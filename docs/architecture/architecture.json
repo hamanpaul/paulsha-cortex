@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "paulsha-cortex SDLC Lifecycle Control Plane",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/paulsha-cortex",
+      "provider": "github",
+      "revision": "739cde17b5b891bcdd575cb98ea07280f428ebaf"
+    },
+    "views": [
+      {
+        "id": "authority-flow",
+        "label": "Authority flow",
+        "focus": ["work-sources", "monitor", "work-read-model", "manager", "workflow-registry"],
+        "note": "Read-side facts never become mutation authority until confirmed and claimed by the Manager single-writer path."
+      },
+      {
+        "id": "execution-gates",
+        "label": "Execution & gates",
+        "focus": ["deck-compiler", "manager", "workflow-registry", "headless-executors", "gate-evidence"],
+        "note": "Deck preserves phase/persona bindings; executors return artifacts and independent evidence while Manager retains lifecycle truth."
+      },
+      {
+        "id": "terminal-closure",
+        "label": "Terminal closure",
+        "focus": ["manager", "gate-evidence", "delivery-closure", "completion-record", "monitor"],
+        "note": "Done is a remote terminal fact: current-HEAD ship gates plus post-merge closure produce CompletionRecord, then Monitor projects done."
+      }
+    ],
+    "viewBox": [1450, 900]
+  },
+  "components": [
+    {
+      "id": "work-sources",
+      "type": "external",
+      "label": "Work Sources",
+      "sublabel": "GitHub + repo authorities",
+      "sources": [{"path":"paulsha_cortex/monitor/work_models.py","line":10,"end_line":24}],
+      "pos": [35, 105],
+      "size": [190, 78]
+    },
+    {
+      "id": "monitor",
+      "type": "backend",
+      "label": "Monitor",
+      "sublabel": "read model only",
+      "sources": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":20,"end_line":28}],
+      "pos": [280, 105],
+      "size": [190, 78]
+    },
+    {
+      "id": "work-read-model",
+      "type": "database",
+      "label": "WorkItem Read Model",
+      "sublabel": "topic → todo → on-going → done",
+      "sources": [{"path":"paulsha_cortex/monitor/work_models.py","line":183,"end_line":219}],
+      "pos": [525, 105],
+      "size": [235, 78]
+    },
+    {
+      "id": "deck-compiler",
+      "type": "backend",
+      "label": "Deck Compiler",
+      "sublabel": "persona-preserving manifest",
+      "sources": [{"path":"paulsha_cortex/coordinator/workflow.py","line":306,"end_line":352}],
+      "pos": [280, 360],
+      "size": [190, 78]
+    },
+    {
+      "id": "manager",
+      "type": "backend",
+      "label": "Manager",
+      "sublabel": "single lifecycle writer",
+      "sources": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":14,"end_line":14}],
+      "pos": [525, 360],
+      "size": [235, 90]
+    },
+    {
+      "id": "workflow-registry",
+      "type": "database",
+      "label": "Workflow Registry",
+      "sublabel": "Manager-owned WorkflowRun v2",
+      "sources": [{"path":"paulsha_cortex/coordinator/workflow.py","line":379,"end_line":407}],
+      "pos": [815, 360],
+      "size": [230, 90]
+    },
+    {
+      "id": "headless-executors",
+      "type": "external",
+      "label": "Headless Executors",
+      "sublabel": "copilot / claude / codex",
+      "sources": [{"path":"README.md","line":24,"end_line":26}],
+      "pos": [815, 650],
+      "size": [230, 78]
+    },
+    {
+      "id": "gate-evidence",
+      "type": "database",
+      "label": "Gate Evidence",
+      "sublabel": "typed immutable refs",
+      "sources": [{"path":"paulsha_cortex/coordinator/workflow.py","line":274,"end_line":303}],
+      "pos": [1100, 650],
+      "size": [215, 78]
+    },
+    {
+      "id": "delivery-closure",
+      "type": "backend",
+      "label": "Delivery / Closure",
+      "sublabel": "bounded current-HEAD ship",
+      "sources": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":46,"end_line":50}],
+      "pos": [1100, 360],
+      "size": [215, 90]
+    },
+    {
+      "id": "completion-record",
+      "type": "database",
+      "label": "CompletionRecord",
+      "sublabel": "remote terminal fact",
+      "sources": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":46,"end_line":50}],
+      "pos": [1100, 105],
+      "size": [215, 78]
+    }
+  ],
+  "boundaries": [],
+  "connections": [
+    {"id":"work-sources-to-monitor","from":"work-sources","to":"monitor","label":"provider snapshots","variant":"emphasis","labelAt":[250,90]},
+    {"id":"monitor-to-work-read-model","from":"monitor","to":"work-read-model","label":"last-good projection","variant":"emphasis","labelAt":[500,90]},
+    {"id":"work-read-model-to-manager","from":"work-read-model","to":"manager","label":"confirmed authority / claim input","variant":"dashed","fromSide":"bottom","toSide":"top","labelAt":[650,270]},
+    {"id":"deck-to-manager","from":"deck-compiler","to":"manager","label":"validated workflow manifest","variant":"emphasis","labelAt":[500,345]},
+    {"id":"manager-to-workflow-registry","from":"manager","to":"workflow-registry","label":"single-writer mutations","variant":"emphasis","labelAt":[790,345]},
+    {"id":"workflow-to-executors","from":"workflow-registry","to":"headless-executors","label":"persona/model scoped dispatch","variant":"dashed","fromSide":"bottom","toSide":"top","labelAt":[930,555]},
+    {"id":"executors-to-gate-evidence","from":"headless-executors","to":"gate-evidence","label":"artifacts + independent verdicts","labelAt":[1070,635]},
+    {"id":"gate-evidence-to-manager","from":"gate-evidence","to":"manager","label":"authorization evidence","variant":"dashed","fromSide":"left","toSide":"bottom","via":[[790,689],[790,500],[642,500]],"labelAt":[860,510]},
+    {"id":"manager-to-delivery","from":"manager","to":"delivery-closure","label":"ship authorization","variant":"emphasis","labelAt":[950,345]},
+    {"id":"delivery-to-completion","from":"delivery-closure","to":"completion-record","label":"remote terminal closure","variant":"emphasis","fromSide":"top","toSide":"bottom","labelAt":[1225,270]},
+    {"id":"completion-to-monitor","from":"completion-record","to":"monitor","label":"strict closure → done","variant":"dashed","fromSide":"left","toSide":"top","via":[[920,144],[920,45],[375,45],[375,95]],"labelAt":[650,30]}
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Authority split",
+      "items": ["Monitor only projects read-side truth", "Manager is the sole lifecycle writer", "heuristics never become mutation authority"]
+    },
+    {
+      "dot": "emerald",
+      "title": "Execution contract",
+      "items": ["Deck fixes the seven-phase spine and persona bindings", "WorkflowRun persists gate refs and source authority", "executors return artifacts/evidence instead of lifecycle truth"]
+    },
+    {
+      "dot": "rose",
+      "title": "Completion semantics",
+      "items": ["foreign exact-HEAD review and delivery review are separate gates", "ship is bounded by preflight/checks/thread/HEAD-race gates", "CompletionRecord is created only after remote post-merge closure"]
+    }
+  ]
+}
