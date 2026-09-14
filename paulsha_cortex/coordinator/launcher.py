@@ -23,7 +23,7 @@ _GIT_REPOSITORY_ENV_KEYS = job_runner.GIT_REPOSITORY_ENV_KEYS | frozenset(
 _CREDENTIAL_ENV_RE = job_runner.CREDENTIAL_ENV_RE
 
 def _claude_review_json_schema(kind: str) -> str:
-    """Bind Claude StructuredOutput to the Manager terminal contract."""
+    """Build the shared Manager terminal-contract schema for Claude and AGY reviewers."""
 
     report = {
         "type": "object",
