@@ -9,6 +9,23 @@
 
 - **Claude builder 命令授權（#480 部分修復）**：commit-required job 使用 per-job 最小 Git 與精確 Python 測試 allowlist，保留 `acceptEdits` 與既有事件／路徑設定，解除無人可核可的測試／提交阻塞。
 
+
+- 修正架構交付誤用說明頁：canonical HTML 改回原版 Archify SVG；新增節點／方向箭頭與流程／條件修正回路驗收，不再以文字頁測試冒充架構圖。
+
+- 架構 HTML 驗收：補齊 Persona／Monitor／Manager 權責、16 元件／22 關係、feature-oneshot 七階段與恢復／狀態模型；加入 README 入口及 source／HTML／browser 回歸驗證。不改 runtime 行為。
+
+- **#831 stability-risk-v2**：修正 planning sizing 的 `spec_stability` 方向；完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind／blocking marker／未 accepted artifact 為 2，並以保守 2 處理 unknown 或不一致 report。其他 sizing 維度、band 門檻、fail-soft 邊界與歷史資料不變；補齊隔離 history/evidence reload、完整 `WorkflowRun` baseline（含 legacy sizing 欄位缺席語意）與真實 frozen-plan bytes/SHA fixture，以及 current snapshot score+band matrix 回歸覆蓋，不新增 schema 或 migration。
+
+- **Recovery registry 子計畫進件（#862）**：納入 #497 的 registry-only A，保留
+  exact CAS／ABA revision、prepared/complete、atomic receipt 與顯式 legacy checkpoint
+  九組不變量。只有 accepted 規劃，現行 8/Red 不派工；公開 recovery／父項仍未完成。
+
+- **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
+  子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。
+  本項只有規劃進件；既存 generic carrier 殘餘與產品、部署驗收保持分帳。
+
+
+
 - **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
 
 - **Launcher／watcher 子計畫進件**：補齊 #823 session-only 三件組與唯一 owner links，
