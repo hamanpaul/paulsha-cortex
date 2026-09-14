@@ -85,6 +85,21 @@ cortex doctor --probe-live --repo owner/repo --json
 `paulsha_cortex/deck/schema.py` 的 `resolve_combo_path()`／`iter_combo_files()`（`deck/cli.py`、`work_bridge.py`、`porcelain/init_sample.py` 皆已改走這兩個入口）會先查 `$PSC_AGENTS_ROOT/config/combos/<id>.yaml`，找不到才 fallback 到套件內建 `paulsha_cortex/deck/data/combos/`。同 id 時 instance-local 優先於套件內建，且 reinstall／升級套件不會蓋掉這份自訂檔——把自訂 combo YAML 放進 `$PSC_AGENTS_ROOT/config/combos/` 即可長期覆寫或新增 combo，不需要 fork 套件內建資料。兩個目錄都找不到指定 id 時 fail-closed，錯誤訊息會列出實際搜尋過的目錄清單。
 
 `small-fix` 是套件內建的輕量 combo 參考實作（`workflow-claim → brainstorming → writing-plans-light → subagent-build → verification → code-review → policy-commit`，7 張卡、2 條核心 gate_spine），刻意用 `writing-plans-light`（只吃 `docs/superpowers/specs/*<task-slug>*-design.md`，不依賴 `openspec/changes/<change>/proposal.md`）取代 `writing-plans`，打斷小任務不需要的 openspec 全鏈。`small-fix` 只能經 `--combo small-fix` explicit override 使用，不在 `task-types.yaml` 的自動選牌映射中（`combo.task_type` 填 `small-fix`，不是 `fix`——避免和 `fix-standard` 的自動選牌搶同一個 `fix` task type）。
+
+### Sizing 評分與 stability-risk-v2
+
+五個 sizing 維度各為 0–2 分，總分仍為 0–10；Green／Yellow／Red 門檻仍分別是 0–3、4–6、7–10。`domain_breadth`、`state_consistency`、`acceptance_surfaces` 與 `orchestration` 的計算不變，只有 `spec_stability` 以風險方向的 `STABILITY_RISK_ALGORITHM = "stability-risk-v2"` 識別：
+
+| completeness 情況 | stability risk |
+|---|---:|
+| 三件 accepted 材料完整、無 blocking marker | 0 |
+| 恰好缺一個 kind，且沒有拒收或阻塞 | 1 |
+| 缺至少兩個 kind、任一 blocking marker，或存在未 accepted artifact | 2 |
+
+空白、unknown 或彼此不一致的 completeness report 也保守給 2；缺少或 invalid 的 plan `domain_breadth`／`state_consistency` 仍使純函式拋 `ValueError`，既有 `current_sizing_snapshot` 則維持 `(None, None)` fail-soft。較低的 stability risk 不代表 planning 已 accepted，也不會略過 readiness 或其他 gate。
+
+此映射只由新的 claim／reclaim 與既有明示 retry 重算入口採用。讀取或重啟不會重算、改寫舊 WorkflowRun、frozen planning、CompletionRecord 或 immutable evidence；沒有可辨識算法來源的歷史分數保留為 legacy／unversioned，不以目前 runtime 猜填。需要新分數時，必須走正式的明示重新評估流程並以當時實際載入的 runtime revision 留下紀錄。
+
 ### Intake（`link` + `start` 合成，#203）
 
 `cortex work intake <work_id> --repo <owner/repo>` 是「拿到一個 issue/task 就進件」的單一入口，取代已停用的低階 `dispatch`。它等價於「（必要時）`link` 後接 `start`」，但收斂成一次呼叫：

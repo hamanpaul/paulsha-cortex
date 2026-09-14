@@ -853,8 +853,10 @@ work_items:
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#823'
-      - kind: github_issue
-        ref: 'hamanpaul/paulsha-cortex#824'
+      - kind: path
+        ref: 'docs/superpowers/specs/launcher-session-and-timeout-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/launcher-session-and-timeout-design.md'
       - kind: path
         ref: 'docs/superpowers/workstreams/launcher-session-and-timeout/todo.md'
     excludes: []
@@ -929,4 +931,70 @@ work_items:
         ref: 'docs/superpowers/specs/executor-backoff-store-core-design.md'
       - kind: path
         ref: 'docs/superpowers/workstreams/executor-backoff-store-core/todo.md'
+    excludes: []
+  agy-probe-construction-containment:
+    title: 'agy-probe-construction-containment'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#851'
+      - kind: path
+        ref: 'docs/superpowers/specs/agy-probe-construction-containment-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/agy-probe-construction-containment-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/agy-probe-construction-containment/todo.md'
+    excludes: []
+  monitor-watcher-bounded:
+    title: 'monitor-watcher-bounded'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#853'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-watcher-bounded-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-watcher-bounded-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-watcher-bounded/todo.md'
+    excludes: []
+  workflow-terminal-jsonl-framing:
+    title: 'workflow-terminal-jsonl-framing'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#860'
+      - kind: openspec
+        ref: 'workflow-terminal-jsonl-framing'
+      - kind: path
+        ref: 'docs/superpowers/specs/workflow-terminal-jsonl-framing-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/workflow-terminal-jsonl-framing-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/workflow-terminal-jsonl-framing/todo.md'
+    excludes: []
+  recovery-registry-receipt:
+    title: 'recovery-registry-receipt'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#862'
+      - kind: openspec
+        ref: 'recovery-registry-receipt'
+      - kind: path
+        ref: 'docs/superpowers/specs/recovery-registry-receipt-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/recovery-registry-receipt-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/recovery-registry-receipt/todo.md'
+    excludes: []
+  task-memory-delivery-adapter:
+    title: 'task memory delivery Cortex adapter'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#857'
+      - kind: path
+        ref: 'docs/superpowers/specs/task-memory-delivery-adapter-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/task-memory-delivery-adapter-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/task-memory-delivery-adapter.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/task-memory-delivery-adapter/todo.md'
     excludes: []

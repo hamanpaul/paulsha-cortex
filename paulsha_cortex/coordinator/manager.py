@@ -6537,6 +6537,13 @@ def terminalize_workflow_job(
             raise ValueError(
                 f"workflow verification terminal reported non-passing status: {raw.get('status')}"
             )
+        details = raw.get("details")
+        if isinstance(details, str) and details.strip():
+            logger.warning(
+                "workflow verification terminal details normalized from string for job=%s",
+                job_id,
+            )
+            raw = {**raw, "details": {"text": details}}
         if (
             set(raw) != required
             or raw.get("schema_version") != 1
