@@ -22,9 +22,6 @@ _GIT_REPOSITORY_ENV_KEYS = job_runner.GIT_REPOSITORY_ENV_KEYS | frozenset(
 # 的憑證判準永遠是同一條 pattern，不會兩處漂移。
 _CREDENTIAL_ENV_RE = job_runner.CREDENTIAL_ENV_RE
 
-_AGY_REVIEW_TERMINAL_KIND_UNSET = object()
-
-
 def _claude_review_json_schema(kind: str) -> str:
     """Bind Claude StructuredOutput to the Manager terminal contract."""
 
@@ -1193,7 +1190,7 @@ def build_agy_argv(
     review_only: bool = False,
     commit_required: bool = False,
     write_forbidden: bool = False,
-    review_terminal_kind: str | None | object = _AGY_REVIEW_TERMINAL_KIND_UNSET,
+    review_terminal_kind: str | None = None,
     # Workflow lanes want the single-line JSON envelope; the capability probe
     # (#670) keeps the bare ``--output-format text`` shape because the CLI
     # rejects ``--json-schema`` there and the probe parser reads raw JSON.
@@ -1221,17 +1218,10 @@ def build_agy_argv(
 
     if review_only:
         if review_terminal_kind is None:
-            raise ValueError("AGY reviewer terminal contract kind missing")
-        review_schema = (
-            None
-            if review_terminal_kind is _AGY_REVIEW_TERMINAL_KIND_UNSET
-            else _claude_review_json_schema(str(review_terminal_kind))
-        )
+            raise ValueError("agy reviewer terminal contract kind missing")
+        review_schema = _claude_review_json_schema(review_terminal_kind)
     else:
-        if (
-            review_terminal_kind is not None
-            and review_terminal_kind is not _AGY_REVIEW_TERMINAL_KIND_UNSET
-        ):
+        if review_terminal_kind is not None:
             raise ValueError("AGY terminal contract requires reviewer mode")
         review_schema = None
 

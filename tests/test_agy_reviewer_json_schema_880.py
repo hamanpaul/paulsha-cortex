@@ -111,6 +111,20 @@ def test_agy_reviewer_terminal_kind_validation(
         )
 
 
+def test_agy_reviewer_requires_terminal_kind_when_omitted(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match="^agy reviewer terminal contract kind missing$",
+    ):
+        build_agy_argv(
+            prompt="inspect",
+            slice_id="verify-880",
+            log_dir=str(tmp_path / "logs"),
+            worktree=str(tmp_path / "reviewer"),
+            review_only=True,
+        )
+
+
 def test_agy_probe_and_builder_shapes_do_not_gain_reviewer_schema(tmp_path: Path) -> None:
     probe = build_agy_argv(
         prompt="p",
