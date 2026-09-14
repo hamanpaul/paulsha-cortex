@@ -553,7 +553,12 @@ def _claude_builder_settings() -> str:
         # Claude rules have their own pattern grammar. Even shell-quoted
         # wildcard/metacharacter arguments must not become permission rules.
         if any(not set(arg) <= safe_chars for arg in argv):
-            raise ValueError("Claude builder gate cannot be represented as an exact permission rule")
+            # Name the offending gate so operators can find the PSC_GATE_CMD_*
+            # declaration; the command itself is operator-declared, not secret.
+            raise ValueError(
+                "Claude builder gate cannot be represented as an exact permission rule: "
+                f"gate={spec.name!r} command={spec.command!r}"
+            )
         allowed.append(f"Bash({spec.command})")
     settings["permissions"] = {"allow": sorted(set(allowed))}
     return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
