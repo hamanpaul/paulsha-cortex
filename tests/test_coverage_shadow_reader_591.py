@@ -25,7 +25,10 @@ from paulsha_cortex.coordinator.coverage import (
 from paulsha_cortex.coordinator.work_bridge import default_workflow_manifest
 from paulsha_cortex.coordinator.workflow import WorkflowManifest
 
-NOW = datetime(2026, 8, 16, 12, 0, 0, tzinfo=timezone.utc)
+# 固定日期是時間炸彈：reader 以真實時鐘做 30 天 TTL 清掃，固定 NOW 一旦落到
+# TTL 之外（2026-09-14T12:00Z 起實際發生），每筆合成記錄都會被清掃、整個
+# preflight／CI 全紅。改用測試執行當下的 UTC 時間；days_ago 語意不變。
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _stamp(days_ago: float) -> str:
