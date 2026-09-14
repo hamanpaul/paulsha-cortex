@@ -33,7 +33,10 @@ jobs:
           cmp docs/architecture/architecture.html /tmp/architecture-review/rebuilt.html
       - name: Original Archify file navigation and native graph interaction
         run: |
-          export ARCHIFY_CHROME="$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
+          # Use the runner's installed Chrome; do not disable AppArmor or sandbox.
+          export ARCHIFY_CHROME="$(command -v google-chrome)"
+          test -x "$ARCHIFY_CHROME"
+          "$ARCHIFY_CHROME" --version | tee /tmp/architecture-review/native-browser-version.txt
           node .archify-engine/archify/bin/archify.mjs visual-check docs/architecture/architecture.html --json > /tmp/architecture-review/visual-check.json
           python tests/architecture_browser_review.py --html docs/architecture/architecture.html --output /tmp/architecture-review
       - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
