@@ -659,17 +659,21 @@ def _status_repo(*values: object) -> str | None:
     return None
 
 
-def _unknown_execution_identity(
-    *, job_id: object = None, card: object = None, execution_state: str = "unknown"
-) -> dict[str, Any]:
-    """Return the additive execution-identity fields without inventing identity."""
+def _unknown_execution_identity(*, card: object = None) -> dict[str, Any]:
+    """Return the additive execution-identity fields without inventing identity.
+
+    ``unknown`` means there is no verifiable registry identity, so ``job_id`` is
+    always ``None`` (a manifest-declared id that the registry does not back is
+    not evidence) and ``execution_state`` uses the typed default
+    ``not-dispatched`` rather than a free-form ``unknown`` state.
+    """
     return {
         "executor": None,
         "model": None,
-        "job_id": job_id,
+        "job_id": None,
         "card": card,
         "identity_source": "unknown",
-        "execution_state": execution_state,
+        "execution_state": "not-dispatched",
     }
 
 
@@ -751,7 +755,7 @@ def _manifest_execution_identity(
     """Resolve a handoff manifest's job binding without trusting its identity fields."""
     job = _registry_job(registry, job_id)
     if job is None:
-        return _unknown_execution_identity(job_id=job_id, card=workflow_card)
+        return _unknown_execution_identity(card=workflow_card)
     if isinstance(workflow_run_id, str) and workflow_run_id:
         if not isinstance(workflow_card, str) or not workflow_card:
             # A run binding without a card is still an explicit job binding;
@@ -774,13 +778,13 @@ def _manifest_execution_identity(
         if isinstance(workflow_phase, str) and workflow_phase:
             bound = bound and job.get("workflow_phase") == workflow_phase
     if not bound:
-        return _unknown_execution_identity(job_id=job_id, card=workflow_card)
+        return _unknown_execution_identity(card=workflow_card)
     status = job.get("status")
     if status in IN_FLIGHT_STATUSES:
         return _job_execution_identity(job, identity_source="in-flight", card=workflow_card)
     if status in TERMINAL_STATUSES:
         return _job_execution_identity(job, identity_source="last-execution", card=workflow_card)
-    return _unknown_execution_identity(job_id=job_id, card=workflow_card)
+    return _unknown_execution_identity(card=workflow_card)
 
 
 def _workflow_execution_identity(registry, run) -> dict[str, Any]:
@@ -828,7 +832,7 @@ def _workflow_execution_identity(registry, run) -> dict[str, Any]:
             "identity_source": "planned",
             "execution_state": "not-dispatched",
         }
-    return _unknown_execution_identity(card=step.card, execution_state="not-dispatched")
+    return _unknown_execution_identity(card=step.card)
 
 
 def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runner=None) -> dict[str, Any]:

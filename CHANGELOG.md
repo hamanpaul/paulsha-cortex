@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#828 RED：** 新增 workflow status execution-identity regression coverage，鎖定 registry job 綁定與 planned／actual／last execution 的可區分投影；本卡交付 failing tests，producer 修正留待後續卡片。
+- **#828 regression coverage：** 新增 workflow status execution-identity regression tests，鎖定 registry job 綁定與 planned／actual／last execution 的可區分投影（原以 RED 設計，已由同一 PR 的 producer 修正轉綠）。
 
 - **#828 producer GREEN：** workflow `in_flight`、`attention` 與 `recent_done` 現在從明確的 registry job run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；無 job 時保留 planned 或 unknown，不從 phase／persona 推測實際模型。另提供去識別化 status snapshot fixture 與 producer/consumer 欄位契約，供下游驗收使用。
 
