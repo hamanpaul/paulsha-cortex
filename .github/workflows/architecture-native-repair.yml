@@ -1,0 +1,79 @@
+name: Apply verified native architecture repair
+on:
+  push:
+    branches: [feature/architecture-fact-layer]
+    paths: [.github/workflows/architecture-native-repair.yml]
+permissions:
+  contents: write
+concurrency:
+  group: architecture-native-repair
+  cancel-in-progress: false
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: tt-a1i/archify
+          ref: a07fa1d5b2a10cbea110c5a2be2817397a301cdc
+          path: .archify-engine
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Apply only hash-verified source edits
+        run: |
+          python - <<'PY'
+          import base64,gzip,hashlib,io,json,os
+          from pathlib import Path
+          folder=Path('.ci/architecture-native')
+          encoded=''.join((folder/f'part{i}.txt').read_text().strip() for i in range(4))
+          compressed=base64.b64decode(encoded,validate=True)
+          assert hashlib.sha256(compressed).hexdigest()=='b56ef28da0d991b078741572bf8b53cfa3d3b0100c845f0f139b09979bab9882'
+          with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:raw=stream.read(2000001)
+          assert len(raw)<=2000000
+          records=json.loads(raw)['files'];assert len(records)==8
+          allowed={'README.md','CHANGELOG.md','changelog.d/architecture-fact-layer.md','.github/workflows/architecture-html.yml','docs/architecture/facts.json','docs/architecture/architecture.json','tests/test_architecture_docs.py','tests/architecture_browser_review.py'}
+          assert {r['path'] for r in records}==allowed
+          staged={}
+          for rec in records:
+              p=Path(rec['path']);assert not p.is_absolute() and '..' not in p.parts
+              assert all(not x.is_symlink() for x in [p,*p.parents])
+              before=p.read_bytes() if p.exists() else b''
+              if rec['before'] is None:assert not p.exists()
+              else:assert hashlib.sha256(before).hexdigest()==rec['before'],str(p)+' changed concurrently'
+              lines=before.decode().splitlines(keepends=True)
+              for start,end,replacement in reversed(rec['edits']):
+                  assert 0<=start<=end<=len(lines)
+                  lines[start:end]=replacement
+              after=''.join(lines).encode()
+              assert hashlib.sha256(after).hexdigest()==rec['after'],str(p)+' transport differs'
+              staged[p]=after
+          for p,data in staged.items():
+              p.parent.mkdir(parents=True,exist_ok=True);tmp=p.with_name(p.name+'.native-tmp');tmp.write_bytes(data);os.replace(tmp,p)
+          Path('/tmp/native-paths').write_text('\n'.join(map(str,staged)))
+          PY
+      - name: Original Archify engine produces the canonical HTML
+        run: |
+          node .archify-engine/archify/bin/archify.mjs deliver architecture docs/architecture/architecture.json docs/architecture/architecture.html --repo-root . --quality showcase --json > /tmp/native-delivery.json
+          cat /tmp/native-delivery.json
+          echo '2bb29134774974ac22ccdd813e877051421a023d40bed631f5ec1ddbf17445b0  docs/architecture/architecture.html' | sha256sum --check
+          python -m pip install pytest==8.3.5
+          PYTHONPATH=. python -m pytest tests/test_architecture_docs.py -q
+      - name: Commit verified diagram and remove transport
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          while IFS= read -r path || [ -n "$path" ]; do git add -- "$path"; done < /tmp/native-paths
+          git add docs/architecture/architecture.html
+          git rm -r -- .ci/architecture-native .github/workflows/architecture-native-repair.yml
+          git commit -m 'fix: 將說明頁替換為原生 Archify 架構與流程圖'
+          git fetch origin feature/architecture-fact-layer
+          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          git push origin HEAD:refs/heads/feature/architecture-fact-layer
+          git rev-parse HEAD
