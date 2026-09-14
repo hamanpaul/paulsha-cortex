@@ -1,0 +1,23 @@
+name: Architecture review session
+on:
+  push:
+    branches: [feature/architecture-fact-layer]
+    paths: [.github/workflows/architecture-review-session.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Export credential-free Git objects for local documentation verification
+        run: git bundle create /tmp/cortex-review-source.bundle HEAD refs/remotes/origin/main
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cortex-review-source
+          path: /tmp/cortex-review-source.bundle
+          retention-days: 1
