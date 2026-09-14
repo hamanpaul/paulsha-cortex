@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **AGY reviewer JSON schema 修正（#880）**：reviewer lane 依 verification／review terminal kind 綁定與 Claude 共用的 `--json-schema`；Manager 對非空 verification `details` 字串做 `{"text": ...}` 相容正規化，空字串仍 fail closed。
+
 - **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
   子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。
   本項只有規劃進件；既存 generic carrier 殘餘與產品、部署驗收保持分帳。

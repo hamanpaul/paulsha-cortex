@@ -6357,6 +6357,13 @@ def terminalize_workflow_job(
         normalized_payload: dict[str, object] = dict(raw)
     elif phase == "verify":
         required = {"schema_version", "kind", "status", "summary", "details", "reports"}
+        details = raw.get("details")
+        if isinstance(details, str) and details.strip():
+            logger.warning(
+                "workflow verification terminal details normalized from string for job=%s",
+                job_id,
+            )
+            raw = {**raw, "details": {"text": details}}
         # #261 R1：verifier 也必須能誠實回報 failed／needs_human，不得只有成功形狀
         # 合法。非通過狀態在此 fail closed 為可操作錯誤，而不是被誤判成 schema 壞掉。
         if raw.get("status") in terminal_contract.NON_PASSING_STATUSES:
