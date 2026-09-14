@@ -192,7 +192,7 @@ def _record_subprocess_launch(
     *,
     runner: str,
     executor: str,
-    require_session: bool = False,
+    require_session: bool = True,
 ) -> list[dict[str, object]]:
     _patch_degraded_launch_seams(
         monkeypatch,
@@ -206,7 +206,10 @@ def _record_subprocess_launch(
         pid = 12347
 
     def fake_popen(argv, **kwargs):
-        assert kwargs.get("start_new_session") is True, "start_new_session flag was dropped"
+        # require_session 才是這個 helper 的嚴格模式開關：預設 True 維持現有
+        # 嚴格度；只有明確關掉（例如負控制）才略過 start_new_session 斷言。
+        if require_session:
+            assert kwargs.get("start_new_session") is True, "start_new_session flag was dropped"
         calls.append({"argv": argv, **kwargs})
         return FakeProcess()
 
