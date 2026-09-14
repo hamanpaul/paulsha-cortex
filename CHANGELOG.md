@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- 修正架構交付誤用說明頁：canonical HTML 改回原版 Archify SVG；新增節點／方向箭頭與流程／條件修正回路驗收，不再以文字頁測試冒充架構圖。
+
 - 架構 HTML 驗收：補齊 Persona／Monitor／Manager 權責、16 元件／22 關係、feature-oneshot 七階段與恢復／狀態模型；加入 README 入口及 source／HTML／browser 回歸驗證。不改 runtime 行為。
 
 - **#831 stability-risk-v2**：修正 planning sizing 的 `spec_stability` 方向；完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind／blocking marker／未 accepted artifact 為 2，並以保守 2 處理 unknown 或不一致 report。其他 sizing 維度、band 門檻、fail-soft 邊界與歷史資料不變；補齊隔離 history/evidence reload、完整 `WorkflowRun` baseline（含 legacy sizing 欄位缺席語意）與真實 frozen-plan bytes/SHA fixture，以及 current snapshot score+band matrix 回歸覆蓋，不新增 schema 或 migration。

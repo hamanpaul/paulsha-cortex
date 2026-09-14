@@ -1,52 +1,58 @@
-"""Regression contract for the source-pinned, checked-in HTML review artifact."""
+"""Regression tests require a real native diagram, not a documentation lookalike."""
 import hashlib
 from html.parser import HTMLParser
 import json
 from pathlib import Path
 import subprocess
-
-ROOT = Path(__file__).resolve().parents[1]
-ARCH = ROOT / 'docs/architecture'
-
+import pytest
+ROOT=Path(__file__).resolve().parents[1]
+ARCH=ROOT/'docs/architecture'
 
 class Page(HTMLParser):
-    def __init__(self, text):
-        super().__init__();self.scripts={};self.ids={};self.current=None;self.external=[];self.feed(text)
+    def __init__(self,text):
+        super().__init__();self.nodes=[];self.edges={};self.generators=[];self.external=[];self.feed(text)
     def handle_starttag(self,tag,attrs):
         a=dict(attrs)
-        for key in ('data-node-id','data-relation-id','data-role-id','data-step-id','data-recovery-id','data-state-id'):
-            if key in a:self.ids.setdefault(key,[]).append(a[key])
-        if tag=='script':
-            if a.get('src'):self.external.append(a['src'])
-            self.current=a.get('id');self.scripts.setdefault(self.current,'')
-    def handle_endtag(self,tag):
-        if tag=='script':self.current=None
-    def handle_data(self,text):
-        if self.current:self.scripts[self.current]+=text
-
+        if tag=='g' and 'data-node-id' in a:self.nodes.append(a['data-node-id'])
+        if tag=='path' and 'data-edge-id' in a:self.edges[a['data-edge-id']]=a
+        if tag=='meta' and a.get('name')=='generator':self.generators.append(a.get('content',''))
+        if tag=='script' and a.get('src'):self.external.append(a['src'])
 
 def load():
-    f=json.loads((ARCH/'facts.json').read_text());ir=json.loads((ARCH/'architecture.json').read_text());p=Page((ARCH/'architecture.html').read_text());return f,ir,p
+    return (json.loads((ARCH/'facts.json').read_text()),json.loads((ARCH/'architecture.json').read_text()),Page((ARCH/'architecture.html').read_text()))
 
-
-def test_html_embeds_exact_current_facts_and_ir():
-    f,ir,p=load()
-    assert json.loads(p.scripts['architecture-facts']) == f
-    assert json.loads(p.scripts['architecture-ir']) == ir
-    assert ir['meta']['workflow_review']==f['workflow_review']
-    assert ir['meta']['renderer']=='workflow-review/v1'
+def assert_graph(ir,p):
+    assert any(s.startswith('archify ') for s in p.generators)
+    assert set(p.nodes)=={x['id'] for x in ir['components']}
+    assert len(p.nodes)==len(ir['components'])
+    assert set(p.edges)=={x['id'] for x in ir['connections']}
+    assert all(e.get('d') and e.get('marker-end') for e in p.edges.values())
     assert not p.external
 
+def test_native_diagram_has_actual_svg_nodes_and_arrows():
+    _,ir,p=load();assert_graph(ir,p)
 
-def test_all_fact_records_have_one_canonical_html_element():
-    f,ir,p=load();r=f['workflow_review']
-    for attr,records in [('node-id',f['components']),('relation-id',f['relations']),('role-id',r['roles']),('step-id',r['steps']),('recovery-id',r['recoveries']),('state-id',r['state_models'])]:
-        assert sorted(p.ids['data-'+attr])==sorted(x['id'] for x in records)
-    assert {x['id'] for x in r['roles']}=={'manager','planner','builder','reviewer'}
-    assert [x['id'] for x in r['steps']]==['claim','define','plan','build','verify','review','ship']
-    assert r['controller']=='manager' and r['observer']=='monitor' and r['state_store']=='workflow-registry'
-    assert not any(x['from']=='workflow-registry' and x['to']=='headless-executors' for x in f['relations'])
+def test_native_ir_preserves_contract_nodes_and_workflow():
+    f,ir,p=load();ids={x['id'] for x in ir['components']}
+    assert ids=={x['id'] for x in f['components']}|{'phase-'+s['id'] for s in f['workflow_review']['steps']}
+    assert {'manager','monitor','persona-contracts','deck-compiler','workflow-registry'}<=ids
+    assert ir['meta']['quality_profile']=='showcase' and 'renderer' not in ir['meta']
+    for e in f['relations']:
+        expected={k:e[k] for k in ('id','from','to','label','variant') if k in e}
+        actual=next(x for x in ir['connections'] if x['id']==e['id'])
+        assert expected=={k:actual[k] for k in expected}
+    assert not any(e['from']=='workflow-registry' and e['to']=='headless-executors' for e in ir['connections'])
+    assert any(e['id']=='recovery-candidate-repair' and e['from']=='phase-review' and e['to']=='phase-build' for e in ir['connections'])
 
+def test_prose_page_cannot_pass_by_copying_labels():
+    _,ir,_=load();fake=Page('<meta name="generator" content="archify fake">'+''.join('<p>'+x['label']+'</p>' for x in ir['components']))
+    with pytest.raises(AssertionError):assert_graph(ir,fake)
+
+def test_missing_persona_or_recovery_arrow_is_rejected():
+    _,ir,p=load();p.nodes.remove('persona-contracts')
+    with pytest.raises(AssertionError):assert_graph(ir,p)
+    _,ir,p=load();del p.edges['recovery-candidate-repair']
+    with pytest.raises(AssertionError):assert_graph(ir,p)
 
 def test_source_hashes_refer_to_real_pinned_git_blobs():
     f,_,_=load();revision=f['repository']['revision'];r=f['workflow_review'];cache={}

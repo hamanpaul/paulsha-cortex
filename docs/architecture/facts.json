@@ -22,9 +22,8 @@
   "components": [
     {
       "id": "candidate-worktree",
-      "label": "Builder Worktree／Candidate HEAD",
+      "label": "Candidate / Worktree",
       "type": "database",
-      "tag": "受測程式版本",
       "responsibility": "Builder 在 Manager provision 的工作區依 accepted plan 做 RED→實作→commit，交回 Candidate HEAD。後續 verify/review 必須對準同一版本。",
       "basis": "declared",
       "evidence": [
@@ -42,13 +41,13 @@
           "excerpt_sha256": "d19d545337077a469f269876ffa391ce759d5d93360549f4be988f39fa398ea8",
           "claim": "隔離工作區由 Manager 提供；RED／Build 的 commit 與測試義務。"
         }
-      ]
+      ],
+      "sublabel": "Builder 的受測 HEAD"
     },
     {
       "id": "completion-record",
-      "label": "CompletionRecord：完成證據",
+      "label": "CompletionRecord",
       "type": "database",
-      "tag": "不是 exit code，也不是 PR 按鈕",
       "responsibility": "遠端 merge ancestry、issue closed、OpenSpec archive、Todo 等全數成立後，Manager 才寫 CompletionRecord。它是 done 投影的必要完成證據。",
       "basis": "declared",
       "evidence": [
@@ -59,13 +58,13 @@
           "excerpt_sha256": "e4ccb2f0f535c5df572452c5518baa1718bb2b561e789729cd959423eae2f29f",
           "claim": "遠端 terminal facts 成立後才寫 CompletionRecord 並投影 done。"
         }
-      ]
+      ],
+      "sublabel": "全部完成才發證"
     },
     {
       "id": "control-queue",
-      "label": "CLI／Control Request Queue",
+      "label": "CLI Queue",
       "type": "messagebus",
-      "tag": "操作入口",
       "responsibility": "接收 start、resume、retry、ship 等明確請求；交給 Manager 處理。CLI 不直接改寫 WorkflowRun／Job／Slice registry。",
       "basis": "declared",
       "evidence": [
@@ -76,13 +75,13 @@
           "excerpt_sha256": "7e8128bdf2cbecacc49372857dcdd202797147928882470c0f93682c6c63e9ca",
           "claim": "CLI mutation 送 control request queue，由 Manager daemon 單一 writer 處理，不直接改 registry。"
         }
-      ]
+      ],
+      "sublabel": "start / resume / retry"
     },
     {
       "id": "deck-compiler",
-      "label": "Deck：Card／Combo 定義與編譯",
+      "label": "Deck",
       "type": "backend",
-      "tag": "流程定義，不是執行期看板",
       "responsibility": "把 Combo 的 Card 順序、角色、輸入、輸出及 test/commit policy 編成 WorkflowManifest。定義怎麼做，不保存這次做到哪。",
       "basis": "observed",
       "evidence": [
@@ -100,13 +99,13 @@
           "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
           "claim": "feature-oneshot 核心 Card 與條件式 adversarial-review。"
         }
-      ]
+      ],
+      "sublabel": "Card + Combo → Manifest"
     },
     {
       "id": "delivery-closure",
-      "label": "Delivery：Ship 與遠端閉環",
+      "label": "Delivery / Closure",
       "type": "backend",
-      "tag": "Manager 執行的交付子流程",
       "responsibility": "對 current HEAD 做 archive／policy／preflight／checks／delivery review／threads／HEAD-race 檢查，再 merge；merge 後重讀遠端結果確認閉環。",
       "basis": "declared",
       "evidence": [
@@ -117,13 +116,13 @@
           "excerpt_sha256": "b416ebb50fe63c54b807e9ff44636515b9545239794fc11ffbd55c5e10d6b47e",
           "claim": "Ship 與 post-merge remote closure 由 Manager 負責。"
         }
-      ]
+      ],
+      "sublabel": "merge 後重驗遠端"
     },
     {
       "id": "gate-evidence",
-      "label": "Canonical Gate Evidence",
+      "label": "Gate Evidence",
       "type": "database",
-      "tag": "各 gate 的不可混用證據",
       "responsibility": "Manager 收斂並保存驗證後的 gate refs。Brainstorm、ForeignReview 與 delivery review 是不同 gate；有一份 review 不等於其他 gate 都通過。",
       "basis": "declared",
       "evidence": [
@@ -148,13 +147,13 @@
           "excerpt_sha256": "f30cd7bd3c773a018b355de34fcb5029a67e37e23cb7c9499d7b3a755bd74bb3",
           "claim": "GateEvidenceRef 限定 brainstorm/foreign-review/copilot/maintainer-review 等不同 immutable evidence kind。"
         }
-      ]
+      ],
+      "sublabel": "各 gate 分別綁定"
     },
     {
       "id": "headless-executors",
-      "label": "AgentInstance／Headless Executor",
+      "label": "AgentInstance",
       "type": "external",
-      "tag": "實際工作程序",
       "responsibility": "接受 Manager 派出的 persona/model-scoped 工作。Planner 產規劃、Builder 改程式、Reviewer 回驗證／審查結果；它們交回的結果仍須由 Manager 驗證，不能自行把工作標為 done。",
       "basis": "declared",
       "evidence": [
@@ -172,13 +171,13 @@
           "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
           "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
         }
-      ]
+      ],
+      "sublabel": "執行任務、回傳結果"
     },
     {
       "id": "manager",
-      "label": "Manager：執行期控制器",
+      "label": "Manager",
       "type": "backend",
-      "tag": "流程與 lifecycle 的唯一 writer",
       "responsibility": "讀取 confirmed 工作來源與 manifest，選擇執行器、派工、收取證據、判斷 gate、持久化進度及受限恢復；只有它能推進 workflow 或承認完成。",
       "basis": "declared",
       "evidence": [
@@ -196,13 +195,13 @@
           "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
           "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
         }
-      ]
+      ],
+      "sublabel": "唯一 writer；決定進度"
     },
     {
       "id": "monitor",
-      "label": "Monitor：觀察與狀態投影",
+      "label": "Monitor",
       "type": "backend",
-      "tag": "不控制 workflow，但保存自己的 read snapshot",
       "responsibility": "讀 GitHub／Repo、Workflow Registry 與 CompletionRecord，聚合 WorkItem。來源失敗時保留 last-good 並標 degraded；不因 scan 結果直接派工或改 lifecycle。",
       "basis": "declared",
       "evidence": [
@@ -213,13 +212,13 @@
           "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
           "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
         }
-      ]
+      ],
+      "sublabel": "讀取、聚合、投影"
     },
     {
       "id": "persona-contracts",
-      "label": "Persona：角色／權限契約",
+      "label": "Persona",
       "type": "security",
-      "tag": "契約資料，不是 AgentInstance",
       "responsibility": "定義 manager、planner、builder、reviewer 可在哪些 phase 使用哪些工具與寫入路徑；供 Deck、Manager、Guardrail 讀取，不自行推進進度。",
       "basis": "observed",
       "evidence": [
@@ -237,13 +236,13 @@
           "excerpt_sha256": "3c6bd08915ba5648758f36c9d2b3d118194a4b27fd41d4d12233c04ae54a20d0",
           "claim": "角色是 allowed_phases/write_paths/allowed_tools/skills 契約；四個角色的允許範圍。"
         }
-      ]
+      ],
+      "sublabel": "定義角色、工具與範圍"
     },
     {
       "id": "planning-artifacts",
-      "label": "Accepted Planning Artifacts",
+      "label": "Planning Artifacts",
       "type": "database",
-      "tag": "需求與計畫的版本化輸入",
       "responsibility": "保存 accepted spec／design／plan。Manager 將 ref/kind/hash 綁入 WorkflowRun，再以固定 input snapshot 交給 Builder；不是任由執行器讀取漂移檔案。",
       "basis": "declared",
       "evidence": [
@@ -254,13 +253,13 @@
           "excerpt_sha256": "45b8e16b6c833bee68009343523dc7056b9e0f6a1078b45c60323fc945387e10",
           "claim": "Planning artifacts 與原始發證 revision/hash 綁定，不因新的 PR refresh 靜默變更。"
         }
-      ]
+      ],
+      "sublabel": "accepted spec / plan"
     },
     {
       "id": "scope-guardrail",
-      "label": "Guardrail：角色範圍檢查",
+      "label": "Guardrail",
       "type": "security",
-      "tag": "執行規則檢查",
       "responsibility": "依 Persona 准駁 filesystem path／tool。這是契約檢查，不應誤認為獨立 Agent、進度控制器或完整作業系統 sandbox。",
       "basis": "observed",
       "evidence": [
@@ -271,13 +270,13 @@
           "excerpt_sha256": "fcacb3b7b8c0c3d395617257dd8004f5ed65ebec7d60338106677fd4348fdf1c",
           "claim": "Guardrail 依角色契約檢查路徑與工具，回傳准駁；本身不是流程推進器。"
         }
-      ]
+      ],
+      "sublabel": "檢查工具與可寫範圍"
     },
     {
       "id": "verification-gate",
-      "label": "Deterministic Gate／Evidence 驗證",
+      "label": "Verification Gate",
       "type": "backend",
-      "tag": "機械驗證，不是模型自證",
       "responsibility": "檢查受測 Candidate、命令結果、input snapshot 及 terminal evidence 一致性。降權路徑由獨立 gate 帳號執行命令；通過結果回到 Manager 才能推進。",
       "basis": "observed",
       "evidence": [
@@ -288,13 +287,13 @@
           "excerpt_sha256": "d0d4a1671b3d2bb1e11baabb5a9a8ce3484b8f718073e56d2afe8559615f773b",
           "claim": "成功 exit 只是 terminalize 的必要條件；Manager 仍收斂 canonical evidence 並執行 gate consistency 檢查。"
         }
-      ]
+      ],
+      "sublabel": "機械驗證；不信自證"
     },
     {
       "id": "work-read-model",
-      "label": "WorkItem：對外工作狀態",
+      "label": "WorkItem",
       "type": "database",
-      "tag": "給人與 Agent 查看的工作投影",
       "responsibility": "Monitor 將工作投影為 topic／todo／on-going／done，並附 phase、facets、sources、next_actions。這不是 Deck 的執行進度，也不是 Agent 自報完成。",
       "basis": "observed",
       "evidence": [
@@ -305,13 +304,13 @@
           "excerpt_sha256": "1510c063c4ab97707c25c2555b344cefe75072ec54456a4de3d20d2be40efb57",
           "claim": "WorkItem 的狀態、來源、phase/facets 與對外 on-going spelling。"
         }
-      ]
+      ],
+      "sublabel": "topic→todo→on-going→done"
     },
     {
       "id": "work-sources",
-      "label": "工作來源／GitHub 與 Repo",
+      "label": "GitHub / Repo",
       "type": "external",
-      "tag": "來源事實",
       "responsibility": "提供 issue、PR、spec/design/plan、OpenSpec 與 Todo。它們是工作來源，不是可跳過 gate 的派工命令。",
       "basis": "declared",
       "evidence": [
@@ -329,13 +328,13 @@
           "excerpt_sha256": "6932289e76f62dadd768292e071959f7ff8234bcc9b89ff1366e616d4ad58ed1",
           "claim": "confirmed association 與 persona-preserving manifest；異質 brainstorm 的宣告式契約。"
         }
-      ]
+      ],
+      "sublabel": "issue / PR / repo artifacts"
     },
     {
       "id": "workflow-registry",
-      "label": "Workflow Registry：這次做到哪",
+      "label": "Workflow Registry",
       "type": "database",
-      "tag": "狀態記錄，不是派工者",
       "responsibility": "保存 WorkflowRun、WorkflowStep、attempts、Candidate 與 evidence/completion binding；記錄由 Manager 更新。Job 是一次執行嘗試，重試不等於建立一個新的工作。",
       "basis": "observed",
       "evidence": [
@@ -353,16 +352,46 @@
           "excerpt_sha256": "3c0b9363f52205f8a1acf7d27fdd557803b0b02fe767fb68cd36436fcd3a012c",
           "claim": "WorkflowRun 保存 Manager-owned aggregate，包括 current_phase、steps、attempts、evidence 與 completion binding。"
         }
+      ],
+      "sublabel": "保存 Run / Step / attempt"
+    }
+  ],
+  "boundaries": [
+    {
+      "id": "definition-layer",
+      "kind": "region",
+      "label": "角色與流程定義（契約，不是執行中的 Agent）",
+      "wraps": [
+        "deck-compiler",
+        "persona-contracts",
+        "scope-guardrail"
+      ],
+      "basis": "inferred",
+      "reasoning": "以 Persona 契約及 Deck 編譯來源將規則定義作閱讀分組，不宣稱物理部署或隔離邊界。",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/deck/compile.py",
+          "line": 483,
+          "end_line": 523,
+          "excerpt_sha256": "29943cec5fc9b5092279d3ff5a8655b04da7f4ad37ee1195aa310b74e2c7aca6",
+          "claim": "Deck 讀 persona catalog，逐 Card 保留角色、inputs/outputs 與 execution policy，編譯 WorkflowManifest。"
+        },
+        {
+          "path": "paulsha_cortex/persona/personas.yaml",
+          "line": 1,
+          "end_line": 37,
+          "excerpt_sha256": "3c6bd08915ba5648758f36c9d2b3d118194a4b27fd41d4d12233c04ae54a20d0",
+          "claim": "角色是 allowed_phases/write_paths/allowed_tools/skills 契約；四個角色的允許範圍。"
+        }
       ]
     }
   ],
-  "boundaries": [],
   "relations": [
     {
       "id": "candidate-to-gates",
       "from": "candidate-worktree",
       "to": "verification-gate",
-      "label": "提供 exact Candidate 與受測輸入",
+      "label": "exact HEAD",
       "variant": "default",
       "basis": "declared",
       "evidence": [
@@ -379,7 +408,7 @@
       "id": "completion-to-monitor",
       "from": "completion-record",
       "to": "monitor",
-      "label": "提供 strict closure 證據，允許 done 投影",
+      "label": "完成證據",
       "variant": "emphasis",
       "basis": "declared",
       "evidence": [
@@ -403,7 +432,7 @@
       "id": "control-to-manager",
       "from": "control-queue",
       "to": "manager",
-      "label": "送操作請求，不直接改 lifecycle",
+      "label": "操作請求",
       "variant": "emphasis",
       "basis": "declared",
       "evidence": [
@@ -420,7 +449,7 @@
       "id": "deck-to-manager",
       "from": "deck-compiler",
       "to": "manager",
-      "label": "提供已編譯的 persona-preserving WorkflowManifest",
+      "label": "流程定義",
       "variant": "emphasis",
       "basis": "declared",
       "evidence": [
@@ -437,7 +466,7 @@
       "id": "delivery-to-completion",
       "from": "delivery-closure",
       "to": "completion-record",
-      "label": "遠端閉環全成立後由 Manager 寫入",
+      "label": "完成後發證",
       "variant": "emphasis",
       "basis": "declared",
       "evidence": [
@@ -454,7 +483,7 @@
       "id": "delivery-to-work-sources",
       "from": "delivery-closure",
       "to": "work-sources",
-      "label": "更新 PR／merge；再重讀遠端 terminal facts",
+      "label": "merge / 重讀遠端",
       "variant": "default",
       "basis": "declared",
       "evidence": [
@@ -471,7 +500,7 @@
       "id": "executors-to-candidate",
       "from": "headless-executors",
       "to": "candidate-worktree",
-      "label": "Builder 實作、測試並提交 Candidate HEAD",
+      "label": "提交 HEAD",
       "variant": "default",
       "basis": "observed",
       "evidence": [
@@ -488,7 +517,7 @@
       "id": "executors-to-manager",
       "from": "headless-executors",
       "to": "manager",
-      "label": "交回 log／terminal payload／artifacts，等待驗證",
+      "label": "結果回傳",
       "variant": "default",
       "basis": "observed",
       "evidence": [
@@ -505,7 +534,7 @@
       "id": "gate-evidence-to-manager",
       "from": "gate-evidence",
       "to": "manager",
-      "label": "提供不同 gate 的 authorization evidence",
+      "label": "gate 證據",
       "variant": "default",
       "basis": "observed",
       "evidence": [
@@ -529,7 +558,7 @@
       "id": "gates-to-manager",
       "from": "verification-gate",
       "to": "manager",
-      "label": "回傳 gate／terminal consistency 結果",
+      "label": "驗證結果",
       "variant": "default",
       "basis": "observed",
       "evidence": [
@@ -546,7 +575,7 @@
       "id": "manager-to-delivery",
       "from": "manager",
       "to": "delivery-closure",
-      "label": "授權並執行 bounded current-HEAD ship",
+      "label": "交付授權",
       "variant": "emphasis",
       "basis": "declared",
       "evidence": [
@@ -563,7 +592,7 @@
       "id": "manager-to-executors",
       "from": "manager",
       "to": "headless-executors",
-      "label": "依當前 Step／Persona／Candidate 派出 Job",
+      "label": "派工 Job",
       "variant": "emphasis",
       "basis": "observed",
       "evidence": [
@@ -580,7 +609,7 @@
       "id": "manager-to-gate-evidence",
       "from": "manager",
       "to": "gate-evidence",
-      "label": "收斂及綁定 canonical evidence",
+      "label": "保存證據",
       "variant": "default",
       "basis": "observed",
       "evidence": [
@@ -597,7 +626,7 @@
       "id": "manager-to-planning",
       "from": "manager",
       "to": "planning-artifacts",
-      "label": "驗證並綁定 accepted artifact ref／hash",
+      "label": "綁定 ref / hash",
       "variant": "default",
       "basis": "declared",
       "evidence": [
@@ -614,7 +643,7 @@
       "id": "manager-to-workflow-registry",
       "from": "manager",
       "to": "workflow-registry",
-      "label": "建立 Run／更新 Step、attempt 與 evidence binding",
+      "label": "寫入進度",
       "variant": "emphasis",
       "basis": "declared",
       "evidence": [
@@ -631,7 +660,7 @@
       "id": "monitor-to-work-read-model",
       "from": "monitor",
       "to": "work-read-model",
-      "label": "聚合、保存 last-good 並投影四態",
+      "label": "保存投影",
       "variant": "emphasis",
       "basis": "declared",
       "evidence": [
@@ -648,7 +677,7 @@
       "id": "persona-to-deck",
       "from": "persona-contracts",
       "to": "deck-compiler",
-      "label": "提供角色契約，供 Card binding／phase 驗證",
+      "label": "角色約束",
       "variant": "default",
       "basis": "observed",
       "evidence": [
@@ -665,7 +694,7 @@
       "id": "persona-to-guardrail",
       "from": "persona-contracts",
       "to": "scope-guardrail",
-      "label": "提供 write_paths 與 allowed_tools",
+      "label": "權限規則",
       "variant": "default",
       "basis": "observed",
       "evidence": [
@@ -682,7 +711,7 @@
       "id": "planning-to-executors",
       "from": "planning-artifacts",
       "to": "headless-executors",
-      "label": "由 Manager 以固定 input snapshot 交付",
+      "label": "固定 inputs",
       "variant": "default",
       "basis": "declared",
       "evidence": [
@@ -699,7 +728,7 @@
       "id": "work-read-model-to-manager",
       "from": "work-read-model",
       "to": "manager",
-      "label": "提供 confirmed authority，通過 claim gate 才受理",
+      "label": "確定範圍",
       "variant": "default",
       "basis": "declared",
       "evidence": [
@@ -723,7 +752,7 @@
       "id": "work-sources-to-monitor",
       "from": "work-sources",
       "to": "monitor",
-      "label": "讀入 GitHub／repo source snapshots",
+      "label": "讀取來源",
       "variant": "default",
       "basis": "declared",
       "evidence": [
@@ -740,7 +769,7 @@
       "id": "workflow-to-monitor",
       "from": "workflow-registry",
       "to": "monitor",
-      "label": "提供 Run／Step 進度給唯讀 provider",
+      "label": "讀取進度",
       "variant": "default",
       "basis": "declared",
       "evidence": [
@@ -924,7 +953,9 @@
             "excerpt_sha256": "17868b0aa0449d62842ce312fd41b5c920e1ba110621e566885a228ddeb46f03",
             "claim": "Work 必須先為 confirmed todo 才能取得 claim/start；topic issue 不足。"
           }
-        ]
+        ],
+        "diagram_label": "Claim｜受理",
+        "diagram_summary": "manager · 受理 → Run"
       },
       {
         "id": "define",
@@ -985,7 +1016,9 @@
             "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
             "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
           }
-        ]
+        ],
+        "diagram_label": "Define｜需求",
+        "diagram_summary": "planner · spec / design"
       },
       {
         "id": "plan",
@@ -1043,7 +1076,9 @@
             "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
             "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
           }
-        ]
+        ],
+        "diagram_label": "Plan｜計畫",
+        "diagram_summary": "planner · plan / hash"
       },
       {
         "id": "build",
@@ -1108,7 +1143,9 @@
             "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
             "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
           }
-        ]
+        ],
+        "diagram_label": "Build｜實作",
+        "diagram_summary": "builder · RED → Commit"
       },
       {
         "id": "verify",
@@ -1169,7 +1206,9 @@
             "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
             "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
           }
-        ]
+        ],
+        "diagram_label": "Verify｜驗證",
+        "diagram_summary": "reviewer · exact HEAD"
       },
       {
         "id": "review",
@@ -1235,7 +1274,9 @@
             "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
             "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
           }
-        ]
+        ],
+        "diagram_label": "Review｜審查",
+        "diagram_summary": "reviewer · 異質審查"
       },
       {
         "id": "ship",
@@ -1299,7 +1340,9 @@
             "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
             "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
           }
-        ]
+        ],
+        "diagram_label": "Ship｜交付",
+        "diagram_summary": "manager · 遠端閉環"
       }
     ],
     "recoveries": [
@@ -1610,6 +1653,14 @@
             "claim": "WorkflowRun 保存 Manager-owned aggregate，包括 current_phase、steps、attempts、evidence 與 completion binding。"
           }
         ]
+      }
+    ],
+    "diagram_recoveries": [
+      {
+        "recovery": "candidate-repair",
+        "from": "review",
+        "to": "build",
+        "label": "Manager：符合 CAS 才 retry-build；新 HEAD 重做驗證／審查"
       }
     ]
   }

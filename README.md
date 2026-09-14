@@ -819,3 +819,9 @@ export PSC_DIGEST_DELIVERY_CMD='/path/to/relay-script --channel ops'
 ## Version
 
 套件版本以 repo 根目錄 `VERSION` 為單一真相源；bootstrap 期間維持 `0.0.0`，待後續 feature batch 合併後再依 flat profile 做 patch/minor bump。
+
+### 原生架構圖驗收
+
+架構圖使用原版 Archify 的 SVG 節點與方向箭頭，不再以 workflow-review 說明頁代替。Cortex 的七階段是同一 WorkflowRun 的展開，不是七個服務；主要 Candidate 修正回路維持 Manager／CAS 條件。標籤使用繁體中文，固定 Viewer UI 回退為英文。
+
+[開啟架構與工作流程 HTML](docs/architecture/architecture.html)；直接以瀏覽器開啟本機檔案。完整角色、gate、恢復契約及部署 unknown 保留在 facts.json；本圖不宣稱 runtime E2E 已通過。
