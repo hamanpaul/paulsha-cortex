@@ -7,7 +7,11 @@
 
 ## [Unreleased]
 
-- **AGY reviewer JSON schema 修正（#880）**：reviewer lane 依 verification／review terminal kind 綁定與 Claude 共用的 `--json-schema`；Manager 對非空 verification `details` 字串做 `{"text": ...}` 相容正規化，空字串仍 fail closed。
+- **#831 stability-risk-v2**：修正 planning sizing 的 `spec_stability` 方向；完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind／blocking marker／未 accepted artifact 為 2，並以保守 2 處理 unknown 或不一致 report。其他 sizing 維度、band 門檻、fail-soft 邊界與歷史資料不變；補齊隔離 history/evidence reload、完整 `WorkflowRun` baseline（含 legacy sizing 欄位缺席語意）與真實 frozen-plan bytes/SHA fixture，以及 current snapshot score+band matrix 回歸覆蓋，不新增 schema 或 migration。
+
+- **Recovery registry 子計畫進件（#862）**：納入 #497 的 registry-only A，保留
+  exact CAS／ABA revision、prepared/complete、atomic receipt 與顯式 legacy checkpoint
+  九組不變量。只有 accepted 規劃，現行 8/Red 不派工；公開 recovery／父項仍未完成。
 
 - **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
   子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。

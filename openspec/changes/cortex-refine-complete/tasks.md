@@ -8,12 +8,15 @@
 ## 2. B1 執行基礎
 
 - [ ] 2.0 補 #830 非 Job 決策回覆與 #831 sizing stability 方向；保留合理單模組 sizing 及所有 gate；#833 獨立交付 Red planner 分解接線。
+- [x] 2.0.RED #831 依 accepted `sizing-stability-direction` plan 新增 stability-risk-v2 的 RED regression tests；保留現行 production 算法與其餘 2.0 交付未完成。
+- [x] 2.0.GREEN #831 依 accepted plan 完成 stability-risk-v2 純函式映射、受影響 sizing wiring oracle、文件與 changelog，並通過 full pytest；#830、#833、獨立 review、CI／installed runtime 交付仍未完成。
 - [ ] 2.1 透過 Cortex 完成 #822 argv/YAML canary，取得 RED/GREEN、review、policy 與 terminal delivery 證據。
 - [ ] 2.2 完成 #827 有界 refresh/coalesce、slow-provider 公平與 stop/diagnostics。
 - [ ] 2.2.1 先依 #853 交付 watcher-only A child 的固定 worker、raw0、generation/共享 backend、partial-scan latch 與 nonfollow VFS；現行8/Red不可派，#831 loaded 後重評。B work-model 與 C service 的 provider 公平、durable publication fence、整體 drain 仍需各自交付，不以 A 關閉母票。
 - [ ] 2.3 完成 #819 not-idle clock、periodic 有效 max_load/require_idle 與非法值處置。
 - [ ] 2.4 依 accepted 三件組完成 #496 內容/狀態冪等，驗同 path 內容改變仍恰好記錄；保留現行 7/Red，#831 後真重評。
 - [ ] 2.5 依 accepted 三件組分拆並完成 #497 原子解除綁定、持久 supersession 與 restart/late-terminal 回歸；#831 後仍預計 Red，#501 只核對已修及殘餘污染。
+- [ ] 2.5.1 先依 #862 交付 registry-only A 的九組 receipt/disposition/revision/checkpoint 不變量；accepted 現行8/Red不派工，#831實際loaded後重評。C→B→D2、D1→D2仍需獨立交付，A完成不得關閉#497；own OpenSpec需run前完成唯一owner/發布/binding，archive只收自身。
 - [ ] 2.6 依 accepted 三件組完成 #821 no-op persistence、history retention、writer/fault/rollback 相容與安全暫存清理；完整 archive 缺口/截斷前備份保持列管。
 - [ ] 2.7 完成 #823/#824 session 與 AGY timeout 合約，明示 cgroup restart survival 的獨立驗收。
 - [ ] 2.7.1 先依 #851 補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。
