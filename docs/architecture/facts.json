@@ -1,0 +1,276 @@
+{
+  "schema_version": 1,
+  "document_type": "architecture-facts",
+  "repository": {
+    "url": "https://github.com/hamanpaul/paulsha-cortex",
+    "revision": "739cde17b5b891bcdd575cb98ea07280f428ebaf"
+  },
+  "scope": {
+    "name": "Cortex SDLC lifecycle control plane",
+    "includes": [
+      "跨 GitHub/repo artifacts 的 WorkItem/WorkSource read model",
+      "Manager single-writer lifecycle authority 與 WorkflowRun/WorkflowStep registry",
+      "Deck persona-preserving workflow、typed gate evidence 與 headless executors",
+      "current-HEAD delivery、remote closure 與 CompletionRecord"
+    ],
+    "excludes": [
+      "installer/systemd trust-root provisioning 細節",
+      "model calibration、resource envelope 與近期 refine proposals",
+      "CLI packaging/release 流程、tests 與 archived OpenSpec history"
+    ]
+  },
+  "components": [
+    {
+      "id": "work-sources",
+      "label": "Work Sources",
+      "type": "external",
+      "responsibility": "提供 GitHub issue/PR、Todo、Superpowers、OpenSpec、WorkflowRun 與 CompletionRecord 等可被聚合的工作來源。",
+      "sublabel": "repo + GitHub authorities",
+      "basis": "observed",
+      "evidence": [{
+        "path": "paulsha_cortex/monitor/work_models.py",
+        "line": 10,
+        "end_line": 24,
+        "excerpt_sha256": "18f8e6ff83c8baac407d5d206b016055c518c28caa08860f0dcc0e67e33676e3",
+        "claim": "WorkSource kind 明確列出 GitHub、repo artifact、workflow 與 completion record 來源，並區分 confirmed/inferred confidence。"
+      }]
+    },
+    {
+      "id": "monitor",
+      "label": "Monitor",
+      "type": "backend",
+      "responsibility": "聚合 provider last-good snapshots，建立可解釋的 WorkItem/WorkSource read model；provider 失敗時保留 prior truth 並標 degraded。",
+      "sublabel": "read model only",
+      "basis": "declared",
+      "evidence": [{
+        "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+        "line": 20,
+        "end_line": 28,
+        "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+        "claim": "Accepted ADR 定義 Monitor last-good 聚合、degraded freeze、WorkItem/WorkSource snapshot 與 Manager mutation authority。"
+      }]
+    },
+    {
+      "id": "work-read-model",
+      "label": "WorkItem Read Model",
+      "type": "database",
+      "responsibility": "將 work_id、四態 lifecycle、phase、facets、sources、next actions 與 WorkflowRun 關聯投影成 versioned read-side fact。",
+      "sublabel": "topic → todo → on-going → done",
+      "basis": "observed",
+      "evidence": [{
+        "path": "paulsha_cortex/monitor/work_models.py",
+        "line": 183,
+        "end_line": 219,
+        "excerpt_sha256": "d01d1ef2c88d6d6cfd8caa7715e6467d15a85140156809c00ed1349cc4de2846",
+        "claim": "WorkItem dataclass 固定保存 state/phase/facets/sources/next_actions/workflow_run_id，且 state 必須落在 versioned work states。"
+      }]
+    },
+    {
+      "id": "deck-compiler",
+      "label": "Deck Compiler",
+      "type": "backend",
+      "responsibility": "把 combo/card 的 persona binding 投影為完整 Claim→Define→Plan→Build→Verify→Review→Ship workflow manifest。",
+      "sublabel": "persona-preserving manifest",
+      "basis": "observed",
+      "evidence": [{
+        "path": "paulsha_cortex/coordinator/workflow.py",
+        "line": 306,
+        "end_line": 352,
+        "excerpt_sha256": "62f2d7d476555a26379c211100ed2bd82dd83211691fb10593c0bffb71e5b5d3",
+        "claim": "WorkflowManifest 驗證完整 phase spine 與每個 phase 的 manager/planner/builder/reviewer persona binding。"
+      }]
+    },
+    {
+      "id": "manager",
+      "label": "Manager",
+      "type": "backend",
+      "responsibility": "作為 lifecycle control plane 的唯一 writer，持有 claim、WorkflowRun/Step、GitHub mutation、merge 與 CompletionRecord authority。",
+      "sublabel": "single writer",
+      "basis": "declared",
+      "evidence": [{
+        "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+        "line": 14,
+        "end_line": 14,
+        "excerpt_sha256": "05551f17d5462ebca59470f2b9ecb56a7747bf99301de5622b1e8d5c90b599ca",
+        "claim": "Accepted ADR 明示 Monitor 是 read model、Manager 是唯一 writer，且模糊關聯不得授權 mutation。"
+      }]
+    },
+    {
+      "id": "workflow-registry",
+      "label": "Workflow Registry",
+      "type": "database",
+      "responsibility": "持久化 Manager-owned WorkflowRun aggregate，包括 work/repo/claim、phase/steps、refs、attempts、gate evidence、candidate/verified heads 與 completion binding。",
+      "sublabel": "coordinator registry v2",
+      "basis": "observed",
+      "evidence": [{
+        "path": "paulsha_cortex/coordinator/workflow.py",
+        "line": 379,
+        "end_line": 407,
+        "excerpt_sha256": "fdee56476b52a0f5198fa3fa29d5b22bee5eb824a06b4d356ad448267d40fb08",
+        "claim": "WorkflowRun 是 Manager-owned persistent aggregate，綁定來源 authority、phase、steps、issue/OpenSpec/PR refs 與 gate evidence。"
+      }]
+    },
+    {
+      "id": "headless-executors",
+      "label": "Headless Executors",
+      "type": "external",
+      "responsibility": "執行被 persona/model/domain policy 選中的工作，回傳 artifacts/evidence；不持有 lifecycle truth。",
+      "sublabel": "copilot / claude / codex",
+      "basis": "declared",
+      "evidence": [{
+        "path": "README.md",
+        "line": 24,
+        "end_line": 26,
+        "excerpt_sha256": "0cc801dd9838cb8b4d35f53367f8571ea100579aeff98059611bf4a452b93be1",
+        "claim": "README 將 copilot、claude、codex 定義為需預先安裝登入的 headless executor CLI。"
+      }]
+    },
+    {
+      "id": "gate-evidence",
+      "label": "Gate Evidence",
+      "type": "database",
+      "responsibility": "以 typed immutable refs 保存 brainstorm、foreign review 與 delivery review 的獨立 gate 證據。",
+      "sublabel": "typed immutable refs",
+      "basis": "observed",
+      "evidence": [{
+        "path": "paulsha_cortex/coordinator/workflow.py",
+        "line": 274,
+        "end_line": 303,
+        "excerpt_sha256": "f30cd7bd3c773a018b355de34fcb5029a67e37e23cb7c9499d7b3a755bd74bb3",
+        "claim": "GateEvidenceRef 是 typed immutable locator，限定 brainstorm/foreign-review/copilot/maintainer-review 並可綁 SHA-256。"
+      }]
+    },
+    {
+      "id": "delivery-closure",
+      "label": "Delivery / Closure",
+      "type": "backend",
+      "responsibility": "由 Manager 對 exact current HEAD 執行 archive、policy/preflight/checks/review/thread/HEAD-race/merge，並在 merge 後驗證 remote terminal closure。",
+      "sublabel": "bounded current-HEAD ship",
+      "basis": "declared",
+      "evidence": [{
+        "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+        "line": 46,
+        "end_line": 50,
+        "excerpt_sha256": "2c5761bbed3079de9b9753059ec4a052104098b0b0d692fe3c09ba5dcdb95a52",
+        "claim": "Accepted ADR 要求 deterministic verification、foreign exact-HEAD review、preflight/checks、final HEAD race check、merge 與 remote closure。"
+      }]
+    },
+    {
+      "id": "completion-record",
+      "label": "CompletionRecord",
+      "type": "database",
+      "responsibility": "只在 merge ancestry、issues、remote OpenSpec archive、Todo 與相關 terminal facts 全成立後寫入，作為 done projection 的完成證據。",
+      "sublabel": "remote terminal fact",
+      "basis": "declared",
+      "evidence": [{
+        "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+        "line": 46,
+        "end_line": 50,
+        "excerpt_sha256": "2c5761bbed3079de9b9753059ec4a052104098b0b0d692fe3c09ba5dcdb95a52",
+        "claim": "Merge 後必須驗證 default-branch terminal facts，之後才寫 CompletionRecord；全部成立才投影 done。"
+      }]
+    }
+  ],
+  "boundaries": [],
+  "relations": [
+    {
+      "id": "work-sources-to-monitor",
+      "from": "work-sources",
+      "to": "monitor",
+      "label": "provider snapshots",
+      "variant": "emphasis",
+      "basis": "observed",
+      "evidence": [{"path":"paulsha_cortex/monitor/work_models.py","line":10,"end_line":24,"excerpt_sha256":"18f8e6ff83c8baac407d5d206b016055c518c28caa08860f0dcc0e67e33676e3","claim":"Monitor source model enumerates GitHub/repo/workflow/completion sources."}]
+    },
+    {
+      "id": "monitor-to-work-read-model",
+      "from": "monitor",
+      "to": "work-read-model",
+      "label": "last-good projection",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":20,"end_line":28,"excerpt_sha256":"9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9","claim":"Monitor creates the WorkItem/WorkSource read model from provider snapshots and freezes prior projection on degradation."}]
+    },
+    {
+      "id": "work-read-model-to-manager",
+      "from": "work-read-model",
+      "to": "manager",
+      "label": "confirmed authority / claim input",
+      "variant": "dashed",
+      "basis": "declared",
+      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":32,"end_line":40,"excerpt_sha256":"6932289e76f62dadd768292e071959f7ff8234bcc9b89ff1366e616d4ad58ed1","claim":"Only explicitly confirmed associations can establish mutation authority; heuristics remain display-only."}]
+    },
+    {
+      "id": "deck-to-manager",
+      "from": "deck-compiler",
+      "to": "manager",
+      "label": "validated workflow manifest",
+      "variant": "emphasis",
+      "basis": "observed",
+      "evidence": [{"path":"paulsha_cortex/coordinator/workflow.py","line":306,"end_line":352,"excerpt_sha256":"62f2d7d476555a26379c211100ed2bd82dd83211691fb10593c0bffb71e5b5d3","claim":"Manager spine validation requires all phases and phase-specific personas."}]
+    },
+    {
+      "id": "manager-to-workflow-registry",
+      "from": "manager",
+      "to": "workflow-registry",
+      "label": "single-writer lifecycle mutations",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":20,"end_line":28,"excerpt_sha256":"9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9","claim":"Manager is the only writer for WorkflowRun/Step and related lifecycle mutations."}]
+    },
+    {
+      "id": "workflow-to-executors",
+      "from": "workflow-registry",
+      "to": "headless-executors",
+      "label": "persona/model scoped dispatch",
+      "variant": "dashed",
+      "basis": "declared",
+      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":32,"end_line":40,"excerpt_sha256":"6932289e76f62dadd768292e071959f7ff8234bcc9b89ff1366e616d4ad58ed1","claim":"Workflow preserves persona binding and domain separation; heterogeneous executor identities are selected under that policy."}]
+    },
+    {
+      "id": "executors-to-gate-evidence",
+      "from": "headless-executors",
+      "to": "gate-evidence",
+      "label": "artifacts + independent verdicts",
+      "basis": "inferred",
+      "reasoning": "Executors perform persona-scoped work while GateEvidenceRef persists the independent workflow gate locators; the architectural relation is the evidence handoff, not lifecycle ownership.",
+      "evidence": [{"path":"paulsha_cortex/coordinator/workflow.py","line":274,"end_line":303,"excerpt_sha256":"f30cd7bd3c773a018b355de34fcb5029a67e37e23cb7c9499d7b3a755bd74bb3","claim":"Independent workflow gate results are persisted as typed immutable evidence refs."}]
+    },
+    {
+      "id": "gate-evidence-to-manager",
+      "from": "gate-evidence",
+      "to": "manager",
+      "label": "authorization evidence",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [{"path":"paulsha_cortex/coordinator/workflow.py","line":379,"end_line":407,"excerpt_sha256":"fdee56476b52a0f5198fa3fa29d5b22bee5eb824a06b4d356ad448267d40fb08","claim":"WorkflowRun persists gate_refs alongside lifecycle state under Manager ownership."}]
+    },
+    {
+      "id": "manager-to-delivery",
+      "from": "manager",
+      "to": "delivery-closure",
+      "label": "ship authorization",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":46,"end_line":50,"excerpt_sha256":"2c5761bbed3079de9b9753059ec4a052104098b0b0d692fe3c09ba5dcdb95a52","claim":"Ship is performed by Manager and is bounded by current-HEAD policy, checks, review, thread and race gates."}]
+    },
+    {
+      "id": "delivery-to-completion",
+      "from": "delivery-closure",
+      "to": "completion-record",
+      "label": "remote terminal closure",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":46,"end_line":50,"excerpt_sha256":"2c5761bbed3079de9b9753059ec4a052104098b0b0d692fe3c09ba5dcdb95a52","claim":"CompletionRecord is written only after merge and remote terminal facts are verified."}]
+    },
+    {
+      "id": "completion-to-monitor",
+      "from": "completion-record",
+      "to": "monitor",
+      "label": "strict closure → done",
+      "variant": "dashed",
+      "basis": "declared",
+      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":20,"end_line":28,"excerpt_sha256":"9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9","claim":"Lifecycle reducer projects done only after strict closure; otherwise prior/provider facts determine the projection."}]
+    }
+  ]
+}
