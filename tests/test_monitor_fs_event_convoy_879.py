@@ -28,6 +28,7 @@ class _FakeStore:
         self._lock = threading.Lock()
         self.full_refresh_calls = 0
         self.project_refresh_calls = 0
+        self.project_refresh_ids: list[str] = []
         self.refresh_done = threading.Event()
 
     def load(self) -> tuple[()]:
@@ -41,9 +42,10 @@ class _FakeStore:
             self.full_refresh_calls += 1
         return ()
 
-    def refresh_project(self, _project_id: str) -> None:
+    def refresh_project(self, project_id: str) -> None:
         with self._lock:
             self.project_refresh_calls += 1
+            self.project_refresh_ids.append(project_id)
         self.refresh_done.set()
         return None
 
@@ -68,8 +70,12 @@ class _FakeServer:
 
 
 class _FakeWorkRefresher:
+    def __init__(self) -> None:
+        self.refresh_calls = 0
+
     def refresh(self, _snapshot, *, include_github: bool):
         del include_github
+        self.refresh_calls += 1
         return ()
 
 
@@ -185,3 +191,52 @@ def test_workspace_event_preserves_full_refresh_semantics(tmp_path: Path) -> Non
 
     assert store.full_refresh_calls == 1
     assert store.project_refresh_calls == 0
+
+
+def test_one_refresh_round_refreshes_three_projects_and_work_model_once(
+    tmp_path: Path,
+) -> None:
+    service, store, _server, _workspace, _project = _make_service(tmp_path)
+    work_refresher = service._work_refresher
+    service._pending_refreshes = {
+        "project-a": 0.0,
+        "project-b": 0.0,
+        "project-c": 0.0,
+    }
+
+    with mock.patch(
+        "paulsha_cortex.monitor.service.time.monotonic",
+        return_value=1.0,
+    ):
+        has_work, full_refresh, project_ids = service._next_refresh()
+
+    assert has_work is True
+    assert full_refresh is False
+    assert project_ids == ("project-a", "project-b", "project-c")
+    assert service._pending_refreshes == {}
+
+    service._run_refresh_round(full_refresh=full_refresh, project_ids=project_ids)
+
+    assert store.project_refresh_ids == ["project-a", "project-b", "project-c"]
+    assert work_refresher.refresh_calls == 1
+
+
+def test_thread_count_warning_is_throttled_for_sixty_seconds(tmp_path: Path) -> None:
+    service, _store, _server, _workspace, _project = _make_service(tmp_path)
+    clock = iter((0.0, 30.0, 61.0))
+    with (
+        mock.patch(
+            "paulsha_cortex.monitor.service.threading.active_count",
+            return_value=999,
+        ),
+        mock.patch(
+            "paulsha_cortex.monitor.service.time.monotonic",
+            side_effect=clock,
+        ),
+        mock.patch("paulsha_cortex.monitor.service.logger.warning") as warning,
+    ):
+        service._warn_if_thread_count_high()
+        service._warn_if_thread_count_high()
+        service._warn_if_thread_count_high()
+
+    assert warning.call_count == 2

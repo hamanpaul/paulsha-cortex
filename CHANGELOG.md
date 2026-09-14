@@ -8,10 +8,10 @@
 ## [Unreleased]
 
 - **#879 monitor 檔案事件 convoy 修正**：project filesystem event 改由單一 refresh
-  worker 以每 project 一份 pending 標記合併 debounce，事件 callback 不再建立無界
-  `Timer` 執行緒；新增 `monitor.thread_count_warn_threshold`（預設 `200`）只發出
-  thread count 警告，並保留 workspace event 的全量 refresh 語意與 stop 後 late event
-  拒收。
+  worker 以每 project 一份 pending 標記合併 debounce，同輪只做一次 watch/work-model
+  publication，事件 callback 不再建立無界 `Timer` 執行緒；新增
+  `monitor.thread_count_warn_threshold`（預設 `200`），thread count 警告以 60 秒節流，
+  並保留 workspace event 的全量 refresh 語意與 stop 後 late event 拒收。
 
 - **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
   子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。

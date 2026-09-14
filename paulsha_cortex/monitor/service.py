@@ -68,7 +68,7 @@ class ProjectMonitorService:
         self._refresh_condition = threading.Condition()
         self._refresh_thread: threading.Thread | None = None
         self._pending_refreshes: dict[str | None, float] = {}
-        self._thread_count_warning_emitted = False
+        self._last_thread_count_warning_at: float | None = None
         self._watch_state_lock = threading.RLock()
         self._project_roots: dict[str, Path] = {}
         self._watched_paths: set[tuple[Path, bool]] = set()
@@ -144,67 +144,71 @@ class ProjectMonitorService:
 
     def _refresh_loop(self) -> None:
         while True:
-            has_work, refresh_key = self._next_refresh()
+            has_work, full_refresh, project_ids = self._next_refresh()
             if not has_work:
                 return
-            if refresh_key is None:
-                self._run_full_refresh()
-            else:
-                self._run_project_refresh(refresh_key)
+            self._run_refresh_round(
+                full_refresh=full_refresh,
+                project_ids=project_ids,
+            )
 
-    def _next_refresh(self) -> tuple[bool, str | None]:
+    def _next_refresh(self) -> tuple[bool, bool, tuple[str, ...]]:
         debounce_seconds = max(0.0, self._config.watch_debounce_ms / 1000.0)
         with self._refresh_condition:
             while True:
                 if self._stop_event.is_set():
-                    return False, None
+                    return False, False, ()
                 if not self._pending_refreshes:
                     self._refresh_condition.wait()
                     continue
 
-                refresh_key, pending_since = min(
-                    self._pending_refreshes.items(),
-                    key=lambda item: item[1],
-                )
+                pending_since = min(self._pending_refreshes.values())
                 remaining = debounce_seconds - (time.monotonic() - pending_since)
                 if remaining > 0:
                     self._refresh_condition.wait(timeout=remaining)
                     continue
-                del self._pending_refreshes[refresh_key]
-                return True, refresh_key
 
-    def _run_full_refresh(self) -> None:
-        if self._stop_event.is_set():
-            return
-        try:
-            events = self._store.refresh()
-        except Exception as exc:
-            logger.warning("monitor full refresh failed: %s", exc, exc_info=True)
-            return
-        if self._stop_event.is_set():
-            return
-        self._publish_refresh(events)
+                pending_keys = tuple(self._pending_refreshes)
+                self._pending_refreshes.clear()
+                return (
+                    True,
+                    None in pending_keys,
+                    tuple(key for key in pending_keys if key is not None),
+                )
 
-    def _run_project_refresh(self, project_id: str) -> None:
+    def _run_refresh_round(
+        self,
+        *,
+        full_refresh: bool,
+        project_ids: tuple[str, ...],
+    ) -> None:
         if self._stop_event.is_set():
             return
-        try:
-            event = self._store.refresh_project(project_id)
-        except Exception as exc:
-            logger.warning(
-                "monitor project refresh failed for %s: %s",
-                project_id,
-                exc,
-                exc_info=True,
-            )
-            return
+        events: list[ChangeEvent] = []
+        if full_refresh:
+            try:
+                events.extend(self._store.refresh())
+            except Exception as exc:
+                logger.warning("monitor full refresh failed: %s", exc, exc_info=True)
+        else:
+            for project_id in project_ids:
+                if self._stop_event.is_set():
+                    return
+                try:
+                    event = self._store.refresh_project(project_id)
+                except Exception as exc:
+                    logger.warning(
+                        "monitor project refresh failed for %s: %s",
+                        project_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    continue
+                if event is not None:
+                    events.append(event)
         if self._stop_event.is_set():
             return
-        self._sync_project_roots()
-        self._install_watches()
-        if event is not None:
-            self._server.publish_events((event,))
-        self._refresh_work_model(include_github=False)
+        self._publish_refresh(tuple(events))
 
     def _poll_loop(self) -> None:
         interval = max(0.1, float(self._config.poll_interval_seconds))
@@ -418,13 +422,14 @@ class ProjectMonitorService:
     def _warn_if_thread_count_high(self) -> None:
         count = threading.active_count()
         threshold = self._config.thread_count_warn_threshold
+        if count <= threshold:
+            return
+        now = time.monotonic()
         with self._refresh_condition:
-            if count <= threshold:
-                self._thread_count_warning_emitted = False
+            last_warning_at = self._last_thread_count_warning_at
+            if last_warning_at is not None and now - last_warning_at < 60.0:
                 return
-            if self._thread_count_warning_emitted:
-                return
-            self._thread_count_warning_emitted = True
+            self._last_thread_count_warning_at = now
         logger.warning(
             "monitor thread count %d exceeds warning threshold %d; "
             "refresh scheduling remains bounded",
