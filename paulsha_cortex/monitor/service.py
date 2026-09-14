@@ -4,6 +4,7 @@ import logging
 import os
 import stat
 import threading
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -64,8 +65,10 @@ class ProjectMonitorService:
         self._poll_thread: threading.Thread | None = None
         self._rescan_thread: threading.Thread | None = None
         self._github_thread: threading.Thread | None = None
-        self._debounce_lock = threading.Lock()
-        self._debounce_timers: dict[str, threading.Timer] = {}
+        self._refresh_condition = threading.Condition()
+        self._refresh_thread: threading.Thread | None = None
+        self._pending_refreshes: dict[str | None, float] = {}
+        self._thread_count_warning_emitted = False
         self._watch_state_lock = threading.RLock()
         self._project_roots: dict[str, Path] = {}
         self._watched_paths: set[tuple[Path, bool]] = set()
@@ -84,6 +87,7 @@ class ProjectMonitorService:
         self._refresh_work_model(include_github=False)
         self._sync_project_roots()
         self._install_watches()
+        self._start_refresh_thread()
         self._start_poll_thread()
         self._start_rescan_thread()
         self._start_github_thread()
@@ -94,9 +98,12 @@ class ProjectMonitorService:
 
     def stop(self) -> None:
         self._stop_event.set()
-        self._cancel_debounce_timers()
+        with self._refresh_condition:
+            self._pending_refreshes.clear()
+            self._refresh_condition.notify_all()
         self._watcher.stop()
         self._server.stop()
+        self._join_refresh_thread()
 
     def _prepare_run_dir(self) -> None:
         run_dir = self._config.socket_path.parent
@@ -122,6 +129,82 @@ class ProjectMonitorService:
             target=self._github_refresh_loop, daemon=True
         )
         self._github_thread.start()
+
+    def _start_refresh_thread(self) -> None:
+        with self._refresh_condition:
+            if self._refresh_thread is not None or self._stop_event.is_set():
+                return
+            self._refresh_thread = threading.Thread(
+                target=self._refresh_loop,
+                name="cortex-monitor-refresh",
+                daemon=True,
+            )
+            self._refresh_thread.start()
+        self._warn_if_thread_count_high()
+
+    def _refresh_loop(self) -> None:
+        while True:
+            has_work, refresh_key = self._next_refresh()
+            if not has_work:
+                return
+            if refresh_key is None:
+                self._run_full_refresh()
+            else:
+                self._run_project_refresh(refresh_key)
+
+    def _next_refresh(self) -> tuple[bool, str | None]:
+        debounce_seconds = max(0.0, self._config.watch_debounce_ms / 1000.0)
+        with self._refresh_condition:
+            while True:
+                if self._stop_event.is_set():
+                    return False, None
+                if not self._pending_refreshes:
+                    self._refresh_condition.wait()
+                    continue
+
+                refresh_key, pending_since = min(
+                    self._pending_refreshes.items(),
+                    key=lambda item: item[1],
+                )
+                remaining = debounce_seconds - (time.monotonic() - pending_since)
+                if remaining > 0:
+                    self._refresh_condition.wait(timeout=remaining)
+                    continue
+                del self._pending_refreshes[refresh_key]
+                return True, refresh_key
+
+    def _run_full_refresh(self) -> None:
+        if self._stop_event.is_set():
+            return
+        try:
+            events = self._store.refresh()
+        except Exception as exc:
+            logger.warning("monitor full refresh failed: %s", exc, exc_info=True)
+            return
+        if self._stop_event.is_set():
+            return
+        self._publish_refresh(events)
+
+    def _run_project_refresh(self, project_id: str) -> None:
+        if self._stop_event.is_set():
+            return
+        try:
+            event = self._store.refresh_project(project_id)
+        except Exception as exc:
+            logger.warning(
+                "monitor project refresh failed for %s: %s",
+                project_id,
+                exc,
+                exc_info=True,
+            )
+            return
+        if self._stop_event.is_set():
+            return
+        self._sync_project_roots()
+        self._install_watches()
+        if event is not None:
+            self._server.publish_events((event,))
+        self._refresh_work_model(include_github=False)
 
     def _poll_loop(self) -> None:
         interval = max(0.1, float(self._config.poll_interval_seconds))
@@ -278,9 +361,11 @@ class ProjectMonitorService:
         return resolved, None
 
     def _handle_fs_event(self, path: Path) -> None:
+        if self._stop_event.is_set():
+            return
         project_id = self._project_id_for_path(Path(path))
         if project_id is None:
-            self._publish_refresh(self._store.refresh())
+            self._queue_or_refresh_full()
             return
         with self._watch_state_lock:
             project_root = self._project_roots.get(project_id)
@@ -296,9 +381,9 @@ class ProjectMonitorService:
         ):
             # The workspace parent is still readable, so a full scan can
             # authoritatively distinguish deletion from an unavailable root.
-            self._publish_refresh(self._store.refresh())
+            self._queue_or_refresh_full()
             return
-        self._schedule_project_refresh(project_id)
+        self._mark_refresh(project_id)
 
     def _project_id_for_path(self, path: Path) -> str | None:
         best_match: tuple[str, int] | None = None
@@ -314,32 +399,38 @@ class ProjectMonitorService:
                 best_match = (project_id, root_depth)
         return best_match[0] if best_match is not None else None
 
-    def _schedule_project_refresh(self, project_id: str) -> None:
-        delay_seconds = max(0.0, self._config.watch_debounce_ms / 1000.0)
-        with self._debounce_lock:
-            previous = self._debounce_timers.get(project_id)
-            if previous is not None:
-                previous.cancel()
-            timer = threading.Timer(
-                delay_seconds,
-                self._flush_project_refresh,
-                args=(project_id,),
-            )
-            timer.daemon = True
-            self._debounce_timers[project_id] = timer
-            timer.start()
-
-    def _flush_project_refresh(self, project_id: str) -> None:
-        with self._debounce_lock:
-            self._debounce_timers.pop(project_id, None)
-        if self._stop_event.is_set():
+    def _queue_or_refresh_full(self) -> None:
+        refresh_thread = self._refresh_thread
+        if refresh_thread is not None and refresh_thread.is_alive():
+            self._mark_refresh(None)
             return
-        event = self._store.refresh_project(project_id)
-        self._sync_project_roots()
-        self._install_watches()
-        if event is not None:
-            self._server.publish_events((event,))
-        self._refresh_work_model(include_github=False)
+        if not self._stop_event.is_set():
+            self._publish_refresh(self._store.refresh())
+
+    def _mark_refresh(self, project_id: str | None) -> None:
+        self._warn_if_thread_count_high()
+        with self._refresh_condition:
+            if self._stop_event.is_set():
+                return
+            self._pending_refreshes.setdefault(project_id, time.monotonic())
+            self._refresh_condition.notify()
+
+    def _warn_if_thread_count_high(self) -> None:
+        count = threading.active_count()
+        threshold = self._config.thread_count_warn_threshold
+        with self._refresh_condition:
+            if count <= threshold:
+                self._thread_count_warning_emitted = False
+                return
+            if self._thread_count_warning_emitted:
+                return
+            self._thread_count_warning_emitted = True
+        logger.warning(
+            "monitor thread count %d exceeds warning threshold %d; "
+            "refresh scheduling remains bounded",
+            count,
+            threshold,
+        )
 
     def _publish_refresh(self, events: tuple[ChangeEvent, ...]) -> None:
         self._sync_project_roots()
@@ -365,18 +456,17 @@ class ProjectMonitorService:
         if events:
             self._server.publish_work_events(events)
 
-    def _cancel_debounce_timers(self) -> None:
-        with self._debounce_lock:
-            timers = tuple(self._debounce_timers.values())
-            self._debounce_timers.clear()
-        for timer in timers:
-            timer.cancel()
+    def _join_refresh_thread(self) -> None:
+        refresh_thread = self._refresh_thread
+        if (
+            refresh_thread is not None
+            and refresh_thread.is_alive()
+            and threading.current_thread() is not refresh_thread
+        ):
+            refresh_thread.join(timeout=2.0)
 
     def _shutdown(self) -> None:
-        self._stop_event.set()
-        self._cancel_debounce_timers()
-        self._watcher.stop()
-        self._server.stop()
+        self.stop()
         if (
             self._poll_thread is not None
             and self._poll_thread.is_alive()

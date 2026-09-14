@@ -53,6 +53,7 @@ class MonitorConfig:
     poll_interval_seconds: int = 60
     rescan_interval_seconds: int = 300
     watch_debounce_ms: int = 500
+    thread_count_warn_threshold: int = 200
     github_refresh_interval_seconds: int = 300
     provider_stale_after_seconds: int = 900
     legacy_policy: str = "list-only"
@@ -173,6 +174,7 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
         ("poll_interval_seconds", 60),
         ("rescan_interval_seconds", 300),
         ("watch_debounce_ms", 500),
+        ("thread_count_warn_threshold", 200),
         ("github_refresh_interval_seconds", 300),
         ("provider_stale_after_seconds", 900),
         # #506：節流預算與退避參數。
@@ -216,6 +218,7 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
         poll_interval_seconds=poll_interval,
         rescan_interval_seconds=rescan_interval,
         watch_debounce_ms=debounce,
+        thread_count_warn_threshold=intervals["thread_count_warn_threshold"],
         github_refresh_interval_seconds=intervals["github_refresh_interval_seconds"],
         provider_stale_after_seconds=intervals["provider_stale_after_seconds"],
         legacy_policy=legacy_policy,
