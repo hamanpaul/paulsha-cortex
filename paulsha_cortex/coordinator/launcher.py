@@ -1175,6 +1175,58 @@ def _codex_sandbox_mode(
     return mode
 
 
+
+def _gemini_compatible_schema(node: object) -> object:
+    """Rewrite a JSON schema into the subset Gemini structured output accepts (#888).
+
+    Antigravity forwards ``--json-schema`` as a Gemini function declaration.
+    Gemini's Schema subset only accepts **string** enum members and a single
+    ``type``; ``{"type": "integer", "enum": [1]}`` is serialised as an empty
+    string and rejected with ``INVALID_ARGUMENT … enum[0]: cannot be empty``,
+    and ``"type": ["integer", "null"]`` is not a valid type either.  Both
+    shapes are rewritten to the equivalent constraints Gemini understands:
+    a single-valued numeric enum becomes ``minimum``/``maximum`` and a
+    ``null``-bearing type list becomes the remaining type plus
+    ``nullable: true``.  Everything else (including ``additionalProperties``)
+    is preserved verbatim, so the Claude schema stays the single source.
+    """
+
+    if isinstance(node, list):
+        return [_gemini_compatible_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    rewritten: dict[str, object] = {}
+    for key, value in node.items():
+        if key == "enum" and isinstance(value, list) and value and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) for item in value
+        ):
+            if len(set(value)) != 1:
+                raise ValueError("gemini schema cannot express multi-valued numeric enum")
+            rewritten["minimum"] = value[0]
+            rewritten["maximum"] = value[0]
+            continue
+        if key == "type" and isinstance(value, list):
+            remaining = [item for item in value if item != "null"]
+            if len(remaining) != 1:
+                raise ValueError("gemini schema requires exactly one non-null type")
+            rewritten["type"] = remaining[0]
+            if len(remaining) != len(value):
+                rewritten["nullable"] = True
+            continue
+        rewritten[key] = _gemini_compatible_schema(value)
+    return rewritten
+
+
+def _gemini_review_json_schema(kind: str) -> str:
+    """The shared reviewer terminal schema, rewritten for Gemini (#888)."""
+
+    return json.dumps(
+        _gemini_compatible_schema(json.loads(_claude_review_json_schema(kind))),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
 def build_agy_argv(
     *,
     prompt: str,
@@ -1222,7 +1274,7 @@ def build_agy_argv(
     if review_only:
         if review_terminal_kind is None:
             raise ValueError("agy reviewer terminal contract kind missing")
-        review_schema = _claude_review_json_schema(review_terminal_kind)
+        review_schema = _gemini_review_json_schema(review_terminal_kind)
     else:
         if review_terminal_kind is not None:
             raise ValueError("agy terminal contract requires reviewer mode")

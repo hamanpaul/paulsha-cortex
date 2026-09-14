@@ -96,7 +96,55 @@ def test_agy_reviewer_uses_the_shared_claude_schema(kind: str, tmp_path: Path) -
     )
 
     schema = json.loads(argv[argv.index("--json-schema") + 1])
-    assert schema == json.loads(launcher_module._claude_review_json_schema(kind))
+    # #888：agy 走 Gemini structured output，schema 是同一份 Claude 契約經
+    # `_gemini_compatible_schema` 改寫（整數 enum→min/max、null type→nullable）。
+    assert schema == json.loads(launcher_module._gemini_review_json_schema(kind))
+    assert schema == launcher_module._gemini_compatible_schema(
+        json.loads(launcher_module._claude_review_json_schema(kind))
+    )
+    _assert_gemini_schema_subset(schema)
+
+
+def _assert_gemini_schema_subset(node: object) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _assert_gemini_schema_subset(item)
+        return
+    if not isinstance(node, dict):
+        return
+    enum = node.get("enum")
+    if enum is not None:
+        assert all(isinstance(item, str) for item in enum), enum
+    assert not isinstance(node.get("type"), list), node.get("type")
+    for value in node.values():
+        _assert_gemini_schema_subset(value)
+
+
+def test_gemini_compatible_schema_rewrites_only_unsupported_shapes() -> None:
+    rewritten = launcher_module._gemini_compatible_schema(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "schema_version": {"type": "integer", "enum": [1]},
+                "line": {"type": ["integer", "null"], "minimum": 1},
+                "status": {"type": "string", "enum": ["passed", "failed"]},
+            },
+        }
+    )
+    assert rewritten == {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "integer", "minimum": 1, "maximum": 1},
+            "line": {"type": "integer", "nullable": True, "minimum": 1},
+            "status": {"type": "string", "enum": ["passed", "failed"]},
+        },
+    }
+    with pytest.raises(ValueError):
+        launcher_module._gemini_compatible_schema({"enum": [1, 2]})
+    with pytest.raises(ValueError):
+        launcher_module._gemini_compatible_schema({"type": ["integer", "string"]})
 
 
 @pytest.mark.parametrize(
