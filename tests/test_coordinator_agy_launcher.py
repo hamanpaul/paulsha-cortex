@@ -40,6 +40,7 @@ def test_agy_reviewer_argv_grants_only_the_disposable_checkout(tmp_path) -> None
         log_dir=str(tmp_path / "logs"),
         worktree=str(worktree),
         review_only=True,
+        review_terminal_kind="workflow-verification-result",
     )
 
     assert argv[0:6] == [

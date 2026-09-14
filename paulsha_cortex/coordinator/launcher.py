@@ -22,9 +22,8 @@ _GIT_REPOSITORY_ENV_KEYS = job_runner.GIT_REPOSITORY_ENV_KEYS | frozenset(
 # 的憑證判準永遠是同一條 pattern，不會兩處漂移。
 _CREDENTIAL_ENV_RE = job_runner.CREDENTIAL_ENV_RE
 
-
 def _claude_review_json_schema(kind: str) -> str:
-    """Bind Claude StructuredOutput to the Manager terminal contract."""
+    """Build the shared Manager terminal-contract schema for Claude and AGY reviewers."""
 
     report = {
         "type": "object",
@@ -1191,6 +1190,7 @@ def build_agy_argv(
     review_only: bool = False,
     commit_required: bool = False,
     write_forbidden: bool = False,
+    review_terminal_kind: str | None = None,
     # Workflow lanes want the single-line JSON envelope; the capability probe
     # (#670) keeps the bare ``--output-format text`` shape because the CLI
     # rejects ``--json-schema`` there and the probe parser reads raw JSON.
@@ -1215,6 +1215,18 @@ def build_agy_argv(
         raise ValueError("commit-required agy builder requires enforced workspace-write")
     if write_forbidden and allow_unsafe:
         raise ValueError("write-forbidden agy builder cannot bypass permissions")
+
+    if review_only and not json_envelope:
+        raise ValueError("agy reviewer requires json envelope for terminal schema")
+
+    if review_only:
+        if review_terminal_kind is None:
+            raise ValueError("agy reviewer terminal contract kind missing")
+        review_schema = _claude_review_json_schema(review_terminal_kind)
+    else:
+        if review_terminal_kind is not None:
+            raise ValueError("agy terminal contract requires reviewer mode")
+        review_schema = None
 
     # Unsafe and commit-required modes are builder-only; accepting either
     # without a provisioned checkout would silently turn an invalid builder
@@ -1244,6 +1256,8 @@ def build_agy_argv(
     # its single-line JSON envelope and let Manager unwrap the ``response``.
     if json_envelope:
         argv.extend(["--output-format", "json"])
+    if review_schema is not None:
+        argv.extend(["--json-schema", review_schema])
     if model is not None:
         argv.extend(["--model", model])
     return argv
@@ -1903,8 +1917,9 @@ class SubprocessLauncher:
                     f"executor {self._executor} cannot be granted a verdict spool write path"
                 )
             builder_kwargs["verdict_spool_dir"] = self._verdict_spool_dir
-        if self._executor == "claude":
+        if self._executor in {"claude", "agy"}:
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
+        if self._executor == "claude":
             # Claude's complete workflow envelope can exceed Linux's per-argv
             # limit.  The wrapper receives it over stdin instead.
             builder_kwargs["prompt_via_stdin"] = True

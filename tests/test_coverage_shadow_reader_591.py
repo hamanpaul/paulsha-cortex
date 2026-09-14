@@ -28,6 +28,12 @@ from paulsha_cortex.coordinator.workflow import WorkflowManifest
 NOW = datetime(2026, 8, 16, 12, 0, 0, tzinfo=timezone.utc)
 
 
+@pytest.fixture(autouse=True)
+def _freeze_reader_clock(monkeypatch) -> None:
+    """CLI retention 與本檔合成紀錄使用同一時鐘，不依執行日期漂移。"""
+    monkeypatch.setattr(coverage, "_now_utc", lambda: NOW)
+
+
 def _stamp(days_ago: float) -> str:
     return (NOW - timedelta(days=days_ago)).isoformat().replace("+00:00", "Z")
 
@@ -478,3 +484,16 @@ def test_cli_survives_a_directory_full_of_garbage(tmp_path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["records"]["total"] == 0
     assert payload["corrupt"]["count"] == 3
+
+
+def test_cli_clock_advance_still_expires_records(tmp_path, capsys, monkeypatch) -> None:
+    """負控制：時鐘前進後，原本有效紀錄仍必須真的到期並被清掃。"""
+    _write(tmp_path, "fresh.json", agreement=True)
+    monkeypatch.setattr(coverage, "_now_utc", lambda: NOW + timedelta(days=31))
+
+    assert main(["--report", "--root", str(tmp_path), "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["records"]["total"] == 0
+    assert payload["retention"]["swept"]["files"] == ["fresh.json"]
+    assert not (tmp_path / "fresh.json").exists()
