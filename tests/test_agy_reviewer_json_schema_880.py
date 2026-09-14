@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 import paulsha_cortex.coordinator.launcher as launcher_module
-from paulsha_cortex.coordinator import manager, terminal_contract
+from paulsha_cortex.coordinator import manager
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher, build_agy_argv
 from paulsha_cortex.coordinator.registry import JobRegistry
 
@@ -16,25 +17,32 @@ from paulsha_cortex.coordinator.registry import JobRegistry
 REVIEW_KINDS = ("workflow-verification-result", "workflow-review-result")
 
 
-def _verification_terminal(*, details: object, report_ref: str) -> dict[str, object]:
+def _verification_terminal(
+    *, details: object, report_ref: str, status: str = "verified"
+) -> dict[str, object]:
     return {
         "schema_version": 1,
         "kind": "workflow-verification-result",
-        "status": "verified",
+        "status": status,
         "summary": "verification passed",
         "details": details,
         "reports": [{"path": report_ref, "body": "# Verification\n\nPassed.\n"}],
     }
 
 
-def _verification_fixture(tmp_path: Path, *, details: object):
+def _verification_fixture(
+    tmp_path: Path, *, details: object, status: str = "verified"
+):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     coordinator_root = tmp_path / "coordinator"
     report_ref = "reports/verify/fix-agy-reviewer-json-schema.md"
     log_path = tmp_path / "verification.jsonl"
     log_path.write_text(
-        json.dumps(_verification_terminal(details=details, report_ref=report_ref)) + "\n",
+        json.dumps(
+            _verification_terminal(details=details, report_ref=report_ref, status=status)
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -122,6 +130,22 @@ def test_agy_reviewer_requires_terminal_kind_when_omitted(tmp_path: Path) -> Non
             log_dir=str(tmp_path / "logs"),
             worktree=str(tmp_path / "reviewer"),
             review_only=True,
+        )
+
+
+def test_agy_reviewer_rejects_json_envelope_opt_out(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match="^agy reviewer requires json envelope for terminal schema$",
+    ):
+        build_agy_argv(
+            prompt="inspect",
+            slice_id="verify-880",
+            log_dir=str(tmp_path / "logs"),
+            worktree=str(tmp_path / "reviewer"),
+            review_only=True,
+            review_terminal_kind="workflow-verification-result",
+            json_envelope=False,
         )
 
 
@@ -231,6 +255,33 @@ def test_verification_empty_string_details_remain_invalid(tmp_path: Path) -> Non
             job_id=job["job_id"],
             coordinator_root=coordinator_root,
         )
+
+
+@pytest.mark.parametrize("status", ("failed", "needs_human"))
+def test_non_passing_verification_does_not_normalize_details_warning(
+    status: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry, job, coordinator_root, _report_ref = _verification_fixture(
+        tmp_path,
+        details="failure details",
+        status=status,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=manager.__name__):
+        with pytest.raises(
+            ValueError,
+            match=rf"workflow verification terminal reported non-passing status: {status}",
+        ):
+            manager.terminalize_workflow_job(
+                registry,
+                job_id=job["job_id"],
+                coordinator_root=coordinator_root,
+            )
+
+    assert not any(
+        "workflow verification terminal details normalized from string" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_verification_object_details_remain_unchanged(tmp_path: Path) -> None:

@@ -1216,13 +1216,16 @@ def build_agy_argv(
     if write_forbidden and allow_unsafe:
         raise ValueError("write-forbidden agy builder cannot bypass permissions")
 
+    if review_only and not json_envelope:
+        raise ValueError("agy reviewer requires json envelope for terminal schema")
+
     if review_only:
         if review_terminal_kind is None:
             raise ValueError("agy reviewer terminal contract kind missing")
         review_schema = _claude_review_json_schema(review_terminal_kind)
     else:
         if review_terminal_kind is not None:
-            raise ValueError("AGY terminal contract requires reviewer mode")
+            raise ValueError("agy terminal contract requires reviewer mode")
         review_schema = None
 
     # Unsafe and commit-required modes are builder-only; accepting either
