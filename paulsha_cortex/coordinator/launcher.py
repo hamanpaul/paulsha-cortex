@@ -1195,6 +1195,29 @@ def _gemini_compatible_schema(node: object) -> object:
         return [_gemini_compatible_schema(item) for item in node]
     if not isinstance(node, dict):
         return node
+    # Gemini has no ``additionalProperties`` map type either: the model is
+    # forced to invent identifier-like property names, so a string-keyed map
+    # (``authority_hashes``: repo path → sha256) comes back with mangled keys.
+    # A map-shaped object becomes an array of ``{"key", "value"}`` entries;
+    # Manager folds those entries back into the canonical mapping.
+    if (
+        node.get("type") == "object"
+        and isinstance(node.get("additionalProperties"), dict)
+        and "properties" not in node
+    ):
+        return {
+            **{k: v for k, v in node.items() if k not in {"type", "additionalProperties"}},
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["key", "value"],
+                "properties": {
+                    "key": {"type": "string", "minLength": 1},
+                    "value": _gemini_compatible_schema(node["additionalProperties"]),
+                },
+            },
+        }
     rewritten: dict[str, object] = {}
     for key, value in node.items():
         if key == "enum" and isinstance(value, list) and value and all(

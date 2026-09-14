@@ -141,6 +141,22 @@ def test_gemini_compatible_schema_rewrites_only_unsupported_shapes() -> None:
             "status": {"type": "string", "enum": ["passed", "failed"]},
         },
     }
+    # 字串鍵 map（authority_hashes）→ [{key, value}] 陣列；Gemini 沒有 map 型別，
+    # 模型會把路徑鍵改寫成識別字，實機 job 503／505 的 ref set 因此對不上。
+    assert launcher_module._gemini_compatible_schema(
+        {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    ) == {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["key", "value"],
+            "properties": {
+                "key": {"type": "string", "minLength": 1},
+                "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            },
+        },
+    }
     with pytest.raises(ValueError):
         launcher_module._gemini_compatible_schema({"enum": [1, 2]})
     with pytest.raises(ValueError):
@@ -374,3 +390,22 @@ def test_agy_structured_output_meta_keys_are_stripped_from_terminal_payload() ->
     }
     untouched = {"schema_version": 1, "kind": "workflow-review-result", "reports": [], "extra": 1}
     assert manager_module._strip_agy_structured_output_meta(untouched) is untouched
+
+
+def test_manager_folds_agy_key_value_authority_hashes() -> None:
+    from paulsha_cortex.coordinator import manager as manager_module
+
+    digest = "0" * 64
+    folded = manager_module._fold_agy_key_value_map(
+        [{"key": "docs/superpowers/plans/x.md", "value": digest}]
+    )
+    assert folded == {"docs/superpowers/plans/x.md": digest}
+    # 非 {key, value} 形狀、重複鍵、空鍵：原樣回傳，交由既有驗證 fail closed。
+    for bad in (
+        [{"key": "a", "value": digest, "extra": 1}],
+        [{"key": "a", "value": digest}, {"key": "a", "value": digest}],
+        [{"key": "", "value": digest}],
+        {"a": digest},
+        [],
+    ):
+        assert manager_module._fold_agy_key_value_map(bad) == bad

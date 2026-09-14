@@ -4422,6 +4422,29 @@ def _strip_agy_structured_output_meta(payload: dict[str, object]) -> dict[str, o
         if key not in _AGY_STRUCTURED_OUTPUT_META_KEYS
     }
 
+
+def _fold_agy_key_value_map(value: object) -> object:
+    """#888：把 Gemini 相容 schema 產出的 ``[{key, value}]`` 陣列摺回字串鍵 map。
+
+    只在「每一項都恰好是 {key, value} 且 key 為非空字串、無重複」時摺回；其他
+    形狀原樣回傳，交由既有驗證 fail closed。
+    """
+
+    if not isinstance(value, list) or not value:
+        return value
+    folded: dict[str, object] = {}
+    for entry in value:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"key", "value"}
+            or not isinstance(entry["key"], str)
+            or not entry["key"]
+            or entry["key"] in folded
+        ):
+            return value
+        folded[entry["key"]] = entry["value"]
+    return folded
+
 def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
     if not isinstance(value, str):
         return None
@@ -6425,6 +6448,11 @@ def terminalize_workflow_job(
         required = {"schema_version", "kind", "reason", "findings", "reports"}
         if expected_authority_hashes:
             required = required | {"authority_hashes"}
+            if "authority_hashes" in raw:
+                raw = {
+                    **raw,
+                    "authority_hashes": _fold_agy_key_value_map(raw["authority_hashes"]),
+                }
         # #261 R1：review card 同樣必須能誠實回報 failed／needs_human。status 是
         # canonical envelope 的選填欄位（review verdict 本身由 findings 決定），
         # 在此先取出並攔截非通過狀態，再做既有的 exact key-set 驗證。
