@@ -21,6 +21,14 @@ flowchart LR
 persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role profile + scope subject），不是執行中的 agent session；真正執行的是 AgentInstance，真正做安全判斷的是 guardrail / policy engine，它們只讀 persona 契約做 enforcement。
 
 
+## 架構與工作流程驗收
+
+[開啟架構／工作流程 HTML](docs/architecture/architecture.html) · [架構事實與來源](docs/architecture/facts.json) · [呈現資料](docs/architecture/architecture.json)
+
+這份 HTML 用同一頁呈現 Persona／Deck 規則、Manager 控制、WorkflowRun／Job／Slice 狀態、Monitor 投影，以及 feature-oneshot 七階段的 Card、輸入、產出、gate 與恢復路徑。它是文件驗收介面，不會派工或修改 runtime。GitHub 檔案頁顯示原始碼；clone 後直接用瀏覽器開啟 `docs/architecture/architecture.html`，不需要 server 或網路套件。
+
+重新產生與驗證：先依 `hamanpaul/custom-skills` 的 `architecture-fact-layer` workflow-review profile 執行 semantic／exact HTML gate，再執行 `python tests/architecture_browser_review.py --html docs/architecture/architecture.html --output /tmp/architecture-review`（需 Playwright／Chromium）。CI 使用同一個 repo HTML 以 `file://` 驗證；不以 PNG 代替交付。
+
 ## Install
 
 需求：Python 3.10+、Git，以及至少一個已安裝並登入的 headless executor CLI（`copilot`、`claude` 或 `codex`）。套件只安裝 Python runtime，不會代裝或登入 executor。

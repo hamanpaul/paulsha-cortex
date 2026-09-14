@@ -6,271 +6,1611 @@
     "revision": "739cde17b5b891bcdd575cb98ea07280f428ebaf"
   },
   "scope": {
-    "name": "Cortex SDLC lifecycle control plane",
+    "name": "Cortex feature-oneshot 的分工、執行流程與完成閉環",
     "includes": [
-      "跨 GitHub/repo artifacts 的 WorkItem/WorkSource read model",
-      "Manager single-writer lifecycle authority 與 WorkflowRun/WorkflowStep registry",
-      "Deck persona-preserving workflow、typed gate evidence 與 headless executors",
-      "current-HEAD delivery、remote closure 與 CompletionRecord"
+      "Persona／Deck 契約與 Manager 執行控制",
+      "feature-oneshot 七階段、Card inputs/outputs 與 gate",
+      "WorkItem／WorkflowRun／Job／Slice 的不同狀態語意",
+      "人工暫停、provider backoff、Candidate repair 與 remote closure"
     ],
     "excludes": [
-      "installer/systemd trust-root provisioning 細節",
-      "model calibration、resource envelope 與近期 refine proposals",
-      "CLI packaging/release 流程、tests 與 archived OpenSpec history"
+      "其他 combo 的完整分支與所有恢復命令",
+      "trust-root 安裝／各 host 的實際隔離部署狀態",
+      "model roster／費率／目前 live jobs 與 runtime E2E 驗證"
     ]
   },
   "components": [
     {
-      "id": "work-sources",
-      "label": "Work Sources",
-      "type": "external",
-      "responsibility": "提供 GitHub issue/PR、Todo、Superpowers、OpenSpec、WorkflowRun 與 CompletionRecord 等可被聚合的工作來源。",
-      "sublabel": "repo + GitHub authorities",
-      "basis": "observed",
-      "evidence": [{
-        "path": "paulsha_cortex/monitor/work_models.py",
-        "line": 10,
-        "end_line": 24,
-        "excerpt_sha256": "18f8e6ff83c8baac407d5d206b016055c518c28caa08860f0dcc0e67e33676e3",
-        "claim": "WorkSource kind 明確列出 GitHub、repo artifact、workflow 與 completion record 來源，並區分 confirmed/inferred confidence。"
-      }]
-    },
-    {
-      "id": "monitor",
-      "label": "Monitor",
-      "type": "backend",
-      "responsibility": "聚合 provider last-good snapshots，建立可解釋的 WorkItem/WorkSource read model；provider 失敗時保留 prior truth 並標 degraded。",
-      "sublabel": "read model only",
-      "basis": "declared",
-      "evidence": [{
-        "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
-        "line": 20,
-        "end_line": 28,
-        "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
-        "claim": "Accepted ADR 定義 Monitor last-good 聚合、degraded freeze、WorkItem/WorkSource snapshot 與 Manager mutation authority。"
-      }]
-    },
-    {
-      "id": "work-read-model",
-      "label": "WorkItem Read Model",
+      "id": "candidate-worktree",
+      "label": "Builder Worktree／Candidate HEAD",
       "type": "database",
-      "responsibility": "將 work_id、四態 lifecycle、phase、facets、sources、next actions 與 WorkflowRun 關聯投影成 versioned read-side fact。",
-      "sublabel": "topic → todo → on-going → done",
-      "basis": "observed",
-      "evidence": [{
-        "path": "paulsha_cortex/monitor/work_models.py",
-        "line": 183,
-        "end_line": 219,
-        "excerpt_sha256": "d01d1ef2c88d6d6cfd8caa7715e6467d15a85140156809c00ed1349cc4de2846",
-        "claim": "WorkItem dataclass 固定保存 state/phase/facets/sources/next_actions/workflow_run_id，且 state 必須落在 versioned work states。"
-      }]
-    },
-    {
-      "id": "deck-compiler",
-      "label": "Deck Compiler",
-      "type": "backend",
-      "responsibility": "把 combo/card 的 persona binding 投影為完整 Claim→Define→Plan→Build→Verify→Review→Ship workflow manifest。",
-      "sublabel": "persona-preserving manifest",
-      "basis": "observed",
-      "evidence": [{
-        "path": "paulsha_cortex/coordinator/workflow.py",
-        "line": 306,
-        "end_line": 352,
-        "excerpt_sha256": "62f2d7d476555a26379c211100ed2bd82dd83211691fb10593c0bffb71e5b5d3",
-        "claim": "WorkflowManifest 驗證完整 phase spine 與每個 phase 的 manager/planner/builder/reviewer persona binding。"
-      }]
-    },
-    {
-      "id": "manager",
-      "label": "Manager",
-      "type": "backend",
-      "responsibility": "作為 lifecycle control plane 的唯一 writer，持有 claim、WorkflowRun/Step、GitHub mutation、merge 與 CompletionRecord authority。",
-      "sublabel": "single writer",
+      "tag": "受測程式版本",
+      "responsibility": "Builder 在 Manager provision 的工作區依 accepted plan 做 RED→實作→commit，交回 Candidate HEAD。後續 verify/review 必須對準同一版本。",
       "basis": "declared",
-      "evidence": [{
-        "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
-        "line": 14,
-        "end_line": 14,
-        "excerpt_sha256": "05551f17d5462ebca59470f2b9ecb56a7747bf99301de5622b1e8d5c90b599ca",
-        "claim": "Accepted ADR 明示 Monitor 是 read model、Manager 是唯一 writer，且模糊關聯不得授權 mutation。"
-      }]
-    },
-    {
-      "id": "workflow-registry",
-      "label": "Workflow Registry",
-      "type": "database",
-      "responsibility": "持久化 Manager-owned WorkflowRun aggregate，包括 work/repo/claim、phase/steps、refs、attempts、gate evidence、candidate/verified heads 與 completion binding。",
-      "sublabel": "coordinator registry v2",
-      "basis": "observed",
-      "evidence": [{
-        "path": "paulsha_cortex/coordinator/workflow.py",
-        "line": 379,
-        "end_line": 407,
-        "excerpt_sha256": "fdee56476b52a0f5198fa3fa29d5b22bee5eb824a06b4d356ad448267d40fb08",
-        "claim": "WorkflowRun 是 Manager-owned persistent aggregate，綁定來源 authority、phase、steps、issue/OpenSpec/PR refs 與 gate evidence。"
-      }]
-    },
-    {
-      "id": "headless-executors",
-      "label": "Headless Executors",
-      "type": "external",
-      "responsibility": "執行被 persona/model/domain policy 選中的工作，回傳 artifacts/evidence；不持有 lifecycle truth。",
-      "sublabel": "copilot / claude / codex",
-      "basis": "declared",
-      "evidence": [{
-        "path": "README.md",
-        "line": 24,
-        "end_line": 26,
-        "excerpt_sha256": "0cc801dd9838cb8b4d35f53367f8571ea100579aeff98059611bf4a452b93be1",
-        "claim": "README 將 copilot、claude、codex 定義為需預先安裝登入的 headless executor CLI。"
-      }]
-    },
-    {
-      "id": "gate-evidence",
-      "label": "Gate Evidence",
-      "type": "database",
-      "responsibility": "以 typed immutable refs 保存 brainstorm、foreign review 與 delivery review 的獨立 gate 證據。",
-      "sublabel": "typed immutable refs",
-      "basis": "observed",
-      "evidence": [{
-        "path": "paulsha_cortex/coordinator/workflow.py",
-        "line": 274,
-        "end_line": 303,
-        "excerpt_sha256": "f30cd7bd3c773a018b355de34fcb5029a67e37e23cb7c9499d7b3a755bd74bb3",
-        "claim": "GateEvidenceRef 是 typed immutable locator，限定 brainstorm/foreign-review/copilot/maintainer-review 並可綁 SHA-256。"
-      }]
-    },
-    {
-      "id": "delivery-closure",
-      "label": "Delivery / Closure",
-      "type": "backend",
-      "responsibility": "由 Manager 對 exact current HEAD 執行 archive、policy/preflight/checks/review/thread/HEAD-race/merge，並在 merge 後驗證 remote terminal closure。",
-      "sublabel": "bounded current-HEAD ship",
-      "basis": "declared",
-      "evidence": [{
-        "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
-        "line": 46,
-        "end_line": 50,
-        "excerpt_sha256": "2c5761bbed3079de9b9753059ec4a052104098b0b0d692fe3c09ba5dcdb95a52",
-        "claim": "Accepted ADR 要求 deterministic verification、foreign exact-HEAD review、preflight/checks、final HEAD race check、merge 與 remote closure。"
-      }]
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62,
+          "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+          "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        },
+        {
+          "path": "paulsha_cortex/deck/data/cards.yaml",
+          "line": 62,
+          "end_line": 105,
+          "excerpt_sha256": "d19d545337077a469f269876ffa391ce759d5d93360549f4be988f39fa398ea8",
+          "claim": "隔離工作區由 Manager 提供；RED／Build 的 commit 與測試義務。"
+        }
+      ]
     },
     {
       "id": "completion-record",
-      "label": "CompletionRecord",
+      "label": "CompletionRecord：完成證據",
       "type": "database",
-      "responsibility": "只在 merge ancestry、issues、remote OpenSpec archive、Todo 與相關 terminal facts 全成立後寫入，作為 done projection 的完成證據。",
-      "sublabel": "remote terminal fact",
+      "tag": "不是 exit code，也不是 PR 按鈕",
+      "responsibility": "遠端 merge ancestry、issue closed、OpenSpec archive、Todo 等全數成立後，Manager 才寫 CompletionRecord。它是 done 投影的必要完成證據。",
       "basis": "declared",
-      "evidence": [{
-        "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
-        "line": 46,
-        "end_line": 50,
-        "excerpt_sha256": "2c5761bbed3079de9b9753059ec4a052104098b0b0d692fe3c09ba5dcdb95a52",
-        "claim": "Merge 後必須驗證 default-branch terminal facts，之後才寫 CompletionRecord；全部成立才投影 done。"
-      }]
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 48,
+          "end_line": 50,
+          "excerpt_sha256": "e4ccb2f0f535c5df572452c5518baa1718bb2b561e789729cd959423eae2f29f",
+          "claim": "遠端 terminal facts 成立後才寫 CompletionRecord 並投影 done。"
+        }
+      ]
+    },
+    {
+      "id": "control-queue",
+      "label": "CLI／Control Request Queue",
+      "type": "messagebus",
+      "tag": "操作入口",
+      "responsibility": "接收 start、resume、retry、ship 等明確請求；交給 Manager 處理。CLI 不直接改寫 WorkflowRun／Job／Slice registry。",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "README.md",
+          "line": 412,
+          "end_line": 414,
+          "excerpt_sha256": "7e8128bdf2cbecacc49372857dcdd202797147928882470c0f93682c6c63e9ca",
+          "claim": "CLI mutation 送 control request queue，由 Manager daemon 單一 writer 處理，不直接改 registry。"
+        }
+      ]
+    },
+    {
+      "id": "deck-compiler",
+      "label": "Deck：Card／Combo 定義與編譯",
+      "type": "backend",
+      "tag": "流程定義，不是執行期看板",
+      "responsibility": "把 Combo 的 Card 順序、角色、輸入、輸出及 test/commit policy 編成 WorkflowManifest。定義怎麼做，不保存這次做到哪。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/deck/compile.py",
+          "line": 483,
+          "end_line": 523,
+          "excerpt_sha256": "29943cec5fc9b5092279d3ff5a8655b04da7f4ad37ee1195aa310b74e2c7aca6",
+          "claim": "Deck 讀 persona catalog，逐 Card 保留角色、inputs/outputs 與 execution policy，編譯 WorkflowManifest。"
+        },
+        {
+          "path": "paulsha_cortex/deck/data/combos/feature-oneshot.yaml",
+          "line": 1,
+          "end_line": 35,
+          "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
+          "claim": "feature-oneshot 核心 Card 與條件式 adversarial-review。"
+        }
+      ]
+    },
+    {
+      "id": "delivery-closure",
+      "label": "Delivery：Ship 與遠端閉環",
+      "type": "backend",
+      "tag": "Manager 執行的交付子流程",
+      "responsibility": "對 current HEAD 做 archive／policy／preflight／checks／delivery review／threads／HEAD-race 檢查，再 merge；merge 後重讀遠端結果確認閉環。",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 50,
+          "excerpt_sha256": "b416ebb50fe63c54b807e9ff44636515b9545239794fc11ffbd55c5e10d6b47e",
+          "claim": "Ship 與 post-merge remote closure 由 Manager 負責。"
+        }
+      ]
+    },
+    {
+      "id": "gate-evidence",
+      "label": "Canonical Gate Evidence",
+      "type": "database",
+      "tag": "各 gate 的不可混用證據",
+      "responsibility": "Manager 收斂並保存驗證後的 gate refs。Brainstorm、ForeignReview 與 delivery review 是不同 gate；有一份 review 不等於其他 gate 都通過。",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62,
+          "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+          "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 6281,
+          "end_line": 6348,
+          "excerpt_sha256": "d0d4a1671b3d2bb1e11baabb5a9a8ce3484b8f718073e56d2afe8559615f773b",
+          "claim": "成功 exit 只是 terminalize 的必要條件；Manager 仍收斂 canonical evidence 並執行 gate consistency 檢查。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 274,
+          "end_line": 303,
+          "excerpt_sha256": "f30cd7bd3c773a018b355de34fcb5029a67e37e23cb7c9499d7b3a755bd74bb3",
+          "claim": "GateEvidenceRef 限定 brainstorm/foreign-review/copilot/maintainer-review 等不同 immutable evidence kind。"
+        }
+      ]
+    },
+    {
+      "id": "headless-executors",
+      "label": "AgentInstance／Headless Executor",
+      "type": "external",
+      "tag": "實際工作程序",
+      "responsibility": "接受 Manager 派出的 persona/model-scoped 工作。Planner 產規劃、Builder 改程式、Reviewer 回驗證／審查結果；它們交回的結果仍須由 Manager 驗證，不能自行把工作標為 done。",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "README.md",
+          "line": 21,
+          "end_line": 21,
+          "excerpt_sha256": "58ab2619aca5e7b54e8d731fb0f63378e2dd8511f012904d06d447ed3ca7a073",
+          "claim": "Persona 與執行中的 AgentInstance／policy engine 明確區分。"
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62,
+          "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+          "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        }
+      ]
+    },
+    {
+      "id": "manager",
+      "label": "Manager：執行期控制器",
+      "type": "backend",
+      "tag": "流程與 lifecycle 的唯一 writer",
+      "responsibility": "讀取 confirmed 工作來源與 manifest，選擇執行器、派工、收取證據、判斷 gate、持久化進度及受限恢復；只有它能推進 workflow 或承認完成。",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28,
+          "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+          "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62,
+          "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+          "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        }
+      ]
+    },
+    {
+      "id": "monitor",
+      "label": "Monitor：觀察與狀態投影",
+      "type": "backend",
+      "tag": "不控制 workflow，但保存自己的 read snapshot",
+      "responsibility": "讀 GitHub／Repo、Workflow Registry 與 CompletionRecord，聚合 WorkItem。來源失敗時保留 last-good 並標 degraded；不因 scan 結果直接派工或改 lifecycle。",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28,
+          "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+          "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+        }
+      ]
+    },
+    {
+      "id": "persona-contracts",
+      "label": "Persona：角色／權限契約",
+      "type": "security",
+      "tag": "契約資料，不是 AgentInstance",
+      "responsibility": "定義 manager、planner、builder、reviewer 可在哪些 phase 使用哪些工具與寫入路徑；供 Deck、Manager、Guardrail 讀取，不自行推進進度。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/deck/compile.py",
+          "line": 483,
+          "end_line": 523,
+          "excerpt_sha256": "29943cec5fc9b5092279d3ff5a8655b04da7f4ad37ee1195aa310b74e2c7aca6",
+          "claim": "Deck 讀 persona catalog，逐 Card 保留角色、inputs/outputs 與 execution policy，編譯 WorkflowManifest。"
+        },
+        {
+          "path": "paulsha_cortex/persona/personas.yaml",
+          "line": 1,
+          "end_line": 37,
+          "excerpt_sha256": "3c6bd08915ba5648758f36c9d2b3d118194a4b27fd41d4d12233c04ae54a20d0",
+          "claim": "角色是 allowed_phases/write_paths/allowed_tools/skills 契約；四個角色的允許範圍。"
+        }
+      ]
+    },
+    {
+      "id": "planning-artifacts",
+      "label": "Accepted Planning Artifacts",
+      "type": "database",
+      "tag": "需求與計畫的版本化輸入",
+      "responsibility": "保存 accepted spec／design／plan。Manager 將 ref/kind/hash 綁入 WorkflowRun，再以固定 input snapshot 交給 Builder；不是任由執行器讀取漂移檔案。",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 56,
+          "end_line": 58,
+          "excerpt_sha256": "45b8e16b6c833bee68009343523dc7056b9e0f6a1078b45c60323fc945387e10",
+          "claim": "Planning artifacts 與原始發證 revision/hash 綁定，不因新的 PR refresh 靜默變更。"
+        }
+      ]
+    },
+    {
+      "id": "scope-guardrail",
+      "label": "Guardrail：角色範圍檢查",
+      "type": "security",
+      "tag": "執行規則檢查",
+      "responsibility": "依 Persona 准駁 filesystem path／tool。這是契約檢查，不應誤認為獨立 Agent、進度控制器或完整作業系統 sandbox。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/persona/guardrail.py",
+          "line": 18,
+          "end_line": 81,
+          "excerpt_sha256": "fcacb3b7b8c0c3d395617257dd8004f5ed65ebec7d60338106677fd4348fdf1c",
+          "claim": "Guardrail 依角色契約檢查路徑與工具，回傳准駁；本身不是流程推進器。"
+        }
+      ]
+    },
+    {
+      "id": "verification-gate",
+      "label": "Deterministic Gate／Evidence 驗證",
+      "type": "backend",
+      "tag": "機械驗證，不是模型自證",
+      "responsibility": "檢查受測 Candidate、命令結果、input snapshot 及 terminal evidence 一致性。降權路徑由獨立 gate 帳號執行命令；通過結果回到 Manager 才能推進。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 6281,
+          "end_line": 6348,
+          "excerpt_sha256": "d0d4a1671b3d2bb1e11baabb5a9a8ce3484b8f718073e56d2afe8559615f773b",
+          "claim": "成功 exit 只是 terminalize 的必要條件；Manager 仍收斂 canonical evidence 並執行 gate consistency 檢查。"
+        }
+      ]
+    },
+    {
+      "id": "work-read-model",
+      "label": "WorkItem：對外工作狀態",
+      "type": "database",
+      "tag": "給人與 Agent 查看的工作投影",
+      "responsibility": "Monitor 將工作投影為 topic／todo／on-going／done，並附 phase、facets、sources、next_actions。這不是 Deck 的執行進度，也不是 Agent 自報完成。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/monitor/work_models.py",
+          "line": 186,
+          "end_line": 236,
+          "excerpt_sha256": "1510c063c4ab97707c25c2555b344cefe75072ec54456a4de3d20d2be40efb57",
+          "claim": "WorkItem 的狀態、來源、phase/facets 與對外 on-going spelling。"
+        }
+      ]
+    },
+    {
+      "id": "work-sources",
+      "label": "工作來源／GitHub 與 Repo",
+      "type": "external",
+      "tag": "來源事實",
+      "responsibility": "提供 issue、PR、spec/design/plan、OpenSpec 與 Todo。它們是工作來源，不是可跳過 gate 的派工命令。",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28,
+          "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+          "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 32,
+          "end_line": 40,
+          "excerpt_sha256": "6932289e76f62dadd768292e071959f7ff8234bcc9b89ff1366e616d4ad58ed1",
+          "claim": "confirmed association 與 persona-preserving manifest；異質 brainstorm 的宣告式契約。"
+        }
+      ]
+    },
+    {
+      "id": "workflow-registry",
+      "label": "Workflow Registry：這次做到哪",
+      "type": "database",
+      "tag": "狀態記錄，不是派工者",
+      "responsibility": "保存 WorkflowRun、WorkflowStep、attempts、Candidate 與 evidence/completion binding；記錄由 Manager 更新。Job 是一次執行嘗試，重試不等於建立一個新的工作。",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412,
+          "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+          "claim": "Manager 的實際 workflow spawn 點以當前 Run/Step、角色與 Candidate 選取或建立 Job。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 378,
+          "end_line": 421,
+          "excerpt_sha256": "3c0b9363f52205f8a1acf7d27fdd557803b0b02fe767fb68cd36436fcd3a012c",
+          "claim": "WorkflowRun 保存 Manager-owned aggregate，包括 current_phase、steps、attempts、evidence 與 completion binding。"
+        }
+      ]
     }
   ],
   "boundaries": [],
   "relations": [
     {
-      "id": "work-sources-to-monitor",
-      "from": "work-sources",
-      "to": "monitor",
-      "label": "provider snapshots",
-      "variant": "emphasis",
-      "basis": "observed",
-      "evidence": [{"path":"paulsha_cortex/monitor/work_models.py","line":10,"end_line":24,"excerpt_sha256":"18f8e6ff83c8baac407d5d206b016055c518c28caa08860f0dcc0e67e33676e3","claim":"Monitor source model enumerates GitHub/repo/workflow/completion sources."}]
-    },
-    {
-      "id": "monitor-to-work-read-model",
-      "from": "monitor",
-      "to": "work-read-model",
-      "label": "last-good projection",
-      "variant": "emphasis",
+      "id": "candidate-to-gates",
+      "from": "candidate-worktree",
+      "to": "verification-gate",
+      "label": "提供 exact Candidate 與受測輸入",
+      "variant": "default",
       "basis": "declared",
-      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":20,"end_line":28,"excerpt_sha256":"9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9","claim":"Monitor creates the WorkItem/WorkSource read model from provider snapshots and freezes prior projection on degradation."}]
-    },
-    {
-      "id": "work-read-model-to-manager",
-      "from": "work-read-model",
-      "to": "manager",
-      "label": "confirmed authority / claim input",
-      "variant": "dashed",
-      "basis": "declared",
-      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":32,"end_line":40,"excerpt_sha256":"6932289e76f62dadd768292e071959f7ff8234bcc9b89ff1366e616d4ad58ed1","claim":"Only explicitly confirmed associations can establish mutation authority; heuristics remain display-only."}]
-    },
-    {
-      "id": "deck-to-manager",
-      "from": "deck-compiler",
-      "to": "manager",
-      "label": "validated workflow manifest",
-      "variant": "emphasis",
-      "basis": "observed",
-      "evidence": [{"path":"paulsha_cortex/coordinator/workflow.py","line":306,"end_line":352,"excerpt_sha256":"62f2d7d476555a26379c211100ed2bd82dd83211691fb10593c0bffb71e5b5d3","claim":"Manager spine validation requires all phases and phase-specific personas."}]
-    },
-    {
-      "id": "manager-to-workflow-registry",
-      "from": "manager",
-      "to": "workflow-registry",
-      "label": "single-writer lifecycle mutations",
-      "variant": "emphasis",
-      "basis": "declared",
-      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":20,"end_line":28,"excerpt_sha256":"9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9","claim":"Manager is the only writer for WorkflowRun/Step and related lifecycle mutations."}]
-    },
-    {
-      "id": "workflow-to-executors",
-      "from": "workflow-registry",
-      "to": "headless-executors",
-      "label": "persona/model scoped dispatch",
-      "variant": "dashed",
-      "basis": "declared",
-      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":32,"end_line":40,"excerpt_sha256":"6932289e76f62dadd768292e071959f7ff8234bcc9b89ff1366e616d4ad58ed1","claim":"Workflow preserves persona binding and domain separation; heterogeneous executor identities are selected under that policy."}]
-    },
-    {
-      "id": "executors-to-gate-evidence",
-      "from": "headless-executors",
-      "to": "gate-evidence",
-      "label": "artifacts + independent verdicts",
-      "basis": "inferred",
-      "reasoning": "Executors perform persona-scoped work while GateEvidenceRef persists the independent workflow gate locators; the architectural relation is the evidence handoff, not lifecycle ownership.",
-      "evidence": [{"path":"paulsha_cortex/coordinator/workflow.py","line":274,"end_line":303,"excerpt_sha256":"f30cd7bd3c773a018b355de34fcb5029a67e37e23cb7c9499d7b3a755bd74bb3","claim":"Independent workflow gate results are persisted as typed immutable evidence refs."}]
-    },
-    {
-      "id": "gate-evidence-to-manager",
-      "from": "gate-evidence",
-      "to": "manager",
-      "label": "authorization evidence",
-      "variant": "dashed",
-      "basis": "observed",
-      "evidence": [{"path":"paulsha_cortex/coordinator/workflow.py","line":379,"end_line":407,"excerpt_sha256":"fdee56476b52a0f5198fa3fa29d5b22bee5eb824a06b4d356ad448267d40fb08","claim":"WorkflowRun persists gate_refs alongside lifecycle state under Manager ownership."}]
-    },
-    {
-      "id": "manager-to-delivery",
-      "from": "manager",
-      "to": "delivery-closure",
-      "label": "ship authorization",
-      "variant": "emphasis",
-      "basis": "declared",
-      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":46,"end_line":50,"excerpt_sha256":"2c5761bbed3079de9b9753059ec4a052104098b0b0d692fe3c09ba5dcdb95a52","claim":"Ship is performed by Manager and is bounded by current-HEAD policy, checks, review, thread and race gates."}]
-    },
-    {
-      "id": "delivery-to-completion",
-      "from": "delivery-closure",
-      "to": "completion-record",
-      "label": "remote terminal closure",
-      "variant": "emphasis",
-      "basis": "declared",
-      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":46,"end_line":50,"excerpt_sha256":"2c5761bbed3079de9b9753059ec4a052104098b0b0d692fe3c09ba5dcdb95a52","claim":"CompletionRecord is written only after merge and remote terminal facts are verified."}]
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62,
+          "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+          "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        }
+      ]
     },
     {
       "id": "completion-to-monitor",
       "from": "completion-record",
       "to": "monitor",
-      "label": "strict closure → done",
-      "variant": "dashed",
+      "label": "提供 strict closure 證據，允許 done 投影",
+      "variant": "emphasis",
       "basis": "declared",
-      "evidence": [{"path":"docs/adr/0001-unified-work-lifecycle-authority.md","line":20,"end_line":28,"excerpt_sha256":"9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9","claim":"Lifecycle reducer projects done only after strict closure; otherwise prior/provider facts determine the projection."}]
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28,
+          "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+          "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62,
+          "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+          "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        }
+      ]
+    },
+    {
+      "id": "control-to-manager",
+      "from": "control-queue",
+      "to": "manager",
+      "label": "送操作請求，不直接改 lifecycle",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "README.md",
+          "line": 412,
+          "end_line": 414,
+          "excerpt_sha256": "7e8128bdf2cbecacc49372857dcdd202797147928882470c0f93682c6c63e9ca",
+          "claim": "CLI mutation 送 control request queue，由 Manager daemon 單一 writer 處理，不直接改 registry。"
+        }
+      ]
+    },
+    {
+      "id": "deck-to-manager",
+      "from": "deck-compiler",
+      "to": "manager",
+      "label": "提供已編譯的 persona-preserving WorkflowManifest",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 32,
+          "end_line": 40,
+          "excerpt_sha256": "6932289e76f62dadd768292e071959f7ff8234bcc9b89ff1366e616d4ad58ed1",
+          "claim": "confirmed association 與 persona-preserving manifest；異質 brainstorm 的宣告式契約。"
+        }
+      ]
+    },
+    {
+      "id": "delivery-to-completion",
+      "from": "delivery-closure",
+      "to": "completion-record",
+      "label": "遠端閉環全成立後由 Manager 寫入",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 48,
+          "end_line": 50,
+          "excerpt_sha256": "e4ccb2f0f535c5df572452c5518baa1718bb2b561e789729cd959423eae2f29f",
+          "claim": "CompletionRecord 只能在 remote closure 後建立。"
+        }
+      ]
+    },
+    {
+      "id": "delivery-to-work-sources",
+      "from": "delivery-closure",
+      "to": "work-sources",
+      "label": "更新 PR／merge；再重讀遠端 terminal facts",
+      "variant": "default",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62,
+          "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+          "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        }
+      ]
+    },
+    {
+      "id": "executors-to-candidate",
+      "from": "headless-executors",
+      "to": "candidate-worktree",
+      "label": "Builder 實作、測試並提交 Candidate HEAD",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/deck/data/cards.yaml",
+          "line": 94,
+          "end_line": 110,
+          "excerpt_sha256": "662f298b75dbf667c2551f391db324c14d5a41d730c4588b3a55bc96b47e638f",
+          "claim": "subagent-build 的角色、commit policy 與 focused test policy。"
+        }
+      ]
+    },
+    {
+      "id": "executors-to-manager",
+      "from": "headless-executors",
+      "to": "manager",
+      "label": "交回 log／terminal payload／artifacts，等待驗證",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 6281,
+          "end_line": 6348,
+          "excerpt_sha256": "d0d4a1671b3d2bb1e11baabb5a9a8ce3484b8f718073e56d2afe8559615f773b",
+          "claim": "成功 exit 只是 terminalize 的必要條件；Manager 仍收斂 canonical evidence 並執行 gate consistency 檢查。"
+        }
+      ]
+    },
+    {
+      "id": "gate-evidence-to-manager",
+      "from": "gate-evidence",
+      "to": "manager",
+      "label": "提供不同 gate 的 authorization evidence",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 274,
+          "end_line": 303,
+          "excerpt_sha256": "f30cd7bd3c773a018b355de34fcb5029a67e37e23cb7c9499d7b3a755bd74bb3",
+          "claim": "GateEvidenceRef 限定 brainstorm/foreign-review/copilot/maintainer-review 等不同 immutable evidence kind。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 378,
+          "end_line": 421,
+          "excerpt_sha256": "3c0b9363f52205f8a1acf7d27fdd557803b0b02fe767fb68cd36436fcd3a012c",
+          "claim": "WorkflowRun 保存 Manager-owned aggregate，包括 current_phase、steps、attempts、evidence 與 completion binding。"
+        }
+      ]
+    },
+    {
+      "id": "gates-to-manager",
+      "from": "verification-gate",
+      "to": "manager",
+      "label": "回傳 gate／terminal consistency 結果",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 6281,
+          "end_line": 6348,
+          "excerpt_sha256": "d0d4a1671b3d2bb1e11baabb5a9a8ce3484b8f718073e56d2afe8559615f773b",
+          "claim": "成功 exit 只是 terminalize 的必要條件；Manager 仍收斂 canonical evidence 並執行 gate consistency 檢查。"
+        }
+      ]
+    },
+    {
+      "id": "manager-to-delivery",
+      "from": "manager",
+      "to": "delivery-closure",
+      "label": "授權並執行 bounded current-HEAD ship",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62,
+          "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+          "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        }
+      ]
+    },
+    {
+      "id": "manager-to-executors",
+      "from": "manager",
+      "to": "headless-executors",
+      "label": "依當前 Step／Persona／Candidate 派出 Job",
+      "variant": "emphasis",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412,
+          "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+          "claim": "Manager 的實際 workflow spawn 點以當前 Run/Step、角色與 Candidate 選取或建立 Job。"
+        }
+      ]
+    },
+    {
+      "id": "manager-to-gate-evidence",
+      "from": "manager",
+      "to": "gate-evidence",
+      "label": "收斂及綁定 canonical evidence",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 6281,
+          "end_line": 6348,
+          "excerpt_sha256": "d0d4a1671b3d2bb1e11baabb5a9a8ce3484b8f718073e56d2afe8559615f773b",
+          "claim": "成功 exit 只是 terminalize 的必要條件；Manager 仍收斂 canonical evidence 並執行 gate consistency 檢查。"
+        }
+      ]
+    },
+    {
+      "id": "manager-to-planning",
+      "from": "manager",
+      "to": "planning-artifacts",
+      "label": "驗證並綁定 accepted artifact ref／hash",
+      "variant": "default",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 56,
+          "end_line": 58,
+          "excerpt_sha256": "45b8e16b6c833bee68009343523dc7056b9e0f6a1078b45c60323fc945387e10",
+          "claim": "Planning authority 的 hash-bound input snapshot。"
+        }
+      ]
+    },
+    {
+      "id": "manager-to-workflow-registry",
+      "from": "manager",
+      "to": "workflow-registry",
+      "label": "建立 Run／更新 Step、attempt 與 evidence binding",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28,
+          "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+          "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+        }
+      ]
+    },
+    {
+      "id": "monitor-to-work-read-model",
+      "from": "monitor",
+      "to": "work-read-model",
+      "label": "聚合、保存 last-good 並投影四態",
+      "variant": "emphasis",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28,
+          "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+          "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+        }
+      ]
+    },
+    {
+      "id": "persona-to-deck",
+      "from": "persona-contracts",
+      "to": "deck-compiler",
+      "label": "提供角色契約，供 Card binding／phase 驗證",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/deck/compile.py",
+          "line": 483,
+          "end_line": 523,
+          "excerpt_sha256": "29943cec5fc9b5092279d3ff5a8655b04da7f4ad37ee1195aa310b74e2c7aca6",
+          "claim": "Deck 讀 persona catalog，逐 Card 保留角色、inputs/outputs 與 execution policy，編譯 WorkflowManifest。"
+        }
+      ]
+    },
+    {
+      "id": "persona-to-guardrail",
+      "from": "persona-contracts",
+      "to": "scope-guardrail",
+      "label": "提供 write_paths 與 allowed_tools",
+      "variant": "default",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/persona/guardrail.py",
+          "line": 18,
+          "end_line": 81,
+          "excerpt_sha256": "fcacb3b7b8c0c3d395617257dd8004f5ed65ebec7d60338106677fd4348fdf1c",
+          "claim": "Guardrail 依角色契約檢查路徑與工具，回傳准駁；本身不是流程推進器。"
+        }
+      ]
+    },
+    {
+      "id": "planning-to-executors",
+      "from": "planning-artifacts",
+      "to": "headless-executors",
+      "label": "由 Manager 以固定 input snapshot 交付",
+      "variant": "default",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 56,
+          "end_line": 58,
+          "excerpt_sha256": "45b8e16b6c833bee68009343523dc7056b9e0f6a1078b45c60323fc945387e10",
+          "claim": "Manager seed accepted planning inputs 並在 terminalize 重驗。"
+        }
+      ]
+    },
+    {
+      "id": "work-read-model-to-manager",
+      "from": "work-read-model",
+      "to": "manager",
+      "label": "提供 confirmed authority，通過 claim gate 才受理",
+      "variant": "default",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28,
+          "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+          "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 32,
+          "end_line": 40,
+          "excerpt_sha256": "6932289e76f62dadd768292e071959f7ff8234bcc9b89ff1366e616d4ad58ed1",
+          "claim": "confirmed association 與 persona-preserving manifest；異質 brainstorm 的宣告式契約。"
+        }
+      ]
+    },
+    {
+      "id": "work-sources-to-monitor",
+      "from": "work-sources",
+      "to": "monitor",
+      "label": "讀入 GitHub／repo source snapshots",
+      "variant": "default",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28,
+          "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+          "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+        }
+      ]
+    },
+    {
+      "id": "workflow-to-monitor",
+      "from": "workflow-registry",
+      "to": "monitor",
+      "label": "提供 Run／Step 進度給唯讀 provider",
+      "variant": "default",
+      "basis": "declared",
+      "evidence": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28,
+          "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+          "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+        }
+      ]
     }
-  ]
+  ],
+  "unknowns": [
+    {
+      "id": "deployment-enforcement",
+      "question": "各部署 host 實際採 direct、systemd-run 或 systemd-template 的哪一種隔離模式？",
+      "impact": "本頁只畫 source 所提供的權責與條件路徑，不保證特定部署已啟用 OS 隔離。"
+    }
+  ],
+  "conflicts": [],
+  "workflow_review": {
+    "schema_version": 1,
+    "id": "feature-oneshot",
+    "title": "Cortex：誰控制流程，一件工作如何完成？",
+    "scope_note": "Deck 定義流程；Persona 定義角色範圍；Manager 執行並判定推進；WorkflowRun 保存本次進度；Monitor 投影對外狀態。以下展開 feature-oneshot，並非所有 combo 的通用順序。",
+    "controller": "manager",
+    "observer": "monitor",
+    "state_store": "workflow-registry",
+    "roles": [
+      {
+        "id": "manager",
+        "label": "Manager 角色",
+        "component": "persona-contracts",
+        "allowed_phases": [
+          "claim",
+          "define",
+          "plan",
+          "build",
+          "verify",
+          "review",
+          "ship"
+        ],
+        "description": "允許參與七階段；此 workflow 的 claim／ship 綁 manager。執行期 Manager 程式讀取此契約，不表示有第二個同名 Agent 控制進度。",
+        "basis": "observed",
+        "evidence": [
+          {
+            "path": "paulsha_cortex/persona/personas.yaml",
+            "line": 1,
+            "end_line": 37,
+            "excerpt_sha256": "3c6bd08915ba5648758f36c9d2b3d118194a4b27fd41d4d12233c04ae54a20d0",
+            "claim": "角色是 allowed_phases/write_paths/allowed_tools/skills 契約；四個角色的允許範圍。"
+          }
+        ]
+      },
+      {
+        "id": "planner",
+        "label": "Planner",
+        "component": "persona-contracts",
+        "allowed_phases": [
+          "define",
+          "plan"
+        ],
+        "description": "負責 define／plan 的 accepted spec、design 與 plan；不以規劃角色越權建置或交付。",
+        "basis": "observed",
+        "evidence": [
+          {
+            "path": "paulsha_cortex/persona/personas.yaml",
+            "line": 1,
+            "end_line": 37,
+            "excerpt_sha256": "3c6bd08915ba5648758f36c9d2b3d118194a4b27fd41d4d12233c04ae54a20d0",
+            "claim": "角色是 allowed_phases/write_paths/allowed_tools/skills 契約；四個角色的允許範圍。"
+          }
+        ]
+      },
+      {
+        "id": "builder",
+        "label": "Builder",
+        "component": "persona-contracts",
+        "allowed_phases": [
+          "build"
+        ],
+        "description": "只在 build 範圍實作與測試。依 Card 的 commit_policy 提交 Candidate，不能替 reviewer 自證通過。",
+        "basis": "observed",
+        "evidence": [
+          {
+            "path": "paulsha_cortex/persona/personas.yaml",
+            "line": 1,
+            "end_line": 37,
+            "excerpt_sha256": "3c6bd08915ba5648758f36c9d2b3d118194a4b27fd41d4d12233c04ae54a20d0",
+            "claim": "角色是 allowed_phases/write_paths/allowed_tools/skills 契約；四個角色的允許範圍。"
+          }
+        ]
+      },
+      {
+        "id": "reviewer",
+        "label": "Reviewer",
+        "component": "persona-contracts",
+        "allowed_phases": [
+          "verify",
+          "review"
+        ],
+        "description": "負責 verify／review，回傳報告與 verdict；不直接改程式或宣告整個工作 done。",
+        "basis": "observed",
+        "evidence": [
+          {
+            "path": "paulsha_cortex/persona/personas.yaml",
+            "line": 1,
+            "end_line": 37,
+            "excerpt_sha256": "3c6bd08915ba5648758f36c9d2b3d118194a4b27fd41d4d12233c04ae54a20d0",
+            "claim": "角色是 allowed_phases/write_paths/allowed_tools/skills 契約；四個角色的允許範圍。"
+          }
+        ]
+      }
+    ],
+    "steps": [
+      {
+        "id": "claim",
+        "order": 1,
+        "label": "Claim｜受理工作",
+        "persona": "manager",
+        "actor": "manager",
+        "cards": [
+          "workflow-claim"
+        ],
+        "conditional_cards": [],
+        "inputs": [
+          "confirmed Todo／issue mapping 與可用來源",
+          "明確 start／intake 請求，或符合 auto claim 的 label 與前置條件",
+          "Deck 編譯且 Persona binding 合法的 manifest"
+        ],
+        "outputs": [
+          "帶 claim_key 的 WorkflowRun／steps／初始進度",
+          "來源 authority 與 run identity 的綁定"
+        ],
+        "gates": [
+          "只有 topic 的 issue 不足以 claim",
+          "關聯與來源必須明確；provider degraded／collision 時不得授權",
+          "Manager 經受理路徑建立或 idempotent resume 同一工作"
+        ],
+        "failure": [
+          "缺 issue／mapping／readiness 時保留原因並停止；先補齊來源，不手改 jobs.json"
+        ],
+        "next": "define",
+        "related_components": [
+          "work-sources",
+          "control-queue",
+          "deck-compiler",
+          "persona-contracts",
+          "manager",
+          "monitor",
+          "workflow-registry"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "README.md",
+            "line": 412,
+            "end_line": 414,
+            "excerpt_sha256": "7e8128bdf2cbecacc49372857dcdd202797147928882470c0f93682c6c63e9ca",
+            "claim": "CLI mutation 送 control request queue，由 Manager daemon 單一 writer 處理，不直接改 registry。"
+          },
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 20,
+            "end_line": 28,
+            "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+            "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+          },
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 32,
+            "end_line": 40,
+            "excerpt_sha256": "6932289e76f62dadd768292e071959f7ff8234bcc9b89ff1366e616d4ad58ed1",
+            "claim": "confirmed association 與 persona-preserving manifest；異質 brainstorm 的宣告式契約。"
+          },
+          {
+            "path": "docs/onboarding/concepts.md",
+            "line": 48,
+            "end_line": 51,
+            "excerpt_sha256": "17868b0aa0449d62842ce312fd41b5c920e1ba110621e566885a228ddeb46f03",
+            "claim": "Work 必須先為 confirmed todo 才能取得 claim/start；topic issue 不足。"
+          }
+        ]
+      },
+      {
+        "id": "define",
+        "order": 2,
+        "label": "Define｜需求與設計",
+        "persona": "planner",
+        "actor": "headless-executors",
+        "cards": [
+          "brainstorming",
+          "openspec-propose"
+        ],
+        "conditional_cards": [],
+        "inputs": [
+          "工作範圍與目前 spec/design 的 completeness",
+          "既有已接受的 planning authority（如有）"
+        ],
+        "outputs": [
+          "accepted spec／design",
+          "OpenSpec proposal／tasks",
+          "需要 brainstorm 時的獨立 peer evidence"
+        ],
+        "gates": [
+          "缺少 accepted 三件組或有未決問題時，由 primary planner 發出問題包",
+          "需要 peer 時必須為不同 independence domain",
+          "Manager 驗證 planning artifact 與 evidence，不能只接受「已想清楚」"
+        ],
+        "failure": [
+          "異質 planner 不可用、仍有未決項或 artifact 驗證失敗時停止；不要把未決需求送給 Builder"
+        ],
+        "next": "plan",
+        "related_components": [
+          "manager",
+          "headless-executors",
+          "persona-contracts",
+          "planning-artifacts",
+          "gate-evidence"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/cards.yaml",
+            "line": 1,
+            "end_line": 206,
+            "excerpt_sha256": "1530062ce217b5ba54e5f6f0042cef3f65c27c376ecc328355e1b36cc6bba3c8",
+            "claim": "Card catalog 的 phase／persona／requires／produces／execution policy。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/combos/feature-oneshot.yaml",
+            "line": 1,
+            "end_line": 35,
+            "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
+            "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
+          }
+        ]
+      },
+      {
+        "id": "plan",
+        "order": 3,
+        "label": "Plan｜可執行計畫",
+        "persona": "planner",
+        "actor": "headless-executors",
+        "cards": [
+          "writing-plans"
+        ],
+        "conditional_cards": [],
+        "inputs": [
+          "accepted spec／design 與 OpenSpec proposal",
+          "Card requires 與工作範圍"
+        ],
+        "outputs": [
+          "implementation plan",
+          "綁定 kind／ref／hash 的 planning input snapshot"
+        ],
+        "gates": [
+          "計畫必須是 accepted artifact，且與 WorkflowRun authority 一致",
+          "launch／terminalize 都驗 input snapshot；來源 revision 與 Candidate git base 分開"
+        ],
+        "failure": [
+          "缺計畫、內容或 hash 漂移時 needs_human；修正 authority 後循正式 resume 入口"
+        ],
+        "next": "build",
+        "related_components": [
+          "manager",
+          "headless-executors",
+          "persona-contracts",
+          "planning-artifacts",
+          "workflow-registry"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/cards.yaml",
+            "line": 1,
+            "end_line": 206,
+            "excerpt_sha256": "1530062ce217b5ba54e5f6f0042cef3f65c27c376ecc328355e1b36cc6bba3c8",
+            "claim": "Card catalog 的 phase／persona／requires／produces／execution policy。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/combos/feature-oneshot.yaml",
+            "line": 1,
+            "end_line": 35,
+            "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
+            "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
+          }
+        ]
+      },
+      {
+        "id": "build",
+        "order": 4,
+        "label": "Build｜RED → 實作 → Commit",
+        "persona": "builder",
+        "actor": "headless-executors",
+        "cards": [
+          "worktree-isolation",
+          "tdd-red",
+          "subagent-build"
+        ],
+        "conditional_cards": [],
+        "inputs": [
+          "Manager provision 的 builder worktree",
+          "固定 accepted plan 與 declared inputs",
+          "每張 Card 的 test_policy／commit_policy"
+        ],
+        "outputs": [
+          "可重現缺口的 RED regression",
+          "使 RED 轉綠的程式與測試",
+          "已 commit 的 Candidate HEAD、log 與 terminal payload"
+        ],
+        "gates": [
+          "worktree-isolation 不另建第二工作區且 commit forbidden",
+          "tdd-red 必須留下 RED；subagent-build 必須 focused test＋required commit",
+          "Manager 獨立驗證 Candidate／input hash／terminal schema；exit 0 不是 done"
+        ],
+        "failure": [
+          "build／terminal binding 失敗保留 Job 與 log；依目前允許的 resume／retry-card／retry-build 恢復"
+        ],
+        "next": "verify",
+        "related_components": [
+          "manager",
+          "headless-executors",
+          "persona-contracts",
+          "candidate-worktree",
+          "planning-artifacts",
+          "verification-gate",
+          "workflow-registry"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/cards.yaml",
+            "line": 1,
+            "end_line": 206,
+            "excerpt_sha256": "1530062ce217b5ba54e5f6f0042cef3f65c27c376ecc328355e1b36cc6bba3c8",
+            "claim": "Card catalog 的 phase／persona／requires／produces／execution policy。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/combos/feature-oneshot.yaml",
+            "line": 1,
+            "end_line": 35,
+            "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
+            "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
+          }
+        ]
+      },
+      {
+        "id": "verify",
+        "order": 5,
+        "label": "Verify｜機械驗證",
+        "persona": "reviewer",
+        "actor": "headless-executors",
+        "cards": [
+          "verification"
+        ],
+        "conditional_cards": [],
+        "inputs": [
+          "凍結的 Candidate HEAD",
+          "repository policy 定義的驗證命令與全套測試",
+          "與這次 Run/Card 綁定的 input evidence"
+        ],
+        "outputs": [
+          "verification report",
+          "命令結果、受測版本與 evidence binding"
+        ],
+        "gates": [
+          "對同一 exact Candidate 驗證，不接受舊 HEAD 的綠燈",
+          "Manager 檢查 canonical evidence／gate consistency；降權模式由 gate 帳號重跑命令",
+          "verify 過關只代表可進 review，不等於已交付"
+        ],
+        "failure": [
+          "測試或 evidence 不合即停止；若修出新 Candidate，原 verify／review 必須重做"
+        ],
+        "next": "review",
+        "related_components": [
+          "manager",
+          "headless-executors",
+          "persona-contracts",
+          "candidate-worktree",
+          "verification-gate",
+          "gate-evidence"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/cards.yaml",
+            "line": 1,
+            "end_line": 206,
+            "excerpt_sha256": "1530062ce217b5ba54e5f6f0042cef3f65c27c376ecc328355e1b36cc6bba3c8",
+            "claim": "Card catalog 的 phase／persona／requires／produces／execution policy。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/combos/feature-oneshot.yaml",
+            "line": 1,
+            "end_line": 35,
+            "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
+            "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
+          }
+        ]
+      },
+      {
+        "id": "review",
+        "order": 6,
+        "label": "Review｜獨立審查",
+        "persona": "reviewer",
+        "actor": "headless-executors",
+        "cards": [
+          "code-review"
+        ],
+        "conditional_cards": [
+          {
+            "id": "adversarial-review",
+            "condition": "sizing 為 Yellow／Red 時加入；band 未知時保守加入；Green 不加。"
+          }
+        ],
+        "inputs": [
+          "已驗證的 exact Candidate",
+          "verify report 與變更 artifacts",
+          "不同於 Builder 的 reviewer independence domain"
+        ],
+        "outputs": [
+          "ForeignReview verdict／findings",
+          "依 sizing band 需要時的 adversarial-review report"
+        ],
+        "gates": [
+          "ForeignReview 必須對 exact HEAD 且符合獨立性",
+          "blocking findings 不能升級成 passed",
+          "條件式 adversarial-review 必須完成；本 review 不能代替 Ship 的 delivery review"
+        ],
+        "failure": [
+          "被退件時走受限修正路徑；Candidate 改變後再 verify＋review，不沿用舊 verdict"
+        ],
+        "next": "ship",
+        "related_components": [
+          "manager",
+          "headless-executors",
+          "persona-contracts",
+          "candidate-worktree",
+          "gate-evidence",
+          "verification-gate"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/cards.yaml",
+            "line": 1,
+            "end_line": 206,
+            "excerpt_sha256": "1530062ce217b5ba54e5f6f0042cef3f65c27c376ecc328355e1b36cc6bba3c8",
+            "claim": "Card catalog 的 phase／persona／requires／produces／execution policy。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/combos/feature-oneshot.yaml",
+            "line": 1,
+            "end_line": 35,
+            "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
+            "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
+          }
+        ]
+      },
+      {
+        "id": "ship",
+        "order": 7,
+        "label": "Ship｜交付與遠端閉環",
+        "persona": "manager",
+        "actor": "manager",
+        "cards": [
+          "openspec-archive",
+          "policy-commit"
+        ],
+        "conditional_cards": [],
+        "inputs": [
+          "同一 Candidate 的 verify 與 ForeignReview evidence",
+          "confirmed PR／OpenSpec／Todo targets",
+          "來源與 GitHub provider 必須可用"
+        ],
+        "outputs": [
+          "官方 archive、policy／preflight 結果",
+          "typed current-HEAD delivery review 與 merge evidence",
+          "遠端閉環驗證後的 CompletionRecord，供 Monitor 投影 done"
+        ],
+        "gates": [
+          "依 local-closeout → pr-preflight → external-ship 執行；不是只有按 merge",
+          "checks／delivery review／threads／final HEAD race check 全對準同一 HEAD",
+          "merge 後再驗 ancestry、issue closed、remote archive、Todo；全部成立才完成"
+        ],
+        "failure": [
+          "HEAD 漂移／preflight 或遠端閉環未完成時停止並保留原因",
+          "provider backoff 與 needs_human 不混用；PR 已 merge 仍不可跳過 closure"
+        ],
+        "next": "done",
+        "related_components": [
+          "manager",
+          "delivery-closure",
+          "gate-evidence",
+          "completion-record",
+          "monitor",
+          "work-sources"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/cards.yaml",
+            "line": 1,
+            "end_line": 206,
+            "excerpt_sha256": "1530062ce217b5ba54e5f6f0042cef3f65c27c376ecc328355e1b36cc6bba3c8",
+            "claim": "Card catalog 的 phase／persona／requires／produces／execution policy。"
+          },
+          {
+            "path": "paulsha_cortex/deck/data/combos/feature-oneshot.yaml",
+            "line": 1,
+            "end_line": 35,
+            "excerpt_sha256": "376a843dba29b462e67ae871ac5a3c402fa85de4539f0c04472b6213cb06874a",
+            "claim": "feature-oneshot 核心順序與 band-triggered adversarial-review。"
+          }
+        ]
+      }
+    ],
+    "recoveries": [
+      {
+        "id": "candidate-repair",
+        "label": "Candidate 需要修正",
+        "from_steps": [
+          "build",
+          "verify",
+          "review",
+          "ship"
+        ],
+        "resume_steps": [
+          "build",
+          "verify",
+          "review"
+        ],
+        "authority": "manager",
+        "condition": "在受支援的 needs_human／CAS／無 active job 條件下，需重新實作或修正 Candidate。",
+        "action": "以 current expected_candidate 走正式 retry-build；Manager 獨立驗 ancestry，新的 HEAD 再跑 verify 與 review。",
+        "invalidates": [
+          "新 Candidate 不得沿用舊 HEAD 的 verify、review 或 downstream ship authority。"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "README.md",
+            "line": 428,
+            "end_line": 428,
+            "excerpt_sha256": "be71c015e0cf60b9b974ec561eab34e8794e804f64b1d61e25ff3f91cdc3e180",
+            "claim": "retry-build 的 expected_candidate、前置狀態、恢復分支與下游 authority invalidation。"
+          }
+        ]
+      },
+      {
+        "id": "human-stop",
+        "label": "人工暫停／Job 失敗",
+        "from_steps": [
+          "plan",
+          "build",
+          "verify",
+          "review"
+        ],
+        "resume_steps": [
+          "plan",
+          "build",
+          "verify",
+          "review"
+        ],
+        "authority": "manager",
+        "condition": "Run 帶 needs_human 或 terminal/dispatch evidence 不成立。",
+        "action": "Manager periodic runner 不自動清掉 needs_human；operator 透過 queue 明確 resume，或依 next_actions 選擇允許的 retry-card。",
+        "invalidates": [
+          "舊 Job／log 留存；新 attempt 必須重新驗證，不把舊失敗紀錄改成成功。"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 9370,
+            "end_line": 9412,
+            "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+            "claim": "Manager 的實際 workflow spawn 點以當前 Run/Step、角色與 Candidate 選取或建立 Job。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 10181,
+            "end_line": 10227,
+            "excerpt_sha256": "d1f741bed8411de6e7fc0d19eb550ca16103361d52f132f938d98bab84719b61",
+            "claim": "provider backoff 與 needs_human 分開；非 operator resume 不得自動清掉人工暫停。"
+          }
+        ]
+      },
+      {
+        "id": "planning-drift",
+        "label": "規劃／輸入漂移",
+        "from_steps": [
+          "define",
+          "plan",
+          "build"
+        ],
+        "resume_steps": [
+          "define",
+          "plan"
+        ],
+        "authority": "manager",
+        "condition": "accepted artifact 缺失、hash 不一致或 planning authority reconciliation 失敗。",
+        "action": "先修正可驗證 planning authority，再用正式 control/resume 路徑；不能把任意新檔案當 accepted input。",
+        "invalidates": [
+          "漂移的 planning inputs 不可沿用；passed 卡不因補檔靜默回填 gate。"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          }
+        ]
+      },
+      {
+        "id": "provider-and-ship",
+        "label": "Provider／Ship 未閉環",
+        "from_steps": [
+          "claim",
+          "define",
+          "plan",
+          "build",
+          "verify",
+          "review",
+          "ship"
+        ],
+        "resume_steps": [
+          "claim",
+          "define",
+          "plan",
+          "build",
+          "verify",
+          "review",
+          "ship"
+        ],
+        "authority": "manager",
+        "condition": "provider rate limit/backoff、degraded source、current HEAD drift、或 merge 後 closure 不全。",
+        "action": "先遵守 durable provider retry window／來源 freshness；typed human stop 仍須 explicit resume。PR 已 merge 時僅重驗尚缺的遠端完成證據，不重複宣稱完成。",
+        "invalidates": [
+          "degraded 不是空來源；prior read model 保留。舊 HEAD evidence 不授權新 HEAD 的 merge。"
+        ],
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 20,
+            "end_line": 28,
+            "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+            "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+          },
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 10181,
+            "end_line": 10227,
+            "excerpt_sha256": "d1f741bed8411de6e7fc0d19eb550ca16103361d52f132f938d98bab84719b61",
+            "claim": "provider backoff 與 needs_human 分開；非 operator resume 不得自動清掉人工暫停。"
+          }
+        ]
+      }
+    ],
+    "state_models": [
+      {
+        "id": "facets",
+        "label": "Facets：阻塞與健康註記",
+        "writer": "manager",
+        "reader": "monitor",
+        "states": [
+          "blocked",
+          "needs_human",
+          "degraded"
+        ],
+        "meaning": "這是與 lifecycle 正交的註記，不是新增第五、第六種 WorkItem 狀態。Manager 寫 Run facets；Monitor 也會在自己的 read model 依 provider health 加 degraded。",
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 20,
+            "end_line": 28,
+            "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+            "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+          }
+        ]
+      },
+      {
+        "id": "job",
+        "label": "Job：一次實際程序嘗試",
+        "writer": "manager",
+        "reader": "monitor",
+        "states": [
+          "dispatched",
+          "running",
+          "exited",
+          "failed"
+        ],
+        "meaning": "Job 是 executor 的單次執行。exited/0 只是程序成功，仍需 gate evidence 與 terminal closure；不是交付完成。",
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "README.md",
+            "line": 449,
+            "end_line": 453,
+            "excerpt_sha256": "2773bf09ffd7cdc2f0e984850438160db3fc6841c3630ab5731e31cb1dfdb3a1",
+            "claim": "Job、Slice、Gate 的不同 state 與交付語意。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 6281,
+            "end_line": 6348,
+            "excerpt_sha256": "d0d4a1671b3d2bb1e11baabb5a9a8ce3484b8f718073e56d2afe8559615f773b",
+            "claim": "成功 exit 只是 terminalize 的必要條件；Manager 仍收斂 canonical evidence 並執行 gate consistency 檢查。"
+          }
+        ]
+      },
+      {
+        "id": "slice",
+        "label": "Slice：交付切片／legacy lane",
+        "writer": "manager",
+        "reader": "monitor",
+        "states": [
+          "pending",
+          "building",
+          "reviewing",
+          "verified",
+          "completed",
+          "needs_human",
+          "failed"
+        ],
+        "meaning": "Slice 包住 build／verify／review 等 gate，與 WorkflowRun 不能混成同一狀態機。依賴 release 只接受 completed＋CompletionRecord/hash/target ancestry，不接受 Job exited。",
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "README.md",
+            "line": 449,
+            "end_line": 455,
+            "excerpt_sha256": "3463d6557347ad18351cfae0284b096e765b9a04d66e38304b38ae24ddd41976",
+            "claim": "Job、Slice、Gate 狀態以及依賴 release 的必要完成證據。"
+          }
+        ]
+      },
+      {
+        "id": "work-item",
+        "label": "WorkItem：整件工作的對外投影",
+        "writer": "monitor",
+        "reader": "manager",
+        "states": [
+          "topic",
+          "todo",
+          "on-going",
+          "done"
+        ],
+        "meaning": "Monitor 聚合多來源並寫自己的 snapshot；Manager 讀 confirmed authority。done 是 strict remote closure，不是 Job exit 或單純 PR closed。",
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 20,
+            "end_line": 28,
+            "excerpt_sha256": "9786e2699a5cdb8d42da23e32a9227e4cb283d1ca9a099ec3e47129038e154e9",
+            "claim": "四態與 facets 分離；Monitor 聚合 last-good，Manager 持有 lifecycle mutation authority。"
+          },
+          {
+            "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+            "line": 44,
+            "end_line": 62,
+            "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
+            "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+          }
+        ]
+      },
+      {
+        "id": "workflow-run",
+        "label": "WorkflowRun／Step：本次流程進度",
+        "writer": "manager",
+        "reader": "monitor",
+        "states": [
+          "claim",
+          "define",
+          "plan",
+          "build",
+          "verify",
+          "review",
+          "ship"
+        ],
+        "meaning": "Run 保存 current_phase；每張 Card 對應一個 Step。Step gate_result 與 Run phase 不是 WorkItem 四態。重試可能對同一卡產生新的 Job attempt。",
+        "basis": "declared",
+        "evidence": [
+          {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 9370,
+            "end_line": 9412,
+            "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+            "claim": "Manager 的實際 workflow spawn 點以當前 Run/Step、角色與 Candidate 選取或建立 Job。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/workflow.py",
+            "line": 173,
+            "end_line": 213,
+            "excerpt_sha256": "8dd0b1d2af3884c849abc993ecbf3d1fa29abe87861f8e54a6ec7f31dfeb8045",
+            "claim": "WorkflowStep 保存 phase/persona/card 及 gate_result、inputs/outputs。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/workflow.py",
+            "line": 378,
+            "end_line": 421,
+            "excerpt_sha256": "3c0b9363f52205f8a1acf7d27fdd557803b0b02fe767fb68cd36436fcd3a012c",
+            "claim": "WorkflowRun 保存 Manager-owned aggregate，包括 current_phase、steps、attempts、evidence 與 completion binding。"
+          }
+        ]
+      }
+    ]
+  }
 }
