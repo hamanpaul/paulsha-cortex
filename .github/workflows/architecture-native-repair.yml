@@ -34,7 +34,7 @@ jobs:
           folder=Path('.ci/architecture-native')
           encoded=''.join((folder/f'part{i}.txt').read_text().strip() for i in range(4))
           compressed=base64.b64decode(encoded,validate=True)
-          assert hashlib.sha256(compressed).hexdigest()=='b56ef28da0d991b078741572bf8b53cfa3d3b0100c845f0f139b09979bab9882'
+          assert hashlib.sha256(compressed).hexdigest()=='0ef26296d755b96022b1c2b3eb2e94c60b0bd35830df0b431da283d69e91ef5d'
           with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:raw=stream.read(2000001)
           assert len(raw)<=2000000
           records=json.loads(raw)['files'];assert len(records)==8
