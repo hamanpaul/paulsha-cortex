@@ -4405,6 +4405,23 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
     raise ValueError("workflow terminal log has no JSON evidence")
 
 
+
+# #888：agy 以 --json-schema 產出 structured output 時，會在 canonical payload 之外
+# 多掛 Antigravity 自己的 tool 中繼欄位（toolAction／toolSummary）。這兩個鍵不是
+# 模型自由發揮，而是 CLI 把 schema 包成 function declaration 的固定副產物；只剝
+# 這兩個固定鍵，其餘多餘鍵仍交由 terminalize 的 exact key-set 檢查 fail closed。
+_AGY_STRUCTURED_OUTPUT_META_KEYS = ("toolAction", "toolSummary")
+
+
+def _strip_agy_structured_output_meta(payload: dict[str, object]) -> dict[str, object]:
+    if not any(key in payload for key in _AGY_STRUCTURED_OUTPUT_META_KEYS):
+        return payload
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _AGY_STRUCTURED_OUTPUT_META_KEYS
+    }
+
 def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
     if not isinstance(value, str):
         return None
@@ -4433,9 +4450,11 @@ def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
             except json.JSONDecodeError:
                 continue
             if _is_workflow_terminal_payload(parsed):
-                return parsed
+                return _strip_agy_structured_output_meta(parsed)
         return None
-    return parsed if _is_workflow_terminal_payload(parsed) else None
+    if not _is_workflow_terminal_payload(parsed):
+        return None
+    return _strip_agy_structured_output_meta(parsed)
 
 
 def _is_workflow_terminal_payload(value: object) -> bool:

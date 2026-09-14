@@ -346,3 +346,31 @@ def test_verification_object_details_remain_unchanged(tmp_path: Path) -> None:
 
     evidence = _evidence_payload(bound, coordinator_root)
     assert evidence["payload"]["details"] == {"checks": {"pytest": "passed"}}
+
+
+def test_agy_structured_output_meta_keys_are_stripped_from_terminal_payload() -> None:
+    # #888：agy --json-schema 的實機 response = 模型的 fenced 文字 + 最後一行
+    # structured output（多掛 toolAction／toolSummary）。Manager 必須拿最後那行，
+    # 並只剝掉這兩個固定的 CLI 中繼鍵，details 物件形狀原樣保留。
+    from paulsha_cortex.coordinator import manager as manager_module
+
+    response = (
+        "```json\n"
+        "{\n  \"schema_version\": 1,\n  \"kind\": \"workflow-verification-result\"\n}\n"
+        "```\n"
+        "{\"details\":{\"text\":\"ok\"},\"kind\":\"workflow-verification-result\","
+        "\"reports\":[{\"body\":\"ok\",\"path\":\"reports/verify/x.md\"}],"
+        "\"schema_version\":1,\"status\":\"verified\",\"summary\":\"ok\","
+        "\"toolAction\":\"Finishing the interaction\",\"toolSummary\":\"Workflow verification result\"}\n"
+    )
+    parsed = manager_module._parse_terminal_json_text(response)
+    assert parsed == {
+        "details": {"text": "ok"},
+        "kind": "workflow-verification-result",
+        "reports": [{"body": "ok", "path": "reports/verify/x.md"}],
+        "schema_version": 1,
+        "status": "verified",
+        "summary": "ok",
+    }
+    untouched = {"schema_version": 1, "kind": "workflow-review-result", "reports": [], "extra": 1}
+    assert manager_module._strip_agy_structured_output_meta(untouched) is untouched
