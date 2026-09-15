@@ -19,6 +19,9 @@
   同時鎖定 burst thread 上界、事件 callback 不建 refresh Timer、stop 後 late event 拒收，
   並保留 workspace 全量 refresh 與 burst coalesce 語意。#827 完整公平／provider／
   publication fence 仍由 2.2 列管。
+- [x] 2.2.0-repair pre-archive：更新基線後重跑 #879 monitor 與 #591 shadow-reader 回歸，
+  確認候選可進 archive 前置驗證；archive、PR、issue closure 與 runtime qualification
+  仍待後續責任方處理。
 - [ ] 2.2.1 先依 #853 交付 watcher-only A child 的固定 worker、raw0、generation/共享 backend、partial-scan latch 與 nonfollow VFS；現行8/Red不可派，#831 loaded 後重評。B work-model 與 C service 的 provider 公平、durable publication fence、整體 drain 仍需各自交付，不以 A 關閉母票。
 - [ ] 2.3 完成 #819 not-idle clock、periodic 有效 max_load/require_idle 與非法值處置。
 - [ ] 2.4 依 accepted 三件組完成 #496 內容/狀態冪等，驗同 path 內容改變仍恰好記錄；保留現行 7/Red，#831 後真重評。
