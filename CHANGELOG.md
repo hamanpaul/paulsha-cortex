@@ -9,6 +9,8 @@
 
 - 架構圖釐清 WorkflowRun／Phase／Card／Job：新增 Card 與 attempt 節點、逐階段 Persona 與多卡關係；明示既有規劃採用和 Manager 本地交付／deterministic 稽核 Job，不再暗示每次派工重跑七階段。
 
+- **#888 AGY reviewer schema 改寫成 Gemini 相容子集**：#880 帶入的 `--json-schema` 含整數 enum／null type／map 型別，Gemini function declaration 直接 400 或改寫 `authority_hashes` 鍵名；launcher 以 `_gemini_compatible_schema` 改寫（整數單值 enum → minimum/maximum、null type → nullable、字串鍵 map → `[{key, value}]`），Manager 剝掉 agy structured output 的 `toolAction`／`toolSummary` 中繼鍵並把 key/value 陣列摺回 mapping。Claude 契約仍是唯一來源。
+
 - 修正架構交付誤用說明頁：canonical HTML 改回原版 Archify SVG；新增節點／方向箭頭與流程／條件修正回路驗收，不再以文字頁測試冒充架構圖。
 
 - 架構 HTML 驗收：補齊 Persona／Monitor／Manager 權責、16 元件／22 關係、feature-oneshot 七階段與恢復／狀態模型；加入 README 入口及 source／HTML／browser 回歸驗證。不改 runtime 行為。
