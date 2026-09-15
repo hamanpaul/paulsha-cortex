@@ -3304,7 +3304,22 @@ cortex 自身的 secondary-limit 分診終局而維持 evidence-insufficient。
 - **以效果斷言，不以回傳值斷言。** 對像 `seal` 這種「失敗不 raise」的流程，case 必須證明
   producer 實際寫不進去，而不是只看函式有沒有丟例外。來源：本盤點；執行機制：無（未來 harness）。
 
-## 十四、下一步建議（供 R3 排序參考）
+## 十四、第二輪完成摘要
+
+- **重算結果**：候選清單現為 **109 筆**去重候選；`hit_by` 分佈為四路 **1**、三路 **9**、二路
+  **32**、單路 **67**；`evidence-insufficient` 收斂為 **31 筆**。
+- **T1 補讀 6 張**：新增候選 **103／104／105／106**；候選 **77** 由單路升級為雙路；`#506`
+  補到 manager／monitor 呼叫形狀證據後仍維持 evidence-insufficient 9。
+- **T2 ship／delivery**：PR metadata preflight／merge authorization／push readback 新增候選
+  **107／108／109**；delivery journal 與 closed-unmerged PR 分別由既有候選 **92／78** 承接。
+- **T3 porcelain**：supported path 與 operator bypass 已分群；`systemctl --user`、
+  `gh api graphql`、`pipx install --force` 等旁路均已明記在 **§十**。
+- **T4 T1 決定**：三筆首批候選全數標為 **首批（待 R2）**，理由與依賴已整理成四欄表，未在本輪開票。
+- **T5 契約備註**：`verification.py` 的 `schema_version`／`slice_id`／`candidate`／`status`／
+  `summary`／`details` 六欄已寫入 attestation 對齊節；`unsupported` vs `passed` 可區分、
+  production generator provenance 與效果斷言等四條 harness 硬規則亦已補齊。
+
+## 十五、下一步建議（供 R3 排序參考）
 
 1. **首批三筆仍是候選 1／2／3。** 它們已在 **§十一** 決定為 `首批（待 R2）`；R2 Compact 一收斂，
    就可直接開實作票。
