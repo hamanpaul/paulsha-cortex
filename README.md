@@ -133,6 +133,14 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    同為**必填**，未宣告時 Manager 在派工前即 fail-closed。值由產生器導出，不要手打：
    `python3 -m paulsha_cortex.trust_root unit four-way --job | grep '^Environment=PATH='`。
 
+   **#823 headless session 的生命週期邊界**：每個合法 headless `Popen` 嘗試（含
+   `systemd-run`／`systemd-template` 的 Manager-side client wrapper 與窄 `stdin` retry）都帶
+   `start_new_session=True`。direct child 因此有自己的 POSIX session/process group；這是
+   `setsid` 隔離，不是 systemd cgroup 移動，也不改變 unit 的 `KillMode` 或提供 cgroup
+   restart survival 保證。Manager daemon restart、timeout/parser/CLI 值域（#824）與 AGY
+   probe containment（#851）仍是獨立工作項；本 session 修正不新增 cancel/timeout/probe
+   語意，也不宣稱這些 issue 已完成或關閉。
+
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 
    ```bash
@@ -393,7 +401,14 @@ systemctl --user status cortex-manager.service cortex-monitor.service
 
 - `ready`：已滿足派工條件。
 - `held`：尚未可派工，並列出 `no-plan`、`dispatch-hold` 或未滿足的 dependency。
-- `in_flight`：正在執行的 Job，含 `candidate_git_base`（見下）。
+- `in_flight`：正在執行的 Job，含 `candidate_git_base`（見下）以及由 registry job
+  實際綁定的 `executor`、`model`、`job_id`、`card`、`identity_source` 與
+  `execution_state`。workflow 的 `attention`／`recent_done` 也使用同一組身份欄位：
+  `identity_source` 為 `in-flight`、`last-execution`、`planned` 或 `unknown`；沒有
+  registry 證據時不從 phase／persona 推測 executor 或 model。
+  下游可直接使用去識別化 producer snapshot fixture
+  `tests/fixtures/workflow-execution-identity-828-status.json`；欄位與 selection
+  語意見 `docs/superpowers/specs/workflow-execution-identity-producer-contract.md`。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。
 - `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及 `candidate_git_base`。
 - `candidate_git_base`（#731）：這條 run／這張卡的**候選 git base**——真正那個 40-hex commit SHA，以及它落後 mirror 上 `origin/main` 幾個 commit。欄位含 `sha`、`sha_source`（`frozen-readiness-base-sha` 或 `first-build-job-dispatch-head`）、`behind_origin_main`、`mirror_origin_main`、`threshold_commits`、`reason`、`measured_against`、`fetched`。
@@ -492,6 +507,7 @@ verification:
 
 - v1 只支援 `tier: shareable`；非 shareable 會 fail-closed 到 `needs_human`。
 - verification command 只接受 typed argv（`shell=False`）；採 sanitized env，但這不是 sandbox，不保證隔離 untrusted code。
+- verification frontmatter 的 inline `argv` list 由 zero-dependency YAML subset parser 解析；含逗號或 `]` 的元素需使用單／雙引號，單／雙引號內的反斜線跳脫可保留引號等字面值，尾逗號可容忍，前導／中間空元素與未閉合引號會拒絕。
 - `repo` 為 optional 顯式歸屬宣告（`owner/repo`，#469）：宣告後派工會寫進 builder/reviewer job 的 `workflow_repo`，`recent_done`／`slices` 的 repo 歸屬即投影此值；未宣告維持 `null`，不從本機路徑或 git remote 推斷。非法 shape（不是恰一個 `/` 或任一段為空）會 fail-closed 落 `hold`。
 
 ### Runtime preflight（dispatch 前的 capability 與 provider 新鮮度，#262）

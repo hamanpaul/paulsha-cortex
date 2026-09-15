@@ -797,7 +797,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 999
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -858,7 +858,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 741
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -897,7 +897,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 222
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -920,7 +920,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 223
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -967,7 +967,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 231
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -991,7 +991,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 232
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -1017,7 +1017,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 233
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -1041,7 +1041,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 234
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -1067,7 +1067,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 235
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -1095,7 +1095,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 225
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv, "env": env})
             return _FakeProc()
 
@@ -1147,7 +1147,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 224
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv, "cwd": cwd})
             return _FakeProc()
 
@@ -1181,7 +1181,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 111
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1203,7 +1203,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 222
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1225,7 +1225,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 226
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1294,7 +1294,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 227
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1361,7 +1361,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 456
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv, "cwd": cwd, "env": env})
             return _FakeProc()
 
@@ -1396,7 +1396,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 789
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1437,7 +1437,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 333
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             return _FakeProc()
 
         original = launcher_module.subprocess.Popen
@@ -1537,7 +1537,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 654
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv, "env": env})
             return _FakeProc()
 
