@@ -1,15 +1,19 @@
 ---
-status: proposed
+status: accepted
 work_item: r3-testpilot-case-corpus
+issue: 904
 ---
 
 # r3-testpilot-case-corpus Todo
 
 R3（原 v3 的 1-B）testpilot plugin case 的**素材盤點** workstream，對應 issue `#667`。
 
-**status 刻意不是 `accepted`**：本 workstream 的產出是一份**候選清單**，不是已核可的實作
-計畫。清單本身不進派工鏈、不當 gate、不擋 merge。要把其中任何一筆長成 case，需要另開
-實作票並在該票上取得 accepted 的計畫——本 workstream 不代行那個核可。
+本 workstream 的產出是一份**候選清單**，不是已核可的實作計畫。清單本身不進派工鏈、不當
+gate、不擋 merge。要把其中任何一筆長成 case，需要另開實作票並在該票上取得 accepted 的計畫——
+本 workstream 不代行那個核可。第二輪（`#904`，2026-09-15 進件）承接下列 6 項未勾任務，規劃
+三件套見 `docs/superpowers/specs/r3-testpilot-case-corpus-{spec,design}.md` 與
+`docs/superpowers/plans/r3-testpilot-case-corpus.md`；`status: accepted` 指第二輪盤點計畫已核可，
+不代表任何 case 進入實作。
 
 本票的唯一產出是文件。**明確不做**（`#667` scope fence，越界即為失敗）：不寫任何 case
 yaml、不建 mock provider／tick harness、不動 `paulsha_cortex/` 下任何程式、不預蓋框架。
@@ -62,7 +66,7 @@ yaml、不建 mock provider／tick harness、不動 `paulsha_cortex/` 下任何�
 
 ## 相關
 
-- issue：`#667`
+- issue：`#667`（第一輪）、`#904`（第二輪）
 - 計畫：`~/prj_pri/cortex-redesign-rollout-plan.md` → `Phase R3【原 1-B｜testpilot plugin
   cases，用 Compact 跑】`
 - 清單本體：`docs/superpowers/workstreams/r3-testpilot-case-corpus/case-candidates.md`
