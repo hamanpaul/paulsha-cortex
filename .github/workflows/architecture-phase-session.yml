@@ -1,23 +1,93 @@
 name: Architecture phase session
 on:
   push:
-    branches: [feature/architecture-fact-layer]
+    branches: [feature/architecture-phase-dispatch]
     paths: [.github/workflows/architecture-phase-session.yml]
 permissions:
-  contents: read
+  contents: write
+concurrency:
+  group: architecture-phase-publication
+  cancel-in-progress: false
 jobs:
-  source:
+  publish:
+    if: github.repository == 'hamanpaul/paulsha-cortex'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
-          persist-credentials: false
-      - name: Export only this review branch and pinned source history
-        run: git bundle create /tmp/cortex-phase-source.bundle HEAD
-      - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          name: cortex-phase-source
-          path: /tmp/cortex-phase-source.bundle
-          retention-days: 1
+          repository: tt-a1i/archify
+          ref: a07fa1d5b2a10cbea110c5a2be2817397a301cdc
+          path: .archify-engine
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest==8.3.5 PyYAML==6.0.3
+      - name: Apply hash-bound documentation patch on the merged baseline
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 0d15f2b814ae0e5826b9c7482786a528a7fa1eb2 HEAD
+          python - <<'PY'
+          import base64, hashlib, lzma, subprocess
+          from pathlib import Path
+          data = lzma.decompress(base64.b64decode(Path('.github/architecture-phase.patch.xz.b64').read_text()))
+          assert hashlib.sha256(data).hexdigest() == '084942afaca926c25e3e627cc68e3d8ae1c07465bdb9484cc9953d0f21c0b040', 'Transferred patch mismatch'
+          target = Path('/tmp/architecture-phase.patch')
+          target.write_bytes(data)
+          subprocess.run(['git', 'apply', '--check', str(target)], check=True)
+          subprocess.run(['git', 'apply', str(target)], check=True)
+          PY
+      - name: Native Archify deliver and pinned source regression
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/architecture-phase-review
+          node .archify-engine/archify/bin/archify.mjs deliver architecture docs/architecture/architecture.json docs/architecture/architecture.html --repo-root . --quality showcase --json > /tmp/architecture-phase-review/delivery.json
+          python -m pytest tests/test_architecture_docs.py tests/test_architecture_phase_dispatch.py -q
+          git diff --check
+      - name: Verify every output and remove temporary publication files
+        run: |
+          python - <<'PY'
+          import hashlib, json, subprocess
+          from pathlib import Path
+          expected = {
+            '.github/workflows/architecture-html.yml': '81b7bb75b31fc499028d45d177f15cd906d0f286e4e5ba82b8969206aa028a97',
+            'CHANGELOG.md': '91edaa814ff0753d44cd45c0ea3a75b67d8485c57cc4a5b087d961c4b2baf9f4',
+            'changelog.d/architecture-phase-dispatch.md': '4a9e2157405056d3161347ca9ba23c57fe87bfdf1b8dd2e7cd7d1fcef6e44b56',
+            'docs/architecture/facts.json': '2d7da14324315e81e4671fff6e70c4b60bb7fe60548dcd56f4c612da6d7faf34',
+            'docs/architecture/architecture.json': 'deb3d682124ac1ed24ae098be8c1433ba918b9307cb1e91b7494a533161225ab',
+            'docs/architecture/architecture.html': '1ff0aeb03cfd95af8e70bdd16eafbee7981267936e90907b9fbc25875e566d54',
+            'tests/architecture_browser_review.py': '1a980b6e38b29886d99bf6ff594af96530697b45a31a90c7816eb144e0fbe4b0',
+            'tests/test_architecture_phase_dispatch.py': '7afccf0ac00ab24c87e03bd0d3da7d081e7be910b4ecc8deac4b7770c7590a19',
+          }
+          for name, digest in expected.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, name
+          temporary = ['.github/architecture-phase.patch.xz.b64', '.github/workflows/architecture-phase-session.yml']
+          for name in temporary:
+              Path(name).unlink()
+          allowed = sorted(set(expected) | set(temporary))
+          subprocess.run(['git', 'add', '-A', '--', *allowed], check=True)
+          staged = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert sorted(staged) == allowed, staged
+          Path('/tmp/architecture-phase-review/hashes.json').write_text(json.dumps(expected, indent=2))
+          PY
+      - name: Fast-forward only the requested documentation branch
+        run: |
+          set -euo pipefail
+          current="$(git ls-remote origin refs/heads/feature/architecture-phase-dispatch | cut -f1)"
+          test "$current" = "$GITHUB_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'docs: 釐清 WorkflowRun、Phase、Card 與 Job 層級'
+          git push origin HEAD:refs/heads/feature/architecture-phase-dispatch
+          git rev-parse HEAD > /tmp/architecture-phase-review/document-commit.txt
+      - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        if: always()
+        with:
+          name: architecture-phase-delivery
+          path: /tmp/architecture-phase-review
+          retention-days: 7
