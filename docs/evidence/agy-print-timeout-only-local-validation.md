@@ -48,5 +48,15 @@ Both commands ran from a temporary directory outside the checkout with
 - The downstream `#851` containment behavior stays intact: invalid timeout
   env still fails AGY capability probing closed without blocking a ready
   non-AGY primary runtime.
-- PR-context policy/preflight is intentionally run on the committed candidate,
-  after the local evidence above is already present in the tree.
+
+## PR-context policy and preflight
+
+These checks ran on the committed candidate with intended PR metadata:
+title `fix(agy): 補齊 print timeout 交付`, base `main`, head
+`feature/824-agy-print-timeout-only`, labels empty, body containing
+`Closes #824` and a fully checked checklist.
+
+| Check | Command shape | Exit | Observation |
+| --- | --- | ---: | --- |
+| Preflight | `python3 -m policy_check.preflight --repo . --offline --pr-title ... --pr-body-file ... --pr-labels '' --base main --head feature/824-agy-print-timeout-only` | 0 | engine PASS, policy PASS, OpenSpec PASS, tests PASS |
+| Policy check | `python3 -m policy_check --repo . --pr-title ... --pr-body ... --pr-labels '' --pr-base-ref main --pr-head-ref feature/824-agy-print-timeout-only` | 0 | `24 pass, 0 fail, 2 warn` (`R-19` parser reliability advisory, `R-22` 73 pre-existing dangling references) |
