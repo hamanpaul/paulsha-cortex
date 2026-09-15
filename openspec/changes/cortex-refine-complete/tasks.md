@@ -19,9 +19,11 @@
 - [ ] 2.5.1 先依 #862 交付 registry-only A 的九組 receipt/disposition/revision/checkpoint 不變量；accepted 現行8/Red不派工，#831實際loaded後重評。C→B→D2、D1→D2仍需獨立交付，A完成不得關閉#497；own OpenSpec需run前完成唯一owner/發布/binding，archive只收自身。
 - [ ] 2.6 依 accepted 三件組完成 #821 no-op persistence、history retention、writer/fault/rollback 相容與安全暫存清理；完整 archive 缺口/截斷前備份保持列管。
 - [ ] 2.7 完成 #823/#824 session 與 AGY timeout 合約，明示 cgroup restart survival 的獨立驗收。
-- [ ] 2.7.1 先依 #851 補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。
+- [x] 2.7.1 #851 pre-archive：補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。archive、merge、issue closure 與 loaded-runtime 驗證仍由後續責任方處理。
 - [ ] 2.7.2 #824 dependency 證據未滿前不登錄可 claim child／不開 auto label；解除後重新核對完整性、真 sizing、唯一 owner 與正式 freeze，不能依 custom frontmatter 自稱已鎖派工。
 - [ ] 2.7.3 依 #823 session-only 三件組完成共用 kwargs 真接線、兩個 Popen／stdin 窄重試、合法配置及既有拒絕、所有權驗證先於 group signal 的真 fixture 與候選 wheel 驗收；不擴成 cgroup/restart/cancel 實作。
+  - [x] RED：新增 `tests/test_coordinator_launcher_session.py`，鎖定 shared Popen kwargs 的 `start_new_session=True`、Claude stdin 保留，以及五個 executor 的 direct launch recording。
+  - [x] GREEN：在 launcher 共用 helper 實作並接入所有 headless Popen；保留 runner override、Claude stdin-only retry 與固定 fake 相容性。
 - [ ] 2.8 完成 #825 最小 durable backoff，所有 lane 與 corrupt-state/expiry 可測；不標 R05 完成。
 - [ ] 2.8.1 先依 #850 有界 store／immutable event-fold child 交付 component；C/D provenance、reconciliation 與所有 lane 接線仍由 #825 後續 child 承接。
 - [ ] 2.9 以實際已載入 revision 驗 B1 成效，退出暫時 bypass 前保存 active jobs 與 rollback 方案。
@@ -63,6 +65,9 @@
 ## 6. B5 狀態與部署
 
 - [ ] 6.1 核對 #828 獨立 producer 交付；由 #840 補 actual/planned/last、facets、quota wait 與 selection receipts 的 status 一致性，不接管原producer。
+  - [x] 6.1.a [RED] #828 在 Cortex producer 邊界新增 execution-identity regression tests；以 registry job binding 驗證多卡、retry、缺值、未派工、跨 run/repo、needs_human、in-flight 與 completed status projection，保留 RED 供後續最小修正。
+  - [x] 6.1.b [GREEN] #828 producer 以 registry job 的 run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；planned、actual、last execution 與 unknown 不互相代填。
+  - [x] 6.1.c [CONTRACT] #828 新增去識別化 status snapshot fixture 與 producer/consumer 欄位契約；僅完成 pre-archive handoff，consumer、pin、installed/runtime integration 與下游 issue closure 仍未完成。
 - [ ] 6.2 由 #841 建立 CLI/site-packages/service loaded artifact/config identity 的同源驗證與 checkout 外 smoke。
 - [ ] 6.3 完成 installer/doctor instance roots、writer ownership 與 owner-aware stop/cleanup 的契約驗收。
 - [ ] 6.4 取得 upgrade/restart/rollback 對 active jobs 的實際 receipts；未重載程序不得標已部署。
