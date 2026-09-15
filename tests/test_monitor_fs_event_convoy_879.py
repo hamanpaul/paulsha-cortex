@@ -163,6 +163,45 @@ def test_burst_of_project_events_coalesces_to_one_refresh(tmp_path: Path) -> Non
         _stop_service(service, runner)
 
 
+def test_refresh_worker_survives_publish_failure_and_processes_later_event(
+    tmp_path: Path,
+) -> None:
+    service, store, server, _workspace, project = _make_service(tmp_path)
+    runner = _run_service(service, server)
+    first_failure = threading.Event()
+    second_publish = threading.Event()
+    original_publish = service._publish_refresh
+
+    def flaky_publish(events) -> None:
+        if not first_failure.is_set():
+            first_failure.set()
+            raise RuntimeError("boom")
+        original_publish(events)
+        second_publish.set()
+
+    try:
+        with (
+            mock.patch.object(service, "_publish_refresh", side_effect=flaky_publish),
+            mock.patch("paulsha_cortex.monitor.service.logger.exception") as log_exception,
+        ):
+            service._handle_fs_event(project / "changed-1.txt")
+
+            assert store.refresh_done.wait(timeout=2.0)
+            assert first_failure.wait(timeout=2.0)
+            assert service._refresh_thread is not None
+            assert service._refresh_thread.is_alive()
+
+            store.refresh_done.clear()
+            service._handle_fs_event(project / "changed-2.txt")
+
+            assert store.refresh_done.wait(timeout=2.0)
+            assert second_publish.wait(timeout=2.0)
+            assert store.project_refresh_calls == 2
+            assert log_exception.call_count == 1
+    finally:
+        _stop_service(service, runner)
+
+
 def test_event_callback_does_not_start_refresh_timer(tmp_path: Path) -> None:
     service, store, _server, _workspace, project = _make_service(tmp_path)
     with mock.patch("paulsha_cortex.monitor.service.threading.Timer") as timer:

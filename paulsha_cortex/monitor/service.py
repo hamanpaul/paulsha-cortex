@@ -147,10 +147,13 @@ class ProjectMonitorService:
             has_work, full_refresh, project_ids = self._next_refresh()
             if not has_work:
                 return
-            self._run_refresh_round(
-                full_refresh=full_refresh,
-                project_ids=project_ids,
-            )
+            try:
+                self._run_refresh_round(
+                    full_refresh=full_refresh,
+                    project_ids=project_ids,
+                )
+            except Exception:
+                logger.exception("monitor refresh round failed")
 
     def _next_refresh(self) -> tuple[bool, bool, tuple[str, ...]]:
         debounce_seconds = max(0.0, self._config.watch_debounce_ms / 1000.0)
