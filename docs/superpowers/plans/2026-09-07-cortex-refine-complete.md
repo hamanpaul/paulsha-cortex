@@ -376,6 +376,33 @@ PatchMUD #37仍是外部producer gate，真人qualification核可若生效也需
   這是R05/R08/R09待辦的現場佐證，不能同池換名當fallback或自造review資格；#836–#839、
   #842仍須正式交付，#862不承接模型設定或額度產品實作。
 
+### Quota observation child A 進件（2026-09-08，#866）
+
+- #836 的第一件為 #866 `quota-observation-schema-core`，只新增 stdlib 純資料核心與
+  專用測試；[spec](../specs/quota-observation-schema-core-spec.md)、
+  [design](../specs/quota-observation-schema-core-design.md)、
+  [todo](../workstreams/quota-observation-schema-core/todo.md)、
+  [own OpenSpec](../../../openspec/changes/quota-observation-schema-core/proposal.md) 與
+  [review ledger](../../../reports/review/refine-quota-schema-20260908.md) 對齊。
+- R3 保留未歸戶原生 usage `123`：standalone UnitDefinition catalog 不依附 account/pool，
+  unknown scope 不捏造帳號；unknown unit 只容許 unknown quantity，known scope/window 與
+  amount/gauge 仍一致驗證。Exact wire、bounded inputs、deep immutability、Decimal、
+  TTL/reset 與 source-issued event identity 的十組不變量均須產品正反例，不做換算或去重。
+- domain=0/state=1/invariants=10 源自單一純資料 owner、versioned reference consistency，
+  不是依檔案數或調低 envelope。六 views 接受內容後現行7/Red仍不派工；#831實際loaded
+  後5/Yellow只是條件投影，須重新核對真 sizing、完整性、資格與唯一 source/hash binding。
+- A→B source adapters→C durable replay/reconciliation→D shadow；C亦直接依賴A。
+  B重用既有usage/StreamEvidence，不另造token parser；各來源官方可讀介面、認證與
+  coverage須另驗，既有consumption/rejection不是remaining。#849目前只有 frozen profile-ref
+  framing fixtures，正式 upstream conformance仍pending；不複製effort taxonomy或key演算法。
+- #837 forecast、#838原子reservation、#839合格獨立池fallback、#842qualification各自未完成；
+  合法schema／fresh／完整binding都不是可派工資格。PatchMUD #37仍只有producer issue權限，
+  不增加外部runtime dependency、paid campaign或global identity/qualification。
+- 本批只交付規劃。產品freeze前先發布唯一owner與完整upfront六views；freeze後operator
+  baseline不改，candidate只有有據checkbox toggles，非checkbox走正式root authority。
+  Local pre-archive Tasks與正式Manager review/archive/reverify/PR/CI/merge/installed/live
+  分帳，不以builder checkbox冒簽正式review，不因A完成關閉母#836或R05。
+
 ### Canary sizing 校正紀錄
 
 首輪 #822 的 domain_breadth 被主 agent 設為 1，將 emitter/frontmatter 的回歸測試消費端誤算為 production 模組。依 #208 原始 rubric（0=單模組／單資料流、1=2–3 模組），本工作 production 只改 `_yaml._parse_scalar`，正確為 0；state_consistency=0、其餘實際條件不變。更正不直接改凍結 run；使用正式 abandon/重新接受流程保留原 receipts，且 yellow plan review 仍須執行。spec_stability 與原 rubric 方向不一致由 #831 列管，不以刪欄位/捏造數值繞過 sizing gate。

@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+- **Quota observation 純資料核心進件（#866）**：納入 #836 A 的 accepted 三件組、
+  自有 OpenSpec 與原生單位／未知 coverage 契約；未歸戶 usage 不捏造 account/pool。
+  本批只有規劃，現行 7/Red 不派工；來源 adapter、ledger、forecast、reservation
+  與跨獨立額度池 fallback 仍須後續正式交付，不硬編 model/agent/native effort。
+
+
 - **Claude builder 命令授權（#480 部分修復）**：commit-required job 使用 per-job 最小 Git 與精確 Python 測試 allowlist，保留 `acceptEdits` 與既有事件／路徑設定，解除無人可核可的測試／提交阻塞。
 
 
