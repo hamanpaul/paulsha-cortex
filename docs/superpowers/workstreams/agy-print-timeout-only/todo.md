@@ -1,8 +1,8 @@
 ---
 status: accepted
 work_item: agy-print-timeout-only
-authority_state: proposed-unregistered
-dispatch_readiness: blocked-dependency
+authority_state: registered
+dispatch_readiness: ready
 depends_on:
   - agy-probe-construction-containment
 dependency_issues:
@@ -20,23 +20,19 @@ artifact_classes:
 
 ## Current integration gate
 
-#851已由root納入本PR repository intake，但其產品／base／loaded runtime前置
-未完成；#824已移出母#823 mapping、故意不登錄timeout child，owner issue仍OPEN。
-下方root marker逐字保留：當前真completeness=false、plan blocking-decision、
-total4 Yellow；原author完整6 Yellow與記憶體移除marker的6僅是歷史／控制組。
-runtime79不以dispatch_readiness／dependency_issues阻擋workflow，depends_on只舊
-slice lane使用；surface-only plan_review_gate仍ready／envelope bypass，而且
-incomplete start可能進brainstorm，故metadata／marker不保證zero-spawn。
-root保持不登錄、不加cortex:auto-on-going、不start #824；前置真完成後才解除
-marker、重接受並正式登錄。0／0／7與R1–R7、Tasks的resolver／tests契約均不變。
+前置 `agy-probe-construction-containment`（#851）已由 PR #873 於 2026-09-15 交付並
+merge 進 main（commit c1ff347b），daemon 現行 runtime pin（75565400）已包含該修正；
+dependency 解除。#824 於 2026-09-15 正式登錄 `.cortex/work-items.yaml`
+（PR #905）並掛 `cortex:auto-on-going` 交由管線派工。舊 blocked-dependency marker
+於同日由 operator 解除；0／0／7 與 R1–R7、Tasks 的 resolver／tests 契約均不變。
 
 ## Open Questions
 
-- #851 的產品驗收、預定 base 及實際 loaded runtime 保護尚未完成；須由有權 operator 核對證據並正式解除依賴後重接受。本 marker 未解除前，#824 不得進入實作／派工。
+- 無。
 
 ## Tasks
 
-- [ ] **T0 dependency/tests**：本 child 不可先 freeze／dispatch；先完成 `agy-probe-construction-containment` 的 argv-construction try 邊界修正與 fake regression，root 核對預定 base／實際 runtime 已含保護後才解除 block；保留 R4 probe 的 timeout resolve 與全部非法 env／Go range 驗證，不在此 child 改 `model_identities.py` 或忽略 probe 值。
+- [x] **T0 dependency/tests**（2026-09-15 由 operator 核對解除：#851 由 PR #873 交付，daemon pin 75565400 已含保護）：原要求——本 child 不可先 freeze／dispatch；先完成 `agy-probe-construction-containment` 的 argv-construction try 邊界修正與 fake regression，root 核對預定 base／實際 runtime 已含保護後才解除 block；保留 R4 probe 的 timeout resolve 與全部非法 env／Go range 驗證，不在此 child 改 `model_identities.py` 或忽略 probe 值。
 - [ ] **T1 tests/RED**：以本 child spec R1–R7 與 design D1–D5 為需求，先在 `tests/test_coordinator_agy_launcher.py` 新增預設／override／exact flag 的 focused RED tests；確認舊 launcher 缺 flag 或 resolver 的真實失敗，再提交 RED candidate；此卡不先重跑全庫 baseline，不探索無關歷史，不修改 source 或 pinned plan。
 - [ ] **T2 source/resolver**：只改 `launcher.py`，新增 `AGY_PRINT_TIMEOUT_ENV`、600 秒 buffer／9223372036 秒上界、canonical duration 驗證與 `resolve_agy_print_timeout`；env strip 後 ASCII digits only／容許前導零，顯式空白／零／非法／超界一律 `ValueError`；未設定時直接重用 `gate_ledger._gate_timeout(env)`，invalid gate 仍 fallback，最後推導結果才檢查 Go 上界。
 - [ ] **T3 source/argv**：`build_agy_argv(print_timeout: str | None = None)` 對 None 自行 resolve，顯式 keyword 做 fullmatch 與上界驗證；所有 AGY 形狀、包含 `json_envelope=False`，於 JSON flag 後／model 前恰加入一組 timeout；正式 `SubprocessLauncher.launch` 對 AGY 顯式傳入 resolver 值，非法設定在 Popen 前失敗。
@@ -49,11 +45,11 @@ marker、重接受並正式登錄。0／0／7與R1–R7、Tasks的resolver／tes
 
 ## Boundary
 
-- dependency `agy-probe-construction-containment` 的唯一 owner [#851](https://github.com/hamanpaul/paulsha-cortex/issues/851) 已由root建立且納入本PR repository intake；本child仍屬#824、刻意不登錄且blocked-dependency，不以依賴內容審查PASS代替產品／runtime保護完成。
+- dependency `agy-probe-construction-containment` 的唯一 owner [#851](https://github.com/hamanpaul/paulsha-cortex/issues/851) 已由 PR #873 交付並進入 daemon runtime pin；本 child 屬 #824，已於 2026-09-15 正式登錄並解除 blocked-dependency。
 - Child 需求來源：[#824](https://github.com/hamanpaul/paulsha-cortex/issues/824)；母 work item `launcher-session-and-timeout` 的 #823 不在此交付。
 - Spec：`docs/superpowers/specs/agy-print-timeout-only-spec.md`；design：`docs/superpowers/specs/agy-print-timeout-only-design.md`。
 - 唯一 production 寫入：`paulsha_cortex/coordinator/launcher.py`；測試、操作文件及 changelog 允許同步，registry/schema/loader/installer/job_runner/gate_ledger/CLI production皆不改。
 - 原author時期僅四份planning文件，未操作產品、issue或registration；目前root另負責本PR登錄，本八檔整合不代行registration／commit／push／服務／runtime／模型session操作。
-- R1 已證 argv construction 例外可穿透非 AGY primary runtime 建立；這是 active dependency blocker，不以6 Yellow或機械plan-review通過宣稱ready。
-- 切面依#208真rubric仍domain=0／state=0；原author完整三件套與記憶體移除marker控制組為6 Yellow，當前帶marker的真狀態為不完整4 Yellow，不能派工；不使用#831候選算法，不改band門檻。
+- R1 已證 argv construction 例外可穿透非 AGY primary runtime 建立；該 blocker 已由 #851（PR #873）修正，dependency 不再阻擋派工。
+- 切面依#208真rubric仍domain=0／state=0；原author完整三件套與記憶體移除marker控制組為6 Yellow，blocked-dependency marker 於 2026-09-15 解除後恢復完整三件套；不使用#831候選算法，不改band門檻。
 - `invariant_count: 7` 對應 spec R1–R7；`artifact_classes` 列 source、tests、documentation，未隱藏 CLI proof／policy／changelog acceptance surfaces。
