@@ -4356,10 +4356,11 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
     if not isinstance(log_path, str) or not log_path:
         raise ValueError("workflow terminal log missing")
     try:
-        content = Path(log_path).read_text(encoding="utf-8")
+        with Path(log_path).open(encoding="utf-8", newline="") as handle:
+            content = handle.read()
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("workflow terminal log unreadable") from exc
-    lines = content.splitlines()
+    lines = content.split("\n")
     for line in reversed(lines):
         if not line.strip():
             continue
