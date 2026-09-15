@@ -430,3 +430,81 @@ def test_build_agy_argv_json_envelope_opt_out_keeps_probe_shape() -> None:
         read_only=True,
     )
     assert default[default.index("--output-format") + 1] == "json"
+
+
+@pytest.mark.parametrize(
+    ("override", "expected_timeout"),
+    (
+        (None, "2400s"),
+        ("900", "900s"),
+    ),
+    ids=("default-timeout", "env-override"),
+)
+def test_build_agy_argv_includes_resolved_print_timeout_in_exact_position(
+    monkeypatch, override, expected_timeout
+) -> None:
+    monkeypatch.delenv("PSC_GATE_TIMEOUT", raising=False)
+    if override is None:
+        monkeypatch.delenv("PSC_AGY_PRINT_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("PSC_AGY_PRINT_TIMEOUT", override)
+
+    argv = build_agy_argv(
+        prompt="first line\nsecond line",
+        slice_id="plan-demo",
+        log_dir="/tmp/logs",
+        model="Gemini 3.1 Pro (High)",
+    )
+
+    assert argv == [
+        "agy",
+        "--print",
+        "first line\nsecond line",
+        "--mode",
+        "plan",
+        "--sandbox",
+        "--output-format",
+        "json",
+        "--print-timeout",
+        expected_timeout,
+        "--model",
+        "Gemini 3.1 Pro (High)",
+    ]
+
+
+def test_agy_launcher_forwards_env_override_print_timeout_to_argv_builder(
+    monkeypatch, tmp_path
+) -> None:
+    calls: list[dict] = []
+
+    def fake_builder(**kwargs):
+        calls.append(kwargs)
+        return ["agy"]
+
+    class FakeProcess:
+        pid = 126
+
+    monkeypatch.setitem(launcher_module._ARGV_BUILDERS, "agy", fake_builder)
+    monkeypatch.setattr(
+        launcher_module.subprocess,
+        "Popen",
+        lambda argv, **kwargs: FakeProcess(),
+    )
+    monkeypatch.setattr(
+        launcher_module.job_workspace,
+        "prepare_commit_spool",
+        lambda **kwargs: tmp_path / "commit.bundle",
+    )
+    monkeypatch.setenv("PSC_JOB_RUNNER", "direct")
+    monkeypatch.setenv("PSC_AGY_PRINT_TIMEOUT", "900")
+    monkeypatch.setenv("PSC_GATE_TIMEOUT", "3600")
+
+    SubprocessLauncher("agy").launch(
+        slice_id="agy-timeout-forwarding",
+        prompt="implement",
+        worktree=str(tmp_path),
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    assert calls
+    assert calls[0].get("print_timeout") == "900s"

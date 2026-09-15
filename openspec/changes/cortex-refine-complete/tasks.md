@@ -31,6 +31,7 @@
 - [ ] 2.7 完成 #823/#824 session 與 AGY timeout 合約，明示 cgroup restart survival 的獨立驗收。
 - [x] 2.7.1 #851 pre-archive：補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。archive、merge、issue closure 與 loaded-runtime 驗證仍由後續責任方處理。
 - [ ] 2.7.2 #824 dependency 證據未滿前不登錄可 claim child／不開 auto label；解除後重新核對完整性、真 sizing、唯一 owner 與正式 freeze，不能依 custom frontmatter 自稱已鎖派工。
+  - [x] RED：新增 `tests/test_coordinator_agy_launcher.py` 的 focused regression，鎖定預設／override／exact `--print-timeout` 缺口與 `SubprocessLauncher("agy")` 未轉發 timeout 的現況；resolver／argv／CLI／policy 交付仍待後續卡片。
 - [ ] 2.7.3 依 #823 session-only 三件組完成共用 kwargs 真接線、兩個 Popen／stdin 窄重試、合法配置及既有拒絕、所有權驗證先於 group signal 的真 fixture 與候選 wheel 驗收；不擴成 cgroup/restart/cancel 實作。
   - [x] RED：新增 `tests/test_coordinator_launcher_session.py`，鎖定 shared Popen kwargs 的 `start_new_session=True`、Claude stdin 保留，以及五個 executor 的 direct launch recording。
   - [x] GREEN：在 launcher 共用 helper 實作並接入所有 headless Popen；保留 runner override、Claude stdin-only retry 與固定 fake 相容性。

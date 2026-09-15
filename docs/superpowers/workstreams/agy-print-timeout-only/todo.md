@@ -33,7 +33,7 @@ dependency 解除。#824 於 2026-09-15 正式登錄 `.cortex/work-items.yaml`
 ## Tasks
 
 - [x] **T0 dependency/tests**（2026-09-15 由 operator 核對解除：#851 由 PR #873 交付，daemon pin 75565400 已含保護）：原要求——本 child 不可先 freeze／dispatch；先完成 `agy-probe-construction-containment` 的 argv-construction try 邊界修正與 fake regression，root 核對預定 base／實際 runtime 已含保護後才解除 block；保留 R4 probe 的 timeout resolve 與全部非法 env／Go range 驗證，不在此 child 改 `model_identities.py` 或忽略 probe 值。
-- [ ] **T1 tests/RED**：以本 child spec R1–R7 與 design D1–D5 為需求，先在 `tests/test_coordinator_agy_launcher.py` 新增預設／override／exact flag 的 focused RED tests；確認舊 launcher 缺 flag 或 resolver 的真實失敗，再提交 RED candidate；此卡不先重跑全庫 baseline，不探索無關歷史，不修改 source 或 pinned plan。
+- [x] **T1 tests/RED**：以本 child spec R1–R7 與 design D1–D5 為需求，先在 `tests/test_coordinator_agy_launcher.py` 新增預設／override／exact flag 的 focused RED tests；確認舊 launcher 缺 flag 或 resolver 的真實失敗，再提交 RED candidate；此卡不先重跑全庫 baseline，不探索無關歷史，不修改 source 或 pinned plan。
 - [ ] **T2 source/resolver**：只改 `launcher.py`，新增 `AGY_PRINT_TIMEOUT_ENV`、600 秒 buffer／9223372036 秒上界、canonical duration 驗證與 `resolve_agy_print_timeout`；env strip 後 ASCII digits only／容許前導零，顯式空白／零／非法／超界一律 `ValueError`；未設定時直接重用 `gate_ledger._gate_timeout(env)`，invalid gate 仍 fallback，最後推導結果才檢查 Go 上界。
 - [ ] **T3 source/argv**：`build_agy_argv(print_timeout: str | None = None)` 對 None 自行 resolve，顯式 keyword 做 fullmatch 與上界驗證；所有 AGY 形狀、包含 `json_envelope=False`，於 JSON flag 後／model 前恰加入一組 timeout；正式 `SubprocessLauncher.launch` 對 AGY 顯式傳入 resolver 值，非法設定在 Popen 前失敗。
 - [ ] **T4 tests/matrix**：涵蓋 spec R2/R3 的完整值矩陣、最大／最大+1、derived gate 9223371436／9223371437、5000-digit 值、Unicode／符號／浮點／尾 newline／非字串；以 fake gate helper 驗證重用與 override priority；保留 helper 本體不變，若需修改則停止回 root。
