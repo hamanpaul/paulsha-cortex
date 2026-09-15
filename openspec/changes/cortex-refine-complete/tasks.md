@@ -4,10 +4,10 @@
 - [x] 1.2 將 Claude 已完成的進件驗證與本輪缺失複核併回 canonical child todo；保留 #828 獨立 ownership。（#832；operator原稿另存）
 - [x] 1.3 保存 operator dirty 原稿並對齊實際 builder base；核對 Monitor confirmed authority 後只啟動一條低風險 Cortex canary。（#822 run workflow-97a9aa661e4816e38964；不是canary完成）
 - [x] 1.4 進件 artifact-only commit/PR 經 preflight 與 CI；不關閉尚未實作的 issues。（#832 merge 60a3ffa8；#829仍OPEN）
-- [x] 1.5 [RED] #904 依 accepted `r3-testpilot-case-corpus` plan 新增 repo-level regression
-  test，鎖定 work item metadata 必須把 proposed candidate inventory `todo.md` 綁成追蹤
-  來源；保留現狀 RED，不開 implementation ticket，不寫 case YAML / harness，也不碰
-  `paulsha_cortex/`。
+- [x] 1.5 [RED/GREEN] #904 依 accepted `r3-testpilot-case-corpus` plan 新增 repo-level
+  regression test，並將 `r3-testpilot-case-corpus` work item metadata 補綁 proposed
+  candidate inventory `todo.md` 為追蹤來源；repo scan 可穩定觀測該 `todo` source，且仍
+  不開 implementation ticket、不寫 case YAML / harness，也不碰 `paulsha_cortex/`。
 
 ## 2. B1 執行基礎
 

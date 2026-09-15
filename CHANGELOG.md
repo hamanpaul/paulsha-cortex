@@ -7,9 +7,9 @@
 
 ## [Unreleased]
 
-- **#904 RED regression：** 新增 `tests/test_r3_testpilot_case_corpus_904.py`，把
-  `r3-testpilot-case-corpus` work item 必須把 proposed candidate inventory
-  `todo.md` 綁成追蹤來源的缺口釘成失敗測試；本批刻意只交付 RED，不新增 case YAML、
+- **#904 candidate inventory tracking：** 新增 `tests/test_r3_testpilot_case_corpus_904.py`
+  並將 `r3-testpilot-case-corpus` work item 補綁 proposed candidate inventory `todo.md`
+  為追蹤來源，讓 repo monitor 會把這份候選清單 source 納入掃描；不新增 case YAML、
   harness framework，也不碰 `paulsha_cortex/` 實作。
 - **`.cortex/work-items.yaml` 補登錄 33 個 work item 的 `github_issue` link**：31 個管線外
   交付、只剩規劃文件殘留者綁定原交付 issue（6 個無專屬 issue 者以 closeout 票 `#898`–`#903`

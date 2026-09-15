@@ -1189,6 +1189,8 @@ work_items:
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#904'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/r3-testpilot-case-corpus/todo.md'
     excludes: []
   workflow-execution-identity-producer:
     title: 'workflow-execution-identity-producer'
