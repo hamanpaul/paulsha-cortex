@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **Claude builder 命令授權（#480 部分修復）**：commit-required job 使用 per-job 最小 Git 與精確 Python 測試 allowlist，保留 `acceptEdits` 與既有事件／路徑設定，解除無人可核可的測試／提交阻塞。
+
+
 - **#822：YAML inline list 保留引號元素**：zero-dependency YAML subset parser 現在以
   quote-aware tokenizer 讀取 flow list，含逗號或 `]` 的 `argv` 元素、單／雙引號內的反斜線跳脫與尾逗號
   可正確 round-trip；前導／中間空元素與未閉合引號會以 `malformed inline list` 拒絕。
