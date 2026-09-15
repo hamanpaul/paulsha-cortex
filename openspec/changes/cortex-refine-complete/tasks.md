@@ -12,6 +12,16 @@
 - [x] 2.0.GREEN #831 依 accepted plan 完成 stability-risk-v2 純函式映射、受影響 sizing wiring oracle、文件與 changelog，並通過 full pytest；#830、#833、獨立 review、CI／installed runtime 交付仍未完成。
 - [ ] 2.1 透過 Cortex 完成 #822 argv/YAML canary，取得 RED/GREEN、review、policy 與 terminal delivery 證據。
 - [ ] 2.2 完成 #827 有界 refresh/coalesce、slow-provider 公平與 stop/diagnostics。
+- [x] 2.2.0 [RED/GREEN] 依 accepted #879 plan 新增並通過
+  `tests/test_monitor_fs_event_convoy_879.py`，以單一 refresh worker、有界 pending
+  標記與 worker 內 debounce 取代 project event Timer；每輪 take-and-clear 合併待處理
+  project、只做一次 watch/work-model publication，並以 60 秒節流 thread count warning。
+  同時鎖定 burst thread 上界、事件 callback 不建 refresh Timer、stop 後 late event 拒收，
+  並保留 workspace 全量 refresh 與 burst coalesce 語意。#827 完整公平／provider／
+  publication fence 仍由 2.2 列管。
+- [x] 2.2.0-repair pre-archive：更新基線後重跑 #879 monitor 與 #591 shadow-reader 回歸，
+  確認候選可進 archive 前置驗證；archive、PR、issue closure 與 runtime qualification
+  仍待後續責任方處理。
 - [ ] 2.2.1 先依 #853 交付 watcher-only A child 的固定 worker、raw0、generation/共享 backend、partial-scan latch 與 nonfollow VFS；現行8/Red不可派，#831 loaded 後重評。B work-model 與 C service 的 provider 公平、durable publication fence、整體 drain 仍需各自交付，不以 A 關閉母票。
 - [ ] 2.3 完成 #819 not-idle clock、periodic 有效 max_load/require_idle 與非法值處置。
 - [ ] 2.4 依 accepted 三件組完成 #496 內容/狀態冪等，驗同 path 內容改變仍恰好記錄；保留現行 7/Red，#831 後真重評。
