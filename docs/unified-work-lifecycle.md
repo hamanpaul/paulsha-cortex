@@ -13,6 +13,12 @@ Monitor 對每個 repo/work item 只公開 `topic`、`todo`、`on-going`、`done
 
 Provider 失敗時會保留 last-good snapshot 並標 `degraded`。GitHub provider 超過 900 秒沒有成功 snapshot 時，auto claim 與 merge 都會 fail-closed。
 
+### Planning capability probe boundary
+
+Planning runtime 建構時，AGY capability probe 的 `build_agy_argv(...)` 若拋出一般 `Exception`，只會把 AGY probe 降為 `smoke-failed`／`ready=false`；這個局部 containment 不會把建構錯誤升格成整個 runtime failure。只要非 AGY primary 的 probe 成功，production planning runtime 仍可完成建構並保留 primary。失敗的 AGY identity 不會被選為 ready secondary；這只說明 probe 邊界，並不保證一定存在合格的異質 secondary planner。
+
+這項邊界不涵蓋直接 launcher 的錯誤吞除：direct `SubprocessLauncher` 仍會讓無效 argv 設定向 caller 傳播，且在 argv 建構失敗後不啟動 Popen。真實非法 timeout env 的 direct／probe 雙路徑驗收仍屬後續 timeout child，不由本 child 冒稱完成。
+
 GitHub terminal closure scan 會以 authenticated default revision 的 Contents API 讀取 remote Todo，並重驗 path、blob SHA 與 base64 encoding；production 只對 canonical WorkflowRegistry 已連結的 PR 做 merge ancestry compare。只有 HTTP 502/503/504 會有限次 backoff retry，auth、rate-limit、其他 HTTP error、malformed JSON 或 identity mismatch 都立即保留 last-good 並標 degraded。
 
 ## Correlation authority
@@ -117,6 +123,17 @@ cortex work intake unified-work-lifecycle --repo owner/repo --issue 14 --combo f
 ```
 
 Telegram 等 bot 宿主若要提供「貼一段文字/issue 就進件」的入口，應呼叫 `submit_work_action(action="intake", ...)`（`paulsha_cortex/control/client.py`）；既有的 `/dispatch <slice_id>` 走既存 slice_id 派工，維持原樣不變，不在本次範圍內改動。
+
+### Headless launcher session boundary（#823）
+
+Headless job 的每次合法 `Popen`（direct、`systemd-run`、`systemd-template` 的外層
+Manager client，以及只移除 `stdin` 的相容 retry）都必須使用
+`start_new_session=True`。direct mode 的 child 因此離開 Manager 的 POSIX session/process
+group；這不等於把程序移入 systemd cgroup，也不承諾 Manager daemon restart 後 job 存活，
+更不改變 systemd unit 的 cgroup／`KillMode` 語意。#824 的 timeout/parser/CLI 合約與
+#851 的 AGY probe containment 仍由各自 work item 負責；#823 不藉 session flag 宣稱
+timeout、cancel、probe 或 issue closure 已完成。
+
 ### Work identity migration（設計中，見 ADR-0002）
 
 `link`／`unlink` 目前一次只能對單一 `(work_id, source)` pair 生效，重識別
