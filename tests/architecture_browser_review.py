@@ -32,6 +32,17 @@ def run(html, output, executable=None, transport='file'):
         assert {x['id'] for x in rows} == set(edges), 'Diagram has missing or substituted relationships'
         assert all(x['d'] and x['marker'] for x in rows), 'A relationship is not an actual directional SVG path'
         assert all(x.is_visible() for x in actual_nodes.all()), 'Core nodes hidden by default'
+        # Verify phase/card/attempt meaning on actual native nodes, not a hidden prose block.
+        expected_captions = {
+            'workflow-card': 'phase + persona + I/O + gate',
+            'job-attempt': '0..N',
+            'phase-claim': '本地受理', 'phase-define': '採用或規劃',
+            'phase-plan': '採用或 Job', 'phase-build': '3 張 Card',
+            'phase-ship': '本地交付',
+        }
+        for node_id, caption in expected_captions.items():
+            node = svg.locator(f'g[data-node-id="{node_id}"]')
+            assert node.is_visible() and caption in (node.text_content() or ""), (node_id, caption)
         for width, height in [(1440,900),(1600,1000),(1920,1080),(2048,1320),(390,844)]:
             page.set_viewport_size({'width':width,'height':height}); page.wait_for_timeout(250)
             m = page.evaluate('({width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,scrollHeight:document.documentElement.scrollHeight})')

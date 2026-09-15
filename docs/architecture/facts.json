@@ -175,10 +175,48 @@
       "sublabel": "執行任務、回傳結果"
     },
     {
+      "id": "job-attempt",
+      "label": "Job / Attempt",
+      "type": "database",
+      "responsibility": "Job 綁定 run／phase／card／persona，記錄一次嘗試。已存在的 Job 會復用；受限 retry 才產生新 attempt，不重跑七階段。既有規劃可無新模型 Job；Ship 的 deterministic Manager 稽核 Job 也不是 LLM process。",
+      "sublabel": "單卡 0..N 次；含本地稽核",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412,
+          "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+          "claim": "一般 card dispatch 只處理 plan/build/verify/review，Job 關聯 run_id/card/phase；force_new_card 是受限單卡重試。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9459,
+          "end_line": 9460,
+          "excerpt_sha256": "a066adc9bb6df4a5973a0af8859da45254ab4f0a353c1621c5beb10e8c2659ea",
+          "claim": "已有可復用 Job 時直接回傳該 Job，不因下一輪 tick 重派整個工作流程。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9964,
+          "end_line": 9997,
+          "excerpt_sha256": "15ad2d498cba1038fe03bd48dfe540b265dcceaf80235f3f21be2f0de31d8f16",
+          "claim": "Job 逐次綁定 workflow_run_id、workflow_card、workflow_phase、persona、executor、model 及 inputs。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/work_bridge.py",
+          "line": 1241,
+          "end_line": 1265,
+          "excerpt_sha256": "ae5e07006b1d34024d8fb420cf961ef96e5df4bf2327a9ea47f607979ecd04d8",
+          "claim": "Ship 可建立 executor=cortex-manager/model=deterministic 的 Job 稽核紀錄，不代表呼叫 LLM。"
+        }
+      ]
+    },
+    {
       "id": "manager",
       "label": "Manager",
       "type": "backend",
-      "responsibility": "讀取 confirmed 工作來源與 manifest，選擇執行器、派工、收取證據、判斷 gate、持久化進度及受限恢復；只有它能推進 workflow 或承認完成。",
+      "responsibility": "讀取 confirmed 工作來源與 manifest，選擇執行器、派工、收取證據、判斷 gate、持久化進度及受限恢復；只有它能推進 workflow 或承認完成。 每輪選當前未完成 Card；復用、恢復或派出該 Card 的 Job，而不是每次派工都從 Claim 重新開始。",
       "basis": "declared",
       "evidence": [
         {
@@ -194,9 +232,30 @@
           "end_line": 62,
           "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
           "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412,
+          "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+          "claim": "一般 card dispatch 只處理 plan/build/verify/review，Job 關聯 run_id/card/phase；force_new_card 是受限單卡重試。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9459,
+          "end_line": 9460,
+          "excerpt_sha256": "a066adc9bb6df4a5973a0af8859da45254ab4f0a353c1621c5beb10e8c2659ea",
+          "claim": "已有可復用 Job 時直接回傳該 Job，不因下一輪 tick 重派整個工作流程。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 11343,
+          "end_line": 11355,
+          "excerpt_sha256": "c7401775a0bf3b2bd316df5bdb5326596408035423a450df4fef7f51b1ea7b03",
+          "claim": "當前 phase 的全部 Cards passed 才可推進；尚有未完成 Cards 則留在同一 phase。"
         }
       ],
-      "sublabel": "唯一 writer；決定進度"
+      "sublabel": "選當前 Card；驗證才推進"
     },
     {
       "id": "monitor",
@@ -332,10 +391,41 @@
       "sublabel": "issue / PR / repo artifacts"
     },
     {
+      "id": "workflow-card",
+      "label": "Card / WorkflowStep",
+      "type": "database",
+      "responsibility": "一個 WorkflowRun 包含多個 WorkflowStep；每個 Step 是一張 Card 的投影，屬於一個 Phase 並綁定角色、輸入／產出與驗收契約。一個 Phase 可以有多張 Card，不能與一個 Job 劃上等號。",
+      "sublabel": "phase + persona + I/O + gate",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 11343,
+          "end_line": 11355,
+          "excerpt_sha256": "c7401775a0bf3b2bd316df5bdb5326596408035423a450df4fef7f51b1ea7b03",
+          "claim": "當前 phase 的全部 Cards passed 才可推進；尚有未完成 Cards 則留在同一 phase。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 174,
+          "end_line": 190,
+          "excerpt_sha256": "8a0c49db53ff484544a3c73bde81f727739d7d2ac3a6cdb989dbc5140574b217",
+          "claim": "WorkflowStep 是一張 Deck Card 的投影，帶 phase、persona、inputs/outputs 與 gate_result；不是一次 process。"
+        },
+        {
+          "path": "paulsha_cortex/deck/compile.py",
+          "line": 483,
+          "end_line": 523,
+          "excerpt_sha256": "29943cec5fc9b5092279d3ff5a8655b04da7f4ad37ee1195aa310b74e2c7aca6",
+          "claim": "每張 Combo Card 各編成一個 WorkflowStep，保留 phase、persona、I/O 與 commit/test policy。"
+        }
+      ]
+    },
+    {
       "id": "workflow-registry",
       "label": "Workflow Registry",
       "type": "database",
-      "responsibility": "保存 WorkflowRun、WorkflowStep、attempts、Candidate 與 evidence/completion binding；記錄由 Manager 更新。Job 是一次執行嘗試，重試不等於建立一個新的工作。",
+      "responsibility": "保存 WorkflowRun、WorkflowStep、attempts、Candidate 與 evidence/completion binding；記錄由 Manager 更新。Job 是一次執行嘗試，重試不等於建立一個新的工作。 Phase 是進度分組，Card/WorkflowStep 是工作契約，Job 是執行／稽核嘗試；三者不是同一層級。",
       "basis": "observed",
       "evidence": [
         {
@@ -346,6 +436,20 @@
           "claim": "Manager 的實際 workflow spawn 點以當前 Run/Step、角色與 Candidate 選取或建立 Job。"
         },
         {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 11343,
+          "end_line": 11355,
+          "excerpt_sha256": "c7401775a0bf3b2bd316df5bdb5326596408035423a450df4fef7f51b1ea7b03",
+          "claim": "當前 phase 的全部 Cards passed 才可推進；尚有未完成 Cards 則留在同一 phase。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 174,
+          "end_line": 190,
+          "excerpt_sha256": "8a0c49db53ff484544a3c73bde81f727739d7d2ac3a6cdb989dbc5140574b217",
+          "claim": "WorkflowStep 是一張 Deck Card 的投影，帶 phase、persona、inputs/outputs 與 gate_result；不是一次 process。"
+        },
+        {
           "path": "paulsha_cortex/coordinator/workflow.py",
           "line": 378,
           "end_line": 421,
@@ -353,7 +457,7 @@
           "claim": "WorkflowRun 保存 Manager-owned aggregate，包括 current_phase、steps、attempts、evidence 與 completion binding。"
         }
       ],
-      "sublabel": "保存 Run / Step / attempt"
+      "sublabel": "Run → Phase → 多張 Card"
     }
   ],
   "boundaries": [
@@ -401,6 +505,44 @@
           "end_line": 62,
           "excerpt_sha256": "6a2af42cdd01a2d107558336cbda364cdc7b3d1d1ff9a45e87e30e01e99328dd",
           "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
+        }
+      ]
+    },
+    {
+      "id": "card-to-attempt",
+      "from": "workflow-card",
+      "to": "job-attempt",
+      "label": "一張卡 → 0..N 次紀錄",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412,
+          "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+          "claim": "一般 card dispatch 只處理 plan/build/verify/review，Job 關聯 run_id/card/phase；force_new_card 是受限單卡重試。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9459,
+          "end_line": 9460,
+          "excerpt_sha256": "a066adc9bb6df4a5973a0af8859da45254ab4f0a353c1621c5beb10e8c2659ea",
+          "claim": "已有可復用 Job 時直接回傳該 Job，不因下一輪 tick 重派整個工作流程。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9964,
+          "end_line": 9997,
+          "excerpt_sha256": "15ad2d498cba1038fe03bd48dfe540b265dcceaf80235f3f21be2f0de31d8f16",
+          "claim": "Job 逐次綁定 workflow_run_id、workflow_card、workflow_phase、persona、executor、model 及 inputs。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/work_bridge.py",
+          "line": 1241,
+          "end_line": 1265,
+          "excerpt_sha256": "ae5e07006b1d34024d8fb420cf961ef96e5df4bf2327a9ea47f607979ecd04d8",
+          "claim": "Ship 可建立 executor=cortex-manager/model=deterministic 的 Job 稽核紀錄，不代表呼叫 LLM。"
         }
       ]
     },
@@ -572,6 +714,30 @@
       ]
     },
     {
+      "id": "manager-to-attempt",
+      "from": "manager",
+      "to": "job-attempt",
+      "label": "綁定／記錄 attempt",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9964,
+          "end_line": 9997,
+          "excerpt_sha256": "15ad2d498cba1038fe03bd48dfe540b265dcceaf80235f3f21be2f0de31d8f16",
+          "claim": "Job 逐次綁定 workflow_run_id、workflow_card、workflow_phase、persona、executor、model 及 inputs。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/work_bridge.py",
+          "line": 1241,
+          "end_line": 1265,
+          "excerpt_sha256": "ae5e07006b1d34024d8fb420cf961ef96e5df4bf2327a9ea47f607979ecd04d8",
+          "claim": "Ship 可建立 executor=cortex-manager/model=deterministic 的 Job 稽核紀錄，不代表呼叫 LLM。"
+        }
+      ]
+    },
+    {
       "id": "manager-to-delivery",
       "from": "manager",
       "to": "delivery-closure",
@@ -592,7 +758,7 @@
       "id": "manager-to-executors",
       "from": "manager",
       "to": "headless-executors",
-      "label": "派工 Job",
+      "label": "按 Card 派工",
       "variant": "emphasis",
       "basis": "observed",
       "evidence": [
@@ -602,6 +768,20 @@
           "end_line": 9412,
           "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
           "claim": "Manager 的實際 workflow spawn 點以當前 Run/Step、角色與 Candidate 選取或建立 Job。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412,
+          "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+          "claim": "一般 card dispatch 只處理 plan/build/verify/review，Job 關聯 run_id/card/phase；force_new_card 是受限單卡重試。"
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9964,
+          "end_line": 9997,
+          "excerpt_sha256": "15ad2d498cba1038fe03bd48dfe540b265dcceaf80235f3f21be2f0de31d8f16",
+          "claim": "Job 逐次綁定 workflow_run_id、workflow_card、workflow_phase、persona、executor、model 及 inputs。"
         }
       ]
     },
@@ -725,6 +905,30 @@
       ]
     },
     {
+      "id": "run-to-card",
+      "from": "workflow-registry",
+      "to": "workflow-card",
+      "label": "Run 內分組 Cards",
+      "variant": "dashed",
+      "basis": "observed",
+      "evidence": [
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 174,
+          "end_line": 190,
+          "excerpt_sha256": "8a0c49db53ff484544a3c73bde81f727739d7d2ac3a6cdb989dbc5140574b217",
+          "claim": "WorkflowStep 是一張 Deck Card 的投影，帶 phase、persona、inputs/outputs 與 gate_result；不是一次 process。"
+        },
+        {
+          "path": "paulsha_cortex/deck/compile.py",
+          "line": 483,
+          "end_line": 523,
+          "excerpt_sha256": "29943cec5fc9b5092279d3ff5a8655b04da7f4ad37ee1195aa310b74e2c7aca6",
+          "claim": "每張 Combo Card 各編成一個 WorkflowStep，保留 phase、persona、I/O 與 commit/test policy。"
+        }
+      ]
+    },
+    {
       "id": "work-read-model-to-manager",
       "from": "work-read-model",
       "to": "manager",
@@ -795,7 +999,7 @@
     "schema_version": 1,
     "id": "feature-oneshot",
     "title": "Cortex：誰控制流程，一件工作如何完成？",
-    "scope_note": "Deck 定義流程；Persona 定義角色範圍；Manager 執行並判定推進；WorkflowRun 保存本次進度；Monitor 投影對外狀態。以下展開 feature-oneshot，並非所有 combo 的通用順序。",
+    "scope_note": "只展開 feature-oneshot 這一個 WorkflowRun。七個 Phase 不是七個 Job，更不是每次派工重跑七階段：一 Phase 可含多張 Card，Card 綁 Persona 與 I/O；Manager 採用既有產物、復用 Job 或派出單卡 attempt，全部 Card 通過後才推進。",
     "controller": "manager",
     "observer": "monitor",
     "state_store": "workflow-registry",
@@ -908,7 +1112,8 @@
         "gates": [
           "只有 topic 的 issue 不足以 claim",
           "關聯與來源必須明確；provider degraded／collision 時不得授權",
-          "Manager 經受理路徑建立或 idempotent resume 同一工作"
+          "Manager 經受理路徑建立或 idempotent resume 同一工作",
+          "Claim 是 Manager 的本地 authority／Run 受理，不啟動一輪新的七階段 Agent Job。"
         ],
         "failure": [
           "缺 issue／mapping／readiness 時保留原因並停止；先補齊來源，不手改 jobs.json"
@@ -952,10 +1157,24 @@
             "end_line": 51,
             "excerpt_sha256": "17868b0aa0449d62842ce312fd41b5c920e1ba110621e566885a228ddeb46f03",
             "claim": "Work 必須先為 confirmed todo 才能取得 claim/start；topic issue 不足。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 9370,
+            "end_line": 9412,
+            "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+            "claim": "一般 card dispatch 只處理 plan/build/verify/review，Job 關聯 run_id/card/phase；force_new_card 是受限單卡重試。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 11641,
+            "end_line": 11684,
+            "excerpt_sha256": "19a04ed040a9725e62358b91f30f3645aae8e40df41ecfb1e932a3e8be02d662",
+            "claim": "Claim 本地推進到 Define；規劃完整時 Manager 稽核既有 Define 產物，無須重新呼叫 Planner。"
           }
         ],
         "diagram_label": "Claim｜受理",
-        "diagram_summary": "manager · 受理 → Run"
+        "diagram_summary": "manager｜本地受理"
       },
       {
         "id": "define",
@@ -980,7 +1199,8 @@
         "gates": [
           "缺少 accepted 三件組或有未決問題時，由 primary planner 發出問題包",
           "需要 peer 時必須為不同 independence domain",
-          "Manager 驗證 planning artifact 與 evidence，不能只接受「已想清楚」"
+          "Manager 驗證 planning artifact 與 evidence，不能只接受「已想清楚」",
+          "已有完整 accepted 規劃時 Manager 採用並稽核；缺漏時才執行異質規劃路徑。角色責任仍是 Planner，不等於每次都新開 process。"
         ],
         "failure": [
           "異質 planner 不可用、仍有未決項或 artifact 驗證失敗時停止；不要把未決需求送給 Builder"
@@ -1003,6 +1223,13 @@
             "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
           },
           {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 11641,
+            "end_line": 11684,
+            "excerpt_sha256": "19a04ed040a9725e62358b91f30f3645aae8e40df41ecfb1e932a3e8be02d662",
+            "claim": "Claim 本地推進到 Define；規劃完整時 Manager 稽核既有 Define 產物，無須重新呼叫 Planner。"
+          },
+          {
             "path": "paulsha_cortex/deck/data/cards.yaml",
             "line": 1,
             "end_line": 206,
@@ -1018,7 +1245,7 @@
           }
         ],
         "diagram_label": "Define｜需求",
-        "diagram_summary": "planner · spec / design"
+        "diagram_summary": "planner｜採用或規劃"
       },
       {
         "id": "plan",
@@ -1040,7 +1267,8 @@
         ],
         "gates": [
           "計畫必須是 accepted artifact，且與 WorkflowRun authority 一致",
-          "launch／terminalize 都驗 input snapshot；來源 revision 與 Candidate git base 分開"
+          "launch／terminalize 都驗 input snapshot；來源 revision 與 Candidate git base 分開",
+          "既有產物完整、宣告 outputs 與 sizing gate 成立時可 deterministic 採用；否則才嘗試 Planner Job，不能把採用解釋為跳過 gate。"
         ],
         "failure": [
           "缺計畫、內容或 hash 漂移時 needs_human；修正 authority 後循正式 resume 入口"
@@ -1063,6 +1291,20 @@
             "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
           },
           {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 9481,
+            "end_line": 9501,
+            "excerpt_sha256": "b7adb60c1b40dfb42bbedc31fd1db04b7f3d2de87966fdf842cc81b5162f3c03",
+            "claim": "Plan 的既有 artifact 採用路徑先查 completeness/sizing，不是無條件派出 Planner Job。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 9585,
+            "end_line": 9635,
+            "excerpt_sha256": "754a944f3d9e9c0220c56f153e7c5751d65cdb10dfbe5ece1d56b9bf1b747f75",
+            "claim": "Plan 宣告產物存在或成功 materialize 後由 deterministic Manager 標記該 Card；全部 Card 完成才進 Build。"
+          },
+          {
             "path": "paulsha_cortex/deck/data/cards.yaml",
             "line": 1,
             "end_line": 206,
@@ -1078,7 +1320,7 @@
           }
         ],
         "diagram_label": "Plan｜計畫",
-        "diagram_summary": "planner · plan / hash"
+        "diagram_summary": "planner｜採用或 Job"
       },
       {
         "id": "build",
@@ -1105,7 +1347,8 @@
         "gates": [
           "worktree-isolation 不另建第二工作區且 commit forbidden",
           "tdd-red 必須留下 RED；subagent-build 必須 focused test＋required commit",
-          "Manager 獨立驗證 Candidate／input hash／terminal schema；exit 0 不是 done"
+          "Manager 獨立驗證 Candidate／input hash／terminal schema；exit 0 不是 done",
+          "本 Phase 含三張 Card，Manager 依次處理：worktree-isolation → tdd-red → subagent-build；一張 Card 的重試不等於重跑整個 WorkflowRun。"
         ],
         "failure": [
           "build／terminal binding 失敗保留 Job 與 log；依目前允許的 resume／retry-card／retry-build 恢復"
@@ -1130,6 +1373,27 @@
             "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
           },
           {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 9370,
+            "end_line": 9412,
+            "excerpt_sha256": "e276a93115a281aa36d21a476270bf93f0ef288ce9cab53fcae5be79cf262969",
+            "claim": "一般 card dispatch 只處理 plan/build/verify/review，Job 關聯 run_id/card/phase；force_new_card 是受限單卡重試。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 11343,
+            "end_line": 11355,
+            "excerpt_sha256": "c7401775a0bf3b2bd316df5bdb5326596408035423a450df4fef7f51b1ea7b03",
+            "claim": "當前 phase 的全部 Cards passed 才可推進；尚有未完成 Cards 則留在同一 phase。"
+          },
+          {
+            "path": "paulsha_cortex/deck/compile.py",
+            "line": 483,
+            "end_line": 523,
+            "excerpt_sha256": "29943cec5fc9b5092279d3ff5a8655b04da7f4ad37ee1195aa310b74e2c7aca6",
+            "claim": "每張 Combo Card 各編成一個 WorkflowStep，保留 phase、persona、I/O 與 commit/test policy。"
+          },
+          {
             "path": "paulsha_cortex/deck/data/cards.yaml",
             "line": 1,
             "end_line": 206,
@@ -1145,7 +1409,7 @@
           }
         ],
         "diagram_label": "Build｜實作",
-        "diagram_summary": "builder · RED → Commit"
+        "diagram_summary": "builder｜3 張 Card"
       },
       {
         "id": "verify",
@@ -1169,7 +1433,8 @@
         "gates": [
           "對同一 exact Candidate 驗證，不接受舊 HEAD 的綠燈",
           "Manager 檢查 canonical evidence／gate consistency；降權模式由 gate 帳號重跑命令",
-          "verify 過關只代表可進 review，不等於已交付"
+          "verify 過關只代表可進 review，不等於已交付",
+          "verification 是 Reviewer Card；Manager 另行檢查結果與 gate，不是每個驗證命令各跑一次七階段。"
         ],
         "failure": [
           "測試或 evidence 不合即停止；若修出新 Candidate，原 verify／review 必須重做"
@@ -1208,7 +1473,7 @@
           }
         ],
         "diagram_label": "Verify｜驗證",
-        "diagram_summary": "reviewer · exact HEAD"
+        "diagram_summary": "reviewer｜1 張 Card"
       },
       {
         "id": "review",
@@ -1237,7 +1502,8 @@
         "gates": [
           "ForeignReview 必須對 exact HEAD 且符合獨立性",
           "blocking findings 不能升級成 passed",
-          "條件式 adversarial-review 必須完成；本 review 不能代替 Ship 的 delivery review"
+          "條件式 adversarial-review 必須完成；本 review 不能代替 Ship 的 delivery review",
+          "code-review 與條件式 adversarial-review 各自是 Card；當前 Phase 的全部所需 Cards passed 才可交付。"
         ],
         "failure": [
           "被退件時走受限修正路徑；Candidate 改變後再 verify＋review，不沿用舊 verdict"
@@ -1261,6 +1527,13 @@
             "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
           },
           {
+            "path": "paulsha_cortex/coordinator/manager.py",
+            "line": 11343,
+            "end_line": 11355,
+            "excerpt_sha256": "c7401775a0bf3b2bd316df5bdb5326596408035423a450df4fef7f51b1ea7b03",
+            "claim": "當前 phase 的全部 Cards passed 才可推進；尚有未完成 Cards 則留在同一 phase。"
+          },
+          {
             "path": "paulsha_cortex/deck/data/cards.yaml",
             "line": 1,
             "end_line": 206,
@@ -1276,7 +1549,7 @@
           }
         ],
         "diagram_label": "Review｜審查",
-        "diagram_summary": "reviewer · 異質審查"
+        "diagram_summary": "reviewer｜1 + 條件卡"
       },
       {
         "id": "ship",
@@ -1302,7 +1575,8 @@
         "gates": [
           "依 local-closeout → pr-preflight → external-ship 執行；不是只有按 merge",
           "checks／delivery review／threads／final HEAD race check 全對準同一 HEAD",
-          "merge 後再驗 ancestry、issue closed、remote archive、Todo；全部成立才完成"
+          "merge 後再驗 ancestry、issue closed、remote archive、Todo；全部成立才完成",
+          "Ship 由 Manager 本地 adapter 執行；可留下 deterministic Job 稽核列，Job 紀錄存在不代表派出 LLM。"
         ],
         "failure": [
           "HEAD 漂移／preflight 或遠端閉環未完成時停止並保留原因",
@@ -1327,6 +1601,20 @@
             "claim": "交付、planning hash binding、typed review 與人工恢復的 Accepted ADR。"
           },
           {
+            "path": "paulsha_cortex/coordinator/work_bridge.py",
+            "line": 1241,
+            "end_line": 1265,
+            "excerpt_sha256": "ae5e07006b1d34024d8fb420cf961ef96e5df4bf2327a9ea47f607979ecd04d8",
+            "claim": "Ship 可建立 executor=cortex-manager/model=deterministic 的 Job 稽核紀錄，不代表呼叫 LLM。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/work_bridge.py",
+            "line": 1884,
+            "end_line": 1919,
+            "excerpt_sha256": "297d240cf8e189bef84a405248d42772d3d11e79dadb4e977a7efb2b4850f7cd",
+            "claim": "Manager 的 Ship adapter 以 subprocess 執行官方 archive，再提交 archive 與要求新 Candidate 重驗。"
+          },
+          {
             "path": "paulsha_cortex/deck/data/cards.yaml",
             "line": 1,
             "end_line": 206,
@@ -1342,7 +1630,7 @@
           }
         ],
         "diagram_label": "Ship｜交付",
-        "diagram_summary": "manager · 遠端閉環"
+        "diagram_summary": "manager｜本地交付"
       }
     ],
     "recoveries": [
@@ -1530,7 +1818,7 @@
       },
       {
         "id": "job",
-        "label": "Job：一次實際程序嘗試",
+        "label": "Job：執行／本地稽核紀錄",
         "writer": "manager",
         "reader": "monitor",
         "states": [
@@ -1539,7 +1827,7 @@
           "exited",
           "failed"
         ],
-        "meaning": "Job 是 executor 的單次執行。exited/0 只是程序成功，仍需 gate evidence 與 terminal closure；不是交付完成。",
+        "meaning": "一般 Job 記錄 executor 的單次嘗試並綁定 Run/Phase/Card；同 Card 的合法重試可有新 attempt。Ship 另可建立 cortex-manager/deterministic 的本地稽核 Job，因此 Job 紀錄不等於一次 LLM 呼叫。exited/0 仍不等於交付完成。",
         "basis": "declared",
         "evidence": [
           {
@@ -1555,6 +1843,13 @@
             "end_line": 6348,
             "excerpt_sha256": "d0d4a1671b3d2bb1e11baabb5a9a8ce3484b8f718073e56d2afe8559615f773b",
             "claim": "成功 exit 只是 terminalize 的必要條件；Manager 仍收斂 canonical evidence 並執行 gate consistency 檢查。"
+          },
+          {
+            "path": "paulsha_cortex/coordinator/work_bridge.py",
+            "line": 1241,
+            "end_line": 1265,
+            "excerpt_sha256": "ae5e07006b1d34024d8fb420cf961ef96e5df4bf2327a9ea47f607979ecd04d8",
+            "claim": "Ship 可建立 executor=cortex-manager/model=deterministic 的 Job 稽核紀錄，不代表呼叫 LLM。"
           }
         ]
       },
