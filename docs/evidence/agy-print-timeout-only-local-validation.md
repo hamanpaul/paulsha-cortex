@@ -27,19 +27,28 @@ Both commands ran from a temporary directory outside the checkout with
 
 ## AGY parser negative controls
 
-- AGY CLI version observed locally: `1.2.3`.
-- All parser checks ran with no credential env, no prompt, stdin EOF, and an
-  unknown sentinel flag after `--print-timeout`: `env -i HOME=/dev/null
-  XDG_CONFIG_HOME=/dev/null PATH=/usr/bin:/bin "$AGY_BIN"
-  --print-timeout <value> --cortex-timeout-parser-sentinel </dev/null`.
+This repair card reran the five D4 parser rows against the local `agy` binary.
+The earlier table only restated the expected outcomes; the rows below now bind
+durable, byte-measured transcripts for the actual invocations.
 
-| Value | Exit | First parser result |
-| --- | ---: | --- |
-| `abc` | 2 | `time: invalid duration` |
-| `2400` | 2 | `time: missing unit in duration` |
-| `2400s` | 2 | unknown sentinel flag |
-| `9223372036s` | 2 | unknown sentinel flag |
-| `9223372037s` | 2 | `time: invalid duration` |
+- `command -v agy` resolved the local binary path recorded here as `$AGY_BIN`.
+- The command spellings below use `$AGY_BIN` for that resolved binary path so
+  this repository does not commit a personal absolute path; the transcript
+  bodies keep the actual parser stdout/stderr and recorded exit codes.
+- `agy --version` ran as `$AGY_BIN --version`, returned exit `0`, and printed
+  `1.2.3`.
+- Every parser check ran with no credential env, no prompt, and stdin EOF
+  under `env -i HOME=/dev/null XDG_CONFIG_HOME=/dev/null PATH=/usr/bin:/bin`.
+- Each transcript contains the complete merged stdout/stderr stream for that
+  invocation plus a trailing `[exit code: N]` line.
+
+| Value | Exact argv | Exit | First parser result | Durable transcript |
+| --- | --- | ---: | --- | --- |
+| `abc` | `["$AGY_BIN", "--print-timeout", "abc", "--cortex-timeout-parser-sentinel"]` | 2 | `time: invalid duration` | `docs/evidence/agy-print-timeout-only-logs/abc.txt` — 3000 bytes, SHA256 `6da04794988e903d672c9a1324495e39a7060ed64038845fc6874deaf3785a64` |
+| `2400` | `["$AGY_BIN", "--print-timeout", "2400", "--cortex-timeout-parser-sentinel"]` | 2 | `time: missing unit in duration` | `docs/evidence/agy-print-timeout-only-logs/2400.txt` — 3011 bytes, SHA256 `ac635c0d8cdd537363ea364e9c64e6eab425a9933497dd7b0ac9512ac3563281` |
+| `2400s` | `["$AGY_BIN", "--print-timeout", "2400s", "--cortex-timeout-parser-sentinel"]` | 2 | unknown sentinel flag | `docs/evidence/agy-print-timeout-only-logs/2400s.txt` — 2992 bytes, SHA256 `66f3e77331f2bac3efbf4b5e56813eee87cc4773a763eeb640486f1bc7113be7` |
+| `9223372036s` | `["$AGY_BIN", "--print-timeout", "9223372036s", "--cortex-timeout-parser-sentinel"]` | 2 | unknown sentinel flag | `docs/evidence/agy-print-timeout-only-logs/9223372036s.txt` — 2998 bytes, SHA256 `722b51186d65b5be6c454b5f752c8afed43e815047ba8e969654e027f426384b` |
+| `9223372037s` | `["$AGY_BIN", "--print-timeout", "9223372037s", "--cortex-timeout-parser-sentinel"]` | 2 | `time: invalid duration` | `docs/evidence/agy-print-timeout-only-logs/9223372037s.txt` — 3024 bytes, SHA256 `6a36fb4bf8e816f24c9133e3d2ca25fbb0b31ff473f371f791ad69f256533c63` |
 
 ## Boundary reminders
 
