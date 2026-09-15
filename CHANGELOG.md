@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#828 regression coverage：** 新增 workflow status execution-identity regression tests，鎖定 registry job 綁定與 planned／actual／last execution 的可區分投影（原以 RED 設計，已由同一 PR 的 producer 修正轉綠）。
+
+- **#828 producer GREEN：** workflow `in_flight`、`attention` 與 `recent_done` 現在從明確的 registry job run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；無 job 時保留 planned 或 unknown，不從 phase／persona 推測實際模型。另提供去識別化 status snapshot fixture 與 producer/consumer 欄位契約，供下游驗收使用。
+
+
 - **Terminal JSONL framing 實作（#860）**：Manager terminal parser 以保留換行的 UTF-8 reader
   和 literal LF record framing 保真處理 CRLF 與 Unicode JSON string data，維持既有
   terminal carrier、schema 與 fail-closed 邊界；補齊 framing／carrier／recovery 負例、
@@ -54,6 +59,8 @@
 - **#851 AGY probe 建構 containment**：將 capability probe 的 `build_agy_argv(...)`
   例外納入既有 smoke 失敗邊界；建構失敗只回傳 `smoke-failed` 的 AGY not-ready
   結果，不中斷非 AGY primary 的後續 runtime 建構。
+
+
 
 - **有界核心 child 進件**：登錄 #849 可擴充 execution-profile schema／canonical key，
   與 #850 跨程序 backoff store／immutable event fold；補 byte-level oracle、資源上限及
