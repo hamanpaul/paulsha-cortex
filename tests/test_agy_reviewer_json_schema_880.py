@@ -96,7 +96,71 @@ def test_agy_reviewer_uses_the_shared_claude_schema(kind: str, tmp_path: Path) -
     )
 
     schema = json.loads(argv[argv.index("--json-schema") + 1])
-    assert schema == json.loads(launcher_module._claude_review_json_schema(kind))
+    # #888：agy 走 Gemini structured output，schema 是同一份 Claude 契約經
+    # `_gemini_compatible_schema` 改寫（整數 enum→min/max、null type→nullable）。
+    assert schema == json.loads(launcher_module._gemini_review_json_schema(kind))
+    assert schema == launcher_module._gemini_compatible_schema(
+        json.loads(launcher_module._claude_review_json_schema(kind))
+    )
+    _assert_gemini_schema_subset(schema)
+
+
+def _assert_gemini_schema_subset(node: object) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _assert_gemini_schema_subset(item)
+        return
+    if not isinstance(node, dict):
+        return
+    enum = node.get("enum")
+    if enum is not None:
+        assert all(isinstance(item, str) for item in enum), enum
+    assert not isinstance(node.get("type"), list), node.get("type")
+    for value in node.values():
+        _assert_gemini_schema_subset(value)
+
+
+def test_gemini_compatible_schema_rewrites_only_unsupported_shapes() -> None:
+    rewritten = launcher_module._gemini_compatible_schema(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "schema_version": {"type": "integer", "enum": [1]},
+                "line": {"type": ["integer", "null"], "minimum": 1},
+                "status": {"type": "string", "enum": ["passed", "failed"]},
+            },
+        }
+    )
+    assert rewritten == {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "integer", "minimum": 1, "maximum": 1},
+            "line": {"type": "integer", "nullable": True, "minimum": 1},
+            "status": {"type": "string", "enum": ["passed", "failed"]},
+        },
+    }
+    # 字串鍵 map（authority_hashes）→ [{key, value}] 陣列；Gemini 沒有 map 型別，
+    # 模型會把路徑鍵改寫成識別字，實機 job 503／505 的 ref set 因此對不上。
+    assert launcher_module._gemini_compatible_schema(
+        {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    ) == {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["key", "value"],
+            "properties": {
+                "key": {"type": "string", "minLength": 1},
+                "value": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            },
+        },
+    }
+    with pytest.raises(ValueError):
+        launcher_module._gemini_compatible_schema({"enum": [1, 2]})
+    with pytest.raises(ValueError):
+        launcher_module._gemini_compatible_schema({"type": ["integer", "string"]})
 
 
 @pytest.mark.parametrize(
@@ -298,3 +362,50 @@ def test_verification_object_details_remain_unchanged(tmp_path: Path) -> None:
 
     evidence = _evidence_payload(bound, coordinator_root)
     assert evidence["payload"]["details"] == {"checks": {"pytest": "passed"}}
+
+
+def test_agy_structured_output_meta_keys_are_stripped_from_terminal_payload() -> None:
+    # #888：agy --json-schema 的實機 response = 模型的 fenced 文字 + 最後一行
+    # structured output（多掛 toolAction／toolSummary）。Manager 必須拿最後那行，
+    # 並只剝掉這兩個固定的 CLI 中繼鍵，details 物件形狀原樣保留。
+    from paulsha_cortex.coordinator import manager as manager_module
+
+    response = (
+        "```json\n"
+        "{\n  \"schema_version\": 1,\n  \"kind\": \"workflow-verification-result\"\n}\n"
+        "```\n"
+        "{\"details\":{\"text\":\"ok\"},\"kind\":\"workflow-verification-result\","
+        "\"reports\":[{\"body\":\"ok\",\"path\":\"reports/verify/x.md\"}],"
+        "\"schema_version\":1,\"status\":\"verified\",\"summary\":\"ok\","
+        "\"toolAction\":\"Finishing the interaction\",\"toolSummary\":\"Workflow verification result\"}\n"
+    )
+    parsed = manager_module._parse_terminal_json_text(response)
+    assert parsed == {
+        "details": {"text": "ok"},
+        "kind": "workflow-verification-result",
+        "reports": [{"body": "ok", "path": "reports/verify/x.md"}],
+        "schema_version": 1,
+        "status": "verified",
+        "summary": "ok",
+    }
+    untouched = {"schema_version": 1, "kind": "workflow-review-result", "reports": [], "extra": 1}
+    assert manager_module._strip_agy_structured_output_meta(untouched) is untouched
+
+
+def test_manager_folds_agy_key_value_authority_hashes() -> None:
+    from paulsha_cortex.coordinator import manager as manager_module
+
+    digest = "0" * 64
+    folded = manager_module._fold_agy_key_value_map(
+        [{"key": "docs/superpowers/plans/x.md", "value": digest}]
+    )
+    assert folded == {"docs/superpowers/plans/x.md": digest}
+    # 非 {key, value} 形狀、重複鍵、空鍵：原樣回傳，交由既有驗證 fail closed。
+    for bad in (
+        [{"key": "a", "value": digest, "extra": 1}],
+        [{"key": "a", "value": digest}, {"key": "a", "value": digest}],
+        [{"key": "", "value": digest}],
+        {"a": digest},
+        [],
+    ):
+        assert manager_module._fold_agy_key_value_map(bad) == bad
