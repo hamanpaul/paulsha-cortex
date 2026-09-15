@@ -12,6 +12,9 @@
   direct／systemd-run／systemd-template 的 14 格合法接線回歸與 ownership-first 負控制，
   並明示 cgroup、restart、#824 與 #851 的未承接邊界。
 
+- **#888 AGY reviewer schema 改寫成 Gemini 相容子集**：#880 帶入的 `--json-schema` 含整數 enum／null type／map 型別，Gemini function declaration 直接 400 或改寫 `authority_hashes` 鍵名；launcher 以 `_gemini_compatible_schema` 改寫（整數單值 enum → minimum/maximum、null type → nullable、字串鍵 map → `[{key, value}]`），Manager 剝掉 agy structured output 的 `toolAction`／`toolSummary` 中繼鍵並把 key/value 陣列摺回 mapping。Claude 契約仍是唯一來源。
+
+
 
 - 修正架構交付誤用說明頁：canonical HTML 改回原版 Archify SVG；新增節點／方向箭頭與流程／條件修正回路驗收，不再以文字頁測試冒充架構圖。
 
@@ -38,6 +41,10 @@
 - **AGY 前置契約進件**：登錄 #851 probe argv 例外隔離，#824 timeout 拆為獨立候選，
   保留 #823 session/cgroup 邊界。#824 依賴未完成，移除母件重複 owner 並暫不登錄
   可 claim child；真 completeness 阻擋與 surface-only Yellow gate 分帳，不依自訂欄位假鎖派工。
+
+- **#851 AGY probe 建構 containment**：將 capability probe 的 `build_agy_argv(...)`
+  例外納入既有 smoke 失敗邊界；建構失敗只回傳 `smoke-failed` 的 AGY not-ready
+  結果，不中斷非 AGY primary 的後續 runtime 建構。
 
 - **有界核心 child 進件**：登錄 #849 可擴充 execution-profile schema／canonical key，
   與 #850 跨程序 backoff store／immutable event fold；補 byte-level oracle、資源上限及
