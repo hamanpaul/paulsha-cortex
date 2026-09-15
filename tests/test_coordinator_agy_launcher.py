@@ -5,8 +5,30 @@ import shlex
 import pytest
 
 import paulsha_cortex.coordinator.launcher as launcher_module
-from paulsha_cortex.coordinator.launcher import SubprocessLauncher, build_agy_argv
+from paulsha_cortex.coordinator.launcher import (
+    SubprocessLauncher,
+    build_agy_argv,
+    resolve_agy_print_timeout,
+)
 from paulsha_cortex.coordinator.model_identities import AGY_MODEL_ID, load_model_identities
+
+
+@pytest.fixture(autouse=True)
+def _clear_agy_timeout_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(launcher_module.AGY_PRINT_TIMEOUT_ENV, raising=False)
+    monkeypatch.delenv(launcher_module.gate_ledger.GATE_TIMEOUT_ENV, raising=False)
+
+
+def _assert_print_timeout(argv: list[str], expected: str) -> None:
+    assert argv.count("--print-timeout") == 1
+    assert argv[argv.index("--print-timeout") + 1] == expected
+
+
+def _script_inner_argv(script: str) -> list[str]:
+    lexer = shlex.shlex(script, posix=True, punctuation_chars=";")
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    return tokens[: tokens.index(";")] if ";" in tokens else tokens
 
 
 def test_agy_argv_is_headless_plan_sandbox_and_keeps_prompt_single() -> None:
@@ -26,6 +48,8 @@ def test_agy_argv_is_headless_plan_sandbox_and_keeps_prompt_single() -> None:
         "--sandbox",
         "--output-format",
         "json",
+        "--print-timeout",
+        "2400s",
         "--model",
         "Gemini 3.1 Pro (High)",
     ]
@@ -53,6 +77,7 @@ def test_agy_reviewer_argv_grants_only_the_disposable_checkout(tmp_path) -> None
     ]
     assert argv[6:8] == ["--add-dir", str(worktree.resolve())]
     assert argv[argv.index("--output-format") + 1] == "json"
+    _assert_print_timeout(argv, "2400s")
     assert "--dangerously-skip-permissions" not in argv
 
 
@@ -76,6 +101,7 @@ def test_agy_builder_argv_uses_accept_edits_and_scopes_worktree(tmp_path) -> Non
     ]
     assert argv[5:7] == ["--add-dir", str(worktree.resolve())]
     assert argv[argv.index("--output-format") + 1] == "json"
+    _assert_print_timeout(argv, "2400s")
     assert "--sandbox" not in argv
     assert "--dangerously-skip-permissions" not in argv
 
@@ -98,6 +124,7 @@ def test_agy_builder_unsafe_argv_adds_permission_bypass(tmp_path) -> None:
         "accept-edits",
     ]
     assert argv[5:7] == ["--add-dir", str(worktree.resolve())]
+    _assert_print_timeout(argv, "2400s")
     assert "--sandbox" not in argv
     assert "--dangerously-skip-permissions" in argv
 
@@ -128,6 +155,7 @@ def test_agy_builder_write_forbidden_argv_keeps_strict_plan_sandbox(tmp_path) ->
     ]
     assert argv[6:8] == ["--add-dir", str(worktree.resolve())]
     assert argv[argv.index("--output-format") + 1] == "json"
+    _assert_print_timeout(argv, "2400s")
     assert "accept-edits" not in argv
     assert "--dangerously-skip-permissions" not in argv
 
@@ -152,6 +180,8 @@ def test_agy_planner_write_forbidden_argv_never_adds_worktree(tmp_path) -> None:
         "--sandbox",
         "--output-format",
         "json",
+        "--print-timeout",
+        "2400s",
     ]
     assert "--add-dir" not in argv
 
@@ -216,6 +246,7 @@ identities:
         and actual_worktree == str(worktree.resolve())
     )
     assert actual_mode == "accept-edits"
+    _assert_print_timeout(argv, "2400s")
     assert "--sandbox" not in argv
     assert launcher_is_writable
 
@@ -262,6 +293,7 @@ def test_agy_commit_required_argv_adds_linked_git_write_dirs(monkeypatch, tmp_pa
         if value == "--add-dir"
     ]
     assert add_dirs == [str(worktree.resolve()), *git_write_dirs]
+    _assert_print_timeout(argv, "2400s")
 
 
 def test_agy_launcher_forwards_commit_required_to_argv_builder(monkeypatch, tmp_path) -> None:
@@ -385,16 +417,17 @@ def test_agy_commit_required_launcher_emits_real_scoped_git_dirs(monkeypatch, tm
         lambda **kwargs: tmp_path / "commit.bundle",
     )
     monkeypatch.setenv("PSC_JOB_RUNNER", "direct")
+    prompt = 'implement; keep "quoted"'
 
     SubprocessLauncher("agy", commit_required=True).launch(
         slice_id="agy-commit-real-builder",
-        prompt="implement",
+        prompt=prompt,
         worktree=str(tmp_path),
         log_dir=str(tmp_path / "logs"),
     )
 
     assert calls
-    inner_argv = shlex.split(calls[0][2].split(";", 1)[0])
+    inner_argv = _script_inner_argv(calls[0][2])
     add_dirs = [
         inner_argv[index + 1]
         for index, value in enumerate(inner_argv)
@@ -403,11 +436,12 @@ def test_agy_commit_required_launcher_emits_real_scoped_git_dirs(monkeypatch, tm
     assert inner_argv[:5] == [
         "agy",
         "--print",
-        "implement",
+        prompt,
         "--mode",
         "accept-edits",
     ]
     assert add_dirs == [str(tmp_path.resolve()), *git_write_dirs]
+    _assert_print_timeout(inner_argv, "2400s")
     assert "--sandbox" not in inner_argv
 
 
@@ -422,6 +456,7 @@ def test_build_agy_argv_json_envelope_opt_out_keeps_probe_shape() -> None:
         json_envelope=False,
     )
     assert "--output-format" not in probe
+    _assert_print_timeout(probe, "2400s")
     default = build_agy_argv(
         prompt="p",
         slice_id="cortex-capability-probe",
@@ -430,6 +465,176 @@ def test_build_agy_argv_json_envelope_opt_out_keeps_probe_shape() -> None:
         read_only=True,
     )
     assert default[default.index("--output-format") + 1] == "json"
+    _assert_print_timeout(default, "2400s")
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    (
+        ({}, "2400s"),
+        ({launcher_module.gate_ledger.GATE_TIMEOUT_ENV: "900"}, "2400s"),
+        ({launcher_module.gate_ledger.GATE_TIMEOUT_ENV: "3600"}, "4200s"),
+        ({launcher_module.gate_ledger.GATE_TIMEOUT_ENV: "abc"}, "2400s"),
+        ({launcher_module.gate_ledger.GATE_TIMEOUT_ENV: "0"}, "2400s"),
+        ({launcher_module.gate_ledger.GATE_TIMEOUT_ENV: "-5"}, "2400s"),
+        ({launcher_module.gate_ledger.GATE_TIMEOUT_ENV: " "}, "2400s"),
+        ({launcher_module.gate_ledger.GATE_TIMEOUT_ENV: "9223371436"}, "9223372036s"),
+    ),
+    ids=(
+        "unset-gate",
+        "gate-below-default",
+        "gate-override",
+        "gate-invalid-string",
+        "gate-zero",
+        "gate-negative",
+        "gate-blank",
+        "gate-derived-maximum",
+    ),
+)
+def test_resolve_agy_print_timeout_reuses_gate_timeout_fallback(env, expected) -> None:
+    assert resolve_agy_print_timeout(env) == expected
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    (
+        ("900", "900s"),
+        (" 0900 ", "900s"),
+        ("900\n", "900s"),
+        ("09223372036", "9223372036s"),
+    ),
+    ids=("plain", "leading-zeros", "trailing-newline", "max-with-leading-zero"),
+)
+def test_resolve_agy_print_timeout_normalizes_valid_override(override, expected) -> None:
+    assert resolve_agy_print_timeout(
+        {
+            launcher_module.AGY_PRINT_TIMEOUT_ENV: override,
+            launcher_module.gate_ledger.GATE_TIMEOUT_ENV: "3600",
+        }
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "override",
+    ("", "   ", "abc", "0", "-5", "+900", "1.5", "1e3", "900s", "１２３", "9" * 5000, 900),
+    ids=(
+        "empty",
+        "blank",
+        "letters",
+        "zero",
+        "negative",
+        "plus-sign",
+        "float",
+        "scientific",
+        "unit-suffix",
+        "unicode-digits",
+        "too-many-digits",
+        "non-string",
+    ),
+)
+def test_resolve_agy_print_timeout_rejects_invalid_override(override) -> None:
+    with pytest.raises(ValueError, match=launcher_module.AGY_PRINT_TIMEOUT_ENV):
+        resolve_agy_print_timeout({launcher_module.AGY_PRINT_TIMEOUT_ENV: override})
+
+
+def test_resolve_agy_print_timeout_rejects_overflow_after_gate_buffer() -> None:
+    with pytest.raises(ValueError, match=launcher_module.gate_ledger.GATE_TIMEOUT_ENV):
+        resolve_agy_print_timeout({launcher_module.gate_ledger.GATE_TIMEOUT_ENV: "9223371437"})
+
+
+def test_resolve_agy_print_timeout_uses_gate_helper_when_override_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, str]] = []
+
+    def fake_gate_timeout(env: dict[str, str]) -> int:
+        calls.append(env)
+        return 3600
+
+    monkeypatch.setattr(launcher_module.gate_ledger, "_gate_timeout", fake_gate_timeout)
+    env: dict[str, str] = {}
+
+    assert resolve_agy_print_timeout(env) == "4200s"
+    assert calls == [env]
+
+
+def test_resolve_agy_print_timeout_skips_gate_helper_when_override_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, str]] = []
+
+    def fake_gate_timeout(env: dict[str, str]) -> int:
+        calls.append(env)
+        return 3600
+
+    monkeypatch.setattr(launcher_module.gate_ledger, "_gate_timeout", fake_gate_timeout)
+
+    assert resolve_agy_print_timeout(
+        {
+            launcher_module.AGY_PRINT_TIMEOUT_ENV: "900",
+            launcher_module.gate_ledger.GATE_TIMEOUT_ENV: "9223371437",
+        }
+    ) == "900s"
+    assert calls == []
+
+
+def test_build_agy_argv_accepts_explicit_canonical_print_timeout_keyword(tmp_path) -> None:
+    prompt = 'implement; keep "quoted"'
+    worktree = tmp_path / "builder-checkout"
+
+    argv = build_agy_argv(
+        prompt=prompt,
+        slice_id="build-demo",
+        log_dir=str(tmp_path / "logs"),
+        worktree=str(worktree),
+        model="Gemini 3.1 Pro (High)",
+        print_timeout="900s",
+    )
+
+    assert argv == [
+        "agy",
+        "--print",
+        prompt,
+        "--mode",
+        "accept-edits",
+        "--add-dir",
+        str(worktree.resolve()),
+        "--output-format",
+        "json",
+        "--print-timeout",
+        "900s",
+        "--model",
+        "Gemini 3.1 Pro (High)",
+    ]
+
+
+@pytest.mark.parametrize(
+    "print_timeout",
+    ("2400", "abc", "00s", "01s", "2400s\n", " 2400s", "2400s ", "9223372037s", "9" * 5000 + "s", 900),
+    ids=(
+        "missing-unit",
+        "letters",
+        "double-zero",
+        "leading-zero",
+        "trailing-newline",
+        "leading-space",
+        "trailing-space",
+        "overflow",
+        "too-many-digits",
+        "non-string",
+    ),
+)
+def test_build_agy_argv_rejects_invalid_explicit_print_timeout_keyword(
+    tmp_path, print_timeout
+) -> None:
+    with pytest.raises(ValueError, match="print_timeout"):
+        build_agy_argv(
+            prompt="implement",
+            slice_id="build-demo",
+            log_dir=str(tmp_path / "logs"),
+            worktree=str(tmp_path / "builder-checkout"),
+            print_timeout=print_timeout,
+        )
 
 
 @pytest.mark.parametrize(
@@ -508,3 +713,66 @@ def test_agy_launcher_forwards_env_override_print_timeout_to_argv_builder(
 
     assert calls
     assert calls[0].get("print_timeout") == "900s"
+
+
+@pytest.mark.parametrize(
+    ("override", "expected_timeout"),
+    ((None, "2400s"), ("900", "900s")),
+    ids=("default-timeout", "env-override"),
+)
+def test_agy_launcher_emits_single_resolved_print_timeout_in_wrapper_script(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, override, expected_timeout
+) -> None:
+    calls: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 127
+
+    def fake_popen(argv, **kwargs):
+        calls.append(argv)
+        return FakeProcess()
+
+    monkeypatch.setattr(launcher_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("PSC_JOB_RUNNER", "direct")
+    prompt = 'implement; keep "quoted"'
+    if override is None:
+        monkeypatch.delenv(launcher_module.AGY_PRINT_TIMEOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(launcher_module.AGY_PRINT_TIMEOUT_ENV, override)
+        monkeypatch.setenv(launcher_module.gate_ledger.GATE_TIMEOUT_ENV, "3600")
+
+    SubprocessLauncher("agy").launch(
+        slice_id="agy-timeout-script",
+        prompt=prompt,
+        worktree=str(tmp_path),
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    assert calls
+    inner_argv = _script_inner_argv(calls[0][2])
+    assert inner_argv[inner_argv.index("--print") + 1] == prompt
+    _assert_print_timeout(inner_argv, expected_timeout)
+
+
+def test_agy_launcher_rejects_invalid_print_timeout_before_popen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    popen_calls: list[object] = []
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        raise AssertionError("Popen must not run after invalid timeout resolution")
+
+    monkeypatch.setattr(launcher_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("PSC_JOB_RUNNER", "direct")
+    monkeypatch.setenv(launcher_module.AGY_PRINT_TIMEOUT_ENV, "9" * 5000)
+
+    with pytest.raises(ValueError, match=launcher_module.AGY_PRINT_TIMEOUT_ENV):
+        SubprocessLauncher("agy").launch(
+            slice_id="agy-invalid-timeout",
+            prompt="implement",
+            worktree=str(tmp_path),
+            log_dir=str(tmp_path / "logs"),
+        )
+
+    assert popen_calls == []

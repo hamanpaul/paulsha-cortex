@@ -17,6 +17,12 @@ from paulsha_cortex.coordinator.registry import JobRegistry
 REVIEW_KINDS = ("workflow-verification-result", "workflow-review-result")
 
 
+@pytest.fixture(autouse=True)
+def _clear_agy_timeout_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(launcher_module.AGY_PRINT_TIMEOUT_ENV, raising=False)
+    monkeypatch.delenv(launcher_module.gate_ledger.GATE_TIMEOUT_ENV, raising=False)
+
+
 def _verification_terminal(
     *, details: object, report_ref: str, status: str = "verified"
 ) -> dict[str, object]:
@@ -229,6 +235,8 @@ def test_agy_probe_and_builder_shapes_do_not_gain_reviewer_schema(tmp_path: Path
         "--mode",
         "plan",
         "--sandbox",
+        "--print-timeout",
+        "2400s",
         "--model",
         "gemini-3.1-pro-high",
     ]
@@ -249,6 +257,8 @@ def test_agy_probe_and_builder_shapes_do_not_gain_reviewer_schema(tmp_path: Path
         str((tmp_path / "builder").resolve()),
         "--output-format",
         "json",
+        "--print-timeout",
+        "2400s",
     ]
     assert "--json-schema" not in builder
 

@@ -193,7 +193,11 @@ identities:
     assert all(set(row) == {"executor", "model_id", "independence_domain"} for row in mapping.values())
 
 
-def test_agy_probe_requires_model_listing_and_safe_headless_smoke() -> None:
+def test_agy_probe_requires_model_listing_and_safe_headless_smoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PSC_AGY_PRINT_TIMEOUT", raising=False)
+    monkeypatch.delenv("PSC_GATE_TIMEOUT", raising=False)
     calls: list[dict] = []
 
     def runner(argv, **kwargs):
@@ -211,6 +215,8 @@ def test_agy_probe_requires_model_listing_and_safe_headless_smoke() -> None:
     assert calls[1]["argv"][:2] == ["agy", "--print"]
     assert calls[1]["argv"][calls[1]["argv"].index("--mode") + 1] == "plan"
     assert "--sandbox" in calls[1]["argv"]
+    assert calls[1]["argv"].count("--print-timeout") == 1
+    assert calls[1]["argv"][calls[1]["argv"].index("--print-timeout") + 1] == "2400s"
     assert "--dangerously-skip-permissions" not in calls[1]["argv"]
     assert calls[1]["shell"] is False
     assert calls[1]["timeout"] == 11
@@ -250,6 +256,26 @@ def test_agy_probe_contains_argv_builder_value_error_as_smoke_failure(
     assert builder_calls[0]["model"] == AGY_MODEL_ID
     assert builder_calls[0]["read_only"] is True
     assert builder_calls[0]["json_envelope"] is False
+
+
+def test_agy_probe_invalid_print_timeout_env_fails_closed_before_smoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_calls: list[list[str]] = []
+    monkeypatch.setenv("PSC_AGY_PRINT_TIMEOUT", "9" * 5000)
+
+    def runner(argv, **kwargs):
+        del kwargs
+        runner_calls.append(list(argv))
+        return _completed(stdout=f"{AGY_MODEL_ID}\n")
+
+    probe = probe_agy_capability(runner=runner)
+
+    assert probe.ready is False
+    assert probe.reason == "smoke-failed"
+    assert probe.diagnostic == "ValueError"
+    assert probe.identity == ("agy", AGY_MODEL_ID, "google")
+    assert runner_calls == [["agy", "models"]]
 
 
 @pytest.mark.parametrize("exception_type", (KeyboardInterrupt, SystemExit))

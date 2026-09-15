@@ -41,6 +41,8 @@ def test_planning_json_extracts_agy_response_envelope() -> None:
 def test_production_runtime_loads_registry_and_probes_only_safe_launchers(
     monkeypatch, tmp_path: Path
 ) -> None:
+    monkeypatch.delenv("PSC_AGY_PRINT_TIMEOUT", raising=False)
+    monkeypatch.delenv("PSC_GATE_TIMEOUT", raising=False)
     registry = IdentityRegistry.from_rows(
         [
             {
@@ -89,6 +91,8 @@ def test_production_runtime_loads_registry_and_probes_only_safe_launchers(
         argv for argv in calls if argv and argv[0] == "agy" and argv != ["agy", "models"]
     ]
     assert agy_calls and all("--sandbox" in argv and "--mode" in argv for argv in agy_calls)
+    assert all(argv.count("--print-timeout") == 1 for argv in agy_calls)
+    assert all(argv[argv.index("--print-timeout") + 1] == "2400s" for argv in agy_calls)
     assert invocation_cwds and all(path != tmp_path for path in invocation_cwds)
     assert all("cortex-planning-" in str(path) for path in invocation_cwds)
 
@@ -208,6 +212,91 @@ def test_production_runtime_contains_agy_builder_failure_for_both_roster_orders(
     assert any(
         rejection.executor == "agy" and rejection.reason == "probe-not-ready"
         for rejection in selection.rejections
+    )
+
+
+@pytest.mark.parametrize(
+    "identities",
+    (
+        (
+            {
+                "executor": "codex",
+                "model_id": "primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": "agy-plan-sandbox",
+            },
+        ),
+        (
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": "agy-plan-sandbox",
+            },
+            {
+                "executor": "codex",
+                "model_id": "primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+        ),
+    ),
+    ids=("primary-before-agy", "agy-before-primary"),
+)
+def test_production_runtime_contains_invalid_agy_timeout_env_for_both_roster_orders(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, identities
+) -> None:
+    """#824：真 timeout resolver 的 ValueError 不得阻擋非 AGY primary runtime。"""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "input.txt").write_text("isolated\n", encoding="utf-8")
+    registry = IdentityRegistry.from_rows(list(identities))
+    monkeypatch.setattr(planning_runtime, "load_model_identities", lambda: registry)
+    monkeypatch.setenv("PSC_AGY_PRINT_TIMEOUT", "9" * 5000)
+
+    runner_calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        del kwargs
+        runner_calls.append(list(argv))
+        if argv == ["agy", "models"]:
+            return _completed(stdout=f"{AGY_MODEL_ID}\n")
+        assert argv[0] == "codex"
+        return _completed(
+            stdout=json.dumps(
+                {
+                    "capability": "cortex-planning-json",
+                    "executor": "codex",
+                    "model": "primary",
+                }
+            )
+        )
+
+    runtime = planning_runtime.build_production_planning_runtime(
+        primary=("codex", "primary"),
+        worktree=worktree,
+        runner=runner,
+        probe_cache_path=tmp_path / "probe-cache.json",
+    )
+
+    primary_probe = runtime.probes[("codex", "primary")]
+    agy_probe = runtime.probes[("agy", AGY_MODEL_ID)]
+    assert primary_probe.ready is True
+    assert agy_probe.ready is False
+    assert agy_probe.reason == "smoke-failed"
+    assert agy_probe.diagnostic == "ValueError"
+    assert runner_calls.count(["agy", "models"]) == 1
+    assert not any(
+        argv and argv[0] == "agy" and argv != ["agy", "models"]
+        for argv in runner_calls
     )
 
 

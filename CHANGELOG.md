@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#824 AGY print timeout**：launcher 現在會解析 `PSC_AGY_PRINT_TIMEOUT` 或既有 gate
+  timeout fallback，對所有 AGY headless argv 形態顯式加入 canonical
+  `--print-timeout <Ns>`，並在 direct launch／capability probe 前 fail-closed
+  拒絕非法或超界設定。
+
 - **`.cortex/work-items.yaml` 補登錄 33 個 work item 的 `github_issue` link**：31 個管線外
   交付、只剩規劃文件殘留者綁定原交付 issue（6 個無專屬 issue 者以 closeout 票 `#898`–`#903`
   作結案紀錄），清掉 `not_claimable` 的 `missing_issue` 反覆觀測（`#895` 治標）；
