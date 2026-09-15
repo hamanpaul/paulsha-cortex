@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **`.cortex/work-items.yaml` 補登錄 33 個 work item 的 `github_issue` link**：31 個管線外
+  交付、只剩規劃文件殘留者綁定原交付 issue（6 個無專屬 issue 者以 closeout 票 `#898`–`#903`
+  作結案紀錄），清掉 `not_claimable` 的 `missing_issue` 反覆觀測（`#895` 治標）；
+  `agy-print-timeout-only` 綁 `#824`、`r3-testpilot-case-corpus` 綁第二輪承接票 `#904`
+  交由管線派工；另還原 `#879`／`#880`／`#828` 三筆未提交的本機登錄。
 - **#879 monitor 檔案事件 convoy 修正**：project filesystem event 改由單一 refresh
   worker 以每 project 一份 pending 標記合併 debounce，同輪只做一次 watch/work-model
   publication，事件 callback 不再建立無界 `Timer` 執行緒；新增
