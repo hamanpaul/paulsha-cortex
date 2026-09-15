@@ -659,6 +659,182 @@ def _status_repo(*values: object) -> str | None:
     return None
 
 
+def _unknown_execution_identity(*, card: object = None) -> dict[str, Any]:
+    """Return the additive execution-identity fields without inventing identity.
+
+    ``unknown`` means there is no verifiable registry identity, so ``job_id`` is
+    always ``None`` (a manifest-declared id that the registry does not back is
+    not evidence) and ``execution_state`` uses the typed default
+    ``not-dispatched`` rather than a free-form ``unknown`` state.
+    """
+    return {
+        "executor": None,
+        "model": None,
+        "job_id": None,
+        "card": card,
+        "identity_source": "unknown",
+        "execution_state": "not-dispatched",
+    }
+
+
+def _job_execution_identity(
+    job: Mapping[str, Any], *, identity_source: str, card: object = None
+) -> dict[str, Any]:
+    """Project identity only from a concrete registry job row.
+
+    ``model`` is deliberately sourced from the job's persisted ``model_id``;
+    planned workflow-step values are never used as a fallback for an actual
+    execution.
+    """
+    job_card = job.get("workflow_card")
+    if not isinstance(job_card, str) or not job_card:
+        job_card = card
+    state = job.get("status")
+    if not isinstance(state, str) or not state:
+        state = "unknown"
+    return {
+        "executor": job.get("executor"),
+        "model": job.get("model_id"),
+        "job_id": job.get("job_id"),
+        "card": job_card,
+        "identity_source": identity_source,
+        "execution_state": state,
+    }
+
+
+def _workflow_job_matches(
+    job: Mapping[str, Any],
+    *,
+    run_id: str,
+    repo: str | None,
+    card: str,
+    phase: str | None,
+) -> bool:
+    """Require explicit workflow binding before borrowing a job identity."""
+    if job.get("workflow_run_id") != run_id or job.get("workflow_card") != card:
+        return False
+    if phase is not None and job.get("workflow_phase") != phase:
+        return False
+    job_repo = job.get("workflow_repo")
+    # Legacy rows may lack workflow_repo, but an explicit foreign repository is
+    # never allowed to satisfy a same-card lookup.
+    return repo is None or job_repo in (None, repo)
+
+
+def _registry_job(registry, job_id: object) -> Mapping[str, Any] | None:
+    if not isinstance(job_id, str) or not job_id:
+        return None
+    getter = getattr(registry, "get_job", None)
+    if callable(getter):
+        try:
+            job = getter(job_id)
+        except Exception:  # noqa: BLE001 - status projection is fail-soft
+            job = None
+        if isinstance(job, Mapping):
+            return job
+    lister = getattr(registry, "list_jobs", None)
+    if callable(lister):
+        try:
+            for job in lister():
+                if isinstance(job, Mapping) and job.get("job_id") == job_id:
+                    return job
+        except Exception:  # noqa: BLE001 - status projection is fail-soft
+            pass
+    return None
+
+
+def _manifest_execution_identity(
+    registry,
+    *,
+    job_id: object,
+    workflow_run_id: object = None,
+    workflow_repo: str | None = None,
+    workflow_card: object = None,
+    workflow_phase: object = None,
+) -> dict[str, Any]:
+    """Resolve a handoff manifest's job binding without trusting its identity fields."""
+    job = _registry_job(registry, job_id)
+    if job is None:
+        return _unknown_execution_identity(card=workflow_card)
+    if isinstance(workflow_run_id, str) and workflow_run_id:
+        if not isinstance(workflow_card, str) or not workflow_card:
+            # A run binding without a card is still an explicit job binding;
+            # the job id remains the authority for the card projection.
+            bound = job.get("workflow_run_id") == workflow_run_id
+        else:
+            bound = _workflow_job_matches(
+                job,
+                run_id=workflow_run_id,
+                repo=workflow_repo,
+                card=workflow_card,
+                phase=workflow_phase if isinstance(workflow_phase, str) else None,
+            )
+    else:
+        bound = True
+        if workflow_repo is not None and job.get("workflow_repo") not in (None, workflow_repo):
+            bound = False
+        if isinstance(workflow_card, str) and workflow_card:
+            bound = bound and job.get("workflow_card") == workflow_card
+        if isinstance(workflow_phase, str) and workflow_phase:
+            bound = bound and job.get("workflow_phase") == workflow_phase
+    if not bound:
+        return _unknown_execution_identity(card=workflow_card)
+    status = job.get("status")
+    if status in IN_FLIGHT_STATUSES:
+        return _job_execution_identity(job, identity_source="in-flight", card=workflow_card)
+    if status in TERMINAL_STATUSES:
+        return _job_execution_identity(job, identity_source="last-execution", card=workflow_card)
+    return _unknown_execution_identity(card=workflow_card)
+
+
+def _workflow_execution_identity(registry, run) -> dict[str, Any]:
+    """Project the current workflow card's planned/actual/last identity.
+
+    Selection is intentionally ordered as current-card in-flight, current-card
+    terminal execution, planned step, then unknown.  A job from another card,
+    run, phase, or explicit repository is not evidence for this projection.
+    """
+    if not getattr(run, "steps", None):
+        return _unknown_execution_identity()
+    step = _current_workflow_step(run)
+    if step is None:
+        return _unknown_execution_identity()
+    jobs: list[Mapping[str, Any]] = []
+    lister = getattr(registry, "list_jobs", None)
+    if callable(lister):
+        try:
+            jobs = [job for job in lister() if isinstance(job, Mapping)]
+        except Exception:  # noqa: BLE001 - status projection is fail-soft
+            jobs = []
+    matching = [
+        job
+        for job in jobs
+        if _workflow_job_matches(
+            job,
+            run_id=run.run_id,
+            repo=getattr(run, "repo", None),
+            card=step.card,
+            phase=step.phase,
+        )
+    ]
+    in_flight = [job for job in matching if job.get("status") in IN_FLIGHT_STATUSES]
+    if in_flight:
+        return _job_execution_identity(in_flight[-1], identity_source="in-flight", card=step.card)
+    terminal = [job for job in matching if job.get("status") in TERMINAL_STATUSES]
+    if terminal:
+        return _job_execution_identity(terminal[-1], identity_source="last-execution", card=step.card)
+    if step.executor is not None or step.model is not None:
+        return {
+            "executor": step.executor,
+            "model": step.model,
+            "job_id": None,
+            "card": step.card,
+            "identity_source": "planned",
+            "execution_state": "not-dispatched",
+        }
+    return _unknown_execution_identity(card=step.card)
+
+
 def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runner=None) -> dict[str, Any]:
     slice_id = str(slice_row.get("slice_id") or "")
     builder_job_id = slice_row.get("builder_job_id")
@@ -824,6 +1000,7 @@ def workflow_status_entry(
         ).to_dict()
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         candidate_git_base = None
+    execution_identity = _workflow_execution_identity(registry, run)
     return {
         "kind": "workflow_run",
         "run_id": run.run_id,
@@ -845,6 +1022,7 @@ def workflow_status_entry(
         "next_actions": list(next_actions),
         "next_step_hint": next_step_hint,
         "updated_at": run.updated_at,
+        **execution_identity,
     }
 
 
@@ -4356,10 +4534,11 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
     if not isinstance(log_path, str) or not log_path:
         raise ValueError("workflow terminal log missing")
     try:
-        content = Path(log_path).read_text(encoding="utf-8")
+        with Path(log_path).open(encoding="utf-8", newline="") as handle:
+            content = handle.read()
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("workflow terminal log unreadable") from exc
-    lines = content.splitlines()
+    lines = content.split("\n")
     for line in reversed(lines):
         if not line.strip():
             continue
@@ -4405,6 +4584,46 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
     raise ValueError("workflow terminal log has no JSON evidence")
 
 
+
+# #888：agy 以 --json-schema 產出 structured output 時，會在 canonical payload 之外
+# 多掛 Antigravity 自己的 tool 中繼欄位（toolAction／toolSummary）。這兩個鍵不是
+# 模型自由發揮，而是 CLI 把 schema 包成 function declaration 的固定副產物；只剝
+# 這兩個固定鍵，其餘多餘鍵仍交由 terminalize 的 exact key-set 檢查 fail closed。
+_AGY_STRUCTURED_OUTPUT_META_KEYS = ("toolAction", "toolSummary")
+
+
+def _strip_agy_structured_output_meta(payload: dict[str, object]) -> dict[str, object]:
+    if not any(key in payload for key in _AGY_STRUCTURED_OUTPUT_META_KEYS):
+        return payload
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _AGY_STRUCTURED_OUTPUT_META_KEYS
+    }
+
+
+def _fold_agy_key_value_map(value: object) -> object:
+    """#888：把 Gemini 相容 schema 產出的 ``[{key, value}]`` 陣列摺回字串鍵 map。
+
+    只在「每一項都恰好是 {key, value} 且 key 為非空字串、無重複」時摺回；其他
+    形狀原樣回傳，交由既有驗證 fail closed。
+    """
+
+    if not isinstance(value, list) or not value:
+        return value
+    folded: dict[str, object] = {}
+    for entry in value:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"key", "value"}
+            or not isinstance(entry["key"], str)
+            or not entry["key"]
+            or entry["key"] in folded
+        ):
+            return value
+        folded[entry["key"]] = entry["value"]
+    return folded
+
 def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
     if not isinstance(value, str):
         return None
@@ -4433,9 +4652,11 @@ def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
             except json.JSONDecodeError:
                 continue
             if _is_workflow_terminal_payload(parsed):
-                return parsed
+                return _strip_agy_structured_output_meta(parsed)
         return None
-    return parsed if _is_workflow_terminal_payload(parsed) else None
+    if not _is_workflow_terminal_payload(parsed):
+        return None
+    return _strip_agy_structured_output_meta(parsed)
 
 
 def _is_workflow_terminal_payload(value: object) -> bool:
@@ -6363,6 +6584,13 @@ def terminalize_workflow_job(
             raise ValueError(
                 f"workflow verification terminal reported non-passing status: {raw.get('status')}"
             )
+        details = raw.get("details")
+        if isinstance(details, str) and details.strip():
+            logger.warning(
+                "workflow verification terminal details normalized from string for job=%s",
+                job_id,
+            )
+            raw = {**raw, "details": {"text": details}}
         if (
             set(raw) != required
             or raw.get("schema_version") != 1
@@ -6399,6 +6627,11 @@ def terminalize_workflow_job(
         required = {"schema_version", "kind", "reason", "findings", "reports"}
         if expected_authority_hashes:
             required = required | {"authority_hashes"}
+            if "authority_hashes" in raw:
+                raw = {
+                    **raw,
+                    "authority_hashes": _fold_agy_key_value_map(raw["authority_hashes"]),
+                }
         # #261 R1：review card 同樣必須能誠實回報 failed／needs_human。status 是
         # canonical envelope 的選填欄位（review verdict 本身由 findings 決定），
         # 在此先取出並攔截非通過狀態，再做既有的 exact key-set 驗證。

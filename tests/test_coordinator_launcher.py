@@ -20,6 +20,48 @@ from paulsha_cortex.coordinator.launcher import (
 
 
 class ArgvTests(unittest.TestCase):
+    def test_claude_commit_permissions_are_per_job_and_exact(self) -> None:
+        gate = "env -u PSC_REPO_ROOT /opt/test/bin/python -m pytest -q"
+        with mock.patch.dict(os.environ, {"PSC_GATE_CMD_PYTEST": gate}, clear=True):
+            argv = build_claude_argv(
+                prompt="P", slice_id="s", log_dir="/lg", commit_required=True,
+            )
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings["permissions"]["allow"], sorted([
+            "Bash(git add:*)", "Bash(git commit:*)", f"Bash({gate})",
+        ]))
+        self.assertIn("hooks", settings)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
+        for forbidden in ("Bash(*)", "Bash(git:*)", "Bash(python:*)", "bypassPermissions"):
+            self.assertNotIn(forbidden, json.dumps(argv))
+
+    def test_claude_commit_permissions_reject_rule_injection(self) -> None:
+        for gate in (
+            "python3 -m pytest tests/*", "python3 -m pytest 'x);*'",
+            "python3 -m pytest 'x;echo'", "python3 -m pytest '$(id)'",
+            "python3 -m pytest 'a\\nb'", "bash -c 'python3 -m pytest'",
+        ):
+            with self.subTest(gate=gate), mock.patch.dict(
+                os.environ, {"PSC_GATE_CMD_PYTEST": gate}, clear=True,
+            ):
+                with self.assertRaises(ValueError):
+                    build_claude_argv(prompt="P", slice_id="s", log_dir="/lg", commit_required=True)
+
+    def test_claude_commit_permissions_do_not_grant_arbitrary_commands(self) -> None:
+        for gate in ("git push origin main", "python3 -c print", "env PATH=/other pytest", "rm -rf /tmp/example"):
+            with self.subTest(gate=gate), mock.patch.dict(
+                os.environ, {"PSC_GATE_CMD_OTHER": gate}, clear=True,
+            ):
+                argv = build_claude_argv(prompt="P", slice_id="s", log_dir="/lg", commit_required=True)
+            settings = json.loads(argv[argv.index("--settings") + 1])
+            self.assertEqual(settings["permissions"]["allow"], ["Bash(git add:*)", "Bash(git commit:*)"])
+
+    def test_claude_non_commit_permissions_unchanged(self) -> None:
+        with mock.patch.dict(os.environ, {"PSC_GATE_CMD_PYTEST": "python3 -m pytest *"}, clear=True):
+            argv = build_claude_argv(prompt="P", slice_id="s", log_dir="/lg")
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertNotIn("permissions", settings)
+
     def test_srt_runtime_root_resolves_regular_jitless_toolchain_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "toolchain"
@@ -755,7 +797,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 999
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -816,7 +858,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 741
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -855,7 +897,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 222
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -878,7 +920,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 223
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -925,7 +967,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 231
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -949,7 +991,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 232
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -975,7 +1017,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 233
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -999,7 +1041,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 234
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -1025,7 +1067,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 235
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"env": env})
             return _FakeProc()
 
@@ -1053,7 +1095,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 225
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv, "env": env})
             return _FakeProc()
 
@@ -1105,7 +1147,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 224
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv, "cwd": cwd})
             return _FakeProc()
 
@@ -1139,7 +1181,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 111
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1161,7 +1203,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 222
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1183,7 +1225,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 226
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1252,7 +1294,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 227
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1319,7 +1361,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 456
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv, "cwd": cwd, "env": env})
             return _FakeProc()
 
@@ -1354,7 +1396,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 789
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv})
             return _FakeProc()
 
@@ -1395,7 +1437,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 333
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             return _FakeProc()
 
         original = launcher_module.subprocess.Popen
@@ -1495,7 +1537,7 @@ class ArgvTests(unittest.TestCase):
         class _FakeProc:
             pid = 654
 
-        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+        def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
             calls.append({"argv": argv, "env": env})
             return _FakeProc()
 

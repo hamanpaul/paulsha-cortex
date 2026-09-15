@@ -22,9 +22,8 @@ _GIT_REPOSITORY_ENV_KEYS = job_runner.GIT_REPOSITORY_ENV_KEYS | frozenset(
 # 的憑證判準永遠是同一條 pattern，不會兩處漂移。
 _CREDENTIAL_ENV_RE = job_runner.CREDENTIAL_ENV_RE
 
-
 def _claude_review_json_schema(kind: str) -> str:
-    """Bind Claude StructuredOutput to the Manager terminal contract."""
+    """Build the shared Manager terminal-contract schema for Claude and AGY reviewers."""
 
     report = {
         "type": "object",
@@ -520,6 +519,51 @@ def _claude_spool_hook_settings() -> str:
     return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
+def _claude_builder_settings() -> str:
+    """Grant commit-required jobs Git writes and exact declared Python tests.
+
+    This is a per-process usability grant, not an OS sandbox. Never derive
+    permissions from candidate files or prompt text. Other gate executables
+    remain subject to the existing approval policy.
+    """
+    settings = json.loads(_claude_spool_hook_settings())
+    allowed = ["Bash(git add:*)", "Bash(git commit:*)"]
+    safe_chars = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/.:=,@+"
+    )
+    for spec in gate_ledger.load_gate_specs():
+        argv = spec.argv
+        offset = 0
+        # Support the existing scoped repository-selector cleanup, not an
+        # arbitrary env wrapper or executable/PATH substitution.
+        if Path(argv[0]).name == "env":
+            if argv[1:3] != ("-u", "PSC_REPO_ROOT"):
+                continue
+            offset = 3
+        command = argv[offset:]
+        if not command:
+            continue
+        executable = Path(command[0]).name
+        is_test = executable == "pytest" or (
+            executable in {"python", "python3"}
+            and command[1:3] in {("-m", "pytest"), ("-m", "unittest")}
+        )
+        if not is_test:
+            continue
+        # Claude rules have their own pattern grammar. Even shell-quoted
+        # wildcard/metacharacter arguments must not become permission rules.
+        if any(not set(arg) <= safe_chars for arg in argv):
+            # Name the offending gate so operators can find the PSC_GATE_CMD_*
+            # declaration; the command itself is operator-declared, not secret.
+            raise ValueError(
+                "Claude builder gate cannot be represented as an exact permission rule: "
+                f"gate={spec.name!r} command={spec.command!r}"
+            )
+        allowed.append(f"Bash({spec.command})")
+    settings["permissions"] = {"allow": sorted(set(allowed))}
+    return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
 def _git_scope_env() -> dict[str, str]:
     """Drop inherited Git repository/config selectors before scope binding."""
 
@@ -949,7 +993,10 @@ def build_claude_argv(
         # - review_only reviewer 是 read-only 契約，且它的 `--settings` 是那份
         #   sandbox 政策（deny 掉 $HOME 讀寫），事件根本寫不出去。
         # 這一行是 hook 的**唯一**注入點：per-job、走 argv、不落地任何檔案。
-        argv += ["--settings", _claude_spool_hook_settings()]
+        argv += [
+            "--settings",
+            _claude_builder_settings() if commit_required else _claude_spool_hook_settings(),
+        ]
     if model is not None:
         argv += ["--model", model]
     if worktree is not None and not review_only:
@@ -1176,6 +1223,81 @@ def _codex_sandbox_mode(
     return mode
 
 
+
+def _gemini_compatible_schema(node: object) -> object:
+    """Rewrite a JSON schema into the subset Gemini structured output accepts (#888).
+
+    Antigravity forwards ``--json-schema`` as a Gemini function declaration.
+    Gemini's Schema subset only accepts **string** enum members and a single
+    ``type``; ``{"type": "integer", "enum": [1]}`` is serialised as an empty
+    string and rejected with ``INVALID_ARGUMENT … enum[0]: cannot be empty``,
+    and ``"type": ["integer", "null"]`` is not a valid type either.  Both
+    shapes are rewritten to the equivalent constraints Gemini understands:
+    a single-valued numeric enum becomes ``minimum``/``maximum`` and a
+    ``null``-bearing type list becomes the remaining type plus
+    ``nullable: true``.  Everything else (including ``additionalProperties``)
+    is preserved verbatim, so the Claude schema stays the single source.
+    """
+
+    if isinstance(node, list):
+        return [_gemini_compatible_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    # Gemini has no ``additionalProperties`` map type either: the model is
+    # forced to invent identifier-like property names, so a string-keyed map
+    # (``authority_hashes``: repo path → sha256) comes back with mangled keys.
+    # A map-shaped object becomes an array of ``{"key", "value"}`` entries;
+    # Manager folds those entries back into the canonical mapping.
+    if (
+        node.get("type") == "object"
+        and isinstance(node.get("additionalProperties"), dict)
+        and "properties" not in node
+    ):
+        return {
+            **{k: v for k, v in node.items() if k not in {"type", "additionalProperties"}},
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["key", "value"],
+                "properties": {
+                    "key": {"type": "string", "minLength": 1},
+                    "value": _gemini_compatible_schema(node["additionalProperties"]),
+                },
+            },
+        }
+    rewritten: dict[str, object] = {}
+    for key, value in node.items():
+        if key == "enum" and isinstance(value, list) and value and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) for item in value
+        ):
+            if len(set(value)) != 1:
+                raise ValueError("gemini schema cannot express multi-valued numeric enum")
+            rewritten["minimum"] = value[0]
+            rewritten["maximum"] = value[0]
+            continue
+        if key == "type" and isinstance(value, list):
+            remaining = [item for item in value if item != "null"]
+            if len(remaining) != 1:
+                raise ValueError("gemini schema requires exactly one non-null type")
+            rewritten["type"] = remaining[0]
+            if len(remaining) != len(value):
+                rewritten["nullable"] = True
+            continue
+        rewritten[key] = _gemini_compatible_schema(value)
+    return rewritten
+
+
+def _gemini_review_json_schema(kind: str) -> str:
+    """The shared reviewer terminal schema, rewritten for Gemini (#888)."""
+
+    return json.dumps(
+        _gemini_compatible_schema(json.loads(_claude_review_json_schema(kind))),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
 def build_agy_argv(
     *,
     prompt: str,
@@ -1191,6 +1313,7 @@ def build_agy_argv(
     review_only: bool = False,
     commit_required: bool = False,
     write_forbidden: bool = False,
+    review_terminal_kind: str | None = None,
     # Workflow lanes want the single-line JSON envelope; the capability probe
     # (#670) keeps the bare ``--output-format text`` shape because the CLI
     # rejects ``--json-schema`` there and the probe parser reads raw JSON.
@@ -1215,6 +1338,18 @@ def build_agy_argv(
         raise ValueError("commit-required agy builder requires enforced workspace-write")
     if write_forbidden and allow_unsafe:
         raise ValueError("write-forbidden agy builder cannot bypass permissions")
+
+    if review_only and not json_envelope:
+        raise ValueError("agy reviewer requires json envelope for terminal schema")
+
+    if review_only:
+        if review_terminal_kind is None:
+            raise ValueError("agy reviewer terminal contract kind missing")
+        review_schema = _gemini_review_json_schema(review_terminal_kind)
+    else:
+        if review_terminal_kind is not None:
+            raise ValueError("agy terminal contract requires reviewer mode")
+        review_schema = None
 
     # Unsafe and commit-required modes are builder-only; accepting either
     # without a provisioned checkout would silently turn an invalid builder
@@ -1244,6 +1379,8 @@ def build_agy_argv(
     # its single-line JSON envelope and let Manager unwrap the ``response``.
     if json_envelope:
         argv.extend(["--output-format", "json"])
+    if review_schema is not None:
+        argv.extend(["--json-schema", review_schema])
     if model is not None:
         argv.extend(["--model", model])
     return argv
@@ -1345,6 +1482,30 @@ _ARGV_BUILDERS = {
     "agy": build_agy_argv,
     "cg": build_cg_argv,
 }
+
+
+def build_headless_popen_kwargs(
+    *,
+    cwd: str | None,
+    env: Mapping[str, str],
+    executor: str,
+) -> dict[str, object]:
+    """Build the common spawn kwargs for every headless executor.
+
+    The launcher owns the process-group boundary.  Runner-specific callers may
+    override stdin, cwd, or env after this helper returns, but every Popen
+    attempt starts from the same isolated-session contract.
+    """
+
+    kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "stderr": subprocess.STDOUT,
+        "start_new_session": True,
+    }
+    if executor == "claude":
+        kwargs["stdin"] = subprocess.PIPE
+    return kwargs
 
 
 class SubprocessLauncher:
@@ -1903,8 +2064,9 @@ class SubprocessLauncher:
                     f"executor {self._executor} cannot be granted a verdict spool write path"
                 )
             builder_kwargs["verdict_spool_dir"] = self._verdict_spool_dir
-        if self._executor == "claude":
+        if self._executor in {"claude", "agy"}:
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
+        if self._executor == "claude":
             # Claude's complete workflow envelope can exceed Linux's per-argv
             # limit.  The wrapper receives it over stdin instead.
             builder_kwargs["prompt_via_stdin"] = True
@@ -2083,13 +2245,11 @@ class SubprocessLauncher:
         # 白名單 env 建立完成之後重新 source ~/.profile，把 env 約束整個覆寫掉。
         # direct 模式的 builder 維持 `-lc` 不動——那是既有行為，本票不改。
         argv = ["bash", "-c" if (self._review_only or degraded) else "-lc", script]
-        popen_kwargs: dict[str, object] = {
-            "cwd": worktree,
-            "env": env,
-            "stderr": subprocess.STDOUT,
-        }
-        if self._executor == "claude":
-            popen_kwargs["stdin"] = subprocess.PIPE
+        popen_kwargs = build_headless_popen_kwargs(
+            cwd=worktree,
+            env=env,
+            executor=self._executor,
+        )
         if runner_plan is not None:
             argv = job_runner.build_systemd_run_argv(
                 systemd_run=runner_plan.binary,

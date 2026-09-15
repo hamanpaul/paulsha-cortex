@@ -970,6 +970,34 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/workflow-terminal-jsonl-framing/todo.md'
     excludes: []
+  recovery-registry-receipt:
+    title: 'recovery-registry-receipt'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#862'
+      - kind: openspec
+        ref: 'recovery-registry-receipt'
+      - kind: path
+        ref: 'docs/superpowers/specs/recovery-registry-receipt-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/recovery-registry-receipt-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/recovery-registry-receipt/todo.md'
+    excludes: []
+  quota-observation-schema-core:
+    title: 'quota-observation-schema-core'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#866'
+      - kind: openspec
+        ref: 'quota-observation-schema-core'
+      - kind: path
+        ref: 'docs/superpowers/specs/quota-observation-schema-core-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/quota-observation-schema-core-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/quota-observation-schema-core/todo.md'
+    excludes: []
   task-memory-delivery-adapter:
     title: 'task memory delivery Cortex adapter'
     links:

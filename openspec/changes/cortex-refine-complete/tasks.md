@@ -8,6 +8,8 @@
 ## 2. B1 執行基礎
 
 - [ ] 2.0 補 #830 非 Job 決策回覆與 #831 sizing stability 方向；保留合理單模組 sizing 及所有 gate；#833 獨立交付 Red planner 分解接線。
+- [x] 2.0.RED #831 依 accepted `sizing-stability-direction` plan 新增 stability-risk-v2 的 RED regression tests；保留現行 production 算法與其餘 2.0 交付未完成。
+- [x] 2.0.GREEN #831 依 accepted plan 完成 stability-risk-v2 純函式映射、受影響 sizing wiring oracle、文件與 changelog，並通過 full pytest；#830、#833、獨立 review、CI／installed runtime 交付仍未完成。
 - [ ] 2.1 透過 Cortex 完成 #822 argv/YAML canary，取得 RED/GREEN、review、policy 與 terminal delivery 證據。
 - [ ] 2.2 完成 #827 有界 refresh/coalesce、slow-provider 公平與 stop/diagnostics。
 - [x] 2.2.0 [RED/GREEN] 依 accepted #879 plan 新增並通過
@@ -21,11 +23,14 @@
 - [ ] 2.3 完成 #819 not-idle clock、periodic 有效 max_load/require_idle 與非法值處置。
 - [ ] 2.4 依 accepted 三件組完成 #496 內容/狀態冪等，驗同 path 內容改變仍恰好記錄；保留現行 7/Red，#831 後真重評。
 - [ ] 2.5 依 accepted 三件組分拆並完成 #497 原子解除綁定、持久 supersession 與 restart/late-terminal 回歸；#831 後仍預計 Red，#501 只核對已修及殘餘污染。
+- [ ] 2.5.1 先依 #862 交付 registry-only A 的九組 receipt/disposition/revision/checkpoint 不變量；accepted 現行8/Red不派工，#831實際loaded後重評。C→B→D2、D1→D2仍需獨立交付，A完成不得關閉#497；own OpenSpec需run前完成唯一owner/發布/binding，archive只收自身。
 - [ ] 2.6 依 accepted 三件組完成 #821 no-op persistence、history retention、writer/fault/rollback 相容與安全暫存清理；完整 archive 缺口/截斷前備份保持列管。
 - [ ] 2.7 完成 #823/#824 session 與 AGY timeout 合約，明示 cgroup restart survival 的獨立驗收。
-- [ ] 2.7.1 先依 #851 補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。
+- [x] 2.7.1 #851 pre-archive：補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。archive、merge、issue closure 與 loaded-runtime 驗證仍由後續責任方處理。
 - [ ] 2.7.2 #824 dependency 證據未滿前不登錄可 claim child／不開 auto label；解除後重新核對完整性、真 sizing、唯一 owner 與正式 freeze，不能依 custom frontmatter 自稱已鎖派工。
 - [ ] 2.7.3 依 #823 session-only 三件組完成共用 kwargs 真接線、兩個 Popen／stdin 窄重試、合法配置及既有拒絕、所有權驗證先於 group signal 的真 fixture 與候選 wheel 驗收；不擴成 cgroup/restart/cancel 實作。
+  - [x] RED：新增 `tests/test_coordinator_launcher_session.py`，鎖定 shared Popen kwargs 的 `start_new_session=True`、Claude stdin 保留，以及五個 executor 的 direct launch recording。
+  - [x] GREEN：在 launcher 共用 helper 實作並接入所有 headless Popen；保留 runner override、Claude stdin-only retry 與固定 fake 相容性。
 - [ ] 2.8 完成 #825 最小 durable backoff，所有 lane 與 corrupt-state/expiry 可測；不標 R05 完成。
 - [ ] 2.8.1 先依 #850 有界 store／immutable event-fold child 交付 component；C/D provenance、reconciliation 與所有 lane 接線仍由 #825 後續 child 承接。
 - [ ] 2.9 以實際已載入 revision 驗 B1 成效，退出暫時 bypass 前保存 active jobs 與 rollback 方案。
@@ -49,6 +54,7 @@
 - [ ] 4.1 完成 #826 failure 原始訊號→持久化→消費端分類，保留 runtime-contract 硬阻擋。
 - [ ] 4.2 整合 usage provenance：observed/estimated/unknown、增量/累計、input/cache/reasoning 不重複加總。
 - [ ] 4.3 由 #836 核對各 provider 真正可用的 quota observation 介面，實作帶來源/TTL/window/unit 的 adapters 與 unknown fallback。
+- [ ] 4.3.1 先依 #866 交付純 schema A 的十組不變量、standalone native unit cold-start、strict refs/unknown 與無 I/O helpers；現行7/Red不派工，#831真正loaded後重評。B來源adapter、C持久ledger、Dshadow及#849正式upstream conformance仍需各自證據；A不得關閉#836或代替forecast/reservation/fallback。
 - [ ] 4.4 實作與 benchmark 分開的 operational track record，涵蓋失敗消耗、duration 及任務分布。
 - [ ] 4.5 由 #837 實作 task/profile 用量 forecast 與冷啟動先驗、風險區間、版本與資料期間。
 - [ ] 4.6 以 shadow 流程取得觀測覆蓋率、預估誤差與 confidence baseline；據此核定有限啟用門檻。
@@ -66,6 +72,9 @@
 ## 6. B5 狀態與部署
 
 - [ ] 6.1 核對 #828 獨立 producer 交付；由 #840 補 actual/planned/last、facets、quota wait 與 selection receipts 的 status 一致性，不接管原producer。
+  - [x] 6.1.a [RED] #828 在 Cortex producer 邊界新增 execution-identity regression tests；以 registry job binding 驗證多卡、retry、缺值、未派工、跨 run/repo、needs_human、in-flight 與 completed status projection，保留 RED 供後續最小修正。
+  - [x] 6.1.b [GREEN] #828 producer 以 registry job 的 run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；planned、actual、last execution 與 unknown 不互相代填。
+  - [x] 6.1.c [CONTRACT] #828 新增去識別化 status snapshot fixture 與 producer/consumer 欄位契約；僅完成 pre-archive handoff，consumer、pin、installed/runtime integration 與下游 issue closure 仍未完成。
 - [ ] 6.2 由 #841 建立 CLI/site-packages/service loaded artifact/config identity 的同源驗證與 checkout 外 smoke。
 - [ ] 6.3 完成 installer/doctor instance roots、writer ownership 與 owner-aware stop/cleanup 的契約驗收。
 - [ ] 6.4 取得 upgrade/restart/rollback 對 active jobs 的實際 receipts；未重載程序不得標已部署。

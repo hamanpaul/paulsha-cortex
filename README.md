@@ -21,6 +21,14 @@ flowchart LR
 persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role profile + scope subject），不是執行中的 agent session；真正執行的是 AgentInstance，真正做安全判斷的是 guardrail / policy engine，它們只讀 persona 契約做 enforcement。
 
 
+## 架構與工作流程驗收
+
+[開啟架構／工作流程 HTML](docs/architecture/architecture.html) · [架構事實與來源](docs/architecture/facts.json) · [呈現資料](docs/architecture/architecture.json)
+
+這份 HTML 用同一頁呈現 Persona／Deck 規則、Manager 控制、WorkflowRun／Job／Slice 狀態、Monitor 投影，以及 feature-oneshot 七階段的 Card、輸入、產出、gate 與恢復路徑。它是文件驗收介面，不會派工或修改 runtime。GitHub 檔案頁顯示原始碼；clone 後直接用瀏覽器開啟 `docs/architecture/architecture.html`，不需要 server 或網路套件。
+
+重新產生與驗證：先依 `hamanpaul/custom-skills` 的 `architecture-fact-layer` workflow-review profile 執行 semantic／exact HTML gate，再執行 `python tests/architecture_browser_review.py --html docs/architecture/architecture.html --output /tmp/architecture-review`（需 Playwright／Chromium）。CI 使用同一個 repo HTML 以 `file://` 驗證；不以 PNG 代替交付。
+
 ## Install
 
 需求：Python 3.10+、Git，以及至少一個已安裝並登入的 headless executor CLI（`copilot`、`claude` 或 `codex`）。套件只安裝 Python runtime，不會代裝或登入 executor。
@@ -124,6 +132,14 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    **`PSC_BUILDER_PATH` 不是選配**（#679）：它與 `PSC_REVIEWER_PATH`／`PSC_GATE_PATH`
    同為**必填**，未宣告時 Manager 在派工前即 fail-closed。值由產生器導出，不要手打：
    `python3 -m paulsha_cortex.trust_root unit four-way --job | grep '^Environment=PATH='`。
+
+   **#823 headless session 的生命週期邊界**：每個合法 headless `Popen` 嘗試（含
+   `systemd-run`／`systemd-template` 的 Manager-side client wrapper 與窄 `stdin` retry）都帶
+   `start_new_session=True`。direct child 因此有自己的 POSIX session/process group；這是
+   `setsid` 隔離，不是 systemd cgroup 移動，也不改變 unit 的 `KillMode` 或提供 cgroup
+   restart survival 保證。Manager daemon restart、timeout/parser/CLI 值域（#824）與 AGY
+   probe containment（#851）仍是獨立工作項；本 session 修正不新增 cancel/timeout/probe
+   語意，也不宣稱這些 issue 已完成或關閉。
 
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 
@@ -385,7 +401,14 @@ systemctl --user status cortex-manager.service cortex-monitor.service
 
 - `ready`：已滿足派工條件。
 - `held`：尚未可派工，並列出 `no-plan`、`dispatch-hold` 或未滿足的 dependency。
-- `in_flight`：正在執行的 Job，含 `candidate_git_base`（見下）。
+- `in_flight`：正在執行的 Job，含 `candidate_git_base`（見下）以及由 registry job
+  實際綁定的 `executor`、`model`、`job_id`、`card`、`identity_source` 與
+  `execution_state`。workflow 的 `attention`／`recent_done` 也使用同一組身份欄位：
+  `identity_source` 為 `in-flight`、`last-execution`、`planned` 或 `unknown`；沒有
+  registry 證據時不從 phase／persona 推測 executor 或 model。
+  下游可直接使用去識別化 producer snapshot fixture
+  `tests/fixtures/workflow-execution-identity-828-status.json`；欄位與 selection
+  語意見 `docs/superpowers/specs/workflow-execution-identity-producer-contract.md`。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。
 - `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及 `candidate_git_base`。
 - `candidate_git_base`（#731）：這條 run／這張卡的**候選 git base**——真正那個 40-hex commit SHA，以及它落後 mirror 上 `origin/main` 幾個 commit。欄位含 `sha`、`sha_source`（`frozen-readiness-base-sha` 或 `first-build-job-dispatch-head`）、`behind_origin_main`、`mirror_origin_main`、`threshold_commits`、`reason`、`measured_against`、`fetched`。
@@ -412,6 +435,8 @@ cortex slice-action "$SLICE_ID" abandon      --actor operator
 `fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
 
 Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|auto|review-attest|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS；`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord。`review-attest` 的review摘要與 `ship` 的 exact evidence refs 也由 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+
+Sizing 的五個維度仍各為 0–2 分，Green／Yellow／Red 仍是 0–3／4–6／7–10。`spec_stability` 使用可識別的 `stability-risk-v2` 風險映射：完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind 或任何 blocker／未 accepted artifact 為 2；空白或不一致資料保守為 2。這不會取代 accepted/readiness gate。新 claim／reclaim／明示 retry 重算才採用新映射；舊 run、frozen planning、CompletionRecord 與 immutable evidence 不會因讀取或重啟被回填，缺算法來源的歷史分數標為 legacy／unversioned，需正式重新評估才取得新分數。
 
 Manager periodic tick 會從 durable Monitor snapshot 執行 auto-claim scan；它會讀取 work item 的全部 mapped issues，任一張帶 `cortex:auto-on-going` 即符合 label 條件，但任一 GitHub API read 失敗會讓整個 claim fail-closed。`cortex work auto ... --enable|--disable` 未指定 legacy `--issue` 時會對全部 mapped issues 套用相同 label mutation；任一 mutation 失敗時整個 action 報錯。缺 issue 的 confirmed Todo 會持久化為 `needs_human: missing_issue`，待 operator link 且 Monitor snapshot 更新後才能 resume。Run 的 claim key 綁定該 work item 的 canonical semantic authority（provider/source revisions 與 confirmed refs），不綁 whole-fleet snapshot hash；只有 sequence、written-at 或其他 repo 噪音的 snapshot refresh 會原 run resume 並更新 provenance，語意來源變更才建立新 run。
 
@@ -482,6 +507,7 @@ verification:
 
 - v1 只支援 `tier: shareable`；非 shareable 會 fail-closed 到 `needs_human`。
 - verification command 只接受 typed argv（`shell=False`）；採 sanitized env，但這不是 sandbox，不保證隔離 untrusted code。
+- verification frontmatter 的 inline `argv` list 由 zero-dependency YAML subset parser 解析；含逗號或 `]` 的元素需使用單／雙引號，單／雙引號內的反斜線跳脫可保留引號等字面值，尾逗號可容忍，前導／中間空元素與未閉合引號會拒絕。
 - `repo` 為 optional 顯式歸屬宣告（`owner/repo`，#469）：宣告後派工會寫進 builder/reviewer job 的 `workflow_repo`，`recent_done`／`slices` 的 repo 歸屬即投影此值；未宣告維持 `null`，不從本機路徑或 git remote 推斷。非法 shape（不是恰一個 `/` 或任一段為空）會 fail-closed 落 `hold`。
 
 ### Runtime preflight（dispatch 前的 capability 與 provider 新鮮度，#262）
@@ -809,3 +835,9 @@ export PSC_DIGEST_DELIVERY_CMD='/path/to/relay-script --channel ops'
 ## Version
 
 套件版本以 repo 根目錄 `VERSION` 為單一真相源；bootstrap 期間維持 `0.0.0`，待後續 feature batch 合併後再依 flat profile 做 patch/minor bump。
+
+### 原生架構圖驗收
+
+架構圖使用原版 Archify 的 SVG 節點與方向箭頭，不再以 workflow-review 說明頁代替。Cortex 的七階段是同一 WorkflowRun 的展開，不是七個服務；主要 Candidate 修正回路維持 Manager／CAS 條件。標籤使用繁體中文，固定 Viewer UI 回退為英文。
+
+[開啟架構與工作流程 HTML](docs/architecture/architecture.html)；直接以瀏覽器開啟本機檔案。完整角色、gate、恢復契約及部署 unknown 保留在 facts.json；本圖不宣稱 runtime E2E 已通過。
