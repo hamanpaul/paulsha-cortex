@@ -81,15 +81,18 @@ def test_phase_dispatch_misrepresentations_are_rejected(mutation):
 
 def test_every_core_and_phase_caption_has_exact_source_projection():
     facts, ir = documents()
-    expected = facts["components"]
-    for record, node in zip(expected, ir["components"]):
+    expected = {record["id"]: record for record in facts["components"]}
+    nodes = {node["id"]: node for node in ir["components"]}
+    phase_ids = {"phase-" + phase for phase in PHASES}
+    assert set(nodes) == set(expected) | phase_ids
+    for component_id, record in expected.items():
+        node = nodes[component_id]
         for key in ("id", "type", "label", "sublabel", "tag"):
             assert record.get(key) == node.get(key)
         assert node["sources"] == [
             {k: a[k] for k in ("path", "line", "end_line")}
             for a in record["evidence"][:3]
         ]
-    assert len(ir["components"]) == len(expected) + len(PHASES)
 
 
 def test_local_adoption_and_ship_job_exceptions_are_visible_and_evidenced():
