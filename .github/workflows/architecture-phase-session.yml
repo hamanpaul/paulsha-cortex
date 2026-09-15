@@ -49,7 +49,7 @@ jobs:
           node .archify-engine/archify/bin/archify.mjs deliver architecture docs/architecture/architecture.json docs/architecture/architecture.html --repo-root . --quality showcase --json > /tmp/architecture-phase-review/delivery.json
           python -m pytest tests/test_architecture_docs.py tests/test_architecture_phase_dispatch.py -q
           git diff --check
-      - name: Verify every output and remove temporary publication files
+      - name: Verify exact outputs and stage documentation only
         run: |
           python - <<'PY'
           import hashlib, json, subprocess
@@ -66,13 +66,24 @@ jobs:
           }
           for name, digest in expected.items():
               assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, name
-          temporary = ['.github/architecture-phase.patch.xz.b64', '.github/workflows/architecture-phase-session.yml']
-          for name in temporary:
-              Path(name).unlink()
-          allowed = sorted(set(expected) | set(temporary))
+          # SVG has textContent, not HTMLElement.innerText. Checked locally on actual native nodes.
+          browser = Path('tests/architecture_browser_review.py')
+          text = browser.read_text(encoding='utf-8')
+          assert text.count('caption in node.inner_text()') == 1
+          browser.write_text(text.replace('caption in node.inner_text()', 'caption in (node.text_content() or "")'), encoding='utf-8')
+          expected[str(browser)] = '58be4ad0630edeb7ab44bca7e631867b7ab69e32941bb79188a10f3d8b990d5c'
+          assert hashlib.sha256(browser.read_bytes()).hexdigest() == expected[str(browser)]
+          # GITHUB_TOKEN does not have workflows permission. Leave both workflow files
+          # unchanged here; the authorized connector will update CI and remove this helper.
+          subprocess.run(['git', 'restore', '--source=HEAD', '--', '.github/workflows/architecture-html.yml'], check=True)
+          del expected['.github/workflows/architecture-html.yml']
+          temporary = '.github/architecture-phase.patch.xz.b64'
+          Path(temporary).unlink()
+          allowed = sorted([*expected, temporary])
           subprocess.run(['git', 'add', '-A', '--', *allowed], check=True)
           staged = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
           assert sorted(staged) == allowed, staged
+          assert not any(p.startswith('.github/workflows/') for p in staged)
           Path('/tmp/architecture-phase-review/hashes.json').write_text(json.dumps(expected, indent=2))
           PY
       - name: Fast-forward only the requested documentation branch
