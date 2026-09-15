@@ -12,11 +12,29 @@
 - **#828 producer GREEN：** workflow `in_flight`、`attention` 與 `recent_done` 現在從明確的 registry job run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；無 job 時保留 planned 或 unknown，不從 phase／persona 推測實際模型。另提供去識別化 status snapshot fixture 與 producer/consumer 欄位契約，供下游驗收使用。
 
 
+- **Terminal JSONL framing 實作（#860）**：Manager terminal parser 以保留換行的 UTF-8 reader
+  和 literal LF record framing 保真處理 CRLF 與 Unicode JSON string data，維持既有
+  terminal carrier、schema 與 fail-closed 邊界；補齊 framing／carrier／recovery 負例、
+  incident-shaped byte oracle 與 lifecycle 邊界文件。OpenSpec archive、remote CI、PR／
+  merge、issue closure 與 live qualification 仍為下游 pending。
+
+
+- **#823 headless launcher session**：共用 headless `Popen` kwargs 現在建立獨立
+  session/process group，保留 Claude stdin 與既有 runner override/retry 契約；補齊
+  direct／systemd-run／systemd-template 的 14 格合法接線回歸與 ownership-first 負控制，
+  並明示 cgroup、restart、#824 與 #851 的未承接邊界。
+
+- **#888 AGY reviewer schema 改寫成 Gemini 相容子集**：#880 帶入的 `--json-schema` 含整數 enum／null type／map 型別，Gemini function declaration 直接 400 或改寫 `authority_hashes` 鍵名；launcher 以 `_gemini_compatible_schema` 改寫（整數單值 enum → minimum/maximum、null type → nullable、字串鍵 map → `[{key, value}]`），Manager 剝掉 agy structured output 的 `toolAction`／`toolSummary` 中繼鍵並把 key/value 陣列摺回 mapping。Claude 契約仍是唯一來源。
+
+
+
 - 修正架構交付誤用說明頁：canonical HTML 改回原版 Archify SVG；新增節點／方向箭頭與流程／條件修正回路驗收，不再以文字頁測試冒充架構圖。
 
 - 架構 HTML 驗收：補齊 Persona／Monitor／Manager 權責、16 元件／22 關係、feature-oneshot 七階段與恢復／狀態模型；加入 README 入口及 source／HTML／browser 回歸驗證。不改 runtime 行為。
 
 - **#831 stability-risk-v2**：修正 planning sizing 的 `spec_stability` 方向；完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind／blocking marker／未 accepted artifact 為 2，並以保守 2 處理 unknown 或不一致 report。其他 sizing 維度、band 門檻、fail-soft 邊界與歷史資料不變；補齊隔離 history/evidence reload、完整 `WorkflowRun` baseline（含 legacy sizing 欄位缺席語意）與真實 frozen-plan bytes/SHA fixture，以及 current snapshot score+band matrix 回歸覆蓋，不新增 schema 或 migration。
+
+
 
 - **Recovery registry 子計畫進件（#862）**：納入 #497 的 registry-only A，保留
   exact CAS／ABA revision、prepared/complete、atomic receipt 與顯式 legacy checkpoint
@@ -28,6 +46,8 @@
 
 - **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
 
+
+
 - **Launcher／watcher 子計畫進件**：補齊 #823 session-only 三件組與唯一 owner links，
   登錄 #853 有界 watcher A child。真 process-group 與 cgroup 邊界、raw0／generation／
   partial-scan／nonfollow 驗收完整列管；現行 sizing 6／8 與正式產品交付分開。
@@ -35,6 +55,10 @@
 - **AGY 前置契約進件**：登錄 #851 probe argv 例外隔離，#824 timeout 拆為獨立候選，
   保留 #823 session/cgroup 邊界。#824 依賴未完成，移除母件重複 owner 並暫不登錄
   可 claim child；真 completeness 阻擋與 surface-only Yellow gate 分帳，不依自訂欄位假鎖派工。
+
+- **#851 AGY probe 建構 containment**：將 capability probe 的 `build_agy_argv(...)`
+  例外納入既有 smoke 失敗邊界；建構失敗只回傳 `smoke-failed` 的 AGY not-ready
+  結果，不中斷非 AGY primary 的後續 runtime 建構。
 
 
 

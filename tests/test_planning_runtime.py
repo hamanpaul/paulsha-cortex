@@ -5,9 +5,15 @@ import os
 from pathlib import Path
 
 from paulsha_cortex.coordinator import planning, planning_runtime
+import paulsha_cortex.coordinator.model_identities as model_identities
 import pytest
 
-from paulsha_cortex.coordinator.model_identities import AGY_MODEL_ID, IdentityRegistry, ModelIdentity
+from paulsha_cortex.coordinator.model_identities import (
+    AGY_MODEL_ID,
+    IdentityRegistry,
+    ModelIdentity,
+    select_secondary_planner,
+)
 
 
 def _completed(stdout: str = "", returncode: int = 0):
@@ -97,6 +103,112 @@ def test_production_runtime_loads_registry_and_probes_only_safe_launchers(
     # no-tools＋disposable sandbox＋樹快照＋hermetic 配置共同承擔。
     assert "--permission-mode" not in claude_argv
     assert claude_argv[claude_argv.index("--tools") + 1] == ""
+
+
+@pytest.mark.parametrize(
+    "identities",
+    (
+        (
+            {
+                "executor": "codex",
+                "model_id": "primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": "agy-plan-sandbox",
+            },
+        ),
+        (
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": "agy-plan-sandbox",
+            },
+            {
+                "executor": "codex",
+                "model_id": "primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+        ),
+    ),
+    ids=("primary-before-agy", "agy-before-primary"),
+)
+def test_production_runtime_contains_agy_builder_failure_for_both_roster_orders(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, identities
+) -> None:
+    """#851 R3：AGY probe 建構失敗不能阻擋非 AGY primary runtime。"""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "input.txt").write_text("isolated\n", encoding="utf-8")
+    registry = IdentityRegistry.from_rows(list(identities))
+    monkeypatch.setattr(planning_runtime, "load_model_identities", lambda: registry)
+
+    builder_calls: list[dict[str, object]] = []
+
+    def broken_builder(**kwargs):
+        builder_calls.append(kwargs)
+        raise ValueError("probe-builder-marker")
+
+    # Patch the production module's imported alias; do not replace the probe.
+    monkeypatch.setattr(model_identities, "build_agy_argv", broken_builder)
+
+    runner_calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        del kwargs
+        runner_calls.append(list(argv))
+        if argv == ["agy", "models"]:
+            return _completed(stdout=f"{AGY_MODEL_ID}\n")
+        assert argv[0] == "codex"
+        return _completed(
+            stdout=json.dumps(
+                {
+                    "capability": "cortex-planning-json",
+                    "executor": "codex",
+                    "model": "primary",
+                }
+            )
+        )
+
+    runtime = planning_runtime.build_production_planning_runtime(
+        primary=("codex", "primary"),
+        worktree=worktree,
+        runner=runner,
+        probe_cache_path=tmp_path / "probe-cache.json",
+    )
+
+    primary_probe = runtime.probes[("codex", "primary")]
+    agy_probe = runtime.probes[("agy", AGY_MODEL_ID)]
+    assert primary_probe.ready is True
+    assert agy_probe.ready is False
+    assert agy_probe.reason == "smoke-failed"
+    assert agy_probe.diagnostic == "ValueError"
+    assert builder_calls and builder_calls[0]["model"] == AGY_MODEL_ID
+    assert runner_calls.count(["agy", "models"]) == 1
+    assert not any(
+        argv and argv[0] == "agy" and argv != ["agy", "models"]
+        for argv in runner_calls
+    )
+
+    selection = select_secondary_planner(
+        registry=runtime.identity_registry,
+        primary=("codex", "primary"),
+        probes=runtime.probes,
+    )
+    assert selection.state == "needs_human"
+    assert selection.identity is None
+    assert any(
+        rejection.executor == "agy" and rejection.reason == "probe-not-ready"
+        for rejection in selection.rejections
+    )
 
 
 def test_secondary_prompt_embeds_bounded_repo_sources_without_tool_access(
