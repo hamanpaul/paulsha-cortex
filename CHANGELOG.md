@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#822：YAML inline list 保留引號元素**：zero-dependency YAML subset parser 現在以
+  quote-aware tokenizer 讀取 flow list，含逗號或 `]` 的 `argv` 元素、單／雙引號內的反斜線跳脫與尾逗號
+  可正確 round-trip；前導／中間空元素與未閉合引號會以 `malformed inline list` 拒絕。
+
+
 - **#828 regression coverage：** 新增 workflow status execution-identity regression tests，鎖定 registry job 綁定與 planned／actual／last execution 的可區分投影（原以 RED 設計，已由同一 PR 的 producer 修正轉綠）。
 
 - **#828 producer GREEN：** workflow `in_flight`、`attention` 與 `recent_done` 現在從明確的 registry job run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；無 job 時保留 planned 或 unknown，不從 phase／persona 推測實際模型。另提供去識別化 status snapshot fixture 與 producer/consumer 欄位契約，供下游驗收使用。
@@ -43,6 +48,8 @@
 - **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
   子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。
   本項只有規劃進件；既存 generic carrier 殘餘與產品、部署驗收保持分帳。
+
+
 
 - **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
 
