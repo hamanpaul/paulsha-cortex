@@ -1175,6 +1175,81 @@ def _codex_sandbox_mode(
     return mode
 
 
+
+def _gemini_compatible_schema(node: object) -> object:
+    """Rewrite a JSON schema into the subset Gemini structured output accepts (#888).
+
+    Antigravity forwards ``--json-schema`` as a Gemini function declaration.
+    Gemini's Schema subset only accepts **string** enum members and a single
+    ``type``; ``{"type": "integer", "enum": [1]}`` is serialised as an empty
+    string and rejected with ``INVALID_ARGUMENT … enum[0]: cannot be empty``,
+    and ``"type": ["integer", "null"]`` is not a valid type either.  Both
+    shapes are rewritten to the equivalent constraints Gemini understands:
+    a single-valued numeric enum becomes ``minimum``/``maximum`` and a
+    ``null``-bearing type list becomes the remaining type plus
+    ``nullable: true``.  Everything else (including ``additionalProperties``)
+    is preserved verbatim, so the Claude schema stays the single source.
+    """
+
+    if isinstance(node, list):
+        return [_gemini_compatible_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    # Gemini has no ``additionalProperties`` map type either: the model is
+    # forced to invent identifier-like property names, so a string-keyed map
+    # (``authority_hashes``: repo path → sha256) comes back with mangled keys.
+    # A map-shaped object becomes an array of ``{"key", "value"}`` entries;
+    # Manager folds those entries back into the canonical mapping.
+    if (
+        node.get("type") == "object"
+        and isinstance(node.get("additionalProperties"), dict)
+        and "properties" not in node
+    ):
+        return {
+            **{k: v for k, v in node.items() if k not in {"type", "additionalProperties"}},
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["key", "value"],
+                "properties": {
+                    "key": {"type": "string", "minLength": 1},
+                    "value": _gemini_compatible_schema(node["additionalProperties"]),
+                },
+            },
+        }
+    rewritten: dict[str, object] = {}
+    for key, value in node.items():
+        if key == "enum" and isinstance(value, list) and value and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) for item in value
+        ):
+            if len(set(value)) != 1:
+                raise ValueError("gemini schema cannot express multi-valued numeric enum")
+            rewritten["minimum"] = value[0]
+            rewritten["maximum"] = value[0]
+            continue
+        if key == "type" and isinstance(value, list):
+            remaining = [item for item in value if item != "null"]
+            if len(remaining) != 1:
+                raise ValueError("gemini schema requires exactly one non-null type")
+            rewritten["type"] = remaining[0]
+            if len(remaining) != len(value):
+                rewritten["nullable"] = True
+            continue
+        rewritten[key] = _gemini_compatible_schema(value)
+    return rewritten
+
+
+def _gemini_review_json_schema(kind: str) -> str:
+    """The shared reviewer terminal schema, rewritten for Gemini (#888)."""
+
+    return json.dumps(
+        _gemini_compatible_schema(json.loads(_claude_review_json_schema(kind))),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
 def build_agy_argv(
     *,
     prompt: str,
@@ -1222,7 +1297,7 @@ def build_agy_argv(
     if review_only:
         if review_terminal_kind is None:
             raise ValueError("agy reviewer terminal contract kind missing")
-        review_schema = _claude_review_json_schema(review_terminal_kind)
+        review_schema = _gemini_review_json_schema(review_terminal_kind)
     else:
         if review_terminal_kind is not None:
             raise ValueError("agy terminal contract requires reviewer mode")
@@ -1359,6 +1434,30 @@ _ARGV_BUILDERS = {
     "agy": build_agy_argv,
     "cg": build_cg_argv,
 }
+
+
+def build_headless_popen_kwargs(
+    *,
+    cwd: str | None,
+    env: Mapping[str, str],
+    executor: str,
+) -> dict[str, object]:
+    """Build the common spawn kwargs for every headless executor.
+
+    The launcher owns the process-group boundary.  Runner-specific callers may
+    override stdin, cwd, or env after this helper returns, but every Popen
+    attempt starts from the same isolated-session contract.
+    """
+
+    kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "stderr": subprocess.STDOUT,
+        "start_new_session": True,
+    }
+    if executor == "claude":
+        kwargs["stdin"] = subprocess.PIPE
+    return kwargs
 
 
 class SubprocessLauncher:
@@ -2098,13 +2197,11 @@ class SubprocessLauncher:
         # 白名單 env 建立完成之後重新 source ~/.profile，把 env 約束整個覆寫掉。
         # direct 模式的 builder 維持 `-lc` 不動——那是既有行為，本票不改。
         argv = ["bash", "-c" if (self._review_only or degraded) else "-lc", script]
-        popen_kwargs: dict[str, object] = {
-            "cwd": worktree,
-            "env": env,
-            "stderr": subprocess.STDOUT,
-        }
-        if self._executor == "claude":
-            popen_kwargs["stdin"] = subprocess.PIPE
+        popen_kwargs = build_headless_popen_kwargs(
+            cwd=worktree,
+            env=env,
+            executor=self._executor,
+        )
         if runner_plan is not None:
             argv = job_runner.build_systemd_run_argv(
                 systemd_run=runner_plan.binary,

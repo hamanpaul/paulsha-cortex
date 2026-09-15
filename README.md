@@ -133,6 +133,14 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    同為**必填**，未宣告時 Manager 在派工前即 fail-closed。值由產生器導出，不要手打：
    `python3 -m paulsha_cortex.trust_root unit four-way --job | grep '^Environment=PATH='`。
 
+   **#823 headless session 的生命週期邊界**：每個合法 headless `Popen` 嘗試（含
+   `systemd-run`／`systemd-template` 的 Manager-side client wrapper 與窄 `stdin` retry）都帶
+   `start_new_session=True`。direct child 因此有自己的 POSIX session/process group；這是
+   `setsid` 隔離，不是 systemd cgroup 移動，也不改變 unit 的 `KillMode` 或提供 cgroup
+   restart survival 保證。Manager daemon restart、timeout/parser/CLI 值域（#824）與 AGY
+   probe containment（#851）仍是獨立工作項；本 session 修正不新增 cancel/timeout/probe
+   語意，也不宣稱這些 issue 已完成或關閉。
+
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 
    ```bash
@@ -393,7 +401,14 @@ systemctl --user status cortex-manager.service cortex-monitor.service
 
 - `ready`：已滿足派工條件。
 - `held`：尚未可派工，並列出 `no-plan`、`dispatch-hold` 或未滿足的 dependency。
-- `in_flight`：正在執行的 Job，含 `candidate_git_base`（見下）。
+- `in_flight`：正在執行的 Job，含 `candidate_git_base`（見下）以及由 registry job
+  實際綁定的 `executor`、`model`、`job_id`、`card`、`identity_source` 與
+  `execution_state`。workflow 的 `attention`／`recent_done` 也使用同一組身份欄位：
+  `identity_source` 為 `in-flight`、`last-execution`、`planned` 或 `unknown`；沒有
+  registry 證據時不從 phase／persona 推測 executor 或 model。
+  下游可直接使用去識別化 producer snapshot fixture
+  `tests/fixtures/workflow-execution-identity-828-status.json`；欄位與 selection
+  語意見 `docs/superpowers/specs/workflow-execution-identity-producer-contract.md`。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。
 - `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及 `candidate_git_base`。
 - `candidate_git_base`（#731）：這條 run／這張卡的**候選 git base**——真正那個 40-hex commit SHA，以及它落後 mirror 上 `origin/main` 幾個 commit。欄位含 `sha`、`sha_source`（`frozen-readiness-base-sha` 或 `first-build-job-dispatch-head`）、`behind_origin_main`、`mirror_origin_main`、`threshold_commits`、`reason`、`measured_against`、`fetched`。
