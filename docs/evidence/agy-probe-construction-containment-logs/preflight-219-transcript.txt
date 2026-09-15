@@ -1,0 +1,7 @@
+context: base=main head=feature/851-agy-probe-construction-containment labels=0 visibility=unknown
+engine: PASS 0.02s (skill:hamanpaul/paulsha-conventions@9e7fabbf0b5eea9ad933fa6798764b723934a0b7)
+offline: resolver network disabled; repo-owned commands remain under repo authority
+policy: PASS 1.89s (exit=0)
+openspec: PASS 1.66s (exit=0)
+tests: PASS 202.71s (exit=0)
+PREFLIGHT PASS

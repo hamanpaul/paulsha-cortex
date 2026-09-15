@@ -19,7 +19,7 @@
 - [ ] 2.5.1 先依 #862 交付 registry-only A 的九組 receipt/disposition/revision/checkpoint 不變量；accepted 現行8/Red不派工，#831實際loaded後重評。C→B→D2、D1→D2仍需獨立交付，A完成不得關閉#497；own OpenSpec需run前完成唯一owner/發布/binding，archive只收自身。
 - [ ] 2.6 依 accepted 三件組完成 #821 no-op persistence、history retention、writer/fault/rollback 相容與安全暫存清理；完整 archive 缺口/截斷前備份保持列管。
 - [ ] 2.7 完成 #823/#824 session 與 AGY timeout 合約，明示 cgroup restart survival 的獨立驗收。
-- [ ] 2.7.1 先依 #851 補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。
+- [x] 2.7.1 #851 pre-archive：補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。archive、merge、issue closure 與 loaded-runtime 驗證仍由後續責任方處理。
 - [ ] 2.7.2 #824 dependency 證據未滿前不登錄可 claim child／不開 auto label；解除後重新核對完整性、真 sizing、唯一 owner 與正式 freeze，不能依 custom frontmatter 自稱已鎖派工。
 - [ ] 2.7.3 依 #823 session-only 三件組完成共用 kwargs 真接線、兩個 Popen／stdin 窄重試、合法配置及既有拒絕、所有權驗證先於 group signal 的真 fixture 與候選 wheel 驗收；不擴成 cgroup/restart/cancel 實作。
 - [ ] 2.8 完成 #825 最小 durable backoff，所有 lane 與 corrupt-state/expiry 可測；不標 R05 完成。

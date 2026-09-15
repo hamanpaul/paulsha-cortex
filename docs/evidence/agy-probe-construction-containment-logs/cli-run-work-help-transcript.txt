@@ -1,0 +1,56 @@
+2026-09-08T07:49:59Z
+usage: cortex run work [-h] --repo REPO [--issue ISSUE]
+                       [--kind {github_issue,github_pr,openspec,path}]
+                       [--ref REF] [--actor ACTOR]
+                       [--failure-classification FAILURE_CLASSIFICATION]
+                       [--failure-reason FAILURE_REASON]
+                       [--expected-candidate EXPECTED_CANDIDATE]
+                       [--expected-run-id EXPECTED_RUN_ID] [--reason REASON]
+                       [--combo COMBO] [--enable | --disable]
+                       [--payload PAYLOAD]
+                       [--planner-executor PLANNER_EXECUTOR]
+                       [--planner-model PLANNER_MODEL]
+                       [--builder-executor BUILDER_EXECUTOR]
+                       [--builder-model BUILDER_MODEL]
+                       [--reviewer-executor REVIEWER_EXECUTOR]
+                       [--reviewer-model REVIEWER_MODEL] [--wait]
+                       [--timeout TIMEOUT] [--json]
+                       {abandon,auto,intake,link,recover-planning,recover-pre-candidate,recover-repair-commit,recover-superseded,refreeze-base,regenerate-gates,reset-reclaim-budget,resume,retire-delivered,retry-build,retry-card,retry-review,retry-verify,review-attest,ship,start,unlink}
+                       work_id
+
+positional arguments:
+  {abandon,auto,intake,link,recover-planning,recover-pre-candidate,recover-repair-commit,recover-superseded,refreeze-base,regenerate-gates,reset-reclaim-budget,resume,retire-delivered,retry-build,retry-card,retry-review,retry-verify,review-attest,ship,start,unlink}
+  work_id
+
+options:
+  -h, --help            show this help message and exit
+  --repo REPO
+  --issue ISSUE
+  --kind {github_issue,github_pr,openspec,path}
+  --ref REF
+  --actor ACTOR
+  --failure-classification FAILURE_CLASSIFICATION
+  --failure-reason FAILURE_REASON
+  --expected-candidate EXPECTED_CANDIDATE
+  --expected-run-id EXPECTED_RUN_ID
+  --reason REASON
+  --combo COMBO         start／intake 專用：明示指定 combo id，跳過 task_type
+                        自動選牌（authoritative override）
+  --enable
+  --disable
+  --payload PAYLOAD     額外 manager-side evidence refs JSON 檔案路徑
+  --planner-executor PLANNER_EXECUTOR
+                        覆寫本 run 的 planner executor（run-scoped，不動共享 registry）
+  --planner-model PLANNER_MODEL
+                        覆寫本 run 的 planner model ID（run-scoped，不動共享 registry）
+  --builder-executor BUILDER_EXECUTOR
+                        覆寫本 run 的 builder executor（run-scoped，不動共享 registry）
+  --builder-model BUILDER_MODEL
+                        覆寫本 run 的 builder model ID（run-scoped，不動共享 registry）
+  --reviewer-executor REVIEWER_EXECUTOR
+                        覆寫本 run 的 reviewer executor（run-scoped，不動共享 registry）
+  --reviewer-model REVIEWER_MODEL
+                        覆寫本 run 的 reviewer model ID（run-scoped，不動共享 registry）
+  --wait                等待 request 進入 terminal 狀態
+  --timeout TIMEOUT     搭配 --wait 的等待秒數
+  --json                輸出 cortex-porcelain/run/v1 JSON

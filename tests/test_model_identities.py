@@ -216,6 +216,57 @@ def test_agy_probe_requires_model_listing_and_safe_headless_smoke() -> None:
     assert calls[1]["timeout"] == 11
 
 
+def test_agy_probe_contains_argv_builder_value_error_as_smoke_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#851：argv 建構失敗只能讓 AGY probe failed，不能外洩中止 caller。"""
+    runner_calls: list[list[str]] = []
+    builder_calls: list[dict] = []
+
+    def runner(argv, **kwargs):
+        runner_calls.append(list(argv))
+        return _completed(stdout=f"{AGY_MODEL_ID}\n")
+
+    def broken_builder(**kwargs):
+        builder_calls.append(kwargs)
+        raise ValueError("harmless-marker")
+
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.model_identities.build_agy_argv",
+        broken_builder,
+    )
+
+    probe = probe_agy_capability(runner=runner)
+
+    assert probe.ready is False
+    assert probe.reason == "smoke-failed"
+    assert probe.diagnostic == "ValueError"
+    assert "harmless-marker" not in probe.diagnostic
+    assert probe.identity == ("agy", AGY_MODEL_ID, "google")
+    assert runner_calls == [["agy", "models"]]
+    assert len(builder_calls) == 1
+    assert builder_calls[0]["slice_id"] == "cortex-capability-probe"
+    assert builder_calls[0]["log_dir"] == "."
+    assert builder_calls[0]["model"] == AGY_MODEL_ID
+    assert builder_calls[0]["read_only"] is True
+    assert builder_calls[0]["json_envelope"] is False
+
+
+@pytest.mark.parametrize("exception_type", (KeyboardInterrupt, SystemExit))
+@pytest.mark.parametrize("stage", ("models", "smoke"))
+def test_agy_probe_does_not_swallow_base_exceptions(exception_type, stage) -> None:
+    """#851 R5：cancellation/system-exit 不得被 Exception 邊界吞掉。"""
+
+    def runner(argv, **kwargs):
+        del kwargs
+        if stage == "models" or argv != ["agy", "models"]:
+            raise exception_type("stop-probe")
+        return _completed(stdout=f"{AGY_MODEL_ID}\n")
+
+    with pytest.raises(exception_type):
+        probe_agy_capability(runner=runner)
+
+
 @pytest.mark.parametrize(
     ("model_stdout", "smoke_result", "reason"),
     [
