@@ -4,6 +4,15 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_injected_agents_root(monkeypatch, _clear_runtime_env):
+    # 顯式依賴 conftest 的 `_clear_runtime_env`，確保它先把 PSC_AGENTS_ROOT 設成
+    # guard 值、本 fixture 再清掉；不倚賴 pytest 對同 scope autouse fixture 的
+    # 隱含排序（PR #913 Copilot review）。
+    """Installer tests choose HOME or their persisted root as the authority."""
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+
+
 def _init_git_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", str(path)], check=True)
@@ -23,7 +32,7 @@ def test_install_service_migrates_legacy_env_without_identity_stamp(tmp_path, mo
     runtime_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
     runtime_file.parent.mkdir(parents=True, exist_ok=True)
     runtime_file.write_text(
-        f"PY={existing_python}\nPSC_AGENTS_ROOT=/tmp/agents-a\n",
+        f"PY={existing_python}\nPSC_AGENTS_ROOT={home / 'agents-a'}\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
@@ -50,7 +59,7 @@ def test_install_service_allows_existing_config_with_same_python(
     runtime_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
     runtime_file.parent.mkdir(parents=True, exist_ok=True)
     runtime_file.write_text(
-        f"PY={same_python}\nPSC_AGENTS_ROOT=/tmp/agents-a\n",
+        f"PY={same_python}\nPSC_AGENTS_ROOT={home / 'agents-a'}\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(installer, "_systemctl_available", lambda: False)

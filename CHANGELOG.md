@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+- **Installer shared config guard**：`cortex install service` 遇到既有
+  `project-cortex.yaml` 時只追加目標 workspace，替換前保留 `.bak-*` 備份；既有
+  `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時 fail-closed，跨 HOME
+  的 default agents root 也必須以 `--agents-root` 明確指定；命中既有 workspace 時
+  保留原條目與其他設定區塊，migration rollback 僅在 restore 成功時清理本次建立的
+  備份，restore 失敗則保留備份並在錯誤訊息列出復原路徑；尚未取得備份時則列出可能
+  不一致的檔案，且備份 mode 與來源一致不受 umask 影響；porcelain install 也會保留
+  installer 正常返回時產生的 stderr 診斷訊息；rollback 成功後若清理備份失敗則記錄
+  warning，不遮蔽原始 migration 例外；既有 `project-cortex.yaml` 若為 symlink，
+  append/replace 會在 mutation 前 fail-closed 並明示路徑，保留 symlink 與其 target 不變；
+  若目標 workspace 已存在而不需改寫 project config，symlink 可正常完成 no-op install；
+  rollback 失敗診斷會逐檔綁定自身 backup、區分遷移前不存在的檔案與只存在於記憶體中的
+  `previous`，並記錄每一檔 restore 結果；restore 使用同目錄暫存檔 atomic replace 並保留
+  原檔 mode，project config loader 會保留原始驗證例外與原因。
 - **#824 AGY print timeout**：launcher 現在會解析 `PSC_AGY_PRINT_TIMEOUT` 或既有 gate
   timeout fallback，對所有 AGY headless argv 形態顯式加入 canonical
   `--print-timeout <Ns>`，並在 direct launch／capability probe 前 fail-closed

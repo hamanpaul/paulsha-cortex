@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -15,6 +17,9 @@ from . import COMMANDS, PorcelainCommand, register
 from ._runtime_probe import probe_service_runtime
 
 SERVICE_SCHEMA = "cortex-porcelain/service/v1"
+_AGENTS_ROOT_INSTALL_HINT = (
+    "porcelain 請改用 cortex install service --agents-root PATH"
+)
 
 
 def register_commands() -> None:
@@ -95,6 +100,16 @@ def _service_envelope(command: str, instance: str, *, mode: str, **payload: Any)
         "mode": mode,
         **payload,
     }
+
+
+def _append_agents_root_install_hint(message: str) -> str:
+    if (
+        "PSC_AGENTS_ROOT" not in message
+        or "--agents-root" not in message
+        or _AGENTS_ROOT_INSTALL_HINT in message
+    ):
+        return message
+    return f"{message.rstrip()}\n{_AGENTS_ROOT_INSTALL_HINT}"
 
 
 def install(*, instance: str, interval: int, repo_root: str, rebind: bool = False) -> dict[str, Any]:
@@ -352,7 +367,14 @@ def _run_install(
         payload = install(instance=instance, interval=interval, repo_root=repo_root, rebind=rebind)
         _json_dump(payload)
         return int(payload.get("result", {}).get("exit_code", 1))
-    return int(installer.main(argv) or 0)
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(stderr):
+            return int(installer.main(argv) or 0)
+    finally:
+        message = _append_agents_root_install_hint(stderr.getvalue())
+        if message:
+            sys.stderr.write(message)
 
 
 def _run_systemctl(verb: str, *units: str) -> subprocess.CompletedProcess[str]:
@@ -638,7 +660,10 @@ def main(argv: Sequence[str]) -> int:
         if args.command == "uninstall":
             return _run_uninstall(instance=instance, purge=args.purge, json_output=args.json)
     except ValueError as exc:
-        print(f"錯誤: {exc}", file=sys.stderr)
+        print(
+            _append_agents_root_install_hint(f"錯誤: {exc}"),
+            file=sys.stderr,
+        )
         return 1
     parser.error(f"unsupported service command: {args.command}")
     return 2

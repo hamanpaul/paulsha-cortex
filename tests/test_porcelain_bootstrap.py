@@ -384,6 +384,7 @@ def test_service_install_rejects_unsupported_executor_override(
     repo_root.mkdir()
     subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.setenv("PSC_MANAGER_EXECUTOR", "badexec")
 
     with pytest.raises(ValueError, match="PSC_MANAGER_EXECUTOR"):

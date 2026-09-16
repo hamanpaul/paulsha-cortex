@@ -115,6 +115,7 @@ def service_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str
         path.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("PSC_INSTANCE", "beta")
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(control_root))
@@ -258,6 +259,76 @@ def test_service_install_json_reports_fallback_mode_when_systemd_is_unavailable(
     assert "systemd 不可用" in payload["message"]
     assert "service-manager.sh" in payload["message"]
     assert "--follow" in payload["message"]
+
+
+def test_service_install_foreign_agents_root_explains_porcelain_override(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.deploy import installer
+
+    _load_cli()
+    monkeypatch.setattr(installer, "_resolve_git_repo_root", lambda path: path.resolve())
+
+    def fail_install(*args, **kwargs):
+        raise ValueError(
+            "既有 runtime env 的 PSC_AGENTS_ROOT=/foreign/.agents 不在目前 "
+            "HOME=/current/home 底下；如為合法自訂路徑請使用 --agents-root 明確指定"
+        )
+
+    monkeypatch.setattr(installer, "install_service_result", fail_install)
+
+    with pytest.raises(SystemExit):
+        importlib.import_module("paulsha_cortex.porcelain.service").main(
+            [
+                "install",
+                "--instance",
+                "beta",
+                "--repo-root",
+                str(service_runtime["repo_root"]),
+            ]
+        )
+
+    assert (
+        "porcelain 請改用 cortex install service --agents-root PATH"
+        in capsys.readouterr().err
+    )
+
+
+def test_service_install_forwards_stderr_when_installer_returns_normally(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.porcelain import service
+
+    def fake_main(argv: list[str]) -> int:
+        assert argv == [
+            "service",
+            "--instance",
+            "beta",
+            "--repo-root",
+            str(service_runtime["repo_root"]),
+            "--interval",
+            "60",
+        ]
+        sys.stderr.write("installer diagnostic\n")
+        return 3
+
+    monkeypatch.setattr(service.installer, "main", fake_main)
+
+    assert (
+        service._run_install(
+            instance="beta",
+            interval=60,
+            repo_root=str(service_runtime["repo_root"]),
+            json_output=False,
+        )
+        == 3
+    )
+
+    assert capsys.readouterr().err == "installer diagnostic\n"
 
 
 @pytest.mark.parametrize("use_json", [False, True], ids=["plain", "json"])

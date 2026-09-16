@@ -98,6 +98,23 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
 
    Installer 會 render/copy units、執行 `daemon-reload`，並 enable manager timer 與 monitor service；**不會 start service**。`--interval` 只調整 deprecated timer 的 `OnUnitActiveSec`；長駐 daemon 的 tick 週期由 `PSC_MANAGER_INTERVAL_SECONDS` 控制。兩個 service 都會設定 `WorkingDirectory=<PSC_REPO_ROOT>`，因此服務執行時不受 `cwd` 影響。
 
+   若既有 `$HOME/.agents/config/paulsha/project-cortex.yaml` 已包含其他 workspace，
+   installer 只會在末端追加目前目標，並在替換前建立 `project-cortex.yaml.bak-*`；既有
+   `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時會拒絕覆寫。若舊 env
+   記錄的是另一個 HOME 下的 default agents root，請以 `--agents-root PATH` 明確指定後再安裝。
+   回寫會以 `yaml.safe_dump` 重排格式並移除註解，原始位元組保留於同目錄的 `.bak-*`。
+   每次 append 遷移會在 config root 留下
+   `project-cortex.yaml.bak-<UTC timestamp>`；這是刻意保留的復原素材（spec 要求），
+   operator 可自行依需要清理舊備份。config root 會有一個 `.cortex-migration.lock`（0600）
+   用於序列化併發安裝，屬常駐鎖檔，不需清除。沒有任何程式會 glob config root，殘留檔
+   不影響 monitor/doctor 讀取；若 rollback restore 失敗，錯誤會逐一列出各檔案自己的
+   backup、遷移前不存在而 rollback 僅需移除，或沒有 backup 且原始內容只留在記憶體
+   中的 `previous`，並逐檔記錄 restore 結果。既有 `project-cortex.yaml` 若是 symlink，
+   只有在此次 install 需要 append/replace、確實會改寫 project config 時才會
+   fail-closed，明確指出該路徑並保留 symlink 與其 target 不變；若目標 workspace 已存在、
+   install 不需改寫 project config，則保留 symlink 正常完成。本段 append-only 說明只涵蓋
+   一般檔案的改寫。
+
 2. 啟動 manager 並分別檢查 service/runtime 狀態：
 
    ```bash
