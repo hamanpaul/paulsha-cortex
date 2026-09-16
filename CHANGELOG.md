@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+- **Open-issue 全量盤點與 refine 開工 handoff（#868）**：新增
+  `docs/handoffs/2026-09-16-open-issue-triage-refine-handoff.md`——145 張 open issue 三分類
+  （38 已修→關、8 過時→not planned、97 仍 open）、PR #913 交付 #800／#815、daemon pin 與 main
+  落差、attention／not_claimable 現況、依 #868 §3 拉出的第一批已驗證缺陷，以及 operator 近期
+  用 cortex 撞到的 16 條問題與對應票號。docs-only。
+
 - **Installer shared config guard**：`cortex install service` 遇到既有
   `project-cortex.yaml` 時只追加目標 workspace，替換前保留 `.bak-*` 備份；既有
   `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時 fail-closed，跨 HOME
