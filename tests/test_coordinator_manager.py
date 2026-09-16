@@ -218,6 +218,78 @@ def _create_slice(
         reg.update_slice(slice_id, state="building", builder_job_id=job["job_id"])
 
 
+def _launch_foreign_review_with_exception(exc: Exception) -> tuple[dict, dict, dict]:
+    with tempfile.TemporaryDirectory() as d:
+        reg = _reg(d)
+        root = Path(d)
+        worktree = root / "candidate"
+        worktree.mkdir()
+        builder = _make_job(reg, "slice-review-launch", worktree=str(worktree))
+        reg.attach_launch_handle(
+            builder["job_id"],
+            executor="copilot",
+            model_id="claude-haiku-4.5",
+            session_name="slice-review-launch",
+            pid=1,
+            log_path="/log",
+        )
+        _create_slice(reg, root, builder, docs_class="code")
+        review_worktree = root / "reviewer"
+        review_worktree.mkdir()
+        verdict_spool = root / "coordinator" / "review-verdicts" / "reviewer-job" / "verdict.json"
+        identity_registry = {
+            ("copilot", "claude-haiku-4.5"): {
+                "executor": "copilot",
+                "model_id": "claude-haiku-4.5",
+                "independence_domain": "anthropic",
+            },
+            ("codex", "gpt-5.4"): {
+                "executor": "codex",
+                "model_id": "gpt-5.4",
+                "independence_domain": "openai",
+            },
+        }
+
+        class _FailingReviewLauncher:
+            def launch(self, *, slice_id, prompt, worktree, log_dir):
+                raise exc
+
+        with (
+            mock.patch.object(manager, "_identity_registry", return_value=identity_registry),
+            mock.patch.object(manager.foreign_review, "read_repo_tier", return_value="shareable"),
+            mock.patch.object(manager, "_slice_review_authority_inputs", return_value=(None, ())),
+            mock.patch.object(
+                manager.foreign_review,
+                "prepare_review_worktree",
+                return_value=review_worktree,
+            ),
+            mock.patch.object(
+                manager.foreign_review,
+                "prepare_review_verdict_spool",
+                return_value=verdict_spool,
+            ),
+            mock.patch.object(manager.foreign_review, "build_review_prompt", return_value="prompt"),
+        ):
+            result = manager._launch_foreign_review(
+                registry=reg,
+                slice_row=reg.get_slice("slice-review-launch"),
+                builder_job=reg.get_job(builder["job_id"]),
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                candidate="b" * 40,
+                subprocess_runner=lambda *args, **kwargs: None,
+                git_runner=lambda *args, **kwargs: None,
+                review_launcher=_FailingReviewLauncher(),
+                review_executor="codex",
+                review_model="gpt-5.4",
+            )
+
+        reloaded = JobRegistry(state_path=root / "jobs.json")
+        reviewer_jobs = [job for job in reloaded.list_jobs() if job.get("kind") == "review"]
+        assert len(reviewer_jobs) == 1
+        return result, reviewer_jobs[0], reloaded.get_slice("slice-review-launch")
+
+
 class CompleteTickDoneTests(unittest.TestCase):
     def test_exited_job_without_slice_proof_becomes_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1214,6 +1286,55 @@ class CompleteTickVerificationTests(unittest.TestCase):
             self.assertEqual(manifest["gate_status"], "needs_human")
             self.assertEqual(manifest["gate_verdict"]["state"], "absent")
             self.assertEqual(summary["completed"], [{"slice_id": "slice-review-absent", "gate_status": "needs_human"}])
+
+    def test_foreign_review_launch_exception_persists_typed_reviewer_failure(self) -> None:
+        launch_result, reviewer_job, slice_row = _launch_foreign_review_with_exception(
+            RuntimeError("launch exploded")
+        )
+
+        self.assertFalse(launch_result["launched"])
+        self.assertEqual(launch_result["gate_status"], "needs_human")
+        self.assertEqual(launch_result["gate_reason"], "foreign-review-provider-launch_failed")
+        self.assertEqual(launch_result["evaluation"]["payload"]["reason"], "launch-error")
+        self.assertEqual(reviewer_job["status"], "failed")
+        self.assertEqual(reviewer_job["exit_code"], 1)
+        self.assertTrue(reviewer_job["exited_at"])
+        self.assertEqual(
+            reviewer_job["provider_outcome"],
+            {
+                "outcome": "launch_failed",
+                "authority": "structured",
+                "reason": "launch failed before attach_launch_handle: RuntimeError: launch exploded",
+                "retryable": False,
+            },
+        )
+        self.assertEqual(
+            reviewer_job["runtime_diagnostic"],
+            {
+                "reason": "launch-failed",
+                "detail": "RuntimeError: launch exploded",
+                "source": "manager._launch_foreign_review:launch",
+                "job_id": reviewer_job["job_id"],
+            },
+        )
+        self.assertEqual(slice_row["reviewer_job_id"], reviewer_job["job_id"])
+        self.assertEqual(slice_row["candidate"], "b" * 40)
+
+    def test_foreign_review_launch_exception_preserves_missing_executable_classification(self) -> None:
+        launch_result, reviewer_job, slice_row = _launch_foreign_review_with_exception(
+            FileNotFoundError(2, "No such file or directory", "codex")
+        )
+
+        self.assertFalse(launch_result["launched"])
+        self.assertEqual(
+            launch_result["gate_reason"],
+            "foreign-review-provider-executable_not_found",
+        )
+        self.assertEqual(launch_result["evaluation"]["payload"]["reason"], "launch-error")
+        self.assertEqual(reviewer_job["provider_outcome"]["outcome"], "executable_not_found")
+        self.assertEqual(reviewer_job["provider_outcome"]["authority"], "structured")
+        self.assertEqual(reviewer_job["runtime_diagnostic"]["reason"], "launch-failed")
+        self.assertEqual(slice_row["reviewer_job_id"], reviewer_job["job_id"])
 
     def test_existing_inflight_reviewer_prevents_duplicate_relaunch(self) -> None:
         with tempfile.TemporaryDirectory() as d:

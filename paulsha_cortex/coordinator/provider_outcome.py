@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Mapping
 
 from . import outcome_taxonomy
@@ -55,6 +56,7 @@ __all__ = [
     "RETRYABLE_OUTCOMES",
     "ProviderFailureClassification",
     "classify_provider_failure",
+    "classify_launch_failure",
     "classification_from_job",
     "read_log_tail",
 ]
@@ -66,6 +68,9 @@ class ProviderOutcome(str, Enum):
     AUTH = "auth"
     RATE_LIMITED = "rate_limited"
     QUOTA = "quota"
+    EFFORT_NOT_SUPPORTED = "effort_not_supported"
+    EXECUTABLE_NOT_FOUND = "executable_not_found"
+    LAUNCH_FAILED = "launch_failed"
     TRANSIENT = "transient"
     CONTENT = "content"
     UNKNOWN = "unknown"
@@ -85,6 +90,26 @@ class SignalAuthority(str, Enum):
 # candidate 不會變；quota 通常是固定週期額度，短時間內重試沒有意義；unknown
 # 沒有訊號可支持任何自動決策）。
 RETRYABLE_OUTCOMES = frozenset({ProviderOutcome.RATE_LIMITED, ProviderOutcome.TRANSIENT})
+_REROUTABLE_OUTCOMES = frozenset(
+    {ProviderOutcome.EFFORT_NOT_SUPPORTED, ProviderOutcome.EXECUTABLE_NOT_FOUND}
+)
+_KNOWN_PROVIDER_EXECUTABLE_TOKENS = frozenset({"agy", "cg", "claude", "codex", "copilot"})
+_SHARED_LAUNCH_INFRASTRUCTURE_TOKENS = frozenset(
+    {
+        "ash",
+        "bash",
+        "dash",
+        "fish",
+        "git",
+        "ksh",
+        "powershell",
+        "pwsh",
+        "sh",
+        "systemctl",
+        "systemd-run",
+        "zsh",
+    }
+)
 
 # 分類結果 payload 的必要鍵。`reset_at` 是可選鍵（#499：只有帶得到權威重置
 # 時刻的 rate-limit 才會有），故舊狀態檔的四鍵 payload 仍原樣可讀。
@@ -97,6 +122,8 @@ _OUTCOME_BY_TEXT_SIGNAL: dict[outcome_taxonomy.TextSignal, ProviderOutcome] = {
     outcome_taxonomy.TextSignal.RATE_LIMIT: ProviderOutcome.RATE_LIMITED,
     outcome_taxonomy.TextSignal.QUOTA: ProviderOutcome.QUOTA,
     outcome_taxonomy.TextSignal.AUTH: ProviderOutcome.AUTH,
+    outcome_taxonomy.TextSignal.EFFORT_NOT_SUPPORTED: ProviderOutcome.EFFORT_NOT_SUPPORTED,
+    outcome_taxonomy.TextSignal.EXECUTABLE_NOT_FOUND: ProviderOutcome.EXECUTABLE_NOT_FOUND,
     outcome_taxonomy.TextSignal.CONTENT: ProviderOutcome.CONTENT,
     outcome_taxonomy.TextSignal.TRANSIENT: ProviderOutcome.TRANSIENT,
     outcome_taxonomy.TextSignal.NONE: ProviderOutcome.UNKNOWN,
@@ -109,6 +136,8 @@ _OUTCOME_BY_STRUCTURED_KIND: dict[outcome_taxonomy.StructuredKind, ProviderOutco
     outcome_taxonomy.StructuredKind.RATE_LIMITED: ProviderOutcome.RATE_LIMITED,
     outcome_taxonomy.StructuredKind.TRANSIENT: ProviderOutcome.TRANSIENT,
     outcome_taxonomy.StructuredKind.AUTH: ProviderOutcome.AUTH,
+    outcome_taxonomy.StructuredKind.EXECUTABLE_NOT_FOUND: ProviderOutcome.EXECUTABLE_NOT_FOUND,
+    outcome_taxonomy.StructuredKind.LAUNCH_FAILED: ProviderOutcome.LAUNCH_FAILED,
     outcome_taxonomy.StructuredKind.INTERRUPTED: ProviderOutcome.UNKNOWN,
 }
 
@@ -130,6 +159,12 @@ class ProviderFailureClassification:
         """是否適合驅動 bounded retry——見模組 docstring 的 authority 分級。"""
 
         return self.authority is not SignalAuthority.HINT and self.outcome in RETRYABLE_OUTCOMES
+
+    @property
+    def reroutable(self) -> bool:
+        """是否適合驅動 bounded re-route（不持久化）。"""
+
+        return self.authority is not SignalAuthority.HINT and self.outcome in _REROUTABLE_OUTCOMES
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -176,6 +211,91 @@ class ProviderFailureClassification:
         )
 
 
+def _structured_classification(
+    kind: outcome_taxonomy.StructuredKind,
+    detail: str,
+    *,
+    reset_at: int | None = None,
+) -> ProviderFailureClassification:
+    return ProviderFailureClassification(
+        _OUTCOME_BY_STRUCTURED_KIND[kind],
+        SignalAuthority.STRUCTURED,
+        detail,
+        reset_at=reset_at,
+    )
+
+
+def _normalize_executable_token(value: str) -> str:
+    token = value.strip().strip("`'\"")
+    token = token.rsplit("/", 1)[-1]
+    token = token.rsplit("\\", 1)[-1]
+    return token.lower()
+
+
+def _is_path_within_root(path_value: str, root: str | None) -> bool:
+    if not root:
+        return False
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        return False
+    try:
+        resolved_candidate = candidate.resolve(strict=False)
+        resolved_root = Path(root).resolve(strict=False)
+    except OSError:
+        return False
+    try:
+        resolved_candidate.relative_to(resolved_root)
+    except ValueError:
+        return False
+    return True
+
+
+def _exception_summary(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _is_missing_executable_exception(
+    exc: BaseException,
+    *,
+    executor: str | None,
+    worktree: str | None,
+) -> bool:
+    if not isinstance(exc, FileNotFoundError):
+        return False
+    filename = exc.filename
+    if not isinstance(filename, str) or not filename:
+        return False
+    if _is_path_within_root(filename, worktree):
+        return False
+    token = _normalize_executable_token(filename)
+    if token in _SHARED_LAUNCH_INFRASTRUCTURE_TOKENS:
+        return False
+    if executor is not None and token == executor.lower():
+        return True
+    return token in _KNOWN_PROVIDER_EXECUTABLE_TOKENS
+
+
+def classify_launch_failure(
+    *,
+    detail: str | None = None,
+    exc: BaseException | None = None,
+    executor: str | None = None,
+    worktree: str | None = None,
+) -> ProviderFailureClassification:
+    """把 launch 階段（attach_launch_handle 之前）失敗投影成 structured outcome。"""
+
+    if detail is None:
+        if exc is None:
+            raise ValueError("launch failure classification requires detail or exc")
+        detail = f"launch failed before attach_launch_handle: {_exception_summary(exc)}"
+    kind = outcome_taxonomy.StructuredKind.LAUNCH_FAILED
+    if exc is not None and _is_missing_executable_exception(
+        exc, executor=executor, worktree=worktree
+    ):
+        kind = outcome_taxonomy.StructuredKind.EXECUTABLE_NOT_FOUND
+    return _structured_classification(kind, detail)
+
+
 def classify_provider_failure(*, exit_code: int, output: str | None) -> ProviderFailureClassification:
     """把一次 executor 失敗的 (exit_code, 合併 stdout/stderr 文字) 分類成 typed outcome。
 
@@ -203,14 +323,19 @@ def classify_provider_failure(*, exit_code: int, output: str | None) -> Provider
             SignalAuthority.HINT,
             "exit code 0 -- classify_provider_failure 不應被呼叫在成功案例",
         )
+    if exit_code == 127 and output is None:
+        return ProviderFailureClassification(
+            ProviderOutcome.UNKNOWN,
+            SignalAuthority.HINT,
+            "exit 127 without readable provider output is not enough to prove missing executable",
+        )
 
     evidence = outcome_taxonomy.parse_stream_evidence(output)
 
     structured = outcome_taxonomy.classify_structured_evidence(evidence)
     if structured is not None:
-        return ProviderFailureClassification(
-            _OUTCOME_BY_STRUCTURED_KIND[structured.kind],
-            SignalAuthority.STRUCTURED,
+        return _structured_classification(
+            structured.kind,
             structured.detail,
             reset_at=structured.reset_at,
         )

@@ -7,6 +7,22 @@
 
 ## [Unreleased]
 
+- **#826 outcome taxonomy signals**：新增 `effort_not_supported`／`executable_not_found`／`launch_failed`
+  failure 詞彙與環境類 family 映射；structured terminal／interruption 仍優先於可信 `exit 127`
+  與文字訊號，`not found` 只有在已知 launcher／executor 的 shell command-not-found、同一行帶
+  `exec`／`execvpe`／`execve`／`spawn`／`Popen` 與 `No such file or directory` 的 launcher ENOENT
+  （若同一行也附帶 `: <target>`，該 target 必須是已知 launcher executable，且不能只是缺失的 cwd/path）、
+  可信的空 `127`（不是缺 log／讀不到 log），或 typed launch exception 能證明缺的是 provider executable
+  （如 `copilot`／`codex`／`claude`／`agy`／`cg` 或精確 executor 名）時才會歸類為 executable 缺失；`bash`／
+  `sh`／`git`／`systemctl`／`systemd-run` 這類 shared launch infrastructure 缺失與 `pytest` 這類未知
+  target 不會 reroute，仍維持 `launch_failed`／unknown。headless result 會保存 optional `executor`／`model_id`、typed
+  `provider_outcome` 與 `launch-failed` runtime diagnostic；foreign-review launch exception 也會即時投影
+  `foreign-review-provider-*`，slice/workflow consumer 改為投影具名 `builder-failed-*`／`job-failed-*`
+  reason，`effort_not_supported` 與
+  `executable_not_found` 可在既有候選清單內有界 reroute，且 reroute 會重跑該 card 的完整 runtime
+  preflight：缺 `module:pytest` 等能力的替代候選會被跳過，正式重派會沿用 preflight 核可的同一個
+  specialized launcher／executor environment，沒有 runtime-qualified 替代候選時維持停止等待人工；
+  真正的 runtime-contract failure 仍優先 fail-closed、不進 provider reroute。
 - **#503 slice-lane pinned spec 交付與 attestation**：builder prompt 附 `[SPEC: path sha256=…]`＋逐字 spec body
   與明示語句，dispatch 時 spec hash 必須等於 pin 值否則 needs_human；job row 記錄交付的 spec／plan hash，完成側
   對照 slice 釘住的值（`builder-input-*-hash` → pinned-input-mismatch）；review prompt 附同一份 spec 行。

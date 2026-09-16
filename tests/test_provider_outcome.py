@@ -16,8 +16,14 @@ from paulsha_cortex.coordinator.provider_outcome import (
     ProviderOutcome,
     SignalAuthority,
     classification_from_job,
+    classify_launch_failure,
     classify_provider_failure,
     read_log_tail,
+)
+
+_COPILOT_EFFORT_UNSUPPORTED = (
+    'Reasoning effort "xhigh" is not supported for model '
+    '"mai-code-1-flash-picker"'
 )
 
 
@@ -140,11 +146,95 @@ def test_none_output_does_not_raise():
     assert result.outcome is ProviderOutcome.UNKNOWN
 
 
+def test_exit_127_without_readable_output_stays_unknown_hint():
+    result = classify_provider_failure(exit_code=127, output=None)
+    assert result.outcome is ProviderOutcome.UNKNOWN
+    assert result.authority is SignalAuthority.HINT
+    assert result.retryable is False
+    assert result.reroutable is False
+    assert "not enough to prove missing executable" in result.reason
+
+
 def test_only_rate_limited_and_transient_are_retryable_outcomes():
     assert RETRYABLE_OUTCOMES == {ProviderOutcome.RATE_LIMITED, ProviderOutcome.TRANSIENT}
 
 
 # --------------------------------------------------------------- authority level design
+
+
+def test_effort_not_supported_is_reroutable_but_not_retryable():
+    result = classify_provider_failure(exit_code=1, output=_COPILOT_EFFORT_UNSUPPORTED)
+    assert result.outcome is ProviderOutcome.EFFORT_NOT_SUPPORTED
+    assert result.retryable is False
+    assert result.reroutable is True
+    assert "reroutable" not in result.to_dict()
+
+
+def test_exit_127_empty_output_is_executable_not_found_and_reroutable():
+    result = classify_provider_failure(exit_code=127, output="")
+    assert result.outcome is ProviderOutcome.EXECUTABLE_NOT_FOUND
+    assert result.authority is SignalAuthority.TEXT_SIGNAL
+    assert result.retryable is False
+    assert result.reroutable is True
+
+
+@pytest.mark.parametrize(
+    "shared_binary", ["bash", "sh", "git", "systemctl", "systemd-run"]
+)
+def test_same_line_launch_enoent_for_shared_infrastructure_is_not_reroutable(
+    shared_binary: str,
+) -> None:
+    result = classify_provider_failure(
+        exit_code=1,
+        output=f"subprocess.Popen(...): [Errno 2] No such file or directory: '{shared_binary}'",
+    )
+
+    assert result.outcome is ProviderOutcome.UNKNOWN
+    assert result.authority is SignalAuthority.HINT
+    assert result.reroutable is False
+
+
+def test_same_line_launch_enoent_for_unknown_target_is_not_reroutable() -> None:
+    result = classify_provider_failure(
+        exit_code=1,
+        output="subprocess.Popen(...): [Errno 2] No such file or directory: 'pytest'",
+    )
+
+    assert result.outcome is ProviderOutcome.UNKNOWN
+    assert result.authority is SignalAuthority.HINT
+    assert result.reroutable is False
+
+
+def test_launch_failure_only_classifies_missing_executable_when_exception_proves_it():
+    missing_program = classify_launch_failure(
+        exc=FileNotFoundError(2, "No such file or directory", "copilot"),
+        executor="copilot",
+        worktree="/tmp/worktree",
+    )
+    missing_cwd = classify_launch_failure(
+        exc=FileNotFoundError(2, "No such file or directory", "/tmp/worktree"),
+        executor="copilot",
+        worktree="/tmp/worktree",
+    )
+
+    assert missing_program.outcome is ProviderOutcome.EXECUTABLE_NOT_FOUND
+    assert missing_program.reroutable is True
+    assert missing_cwd.outcome is ProviderOutcome.LAUNCH_FAILED
+    assert missing_cwd.reroutable is False
+
+
+@pytest.mark.parametrize("shared_binary", ["bash", "sh", "git", "systemctl", "systemd-run"])
+def test_launch_failure_keeps_shared_launch_infrastructure_as_launch_failed(
+    shared_binary: str,
+) -> None:
+    result = classify_launch_failure(
+        exc=FileNotFoundError(2, "No such file or directory", shared_binary),
+        executor="copilot",
+        worktree="/tmp/worktree",
+    )
+
+    assert result.outcome is ProviderOutcome.LAUNCH_FAILED
+    assert result.reroutable is False
 
 
 def test_text_signal_authority_is_between_structured_and_hint():

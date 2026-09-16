@@ -56,7 +56,19 @@
 
 ## 4. B3 遙測與預估
 
-- [ ] 4.1 完成 #826 failure 原始訊號→持久化→消費端分類，保留 runtime-contract 硬阻擋。
+- [x] 4.1 完成 #826 failure 原始訊號→持久化→消費端分類，保留 runtime-contract 硬阻擋。
+  - [x] RED：新增 `tests/test_outcome_taxonomy_signals_826.py` 與缺 handle completion 回歸，
+        鎖定 copilot effort、exit 127 空日誌、dispatcher missing handle、autonomy／
+        workflow launch exception 與 workflow reroute/contract consumer wiring；正式
+        taxonomy、詞彙文件與 GREEN 修補仍待後續卡片。
+  - [x] GREEN：補上 `effort_not_supported`／`executable_not_found`／`launch_failed`
+        taxonomy、registry round-trip、slice gate_reason／workflow `job-failed-*` consumer、
+        bounded reroute 與 launch/runtime diagnostic 保真；structured authority、missing
+        handle 與 runtime-contract fail-closed gate 皆維持不變。
+  - [x] repair pre-archive：補 `autonomy._fail_launching_job()` 在 `exc=None` 時仍會
+        durable 寫 failed job，並把同一行 `exec`／`execvpe`／`execve`／`spawn`／`Popen`
+        ＋ `No such file or directory` 視為 launcher executable 缺失；focused/full pytest
+        已通過，archive／merge／issue closure 與 runtime qualification 仍待後續責任方處理。
 - [ ] 4.2 整合 usage provenance：observed/estimated/unknown、增量/累計、input/cache/reasoning 不重複加總。
 - [ ] 4.3 由 #836 核對各 provider 真正可用的 quota observation 介面，實作帶來源/TTL/window/unit 的 adapters 與 unknown fallback。
 - [ ] 4.3.1 先依 #866 交付純 schema A 的十組不變量、standalone native unit cold-start、strict refs/unknown 與無 I/O helpers；現行7/Red不派工，#831真正loaded後重評。B來源adapter、C持久ledger、Dshadow及#849正式upstream conformance仍需各自證據；A不得關閉#836或代替forecast/reservation/fallback。

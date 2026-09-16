@@ -15,6 +15,7 @@ from .diagnostics import DiagnosticReason, diagnostic_reason
 from .dispatcher import _default_git_runner
 from .launcher import AgentLauncher, LaunchHandle
 from .model_identities import load_model_identities
+from . import provider_outcome
 from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
 from . import verification
 
@@ -757,7 +758,13 @@ def dispatch_ready(
             jobs.append(job)
         except Exception as exc:
             if job is not None:
-                _fail_launching_job(dispatcher, job)
+                _fail_launching_job(
+                    dispatcher,
+                    job,
+                    executor=executor if isinstance(executor, str) else None,
+                    model_id=model_id if isinstance(model_id, str) else None,
+                    exc=exc,
+                )
             if pinned_inputs is not None:
                 _mark_slice_needs_human(dispatcher, slice_id, reason=str(exc))
             errors.append((slice_id, exc))
@@ -1047,12 +1054,43 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
     return registry.attach_launch_handle(job["job_id"], **kwargs)
 
 
-def _fail_launching_job(dispatcher, job: dict) -> None:
+def _fail_launching_job(
+    dispatcher,
+    job: dict,
+    *,
+    executor: str | None = None,
+    model_id: str | None = None,
+    exc: BaseException | None = None,
+) -> None:
     """Reconcile a pre-launch row whose launch raised (mark failed)."""
     registry = getattr(dispatcher, "_registry", None)
     if registry is None or "job_id" not in job:
         return
+    detail = (
+        f"{type(exc).__name__}: {exc}"
+        if exc is not None
+        else "launch failed before attach_launch_handle"
+    )
+    worktree = job.get("worktree") if isinstance(job.get("worktree"), str) else None
     try:
-        registry.update_status(job["job_id"], "failed")
+        registry.update_headless_result(
+            job["job_id"],
+            status="failed",
+            exit_code=1,
+            executor=executor,
+            model_id=model_id,
+            provider_outcome=provider_outcome.classify_launch_failure(
+                detail=detail if exc is None else None,
+                exc=exc,
+                executor=executor,
+                worktree=worktree,
+            ).to_dict(),
+            runtime_diagnostic={
+                "reason": "launch-failed",
+                "detail": detail,
+                "source": "autonomy.dispatch_ready:launch",
+                "job_id": str(job["job_id"]),
+            },
+        )
     except Exception:
         pass

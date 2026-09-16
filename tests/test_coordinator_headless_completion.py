@@ -176,10 +176,7 @@ class CrossProcessCompletionTests(unittest.TestCase):
             self.assertEqual(updated["status"], "exited")
             self.assertIsNone(updated["provider_outcome"])
 
-    def test_missing_launch_handle_failure_classifies_as_unknown_hint(self) -> None:
-        # launch 本身失敗（無 log_path 可分類，read_log_tail 回 None）——分類器
-        # 誠實回報「沒有訊號」（unknown/hint），不是偽造出一個具體 outcome，
-        # 也不是省略欄位；retryable 仍是 False（HINT 永不驅動 retry）。
+    def test_missing_launch_handle_failure_classifies_as_launch_failed(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             state = Path(d) / "jobs.json"
             _seed_job(state, log_path=None, pid=None)
@@ -191,9 +188,21 @@ class CrossProcessCompletionTests(unittest.TestCase):
             self.assertEqual(updated["status"], "failed")
             outcome = updated["provider_outcome"]
             self.assertIsNotNone(outcome)
-            self.assertEqual(outcome["outcome"], "unknown")
-            self.assertEqual(outcome["authority"], "hint")
+            self.assertEqual(outcome["outcome"], "launch_failed")
+            self.assertEqual(outcome["authority"], "structured")
+            self.assertEqual(
+                outcome["reason"], "launch handle missing: pid=None, log_path=None"
+            )
             self.assertFalse(outcome["retryable"])
+            self.assertEqual(
+                updated["runtime_diagnostic"],
+                {
+                    "reason": "launch-failed",
+                    "detail": "launch handle missing: pid=None, log_path=None",
+                    "source": "dispatcher.poll_headless_done:launch",
+                    "job_id": "slice-a-1",
+                },
+            )
 
 
 if __name__ == "__main__":
