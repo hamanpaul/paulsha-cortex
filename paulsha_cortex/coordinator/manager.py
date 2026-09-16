@@ -1550,7 +1550,9 @@ def _launch_foreign_review(
         # worktree verdict 就能把自己洗回 legacy 路徑。
         review_verdict_channel=foreign_review.REVIEW_VERDICT_CHANNEL_SPOOL,
     )
+    review_worktree: Path | None = None
     try:
+        registry.update_slice(slice_id, reviewer_job_id=reviewer_job["job_id"], candidate=candidate)
         authority_inputs = _slice_review_authority_inputs(
             slice_row=slice_row,
             repo_root=repo_root,
@@ -1609,7 +1611,6 @@ def _launch_foreign_review(
             prompt_path=handle.prompt_path,
             control_log_path=handle.control_log_path,
         )
-        registry.update_slice(slice_id, reviewer_job_id=reviewer_job["job_id"], candidate=candidate)
         registry.record_action(
             slice_id,
             action="foreign-review-dispatched",
@@ -1620,10 +1621,25 @@ def _launch_foreign_review(
         )
         return {"launched": True, "reviewer_job_id": reviewer_job["job_id"]}
     except Exception as exc:
-        try:
-            registry.update_status(reviewer_job["job_id"], "failed")
-        except Exception:
-            pass
+        reviewer_executor = reviewer_job.get("executor")
+        if not isinstance(reviewer_executor, str) or not reviewer_executor:
+            reviewer_executor = review_executor
+        failed_reviewer_job = registry.update_headless_result(
+            reviewer_job["job_id"],
+            status="failed",
+            exit_code=1,
+            provider_outcome=provider_outcome.classify_launch_failure(
+                exc=exc,
+                executor=reviewer_executor,
+                worktree=str(review_worktree) if review_worktree is not None else None,
+            ).to_dict(),
+            runtime_diagnostic={
+                "reason": "launch-failed",
+                "detail": summarize_exception(exc),
+                "source": "manager._launch_foreign_review:launch",
+                "job_id": str(reviewer_job["job_id"]),
+            },
+        )
         evaluation = _write_gate_evaluation(
             slice_id=slice_id,
             state="absent",
@@ -1640,7 +1656,7 @@ def _launch_foreign_review(
         return {
             "launched": False,
             "gate_status": "needs_human",
-            "gate_reason": f"foreign-review-launch-error:{exc}",
+            "gate_reason": _review_failure_gate_reason(failed_reviewer_job),
             "evaluation": evaluation,
         }
 
