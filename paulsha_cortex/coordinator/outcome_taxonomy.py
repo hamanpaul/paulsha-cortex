@@ -282,6 +282,10 @@ _COMMAND_NOT_FOUND_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE | re.VERBOSE,
     ),
 )
+_LAUNCH_EXECUTABLE_ENOENT_RE = re.compile(
+    r"\b(?P<call>execvpe|execve|exec|spawn|Popen)\b",
+    re.IGNORECASE,
+)
 
 # Transient：網路/服務暫時性錯誤，與 rate limit 不同——這裡沒有「額度」語意，
 # 純粹是這一次呼叫失敗，重試通常會成功。
@@ -414,6 +418,12 @@ def _has_shell_command_not_found_context(provider_text: str) -> str | None:
         line = raw_line.strip()
         if not line:
             continue
+        if "no such file or directory" in line.lower():
+            launch_call = _LAUNCH_EXECUTABLE_ENOENT_RE.search(line)
+            if launch_call is not None:
+                return (
+                    f"{launch_call.group('call').lower()} reported missing executable"
+                )
         for pattern in _COMMAND_NOT_FOUND_PATTERNS:
             match = pattern.match(line)
             if match is None:

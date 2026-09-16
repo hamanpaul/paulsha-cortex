@@ -1080,6 +1080,7 @@ def _fail_launching_job(
             executor=executor,
             model_id=model_id,
             provider_outcome=provider_outcome.classify_launch_failure(
+                detail=detail if exc is None else None,
                 exc=exc,
                 executor=executor,
                 worktree=worktree,

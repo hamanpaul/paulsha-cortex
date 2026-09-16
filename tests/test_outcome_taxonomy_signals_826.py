@@ -353,6 +353,39 @@ def test_bash_line_command_not_found_classifies_as_executable_not_found_signal()
     assert result.signal.value == "executable_not_found"
 
 
+@pytest.mark.parametrize(
+    "provider_text",
+    [
+        "exec: No such file or directory",
+        "execvpe: No such file or directory",
+        "execve: No such file or directory",
+        "spawn: No such file or directory",
+        "Popen: No such file or directory",
+    ],
+)
+def test_exec_spawn_popen_enoent_classifies_as_executable_not_found_signal(
+    provider_text: str,
+) -> None:
+    result = outcome_taxonomy.classify_text(
+        exit_code=1,
+        provider_text=provider_text,
+        model_text="",
+    )
+
+    assert result.signal.value == "executable_not_found"
+    assert "missing executable" in result.detail
+
+
+def test_general_file_open_enoent_stays_none_signal() -> None:
+    result = outcome_taxonomy.classify_text(
+        exit_code=1,
+        provider_text="open /tmp/work/spec.json: No such file or directory",
+        model_text="",
+    )
+
+    assert result.signal.value == "none"
+
+
 def test_structured_signals_still_win_before_exit_127_text_classification() -> None:
     rate_limited = classify_provider_failure(
         exit_code=127, output=_STRUCTURED_RATE_LIMIT_LOG
@@ -498,6 +531,39 @@ def test_autonomy_fail_launching_job_persists_launch_failed_runtime_diagnostic(
             "job_id": "slice-launch-1",
         },
     }
+
+
+def test_autonomy_fail_launching_job_without_exception_still_marks_job_failed() -> None:
+    class Registry:
+        def __init__(self) -> None:
+            self.updated = None
+
+        def update_headless_result(self, job_id: str, **kwargs) -> dict:
+            self.updated = {"job_id": job_id, **kwargs}
+            return self.updated
+
+    registry = Registry()
+    dispatcher = type("D", (), {"_registry": registry})()
+
+    autonomy._fail_launching_job(
+        dispatcher,
+        {"job_id": "slice-launch-0"},
+        executor="copilot",
+        model_id="mai-code-1-flash-picker",
+    )
+
+    assert registry.updated is not None
+    assert registry.updated["status"] == "failed"
+    assert registry.updated["provider_outcome"]["outcome"] == "launch_failed"
+    assert registry.updated["provider_outcome"]["authority"] == "structured"
+    assert (
+        registry.updated["provider_outcome"]["reason"]
+        == "launch failed before attach_launch_handle"
+    )
+    assert (
+        registry.updated["runtime_diagnostic"]["detail"]
+        == "launch failed before attach_launch_handle"
+    )
 
 
 def test_autonomy_fail_launching_job_classifies_missing_executable_exception_as_executable_not_found() -> None:

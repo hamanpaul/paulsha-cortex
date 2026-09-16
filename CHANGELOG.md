@@ -9,8 +9,9 @@
 
 - **#826 outcome taxonomy signals**：新增 `effort_not_supported`／`executable_not_found`／`launch_failed`
   failure 詞彙與環境類 family 映射；structured terminal／interruption 仍優先於可信 `exit 127`
-  與文字訊號，`not found` 只有在已知 launcher／executor 的 shell command-not-found、可信的空 `127`
-  （不是缺 log／讀不到 log），或 typed launch exception 能證明缺的是 provider executable
+  與文字訊號，`not found` 只有在已知 launcher／executor 的 shell command-not-found、同一行帶
+  `exec`／`execvpe`／`execve`／`spawn`／`Popen` 與 `No such file or directory` 的 launcher ENOENT、
+  可信的空 `127`（不是缺 log／讀不到 log），或 typed launch exception 能證明缺的是 provider executable
   （如 `copilot`／`codex`／`claude`／`agy`／`cg` 或精確 executor 名）時才會歸類為 executable 缺失；`bash`／
   `sh`／`git`／`systemctl`／`systemd-run` 這類 shared launch infrastructure 缺失維持 `launch_failed`。headless result 會保存 optional `executor`／`model_id`、typed
   `provider_outcome` 與 `launch-failed` runtime diagnostic；foreign-review launch exception 也會即時投影

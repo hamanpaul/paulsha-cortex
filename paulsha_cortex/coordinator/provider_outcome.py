@@ -246,7 +246,7 @@ def _is_path_within_root(path_value: str, root: str | None) -> bool:
     try:
         resolved_candidate.relative_to(resolved_root)
     except ValueError:
-        return resolved_candidate == resolved_root
+        return False
     return True
 
 

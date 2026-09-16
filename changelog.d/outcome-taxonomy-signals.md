@@ -7,7 +7,8 @@
   `classification_from_job()` 仍能 round-trip 讀回；foreign-review launch exception 也會即時投影
   `foreign-review-provider-<outcome>` gate reason，而不是舊的 `foreign-review-launch-error:*`。
   workflow/slice consumer 會保留 structured authority 與 runtime-contract 優先序；已知 launcher／
-  executor 的 shell command-not-found、可信空 `127`，以及 typed launch exception 能證明缺的是 provider executable
+  executor 的 shell command-not-found、同一行帶 `exec`／`execvpe`／`execve`／`spawn`／`Popen` 與
+  `No such file or directory` 的 launcher ENOENT、可信空 `127`，以及 typed launch exception 能證明缺的是 provider executable
   （如 `copilot`／`codex`／`claude`／`agy`／`cg` 或精確 executor 名）時才會進 `executable_not_found`；
   缺 log／讀不到 log 的 `127` 維持 unknown/hint，`bash`／`sh`／`git`／`systemctl`／`systemd-run`
   這類 shared launch infrastructure 缺失則保留 `launch_failed`。`effort_not_supported`／`executable_not_found` 可在既有合格候選內有界 reroute，
