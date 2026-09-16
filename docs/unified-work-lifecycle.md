@@ -13,6 +13,12 @@ Monitor 對每個 repo/work item 只公開 `topic`、`todo`、`on-going`、`done
 
 Provider 失敗時會保留 last-good snapshot 並標 `degraded`。GitHub provider 超過 900 秒沒有成功 snapshot 時，auto claim 與 merge 都會 fail-closed。
 
+### Planning capability probe boundary
+
+Planning runtime 建構時，AGY capability probe 的 `build_agy_argv(...)` 若拋出一般 `Exception`，只會把 AGY probe 降為 `smoke-failed`／`ready=false`；這個局部 containment 不會把建構錯誤升格成整個 runtime failure。只要非 AGY primary 的 probe 成功，production planning runtime 仍可完成建構並保留 primary。失敗的 AGY identity 不會被選為 ready secondary；這只說明 probe 邊界，並不保證一定存在合格的異質 secondary planner。
+
+這項邊界不涵蓋直接 launcher 的錯誤吞除：direct `SubprocessLauncher` 仍會讓無效 argv 設定向 caller 傳播，且在 argv 建構失敗後不啟動 Popen。真實非法 timeout env 的 direct／probe 雙路徑驗收仍屬後續 timeout child，不由本 child 冒稱完成。
+
 GitHub terminal closure scan 會以 authenticated default revision 的 Contents API 讀取 remote Todo，並重驗 path、blob SHA 與 base64 encoding；production 只對 canonical WorkflowRegistry 已連結的 PR 做 merge ancestry compare。只有 HTTP 502/503/504 會有限次 backoff retry，auth、rate-limit、其他 HTTP error、malformed JSON 或 identity mismatch 都立即保留 last-good 並標 degraded。
 
 ## Correlation authority
@@ -85,6 +91,21 @@ cortex doctor --probe-live --repo owner/repo --json
 `paulsha_cortex/deck/schema.py` 的 `resolve_combo_path()`／`iter_combo_files()`（`deck/cli.py`、`work_bridge.py`、`porcelain/init_sample.py` 皆已改走這兩個入口）會先查 `$PSC_AGENTS_ROOT/config/combos/<id>.yaml`，找不到才 fallback 到套件內建 `paulsha_cortex/deck/data/combos/`。同 id 時 instance-local 優先於套件內建，且 reinstall／升級套件不會蓋掉這份自訂檔——把自訂 combo YAML 放進 `$PSC_AGENTS_ROOT/config/combos/` 即可長期覆寫或新增 combo，不需要 fork 套件內建資料。兩個目錄都找不到指定 id 時 fail-closed，錯誤訊息會列出實際搜尋過的目錄清單。
 
 `small-fix` 是套件內建的輕量 combo 參考實作（`workflow-claim → brainstorming → writing-plans-light → subagent-build → verification → code-review → policy-commit`，7 張卡、2 條核心 gate_spine），刻意用 `writing-plans-light`（只吃 `docs/superpowers/specs/*<task-slug>*-design.md`，不依賴 `openspec/changes/<change>/proposal.md`）取代 `writing-plans`，打斷小任務不需要的 openspec 全鏈。`small-fix` 只能經 `--combo small-fix` explicit override 使用，不在 `task-types.yaml` 的自動選牌映射中（`combo.task_type` 填 `small-fix`，不是 `fix`——避免和 `fix-standard` 的自動選牌搶同一個 `fix` task type）。
+
+### Sizing 評分與 stability-risk-v2
+
+五個 sizing 維度各為 0–2 分，總分仍為 0–10；Green／Yellow／Red 門檻仍分別是 0–3、4–6、7–10。`domain_breadth`、`state_consistency`、`acceptance_surfaces` 與 `orchestration` 的計算不變，只有 `spec_stability` 以風險方向的 `STABILITY_RISK_ALGORITHM = "stability-risk-v2"` 識別：
+
+| completeness 情況 | stability risk |
+|---|---:|
+| 三件 accepted 材料完整、無 blocking marker | 0 |
+| 恰好缺一個 kind，且沒有拒收或阻塞 | 1 |
+| 缺至少兩個 kind、任一 blocking marker，或存在未 accepted artifact | 2 |
+
+空白、unknown 或彼此不一致的 completeness report 也保守給 2；缺少或 invalid 的 plan `domain_breadth`／`state_consistency` 仍使純函式拋 `ValueError`，既有 `current_sizing_snapshot` 則維持 `(None, None)` fail-soft。較低的 stability risk 不代表 planning 已 accepted，也不會略過 readiness 或其他 gate。
+
+此映射只由新的 claim／reclaim 與既有明示 retry 重算入口採用。讀取或重啟不會重算、改寫舊 WorkflowRun、frozen planning、CompletionRecord 或 immutable evidence；沒有可辨識算法來源的歷史分數保留為 legacy／unversioned，不以目前 runtime 猜填。需要新分數時，必須走正式的明示重新評估流程並以當時實際載入的 runtime revision 留下紀錄。
+
 ### Intake（`link` + `start` 合成，#203）
 
 `cortex work intake <work_id> --repo <owner/repo>` 是「拿到一個 issue/task 就進件」的單一入口，取代已停用的低階 `dispatch`。它等價於「（必要時）`link` 後接 `start`」，但收斂成一次呼叫：
@@ -102,6 +123,31 @@ cortex work intake unified-work-lifecycle --repo owner/repo --issue 14 --combo f
 ```
 
 Telegram 等 bot 宿主若要提供「貼一段文字/issue 就進件」的入口，應呼叫 `submit_work_action(action="intake", ...)`（`paulsha_cortex/control/client.py`）；既有的 `/dispatch <slice_id>` 走既存 slice_id 派工，維持原樣不變，不在本次範圍內改動。
+
+### Headless launcher session boundary（#823）
+
+Headless job 的每次合法 `Popen`（direct、`systemd-run`、`systemd-template` 的外層
+Manager client，以及只移除 `stdin` 的相容 retry）都必須使用
+`start_new_session=True`。direct mode 的 child 因此離開 Manager 的 POSIX session/process
+group；這不等於把程序移入 systemd cgroup，也不承諾 Manager daemon restart 後 job 存活，
+更不改變 systemd unit 的 cgroup／`KillMode` 語意。#824 的 timeout/parser/CLI 合約與
+#851 的 AGY probe containment 仍由各自 work item 負責；#823 不藉 session flag 宣稱
+timeout、cancel、probe 或 issue closure 已完成。
+
+### AGY print timeout boundary（#824）
+
+AGY 的 headless `--print` 形態現在一律帶單一 `--print-timeout <Ns>`。若 caller 明示
+`PSC_AGY_PRINT_TIMEOUT`，launcher 先做 `strip()`，只接受 ASCII digits，容許前導零但會
+正規化成 canonical `Ns`；空白、零、符號、小數、Unicode digits、已帶 `s` unit 或超過
+Go `time.Duration` 整秒上界 `9223372036s` 都會在 spawn 前 `ValueError`。`build_agy_argv`
+的顯式 `print_timeout=` keyword 只接受已 canonical 的 `Ns` 字串，不做 strip 或前導零修正。
+
+未設定 `PSC_AGY_PRINT_TIMEOUT` 時，launcher 直接重用既有
+`gate_ledger._gate_timeout(env)`：`max(DEFAULT_GATE_TIMEOUT_SECONDS, gate_seconds) + 600`，
+最後才檢查 AGY/Go 上界。這保留 `PSC_GATE_TIMEOUT` 對非法／非正值的既有 fallback，不新增第二份
+gate parser，也不改變 planning runtime 的 45 秒 probe process deadline、120 秒 planning
+timeout，或其他 executor 的 argv 形狀。
+
 ### Work identity migration（設計中，見 ADR-0002）
 
 `link`／`unlink` 目前一次只能對單一 `(work_id, source)` pair 生效，重識別
@@ -195,6 +241,10 @@ PR #54 僅識別目前仍為 open 的 delivery target；此編號本身不是 me
 `paulsha_cortex/coordinator/terminal_contract.py` 是 terminal/result 契約的單一真相源，供 build、verify、review 三類 card 共用。
 
 **Canonical envelope。** envelope 帶 `schema_version`，並完整支援 `passed`、`failed`、`needs_human` 三種終局狀態與結構化 `diagnostics`；三類 card 都不存在「只有成功形狀才合法」的路徑。不帶 canonical 版本的舊 payload 走相容讀取路徑並記 legacy 標記，既有 run 不因版本差異被拒收。
+
+**Terminal JSONL extraction 與 recovery 邊界（#860）。** Manager 讀取 terminal log 時以保留換行的 UTF-8 reader 開啟檔案，且只用 literal LF（`\n`）切分 JSONL records。CRLF 是相容輸入；單筆 JSON 外的 CR 仍交給 JSON whitespace／既有 fence 規則處理，但裸 CR 不會被當成另一個 record delimiter，因此兩筆 JSON 只以裸 CR 相接時會 fail closed。末筆無換行、空行與尾端空行都不改變這項判定。Recovery 只讀取既有 log；路徑遺失、檔案遺失、UTF-8 無效、純文字或 terminal shape 無效時，不會產生 terminal evidence。
+
+JSON string data 中的原始 Unicode NEL（`U+0085`）、line separator（`U+2028`）與 paragraph separator（`U+2029`）會保留在 details／reports 等欄位；inner `result` JSON string 與 outer provider record 的 `structured_output` 各自可能採 raw 或 `ensure_ascii` escaped 形式。只 escape inner result 並不足以修復會把 outer raw separator 當換行的 reader；以 ASCII codepoint 名稱暫避只是一種內容改寫，不能當作 fidelity 修復或事故 replay 的替代品。Parser 仍只接受既有 terminal carriers 與一層白名單 wrapper；任意 `structured_output` 不會自動成為證據來源。這項修復也不把 generic top-level text 欄位變成經 event-type 認證的工具輸出，既有相容路徑的限制仍須分開看待。既有 `work start`／`recover work` CLI 介面不因本修復新增旗標。
 
 **gate ledger 由 manager 產生，不是模型自述。** 重驗只有在「被驗的東西不是模型講的話」時才有意義。`launcher.build_wrapper_script` 產生的 headless wrapper 是 manager 擁有的，形狀為：
 

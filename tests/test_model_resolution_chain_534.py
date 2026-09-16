@@ -109,7 +109,11 @@ def test_packaged_candidates_are_kept_as_lower_priority_fallback(tmp_path: Path)
     keys = [(item.executor, item.model_id) for item in candidates]
     assert keys[0] == ("codex", "gpt-5.6-luna")
     assert ("copilot", "gpt-5.4") in keys  # packaged 候選仍在，但排在 overlay 之後
-    overlay_keys = {("codex", "gpt-5.6-luna"), ("copilot", "MAI-Code-1.1-Flash"), ("agy", "gemini-3.6-flash-high")}
+    overlay_keys = {
+        ("codex", "gpt-5.6-luna"),
+        ("copilot", "MAI-Code-1.1-Flash"),
+        ("agy", "gemini-3.6-flash-high"),
+    }
     last_overlay = max(keys.index(key) for key in overlay_keys if key in keys)
     assert keys.index(("copilot", "gpt-5.4")) > last_overlay
 
@@ -389,15 +393,24 @@ def test_overlay_can_park_and_demote_packaged_identities(tmp_path: Path) -> None
     _write(
         tmp_path,
         "model-identities.yaml",
-        _OPERATOR_OVERLAY
-        + """\
+        """\
+schema_version: 3
+identities:
+  - executor: claude
+    model_id: claude-opus-5
+    independence_domain: anthropic
+    capabilities: [planning, review]
+  - executor: codex
+    model_id: gpt-5.6-luna
+    independence_domain: openai
+    capabilities: [build]
 packaged_overrides:
   - executor: agy
     model_id: gemini-3.1-pro-high
     action: park
     reason: operator 未核可此引擎
-  - executor: copilot
-    model_id: gpt-5.4
+  - executor: codex
+    model_id: gpt-5.3-codex-spark
     action: demote
     reason: 尚未評估，僅供最後手段
 """,
@@ -417,7 +430,7 @@ packaged_overrides:
         (item.executor, item.model_id)
         for item in manager._workflow_identity_candidates(_run(), _step("builder"), registry)
     ]
-    assert builder_keys[-1] == ("copilot", "gpt-5.4")
+    assert builder_keys[-1] == ("codex", "gpt-5.3-codex-spark")
 
 
 def test_packaged_overrides_are_fail_closed(tmp_path: Path) -> None:

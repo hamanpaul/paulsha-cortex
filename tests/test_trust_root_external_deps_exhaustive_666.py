@@ -549,6 +549,7 @@ def test_home_anchored_assets_are_derived_not_hand_written() -> None:
         # #698：builder 的 codex 憑證改成 sticky 樹（舊 id `builder-executor-credential`），
         # 而 `codex-hooks` 拆成 per-account 兩份——兩者都由憑證表那條規則導出。
         "builder-codex-state",
+        "builder-agy-state",
         "builder-codex-hooks",
         "reviewer-planner-codex-hooks",
         "builder-gitconfig",

@@ -1162,6 +1162,7 @@ def test_qualification_driver_and_runner_are_fail_closed_on_live_inputs() -> Non
     for variable in (
         "CORTEX_RC_CODEX_AUTH",
         "CORTEX_RC_AGY_AUTH",
+        "CORTEX_RC_BUILDER_AGY_AUTH",
         "CORTEX_RC_COPILOT_AUTH",
         "CORTEX_RC_MANAGER_GITHUB_AUTH",
         "CORTEX_RC_PROBE_REPOSITORY",
@@ -1169,6 +1170,15 @@ def test_qualification_driver_and_runner_are_fail_closed_on_live_inputs() -> Non
         "CORTEX_RC_PROBE_ISSUE",
     ):
         assert variable in runner
+    assert "builder_agy_required" in runner
+    assert "jq -e" in runner
+    assert (
+        "import_secret CORTEX_RC_BUILDER_AGY_AUTH builder agy /run/oauth_creds.json"
+        in runner
+    )
+    assert (
+        "import_fixture builder agy /run/oauth_creds.json" in runner
+    )
 
 
 def test_release_driver_never_calls_live_provider_or_repository_functions(
@@ -1270,6 +1280,21 @@ def test_canary_redaction_profile_requires_every_live_secret(
     (tmp_path / "qualification.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(ValueError, match="protected secret"):
+        redaction.scan(tmp_path, profile="deployment-canary")
+
+
+def test_canary_redaction_covers_optional_builder_agy_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    redaction = _load_redaction_module()
+    for name in redaction.SECRET_ENV:
+        monkeypatch.setenv(name, "base-secret-value")
+    builder_secret = "builder-agy-secret-value"
+    monkeypatch.setenv("CORTEX_RC_BUILDER_AGY_AUTH", builder_secret)
+    candidate = tmp_path / "qualification.json"
+    candidate.write_text(builder_secret, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="credential-like material"):
         redaction.scan(tmp_path, profile="deployment-canary")
 
 

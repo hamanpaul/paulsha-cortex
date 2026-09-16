@@ -273,12 +273,16 @@ def _in_flight_status(
             ).to_dict()
         except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
             git_base = None
+        execution_identity = manager._job_execution_identity(
+            job, identity_source="in-flight"
+        )
+        # ``job_id`` 只來自 execution_identity 的投影（單一來源）。
         in_flight.append(
             {
-                "job_id": job.get("job_id"),
                 "slice_id": job.get("task"),
                 "state": status,
                 "candidate_git_base": git_base,
+                **execution_identity,
             }
         )
     return in_flight
@@ -433,9 +437,20 @@ def build_runtime_status_provider(
                         "gate_status": payload.get("gate_status"),
                         "at": completed_at,
                         "gate_reason": payload.get("gate_reason"),
-                        "job_id": payload.get("job_id"),
                         "branch": payload.get("branch"),
                         "repo": _repo_from_manifest(payload),
+                        **manager._manifest_execution_identity(
+                            registry,
+                            job_id=payload.get("job_id"),
+                            workflow_run_id=payload.get("workflow_run_id"),
+                            workflow_repo=_repo_from_manifest(payload),
+                            workflow_card=payload.get("workflow_card"),
+                            workflow_phase=payload.get("workflow_phase"),
+                        ),
+                        # #265 既有契約：recent_done 的 ``job_id`` 是 manifest 宣告的
+                        # 產出 job，即使 registry 無法背書（identity_source=unknown）
+                        # 也保留；executor／model 等身份欄位仍只來自 registry 投影。
+                        "job_id": payload.get("job_id"),
                     },
                 )
             )

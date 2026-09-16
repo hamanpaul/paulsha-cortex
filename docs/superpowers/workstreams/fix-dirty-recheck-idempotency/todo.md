@@ -1,102 +1,79 @@
 ---
 status: accepted
 work_item: fix-dirty-recheck-idempotency
+domain_breadth: 0
+state_consistency: 1
+invariant_count: 10
+artifact_classes:
+  - source
+  - tests
+  - documentation
 ---
 
-# fix-dirty-recheck-idempotency Todo
+# Dirty recheck 結果未變時的寫入冪等
 
-`#496`：slice 因 `candidate-worktree-dirty` 掛上 `needs_human` 後，manager 每個
-tick 都會重跑同一份 verification，並**無條件**寫入一筆新的 `verification-failed`
-action ＋ 一筆 evidence_history——即使 worktree、candidate、結果、證據位址
-四者全部沒變。實測 5 秒 timer 下約 2 分鐘累積 **33 筆**重複紀錄，`jobs.json`
-在等待 operator 期間無界成長。
+## Boundary
 
-## 現況查核（0816，對 main `48b0205`）
+- Issue：`hamanpaul/paulsha-cortex#496`；正式 work_id 保持不變。
+- `complete_tick` 對 needs_human 且 verification summary 為
+  `candidate-worktree-dirty`／`candidate-worktree-dirty-after-verification` 的 slice
+  刻意重驗，讓 operator 清乾淨 worktree 後能自動脫困；該 recheck 不得移除。
+- 本票只在 recheck 呼叫 `_apply_verification_result` 前判斷是否為真實轉換；
+  不改原語其他呼叫點的語意，不實作 #497 terminal supersession 或 #821 persistence。
+- #501 的 contract／evidence hash 分離已在本次基底：`registry.py` 的
+  `_read_current_verification_evidence_hash`／`_normalize_loaded_slice_verification`
+  與 manager 寫入 `current_verification_evidence_hash` 維持原意。本票不得讀寫
+  `slice_row["verification"]["hash"]` 作為當前 evidence hash，也不重做 #501。
+- 不改不可變 evidence writer／quarantine、fanout gate、tick clock、證據位址或
+  verification runner 的驗證能力。#496 與 #497 各自測試與交付，不建立第三個 bucket-C run。
 
-**缺陷仍完整成立。** 兩段程式碼構成迴圈：
-
-1. `manager.py:1815-1853` —— `complete_tick` 開頭掃 `list_slices()`，對
-   `state == "needs_human"` 且 current evidence summary 落在
-   `{"candidate-worktree-dirty", "candidate-worktree-dirty-after-verification"}`
-   的 slice **刻意**重跑 `verification_runner`。這個 recheck 行為本身是設計意圖
-   （讓 operator 清乾淨 worktree 後能自動脫困），**不是缺陷、不要移除**。
-2. `manager.py:1845-1851` —— 重跑結果經 `_validate_result_evidence()` 後，
-   **無條件**呼叫 `_apply_verification_result(registry, slice_item["slice_id"], validated_ev)`。
-   沒有任何「與現況比對」的閘門。
-3. `manager.py:386-409` —— `_apply_verification_result()` 一律
-   `registry.record_action(...)`（`:395`）＋ `registry.update_slice(...)`（`:404`），
-   本身不具冪等性，也不該由它自己承擔冪等責任（它是「套用一個真實轉換」的原語）。
-
-因此「沒變化」與「有變化」走完全相同的寫入路徑，每 tick 各記一筆。
-
-**放大效應**：`_apply_verification_result()` 同時會把證據 hash 寫進
-`slice_row["verification"]["hash"]`（見 `#501`），所以這個迴圈**每 tick 還會
-重覆污染 contract hash**。`#501` 0812-18:05 留言即由此現場觸發。本張不修那條，
-但實作者需知道兩者共用同一個原語。
-
-### 既有測試覆蓋
-
-`tests/test_pre_candidate_recovery.py:218`
-`test_candidate_worktree_dirty_reevaluation_on_tick` **只覆蓋「結果有變」**
-（dirty → verified，candidate 換新）並斷言轉換發生。**沒有任何測試斷言
-「結果沒變時不得寫入」**——這正是本張要補的缺口。修復不得讓這個既有測試轉紅。
-
-## Scope（明確邊界）
-
-**本 work item 的主體是「recheck 結果未變時的寫入冪等」，不是「recheck 該不該存在」，
-也不是「terminal job 重播治理」。**
-
-- 要做：在套用 recheck 結果**之前**，與當前狀態比對——至少涵蓋 verification
-  evidence hash、`state`、`gate_state`、summary、candidate、
-  `current_evidence_refs` 六者。完全相同就直接 return，**不 `record_action`、
-  不 append `evidence_history`、不 `update_slice`**。
-- 要做：worktree 真的變乾淨、verification 結果真的改變時，**恰好記錄一次**
-  真實轉換（不得因為新增比對而漏記，也不得記兩次）。
-- 要做：保持 fail-closed——證據不可讀、schema 不合法、內容不一致時，
-  維持現行的保守行為，**不得**因為「比對不出差異」就把壞證據當成「沒變化」放行。
-- 可做：若確有觀測需求，另立 `last_rechecked_at` 之類的欄位承載「我有在輪詢」
-  這個事實，**與 lifecycle history 分離**（`#496` 建議驗收最後一條）。
-  這是 optional，不做也可驗收。
-- **不要做**：移除或停用 `manager.py:1815-1853` 的 dirty recheck。它是 operator
-  清理後的自動脫困路徑，移掉會製造新的人工卡點。
-- **不要做**：把冪等閘門塞進 `_apply_verification_result()` 內部去「一次修好所有
-  呼叫點」。該函式另有五個呼叫點（`manager.py:1851`、`1960`、`2046`、`2057`，
-  以及 `1623`／`1638` 的 slice action 路徑），它們的語意是「一個真實轉換剛發生」，
-  在原語層加靜默 skip 會改變那些路徑的行為並可能遮蔽真實轉換。
-  **閘門應加在 recheck 呼叫點（本張現場）**；若實作者評估後仍主張下沉到原語層，
-  必須為上述每個呼叫點補測試證明語意不變。
-- **不要做**：修 `#501` 的 contract／evidence hash 欄位混用、或 `#497` 的
-  superseded terminal job 重播。本張驗收**不得依賴**那兩張是否已落地。
+Spec/design：`docs/superpowers/specs/fix-dirty-recheck-idempotency-{spec,design}.md`。
+本清單保留 #832 全部原 AC；accepted 不代表 product implementation 或 runtime admission。
 
 ## Tasks
 
-- [ ] **冪等閘門**：dirty recheck 套用前與當前 verification hash／`state`／
-      `gate_state`／summary／candidate／evidence refs 比對；一致即 no-op 返回
-- [ ] **真實轉換恰好一次**：worktree 轉乾淨後，脫離 dirty 狀態只產生**一筆**
-      action ＋ 一筆 evidence_history
-- [ ] **fail-closed 保留**：證據不可讀／schema 不合法／與 registry 現況不一致時，
-      不得被冪等閘門誤判為「沒變化」而靜默略過
-- [ ] **（optional）觀測分離**：如需呈現「仍在輪詢」，以獨立欄位承載，
-      不寫進 lifecycle action／evidence_history
-- [ ] **測試**：
-      - 對未變的 dirty worktree 連續呼叫 `complete_tick` N 次（N ≥ 5），
-        斷言 action 數與 evidence_history 數**完全不變**（`#496` 建議驗收第 5 條）
-      - tick 之間把 worktree 清乾淨，斷言**恰好一次**脫離 dirty 的轉換
-        （`#496` 建議驗收第 6 條）
-      - 既有 `test_candidate_worktree_dirty_reevaluation_on_tick` 維持綠燈
-      - 證據檔被破壞／不可讀時仍 fail-closed，不因冪等閘門而放行
+- [ ] **T01 source／D01**：在 `complete_tick` dirty recheck 中，先以 `_validate_result_evidence` 驗證新
+      evidence，再在 `_apply_verification_result` 呼叫點建立 no-op 閘門；不把
+      所有呼叫者的去重責任下沉到 `_apply_verification_result`。
+- [ ] **T02 source／D02**：比較 canonical 內容 hash 與 slice 的 `current_verification_evidence_hash`，
+      並比較預期 state／gate_state、summary、candidate 與 current evidence refs；
+      全部一致才略過。只有 ref path 相同不能判成未變；合法 hash 缺失或目前證據
+      不可解析不能當成相等。若內容相同但需修正 slice 狀態／引用，仍作一次真實轉換。
+- [ ] **T03 source／D03**：相同結果不 `record_action`、不追加 evidence_history、不 `update_slice`；
+      驗證仍確實執行。若需要 last_rechecked_at 觀測，與 lifecycle history 分離，
+      屬 optional；不能藉此恢復每 tick 的歷史 append。
+- [ ] **T04 source／D04**：hash／status／gate_state／candidate／summary／refs 任一真實變更，沿原路徑
+      記錄恰好一筆 action 及 evidence_history，更新 current evidence hash；下一次
+      相同結果即 no-op。不改 contract verification hash。
+- [ ] **T05 source／D05**：`_validate_result_evidence` 對不可讀／schema 不合法／payload mismatch 失敗時
+      維持既有保守錯誤處理，不放行為成功、不視為證據未變；不得以 catch-all equality
+      或空值相等遮蔽壞證據。
+- [ ] **T06 tests／D06**：新增 `tests/test_dirty_recheck_idempotency_496.py` 或等價 focused 檔案，沿
+      `tests/test_pre_candidate_recovery.py::test_candidate_worktree_dirty_reevaluation_on_tick`
+      fixture：fake verification runner 回當前相同候選／內容，連續10次
+      `complete_tick`，斷言 runner 仍被呼叫、action/history 數從既有基準完全不變、
+      current evidence hash 不變；修前應 RED，不用降低 history limit 偽造不增長。
+- [ ] **T07 tests／D07**：同一 fixture 在第K次改回傳證據 details，維持同 path 但 canonical hash 改變；
+      斷言只增加一筆 action/history 且 hash 更新，後續 ticks 不再增加。此為受控
+      測試 evidence fixture，不授權生產 writer 覆寫既有不可變證據。
+- [ ] **T08 tests／D08**：另測 dirty→verified、candidate 改變、gate_state 或 refs 不一致修復，每次真實
+      轉換恰好一次；原 `test_candidate_worktree_dirty_reevaluation_on_tick` 保持綠燈。
+      不要求此測試依賴 #497 或 #821 已實作。
+- [ ] **T09 tests／D09**：壞檔／不可讀／payload mismatch 均保持 fail-closed；contract hash 不受 recheck
+      改動。沿既有 #501 normalization 測試確認舊資料讀取相容，不重寫 migration。
+- [ ] **T10 documentation／D10**：新增本正式 work_id 對應的 changelog fragment，同步
+      `CHANGELOG.md [Unreleased]`；記錄 RED／GREEN、必要完整 gates、獨立 review、
+      正確 HEAD merge 與 runtime 重複 tick 的 evidence/history delta。進件 accepted
+      不代表任何測試或部署已完成。
 
-## 現場紀錄（供實作者參考）
+- [ ] **T11 documentation／CLI**：在既有 recovery 文件補 dirty polling 與 lifecycle transition 的區別，未變結果不追加歷史；以候選環境從 checkout 外實跑 `python3 -m paulsha_cortex.cli work start --help`、`python3 -m paulsha_cortex.cli run work --help`，保存 exit/output。無新增 action，help 未變也實測，不呼叫 live manager。
+- [ ] **T12 tests／intake and delivery gates**：純函式檢查 accepted 三件組、source/tests/documentation surface 與 changelog/CLI/test/doc 契約；依實際 packaged fix-standard 及原 domain/state 計分。先 focused 再 full pytest/CI/PR-context policy、git diff --check；Red 不直接派 build，#831 後以實際 runtime 重算，不回填歷史 band。
 
-- issue `#496` 首則：slice `task-3-private-repo-and-forbidden-documentation-scan-build`、
-  candidate `0c9faff9…`，5 秒 timer 下
-  `2026-08-12T14:12:06.381861Z` → `14:14:02.820132Z` 約 **116 秒累積 33 筆**
-  `verification-failed` action ＋ 33 筆 evidence_history，worktree／candidate／
-  結果／證據位址全程未變
-- issue 首則的 root cause 段已精準點出
-  「`_apply_verification_result` always record_action and update_slice.
-  There is no comparison against the current verification hash, status, summary,
-  candidate, or refs」——0816 複查確認這段描述與 main 現況逐字相符
-- 本張與 `#501`／`#497` 同屬「桶C slice 迴圈家族」。三者的關係：
-  `#497` 是重播**來源**、`#496` 是 recheck **迴圈**、`#501` 是兩者共用的
-  **污染原語**。三張各自獨立可驗收，不得合併修
+## Evidence
+
+- issue #496 的歷史現場為約116秒增加33筆 verification-failed action/history；
+  該量測不等於這次 host 的最新值。成因是 `_apply_verification_result` 呼叫
+  `record_action` 無條件追加，不是 `update_slice` 自己追加 history。
+- #497 消除不該進入 completion 的舊 attempt；本票消除合法 dirty recheck 中未變
+  結果的重複寫入；#501 已分離 contract/evidence hash；#821 管控檔案與 history 大小。
+  各項完成狀態必須獨立驗證。

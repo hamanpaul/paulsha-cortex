@@ -16,9 +16,10 @@ registry 檔案、不改任何 `.py`**；實際登錄由 `#452` B（schema v2→
   `MODEL_CHAIN_PERSONAS`，`#205` 已凍結，claim 時整條鏈一次解析）。
 - executor 五家族：`copilot`／`claude`／`codex`／`agy`／`cg`
   （`paulsha_cortex/coordinator/launcher.py:783-789` `_ARGV_BUILDERS`，唯一真相來源）。
-- packaged registry（`paulsha_cortex/coordinator/data/model-identities.yaml`）現況**只有一個身分**：
-  `agy` / `gemini-3.1-pro-high` / `google` / `capabilities: [planning]` / `live_probe: agy-plan-sandbox`。
-  沒有任何身分帶 `build` 或 `review` capability（與 `#209` spec R6 的現況更正一致）。
+- packaged registry（`paulsha_cortex/coordinator/data/model-identities.yaml`）現況**只有一個 agy 身分**：
+  `agy` / `gemini-3.1-pro-high` / `google` / `capabilities: [planning, review]` /
+  `live_probe: agy-plan-sandbox`。packaged roster 中沒有任何 agy 身分帶 `build` capability
+  （build 僅 copilot／claude／codex 具備）。
 - 至今**沒有任何真模型跑完整 patchmud deck 的實測樣本**（`#455` 現況），因此本矩陣沒有
   「已實測」格；全部非排除格皆為「待 benchmark」。
 - 引用之行號以 main @ `ea76673`（v0.1.6）為準，行號可能隨後續 commit 漂移；引用時以
@@ -26,13 +27,13 @@ registry 檔案、不改任何 `.py`**；實際登錄由 `#452` B（schema v2→
 
 ## Requirements／決策
 
-### R1 硬約束排除清單（4 格，先於 benchmark 定案，逐格附程式碼依據）
+### R1 packaged baseline 硬約束排除清單（4 格，先於 benchmark 定案，逐格附程式碼依據）
 
 | # | 排除格 | 依據（建構期或 argv 層即不可達） |
 |---|---|---|
 | 1 | `copilot` × planner | `SubprocessLauncher.__init__`（`launcher.py:815-816`）：`(read_only or review_only) and executor == "copilot"` → raise「copilot executor has no enforced read-only planning mode」；`build_copilot_argv`（`launcher.py:496-497`）同樣拒絕。無法提供唯讀保證的 executor 不得任 planner。 |
 | 2 | `copilot` × reviewer | 同上——該檢查對 `review_only` 一併拒絕，`as_review_only()` 對 copilot 必在建構期 raise。注意：ship 階段的「copilot delivery review」gate（`workflow.py:566-568` `delivery_reviews = {"copilot", "maintainer-review"}`、`delivery.py` 的 copilot loop）是 **PR 層的 current-HEAD delivery review**，不是 reviewer persona 的 launcher 巷道，兩者不可混淆；本格排除的是後者。 |
-| 3 | `agy` × builder | `build_agy_argv`（`launcher.py:667-691`）docstring 明載「the only supported Antigravity invocation: headless plan+sandbox」，argv 固定 `--mode plan --sandbox`，且 `allow_unsafe` 建構期 raise（`launcher.py:686-687`、`launcher.py:811-812`）；`launch()` 的 `commit_required` kwarg 只 plumb 給 `{codex, copilot, claude, cg}`（`launcher.py:991`），agy 完全沒有寫入／commit 形態的 invocation → builder persona 結構性不可達（candidate 永遠無新 commit）。註：此排除是 argv 層 de-facto，`SubprocessLauncher.__init__` 尚無 agy-builder 建構期 guard；補 guard 屬可選 follow-up，非本票範圍。 |
+| 3 | `agy` × builder（packaged fallback） | packaged roster 未宣告 `build` capability，因此 packaged fallback 不會把 agy 選為 builder；此閘控住在 roster 選擇（`manager._workflow_identity_candidates_for_persona`），launcher 本身不查 capability。#799 另提供 host overlay 明示 `build` 時的 `accept-edits` launcher；ad-hoc 直接指定 `executor: agy` 且具 provisioned worktree 的 builder 語境仍會得到 `accept-edits` 可寫形態。該 overlay opt-in 不改 packaged baseline，也不把未驗證的 builder capability 寫入 roster。 |
 | 4 | `cg` × builder | cg 是 zero-tool（`build_cg_argv` docstring，`launcher.py:703-754`：wrapper 自帶 `--available-tools=__none__`＋`--disable-builtin-mcps`＋throwaway HOME，不能跑 tool／寫檔／commit）。建構期三重 fail-closed：`allow_unsafe` raise（`launcher.py:735-736`、`813-814`）、`commit_required` raise（`launcher.py:737-738`）、builder 語境（`read_only`／`review_only` 皆 False）raise（`launcher.py:739-740`、`820-821`）。`#442` 已確認「補 cg builder」這條路走不通。 |
 
 ### R2 (executor, persona) 候選矩陣定案（5×3 = 15 格）
@@ -42,7 +43,7 @@ registry 檔案、不改任何 `.py`**；實際登錄由 `#452` B（schema v2→
 | `copilot` | **硬約束排除**（R1-1） | 待 benchmark | **硬約束排除**（R1-2） |
 | `claude` | 待 benchmark | 待 benchmark | 待 benchmark |
 | `codex` | 待 benchmark | 待 benchmark | 待 benchmark |
-| `agy` | 待 benchmark | **硬約束排除**（R1-3） | 待 benchmark |
+| `agy` | 待 benchmark | **packaged fallback 不可達；host overlay 明示 `build` 後由 #799 launcher 可達** | 待 benchmark |
 | `cg` | 待 benchmark¹ | **硬約束排除**（R1-4） | 待 benchmark |
 
 已實測（patchmud）：**0 格**（`#455` 現況：無任何真模型完整 deck 樣本）。生產 dogfood 實跑紀錄
@@ -76,7 +77,7 @@ benchmark 結果是日後決定是否擴充優先序的依據。
 
 | executor | model_id | independence_domain | capabilities | model_id 出處（repo 內） |
 |---|---|---|---|---|
-| `agy` | `gemini-3.1-pro-high` | `google` | `[planning, review]` ＋ `live_probe: agy-plan-sandbox` | `model_identities.py:20` `AGY_MODEL_ID`；packaged registry 既有身分（本票僅追加 `review` 候選 capability，改動落在 packaged 檔案，不觸發 shadow 檢查） |
+| `agy` | `gemini-3.1-pro-high` | `google` | `[planning, review]` ＋ `live_probe: agy-plan-sandbox` | `model_identities.py:20` `AGY_MODEL_ID`；packaged registry 既有身分（#799 的 `build` 僅能由 host overlay 明示，不改 packaged roster）。此閘控住在 roster 選擇（`manager._workflow_identity_candidates_for_persona`），launcher 本身不查 capability；ad-hoc 直接指定 `executor: agy` 且具 provisioned worktree 的 builder 語境仍會得到 `accept-edits` 可寫形態。 |
 | `copilot` | `gpt-5.4` | `openai` | `[build]` | `docs/superpowers/plans/2026-07-21-v0.1.0-release-plan.md:12`（builder：copilot CLI / gpt-5.4）；`docs/superpowers/workstreams/add-cortex-version-flag/todo.md:11` 等多處派工紀錄 |
 | `claude` | `sonnet` | `anthropic` | `[planning, build, review]` | `docs/superpowers/plans/2026-07-21-v0.1.0-release-plan.md:12`（ForeignReview：claude / sonnet）；claude CLI `--model` 接受 `sonnet` 別名（`build_claude_argv` `--model` 原樣透傳，`launcher.py:600-601`）。完整版本 pin **待確認**（見 R4） |
 | `codex` | `gpt-5.3-codex-spark` | `openai` | `[planning, build, review]` | `docs/superpowers/workstreams/fix-mutation-request-timeout/todo.md:11`、`terminal-result-contract/todo.md:11` 等多處派工紀錄 |
@@ -94,6 +95,9 @@ benchmark 結果是日後決定是否擴充優先序的依據。
 - **agy planning 綁定**：任何 `agy` 身分若帶 `planning` capability，MUST 為
   `independence_domain: google` ＋ `live_probe: agy-plan-sandbox`
   （`model_identities.py:147-151` fail-closed）。
+- **agy builder opt-in（#799）**：`build_agy_argv` 的 `accept-edits` 形狀只適用於
+  provisioned worktree；registry 的 `build` capability MUST 來自明示的 host overlay。
+  這不會提升 packaged fallback 的 capability，也不代表已完成 benchmark。
 
 ### R4 待確認 model_id（不登錄、不計入 N；查不到依據的一律不發明）
 
@@ -101,7 +105,7 @@ benchmark 結果是日後決定是否擴充優先序的依據。
 |---|---|---|
 | `agy` / `gemini-3.6-flash-high`（review 候選） | `docs/superpowers/workstreams/cost-governance-cluster/todo.md:135`（三身分表，與 packaged registry 矛盾、`#209` spec R6 已記錄未收斂）；`driving-cortex-skill/todo.md:12`（ForeignReview 計畫） | 需 `agy models` 實測確認 CLI token 在列才可登錄。**即使確認，也只登 `review` capability、不得登 `planning`**：`probe_agy_capability`（`model_identities.py:352,360`）寫死只驗 `AGY_MODEL_ID`，第二個 agy planning 身分會通過 registry 驗證卻拿不到真 live probe 覆蓋（假覆蓋）。確認後 reviewer 格 +1 → N+1。 |
 | `codex` / `gpt-5.4-codex` | 僅 `docs/superpowers/plans/feat-slice-executor-model.md:13` 的測試 fixture 例示 | 非實跑紀錄，不足為據；確認實際可用後依 R2 codex 列（3 個非排除格）→ N+3。 |
-| `claude` / `sonnet` 的完整版本 pin | `cost-governance-cluster/todo.md:135` 的 `claude-sonnet-4-6` 掛在 executor `agy` 之下（且該表與 packaged registry 矛盾、agy builder 已被 R1-3 排除），不可移植為 `claude` executor 的依據 | 先以別名 `sonnet` 登錄（CLI 接受），版本 pin 由 benchmark run 的 provenance 記錄實際解析到的模型版本，之後再決定是否改登 pinned id。 |
+| `claude` / `sonnet` 的完整版本 pin | `cost-governance-cluster/todo.md:135` 的 `claude-sonnet-4-6` 掛在 executor `agy` 之下（且該表與 packaged registry 矛盾；agy builder 在 packaged fallback 不可達（R1-3），host overlay 明示 `build` 後由 #799 launcher 可達），不可移植為 `claude` executor 的依據 | 先以別名 `sonnet` 登錄（CLI 接受），版本 pin 由 benchmark run 的 provenance 記錄實際解析到的模型版本，之後再決定是否改登 pinned id。 |
 
 ### R5 `independence_domain` 填法與 builder/reviewer 分離相容性
 
@@ -115,7 +119,8 @@ benchmark 結果是日後決定是否擴充優先序的依據。
 
 相容性檢核（依 R3 roster）：
 
-- builders：`copilot`(openai)、`claude`(anthropic)、`codex`(openai)。
+- packaged builders：`copilot`(openai)、`claude`(anthropic)、`codex`(openai)。
+  `agy` 僅在 host overlay 明示 `build` 時加入 builder lane，不屬 packaged roster。
 - reviewers：`claude`(anthropic)、`codex`(openai)、`agy`(google)、`cg`(zhipu)。
 - 每個 builder 都存在至少一個異 domain reviewer → roster 與 ship 前檢查相容。
 - **不可配對（同 domain，ship 必拒）**：`copilot` builder × `codex` reviewer、
@@ -156,7 +161,8 @@ benchmark 結果是日後決定是否擴充優先序的依據。
 | builder | `copilot/gpt-5.4`、`claude/sonnet`、`codex/gpt-5.3-codex-spark` | 3 |
 | reviewer | `claude/sonnet`、`codex/gpt-5.3-codex-spark`、`agy/gemini-3.1-pro-high`、`cg/glm-5.2` | 4 |
 
-**N = 11**（15 格 − 硬約束排除 4 格；已實測 0 格）。
+**N = 11**（packaged baseline：15 格 − 硬約束排除 4 格；已實測 0 格）。#799 的
+host-overlay agy builder opt-in 不計入這份 packaged benchmark 基線。
 
 分期註記：`pilot-v1` 現況只量得到 builder 維度（`#452` 邊界明載，題庫票
 `hamanpaul/paulsha-patchmud#13` 未落地前 planner／reviewer 停在預設窗口），故**現階段可

@@ -181,7 +181,9 @@ def test_current_runbook_holds_maintenance_lease_before_service_snapshot() -> No
     ):
         assert f'"{field}"' in current
     assert 'token = document["maintenance_token"]' in current
-    assert current.count('--maintenance-token "$cortex_maintenance_token"') == 8
+    # The optional builder/AGY import adds one plan-gated mutation command;
+    # the default four credential imports remain unchanged.
+    assert current.count('--maintenance-token "$cortex_maintenance_token"') == 9
     assert "cortex_acquire_maintenance_lease()" in current
     assert current.count("cortex_acquire_maintenance_lease") == 2
     receipt_binding = 'document["receipt_path"] != sys.argv[3]'

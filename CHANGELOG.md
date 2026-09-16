@@ -21,6 +21,150 @@
   rollback 失敗診斷會逐檔綁定自身 backup、區分遷移前不存在的檔案與只存在於記憶體中的
   `previous`，並記錄每一檔 restore 結果；restore 使用同目錄暫存檔 atomic replace 並保留
   原檔 mode，project config loader 會保留原始驗證例外與原因。
+- **#824 AGY print timeout**：launcher 現在會解析 `PSC_AGY_PRINT_TIMEOUT` 或既有 gate
+  timeout fallback，對所有 AGY headless argv 形態顯式加入 canonical
+  `--print-timeout <Ns>`，並在 direct launch／capability probe 前 fail-closed
+  拒絕非法或超界設定。
+- **#904：R3 testpilot case 素材盤點第二輪收斂**：`docs/superpowers/workstreams/r3-testpilot-case-corpus/{case-candidates.md,todo.md}`
+  補齊 08-12 波 6 張 issue 深讀、`github_delivery.py` 五個 ship／delivery 表面與 porcelain
+  穩定／繞過分群；候選清單更新為 **109** 筆，`evidence-insufficient` 收斂為 **31** 筆，並補上
+  T1 首批決定與 `EvidenceAttestation`／harness 契約備註。
+- **`.cortex/work-items.yaml` 補登錄 33 個 work item 的 `github_issue` link**：31 個管線外
+  交付、只剩規劃文件殘留者綁定原交付 issue（6 個無專屬 issue 者以 closeout 票 `#898`–`#903`
+  作結案紀錄），清掉 `not_claimable` 的 `missing_issue` 反覆觀測（`#895` 治標）；
+  `agy-print-timeout-only` 綁 `#824`、`r3-testpilot-case-corpus` 綁第二輪承接票 `#904`
+  交由管線派工；另還原 `#879`／`#880`／`#828` 三筆未提交的本機登錄。
+- **#879 monitor 檔案事件 convoy 修正**：project filesystem event 改由單一 refresh
+  worker 以每 project 一份 pending 標記合併 debounce，同輪只做一次 watch/work-model
+  publication，事件 callback 不再建立無界 `Timer` 執行緒；新增
+  `monitor.thread_count_warn_threshold`（預設 `200`），thread count 警告以 60 秒節流，
+  並保留 workspace event 的全量 refresh 語意與 stop 後 late event 拒收。
+- **Quota observation 純資料核心進件（#866）**：納入 #836 A 的 accepted 三件組、
+  自有 OpenSpec 與原生單位／未知 coverage 契約；未歸戶 usage 不捏造 account/pool。
+  本批只有規劃，現行 7/Red 不派工；來源 adapter、ledger、forecast、reservation
+  與跨獨立額度池 fallback 仍須後續正式交付，不硬編 model/agent/native effort。
+
+
+- **Claude builder 命令授權（#480 部分修復）**：commit-required job 使用 per-job 最小 Git 與精確 Python 測試 allowlist，保留 `acceptEdits` 與既有事件／路徑設定，解除無人可核可的測試／提交阻塞。
+
+
+- **#822：YAML inline list 保留引號元素**：zero-dependency YAML subset parser 現在以
+  quote-aware tokenizer 讀取 flow list，含逗號或 `]` 的 `argv` 元素、單／雙引號內的反斜線跳脫與尾逗號
+  可正確 round-trip；前導／中間空元素與未閉合引號會以 `malformed inline list` 拒絕。
+
+
+- **#828 regression coverage：** 新增 workflow status execution-identity regression tests，鎖定 registry job 綁定與 planned／actual／last execution 的可區分投影（原以 RED 設計，已由同一 PR 的 producer 修正轉綠）。
+
+- **#828 producer GREEN：** workflow `in_flight`、`attention` 與 `recent_done` 現在從明確的 registry job run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；無 job 時保留 planned 或 unknown，不從 phase／persona 推測實際模型。另提供去識別化 status snapshot fixture 與 producer/consumer 欄位契約，供下游驗收使用。
+
+
+- **Terminal JSONL framing 實作（#860）**：Manager terminal parser 以保留換行的 UTF-8 reader
+  和 literal LF record framing 保真處理 CRLF 與 Unicode JSON string data，維持既有
+  terminal carrier、schema 與 fail-closed 邊界；補齊 framing／carrier／recovery 負例、
+  incident-shaped byte oracle 與 lifecycle 邊界文件。OpenSpec archive、remote CI、PR／
+  merge、issue closure 與 live qualification 仍為下游 pending。
+
+
+- **#823 headless launcher session**：共用 headless `Popen` kwargs 現在建立獨立
+  session/process group，保留 Claude stdin 與既有 runner override/retry 契約；補齊
+  direct／systemd-run／systemd-template 的 14 格合法接線回歸與 ownership-first 負控制，
+  並明示 cgroup、restart、#824 與 #851 的未承接邊界。
+
+- **#888 AGY reviewer schema 改寫成 Gemini 相容子集**：#880 帶入的 `--json-schema` 含整數 enum／null type／map 型別，Gemini function declaration 直接 400 或改寫 `authority_hashes` 鍵名；launcher 以 `_gemini_compatible_schema` 改寫（整數單值 enum → minimum/maximum、null type → nullable、字串鍵 map → `[{key, value}]`），Manager 剝掉 agy structured output 的 `toolAction`／`toolSummary` 中繼鍵並把 key/value 陣列摺回 mapping。Claude 契約仍是唯一來源。
+
+
+
+- 修正架構交付誤用說明頁：canonical HTML 改回原版 Archify SVG；新增節點／方向箭頭與流程／條件修正回路驗收，不再以文字頁測試冒充架構圖。
+
+- 架構 HTML 驗收：補齊 Persona／Monitor／Manager 權責、16 元件／22 關係、feature-oneshot 七階段與恢復／狀態模型；加入 README 入口及 source／HTML／browser 回歸驗證。不改 runtime 行為。
+
+- **#831 stability-risk-v2**：修正 planning sizing 的 `spec_stability` 方向；完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind／blocking marker／未 accepted artifact 為 2，並以保守 2 處理 unknown 或不一致 report。其他 sizing 維度、band 門檻、fail-soft 邊界與歷史資料不變；補齊隔離 history/evidence reload、完整 `WorkflowRun` baseline（含 legacy sizing 欄位缺席語意）與真實 frozen-plan bytes/SHA fixture，以及 current snapshot score+band matrix 回歸覆蓋，不新增 schema 或 migration。
+
+
+
+- **Recovery registry 子計畫進件（#862）**：納入 #497 的 registry-only A，保留
+  exact CAS／ABA revision、prepared/complete、atomic receipt 與顯式 legacy checkpoint
+  九組不變量。只有 accepted 規劃，現行 8/Red 不派工；公開 recovery／父項仍未完成。
+
+- **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
+  子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。
+  本項只有規劃進件；既存 generic carrier 殘餘與產品、部署驗收保持分帳。
+
+
+
+- **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
+
+
+
+- **Launcher／watcher 子計畫進件**：補齊 #823 session-only 三件組與唯一 owner links，
+  登錄 #853 有界 watcher A child。真 process-group 與 cgroup 邊界、raw0／generation／
+  partial-scan／nonfollow 驗收完整列管；現行 sizing 6／8 與正式產品交付分開。
+
+- **AGY 前置契約進件**：登錄 #851 probe argv 例外隔離，#824 timeout 拆為獨立候選，
+  保留 #823 session/cgroup 邊界。#824 依賴未完成，移除母件重複 owner 並暫不登錄
+  可 claim child；真 completeness 阻擋與 surface-only Yellow gate 分帳，不依自訂欄位假鎖派工。
+
+- **#851 AGY probe 建構 containment**：將 capability probe 的 `build_agy_argv(...)`
+  例外納入既有 smoke 失敗邊界；建構失敗只回傳 `smoke-failed` 的 AGY not-ready
+  結果，不中斷非 AGY primary 的後續 runtime 建構。
+
+
+
+- **有界核心 child 進件**：登錄 #849 可擴充 execution-profile schema／canonical key，
+  與 #850 跨程序 backoff store／immutable event fold；補 byte-level oracle、資源上限及
+  真 process-death 測試契約。獨立審查通過，現行 sizing 仍為 7／8 Red，
+  不把規劃登錄、機械 gate 或 #831 投影當成產品／派工／資格完成。
+
+- **Evidence／profile 進件**：補 #496/#497/#821 的 accepted 三件組與 #835 可擴充
+  execution-profile／原生 effort／歷史 unknown 契約，保留 Red 真分數、writer ownership、
+  archive 與 PatchMUD/#842 外部資格邊界；只交規劃，不宣稱產品、量測或部署生效。
+
+- **Refine P1 runtime 進件**：補 #819/#825/#827 accepted spec/design、保留全部
+  原驗收並列真實 Red sizing／人工拆分；補限流事件亂序、寫入故障與到期去重負例。
+  將 #835–#845 的 profile、quota、資格、recovery 與交付責任納入總帳；
+  此項為規劃交付，不代表任何產品修正或 runtime gate 已完成。
+
+- **Refine bootstrap 進件**：補 #831 stability 風險方向與 #830 非 Job 派工決策的
+  accepted 三件組、真實 sizing 與純 gate 驗證；#833 獨立列管 Red planner 接續。
+  記錄 #832 規劃合併及 B2–B5 既有能力／待補 child 對照，不宣稱產品修正已交付。
+
+- **十四類 Cortex 精修進件（#829）**：收斂完整分批計畫、OpenSpec 驗收契約、動態
+  execution profile／額度觀測與預估／fallback 邊界；PatchMUD producer 由獨立 #37
+  列管。補齊 P1 canonical todo 與 #496／#497 校正，保留 #828 獨立工作所有權。
+  此項只交付規劃與進件，不宣稱產品修正、測試或部署完成。
+
+- **#807 agy headless terminal 改走 JSON envelope 並剝除前導文字**：`build_agy_argv` 對
+  planner／reviewer／verifier／builder 所有 agy headless 形態一律附加 `--output-format json`，
+  讓 terminal 證據落成單行 JSON envelope；Manager `_extract_terminal_json` 與
+  planning_runtime `_ENVELOPE_KEYS` 新增接受 agy envelope 的 `response` 鍵，
+  `_parse_terminal_json_text` 只在 json code fence 為回應尾綴時剝殼、並在 agy 前綴進度文字時
+  只採信回應尾端的完整 terminal payload（內嵌範例 fence 與任意內嵌 JSON 仍拒絕）。status
+  enum 別名與 rate-limit 同 identity 重試不在本次範圍。
+
+- **Trust Root AGY builder 契約（#805）**：four-way generator、install attestation 與
+  builder credential import 現在支援明示的 AGY builder grant；Trust Root hardened runner
+  （`PSC_JOB_RUNNER` 為非 `direct`）的 model resolution、doctor 與 dispatch preflight 會在
+  launch 前拒絕缺少 launcher、toolchain 或 credential 任一層的 persona–executor 契約，
+  direct mode 保留既有 operator overlay 相容性，且 packaged roster 不宣傳 AGY build
+  fallback。
+
+- **#805 deployment-canary credential wiring**：qualification harness 現在以 install plan 的
+  `required_credentials` 為唯一判準，只有 host overlay 明列 `(builder, agy)` 時才匯入獨立的
+  `CORTEX_RC_BUILDER_AGY_AUTH`；plan 解析失敗會 fail closed，release default 不變，canary
+  redaction scan 也會涵蓋這份 optional credential。
+
+- **#802：fix-standard 的 planning publication 現在對 spec／design／plan 使用
+  work-item-bound canonical destinations，即使 combo manifest 沒有
+  `brainstorming` card 也能落地三件套；內容型 planning failure 的
+  `needs_human` 回應同步提供補件、`abandon` 與重新 intake 的下一步提示，
+  並將提示持久化在 `needs_human_reason` payload；補齊多 combo、路徑邊界與
+  超長提示的回歸保護。`DiagnosticReason` 以加法欄位 bump 至 schema v2，
+  仍相容讀取缺少 `next_step_hint` 的 v1 payload；這是單向遷移，已寫入 hint
+  記錄後不可將 Manager 降級回不認得該欄位的舊版本；三條 operator hint 分支改用
+  正體中文，保留內嵌的 `cortex work abandon` 指令；kind-bound 判定以 accepted
+  basename glob 比對，並由四段相對路徑、目錄家族與正規化守衛限制作用範圍；包含
+  work item 的合法 slug 不得因 combo manifest 缺少 brainstorming 而被拒。**
+
 - **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
   最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留
   missing／pending／failure fail-closed，同時不再讓事故留下的第三方歷史 check 永久阻擋
@@ -32,6 +176,14 @@
   加入非 transactional runtime scaffold fixture，避免合法 retained state 被誤判為 unknown。
   Policy Check 同步監聽 PR `edited`／`labeled`／`unlabeled` 事件，讓 release／exemption label、
   標題或 checklist 的變更都會以最新 metadata 重新判定。
+
+- **#799：agy 支援 builder 派工**：agy builder 現在使用 `accept-edits` 並將權限限制在
+  provisioned worktree；明確 `allow_unsafe` 才附加 `--dangerously-skip-permissions`，
+  `commit_required` 也會傳遞 linked-worktree Git metadata 放行；write-forbidden builder
+  維持嚴格 `plan+sandbox`，並以唯讀 `--add-dir` 檢視 provisioned worktree；registry 宣告 `build` capability
+  的 host overlay 有／無兩種 fixture 皆由測試釘住 direct launcher 的 writable argv 形狀，
+  capability 閘控維持在 packaged/host roster 選擇，packaged fallback roster 維持既有
+  planner／reviewer 形態。
 
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
   依 artifact category 分辨真正註解，shebang、`;`-prefixed shell、polkit `#`／未閉合

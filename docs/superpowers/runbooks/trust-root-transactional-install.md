@@ -747,8 +747,11 @@ exact token 清除可能殘留的 marker。
 
 ## 4. 明確匯入所需 credentials
 
-只匯入 plan 的 `required_credentials` 列出的項目。下列四個 source path 必須由 operator
-逐一指定到正確檔案；不要從任何 HOME 自動探索，也不要把 secret 值放進環境變數或命令列。
+只匯入 plan 的 `required_credentials` 列出的項目。預設 release／canary config 需要下列四個
+source path；若 host overlay 將 builder executor 選為 AGY，plan 會再列出
+`(builder, agy)`，此時必須另外指定第五個、與 reviewer 完全分離的 AGY source path。所有
+source path 都必須由 operator 逐一指定到正確檔案；不要從任何 HOME 自動探索，也不要把
+secret 值放進環境變數或命令列。
 
 ```bash
 cortex_builder_codex_source=/absolute/operator-selected/path/auth.json
@@ -767,6 +770,17 @@ cortex_root_cli install trust-root credentials import --receipt "$cortex_receipt
   --maintenance-token "$cortex_maintenance_token"
 cortex_root_cli install trust-root credentials import --receipt "$cortex_receipt_path" \
   --principal manager --provider github --source "$cortex_manager_github_source" \
+  --maintenance-token "$cortex_maintenance_token"
+```
+
+若人工 review 確認 plan 的 `required_credentials` 額外列出 `(builder, agy)`，才另外執行
+下列一筆 import。source basename 必須符合 AGY credential allowlist，且內容不可與
+`reviewer-planner` 的登入態共用；若 plan 沒有這一列，這筆命令應保持不執行。
+
+```bash
+cortex_builder_agy_source=/absolute/operator-selected/path/oauth_creds.json
+cortex_root_cli install trust-root credentials import --receipt "$cortex_receipt_path" \
+  --principal builder --provider agy --source "$cortex_builder_agy_source" \
   --maintenance-token "$cortex_maintenance_token"
 ```
 

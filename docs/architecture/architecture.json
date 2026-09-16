@@ -1,0 +1,1263 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Cortex｜WorkflowRun、Card 與 Job",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hamanpaul/paulsha-cortex",
+      "revision": "739cde17b5b891bcdd575cb98ea07280f428ebaf",
+      "provider": "github"
+    },
+    "viewBox": [
+      1390,
+      825
+    ]
+  },
+  "components": [
+    {
+      "id": "candidate-worktree",
+      "type": "database",
+      "label": "Candidate / Worktree",
+      "sublabel": "Builder 的受測 HEAD",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        },
+        {
+          "path": "paulsha_cortex/deck/data/cards.yaml",
+          "line": 62,
+          "end_line": 105
+        }
+      ],
+      "pos": [
+        1130,
+        170
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "completion-record",
+      "type": "database",
+      "label": "CompletionRecord",
+      "sublabel": "全部完成才發證",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 48,
+          "end_line": 50
+        }
+      ],
+      "pos": [
+        250,
+        550
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "control-queue",
+      "type": "messagebus",
+      "label": "CLI Queue",
+      "sublabel": "start / resume / retry",
+      "sources": [
+        {
+          "path": "README.md",
+          "line": 412,
+          "end_line": 414
+        }
+      ],
+      "pos": [
+        690,
+        30
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "deck-compiler",
+      "type": "backend",
+      "label": "Deck",
+      "sublabel": "Card + Combo → Manifest",
+      "sources": [
+        {
+          "path": "paulsha_cortex/deck/compile.py",
+          "line": 483,
+          "end_line": 523
+        },
+        {
+          "path": "paulsha_cortex/deck/data/combos/feature-oneshot.yaml",
+          "line": 1,
+          "end_line": 35
+        }
+      ],
+      "pos": [
+        470,
+        30
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "delivery-closure",
+      "type": "backend",
+      "label": "Delivery / Closure",
+      "sublabel": "merge 後重驗遠端",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 50
+        }
+      ],
+      "pos": [
+        690,
+        550
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "gate-evidence",
+      "type": "database",
+      "label": "Gate Evidence",
+      "sublabel": "各 gate 分別綁定",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 6281,
+          "end_line": 6348
+        },
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 274,
+          "end_line": 303
+        }
+      ],
+      "pos": [
+        875,
+        350
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "headless-executors",
+      "type": "external",
+      "label": "AgentInstance",
+      "sublabel": "執行任務、回傳結果",
+      "sources": [
+        {
+          "path": "README.md",
+          "line": 21,
+          "end_line": 21
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        }
+      ],
+      "pos": [
+        910,
+        170
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "job-attempt",
+      "type": "database",
+      "label": "Job / Attempt",
+      "sublabel": "單卡 0..N 次；含本地稽核",
+      "sources": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9459,
+          "end_line": 9460
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9964,
+          "end_line": 9997
+        }
+      ],
+      "pos": [
+        610,
+        460
+      ],
+      "size": [
+        140,
+        65
+      ]
+    },
+    {
+      "id": "manager",
+      "type": "backend",
+      "label": "Manager",
+      "sublabel": "選當前 Card；驗證才推進",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412
+        }
+      ],
+      "pos": [
+        690,
+        170
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "monitor",
+      "type": "backend",
+      "label": "Monitor",
+      "sublabel": "讀取、聚合、投影",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28
+        }
+      ],
+      "pos": [
+        250,
+        170
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "persona-contracts",
+      "type": "security",
+      "label": "Persona",
+      "sublabel": "定義角色、工具與範圍",
+      "sources": [
+        {
+          "path": "paulsha_cortex/deck/compile.py",
+          "line": 483,
+          "end_line": 523
+        },
+        {
+          "path": "paulsha_cortex/persona/personas.yaml",
+          "line": 1,
+          "end_line": 37
+        }
+      ],
+      "pos": [
+        250,
+        30
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "planning-artifacts",
+      "type": "database",
+      "label": "Planning Artifacts",
+      "sublabel": "accepted spec / plan",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 56,
+          "end_line": 58
+        }
+      ],
+      "pos": [
+        910,
+        30
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "scope-guardrail",
+      "type": "security",
+      "label": "Guardrail",
+      "sublabel": "檢查工具與可寫範圍",
+      "sources": [
+        {
+          "path": "paulsha_cortex/persona/guardrail.py",
+          "line": 18,
+          "end_line": 81
+        }
+      ],
+      "pos": [
+        30,
+        30
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "verification-gate",
+      "type": "backend",
+      "label": "Verification Gate",
+      "sublabel": "機械驗證；不信自證",
+      "sources": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 6281,
+          "end_line": 6348
+        }
+      ],
+      "pos": [
+        1130,
+        350
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "work-read-model",
+      "type": "database",
+      "label": "WorkItem",
+      "sublabel": "topic→todo→on-going→done",
+      "sources": [
+        {
+          "path": "paulsha_cortex/monitor/work_models.py",
+          "line": 186,
+          "end_line": 236
+        }
+      ],
+      "pos": [
+        470,
+        170
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "work-sources",
+      "type": "external",
+      "label": "GitHub / Repo",
+      "sublabel": "issue / PR / repo artifacts",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 32,
+          "end_line": 40
+        }
+      ],
+      "pos": [
+        30,
+        170
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "workflow-card",
+      "type": "database",
+      "label": "Card / WorkflowStep",
+      "sublabel": "phase + persona + I/O + gate",
+      "sources": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 11343,
+          "end_line": 11355
+        },
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 174,
+          "end_line": 190
+        },
+        {
+          "path": "paulsha_cortex/deck/compile.py",
+          "line": 483,
+          "end_line": 523
+        }
+      ],
+      "pos": [
+        410,
+        460
+      ],
+      "size": [
+        175,
+        65
+      ]
+    },
+    {
+      "id": "workflow-registry",
+      "type": "database",
+      "label": "Workflow Registry",
+      "sublabel": "Run → Phase → 多張 Card",
+      "sources": [
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 11343,
+          "end_line": 11355
+        },
+        {
+          "path": "paulsha_cortex/coordinator/workflow.py",
+          "line": 174,
+          "end_line": 190
+        }
+      ],
+      "pos": [
+        470,
+        350
+      ],
+      "size": [
+        162,
+        62
+      ]
+    },
+    {
+      "id": "phase-claim",
+      "type": "backend",
+      "label": "1 Claim｜受理",
+      "sublabel": "manager｜本地受理",
+      "sources": [
+        {
+          "path": "README.md",
+          "line": 412,
+          "end_line": 414
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 20,
+          "end_line": 28
+        },
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 32,
+          "end_line": 40
+        }
+      ],
+      "pos": [
+        28,
+        675
+      ],
+      "size": [
+        158,
+        65
+      ]
+    },
+    {
+      "id": "phase-define",
+      "type": "backend",
+      "label": "2 Define｜需求",
+      "sublabel": "planner｜採用或規劃",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 11641,
+          "end_line": 11684
+        },
+        {
+          "path": "paulsha_cortex/deck/data/cards.yaml",
+          "line": 1,
+          "end_line": 206
+        }
+      ],
+      "pos": [
+        222,
+        675
+      ],
+      "size": [
+        158,
+        65
+      ]
+    },
+    {
+      "id": "phase-plan",
+      "type": "backend",
+      "label": "3 Plan｜計畫",
+      "sublabel": "planner｜採用或 Job",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9481,
+          "end_line": 9501
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9585,
+          "end_line": 9635
+        }
+      ],
+      "pos": [
+        416,
+        675
+      ],
+      "size": [
+        158,
+        65
+      ]
+    },
+    {
+      "id": "phase-build",
+      "type": "backend",
+      "label": "4 Build｜實作",
+      "sublabel": "builder｜3 張 Card",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 9370,
+          "end_line": 9412
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 11343,
+          "end_line": 11355
+        }
+      ],
+      "pos": [
+        610,
+        675
+      ],
+      "size": [
+        158,
+        65
+      ]
+    },
+    {
+      "id": "phase-verify",
+      "type": "backend",
+      "label": "5 Verify｜驗證",
+      "sublabel": "reviewer｜1 張 Card",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        },
+        {
+          "path": "paulsha_cortex/deck/data/cards.yaml",
+          "line": 1,
+          "end_line": 206
+        },
+        {
+          "path": "paulsha_cortex/deck/data/combos/feature-oneshot.yaml",
+          "line": 1,
+          "end_line": 35
+        }
+      ],
+      "pos": [
+        804,
+        675
+      ],
+      "size": [
+        158,
+        65
+      ]
+    },
+    {
+      "id": "phase-review",
+      "type": "backend",
+      "label": "6 Review｜審查",
+      "sublabel": "reviewer｜1 + 條件卡",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        },
+        {
+          "path": "paulsha_cortex/coordinator/manager.py",
+          "line": 11343,
+          "end_line": 11355
+        },
+        {
+          "path": "paulsha_cortex/deck/data/cards.yaml",
+          "line": 1,
+          "end_line": 206
+        }
+      ],
+      "pos": [
+        998,
+        675
+      ],
+      "size": [
+        158,
+        65
+      ]
+    },
+    {
+      "id": "phase-ship",
+      "type": "backend",
+      "label": "7 Ship｜交付",
+      "sublabel": "manager｜本地交付",
+      "sources": [
+        {
+          "path": "docs/adr/0001-unified-work-lifecycle-authority.md",
+          "line": 44,
+          "end_line": 62
+        },
+        {
+          "path": "paulsha_cortex/coordinator/work_bridge.py",
+          "line": 1241,
+          "end_line": 1265
+        },
+        {
+          "path": "paulsha_cortex/coordinator/work_bridge.py",
+          "line": 1884,
+          "end_line": 1919
+        }
+      ],
+      "pos": [
+        1192,
+        675
+      ],
+      "size": [
+        158,
+        65
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "from": "candidate-worktree",
+      "label": "exact HEAD",
+      "id": "candidate-to-gates",
+      "to": "verification-gate",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [],
+      "labelAt": [
+        1238,
+        302
+      ]
+    },
+    {
+      "from": "workflow-card",
+      "label": "一張卡 → 0..N 次紀錄",
+      "id": "card-to-attempt",
+      "to": "job-attempt",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        597,
+        450
+      ]
+    },
+    {
+      "from": "completion-record",
+      "label": "完成證據",
+      "id": "completion-to-monitor",
+      "to": "monitor",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [
+        [
+          331,
+          477
+        ],
+        [
+          285,
+          477
+        ],
+        [
+          285,
+          270
+        ],
+        [
+          331,
+          270
+        ]
+      ],
+      "labelAt": [
+        302,
+        465
+      ]
+    },
+    {
+      "from": "control-queue",
+      "label": "操作請求",
+      "id": "control-to-manager",
+      "to": "manager",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [],
+      "labelAt": [
+        739,
+        157
+      ]
+    },
+    {
+      "from": "deck-compiler",
+      "label": "流程定義",
+      "id": "deck-to-manager",
+      "to": "manager",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          655,
+          61
+        ],
+        [
+          655,
+          135
+        ],
+        [
+          771,
+          135
+        ]
+      ],
+      "labelAt": [
+        655,
+        88
+      ]
+    },
+    {
+      "from": "delivery-closure",
+      "label": "完成後發證",
+      "id": "delivery-to-completion",
+      "to": "completion-record",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "right",
+      "via": [],
+      "labelAt": [
+        551,
+        568
+      ]
+    },
+    {
+      "from": "delivery-closure",
+      "label": "merge / 重讀遠端",
+      "id": "delivery-to-work-sources",
+      "to": "work-sources",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          771,
+          632
+        ],
+        [
+          111,
+          632
+        ]
+      ],
+      "labelAt": [
+        449,
+        622
+      ]
+    },
+    {
+      "from": "headless-executors",
+      "label": "提交 HEAD",
+      "id": "executors-to-candidate",
+      "to": "candidate-worktree",
+      "variant": "default"
+    },
+    {
+      "from": "headless-executors",
+      "label": "結果回傳",
+      "id": "executors-to-manager",
+      "to": "manager",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "right",
+      "via": [
+        [
+          991,
+          265
+        ],
+        [
+          892,
+          265
+        ],
+        [
+          892,
+          201
+        ]
+      ],
+      "labelAt": [
+        963,
+        276
+      ]
+    },
+    {
+      "from": "gate-evidence",
+      "label": "gate 證據",
+      "id": "gate-evidence-to-manager",
+      "to": "manager",
+      "variant": "default",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [
+        [
+          852,
+          381
+        ],
+        [
+          852,
+          324
+        ],
+        [
+          771,
+          324
+        ]
+      ],
+      "labelAt": [
+        818,
+        338
+      ]
+    },
+    {
+      "from": "verification-gate",
+      "label": "驗證結果",
+      "id": "gates-to-manager",
+      "to": "manager",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "right",
+      "via": [
+        [
+          1211,
+          450
+        ],
+        [
+          1315,
+          450
+        ],
+        [
+          1315,
+          286
+        ],
+        [
+          905,
+          286
+        ],
+        [
+          905,
+          201
+        ]
+      ],
+      "labelAt": [
+        1262,
+        438
+      ]
+    },
+    {
+      "from": "manager",
+      "label": "綁定／記錄 attempt",
+      "id": "manager-to-attempt",
+      "to": "job-attempt",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          771,
+          435
+        ],
+        [
+          680,
+          435
+        ]
+      ],
+      "labelAt": [
+        699,
+        420
+      ]
+    },
+    {
+      "from": "manager",
+      "label": "交付授權",
+      "id": "manager-to-delivery",
+      "to": "delivery-closure",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [],
+      "labelAt": [
+        811,
+        507
+      ]
+    },
+    {
+      "from": "manager",
+      "label": "按 Card 派工",
+      "id": "manager-to-executors",
+      "to": "headless-executors",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [],
+      "labelAt": [
+        882,
+        166
+      ]
+    },
+    {
+      "from": "manager",
+      "label": "保存證據",
+      "id": "manager-to-gate-evidence",
+      "to": "gate-evidence",
+      "variant": "default",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [
+        [
+          869,
+          201
+        ],
+        [
+          869,
+          300
+        ],
+        [
+          956,
+          300
+        ]
+      ],
+      "labelAt": [
+        939,
+        314
+      ]
+    },
+    {
+      "from": "manager",
+      "label": "綁定 ref / hash",
+      "id": "manager-to-planning",
+      "to": "planning-artifacts",
+      "variant": "default",
+      "fromSide": "top",
+      "toSide": "left",
+      "via": [
+        [
+          771,
+          115
+        ],
+        [
+          875,
+          115
+        ],
+        [
+          875,
+          61
+        ]
+      ],
+      "labelAt": [
+        820,
+        103
+      ]
+    },
+    {
+      "from": "manager",
+      "label": "寫入進度",
+      "id": "manager-to-workflow-registry",
+      "to": "workflow-registry",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "top",
+      "via": [
+        [
+          661,
+          201
+        ],
+        [
+          661,
+          300
+        ],
+        [
+          551,
+          300
+        ]
+      ],
+      "labelAt": [
+        660,
+        240
+      ]
+    },
+    {
+      "from": "monitor",
+      "label": "保存投影",
+      "id": "monitor-to-work-read-model",
+      "to": "work-read-model",
+      "variant": "emphasis"
+    },
+    {
+      "from": "persona-contracts",
+      "label": "角色約束",
+      "id": "persona-to-deck",
+      "to": "deck-compiler",
+      "variant": "default"
+    },
+    {
+      "from": "persona-contracts",
+      "label": "權限規則",
+      "id": "persona-to-guardrail",
+      "to": "scope-guardrail",
+      "variant": "default"
+    },
+    {
+      "from": "planning-artifacts",
+      "label": "固定 inputs",
+      "id": "planning-to-executors",
+      "to": "headless-executors",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [],
+      "labelAt": [
+        1018,
+        132
+      ]
+    },
+    {
+      "from": "workflow-registry",
+      "label": "Run 內分組 Cards",
+      "id": "run-to-card",
+      "to": "workflow-card",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "work-read-model",
+      "label": "確定範圍",
+      "id": "work-read-model-to-manager",
+      "to": "manager",
+      "variant": "default"
+    },
+    {
+      "from": "work-sources",
+      "label": "讀取來源",
+      "id": "work-sources-to-monitor",
+      "to": "monitor",
+      "variant": "default"
+    },
+    {
+      "from": "workflow-registry",
+      "label": "讀取進度",
+      "id": "workflow-to-monitor",
+      "to": "monitor",
+      "variant": "default",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [
+        [
+          371,
+          381
+        ],
+        [
+          371,
+          285
+        ],
+        [
+          331,
+          285
+        ]
+      ],
+      "labelAt": [
+        405,
+        370
+      ]
+    },
+    {
+      "id": "next-claim",
+      "from": "phase-claim",
+      "to": "phase-define",
+      "label": "通過",
+      "variant": "emphasis"
+    },
+    {
+      "id": "next-define",
+      "from": "phase-define",
+      "to": "phase-plan",
+      "label": "通過",
+      "variant": "emphasis"
+    },
+    {
+      "id": "next-plan",
+      "from": "phase-plan",
+      "to": "phase-build",
+      "label": "通過",
+      "variant": "emphasis"
+    },
+    {
+      "id": "next-build",
+      "from": "phase-build",
+      "to": "phase-verify",
+      "label": "通過",
+      "variant": "emphasis"
+    },
+    {
+      "id": "next-verify",
+      "from": "phase-verify",
+      "to": "phase-review",
+      "label": "通過",
+      "variant": "emphasis"
+    },
+    {
+      "id": "next-review",
+      "from": "phase-review",
+      "to": "phase-ship",
+      "label": "通過",
+      "variant": "emphasis"
+    },
+    {
+      "id": "run-spine",
+      "from": "manager",
+      "to": "phase-claim",
+      "label": "同一 WorkflowRun 的七階段展開",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [
+        [
+          771,
+          473
+        ],
+        [
+          1345,
+          473
+        ],
+        [
+          1345,
+          642
+        ],
+        [
+          107,
+          642
+        ]
+      ],
+      "labelAt": [
+        1109,
+        626
+      ]
+    },
+    {
+      "id": "recovery-candidate-repair",
+      "from": "phase-review",
+      "to": "phase-build",
+      "label": "Manager：符合 CAS 才 retry-build；新 HEAD 重做驗證／審查",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          1077,
+          784
+        ],
+        [
+          689,
+          784
+        ]
+      ],
+      "labelAt": [
+        882,
+        800
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "角色與流程定義（契約，不是執行中的 Agent）",
+      "wraps": [
+        "deck-compiler",
+        "persona-contracts",
+        "scope-guardrail"
+      ],
+      "pad": 20
+    },
+    {
+      "kind": "region",
+      "label": "feature-oneshot: Manager 按以下階段派工、收證據、寫進度",
+      "wraps": [
+        "phase-claim",
+        "phase-define",
+        "phase-plan",
+        "phase-build",
+        "phase-verify",
+        "phase-review",
+        "phase-ship"
+      ],
+      "pad": 20
+    }
+  ],
+  "cards": []
+}

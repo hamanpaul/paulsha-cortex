@@ -1,134 +1,93 @@
 ---
 status: accepted
 work_item: fix-superseded-terminal-replay
+domain_breadth: 1
+state_consistency: 2
+invariant_count: 13
+artifact_classes:
+  - source
+  - tests
+  - documentation
 ---
 
-# fix-superseded-terminal-replay Todo
+# Superseded terminal job 的持久身分與防重播
 
-`#497`：**已被取代（superseded／unbound）的 terminal job 會被 `complete_tick`
-反覆重新終局化**，並在「slice_id + candidate SHA」這個決定性證據位址上撞上
-不可變證據寫入器，fail-closed 阻斷本輪 fanout。實測後果包含：復原後不派新
-builder、`completed/passed` 的 slice 被回寫成 `needs_human`、下游 slice 被
-`deps-unsatisfied` 反向鎖死。
+## Boundary
 
-## 現況查核（0816，對 main `48b0205`）
+- Issue：`hamanpaul/paulsha-cortex#497`；正式 work_id 保持不變。
+- 本票修 completion 側 attempt 身分／supersession／consume 判定，讓已取代的
+  terminal job 不再推導 candidate 或寫 missing-slice-proof，保護目前與已完成 slice。
+- #383 的 `_manifest_still_blocks_fanout`／`dispatch_gate_scan` 與 manifest
+  superseded 註記已存在，不重做 fanout 語意；manifest 單槽 job_id 不是完整冪等權威。
+- 不放寬 evidence writer 不可變性／quarantine、不刪 job 或舊 evidence、不實作
+  #496 dirty recheck 去重／#821 persistence、不新增自動 retry 或自動 recovery。
+- #501 的 contract/evidence hash 分離已存在；本票維持正確 current evidence hash，
+  不以修改 contract hash 或重寫 evidence 位址掩蓋 attempt 混淆。
 
-**缺陷仍成立。`#383` 只修了 fanout 側，completion 側完全沒有 supersession 概念。**
-
-已落地的部分（不要重做）：
-
-- `manager.py:2194-2215` `_manifest_still_blocks_fanout()`：fanout 放行改與
-  registry 現況對帳，復原成 `pending` 的 slice 不再被殘留 manifest 永久跳過。
-- `manager.py:164-199` `_supersede_handoff_manifest()`：復原動作後替 manifest 補
-  `superseded_at`／`superseded_by`／`superseded_reason` 稽核欄位。
-
-**沒修到的部分（本 work item 的主體）**：
-
-1. `manager.py:1855` —— `complete_tick` 直接 `for snapshot in registry.list_jobs():`
-   **全量列舉**所有 job，對每個 terminal job 嘗試終局化。沒有任何
-   supersession／attempt 過濾。
-2. `manager.py:1879` —— 唯一的冪等短路是
-   `if _existing_manifest_job_id(manifest_path) == job_id: continue`。
-   這是**每 slice 單槽**的記憶：manifest 只記得住**一個** job_id。同一 slice
-   歷史上若有 `-6`／`-8`／`-9` 三個 terminal job，manifest 指向 `-9` 時，
-   `-6`／`-8` 完全不受保護，每輪都重跑。
-3. `manager.py:154-161` —— `_existing_manifest_job_id()` 另外在
-   `gate_status in {"passed","verified"}`、以及
-   `needs_human + verification_evidence_path is None + gate_reason ∈
-   {pinned-input-mismatch, verification-runner-error, verification-state-update-error}`
-   時**主動回 None**（＝放行重播）。證據寫入撞衝突時 `evidence` 留 None，正好落進
-   第二個條件，形成穩定的每 tick 重播迴圈。
-4. `manager.py:226-236` `_slice_for_job()` 在 `builder_job_id != job_id` 時回 None，
-   但**回 None 不等於跳過**：build lane 會掉進 `manager.py:1997-2010` 的
-   `missing-slice-proof` 分支，該分支**照樣寫證據**——且 candidate 由
-   `_candidate_for_evidence()`（`manager.py:285-309`）以 **branch 當前 HEAD**
-   解析。這就是 `#497` 0812-18:05 現場的機制：舊的 unbound job `-8` 先被終局化，
-   用 branch HEAD 解出 `6421bc98…`，把 `missing-slice-proof` 寫進本該屬於
-   bound job `-9` 的證據位址；`-9` 隨後撞
-   `conflicting verification evidence … (content mismatch)`。
-5. `registry.create_job()`（`registry.py:873-900`）的 job schema **沒有任何**
-   consumed／superseded／attempt 欄位，因此 supersession 目前根本無處持久化。
-6. `manager.py:1477-1560` `recover-pre-candidate`：把 slice 撥回 `pending`、
-   `builder_job_id=None`、`candidate=None`，並標記 manifest——但**舊 job row
-   本身完全沒動**，仍是 `list_jobs()` 的合法 terminal 成員。
-7. `verification.py:377-397` `_existing_evidence_result_or_raise()`：同位址內容不同時
-   把原檔 `os.replace` 進 `quarantine/` 後 `raise RuntimeError`。**這一段是對的
-   （不可變證據 fail-closed），不要為了消 symptom 去放寬它。**
-
-## Scope（明確邊界）
-
-**本 work item 的主體是「completion 側的 attempt 身分與 supersession 過濾」，
-不是「證據不可變規則放寬」，也不是「證據位址重設計以外的其他一切」。**
-
-- 要做：terminal job 在被終局化**之前**先判定它是否仍是該 slice 當前 attempt 的
-  綁定 job；不是就跳過——且**必須在「解析 candidate／推導證據位址」之前**跳過，
-  否則就像現況一樣，已經寫壞了才發現。
-- 要做：supersession 需**持久化在 registry**（job row 或 attempt 層），
-  不能只靠 handoff manifest 的單槽 job_id 或檔案系統狀態——`#497` 的
-  0812-19:10 現場證明 daemon 重啟後重播照樣發生。
-- 要做：舊 job 保持**可稽核**（不刪 row、不刪既有證據），只是不再有資格成為
-  當前 attempt 的終局。
-- 可做（若判定必要）：在證據位址中納入 job／attempt 身分，讓「同 slice 同 SHA
-  的多次合法終局觀測」各有位址——這是 `#497` 建議驗收的第 4 條。若採此路，
-  **既有證據路徑必須保持可讀**（completion record 會引用舊位址，
-  見 `manager.py:843` `verification_evidence_path`）。
-- **不要做**：放寬 `write_verification_evidence()` 的不可變性、或把 quarantine
-  改成靜默覆寫。fail-closed 抓到的是真問題，本修復要消除的是「不該發生的
-  第二次寫入」，不是「抓到衝突時的反應」。
-- **不要做**：修 `#501` 的 contract／evidence hash 欄位混用，或 `#496` 的
-  dirty recheck 冪等。本張假設 `#501` 可能尚未落地，因此**驗收不得依賴
-  contract hash 正確性**；若 `#501` 已先行 merge，測試可一併收緊。
-- **不要做**：改動 `_manifest_still_blocks_fanout()`／`dispatch_gate_scan()`
-  的 fanout 語意（`#383` 已定案且有測試）。本張只碰 completion 側。
-- **不要做**：新增自動 retry／自動修復。`needs_human` 在 operator 動作前必須
-  **靜止**（quiescent），這正是驗收條件之一。
+Spec/design：`docs/superpowers/specs/fix-superseded-terminal-replay-{spec,design}.md`。
+保留 #832 全部 parent AC。完整 parent 即使依 #831 定案 stability=0 仍須真實 sizing；Red 不降分，report 的人工候選不是 #833 自動 planner evidence。
 
 ## Tasks
 
-- [ ] **attempt 身分持久化**：registry 提供「此 terminal job 已被消費／已被取代」
-      的持久標記（CAS 更新，restart-safe），並在
-      `recover-pre-candidate`／`abandon`／新 attempt 派工時原子地設定
-- [ ] **completion 前置過濾**：`complete_tick`（`manager.py:1855` 起）在**推導
-      candidate 與證據位址之前**先跳過非當前 attempt 的 terminal job；
-      `_slice_for_job()` 回 None 的 build-lane 情境不得再無條件寫
-      `missing-slice-proof` 證據（`manager.py:1997-2010`）
-- [ ] **單槽記憶除役**：不再以 handoff manifest 的單一 `job_id`
-      （`manager.py:1879`／`_existing_manifest_job_id`）作為多 terminal job 的
-      冪等權威；改以持久 attempt 標記為準
-- [ ] **completion 證明穩定性**：已 `completed/passed` 且持有合法 completion record
-      的 slice，其被引用的 verification evidence 位址在 daemon 重啟後不得被任何
-      重播改寫（`#497` 0812-19:10 現場）
-- [ ] **測試**：
-      - terminal dirty builder → `recover-pre-candidate` → tick：舊 job 被跳過、
-        無證據衝突、**恰好**派出一個新 builder
-      - 上述情境的 **daemon restart 變體**：跳過語意跨重啟存活
-      - 同 slice 多 terminal job（`-6`／`-8`／`-9`）：只有當前綁定的 job 被終局化，
-        unbound job 不寫任何證據、不解析 branch HEAD 當 candidate
-      - `completed/passed` slice 在 manager 重啟後連續多 tick：completion record
-        與其引用證據 byte 不變、下游 slice 不被 `deps-unsatisfied` 反向鎖
-      - `needs_human` 靜止性：連續 tick 不新增 action／evidence_history
-        （與 `#496` 的驗收互補，但本張測的是「重播來源」而非「recheck 迴圈」）
-      - 舊證據與舊 job row 仍可稽核讀取（不因修復而遺失歷史）
+- [ ] **T01 source／S01**：以 additive registry job／attempt 欄位持久記錄 superseded／已消費狀態，
+      提供 CAS／冪等更新。沿用可稽核的 superseded_at／superseded_by／superseded_reason
+      或等價具體結構，缺新欄位的舊 state 正常載入；不新增 jobs.json 根欄位。
+- [ ] **T02 source／S02**：為 recover-pre-candidate 增加明確的 registry 原子動作：在驗證原 builder／
+      reviewer 綁定仍相同後，同一次 durable 更新將舊 job 標 superseded、slice 轉
+      pending、gate_state 轉 pending，並清掉 builder_job_id／reviewer_job_id／candidate。
+      不再依賴 `update_slice(...=None)`：現行該 API 把 None 當未提供，不會清欄位。
+- [ ] **T03 source／S03**：原子動作內的 validation／state／history 與 supersession 一起成功或回復；
+      fault injection／CAS conflict 不得留下「slice pending 但仍綁舊 job」或「新
+      attempt 綁定被舊 recover 清掉」的半套 durable 狀態。重複同一 recovery request
+      不重複標記或寫 action；在 action gate 前處理有身分可驗的既有成功結果，
+      不藉此放寬其他 pending slice 的 allowed actions。
+- [ ] **T04 source／S04**：核對 abandon／retry-build→repin／新 attempt 綁定的取代路徑：當前綁定真的
+      被取代時持久標記舊 job；正常 terminal 被成功收割後保存 consumed 身分，
+      不依賴單一 manifest job_id 推測跨重啟已消費。新增標記不可讓尚未完整持久化的
+      completion proof 被略過，需與相應交易邊界一致。
+- [ ] **T05 source／S05**：`complete_tick` 對 terminal job 在解析 repo root／branch HEAD／candidate／
+      evidence path 之前先 skip：已標 superseded／已完整消費者，或其 slice 存在
+      但當前 builder/reviewer 綁定已非該 job。不能只檢查 `_slice_for_job` 回 None
+      就掉進 missing-slice-proof；真正 slice 不存在的 job 保持現行 fail-closed 行為。
+- [ ] **T06 source／S06**：skip 舊 job 不寫 evidence、不改 handoff、不解析 branch HEAD、不追加 slice
+      action/history；舊 job／舊 evidence 仍能讀取。保留真正當前 attempt 正常
+      completion/review 與缺 proof 診斷，並以 source invariant 測試涵蓋所有 terminal 入口。
+- [ ] **T07 tests／S07**：recovery fixture 沿
+      `tests/test_pre_candidate_recovery.py::test_recover_pre_candidate_supersedes_stale_handoff_manifest`：
+      明設 `PSC_REPO_ROOT`、failed terminal builder、needs_human slice 且
+      `candidate=None`，寫合法舊 manifest；先斷言 allowed actions 包含 recover，
+      再執行 action 並斷言成功、bindings/candidate 真為 None、舊 job 已 superseded。
+      不得使用帶合法 candidate SHA 的 dirty slice 呼叫 recover，那會被 action gate 擋下。
+- [ ] **T08 tests／S08**：recovery 後執行 `complete_tick`，completed／errors 都不含舊 job，沒有對舊
+      candidate 寫 evidence、沒有 quarantine，slice 維持 pending，history 不增。
+      另在完整 `run_tick`／fanout fixture 中驗其他 gates 均合法時恰好派一個新 builder；
+      `complete_tick` 本身不承諾派工。設定 repo root 避免測試提前 error 卻假綠。
+- [ ] **T09 tests／S09**：manifest 回 None 的變體必測：gate_status=needs_human、
+      verification_evidence_path=None、gate_reason=verification-runner-error；
+      修前會重跑舊 job，修後仍跳過。再以 fresh JobRegistry 模擬 daemon restart，
+      驗證 supersession／consumed 與 skip 持續有效。
+- [ ] **T10 tests／S10**：同一 slice 的多個 terminal jobs（例如 -6／-8／-9，manifest 指向 -9）只讓
+      真正目前綁定且尚未合法完成者終局化；unbound 舊 job 不推導 candidate。
+      帶合法 SHA 的 dirty slice 走 `retry-build`→repin 的合法路徑，覆蓋舊 builder
+      與 reviewer 被取代的情境；不可偷換成不可達的 recover fixture。
+- [ ] **T11 tests／S11**：completed/passed slice 在 restart 後連續10個 ticks，completion record 與
+      被引用 evidence bytes 不變，不倒退 needs_human、不反鎖下游 deps；needs_human
+      但不符合 dirty recheck 的 superseded 情境保持靜止，驗的是舊 replay 來源，
+      不將 #496 尚未實作的合法 dirty recheck append 當本票責任。
+- [ ] **T12 tests／S12**：新增 `tests/test_superseded_terminal_replay_497.py` 或等價 focused 檔；涵蓋
+      stale CAS、原子寫入故障、重複 recovery request、新舊 row 相容、真正 missing slice
+      fail-closed、current attempt 正常完成與歷史可讀。不可放寬 immutable writer。
+- [ ] **T13 documentation／S13**：補本正式 work_id changelog fragment 與 `CHANGELOG.md [Unreleased]`，透過
+      Cortex 記錄 RED／GREEN、必要完整 gates、獨立 review、merge、runtime restart
+      與 completion proof 穩定性的證據。accepted todo 不等於修正／測試／部署完成。
 
-## 現場紀錄（供實作者參考）
+- [ ] **T14 documentation／CLI**：更新 recovery/runbook 對 current/superseded/consumed、合法 pre-candidate request replay 及缺 proof 的說明；保留 slice/work action 邊界。從 checkout 外實跑候選 `python3 -m paulsha_cortex.cli work start --help`、`python3 -m paulsha_cortex.cli run work --help`，另以隔離 request fixture 驗欄位/拒絕，不呼叫 live manager。
+- [ ] **T15 tests／parent accounting**：純 completeness/contract/sizing 與完整 parent S01–S13 mapping 守門；Red 先受治理分解，每個 child 個別 sizing，不偽造 planner lineage。Parent closure 必須補齊所有 child、full pytest/CI/PR-context policy、review、exact-head merge 與 loaded runtime restart 證據；source 成功不替代 runtime。
 
-- issue `#497` 首則：Task 3 `recover-pre-candidate` 後首個 tick 未派工，
-  改為重跑舊 terminal builder 並撞 `conflicting verification evidence … (content mismatch)`
-- 0812-14:57 留言：recovery 回 `slice_state: pending` 後 8 秒，terminal reviewer
-  `-2` 被重跑，slice 退回 `needs_human / missing-slice-proof`
-- 0812-16:11 留言：重複 recovery 每次都被同一個 terminal job 打回，
-  「pending 無法存活」——明確要求 consumed／superseded marker CAS
-- 0812-17:25 留言：foreign-review launch 失敗後，約 90 秒累積 **24 筆**
-  evidence_history（本張是重播來源，`#496`／`#501` 是放大器）
-- 0812-18:05 留言：unbound job `-8` 先於 bound job `-9` 被終局化，
-  造成同 candidate `6421bc98…` 證據位址衝突與兩份 quarantine 檔——
-  這則最精確地指出「必須在解析 candidate 之前跳過」
-- 0812-19:10 留言：**daemon 正常重啟**即可讓已 `completed/passed` 的 Task 4
-  被重播回寫成 305-byte 的 `missing-slice-proof`，handoff 被改寫為
-  `completion-record-missing`，Task 5 被 `deps-unsatisfied` 反鎖——
-  證明缺陷不限於 recovery 競態
-- 0812-19:40／21:09 留言：狀態快照內部不一致（`completed/passed` 併
-  `reason=completion-record-missing`）；以及 manager interval 被夾到 3600 秒
-  當 workaround 後，`stat`／`status` 無法收割已存在的 exit sentinel。
-  **後者（sentinel 收割／targeted `complete <job-id>`）屬觀測面 follow-up，
-  不在本張 scope 內**——本張只負責讓重播不再發生
+## Evidence
+
+- 舊紀錄中的 recover 後 pending 無法存活、unbound -8 汙染 bound -9 證據位址、
+  manager 重啟後 completed slice 被回寫，是此票的回歸來源，不是此次 live 結果。
+- `verification.write_verification_evidence` 發現內容衝突時 quarantine 並 fail-closed
+  是必要保護；本票消除不合法第二次寫入，不將既有證據改成可覆寫。
+- sentinel 收割／targeted complete 是觀測面後續工作，不在本票擴張操作權限。

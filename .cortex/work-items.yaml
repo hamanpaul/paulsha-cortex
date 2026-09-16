@@ -455,12 +455,16 @@ work_items:
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/feat-work-gc/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#899'
     excludes: []
   design-task-type-taxonomy:
     title: 'design-task-type-taxonomy（已由 -v2 重識別接手；舊 runs 為 superseded 審計）'
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/design-task-type-taxonomy/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#898'
     excludes: []
   feat-work-gc-v2:
     title: 'cortex work gc v2 重識別——世代熔斷後續作 (#178)'
@@ -469,6 +473,8 @@ work_items:
         ref: 'docs/superpowers/workstreams/feat-work-gc-v2/todo.md'
       - kind: path
         ref: 'docs/superpowers/specs/feat-work-gc-v2-spec.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#178'
     excludes: []
   design-task-type-taxonomy-v2:
     title: 'task_type taxonomy v2 重識別——世代熔斷後續作 (#139)'
@@ -477,6 +483,8 @@ work_items:
         ref: 'docs/superpowers/workstreams/design-task-type-taxonomy-v2/todo.md'
       - kind: path
         ref: 'docs/superpowers/specs/design-task-type-taxonomy-v2-spec.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#139'
     excludes: []
   feat-slice-executor-model:
     title: 'per-slice executor/model 宣告與 depends_on 顯式診斷 (#294)'
@@ -687,12 +695,16 @@ work_items:
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-claim-provider-scope/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#530'
     excludes: []
   fix-degraded-retention-collision:
     title: 'fix-degraded-retention-collision'
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-degraded-retention-collision/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#523'
     excludes: []
   fix-verification-contract-hash-overwrite:
     title: 'fix-verification-contract-hash-overwrite'
@@ -707,6 +719,10 @@ work_items:
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-superseded-terminal-replay/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-superseded-terminal-replay-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-superseded-terminal-replay-design.md'
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#497'
     excludes: []
@@ -715,6 +731,10 @@ work_items:
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-dirty-recheck-idempotency/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dirty-recheck-idempotency-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dirty-recheck-idempotency-design.md'
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#496'
     excludes: []
@@ -737,7 +757,11 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#665'
       - kind: path
         ref: 'docs/superpowers/workstreams/trust-root-executor-hardening/todo.md'
-    excludes: []
+    excludes:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#692'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#763'
   trust-root-copilot-toolchain-pinning:
     title: 'trust-root-copilot-toolchain-pinning'
     links:
@@ -779,4 +803,422 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#792'
       - kind: openspec
         ref: 'manager-gitconfig-delivery'
+    excludes: []
+  daemon-tick-clock-not-idle:
+    title: 'daemon-tick-clock-not-idle'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#819'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/daemon-tick-clock-not-idle/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/daemon-tick-clock-not-idle-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/daemon-tick-clock-not-idle-design.md'
+    excludes: []
+  registry-persist-hygiene:
+    title: 'registry-persist-hygiene'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#821'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/registry-persist-hygiene/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-persist-hygiene-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-persist-hygiene-design.md'
+    excludes: []
+  executor-durable-backoff:
+    title: 'executor-durable-backoff'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#825'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/executor-durable-backoff/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-durable-backoff-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-durable-backoff-design.md'
+    excludes: []
+  outcome-taxonomy-signals:
+    title: 'outcome-taxonomy-signals'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#826'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/outcome-taxonomy-signals/todo.md'
+    excludes: []
+  yaml-inline-list-quotes:
+    title: 'yaml-inline-list-quotes'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#822'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/yaml-inline-list-quotes/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/yaml-inline-list-quotes-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/yaml-inline-list-quotes-design.md'
+    excludes: []
+  launcher-session-and-timeout:
+    title: 'launcher-session-and-timeout'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#823'
+      - kind: path
+        ref: 'docs/superpowers/specs/launcher-session-and-timeout-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/launcher-session-and-timeout-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/launcher-session-and-timeout/todo.md'
+      - kind: openspec
+        ref: 'launcher-session-and-timeout'
+    excludes: []
+  monitor-refresh-thread-backlog:
+    title: 'monitor-refresh-thread-backlog'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#827'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-refresh-thread-backlog/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-refresh-thread-backlog-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-refresh-thread-backlog-design.md'
+    excludes: []
+  sizing-stability-direction:
+    title: 'sizing-stability-direction'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#831'
+      - kind: path
+        ref: 'docs/superpowers/specs/sizing-stability-direction-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/sizing-stability-direction-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/sizing-stability-direction/todo.md'
+      - kind: openspec
+        ref: 'sizing-stability-direction'
+    excludes: []
+  dispatch-decision-contract:
+    title: 'dispatch-decision-contract'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#830'
+      - kind: path
+        ref: 'docs/superpowers/specs/dispatch-decision-contract-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/dispatch-decision-contract-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/dispatch-decision-contract/todo.md'
+    excludes: []
+  execution-profile-contract:
+    title: 'execution-profile-contract'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#835'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-contract-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-contract-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/execution-profile-contract/todo.md'
+    excludes: []
+  execution-profile-schema-core:
+    title: 'execution-profile-schema-core'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#849'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-schema-core-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-schema-core-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/execution-profile-schema-core/todo.md'
+    excludes: []
+  executor-backoff-store-core:
+    title: 'executor-backoff-store-core'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#850'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-store-core-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-store-core-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/executor-backoff-store-core/todo.md'
+    excludes: []
+  agy-probe-construction-containment:
+    title: 'agy-probe-construction-containment'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#851'
+      - kind: path
+        ref: 'docs/superpowers/specs/agy-probe-construction-containment-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/agy-probe-construction-containment-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/agy-probe-construction-containment/todo.md'
+    excludes: []
+  monitor-watcher-bounded:
+    title: 'monitor-watcher-bounded'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#853'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-watcher-bounded-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-watcher-bounded-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-watcher-bounded/todo.md'
+    excludes: []
+  workflow-terminal-jsonl-framing:
+    title: 'workflow-terminal-jsonl-framing'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#860'
+      - kind: openspec
+        ref: 'workflow-terminal-jsonl-framing'
+      - kind: path
+        ref: 'docs/superpowers/specs/workflow-terminal-jsonl-framing-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/workflow-terminal-jsonl-framing-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/workflow-terminal-jsonl-framing/todo.md'
+    excludes: []
+  recovery-registry-receipt:
+    title: 'recovery-registry-receipt'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#862'
+      - kind: openspec
+        ref: 'recovery-registry-receipt'
+      - kind: path
+        ref: 'docs/superpowers/specs/recovery-registry-receipt-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/recovery-registry-receipt-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/recovery-registry-receipt/todo.md'
+    excludes: []
+  quota-observation-schema-core:
+    title: 'quota-observation-schema-core'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#866'
+      - kind: openspec
+        ref: 'quota-observation-schema-core'
+      - kind: path
+        ref: 'docs/superpowers/specs/quota-observation-schema-core-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/quota-observation-schema-core-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/quota-observation-schema-core/todo.md'
+    excludes: []
+  task-memory-delivery-adapter:
+    title: 'task memory delivery Cortex adapter'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#857'
+      - kind: path
+        ref: 'docs/superpowers/specs/task-memory-delivery-adapter-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/task-memory-delivery-adapter-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/task-memory-delivery-adapter.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/task-memory-delivery-adapter/todo.md'
+    excludes: []
+  agy-builder-support:
+    title: 'agy-builder-support'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#799'
+    excludes: []
+  builder-task-boundary-segmentation:
+    title: 'builder-task-boundary-segmentation'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#276'
+    excludes: []
+  continuation-adoption-dispatch:
+    title: 'continuation-adoption-dispatch'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#395'
+    excludes: []
+  cost-governance-cluster:
+    title: 'cost-governance-cluster'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#208'
+    excludes: []
+  cost-governance-judge:
+    title: 'cost-governance-judge'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#138'
+    excludes: []
+  dedupe-legacy-config-warnings-delivery:
+    title: 'dedupe-legacy-config-warnings-delivery'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#254'
+    excludes: []
+  default-envelope-values:
+    title: 'default-envelope-values'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#453'
+    excludes: []
+  design-adhoc-oneshot-dispatch:
+    title: 'design-adhoc-oneshot-dispatch'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#279'
+    excludes: []
+  design-model-capability-envelope:
+    title: 'design-model-capability-envelope'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#209'
+    excludes: []
+  engineering-outcome-contract:
+    title: 'engineering-outcome-contract'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#275'
+    excludes: []
+  envelope-mapping:
+    title: 'envelope-mapping'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#454'
+    excludes: []
+  fix-copilot-review-verdict-spool:
+    title: 'fix-copilot-review-verdict-spool'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#902'
+    excludes: []
+  fix-doctor-diagnostics-delivery:
+    title: 'fix-doctor-diagnostics-delivery'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#252'
+    excludes: []
+  fix-systemctl-install-failure-delivery-v3:
+    title: 'fix-systemctl-install-failure-delivery-v3'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#253'
+    excludes: []
+  model-persona-roster-matrix:
+    title: 'model-persona-roster-matrix'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#456'
+    excludes: []
+  oneshot-lesson-loop:
+    title: 'oneshot-lesson-loop'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#137'
+    excludes: []
+  phase2-718-runtime-instance-authority:
+    title: 'phase2-718-runtime-instance-authority'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#900'
+    excludes: []
+  phase2-closeout-reconcile:
+    title: 'phase2-closeout-reconcile'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#903'
+    excludes: []
+  planner-job-downgrade:
+    title: 'planner-job-downgrade'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#672'
+    excludes: []
+  planning-artifact-manifest-binding:
+    title: 'planning-artifact-manifest-binding'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#802'
+    excludes: []
+  pretooluse-capacity-gate:
+    title: 'pretooluse-capacity-gate'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#136'
+    excludes: []
+  sizing-envelope-calibration:
+    title: 'sizing-envelope-calibration'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#210'
+    excludes: []
+  skill-usage-ledger-park-janitor:
+    title: 'skill-usage-ledger-park-janitor'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#204'
+    excludes: []
+  trust-root-isolation:
+    title: 'trust-root-isolation'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#718'
+    excludes: []
+  trust-root-phase2-runtime-harvest-fix:
+    title: 'trust-root-phase2-runtime-harvest-fix'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#901'
+    excludes: []
+  agy-print-timeout-only:
+    title: 'agy-print-timeout-only'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#824'
+    excludes: []
+  r3-testpilot-case-corpus:
+    title: 'r3-testpilot-case-corpus'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#904'
+    excludes: []
+  workflow-execution-identity-producer:
+    title: 'workflow-execution-identity-producer'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#828'
+      - kind: openspec
+        ref: 'cortex-refine-complete'
+    excludes: []
+  fix-monitor-fs-event-convoy:
+    title: 'fix-monitor-fs-event-convoy'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#879'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-monitor-fs-event-convoy/todo.md'
+      - kind: openspec
+        ref: 'fix-monitor-fs-event-convoy'
+      - kind: github_pr
+        ref: 'hamanpaul/paulsha-cortex#896'
+    excludes: []
+  fix-agy-reviewer-json-schema:
+    title: 'fix-agy-reviewer-json-schema'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#880'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-agy-reviewer-json-schema/todo.md'
+      - kind: openspec
+        ref: 'fix-agy-reviewer-json-schema'
+      - kind: github_pr
+        ref: 'hamanpaul/paulsha-cortex#884'
     excludes: []

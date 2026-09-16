@@ -2054,6 +2054,8 @@ def _claim_action(
     # 動作集合與具體 blocking reason 時一併回報。
     if decision.next_actions:
         response["next_actions"] = list(decision.next_actions)
+    if decision.next_step_hint is not None:
+        response["next_step_hint"] = decision.next_step_hint
     # #546（部分）：卡片卡在 needs_human 時，`_resume_decision` 看不到 job 層
     # 事實，宣告的唯一出口是 `abandon`（＝燒掉一個世代與合格的 commit）。
     # 這裡把同樣以 run/job 事實判定為「真的會被受理」的復原動作補進去，順序維持

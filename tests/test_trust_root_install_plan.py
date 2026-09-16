@@ -1820,7 +1820,7 @@ def test_plan_provider_manifest_accepts_only_allowlisted_four_way_pairs(
 ) -> None:
     config = _safe_config(tmp_path)
     config["providers"] = {
-        "builder": ["codex"],
+        "builder": ["codex", "agy"],
         "reviewer-planner": ["codex", "agy", "copilot"],
         "manager": ["github"],
     }
@@ -1830,11 +1830,16 @@ def test_plan_provider_manifest_accepts_only_allowlisted_four_way_pairs(
     assert document["provider_manifest"] == config["providers"]
     assert plan["required_credentials"] == [
         {"principal": "builder", "provider": "codex"},
+        {"principal": "builder", "provider": "agy"},
         {"principal": "manager", "provider": "github"},
         {"principal": "reviewer-planner", "provider": "codex"},
         {"principal": "reviewer-planner", "provider": "agy"},
         {"principal": "reviewer-planner", "provider": "copilot"},
     ]
+    assert any(
+        asset["asset_id"] == "builder-agy-state" and asset["is_symlink"]
+        for asset in plan["assets"]
+    )
 
 
 @pytest.mark.parametrize(

@@ -224,6 +224,37 @@ def test_agy_import_writes_physical_cache_target_without_following_home_symlink(
     assert not (outside / "oauth_creds.json").exists()
 
 
+def test_builder_agy_import_is_scoped_to_the_builder_cache(tmp_path: Path) -> None:
+    """The explicit builder/AGY adapter must not discover reviewer state."""
+
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / "oauth_creds.json"
+    source.write_text('{"token":"test-secret"}', encoding="utf-8")
+    builder_home = tmp_path / "cortex-builder"
+    builder_cache = builder_home / "cache/gemini"
+    builder_cache.mkdir(parents=True)
+    reviewer_home = tmp_path / "cortex-reviewer-planner"
+    reviewer_target = reviewer_home / "cache/gemini"
+    reviewer_target.mkdir(parents=True)
+    (reviewer_target / "oauth_creds.json").write_text(
+        '{"token":"reviewer-state"}', encoding="utf-8"
+    )
+
+    import_credential(
+        receipt,
+        principal="builder",
+        provider="agy",
+        source=source,
+        destination_root=builder_home,
+    )
+
+    assert (builder_cache / "oauth_creds.json").read_bytes() == source.read_bytes()
+    assert (reviewer_target / "oauth_creds.json").read_text(encoding="utf-8") == (
+        '{"token":"reviewer-state"}'
+    )
+    assert not (builder_home / ".gemini" / "oauth_creds.json").exists()
+
+
 def test_credential_adapter_rejects_a_symlink_before_reading_content(
     tmp_path: Path,
 ) -> None:

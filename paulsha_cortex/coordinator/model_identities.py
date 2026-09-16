@@ -1068,13 +1068,15 @@ def probe_agy_capability(
         "Return only this compact JSON object and perform no tool calls: "
         + json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
     )
-    argv = build_agy_argv(
-        prompt=prompt,
-        slice_id="cortex-capability-probe",
-        log_dir=".",
-        model=cli_model_token,
-    )
     try:
+        argv = build_agy_argv(
+            prompt=prompt,
+            slice_id="cortex-capability-probe",
+            log_dir=".",
+            model=cli_model_token,
+            read_only=True,
+            json_envelope=False,
+        )
         smoke_raw = process_runner(argv, **common)
         smoke_rc, smoke_stdout, smoke_stderr = _process_fields(smoke_raw)
     except Exception as exc:
@@ -1353,7 +1355,10 @@ def select_secondary_planner(
         identity for identity in registry.identities if "planning" in identity.capabilities
     ]
     ranked = model_resolution.rank_candidates(
-        planning, role="planning", context=registry.resolution_context
+        planning,
+        role="planning",
+        context=registry.resolution_context,
+        compatibility_for=model_resolution.compatibility_checker_for("planner"),
     )
     rejections: list[CandidateRejection] = []
     for identity in ranked.ordered:

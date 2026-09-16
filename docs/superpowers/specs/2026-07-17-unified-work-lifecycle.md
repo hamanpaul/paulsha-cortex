@@ -94,7 +94,7 @@ Registry以atomic backup從v1升v2；v1 jobs/slices保留legacy records，不猜
 
 所有Define/Plan invocation與manifest plan card只在temporary disposable checkout以plan/read-only/sandbox執行；Claude不得使用`acceptEdits`且停用tools，Codex固定`--sandbox read-only`。成功、nonzero與exception都驗sandbox/operator tree；snapshot權限錯誤也先恢復安全traversal，再依baseline還原entries、mode與xattrs，restore fault fail-closed。Scan時持久化canonical ref/kind/work item/content hash authority；Primary structured replacement必須逐欄符合該authority與manifest refs，不接受caller hash或filename推測。新檔no-clobber。Artifacts、immutable/idempotent brainstorm evidence、expected gate ref與registry phase update共用durable intent journal；registry未commit才rollback，已commit則restart逐operation驗type/hash/mode/evidence，drift成`needs_human`並保留journal。
 
-Secondary selection: `agy/google -> claude/anthropic -> codex/openai`，排除primary domain。`agy`只使用headless print + plan + sandbox，不允許unsafe bypass；`agy + Gemini 3.1 Pro (High)`映射google並由live doctor驗證。沒有異質model或output malformed時停needs_human。
+Secondary selection: `agy/google -> claude/anthropic -> codex/openai`，排除primary domain。`agy` planner／reviewer 形態只使用 headless print + plan + sandbox；builder 形態自 #799 起為 `--mode accept-edits --add-dir <worktree>`，`--dangerously-skip-permissions` 僅在 `allow_unsafe` 時附加；write-forbidden builder 回到 `plan+sandbox` 並帶唯讀 `--add-dir`。`agy + Gemini 3.1 Pro (High)`映射google並由live doctor驗證。沒有異質model或output malformed時停needs_human。
 
 ### 5.3 Build/verify/review
 

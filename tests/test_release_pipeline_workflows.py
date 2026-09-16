@@ -232,6 +232,7 @@ def test_deployment_canary_is_manual_protected_and_separate_from_release() -> No
     assert "--profile deployment-canary" in raw
     assert "CORTEX_RC_CODEX_AUTH" in raw
     assert "CORTEX_RC_AGY_AUTH" in raw
+    assert "CORTEX_RC_BUILDER_AGY_AUTH" in raw
     assert "CORTEX_RC_COPILOT_AUTH" in raw
     assert "CORTEX_RC_MANAGER_GITHUB_AUTH" in raw
     assert "CORTEX_RC_PROBE_REPOSITORY" in raw

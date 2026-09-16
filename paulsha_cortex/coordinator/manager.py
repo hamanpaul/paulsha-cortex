@@ -50,6 +50,7 @@ from .claim import (
     REASON_PROVIDER_RATE_LIMITED_CANONICAL,
     decomposition_route,
     needs_human_next_actions,
+    needs_human_next_step_hint,
 )
 from . import model_resolution
 from .diagnostics import DiagnosticReason, diagnostic_reason, summarize_exception
@@ -658,6 +659,182 @@ def _status_repo(*values: object) -> str | None:
     return None
 
 
+def _unknown_execution_identity(*, card: object = None) -> dict[str, Any]:
+    """Return the additive execution-identity fields without inventing identity.
+
+    ``unknown`` means there is no verifiable registry identity, so ``job_id`` is
+    always ``None`` (a manifest-declared id that the registry does not back is
+    not evidence) and ``execution_state`` uses the typed default
+    ``not-dispatched`` rather than a free-form ``unknown`` state.
+    """
+    return {
+        "executor": None,
+        "model": None,
+        "job_id": None,
+        "card": card,
+        "identity_source": "unknown",
+        "execution_state": "not-dispatched",
+    }
+
+
+def _job_execution_identity(
+    job: Mapping[str, Any], *, identity_source: str, card: object = None
+) -> dict[str, Any]:
+    """Project identity only from a concrete registry job row.
+
+    ``model`` is deliberately sourced from the job's persisted ``model_id``;
+    planned workflow-step values are never used as a fallback for an actual
+    execution.
+    """
+    job_card = job.get("workflow_card")
+    if not isinstance(job_card, str) or not job_card:
+        job_card = card
+    state = job.get("status")
+    if not isinstance(state, str) or not state:
+        state = "unknown"
+    return {
+        "executor": job.get("executor"),
+        "model": job.get("model_id"),
+        "job_id": job.get("job_id"),
+        "card": job_card,
+        "identity_source": identity_source,
+        "execution_state": state,
+    }
+
+
+def _workflow_job_matches(
+    job: Mapping[str, Any],
+    *,
+    run_id: str,
+    repo: str | None,
+    card: str,
+    phase: str | None,
+) -> bool:
+    """Require explicit workflow binding before borrowing a job identity."""
+    if job.get("workflow_run_id") != run_id or job.get("workflow_card") != card:
+        return False
+    if phase is not None and job.get("workflow_phase") != phase:
+        return False
+    job_repo = job.get("workflow_repo")
+    # Legacy rows may lack workflow_repo, but an explicit foreign repository is
+    # never allowed to satisfy a same-card lookup.
+    return repo is None or job_repo in (None, repo)
+
+
+def _registry_job(registry, job_id: object) -> Mapping[str, Any] | None:
+    if not isinstance(job_id, str) or not job_id:
+        return None
+    getter = getattr(registry, "get_job", None)
+    if callable(getter):
+        try:
+            job = getter(job_id)
+        except Exception:  # noqa: BLE001 - status projection is fail-soft
+            job = None
+        if isinstance(job, Mapping):
+            return job
+    lister = getattr(registry, "list_jobs", None)
+    if callable(lister):
+        try:
+            for job in lister():
+                if isinstance(job, Mapping) and job.get("job_id") == job_id:
+                    return job
+        except Exception:  # noqa: BLE001 - status projection is fail-soft
+            pass
+    return None
+
+
+def _manifest_execution_identity(
+    registry,
+    *,
+    job_id: object,
+    workflow_run_id: object = None,
+    workflow_repo: str | None = None,
+    workflow_card: object = None,
+    workflow_phase: object = None,
+) -> dict[str, Any]:
+    """Resolve a handoff manifest's job binding without trusting its identity fields."""
+    job = _registry_job(registry, job_id)
+    if job is None:
+        return _unknown_execution_identity(card=workflow_card)
+    if isinstance(workflow_run_id, str) and workflow_run_id:
+        if not isinstance(workflow_card, str) or not workflow_card:
+            # A run binding without a card is still an explicit job binding;
+            # the job id remains the authority for the card projection.
+            bound = job.get("workflow_run_id") == workflow_run_id
+        else:
+            bound = _workflow_job_matches(
+                job,
+                run_id=workflow_run_id,
+                repo=workflow_repo,
+                card=workflow_card,
+                phase=workflow_phase if isinstance(workflow_phase, str) else None,
+            )
+    else:
+        bound = True
+        if workflow_repo is not None and job.get("workflow_repo") not in (None, workflow_repo):
+            bound = False
+        if isinstance(workflow_card, str) and workflow_card:
+            bound = bound and job.get("workflow_card") == workflow_card
+        if isinstance(workflow_phase, str) and workflow_phase:
+            bound = bound and job.get("workflow_phase") == workflow_phase
+    if not bound:
+        return _unknown_execution_identity(card=workflow_card)
+    status = job.get("status")
+    if status in IN_FLIGHT_STATUSES:
+        return _job_execution_identity(job, identity_source="in-flight", card=workflow_card)
+    if status in TERMINAL_STATUSES:
+        return _job_execution_identity(job, identity_source="last-execution", card=workflow_card)
+    return _unknown_execution_identity(card=workflow_card)
+
+
+def _workflow_execution_identity(registry, run) -> dict[str, Any]:
+    """Project the current workflow card's planned/actual/last identity.
+
+    Selection is intentionally ordered as current-card in-flight, current-card
+    terminal execution, planned step, then unknown.  A job from another card,
+    run, phase, or explicit repository is not evidence for this projection.
+    """
+    if not getattr(run, "steps", None):
+        return _unknown_execution_identity()
+    step = _current_workflow_step(run)
+    if step is None:
+        return _unknown_execution_identity()
+    jobs: list[Mapping[str, Any]] = []
+    lister = getattr(registry, "list_jobs", None)
+    if callable(lister):
+        try:
+            jobs = [job for job in lister() if isinstance(job, Mapping)]
+        except Exception:  # noqa: BLE001 - status projection is fail-soft
+            jobs = []
+    matching = [
+        job
+        for job in jobs
+        if _workflow_job_matches(
+            job,
+            run_id=run.run_id,
+            repo=getattr(run, "repo", None),
+            card=step.card,
+            phase=step.phase,
+        )
+    ]
+    in_flight = [job for job in matching if job.get("status") in IN_FLIGHT_STATUSES]
+    if in_flight:
+        return _job_execution_identity(in_flight[-1], identity_source="in-flight", card=step.card)
+    terminal = [job for job in matching if job.get("status") in TERMINAL_STATUSES]
+    if terminal:
+        return _job_execution_identity(terminal[-1], identity_source="last-execution", card=step.card)
+    if step.executor is not None or step.model is not None:
+        return {
+            "executor": step.executor,
+            "model": step.model,
+            "job_id": None,
+            "card": step.card,
+            "identity_source": "planned",
+            "execution_state": "not-dispatched",
+        }
+    return _unknown_execution_identity(card=step.card)
+
+
 def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runner=None) -> dict[str, Any]:
     slice_id = str(slice_row.get("slice_id") or "")
     builder_job_id = slice_row.get("builder_job_id")
@@ -792,6 +969,18 @@ def workflow_status_entry(
         phase=getattr(run, "current_phase", None),
         planning_failure_classification=hint_classification,
     )
+    persisted_next_step_hint = None
+    if isinstance(reason_payload, dict):
+        value = reason_payload.get("next_step_hint")
+        if isinstance(value, str) and value.strip():
+            persisted_next_step_hint = value
+    next_step_hint = persisted_next_step_hint or needs_human_next_step_hint(
+        phase=getattr(run, "current_phase", None),
+        planning_failure_classification=hint_classification,
+        work_id=getattr(run, "work_id", None),
+        repo=getattr(run, "repo", None),
+        run_id=getattr(run, "run_id", None),
+    )
     try:
         from .work_actions import _phase_recovery_actions
 
@@ -811,6 +1000,7 @@ def workflow_status_entry(
         ).to_dict()
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         candidate_git_base = None
+    execution_identity = _workflow_execution_identity(registry, run)
     return {
         "kind": "workflow_run",
         "run_id": run.run_id,
@@ -830,7 +1020,9 @@ def workflow_status_entry(
         "blocking_reason": dict(reason_payload) if isinstance(reason_payload, dict) else None,
         "evidence_refs": list(run.evidence_refs),
         "next_actions": list(next_actions),
+        "next_step_hint": next_step_hint,
         "updated_at": run.updated_at,
+        **execution_identity,
     }
 
 
@@ -3092,7 +3284,10 @@ def _validated_brainstorm_planning_authority(
             )
         existing = persisted.get(ref)
         if existing is None:
-            if not any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns):
+            if not (
+                any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns)
+                or planning_kind_bound(kind, ref, run.work_id)
+            ):
                 raise ValueError(
                     f"workflow brainstorm artifact outside planner outputs: ref={ref} "
                     f"(declared={','.join(declared_patterns) or '-'})"
@@ -4339,10 +4534,11 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
     if not isinstance(log_path, str) or not log_path:
         raise ValueError("workflow terminal log missing")
     try:
-        content = Path(log_path).read_text(encoding="utf-8")
+        with Path(log_path).open(encoding="utf-8", newline="") as handle:
+            content = handle.read()
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("workflow terminal log unreadable") from exc
-    lines = content.splitlines()
+    lines = content.split("\n")
     for line in reversed(lines):
         if not line.strip():
             continue
@@ -4369,7 +4565,7 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
             parsed = _parse_terminal_json_text(data.get("content"))
             if parsed is not None:
                 return parsed
-        for key in ("result", "content", "message", "text"):
+        for key in ("result", "content", "message", "text", "response"):
             parsed = _parse_terminal_json_text(value.get(key))
             if parsed is not None:
                 return parsed
@@ -4388,17 +4584,79 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
     raise ValueError("workflow terminal log has no JSON evidence")
 
 
+
+# #888：agy 以 --json-schema 產出 structured output 時，會在 canonical payload 之外
+# 多掛 Antigravity 自己的 tool 中繼欄位（toolAction／toolSummary）。這兩個鍵不是
+# 模型自由發揮，而是 CLI 把 schema 包成 function declaration 的固定副產物；只剝
+# 這兩個固定鍵，其餘多餘鍵仍交由 terminalize 的 exact key-set 檢查 fail closed。
+_AGY_STRUCTURED_OUTPUT_META_KEYS = ("toolAction", "toolSummary")
+
+
+def _strip_agy_structured_output_meta(payload: dict[str, object]) -> dict[str, object]:
+    if not any(key in payload for key in _AGY_STRUCTURED_OUTPUT_META_KEYS):
+        return payload
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _AGY_STRUCTURED_OUTPUT_META_KEYS
+    }
+
+
+def _fold_agy_key_value_map(value: object) -> object:
+    """#888：把 Gemini 相容 schema 產出的 ``[{key, value}]`` 陣列摺回字串鍵 map。
+
+    只在「每一項都恰好是 {key, value} 且 key 為非空字串、無重複」時摺回；其他
+    形狀原樣回傳，交由既有驗證 fail closed。
+    """
+
+    if not isinstance(value, list) or not value:
+        return value
+    folded: dict[str, object] = {}
+    for entry in value:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"key", "value"}
+            or not isinstance(entry["key"], str)
+            or not entry["key"]
+            or entry["key"] in folded
+        ):
+            return value
+        folded[entry["key"]] = entry["value"]
+    return folded
+
 def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
     if not isinstance(value, str):
         return None
-    fenced = re.fullmatch(r"```json\r?\n(?P<body>[\s\S]+)\r?\n```", value)
+    fenced = re.fullmatch(r"```json\r?\n(?P<body>[\s\S]+)\r?\n```\r?\n?", value)
     if fenced is not None:
         value = fenced.group("body")
+    else:
+        # AGY can emit progress prose before its final fenced terminal object.
+        # Accept the fence only when it is the response suffix; embedded example
+        # blocks remain non-terminal evidence.
+        trailing_fenced = re.search(
+            r"(?:^|\r?\n)```json\r?\n(?P<body>[\s\S]+?)\r?\n```\r?\n?\Z",
+            value,
+        )
+        if trailing_fenced is not None:
+            value = trailing_fenced.group("body")
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
+        # AGY may prepend progress text even when asked for a terminal JSON object.
+        # Accept only a complete terminal payload at the very end of the response;
+        # arbitrary embedded JSON remains rejected.
+        for start in (index for index, char in enumerate(value) if char == "{"):
+            try:
+                parsed = json.loads(value[start:].strip())
+            except json.JSONDecodeError:
+                continue
+            if _is_workflow_terminal_payload(parsed):
+                return _strip_agy_structured_output_meta(parsed)
         return None
-    return parsed if _is_workflow_terminal_payload(parsed) else None
+    if not _is_workflow_terminal_payload(parsed):
+        return None
+    return _strip_agy_structured_output_meta(parsed)
 
 
 def _is_workflow_terminal_payload(value: object) -> bool:
@@ -6326,6 +6584,13 @@ def terminalize_workflow_job(
             raise ValueError(
                 f"workflow verification terminal reported non-passing status: {raw.get('status')}"
             )
+        details = raw.get("details")
+        if isinstance(details, str) and details.strip():
+            logger.warning(
+                "workflow verification terminal details normalized from string for job=%s",
+                job_id,
+            )
+            raw = {**raw, "details": {"text": details}}
         if (
             set(raw) != required
             or raw.get("schema_version") != 1
@@ -6362,6 +6627,11 @@ def terminalize_workflow_job(
         required = {"schema_version", "kind", "reason", "findings", "reports"}
         if expected_authority_hashes:
             required = required | {"authority_hashes"}
+            if "authority_hashes" in raw:
+                raw = {
+                    **raw,
+                    "authority_hashes": _fold_agy_key_value_map(raw["authority_hashes"]),
+                }
         # #261 R1：review card 同樣必須能誠實回報 failed／needs_human。status 是
         # canonical envelope 的選填欄位（review verdict 本身由 findings 決定），
         # 在此先取出並攔截非通過狀態，再做既有的 exact key-set 驗證。
@@ -7855,6 +8125,49 @@ def _record_planning_artifact_rejection_evidence(
         return None
 
 
+def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bool:
+    """Whether a planning artifact uses its canonical work-item destination.
+
+    The planning runtime always materializes the accepted spec/design/plan
+    triplet, even when a combo's manifest omits the optional brainstorming card
+    (for example ``fix-standard``).  Keep that runtime contract independent of
+    the combo's flattened output list while still binding each kind to its own
+    destination family and work item.
+    """
+
+    if (
+        kind not in {"spec", "design", "plan"}
+        or not isinstance(path_value, str)
+        or not path_value
+        or not isinstance(work_id, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None
+    ):
+        return False
+    relative = Path(path_value)
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or relative.as_posix() != path_value
+        or len(relative.parts) != 4
+    ):
+        return False
+    if kind in {"spec", "design"}:
+        if relative.parts[:3] != ("docs", "superpowers", "specs"):
+            return False
+        pattern = f"docs/superpowers/specs/*{work_id}*-{kind}.md"
+    else:
+        if relative.parts[:3] != ("docs", "superpowers", "plans"):
+            return False
+        pattern = f"docs/superpowers/plans/*{work_id}*.md"
+    if relative.suffix != ".md":
+        return False
+    # The accepted planning contract intentionally permits any basename slug
+    # containing the work item.  The directory, four-part relative path and
+    # normalized-path guards above keep this basename glob from crossing into
+    # another governed root or escaping the workspace.
+    return fnmatch.fnmatch(path_value, pattern)
+
+
 def _publish_planning_artifacts(
     root_value: str,
     rows: object,
@@ -7898,11 +8211,12 @@ def _publish_planning_artifacts(
             and relative.parts[2] != "archive"
         )
         manifest_bound = any(fnmatch.fnmatch(path_value, pattern) for pattern in allowed_refs)
+        kind_bound = planning_kind_bound(row.get("kind"), path_value, work_id)
         if (
             relative.is_absolute()
             or ".." in relative.parts
             or not (docs_bound or openspec_bound)
-            or not manifest_bound
+            or not (manifest_bound or kind_bound)
             or relative.suffix != ".md"
         ):
             raise ValueError("planning artifact path outside governed roots")
@@ -8148,7 +8462,10 @@ def _rank_candidates_by_resolution_layer(
 
     role = model_resolution.role_for_persona(persona)
     ranked = model_resolution.rank_candidates(
-        candidates, role=role, context=identities.resolution_context
+        candidates,
+        role=role,
+        context=identities.resolution_context,
+        compatibility_for=model_resolution.compatibility_checker_for(persona),
     )
     for warning in ranked.warnings:
         logger.warning(
@@ -8403,6 +8720,7 @@ def _runtime_preflight_gate(
         return None
 
     candidates = _workflow_identity_candidates(run, step, identities)
+    compatibility_for = model_resolution.compatibility_checker_for(step.persona)
 
     # 每個 identity 只 specialize 一次並記憶：preflight 與最終 dispatch 共用同一
     # 個 launcher 實例，因此（a）檢查的環境就是 job 的環境，（b）通過的 identity
@@ -8413,6 +8731,10 @@ def _runtime_preflight_gate(
         key = id(identity)
         if key not in specialized:
             specialized[key] = _specialize_workflow_launcher(launcher_factory(identity), step)
+            if compatibility_for is not None:
+                model_resolution.validate_identity_compatibility(
+                    step.persona, identity, launcher=specialized[key]
+                )
         return specialized[key]
 
     def _environment_for(identity):
@@ -9601,6 +9923,16 @@ def _dispatch_workflow_card(
         if launcher is None:
             raise ValueError("workflow launcher unavailable")
         launcher = _specialize_workflow_launcher(launcher, step)
+    if identity is not None:
+        # Hardened candidate ranking checks the static registry contract.  A
+        # final check against the specialized launcher closes the remaining
+        # dependency seam before any job/worktree launch side effect; direct
+        # mode intentionally keeps the legacy operator-overlay path.
+        compatibility_for = model_resolution.compatibility_checker_for(step.persona)
+        if compatibility_for is not None:
+            model_resolution.validate_identity_compatibility(
+                step.persona, identity, launcher=launcher
+            )
     # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
     # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
     _record_resolved_model_chain(registry, run, step, identity, identities)
@@ -11771,6 +12103,13 @@ def apply_workflow_action(
         # 這裡把它 hoist 成區域變數，好讓 evidence 與 needs_human_reason 兩者
         # 引用**同一個**判定結果，不各算一次。
         brainstorm_classification = _classify_planning_failure(brainstorm_not_ready_reason)
+        brainstorm_next_step_hint = needs_human_next_step_hint(
+            phase=run.current_phase,
+            planning_failure_classification=brainstorm_classification,
+            work_id=run.work_id,
+            repo=run.repo,
+            run_id=run.run_id,
+        )
         brainstorm_evidence_refs = _record_planning_failure_evidence(
             run,
             coordinator_root=transaction_root,
@@ -11791,6 +12130,7 @@ def apply_workflow_action(
                 f"brainstorm 未收斂（state={result.state}）：{brainstorm_not_ready_reason}",
                 source="manager.apply_workflow_action:start-brainstorm",
                 evidence_refs=brainstorm_evidence_refs,
+                next_step_hint=brainstorm_next_step_hint,
                 run_id=run.run_id,
                 work_id=run.work_id,
                 classification=brainstorm_classification,

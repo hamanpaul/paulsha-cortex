@@ -1300,13 +1300,19 @@ EXECUTOR_CREDENTIALS: tuple[ExecutorCredential, ...] = (
 #: **明文接受的有界殘餘風險**，不另拆帳號。它在後續任何「planner 攻擊面」討論中**不得**
 #: 被當成未知——U-4 的裁決逐字如此。
 #:
-#: **`builder` 只有一格**：builder 不做 planning，不需要異質性；擴大它的 provider
-#: 曝險面買不到任何東西。但那一格的**形狀**與 reviewer-planner 的 codex 逐字相同
+#: **install plan／provider manifest 的 builder 預設只有 codex 一格**；AGY builder 只有在
+#: live qualification 前後由 operator 明示加入 provider manifest 才會匯入。builder 不做
+#: planning，不需要異質性；
+#: 未經 qualification 擴大它的 provider 曝險面買不到任何東西。但每一格的**形狀**與
+#: reviewer-planner 對應 executor 逐字相同
 #: （#698）——形狀不是 per-account 的偏好，是 :data:`EXECUTOR_ENFORCEMENT_LEAVES`
 #: 那條規則的結果。
 CREDENTIALED_ACCOUNTS: Mapping[str, tuple[tuple[str, CredentialShape], ...]] = (
     MappingProxyType({
-        "builder": (("codex", CredentialShape.HOME_STICKY_TREE),),
+        "builder": (
+            ("codex", CredentialShape.HOME_STICKY_TREE),
+            ("agy", CredentialShape.HOME_REDIRECT_TREE),
+        ),
         "reviewer-planner": (
             ("codex", CredentialShape.HOME_STICKY_TREE),
             ("agy", CredentialShape.HOME_REDIRECT_TREE),
@@ -6098,10 +6104,12 @@ RUN_EXTERNAL_DEPENDENCIES: tuple[RunDependency, ...] = (
     ),
     RunDependency(
         "agy", DependencyKind.TOOLCHAIN_PROGRAM,
-        (Principal.PLANNER, Principal.MANAGER), (RunStage.MODEL_CALL, RunStage.DISPATCH),
+        (Principal.PLANNER, Principal.MANAGER, Principal.BUILDER),
+        (RunStage.MODEL_CALL, RunStage.DISPATCH),
         covered_by="EXECUTOR_TOOLS",
         note=(
-            "planning 的 canonical executor。Manager 另外會跑 `agy models`（"
+            "planning 的 canonical executor；AGY 被選為 builder 時，builder job 也必須"
+            "從同一棵 root-owned toolchain 取得它。Manager 另外會跑 `agy models`（"
             "`model_identities` 的 live probe ＋ doctor 的 `agy` probe），因此它同樣"
             "要在 Manager 的 `PATH` 上。"
         ),
@@ -6124,6 +6132,16 @@ RUN_EXTERNAL_DEPENDENCIES: tuple[RunDependency, ...] = (
             "`manager-gh-credential` 不同級**。\n"
             "**#698 起形狀是 root-owned ＋ sticky 的整棵樹**（不再是單檔 `auth.json`）："
             "#686 實測 codex 需要 `$CODEX_HOME` 整棵可寫，只放行單檔時它連起都起不來。"
+        ),
+    ),
+    RunDependency(
+        "builder-agy-state", DependencyKind.CREDENTIAL,
+        (Principal.BUILDER,), (RunStage.MODEL_CALL,),
+        covered_by="builder-agy-state",
+        note=(
+            "builder principal 明示匯入的 AGY OAuth／狀態樹（`~/.gemini` → "
+            "`cache/gemini`）。它與 reviewer-planner 的 AGY 登入態是兩個登記資產；"
+            "不得從另一個 principal 的 `$HOME` 探索、複製或回退。"
         ),
     ),
     RunDependency(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -22,9 +23,15 @@ _GIT_REPOSITORY_ENV_KEYS = job_runner.GIT_REPOSITORY_ENV_KEYS | frozenset(
 # 的憑證判準永遠是同一條 pattern，不會兩處漂移。
 _CREDENTIAL_ENV_RE = job_runner.CREDENTIAL_ENV_RE
 
+AGY_PRINT_TIMEOUT_ENV = "PSC_AGY_PRINT_TIMEOUT"
+_AGY_PRINT_TIMEOUT_BUFFER_SECONDS = 600
+_AGY_PRINT_TIMEOUT_MAX_SECONDS = 9223372036
+_AGY_PRINT_TIMEOUT_MAX_SECONDS_TEXT = str(_AGY_PRINT_TIMEOUT_MAX_SECONDS)
+_AGY_CANONICAL_DURATION_RE = re.compile(r"[1-9][0-9]*s")
+
 
 def _claude_review_json_schema(kind: str) -> str:
-    """Bind Claude StructuredOutput to the Manager terminal contract."""
+    """Build the shared Manager terminal-contract schema for Claude and AGY reviewers."""
 
     report = {
         "type": "object",
@@ -520,6 +527,51 @@ def _claude_spool_hook_settings() -> str:
     return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
+def _claude_builder_settings() -> str:
+    """Grant commit-required jobs Git writes and exact declared Python tests.
+
+    This is a per-process usability grant, not an OS sandbox. Never derive
+    permissions from candidate files or prompt text. Other gate executables
+    remain subject to the existing approval policy.
+    """
+    settings = json.loads(_claude_spool_hook_settings())
+    allowed = ["Bash(git add:*)", "Bash(git commit:*)"]
+    safe_chars = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/.:=,@+"
+    )
+    for spec in gate_ledger.load_gate_specs():
+        argv = spec.argv
+        offset = 0
+        # Support the existing scoped repository-selector cleanup, not an
+        # arbitrary env wrapper or executable/PATH substitution.
+        if Path(argv[0]).name == "env":
+            if argv[1:3] != ("-u", "PSC_REPO_ROOT"):
+                continue
+            offset = 3
+        command = argv[offset:]
+        if not command:
+            continue
+        executable = Path(command[0]).name
+        is_test = executable == "pytest" or (
+            executable in {"python", "python3"}
+            and command[1:3] in {("-m", "pytest"), ("-m", "unittest")}
+        )
+        if not is_test:
+            continue
+        # Claude rules have their own pattern grammar. Even shell-quoted
+        # wildcard/metacharacter arguments must not become permission rules.
+        if any(not set(arg) <= safe_chars for arg in argv):
+            # Name the offending gate so operators can find the PSC_GATE_CMD_*
+            # declaration; the command itself is operator-declared, not secret.
+            raise ValueError(
+                "Claude builder gate cannot be represented as an exact permission rule: "
+                f"gate={spec.name!r} command={spec.command!r}"
+            )
+        allowed.append(f"Bash({spec.command})")
+    settings["permissions"] = {"allow": sorted(set(allowed))}
+    return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
 def _git_scope_env() -> dict[str, str]:
     """Drop inherited Git repository/config selectors before scope binding."""
 
@@ -949,7 +1001,10 @@ def build_claude_argv(
         # - review_only reviewer 是 read-only 契約，且它的 `--settings` 是那份
         #   sandbox 政策（deny 掉 $HOME 讀寫），事件根本寫不出去。
         # 這一行是 hook 的**唯一**注入點：per-job、走 argv、不落地任何檔案。
-        argv += ["--settings", _claude_spool_hook_settings()]
+        argv += [
+            "--settings",
+            _claude_builder_settings() if commit_required else _claude_spool_hook_settings(),
+        ]
     if model is not None:
         argv += ["--model", model]
     if worktree is not None and not review_only:
@@ -1176,6 +1231,129 @@ def _codex_sandbox_mode(
     return mode
 
 
+
+def _gemini_compatible_schema(node: object) -> object:
+    """Rewrite a JSON schema into the subset Gemini structured output accepts (#888).
+
+    Antigravity forwards ``--json-schema`` as a Gemini function declaration.
+    Gemini's Schema subset only accepts **string** enum members and a single
+    ``type``; ``{"type": "integer", "enum": [1]}`` is serialised as an empty
+    string and rejected with ``INVALID_ARGUMENT … enum[0]: cannot be empty``,
+    and ``"type": ["integer", "null"]`` is not a valid type either.  Both
+    shapes are rewritten to the equivalent constraints Gemini understands:
+    a single-valued numeric enum becomes ``minimum``/``maximum`` and a
+    ``null``-bearing type list becomes the remaining type plus
+    ``nullable: true``.  Everything else (including ``additionalProperties``)
+    is preserved verbatim, so the Claude schema stays the single source.
+    """
+
+    if isinstance(node, list):
+        return [_gemini_compatible_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    # Gemini has no ``additionalProperties`` map type either: the model is
+    # forced to invent identifier-like property names, so a string-keyed map
+    # (``authority_hashes``: repo path → sha256) comes back with mangled keys.
+    # A map-shaped object becomes an array of ``{"key", "value"}`` entries;
+    # Manager folds those entries back into the canonical mapping.
+    if (
+        node.get("type") == "object"
+        and isinstance(node.get("additionalProperties"), dict)
+        and "properties" not in node
+    ):
+        return {
+            **{k: v for k, v in node.items() if k not in {"type", "additionalProperties"}},
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["key", "value"],
+                "properties": {
+                    "key": {"type": "string", "minLength": 1},
+                    "value": _gemini_compatible_schema(node["additionalProperties"]),
+                },
+            },
+        }
+    rewritten: dict[str, object] = {}
+    for key, value in node.items():
+        if key == "enum" and isinstance(value, list) and value and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool) for item in value
+        ):
+            if len(set(value)) != 1:
+                raise ValueError("gemini schema cannot express multi-valued numeric enum")
+            rewritten["minimum"] = value[0]
+            rewritten["maximum"] = value[0]
+            continue
+        if key == "type" and isinstance(value, list):
+            remaining = [item for item in value if item != "null"]
+            if len(remaining) != 1:
+                raise ValueError("gemini schema requires exactly one non-null type")
+            rewritten["type"] = remaining[0]
+            if len(remaining) != len(value):
+                rewritten["nullable"] = True
+            continue
+        rewritten[key] = _gemini_compatible_schema(value)
+    return rewritten
+
+
+def _gemini_review_json_schema(kind: str) -> str:
+    """The shared reviewer terminal schema, rewritten for Gemini (#888)."""
+
+    return json.dumps(
+        _gemini_compatible_schema(json.loads(_claude_review_json_schema(kind))),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _validate_agy_print_timeout_seconds(seconds: str, *, setting_name: str) -> str:
+    if len(seconds) > len(_AGY_PRINT_TIMEOUT_MAX_SECONDS_TEXT) or (
+        len(seconds) == len(_AGY_PRINT_TIMEOUT_MAX_SECONDS_TEXT)
+        and seconds > _AGY_PRINT_TIMEOUT_MAX_SECONDS_TEXT
+    ):
+        raise ValueError(f"{setting_name} exceeds AGY Go duration limit")
+    return seconds
+
+
+def _validate_agy_print_timeout_keyword(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("print_timeout must be a string")
+    if _AGY_CANONICAL_DURATION_RE.fullmatch(value) is None:
+        raise ValueError("print_timeout must be a canonical duration like 2400s")
+    _validate_agy_print_timeout_seconds(value[:-1], setting_name="print_timeout")
+    return value
+
+
+def resolve_agy_print_timeout(env: Mapping[str, str]) -> str:
+    if AGY_PRINT_TIMEOUT_ENV in env:
+        raw: object = env[AGY_PRINT_TIMEOUT_ENV]
+        if not isinstance(raw, str):
+            raise ValueError(f"{AGY_PRINT_TIMEOUT_ENV} must be a string")
+        stripped = raw.strip()
+        if not stripped:
+            raise ValueError(f"{AGY_PRINT_TIMEOUT_ENV} must be a non-empty ASCII integer")
+        if not stripped.isascii() or not stripped.isdigit():
+            raise ValueError(f"{AGY_PRINT_TIMEOUT_ENV} must contain only ASCII digits")
+        seconds = stripped.lstrip("0")
+        if not seconds:
+            raise ValueError(f"{AGY_PRINT_TIMEOUT_ENV} must be greater than zero")
+        return (
+            f"{_validate_agy_print_timeout_seconds(seconds, setting_name=AGY_PRINT_TIMEOUT_ENV)}s"
+        )
+
+    gate_seconds = max(
+        gate_ledger.DEFAULT_GATE_TIMEOUT_SECONDS,
+        gate_ledger._gate_timeout(env),
+    ) + _AGY_PRINT_TIMEOUT_BUFFER_SECONDS
+    if gate_seconds > _AGY_PRINT_TIMEOUT_MAX_SECONDS:
+        raise ValueError(
+            "AGY print timeout derived from "
+            f"{gate_ledger.GATE_TIMEOUT_ENV} exceeds AGY Go duration limit"
+        )
+    return f"{gate_seconds}s"
+
+
 def build_agy_argv(
     *,
     prompt: str,
@@ -1185,26 +1363,87 @@ def build_agy_argv(
     remote: str | None = None,
     allow_unsafe: bool = False,
     model: str | None = None,
+    # A missing worktree is the historical direct-planning shape.  A supplied
+    # worktree with the default ``False`` is the explicit builder shape.
     read_only: bool = False,
     review_only: bool = False,
+    commit_required: bool = False,
+    write_forbidden: bool = False,
+    review_terminal_kind: str | None = None,
+    # Workflow lanes want the single-line JSON envelope; the capability probe
+    # (#670) keeps the bare ``--output-format text`` shape because the CLI
+    # rejects ``--json-schema`` there and the probe parser reads raw JSON.
+    json_envelope: bool = True,
+    print_timeout: str | None = None,
 ) -> list[str]:
-    """Build the only supported Antigravity invocation: headless plan+sandbox.
+    """Build the headless Antigravity invocation for each launcher persona.
 
-    Antigravity exposes ``--dangerously-skip-permissions`` but cortex never
-    emits it.  The planner peer is evidence-only, so it has no reason to run
-    with write permissions even when another executor was explicitly granted
-    unsafe mode.
+    Planner and reviewer cards keep the established ``plan+sandbox`` shape;
+    reviewers additionally receive their disposable checkout.  A builder is
+    identified by its provisioned worktree and uses ``accept-edits`` unless its
+    card explicitly forbids workspace writes, in which case it keeps the
+    strict ``plan+sandbox`` shape while receiving a read-only ``--add-dir`` for
+    that checkout.  The unsafe flag is an explicit builder-only bypass, while
+    commit-required builders receive the same narrowly scoped linked-worktree
+    Git directories as the other write-capable executors.
     """
-    if allow_unsafe:
-        raise ValueError("agy executor does not support unsafe mode")
-    argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
-    # Antigravity's plan sandbox otherwise runs in an isolated workspace and
-    # cannot inspect a reviewer checkout at all.  Planner cards receive their
-    # source material through Manager-owned input envelopes and stay zero-tool;
-    # reviewer cards need the explicitly provisioned disposable checkout so
-    # their read-only inspection is about the exact Candidate.
-    if review_only and worktree is not None:
-        argv.extend(["--add-dir", str(Path(worktree).resolve())])
+    if read_only and review_only:
+        raise ValueError("agy launcher cannot be both planner-read-only and reviewer-read-only")
+    if (read_only or review_only) and allow_unsafe:
+        raise ValueError("read-only agy launcher cannot bypass permissions")
+    if commit_required and (read_only or review_only or allow_unsafe or write_forbidden):
+        raise ValueError("commit-required agy builder requires enforced workspace-write")
+    if write_forbidden and allow_unsafe:
+        raise ValueError("write-forbidden agy builder cannot bypass permissions")
+
+    if review_only and not json_envelope:
+        raise ValueError("agy reviewer requires json envelope for terminal schema")
+
+    if review_only:
+        if review_terminal_kind is None:
+            raise ValueError("agy reviewer terminal contract kind missing")
+        review_schema = _gemini_review_json_schema(review_terminal_kind)
+    else:
+        if review_terminal_kind is not None:
+            raise ValueError("agy terminal contract requires reviewer mode")
+        review_schema = None
+    resolved_print_timeout = (
+        resolve_agy_print_timeout(os.environ)
+        if print_timeout is None
+        else _validate_agy_print_timeout_keyword(print_timeout)
+    )
+
+    # Unsafe and commit-required modes are builder-only; accepting either
+    # without a provisioned checkout would silently turn an invalid builder
+    # request into the historical read-only planning shape.
+    if worktree is None and (allow_unsafe or commit_required):
+        raise ValueError("agy builder requires a worktree")
+    if read_only or review_only or write_forbidden or worktree is None:
+        argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
+        # Antigravity's plan sandbox otherwise runs in an isolated workspace and
+        # cannot inspect a reviewer checkout at all.  Planner cards receive their
+        # source material through Manager-owned input envelopes and stay zero-tool;
+        # reviewer cards need the explicitly provisioned disposable checkout so
+        # their read-only inspection is about the exact Candidate.
+        if (review_only or (write_forbidden and not read_only)) and worktree is not None:
+            argv.extend(["--add-dir", str(Path(worktree).resolve())])
+    else:
+        worktree = str(Path(worktree).resolve())
+        argv = ["agy", "--print", prompt, "--mode", "accept-edits"]
+        argv.extend(["--add-dir", worktree])
+        if commit_required:
+            for git_write_dir in _linked_worktree_git_write_dirs(worktree):
+                argv += ["--add-dir", git_write_dir]
+        if allow_unsafe:
+            argv.append("--dangerously-skip-permissions")
+    # Antigravity's default text output pretty-prints structured responses over
+    # multiple lines.  Workflow terminal evidence is JSONL, so ask the CLI for
+    # its single-line JSON envelope and let Manager unwrap the ``response``.
+    if json_envelope:
+        argv.extend(["--output-format", "json"])
+    if review_schema is not None:
+        argv.extend(["--json-schema", review_schema])
+    argv.extend(["--print-timeout", resolved_print_timeout])
     if model is not None:
         argv.extend(["--model", model])
     return argv
@@ -1246,10 +1485,10 @@ def build_cg_argv(
     ``worktree``／``remote`` 是為了滿足與其餘 builder 共用的呼叫介面而接收，
     實際不會進入回傳的 argv（prompt 由呼叫端經 stdin 餵入）。
 
-    比照 `build_agy_argv` 對 `allow_unsafe` 的拒絕模式：agy 與 cg 都是 read-only
-    planner，這裡同樣 fail-closed，而非靜默降級成安全形狀——commit_required／
-    unsafe／非 read-only-或-review-only 的「builder 語境」一律 raise，讓誤用在
-    建構期就顯性失敗，不會把一個從未被授權寫入的 executor 悄悄放進 builder 角色。
+    比照 `build_agy_argv` 對 `allow_unsafe` 的拒絕模式：cg 是 read-only planner，
+    這裡同樣 fail-closed，而非靜默降級成安全形狀——commit_required／unsafe／非
+    read-only-或-review-only 的「builder 語境」一律 raise，讓誤用在建構期就顯性失敗，
+    不會把一個從未被授權寫入的 executor 悄悄放進 builder 角色。
     """
     if allow_unsafe:
         raise ValueError("cg executor does not support unsafe mode")
@@ -1308,6 +1547,30 @@ _ARGV_BUILDERS = {
 }
 
 
+def build_headless_popen_kwargs(
+    *,
+    cwd: str | None,
+    env: Mapping[str, str],
+    executor: str,
+) -> dict[str, object]:
+    """Build the common spawn kwargs for every headless executor.
+
+    The launcher owns the process-group boundary.  Runner-specific callers may
+    override stdin, cwd, or env after this helper returns, but every Popen
+    attempt starts from the same isolated-session contract.
+    """
+
+    kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "stderr": subprocess.STDOUT,
+        "start_new_session": True,
+    }
+    if executor == "claude":
+        kwargs["stdin"] = subprocess.PIPE
+    return kwargs
+
+
 class SubprocessLauncher:
     """真實作：headless subprocess 啟動。測試 MUST 注入 fake，不實體化。"""
 
@@ -1329,8 +1592,6 @@ class SubprocessLauncher:
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
-        if executor == "agy" and allow_unsafe:
-            raise ValueError("agy executor refuses unsafe mode")
         if executor == "cg" and allow_unsafe:
             raise ValueError("cg executor refuses unsafe mode")
         if (read_only or review_only) and executor == "copilot":
@@ -1835,37 +2096,40 @@ class SubprocessLauncher:
             "review_only": self._review_only,
         }
         # #396 item 3：claude 併入 commit_required 傳遞——builder-persona 的
-        # as_commit_required() 轉換（autonomy.dispatch_ready）對三個 executor
-        # 一視同仁，build_claude_argv 缺這個 kwarg 會讓轉換對 claude 變 no-op。
+        # as_commit_required() 轉換（autonomy.dispatch_ready）對所有可寫 executor
+        # 一視同仁，漏掉這個 kwarg 會讓轉換對該 executor 變 no-op。
         # cg 併入同一份 kwarg（issue #442）：self._commit_required 對任何成功建構
         # 的 cg launcher 恆為 False（見 __init__ 的 cg 專屬不變量），這裡顯式傳遞
         # 只是與其餘 builder 的呼叫形狀一致、defense-in-depth，不改變行為。
-        if self._executor in {"codex", "copilot", "claude", "cg"}:
+        if self._executor in {"codex", "copilot", "claude", "agy", "cg"}:
             builder_kwargs["commit_required"] = self._commit_required
         # #716：只有 codex 的 argv 上有 `--sandbox <mode>` 這個維度可表達。其餘 executor
         # 沒有對應旗標（`build_claude_argv` 走 `--permission-mode`、`build_copilot_argv`
-        # 走 `--allow-all`／`--deny-tool`、agy／cg 是 plan-only／zero-tool），傳過去只會
-        # 是一個沒人接的 kwarg——形狀與既有的 `verdict_spool_dir`／`effort`／
-        # `last_message_path` 逐條一致：能力有差異就顯式分岔，不塞給接不住的那幾支。
+        # 走 `--allow-all`／`--deny-tool`、agy 走 plan 或 accept-edits、cg 是
+        # zero-tool），傳過去只會是一個沒人接的 kwarg——形狀與既有的
+        # `verdict_spool_dir`／`effort`／`last_message_path` 逐條一致：能力有差異就
+        # 顯式分岔，不塞給接不住的那幾支。
         #
         # ⚠️ 這是**範圍**判斷，不是「其餘 executor 的最小權限已經對了」的宣稱。
         # `claude` 的 `--permission-mode` 有沒有對應的降級形態**沒有量過**（#716 comment
         # 記過 `EXECUTOR_TOOLS` 的 `inner_sandbox=None` 同時代表「沒有」與「還沒量」，
         # 那是同一族的錯）。要動那幾支，得先各自量一次。
-        if self._executor == "codex":
+        if self._executor in {"codex", "agy"}:
             builder_kwargs["write_forbidden"] = self._write_forbidden
-        # trust-root Phase 2a：Codex／Claude express the spool grant with
-        # `--add-dir`; Copilot uses exact `--allow-tool` entries instead. agy／cg
-        # are zero-tool／plan-only and cannot be assigned a slice-lane reviewer
-        # spool, so reject a spool grant for them explicitly.
+        # trust-root Phase 2a：Codex／Claude express the reviewer spool grant
+        # with `--add-dir`; Copilot uses exact `--allow-tool` entries instead.
+        # agy's `--add-dir` is reserved for its provisioned worktree and, when
+        # required, linked-worktree Git metadata—it cannot receive a slice-lane
+        # reviewer spool grant.
         if self._verdict_spool_dir is not None:
             if self._executor not in {"codex", "copilot", "claude"}:
                 raise ValueError(
                     f"executor {self._executor} cannot be granted a verdict spool write path"
                 )
             builder_kwargs["verdict_spool_dir"] = self._verdict_spool_dir
-        if self._executor == "claude":
+        if self._executor in {"claude", "agy"}:
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
+        if self._executor == "claude":
             # Claude's complete workflow envelope can exceed Linux's per-argv
             # limit.  The wrapper receives it over stdin instead.
             builder_kwargs["prompt_via_stdin"] = True
@@ -1876,6 +2140,8 @@ class SubprocessLauncher:
         # `effort` 逐條一致：能力有差異就顯式分岔，不塞 None 給接不住的那幾支）。
         if self._executor == "codex":
             builder_kwargs["last_message_path"] = last_message_path
+        if self._executor == "agy":
+            builder_kwargs["print_timeout"] = resolve_agy_print_timeout(os.environ)
         inner_argv = _ARGV_BUILDERS[self._executor](
             **builder_kwargs,
         )
@@ -2044,13 +2310,11 @@ class SubprocessLauncher:
         # 白名單 env 建立完成之後重新 source ~/.profile，把 env 約束整個覆寫掉。
         # direct 模式的 builder 維持 `-lc` 不動——那是既有行為，本票不改。
         argv = ["bash", "-c" if (self._review_only or degraded) else "-lc", script]
-        popen_kwargs: dict[str, object] = {
-            "cwd": worktree,
-            "env": env,
-            "stderr": subprocess.STDOUT,
-        }
-        if self._executor == "claude":
-            popen_kwargs["stdin"] = subprocess.PIPE
+        popen_kwargs = build_headless_popen_kwargs(
+            cwd=worktree,
+            env=env,
+            executor=self._executor,
+        )
         if runner_plan is not None:
             argv = job_runner.build_systemd_run_argv(
                 systemd_run=runner_plan.binary,
