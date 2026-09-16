@@ -2229,6 +2229,26 @@ def _record_operator_adjudication(
     )
 
 
+def operator_adjudication_receipt(
+    evidence: dict[str, str] | None, *, card: str
+) -> dict[str, object] | None:
+    """#814：`--reason` 落地後回給 operator 的收據——明示裁決已記錄、會於下一次該卡 dispatch
+    隨 contract 的 `operator_adjudications` 注入 prompt。舊行為只回 `adjudication_evidence`，
+    operator 無從得知它是否真的會被 builder 讀到。沒有 evidence（未帶 reason）回 None。
+    """
+
+    if evidence is None:
+        return None
+    return {
+        "evidence": dict(evidence),
+        "next_step_hint": (
+            f"裁決已記錄為 immutable evidence，將於下一次 `{card}` dispatch 隨 contract 的 "
+            "`operator_adjudications` 區塊逐字注入 builder／reviewer prompt（兩側讀同一份 evidence）；"
+            "不需要再繞 reviewer findings 轉述。"
+        ),
+    }
+
+
 def _validate_operator_adjudication_args(
     args: dict[str, Any], *, state_path: Path | None, action: str
 ) -> None:
@@ -2383,6 +2403,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
     return {
         "action": "retry-build",
         "adjudication_evidence": adjudication_evidence,
+        "adjudication": operator_adjudication_receipt(adjudication_evidence, card="subagent-build"),
         "reason": "candidate-repair-dispatched",
         "expected_candidate": expected_candidate.lower(),
         "run": updated.to_dict(),
@@ -2655,6 +2676,7 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     return {
         "action": "retry-card",
         "adjudication_evidence": adjudication_evidence,
+        "adjudication": operator_adjudication_receipt(adjudication_evidence, card=card),
         "reason": f"{expected_persona}-card-redispatched",
         "expected_run_id": expected_run_id,
         "run_id": run.run_id,
