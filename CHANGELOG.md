@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#830 派工非 Job 決策契約**：`classify_dispatch_result` 把派工結果分成真 Job（registry 綁定）／合法
+  decision／確定性 transition／None，malformed 或 forged job_id fail-closed；daemon start／work-action、
+  manager resume 與 provider retry 五個消費端接上，Red sizing 的 `needs-decomposition` 不再 `KeyError`
+  或被 periodic resume 改寫成 needs_human；request 回應新增 `dispatch.kind`。
+
 - **歸檔 openspec change `installer-shared-config-guard`**：PR 913 交付時只帶進 tasks.md、未
   archive，daemon 每輪掃成 `not_claimable: missing_issue`；因無 proposal.md、`openspec archive`
   不認得，改以 git mv 歸檔到 `openspec/changes/archive/2026-09-16-installer-shared-config-guard/`。

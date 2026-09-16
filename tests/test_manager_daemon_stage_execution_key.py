@@ -150,7 +150,11 @@ def test_start_dispatches_normally_when_no_reusable_stage_evidence(
 
     def _fake_dispatch(*args, **kwargs):
         dispatch_calls.append(kwargs)
-        return {"job_id": "new-build-job"}
+        # #830：daemon 消費端現在驗 registry 綁定，fake 必須登記綁到本 run 的真 Job。
+        return registry.create_job(
+            task="new-build-job", persona="builder", branch="feature/new-build-job", pane="",
+            worktree=str(tmp_path / "new-build-job"), workflow_run_id=run.run_id, workflow_card="build",
+        )
 
     monkeypatch.setattr(manager, "dispatch_workflow_card", _fake_dispatch)
 
@@ -181,7 +185,7 @@ def test_start_dispatches_normally_when_no_reusable_stage_evidence(
     )
 
     assert len(dispatch_calls) == 1
-    assert result["job_id"] == "new-build-job"
+    assert result["job_id"] == registry.list_jobs()[-1]["job_id"]
     assert "reused_from" not in result
 
 
@@ -201,7 +205,11 @@ def test_start_without_stage_execution_key_keeps_previous_behavior(
 
     def _fake_dispatch(*args, **kwargs):
         dispatch_calls.append(kwargs)
-        return {"job_id": "new-build-job"}
+        # #830：daemon 消費端現在驗 registry 綁定，fake 必須登記綁到本 run 的真 Job。
+        return registry.create_job(
+            task="new-build-job", persona="builder", branch="feature/new-build-job", pane="",
+            worktree=str(tmp_path / "new-build-job"), workflow_run_id=run.run_id, workflow_card="build",
+        )
 
     monkeypatch.setattr(manager, "dispatch_workflow_card", _fake_dispatch)
 
@@ -213,5 +221,5 @@ def test_start_without_stage_execution_key_keeps_previous_behavior(
     )
 
     assert len(dispatch_calls) == 1
-    assert result["job_id"] == "new-build-job"
+    assert result["job_id"] == registry.list_jobs()[-1]["job_id"]
     assert "reused_from" not in result
