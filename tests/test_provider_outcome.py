@@ -196,6 +196,20 @@ def test_launch_failure_only_classifies_missing_executable_when_exception_proves
     assert missing_cwd.reroutable is False
 
 
+@pytest.mark.parametrize("shared_binary", ["bash", "sh", "git", "systemctl", "systemd-run"])
+def test_launch_failure_keeps_shared_launch_infrastructure_as_launch_failed(
+    shared_binary: str,
+) -> None:
+    result = classify_launch_failure(
+        exc=FileNotFoundError(2, "No such file or directory", shared_binary),
+        executor="copilot",
+        worktree="/tmp/worktree",
+    )
+
+    assert result.outcome is ProviderOutcome.LAUNCH_FAILED
+    assert result.reroutable is False
+
+
 def test_text_signal_authority_is_between_structured_and_hint():
     # 中間 authority 等級的存在性斷言：TEXT_SIGNAL 分類仍可 retryable=True
     # （驅動 bounded/reversible 動作），HINT 分類則永遠 retryable=False——

@@ -93,8 +93,22 @@ RETRYABLE_OUTCOMES = frozenset({ProviderOutcome.RATE_LIMITED, ProviderOutcome.TR
 _REROUTABLE_OUTCOMES = frozenset(
     {ProviderOutcome.EFFORT_NOT_SUPPORTED, ProviderOutcome.EXECUTABLE_NOT_FOUND}
 )
-_EXECUTABLE_FAILURE_TOKENS = frozenset(
-    {"agy", "bash", "cg", "claude", "codex", "copilot", "git", "sh", "systemctl", "systemd-run"}
+_KNOWN_PROVIDER_EXECUTABLE_TOKENS = frozenset({"agy", "cg", "claude", "codex", "copilot"})
+_SHARED_LAUNCH_INFRASTRUCTURE_TOKENS = frozenset(
+    {
+        "ash",
+        "bash",
+        "dash",
+        "fish",
+        "git",
+        "ksh",
+        "powershell",
+        "pwsh",
+        "sh",
+        "systemctl",
+        "systemd-run",
+        "zsh",
+    }
 )
 
 # 分類結果 payload 的必要鍵。`reset_at` 是可選鍵（#499：只有帶得到權威重置
@@ -254,9 +268,11 @@ def _is_missing_executable_exception(
     if _is_path_within_root(filename, worktree):
         return False
     token = _normalize_executable_token(filename)
+    if token in _SHARED_LAUNCH_INFRASTRUCTURE_TOKENS:
+        return False
     if executor is not None and token == executor.lower():
         return True
-    return token in _EXECUTABLE_FAILURE_TOKENS
+    return token in _KNOWN_PROVIDER_EXECUTABLE_TOKENS
 
 
 def classify_launch_failure(

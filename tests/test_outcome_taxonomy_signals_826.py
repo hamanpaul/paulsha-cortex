@@ -589,6 +589,47 @@ def test_workflow_launch_exception_persists_launch_failed_through_resume(
     assert persisted.needs_human_reason["context"]["effort"] == "unknown"
 
 
+def test_workflow_launch_exception_missing_shared_launch_infrastructure_stays_launch_failed_without_reroute(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    dispatcher = _WorkflowDispatcher(registry, worktree)
+    identities = _two_builder_identities()
+
+    with pytest.raises(FileNotFoundError):
+        manager.dispatch_workflow_card(
+            dispatcher,
+            run=run,
+            identities=identities,
+            launcher_factory=lambda identity: _WorkflowLauncher(
+                identity.executor,
+                identity.model_id,
+                exc=FileNotFoundError(2, "No such file or directory", "bash"),
+            ),
+            coordinator_root=tmp_path / "coordinator",
+        )
+
+    reloaded = JobRegistry(state_path=state)
+    assert len(reloaded.list_jobs()) == 1
+
+    resumed = manager.resume_workflow_run(
+        _WorkflowDispatcher(reloaded, worktree),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    assert resumed["reason"] == "job-failed-launch_failed"
+    assert resumed["provider_outcome"] == "launch_failed"
+    assert resumed["provider_outcome_authority"] == "structured"
+    assert len(reloaded.list_jobs()) == 1
+
+
 def test_effort_not_supported_reroutes_after_real_poll_classification(
     tmp_path: Path,
 ) -> None:
