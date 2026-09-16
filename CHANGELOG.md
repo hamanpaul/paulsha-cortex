@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **#824 AGY print timeout**：launcher 現在會解析 `PSC_AGY_PRINT_TIMEOUT` 或既有 gate
+  timeout fallback，對所有 AGY headless argv 形態顯式加入 canonical
+  `--print-timeout <Ns>`，並在 direct launch／capability probe 前 fail-closed
+  拒絕非法或超界設定。
 - **#904：R3 testpilot case 素材盤點第二輪收斂**：`docs/superpowers/workstreams/r3-testpilot-case-corpus/{case-candidates.md,todo.md}`
   補齊 08-12 波 6 張 issue 深讀、`github_delivery.py` 五個 ship／delivery 表面與 porcelain
   穩定／繞過分群；候選清單更新為 **109** 筆，`evidence-insufficient` 收斂為 **31** 筆，並補上

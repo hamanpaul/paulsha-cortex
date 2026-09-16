@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -21,6 +22,13 @@ _GIT_REPOSITORY_ENV_KEYS = job_runner.GIT_REPOSITORY_ENV_KEYS | frozenset(
 # 需要同一份判準），這裡保留原名別名——reviewer sandbox 政策與 builder transient unit
 # 的憑證判準永遠是同一條 pattern，不會兩處漂移。
 _CREDENTIAL_ENV_RE = job_runner.CREDENTIAL_ENV_RE
+
+AGY_PRINT_TIMEOUT_ENV = "PSC_AGY_PRINT_TIMEOUT"
+_AGY_PRINT_TIMEOUT_BUFFER_SECONDS = 600
+_AGY_PRINT_TIMEOUT_MAX_SECONDS = 9223372036
+_AGY_PRINT_TIMEOUT_MAX_SECONDS_TEXT = str(_AGY_PRINT_TIMEOUT_MAX_SECONDS)
+_AGY_CANONICAL_DURATION_RE = re.compile(r"[1-9][0-9]*s")
+
 
 def _claude_review_json_schema(kind: str) -> str:
     """Build the shared Manager terminal-contract schema for Claude and AGY reviewers."""
@@ -1298,6 +1306,54 @@ def _gemini_review_json_schema(kind: str) -> str:
         sort_keys=True,
     )
 
+
+def _validate_agy_print_timeout_seconds(seconds: str, *, setting_name: str) -> str:
+    if len(seconds) > len(_AGY_PRINT_TIMEOUT_MAX_SECONDS_TEXT) or (
+        len(seconds) == len(_AGY_PRINT_TIMEOUT_MAX_SECONDS_TEXT)
+        and seconds > _AGY_PRINT_TIMEOUT_MAX_SECONDS_TEXT
+    ):
+        raise ValueError(f"{setting_name} exceeds AGY Go duration limit")
+    return seconds
+
+
+def _validate_agy_print_timeout_keyword(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("print_timeout must be a string")
+    if _AGY_CANONICAL_DURATION_RE.fullmatch(value) is None:
+        raise ValueError("print_timeout must be a canonical duration like 2400s")
+    _validate_agy_print_timeout_seconds(value[:-1], setting_name="print_timeout")
+    return value
+
+
+def resolve_agy_print_timeout(env: Mapping[str, str]) -> str:
+    if AGY_PRINT_TIMEOUT_ENV in env:
+        raw: object = env[AGY_PRINT_TIMEOUT_ENV]
+        if not isinstance(raw, str):
+            raise ValueError(f"{AGY_PRINT_TIMEOUT_ENV} must be a string")
+        stripped = raw.strip()
+        if not stripped:
+            raise ValueError(f"{AGY_PRINT_TIMEOUT_ENV} must be a non-empty ASCII integer")
+        if not stripped.isascii() or not stripped.isdigit():
+            raise ValueError(f"{AGY_PRINT_TIMEOUT_ENV} must contain only ASCII digits")
+        seconds = stripped.lstrip("0")
+        if not seconds:
+            raise ValueError(f"{AGY_PRINT_TIMEOUT_ENV} must be greater than zero")
+        return (
+            f"{_validate_agy_print_timeout_seconds(seconds, setting_name=AGY_PRINT_TIMEOUT_ENV)}s"
+        )
+
+    gate_seconds = max(
+        gate_ledger.DEFAULT_GATE_TIMEOUT_SECONDS,
+        gate_ledger._gate_timeout(env),
+    ) + _AGY_PRINT_TIMEOUT_BUFFER_SECONDS
+    if gate_seconds > _AGY_PRINT_TIMEOUT_MAX_SECONDS:
+        raise ValueError(
+            "AGY print timeout derived from "
+            f"{gate_ledger.GATE_TIMEOUT_ENV} exceeds AGY Go duration limit"
+        )
+    return f"{gate_seconds}s"
+
+
 def build_agy_argv(
     *,
     prompt: str,
@@ -1318,6 +1374,7 @@ def build_agy_argv(
     # (#670) keeps the bare ``--output-format text`` shape because the CLI
     # rejects ``--json-schema`` there and the probe parser reads raw JSON.
     json_envelope: bool = True,
+    print_timeout: str | None = None,
 ) -> list[str]:
     """Build the headless Antigravity invocation for each launcher persona.
 
@@ -1350,6 +1407,11 @@ def build_agy_argv(
         if review_terminal_kind is not None:
             raise ValueError("agy terminal contract requires reviewer mode")
         review_schema = None
+    resolved_print_timeout = (
+        resolve_agy_print_timeout(os.environ)
+        if print_timeout is None
+        else _validate_agy_print_timeout_keyword(print_timeout)
+    )
 
     # Unsafe and commit-required modes are builder-only; accepting either
     # without a provisioned checkout would silently turn an invalid builder
@@ -1381,6 +1443,7 @@ def build_agy_argv(
         argv.extend(["--output-format", "json"])
     if review_schema is not None:
         argv.extend(["--json-schema", review_schema])
+    argv.extend(["--print-timeout", resolved_print_timeout])
     if model is not None:
         argv.extend(["--model", model])
     return argv
@@ -2077,6 +2140,8 @@ class SubprocessLauncher:
         # `effort` 逐條一致：能力有差異就顯式分岔，不塞 None 給接不住的那幾支）。
         if self._executor == "codex":
             builder_kwargs["last_message_path"] = last_message_path
+        if self._executor == "agy":
+            builder_kwargs["print_timeout"] = resolve_agy_print_timeout(os.environ)
         inner_argv = _ARGV_BUILDERS[self._executor](
             **builder_kwargs,
         )

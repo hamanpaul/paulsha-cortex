@@ -134,6 +134,20 @@ group；這不等於把程序移入 systemd cgroup，也不承諾 Manager daemon
 #851 的 AGY probe containment 仍由各自 work item 負責；#823 不藉 session flag 宣稱
 timeout、cancel、probe 或 issue closure 已完成。
 
+### AGY print timeout boundary（#824）
+
+AGY 的 headless `--print` 形態現在一律帶單一 `--print-timeout <Ns>`。若 caller 明示
+`PSC_AGY_PRINT_TIMEOUT`，launcher 先做 `strip()`，只接受 ASCII digits，容許前導零但會
+正規化成 canonical `Ns`；空白、零、符號、小數、Unicode digits、已帶 `s` unit 或超過
+Go `time.Duration` 整秒上界 `9223372036s` 都會在 spawn 前 `ValueError`。`build_agy_argv`
+的顯式 `print_timeout=` keyword 只接受已 canonical 的 `Ns` 字串，不做 strip 或前導零修正。
+
+未設定 `PSC_AGY_PRINT_TIMEOUT` 時，launcher 直接重用既有
+`gate_ledger._gate_timeout(env)`：`max(DEFAULT_GATE_TIMEOUT_SECONDS, gate_seconds) + 600`，
+最後才檢查 AGY/Go 上界。這保留 `PSC_GATE_TIMEOUT` 對非法／非正值的既有 fallback，不新增第二份
+gate parser，也不改變 planning runtime 的 45 秒 probe process deadline、120 秒 planning
+timeout，或其他 executor 的 argv 形狀。
+
 ### Work identity migration（設計中，見 ADR-0002）
 
 `link`／`unlink` 目前一次只能對單一 `(work_id, source)` pair 生效，重識別

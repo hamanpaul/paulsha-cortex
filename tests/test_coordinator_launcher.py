@@ -94,6 +94,44 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(argv.count("--effort"), 1)
         self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
 
+    def test_non_agy_argv_never_emits_print_timeout(self) -> None:
+        self.assertNotIn(
+            "--print-timeout",
+            build_copilot_argv(
+                prompt="P",
+                slice_id="builder",
+                log_dir="/lg",
+                worktree="/wt/builder",
+            ),
+        )
+        self.assertNotIn(
+            "--print-timeout",
+            build_claude_argv(
+                prompt="P",
+                slice_id="builder",
+                log_dir="/lg",
+                worktree="/wt/builder",
+            ),
+        )
+        self.assertNotIn(
+            "--print-timeout",
+            build_codex_argv(
+                prompt="P",
+                slice_id="builder",
+                log_dir="/lg",
+                worktree="/wt/builder",
+            ),
+        )
+        self.assertNotIn(
+            "--print-timeout",
+            build_cg_argv(
+                prompt="P",
+                slice_id="planner",
+                log_dir="/lg",
+                read_only=True,
+            ),
+        )
+
     def test_copilot_verdict_spool_grants_exact_file_and_read_only_checks(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
