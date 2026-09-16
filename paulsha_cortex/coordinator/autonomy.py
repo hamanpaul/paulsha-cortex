@@ -668,16 +668,20 @@ def dispatch_ready(
             # 加進的 recovery 指示會在模型邊界被靜默丟掉。slice row 登記後重讀 spec、hash
             # 必須等於 pin 值（launch-time equality），逐字交付進 prompt，並把交付的 hash
             # 記到 job row 供完成側對照（`manager._builder_input_attestation_mismatches`）。
-            # 失敗走既有 per-slice except：slice 落 needs_human、不派 job。
-            spec_body = _read_pinned_spec_body(pinned_inputs)
-            prompt = build_dispatch_prompt(
-                persona,
-                task=slice_id,
-                plan_path=m["plan"],
-                spec_path=str(pinned_inputs["spec_path"]),
-                spec_hash=str(pinned_inputs["spec_hash"]),
-                spec_body=spec_body,
-            )
+            # 失敗走既有 per-slice except：slice 落 needs_human、不派 job。只有 builder
+            # persona 交付 spec authority；其他 persona 維持既有三行 prompt 形狀。
+            if persona == "builder":
+                spec_body = _read_pinned_spec_body(pinned_inputs)
+                prompt = build_dispatch_prompt(
+                    persona,
+                    task=slice_id,
+                    plan_path=m["plan"],
+                    spec_path=str(pinned_inputs["spec_path"]),
+                    spec_hash=str(pinned_inputs["spec_hash"]),
+                    spec_body=spec_body,
+                )
+            else:
+                prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
             active_launcher = launcher
             executor = m.get("executor")
             model_id = m.get("model_id")

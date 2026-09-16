@@ -170,6 +170,37 @@ def test_unreadable_spec_is_refused_at_launch(repo: Path, tmp_path: Path, monkey
     assert launcher.calls == [] and registry.list_jobs() == []
 
 
+def test_oversized_spec_body_still_verifies_hash_against_full_content() -> None:
+    from paulsha_cortex.coordinator.contract_command import PINNED_SPEC_BODY_LIMIT
+
+    body = "x" * (PINNED_SPEC_BODY_LIMIT + 100)
+    good = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    prompt = build_dispatch_prompt(
+        "builder", task="t", plan_path="p.md", spec_path="/specs/t.md", spec_hash=good, spec_body=body,
+    )
+    assert f"sha256={good}" in prompt and "truncated at" in prompt
+    with pytest.raises(ValueError, match="does not match spec_hash"):
+        build_dispatch_prompt(
+            "builder", task="t", plan_path="p.md", spec_path="/specs/t.md", spec_hash="0" * 64, spec_body=body,
+        )
+
+
+def test_non_builder_persona_dispatch_keeps_three_line_prompt(repo: Path, tmp_path: Path) -> None:
+    """reviewer persona 不交付 spec body，prompt 形狀逐字不變，spec 不可讀也不擋派工。"""
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    meta = _meta(repo, "task-4", spec_body=_spec_text("x"))
+    launcher = _RecordingLauncher()
+    dispatcher = Dispatcher(registry, pane_sender=MagicMock(), worktree_creator=None)
+    dispatch_ready(
+        [meta], is_satisfied=lambda _id: True, dispatcher=dispatcher, persona="reviewer",
+        launcher=launcher, git_runner=_fake_git_runner, handoff_dir=str(repo / "handoff"),
+    )
+    assert len(launcher.calls) == 1
+    prompt = launcher.calls[0]["prompt"]
+    assert "[SPEC" not in prompt and PINNED_SPEC_DIRECTIVE not in prompt
+    assert prompt.endswith("[TASK] task-4\n[PLAN: docs/superpowers/plans/task-4.md]\n請於本 worktree 內讀取上述 plan 並依 persona 契約邊界執行。")
+
+
 def test_task_id_and_plan_only_builder_prompt_is_refused() -> None:
     with pytest.raises(ValueError, match="#503"):
         build_dispatch_prompt("builder", task="task-4", plan_path="docs/plan.md")

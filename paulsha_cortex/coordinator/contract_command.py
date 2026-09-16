@@ -66,8 +66,10 @@ def build_dispatch_prompt(
         return "\n".join(lines)
     if spec_hash is None or spec_body is None:
         raise ValueError("spec_path requires spec_hash and spec_body together (#503)")
+    # ``spec_body`` 是完整檔案內容（截斷只發生在 prompt 輸出），因此 hash 一律核對，
+    # 不因超過上限而放行——否則 [SPEC] 宣稱的 sha256 與實際交付來源可能脫鉤。
     body_hash = hashlib.sha256(spec_body.encode("utf-8")).hexdigest()
-    if len(spec_body) <= PINNED_SPEC_BODY_LIMIT and body_hash != spec_hash:
+    if body_hash != spec_hash:
         raise ValueError(
             f"pinned spec body for {task!r} does not match spec_hash (#503): "
             f"delivered={body_hash} pinned={spec_hash}"
