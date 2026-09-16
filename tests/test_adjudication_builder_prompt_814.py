@@ -92,6 +92,7 @@ def test_prompt_without_adjudications_is_byte_identical_to_before(tmp_path: Path
     prompt = manager._workflow_job_prompt(run, step, builder_job_id="job-1", coordinator_root=tmp_path)
     assert "operator_adjudications" not in prompt
     assert manager.OPERATOR_ADJUDICATION_DIRECTIVE.strip() not in prompt
+    assert manager.OPERATOR_ADJUDICATION_REVIEWER_DIRECTIVE.strip() not in prompt
 
 
 def test_builder_and_reviewer_prompts_consume_the_same_evidence(tmp_path: Path) -> None:
@@ -109,8 +110,12 @@ def test_builder_and_reviewer_prompts_consume_the_same_evidence(tmp_path: Path) 
         builder_job_id="job-1", coordinator_root=tmp_path, operator_adjudications=rows,
     )
     assert REASON in builder_prompt and REASON in reviewer_prompt
+    # persona 各自的語意：builder 要實作；reviewer read-only，把未實作的裁決當 blocking finding。
     assert manager.OPERATOR_ADJUDICATION_DIRECTIVE.strip() in builder_prompt
-    assert manager.OPERATOR_ADJUDICATION_DIRECTIVE.strip() in reviewer_prompt
+    assert manager.OPERATOR_ADJUDICATION_REVIEWER_DIRECTIVE.strip() in reviewer_prompt
+    assert manager.OPERATOR_ADJUDICATION_DIRECTIVE.strip() not in reviewer_prompt
+    assert "read-only" in manager.OPERATOR_ADJUDICATION_REVIEWER_DIRECTIVE
+    assert "blocking finding" in manager.OPERATOR_ADJUDICATION_REVIEWER_DIRECTIVE
 
 
 def test_dispatch_still_passes_run_level_adjudications_to_every_card() -> None:
