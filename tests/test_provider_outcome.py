@@ -146,6 +146,15 @@ def test_none_output_does_not_raise():
     assert result.outcome is ProviderOutcome.UNKNOWN
 
 
+def test_exit_127_without_readable_output_stays_unknown_hint():
+    result = classify_provider_failure(exit_code=127, output=None)
+    assert result.outcome is ProviderOutcome.UNKNOWN
+    assert result.authority is SignalAuthority.HINT
+    assert result.retryable is False
+    assert result.reroutable is False
+    assert "not enough to prove missing executable" in result.reason
+
+
 def test_only_rate_limited_and_transient_are_retryable_outcomes():
     assert RETRYABLE_OUTCOMES == {ProviderOutcome.RATE_LIMITED, ProviderOutcome.TRANSIENT}
 

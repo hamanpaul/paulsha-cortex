@@ -307,6 +307,12 @@ def classify_provider_failure(*, exit_code: int, output: str | None) -> Provider
             SignalAuthority.HINT,
             "exit code 0 -- classify_provider_failure 不應被呼叫在成功案例",
         )
+    if exit_code == 127 and output is None:
+        return ProviderFailureClassification(
+            ProviderOutcome.UNKNOWN,
+            SignalAuthority.HINT,
+            "exit 127 without readable provider output is not enough to prove missing executable",
+        )
 
     evidence = outcome_taxonomy.parse_stream_evidence(output)
 

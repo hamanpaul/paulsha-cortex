@@ -194,6 +194,15 @@ class CrossProcessCompletionTests(unittest.TestCase):
                 outcome["reason"], "launch handle missing: pid=None, log_path=None"
             )
             self.assertFalse(outcome["retryable"])
+            self.assertEqual(
+                updated["runtime_diagnostic"],
+                {
+                    "reason": "launch-failed",
+                    "detail": "launch handle missing: pid=None, log_path=None",
+                    "source": "dispatcher.poll_headless_done:launch",
+                    "job_id": "slice-a-1",
+                },
+            )
 
 
 if __name__ == "__main__":

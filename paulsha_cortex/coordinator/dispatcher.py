@@ -224,13 +224,20 @@ class Dispatcher:
             else log_path
         )
         if not isinstance(pid, int) or not log_path:
+            detail = f"launch handle missing: pid={raw_pid!r}, log_path={raw_log_path!r}"
             return self._registry.update_headless_result(
                 job_id,
                 status="failed",
                 exit_code=1,
                 provider_outcome=classify_launch_failure(
-                    detail=f"launch handle missing: pid={raw_pid!r}, log_path={raw_log_path!r}"
+                    detail=detail
                 ).to_dict(),
+                runtime_diagnostic={
+                    "reason": "launch-failed",
+                    "detail": detail,
+                    "source": "dispatcher.poll_headless_done:launch",
+                    "job_id": str(job_id),
+                },
             )
 
         # 向後相容：注入 pid_waiter → 走舊「呼叫者直接給 exit code」路徑。

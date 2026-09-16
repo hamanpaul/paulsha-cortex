@@ -372,6 +372,8 @@ def test_structured_signals_still_win_before_exit_127_text_classification() -> N
         ("model 'mai-code-1-flash-picker' not found", ""),
         ("open build/output.log: No such file or directory", ""),
         ("", "bash: copilot: command not found"),
+        ("bash: pytest: command not found", ""),
+        ("bash: line 1: pytest: command not found", ""),
     ],
 )
 def test_executable_not_found_requires_provider_side_launch_evidence(
@@ -435,6 +437,12 @@ def test_poll_headless_done_projects_missing_launch_handle_as_launch_failed(
         updated["provider_outcome"]["reason"]
         == "launch handle missing: pid=None, log_path=None"
     )
+    assert updated["runtime_diagnostic"] == {
+        "reason": "launch-failed",
+        "detail": "launch handle missing: pid=None, log_path=None",
+        "source": "dispatcher.poll_headless_done:launch",
+        "job_id": str(updated["job_id"]),
+    }
     assert manifest["gate_reason"] == "builder-failed-launch_failed"
     assert manifest["provider_outcome"]["outcome"] == "launch_failed"
 

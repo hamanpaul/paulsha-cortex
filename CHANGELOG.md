@@ -9,8 +9,8 @@
 
 - **#826 outcome taxonomy signals**：新增 `effort_not_supported`／`executable_not_found`／`launch_failed`
   failure 詞彙與環境類 family 映射；structured terminal／interruption 仍優先於可信 `exit 127`
-  與文字訊號，`not found` 只有在 shell command-not-found、空 `127` 或可證實的 launch exception
-  才會歸類為 executable 缺失。headless result 會保存 optional `executor`／`model_id`、typed
+  與文字訊號，`not found` 只有在已知 launcher／executor 的 shell command-not-found、可信的空 `127`
+  （不是缺 log／讀不到 log）或可證實的 launch exception 才會歸類為 executable 缺失。headless result 會保存 optional `executor`／`model_id`、typed
   `provider_outcome` 與 `launch-failed` runtime diagnostic；slice/workflow consumer 改為投影
   具名 `builder-failed-*`／`job-failed-*` reason，`effort_not_supported` 與
   `executable_not_found` 可在既有候選清單內有界 reroute，且 reroute 會重跑該 card 的完整 runtime

@@ -419,11 +419,12 @@ def _has_shell_command_not_found_context(provider_text: str) -> str | None:
             if match is None:
                 continue
             command = _normalize_command_token(match.group("command"))
+            if command not in _LAUNCHER_IDENTIFIERS:
+                continue
             prefix = match.group("prefix")
             if prefix is not None and _normalize_command_token(prefix) in _SHELL_NAMES:
                 return f"shell command-not-found while launching {command}"
-            if command in _LAUNCHER_IDENTIFIERS:
-                return f"launcher executable not found: {command}"
+            return f"launcher executable not found: {command}"
     return None
 
 
