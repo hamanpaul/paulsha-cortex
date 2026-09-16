@@ -283,8 +283,21 @@ _COMMAND_NOT_FOUND_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
 )
 _LAUNCH_EXECUTABLE_ENOENT_RE = re.compile(
-    r"\b(?P<call>execvpe|execve|exec|spawn|Popen)\b",
-    re.IGNORECASE,
+    r"""
+    ^\s*
+    (?:(?:os|subprocess)\.)?
+    (?P<call>execvpe|execve|exec|spawn|Popen)
+    (?=
+        (?:\s*\([^)\r\n]*\))?
+        \s*
+        (?:
+            :
+            | \b(?:failed|error|errno|raised|returned|ENOENT)\b
+            | $
+        )
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 # Transient：網路/服務暫時性錯誤，與 rate limit 不同——這裡沒有「額度」語意，
@@ -419,7 +432,7 @@ def _has_shell_command_not_found_context(provider_text: str) -> str | None:
         if not line:
             continue
         if "no such file or directory" in line.lower():
-            launch_call = _LAUNCH_EXECUTABLE_ENOENT_RE.search(line)
+            launch_call = _LAUNCH_EXECUTABLE_ENOENT_RE.match(line)
             if launch_call is not None:
                 return (
                     f"{launch_call.group('call').lower()} reported missing executable"

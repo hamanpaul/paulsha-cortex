@@ -386,6 +386,16 @@ def test_general_file_open_enoent_stays_none_signal() -> None:
     assert result.signal.value == "none"
 
 
+def test_spawn_log_open_enoent_stays_none_signal() -> None:
+    result = outcome_taxonomy.classify_text(
+        exit_code=1,
+        provider_text="open /tmp/spawn.log: No such file or directory",
+        model_text="",
+    )
+
+    assert result.signal.value == "none"
+
+
 def test_structured_signals_still_win_before_exit_127_text_classification() -> None:
     rate_limited = classify_provider_failure(
         exit_code=127, output=_STRUCTURED_RATE_LIMIT_LOG
