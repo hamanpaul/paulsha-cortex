@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#496 dirty recheck 冪等**：`complete_tick` 對 dirty needs_human slice 的每 tick 重驗，結果與
+  slice 目前的 hash／state／gate_state／candidate／summary／refs 完全相同時不再 `record_action`／
+  `update_slice`（舊實作六天累積 92k 筆 `verification-failed` history、jobs.json 58.7 MB）；任一欄位
+  真實變更仍恰好記一次，壞證據維持 fail-closed，contract hash 與 evidence writer 不動。
+
 - **Open-issue 全量盤點與 refine 開工 handoff（#868）**：新增
   `docs/handoffs/2026-09-16-open-issue-triage-refine-handoff.md`——145 張 open issue 三分類
   （38 已修→關、8 過時→not planned、97 仍 open）、PR #913 交付 #800／#815、daemon pin 與 main
