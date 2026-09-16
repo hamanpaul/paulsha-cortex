@@ -703,7 +703,11 @@ def test_public_work_retry_build_forces_one_new_manager_dispatched_builder(
 
     def forced_dispatch(*args, **kwargs):
         calls.append(kwargs.get("force_new_card"))
-        return {"job_id": "repair-builder"}
+        # #830：daemon 消費端現在驗 registry 綁定，fake 必須登記綁到本 run 的真 Job。
+        return registry.create_job(
+            task="repair-builder", persona="builder", branch="feature/repair-builder", pane="",
+            worktree=str(tmp_path / "repair-builder"), workflow_run_id=run.run_id, workflow_card="subagent-build",
+        )
 
     monkeypatch.setattr(manager, "dispatch_workflow_card", forced_dispatch)
     executor = manager_daemon.build_request_executor(
@@ -732,7 +736,7 @@ def test_public_work_retry_build_forces_one_new_manager_dispatched_builder(
     )
 
     assert calls == [True]
-    assert result["result"]["job_id"] == "repair-builder"
+    assert result["result"]["job_id"] == registry.list_jobs()[-1]["job_id"]
 
 
 def test_plan_dispatch_passes_complete_planner_card_without_launch(tmp_path: Path) -> None:

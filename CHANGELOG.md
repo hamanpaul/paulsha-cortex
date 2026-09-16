@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#830 派工非 Job 決策契約**：`classify_dispatch_result` 把派工結果分成真 Job（registry 綁定）／合法
+  decision／確定性 transition／None，malformed 或 forged job_id fail-closed；daemon start／work-action、
+  manager resume 與 provider retry 五個消費端接上，Red sizing 的 `needs-decomposition` 不再 `KeyError`
+  或被 periodic resume 改寫成 needs_human；request 回應新增 `dispatch.kind`。
+
 - **#496 dirty recheck 冪等**：`complete_tick` 對 dirty needs_human slice 的每 tick 重驗，結果與
   slice 目前的 hash／state／gate_state／candidate／summary／refs 完全相同時不再 `record_action`／
   `update_slice`（舊實作六天累積 92k 筆 `verification-failed` history、jobs.json 58.7 MB）；任一欄位

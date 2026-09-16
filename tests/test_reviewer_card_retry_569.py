@@ -882,7 +882,11 @@ def test_public_work_retry_card_forces_one_new_manager_dispatched_reviewer(
 
     def forced_dispatch(*args, **kwargs):
         calls.append(kwargs.get("force_new_card"))
-        return {"job_id": "replacement-reviewer"}
+        # #830：daemon 消費端現在驗 registry 綁定，fake 必須登記綁到本 run 的真 Job。
+        return registry.create_job(
+            task="replacement-reviewer", persona="reviewer", branch="feature/replacement-reviewer", pane="",
+            worktree=str(tmp_path / "replacement-reviewer"), workflow_run_id=run.run_id, workflow_card="verification",
+        )
 
     monkeypatch.setattr(manager, "dispatch_workflow_card", forced_dispatch)
     executor = _daemon_executor(tmp_path, registry, run)
@@ -890,7 +894,7 @@ def test_public_work_retry_card_forces_one_new_manager_dispatched_reviewer(
     result = executor(_retry_card_request(run))
 
     assert calls == [True]
-    assert result["result"]["job_id"] == "replacement-reviewer"
+    assert result["result"]["job_id"] == registry.list_jobs()[-1]["job_id"]
 
 
 def test_public_work_retry_card_restores_needs_human_when_reviewer_dispatch_fails(

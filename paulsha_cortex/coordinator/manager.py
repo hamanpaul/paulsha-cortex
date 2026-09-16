@@ -10391,6 +10391,84 @@ def dispatch_workflow_card(
     )
 
 
+def classify_dispatch_result(
+    result: object,
+    *,
+    registry,
+    run_id: str,
+    before_phase: str | None = None,
+) -> dict[str, object]:
+    """#830：把 `dispatch_workflow_card`／`_dispatch_workflow_card` 的回傳投影成明確契約。
+
+    回傳 `{"kind": ...}`，kind 為四類之一；不符任何一類即 `ValueError`（fail-closed，
+    不把未知 dict 當成功）：
+
+    - ``job``：帶非空 `job_id`，且 registry 真有這筆 Job、其 `workflow_run_id` 綁定到
+      `run_id`（forged job_id／錯 run 一律拒絕）。附 `job_id`。
+    - ``decision``：producer 的合法非 Job 決策（`{run_id, current_phase, reason}`，例如
+      needs-decomposition、runtime-preflight-*、plan-outputs-missing），`run_id` 必須是本 run。
+      附 `reason`；不造 job_id、不標 dispatched。
+    - ``transition``：回 None 但 run 已持久化推進 phase（確定性 transition，無 Job）。
+      附 `from_phase`；`current_phase` 為重新讀取後的新 phase。
+    - ``none``：回 None 且 phase 未動，維持既有 not-dispatchable 語意。
+
+    每一類都重新讀取 registry 內最新的 run，不回傳呼叫前的 run 快照。
+    """
+    current_run = registry.get_workflow_run(run_id)
+    current_phase = current_run.current_phase
+    if result is None:
+        if before_phase is not None and before_phase != current_phase:
+            return {
+                "kind": "transition",
+                "run_id": run_id,
+                "from_phase": before_phase,
+                "current_phase": current_phase,
+            }
+        return {"kind": "none", "run_id": run_id, "current_phase": current_phase}
+    if not isinstance(result, dict):
+        raise ValueError(
+            f"dispatch result contract violated: expected Job/decision dict or None, got {type(result).__name__}"
+        )
+    if "job_id" in result:
+        job_id = result.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("dispatch result contract violated: job_id must be a non-empty string")
+        try:
+            job = registry.get_job(job_id)
+        except Exception as exc:
+            raise ValueError(
+                f"dispatch result contract violated: job_id {job_id!r} is not a registered Job"
+            ) from exc
+        bound_run_id = job.get("workflow_run_id")
+        if bound_run_id != run_id:
+            raise ValueError(
+                f"dispatch result contract violated: Job {job_id!r} is bound to run {bound_run_id!r}, not {run_id!r}"
+            )
+        return {"kind": "job", "job_id": job_id, "run_id": run_id}
+    reason = result.get("reason")
+    result_run_id = result.get("run_id")
+    result_phase = result.get("current_phase")
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or not isinstance(result_run_id, str)
+        or not result_run_id
+        or not isinstance(result_phase, str)
+        or not result_phase
+    ):
+        # key 型別可能混雜（malformed payload 正是這裡要擋的東西），排序前先轉字串，
+        # 讓契約違反一律以 ValueError 呈現而不是 TypeError。
+        raise ValueError(
+            "dispatch result contract violated: non-Job result must carry run_id, current_phase and reason "
+            f"(keys={sorted(str(key) for key in result)})"
+        )
+    if result_run_id != run_id:
+        raise ValueError(
+            f"dispatch result contract violated: decision belongs to run {result_run_id!r}, not {run_id!r}"
+        )
+    return {"kind": "decision", "run_id": run_id, "current_phase": current_phase, "reason": reason}
+
+
 def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path) -> bool:
     """Detect the narrow terminal closure path without granting ship authority."""
     terminal_refresh = (
@@ -10811,6 +10889,13 @@ def resume_workflow_run(
         job = dispatch_or_stop(run, retry=True)
     if job is None:
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
+    # #830：`dispatch_or_stop` 可能回 producer 的合法非 Job 決策（needs-decomposition、
+    # runtime-preflight-*、plan-outputs-missing…）。舊實作把它當 Job 往下走：
+    # `status` 缺 → 掉進 job-failed 分支 → 讀 `["job_id"]` KeyError（explicit resume）
+    # 或被 periodic 外層改寫成 needs_human／resume-workflow-failed。合法 decision
+    # 原樣回傳、不動 run；registry 列出的 Job 與真派工 Job 照舊。
+    if classify_dispatch_result(job, registry=registry, run_id=run.run_id)["kind"] == "decision":
+        return dict(job)
     if job.get("status") in IN_FLIGHT_STATUSES:
         job = dispatcher.poll_headless_done(str(job["job_id"]))
     if job.get("status") in IN_FLIGHT_STATUSES:
@@ -10876,6 +10961,13 @@ def resume_workflow_run(
                         "current_phase": run.current_phase,
                         "reason": "not-dispatchable",
                     }
+                # #830：重派也可能撞到合法非 Job 決策（例如 runtime preflight
+                # refusal）；原樣回傳 producer 的 reason，不計入 retry 次數、不造 job_id。
+                if (
+                    classify_dispatch_result(replacement, registry=registry, run_id=run.run_id)["kind"]
+                    == "decision"
+                ):
+                    return {**dict(replacement), **status_fields}
                 current = registry.get_workflow_run(run.run_id)
                 attempts = dict(current.attempts)
                 attempts[retry_key] = seen + 1
@@ -11025,6 +11117,9 @@ def resume_workflow_run(
         )
         if replacement is None:
             return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
+        # #830：同 provider-failure retry——合法非 Job 決策原樣回傳，不計 retry、不造 job_id。
+        if classify_dispatch_result(replacement, registry=registry, run_id=run.run_id)["kind"] == "decision":
+            return {**dict(replacement), **status_fields}
         current = registry.get_workflow_run(run.run_id)
         attempts = dict(current.attempts)
         attempts[retry_key] = seen + 1

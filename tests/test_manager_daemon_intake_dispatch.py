@@ -60,7 +60,11 @@ def test_intake_dispatches_builder_job_like_start(
 
     def fake_dispatch(*args, **kwargs):
         dispatch_calls.append(kwargs)
-        return {"job_id": "intake-builder-job"}
+        # #830：daemon 消費端現在驗 registry 綁定，fake 必須登記綁到本 run 的真 Job。
+        return registry.create_job(
+            task="intake-builder-job", persona="builder", branch="feature/intake-builder-job", pane="",
+            worktree=str(tmp_path / "intake-builder-job"), workflow_run_id=run.run_id, workflow_card="subagent-build",
+        )
 
     monkeypatch.setattr(manager, "dispatch_workflow_card", fake_dispatch)
 
@@ -86,7 +90,7 @@ def test_intake_dispatches_builder_job_like_start(
 
     assert len(dispatch_calls) == 1
     assert dispatch_calls[0]["run"].run_id == run.run_id
-    assert result["result"]["job_id"] == "intake-builder-job"
+    assert result["result"]["job_id"] == registry.list_jobs()[-1]["job_id"]
 
 
 def test_link_and_unlink_do_not_spuriously_dispatch_a_builder_job(

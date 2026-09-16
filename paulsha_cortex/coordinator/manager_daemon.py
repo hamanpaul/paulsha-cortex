@@ -700,8 +700,21 @@ def build_request_executor(
                         launcher_factory=launcher_factory,
                         coordinator_root=coordinator_root,
                     )
-                    if job is not None:
-                        result["job_id"] = job["job_id"]
+                    # #830：producer 對 Red sizing／preflight refusal 等情況合法回傳
+                    # 非 Job 決策（`{run_id, current_phase, reason}`），舊實作只驗
+                    # `is not None` 就讀 `["job_id"]` → KeyError，而且 periodic
+                    # resume 再撞同型錯誤時把 needs_decomposition 改寫成
+                    # needs_human。改走明確分類契約：真 Job 才回 job_id，
+                    # decision／transition／none 各自投影，不造假 job_id。
+                    projection = manager.classify_dispatch_result(
+                        job,
+                        registry=registry,
+                        run_id=run.run_id,
+                        before_phase=run.current_phase,
+                    )
+                    result["dispatch"] = projection
+                    if projection["kind"] == "job":
+                        result["job_id"] = projection["job_id"]
             return result
         if request_type == "work-action":
             registry = getattr(dispatcher, "_registry", None)
@@ -791,14 +804,29 @@ def build_request_executor(
                                 coordinator_root=coordinator_root,
                                 force_new_card=forced_card_retry,
                             )
-                            if forced_card_retry and job is None:
+                            # #830：同 start 路徑的分類契約（見上方 workflow-action
+                            # start）。forced retry 的成功後置條件是「新 replacement
+                            # Job」——合法 decision／transition／None 都不滿足，沿既有
+                            # fail-closed 補償，並把 producer 的 reason 帶進診斷。
+                            projection = manager.classify_dispatch_result(
+                                job,
+                                registry=registry,
+                                run_id=run.run_id,
+                                before_phase=run.current_phase,
+                            )
+                            if forced_card_retry and projection["kind"] != "job":
                                 # persona 依 phase 決定（build→builder、
                                 # verify／review→reviewer），與
                                 # `registry.RETRY_CARD_PHASE_PERSONA` 同一份判準。
+                                detail = (
+                                    f"（dispatch decision: {projection['reason']}）"
+                                    if projection["kind"] == "decision"
+                                    else ""
+                                )
                                 raise RuntimeError(
                                     f"{args.get('action')} produced no "
                                     f"{RETRY_CARD_PHASE_PERSONA.get(run.current_phase, 'replacement')}"
-                                    " Job"
+                                    f" Job{detail}"
                                 )
                         except Exception as exc:
                             if forced_card_retry:
@@ -821,8 +849,13 @@ def build_request_executor(
                                     ),
                                 )
                             raise
-                        if job is not None:
-                            result["result"]["job_id"] = job["job_id"]
+                        result["result"]["dispatch"] = projection
+                        if projection["kind"] == "job":
+                            result["result"]["job_id"] = projection["job_id"]
+                        else:
+                            # 非 Job 結果：回最新持久化的 run（D1「各 consumer 派工後重讀
+                            # run」），不回傳呼叫前的快照。
+                            result["result"]["run"] = registry.get_workflow_run(run.run_id).to_dict()
             return result
         if request_type == "complete":
             complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None
