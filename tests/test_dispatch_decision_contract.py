@@ -397,6 +397,16 @@ def test_classify_dispatch_result_matrix(tmp_path: Path) -> None:
             {"run_id": "workflow-someone-else", "current_phase": "plan", "reason": "needs-decomposition"},
             registry=registry, run_id=run.run_id, before_phase="claim",
         )
-    for malformed in ({}, {"reason": "x"}, {"run_id": run.run_id}, {"job_id": ""}, "job-1", 3):
+    for malformed in (
+        {},
+        {"reason": "x"},
+        {"run_id": run.run_id},
+        {"run_id": run.run_id, "reason": "needs-decomposition"},  # 缺 current_phase
+        {"run_id": run.run_id, "current_phase": "", "reason": "needs-decomposition"},
+        {"job_id": ""},
+        {"run_id": run.run_id, 3: "mixed-key-types", ("t",): None},  # key 型別混雜也必須是 ValueError
+        "job-1",
+        3,
+    ):
         with pytest.raises(ValueError):
             classify(malformed, registry=registry, run_id=run.run_id, before_phase="claim")

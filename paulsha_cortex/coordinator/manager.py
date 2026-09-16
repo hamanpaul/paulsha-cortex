@@ -10389,10 +10389,20 @@ def classify_dispatch_result(
         return {"kind": "job", "job_id": job_id, "run_id": run_id}
     reason = result.get("reason")
     result_run_id = result.get("run_id")
-    if not isinstance(reason, str) or not reason or not isinstance(result_run_id, str) or not result_run_id:
+    result_phase = result.get("current_phase")
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or not isinstance(result_run_id, str)
+        or not result_run_id
+        or not isinstance(result_phase, str)
+        or not result_phase
+    ):
+        # key 型別可能混雜（malformed payload 正是這裡要擋的東西），排序前先轉字串，
+        # 讓契約違反一律以 ValueError 呈現而不是 TypeError。
         raise ValueError(
-            "dispatch result contract violated: non-Job result must carry run_id and reason "
-            f"(keys={sorted(result)})"
+            "dispatch result contract violated: non-Job result must carry run_id, current_phase and reason "
+            f"(keys={sorted(str(key) for key in result)})"
         )
     if result_run_id != run_id:
         raise ValueError(
