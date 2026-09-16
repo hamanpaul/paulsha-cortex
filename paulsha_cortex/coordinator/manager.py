@@ -427,7 +427,7 @@ def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
     payload = evidence["payload"]
     refs = [evidence["path"]]
     state = payload["status"]
-    gate_state = "pending" if state == "reviewing" else ("passed" if state == "verified" else "needs_human")
+    gate_state = _verification_gate_state(state)
     action = {
         "reviewing": "verification-passed-await-review",
         "verified": "verification-passed",
@@ -450,7 +450,8 @@ def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
 
 
 def _verification_gate_state(status: str) -> str:
-    # 與 `_apply_verification_result` 的推導逐字相同：reviewing→pending、verified→passed、其餘→needs_human。
+    # verification 結果 → gate_state 的唯一來源：reviewing→pending、verified→passed、其餘→needs_human。
+    # `_apply_verification_result` 與 `_dirty_recheck_is_noop` 都從這裡取，不各自複製。
     return "pending" if status == "reviewing" else ("passed" if status == "verified" else "needs_human")
 
 
