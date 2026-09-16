@@ -460,6 +460,7 @@ def test_structured_signals_still_win_before_exit_127_text_classification() -> N
         ("", "bash: copilot: command not found"),
         ("bash: pytest: command not found", ""),
         ("bash: line 1: pytest: command not found", ""),
+        ("subprocess.Popen(...): [Errno 2] No such file or directory: 'pytest'", ""),
     ],
 )
 def test_executable_not_found_requires_provider_side_launch_evidence(

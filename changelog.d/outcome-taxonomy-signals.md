@@ -8,11 +8,12 @@
   `foreign-review-provider-<outcome>` gate reason，而不是舊的 `foreign-review-launch-error:*`。
   workflow/slice consumer 會保留 structured authority 與 runtime-contract 優先序；已知 launcher／
   executor 的 shell command-not-found、同一行帶 `exec`／`execvpe`／`execve`／`spawn`／`Popen` 與
-  `No such file or directory` 的 launcher ENOENT（若同一行也附帶 `: <target>`，該 target 不能只是
-  缺失的 cwd/path）、可信空 `127`，以及 typed launch exception 能證明缺的是 provider executable
-  （如 `copilot`／`codex`／`claude`／`agy`／`cg` 或精確 executor 名）時才會進 `executable_not_found`；
-  缺 log／讀不到 log 的 `127` 維持 unknown/hint，`bash`／`sh`／`git`／`systemctl`／`systemd-run`
-  這類 shared launch infrastructure 缺失則保留 `launch_failed`。`effort_not_supported`／`executable_not_found` 可在既有合格候選內有界 reroute，
+  `No such file or directory` 的 launcher ENOENT（若同一行也附帶 `: <target>`，該 target 必須是
+  已知 launcher executable，且不能只是缺失的 cwd/path）、可信空 `127`，以及 typed launch exception
+  能證明缺的是 provider executable（如 `copilot`／`codex`／`claude`／`agy`／`cg` 或精確 executor 名）
+  時才會進 `executable_not_found`；缺 log／讀不到 log 的 `127` 維持 unknown/hint，`bash`／`sh`／`git`／
+  `systemctl`／`systemd-run` 這類 shared launch infrastructure 缺失與 `pytest` 這類未知 target
+  則保留 `launch_failed`／unknown，而不會誤當成 provider executable 缺失。`effort_not_supported`／`executable_not_found` 可在既有合格候選內有界 reroute，
   reroute 也會重跑該 card 的完整 runtime preflight，因此缺 `module:pytest` 等能力的替代候選會被跳過；
   實際重派會沿用 preflight 核可的同一個 specialized launcher／executor environment，若沒有任何
   runtime-qualified 替代候選則維持停止並等待人工；`launch_failed` 則保留原始 exception 或缺 handle

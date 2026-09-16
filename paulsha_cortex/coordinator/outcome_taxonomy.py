@@ -459,19 +459,6 @@ def _extract_enoent_target(line: str) -> str | None:
     return target or None
 
 
-def _looks_like_path_reference(value: str) -> bool:
-    candidate = _strip_inline_argument_value(value)
-    if not candidate:
-        return False
-    if re.match(r"^[A-Za-z]:[\\/]", candidate) is not None:
-        return True
-    return (
-        "/" in candidate
-        or "\\" in candidate
-        or candidate.startswith(("~", "./", "../", ".\\", "..\\"))
-    )
-
-
 def _is_cwd_style_launch_enoent(line: str, target: str) -> bool:
     cwd_match = _LAUNCH_CWD_ARGUMENT_RE.search(line)
     if cwd_match is None:
@@ -496,9 +483,8 @@ def _has_shell_command_not_found_context(provider_text: str) -> str | None:
                         continue
                     if _is_cwd_style_launch_enoent(line, target):
                         continue
-                    if _looks_like_path_reference(target):
-                        if target_token not in _LAUNCHER_IDENTIFIERS:
-                            continue
+                    if target_token not in _LAUNCHER_IDENTIFIERS:
+                        continue
                 return (
                     f"{launch_call.group('call').lower()} reported missing executable"
                 )
