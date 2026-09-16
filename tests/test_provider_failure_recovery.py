@@ -250,6 +250,12 @@ def _launcher_factory(identity):
     return _Launcher(identity.executor, identity.model_id)
 
 
+def _rerouted_identity(target):
+    if target is None:
+        return None
+    return getattr(target, "identity", target)
+
+
 # --------------------------------------------------------------- bounded retry + re-route
 
 
@@ -295,6 +301,82 @@ def test_rate_limited_failure_triggers_bounded_retry_and_reroutes_to_next_candid
     new_job = registry.get_job(result["job_id"])
     assert new_job["executor"] == "claude"
     assert new_job["independence_domain"] == "anthropic"
+
+
+def test_provider_failure_retry_reuses_preflight_approved_launcher(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    base_head = _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    _seed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+        outcome=ProviderOutcome.RATE_LIMITED,
+    )
+    dispatcher = _ResumeDispatcher(registry, worktree)
+    identities = _two_builder_identities()
+
+    created: list[str] = []
+    specialized: list[str] = []
+    preflight_checked: list[str] = []
+    launched: list[str] = []
+
+    class _TrackingLauncher(_Launcher):
+        def __init__(self, identity, *, token: str) -> None:
+            super().__init__(identity.executor, identity.model_id)
+            self._identity = identity
+            self._token = token
+            self._commit_required = False
+
+        def as_commit_required(self):
+            specialized.append(self._token)
+            self._commit_required = True
+            return self
+
+        def executor_environment(self) -> ExecutorEnvironment:
+            preflight_checked.append(self._token)
+            assert self._commit_required, "preflight must inspect the specialized launcher"
+            return _host_executor_env(
+                name=f"{self._identity.executor}-workflow",
+                provider_identity=self._identity.executor,
+            )
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            launched.append(self._token)
+            return super().launch(
+                slice_id=slice_id,
+                prompt=prompt,
+                worktree=worktree,
+                log_dir=log_dir,
+            )
+
+    def _tracking_launcher_factory(identity):
+        token = f"{identity.executor}#{len(created) + 1}"
+        created.append(token)
+        return _TrackingLauncher(identity, token=token)
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_tracking_launcher_factory,
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    assert result["reason"] == "provider-failure-retry"
+    replacement = registry.get_job(result["job_id"])
+    assert replacement["executor"] == "claude"
+    assert created == ["claude#1"]
+    assert specialized == ["claude#1"]
+    assert preflight_checked == ["claude#1"]
+    assert launched == ["claude#1"]
 
 
 def test_rate_limited_reroute_skips_candidates_missing_subagent_build_runtime_capability(
@@ -360,9 +442,10 @@ def test_rate_limited_reroute_skips_candidates_missing_subagent_build_runtime_ca
         launcher_factory=_env_aware_launcher_factory,
     )
 
-    assert rerouted is not None
-    assert rerouted.executor == "copilot"
-    assert rerouted.model_id == "gpt-5.4"
+    rerouted_identity = _rerouted_identity(rerouted)
+    assert rerouted_identity is not None
+    assert rerouted_identity.executor == "copilot"
+    assert rerouted_identity.model_id == "gpt-5.4"
 
 
 def test_effort_not_supported_with_only_runtime_unqualified_alternatives_stops_in_needs_human(
@@ -601,9 +684,10 @@ def test_reroute_never_returns_identity_outside_existing_candidate_list(tmp_path
         classification=classification,
         launcher_factory=_launcher_factory,
     )
-    assert rerouted is not None
-    assert rerouted in candidates
-    assert rerouted.executor != "codex"
+    rerouted_identity = _rerouted_identity(rerouted)
+    assert rerouted_identity is not None
+    assert rerouted_identity in candidates
+    assert rerouted_identity.executor != "codex"
 
 
 def test_reroute_with_single_candidate_returns_none_not_a_policy_shopped_identity(tmp_path: Path) -> None:
@@ -710,4 +794,4 @@ def test_reroute_for_reviewer_never_crosses_into_builder_domain(tmp_path: Path) 
     )
     # 唯一候選（claude）本身就是失敗中的那個 -> None（回退 _select_workflow_identity
     # 仍選 claude，不會、也不能 re-route 回 codex/openai）。
-    assert rerouted is None
+    assert _rerouted_identity(rerouted) is None

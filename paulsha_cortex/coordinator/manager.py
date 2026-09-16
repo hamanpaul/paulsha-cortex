@@ -4288,6 +4288,11 @@ def _provider_failure_reroute(
     之後把剩餘候選交回 :func:`_runtime_preflight_gate`，用與正常 dispatch 同
     一套 launcher specialization / executor environment / compatibility
     檢查，避免 reroute 旁路 card capability（例如 ``module:pytest``）。
+
+    回傳值直接餵給 ``dispatch_workflow_card(..., forced_identity=...)``：有
+    runtime preflight 時帶回完整 gate 決策，讓正式 dispatch 可重用同一個已
+    核可的 specialized launcher；沒有 runtime capability 宣告時才退回 bare
+    identity，維持既有 forced reroute 介面。
     """
 
     candidates = _workflow_identity_candidates(run, step, identities)
@@ -4321,7 +4326,7 @@ def _provider_failure_reroute(
         return reroute_candidates[0]
     if gate.action == "needs_human":
         return None
-    return gate.identity
+    return gate
 
 
 def _canonicalize_card_terminal(raw: Mapping[str, object]) -> dict[str, object]:
@@ -10026,18 +10031,28 @@ def _dispatch_workflow_card(
     # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。
     # #384/#826：`forced_identity` 提供時（provider 失敗 bounded retry 的
     # re-route 決策，見 `resume_workflow_run`／`_provider_failure_reroute`）代表
-    # 呼叫端已用同一套 `_runtime_preflight_gate` 驗過替代候選；這裡只重用決策，
-    # 不再重跑一次避免重複探測／specialize 成本。
-    gate = (
-        None
-        if forced_identity is not None
-        else _runtime_preflight_gate(
+    # 呼叫端已用同一套 `_runtime_preflight_gate` 驗過替代候選；若帶入的是完整
+    # DispatchGateDecision，就直接重用那個 gate 產出的 specialized launcher，
+    # 保持 preflight 與正式 job 是同一個 executor environment。
+    forced_gate = None
+    forced_reroute_identity = forced_identity
+    if forced_identity is not None:
+        from .runtime_preflight import DispatchGateDecision
+
+        if isinstance(forced_identity, DispatchGateDecision):
+            forced_gate = forced_identity
+            forced_reroute_identity = forced_gate.identity
+    if forced_gate is not None:
+        gate = forced_gate
+    elif forced_identity is not None:
+        gate = None
+    else:
+        gate = _runtime_preflight_gate(
             run,
             step,
             identities=identities,
             launcher_factory=launcher_factory,
         )
-    )
     if gate is not None and gate.action == "needs_human":
         updated = registry._manager_update_workflow_run(
             run.run_id,
@@ -10065,8 +10080,8 @@ def _dispatch_workflow_card(
         launcher = gate.launcher
         if launcher is None:
             raise ValueError("workflow launcher unavailable")
-    elif forced_identity is not None:
-        identity = forced_identity
+    elif forced_reroute_identity is not None:
+        identity = forced_reroute_identity
         launcher = launcher_factory(identity)
         if launcher is None:
             raise ValueError("workflow launcher unavailable")
@@ -11062,7 +11077,7 @@ def resume_workflow_run(
             status_fields["provider_retry_count"] = seen
             status_fields["provider_retry_limit"] = terminal_contract.MAX_PROVIDER_RETRIES
             if seen < terminal_contract.MAX_PROVIDER_RETRIES:
-                rerouted_identity = _provider_failure_reroute(
+                rerouted_target = _provider_failure_reroute(
                     run,
                     step,
                     identities,
@@ -11070,7 +11085,7 @@ def resume_workflow_run(
                     classification=classification,
                     launcher_factory=launcher_factory,
                 )
-                if classification.reroutable and rerouted_identity is None:
+                if classification.reroutable and rerouted_target is None:
                     pass
                 else:
                     replacement = dispatch_workflow_card(
@@ -11080,7 +11095,7 @@ def resume_workflow_run(
                         launcher_factory=launcher_factory,
                         coordinator_root=coordinator_root,
                         retry_failed=True,
-                        forced_identity=rerouted_identity,
+                        forced_identity=rerouted_target,
                     )
                     if replacement is None:
                         return {

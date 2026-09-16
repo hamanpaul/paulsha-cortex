@@ -14,7 +14,8 @@
   `provider_outcome` 與 `launch-failed` runtime diagnostic；slice/workflow consumer 改為投影
   具名 `builder-failed-*`／`job-failed-*` reason，`effort_not_supported` 與
   `executable_not_found` 可在既有候選清單內有界 reroute，且 reroute 會重跑該 card 的完整 runtime
-  preflight：缺 `module:pytest` 等能力的替代候選會被跳過，沒有 runtime-qualified 替代候選時維持停止等待人工；
+  preflight：缺 `module:pytest` 等能力的替代候選會被跳過，正式重派會沿用 preflight 核可的同一個
+  specialized launcher／executor environment，沒有 runtime-qualified 替代候選時維持停止等待人工；
   真正的 runtime-contract failure 仍優先 fail-closed、不進 provider reroute。
 - **#503 slice-lane pinned spec 交付與 attestation**：builder prompt 附 `[SPEC: path sha256=…]`＋逐字 spec body
   與明示語句，dispatch 時 spec hash 必須等於 pin 值否則 needs_human；job row 記錄交付的 spec／plan hash，完成側
