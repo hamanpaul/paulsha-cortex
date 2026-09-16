@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **#496 dirty recheck 冪等**：`complete_tick` 對 dirty needs_human slice 的每 tick 重驗，結果與
+  slice 目前的 hash／state／gate_state／candidate／summary／refs 完全相同時不再 `record_action`／
+  `update_slice`（舊實作六天累積 92k 筆 `verification-failed` history、jobs.json 58.7 MB）；任一欄位
+  真實變更仍恰好記一次，壞證據維持 fail-closed，contract hash 與 evidence writer 不動。
 - **歸檔 openspec change `installer-shared-config-guard`**：PR 913 交付時只帶進 tasks.md、未
   archive，daemon 每輪掃成 `not_claimable: missing_issue`；因無 proposal.md、`openspec archive`
   不認得，改以 git mv 歸檔到 `openspec/changes/archive/2026-09-16-installer-shared-config-guard/`。
