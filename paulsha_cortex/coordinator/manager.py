@@ -8939,6 +8939,18 @@ def _repair_findings_prompt_suffix(run, *, coordinator_root: str | Path) -> str:
 # 見 `gate_ledger.run_gates`），長度不受控——一個失敗的全套 pytest 可以吐出數萬
 # 字。沒有上限的話「附上證據」會直接把 dispatch prompt 撐爆，反而讓重派更糟。
 RETRY_CONTEXT_EVIDENCE_LIMIT = 2000
+
+# #814：operator 裁決進 prompt 時成對出現的明示語句（比照 #606 的 retry_context 語句：
+# 文字固定，裁決內容一律留在 contract 的 `operator_adjudications` 結構化欄位）。
+OPERATOR_ADJUDICATION_DIRECTIVE = (
+    " The operator_adjudications block of the contract below reproduces rulings the human "
+    "operator issued through the Manager's bounded CLI (source operator-adjudication); "
+    "verification and review read the same evidence. Those rulings are authoritative and "
+    "outrank model-generated findings: implement every ruling that applies to this card "
+    "before completing it, and never answer a ruling with an empty or re-verification-only "
+    "commit, because a candidate that leaves a ruling unaddressed is rejected by the verifier "
+    "reading that same evidence."
+)
 RETRY_CONTEXT_MESSAGE_LIMIT = 600
 
 
@@ -9527,6 +9539,11 @@ def _workflow_job_prompt(
     )
     # #606：明示語句與 retry_context 區塊成對出現。文字固定、數字機械帶入——
     # 「上一次為什麼被拒」的內容一律留在 retry_context 的結構化欄位裡。
+    # #814：裁決光是躺在 contract 的 `operator_adjudications` 鍵裡不夠——retry_context 有
+    # 明示語句、裁決沒有，builder 把它當 metadata 略過，交出 tree 不變的空 commit，而
+    # verifier 讀同一份 evidence 逐條判 failed（實機 run workflow-05c65e8cd09879fc741f 的死結）。
+    # 語句固定、內容一律留在結構化欄位；無裁決時整句缺席，prompt 逐字不變。
+    adjudication_contract = OPERATOR_ADJUDICATION_DIRECTIVE if operator_adjudications else ""
     retry_context_contract = (
         (
             f" This card is being redispatched: attempt {int(retry_context.get('attempt', 2)) - 1} "
@@ -9555,6 +9572,7 @@ def _workflow_job_prompt(
         + commit_required_contract
         + repair_findings_contract
         + retry_context_contract
+        + adjudication_contract
     )
     preamble = (
         job_runner.WORKTREE_ISOLATION_AUTONOMOUS_PREAMBLE
