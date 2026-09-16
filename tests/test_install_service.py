@@ -8,7 +8,10 @@ from paulsha_cortex.deploy.installer import render_units
 
 
 @pytest.fixture(autouse=True)
-def _clear_injected_agents_root(monkeypatch):
+def _clear_injected_agents_root(monkeypatch, _clear_runtime_env):
+    # 顯式依賴 conftest 的 `_clear_runtime_env`，確保它先把 PSC_AGENTS_ROOT 設成
+    # guard 值、本 fixture 再清掉；不倚賴 pytest 對同 scope autouse fixture 的
+    # 隱含排序（PR #913 Copilot review）。
     """Installer tests choose HOME or an explicit root as their authority."""
     monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
 
