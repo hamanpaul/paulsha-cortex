@@ -6,4 +6,6 @@
   現在都會把 typed `provider_outcome` 與 `launch-failed` runtime diagnostic 寫入 registry；reload 後
   `classification_from_job()` 仍能 round-trip 讀回。workflow/slice consumer 會保留 structured authority
   與 runtime-contract 優先序，`effort_not_supported`／`executable_not_found` 可在既有合格候選內有界 reroute，
-  `launch_failed` 則保留原始 exception 或缺 handle 理由，不自動 retry 或 reroute。
+  reroute 也會重跑該 card 的完整 runtime preflight，因此缺 `module:pytest` 等能力的替代候選會被跳過，
+  若沒有任何 runtime-qualified 替代候選則維持停止並等待人工；`launch_failed` 則保留原始 exception 或缺 handle
+  理由，不自動 retry 或 reroute。

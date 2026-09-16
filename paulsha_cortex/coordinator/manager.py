@@ -4272,75 +4272,56 @@ def _provider_failure_reroute(
     *,
     failed_job: Mapping[str, object],
     classification: "provider_outcome.ProviderFailureClassification",
+    launcher_factory,
 ):
-    """#384：provider 失敗時，在既有 candidate 順序上 re-route，不放寬
-    independence domain（forward-looking 約束：禁 policy-shopping，例如
-    Codex builder 失敗後不得 re-route 成也用 Codex 的 reviewer）。
+    """#384/#826：provider 失敗時只在既有合法候選內 re-route，且替代候選仍
+    必須通過該 card 的完整 runtime preflight。
 
-    複用 :func:`runtime_preflight.evaluate_dispatch_gate`（#369 已把 provider
-    snapshot 接進生產的同一套機制）：把「剛剛觀察到的這次失敗」餵成一筆
-    僅本次呼叫可見、in-memory 的 provider snapshot，讓 gate 依
-    :func:`_workflow_identity_candidates`（既有 domain-filtered 順序，完全未
-    改動）跳過剛失敗的 identity、選下一個候選。刻意不觸碰
-    ``_EXECUTOR_AUTH_CACHE`` 或任何 durable snapshot——這只是這一次 retry
-    決策的暫時性輸入，不影響其他 dispatch 熱路徑（`provider_prober=None`：
-    不觸發任何真實 CLI 探測子行程）。
+    候選清單仍完全複用 :func:`_workflow_identity_candidates` 的既有順序與
+    independence-domain 約束，不得 policy-shop。差別只在於 provider 失敗會
+    先排除「剛剛證實不適合這次重派」的候選：
 
-    只剩失敗的那個 identity 本身合格時，`evaluate_dispatch_gate` 必然又選回
-    它——這不是 bug，是唯一合法選擇（沒有domain-合法的替代候選可換）。
+    - ``effort_not_supported`` 是模型層訊號，只排除同一個 executor/model。
+    - 其餘可恢復 provider 失敗視為 executor 層訊號，整個 failed executor
+      都先跳過。
+
+    之後把剩餘候選交回 :func:`_runtime_preflight_gate`，用與正常 dispatch 同
+    一套 launcher specialization / executor environment / compatibility
+    檢查，避免 reroute 旁路 card capability（例如 ``module:pytest``）。
     """
-
-    from .runtime_preflight import (
-        DEFAULT_PROVIDER_TTL_SECONDS,
-        PROVIDER_EXECUTOR_SENTINEL,
-        ProviderFreshness,
-        RuntimeCapability,
-        evaluate_dispatch_gate,
-        host_environment,
-    )
 
     candidates = _workflow_identity_candidates(run, step, identities)
     failed_executor = failed_job.get("executor")
     failed_model_id = failed_job.get("model_id")
+
     if classification.outcome is provider_outcome.ProviderOutcome.EFFORT_NOT_SUPPORTED:
-        for candidate in candidates:
-            if (
+        reroute_candidates = tuple(
+            candidate
+            for candidate in candidates
+            if not (
                 candidate.executor == failed_executor
                 and candidate.model_id == failed_model_id
-            ):
-                continue
-            return candidate
-        return None
-    observed_at = time.time()
-
-    def _snapshot_lookup(provider_id: str) -> ProviderFreshness | None:
-        if provider_id != failed_executor:
-            # 其餘候選：無快照 -> STALE_SNAPSHOT（non-blocking，直接放行，
-            # 不多探測、不 spawn 任何子行程）。
-            return None
-        return ProviderFreshness(
-            provider_id=provider_id,
-            status="degraded",
-            observed_at=observed_at,
-            ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
-            source="provider-failure-observed",
-            reason=f"{classification.outcome.value}: {classification.reason}",
+            )
         )
-
-    # `_workflow_identity_candidates` 在無合格候選時已 raise ValueError——與
-    # `_select_workflow_identity` 完全相同的既有錯誤行為，這裡刻意不吞掉它
-    # （沒有候選是設定錯誤，不是「這次 retry 剛好找不到人可換」）。
-    decision = evaluate_dispatch_gate(
-        card=step.card,
-        requirements=(RuntimeCapability(kind="provider", name=PROVIDER_EXECUTOR_SENTINEL),),
-        candidates=candidates,
-        environment_for=lambda _identity: host_environment(),
-        snapshot_lookup=_snapshot_lookup,
-        provider_prober=None,
-    )
-    if decision.action == "needs_human":
+    else:
+        reroute_candidates = tuple(
+            candidate for candidate in candidates if candidate.executor != failed_executor
+        )
+    if not reroute_candidates:
         return None
-    return decision.identity
+
+    gate = _runtime_preflight_gate(
+        run,
+        step,
+        identities=identities,
+        launcher_factory=launcher_factory,
+        candidates=reroute_candidates,
+    )
+    if gate is None:
+        return reroute_candidates[0]
+    if gate.action == "needs_human":
+        return None
+    return gate.identity
 
 
 def _canonicalize_card_terminal(raw: Mapping[str, object]) -> dict[str, object]:
@@ -8822,7 +8803,13 @@ def _combined_provider_prober(provider_id: str) -> object | None:
 
 
 def _runtime_preflight_gate(
-    run, step, *, identities: IdentityRegistry, launcher_factory, snapshot_store=None
+    run,
+    step,
+    *,
+    identities: IdentityRegistry,
+    launcher_factory,
+    snapshot_store=None,
+    candidates=None,
 ):
     """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
 
@@ -8833,6 +8820,9 @@ def _runtime_preflight_gate(
     `snapshot_store` 預設 None 時延後到真正需要時才建立
     `monitor.work_snapshot.WorkSnapshotStore()`（讀既有 monitor durable
     snapshot）；測試可注入指向 tmp_path 的 store，不觸碰真實安裝路徑。
+
+    `candidates` 缺席時使用這張 card/persona 的既有完整候選清單；provider
+    failure reroute 會提供已過濾的合法替代候選，重用同一套 runtime gate。
     """
 
     from .runtime_preflight import card_runtime_requirements, evaluate_dispatch_gate
@@ -8844,7 +8834,11 @@ def _runtime_preflight_gate(
     if not requirements:
         return None
 
-    candidates = _workflow_identity_candidates(run, step, identities)
+    active_candidates = (
+        _workflow_identity_candidates(run, step, identities)
+        if candidates is None
+        else list(candidates)
+    )
     compatibility_for = model_resolution.compatibility_checker_for(step.persona)
 
     # 每個 identity 只 specialize 一次並記憶：preflight 與最終 dispatch 共用同一
@@ -8882,7 +8876,7 @@ def _runtime_preflight_gate(
     return evaluate_dispatch_gate(
         card=step.card,
         requirements=requirements,
-        candidates=candidates,
+        candidates=active_candidates,
         environment_for=_environment_for,
         launcher_factory=_launcher_for,
         snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
@@ -10030,11 +10024,10 @@ def _dispatch_workflow_card(
     # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
     # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
     # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。
-    # #384：`forced_identity` 提供時（provider 失敗 bounded retry 的 re-route
-    # 決策，見 `resume_workflow_run`／`_provider_failure_reroute`）代表呼叫端
-    # 已經跑過一次針對「剛剛觀察到的失敗」的 evaluate_dispatch_gate 決策，這裡
-    # 不再重跑一次通用 preflight（重跑不會產生更好的答案，只是多付一次探測
-    # 成本）。
+    # #384/#826：`forced_identity` 提供時（provider 失敗 bounded retry 的
+    # re-route 決策，見 `resume_workflow_run`／`_provider_failure_reroute`）代表
+    # 呼叫端已用同一套 `_runtime_preflight_gate` 驗過替代候選；這裡只重用決策，
+    # 不再重跑一次避免重複探測／specialize 成本。
     gate = (
         None
         if forced_identity is not None
@@ -11070,7 +11063,12 @@ def resume_workflow_run(
             status_fields["provider_retry_limit"] = terminal_contract.MAX_PROVIDER_RETRIES
             if seen < terminal_contract.MAX_PROVIDER_RETRIES:
                 rerouted_identity = _provider_failure_reroute(
-                    run, step, identities, failed_job=job, classification=classification,
+                    run,
+                    step,
+                    identities,
+                    failed_job=job,
+                    classification=classification,
+                    launcher_factory=launcher_factory,
                 )
                 if classification.reroutable and rerouted_identity is None:
                     pass

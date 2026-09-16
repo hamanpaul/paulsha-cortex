@@ -14,7 +14,9 @@ retry、無 backoff。本檔驗證：
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,7 @@ from paulsha_cortex.coordinator.launcher import LaunchHandle
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.provider_outcome import ProviderOutcome, SignalAuthority
 from paulsha_cortex.coordinator.registry import JobRegistry
+from paulsha_cortex.coordinator.runtime_preflight import ExecutorEnvironment
 from paulsha_cortex.coordinator.workflow import WorkflowStep
 
 _PERSONA_BY_PHASE = {
@@ -60,6 +63,32 @@ def _build_only_steps() -> tuple[WorkflowStep, ...]:
         _step("verify", "reviewer-verify", gate_result="pending"),
         _step("review", "reviewer-review", gate_result="pending"),
         _step("ship", "manager-ship", gate_result="pending"),
+    )
+
+
+def _host_executor_env(*, name: str, provider_identity: str | None = None) -> ExecutorEnvironment:
+    return ExecutorEnvironment(
+        name=name,
+        interpreter=(sys.executable,),
+        path=os.environ.get("PATH", ""),
+        home=os.path.expanduser("~"),
+        provider_identity=provider_identity,
+    )
+
+
+def _isolated_executor_env(
+    tmp_path: Path, *, name: str, provider_identity: str | None = None
+) -> ExecutorEnvironment:
+    bindir = tmp_path / f"{name}-bin"
+    home = tmp_path / f"{name}-home"
+    bindir.mkdir(exist_ok=True)
+    home.mkdir(exist_ok=True)
+    return ExecutorEnvironment(
+        name=name,
+        interpreter=(sys.executable, "-I", "-S"),
+        path=str(bindir),
+        home=str(home),
+        provider_identity=provider_identity,
     )
 
 
@@ -150,12 +179,33 @@ class _FakeWorktreeCreator:
 
 
 class _Launcher:
-    def __init__(self, executor: str, model_id: str):
+    def __init__(
+        self,
+        executor: str,
+        model_id: str,
+        *,
+        environment: ExecutorEnvironment | None = None,
+    ):
         self._executor = executor
         self._model_id = model_id
+        self._environment = environment
 
     def as_commit_required(self):
         return self
+
+    def as_read_only(self):
+        return self
+
+    def as_review_only(self, *, terminal_kind: str):
+        return self
+
+    def executor_environment(self) -> ExecutorEnvironment:
+        if self._environment is not None:
+            return self._environment
+        return _host_executor_env(
+            name=f"{self._executor}-workflow",
+            provider_identity=self._executor,
+        )
 
     def launch(self, *, slice_id, prompt, worktree, log_dir):
         return LaunchHandle(
@@ -245,6 +295,136 @@ def test_rate_limited_failure_triggers_bounded_retry_and_reroutes_to_next_candid
     new_job = registry.get_job(result["job_id"])
     assert new_job["executor"] == "claude"
     assert new_job["independence_domain"] == "anthropic"
+
+
+def test_rate_limited_reroute_skips_candidates_missing_subagent_build_runtime_capability(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "claude-primary",
+                "independence_domain": "anthropic",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "copilot",
+                "model_id": "gpt-5.4",
+                "independence_domain": "github",
+                "capabilities": ["build"],
+            },
+        ]
+    )
+    step = manager._current_workflow_step(run)
+    candidates = manager._workflow_identity_candidates(run, step, identities)
+    assert [(item.executor, item.model_id) for item in candidates] == [
+        ("codex", "gpt-primary"),
+        ("claude", "claude-primary"),
+        ("copilot", "gpt-5.4"),
+    ]
+
+    def _env_aware_launcher_factory(identity):
+        environment = (
+            _isolated_executor_env(
+                tmp_path,
+                name="claude-sandbox",
+                provider_identity=identity.executor,
+            )
+            if identity.executor == "claude"
+            else _host_executor_env(
+                name=f"{identity.executor}-workflow",
+                provider_identity=identity.executor,
+            )
+        )
+        return _Launcher(identity.executor, identity.model_id, environment=environment)
+
+    rerouted = manager._provider_failure_reroute(
+        run,
+        step,
+        identities=identities,
+        failed_job={"executor": "codex", "model_id": "gpt-primary"},
+        classification=manager.provider_outcome.ProviderFailureClassification(
+            outcome=ProviderOutcome.RATE_LIMITED,
+            authority=SignalAuthority.TEXT_SIGNAL,
+            reason="synthetic",
+        ),
+        launcher_factory=_env_aware_launcher_factory,
+    )
+
+    assert rerouted is not None
+    assert rerouted.executor == "copilot"
+    assert rerouted.model_id == "gpt-5.4"
+
+
+def test_effort_not_supported_with_only_runtime_unqualified_alternatives_stops_in_needs_human(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    base_head = _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    _seed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        executor="copilot",
+        model_id="mai-code-1-flash-picker",
+        domain="github",
+        outcome=ProviderOutcome.EFFORT_NOT_SUPPORTED,
+    )
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "copilot",
+                "model_id": "mai-code-1-flash-picker",
+                "independence_domain": "github",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "claude-primary",
+                "independence_domain": "anthropic",
+                "capabilities": ["build"],
+            },
+        ]
+    )
+    dispatcher = _ResumeDispatcher(registry, worktree)
+    jobs_before = len(registry.list_jobs())
+
+    def _env_aware_launcher_factory(identity):
+        return _Launcher(
+            identity.executor,
+            identity.model_id,
+            environment=_isolated_executor_env(
+                tmp_path,
+                name=f"{identity.executor}-sandbox",
+                provider_identity=identity.executor,
+            ),
+        )
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_env_aware_launcher_factory,
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    assert result["reason"] == "job-failed-effort_not_supported"
+    assert result["provider_outcome"] == "effort_not_supported"
+    assert len(registry.list_jobs()) == jobs_before
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" in persisted.facets
 
 
 def test_provider_retry_bounded_and_exhaustion_reaches_needs_human(tmp_path: Path) -> None:
@@ -414,7 +594,12 @@ def test_reroute_never_returns_identity_outside_existing_candidate_list(tmp_path
         reason="synthetic",
     )
     rerouted = manager._provider_failure_reroute(
-        run, step, identities, failed_job={"executor": "codex"}, classification=classification
+        run,
+        step,
+        identities,
+        failed_job={"executor": "codex"},
+        classification=classification,
+        launcher_factory=_launcher_factory,
     )
     assert rerouted is not None
     assert rerouted in candidates
@@ -446,7 +631,12 @@ def test_reroute_with_single_candidate_returns_none_not_a_policy_shopped_identit
         reason="synthetic",
     )
     rerouted = manager._provider_failure_reroute(
-        run, step, identities, failed_job={"executor": "codex"}, classification=classification
+        run,
+        step,
+        identities,
+        failed_job={"executor": "codex"},
+        classification=classification,
+        launcher_factory=_launcher_factory,
     )
     assert rerouted is None
 
@@ -511,7 +701,12 @@ def test_reroute_for_reviewer_never_crosses_into_builder_domain(tmp_path: Path) 
         reason="synthetic",
     )
     rerouted = manager._provider_failure_reroute(
-        run, step, identities, failed_job={"executor": "claude"}, classification=classification
+        run,
+        step,
+        identities,
+        failed_job={"executor": "claude"},
+        classification=classification,
+        launcher_factory=_launcher_factory,
     )
     # 唯一候選（claude）本身就是失敗中的那個 -> None（回退 _select_workflow_identity
     # 仍選 claude，不會、也不能 re-route 回 codex/openai）。
