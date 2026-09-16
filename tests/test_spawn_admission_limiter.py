@@ -27,6 +27,8 @@ provider 的 spawn 之間確實錯開、不同 provider 之間不互相拖慢。
 
 from __future__ import annotations
 
+from _pinned_spec_support import materialize_spec
+
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -271,7 +273,7 @@ def _meta(
     executor: str | None = None,
     model_id: str | None = None,
 ) -> dict:
-    spec_path = f"/specs/{slice_id}.md"
+    spec_path, spec_hash = materialize_spec(f"/specs/{slice_id}.md")  # #503
     return {
         "path": spec_path,
         "dispatch": dispatch,
@@ -297,7 +299,7 @@ def _meta(
         "model_id": model_id,
         "_pinned_inputs": {
             "spec_path": spec_path,
-            "spec_hash": "0" * 64,
+            "spec_hash": spec_hash,
             "plan_path": plan,
             "plan_hash": "1" * 64,
             "target_branch": "main",

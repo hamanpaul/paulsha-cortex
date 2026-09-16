@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _pinned_spec_support import materialize_spec
+
 import json
 import os
 import subprocess
@@ -161,6 +163,7 @@ def _meta(
     target_branch: str = "main",
     target_remote: str = "origin",
 ) -> dict:
+    spec_path_str, spec_hash = materialize_spec(spec_path)  # #503
     verification_contract = {
         "docs_class": "code",
         "review_policy": "required",
@@ -184,7 +187,7 @@ def _meta(
         },
     }
     return {
-        "path": str(spec_path),
+        "path": spec_path_str,
         "dispatch": dispatch,
         "slice_id": slice_id,
         "plan": f"docs/superpowers/plans/{slice_id}.md",
@@ -192,8 +195,8 @@ def _meta(
         "target_branch": target_branch,
         "verification": verification_contract,
         "_pinned_inputs": {
-            "spec_path": str(spec_path),
-            "spec_hash": "0" * 64,
+            "spec_path": spec_path_str,
+            "spec_hash": spec_hash,
             "plan_path": f"docs/superpowers/plans/{slice_id}.md",
             "plan_hash": "1" * 64,
             "target_branch": target_branch,

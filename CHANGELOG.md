@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **#503 slice-lane pinned spec 交付與 attestation**：builder prompt 附 `[SPEC: path sha256=…]`＋逐字 spec body
+  與明示語句，dispatch 時 spec hash 必須等於 pin 值否則 needs_human；job row 記錄交付的 spec／plan hash，完成側
+  對照 slice 釘住的值（`builder-input-*-hash` → pinned-input-mismatch）；review prompt 附同一份 spec 行。
 - **#814 operator 裁決進 builder prompt 是指令不是 metadata**：`operator_adjudications` 區塊成對附上固定明示語句
   （權威、優先於模型 findings、完成前必須實作、verifier 讀同一份 evidence、空 commit 會被打回），無裁決時 prompt
   逐字不變；`retry-build`／`retry-card` 回傳新增 `adjudication.next_step_hint` 告知裁決將於下一次 dispatch 注入。
