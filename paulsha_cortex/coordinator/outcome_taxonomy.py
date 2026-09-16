@@ -256,6 +256,9 @@ _SHELL_NAMES = frozenset(
     {"ash", "bash", "dash", "fish", "ksh", "powershell", "pwsh", "sh", "zsh"}
 )
 _LAUNCHER_IDENTIFIERS = frozenset({"agy", "cg", "claude", "codex", "copilot"})
+_SHARED_LAUNCH_INFRASTRUCTURE_IDENTIFIERS = _SHELL_NAMES | frozenset(
+    {"git", "systemctl", "systemd-run"}
+)
 _COMMAND_NOT_FOUND_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"""
@@ -488,10 +491,12 @@ def _has_shell_command_not_found_context(provider_text: str) -> str | None:
             if launch_call is not None:
                 target = _extract_enoent_target(line)
                 if target is not None:
+                    target_token = _normalize_command_token(target)
+                    if target_token in _SHARED_LAUNCH_INFRASTRUCTURE_IDENTIFIERS:
+                        continue
                     if _is_cwd_style_launch_enoent(line, target):
                         continue
                     if _looks_like_path_reference(target):
-                        target_token = _normalize_command_token(target)
                         if target_token not in _LAUNCHER_IDENTIFIERS:
                             continue
                 return (

@@ -178,6 +178,22 @@ def test_exit_127_empty_output_is_executable_not_found_and_reroutable():
     assert result.reroutable is True
 
 
+@pytest.mark.parametrize(
+    "shared_binary", ["bash", "sh", "git", "systemctl", "systemd-run"]
+)
+def test_same_line_launch_enoent_for_shared_infrastructure_is_not_reroutable(
+    shared_binary: str,
+) -> None:
+    result = classify_provider_failure(
+        exit_code=1,
+        output=f"subprocess.Popen(...): [Errno 2] No such file or directory: '{shared_binary}'",
+    )
+
+    assert result.outcome is ProviderOutcome.UNKNOWN
+    assert result.authority is SignalAuthority.HINT
+    assert result.reroutable is False
+
+
 def test_launch_failure_only_classifies_missing_executable_when_exception_proves_it():
     missing_program = classify_launch_failure(
         exc=FileNotFoundError(2, "No such file or directory", "copilot"),

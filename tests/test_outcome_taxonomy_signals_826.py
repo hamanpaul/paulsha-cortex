@@ -411,6 +411,24 @@ def test_launch_call_enoent_for_missing_cwd_stays_none_signal(provider_text: str
     assert result.signal.value == "none"
 
 
+@pytest.mark.parametrize(
+    "shared_binary", ["bash", "sh", "git", "systemctl", "systemd-run"]
+)
+def test_launch_call_enoent_for_shared_launch_infrastructure_stays_none_signal(
+    shared_binary: str,
+) -> None:
+    result = outcome_taxonomy.classify_text(
+        exit_code=1,
+        provider_text=(
+            "subprocess.Popen(...): "
+            f"[Errno 2] No such file or directory: '{shared_binary}'"
+        ),
+        model_text="",
+    )
+
+    assert result.signal.value == "none"
+
+
 def test_spawn_log_open_enoent_stays_none_signal() -> None:
     result = outcome_taxonomy.classify_text(
         exit_code=1,
