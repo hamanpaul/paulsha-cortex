@@ -361,6 +361,8 @@ def test_bash_line_command_not_found_classifies_as_executable_not_found_signal()
         "execve: No such file or directory",
         "spawn: No such file or directory",
         "Popen: No such file or directory",
+        "os.execvpe(...): [Errno 2] No such file or directory: 'copilot'",
+        "subprocess.Popen(...): [Errno 2] No such file or directory: 'copilot'",
     ],
 )
 def test_exec_spawn_popen_enoent_classifies_as_executable_not_found_signal(
@@ -380,6 +382,29 @@ def test_general_file_open_enoent_stays_none_signal() -> None:
     result = outcome_taxonomy.classify_text(
         exit_code=1,
         provider_text="open /tmp/work/spec.json: No such file or directory",
+        model_text="",
+    )
+
+    assert result.signal.value == "none"
+
+
+@pytest.mark.parametrize(
+    "provider_text",
+    [
+        (
+            "subprocess.Popen(..., cwd='/tmp/missing'): "
+            "[Errno 2] No such file or directory: '/tmp/missing'"
+        ),
+        (
+            "subprocess.Popen(..., cwd='missing-cwd'): "
+            "[Errno 2] No such file or directory: 'missing-cwd'"
+        ),
+    ],
+)
+def test_launch_call_enoent_for_missing_cwd_stays_none_signal(provider_text: str) -> None:
+    result = outcome_taxonomy.classify_text(
+        exit_code=1,
+        provider_text=provider_text,
         model_text="",
     )
 

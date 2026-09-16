@@ -299,6 +299,20 @@ _LAUNCH_EXECUTABLE_ENOENT_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+_LAUNCH_CWD_ARGUMENT_RE = re.compile(
+    r"""
+    \bcwd
+    \s*[:=]
+    \s*
+    (?P<cwd>
+        `[^`\r\n]+`
+        | '[^'\r\n]+'
+        | "[^"\r\n]+"
+        | [^,)\]}]+
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 # Transient：網路/服務暫時性錯誤，與 rate limit 不同——這裡沒有「額度」語意，
 # 純粹是這一次呼叫失敗，重試通常會成功。
@@ -426,6 +440,44 @@ def _normalize_command_token(token: str) -> str:
     return candidate.lower()
 
 
+def _strip_inline_argument_value(value: str) -> str:
+    return value.strip().strip("`'\"")
+
+
+def _extract_enoent_target(line: str) -> str | None:
+    marker = "no such file or directory"
+    position = line.lower().rfind(marker)
+    if position < 0:
+        return None
+    suffix = line[position + len(marker) :].strip()
+    if not suffix.startswith(":"):
+        return None
+    target = suffix[1:].strip()
+    return target or None
+
+
+def _looks_like_path_reference(value: str) -> bool:
+    candidate = _strip_inline_argument_value(value)
+    if not candidate:
+        return False
+    if re.match(r"^[A-Za-z]:[\\/]", candidate) is not None:
+        return True
+    return (
+        "/" in candidate
+        or "\\" in candidate
+        or candidate.startswith(("~", "./", "../", ".\\", "..\\"))
+    )
+
+
+def _is_cwd_style_launch_enoent(line: str, target: str) -> bool:
+    cwd_match = _LAUNCH_CWD_ARGUMENT_RE.search(line)
+    if cwd_match is None:
+        return False
+    return _strip_inline_argument_value(cwd_match.group("cwd")) == _strip_inline_argument_value(
+        target
+    )
+
+
 def _has_shell_command_not_found_context(provider_text: str) -> str | None:
     for raw_line in provider_text.splitlines():
         line = raw_line.strip()
@@ -434,6 +486,14 @@ def _has_shell_command_not_found_context(provider_text: str) -> str | None:
         if "no such file or directory" in line.lower():
             launch_call = _LAUNCH_EXECUTABLE_ENOENT_RE.match(line)
             if launch_call is not None:
+                target = _extract_enoent_target(line)
+                if target is not None:
+                    if _is_cwd_style_launch_enoent(line, target):
+                        continue
+                    if _looks_like_path_reference(target):
+                        target_token = _normalize_command_token(target)
+                        if target_token not in _LAUNCHER_IDENTIFIERS:
+                            continue
                 return (
                     f"{launch_call.group('call').lower()} reported missing executable"
                 )
