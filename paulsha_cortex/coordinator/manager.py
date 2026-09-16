@@ -427,7 +427,7 @@ def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
     payload = evidence["payload"]
     refs = [evidence["path"]]
     state = payload["status"]
-    gate_state = "pending" if state == "reviewing" else ("passed" if state == "verified" else "needs_human")
+    gate_state = _verification_gate_state(state)
     action = {
         "reviewing": "verification-passed-await-review",
         "verified": "verification-passed",
@@ -447,6 +447,52 @@ def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
         current_evidence_refs=refs,
         candidate=payload["candidate"],
     )
+
+
+def _verification_gate_state(status: str) -> str:
+    # verification 結果 → gate_state 的唯一來源：reviewing→pending、verified→passed、其餘→needs_human。
+    # `_apply_verification_result` 與 `_dirty_recheck_is_noop` 都從這裡取，不各自複製。
+    return "pending" if status == "reviewing" else ("passed" if status == "verified" else "needs_human")
+
+
+def _dirty_recheck_is_noop(slice_row: dict | None, evidence: dict) -> bool:
+    """#496：dirty recheck 的結果是否與 slice 目前的 effective transition 完全相同。
+
+    只有「canonical 內容 hash、state／gate_state、candidate、summary、current evidence refs」
+    全部一致才回 True（呼叫端據此略過 `_apply_verification_result`）。任何欄位缺失、
+    current evidence 不可解析、或只是 ref path 相同都不算相等——這種情況一律回 False，
+    沿原路徑做一次真實轉換把 slice 修正到位。`evidence` 必須已通過
+    `_validate_result_evidence`；本函式不重驗證據、不讀寫 contract hash。
+    """
+    if not isinstance(slice_row, dict):
+        return False
+    payload = evidence.get("payload")
+    new_hash = evidence.get("hash")
+    new_path = evidence.get("path")
+    if not isinstance(payload, dict) or not isinstance(new_hash, str) or not new_hash:
+        return False
+    if not isinstance(new_path, str) or not new_path:
+        return False
+    current_hash = slice_row.get("current_verification_evidence_hash")
+    if not isinstance(current_hash, str) or not current_hash or current_hash != new_hash:
+        return False
+    status = payload.get("status")
+    if not isinstance(status, str):
+        return False
+    if slice_row.get("state") != status:
+        return False
+    if slice_row.get("gate_state") != _verification_gate_state(status):
+        return False
+    if slice_row.get("candidate") != payload.get("candidate"):
+        return False
+    if slice_row.get("current_evidence_refs") != [new_path]:
+        return False
+    current = _current_verification_payload(slice_row)
+    if current is None or current["hash"] != new_hash:
+        return False
+    if current["payload"].get("summary") != payload.get("summary"):
+        return False
+    return True
 
 
 def _identity_registry() -> dict[tuple[str, str], dict[str, str]]:
@@ -2302,7 +2348,19 @@ def complete_tick(
                                     slice_id=slice_item["slice_id"],
                                     coordinator_root=coord_root,
                                 )
-                                _apply_verification_result(registry, slice_item["slice_id"], validated_ev)
+                                # #496：重驗結果與 slice 目前的 effective transition 完全相同時
+                                # 不再 record_action／update_slice——舊實作每 tick 無條件 apply，
+                                # 一個放著不管的 dirty slice 六天累積 9 萬筆 verification-failed
+                                # evidence_history／actions。判準是內容 hash 對
+                                # `current_verification_evidence_hash`（#501 已分離的欄位），
+                                # 不是 evidence path；驗證本身仍每 tick 執行，operator 清乾淨
+                                # worktree 後照舊脫困。
+                                if not _dirty_recheck_is_noop(
+                                    registry.get_slice(slice_item["slice_id"]), validated_ev
+                                ):
+                                    _apply_verification_result(
+                                        registry, slice_item["slice_id"], validated_ev
+                                    )
                     except Exception:
                         pass
 
