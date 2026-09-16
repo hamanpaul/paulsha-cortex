@@ -1,15 +1,19 @@
 ---
-status: proposed
+status: accepted
 work_item: r3-testpilot-case-corpus
+issue: 904
 ---
 
 # r3-testpilot-case-corpus Todo
 
 R3（原 v3 的 1-B）testpilot plugin case 的**素材盤點** workstream，對應 issue `#667`。
 
-**status 刻意不是 `accepted`**：本 workstream 的產出是一份**候選清單**，不是已核可的實作
-計畫。清單本身不進派工鏈、不當 gate、不擋 merge。要把其中任何一筆長成 case，需要另開
-實作票並在該票上取得 accepted 的計畫——本 workstream 不代行那個核可。
+本 workstream 的產出是一份**候選清單**，不是已核可的實作計畫。清單本身不進派工鏈、不當
+gate、不擋 merge。要把其中任何一筆長成 case，需要另開實作票並在該票上取得 accepted 的計畫——
+本 workstream 不代行那個核可。第二輪（`#904`，2026-09-15 進件）承接下列 6 項未勾任務，規劃
+三件套見 `docs/superpowers/specs/r3-testpilot-case-corpus-{spec,design}.md` 與
+`docs/superpowers/plans/r3-testpilot-case-corpus.md`；`status: accepted` 指第二輪盤點計畫已核可，
+不代表任何 case 進入實作。
 
 本票的唯一產出是文件。**明確不做**（`#667` scope fence，越界即為失敗）：不寫任何 case
 yaml、不建 mock provider／tick harness、不動 `paulsha_cortex/` 下任何程式、不預蓋框架。
@@ -27,25 +31,25 @@ yaml、不建 mock provider／tick harness、不動 `paulsha_cortex/` 下任何�
       整組存在）。見 `case-candidates.md` 的「三個橫向發現」一節。
 - [x] 覆蓋缺口誠實記錄（08-12 波未深讀 6 張／ship-delivery 語意零覆蓋／porcelain 分不出
       穩定與繞過／deck-combo 次級缺口）。見 `case-candidates.md` 的「覆蓋缺口」一節。
-- [ ] **下一輪優先**：補讀 08-12 波未深讀的 6 張（`#473`／`#475`／`#476`／`#478`／`#506`／
+- [x] **下一輪優先**：補讀 08-12 波未深讀的 6 張（`#473`／`#475`／`#476`／`#478`／`#506`／
       `#508`）。成本約 1 次 `gh` 呼叫。其中 `#478` 與 `#506` 已由症狀路獨立取證進入候選
       （`recovery-reports-ok-while-git-registry-stale`／`secondary-rate-limit-response`），
       補讀可把它們從單路命中升級，並可能新增 deck 與 work-registry schema 兩格。
-- [ ] **下一輪優先**：補 ship／delivery 的語意面。**不要再掃 issue**——語料已證實 08-12 波
+- [x] **下一輪優先**：補 ship／delivery 的語意面。**不要再掃 issue**——語料已證實 08-12 波
       33 張深讀裡零張是 ship 事故。建議改讀 `github_delivery.py`(47KB) 的 PR metadata
       preflight／merge authorization／delivery journal／push readback／closed-unmerged PR
       五個表面，並以 `delivery-journal.json` 的 19 個 run 當 fixture 來源。
-- [ ] **下一輪優先**：補 porcelain 的 operator 繞過手法。同樣**不要再掃 issue**——建議讀
+- [x] **下一輪優先**：補 porcelain 的 operator 繞過手法。同樣**不要再掃 issue**——建議讀
       `docs/` 的 onboarding／quickstart／troubleshooting 與 driving-cortex skill
       （`#177`／`#192`），operator 的繞法沉澱在那裡而不在 issue tracker。
-- [ ] 決定 T1 三筆（`review-identity-loader-asymmetry` `#490`／
+- [x] 決定 T1 三筆（`review-identity-loader-asymmetry` `#490`／
       `porcelain-cli-verb-must-match-permgen-execstart` `#618`+`#619`／
       `unbounded-substring-marker-misclassifies-failure` `#487`+`#500`+`#554`）是否為 R3 的
       首批實作票。三筆皆為純函式＋凍結 fixture、oracle 型別為集合相等或差分、零 harness
       前置。**待 R2 Compact 收斂後才開實作票**（R3 本體依賴 R2，本盤點不依賴）。
-- [ ] 確認 case report 與 `EvidenceAttestation` 的契約對齊（subject 綁 candidate、**不得
+- [x] 確認 case report 與 `EvidenceAttestation` 的契約對齊（subject 綁 candidate、**不得
       自我背書**）。本盤點未涉及此契約的實作形狀，僅記錄依賴。
-- [ ] 把「多 UID 不可用時標 `unsupported`，不得標 `pass`」寫進未來 case harness 的契約層
+- [x] 把「多 UID 不可用時標 `unsupported`，不得標 `pass`」寫進未來 case harness 的契約層
       （目前只是本文件裡的硬規則，尚無執行機制）。
 
 ## 一句話狀態
@@ -62,7 +66,7 @@ yaml、不建 mock provider／tick harness、不動 `paulsha_cortex/` 下任何�
 
 ## 相關
 
-- issue：`#667`
+- issue：`#667`（第一輪）、`#904`（第二輪）
 - 計畫：`~/prj_pri/cortex-redesign-rollout-plan.md` → `Phase R3【原 1-B｜testpilot plugin
   cases，用 Compact 跑】`
 - 清單本體：`docs/superpowers/workstreams/r3-testpilot-case-corpus/case-candidates.md`

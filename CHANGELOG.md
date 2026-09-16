@@ -11,7 +11,10 @@
   timeout fallback，對所有 AGY headless argv 形態顯式加入 canonical
   `--print-timeout <Ns>`，並在 direct launch／capability probe 前 fail-closed
   拒絕非法或超界設定。
-
+- **#904：R3 testpilot case 素材盤點第二輪收斂**：`docs/superpowers/workstreams/r3-testpilot-case-corpus/{case-candidates.md,todo.md}`
+  補齊 08-12 波 6 張 issue 深讀、`github_delivery.py` 五個 ship／delivery 表面與 porcelain
+  穩定／繞過分群；候選清單更新為 **109** 筆，`evidence-insufficient` 收斂為 **31** 筆，並補上
+  T1 首批決定與 `EvidenceAttestation`／harness 契約備註。
 - **`.cortex/work-items.yaml` 補登錄 33 個 work item 的 `github_issue` link**：31 個管線外
   交付、只剩規劃文件殘留者綁定原交付 issue（6 個無專屬 issue 者以 closeout 票 `#898`–`#903`
   作結案紀錄），清掉 `not_claimable` 的 `missing_issue` 反覆觀測（`#895` 治標）；

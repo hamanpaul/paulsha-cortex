@@ -1,7 +1,9 @@
 # R3 testpilot case 候選清單
 
-issue `#667` 的產出本體。四路**互相盲測**的語料 sweep（症狀家族／子系統／生命週期階段／
-artifact 型別）跨軸去重後的候選清單。
+issue `#667` 的第一輪產出本體，並承接 `#904` 的第二輪補讀／補面。四路**互相盲測**的語料
+sweep（症狀家族／子系統／生命週期階段／artifact 型別）跨軸去重後的候選清單，第二輪另補
+08-12 波 6 張 issue、`github_delivery.py` 的五個 delivery 表面，以及 porcelain 文件／skill
+中沉澱的 operator 繞過手法。
 
 **本清單不進派工鏈、不當 gate、不擋 merge。** 它是給人看的素材盤點。要把任何一筆長成
 case，需另開實作票；R3 本體依賴 R2 Compact，本盤點不依賴。
@@ -16,25 +18,27 @@ case，需另開實作票；R3 本體依賴 R2 Compact，本盤點不依賴。
 
 | | 數量 |
 |---|---:|
-| 四路原始條目 | **155**（症狀 37／子系統 49／生命週期 37／artifact 32） |
-| 去重後候選 | **102** |
+| 第一期四路原始條目 | **155**（症狀 37／子系統 49／生命週期 37／artifact 32） |
+| 第二輪補讀／補面新增命中 | **8**（新候選 7 ＋ `#478` 補命中 1） |
+| 去重後候選 | **109** |
 | — `hit_by` 四路 | **1** |
 | — `hit_by` 三路 | **9** |
-| — `hit_by` 二路 | **31** |
-| — `hit_by` 單路 | **61** |
-| evidence-insufficient（四路原始 41）| 去重後 **32** |
+| — `hit_by` 二路 | **32** |
+| — `hit_by` 單路 | **67** |
+| evidence-insufficient（四路原始 41；第二輪解掉 EI 17）| 去重後 **31** |
 
 > `#667` 派工單記 artifact 路為 31 筆，實際條目重算為 **32**（`### ` 級候選標題逐一計數）。
 > 以實際條目為準。
 
-**155 與 102×`hit_by` 的對帳**：`1×4 + 9×3 + 31×2 + 61×1 = 154`。差額來自兩種情形，皆已在
-對應候選標註：(a) 三筆候選各吸收了**同一軸的兩個條目**（`#536` 吸收子系統路的
+**163 與 109×`hit_by` 的對帳**：`1×4 + 9×3 + 32×2 + 67×1 = 162`。差額延續第一輪的兩種情形，
+皆已在對應候選標註：(a) 三筆候選各吸收了**同一軸的兩個條目**（`#536` 吸收子系統路的
 `planning-define-ongoing-run-invisible…` 與 `planning-publish-and-run-state-not-one-transaction`；
 `#487/#500/#554` 吸收子系統路的兩條 classifier；`#482/#497/#571` 吸收子系統路的
 `review-absent-evidence-path-collision` 與 `tick-recovered-slice-reprocesses-superseded-job`）
 ＝ +3；(b) 兩個條目各自跨了**兩筆**合成候選（症狀路 `abandon-does-not-enumerate-named-resources`
 橫跨 artifacts／evidence 與 branch 兩筆；生命週期路 `ship-card-handoff-must-not-depend-on-disk-residue`
-的 (c) 項橫跨 ship git cwd 與 ship 卡交接兩筆）＝ −2。`154 + 3 − 2 = 155`。
+的 (c) 項橫跨 ship git cwd 與 ship 卡交接兩筆）＝ −2。第一輪的 `155` 因而是 `154 + 3 − 2`；
+第二輪再補進 **7 筆單路候選**與 `#478` 的**第 2 路命中 1 筆**，故總命中為 `155 + 7 + 1 = 163`。
 
 ### 單路命中不等於不重要
 
@@ -1859,15 +1863,15 @@ case，需另開實作票；R3 本體依賴 R2 Compact，本盤點不依賴。
   不需真實 model。
 - **determinism_risk**：中（因 N 未定案）。
 
-### 77. `recovery-reports-ok-while-git-registry-stale` ｜ hit_by: symptom（1 路）｜ oracle 型別: 雙向＋真實 git 硬性前置
+### 77. `recovery-reports-ok-while-git-registry-stale` ｜ hit_by: symptom·round2:subsystem（2 路）｜ oracle 型別: 雙向＋真實 git 硬性前置
 
 - **source**：issue `#478`（open），paulsha-cortex 0.1.8 live isolated instance；同型 `#601`（open）。
-  ⚠ **子系統路未深讀 `#478`**（列在其 evidence-insufficient「08-12 波未深讀 6 張」），故僅單路
-  命中——**補讀後可升級**（見「覆蓋缺口」第 1 節）。
+  第二輪補讀 body／comments 後，子系統路補進了 recovery root cause 與 postcondition 的命中。
 - **observed**（逐字）：
   > 「Operator ran `cortex slice-action <slice> recover-pre-candidate` → Cortex returned `result: ok` / `slice_state: pending` / `gate_state: pending`. The worktree directory no longer existed. **`git worktree list --porcelain` still showed the same worktree** with the feature branch and `prunable gitdir file points to non-existent location`. **Four seconds later** the manager recorded a new `dispatch-failed` action and changed both slice states back to `needs_human`.」
   > 根因：「`runner = git_runner or getattr(dispatcher, "_git_runner", None)`；Git cleanup runs only under `if runner is not None`；otherwise Cortex falls through to `shutil.rmtree(target_wt, ignore_errors=True)`。The production dispatcher can legitimately have `_git_runner is None`。」
   > **測試為何沒抓到**：「The existing recovery test uses a normal temporary directory rather than a real Git worktree, so it proves filesystem deletion but cannot detect stale Git registry state.」
+  > comment 2：「Because the builder job pointer had already been cleared and the slice had no worktree/branch fallback fields, recovery could not resolve a target path at all. Both the physical worktree and Git registration remained present… So cleanup must not rely solely on a still-bound builder_job_id. It needs a durable slice/worktree identity or a validated branch-derived lookup, and must verify postconditions before returning ok.」
 - **oracle**：用**真實 git repo 與真實 linked worktree**（**非普通 tmp 目錄**），斷言 recovery
   成功後：(a) worktree 目錄不存在；(b) `git worktree list --porcelain` **無該路徑條目**；
   (c) slice 與 gate state 皆 pending；(d) 同一 feature branch **可被再次 attach**；(e) 再推一個
@@ -2485,35 +2489,21 @@ case，需另開實作票；R3 本體依賴 R2 Compact，本盤點不依賴。
 
 ## 五、覆蓋缺口
 
-**本節刻意不淡化。** 一份「哪裡都覆蓋到了」的盤點報告，本身就是造假的訊號。以下四格是四路
-sweep 合起來仍然沒有覆蓋到、或覆蓋了卻分不出真假的地方。
+**本節刻意不淡化。** 第一輪留下的四格缺口，第二輪已補齊前三格；目前真正尚未補面的只剩
+deck-combo 的次級缺口。以下保留歷史缺口與本輪收斂結果。
 
-### 缺口 1：08-12 波有 6 張未深讀（最容易補、下一輪優先）
+### 缺口 1：08-12 波有 6 張未深讀（第二輪已補齊）
 
-子系統路自陳：08-12 波的 65 張裡，深讀了 33 張，**`#473`／`#475`／`#476`／`#478`／`#506`／
-`#508` 這 6 張只讀了標題、沒有讀 body**。依本次盤點的硬性準則——`observed` 必須逐字引用來源、
-**不得憑標題推測**——它們不能以子系統路的身分進候選。
+`#473`／`#475`／`#476`／`#478`／`#506`／`#508` 的 body／comments 已全數補讀。結果是：
 
-依標題可粗歸屬（**這是歸屬，不是候選**）：
+- 新增候選 **103／104／105／106**，其中 deck 與 work-registry schema 兩格已各有一筆；
+- 候選 **77** 由單路升為 `symptom·round2:subsystem` 雙路命中；
+- `#506` 取得 manager／monitor 呼叫形狀的新證據，但**仍維持 EI 9**——因為 cortex 自身
+  `403 secondary limit → 分類 → recovery` 的終局仍未被直接觀測。
 
-| issue | 粗歸屬 | 現況 |
-|---|---|---|
-| `#473` | deck | 四路皆無候選 |
-| `#475` | dispatch／launcher | 四路皆無候選 |
-| `#476` | porcelain／service | 四路皆無候選 |
-| `#478` | coordinator／worktree 回收 | **症狀路已獨立深讀並產出候選 77**（單路命中） |
-| `#506` | claim／GitHub 節流 | **症狀路已讀，但判為 evidence-insufficient 9**（cortex 自身行為從未被觀測） |
-| `#508` | claim／work-registry schema | 四路皆無候選 |
+詳見 **§八「第二輪：08-12 波補讀」**。
 
-**補齊成本：約 1 次 `gh` 呼叫。** 這是本次 sweep 中投報最高的一塊。
-
-預期效果：`#478` 與 `#506` 會從單路命中升級為雙路（強化候選 77 與 evidence-insufficient 9
-的判定）；`#473`／`#475`／`#476`／`#508` 有可能各補一條新候選，其中 `#476` 若真是 porcelain
-事故，會**直接填補缺口 3**（porcelain 七個 verb 家族目前零原生事故）。
-
-**下一輪應先做這件事，再做任何新的 sweep。**
-
-### 缺口 2：ship／delivery 是覆蓋度與風險落差最大的一格
+### 缺口 2：ship／delivery 是覆蓋度與風險落差最大的一格（第二輪已補 delivery 語意面）
 
 `delivery.py`(21KB) ＋ `github_delivery.py`(47KB) ＋ `preflight.py`(16KB) 是**全庫第三大的
 功能面**，四路合起來卻只擠出五條候選，而且**沒有一條是 delivery 語意問題**：
@@ -2549,16 +2539,12 @@ sweep 合起來仍然沒有覆蓋到、或覆蓋了卻分不出真假的地方�
 mutation`）與 `#502`（verified 之後發現阻擋缺陷卻無法退回，見候選 96）都指向同一個位置。
 **這裡的假綠代價最高，而語料最薄——這是本次盤點中風險與覆蓋度落差最大的一格。**
 
-**補這格的建議（不要再掃 issue）**：
+第二輪已依 `github_delivery.py` 五個表面補面：PR metadata preflight → 候選 **107**、merge
+authorization → 候選 **108**、delivery journal 寫入端 → 候選 **92**、push readback →
+候選 **109**、closed-unmerged PR → 候選 **78**。覆蓋度仍薄，但它已不再是「零條 delivery
+語意候選」。詳見 **§九「第二輪：ship／delivery 語意面」**。
 
-- 讀 `github_delivery.py` 的五個表面，以 `delivery-journal.json` 的 **19 個 run** 當 fixture
-  來源（artifact 路已全部逐欄 dump 過，形狀已知）。
-- 候選 92 已證實 journal 上存在**一筆未完成交易**（`workflow-f9f639b2a677496c29c1`：已綁定
-  交付目標、已推送三個 commit、`ship = None`）——那是唯一一個由實體 artifact 直接指出的
-  delivery 語意破口，可作為切入點。
-- **不要**用「ship 成功」當 oracle。候選 67 已經記錄了原因：在單 UID CI 下永遠綠。
-
-### 缺口 3：porcelain 分不出「真的穩定」還是「operator 當場繞過而不開票」
+### 缺口 3：porcelain 分不出「真的穩定」還是「operator 當場繞過而不開票」（第二輪已分群）
 
 `porcelain/` 有 14 個模組、merged PR 數不算少（約 25），但**兩條候選都是其他子系統外溢進來
 的，不是 porcelain 原生事故**：
@@ -2583,10 +2569,15 @@ PR 數不少卻零事故的原因是**那些 PR 幾乎全是 feature 交付而�
 `#474` 是唯一的反例，而且那是在一個**外部 repo 首次使用時**才被寫下來的；`#474` 的三個項目
 全是「摩擦」而非「崩潰」——**這比較支持 (b)**。
 
-**補這格的建議（不要再掃 issue）**：最有效的動作是去讀 `docs/` 底下的 onboarding／quickstart／
-troubleshooting，以及 **driving-cortex skill**（`#177`／`#192`）。**operator 繞過的手法通常
-沉澱在文件與 skill 裡，而不是在 issue tracker 裡。** 若那些文件裡出現「如果 X 失敗，改用 Y」
-形式的段落，每一段都是一條沒有開票的 porcelain 事故。
+第二輪已讀 `docs/onboarding/{quickstart,troubleshooting}.md`、`#177`／`#192` 與現行
+`skills/driving-cortex/SKILL.md`。結果可明確分成兩群：
+
+- **穩定行為**：`cortex bootstrap`／`ready`／`request wait`／`retry-build`／`review-attest`
+  仍是文件正面教學的 supported path；
+- **operator 繞過**：`systemctl --user`、`pipx install --force`、`gh api graphql
+  resolveReviewThread`、`sudo -u <service-account>` probes 仍是故障／部署邊界的真實恢復手法。
+
+詳見 **§十「第二輪：porcelain 穩定 vs 繞過」**。
 
 ### 缺口 4（次級）：deck-combo 的自動選型面零事故
 
@@ -2626,7 +2617,7 @@ troubleshooting，以及 **driving-cortex skill**（`#177`／`#192`）。**opera
 
 **本節必須非空。** 若全部候選都「證據充分」，那是造假的訊號，不是品質的訊號。
 
-四路原始 **41 筆**（症狀 9／子系統 11／生命週期 12／artifact 9），去重後 **32 筆**。
+四路原始 **41 筆**（症狀 9／子系統 11／生命週期 12／artifact 9），去重後 **31 筆**。
 
 > **注意**：本節有 3 筆與候選清單**重疊**——`#502`（EI 12 ↔ 候選 96）、`#524`（EI 4 ↔ 候選 97）、
 > `#488`（EI 6 ↔ 候選 95）。這不是矛盾，是**四路之間真實的判斷分歧**：某一路認為可判定的
@@ -2773,18 +2764,24 @@ troubleshooting，以及 **driving-cortex skill**（`#177`／`#192`）。**opera
 
 ### EI 9. `#506` cortex 自身在 secondary rate limit 下的行為
 
-- **來源軸**：症狀路 EI-7
+- **來源軸**：症狀路 EI-7 ＋ `round2:subsystem` 補讀 `#506`
 - **已有的觀測**：事故本身是 **fleet conventions 升級批次**（7 個平行 agent 用
   `gh pr checks --watch`）觸發，**不是 cortex 自己的行為**；issue 是把外部事故的教訓**預防性**
   寫進 cortex。
+- **第二輪補讀（逐字）**：
+  > `coordinator/work_actions.py:3425` 的 auto-claim scan 對**每一個** mapped issue 各發一次即時 `gh api` 讀 label（per-tick O(n)）。
+  > `cortex manager | 週期 30s | 每輪呼叫 57 | 換算 114 次／分鐘`
+  > **manager 一支就是 monitor 的 7 倍以上，24 小時不停，而且完全不受 `GitHubPressureGate` 管**。
 - **為何無法定期望值**：**cortex 自身在 secondary rate limit 下的實際行為從未被觀測。**
   issue 的五條建議**全是「應該」而非「觀測到」**。以未觀測的行為寫 case 就是編期望。
+- **第二輪後的邊界**：現在已可確定「auto-claim 目前是 per-tick per-issue live API，且節流未
+  涵蓋 coordinator」這條**呼叫形狀**；但 `403` 發生時 cortex 會把它分成 auth／rate-limit
+  哪一類、以及後續採取何種 recovery，仍無實測終局。
 - **缺什麼證據才能判定**：一次 cortex 自身在 secondary limit 下的實測記錄（403 訊息、
   `rate_limit` 端點回應、cortex 的分類與後續動作）。
 - **部分可先寫**：「auto-claim scan 每 tick 對每個 mapped issue 打一次 REST」這條是**可由程式碼
   直接驗證**的（`work_actions.py:3425`），可寫成 API 呼叫次數為 O(1)~O(log n) 的斷言；
   403 分診行為不行。
-- **⚠ 與缺口 1 交叉**：`#506` 是子系統路未深讀的 6 張之一。補讀後可能改變本項判定。
 
 ### EI 10. `#610` github egress 的肇事測試定位
 
@@ -2884,15 +2881,6 @@ troubleshooting，以及 **driving-cortex skill**（`#177`／`#192`）。**opera
   source」，看起來處理的是**相鄰但不同**的分支，而**子系統路自陳沒有讀該 PR 的 diff，就不能
   斷定它是否落實了本 issue 的建議 2**。
 - **缺什麼證據才能判定**：PR `#532` 的實際 diff，或對受影響列呈現形態的明文裁決。
-
-### EI 17. 08-12 波未深讀的 6 張：`#473` `#475` `#476` `#478` `#506` `#508`
-
-- **來源軸**：子系統路 I
-- **為何列在這裡**：標題已足以粗歸屬，但**沒有讀原文**。依本次的硬性準則——`observed` 必須
-  逐字引用來源、**不得憑標題推測**——它們不能進候選。
-- **缺什麼證據才能判定**：讀完 6 張的 body。
-- **⚠ 這是本次 sweep 中最容易補齊的一塊**（成本約 1 次 `gh` 呼叫）。詳見「覆蓋缺口」缺口 1。
-  註：`#478` 已由症狀路獨立深讀並產出候選 77；`#506` 已由症狀路讀過但判為 EI 9。
 
 ### EI 18. 輔語料 `/var/lib/cortex/legacy-imported/coordinator/` 缺配對期望值
 
@@ -3132,17 +3120,213 @@ artifact 路做了比對但**沒有**找到矛盾的項目，一併記錄以免�
 
 ---
 
-## 八、下一步建議（供 R3 排序參考）
+## 八、第二輪：08-12 波補讀
 
-1. **先補缺口 1**（6 張未讀，約 1 次 `gh` 呼叫），再做任何新的 sweep。
-2. **首批三筆**：候選 1（`#490`）、候選 2（`#618`/`#619`）、候選 3（`#487`/`#500`/`#554`）。
-   三筆皆為純函式＋凍結 fixture、oracle 型別為集合相等或差分／property、零 harness 前置，
-   且**不依賴任何未定裁決**。
-3. **旗艦兩筆**（風險最高、但需 T2 fs 佈置）：候選 28（`#296`/`#310`）與候選 59（`#501`，
-   唯一四路命中）。
-4. **define 八環攻關鏈整組長**（候選 10／48／64／65／18／6，＋ 補讀 `#391`／`#393`）——
-   **不要拆開只做其中幾條**，見發現 3。
-5. **ship／delivery 補課**——見缺口 2，從候選 92 指出的那筆未完成交易切入。
-6. 把「多 UID 不可用時標 `unsupported`，不得標 `pass`」與「手抄 property 子集 ＝ 驗證無效」
-   兩條**寫進 harness 契約層**，目前它們只是本文件裡的硬規則，**尚無執行機制**。
+第二輪已把 `#473`／`#475`／`#476`／`#478`／`#506`／`#508` 的 body／comments 補讀完；
+deck 與 work-registry schema 兩格各補到一筆，`#478` 由單路升級為雙路，`#506` 則因缺
+cortex 自身的 secondary-limit 分診終局而維持 evidence-insufficient。
 
+| issue | 歸類 | 結果 |
+|---|---|---|
+| `#473` | deck | 新候選 **103** |
+| `#475` | launcher | 新候選 **104** |
+| `#476` | porcelain／service | 新候選 **105** |
+| `#478` | coordinator／worktree recovery | 候選 **77** 升為 `symptom·round2:subsystem` |
+| `#506` | claim／GitHub 節流 | 維持 **EI 9**，但補到 manager／monitor 呼叫形狀證據 |
+| `#508` | work-registry schema | 新候選 **106** |
+
+### 103. `deck-emit-must-carry-explicit-work-repo` ｜ hit_by: round2:subsystem（1 路）｜ oracle 型別: 逐欄等式＋`null` 負向
+
+- **source**：issue `#473`（open）。
+- **observed**（逐字）：
+  > `EMITTED_FRONTMATTER_FIELDS` 加 `repo`，但 `deck emit` 目前只出 **`repo: null` 佔位**——操作者把 deck 產出的 spec 翻 `dispatch: auto` 前需人工補宣告，否則歸屬維持 null
+  > `deck/compile.py::_render_frontmatter` 自 claim／work item 的 repo 宣告自動帶入 `repo:` 欄（workflow lane 的 `run.repo` 本就來自 work item 顯式宣告，語意同構）：來源有值就填、無值維持 null，不做任何推導。
+- **oracle**：對同一份 claim/work item authority，`deck emit` 產出的 frontmatter `repo`
+  必須**逐欄等於** authority 的顯式 repo；authority 無值時必須維持 `repo: null`，不得猜測
+  remote、cwd 或 workflow lane 的旁路資訊。
+- **harness_needs**：deck emit fixture ×2（有 repo／無 repo）；frontmatter 解析。無 provider、
+  無時間、無 git。
+- **determinism_risk**：極低。
+
+### 104. `claude-launcher-must-bind-explicit-executable` ｜ hit_by: round2:subsystem（1 路）｜ oracle 型別: 逐欄等式＋fail-closed provenance
+
+- **source**：issue `#475`（open）。
+- **observed**（逐字）：
+  > `build_claude_argv()` 把 argv[0] 固定寫成 `claude`。job 又由 `bash -lc` 執行，因此 interactive alias 不會展開。
+  > 若主機同時裝有標準 Claude，job 會成功啟動但模型身分錯誤，job record 的 model_id 與真實 provider 不一致。
+  > 要求：只接受絕對 regular executable、job/doctor 顯示 resolved executable provenance、不可在解析失敗時靜默 fallback 到 PATH 的 `claude`。
+- **oracle**：一旦 identity／instance 宣告了 Claude-compatible executable，launcher 與 doctor
+  看見的 resolved executable 必須**逐欄等於**該值；路徑不存在、非 regular executable 或 provenance
+  無法證明時必須 fail closed，**不得**靜默退回 PATH 上的 `claude`。
+- **harness_needs**：identity fixture（含 executable 宣告）＋ mock launcher／doctor readback。
+  不需真 model。
+- **determinism_risk**：低。
+
+### 105. `service-install-must-scaffold-or-preflight-project-config` ｜ hit_by: round2:subsystem（1 路）｜ oracle 型別: 雙向（scaffold 或 fail-fast）
+
+- **source**：issue `#476`（open）。
+- **observed**（逐字）：
+  > `install` 回報成功，並 enable `cortex-octopus-deliver-monitor.service`；`start` 回報 manager 成功，但 status 中 monitor 是 inactive/dead。手動啟動 monitor 後進入 restart loop，最後 hit start-limit。
+  > `fresh instance` 的 `PSC_PROJECT_CONFIG_ROOT` 是 installer 建立的新空目錄；monitor 的 fail-closed 選擇本身合理，但 `service install/start` 沒有 scaffold、preflight 或 actionable warning。
+  > 暫行 workaround：手動建立 instance-local `project-cortex.yaml`，接著 `systemctl --user reset-failed …`／`start …`。
+- **oracle**：新 instance 的 `service install/start` 必須二選一且可稽核：(a) **scaffold** 最小
+  `project-cortex.yaml`；或 (b) 在 enable／start monitor **之前**就 fail-fast，指出精確缺檔路徑
+  與 sample command。反向：不得出現「install success ＋ manager success，但 monitor 穩定 crash」
+  的半成功狀態。
+- **harness_needs**：tmp config root ＋ service install/start fixture；monitor status readback。
+- **determinism_risk**：低。
+
+### 106. `work-registry-legacy-rows-must-normalize-missing-excludes` ｜ hit_by: round2:subsystem（1 路）｜ oracle 型別: 相容讀取＋精確錯誤定位
+
+- **source**：issue `#508`（open）。
+- **observed**（逐字）：
+  > `_validate_override_payload()` 對每一列要求鍵集合**恰好**等於 `{"title", "links", "excludes"}`
+  > `.cortex/work-items.yaml` 的 57 個 work item 中有 **42 個**是在該欄位引入前寫入的，只有 `title` 與 `links` → 全部判為 malformed。
+  > `_mutate_override()` 先讀檔、對**整份 payload** 跑 `_validate_override_payload()` 才做變更，任一舊列都會毒化整個檔案的所有 `link/unlink` 操作。
+- **oracle**：讀取 work-registry 時，舊列缺 `excludes` 必須 normalize 成 `[]`；對新 `work_id`
+  執行 `link/unlink` 時，**不得**因無關舊列而整體失敗。若仍有格式錯誤，訊息必須指出違規
+  `work_id` 與實際鍵集合，不能只有泛用的 `work override row malformed`。
+- **harness_needs**：混合新舊 row 的 `.cortex/work-items.yaml` fixture；一次 `link` 與一次
+  `unlink` 讀寫。
+- **determinism_risk**：極低。
+
+## 九、第二輪：ship／delivery 語意面
+
+第二輪依 `paulsha_cortex/coordinator/github_delivery.py` 的五個表面補面，並用
+`~/.agents/coordinator-cortex/delivery-journal.json` 的真實 run 當 fixture 錨點：
+
+| 表面 | fixture（`delivery-journal.json` run_id） | 結果 |
+|---|---|---|
+| PR metadata preflight | `workflow-97f6330f7ee709588403` | 新候選 **107** |
+| merge authorization | `workflow-97f6330f7ee709588403`、`workflow-ced42c7b999df8bc222d` | 新候選 **108** |
+| delivery journal 寫入端 | `workflow-11981b68acac2842a018`、`workflow-6387e33c01b4e8153f0e` | 既有候選 **92**（另見 25／26） |
+| push readback | `workflow-ced42c7b999df8bc222d` | 新候選 **109** |
+| closed-unmerged PR | `workflow-f4cf287291b8f4a8e5ad` | 既有候選 **78** |
+
+### 107. `pr-metadata-reread-must-match-exact-title-body-labels` ｜ hit_by: round2:delivery（1 路）｜ oracle 型別: 逐欄等式＋idempotent retry
+
+- **source**：`paulsha_cortex/coordinator/github_delivery.py`（`_metadata_json()`／
+  `_read_pr_metadata()`／`ensure_pr_metadata()`）；fixture run
+  `workflow-97f6330f7ee709588403`。
+- **observed**（逐字）：
+  > `"""Ensure exact remote metadata, writing only after authenticated drift."""`
+  > `if pull.get("title") == title and pull.get("body") == body and remote_labels == expected_labels: return`
+  > `if pull.get("title") != title or pull.get("body") != body or remote_labels != expected_labels: raise RuntimeError("GitHub PR metadata reread mismatch")`
+- **oracle**：PR metadata surface 必須以 **exact reread** 收尾：title、body、labels 三者只要任一
+  漂移，就必須 PATCH／PUT 後重讀到**逐欄相等**；若重讀仍不相等，必須 fail closed。`502/503/504`
+  retry 只允許在這個 idempotent metadata surface 上發生，不能外溢到 merge mutation。
+- **harness_needs**：mock `gh api`（含 `502/503/504` transient）＋ PR metadata drift fixture。
+- **determinism_risk**：低。
+
+### 108. `merge-authorization-must-bind-head-and-authority-digest` ｜ hit_by: round2:delivery（1 路）｜ oracle 型別: exact-candidate attestation
+
+- **source**：`paulsha_cortex/coordinator/github_delivery.py`（`FinalGateVerdict`／
+  `evaluate_final_gate()`／`commit_merge()`）；fixtures `workflow-97f6330f7ee709588403`、
+  `workflow-ced42c7b999df8bc222d`。
+- **observed**（逐字）：
+  > `Produced only by GitHubDeliveryClient.evaluate_final_gate after a fresh remote reread and gate evaluation — never by the merge mutation itself.`
+  > `if facts.head != policy.expected_head: reasons.append("head-race")`
+  > `commit_merge` 先比對 `verdict.repo`／`pr_number`／`change`／`expected_head`／`authority_digest`，不符即 `raise RuntimeError("final gate verdict does not authorize this exact candidate merge")`
+  > `workflow-97f6330f7ee709588403` 的 `ship.merge_authorization.payload` 含 `schema: "cortex-merge-authorization/v2"`、`authority_digest`、`head`、`pr_number`、`review_kind`、`todo_paths`、`tree_hash`
+- **oracle**：merge admission 必須綁定**同一個** `expected_head` 與 `authority_digest`：remote
+  reread若發現 head、closing issues、review thread、openspec 狀態或 archive 狀態漂移，必須在 merge
+  前失敗；任何 stale／substituted verdict 都不得授權 merge mutation。
+- **harness_needs**：mock remote reread（head race／thread open／closing issue drift）＋ attestation
+  fixture。無需真 GitHub。
+- **determinism_risk**：低。
+
+### 109. `delivery-target-must-bind-exact-pushed-head` ｜ hit_by: round2:delivery（1 路）｜ oracle 型別: 逐欄等式＋branch-name 負向
+
+- **source**：`paulsha_cortex/coordinator/github_delivery.py`（`create_or_get_pull_request()`／
+  `fetch_merge_status()`）＋ `delivery-journal.json` fixtures
+  `workflow-ced42c7b999df8bc222d`、`workflow-f4cf287291b8f4a8e5ad`。
+- **observed**（逐字）：
+  > `workflow-ced42c7b999df8bc222d`：`ship.head = "8b3de21020e6b198ae97379ad557653118836152"`，且 `pushes["8b3de21020e6b198ae97379ad557653118836152"] = {"branch": "feature/880-fix-agy-reviewer-json-schema", ...}`
+  > `workflow-f4cf287291b8f4a8e5ad`：`mapped_prs = [907]`、`pushes["54f0916b4fc797319095b6ce404ecfc37b285d53"] = {"branch": "feature/904-r3-testpilot-case-corpus", ...}`，但 `delivery_binding = null`、`ship = null`
+  > `create_or_get_pull_request()` 對既有 PR 的保護是：`head.get("sha") != expected_head.lower()` 即拒絕
+- **oracle**：delivery target 一旦要綁 PR 或進 ship，必須綁定**精確 pushed head**，不是只看
+  branch 名。`expected_head` 必須存在於 `pushes`，且 remote PR head reread 必須等於它；若 PR 綁在別的
+  head、或 journal 找不到對應 push proof，則必須 fail closed。
+- **harness_needs**：delivery-journal fixture（同 branch 多次 push）＋ mocked PR head drift。
+- **determinism_risk**：低。
+
+## 十、第二輪：porcelain 穩定 vs 繞過
+
+第二輪補讀 `docs/onboarding/{quickstart,troubleshooting}.md`、`#177`／`#192` 與現行
+`skills/driving-cortex/SKILL.md` 後，porcelain 已可分出「supported path」與「operator 繞過」：
+
+| 來源 | 條目 | 分類 | 判讀 |
+|---|---|---|---|
+| `docs/onboarding/quickstart.md` | `cortex bootstrap --repo-root ...` → `cortex ready` → `cortex run tick --wait` | **穩定行為** | onboarding 直接把 claim 前的 happy path 與第一個 workflow 建立流程寫成日常指引，沒有要求 operator 離開 porcelain。 |
+| `docs/onboarding/troubleshooting.md` | F8 timeout 時改用 `cortex request list/show/logs/wait`，再看 `cortex jobs`／`cortex status` | **穩定行為** | timeout 被文件定義成「查狀態／等待視窗」問題，而不是崩潰後改走旁門。 |
+| issue `#476` ＋ `docs/onboarding/troubleshooting.md` | 手動建立 `project-cortex.yaml`，接著 `systemctl --user reset-failed`／`start` | **operator 繞過** | 這是 service install/start 沒把 monitor 缺檔 fail-fast 的補救面；對應候選 **105**。 |
+| issue `#177`／`#192` ＋ `skills/driving-cortex/SKILL.md` | `gh api graphql` `resolveReviewThread` 後再 `cortex work resume` | **operator 繞過** | review-thread resolution 仍需直接打 GitHub primitive，porcelain 只負責續跑。 |
+| issue `#177`／`#192` ＋ `skills/driving-cortex/SKILL.md` | `pipx install --force <repo>` ＋ `systemctl --user restart ...` ＋ `ps/stat` 對時序 | **operator 繞過** | merge 後部署與 daemon mtime 驗證仍落在 repo／OS 面，不在 porcelain abstraction 內。 |
+| `docs/onboarding/troubleshooting.md` | `sudo -u <gate>` `python3 -m pytest --version`／`gh auth status` | **operator 繞過** | service identity、`ProtectHome`、toolchain provenance 仍需直接檢 underlying account。 |
+| `skills/driving-cortex/SKILL.md` | `cortex work start/resume/retry-build/review-attest` | **穩定行為** | 這四根桿子已被文件明文當成人機交界的 supported continuation path。 |
+
+## 十一、T1 首批決定
+
+三筆 T1 候選的排序與決定如下；**本輪只做決定，不開實作票**。
+
+| 候選 id | 決定 | 理由 | 依賴 |
+|---|---|---|---|
+| `review-identity-loader-asymmetry` | **首批（待 R2）** | oracle 是集合相等、零 tick／時間／git 依賴，且直接鎖住 review vs manager 身分來源不對稱。 | R2 Compact 收斂後開票；fixture 只需 packaged＋overlay YAML。 |
+| `porcelain-cli-verb-must-match-permgen-execstart` | **首批（待 R2）** | 已有一次真實漂移（`#618`）且現有測試就是跨模組契約鎖；回歸價值高、動工成本低。 | R2 Compact 收斂後開票；沿用 permgen 輸出＋CLI parser fixture。 |
+| `unbounded-substring-marker-misclassifies-failure` | **首批（待 R2）** | 這是本清單最乾淨的 classifier/property case，三個 issue 都是 fail-open 形狀，且不依賴任何 deployment 面。 | R2 Compact 收斂後開票；需現行 marker 表與三條脫敏 golden fixture。 |
+
+## 十二、case report ↔ EvidenceAttestation 契約對齊
+
+- **subject 必須綁 `(slice_id, candidate)`，不能只綁 work_id／PR。** `verification.py` 的證據路徑就是
+  `<slice_id>-<candidate>.json`，且 schema 只接受 `schema_version`／`slice_id`／`candidate`／
+  `status`／`summary`／`details` 這六欄。來源：本盤點；執行機制：無（未來 harness）。
+- **`candidate` 必須是 exact 40-hex SHA，且以 attestation 寫入時的值為準。** `validate_verification_evidence()`
+  會把 `candidate` canonicalize 成小寫；case report 不得用 moving branch／PR head 取代它。來源：
+  本盤點；執行機制：無（未來 harness）。
+- **`status`／`summary`／`details` 必須來自獨立驗證者，不得自我背書。** builder 自述「我修好了」
+  或 terminal text 只能當輸入語料，不能直接充當 attestation；report 至少要能指回一份由 verifier／
+  maintainer 產生的結構化證據。來源：本盤點；執行機制：無（未來 harness）。
+- **`details` 內的 mismatch／gate／scope 細節不可在 report 層被抹平。** 否則同一份 attestation
+  會在摘要層看似通過、在細節層其實指向 `candidate-worktree-dirty`／`candidate-not-descendant`
+  之類的 needs_human。來源：本盤點；執行機制：無（未來 harness）。
+
+## 十三、case harness 契約層硬規則
+
+- **多 UID 不可用時一律標 `unsupported`，絕不可標 `pass`，也不可 skip 成綠。** 同理適用於
+  root 執行、`direct` 模式同 UID、本機缺 `acl` 掛載能力等會讓權限差異失真的情境。來源：本盤點；
+  執行機制：無（未來 harness）。
+- **`unsupported` 必須與 `passed` 在結構上可區分。** 至少要在對應 report／attestation 的
+  `status`、`summary`、`details` 保留「缺哪個 capability」；不能只回空字串或 generic skip。
+  來源：本盤點；執行機制：無（未來 harness）。
+- **由 production 產生器導出的屬性不得手抄。** worktree 路徑、instance 名、unit 文字、ACL 條目、
+  job spec 路徑都必須走 production generator 或直接引用 production asset；手抄子集會同時造出
+  假綠與假紅。來源：本盤點；執行機制：無（未來 harness）。
+- **以效果斷言，不以回傳值斷言。** 對像 `seal` 這種「失敗不 raise」的流程，case 必須證明
+  producer 實際寫不進去，而不是只看函式有沒有丟例外。來源：本盤點；執行機制：無（未來 harness）。
+
+## 十四、第二輪完成摘要
+
+- **重算結果**：候選清單現為 **109 筆**去重候選；`hit_by` 分佈為四路 **1**、三路 **9**、二路
+  **32**、單路 **67**；`evidence-insufficient` 收斂為 **31 筆**。
+- **T1 補讀 6 張**：新增候選 **103／104／105／106**；候選 **77** 由單路升級為雙路；`#506`
+  補到 manager／monitor 呼叫形狀證據後仍維持 evidence-insufficient 9。
+- **T2 ship／delivery**：PR metadata preflight／merge authorization／push readback 新增候選
+  **107／108／109**；delivery journal 與 closed-unmerged PR 分別由既有候選 **92／78** 承接。
+- **T3 porcelain**：supported path 與 operator bypass 已分群；`systemctl --user`、
+  `gh api graphql`、`pipx install --force` 等旁路均已明記在 **§十**。
+- **T4 T1 決定**：三筆首批候選全數標為 **首批（待 R2）**，理由與依賴已整理成四欄表，未在本輪開票。
+- **T5 契約備註**：`verification.py` 的 `schema_version`／`slice_id`／`candidate`／`status`／
+  `summary`／`details` 六欄已寫入 attestation 對齊節；`unsupported` vs `passed` 可區分、
+  production generator provenance 與效果斷言等四條 harness 硬規則亦已補齊。
+
+## 十五、下一步建議（供 R3 排序參考）
+
+1. **首批三筆仍是候選 1／2／3。** 它們已在 **§十一** 決定為 `首批（待 R2）`；R2 Compact 一收斂，
+   就可直接開實作票。
+2. **ship／delivery 不必再回頭掃 7 月 issue。** metadata preflight／merge authorization／
+   push readback 已在 **§九** 各有具體候選 107／108／109，delivery journal 與 terminal PR
+   lifecycle 則分別由 92／78 接住。
+3. **deck-combo 是目前唯一未補完的次級缺口。** 若還要做第三輪，優先讀 `selector.py`／
+   `task_types.py` 與 `#474` 外部 repo 摩擦，不必再重掃 quickstart 或 ship。
+4. **任何實作票之前，先把 attestation／unsupported 契約吃進 template。** 否則 case 寫得再多，
+   仍會在 report 層回到自我背書或環境不足假綠。
