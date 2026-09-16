@@ -322,6 +322,28 @@ def _pinned_input_mismatches(slice_row: dict) -> list[str]:
     return mismatches
 
 
+def _builder_input_attestation_mismatches(slice_row: dict, job: dict | None) -> list[str]:
+    """#503：builder job 記錄的「實際交付」spec／plan hash 必須等於 slice 釘住的值。
+
+    `_pinned_input_mismatches` 只驗檔案現在有沒有漂移；這裡驗**模型當時拿到的**是不是
+    slice 現在宣稱的 authority——registry 顯示新 spec hash、但派出去的 builder 讀的是舊
+    的，candidate 不得通過。缺欄位（legacy job）不判，與 #379 同型容忍。
+    """
+
+    if not isinstance(job, dict):
+        return []
+    mismatches: list[str] = []
+    for job_field, slice_field in (("spec_hash", "spec"), ("plan_hash", "plan")):
+        delivered = job.get(job_field)
+        if not isinstance(delivered, str) or not delivered:
+            continue
+        pinned_meta = slice_row.get(slice_field)
+        pinned = pinned_meta.get("hash") if isinstance(pinned_meta, dict) else None
+        if delivered != pinned:
+            mismatches.append(f"builder-input-{slice_field}-hash")
+    return mismatches
+
+
 def _candidate_for_evidence(
     *,
     slice_row: dict | None,
@@ -1557,6 +1579,9 @@ def _launch_foreign_review(
         prompt = foreign_review.build_review_prompt(
             slice_id=slice_id,
             plan_path=slice_row["plan"]["path"],
+            # #503：reviewer 也拿到 pinned spec 的路徑與 hash（同一份 authority）。
+            spec_path=slice_row["spec"]["path"],
+            spec_hash=slice_row["spec"]["hash"],
             verdict_path=str(verdict_spool_path),
             builder_job_id=builder_job_id,
             reviewer_job_id=reviewer_job["job_id"],
@@ -2448,7 +2473,12 @@ def complete_tick(
                         if review_classification is not None:
                             slice_provider_outcome_payload = review_classification.to_dict()
             else:
-                mismatches = _pinned_input_mismatches(slice_row) if slice_row is not None else []
+                mismatches = (
+                    _pinned_input_mismatches(slice_row)
+                    + _builder_input_attestation_mismatches(slice_row, job)
+                    if slice_row is not None
+                    else []
+                )
 
                 if mismatches:
                     gate_status = "needs_human"

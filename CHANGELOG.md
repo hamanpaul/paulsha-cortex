@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **#503 slice-lane pinned spec 交付與 attestation**：builder prompt 附 `[SPEC: path sha256=…]`＋逐字 spec body
+  與明示語句，dispatch 時 spec hash 必須等於 pin 值否則 needs_human；job row 記錄交付的 spec／plan hash，完成側
+  對照 slice 釘住的值（`builder-input-*-hash` → pinned-input-mismatch）；review prompt 附同一份 spec 行。
+
 - **#830 派工非 Job 決策契約**：`classify_dispatch_result` 把派工結果分成真 Job（registry 綁定）／合法
   decision／確定性 transition／None，malformed 或 forged job_id fail-closed；daemon start／work-action、
   manager resume 與 provider retry 五個消費端接上，Red sizing 的 `needs-decomposition` 不再 `KeyError`

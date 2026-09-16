@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _pinned_spec_support import materialize_spec
+
 import inspect
 import json
 import os
@@ -53,7 +55,9 @@ def _make_job(reg: JobRegistry, slice_id: str, *, worktree: str | None = None, b
 
 
 def _dispatch_meta(slice_id: str, *, plan: str = "p.md") -> dict:
+    spec_path, spec_hash = materialize_spec(f"/specs/{slice_id}.md")  # #503
     return {
+        "path": spec_path,
         "slice_id": slice_id,
         "dispatch": "auto",
         "plan": plan,
@@ -73,8 +77,8 @@ def _dispatch_meta(slice_id: str, *, plan: str = "p.md") -> dict:
             },
         },
         "_pinned_inputs": {
-            "spec_path": f"/specs/{slice_id}.md",
-            "spec_hash": "0" * 64,
+            "spec_path": spec_path,
+            "spec_hash": spec_hash,
             "plan_path": plan,
             "plan_hash": "1" * 64,
             "target_branch": "main",

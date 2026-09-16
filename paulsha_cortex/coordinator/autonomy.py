@@ -649,7 +649,6 @@ def dispatch_ready(
         job: dict | None = None
         pinned_inputs: dict | None = None
         try:
-            prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
             pinned_inputs = pin_dispatch_inputs(m)
             # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查
             # 或 base_sha 解析若晚點失敗，slice 落 needs_human 後 dispatch_base 不會
@@ -664,6 +663,20 @@ def dispatch_ready(
                 slice_id=slice_id,
                 pinned_inputs=pinned_inputs,
                 dispatch_base=early_dispatch_head,
+            )
+            # #503：builder 只拿 task id＋plan 路徑不是 authority——controller 重釘 spec
+            # 加進的 recovery 指示會在模型邊界被靜默丟掉。slice row 登記後重讀 spec、hash
+            # 必須等於 pin 值（launch-time equality），逐字交付進 prompt，並把交付的 hash
+            # 記到 job row 供完成側對照（`manager._builder_input_attestation_mismatches`）。
+            # 失敗走既有 per-slice except：slice 落 needs_human、不派 job。
+            spec_body = _read_pinned_spec_body(pinned_inputs)
+            prompt = build_dispatch_prompt(
+                persona,
+                task=slice_id,
+                plan_path=m["plan"],
+                spec_path=str(pinned_inputs["spec_path"]),
+                spec_hash=str(pinned_inputs["spec_hash"]),
+                spec_body=spec_body,
             )
             active_launcher = launcher
             executor = m.get("executor")
@@ -715,6 +728,9 @@ def dispatch_ready(
                 # 不推斷）；寫進 job record 既有 workflow_repo 欄，終局 manifest
                 # 與 slices/attention 讀取端（#465/#349）即可投影。
                 workflow_repo=m.get("repo"),
+                # #503：attestation——這顆 job 實際拿到的 spec／plan 就是這兩個 hash。
+                spec_hash=str(pinned_inputs["spec_hash"]),
+                plan_hash=str(pinned_inputs["plan_hash"]),
             )
             _mark_slice_building(
                 dispatcher=dispatcher,
@@ -820,6 +836,32 @@ def _launcher_worktree(dispatcher, slice_id: str, *, base_sha: str | None = None
         return worktree_creator.create(branch, job_id=slice_id)
 
 
+def _read_pinned_spec_body(pinned_inputs: dict) -> str:
+    """#503：讀回要交付給 builder 的 pinned spec 內容，並驗它就是 pin 住的那份。
+
+    spec 不可讀、hash 與 ``pinned_inputs["spec_hash"]`` 不等、或不是 UTF-8，一律
+    ``ValueError`` → dispatch 對該 slice fail-closed（needs_human），不派一個看不到
+    authority 的 builder。
+    """
+
+    spec_path = Path(str(pinned_inputs["spec_path"]))
+    try:
+        data = spec_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"pinned spec unreadable at dispatch (#503): {spec_path}") from exc
+    delivered = verification.sha256_bytes(data)
+    pinned = str(pinned_inputs["spec_hash"])
+    if delivered != pinned:
+        raise ValueError(
+            f"pinned spec changed between pinning and dispatch (#503): {spec_path} "
+            f"pinned={pinned} delivered={delivered}"
+        )
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"pinned spec is not UTF-8 (#503): {spec_path}") from exc
+
+
 def _record_launching_job(
     *,
     dispatcher,
@@ -828,6 +870,8 @@ def _record_launching_job(
     worktree: str,
     dispatch_head: str | None = None,
     workflow_repo: str | None = None,
+    spec_hash: str | None = None,
+    plan_hash: str | None = None,
 ) -> dict:
     """Persist the job row *before* launch (handle fields filled in later)."""
     registry = getattr(dispatcher, "_registry", None)
@@ -843,6 +887,8 @@ def _record_launching_job(
             "pid": None,
             "log_path": None,
             "workflow_repo": workflow_repo,
+            "spec_hash": spec_hash,
+            "plan_hash": plan_hash,
         }
     return registry.create_job(
         task=slice_id,
@@ -859,6 +905,9 @@ def _record_launching_job(
         # #469：slice-lane 的 repo 歸屬只來自 spec 顯式宣告；lane 判定看
         # workflow_run_id（manager._is_workflow_lane_job），帶此欄不會誤判 lane。
         workflow_repo=workflow_repo,
+        # #503：builder 實際拿到的 pinned inputs（完成側據此對照 slice 釘住的值）。
+        spec_hash=spec_hash,
+        plan_hash=plan_hash,
     )
 
 

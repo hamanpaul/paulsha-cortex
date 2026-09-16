@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _pinned_spec_support import materialize_spec
+
 import contextlib
 import io
 import json
@@ -45,7 +47,7 @@ def _v1_verification_block(*, docs_class: str = "code") -> str:
 
 
 def _meta(slice_id, *, dispatch="auto", plan="docs/plan.md", depends_on=None, path=None):
-    spec_path = path or f"/specs/{slice_id}.md"
+    spec_path, spec_hash = materialize_spec(path or f"/specs/{slice_id}.md")  # #503
     return {
         "path": spec_path,
         "dispatch": dispatch,
@@ -78,7 +80,7 @@ def _meta(slice_id, *, dispatch="auto", plan="docs/plan.md", depends_on=None, pa
         "parse_error": None,
         "_pinned_inputs": {
             "spec_path": spec_path,
-            "spec_hash": "0" * 64,
+            "spec_hash": spec_hash,
             "plan_path": plan or f"/plans/{slice_id}.md",
             "plan_hash": "1" * 64,
             "target_branch": "main",
@@ -633,10 +635,10 @@ class FanoutTests(unittest.TestCase):
         launcher = _RecordingLauncher()
         metas = [_meta("bad-role-slice", plan="docs/a.md"), _meta("ok-slice", plan="docs/b.md")]
 
-        def _build(persona, *, task, plan_path):
+        def _build(persona, *, task, plan_path, **spec_kwargs):
             if task == "bad-role-slice":
                 raise ValueError("unknown persona role: bogus")
-            return _real_build(persona, task=task, plan_path=plan_path)
+            return _real_build(persona, task=task, plan_path=plan_path, **spec_kwargs)
 
         original = autonomy_mod.build_dispatch_prompt
         autonomy_mod.build_dispatch_prompt = _build
