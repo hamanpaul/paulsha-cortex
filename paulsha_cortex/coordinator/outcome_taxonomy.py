@@ -82,6 +82,7 @@ __all__ = [
     "parse_stream_evidence",
     "classify_structured_evidence",
     "classify_text",
+    "extract_effort_not_supported",
 ]
 
 
@@ -93,7 +94,8 @@ class OutcomeFamily(str, Enum):
     - ``CONTENT``：模型輸出本身的問題（內容政策拒答、回散文不回 JSON、schema
       不合）。重跑同一個 candidate 不會變，維持既有 fail-closed 意圖。
     - ``ENVIRONMENT``：本機／狀態層問題（殘留 worktree、額度需人工處理的帳單
-      與方案上限）。要人動手，但不是模型內容缺陷。
+      與方案上限、不支援的 effort、缺失的啟動 executable、launch 失敗）。
+      要人動手，但不是模型內容缺陷。
     - ``AUTH``：憑證失效，需要人工重新登入。
     """
 
@@ -105,13 +107,16 @@ class OutcomeFamily(str, Enum):
 
 
 class TextSignal(str, Enum):
-    """文字關鍵字層的細分訊號——比 family 細，因為 build lane 的既有六值詞彙
-    需要區分 rate_limit 與 quota（兩者同屬 environment/transient-service 家族，
-    但 backoff 策略不同）。"""
+    """文字關鍵字層的細分訊號——比 family 細，因為 build lane 的既有詞彙需要
+    區分 rate_limit 與 quota（兩者同屬 environment/transient-service 家族，
+    但 backoff 策略不同），也需要把「可 reroute 的環境失敗」與一般 content/
+    transient 分開。"""
 
     RATE_LIMIT = "rate_limit"
     QUOTA = "quota"
     AUTH = "auth"
+    EFFORT_NOT_SUPPORTED = "effort_not_supported"
+    EXECUTABLE_NOT_FOUND = "executable_not_found"
     CONTENT = "content"
     TRANSIENT = "transient"
     NONE = "none"
@@ -125,6 +130,8 @@ class StructuredKind(str, Enum):
     RATE_LIMITED = "rate_limited"
     TRANSIENT = "transient"
     AUTH = "auth"
+    EXECUTABLE_NOT_FOUND = "executable_not_found"
+    LAUNCH_FAILED = "launch_failed"
     INTERRUPTED = "interrupted"
 
 
@@ -235,6 +242,47 @@ QUOTA_RE = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+EFFORT_NOT_SUPPORTED_RE = re.compile(
+    r"""
+    reasoning\ effort
+    \s+"(?P<effort>[^"\r\n]+)"
+    \s+is\ not\ supported\ for\ model
+    \s+"(?P<model>[^"\r\n]+)"
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_SHELL_NAMES = frozenset(
+    {"ash", "bash", "dash", "fish", "ksh", "powershell", "pwsh", "sh", "zsh"}
+)
+_LAUNCHER_IDENTIFIERS = frozenset({"agy", "cg", "claude", "codex", "copilot"})
+_COMMAND_NOT_FOUND_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"""
+        ^\s*
+        (?:(?P<prefix>[^:\s]+):\s*)?
+        (?:(?:line\s+)?\d+:\s*)?
+        (?P<command>[^:\s]+)
+        :
+        \s*
+        (?:command\ not\ found|not\ found)
+        \s*$
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+    re.compile(
+        r"""
+        ^\s*
+        (?:(?P<prefix>[^:\s]+):\s*)?
+        command\ not\ found:
+        \s*
+        (?P<command>[^:\s]+)
+        \s*$
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+)
+
 # Transient：網路/服務暫時性錯誤，與 rate limit 不同——這裡沒有「額度」語意，
 # 純粹是這一次呼叫失敗，重試通常會成功。
 #
@@ -296,6 +344,8 @@ FAMILY_BY_TEXT_SIGNAL: dict[TextSignal, OutcomeFamily] = {
     TextSignal.RATE_LIMIT: OutcomeFamily.TRANSIENT_SERVICE,
     TextSignal.QUOTA: OutcomeFamily.ENVIRONMENT,
     TextSignal.AUTH: OutcomeFamily.AUTH,
+    TextSignal.EFFORT_NOT_SUPPORTED: OutcomeFamily.ENVIRONMENT,
+    TextSignal.EXECUTABLE_NOT_FOUND: OutcomeFamily.ENVIRONMENT,
     TextSignal.CONTENT: OutcomeFamily.CONTENT,
     TextSignal.TRANSIENT: OutcomeFamily.TRANSIENT_SERVICE,
     TextSignal.NONE: OutcomeFamily.UNKNOWN,
@@ -305,6 +355,8 @@ FAMILY_BY_STRUCTURED_KIND: dict[StructuredKind, OutcomeFamily] = {
     StructuredKind.RATE_LIMITED: OutcomeFamily.TRANSIENT_SERVICE,
     StructuredKind.TRANSIENT: OutcomeFamily.TRANSIENT_SERVICE,
     StructuredKind.AUTH: OutcomeFamily.AUTH,
+    StructuredKind.EXECUTABLE_NOT_FOUND: OutcomeFamily.ENVIRONMENT,
+    StructuredKind.LAUNCH_FAILED: OutcomeFamily.ENVIRONMENT,
     # 中斷不是四大類的任何一類——它是「我們自己停的」，故落 UNKNOWN 哨兵，
     # 由呼叫端維持既有的不自動重試處置。
     StructuredKind.INTERRUPTED: OutcomeFamily.UNKNOWN,
@@ -348,6 +400,40 @@ def strip_known_process_banners(lines: Sequence[str]) -> list[str]:
             continue
         return kept + list(lines[index:])
     return kept
+
+
+def _normalize_command_token(token: str) -> str:
+    candidate = token.strip().strip("`'\"")
+    candidate = candidate.rsplit("/", 1)[-1]
+    candidate = candidate.rsplit("\\", 1)[-1]
+    return candidate.lower()
+
+
+def _has_shell_command_not_found_context(provider_text: str) -> str | None:
+    for raw_line in provider_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        for pattern in _COMMAND_NOT_FOUND_PATTERNS:
+            match = pattern.match(line)
+            if match is None:
+                continue
+            command = _normalize_command_token(match.group("command"))
+            prefix = match.group("prefix")
+            if prefix is not None and _normalize_command_token(prefix) in _SHELL_NAMES:
+                return f"shell command-not-found while launching {command}"
+            if command in _LAUNCHER_IDENTIFIERS:
+                return f"launcher executable not found: {command}"
+    return None
+
+
+def extract_effort_not_supported(text: str | None) -> tuple[str | None, str | None]:
+    if not text:
+        return None, None
+    match = EFFORT_NOT_SUPPORTED_RE.search(text)
+    if match is None:
+        return None, None
+    return match.group("effort"), match.group("model")
 
 
 # --------------------------------------------------------------- 證據分層
@@ -634,6 +720,14 @@ def classify_text(
     （#500），但拒答本來就只會出現在模型自己的話裡。
     """
 
+    stripped_provider = provider_text.strip()
+    stripped_model = model_text.strip()
+    if exit_code == 127 and not stripped_provider and not stripped_model:
+        return TextClassification(
+            TextSignal.EXECUTABLE_NOT_FOUND,
+            "exit 127 with no provider or model text suggests missing executable",
+        )
+
     cli_status, cli_detail = executor_auth.classify_cli_output(exit_code, provider_text)
 
     if cli_status == "rate_limited" or is_rate_limit_signal(provider_text):
@@ -647,6 +741,18 @@ def classify_text(
         return TextClassification(
             TextSignal.AUTH,
             f"auth/login signal detected in executor output ({cli_detail})",
+        )
+    effort, model = extract_effort_not_supported(provider_text)
+    if effort is not None and model is not None:
+        return TextClassification(
+            TextSignal.EFFORT_NOT_SUPPORTED,
+            f'reasoning effort "{effort}" is not supported for model "{model}"',
+        )
+    executable_detail = _has_shell_command_not_found_context(provider_text)
+    if executable_detail is not None:
+        return TextClassification(
+            TextSignal.EXECUTABLE_NOT_FOUND,
+            executable_detail,
         )
     if CONTENT_RE.search(provider_text) or CONTENT_RE.search(model_text):
         return TextClassification(

@@ -8,6 +8,12 @@ from unittest import mock
 
 from paulsha_cortex.coordinator.completion import classify_completion
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
+from paulsha_cortex.coordinator.provider_outcome import (
+    ProviderFailureClassification,
+    ProviderOutcome,
+    SignalAuthority,
+    classification_from_job,
+)
 from paulsha_cortex.coordinator import verification
 from paulsha_cortex.coordinator.registry import (
     COORDINATOR_STATE_SCHEMA_VERSION,
@@ -950,6 +956,90 @@ class UsageTrackingTests(unittest.TestCase):
 
             self.assertIsNotNone(updated["exited_at"])
             self.assertGreaterEqual(updated["exited_at"], updated["started_at"])
+
+    def test_update_headless_result_round_trips_new_provider_outcomes_and_optional_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            reg = JobRegistry(state_path=state)
+            job_ids: dict[str, str] = {}
+            cases = [
+                {
+                    "task": "slice-effort",
+                    "created_executor": None,
+                    "created_model": None,
+                    "update_executor": "copilot",
+                    "update_model": "mai-code-1-flash-picker",
+                    "classification": ProviderFailureClassification(
+                        outcome=ProviderOutcome.EFFORT_NOT_SUPPORTED,
+                        authority=SignalAuthority.TEXT_SIGNAL,
+                        reason=(
+                            'reasoning effort "xhigh" is not supported for model '
+                            '"mai-code-1-flash-picker"'
+                        ),
+                    ),
+                    "expected_executor": "copilot",
+                    "expected_model": "mai-code-1-flash-picker",
+                },
+                {
+                    "task": "slice-exec",
+                    "created_executor": "claude",
+                    "created_model": "claude-sonnet-4.6",
+                    "update_executor": None,
+                    "update_model": None,
+                    "classification": ProviderFailureClassification(
+                        outcome=ProviderOutcome.EXECUTABLE_NOT_FOUND,
+                        authority=SignalAuthority.TEXT_SIGNAL,
+                        reason="exit 127 with no provider or model text suggests missing executable",
+                    ),
+                    "expected_executor": "claude",
+                    "expected_model": "claude-sonnet-4.6",
+                },
+                {
+                    "task": "slice-launch",
+                    "created_executor": None,
+                    "created_model": None,
+                    "update_executor": "copilot",
+                    "update_model": None,
+                    "classification": ProviderFailureClassification(
+                        outcome=ProviderOutcome.LAUNCH_FAILED,
+                        authority=SignalAuthority.STRUCTURED,
+                        reason="launch handle missing: pid=None, log_path=None",
+                    ),
+                    "expected_executor": "copilot",
+                    "expected_model": None,
+                },
+            ]
+
+            for case in cases:
+                job = reg.create_job(
+                    task=case["task"],
+                    persona="builder",
+                    branch=f"feature/{case['task']}",
+                    pane="",
+                    worktree=f"/wt/{case['task']}",
+                    executor=case["created_executor"],
+                    model_id=case["created_model"],
+                )
+                job_ids[case["task"]] = job["job_id"]
+                reg.update_headless_result(
+                    job["job_id"],
+                    status="failed",
+                    exit_code=1,
+                    executor=case["update_executor"],
+                    model_id=case["update_model"],
+                    provider_outcome=case["classification"].to_dict(),
+                )
+
+            reloaded = JobRegistry(state_path=state)
+            for case in cases:
+                with self.subTest(task=case["task"]):
+                    stored = reloaded.get_job(job_ids[case["task"]])
+                    self.assertEqual(stored["executor"], case["expected_executor"])
+                    self.assertEqual(stored["model_id"], case["expected_model"])
+                    self.assertEqual(
+                        classification_from_job(stored),
+                        case["classification"],
+                    )
 
 
 if __name__ == "__main__":

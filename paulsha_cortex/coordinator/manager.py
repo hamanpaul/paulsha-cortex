@@ -4238,6 +4238,33 @@ def _provider_retry_attempt_key(card_id: str) -> str:
     return f"provider-retry:{card_id}"
 
 
+def _runtime_diagnostic_reason(runtime_diagnostic: object) -> str | None:
+    if not isinstance(runtime_diagnostic, Mapping):
+        return None
+    reason = runtime_diagnostic.get("reason")
+    return reason if isinstance(reason, str) and reason else None
+
+
+def _provider_failure_context(
+    job: Mapping[str, object],
+    classification: "provider_outcome.ProviderFailureClassification | None",
+) -> dict[str, str]:
+    executor = job.get("executor")
+    model = job.get("model_id")
+    effort = "unknown"
+    if classification is not None:
+        extracted_effort, _ = outcome_taxonomy.extract_effort_not_supported(
+            classification.reason
+        )
+        if extracted_effort:
+            effort = extracted_effort
+    return {
+        "executor": executor if isinstance(executor, str) and executor else "unknown",
+        "model": model if isinstance(model, str) and model else "unknown",
+        "effort": effort,
+    }
+
+
 def _provider_failure_reroute(
     run,
     step,
@@ -4274,6 +4301,16 @@ def _provider_failure_reroute(
 
     candidates = _workflow_identity_candidates(run, step, identities)
     failed_executor = failed_job.get("executor")
+    failed_model_id = failed_job.get("model_id")
+    if classification.outcome is provider_outcome.ProviderOutcome.EFFORT_NOT_SUPPORTED:
+        for candidate in candidates:
+            if (
+                candidate.executor == failed_executor
+                and candidate.model_id == failed_model_id
+            ):
+                continue
+            return candidate
+        return None
     observed_at = time.time()
 
     def _snapshot_lookup(provider_id: str) -> ProviderFreshness | None:
@@ -10415,7 +10452,24 @@ def _dispatch_workflow_card(
             control_log_path=handle.control_log_path,
         )
     except BaseException as launch_exc:
-        registry.update_headless_result(str(job["job_id"]), status="failed", exit_code=1)
+        registry.update_headless_result(
+            str(job["job_id"]),
+            status="failed",
+            exit_code=1,
+            executor=identity.executor,
+            model_id=identity.model_id,
+            provider_outcome=provider_outcome.classify_launch_failure(
+                exc=launch_exc,
+                executor=identity.executor,
+                worktree=worktree,
+            ).to_dict(),
+            runtime_diagnostic={
+                "reason": "launch-failed",
+                "detail": summarize_exception(launch_exc),
+                "source": "manager._dispatch_workflow_card:launch",
+                "job_id": str(job["job_id"]),
+            },
+        )
         if planner_sandbox is not None:
             shutil.rmtree(planner_sandbox, ignore_errors=True)
         if reviewer_sandbox is not None:
@@ -10969,7 +11023,9 @@ def resume_workflow_run(
     if job.get("status") != "exited" or job.get("exit_code") != 0:
         failure_reason = "job-failed"
         runtime_diagnostic = job.get("runtime_diagnostic")
-        if isinstance(runtime_diagnostic, dict):
+        runtime_reason = _runtime_diagnostic_reason(runtime_diagnostic)
+        runtime_contract_failed = runtime_reason not in {None, "launch-failed"}
+        if runtime_contract_failed:
             failure_reason = "runtime-contract-failed"
         sandbox_ok = True
         try:
@@ -10992,7 +11048,7 @@ def resume_workflow_run(
         classification = (
             provider_outcome.classification_from_job(job) if sandbox_ok else None
         )
-        if isinstance(runtime_diagnostic, dict):
+        if runtime_contract_failed:
             # A runtime contract failure is already a durable Manager-side
             # diagnosis.  It must not be reclassified as a retryable provider
             # outage or fed back into provider routing.
@@ -11002,7 +11058,11 @@ def resume_workflow_run(
             status_fields["provider_outcome"] = classification.outcome.value
             status_fields["provider_outcome_authority"] = classification.authority.value
             failure_reason = f"job-failed-{classification.outcome.value}"
-        if sandbox_ok and classification is not None and classification.retryable:
+        provider_recoverable = (
+            classification is not None
+            and (classification.retryable or classification.reroutable)
+        )
+        if sandbox_ok and provider_recoverable:
             retry_key = _provider_retry_attempt_key(step.card)
             attempts = dict(run.attempts)
             seen = attempts.get(retry_key, 0)
@@ -11012,41 +11072,48 @@ def resume_workflow_run(
                 rerouted_identity = _provider_failure_reroute(
                     run, step, identities, failed_job=job, classification=classification,
                 )
-                replacement = dispatch_workflow_card(
-                    dispatcher,
-                    run=run,
-                    identities=identities,
-                    launcher_factory=launcher_factory,
-                    coordinator_root=coordinator_root,
-                    retry_failed=True,
-                    forced_identity=rerouted_identity,
-                )
-                if replacement is None:
+                if classification.reroutable and rerouted_identity is None:
+                    pass
+                else:
+                    replacement = dispatch_workflow_card(
+                        dispatcher,
+                        run=run,
+                        identities=identities,
+                        launcher_factory=launcher_factory,
+                        coordinator_root=coordinator_root,
+                        retry_failed=True,
+                        forced_identity=rerouted_identity,
+                    )
+                    if replacement is None:
+                        return {
+                            "run_id": run.run_id,
+                            "current_phase": run.current_phase,
+                            "reason": "not-dispatchable",
+                        }
+                    # #830：重派也可能撞到合法非 Job 決策（例如 runtime preflight
+                    # refusal）；原樣回傳 producer 的 reason，不計入 retry 次數、不造 job_id。
+                    if (
+                        classify_dispatch_result(
+                            replacement, registry=registry, run_id=run.run_id
+                        )["kind"]
+                        == "decision"
+                    ):
+                        return {**dict(replacement), **status_fields}
+                    current = registry.get_workflow_run(run.run_id)
+                    attempts = dict(current.attempts)
+                    attempts[retry_key] = seen + 1
+                    registry._manager_update_workflow_run(run.run_id, attempts=attempts)
                     return {
                         "run_id": run.run_id,
                         "current_phase": run.current_phase,
-                        "reason": "not-dispatchable",
+                        "job_id": replacement["job_id"],
+                        "reason": "provider-failure-retry",
+                        **{**status_fields, "provider_retry_count": seen + 1},
+                        "terminal_diagnostics": diagnostics.as_dict(),
                     }
-                # #830：重派也可能撞到合法非 Job 決策（例如 runtime preflight
-                # refusal）；原樣回傳 producer 的 reason，不計入 retry 次數、不造 job_id。
-                if (
-                    classify_dispatch_result(replacement, registry=registry, run_id=run.run_id)["kind"]
-                    == "decision"
-                ):
-                    return {**dict(replacement), **status_fields}
-                current = registry.get_workflow_run(run.run_id)
-                attempts = dict(current.attempts)
-                attempts[retry_key] = seen + 1
-                registry._manager_update_workflow_run(run.run_id, attempts=attempts)
-                return {
-                    "run_id": run.run_id,
-                    "current_phase": run.current_phase,
-                    "job_id": replacement["job_id"],
-                    "reason": "provider-failure-retry",
-                    **{**status_fields, "provider_retry_count": seen + 1},
-                    "terminal_diagnostics": diagnostics.as_dict(),
-                }
-            failure_reason = "provider-retry-exhausted"
+            else:
+                failure_reason = "provider-retry-exhausted"
+        provider_context = _provider_failure_context(job, classification)
         updated = registry._manager_update_workflow_run(
             run.run_id,
             facets=("needs_human",),
@@ -11056,19 +11123,23 @@ def resume_workflow_run(
                 (
                     "isolated runtime contract failed: "
                     f"{runtime_diagnostic.get('detail', failure_reason)}"
-                    if isinstance(runtime_diagnostic, dict)
+                    if runtime_contract_failed
                     else "builder/reviewer job 以 provider 層失敗終局，"
-                    f"bounded retry 已耗盡或不可重試：{diagnostics.reason or failure_reason}"
+                    "bounded retry/reroute 已耗盡或不可繼續："
+                    f"{(classification.reason if classification is not None else diagnostics.reason) or failure_reason}"
                 ),
                 source=(
                     "manager._poll_workflow_job:runtime-contract"
-                    if isinstance(runtime_diagnostic, dict)
+                    if runtime_contract_failed
                     else "manager._poll_workflow_job:provider-failure"
                 ),
                 run_id=run.run_id,
                 work_id=run.work_id,
                 job_id=str(job["job_id"]),
                 card=step.card,
+                executor=provider_context["executor"],
+                model=provider_context["model"],
+                effort=provider_context["effort"],
             ),
         )
         return {

@@ -10,7 +10,11 @@ from paulsha_cortex.config import paths
 
 from . import terminal_contract
 from .completion import classify_completion
-from .provider_outcome import classify_provider_failure, read_log_tail
+from .provider_outcome import (
+    classify_launch_failure,
+    classify_provider_failure,
+    read_log_tail,
+)
 from .registry import JobRegistry
 from .seams import PaneSender, WorktreeCreator
 
@@ -210,15 +214,24 @@ class Dispatcher:
         （None=仍在跑），不讀 sentinel。單元測試用以模擬已知 exit code。
         """
         job = self._registry.get_job(job_id)
-        pid = job.get("pid")
-        log_path = job.get("log_path") if isinstance(job.get("log_path"), str) else None
+        raw_pid = job.get("pid")
+        raw_log_path = job.get("log_path")
+        pid = raw_pid
+        log_path = raw_log_path if isinstance(raw_log_path, str) else None
         control_log_path = (
             job.get("control_log_path")
             if isinstance(job.get("control_log_path"), str)
             else log_path
         )
         if not isinstance(pid, int) or not log_path:
-            return self._finalize_headless(job_id, exit_code=1, log_path=log_path)
+            return self._registry.update_headless_result(
+                job_id,
+                status="failed",
+                exit_code=1,
+                provider_outcome=classify_launch_failure(
+                    detail=f"launch handle missing: pid={raw_pid!r}, log_path={raw_log_path!r}"
+                ).to_dict(),
+            )
 
         # 向後相容：注入 pid_waiter → 走舊「呼叫者直接給 exit code」路徑。
         if pid_waiter is not None:

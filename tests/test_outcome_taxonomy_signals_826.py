@@ -1,8 +1,8 @@
-"""#826：Outcome taxonomy 與 launch failure 訊號保真的 RED 回歸測試。
+"""#826：Outcome taxonomy 與 launch failure 訊號保真回歸測試。
 
 accepted plan 要求新的 failure taxonomy 從 producer（dispatcher／autonomy／
 workflow launch）一路穿到 persisted job、slice gate_reason 與 workflow
-consumer。本檔先把缺口鎖死；production 尚未補齊前，這些測試應保持 RED。
+consumer。本檔覆蓋三條 producer 寫入路徑與 workflow consumer 的實際接線。
 """
 
 from __future__ import annotations
@@ -322,6 +322,37 @@ def test_effort_signal_extracts_effort_and_model_from_provider_text() -> None:
     assert "mai-code-1-flash-picker" in result.detail
 
 
+def test_exit_127_without_output_classifies_as_executable_not_found_signal() -> None:
+    result = outcome_taxonomy.classify_text(
+        exit_code=127,
+        provider_text="",
+        model_text="",
+    )
+
+    assert result.signal.value == "executable_not_found"
+
+
+def test_shell_command_not_found_classifies_as_executable_not_found_signal() -> None:
+    result = outcome_taxonomy.classify_text(
+        exit_code=1,
+        provider_text="bash: copilot: command not found",
+        model_text="",
+    )
+
+    assert result.signal.value == "executable_not_found"
+    assert "copilot" in result.detail
+
+
+def test_bash_line_command_not_found_classifies_as_executable_not_found_signal() -> None:
+    result = outcome_taxonomy.classify_text(
+        exit_code=1,
+        provider_text="bash: line 1: copilot: command not found",
+        model_text="",
+    )
+
+    assert result.signal.value == "executable_not_found"
+
+
 def test_structured_signals_still_win_before_exit_127_text_classification() -> None:
     rate_limited = classify_provider_failure(
         exit_code=127, output=_STRUCTURED_RATE_LIMIT_LOG
@@ -461,6 +492,31 @@ def test_autonomy_fail_launching_job_persists_launch_failed_runtime_diagnostic(
     }
 
 
+def test_autonomy_fail_launching_job_classifies_missing_executable_exception_as_executable_not_found() -> None:
+    class Registry:
+        def __init__(self) -> None:
+            self.updated = None
+
+        def update_headless_result(self, job_id: str, **kwargs) -> dict:
+            self.updated = {"job_id": job_id, **kwargs}
+            return self.updated
+
+    registry = Registry()
+    dispatcher = type("D", (), {"_registry": registry})()
+
+    autonomy._fail_launching_job(
+        dispatcher,
+        {"job_id": "slice-launch-2", "worktree": "/tmp/worktree"},
+        executor="copilot",
+        model_id="mai-code-1-flash-picker",
+        exc=FileNotFoundError(2, "No such file or directory", "copilot"),
+    )
+
+    assert registry.updated["provider_outcome"]["outcome"] == "executable_not_found"
+    assert registry.updated["provider_outcome"]["authority"] == "structured"
+    assert registry.updated["runtime_diagnostic"]["reason"] == "launch-failed"
+
+
 def test_workflow_launch_exception_persists_launch_failed_through_resume(
     tmp_path: Path,
 ) -> None:
@@ -519,6 +575,10 @@ def test_workflow_launch_exception_persists_launch_failed_through_resume(
     assert resumed["reason"] == "job-failed-launch_failed"
     assert resumed["provider_outcome"] == "launch_failed"
     assert resumed["provider_outcome_authority"] == "structured"
+    persisted = reloaded.get_workflow_run(run.run_id)
+    assert persisted.needs_human_reason["context"]["executor"] == "copilot"
+    assert persisted.needs_human_reason["context"]["model"] == "mai-code-1-flash-picker"
+    assert persisted.needs_human_reason["context"]["effort"] == "unknown"
 
 
 def test_effort_not_supported_reroutes_after_real_poll_classification(
@@ -562,6 +622,110 @@ def test_effort_not_supported_reroutes_after_real_poll_classification(
     replacement = reloaded.get_job(result["job_id"])
     assert replacement["executor"] == "claude"
     assert replacement["independence_domain"] == "anthropic"
+
+
+def test_effort_not_supported_without_alternative_candidate_stops_in_needs_human(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    worktree = tmp_path / "wt"
+    base_head = _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    _seed_workflow_job_from_log(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        executor="copilot",
+        model_id="mai-code-1-flash-picker",
+        domain="github",
+        log_text=_COPILOT_EFFORT_UNSUPPORTED,
+        exit_code=1,
+    )
+
+    reloaded = JobRegistry(state_path=state)
+    dispatcher = _WorkflowDispatcher(reloaded, worktree)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "copilot",
+                "model_id": "mai-code-1-flash-picker",
+                "independence_domain": "github",
+                "capabilities": ["build"],
+            }
+        ]
+    )
+    jobs_before = len(reloaded.list_jobs())
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    assert result["reason"] == "job-failed-effort_not_supported"
+    assert result["provider_outcome"] == "effort_not_supported"
+    assert len(reloaded.list_jobs()) == jobs_before
+    persisted = reloaded.get_workflow_run(run.run_id)
+    assert persisted.needs_human_reason["context"]["executor"] == "copilot"
+    assert persisted.needs_human_reason["context"]["model"] == "mai-code-1-flash-picker"
+    assert persisted.needs_human_reason["context"]["effort"] == "xhigh"
+
+
+def test_effort_not_supported_can_reroute_to_same_executor_different_model(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    worktree = tmp_path / "wt"
+    base_head = _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    _seed_workflow_job_from_log(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        executor="copilot",
+        model_id="mai-code-1-flash-picker",
+        domain="github",
+        log_text=_COPILOT_EFFORT_UNSUPPORTED,
+        exit_code=1,
+    )
+
+    reloaded = JobRegistry(state_path=state)
+    dispatcher = _WorkflowDispatcher(reloaded, worktree)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "copilot",
+                "model_id": "mai-code-1-flash-picker",
+                "independence_domain": "github",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "copilot",
+                "model_id": "gpt-5.4",
+                "independence_domain": "github",
+                "capabilities": ["build"],
+            },
+        ]
+    )
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    assert result["reason"] == "provider-failure-retry"
+    replacement = reloaded.get_job(result["job_id"])
+    assert replacement["executor"] == "copilot"
+    assert replacement["model_id"] == "gpt-5.4"
 
 
 def test_runtime_contract_failures_still_do_not_reroute_retryable_outages(

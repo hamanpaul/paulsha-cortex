@@ -1336,6 +1336,8 @@ class JobRegistry:
         *,
         status: str,
         exit_code: int,
+        executor: str | None = None,
+        model_id: str | None = None,
         provider_outcome: Mapping[str, Any] | None = None,
         runtime_diagnostic: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -1369,6 +1371,10 @@ class JobRegistry:
         )
         job["status"] = status
         job["exit_code"] = exit_code
+        if executor is not None:
+            job["executor"] = executor
+        if model_id is not None:
+            job["model_id"] = model_id
         job["exited_at"] = _now_iso()
         # #384：executor 失敗的 typed 分類（見 provider_outcome.py）。只在呼叫端
         # 傳入時才寫入——`status == "exited"` 或呼叫端未提供分類（例如 launch

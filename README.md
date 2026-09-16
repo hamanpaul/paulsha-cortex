@@ -426,8 +426,14 @@ systemctl --user status cortex-manager.service cortex-monitor.service
   下游可直接使用去識別化 producer snapshot fixture
   `tests/fixtures/workflow-execution-identity-828-status.json`；欄位與 selection
   語意見 `docs/superpowers/specs/workflow-execution-identity-producer-contract.md`。
-- `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。
-- `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及 `candidate_git_base`。
+- `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。builder／reviewer 失敗若已有
+  durable `provider_outcome`，`gate_reason` 會帶具名後綴（例如 `builder-failed-rate_limited`、
+  `builder-failed-effort_not_supported`、`foreign-review-provider-launch_failed`），而不是把所有
+  provider 層與 launch 層失敗壓平成同一句。
+- `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及
+  `candidate_git_base`。workflow job 的 provider 類失敗會另外投影 `provider_outcome` 與
+  `provider_outcome_authority`；`runtime-contract-failed` 仍與 provider 分類分層，不會被
+  `exit 127` 或關鍵字比對覆蓋。
 - `candidate_git_base`（#731）：這條 run／這張卡的**候選 git base**——真正那個 40-hex commit SHA，以及它落後 mirror 上 `origin/main` 幾個 commit。欄位含 `sha`、`sha_source`（`frozen-readiness-base-sha` 或 `first-build-job-dispatch-head`）、`behind_origin_main`、`mirror_origin_main`、`threshold_commits`、`reason`、`measured_against`、`fetched`。
   - **與 `source_revision` 是兩件事**：`source_revision` 是 work item 來源材料的 sha256（authority digest，64-hex），與 git 無關、也不隨 `origin/main` 前進而改變。過去候選基底只存在於候選 worktree 的 `.git` 裡，operator 只能 `git -C <候選 worktree> rev-parse HEAD` 才問得到，於是把診斷掛在 `source_revision` 上而誤判。
   - 落後達 `threshold_commits`（預設 10，可用 `PSC_CANDIDATE_BASE_STALE_THRESHOLD_COMMITS` 覆寫）時，`reason` 為具名診斷 `candidate-git-base-stale`——代表「這條 run 的基底過舊、已 merge 的 test-only 修復進不去」。

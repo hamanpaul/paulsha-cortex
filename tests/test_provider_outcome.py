@@ -16,8 +16,14 @@ from paulsha_cortex.coordinator.provider_outcome import (
     ProviderOutcome,
     SignalAuthority,
     classification_from_job,
+    classify_launch_failure,
     classify_provider_failure,
     read_log_tail,
+)
+
+_COPILOT_EFFORT_UNSUPPORTED = (
+    'Reasoning effort "xhigh" is not supported for model '
+    '"mai-code-1-flash-picker"'
 )
 
 
@@ -145,6 +151,40 @@ def test_only_rate_limited_and_transient_are_retryable_outcomes():
 
 
 # --------------------------------------------------------------- authority level design
+
+
+def test_effort_not_supported_is_reroutable_but_not_retryable():
+    result = classify_provider_failure(exit_code=1, output=_COPILOT_EFFORT_UNSUPPORTED)
+    assert result.outcome is ProviderOutcome.EFFORT_NOT_SUPPORTED
+    assert result.retryable is False
+    assert result.reroutable is True
+    assert "reroutable" not in result.to_dict()
+
+
+def test_exit_127_empty_output_is_executable_not_found_and_reroutable():
+    result = classify_provider_failure(exit_code=127, output="")
+    assert result.outcome is ProviderOutcome.EXECUTABLE_NOT_FOUND
+    assert result.authority is SignalAuthority.TEXT_SIGNAL
+    assert result.retryable is False
+    assert result.reroutable is True
+
+
+def test_launch_failure_only_classifies_missing_executable_when_exception_proves_it():
+    missing_program = classify_launch_failure(
+        exc=FileNotFoundError(2, "No such file or directory", "copilot"),
+        executor="copilot",
+        worktree="/tmp/worktree",
+    )
+    missing_cwd = classify_launch_failure(
+        exc=FileNotFoundError(2, "No such file or directory", "/tmp/worktree"),
+        executor="copilot",
+        worktree="/tmp/worktree",
+    )
+
+    assert missing_program.outcome is ProviderOutcome.EXECUTABLE_NOT_FOUND
+    assert missing_program.reroutable is True
+    assert missing_cwd.outcome is ProviderOutcome.LAUNCH_FAILED
+    assert missing_cwd.reroutable is False
 
 
 def test_text_signal_authority_is_between_structured_and_hint():
