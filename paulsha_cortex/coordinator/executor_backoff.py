@@ -44,7 +44,13 @@ def read_store(store_path: str | Path) -> StoreRead:
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        return StoreRead(observation=StoreObservation.MISSING)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return StoreRead(observation=StoreObservation.MISSING)
+        except OSError as error:
+            return _unknown(f"unable to stat executor backoff store after read miss: {error}")
+        return _unknown("executor backoff store path exists but could not be read")
     except OSError as error:
         return _unknown(f"unable to read executor backoff store: {error}")
 

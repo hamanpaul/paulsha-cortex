@@ -12,7 +12,7 @@
   reader surface：缺檔明確回 `missing`，corrupt persisted bytes／UTF-8／JSON／
   non-object payload 與 read faults 皆回 `unknown` 並附 diagnostics，讓
   `tests/test_executor_backoff.py` focused regression 轉綠；schema v1／atomic RMW／
-  immutable fold／reconciliation lane 仍待後續卡片。
+  bounded capacity／immutable fold／reconciliation lane 仍待後續卡片。
 
 - **#911 ship lane 無 openspec 交付模式**：ship lane 現在接受 `mapped_openspec == ()` 的合法交付模式；
   `_ship_action`／delivery binding／GitHub facts／remote closure／CompletionRecord 全面支援 `change=None`，

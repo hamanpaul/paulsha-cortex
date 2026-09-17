@@ -44,3 +44,18 @@ def test_store_that_disappears_during_read_stays_missing(
 
     assert observation == "missing"
     assert not observed.diagnostics
+
+
+def test_dangling_symlink_store_stays_unknown(tmp_path: Path) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    store_path = tmp_path / "executor-backoff-state.json"
+    store_path.symlink_to(tmp_path / "missing-target.json")
+
+    observed = executor_backoff.read_store(store_path)
+    observation = observed.observation
+    if not isinstance(observation, str):
+        observation = observation.value
+
+    assert observation == "unknown"
+    assert observed.diagnostics
