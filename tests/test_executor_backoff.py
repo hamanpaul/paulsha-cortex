@@ -20,3 +20,27 @@ def test_invalid_store_bytes_stay_unknown_instead_of_falling_back_to_missing(
 
     assert observation == "unknown"
     assert observed.diagnostics
+
+
+def test_store_that_disappears_during_read_stays_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    store_path = tmp_path / "executor-backoff-state.json"
+    store_path.write_text("{}", encoding="utf-8")
+    original_read_bytes = Path.read_bytes
+
+    def disappearing_read_bytes(self: Path) -> bytes:
+        if self == store_path:
+            store_path.unlink()
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", disappearing_read_bytes)
+    observed = executor_backoff.read_store(store_path)
+    observation = observed.observation
+    if not isinstance(observation, str):
+        observation = observation.value
+
+    assert observation == "missing"
+    assert not observed.diagnostics
