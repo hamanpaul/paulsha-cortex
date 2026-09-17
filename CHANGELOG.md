@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **Refine B1 收尾／B2 開工 handoff**：新增 `docs/handoffs/2026-09-17-refine-b1-b2-handoff.md`——本輪六張票交付方式、
+  使用者裁決、runtime 現況、未完成工作順序（#911 → B2）與 cortex 派工實測要訣。docs-only。
+
 - **進件 #922 reviewer authority_hashes 回聲**：登記 work item `reviewer-authority-hashes-echo` 與 accepted todo
   （T1–T6：採信端改選填＋Manager 以 snapshot 補齊、prompt 端移出 required、採信失敗 diagnostic 補 envelope 摘要）。
   docs-only 進件。
