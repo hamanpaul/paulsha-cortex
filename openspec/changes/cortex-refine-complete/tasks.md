@@ -38,6 +38,10 @@
   - [x] GREEN：在 launcher 共用 helper 實作並接入所有 headless Popen；保留 runner override、Claude stdin-only retry 與固定 fake 相容性。
 - [ ] 2.8 完成 #825 最小 durable backoff，所有 lane 與 corrupt-state/expiry 可測；不標 R05 完成。
 - [ ] 2.8.1 先依 #850 有界 store／immutable event-fold child 交付 component；C/D provenance、reconciliation 與所有 lane 接線仍由 #825 後續 child 承接。
+  - [x] RED：新增 `tests/test_executor_backoff.py` focused regression，鎖定 strict reader
+    遇到 corrupt persisted bytes 時必須回報 `unknown` observation 並附 diagnostics、
+    不可降級成 `missing`；目前 `paulsha_cortex.coordinator.executor_backoff` 尚未實作，
+    故此卡維持 RED，bounded store／immutable fold／lane 接線仍待後續卡片。
 - [ ] 2.9 以實際已載入 revision 驗 B1 成效，退出暫時 bypass 前保存 active jobs 與 rollback 方案。
 - [ ] 2.10 由 #847 區分可信 frozen 自發布 metadata 等價與真 authority 變更；前者保持 needs_human/gates/attempt/model binding 且零 spawn，後者仍走合法 restart，缺 provenance 不豁免。
 - [ ] 2.11 依 #860 交付 terminal JSONL 實體 LF／CRLF 分界、合法 Unicode／雙層序列化保真與不可變重播；維持既有 carrier/schema/claim-era 採信，不以 parser-only proof 關閉 R13／R06。

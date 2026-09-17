@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+- **#850 executor backoff store RED coverage**：新增 `tests/test_executor_backoff.py` focused
+  regression，鎖定 strict reader 遇到 corrupt persisted bytes 時必須回報 `unknown`
+  observation 並附 diagnostics、不可降級成 `missing`；現況因
+  `paulsha_cortex.coordinator.executor_backoff` 尚未實作而維持 RED，bounded
+  store／immutable fold／lane 接線仍待後續卡片。
+
 - **#911 ship lane 無 openspec 交付模式**：ship lane 現在接受 `mapped_openspec == ()` 的合法交付模式；
   `_ship_action`／delivery binding／GitHub facts／remote closure／CompletionRecord 全面支援 `change=None`，
   `mapped_openspec > 1` 仍以 `multiple-delivery-targets-unsupported` fail-closed，並明示先 `cortex work unlink`
