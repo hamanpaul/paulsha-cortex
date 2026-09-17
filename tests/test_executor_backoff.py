@@ -22,6 +22,37 @@ def test_invalid_store_bytes_stay_unknown_instead_of_falling_back_to_missing(
     assert observed.diagnostics
 
 
+def test_invalid_utf8_store_bytes_stay_unknown(tmp_path: Path) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    store_path = tmp_path / "executor-backoff-state.json"
+    store_path.write_bytes(b"\xff\xfe")
+
+    observed = executor_backoff.read_store(store_path)
+    observation = observed.observation
+    if not isinstance(observation, str):
+        observation = observation.value
+
+    assert observation == "unknown"
+    assert observed.diagnostics
+
+
+def test_valid_json_object_store_is_reported_as_valid(tmp_path: Path) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    store_path = tmp_path / "executor-backoff-state.json"
+    store_path.write_text('{"entries": {}}', encoding="utf-8")
+
+    observed = executor_backoff.read_store(store_path)
+    observation = observed.observation
+    if not isinstance(observation, str):
+        observation = observation.value
+
+    assert observation == "valid"
+    assert observed.payload == {"entries": {}}
+    assert not observed.diagnostics
+
+
 def test_store_that_disappears_during_read_stays_missing(
     tmp_path: Path, monkeypatch
 ) -> None:
