@@ -1230,3 +1230,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/reviewer-authority-hashes-echo/todo.md'
     excludes: []
+  ship-lane-no-openspec:
+    title: 'ship-lane-no-openspec'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#911'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/ship-lane-no-openspec/todo.md'
+    excludes: []
