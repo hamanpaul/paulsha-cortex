@@ -1,4 +1,4 @@
-"""Issue #922 RED coverage for reviewer authority_hashes echo fallback."""
+"""Issue #922 regression coverage: reviewer authority_hashes echo — absence is filled from the pinned snapshot, echoes must match exactly, drift stays fail-closed, and acceptance failures carry envelope diagnostics."""
 
 from __future__ import annotations
 
