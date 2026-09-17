@@ -7,10 +7,11 @@
 
 ## [Unreleased]
 
-- **進件 #911 ship lane 無 openspec 交付模式**：登記 work item `ship-lane-no-openspec` 與 accepted todo
-  （T1–T7：`_ship_action` 入口 gate／binding／archive 跳過、GitHub facts 與 closure gate 對 `change=None`
-  放行、completion record 允許 `mapped_openspec: []`、`review-attest` 無 openspec／無 PR 可用＋
-  `evidence_refs`）。範圍裁決 A＋C、不做 B。docs-only 進件。
+- **#911 ship lane 無 openspec 交付模式**：ship lane 現在接受 `mapped_openspec == ()` 的合法交付模式；
+  `_ship_action`／delivery binding／GitHub facts／remote closure／CompletionRecord 全面支援 `change=None`，
+  `mapped_openspec > 1` 仍以 `multiple-delivery-targets-unsupported` fail-closed，並明示先 `cortex work unlink`
+  修正 correlation 後再 `resume`。`review-attest` 也可在無 openspec、甚至尚無 PR 時先建立 immutable
+  maintainer evidence，並支援選填 `evidence_refs` 記錄 operator reproduction artifact。
 
 - **Refine B1 收尾／B2 開工 handoff**：新增 `docs/handoffs/2026-09-17-refine-b1-b2-handoff.md`——本輪六張票交付方式、
   使用者裁決、runtime 現況、未完成工作順序（#911 → B2）與 cortex 派工實測要訣。docs-only。

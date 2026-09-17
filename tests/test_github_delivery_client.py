@@ -183,6 +183,18 @@ def test_fetch_delivery_facts_uses_authenticated_typed_gh_api() -> None:
     assert all(call[1]["shell"] is False for call in runner.calls)
 
 
+def test_fetch_delivery_facts_treats_openspec_as_optional_when_change_is_none() -> None:
+    facts = GitHubDeliveryClient(runner=FakeRunner()).fetch_delivery_facts(
+        repo="acme/demo",
+        pr_number=7,
+        change=None,
+    )
+
+    assert facts.active_openspec_absent
+    assert facts.archive_present
+    assert facts.openspec_required is False
+
+
 def test_fetch_delivery_facts_uses_latest_legacy_status_per_context() -> None:
     class StatusHistory(FakeRunner):
         def __call__(self, argv, **kwargs):
@@ -224,6 +236,20 @@ def test_fetch_remote_closure_verifies_merge_ancestor_issues_and_archive() -> No
     assert facts.default_head == DEFAULT_HEAD
     assert facts.todo_revisions == {"docs/todo.md": "f" * 40}
     assert not facts.completion_record_valid
+
+
+def test_fetch_remote_closure_treats_openspec_as_optional_when_change_is_none() -> None:
+    facts = GitHubDeliveryClient(runner=FakeRunner()).fetch_remote_closure(
+        repo="acme/demo",
+        pr_number=7,
+        change=None,
+        required_issues=(14,),
+        todo_paths=("docs/todo.md",),
+    )
+
+    assert facts.active_openspec_absent
+    assert facts.archive_present
+    assert facts.openspec_required is False
 
 
 def test_fetch_merge_status_binds_merged_side_effect_to_exact_pr_head() -> None:

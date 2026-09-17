@@ -176,6 +176,16 @@ class CompletionRecordValidationTests(unittest.TestCase):
             {"preflight", "foreign_review", "maintainer-review", "merge_authorization"},
         )
 
+    def test_work_authority_accepts_null_change_when_no_openspec_is_mapped(self) -> None:
+        authority = self._work_authority(review_kind="maintainer-review")
+        authority["mapped_openspec"] = []
+        authority["change"] = None
+
+        normalized = completion._normalize_work_authority(authority)
+
+        self.assertEqual(normalized["mapped_openspec"], [])
+        self.assertIsNone(normalized["change"])
+
     def test_work_authority_rejects_both_delivery_review_authorities(self) -> None:
         authority = self._work_authority(review_kind="maintainer-review")
         authority["trusted_evidence_refs"].append(
@@ -207,6 +217,18 @@ class CompletionRecordValidationTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "refs invalid"):
             completion._normalize_work_authority(authority)
+
+    def test_work_authority_rejects_multiple_or_mismatched_openspec_refs(self) -> None:
+        multiple = self._work_authority()
+        multiple["mapped_openspec"] = ["work", "other"]
+        multiple["change"] = None
+        with self.assertRaisesRegex(ValueError, "refs invalid"):
+            completion._normalize_work_authority(multiple)
+
+        mismatched = self._work_authority()
+        mismatched["change"] = "other"
+        with self.assertRaisesRegex(ValueError, "refs invalid"):
+            completion._normalize_work_authority(mismatched)
 
     def test_required_policy_requires_reviewer_identity_and_eval_refs(self) -> None:
         payload = _completion_payload(

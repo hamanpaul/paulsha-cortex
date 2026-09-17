@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -49,6 +50,9 @@ from .delivery import (
     repair_budget_for_band,
     validate_archive_gate,
     validate_pr_metadata,
+    _maintainer_review_authority_digest,
+    _maintainer_review_pr_matches,
+    _normalize_maintainer_review_evidence_refs,
     _validate_foreign_review,
 )
 from .github_delivery import (
@@ -773,7 +777,10 @@ def _ship_binding(args: dict[str, Any], authority) -> dict[str, Any]:
     todo_paths = args.get("todo_paths")
     if pr_number not in authority.mapped_prs:
         raise RuntimeError("ship PR is not authorized by WorkAuthority")
-    if not isinstance(change, str) or change not in authority.mapped_openspec:
+    if authority.mapped_openspec:
+        if not isinstance(change, str) or change not in authority.mapped_openspec:
+            raise RuntimeError("ship OpenSpec change is not authorized by WorkAuthority")
+    elif change is not None:
         raise RuntimeError("ship OpenSpec change is not authorized by WorkAuthority")
     if (
         not isinstance(todo_paths, list)
@@ -787,6 +794,50 @@ def _ship_binding(args: dict[str, Any], authority) -> dict[str, Any]:
         "change": change,
         "todo_paths": list(authority.mapped_todo_paths),
     }
+
+
+def _review_attest_evidence_refs(value: object) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("review-attest evidence_refs malformed")
+    normalized: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"kind", "ref", "sha256"}:
+            raise ValueError("review-attest evidence_refs malformed")
+        evidence_path = _absolute_file(
+            item.get("ref"), field="review-attest evidence_refs.ref"
+        )
+        supplied_hash = item.get("sha256")
+        if (
+            item.get("kind") != "operator-reproduction"
+            or not isinstance(supplied_hash, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", supplied_hash) is None
+        ):
+            raise ValueError("review-attest evidence_refs malformed")
+        actual_hash = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        if actual_hash != supplied_hash.lower():
+            raise ValueError("review-attest evidence_refs sha256 mismatch")
+        normalized.append(
+            {
+                "kind": "operator-reproduction",
+                "ref": str(evidence_path),
+                "sha256": actual_hash,
+            }
+        )
+    return [dict(item) for item in _normalize_maintainer_review_evidence_refs(normalized)]
+
+
+def _merged_awaiting_closure_detail(change: str | None) -> str:
+    if change is None:
+        return (
+            "PR 已在遠端 merge，本地 closeout（Todo／CompletionRecord）"
+            "尚未完成，需要人工接手收尾"
+        )
+    return (
+        "PR 已在遠端 merge，本地 closeout（openspec archive／todo 回寫）"
+        "尚未完成，需要人工接手收尾"
+    )
 
 
 def _command_result_payload(result: object) -> dict[str, Any] | None:
@@ -1156,7 +1207,7 @@ def _validate_maintainer_review(
     expected_hash: object,
     run,
     authority,
-    pr_number: int,
+    pr_number: int | None,
     candidate: str,
 ) -> dict[str, Any]:
     evidence_path = _absolute_file(path, field="maintainer_review_path")
@@ -1167,6 +1218,28 @@ def _validate_maintainer_review(
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("maintainer review evidence unreadable") from exc
     bound_refs = [ref for ref in run.gate_refs if ref.kind == "maintainer-review"]
+    required_fields = {
+        "schema",
+        "repo",
+        "work_id",
+        "run_id",
+        "authority_digest",
+        "pr_number",
+        "candidate",
+        "actor",
+        "requested_by",
+        "verdict",
+        "summary",
+        "findings",
+        "reviewed_at_epoch",
+    }
+    optional_fields = {"evidence_refs"}
+    try:
+        _normalize_maintainer_review_evidence_refs(
+            body.get("evidence_refs") if isinstance(body, dict) else None
+        )
+    except ValueError as exc:
+        raise RuntimeError("maintainer review does not authorize exact HEAD") from exc
     if (
         run.current_phase != "review"
         or run.candidate_head != candidate
@@ -1175,12 +1248,21 @@ def _validate_maintainer_review(
         or bound_refs[0].ref != str(evidence_path)
         or bound_refs[0].sha256 != expected_hash
         or not isinstance(body, dict)
+        or not required_fields.issubset(body)
+        or bool(set(body) - (required_fields | optional_fields))
         or body.get("schema") != "cortex-maintainer-review/v1"
         or body.get("repo") != authority.repo
         or body.get("work_id") != authority.work_id
         or body.get("run_id") != run.run_id
-        or body.get("authority_digest") != work_authority_digest(authority)
-        or body.get("pr_number") != pr_number
+        or body.get("authority_digest")
+        != _maintainer_review_authority_digest(
+            authority, pr_number=body.get("pr_number")
+        )
+        or not _maintainer_review_pr_matches(
+            body.get("pr_number"),
+            expected_pr_number=pr_number,
+            authority=authority,
+        )
         or body.get("candidate") != candidate
         or body.get("verdict") != "approved"
         or body.get("findings") != []
@@ -1202,13 +1284,23 @@ def _review_attest_action(
     state_path: Path,
     workflow_registry,
 ) -> dict[str, Any]:
-    allowed = {"action", "repo", "work_id", "actor", "verdict", "summary", "findings"}
+    allowed = {
+        "action",
+        "repo",
+        "work_id",
+        "actor",
+        "verdict",
+        "summary",
+        "findings",
+        "evidence_refs",
+    }
     extras = set(args) - allowed
     if extras:
         raise ValueError(f"review-attest rejects caller evidence/input: {sorted(extras)[0]}")
     actor = args.get("actor")
     summary = args.get("summary")
     findings = args.get("findings")
+    evidence_refs = _review_attest_evidence_refs(args.get("evidence_refs"))
     if (
         not isinstance(actor, str) or not actor.strip() or len(actor) > 128 or "\n" in actor
         or args.get("verdict") != "approved"
@@ -1226,24 +1318,34 @@ def _review_attest_action(
     )
     _validate_current_run_authority(active, authority, run)
     foreign = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]
+    change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
     if (
         run.current_phase != "review"
         or run.status != "ongoing"
         or not isinstance(run.candidate_head, str)
         or run.verified_head != run.candidate_head
         or len(foreign) != 1
-        or len(authority.mapped_prs) != 1
-        or run.pr_refs != (f"{run.repo}#{authority.mapped_prs[0]}",)
+        or len(authority.mapped_prs) > 1
+        or len(authority.mapped_openspec) > 1
+        or (
+            len(authority.mapped_prs) == 1
+            and run.pr_refs != (f"{run.repo}#{authority.mapped_prs[0]}",)
+        )
+        or (
+            len(authority.mapped_prs) == 0
+            and (run.pr_refs != () or authority.mapped_openspec != ())
+        )
     ):
         raise RuntimeError("review-attest requires current exact-HEAD review run")
-    pr_number = authority.mapped_prs[0]
-    remote = GitHubDeliveryClient(runner=runner).fetch_delivery_facts(
-        repo=authority.repo,
-        pr_number=pr_number,
-        change=authority.mapped_openspec[0],
-    )
-    if remote.head != run.candidate_head:
-        raise RuntimeError("review-attest PR HEAD mismatch")
+    pr_number: int | None = authority.mapped_prs[0] if authority.mapped_prs else None
+    if pr_number is not None:
+        remote = GitHubDeliveryClient(runner=runner).fetch_delivery_facts(
+            repo=authority.repo,
+            pr_number=pr_number,
+            change=change,
+        )
+        if remote.head != run.candidate_head:
+            raise RuntimeError("review-attest PR HEAD mismatch")
     body = {
         "schema": "cortex-maintainer-review/v1",
         "repo": authority.repo,
@@ -1259,6 +1361,8 @@ def _review_attest_action(
         "findings": [],
         "reviewed_at_epoch": float(now_epoch),
     }
+    if evidence_refs:
+        body["evidence_refs"] = evidence_refs
     record = _maintainer_review_record(body, state_path=state_path)
     refs = {ref.kind: ref for ref in run.gate_refs if ref.kind != "copilot"}
     refs["maintainer-review"] = GateEvidenceRef(
@@ -5438,7 +5542,7 @@ def _ship_action(
         _save_runs(state_path, state)
     if (
         len(authority.mapped_prs) != 1
-        or len(authority.mapped_openspec) != 1
+        or len(authority.mapped_openspec) > 1
         or len(authority.mapped_todo_paths) != 1
     ):
         active["ship"] = {
@@ -5452,10 +5556,10 @@ def _ship_action(
             gate_status="running",
             needs_human_reason=diagnostic_reason(
                 "multiple-delivery-targets-unsupported",
-                "work item 綁到多於一組交付目標（PR／openspec change／todo 路徑），"
-                f"ship lane 不支援：prs={len(authority.mapped_prs)} "
-                f"openspec={len(authority.mapped_openspec)} "
-                f"todo={len(authority.mapped_todo_paths)}",
+                "work item 的交付 correlation 尚未收斂到 ship lane 支援的唯一組合"
+                f"（需要 pr=1、todo=1、openspec=0 或 1；觀察到 prs={len(authority.mapped_prs)} "
+                f"openspec={len(authority.mapped_openspec)} todo={len(authority.mapped_todo_paths)}）。"
+                "請先用 `cortex work unlink` 修正多餘的 delivery correlation，待 snapshot 更新後再 `resume`。",
                 source="work_actions._ship_action:delivery-targets",
                 run_id=canonical_run.run_id,
                 work_id=canonical_run.work_id,
@@ -5476,8 +5580,8 @@ def _ship_action(
         and active.get("delivery_binding") is None
     ):
         # This stop is established before any delivery binding or external
-        # mutation.  Once operator-owned correlation resolves to the one
-        # PR/OpenSpec/Todo tuple required by v1, an explicit resume may safely
+        # mutation.  Once operator-owned correlation resolves to the v1 ship
+        # shape (PR=1, Todo=1, OpenSpec=0 or 1), an explicit resume may safely
         # re-arm the same WorkflowRun instead of requiring registry surgery.
         active.pop("ship")
         _save_runs(state_path, state)
@@ -5493,7 +5597,10 @@ def _ship_action(
     pr_number = binding["pr_number"]
     change = binding["change"]
     todo_paths_value = binding["todo_paths"]
-    protected_refs = [f"openspec/changes/{change}", *todo_paths_value]
+    protected_refs = [
+        *([f"openspec/changes/{change}"] if change is not None else []),
+        *todo_paths_value,
+    ]
     if any(_path_has_symlink(repo_root, ref) for ref in protected_refs):
         raise ValueError("ship authorized repo path must not traverse a symlink")
     metadata = _pr_metadata(args, required_issues=authority.mapped_issues)
@@ -5702,8 +5809,7 @@ def _ship_action(
                 gate_status="running",
                 needs_human_reason=diagnostic_reason(
                     "merged-awaiting-closure",
-                    "PR 已在遠端 merge，本地 closeout（openspec archive／todo 回寫）"
-                    "尚未完成，需要人工接手收尾",
+                    _merged_awaiting_closure_detail(change),
                     source="work_actions._ship_action:merged-awaiting-closure",
                     run_id=canonical_run.run_id,
                     work_id=canonical_run.work_id,
@@ -5713,8 +5819,8 @@ def _ship_action(
             )
             return {"action": "merged-awaiting-closure", "head": expected_head}
 
-    active_change = repo_root / "openspec" / "changes" / change
-    if active_change.is_dir():
+    active_change = repo_root / "openspec" / "changes" / change if change is not None else None
+    if active_change is not None and active_change.is_dir():
         _validate_local_archive_inputs(
             repo_root=repo_root,
             change=change,
@@ -5764,7 +5870,10 @@ def _ship_action(
     )
     if remote.head != preflight.head:
         raise RuntimeError("ship HEAD differs from authenticated GitHub PR")
-    if not remote.active_openspec_absent or not remote.archive_present:
+    if (
+        remote.openspec_required
+        and (not remote.active_openspec_absent or not remote.archive_present)
+    ):
         raise RuntimeError("official OpenSpec archive is not present on the exact PR HEAD")
 
     merge_status = github.fetch_merge_status(repo=authority.repo, pr_number=pr_number)

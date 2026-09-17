@@ -263,11 +263,105 @@ class MaintainerReviewEvidence:
     expected_hash: str
 
 
+_MAINTAINER_REVIEW_REQUIRED_FIELDS = frozenset(
+    {
+        "schema",
+        "repo",
+        "work_id",
+        "run_id",
+        "authority_digest",
+        "pr_number",
+        "candidate",
+        "actor",
+        "requested_by",
+        "verdict",
+        "summary",
+        "findings",
+        "reviewed_at_epoch",
+    }
+)
+_MAINTAINER_REVIEW_OPTIONAL_FIELDS = frozenset({"evidence_refs"})
+
+
+def _normalize_maintainer_review_evidence_refs(
+    value: object,
+) -> tuple[dict[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("maintainer review evidence_refs malformed")
+    normalized: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"kind", "ref", "sha256"}:
+            raise ValueError("maintainer review evidence_refs malformed")
+        kind = item.get("kind")
+        ref = item.get("ref")
+        sha256 = item.get("sha256")
+        if (
+            kind != "operator-reproduction"
+            or not isinstance(ref, str)
+            or not ref
+            or not Path(ref).is_absolute()
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", sha256) is None
+        ):
+            raise ValueError("maintainer review evidence_refs malformed")
+        normalized.append({"kind": kind, "ref": ref, "sha256": sha256.lower()})
+    return tuple(normalized)
+
+
+def _maintainer_review_pr_matches(
+    body_pr_number: object,
+    *,
+    expected_pr_number: int | None,
+    authority: WorkAuthority,
+) -> bool:
+    if body_pr_number is None:
+        return authority.mapped_openspec == ()
+    return (
+        isinstance(body_pr_number, int)
+        and not isinstance(body_pr_number, bool)
+        and body_pr_number > 0
+        and expected_pr_number is not None
+        and body_pr_number == expected_pr_number
+    )
+
+
+def _maintainer_review_authority_digest(
+    authority: WorkAuthority, *, pr_number: int | None
+) -> str:
+    if pr_number is not None:
+        return work_authority_digest(authority)
+    source_prefix = f"github_pr:{authority.repo}#"
+    prless_authority = WorkAuthority._verified(
+        repo=authority.repo,
+        work_id=authority.work_id,
+        mapped_issues=authority.mapped_issues,
+        mapped_prs=(),
+        mapped_openspec=authority.mapped_openspec,
+        mapped_todo_paths=authority.mapped_todo_paths,
+        confirmed_todo=authority.confirmed_todo,
+        auto_label=authority.auto_label,
+        source_revisions=tuple(
+            sorted(
+                revision
+                for revision in authority.source_revisions
+                if not revision.startswith(source_prefix)
+            )
+        ),
+        provider_id=authority.github_provider_id,
+        provider_revision=authority.github_provider_revision,
+        last_success_epoch=authority.github_last_success_epoch,
+        snapshot_hash=authority.snapshot_hash,
+    )
+    return work_authority_digest(prless_authority)
+
+
 def _validate_maintainer_review_evidence(
     evidence: MaintainerReviewEvidence,
     *,
     authority: WorkAuthority,
-    pr_number: int,
+    pr_number: int | None,
     expected_head: str,
 ) -> dict[str, object]:
     path = Path(evidence.path)
@@ -277,13 +371,28 @@ def _validate_maintainer_review_evidence(
         body = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("maintainer review evidence unreadable") from exc
+    try:
+        _normalize_maintainer_review_evidence_refs(
+            body.get("evidence_refs") if isinstance(body, dict) else None
+        )
+    except ValueError as exc:
+        raise RuntimeError("maintainer review does not authorize exact HEAD") from exc
     if (
         not isinstance(body, dict)
+        or not _MAINTAINER_REVIEW_REQUIRED_FIELDS.issubset(body)
+        or bool(set(body) - (_MAINTAINER_REVIEW_REQUIRED_FIELDS | _MAINTAINER_REVIEW_OPTIONAL_FIELDS))
         or body.get("schema") != "cortex-maintainer-review/v1"
         or body.get("repo") != authority.repo
         or body.get("work_id") != authority.work_id
-        or body.get("authority_digest") != work_authority_digest(authority)
-        or body.get("pr_number") != pr_number
+        or body.get("authority_digest")
+        != _maintainer_review_authority_digest(
+            authority, pr_number=body.get("pr_number")
+        )
+        or not _maintainer_review_pr_matches(
+            body.get("pr_number"),
+            expected_pr_number=pr_number,
+            authority=authority,
+        )
         or body.get("candidate") != expected_head
         or body.get("verdict") != "approved"
         or body.get("findings") != []
@@ -317,7 +426,6 @@ def _validate_work_authority(
         or not authority.github_provider_revision
         or not authority.mapped_issues
         or not authority.mapped_prs
-        or not authority.mapped_openspec
         or not authority.mapped_todo_paths
         or not authority.confirmed_todo
         or not authority.source_revisions
@@ -329,7 +437,7 @@ def _validate_work_authority(
         raise ValueError("confirmed WorkAuthority is incomplete")
     if (
         len(authority.mapped_prs) != 1
-        or len(authority.mapped_openspec) != 1
+        or len(authority.mapped_openspec) > 1
         or len(authority.mapped_todo_paths) != 1
     ):
         raise ValueError("confirmed WorkAuthority must have a single delivery target")
@@ -388,7 +496,7 @@ class ShipOrchestrator:
         *,
         repo: str,
         pr_number: int,
-        change: str,
+        change: str | None,
         expected_head: str,
         expected_tree_hash: str,
         authority: WorkAuthority,
@@ -472,7 +580,7 @@ class ShipOrchestrator:
         *,
         repo: str,
         pr_number: int,
-        change: str,
+        change: str | None,
         authority: WorkAuthority,
         todo_paths: tuple[str, ...],
         expected_head: str,

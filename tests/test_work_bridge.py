@@ -62,6 +62,7 @@ def _snapshot(
     path: Path,
     *,
     mapped_prs: tuple[int, ...] = (),
+    mapped_openspec: tuple[str, ...] = ("work",),
     source_revisions: tuple[str, ...] = (
         "github_issue:acme/demo#14@issue-open",
         "openspec:acme/demo:work@spec-1",
@@ -85,7 +86,7 @@ def _snapshot(
                         "work_id": "work",
                         "mapped_issues": [14],
                         "mapped_prs": list(mapped_prs),
-                        "mapped_openspec": ["work"],
+                        "mapped_openspec": list(mapped_openspec),
                         "mapped_todo_paths": ["docs/todo.md"],
                         "confirmed_todo": True,
                         "auto_label": False,
@@ -1028,6 +1029,7 @@ identities:
 
     monkeypatch.setattr(work_bridge, "run_preflight", fake_preflight)
     created = []
+    remote_closure_calls: list[dict[str, object]] = []
 
     default_head = {"value": "d" * 40}
 
@@ -1040,6 +1042,7 @@ identities:
             return 17
 
         def fetch_remote_closure(self, **kwargs):
+            remote_closure_calls.append(dict(kwargs))
             return SimpleNamespace(default_head=default_head["value"], merge_commit="e" * 40)
 
         def fetch_default_branch(self, **kwargs):
@@ -1222,6 +1225,36 @@ identities:
     assert completion_payload["sizing_score"] == 8
     assert completion_payload["sizing_band"] == "red"
     assert completion.read_completion_record(draft) == completion_payload
+
+    no_openspec_authority = work_bridge._authority_with_manager_pr(
+        load_work_authority(
+            repo="acme/demo",
+            work_id="work",
+            snapshot_path=_snapshot(
+                tmp_path / "no-openspec-snapshot.json",
+                mapped_prs=(17,),
+                mapped_openspec=(),
+                source_revisions=("github_issue:acme/demo#14@issue-open",),
+            ),
+        ),
+        17,
+    )
+    no_openspec_draft = work_bridge._completion_draft(
+        registry=registry,
+        state_root=coordinator_root,
+        run=run,
+        authority=no_openspec_authority,
+        candidate=str(run.candidate_head),
+        pr_number=17,
+        foreign_ref=foreign_ref,
+        runner=subprocess.run,
+        now=lambda: 150.0,
+    )
+    assert no_openspec_draft is not None and no_openspec_draft.is_file()
+    no_openspec_payload = json.loads(no_openspec_draft.read_text(encoding="utf-8"))
+    assert remote_closure_calls[-1]["change"] is None
+    assert no_openspec_payload["work_authority"]["mapped_openspec"] == []
+    assert no_openspec_payload["work_authority"]["change"] is None
 
     # Retry reuses the first immutable draft when only completed_at changes.
     replay = work_bridge._completion_draft(

@@ -149,7 +149,6 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
         or not mapped_prs
         or any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in mapped_prs)
         or not isinstance(mapped_openspec, list)
-        or not mapped_openspec
         or any(not isinstance(item, str) or not item for item in mapped_openspec)
         or not isinstance(mapped_todo_paths, list)
         or not mapped_todo_paths
@@ -166,14 +165,16 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
         or len(set(step_ids)) != len(step_ids)
         or not isinstance(evidence_refs, list)
         or len(mapped_prs) != 1
-        or len(mapped_openspec) != 1
+        or len(mapped_openspec) > 1
         or len(mapped_todo_paths) != 1
         or pr_number != mapped_prs[0]
-        or not isinstance(change, str)
-        or not change
-        or change != mapped_openspec[0]
         or sorted(todo_paths) != sorted(mapped_todo_paths)
     ):
+        raise ValueError("completion work_authority refs invalid")
+    if len(mapped_openspec) == 0:
+        if change is not None:
+            raise ValueError("completion work_authority refs invalid")
+    elif not isinstance(change, str) or not change or change != mapped_openspec[0]:
         raise ValueError("completion work_authority refs invalid")
     normalized_evidence: list[dict[str, str]] = []
     for item in evidence_refs:
@@ -224,7 +225,7 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
         "mapped_openspec": sorted(mapped_openspec),
         "mapped_todo_paths": sorted(mapped_todo_paths),
         "pr_number": pr_number,
-        "change": change,
+        "change": change if change is None else str(change),
         "todo_paths": sorted(todo_paths),
         "merge_commit": _normalize_git_sha(
             value.get("merge_commit"), field="work_authority.merge_commit"

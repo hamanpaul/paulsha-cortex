@@ -1707,10 +1707,11 @@ def _completion_draft(
     ):
         raise RuntimeError("workflow completion job binding malformed")
     github = GitHubDeliveryClient(runner=runner)
+    change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
     closure = github.fetch_remote_closure(
         repo=authority.repo,
         pr_number=pr_number,
-        change=authority.mapped_openspec[0],
+        change=change,
         required_issues=authority.mapped_issues,
         todo_paths=authority.mapped_todo_paths,
     )
@@ -1755,7 +1756,7 @@ def _completion_draft(
             "mapped_openspec": sorted(authority.mapped_openspec),
             "mapped_todo_paths": sorted(authority.mapped_todo_paths),
             "pr_number": pr_number,
-            "change": authority.mapped_openspec[0],
+            "change": change,
             "todo_paths": sorted(authority.mapped_todo_paths),
             "merge_commit": closure.merge_commit,
             "run_id": run.run_id,
