@@ -19,7 +19,7 @@ policy envelope 凍結 rate base、quota base、margin、倍率／上限及算�
 
 ### D2 Schema and explicit observation
 
-schema `executor-backoff/v1` 儲存 scope、canonical event map、每 identity aggregate、事件 fingerprint/ack、policy/provenance 與資料版本。terminal key 全 store 唯一；identity key 固定為 `f"{executor}/{model_id}"`，v1 明確拒絕含 `/` 的 executor/model 值，避免分隔歧義。同 key 重送先比完整 canonical envelope；缺欄位／變更 identity/time/policy/reset 皆拒絕且不覆蓋原記憶。
+schema `executor-backoff/v1` 儲存 scope、canonical event map、每 identity aggregate、事件 fingerprint/ack、policy/provenance 與資料版本。terminal key 全 store 唯一；identity 用結構化二元 key，不靠可碰撞的分隔字串。同 key 重送先比完整 canonical envelope；缺欄位／變更 identity/time/policy/reset 皆拒絕且不覆蓋原記憶。
 
 epoch/deadline/policy 數值拒絕 bool、NaN、infinity 與運算溢位，hits 為非 bool 的正整數；empty identity/key、非法 outcome/authority、fingerprint 不符與未知資料版本回 unknown。可採 reset 不早於其原解析基準時刻（Retry-After 0 可等於基準）；缺資料不默認 absent，A 不把現在時間代入驗舊事件。
 
@@ -27,7 +27,7 @@ epoch/deadline/policy 數值拒絕 bool、NaN、infinity 與運算溢位，hits 
 
 | 維度 | 值 | 禁止的推論 |
 |---|---|---|
-| store observation | missing / valid / unknown，附具體 diagnostic，並在可恢復時附同 scope persisted last-known floor | missing 或 valid 無 active ≠ quota 足夠；unknown 的 last-good/floor ≠ 獨立 admission 證據 |
+| store observation | missing / valid / unknown，附 last-good 與具體 diagnostic | missing 或 valid 無 active ≠ quota 足夠 |
 | reconciliation | unverified / pending / complete / unknown，附 missing/conflicting keys 與 caller evidence ref | 沒提供 inventory ≠ complete；可解析旧檔 ≠ 新 intent 已 ack |
 
 query `now` 只決定 active/expired，永不參與 event epoch、hits、policy 或 reset 的重建。未知輸入／IO error 回 unknown，不以 `None`、空 dict 或布林 false 混同正常無 active。`complete` 僅表示「本次 supplied、具 scope/revision/completeness 聲明的 inventory」已可靠合併；是否 canonical、fresh、retained 仍是 C/D 的外部責任，沒有通用 `allowed=true` API。
@@ -50,7 +50,7 @@ v1 使用固定 `capacity_profile=bounded-ledger/v1`；同模組所有 process �
 
 只讀 regular file，fd 上限檢查後仍使用 bounded read，避免檔案增長／stat race 令 read 無界。大小只讀到 cap+1 就能判超限；超限舊 store 回 `store-too-large` unknown，不解析尾部、不截斷或 migration。shape/token 限制在一般 JSON decoder 大配置之前以有限掃描驗證；結構化 Python input 只接受可有界遍歷的資料形狀，不接受無界 generator/custom object hook，避免驗證前 deepcopy/json.dumps。caller 已配置的記憶體不在 A 所有權內，但 A 自己不得先完整複製／展開超限 input。
 
-計算界為固定 byte/node/comparison/visit 上限；因此 retained ledger 即使永不 GC，A 單操作擁有的解碼／排序／fold／輸出配置也不隨運行歷史無限增長，不聲稱掌控外部 caller 數或 host 全域記憶體。deadline 超出回 `computation-budget-exceeded` unknown；不靠背景 worker 超時後棄置工作／另起 worker。所有可拒收的 CPU/容量檢查都在 replace 前完成，commit 後不再套新增事件拒收判定；post-replace sync failure 仍是 D3 durability-unknown，而非「零 replace」的計算超限。**事件/byte caps 與 1 秒 compute deadline 為並列硬限制，不保證在每一台主機或任意負載下都能同時跑到名目上的 1024 events / 2 MiB / 1 MiB ceiling；若先撞到 compute deadline，必須 fail-closed。** deadline 只約束可合作中止的 CPU 工作，不能宣稱能搶占阻塞的 filesystem syscall 或 OS scheduling；lock acquisition timeout 與 POSIX durability/IO 故障維持 D3 的獨立契約。
+計算界為固定 byte/node/comparison/visit 上限；因此 retained ledger 即使永不 GC，A 單操作擁有的解碼／排序／fold／輸出配置也不隨運行歷史無限增長，不聲稱掌控外部 caller 數或 host 全域記憶體。deadline 超出回 `computation-budget-exceeded` unknown；不靠背景 worker 超時後棄置工作／另起 worker。所有可拒收的 CPU/容量檢查都在 replace 前完成，commit 後不再套新增事件拒收判定；post-replace sync failure 仍是 D3 durability-unknown，而非「零 replace」的計算超限。deadline 只約束可合作中止的 CPU 工作，不能宣稱能搶占阻塞的 filesystem syscall 或 OS scheduling；lock acquisition timeout 與 POSIX durability/IO 故障維持 D3 的獨立契約。
 
 容量判斷順序：先 bounded input／fresh store validation → 同 key 完整 fingerprint/provenance 比對與去重 → 計候選 distinct union／output bytes/work budget → 單次 atomic commit。合法 store **恰達 cap** 時，size 合法的 exact duplicate 仍回 unchanged，bytes/acks/hits/deadline 不變；不得一看到 count==cap 就短路拒 duplicate。same-key 衝突仍 integrity unknown。任何新增事件使一項 cap 超出，整批回 `capacity-exceeded` unknown，不部分 ack、不更動原 bytes，也不從別 identity 刪資料騰位。若 input 自身超限或舊 store 已越安全 cap，則無法承諾辨認 duplicate，回具體 unknown，不突破讀取界。
 
@@ -64,7 +64,7 @@ writer 取得鎖後才按 D2.1 bounded read 重讀最新 state，在 byte/node/w
 
 故障切點分開驗：read／validation／temp write／temp sync／replace 前失敗保留舊檔 bytes、無新 ack；replace 失敗也不能回 success。replace 成功但後續 durability barrier 失敗時，檔案可能已是新版本，必須回 `commit-durability-unknown`，不可假稱 rollback 舊 bytes。另一 process 不得僅因新檔可解析而解除：所有 fresh valid observation 須在同 lock 內完成該 data fd/目錄所需 durability check，再由 caller 以 fresh terminal inventory 驗 ack。barrier 持續失敗即持續 unknown；barrier 恢復且全部 intent 可靠收斂才可回 valid/complete。這是明示的 store protocol，不靠可能寫不出的 error sidecar 或 process sticky flag。
 
-read permission/IO/unknown schema、lock timeout、同 key 衝突與政策 mismatch 均不會清掉別的 identity。unknown 可在可恢復時附同 scope persisted last-known floor 供 diagnostics／保守保護界使用，但它不是獨立再驗證過的 admission 證據；fresh process 拿不到可信 floor 就明說 unknown，不憑舊 reader cache 宣稱全貌。crash、sync 與 lock 行為由 POSIX 本地檔案系統 fixture 驗證，不聲稱已認證所有網路檔案系統。
+read permission/IO/unknown schema、lock timeout、同 key 衝突與政策 mismatch 均不會清掉別的 identity。last-good 只可引用同 scope、曾驗證之已知內容；fresh process 拿不到可信 last-good 就明說 unknown，不憑舊 reader cache 宣稱全貌。crash、sync 與 lock 行為由 POSIX 本地檔案系統 fixture 驗證，不聲稱已認證所有網路檔案系統。
 
 #### D3.1 Real process-death test boundary
 
@@ -120,7 +120,7 @@ fixture caller 是測試邊界，不是聲稱 C/D 已存在。A 不掃 live/inst
 | T15 R4/R7/R8 | at-cap exact duplicate→fresh process→expiry/clear→duplicate；同 key 衝突、新 distinct event | duplicate bytes/hits/deadline/acks 不變；衝突 integrity unknown；新事件 capacity unknown，未 ack intent 仍可見；先 count==cap 就拒 duplicate mutant 必紅 |
 | T16 R2/R5/R8 | 受控 byte/node/comparison/fold counter 與 fake monotonic deadline；近 cap 單操作 | 在各有限界停止、釋放鎖，超預算 unknown 且零 replace；無每新增 event 重 fold 全 ledger；忽略 counters/deadline mutant 必紅 |
 
-negative controls 在隔離測試 harness 或 disposable mutation 環境跑，記 oracle 名、失敗原因與還原；不把 mutant 提交到 production。本 child A 現已執行 focused/full pytest 與 package-level help smoke；registry/terminal provenance 與 production lane RED/GREEN 仍留後續工作。
+negative controls 在隔離測試 harness 或 disposable mutation 環境跑，記 oracle 名、失敗原因與還原；不把 mutant 提交到 production。本 authoring 不執行產品 RED/GREEN。
 
 ### D7 Sizing and acceptance
 
