@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -72,6 +73,22 @@ def test_non_object_json_store_stays_unknown(tmp_path: Path) -> None:
 
     store_path = tmp_path / "executor-backoff-state.json"
     store_path.write_text('["not-an-object"]', encoding="utf-8")
+
+    observed = executor_backoff.read_store(store_path)
+    observation = observed.observation
+    if not isinstance(observation, str):
+        observation = observation.value
+
+    assert observation == "unknown"
+    assert observed.payload is None
+    assert observed.diagnostics
+
+
+def test_fifo_store_stays_unknown_without_blocking(tmp_path: Path) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    store_path = tmp_path / "executor-backoff-state.json"
+    os.mkfifo(store_path)
 
     observed = executor_backoff.read_store(store_path)
     observation = observed.observation

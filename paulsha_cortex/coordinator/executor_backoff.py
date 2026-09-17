@@ -8,6 +8,7 @@ corrupt persisted state.
 from __future__ import annotations
 
 import json
+import stat
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -35,11 +36,23 @@ def _unknown(*diagnostics: str) -> StoreRead:
 def read_store(store_path: str | Path) -> StoreRead:
     path = Path(store_path)
     try:
-        path.lstat()
+        path_info = path.lstat()
     except FileNotFoundError:
         return StoreRead(observation=StoreObservation.MISSING)
     except OSError as error:
         return _unknown(f"unable to stat executor backoff store: {error}")
+
+    if stat.S_ISLNK(path_info.st_mode):
+        try:
+            target_info = path.stat()
+        except FileNotFoundError:
+            return _unknown("executor backoff store symlink target is missing")
+        except OSError as error:
+            return _unknown(f"unable to stat executor backoff store target: {error}")
+        if not stat.S_ISREG(target_info.st_mode):
+            return _unknown("executor backoff store symlink target must be a regular file")
+    elif not stat.S_ISREG(path_info.st_mode):
+        return _unknown("executor backoff store must be a regular file")
 
     try:
         raw = path.read_bytes()
