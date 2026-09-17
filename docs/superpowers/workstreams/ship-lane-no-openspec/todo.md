@@ -50,7 +50,7 @@ work_item: ship-lane-no-openspec
 
 ## Tasks
 
-- [ ] **T1 tests／RED**：新增 `tests/test_ship_lane_no_openspec_911.py`。以 `mapped_prs=(N,)`、
+- [x] **T1 tests／RED**：新增 `tests/test_ship_lane_no_openspec_911.py`。以 `mapped_prs=(N,)`、
       `mapped_openspec=()`、`mapped_todo_paths=(todo,)` 的 authority 呼叫 `_ship_action(change=None)`，
       現行必須回 `needs_human: multiple-delivery-targets-unsupported`（RED 基線）；同 authority 呼叫
       `_review_attest_action` 現行必須 IndexError／RuntimeError（RED 基線）。修後：(a) `_ship_action`
