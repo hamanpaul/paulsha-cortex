@@ -368,7 +368,7 @@ def _write_review_log(review_job: dict, payload: dict) -> Path:
     return log_path
 
 
-def test_terminalize_review_requires_authority_hashes_echo(tmp_path: Path) -> None:
+def test_terminalize_review_backfills_missing_authority_hashes_echo(tmp_path: Path) -> None:
     registry, run, review_job, report_ref, digest, plan_ref, coordinator_root = (
         _review_terminalize_fixture(tmp_path)
     )
@@ -384,10 +384,17 @@ def test_terminalize_review_requires_authority_hashes_echo(tmp_path: Path) -> No
     )
     registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
 
-    with pytest.raises(ValueError, match="workflow review terminal schema invalid"):
-        manager.terminalize_workflow_job(
-            registry, job_id=review_job["job_id"], coordinator_root=coordinator_root,
-        )
+    bound = manager.terminalize_workflow_job(
+        registry, job_id=review_job["job_id"], coordinator_root=coordinator_root,
+    )
+    evidence, _outputs, _path, _digest = manager._read_job_workflow_evidence(
+        bound,
+        run=run,
+        coordinator_root=coordinator_root,
+        include_review_authority_metadata=True,
+    )
+    assert evidence["authority_hashes"] == {plan_ref: digest}
+    assert evidence["authority_hashes_source"] == "manager-snapshot"
 
 
 def test_terminalize_review_rejects_drifted_authority_hashes_echo(tmp_path: Path) -> None:

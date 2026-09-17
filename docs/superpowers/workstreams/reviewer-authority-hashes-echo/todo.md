@@ -28,25 +28,25 @@ Manager 端 `expected_authority_hashes` 與 prompt 給模型的值同源（job `
 
 ## Tasks
 
-- [ ] **T1 tests／RED**：新增 `tests/test_review_authority_hashes_echo_922.py`：以帶 `planning-authority`
+- [x] **T1 tests／RED**：新增 `tests/test_review_authority_hashes_echo_922.py`：以帶 `planning-authority`
       snapshot 的 review job，terminal envelope（a）缺 `authority_hashes`、其餘合法且 findings 空，
       現行必須 `ValueError("workflow review terminal schema invalid")`（RED 基線）；（b）帶正確值；
       （c）帶錯誤值；（d）帶部分鍵。修後：(a) 採信、verdict payload 的 `authority_hashes` 由 Manager 依
       job snapshot 補齊並標 `authority_hashes_source: "manager-snapshot"`；(b) 採信且 source 為
       `reviewer-echo`；(c)(d) 維持 fail-closed 且錯誤訊息點名不符的 path。
-- [ ] **T2 source／採信端**：`terminalize_workflow_job` review 分支把 `authority_hashes` 從 exact
+- [x] **T2 source／採信端**：`terminalize_workflow_job` review 分支把 `authority_hashes` 從 exact
       key-set 的必要鍵改為選填：缺席時以 `expected_authority_hashes` 補進 `verdict_payload`／evidence，
       有帶時沿既有精確比對；`_fold_agy_key_value_map` 路徑不變。不得影響 verify 分支。
-- [ ] **T3 source／prompt 端**：review 卡 `terminal_schema` 保留 `authority_hashes` 於 `fixed`（期望值
+- [x] **T3 source／prompt 端**：review 卡 `terminal_schema` 保留 `authority_hashes` 於 `fixed`（期望值
       仍提供），但從 `required` 移除並註明「缺席時由 Manager 以 snapshot 補齊；帶值必須逐字相符」；
       更新原「實測 2/2 省略」註解為本票結論。無 planning-authority 時 prompt 逐字不變。
-- [ ] **T4 source／診斷**：review terminal 採信失敗（任何 `ValueError`）落到 run 的
+- [x] **T4 source／診斷**：review terminal 採信失敗（任何 `ValueError`）落到 run 的
       `resume-workflow-failed`／`terminalize-workflow-job-failed` diagnostic 時，context 附
       `envelope_keys`（排序）、`findings_count`、`reason_head`（≤200 字）與 `job_log_path`；
       內容不可解析時附 `envelope_parse_error`。不改既有 reason 字串。
-- [ ] **T5 tests／回歸**：`tests/test_terminal_result_contract.py`、`tests/test_workflow_production_wiring.py`
+- [x] **T5 tests／回歸**：`tests/test_terminal_result_contract.py`、`tests/test_workflow_production_wiring.py`
       與其他 review terminal 相關測試維持綠燈；補 T4 的 diagnostic 斷言；non-passing `status`
       仍被攔截。
-- [ ] **T6 documentation**：`docs/unified-work-lifecycle.md` 的 review 採信段補「`authority_hashes`
+- [x] **T6 documentation**：`docs/unified-work-lifecycle.md` 的 review 採信段補「`authority_hashes`
       缺席由 Manager 補齊、帶值必須相符」一句；新增 `changelog.d/reviewer-authority-hashes-echo.md`
       並同步 `CHANGELOG.md [Unreleased]`。

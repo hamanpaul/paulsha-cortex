@@ -707,7 +707,15 @@ def _normalize_authority_hashes(value: object, *, expected: Mapping[str, str]) -
     if not isinstance(value, dict):
         raise ValueError("review verdict authority_hashes must be an object")
     if set(value) != set(expected):
-        raise ValueError("review verdict authority_hashes ref set mismatch")
+        missing = sorted(set(expected) - set(value))
+        extra = sorted(set(value) - set(expected))
+        detail: list[str] = []
+        if missing:
+            detail.append("missing: " + ", ".join(missing))
+        if extra:
+            detail.append("extra: " + ", ".join(extra))
+        suffix = f" ({'; '.join(detail)})" if detail else ""
+        raise ValueError(f"review verdict authority_hashes ref set mismatch{suffix}")
     normalized: dict[str, str] = {}
     for ref, expected_hash in expected.items():
         claimed_hash = value.get(ref)
