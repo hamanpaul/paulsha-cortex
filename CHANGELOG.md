@@ -7,12 +7,18 @@
 
 ## [Unreleased]
 
-- **#850 executor backoff store strict reader**：新增
-  `paulsha_cortex/coordinator/executor_backoff.py` 與 package export，先交付最小 strict
-  reader surface：缺檔明確回 `missing`，corrupt persisted bytes／UTF-8／JSON／
-  non-object payload 與 read faults 皆回 `unknown` 並附 diagnostics，讓
-  `tests/test_executor_backoff.py` focused regression 轉綠；schema v1／atomic RMW／
-  bounded capacity／immutable fold／reconciliation lane 仍待後續卡片。
+- **#850 executor backoff store core**：擴充既有
+  `paulsha_cortex/coordinator/executor_backoff.py` 與
+  `tests/test_executor_backoff.py`，把最初的 strict-reader 骨架補成單模組
+  `executor-backoff/v1` store：strict
+  three-state reader、scope validation、stable root-scoped `flock`、fresh
+  read-modify-write、temp fsync＋atomic replace＋directory barrier、exact
+  terminal-key ack ledger、caller-supplied outcome payload fingerprint／authority／
+  evidence ref／parsed reset metadata 驗證、fixture inventory reconciliation seam
+  （`unverified`/`pending`/`complete`/`unknown`）、bounded `bounded-ledger/v1`
+  容量檢查，以及依 event-time 穩定排序的 immutable fold。active clear 會以
+  `active-cooldown` 拒絕，expired replay 保持冪等且不釋放 ledger 額度；production
+  caller inventory sourcing 與 workflow/slice lane 接線仍由 #825 後續 child 承接。
 
 - **#911 ship lane 無 openspec 交付模式**：ship lane 現在接受 `mapped_openspec == ()` 的合法交付模式；
   `_ship_action`／delivery binding／GitHub facts／remote closure／CompletionRecord 全面支援 `change=None`，

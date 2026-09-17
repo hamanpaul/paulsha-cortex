@@ -37,16 +37,22 @@
   - [x] RED：新增 `tests/test_coordinator_launcher_session.py`，鎖定 shared Popen kwargs 的 `start_new_session=True`、Claude stdin 保留，以及五個 executor 的 direct launch recording。
   - [x] GREEN：在 launcher 共用 helper 實作並接入所有 headless Popen；保留 runner override、Claude stdin-only retry 與固定 fake 相容性。
 - [ ] 2.8 完成 #825 最小 durable backoff，所有 lane 與 corrupt-state/expiry 可測；不標 R05 完成。
-- [ ] 2.8.1 先依 #850 有界 store／immutable event-fold child 交付 component；C/D provenance、reconciliation 與所有 lane 接線仍由 #825 後續 child 承接。
+- [x] 2.8.1 依 #850 交付單模組 executor backoff store component：`executor-backoff/v1`
+  strict reader、root-scoped `flock`、fresh RMW、temp fsync＋atomic replace＋directory
+  barrier、scope validation、exact ack ledger、caller-supplied payload fingerprint／
+  authority 驗證、fixture inventory reconciliation seam、bounded
+  `bounded-ledger/v1` 容量檢查，以及 immutable event-time fold。production caller
+  inventory sourcing 與所有 lane 接線仍由 #825 後續 child 承接。
   - [x] RED：新增 `tests/test_executor_backoff.py` focused regression，鎖定 strict reader
     遇到 corrupt persisted bytes 時必須回報 `unknown` observation 並附 diagnostics、
     不可降級成 `missing`；目前 `paulsha_cortex.coordinator.executor_backoff` 尚未實作，
     故此卡維持 RED，bounded store／immutable fold／lane 接線仍待後續卡片。
-  - [x] GREEN：新增 `paulsha_cortex/coordinator/executor_backoff.py` 與 package
-    export，交付最小 strict reader surface：缺檔回 `missing`，corrupt persisted
-    bytes／UTF-8／invalid JSON／non-object payload 與 read faults 回 `unknown` 並附
-    diagnostics，focused `tests/test_executor_backoff.py` 轉綠；schema v1／bounded capacity／
-    atomic RMW／reconciliation／retention 與完整 immutable fold 仍待後續卡片。
+  - [x] GREEN：完成 `paulsha_cortex/coordinator/executor_backoff.py` 與
+    `tests/test_executor_backoff.py` 的 store-core 擴充，交付 `executor-backoff/v1` strict three-state
+    reader、scope/immutable payload 驗證、fixture inventory reconciliation seam、
+    exact terminal-key ack ledger、event-time fold/max-deadline、quota>rate base、
+    active clear 拒絕、expired replay 不復活、bounded resource checks、cross-process
+    lock/atomicity 與 K0/K1/K2 process-death regression；focused/full pytest 皆已通過。
 - [ ] 2.9 以實際已載入 revision 驗 B1 成效，退出暫時 bypass 前保存 active jobs 與 rollback 方案。
 - [ ] 2.10 由 #847 區分可信 frozen 自發布 metadata 等價與真 authority 變更；前者保持 needs_human/gates/attempt/model binding 且零 spawn，後者仍走合法 restart，缺 provenance 不豁免。
 - [ ] 2.11 依 #860 交付 terminal JSONL 實體 LF／CRLF 分界、合法 Unicode／雙層序列化保真與不可變重播；維持既有 carrier/schema/claim-era 採信，不以 parser-only proof 關閉 R13／R06。
