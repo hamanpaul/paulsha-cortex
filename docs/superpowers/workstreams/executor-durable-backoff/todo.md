@@ -22,6 +22,10 @@ artifact_classes:
   任務用量預估、reservation、動態 model／agent／effort 選擇由 refine plan 後續
   工作實作。本票的 identity key 不能代表不同模型具有獨立帳號額度；#825 完成不等於
   完整第5類問題完成，也不授權降低品質或突破 pin／independence-domain。
+- 拆分紀錄（2026-09-17，#831 落地後實跑重評仍 Red 8）：A store 本體 → #850 `executor-backoff-store-core`；
+  C＋D＋parser（終局記錄、對帳 seam、reset hint、workflow admission）→ #928 `executor-backoff-terminal-admission`；
+  E＋F（slice admission、request／tick consumers）→ #929 `executor-backoff-slice-consumers`。三者依序落地後本票只剩
+  收尾核對（R9 residual 另由 quota work item 承接），不再整包派工。
 
 ## Tasks
 
