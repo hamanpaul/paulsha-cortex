@@ -1,4 +1,4 @@
-"""#850: executor backoff store strict reader must not collapse corrupt state into missing."""
+"""#850: executor backoff store strict reader state classification coverage."""
 
 from __future__ import annotations
 
