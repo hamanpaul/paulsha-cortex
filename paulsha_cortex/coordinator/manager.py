@@ -4378,6 +4378,7 @@ TERMINAL_MODEL_DIAGNOSTICS_LIMIT = 2000
 
 # 單一 diagnostics key 的長度上限；key 同樣是模型寫的，不能無界。
 TERMINAL_MODEL_DIAGNOSTICS_KEY_LIMIT = 64
+_REVIEW_TERMINAL_DIAGNOSTIC_CONTEXT_ATTR = "_workflow_review_terminal_diagnostic_context"
 
 
 def _model_terminal_diagnostics(
@@ -4420,6 +4421,60 @@ def _model_terminal_diagnostics(
             kept = f"{kept}…"
         rows.append((key.strip()[:TERMINAL_MODEL_DIAGNOSTICS_KEY_LIMIT], kept))
     return tuple(rows)
+
+
+def _review_terminal_reason_head(value: object) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return ""
+    head = " ".join(text.split())
+    if len(head) > 200:
+        return head[:200].rstrip() + "…"
+    return head
+
+
+def _review_terminal_failure_context(job: Mapping[str, object]) -> dict[str, str]:
+    context: dict[str, str] = {}
+    log_path = job.get("log_path")
+    if isinstance(log_path, str) and log_path:
+        context["job_log_path"] = log_path
+    try:
+        raw = _extract_terminal_json(log_path)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must fail-soft
+        context["envelope_parse_error"] = summarize_exception(exc)
+        return context
+    context["envelope_keys"] = json.dumps(
+        sorted(str(key) for key in raw),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    findings = raw.get("findings")
+    context["findings_count"] = str(len(findings)) if isinstance(findings, list) else "<invalid>"
+    context["reason_head"] = _review_terminal_reason_head(raw.get("reason")) or "<missing>"
+    return context
+
+
+def _attach_review_terminal_diagnostic_context(
+    error: BaseException,
+    *,
+    job: Mapping[str, object],
+) -> dict[str, str]:
+    if not isinstance(error, ValueError):
+        return {}
+    context = _review_terminal_failure_context(job)
+    setattr(error, _REVIEW_TERMINAL_DIAGNOSTIC_CONTEXT_ATTR, context)
+    return context
+
+
+def _review_terminal_diagnostic_context_from_error(error: BaseException) -> dict[str, str]:
+    context = getattr(error, _REVIEW_TERMINAL_DIAGNOSTIC_CONTEXT_ATTR, None)
+    if not isinstance(context, Mapping):
+        return {}
+    return {str(key): str(value) for key, value in context.items() if value is not None}
 
 
 def _terminal_parse_diagnostics(
@@ -6752,13 +6807,11 @@ def terminalize_workflow_job(
             if isinstance(row, dict) and row.get("authority") == "planning-authority"
         }
         required = {"schema_version", "kind", "reason", "findings", "reports"}
-        if expected_authority_hashes:
-            required = required | {"authority_hashes"}
-            if "authority_hashes" in raw:
-                raw = {
-                    **raw,
-                    "authority_hashes": _fold_agy_key_value_map(raw["authority_hashes"]),
-                }
+        if expected_authority_hashes and "authority_hashes" in raw:
+            raw = {
+                **raw,
+                "authority_hashes": _fold_agy_key_value_map(raw["authority_hashes"]),
+            }
         # #261 R1：review card 同樣必須能誠實回報 failed／needs_human。status 是
         # canonical envelope 的選填欄位（review verdict 本身由 findings 決定），
         # 在此先取出並攔截非通過狀態，再做既有的 exact key-set 驗證。
@@ -6771,8 +6824,9 @@ def terminalize_workflow_job(
             if declared_review_status != "passed":
                 raise ValueError("workflow review terminal schema invalid")
             raw = {key: value for key, value in raw.items() if key != "status"}
+        allowed_keys = required | ({"authority_hashes"} if expected_authority_hashes else set())
         if (
-            set(raw) != required
+            set(raw) not in (required, allowed_keys)
             or raw.get("schema_version") != 1
             or raw.get("kind") != "workflow-review-result"
             or not isinstance(raw.get("reason"), str)
@@ -6806,7 +6860,10 @@ def terminalize_workflow_job(
             "findings": raw["findings"],
         }
         if expected_authority_hashes:
-            verdict_payload["authority_hashes"] = raw.get("authority_hashes")
+            if "authority_hashes" in raw:
+                verdict_payload["authority_hashes"] = raw["authority_hashes"]
+            else:
+                verdict_payload["authority_hashes"] = dict(expected_authority_hashes)
         verdict = foreign_review.validate_review_verdict(
             verdict_payload,
             builder_job_id=builder_job_id,
@@ -6993,7 +7050,16 @@ def _read_job_workflow_evidence(
     *,
     run,
     coordinator_root: str | Path,
+    include_review_authority_metadata: bool = False,
 ) -> tuple[dict[str, object], tuple[str, ...], str, str]:
+    """Read canonical workflow evidence.
+
+    `include_review_authority_metadata` is a read-time convenience for the
+    review lane only: it re-attaches Manager-derived `authority_hashes` and the
+    reviewer-vs-manager source marker without changing the durable gate
+    evaluation schema on disk.
+    """
+
     locator = job.get("workflow_evidence")
     if not isinstance(locator, dict) or set(locator) != {"kind", "path", "hash"}:
         raise ValueError("workflow job has no canonical evidence locator")
@@ -7092,7 +7158,28 @@ def _read_job_workflow_evidence(
         elif hashlib.sha256(artifact_bytes).hexdigest() != expected_hash:
             raise ValueError("workflow canonical artifact drift")
         refs.append(ref)
-    return payload["payload"], tuple(refs), str(path), digest
+    evidence_payload = dict(payload["payload"])
+    if include_review_authority_metadata and job.get("workflow_phase") == "review":
+        expected_authority_hashes = {
+            str(row["path"]): str(row["sha256"])
+            for row in expected_job.get("input_snapshot", [])
+            if isinstance(row, dict)
+            and row.get("authority") == "planning-authority"
+            and isinstance(row.get("path"), str)
+            and isinstance(row.get("sha256"), str)
+        }
+        if expected_authority_hashes:
+            evidence_payload["authority_hashes"] = expected_authority_hashes
+            try:
+                raw_review_terminal = _extract_terminal_json(job.get("log_path"))
+            except Exception:  # noqa: BLE001 - evidence read must stay backward-compatible
+                raw_review_terminal = None
+            evidence_payload["authority_hashes_source"] = (
+                "reviewer-echo"
+                if isinstance(raw_review_terminal, dict) and "authority_hashes" in raw_review_terminal
+                else "manager-snapshot"
+            )
+    return evidence_payload, tuple(refs), str(path), digest
 
 
 def _workflow_report_cleanup_allows_missing(
@@ -9405,18 +9492,14 @@ def _workflow_job_prompt(
         terminal_schema = {
             "kind": "workflow-review-result",
             "schema_version": 1,
-            "required": [
-                "schema_version", "kind", "reason", "findings", "reports",
-                *(["authority_hashes"] if authority_hashes_expected else []),
-            ],
+            "required": ["schema_version", "kind", "reason", "findings", "reports"],
             "fixed": {
                 "schema_version": 1,
                 "kind": "workflow-review-result",
-                # #315 補遺 2：sonnet reviewer 對「actually opened」措辭的條件性
-                # 解讀會整組省略 authority_hashes（實測 2/2）。expected 值由
-                # manager 原樣提供，列入 fixed 要求逐字照抄——照抄本身即攻證
-                # 「收到的 frozen authority 與 pinned hash 一致」；harvest 端
-                # 的精確比對不變。
+                # #922：這個欄位和 manager 的 expected snapshot 同源；prompt 端
+                # 保留 expected 值讓模型能逐字照抄，但缺席時改由 Manager 以
+                # pinned snapshot 補齊。模型若有帶值，harvest 端仍逐字精確比對，
+                # 任何 drift 一律 fail closed。
                 **(
                     {"authority_hashes": dict(authority_hashes_expected)}
                     if authority_hashes_expected
@@ -9446,10 +9529,10 @@ def _workflow_job_prompt(
         if authority_hashes_expected:
             terminal_schema["authority_hashes"] = {
                 "description": (
-                    "MANDATORY: copy the expected mapping below verbatim into the "
-                    "authority_hashes field of your terminal JSON. It attests the frozen "
-                    "planning authority you received; the verdict is rejected if the field "
-                    "is missing or differs in any way."
+                    "OPTIONAL echo: if you include authority_hashes, copy the expected "
+                    "mapping below verbatim. If the field is absent, the Manager backfills "
+                    "it from the pinned input snapshot; any supplied value must match "
+                    "exactly or the verdict is rejected."
                 ),
                 "expected": dict(authority_hashes_expected),
             }
@@ -11309,6 +11392,11 @@ def resume_workflow_run(
             coordinator_root=coordinator_root,
         )
     except Exception as exc:
+        review_terminal_context = (
+            _attach_review_terminal_diagnostic_context(exc, job=job)
+            if step.phase == "review"
+            else {}
+        )
         _discard_reviewer_sandbox(
             registry.get_job(str(job["job_id"])),
             coordinator_root=coordinator_root,
@@ -11327,6 +11415,7 @@ def resume_workflow_run(
                 work_id=run.work_id,
                 job_id=str(job["job_id"]),
                 card=step.card,
+                **review_terminal_context,
             ),
         )
         raise

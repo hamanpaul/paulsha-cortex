@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from paulsha_cortex.coordinator import manager
+from paulsha_cortex.coordinator import manager, manager_daemon
+from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority, WorkflowStep
 from paulsha_cortex.deck.compile import compile_combo
@@ -173,6 +174,7 @@ def _terminalize_review(
         bound,
         run=run,
         coordinator_root=coordinator_root,
+        include_review_authority_metadata=True,
     )
     return evidence, outputs, report_ref, expected_authority_hashes
 
@@ -215,6 +217,7 @@ def test_terminalize_review_marks_reviewer_echo_source_when_authority_hashes_mat
         bound,
         run=run,
         coordinator_root=coordinator_root,
+        include_review_authority_metadata=True,
     )
     assert outputs == (report_ref,)
     assert evidence["authority_hashes"] == expected_authority_hashes
@@ -274,6 +277,150 @@ def test_terminalize_review_rejects_partial_authority_hashes_with_path(tmp_path:
     registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
 
     with pytest.raises(ValueError, match=rf"authority_hashes ref set mismatch.*{re.escape(missing_ref)}"):
+        manager.terminalize_workflow_job(
+            registry, job_id=review_job["job_id"], coordinator_root=coordinator_root
+        )
+
+
+def test_review_prompt_keeps_authority_hashes_fixed_but_not_required(tmp_path: Path) -> None:
+    registry, run, review_job, _report_ref, expected_authority_hashes, coordinator_root = (
+        _review_terminalize_fixture(tmp_path)
+    )
+    review_step = next(step for step in run.steps if step.card == "code-review")
+    prompt = manager._workflow_job_prompt(
+        run,
+        review_step,
+        builder_job_id=str(review_job["workflow_builder_job_id"]),
+        coordinator_root=coordinator_root,
+        input_snapshot=tuple(review_job["workflow_input_snapshot"]),
+    )
+    contract = json.loads(prompt.split("Contract: ", 1)[1])
+    schema = contract["terminal_schema"]
+
+    assert schema["required"] == ["schema_version", "kind", "reason", "findings", "reports"]
+    assert schema["fixed"]["authority_hashes"] == expected_authority_hashes
+    assert schema["authority_hashes"]["expected"] == expected_authority_hashes
+    assert "Manager backfills" in schema["authority_hashes"]["description"]
+    assert "must match exactly" in schema["authority_hashes"]["description"]
+
+
+class _ResumeDispatcher:
+    def __init__(self, registry: JobRegistry) -> None:
+        self._registry = registry
+
+    def poll_headless_done(self, job_id: str) -> dict:
+        return self._registry.get_job(job_id)
+
+
+def test_resume_workflow_run_records_review_terminal_context(tmp_path: Path) -> None:
+    registry, run, review_job, report_ref, expected_authority_hashes, coordinator_root = (
+        _review_terminalize_fixture(tmp_path)
+    )
+    ordered_refs = sorted(expected_authority_hashes)
+    missing_ref = ordered_refs[-1]
+    partial = {ordered_refs[0]: expected_authority_hashes[ordered_refs[0]]}
+    log_path = _write_review_log(
+        review_job,
+        {
+            "schema_version": 1,
+            "kind": "workflow-review-result",
+            "reason": "accepted",
+            "findings": [],
+            "reports": [{"path": report_ref, "body": "# Review\n\nPassed.\n"}],
+            "authority_hashes": partial,
+        },
+    )
+    registry.attach_launch_handle(
+        review_job["job_id"], executor="claude", model_id="reviewer", log_path=str(log_path)
+    )
+    registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
+
+    with pytest.raises(ValueError, match=rf"authority_hashes ref set mismatch.*{re.escape(missing_ref)}"):
+        manager.resume_workflow_run(
+            _ResumeDispatcher(registry),
+            run_id=run.run_id,
+            identities=IdentityRegistry.from_rows([]),
+            launcher_factory=lambda identity: identity,
+            coordinator_root=coordinator_root,
+            operator_resume=True,
+        )
+
+    reason = registry.get_workflow_run(run.run_id).needs_human_reason
+    assert reason is not None
+    assert reason["reason"] == "terminalize-workflow-job-failed"
+    assert reason["context"]["job_log_path"] == str(log_path)
+    assert reason["context"]["envelope_keys"] == json.dumps(
+        sorted(["authority_hashes", "findings", "kind", "reason", "reports", "schema_version"]),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    assert reason["context"]["findings_count"] == "0"
+    assert reason["context"]["reason_head"] == "accepted"
+
+
+def test_periodic_resume_surfaces_review_terminal_parse_context(tmp_path: Path) -> None:
+    registry, run, review_job, _report_ref, _expected_authority_hashes, _coordinator_root = (
+        _review_terminalize_fixture(tmp_path)
+    )
+    log_path = Path(review_job["worktree"]) / f"{review_job['job_id']}.jsonl"
+    log_path.write_text("not json at all\n", encoding="utf-8")
+    registry.attach_launch_handle(
+        review_job["job_id"], executor="claude", model_id="reviewer", log_path=str(log_path)
+    )
+    registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
+
+    periodic = manager_daemon.build_periodic_tick_runner(
+        dispatcher=_ResumeDispatcher(registry),
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=object(),
+        run_tick_fn=lambda *args, **kwargs: {
+            "dispatch_skipped": False,
+            "dispatched": [],
+            "completed": [],
+            "errors": [],
+            "reaped": None,
+        },
+        scan_specs_fn=lambda _specs_dir: [],
+        auto_claim_fn=lambda: [],
+        workflow_identity_registry=IdentityRegistry.from_rows([]),
+    )
+    periodic()
+
+    reason = registry.get_workflow_run(run.run_id).needs_human_reason
+    assert reason is not None
+    assert reason["reason"] == "resume-workflow-failed"
+    assert reason["context"]["job_log_path"] == str(log_path)
+    assert "workflow terminal log has no JSON evidence" in reason["context"]["envelope_parse_error"]
+
+
+@pytest.mark.parametrize("status", ["failed", "needs_human"])
+def test_review_terminal_nonpassing_status_is_still_rejected(
+    tmp_path: Path, status: str
+) -> None:
+    registry, _run, review_job, report_ref, _expected_authority_hashes, coordinator_root = (
+        _review_terminalize_fixture(tmp_path)
+    )
+    log_path = _write_review_log(
+        review_job,
+        {
+            "schema_version": 1,
+            "kind": "workflow-review-result",
+            "status": status,
+            "reason": "accepted",
+            "findings": [],
+            "reports": [{"path": report_ref, "body": "# Review\n\nPassed.\n"}],
+        },
+    )
+    registry.attach_launch_handle(
+        review_job["job_id"], executor="claude", model_id="reviewer", log_path=str(log_path)
+    )
+    registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"workflow review terminal reported non-passing status: {status}",
+    ):
         manager.terminalize_workflow_job(
             registry, job_id=review_job["job_id"], coordinator_root=coordinator_root
         )

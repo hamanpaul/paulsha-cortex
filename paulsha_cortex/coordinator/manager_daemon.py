@@ -1184,6 +1184,7 @@ def build_periodic_tick_runner(
                             "source_revision": workflow.source_revision,
                         },
                     )
+                    review_terminal_context = manager._review_terminal_diagnostic_context_from_error(exc)
                     # #527 的根因就在這三行：例外只被 `_log_error` print 到
                     # stderr，而 stderr 由 `service-manager.sh` 導向
                     # `~/.agents/log/manager.log`——不進 journal、不進 evidence、
@@ -1206,6 +1207,7 @@ def build_periodic_tick_runner(
                             work_id=workflow.work_id,
                             repo=workflow.repo,
                             phase=workflow.current_phase,
+                            **review_terminal_context,
                         ),
                     )
         metas = scan_specs_fn(specs_dir)

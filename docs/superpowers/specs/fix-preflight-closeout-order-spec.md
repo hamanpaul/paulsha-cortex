@@ -52,7 +52,7 @@ materialization 紀錄 MUST 含相對路徑、content sha256、source revision�
 
 ### R5 reviewer verdict 必須回填 attestation 且不符 fail-closed
 
-run 有 planning authority 時，reviewer terminal MUST 回填 `authority_hashes`（`manager.py:4221-4283` 的 expected_authority_hashes 驗證、`review.py:364-375` 的 `_normalize_authority_hashes`）；缺漏、ref 集不一致或 hash drift MUST fail closed 拒絕 verdict，MUST NOT 接受 PASS。materialization 紀錄缺失時同樣 MUST NOT 接受 PASS。
+run 有 planning authority 時，reviewer terminal 若回填 `authority_hashes`，MUST 與 Manager 提供的 expected mapping 逐字一致（`manager.py` 的 expected_authority_hashes 驗證、`review.py` 的 `_normalize_authority_hashes`）；欄位缺席時，Manager 只可用同一份 frozen input snapshot 補齊，不得以其他來源推定。ref 集不一致或 hash drift MUST fail closed 拒絕 verdict，MUST NOT 接受 PASS。materialization 紀錄缺失時同樣 MUST NOT 接受 PASS。
 
 ### R6 untracked overlay 不得成為隱形 authority
 

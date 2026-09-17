@@ -11,6 +11,13 @@
   （T1–T6：採信端改選填＋Manager 以 snapshot 補齊、prompt 端移出 required、採信失敗 diagnostic 補 envelope 摘要）。
   docs-only 進件。
 
+- **#922 reviewer authority_hashes 回聲補齊**：review terminal 缺 `authority_hashes` 時，Manager 改以同一份
+  pinned planning-authority snapshot 補齊 review verdict；review evidence 的讀取面會標
+  `authority_hashes_source=manager-snapshot` 或 `reviewer-echo`，而持久化 gate evaluation schema 不變。
+  reviewer 若有回填則仍必須逐字相符，drift 或部分鍵照舊 fail-closed。review 卡 prompt 同步把
+  `authority_hashes` 從 `required` 移除但保留 expected mapping，`terminalize-workflow-job-failed` 與
+  `resume-workflow-failed` 診斷另補 envelope keys／findings 數／reason 摘要／job log 路徑與 parse error。
+
 - **#826 outcome taxonomy signals**：新增 `effort_not_supported`／`executable_not_found`／`launch_failed`
   failure 詞彙與環境類 family 映射；structured terminal／interruption 仍優先於可信 `exit 127`
   與文字訊號，`not found` 只有在已知 launcher／executor 的 shell command-not-found、同一行帶
