@@ -17,7 +17,7 @@ __all__ = ["StoreObservation", "StoreRead", "read_store"]
 
 class StoreObservation(str, Enum):
     MISSING = "missing"
-    PRESENT = "present"
+    VALID = "valid"
     UNKNOWN = "unknown"
 
 
@@ -58,4 +58,4 @@ def read_store(store_path: str | Path) -> StoreRead:
             "executor backoff store payload must be a JSON object, "
             f"got {type(payload).__name__}"
         )
-    return StoreRead(observation=StoreObservation.PRESENT, payload=payload)
+    return StoreRead(observation=StoreObservation.VALID, payload=payload)

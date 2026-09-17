@@ -42,6 +42,11 @@
     遇到 corrupt persisted bytes 時必須回報 `unknown` observation 並附 diagnostics、
     不可降級成 `missing`；目前 `paulsha_cortex.coordinator.executor_backoff` 尚未實作，
     故此卡維持 RED，bounded store／immutable fold／lane 接線仍待後續卡片。
+  - [x] GREEN：新增 `paulsha_cortex/coordinator/executor_backoff.py` 與 package
+    export，交付最小 strict reader surface：缺檔回 `missing`，corrupt persisted
+    bytes／UTF-8／JSON/object payload 與 read faults 回 `unknown` 並附 diagnostics，
+    focused `tests/test_executor_backoff.py` 轉綠；schema v1／atomic RMW／
+    reconciliation／retention 與完整 immutable fold 仍待後續卡片。
 - [ ] 2.9 以實際已載入 revision 驗 B1 成效，退出暫時 bypass 前保存 active jobs 與 rollback 方案。
 - [ ] 2.10 由 #847 區分可信 frozen 自發布 metadata 等價與真 authority 變更；前者保持 needs_human/gates/attempt/model binding 且零 spawn，後者仍走合法 restart，缺 provenance 不豁免。
 - [ ] 2.11 依 #860 交付 terminal JSONL 實體 LF／CRLF 分界、合法 Unicode／雙層序列化保真與不可變重播；維持既有 carrier/schema/claim-era 採信，不以 parser-only proof 關閉 R13／R06。
