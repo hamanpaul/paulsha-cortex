@@ -71,6 +71,17 @@ def test_delivery_gate_accepts_typed_maintainer_review_without_copilot() -> None
     assert blocked.reasons == ("review-thread-open",)
 
 
+def test_delivery_gate_skips_openspec_reasons_when_no_openspec_is_required() -> None:
+    facts = replace(
+        _facts(),
+        active_openspec_absent=False,
+        archive_present=False,
+        openspec_required=False,
+    )
+
+    assert evaluate_delivery_gate(facts=facts, policy=_policy()).allowed
+
+
 @pytest.mark.parametrize(
     ("facts", "reason"),
     (
@@ -290,6 +301,30 @@ def test_remote_closure_is_strict_conjunction() -> None:
 
     assert not evaluate_remote_closure(
         facts=replace(facts, merge_parents=("1" * 40, "2" * 40)),
+        required_issues=(14,),
+        expected_head=HEAD,
+    ).allowed
+
+
+def test_remote_closure_skips_openspec_reasons_when_no_openspec_is_required() -> None:
+    facts = RemoteClosureFacts(
+        merge_commit="c" * 40,
+        pr_head=HEAD,
+        merge_parents=("1" * 40, HEAD),
+        default_head="d" * 40,
+        merge_is_ancestor=True,
+        merge_is_merge_commit=True,
+        issue_states={14: "closed"},
+        active_openspec_absent=False,
+        archive_present=False,
+        todo_complete=True,
+        todo_revisions={"todo.md": "d" * 40},
+        completion_record_valid=True,
+        openspec_required=False,
+    )
+
+    assert evaluate_remote_closure(
+        facts=facts,
         required_issues=(14,),
         expected_head=HEAD,
     ).allowed

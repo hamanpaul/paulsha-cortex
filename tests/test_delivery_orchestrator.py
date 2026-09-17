@@ -7,9 +7,10 @@ from pathlib import Path
 import pytest
 
 from paulsha_cortex.coordinator import completion, review, verification
-from paulsha_cortex.coordinator.claim import load_work_authority
+from paulsha_cortex.coordinator.claim import load_work_authority, work_authority_digest
 from paulsha_cortex.coordinator.delivery import (
     ArchiveGateFacts,
+    MaintainerReviewEvidence,
     PullRequestMetadata,
     ReviewLoop,
     ForeignReviewEvidence,
@@ -19,6 +20,7 @@ from paulsha_cortex.coordinator.delivery import (
     repair_budget_for_band,
     validate_archive_gate,
     validate_pr_metadata,
+    _validate_maintainer_review_evidence,
 )
 from paulsha_cortex.coordinator.github_delivery import RemoteClosureFacts
 from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
@@ -477,6 +479,79 @@ def test_delivery_orchestrator_rejects_multi_target_authority_before_remote_muta
             preflight=_preflight(),
             copilot=_copilot_decision(),
             foreign_review=_foreign_review(tmp_path),
+        )
+
+
+def test_maintainer_review_evidence_accepts_pre_pr_attestation_after_pr_binding(
+    tmp_path: Path,
+) -> None:
+    pre_pr_authority = _authority(tmp_path, prs=(), changes=())
+    current_authority = _authority(tmp_path, prs=(7,), changes=())
+    body = {
+        "schema": "cortex-maintainer-review/v1",
+        "repo": current_authority.repo,
+        "work_id": current_authority.work_id,
+        "run_id": "run-1",
+        "authority_digest": work_authority_digest(pre_pr_authority),
+        "pr_number": None,
+        "candidate": HEAD1,
+        "actor": "maintainer@example",
+        "requested_by": "operator",
+        "verdict": "approved",
+        "summary": "Exact-HEAD review passed before PR creation.",
+        "findings": [],
+        "reviewed_at_epoch": 110.0,
+    }
+    path = tmp_path / "maintainer-review.json"
+    path.write_text(json.dumps(body), encoding="utf-8")
+    path.chmod(0o444)
+
+    normalized = _validate_maintainer_review_evidence(
+        MaintainerReviewEvidence(
+            path=str(path),
+            expected_hash=verification.canonical_json_hash(body),
+        ),
+        authority=current_authority,
+        pr_number=7,
+        expected_head=HEAD1,
+    )
+
+    assert normalized["pr_number"] is None
+
+
+def test_maintainer_review_evidence_rejects_legacy_prless_attestation_for_openspec_runs(
+    tmp_path: Path,
+) -> None:
+    pre_pr_authority = _authority(tmp_path, prs=(), changes=("work",))
+    current_authority = _authority(tmp_path, prs=(7,), changes=("work",))
+    body = {
+        "schema": "cortex-maintainer-review/v1",
+        "repo": current_authority.repo,
+        "work_id": current_authority.work_id,
+        "run_id": "run-1",
+        "authority_digest": work_authority_digest(pre_pr_authority),
+        "pr_number": None,
+        "candidate": HEAD1,
+        "actor": "maintainer@example",
+        "requested_by": "operator",
+        "verdict": "approved",
+        "summary": "Legacy pre-PR review should not authorize OpenSpec-backed ship.",
+        "findings": [],
+        "reviewed_at_epoch": 110.0,
+    }
+    path = tmp_path / "maintainer-review-openspec.json"
+    path.write_text(json.dumps(body), encoding="utf-8")
+    path.chmod(0o444)
+
+    with pytest.raises(RuntimeError, match="maintainer review does not authorize exact HEAD"):
+        _validate_maintainer_review_evidence(
+            MaintainerReviewEvidence(
+                path=str(path),
+                expected_hash=verification.canonical_json_hash(body),
+            ),
+            authority=current_authority,
+            pr_number=7,
+            expected_head=HEAD1,
         )
 
 

@@ -81,6 +81,7 @@ class DeliveryFacts:
     closing_issues: tuple[int, ...]
     active_openspec_absent: bool
     archive_present: bool
+    openspec_required: bool = True
 
 
 @dataclass(frozen=True)
@@ -113,7 +114,7 @@ class FinalGateVerdict:
 
     repo: str
     pr_number: int
-    change: str
+    change: str | None
     expected_head: str
     review_kind: str
     authority_digest: str
@@ -162,10 +163,11 @@ def evaluate_delivery_gate(*, facts: DeliveryFacts, policy: DeliveryPolicy) -> G
     missing_issues = set(policy.required_closing_issues) - set(facts.closing_issues)
     if missing_issues:
         reasons.append("closing-issue-missing")
-    if not facts.active_openspec_absent:
-        reasons.append("active-openspec-present")
-    if not facts.archive_present:
-        reasons.append("openspec-archive-missing")
+    if facts.openspec_required:
+        if not facts.active_openspec_absent:
+            reasons.append("active-openspec-present")
+        if not facts.archive_present:
+            reasons.append("openspec-archive-missing")
     normalized = _unique_reasons(reasons)
     return GateResult(allowed=not normalized, reasons=normalized)
 
@@ -220,6 +222,7 @@ class RemoteClosureFacts:
     todo_complete: bool
     todo_revisions: Mapping[str, str]
     completion_record_valid: bool
+    openspec_required: bool = True
 
 
 @dataclass(frozen=True)
@@ -265,10 +268,11 @@ def evaluate_remote_closure(
         reasons.append("merge-commit-required")
     if any(facts.issue_states.get(issue) != "closed" for issue in required_issues):
         reasons.append("issue-not-closed")
-    if not facts.active_openspec_absent:
-        reasons.append("active-openspec-present")
-    if not facts.archive_present:
-        reasons.append("openspec-archive-missing")
+    if facts.openspec_required:
+        if not facts.active_openspec_absent:
+            reasons.append("active-openspec-present")
+        if not facts.archive_present:
+            reasons.append("openspec-archive-missing")
     if not facts.todo_complete:
         reasons.append("todo-incomplete")
     if not facts.completion_record_valid:
@@ -520,7 +524,9 @@ class GitHubDeliveryClient:
         return self._tree_paths(repo=repo, ref=tree_sha)
 
     @staticmethod
-    def _openspec_facts(paths: tuple[str, ...], change: str) -> tuple[bool, bool]:
+    def _openspec_facts(paths: tuple[str, ...], change: str | None) -> tuple[bool, bool]:
+        if change is None:
+            return True, True
         if not change or "/" in change or change in {".", ".."}:
             raise ValueError("change must be a safe OpenSpec slug")
         active_prefix = f"openspec/changes/{change}/"
@@ -536,7 +542,7 @@ class GitHubDeliveryClient:
         *,
         repo: str,
         pr_number: int,
-        change: str,
+        change: str | None,
     ) -> DeliveryFacts:
         self._repo_parts(repo)
         pull = self._api(f"repos/{repo}/pulls/{pr_number}")
@@ -737,6 +743,7 @@ class GitHubDeliveryClient:
             closing_issues=issues,
             active_openspec_absent=active_absent,
             archive_present=archive_present,
+            openspec_required=change is not None,
         )
 
     def fetch_remote_closure(
@@ -744,7 +751,7 @@ class GitHubDeliveryClient:
         *,
         repo: str,
         pr_number: int,
-        change: str,
+        change: str | None,
         required_issues: tuple[int, ...],
         todo_paths: tuple[str, ...],
     ) -> RemoteClosureFacts:
@@ -859,6 +866,7 @@ class GitHubDeliveryClient:
             todo_complete=todo_complete,
             todo_revisions=todo_revisions,
             completion_record_valid=False,
+            openspec_required=change is not None,
         )
 
     def request_copilot(self, *, repo: str, pr_number: int) -> None:
@@ -1112,7 +1120,7 @@ class GitHubDeliveryClient:
         *,
         repo: str,
         pr_number: int,
-        change: str,
+        change: str | None,
         policy: DeliveryPolicy,
         authority_digest: str,
         _capability: object | None = None,
@@ -1151,7 +1159,7 @@ class GitHubDeliveryClient:
         verdict: FinalGateVerdict,
         repo: str,
         pr_number: int,
-        change: str,
+        change: str | None,
         expected_head: str,
         authority_digest: str,
         _capability: object | None = None,
@@ -1189,7 +1197,7 @@ class GitHubDeliveryClient:
         *,
         repo: str,
         pr_number: int,
-        change: str,
+        change: str | None,
         policy: DeliveryPolicy,
         _capability: object | None = None,
     ) -> DeliveryFacts:

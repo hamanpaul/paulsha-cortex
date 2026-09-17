@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -236,6 +237,9 @@ def test_review_attest_without_openspec_or_pr_writes_null_pr_evidence(
         gate_refs=(GateEvidenceRef("foreign-review", "/evidence/foreign.json", "f" * 64),),
         gate_status="passed",
     )
+    reproduction = tmp_path / "operator-reproduction.txt"
+    reproduction.write_text("exact repro steps\n", encoding="utf-8")
+    reproduction_hash = hashlib.sha256(reproduction.read_bytes()).hexdigest()
 
     class GitHub:
         def __init__(self, *, runner):
@@ -258,6 +262,13 @@ def test_review_attest_without_openspec_or_pr_writes_null_pr_evidence(
                 "verdict": "approved",
                 "summary": "Exact-HEAD adversarial review passed before PR creation.",
                 "findings": [],
+                "evidence_refs": [
+                    {
+                        "kind": "operator-reproduction",
+                        "ref": str(reproduction),
+                        "sha256": reproduction_hash,
+                    }
+                ],
             },
             requested_by="operator",
             authority=authority,
@@ -277,10 +288,211 @@ def test_review_attest_without_openspec_or_pr_writes_null_pr_evidence(
     assert result["head"] == HEAD
     assert persisted["pr_number"] is None
     assert persisted["candidate"] == HEAD
+    assert persisted["evidence_refs"] == [
+        {
+            "kind": "operator-reproduction",
+            "ref": str(reproduction),
+            "sha256": reproduction_hash,
+        }
+    ]
     assert {ref.kind for ref in registry.get_workflow_run(run_id).gate_refs} == {
         "foreign-review",
         "maintainer-review",
     }
+
+
+def test_review_attest_rejects_operator_evidence_hash_drift(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=(), changes=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run_id = _start_run(snapshot=snapshot, state=state, registry=registry)
+    authority = work_actions.load_work_authority(
+        repo=REPO,
+        work_id=WORK_ID,
+        snapshot_path=snapshot,
+    )
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        pr_refs=(),
+        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/foreign.json", "f" * 64),),
+        gate_status="passed",
+    )
+    reproduction = tmp_path / "operator-reproduction.txt"
+    reproduction.write_text("exact repro steps\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        work_actions._review_attest_action(
+            args={
+                "action": "review-attest",
+                "repo": REPO,
+                "work_id": WORK_ID,
+                "actor": "maintainer@example",
+                "verdict": "approved",
+                "summary": "Exact-HEAD adversarial review passed before PR creation.",
+                "findings": [],
+                "evidence_refs": [
+                    {
+                        "kind": "operator-reproduction",
+                        "ref": str(reproduction),
+                        "sha256": "0" * 64,
+                    }
+                ],
+            },
+            requested_by="operator",
+            authority=authority,
+            runner=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+            now_epoch=210,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+
+def test_review_attest_still_requires_no_openspec_when_pr_is_absent(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=(), changes=(WORK_ID,))
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run_id = _start_run(snapshot=snapshot, state=state, registry=registry)
+    authority = work_actions.load_work_authority(
+        repo=REPO,
+        work_id=WORK_ID,
+        snapshot_path=snapshot,
+    )
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        pr_refs=(),
+        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/foreign.json", "f" * 64),),
+        gate_status="passed",
+    )
+
+    with pytest.raises(RuntimeError, match="current exact-HEAD review run"):
+        work_actions._review_attest_action(
+            args={
+                "action": "review-attest",
+                "repo": REPO,
+                "work_id": WORK_ID,
+                "actor": "maintainer@example",
+                "verdict": "approved",
+                "summary": "Should still require a PR when an OpenSpec change exists.",
+                "findings": [],
+            },
+            requested_by="operator",
+            authority=authority,
+            runner=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+            now_epoch=210,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+
+def test_bound_maintainer_review_accepts_pr_created_after_prless_attestation(
+    tmp_path: Path,
+) -> None:
+    pre_pr_snapshot = _snapshot(tmp_path / "pre-pr-snapshot.json", prs=(), changes=())
+    post_pr_snapshot = _snapshot(tmp_path / "post-pr-snapshot.json", prs=(8,), changes=())
+    state = tmp_path / "runs.json"
+    pre_pr_authority = work_actions.load_work_authority(
+        repo=REPO,
+        work_id=WORK_ID,
+        snapshot_path=pre_pr_snapshot,
+    )
+    post_pr_authority = work_actions.load_work_authority(
+        repo=REPO,
+        work_id=WORK_ID,
+        snapshot_path=post_pr_snapshot,
+    )
+    body = {
+        "schema": "cortex-maintainer-review/v1",
+        "repo": REPO,
+        "work_id": WORK_ID,
+        "run_id": "run-1",
+        "authority_digest": work_actions.work_authority_digest(pre_pr_authority),
+        "pr_number": None,
+        "candidate": HEAD,
+        "actor": "maintainer@example",
+        "requested_by": "operator",
+        "verdict": "approved",
+        "summary": "Exact-HEAD review passed before PR creation.",
+        "findings": [],
+        "reviewed_at_epoch": 210.0,
+    }
+    record = work_actions._maintainer_review_record(body, state_path=state)
+    run = SimpleNamespace(
+        current_phase="review",
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        run_id="run-1",
+        gate_refs=(GateEvidenceRef("maintainer-review", record["ref"], record["hash"]),),
+    )
+
+    validated = work_actions._validate_maintainer_review(
+        path=record["ref"],
+        expected_hash=record["hash"],
+        run=run,
+        authority=post_pr_authority,
+        pr_number=8,
+        candidate=HEAD,
+    )
+
+    assert validated["pr_number"] is None
+
+
+def test_bound_maintainer_review_rejects_prless_attestation_when_openspec_is_mapped(
+    tmp_path: Path,
+) -> None:
+    pre_pr_snapshot = _snapshot(tmp_path / "pre-pr-snapshot.json", prs=(), changes=(WORK_ID,))
+    post_pr_snapshot = _snapshot(tmp_path / "post-pr-snapshot.json", prs=(8,), changes=(WORK_ID,))
+    state = tmp_path / "runs.json"
+    pre_pr_authority = work_actions.load_work_authority(
+        repo=REPO,
+        work_id=WORK_ID,
+        snapshot_path=pre_pr_snapshot,
+    )
+    post_pr_authority = work_actions.load_work_authority(
+        repo=REPO,
+        work_id=WORK_ID,
+        snapshot_path=post_pr_snapshot,
+    )
+    body = {
+        "schema": "cortex-maintainer-review/v1",
+        "repo": REPO,
+        "work_id": WORK_ID,
+        "run_id": "run-1",
+        "authority_digest": work_actions.work_authority_digest(pre_pr_authority),
+        "pr_number": None,
+        "candidate": HEAD,
+        "actor": "maintainer@example",
+        "requested_by": "operator",
+        "verdict": "approved",
+        "summary": "Legacy pre-PR attestation should not authorize OpenSpec-backed ship.",
+        "findings": [],
+        "reviewed_at_epoch": 210.0,
+    }
+    record = work_actions._maintainer_review_record(body, state_path=state)
+    run = SimpleNamespace(
+        current_phase="review",
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        run_id="run-1",
+        gate_refs=(GateEvidenceRef("maintainer-review", record["ref"], record["hash"]),),
+    )
+
+    with pytest.raises(RuntimeError, match="maintainer review does not authorize exact HEAD"):
+        work_actions._validate_maintainer_review(
+            path=record["ref"],
+            expected_hash=record["hash"],
+            run=run,
+            authority=post_pr_authority,
+            pr_number=8,
+            candidate=HEAD,
+        )
 
 
 def test_multi_openspec_stop_tells_operator_to_unlink_before_resume(tmp_path: Path) -> None:
