@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **進件 #922 reviewer authority_hashes 回聲**：登記 work item `reviewer-authority-hashes-echo` 與 accepted todo
+  （T1–T6：採信端改選填＋Manager 以 snapshot 補齊、prompt 端移出 required、採信失敗 diagnostic 補 envelope 摘要）。
+  docs-only 進件。
+
 - **#826 outcome taxonomy signals**：新增 `effort_not_supported`／`executable_not_found`／`launch_failed`
   failure 詞彙與環境類 family 映射；structured terminal／interruption 仍優先於可信 `exit 127`
   與文字訊號，`not found` 只有在已知 launcher／executor 的 shell command-not-found、同一行帶

@@ -1222,3 +1222,11 @@ work_items:
       - kind: github_pr
         ref: 'hamanpaul/paulsha-cortex#884'
     excludes: []
+  reviewer-authority-hashes-echo:
+    title: 'reviewer-authority-hashes-echo'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#922'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/reviewer-authority-hashes-echo/todo.md'
+    excludes: []
