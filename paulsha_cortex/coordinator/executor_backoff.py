@@ -331,9 +331,20 @@ def _state_path(coordinator_root: str | Path) -> Path:
 
 def _resolve_path(path: str | Path, *, diagnostic_name: str) -> Path:
     try:
-        return Path(path).resolve(strict=False)
+        resolved = Path(path).resolve(strict=False)
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise _StoreProblem(f"invalid-{diagnostic_name}") from error
+    # Python 3.13 起 ``Path.resolve(strict=False)`` 遇 symlink 迴圈不再拋例外
+    # （≤3.12 拋 ``RuntimeError``），錯誤會晚到 ``lstat`` 才以 ELOOP 冒出，診斷
+    # 標籤因此隨版本漂移。這裡以 ``realpath(strict=True)`` 顯式偵測迴圈與其他
+    # 走訪錯誤（3.10+ 語意一致），缺檔元件維持 strict=False 的放行語意。
+    try:
+        os.path.realpath(path, strict=True)
+    except FileNotFoundError:
+        pass
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise _StoreProblem(f"invalid-{diagnostic_name}") from error
+    return resolved
 
 
 def _lock_path(coordinator_root: str | Path) -> Path:
