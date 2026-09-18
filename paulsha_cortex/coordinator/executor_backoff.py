@@ -549,11 +549,11 @@ def _validate_input_json_value(
 def _normalize_reset_parser(value: object, *, provenance: str) -> dict[str, object] | None:
     if provenance != "parsed":
         if value is not None:
-            raise _StoreProblem("invalid-reset-parser")
+            raise _StoreProblem("invalid-reset_parser")
         return None
     parser = _require_mapping(value, "reset_parser")
     if set(parser) != {"rule_version", "timezone", "base_year", "base_reference_epoch"}:
-        raise _StoreProblem("invalid-reset-parser")
+        raise _StoreProblem("invalid-reset_parser")
     base_year = _require_int(parser.get("base_year"), "base_year")
     if len(str(base_year)) > MAX_NUMERIC_TOKEN_CHARS:
         raise _StoreProblem("json-number-token-too-large")
@@ -1011,7 +1011,7 @@ def _strict_json_loads(raw: bytes, *, budget: _ComputeBudget) -> object:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise _StoreProblem(f"executor backoff store is not valid UTF-8: {error}") from error
-    budget.note_bytes(len(text.encode("utf-8")))
+    budget.note_bytes(len(raw))
     try:
         return json.loads(
             text,
