@@ -63,6 +63,5 @@ artifact_classes:
 - [ ] **T7 tests／回歸**：`tests/test_provider_failure_slice_lane.py`、`tests/test_slice_executor_model.py`、`tests/test_fix_slice_failed_deadend.py`、
       `tests/test_dispatch_decision_contract.py`、`tests/test_executor_backoff.py`、`tests/test_executor_backoff_workflow_lane.py` 全綠、
       不改斷言；真跑候選 CLI `--help`（`cortex status`／`stat`／`tick`；`dispatch` 只驗 help 相容，不執行）。
-- [ ] **T8 documentation**：`README.md` 的 request／tick 結果說明補 `dispatch_skipped_by_backoff` 欄位、known／unknown 區別與「未知餘量不等於
-      額度足夠」；`docs/unified-work-lifecycle.md` slice lane 段補一句；新增 `changelog.d/executor-backoff-slice-consumers.md` 並同步
-      `CHANGELOG.md [Unreleased]`；明寫 #825 母票的 quota pool／forecast／reservation（R9）仍未完成、不因本票 merge 關閉。
+- [ ] **T8 documentation／changelog／CLI help**：新增 `changelog.d/executor-backoff-slice-consumers.md` 並同步 `CHANGELOG.md [Unreleased]`；真跑 CLI `--help`（`cortex status`／`stat`／`tick`；`dispatch` 只驗 help 相容）確認輸出不變；`README.md` 的 request／tick 結果說明補 `dispatch_skipped_by_backoff` 欄位、known／unknown 區別與「未知餘量不等於
+      額度足夠」；`docs/unified-work-lifecycle.md` slice lane 段補一句；明寫 #825 母票的 quota pool／forecast／reservation（R9）仍未完成、不因本票 merge 關閉。

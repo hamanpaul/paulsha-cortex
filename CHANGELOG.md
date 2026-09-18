@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **#928／#929 todo 契約關鍵字**：T8 首行補 `changelog`／`CLI`——機械 plan review 只掃 Tasks list item 首行，
+  續行的關鍵字不算，原 todo 觸發 `plan-review-retry-contract_compatibility`。docs-only。
+
 - **#850 executor backoff store core**：擴充既有
   `paulsha_cortex/coordinator/executor_backoff.py` 與
   `tests/test_executor_backoff.py`，把最初的 strict-reader 骨架補成單模組

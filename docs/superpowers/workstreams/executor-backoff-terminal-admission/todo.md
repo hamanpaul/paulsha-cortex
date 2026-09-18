@@ -72,7 +72,6 @@ artifact_classes:
       `tests/test_outcome_taxonomy.py`、`tests/test_dispatch_runtime_preflight.py`、`tests/test_dispatch_decision_contract.py`、
       `tests/test_executor_backoff.py`（#850）全綠、不改斷言；補「同終局 job 重送不增 hits」「store unknown → 可區分 reason、無假
       deadline」「到期後可再派回第一候選」斷言。
-- [ ] **T8 documentation**：`docs/unified-work-lifecycle.md` 派工段補「executor×model cooldown 於 preflight／reroute 前過濾、
-      `executor-backoff`／`executor-backoff-unknown` 決策不落 needs_human、`dispatch_reroute` 收據」；新增
-      `changelog.d/executor-backoff-terminal-admission.md` 並同步 `CHANGELOG.md [Unreleased]`；明寫 slice lane 尚由 #929 承接、
+- [ ] **T8 documentation／changelog／CLI help**：新增 `changelog.d/executor-backoff-terminal-admission.md` 並同步 `CHANGELOG.md [Unreleased]`；本票不新增 CLI，`cortex work --help`／`cortex status --help` 輸出不變並以 help smoke 驗證；`docs/unified-work-lifecycle.md` 派工段補「executor×model cooldown 於 preflight／reroute 前過濾、
+      `executor-backoff`／`executor-backoff-unknown` 決策不落 needs_human、`dispatch_reroute` 收據」；明寫 slice lane 尚由 #929 承接、
       #825 母票不因本票 merge 關閉。
