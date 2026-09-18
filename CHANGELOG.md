@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+- **#850 executor backoff store core**：擴充既有
+  `paulsha_cortex/coordinator/executor_backoff.py` 與
+  `tests/test_executor_backoff.py`，把最初的 strict-reader 骨架補成單模組
+  `executor-backoff/v1` store：strict
+  three-state reader、scope validation、stable root-scoped `flock`、fresh
+  read-modify-write、temp fsync＋atomic replace＋directory barrier、exact
+  terminal-key ack ledger、caller-supplied outcome payload fingerprint／authority／
+  evidence ref／parsed reset metadata 驗證、fixture inventory reconciliation seam
+  （`unverified`/`pending`/`complete`/`unknown`）、bounded `bounded-ledger/v1`
+  容量檢查，以及依 event-time 穩定排序的 immutable fold。active clear 會以
+  `active-cooldown` 拒絕，expired replay 保持冪等且不釋放 ledger 額度；production
+  caller inventory sourcing 與 workflow/slice lane 接線仍由 #825 後續 child 承接。
+
 - **進件 #928／#929 executor backoff 子票**：#825 母票實算 sizing 8／Red 後拆出 `executor-backoff-terminal-admission`
   （#928：reset hint、終局寫入與對帳、workflow admission）與 `executor-backoff-slice-consumers`（#929：slice admission、
   request／tick consumers），各自 accepted 三件套、sizing 6／Yellow；母 todo 補拆分紀錄。docs-only 進件。
