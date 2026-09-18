@@ -20,6 +20,10 @@
   `active-cooldown` 拒絕，expired replay 保持冪等且不釋放 ledger 額度；production
   caller inventory sourcing 與 workflow/slice lane 接線仍由 #825 後續 child 承接。
 
+- **進件 #928／#929 executor backoff 子票**：#825 母票實算 sizing 8／Red 後拆出 `executor-backoff-terminal-admission`
+  （#928：reset hint、終局寫入與對帳、workflow admission）與 `executor-backoff-slice-consumers`（#929：slice admission、
+  request／tick consumers），各自 accepted 三件套、sizing 6／Yellow；母 todo 補拆分紀錄。docs-only 進件。
+
 - **#911 ship lane 無 openspec 交付模式**：ship lane 現在接受 `mapped_openspec == ()` 的合法交付模式；
   `_ship_action`／delivery binding／GitHub facts／remote closure／CompletionRecord 全面支援 `change=None`，
   `mapped_openspec > 1` 仍以 `multiple-delivery-targets-unsupported` fail-closed，並明示先 `cortex work unlink`

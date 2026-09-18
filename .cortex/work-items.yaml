@@ -1238,3 +1238,27 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/ship-lane-no-openspec/todo.md'
     excludes: []
+  executor-backoff-terminal-admission:
+    title: 'executor-backoff-terminal-admission'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#928'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/executor-backoff-terminal-admission/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-terminal-admission-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-terminal-admission-design.md'
+    excludes: []
+  executor-backoff-slice-consumers:
+    title: 'executor-backoff-slice-consumers'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#929'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/executor-backoff-slice-consumers/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-slice-consumers-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-slice-consumers-design.md'
+    excludes: []
