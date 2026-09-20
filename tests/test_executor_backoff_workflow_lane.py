@@ -311,6 +311,62 @@ def test_active_executor_backoff_skips_the_cooled_down_first_candidate_on_resume
     )
 
 
+def test_expired_executor_backoff_restores_first_candidate_without_stale_reroute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    identities = _two_builder_identities()
+    coordinator_root = tmp_path / "coordinator"
+    base = 1_786_000_000.0
+    observed_now = {"value": base + 1.0}
+    monkeypatch.setattr(manager.time, "time", lambda: observed_now["value"])
+
+    _record_backoff(
+        coordinator_root,
+        executor="codex",
+        model_id="gpt-primary",
+        now=base,
+        reset_at=base + 60.0,
+        job_id="job-codex-rate-limited",
+    )
+
+    first_registry = JobRegistry(state_path=tmp_path / "jobs-first.json")
+    first_run = _make_run(first_registry, workspace_root=tmp_path, steps=_build_only_steps())
+    first_dispatcher = _ResumeDispatcher(first_registry, worktree)
+
+    first_result = manager.resume_workflow_run(
+        first_dispatcher,
+        run_id=first_run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+
+    first_job = first_registry.get_job(first_result["job_id"])
+    assert first_job["executor"] == "claude"
+    assert first_job["dispatch_reroute"] is not None
+
+    observed_now["value"] = base + 120.0
+    second_registry = JobRegistry(state_path=tmp_path / "jobs-second.json")
+    second_run = _make_run(second_registry, workspace_root=tmp_path, steps=_build_only_steps())
+    second_dispatcher = _ResumeDispatcher(second_registry, worktree)
+
+    second_result = manager.resume_workflow_run(
+        second_dispatcher,
+        run_id=second_run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+
+    second_job = second_registry.get_job(second_result["job_id"])
+    assert second_job["executor"] == "codex"
+    assert second_job["model_id"] == "gpt-primary"
+    assert second_job["dispatch_reroute"] is None
+
+
 def test_runtime_preflight_still_projects_cooled_candidate_during_workflow_admission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

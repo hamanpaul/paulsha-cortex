@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import time
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Callable
 
@@ -26,6 +28,8 @@ PidWaiter = Callable[[int], int | None]
 # pid_alive seam：收 pid，回該進程是否仍存活。預設 os.kill(pid, 0)。
 # 跨進程安全：不依賴 os.waitpid（只有 spawn 該子進程的進程能 reap）。
 PidAlive = Callable[[int], bool]
+ProviderFailureNow = Callable[[], object]
+ProviderFailureTimezone = Callable[[], tzinfo | None]
 
 
 def _default_git_runner(args: list[str]) -> str:
@@ -108,6 +112,13 @@ def _default_pid_alive(pid: int) -> bool:
     return True
 
 
+def _default_provider_failure_tz() -> tzinfo:
+    """Codex 月日 reset hint 需要明示時區；production 預設沿 operator/local tz。"""
+
+    local_now = datetime.now().astimezone()
+    return local_now.tzinfo or timezone.utc
+
+
 def _last_nonempty_line(path: str | None) -> str | None:
     if not path:
         return None
@@ -134,11 +145,15 @@ class Dispatcher:
         pane_sender: PaneSender,
         worktree_creator: WorktreeCreator,
         git_runner: GitRunner | None = None,
+        provider_failure_now: ProviderFailureNow | None = None,
+        provider_failure_tz: ProviderFailureTimezone | None = None,
     ) -> None:
         self._registry = registry
         self._pane_sender = pane_sender
         self._worktree_creator = worktree_creator
         self._git_runner = git_runner
+        self._provider_failure_now = provider_failure_now or time.time
+        self._provider_failure_tz = provider_failure_tz or _default_provider_failure_tz
 
     def dispatch(
         self,
@@ -465,7 +480,12 @@ class Dispatcher:
         provider_outcome_reset_parser = None
         if status == "failed" and runtime_diagnostic is None:
             output = read_log_tail(log_path)
-            classification = classify_provider_failure(exit_code=exit_code, output=output)
+            classification = classify_provider_failure(
+                exit_code=exit_code,
+                output=output,
+                now=self._provider_failure_now(),
+                tz=self._provider_failure_tz(),
+            )
             provider_outcome = classification.to_dict()
             provider_outcome_reset_parser = classification.reset_parser
         result_kwargs = {

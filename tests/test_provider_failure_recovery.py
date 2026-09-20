@@ -937,6 +937,82 @@ def test_provider_failure_reroute_returns_none_when_only_remaining_candidate_is_
     assert rerouted is None
 
 
+def test_reroute_with_eligible_and_unknown_candidates_returns_unknown_decision(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "claude-primary",
+                "independence_domain": "anthropic",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "copilot",
+                "model_id": "gpt-5.4",
+                "independence_domain": "github",
+                "capabilities": ["build"],
+            },
+        ]
+    )
+    step = manager._current_workflow_step(run)
+    assert step is not None
+    coordinator_root = tmp_path / "coordinator"
+    coordinator_root.mkdir(parents=True, exist_ok=True)
+
+    class _UnreadableInventoryRegistry:
+        def list_jobs(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "job_id": "job-claude-terminal",
+                    "status": "failed",
+                    "executor": "claude",
+                    "model_id": "claude-primary",
+                    "provider_outcome": {
+                        "outcome": "rate_limited",
+                        "authority": "text_signal",
+                        "reason": "synthetic-rate-limit",
+                        "retryable": True,
+                    },
+                }
+            ]
+
+    def _launcher_factory_should_not_run(_identity):
+        raise AssertionError("unknown reroute candidate must short-circuit before preflight")
+
+    rerouted = manager._provider_failure_reroute(
+        run,
+        step,
+        identities,
+        failed_job={"executor": "codex", "model_id": "gpt-primary"},
+        classification=manager.provider_outcome.ProviderFailureClassification(
+            outcome=ProviderOutcome.RATE_LIMITED,
+            authority=SignalAuthority.TEXT_SIGNAL,
+            reason="synthetic",
+        ),
+        launcher_factory=_launcher_factory_should_not_run,
+        coordinator_root=coordinator_root,
+        registry=_UnreadableInventoryRegistry(),
+    )
+
+    assert isinstance(rerouted, dict)
+    assert rerouted["reason"] == "executor-backoff-unknown"
+    assert "skipped" not in rerouted
+    assert rerouted["diagnostics"][0]["executor"] == "claude"
+    assert rerouted["diagnostics"][0]["model_id"] == "claude-primary"
+    assert rerouted["diagnostics"][0]["diagnostics"] == ["inventory-unavailable"]
+    assert rerouted["diagnostics"][0]["reconciliation"] == "unknown"
+
+
 def test_reroute_for_reviewer_never_crosses_into_builder_domain(tmp_path: Path) -> None:
     """Reviewer 的候選清單本就排除跟 builder 同 domain 的 identity
     （independence domain 規則）；`_provider_failure_reroute` 完全複用這份既有

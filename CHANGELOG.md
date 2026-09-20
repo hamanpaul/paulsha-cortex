@@ -12,7 +12,11 @@
   durable executor-backoff store；workflow admission 與 provider reroute 會在 runtime preflight 前
   過濾 executor×model cooldown，派出的 replacement job 會保留 `dispatch_reroute` 收據；若 store
   unreadable 或與 terminal inventory 對帳未完成，Manager 直接回 `executor-backoff-unknown`，
-  不捏造 `retry_after_epoch`。slice request/tick consumer 仍由 #929 承接。
+  不捏造 `retry_after_epoch`。dispatcher 現在會沿實際 finalize 路徑帶入明示 timezone/clock seam，
+  讓 Codex `Try again at ...` 文字 hint 真正持久化 `reset_at`／`provider_outcome_reset_parser`；
+  reroute 遇到 eligible＋unknown 混合候選時改為 fail-closed 回 `executor-backoff-unknown`，而且
+  cooldown 過期後 workflow admission 會回到原始第一候選、不殘留舊 `dispatch_reroute`。slice
+  request/tick consumer 仍由 #929 承接。
 
 - **#928／#929 todo 契約關鍵字**：T8 首行補 `changelog`／`CLI`——機械 plan review 只掃 Tasks list item 首行，
   續行的關鍵字不算，原 todo 觸發 `plan-review-retry-contract_compatibility`。docs-only。

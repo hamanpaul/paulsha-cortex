@@ -4669,6 +4669,12 @@ def _provider_failure_reroute(
         now=time.time(),
         registry=registry,
     )
+    if report["unknown"]:
+        return _executor_backoff_admission_decision(
+            run,
+            skipped_candidates=report["skipped"],
+            unknown_candidates=report["unknown"],
+        )
     reroute_candidates = tuple(report["eligible"])
     if not reroute_candidates:
         if classification.reroutable:
