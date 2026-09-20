@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Mapping
@@ -354,7 +353,7 @@ def classify_provider_failure(
         provider_text=evidence.provider_text,
         model_text=evidence.model_text,
         now=time.time() if now is None else now,
-        tz=datetime.now().astimezone().tzinfo if tz is None else tz,
+        tz=tz,
     )
     outcome = _OUTCOME_BY_TEXT_SIGNAL[classification.signal]
     authority = (

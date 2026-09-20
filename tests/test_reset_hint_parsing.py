@@ -67,6 +67,13 @@ def test_invalid_retry_after_values_are_rejected(value: str) -> None:
     assert parse_reset_hint(f"Retry-After: {value}", now=now) is None
 
 
+def test_retry_after_overflow_is_rejected() -> None:
+    parse_reset_hint = _parse_reset_hint()
+    now = int(datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc).timestamp())
+
+    assert parse_reset_hint(f"Retry-After: {10**30}", now=now) is None
+
+
 def test_ambiguous_dst_hint_is_rejected() -> None:
     parse_reset_hint = _parse_reset_hint()
     now = int(datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc).timestamp())

@@ -4503,6 +4503,37 @@ def _executor_backoff_admission_report(
     return {"eligible": eligible, "skipped": skipped, "unknown": unknown}
 
 
+def _executor_backoff_admission_decision(
+    run,
+    *,
+    skipped_candidates: Sequence[Mapping[str, object]],
+    unknown_candidates: Sequence[Mapping[str, object]],
+) -> dict[str, object] | None:
+    skipped = list(skipped_candidates)
+    unknown = list(unknown_candidates)
+    if unknown:
+        payload: dict[str, object] = {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "executor-backoff-unknown",
+            "diagnostics": unknown,
+        }
+        if skipped:
+            payload["skipped"] = skipped
+        return payload
+    if not skipped:
+        return None
+    return {
+        "run_id": run.run_id,
+        "current_phase": run.current_phase,
+        "reason": "executor-backoff",
+        "retry_after_epoch": min(
+            float(item["retry_after_epoch"]) for item in skipped
+        ),
+        "skipped": skipped,
+    }
+
+
 def _executor_backoff_filter(
     candidates: Sequence[object],
     *,
@@ -4608,8 +4639,11 @@ def _provider_failure_reroute(
 
     回傳值直接餵給 ``dispatch_workflow_card(..., forced_identity=...)``：有
     runtime preflight 時帶回完整 gate 決策，讓正式 dispatch 可重用同一個已
-    核可的 specialized launcher；沒有 runtime capability 宣告時才退回 bare
-    identity，維持既有 forced reroute 介面。
+    核可的 specialized launcher；若 reroutable failure 的替代候選整批卡在
+    durable executor backoff，則回與 admission 同形狀的 `executor-backoff`
+    / `executor-backoff-unknown` decision，讓呼叫端沿 #830 原樣回傳、不耗
+    retry；沒有 runtime capability 宣告時才退回 bare identity，維持既有
+    forced reroute 介面。
     """
 
     candidates = _workflow_identity_candidates(run, step, identities)
@@ -4637,6 +4671,12 @@ def _provider_failure_reroute(
     )
     reroute_candidates = tuple(report["eligible"])
     if not reroute_candidates:
+        if classification.reroutable:
+            return _executor_backoff_admission_decision(
+                run,
+                skipped_candidates=report["skipped"],
+                unknown_candidates=report["unknown"],
+            )
         return None
 
     gate = _runtime_preflight_gate(
@@ -10518,25 +10558,17 @@ def _dispatch_workflow_card(
     skipped_candidates = list(backoff_report["skipped"])
     unknown_candidates = list(backoff_report["unknown"])
     if unknown_candidates:
-        payload = {
-            "run_id": run.run_id,
-            "current_phase": run.current_phase,
-            "reason": "executor-backoff-unknown",
-            "diagnostics": unknown_candidates,
-        }
-        if skipped_candidates:
-            payload["skipped"] = skipped_candidates
-        return payload
+        return _executor_backoff_admission_decision(
+            run,
+            skipped_candidates=skipped_candidates,
+            unknown_candidates=unknown_candidates,
+        )
     if not eligible_candidates and skipped_candidates:
-        return {
-            "run_id": run.run_id,
-            "current_phase": run.current_phase,
-            "reason": "executor-backoff",
-            "retry_after_epoch": min(
-                float(item["retry_after_epoch"]) for item in skipped_candidates
-            ),
-            "skipped": skipped_candidates,
-        }
+        return _executor_backoff_admission_decision(
+            run,
+            skipped_candidates=skipped_candidates,
+            unknown_candidates=unknown_candidates,
+        )
     skipped_by_identity = {
         (str(item["executor"]), str(item["model_id"])): item for item in skipped_candidates
     }
@@ -11620,6 +11652,17 @@ def resume_workflow_run(
                     coordinator_root=coordinator_root,
                     registry=registry,
                 )
+                if isinstance(rerouted_target, dict):
+                    if (
+                        classify_dispatch_result(
+                            rerouted_target,
+                            registry=registry,
+                            run_id=run.run_id,
+                        )["kind"]
+                        != "decision"
+                    ):
+                        raise ValueError("provider failure reroute must return a decision payload")
+                    return {**dict(rerouted_target), **status_fields}
                 if classification.reroutable and rerouted_target is None:
                     pass
                 else:

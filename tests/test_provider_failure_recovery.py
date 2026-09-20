@@ -572,6 +572,118 @@ def test_effort_not_supported_with_only_runtime_unqualified_alternatives_stops_i
     assert "needs_human" in persisted.facets
 
 
+def test_reroutable_failure_with_only_backed_off_alternative_returns_executor_backoff_decision(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    base_head = _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    _seed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+        outcome=ProviderOutcome.EXECUTABLE_NOT_FOUND,
+    )
+    identities = _two_builder_identities()
+    dispatcher = _ResumeDispatcher(registry, worktree)
+    coordinator_root = tmp_path / "coordinator"
+    current = time.time()
+    jobs_before = len(registry.list_jobs())
+
+    _record_backoff(
+        coordinator_root,
+        executor="claude",
+        model_id="claude-primary",
+        now=current,
+        reset_at=current + 600.0,
+        job_id="job-claude-rate-limited",
+    )
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+
+    assert result["reason"] == "executor-backoff"
+    assert result["provider_outcome"] == "executable_not_found"
+    assert result["provider_retry_count"] == 0
+    assert result["provider_retry_limit"] == terminal_contract.MAX_PROVIDER_RETRIES
+    assert result["retry_after_epoch"] == pytest.approx(current + 605.0, rel=0, abs=5.0)
+    assert result["skipped"] == [
+        {
+            "executor": "claude",
+            "model_id": "claude-primary",
+            "retry_after_epoch": pytest.approx(current + 605.0, rel=0, abs=5.0),
+        }
+    ]
+    assert "job_id" not in result
+    assert len(registry.list_jobs()) == jobs_before
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" not in persisted.facets
+    assert persisted.attempts.get(manager._provider_retry_attempt_key("subagent-build"), 0) == 0
+
+
+def test_reroutable_failure_with_unknown_backoff_state_returns_unknown_decision(
+    tmp_path: Path,
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    base_head = _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    _seed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+        outcome=ProviderOutcome.EXECUTABLE_NOT_FOUND,
+    )
+    identities = _two_builder_identities()
+    dispatcher = _ResumeDispatcher(registry, worktree)
+    coordinator_root = tmp_path / "coordinator"
+    coordinator_root.mkdir(parents=True, exist_ok=True)
+    (coordinator_root / executor_backoff.STATE_FILENAME).write_text(
+        "{not-json}\n",
+        encoding="utf-8",
+    )
+    jobs_before = len(registry.list_jobs())
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+
+    assert result["reason"] == "executor-backoff-unknown"
+    assert result["provider_outcome"] == "executable_not_found"
+    assert result["provider_retry_count"] == 0
+    assert result["provider_retry_limit"] == terminal_contract.MAX_PROVIDER_RETRIES
+    assert "retry_after_epoch" not in result
+    assert "job_id" not in result
+    assert result["diagnostics"][0]["executor"] == "claude"
+    assert result["diagnostics"][0]["reconciliation"] == "unknown"
+    assert len(registry.list_jobs()) == jobs_before
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" not in persisted.facets
+    assert persisted.attempts.get(manager._provider_retry_attempt_key("subagent-build"), 0) == 0
+
+
 def test_provider_retry_bounded_and_exhaustion_reaches_needs_human(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     worktree = tmp_path / "wt"

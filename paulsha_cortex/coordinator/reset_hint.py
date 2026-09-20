@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 
 _RULE_VERSION = "v1"
 _RETRY_AFTER_RE = re.compile(r"(?im)^\s*retry-after\s*:\s*(?P<value>[^\s]+)\s*$")
@@ -51,6 +51,9 @@ _MONTH_BY_NAME = {
     "dec": 12,
     "december": 12,
 }
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MAX_EPOCH_DELTA = datetime.max.replace(tzinfo=timezone.utc) - _UNIX_EPOCH
+_MAX_EPOCH_SECONDS = _MAX_EPOCH_DELTA.days * 86400 + _MAX_EPOCH_DELTA.seconds
 
 
 def _coerce_epoch(now: object) -> int | None:
@@ -88,12 +91,12 @@ def _parser_metadata(reference: datetime) -> dict[str, object]:
 
 def _parse_retry_after(value: str, *, base_epoch: int) -> int | None:
     try:
-        seconds = float(value.strip())
+        seconds = int(value.strip(), 10)
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(seconds) or seconds < 0 or not seconds.is_integer():
+    if seconds < 0 or seconds > _MAX_EPOCH_SECONDS - base_epoch:
         return None
-    return base_epoch + int(seconds)
+    return base_epoch + seconds
 
 
 def _month_number(token: str) -> int | None:
@@ -150,7 +153,12 @@ def parse_reset_hint_details(
     if base_epoch is None:
         return None, None
     haystack = text or ""
-    reference = datetime.fromtimestamp(base_epoch, tz or timezone.utc)
+    try:
+        reference = (_UNIX_EPOCH + timedelta(seconds=base_epoch)).astimezone(
+            tz or timezone.utc
+        )
+    except (OverflowError, ValueError):
+        return None, None
 
     retry_after = _RETRY_AFTER_RE.search(haystack)
     if retry_after is not None:

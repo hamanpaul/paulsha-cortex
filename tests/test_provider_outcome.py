@@ -84,6 +84,20 @@ def test_text_rate_limit_parses_reset_hint_without_changing_payload_shape() -> N
     }
 
 
+def test_text_rate_limit_without_explicit_timezone_does_not_parse_codex_hint() -> None:
+    now = int(datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc).timestamp())
+
+    result = classify_provider_failure(
+        exit_code=1,
+        output="rate limit exceeded -- Try again at Sep 7th 12:23 PM",
+        now=now,
+    )
+
+    assert result.outcome is ProviderOutcome.RATE_LIMITED
+    assert result.reset_at is None
+    assert result.reset_parser is None
+
+
 def test_structured_reset_signal_keeps_reset_at_without_parser_metadata() -> None:
     output = "\n".join(
         [
