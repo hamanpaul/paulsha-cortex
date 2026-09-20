@@ -43,7 +43,7 @@ artifact_classes:
 
 ## Tasks
 
-- [ ] **T1 tests／RED**：新增 `tests/test_reset_hint_parsing.py` 與 `tests/test_executor_backoff_workflow_lane.py`（沿
+- [x] **T1 tests／RED**：新增 `tests/test_reset_hint_parsing.py` 與 `tests/test_executor_backoff_workflow_lane.py`（沿
       `tests/test_provider_failure_recovery.py` 的 `_two_builder_identities`／`_seed_builder_job`／`_ResumeDispatcher` 樣板），
       斷言逐條對應 #928「驗收」節；現行必須 RED（`parse_reset_hint` 不存在／第一候選 rate_limited 後下一次 resume 仍派同一 identity）。
 - [ ] **T2 source／reset hint（R4 parser、D3）**：`parse_reset_hint(text, *, now, tz=None) -> int | None`：Retry-After 非負秒
