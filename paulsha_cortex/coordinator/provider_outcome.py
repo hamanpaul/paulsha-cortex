@@ -43,7 +43,9 @@ markers 表與同一套證據分層，本模組只保留 build lane 的六值詞
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Mapping
@@ -153,6 +155,7 @@ class ProviderFailureClassification:
     # （Claude `rate_limit_event.resetsAt`）帶得到。None 時 `to_dict()` 不寫這個
     # 鍵，舊讀取端與舊狀態檔的四鍵形狀完全不受影響。
     reset_at: int | None = None
+    reset_parser: dict[str, object] | None = field(default=None, compare=False)
 
     @property
     def retryable(self) -> bool:
@@ -296,7 +299,13 @@ def classify_launch_failure(
     return _structured_classification(kind, detail)
 
 
-def classify_provider_failure(*, exit_code: int, output: str | None) -> ProviderFailureClassification:
+def classify_provider_failure(
+    *,
+    exit_code: int,
+    output: str | None,
+    now: object | None = None,
+    tz=None,
+) -> ProviderFailureClassification:
     """把一次 executor 失敗的 (exit_code, 合併 stdout/stderr 文字) 分類成 typed outcome。
 
     分兩層，順序不可互換（#499／#500／#487）：
@@ -344,6 +353,8 @@ def classify_provider_failure(*, exit_code: int, output: str | None) -> Provider
         exit_code=exit_code,
         provider_text=evidence.provider_text,
         model_text=evidence.model_text,
+        now=time.time() if now is None else now,
+        tz=datetime.now().astimezone().tzinfo if tz is None else tz,
     )
     outcome = _OUTCOME_BY_TEXT_SIGNAL[classification.signal]
     authority = (
@@ -351,7 +362,13 @@ def classify_provider_failure(*, exit_code: int, output: str | None) -> Provider
         if classification.signal is outcome_taxonomy.TextSignal.NONE
         else SignalAuthority.TEXT_SIGNAL
     )
-    return ProviderFailureClassification(outcome, authority, classification.detail)
+    return ProviderFailureClassification(
+        outcome,
+        authority,
+        classification.detail,
+        reset_at=classification.reset_at,
+        reset_parser=classification.reset_parser,
+    )
 
 
 def classification_from_job(job: Mapping[str, object]) -> ProviderFailureClassification | None:

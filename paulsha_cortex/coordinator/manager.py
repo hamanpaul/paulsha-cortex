@@ -2535,6 +2535,11 @@ def complete_tick(
                     if classification is not None:
                         gate_reason = f"builder-failed-{classification.outcome.value}"
                         slice_provider_outcome_payload = classification.to_dict()
+                        record_executor_backoff_from_job(
+                            coordinator_root,
+                            job,
+                            classification,
+                        )
                     else:
                         gate_reason = "builder-failed"
                     if slice_row is not None:
@@ -4281,6 +4286,300 @@ def _provider_failure_context(
     }
 
 
+def _job_terminal_epoch(job: Mapping[str, object]) -> float | None:
+    exited_at = job.get("exited_at")
+    if not isinstance(exited_at, str) or not exited_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(exited_at)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _job_provider_outcome_reset_parser(
+    job: Mapping[str, object],
+) -> dict[str, object] | None:
+    parser = job.get("provider_outcome_reset_parser")
+    if not isinstance(parser, Mapping):
+        return None
+    if set(parser) != {"rule_version", "timezone", "base_year", "base_reference_epoch"}:
+        return None
+    if (
+        not isinstance(parser.get("rule_version"), str)
+        or not parser["rule_version"]
+        or not isinstance(parser.get("timezone"), str)
+        or not parser["timezone"]
+        or not isinstance(parser.get("base_year"), int)
+        or isinstance(parser.get("base_year"), bool)
+        or not isinstance(parser.get("base_reference_epoch"), (int, float))
+        or isinstance(parser.get("base_reference_epoch"), bool)
+    ):
+        return None
+    return dict(parser)
+
+
+def _executor_backoff_outcome_payload(
+    classification: "provider_outcome.ProviderFailureClassification",
+    *,
+    job: Mapping[str, object],
+    evidence_ref: str,
+) -> dict[str, object]:
+    from . import executor_backoff
+
+    reset_parser = (
+        _job_provider_outcome_reset_parser(job)
+        if classification.reset_at is not None
+        else None
+    )
+    payload = classification.to_dict()
+    payload_bytes = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "outcome": classification.outcome.value,
+        "authority": classification.authority.value,
+        "payload": payload,
+        "payload_fingerprint": hashlib.sha256(payload_bytes).hexdigest(),
+        "reason": classification.reason,
+        "policy_revision": executor_backoff.POLICY_REVISION,
+        "rate_limited_base_seconds": executor_backoff.RATE_LIMITED_BASE_SECONDS,
+        "quota_base_seconds": executor_backoff.QUOTA_BASE_SECONDS,
+        "backoff_multiplier_base": executor_backoff.POLICY_BACKOFF_MULTIPLIER_BASE,
+        "backoff_max_exponent": executor_backoff.POLICY_BACKOFF_MAX_EXPONENT,
+        "reset_margin_seconds": executor_backoff.RESET_MARGIN_SECONDS,
+        "reset_provenance": (
+            "parsed"
+            if reset_parser is not None
+            else "structured"
+            if classification.reset_at is not None
+            else "absent"
+        ),
+        "reset_parser": reset_parser,
+        "evidence_ref": evidence_ref,
+    }
+
+
+def _executor_backoff_inventory(
+    registry,
+    *,
+    executor: str,
+    model_id: str,
+) -> dict[str, object] | None:
+    if registry is None:
+        return None
+    events: list[dict[str, object]] = []
+    for job in registry.list_jobs():
+        if job.get("status") not in TERMINAL_STATUSES:
+            continue
+        if job.get("executor") != executor or job.get("model_id") != model_id:
+            continue
+        classification = provider_outcome.classification_from_job(job)
+        if (
+            classification is None
+            or classification.authority is provider_outcome.SignalAuthority.HINT
+            or classification.outcome
+            not in {
+                provider_outcome.ProviderOutcome.RATE_LIMITED,
+                provider_outcome.ProviderOutcome.QUOTA,
+            }
+        ):
+            continue
+        job_id = job.get("job_id")
+        event_epoch = _job_terminal_epoch(job)
+        if not isinstance(job_id, str) or not job_id or event_epoch is None:
+            return {
+                "readable": False,
+                "complete": False,
+                "events": [],
+                "evidence_ref": "registry://job-terminal-inventory",
+            }
+        events.append(
+            {
+                "executor": executor,
+                "model_id": model_id,
+                "job_id": job_id,
+                "event_epoch": event_epoch,
+                "outcome": _executor_backoff_outcome_payload(
+                    classification,
+                    job=job,
+                    evidence_ref=f"registry://job/{job_id}",
+                ),
+                "reset_at": classification.reset_at,
+                "reason": classification.reason,
+            }
+        )
+    if not events:
+        return None
+    events.sort(key=lambda row: (float(row["event_epoch"]), str(row["job_id"])))
+    return {
+        "readable": True,
+        "complete": True,
+        "events": events,
+        "evidence_ref": "registry://job-terminal-inventory",
+    }
+
+
+def _executor_backoff_admission_report(
+    candidates: Sequence[object],
+    *,
+    coordinator_root: str | Path | None,
+    now: float,
+    registry=None,
+) -> dict[str, object]:
+    from . import executor_backoff
+
+    resolved = list(candidates)
+    if coordinator_root is None:
+        return {"eligible": resolved, "skipped": [], "unknown": []}
+
+    eligible: list[object] = []
+    skipped: list[dict[str, object]] = []
+    unknown: list[dict[str, object]] = []
+    inventory_cache: dict[tuple[str, str], dict[str, object] | None] = {}
+
+    for candidate in resolved:
+        executor = getattr(candidate, "executor", None)
+        model_id = getattr(candidate, "model_id", None)
+        if not isinstance(executor, str) or not executor or not isinstance(model_id, str) or not model_id:
+            eligible.append(candidate)
+            continue
+        identity_key = (executor, model_id)
+        if identity_key not in inventory_cache:
+            inventory_cache[identity_key] = _executor_backoff_inventory(
+                registry,
+                executor=executor,
+                model_id=model_id,
+            )
+        status = executor_backoff.reconcile_backoff(
+            coordinator_root,
+            executor,
+            model_id,
+            now=now,
+            inventory=inventory_cache[identity_key],
+        )
+        if status.reconciliation in {
+            executor_backoff.ReconciliationStatus.PENDING,
+            executor_backoff.ReconciliationStatus.UNKNOWN,
+        } or status.observation is executor_backoff.StoreObservation.UNKNOWN:
+            detail: dict[str, object] = {
+                "executor": executor,
+                "model_id": model_id,
+                "diagnostics": list(status.diagnostics),
+                "reconciliation": status.reconciliation.value,
+            }
+            if status.evidence_refs:
+                detail["evidence_refs"] = list(status.evidence_refs)
+            unknown.append(detail)
+            logger.info(
+                "executor backoff state unknown executor=%s model_id=%s diagnostics=%s reconciliation=%s",
+                executor,
+                model_id,
+                ",".join(status.diagnostics) or "none",
+                status.reconciliation.value,
+            )
+            continue
+        if status.backoff is not None:
+            skipped_row = {
+                "executor": executor,
+                "model_id": model_id,
+                "retry_after_epoch": status.backoff.deadline_epoch,
+            }
+            skipped.append(skipped_row)
+            logger.info(
+                "executor backoff skipped executor=%s model_id=%s retry_after_epoch=%s",
+                executor,
+                model_id,
+                status.backoff.deadline_epoch,
+            )
+            continue
+        eligible.append(candidate)
+    return {"eligible": eligible, "skipped": skipped, "unknown": unknown}
+
+
+def _executor_backoff_filter(
+    candidates: Sequence[object],
+    *,
+    coordinator_root: str | Path | None,
+    now: float,
+    registry=None,
+) -> tuple[list[object], list[dict[str, object]]]:
+    report = _executor_backoff_admission_report(
+        candidates,
+        coordinator_root=coordinator_root,
+        now=now,
+        registry=registry,
+    )
+    return list(report["eligible"]), list(report["skipped"])
+
+
+def record_executor_backoff_from_job(
+    coordinator_root: str | Path | None,
+    job: Mapping[str, object],
+    classification: "provider_outcome.ProviderFailureClassification | None",
+):
+    from . import executor_backoff
+
+    if coordinator_root is None or classification is None:
+        return None
+    if classification.authority is provider_outcome.SignalAuthority.HINT:
+        return None
+    if classification.outcome not in {
+        provider_outcome.ProviderOutcome.RATE_LIMITED,
+        provider_outcome.ProviderOutcome.QUOTA,
+    }:
+        return None
+    executor = job.get("executor")
+    model_id = job.get("model_id")
+    job_id = job.get("job_id")
+    event_epoch = _job_terminal_epoch(job)
+    if (
+        not isinstance(executor, str)
+        or not executor
+        or not isinstance(model_id, str)
+        or not model_id
+        or not isinstance(job_id, str)
+        or not job_id
+        or event_epoch is None
+    ):
+        logger.info(
+            "executor backoff record skipped due to incomplete terminal metadata job_id=%r",
+            job.get("job_id"),
+        )
+        return None
+    outcome_payload = _executor_backoff_outcome_payload(
+        classification,
+        job=job,
+        evidence_ref=f"registry://job/{job_id}",
+    )
+    observed = executor_backoff.record_backoff(
+        coordinator_root,
+        executor,
+        model_id,
+        now=event_epoch,
+        outcome=outcome_payload,
+        reset_at=None if classification.reset_at is None else float(classification.reset_at),
+        reason=classification.reason,
+        job_id=job_id,
+        event_epoch=event_epoch,
+    )
+    if observed.observation is executor_backoff.StoreObservation.UNKNOWN:
+        logger.info(
+            "executor backoff record unresolved executor=%s model_id=%s job_id=%s diagnostics=%s",
+            executor,
+            model_id,
+            job_id,
+            ",".join(observed.diagnostics) or "none",
+        )
+    return observed.backoff if observed.backoff is not None else observed.last_good
+
+
 def _provider_failure_reroute(
     run,
     step,
@@ -4289,6 +4588,8 @@ def _provider_failure_reroute(
     failed_job: Mapping[str, object],
     classification: "provider_outcome.ProviderFailureClassification",
     launcher_factory,
+    coordinator_root: str | Path | None = None,
+    registry=None,
 ):
     """#384/#826：provider 失敗時只在既有合法候選內 re-route，且替代候選仍
     必須通過該 card 的完整 runtime preflight。
@@ -4328,6 +4629,13 @@ def _provider_failure_reroute(
         reroute_candidates = tuple(
             candidate for candidate in candidates if candidate.executor != failed_executor
         )
+    report = _executor_backoff_admission_report(
+        reroute_candidates,
+        coordinator_root=coordinator_root,
+        now=time.time(),
+        registry=registry,
+    )
+    reroute_candidates = tuple(report["eligible"])
     if not reroute_candidates:
         return None
 
@@ -8729,8 +9037,19 @@ def _workflow_identity_candidates(run, step, identities: IdentityRegistry) -> li
     return _workflow_identity_candidates_for_persona(run, step.persona, identities)
 
 
-def _select_workflow_identity(run, step, identities: IdentityRegistry):
-    return _workflow_identity_candidates(run, step, identities)[0]
+def _select_workflow_identity(
+    run,
+    step,
+    identities: IdentityRegistry,
+    *,
+    candidates: Sequence[object] | None = None,
+):
+    active_candidates = (
+        list(candidates)
+        if candidates is not None
+        else _workflow_identity_candidates(run, step, identities)
+    )
+    return active_candidates[0]
 
 
 def _specialize_workflow_launcher(launcher, step):
@@ -8918,6 +9237,7 @@ def _runtime_preflight_gate(
     launcher_factory,
     snapshot_store=None,
     candidates=None,
+    projected_backoff_candidates: Sequence[tuple[object, Mapping[str, object]]] = (),
 ):
     """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
 
@@ -8933,6 +9253,7 @@ def _runtime_preflight_gate(
     failure reroute 會提供已過濾的合法替代候選，重用同一套 runtime gate。
     """
 
+    from . import runtime_preflight
     from .runtime_preflight import card_runtime_requirements, evaluate_dispatch_gate
 
     try:
@@ -8981,7 +9302,62 @@ def _runtime_preflight_gate(
 
         active_store = WorkSnapshotStore()
 
-    return evaluate_dispatch_gate(
+    projected_attempts: list[runtime_preflight.RuntimePreflightResult] = []
+    provider_requirements = tuple(
+        requirement for requirement in requirements if requirement.kind == "provider"
+    )
+    checked_at = time.time()
+    if provider_requirements:
+        seen_projected: set[str] = set()
+        for identity, skipped in projected_backoff_candidates:
+            try:
+                identity_token = runtime_preflight._identity_token(identity)
+            except Exception:
+                continue
+            if identity_token in seen_projected:
+                continue
+            seen_projected.add(identity_token)
+            try:
+                environment = _environment_for(identity)
+            except Exception:
+                continue
+            findings: list[runtime_preflight.CapabilityFinding] = []
+            for requirement in provider_requirements:
+                provider_id = (
+                    identity.executor
+                    if requirement.name == runtime_preflight.PROVIDER_EXECUTOR_SENTINEL
+                    else requirement.name
+                )
+                if provider_id != getattr(identity, "executor", None):
+                    continue
+                retry_after = skipped.get("retry_after_epoch")
+                findings.append(
+                    runtime_preflight.CapabilityFinding(
+                        capability=requirement,
+                        outcome=runtime_preflight.PreflightOutcome.PROVIDER_UNAVAILABLE,
+                        reason=f"executor backoff active until {retry_after}",
+                        freshness=runtime_preflight.ProviderFreshness(
+                            provider_id=provider_id,
+                            status="degraded",
+                            observed_at=checked_at,
+                            ttl_seconds=runtime_preflight.DEFAULT_PROVIDER_TTL_SECONDS,
+                            source="executor-backoff",
+                            reason=f"retry_after_epoch={retry_after}",
+                        ),
+                    )
+                )
+            if findings:
+                projected_attempts.append(
+                    runtime_preflight.RuntimePreflightResult(
+                        card=step.card,
+                        identity_token=identity_token,
+                        environment=environment,
+                        findings=tuple(findings),
+                        checked_at=checked_at,
+                    )
+                )
+
+    gate = evaluate_dispatch_gate(
         card=step.card,
         requirements=requirements,
         candidates=active_candidates,
@@ -8990,6 +9366,9 @@ def _runtime_preflight_gate(
         snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
         provider_prober=_combined_provider_prober,
     )
+    if projected_attempts:
+        gate = replace(gate, attempts=tuple(projected_attempts) + gate.attempts)
+    return gate
 
 
 def _record_resolved_model_chain(
@@ -10128,6 +10507,52 @@ def _dispatch_workflow_card(
     # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
     # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
     # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。
+    candidate_pool = _workflow_identity_candidates(run, step, identities)
+    backoff_report = _executor_backoff_admission_report(
+        candidate_pool,
+        coordinator_root=coordinator_root,
+        now=time.time(),
+        registry=registry,
+    )
+    eligible_candidates = tuple(backoff_report["eligible"])
+    skipped_candidates = list(backoff_report["skipped"])
+    unknown_candidates = list(backoff_report["unknown"])
+    if unknown_candidates:
+        payload = {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "executor-backoff-unknown",
+            "diagnostics": unknown_candidates,
+        }
+        if skipped_candidates:
+            payload["skipped"] = skipped_candidates
+        return payload
+    if not eligible_candidates and skipped_candidates:
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "executor-backoff",
+            "retry_after_epoch": min(
+                float(item["retry_after_epoch"]) for item in skipped_candidates
+            ),
+            "skipped": skipped_candidates,
+        }
+    skipped_by_identity = {
+        (str(item["executor"]), str(item["model_id"])): item for item in skipped_candidates
+    }
+    projected_backoff_candidates = tuple(
+        (
+            candidate,
+            skipped_by_identity[(candidate.executor, candidate.model_id)],
+        )
+        for candidate in candidate_pool
+        if (candidate.executor, candidate.model_id) in skipped_by_identity
+    )
+    dispatch_reroute = (
+        {"source": "executor-backoff", "skipped": skipped_candidates}
+        if skipped_candidates
+        else None
+    )
     # #384/#826：`forced_identity` 提供時（provider 失敗 bounded retry 的
     # re-route 決策，見 `resume_workflow_run`／`_provider_failure_reroute`）代表
     # 呼叫端已用同一套 `_runtime_preflight_gate` 驗過替代候選；若帶入的是完整
@@ -10151,6 +10576,8 @@ def _dispatch_workflow_card(
             step,
             identities=identities,
             launcher_factory=launcher_factory,
+            candidates=eligible_candidates,
+            projected_backoff_candidates=projected_backoff_candidates,
         )
     if gate is not None and gate.action == "needs_human":
         updated = registry._manager_update_workflow_run(
@@ -10186,7 +10613,12 @@ def _dispatch_workflow_card(
             raise ValueError("workflow launcher unavailable")
         launcher = _specialize_workflow_launcher(launcher, step)
     else:
-        identity = _select_workflow_identity(run, step, identities)
+        identity = _select_workflow_identity(
+            run,
+            step,
+            identities,
+            candidates=eligible_candidates,
+        )
         launcher = launcher_factory(identity)
         if launcher is None:
             raise ValueError("workflow launcher unavailable")
@@ -10495,6 +10927,7 @@ def _dispatch_workflow_card(
             # 與 registry 現有 WorkflowRun.steps 的現值比對出 drift（見
             # manager._workflow_acceptance_definition_drifted）。
             workflow_test_policy=step.test_policy,
+            dispatch_reroute=dispatch_reroute,
         )
     except BaseException:
         if planner_sandbox is not None:
@@ -11155,6 +11588,7 @@ def resume_workflow_run(
         classification = (
             provider_outcome.classification_from_job(job) if sandbox_ok else None
         )
+        record_executor_backoff_from_job(coordinator_root, job, classification)
         if runtime_contract_failed:
             # A runtime contract failure is already a durable Manager-side
             # diagnosis.  It must not be reclassified as a retryable provider
@@ -11183,6 +11617,8 @@ def resume_workflow_run(
                     failed_job=job,
                     classification=classification,
                     launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                    registry=registry,
                 )
                 if classification.reroutable and rerouted_target is None:
                     pass

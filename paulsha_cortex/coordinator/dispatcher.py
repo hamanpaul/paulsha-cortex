@@ -462,14 +462,19 @@ class Dispatcher:
         # classify_completion 的 failed 分支」這種邊界情況也排除掉，避免對
         # 明明成功的 job 做無意義的 log 讀取與分類。
         provider_outcome = None
+        provider_outcome_reset_parser = None
         if status == "failed" and runtime_diagnostic is None:
             output = read_log_tail(log_path)
-            provider_outcome = classify_provider_failure(exit_code=exit_code, output=output).to_dict()
+            classification = classify_provider_failure(exit_code=exit_code, output=output)
+            provider_outcome = classification.to_dict()
+            provider_outcome_reset_parser = classification.reset_parser
         result_kwargs = {
             "status": status,
             "exit_code": exit_code,
             "provider_outcome": provider_outcome,
         }
+        if provider_outcome_reset_parser is not None:
+            result_kwargs["provider_outcome_reset_parser"] = provider_outcome_reset_parser
         # Keep the legacy registry seam usable for pre-migration callers while
         # passing the durable runtime field whenever a real failure exists.
         if runtime_diagnostic is not None:

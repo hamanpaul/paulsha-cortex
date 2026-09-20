@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable, Sequence
@@ -60,6 +61,7 @@ from typing import Any, Iterable, Sequence
 from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
 
 from . import executor_auth
+from . import reset_hint
 
 __all__ = [
     "OutcomeFamily",
@@ -568,6 +570,8 @@ class StreamEvidence:
 class TextClassification:
     signal: TextSignal
     detail: str
+    reset_at: int | None = None
+    reset_parser: dict[str, object] | None = None
 
     @property
     def family(self) -> OutcomeFamily:
@@ -784,6 +788,8 @@ def classify_text(
     exit_code: int,
     provider_text: str,
     model_text: str = "",
+    now: object | None = None,
+    tz=None,
 ) -> TextClassification:
     """文字關鍵字層的共用分類器。
 
@@ -805,13 +811,29 @@ def classify_text(
 
     cli_status, cli_detail = executor_auth.classify_cli_output(exit_code, provider_text)
 
-    if cli_status == "rate_limited" or is_rate_limit_signal(provider_text):
+    def _with_reset(signal: TextSignal, detail: str) -> TextClassification:
+        if signal not in {TextSignal.RATE_LIMIT, TextSignal.QUOTA}:
+            return TextClassification(signal, detail)
+        parsed_now = time.time() if now is None else now
+        reset_at, reset_parser = reset_hint.parse_reset_hint_details(
+            provider_text,
+            now=parsed_now,
+            tz=tz,
+        )
         return TextClassification(
+            signal,
+            detail,
+            reset_at=reset_at,
+            reset_parser=reset_parser,
+        )
+
+    if cli_status == "rate_limited" or is_rate_limit_signal(provider_text):
+        return _with_reset(
             TextSignal.RATE_LIMIT,
             f"rate limit signal detected in executor output ({cli_detail})",
         )
     if QUOTA_RE.search(provider_text):
-        return TextClassification(TextSignal.QUOTA, "quota signal detected in executor output")
+        return _with_reset(TextSignal.QUOTA, "quota signal detected in executor output")
     if cli_status == "logged_out" or is_auth_signal(provider_text):
         return TextClassification(
             TextSignal.AUTH,

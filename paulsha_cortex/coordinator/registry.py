@@ -739,6 +739,27 @@ class JobRegistry:
             raise ValueError(
                 f"coordinator 狀態檔 runtime_diagnostic 格式錯誤（fail-closed）: {self._state_path}"
             )
+        dispatch_reroute = job.get("dispatch_reroute")
+        if dispatch_reroute is not None and (
+            not isinstance(dispatch_reroute, dict)
+            or set(dispatch_reroute) != {"source", "skipped"}
+            or dispatch_reroute.get("source") != "executor-backoff"
+            or not isinstance(dispatch_reroute.get("skipped"), list)
+            or any(
+                not isinstance(item, dict)
+                or set(item) != {"executor", "model_id", "retry_after_epoch"}
+                or not isinstance(item.get("executor"), str)
+                or not item["executor"]
+                or not isinstance(item.get("model_id"), str)
+                or not item["model_id"]
+                or not isinstance(item.get("retry_after_epoch"), (int, float))
+                or isinstance(item.get("retry_after_epoch"), bool)
+                for item in dispatch_reroute["skipped"]
+            )
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 dispatch_reroute 格式錯誤（fail-closed）: {self._state_path}"
+            )
         # trust-root Phase 2a：通道標記只有一個合法字面值。任何其他值都可能是被
         # 改過的狀態檔（想把新 job 偽裝成 legacy 以打開 worktree fallback）→ fail-closed。
         verdict_channel = job.get("review_verdict_channel")
@@ -812,6 +833,27 @@ class JobRegistry:
         ):
             raise ValueError(
                 f"coordinator 狀態檔 provider_outcome 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        provider_outcome_reset_parser = job.get("provider_outcome_reset_parser")
+        if provider_outcome_reset_parser is not None and (
+            provider_outcome is None
+            or provider_outcome.get("reset_at") is None
+            or not isinstance(provider_outcome_reset_parser, dict)
+            or set(provider_outcome_reset_parser)
+            != {"rule_version", "timezone", "base_year", "base_reference_epoch"}
+            or not isinstance(provider_outcome_reset_parser.get("rule_version"), str)
+            or not provider_outcome_reset_parser["rule_version"]
+            or not isinstance(provider_outcome_reset_parser.get("timezone"), str)
+            or not provider_outcome_reset_parser["timezone"]
+            or not isinstance(provider_outcome_reset_parser.get("base_year"), int)
+            or isinstance(provider_outcome_reset_parser.get("base_year"), bool)
+            or not isinstance(
+                provider_outcome_reset_parser.get("base_reference_epoch"), (int, float)
+            )
+            or isinstance(provider_outcome_reset_parser.get("base_reference_epoch"), bool)
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 provider_outcome_reset_parser 格式錯誤（fail-closed）: {self._state_path}"
             )
         for field in ("workflow_inputs", "workflow_outputs"):
             value = job.get(field)
@@ -1072,6 +1114,7 @@ class JobRegistry:
         runtime_surface: str | None = None,
         credential_publish: bool = False,
         prompt_path: str | None = None,
+        dispatch_reroute: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -1155,11 +1198,13 @@ class JobRegistry:
             "runtime_surface": runtime_surface,
             "credential_publish": credential_publish,
             "prompt_path": prompt_path,
+            "dispatch_reroute": None if dispatch_reroute is None else dict(dispatch_reroute),
             "runtime_diagnostic": None,
             "workflow_evidence": None,
             # #384：executor 失敗的 typed 分類（見 provider_outcome.py），只在
             # `update_headless_result` 收到失敗結果且能分類時才會被寫入。
             "provider_outcome": None,
+            "provider_outcome_reset_parser": None,
             "usage": None,
             "usage_raw": None,
             "usage_reason": None,
@@ -1339,6 +1384,7 @@ class JobRegistry:
         executor: str | None = None,
         model_id: str | None = None,
         provider_outcome: Mapping[str, Any] | None = None,
+        provider_outcome_reset_parser: Mapping[str, Any] | None = None,
         runtime_diagnostic: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in TERMINAL_JOB_STATUSES:
@@ -1352,6 +1398,24 @@ class JobRegistry:
             or set(provider_outcome) - {"outcome", "authority", "reason", "retryable", "reset_at"}
         ):
             raise ValueError("provider_outcome 格式錯誤（fail-closed）")
+        if provider_outcome_reset_parser is not None and (
+            provider_outcome is None
+            or provider_outcome.get("reset_at") is None
+            or not isinstance(provider_outcome_reset_parser, Mapping)
+            or set(provider_outcome_reset_parser)
+            != {"rule_version", "timezone", "base_year", "base_reference_epoch"}
+            or not isinstance(provider_outcome_reset_parser.get("rule_version"), str)
+            or not provider_outcome_reset_parser["rule_version"]
+            or not isinstance(provider_outcome_reset_parser.get("timezone"), str)
+            or not provider_outcome_reset_parser["timezone"]
+            or not isinstance(provider_outcome_reset_parser.get("base_year"), int)
+            or isinstance(provider_outcome_reset_parser.get("base_year"), bool)
+            or not isinstance(
+                provider_outcome_reset_parser.get("base_reference_epoch"), (int, float)
+            )
+            or isinstance(provider_outcome_reset_parser.get("base_reference_epoch"), bool)
+        ):
+            raise ValueError("provider_outcome_reset_parser 格式錯誤（fail-closed）")
         if runtime_diagnostic is not None and (
             not isinstance(runtime_diagnostic, Mapping)
             or set(runtime_diagnostic) != {"reason", "detail", "source", "job_id"}
@@ -1380,6 +1444,11 @@ class JobRegistry:
         # 傳入時才寫入——`status == "exited"` 或呼叫端未提供分類（例如 launch
         # 本身失敗、根本沒有 executor 輸出可分類）時保持 None，不偽造分類。
         job["provider_outcome"] = dict(provider_outcome) if provider_outcome is not None else None
+        job["provider_outcome_reset_parser"] = (
+            dict(provider_outcome_reset_parser)
+            if provider_outcome_reset_parser is not None
+            else None
+        )
         job["runtime_diagnostic"] = (
             dict(runtime_diagnostic) if runtime_diagnostic is not None else None
         )

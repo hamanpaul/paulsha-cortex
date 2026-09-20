@@ -7,6 +7,7 @@ consumer。本檔覆蓋三條 producer 寫入路徑與 workflow consumer 的實�
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import subprocess
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from paulsha_cortex.coordinator import autonomy, manager, outcome_taxonomy
+from paulsha_cortex.coordinator import dispatcher as dispatcher_module
 from paulsha_cortex.coordinator.dispatcher import Dispatcher, exit_sentinel_path
 from paulsha_cortex.coordinator.launcher import LaunchHandle
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
@@ -489,6 +491,38 @@ def test_poll_headless_done_projects_effort_not_supported_into_slice_gate_reason
     assert updated["provider_outcome"]["authority"] != "hint"
     assert manifest["gate_reason"] == "builder-failed-effort_not_supported"
     assert manifest["provider_outcome"]["outcome"] == "effort_not_supported"
+
+
+def test_dispatcher_persists_reset_parser_metadata_for_codex_style_text_hints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "jobs.json"
+    now = int(datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc).timestamp())
+    utc = timezone.utc
+    expected_reset = int(datetime(2026, 9, 7, 12, 23, tzinfo=utc).timestamp())
+    job_id = _seed_slice_job(
+        state,
+        slice_id="slice-reset-parser",
+        log_text="rate limit exceeded -- Try again at Sep 7th 12:23 PM",
+        exit_code=1,
+    )
+
+    def _classify(*, exit_code: int, output: str | None):
+        return classify_provider_failure(exit_code=exit_code, output=output, now=now, tz=utc)
+
+    monkeypatch.setattr(dispatcher_module, "classify_provider_failure", _classify)
+    registry = JobRegistry(state_path=state)
+    updated = Dispatcher(registry, pane_sender=None, worktree_creator=None).poll_headless_done(
+        job_id, pid_alive=lambda _pid: False
+    )
+
+    assert updated["provider_outcome"]["reset_at"] == expected_reset
+    assert updated["provider_outcome_reset_parser"] == {
+        "rule_version": "v1",
+        "timezone": "UTC",
+        "base_year": 2026,
+        "base_reference_epoch": now,
+    }
 
 
 def test_poll_headless_done_projects_exit_127_empty_log_as_executable_not_found(
