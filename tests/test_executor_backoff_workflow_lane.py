@@ -412,6 +412,17 @@ def test_runtime_preflight_still_projects_cooled_candidate_during_workflow_admis
         "card_runtime_requirements",
         lambda _card: (RuntimeCapability("provider", "executor"),),
     )
+    # Provider capability checks probe real CLI login state; seed fresh snapshots
+    # so this admission test stays hermetic when sandboxes lack those CLIs.
+    monkeypatch.setattr(manager, "_EXECUTOR_AUTH_CACHE", {})
+    for provider_id in ("claude", "codex"):
+        manager._EXECUTOR_AUTH_CACHE[provider_id] = runtime_preflight.ProviderFreshness(
+            provider_id=provider_id,
+            status="ok",
+            observed_at=current,
+            ttl_seconds=900.0,
+            source="snapshot",
+        )
 
     gate = manager._runtime_preflight_gate(
         run,
