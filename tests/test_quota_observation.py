@@ -64,6 +64,21 @@ def _pool_descriptor_payload() -> dict[str, object]:
     }
 
 
+def _binding_constraint(window_id: str = "fixture-window-short") -> dict[str, object]:
+    return {
+        "state": "known",
+        "value": {
+            "pool_ref": {
+                "authority_id": "fixture-authority",
+                "account_id": "fixture-account-a",
+                "pool_id": "fixture-pool-a",
+                "revision": "fixture-revision-1",
+            },
+            "window_id": window_id,
+        },
+    }
+
+
 def _binding_payload(*, domain: str = "request") -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -76,20 +91,7 @@ def _binding_payload(*, domain: str = "request") -> dict[str, object]:
                 "value": {"schema_version": 1, "key": _profile_key(domain)},
             },
         },
-        "constraints": [
-            {
-                "state": "known",
-                "value": {
-                    "pool_ref": {
-                        "authority_id": "fixture-authority",
-                        "account_id": "fixture-account-a",
-                        "pool_id": "fixture-pool-a",
-                        "revision": "fixture-revision-1",
-                    },
-                    "window_id": "fixture-window-short",
-                },
-            }
-        ],
+        "constraints": [_binding_constraint()],
         "coverage": {"state": "complete", "gaps": []},
     }
 
@@ -267,17 +269,37 @@ def test_unit_definition_rejects_non_v1_schema() -> None:
     assert excinfo.value.code == "unsupported_schema"
 
 
-def test_parsed_records_ignore_later_source_and_result_mutations() -> None:
+def test_binding_rejects_more_than_64_constraints() -> None:
+    api = _quota_api()
+    descriptor = api["parse_pool_descriptor"](_pool_descriptor_payload())
+    payload = _binding_payload()
+    payload["constraints"] = [
+        _binding_constraint(window_id=f"fixture-window-{index}") for index in range(65)
+    ]
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_binding"](payload, descriptors=(descriptor,))
+
+    assert excinfo.value.code == "resource_limit"
+    assert excinfo.value.locator == ("constraints",)
+
+
+def test_parse_unit_and_observation_leave_exact_payloads_unchanged_and_snapshot_results() -> None:
     api = _quota_api()
     unit_payload = _unit_definition_payload()
     observation_payload = _cold_start_observation_payload()
+    unit_source_before = deepcopy(unit_payload)
+    observation_source_before = deepcopy(observation_payload)
 
-    unit = api["parse_unit_definition"](deepcopy(unit_payload))
+    unit = api["parse_unit_definition"](unit_payload)
     observation = api["parse_observation"](
-        deepcopy(observation_payload),
+        observation_payload,
         descriptors=(),
         unit_catalog=(unit,),
     )
+
+    assert unit_payload == unit_source_before
+    assert observation_payload == observation_source_before
 
     unit_payload["semantics_ref"] = "fixture:mutated-source/v2"
     observation_payload["measurement"]["quantity"]["amount"]["value"] = "999"
@@ -287,8 +309,8 @@ def test_parsed_records_ignore_later_source_and_result_mutations() -> None:
     mutated_observation_dict = observation.to_dict()
     mutated_observation_dict["measurement"]["quantity"]["amount"]["value"] = "777"
 
-    assert unit.to_dict() == _unit_definition_payload()
-    assert observation.to_dict() == _cold_start_observation_payload()
+    assert unit.to_dict() == unit_source_before
+    assert observation.to_dict() == observation_source_before
 
 
 def test_context_records_reject_caller_constructed_dataclasses() -> None:
@@ -332,21 +354,40 @@ def test_context_records_reject_caller_constructed_dataclasses() -> None:
     assert binding_error.value.locator == ("descriptors", 0)
 
 
-def test_descriptor_and_catalog_records_stay_immutable_after_roundtrip() -> None:
+def test_parse_binding_and_context_records_leave_exact_sources_unchanged() -> None:
     api = _quota_api()
     descriptor_payload = _pool_descriptor_payload()
     unit_payload = _unit_definition_payload()
     binding_payload = _binding_payload()
     observation_payload = _cold_start_observation_payload()
+    descriptor_source_before = deepcopy(descriptor_payload)
+    unit_source_before = deepcopy(unit_payload)
+    binding_source_before = deepcopy(binding_payload)
+    observation_source_before = deepcopy(observation_payload)
 
-    descriptor = api["parse_pool_descriptor"](deepcopy(descriptor_payload))
-    unit = api["parse_unit_definition"](deepcopy(unit_payload))
-    binding = api["parse_binding"](deepcopy(binding_payload), descriptors=(descriptor,))
+    descriptor = api["parse_pool_descriptor"](descriptor_payload)
+    unit = api["parse_unit_definition"](unit_payload)
+    descriptor_record_before = descriptor.to_dict()
+    unit_record_before = unit.to_dict()
+    binding = api["parse_binding"](binding_payload, descriptors=(descriptor,))
     observation = api["parse_observation"](
-        deepcopy(observation_payload),
+        observation_payload,
         descriptors=(descriptor,),
         unit_catalog=(unit,),
     )
+
+    assert descriptor_payload == descriptor_source_before
+    assert unit_payload == unit_source_before
+    assert binding_payload == binding_source_before
+    assert observation_payload == observation_source_before
+    assert descriptor.to_dict() == descriptor_record_before
+    assert unit.to_dict() == unit_record_before
+
+    assert dict(api["binding_status"](binding)) == {"state": "deferred"}
+    assert dict(
+        api["freshness"](observation, now_utc_ms=1000, allowed_clock_skew_ms=0)
+    ) == {"state": "deferred"}
+    assert dict(api["event_identity"](observation)) == {"state": "deferred"}
 
     descriptor_payload["units"][0]["semantics_ref"] = "fixture:mutated-source/v2"
     unit_payload["semantics_ref"] = "fixture:mutated-source/v2"
@@ -362,10 +403,10 @@ def test_descriptor_and_catalog_records_stay_immutable_after_roundtrip() -> None
     mutated_observation_dict = observation.to_dict()
     mutated_observation_dict["source"]["adapter_version"] = "fixture-mutated-result"
 
-    assert descriptor.to_dict() == _pool_descriptor_payload()
-    assert unit.to_dict() == _unit_definition_payload()
-    assert binding.to_dict() == _binding_payload()
-    assert observation.to_dict() == _cold_start_observation_payload()
+    assert descriptor.to_dict() == descriptor_source_before
+    assert unit.to_dict() == unit_source_before
+    assert binding.to_dict() == binding_source_before
+    assert observation.to_dict() == observation_source_before
 
 
 def test_helper_scaffolds_remain_deferred_in_t2() -> None:

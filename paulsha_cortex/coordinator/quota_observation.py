@@ -33,6 +33,7 @@ _MAX_STRING_CODEPOINTS = 1024
 _MAX_ROOT_BYTES = 65536
 _MAX_UNIT_DEFINITION_BYTES = 2048
 _MAX_CONTEXT_ITEMS = 16
+_MAX_BINDING_CONSTRAINTS = 64
 _MAX_BINDING_CONTEXT_BYTES = 17 * _MAX_ROOT_BYTES
 _MAX_OBSERVATION_CONTEXT_BYTES = _MAX_BINDING_CONTEXT_BYTES + (
     _MAX_CONTEXT_ITEMS * _MAX_UNIT_DEFINITION_BYTES
@@ -839,6 +840,8 @@ def _parse_binding_constraints(
     items = _expect_list(value, locator)
     if not items:
         raise QuotaContractError("invalid_shape", locator)
+    if len(items) > _MAX_BINDING_CONSTRAINTS:
+        raise QuotaContractError("resource_limit", locator)
     parsed: list[_KnownValue] = []
     for index, item in enumerate(items):
         parsed.append(
