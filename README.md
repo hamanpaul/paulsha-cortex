@@ -141,7 +141,16 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    PSC_MANAGER_EXECUTOR=codex
    PSC_MANAGER_INTERVAL_SECONDS=300
    PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS=86400
+   PSC_MANAGER_MAX_LOAD=10.0
+   PSC_MANAGER_REQUIRE_IDLE=1
    ```
+
+   - **`PSC_MANAGER_MAX_LOAD`／CLI `--max-load`（#819）**：控制 periodic tick runner 允許的最大 load1 門檻（正有限浮點數）。超過門檻時略過本輪 tick 並推進 `last_tick_monotonic`（避免 hot loop）。
+     - **預設行為變更**：periodic runner 預設由固定 1.0 改為 CPU-aware（`max(1.0, (os.cpu_count() or 1) * 0.5)`）。若需保留既有 1.0 門檻，可顯式設定 `PSC_MANAGER_MAX_LOAD=1.0`。
+     - **優先序**：CLI `--max-load` > env `PSC_MANAGER_MAX_LOAD` > CPU-aware 預設。
+     - **非法值處理差異**：CLI 的顯式非法值（如 NaN、Inf、0、負數或非數值）直接由 argparse 報錯拒絕（exit 2）；env 若為 unset、空字串、無法解析、NaN、正負 Inf、零或負數，則安全回落到 CPU-aware 預設，不得使非法值進入 probe。
+     - **限制**：`os.cpu_count()` 不反映容器 cgroup CPU 配額；容器環境應顯式配置合適門檻。manual tick request lane 預設仍維持 1.0（不受本項變更影響）。不能以 bypass 模式的 `idle=True` 證明自然負載低於門檻。
+   - **`PSC_MANAGER_REQUIRE_IDLE`／CLI `--no-require-idle`（#819）**：控制 periodic runner 是否探測主機負載。`PSC_MANAGER_REQUIRE_IDLE` 經 `strip().lower()` 為 `0`／`false`／`off`／`no` 時停用 idle 檢查，其餘值、unset 或空字串皆預設為 `True`（啟用檢查）。CLI `--no-require-idle` 優先停用（`default_require_idle() and not args.no_require_idle`）。
 
    **`PSC_JOB_RUNNER`（trust-root Phase 2 降權啟動器）**：預設 `direct`＝headless job 與
    Manager 同帳號執行（現行行為）。設為 `systemd-run` 後，builder persona 的 job 改以
