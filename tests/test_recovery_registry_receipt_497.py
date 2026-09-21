@@ -63,6 +63,21 @@ def _stored_receipt(
     }
 
 
+def _stored_disposition(
+    *,
+    version: int = 1,
+    request_id: str = "recovery-request-1",
+    status: str = "completed",
+    completed_at: str = "2026-09-21T00:00:00+00:00",
+) -> dict[str, Any]:
+    return {
+        "version": version,
+        "request_id": request_id,
+        "status": status,
+        "completed_at": completed_at,
+    }
+
+
 def _slice_row(
     *,
     recovery_receipts: list[dict[str, Any]] | None = None,
@@ -127,6 +142,18 @@ def _mutate_bad_target(receipt: dict[str, Any]) -> None:
     }
 
 
+def _mutate_missing_disposition_version(disposition: dict[str, Any]) -> None:
+    disposition.pop("version")
+
+
+def _mutate_bad_disposition_version(disposition: dict[str, Any]) -> None:
+    disposition["version"] = 99
+
+
+def _mutate_unknown_disposition_key(disposition: dict[str, Any]) -> None:
+    disposition["unexpected"] = "nope"
+
+
 def test_legacy_receipt_bytes_complete_golden_request_and_history_survive_read_reload(
     tmp_path: Path,
 ) -> None:
@@ -142,11 +169,10 @@ def test_legacy_receipt_bytes_complete_golden_request_and_history_survive_read_r
         recorded_at="2026-09-20T00:00:00+00:00",
     )
     dispositions = [
-        {
-            "request_id": historical_request["request_id"],
-            "status": "completed",
-            "completed_at": historical["recorded_at"],
-        }
+        _stored_disposition(
+            request_id=historical_request["request_id"],
+            completed_at=historical["recorded_at"],
+        )
     ]
     payload = _state_payload(
         _slice_row(
@@ -187,6 +213,28 @@ def test_unknown_recovery_receipt_version_is_rejected_fail_closed(tmp_path: Path
     _write_state(state, payload)
 
     with pytest.raises(ValueError, match="receipt|version"):
+        JobRegistry(state_path=state)
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        _mutate_bad_disposition_version,
+        _mutate_missing_disposition_version,
+        _mutate_unknown_disposition_key,
+    ],
+)
+def test_recovery_disposition_contract_is_versioned_and_exact_key_fail_closed(
+    tmp_path: Path,
+    mutator,
+) -> None:
+    state = tmp_path / "jobs.json"
+    disposition = _stored_disposition()
+    mutator(disposition)
+    payload = _state_payload(_slice_row(recovery_dispositions=[disposition]))
+    _write_state(state, payload)
+
+    with pytest.raises(ValueError, match="recovery disposition|version"):
         JobRegistry(state_path=state)
 
 

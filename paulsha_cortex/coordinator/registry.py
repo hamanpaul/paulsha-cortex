@@ -228,7 +228,8 @@ _RECOVERY_REQUEST_FIELDS = frozenset(
 _RECOVERY_TARGET_FIELDS = frozenset({"slice_id", "target_branch", "candidate"})
 _RECOVERY_PROOF_REQUIREMENT_FIELDS = frozenset({"required_refs", "must_match_candidate"})
 _RECOVERY_CONTEXT_FIELDS = frozenset({"actor", "job_id", "workflow_run_id", "legacy_fingerprint"})
-_RECOVERY_DISPOSITION_REQUIRED_FIELDS = frozenset({"request_id"})
+_RECOVERY_DISPOSITION_VERSION = 1
+_RECOVERY_DISPOSITION_FIELDS = frozenset({"version", "request_id", "status", "completed_at"})
 
 
 def _canonical_json_bytes(payload: Any) -> bytes:
@@ -480,16 +481,36 @@ def _validate_recovery_disposition(
     *,
     state_path: Path,
 ) -> dict[str, Any]:
-    if not isinstance(value, dict) or not _RECOVERY_DISPOSITION_REQUIRED_FIELDS.issubset(value):
-        raise ValueError(
-            f"coordinator 狀態檔 recovery disposition 格式錯誤（fail-closed）: {state_path}"
-        )
-    _require_non_empty_string(
-        value.get("request_id"),
-        label="recovery disposition request_id",
+    disposition = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_DISPOSITION_FIELDS,
+        label="recovery disposition",
         state_path=state_path,
     )
-    return _deepcopy_json(value)
+    version = disposition.get("version")
+    if type(version) is not int or version != _RECOVERY_DISPOSITION_VERSION:
+        raise ValueError(
+            "coordinator 狀態檔 unsupported recovery disposition version（fail-closed）: "
+            f"{state_path}"
+        )
+    return {
+        "version": version,
+        "request_id": _require_non_empty_string(
+            disposition.get("request_id"),
+            label="recovery disposition request_id",
+            state_path=state_path,
+        ),
+        "status": _require_non_empty_string(
+            disposition.get("status"),
+            label="recovery disposition status",
+            state_path=state_path,
+        ),
+        "completed_at": _require_non_empty_string(
+            disposition.get("completed_at"),
+            label="recovery disposition completed_at",
+            state_path=state_path,
+        ),
+    }
 
 
 def _validate_optional_recovery_slice_fields(
