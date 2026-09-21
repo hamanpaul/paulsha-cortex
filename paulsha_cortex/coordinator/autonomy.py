@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import os
 import inspect
+import logging
+import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -10,14 +12,15 @@ from paulsha_cortex.config import paths
 
 from .._yaml import YAMLError, safe_load
 from . import completion
+from . import executor_backoff
+from . import provider_outcome
+from . import verification
 from .contract_command import build_dispatch_prompt
 from .diagnostics import DiagnosticReason, diagnostic_reason
 from .dispatcher import _default_git_runner
 from .launcher import AgentLauncher, LaunchHandle
 from .model_identities import load_model_identities
-from . import provider_outcome
 from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
-from . import verification
 
 # is_satisfied predicate 型別：收 slice_id，回該相依是否「已滿足」（可釋放下游）。
 # 判定來源由呼叫者決定（merged-to-main vs handoff gate_status）——#104 留開放。
@@ -25,6 +28,9 @@ IsSatisfied = Callable[[str], bool]
 
 # Dispatcher duck-type：只需有 dispatch(task, persona, pane_id, command) -> dict（Phase 2 介面）。
 DEFAULT_HANDOFF_DIR = "runtime/handoff"
+_DISPATCH_BACKOFF_UNKNOWN_REASON = "executor-backoff-store-unknown"
+
+logger = logging.getLogger(__name__)
 
 
 class DispatchReadyError(RuntimeError):
@@ -601,6 +607,8 @@ def dispatch_ready(
     identity_registry=None,
     launcher_factory=None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    *,
+    backoff_skips: list[dict] | None = None,
 ) -> list[dict]:
     """算就緒集，對每單位經注入的 headless AgentLauncher 各啟一個 agent（一單位一 job）。
 
@@ -649,6 +657,14 @@ def dispatch_ready(
         slice_id = m["slice_id"]
         job: dict | None = None
         pinned_inputs: dict | None = None
+        early_dispatch_head: str | None = None
+        active_launcher = launcher
+        identity = None
+        resolved_executor: str | None = None
+        resolved_model_id: str | None = None
+        launch_executor: str | None = None
+        launch_model_id: str | None = None
+        slice_recorded = False
         try:
             pinned_inputs = pin_dispatch_inputs(m)
             # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查
@@ -656,37 +672,11 @@ def dispatch_ready(
             # 再被更新（見下方 _mark_slice_needs_human），故先嘗試取現有 branch head
             # 存底；branch 尚未建立（首次派工常態）時取不到，None 為預期落點。
             try:
-                early_dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])
+                early_dispatch_head = runner(["rev-parse", _branch_for_slice(slice_id)])
             except Exception:
                 early_dispatch_head = None
-            _record_pending_slice(
-                dispatcher=dispatcher,
-                slice_id=slice_id,
-                pinned_inputs=pinned_inputs,
-                dispatch_base=early_dispatch_head,
-            )
-            # #503：builder 只拿 task id＋plan 路徑不是 authority——controller 重釘 spec
-            # 加進的 recovery 指示會在模型邊界被靜默丟掉。slice row 登記後重讀 spec、hash
-            # 必須等於 pin 值（launch-time equality），逐字交付進 prompt，並把交付的 hash
-            # 記到 job row 供完成側對照（`manager._builder_input_attestation_mismatches`）。
-            # 失敗走既有 per-slice except：slice 落 needs_human、不派 job。只有 builder
-            # persona 交付 spec authority；其他 persona 維持既有三行 prompt 形狀。
-            if persona == "builder":
-                spec_body = _read_pinned_spec_body(pinned_inputs)
-                prompt = build_dispatch_prompt(
-                    persona,
-                    task=slice_id,
-                    plan_path=m["plan"],
-                    spec_path=str(pinned_inputs["spec_path"]),
-                    spec_hash=str(pinned_inputs["spec_hash"]),
-                    spec_body=spec_body,
-                )
-            else:
-                prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
-            active_launcher = launcher
             executor = m.get("executor")
             model_id = m.get("model_id")
-            identity = None
             if isinstance(executor, str) and executor and isinstance(model_id, str) and model_id:
                 if resolved_identity_registry is None:
                     resolved_identity_registry = load_model_identities()
@@ -708,6 +698,70 @@ def dispatch_ready(
                     commit_required_factory = getattr(active_launcher, "as_commit_required", None)
                     if callable(commit_required_factory):
                         active_launcher = commit_required_factory()
+            resolved_executor, resolved_model_id, identity_diagnostic = _resolve_dispatch_identity(
+                meta=m,
+                launcher=active_launcher,
+            )
+            coordinator_root = _dispatcher_coordinator_root(dispatcher)
+            if (
+                identity_diagnostic is None
+                and coordinator_root is not None
+                and resolved_executor is not None
+                and resolved_model_id is not None
+            ):
+                backoff_status = executor_backoff.active_backoff(
+                    coordinator_root,
+                    resolved_executor,
+                    resolved_model_id,
+                    now=time.time(),
+                )
+                if backoff_status.observation is executor_backoff.StoreObservation.UNKNOWN:
+                    _record_executor_backoff_skip(
+                        backoff_skips,
+                        slice_id=slice_id,
+                        executor=resolved_executor,
+                        model_id=resolved_model_id,
+                        retry_after_epoch=None,
+                        reason=_DISPATCH_BACKOFF_UNKNOWN_REASON,
+                        diagnostics=backoff_status.diagnostics,
+                    )
+                    continue
+                if backoff_status.backoff is not None:
+                    _record_executor_backoff_skip(
+                        backoff_skips,
+                        slice_id=slice_id,
+                        executor=resolved_executor,
+                        model_id=resolved_model_id,
+                        retry_after_epoch=backoff_status.backoff.deadline_epoch,
+                    )
+                    continue
+            launch_executor = _non_empty_string(getattr(active_launcher, "executor", None))
+            launch_model_id = _non_empty_string(getattr(active_launcher, "model", None))
+            _record_pending_slice(
+                dispatcher=dispatcher,
+                slice_id=slice_id,
+                pinned_inputs=pinned_inputs,
+                dispatch_base=early_dispatch_head,
+            )
+            slice_recorded = True
+            # #503：builder 只拿 task id＋plan 路徑不是 authority——controller 重釘 spec
+            # 加進的 recovery 指示會在模型邊界被靜默丟掉。slice row 登記後重讀 spec、hash
+            # 必須等於 pin 值（launch-time equality），逐字交付進 prompt，並把交付的 hash
+            # 記到 job row 供完成側對照（`manager._builder_input_attestation_mismatches`）。
+            # 失敗走既有 per-slice except：slice 落 needs_human、不派 job。只有 builder
+            # persona 交付 spec authority；其他 persona 維持既有三行 prompt 形狀。
+            if persona == "builder":
+                spec_body = _read_pinned_spec_body(pinned_inputs)
+                prompt = build_dispatch_prompt(
+                    persona,
+                    task=slice_id,
+                    plan_path=m["plan"],
+                    spec_path=str(pinned_inputs["spec_path"]),
+                    spec_hash=str(pinned_inputs["spec_hash"]),
+                    spec_body=spec_body,
+                )
+            else:
+                prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
             base_sha = _resolve_target_base_sha(
                 meta=m,
                 pinned_inputs=pinned_inputs,
@@ -746,7 +800,11 @@ def dispatch_ready(
             # #381：真正 spawn 前才 admit——記錄下這次要用的 job row 之後、
             # Popen 之前，讓等待時間不計入「job 已在跑」的錯覺。
             limiter.admit(
-                resolve_provider(identity=identity, executor=executor, launcher=active_launcher)
+                resolve_provider(
+                    identity=identity,
+                    executor=resolved_executor,
+                    launcher=active_launcher,
+                )
             )
             handle = active_launcher.launch(
                 slice_id=slice_id,
@@ -757,12 +815,22 @@ def dispatch_ready(
             job = _attach_launch_handle(dispatcher=dispatcher, job=job, handle=handle)
             jobs.append(job)
         except Exception as exc:
+            if pinned_inputs is not None and not slice_recorded:
+                try:
+                    _record_pending_slice(
+                        dispatcher=dispatcher,
+                        slice_id=slice_id,
+                        pinned_inputs=pinned_inputs,
+                        dispatch_base=early_dispatch_head,
+                    )
+                except Exception:
+                    pass
             if job is not None:
                 _fail_launching_job(
                     dispatcher,
                     job,
-                    executor=executor if isinstance(executor, str) else None,
-                    model_id=model_id if isinstance(model_id, str) else None,
+                    executor=launch_executor,
+                    model_id=launch_model_id,
                     exc=exc,
                 )
             if pinned_inputs is not None:
@@ -775,6 +843,82 @@ def dispatch_ready(
 
 def _branch_for_slice(slice_id: str) -> str:
     return f"feature/{slice_id}"
+
+
+def _non_empty_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _resolve_dispatch_identity(
+    *,
+    meta: dict,
+    launcher: AgentLauncher | None,
+) -> tuple[str | None, str | None, str | None]:
+    spec_executor = _non_empty_string(meta.get("executor"))
+    spec_model_id = _non_empty_string(meta.get("model_id"))
+    if spec_executor is not None and spec_model_id is not None:
+        return spec_executor, spec_model_id, None
+    launcher_executor = _non_empty_string(getattr(launcher, "executor", None))
+    launcher_model_id = _non_empty_string(getattr(launcher, "model", None))
+    if launcher_executor is not None and launcher_model_id is not None:
+        return launcher_executor, launcher_model_id, None
+    if spec_executor is not None or spec_model_id is not None:
+        missing = "model_id" if spec_executor is not None else "executor"
+        return None, None, f"spec-missing-{missing}"
+    if launcher_executor is not None or launcher_model_id is not None:
+        missing = "model_id" if launcher_executor is not None else "executor"
+        return None, None, f"launcher-missing-{missing}"
+    return None, None, "identity-unavailable"
+
+
+def _dispatcher_coordinator_root(dispatcher) -> Path | None:
+    registry = getattr(dispatcher, "_registry", None)
+    state_path = getattr(registry, "_state_path", None)
+    if state_path is None:
+        return None
+    try:
+        return Path(state_path).resolve().parent
+    except Exception:
+        return None
+
+
+def _record_executor_backoff_skip(
+    sink: list[dict] | None,
+    *,
+    slice_id: str,
+    executor: str,
+    model_id: str,
+    retry_after_epoch: float | None,
+    reason: str | None = None,
+    diagnostics: tuple[str, ...] = (),
+) -> None:
+    payload = {
+        "slice_id": slice_id,
+        "executor": executor,
+        "model_id": model_id,
+        "retry_after_epoch": retry_after_epoch,
+    }
+    if reason is None:
+        logger.info(
+            "slice dispatch skipped by executor backoff slice_id=%s executor=%s model_id=%s retry_after_epoch=%s",
+            slice_id,
+            executor,
+            model_id,
+            retry_after_epoch,
+        )
+    else:
+        payload["reason"] = reason
+        diagnostics_text = ",".join(diagnostics) or "none"
+        logger.info(
+            "slice dispatch skipped by executor backoff slice_id=%s executor=%s model_id=%s reason=%s diagnostics=%s",
+            slice_id,
+            executor,
+            model_id,
+            reason,
+            diagnostics_text,
+        )
+    if sink is not None:
+        sink.append(payload)
 
 
 def _resolve_target_base_sha(

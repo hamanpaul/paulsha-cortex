@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+- **#929 executor backoff slice consumers**：slice lane 的 `dispatch_ready` 現在會在 `_record_pending_slice`／
+  worktree／launch／job 建立前先解析 builder identity，優先用 spec frontmatter 的 `executor/model_id`，否則退回
+  launcher 的公開 `executor`/`model`；命中 durable executor-backoff cooldown 時不再建立 pending slice、worktree、
+  job 或模型 session，request／tick／`retry-build` consumer 會回 `dispatch_skipped_by_backoff` 而不是造假成功派工。
+  已知 cooldown 元素只帶 `slice_id`＋`executor`＋`model_id`＋`retry_after_epoch`；store unknown 則改回
+  `retry_after_epoch: null` 與明示 `reason`，提醒 unknown 不代表 quota 已可用。#825 的 quota pool／forecast／reservation
+  （R9）仍未完成。
+
 - **#928 executor backoff terminal admission**：新增 `reset_hint.py` 解析 Retry-After 與 Codex
   `Try again at ...` 文字 reset hint，workflow/slice terminal 會把 rate-limited／quota 終局寫進
   durable executor-backoff store；workflow admission 與 provider reroute 會在 runtime preflight 前

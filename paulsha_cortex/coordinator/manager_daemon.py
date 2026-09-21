@@ -940,6 +940,7 @@ def build_request_executor(
                 allow_unsafe=allow_unsafe,
                 model=requested_model,
             )
+            backoff_skips: list[dict[str, Any]] = []
             dispatched = _call_with_supported_kwargs(
                 dispatch_ready_fn,
                 [{**target, "dispatch": "auto"}],
@@ -952,7 +953,15 @@ def build_request_executor(
                 identity_registry=builder_identity_registry,
                 launcher_factory=builder_launcher_factory,
                 spawn_admission=spawn_admission,
+                backoff_skips=backoff_skips,
             )
+            if not dispatched:
+                if backoff_skips:
+                    return {
+                        "slice_id": slice_id,
+                        "dispatch_skipped_by_backoff": backoff_skips,
+                    }
+                raise RuntimeError("dispatch-returned-no-job")
             job = dispatched[0]
             if registry is None:
                 raise RuntimeError("dispatch requires registry for pinned slice metadata")
@@ -990,6 +999,7 @@ def build_request_executor(
             fanout_metas, _already_terminal, _needs_human = manager.dispatch_gate_scan(
                 metas, handoff_dir=request_handoff_dir, registry=getattr(dispatcher, "_registry", None)
             )
+            backoff_skips: list[dict[str, Any]] = []
             jobs = _call_with_supported_kwargs(
                 dispatch_ready_fn,
                 fanout_metas,
@@ -1002,9 +1012,11 @@ def build_request_executor(
                 identity_registry=builder_identity_registry,
                 launcher_factory=builder_launcher_factory,
                 spawn_admission=spawn_admission,
+                backoff_skips=backoff_skips,
             )
             return {
                 "dispatch_skipped": False,
+                "dispatch_skipped_by_backoff": backoff_skips,
                 "dispatched": jobs,
                 "completed": [],
                 "errors": [],
@@ -1031,11 +1043,14 @@ def build_request_executor(
                     "review_model": requested_review_model,
                 }
             )
-        return _call_with_supported_kwargs(
+        result = _call_with_supported_kwargs(
             run_tick_fn,
             dispatcher,
             **run_tick_kwargs,
         )
+        if isinstance(result, dict):
+            result.setdefault("dispatch_skipped_by_backoff", [])
+        return result
 
     return execute
 

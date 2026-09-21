@@ -24,8 +24,8 @@ class ResolveLauncherTests(unittest.TestCase):
         lr = _resolve_launcher("copilot", None, allow_unsafe=True, model="claude-haiku-4.5")
         self.assertIsInstance(lr, SubprocessLauncher)
         self.assertTrue(lr._allow_unsafe)
-        self.assertEqual(lr._model, "claude-haiku-4.5")
-        self.assertEqual(lr._executor, "copilot")
+        self.assertEqual(lr.model, "claude-haiku-4.5")
+        self.assertEqual(lr.executor, "copilot")
 
     def test_respects_injected_launcher(self) -> None:
         sentinel = object()

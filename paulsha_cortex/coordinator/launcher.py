@@ -1660,6 +1660,11 @@ class SubprocessLauncher:
         """
         return self._executor
 
+    @property
+    def model(self) -> str | None:
+        """公開 launcher 綁定的 model id（未 pin 時為 ``None``）。"""
+        return self._model
+
     def as_read_only(self) -> "SubprocessLauncher":
         """Return an equivalent launcher with the executor's strict planning contract."""
 

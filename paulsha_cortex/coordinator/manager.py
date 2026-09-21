@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import fnmatch
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -104,6 +105,28 @@ WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _call_with_supported_kwargs(func, *args, **kwargs):
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return func(*args, **kwargs)
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return func(*args, **kwargs)
+    supported = {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    }
+    filtered_kwargs = {name: value for name, value in kwargs.items() if name in supported}
+    return func(*args, **filtered_kwargs)
 
 
 def _is_safe_slice_id(slice_id) -> bool:
@@ -2110,7 +2133,9 @@ def apply_slice_action(
             raise ValueError(f"invalid-spec:{target['parse_error'].get('field')}")
         if not (isinstance(target.get("plan"), str) and target["plan"]):
             raise ValueError("no-plan")
-        dispatched = dispatch_ready_fn(
+        backoff_skips: list[dict[str, Any]] = []
+        dispatched = _call_with_supported_kwargs(
+            dispatch_ready_fn,
             [{**target, "dispatch": "auto"}],
             lambda sid: autonomy.default_is_satisfied(
                 sid,
@@ -2122,8 +2147,15 @@ def apply_slice_action(
             launcher=launcher,
             handoff_dir=handoff_dir,
             git_runner=runner,
+            backoff_skips=backoff_skips,
         )
         if not dispatched:
+            if backoff_skips:
+                return {
+                    "slice_id": slice_id,
+                    "action": action,
+                    "dispatch_skipped_by_backoff": backoff_skips,
+                }
             raise RuntimeError("retry-build-dispatch-failed")
         latest = registry.get_slice(slice_id)
         outcome = {
@@ -2885,10 +2917,12 @@ def run_tick(
       `functools.partial(skill_janitor.run_janitor_tick, cards=cards, ledger_path=..., proposals_dir=...)`。
     兩者任一丟例外都收進 errors（stage 分別為 skill_ledger／skill_janitor），不影響
     dispatch/complete/reap 任何一段的結果。
-    回 {dispatch_skipped, dispatched, completed, errors, reaped, needs_human, skill_usage_events, skill_janitor}。
+    回 {dispatch_skipped, dispatch_skipped_by_backoff, dispatched, completed, errors, reaped, needs_human,
+    skill_usage_events, skill_janitor}。
     """
     satisfied = is_satisfied if is_satisfied is not None else _satisfied_pred(handoff_dir)
     dispatched: list = []
+    dispatch_skipped_by_backoff: list[dict[str, Any]] = []
     errors: list = []
     # 已有 handoff 終局紀錄（needs_human/failed/passed/verified 皆算）的 slice：
     # 不論 dispatch_skipped 與否都要掃描——這段刻意放在 idle 判斷之前、兩分支共用，
@@ -2908,7 +2942,8 @@ def run_tick(
     else:
         dispatch_skipped = False
         try:
-            dispatched = autonomy.dispatch_ready(
+            dispatched = _call_with_supported_kwargs(
+                autonomy.dispatch_ready,
                 fanout_metas,
                 satisfied,
                 dispatcher,
@@ -2919,6 +2954,7 @@ def run_tick(
                 identity_registry=identity_registry,
                 launcher_factory=launcher_factory,
                 spawn_admission=spawn_admission,
+                backoff_skips=dispatch_skipped_by_backoff,
             )
         except autonomy.DispatchReadyError as exc:
             dispatched = list(exc.jobs)
@@ -2976,6 +3012,7 @@ def run_tick(
             reap_errors.append({"stage": "reap", "error": str(exc)})
     return {
         "dispatch_skipped": dispatch_skipped,
+        "dispatch_skipped_by_backoff": dispatch_skipped_by_backoff,
         "dispatched": dispatched,
         "completed": complete["completed"],
         "errors": errors + complete["errors"] + ledger_errors + janitor_errors + reap_errors,

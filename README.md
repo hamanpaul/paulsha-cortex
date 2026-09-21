@@ -289,6 +289,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
 
    `--executor`／`--model` 省略時由 daemon 採用部署設定；帶 `--wait [--timeout N]` 時成功為 exit 0、terminal failure 為 exit 1、逾時仍為 exit 3。所有 queue mutation 都可加 `--json` 取得 `cortex-porcelain/run/v1` 輸出。
    若 spec frontmatter 成對宣告 optional `executor`／`model_id`，fanout/tick 會逐 slice 覆寫這裡的 builder 預設值；命令列明確指定與 spec frontmatter 宣告的 `(executor, model_id)` 都會先查 `model-identities.yaml`，unknown identity 直接 fail-closed 並列出可用 candidates。
+   `run fanout`／`run tick` 的 JSON 結果固定帶 `dispatch_skipped_by_backoff`；若 `dispatch` request 或 `slice-action retry-build` 因 durable executor backoff 沒有派出 job，也會回同名欄位而不是造假 `job_id`。元素若是已知 cooldown，形狀正好是 `{"slice_id","executor","model_id","retry_after_epoch"}`；若 store 狀態未知，則改為 `retry_after_epoch: null` 並帶 `reason`（目前為 `executor-backoff-store-unknown`）。**unknown 只代表 durable backoff state 無法可信判定，不代表 quota/額度已可用。**
    `cortex run work start/resume/...` 額外支援 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model`：run-scoped 覆寫該 work item 這次 claim 的 planner/builder/reviewer 模型鏈，三段各自獨立、未指定的段落回退共享 `model-identities.yaml`。覆寫只影響這個 run，不改共享設定檔、不影響其他 active run 尚未派出的 card；於 claim（或首次 dispatch）時凍結，之後 resume／retry 沿用凍結值。指定的 identity 仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 CLI 直接回報錯誤原因並列出可用 identity，不會靜默退回共享預設。
 
 11. 用 `recover` 家族執行受限復原；slice/work mutation 的 `--actor` 為必要審計欄位：
@@ -390,7 +391,7 @@ cortex tick \
 
 `tick` 會依序處理 ready fanout、既有 Job 輪詢、deterministic verification、必要的 foreign review 與 completion 判斷。`--executor`／`--model` 是整批 builder 預設值；spec frontmatter 若成對宣告 `executor`／`model_id`，會逐 slice 覆寫且沿用同一套 commit-required／approval-safety 語意。命令列明確指定與 per-slice 覆寫的 `(executor, model_id)` 都必須存在於 `model-identities.yaml`，才會真正進 executor argv。不要在一般操作加入 `--allow-unsafe`；它會旁路 executor approval/sandbox，且只允許單一 ready slice canary。
 
-若 fanout 發生 `dispatch` 例外，`tick` 回傳仍包含 `completed` 與 `dispatched`，並在 `errors` 按 slice 回報 `slice_id`、`type`、`message`，讓上層在部分派送成功時仍可見完整狀態。
+若 fanout 發生 `dispatch` 例外，`tick` 回傳仍包含 `completed` 與 `dispatched`，並在 `errors` 按 slice 回報 `slice_id`、`type`、`message`，讓上層在部分派送成功時仍可見完整狀態。summary 也固定帶 `dispatch_skipped_by_backoff`：已知 cooldown 會給 `retry_after_epoch`，store unknown 只會給 `reason` 與 `retry_after_epoch: null`；unknown 一律視為「暫時不能可信派工」，不是 quota 已恢復的訊號。
 
 Daemon log 的每筆輸出則會以 ISO-8601 時間戳作為欄位首位，便於 `journalctl` / `manager.log` 直接過濾。
 
