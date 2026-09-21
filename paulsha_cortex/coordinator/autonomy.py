@@ -800,9 +800,16 @@ def dispatch_ready(
             # #381：真正 spawn 前才 admit——記錄下這次要用的 job row 之後、
             # Popen 之前，讓等待時間不計入「job 已在跑」的錯覺。
             limiter.admit(
+                # spawn admission 的 provider 分桶沿用 spec 的 executor 字面值
+                # （todo 非目標：不改 spawn_admission 節流語意）；identity 不完整時
+                # resolved_executor 為 None，不得因此退到 launcher 自報／default 桶。
                 resolve_provider(
                     identity=identity,
-                    executor=resolved_executor,
+                    executor=(
+                        resolved_executor
+                        if resolved_executor is not None
+                        else (executor if isinstance(executor, str) else None)
+                    ),
                     launcher=active_launcher,
                 )
             )
