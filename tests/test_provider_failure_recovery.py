@@ -14,9 +14,12 @@ retry、無 backoff。本檔驗證：
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -254,6 +257,65 @@ def _rerouted_identity(target):
     if target is None:
         return None
     return getattr(target, "identity", target)
+
+
+def _outcome_input(outcome: str, reason: str, reset_at: float | None) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "outcome": outcome,
+        "authority": "structured",
+        "reason": reason,
+        "retryable": outcome == "rate_limited",
+    }
+    if reset_at is not None:
+        payload["reset_at"] = reset_at
+    payload_bytes = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "outcome": outcome,
+        "authority": "structured",
+        "payload": payload,
+        "payload_fingerprint": hashlib.sha256(payload_bytes).hexdigest(),
+        "reason": reason,
+        "policy_revision": "executor-backoff/v1",
+        "rate_limited_base_seconds": 10.0,
+        "quota_base_seconds": 40.0,
+        "backoff_multiplier_base": 2.0,
+        "backoff_max_exponent": 4,
+        "reset_margin_seconds": 5.0,
+        "reset_provenance": "structured" if reset_at is not None else "absent",
+        "reset_parser": None,
+        "evidence_ref": "fixture://provider-failure-recovery",
+    }
+
+
+def _record_backoff(
+    coordinator_root: Path,
+    *,
+    executor: str,
+    model_id: str,
+    now: float,
+    reset_at: float,
+    job_id: str,
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    result = executor_backoff.record_backoff(
+        coordinator_root,
+        executor,
+        model_id,
+        now=now,
+        outcome=_outcome_input("rate_limited", "synthetic-rate-limit", reset_at),
+        reset_at=reset_at,
+        reason="synthetic-rate-limit",
+        job_id=job_id,
+        event_epoch=now,
+    )
+    assert result.observation.value == "valid"
 
 
 # --------------------------------------------------------------- bounded retry + re-route
@@ -510,6 +572,118 @@ def test_effort_not_supported_with_only_runtime_unqualified_alternatives_stops_i
     assert "needs_human" in persisted.facets
 
 
+def test_reroutable_failure_with_only_backed_off_alternative_returns_executor_backoff_decision(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    base_head = _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    _seed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+        outcome=ProviderOutcome.EXECUTABLE_NOT_FOUND,
+    )
+    identities = _two_builder_identities()
+    dispatcher = _ResumeDispatcher(registry, worktree)
+    coordinator_root = tmp_path / "coordinator"
+    current = time.time()
+    jobs_before = len(registry.list_jobs())
+
+    _record_backoff(
+        coordinator_root,
+        executor="claude",
+        model_id="claude-primary",
+        now=current,
+        reset_at=current + 600.0,
+        job_id="job-claude-rate-limited",
+    )
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+
+    assert result["reason"] == "executor-backoff"
+    assert result["provider_outcome"] == "executable_not_found"
+    assert result["provider_retry_count"] == 0
+    assert result["provider_retry_limit"] == terminal_contract.MAX_PROVIDER_RETRIES
+    assert result["retry_after_epoch"] == pytest.approx(current + 605.0, rel=0, abs=5.0)
+    assert result["skipped"] == [
+        {
+            "executor": "claude",
+            "model_id": "claude-primary",
+            "retry_after_epoch": pytest.approx(current + 605.0, rel=0, abs=5.0),
+        }
+    ]
+    assert "job_id" not in result
+    assert len(registry.list_jobs()) == jobs_before
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" not in persisted.facets
+    assert persisted.attempts.get(manager._provider_retry_attempt_key("subagent-build"), 0) == 0
+
+
+def test_reroutable_failure_with_unknown_backoff_state_returns_unknown_decision(
+    tmp_path: Path,
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    base_head = _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    _seed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+        outcome=ProviderOutcome.EXECUTABLE_NOT_FOUND,
+    )
+    identities = _two_builder_identities()
+    dispatcher = _ResumeDispatcher(registry, worktree)
+    coordinator_root = tmp_path / "coordinator"
+    coordinator_root.mkdir(parents=True, exist_ok=True)
+    (coordinator_root / executor_backoff.STATE_FILENAME).write_text(
+        "{not-json}\n",
+        encoding="utf-8",
+    )
+    jobs_before = len(registry.list_jobs())
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+
+    assert result["reason"] == "executor-backoff-unknown"
+    assert result["provider_outcome"] == "executable_not_found"
+    assert result["provider_retry_count"] == 0
+    assert result["provider_retry_limit"] == terminal_contract.MAX_PROVIDER_RETRIES
+    assert "retry_after_epoch" not in result
+    assert "job_id" not in result
+    assert result["diagnostics"][0]["executor"] == "claude"
+    assert result["diagnostics"][0]["reconciliation"] == "unknown"
+    assert len(registry.list_jobs()) == jobs_before
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" not in persisted.facets
+    assert persisted.attempts.get(manager._provider_retry_attempt_key("subagent-build"), 0) == 0
+
+
 def test_provider_retry_bounded_and_exhaustion_reaches_needs_human(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     worktree = tmp_path / "wt"
@@ -723,6 +897,120 @@ def test_reroute_with_single_candidate_returns_none_not_a_policy_shopped_identit
         launcher_factory=_launcher_factory,
     )
     assert rerouted is None
+
+
+def test_provider_failure_reroute_returns_none_when_only_remaining_candidate_is_on_backoff(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    identities = _two_builder_identities()
+    step = manager._current_workflow_step(run)
+    assert step is not None
+    coordinator_root = tmp_path / "coordinator"
+    current = time.time()
+
+    _record_backoff(
+        coordinator_root,
+        executor="claude",
+        model_id="claude-primary",
+        now=current,
+        reset_at=current + 600.0,
+        job_id="job-claude-rate-limited",
+    )
+
+    rerouted = manager._provider_failure_reroute(
+        run,
+        step,
+        identities,
+        failed_job={"executor": "codex", "model_id": "gpt-primary"},
+        classification=manager.provider_outcome.ProviderFailureClassification(
+            outcome=ProviderOutcome.RATE_LIMITED,
+            authority=SignalAuthority.TEXT_SIGNAL,
+            reason="synthetic",
+        ),
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+        registry=registry,
+    )
+
+    assert rerouted is None
+
+
+def test_reroute_with_eligible_and_unknown_candidates_returns_unknown_decision(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "claude-primary",
+                "independence_domain": "anthropic",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "copilot",
+                "model_id": "gpt-5.4",
+                "independence_domain": "github",
+                "capabilities": ["build"],
+            },
+        ]
+    )
+    step = manager._current_workflow_step(run)
+    assert step is not None
+    coordinator_root = tmp_path / "coordinator"
+    coordinator_root.mkdir(parents=True, exist_ok=True)
+
+    class _UnreadableInventoryRegistry:
+        def list_jobs(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "job_id": "job-claude-terminal",
+                    "status": "failed",
+                    "executor": "claude",
+                    "model_id": "claude-primary",
+                    "provider_outcome": {
+                        "outcome": "rate_limited",
+                        "authority": "text_signal",
+                        "reason": "synthetic-rate-limit",
+                        "retryable": True,
+                    },
+                }
+            ]
+
+    def _launcher_factory_should_not_run(_identity):
+        raise AssertionError("unknown reroute candidate must short-circuit before preflight")
+
+    rerouted = manager._provider_failure_reroute(
+        run,
+        step,
+        identities,
+        failed_job={"executor": "codex", "model_id": "gpt-primary"},
+        classification=manager.provider_outcome.ProviderFailureClassification(
+            outcome=ProviderOutcome.RATE_LIMITED,
+            authority=SignalAuthority.TEXT_SIGNAL,
+            reason="synthetic",
+        ),
+        launcher_factory=_launcher_factory_should_not_run,
+        coordinator_root=coordinator_root,
+        registry=_UnreadableInventoryRegistry(),
+    )
+
+    assert isinstance(rerouted, dict)
+    assert rerouted["reason"] == "executor-backoff-unknown"
+    assert "skipped" not in rerouted
+    assert rerouted["diagnostics"][0]["executor"] == "claude"
+    assert rerouted["diagnostics"][0]["model_id"] == "claude-primary"
+    assert rerouted["diagnostics"][0]["diagnostics"] == ["inventory-unavailable"]
+    assert rerouted["diagnostics"][0]["reconciliation"] == "unknown"
 
 
 def test_reroute_for_reviewer_never_crosses_into_builder_domain(tmp_path: Path) -> None:

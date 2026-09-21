@@ -8,6 +8,8 @@ Root cause：`completion.classify_completion` 只有 exited/failed 兩值，`man
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from paulsha_cortex.coordinator.provider_outcome import (
@@ -52,6 +54,63 @@ def test_rate_limit_signals_classify_as_rate_limited_and_retryable(output):
     assert result.outcome is ProviderOutcome.RATE_LIMITED
     assert result.authority is SignalAuthority.TEXT_SIGNAL
     assert result.retryable is True
+
+
+def test_text_rate_limit_parses_reset_hint_without_changing_payload_shape() -> None:
+    now = int(datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc).timestamp())
+    pdt = timezone(timedelta(hours=-7), name="PDT")
+
+    result = classify_provider_failure(
+        exit_code=1,
+        output="rate limit exceeded -- Try again at Sep 7th 12:23 PM",
+        now=now,
+        tz=pdt,
+    )
+
+    assert result.outcome is ProviderOutcome.RATE_LIMITED
+    assert result.reset_at == int(datetime(2026, 9, 7, 12, 23, tzinfo=pdt).timestamp())
+    assert result.reset_parser == {
+        "rule_version": "v1",
+        "timezone": "PDT",
+        "base_year": 2026,
+        "base_reference_epoch": now,
+    }
+    assert set(result.to_dict()) == {
+        "outcome",
+        "authority",
+        "reason",
+        "retryable",
+        "reset_at",
+    }
+
+
+def test_text_rate_limit_without_explicit_timezone_does_not_parse_codex_hint() -> None:
+    now = int(datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc).timestamp())
+
+    result = classify_provider_failure(
+        exit_code=1,
+        output="rate limit exceeded -- Try again at Sep 7th 12:23 PM",
+        now=now,
+    )
+
+    assert result.outcome is ProviderOutcome.RATE_LIMITED
+    assert result.reset_at is None
+    assert result.reset_parser is None
+
+
+def test_structured_reset_signal_keeps_reset_at_without_parser_metadata() -> None:
+    output = "\n".join(
+        [
+            '{"type":"system","subtype":"rate_limit_event","rate_limit_event":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1786554000}}',
+            '{"type":"result","subtype":"error","is_error":true,"api_error_status":429,"terminal_reason":"api_error"}',
+        ]
+    )
+
+    result = classify_provider_failure(exit_code=1, output=output)
+
+    assert result.outcome is ProviderOutcome.RATE_LIMITED
+    assert result.reset_at == 1786554000
+    assert result.reset_parser is None
 
 
 def test_rate_limit_signal_wins_even_when_message_also_mentions_authenticate():

@@ -13,6 +13,21 @@ Monitor 對每個 repo/work item 只公開 `topic`、`todo`、`on-going`、`done
 
 Provider 失敗時會保留 last-good snapshot 並標 `degraded`。GitHub provider 超過 900 秒沒有成功 snapshot 時，auto claim 與 merge 都會 fail-closed。
 
+### Workflow admission 的 executor backoff
+
+Workflow lane 在 runtime preflight 與 provider-failure reroute 之前，會先讀 durable
+executor-backoff store 的 executor×model cooldown。active cooldown 只會在既有候選順序上
+被跳過，不會把 run 打進 `needs_human`；若仍有其他合法候選，正式派出的 job row 會帶
+`dispatch_reroute = {"source": "executor-backoff", "skipped": [...]}` 收據，保留這次略過了哪個
+identity 與其 `retry_after_epoch`。若全部候選都仍在 cooldown，Manager 直接回
+`reason: executor-backoff` 與最早的 `retry_after_epoch`，不建立 worktree、job 或模型 session。
+
+admission 前也會拿 registry 內既有 terminal job 當 caller inventory 與 store 對帳；若 store
+unreadable/corrupt，或 inventory 與 store 還在 pending/conflict，Manager 會回
+`reason: executor-backoff-unknown`，明確保留 unknown 而不是把它折成 allow/deny，也不捏造
+`retry_after_epoch`。修好 store 後重新 `resume` 即可；slice lane 的 request／tick consumer 仍由
+#929 承接，本票只落 workflow admission 與 terminal 記錄/對帳。
+
 ### Planning capability probe boundary
 
 Planning runtime 建構時，AGY capability probe 的 `build_agy_argv(...)` 若拋出一般 `Exception`，只會把 AGY probe 降為 `smoke-failed`／`ready=false`；這個局部 containment 不會把建構錯誤升格成整個 runtime failure。只要非 AGY primary 的 probe 成功，production planning runtime 仍可完成建構並保留 primary。失敗的 AGY identity 不會被選為 ready secondary；這只說明 probe 邊界，並不保證一定存在合格的異質 secondary planner。
