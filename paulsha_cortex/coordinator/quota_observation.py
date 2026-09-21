@@ -947,11 +947,16 @@ def _parse_descriptor_units(
     if len(items) > _MAX_CONTEXT_ITEMS:
         raise QuotaContractError("resource_limit", locator)
     units: list[UnitDefinition] = []
+    seen_refs: set[tuple[str, str]] = set()
     for index, item in enumerate(items):
         item_locator = locator + (index,)
         payload = _expect_dict(item, item_locator)
         _ensure_exact_keys(payload, _UNIT_INLINE_KEYS, item_locator)
-        units.append(_parse_inline_unit(payload, item_locator))
+        unit = _parse_inline_unit(payload, item_locator)
+        if unit.ref in seen_refs:
+            raise QuotaContractError("duplicate_reference", item_locator)
+        seen_refs.add(unit.ref)
+        units.append(unit)
     return tuple(units)
 
 
@@ -984,10 +989,19 @@ def _parse_descriptor_windows(
         raise QuotaContractError("resource_limit", locator)
     unit_refs = frozenset(unit.ref for unit in units)
     windows: list[object] = []
+    seen_window_ids: set[str] = set()
     for index, item in enumerate(items):
         item_locator = locator + (index,)
         payload = _expect_dict(item, item_locator)
-        windows.append(_parse_descriptor_window(payload, item_locator, unit_refs))
+        window = _parse_descriptor_window(payload, item_locator, unit_refs)
+        window_id = _parse_identifier(
+            payload.get("window_id"),
+            item_locator + ("window_id",),
+        )
+        if window_id in seen_window_ids:
+            raise QuotaContractError("duplicate_reference", item_locator)
+        seen_window_ids.add(window_id)
+        windows.append(window)
     return tuple(windows)
 
 

@@ -864,6 +864,32 @@ def test_parse_pool_descriptor_rejects_window_unit_ref_missing_from_inline_units
     assert excinfo.value.locator == ("windows", 0, "unit_ref")
 
 
+def test_parse_pool_descriptor_rejects_duplicate_inline_unit_refs() -> None:
+    api = _quota_api()
+    payload = _pool_descriptor_payload()
+    payload["units"].append(deepcopy(payload["units"][0]))
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_pool_descriptor"](payload)
+
+    assert excinfo.value.code == "duplicate_reference"
+    assert excinfo.value.locator == ("units", 1)
+
+
+def test_parse_pool_descriptor_rejects_duplicate_window_ids() -> None:
+    api = _quota_api()
+    payload = _pool_descriptor_payload()
+    duplicate_window = deepcopy(payload["windows"][0])
+    duplicate_window["duration_ms"] = 120000
+    payload["windows"].append(duplicate_window)
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_pool_descriptor"](payload)
+
+    assert excinfo.value.code == "duplicate_reference"
+    assert excinfo.value.locator == ("windows", 1)
+
+
 @pytest.mark.parametrize(
     ("window_instance", "expected_code", "expected_locator"),
     (
