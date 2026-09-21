@@ -48,7 +48,7 @@
 - [ ] 3.1 為 R08/R09/R12 建立/重用精確 child work items；#835 已有 accepted profile schema/原生 effort/registry 相容三件組，完整母範圍仍 Red，先 schema-key child 再分拆其他入口，不先勾產品完成。
 - [ ] 3.2 實作 adapter capability descriptors 與 conformance；新虛構 model/effort 無 central product-name diff。
 - [ ] 3.3 實作 requested/resolved/observed profile 與可追溯 effective argv/config；unsupported pre-spawn fail-closed。
-- [ ] 3.3.1 依 #849 交付純 schema／canonical key 核心，原生 effort 與 observed unknown 不補值；母 #835 routing／migration 與 #842 qualification 另留正式 evidence。
+- [x] 3.3.1 依 #849 交付純 schema／canonical key 核心，原生 effort 與 observed unknown 不補值；母 #835 routing／migration 與 #842 qualification 另留正式 evidence。
   - [x] RED：依 accepted `execution-profile-schema-core` plan 新增 `tests/test_execution_profile_schema_core.py`，鎖定虛構 descriptor／原生 effort、三層 plane round-trip 與 observed/actual key 缺口；目前 production module 尚未實作，focused pytest 以 6 failures／exit 1 呈現 RED，T01/T02 source 與後續 GREEN 仍待完成。
   - [x] GREEN：新增 `paulsha_cortex/coordinator/execution_profile.py` 純 schema／canonical-key core，完成 immutable descriptor/profile、原生 effort grammar、三層 tagged values、typed D4 projection／framing、actual unknown fail-closed 與 D5 bounded validation；focused pytest 6 passed。production routing、qualification、migration、installed/live 仍未完成。
 - [ ] 3.4 實作 PatchMUD versioned report consumer、legacy migration 與 profile/cohort/role/coverage 驗證。
