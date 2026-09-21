@@ -7,17 +7,17 @@
 
 ## [Unreleased]
 
-- **#862 recovery registry receipt load contract**：`JobRegistry` 現在對 slice 的 additive
-  `recovery_receipts`／`recovery_receipt_history`／`recovery_checkpoints`／
-  `recovery_dispositions` 做 fail-closed 載入驗證與深拷貝保護：live
-  `recovery_receipts` 仍鎖定當前 slice 的 target/caller 綁定，而
-  `recovery_receipt_history`／`recovery_checkpoints` 只驗 immutable payload
-  自洽性，不再因 slice 後續演進而被拒載；receipt version 也嚴格限定 exact-int v1。
-  receipts/checkpoints 會拒絕未知 version、request bytes／payload digest／target
-  mismatch 與跨 recovery/checkpoint 的 registry-wide `request_id` collision；
-  dispositions 則只接受 versioned exact-key rows，unversioned 或未知鍵 payload 會
-  fail-closed。合法 legacy rows 仍不補寫缺欄位，既有 v1 migration 與 #501 repair
-  行為維持不變。
+- **#862 recovery registry receipt contract**：`JobRegistry` 現在依 OpenSpec 實作
+  recovery registry 的 versioned request/receipt/checkpoint 契約：fresh /
+  checkpointed slice 會持久化 `binding_version`／`binding_revision`，
+  `prepare_recovery()`／`commit_pre_candidate_recovery()` 以
+  `cortex/recovery-registry-request/v1` digest、exact binding CAS、required-step
+  receipts 與 idempotent replay 寫入 `cortex/recovery-registry-receipt/v1`；舊
+  builder/reviewer job 會落 `cortex/job-supersession/v1`，`record_job_consumption()`
+  另以 `cortex/job-consumption/v1` 保存獨立 completion proof，而
+  `checkpoint_legacy_binding()` 可用 fingerprint + provenance 建立 revision 1 的
+  `cortex/legacy-binding-checkpoint-receipt/v1`，不清 binding、不改歷史欄位。同步補上
+  golden-vector / ABA / replay / rollback 測試。
 
 - **Refine B2 進度 handoff**：新增 `docs/handoffs/2026-09-21-refine-b2-handoff.md`——#911／#825 家族／#866 六條 run
   的交付與介入紀錄、runtime 現況、下一步順序與派工要訣、#933–#937 分析。docs-only。
