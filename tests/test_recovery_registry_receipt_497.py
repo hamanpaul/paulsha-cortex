@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 import pytest
 
+from paulsha_cortex.coordinator import registry as registry_module
 from paulsha_cortex.coordinator.registry import JobRegistry
 
 RECOVERY_REQUEST_VERSION = "cortex/recovery-registry-request/v1"
@@ -701,6 +702,98 @@ def test_commit_pre_candidate_recovery_persist_failure_rolls_back_prepared_state
     assert registry.get_job(reviewer["job_id"]).get("supersession") is None
 
 
+def test_commit_pre_candidate_recovery_replace_failure_rolls_back_prepared_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, builder, reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
+    request = _recovery_request(slice_row)
+    registry.prepare_recovery("slice-a", request=request)
+    prepared_bytes = state_path.read_bytes()
+
+    def fail_replace(_source: object, _target: object) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(registry_module.os, "replace", fail_replace)
+    with pytest.raises(RuntimeError, match="recovery-persistence-failed: replace failed"):
+        registry.commit_pre_candidate_recovery(
+            "slice-a",
+            request=request,
+            step_receipts=_step_receipts(),
+        )
+
+    assert state_path.read_bytes() == prepared_bytes
+    rolled_back = registry.get_slice("slice-a")
+    assert rolled_back["state"] == "needs_human"
+    assert rolled_back["gate_state"] == "needs_human"
+    assert rolled_back["binding_revision"] == slice_row["binding_revision"]
+    assert rolled_back["recovery_receipts"][0]["phase"] == "prepared"
+    assert registry.get_job(builder["job_id"]).get("supersession") is None
+    assert registry.get_job(reviewer["job_id"]).get("supersession") is None
+
+
+def test_commit_pre_candidate_recovery_directory_fsync_failure_restores_prepared_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, builder, reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
+    request = _recovery_request(slice_row)
+    registry.prepare_recovery("slice-a", request=request)
+    prepared_bytes = state_path.read_bytes()
+    original_fsync = registry_module._fsync_directory
+    fsync_calls = 0
+
+    def fail_first_directory_fsync(directory: Path) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 1:
+            raise OSError("directory fsync failed")
+        original_fsync(directory)
+
+    monkeypatch.setattr(registry_module, "_fsync_directory", fail_first_directory_fsync)
+    with pytest.raises(RuntimeError, match="recovery-persistence-failed: directory fsync failed"):
+        registry.commit_pre_candidate_recovery(
+            "slice-a",
+            request=request,
+            step_receipts=_step_receipts(),
+        )
+
+    assert state_path.read_bytes() == prepared_bytes
+    rolled_back = registry.get_slice("slice-a")
+    assert rolled_back["state"] == "needs_human"
+    assert rolled_back["gate_state"] == "needs_human"
+    assert rolled_back["binding_revision"] == slice_row["binding_revision"]
+    assert rolled_back["recovery_receipts"][0]["phase"] == "prepared"
+    assert registry.get_job(builder["job_id"]).get("supersession") is None
+    assert registry.get_job(reviewer["job_id"]).get("supersession") is None
+
+
+def test_commit_pre_candidate_recovery_rollback_failure_surfaces_fatal_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry, _builder, _reviewer, slice_row, _state_path = _create_bound_slice(tmp_path)
+    request = _recovery_request(slice_row)
+    registry.prepare_recovery("slice-a", request=request)
+
+    def fail_all_directory_fsync(_directory: Path) -> None:
+        raise OSError("directory fsync failed")
+
+    monkeypatch.setattr(registry_module, "_fsync_directory", fail_all_directory_fsync)
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "recovery-persistence-failed: "
+            "coordinator state rollback failed after durability fault"
+        ),
+    ):
+        registry.commit_pre_candidate_recovery(
+            "slice-a",
+            request=request,
+            step_receipts=_step_receipts(),
+        )
+
+
 def test_commit_pre_candidate_recovery_conflict_does_not_leave_partial_job_mutations(
     tmp_path: Path,
 ) -> None:
@@ -1047,6 +1140,19 @@ def test_checkpoint_request_validates_provenance_job_refs_and_request_version(tm
         registry.checkpoint_legacy_binding("legacy-a", request=bad_version)
 
 
+def test_checkpoint_rejects_complete_legacy_row_drift(tmp_path: Path) -> None:
+    registry, _builder, _reviewer, slice_row, _state_path = _create_legacy_registry(tmp_path)
+    request = _checkpoint_request(slice_row)
+
+    registry.update_slice(
+        "legacy-a",
+        current_evidence_refs=["evidence/drifted.json"],
+    )
+
+    with pytest.raises(ValueError, match="stale-binding"):
+        registry.checkpoint_legacy_binding("legacy-a", request=request)
+
+
 def test_checkpoint_receipt_reload_rejects_rewired_applied_binding(tmp_path: Path) -> None:
     registry, _builder, _reviewer, slice_row, state_path = _create_legacy_registry(tmp_path)
     request = _checkpoint_request(slice_row)
@@ -1108,3 +1214,48 @@ def test_checkpoint_receipt_and_slice_copies_do_not_alias_registry_state(tmp_pat
         "confirmed": True,
         "score": -0.0,
     }
+
+
+def test_checkpoint_replay_after_newer_binding_revision_does_not_roll_back_generation(
+    tmp_path: Path,
+) -> None:
+    registry, _builder, _reviewer, slice_row, _state_path = _create_legacy_registry(tmp_path)
+    request = _checkpoint_request(slice_row)
+    receipt = registry.checkpoint_legacy_binding("legacy-a", request=request)
+
+    repinned = registry.repin_slice(
+        "legacy-a",
+        spec_path=slice_row["spec"]["path"],
+        spec_hash=slice_row["spec"]["hash"],
+        plan_path=slice_row["plan"]["path"],
+        plan_hash=slice_row["plan"]["hash"],
+        target_branch=slice_row["target_branch"],
+        target_remote=slice_row["target_remote"],
+        verification_hash=slice_row["verification"]["hash"],
+        verification=slice_row["verification"]["contract"],
+        dispatch_base=slice_row["dispatch_base"],
+    )
+    assert repinned["binding_revision"] == 2
+
+    replayed = registry.checkpoint_legacy_binding("legacy-a", request=request)
+    assert replayed == receipt
+    assert registry.get_slice("legacy-a")["binding_revision"] == 2
+
+
+def test_checkpoint_only_starts_revision_counting_from_the_new_observation_origin(
+    tmp_path: Path,
+) -> None:
+    registry, _builder, _reviewer, slice_row, state_path = _create_legacy_registry(tmp_path)
+    request = _checkpoint_request(slice_row)
+    original_bytes = state_path.read_bytes()
+    payload = json.loads(original_bytes.decode("utf-8"))
+    payload["slices"][0]["legacy_metadata"]["confirmed"] = False
+    state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    state_path.write_bytes(original_bytes)
+
+    reloaded = JobRegistry(state_path=state_path)
+    assert reloaded.get_slice("legacy-a").get("binding_revision") is None
+
+    receipt = reloaded.checkpoint_legacy_binding("legacy-a", request=request)
+    assert receipt["applied_binding"]["binding_revision"] == 1
+    assert reloaded.get_slice("legacy-a")["binding_revision"] == 1

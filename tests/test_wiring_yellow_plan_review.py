@@ -23,9 +23,10 @@ import hashlib
 import json
 from pathlib import Path
 
-from paulsha_cortex.coordinator import manager, work_actions
+from paulsha_cortex.coordinator import manager, work_actions, work_bridge
 from paulsha_cortex.coordinator.claim import ClaimCandidate, load_work_authority
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+from paulsha_cortex.coordinator.planning import PlanningArtifact, _frontmatter_and_body
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority
 from paulsha_cortex.deck.compile import compile_combo
@@ -366,3 +367,67 @@ def test_yellow_band_without_artifact_classes_declaration_fails_soft_and_is_obse
     # → 消費端可據此辨識「gate 被 fail-soft 跳過」而非「審查通過」。
     assert persisted.sizing_band == "yellow"
     assert persisted.plan_review_passed is False
+
+
+def test_recovery_registry_receipt_plan_twins_keep_first_and_last_helpers_in_lockstep() -> None:
+    root = Path(__file__).resolve().parents[1]
+    todo_ref = "docs/superpowers/workstreams/recovery-registry-receipt/todo.md"
+    tasks_ref = "openspec/changes/recovery-registry-receipt/tasks.md"
+    todo_text = (root / todo_ref).read_text(encoding="utf-8")
+    tasks_text = (root / tasks_ref).read_text(encoding="utf-8")
+
+    def checklist_lines(text: str) -> tuple[str, ...]:
+        return tuple(
+            line.replace("[x]", "[ ]")
+            for line in text.splitlines()
+            if line.startswith("- [")
+        )
+
+    todo_frontmatter, _, _ = _frontmatter_and_body(todo_text)
+    tasks_frontmatter, _, _ = _frontmatter_and_body(tasks_text)
+    for field_name in (
+        "domain_breadth",
+        "state_consistency",
+        "invariant_count",
+        "artifact_classes",
+    ):
+        assert todo_frontmatter[field_name] == tasks_frontmatter[field_name]
+    assert checklist_lines(todo_text) == checklist_lines(tasks_text)
+
+    todo_artifact = PlanningArtifact(kind="plan", ref=todo_ref, text=todo_text)
+    tasks_artifact = PlanningArtifact(kind="plan", ref=tasks_ref, text=tasks_text)
+    first_todo = manager._evaluate_yellow_plan_review((todo_artifact, tasks_artifact))
+    first_tasks = manager._evaluate_yellow_plan_review((tasks_artifact, todo_artifact))
+    assert first_todo is not None
+    assert first_tasks is not None
+    assert first_todo.ready is True
+    assert first_tasks.ready is True
+    assert first_todo.failed_check is None
+    assert first_tasks.failed_check is None
+
+    rows_with_todo_last = [
+        {"kind": "spec", "ref": "docs/superpowers/specs/recovery-registry-receipt-spec.md"},
+        {"kind": "design", "ref": "docs/superpowers/specs/recovery-registry-receipt-design.md"},
+        {"kind": "spec", "ref": "openspec/changes/recovery-registry-receipt/proposal.md"},
+        {"kind": "design", "ref": "openspec/changes/recovery-registry-receipt/design.md"},
+        {"kind": "plan", "ref": tasks_ref},
+        {"kind": "plan", "ref": todo_ref},
+    ]
+    rows_with_tasks_last = [
+        {"kind": "spec", "ref": "docs/superpowers/specs/recovery-registry-receipt-spec.md"},
+        {"kind": "design", "ref": "docs/superpowers/specs/recovery-registry-receipt-design.md"},
+        {"kind": "plan", "ref": todo_ref},
+        {"kind": "spec", "ref": "openspec/changes/recovery-registry-receipt/proposal.md"},
+        {"kind": "design", "ref": "openspec/changes/recovery-registry-receipt/design.md"},
+        {"kind": "plan", "ref": tasks_ref},
+    ]
+    assert work_bridge.current_sizing_snapshot(
+        workspace_root=root,
+        combo_name="feature-oneshot",
+        artifact_rows=rows_with_todo_last,
+    ) == (6, "yellow")
+    assert work_bridge.current_sizing_snapshot(
+        workspace_root=root,
+        combo_name="feature-oneshot",
+        artifact_rows=rows_with_tasks_last,
+    ) == (6, "yellow")

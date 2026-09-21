@@ -78,6 +78,33 @@ SCOPE = PlanningScope(
 )
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _tracked_recovery_registry_receipt_views() -> dict[str, tuple[PlanningArtifact, ...]]:
+    root = _repo_root()
+
+    def load(kind: str, ref: str) -> PlanningArtifact:
+        return PlanningArtifact(kind=kind, ref=ref, text=(root / ref).read_text(encoding="utf-8"))
+
+    superpowers = (
+        load("spec", "docs/superpowers/specs/recovery-registry-receipt-spec.md"),
+        load("design", "docs/superpowers/specs/recovery-registry-receipt-design.md"),
+        load("plan", "docs/superpowers/workstreams/recovery-registry-receipt/todo.md"),
+    )
+    openspec = (
+        load("spec", "openspec/changes/recovery-registry-receipt/proposal.md"),
+        load("design", "openspec/changes/recovery-registry-receipt/design.md"),
+        load("plan", "openspec/changes/recovery-registry-receipt/tasks.md"),
+    )
+    return {
+        "superpowers": superpowers,
+        "openspec": openspec,
+        "combined": superpowers + openspec,
+    }
+
+
 def test_artifact_acceptance_requires_status_sections_and_no_blocking_marker() -> None:
     accepted = assess_planning_artifact(_artifact("spec", ACCEPTED_SPEC))
     assert accepted.accepted is True
@@ -217,6 +244,61 @@ def test_canonical_accepted_source_spec_and_plan_satisfy_required_sections() -> 
 
     assert assess_planning_artifact(_artifact("spec", spec)).accepted is True
     assert assess_planning_artifact(_artifact("plan", plan)).accepted is True
+
+
+def test_recovery_registry_receipt_real_accepted_views_stay_complete_by_group_and_bundle() -> None:
+    bundles = _tracked_recovery_registry_receipt_views()
+
+    for artifact in bundles["combined"]:
+        assert assess_planning_artifact(artifact).accepted is True
+
+    for artifacts in bundles.values():
+        report = assess_planning_completeness(artifacts)
+        assert report.complete is True
+        assert report.missing_kinds == ()
+        assert report.default_question_pack.questions == ()
+
+
+def test_recovery_registry_receipt_counterfactual_draft_and_blocking_views_stay_in_memory_only() -> None:
+    bundles = _tracked_recovery_registry_receipt_views()
+    proposal, design, tasks = bundles["openspec"]
+    draft_report = assess_planning_completeness(
+        (
+            PlanningArtifact(
+                kind=proposal.kind,
+                ref=proposal.ref,
+                text=proposal.text.replace("status: accepted", "status: draft", 1),
+            ),
+            design,
+            tasks,
+        )
+    )
+    assert draft_report.complete is False
+    assert draft_report.missing_kinds == ("spec",)
+    assert [question.source_refs for question in draft_report.default_question_pack.questions] == [
+        (proposal.ref,),
+    ]
+
+    spec, design, todo = bundles["superpowers"]
+    _, _, tasks = bundles["openspec"]
+    blocked_report = assess_planning_completeness(
+        (
+            spec,
+            design,
+            PlanningArtifact(
+                kind=todo.kind,
+                ref=todo.ref,
+                text=todo.text + "\n## Open Questions\n\n- 是否可忽略 checkpoint provenance？\n",
+            ),
+            tasks,
+        )
+    )
+    assert blocked_report.complete is False
+    assert blocked_report.missing_kinds == ()
+    assert [question.kind for question in blocked_report.default_question_pack.questions] == [
+        "blocking-decision"
+    ]
+    assert blocked_report.default_question_pack.questions[0].source_refs == (todo.ref,)
 
 
 def test_marker_parser_only_blocks_standalone_or_actual_open_question_items() -> None:

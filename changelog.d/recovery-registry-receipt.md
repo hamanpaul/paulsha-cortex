@@ -11,4 +11,7 @@
   proof。Legacy row 可透過 `checkpoint_legacy_binding()` 用 fingerprint +
   provenance 建立 revision 1 的
   `cortex/legacy-binding-checkpoint-receipt/v1`，不清 binding、不改歷史欄位。同步補上
-  golden-vector / ABA / replay / rollback 測試。
+  rename/fsync/rollback fault injection、checkpoint drift/replay 與 planning-gate
+  regression，並更新 `docs/unified-work-lifecycle.md` 說明 recovery/checkpoint
+  仍屬 registry-only contract、既有 CLI 不新增 public 動詞，另留 `docs/evidence/`
+  的 pre-archive local validation record。

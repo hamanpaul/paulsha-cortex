@@ -134,6 +134,24 @@ def _authority(tmp_path: Path):
     return load_work_authority(repo="acme/demo", work_id="work", snapshot_path=snapshot)
 
 
+def _tracked_recovery_registry_receipt_rows() -> dict[str, list[dict[str, str]]]:
+    superpowers = [
+        {"kind": "spec", "ref": "docs/superpowers/specs/recovery-registry-receipt-spec.md"},
+        {"kind": "design", "ref": "docs/superpowers/specs/recovery-registry-receipt-design.md"},
+        {"kind": "plan", "ref": "docs/superpowers/workstreams/recovery-registry-receipt/todo.md"},
+    ]
+    openspec = [
+        {"kind": "spec", "ref": "openspec/changes/recovery-registry-receipt/proposal.md"},
+        {"kind": "design", "ref": "openspec/changes/recovery-registry-receipt/design.md"},
+        {"kind": "plan", "ref": "openspec/changes/recovery-registry-receipt/tasks.md"},
+    ]
+    return {
+        "superpowers": superpowers,
+        "openspec": openspec,
+        "combined": superpowers + openspec,
+    }
+
+
 def test_claim_time_sizing_computed_when_plan_and_combo_available(tmp_path: Path) -> None:
     root = _repo(tmp_path / "repo")
     _write_planning_docs(root, declare_sizing_dimensions=True)
@@ -268,6 +286,19 @@ def test_current_sizing_snapshot_invalid_dimensions_fail_soft(
         combo_name="small-fix",
         artifact_rows=rows,
     ) == (None, None)
+
+
+def test_recovery_registry_receipt_real_accepted_views_keep_current_yellow_projection() -> None:
+    root = Path(__file__).resolve().parents[1]
+    bundles = _tracked_recovery_registry_receipt_rows()
+
+    for combo_name in ("feature-oneshot", "small-fix"):
+        for rows in bundles.values():
+            assert work_bridge.current_sizing_snapshot(
+                workspace_root=root,
+                combo_name=combo_name,
+                artifact_rows=rows,
+            ) == (6, "yellow")
 
 
 # ---------------------------------------------------------------------------
