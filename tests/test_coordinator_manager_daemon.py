@@ -983,7 +983,7 @@ def test_request_tick_resets_periodic_deadline(monkeypatch, tmp_path):
 def test_idle_skipped_periodic_tick_does_not_reset_deadline(monkeypatch, tmp_path):
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
     periodic_calls: list[str] = []
-    monotonic_points = iter((0.0, 5.0, 6.0))
+    monotonic_points = iter((0.0, 5.0, 5.0, 10.0, 10.0))
 
     manager_daemon.run_loop(
         request_executor=lambda req: {"dispatched": []},

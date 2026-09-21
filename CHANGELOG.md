@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **#819 daemon periodic tick 時鐘與 idle 設定**：修正 `manager_daemon.run_loop` periodic lane 在 `dispatch_skipped="not-idle"` 時未推進時鐘導致 hot loop 的問題；跳過時推進 `last_tick_monotonic`，保持 `daemon.idle=False`、不增加錯誤計數或觸發熔斷。periodic tick runner 的 `max_load` 預設由固定 1.0 改為 CPU-aware 計算（`max(1.0, (os.cpu_count() or 1) * 0.5)`）；可設 `PSC_MANAGER_MAX_LOAD=1.0` 保留舊門檻。新增 CLI 參數 `--max-load` 與環境變數 `PSC_MANAGER_MAX_LOAD`（CLI 顯式非法值報錯 exit 2，env 非法值安全回落預設）；新增 `PSC_MANAGER_REQUIRE_IDLE` 與 `--no-require-idle` 旗標；manual tick request lane 維持 1.0 預設與既有行為不變。
+
 - **Refine B2 進度 handoff**：新增 `docs/handoffs/2026-09-21-refine-b2-handoff.md`——#911／#825 家族／#866 六條 run
   的交付與介入紀錄、runtime 現況、下一步順序與派工要訣、#933–#937 分析。docs-only。
 
