@@ -16,6 +16,9 @@
   standalone unit-catalog observation parsing。T2 已公開的 parser scaffold 現在也會
   嚴格拒收未列舉或錯形的 descriptor window／measurement／`source.method`／
   `coverage.state` wire；不接 consumer、不做 I/O、也不依賴 global catalog。
+  `PoolDescriptor`、`ProfilePoolBinding` 與 `QuotaObservation` 的 public record
+  equality/hash semantics 也改為反映完整 wire payload，避免不同隱藏欄位只因公開子集相同
+  就誤判成相等。
 
 - **#928 executor backoff terminal admission**：新增 `reset_hint.py` 解析 Retry-After 與 Codex
   `Try again at ...` 文字 reset hint，workflow/slice terminal 會把 rate-limited／quota 終局寫進

@@ -381,6 +381,56 @@ def test_unit_definition_uses_canonical_public_shape_even_for_inline_descriptor_
     assert descriptor.to_dict()["units"] == descriptor_payload["units"]
 
 
+def test_public_records_compare_and_hash_by_full_wire_payload() -> None:
+    api = _quota_api()
+
+    descriptor_payload = _pool_descriptor_payload()
+    descriptor_variant_payload = _pool_descriptor_payload()
+    descriptor_variant_payload["authority_ref"] = "fixture:pool-authority/v2"
+
+    descriptor = api["parse_pool_descriptor"](deepcopy(descriptor_payload))
+    descriptor_variant = api["parse_pool_descriptor"](
+        deepcopy(descriptor_variant_payload)
+    )
+
+    assert descriptor.to_dict() != descriptor_variant.to_dict()
+    assert descriptor != descriptor_variant
+    assert len({descriptor, descriptor_variant}) == 2
+
+    binding_payload = _binding_payload(domain="request")
+    binding_variant_payload = _binding_payload(domain="resolved")
+
+    binding = api["parse_binding"](deepcopy(binding_payload), descriptors=(descriptor,))
+    binding_variant = api["parse_binding"](
+        deepcopy(binding_variant_payload),
+        descriptors=(descriptor,),
+    )
+
+    assert binding.to_dict() != binding_variant.to_dict()
+    assert binding != binding_variant
+    assert len({binding, binding_variant}) == 2
+
+    unit = api["parse_unit_definition"](deepcopy(_unit_definition_payload()))
+    observation_payload = _cold_start_observation_payload()
+    observation_variant_payload = _cold_start_observation_payload()
+    observation_variant_payload["source"]["adapter_version"] = "fixture-adapter-v2"
+
+    observation = api["parse_observation"](
+        deepcopy(observation_payload),
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+    observation_variant = api["parse_observation"](
+        deepcopy(observation_variant_payload),
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+
+    assert observation.to_dict() != observation_variant.to_dict()
+    assert observation != observation_variant
+    assert len({observation, observation_variant}) == 2
+
+
 def test_context_records_reject_forged_untrusted_dataclasses() -> None:
     api = _quota_api()
 

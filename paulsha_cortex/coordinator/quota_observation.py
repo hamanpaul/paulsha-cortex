@@ -42,6 +42,7 @@ _MAX_OBSERVATION_CONTEXT_BYTES = _MAX_BINDING_CONTEXT_BYTES + (
 _TIME_MAX = 253402300799999
 _DURATION_MAX = 31622400000
 _TRUST_MARKER = object()
+_MISSING_WIRE = object()
 _DEFERRED_HELPER_RESULT = MappingProxyType({"state": "deferred"})
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -135,6 +136,23 @@ class _ParserSealedRecord:
             f"{type(self).__name__} is parser-sealed; use {type(self)._parser_entrypoint}()"
         )
 
+    def __eq__(self, other: object) -> bool:
+        if self is other:
+            return True
+        if type(self) is not type(other):
+            return False
+        self_wire = getattr(self, "_wire", _MISSING_WIRE)
+        other_wire = getattr(other, "_wire", _MISSING_WIRE)
+        if self_wire is _MISSING_WIRE or other_wire is _MISSING_WIRE:
+            return False
+        return self_wire == other_wire
+
+    def __hash__(self) -> int:
+        wire = getattr(self, "_wire", _MISSING_WIRE)
+        if wire is _MISSING_WIRE:
+            return object.__hash__(self)
+        return hash(_wire_hash_key(wire))
+
 
 @dataclass(frozen=True, init=False)
 class UnitDefinition(_ParserSealedRecord):
@@ -194,7 +212,7 @@ class UnitDefinition(_ParserSealedRecord):
         return _thaw_root_dict(self._wire)
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, eq=False)
 class PoolDescriptor(_ParserSealedRecord):
     _parser_entrypoint: ClassVar[str] = "parse_pool_descriptor"
     schema_version: int
@@ -248,7 +266,7 @@ class PoolDescriptor(_ParserSealedRecord):
         return _thaw_root_dict(self._wire)
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, eq=False)
 class ProfilePoolBinding(_ParserSealedRecord):
     _parser_entrypoint: ClassVar[str] = "parse_binding"
     schema_version: int
@@ -289,7 +307,7 @@ class ProfilePoolBinding(_ParserSealedRecord):
         return _thaw_root_dict(self._wire)
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, eq=False)
 class QuotaObservation(_ParserSealedRecord):
     _parser_entrypoint: ClassVar[str] = "parse_observation"
     schema_version: int
@@ -698,6 +716,16 @@ def _thaw_wire(value: object) -> object:
         return {str(key): _thaw_wire(item) for key, item in value.items()}
     if type(value) is tuple:
         return [_thaw_wire(item) for item in value]
+    return value
+
+
+def _wire_hash_key(value: object) -> object:
+    if isinstance(value, Mapping):
+        return tuple(
+            (str(key), _wire_hash_key(item)) for key, item in sorted(value.items())
+        )
+    if type(value) is tuple:
+        return tuple(_wire_hash_key(item) for item in value)
     return value
 
 
