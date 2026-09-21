@@ -219,7 +219,36 @@ def test_observed_profile_uses_frozen_actual_and_record_key_vectors() -> None:
         descriptor,
     )
 
-    assert isinstance(api.canonical_profile_bytes(observed), bytes)
+    assert (
+        api._typed_json_bytes(api._actual_projection(observed))
+        == (
+            b'["o",[["conditions",["o",[["adapter",["o",[["state",["s","known"]],["value",["o",[["id",["s","fixtur'
+            b'e-adapter"]],["protocol_id",["s","fixture-wire"]],["protocol_version",["s","1"]],["runtime_version",'
+            b'["s","1"]]]]]]]],["effort",["o",[["state",["s","known"]],["value",["f","3ff0000000000000"]]]]],["loa'
+            b'dout",["o",[["state",["s","known"]],["value",["o",[["id",["s","fixture-loadout"]],["version",["s","1'
+            b'"]]]]]]]],["model",["o",[["state",["s","known"]],["value",["o",[["id",["s","fixture-model"]],["revis'
+            b'ion",["s","r1"]]]]]]]],["permissions",["o",[["state",["s","known"]],["value",["a",[]]]]]],["sandbox"'
+            b',["o",[["state",["s","known"]],["value",["o",[["id",["s","fixture-sandbox"]],["version",["s","1"]]]]'
+            b']]]],["toolchain",["o",[["state",["s","known"]],["value",["o",[["id",["s","fixture-toolchain"]],["ve'
+            b'rsion",["s","1"]]]]]]]],["toolset",["o",[["state",["s","known"]],["value",["a",[]]]]]]]]],["schema_v'
+            b'ersion",["i","1"]]]]'
+        )
+    )
+    assert api.canonical_profile_bytes(observed) == (
+        b'["o",[["conditions",["o",[["adapter",["o",[["state",["s","known"]],["value",["o",[["id",["s","fixtur'
+        b'e-adapter"]],["protocol_id",["s","fixture-wire"]],["protocol_version",["s","1"]],["runtime_version",'
+        b'["s","1"]]]]]]]],["effort",["o",[["state",["s","known"]],["value",["f","3ff0000000000000"]]]]],["loa'
+        b'dout",["o",[["state",["s","known"]],["value",["o",[["id",["s","fixture-loadout"]],["version",["s","1'
+        b'"]]]]]]]],["model",["o",[["state",["s","known"]],["value",["o",[["id",["s","fixture-model"]],["revis'
+        b'ion",["s","r1"]]]]]]]],["permissions",["o",[["state",["s","known"]],["value",["a",[]]]]]],["sandbox"'
+        b',["o",[["state",["s","known"]],["value",["o",[["id",["s","fixture-sandbox"]],["version",["s","1"]]]]'
+        b']]]],["toolchain",["o",[["state",["s","known"]],["value",["o",[["id",["s","fixture-toolchain"]],["ve'
+        b'rsion",["s","1"]]]]]]]],["toolset",["o",[["state",["s","known"]],["value",["a",[]]]]]]]]],["plane",['
+        b'"s","observed"]],["requirements",["o",[["independence",["o",[["state",["s","known"]],["value",["n"]]'
+        b']]],["minimum_quality",["o",[["state",["s","known"]],["value",["n"]]]]],["pin",["o",[["state",["s",'
+        b'"known"]],["value",["n"]]]]],["role",["o",[["state",["s","known"]],["value",["s","review"]]]]]]]],["s'
+        b'chema_version",["i","1"]]]]'
+    )
     assert (
         api.profile_key(observed)
         == "epk:v1:observed:e2750040b4f91c563760daa19bcaa808f66bab7f4c445c3765522f19609b841b"
@@ -228,6 +257,43 @@ def test_observed_profile_uses_frozen_actual_and_record_key_vectors() -> None:
         api.actual_condition_key(observed)
         == "epk:v1:actual:cccfc64a59aed4d4f3c14caa2468b18ff1ea067eeb84e3f376e0e722799e9ac2"
     )
+
+
+@pytest.mark.parametrize(
+    ("grammar", "effort", "expected_key"),
+    [
+        (
+            {"type": "integer"},
+            1,
+            "epk:v1:actual:a5b73772473ec7f2926cc56d0117cf8b5e6ffa68431090d5be3fc552b91e729f",
+        ),
+        (
+            {"type": "string"},
+            "1",
+            "epk:v1:actual:0bbfb460e7bd4e09122ac9737d14f9efb3ecba7387a562078a0496ce395a9e30",
+        ),
+        (
+            {"type": "number"},
+            0.0,
+            "epk:v1:actual:987c15ceb122f1e723247646330890502786b63a53a13bf01311b7e06a53cbd6",
+        ),
+        (
+            {"type": "number"},
+            -0.0,
+            "epk:v1:actual:a637e42ea4416af2af0e34e869c48ef3682dceec152f7124b0855d5550731f26",
+        ),
+    ],
+)
+def test_actual_condition_key_matches_remaining_d44_golden_vectors(
+    grammar: dict[str, object], effort: object, expected_key: str
+) -> None:
+    api = _api()
+    descriptor = api.parse_descriptor(_descriptor_payload(grammar))
+    observed = api.parse_profile(
+        _profile_payload(plane="observed", effort=effort), descriptor
+    )
+
+    assert api.actual_condition_key(observed) == expected_key
 
 
 @pytest.mark.parametrize(
