@@ -40,6 +40,7 @@ _MAX_OBSERVATION_CONTEXT_BYTES = _MAX_BINDING_CONTEXT_BYTES + (
 _TIME_MAX = 253402300799999
 _DURATION_MAX = 31622400000
 _ALLOWED_CLOCK_SKEW_MAX = 300000
+_TRUST_MARKER = object()
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _REASON_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -126,6 +127,12 @@ class UnitDefinition:
     semantics_ref: str
     _wire: object = field(repr=False, compare=False)
     _json_bytes: int = field(repr=False, compare=False)
+    _trusted: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        init=False,
+    )
 
     @property
     def ref(self) -> tuple[str, str]:
@@ -165,6 +172,12 @@ class PoolDescriptor:
     windows: tuple[_WindowDefinition, ...]
     _wire: object = field(repr=False, compare=False)
     _json_bytes: int = field(repr=False, compare=False)
+    _trusted: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        init=False,
+    )
 
     @property
     def pool_ref(self) -> tuple[str, str, str, str]:
@@ -182,6 +195,12 @@ class ProfilePoolBinding:
     _status: Mapping[str, object] = field(repr=False, compare=False)
     _wire: object = field(repr=False, compare=False)
     _json_bytes: int = field(repr=False, compare=False)
+    _trusted: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        init=False,
+    )
 
     def to_dict(self) -> dict[str, object]:
         return _thaw_root_dict(self._wire)
@@ -201,6 +220,12 @@ class QuotaObservation:
     _window_end_ms: int | None = field(repr=False, compare=False)
     _wire: object = field(repr=False, compare=False)
     _json_bytes: int = field(repr=False, compare=False)
+    _trusted: object | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        init=False,
+    )
 
     def to_dict(self) -> dict[str, object]:
         return _thaw_root_dict(self._wire)
@@ -226,6 +251,15 @@ class _WindowInstanceInfo:
     end_ms: int | None = None
 
 
+def _seal_record(record: object) -> object:
+    object.__setattr__(record, "_trusted", _TRUST_MARKER)
+    return record
+
+
+def _is_trusted_record(value: object, expected_type: type[object]) -> bool:
+    return type(value) is expected_type and getattr(value, "_trusted", None) is _TRUST_MARKER
+
+
 def parse_unit_definition(payload: dict) -> UnitDefinition:
     snapshot, json_bytes = _snapshot_payload(payload, locator=(), byte_limit=_MAX_UNIT_DEFINITION_BYTES)
     _ensure_exact_keys(snapshot, _UNIT_ROOT_KEYS, ())
@@ -234,14 +268,16 @@ def parse_unit_definition(payload: dict) -> UnitDefinition:
     version = _parse_identifier(snapshot.get("version"), ("version",))
     quantity_kind = _parse_quantity_kind(snapshot.get("quantity_kind"), ("quantity_kind",))
     semantics_ref = _parse_ref(snapshot.get("semantics_ref"), ("semantics_ref",))
-    return UnitDefinition(
-        schema_version=schema_version,
-        unit_id=unit_id,
-        version=version,
-        quantity_kind=quantity_kind,
-        semantics_ref=semantics_ref,
-        _wire=_freeze_wire(snapshot),
-        _json_bytes=json_bytes,
+    return _seal_record(
+        UnitDefinition(
+            schema_version=schema_version,
+            unit_id=unit_id,
+            version=version,
+            quantity_kind=quantity_kind,
+            semantics_ref=semantics_ref,
+            _wire=_freeze_wire(snapshot),
+            _json_bytes=json_bytes,
+        )
     )
 
 
@@ -286,22 +322,19 @@ def parse_pool_descriptor(payload: dict) -> PoolDescriptor:
         if window.window_id in seen_window_ids:
             raise QuotaContractError("duplicate_reference", locator)
         seen_window_ids.add(window.window_id)
-        unit = unit_map[window.unit_ref]
-        if unit.quantity_kind == "amount" and window.kind == "instantaneous":
-            raise QuotaContractError("incompatible_semantics", locator)
-        if unit.quantity_kind == "gauge" and window.kind in {"fixed", "rolling"}:
-            raise QuotaContractError("incompatible_semantics", locator)
         windows.append(window)
-    return PoolDescriptor(
-        schema_version=schema_version,
-        authority_id=authority_id,
-        account_id=account_id,
-        pool_id=pool_id,
-        revision=revision,
-        units=tuple(units),
-        windows=tuple(windows),
-        _wire=_freeze_wire(snapshot),
-        _json_bytes=json_bytes,
+    return _seal_record(
+        PoolDescriptor(
+            schema_version=schema_version,
+            authority_id=authority_id,
+            account_id=account_id,
+            pool_id=pool_id,
+            revision=revision,
+            units=tuple(units),
+            windows=tuple(windows),
+            _wire=_freeze_wire(snapshot),
+            _json_bytes=json_bytes,
+        )
     )
 
 
@@ -321,7 +354,6 @@ def parse_binding(
     revision = _parse_identifier(snapshot.get("revision"), ("revision",))
     subject_known = _parse_subject(snapshot.get("subject"), ("subject",))
     coverage_state = _parse_coverage(snapshot.get("coverage"), ("coverage",))
-    descriptor_map = _descriptor_pool_map(descriptors)
     constraints_raw = _expect_list(snapshot.get("constraints"), ("constraints",))
     if not constraints_raw:
         raise QuotaContractError("invalid_shape", ("constraints",))
@@ -333,18 +365,14 @@ def parse_binding(
         constraint = _parse_known_unknown(
             item,
             ("constraints", index),
-            lambda value, locator: _parse_binding_constraint(value, locator, descriptor_map),
+            _parse_scope_value,
         )
         if constraint.state == "unknown":
             reasons.append("constraint-unknown")
             continue
-        pool_ref, window_id, window = constraint.value
-        key = (pool_ref, window_id)
-        if key in known_constraints:
+        if constraint.value in known_constraints:
             raise QuotaContractError("duplicate_reference", ("constraints", index))
-        known_constraints.add(key)
-        if window.kind == "unknown":
-            reasons.append("window-unknown")
+        known_constraints.add(constraint.value)
     if not subject_known:
         reasons.append("subject-unknown")
     if coverage_state != "complete":
@@ -352,13 +380,15 @@ def parse_binding(
     unique_reasons = tuple(sorted(set(reasons)))
     status_state = "complete" if not unique_reasons else "incomplete"
     status = MappingProxyType({"state": status_state, "reasons": unique_reasons})
-    return ProfilePoolBinding(
-        schema_version=schema_version,
-        binding_id=binding_id,
-        revision=revision,
-        _status=status,
-        _wire=_freeze_wire(snapshot),
-        _json_bytes=json_bytes,
+    return _seal_record(
+        ProfilePoolBinding(
+            schema_version=schema_version,
+            binding_id=binding_id,
+            revision=revision,
+            _status=status,
+            _wire=_freeze_wire(snapshot),
+            _json_bytes=json_bytes,
+        )
     )
 
 
@@ -381,7 +411,7 @@ def parse_observation(
     _ensure_exact_keys(snapshot, _OBSERVATION_KEYS, ())
     schema_version = _parse_schema_version(snapshot.get("schema_version"), ("schema_version",))
     observation_id = _parse_identifier(snapshot.get("observation_id"), ("observation_id",))
-    scope = _parse_known_unknown(
+    _parse_known_unknown(
         snapshot.get("scope"),
         ("scope",),
         _parse_scope_value,
@@ -414,7 +444,7 @@ def parse_observation(
         ("reset_at_ms",),
         lambda value, locator: _parse_time(value, locator),
     )
-    source_id, source_method, event_components = _parse_source(
+    source_id, _source_method, event_components = _parse_source(
         snapshot.get("source"), ("source",)
     )
     _parse_coverage(snapshot.get("coverage"), ("coverage",))
@@ -422,66 +452,31 @@ def parse_observation(
         if observed_at.value + ttl_ms.value > _TIME_MAX:
             raise QuotaContractError("invalid_time", ("ttl_ms",))
 
-    unit_union = _build_unit_union(descriptors, unit_catalog)
-    resolved_unit: UnitDefinition | None = None
+    unit_map = _build_unit_catalog(unit_catalog)
     if unit_ref.state == "known":
-        resolved_unit = unit_union.get(unit_ref.value)
-        if resolved_unit is None:
+        if unit_ref.value not in unit_map:
             raise QuotaContractError("unresolved_reference", ("unit_ref",))
+    if unit_ref.state == "unknown" and measurement.quantity_state not in {None, "unknown"}:
+        raise QuotaContractError("incompatible_semantics", ("measurement", "quantity"))
 
-    scope_window: _WindowDefinition | None = None
-    scope_unit: UnitDefinition | None = None
-    if scope.state == "known":
-        pool_ref, window_id = scope.value
-        descriptor = _resolve_pool_descriptor(descriptors, pool_ref, ("scope", "value", "pool_ref"))
-        scope_window = _resolve_window(descriptor, window_id, ("scope", "value", "window_id"))
-        scope_unit = _descriptor_unit_map(descriptor)[scope_window.unit_ref]
-
-    if scope_window is not None and resolved_unit is not None and resolved_unit.ref != scope_window.unit_ref:
-        raise QuotaContractError("incompatible_semantics", ("unit_ref",))
-
-    semantic_unit = resolved_unit if resolved_unit is not None else scope_unit
-    if measurement.kind == "limit_signal":
-        if source_method not in _LIMIT_SIGNAL_METHODS:
-            raise QuotaContractError("incompatible_semantics", ("source", "method"))
-    else:
-        if unit_ref.state == "unknown" and measurement.quantity_state != "unknown":
-            raise QuotaContractError("incompatible_semantics", ("measurement", "quantity"))
-        if source_method == "estimate" and measurement.quantity_state not in {"estimated", "unknown"}:
-            raise QuotaContractError("incompatible_semantics", ("source", "method"))
-        if source_method == "legacy" and measurement.quantity_state != "unknown":
-            raise QuotaContractError("incompatible_semantics", ("source", "method"))
-        if semantic_unit is not None:
-            if semantic_unit.quantity_kind == "amount" and measurement.kind == "gauge_snapshot":
-                raise QuotaContractError("incompatible_semantics", ("measurement", "kind"))
-            if semantic_unit.quantity_kind == "gauge" and measurement.kind != "gauge_snapshot":
-                raise QuotaContractError("incompatible_semantics", ("measurement", "kind"))
-
-    if scope_window is not None:
-        _validate_window_instance_against_scope(window_instance, scope_window, ("window_instance",))
-        if unit_ref.state == "unknown" and measurement.kind in _QUANTITY_MEASUREMENTS:
-            if scope_unit is not None:
-                if scope_unit.quantity_kind == "amount" and measurement.kind == "gauge_snapshot":
-                    raise QuotaContractError("incompatible_semantics", ("measurement", "kind"))
-                if scope_unit.quantity_kind == "gauge" and measurement.kind != "gauge_snapshot":
-                    raise QuotaContractError("incompatible_semantics", ("measurement", "kind"))
-
-    return QuotaObservation(
-        schema_version=schema_version,
-        observation_id=observation_id,
-        source_id=source_id,
-        _event_identity_components=event_components,
-        _observed_at_ms=observed_at.value if observed_at.state == "known" else None,
-        _ttl_ms=ttl_ms.value if ttl_ms.state == "known" else None,
-        _reset_at_ms=reset_at_ms.value if reset_at_ms.state == "known" else None,
-        _window_end_ms=window_instance.end_ms if window_instance.kind == "interval" else None,
-        _wire=_freeze_wire(snapshot),
-        _json_bytes=json_bytes,
+    return _seal_record(
+        QuotaObservation(
+            schema_version=schema_version,
+            observation_id=observation_id,
+            source_id=source_id,
+            _event_identity_components=event_components,
+            _observed_at_ms=observed_at.value if observed_at.state == "known" else None,
+            _ttl_ms=ttl_ms.value if ttl_ms.state == "known" else None,
+            _reset_at_ms=reset_at_ms.value if reset_at_ms.state == "known" else None,
+            _window_end_ms=window_instance.end_ms if window_instance.kind == "interval" else None,
+            _wire=_freeze_wire(snapshot),
+            _json_bytes=json_bytes,
+        )
     )
 
 
 def binding_status(binding: ProfilePoolBinding) -> Mapping[str, object]:
-    if type(binding) is not ProfilePoolBinding:
+    if not _is_trusted_record(binding, ProfilePoolBinding):
         raise QuotaContractError("invalid_type", ("binding",))
     return binding._status
 
@@ -489,7 +484,7 @@ def binding_status(binding: ProfilePoolBinding) -> Mapping[str, object]:
 def freshness(
     observation: QuotaObservation, *, now_utc_ms: int, allowed_clock_skew_ms: int
 ) -> Mapping[str, object]:
-    if type(observation) is not QuotaObservation:
+    if not _is_trusted_record(observation, QuotaObservation):
         raise QuotaContractError("invalid_type", ("observation",))
     now = _parse_time(now_utc_ms, ("now_utc_ms",))
     if type(allowed_clock_skew_ms) is not int or isinstance(allowed_clock_skew_ms, bool):
@@ -513,7 +508,7 @@ def freshness(
 
 
 def event_identity(observation: QuotaObservation) -> Mapping[str, object]:
-    if type(observation) is not QuotaObservation:
+    if not _is_trusted_record(observation, QuotaObservation):
         raise QuotaContractError("invalid_type", ("observation",))
     if observation._event_identity_components is None:
         return MappingProxyType(
@@ -803,22 +798,24 @@ def _parse_inline_unit(
     version = _parse_identifier(payload.get("version"), locator + ("version",))
     quantity_kind = _parse_quantity_kind(payload.get("quantity_kind"), locator + ("quantity_kind",))
     semantics_ref = _parse_ref(payload.get("semantics_ref"), locator + ("semantics_ref",))
-    return UnitDefinition(
-        schema_version=_SCHEMA_VERSION,
-        unit_id=unit_id,
-        version=version,
-        quantity_kind=quantity_kind,
-        semantics_ref=semantics_ref,
-        _wire=_freeze_wire(payload),
-        _json_bytes=_json_bytes(
-            {
-                "schema_version": _SCHEMA_VERSION,
-                "unit_id": unit_id,
-                "version": version,
-                "quantity_kind": quantity_kind,
-                "semantics_ref": semantics_ref,
-            }
-        ),
+    return _seal_record(
+        UnitDefinition(
+            schema_version=_SCHEMA_VERSION,
+            unit_id=unit_id,
+            version=version,
+            quantity_kind=quantity_kind,
+            semantics_ref=semantics_ref,
+            _wire=_freeze_wire(payload),
+            _json_bytes=_json_bytes(
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "unit_id": unit_id,
+                    "version": version,
+                    "quantity_kind": quantity_kind,
+                    "semantics_ref": semantics_ref,
+                }
+            ),
+        )
     )
 
 
@@ -1007,7 +1004,7 @@ def _validate_descriptors(value: object) -> tuple[PoolDescriptor, ...]:
     if len(value) > _MAX_CONTEXT_ITEMS:
         raise QuotaContractError("resource_limit", ("descriptors",))
     for index, item in enumerate(value):
-        if type(item) is not PoolDescriptor:
+        if not _is_trusted_record(item, PoolDescriptor):
             raise QuotaContractError("invalid_type", ("descriptors", index))
     return value
 
@@ -1018,7 +1015,7 @@ def _validate_unit_catalog(value: object) -> tuple[UnitDefinition, ...]:
     if len(value) > _MAX_CONTEXT_ITEMS:
         raise QuotaContractError("resource_limit", ("unit_catalog",))
     for index, item in enumerate(value):
-        if type(item) is not UnitDefinition:
+        if not _is_trusted_record(item, UnitDefinition):
             raise QuotaContractError("invalid_type", ("unit_catalog", index))
     return value
 
@@ -1028,6 +1025,21 @@ def _ensure_total_bytes(
 ) -> None:
     if observed > limit:
         raise QuotaContractError("resource_limit", locator)
+
+
+def _build_unit_catalog(
+    unit_catalog: tuple[UnitDefinition, ...],
+) -> dict[tuple[str, str], UnitDefinition]:
+    mapping: dict[tuple[str, str], UnitDefinition] = {}
+    for index, unit in enumerate(unit_catalog):
+        existing = mapping.get(unit.ref)
+        if existing is None:
+            mapping[unit.ref] = unit
+            continue
+        if existing.definition_key != unit.definition_key:
+            raise QuotaContractError("unit_conflict", ("unit_catalog", index))
+        raise QuotaContractError("duplicate_reference", ("unit_catalog", index))
+    return mapping
 
 
 def _build_unit_union(

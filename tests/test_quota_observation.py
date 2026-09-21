@@ -8,9 +8,13 @@ profile parser / fingerprint。
 
 from __future__ import annotations
 
+import builtins
 from copy import deepcopy
 from importlib import import_module
 import inspect
+import os
+import socket
+import subprocess
 
 import pytest
 
@@ -285,6 +289,165 @@ def test_parsed_records_ignore_later_source_and_result_mutations() -> None:
 
     assert unit.to_dict() == _unit_definition_payload()
     assert observation.to_dict() == _cold_start_observation_payload()
+
+
+def test_context_records_reject_caller_constructed_dataclasses() -> None:
+    api = _quota_api()
+
+    raw_unit = api["UnitDefinition"](
+        schema_version=1,
+        unit_id="fixture-native-token",
+        version="1",
+        quantity_kind="amount",
+        semantics_ref="fixture:native-token/v1",
+        _wire={"schema_version": 1},
+        _json_bytes=1,
+    )
+    raw_descriptor = api["PoolDescriptor"](
+        schema_version=1,
+        authority_id="fixture-authority",
+        account_id="fixture-account-a",
+        pool_id="fixture-pool-a",
+        revision="fixture-revision-1",
+        units=(),
+        windows=(),
+        _wire={"schema_version": 1},
+        _json_bytes=1,
+    )
+
+    with pytest.raises(api["QuotaContractError"]) as observation_error:
+        api["parse_observation"](
+            _cold_start_observation_payload(),
+            descriptors=(),
+            unit_catalog=(raw_unit,),
+        )
+
+    assert observation_error.value.code == "invalid_type"
+    assert observation_error.value.locator == ("unit_catalog", 0)
+
+    with pytest.raises(api["QuotaContractError"]) as binding_error:
+        api["parse_binding"](_binding_payload(), descriptors=(raw_descriptor,))
+
+    assert binding_error.value.code == "invalid_type"
+    assert binding_error.value.locator == ("descriptors", 0)
+
+
+def test_descriptor_and_catalog_records_stay_immutable_across_helper_calls() -> None:
+    api = _quota_api()
+    descriptor_payload = _pool_descriptor_payload()
+    unit_payload = _unit_definition_payload()
+    binding_payload = _binding_payload()
+    observation_payload = _cold_start_observation_payload()
+
+    descriptor = api["parse_pool_descriptor"](deepcopy(descriptor_payload))
+    unit = api["parse_unit_definition"](deepcopy(unit_payload))
+    binding = api["parse_binding"](deepcopy(binding_payload), descriptors=(descriptor,))
+    observation = api["parse_observation"](
+        deepcopy(observation_payload),
+        descriptors=(descriptor,),
+        unit_catalog=(unit,),
+    )
+
+    descriptor_payload["units"][0]["semantics_ref"] = "fixture:mutated-source/v2"
+    unit_payload["semantics_ref"] = "fixture:mutated-source/v2"
+    binding_payload["revision"] = "fixture-mutated-binding-revision"
+    observation_payload["source"]["adapter_version"] = "fixture-mutated-adapter"
+
+    mutated_descriptor_dict = descriptor.to_dict()
+    mutated_descriptor_dict["units"][0]["semantics_ref"] = "fixture:mutated-result/v3"
+    mutated_unit_dict = unit.to_dict()
+    mutated_unit_dict["semantics_ref"] = "fixture:mutated-result/v3"
+    mutated_binding_dict = binding.to_dict()
+    mutated_binding_dict["revision"] = "fixture-mutated-binding-result"
+    mutated_observation_dict = observation.to_dict()
+    mutated_observation_dict["source"]["adapter_version"] = "fixture-mutated-result"
+
+    assert descriptor.to_dict() == _pool_descriptor_payload()
+    assert unit.to_dict() == _unit_definition_payload()
+    assert binding.to_dict() == _binding_payload()
+    assert observation.to_dict() == _cold_start_observation_payload()
+
+
+def test_parse_helpers_do_not_touch_io_env_subprocess_or_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _quota_api()
+    descriptor = api["parse_pool_descriptor"](deepcopy(_pool_descriptor_payload()))
+    unit = api["parse_unit_definition"](deepcopy(_unit_definition_payload()))
+    binding = api["parse_binding"](deepcopy(_binding_payload()), descriptors=(descriptor,))
+    observation = api["parse_observation"](
+        deepcopy(_cold_start_observation_payload()),
+        descriptors=(descriptor,),
+        unit_catalog=(unit,),
+    )
+
+    def _blocked(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("unexpected external access")
+
+    class _BlockedEnviron(dict[str, str]):
+        def __getitem__(self, _key: str) -> str:
+            _blocked()
+            raise AssertionError("unreachable")
+
+        def get(self, _key: str, _default: object = None) -> object:
+            _blocked()
+            raise AssertionError("unreachable")
+
+        def __contains__(self, _key: object) -> bool:
+            _blocked()
+            raise AssertionError("unreachable")
+
+        def copy(self) -> dict[str, str]:
+            _blocked()
+            raise AssertionError("unreachable")
+
+        def __iter__(self):
+            _blocked()
+            return iter(())
+
+    monkeypatch.setattr(builtins, "open", _blocked)
+    monkeypatch.setattr(os, "getenv", _blocked)
+    monkeypatch.setattr(os, "environ", _BlockedEnviron(), raising=False)
+    monkeypatch.setattr(subprocess, "Popen", _blocked)
+    monkeypatch.setattr(subprocess, "run", _blocked)
+    monkeypatch.setattr(subprocess, "call", _blocked)
+    monkeypatch.setattr(subprocess, "check_output", _blocked)
+    monkeypatch.setattr(socket, "socket", _blocked)
+    monkeypatch.setattr(socket, "create_connection", _blocked)
+    monkeypatch.setattr(socket, "getaddrinfo", _blocked)
+
+    api["parse_unit_definition"](deepcopy(_unit_definition_payload()))
+    api["parse_pool_descriptor"](deepcopy(_pool_descriptor_payload()))
+    rebound_binding = api["parse_binding"](
+        deepcopy(_binding_payload()),
+        descriptors=(descriptor,),
+    )
+    rebound_observation = api["parse_observation"](
+        deepcopy(_cold_start_observation_payload()),
+        descriptors=(descriptor,),
+        unit_catalog=(unit,),
+    )
+
+    assert dict(api["binding_status"](binding)) == {"state": "complete", "reasons": ()}
+    assert dict(api["binding_status"](rebound_binding)) == {
+        "state": "complete",
+        "reasons": (),
+    }
+    assert dict(api["freshness"](observation, now_utc_ms=1000, allowed_clock_skew_ms=0)) == {
+        "state": "fresh",
+        "reason": "within-ttl",
+    }
+    assert dict(
+        api["freshness"](rebound_observation, now_utc_ms=1000, allowed_clock_skew_ms=0)
+    ) == {"state": "fresh", "reason": "within-ttl"}
+    assert dict(api["event_identity"](observation)) == {
+        "state": "unavailable",
+        "reason": "source-event-id-unavailable",
+    }
+    assert dict(api["event_identity"](rebound_observation)) == {
+        "state": "unavailable",
+        "reason": "source-event-id-unavailable",
+    }
 
 
 def test_known_unit_ref_requires_explicit_catalog_context() -> None:
