@@ -35,7 +35,7 @@ baseline；active workstream 進度只更新 `docs/superpowers/workstreams/.../t
 | `python3 -m pytest tests/test_quota_observation.py --collect-only -q` | 0 | `82 tests collected` |
 | `python3 -m pytest tests/test_quota_observation.py -q` | 0 | `82 passed` |
 | `python3 -m pytest tests/ -q` | 0 | `6191 passed, 41 skipped, 186 subtests passed` |
-| `env -u PSC_REPO_ROOT /home/paul_chen/prj_pri/paulshaclaw/.venv/bin/python -m pytest -q` | 0 | `6188 passed, 44 skipped, 186 subtests passed` |
+| `env -u PSC_REPO_ROOT "$HOME/prj_pri/paulshaclaw/.venv/bin/python" -m pytest -q` | 0 | `6188 passed, 44 skipped, 186 subtests passed` |
 | `HOME=$(mktemp -d) python3 -m pytest -q` | 0 | `6188 passed, 44 skipped, 186 subtests passed` |
 | `openspec validate quota-observation-schema-core --strict --no-interactive` | 0 | `Change 'quota-observation-schema-core' is valid` |
 | `openspec validate --specs` | 0 | `27 passed, 0 failed` |
