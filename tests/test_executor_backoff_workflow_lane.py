@@ -81,7 +81,13 @@ def _init_worktree(path: Path) -> str:
     return _git(["rev-parse", "HEAD"], path).stdout.strip().lower()
 
 
-def _make_run(registry: JobRegistry, *, workspace_root: Path, steps):
+def _make_run(
+    registry: JobRegistry,
+    *,
+    workspace_root: Path,
+    steps,
+    model_chain_override: dict[str, dict[str, str]] | None = None,
+):
     return registry._manager_create_workflow_run(
         work_id="executor-backoff-928",
         repo="hamanpaul/paulsha-cortex",
@@ -95,6 +101,7 @@ def _make_run(registry: JobRegistry, *, workspace_root: Path, steps):
         openspec_refs=("executor-backoff-terminal-admission",),
         facets=(),
         gate_status="running",
+        model_chain_override=model_chain_override,
     )
 
 
@@ -494,6 +501,78 @@ def test_all_candidates_on_backoff_return_executor_backoff_decision_without_disp
         },
     ]
     assert registry.list_jobs() == []
+
+
+def test_model_chain_override_identity_on_active_backoff_returns_decision_without_fallback_dispatch(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    creator_calls: list[tuple[str, str | None, str | None]] = []
+
+    class _TrackingWorktreeCreator:
+        def create(
+            self, branch: str, base_sha: str | None = None, *, job_id: str | None = None
+        ) -> Path:
+            creator_calls.append((branch, base_sha, job_id))
+            raise AssertionError("executor-backoff override decision must not create a worktree")
+
+    run = _make_run(
+        registry,
+        workspace_root=tmp_path,
+        steps=_build_only_steps(),
+        model_chain_override={
+            "builder": {
+                "executor": "claude",
+                "model_id": "claude-primary",
+            }
+        },
+    )
+    identities = _two_builder_identities()
+    coordinator_root = tmp_path / "coordinator"
+    current = time.time()
+
+    _record_backoff(
+        coordinator_root,
+        executor="claude",
+        model_id="claude-primary",
+        now=current,
+        reset_at=current + 600.0,
+        job_id="job-claude-rate-limited",
+    )
+
+    dispatcher = type(
+        "D",
+        (),
+        {
+            "_registry": registry,
+            "_git_runner": None,
+            "_worktree_creator": _TrackingWorktreeCreator(),
+        },
+    )()
+
+    result = manager.dispatch_workflow_card(
+        dispatcher,
+        run=run,
+        identities=identities,
+        launcher_factory=lambda _identity: (_ for _ in ()).throw(
+            AssertionError("executor-backoff override decision must not launch")
+        ),
+        coordinator_root=coordinator_root,
+    )
+
+    assert result is not None
+    assert result["reason"] == "executor-backoff"
+    assert result["retry_after_epoch"] == pytest.approx(current + 605.0, rel=0, abs=5.0)
+    assert result["skipped"] == [
+        {
+            "executor": "claude",
+            "model_id": "claude-primary",
+            "retry_after_epoch": pytest.approx(current + 605.0, rel=0, abs=5.0),
+        }
+    ]
+    assert "job_id" not in result
+    assert registry.list_jobs() == []
+    assert creator_calls == []
 
 
 def test_executor_backoff_unknown_returns_decision_without_fake_deadline(
