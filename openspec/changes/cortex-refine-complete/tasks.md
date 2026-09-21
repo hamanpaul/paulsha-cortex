@@ -49,6 +49,7 @@
 - [ ] 3.2 實作 adapter capability descriptors 與 conformance；新虛構 model/effort 無 central product-name diff。
 - [ ] 3.3 實作 requested/resolved/observed profile 與可追溯 effective argv/config；unsupported pre-spawn fail-closed。
 - [ ] 3.3.1 依 #849 交付純 schema／canonical key 核心，原生 effort 與 observed unknown 不補值；母 #835 routing／migration 與 #842 qualification 另留正式 evidence。
+  - [x] RED：依 accepted `execution-profile-schema-core` plan 新增 `tests/test_execution_profile_schema_core.py`，鎖定虛構 descriptor／原生 effort、三層 plane round-trip 與 observed/actual key 缺口；目前 production module 尚未實作，focused pytest 以 6 failures／exit 1 呈現 RED，T01/T02 source 與後續 GREEN 仍待完成。
 - [ ] 3.4 實作 PatchMUD versioned report consumer、legacy migration 與 profile/cohort/role/coverage 驗證。
 - [ ] 3.5 由 #842 實作 qualification candidate→review receipt→approved roster 發布鏈；保留 operator 核可與 independence policy，不擴 #581 原scope。
 - [ ] 3.6 實作安全 model register/probe 操作面與 TTL、角色擴充契約；探活不暗中消耗無上限額度。
