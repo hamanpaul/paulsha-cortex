@@ -162,7 +162,7 @@ class _ParserSealedRecord:
         return hash(_wire_hash_key(wire))
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, eq=False)
 class UnitDefinition(_ParserSealedRecord):
     _parser_entrypoint: ClassVar[str] = "parse_unit_definition"
     schema_version: int

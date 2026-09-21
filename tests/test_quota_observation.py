@@ -1697,7 +1697,6 @@ def test_parse_pool_descriptor_rejects_duplicate_window_ids() -> None:
 
     assert excinfo.value.code == "duplicate_reference"
     assert excinfo.value.locator == ("windows", 1)
-    assert excinfo.value.locator == ("windows", 1)
 
 def test_parse_pool_descriptor_enforces_window_quantity_kind_matrix() -> None:
     api = _quota_api()
