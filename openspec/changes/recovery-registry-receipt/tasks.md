@@ -29,8 +29,8 @@ Operator/intake 已發布 baseline immutable；產品 candidate 對上述 frozen
 
 ## Tasks
 
-- [ ] **T01 source／I01/I07**：只在 registry.py 定義 additive versioned receipt/disposition/checkpoint 的 load/copy 契約；缺欄位不 backfill、不因 A 新增欄位寫回，未知/malformed 拒絕。保留既有 v1 migration/#501 repair 原政策與 fixtures，不宣稱所有歷史格式零寫入。
-- [ ] **T02 source／I02**：實作 strict immutable recovery/checkpoint context、各自完整 payload digest 與全 registry 兩類 receipt 的 request_id collision 檢查；固定 encoding/golden vector，拒絕 caller mismatch、未知欄位、跨 target/種類重用、同 ID 更換 proof requirements，不能 hash actor/slice/action 當新 attempt ID。
+- [x] **T01 source／I01/I07**：只在 registry.py 定義 additive versioned receipt/disposition/checkpoint 的 load/copy 契約；缺欄位不 backfill、不因 A 新增欄位寫回，未知/malformed 拒絕。保留既有 v1 migration/#501 repair 原政策與 fixtures，不宣稱所有歷史格式零寫入。
+- [x] **T02 source／I02**：實作 strict immutable recovery/checkpoint context、各自完整 payload digest 與全 registry 兩類 receipt 的 request_id collision 檢查；固定 encoding/golden vector，拒絕 caller mismatch、未知欄位、跨 target/種類重用、同 ID 更換 proof requirements，不能 hash actor/slice/action 當新 attempt ID。
 - [ ] **T03 source／I03**：fresh slice revision、exact snapshot CAS、所有 registry 內有效 binding/state/repin writer 的 revision 更新與 ABA 守門；保留 update_slice(None) 語意。Legacy 舊 mutator 相容但不自動升級/不獲 ABA 保證；versioned row 依 D3 每個有效 mutation 計次。
 - [ ] **T04 source／I04/I05**：建立 lookup／prepare／commit 原語；prepared 不開 pending、不清綁或冒充成功；complete 重送回原結果且零新增寫入。commit 同 snapshot revalidate、supersede 舊 B/R、明確清三欄、revision/history/receipt 一次落盤。
 - [ ] **T05 source／I06**：提供 supersession／consumption 的 exact CAS、copy、冪等 persistence；required proof closure 只作內部資料契約，來源驗證與真 replacement/consume call sites 留 B/C，不把 stub 當實際 proof。

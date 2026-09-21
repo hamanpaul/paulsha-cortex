@@ -214,6 +214,379 @@ def _deepcopy_json(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False))
 
 
+_RECOVERY_RECEIPT_VERSION = 1
+_RECOVERY_ALLOWED_CALLERS = {
+    "builder": "builder_job_id",
+    "reviewer": "reviewer_job_id",
+}
+_RECOVERY_RECEIPT_FIELDS = frozenset(
+    {"version", "receipt_kind", "request", "request_bytes", "payload_digest", "recorded_at"}
+)
+_RECOVERY_REQUEST_FIELDS = frozenset(
+    {"request_id", "caller", "target", "proof_requirements", "context"}
+)
+_RECOVERY_TARGET_FIELDS = frozenset({"slice_id", "target_branch", "candidate"})
+_RECOVERY_PROOF_REQUIREMENT_FIELDS = frozenset({"required_refs", "must_match_candidate"})
+_RECOVERY_CONTEXT_FIELDS = frozenset({"actor", "job_id", "workflow_run_id", "legacy_fingerprint"})
+_RECOVERY_DISPOSITION_REQUIRED_FIELDS = frozenset({"request_id"})
+
+
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def _require_non_empty_string(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"coordinator 狀態檔 {label} 格式錯誤（fail-closed）: {state_path}")
+    return value
+
+
+def _require_exact_dict_keys(
+    value: object,
+    *,
+    expected: frozenset[str],
+    label: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError(f"coordinator 狀態檔 {label} 格式錯誤（fail-closed）: {state_path}")
+    return value
+
+
+def _validate_recovery_target(
+    value: object,
+    *,
+    slice_row: Mapping[str, Any],
+    state_path: Path,
+) -> dict[str, str]:
+    target = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_TARGET_FIELDS,
+        label="recovery receipt target",
+        state_path=state_path,
+    )
+    normalized = {
+        key: _require_non_empty_string(
+            target.get(key),
+            label=f"recovery receipt target.{key}",
+            state_path=state_path,
+        )
+        for key in _RECOVERY_TARGET_FIELDS
+    }
+    live_candidate = slice_row.get("candidate")
+    if not isinstance(live_candidate, str) or not live_candidate:
+        raise ValueError(
+            f"coordinator 狀態檔 recovery receipt target mismatch（fail-closed）: {state_path}"
+        )
+    expected_target = {
+        "slice_id": slice_row["slice_id"],
+        "target_branch": slice_row["target_branch"],
+        "candidate": live_candidate,
+    }
+    if normalized != expected_target:
+        raise ValueError(
+            f"coordinator 狀態檔 recovery receipt target mismatch（fail-closed）: {state_path}"
+        )
+    return normalized
+
+
+def _validate_recovery_proof_requirements(
+    value: object,
+    *,
+    target_candidate: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    proof_requirements = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_PROOF_REQUIREMENT_FIELDS,
+        label="recovery receipt proof_requirements",
+        state_path=state_path,
+    )
+    required_refs = proof_requirements.get("required_refs")
+    if not _is_ref_list(required_refs) or not required_refs or any(not ref for ref in required_refs):
+        raise ValueError(
+            "coordinator 狀態檔 recovery receipt proof_requirements.required_refs 格式錯誤"
+            f"（fail-closed）: {state_path}"
+        )
+    if len(set(required_refs)) != len(required_refs):
+        raise ValueError(
+            "coordinator 狀態檔 recovery receipt proof_requirements.required_refs 重複"
+            f"（fail-closed）: {state_path}"
+        )
+    must_match_candidate = _require_non_empty_string(
+        proof_requirements.get("must_match_candidate"),
+        label="recovery receipt proof_requirements.must_match_candidate",
+        state_path=state_path,
+    )
+    if must_match_candidate != target_candidate:
+        raise ValueError(
+            "coordinator 狀態檔 recovery receipt proof_requirements candidate mismatch"
+            f"（fail-closed）: {state_path}"
+        )
+    return {
+        "required_refs": list(required_refs),
+        "must_match_candidate": must_match_candidate,
+    }
+
+
+def _validate_recovery_context(
+    value: object,
+    *,
+    caller: str,
+    slice_row: Mapping[str, Any],
+    state_path: Path,
+) -> dict[str, str]:
+    context = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_CONTEXT_FIELDS,
+        label="recovery receipt context",
+        state_path=state_path,
+    )
+    normalized = {
+        key: _require_non_empty_string(
+            context.get(key),
+            label=f"recovery receipt context.{key}",
+            state_path=state_path,
+        )
+        for key in _RECOVERY_CONTEXT_FIELDS
+    }
+    job_field = _RECOVERY_ALLOWED_CALLERS[caller]
+    live_job_id = slice_row.get(job_field)
+    if live_job_id is not None and normalized["job_id"] != live_job_id:
+        raise ValueError(
+            f"coordinator 狀態檔 recovery receipt caller mismatch（fail-closed）: {state_path}"
+        )
+    return normalized
+
+
+def _validate_recovery_request(
+    value: object,
+    *,
+    slice_row: Mapping[str, Any],
+    state_path: Path,
+) -> dict[str, Any]:
+    request = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_REQUEST_FIELDS,
+        label="recovery receipt request",
+        state_path=state_path,
+    )
+    request_id = _require_non_empty_string(
+        request.get("request_id"),
+        label="recovery receipt request.request_id",
+        state_path=state_path,
+    )
+    caller = _require_non_empty_string(
+        request.get("caller"),
+        label="recovery receipt request.caller",
+        state_path=state_path,
+    )
+    if caller not in _RECOVERY_ALLOWED_CALLERS:
+        raise ValueError(
+            f"coordinator 狀態檔 recovery receipt caller mismatch（fail-closed）: {state_path}"
+        )
+    target = _validate_recovery_target(request.get("target"), slice_row=slice_row, state_path=state_path)
+    proof_requirements = _validate_recovery_proof_requirements(
+        request.get("proof_requirements"),
+        target_candidate=target["candidate"],
+        state_path=state_path,
+    )
+    context = _validate_recovery_context(
+        request.get("context"),
+        caller=caller,
+        slice_row=slice_row,
+        state_path=state_path,
+    )
+    return {
+        "request_id": request_id,
+        "caller": caller,
+        "target": target,
+        "proof_requirements": proof_requirements,
+        "context": context,
+    }
+
+
+def _validate_recovery_receipt(
+    value: object,
+    *,
+    expected_kind: str,
+    slice_row: Mapping[str, Any],
+    state_path: Path,
+) -> dict[str, Any]:
+    receipt = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_RECEIPT_FIELDS,
+        label="recovery receipt",
+        state_path=state_path,
+    )
+    version = receipt.get("version")
+    if version != _RECOVERY_RECEIPT_VERSION:
+        raise ValueError(
+            f"coordinator 狀態檔 unsupported recovery receipt version（fail-closed）: {state_path}"
+        )
+    receipt_kind = _require_non_empty_string(
+        receipt.get("receipt_kind"),
+        label="recovery receipt receipt_kind",
+        state_path=state_path,
+    )
+    if receipt_kind != expected_kind:
+        raise ValueError(
+            f"coordinator 狀態檔 recovery receipt kind mismatch（fail-closed）: {state_path}"
+        )
+    request = _validate_recovery_request(receipt.get("request"), slice_row=slice_row, state_path=state_path)
+    request_bytes = _require_non_empty_string(
+        receipt.get("request_bytes"),
+        label="recovery receipt request_bytes",
+        state_path=state_path,
+    )
+    payload_digest = _require_non_empty_string(
+        receipt.get("payload_digest"),
+        label="recovery receipt payload_digest",
+        state_path=state_path,
+    )
+    _require_non_empty_string(
+        receipt.get("recorded_at"),
+        label="recovery receipt recorded_at",
+        state_path=state_path,
+    )
+    expected_request_bytes = _canonical_json_bytes(request).hex()
+    try:
+        bytes.fromhex(request_bytes)
+    except ValueError as exc:
+        raise ValueError(
+            f"coordinator 狀態檔 recovery receipt request_bytes 格式錯誤（fail-closed）: {state_path}"
+        ) from exc
+    if request_bytes != expected_request_bytes:
+        raise ValueError(
+            f"coordinator 狀態檔 recovery receipt request_bytes mismatch（fail-closed）: {state_path}"
+        )
+    expected_payload_digest = verification.canonical_json_hash(request)
+    if payload_digest != expected_payload_digest:
+        raise ValueError(
+            f"coordinator 狀態檔 recovery receipt payload_digest mismatch（fail-closed）: {state_path}"
+        )
+    return _deepcopy_json(receipt)
+
+
+def _validate_recovery_disposition(
+    value: object,
+    *,
+    state_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or not _RECOVERY_DISPOSITION_REQUIRED_FIELDS.issubset(value):
+        raise ValueError(
+            f"coordinator 狀態檔 recovery disposition 格式錯誤（fail-closed）: {state_path}"
+        )
+    _require_non_empty_string(
+        value.get("request_id"),
+        label="recovery disposition request_id",
+        state_path=state_path,
+    )
+    return _deepcopy_json(value)
+
+
+def _validate_optional_recovery_slice_fields(
+    slice_row: Mapping[str, Any],
+    *,
+    state_path: Path,
+) -> dict[str, Any]:
+    validated: dict[str, Any] = {}
+    field_validators: dict[str, Callable[[object], dict[str, Any]]] = {
+        "recovery_receipts": lambda item: _validate_recovery_receipt(
+            item,
+            expected_kind="recovery",
+            slice_row=slice_row,
+            state_path=state_path,
+        ),
+        "recovery_checkpoints": lambda item: _validate_recovery_receipt(
+            item,
+            expected_kind="checkpoint",
+            slice_row=slice_row,
+            state_path=state_path,
+        ),
+        "recovery_receipt_history": lambda item: _validate_recovery_receipt(
+            item,
+            expected_kind="recovery",
+            slice_row=slice_row,
+            state_path=state_path,
+        ),
+        "recovery_dispositions": lambda item: _validate_recovery_disposition(
+            item,
+            state_path=state_path,
+        ),
+    }
+    for field_name, validator in field_validators.items():
+        if field_name not in slice_row:
+            continue
+        value = slice_row[field_name]
+        if not isinstance(value, list):
+            raise ValueError(
+                f"coordinator 狀態檔 {field_name} 格式錯誤（fail-closed）: {state_path}"
+            )
+        validated[field_name] = [validator(item) for item in value]
+    return validated
+
+
+def _iter_recovery_request_receipts(slice_row: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    receipts: list[tuple[str, dict[str, Any]]] = []
+    for field_name, expected_kind in (
+        ("recovery_receipts", "recovery"),
+        ("recovery_receipt_history", "recovery"),
+        ("recovery_checkpoints", "checkpoint"),
+    ):
+        value = slice_row.get(field_name)
+        if not isinstance(value, list):
+            continue
+        for receipt in value:
+            if isinstance(receipt, dict):
+                receipts.append((expected_kind, receipt))
+    return receipts
+
+
+def _validate_recovery_request_id_collisions(
+    slices: list[Mapping[str, Any]],
+    *,
+    state_path: Path,
+) -> None:
+    seen: dict[str, tuple[str, tuple[str, str, str], tuple[str, ...], str]] = {}
+    for slice_row in slices:
+        for expected_kind, receipt in _iter_recovery_request_receipts(slice_row):
+            request = receipt["request"]
+            request_id = request["request_id"]
+            target = request["target"]
+            target_identity = (
+                target["slice_id"],
+                target["target_branch"],
+                target["candidate"],
+            )
+            proof_requirements = tuple(request["proof_requirements"]["required_refs"])
+            signature = (
+                expected_kind,
+                target_identity,
+                proof_requirements,
+                receipt["payload_digest"],
+            )
+            previous = seen.get(request_id)
+            if previous is not None and previous != signature:
+                raise ValueError(
+                    "coordinator 狀態檔 recovery receipt request_id collision（fail-closed）: "
+                    f"{state_path}"
+                )
+            if previous is not None:
+                raise ValueError(
+                    "coordinator 狀態檔 recovery receipt duplicated request_id（fail-closed）: "
+                    f"{state_path}"
+                )
+            seen[request_id] = signature
+
+
 def _empty_legacy_records() -> dict[str, Any]:
     return {"source_schema_version": 1, "seq": 0, "jobs": [], "slices": []}
 
@@ -531,6 +904,7 @@ class JobRegistry:
                     f"{self._state_path}"
                 )
         validated_slices = [self._validate_loaded_slice(slice_row, job_ids) for slice_row in slices]
+        _validate_recovery_request_id_collisions(validated_slices, state_path=self._state_path)
         return validated_jobs, validated_slices, seq
 
     def _validate_legacy_records(self, value: object) -> None:
@@ -989,6 +1363,10 @@ class JobRegistry:
             ):
                 raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
         normalized_slice = _normalize_loaded_slice_verification(slice_row)
+        additive_fields = _validate_optional_recovery_slice_fields(
+            normalized_slice,
+            state_path=self._state_path,
+        )
         return {
             **normalized_slice,
             "spec": dict(slice_row["spec"]),
@@ -999,6 +1377,7 @@ class JobRegistry:
             "evidence_history": _copy_json_list(slice_row["evidence_history"]),
             "evaluation_history": _copy_json_list(slice_row["evaluation_history"]),
             "actions": _copy_json_list(slice_row["actions"]),
+            **additive_fields,
         }
 
     def _find_job(self, job_id: str) -> dict[str, Any]:
@@ -1016,7 +1395,7 @@ class JobRegistry:
         raise KeyError(f"slice 不存在: {slice_id}")
 
     def _copy_slice(self, slice_row: dict[str, Any]) -> dict[str, Any]:
-        return {
+        copied = {
             **dict(slice_row),
             "spec": dict(slice_row["spec"]),
             "plan": dict(slice_row["plan"]),
@@ -1027,6 +1406,15 @@ class JobRegistry:
             "evaluation_history": _copy_json_list(slice_row["evaluation_history"]),
             "actions": _copy_json_list(slice_row["actions"]),
         }
+        for field_name in (
+            "recovery_receipts",
+            "recovery_dispositions",
+            "recovery_checkpoints",
+            "recovery_receipt_history",
+        ):
+            if field_name in slice_row:
+                copied[field_name] = _deepcopy_json(slice_row[field_name])
+        return copied
 
     def _validate_existing_job_ref(self, field: str, job_id: str | None) -> None:
         if job_id is None:
