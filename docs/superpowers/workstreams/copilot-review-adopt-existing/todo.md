@@ -26,7 +26,7 @@ artifact_classes:
 
 ## Tasks
 
-- [ ] **T1 tests／RED**：新增 `tests/test_copilot_review_adopt_existing.py`（沿既有 ship 段測試的 fake GitHub adapter／`_ship_action` fixture 樣板，`request_copilot` 計數），斷言逐條對應 spec R6 (a)–(f)；現行必須 RED（(a) 走 request 並最終 timeout；(f) 無 `review-attest`）。
+- [x] **T1 tests／RED**：新增 `tests/test_copilot_review_adopt_existing.py`（沿既有 ship 段測試的 fake GitHub adapter／`_ship_action` fixture 樣板，`request_copilot` 計數），斷言逐條對應 spec R6 (a)–(f)；現行必須 RED（(a) 走 request 並最終 timeout；(f) 無 `review-attest`）。
 - [ ] **T2 source／採信分支（R1、R3、D1、D3）**：`_ship_action` 在 `request_copilot` 前篩 exact-HEAD Copilot COMMENTED／APPROVED 非 error review（多筆取最大 `(submitted_at_epoch, review_id)`）；命中 → 寫 ship 狀態 `requested_at_epoch = review.submitted_at_epoch`、`adopted_review_id`、`adopted_at_epoch = now`，同 tick 進 review 判定、不 request、不回 `awaiting-copilot`；未命中 → 現行路徑、狀態形狀不變；head 前進整份覆寫。
 - [ ] **T3 source／ReviewLoop 時間基準（R2、D2）**：`ReviewLoop` 加可選 `adopted_at`；timeout 的 `elapsed` 以 `adopted_at`（有）或 `requested_at` 計；outside-request-epoch 判定對採信 review 成立；`adopted_at is None` 時行為與現行逐字相同。
 - [ ] **T4 source／stop 出口與證據（R4、R5、D4）**：`copilot-*` stop 的 `next_actions` 補 `review-attest`（既有值在前）、`next_step_hint` 給指令形式；採信時 `logger.info` 一行並在 delivery journal／`evidence/delivery-adapter` 帶 `adopted_review_id`。
