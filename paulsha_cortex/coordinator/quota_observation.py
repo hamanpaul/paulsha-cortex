@@ -100,6 +100,9 @@ _WINDOW_DURATION_KEYS = ("window_id", "kind", "unit_ref", "duration_ms")
 _WINDOW_MIN_KEYS = ("window_id", "kind", "unit_ref")
 _WINDOW_DURATION_KINDS = frozenset(("fixed", "rolling"))
 _WINDOW_MIN_KINDS = frozenset(("instantaneous",))
+_WINDOW_INSTANCE_INTERVAL_KEYS = ("kind", "start_ms", "end_ms", "epoch")
+_WINDOW_INSTANCE_INSTANT_KEYS = ("kind", "at_ms")
+_WINDOW_INSTANCE_UNKNOWN_KEYS = ("kind", "reason")
 _MEASUREMENT_QUANTITY_KINDS = frozenset(
     ("remaining_snapshot", "usage_delta", "usage_total", "gauge_snapshot")
 )
@@ -444,7 +447,7 @@ def parse_pool_descriptor(payload: dict) -> PoolDescriptor:
     _parse_ref(snapshot.get("authority_ref"), ("authority_ref",))
     _parse_ref_list(snapshot.get("provenance_refs"), ("provenance_refs",))
     units = _parse_descriptor_units(snapshot.get("units"), ("units",))
-    windows = _parse_descriptor_windows(snapshot.get("windows"), ("windows",))
+    windows = _parse_descriptor_windows(snapshot.get("windows"), ("windows",), units)
     return _seal_record(
         PoolDescriptor._from_parser(
             schema_version=schema_version,
@@ -522,7 +525,7 @@ def parse_observation(
     observation_id = _parse_identifier(
         snapshot.get("observation_id"), ("observation_id",)
     )
-    _parse_known_unknown(snapshot.get("scope"), ("scope",), _parse_scope_value)
+    scope = _parse_known_unknown(snapshot.get("scope"), ("scope",), _parse_scope_value)
     _parse_known_unknown(
         snapshot.get("profile_ref"),
         ("profile_ref",),
@@ -555,6 +558,8 @@ def parse_observation(
     _parse_coverage(snapshot.get("coverage"), ("coverage",))
 
     unit_map = _build_unit_catalog(unit_catalog)
+    if scope.state == "known":
+        raise QuotaContractError("unresolved_reference", ("scope",))
     if unit_ref.state == "known" and unit_ref.value not in unit_map:
         raise QuotaContractError("unresolved_reference", ("unit_ref",))
     if unit_ref.state == "unknown" and measurement.state in {"observed", "estimated"}:
@@ -959,23 +964,28 @@ def _canonical_unit_snapshot(
 
 
 def _parse_descriptor_windows(
-    value: object, locator: tuple[str | int, ...]
+    value: object,
+    locator: tuple[str | int, ...],
+    units: tuple[UnitDefinition, ...],
 ) -> tuple[object, ...]:
     items = _expect_list(value, locator)
     if not items:
         raise QuotaContractError("invalid_shape", locator)
     if len(items) > _MAX_CONTEXT_ITEMS:
         raise QuotaContractError("resource_limit", locator)
+    unit_refs = frozenset(unit.ref for unit in units)
     windows: list[object] = []
     for index, item in enumerate(items):
         item_locator = locator + (index,)
         payload = _expect_dict(item, item_locator)
-        windows.append(_parse_descriptor_window(payload, item_locator))
+        windows.append(_parse_descriptor_window(payload, item_locator, unit_refs))
     return tuple(windows)
 
 
 def _parse_descriptor_window(
-    payload: dict[str, object], locator: tuple[str | int, ...]
+    payload: dict[str, object],
+    locator: tuple[str | int, ...],
+    unit_refs: frozenset[tuple[str, str]],
 ) -> object:
     if "kind" not in payload:
         raise QuotaContractError("invalid_shape", locator + ("kind",))
@@ -983,13 +993,17 @@ def _parse_descriptor_window(
     if kind in _WINDOW_DURATION_KINDS:
         _ensure_exact_keys(payload, _WINDOW_DURATION_KEYS, locator)
         _parse_identifier(payload.get("window_id"), locator + ("window_id",))
-        _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
+        unit_ref = _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
+        if unit_ref not in unit_refs:
+            raise QuotaContractError("unresolved_reference", locator + ("unit_ref",))
         _parse_duration(payload.get("duration_ms"), locator + ("duration_ms",))
         return _freeze_wire(payload)
     if kind in _WINDOW_MIN_KINDS:
         _ensure_exact_keys(payload, _WINDOW_MIN_KEYS, locator)
         _parse_identifier(payload.get("window_id"), locator + ("window_id",))
-        _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
+        unit_ref = _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
+        if unit_ref not in unit_refs:
+            raise QuotaContractError("unresolved_reference", locator + ("unit_ref",))
         return _freeze_wire(payload)
     raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
@@ -1128,20 +1142,19 @@ def _parse_window_instance(
     value: object, locator: tuple[str | int, ...]
 ) -> object:
     payload = _expect_dict(value, locator)
-    keys = set(payload)
-    if keys == {"kind", "reason"}:
-        _ensure_exact_keys(payload, ("kind", "reason"), locator)
-        _parse_identifier(payload.get("kind"), locator + ("kind",))
+    kind = payload.get("kind")
+    if type(kind) is not str:
+        raise QuotaContractError("invalid_type", locator + ("kind",))
+    if kind == "unknown":
+        _ensure_exact_keys(payload, _WINDOW_INSTANCE_UNKNOWN_KEYS, locator)
         _parse_reason(payload.get("reason"), locator + ("reason",))
         return _freeze_wire(payload)
-    if keys == {"kind", "at_ms"}:
-        _ensure_exact_keys(payload, ("kind", "at_ms"), locator)
-        _parse_identifier(payload.get("kind"), locator + ("kind",))
+    if kind == "instant":
+        _ensure_exact_keys(payload, _WINDOW_INSTANCE_INSTANT_KEYS, locator)
         _parse_time(payload.get("at_ms"), locator + ("at_ms",))
         return _freeze_wire(payload)
-    if keys == {"kind", "start_ms", "end_ms", "epoch"}:
-        _ensure_exact_keys(payload, ("kind", "start_ms", "end_ms", "epoch"), locator)
-        _parse_identifier(payload.get("kind"), locator + ("kind",))
+    if kind == "interval":
+        _ensure_exact_keys(payload, _WINDOW_INSTANCE_INTERVAL_KEYS, locator)
         _parse_time(payload.get("start_ms"), locator + ("start_ms",))
         _parse_time(payload.get("end_ms"), locator + ("end_ms",))
         _parse_known_unknown(
@@ -1150,7 +1163,7 @@ def _parse_window_instance(
             lambda epoch_value, epoch_locator: _parse_identifier(epoch_value, epoch_locator),
         )
         return _freeze_wire(payload)
-    raise QuotaContractError("invalid_shape", locator + ("<unknown>",))
+    raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
 
 def _parse_measurement(

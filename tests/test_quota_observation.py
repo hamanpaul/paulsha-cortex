@@ -612,6 +612,24 @@ def test_known_unit_ref_requires_explicit_catalog_context() -> None:
     assert excinfo.value.code == "unresolved_reference"
 
 
+def test_parse_observation_rejects_descriptor_backed_known_scope_until_resolution_lands() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    descriptor = api["parse_pool_descriptor"](_pool_descriptor_payload())
+    payload = _cold_start_observation_payload()
+    payload["scope"] = _binding_constraint()
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](
+            payload,
+            descriptors=(descriptor,),
+            unit_catalog=(unit,),
+        )
+
+    assert excinfo.value.code == "unresolved_reference"
+    assert excinfo.value.locator == ("scope",)
+
+
 def test_duplicate_standalone_unit_catalog_ref_is_rejected() -> None:
     api = _quota_api()
     unit_one = api["parse_unit_definition"](_unit_definition_payload())
@@ -780,6 +798,53 @@ def test_parse_observation_rejects_invalid_coverage_states_and_gap_shapes(
     unit = api["parse_unit_definition"](_unit_definition_payload())
     payload = _cold_start_observation_payload()
     payload["coverage"] = coverage
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
+
+    assert excinfo.value.code == expected_code
+    assert excinfo.value.locator == expected_locator
+
+
+def test_parse_pool_descriptor_rejects_window_unit_ref_missing_from_inline_units() -> None:
+    api = _quota_api()
+    payload = _pool_descriptor_payload()
+    payload["windows"][0]["unit_ref"] = {
+        "unit_id": "fixture-missing-unit",
+        "version": "1",
+    }
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_pool_descriptor"](payload)
+
+    assert excinfo.value.code == "unresolved_reference"
+    assert excinfo.value.locator == ("windows", 0, "unit_ref")
+
+
+@pytest.mark.parametrize(
+    ("window_instance", "expected_code", "expected_locator"),
+    (
+        (
+            {"kind": "rolling", "at_ms": 1000},
+            "invalid_identifier",
+            ("window_instance", "kind"),
+        ),
+        (
+            {"kind": "interval", "at_ms": 1000},
+            "invalid_shape",
+            ("window_instance", "<unknown>"),
+        ),
+    ),
+)
+def test_parse_observation_rejects_window_instance_kinds_without_documented_shapes(
+    window_instance: dict[str, object],
+    expected_code: str,
+    expected_locator: tuple[str | int, ...],
+) -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["window_instance"] = window_instance
 
     with pytest.raises(api["QuotaContractError"]) as excinfo:
         api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
