@@ -140,6 +140,7 @@ class ReviewLoop:
     # #218：work-item repair budget，依 sizing band 參數化（repair_budget_for_band）；
     # 預設沿用既有 MAX_FIX_ROUNDS，向後相容未帶 band 的既有呼叫端。
     max_fix_rounds: int = MAX_FIX_ROUNDS
+    adopted_at: float | None = None
 
     @classmethod
     def start(
@@ -158,6 +159,7 @@ class ReviewLoop:
             epoch_started_at=float(now_epoch),
             requested_at=None,
             max_fix_rounds=max_fix_rounds,
+            adopted_at=None,
         )
 
     @property
@@ -195,6 +197,7 @@ class ReviewLoop:
             epoch_started_at=float(now_epoch),
             requested_at=None,
             max_fix_rounds=self.max_fix_rounds,
+            adopted_at=None,
         )
 
     def record_review(
@@ -216,9 +219,10 @@ class ReviewLoop:
         if not isinstance(review_id, int) or isinstance(review_id, bool) or review_id <= 0:
             raise ValueError("review_id must be a positive integer")
         submitted_at = float(submitted_at_epoch)
-        if submitted_at < self.requested_at or submitted_at > float(now_epoch):
+        if (self.adopted_at is None and submitted_at < self.requested_at) or submitted_at > float(now_epoch):
             return ReviewDecision(self, "needs_human", "copilot-review-outside-request-epoch")
-        elapsed = float(now_epoch) - self.requested_at
+        base_epoch = self.adopted_at if self.adopted_at is not None else self.requested_at
+        elapsed = float(now_epoch) - base_epoch
         if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
             return ReviewDecision(self, "needs_human", "copilot-review-timeout")
         if error:
