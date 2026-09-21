@@ -241,6 +241,59 @@ def test_parse_observation_requires_explicit_unit_catalog_keyword() -> None:
         api["parse_observation"](_cold_start_observation_payload(), descriptors=())
 
 
+def test_context_record_types_require_parse_entrypoints_for_construction() -> None:
+    api = _quota_api()
+
+    construction_cases = (
+        (
+            "UnitDefinition",
+            {
+                "schema_version": 1,
+                "unit_id": "fixture-native-token",
+                "version": "1",
+                "quantity_kind": "amount",
+                "semantics_ref": "fixture:native-token/v1",
+            },
+            "parse_unit_definition",
+        ),
+        (
+            "PoolDescriptor",
+            {
+                "schema_version": 1,
+                "authority_id": "fixture-authority",
+                "account_id": "fixture-account-a",
+                "pool_id": "fixture-pool-a",
+                "revision": "fixture-revision-1",
+                "units": (),
+                "windows": (),
+            },
+            "parse_pool_descriptor",
+        ),
+        (
+            "ProfilePoolBinding",
+            {
+                "schema_version": 1,
+                "binding_id": "fixture-binding-1",
+                "revision": "fixture-binding-revision-1",
+            },
+            "parse_binding",
+        ),
+        (
+            "QuotaObservation",
+            {
+                "schema_version": 1,
+                "observation_id": "fixture-observation-1",
+                "source_id": "fixture-source",
+            },
+            "parse_observation",
+        ),
+    )
+
+    for record_name, kwargs, parser_name in construction_cases:
+        with pytest.raises(TypeError, match=parser_name):
+            api[record_name](**kwargs)
+
+
 def test_unit_definition_enforces_strict_shape_and_redacted_error_locator() -> None:
     api = _quota_api()
     payload = _unit_definition_payload()
@@ -313,29 +366,26 @@ def test_parse_unit_and_observation_leave_exact_payloads_unchanged_and_snapshot_
     assert observation.to_dict() == observation_source_before
 
 
-def test_context_records_reject_caller_constructed_dataclasses() -> None:
+def test_unit_definition_uses_canonical_public_shape_even_for_inline_descriptor_units() -> None:
+    api = _quota_api()
+    unit_payload = _unit_definition_payload()
+    descriptor_payload = _pool_descriptor_payload()
+
+    standalone_unit = api["parse_unit_definition"](deepcopy(unit_payload))
+    descriptor = api["parse_pool_descriptor"](deepcopy(descriptor_payload))
+    inline_unit = descriptor.units[0]
+
+    assert inline_unit == standalone_unit
+    assert inline_unit.to_dict() == unit_payload
+    assert standalone_unit.to_dict() == unit_payload
+    assert descriptor.to_dict()["units"] == descriptor_payload["units"]
+
+
+def test_context_records_reject_forged_untrusted_dataclasses() -> None:
     api = _quota_api()
 
-    raw_unit = api["UnitDefinition"](
-        schema_version=1,
-        unit_id="fixture-native-token",
-        version="1",
-        quantity_kind="amount",
-        semantics_ref="fixture:native-token/v1",
-        _wire={"schema_version": 1},
-        _json_bytes=1,
-    )
-    raw_descriptor = api["PoolDescriptor"](
-        schema_version=1,
-        authority_id="fixture-authority",
-        account_id="fixture-account-a",
-        pool_id="fixture-pool-a",
-        revision="fixture-revision-1",
-        units=(),
-        windows=(),
-        _wire={"schema_version": 1},
-        _json_bytes=1,
-    )
+    raw_unit = object.__new__(api["UnitDefinition"])
+    raw_descriptor = object.__new__(api["PoolDescriptor"])
 
     with pytest.raises(api["QuotaContractError"]) as observation_error:
         api["parse_observation"](

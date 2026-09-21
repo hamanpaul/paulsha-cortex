@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import json
 import re
 from types import MappingProxyType
+from typing import ClassVar, TypeVar
 
 __all__ = [
     "QuotaContractError",
@@ -98,6 +99,8 @@ _WINDOW_DURATION_KEYS = ("window_id", "kind", "unit_ref", "duration_ms")
 _WINDOW_REASON_KEYS = ("window_id", "kind", "unit_ref", "reason")
 _WINDOW_MIN_KEYS = ("window_id", "kind", "unit_ref")
 
+_RecordT = TypeVar("_RecordT")
+
 
 class QuotaContractError(ValueError):
     """Machine-readable validation failure."""
@@ -113,8 +116,20 @@ class QuotaContractError(ValueError):
         return f"{self.code} at {_format_locator(self.locator)}"
 
 
-@dataclass(frozen=True)
-class UnitDefinition:
+class _ParserSealedRecord:
+    _parser_entrypoint: ClassVar[str]
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args
+        del kwargs
+        raise TypeError(
+            f"{type(self).__name__} is parser-sealed; use {type(self)._parser_entrypoint}()"
+        )
+
+
+@dataclass(frozen=True, init=False)
+class UnitDefinition(_ParserSealedRecord):
+    _parser_entrypoint: ClassVar[str] = "parse_unit_definition"
     schema_version: int
     unit_id: str
     version: str
@@ -128,6 +143,29 @@ class UnitDefinition:
         compare=False,
         init=False,
     )
+
+    @classmethod
+    def _from_parser(
+        cls,
+        *,
+        schema_version: int,
+        unit_id: str,
+        version: str,
+        quantity_kind: str,
+        semantics_ref: str,
+        wire: object,
+        json_bytes: int,
+    ) -> "UnitDefinition":
+        return _build_record(
+            cls,
+            schema_version=schema_version,
+            unit_id=unit_id,
+            version=version,
+            quantity_kind=quantity_kind,
+            semantics_ref=semantics_ref,
+            _wire=wire,
+            _json_bytes=json_bytes,
+        )
 
     @property
     def ref(self) -> tuple[str, str]:
@@ -147,8 +185,9 @@ class UnitDefinition:
         return _thaw_root_dict(self._wire)
 
 
-@dataclass(frozen=True)
-class PoolDescriptor:
+@dataclass(frozen=True, init=False)
+class PoolDescriptor(_ParserSealedRecord):
+    _parser_entrypoint: ClassVar[str] = "parse_pool_descriptor"
     schema_version: int
     authority_id: str
     account_id: str
@@ -165,6 +204,33 @@ class PoolDescriptor:
         init=False,
     )
 
+    @classmethod
+    def _from_parser(
+        cls,
+        *,
+        schema_version: int,
+        authority_id: str,
+        account_id: str,
+        pool_id: str,
+        revision: str,
+        units: tuple[UnitDefinition, ...],
+        windows: tuple[object, ...],
+        wire: object,
+        json_bytes: int,
+    ) -> "PoolDescriptor":
+        return _build_record(
+            cls,
+            schema_version=schema_version,
+            authority_id=authority_id,
+            account_id=account_id,
+            pool_id=pool_id,
+            revision=revision,
+            units=units,
+            windows=windows,
+            _wire=wire,
+            _json_bytes=json_bytes,
+        )
+
     @property
     def pool_ref(self) -> tuple[str, str, str, str]:
         return (self.authority_id, self.account_id, self.pool_id, self.revision)
@@ -173,8 +239,9 @@ class PoolDescriptor:
         return _thaw_root_dict(self._wire)
 
 
-@dataclass(frozen=True)
-class ProfilePoolBinding:
+@dataclass(frozen=True, init=False)
+class ProfilePoolBinding(_ParserSealedRecord):
+    _parser_entrypoint: ClassVar[str] = "parse_binding"
     schema_version: int
     binding_id: str
     revision: str
@@ -188,12 +255,34 @@ class ProfilePoolBinding:
         init=False,
     )
 
+    @classmethod
+    def _from_parser(
+        cls,
+        *,
+        schema_version: int,
+        binding_id: str,
+        revision: str,
+        status: Mapping[str, object],
+        wire: object,
+        json_bytes: int,
+    ) -> "ProfilePoolBinding":
+        return _build_record(
+            cls,
+            schema_version=schema_version,
+            binding_id=binding_id,
+            revision=revision,
+            _status=status,
+            _wire=wire,
+            _json_bytes=json_bytes,
+        )
+
     def to_dict(self) -> dict[str, object]:
         return _thaw_root_dict(self._wire)
 
 
-@dataclass(frozen=True)
-class QuotaObservation:
+@dataclass(frozen=True, init=False)
+class QuotaObservation(_ParserSealedRecord):
+    _parser_entrypoint: ClassVar[str] = "parse_observation"
     schema_version: int
     observation_id: str
     source_id: str
@@ -213,6 +302,35 @@ class QuotaObservation:
         init=False,
     )
 
+    @classmethod
+    def _from_parser(
+        cls,
+        *,
+        schema_version: int,
+        observation_id: str,
+        source_id: str,
+        event_identity_components: tuple[str, str, str] | None,
+        observed_at_ms: int | None,
+        ttl_ms: int | None,
+        reset_at_ms: int | None,
+        window_end_ms: int | None,
+        wire: object,
+        json_bytes: int,
+    ) -> "QuotaObservation":
+        return _build_record(
+            cls,
+            schema_version=schema_version,
+            observation_id=observation_id,
+            source_id=source_id,
+            _event_identity_components=event_identity_components,
+            _observed_at_ms=observed_at_ms,
+            _ttl_ms=ttl_ms,
+            _reset_at_ms=reset_at_ms,
+            _window_end_ms=window_end_ms,
+            _wire=wire,
+            _json_bytes=json_bytes,
+        )
+
     def to_dict(self) -> dict[str, object]:
         return _thaw_root_dict(self._wire)
 
@@ -227,6 +345,14 @@ class _KnownValue:
 @dataclass(frozen=True)
 class _QuantityInfo:
     state: str | None = None
+
+
+def _build_record(cls: type[_RecordT], /, **attributes: object) -> _RecordT:
+    record = object.__new__(cls)
+    for name, value in attributes.items():
+        object.__setattr__(record, name, value)
+    object.__setattr__(record, "_trusted", None)
+    return record
 
 
 def _seal_record(record: object) -> object:
@@ -254,15 +380,22 @@ def parse_unit_definition(payload: dict) -> UnitDefinition:
         snapshot.get("quantity_kind"), ("quantity_kind",)
     )
     semantics_ref = _parse_ref(snapshot.get("semantics_ref"), ("semantics_ref",))
+    canonical_snapshot = _canonical_unit_snapshot(
+        schema_version=schema_version,
+        unit_id=unit_id,
+        version=version,
+        quantity_kind=quantity_kind,
+        semantics_ref=semantics_ref,
+    )
     return _seal_record(
-        UnitDefinition(
+        UnitDefinition._from_parser(
             schema_version=schema_version,
             unit_id=unit_id,
             version=version,
             quantity_kind=quantity_kind,
             semantics_ref=semantics_ref,
-            _wire=_freeze_wire(snapshot),
-            _json_bytes=json_bytes,
+            wire=_freeze_wire(canonical_snapshot),
+            json_bytes=json_bytes,
         )
     )
 
@@ -286,7 +419,7 @@ def parse_pool_descriptor(payload: dict) -> PoolDescriptor:
     units = _parse_descriptor_units(snapshot.get("units"), ("units",))
     windows = _parse_descriptor_windows(snapshot.get("windows"), ("windows",))
     return _seal_record(
-        PoolDescriptor(
+        PoolDescriptor._from_parser(
             schema_version=schema_version,
             authority_id=authority_id,
             account_id=account_id,
@@ -294,8 +427,8 @@ def parse_pool_descriptor(payload: dict) -> PoolDescriptor:
             revision=revision,
             units=units,
             windows=windows,
-            _wire=_freeze_wire(snapshot),
-            _json_bytes=json_bytes,
+            wire=_freeze_wire(snapshot),
+            json_bytes=json_bytes,
         )
     )
 
@@ -324,13 +457,13 @@ def parse_binding(
     _parse_binding_constraints(snapshot.get("constraints"), ("constraints",))
     _parse_coverage(snapshot.get("coverage"), ("coverage",))
     return _seal_record(
-        ProfilePoolBinding(
+        ProfilePoolBinding._from_parser(
             schema_version=schema_version,
             binding_id=binding_id,
             revision=revision,
-            _status=_DEFERRED_HELPER_RESULT,
-            _wire=_freeze_wire(snapshot),
-            _json_bytes=json_bytes,
+            status=_DEFERRED_HELPER_RESULT,
+            wire=_freeze_wire(snapshot),
+            json_bytes=json_bytes,
         )
     )
 
@@ -401,17 +534,17 @@ def parse_observation(
         raise QuotaContractError("incompatible_semantics", ("measurement", "quantity"))
 
     return _seal_record(
-        QuotaObservation(
+        QuotaObservation._from_parser(
             schema_version=schema_version,
             observation_id=observation_id,
             source_id=source_id,
-            _event_identity_components=None,
-            _observed_at_ms=None,
-            _ttl_ms=None,
-            _reset_at_ms=None,
-            _window_end_ms=None,
-            _wire=_freeze_wire(snapshot),
-            _json_bytes=json_bytes,
+            event_identity_components=None,
+            observed_at_ms=None,
+            ttl_ms=None,
+            reset_at_ms=None,
+            window_end_ms=None,
+            wire=_freeze_wire(snapshot),
+            json_bytes=json_bytes,
         )
     )
 
@@ -726,23 +859,22 @@ def _parse_inline_unit(
         locator + ("quantity_kind",),
     )
     semantics_ref = _parse_ref(payload.get("semantics_ref"), locator + ("semantics_ref",))
+    canonical_snapshot = _canonical_unit_snapshot(
+        schema_version=_SCHEMA_VERSION,
+        unit_id=unit_id,
+        version=version,
+        quantity_kind=quantity_kind,
+        semantics_ref=semantics_ref,
+    )
     return _seal_record(
-        UnitDefinition(
+        UnitDefinition._from_parser(
             schema_version=_SCHEMA_VERSION,
             unit_id=unit_id,
             version=version,
             quantity_kind=quantity_kind,
             semantics_ref=semantics_ref,
-            _wire=_freeze_wire(payload),
-            _json_bytes=_json_bytes(
-                {
-                    "schema_version": _SCHEMA_VERSION,
-                    "unit_id": unit_id,
-                    "version": version,
-                    "quantity_kind": quantity_kind,
-                    "semantics_ref": semantics_ref,
-                }
-            ),
+            wire=_freeze_wire(canonical_snapshot),
+            json_bytes=_json_bytes(canonical_snapshot),
         )
     )
 
@@ -762,6 +894,23 @@ def _parse_descriptor_units(
         _ensure_exact_keys(payload, _UNIT_INLINE_KEYS, item_locator)
         units.append(_parse_inline_unit(payload, item_locator))
     return tuple(units)
+
+
+def _canonical_unit_snapshot(
+    *,
+    schema_version: int,
+    unit_id: str,
+    version: str,
+    quantity_kind: str,
+    semantics_ref: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": schema_version,
+        "unit_id": unit_id,
+        "version": version,
+        "quantity_kind": quantity_kind,
+        "semantics_ref": semantics_ref,
+    }
 
 
 def _parse_descriptor_windows(
