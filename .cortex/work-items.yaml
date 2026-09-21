@@ -1264,3 +1264,27 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/executor-backoff-slice-consumers-design.md'
     excludes: []
+  executor-backoff-reconcile-replay:
+    title: 'executor-backoff-reconcile-replay'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#946'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/executor-backoff-reconcile-replay/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-reconcile-replay-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-reconcile-replay-design.md'
+    excludes: []
+  copilot-review-adopt-existing:
+    title: 'copilot-review-adopt-existing'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#948'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/copilot-review-adopt-existing/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/copilot-review-adopt-existing-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/copilot-review-adopt-existing-design.md'
+    excludes: []
