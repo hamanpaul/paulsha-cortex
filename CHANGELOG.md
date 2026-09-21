@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **Refine B2 進度 handoff**：新增 `docs/handoffs/2026-09-21-refine-b2-handoff.md`——#911／#825 家族／#866 六條 run
+  的交付與介入紀錄、runtime 現況、下一步順序與派工要訣、#933–#937 分析。docs-only。
+
 - **#866 quota observation schema core**：補齊
   `paulsha_cortex/coordinator/quota_observation.py` 的完整 pure-data contract core：
   standalone / inline unit union、profile/group binding、多 constraint／coverage、
