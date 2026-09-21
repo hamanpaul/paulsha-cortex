@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#849 execution profile schema core**：新增純 `execution_profile.py` descriptor/profile schema 與
+  D4 canonical bytes／versioned profile key、actual-condition key；保留 immutable input／output、
+  native effort grammar、unknown fail-closed 與 bounded validation，未接 production routing、
+  qualification 或 state migration。
+
 - **Refine B2 進度 handoff**：新增 `docs/handoffs/2026-09-21-refine-b2-handoff.md`——#911／#825 家族／#866 六條 run
   的交付與介入紀錄、runtime 現況、下一步順序與派工要訣、#933–#937 分析。docs-only。
 
