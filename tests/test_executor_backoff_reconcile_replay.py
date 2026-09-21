@@ -118,6 +118,7 @@ def _seed_job(
     exit_code: int,
     outcome: str | None = None,
     reason: str = "synthetic-rate-limit",
+    reset_at: float | None = None,
 ) -> dict[str, object]:
     base_head = _git(["rev-parse", "HEAD"], worktree).stdout.strip().lower()
     job = registry.create_job(
@@ -147,6 +148,8 @@ def _seed_job(
             "reason": reason,
             "retryable": outcome == "rate_limited",
         }
+        if reset_at is not None:
+            provider_outcome["reset_at"] = reset_at
     registry.update_headless_result(
         job["job_id"],
         status=status,
@@ -166,6 +169,7 @@ def _seed_terminal_job(
     domain: str = "openai",
     outcome: str = "rate_limited",
     reason: str = "synthetic-rate-limit",
+    reset_at: float | None = None,
 ) -> dict[str, object]:
     return _seed_job(
         registry,
@@ -178,6 +182,7 @@ def _seed_terminal_job(
         exit_code=1,
         outcome=outcome,
         reason=reason,
+        reset_at=reset_at,
     )
 
 
@@ -195,6 +200,7 @@ class _ResumeDispatcher:
 def test_admission_replays_historical_terminal_inventory_and_is_idempotent(
     tmp_path: Path,
     outcome: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """R5(a): an empty store must be repaired from durable terminal inventory."""
 
@@ -212,6 +218,14 @@ def test_admission_replays_historical_terminal_inventory_and_is_idempotent(
     )
     coordinator_root = tmp_path / "coordinator"
     admission_now = time.time() + 3600.0
+    replayed_jobs: list[str] = []
+    original_record_backoff = executor_backoff.record_backoff
+
+    def record_replay(*args, **kwargs):
+        replayed_jobs.append(str(kwargs["job_id"]))
+        return original_record_backoff(*args, **kwargs)
+
+    monkeypatch.setattr(executor_backoff, "record_backoff", record_replay)
 
     first = manager._executor_backoff_admission_report(
         [candidate],
@@ -240,10 +254,46 @@ def test_admission_replays_historical_terminal_inventory_and_is_idempotent(
     assert second["eligible"] == [candidate]
     assert second["skipped"] == []
     assert second["unknown"] == []
+    assert replayed_jobs == [terminal["job_id"]]
     reread = executor_backoff.read_store(
         coordinator_root / executor_backoff.STATE_FILENAME
     )
     assert reread.payload == stored.payload
+
+
+def test_admission_replay_preserves_a_real_future_cooldown(
+    tmp_path: Path,
+) -> None:
+    """A replay must fold the immutable reset time, not admission time."""
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    admission_now = time.time() + 3600.0
+    reset_at = int(admission_now + 600.0)
+    _seed_terminal_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        reset_at=reset_at,
+    )
+
+    report = manager._executor_backoff_admission_report(
+        [_two_builder_identities().identities[0]],
+        coordinator_root=tmp_path / "coordinator",
+        now=admission_now,
+        registry=registry,
+    )
+
+    assert report["eligible"] == []
+    assert report["skipped"] == [
+        {
+            "executor": "codex",
+            "model_id": "gpt-primary",
+            "retry_after_epoch": pytest.approx(reset_at + 5.0, rel=0, abs=0.01),
+        }
+    ]
 
 
 def test_admission_replays_only_the_terminal_event_missing_after_a_store_write(
