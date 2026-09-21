@@ -34,6 +34,19 @@ Planning runtime 建構時，AGY capability probe 的 `build_agy_argv(...)` 若�
 
 這項邊界不涵蓋直接 launcher 的錯誤吞除：direct `SubprocessLauncher` 仍會讓無效 argv 設定向 caller 傳播，且在 argv 建構失敗後不啟動 Popen。真實非法 timeout env 的 direct／probe 雙路徑驗收仍屬後續 timeout child，不由本 child 冒稱完成。
 
+### Quota observation schema boundary
+
+`paulsha_cortex.coordinator.quota_observation` 是 #866 交付的純 schema／helper
+模組：它只提供 standalone `UnitDefinition`、`PoolDescriptor`、
+`ProfilePoolBinding`、`QuotaObservation` 的 bounded parser，以及
+`binding_status()`、`freshness()`、`event_identity()` 三個 read-only helper。
+這層目前**沒有**接到 workflow read model、delivery truth、或既有 usage pipeline；
+production 路徑仍是 `registry.update_headless_result()` 先寫 terminal outcome，再交
+`usage_extractors.extract_usage()` 擷取 usage，structured rate-limit／reset 訊號則
+沿既有 `outcome_taxonomy.StreamEvidence` seam 保留。若未來要把 quota observation
+餵進 source adapters、durable ledger、shadow read projection 或 admission，仍屬
+#836 的後續 B/C/D child，不在這個 pure-schema owner 內偷接 consumer。
+
 GitHub terminal closure scan 會以 authenticated default revision 的 Contents API 讀取 remote Todo，並重驗 path、blob SHA 與 base64 encoding；production 只對 canonical WorkflowRegistry 已連結的 PR 做 merge ancestry compare。只有 HTTP 502/503/504 會有限次 backoff retry，auth、rate-limit、其他 HTTP error、malformed JSON 或 identity mismatch 都立即保留 last-good 並標 degraded。
 
 ## Correlation authority

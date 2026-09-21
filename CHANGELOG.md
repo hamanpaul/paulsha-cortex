@@ -7,24 +7,17 @@
 
 ## [Unreleased]
 
-- **#866 quota observation schema core**：新增純 stdlib 的
-  `paulsha_cortex/coordinator/quota_observation.py` T2 contract core，提供 bounded
-  wire walker、immutable schema records、strict standalone unit parsing、trusted
-  tuple-only unit catalog／descriptor context boundary、parser-sealed DTO constructor
-  boundary、canonical `UnitDefinition.to_dict()`（descriptor inline unit wire shape
-  維持原樣）、redacted contract errors，以及只涵蓋 current RED fixtures 的
-  standalone unit-catalog observation parsing。T2 已公開的 parser scaffold 現在也會
-  嚴格拒收未列舉或錯形的 descriptor window／measurement／`source.method`／
-  `coverage.state` wire；尚未真正實作的 descriptor-backed observation path 也改為
-  fail-closed：known `scope` 直接回 `unresolved_reference`、descriptor window 的
-  `unit_ref` 必須指向同一 descriptor 內的 inline unit、`window_instance.kind`
-  只接受 `interval|instant|unknown` 與各自 exact keys；已知 standalone
-  `unit_ref` 也會對 known amount/gauge measurement kind mismatch fail-closed，
-  已知 binding constraint 則必須精確對到唯一 supplied descriptor window。
-  不接 consumer、不做 I/O、也不依賴 global catalog。
-  `PoolDescriptor`、`ProfilePoolBinding` 與 `QuotaObservation` 的 public record
-  equality/hash semantics 也改為反映完整 wire payload，避免不同隱藏欄位只因公開子集相同
-  就誤判成相等。
+- **#866 quota observation schema core**：補齊
+  `paulsha_cortex/coordinator/quota_observation.py` 的完整 pure-data contract core：
+  standalone / inline unit union、profile/group binding、多 constraint／coverage、
+  descriptor-backed known scope resolution、exact+bounds amount、source method matrix、
+  fresh/stale/unknown freshness、available/unavailable event identity，以及不可變
+  parser-sealed records / redacted errors。模組仍維持 stdlib-only、bounded
+  validation、零 consumer 接線；既有 `registry.update_headless_result() →
+  extract_usage()`／`StreamEvidence` 路徑不變。同步補齊
+  `tests/test_quota_observation.py` 的 grammar／resource／immutability／frozen
+  profile framing／reuse seam coverage，並更新 `README.md` 與
+  `docs/unified-work-lifecycle.md` 的 schema-only boundary 說明。
 
 - **#928 executor backoff terminal admission**：新增 `reset_hint.py` 解析 Retry-After 與 Codex
   `Try again at ...` 文字 reset hint，workflow/slice terminal 會把 rate-limited／quota 終局寫進

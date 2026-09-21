@@ -12,6 +12,7 @@ import builtins
 from copy import deepcopy
 from importlib import import_module
 import inspect
+import json
 import os
 import socket
 import subprocess
@@ -96,6 +97,34 @@ def _binding_payload(*, domain: str = "request") -> dict[str, object]:
     }
 
 
+def _group_binding_payload(*, members_state: str = "known") -> dict[str, object]:
+    payload = _binding_payload()
+    payload["subject"] = {
+        "kind": "group",
+        "group_ref": "fixture:group/v1",
+        "revision": "fixture-group-revision-1",
+        "members": {
+            "state": members_state,
+            "value": [{"schema_version": 1, "key": _profile_key("request")}],
+        }
+        if members_state == "known"
+        else {"state": "unknown", "reason": "unresolved-group"},
+    }
+    return payload
+
+
+def _known_scope_value(window_id: str = "fixture-window-short") -> dict[str, object]:
+    return {
+        "pool_ref": {
+            "authority_id": "fixture-authority",
+            "account_id": "fixture-account-a",
+            "pool_id": "fixture-pool-a",
+            "revision": "fixture-revision-1",
+        },
+        "window_id": window_id,
+    }
+
+
 def _cold_start_observation_payload() -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -145,6 +174,60 @@ def _unknown_unit_observation_payload(kind: str) -> dict[str, object]:
             "scope_id": "fixture-counter",
             "epoch": {"state": "unknown", "reason": "missing-counter-epoch"},
         }
+    return payload
+
+
+def _known_scope_observation_payload() -> dict[str, object]:
+    payload = _cold_start_observation_payload()
+    payload["scope"] = {"state": "known", "value": _known_scope_value()}
+    return payload
+
+
+def _gauge_unit_definition_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "unit_id": "fixture-gauge-unit",
+        "version": "1",
+        "quantity_kind": "gauge",
+        "semantics_ref": "fixture:gauge-unit/v1",
+    }
+
+
+def _gauge_pool_descriptor_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "authority_id": "fixture-authority",
+        "account_id": "fixture-account-a",
+        "pool_id": "fixture-gauge-pool-a",
+        "revision": "fixture-revision-1",
+        "authority_ref": "fixture:pool-authority/v1",
+        "provenance_refs": ["fixture:pool-descriptor/1"],
+        "units": [
+            {
+                "unit_id": "fixture-gauge-unit",
+                "version": "1",
+                "quantity_kind": "gauge",
+                "semantics_ref": "fixture:gauge-unit/v1",
+            }
+        ],
+        "windows": [
+            {
+                "window_id": "fixture-window-live",
+                "kind": "instantaneous",
+                "unit_ref": {"unit_id": "fixture-gauge-unit", "version": "1"},
+            }
+        ],
+    }
+
+
+def _known_event_observation_payload() -> dict[str, object]:
+    payload = _cold_start_observation_payload()
+    payload["source"]["event_identity"] = {
+        "state": "known",
+        "namespace": "fixture-provider",
+        "epoch": "fixture-epoch-1",
+        "event_id": "fixture-event-1",
+    }
     return payload
 
 
@@ -483,11 +566,17 @@ def test_parse_binding_and_context_records_leave_exact_sources_unchanged() -> No
     assert descriptor.to_dict() == descriptor_record_before
     assert unit.to_dict() == unit_record_before
 
-    assert dict(api["binding_status"](binding)) == {"state": "deferred"}
+    assert dict(api["binding_status"](binding)) == {
+        "state": "complete",
+        "reasons": (),
+    }
     assert dict(
         api["freshness"](observation, now_utc_ms=1000, allowed_clock_skew_ms=0)
-    ) == {"state": "deferred"}
-    assert dict(api["event_identity"](observation)) == {"state": "deferred"}
+    ) == {"state": "fresh", "reason": "within-ttl"}
+    assert dict(api["event_identity"](observation)) == {
+        "state": "unavailable",
+        "reason": "source-event-id-unavailable",
+    }
 
     descriptor_payload["units"][0]["semantics_ref"] = "fixture:mutated-source/v2"
     unit_payload["semantics_ref"] = "fixture:mutated-source/v2"
@@ -509,7 +598,7 @@ def test_parse_binding_and_context_records_leave_exact_sources_unchanged() -> No
     assert observation.to_dict() == observation_source_before
 
 
-def test_helper_scaffolds_remain_deferred_in_t2() -> None:
+def test_helpers_compute_documented_results() -> None:
     api = _quota_api()
     descriptor = api["parse_pool_descriptor"](deepcopy(_pool_descriptor_payload()))
     unit = api["parse_unit_definition"](deepcopy(_unit_definition_payload()))
@@ -520,11 +609,124 @@ def test_helper_scaffolds_remain_deferred_in_t2() -> None:
         unit_catalog=(unit,),
     )
 
-    assert dict(api["binding_status"](binding)) == {"state": "deferred"}
+    assert dict(api["binding_status"](binding)) == {
+        "state": "complete",
+        "reasons": (),
+    }
     assert dict(
         api["freshness"](observation, now_utc_ms=1000, allowed_clock_skew_ms=0)
-    ) == {"state": "deferred"}
-    assert dict(api["event_identity"](observation)) == {"state": "deferred"}
+    ) == {"state": "fresh", "reason": "within-ttl"}
+    assert dict(api["event_identity"](observation)) == {
+        "state": "unavailable",
+        "reason": "source-event-id-unavailable",
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload_factory", "expected_reasons"),
+    (
+        (
+            lambda: _group_binding_payload(members_state="unknown"),
+            ("subject-unknown",),
+        ),
+        (
+            lambda: {
+                **_binding_payload(),
+                "constraints": [{"state": "unknown", "reason": "unresolved-alias"}],
+            },
+            ("constraint-unknown",),
+        ),
+        (
+            lambda: {
+                **_binding_payload(),
+                "coverage": {
+                    "state": "partial",
+                    "gaps": [{"scope": "fixture-gap", "reason": "missing-evidence"}],
+                },
+            },
+            ("coverage-incomplete",),
+        ),
+        (
+            lambda: {
+                **_binding_payload(),
+                "constraints": [
+                    {
+                        "state": "known",
+                        "value": {
+                            "pool_ref": _known_scope_value()["pool_ref"],
+                            "window_id": "fixture-window-unknown",
+                        },
+                    }
+                ],
+            },
+            ("window-unknown",),
+        ),
+    ),
+)
+def test_binding_status_reports_incomplete_reasons(
+    payload_factory,
+    expected_reasons: tuple[str, ...],
+) -> None:
+    api = _quota_api()
+    descriptor_payload = _pool_descriptor_payload()
+    descriptor_payload["windows"].append(
+        {
+            "window_id": "fixture-window-unknown",
+            "kind": "unknown",
+            "unit_ref": {"unit_id": "fixture-native-token", "version": "1"},
+            "reason": "missing-window-shape",
+        }
+    )
+    descriptor = api["parse_pool_descriptor"](descriptor_payload)
+    binding = api["parse_binding"](payload_factory(), descriptors=(descriptor,))
+
+    assert dict(api["binding_status"](binding)) == {
+        "state": "incomplete",
+        "reasons": expected_reasons,
+    }
+
+
+def test_parse_binding_accepts_group_subject_and_known_members() -> None:
+    api = _quota_api()
+    descriptor = api["parse_pool_descriptor"](_pool_descriptor_payload())
+
+    binding = api["parse_binding"](
+        _group_binding_payload(),
+        descriptors=(descriptor,),
+    )
+
+    assert binding.to_dict()["subject"]["kind"] == "group"
+    assert dict(api["binding_status"](binding)) == {
+        "state": "complete",
+        "reasons": (),
+    }
+
+
+def test_binding_preserves_same_pool_short_and_week_constraints() -> None:
+    api = _quota_api()
+    descriptor_payload = _pool_descriptor_payload()
+    descriptor_payload["windows"].append(
+        {
+            "window_id": "fixture-window-week",
+            "kind": "rolling",
+            "unit_ref": {"unit_id": "fixture-native-token", "version": "1"},
+            "duration_ms": 604800000,
+        }
+    )
+    descriptor = api["parse_pool_descriptor"](descriptor_payload)
+    payload = _binding_payload()
+    payload["constraints"] = [
+        {"state": "known", "value": _known_scope_value("fixture-window-short")},
+        {"state": "known", "value": _known_scope_value("fixture-window-week")},
+    ]
+
+    binding = api["parse_binding"](payload, descriptors=(descriptor,))
+
+    assert binding.to_dict()["constraints"] == payload["constraints"]
+    assert dict(api["binding_status"](binding)) == {
+        "state": "complete",
+        "reasons": (),
+    }
 
 
 def test_parse_helpers_do_not_touch_io_env_subprocess_or_network(
@@ -655,22 +857,179 @@ def test_parse_binding_rejects_known_constraints_without_unique_descriptor_match
     assert ambiguous_excinfo.value.locator == ("constraints", 0)
 
 
-def test_parse_observation_rejects_descriptor_backed_known_scope_until_resolution_lands() -> None:
+def test_parse_observation_rejects_duplicate_descriptor_pool_refs_even_when_scope_unknown() -> None:
     api = _quota_api()
-    unit = api["parse_unit_definition"](_unit_definition_payload())
     descriptor = api["parse_pool_descriptor"](_pool_descriptor_payload())
-    payload = _cold_start_observation_payload()
-    payload["scope"] = _binding_constraint()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
 
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](
+            _cold_start_observation_payload(),
+            descriptors=(descriptor, api["parse_pool_descriptor"](_pool_descriptor_payload())),
+            unit_catalog=(unit,),
+        )
+
+    assert excinfo.value.code == "duplicate_reference"
+    assert excinfo.value.locator == ("descriptors", 1)
+
+
+def test_parse_observation_accepts_descriptor_backed_known_scope_with_explicit_context() -> None:
+    api = _quota_api()
+    descriptor = api["parse_pool_descriptor"](_pool_descriptor_payload())
+    payload = _known_scope_observation_payload()
+
+    observation = api["parse_observation"](
+        payload,
+        descriptors=(descriptor,),
+        unit_catalog=(),
+    )
+
+    assert observation.to_dict() == payload
+
+
+def test_scope_resolution_keeps_different_accounts_distinct() -> None:
+    api = _quota_api()
+    descriptor_a = api["parse_pool_descriptor"](_pool_descriptor_payload())
+    descriptor_b_payload = _pool_descriptor_payload()
+    descriptor_b_payload["account_id"] = "fixture-account-b"
+    descriptor_b_payload["pool_id"] = "fixture-pool-b"
+    descriptor_b_payload["windows"][0]["window_id"] = "fixture-window-week"
+    descriptor_b = api["parse_pool_descriptor"](descriptor_b_payload)
+    payload = _cold_start_observation_payload()
+    payload["scope"] = {
+        "state": "known",
+        "value": {
+            "pool_ref": {
+                "authority_id": "fixture-authority",
+                "account_id": "fixture-account-b",
+                "pool_id": "fixture-pool-b",
+                "revision": "fixture-revision-1",
+            },
+            "window_id": "fixture-window-week",
+        },
+    }
+    payload["window_instance"] = {
+        "kind": "interval",
+        "start_ms": 1000,
+        "end_ms": 61000,
+        "epoch": {"state": "unknown", "reason": "missing-counter-epoch"},
+    }
+
+    observation = api["parse_observation"](
+        payload,
+        descriptors=(descriptor_a, descriptor_b),
+        unit_catalog=(),
+    )
+
+    assert observation.to_dict()["scope"]["value"]["pool_ref"]["account_id"] == "fixture-account-b"
+
+
+def test_known_scope_requires_window_consistent_with_measurement_even_if_unit_unknown() -> None:
+    api = _quota_api()
+    descriptor = api["parse_pool_descriptor"](_gauge_pool_descriptor_payload())
+    payload = _cold_start_observation_payload()
+    payload["scope"] = {
+        "state": "known",
+        "value": {
+            "pool_ref": {
+                "authority_id": "fixture-authority",
+                "account_id": "fixture-account-a",
+                "pool_id": "fixture-gauge-pool-a",
+                "revision": "fixture-revision-1",
+            },
+            "window_id": "fixture-window-live",
+        },
+    }
+    payload["unit_ref"] = {"state": "unknown", "reason": "missing-unit"}
+    payload["measurement"] = {
+        "kind": "usage_delta",
+        "metric_id": "fixture-gauge",
+        "quantity": {"state": "unknown", "reason": "missing-unit"},
+    }
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(descriptor,), unit_catalog=())
+
+    assert excinfo.value.code == "incompatible_semantics"
+    assert excinfo.value.locator == ("measurement", "kind")
+
+
+def test_known_scope_gauge_requires_instant_window_instance() -> None:
+    api = _quota_api()
+    descriptor = api["parse_pool_descriptor"](_gauge_pool_descriptor_payload())
+    gauge_unit = api["parse_unit_definition"](_gauge_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["scope"] = {
+        "state": "known",
+        "value": {
+            "pool_ref": {
+                "authority_id": "fixture-authority",
+                "account_id": "fixture-account-a",
+                "pool_id": "fixture-gauge-pool-a",
+                "revision": "fixture-revision-1",
+            },
+            "window_id": "fixture-window-live",
+        },
+    }
+    payload["unit_ref"] = {
+        "state": "known",
+        "value": {"unit_id": "fixture-gauge-unit", "version": "1"},
+    }
+    payload["measurement"] = {
+        "kind": "gauge_snapshot",
+        "metric_id": "fixture-gauge",
+        "quantity": {"state": "unknown", "reason": "missing-gauge-value"},
+    }
+    payload["window_instance"] = {"kind": "instant", "at_ms": 1000}
+
+    observation = api["parse_observation"](
+        deepcopy(payload),
+        descriptors=(descriptor,),
+        unit_catalog=(gauge_unit,),
+    )
+    assert observation.to_dict() == payload
+
+    payload["window_instance"] = {
+        "kind": "interval",
+        "start_ms": 1000,
+        "end_ms": 2000,
+        "epoch": {"state": "unknown", "reason": "missing-counter-epoch"},
+    }
     with pytest.raises(api["QuotaContractError"]) as excinfo:
         api["parse_observation"](
             payload,
             descriptors=(descriptor,),
-            unit_catalog=(unit,),
+            unit_catalog=(gauge_unit,),
         )
 
-    assert excinfo.value.code == "unresolved_reference"
-    assert excinfo.value.locator == ("scope",)
+    assert excinfo.value.code == "incompatible_semantics"
+    assert excinfo.value.locator == ("window_instance", "kind")
+
+
+def test_known_scope_rolling_window_requires_exact_interval_width() -> None:
+    api = _quota_api()
+    descriptor = api["parse_pool_descriptor"](_pool_descriptor_payload())
+    payload = _known_scope_observation_payload()
+    payload["window_instance"] = {
+        "kind": "interval",
+        "start_ms": 1000,
+        "end_ms": 61000,
+        "epoch": {"state": "unknown", "reason": "missing-counter-epoch"},
+    }
+
+    observation = api["parse_observation"](
+        deepcopy(payload),
+        descriptors=(descriptor,),
+        unit_catalog=(),
+    )
+    assert observation.to_dict() == payload
+
+    payload["window_instance"]["end_ms"] = 62000
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(descriptor,), unit_catalog=())
+
+    assert excinfo.value.code == "incompatible_semantics"
+    assert excinfo.value.locator == ("window_instance", "end_ms")
 
 
 def test_duplicate_standalone_unit_catalog_ref_is_rejected() -> None:
@@ -686,6 +1045,135 @@ def test_duplicate_standalone_unit_catalog_ref_is_rejected() -> None:
         )
 
     assert excinfo.value.code == "duplicate_reference"
+
+
+def test_unit_catalog_rejects_more_than_16_entries() -> None:
+    api = _quota_api()
+    payloads = []
+    for index in range(17):
+        payload = _unit_definition_payload()
+        payload["unit_id"] = f"fixture-native-token-{index}"
+        payload["semantics_ref"] = f"fixture:native-token/{index}"
+        payloads.append(api["parse_unit_definition"](payload))
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](
+            _cold_start_observation_payload(),
+            descriptors=(),
+            unit_catalog=tuple(payloads),
+        )
+
+    assert excinfo.value.code == "resource_limit"
+    assert excinfo.value.locator == ("unit_catalog",)
+
+
+def test_unit_catalog_accepts_exact_16_entries() -> None:
+    api = _quota_api()
+    units = [api["parse_unit_definition"](_unit_definition_payload())]
+    for index in range(1, 16):
+        payload = _unit_definition_payload()
+        payload["unit_id"] = f"fixture-native-token-{index}"
+        payload["semantics_ref"] = f"fixture:native-token/{index}"
+        units.append(api["parse_unit_definition"](payload))
+
+    observation = api["parse_observation"](
+        _cold_start_observation_payload(),
+        descriptors=(),
+        unit_catalog=tuple(units),
+    )
+
+    assert observation.to_dict()["unit_ref"] == {
+        "state": "known",
+        "value": {"unit_id": "fixture-native-token", "version": "1"},
+    }
+
+
+def test_bounded_walker_rejects_cycles_depth_and_node_overflow() -> None:
+    api = _quota_api()
+
+    cyclic_payload = _unit_definition_payload()
+    cyclic_payload["extra"] = cyclic_payload
+    with pytest.raises(api["QuotaContractError"]) as cycle_excinfo:
+        api["parse_unit_definition"](cyclic_payload)
+    assert cycle_excinfo.value.code == "cyclic_input"
+
+    deep_payload = _unit_definition_payload()
+    current: dict[str, object] = {}
+    deep_payload["extra"] = current
+    for index in range(17):
+        current[str(index)] = {}
+        current = current[str(index)]  # type: ignore[assignment]
+    with pytest.raises(api["QuotaContractError"]) as depth_excinfo:
+        api["parse_unit_definition"](deep_payload)
+    assert depth_excinfo.value.code == "resource_limit"
+
+    node_payload = _unit_definition_payload()
+    node_payload["extra"] = list(range(5000))
+    with pytest.raises(api["QuotaContractError"]) as node_excinfo:
+        api["parse_unit_definition"](node_payload)
+    assert node_excinfo.value.code == "resource_limit"
+
+
+def test_string_and_root_byte_limits_fail_closed_before_shape_validation() -> None:
+    api = _quota_api()
+
+    max_ref = "aa:" + ("b" * 1021)
+    payload = _unit_definition_payload()
+    payload["semantics_ref"] = max_ref
+    unit = api["parse_unit_definition"](payload)
+    rendered = json.dumps(
+        unit.to_dict(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert len(rendered) < 2048
+
+    overflow_string_payload = _unit_definition_payload()
+    overflow_string_payload["semantics_ref"] = "aa:" + ("b" * 1022)
+    with pytest.raises(api["QuotaContractError"]) as string_excinfo:
+        api["parse_unit_definition"](overflow_string_payload)
+    assert string_excinfo.value.code == "resource_limit"
+
+    overflow_root_payload = _cold_start_observation_payload()
+    overflow_root_payload["extra"] = ["x" * 1024] * 70
+    with pytest.raises(api["QuotaContractError"]) as root_excinfo:
+        api["parse_observation"](overflow_root_payload, descriptors=(), unit_catalog=())
+    assert root_excinfo.value.code == "resource_limit"
+
+
+def test_equal_descriptor_and_standalone_unit_refs_share_context_without_conflict() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    descriptor = api["parse_pool_descriptor"](_pool_descriptor_payload())
+
+    observation = api["parse_observation"](
+        _known_scope_observation_payload(),
+        descriptors=(descriptor,),
+        unit_catalog=(unit,),
+    )
+
+    assert observation.to_dict()["unit_ref"] == {
+        "state": "known",
+        "value": {"unit_id": "fixture-native-token", "version": "1"},
+    }
+
+
+def test_conflicting_unit_definition_across_descriptor_and_catalog_is_rejected() -> None:
+    api = _quota_api()
+    conflicting_payload = _unit_definition_payload()
+    conflicting_payload["semantics_ref"] = "fixture:native-token/v2"
+    conflicting_unit = api["parse_unit_definition"](conflicting_payload)
+    descriptor = api["parse_pool_descriptor"](_pool_descriptor_payload())
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](
+            _known_scope_observation_payload(),
+            descriptors=(descriptor,),
+            unit_catalog=(conflicting_unit,),
+        )
+
+    assert excinfo.value.code == "unit_conflict"
 
 
 @pytest.mark.parametrize(
@@ -710,6 +1198,40 @@ def test_profile_ref_domain_roundtrips_without_upgrading(domain: str) -> None:
     assert observation.to_dict()["profile_ref"] == payload["profile_ref"]
 
 
+def test_profile_ref_shape_does_not_create_qualification_or_actual_state() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["profile_ref"] = {
+        "state": "known",
+        "value": {"schema_version": 1, "key": _profile_key("actual")},
+    }
+
+    observation = api["parse_observation"](
+        payload,
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+
+    assert observation.to_dict()["profile_ref"]["value"]["key"] == _profile_key("actual")
+    assert set(dict(api["event_identity"](observation))) <= {"state", "reason", "key"}
+
+
+@pytest.mark.parametrize(
+    "measurement_kind",
+    ("remaining_snapshot", "usage_delta", "usage_total", "gauge_snapshot"),
+)
+def test_unknown_unit_and_unknown_quantity_variants_are_allowed(
+    measurement_kind: str,
+) -> None:
+    api = _quota_api()
+    payload = _unknown_unit_observation_payload(measurement_kind)
+
+    observation = api["parse_observation"](payload, descriptors=(), unit_catalog=())
+
+    assert observation.to_dict()["measurement"]["kind"] == measurement_kind
+
+
 @pytest.mark.parametrize(
     "quantity",
     (
@@ -732,6 +1254,58 @@ def test_unknown_unit_ref_cannot_carry_numeric_quantity(
         api["parse_observation"](payload, descriptors=(), unit_catalog=())
 
     assert excinfo.value.code == "incompatible_semantics"
+
+
+def test_amount_bounds_roundtrip_is_supported_for_known_units() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["measurement"]["quantity"]["amount"] = {
+        "kind": "bounds",
+        "lower": "1",
+        "upper": "2.5",
+    }
+
+    observation = api["parse_observation"](
+        payload,
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+
+    assert (
+        observation.to_dict()["measurement"]["quantity"]["amount"]
+        == payload["measurement"]["quantity"]["amount"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("amount", "expected_code"),
+    (
+        ({"kind": "bounds", "lower": None, "upper": None}, "invalid_bounds"),
+        ({"kind": "bounds", "lower": "3", "upper": "2"}, "invalid_bounds"),
+        ({"kind": "bounds", "lower": "01", "upper": "2"}, "invalid_decimal"),
+        ({"kind": "exact", "value": "1.0"}, "invalid_decimal"),
+        ({"kind": "exact", "value": "-0"}, "invalid_decimal"),
+        ({"kind": "exact", "value": "1e3"}, "invalid_decimal"),
+        ({"kind": "exact", "value": "NaN"}, "invalid_decimal"),
+        ({"kind": "exact", "value": "Infinity"}, "invalid_decimal"),
+        ({"kind": "exact", "value": True}, "invalid_type"),
+        ({"kind": "exact", "value": 0.5}, "invalid_type"),
+    ),
+)
+def test_amount_variants_enforce_bounds_and_decimal_grammar(
+    amount: dict[str, object],
+    expected_code: str,
+) -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["measurement"]["quantity"]["amount"] = amount
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
+
+    assert excinfo.value.code == expected_code
 
 
 @pytest.mark.parametrize(
@@ -796,6 +1370,53 @@ def test_parse_observation_rejects_undervalidated_measurement_variants(
     assert excinfo.value.locator == expected_locator
 
 
+@pytest.mark.parametrize(
+    ("mutator", "expected_locator"),
+    (
+        (
+            lambda payload: payload["source"].__setitem__("method", "estimate"),
+            ("source", "method"),
+        ),
+        (
+            lambda payload: payload["source"].__setitem__("method", "legacy"),
+            ("source", "method"),
+        ),
+    ),
+)
+def test_source_method_restricts_quantity_state(
+    mutator,
+    expected_locator: tuple[str | int, ...],
+) -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    mutator(payload)
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
+
+    assert excinfo.value.code == "incompatible_semantics"
+    assert excinfo.value.locator == expected_locator
+
+
+def test_limit_signal_requires_status_or_structured_source_method() -> None:
+    api = _quota_api()
+    payload = _cold_start_observation_payload()
+    payload["unit_ref"] = {"state": "unknown", "reason": "missing-unit"}
+    payload["measurement"] = {
+        "kind": "limit_signal",
+        "metric_id": "fixture-limit",
+        "signal": "quota-exhausted",
+    }
+    payload["source"]["method"] = "executor_usage"
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(), unit_catalog=())
+
+    assert excinfo.value.code == "incompatible_semantics"
+    assert excinfo.value.locator == ("source", "method")
+
+
 def test_parse_observation_rejects_unknown_source_method() -> None:
     api = _quota_api()
     unit = api["parse_unit_definition"](_unit_definition_payload())
@@ -849,6 +1470,194 @@ def test_parse_observation_rejects_invalid_coverage_states_and_gap_shapes(
     assert excinfo.value.locator == expected_locator
 
 
+def test_freshness_states_follow_ttl_reset_and_window_end_precedence() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+
+    fresh = api["parse_observation"](deepcopy(payload), descriptors=(), unit_catalog=(unit,))
+    assert dict(api["freshness"](fresh, now_utc_ms=1000, allowed_clock_skew_ms=0)) == {
+        "state": "fresh",
+        "reason": "within-ttl",
+    }
+
+    at_ttl = api["parse_observation"](deepcopy(payload), descriptors=(), unit_catalog=(unit,))
+    assert dict(api["freshness"](at_ttl, now_utc_ms=61000, allowed_clock_skew_ms=0)) == {
+        "state": "stale",
+        "reason": "expired-observation",
+    }
+
+    reset_payload = deepcopy(payload)
+    reset_payload["reset_at_ms"] = {"state": "known", "value": 5000}
+    reset_obs = api["parse_observation"](reset_payload, descriptors=(), unit_catalog=(unit,))
+    assert dict(api["freshness"](reset_obs, now_utc_ms=5000, allowed_clock_skew_ms=0)) == {
+        "state": "stale",
+        "reason": "expired-observation",
+    }
+
+    window_payload = deepcopy(payload)
+    window_payload["window_instance"] = {
+        "kind": "interval",
+        "start_ms": 1000,
+        "end_ms": 4000,
+        "epoch": {"state": "unknown", "reason": "missing-counter-epoch"},
+    }
+    window_obs = api["parse_observation"](window_payload, descriptors=(), unit_catalog=(unit,))
+    assert dict(api["freshness"](window_obs, now_utc_ms=4000, allowed_clock_skew_ms=0)) == {
+        "state": "stale",
+        "reason": "expired-observation",
+    }
+
+
+def test_freshness_reports_missing_inputs_and_future_source_time() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["ttl_ms"] = {"state": "unknown", "reason": "missing-ttl"}
+    missing_ttl = api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
+
+    assert dict(api["freshness"](missing_ttl, now_utc_ms=1000, allowed_clock_skew_ms=0)) == {
+        "state": "unknown",
+        "reason": "missing-freshness-input",
+    }
+
+    future_payload = _cold_start_observation_payload()
+    future_payload["observed_at_ms"] = {"state": "known", "value": 2000}
+    future_obs = api["parse_observation"](
+        future_payload,
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+
+    assert dict(api["freshness"](future_obs, now_utc_ms=1000, allowed_clock_skew_ms=0)) == {
+        "state": "unknown",
+        "reason": "future-source-time",
+    }
+    assert dict(api["freshness"](future_obs, now_utc_ms=1000, allowed_clock_skew_ms=1000)) == {
+        "state": "fresh",
+        "reason": "within-ttl",
+    }
+
+
+def test_time_and_duration_caps_are_enforced() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["observed_at_ms"] = {"state": "known", "value": 253402300799999}
+    payload["ttl_ms"] = {"state": "unknown", "reason": "missing-ttl"}
+    observation = api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
+    assert observation.to_dict()["observed_at_ms"]["value"] == 253402300799999
+
+    invalid_time_payload = _cold_start_observation_payload()
+    invalid_time_payload["observed_at_ms"] = {"state": "known", "value": 253402300800000}
+    with pytest.raises(api["QuotaContractError"]) as time_excinfo:
+        api["parse_observation"](invalid_time_payload, descriptors=(), unit_catalog=(unit,))
+    assert time_excinfo.value.code == "invalid_time"
+    assert time_excinfo.value.locator == ("observed_at_ms", "value")
+
+    invalid_duration_payload = _cold_start_observation_payload()
+    invalid_duration_payload["ttl_ms"] = {"state": "known", "value": 31622400001}
+    with pytest.raises(api["QuotaContractError"]) as duration_excinfo:
+        api["parse_observation"](
+            invalid_duration_payload,
+            descriptors=(),
+            unit_catalog=(unit,),
+        )
+    assert duration_excinfo.value.code == "invalid_time"
+    assert duration_excinfo.value.locator == ("ttl_ms", "value")
+
+
+def test_event_identity_available_and_stable_across_receipt_changes() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    observation_payload = _known_event_observation_payload()
+    observation = api["parse_observation"](
+        deepcopy(observation_payload),
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+    variant_payload = _known_event_observation_payload()
+    variant_payload["observation_id"] = "fixture-receipt-2"
+    variant_payload["received_at_ms"] = 2000
+    variant_payload["source"]["adapter_version"] = "fixture-adapter-v2"
+    variant = api["parse_observation"](
+        variant_payload,
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+
+    expected_key = (
+        "qev:v1",
+        "fixture-source",
+        "fixture-provider",
+        "fixture-epoch-1",
+        "fixture-event-1",
+    )
+    assert dict(api["event_identity"](observation)) == {
+        "state": "available",
+        "key": expected_key,
+    }
+    assert dict(api["event_identity"](variant)) == {
+        "state": "available",
+        "key": expected_key,
+    }
+
+
+def test_event_identity_collides_intentionally_for_same_source_event() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    base_payload = _known_event_observation_payload()
+    first = api["parse_observation"](
+        deepcopy(base_payload),
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+
+    second_payload = _known_event_observation_payload()
+    second_payload["measurement"] = {
+        "kind": "remaining_snapshot",
+        "metric_id": "fixture-remaining",
+        "quantity": {"state": "observed", "amount": {"kind": "exact", "value": "456"}},
+    }
+    second = api["parse_observation"](
+        second_payload,
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+
+    assert first != second
+    assert dict(api["event_identity"](first)) == dict(api["event_identity"](second))
+
+
+def test_freshness_rejects_invalid_clock_inputs() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    observation = api["parse_observation"](
+        _cold_start_observation_payload(),
+        descriptors=(),
+        unit_catalog=(unit,),
+    )
+
+    with pytest.raises(api["QuotaContractError"]) as now_excinfo:
+        api["freshness"](observation, now_utc_ms=True, allowed_clock_skew_ms=0)
+
+    assert now_excinfo.value.code == "invalid_type"
+    assert now_excinfo.value.locator == ("now_utc_ms",)
+
+    with pytest.raises(api["QuotaContractError"]) as skew_excinfo:
+        api["freshness"](observation, now_utc_ms=1000, allowed_clock_skew_ms=300001)
+
+    assert skew_excinfo.value.code == "invalid_time"
+    assert skew_excinfo.value.locator == ("allowed_clock_skew_ms",)
+
+
+def test_existing_usage_pipeline_trace_stays_registry_to_extract_usage() -> None:
+    from paulsha_cortex.coordinator import registry as registry_module
+    from paulsha_cortex.coordinator import usage_extractors
+
+    assert registry_module.extract_usage is usage_extractors.extract_usage
+
+
 def test_parse_pool_descriptor_rejects_window_unit_ref_missing_from_inline_units() -> None:
     api = _quota_api()
     payload = _pool_descriptor_payload()
@@ -888,6 +1697,39 @@ def test_parse_pool_descriptor_rejects_duplicate_window_ids() -> None:
 
     assert excinfo.value.code == "duplicate_reference"
     assert excinfo.value.locator == ("windows", 1)
+    assert excinfo.value.locator == ("windows", 1)
+
+def test_parse_pool_descriptor_enforces_window_quantity_kind_matrix() -> None:
+    api = _quota_api()
+    amount_payload = _pool_descriptor_payload()
+    amount_payload["windows"] = [
+        {
+            "window_id": "fixture-window-live",
+            "kind": "instantaneous",
+            "unit_ref": {"unit_id": "fixture-native-token", "version": "1"},
+        }
+    ]
+
+    with pytest.raises(api["QuotaContractError"]) as amount_excinfo:
+        api["parse_pool_descriptor"](amount_payload)
+
+    assert amount_excinfo.value.code == "incompatible_semantics"
+    assert amount_excinfo.value.locator == ("windows", 0, "kind")
+
+    gauge_payload = _gauge_pool_descriptor_payload()
+    gauge_payload["windows"] = [
+        {
+            "window_id": "fixture-window-short",
+            "kind": "rolling",
+            "unit_ref": {"unit_id": "fixture-gauge-unit", "version": "1"},
+            "duration_ms": 60000,
+        }
+    ]
+    with pytest.raises(api["QuotaContractError"]) as gauge_excinfo:
+        api["parse_pool_descriptor"](gauge_payload)
+
+    assert gauge_excinfo.value.code == "incompatible_semantics"
+    assert gauge_excinfo.value.locator == ("windows", 0, "kind")
 
 
 @pytest.mark.parametrize(

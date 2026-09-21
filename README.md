@@ -20,6 +20,18 @@ flowchart LR
 
 persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role profile + scope subject），不是執行中的 agent session；真正執行的是 AgentInstance，真正做安全判斷的是 guardrail / policy engine，它們只讀 persona 契約做 enforcement。
 
+## Quota observation schema core
+
+`paulsha_cortex.coordinator.quota_observation` 是 #866 的純 stdlib wire-contract
+模組：它解析 standalone `UnitDefinition`、`PoolDescriptor`、
+`ProfilePoolBinding`、`QuotaObservation`，並計算 `binding_status()`、
+`freshness()`、`event_identity()`。目前這層只做 bounded validation、不可變
+record 與 helper，**沒有**接到 `registry.update_headless_result()`、
+`usage_extractors.extract_usage()`、durable quota ledger、admission 或派工裁決。
+現有 usage／reset 訊號路徑仍維持 `registry.update_headless_result() →
+extract_usage()` 與 `outcome_taxonomy.StreamEvidence`；若未來要把 quota 觀測接到
+來源 adapter／ledger／admission，仍屬 #836 的後續 B/C/D work item。
+
 
 ## 架構與工作流程驗收
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 import json
 import re
 from types import MappingProxyType
@@ -41,9 +42,11 @@ _MAX_OBSERVATION_CONTEXT_BYTES = _MAX_BINDING_CONTEXT_BYTES + (
 )
 _TIME_MAX = 253402300799999
 _DURATION_MAX = 31622400000
+_MAX_CLOCK_SKEW_MS = 300000
+_MAX_GROUP_MEMBERS = 64
+_MAX_COVERAGE_GAPS = 32
 _TRUST_MARKER = object()
 _MISSING_WIRE = object()
-_DEFERRED_HELPER_RESULT = MappingProxyType({"state": "deferred"})
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _REASON_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
@@ -98,6 +101,7 @@ _OBSERVATION_KEYS = (
 )
 _WINDOW_DURATION_KEYS = ("window_id", "kind", "unit_ref", "duration_ms")
 _WINDOW_MIN_KEYS = ("window_id", "kind", "unit_ref")
+_WINDOW_UNKNOWN_KEYS = ("window_id", "kind", "unit_ref", "reason")
 _WINDOW_DURATION_KINDS = frozenset(("fixed", "rolling"))
 _WINDOW_MIN_KINDS = frozenset(("instantaneous",))
 _WINDOW_INSTANCE_INTERVAL_KEYS = ("kind", "start_ms", "end_ms", "epoch")
@@ -110,6 +114,7 @@ _MEASUREMENT_SIGNAL_KINDS = frozenset(("limit_signal",))
 _SOURCE_METHOD_KINDS = frozenset(
     ("provider_status", "structured_event", "executor_usage", "estimate", "legacy")
 )
+_LIMIT_SIGNAL_SOURCE_METHODS = frozenset(("provider_status", "structured_event"))
 _COVERAGE_STATES = frozenset(("complete", "partial", "unknown"))
 
 _RecordT = TypeVar("_RecordT")
@@ -378,12 +383,38 @@ class _QuantityInfo:
     state: str | None = None
 
 
+@dataclass(frozen=True)
+class _ResolvedWindow:
+    kind: str
+    unit_ref: tuple[str, str]
+    quantity_kind: str
+    duration_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class _WindowInstanceInfo:
+    kind: str
+    start_ms: int | None = None
+    end_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class _SourceInfo:
+    source_id: str
+    method: str
+    event_identity_components: tuple[str, str, str] | None = None
+
+
 def _build_record(cls: type[_RecordT], /, **attributes: object) -> _RecordT:
     record = object.__new__(cls)
     for name, value in attributes.items():
         object.__setattr__(record, name, value)
     object.__setattr__(record, "_trusted", None)
     return record
+
+
+def _helper_result(**payload: object) -> Mapping[str, object]:
+    return MappingProxyType(dict(payload))
 
 
 def _seal_record(record: object) -> object:
@@ -484,16 +515,29 @@ def parse_binding(
     )
     binding_id = _parse_identifier(snapshot.get("binding_id"), ("binding_id",))
     revision = _parse_identifier(snapshot.get("revision"), ("revision",))
-    _parse_binding_subject(snapshot.get("subject"), ("subject",))
+    subject_complete = _parse_binding_subject(snapshot.get("subject"), ("subject",))
     constraints = _parse_binding_constraints(snapshot.get("constraints"), ("constraints",))
-    _parse_coverage(snapshot.get("coverage"), ("coverage",))
-    _resolve_known_binding_constraints(constraints, descriptors)
+    coverage_state = _parse_coverage(snapshot.get("coverage"), ("coverage",))
+    has_unknown_window = _resolve_known_binding_constraints(constraints, descriptors)
+    reasons: set[str] = set()
+    if not subject_complete:
+        reasons.add("subject-unknown")
+    if any(constraint.state != "known" for constraint in constraints):
+        reasons.add("constraint-unknown")
+    if has_unknown_window:
+        reasons.add("window-unknown")
+    if coverage_state != "complete":
+        reasons.add("coverage-incomplete")
+    status = _helper_result(
+        state="complete" if not reasons else "incomplete",
+        reasons=tuple(sorted(reasons)),
+    )
     return _seal_record(
         ProfilePoolBinding._from_parser(
             schema_version=schema_version,
             binding_id=binding_id,
             revision=revision,
-            status=_DEFERRED_HELPER_RESULT,
+            status=status,
             wire=_freeze_wire(snapshot),
             json_bytes=json_bytes,
         )
@@ -507,6 +551,7 @@ def parse_observation(
     unit_catalog: tuple[UnitDefinition, ...],
 ) -> QuotaObservation:
     descriptors = _validate_descriptors(descriptors)
+    _validate_observation_descriptors(descriptors)
     unit_catalog = _validate_unit_catalog(unit_catalog)
     snapshot, json_bytes = _snapshot_payload(
         payload,
@@ -538,52 +583,82 @@ def parse_observation(
         ("unit_ref",),
         _parse_unit_ref_value,
     )
-    _parse_window_instance(snapshot.get("window_instance"), ("window_instance",))
+    window_instance = _parse_window_instance(
+        snapshot.get("window_instance"), ("window_instance",)
+    )
     measurement = _parse_measurement(snapshot.get("measurement"), ("measurement",))
-    _parse_known_unknown(
+    observed_at_ms = _parse_known_unknown(
         snapshot.get("observed_at_ms"),
         ("observed_at_ms",),
         lambda value, locator: _parse_time(value, locator),
     )
+    if observed_at_ms.state == "known" and type(observed_at_ms.value) is not int:
+        raise QuotaContractError("invalid_type", ("observed_at_ms", "value"))
     _parse_time(snapshot.get("received_at_ms"), ("received_at_ms",))
-    _parse_known_unknown(
+    ttl_ms = _parse_known_unknown(
         snapshot.get("ttl_ms"),
         ("ttl_ms",),
         lambda value, locator: _parse_duration(value, locator),
     )
-    _parse_known_unknown(
+    if ttl_ms.state == "known" and type(ttl_ms.value) is not int:
+        raise QuotaContractError("invalid_type", ("ttl_ms", "value"))
+    reset_at_ms = _parse_known_unknown(
         snapshot.get("reset_at_ms"),
         ("reset_at_ms",),
         lambda value, locator: _parse_time(value, locator),
     )
-    source_id = _parse_source(snapshot.get("source"), ("source",))
+    if reset_at_ms.state == "known" and type(reset_at_ms.value) is not int:
+        raise QuotaContractError("invalid_type", ("reset_at_ms", "value"))
+    source = _parse_source(snapshot.get("source"), ("source",))
     _parse_coverage(snapshot.get("coverage"), ("coverage",))
 
-    unit_map = _build_unit_catalog(unit_catalog)
+    if (
+        observed_at_ms.state == "known"
+        and ttl_ms.state == "known"
+        and observed_at_ms.value + ttl_ms.value > _TIME_MAX
+    ):
+        raise QuotaContractError("invalid_time", ("ttl_ms", "value"))
+
+    unit_map = _build_unit_catalog(descriptors, unit_catalog)
+    resolved_scope = None
     if scope.state == "known":
-        raise QuotaContractError("unresolved_reference", ("scope",))
+        resolved_scope = _resolve_pool_window_constraint(
+            scope.value,
+            descriptors,
+            ("scope",),
+        )
+    resolved_unit = None
     if unit_ref.state == "known":
         resolved_unit = unit_map.get(unit_ref.value)
         if resolved_unit is None:
             raise QuotaContractError("unresolved_reference", ("unit_ref",))
-        if not _measurement_kind_matches_quantity_kind(
-            measurement.kind,
-            resolved_unit.quantity_kind,
-        ):
-            raise QuotaContractError("incompatible_semantics", ("measurement", "kind"))
-    if unit_ref.state == "unknown" and measurement.state in {"observed", "estimated"}:
-        raise QuotaContractError("incompatible_semantics", ("measurement", "quantity"))
+
+    _validate_window_instance_against_scope(window_instance, resolved_scope)
+    _validate_measurement_semantics(
+        measurement,
+        source=source,
+        unit_ref=unit_ref,
+        resolved_unit=resolved_unit,
+        resolved_scope=resolved_scope,
+    )
+
+    window_end_ms = (
+        window_instance.end_ms if window_instance.kind == "interval" else None
+    )
+    event_identity_components = source.event_identity_components
 
     return _seal_record(
         QuotaObservation._from_parser(
             schema_version=schema_version,
             observation_id=observation_id,
-            source_id=source_id,
-            event_identity_components=None,
-            observed_at_ms=None,
-            ttl_ms=None,
-            reset_at_ms=None,
-            window_end_ms=None,
+            source_id=source.source_id,
+            event_identity_components=event_identity_components,
+            observed_at_ms=observed_at_ms.value
+            if observed_at_ms.state == "known"
+            else None,
+            ttl_ms=ttl_ms.value if ttl_ms.state == "known" else None,
+            reset_at_ms=reset_at_ms.value if reset_at_ms.state == "known" else None,
+            window_end_ms=window_end_ms,
             wire=_freeze_wire(snapshot),
             json_bytes=json_bytes,
         )
@@ -599,17 +674,39 @@ def binding_status(binding: ProfilePoolBinding) -> Mapping[str, object]:
 def freshness(
     observation: QuotaObservation, *, now_utc_ms: int, allowed_clock_skew_ms: int
 ) -> Mapping[str, object]:
-    del now_utc_ms
-    del allowed_clock_skew_ms
     if not _is_trusted_record(observation, QuotaObservation):
         raise QuotaContractError("invalid_type", ("observation",))
-    return _DEFERRED_HELPER_RESULT
+    current_time = _parse_time(now_utc_ms, ("now_utc_ms",))
+    if type(allowed_clock_skew_ms) is not int:
+        raise QuotaContractError("invalid_type", ("allowed_clock_skew_ms",))
+    if allowed_clock_skew_ms < 0 or allowed_clock_skew_ms > _MAX_CLOCK_SKEW_MS:
+        raise QuotaContractError("invalid_time", ("allowed_clock_skew_ms",))
+    if observation._observed_at_ms is None or observation._ttl_ms is None:
+        return _helper_result(state="unknown", reason="missing-freshness-input")
+    if observation._observed_at_ms > current_time + allowed_clock_skew_ms:
+        return _helper_result(state="unknown", reason="future-source-time")
+    expiry = observation._observed_at_ms + observation._ttl_ms
+    if observation._reset_at_ms is not None and observation._reset_at_ms < expiry:
+        expiry = observation._reset_at_ms
+    if observation._window_end_ms is not None and observation._window_end_ms < expiry:
+        expiry = observation._window_end_ms
+    if current_time >= expiry:
+        return _helper_result(state="stale", reason="expired-observation")
+    return _helper_result(state="fresh", reason="within-ttl")
 
 
 def event_identity(observation: QuotaObservation) -> Mapping[str, object]:
     if not _is_trusted_record(observation, QuotaObservation):
         raise QuotaContractError("invalid_type", ("observation",))
-    return _DEFERRED_HELPER_RESULT
+    if observation._event_identity_components is None:
+        return _helper_result(
+            state="unavailable",
+            reason="source-event-id-unavailable",
+        )
+    return _helper_result(
+        state="available",
+        key=("qev:v1", observation.source_id, *observation._event_identity_components),
+    )
 
 
 def _format_locator(locator: tuple[str | int, ...]) -> str:
@@ -987,13 +1084,13 @@ def _parse_descriptor_windows(
         raise QuotaContractError("invalid_shape", locator)
     if len(items) > _MAX_CONTEXT_ITEMS:
         raise QuotaContractError("resource_limit", locator)
-    unit_refs = frozenset(unit.ref for unit in units)
+    unit_defs = {unit.ref: unit for unit in units}
     windows: list[object] = []
     seen_window_ids: set[str] = set()
     for index, item in enumerate(items):
         item_locator = locator + (index,)
         payload = _expect_dict(item, item_locator)
-        window = _parse_descriptor_window(payload, item_locator, unit_refs)
+        window = _parse_descriptor_window(payload, item_locator, unit_defs)
         window_id = _parse_identifier(
             payload.get("window_id"),
             item_locator + ("window_id",),
@@ -1008,7 +1105,7 @@ def _parse_descriptor_windows(
 def _parse_descriptor_window(
     payload: dict[str, object],
     locator: tuple[str | int, ...],
-    unit_refs: frozenset[tuple[str, str]],
+    unit_defs: dict[tuple[str, str], UnitDefinition],
 ) -> object:
     if "kind" not in payload:
         raise QuotaContractError("invalid_shape", locator + ("kind",))
@@ -1017,16 +1114,30 @@ def _parse_descriptor_window(
         _ensure_exact_keys(payload, _WINDOW_DURATION_KEYS, locator)
         _parse_identifier(payload.get("window_id"), locator + ("window_id",))
         unit_ref = _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
-        if unit_ref not in unit_refs:
+        unit = unit_defs.get(unit_ref)
+        if unit is None:
             raise QuotaContractError("unresolved_reference", locator + ("unit_ref",))
+        if unit.quantity_kind != "amount":
+            raise QuotaContractError("incompatible_semantics", locator + ("kind",))
         _parse_duration(payload.get("duration_ms"), locator + ("duration_ms",))
         return _freeze_wire(payload)
     if kind in _WINDOW_MIN_KINDS:
         _ensure_exact_keys(payload, _WINDOW_MIN_KEYS, locator)
         _parse_identifier(payload.get("window_id"), locator + ("window_id",))
         unit_ref = _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
-        if unit_ref not in unit_refs:
+        unit = unit_defs.get(unit_ref)
+        if unit is None:
             raise QuotaContractError("unresolved_reference", locator + ("unit_ref",))
+        if unit.quantity_kind != "gauge":
+            raise QuotaContractError("incompatible_semantics", locator + ("kind",))
+        return _freeze_wire(payload)
+    if kind == "unknown":
+        _ensure_exact_keys(payload, _WINDOW_UNKNOWN_KEYS, locator)
+        _parse_identifier(payload.get("window_id"), locator + ("window_id",))
+        unit_ref = _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
+        if unit_ref not in unit_defs:
+            raise QuotaContractError("unresolved_reference", locator + ("unit_ref",))
+        _parse_reason(payload.get("reason"), locator + ("reason",))
         return _freeze_wire(payload)
     raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
@@ -1038,24 +1149,59 @@ def _parse_ref_list(value: object, locator: tuple[str | int, ...]) -> tuple[str,
     if len(items) > _MAX_CONTEXT_ITEMS:
         raise QuotaContractError("resource_limit", locator)
     refs: list[str] = []
+    seen_refs: set[str] = set()
     for index, item in enumerate(items):
-        refs.append(_parse_ref(item, locator + (index,)))
+        ref = _parse_ref(item, locator + (index,))
+        if ref in seen_refs:
+            raise QuotaContractError("duplicate_reference", locator + (index,))
+        seen_refs.add(ref)
+        refs.append(ref)
     return tuple(refs)
 
 
-def _parse_binding_subject(value: object, locator: tuple[str | int, ...]) -> None:
+def _parse_profile_ref_list(
+    value: object, locator: tuple[str | int, ...]
+) -> tuple[tuple[int, str], ...]:
+    items = _expect_list(value, locator)
+    if not items:
+        raise QuotaContractError("invalid_shape", locator)
+    if len(items) > _MAX_GROUP_MEMBERS:
+        raise QuotaContractError("resource_limit", locator)
+    profiles: list[tuple[int, str]] = []
+    seen_profiles: set[tuple[int, str]] = set()
+    for index, item in enumerate(items):
+        parsed = _parse_profile_ref_value(item, locator + (index,))
+        if parsed in seen_profiles:
+            raise QuotaContractError("duplicate_reference", locator + (index,))
+        seen_profiles.add(parsed)
+        profiles.append(parsed)
+    return tuple(profiles)
+
+
+def _parse_binding_subject(value: object, locator: tuple[str | int, ...]) -> bool:
     payload = _expect_dict(value, locator)
     kind = payload.get("kind")
     if type(kind) is not str:
         raise QuotaContractError("invalid_type", locator + ("kind",))
-    if kind != "profile":
-        raise QuotaContractError("invalid_identifier", locator + ("kind",))
-    _ensure_exact_keys(payload, ("kind", "profile_ref"), locator)
-    _parse_known_unknown(
-        payload.get("profile_ref"),
-        locator + ("profile_ref",),
-        _parse_profile_ref_value,
-    )
+    if kind == "profile":
+        _ensure_exact_keys(payload, ("kind", "profile_ref"), locator)
+        profile_ref = _parse_known_unknown(
+            payload.get("profile_ref"),
+            locator + ("profile_ref",),
+            _parse_profile_ref_value,
+        )
+        return profile_ref.state == "known"
+    if kind == "group":
+        _ensure_exact_keys(payload, ("kind", "group_ref", "revision", "members"), locator)
+        _parse_ref(payload.get("group_ref"), locator + ("group_ref",))
+        _parse_identifier(payload.get("revision"), locator + ("revision",))
+        members = _parse_known_unknown(
+            payload.get("members"),
+            locator + ("members",),
+            _parse_profile_ref_list,
+        )
+        return members.state == "known"
+    raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
 
 def _parse_binding_constraints(
@@ -1067,14 +1213,18 @@ def _parse_binding_constraints(
     if len(items) > _MAX_BINDING_CONSTRAINTS:
         raise QuotaContractError("resource_limit", locator)
     parsed: list[_KnownValue] = []
+    seen_constraints: set[tuple[tuple[str, str, str, str], str]] = set()
     for index, item in enumerate(items):
-        parsed.append(
-            _parse_known_unknown(
-                item,
-                locator + (index,),
-                _parse_binding_constraint_value,
-            )
+        constraint = _parse_known_unknown(
+            item,
+            locator + (index,),
+            _parse_binding_constraint_value,
         )
+        if constraint.state == "known":
+            if constraint.value in seen_constraints:
+                raise QuotaContractError("duplicate_reference", locator + (index,))
+            seen_constraints.add(constraint.value)
+        parsed.append(constraint)
     return tuple(parsed)
 
 
@@ -1089,25 +1239,31 @@ def _parse_binding_constraint_value(
     )
 
 
-def _parse_coverage(value: object, locator: tuple[str | int, ...]) -> None:
+def _parse_coverage(value: object, locator: tuple[str | int, ...]) -> str:
     payload = _expect_dict(value, locator)
     _ensure_exact_keys(payload, ("state", "gaps"), locator)
     state = _parse_enum_identifier(
         payload.get("state"), locator + ("state",), _COVERAGE_STATES
     )
     gaps = _expect_list(payload.get("gaps"), locator + ("gaps",))
-    if len(gaps) > 32:
+    if len(gaps) > _MAX_COVERAGE_GAPS:
         raise QuotaContractError("resource_limit", locator + ("gaps",))
     if state == "complete" and gaps:
         raise QuotaContractError("invalid_shape", locator + ("gaps",))
     if state == "partial" and not gaps:
         raise QuotaContractError("invalid_shape", locator + ("gaps",))
+    seen_gaps: set[tuple[str, str]] = set()
     for index, item in enumerate(gaps):
         gap_locator = locator + ("gaps", index)
         gap = _expect_dict(item, gap_locator)
         _ensure_exact_keys(gap, ("scope", "reason"), gap_locator)
-        _parse_identifier(gap.get("scope"), gap_locator + ("scope",))
-        _parse_reason(gap.get("reason"), gap_locator + ("reason",))
+        scope = _parse_identifier(gap.get("scope"), gap_locator + ("scope",))
+        reason = _parse_reason(gap.get("reason"), gap_locator + ("reason",))
+        pair = (scope, reason)
+        if pair in seen_gaps:
+            raise QuotaContractError("duplicate_reference", gap_locator)
+        seen_gaps.add(pair)
+    return state
 
 
 def _validate_descriptors(value: object) -> tuple[PoolDescriptor, ...]:
@@ -1132,6 +1288,16 @@ def _validate_unit_catalog(value: object) -> tuple[UnitDefinition, ...]:
     return value
 
 
+def _validate_observation_descriptors(
+    descriptors: tuple[PoolDescriptor, ...],
+) -> None:
+    seen_pool_refs: set[tuple[str, str, str, str]] = set()
+    for index, descriptor in enumerate(descriptors):
+        if descriptor.pool_ref in seen_pool_refs:
+            raise QuotaContractError("duplicate_reference", ("descriptors", index))
+        seen_pool_refs.add(descriptor.pool_ref)
+
+
 def _ensure_total_bytes(
     observed: int, limit: int, locator: tuple[str | int, ...]
 ) -> None:
@@ -1140,6 +1306,7 @@ def _ensure_total_bytes(
 
 
 def _build_unit_catalog(
+    descriptors: tuple[PoolDescriptor, ...],
     unit_catalog: tuple[UnitDefinition, ...],
 ) -> dict[tuple[str, str], UnitDefinition]:
     mapping: dict[tuple[str, str], UnitDefinition] = {}
@@ -1147,6 +1314,17 @@ def _build_unit_catalog(
         if unit.ref in mapping:
             raise QuotaContractError("duplicate_reference", ("unit_catalog", index))
         mapping[unit.ref] = unit
+    for descriptor_index, descriptor in enumerate(descriptors):
+        for unit_index, unit in enumerate(descriptor.units):
+            existing = mapping.get(unit.ref)
+            if existing is None:
+                mapping[unit.ref] = unit
+                continue
+            if existing.definition_key != unit.definition_key:
+                raise QuotaContractError(
+                    "unit_conflict",
+                    ("descriptors", descriptor_index, "units", unit_index),
+                )
     return mapping
 
 
@@ -1163,34 +1341,57 @@ def _measurement_kind_matches_quantity_kind(
 def _resolve_known_binding_constraints(
     constraints: tuple[_KnownValue, ...],
     descriptors: tuple[PoolDescriptor, ...],
-) -> None:
+) -> bool:
+    has_unknown_window = False
     for index, constraint in enumerate(constraints):
         if constraint.state != "known":
             continue
-        _resolve_pool_window_constraint(
+        resolved_window = _resolve_pool_window_constraint(
             constraint.value,
             descriptors,
             ("constraints", index),
         )
+        if resolved_window.kind == "unknown":
+            has_unknown_window = True
+    return has_unknown_window
 
 
 def _resolve_pool_window_constraint(
     value: object,
     descriptors: tuple[PoolDescriptor, ...],
     locator: tuple[str | int, ...],
-) -> None:
+) -> _ResolvedWindow:
     pool_ref, window_id = value
-    matches = 0
-    for descriptor in descriptors:
-        if descriptor.pool_ref != pool_ref:
-            continue
-        for window in descriptor.windows:
-            if isinstance(window, Mapping) and window.get("window_id") == window_id:
-                matches += 1
-                if matches > 1:
-                    raise QuotaContractError("duplicate_reference", locator)
-    if matches == 0:
+    matching_descriptors = [descriptor for descriptor in descriptors if descriptor.pool_ref == pool_ref]
+    if not matching_descriptors:
         raise QuotaContractError("unresolved_reference", locator)
+    if len(matching_descriptors) > 1:
+        raise QuotaContractError("duplicate_reference", locator)
+    descriptor = matching_descriptors[0]
+    descriptor_units = {unit.ref: unit for unit in descriptor.units}
+    for window in descriptor.windows:
+        if not isinstance(window, Mapping) or window.get("window_id") != window_id:
+            continue
+        unit_ref_payload = window.get("unit_ref")
+        if not isinstance(unit_ref_payload, Mapping):
+            raise QuotaContractError("invalid_type", locator + ("unit_ref",))
+        unit_ref = (
+            _parse_identifier(unit_ref_payload.get("unit_id"), locator + ("unit_ref", "unit_id")),
+            _parse_identifier(unit_ref_payload.get("version"), locator + ("unit_ref", "version")),
+        )
+        unit = descriptor_units.get(unit_ref)
+        if unit is None:
+            raise QuotaContractError("unresolved_reference", locator + ("unit_ref",))
+        duration_ms = window.get("duration_ms")
+        if duration_ms is not None and type(duration_ms) is not int:
+            raise QuotaContractError("invalid_type", locator + ("duration_ms",))
+        return _ResolvedWindow(
+            kind=str(window.get("kind")),
+            unit_ref=unit_ref,
+            quantity_kind=unit.quantity_kind,
+            duration_ms=duration_ms,
+        )
+    raise QuotaContractError("unresolved_reference", locator)
 
 
 def _parse_scope_value(
@@ -1206,7 +1407,7 @@ def _parse_scope_value(
 
 def _parse_window_instance(
     value: object, locator: tuple[str | int, ...]
-) -> object:
+) -> _WindowInstanceInfo:
     payload = _expect_dict(value, locator)
     kind = payload.get("kind")
     if type(kind) is not str:
@@ -1214,21 +1415,23 @@ def _parse_window_instance(
     if kind == "unknown":
         _ensure_exact_keys(payload, _WINDOW_INSTANCE_UNKNOWN_KEYS, locator)
         _parse_reason(payload.get("reason"), locator + ("reason",))
-        return _freeze_wire(payload)
+        return _WindowInstanceInfo(kind="unknown")
     if kind == "instant":
         _ensure_exact_keys(payload, _WINDOW_INSTANCE_INSTANT_KEYS, locator)
         _parse_time(payload.get("at_ms"), locator + ("at_ms",))
-        return _freeze_wire(payload)
+        return _WindowInstanceInfo(kind="instant")
     if kind == "interval":
         _ensure_exact_keys(payload, _WINDOW_INSTANCE_INTERVAL_KEYS, locator)
-        _parse_time(payload.get("start_ms"), locator + ("start_ms",))
-        _parse_time(payload.get("end_ms"), locator + ("end_ms",))
+        start_ms = _parse_time(payload.get("start_ms"), locator + ("start_ms",))
+        end_ms = _parse_time(payload.get("end_ms"), locator + ("end_ms",))
+        if start_ms >= end_ms:
+            raise QuotaContractError("invalid_time", locator + ("end_ms",))
         _parse_known_unknown(
             payload.get("epoch"),
             locator + ("epoch",),
             lambda epoch_value, epoch_locator: _parse_identifier(epoch_value, epoch_locator),
         )
-        return _freeze_wire(payload)
+        return _WindowInstanceInfo(kind="interval", start_ms=start_ms, end_ms=end_ms)
     raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
 
@@ -1290,10 +1493,25 @@ def _parse_quantity(value: object, locator: tuple[str | int, ...]) -> str:
 
 def _parse_amount(value: object, locator: tuple[str | int, ...]) -> None:
     payload = _expect_dict(value, locator)
-    _ensure_exact_keys(payload, ("kind", "value"), locator)
-    if _parse_identifier(payload.get("kind"), locator + ("kind",)) != "exact":
-        raise QuotaContractError("invalid_identifier", locator + ("kind",))
-    _parse_decimal_wire(payload.get("value"), locator + ("value",))
+    kind = _parse_identifier(payload.get("kind"), locator + ("kind",))
+    if kind == "exact":
+        _ensure_exact_keys(payload, ("kind", "value"), locator)
+        _parse_decimal_wire(payload.get("value"), locator + ("value",))
+        return
+    if kind == "bounds":
+        _ensure_exact_keys(payload, ("kind", "lower", "upper"), locator)
+        lower = _parse_optional_decimal_wire(payload.get("lower"), locator + ("lower",))
+        upper = _parse_optional_decimal_wire(payload.get("upper"), locator + ("upper",))
+        if lower is None and upper is None:
+            raise QuotaContractError("invalid_bounds", locator)
+        if lower is not None and upper is not None:
+            try:
+                if Decimal(lower) > Decimal(upper):
+                    raise QuotaContractError("invalid_bounds", locator)
+            except InvalidOperation as exc:  # pragma: no cover - guarded by regex
+                raise QuotaContractError("invalid_decimal", locator) from exc
+        return
+    raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
 
 def _parse_decimal_wire(value: object, locator: tuple[str | int, ...]) -> str:
@@ -1302,6 +1520,14 @@ def _parse_decimal_wire(value: object, locator: tuple[str | int, ...]) -> str:
     if not _DECIMAL_WIRE_RE.fullmatch(value):
         raise QuotaContractError("invalid_decimal", locator)
     return value
+
+
+def _parse_optional_decimal_wire(
+    value: object, locator: tuple[str | int, ...]
+) -> str | None:
+    if value is None:
+        return None
+    return _parse_decimal_wire(value, locator)
 
 
 def _parse_counter(value: object, locator: tuple[str | int, ...]) -> None:
@@ -1315,7 +1541,7 @@ def _parse_counter(value: object, locator: tuple[str | int, ...]) -> None:
     )
 
 
-def _parse_source(value: object, locator: tuple[str | int, ...]) -> str:
+def _parse_source(value: object, locator: tuple[str | int, ...]) -> _SourceInfo:
     payload = _expect_dict(value, locator)
     _ensure_exact_keys(
         payload,
@@ -1334,7 +1560,7 @@ def _parse_source(value: object, locator: tuple[str | int, ...]) -> str:
     _parse_identifier(payload.get("source_schema"), locator + ("source_schema",))
     _parse_identifier(payload.get("adapter_version"), locator + ("adapter_version",))
     _parse_ref(payload.get("authority_ref"), locator + ("authority_ref",))
-    _parse_enum_identifier(
+    method = _parse_enum_identifier(
         payload.get("method"), locator + ("method",), _SOURCE_METHOD_KINDS
     )
     _parse_ref_list(payload.get("provenance_refs"), locator + ("provenance_refs",))
@@ -1363,7 +1589,15 @@ def _parse_source(value: object, locator: tuple[str | int, ...]) -> str:
             event_identity.get("event_id"),
             locator + ("event_identity", "event_id"),
         )
-        return source_id
+        return _SourceInfo(
+            source_id=source_id,
+            method=method,
+            event_identity_components=(
+                str(event_identity.get("namespace")),
+                str(event_identity.get("epoch")),
+                str(event_identity.get("event_id")),
+            ),
+        )
     if state == "unknown":
         _ensure_exact_keys(
             event_identity,
@@ -1374,5 +1608,71 @@ def _parse_source(value: object, locator: tuple[str | int, ...]) -> str:
             event_identity.get("reason"),
             locator + ("event_identity", "reason"),
         )
-        return source_id
+        return _SourceInfo(source_id=source_id, method=method)
     raise QuotaContractError("invalid_shape", locator + ("event_identity", "state"))
+
+
+def _validate_window_instance_against_scope(
+    window_instance: _WindowInstanceInfo,
+    resolved_scope: _ResolvedWindow | None,
+) -> None:
+    if resolved_scope is None:
+        return
+    if resolved_scope.kind == "unknown":
+        if window_instance.kind != "unknown":
+            raise QuotaContractError("incompatible_semantics", ("window_instance", "kind"))
+        return
+    if window_instance.kind == "unknown":
+        return
+    if resolved_scope.kind in _WINDOW_DURATION_KINDS:
+        if window_instance.kind != "interval":
+            raise QuotaContractError("incompatible_semantics", ("window_instance", "kind"))
+        if (
+            window_instance.start_ms is None
+            or window_instance.end_ms is None
+            or resolved_scope.duration_ms is None
+            or window_instance.end_ms - window_instance.start_ms != resolved_scope.duration_ms
+        ):
+            raise QuotaContractError("incompatible_semantics", ("window_instance", "end_ms"))
+        return
+    if resolved_scope.kind == "instantaneous" and window_instance.kind != "instant":
+        raise QuotaContractError("incompatible_semantics", ("window_instance", "kind"))
+
+
+def _validate_measurement_semantics(
+    measurement: _QuantityInfo,
+    *,
+    source: _SourceInfo,
+    unit_ref: _KnownValue,
+    resolved_unit: UnitDefinition | None,
+    resolved_scope: _ResolvedWindow | None,
+) -> None:
+    if resolved_scope is not None and resolved_unit is not None:
+        if resolved_scope.unit_ref != resolved_unit.ref:
+            raise QuotaContractError("incompatible_semantics", ("unit_ref",))
+    if measurement.kind in _MEASUREMENT_QUANTITY_KINDS:
+        if (
+            resolved_scope is not None
+            and not _measurement_kind_matches_quantity_kind(
+                measurement.kind,
+                resolved_scope.quantity_kind,
+            )
+        ):
+            raise QuotaContractError("incompatible_semantics", ("measurement", "kind"))
+        if (
+            resolved_unit is not None
+            and not _measurement_kind_matches_quantity_kind(
+                measurement.kind,
+                resolved_unit.quantity_kind,
+            )
+        ):
+            raise QuotaContractError("incompatible_semantics", ("measurement", "kind"))
+        if unit_ref.state == "unknown" and measurement.state in {"observed", "estimated"}:
+            raise QuotaContractError("incompatible_semantics", ("measurement", "quantity"))
+        if source.method == "estimate" and measurement.state == "observed":
+            raise QuotaContractError("incompatible_semantics", ("source", "method"))
+        if source.method == "legacy" and measurement.state != "unknown":
+            raise QuotaContractError("incompatible_semantics", ("source", "method"))
+        return
+    if measurement.kind == "limit_signal" and source.method not in _LIMIT_SIGNAL_SOURCE_METHODS:
+        raise QuotaContractError("incompatible_semantics", ("source", "method"))
