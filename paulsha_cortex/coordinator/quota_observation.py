@@ -96,8 +96,17 @@ _OBSERVATION_KEYS = (
     "coverage",
 )
 _WINDOW_DURATION_KEYS = ("window_id", "kind", "unit_ref", "duration_ms")
-_WINDOW_REASON_KEYS = ("window_id", "kind", "unit_ref", "reason")
 _WINDOW_MIN_KEYS = ("window_id", "kind", "unit_ref")
+_WINDOW_DURATION_KINDS = frozenset(("fixed", "rolling"))
+_WINDOW_MIN_KINDS = frozenset(("instantaneous",))
+_MEASUREMENT_QUANTITY_KINDS = frozenset(
+    ("remaining_snapshot", "usage_delta", "usage_total", "gauge_snapshot")
+)
+_MEASUREMENT_SIGNAL_KINDS = frozenset(("limit_signal",))
+_SOURCE_METHOD_KINDS = frozenset(
+    ("provider_status", "structured_event", "executor_usage", "estimate", "legacy")
+)
+_COVERAGE_STATES = frozenset(("complete", "partial", "unknown"))
 
 _RecordT = TypeVar("_RecordT")
 
@@ -774,10 +783,18 @@ def _parse_duration(value: object, locator: tuple[str | int, ...]) -> int:
 
 
 def _parse_quantity_kind(value: object, locator: tuple[str | int, ...]) -> str:
-    quantity_kind = _parse_identifier(value, locator)
-    if quantity_kind not in {"amount", "gauge"}:
+    return _parse_enum_identifier(value, locator, {"amount", "gauge"})
+
+
+def _parse_enum_identifier(
+    value: object,
+    locator: tuple[str | int, ...],
+    allowed: set[str] | frozenset[str],
+) -> str:
+    parsed = _parse_identifier(value, locator)
+    if parsed not in allowed:
         raise QuotaContractError("invalid_identifier", locator)
-    return quantity_kind
+    return parsed
 
 
 def _parse_profile_ref_value(
@@ -932,28 +949,21 @@ def _parse_descriptor_windows(
 def _parse_descriptor_window(
     payload: dict[str, object], locator: tuple[str | int, ...]
 ) -> object:
-    keys = set(payload)
-    if keys == set(_WINDOW_DURATION_KEYS):
+    if "kind" not in payload:
+        raise QuotaContractError("invalid_shape", locator + ("kind",))
+    kind = _parse_identifier(payload.get("kind"), locator + ("kind",))
+    if kind in _WINDOW_DURATION_KINDS:
         _ensure_exact_keys(payload, _WINDOW_DURATION_KEYS, locator)
         _parse_identifier(payload.get("window_id"), locator + ("window_id",))
-        _parse_identifier(payload.get("kind"), locator + ("kind",))
         _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
         _parse_duration(payload.get("duration_ms"), locator + ("duration_ms",))
         return _freeze_wire(payload)
-    if keys == set(_WINDOW_MIN_KEYS):
+    if kind in _WINDOW_MIN_KINDS:
         _ensure_exact_keys(payload, _WINDOW_MIN_KEYS, locator)
         _parse_identifier(payload.get("window_id"), locator + ("window_id",))
-        _parse_identifier(payload.get("kind"), locator + ("kind",))
         _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
         return _freeze_wire(payload)
-    if keys == set(_WINDOW_REASON_KEYS):
-        _ensure_exact_keys(payload, _WINDOW_REASON_KEYS, locator)
-        _parse_identifier(payload.get("window_id"), locator + ("window_id",))
-        _parse_identifier(payload.get("kind"), locator + ("kind",))
-        _parse_unit_ref_value(payload.get("unit_ref"), locator + ("unit_ref",))
-        _parse_reason(payload.get("reason"), locator + ("reason",))
-        return _freeze_wire(payload)
-    raise QuotaContractError("invalid_shape", locator + ("<unknown>",))
+    raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
 
 def _parse_ref_list(value: object, locator: tuple[str | int, ...]) -> tuple[str, ...]:
@@ -1017,10 +1027,16 @@ def _parse_binding_constraint_value(
 def _parse_coverage(value: object, locator: tuple[str | int, ...]) -> None:
     payload = _expect_dict(value, locator)
     _ensure_exact_keys(payload, ("state", "gaps"), locator)
-    _parse_identifier(payload.get("state"), locator + ("state",))
+    state = _parse_enum_identifier(
+        payload.get("state"), locator + ("state",), _COVERAGE_STATES
+    )
     gaps = _expect_list(payload.get("gaps"), locator + ("gaps",))
     if len(gaps) > 32:
         raise QuotaContractError("resource_limit", locator + ("gaps",))
+    if state == "complete" and gaps:
+        raise QuotaContractError("invalid_shape", locator + ("gaps",))
+    if state == "partial" and not gaps:
+        raise QuotaContractError("invalid_shape", locator + ("gaps",))
     for index, item in enumerate(gaps):
         gap_locator = locator + ("gaps", index)
         gap = _expect_dict(item, gap_locator)
@@ -1113,21 +1129,21 @@ def _parse_measurement(
     value: object, locator: tuple[str | int, ...]
 ) -> _QuantityInfo:
     payload = _expect_dict(value, locator)
-    keys = set(payload)
-    if keys == {"kind", "metric_id", "quantity"}:
+    if "kind" not in payload:
+        raise QuotaContractError("invalid_shape", locator + ("kind",))
+    kind = _parse_identifier(payload.get("kind"), locator + ("kind",))
+    if kind in _MEASUREMENT_QUANTITY_KINDS - {"usage_total"}:
         _ensure_exact_keys(payload, ("kind", "metric_id", "quantity"), locator)
-        _parse_identifier(payload.get("kind"), locator + ("kind",))
         _parse_identifier(payload.get("metric_id"), locator + ("metric_id",))
         return _QuantityInfo(
             state=_parse_quantity(payload.get("quantity"), locator + ("quantity",))
         )
-    if keys == {"kind", "metric_id", "quantity", "counter"}:
+    if kind == "usage_total":
         _ensure_exact_keys(
             payload,
             ("kind", "metric_id", "quantity", "counter"),
             locator,
         )
-        _parse_identifier(payload.get("kind"), locator + ("kind",))
         _parse_identifier(payload.get("metric_id"), locator + ("metric_id",))
         quantity_state = _parse_quantity(
             payload.get("quantity"),
@@ -1135,13 +1151,12 @@ def _parse_measurement(
         )
         _parse_counter(payload.get("counter"), locator + ("counter",))
         return _QuantityInfo(state=quantity_state)
-    if keys == {"kind", "metric_id", "signal"}:
+    if kind in _MEASUREMENT_SIGNAL_KINDS:
         _ensure_exact_keys(payload, ("kind", "metric_id", "signal"), locator)
-        _parse_identifier(payload.get("kind"), locator + ("kind",))
         _parse_identifier(payload.get("metric_id"), locator + ("metric_id",))
         _parse_identifier(payload.get("signal"), locator + ("signal",))
         return _QuantityInfo()
-    raise QuotaContractError("invalid_shape", locator + ("<unknown>",))
+    raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
 
 def _parse_quantity(value: object, locator: tuple[str | int, ...]) -> str:
@@ -1211,7 +1226,9 @@ def _parse_source(value: object, locator: tuple[str | int, ...]) -> str:
     _parse_identifier(payload.get("source_schema"), locator + ("source_schema",))
     _parse_identifier(payload.get("adapter_version"), locator + ("adapter_version",))
     _parse_ref(payload.get("authority_ref"), locator + ("authority_ref",))
-    _parse_identifier(payload.get("method"), locator + ("method",))
+    _parse_enum_identifier(
+        payload.get("method"), locator + ("method",), _SOURCE_METHOD_KINDS
+    )
     _parse_ref_list(payload.get("provenance_refs"), locator + ("provenance_refs",))
     event_identity = _expect_dict(
         payload.get("event_identity"),

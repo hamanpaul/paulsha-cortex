@@ -621,3 +621,159 @@ def test_unknown_unit_ref_cannot_carry_numeric_quantity(
         api["parse_observation"](payload, descriptors=(), unit_catalog=())
 
     assert excinfo.value.code == "incompatible_semantics"
+
+
+@pytest.mark.parametrize(
+    ("measurement", "expected_code", "expected_locator"),
+    (
+        (
+            {
+                "kind": "usage_total",
+                "metric_id": "fixture-token-usage",
+                "quantity": {
+                    "state": "observed",
+                    "amount": {"kind": "exact", "value": "123"},
+                },
+            },
+            "invalid_shape",
+            ("measurement", "counter"),
+        ),
+        (
+            {
+                "kind": "usage_delta",
+                "metric_id": "fixture-token-usage",
+                "quantity": {
+                    "state": "observed",
+                    "amount": {"kind": "exact", "value": "123"},
+                },
+                "counter": {
+                    "scope_id": "fixture-counter",
+                    "epoch": {"state": "unknown", "reason": "missing-counter-epoch"},
+                },
+            },
+            "invalid_shape",
+            ("measurement", "<unknown>"),
+        ),
+        (
+            {
+                "kind": "collector_guess",
+                "metric_id": "fixture-token-usage",
+                "quantity": {
+                    "state": "observed",
+                    "amount": {"kind": "exact", "value": "123"},
+                },
+            },
+            "invalid_identifier",
+            ("measurement", "kind"),
+        ),
+    ),
+)
+def test_parse_observation_rejects_undervalidated_measurement_variants(
+    measurement: dict[str, object],
+    expected_code: str,
+    expected_locator: tuple[str | int, ...],
+) -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["measurement"] = measurement
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
+
+    assert excinfo.value.code == expected_code
+    assert excinfo.value.locator == expected_locator
+
+
+def test_parse_observation_rejects_unknown_source_method() -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["source"]["method"] = "collector-guess"
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
+
+    assert excinfo.value.code == "invalid_identifier"
+    assert excinfo.value.locator == ("source", "method")
+
+
+@pytest.mark.parametrize(
+    ("coverage", "expected_code", "expected_locator"),
+    (
+        (
+            {"state": "incomplete", "gaps": []},
+            "invalid_identifier",
+            ("coverage", "state"),
+        ),
+        (
+            {
+                "state": "complete",
+                "gaps": [{"scope": "fixture-gap", "reason": "missing-evidence"}],
+            },
+            "invalid_shape",
+            ("coverage", "gaps"),
+        ),
+        (
+            {"state": "partial", "gaps": []},
+            "invalid_shape",
+            ("coverage", "gaps"),
+        ),
+    ),
+)
+def test_parse_observation_rejects_invalid_coverage_states_and_gap_shapes(
+    coverage: dict[str, object],
+    expected_code: str,
+    expected_locator: tuple[str | int, ...],
+) -> None:
+    api = _quota_api()
+    unit = api["parse_unit_definition"](_unit_definition_payload())
+    payload = _cold_start_observation_payload()
+    payload["coverage"] = coverage
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
+
+    assert excinfo.value.code == expected_code
+    assert excinfo.value.locator == expected_locator
+
+
+@pytest.mark.parametrize(
+    ("window", "expected_code", "expected_locator"),
+    (
+        (
+            {
+                "window_id": "fixture-window-short",
+                "kind": "calendar",
+                "unit_ref": {"unit_id": "fixture-native-token", "version": "1"},
+                "duration_ms": 60000,
+            },
+            "invalid_identifier",
+            ("windows", 0, "kind"),
+        ),
+        (
+            {
+                "window_id": "fixture-window-short",
+                "kind": "instantaneous",
+                "unit_ref": {"unit_id": "fixture-native-token", "version": "1"},
+                "duration_ms": 60000,
+            },
+            "invalid_shape",
+            ("windows", 0, "<unknown>"),
+        ),
+    ),
+)
+def test_parse_pool_descriptor_rejects_undervalidated_window_variants(
+    window: dict[str, object],
+    expected_code: str,
+    expected_locator: tuple[str | int, ...],
+) -> None:
+    api = _quota_api()
+    payload = _pool_descriptor_payload()
+    payload["windows"] = [window]
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_pool_descriptor"](payload)
+
+    assert excinfo.value.code == expected_code
+    assert excinfo.value.locator == expected_locator
