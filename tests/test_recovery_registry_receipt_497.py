@@ -1,4 +1,4 @@
-"""#497 / T06 RED：凍結 recovery registry receipt 的 additive load/copy 契約。"""
+"""#497 / T06 GREEN：凍結 recovery registry receipt 的 additive load/copy 契約。"""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ def _recovery_request(
     target_branch: str = "feature/slice-a",
     candidate: str = "candidate-sha",
     proof_ref: str = "evidence/recover-1.json",
+    job_id: str = "builder-1",
 ) -> dict[str, Any]:
     return {
         "request_id": request_id,
@@ -39,7 +40,7 @@ def _recovery_request(
         },
         "context": {
             "actor": "operator",
-            "job_id": "builder-1",
+            "job_id": job_id,
             "workflow_run_id": "workflow-1",
             "legacy_fingerprint": "legacy-fingerprint-1",
         },
@@ -49,7 +50,7 @@ def _recovery_request(
 def _stored_receipt(
     request: dict[str, Any],
     *,
-    version: int = 1,
+    version: object = 1,
     receipt_kind: str = "recovery",
     recorded_at: str = "2026-09-21T00:00:00+00:00",
 ) -> dict[str, Any]:
@@ -113,11 +114,19 @@ def _slice_row(
     }
 
 
-def _state_payload(slice_row: dict[str, Any]) -> dict[str, Any]:
+def _job_row(job_id: str, *, status: str = "running") -> dict[str, Any]:
+    return {"job_id": job_id, "status": status}
+
+
+def _state_payload(
+    slice_row: dict[str, Any],
+    *,
+    jobs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     return {
         "schema_version": 2,
         "seq": 0,
-        "jobs": [],
+        "jobs": jobs or [],
         "slices": [slice_row],
         "workflows": [],
         "legacy_records": {"source_schema_version": 1, "seq": 0, "jobs": [], "slices": []},
@@ -203,11 +212,92 @@ def test_legacy_receipt_bytes_complete_golden_request_and_history_survive_read_r
     assert state.read_bytes() == original
 
 
-def test_unknown_recovery_receipt_version_is_rejected_fail_closed(tmp_path: Path) -> None:
+def test_historical_recovery_rows_survive_live_slice_evolution(tmp_path: Path) -> None:
+    state = tmp_path / "jobs.json"
+    current_request = _recovery_request(
+        target_branch="feature/slice-b",
+        candidate="candidate-sha-2",
+        job_id="builder-2",
+    )
+    historical_request = _recovery_request(
+        request_id="recovery-request-0",
+        proof_ref="evidence/recover-0.json",
+    )
+    checkpoint_request = _recovery_request(
+        request_id="checkpoint-request-0",
+        proof_ref="evidence/checkpoint-0.json",
+    )
+    current = _stored_receipt(current_request)
+    historical = _stored_receipt(
+        historical_request,
+        recorded_at="2026-09-20T00:00:00+00:00",
+    )
+    checkpoint = _stored_receipt(
+        checkpoint_request,
+        receipt_kind="checkpoint",
+        recorded_at="2026-09-20T12:00:00+00:00",
+    )
+    slice_row = _slice_row(
+        recovery_receipts=[current],
+        recovery_checkpoints=[checkpoint],
+        recovery_receipt_history=[historical],
+    )
+    slice_row["target_branch"] = current_request["target"]["target_branch"]
+    slice_row["candidate"] = current_request["target"]["candidate"]
+    slice_row["builder_job_id"] = current_request["context"]["job_id"]
+    _write_state(state, _state_payload(slice_row, jobs=[_job_row("builder-2")]))
+
+    loaded = JobRegistry(state_path=state).get_slice("slice-a")
+
+    assert loaded["recovery_receipts"] == [current]
+    assert loaded["recovery_checkpoints"] == [checkpoint]
+    assert loaded["recovery_receipt_history"] == [historical]
+
+
+def test_current_recovery_receipt_live_target_binding_remains_fail_closed(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "jobs.json"
+    slice_row = _slice_row(
+        recovery_receipts=[_stored_receipt(_recovery_request())],
+    )
+    slice_row["target_branch"] = "feature/slice-b"
+    slice_row["candidate"] = "candidate-sha-2"
+    _write_state(state, _state_payload(slice_row))
+
+    with pytest.raises(ValueError, match="receipt|target|mismatch"):
+        JobRegistry(state_path=state)
+
+
+def test_current_recovery_receipt_live_job_binding_remains_fail_closed(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "jobs.json"
+    request = _recovery_request(
+        target_branch="feature/slice-b",
+        candidate="candidate-sha-2",
+    )
+    slice_row = _slice_row(
+        recovery_receipts=[_stored_receipt(request)],
+    )
+    slice_row["target_branch"] = request["target"]["target_branch"]
+    slice_row["candidate"] = request["target"]["candidate"]
+    slice_row["builder_job_id"] = "builder-2"
+    _write_state(state, _state_payload(slice_row, jobs=[_job_row("builder-2")]))
+
+    with pytest.raises(ValueError, match="receipt|caller|mismatch"):
+        JobRegistry(state_path=state)
+
+
+@pytest.mark.parametrize("version", [99, True, 1.0])
+def test_invalid_recovery_receipt_version_is_rejected_fail_closed(
+    tmp_path: Path,
+    version: object,
+) -> None:
     state = tmp_path / "jobs.json"
     payload = _state_payload(
         _slice_row(
-            recovery_receipts=[_stored_receipt(_recovery_request(), version=99)],
+            recovery_receipts=[_stored_receipt(_recovery_request(), version=version)],
         )
     )
     _write_state(state, payload)

@@ -266,6 +266,7 @@ def _validate_recovery_target(
     *,
     slice_row: Mapping[str, Any],
     state_path: Path,
+    require_live_binding: bool = True,
 ) -> dict[str, str]:
     target = _require_exact_dict_keys(
         value,
@@ -281,6 +282,12 @@ def _validate_recovery_target(
         )
         for key in _RECOVERY_TARGET_FIELDS
     }
+    if normalized["slice_id"] != slice_row["slice_id"]:
+        raise ValueError(
+            f"coordinator 狀態檔 recovery receipt target mismatch（fail-closed）: {state_path}"
+        )
+    if not require_live_binding:
+        return normalized
     live_candidate = slice_row.get("candidate")
     if not isinstance(live_candidate, str) or not live_candidate:
         raise ValueError(
@@ -343,6 +350,7 @@ def _validate_recovery_context(
     caller: str,
     slice_row: Mapping[str, Any],
     state_path: Path,
+    require_live_binding: bool = True,
 ) -> dict[str, str]:
     context = _require_exact_dict_keys(
         value,
@@ -358,6 +366,8 @@ def _validate_recovery_context(
         )
         for key in _RECOVERY_CONTEXT_FIELDS
     }
+    if not require_live_binding:
+        return normalized
     job_field = _RECOVERY_ALLOWED_CALLERS[caller]
     live_job_id = slice_row.get(job_field)
     if live_job_id is not None and normalized["job_id"] != live_job_id:
@@ -372,6 +382,7 @@ def _validate_recovery_request(
     *,
     slice_row: Mapping[str, Any],
     state_path: Path,
+    require_live_binding: bool = True,
 ) -> dict[str, Any]:
     request = _require_exact_dict_keys(
         value,
@@ -393,7 +404,12 @@ def _validate_recovery_request(
         raise ValueError(
             f"coordinator 狀態檔 recovery receipt caller mismatch（fail-closed）: {state_path}"
         )
-    target = _validate_recovery_target(request.get("target"), slice_row=slice_row, state_path=state_path)
+    target = _validate_recovery_target(
+        request.get("target"),
+        slice_row=slice_row,
+        state_path=state_path,
+        require_live_binding=require_live_binding,
+    )
     proof_requirements = _validate_recovery_proof_requirements(
         request.get("proof_requirements"),
         target_candidate=target["candidate"],
@@ -404,6 +420,7 @@ def _validate_recovery_request(
         caller=caller,
         slice_row=slice_row,
         state_path=state_path,
+        require_live_binding=require_live_binding,
     )
     return {
         "request_id": request_id,
@@ -420,6 +437,7 @@ def _validate_recovery_receipt(
     expected_kind: str,
     slice_row: Mapping[str, Any],
     state_path: Path,
+    require_live_binding: bool = True,
 ) -> dict[str, Any]:
     receipt = _require_exact_dict_keys(
         value,
@@ -428,7 +446,7 @@ def _validate_recovery_receipt(
         state_path=state_path,
     )
     version = receipt.get("version")
-    if version != _RECOVERY_RECEIPT_VERSION:
+    if type(version) is not int or version != _RECOVERY_RECEIPT_VERSION:
         raise ValueError(
             f"coordinator 狀態檔 unsupported recovery receipt version（fail-closed）: {state_path}"
         )
@@ -441,7 +459,12 @@ def _validate_recovery_receipt(
         raise ValueError(
             f"coordinator 狀態檔 recovery receipt kind mismatch（fail-closed）: {state_path}"
         )
-    request = _validate_recovery_request(receipt.get("request"), slice_row=slice_row, state_path=state_path)
+    request = _validate_recovery_request(
+        receipt.get("request"),
+        slice_row=slice_row,
+        state_path=state_path,
+        require_live_binding=require_live_binding,
+    )
     request_bytes = _require_non_empty_string(
         receipt.get("request_bytes"),
         label="recovery receipt request_bytes",
@@ -531,12 +554,14 @@ def _validate_optional_recovery_slice_fields(
             expected_kind="checkpoint",
             slice_row=slice_row,
             state_path=state_path,
+            require_live_binding=False,
         ),
         "recovery_receipt_history": lambda item: _validate_recovery_receipt(
             item,
             expected_kind="recovery",
             slice_row=slice_row,
             state_path=state_path,
+            require_live_binding=False,
         ),
         "recovery_dispositions": lambda item: _validate_recovery_disposition(
             item,
