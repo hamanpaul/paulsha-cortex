@@ -8,11 +8,11 @@
 ## [Unreleased]
 
 - **#866 quota observation schema core**：新增純 stdlib 的
-  `paulsha_cortex/coordinator/quota_observation.py`，提供 bounded wire walker、
-  immutable schema records、strict standalone unit parsing，以及顯式 tuple-only
-  unit catalog／descriptor context 的 observation round-trip、僅接受 parser 產生
-  DTO 的 trust boundary 與 redacted contract errors；不接 consumer、不做 I/O、
-  也不依賴 global catalog。
+  `paulsha_cortex/coordinator/quota_observation.py` T2 contract core，提供 bounded
+  wire walker、immutable schema records、strict standalone unit parsing、trusted
+  tuple-only unit catalog／descriptor context boundary、redacted contract errors，
+  以及只涵蓋 current RED fixtures 的 standalone unit-catalog observation parsing；
+  不接 consumer、不做 I/O、也不依賴 global catalog。
 
 - **#928 executor backoff terminal admission**：新增 `reset_hint.py` 解析 Retry-After 與 Codex
   `Try again at ...` 文字 reset hint，workflow/slice terminal 會把 rate-limited／quota 終局寫進

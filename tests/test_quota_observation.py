@@ -332,7 +332,7 @@ def test_context_records_reject_caller_constructed_dataclasses() -> None:
     assert binding_error.value.locator == ("descriptors", 0)
 
 
-def test_descriptor_and_catalog_records_stay_immutable_across_helper_calls() -> None:
+def test_descriptor_and_catalog_records_stay_immutable_after_roundtrip() -> None:
     api = _quota_api()
     descriptor_payload = _pool_descriptor_payload()
     unit_payload = _unit_definition_payload()
@@ -366,6 +366,24 @@ def test_descriptor_and_catalog_records_stay_immutable_across_helper_calls() -> 
     assert unit.to_dict() == _unit_definition_payload()
     assert binding.to_dict() == _binding_payload()
     assert observation.to_dict() == _cold_start_observation_payload()
+
+
+def test_helper_scaffolds_remain_deferred_in_t2() -> None:
+    api = _quota_api()
+    descriptor = api["parse_pool_descriptor"](deepcopy(_pool_descriptor_payload()))
+    unit = api["parse_unit_definition"](deepcopy(_unit_definition_payload()))
+    binding = api["parse_binding"](deepcopy(_binding_payload()), descriptors=(descriptor,))
+    observation = api["parse_observation"](
+        deepcopy(_cold_start_observation_payload()),
+        descriptors=(descriptor,),
+        unit_catalog=(unit,),
+    )
+
+    assert dict(api["binding_status"](binding)) == {"state": "deferred"}
+    assert dict(
+        api["freshness"](observation, now_utc_ms=1000, allowed_clock_skew_ms=0)
+    ) == {"state": "deferred"}
+    assert dict(api["event_identity"](observation)) == {"state": "deferred"}
 
 
 def test_parse_helpers_do_not_touch_io_env_subprocess_or_network(
@@ -428,26 +446,16 @@ def test_parse_helpers_do_not_touch_io_env_subprocess_or_network(
         unit_catalog=(unit,),
     )
 
-    assert dict(api["binding_status"](binding)) == {"state": "complete", "reasons": ()}
-    assert dict(api["binding_status"](rebound_binding)) == {
-        "state": "complete",
-        "reasons": (),
-    }
-    assert dict(api["freshness"](observation, now_utc_ms=1000, allowed_clock_skew_ms=0)) == {
-        "state": "fresh",
-        "reason": "within-ttl",
-    }
-    assert dict(
+    assert "state" in dict(api["binding_status"](binding))
+    assert "state" in dict(api["binding_status"](rebound_binding))
+    assert "state" in dict(
+        api["freshness"](observation, now_utc_ms=1000, allowed_clock_skew_ms=0)
+    )
+    assert "state" in dict(
         api["freshness"](rebound_observation, now_utc_ms=1000, allowed_clock_skew_ms=0)
-    ) == {"state": "fresh", "reason": "within-ttl"}
-    assert dict(api["event_identity"](observation)) == {
-        "state": "unavailable",
-        "reason": "source-event-id-unavailable",
-    }
-    assert dict(api["event_identity"](rebound_observation)) == {
-        "state": "unavailable",
-        "reason": "source-event-id-unavailable",
-    }
+    )
+    assert "state" in dict(api["event_identity"](observation))
+    assert "state" in dict(api["event_identity"](rebound_observation))
 
 
 def test_known_unit_ref_requires_explicit_catalog_context() -> None:
