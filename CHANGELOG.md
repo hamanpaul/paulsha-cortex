@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **#866 排除 openspec 鏡像（#938 workaround）**：`quota-observation-schema-core` 的 `openspec` link 移到 `excludes`，
+  避免 planning authority 同內容重複計入 128 KiB workflow input envelope 讓 verify 必炸。docs-only。
+
 - **#928／#929 todo 契約關鍵字**：T8 首行補 `changelog`／`CLI`——機械 plan review 只掃 Tasks list item 首行，
   續行的關鍵字不算，原 todo 觸發 `plan-review-retry-contract_compatibility`。docs-only。
 

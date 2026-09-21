@@ -1005,15 +1005,17 @@ work_items:
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#866'
-      - kind: openspec
-        ref: 'quota-observation-schema-core'
       - kind: path
         ref: 'docs/superpowers/specs/quota-observation-schema-core-spec.md'
       - kind: path
         ref: 'docs/superpowers/specs/quota-observation-schema-core-design.md'
       - kind: path
         ref: 'docs/superpowers/workstreams/quota-observation-schema-core/todo.md'
-    excludes: []
+    excludes:
+      # #938：openspec 鏡像與 superpowers 三件套同內容重複計入 workflow input
+      # envelope（128 KiB 上限）→ verify 必炸；暫時只掛 superpowers 三件套。
+      - kind: openspec
+        ref: 'quota-observation-schema-core'
   task-memory-delivery-adapter:
     title: 'task memory delivery Cortex adapter'
     links:
