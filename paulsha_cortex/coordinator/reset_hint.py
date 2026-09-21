@@ -157,7 +157,8 @@ def parse_reset_hint_details(
         reference = (_UNIX_EPOCH + timedelta(seconds=base_epoch)).astimezone(
             tz or timezone.utc
         )
-    except (OverflowError, ValueError):
+    except (OverflowError, ValueError, TypeError):
+        # TypeError：呼叫端誤傳非 tzinfo 的 tz；parser 對不合法輸入 fail-soft。
         return None, None
 
     retry_after = _RETRY_AFTER_RE.search(haystack)
