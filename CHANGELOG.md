@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+- **#866 quota observation schema core**：補齊
+  `paulsha_cortex/coordinator/quota_observation.py` 的完整 pure-data contract core：
+  standalone / inline unit union、profile/group binding、多 constraint／coverage、
+  descriptor-backed known scope resolution、exact+bounds amount、source method matrix、
+  fresh/stale/unknown freshness、available/unavailable event identity，以及不可變
+  parser-sealed records / redacted errors。模組仍維持 stdlib-only、bounded
+  validation、零 consumer 接線；既有 `registry.update_headless_result() →
+  extract_usage()`／`StreamEvidence` 路徑不變。同步補齊
+  `tests/test_quota_observation.py` 的 grammar／resource／immutability／frozen
+  profile framing／reuse seam coverage，並更新 `README.md` 與
+  `docs/unified-work-lifecycle.md` 的 schema-only boundary 說明。
+
 - **#929 executor backoff slice consumers**：slice lane 的 `dispatch_ready` 現在會在 `_record_pending_slice`／
   worktree／launch／job 建立前先解析 builder identity，優先用 spec frontmatter 的 `executor/model_id`，否則退回
   launcher 的公開 `executor`/`model`；命中 durable executor-backoff cooldown 時不再建立 pending slice、worktree、
