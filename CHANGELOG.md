@@ -18,8 +18,10 @@
   `coverage.state` wire；尚未真正實作的 descriptor-backed observation path 也改為
   fail-closed：known `scope` 直接回 `unresolved_reference`、descriptor window 的
   `unit_ref` 必須指向同一 descriptor 內的 inline unit、`window_instance.kind`
-  只接受 `interval|instant|unknown` 與各自 exact keys；不接 consumer、不做 I/O、
-  也不依賴 global catalog。
+  只接受 `interval|instant|unknown` 與各自 exact keys；已知 standalone
+  `unit_ref` 也會對 known amount/gauge measurement kind mismatch fail-closed，
+  已知 binding constraint 則必須精確對到唯一 supplied descriptor window。
+  不接 consumer、不做 I/O、也不依賴 global catalog。
   `PoolDescriptor`、`ProfilePoolBinding` 與 `QuotaObservation` 的 public record
   equality/hash semantics 也改為反映完整 wire payload，避免不同隱藏欄位只因公開子集相同
   就誤判成相等。

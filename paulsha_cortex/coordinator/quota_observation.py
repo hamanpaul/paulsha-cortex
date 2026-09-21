@@ -374,6 +374,7 @@ class _KnownValue:
 
 @dataclass(frozen=True)
 class _QuantityInfo:
+    kind: str | None = None
     state: str | None = None
 
 
@@ -484,8 +485,9 @@ def parse_binding(
     binding_id = _parse_identifier(snapshot.get("binding_id"), ("binding_id",))
     revision = _parse_identifier(snapshot.get("revision"), ("revision",))
     _parse_binding_subject(snapshot.get("subject"), ("subject",))
-    _parse_binding_constraints(snapshot.get("constraints"), ("constraints",))
+    constraints = _parse_binding_constraints(snapshot.get("constraints"), ("constraints",))
     _parse_coverage(snapshot.get("coverage"), ("coverage",))
+    _resolve_known_binding_constraints(constraints, descriptors)
     return _seal_record(
         ProfilePoolBinding._from_parser(
             schema_version=schema_version,
@@ -560,8 +562,15 @@ def parse_observation(
     unit_map = _build_unit_catalog(unit_catalog)
     if scope.state == "known":
         raise QuotaContractError("unresolved_reference", ("scope",))
-    if unit_ref.state == "known" and unit_ref.value not in unit_map:
-        raise QuotaContractError("unresolved_reference", ("unit_ref",))
+    if unit_ref.state == "known":
+        resolved_unit = unit_map.get(unit_ref.value)
+        if resolved_unit is None:
+            raise QuotaContractError("unresolved_reference", ("unit_ref",))
+        if not _measurement_kind_matches_quantity_kind(
+            measurement.kind,
+            resolved_unit.quantity_kind,
+        ):
+            raise QuotaContractError("incompatible_semantics", ("measurement", "kind"))
     if unit_ref.state == "unknown" and measurement.state in {"observed", "estimated"}:
         raise QuotaContractError("incompatible_semantics", ("measurement", "quantity"))
 
@@ -1127,6 +1136,49 @@ def _build_unit_catalog(
     return mapping
 
 
+def _measurement_kind_matches_quantity_kind(
+    measurement_kind: str | None, quantity_kind: str
+) -> bool:
+    if measurement_kind not in _MEASUREMENT_QUANTITY_KINDS:
+        return True
+    if quantity_kind == "gauge":
+        return measurement_kind == "gauge_snapshot"
+    return measurement_kind != "gauge_snapshot"
+
+
+def _resolve_known_binding_constraints(
+    constraints: tuple[_KnownValue, ...],
+    descriptors: tuple[PoolDescriptor, ...],
+) -> None:
+    for index, constraint in enumerate(constraints):
+        if constraint.state != "known":
+            continue
+        _resolve_pool_window_constraint(
+            constraint.value,
+            descriptors,
+            ("constraints", index),
+        )
+
+
+def _resolve_pool_window_constraint(
+    value: object,
+    descriptors: tuple[PoolDescriptor, ...],
+    locator: tuple[str | int, ...],
+) -> None:
+    pool_ref, window_id = value
+    matches = 0
+    for descriptor in descriptors:
+        if descriptor.pool_ref != pool_ref:
+            continue
+        for window in descriptor.windows:
+            if isinstance(window, Mapping) and window.get("window_id") == window_id:
+                matches += 1
+                if matches > 1:
+                    raise QuotaContractError("duplicate_reference", locator)
+    if matches == 0:
+        raise QuotaContractError("unresolved_reference", locator)
+
+
 def _parse_scope_value(
     value: object, locator: tuple[str | int, ...]
 ) -> tuple[tuple[str, str, str, str], str]:
@@ -1177,6 +1229,7 @@ def _parse_measurement(
         _ensure_exact_keys(payload, ("kind", "metric_id", "quantity"), locator)
         _parse_identifier(payload.get("metric_id"), locator + ("metric_id",))
         return _QuantityInfo(
+            kind=kind,
             state=_parse_quantity(payload.get("quantity"), locator + ("quantity",))
         )
     if kind == "usage_total":
@@ -1191,12 +1244,12 @@ def _parse_measurement(
             locator + ("quantity",),
         )
         _parse_counter(payload.get("counter"), locator + ("counter",))
-        return _QuantityInfo(state=quantity_state)
+        return _QuantityInfo(kind=kind, state=quantity_state)
     if kind in _MEASUREMENT_SIGNAL_KINDS:
         _ensure_exact_keys(payload, ("kind", "metric_id", "signal"), locator)
         _parse_identifier(payload.get("metric_id"), locator + ("metric_id",))
         _parse_identifier(payload.get("signal"), locator + ("signal",))
-        return _QuantityInfo()
+        return _QuantityInfo(kind=kind)
     raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
 

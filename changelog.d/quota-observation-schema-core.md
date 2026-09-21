@@ -13,6 +13,8 @@ boundary：descriptor window kind、measurement variant keys、`source.method` �
 global catalog。另把尚未真正實作的 descriptor-backed observation path 改為
 fail-closed：known `scope` 直接回 `unresolved_reference`、descriptor window 的
 `unit_ref` 必須指向同一 descriptor 內的 inline unit、`window_instance.kind`
-只接受 `interval|instant|unknown` 與各自 exact keys。另修正 `PoolDescriptor`、`ProfilePoolBinding` 與
+只接受 `interval|instant|unknown` 與各自 exact keys；已知 standalone `unit_ref`
+也會對 known amount/gauge measurement kind mismatch fail-closed，已知 binding
+constraint 則必須精確對到唯一 supplied descriptor window。另修正 `PoolDescriptor`、`ProfilePoolBinding` 與
 `QuotaObservation` 的 public record equality/hash semantics，現在會反映完整 wire payload，
 避免僅因公開欄位子集相同而把不同結構誤判成相等。

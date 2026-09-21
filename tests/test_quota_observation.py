@@ -612,6 +612,49 @@ def test_known_unit_ref_requires_explicit_catalog_context() -> None:
     assert excinfo.value.code == "unresolved_reference"
 
 
+def test_parse_observation_rejects_known_unit_measurement_kind_mismatch() -> None:
+    api = _quota_api()
+    unit_payload = _unit_definition_payload()
+    unit_payload["unit_id"] = "fixture-native-gauge"
+    unit_payload["quantity_kind"] = "gauge"
+    unit_payload["semantics_ref"] = "fixture:native-gauge/v1"
+    unit = api["parse_unit_definition"](unit_payload)
+    payload = _cold_start_observation_payload()
+    payload["unit_ref"]["value"]["unit_id"] = "fixture-native-gauge"
+    payload["measurement"]["quantity"] = {
+        "state": "unknown",
+        "reason": "missing-gauge-value",
+    }
+
+    with pytest.raises(api["QuotaContractError"]) as excinfo:
+        api["parse_observation"](payload, descriptors=(), unit_catalog=(unit,))
+
+    assert excinfo.value.code == "incompatible_semantics"
+    assert excinfo.value.locator == ("measurement", "kind")
+
+
+def test_parse_binding_rejects_known_constraints_without_unique_descriptor_match() -> None:
+    api = _quota_api()
+    payload = _binding_payload()
+
+    with pytest.raises(api["QuotaContractError"]) as missing_excinfo:
+        api["parse_binding"](deepcopy(payload), descriptors=())
+
+    assert missing_excinfo.value.code == "unresolved_reference"
+    assert missing_excinfo.value.locator == ("constraints", 0)
+
+    descriptor = api["parse_pool_descriptor"](_pool_descriptor_payload())
+
+    with pytest.raises(api["QuotaContractError"]) as ambiguous_excinfo:
+        api["parse_binding"](
+            deepcopy(payload),
+            descriptors=(descriptor, api["parse_pool_descriptor"](_pool_descriptor_payload())),
+        )
+
+    assert ambiguous_excinfo.value.code == "duplicate_reference"
+    assert ambiguous_excinfo.value.locator == ("constraints", 0)
+
+
 def test_parse_observation_rejects_descriptor_backed_known_scope_until_resolution_lands() -> None:
     api = _quota_api()
     unit = api["parse_unit_definition"](_unit_definition_payload())
