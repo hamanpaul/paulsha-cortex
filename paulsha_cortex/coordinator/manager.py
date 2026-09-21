@@ -4557,7 +4557,13 @@ def record_executor_backoff_from_job(
 ):
     from . import executor_backoff
 
-    if coordinator_root is None or classification is None:
+    if coordinator_root is None:
+        logger.info(
+            "executor backoff record skipped due to missing coordinator_root job_id=%r",
+            job.get("job_id"),
+        )
+        return None
+    if classification is None:
         return None
     if classification.authority is provider_outcome.SignalAuthority.HINT:
         return None

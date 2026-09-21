@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -276,6 +277,282 @@ def _seed_failed_job(
         },
     )
     return registry.get_job(job["job_id"])
+
+
+def test_record_executor_backoff_from_job_records_identity_key_and_reset_deadline(
+    tmp_path: Path,
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    coordinator_root = tmp_path / "coordinator"
+    terminal = _seed_failed_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+    )
+    reset_at = int(time.time()) + 600
+
+    recorded = manager.record_executor_backoff_from_job(
+        coordinator_root,
+        terminal,
+        manager.provider_outcome.ProviderFailureClassification(
+            outcome=manager.provider_outcome.ProviderOutcome.RATE_LIMITED,
+            authority=manager.provider_outcome.SignalAuthority.TEXT_SIGNAL,
+            reason="synthetic-rate-limit",
+            reset_at=reset_at,
+        ),
+    )
+
+    assert recorded is not None
+    assert recorded.executor == "codex"
+    assert recorded.model_id == "gpt-primary"
+    assert recorded.deadline_epoch == pytest.approx(
+        reset_at + executor_backoff.RESET_MARGIN_SECONDS
+    )
+    assert recorded.last_terminal_key == terminal["job_id"]
+    store = executor_backoff.read_store(coordinator_root / executor_backoff.STATE_FILENAME)
+    assert store.observation is executor_backoff.StoreObservation.VALID
+    assert store.payload is not None
+    assert set(store.payload["entries"]) == {"codex/gpt-primary"}
+    assert store.payload["entries"]["codex/gpt-primary"]["last_terminal_key"] == terminal["job_id"]
+    assert store.payload["entries"]["codex/gpt-primary"]["deadline_epoch"] == pytest.approx(
+        reset_at + executor_backoff.RESET_MARGIN_SECONDS
+    )
+
+
+def test_record_executor_backoff_from_job_replaying_same_terminal_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    coordinator_root = tmp_path / "coordinator"
+    terminal = _seed_failed_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+    )
+    reset_at = int(time.time()) + 600
+    classification = manager.provider_outcome.ProviderFailureClassification(
+        outcome=manager.provider_outcome.ProviderOutcome.RATE_LIMITED,
+        authority=manager.provider_outcome.SignalAuthority.TEXT_SIGNAL,
+        reason="synthetic-rate-limit",
+        reset_at=reset_at,
+    )
+
+    manager.record_executor_backoff_from_job(coordinator_root, terminal, classification)
+    first_active = executor_backoff.active_backoff(
+        coordinator_root,
+        "codex",
+        "gpt-primary",
+        now=time.time(),
+    )
+    manager.record_executor_backoff_from_job(coordinator_root, terminal, classification)
+    second_active = executor_backoff.active_backoff(
+        coordinator_root,
+        "codex",
+        "gpt-primary",
+        now=time.time(),
+    )
+
+    assert first_active.backoff is not None
+    assert second_active.backoff is not None
+    assert first_active.backoff.consecutive_hits == 1
+    assert second_active.backoff.consecutive_hits == 1
+    assert first_active.backoff.deadline_epoch == second_active.backoff.deadline_epoch
+    assert first_active.backoff.event_count == 1
+    assert second_active.backoff.event_count == 1
+
+
+@pytest.mark.parametrize(
+    "classification",
+    [
+        manager.provider_outcome.ProviderFailureClassification(
+            outcome=manager.provider_outcome.ProviderOutcome.AUTH,
+            authority=manager.provider_outcome.SignalAuthority.TEXT_SIGNAL,
+            reason="synthetic-auth",
+        ),
+        manager.provider_outcome.ProviderFailureClassification(
+            outcome=manager.provider_outcome.ProviderOutcome.RATE_LIMITED,
+            authority=manager.provider_outcome.SignalAuthority.HINT,
+            reason="synthetic-hint",
+        ),
+    ],
+)
+def test_record_executor_backoff_from_job_ignores_non_durable_classifications(
+    tmp_path: Path,
+    classification: manager.provider_outcome.ProviderFailureClassification,
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    coordinator_root = tmp_path / "coordinator"
+    terminal = _seed_failed_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+    )
+
+    result = manager.record_executor_backoff_from_job(
+        coordinator_root, terminal, classification
+    )
+
+    assert result is None
+    store = executor_backoff.read_store(coordinator_root / executor_backoff.STATE_FILENAME)
+    assert store.observation is executor_backoff.StoreObservation.MISSING
+
+
+@pytest.mark.parametrize("missing_field", ["executor", "model_id"])
+def test_record_executor_backoff_from_job_missing_identity_logs_diagnostic(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    missing_field: str,
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    coordinator_root = tmp_path / "coordinator"
+    terminal = _seed_failed_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+    )
+    incomplete = dict(terminal)
+    incomplete[missing_field] = None
+
+    with caplog.at_level(logging.INFO, logger=manager.logger.name):
+        result = manager.record_executor_backoff_from_job(
+            coordinator_root,
+            incomplete,
+            manager.provider_outcome.ProviderFailureClassification(
+                outcome=manager.provider_outcome.ProviderOutcome.RATE_LIMITED,
+                authority=manager.provider_outcome.SignalAuthority.TEXT_SIGNAL,
+                reason="synthetic-rate-limit",
+            ),
+        )
+
+    assert result is None
+    assert "incomplete terminal metadata" in caplog.text
+    store = executor_backoff.read_store(coordinator_root / executor_backoff.STATE_FILENAME)
+    assert store.observation is executor_backoff.StoreObservation.MISSING
+
+
+def test_record_executor_backoff_from_job_without_coordinator_root_logs_diagnostic(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    terminal = _seed_failed_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+    )
+
+    with caplog.at_level(logging.INFO, logger=manager.logger.name):
+        result = manager.record_executor_backoff_from_job(
+            None,
+            terminal,
+            manager.provider_outcome.ProviderFailureClassification(
+                outcome=manager.provider_outcome.ProviderOutcome.RATE_LIMITED,
+                authority=manager.provider_outcome.SignalAuthority.TEXT_SIGNAL,
+                reason="synthetic-rate-limit",
+            ),
+        )
+
+    assert result is None
+    assert "missing coordinator_root" in caplog.text
+
+
+def test_resume_workflow_run_records_backoff_before_reroute_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    identities = _two_builder_identities()
+    dispatcher = _ResumeDispatcher(registry, worktree)
+    coordinator_root = tmp_path / "coordinator"
+    current = time.time()
+    failed_job = _seed_failed_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+    )
+
+    # Provider capability checks probe real CLI login state; seed fresh snapshots
+    # so this resume test stays hermetic when sandboxes lack those CLIs.
+    monkeypatch.setattr(manager, "_EXECUTOR_AUTH_CACHE", {})
+    for provider_id in ("claude", "codex"):
+        manager._EXECUTOR_AUTH_CACHE[provider_id] = runtime_preflight.ProviderFreshness(
+            provider_id=provider_id,
+            status="ok",
+            observed_at=current,
+            ttl_seconds=900.0,
+            source="snapshot",
+        )
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+
+    assert result["reason"] == "provider-failure-retry"
+    assert result["provider_outcome"] == "rate_limited"
+    dispatched = registry.get_job(result["job_id"])
+    assert dispatched["executor"] == "claude"
+    assert dispatched["model_id"] == "claude-primary"
+    assert dispatched["dispatch_reroute"]["source"] == "executor-backoff"
+    assert dispatched["dispatch_reroute"]["skipped"][0]["executor"] == "codex"
+    assert dispatched["dispatch_reroute"]["skipped"][0]["model_id"] == "gpt-primary"
+    recorded = executor_backoff.active_backoff(
+        coordinator_root,
+        "codex",
+        "gpt-primary",
+        now=time.time(),
+    )
+    assert recorded.backoff is not None
+    assert recorded.backoff.last_terminal_key == failed_job["job_id"]
 
 
 def test_active_executor_backoff_skips_the_cooled_down_first_candidate_on_resume(
