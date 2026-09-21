@@ -1969,6 +1969,8 @@ def apply_slice_action(
     persona: str = "builder",
     review_executor: str | None = None,
     review_model: str | None = None,
+    identity_registry=None,
+    launcher_factory=None,
     clock: Callable[[], str] = _utcnow,
     git_runner=None,
     subprocess_runner=None,
@@ -2147,6 +2149,8 @@ def apply_slice_action(
             launcher=launcher,
             handoff_dir=handoff_dir,
             git_runner=runner,
+            identity_registry=identity_registry,
+            launcher_factory=launcher_factory,
             backoff_skips=backoff_skips,
         )
         if not dispatched:

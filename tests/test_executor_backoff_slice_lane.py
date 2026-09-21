@@ -445,6 +445,98 @@ def test_retry_build_returns_dispatch_skipped_by_backoff_instead_of_raising(tmp_
     assert result["dispatch_skipped_by_backoff"] == [expected_skip]
 
 
+def test_retry_build_request_uses_spec_identity_launcher_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path))
+    state_path = tmp_path / "runtime" / "coordinator" / "jobs.json"
+    specs_dir = tmp_path / "specs"
+    specs_dir.mkdir()
+    plan_path = tmp_path / "docs" / "superpowers" / "plans" / "example.md"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text("plan\n", encoding="utf-8")
+    (specs_dir / "slice-a.md").write_text(
+        "---\n"
+        "dispatch: auto\n"
+        "slice_id: slice-a\n"
+        "plan: docs/superpowers/plans/example.md\n"
+        "target_branch: main\n"
+        "executor: codex\n"
+        "model_id: gpt-5.4-codex\n"
+        "verification:\n"
+        "  docs_class: code\n"
+        "  review_policy: required\n"
+        "  required_artifacts: []\n"
+        "  checks:\n"
+        "    - kind: persona-scope\n"
+        "    - kind: command\n"
+        "      name: policy\n"
+        "      argv: [python3, -m, pytest, -q]\n"
+        "      cwd: .\n"
+        "      timeout_seconds: 300\n"
+        "  tests: []\n"
+        "  full_suite:\n"
+        "    argv: [python3, -m, pytest, -q]\n"
+        "    cwd: .\n"
+        "    timeout_seconds: 300\n"
+        "    baseline: no-regression\n"
+        "---\n\n"
+        "body\n",
+        encoding="utf-8",
+    )
+    registry = _failed_slice_registry(state_path)
+    registry.update_status(str(registry.get_slice("slice-a")["builder_job_id"]), "exited")
+    dispatcher = _DispatchContext(registry, _WorktreeCreator(tmp_path / "worktrees"))
+    resolve_calls: list[tuple[str | None, str | None]] = []
+    created_launchers: list[_RecordingLauncher] = []
+
+    def fake_resolve(executor, injected, *, allow_unsafe, model):
+        resolve_calls.append((executor, model))
+        if executor is None and model is None:
+            return injected
+        launcher = _RecordingLauncher(executor=executor or "copilot", model_id=model)
+        created_launchers.append(launcher)
+        return launcher
+
+    monkeypatch.setattr(manager_daemon, "_resolve_launcher", fake_resolve)
+
+    request_executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(specs_dir),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=object(),
+        workflow_identity_registry=_identity_registry(),
+    )
+
+    result = request_executor(
+        {
+            "type": "slice-action",
+            "args": {
+                "slice_id": "slice-a",
+                "action": "retry-build",
+                "actor": "operator",
+            },
+            "requested_by": "operator",
+        }
+    )
+
+    relaunched_job = registry.get_job(str(result["job_id"]))
+    identity_launcher = next(
+        launcher
+        for launcher in created_launchers
+        if launcher.executor == "codex" and launcher.model == "gpt-5.4-codex"
+    )
+
+    assert result["slice_id"] == "slice-a"
+    assert result["action"] == "retry-build"
+    assert ("codex", "gpt-5.4-codex") in resolve_calls
+    assert relaunched_job["executor"] == "codex"
+    assert relaunched_job["model_id"] == "gpt-5.4-codex"
+    assert identity_launcher.commit_required_calls == 1
+    assert identity_launcher.calls and identity_launcher.calls[0]["slice_id"] == "slice-a"
+
+
 def test_dispatch_request_returns_backoff_skip_instead_of_index_error(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "runtime" / "coordinator" / "jobs.json")
     dispatcher = Dispatcher(registry, pane_sender=None, worktree_creator=None)

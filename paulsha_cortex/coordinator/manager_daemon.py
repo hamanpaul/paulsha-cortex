@@ -593,6 +593,9 @@ def build_request_executor(
         requested_review_executor = args.get("review_executor", default_review_executor)
         requested_review_model = args.get("review_model", default_review_model)
         request_type = request["type"]
+        needs_builder_identity_launcher = request_type in {"dispatch", "fanout", "tick"} or (
+            request_type == "slice-action" and args.get("action") == "retry-build"
+        )
         active_review_launcher = _resolve_launcher(
             requested_review_executor,
             launcher,
@@ -601,14 +604,15 @@ def build_request_executor(
         )
         builder_identity_registry = None
         builder_launcher_factory = None
-        if request_type in {"dispatch", "fanout", "tick"}:
-            builder_identity_registry = workflow_identity_registry or load_model_identities()
+        if needs_builder_identity_launcher:
             builder_launcher_factory = lambda identity: _resolve_launcher(
                 identity.executor,
                 launcher,
                 allow_unsafe=allow_unsafe,
                 model=identity.model_id,
             )
+        if request_type in {"dispatch", "fanout", "tick"}:
+            builder_identity_registry = workflow_identity_registry or load_model_identities()
             requested_executor = args.get("executor", default_executor)
             if isinstance(requested_executor, str) and requested_executor and isinstance(requested_model, str) and requested_model:
                 _require_registered_identity(
@@ -617,6 +621,8 @@ def build_request_executor(
                     model_id=requested_model,
                     context=f"{request_type} request 指定的 identity 不存在於 registry",
                 )
+        elif request_type == "slice-action":
+            builder_identity_registry = workflow_identity_registry
         if request_type == "workflow-action":
             registry = getattr(dispatcher, "_registry", None)
             if registry is None:
@@ -902,6 +908,8 @@ def build_request_executor(
                 persona=persona,
                 review_executor=requested_review_executor,
                 review_model=requested_review_model,
+                identity_registry=builder_identity_registry,
+                launcher_factory=builder_launcher_factory,
                 git_runner=getattr(dispatcher, "_git_runner", None),
             )
         metas = scan_specs_fn(request_specs_dir)
