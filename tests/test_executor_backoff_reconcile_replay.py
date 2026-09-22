@@ -1,4 +1,4 @@
-"""#946：admission reconciliation replay 與 workflow decision consumer 的 RED tests。"""
+"""#946：admission reconciliation replay 與 workflow decision consumer 的 regression tests。"""
 
 from __future__ import annotations
 
@@ -335,6 +335,63 @@ def test_admission_replays_only_the_terminal_event_missing_after_a_store_write(
     assert set(after.payload["acks"]) == {first["job_id"], second["job_id"]}
 
 
+def test_admission_reconciles_after_a_partial_replay_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later replay failure reports the store state after earlier writes."""
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    _seed_terminal_job(registry, run=run, worktree=worktree)
+    _seed_terminal_job(registry, run=run, worktree=worktree)
+    candidate = _two_builder_identities().identities[0]
+    coordinator_root = tmp_path / "coordinator"
+    replay_calls: list[str] = []
+    original_record_backoff = executor_backoff.record_backoff
+
+    def fail_on_second_replay(*args, **kwargs):
+        replay_calls.append(str(kwargs["job_id"]))
+        if len(replay_calls) == 2:
+            raise RuntimeError("synthetic partial replay failure")
+        return original_record_backoff(*args, **kwargs)
+
+    monkeypatch.setattr(executor_backoff, "record_backoff", fail_on_second_replay)
+    report = manager._executor_backoff_admission_report(
+        [candidate],
+        coordinator_root=coordinator_root,
+        now=time.time() + 3600.0,
+        registry=registry,
+    )
+
+    inventory = manager._executor_backoff_inventory(
+        registry,
+        executor="codex",
+        model_id="gpt-primary",
+    )
+    assert inventory is not None
+    event_by_job_id = {
+        str(event["job_id"]): event for event in inventory["events"]
+    }
+    remaining_job_id = replay_calls[1]
+    detail = report["unknown"][0]
+    assert replay_calls == list(event_by_job_id)
+    assert detail["pending_count"] == 1
+    assert detail["earliest_event_epoch"] == event_by_job_id[remaining_job_id][
+        "event_epoch"
+    ]
+    assert detail["latest_event_epoch"] == event_by_job_id[remaining_job_id][
+        "event_epoch"
+    ]
+    assert detail["replayed_count"] == 1
+    assert detail["replay_diagnostics"][0]["changed"] is True
+    assert detail["replay_diagnostics"][1]["diagnostics"] == [
+        "replay-exception:RuntimeError"
+    ]
+
+
 def test_admission_conflict_stays_unknown_without_overwriting_the_store(
     tmp_path: Path,
 ) -> None:
@@ -492,5 +549,6 @@ def test_resume_consumes_decision_after_advance_without_job_id_lookup(
     )
 
     assert result["dispatch_decision"] == decision
+    assert result["dispatch_decision"] is not decision
     assert "job_id" not in result
     assert registry.get_workflow_run(run.run_id).attempts == before_attempts

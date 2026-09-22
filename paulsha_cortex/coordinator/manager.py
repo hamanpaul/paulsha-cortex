@@ -4553,27 +4553,8 @@ def _executor_backoff_admission_report(
                 and isinstance(event.get("job_id"), str)
             }
 
-        if len(missing_terminal_keys) > executor_backoff.MAX_RETAINED_EVENTS:
-            replay_diagnostics.append(
-                {
-                    "observation": executor_backoff.StoreObservation.UNKNOWN.value,
-                    "diagnostics": ["capacity-exceeded"],
-                    "pending_count": pending_count,
-                }
-            )
-            cached = (
-                status,
-                replayed_count,
-                replay_diagnostics,
-                pending_count,
-                earliest_event_epoch,
-                latest_event_epoch,
-            )
-            replay_cache[identity_key] = cached
-            return cached
-
         replay_failed = False
-        for terminal_key in missing_terminal_keys[: executor_backoff.MAX_RETAINED_EVENTS]:
+        for terminal_key in missing_terminal_keys:
             event = event_by_job_id.get(terminal_key)
             if event is None:
                 replay_diagnostics.append(
@@ -4584,6 +4565,13 @@ def _executor_backoff_admission_report(
                     }
                 )
                 replay_failed = True
+                logger.info(
+                    "executor backoff replay executor=%s model_id=%s replayed_count=%s result=%s",
+                    identity_key[0],
+                    identity_key[1],
+                    replayed_count,
+                    "inventory-event-missing",
+                )
                 break
             try:
                 mutation = executor_backoff.record_backoff(
@@ -4606,6 +4594,13 @@ def _executor_backoff_admission_report(
                     }
                 )
                 replay_failed = True
+                logger.info(
+                    "executor backoff replay executor=%s model_id=%s replayed_count=%s result=%s",
+                    identity_key[0],
+                    identity_key[1],
+                    replayed_count,
+                    f"replay-exception:{type(exc).__name__}",
+                )
                 break
             mutation_diagnostics = list(mutation.diagnostics)
             replay_diagnostics.append(
@@ -4616,22 +4611,6 @@ def _executor_backoff_admission_report(
                     "changed": mutation.changed,
                 }
             )
-            if (
-                mutation.observation is not executor_backoff.StoreObservation.VALID
-                or any(
-                    diagnostic in {"integrity-conflict", "capacity-exceeded"}
-                    for diagnostic in mutation_diagnostics
-                )
-            ):
-                replay_failed = True
-                logger.info(
-                    "executor backoff replay executor=%s model_id=%s replayed_count=%s result=%s",
-                    identity_key[0],
-                    identity_key[1],
-                    replayed_count,
-                    ",".join(mutation_diagnostics) or mutation.observation.value,
-                )
-                break
             if mutation.changed:
                 replayed_count += 1
             logger.info(
@@ -4641,9 +4620,18 @@ def _executor_backoff_admission_report(
                 replayed_count,
                 ",".join(mutation_diagnostics) or mutation.observation.value,
             )
+            if (
+                mutation.observation is not executor_backoff.StoreObservation.VALID
+                or any(
+                    diagnostic in {"integrity-conflict", "capacity-exceeded"}
+                    for diagnostic in mutation_diagnostics
+                )
+            ):
+                replay_failed = True
+                break
 
         replayed_status = status
-        if not replay_failed:
+        if not replay_failed or replayed_count > 0:
             replayed_status = executor_backoff.reconcile_backoff(
                 coordinator_root,
                 identity_key[0],
@@ -4651,6 +4639,11 @@ def _executor_backoff_admission_report(
                 now=now,
                 inventory=inventory,
             )
+            (
+                pending_count,
+                earliest_event_epoch,
+                latest_event_epoch,
+            ) = _pending_summary(inventory, replayed_status.missing_terminal_keys)
         cached = (
             replayed_status,
             replayed_count,
@@ -12210,7 +12203,7 @@ def resume_workflow_run(
     if classified["kind"] == "job":
         result["job_id"] = classified["job_id"]
     elif classified["kind"] == "decision":
-        result["dispatch_decision"] = next_job
+        result["dispatch_decision"] = dict(next_job)
     return result
 
 
