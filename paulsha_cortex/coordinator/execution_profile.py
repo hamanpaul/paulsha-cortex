@@ -411,7 +411,10 @@ def _validate_grammar(
         return grammar
 
     if grammar_type == "string":
-        _exact_keys(grammar, ("type", "enum"), locator) if "enum" in grammar else _exact_keys(grammar, ("type",), locator)
+        if "enum" in grammar:
+            _exact_keys(grammar, ("type", "enum"), locator)
+        else:
+            _exact_keys(grammar, ("type",), locator)
         if "enum" in grammar:
             enum = _expect_list(grammar["enum"], locator + ("enum",))
             if not enum:
