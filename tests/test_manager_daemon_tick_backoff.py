@@ -232,6 +232,40 @@ def test_periodic_tick_cadence_unaffected_when_no_failures_occur(monkeypatch, tm
     assert call_clocks == [10.0, 20.0, 30.0]
 
 
+def test_periodic_tick_not_idle_does_not_hot_loop(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    clock = _FakeClock()
+    call_clocks: list[float] = []
+
+    def periodic_tick_runner() -> dict:
+        call_clocks.append(clock.value)
+        return {"dispatch_skipped": "not-idle"}
+
+    started = manager_daemon.run_loop(
+        request_executor=lambda req: {"dispatched": []},
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=periodic_tick_runner,
+        poll_interval=1.0,
+        tick_interval=10.0,
+        now_fn=lambda: "2026-07-03T09:05:00+00:00",
+        monotonic_fn=clock.monotonic,
+        sleep_fn=clock.sleep,
+        pid=1,
+        max_rounds=85,
+    )
+
+    assert started is True
+    assert call_clocks == [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
+
+    status = contract.read_json(constants.status_path())
+    daemon = status["daemon"]
+    assert daemon["last_tick_at"] is None
+    assert daemon["consecutive_tick_failures"] == 0
+    assert daemon["tick_circuit_open"] is False
+    assert daemon["last_tick_error"] is None
+    assert daemon["idle"] is False
+
+
 def test_log_error_deduplicates_repeated_signature_with_periodic_summary(capsys):
     manager_daemon._reset_log_error_dedup_state()
     exc = ValueError("same failure every time")

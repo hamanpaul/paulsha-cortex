@@ -1,0 +1,1 @@
+- **#946 executor backoff reconcile replay**：admission 對 registry terminal inventory 的 reconciliation `PENDING` 逐筆重播 missing event 補 ack，依 immutable event time fold cooldown，並以 pending／replayed 計數與 replay diagnostics 保留 unknown 原因；`_poll_workflow_job` 依 #830 decision contract 消費 post-advance 結果，不再對合法 decision 讀取 `job_id`。CLI help 輸出不變。
