@@ -115,6 +115,12 @@ def _journal_row(path: Path, run_id: str) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))["runs"][run_id]
 
 
+def _write_journal_row(path: Path, run_id: str, row: dict[str, Any]) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["runs"][run_id] = row
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def _pr_metadata(
     path: Path,
     *,
@@ -459,7 +465,7 @@ def test_r6_f_copilot_review_timeout_next_actions_includes_review_attest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """(f) copilot-review-timeout 的 next_actions 含 review-attest。"""
+    """(f) copilot-review-timeout / resume 的 next_actions 都維持 list[str]。"""
     github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
         tmp_path, monkeypatch, reviews=(), threads=()
     )
@@ -475,6 +481,7 @@ def test_r6_f_copilot_review_timeout_next_actions_includes_review_attest(
     assert result.get("action") == "needs_human"
     assert result.get("reason") == "copilot-review-timeout"
     next_actions = result.get("next_actions", ())
+    assert isinstance(next_actions, list)
     assert "review-attest" in next_actions
     assert "abandon" in next_actions
     # 既有值在前，補充在後
@@ -490,6 +497,7 @@ def test_r6_f_copilot_review_timeout_next_actions_includes_review_attest(
         workflow_registry=registry,
     )
     resume_actions = resume_resp["result"].get("next_actions", ())
+    assert isinstance(resume_actions, list)
     assert "review-attest" in resume_actions
 
 
@@ -549,6 +557,80 @@ def test_review_loop_adopted_at_epoch_preserves_valid_window_for_earlier_submiss
     )
     assert decision.action == "passed"
     assert decision.reason is None
+
+
+def test_copilot_error_review_needs_human_next_actions_are_lists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    requested_at = 1000.0
+    first = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at,
+    )
+    assert first.get("action") == "awaiting-copilot"
+
+    github.reviews = (
+        CopilotReview(
+            review_id=46,
+            commit_id=HEAD,
+            state="COMMENTED",
+            body="Copilot encountered an error while reviewing changes.",
+            author=COPILOT_REVIEWER_LOGIN,
+            submitted_at_epoch=requested_at + 1.0,
+        ),
+    )
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at + 2.0,
+    )
+
+    assert result.get("action") == "needs_human"
+    assert result.get("reason") == "copilot-error-review"
+    assert result.get("next_actions") == ["abandon", "review-attest"]
+
+
+@pytest.mark.parametrize("adopted_at_epoch", [float("nan"), float("inf")])
+def test_ship_rejects_non_finite_adopted_at_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    adopted_at_epoch: float,
+) -> None:
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    requested_at = 1000.0
+    first = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at,
+    )
+    assert first.get("action") == "awaiting-copilot"
+
+    row = _journal_row(state, run_id)
+    row["ship"]["adopted_at_epoch"] = adopted_at_epoch
+    _write_journal_row(state, run_id, row)
+
+    with pytest.raises(ValueError, match="ship review request state malformed"):
+        _invoke_ship(
+            tmp_path,
+            authority=authority,
+            state=state,
+            registry=registry,
+            now=requested_at + REVIEW_TIMEOUT_SECONDS + 1.0,
+        )
 
 
 @pytest.mark.parametrize(
@@ -660,3 +742,17 @@ def test_delivery_adapter_evidence_reflects_adopted_review_only_when_ship_state_
     else:
         assert "adopted_review_id" not in payload
         assert "adopted_at_epoch" not in payload
+
+
+def test_delivery_adapter_adoption_fields_wrap_invalid_journal_json(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir(parents=True)
+    (state_root / "delivery-journal.json").write_text("{\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="delivery journal payload malformed") as excinfo:
+        work_bridge._delivery_adapter_adoption_fields(
+            state_root=state_root,
+            run_id="run-1",
+        )
+
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)

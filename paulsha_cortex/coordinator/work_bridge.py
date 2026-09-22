@@ -1824,7 +1824,10 @@ def _delivery_adapter_adoption_fields(*, state_root: Path, run_id: str) -> dict[
         return {}
     if journal_path.is_symlink() or not journal_path.is_file():
         raise RuntimeError("delivery journal path is not a regular file")
-    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("delivery journal payload malformed") from exc
     if not isinstance(journal, dict):
         raise RuntimeError("delivery journal payload malformed")
     runs = journal.get("runs")

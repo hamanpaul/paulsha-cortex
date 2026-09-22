@@ -5628,7 +5628,7 @@ def _ship_action(
     if ship and ship.get("phase") == "needs_human" and not maintainer_recovery:
         res = {"action": "needs_human", "reason": ship.get("reason")}
         if str(ship.get("reason", "")).startswith("copilot-"):
-            res["next_actions"] = ("abandon", "review-attest")
+            res["next_actions"] = ["abandon", "review-attest"]
             res["next_step_hint"] = (
                 f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
             )
@@ -6011,7 +6011,7 @@ def _ship_action(
             return {
                 "action": "needs_human",
                 "reason": "copilot-finding-budget-exhausted",
-                "next_actions": ("abandon", "review-attest"),
+                "next_actions": ["abandon", "review-attest"],
                 "next_step_hint": (
                     f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
                 ),
@@ -6084,6 +6084,16 @@ def _ship_action(
         or not math.isfinite(float(requested_at))
     ):
         raise ValueError("ship review request state malformed")
+    adopted_at_epoch: float | None = None
+    if "adopted_at_epoch" in ship:
+        adopted_at = ship.get("adopted_at_epoch")
+        if (
+            not isinstance(adopted_at, (int, float))
+            or isinstance(adopted_at, bool)
+            or not math.isfinite(float(adopted_at))
+        ):
+            raise ValueError("ship review request state malformed")
+        adopted_at_epoch = float(adopted_at)
     current_reviews = [
         review
         for review in remote.copilot_reviews
@@ -6092,7 +6102,7 @@ def _ship_action(
         and review.submitted_at_epoch >= float(requested_at)
     ]
     if not current_reviews:
-        timeout_base = float(ship.get("adopted_at_epoch", requested_at))
+        timeout_base = adopted_at_epoch if adopted_at_epoch is not None else float(requested_at)
         if float(now_epoch) - timeout_base > 15 * 60:
             active["ship"] = {**ship, "phase": "needs_human", "reason": "copilot-review-timeout"}
             workflow_registry._manager_update_workflow_run(
@@ -6113,7 +6123,7 @@ def _ship_action(
             return {
                 "action": "needs_human",
                 "reason": "copilot-review-timeout",
-                "next_actions": ("abandon", "review-attest"),
+                "next_actions": ["abandon", "review-attest"],
                 "next_step_hint": (
                     f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
                 ),
@@ -6126,7 +6136,7 @@ def _ship_action(
         epoch_started_at=float(ship.get("epoch_started_at", requested_at)),
         requested_at=float(requested_at),
         max_fix_rounds=max_fix_rounds,
-        adopted_at=float(ship["adopted_at_epoch"]) if "adopted_at_epoch" in ship else None,
+        adopted_at=adopted_at_epoch,
     )
     finding_count = sum(1 for thread in remote.review_threads if thread.blocks_merge)
     findings = [
@@ -6182,7 +6192,7 @@ def _ship_action(
         )
         res = {"action": "needs_human", "reason": copilot.reason, **extra}
         if str(copilot.reason or "").startswith("copilot-"):
-            res["next_actions"] = ("abandon", "review-attest")
+            res["next_actions"] = ["abandon", "review-attest"]
             res["next_step_hint"] = (
                 f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
             )
