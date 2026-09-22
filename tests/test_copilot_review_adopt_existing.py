@@ -15,6 +15,9 @@ from typing import Any
 import pytest
 
 from paulsha_cortex.coordinator import work_actions
+from paulsha_cortex.coordinator import review as review_evidence
+from paulsha_cortex.coordinator import work_bridge
+from paulsha_cortex.coordinator.claim import load_work_authority, work_authority_digest
 from paulsha_cortex.coordinator.delivery import (
     ReviewLoop,
     REVIEW_TIMEOUT_SECONDS,
@@ -28,6 +31,7 @@ from paulsha_cortex.coordinator.github_delivery import (
 )
 from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
 from paulsha_cortex.coordinator.registry import JobRegistry
+from paulsha_cortex.coordinator.workflow import GateEvidenceRef, WorkflowStep
 
 
 HEAD = "a" * 40
@@ -122,6 +126,32 @@ def _pr_metadata(
         encoding="utf-8",
     )
     return path
+
+
+def _workflow_steps() -> tuple[WorkflowStep, ...]:
+    personas = {
+        "claim": "manager",
+        "define": "planner",
+        "plan": "planner",
+        "build": "builder",
+        "verify": "reviewer",
+        "review": "reviewer",
+        "ship": "manager",
+    }
+    return tuple(
+        WorkflowStep(
+            phase=phase,
+            persona=persona,
+            card=f"{phase}-card",
+            executor=("codex" if phase == "build" else "claude"),
+            model=("gpt" if phase == "build" else "sonnet"),
+            domain=("openai" if phase == "build" else "anthropic"),
+            inputs=(),
+            outputs=(),
+            gate_result="pending" if phase == "ship" else "passed",
+        )
+        for phase, persona in personas.items()
+    )
 
 
 class FakeGitHubDeliveryClient:
@@ -519,3 +549,114 @@ def test_review_loop_adopted_at_epoch_preserves_valid_window_for_earlier_submiss
     )
     assert decision.action == "passed"
     assert decision.reason is None
+
+
+@pytest.mark.parametrize(
+    ("ship_state", "action", "expects_adoption"),
+    [
+        (
+            {
+                "phase": "needs-fix",
+                "requested_at_epoch": 1000.0,
+                "adopted_review_id": 42,
+                "adopted_at_epoch": 3400.0,
+            },
+            {"action": "fix-required", "reason": "copilot-review-findings"},
+            True,
+        ),
+        (
+            {
+                "phase": "review-requested",
+                "requested_at_epoch": 1000.0,
+            },
+            {"action": "awaiting-copilot"},
+            False,
+        ),
+    ],
+)
+def test_delivery_adapter_evidence_reflects_adopted_review_only_when_ship_state_adopts_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ship_state: dict[str, Any],
+    action: dict[str, str],
+    expects_adoption: bool,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", changes=())
+    authority = load_work_authority(repo=REPO, work_id=WORK_ID, snapshot_path=snapshot)
+    state_root = tmp_path / "state"
+    registry = JobRegistry(state_path=state_root / "jobs.json")
+    run = registry._manager_create_workflow_run(
+        work_id=WORK_ID,
+        repo=REPO,
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision=work_authority_digest(authority),
+        workspace_root=str(tmp_path / "repo"),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=_workflow_steps(),
+        issue_refs=(f"{REPO}#12",),
+        openspec_refs=(),
+        pr_refs=(f"{REPO}#8",),
+        attempts={"review": 1},
+        gate_refs=(GateEvidenceRef("foreign-review", str(tmp_path / "foreign.json"), "f" * 64),),
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        gate_status="running",
+    )
+    work_actions._load_work_run(
+        state_path=state_root / "delivery-journal.json",
+        workflow_registry=registry,
+        authority=authority,
+    )
+
+    monkeypatch.setattr(work_bridge, "_builder_binding", lambda *args, **kwargs: "feature/12-work")
+    monkeypatch.setattr(work_bridge, "_manager_ship_workspace", lambda **kwargs: tmp_path)
+    monkeypatch.setattr(work_bridge, "load_preflight_command", lambda: ("preflight",))
+    monkeypatch.setattr(
+        work_bridge,
+        "_run_exact_candidate_preflight",
+        lambda **kwargs: PreflightResult(
+            True,
+            None,
+            CommandResult(("policy",), 0, "", ""),
+            CommandResult(("preflight",), 0, "", ""),
+            HEAD,
+            TREE,
+        ),
+    )
+    monkeypatch.setattr(work_bridge, "_push_exact_candidate", lambda **kwargs: None)
+    monkeypatch.setattr(work_bridge, "_workflow_evidence_payload", lambda **kwargs: ({}, {}))
+    monkeypatch.setattr(
+        review_evidence,
+        "write_gate_evaluation",
+        lambda payload, *, coordinator_root=None: {
+            "path": str(tmp_path / "foreign-review.json"),
+            "hash": "f" * 64,
+            "payload": payload,
+        },
+    )
+
+    def fake_ship_action(*, state_path: Path, **kwargs) -> dict[str, str]:
+        journal = json.loads(state_path.read_text(encoding="utf-8"))
+        journal["runs"][run.run_id]["ship"] = dict(ship_state)
+        state_path.write_text(json.dumps(journal), encoding="utf-8")
+        return dict(action)
+
+    monkeypatch.setattr(work_actions, "_ship_action", fake_ship_action)
+
+    validator = work_bridge.build_production_ship_validator(
+        registry=registry,
+        coordinator_root=state_root,
+        snapshot_path=snapshot,
+    )
+
+    result = validator(run=run, candidate=HEAD)
+
+    evidence = json.loads(Path(str(result["ref"])).read_text(encoding="utf-8"))
+    payload = evidence["payload"]
+    if expects_adoption:
+        assert payload["adopted_review_id"] == 42
+        assert payload["adopted_at_epoch"] == 3400.0
+    else:
+        assert "adopted_review_id" not in payload
+        assert "adopted_at_epoch" not in payload
