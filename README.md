@@ -32,6 +32,34 @@ record 與 helper，**沒有**接到 `registry.update_headless_result()`、
 extract_usage()` 與 `outcome_taxonomy.StreamEvidence`；若未來要把 quota 觀測接到
 來源 adapter／ledger／admission，仍屬 #836 的後續 B/C/D work item。
 
+## Execution profile schema／key core
+
+`paulsha_cortex.coordinator.execution_profile` 是 #849 的純 stdlib
+execution-profile core。它以 caller 明示交入的 mapping 或 JSON text 解析
+descriptor 與單一 `requested`／`resolved`／`observed` record，提供
+`parse_descriptor()`、`parse_profile()`、`canonical_profile_bytes()`、
+`profile_key()`、`actual_condition_key()` 與
+`actual_condition_missing_fields()`。解析結果 immutable，`to_dict()` 回傳獨立
+副本；模組不讀檔案、環境、clock、registry，不啟動 subprocess／network，亦不改
+既有 resolver、launcher、workflow、registry 或 CLI。
+
+這個 core 的完整 API、D4 canonical encoding、D5 resource bounds 與 owner／交付
+邊界見 [`docs/execution-profile-schema-core.md`](docs/execution-profile-schema-core.md)。
+重點是：
+
+- v1 嚴格要求 `schema_version: 1`；缺版本與未知未來版拒收，不猜測 migration。
+- effort 是 descriptor 定義的原生 string／integer／finite number／object／array
+  grammar；新增 model、effort 值或 adapter protocol 欄位新值屬 descriptor-only
+  擴充，不建立全域產品清單。
+- 三層 record 分開保存；`unknown` 保留原因，不能補成 observed。`not_applicable`
+  只可用於 descriptor 明示 `none` effort；任何 schema/key 成功都不授予
+  approved／qualified／permission grant。
+- record key 與 actual-condition key 使用不同 domain；價格、時間戳、provenance、
+  report／approval reference 不進 capability key。core wire／projection／encoding
+  改變才需要新 core 版本；adapter protocol 欄位換值沿用 v1 且自然得到不同 key。
+- core 不新增 flags、commands、model／agent／effort 固定清單或 runtime probe；既有
+  CLI `--help` 仍是唯一 help contract。
+
 
 ## 架構與工作流程驗收
 

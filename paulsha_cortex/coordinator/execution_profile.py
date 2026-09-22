@@ -542,7 +542,9 @@ def _parse_tagged(
     only_not_applicable: bool = False,
 ) -> None:
     payload = _expect_mapping(value, locator)
-    state = payload.get("state")
+    if "state" not in payload:
+        _fail("missing_field", locator + ("state",))
+    state = payload["state"]
     if type(state) is not str:
         _fail("invalid_type", locator + ("state",))
     if state == "known":

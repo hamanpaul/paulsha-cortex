@@ -536,6 +536,19 @@ def test_profile_strict_version_and_field_contract(
     assert "fixture-secret-value" not in str(error)
 
 
+def test_missing_tagged_state_is_reported_as_missing_field() -> None:
+    api = _api()
+    descriptor = api.parse_descriptor(_descriptor_payload({"type": "number"}))
+    payload = _profile_payload(plane="observed", effort=0.5)
+    del payload["conditions"]["effort"]["state"]  # type: ignore[index]
+
+    _assert_error(
+        api,
+        lambda: api.parse_profile(payload, descriptor),
+        "missing_field",
+    )
+
+
 def test_json_escape_decoded_duplicate_key_is_rejected() -> None:
     api = _api()
     payload = _descriptor_payload({"type": "string"})
