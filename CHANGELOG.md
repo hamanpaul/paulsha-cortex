@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#849 execution profile schema core**：新增純 `execution_profile.py` descriptor/profile schema 與
+  D4 canonical bytes／versioned profile key、actual-condition key；保留 immutable input／output、
+  native effort grammar、unknown fail-closed 與 bounded validation，未接 production routing、
+  qualification 或 state migration。
+
 - **#946 executor backoff reconcile replay**：admission 對 registry terminal inventory 的 reconciliation `PENDING` 逐筆重播 missing event 補 ack，依 immutable event time fold cooldown，並以 pending／replayed 計數與 replay diagnostics 保留 unknown 原因；`_poll_workflow_job` 依 #830 decision contract 消費 post-advance 結果，不再對合法 decision 讀取 `job_id`。本票 merge 後才可再升級含 #928 的 pin；CLI help 輸出不變。
 
 - **#946／#948 進件三件套**：新增 work item `executor-backoff-reconcile-replay`（#946：admission 對 reconciliation
