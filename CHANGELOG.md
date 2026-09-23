@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **Refine B2 進度 handoff（2026-09-23）**：新增 `docs/handoffs/2026-09-23-refine-b2-handoff.md`——#819／#946／#849
+  落地與介入紀錄、#862／#948 在飛 run 的接手指令、runtime 與 executor 可用性現況、三支 retry API 的實際判準與
+  收割期修復手順、下一批候選順序。docs-only。
+
 - **#946／#948 進件三件套**：新增 work item `executor-backoff-reconcile-replay`（#946：admission 對 reconciliation
   PENDING 重播 missing terminal 補 ack、unknown 診斷帶計數、`_poll_workflow_job` 接 #830 decision 契約）與
   `copilot-review-adopt-existing`（#948：ship 段採信既有 exact-HEAD Copilot review、`copilot-*` stop 補 `review-attest`）
