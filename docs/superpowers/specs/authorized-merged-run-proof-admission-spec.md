@@ -62,7 +62,7 @@ work_item: authorized-merged-run-proof-admission
 
 Manager 私有 proof oracle 必須重新讀取 journal row 及其 authorization evidence，並重驗同一份 WorkRun/PR delivery binding：
 
-- authorization 是 non-symlink、non-writable regular file；讀取的 wrapper 正好是 `{payload, hash})，payload canonical JSON hash 等於記錄 hash。
+- authorization 是 non-symlink、non-writable regular file；讀取的 wrapper 正好是 `{payload, hash}`，payload canonical JSON hash 等於記錄 hash。
 - authorization schema/version、run_id、repo、work_id、workflow_step_ids、head、tree_hash、PR number、change、todo paths、review binding 都與該 WorkRun、journal 及 delivery binding 一致。
 - authority digest 屬原始 merge authorization。因 merge/archive 會推進目前 WorkAuthority，原 digest 可不同於目前 digest，但必須保留原始 payload/hash、格式為 64-hex，不能改寫成目前 digest冒充原授權。#977 會以 #961 收斂後的目前 WorkAuthority 建立最終 CompletionRecord。
 - 沿用現有 verifier 重驗 authorization 引用的 foreign-review、preflight/checks，以及 Copilot 或 maintainer-review evidence。任一證據缺失、損壞、hash/identity 不符、不可重驗或 review authority 不明確即拒絕 proof。
