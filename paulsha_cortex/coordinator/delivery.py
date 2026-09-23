@@ -524,16 +524,30 @@ class ShipOrchestrator:
         if (copilot is None) == (maintainer_review is None):
             raise RuntimeError("exactly one current-HEAD delivery review is required")
         if copilot is not None:
+            requested_at = copilot.loop.requested_at
             if (
                 copilot.action != "passed"
                 or copilot.head != expected_head
                 or copilot.review_id is None
                 or copilot.loop.head != expected_head
-                or copilot.loop.requested_at is None
+                or requested_at is None
                 or copilot.loop.fix_rounds > copilot.loop.max_fix_rounds
-                or float(now_epoch) - copilot.loop.requested_at < 0
-                or float(now_epoch) - copilot.loop.requested_at > REVIEW_TIMEOUT_SECONDS
             ):
+                raise RuntimeError("Copilot review epoch has not passed")
+            try:
+                _require_finite_epoch(requested_at, field="Copilot review request epoch")
+                adopted_at = None
+                if copilot.loop.adopted_at is not None:
+                    _require_finite_epoch(
+                        copilot.loop.adopted_at,
+                        field="Copilot review adoption epoch",
+                    )
+                    adopted_at = float(copilot.loop.adopted_at)
+            except ValueError as exc:
+                raise RuntimeError("Copilot review epoch has not passed") from exc
+            timeout_basis = adopted_at if adopted_at is not None else float(requested_at)
+            elapsed = float(now_epoch) - timeout_basis
+            if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
                 raise RuntimeError("Copilot review epoch has not passed")
             review_kind = "copilot"
         else:
@@ -550,7 +564,7 @@ class ShipOrchestrator:
             expected_head=expected_head,
             required_closing_issues=authority.mapped_issues,
             copilot_review_id=copilot.review_id if copilot is not None else None,
-            copilot_requested_at_epoch=(copilot.loop.requested_at if copilot is not None else None),
+            copilot_requested_at_epoch=(float(requested_at) if copilot is not None else None),
             review_kind=review_kind,
         )
         # The exact-candidate final verdict must be evaluated and already
