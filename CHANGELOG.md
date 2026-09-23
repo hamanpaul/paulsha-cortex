@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **Refine 0.1.11 定版進件（第一批）**：新增接手與驗收表，並為 #579、#812、#874、#956
+  加入 accepted spec／design／todo 與 work item 綁定，供 Cortex 分票派工；產品實作及發版仍待後續 gate。
+
 - **launcher：`gpt-6-luna` 明示 max reasoning effort**：`build_codex_argv` 對 `gpt-6-luna` 帶
   `-c model_reasoning_effort="max"`，與 `gpt-5.6-luna` 一致，不再受 host ambient codex config 影響。
 
