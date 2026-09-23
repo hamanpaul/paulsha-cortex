@@ -1540,3 +1540,51 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/github-pr-read-back-design.md'
     excludes: []
+  read-only-merged-completion-inspection:
+    title: 'read-only-merged-completion-inspection'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#995'
+      - kind: path
+        ref: 'docs/superpowers/plans/read-only-merged-completion-inspection.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/read-only-merged-completion-inspection-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/read-only-merged-completion-inspection-design.md'
+    excludes: []
+  completion-record-conditional-writer:
+    title: 'completion-record-conditional-writer'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#996'
+      - kind: path
+        ref: 'docs/superpowers/plans/completion-record-conditional-writer.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/completion-record-conditional-writer-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/completion-record-conditional-writer-design.md'
+    excludes: []
+  outcome-store-conditional-cas:
+    title: 'outcome-store-conditional-cas'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#997'
+      - kind: path
+        ref: 'docs/superpowers/plans/outcome-store-conditional-cas.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/outcome-store-conditional-cas-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/outcome-store-conditional-cas-design.md'
+    excludes: []
+  authorized-merged-run-completion-finalizer:
+    title: 'authorized-merged-run-completion-finalizer'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#977'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/authorized-merged-run-completion-finalizer/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/authorized-merged-run-completion-finalizer-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/authorized-merged-run-completion-finalizer-design.md'
+    excludes: []
