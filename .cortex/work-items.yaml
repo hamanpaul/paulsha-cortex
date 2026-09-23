@@ -1384,3 +1384,15 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/review-gate-adjudication-exit-design.md'
     excludes: []
+  fix-standard-archive-step-evidence:
+    title: 'fix-standard-archive-step-evidence'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#885'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-standard-archive-step-evidence/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-standard-archive-step-evidence-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-standard-archive-step-evidence-design.md'
+    excludes: []
