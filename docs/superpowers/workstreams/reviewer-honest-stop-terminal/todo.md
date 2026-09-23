@@ -44,7 +44,7 @@ artifact_classes:
 
 ## Tasks
 
-- [ ] **T1 tests／RED**：新增 `tests/test_reviewer_honest_stop_terminal.py`，斷言逐條對應 spec R8 (a)–(h)。
+- [x] **T1 tests／RED**：新增 `tests/test_reviewer_honest_stop_terminal.py`，斷言逐條對應 spec R8 (a)–(h)。
   - 樣板：review 用 `tests/test_review_authority_hashes_echo_922.py` 的 `_review_terminalize_fixture`／`_ResumeDispatcher`／periodic runner，複製進新檔，不 import 其他測試模組。verify 以同一樣板改成 `current_phase="verify"`、claim／define／plan／build step 標 passed、`verification` reviewer job。
   - fixture：verify 的 `summary` 與 `details.host_preflight_status`／`details.sandbox_limitations` 取 #874 本文引用的字串原樣（含本文裡的 `…`）；oracle 是 fixture 值原樣出現在 detail／`model_diagnostics`，不對照實機 log。review 用第二則留言的形狀，reason＋1 條 blocking finding。
   - verify `needs_human` 做 agy、claude 各一份：agy 份用 agy identity，log 為 `{"response": ...}` 單行 envelope，response 是「fenced 文字＋最後一行帶 `toolAction`／`toolSummary` 的 structured output」；claude 份用 claude identity，log 為 `{"type": "result", "result": ...}`。
