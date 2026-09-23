@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import pytest
 
@@ -325,6 +325,61 @@ def _drop_persisted_bound_bindings(state_path: Path) -> bytes:
             if isinstance(entry, dict):
                 entry.pop("bound_binding", None)
     return _write_state(state_path, payload)
+
+
+def _drop_in_memory_and_persisted_bound_bindings(
+    registry: JobRegistry,
+    state_path: Path,
+) -> bytes:
+    for job in registry._jobs:
+        if not isinstance(job, dict):
+            continue
+        for field_name in ("supersession", "consumption"):
+            entry = job.get(field_name)
+            if isinstance(entry, dict):
+                entry.pop("bound_binding", None)
+    return _drop_persisted_bound_bindings(state_path)
+
+
+def _ordinary_binding_bump_via_repin(
+    registry: JobRegistry,
+    slice_id: str,
+    _candidate: str,
+) -> dict[str, Any]:
+    return registry.repin_slice(
+        slice_id,
+        spec_path=f"specs/{slice_id}.md",
+        spec_hash="spec-sha",
+        plan_path=f"plans/{slice_id}.md",
+        plan_hash="plan-sha",
+        target_branch=f"feature/{slice_id}",
+        target_remote="origin",
+        verification_hash="verification-hash",
+        verification={"docs_class": "code"},
+        dispatch_base="dispatch-base-sha",
+    )
+
+
+def _ordinary_binding_bump_via_update(
+    registry: JobRegistry,
+    slice_id: str,
+    candidate: str,
+) -> dict[str, Any]:
+    return registry.update_slice(slice_id, candidate=candidate)
+
+
+def _ordinary_binding_bump_via_action(
+    registry: JobRegistry,
+    slice_id: str,
+    candidate: str,
+) -> dict[str, Any]:
+    return registry.record_action(
+        slice_id,
+        action="candidate-drift",
+        actor="builder",
+        candidate=candidate,
+        result="ordinary-drift",
+    )
 
 
 def test_create_slice_starts_versioned_and_repin_forces_new_generation(tmp_path: Path) -> None:
@@ -1025,6 +1080,68 @@ def test_pre_bound_binding_job_dispositions_reload_and_replay_current_binding(
         at="2026-09-21T08:10:00+00:00",
     )
     assert replayed_supersession["supersession"] == superseded["supersession"]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "next_candidate"),
+    [
+        (_ordinary_binding_bump_via_repin, "d" * 40),
+        (_ordinary_binding_bump_via_update, "e" * 40),
+        (_ordinary_binding_bump_via_action, "f" * 40),
+    ],
+)
+def test_pre_bound_binding_job_dispositions_survive_ordinary_binding_drift_upgrade(
+    tmp_path: Path,
+    mutate: Callable[[JobRegistry, str, str], dict[str, Any]],
+    next_candidate: str,
+) -> None:
+    registry, builder, _reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
+    old_revision = slice_row["binding_revision"]
+    consumed = registry.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=old_revision,
+        actor="operator",
+        completion_identity={"request_id": "consume-upgrade", "request_digest": "6" * 64},
+        proof_refs=[_proof_ref("evidence/consume-upgrade.json", "7" * 64)],
+        at="2026-09-21T08:00:00+00:00",
+    )
+    superseded = registry.record_job_supersession(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=old_revision,
+        actor="operator",
+        reason="ordinary-drift-upgrade",
+        superseding_identity={"request_id": "supersede-upgrade", "request_digest": "8" * 64},
+        at="2026-09-21T08:10:00+00:00",
+    )
+
+    legacy_bytes = _drop_in_memory_and_persisted_bound_bindings(registry, state_path)
+    drifted = mutate(registry, "slice-a", next_candidate)
+    assert state_path.read_bytes() != legacy_bytes
+    assert drifted["binding_revision"] == old_revision + 1
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    builder_row = next(job for job in payload["jobs"] if job["job_id"] == builder["job_id"])
+    assert "_binding_history" not in payload["slices"][0]
+    assert builder_row["consumption"]["bound_binding"] == _binding_snapshot(slice_row)
+    assert builder_row["supersession"]["bound_binding"] == _binding_snapshot(slice_row)
+
+    reloaded = JobRegistry(state_path=state_path)
+    restored = reloaded.get_job(builder["job_id"])
+    assert restored["consumption"] == consumed["consumption"]
+    assert restored["supersession"] == superseded["supersession"]
+    replayed = reloaded.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=old_revision,
+        actor="operator",
+        completion_identity={"request_id": "consume-upgrade", "request_digest": "6" * 64},
+        proof_refs=[_proof_ref("evidence/consume-upgrade.json", "7" * 64)],
+        at="2026-09-21T08:00:00+00:00",
+    )
+    assert replayed["consumption"] == consumed["consumption"]
+    assert replayed["supersession"] == superseded["supersession"]
 
 
 def test_job_dispositions_survive_binding_revision_drift_and_restart_without_extra_slice_fields(

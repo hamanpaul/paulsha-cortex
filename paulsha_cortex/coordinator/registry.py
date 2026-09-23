@@ -2774,14 +2774,15 @@ class JobRegistry:
                 raise _contract_error("request-content-conflict", state_path=self._state_path, detail=detail)
         return witness
 
-    def _recorded_job_bound_binding(
+    def _recorded_job_bound_binding_details(
         self,
         job: Mapping[str, Any],
         *,
         slice_row: Mapping[str, Any],
         slice_id: str,
         binding_revision: int,
-    ) -> dict[str, Any] | None:
+        mutate_missing: bool,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         job_id = str(job["job_id"])
         explicit_witness: dict[str, Any] | None = None
         missing_entries: list[dict[str, Any]] = []
@@ -2829,10 +2830,63 @@ class JobRegistry:
                 detail="binding",
             )
         if witness is None:
-            return None
-        for entry in missing_entries:
-            entry[_BOUND_BINDING_FIELD] = _deepcopy_json(witness)
+            return None, missing_entries
+        if mutate_missing:
+            for entry in missing_entries:
+                entry[_BOUND_BINDING_FIELD] = _deepcopy_json(witness)
+        return witness, missing_entries
+
+    def _recorded_job_bound_binding(
+        self,
+        job: Mapping[str, Any],
+        *,
+        slice_row: Mapping[str, Any],
+        slice_id: str,
+        binding_revision: int,
+    ) -> dict[str, Any] | None:
+        witness, _missing_entries = self._recorded_job_bound_binding_details(
+            job,
+            slice_row=slice_row,
+            slice_id=slice_id,
+            binding_revision=binding_revision,
+            mutate_missing=True,
+        )
         return witness
+
+    def _stage_current_binding_disposition_backfills(
+        self,
+        *,
+        slice_row: Mapping[str, Any],
+        current_binding: Mapping[str, Any],
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        slice_id = str(slice_row["slice_id"])
+        binding_revision = int(current_binding["binding_revision"])
+        staged: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for job in self._jobs:
+            witness, missing_entries = self._recorded_job_bound_binding_details(
+                job,
+                slice_row=slice_row,
+                slice_id=slice_id,
+                binding_revision=binding_revision,
+                mutate_missing=False,
+            )
+            if witness is None:
+                if missing_entries:
+                    raise _contract_error(
+                        "request-content-conflict",
+                        state_path=self._state_path,
+                        detail="binding",
+                    )
+                continue
+            if witness != current_binding:
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail="binding",
+                )
+            for entry in missing_entries:
+                staged.append((entry, witness))
+        return staged
 
     def _resolve_job_disposition_binding(
         self,
@@ -3586,8 +3640,13 @@ class JobRegistry:
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
         previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
+        staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
         if previous_binding is not None:
             self._next_binding_revision(int(slice_row["binding_revision"]))
+            staged_binding_backfills = self._stage_current_binding_disposition_backfills(
+                slice_row=slice_row,
+                current_binding=previous_binding,
+            )
         if str(slice_row["state"]) not in REPINNABLE_SLICE_STATES:
             raise ValueError(
                 f"非法 slice state repin: {slice_row['state']!r}"
@@ -3599,6 +3658,8 @@ class JobRegistry:
             new="pending",
             allowed=GATE_STATE_TRANSITIONS,
         )
+        for entry, witness in staged_binding_backfills:
+            entry[_BOUND_BINDING_FIELD] = _deepcopy_json(witness)
         slice_row["spec"] = {"path": spec_path, "hash": spec_hash}
         slice_row["plan"] = {"path": plan_path, "hash": plan_hash}
         slice_row["target_branch"] = target_branch
@@ -3929,6 +3990,7 @@ class JobRegistry:
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
         previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
+        staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
         # Phase 1 — validate every provided field against the live row
         # *without* mutating anything. #382: the previous validate-then-write
@@ -3990,8 +4052,14 @@ class JobRegistry:
             )
             if will_bump_binding:
                 self._next_binding_revision(int(slice_row["binding_revision"]))
+                staged_binding_backfills = self._stage_current_binding_disposition_backfills(
+                    slice_row=slice_row,
+                    current_binding=previous_binding,
+                )
 
         # Phase 2 — everything validated; apply every field together.
+        for entry, witness in staged_binding_backfills:
+            entry[_BOUND_BINDING_FIELD] = _deepcopy_json(witness)
         if state is not None:
             slice_row["state"] = state
         if gate_state is not None:
@@ -4034,6 +4102,7 @@ class JobRegistry:
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
         previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
+        staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
         # Phase 1 — validate every provided field before mutating anything
         # (#382, same rationale as update_slice above): a rejected multi-field
@@ -4076,9 +4145,15 @@ class JobRegistry:
             )
             if will_bump_binding:
                 self._next_binding_revision(int(slice_row["binding_revision"]))
+                staged_binding_backfills = self._stage_current_binding_disposition_backfills(
+                    slice_row=slice_row,
+                    current_binding=previous_binding,
+                )
 
         # Phase 2 — everything validated; apply every field together, then
         # persist exactly once.
+        for entry, witness in staged_binding_backfills:
+            entry[_BOUND_BINDING_FIELD] = _deepcopy_json(witness)
         if state is not None:
             slice_row["state"] = state
         if gate_state is not None:
