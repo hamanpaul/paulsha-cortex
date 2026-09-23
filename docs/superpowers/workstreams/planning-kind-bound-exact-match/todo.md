@@ -33,7 +33,7 @@ artifact_classes:
 
 ## Tasks
 
-- [ ] **T1 tests／RED**：新增 `tests/test_planning_kind_bound_exact_match.py`，斷言逐條對應 spec R7 (a)–(g)；
+- [x] **T1 tests／RED**：新增 `tests/test_planning_kind_bound_exact_match.py`，斷言逐條對應 spec R7 (a)–(g)；
       manifest 用 `compile_combo`（沿 `tests/test_planning_artifact_manifest_binding_802.py` 的 `_manifest_outputs`）、authority 重驗用同檔 `test_fix_standard_authority_accepts_published_canonical_planning_triplet` 的 `SimpleNamespace` run＋brainstorm evidence 樣板。
       同時把 802 檔 `test_planning_kind_bound_accepts_glob_bound_destinations` 的 prefix／suffix／middle 三個 `is True` 改成 `is False`（canonical／dated 保留）。
       在現行 main 必須 RED：(a)(b)(c)(e) 被接受（(c) 的未知 kind 在 main 是 `unknown planning artifact kind`，訊息斷言 RED）、`_planning_anchor_slugs` 與 `anchor_slugs` 參數不存在；(d) 的 `work_id="demo-plan"` 案例在 main 已是預期值，屬回歸防護，允許一開始就 GREEN。

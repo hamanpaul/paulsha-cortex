@@ -120,9 +120,9 @@ def test_planning_kind_bound_accepts_glob_bound_destinations(
         if kind in {"spec", "design"}
         else path.replace(f"{TASK_SLUG}.md", f"prefix-{TASK_SLUG}-middle.md")
     )
-    assert manager.planning_kind_bound(kind, prefix, TASK_SLUG) is True
-    assert manager.planning_kind_bound(kind, suffix, TASK_SLUG) is True
-    assert manager.planning_kind_bound(kind, middle, TASK_SLUG) is True
+    assert manager.planning_kind_bound(kind, prefix, TASK_SLUG) is False
+    assert manager.planning_kind_bound(kind, suffix, TASK_SLUG) is False
+    assert manager.planning_kind_bound(kind, middle, TASK_SLUG) is False
 
 
 @pytest.mark.parametrize(
