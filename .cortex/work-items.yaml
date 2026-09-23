@@ -1588,3 +1588,99 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/authorized-merged-run-completion-finalizer-design.md'
     excludes: []
+  slice-recovery-registry-identity:
+    title: 'slice-recovery-registry-identity'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#968'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/slice-recovery-registry-identity/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/slice-recovery-registry-identity-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/slice-recovery-registry-identity-design.md'
+    excludes: []
+  legacy-checkpoint-contract:
+    title: 'legacy-checkpoint-contract'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#999'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/legacy-checkpoint-contract/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-checkpoint-contract-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-checkpoint-contract-design.md'
+    excludes: []
+  legacy-workspace-proof-helper:
+    title: 'legacy-workspace-proof-helper'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1000'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/legacy-workspace-proof-helper/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-workspace-proof-helper-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-workspace-proof-helper-design.md'
+    excludes: []
+  legacy-proof-runner-transport:
+    title: 'legacy-proof-runner-transport'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1001'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/legacy-proof-runner-transport/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-proof-runner-transport-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-proof-runner-transport-design.md'
+    excludes: []
+  legacy-caller-auth:
+    title: 'legacy-caller-auth'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1002'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/legacy-caller-auth/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-caller-auth-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-caller-auth-design.md'
+    excludes: []
+  legacy-binding-single-cas:
+    title: 'legacy-binding-single-cas'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1003'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/legacy-binding-single-cas/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-binding-single-cas-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-binding-single-cas-design.md'
+    excludes: []
+  legacy-binding-action:
+    title: 'legacy-binding-action'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1004'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/legacy-binding-action/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-binding-action-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-binding-action-design.md'
+    excludes: []
+  legacy-proof-recovery-adapter:
+    title: 'legacy-proof-recovery-adapter'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1005'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/legacy-proof-recovery-adapter/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-proof-recovery-adapter-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/legacy-proof-recovery-adapter-design.md'
+    excludes: []
