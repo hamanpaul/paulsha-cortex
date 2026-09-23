@@ -30,6 +30,34 @@
   `record_job_consumption()` 的省略 `at` retry 會保留第一次寫入的 disposition 時間，
   exact replay 不再重複持久化；呼叫者明示不同 `at` 仍維持 conflict。
 
+- **Refine 0.1.11 定版進件（第二批）**：為 #479、#481、#810、#871 新增 accepted
+  spec／design／todo 與 work item 綁定，供後續 Cortex 分票派工；產品實作仍待正式驗收。
+- **Refine 0.1.11 定版進件（第一批）**：新增接手與驗收表，並為 #579、#812、#874、#956
+  加入 accepted spec／design／todo 與 work item 綁定，供 Cortex 分票派工；產品實作及發版仍待後續 gate。
+
+- **launcher：`gpt-6-luna` 明示 max reasoning effort**：`build_codex_argv` 對 `gpt-6-luna` 帶
+  `-c model_reasoning_effort="max"`，與 `gpt-5.6-luna` 一致，不再受 host ambient codex config 影響。
+
+- **#948 ship 段採信既有 exact-HEAD Copilot review**：`_ship_action` 在呼叫 `request_copilot` 前先檢查 `remote.copilot_reviews`，存在 exact-HEAD、Copilot、COMMENTED／APPROVED 且非 error review 時直接採信（多筆取最新 `(submitted_at_epoch, review_id)`），同 tick 進入 review 判定而不重複 request；`ReviewLoop` 支援 `adopted_at` 基準，採信 review 不受請求前 epoch 或 15 分鐘 timeout 誤判；候選 HEAD 前進時重新評估不沿用舊 review；`copilot-*` stop 的 `next_actions` 補齊 `review-attest` 重入出口並提示指令形式。
+
+- **Refine B2 進度 handoff（2026-09-23）**：新增 `docs/handoffs/2026-09-23-refine-b2-handoff.md`——#819／#946／#849
+  落地與介入紀錄、#862／#948 在飛 run 的接手指令、runtime 與 executor 可用性現況、三支 retry API 的實際判準與
+  收割期修復手順、下一批候選順序。docs-only。
+
+- **#849 execution profile schema core**：新增純 `execution_profile.py` descriptor/profile schema 與
+  D4 canonical bytes／versioned profile key、actual-condition key；保留 immutable input／output、
+  native effort grammar、unknown fail-closed 與 bounded validation，未接 production routing、
+  qualification 或 state migration。
+
+- **#946 executor backoff reconcile replay**：admission 對 registry terminal inventory 的 reconciliation `PENDING` 逐筆重播 missing event 補 ack，依 immutable event time fold cooldown，並以 pending／replayed 計數與 replay diagnostics 保留 unknown 原因；`_poll_workflow_job` 依 #830 decision contract 消費 post-advance 結果，不再對合法 decision 讀取 `job_id`。本票 merge 後才可再升級含 #928 的 pin；CLI help 輸出不變。
+
+- **#946／#948 進件三件套**：新增 work item `executor-backoff-reconcile-replay`（#946：admission 對 reconciliation
+  PENDING 重播 missing terminal 補 ack、unknown 診斷帶計數、`_poll_workflow_job` 接 #830 decision 契約）與
+  `copilot-review-adopt-existing`（#948：ship 段採信既有 exact-HEAD Copilot review、`copilot-*` stop 補 `review-attest`）
+  的 accepted spec／design／todo 與 `.cortex/work-items.yaml` 條目；實算 sizing 5／6（Yellow）。docs-only。
+
+- **#819 daemon periodic tick 時鐘與 idle 設定**：修正 `manager_daemon.run_loop` periodic lane 在 `dispatch_skipped="not-idle"` 時未推進時鐘導致 hot loop 的問題；跳過時推進 `last_tick_monotonic`，保持 `daemon.idle=False`、不增加錯誤計數或觸發熔斷。periodic tick runner 的 `max_load` 預設由固定 1.0 改為 CPU-aware 計算（`max(1.0, (os.cpu_count() or 1) * 0.5)`）；可設 `PSC_MANAGER_MAX_LOAD=1.0` 保留舊門檻。新增 CLI 參數 `--max-load` 與環境變數 `PSC_MANAGER_MAX_LOAD`（CLI 顯式非法值報錯 exit 2，env 非法值安全回落預設）；新增 `PSC_MANAGER_REQUIRE_IDLE` 與 `--no-require-idle` 旗標；manual tick request lane 維持 1.0 預設與既有行為不變。
+
 - **Refine B2 進度 handoff**：新增 `docs/handoffs/2026-09-21-refine-b2-handoff.md`——#911／#825 家族／#866 六條 run
   的交付與介入紀錄、runtime 現況、下一步順序與派工要訣、#933–#937 分析。docs-only。
 

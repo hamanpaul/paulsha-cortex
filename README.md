@@ -32,6 +32,34 @@ record 與 helper，**沒有**接到 `registry.update_headless_result()`、
 extract_usage()` 與 `outcome_taxonomy.StreamEvidence`；若未來要把 quota 觀測接到
 來源 adapter／ledger／admission，仍屬 #836 的後續 B/C/D work item。
 
+## Execution profile schema／key core
+
+`paulsha_cortex.coordinator.execution_profile` 是 #849 的純 stdlib
+execution-profile core。它以 caller 明示交入的 mapping 或 JSON text 解析
+descriptor 與單一 `requested`／`resolved`／`observed` record，提供
+`parse_descriptor()`、`parse_profile()`、`canonical_profile_bytes()`、
+`profile_key()`、`actual_condition_key()` 與
+`actual_condition_missing_fields()`。解析結果 immutable，`to_dict()` 回傳獨立
+副本；模組不讀檔案、環境、clock、registry，不啟動 subprocess／network，亦不改
+既有 resolver、launcher、workflow、registry 或 CLI。
+
+這個 core 的完整 API、D4 canonical encoding、D5 resource bounds 與 owner／交付
+邊界見 [`docs/execution-profile-schema-core.md`](docs/execution-profile-schema-core.md)。
+重點是：
+
+- v1 嚴格要求 `schema_version: 1`；缺版本與未知未來版拒收，不猜測 migration。
+- effort 是 descriptor 定義的原生 string／integer／finite number／object／array
+  grammar；新增 model、effort 值或 adapter protocol 欄位新值屬 descriptor-only
+  擴充，不建立全域產品清單。
+- 三層 record 分開保存；`unknown` 保留原因，不能補成 observed。`not_applicable`
+  只可用於 descriptor 明示 `none` effort；任何 schema/key 成功都不授予
+  approved／qualified／permission grant。
+- record key 與 actual-condition key 使用不同 domain；價格、時間戳、provenance、
+  report／approval reference 不進 capability key。core wire／projection／encoding
+  改變才需要新 core 版本；adapter protocol 欄位換值沿用 v1 且自然得到不同 key。
+- core 不新增 flags、commands、model／agent／effort 固定清單或 runtime probe；既有
+  CLI `--help` 仍是唯一 help contract。
+
 
 ## 架構與工作流程驗收
 
@@ -141,7 +169,16 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    PSC_MANAGER_EXECUTOR=codex
    PSC_MANAGER_INTERVAL_SECONDS=300
    PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS=86400
+   PSC_MANAGER_MAX_LOAD=10.0
+   PSC_MANAGER_REQUIRE_IDLE=1
    ```
+
+   - **`PSC_MANAGER_MAX_LOAD`／CLI `--max-load`（#819）**：控制 periodic tick runner 允許的最大 load1 門檻（正有限浮點數）。超過門檻時略過本輪 tick 並推進 `last_tick_monotonic`（避免 hot loop）。
+     - **預設行為變更**：periodic runner 預設由固定 1.0 改為 CPU-aware（`max(1.0, (os.cpu_count() or 1) * 0.5)`）。若需保留既有 1.0 門檻，可顯式設定 `PSC_MANAGER_MAX_LOAD=1.0`。
+     - **優先序**：CLI `--max-load` > env `PSC_MANAGER_MAX_LOAD` > CPU-aware 預設。
+     - **非法值處理差異**：CLI 的顯式非法值（如 NaN、Inf、0、負數或非數值）直接由 argparse 報錯拒絕（exit 2）；env 若為 unset、空字串、無法解析、NaN、正負 Inf、零或負數，則安全回落到 CPU-aware 預設，不得使非法值進入 probe。
+     - **限制**：`os.cpu_count()` 不反映容器 cgroup CPU 配額；容器環境應顯式配置合適門檻。manual tick request lane 預設仍維持 1.0（不受本項變更影響）。不能以 bypass 模式的 `idle=True` 證明自然負載低於門檻。
+   - **`PSC_MANAGER_REQUIRE_IDLE`／CLI `--no-require-idle`（#819）**：控制 periodic runner 是否探測主機負載。`PSC_MANAGER_REQUIRE_IDLE` 經 `strip().lower()` 為 `0`／`false`／`off`／`no` 時停用 idle 檢查，其餘值、unset 或空字串皆預設為 `True`（啟用檢查）。CLI `--no-require-idle` 優先停用（`default_require_idle() and not args.no_require_idle`）。
 
    **`PSC_JOB_RUNNER`（trust-root Phase 2 降權啟動器）**：預設 `direct`＝headless job 與
    Manager 同帳號執行（現行行為）。設為 `systemd-run` 後，builder persona 的 job 改以

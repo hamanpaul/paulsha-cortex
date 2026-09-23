@@ -48,3 +48,29 @@ Both commands ran from a temporary directory outside the checkout with
   `checkpoint_legacy_binding()` remain registry-only primitives; they do not
   add new public CLI verbs, do not grant allowed-action authority, and do not
   reconcile queue/done or CompletionRecord on behalf of B/C/D.
+
+## Post-archive intake evidence
+
+The frozen wording that says publication, mapping, and binding were still pending
+records the state when the accepted plan was written. The committed intake landed
+on 2026-09-08 and is an ancestor of the frozen build base merged on 2026-09-21
+(at 20:31 +08). It contains the accepted child OpenSpec proposal, design, spec,
+tasks, and the unique `#862` work-item mapping. The durable workflow record was
+created later on 2026-09-21 (20:54 +08), binds issue `#862` and OpenSpec
+`recovery-registry-receipt`, records a passed plan review, and pins the plan,
+accepted spec/design, and todo inputs. The stored plan digest matches the
+unchanged frozen plan snapshot.
+
+The todo and archived OpenSpec task prose remain unchanged; their historical
+wording is time-scoped to the pre-publication baseline. The existing T10 checkbox
+in the todo is checked, and the archived task checkbox is now checked to reflect
+the verified prerequisites and this card's changelog/local-validation alignment.
+The frozen plan input was not modified. The current worktree retains the official
+archive and does not recreate an active OpenSpec change.
+
+## Redispatch regression check
+
+After merging the fetched `origin/main` into the Candidate tree, the five
+operator-required regression files passed: `102 passed`. The check covered
+recovery registry receipts, workflow registry, planning completeness, claim-time
+sizing, and yellow-plan review.

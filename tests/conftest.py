@@ -5,8 +5,20 @@ from typing import Iterator, Mapping
 import os
 import shutil
 import subprocess
+import sys
 
 import pytest
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_ROOT_STR = str(_REPO_ROOT)
+# Operator pytest entrypoints may inject a stale runtime pin ahead of the
+# checkout under validation; force this worktree's package to win during tests.
+if sys.path[0] != _REPO_ROOT_STR:
+    try:
+        sys.path.remove(_REPO_ROOT_STR)
+    except ValueError:
+        pass
+    sys.path.insert(0, _REPO_ROOT_STR)
 
 import network_guard
 from socket_fixtures import short_socket_dir
@@ -180,8 +192,7 @@ def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 @pytest.fixture(autouse=True)
 def _prefer_local_openspec(monkeypatch: pytest.MonkeyPatch) -> None:
-    repo_root = Path(__file__).resolve().parent.parent
-    wrapper = repo_root / "scripts" / "openspec"
+    wrapper = _REPO_ROOT / "scripts" / "openspec"
     if not wrapper.exists():
         return
 

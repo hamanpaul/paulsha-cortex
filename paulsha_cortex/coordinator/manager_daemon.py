@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import inspect
 import json
+import math
 import os
 import re
 import signal
@@ -161,6 +162,47 @@ def default_recent_done_window_seconds() -> float:
         return float(override)
     except ValueError:
         return RECENT_DONE_WINDOW_SECONDS
+
+
+def default_max_load() -> float:
+    base = max(1.0, (os.cpu_count() or 1) * 0.5)
+    override = os.environ.get("PSC_MANAGER_MAX_LOAD")
+    if override is None:
+        return base
+    cleaned = override.strip()
+    if not cleaned:
+        return base
+    try:
+        val = float(cleaned)
+    except (ValueError, TypeError):
+        return base
+    if math.isfinite(val) and val > 0:
+        return val
+    return base
+
+
+def default_require_idle() -> bool:
+    override = os.environ.get("PSC_MANAGER_REQUIRE_IDLE")
+    if override is None:
+        return True
+    cleaned = override.strip().lower()
+    if cleaned in ("0", "false", "off", "no"):
+        return False
+    return True
+
+
+def _parse_cli_max_load(value: str) -> float:
+    try:
+        val = float(value)
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --max-load {value!r}: must be a finite positive float"
+        ) from exc
+    if not math.isfinite(val) or val <= 0:
+        raise argparse.ArgumentTypeError(
+            f"invalid --max-load {value!r}: must be a finite positive float"
+        )
+    return val
 
 
 def _parse_iso8601(value: Any) -> datetime | None:
@@ -1353,7 +1395,17 @@ def run_loop(
     reaper: Callable[[], dict[str, Any]] | None = None,
     recent_done_window_seconds: float | None = RECENT_DONE_WINDOW_SECONDS,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    default_max_load: float | None = None,
 ) -> bool:
+    if default_max_load is not None:
+        if (
+            not isinstance(default_max_load, (int, float))
+            or not math.isfinite(default_max_load)
+            or default_max_load <= 0
+        ):
+            raise ValueError(
+                f"default_max_load must be a finite positive number, got {default_max_load!r}"
+            )
     runtime_pid = os.getpid() if pid is None else pid
     held_lock = acquire_lock(pid=runtime_pid, pid_alive=pid_alive, now_fn=now_fn)
     if held_lock is None:
@@ -1437,6 +1489,8 @@ def run_loop(
         # resume + fanout）——兩條 lane 才會對同一個 provider 共用節流時間軸。
         if spawn_admission is not None:
             periodic_kwargs["spawn_admission"] = spawn_admission
+        if default_max_load is not None:
+            periodic_kwargs["default_max_load"] = default_max_load
         periodic_runner = build_periodic_tick_runner(**periodic_kwargs)
 
     constants.requests_dir().mkdir(parents=True, exist_ok=True)
@@ -1534,6 +1588,8 @@ def run_loop(
                         consecutive_tick_failures = 0
                         tick_circuit_open = False
                         last_tick_error = None
+                    else:
+                        last_tick_monotonic = monotonic_fn()
                 except Exception as exc:  # noqa: BLE001
                     _log_error(exc)
                     # Failure must still advance the clock -- this is the
@@ -1744,6 +1800,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-rounds", type=int)
     parser.add_argument("--no-require-idle", action="store_true")
     parser.add_argument(
+        "--max-load",
+        type=_parse_cli_max_load,
+        default=None,
+        help=(
+            "periodic tick runner 的 CPU load 門檻；"
+            "未指定時讀取 PSC_MANAGER_MAX_LOAD，皆未設則依 CPU 核心數自動計算 (max(1.0, cpu_count * 0.5))。"
+        ),
+    )
+    parser.add_argument(
         "--recent-done-window-seconds",
         type=float,
         default=default_recent_done_window_seconds(),
@@ -1782,13 +1847,14 @@ def main(argv: list[str] | None = None) -> int:
         specs_dir=args.specs_dir,
         handoff_dir=args.handoff_dir,
         max_rounds=args.max_rounds,
-        require_idle=not args.no_require_idle,
+        require_idle=default_require_idle() and not args.no_require_idle,
         default_executor=args.executor,
         default_model=args.model,
         default_review_executor=args.review_executor,
         default_review_model=args.review_model,
         recent_done_window_seconds=args.recent_done_window_seconds,
         spawn_admission=spawn_admission_limiter,
+        default_max_load=args.max_load if args.max_load is not None else default_max_load(),
     )
     return 0 if started else 1
 

@@ -1126,6 +1126,7 @@ def build_codex_argv(
         argv += ["--model", model]
         reasoning_effort = {
             "gpt-5.6-luna": "max",
+            "gpt-6-luna": "max",
             "gpt-5.3-codex-spark": "xhigh",
         }.get(model)
         if reasoning_effort is not None:
