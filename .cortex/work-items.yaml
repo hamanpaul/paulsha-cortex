@@ -1396,3 +1396,15 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/fix-standard-archive-step-evidence-design.md'
     excludes: []
+  openspec-remote-archive-authority-reconciliation:
+    title: 'openspec-remote-archive-authority-reconciliation'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#961'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/openspec-remote-archive-authority-reconciliation/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/openspec-remote-archive-authority-reconciliation-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/openspec-remote-archive-authority-reconciliation-design.md'
+    excludes: []
