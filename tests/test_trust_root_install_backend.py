@@ -1927,9 +1927,9 @@ def _write_visudo_valid_fixture(tmp_path: Path, policy: str) -> Path:
 @pytest.fixture
 def _system_sbin_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
     # The manager service PATH omits sbin; validation and detection need the same tools.
-    monkeypatch.setenv(
-        "PATH", os.pathsep.join((os.environ.get("PATH", ""), "/usr/sbin", "/sbin"))
-    )
+    existing_path = os.environ.get("PATH")
+    parts = (existing_path, "/usr/sbin", "/sbin")
+    monkeypatch.setenv("PATH", os.pathsep.join(part for part in parts if part))
 
 
 @pytest.mark.usefixtures("_system_sbin_on_path")
