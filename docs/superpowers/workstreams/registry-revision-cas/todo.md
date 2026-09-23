@@ -23,7 +23,7 @@ artifact_classes:
 
 ## Repository evidence at intake
 
-- Current checkout observed at main HEAD ea3f81ef. No RegistryRevisionConflict, transaction-lock helper or tests/test_registry_single_writer_lock_818.py exists yet.
+- Current checkout observed at main HEAD ea3f81eff45be532d7f99155399b02d4e37be1a0. No RegistryRevisionConflict, transaction-lock helper or tests/test_registry_single_writer_lock_818.py exists yet.
 - Current registry source is paulsha_cortex/coordinator/registry.py. _reload_if_changed() short-circuits on equal mtime/size; _persist() writes the whole payload with _write_payload_atomically(); v1 migration directly backs up/replaces state; v2 slice normalization calls _persist() from _load().
 - manager_daemon.run_loop currently catches executor exceptions, persists a done error envelope, then removes the request file. Test that conflict follows this path and preserves diagnostic text before changing daemon code.
 - Relevant regressions already present: tests/test_workflow_registry.py::test_v2_atomic_write_failure_rolls_back_memory_and_file and tests/test_coordinator_registry_headless.py::test_legacy_overwritten_verification_hash_is_migrated.
