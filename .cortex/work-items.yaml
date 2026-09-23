@@ -1588,3 +1588,123 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/authorized-merged-run-completion-finalizer-design.md'
     excludes: []
+  producer-lineage-resolver:
+    title: 'producer-lineage-resolver'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1006'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/producer-lineage-resolver/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/producer-lineage-resolver-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/producer-lineage-resolver-design.md'
+    excludes: []
+  main-sync-repair-budget:
+    title: 'main-sync-repair-budget'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1007'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-sync-repair-budget/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-sync-repair-budget-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-sync-repair-budget-design.md'
+    excludes: []
+  main-sync-builder-m-object-pin:
+    title: 'main-sync-builder-m-object-pin'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1008'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-sync-builder-m-object-pin/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-sync-builder-m-object-pin-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-sync-builder-m-object-pin-design.md'
+    excludes: []
+  main-sync-builder-m-object-import:
+    title: 'main-sync-builder-m-object-import'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1009'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-sync-builder-m-object-import/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-sync-builder-m-object-import-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-sync-builder-m-object-import-design.md'
+    excludes: []
+  retry-build-pinned-main-task-contract:
+    title: 'retry-build-pinned-main-task-contract'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1010'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/retry-build-pinned-main-task-contract/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/retry-build-pinned-main-task-contract-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/retry-build-pinned-main-task-contract-design.md'
+    excludes: []
+  automatic-main-sync-retry-stop:
+    title: 'automatic-main-sync-retry-stop'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1012'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/automatic-main-sync-retry-stop/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/automatic-main-sync-retry-stop-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/automatic-main-sync-retry-stop-design.md'
+    excludes: []
+  builder-main-merge-candidate-proof:
+    title: 'builder-main-merge-candidate-proof'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1013'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/builder-main-merge-candidate-proof/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/builder-main-merge-candidate-proof-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/builder-main-merge-candidate-proof-design.md'
+    excludes: []
+  quarantined-harvest-ref-cas:
+    title: 'quarantined-harvest-ref-cas'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1011'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/quarantined-harvest-ref-cas/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/quarantined-harvest-ref-cas-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/quarantined-harvest-ref-cas-design.md'
+    excludes: []
+  d-bound-prepush-gates:
+    title: 'd-bound-prepush-gates'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1014'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/d-bound-prepush-gates/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/d-bound-prepush-gates-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/d-bound-prepush-gates-design.md'
+    excludes: []
+  d-bound-postpush-ship:
+    title: 'd-bound-postpush-ship'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1015'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/d-bound-postpush-ship/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/d-bound-postpush-ship-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/d-bound-postpush-ship-design.md'
+    excludes: []
