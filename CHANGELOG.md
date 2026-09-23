@@ -16,7 +16,9 @@
   builder/reviewer job 會落 `cortex/job-supersession/v1`，`record_job_consumption()`
   另以 `cortex/job-consumption/v1` 保存獨立 completion proof，而
   `checkpoint_legacy_binding()` 可用 fingerprint + provenance 建立 revision 1 的
-  `cortex/legacy-binding-checkpoint-receipt/v1`，不清 binding、不改歷史欄位。同步補上
+  `cortex/legacy-binding-checkpoint-receipt/v1`，不清 binding、不改歷史欄位；另補上
+  pre-`bound_binding` job disposition persisted state 的 backward-compatible
+  loader / replay 正規化，不需 schema bump。同步補上
   rename/fsync/rollback fault injection、checkpoint drift/replay 與 planning-gate
   regression，並更新 `docs/unified-work-lifecycle.md` 說明 recovery/checkpoint
   仍屬 registry-only contract、既有 CLI 不新增 public 動詞，另留 `docs/evidence/`

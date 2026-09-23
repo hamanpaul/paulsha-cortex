@@ -315,6 +315,18 @@ def _set_slice_binding_revision(state_path: Path, *, revision: int) -> None:
     state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def _drop_persisted_bound_bindings(state_path: Path) -> bytes:
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    for job in payload["jobs"]:
+        if not isinstance(job, dict):
+            continue
+        for field_name in ("supersession", "consumption"):
+            entry = job.get(field_name)
+            if isinstance(entry, dict):
+                entry.pop("bound_binding", None)
+    return _write_state(state_path, payload)
+
+
 def test_create_slice_starts_versioned_and_repin_forces_new_generation(tmp_path: Path) -> None:
     state_path = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state_path)
@@ -961,6 +973,60 @@ def test_job_consumption_is_idempotent_and_survives_supersession(tmp_path: Path)
         )
 
 
+def test_pre_bound_binding_job_dispositions_reload_and_replay_current_binding(
+    tmp_path: Path,
+) -> None:
+    registry, builder, _reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
+    consumed = registry.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=slice_row["binding_revision"],
+        actor="operator",
+        completion_identity={"request_id": "consume-legacy", "request_digest": "3" * 64},
+        proof_refs=[_proof_ref("evidence/consume-legacy.json", "4" * 64)],
+        at="2026-09-21T08:00:00+00:00",
+    )
+    superseded = registry.record_job_supersession(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=slice_row["binding_revision"],
+        actor="operator",
+        reason="legacy-replay",
+        superseding_identity={"request_id": "supersede-legacy", "request_digest": "5" * 64},
+        at="2026-09-21T08:10:00+00:00",
+    )
+
+    legacy_bytes = _drop_persisted_bound_bindings(state_path)
+    reloaded = JobRegistry(state_path=state_path)
+    assert state_path.read_bytes() == legacy_bytes
+
+    restored = reloaded.get_job(builder["job_id"])
+    assert restored["consumption"]["bound_binding"] == _binding_snapshot(slice_row)
+    assert restored["supersession"]["bound_binding"] == _binding_snapshot(slice_row)
+
+    replayed_consumption = reloaded.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=slice_row["binding_revision"],
+        actor="operator",
+        completion_identity={"request_id": "consume-legacy", "request_digest": "3" * 64},
+        proof_refs=[_proof_ref("evidence/consume-legacy.json", "4" * 64)],
+        at="2026-09-21T08:00:00+00:00",
+    )
+    assert replayed_consumption["consumption"] == consumed["consumption"]
+
+    replayed_supersession = reloaded.record_job_supersession(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=slice_row["binding_revision"],
+        actor="operator",
+        reason="legacy-replay",
+        superseding_identity={"request_id": "supersede-legacy", "request_digest": "5" * 64},
+        at="2026-09-21T08:10:00+00:00",
+    )
+    assert replayed_supersession["supersession"] == superseded["supersession"]
+
+
 def test_job_dispositions_survive_binding_revision_drift_and_restart_without_extra_slice_fields(
     tmp_path: Path,
 ) -> None:
@@ -1076,6 +1142,44 @@ def test_recovery_supersession_allows_consumption_after_binding_revision_drift_a
         at="2026-09-21T08:20:00+00:00",
     )
 
+    assert replayed["supersession"] == consumed["supersession"]
+    assert replayed["consumption"] == consumed["consumption"]
+
+
+def test_pre_bound_binding_recovery_dispositions_reload_after_binding_drift(
+    tmp_path: Path,
+) -> None:
+    registry, builder, _reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
+    request = _recovery_request(slice_row)
+    registry.prepare_recovery("slice-a", request=request)
+    registry.commit_pre_candidate_recovery("slice-a", request=request, step_receipts=_step_receipts())
+    consumed = registry.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=slice_row["binding_revision"],
+        actor="operator",
+        completion_identity={"request_id": "consume-after-recovery", "request_digest": "8" * 64},
+        proof_refs=[_proof_ref("evidence/consume-after-recovery.json", "9" * 64)],
+        at="2026-09-21T08:20:00+00:00",
+    )
+
+    legacy_bytes = _drop_persisted_bound_bindings(state_path)
+    reloaded = JobRegistry(state_path=state_path)
+    assert state_path.read_bytes() == legacy_bytes
+
+    restored = reloaded.get_job(builder["job_id"])
+    assert restored["supersession"]["bound_binding"] == _binding_snapshot(slice_row)
+    assert restored["consumption"]["bound_binding"] == _binding_snapshot(slice_row)
+
+    replayed = reloaded.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=slice_row["binding_revision"],
+        actor="operator",
+        completion_identity={"request_id": "consume-after-recovery", "request_digest": "8" * 64},
+        proof_refs=[_proof_ref("evidence/consume-after-recovery.json", "9" * 64)],
+        at="2026-09-21T08:20:00+00:00",
+    )
     assert replayed["supersession"] == consumed["supersession"]
     assert replayed["consumption"] == consumed["consumption"]
 
