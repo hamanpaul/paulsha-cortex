@@ -1288,6 +1288,54 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/copilot-review-adopt-existing-design.md'
     excludes: []
+  retry-build-preserve-proof:
+    title: 'retry-build-preserve-proof'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#479'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/retry-build-preserve-proof/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/retry-build-preserve-proof-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/retry-build-preserve-proof-design.md'
+    excludes: []
+  terminal-replay-manifest-fence:
+    title: 'terminal-replay-manifest-fence'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#481'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/terminal-replay-manifest-fence/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/terminal-replay-manifest-fence-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/terminal-replay-manifest-fence-design.md'
+    excludes: []
+  closure-todo-advisory:
+    title: 'closure-todo-advisory'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#810'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/closure-todo-advisory/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/closure-todo-advisory-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/closure-todo-advisory-design.md'
+    excludes: []
+  maintainer-fallback-authorization-v2:
+    title: 'maintainer-fallback-authorization-v2'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#871'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/maintainer-fallback-authorization-v2/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/maintainer-fallback-authorization-v2-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/maintainer-fallback-authorization-v2-design.md'
+    excludes: []
   reviewer-sandbox-job-scoped-name:
     title: 'reviewer-sandbox-job-scoped-name'
     links:
