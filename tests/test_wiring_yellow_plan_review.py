@@ -23,6 +23,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from recovery_registry_receipt_support import recovery_registry_receipt_openspec_refs
 from paulsha_cortex.coordinator import manager, work_actions, work_bridge
 from paulsha_cortex.coordinator.claim import ClaimCandidate, load_work_authority
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
@@ -371,8 +372,9 @@ def test_yellow_band_without_artifact_classes_declaration_fails_soft_and_is_obse
 
 def test_recovery_registry_receipt_plan_twins_keep_first_and_last_helpers_in_lockstep() -> None:
     root = Path(__file__).resolve().parents[1]
+    openspec_refs = recovery_registry_receipt_openspec_refs(root)
     todo_ref = "docs/superpowers/workstreams/recovery-registry-receipt/todo.md"
-    tasks_ref = "openspec/changes/recovery-registry-receipt/tasks.md"
+    tasks_ref = openspec_refs["tasks"]
     todo_text = (root / todo_ref).read_text(encoding="utf-8")
     tasks_text = (root / tasks_ref).read_text(encoding="utf-8")
 
@@ -408,8 +410,8 @@ def test_recovery_registry_receipt_plan_twins_keep_first_and_last_helpers_in_loc
     rows_with_todo_last = [
         {"kind": "spec", "ref": "docs/superpowers/specs/recovery-registry-receipt-spec.md"},
         {"kind": "design", "ref": "docs/superpowers/specs/recovery-registry-receipt-design.md"},
-        {"kind": "spec", "ref": "openspec/changes/recovery-registry-receipt/proposal.md"},
-        {"kind": "design", "ref": "openspec/changes/recovery-registry-receipt/design.md"},
+        {"kind": "spec", "ref": openspec_refs["proposal"]},
+        {"kind": "design", "ref": openspec_refs["design"]},
         {"kind": "plan", "ref": tasks_ref},
         {"kind": "plan", "ref": todo_ref},
     ]
@@ -417,8 +419,8 @@ def test_recovery_registry_receipt_plan_twins_keep_first_and_last_helpers_in_loc
         {"kind": "spec", "ref": "docs/superpowers/specs/recovery-registry-receipt-spec.md"},
         {"kind": "design", "ref": "docs/superpowers/specs/recovery-registry-receipt-design.md"},
         {"kind": "plan", "ref": todo_ref},
-        {"kind": "spec", "ref": "openspec/changes/recovery-registry-receipt/proposal.md"},
-        {"kind": "design", "ref": "openspec/changes/recovery-registry-receipt/design.md"},
+        {"kind": "spec", "ref": openspec_refs["proposal"]},
+        {"kind": "design", "ref": openspec_refs["design"]},
         {"kind": "plan", "ref": tasks_ref},
     ]
     assert work_bridge.current_sizing_snapshot(

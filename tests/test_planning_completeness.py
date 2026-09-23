@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from recovery_registry_receipt_support import recovery_registry_receipt_openspec_refs
 from paulsha_cortex.coordinator.model_identities import (
     CapabilityProbe,
     IdentityRegistry,
@@ -84,6 +85,7 @@ def _repo_root() -> Path:
 
 def _tracked_recovery_registry_receipt_views() -> dict[str, tuple[PlanningArtifact, ...]]:
     root = _repo_root()
+    openspec_refs = recovery_registry_receipt_openspec_refs(root)
 
     def load(kind: str, ref: str) -> PlanningArtifact:
         return PlanningArtifact(kind=kind, ref=ref, text=(root / ref).read_text(encoding="utf-8"))
@@ -94,9 +96,9 @@ def _tracked_recovery_registry_receipt_views() -> dict[str, tuple[PlanningArtifa
         load("plan", "docs/superpowers/workstreams/recovery-registry-receipt/todo.md"),
     )
     openspec = (
-        load("spec", "openspec/changes/recovery-registry-receipt/proposal.md"),
-        load("design", "openspec/changes/recovery-registry-receipt/design.md"),
-        load("plan", "openspec/changes/recovery-registry-receipt/tasks.md"),
+        load("spec", openspec_refs["proposal"]),
+        load("design", openspec_refs["design"]),
+        load("plan", openspec_refs["tasks"]),
     )
     return {
         "superpowers": superpowers,

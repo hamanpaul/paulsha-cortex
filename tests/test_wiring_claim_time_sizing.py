@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from recovery_registry_receipt_support import recovery_registry_receipt_openspec_refs
 from paulsha_cortex.coordinator import work_bridge
 from paulsha_cortex.coordinator.claim import load_work_authority
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -135,15 +136,16 @@ def _authority(tmp_path: Path):
 
 
 def _tracked_recovery_registry_receipt_rows() -> dict[str, list[dict[str, str]]]:
+    openspec_refs = recovery_registry_receipt_openspec_refs(Path(__file__).resolve().parents[1])
     superpowers = [
         {"kind": "spec", "ref": "docs/superpowers/specs/recovery-registry-receipt-spec.md"},
         {"kind": "design", "ref": "docs/superpowers/specs/recovery-registry-receipt-design.md"},
         {"kind": "plan", "ref": "docs/superpowers/workstreams/recovery-registry-receipt/todo.md"},
     ]
     openspec = [
-        {"kind": "spec", "ref": "openspec/changes/recovery-registry-receipt/proposal.md"},
-        {"kind": "design", "ref": "openspec/changes/recovery-registry-receipt/design.md"},
-        {"kind": "plan", "ref": "openspec/changes/recovery-registry-receipt/tasks.md"},
+        {"kind": "spec", "ref": openspec_refs["proposal"]},
+        {"kind": "design", "ref": openspec_refs["design"]},
+        {"kind": "plan", "ref": openspec_refs["tasks"]},
     ]
     return {
         "superpowers": superpowers,

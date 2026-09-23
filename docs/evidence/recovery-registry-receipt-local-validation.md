@@ -25,12 +25,16 @@ Both commands ran from a temporary directory outside the checkout with
 ## Planning-boundary observations
 
 - `docs/superpowers/workstreams/recovery-registry-receipt/todo.md` and
-  `openspec/changes/recovery-registry-receipt/tasks.md` still carry identical
-  `domain_breadth` / `state_consistency` / `invariant_count` /
-  `artifact_classes`, and their checklist lines remain byte-identical after
-  normalizing `[x]` to `[ ]`.
-- The accepted intake authority tracked in this repository remains present at
-  `openspec/changes/recovery-registry-receipt/{proposal.md,design.md,tasks.md,specs/recovery-registry-receipt/spec.md}`.
+  `openspec/changes/archive/2026-09-22-recovery-registry-receipt/tasks.md`
+  still carry identical `domain_breadth` / `state_consistency` /
+  `invariant_count` / `artifact_classes`, and their checklist lines remain
+  byte-identical after normalizing `[x]` to `[ ]`.
+- The accepted intake authority tracked in this repository remains present
+  under the manager-owned archive:
+  `openspec/changes/archive/2026-09-22-recovery-registry-receipt/proposal.md`,
+  `openspec/changes/archive/2026-09-22-recovery-registry-receipt/design.md`,
+  `openspec/changes/archive/2026-09-22-recovery-registry-receipt/tasks.md`, and
+  `openspec/changes/archive/2026-09-22-recovery-registry-receipt/specs/recovery-registry-receipt/spec.md`.
   This card only validated the presence and internal agreement of those files;
   it does not claim archive, merge, or any extra publication authority beyond
   the current repository revision.
