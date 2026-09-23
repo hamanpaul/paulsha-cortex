@@ -398,7 +398,7 @@ def test_retry_build_worktree_failure_preserves_existing_proof(tmp_path: Path) -
     assert restored["spec"]["hash"] != rewritten_hash
     _assert_preserved_recovery_slice(restored, snapshot)
     assert manager.allowed_slice_actions(registry, restored) == expected_actions
-    assert worktree_creator.calls == [("feature/slice-a", "f" * 40, None)]
+    assert worktree_creator.calls == [("feature/slice-a", "f" * 40, "slice-a")]
     assert launcher.calls == []
 
 

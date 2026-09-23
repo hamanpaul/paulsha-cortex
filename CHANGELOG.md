@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **#479 retry-build launch 前失敗保留既有 proof**：票面主缺陷已由 #941 修正；本次補齊殘項，讓恢復態 slice 在 `retry-build` 的 launch 前失敗時保留既有 candidate、verification／review refs、builder／reviewer 綁定與 slice state；未真正 launch 的新 failed build job 在 `complete_tick` 只保留稽核，不再覆寫現任 slice manifest。
 - **Refine 0.1.11 定版進件（第二批）**：為 #479、#481、#810、#871 新增 accepted
   spec／design／todo 與 work item 綁定，供後續 Cortex 分票派工；產品實作仍待正式驗收。
 - **Refine 0.1.11 定版進件（第一批）**：新增接手與驗收表，並為 #579、#812、#874、#956

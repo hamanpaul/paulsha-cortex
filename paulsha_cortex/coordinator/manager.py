@@ -274,6 +274,19 @@ def _slice_for_job(registry, slice_id: str, job_id: str) -> dict | None:
     return slice_row
 
 
+def _is_unbound_launch_failed_build_job(registry, slice_id: str, job: dict) -> bool:
+    if registry is None or job.get("status") != "failed" or _is_workflow_lane_job(job):
+        return False
+    job_id = job.get("job_id")
+    if not isinstance(job_id, str) or _runtime_diagnostic_reason(job.get("runtime_diagnostic")) != "launch-failed":
+        return False
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return False
+    return slice_row.get("builder_job_id") != job_id
+
+
 def _slice_for_reviewer_job(registry, slice_id: str, job_id: str) -> dict | None:
     if registry is None:
         return None
@@ -2473,6 +2486,8 @@ def complete_tick(
             else:
                 slice_row = _slice_for_job(registry, slice_id, job_id)
                 if slice_row is not None and slice_row.get("reviewer_job_id"):
+                    continue
+                if slice_row is None and _is_unbound_launch_failed_build_job(registry, slice_id, job):
                     continue
             repo_root = _repo_root_for_slice_row(slice_row)
             state_path = getattr(registry, "_state_path", None)

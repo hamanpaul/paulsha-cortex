@@ -767,6 +767,9 @@ cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
 `review-attest.json`接受`{"verdict":"approved","summary":"...","findings":[]}`，並可選填 `evidence_refs`（只接受 `{"kind":"operator-reproduction","ref":"<absolute path>","sha256":"<64 hex>"}` 陣列）。path/hash 仍由 Manager 生成，caller 不得注入。若 work item 尚無 mapped PR，Manager 會在 `verified_head == candidate_head` 時先建立 `pr_number: null` 的 immutable maintainer evidence；後續 ship 建 PR 時再把它綁進 delivery gate。若已有 PR，Manager 仍會重讀 authenticated PR HEAD 並將 evidence 綁定 repo/work/run/authority/PR/candidate/actor。
 
 - `slice-action` 一律透過 control request queue，由 daemon/manager 單一 writer 消費。
+- `slice-action retry-build` 若在 agent 真正 launch 前失敗，現在會保留既有
+  candidate、verification／review refs、builder／reviewer 綁定與 slice state；operator
+  修正原因後可直接再次重試，不必先從被清空的恢復態重新補 proof。
 - status snapshot 會一次列出所有 `needs_human` 事項（`attention`），包含 reason、evidence refs、ancestry 摘要與 `next_actions`，不需逐筆互動追問。
 
 ### Broker cleanup（best-effort）
