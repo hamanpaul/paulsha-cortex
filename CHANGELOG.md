@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **Refine 0.1.11 定版進件（第二批）**：為 #479、#481、#810、#871 新增 accepted
+  spec／design／todo 與 work item 綁定，供後續 Cortex 分票派工；產品實作仍待正式驗收。
+
 - **launcher：`gpt-6-luna` 明示 max reasoning effort**：`build_codex_argv` 對 `gpt-6-luna` 帶
   `-c model_reasoning_effort="max"`，與 `gpt-5.6-luna` 一致，不再受 host ambient codex config 影響。
 
