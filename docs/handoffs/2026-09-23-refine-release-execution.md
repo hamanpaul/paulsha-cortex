@@ -13,10 +13,10 @@
 
 | 工作線 | 依賴順序 | 唯一實作 owner 與關鍵驗收 |
 | --- | --- | --- |
-| Ship/closure | #987 → #988 → #989 → #990（父票 #972）→ #973 的真 merge／D gates 切片（父票 #943）→ #885 → #810 | #987–#990 分別固定 main probe、typed C/M、recovery action、durable Manager context；#972 四票與整合驗收完成前不解除 #973 前置。#973 的完整 7/Red 範圍仍需 issue-backed 子票閉合。真 Git 合併、雙方 CHANGELOG 條目、D 的 exact-head CI 與 merge/closure 分階段驗收。 |
+| Ship/closure | #987 → #988 → #989 → #990（父票 #972）→ #973 的真 merge／D gates 切片（父票 #943）→ #885 → #810 | #987–#990 分別固定 main probe、typed C/M、recovery action、durable Manager context；#972 四票與整合驗收完成前不解除 #973 前置。#973 的完整 8/Red 範圍由 #1006–#1017 承接，其中 #1016/#1017 維持 Red aggregate；產品與整合驗收仍待閉合。真 Git 合併、雙方 CHANGELOG 條目、D 的 exact-head CI 與 merge/closure 分階段驗收。 |
 | Authority | #992 → #993、#994；#979 等 #992+#993，#982 等 #992+#994，#980 等 #992–#994+#982+#983；#978 aggregate 後接 #964 → #965（父票 #847）；#961 → #975 → #976 → #977（父票 #962／#887） | #978 保持 Red umbrella，直到 schema/store/read-back 與 #979/#980 producers 全部驗收；#993 額外等 #966 全檔 CAS，不能以 #862 slice CAS 取代。#977 另等 #995 唯讀 closure inspection、#996 CompletionRecord 條件建立與 #997 Outbox CAS 合併，並需 #975 凍結完整 proof consumer shape；#847 AC10 loaded-runtime canary 保持獨立 gate。 |
 | State integrity | #862 → #966 → #967（父票 #818）→ #481；#479 → #968 → #969 → #970 → #971（父票 #547） | #968 A1 與 #547 AC7 的 #999–#1005 已拆為無循環子票；#862 owner contract acceptance、#969 marker 與跨 UID proof 仍是前置，#547 保持 open。重疊的 registry／Manager recovery 修改由單一 owner 串行。 |
-| Recovery/UI | #956、#874、#812、#871、#579 | 依重疊模組錯開 merge；每票以正式 action 的可達性與錯誤終態作驗收。 |
+| Recovery/UI | #956、#874、#812、#871；#803 → #579 | #579 job900 的 19 項 pytest 失敗均在 Claude review sandbox 的 `setfacl -R`；同候選 Manager full-suite ledger 為綠但 verifier 未採信。#803 的 exact-candidate ledger consumer 或經驗證的 ACL-capable disposable 測試環境是重新驗證前置；其他票依重疊模組錯開 merge，皆以正式 action 的可達性與錯誤終態驗收。 |
 
 實作可使用 Copilot `gpt-5.4`（較大修改）或 Codex `gpt-6-luna(max)`（較窄修改）。`gpt-6-sol` 做獨立對抗審查；agy 指定的 `gemini-2.8-flash (high)` 未在現行 roster，現行可見的是 `gemini-3.8-flash-high`，不得自行視為同型號替代。每票使用獨立 worktree、唯一 work item 與 run owner；merge 前重新檢查 exact PR head 和 review threads。並行數量以實際資源與重疊模組風險調度。
 
