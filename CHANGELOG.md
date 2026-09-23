@@ -26,6 +26,10 @@
   仍屬 registry-only contract、既有 CLI 不新增 public 動詞，另留 `docs/evidence/`
   的 pre-archive local validation record。
 
+- **#862 job disposition replay**：`record_job_supersession()` 與
+  `record_job_consumption()` 的省略 `at` retry 會保留第一次寫入的 disposition 時間，
+  exact replay 不再重複持久化；呼叫者明示不同 `at` 仍維持 conflict。
+
 - **Refine B2 進度 handoff**：新增 `docs/handoffs/2026-09-21-refine-b2-handoff.md`——#911／#825 家族／#866 六條 run
   的交付與介入紀錄、runtime 現況、下一步順序與派工要訣、#933–#937 分析。docs-only。
 

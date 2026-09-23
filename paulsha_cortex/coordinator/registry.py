@@ -367,6 +367,15 @@ def _contract_error(
     return ValueError(f"{code}{suffix}（fail-closed）: {state_path}")
 
 
+def _same_disposition_except_at(existing: object, proposed: Mapping[str, Any]) -> bool:
+    if not isinstance(existing, Mapping) or "at" not in existing or "at" not in proposed:
+        return False
+    return (
+        {key: value for key, value in existing.items() if key != "at"}
+        == {key: value for key, value in proposed.items() if key != "at"}
+    )
+
+
 def _require_non_empty_string(
     value: object,
     *,
@@ -3042,7 +3051,8 @@ class JobRegistry:
         reason: str,
         superseding_identity: Mapping[str, Any],
         at: str,
-    ) -> None:
+        at_was_omitted: bool = False,
+    ) -> bool:
         supersession = self._build_job_supersession(
             job,
             slice_id=slice_id,
@@ -3054,9 +3064,12 @@ class JobRegistry:
             at=at,
         )
         existing = job.get("supersession")
-        if existing is not None and existing != supersession:
+        if existing is not None:
+            if existing == supersession or (at_was_omitted and _same_disposition_except_at(existing, supersession)):
+                return False
             raise _contract_error("request-content-conflict", state_path=self._state_path, detail="supersession")
         job["supersession"] = supersession
+        return True
 
     def _record_job_consumption_inplace(
         self,
@@ -3069,7 +3082,8 @@ class JobRegistry:
         completion_identity: Mapping[str, Any],
         proof_refs: list[Mapping[str, Any]],
         at: str,
-    ) -> None:
+        at_was_omitted: bool = False,
+    ) -> bool:
         consumption = self._build_job_consumption(
             job,
             slice_id=slice_id,
@@ -3081,9 +3095,12 @@ class JobRegistry:
             at=at,
         )
         existing = job.get("consumption")
-        if existing is not None and existing != consumption:
+        if existing is not None:
+            if existing == consumption or (at_was_omitted and _same_disposition_except_at(existing, consumption)):
+                return False
             raise _contract_error("request-content-conflict", state_path=self._state_path, detail="consumption")
         job["consumption"] = consumption
+        return True
 
     def _build_recovery_receipt(
         self,
@@ -3872,7 +3889,8 @@ class JobRegistry:
             slice_row=slice_row,
             binding_revision=normalized_binding_revision,
         )
-        self._record_job_supersession_inplace(
+        at_was_omitted = at is None
+        changed = self._record_job_supersession_inplace(
             job,
             slice_id=slice_id,
             binding_revision=normalized_binding_revision,
@@ -3880,13 +3898,15 @@ class JobRegistry:
             actor=_require_non_empty_string(actor, label="record_job_supersession.actor", state_path=self._state_path),
             reason=_require_non_empty_string(reason, label="record_job_supersession.reason", state_path=self._state_path),
             superseding_identity=superseding_identity,
-            at=_now_iso() if at is None else _require_non_empty_string(
+            at=_now_iso() if at_was_omitted else _require_non_empty_string(
                 at,
                 label="record_job_supersession.at",
                 state_path=self._state_path,
             ),
+            at_was_omitted=at_was_omitted,
         )
-        self._persist_recovery_change()
+        if changed:
+            self._persist_recovery_change()
         return _deepcopy_json(job)
 
     def record_job_consumption(
@@ -3912,7 +3932,8 @@ class JobRegistry:
             slice_row=slice_row,
             binding_revision=normalized_binding_revision,
         )
-        self._record_job_consumption_inplace(
+        at_was_omitted = at is None
+        changed = self._record_job_consumption_inplace(
             job,
             slice_id=slice_id,
             binding_revision=normalized_binding_revision,
@@ -3920,13 +3941,15 @@ class JobRegistry:
             actor=_require_non_empty_string(actor, label="record_job_consumption.actor", state_path=self._state_path),
             completion_identity=completion_identity,
             proof_refs=proof_refs,
-            at=_now_iso() if at is None else _require_non_empty_string(
+            at=_now_iso() if at_was_omitted else _require_non_empty_string(
                 at,
                 label="record_job_consumption.at",
                 state_path=self._state_path,
             ),
+            at_was_omitted=at_was_omitted,
         )
-        self._persist_recovery_change()
+        if changed:
+            self._persist_recovery_change()
         return _deepcopy_json(job)
 
     def checkpoint_legacy_binding(

@@ -19,3 +19,6 @@
   regression，並更新 `docs/unified-work-lifecycle.md` 說明 recovery/checkpoint
   仍屬 registry-only contract、既有 CLI 不新增 public 動詞，另留 `docs/evidence/`
   的 pre-archive local validation record。
+- `record_job_supersession()` 與 `record_job_consumption()` 現在接受省略 `at` 的相同
+  disposition retry，保留第一次寫入的時間且不再持久化；相同明示時間的 replay
+  也跳過寫入，明示不同時間仍回報 `request-content-conflict`。

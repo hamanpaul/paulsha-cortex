@@ -150,6 +150,38 @@ def _create_bound_slice(
     return registry, builder, reviewer, registry.get_slice(slice_id), state_path
 
 
+def _record_job_disposition(
+    registry: JobRegistry,
+    job: Mapping[str, Any],
+    slice_row: Mapping[str, Any],
+    *,
+    kind: str,
+    at: str | None = None,
+) -> dict[str, Any]:
+    at_arg = {} if at is None else {"at": at}
+    if kind == "supersession":
+        return registry.record_job_supersession(
+            job["job_id"],
+            slice_id=slice_row["slice_id"],
+            binding_revision=slice_row["binding_revision"],
+            actor="operator",
+            reason="retry-replay",
+            superseding_identity={"request_id": "supersede-retry", "request_digest": "a" * 64},
+            **at_arg,
+        )
+    if kind == "consumption":
+        return registry.record_job_consumption(
+            job["job_id"],
+            slice_id=slice_row["slice_id"],
+            binding_revision=slice_row["binding_revision"],
+            actor="operator",
+            completion_identity={"request_id": "consume-retry", "request_digest": "b" * 64},
+            proof_refs=[_proof_ref("evidence/retry-replay.json", "c" * 64)],
+            **at_arg,
+        )
+    raise AssertionError(f"unknown disposition kind: {kind}")
+
+
 def _recovery_request(
     slice_row: Mapping[str, Any],
     *,
@@ -1026,6 +1058,69 @@ def test_job_consumption_is_idempotent_and_survives_supersession(tmp_path: Path)
             reason="bad-identity",
             superseding_identity={"opaque": "bad"},
         )
+
+
+@pytest.mark.parametrize("kind", ["supersession", "consumption"])
+def test_job_disposition_retry_without_at_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    registry, builder, _reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
+    monkeypatch.setattr(registry_module, "_now_iso", lambda: "2026-09-23T01:00:00+00:00")
+    first = _record_job_disposition(registry, builder, slice_row, kind=kind)
+    stored_at = first[kind]["at"]
+    state_after_first = state_path.read_bytes()
+
+    monkeypatch.setattr(registry_module, "_now_iso", lambda: "2026-09-23T01:00:01+00:00")
+    persist_calls = 0
+
+    def count_persist() -> None:
+        nonlocal persist_calls
+        persist_calls += 1
+
+    monkeypatch.setattr(registry, "_persist_recovery_change", count_persist)
+    replayed = _record_job_disposition(registry, builder, slice_row, kind=kind)
+
+    assert replayed[kind] == first[kind]
+    assert replayed[kind]["at"] == stored_at
+    assert persist_calls == 0
+    assert state_path.read_bytes() == state_after_first
+
+
+@pytest.mark.parametrize("kind", ["supersession", "consumption"])
+def test_job_disposition_retry_with_different_explicit_at_conflicts(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    registry, builder, _reviewer, slice_row, _state_path = _create_bound_slice(tmp_path)
+    _record_job_disposition(registry, builder, slice_row, kind=kind, at="stored-at")
+
+    with pytest.raises(ValueError, match="request-content-conflict"):
+        _record_job_disposition(registry, builder, slice_row, kind=kind, at="different-at")
+
+
+@pytest.mark.parametrize("kind", ["supersession", "consumption"])
+def test_job_disposition_exact_replay_skips_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    registry, builder, _reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
+    first = _record_job_disposition(registry, builder, slice_row, kind=kind, at="fixed-at")
+    state_after_first = state_path.read_bytes()
+    persist_calls = 0
+
+    def count_persist() -> None:
+        nonlocal persist_calls
+        persist_calls += 1
+
+    monkeypatch.setattr(registry, "_persist_recovery_change", count_persist)
+    replayed = _record_job_disposition(registry, builder, slice_row, kind=kind, at="fixed-at")
+
+    assert replayed[kind] == first[kind]
+    assert persist_calls == 0
+    assert state_path.read_bytes() == state_after_first
 
 
 def test_pre_bound_binding_job_dispositions_reload_and_replay_current_binding(
