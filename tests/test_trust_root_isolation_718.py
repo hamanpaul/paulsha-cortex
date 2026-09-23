@@ -788,7 +788,11 @@ def test_codex_reasoning_effort_is_explicit_for_pinned_models() -> None:
         log_dir="/tmp",
         model="gpt-5.3-codex-spark",
     )
+    luna6 = build_codex_argv(
+        prompt="PROMPT", slice_id="job-c", log_dir="/tmp", model="gpt-6-luna"
+    )
     assert 'model_reasoning_effort="max"' in luna
+    assert 'model_reasoning_effort="max"' in luna6
     assert 'model_reasoning_effort="xhigh"' in spark
 
 
