@@ -1924,6 +1924,15 @@ def _write_visudo_valid_fixture(tmp_path: Path, policy: str) -> Path:
     return sudoers
 
 
+@pytest.fixture
+def _system_sbin_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The manager service PATH omits sbin; these integration cases require sudo tools.
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join((os.environ.get("PATH", ""), "/usr/sbin", "/sbin"))
+    )
+
+
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_catches_blanket_noauth_in_colon_host_spec(
     tmp_path: Path,
 ) -> None:
@@ -1936,6 +1945,7 @@ def test_sudoers_detector_catches_blanket_noauth_in_colon_host_spec(
     assert backend_module._universal_nopasswd(sudoers)
 
 
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_catches_defaults_noauth_for_blanket_authority(
     tmp_path: Path,
 ) -> None:
@@ -1949,6 +1959,7 @@ def test_sudoers_detector_catches_defaults_noauth_for_blanket_authority(
 
 
 @pytest.mark.parametrize("host", ["*", "0.0.0.0/0", "::/0"])
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_catches_blanket_noauth_on_universal_host_expression(
     tmp_path: Path, host: str
 ) -> None:
@@ -1960,6 +1971,7 @@ def test_sudoers_detector_catches_blanket_noauth_on_universal_host_expression(
     assert backend_module._universal_nopasswd(sudoers)
 
 
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_honors_explicit_passwd_override(
     tmp_path: Path,
 ) -> None:
@@ -1972,6 +1984,7 @@ def test_sudoers_detector_honors_explicit_passwd_override(
     assert not backend_module._universal_nopasswd(sudoers)
 
 
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_resolves_universal_command_alias_across_continuations(
     tmp_path: Path,
 ) -> None:
@@ -1987,6 +2000,7 @@ def test_sudoers_detector_resolves_universal_command_alias_across_continuations(
     assert backend_module._universal_nopasswd(sudoers)
 
 
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_does_not_treat_limited_alias_as_universal(
     tmp_path: Path,
 ) -> None:
@@ -1999,6 +2013,7 @@ def test_sudoers_detector_does_not_treat_limited_alias_as_universal(
     assert not backend_module._universal_nopasswd(sudoers)
 
 
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_resolves_host_alias_to_all(tmp_path: Path) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
@@ -2009,6 +2024,7 @@ def test_sudoers_detector_resolves_host_alias_to_all(tmp_path: Path) -> None:
     assert backend_module._universal_nopasswd(sudoers)
 
 
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_resolves_recursive_host_aliases(tmp_path: Path) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
@@ -2034,6 +2050,7 @@ def test_sudoers_detector_fails_closed_on_referenced_host_alias_cycle(
     assert backend_module._universal_nopasswd(sudoers)
 
 
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_does_not_treat_limited_host_alias_as_universal(
     tmp_path: Path,
 ) -> None:
@@ -2062,6 +2079,7 @@ def test_sudoers_detector_follows_authoritative_include(
     assert backend_module._universal_nopasswd(sudoers)
 
 
+@pytest.mark.usefixtures("_system_sbin_on_path")
 def test_sudoers_detector_does_not_scan_unincluded_sibling_policy(
     tmp_path: Path,
 ) -> None:
