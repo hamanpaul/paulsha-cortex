@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **#871 maintainer fallback authorization v2**：同一 run/head 若已存在 Copilot v1 merge authorization，maintainer fallback 現在會保留 immutable v1 為 superseded 稽核，另建以 payload digest 定址的 v2 並在 payload 內綁定 v1 ref/hash；replay 會驗證 superseded v1 wrapper 不可變且身分一致，`merge-authorized` 前置檢查與 trusted evidence refs 仍維持既有 fail-closed 邊界。
+
 - **Refine 0.1.11 定版進件（第二批）**：為 #479、#481、#810、#871 新增 accepted
   spec／design／todo 與 work item 綁定，供後續 Cortex 分票派工；產品實作仍待正式驗收。
 - **Refine 0.1.11 定版進件（第一批）**：新增接手與驗收表，並為 #579、#812、#874、#956

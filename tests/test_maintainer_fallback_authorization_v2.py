@@ -508,6 +508,9 @@ def _assert_superseded_success(
     assert Path(authorization["path"]).name == (
         f"{env.run_id}-{HEAD.lower()}-{authorization['hash']}.json"
     )
+    assert set(authorization["payload"]) == set(
+        _v2_body(env, superseded=legacy if expect_superseded else None)
+    )
     refs = work_actions._trusted_evidence_refs(authorization)
     assert refs == (
         {
