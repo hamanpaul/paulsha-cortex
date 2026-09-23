@@ -5,5 +5,5 @@
 - [x] T3 source: add the reviewer adjudication directive with derived finding categories.
 - [x] T4 source: expose blocking-findings recovery actions and actionable hints.
 - [x] T5 source: reject `review-attest` for a rejected review gate.
-- [x] T6 tests: run the specified regression suite and full test suite.
+- [ ] T6 tests: run the specified regression suite and full test suite.
 - [x] T7 docs / CLI: update help, lifecycle documentation, and changelog.
