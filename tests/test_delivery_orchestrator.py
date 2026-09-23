@@ -372,6 +372,28 @@ def _copilot_decision(*, head: str = HEAD1):
     )
 
 
+def _adopted_copilot_decision(
+    *,
+    head: str = HEAD1,
+    submitted_at_epoch: float = 1_000.0,
+    adopted_at_epoch: float = 3_400.0,
+    observed_at_epoch: float = 3_405.0,
+):
+    return ReviewLoop(
+        head=head,
+        fix_rounds=0,
+        epoch_started_at=submitted_at_epoch,
+        requested_at=submitted_at_epoch,
+        adopted_at=adopted_at_epoch,
+    ).record_review(
+        head=head,
+        now_epoch=observed_at_epoch,
+        finding_count=0,
+        review_id=88,
+        submitted_at_epoch=submitted_at_epoch,
+    )
+
+
 def test_ship_orchestrator_is_single_exact_evidence_merge_admission(tmp_path: Path) -> None:
     class GitHub:
         def __init__(self):
@@ -402,6 +424,38 @@ def test_ship_orchestrator_is_single_exact_evidence_merge_admission(tmp_path: Pa
     assert github.policy.copilot_requested_at_epoch == 100
 
 
+def test_ship_orchestrator_accepts_recently_adopted_exact_head_copilot_review(
+    tmp_path: Path,
+) -> None:
+    class GitHub:
+        def __init__(self):
+            self.policy = None
+
+        def evaluate_final_gate(self, **kwargs):
+            self.policy = kwargs["policy"]
+            return kwargs["policy"]
+
+        def commit_merge(self, **kwargs):
+            return object()
+
+    github = GitHub()
+    copilot = _adopted_copilot_decision()
+    result = ShipOrchestrator(github=github, now=lambda: 3_405.0).merge_if_ready(
+        repo="acme/demo",
+        pr_number=7,
+        change="work",
+        expected_head=HEAD1,
+        expected_tree_hash=HEAD2,
+        authority=_authority(tmp_path, last_success=3_400.0),
+        preflight=_preflight(),
+        copilot=copilot,
+        foreign_review=_foreign_review(tmp_path),
+    )
+    assert result.expected_head == HEAD1
+    assert github.policy.copilot_review_id == 88
+    assert github.policy.copilot_requested_at_epoch == 1_000.0
+
+
 def test_ship_orchestrator_blocks_stale_provider_or_non_exact_preflight(tmp_path: Path) -> None:
     class GitHub:
         def merge_if_ready(self, **kwargs):
@@ -425,6 +479,98 @@ def test_ship_orchestrator_blocks_stale_provider_or_non_exact_preflight(tmp_path
     base["preflight"] = _preflight(head=HEAD3)
     with pytest.raises(RuntimeError, match="exact HEAD/tree"):
         orchestrator.merge_if_ready(**base)
+
+
+def test_ship_orchestrator_rejects_stale_non_adopted_copilot_request(
+    tmp_path: Path,
+) -> None:
+    class GitHub:
+        def evaluate_final_gate(self, **kwargs):
+            raise AssertionError("stale request must not reach GitHub")
+
+        def commit_merge(self, **kwargs):
+            raise AssertionError("stale request must not reach GitHub")
+
+    with pytest.raises(RuntimeError, match="Copilot review epoch has not passed"):
+        ShipOrchestrator(github=GitHub(), now=lambda: 1_001.0).merge_if_ready(
+            repo="acme/demo",
+            pr_number=7,
+            change="work",
+            expected_head=HEAD1,
+            expected_tree_hash=HEAD2,
+            authority=_authority(tmp_path, last_success=1_000.0),
+            preflight=_preflight(),
+            copilot=_copilot_decision(),
+            foreign_review=_foreign_review(tmp_path),
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_ship_orchestrator_rejects_non_finite_requested_at_epoch(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    class GitHub:
+        def evaluate_final_gate(self, **kwargs):
+            raise AssertionError("malformed epochs must not reach GitHub")
+
+        def commit_merge(self, **kwargs):
+            raise AssertionError("malformed epochs must not reach GitHub")
+
+    copilot = _copilot_decision()
+    bad_copilot = replace(
+        copilot,
+        loop=replace(copilot.loop, requested_at=value),
+    )
+
+    with pytest.raises(RuntimeError, match="Copilot review epoch has not passed"):
+        ShipOrchestrator(github=GitHub(), now=lambda: 200.0).merge_if_ready(
+            repo="acme/demo",
+            pr_number=7,
+            change="work",
+            expected_head=HEAD1,
+            expected_tree_hash=HEAD2,
+            authority=_authority(tmp_path, last_success=150.0),
+            preflight=_preflight(),
+            copilot=bad_copilot,
+            foreign_review=_foreign_review(tmp_path),
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_ship_orchestrator_rejects_non_finite_adopted_at_epoch(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    class GitHub:
+        def evaluate_final_gate(self, **kwargs):
+            raise AssertionError("malformed epochs must not reach GitHub")
+
+        def commit_merge(self, **kwargs):
+            raise AssertionError("malformed epochs must not reach GitHub")
+
+    copilot = _adopted_copilot_decision(
+        submitted_at_epoch=1_000.0,
+        adopted_at_epoch=1_005.0,
+        observed_at_epoch=1_010.0,
+    )
+    bad_copilot = replace(
+        copilot,
+        loop=replace(copilot.loop, adopted_at=value),
+    )
+
+    with pytest.raises(RuntimeError, match="Copilot review epoch has not passed"):
+        ShipOrchestrator(github=GitHub(), now=lambda: 1_010.0).merge_if_ready(
+            repo="acme/demo",
+            pr_number=7,
+            change="work",
+            expected_head=HEAD1,
+            expected_tree_hash=HEAD2,
+            authority=_authority(tmp_path, last_success=1_005.0),
+            preflight=_preflight(),
+            copilot=bad_copilot,
+            foreign_review=_foreign_review(tmp_path),
+        )
 
 
 def test_ship_orchestrator_gates_final_merge_on_the_loops_own_band_budget(

@@ -140,6 +140,7 @@ class ReviewLoop:
     # #218：work-item repair budget，依 sizing band 參數化（repair_budget_for_band）；
     # 預設沿用既有 MAX_FIX_ROUNDS，向後相容未帶 band 的既有呼叫端。
     max_fix_rounds: int = MAX_FIX_ROUNDS
+    adopted_at: float | None = None
 
     @classmethod
     def start(
@@ -158,6 +159,7 @@ class ReviewLoop:
             epoch_started_at=float(now_epoch),
             requested_at=None,
             max_fix_rounds=max_fix_rounds,
+            adopted_at=None,
         )
 
     @property
@@ -195,6 +197,7 @@ class ReviewLoop:
             epoch_started_at=float(now_epoch),
             requested_at=None,
             max_fix_rounds=self.max_fix_rounds,
+            adopted_at=None,
         )
 
     def record_review(
@@ -216,9 +219,10 @@ class ReviewLoop:
         if not isinstance(review_id, int) or isinstance(review_id, bool) or review_id <= 0:
             raise ValueError("review_id must be a positive integer")
         submitted_at = float(submitted_at_epoch)
-        if submitted_at < self.requested_at or submitted_at > float(now_epoch):
+        if (self.adopted_at is None and submitted_at < self.requested_at) or submitted_at > float(now_epoch):
             return ReviewDecision(self, "needs_human", "copilot-review-outside-request-epoch")
-        elapsed = float(now_epoch) - self.requested_at
+        base_epoch = self.adopted_at if self.adopted_at is not None else self.requested_at
+        elapsed = float(now_epoch) - base_epoch
         if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
             return ReviewDecision(self, "needs_human", "copilot-review-timeout")
         if error:
@@ -520,16 +524,30 @@ class ShipOrchestrator:
         if (copilot is None) == (maintainer_review is None):
             raise RuntimeError("exactly one current-HEAD delivery review is required")
         if copilot is not None:
+            requested_at = copilot.loop.requested_at
             if (
                 copilot.action != "passed"
                 or copilot.head != expected_head
                 or copilot.review_id is None
                 or copilot.loop.head != expected_head
-                or copilot.loop.requested_at is None
+                or requested_at is None
                 or copilot.loop.fix_rounds > copilot.loop.max_fix_rounds
-                or float(now_epoch) - copilot.loop.requested_at < 0
-                or float(now_epoch) - copilot.loop.requested_at > REVIEW_TIMEOUT_SECONDS
             ):
+                raise RuntimeError("Copilot review epoch has not passed")
+            try:
+                _require_finite_epoch(requested_at, field="Copilot review request epoch")
+                adopted_at = None
+                if copilot.loop.adopted_at is not None:
+                    _require_finite_epoch(
+                        copilot.loop.adopted_at,
+                        field="Copilot review adoption epoch",
+                    )
+                    adopted_at = float(copilot.loop.adopted_at)
+            except ValueError as exc:
+                raise RuntimeError("Copilot review epoch has not passed") from exc
+            timeout_basis = adopted_at if adopted_at is not None else float(requested_at)
+            elapsed = float(now_epoch) - timeout_basis
+            if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
                 raise RuntimeError("Copilot review epoch has not passed")
             review_kind = "copilot"
         else:
@@ -546,7 +564,7 @@ class ShipOrchestrator:
             expected_head=expected_head,
             required_closing_issues=authority.mapped_issues,
             copilot_review_id=copilot.review_id if copilot is not None else None,
-            copilot_requested_at_epoch=(copilot.loop.requested_at if copilot is not None else None),
+            copilot_requested_at_epoch=(float(requested_at) if copilot is not None else None),
             review_kind=review_kind,
         )
         # The exact-candidate final verdict must be evaluated and already

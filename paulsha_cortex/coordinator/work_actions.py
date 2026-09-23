@@ -2174,6 +2174,10 @@ def _claim_action(
         ]
         if extra:
             response["next_actions"] = [*response.get("next_actions", []), *extra]
+            if "review-attest" in extra and authority is not None:
+                response["next_step_hint"] = (
+                    f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+                )
     if decision.blocking_reason is not None:
         response["blocking_reason"] = decision.blocking_reason
     return response
@@ -2546,45 +2550,52 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
     if (
         run is None
         or workflow_registry is None
-        or getattr(run, "status", None) != "ongoing"
+        or getattr(run, "status", None) not in ("ongoing", "needs_human")
         or "needs_human" not in getattr(run, "facets", ())
-        or run.current_phase not in RETRY_CARD_PHASE_PERSONA
     ):
-        return ()
-    try:
-        jobs = list(workflow_registry.list_jobs())
-    except Exception:  # pragma: no cover - 曝光面不得因讀取失敗而讓 resume 死掉
-        return ()
-    run_jobs = [job for job in jobs if job.get("workflow_run_id") == run.run_id]
-    if any(job.get("status") in ACTIVE_JOB_STATUSES for job in run_jobs):
         return ()
 
     actions: list[str] = []
-    # regenerate-gates：與 `_regenerate_gates_action` 同一組 candidate 條件。
-    ledger_jobs = [
-        job
-        for job in run_jobs
-        if job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES
-        and job.get("status") in TERMINAL_JOB_STATUSES
-        and isinstance(job.get("log_path"), str)
-        and job.get("log_path")
-        and Path(job["log_path"]).is_file()
-    ]
-    if ledger_jobs:
-        worktree = ledger_jobs[-1].get("worktree")
-        if isinstance(worktree, str) and Path(worktree).is_dir():
-            actions.append("regenerate-gates")
+    if run.current_phase in RETRY_CARD_PHASE_PERSONA:
+        try:
+            jobs = list(workflow_registry.list_jobs())
+        except Exception:  # pragma: no cover - 曝光面不得因讀取失敗而讓 resume 死掉
+            jobs = []
+        run_jobs = [job for job in jobs if job.get("workflow_run_id") == run.run_id]
+        if not any(job.get("status") in ACTIVE_JOB_STATUSES for job in run_jobs):
+            # regenerate-gates：與 `_regenerate_gates_action` 同一組 candidate 條件。
+            ledger_jobs = [
+                job
+                for job in run_jobs
+                if job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES
+                and job.get("status") in TERMINAL_JOB_STATUSES
+                and isinstance(job.get("log_path"), str)
+                and job.get("log_path")
+                and Path(job["log_path"]).is_file()
+            ]
+            if ledger_jobs:
+                worktree = ledger_jobs[-1].get("worktree")
+                if isinstance(worktree, str) and Path(worktree).is_dir():
+                    actions.append("regenerate-gates")
 
-    # retry-card：與 `_retry_card_action` 同一組前置驗（含 #569 的 reviewer 卡）。
-    target = _current_workflow_step(run)
-    if target is not None and target.persona == RETRY_CARD_PHASE_PERSONA[run.current_phase]:
-        card_jobs = _retry_card_target_jobs(run, run_jobs, card=target.card)
-        if (
-            card_jobs
-            and card_jobs[-1].get("status") in TERMINAL_JOB_STATUSES
-            and all(job.get("workflow_evidence") is None for job in card_jobs)
-        ):
-            actions.append("retry-card")
+            # retry-card：與 `_retry_card_action` 同一組前置驗（含 #569 的 reviewer 卡）。
+            target = _current_workflow_step(run)
+            if target is not None and target.persona == RETRY_CARD_PHASE_PERSONA[run.current_phase]:
+                card_jobs = _retry_card_target_jobs(run, run_jobs, card=target.card)
+                if (
+                    card_jobs
+                    and card_jobs[-1].get("status") in TERMINAL_JOB_STATUSES
+                    and all(job.get("workflow_evidence") is None for job in card_jobs)
+                ):
+                    actions.append("retry-card")
+
+    reason_code = (
+        run.needs_human_reason.get("reason")
+        if isinstance(getattr(run, "needs_human_reason", None), dict)
+        else str(getattr(run, "needs_human_reason", None) or "")
+    )
+    if reason_code.startswith("copilot-") and "review-attest" not in actions:
+        actions.append("review-attest")
     return tuple(actions)
 
 
@@ -5615,7 +5626,13 @@ def _ship_action(
 
     maintainer_recovery = _recoverable_maintainer_ship_stop(ship=ship, args=args)
     if ship and ship.get("phase") == "needs_human" and not maintainer_recovery:
-        return {"action": "needs_human", "reason": ship.get("reason")}
+        res = {"action": "needs_human", "reason": ship.get("reason")}
+        if str(ship.get("reason", "")).startswith("copilot-"):
+            res["next_actions"] = ["abandon", "review-attest"]
+            res["next_step_hint"] = (
+                f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+            )
+        return res
 
     if ship and ship.get("phase") == "merged":
         expected_head = ship.get("head")
@@ -5994,6 +6011,10 @@ def _ship_action(
             return {
                 "action": "needs_human",
                 "reason": "copilot-finding-budget-exhausted",
+                "next_actions": ["abandon", "review-attest"],
+                "next_step_hint": (
+                    f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+                ),
                 **_repair_budget_status(
                     fix_rounds=fix_rounds,
                     max_fix_rounds=max_fix_rounds,
@@ -6005,20 +6026,56 @@ def _ship_action(
         or previous_head != preflight.head
         or ship.get("phase") not in {"review-requested", "merge-authorized"}
     ):
-        github.request_copilot(repo=authority.repo, pr_number=pr_number)
-        active["ship"] = {
-            "phase": "review-requested",
-            "head": preflight.head,
-            "tree_hash": preflight.tree_hash,
-            "requested_at_epoch": float(now_epoch),
-            "epoch_started_at": float(now_epoch),
-            "fix_rounds": fix_rounds,
-            "pr_number": pr_number,
-            "change": change,
-            "todo_paths": list(todo_paths_value),
-        }
-        _save_runs(state_path, state)
-        return {"action": "awaiting-copilot", "head": preflight.head}
+        adoptable_reviews = [
+            review
+            for review in remote.copilot_reviews
+            if review.commit_id == preflight.head
+            and review.author == COPILOT_REVIEWER_LOGIN
+            and review.state in {"COMMENTED", "APPROVED"}
+            and not review.is_error
+        ]
+        if adoptable_reviews:
+            adopted_review = max(
+                adoptable_reviews,
+                key=lambda value: (value.submitted_at_epoch, value.review_id),
+            )
+            logger.info(
+                "adopted existing Copilot review run_id=%s head=%s review_id=%s submitted_at=%s",
+                canonical_run.run_id,
+                preflight.head,
+                adopted_review.review_id,
+                adopted_review.submitted_at_epoch,
+            )
+            active["ship"] = {
+                "phase": "review-requested",
+                "head": preflight.head,
+                "tree_hash": preflight.tree_hash,
+                "requested_at_epoch": float(adopted_review.submitted_at_epoch),
+                "adopted_review_id": adopted_review.review_id,
+                "adopted_at_epoch": float(now_epoch),
+                "epoch_started_at": float(now_epoch),
+                "fix_rounds": fix_rounds,
+                "pr_number": pr_number,
+                "change": change,
+                "todo_paths": list(todo_paths_value),
+            }
+            _save_runs(state_path, state)
+            ship = active["ship"]
+        else:
+            github.request_copilot(repo=authority.repo, pr_number=pr_number)
+            active["ship"] = {
+                "phase": "review-requested",
+                "head": preflight.head,
+                "tree_hash": preflight.tree_hash,
+                "requested_at_epoch": float(now_epoch),
+                "epoch_started_at": float(now_epoch),
+                "fix_rounds": fix_rounds,
+                "pr_number": pr_number,
+                "change": change,
+                "todo_paths": list(todo_paths_value),
+            }
+            _save_runs(state_path, state)
+            return {"action": "awaiting-copilot", "head": preflight.head}
 
     requested_at = ship.get("requested_at_epoch")
     if (
@@ -6027,6 +6084,16 @@ def _ship_action(
         or not math.isfinite(float(requested_at))
     ):
         raise ValueError("ship review request state malformed")
+    adopted_at_epoch: float | None = None
+    if "adopted_at_epoch" in ship:
+        adopted_at = ship.get("adopted_at_epoch")
+        if (
+            not isinstance(adopted_at, (int, float))
+            or isinstance(adopted_at, bool)
+            or not math.isfinite(float(adopted_at))
+        ):
+            raise ValueError("ship review request state malformed")
+        adopted_at_epoch = float(adopted_at)
     current_reviews = [
         review
         for review in remote.copilot_reviews
@@ -6035,7 +6102,8 @@ def _ship_action(
         and review.submitted_at_epoch >= float(requested_at)
     ]
     if not current_reviews:
-        if float(now_epoch) - float(requested_at) > 15 * 60:
+        timeout_base = adopted_at_epoch if adopted_at_epoch is not None else float(requested_at)
+        if float(now_epoch) - timeout_base > 15 * 60:
             active["ship"] = {**ship, "phase": "needs_human", "reason": "copilot-review-timeout"}
             workflow_registry._manager_update_workflow_run(
                 canonical_run.run_id,
@@ -6052,7 +6120,14 @@ def _ship_action(
                 ),
             )
             _save_runs(state_path, state)
-            return {"action": "needs_human", "reason": "copilot-review-timeout"}
+            return {
+                "action": "needs_human",
+                "reason": "copilot-review-timeout",
+                "next_actions": ["abandon", "review-attest"],
+                "next_step_hint": (
+                    f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+                ),
+            }
         return {"action": "awaiting-copilot", "head": preflight.head}
     review = max(current_reviews, key=lambda value: (value.submitted_at_epoch, value.review_id))
     loop = ReviewLoop(
@@ -6061,6 +6136,7 @@ def _ship_action(
         epoch_started_at=float(ship.get("epoch_started_at", requested_at)),
         requested_at=float(requested_at),
         max_fix_rounds=max_fix_rounds,
+        adopted_at=adopted_at_epoch,
     )
     finding_count = sum(1 for thread in remote.review_threads if thread.blocks_merge)
     findings = [
@@ -6114,7 +6190,13 @@ def _ship_action(
             if copilot.reason == "copilot-finding-budget-exhausted"
             else {}
         )
-        return {"action": "needs_human", "reason": copilot.reason, **extra}
+        res = {"action": "needs_human", "reason": copilot.reason, **extra}
+        if str(copilot.reason or "").startswith("copilot-"):
+            res["next_actions"] = ["abandon", "review-attest"]
+            res["next_step_hint"] = (
+                f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+            )
+        return res
 
     foreign_review = ForeignReviewEvidence(
         path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),

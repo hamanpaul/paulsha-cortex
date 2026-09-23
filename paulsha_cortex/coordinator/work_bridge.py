@@ -1818,6 +1818,39 @@ def _delivery_adapter_status(action: object) -> str:
     return "pending"
 
 
+def _delivery_adapter_adoption_fields(*, state_root: Path, run_id: str) -> dict[str, object]:
+    journal_path = state_root / "delivery-journal.json"
+    if not journal_path.exists():
+        return {}
+    if journal_path.is_symlink() or not journal_path.is_file():
+        raise RuntimeError("delivery journal path is not a regular file")
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("delivery journal payload malformed") from exc
+    if not isinstance(journal, dict):
+        raise RuntimeError("delivery journal payload malformed")
+    runs = journal.get("runs")
+    if not isinstance(runs, dict):
+        raise RuntimeError("delivery journal runs payload malformed")
+    row = runs.get(run_id)
+    if row is None:
+        return {}
+    if not isinstance(row, dict):
+        raise RuntimeError("delivery journal run payload malformed")
+    ship = row.get("ship")
+    if ship is None:
+        return {}
+    if not isinstance(ship, dict):
+        raise RuntimeError("delivery journal ship payload malformed")
+    payload: dict[str, object] = {}
+    for field in ("adopted_review_id", "adopted_at_epoch"):
+        value = ship.get(field)
+        if value is not None:
+            payload[field] = value
+    return payload
+
+
 def build_production_ship_validator(
     *,
     registry,
@@ -2162,6 +2195,10 @@ def build_production_ship_validator(
                 "candidate": candidate,
                 "action": action.get("action"),
                 "pr_number": number,
+                **_delivery_adapter_adoption_fields(
+                    state_root=state_root,
+                    run_id=run.run_id,
+                ),
             },
         )
         result: dict[str, object] = {
