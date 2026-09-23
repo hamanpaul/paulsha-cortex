@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **Refine B2 進度 handoff（2026-09-23）**：新增 `docs/handoffs/2026-09-23-refine-b2-handoff.md`——#819／#946／#849
+  落地與介入紀錄、#862／#948 在飛 run 的接手指令、runtime 與 executor 可用性現況、三支 retry API 的實際判準與
+  收割期修復手順、下一批候選順序。docs-only。
+
 - **#849 execution profile schema core**：新增純 `execution_profile.py` descriptor/profile schema 與
   D4 canonical bytes／versioned profile key、actual-condition key；保留 immutable input／output、
   native effort grammar、unknown fail-closed 與 bounded validation，未接 production routing、
