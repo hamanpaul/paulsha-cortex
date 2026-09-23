@@ -9,8 +9,8 @@ runtime verification, or any downstream B/C/D recovery action.
 
 | Check | Command shape | Exit | Observation |
 | --- | --- | ---: | --- |
-| Focused pytest | `env -u PSC_REPO_ROOT $HOME/prj_pri/paulshaclaw/.venv/bin/python -m pytest tests/test_recovery_registry_receipt_497.py tests/test_planning_completeness.py tests/test_wiring_claim_time_sizing.py tests/test_wiring_yellow_plan_review.py tests/test_workflow_registry.py tests/test_coordinator_registry_headless.py tests/test_registry_released_claimkey_load.py tests/test_registry_decomposition_depth_223.py tests/test_registry_sizing_band.py -q` | 0 | `137 passed, 3 subtests passed` |
-| Pytest gate scope | `env -u PSC_REPO_ROOT $HOME/prj_pri/paulshaclaw/.venv/bin/python -m pytest -q` | 0 | `6234 passed, 44 skipped, 186 subtests passed` |
+| Focused pytest | `env -u PSC_REPO_ROOT $VENV_PYTHON -m pytest tests/test_recovery_registry_receipt_497.py tests/test_planning_completeness.py tests/test_wiring_claim_time_sizing.py tests/test_wiring_yellow_plan_review.py tests/test_workflow_registry.py tests/test_coordinator_registry_headless.py tests/test_registry_released_claimkey_load.py tests/test_registry_decomposition_depth_223.py tests/test_registry_sizing_band.py -q` | 0 | `137 passed, 3 subtests passed` |
+| Pytest gate scope | `env -u PSC_REPO_ROOT $VENV_PYTHON -m pytest -q` | 0 | `6234 passed, 44 skipped, 186 subtests passed` |
 
 ## CLI help smoke
 

@@ -225,6 +225,7 @@ _JOB_CONSUMPTION_VERSION = "cortex/job-consumption/v1"
 _CHECKPOINT_REQUEST_VERSION = "cortex/legacy-binding-checkpoint-request/v1"
 _CHECKPOINT_SNAPSHOT_VERSION = "cortex/legacy-binding-snapshot/v1"
 _CHECKPOINT_RECEIPT_VERSION = "cortex/legacy-binding-checkpoint-receipt/v1"
+_BINDING_HISTORY_FIELD = "_binding_history"
 _RECOVERY_REQUIRED_STEP_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
 _RECOVERY_REQUEST_FIELDS = frozenset({"version", "request_id", "payload", "request_digest"})
 _RECOVERY_REQUEST_PAYLOAD_FIELDS = frozenset(
@@ -1641,10 +1642,11 @@ def _validate_optional_recovery_slice_fields(
     has_binding_revision = "binding_revision" in slice_row
     has_recovery_receipts = "recovery_receipts" in slice_row
     has_checkpoint_receipt = "binding_checkpoint_receipt" in slice_row
+    has_binding_history = _BINDING_HISTORY_FIELD in slice_row
     if has_binding_version != has_binding_revision:
         raise _contract_error("legacy-binding-unversioned", state_path=state_path)
     if not has_binding_version:
-        if has_recovery_receipts or has_checkpoint_receipt:
+        if has_recovery_receipts or has_checkpoint_receipt or has_binding_history:
             raise _contract_error("legacy-binding-unversioned", state_path=state_path)
         return {}
     binding_version = _require_non_empty_string(
@@ -1670,6 +1672,32 @@ def _validate_optional_recovery_slice_fields(
             for item in recovery_receipts
         ],
     }
+    if has_binding_history:
+        binding_history = slice_row.get(_BINDING_HISTORY_FIELD)
+        if not isinstance(binding_history, list):
+            raise _contract_error(
+                "malformed-recovery-context",
+                state_path=state_path,
+                detail=_BINDING_HISTORY_FIELD,
+            )
+        validated_history: list[dict[str, Any]] = []
+        seen_revisions: set[int] = set()
+        for index, snapshot in enumerate(binding_history):
+            normalized_snapshot = _validate_slice_binding_snapshot(
+                snapshot,
+                label=f"slice.{_BINDING_HISTORY_FIELD}[{index}]",
+                state_path=state_path,
+            )
+            revision = int(normalized_snapshot["binding_revision"])
+            if revision >= binding_revision or revision in seen_revisions:
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=state_path,
+                    detail=_BINDING_HISTORY_FIELD,
+                )
+            seen_revisions.add(revision)
+            validated_history.append(normalized_snapshot)
+        validated[_BINDING_HISTORY_FIELD] = validated_history
     if has_checkpoint_receipt:
         validated["binding_checkpoint_receipt"] = _validate_checkpoint_receipt(
             slice_row.get("binding_checkpoint_receipt"),
@@ -1713,6 +1741,11 @@ def _bound_job_ids_for_binding_revision(
     checkpoint = slice_row.get("binding_checkpoint_receipt")
     if isinstance(checkpoint, dict):
         _collect(checkpoint["applied_binding"])
+    binding_history = slice_row.get(_BINDING_HISTORY_FIELD)
+    if isinstance(binding_history, list):
+        for snapshot in binding_history:
+            if isinstance(snapshot, Mapping):
+                _collect(snapshot)
     receipts = slice_row.get("recovery_receipts")
     if isinstance(receipts, list):
         for receipt in receipts:
@@ -2588,7 +2621,9 @@ class JobRegistry:
         raise KeyError(f"slice 不存在: {slice_id}")
 
     def _copy_slice(self, slice_row: dict[str, Any]) -> dict[str, Any]:
-        return _deepcopy_json(slice_row)
+        copied = _deepcopy_json(slice_row)
+        copied.pop(_BINDING_HISTORY_FIELD, None)
+        return copied
 
     def _slice_is_versioned(self, slice_row: Mapping[str, Any]) -> bool:
         return "binding_version" in slice_row and "binding_revision" in slice_row
@@ -2614,6 +2649,15 @@ class JobRegistry:
             return
         current_binding = _slice_binding_from_row(slice_row)
         if force or previous_binding != current_binding:
+            if previous_binding is not None:
+                history = slice_row.setdefault(_BINDING_HISTORY_FIELD, [])
+                if not isinstance(history, list):
+                    raise _contract_error(
+                        "malformed-recovery-context",
+                        state_path=self._state_path,
+                        detail=_BINDING_HISTORY_FIELD,
+                    )
+                history.append(_deepcopy_json(previous_binding))
             slice_row["binding_revision"] = self._next_binding_revision(int(slice_row["binding_revision"]))
 
     def _locate_registry_request_receipt(
@@ -3371,11 +3415,9 @@ class JobRegistry:
         dispatch_base: str | None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
-        next_binding_revision = (
+        previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
+        if previous_binding is not None:
             self._next_binding_revision(int(slice_row["binding_revision"]))
-            if self._slice_is_versioned(slice_row)
-            else None
-        )
         if str(slice_row["state"]) not in REPINNABLE_SLICE_STATES:
             raise ValueError(
                 f"非法 slice state repin: {slice_row['state']!r}"
@@ -3403,8 +3445,7 @@ class JobRegistry:
         slice_row[_CURRENT_VERIFICATION_EVIDENCE_HASH] = None
         slice_row["current_evidence_refs"] = []
         slice_row["current_evaluation_refs"] = []
-        if next_binding_revision is not None:
-            slice_row["binding_revision"] = next_binding_revision
+        self._maybe_bump_binding_revision(slice_row, previous_binding=previous_binding, force=True)
         slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)
@@ -3722,7 +3763,7 @@ class JobRegistry:
         current_verification_evidence_hash: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
-        next_binding_revision: int | None = None
+        previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
 
         # Phase 1 — validate every provided field against the live row
         # *without* mutating anything. #382: the previous validate-then-write
@@ -3772,7 +3813,7 @@ class JobRegistry:
             self._validate_existing_job_ref("builder_job_id", builder_job_id)
         if reviewer_job_id is not None:
             self._validate_existing_job_ref("reviewer_job_id", reviewer_job_id)
-        if self._slice_is_versioned(slice_row):
+        if previous_binding is not None:
             will_bump_binding = (
                 (state is not None and state != slice_row["state"])
                 or (gate_state is not None and gate_state != slice_row["gate_state"])
@@ -3783,7 +3824,7 @@ class JobRegistry:
                 or (target_remote is not None and target_remote != slice_row["target_remote"])
             )
             if will_bump_binding:
-                next_binding_revision = self._next_binding_revision(int(slice_row["binding_revision"]))
+                self._next_binding_revision(int(slice_row["binding_revision"]))
 
         # Phase 2 — everything validated; apply every field together.
         if state is not None:
@@ -3806,8 +3847,7 @@ class JobRegistry:
             slice_row["target_remote"] = target_remote
         if current_verification_evidence_hash is not None:
             slice_row[_CURRENT_VERIFICATION_EVIDENCE_HASH] = current_verification_evidence_hash
-        if next_binding_revision is not None:
-            slice_row["binding_revision"] = next_binding_revision
+        self._maybe_bump_binding_revision(slice_row, previous_binding=previous_binding)
         slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)
@@ -3828,7 +3868,7 @@ class JobRegistry:
         result: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
-        next_binding_revision: int | None = None
+        previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
 
         # Phase 1 — validate every provided field before mutating anything
         # (#382, same rationale as update_slice above): a rejected multi-field
@@ -3863,14 +3903,14 @@ class JobRegistry:
                 new=gate_state,
                 allowed=GATE_STATE_TRANSITIONS,
             )
-        if self._slice_is_versioned(slice_row):
+        if previous_binding is not None:
             will_bump_binding = (
                 (state is not None and state != slice_row["state"])
                 or (gate_state is not None and gate_state != slice_row["gate_state"])
                 or (candidate is not None and candidate != slice_row["candidate"])
             )
             if will_bump_binding:
-                next_binding_revision = self._next_binding_revision(int(slice_row["binding_revision"]))
+                self._next_binding_revision(int(slice_row["binding_revision"]))
 
         # Phase 2 — everything validated; apply every field together, then
         # persist exactly once.
@@ -3890,8 +3930,7 @@ class JobRegistry:
             )
         if candidate is not None:
             slice_row["candidate"] = candidate
-        if next_binding_revision is not None:
-            slice_row["binding_revision"] = next_binding_revision
+        self._maybe_bump_binding_revision(slice_row, previous_binding=previous_binding)
         action_entry: dict[str, Any] = {
             "action": action,
             "actor": actor,

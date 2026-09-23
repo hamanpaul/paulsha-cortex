@@ -1,7 +1,7 @@
 # recovery-registry-receipt Specification
 
 ## Purpose
-TBD - created by archiving change recovery-registry-receipt. Update Purpose after archive.
+讓 `JobRegistry` 對 slice binding 建立 versioned recovery receipt、legacy checkpoint 與 job disposition 契約，讓 pre-candidate recovery、legacy row 起始 checkpoint，以及 builder/reviewer job 的 supersession／consumption 能以 exact CAS、idempotent replay 與 restart-safe durable history 綁定同一個 binding 世代。
 ## Requirements
 ### Requirement: I01 Version 與 legacy truth
 
@@ -133,4 +133,3 @@ Registry MUST 滿足本 child 已審契約：registry-only 原語接收 caller �
 
 - **WHEN** checkpoint 成功後重啟，同 ID 重送，或換新 ID 重 checkpoint，或已有 revision N
 - **THEN** 同 ID 回原 receipt、零寫入；新 ID 因已 versioned 拒絕，revision N 不退回1；仍不得宣稱 fingerprint 追證 legacy 歷史 ABA。
-

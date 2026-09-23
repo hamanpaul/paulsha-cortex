@@ -958,6 +958,86 @@ def test_job_consumption_is_idempotent_and_survives_supersession(tmp_path: Path)
         )
 
 
+def test_job_dispositions_survive_repin_history_and_restart(tmp_path: Path) -> None:
+    registry, builder, _reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
+    old_revision = slice_row["binding_revision"]
+    consumed = registry.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=old_revision,
+        actor="operator",
+        completion_identity={"request_id": "consume-historical", "request_digest": "3" * 64},
+        proof_refs=[_proof_ref("evidence/consume-historical.json", "4" * 64)],
+        at="2026-09-21T08:00:00+00:00",
+    )
+
+    repinned = registry.repin_slice(
+        "slice-a",
+        spec_path="specs/slice-a.md",
+        spec_hash="spec-sha",
+        plan_path="plans/slice-a.md",
+        plan_hash="plan-sha",
+        target_branch="feature/slice-a",
+        target_remote="origin",
+        verification_hash="verification-hash",
+        verification={"docs_class": "code"},
+        dispatch_base="dispatch-base-sha",
+    )
+    assert repinned["binding_revision"] == old_revision + 1
+    assert repinned["builder_job_id"] is None
+    assert repinned["reviewer_job_id"] is None
+    assert "_binding_history" not in repinned
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["slices"][0]["_binding_history"][-1]["binding_revision"] == old_revision
+    assert payload["slices"][0]["_binding_history"][-1]["builder_job_id"] == builder["job_id"]
+
+    replayed_consumption = registry.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=old_revision,
+        actor="operator",
+        completion_identity={"request_id": "consume-historical", "request_digest": "3" * 64},
+        proof_refs=[_proof_ref("evidence/consume-historical.json", "4" * 64)],
+        at="2026-09-21T08:00:00+00:00",
+    )
+    assert replayed_consumption["consumption"] == consumed["consumption"]
+
+    superseded = registry.record_job_supersession(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=old_revision,
+        actor="operator",
+        reason="post-repin-cleanup",
+        superseding_identity={
+            "binding_version": SLICE_BINDING_VERSION,
+            "binding_revision": repinned["binding_revision"],
+            "builder_job_id": repinned["builder_job_id"],
+            "reviewer_job_id": repinned["reviewer_job_id"],
+            "candidate": repinned["candidate"],
+        },
+        at="2026-09-21T08:10:00+00:00",
+    )
+    assert superseded["consumption"] == consumed["consumption"]
+    assert superseded["supersession"]["binding_revision"] == old_revision
+
+    reloaded = JobRegistry(state_path=state_path)
+    restored = reloaded.get_job(builder["job_id"])
+    assert restored["consumption"] == consumed["consumption"]
+    assert restored["supersession"] == superseded["supersession"]
+    replayed_after_restart = reloaded.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=old_revision,
+        actor="operator",
+        completion_identity={"request_id": "consume-historical", "request_digest": "3" * 64},
+        proof_refs=[_proof_ref("evidence/consume-historical.json", "4" * 64)],
+        at="2026-09-21T08:00:00+00:00",
+    )
+    assert replayed_after_restart["consumption"] == consumed["consumption"]
+    assert replayed_after_restart["supersession"] == superseded["supersession"]
+
+
 def test_job_consumption_reload_rejects_wrong_binding_reference(tmp_path: Path) -> None:
     registry, builder, _reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
     registry.record_job_consumption(
