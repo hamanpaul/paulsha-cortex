@@ -34,6 +34,12 @@ Planning runtime 建構時，AGY capability probe 的 `build_agy_argv(...)` 若�
 
 這項邊界不涵蓋直接 launcher 的錯誤吞除：direct `SubprocessLauncher` 仍會讓無效 argv 設定向 caller 傳播，且在 argv 建構失敗後不啟動 Popen。真實非法 timeout env 的 direct／probe 雙路徑驗收仍屬後續 timeout child，不由本 child 冒稱完成。
 
+### Planning 產出目的地綁定（#812）
+
+Planning publication 對 `docs/superpowers/specs`／`docs/superpowers/plans` 現在只接受精確 stem 文法：spec／design 只能是 `<base>-spec.md`／`<base>-design.md`，plan 只能是 `<base>.md`／`<base>-plan.md`。`<base>` 只允許 `work_id`、`YYYY-MM-DD-<work_id>`，或從 `run.openspec_refs` 與同 work item 的 `docs/superpowers/workstreams/<slug>/todo.md` authority 推導出的 planning anchor slug，因此 change slug ≠ work_id 的 canonical 目的地仍可被接受。
+
+combo manifest 既有的 `*<task-slug>*` outputs pattern 仍保留給 `openspec/changes/<change>/...` 使用，但不再單獨放行 `docs/superpowers/{specs,plans}`。這會同時關掉 substring prefix／suffix／middle／`-v2` 家族誤放行，以及「manifest pattern 命中但 kind 寫錯路徑」的 docs publication 入口；authority 重驗也與同一條 exact-stem 判準對齊。
+
 ### Quota observation schema boundary
 
 `paulsha_cortex.coordinator.quota_observation` 是 #866 交付的純 schema／helper
