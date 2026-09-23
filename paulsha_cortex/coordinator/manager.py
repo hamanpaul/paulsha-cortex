@@ -5141,44 +5141,6 @@ def _gate_terminal_stop_diagnostics(
     )
 
 
-def _gate_terminal_stop_detail(
-    raw: Mapping[str, object],
-) -> str:
-    rows: list[str] = []
-    if raw.get("kind") == "workflow-verification-result":
-        summary = raw.get("summary")
-        if isinstance(summary, str) and summary.strip():
-            rows.append(summary.strip())
-        details = raw.get("details")
-        if isinstance(details, dict):
-            for value in details.values():
-                if isinstance(value, str):
-                    text = value.strip()
-                else:
-                    try:
-                        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
-                    except (TypeError, ValueError):
-                        continue
-                if text:
-                    rows.append(text)
-        elif isinstance(details, str) and details.strip():
-            rows.append(details.strip())
-    else:
-        reason = raw.get("reason")
-        if isinstance(reason, str) and reason.strip():
-            rows.append(reason.strip())
-        findings = raw.get("findings")
-        if isinstance(findings, list):
-            for item in findings:
-                try:
-                    text = json.dumps(item, ensure_ascii=False, sort_keys=True)
-                except (TypeError, ValueError):
-                    continue
-                if text:
-                    rows.append(text)
-    return "；".join(rows)
-
-
 # #261 R2：會實際跑確定性 gate 的 phase。這些 phase 的 `passed` 必須有 manager 獨立
 # 產生的 gate ledger 背書；plan card 不改動 candidate、不跑 gate，故不在此列。
 # #313：verify 亦不在此列——verification 卡以 review-only 沙箱啟動，
@@ -12172,6 +12134,7 @@ def resume_workflow_run(
         diagnostics = _gate_terminal_stop_diagnostics(job, raw_explicit_stop)
         declared_status = str(raw_explicit_stop["status"])
         label = "verification" if step.phase == "verify" else "review"
+        model_text = diagnostics.model_diagnostics_text()
         reason_code = (
             "verification-terminal-explicit-stop"
             if step.phase == "verify"
@@ -12221,7 +12184,7 @@ def resume_workflow_run(
             needs_human_reason=diagnostic_reason(
                 reason_code,
                 f"{label} terminal 明示要求停止（status={declared_status}）："
-                f"{_gate_terminal_stop_detail(raw_explicit_stop)}",
+                f"{model_text}",
                 source="manager._poll_workflow_job:explicit-stop",
                 evidence_refs=evidence_refs,
                 run_id=run.run_id,

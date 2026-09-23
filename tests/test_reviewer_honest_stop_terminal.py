@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from paulsha_cortex.coordinator import manager, manager_daemon
+from paulsha_cortex.coordinator.diagnostics import DIAGNOSTIC_DETAIL_MAX_LENGTH
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority, WorkflowStep
@@ -321,6 +322,24 @@ def _explicit_stop_gate_terminal(job: dict[str, object]) -> dict[str, object] | 
     return predicate(job)
 
 
+def _diagnostics_text(rows: dict[str, str]) -> str:
+    return "；".join(f"{key}={value}" for key, value in rows.items())
+
+
+def _expected_attention_detail(
+    label: str,
+    status: str,
+    model_diagnostics: dict[str, str],
+) -> str:
+    detail = (
+        f"{label} terminal 明示要求停止（status={status}）："
+        f"{_diagnostics_text(model_diagnostics)}"
+    )
+    if len(detail) > DIAGNOSTIC_DETAIL_MAX_LENGTH:
+        return detail[:DIAGNOSTIC_DETAIL_MAX_LENGTH].rstrip() + "…"
+    return detail
+
+
 @pytest.mark.parametrize(
     ("executor", "model_id", "independence_domain", "writer"),
     (
@@ -361,11 +380,11 @@ def test_verify_needs_human_terminal_becomes_explicit_stop_attention(
     assert "needs_human" in persisted.facets
     reason = dict(persisted.needs_human_reason)
     assert reason["reason"] == "verification-terminal-explicit-stop"
-    assert VERIFY_SUMMARY in reason["detail"]
-    assert VERIFY_HOST_PREFLIGHT_STATUS in reason["detail"]
-    assert VERIFY_SANDBOX_LIMITATIONS in reason["detail"]
-    assert reason["evidence_refs"] == [str(log_path)]
     diagnostics = result["terminal_diagnostics"]
+    assert reason["detail"] == _expected_attention_detail(
+        "verification", "needs_human", diagnostics["model_diagnostics"]
+    )
+    assert reason["evidence_refs"] == [str(log_path)]
     assert diagnostics["reason"] == (
         "workflow verification terminal reported non-passing status: needs_human"
     )
@@ -410,8 +429,9 @@ def test_verify_failed_string_details_and_empty_reports_become_explicit_stop(
     assert result["terminal_diagnostics"]["model_diagnostics"]["details"] == VERIFY_FAILED_DETAILS
     reason = dict(registry.get_workflow_run(run.run_id).needs_human_reason)
     assert reason["reason"] == "verification-terminal-explicit-stop"
-    assert VERIFY_FAILED_SUMMARY in reason["detail"]
-    assert VERIFY_FAILED_DETAILS in reason["detail"]
+    assert reason["detail"] == _expected_attention_detail(
+        "verification", "failed", result["terminal_diagnostics"]["model_diagnostics"]
+    )
     assert reason["evidence_refs"] == [str(log_path)]
 
 
@@ -445,8 +465,9 @@ def test_review_failed_terminal_becomes_explicit_stop(
     assert diagnostics["authority_granted"] is False
     reason = dict(registry.get_workflow_run(run.run_id).needs_human_reason)
     assert reason["reason"] == "review-terminal-explicit-stop"
-    assert REVIEW_FAILED_REASON in reason["detail"]
-    assert REVIEW_BLOCKING_FINDING["summary"] in reason["detail"]
+    assert reason["detail"] == _expected_attention_detail(
+        "review", "failed", diagnostics["model_diagnostics"]
+    )
     assert reason["evidence_refs"] == [str(log_path)]
 
 
