@@ -1073,7 +1073,10 @@ def workflow_status_entry(
         run_id=getattr(run, "run_id", None),
     )
     try:
-        from .work_actions import _phase_recovery_actions
+        from .work_actions import (
+            _phase_recovery_actions,
+            blocking_findings_next_step_hint,
+        )
 
         next_actions = (
             *next_actions,
@@ -1083,6 +1086,16 @@ def workflow_status_entry(
                 if item not in next_actions
             ),
         )
+        if (
+            persisted_next_step_hint is None
+            and reason_code == "blocking-findings"
+            and "retry-review" in next_actions
+        ):
+            next_step_hint = blocking_findings_next_step_hint(
+                work_id=getattr(run, "work_id", None),
+                repo=getattr(run, "repo", None),
+                candidate=getattr(run, "candidate_head", None),
+            )
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         pass
     try:
@@ -9791,6 +9804,18 @@ OPERATOR_ADJUDICATION_REVIEWER_DIRECTIVE = _OPERATOR_ADJUDICATION_PREAMBLE + (
     "criterion for the candidate—report any ruling the candidate leaves unaddressed as a "
     "blocking finding that names the ruling, and do not accept the candidate on the strength "
     "of findings the operator has already overruled."
+) + (
+    " When a ruling explicitly accepts or waives a specific finding or deviation, do not "
+    "report that finding again under a blocking category ("
+    + ", ".join(sorted(foreign_review.BLOCKING_FINDING_CATEGORIES))
+    + "); if you still record it, use a non-blocking category ("
+    + ", ".join(
+        sorted(
+            foreign_review.VALID_FINDING_CATEGORIES
+            - foreign_review.BLOCKING_FINDING_CATEGORIES
+        )
+    )
+    + ") and cite the ruling in its recommendation."
 )
 RETRY_CONTEXT_MESSAGE_LIMIT = 600
 

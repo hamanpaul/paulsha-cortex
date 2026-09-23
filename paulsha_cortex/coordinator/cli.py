@@ -232,8 +232,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument(
         "--reason",
         help=(
-            "abandon／retire-delivered／recover-superseded／reset-reclaim-budget／"
-            "refreeze-base 的單行審計理由（最多 500 字）"
+            "retry-build／retry-card／retry-review：operator 裁決，最多 4000 字；全文落成 "
+            "operator-adjudication evidence，前 2000 字注入後續 dispatch prompt。 "
+            "abandon／retire-delivered／recover-superseded／reset-reclaim-budget／refreeze-base："
+            "單行審計理由，最多 500 字。"
         ),
     )
     p_work.add_argument(

@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **#956 review gate operator 裁決出口**：`retry-review --reason` 接受裁決並保存完整 immutable evidence，後續 reviewer prompt 注入前 2000 字；`blocking-findings` attention／resume 顯示可行的 `retry-review`／`retry-build` 出口與指令提示，`review-attest` 對 rejected review gate fail closed。同步補上 reviewer directive、coordinator CLI help 與 lifecycle 文件。
+
 - **Refine 0.1.11 定版進件（第二批）**：為 #479、#481、#810、#871 新增 accepted
   spec／design／todo 與 work item 綁定，供後續 Cortex 分票派工；產品實作仍待正式驗收。
 - **Refine 0.1.11 定版進件（第一批）**：新增接手與驗收表，並為 #579、#812、#874、#956

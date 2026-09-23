@@ -1317,6 +1317,14 @@ def _review_attest_action(
         authority=authority,
     )
     _validate_current_run_authority(active, authority, run)
+    if any(
+        step.phase == "review" and step.gate_result == "needs_human"
+        for step in run.steps
+    ):
+        raise RuntimeError(
+            "review-attest does not adjudicate review-gate blocking findings; "
+            "use retry-review --reason to accept or retry-build --reason to reject"
+        )
     foreign = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]
     change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
     if (
@@ -2174,7 +2182,19 @@ def _claim_action(
         ]
         if extra:
             response["next_actions"] = [*response.get("next_actions", []), *extra]
-            if "review-attest" in extra and authority is not None:
+            reason_payload = canonical_run.needs_human_reason
+            reason_code = (
+                reason_payload.get("reason")
+                if isinstance(reason_payload, dict)
+                else None
+            )
+            if "retry-review" in extra and reason_code == "blocking-findings":
+                response["next_step_hint"] = blocking_findings_next_step_hint(
+                    work_id=canonical_run.work_id,
+                    repo=canonical_run.repo,
+                    candidate=canonical_run.candidate_head,
+                )
+            elif "review-attest" in extra and authority is not None:
                 response["next_step_hint"] = (
                     f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
                 )
@@ -2519,6 +2539,89 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
     }
 
 
+def _blocking_findings_recovery_actions(run) -> tuple[str, ...]:
+    """Return only blocking-findings exits whose reset preconditions are met."""
+
+    reason_payload = getattr(run, "needs_human_reason", None)
+    reason_code = (
+        reason_payload.get("reason")
+        if isinstance(reason_payload, dict)
+        else str(reason_payload or "")
+    )
+    if (
+        getattr(run, "current_phase", None) != "review"
+        or getattr(run, "status", None) != "ongoing"
+        or "needs_human" not in getattr(run, "facets", ())
+        or reason_code != "blocking-findings"
+    ):
+        return ()
+
+    actions: list[str] = []
+    candidate = getattr(run, "candidate_head", None)
+    verify_steps = [step for step in run.steps if step.phase == "verify"]
+    if (
+        isinstance(candidate, str)
+        and candidate == getattr(run, "verified_head", None)
+        and any(item.kind == "plan" for item in run.planning_authority)
+        and verify_steps
+        and all(step.gate_result == "passed" for step in verify_steps)
+    ):
+        actions.append("retry-review")
+
+    build_steps = [step for step in run.steps if step.phase == "build"]
+    passed_ship_steps = [
+        step
+        for step in run.steps
+        if step.phase == "ship" and step.gate_result == "passed"
+    ]
+    if (
+        isinstance(candidate, str)
+        and build_steps
+        and all(step.gate_result == "passed" for step in build_steps)
+        and len(passed_ship_steps) <= 1
+        and all(
+            step.card == "openspec-archive"
+            and step.executor == "cortex-manager"
+            and step.model == "deterministic"
+            and step.domain == "cortex"
+            for step in passed_ship_steps
+        )
+    ):
+        actions.append("retry-build")
+    return tuple(actions)
+
+
+def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
+    """Format the two operator exits for a blocking review finding."""
+
+    work_value = (
+        work_id
+        if isinstance(work_id, str)
+        and re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id)
+        else "<work-id>"
+    )
+    repo_value = (
+        repo
+        if isinstance(repo, str)
+        and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+        else "<owner/repo>"
+    )
+    candidate_value = (
+        candidate
+        if isinstance(candidate, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", candidate)
+        else "<candidate-sha>"
+    )
+    prefix = f"cortex run work {{action}} {work_value} --repo {repo_value} --expected-candidate {candidate_value} --actor <operator> --reason '<裁決>'"
+    return (
+        "接受 finding：`"
+        + prefix.format(action="retry-review")
+        + "`\n駁回 finding：`"
+        + prefix.format(action="retry-build")
+        + "`\n兩者都不適用時才執行 `abandon`。"
+    )
+
+
 def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
     """#546（部分）：run 停在 needs_human 時真的可用的 recovery 動作。
 
@@ -2539,6 +2642,12 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
     宣告更糟——這是 #382 已經付過學費的教訓。
     """
 
+    reason_code = (
+        run.needs_human_reason.get("reason")
+        if isinstance(getattr(run, "needs_human_reason", None), dict)
+        else str(getattr(run, "needs_human_reason", None) or "")
+    )
+
     from .manager import _current_workflow_step
     from .manager import GATE_LEDGER_REQUIRED_PHASES
     from .registry import (
@@ -2557,8 +2666,10 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
 
     actions: list[str] = []
     if run.current_phase in RETRY_CARD_PHASE_PERSONA:
+        jobs_readable = False
         try:
             jobs = list(workflow_registry.list_jobs())
+            jobs_readable = True
         except Exception:  # pragma: no cover - 曝光面不得因讀取失敗而讓 resume 死掉
             jobs = []
         run_jobs = [job for job in jobs if job.get("workflow_run_id") == run.run_id]
@@ -2589,11 +2700,13 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
                 ):
                     actions.append("retry-card")
 
-    reason_code = (
-        run.needs_human_reason.get("reason")
-        if isinstance(getattr(run, "needs_human_reason", None), dict)
-        else str(getattr(run, "needs_human_reason", None) or "")
-    )
+            if jobs_readable:
+                actions.extend(
+                    action
+                    for action in _blocking_findings_recovery_actions(run)
+                    if action not in actions
+                )
+
     if reason_code.startswith("copilot-") and "review-attest" not in actions:
         actions.append("review-attest")
     return tuple(actions)
@@ -2864,7 +2977,14 @@ def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) 
     }
 
 
-def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+def _retry_review_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    workflow_registry,
+    state_path: Path | None = None,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
     """Relaunch foreign review only for the exact verified Candidate（#216 AC3）。
 
     build／verify phase 完全不動：不重跑 builder、不重建 candidate。若 run 缺少
@@ -2873,10 +2993,13 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
     """
 
     extras = set(args) - {
-        "action", "repo", "work_id", "issue", "actor", "expected_candidate",
+        "action", "repo", "work_id", "issue", "actor", "expected_candidate", "reason",
     }
     if extras:
         raise ValueError(f"retry-review rejects caller evidence/input: {sorted(extras)[0]}")
+    _validate_operator_adjudication_args(
+        args, state_path=state_path, action="retry-review"
+    )
     expected_candidate = args.get("expected_candidate")
     if (
         not isinstance(expected_candidate, str)
@@ -2912,6 +3035,17 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
         raise RuntimeError("retry-review expected Candidate CAS mismatch")
     if not any(item.kind == "plan" for item in run.planning_authority):
         raise RuntimeError("retry-review requires frozen plan authority pre-dispatch")
+    from .manager import _current_workflow_step
+
+    target = _current_workflow_step(run)
+    card = (
+        target.card
+        if target is not None
+        else next(
+            (step.card for step in reversed(run.steps) if step.phase == "review"),
+            "review",
+        )
+    )
     # 重跑 review 本身即是 review 交接修復：candidate 未變，不是 model repair。
     retry_classification = _classify_retry(
         run, workflow_registry, trigger="review-handoff-failure"
@@ -2922,8 +3056,17 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
         retry_classification=retry_classification.value,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
+    adjudication_evidence = _record_operator_adjudication(
+        run=run,
+        card=card,
+        args=args,
+        state_path=state_path,
+        now_epoch=now_epoch,
+    )
     return {
         "action": "retry-review",
+        "adjudication_evidence": adjudication_evidence,
+        "adjudication": operator_adjudication_receipt(adjudication_evidence, card=card),
         "reason": "foreign-review-rerun-dispatched",
         "expected_candidate": expected_candidate.lower(),
         "run": updated.to_dict(),
@@ -6403,6 +6546,8 @@ def execute_work_action(
             args=args,
             authority=authority,
             workflow_registry=workflow_registry,
+            state_path=resolved_state_path,
+            now_epoch=now_epoch,
         )
     elif action == "recover-planning":
         result = _recover_planning_action(
