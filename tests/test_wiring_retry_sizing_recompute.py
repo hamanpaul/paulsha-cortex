@@ -74,6 +74,23 @@ def _init_repo(root: Path, repo: str = "acme/demo") -> Path:
     return root
 
 
+def _commit_candidate(root: Path) -> str:
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(root), "-c", "user.name=Tests", "-c",
+            "user.email=tests@example.invalid", "commit", "-qm", "fixture candidate",
+        ],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def _write_planning_docs(root: Path, *, declare_sizing_dimensions: bool) -> tuple[PlanningArtifactAuthority, ...]:
     base = root / "openspec/changes/demo"
     base.mkdir(parents=True, exist_ok=True)
@@ -190,6 +207,7 @@ def test_retry_build_recomputes_sizing_on_success(tmp_path: Path) -> None:
     claim_key = work_actions._expected_claim_key(authority)
     repo = _init_repo(tmp_path / "repo")
     planning_authority = _write_planning_docs(repo, declare_sizing_dimensions=True)
+    candidate = _commit_candidate(repo)
     steps = _base_steps(verify_result="passed", review_result="passed")
     _make_run(
         registry,
@@ -198,8 +216,8 @@ def test_retry_build_recomputes_sizing_on_success(tmp_path: Path) -> None:
         current_phase="review",
         steps=steps,
         workspace_root=repo,
-        candidate_head=HEAD,
-        verified_head=HEAD,
+        candidate_head=candidate,
+        verified_head=candidate,
         facets=("needs_human",),
         planning_authority=planning_authority,
         sizing_score=2,
@@ -213,7 +231,7 @@ def test_retry_build_recomputes_sizing_on_success(tmp_path: Path) -> None:
             "work_id": "demo",
             "issue": 12,
             "actor": "operator",
-            "expected_candidate": HEAD,
+            "expected_candidate": candidate,
         },
         requested_by="operator",
         snapshot_path=snapshot,
@@ -241,6 +259,7 @@ def test_retry_build_fails_soft_and_leaves_stale_sizing_when_recompute_unavailab
     repo = _init_repo(tmp_path / "repo")
     # 舊 plan：沒有宣告 domain_breadth/state_consistency（#221 之前的 plan）。
     planning_authority = _write_planning_docs(repo, declare_sizing_dimensions=False)
+    candidate = _commit_candidate(repo)
     steps = _base_steps(verify_result="passed", review_result="passed")
     _make_run(
         registry,
@@ -249,8 +268,8 @@ def test_retry_build_fails_soft_and_leaves_stale_sizing_when_recompute_unavailab
         current_phase="review",
         steps=steps,
         workspace_root=repo,
-        candidate_head=HEAD,
-        verified_head=HEAD,
+        candidate_head=candidate,
+        verified_head=candidate,
         facets=("needs_human",),
         planning_authority=planning_authority,
         sizing_score=2,
@@ -264,7 +283,7 @@ def test_retry_build_fails_soft_and_leaves_stale_sizing_when_recompute_unavailab
             "work_id": "demo",
             "issue": 12,
             "actor": "operator",
-            "expected_candidate": HEAD,
+            "expected_candidate": candidate,
         },
         requested_by="operator",
         snapshot_path=snapshot,

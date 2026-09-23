@@ -2528,7 +2528,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         registry=workflow_registry,
     )
     warnings: list[dict[str, object]] = []
-    if len(authority.mapped_openspec) == 1 and archive_applied:
+    if len(authority.mapped_openspec) == 1:
         change = authority.mapped_openspec[0]
         archive_entries = _candidate_tree_matching_archive_entries(
             workspace_root=Path(str(run.workspace_root)),

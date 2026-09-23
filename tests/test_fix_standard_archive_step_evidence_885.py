@@ -598,6 +598,77 @@ def test_retry_build_warns_on_active_archive_coexistence_in_exact_candidate_tree
     assert "pre-archive work" not in action
 
 
+def test_retry_build_warns_on_coexistence_when_archive_jobs_are_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, _initial = _repo(
+        tmp_path / "retry-build-ambiguous-warning-repo",
+        active_change=True,
+        archived_change=False,
+    )
+    candidate = _coexisting_candidate_commit(repo)
+    shutil.rmtree(repo / "openspec" / "changes" / "archive")
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _create_fix_standard_run(
+        registry=registry,
+        repo_root=repo,
+        snapshot=snapshot,
+        candidate=candidate,
+        facets=("needs_human",),
+        gate_status="failed",
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=tmp_path / "state",
+        run=run,
+        repo=repo,
+        card="openspec-archive",
+        subject_head=candidate,
+    )
+    archive_job = next(
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_card") == "openspec-archive"
+    )
+    original_list_jobs = registry.list_jobs
+    monkeypatch.setattr(
+        registry,
+        "list_jobs",
+        lambda: original_list_jobs()
+        + [{**archive_job, "job_id": "ambiguous-archive-job"}],
+    )
+
+    assert manager._manager_archive_applied(run, registry=registry) is False
+    result = work_actions.execute_work_action(
+        args={
+            "action": "retry-build",
+            "repo": REPO,
+            "work_id": WORK_ID,
+            "issue": 14,
+            "actor": "operator",
+            "expected_candidate": candidate,
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["reason"] == "candidate-repair-dispatched"
+    assert result["result"]["warnings"] == [
+        {
+            "change": WORK_ID,
+            "archive_entries": ["2026-09-14-work"],
+            "message": (
+                "exact Candidate tree contains both the active OpenSpec change and its "
+                "official archive entry; fix the coexistence before the next review"
+            ),
+        }
+    ]
+
+
 def test_retry_build_ignores_dirty_worktree_when_exact_candidate_tree_is_clean(
     tmp_path: Path,
 ) -> None:
