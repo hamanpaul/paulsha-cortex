@@ -1420,3 +1420,39 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/registry-revision-cas-design.md'
     excludes: []
+  authorized-merged-run-proof-admission:
+    title: 'authorized-merged-run-proof-admission'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#975'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/authorized-merged-run-proof-admission/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/authorized-merged-run-proof-admission-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/authorized-merged-run-proof-admission-design.md'
+    excludes: []
+  merged-verify-registry-transition:
+    title: 'merged-verify-registry-transition'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#976'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/merged-verify-registry-transition/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/merged-verify-registry-transition-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/merged-verify-registry-transition-design.md'
+    excludes: []
+  delivery-journal-conditional-commit:
+    title: 'delivery-journal-conditional-commit'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#983'
+      - kind: path
+        ref: 'docs/superpowers/plans/delivery-journal-conditional-commit.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/delivery-journal-conditional-commit-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/delivery-journal-conditional-commit-design.md'
+    excludes: []

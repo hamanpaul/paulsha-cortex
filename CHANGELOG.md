@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 - **preflight visudo 測試環境**：sudoers 整合測試將系統 sbin 加入個別測試的 PATH，避免 #862 exact-Candidate preflight 因 service PATH 差異誤判失敗。
+- **Refine 0.1.11 子票進件（第三批）**：為 #975、#976、#983 發布已審核的 accepted 規劃與 work item；#975／#976 的合併 run closure 與 #983 的 delivery journal 條件寫入仍待各自前置及產品實作驗收。
 - **Refine 0.1.11 Registry CAS 進件**：為 #966 新增 accepted spec／design／todo 與唯一 work item，作為 #818 多進程寫入防護的第一階段；產品實作與 #967 owner lock 仍待獨立驗收。
 - **Refine 0.1.11 子票進件**：為 #961 發布已審核的 accepted 規劃與唯一 work item，更新 #887／#847／#818／#547／#943 的拆票依賴與定版執行表；產品實作與發版仍待各自驗收。
 - **Refine 0.1.11 定版進件（第三批）**：為 #885 新增 accepted spec／design／todo 與唯一 work item 綁定；archive 修復仍待產品實作與驗收。
