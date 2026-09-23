@@ -19,7 +19,7 @@ artifact_classes:
 - 明確不做：不改 `registry.py`（不在 `_manager_reset_workflow_after_archive` 插入 step）、不改 combo YAML／deck compile、不改 `_planning_artifact_relative_path_after_archive`（fix-standard post-archive 無消費端解析 openspec planning ref，見 design D3）、不改 `work_actions._ship_action` 直接路徑的 archive 呼叫、不拒絕已偵測到並存候選的 `retry-build`（它是唯一修復出口；R3 派工並回報 warning，R6 作 ship 段 backstop，見 design D5）、不修 pre-fix 殘留兩筆 archive job 的 run；不處理 #876、#953、#887、#808、#847。
 - spec／design／本 todo 文字是 pinned authority：只准把 `[ ]` 翻成 `[x]`，不得改寫任何其他文字；澄清寫進 terminal reason。
 - 留在 Manager checkout 的分支上工作，不得另建 `wt/...` 分支。
-- 不得 commit 或刪除 `docs/superpowers/plans/fix-standard-archive-step-evidence.md`。
+- Cortex intake 若產生 `docs/superpowers/plans/fix-standard-archive-step-evidence.md`，該 Manager 工作檔不得由產品實作 PR commit 或刪除；進件時 repo 不要求預先存在此檔。
 - tests 與 docs 不得 hard-code `openspec/changes/<change>/` 路徑（本 work item 自己的 active change 會被 Manager archive 搬走）；測試在 `tmp_path` 內自建的 fixture change（如既有 harness 的 `work`）不在此限。
 
 ## 現場證據
