@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+- **#874 verify/review 誠實 non-passing terminal 落 needs_human 明示停止**：`resume_workflow_run`
+  現在會把 verify/review 合法的 `failed`／`needs_human` terminal 直接落成
+  `verification-terminal-explicit-stop`／`review-terminal-explicit-stop`，保留模型原文與
+  job log evidence ref，不再包成 `terminalize-workflow-job-failed`／`resume-workflow-failed`。
+  periodic runner 不自動重派；explicit resume 也只會重落同一個停止，實際重派出口仍是
+  `retry-card`／`retry-build`。
+
 - **Refine 0.1.11 定版進件（第二批）**：為 #479、#481、#810、#871 新增 accepted
   spec／design／todo 與 work item 綁定，供後續 Cortex 分票派工；產品實作仍待正式驗收。
 - **Refine 0.1.11 定版進件（第一批）**：新增接手與驗收表，並為 #579、#812、#874、#956
