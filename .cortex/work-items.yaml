@@ -1336,3 +1336,51 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/maintainer-fallback-authorization-v2-design.md'
     excludes: []
+  reviewer-sandbox-job-scoped-name:
+    title: 'reviewer-sandbox-job-scoped-name'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#579'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/reviewer-sandbox-job-scoped-name/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/reviewer-sandbox-job-scoped-name-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/reviewer-sandbox-job-scoped-name-design.md'
+    excludes: []
+  planning-kind-bound-exact-match:
+    title: 'planning-kind-bound-exact-match'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#812'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/planning-kind-bound-exact-match/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/planning-kind-bound-exact-match-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/planning-kind-bound-exact-match-design.md'
+    excludes: []
+  reviewer-honest-stop-terminal:
+    title: 'reviewer-honest-stop-terminal'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#874'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/reviewer-honest-stop-terminal/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/reviewer-honest-stop-terminal-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/reviewer-honest-stop-terminal-design.md'
+    excludes: []
+  review-gate-adjudication-exit:
+    title: 'review-gate-adjudication-exit'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#956'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/review-gate-adjudication-exit/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/review-gate-adjudication-exit-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/review-gate-adjudication-exit-design.md'
+    excludes: []
