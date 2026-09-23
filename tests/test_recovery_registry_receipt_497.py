@@ -600,6 +600,7 @@ def test_commit_pre_candidate_recovery_supersedes_jobs_and_is_idempotent(tmp_pat
         assert job["supersession"]["version"] == JOB_SUPERSESSION_VERSION
         assert job["supersession"]["slice_id"] == "slice-a"
         assert job["supersession"]["binding_revision"] == slice_row["binding_revision"]
+        assert job["supersession"]["bound_binding"] == _binding_snapshot(slice_row)
         assert job["supersession"]["reason"] == "recover-pre-candidate"
         assert job["supersession"]["superseding_identity"] == {
             "request_id": request["request_id"],
@@ -884,6 +885,7 @@ def test_job_consumption_is_idempotent_and_survives_supersession(tmp_path: Path)
         at="2026-09-21T08:00:00+00:00",
     )
     assert consumed["consumption"]["version"] == JOB_CONSUMPTION_VERSION
+    assert consumed["consumption"]["bound_binding"] == _binding_snapshot(slice_row)
     assert consumed["consumption"]["proof_refs"] == [_proof_ref("evidence/consume.json", "6" * 64)]
 
     replayed = registry.record_job_consumption(
@@ -908,6 +910,7 @@ def test_job_consumption_is_idempotent_and_survives_supersession(tmp_path: Path)
     )
     assert updated["consumption"]["version"] == JOB_CONSUMPTION_VERSION
     assert updated["supersession"]["version"] == JOB_SUPERSESSION_VERSION
+    assert updated["supersession"]["bound_binding"] == _binding_snapshot(slice_row)
 
     with pytest.raises(ValueError, match="request-content-conflict"):
         registry.record_job_consumption(
@@ -958,7 +961,9 @@ def test_job_consumption_is_idempotent_and_survives_supersession(tmp_path: Path)
         )
 
 
-def test_job_dispositions_survive_repin_history_and_restart(tmp_path: Path) -> None:
+def test_job_dispositions_survive_binding_revision_drift_and_restart_without_extra_slice_fields(
+    tmp_path: Path,
+) -> None:
     registry, builder, _reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
     old_revision = slice_row["binding_revision"]
     consumed = registry.record_job_consumption(
@@ -986,11 +991,11 @@ def test_job_dispositions_survive_repin_history_and_restart(tmp_path: Path) -> N
     assert repinned["binding_revision"] == old_revision + 1
     assert repinned["builder_job_id"] is None
     assert repinned["reviewer_job_id"] is None
-    assert "_binding_history" not in repinned
 
     payload = json.loads(state_path.read_text(encoding="utf-8"))
-    assert payload["slices"][0]["_binding_history"][-1]["binding_revision"] == old_revision
-    assert payload["slices"][0]["_binding_history"][-1]["builder_job_id"] == builder["job_id"]
+    builder_row = next(job for job in payload["jobs"] if job["job_id"] == builder["job_id"])
+    assert "_binding_history" not in payload["slices"][0]
+    assert builder_row["consumption"]["bound_binding"] == _binding_snapshot(slice_row)
 
     replayed_consumption = registry.record_job_consumption(
         builder["job_id"],
@@ -1020,6 +1025,7 @@ def test_job_dispositions_survive_repin_history_and_restart(tmp_path: Path) -> N
     )
     assert superseded["consumption"] == consumed["consumption"]
     assert superseded["supersession"]["binding_revision"] == old_revision
+    assert superseded["supersession"]["bound_binding"] == consumed["consumption"]["bound_binding"]
 
     reloaded = JobRegistry(state_path=state_path)
     restored = reloaded.get_job(builder["job_id"])
@@ -1036,6 +1042,42 @@ def test_job_dispositions_survive_repin_history_and_restart(tmp_path: Path) -> N
     )
     assert replayed_after_restart["consumption"] == consumed["consumption"]
     assert replayed_after_restart["supersession"] == superseded["supersession"]
+
+
+def test_recovery_supersession_allows_consumption_after_binding_revision_drift_and_restart(
+    tmp_path: Path,
+) -> None:
+    registry, builder, _reviewer, slice_row, state_path = _create_bound_slice(tmp_path)
+    request = _recovery_request(slice_row)
+    registry.prepare_recovery("slice-a", request=request)
+    registry.commit_pre_candidate_recovery("slice-a", request=request, step_receipts=_step_receipts())
+
+    consumed = registry.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=slice_row["binding_revision"],
+        actor="operator",
+        completion_identity={"request_id": "consume-after-recovery", "request_digest": "8" * 64},
+        proof_refs=[_proof_ref("evidence/consume-after-recovery.json", "9" * 64)],
+        at="2026-09-21T08:20:00+00:00",
+    )
+
+    assert consumed["supersession"]["bound_binding"] == _binding_snapshot(slice_row)
+    assert consumed["consumption"]["bound_binding"] == _binding_snapshot(slice_row)
+
+    reloaded = JobRegistry(state_path=state_path)
+    replayed = reloaded.record_job_consumption(
+        builder["job_id"],
+        slice_id="slice-a",
+        binding_revision=slice_row["binding_revision"],
+        actor="operator",
+        completion_identity={"request_id": "consume-after-recovery", "request_digest": "8" * 64},
+        proof_refs=[_proof_ref("evidence/consume-after-recovery.json", "9" * 64)],
+        at="2026-09-21T08:20:00+00:00",
+    )
+
+    assert replayed["supersession"] == consumed["supersession"]
+    assert replayed["consumption"] == consumed["consumption"]
 
 
 def test_job_consumption_reload_rejects_wrong_binding_reference(tmp_path: Path) -> None:

@@ -225,7 +225,7 @@ _JOB_CONSUMPTION_VERSION = "cortex/job-consumption/v1"
 _CHECKPOINT_REQUEST_VERSION = "cortex/legacy-binding-checkpoint-request/v1"
 _CHECKPOINT_SNAPSHOT_VERSION = "cortex/legacy-binding-snapshot/v1"
 _CHECKPOINT_RECEIPT_VERSION = "cortex/legacy-binding-checkpoint-receipt/v1"
-_BINDING_HISTORY_FIELD = "_binding_history"
+_BOUND_BINDING_FIELD = "bound_binding"
 _RECOVERY_REQUIRED_STEP_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
 _RECOVERY_REQUEST_FIELDS = frozenset({"version", "request_id", "payload", "request_digest"})
 _RECOVERY_REQUEST_PAYLOAD_FIELDS = frozenset(
@@ -286,6 +286,7 @@ _JOB_SUPERSESSION_FIELDS = frozenset(
         "at",
         "reason",
         "superseding_identity",
+        _BOUND_BINDING_FIELD,
     }
 )
 _JOB_CONSUMPTION_FIELDS = frozenset(
@@ -298,6 +299,7 @@ _JOB_CONSUMPTION_FIELDS = frozenset(
         "at",
         "completion_identity",
         "proof_refs",
+        _BOUND_BINDING_FIELD,
     }
 )
 _CHECKPOINT_REQUEST_FIELDS = frozenset({"version", "request_id", "payload", "request_digest"})
@@ -1500,23 +1502,25 @@ def _validate_job_supersession(
     )
     if version != _JOB_SUPERSESSION_VERSION:
         raise _contract_error("unsupported-recovery-version", state_path=state_path)
-    return {
+    job_id = _require_non_empty_string(
+        supersession.get("job_id"),
+        label="job supersession.job_id",
+        state_path=state_path,
+    )
+    binding_revision = _require_safe_integer(
+        supersession.get("binding_revision"),
+        label="job supersession.binding_revision",
+        state_path=state_path,
+    )
+    normalized = {
         "version": version,
-        "job_id": _require_non_empty_string(
-            supersession.get("job_id"),
-            label="job supersession.job_id",
-            state_path=state_path,
-        ),
+        "job_id": job_id,
         "slice_id": _require_non_empty_string(
             supersession.get("slice_id"),
             label="job supersession.slice_id",
             state_path=state_path,
         ),
-        "binding_revision": _require_safe_integer(
-            supersession.get("binding_revision"),
-            label="job supersession.binding_revision",
-            state_path=state_path,
-        ),
+        "binding_revision": binding_revision,
         "actor": _require_non_empty_string(
             supersession.get("actor"),
             label="job supersession.actor",
@@ -1538,6 +1542,21 @@ def _validate_job_supersession(
             state_path=state_path,
         ),
     }
+    normalized[_BOUND_BINDING_FIELD] = _validate_slice_binding_snapshot(
+        supersession.get(_BOUND_BINDING_FIELD),
+        label=f"job supersession.{_BOUND_BINDING_FIELD}",
+        state_path=state_path,
+    )
+    if (
+        int(normalized[_BOUND_BINDING_FIELD]["binding_revision"]) != binding_revision
+        or not _job_id_in_binding_snapshot(job_id, normalized[_BOUND_BINDING_FIELD])
+    ):
+        raise _contract_error(
+            "request-content-conflict",
+            state_path=state_path,
+            detail=f"job supersession.{_BOUND_BINDING_FIELD}",
+        )
+    return normalized
 
 
 def _validate_job_consumption(
@@ -1558,23 +1577,25 @@ def _validate_job_consumption(
     )
     if version != _JOB_CONSUMPTION_VERSION:
         raise _contract_error("unsupported-recovery-version", state_path=state_path)
-    return {
+    job_id = _require_non_empty_string(
+        consumption.get("job_id"),
+        label="job consumption.job_id",
+        state_path=state_path,
+    )
+    binding_revision = _require_safe_integer(
+        consumption.get("binding_revision"),
+        label="job consumption.binding_revision",
+        state_path=state_path,
+    )
+    normalized = {
         "version": version,
-        "job_id": _require_non_empty_string(
-            consumption.get("job_id"),
-            label="job consumption.job_id",
-            state_path=state_path,
-        ),
+        "job_id": job_id,
         "slice_id": _require_non_empty_string(
             consumption.get("slice_id"),
             label="job consumption.slice_id",
             state_path=state_path,
         ),
-        "binding_revision": _require_safe_integer(
-            consumption.get("binding_revision"),
-            label="job consumption.binding_revision",
-            state_path=state_path,
-        ),
+        "binding_revision": binding_revision,
         "actor": _require_non_empty_string(
             consumption.get("actor"),
             label="job consumption.actor",
@@ -1597,6 +1618,21 @@ def _validate_job_consumption(
             required=True,
         ),
     }
+    normalized[_BOUND_BINDING_FIELD] = _validate_slice_binding_snapshot(
+        consumption.get(_BOUND_BINDING_FIELD),
+        label=f"job consumption.{_BOUND_BINDING_FIELD}",
+        state_path=state_path,
+    )
+    if (
+        int(normalized[_BOUND_BINDING_FIELD]["binding_revision"]) != binding_revision
+        or not _job_id_in_binding_snapshot(job_id, normalized[_BOUND_BINDING_FIELD])
+    ):
+        raise _contract_error(
+            "request-content-conflict",
+            state_path=state_path,
+            detail=f"job consumption.{_BOUND_BINDING_FIELD}",
+        )
+    return normalized
 
 
 def _slice_binding_from_row(slice_row: Mapping[str, Any]) -> dict[str, Any]:
@@ -1633,20 +1669,32 @@ def _legacy_binding_from_row(slice_row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _job_id_in_binding_snapshot(job_id: str, binding: Mapping[str, Any]) -> bool:
+    return job_id in {
+        binding.get("builder_job_id"),
+        binding.get("reviewer_job_id"),
+    }
+
+
 def _validate_optional_recovery_slice_fields(
     slice_row: Mapping[str, Any],
     *,
     state_path: Path,
 ) -> dict[str, Any]:
+    if "_binding_history" in slice_row:
+        raise _contract_error(
+            "malformed-recovery-context",
+            state_path=state_path,
+            detail="_binding_history",
+        )
     has_binding_version = "binding_version" in slice_row
     has_binding_revision = "binding_revision" in slice_row
     has_recovery_receipts = "recovery_receipts" in slice_row
     has_checkpoint_receipt = "binding_checkpoint_receipt" in slice_row
-    has_binding_history = _BINDING_HISTORY_FIELD in slice_row
     if has_binding_version != has_binding_revision:
         raise _contract_error("legacy-binding-unversioned", state_path=state_path)
     if not has_binding_version:
-        if has_recovery_receipts or has_checkpoint_receipt or has_binding_history:
+        if has_recovery_receipts or has_checkpoint_receipt:
             raise _contract_error("legacy-binding-unversioned", state_path=state_path)
         return {}
     binding_version = _require_non_empty_string(
@@ -1672,32 +1720,6 @@ def _validate_optional_recovery_slice_fields(
             for item in recovery_receipts
         ],
     }
-    if has_binding_history:
-        binding_history = slice_row.get(_BINDING_HISTORY_FIELD)
-        if not isinstance(binding_history, list):
-            raise _contract_error(
-                "malformed-recovery-context",
-                state_path=state_path,
-                detail=_BINDING_HISTORY_FIELD,
-            )
-        validated_history: list[dict[str, Any]] = []
-        seen_revisions: set[int] = set()
-        for index, snapshot in enumerate(binding_history):
-            normalized_snapshot = _validate_slice_binding_snapshot(
-                snapshot,
-                label=f"slice.{_BINDING_HISTORY_FIELD}[{index}]",
-                state_path=state_path,
-            )
-            revision = int(normalized_snapshot["binding_revision"])
-            if revision >= binding_revision or revision in seen_revisions:
-                raise _contract_error(
-                    "request-content-conflict",
-                    state_path=state_path,
-                    detail=_BINDING_HISTORY_FIELD,
-                )
-            seen_revisions.add(revision)
-            validated_history.append(normalized_snapshot)
-        validated[_BINDING_HISTORY_FIELD] = validated_history
     if has_checkpoint_receipt:
         validated["binding_checkpoint_receipt"] = _validate_checkpoint_receipt(
             slice_row.get("binding_checkpoint_receipt"),
@@ -1719,45 +1741,6 @@ def _iter_registry_request_receipts(
     if isinstance(checkpoint, dict):
         receipts.append(("checkpoint", checkpoint))
     return receipts
-
-
-def _bound_job_ids_for_binding_revision(
-    slice_row: Mapping[str, Any],
-    *,
-    binding_revision: int,
-) -> set[str]:
-    bound: set[str] = set()
-
-    def _collect(binding: Mapping[str, Any]) -> None:
-        if int(binding["binding_revision"]) != binding_revision:
-            return
-        for field_name in ("builder_job_id", "reviewer_job_id"):
-            job_id = binding.get(field_name)
-            if isinstance(job_id, str):
-                bound.add(job_id)
-
-    if "binding_version" in slice_row and "binding_revision" in slice_row:
-        _collect(_slice_binding_from_row(slice_row))
-    checkpoint = slice_row.get("binding_checkpoint_receipt")
-    if isinstance(checkpoint, dict):
-        _collect(checkpoint["applied_binding"])
-    binding_history = slice_row.get(_BINDING_HISTORY_FIELD)
-    if isinstance(binding_history, list):
-        for snapshot in binding_history:
-            if isinstance(snapshot, Mapping):
-                _collect(snapshot)
-    receipts = slice_row.get("recovery_receipts")
-    if isinstance(receipts, list):
-        for receipt in receipts:
-            if not isinstance(receipt, dict):
-                continue
-            payload = receipt.get("payload")
-            if isinstance(payload, dict) and isinstance(payload.get("expected_binding"), dict):
-                _collect(payload["expected_binding"])
-            applied = receipt.get("applied_binding")
-            if isinstance(applied, dict):
-                _collect(applied)
-    return bound
 
 
 def _validate_recovery_request_id_collisions(
@@ -2099,15 +2082,18 @@ class JobRegistry:
                 if not isinstance(entry, dict):
                     continue
                 slice_row = slices_by_id.get(str(entry["slice_id"]))
-                if slice_row is None or job["job_id"] not in _bound_job_ids_for_binding_revision(
-                    slice_row,
-                    binding_revision=int(entry["binding_revision"]),
-                ):
+                if slice_row is None:
                     raise _contract_error(
                         "request-content-conflict",
                         state_path=self._state_path,
                         detail=f"{field_name}.binding",
                     )
+                self._validate_loaded_job_disposition_binding(
+                    job,
+                    field_name=field_name,
+                    entry=entry,
+                    slice_row=slice_row,
+                )
         return validated_jobs, validated_slices, seq
 
     def _validate_legacy_records(self, value: object) -> None:
@@ -2621,9 +2607,7 @@ class JobRegistry:
         raise KeyError(f"slice 不存在: {slice_id}")
 
     def _copy_slice(self, slice_row: dict[str, Any]) -> dict[str, Any]:
-        copied = _deepcopy_json(slice_row)
-        copied.pop(_BINDING_HISTORY_FIELD, None)
-        return copied
+        return _deepcopy_json(slice_row)
 
     def _slice_is_versioned(self, slice_row: Mapping[str, Any]) -> bool:
         return "binding_version" in slice_row and "binding_revision" in slice_row
@@ -2649,15 +2633,6 @@ class JobRegistry:
             return
         current_binding = _slice_binding_from_row(slice_row)
         if force or previous_binding != current_binding:
-            if previous_binding is not None:
-                history = slice_row.setdefault(_BINDING_HISTORY_FIELD, [])
-                if not isinstance(history, list):
-                    raise _contract_error(
-                        "malformed-recovery-context",
-                        state_path=self._state_path,
-                        detail=_BINDING_HISTORY_FIELD,
-                    )
-                history.append(_deepcopy_json(previous_binding))
             slice_row["binding_revision"] = self._next_binding_revision(int(slice_row["binding_revision"]))
 
     def _locate_registry_request_receipt(
@@ -2740,13 +2715,112 @@ class JobRegistry:
                 self._validate_existing_job_ref(field_name, job_id)
         return current_binding
 
-    def _bound_job_ids_for_binding_revision(
+    def _recorded_job_bound_binding(
         self,
-        slice_row: Mapping[str, Any],
+        job: Mapping[str, Any],
         *,
+        slice_id: str,
         binding_revision: int,
-    ) -> set[str]:
-        return _bound_job_ids_for_binding_revision(slice_row, binding_revision=binding_revision)
+    ) -> dict[str, Any] | None:
+        witness: dict[str, Any] | None = None
+        job_id = str(job["job_id"])
+        for field_name in ("supersession", "consumption"):
+            entry = job.get(field_name)
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get("slice_id") != slice_id or int(entry["binding_revision"]) != binding_revision:
+                continue
+            bound_binding = entry.get(_BOUND_BINDING_FIELD)
+            if not isinstance(bound_binding, Mapping):
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail=f"{field_name}.{_BOUND_BINDING_FIELD}",
+                )
+            normalized = _deepcopy_json(bound_binding)
+            if (
+                int(normalized["binding_revision"]) != binding_revision
+                or not _job_id_in_binding_snapshot(job_id, normalized)
+            ):
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail=f"{field_name}.{_BOUND_BINDING_FIELD}",
+                )
+            if witness is None:
+                witness = normalized
+            elif witness != normalized:
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail=f"{field_name}.{_BOUND_BINDING_FIELD}",
+                )
+        return witness
+
+    def _resolve_job_disposition_binding(
+        self,
+        job: Mapping[str, Any],
+        *,
+        slice_row: Mapping[str, Any],
+        binding_revision: int,
+    ) -> dict[str, Any]:
+        if not self._slice_is_versioned(slice_row):
+            raise _contract_error("legacy-binding-unversioned", state_path=self._state_path)
+        current_binding = _slice_binding_from_row(slice_row)
+        current_revision = int(current_binding["binding_revision"])
+        if binding_revision == current_revision:
+            if not _job_id_in_binding_snapshot(str(job["job_id"]), current_binding):
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail="job_id",
+                )
+            return current_binding
+        if binding_revision > current_revision:
+            raise _contract_error("stale-binding", state_path=self._state_path)
+        witness = self._recorded_job_bound_binding(
+            job,
+            slice_id=str(slice_row["slice_id"]),
+            binding_revision=binding_revision,
+        )
+        if witness is None:
+            raise _contract_error("stale-binding", state_path=self._state_path)
+        return witness
+
+    def _validate_loaded_job_disposition_binding(
+        self,
+        job: Mapping[str, Any],
+        *,
+        field_name: str,
+        entry: Mapping[str, Any],
+        slice_row: Mapping[str, Any],
+    ) -> None:
+        if not self._slice_is_versioned(slice_row):
+            raise _contract_error("legacy-binding-unversioned", state_path=self._state_path)
+        bound_binding = entry[_BOUND_BINDING_FIELD]
+        current_binding = _slice_binding_from_row(slice_row)
+        entry_revision = int(entry["binding_revision"])
+        if (
+            int(bound_binding["binding_revision"]) != entry_revision
+            or not _job_id_in_binding_snapshot(str(job["job_id"]), bound_binding)
+            or entry_revision > int(current_binding["binding_revision"])
+        ):
+            raise _contract_error(
+                "request-content-conflict",
+                state_path=self._state_path,
+                detail=f"{field_name}.binding",
+            )
+        self._recorded_job_bound_binding(
+            job,
+            slice_id=str(entry["slice_id"]),
+            binding_revision=entry_revision,
+        )
+        if entry_revision == int(current_binding["binding_revision"]) and bound_binding != current_binding:
+            raise _contract_error(
+                "request-content-conflict",
+                state_path=self._state_path,
+                detail=f"{field_name}.{_BOUND_BINDING_FIELD}",
+            )
 
     def _persist_recovery_change(self) -> None:
         try:
@@ -2760,6 +2834,7 @@ class JobRegistry:
         *,
         slice_id: str,
         binding_revision: int,
+        bound_binding: Mapping[str, Any],
         actor: str,
         reason: str,
         superseding_identity: Mapping[str, Any],
@@ -2778,6 +2853,11 @@ class JobRegistry:
                 label="job supersession.superseding_identity",
                 state_path=self._state_path,
             ),
+            _BOUND_BINDING_FIELD: _validate_slice_binding_snapshot(
+                bound_binding,
+                label=f"job supersession.{_BOUND_BINDING_FIELD}",
+                state_path=self._state_path,
+            ),
         }
 
     def _build_job_consumption(
@@ -2786,6 +2866,7 @@ class JobRegistry:
         *,
         slice_id: str,
         binding_revision: int,
+        bound_binding: Mapping[str, Any],
         actor: str,
         completion_identity: Mapping[str, Any],
         proof_refs: list[Mapping[str, Any]],
@@ -2809,6 +2890,11 @@ class JobRegistry:
                 state_path=self._state_path,
                 required=True,
             ),
+            _BOUND_BINDING_FIELD: _validate_slice_binding_snapshot(
+                bound_binding,
+                label=f"job consumption.{_BOUND_BINDING_FIELD}",
+                state_path=self._state_path,
+            ),
         }
 
     def _record_job_supersession_inplace(
@@ -2817,6 +2903,7 @@ class JobRegistry:
         *,
         slice_id: str,
         binding_revision: int,
+        bound_binding: Mapping[str, Any],
         actor: str,
         reason: str,
         superseding_identity: Mapping[str, Any],
@@ -2826,6 +2913,7 @@ class JobRegistry:
             job,
             slice_id=slice_id,
             binding_revision=binding_revision,
+            bound_binding=bound_binding,
             actor=actor,
             reason=reason,
             superseding_identity=superseding_identity,
@@ -2842,6 +2930,7 @@ class JobRegistry:
         *,
         slice_id: str,
         binding_revision: int,
+        bound_binding: Mapping[str, Any],
         actor: str,
         completion_identity: Mapping[str, Any],
         proof_refs: list[Mapping[str, Any]],
@@ -2851,6 +2940,7 @@ class JobRegistry:
             job,
             slice_id=slice_id,
             binding_revision=binding_revision,
+            bound_binding=bound_binding,
             actor=actor,
             completion_identity=completion_identity,
             proof_refs=proof_refs,
@@ -3574,6 +3664,7 @@ class JobRegistry:
                 job,
                 slice_id=slice_id,
                 binding_revision=old_revision,
+                bound_binding=current_binding,
                 actor=normalized_request["payload"]["actor"],
                 reason="recover-pre-candidate",
                 superseding_identity=superseding_identity,
@@ -3635,19 +3726,16 @@ class JobRegistry:
             label="record_job_supersession.binding_revision",
             state_path=self._state_path,
         )
-        if not self._slice_is_versioned(slice_row):
-            raise _contract_error("legacy-binding-unversioned", state_path=self._state_path)
-        if normalized_binding_revision > int(slice_row["binding_revision"]):
-            raise _contract_error("stale-binding", state_path=self._state_path)
-        if job_id not in self._bound_job_ids_for_binding_revision(
-            slice_row,
+        bound_binding = self._resolve_job_disposition_binding(
+            job,
+            slice_row=slice_row,
             binding_revision=normalized_binding_revision,
-        ):
-            raise _contract_error("request-content-conflict", state_path=self._state_path, detail="job_id")
+        )
         self._record_job_supersession_inplace(
             job,
             slice_id=slice_id,
             binding_revision=normalized_binding_revision,
+            bound_binding=bound_binding,
             actor=_require_non_empty_string(actor, label="record_job_supersession.actor", state_path=self._state_path),
             reason=_require_non_empty_string(reason, label="record_job_supersession.reason", state_path=self._state_path),
             superseding_identity=superseding_identity,
@@ -3678,19 +3766,16 @@ class JobRegistry:
             label="record_job_consumption.binding_revision",
             state_path=self._state_path,
         )
-        if not self._slice_is_versioned(slice_row):
-            raise _contract_error("legacy-binding-unversioned", state_path=self._state_path)
-        if normalized_binding_revision > int(slice_row["binding_revision"]):
-            raise _contract_error("stale-binding", state_path=self._state_path)
-        if job_id not in self._bound_job_ids_for_binding_revision(
-            slice_row,
+        bound_binding = self._resolve_job_disposition_binding(
+            job,
+            slice_row=slice_row,
             binding_revision=normalized_binding_revision,
-        ):
-            raise _contract_error("request-content-conflict", state_path=self._state_path, detail="job_id")
+        )
         self._record_job_consumption_inplace(
             job,
             slice_id=slice_id,
             binding_revision=normalized_binding_revision,
+            bound_binding=bound_binding,
             actor=_require_non_empty_string(actor, label="record_job_consumption.actor", state_path=self._state_path),
             completion_identity=completion_identity,
             proof_refs=proof_refs,
