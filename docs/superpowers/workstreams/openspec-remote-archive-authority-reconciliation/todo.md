@@ -18,14 +18,14 @@ artifact_classes:
 - Dependency：#961 是先行 Child A；#962 是 Child B 並已標為 blocked by #961。#962 只有在本票合併後才可整合 completion recovery；#887 不因 #961 單獨完成而關閉。
 - Frozen authority：本目錄的 accepted spec/design/todo 對應 live #961；實作時只翻 todo checkbox，其餘變更走正式新 review，不要在 red-to-green 途中暗改 acceptance。
 - Production：僅 paulsha_cortex/coordinator/claim.py 的 semantic-source aggregation/arbitration 和 module logger。無 registry/journal/outcome writes、無新 persisted 欄位/schema。
-- Tests：新增 tests/test_post_merge_authority_restart_guard.py 的 authority arbitration cases；既有 tests/test_work_claim.py、tests/test_claim_provider_scope_530.py、tests/test_monitor_work_review_regressions.py 作回歸。#962 後續會依依賴在同一新測試檔增加 run recovery cases。
+- Tests：新增 tests/test_post_merge_authority_restart_guard.py 的 authority arbitration cases；既有 tests/test_work_claim.py、tests/test_claim_provider_scope_530.py、tests/test_monitor_work_review_regressions.py 作回歸。#962 後續會依賴本票，在同一新測試檔增加 run recovery cases。
 - Docs/changelog：後續實作新增 changelog.d/openspec-remote-archive-authority-reconciliation.md、更新 CHANGELOG.md [Unreleased] 與 docs/unified-work-lifecycle.md；記錄僅在 exact remote merged-with-merge-commit proof 成立時採 archived。
 - 不得在測試或文件寫死 OpenSpec change 的 workspace 路徑；fixtures 以參數化 ref/change name 建構 source。
 - 本 todo 不涵蓋 #962 sizing、parent closeout、runtime deployment 或 service restart。
 
 ## 現況證據（2026-09-23）
 
-- 工作目錄唯讀檢視為 branch main、HEAD 3e23f9dc4fcd2c0b19d9a46ffc13d4540e681d4d；git status 顯示 7 個既有未追蹤的 superpowers plan 檔案，本任務保留且未觸碰它們。
+- 程式基準為 main commit 3e23f9dc4fcd2c0b19d9a46ffc13d4540e681d4d；下列 source 與測試觀察以該版本的受版本控制檔案為準。
 - live #961 與 #962 均 open；#962 正確標記 blocked by #961；parent #887 更新後仍 open 並要求兩 children landed 加完整整合驗收才完成。
 - claim.py:160-169 將本地與 GitHub OpenSpec sources 折成同一 semantic key；:735-762 目前採第一個 revision 並在另一個值出現時即以 row-malformed/source_revisions 拒絕。
 - providers.py:221-229 的 RepoWorkProvider 產生 repo:{repo}／active source；:1715-1731 的 GitHub terminal tree 產生 github-terminal:{repo} OpenSpec sources；:1733-1792 與 :1808-1812 建立並驗證帶 merge ancestry 的 remote_prs rows。
@@ -57,7 +57,7 @@ Sizing inputs were read from current source, not copied from the #887 aggregate.
 
 ## Tasks
 
-- [ ] **T0 acceptance freeze and fixture inventory**：核對 live #961/#887 dependency與 current source evidence；準備 canonical snapshot fixtures，明確標示 repo provider、terminal provider、confirmed github_pr 及同 source_id remote_pr row。不得更動 repo 既有未追蹤 artifacts。
+- [ ] **T0 acceptance freeze and fixture inventory**：核對 live #961/#887 dependency與 current source evidence；準備 canonical snapshot fixtures，明確標示 repo provider、terminal provider、confirmed github_pr 及同 source_id remote_pr row。不得新增或 commit 本票 scope 外的檔案。
 - [ ] **T1 tests／RED**：在 tests/test_post_merge_authority_restart_guard.py 加 Child A public-boundary tests。正例要證明嚴格 proof 下選 archived，輸出等於移除 local source；負例逐條否定條件並精確斷言錯誤欄位。先確認現行 setdefault 路徑對 active+archived fixture RED。
 - [ ] **T2 source／兩階段收集與裁決**：在 claim._authority_from_canonical_row 先 collect observed values per semantic key，再呼叫純 _merged_remote_archive_resolution。一般單值沿用原值；只有 spec R961.2 全部條件成立回 archived；其他衝突 raise 現有 AuthorityValidationError。semantic_source_revision 的過濾/驗證與 mapped_openspec aggregation 不改。
 - [ ] **T3 audit／determinism tests**：測來源列正反順序、source_revisions/digest/mapped_openspec exact equality、每 key 一行 warning 及 diagnostic label 路徑清理；確保無 provider network、registry write、filesystem mutation。
