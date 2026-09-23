@@ -1504,3 +1504,39 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/durable-context-design.md'
     excludes: []
+  self-publication-receipt-value:
+    title: 'self-publication-receipt-value'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#992'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/self-publication-receipt-value/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/self-publication-receipt-value-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/self-publication-receipt-value-design.md'
+    excludes: []
+  self-publication-receipt-append:
+    title: 'self-publication-receipt-append'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#993'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/self-publication-receipt-append/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/self-publication-receipt-append-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/self-publication-receipt-append-design.md'
+    excludes: []
+  github-pr-read-back:
+    title: 'github-pr-read-back'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#994'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/github-pr-read-back/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/github-pr-read-back-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/github-pr-read-back-design.md'
+    excludes: []

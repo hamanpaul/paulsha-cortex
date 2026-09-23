@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **Refine 0.1.11 self-publication receipt 子票進件**：為 #992–#994 新增 accepted spec／design／todo 與唯一 work item，分別固定 receipt value、Registry 原子 append 與 GitHub PR 唯讀 read-back；#978 與 #847 的完整驗收、producer 接線及 loaded-runtime canary 仍待交付。
 - **Refine 0.1.11 main-sync 子票進件**：為 #987–#990 新增 accepted spec／design／todo 與唯一 work item 綁定，依序承接 #972 的 main probe、typed diagnostics、recovery actions 與 durable Manager context；產品實作與 #943 整合驗收仍待後續交付。
 - **preflight visudo 測試環境**：sudoers 整合測試將系統 sbin 加入個別測試的 PATH，避免 #862 exact-Candidate preflight 因 service PATH 差異誤判失敗。
 - **Refine 0.1.11 子票進件（第三批）**：為 #975、#976、#983 發布已審核的 accepted 規劃與 work item；#975／#976 的合併 run closure 與 #983 的 delivery journal 條件寫入仍待各自前置及產品實作驗收。
