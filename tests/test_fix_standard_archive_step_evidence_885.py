@@ -409,6 +409,132 @@ def test_fix_standard_ship_audit_accepts_archive_job_ancestor_after_retry_build(
         )
 
 
+def test_fix_standard_ship_audit_rejects_exact_match_archive_job_with_wrong_identity(
+    tmp_path: Path,
+) -> None:
+    repo, candidate = _repo(
+        tmp_path / "ship-audit-identity-repo",
+        active_change=False,
+        archived_change=False,
+    )
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    run = _create_fix_standard_run(
+        registry=registry,
+        repo_root=repo,
+        snapshot=snapshot,
+        candidate=candidate,
+    )
+    bad_job = registry.create_job(
+        task="wf-bad-openspec-archive",
+        persona="manager",
+        kind="build",
+        branch="feature/work",
+        pane="",
+        worktree=str(repo),
+        dispatch_head=candidate,
+        executor="codex",
+        model_id="deterministic",
+        independence_domain="cortex",
+        subject_head=candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="openspec-archive",
+        workflow_phase="ship",
+        workflow_repo_root=str(repo),
+        source_revision=run.source_revision,
+    )
+    registry.update_headless_result(bad_job["job_id"], status="exited", exit_code=0)
+    registry.bind_workflow_evidence(
+        bad_job["job_id"],
+        locator={"kind": "ship", "path": "evidence/workflow/bad.json", "hash": "f" * 64},
+        subject_head=candidate,
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="policy-commit",
+        subject_head=candidate,
+    )
+
+    assert manager._manager_archive_applied(run, registry=registry) is False
+    with pytest.raises(ValueError, match="missing or ambiguous: openspec-archive"):
+        manager._validated_ship_steps(
+            registry,
+            run=run,
+            candidate=candidate,
+            coordinator_root=coordinator,
+        )
+
+
+def test_fix_standard_ship_audit_rejects_exact_match_when_archive_jobs_are_ambiguous(
+    tmp_path: Path,
+) -> None:
+    repo, archive_candidate = _repo(
+        tmp_path / "ship-audit-ambiguous-repo",
+        active_change=False,
+        archived_change=False,
+    )
+    (repo / "repair.txt").write_text("repair\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "repair.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "repair"], check=True)
+    final_candidate = _git(repo, "rev-parse", "HEAD")
+    sibling_candidate = _git(
+        repo,
+        "commit-tree",
+        _git(repo, "rev-parse", f"{archive_candidate}^{{tree}}"),
+        "-p",
+        archive_candidate,
+        input="unrelated sibling\n",
+    )
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    run = _create_fix_standard_run(
+        registry=registry,
+        repo_root=repo,
+        snapshot=snapshot,
+        candidate=final_candidate,
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="openspec-archive",
+        subject_head=final_candidate,
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="openspec-archive",
+        subject_head=sibling_candidate,
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="policy-commit",
+        subject_head=final_candidate,
+    )
+
+    assert manager._manager_archive_applied(run, registry=registry) is False
+    with pytest.raises(ValueError, match="missing or ambiguous: openspec-archive"):
+        manager._validated_ship_steps(
+            registry,
+            run=run,
+            candidate=final_candidate,
+            coordinator_root=coordinator,
+        )
+
+
 def test_retry_build_warns_on_active_archive_coexistence_in_exact_candidate_tree(
     tmp_path: Path,
 ) -> None:

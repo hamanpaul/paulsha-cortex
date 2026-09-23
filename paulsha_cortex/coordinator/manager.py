@@ -3233,19 +3233,90 @@ def _materialize_plan_card_output(
     return artifacts + (materialized,), authority, transaction
 
 
-def _manager_archive_applied(run) -> bool:
-    archives = [
+def _manager_archive_subject_applies(
+    *, workspace_root: str | Path, subject_head: str, candidate_head: str
+) -> bool:
+    if subject_head == candidate_head:
+        return True
+    if (
+        verification.SAFE_SHA_RE.fullmatch(subject_head) is None
+        or verification.SAFE_SHA_RE.fullmatch(candidate_head) is None
+    ):
+        return False
+    try:
+        ancestry = subprocess.run(
+            [
+                "git", "-C", str(workspace_root), "merge-base", "--is-ancestor",
+                subject_head, candidate_head,
+            ],
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return ancestry.returncode == 0
+
+
+def _manager_archive_job_matches(job: Mapping[str, object], *, run_id: str) -> bool:
+    return (
+        job.get("workflow_run_id") == run_id
+        and job.get("workflow_phase") == "ship"
+        and job.get("workflow_card") == "openspec-archive"
+        and job.get("persona") == "manager"
+        and job.get("executor") == "cortex-manager"
+        and job.get("model_id") == "deterministic"
+        and job.get("independence_domain") == "cortex"
+        and job.get("status") == "exited"
+        and job.get("exit_code") == 0
+        and isinstance(job.get("workflow_evidence"), dict)
+        and job["workflow_evidence"].get("kind") == "ship"
+    )
+
+
+def _manager_archive_job_applied(registry, run) -> bool:
+    run_id = getattr(run, "run_id", None)
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(run_id, str)
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+    ):
+        return False
+    jobs = [
+        job
+        for job in registry.list_jobs()
+        if _manager_archive_job_matches(job, run_id=run_id)
+    ]
+    if len(jobs) != 1:
+        return False
+    subject = jobs[0].get("subject_head")
+    if not isinstance(subject, str) or verification.SAFE_SHA_RE.fullmatch(subject) is None:
+        return False
+    return _manager_archive_subject_applies(
+        workspace_root=getattr(run, "workspace_root", ""),
+        subject_head=subject,
+        candidate_head=candidate,
+    )
+
+
+def _manager_archive_applied(run, *, registry=None) -> bool:
+    declared = [
         step
         for step in run.steps
-        if step.phase == "ship"
-        and step.card == "openspec-archive"
-        and step.gate_result == "passed"
+        if step.phase == "ship" and step.card == "openspec-archive"
     ]
-    return len(archives) == 1 and (
-        archives[0].executor,
-        archives[0].model,
-        archives[0].domain,
-    ) == ("cortex-manager", "deterministic", "cortex")
+    if declared:
+        archives = [step for step in declared if step.gate_result == "passed"]
+        return len(archives) == 1 and (
+            archives[0].executor,
+            archives[0].model,
+            archives[0].domain,
+        ) == ("cortex-manager", "deterministic", "cortex")
+    if registry is None:
+        return False
+    return _manager_archive_job_applied(registry, run)
 
 
 def _planning_artifact_relative_path_after_archive(
@@ -7855,43 +7926,45 @@ def _workflow_report_cleanup_allows_missing(
 def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: str | Path):
     def matches_candidate(card: str, job: Mapping[str, object]) -> bool:
         subject = job.get("subject_head")
-        if subject == candidate:
+        if subject == candidate and card != "openspec-archive":
             return True
+        declares_archive_step = any(
+            step.phase == "ship" and step.card == "openspec-archive"
+            for step in run.steps
+        )
+        archive_applied = _manager_archive_applied(run, registry=registry)
+        if subject == candidate:
+            return declares_archive_step or archive_applied
         if (
             card != "openspec-archive"
-            or not _manager_archive_applied(run)
+            or not archive_applied
             or not isinstance(subject, str)
-            or verification.SAFE_SHA_RE.fullmatch(subject) is None
-            or verification.SAFE_SHA_RE.fullmatch(candidate) is None
         ):
             return False
-        try:
-            ancestry = subprocess.run(
-                [
-                    "git", "-C", str(run.workspace_root), "merge-base", "--is-ancestor",
-                    subject, candidate,
-                ],
-                shell=False,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except OSError:
-            return False
-        return ancestry.returncode == 0
+        return _manager_archive_subject_applies(
+            workspace_root=run.workspace_root,
+            subject_head=subject,
+            candidate_head=candidate,
+        )
 
     steps = run.steps
     for card in ("openspec-archive", "policy-commit"):
         jobs = [
             job
             for job in registry.list_jobs()
-            if job.get("workflow_run_id") == run.run_id
-            and job.get("workflow_phase") == "ship"
-            and job.get("workflow_card") == card
-            and job.get("persona") == "manager"
+            if (
+                (
+                    _manager_archive_job_matches(job, run_id=run.run_id)
+                    if card == "openspec-archive"
+                    else job.get("workflow_run_id") == run.run_id
+                    and job.get("workflow_phase") == "ship"
+                    and job.get("workflow_card") == card
+                    and job.get("persona") == "manager"
+                    and job.get("status") == "exited"
+                    and job.get("exit_code") == 0
+                )
+            )
             and matches_candidate(card, job)
-            and job.get("status") == "exited"
-            and job.get("exit_code") == 0
         ]
         if len(jobs) != 1:
             raise ValueError(f"workflow ship card audit missing or ambiguous: {card}")

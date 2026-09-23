@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#885 fix-standard-archive-step-evidence**：fix-standard 現在可用唯一 Manager `openspec-archive`
+  job 加 Git ancestry 判定 archive-applied；`retry-build` 會按 exact Candidate Git tree 偵測
+  active/archive 並存並回報 warning，ship/local-closeout 對 `openspec archive` Aborted、未搬移
+  active change 與 post-archive 並存一律 fail-closed。
+
 - **Refine 0.1.11 定版進件（第三批）**：為 #885 新增 accepted spec／design／todo 與唯一 work item 綁定；archive 修復仍待產品實作與驗收。
 - **Refine 0.1.11 定版進件（第二批）**：為 #479、#481、#810、#871 新增 accepted
   spec／design／todo 與 work item 綁定，供後續 Cortex 分票派工；產品實作仍待正式驗收。
