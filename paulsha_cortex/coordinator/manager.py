@@ -4484,6 +4484,176 @@ def _executor_backoff_admission_report(
     skipped: list[dict[str, object]] = []
     unknown: list[dict[str, object]] = []
     inventory_cache: dict[tuple[str, str], dict[str, object] | None] = {}
+    replay_cache: dict[
+        tuple[str, str],
+        tuple[
+            object,
+            int,
+            list[dict[str, object]],
+            int,
+            float | None,
+            float | None,
+        ],
+    ] = {}
+
+    def _pending_summary(
+        inventory: Mapping[str, object] | None,
+        missing_terminal_keys: Sequence[str],
+    ) -> tuple[int, float | None, float | None]:
+        if not isinstance(inventory, Mapping):
+            return len(missing_terminal_keys), None, None
+        raw_events = inventory.get("events")
+        if not isinstance(raw_events, list):
+            return len(missing_terminal_keys), None, None
+        missing = set(missing_terminal_keys)
+        epochs = [
+            float(event["event_epoch"])
+            for event in raw_events
+            if isinstance(event, Mapping)
+            and event.get("job_id") in missing
+            and isinstance(event.get("event_epoch"), (int, float))
+        ]
+        return (
+            len(missing_terminal_keys),
+            min(epochs) if epochs else None,
+            max(epochs) if epochs else None,
+        )
+
+    def _replay_pending(
+        identity_key: tuple[str, str],
+        status,
+    ) -> tuple[
+        object,
+        int,
+        list[dict[str, object]],
+        int,
+        float | None,
+        float | None,
+    ]:
+        cached = replay_cache.get(identity_key)
+        if cached is not None:
+            return cached
+
+        inventory = inventory_cache[identity_key]
+        missing_terminal_keys = tuple(status.missing_terminal_keys)
+        pending_count, earliest_event_epoch, latest_event_epoch = _pending_summary(
+            inventory,
+            missing_terminal_keys,
+        )
+        replay_diagnostics: list[dict[str, object]] = []
+        replayed_count = 0
+        event_by_job_id: dict[str, Mapping[str, object]] = {}
+        if isinstance(inventory, Mapping) and isinstance(inventory.get("events"), list):
+            event_by_job_id = {
+                str(event["job_id"]): event
+                for event in inventory["events"]
+                if isinstance(event, Mapping)
+                and event.get("executor") == identity_key[0]
+                and event.get("model_id") == identity_key[1]
+                and isinstance(event.get("job_id"), str)
+            }
+
+        replay_failed = False
+        for terminal_key in missing_terminal_keys:
+            event = event_by_job_id.get(terminal_key)
+            if event is None:
+                replay_diagnostics.append(
+                    {
+                        "job_id": terminal_key,
+                        "observation": executor_backoff.StoreObservation.UNKNOWN.value,
+                        "diagnostics": ["inventory-event-missing"],
+                    }
+                )
+                replay_failed = True
+                logger.info(
+                    "executor backoff replay executor=%s model_id=%s replayed_count=%s result=%s",
+                    identity_key[0],
+                    identity_key[1],
+                    replayed_count,
+                    "inventory-event-missing",
+                )
+                break
+            try:
+                mutation = executor_backoff.record_backoff(
+                    coordinator_root,
+                    identity_key[0],
+                    identity_key[1],
+                    now=now,
+                    outcome=event["outcome"],
+                    reset_at=event["reset_at"],
+                    reason=event["reason"],
+                    job_id=event["job_id"],
+                    event_epoch=event["event_epoch"],
+                )
+            except Exception as exc:
+                replay_diagnostics.append(
+                    {
+                        "job_id": terminal_key,
+                        "observation": executor_backoff.StoreObservation.UNKNOWN.value,
+                        "diagnostics": [f"replay-exception:{type(exc).__name__}"],
+                    }
+                )
+                replay_failed = True
+                logger.info(
+                    "executor backoff replay executor=%s model_id=%s replayed_count=%s result=%s",
+                    identity_key[0],
+                    identity_key[1],
+                    replayed_count,
+                    f"replay-exception:{type(exc).__name__}",
+                )
+                break
+            mutation_diagnostics = list(mutation.diagnostics)
+            replay_diagnostics.append(
+                {
+                    "job_id": terminal_key,
+                    "observation": mutation.observation.value,
+                    "diagnostics": mutation_diagnostics,
+                    "changed": mutation.changed,
+                }
+            )
+            if mutation.changed:
+                replayed_count += 1
+            logger.info(
+                "executor backoff replay executor=%s model_id=%s replayed_count=%s result=%s",
+                identity_key[0],
+                identity_key[1],
+                replayed_count,
+                ",".join(mutation_diagnostics) or mutation.observation.value,
+            )
+            if (
+                mutation.observation is not executor_backoff.StoreObservation.VALID
+                or any(
+                    diagnostic in {"integrity-conflict", "capacity-exceeded"}
+                    for diagnostic in mutation_diagnostics
+                )
+            ):
+                replay_failed = True
+                break
+
+        replayed_status = status
+        if not replay_failed or replayed_count > 0:
+            replayed_status = executor_backoff.reconcile_backoff(
+                coordinator_root,
+                identity_key[0],
+                identity_key[1],
+                now=now,
+                inventory=inventory,
+            )
+            (
+                pending_count,
+                earliest_event_epoch,
+                latest_event_epoch,
+            ) = _pending_summary(inventory, replayed_status.missing_terminal_keys)
+        cached = (
+            replayed_status,
+            replayed_count,
+            replay_diagnostics,
+            pending_count,
+            earliest_event_epoch,
+            latest_event_epoch,
+        )
+        replay_cache[identity_key] = cached
+        return cached
 
     for candidate in resolved:
         executor = getattr(candidate, "executor", None)
@@ -4505,6 +4675,21 @@ def _executor_backoff_admission_report(
             now=now,
             inventory=inventory_cache[identity_key],
         )
+        replayed_count = 0
+        replay_diagnostics: list[dict[str, object]] = []
+        pending_count, earliest_event_epoch, latest_event_epoch = _pending_summary(
+            inventory_cache[identity_key],
+            status.missing_terminal_keys,
+        )
+        if status.reconciliation is executor_backoff.ReconciliationStatus.PENDING:
+            (
+                status,
+                replayed_count,
+                replay_diagnostics,
+                pending_count,
+                earliest_event_epoch,
+                latest_event_epoch,
+            ) = _replay_pending(identity_key, status)
         if status.reconciliation in {
             executor_backoff.ReconciliationStatus.PENDING,
             executor_backoff.ReconciliationStatus.UNKNOWN,
@@ -4514,6 +4699,11 @@ def _executor_backoff_admission_report(
                 "model_id": model_id,
                 "diagnostics": list(status.diagnostics),
                 "reconciliation": status.reconciliation.value,
+                "pending_count": pending_count,
+                "earliest_event_epoch": earliest_event_epoch,
+                "latest_event_epoch": latest_event_epoch,
+                "replayed_count": replayed_count,
+                "replay_diagnostics": replay_diagnostics,
             }
             if status.evidence_refs:
                 detail["evidence_refs"] = list(status.evidence_refs)
@@ -12004,8 +12194,16 @@ def resume_workflow_run(
     if "needs_human" in updated.facets:
         return result
     next_job = dispatch_or_stop(updated)
-    if next_job is not None:
-        result["job_id"] = next_job["job_id"]
+    classified = classify_dispatch_result(
+        next_job,
+        registry=registry,
+        run_id=run.run_id,
+        before_phase=updated.current_phase,
+    )
+    if classified["kind"] == "job":
+        result["job_id"] = classified["job_id"]
+    elif classified["kind"] == "decision":
+        result["dispatch_decision"] = dict(next_job)
     return result
 
 

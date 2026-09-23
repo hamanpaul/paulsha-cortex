@@ -25,26 +25,26 @@ feature-oneshot 的現行 79 runtime 純函式實算 7/Red；#831 完整穩定�
 
 ## Tasks
 
-- [ ] source T01：只新增 execution_profile.py 純 descriptor/profile/requirements schema API；嚴格版本、原生 effort grammar、三層 plane/tagged unknown（C01/C02/C06/C07）。
+- [x] source T01：只新增 execution_profile.py 純 descriptor/profile/requirements schema API；嚴格版本、原生 effort grammar、三層 plane/tagged unknown（C01/C02/C06/C07）。
       使用 stdlib，normal direct import 不改現有 __init__/loader/launcher/registry/CLI；不讀檔／環境或呼叫模型。
-- [ ] source T02：實作 typed canonical bytes、分 domain record/actual key、unknown 無 actual key、metadata 排除與 immutable serializer（C03–C08）。
+- [x] source T02：實作 typed canonical bytes、分 domain record/actual key、unknown 無 actual key、metadata 排除與 immutable serializer（C03–C08）。
       逐 byte 遵守 Design D3/D4 完整欄位、projection、node tags/arity、JSON token／escaping、NUL／uint64 framing；無 approved／qualified API，role 是資料不是 build fallback。
-- [ ] tests T03：新增虛構 descriptor 的 string/new value/integer/finite number/nested effort 正負矩陣與 exact requested/resolved/observed round-trip（C01/C02/C07）。
+- [x] tests T03：新增虛構 descriptor 的 string/new value/integer/finite number/nested effort 正負矩陣與 exact requested/resolved/observed round-trip（C01/C02/C07）。
       unknown model/role 的 runtime eligibility 留母 resolver；不把 schema 合法視為相容性已過。
-- [ ] tests T04：新增 canonical golden vectors、field perturbation、metadata-only、set/order/type/domain 差異及缺 observed 無 actual key（C03–C06）。
+- [x] tests T04：新增 canonical golden vectors、field perturbation、metadata-only、set/order/type/domain 差異及缺 observed 無 actual key（C03–C06）。
       直接使用 Design D4 兩個完整 canonical payload／key 與五個 int/float/string/signed-zero key；替換 node shape／framing／projection 的負控制須拒絕，不能用被測函式自產 expected；測量 pass 不產資格 grant。
-- [ ] tests T05：新增 mutation alias、duplicate keys、bool version/number、NaN/Inf、surrogate、未知欄位、depth/nodes/bytes 邊界、循環／未來版負例（C07/C08/C10）。
+- [x] tests T05：新增 mutation alias、duplicate keys、bool version/number、NaN/Inf、surrogate、未知欄位、depth/nodes/bytes 邊界、循環／未來版負例（C07/C08/C10）。
       依 D5 精確計完整 descriptor+profile/root/keys，16/17、4096/4097、65536/65537、1048576/1048577 成對；transport/semantic 錯誤分開且提早中止，預解析／native／等價 JSON 路徑一致；D1 reference 正負 grammar；no-version legacy input 拒收但原 bytes 不變。
-- [ ] tests T06：以公開 API 做 fixture consumer 與獨立 process／hash seed round-trip、純函式 I/O 邊界與負控制（C09/C10）。
+- [x] tests T06：以公開 API 做 fixture consumer 與獨立 process／hash seed round-trip、純函式 I/O 邊界與負控制（C09/C10）。
       從 checkout 外讀已建 package 的新 module 驗 packaging/import；不因此宣稱 production routing／installed Manager 已接線。
-- [ ] tests T07：跑既有 model identity/envelope/resolution/per-work-chain/profile CLI 回歸、focused/full suite 與 CI；保存實際 RED→GREEN／候選 SHA 與未執行項目。
-- [ ] documentation T08：同步 README／純 API 契約、版本／數值規則、未知值、native effort 擴充與 parent AC 對照；#581/#842/PatchMUD #37 owner 邊界不得遺失。
+- [x] tests T07：跑既有 model identity/envelope/resolution/per-work-chain/profile CLI 回歸、focused/full suite 與 CI；保存實際 RED→GREEN／候選 SHA 與未執行項目。
+- [x] documentation T08：同步 README／純 API 契約、版本／數值規則、未知值、native effort 擴充與 parent AC 對照；#581/#842/PatchMUD #37 owner 邊界不得遺失。
       #842 只依 core 契約；母 T03/T04/T05/T06 的 routing/qualification/migration 接線仍另行交付。
       區分 core wire 升版與 adapter protocol 欄位新值；後者 descriptor-only／key 自然變。記載 D5 transport 界內的 encoding 等價保證及超大 padding 的獨立拒絕。
-- [ ] CLI T09：既有 --help smoke 與文件說明本件沒有新 flags/commands，也不提供任何 model/agent/effort 固定清單或 runtime probe。
-- [ ] changelog T10：正式 Cortex delivery 新增 changelog.d/execution-profile-schema-core.md 並同步 CHANGELOG.md [Unreleased]，本 planning-only authoring 不代寫。
-- [ ] tests T11：以實際 PR context 跑 policy R-09/R-16/R-19/R-22 等適用 gate；只允許本 core production 檔，若必須改其他 consumer 則停止並重裁 scope/sizing。
-- [ ] documentation T12：分帳 core implemented/tests/merged/package import 與母 routing/installed/live；未知或 legacy qualification 不補值，真人批准仍由 #842 政策要求的 receipt 決定。
+- [x] CLI T09：既有 --help smoke 與文件說明本件沒有新 flags/commands，也不提供任何 model/agent/effort 固定清單或 runtime probe。
+- [x] changelog T10：正式 Cortex delivery 新增 changelog.d/execution-profile-schema-core.md 並同步 CHANGELOG.md [Unreleased]，本 planning-only authoring 不代寫。
+- [x] tests T11：以實際 PR context 跑 policy R-09/R-16/R-19/R-22 等適用 gate；只允許本 core production 檔，若必須改其他 consumer 則停止並重裁 scope/sizing。
+- [x] documentation T12：分帳 core implemented/tests/merged/package import 與母 routing/installed/live；未知或 legacy qualification 不補值，真人批准仍由 #842 政策要求的 receipt 決定。
 
 ## Dependencies
 
