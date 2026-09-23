@@ -25,7 +25,8 @@ identity 與其 `retry_after_epoch`。若全部候選都仍在 cooldown，Manage
 admission 前也會拿 registry 內既有 terminal job 當 caller inventory 與 store 對帳；若 store
 unreadable/corrupt，或 inventory 與 store 還在 pending/conflict，Manager 會回
 `reason: executor-backoff-unknown`，明確保留 unknown 而不是把它折成 allow/deny，也不捏造
-`retry_after_epoch`。修好 store 後重新 `resume` 即可；slice lane 的 admission 與 request／tick consumer 現在也會共用這份 durable state，透過 `dispatch_skipped_by_backoff` 明確區分 known cooldown 與 unknown（unknown 不代表 quota 已可用），但 #825 的 quota pool／forecast／reservation（R9）仍未完成。
+`retry_after_epoch`；pending 終局由 admission 重播補 ack，unknown 診斷含 pending／replayed 計數與
+replay diagnostics。修好 store 後重新 `resume` 即可；slice lane 的 admission 與 request／tick consumer 現在也會共用這份 durable state，透過 `dispatch_skipped_by_backoff` 明確區分 known cooldown 與 unknown（unknown 不代表 quota 已可用），但 #825 的 quota pool／forecast／reservation（R9）仍未完成。本票 merge 後才可再升級含 #928 的 pin。
 
 ### Planning capability probe boundary
 
