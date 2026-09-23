@@ -318,6 +318,37 @@ def _persist_legacy_v1(
     )
 
 
+def test_merge_authorization_body_rejects_superseded_v1_for_copilot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env = _bootstrap_review_env(tmp_path)
+    legacy = _persist_legacy_v1(env)
+    monkeypatch.setattr(
+        work_actions,
+        "_validate_foreign_review",
+        lambda *args, **kwargs: env.foreign_payload,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="merge authorization superseded evidence requires maintainer review",
+    ):
+        work_actions._merge_authorization_body(
+            active={"run_id": env.run_id, "workflow_step_ids": env.workflow_step_ids},
+            authority=env.authority,
+            binding=env.binding,
+            preflight=_default_preflight(),
+            remote=_default_delivery_facts(),
+            copilot=SimpleNamespace(),
+            foreign_review=SimpleNamespace(
+                path=str(env.foreign_path),
+                expected_hash=env.foreign_hash,
+            ),
+            superseded_authorization=legacy,
+        )
+
+
 def _v2_body(
     env: ReviewRunEnv,
     *,
