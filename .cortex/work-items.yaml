@@ -1588,3 +1588,39 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/authorized-merged-run-completion-finalizer-design.md'
     excludes: []
+  self-publication-planning-producers:
+    title: 'self-publication-planning-producers'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#979'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/self-publication-planning-producers/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/self-publication-planning-producers-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/self-publication-planning-producers-design.md'
+    excludes: []
+  self-publication-pr-producer:
+    title: 'self-publication-pr-producer'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#980'
+      - kind: path
+        ref: 'docs/superpowers/plans/self-publication-pr-producer.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/self-publication-pr-producer-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/self-publication-pr-producer-design.md'
+    excludes: []
+  pr-create-adopt-provenance:
+    title: 'pr-create-adopt-provenance'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#982'
+      - kind: path
+        ref: 'docs/superpowers/plans/pr-create-adopt-provenance.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/pr-create-adopt-provenance-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/pr-create-adopt-provenance-design.md'
+    excludes: []

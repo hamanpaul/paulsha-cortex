@@ -16,23 +16,23 @@ JobRegistry 所有 WorkflowRun reconstruction、copy、ordinary update、seriali
 
 ### R2 — Narrow private append
 
-提供僅供 Manager producer seam 呼叫的 internal append operation。輸入需含 expected full registry raw-byte revision、exact run/work/repo/claim key、Child A strict typed receipt、以及 producer 在同一 row 更新的明確欄位 patch。操作本身不接受 caller-supplied dict，不做 publication side effect或證據推論。
+提供僅供 Manager producer seam 呼叫的 private append operation。輸入需含 expected full-registry raw-byte revision、exact run/work/repo/claim key、非空 `Sequence[PublicationReceipt]`（每筆均為 Child A strict typed value）、以及 producer 對同一 row 更新的一份明確欄位 patch。單筆 plan/PR append 是長度 1 的 batch；多輸出 brainstorm 必須在一個 batch 提交全部 receipts。操作不接受 caller-supplied dict，不做 publication side effect或證據推論。
 
-在 mutation 前重新載入/確認 current snapshot、run row與 claim era。B 僅核 Child A typed value 的內部 digest/schema、current run/claim binding，以及 receipt 與同一 row coupled patch 的結構一致性；它不讀 workspace、GitHub 或 evidence sidecar，也不呼叫 C GET。#979/#980 必須在呼叫前驗實際 filesystem/remote side effect。若 PR variant，B 可檢查 receipt 內 create-witness tuple 與 published-object tuple相同；這只是結構一致，不是 B 認證 POST 或 GET。
+在任何 mutation 前重新載入/確認 current snapshot、run row與 claim era。整個 batch 的 receipts 必須綁定同一 producer kind/event ID 與 repo/work/run/claim；batch 內 `(producer_event_id, publication_id)`、receipt ID 與 variant object key 均不得衝突。B 僅核 Child A typed values 的內部 digest/schema、current run/claim binding，以及所有 receipts 與同一份 coupled patch 的結構一致性；它不讀 workspace、GitHub 或 evidence sidecar，也不呼叫 C GET。#979/#980 必須在呼叫前驗實際 filesystem/remote side effect。若 PR variant，B 可檢查 receipt 內 create-witness tuple 與 published-object tuple相同；這只是結構一致，不是 B 認證 POST 或 GET。
 
 ### R3 — Atomicity and full-registry writer safety
 
 硬依賴 #966 merged exact raw-byte revision CAS under canonical transaction lock; stale writer returns visible conflict and restores in-memory state. #862's slice-level binding CAS is narrower and cannot protect whole-file _persist(). Do not add merge/retry to stale append. No-lost-update test uses two processes against one registry snapshot and proves stale whole-file replacement is impossible.
 
-Append and coupled WorkflowRun fields are one registry snapshot commit. The filesystem/remote operation and its immutable intent/result journal belong to #979/#980/#983; registry append only commits the verified receipt and row fields. Any failed persist must retain the previous durable row and not expose an in-memory success.
+All receipts in one non-empty append batch and the producer-coupled WorkflowRun fields are one registry snapshot commit and exactly one `_persist()` attempt. The filesystem/remote operation and immutable intent/result journal belong to #979/#980/#983; registry append only commits verified receipts and row fields. Any failed persist must retain the previous durable row and not expose an in-memory success.
 
 #968 is a same-module field/API owner. Coordinate and serialize exact API/schema integration before production edits. #967 lifetime Manager lock does not substitute for #966, which covers all registry writers.
 
 ### R4 — Idempotency/collision contract
 
-- Exact identical (producer_event_id, publication_id, receipt payload) replay returns prior committed state without another row or coupled-field rewrite.
-- Same pair/different payload, publication_id under another event, duplicate receipt_id with different payload, or same variant-specific object key under a different pair is conflict; planning key uses artifact kind/ref and PR key uses repository/number/id/node_id.
-- One event may have multiple distinct publication IDs for different outputs.
+- A batch contains one producer kind/event ID and is either wholly new or an exact replay of the whole previously committed receipt set and identical coupled patch. Exact full-batch replay returns prior state without another row or coupled-field rewrite.
+- A partly pre-existing batch, same pair/different payload, publication_id under another event, duplicate receipt_id with different payload, or same variant-specific object key under a different pair is conflict; no subset is appended. Planning key uses artifact kind/ref and PR key uses repository/number/id/node_id.
+- One event may have multiple distinct publication IDs for different outputs; all are appended atomically as one batch with the single producer patch.
 - Invalid container blocks append. An opaque malformed history row blocks only when uniqueness/replay cannot be established safely; it is never dropped or promoted.
 
 ### R5 — Reachable foreign planning artifact negative
@@ -42,8 +42,8 @@ Create a real temporary repo/workspace and authority whose confirmed source_revi
 ### Acceptance criteria
 
 - [ ] All ordinary Registry create/start/intake/update/reconstruction paths retain receipt state and reject request-facing injection/replacement/removal.
-- [ ] Private append revalidates exact current run/claim and A union hashes, atomically appends with coupled fields, and uses #966 full-registry CAS on every persistence.
-- [ ] Exact replay, conflict keys, multiple outputs/event, cross-run/claim, invalid container/row, stale revision, persist/rename/fsync/rollback failure all have zero false receipt and no lost prior row.
+- [ ] Private append accepts a non-empty typed receipt batch; validates every item and exact run/claim/revision, appends all new receipts plus one coupled patch in exactly one `_persist()` using #966 full-registry CAS; exact full-batch replay is a no-op and partial/conflicting batches write nothing.
+- [ ] Exact batch replay, same-event multiple outputs, partial prior batch, within-batch duplicate/collision keys, cross-run/claim, invalid container/row, stale revision, persist/rename/fsync/rollback failure all have zero false receipt and no lost prior row.
 - [ ] Two-process race leaves either an explicit stale conflict or a serialized commit; never last-writer whole-file overwrite. Conflict is not auto-merged/retried.
 - [ ] Formal start and intake negative fixtures use mapped pre-existing foreign files, production entrypoints/starter, fresh reload, exact authority/hash equality, and no valid receipt.
 - [ ] Tests prove #862 slice CAS and #967 Manager lock cannot substitute for #966.

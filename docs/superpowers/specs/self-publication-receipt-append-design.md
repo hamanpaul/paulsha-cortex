@@ -16,9 +16,11 @@ The typed model is frozen by Child A. Registry code alone owns the durable row, 
 
 Every append runs through #966's exact whole-file revision CAS under the canonical transaction lock. The expected token is the hash of the raw registry bytes observed by the caller. A stale writer gets a conflict and its memory is restored; this method does not merge or silently retry. #862's slice-level binding CAS is separate and insufficient. #967's Manager-lifetime lock is also not a substitute for protection of all registry writers.
 
-### D3 — Single-row commit boundary
+### D3 — Batch receipts and one-row commit boundary
 
-The new receipt and producer-coupled fields live on the same WorkflowRun row and in the same registry snapshot persist. Filesystem/remote writes must already have their own owner-controlled durable intent/result journal. The registry does not attempt a distributed transaction. #979/#980 validate the external operation before calling append; registry checks only the typed receipt's internal hashes, exact row binding and same-row patch consistency.
+A private append accepts a non-empty sequence of strict typed receipts from one producer kind/event ID and one producer patch for one WorkflowRun. It revalidates every receipt against the same expected full-registry raw-byte revision and exact run/work/repo/claim row, then appends all receipts and applies the patch in exactly one `_persist()` attempt. This is required for one brainstorm event that publishes several eligible artifacts; a loop of single-receipt commits is not equivalent. A batch is either wholly new or an exact full-batch replay with the identical patch. Partial prior presence, duplicate pair/receipt/object keys within the batch, or any conflict fails before persistence.
+
+Filesystem/remote writes must already have their own owner-controlled durable intent/result journal. The registry does not attempt a distributed transaction. #979/#980 validate the external operation before calling append; registry checks only typed receipts' internal hashes, exact row binding and same-row patch consistency.
 
 ### D4 — Quarantine duplicate-key receipt JSON losslessly
 
@@ -48,9 +50,9 @@ The formal start/intake route constructs artifact rows from WorkAuthority-mapped
 | ordinary update with receipt replacement/removal | ignored or rejected; prior state retained |
 | request start/intake with receipt field | no receipt injection |
 | formal mapped foreign file start/intake | exact authority/hash present, no valid receipt |
-| append exact replay | existing committed receipt, no duplicate |
-| same event, new publication ID | append distinct output |
-| conflicting pair/publication/object | conflict, no mutation |
+| append exact full-batch replay | existing committed receipt set and identical patch, no rewrite |
+| same event, several new publication IDs | all outputs appended in one persist with one patch |
+| partial pre-existing batch or conflicting pair/publication/object | conflict, no mutation |
 | stale whole-file revision | #966 CAS conflict, memory restored |
 | concurrent second process | no lost first receipt, visible stale conflict |
 | #862 CAS only / #967 lock only | insufficient; do not satisfy precondition |

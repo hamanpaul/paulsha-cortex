@@ -15,7 +15,7 @@ artifact_classes:
 
 ## Authority and dependencies
 
-- Proposed #978 Child B; issue #993 已建立. Accepted contract: self-publication-receipt-append-spec.md and self-publication-receipt-append-design.md.
+- Child B of #978; live issue is #993. Accepted contract: self-publication-receipt-append-spec.md and self-publication-receipt-append-design.md.
 - Sole production owner: paulsha_cortex/coordinator/registry.py. Child A workflow.py freezes typed values; Child C github_delivery.py owns read-only PR GET.
 - Hard implementation prerequisite: #966 merged full registry raw-byte CAS for every _persist(); #862 slice CAS is not enough. Coordinate same-file ownership/API/merge order with #968 first. #967 Manager lock is not a substitute. #978 aggregate additionally retains its live #862 precondition.
 - #979 needs A+B. #980 needs A+B+C plus #982/#983. #978/#963/#847 remain open until aggregate acceptance; AC10 stays at #965/#847.
@@ -38,9 +38,9 @@ feature-oneshot projection; recompute on actual work registration:
 - [ ] T0 — prerequisites/owner gate: verify #966 merged raw-byte revision CAS, inspect exact API, coordinate with #968 owner; do not touch registry production code before both gates.
 - [ ] T1 — carry-forward: preserve A typed/opaque/invalid-container state through registry load, manual WorkflowRun reconstruction, ordinary update and copy; preserve duplicate/non-finite row token in the exact JSON-safe diagnostic wrapper, and prove wrapper reload never promotes it.
 - [ ] T2 — request boundary: prove create/start/intake/general update reject or ignore public receipt injection/replacement/removal while preserving pre-existing state.
-- [ ] T3 — narrow internal append: require trusted producer path, expected whole-file revision, exact run/work/repo/claim; append typed rows with the producer patch in one _persist().
-- [ ] T4 — collisions/replay: implement exact pair and object uniqueness rules; allow same event across distinct output publication IDs; fail conflicting history without mutation.
-- [ ] T5 — CAS/race tests: stale revision restores memory and returns explicit conflict; use two processes to show no lost update and no merge/retry.
+- [ ] T3 — narrow internal append: require trusted producer path, expected whole-file revision, exact run/work/repo/claim; accept a non-empty typed receipt sequence from one producer kind/event ID plus one producer patch and append the full batch in one `_persist()`.
+- [ ] T4 — collisions/replay: implement exact pair and object uniqueness rules across each batch; allow same event across distinct output publication IDs; exact whole-batch replay is a no-op; partial prior batch or any conflict writes nothing.
+- [ ] T5 — CAS/batch/race tests: one multi-output brainstorm batch plus coupled fields produces exactly one persist; exact batch replay is a no-op; stale revision restores memory and returns explicit conflict; use two processes to show no lost update and no merge/retry.
 - [ ] T6 — reachable negative: temporary repo, WorkAuthority-mapped pre-existing foreign file, formal work-action start and intake separately, production starter, exact post-reload planning_authority/hash, no valid receipt.
 - [ ] T7 — failure matrix: invalid-container, ambiguous raw row, duplicate-key/non-finite wrapper tampering, cross-run/claim, wrong PR POST-vs-GET id, atomic persist/fsync/rename failure and reload all fail closed.
 - [ ] T8 — docs/changelog/policy: document writer contract, add changelog fragment and Unreleased entry, run focused tests and PR-context policy preflight.
