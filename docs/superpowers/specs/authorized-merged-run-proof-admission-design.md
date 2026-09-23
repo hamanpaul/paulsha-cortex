@@ -88,3 +88,9 @@ Sizing 按 repo 當前純 helper 計算，不以驗收案例數估計 mechanical
 ## Operational boundary
 
 本設計不修改 repo、GitHub issue 或 runtime；規格文件只在指定 intake 目錄。實作必須等 #961 合併，使用新 WorkAuthority load semantics，再由 #962 做跨切片 R8(a)–(d) 的完整驗收。完成 #975 只代表 admission/proof slice 通過自身 tests/review/merge，不代表任何 run 已完成或 #962/#887 可關閉。
+
+## #977 consumer proof 組裝
+
+私有唯讀 oracle 回傳 immutable `run_binding`、`work_authority_binding`、`merge_authorization`、`step_bindings`、`gate_bindings` 與本地 `completion_record_inputs`，各欄依同 run/claim/head 的 Registry、原始 Manager 授權、job 與 trusted evidence 重新讀取並驗 hash。reset 後 pending/cleared 的 step/gate 不是歷史 passed 證據；job-backed step 缺少唯一成功 job／可信 evidence、Manager-only step 缺少原生 durable provenance 時只回 typed stop。不得只回 passed 布林值或讓 #977 補造 proof。
+
+`target_ref_sha` 不由本 oracle 回傳：#995 唯讀 inspector 每次 fresh GET default head，#977 才把它寫入記憶體 CompletionRecord draft。`completed_at` 由 #977 對既存 record 固定沿用或在新建時產生。每個 durable boundary 前由 #977 重新載入 current WorkAuthority/source revisions 與本 oracle；此切片不寫 CompletionRecord、OutcomeStore、Registry、journal 或 workspace。step ID 依原授權 `run_id:phase:card` 規則核對；job-backed step 以 run+phase+card+claim era+head 關聯唯一成功 job，不發明 registry.workflow_step_id 欄。若現有 durable evidence 不足以建立合法 terminal steps/gates，#975 proof 必須拒絕而不能把缺欄責任轉嫁 #976/#977。
