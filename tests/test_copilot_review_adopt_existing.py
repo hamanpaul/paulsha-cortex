@@ -501,6 +501,115 @@ def test_r6_f_copilot_review_timeout_next_actions_includes_review_attest(
     assert "review-attest" in resume_actions
 
 
+def test_persisted_copilot_needs_human_stop_returns_list_shaped_next_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persisted copilot-* stop 重播時，next_actions 維持 list[str]。"""
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    work_actions._load_work_run(
+        state_path=state,
+        workflow_registry=registry,
+        authority=authority,
+    )
+    row = _journal_row(state, run_id)
+    row["ship"] = {
+        "phase": "needs_human",
+        "reason": "copilot-review-timeout",
+    }
+    _write_journal_row(state, run_id, row)
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=1000.0,
+    )
+
+    assert github.request_copilot_calls == 0
+    assert result.get("action") == "needs_human"
+    assert result.get("reason") == "copilot-review-timeout"
+    next_actions = result.get("next_actions", ())
+    assert isinstance(next_actions, list)
+    assert next_actions == ["abandon", "review-attest"]
+
+
+def test_copilot_finding_budget_exhausted_returns_list_shaped_next_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copilot 修復預算耗盡分支回傳的 next_actions 維持 list[str]。"""
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    work_actions._load_work_run(
+        state_path=state,
+        workflow_registry=registry,
+        authority=authority,
+    )
+    row = _journal_row(state, run_id)
+    row["repair_rounds"] = 2
+    row["ship"] = {
+        "phase": "needs-fix",
+        "head": HEAD,
+    }
+    _write_journal_row(state, run_id, row)
+
+    next_head = "c" * 40
+    next_tree = "d" * 40
+    monkeypatch.setattr(
+        work_actions,
+        "run_preflight",
+        lambda **kwargs: PreflightResult(
+            passed=True,
+            failed_stage=None,
+            policy=CommandResult(("policy",), 0, "", ""),
+            ci_parity=CommandResult(("preflight",), 0, "", ""),
+            head=next_head,
+            tree_hash=next_tree,
+        ),
+    )
+    github.fetch_delivery_facts = lambda **kwargs: DeliveryFacts(
+        head=next_head,
+        mergeable=True,
+        mergeable_state="clean",
+        checks=(GitHubCheck("pytest", "completed", "success"),),
+        copilot_reviews=(),
+        review_threads=(),
+        closing_issues=(12,),
+        active_openspec_absent=True,
+        archive_present=True,
+        openspec_required=False,
+    )
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=1000.0,
+    )
+
+    assert github.request_copilot_calls == 0
+    assert result.get("action") == "needs_human"
+    assert result.get("reason") == "copilot-finding-budget-exhausted"
+    next_actions = result.get("next_actions", ())
+    assert isinstance(next_actions, list)
+    assert next_actions == ["abandon", "review-attest"]
+    assert result.get("repair_rounds_used") == 3
+    assert result.get("repair_rounds_budget") == 2
+    assert result.get("repair_rounds_remaining") == 0
+
+    updated = _journal_row(state, run_id)
+    assert updated["repair_rounds"] == 3
+    assert updated["ship"]["phase"] == "needs_human"
+    assert updated["ship"]["reason"] == "copilot-finding-budget-exhausted"
+    assert updated["ship"]["head"] == next_head
+
+
 def test_adopt_existing_copilot_review_selects_latest_by_epoch_and_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
