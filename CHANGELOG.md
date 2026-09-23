@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **Refine 0.1.11 main-sync 子票進件**：為 #987–#990 新增 accepted spec／design／todo 與唯一 work item 綁定，依序承接 #972 的 main probe、typed diagnostics、recovery actions 與 durable Manager context；產品實作與 #943 整合驗收仍待後續交付。
 - **preflight visudo 測試環境**：sudoers 整合測試將系統 sbin 加入個別測試的 PATH，避免 #862 exact-Candidate preflight 因 service PATH 差異誤判失敗。
 - **Refine 0.1.11 子票進件（第三批）**：為 #975、#976、#983 發布已審核的 accepted 規劃與 work item；#975／#976 的合併 run closure 與 #983 的 delivery journal 條件寫入仍待各自前置及產品實作驗收。
 - **Refine 0.1.11 Registry CAS 進件**：為 #966 新增 accepted spec／design／todo 與唯一 work item，作為 #818 多進程寫入防護的第一階段；產品實作與 #967 owner lock 仍待獨立驗收。
