@@ -1408,3 +1408,15 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/openspec-remote-archive-authority-reconciliation-design.md'
     excludes: []
+  registry-revision-cas:
+    title: 'registry-revision-cas'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#966'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/registry-revision-cas/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-revision-cas-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-revision-cas-design.md'
+    excludes: []
