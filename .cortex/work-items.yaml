@@ -1384,3 +1384,39 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/review-gate-adjudication-exit-design.md'
     excludes: []
+  fix-standard-archive-step-evidence:
+    title: 'fix-standard-archive-step-evidence'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#885'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-standard-archive-step-evidence/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-standard-archive-step-evidence-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-standard-archive-step-evidence-design.md'
+    excludes: []
+  openspec-remote-archive-authority-reconciliation:
+    title: 'openspec-remote-archive-authority-reconciliation'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#961'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/openspec-remote-archive-authority-reconciliation/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/openspec-remote-archive-authority-reconciliation-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/openspec-remote-archive-authority-reconciliation-design.md'
+    excludes: []
+  registry-revision-cas:
+    title: 'registry-revision-cas'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#966'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/registry-revision-cas/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-revision-cas-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-revision-cas-design.md'
+    excludes: []
