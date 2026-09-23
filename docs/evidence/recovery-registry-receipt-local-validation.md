@@ -1,15 +1,17 @@
 # Recovery registry receipt — local validation record
 
-This record covers the local `#862` recovery-registry-receipt candidate on
-`feature/862-recovery-registry-receipt`. It documents pre-archive validation
-only. It does not claim archive, merge, issue closure, installation, loaded
+This record covers local validation for the `#862` recovery-registry-receipt
+work on `feature/862-recovery-registry-receipt`. The gate result below belongs to
+the earlier merged-main candidate, before this archive-state repair. The existing
+official archive and promoted spec are preserved by this repair. This card does
+not claim a new archive action, merge, issue closure, installation, loaded
 runtime verification, or any downstream B/C/D recovery action.
 
-## Local gates
+## Earlier candidate gate
 
 | Check | Command shape | Exit | Observation |
 | --- | --- | ---: | --- |
-| Full pytest preflight | `env -u PSC_REPO_ROOT $VENV_PYTHON -m pytest -q` | 0 | `6367 passed, 44 skipped, 186 subtests passed` on the merged current-main tree |
+| Full pytest | `env -u PSC_REPO_ROOT $VENV_PYTHON -m pytest -q` | 0 | `6367 passed, 44 skipped, 186 subtests passed` on the earlier merged current-main tree, before this archive-state repair |
 
 ## CLI help smoke
 
@@ -23,16 +25,16 @@ Both commands ran from a temporary directory outside the checkout with
 
 ## Planning-boundary observations
 
-- `docs/superpowers/workstreams/recovery-registry-receipt/todo.md` and
-  `openspec/changes/recovery-registry-receipt/tasks.md`
+- `docs/superpowers/workstreams/recovery-registry-receipt/todo.md` and the
+  archived `openspec/changes/archive/2026-09-22-recovery-registry-receipt/tasks.md`
   still carry identical `domain_breadth` / `state_consistency` /
   `invariant_count` / `artifact_classes`, and their checklist lines remain
   byte-identical after normalizing `[x]` to `[ ]`.
-- The accepted intake authority is present in the active change at
-  `openspec/changes/recovery-registry-receipt/`. Proposal, design, task metadata,
-  and spec content remain the accepted baseline; this candidate changes only
-  existing task checkboxes. The active task list and workstream todo have the
-  same 14 pre-archive tasks after checkbox normalization.
+- The accepted intake authority remains in the official archive at
+  `openspec/changes/archive/2026-09-22-recovery-registry-receipt/`, with the
+  promoted spec at `openspec/specs/recovery-registry-receipt/spec.md`. The
+  active change path is absent. The archived task list and workstream todo have
+  the same 14 pre-archive tasks after checkbox normalization.
 - The accepted Superpowers trio, accepted OpenSpec trio, and combined six-file
   bundle each remain complete under `assess_planning_completeness()`.
 - `work_bridge.current_sizing_snapshot()` still projects those tracked accepted
@@ -56,17 +58,19 @@ created later on 2026-09-21 (20:54 +08), binds issue `#862` and OpenSpec
 accepted spec/design, and todo inputs. The stored plan digest matches the
 unchanged frozen plan snapshot.
 
-The todo and active OpenSpec task prose remain unchanged; their historical
+The todo and archived OpenSpec task prose remain unchanged; their historical
 wording is time-scoped to the pre-publication baseline. T10 is checked in both
-task lists to reflect the verified prerequisites and this card's changelog/local-
-validation alignment. The frozen plan input was not modified. Earlier archive
-commits remain in Git history, while this candidate restores the active change
-so the task list represents pre-archive work. The Manager-owned archive action
-remains pending and is not claimed here.
+task lists to reflect the verified prerequisites and the changelog/local-
+validation alignment. The frozen plan input was not modified. The previous
+Candidate already contained the official archive and promoted spec; this repair
+restores that state after the latest-main merge recreated an empty active change
+directory. The active path is absent, and this card did not run a new archive
+action.
 
 ## Redispatch regression check
 
 The current-main merge includes the service-PATH fixture fix from #984 and
-preserves both the #862 and mainline Unreleased entries. The full pytest
-preflight passed on this merged tree, including the previously failing
-service-PATH fixture.
+preserves both the #862 and mainline Unreleased entries. The earlier full pytest
+run covered that merged tree, including the previously failing service-PATH
+fixture; the current repair candidate requires its own authoritative preflight
+and pytest gate.
