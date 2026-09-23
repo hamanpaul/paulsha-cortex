@@ -18,13 +18,13 @@ issue: 995
 
 ### D3 — 驗 draft 後才把 evaluator 的 record-valid bit 設 true
 
-呼叫 `fetch_remote_closure` 後先保留原始 `RemoteClosureFacts.completion_record_valid=False`。先用 `completion.validate_completion_record` 正規化記憶體 draft；由 authority、fresh merge facts、run ID、step IDs 與 proof-validated refs 組成 expected `work_authority`，要求 draft 完整欄位 exact equal；candidate 必須等於 expected_head，target_ref_sha 必須等於當次 facts.default_head。只有這些檢查全數成功，才以 `dataclasses.replace(facts, completion_record_valid=True)` 產生 evaluator facts 並呼叫 `evaluate_remote_closure`。invalid draft 絕不可到達 evaluator。不可呼叫 `completion_records_semantically_match` 作為 exact check，因其忽略 volatile source revision 與 optional fields。旗標只代表本次記憶體 draft 已通過 validation，不表示磁碟已有 record。
+第一階段呼叫 `fetch_remote_closure`，保留原始 `RemoteClosureFacts.completion_record_valid=False` 並回傳同次 `default_head`；不接收 draft、不呼叫 evaluator。Manager 以此 head 組成完整 draft 後，第二階段只接受原 snapshot 與該 draft，再用 `completion.validate_completion_record` 正規化記憶體 draft；由 authority、fresh merge facts、run ID、step IDs 與 proof-validated refs 組成 expected `work_authority`，要求 draft 完整欄位 exact equal；candidate 必須等於 expected_head，target_ref_sha 必須等於當次 facts.default_head。只有這些檢查全數成功，才以 `dataclasses.replace(facts, completion_record_valid=True)` 產生 evaluator facts 並呼叫 `evaluate_remote_closure`。invalid draft 絕不可到達 evaluator。不可呼叫 `completion_records_semantically_match` 作為 exact check，因其忽略 volatile source revision 與 optional fields。旗標只代表本次記憶體 draft 已通過 validation，不表示磁碟已有 record。
 
 此 API 不驗證 evidence 檔案的內容。#975 proof oracle 必須先提供已驗證 ref/hash；inspector 驗證這些 identity 在 draft 與 expected binding 中 exact 相同，不把 remote observation 當成 workflow gate pass。
 
 ### D4 — 回傳只讀觀察，不代替 completion persistence
 
-Inspection result 至少帶 normalized/evaluated facts、gate result、default_head、merge_commit、PR head/parent、Todo revisions、normalized record draft、expected authority binding。它不宣稱 CompletionRecord 已存在、已寫入或已 read-back；Manager #977 在 record/outcome boundary 另做 exact persistence/read-back。測試應 spy evaluator：valid draft 走到 evaluator 時旗標必為 true；invalid draft 必須在 evaluator 前拒絕。
+第一階段 result 帶 raw facts/default_head 且 record-valid=false；第二階段 result 至少帶 normalized/evaluated facts、gate result、default_head、merge_commit、PR head/parent、Todo revisions、normalized record draft、expected authority binding。它不宣稱 CompletionRecord 已存在、已寫入或已 read-back；Manager #977 在 record/outcome boundary 另做 exact persistence/read-back。測試應 spy evaluator：valid draft 走到 evaluator 時旗標必為 true；invalid draft 必須在 evaluator 前拒絕。
 
 ### D5 — GitHub client read-only boundary
 
@@ -40,18 +40,20 @@ verify_remote_closure 可留在原控制流程，或只重用抽出的純 helper
 
 ## API sketch
 
-The implementation should expose a read-only result with these semantic fields:
+The implementation should expose two read-only API results for one durable-boundary observation. The first call returns an immutable raw snapshot with fresh RemoteClosureFacts, default_head and Todo revisions, keeping completion_record_valid=false and without invoking the evaluator. Manager uses that default_head to create a complete draft. The second call accepts only that snapshot plus the draft and returns:
 
-- fresh RemoteClosureFacts, including default_head and Todo revisions;
-- allowed/reasons from the existing closure evaluator;
+- allowed/reasons from the existing closure evaluator after validation;
 - normalized CompletionRecord draft;
 - complete expected WorkAuthority binding derived from the exact inputs;
+- the same snapshot identity/default_head used by the first call;
 - no path, write receipt, registry revision, journal row, or claim that persistence has occurred.
+
+Each later durable boundary starts a fresh first call; neither API caches or reuses a previous observation.
 
 Inputs must be explicit keyword arguments. The API must not accept an arbitrary temporary WorkflowRun or let the caller claim passed gate status. It receives proof-validated evidence references only as identity values.
 
 ## Verification design
 
-Add tests/test_delivery_read_only_closure.py with a fake runner returning GET payloads for PR, repo/default ref, compare, merge commit, issues, OpenSpec tree and Todo files. Assert a successful exact inspection validates and normalizes the in-memory draft first, then calls the evaluator with completion_record_valid=True; invalid/missing/conflicting draft must not call the evaluator or promote the flag. Reject non-merged PR, wrong head, missing candidate parent, non-merge commit, wrong default ancestry, open issue, active/missing archive, incomplete Todo, target_ref_sha/default drift, authority/source revision drift and malformed responses.
+Add tests/test_delivery_read_only_closure.py with a fake runner returning GET payloads for PR, repo/default ref, compare, merge commit, issues, OpenSpec tree and Todo files. Assert first-stage GET returns default_head with record-valid=false, Manager builds a complete draft using that head, and second-stage inspection validates and normalizes the draft first, then calls the evaluator with completion_record_valid=True; invalid/missing/conflicting draft must not call the evaluator or promote the flag. Reject non-merged PR, wrong head, missing candidate parent, non-merge commit, wrong default ancestry, open issue, active/missing archive, incomplete Todo, target_ref_sha/default drift, authority/source revision drift and malformed responses.
 
 Mutation audit should patch CompletionRecord writer, quarantine/atomic writers, evidence writer, registry/journal/outcome writers, workspace creator, preflight/push, archive helper and _ship_action to raise if reached. Assert the request runner sees only GET and temp workspace/durable stores remain byte-identical. Separately retain a regression proving verify_remote_closure still performs its established CompletionRecord write/read-back. Run focused tests, full repo-required tests and policy check with the eventual PR context; report external GitHub state only as read evidence, never as a mutation.

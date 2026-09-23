@@ -58,7 +58,7 @@ Manager 在呼叫 #976 前比對 fresh WorkAuthority/source revisions、#975 pro
 
 1. Manager 只經 #967 owner-locked daemon 路徑進入；讀 exact ongoing verify/authority_restart candidate，取得 per-run finalizer critical section。若已 `needs_human` 且未 operator resume，沿既有 gate 返回，不執行自動 retry。
 2. fresh-load 當前 WorkAuthority/source revisions，重比 run/claim identity，執行 #975 proof。若 #975 consumer shape 未 frozen 或不足以提供真實 step/evidence/gate/record fields，停在 durable step 前，不合成資料。
-3. 從 exact proof refs 建記憶體 CompletionRecord draft；呼叫 pure closure inspector。Inspector 保留 raw `completion_record_valid=False`，先 validate draft、authority、candidate/default_head exact match，再設 true 並 evaluate closure。檢查 PR merged/head/merge-parent/ancestry/issues/OpenSpec/Todo。
+3. 先由 #995 第一階段 GET raw facts/default_head（record-valid=false、零 evaluator）；從 exact proof refs 加該次 default_head 建完整記憶體 CompletionRecord draft；第二階段以同次 facts 驗 draft、authority、candidate/default_head exact match，再設 true 並 evaluate closure。檢查 PR merged/head/merge-parent/ancestry/issues/OpenSpec/Todo。
 4. 在 CompletionRecord 持久化前再 fresh-load authority/source、重跑 proof 和 inspector；若與第 2–3 步 snapshot 不同，stop。透過 conditional writer child no-follow exact read existing `completed_at`，再 create-if-absent CAS 或 exact reuse；read-back/hash exact compare。
 5. 在 OutcomeStore append 前第三次 fresh-load authority/source、重跑 proof/inspector；確認 target_ref_sha 仍等於 same default head，且 CRecord hash/payload exact。由注入 registry/runtime configuration取得 explicit OutcomeStore.path，取 conditional-CAS child canonical snapshot/revision；用 `append_if_exact_or_create(expected_revision=...)`。同 ID complete payload exact match 才 zero-write reuse，mismatch stop；新 ID stale revision conflict 時不可拿舊 proof retry。
 6. 在 #976 terminal CAS 前再 fresh-load authority/source、重跑 proof/inspector；讀 exact CRecord/outcome。所有外部 facts 在 Manager 比較並與前一 snapshot/rows exact match。
@@ -91,3 +91,7 @@ Manager 在呼叫 #976 前比對 fresh WorkAuthority/source revisions、#975 pro
 需覆蓋每次寫入前 source revision 在讀取後改變、refresh proof mismatch、default-head 漂移、CRecord race（同/不同 payload）、outbox 同 ID 不同 payload、different-ID lost-update race、stale expected outbox revision、path alias/injected-registry mismatch、active job/head/auth/state revision CAS drift，以及各 durable crash 前後至少三次相同重入。各前置 child 的 unit tests 繼續單獨保留。
 
 保留既有 post-merge closure、done-ship resume、retry invalidation、production wiring、work actions、work claim、provider scope 530、superseded recovery、daemon tick isolation 的全部 assertions。#962 在 #961/#975/#976/#995/#996/#997 prerequisites 合併後仍獨立跑 R1–R4/R6/R8(a–d) aggregate suite；#887 全部 AC 保持 parent gate。
+
+## #995 兩階段 facts 與 draft 次序
+
+Manager 先取 #995 的 raw RemoteClosureFacts/default_head（record-valid=false，零 evaluator），再由 #975 本地 proof 與同次 default_head 組成完整 draft；#995 第二階段驗證 draft、exact authority 與同次 facts 後才呼叫 evaluator。每個 durable boundary 前重新從第一階段 GET，不能把舊 snapshot 當 current。job-backed step 以 run+phase+card+claim era+head 關聯成功 job；Manager-only step 使用原生 durable provenance，不假定 Registry 有 workflow_step_id 欄。

@@ -42,7 +42,7 @@ authority restart 可把原本已 merge 的 run reset 到 verify，清空完成 
 
 - run_id、repo、work_id、claim key/era、candidate_head、verified_head。
 - 原始 Manager merge authorization 的 canonical path/ref 與 content hash。
-- exact workflow_step_ids；逐步回傳 phase/card、gate_result、candidate/head、job_id、workflow_run_id、workflow_step_id、claim era 與 evidence ref/hash。
+- exact workflow_step_ids；逐步回傳 phase/card、gate_result、candidate/head、run/claim era 與 evidence ref/hash。verify/review/ship 等 job-backed step 須有唯一成功 job ID/status，依 run+phase+card+claim era+head 關聯；claim/define 等 Manager-only step 的 job 欄位可為 null，但必須有原生 durable provenance。JobRegistry 無 workflow_step_id 欄，不能假定可用該欄 join 或合成 job。
 - 建立 CompletionRecord 所需的 spec/plan/verification hashes、builder/reviewer job IDs、verification evidence ref/hash、foreign-review evidence ref/hash，以及適用的 delivery review ref/hash；每項都需有可信內容與 passed 狀態證據。
 - workflow gate refs 的完整 kind/ref/hash；foreign-review 必須恰一份，delivery review 必須符合 WorkflowRun 當前契約，且 reviewer/builder independence 可核對。不得合成 verify/review/ship passed step 或 gate。
 - 精確 PR number、candidate、merge authorization identity，以及 proof 使用的當前 WorkAuthority source revisions。
@@ -51,7 +51,7 @@ authority restart 可把原本已 merge 的 run reset 到 verify，清空完成 
 
 ### I5 使用 pure closure inspector 純唯讀 closure inspection
 
-在 #975 proof 完整成立後，Manager 建立本次呼叫的記憶體 CompletionRecord draft，將 proof 的 run/step/evidence identity 與重新載入的 current WorkAuthority 完整寫入 draft，再呼叫 #995 pure closure inspector API。該 API 必須先以 `completion.validate_completion_record` 驗證 draft，確認 exact identity 後才把 fetched facts 的 `completion_record_valid` 從 false 提升為 true 並呼叫 evaluator。inspection 回傳 fresh RemoteClosureFacts 和 normalized expected authority binding；Manager 必須確認：
+在 #975 proof 完整成立後，Manager 先呼叫 #995 第一階段取得 raw facts 與 fresh default_head，raw record-valid 保持 false；以該次 head 加上 proof 的 run/step/evidence identity 及重新載入的 current WorkAuthority 建立完整記憶體 CompletionRecord draft，再將同次 facts snapshot 與 draft 交給 #995 第二階段。第二階段必須先以 `completion.validate_completion_record` 驗證 draft，確認 exact identity 後才把 fetched facts 的 `completion_record_valid` 從 false 提升為 true 並呼叫 evaluator。inspection 回傳 fresh RemoteClosureFacts 和 normalized expected authority binding；Manager 必須確認：
 
 - remote PR 為 merged，PR head 等於 candidate，merge commit 是真正 merge commit 且包含 candidate 為 parent。
 - merge commit 位於剛讀到的 default branch ancestry；required issues closed；適用的 OpenSpec active/archive 與 Todo closure 條件均通過。
@@ -84,7 +84,7 @@ CompletionRecord draft 只能使用 #975 已驗證的既有證據 refs，不得�
 CompletionRecord exact read-back 與 outcome exact durable append/compare 均通過後，Manager 再重新載入 current WorkAuthority/source revisions、重跑 #975 proof、讀 fresh remote closure/default/Todo facts，並 exact compare record/outcome；之後才呼叫 #976 restricted transition。Manager 負責所有外部 proof/remote/outcome 比較；#976 僅負責 Registry 內的 local compare-and-swap。傳給 #976 的欄位限於其凍結 API 支援的 registry-local expected run/job/claim/head/auth state 及支援的 terminal fields。Binding 的外部比較至少須覆蓋：
 
 - run_id、預期目前 status=ongoing/current_phase=verify/retry_classification=authority_restart、claim key/era、candidate_head、verified_head、authorization hash、完整 current WorkAuthority source revisions。
-- 無 active job 的預期；所有原 run workflow_step_ids、逐步 phase/card/status/job/evidence binding 與完整 gate_refs。
+- 無 active job 的預期；所有原 run workflow_step_ids、job-backed step 的成功 job/evidence、Manager-only step 的原生 durable provenance 與完整 gate_refs。
 - 合法 terminal WorkflowRun 全步驟資料：verify/review/ship steps 全為已證明的 passed、foreign-review 與唯一合規 delivery-review gate refs、reviewer/builder independence；不可合成 gate。
 - CompletionRecord path/hash、fixed completed_at、source revisions、PR number/head、merge commit/parents、inspection default_head/Todo revisions，以及 Manager 已透過 outbox CAS exact-checked 的 shipped outcome。這些外部欄位由 Manager 在 CAS 前自行精確核對；不得要求 #976 讀 GitHub、default branch、Todo 檔或 OutcomeStore，也不得把 #976 描述為跨系統 CAS。不得新增 WorkflowRun 欄位。
 

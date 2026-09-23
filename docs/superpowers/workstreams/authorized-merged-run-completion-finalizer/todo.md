@@ -58,3 +58,5 @@ Planning views：[spec](../../specs/authorized-merged-run-completion-finalizer-s
 ## Completion accounting
 
 #977 完成只代表 Manager finalizer 自身及必要 gates 通過；不代表 #962 aggregate R8(a–d) 完成，也不代表 #887 完成。merge、installed daemon、live recovery run、production delivery 各自提供獨立證據。
+
+- [ ] **T-final-inspection-order**：#995 第一階段 GET raw facts/default_head 且不跑 evaluator；Manager 填完整 draft；第二階段只驗同次 snapshot/draft 後評估。各 durable boundary 重做兩階段；測沒有 default_head 前不建立 draft 與 stale snapshot 拒絕。job-backed 與 Manager-only step 分別依原生證據核對。
