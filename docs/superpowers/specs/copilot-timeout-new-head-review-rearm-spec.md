@@ -23,7 +23,7 @@ Manager 在重啟 review epoch 前 MUST 重讀並相符：唯一 canonical run i
 
 ### R4 不重送同一 HEAD stop
 
-新 epoch 已對 candidate HEAD 建立後，相同 HEAD 的 stop 重播或重複 resume MUST NOT 再發出 Copilot request。外部 request 之前，Manager MUST 先持久化新 epoch 的 `review-requesting` phase 與 request identity；只有取得可驗證的成功回應才轉成既有 `review-requested` phase。若程序在持久化後、API 前中止，或在 API 後、回應持久化前中止，重播須先檢查有效 exact-HEAD review；無法證明外部結果時 MUST 記錄該 epoch 為 outcome-unknown 並停在 needs-human，不能以重送解決不確定性。`review-requesting` 是本票新增的 durable phase，不能冒充已完成的 Copilot review。
+新 epoch 已對 candidate HEAD 建立後，相同 HEAD 的 stop 重播或重複 resume MUST NOT 再發出 Copilot request。外部 request 之前，Manager MUST 先持久化新 epoch 的 `review-requesting` phase 與 request identity；只有既有 `GitHubDeliveryClient.request_copilot()` 呼叫正常完成（其內部命令成功並解析回應）才轉成既有 `review-requested` phase。這僅證明 request 呼叫完成，不代表 review 已提交；後續仍須從 remote read-back 驗證有效 exact-HEAD review。若程序在持久化後、API 前中止，或在 API 後、回應持久化前中止，重播須先檢查有效 exact-HEAD review；無法證明外部結果時 MUST 記錄該 epoch 為 outcome-unknown 並停在 needs-human，不能以重送解決不確定性。`review-requesting` 是本票新增的 durable phase，不能冒充已完成的 Copilot review。
 
 ### R5 保留停止與審查歷史
 

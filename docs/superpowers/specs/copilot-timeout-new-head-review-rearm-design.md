@@ -21,7 +21,7 @@ work_item: copilot-timeout-new-head-review-rearm
 
 ### D4 先保存 epoch 歷史，再開始新 request
 
-在 run row 中追加舊 ship snapshot 至 append-only `delivery_review_epochs`，並把恢復許可／transition id 綁入新 epoch。已有項目需逐項比對 canonical hash，唯有原有 list 為新 list 的不變 prefix 才可追加。外部 request 前先持久化 `review-requesting` 與 request identity；成功後才轉 `review-requested`。若程序在外部副作用前後中止，重播先查有效 exact-head review；無法證明 request 結果時轉 `copilot-review-request-outcome-unknown`，不重發 request。
+在 run row 中追加舊 ship snapshot 至 append-only `delivery_review_epochs`，並把恢復許可／transition id 綁入新 epoch。已有項目需逐項比對 canonical hash，唯有原有 list 為新 list 的不變 prefix 才可追加。外部 request 前先持久化 `review-requesting` 與 request identity；既有 `request_copilot()` 呼叫正常完成後才轉 `review-requested`，不要求其回傳目前沒有的 response 欄位。若程序在外部副作用前後中止，重播先查有效 exact-head review；無法證明 request 結果時轉 `copilot-review-request-outcome-unknown`，不重發 request。
 
 ### D5 複用 #948 adoption 與現有 delivery evaluator
 
