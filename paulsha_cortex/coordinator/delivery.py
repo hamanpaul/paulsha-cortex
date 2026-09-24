@@ -577,6 +577,8 @@ class ShipOrchestrator:
                 raise RuntimeError("Copilot review epoch has not passed")
             if submitted_at_epoch < requested_at_epoch:
                 raise RuntimeError("Copilot review epoch has not passed")
+            if adopted_at is not None and observed_at_epoch < adopted_at:
+                raise RuntimeError("Copilot review epoch has not passed")
             if adopted_at is not None:
                 elapsed = float(now_epoch) - adopted_at
             else:

@@ -745,6 +745,32 @@ def test_ship_orchestrator_rejects_non_finite_adopted_at_epoch(
         )
 
 
+def test_ship_orchestrator_rejects_adopted_observation_before_adoption_epoch(
+    tmp_path: Path,
+) -> None:
+    class GitHub:
+        def evaluate_final_gate(self, **kwargs):
+            raise AssertionError("out-of-window adopted evidence must not reach GitHub")
+
+        def commit_merge(self, **kwargs):
+            raise AssertionError("out-of-window adopted evidence must not reach GitHub")
+
+    copilot = replace(_adopted_copilot_decision(), observed_at_epoch=1_000.0)
+
+    with pytest.raises(RuntimeError, match="Copilot review epoch has not passed"):
+        ShipOrchestrator(github=GitHub(), now=lambda: 1_010.0).merge_if_ready(
+            repo="acme/demo",
+            pr_number=7,
+            change="work",
+            expected_head=HEAD1,
+            expected_tree_hash=HEAD2,
+            authority=_authority(tmp_path, last_success=1_005.0),
+            preflight=_preflight(),
+            copilot=copilot,
+            foreign_review=_foreign_review(tmp_path),
+        )
+
+
 @pytest.mark.parametrize(
     "submitted_at_epoch",
     [None, float("nan"), float("inf"), 3_406.0],
