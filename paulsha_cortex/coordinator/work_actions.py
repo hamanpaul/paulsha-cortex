@@ -942,6 +942,16 @@ def _copilot_epoch_rearm_record(permit: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _invalidate_copilot_rearm_permit(
+    *,
+    active: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+) -> None:
+    if active.pop("copilot_review_rearm_permit", None) is not None:
+        _save_runs(state_path, state)
+
+
 def _pick_adoptable_copilot_review(
     reviews: tuple[object, ...], *, head: str
 ) -> object | None:
@@ -5918,6 +5928,11 @@ def _ship_action(
         active["delivery_binding"] = binding
         _save_runs(state_path, state)
     elif persisted_binding != binding:
+        _invalidate_copilot_rearm_permit(
+            active=active,
+            state=state,
+            state_path=state_path,
+        )
         raise RuntimeError("ship delivery binding differs from persisted PR/OpenSpec/Todo refs")
     github = GitHubDeliveryClient(runner=runner)
     orchestrator = ShipOrchestrator(github=github, now=now)
@@ -6209,6 +6224,11 @@ def _ship_action(
         change=change,
     )
     if remote.head != preflight.head:
+        _invalidate_copilot_rearm_permit(
+            active=active,
+            state=state,
+            state_path=state_path,
+        )
         raise RuntimeError("ship HEAD differs from authenticated GitHub PR")
     if (
         remote.openspec_required
@@ -6303,7 +6323,22 @@ def _ship_action(
             fix_rounds=fix_rounds,
         )
     if rearm_permit is not None and preflight.head != rearm_permit["candidate_head"]:
+        _invalidate_copilot_rearm_permit(
+            active=active,
+            state=state,
+            state_path=state_path,
+        )
         raise RuntimeError("ship preflight HEAD differs from explicit resume permit")
+    foreign_review = None
+    if rearm_permit is not None:
+        foreign_review = ForeignReviewEvidence(
+            path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),
+            expected_hash=args.get("foreign_review_hash"),
+        )
+        _validate_foreign_review(
+            foreign_review,
+            expected_head=preflight.head,
+        )
     if ship and ship.get("phase") == "review-requesting":
         if previous_head != preflight.head:
             return _set_copilot_request_outcome_unknown(
@@ -6641,10 +6676,11 @@ def _ship_action(
             )
         return res
 
-    foreign_review = ForeignReviewEvidence(
-        path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),
-        expected_hash=args.get("foreign_review_hash"),
-    )
+    if foreign_review is None:
+        foreign_review = ForeignReviewEvidence(
+            path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),
+            expected_hash=args.get("foreign_review_hash"),
+        )
     remote_gate = evaluate_delivery_gate(
         facts=remote,
         policy=DeliveryPolicy(

@@ -1,1 +1,0 @@
-修正 #1021：明示 `resume` 現在只會為舊 HEAD `copilot-review-timeout` 建立一次性 rearm permit，並在 exact new HEAD 重讀相符時採信既有 exact-HEAD Copilot review 或走 durable `review-requesting` → `review-requested`；same-head timeout 不重送，request crash/race uncertainty 改為 `copilot-review-request-outcome-unknown` fail-closed。

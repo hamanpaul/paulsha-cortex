@@ -774,6 +774,58 @@ def test_rearm_fails_closed_when_delivery_review_history_was_rewritten(
         )
 
 
+def test_binding_drift_invalidates_the_old_head_rearm_permit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, _orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch
+    )
+    _advance_run_to_ship(registry, run_id, candidate_head=OLD_HEAD)
+    _create_timeout_stop(
+        tmp_path,
+        monkeypatch,
+        authority=authority,
+        state=state,
+        registry=registry,
+        github=github,
+    )
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=NEW_HEAD,
+        verified_head=NEW_HEAD,
+    )
+    github.remote_head = NEW_HEAD
+    github.reviews = ()
+    _set_preflight(monkeypatch, head=NEW_HEAD, tree_hash=NEW_TREE)
+
+    _resume(snapshot=snapshot, state=state, registry=registry, at=4_875.0)
+    row = _journal_row(state, run_id)
+    row["delivery_binding"] = {
+        **row["delivery_binding"],
+        "todo_paths": ["docs/superpowers/workstreams/other/todo.md"],
+    }
+    _write_journal_row(state, run_id, row)
+
+    with pytest.raises(
+        RuntimeError,
+        match="ship delivery binding differs from persisted PR/OpenSpec/Todo refs",
+    ):
+        _invoke_ship(
+            tmp_path,
+            authority=authority,
+            state=state,
+            registry=registry,
+            head=NEW_HEAD,
+            now=4_876.0,
+        )
+
+    persisted = _journal_row(state, run_id)
+    assert persisted["ship"]["reason"] == "copilot-review-timeout"
+    assert "copilot_review_rearm_permit" not in persisted
+    assert github.request_copilot_calls == 1
+
+
 def test_explicit_resume_stays_fail_closed_when_the_exact_pr_head_has_raced(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -811,6 +863,128 @@ def test_explicit_resume_stays_fail_closed_when_the_exact_pr_head_has_raced(
             now=4_901.0,
         )
     assert github.request_copilot_calls == 1
+    assert "copilot_review_rearm_permit" not in _journal_row(state, run_id)
+
+
+def test_explicit_resume_invalidates_the_old_head_rearm_permit_when_preflight_head_drifted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, _orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch
+    )
+    _advance_run_to_ship(registry, run_id, candidate_head=OLD_HEAD)
+    _create_timeout_stop(
+        tmp_path,
+        monkeypatch,
+        authority=authority,
+        state=state,
+        registry=registry,
+        github=github,
+    )
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=NEW_HEAD,
+        verified_head=NEW_HEAD,
+    )
+    github.remote_head = RACE_HEAD
+    github.reviews = ()
+    _set_preflight(monkeypatch, head=RACE_HEAD, tree_hash=NEW_TREE)
+
+    _resume(snapshot=snapshot, state=state, registry=registry, at=4_925.0)
+
+    with pytest.raises(RuntimeError, match="ship preflight HEAD differs from explicit resume permit"):
+        _invoke_ship(
+            tmp_path,
+            authority=authority,
+            state=state,
+            registry=registry,
+            head=RACE_HEAD,
+            now=4_926.0,
+        )
+
+    persisted = _journal_row(state, run_id)
+    assert persisted["ship"]["reason"] == "copilot-review-timeout"
+    assert "copilot_review_rearm_permit" not in persisted
+    assert github.request_copilot_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("reviews", "case_id"),
+    (
+        ((), "request"),
+        (
+            (
+                CopilotReview(
+                    review_id=123,
+                    commit_id=NEW_HEAD,
+                    state="COMMENTED",
+                    body="LGTM on the exact new head.",
+                    author=COPILOT_REVIEWER_LOGIN,
+                    submitted_at_epoch=4_950.0,
+                ),
+            ),
+            "adopt",
+        ),
+    ),
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_explicit_resume_rereads_exact_head_foreign_review_before_consuming_the_rearm_permit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reviews: tuple[CopilotReview, ...],
+    case_id: str,
+) -> None:
+    del case_id
+    github, _orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch
+    )
+    _advance_run_to_ship(registry, run_id, candidate_head=OLD_HEAD)
+    _create_timeout_stop(
+        tmp_path,
+        monkeypatch,
+        authority=authority,
+        state=state,
+        registry=registry,
+        github=github,
+    )
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=NEW_HEAD,
+        verified_head=NEW_HEAD,
+    )
+    github.remote_head = NEW_HEAD
+    github.reviews = reviews
+    _set_preflight(monkeypatch, head=NEW_HEAD, tree_hash=NEW_TREE)
+
+    _resume(snapshot=snapshot, state=state, registry=registry, at=4_940.0)
+
+    calls = 0
+
+    def reject_foreign_review(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("foreign review does not authorize exact HEAD")
+
+    monkeypatch.setattr(work_actions, "_validate_foreign_review", reject_foreign_review)
+
+    with pytest.raises(RuntimeError, match="foreign review does not authorize exact HEAD"):
+        _invoke_ship(
+            tmp_path,
+            authority=authority,
+            state=state,
+            registry=registry,
+            head=NEW_HEAD,
+            now=4_941.0,
+        )
+
+    assert calls == 1
+    assert github.request_copilot_calls == 1
+    persisted = _journal_row(state, run_id)
+    assert persisted["ship"]["reason"] == "copilot-review-timeout"
+    assert persisted["ship"]["head"] == OLD_HEAD
+    assert "copilot_review_rearm_permit" in persisted
+    assert "delivery_review_epochs" not in persisted
 
 
 def test_review_requesting_replay_without_exact_head_review_fails_closed_without_resending(
