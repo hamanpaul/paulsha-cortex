@@ -2453,7 +2453,7 @@ def _candidate_tree_matching_archive_entries(
         workspace_root=workspace_root,
         candidate=candidate,
         pathspec=f"openspec/changes/{change}/",
-        required=required,
+        required=True,
     )
     if not active_paths:
         return ()
@@ -2461,7 +2461,7 @@ def _candidate_tree_matching_archive_entries(
         workspace_root=workspace_root,
         candidate=candidate,
         pathspec="openspec/changes/archive/",
-        required=required,
+        required=True,
     )
     suffix = f"-{change}"
     entries = {
@@ -2530,7 +2530,6 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
             workspace_root=Path(str(run.workspace_root)),
             candidate=run.candidate_head,
             change=change,
-            required=True,
         )
         if archive_entries:
             warnings.append(

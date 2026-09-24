@@ -733,6 +733,65 @@ def test_retry_build_ignores_dirty_worktree_when_exact_candidate_tree_is_clean(
     assert "pre-archive work" not in action
 
 
+@pytest.mark.parametrize(
+    ("failing_pathspec", "expected_calls"),
+    (
+        (
+            f"openspec/changes/{WORK_ID}/",
+            ((f"openspec/changes/{WORK_ID}/", True),),
+        ),
+        (
+            "openspec/changes/archive/",
+            (
+                (f"openspec/changes/{WORK_ID}/", True),
+                ("openspec/changes/archive/", True),
+            ),
+        ),
+    ),
+)
+def test_candidate_tree_matching_archive_entries_forces_fail_closed_tree_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_pathspec: str,
+    expected_calls: tuple[tuple[str, bool], ...],
+) -> None:
+    repo, candidate = _repo(
+        tmp_path / "candidate-tree-matching-archive-entries-repo",
+        active_change=True,
+        archived_change=False,
+    )
+    candidate_head = candidate
+    candidate_tree_calls: list[tuple[str, bool]] = []
+    active_pathspec = f"openspec/changes/{WORK_ID}/"
+
+    def fake_candidate_tree_paths(
+        *, workspace_root: Path, candidate: str, pathspec: str, required: bool = True
+    ) -> tuple[str, ...]:
+        candidate_tree_calls.append((pathspec, required))
+        assert workspace_root == repo
+        assert candidate == candidate_head
+        if pathspec == failing_pathspec:
+            if required:
+                raise RuntimeError("retry-build exact candidate tree inspection failed")
+            return ()
+        if pathspec == active_pathspec:
+            return (f"openspec/changes/{WORK_ID}/proposal.md",)
+        if pathspec == "openspec/changes/archive/":
+            return (f"openspec/changes/archive/2026-09-14-{WORK_ID}/proposal.md",)
+        raise AssertionError(f"unexpected pathspec {pathspec}")
+
+    monkeypatch.setattr(work_actions, "_candidate_tree_paths", fake_candidate_tree_paths)
+
+    with pytest.raises(RuntimeError, match="retry-build.*candidate tree"):
+        work_actions._candidate_tree_matching_archive_entries(
+            workspace_root=repo,
+            candidate=candidate,
+            change=WORK_ID,
+            required=False,
+        )
+    assert tuple(candidate_tree_calls) == expected_calls
+
+
 @pytest.mark.parametrize("combo", ("fix-standard", "feature-oneshot"))
 def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_shape(
     tmp_path: Path,
