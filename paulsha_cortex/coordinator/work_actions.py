@@ -526,6 +526,7 @@ def _intake_action(
     *,
     args: dict[str, Any],
     authority,
+    requested_by: str,
     now_epoch: float,
     state_path: Path,
     snapshot_path: str | Path | None,
@@ -580,6 +581,7 @@ def _intake_action(
     claim_result = _claim_action(
         args=args,
         authority=authority,
+        requested_by=requested_by,
         now_epoch=now_epoch,
         state_path=state_path,
         workflow_registry=workflow_registry,
@@ -793,6 +795,217 @@ def _ship_binding(args: dict[str, Any], authority) -> dict[str, Any]:
         "pr_number": pr_number,
         "change": change,
         "todo_paths": list(authority.mapped_todo_paths),
+    }
+
+
+_COPILOT_REARM_PERMIT_SCHEMA = "cortex-copilot-review-rearm-permit/v1"
+_DELIVERY_REVIEW_EPOCH_SCHEMA = "cortex-delivery-review-epoch/v1"
+
+
+def _exact_verified_candidate_head(run) -> str | None:
+    candidate_head = getattr(run, "candidate_head", None)
+    verified_head = getattr(run, "verified_head", None)
+    if (
+        not isinstance(candidate_head, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate_head) is None
+        or not isinstance(verified_head, str)
+        or verification.SAFE_SHA_RE.fullmatch(verified_head) is None
+        or candidate_head != verified_head
+    ):
+        return None
+    return candidate_head
+
+
+def _ship_state_hash(ship: dict[str, Any]) -> str:
+    return verification.canonical_json_hash(ship)
+
+
+def _delivery_binding_hash(binding: dict[str, Any]) -> str:
+    return verification.canonical_json_hash(binding)
+
+
+def _validated_copilot_rearm_permit(
+    value: object, *, field: str = "copilot review rearm permit"
+) -> dict[str, Any]:
+    required = {
+        "schema",
+        "run_id",
+        "ship_hash",
+        "old_head",
+        "candidate_head",
+        "authority_digest",
+        "delivery_binding_hash",
+        "history_prefix_hash",
+        "requested_by",
+        "transition_id",
+        "created_at_epoch",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema") != _COPILOT_REARM_PERMIT_SCHEMA
+        or not isinstance(value.get("run_id"), str)
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", value["run_id"]) is None
+        or any(
+            not isinstance(value.get(name), str)
+            or verification.SAFE_SHA_RE.fullmatch(value[name]) is None
+            for name in ("old_head", "candidate_head")
+        )
+        or any(
+            not isinstance(value.get(name), str)
+            or re.fullmatch(r"[0-9a-f]{64}", value[name]) is None
+            for name in (
+                "ship_hash",
+                "authority_digest",
+                "delivery_binding_hash",
+                "history_prefix_hash",
+            )
+        )
+        or not isinstance(value.get("requested_by"), str)
+        or not value["requested_by"].strip()
+        or "\n" in value["requested_by"]
+        or not isinstance(value.get("transition_id"), str)
+        or not value["transition_id"].strip()
+        or "\n" in value["transition_id"]
+        or not isinstance(value.get("created_at_epoch"), (int, float))
+        or isinstance(value.get("created_at_epoch"), bool)
+        or not math.isfinite(float(value["created_at_epoch"]))
+    ):
+        raise ValueError(f"{field} malformed")
+    return value
+
+
+def _copilot_rearm_permit(active: dict[str, Any]) -> dict[str, Any] | None:
+    value = active.get("copilot_review_rearm_permit")
+    if value is None:
+        return None
+    return _validated_copilot_rearm_permit(value)
+
+
+def _delivery_review_epochs(active: dict[str, Any]) -> list[dict[str, Any]]:
+    value = active.get("delivery_review_epochs")
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("delivery review history malformed")
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"schema", "ship", "ship_hash", "archived_at_epoch", "rearm"}
+            or item.get("schema") != _DELIVERY_REVIEW_EPOCH_SCHEMA
+            or not isinstance(item.get("ship"), dict)
+            or not isinstance(item.get("ship_hash"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["ship_hash"]) is None
+            or _ship_state_hash(item["ship"]) != item["ship_hash"]
+            or not isinstance(item.get("archived_at_epoch"), (int, float))
+            or isinstance(item.get("archived_at_epoch"), bool)
+            or not math.isfinite(float(item["archived_at_epoch"]))
+        ):
+            raise ValueError("delivery review history malformed")
+        _validated_copilot_rearm_permit(item.get("rearm"), field="delivery review history")
+    return value
+
+
+def _delivery_review_history_hash(active: dict[str, Any]) -> str:
+    return verification.canonical_json_hash(_delivery_review_epochs(active))
+
+
+def _append_delivery_review_epoch(
+    *,
+    active: dict[str, Any],
+    ship: dict[str, Any],
+    permit: dict[str, Any],
+    now_epoch: float,
+) -> None:
+    history = list(_delivery_review_epochs(active))
+    archived_ship = json.loads(json.dumps(ship, ensure_ascii=False, sort_keys=True))
+    history.append(
+        {
+            "schema": _DELIVERY_REVIEW_EPOCH_SCHEMA,
+            "ship": archived_ship,
+            "ship_hash": _ship_state_hash(archived_ship),
+            "archived_at_epoch": float(now_epoch),
+            "rearm": dict(permit),
+        }
+    )
+    active["delivery_review_epochs"] = history
+
+
+def _copilot_epoch_rearm_record(permit: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": permit["run_id"],
+        "from_head": permit["old_head"],
+        "authority_digest": permit["authority_digest"],
+        "delivery_binding_hash": permit["delivery_binding_hash"],
+        "requested_by": permit["requested_by"],
+        "transition_id": permit["transition_id"],
+    }
+
+
+def _invalidate_copilot_rearm_permit(
+    *,
+    active: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+) -> None:
+    if active.pop("copilot_review_rearm_permit", None) is not None:
+        _save_runs(state_path, state)
+
+
+def _pick_adoptable_copilot_review(
+    reviews: tuple[object, ...], *, head: str
+) -> object | None:
+    adoptable = [
+        review
+        for review in reviews
+        if review.commit_id == head
+        and review.author == COPILOT_REVIEWER_LOGIN
+        and review.state in {"COMMENTED", "APPROVED"}
+        and not review.is_error
+    ]
+    if not adoptable:
+        return None
+    return max(adoptable, key=lambda value: (value.submitted_at_epoch, value.review_id))
+
+
+def _set_copilot_request_outcome_unknown(
+    *,
+    active: dict[str, Any],
+    ship: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    workflow_registry,
+    canonical_run,
+    authority,
+    detail: str,
+) -> dict[str, Any]:
+    active["ship"] = {
+        **ship,
+        "phase": "needs_human",
+        "reason": "copilot-review-request-outcome-unknown",
+    }
+    active.pop("copilot_review_rearm_permit", None)
+    _save_runs(state_path, state)
+    workflow_registry._manager_update_workflow_run(
+        canonical_run.run_id,
+        facets=("needs_human",),
+        gate_status="running",
+        needs_human_reason=diagnostic_reason(
+            "copilot-review-request-outcome-unknown",
+            detail,
+            source="work_actions._ship_action:copilot-request-outcome-unknown",
+            run_id=canonical_run.run_id,
+            work_id=canonical_run.work_id,
+            head=str(ship.get("head") or ""),
+        ),
+    )
+    return {
+        "action": "needs_human",
+        "reason": "copilot-review-request-outcome-unknown",
+        "next_actions": ["abandon", "review-attest"],
+        "next_step_hint": (
+            f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+        ),
     }
 
 
@@ -1720,10 +1933,100 @@ def _not_claimable_response(
     return response
 
 
+def _maybe_record_copilot_timeout_rearm_permit(
+    *,
+    args: dict[str, Any],
+    authority,
+    requested_by: str,
+    now_epoch: float,
+    state_path: Path,
+    workflow_registry,
+    canonical_run,
+) -> dict[str, Any] | None:
+    if args.get("action") != "resume":
+        return None
+    extras = set(args) - {"action", "repo", "work_id", "issue"}
+    if extras:
+        raise ValueError(f"resume rejects caller evidence/input: {sorted(extras)[0]}")
+    if canonical_run is None or canonical_run.status != "ongoing":
+        return None
+    state, active, run = _load_work_run(
+        state_path=state_path,
+        workflow_registry=workflow_registry,
+        authority=authority,
+    )
+    _validate_current_run_authority(active, authority, run)
+    ship = active.get("ship")
+    if ship is None:
+        return None
+    if not isinstance(ship, dict):
+        raise ValueError("ship state malformed")
+    if ship.get("phase") != "needs_human" or ship.get("reason") != "copilot-review-timeout":
+        return None
+    old_head = ship.get("head")
+    if (
+        not isinstance(old_head, str)
+        or verification.SAFE_SHA_RE.fullmatch(old_head) is None
+    ):
+        raise ValueError("copilot timeout ship state malformed")
+    candidate_head = _exact_verified_candidate_head(run)
+    if candidate_head is None:
+        return None
+    if old_head == candidate_head:
+        if active.get("copilot_review_rearm_permit") is not None:
+            _invalidate_copilot_rearm_permit(
+                active=active,
+                state=state,
+                state_path=state_path,
+            )
+            raise RuntimeError("copilot timeout rearm permit is stale")
+        return None
+    binding = active.get("delivery_binding")
+    if not isinstance(binding, dict):
+        raise RuntimeError("copilot timeout rearm requires persisted delivery binding")
+    desired = {
+        "schema": _COPILOT_REARM_PERMIT_SCHEMA,
+        "run_id": run.run_id,
+        "ship_hash": _ship_state_hash(ship),
+        "old_head": old_head,
+        "candidate_head": candidate_head,
+        "authority_digest": work_authority_digest(authority),
+        "delivery_binding_hash": _delivery_binding_hash(binding),
+        "history_prefix_hash": _delivery_review_history_hash(active),
+        "requested_by": requested_by,
+        "transition_id": f"manager-transition-{uuid4().hex}",
+        "created_at_epoch": float(now_epoch),
+    }
+    existing = _copilot_rearm_permit(active)
+    if existing is None:
+        active["copilot_review_rearm_permit"] = desired
+        _save_runs(state_path, state)
+        return desired
+    same_tuple = (
+        existing["run_id"] == desired["run_id"]
+        and existing["ship_hash"] == desired["ship_hash"]
+        and existing["old_head"] == desired["old_head"]
+        and existing["candidate_head"] == desired["candidate_head"]
+        and existing["authority_digest"] == desired["authority_digest"]
+        and existing["delivery_binding_hash"] == desired["delivery_binding_hash"]
+        and existing["history_prefix_hash"] == desired["history_prefix_hash"]
+        and existing["requested_by"] == desired["requested_by"]
+    )
+    if not same_tuple:
+        _invalidate_copilot_rearm_permit(
+            active=active,
+            state=state,
+            state_path=state_path,
+        )
+        raise RuntimeError("copilot timeout rearm permit conflicts with current state")
+    return existing
+
+
 def _claim_action(
     *,
     args: dict[str, Any],
     authority,
+    requested_by: str = "operator",
     now_epoch: float,
     state_path: Path,
     automatic: bool = False,
@@ -1743,6 +2046,11 @@ def _claim_action(
     default) preserves prior behaviour exactly, so existing callers that do
     not yet wire a checker are unaffected.
     """
+
+    if args.get("action") == "resume":
+        extras = set(args) - {"action", "repo", "work_id", "issue"}
+        if extras:
+            raise ValueError(f"resume rejects caller evidence/input: {sorted(extras)[0]}")
 
     canonical_run = None
     # #524：canonical_run 是靠「in-flight 保護傘」而非 claim_key／identity 比對
@@ -2149,6 +2457,18 @@ def _claim_action(
                     run_id_to_persist, frozen_readiness=frozen_dict
                 )
                 active["frozen_readiness"] = persisted.frozen_readiness
+    if canonical_run is not None:
+        rearm_permit = _maybe_record_copilot_timeout_rearm_permit(
+            args=args,
+            authority=authority,
+            requested_by=requested_by,
+            now_epoch=now_epoch,
+            state_path=state_path,
+            workflow_registry=workflow_registry,
+            canonical_run=canonical_run,
+        )
+        if active is not None and rearm_permit is not None:
+            active["copilot_review_rearm_permit"] = rearm_permit
     response: dict[str, Any] = {
         "action": decision.action,
         "reason": decision.reason,
@@ -2419,6 +2739,58 @@ def _retry_card_model_chain_override(
     return override
 
 
+def _candidate_tree_paths(
+    *, workspace_root: Path, candidate: str, pathspec: str
+) -> tuple[str, ...]:
+    listed = subprocess.run(
+        [
+            "git", "-C", str(workspace_root), "ls-tree", "-r", "--name-only", "-z",
+            candidate, "--", pathspec,
+        ],
+        shell=False,
+        capture_output=True,
+    )
+    if listed.returncode != 0:
+        raise RuntimeError("retry-build exact candidate tree inspection failed")
+    try:
+        return tuple(
+            value.decode("utf-8")
+            for value in listed.stdout.split(b"\0")
+            if value
+        )
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("retry-build exact candidate tree inspection failed") from exc
+
+
+def _candidate_tree_matching_archive_entries(
+    *,
+    workspace_root: Path,
+    candidate: str,
+    change: str,
+) -> tuple[str, ...]:
+    active_paths = _candidate_tree_paths(
+        workspace_root=workspace_root,
+        candidate=candidate,
+        pathspec=f"openspec/changes/{change}/",
+    )
+    archive_paths = _candidate_tree_paths(
+        workspace_root=workspace_root,
+        candidate=candidate,
+        pathspec="openspec/changes/archive/",
+    )
+    if not active_paths:
+        return ()
+    suffix = f"-{change}"
+    entries = {
+        parts[3]
+        for parts in (PurePosixPath(path).parts for path in archive_paths)
+        if len(parts) > 4
+        and parts[:3] == ("openspec", "changes", "archive")
+        and (parts[3] == change or parts[3].endswith(suffix))
+    }
+    return tuple(sorted(entries))
+
+
 def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None) -> dict[str, Any]:
     """Reopen the final builder card with exact-Candidate CAS after a human stop."""
 
@@ -2462,13 +2834,32 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         raise RuntimeError("retry-build requires build/verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
-    retry_classification = _classify_retry(run, workflow_registry)
-    archive_applied = any(
-        step.phase == "ship"
-        and step.card == "openspec-archive"
-        and step.gate_result == "passed"
-        for step in run.steps
+    from . import manager
+
+    archive_applied = manager._manager_archive_applied(
+        run,
+        registry=workflow_registry,
     )
+    warnings: list[dict[str, object]] = []
+    if len(authority.mapped_openspec) == 1:
+        change = authority.mapped_openspec[0]
+        archive_entries = _candidate_tree_matching_archive_entries(
+            workspace_root=Path(str(run.workspace_root)),
+            candidate=run.candidate_head,
+            change=change,
+        )
+        if archive_entries:
+            warnings.append(
+                {
+                    "change": change,
+                    "archive_entries": list(archive_entries),
+                    "message": (
+                        "exact Candidate tree contains both the active OpenSpec change and its "
+                        "official archive entry; fix the coexistence before the next review"
+                    ),
+                }
+            )
+    retry_classification = _classify_retry(run, workflow_registry)
     if run.current_phase == "build":
         repair_action = (
             "Recover the exact Candidate after a builder terminalization failure. Preserve all "
@@ -2483,7 +2874,10 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
             "Inspect any existing worktree repair commits. Preserve the Manager-owned official "
             "OpenSpec archive and fix only real Candidate failures identified by the current "
             "verification/review evidence. Do not recreate the active change or claim merge, issue "
-            "closure, or done. Commit or adopt a tested descendant Candidate."
+            "closure, or done. If the Candidate already contains a re-created active change "
+            "directory for the archived change under openspec/changes/ (outside "
+            "openspec/changes/archive/), delete it and keep only the official archive. "
+            "Commit or adopt a tested descendant Candidate."
         )
     else:
         repair_action = (
@@ -2514,6 +2908,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         "adjudication": operator_adjudication_receipt(adjudication_evidence, card="subagent-build"),
         "reason": "candidate-repair-dispatched",
         "expected_candidate": expected_candidate.lower(),
+        "warnings": warnings,
         "run": updated.to_dict(),
         "retry_classification": retry_classification,
     }
@@ -5455,6 +5850,7 @@ def run_auto_claim_scan(
             result = _claim_action(
                 args={"action": "auto-scan"},
                 authority=authority,
+                requested_by="manager-daemon",
                 now_epoch=now(),
                 state_path=resolved_state,
                 automatic=True,
@@ -5620,12 +6016,52 @@ def _ship_action(
         active["delivery_binding"] = binding
         _save_runs(state_path, state)
     elif persisted_binding != binding:
+        _invalidate_copilot_rearm_permit(
+            active=active,
+            state=state,
+            state_path=state_path,
+        )
         raise RuntimeError("ship delivery binding differs from persisted PR/OpenSpec/Todo refs")
     github = GitHubDeliveryClient(runner=runner)
     orchestrator = ShipOrchestrator(github=github, now=now)
+    rearm_permit = None
+    if (
+        isinstance(ship, dict)
+        and ship.get("phase") == "needs_human"
+        and ship.get("reason") == "copilot-review-timeout"
+        and active.get("copilot_review_rearm_permit") is not None
+    ):
+        permit = _copilot_rearm_permit(active)
+        assert permit is not None
+        current_head = _exact_verified_candidate_head(canonical_run)
+        if current_head is None:
+            raise RuntimeError("persisted copilot timeout rearm permit requires exact verified Candidate")
+        if (
+            permit["run_id"] != canonical_run.run_id
+            or permit["ship_hash"] != _ship_state_hash(ship)
+            or permit["old_head"] != ship.get("head")
+            or permit["candidate_head"] != current_head
+            or permit["authority_digest"] != work_authority_digest(authority)
+            or permit["delivery_binding_hash"] != _delivery_binding_hash(binding)
+            or permit["history_prefix_hash"] != _delivery_review_history_hash(active)
+        ):
+            _invalidate_copilot_rearm_permit(
+                active=active,
+                state=state,
+                state_path=state_path,
+            )
+            raise RuntimeError("persisted copilot timeout rearm permit conflicts with current state")
+        if permit["old_head"] == current_head:
+            _invalidate_copilot_rearm_permit(
+                active=active,
+                state=state,
+                state_path=state_path,
+            )
+            raise RuntimeError("copilot timeout rearm permit no longer targets a new HEAD")
+        rearm_permit = permit
 
     maintainer_recovery = _recoverable_maintainer_ship_stop(ship=ship, args=args)
-    if ship and ship.get("phase") == "needs_human" and not maintainer_recovery:
+    if ship and ship.get("phase") == "needs_human" and not maintainer_recovery and rearm_permit is None:
         res = {"action": "needs_human", "reason": ship.get("reason")}
         if str(ship.get("reason", "")).startswith("copilot-"):
             res["next_actions"] = ["abandon", "review-attest"]
@@ -5886,6 +6322,11 @@ def _ship_action(
         change=change,
     )
     if remote.head != preflight.head:
+        _invalidate_copilot_rearm_permit(
+            active=active,
+            state=state,
+            state_path=state_path,
+        )
         raise RuntimeError("ship HEAD differs from authenticated GitHub PR")
     if (
         remote.openspec_required
@@ -5964,6 +6405,13 @@ def _ship_action(
     if not isinstance(fix_rounds, int) or isinstance(fix_rounds, bool) or fix_rounds < 0:
         raise ValueError("ship fix round state malformed")
     if maintainer_recovery or args.get("maintainer_review_path") is not None:
+        if (
+            ship is not None
+            and ship.get("phase") == "needs_human"
+            and ship.get("reason") == "copilot-review-timeout"
+            and ship.get("head") != preflight.head
+        ):
+            raise RuntimeError("copilot timeout rearm requires exact-HEAD Copilot review")
         return _ship_with_maintainer_review(
             args=args,
             active=active,
@@ -5979,12 +6427,97 @@ def _ship_action(
             ship=ship,
             fix_rounds=fix_rounds,
         )
+    if rearm_permit is not None and preflight.head != rearm_permit["candidate_head"]:
+        _invalidate_copilot_rearm_permit(
+            active=active,
+            state=state,
+            state_path=state_path,
+        )
+        raise RuntimeError("ship preflight HEAD differs from explicit resume permit")
+    foreign_review = None
+    if rearm_permit is not None:
+        foreign_review = ForeignReviewEvidence(
+            path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),
+            expected_hash=args.get("foreign_review_hash"),
+        )
+        _validate_foreign_review(
+            foreign_review,
+            expected_head=preflight.head,
+        )
+    if ship and ship.get("phase") == "review-requesting":
+        if previous_head != preflight.head:
+            return _set_copilot_request_outcome_unknown(
+                active=active,
+                ship=ship,
+                state=state,
+                state_path=state_path,
+                workflow_registry=workflow_registry,
+                canonical_run=canonical_run,
+                authority=authority,
+                detail=(
+                    "已持久化的 review-requesting epoch 與 current exact PR HEAD 不一致；"
+                    "Copilot request outcome 無法確認，為避免重送已 fail-closed。"
+                ),
+            )
+        requested_at = ship.get("requested_at_epoch")
+        if (
+            not isinstance(requested_at, (int, float))
+            or isinstance(requested_at, bool)
+            or not math.isfinite(float(requested_at))
+            or "adopted_review_id" in ship
+            or "adopted_at_epoch" in ship
+        ):
+            return _set_copilot_request_outcome_unknown(
+                active=active,
+                ship=ship,
+                state=state,
+                state_path=state_path,
+                workflow_registry=workflow_registry,
+                canonical_run=canonical_run,
+                authority=authority,
+                detail=(
+                    "已持久化的 review-requesting epoch 缺少有效 request epoch，或帶有不適用的 "
+                    "adoption 欄位；無法證明 review 屬於此 request，已 fail-closed。"
+                ),
+            )
+        adopted_review = _pick_adoptable_copilot_review(
+            remote.copilot_reviews,
+            head=preflight.head,
+        )
+        if adopted_review is None or adopted_review.submitted_at_epoch < float(requested_at):
+            return _set_copilot_request_outcome_unknown(
+                active=active,
+                ship=ship,
+                state=state,
+                state_path=state_path,
+                workflow_registry=workflow_registry,
+                canonical_run=canonical_run,
+                authority=authority,
+                detail=(
+                    "已持久化的 review-requesting epoch 重播時找不到有效的 exact-HEAD "
+                    "request-bound Copilot review；Copilot request outcome 無法確認，為避免重送已 fail-closed。"
+                ),
+            )
+        logger.info(
+            "recovered request-bound Copilot review from review-requesting run_id=%s head=%s review_id=%s submitted_at=%s",
+            canonical_run.run_id,
+            preflight.head,
+            adopted_review.review_id,
+            adopted_review.submitted_at_epoch,
+        )
+        active["ship"] = {
+            **ship,
+            "phase": "review-requested",
+        }
+        _save_runs(state_path, state)
+        ship = active["ship"]
     if ship and ship.get("phase") == "needs-fix" and previous_head == preflight.head:
         return {"action": "fix-required", "head": preflight.head, "fix_rounds": fix_rounds}
     if previous_head is not None and previous_head != preflight.head:
         fix_rounds += 1
         active["repair_rounds"] = fix_rounds
         if fix_rounds > max_fix_rounds:
+            active.pop("copilot_review_rearm_permit", None)
             active["ship"] = {
                 **ship,
                 "phase": "needs_human",
@@ -6026,19 +6559,30 @@ def _ship_action(
         or previous_head != preflight.head
         or ship.get("phase") not in {"review-requested", "merge-authorized"}
     ):
-        adoptable_reviews = [
-            review
-            for review in remote.copilot_reviews
-            if review.commit_id == preflight.head
-            and review.author == COPILOT_REVIEWER_LOGIN
-            and review.state in {"COMMENTED", "APPROVED"}
-            and not review.is_error
-        ]
-        if adoptable_reviews:
-            adopted_review = max(
-                adoptable_reviews,
-                key=lambda value: (value.submitted_at_epoch, value.review_id),
+        if rearm_permit is not None:
+            pre_request_gate = evaluate_delivery_gate(
+                facts=remote,
+                policy=DeliveryPolicy(
+                    expected_head=preflight.head,
+                    required_closing_issues=(),
+                    review_kind="pre-review",
+                ),
             )
+            if not pre_request_gate.allowed:
+                raise RuntimeError(
+                    "copilot timeout rearm pre-request gate blocked: "
+                    f"{', '.join(pre_request_gate.reasons)}"
+                )
+        adopted_review = _pick_adoptable_copilot_review(
+            remote.copilot_reviews,
+            head=preflight.head,
+        )
+        rearm_record = (
+            _copilot_epoch_rearm_record(rearm_permit)
+            if rearm_permit is not None
+            else None
+        )
+        if adopted_review is not None:
             logger.info(
                 "adopted existing Copilot review run_id=%s head=%s review_id=%s submitted_at=%s",
                 canonical_run.run_id,
@@ -6046,7 +6590,15 @@ def _ship_action(
                 adopted_review.review_id,
                 adopted_review.submitted_at_epoch,
             )
-            active["ship"] = {
+            if rearm_permit is not None and ship is not None:
+                _append_delivery_review_epoch(
+                    active=active,
+                    ship=ship,
+                    permit=rearm_permit,
+                    now_epoch=float(now_epoch),
+                )
+                active.pop("copilot_review_rearm_permit", None)
+            new_ship = {
                 "phase": "review-requested",
                 "head": preflight.head,
                 "tree_hash": preflight.tree_hash,
@@ -6059,12 +6611,36 @@ def _ship_action(
                 "change": change,
                 "todo_paths": list(todo_paths_value),
             }
+            if rearm_record is not None:
+                new_ship["rearm"] = rearm_record
+            active["ship"] = new_ship
             _save_runs(state_path, state)
             ship = active["ship"]
         else:
-            github.request_copilot(repo=authority.repo, pr_number=pr_number)
+            if rearm_permit is None:
+                github.request_copilot(repo=authority.repo, pr_number=pr_number)
+                active["ship"] = {
+                    "phase": "review-requested",
+                    "head": preflight.head,
+                    "tree_hash": preflight.tree_hash,
+                    "requested_at_epoch": float(now_epoch),
+                    "epoch_started_at": float(now_epoch),
+                    "fix_rounds": fix_rounds,
+                    "pr_number": pr_number,
+                    "change": change,
+                    "todo_paths": list(todo_paths_value),
+                }
+                _save_runs(state_path, state)
+                return {"action": "awaiting-copilot", "head": preflight.head}
+            assert ship is not None
+            _append_delivery_review_epoch(
+                active=active,
+                ship=ship,
+                permit=rearm_permit,
+                now_epoch=float(now_epoch),
+            )
             active["ship"] = {
-                "phase": "review-requested",
+                "phase": "review-requesting",
                 "head": preflight.head,
                 "tree_hash": preflight.tree_hash,
                 "requested_at_epoch": float(now_epoch),
@@ -6073,8 +6649,47 @@ def _ship_action(
                 "pr_number": pr_number,
                 "change": change,
                 "todo_paths": list(todo_paths_value),
+                "rearm": rearm_record,
             }
+            active.pop("copilot_review_rearm_permit", None)
             _save_runs(state_path, state)
+            try:
+                github.request_copilot(repo=authority.repo, pr_number=pr_number)
+                post_request = github.fetch_merge_status(
+                    repo=authority.repo,
+                    pr_number=pr_number,
+                )
+            except Exception as exc:
+                return _set_copilot_request_outcome_unknown(
+                    active=active,
+                    ship=active["ship"],
+                    state=state,
+                    state_path=state_path,
+                    workflow_registry=workflow_registry,
+                    canonical_run=canonical_run,
+                    authority=authority,
+                    detail=(
+                        "明示 resume 建立的新 review-requesting epoch 已持久化，但 Copilot "
+                        f"request outcome 無法確認：{safe_exception_summary(exc)}"
+                    ),
+                )
+            if post_request.merged or post_request.pr_head != preflight.head:
+                return _set_copilot_request_outcome_unknown(
+                    active=active,
+                    ship=active["ship"],
+                    state=state,
+                    state_path=state_path,
+                    workflow_registry=workflow_registry,
+                    canonical_run=canonical_run,
+                    authority=authority,
+                    detail=(
+                        "Copilot review request 完成後，PR HEAD 已不再是明示 resume "
+                        "核可的 exact candidate；request outcome 無法確認，為避免重送已 fail-closed。"
+                    ),
+                )
+            active["ship"] = {**active["ship"], "phase": "review-requested"}
+            _save_runs(state_path, state)
+            ship = active["ship"]
             return {"action": "awaiting-copilot", "head": preflight.head}
 
     requested_at = ship.get("requested_at_epoch")
@@ -6198,10 +6813,11 @@ def _ship_action(
             )
         return res
 
-    foreign_review = ForeignReviewEvidence(
-        path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),
-        expected_hash=args.get("foreign_review_hash"),
-    )
+    if foreign_review is None:
+        foreign_review = ForeignReviewEvidence(
+            path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),
+            expected_hash=args.get("foreign_review_hash"),
+        )
     remote_gate = evaluate_delivery_gate(
         facts=remote,
         policy=DeliveryPolicy(
@@ -6209,6 +6825,7 @@ def _ship_action(
             required_closing_issues=authority.mapped_issues,
             copilot_review_id=copilot.review_id,
             copilot_requested_at_epoch=copilot.loop.requested_at,
+            copilot_adopted_at_epoch=copilot.loop.adopted_at,
         ),
     )
     if not remote_gate.allowed:
@@ -6357,6 +6974,7 @@ def execute_work_action(
         result = _claim_action(
             args=args,
             authority=authority,
+            requested_by=requested_by,
             now_epoch=now_epoch,
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,
@@ -6367,6 +6985,7 @@ def execute_work_action(
         result = _intake_action(
             args=args,
             authority=authority,
+            requested_by=requested_by,
             now_epoch=now_epoch,
             state_path=resolved_state_path,
             snapshot_path=snapshot_path,
