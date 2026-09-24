@@ -14,7 +14,7 @@ artifact_classes:
 
 ## Boundary
 
-- Issue：[hamanpaul/paulsha-cortex#1020](https://github.com/hamanpaul/paulsha-cortex/issues/1020)。唯一 Work ID：`copilot-review-late-observation`；draft mapping 見 `work-item-mapping.yaml`。
+- Issue：[hamanpaul/paulsha-cortex#1020](https://github.com/hamanpaul/paulsha-cortex/issues/1020)。唯一 Work ID：`copilot-review-late-observation`；正式 mapping 見 [`.cortex/work-items.yaml`](../../../../.cortex/work-items.yaml)，規劃依據見 [spec](../../specs/copilot-review-late-observation-spec.md) 與 [design](../../specs/copilot-review-late-observation-design.md)。
 - 預期 production 只有 `paulsha_cortex/coordinator/delivery.py` 的 `ReviewLoop.record_review()`、成功 `ReviewDecision` 的記憶體內 submission evidence 與 `ShipOrchestrator.merge_if_ready()`。`work_actions.py` 是現有 caller 與 integration-test surface；除非 RED 證明 caller 還需改動，不能順手改 source。
 - 不變更 #948 adoption、#871 maintainer fallback、15 分鐘時限、review/thread 定義、remote delivery/final gates、durable state/schema、CLI 或 PR #986 狀態。
 - Accepted spec/design/本 Todo 是 planned authority；實作中只翻 checkbox。若發現必要新範圍或未決決策，停在該界線、記錄證據並新開 issue，不以改變原 issue 解讀來擴權。
