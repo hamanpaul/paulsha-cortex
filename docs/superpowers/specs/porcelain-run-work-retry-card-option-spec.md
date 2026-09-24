@@ -26,11 +26,13 @@ issue: 1030
 
 ### R1030.3 — 保留 payload 兼容
 
-`--payload` 仍是可選的 manager-side evidence refs JSON object 檔案入口，card 不再需要靠它提供。為兼容當前 workaround，`--payload` 單獨提供 `card` 的舊命令仍可用；若同一 invocation 同時提供 `--card` 與不同的 payload `card`，CLI MUST 在送 request 前拒絕，不能讓 payload 靜默覆蓋明示 selector。相同值重複可保留或明確拒絕，實作須以單一測試鎖定行為。
+`--payload` 仍是可選 JSON object 檔案入口，card 不再需要靠它提供。為兼容當前 workaround，`--payload` 單獨提供 `card` 的舊命令仍可用；若同一 invocation 同時提供 `--card` 與不同的 payload `card`，CLI MUST 在送 request 前拒絕，不能讓 payload 靜默覆蓋明示 selector。相同值重複可保留或明確拒絕，實作須以單一測試鎖定行為。
+
+此項只約束 CLI 對 `card` selector 的合併，不擴大 Manager 接受的欄位。`_retry_card_action` 仍以既有 allowlist 拒絕其他 caller input；不得由 `--payload` 是 JSON object 推論 retry-card 支援任意 evidence refs。其他 payload 欄位仍依各 action 原有的 Manager contract 判定。
 
 ### R1030.4 — help 與操作範例
 
-`cortex run work --help` MUST 顯示 `--card` 及「retry-card 專用」說明。README recovery 範例 MUST 展示 `--expected-run-id`、`--card`，並可同時帶已有 run-scoped builder override；說明 `--payload` 仍用於其他 manager-side refs，不是此命令的必要輸入。
+`cortex run work --help` MUST 顯示 `--card` 及「retry-card 專用」說明。README recovery 範例 MUST 展示 `--expected-run-id`、`--card`，並可同時帶已有 run-scoped builder override；說明 `--payload` 不是此命令選 card 的必要輸入，payload 欄位仍受各 action 既有 Manager contract／allowlist 限制。
 
 ### Non-goals
 

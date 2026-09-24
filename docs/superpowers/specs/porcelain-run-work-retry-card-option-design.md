@@ -16,7 +16,7 @@ issue: 1030
 
 ### D2 — Prevent explicit option shadowing while keeping the workaround
 
-`_work_args()` 現在先建 CLI payload，再以 `--payload` object 更新，payload 可以覆蓋一般 args。保留 payload-only `card`，因其已用於 #1020/#1021；當使用者也傳 `--card` 時，先比對 extra `card`：不同值即拒絕，避免 selector 靜默改變；其餘 evidence refs 仍照既有方式合併。相同值可以作冗餘相容輸入，但行為須由測試固定。Protected top-level fields (`action`／`repo`／`work_id`) 維持現況。
+`_work_args()` 現在先建 CLI payload，再以 `--payload` object 更新，payload 可以覆蓋一般 args。保留 payload-only `card`，因其已用於 #1020/#1021；當使用者也傳 `--card` 時，先比對 extra `card`：不同值即拒絕，避免 selector 靜默改變。相同值作冗餘相容輸入，由測試固定；其他 payload 欄位仍照現有 CLI merge 行為傳送。這不擴大 Manager 接受的欄位：retry-card 的 `_retry_card_action` 只接受既有 allowlist，任意 evidence refs 仍會被拒絕；各 action 的 payload admission 由原 Manager contract 決定。Protected top-level fields (`action`／`repo`／`work_id`) 維持現況。
 
 ### D3 — Preserve run-scoped override and Manager semantics
 
