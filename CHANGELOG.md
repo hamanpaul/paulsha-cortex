@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 - **#1029 self-publication receipt v1 契約**：凍結經 #992／#993／#994／#979／#980 範圍審查對齊的 exact wire appendix、可重算 golden vectors 與決策紀錄；未實作或啟用 receipt。
+- **#1030 retry-card porcelain 規劃**：新增 accepted spec／design／todo，固定 `cortex run work retry-card` 的 `--card` 轉送、payload 衝突處理，以及後續 help／README／測試驗收；本次只完成規劃，CLI 行為尚未修改。
 - **Copilot 規劃 Yellow gate 修正**：在 #1020、#1021 的 Tasks 明列 `documentation`，使既有文件交付項目符合 `artifact_classes` 完整性檢查；不變更產品驗收範圍。
 - **driving-cortex 單票授權界線**：要求 agent 只處理綁定 issue 的已授權驗收，將範圍外問題附證據記錄到既有或新 issue，再獨立規劃與派工；跨票推進及 merge 後部署均須各自授權。
 - **#1021 舊 HEAD timeout 新 HEAD 重啟 review**：`_claim_action` 只在明示 `resume` 且 journal 仍停在舊 HEAD `copilot-review-timeout` 時建立 Manager-owned rearm permit；`_ship_action` 只有在 exact new HEAD／preflight／delivery binding／PR facts／ForeignReview 全數重讀相符，且 checks 終態通過、PR mergeability 通過、沒有未解 current review thread 後才會消費 permit，並在觀察到 binding／PR-head／preflight-head／persisted permit drift 時立即持久化作廢該 permit，避免後續未經再次 `resume` 的重用。條件成立時會先保留舊 timeout/review epoch 歷史，再採信既有 exact-HEAD Copilot review 或以 durable `review-requesting` 後 request 一次；requesting 重播保留原 request epoch、使用 request-bound submission deadline，過期 review 維持 timeout，不套用採信 review 的 adoption 時間。same-head timeout 不重送，old-timeout/new-head rearm 也不得以 maintainer review 取代 Copilot review。request race／crash uncertainty 轉為 `copilot-review-request-outcome-unknown` fail-closed。
