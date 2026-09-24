@@ -557,6 +557,130 @@ def test_request_bound_copilot_review_submitted_before_deadline_survives_late_ob
     assert copilot.observed_at_epoch == 1944.0
 
 
+def _simulate_requesting_phase_crash(
+    tmp_path: Path,
+    *,
+    authority,
+    state: Path,
+    registry: JobRegistry,
+    run_id: str,
+    requested_at: float,
+) -> None:
+    first = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at,
+    )
+    assert first.get("action") == "awaiting-copilot"
+    assert _journal_row(state, run_id)["ship"]["phase"] == "review-requested"
+
+    # The external request completed, but the process crashed before its
+    # response was persisted, leaving the durable pre-request phase behind.
+    row = _journal_row(state, run_id)
+    row["ship"]["phase"] = "review-requesting"
+    _write_journal_row(state, run_id, row)
+
+
+def test_review_requesting_crash_replay_rejects_exact_head_review_submitted_after_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    requested_at = 1000.0
+    _simulate_requesting_phase_crash(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        run_id=run_id,
+        requested_at=requested_at,
+    )
+    github.reviews = (
+        CopilotReview(
+            review_id=48,
+            commit_id=HEAD,
+            state="COMMENTED",
+            body="LGTM, no findings.",
+            author=COPILOT_REVIEWER_LOGIN,
+            submitted_at_epoch=requested_at + REVIEW_TIMEOUT_SECONDS + 1,
+        ),
+    )
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at + REVIEW_TIMEOUT_SECONDS + 2,
+    )
+
+    assert github.request_copilot_calls == 1
+    assert result.get("action") == "needs_human"
+    assert result.get("reason") == "copilot-review-timeout"
+    assert not any("merge-if-ready" in orchestrator.calls for orchestrator in orch_holder)
+    ship_state = _journal_row(state, run_id)["ship"]
+    assert ship_state.get("phase") == "needs_human"
+    assert ship_state.get("requested_at_epoch") == requested_at
+    assert "adopted_review_id" not in ship_state
+    assert "adopted_at_epoch" not in ship_state
+
+
+def test_review_requesting_crash_replay_preserves_deadline_for_timely_late_observed_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    requested_at = 1000.0
+    _simulate_requesting_phase_crash(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        run_id=run_id,
+        requested_at=requested_at,
+    )
+    github.reviews = (
+        CopilotReview(
+            review_id=49,
+            commit_id=HEAD,
+            state="COMMENTED",
+            body="LGTM, no findings.",
+            author=COPILOT_REVIEWER_LOGIN,
+            submitted_at_epoch=requested_at + 162.0,
+        ),
+    )
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at + REVIEW_TIMEOUT_SECONDS + 44.0,
+    )
+
+    assert github.request_copilot_calls == 1
+    assert result.get("action") != "awaiting-copilot"
+    assert result.get("reason") != "copilot-review-timeout"
+    ship_state = _journal_row(state, run_id)["ship"]
+    assert ship_state.get("phase") in {"merge-authorized", "merged"}
+    assert ship_state.get("requested_at_epoch") == requested_at
+    assert "adopted_review_id" not in ship_state
+    assert "adopted_at_epoch" not in ship_state
+    assert orch_holder
+    merge_orchestrator = next(
+        orchestrator for orchestrator in orch_holder if "merge-if-ready" in orchestrator.calls
+    )
+    copilot = merge_orchestrator.merge_kwargs[-1]["copilot"]
+    assert copilot.submitted_at_epoch == requested_at + 162.0
+    assert copilot.observed_at_epoch == requested_at + REVIEW_TIMEOUT_SECONDS + 44.0
+
+
 def test_persisted_copilot_needs_human_stop_returns_list_shaped_next_actions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
