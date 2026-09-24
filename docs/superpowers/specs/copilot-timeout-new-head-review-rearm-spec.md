@@ -11,7 +11,7 @@ work_item: copilot-timeout-new-head-review-rearm
 
 ### R1 只允許明示 resume 開啟新 epoch
 
-Manager 收到 operator 明示的 `cortex work resume` 後，只有在唯一 ongoing WorkflowRun、同一 WorkAuthority、目前 candidate 已通過 exact-head verification／ForeignReview，且 delivery journal 保存的 `ship` 是 `needs_human / copilot-review-timeout` 時，才可建立一筆由 Manager 寫入、綁定 run、舊 stop HEAD、新 candidate HEAD 與 WorkAuthority digest 的單次恢復許可。週期性掃描、一般 ship replay、caller 自述、agent 的 review verdict 或直接 journal 寫入均不得建立此許可。
+Manager 收到 operator 明示的 `cortex work resume` 後，只有在唯一 ongoing WorkflowRun、同一 WorkAuthority、目前 candidate 已通過 exact-head verification／ForeignReview，且 delivery journal 保存的 `ship` 是 `needs_human / copilot-review-timeout` 時，才可建立一筆由 Manager 寫入、綁定 run、舊 stop HEAD、新 candidate HEAD、WorkAuthority digest 與 operator actor 的單次恢復許可。Manager 在執行此 action 時產生本地 transition id 供追溯；它不是 control queue 原始 request id。週期性掃描、一般 ship replay、caller 自述、agent 的 review verdict 或直接 journal 寫入均不得建立此許可。
 
 ### R2 受理條件以新 HEAD 全面重讀
 
@@ -27,7 +27,7 @@ Manager 在重啟 review epoch 前 MUST 重讀並相符：唯一 canonical run i
 
 ### R5 保留停止與審查歷史
 
-切換 current `ship` 前，Manager MUST 將舊 timeout stop 與其 request/review 欄位 append 到該 run 的 delivery journal 歷史；既有 history 項目只能追加、不得改寫或刪除。新 epoch MUST 記錄其 run、HEAD、tree、authority digest、resume event 及 request 或 adopted review 身分，使新舊審查可分別追溯。
+切換 current `ship` 前，Manager MUST 將舊 timeout stop 與其 request/review 欄位 append 到該 run 的 delivery journal 歷史；既有 history 項目只能追加、不得改寫或刪除。新 epoch MUST 記錄其 run、HEAD、tree、authority digest、明示 resume 的 actor／Manager transition id 及 request 或 adopted review 身分，使新舊審查可分別追溯。
 
 ### R6 所有既有 ship gates 維持生效
 

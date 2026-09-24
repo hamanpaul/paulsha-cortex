@@ -13,7 +13,7 @@ work_item: copilot-timeout-new-head-review-rearm
 
 ### D2 journal 轉態採 run 與 state CAS
 
-許可記錄 `run_id`、舊 stop 的 canonical hash、目前 `candidate_head`、WorkAuthority digest、PR binding hash 及 resume event id。寫入前再次比較讀取的 journal `ship` 與所選 canonical run；任何 stale state 或多個 ongoing run 都拒絕。Ship validator 重新讀取全部 authority／remote facts，只有 tuple 完整相等才可消費許可。重複 resume 對同一 tuple 冪等；不同 tuple 或已消費的 event 不得覆寫舊 history。
+許可記錄 `run_id`、舊 stop 的 canonical hash、目前 `candidate_head`、WorkAuthority digest、PR binding hash、明示 action 的 `requested_by` actor 及 Manager 在 `_claim_action` 內產生的 transition id。`manager_daemon` 目前不把 control queue 的 `req_id` 傳至此層，所以 transition id 僅識別本地轉態，不聲稱是原始 queue request id。寫入前在 daemon 單 writer／flock 序列化範圍內，再次比較讀取的 journal `ship` 與所選 canonical run；任何可觀測的 stale state 或多個 ongoing run 都拒絕。Ship validator 重新讀取全部 authority／remote facts，只有 tuple 完整相等才可消費許可。重複 resume 對同一 tuple 冪等；不同 tuple 或已消費的 transition 不得覆寫舊 history。這是單 writer 條件比較，不宣稱跨 writer 的原子 CAS。
 
 ### D3 擴大檢查順序只限舊 HEAD Copilot timeout
 
@@ -21,7 +21,7 @@ work_item: copilot-timeout-new-head-review-rearm
 
 ### D4 先保存 epoch 歷史，再開始新 request
 
-在 run row 中追加舊 ship snapshot 至 append-only `delivery_review_epochs`，並把恢復許可／event id 綁入新 epoch。已有項目需逐項比對 canonical hash，唯有原有 list 為新 list 的不變 prefix 才可追加。外部 request 前先持久化 `review-requesting` 與 request identity；成功後才轉 `review-requested`。若程序在外部副作用前後中止，重播先查有效 exact-head review；無法證明 request 結果時轉 `copilot-review-request-outcome-unknown`，不重發 request。
+在 run row 中追加舊 ship snapshot 至 append-only `delivery_review_epochs`，並把恢復許可／transition id 綁入新 epoch。已有項目需逐項比對 canonical hash，唯有原有 list 為新 list 的不變 prefix 才可追加。外部 request 前先持久化 `review-requesting` 與 request identity；成功後才轉 `review-requested`。若程序在外部副作用前後中止，重播先查有效 exact-head review；無法證明 request 結果時轉 `copilot-review-request-outcome-unknown`，不重發 request。
 
 ### D5 複用 #948 adoption 與現有 delivery evaluator
 
@@ -40,4 +40,4 @@ work_item: copilot-timeout-new-head-review-rearm
 
 ## Risk
 
-此狀態機只有在 Manager queue 串行化 `resume` 與 ship mutation 的前提下才構成單一 writer；並行 Manager writer／journal 外部修改不得假設受本設計保護，遇到非預期 revision 必須停止。GitHub 的 PR review request API 不能原子綁定 SHA；因此需在副作用前後重讀 PR HEAD，外部 request 若撞上 push race 只能記錄為未授權的 outcome-unknown，不能用該 review 走過 gate。
+此狀態機只有在 Manager queue 串行化 `resume` 與 ship mutation 的前提下才構成單一 writer；`_save_runs()` 是 atomic replace，沒有跨 writer CAS。並行 Manager writer／journal 外部修改不受本票保護，遇到可觀測的非預期 revision 必須停止；若驗收證明需要跨 writer 原子性，應先交由既有 #966／#983 的 registry／journal CAS 工作處理，不可在本票內假稱已保證。GitHub 的 PR review request API 不能原子綁定 SHA；因此需在副作用前後重讀 PR HEAD，外部 request 若撞上 push race 只能記錄為未授權的 outcome-unknown，不能用該 review 走過 gate。
