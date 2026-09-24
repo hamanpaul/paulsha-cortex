@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **#1030 retry-card porcelain selector**：`cortex run work retry-card` 新增 retry-card 專用 `--card`，避免 payload 靜默覆寫明示 selector，並保留 payload-only workaround；不改 Manager retry contract。
 - **#1029 self-publication receipt v1 契約**：凍結經 #992／#993／#994／#979／#980 範圍審查對齊的 exact wire appendix、可重算 golden vectors 與決策紀錄；未實作或啟用 receipt。
 - **#1030 retry-card porcelain 規劃**：新增 accepted spec／design／todo，固定 `cortex run work retry-card` 的 `--card` 轉送、payload 衝突處理，以及後續 help／README／測試驗收；本次只完成規劃，CLI 行為尚未修改。
 - **Copilot 規劃 Yellow gate 修正**：在 #1020、#1021 的 Tasks 明列 `documentation`，使既有文件交付項目符合 `artifact_classes` 完整性檢查；不變更產品驗收範圍。
