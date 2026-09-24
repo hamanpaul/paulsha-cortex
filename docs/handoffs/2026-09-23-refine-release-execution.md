@@ -18,7 +18,7 @@
 | State integrity | #862 → #966 → #967（父票 #818）→ #481；#479 → #968 → #969 → #970 → #971（父票 #547） | #968 A1 與 #547 AC7 的 #999–#1005 已拆為無循環子票；#862 owner contract acceptance、#969 marker 與跨 UID proof 仍是前置，#547 保持 open。重疊的 registry／Manager recovery 修改由單一 owner 串行。 |
 | Recovery/UI | #956、#874、#812、#871；#803 → #579 | #579 job900 的 19 項 pytest 失敗均在 Claude review sandbox 的 `setfacl -R`；同候選 Manager full-suite ledger 為綠但 verifier 未採信。#803 的 exact-candidate ledger consumer 或經驗證的 ACL-capable disposable 測試環境是重新驗證前置；其他票依重疊模組錯開 merge，皆以正式 action 的可達性與錯誤終態驗收。 |
 
-實作可使用 Copilot `gpt-5.4`（較大修改）或 Codex `gpt-6-luna(max)`（較窄修改）。`gpt-6-sol` 做獨立對抗審查；agy 指定的 `gemini-2.8-flash (high)` 未在現行 roster，現行可見的是 `gemini-3.8-flash-high`，不得自行視為同型號替代。每票使用獨立 worktree、唯一 work item 與 run owner；merge 前重新檢查 exact PR head 和 review threads。並行數量以實際資源與重疊模組風險調度。
+實作可使用 Copilot `gpt-5.4`（較大修改）、Codex `gpt-6-luna(max)`（較窄修改），或使用者確認的 agy `gemini-3.8-flash-high`；`gpt-6-sol` 做獨立對抗審查。agy Builder fallback 曾出現無 terminal envelope 的失敗（#928／#945），派工前須核對目前 runtime 健康，不能將 job exit 0 當作完成。每票使用獨立 worktree、唯一 work item 與 run owner；merge 前重新檢查 exact PR head 和 review threads。並行數量以實際資源與重疊模組風險調度。
 
 ## 進件材料狀態
 
