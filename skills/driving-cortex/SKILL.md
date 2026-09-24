@@ -1,4 +1,5 @@
 ---
+name: driving-cortex
 description: "driving cortex、派工 cortex、cortex work 導向的協作 skill（issue #177）"
 ---
 
@@ -15,6 +16,12 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 - Monitor 是唯讀投影：讀取 `.cortex/work-items.yaml`、workstream `todo.md` 以及其他 confirmed authority。
 - deck 是上游契約入口：先形成 accepted planning artifact 後，依 `claim → define → plan → build → verify → review → ship` 進入生產化 workflow。
 - `cortex work start`、`resume`、`retry-build`、`review-attest` 是 build 之後的人機協作邊界；`5s` 類 timeout 本身通常只是「未達結果」，不代表系統已失敗。
+
+## 單票授權與問題分流
+
+- 每個 run 只完成綁定 issue、accepted spec/plan 與 operator 裁決已授權的驗收範圍；先核對唯一 owner、exact run/candidate、PR head 和當前 job。不得把順手發現的問題、別張票的 AC、部署或額外權限塞入本票，亦不得用裁決或 reviewer 建議擴大原授權。
+- 遇到範圍內的阻擋問題，保留證據並沿原 run 的正式 action 修復與重驗。遇到範圍外的問題，先查是否已有 issue；有則補上關聯與證據，沒有就新開 issue，記錄重現方式、預期／實際結果、影響、run/candidate/PR、前置依賴。把新 issue 排入後續規劃，**不在本票直接實作**。
+- 回報時分清本票完成、進行中、阻塞及新 issue 的狀態；job exit 0、綠色 CI 或已開 PR 均不能代替本票所需的 review、merge、run closure 與 loaded-runtime 證據。
 
 ## 開一個 dogfood 批次
 
