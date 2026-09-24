@@ -59,7 +59,13 @@ The v1 receipt has exactly these 14 keys and no others:
 }
 ```
 
-`receipt_id = H("cortex-self-publication-receipt/v1", envelope_without_receipt_id)`. `transaction` has exactly `kind`, `intent_ref`, `intent_sha256`; `kind` must equal the referenced intent core's `schema` and the producer-specific literal below. The parser recomputes the receipt, event, publication, metadata, and sidecar hashes and validates all producer-specific identity/ref/hash joins expressible from the envelope and referenced immutable sidecars. Envelope identity fields must match the current Manager-owned run row at producer/append validation. The parser cannot certify that `pre_publication_authority_sha256` has a trusted WorkAuthority origin; #979/#980 establish that proof at their Manager mint boundaries.
+`receipt_id = H("cortex-self-publication-receipt/v1", envelope_without_receipt_id)`. `transaction` has exactly `kind`, `intent_ref`, `intent_sha256`; `kind` must equal the producer-specific intent schema literal below. The pure receipt value parser checks shape, primitive types/ranges, digest syntax, `receipt_id`, and cross-bindings whose operands are contained in the receipt itself (including PR witness/read-back tuple equality and the marker derived from `publication_id`). It does not open refs or claim to recompute event/publication IDs whose basis is in sidecars.
+
+### 1.5 Value parsing, sidecar resolution, and reload
+
+- **Pure value parsing:** `WorkflowRun.from_dict` and each receipt `from_dict` validate only serialized receipt values: exact keys/types, digest syntax, `receipt_id`, producer-kind/transaction-kind pairing, local producer-union joins, and any formula whose complete basis is included in the receipt. No filesystem or GitHub access occurs. Separately, after the intent sidecar has been resolved and parsed into an intent value, a pure intent-value validator can recompute `request_metadata_sha256` and the PR `publication_id` from that intent core. The receipt does not contain the intent core, so this PR validation cannot be done from the receipt alone or during `WorkflowRun.from_dict`.
+- **Sidecar resolution:** a separate producer/append validation boundary resolves immutable snapshot/evidence/intent refs, hashes their exact stored bytes, parses their exact schemas, passes the parsed values to pure sidecar-value validators, rederives event and publication bases, checks receipt-to-sidecar joins, and verifies the producer-specific operation/evidence rules below. This stage reports missing, changed, or mismatched sidecars. Trusted WorkAuthority origin and current run/claim proof remain #979/#980 producer responsibilities.
+- **Typed-valid reload:** a receipt that passes the pure value parser reloads as a typed-valid receipt value even when sidecars are not opened during registry load. “Typed-valid” is not a provenance verdict. Reload neither fetches sidecars nor upgrades the receipt to producer-verified; only the sidecar-resolver/producer boundary can establish that proof. Opaque invalid rows/containers stay opaque and append-conflicting.
 
 ## 2. Shared bounded operation proof
 
@@ -79,7 +85,7 @@ Brainstorm and plan intent cores use this exact operation object:
 
 The exact keys are `path_domain`, `ref`, `kind`, `before_exists`, `before_sha256`, `after_sha256`, and `mutation`. `before_sha256` is `null` iff `before_exists` is false; otherwise it is a lowercase 64-hex digest. `mutation` is a JSON boolean recording that the publication operation wrote the target; an idempotent evidence no-op may be false. The proof omits rollback `before_content`, modes, created directories, mutable journal phase, and absolute host paths. It is a bounded projection of the operation observed by the existing planning transaction.
 
-For an intent's `operations` array, sort ascending by `(path_domain, ref, kind, after_sha256)` using Unicode code-point order. Reject duplicate tuple keys. For an output publication, its selected operation must have `kind="artifact"` and `mutation=true`; the `published_object` ref and SHA must equal that operation's `ref` and `after_sha256`. An evidence operation can be present in the same transaction but is not itself a published artifact.
+For an intent's `operations` array, sort ascending by `(path_domain, ref, kind, after_sha256)` using Unicode code-point order. Reject duplicate tuple keys. Every brainstorm or plan output operation must have `path_domain="workspace"`, `kind="artifact"`, and `mutation=true`; its `published_object` ref and SHA equal that operation's `ref` and `after_sha256`. The `before_exists`/`before_sha256` pair records the actual prior state. A plan output must be new (`before_exists=false`, `before_sha256=null`); a pre-existing same-byte plan target does not mint a receipt. Brainstorm may overwrite an existing authority-owned artifact: when present, its prior content hash is retained in `before_sha256`, and `before_exists=true` does not by itself disqualify the mutation. An evidence operation can be present in the same transaction but is not itself a published artifact; an idempotent evidence no-op may have `mutation=false`.
 
 ## 3. Producer unions
 
@@ -151,6 +157,10 @@ The same vector uses task slug `contract-1029` and the compiled `brainstorming` 
 The gate ref object matches the existing `GateEvidenceRef.to_dict()` shape and has exactly `kind`, `ref`, `sha256`. Preserve its current absolute path spelling; the producer must independently prove it resolves within the coordinator evidence root and reread its exact bytes. Do not use an absolute path for the immutable intent sidecar or bounded operation proof.
 
 `published_object` exact keys: `kind`, `ref`, `sha256`, `output_pattern`. `kind` is a planning kind; `ref` is a workspace-relative path; `sha256` is artifact-byte SHA256; `output_pattern` is the unique exact declared planner output pattern matching that ref.
+
+The peer-evidence payload has `schema_version=1`, `kind="brainstorm-peer"`, and a `scope` object with exactly `repo`, `work_id`, and `source_revision`. Bind `repo` and `work_id` to the captured run; when `run.planning_source_revision` is set, require `source_revision` to equal it. The producer also proves the authority origin from the trusted current run claim. Read the evidence afresh through the captured `GateEvidenceRef` (`kind`, `ref`, and raw-byte `sha256`); the same planning transaction journal must bind that evidence write and the selected output operation. No synthetic transaction-ID field is added.
+
+For each brainstorm receipt, the selected operation must be a workspace artifact mutation with `mutation=true`; it may create or overwrite the workspace artifact, and its before-state fields must truthfully record that transaction. In the same transaction's freshly reread peer-evidence `artifacts` array, there must be exactly one row whose planning `kind`, `ref`, and `sha256` equal the selected output. The integration resolution for that output must agree on kind/ref and the output bytes must match the evidence hash. The evidence scope and GateEvidenceRef/operation-journal binding must also match the captured run and same transaction. Zero or multiple matching evidence rows, a wrong run/authority scope, a coordinator-domain output operation, a changed/missing evidence row, or an operation with `mutation=false` yields no receipt. An existing authority-owned artifact can be replaced when the transaction records a real mutation. The operation row, peer-evidence row, and published object are one joined proof; receipt IDs are not minted from evidence rows alone.
 
 #### Event and publication identity
 
@@ -227,6 +237,8 @@ Each assessment uses exact keys `kind`, `ref`, `sha256`, `content_utf8`, `accept
 
 `published_object` exact keys: `kind`, `ref`, `sha256`, `output_pattern`; `kind` is literal `plan`; `ref` and `sha256` equal the target facts; `output_pattern` is the unique plan output pattern.
 
+The plan intent's `operation` is the exact workspace artifact operation for `published_object`; it must have `before_exists=false`, `before_sha256=null`, and `mutation=true`. If the materializer encounters a pre-existing target with the same bytes, it does not mint a receipt: byte equality alone is not a new write.
+
 #### Event, acceptance-facts, and publication identity
 
 Define `acceptance_facts` with exactly `selection_rule`, `assessments`, `selected_index`, `phase`, `card`, `phase_attempt`, `declared_output_patterns`, and `target_match_count`. `assessments` is the ordered projection of each snapshot assessment to `kind`, `ref`, `sha256`, `accepted`, `reasons`, and `blocking_markers`; the exact source bytes are retained in the snapshot and their hashes are in this projection. `acceptance_facts_sha256 = H("cortex-plan-acceptance-facts/v1", acceptance_facts)`.
@@ -273,7 +285,7 @@ Normalize the request before computing any ID:
 
 - NFC-normalize `title`;
 - in `body`, replace CRLF and lone CR with LF and preserve every other code point; reject any existing marker line or marker-like line containing `cortex-self-publication-intent:` under case-fold comparison;
-- NFC-normalize labels, reject empty labels and any duplicate after NFC, then sort by Unicode code-point order.
+- NFC-normalize labels, reject empty labels, deduplicate equal normalized labels, then sort the remaining labels by Unicode code-point order.
 
 `request_metadata` has exactly `title`, `body`, `labels`. `request_metadata_sha256 = H("cortex-manager-pr-request-metadata/v1", request_metadata)`. For this proposal the immutable intent retains the normalized request values as well as that digest, allowing the digest and later read-back to be recomputed from durable facts.
 
@@ -308,6 +320,8 @@ The only marker syntax is one exact line:
 
 The final body is normalized marker-free body followed by exactly one LF iff it is nonempty and does not already end in LF, then the marker line. An empty body is just the marker line. The marker is excluded from request metadata and the intent digest. Existing/adopted PRs are never retrofitted with it.
 
+For authenticated GET read-back, scan the unmodified response `body` before normalization or trimming, splitting only on CRLF, CR, or LF line boundaries. A line is marker-like when its case-folded text contains `cortex-self-publication-intent:`. Exactly one marker-like line must exist, and it must byte-for-codepoint equal the expected marker line. Reject duplicate exact lines and every malformed marker-like line, including wrong version/ID, altered case, surrounding whitespace, or other text on the line. After the marker scan, replace CRLF and lone CR with LF in the entire GET body, then require it to equal the exact rendered marker-bearing body derived above. Thus line-ending style may differ, while all other body content and the marker must match. The GET body is validation input and is not duplicated in `published_object`; the receipt continues to store the metadata digest.
+
 #### Receipt union and read-back
 
 `acceptance_evidence` has exactly:
@@ -334,7 +348,7 @@ The final body is normalized marker-free body followed by exactly one LF iff it 
 }
 ```
 
-`head` and `base` keys match the corresponding intent objects. State is literal `open`. Repository, number, REST ID, and node ID must each equal the durable POST witness and the GET response; all base/head/marker fields must equal the intent; the observed normalized title/body/labels must equal intent `request_metadata`, and the observed metadata digest must equal its `request_metadata_sha256`. The receipt records the digest in `published_object`; it does not duplicate PR body/title/labels there.
+`head` and `base` keys match the corresponding intent objects. State is literal `open`. Repository, number, REST ID, and node ID must each equal the durable POST witness and the GET response; all base/head/marker fields must equal the intent. Normalize GET title and labels under the same NFC/deduplicate/sort rules and compare them with intent `request_metadata`; scan raw GET marker lines, normalize its line endings, then compare the complete body with the exact rendered marker-bearing body as described above. The observed metadata digest must equal `request_metadata_sha256`. The receipt records the digest in `published_object`; it does not duplicate PR body/title/labels there.
 
 #### Event identity
 
@@ -356,7 +370,7 @@ The final body is normalized marker-free body followed by exactly one LF iff it 
 ### 4.1 `WorkflowRun.publication_receipts` field
 
 - If the serialized run has no `publication_receipts` member, read it as an empty history. Do not backfill a receipt.
-- A normal history is a JSON list. Each strict known-valid v1 receipt is parsed independently. Unknown schema, unknown producer kind, missing/extra key, wrong type, wrong hash, cross-binding, or another malformed object becomes a deterministic opaque invalid row; it does not prevent other WorkflowRun rows from loading.
+- A normal history is a JSON list. Each receipt is parsed independently by the pure value parser. A locally typed-valid receipt remains typed-valid on `WorkflowRun.from_dict` reload without sidecar resolution; it is not thereby provenance-verified. Unknown schema, unknown producer kind, missing/extra key, wrong type, wrong contained digest, local cross-binding failure, or another malformed object becomes a deterministic opaque invalid row; it does not prevent other WorkflowRun rows from loading.
 - A malformed row already available as a JSON value is represented on the next serialization as exactly:
 
 ```json
@@ -370,7 +384,7 @@ Allowed row diagnostic codes are `unknown-schema`, `unknown-producer-kind`, `mal
 {"kind":"cortex-publication-receipt-invalid-json-row/v1","raw_json":"<exact row source text>","diagnostic":{"code":"duplicate-json-key","index":0}}
 ```
 
-The source slice includes the row's original whitespace and escapes. `raw_json` is a string, not reparsed data. The raw-aware decoder must identify the list element before constructing the row mapping; a post-`json.loads` value parser cannot meet this rule. The proposed owner is #993's registry load boundary, with #992 owning only the round-trip typed value.
+The source slice includes the row's original whitespace and escapes. `raw_json` is a string, not reparsed data. The duplicate-key vector names the actual registry location `/workflows/0/publication_receipts/0` but is explicitly an isolated raw receipt-row decoder fixture, not a complete registry document or loadable `WorkflowRun`; it claims only row classification, with `history_loads=false`. The raw-aware registry decoder must identify the row before constructing the row mapping; a post-`json.loads` value parser cannot meet this rule. The proposed owner is #993's registry load boundary, with #992 owning only the round-trip typed value.
 - A non-list container is represented by exactly:
 
 ```json
@@ -384,7 +398,16 @@ Keep this object in the `publication_receipts` field across `to_dict`/`from_dict
 
 ### 4.2 Strict JSON boundary
 
-The raw decoder rejects duplicate keys for envelope and strict nested values. For duplicates inside `publication_receipts[i]`, #993's load boundary must isolate and preserve that row as described above. Duplicate keys elsewhere in the registry remain a registry-level malformed-input condition unless #993 adopts a broader per-run recovery format. `WorkflowRun.from_dict` alone cannot detect duplicate keys.
+The raw decoder rejects duplicate keys for envelope and strict nested values. For duplicates inside `workflows[i].publication_receipts[j]`, #993's load boundary must isolate and preserve that row as described above. Duplicate keys elsewhere in the registry remain a registry-level malformed-input condition unless #993 adopts a broader per-run recovery format. `WorkflowRun.from_dict` alone cannot detect duplicate keys or resolve sidecars.
+
+### 4.3 Proposed object-conflict keys (owner confirmation pending)
+
+The proposal uses these exact keys when append checks whether a different event already claimed the same published object:
+
+- Planning workspace object key: `(run_id, claim_key, producer_kind, workspace_ref)`, where `producer_kind` is the exact receipt union tag (`brainstorm_artifact` or `plan_materialization`) and `workspace_ref` is the exact workspace-relative `published_object.ref`. This deliberately omits the output kind so two producer rows cannot claim one path under different planning labels.
+- PR resource key: `(repository, number)`, using the authenticated GET observation's canonical repository and positive PR number. This is the external GitHub resource identity; it is not the POST REST `id` or `node_id`.
+
+An exact replay of the same publication remains governed by the receipt identity/full-batch replay rules. A distinct valid publication ID for the same proposed object key conflicts before persistence. `same-planning-ref-different-event-conflicts` and `same-pr-object-different-publication-conflicts` carry literal receipts and expected zero-write conflicts. These key choices are proposals for #993/#994 owner concurrence; neither tuple is accepted by this appendix yet.
 
 ## 5. Canonical vectors and negative vectors
 
@@ -395,9 +418,9 @@ The raw decoder rejects duplicate keys for envelope and strict nested values. Fo
 - PR marker and rendered body;
 - generic `J/H` vectors, including literal empty-object input `{}` with canonical bytes `{}` and `H("test/v1", {}) = 24b225963d2bc670202bd0dde4768073c86ccdd932e51789a2a2ccc7d91b283f`.
 
-The brainstorm positive is reachable under current `planning.py` deterministic defaults and has two outputs for its single event: one spec receipt and one design receipt, each with a distinct operation-derived publication ID. It is not a fabricated accepted question pack. The append vectors include that full all-new batch, exact full-batch replay, partial replay, duplicate pair in a batch, mixed-event batch, same pair with a different internally valid PR witness/read-back payload, publication-ID reuse across events, and the same PR object key claimed under a different publication ID. Each scenario carries literal history, incoming batch, coupled patch equality token, and expected persist count/result. The patch token is test-harness equality data, not a proposed #1029 wire member.
+The brainstorm positive is reachable under current `planning.py` deterministic defaults and has two outputs for its single event: one spec receipt and one design receipt, each with a distinct operation-derived publication ID. It is not a fabricated accepted question pack. Producer eligibility vectors include both a new brainstorm output and an overwrite of an existing authority-owned artifact; they reject no-write same-byte operations, duplicate/missing/mismatched evidence rows, wrong evidence scope, and wrong path domain. The plan vectors accept only the new-target operation and reject an existing same-byte target. The append vectors include the full brainstorm all-new batch, exact full-batch replay, partial replay, duplicate pair in a batch, mixed event, same pair with a different internally valid PR witness/read-back payload, publication-ID reuse across events, and the same proposed PR resource key claimed under a different publication ID. A separate plan vector uses the same workspace ref under a different event to exercise the proposed planning object key. Each append scenario carries literal history, incoming batch, coupled patch equality token, and expected persist count/result. The patch token is test-harness equality data, not a proposed #1029 wire member.
 
-Negative value vectors include full receipt objects for unknown schema/kind, missing and extra keys, wrong union type, uppercase/short digests, cross-variant transaction kind, event/publication formula mismatch, published-object/intent mismatch, and bool-as-integer. Raw boundary vectors reject duplicate keys, NaN, both infinities, and unpaired surrogates. Round-trip vectors give exact invalid-row, duplicate-key-row, invalid-container, missing-field, and unknown-wrapper behavior; append must not write when history is opaque or invalid. PR read-back vectors independently mismatch each POST tuple field (`repository`, `number`, REST `id`, `node_id`) against the observation, then reject a wrong publication marker, a duplicated marker line, leading whitespace, trailing whitespace, and a case-altered marker. The normalization vector records the NFC/line-ending/sorted-label result.
+Negative value vectors include full receipt objects for unknown schema/kind, missing and extra keys, wrong union type, uppercase/short digests, cross-variant transaction kind, event/publication formula mismatch, published-object/intent mismatch, and bool-as-integer. Raw boundary vectors reject duplicate keys, NaN, both infinities, and unpaired surrogates. Round-trip vectors give exact invalid-row, invalid-container, missing-field, and unknown-wrapper behavior; the duplicate-key row vector separately tests isolated raw row-decoder classification and explicitly does not claim a successful full registry load. Append must not write when loaded history is opaque or invalid. PR read-back vectors use literal raw GET response bodies: they independently mismatch each POST tuple field (`repository`, `number`, REST `id`, `node_id`) against the observation; accept CRLF/CR bodies after line-ending normalization; reject a wrong publication marker, duplicate exact marker lines, malformed marker-like lines (leading/trailing whitespace, altered case, and wrong version), and a body that differs from the exact rendered marker-bearing body after permitted line-ending normalization. The normalization vector records NFC title/labels, post-NFC label deduplication and sorting, and line-ending normalization.
 
 One `#993` negative case is deliberately pending: a pair of distinct valid receipt preimages with one SHA-256 `receipt_id` cannot be produced as a golden vector without an actual cryptographic collision. The owner requirement remains explicit: detect the duplicate ID and reject before mutation. No forged digest is presented as a valid receipt. The complete current vector inventory and this pending item are recorded in the JSON's `pending_vectors` array and `decision-log.md`.
 
@@ -405,4 +428,4 @@ These vectors are contract fixtures, not evidence that a production producer cur
 
 ## 6. Owner acceptance gate and scope
 
-This proposal supplies exact nested key/type/path/digest choices for owner review; it is not accepted. Written alignment is still required from #992, #993, #994, #979, and #980 owners. The PR object duplicate key and one unconstructible cryptographic-collision vector remain explicitly pending in `decision-log.md` and `golden-vectors.json`. No production module, registry, or service behavior is changed by this draft.
+This proposal supplies exact nested key/type/path/digest choices for owner review; it is not accepted. Written alignment is still required from #992, #993, #994, #979, and #980 owners. The raw duplicate-key fixture is decoder-only and does not establish complete registry-load recovery; proposed planning/PR object-conflict keys and one unconstructible cryptographic-collision vector also remain explicitly pending in `decision-log.md` and `golden-vectors.json`. No production module, registry, or service behavior is changed by this draft.

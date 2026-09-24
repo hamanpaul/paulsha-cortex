@@ -12,7 +12,7 @@
         "coupled_run_patch": {
           "fixture_patch_token": "coupled-to-brainstorm-event-01"
         },
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "brainstorm_artifact",
         "receipts": [
           {
@@ -20,7 +20,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -30,22 +30,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+            "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
             "published_object": {
               "kind": "spec",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
               "ref": "docs/superpowers/specs/contract-1029-spec.md",
               "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
             },
-            "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+            "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -55,7 +55,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -65,22 +65,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "eaea60647b3fc2ea1005d1d1653a621d4f4a9afd7b33658b0529079e4d535a66",
+            "publication_id": "94e713fc48d747b4431bdaf4904e6019156e40a8171dd05226a8c78d87547842",
             "published_object": {
               "kind": "design",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-design.md",
               "ref": "docs/superpowers/specs/contract-1029-design.md",
               "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
             },
-            "receipt_id": "4a27a6fcc722781d58b18b5d0e449866f4ac537b9a078c3fcf6c3e35c0bbafc0",
+            "receipt_id": "fcc8e4339daf84536666072b7bc0d0e1da439c506fbe0c6d1ac499fc202497ef",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -101,7 +101,7 @@
             "gate_ref": {
               "kind": "brainstorm",
               "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-              "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+              "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
             },
             "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
           },
@@ -111,22 +111,22 @@
           },
           "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
           "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+          "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
           "producer_kind": "brainstorm_artifact",
-          "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+          "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
           "published_object": {
             "kind": "spec",
             "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
             "ref": "docs/superpowers/specs/contract-1029-spec.md",
             "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
           },
-          "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+          "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
           "repo": "example-org/demo",
           "run_id": "run-contract-01",
           "schema": "cortex-self-publication-receipt/v1",
           "transaction": {
-            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-            "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+            "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
             "kind": "cortex-planning-publication-intent/v1"
           },
           "work_id": "work-contract-01"
@@ -136,7 +136,7 @@
             "gate_ref": {
               "kind": "brainstorm",
               "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-              "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+              "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
             },
             "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
           },
@@ -146,22 +146,22 @@
           },
           "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
           "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+          "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
           "producer_kind": "brainstorm_artifact",
-          "publication_id": "eaea60647b3fc2ea1005d1d1653a621d4f4a9afd7b33658b0529079e4d535a66",
+          "publication_id": "94e713fc48d747b4431bdaf4904e6019156e40a8171dd05226a8c78d87547842",
           "published_object": {
             "kind": "design",
             "output_pattern": "docs/superpowers/specs/*contract-1029*-design.md",
             "ref": "docs/superpowers/specs/contract-1029-design.md",
             "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
           },
-          "receipt_id": "4a27a6fcc722781d58b18b5d0e449866f4ac537b9a078c3fcf6c3e35c0bbafc0",
+          "receipt_id": "fcc8e4339daf84536666072b7bc0d0e1da439c506fbe0c6d1ac499fc202497ef",
           "repo": "example-org/demo",
           "run_id": "run-contract-01",
           "schema": "cortex-self-publication-receipt/v1",
           "transaction": {
-            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-            "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+            "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
             "kind": "cortex-planning-publication-intent/v1"
           },
           "work_id": "work-contract-01"
@@ -172,7 +172,7 @@
         "coupled_run_patch": {
           "fixture_patch_token": "coupled-to-brainstorm-event-01"
         },
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "brainstorm_artifact",
         "receipts": [
           {
@@ -180,7 +180,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -190,22 +190,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+            "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
             "published_object": {
               "kind": "spec",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
               "ref": "docs/superpowers/specs/contract-1029-spec.md",
               "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
             },
-            "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+            "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -215,7 +215,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -225,22 +225,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "eaea60647b3fc2ea1005d1d1653a621d4f4a9afd7b33658b0529079e4d535a66",
+            "publication_id": "94e713fc48d747b4431bdaf4904e6019156e40a8171dd05226a8c78d87547842",
             "published_object": {
               "kind": "design",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-design.md",
               "ref": "docs/superpowers/specs/contract-1029-design.md",
               "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
             },
-            "receipt_id": "4a27a6fcc722781d58b18b5d0e449866f4ac537b9a078c3fcf6c3e35c0bbafc0",
+            "receipt_id": "fcc8e4339daf84536666072b7bc0d0e1da439c506fbe0c6d1ac499fc202497ef",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -260,7 +260,7 @@
             "gate_ref": {
               "kind": "brainstorm",
               "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-              "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+              "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
             },
             "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
           },
@@ -270,22 +270,22 @@
           },
           "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
           "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+          "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
           "producer_kind": "brainstorm_artifact",
-          "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+          "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
           "published_object": {
             "kind": "spec",
             "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
             "ref": "docs/superpowers/specs/contract-1029-spec.md",
             "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
           },
-          "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+          "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
           "repo": "example-org/demo",
           "run_id": "run-contract-01",
           "schema": "cortex-self-publication-receipt/v1",
           "transaction": {
-            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-            "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+            "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
             "kind": "cortex-planning-publication-intent/v1"
           },
           "work_id": "work-contract-01"
@@ -296,7 +296,7 @@
         "coupled_run_patch": {
           "fixture_patch_token": "coupled-to-brainstorm-event-01"
         },
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "brainstorm_artifact",
         "receipts": [
           {
@@ -304,7 +304,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -314,22 +314,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+            "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
             "published_object": {
               "kind": "spec",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
               "ref": "docs/superpowers/specs/contract-1029-spec.md",
               "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
             },
-            "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+            "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -339,7 +339,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -349,22 +349,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "eaea60647b3fc2ea1005d1d1653a621d4f4a9afd7b33658b0529079e4d535a66",
+            "publication_id": "94e713fc48d747b4431bdaf4904e6019156e40a8171dd05226a8c78d87547842",
             "published_object": {
               "kind": "design",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-design.md",
               "ref": "docs/superpowers/specs/contract-1029-design.md",
               "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
             },
-            "receipt_id": "4a27a6fcc722781d58b18b5d0e449866f4ac537b9a078c3fcf6c3e35c0bbafc0",
+            "receipt_id": "fcc8e4339daf84536666072b7bc0d0e1da439c506fbe0c6d1ac499fc202497ef",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -384,7 +384,7 @@
         "coupled_run_patch": {
           "fixture_patch_token": "coupled-to-brainstorm-event-01"
         },
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "brainstorm_artifact",
         "receipts": [
           {
@@ -392,7 +392,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -402,22 +402,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+            "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
             "published_object": {
               "kind": "spec",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
               "ref": "docs/superpowers/specs/contract-1029-spec.md",
               "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
             },
-            "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+            "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -427,7 +427,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -437,22 +437,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+            "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
             "published_object": {
               "kind": "spec",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
               "ref": "docs/superpowers/specs/contract-1029-spec.md",
               "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
             },
-            "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+            "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -750,7 +750,7 @@
           "marker": "<!-- cortex-self-publication-intent:v1:90985b1d495079c75f90a534929f92c66acb6bcc3a77e3f5c202f5beb1b40d01 -->",
           "request_metadata_sha256": "7b36daff7bccd3c162636d35a8ab0ec707ab81b0b245910029264982202d3f96"
         },
-        "same_resource_key": {
+        "proposed_pr_resource_key": {
           "number": 7,
           "repository": "example-org/demo"
         }
@@ -874,6 +874,296 @@
       }
     },
     {
+      "context": {
+        "acceptance_facts": {
+          "assessments": [
+            {
+              "accepted": false,
+              "blocking_markers": [],
+              "kind": "plan",
+              "reasons": [
+                "status-not-accepted"
+              ],
+              "ref": "workstreams/demo/draft-plan.md",
+              "sha256": "2f2c94b323a032af13497ff8caa3f2d3fe85be8eb8607f5ea8fdb9c3ec03a84e"
+            },
+            {
+              "accepted": true,
+              "blocking_markers": [],
+              "kind": "plan",
+              "reasons": [],
+              "ref": "workstreams/demo/accepted-plan.md",
+              "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+            }
+          ],
+          "card": "planning-contract",
+          "declared_output_patterns": [
+            "docs/superpowers/plans/*receipt-contract.md"
+          ],
+          "phase": "plan",
+          "phase_attempt": 3,
+          "selected_index": 1,
+          "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
+          "target_match_count": 1
+        },
+        "acceptance_facts_sha256": "3e1b29d036f5b740f044231186a02d48ac591dd20c6de419a56daf444cb9f077",
+        "event_basis": {
+          "acceptance_facts_sha256": "3e1b29d036f5b740f044231186a02d48ac591dd20c6de419a56daf444cb9f077",
+          "card": "planning-contract",
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "phase": "plan",
+          "phase_attempt": 3,
+          "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-01",
+          "selected_source": {
+            "kind": "plan",
+            "ref": "workstreams/demo/accepted-plan.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "work_id": "work-contract-01"
+        },
+        "history_workspace_ref": "docs/superpowers/plans/receipt-contract.md",
+        "incoming_workspace_ref": "docs/superpowers/plans/receipt-contract.md",
+        "intent_core": {
+          "acceptance_evidence": {
+            "card": "planning-contract",
+            "match_count": 1,
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "phase": "plan",
+            "phase_attempt": 3,
+            "ref": "planning-input-snapshots/run-contract-01/plan/3/planning-contract.json",
+            "selected_index": 1,
+            "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
+            "sha256": "68487def3f50ab48fd9102e1514318cebc932393c27e9e481a51292355834107"
+          },
+          "accepted_input": {
+            "kind": "plan",
+            "ref": "workstreams/demo/accepted-plan.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "operation": {
+            "after_sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "artifact",
+            "mutation": true,
+            "path_domain": "workspace",
+            "ref": "docs/superpowers/plans/receipt-contract.md"
+          },
+          "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-01",
+          "schema": "cortex-plan-materialization-intent/v1",
+          "work_id": "work-contract-01"
+        },
+        "intent_ref": "planning-publication-intents/run-contract-01/plan/7dddf81baf814bf1d75fd7881e0e5cf6295e4a3fb8d1d060bb7814ab493ba23d.json",
+        "intent_sha256": "97d0f357d97fbe319d5eaa8823d14ad298711dccce3f68c5a7af452f07a08812",
+        "intent_stored_bytes_utf8": "{\"acceptance_evidence\":{\"card\":\"planning-contract\",\"match_count\":1,\"output_pattern\":\"docs/superpowers/plans/*receipt-contract.md\",\"phase\":\"plan\",\"phase_attempt\":3,\"ref\":\"planning-input-snapshots/run-contract-01/plan/3/planning-contract.json\",\"selected_index\":1,\"selection_rule\":\"first_accepted_kind_plan_in_assessment_order/v1\",\"sha256\":\"68487def3f50ab48fd9102e1514318cebc932393c27e9e481a51292355834107\"},\"accepted_input\":{\"kind\":\"plan\",\"ref\":\"workstreams/demo/accepted-plan.md\",\"sha256\":\"3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323\"},\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"operation\":{\"after_sha256\":\"3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/plans/receipt-contract.md\"},\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"schema\":\"cortex-plan-materialization-intent/v1\",\"work_id\":\"work-contract-01\"}",
+        "producer_event_id": "7dddf81baf814bf1d75fd7881e0e5cf6295e4a3fb8d1d060bb7814ab493ba23d",
+        "proposed_planning_object_key": {
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "producer_kind": "plan_materialization",
+          "run_id": "run-contract-01",
+          "workspace_ref": "docs/superpowers/plans/receipt-contract.md"
+        },
+        "publication_basis": {
+          "producer_event_id": "7dddf81baf814bf1d75fd7881e0e5cf6295e4a3fb8d1d060bb7814ab493ba23d",
+          "target": {
+            "kind": "plan",
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "ref": "docs/superpowers/plans/receipt-contract.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          }
+        },
+        "publication_id": "37d2339e9b5804fe67e778fc4d5b870fa4f67159ad5649e35b0eaf4f09f7b230",
+        "receipt": {
+          "acceptance_evidence": {
+            "card": "planning-contract",
+            "match_count": 1,
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "phase": "plan",
+            "phase_attempt": 3,
+            "ref": "planning-input-snapshots/run-contract-01/plan/3/planning-contract.json",
+            "selected_index": 1,
+            "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
+            "sha256": "68487def3f50ab48fd9102e1514318cebc932393c27e9e481a51292355834107"
+          },
+          "accepted_input": {
+            "kind": "plan",
+            "ref": "workstreams/demo/accepted-plan.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "producer_event_id": "7dddf81baf814bf1d75fd7881e0e5cf6295e4a3fb8d1d060bb7814ab493ba23d",
+          "producer_kind": "plan_materialization",
+          "publication_id": "37d2339e9b5804fe67e778fc4d5b870fa4f67159ad5649e35b0eaf4f09f7b230",
+          "published_object": {
+            "kind": "plan",
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "ref": "docs/superpowers/plans/receipt-contract.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "receipt_id": "bbeb7f79895b595c20ff10c865a16dcad1af00d605250dd152e5f31ab8b266fa",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-01",
+          "schema": "cortex-self-publication-receipt/v1",
+          "transaction": {
+            "intent_ref": "planning-publication-intents/run-contract-01/plan/7dddf81baf814bf1d75fd7881e0e5cf6295e4a3fb8d1d060bb7814ab493ba23d.json",
+            "intent_sha256": "97d0f357d97fbe319d5eaa8823d14ad298711dccce3f68c5a7af452f07a08812",
+            "kind": "cortex-plan-materialization-intent/v1"
+          },
+          "work_id": "work-contract-01"
+        },
+        "snapshot": {
+          "assessments": [
+            {
+              "accepted": false,
+              "blocking_markers": [],
+              "content_utf8": "---\nstatus: draft\n---\n\n# Tasks\n- [ ] Draft only.\n",
+              "kind": "plan",
+              "reasons": [
+                "status-not-accepted"
+              ],
+              "ref": "workstreams/demo/draft-plan.md",
+              "sha256": "2f2c94b323a032af13497ff8caa3f2d3fe85be8eb8607f5ea8fdb9c3ec03a84e"
+            },
+            {
+              "accepted": true,
+              "blocking_markers": [],
+              "content_utf8": "---\nstatus: accepted\n---\n\n# Tasks\n- [ ] Freeze receipt wire schema.\n",
+              "kind": "plan",
+              "reasons": [],
+              "ref": "workstreams/demo/accepted-plan.md",
+              "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+            }
+          ],
+          "card": "planning-contract",
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "declared_output_patterns": [
+            "docs/superpowers/plans/*receipt-contract.md"
+          ],
+          "phase": "plan",
+          "phase_attempt": 3,
+          "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-01",
+          "schema": "cortex-plan-accepted-input/v1",
+          "selected_index": 1,
+          "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
+          "target": {
+            "kind": "plan",
+            "match_count": 1,
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "ref": "docs/superpowers/plans/receipt-contract.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "work_id": "work-contract-01"
+        },
+        "snapshot_ref": "planning-input-snapshots/run-contract-01/plan/3/planning-contract.json",
+        "snapshot_sha256": "68487def3f50ab48fd9102e1514318cebc932393c27e9e481a51292355834107",
+        "snapshot_stored_bytes_utf8": "{\"assessments\":[{\"accepted\":false,\"blocking_markers\":[],\"content_utf8\":\"---\\nstatus: draft\\n---\\n\\n# Tasks\\n- [ ] Draft only.\\n\",\"kind\":\"plan\",\"reasons\":[\"status-not-accepted\"],\"ref\":\"workstreams/demo/draft-plan.md\",\"sha256\":\"2f2c94b323a032af13497ff8caa3f2d3fe85be8eb8607f5ea8fdb9c3ec03a84e\"},{\"accepted\":true,\"blocking_markers\":[],\"content_utf8\":\"---\\nstatus: accepted\\n---\\n\\n# Tasks\\n- [ ] Freeze receipt wire schema.\\n\",\"kind\":\"plan\",\"reasons\":[],\"ref\":\"workstreams/demo/accepted-plan.md\",\"sha256\":\"3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323\"}],\"card\":\"planning-contract\",\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"declared_output_patterns\":[\"docs/superpowers/plans/*receipt-contract.md\"],\"phase\":\"plan\",\"phase_attempt\":3,\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"schema\":\"cortex-plan-accepted-input/v1\",\"selected_index\":1,\"selection_rule\":\"first_accepted_kind_plan_in_assessment_order/v1\",\"target\":{\"kind\":\"plan\",\"match_count\":1,\"output_pattern\":\"docs/superpowers/plans/*receipt-contract.md\",\"ref\":\"docs/superpowers/plans/receipt-contract.md\",\"sha256\":\"3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323\"},\"work_id\":\"work-contract-01\"}"
+      },
+      "expected": {
+        "outcome": "conflict",
+        "persist_attempts": 0,
+        "reason": "same-planning-object-key-across-events",
+        "rows_added": 0
+      },
+      "history": [
+        {
+          "acceptance_evidence": {
+            "card": "planning-contract",
+            "match_count": 1,
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "phase": "plan",
+            "phase_attempt": 2,
+            "ref": "planning-input-snapshots/run-contract-01/plan/2/planning-contract.json",
+            "selected_index": 1,
+            "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
+            "sha256": "565045a4c7fa0734eda60b414c816bfd274a9f1409f521bf6a13c483cbb8928b"
+          },
+          "accepted_input": {
+            "kind": "plan",
+            "ref": "workstreams/demo/accepted-plan.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "producer_event_id": "a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6",
+          "producer_kind": "plan_materialization",
+          "publication_id": "c3fbfa69d94e6e64d48cdac29f890d17113248c69c2e75b6fe7b152fce29cc15",
+          "published_object": {
+            "kind": "plan",
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "ref": "docs/superpowers/plans/receipt-contract.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "receipt_id": "725e0a8d2ea88433c22f2a076c6bcfa6c9ab9e2340213b4f5e6b7b015a0aad7c",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-01",
+          "schema": "cortex-self-publication-receipt/v1",
+          "transaction": {
+            "intent_ref": "planning-publication-intents/run-contract-01/plan/a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6.json",
+            "intent_sha256": "ac8247c4f2b658da75f5438168baeb3d960bca583cdd2b9fdd6295fe2f7b5e88",
+            "kind": "cortex-plan-materialization-intent/v1"
+          },
+          "work_id": "work-contract-01"
+        }
+      ],
+      "id": "same-planning-ref-different-event-conflicts",
+      "incoming_batch": {
+        "coupled_run_patch": {
+          "fixture_patch_token": "plan-attempt-3"
+        },
+        "producer_event_id": "7dddf81baf814bf1d75fd7881e0e5cf6295e4a3fb8d1d060bb7814ab493ba23d",
+        "producer_kind": "plan_materialization",
+        "receipts": [
+          {
+            "acceptance_evidence": {
+              "card": "planning-contract",
+              "match_count": 1,
+              "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+              "phase": "plan",
+              "phase_attempt": 3,
+              "ref": "planning-input-snapshots/run-contract-01/plan/3/planning-contract.json",
+              "selected_index": 1,
+              "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
+              "sha256": "68487def3f50ab48fd9102e1514318cebc932393c27e9e481a51292355834107"
+            },
+            "accepted_input": {
+              "kind": "plan",
+              "ref": "workstreams/demo/accepted-plan.md",
+              "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+            },
+            "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+            "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "producer_event_id": "7dddf81baf814bf1d75fd7881e0e5cf6295e4a3fb8d1d060bb7814ab493ba23d",
+            "producer_kind": "plan_materialization",
+            "publication_id": "37d2339e9b5804fe67e778fc4d5b870fa4f67159ad5649e35b0eaf4f09f7b230",
+            "published_object": {
+              "kind": "plan",
+              "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+              "ref": "docs/superpowers/plans/receipt-contract.md",
+              "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+            },
+            "receipt_id": "bbeb7f79895b595c20ff10c865a16dcad1af00d605250dd152e5f31ab8b266fa",
+            "repo": "example-org/demo",
+            "run_id": "run-contract-01",
+            "schema": "cortex-self-publication-receipt/v1",
+            "transaction": {
+              "intent_ref": "planning-publication-intents/run-contract-01/plan/7dddf81baf814bf1d75fd7881e0e5cf6295e4a3fb8d1d060bb7814ab493ba23d.json",
+              "intent_sha256": "97d0f357d97fbe319d5eaa8823d14ad298711dccce3f68c5a7af452f07a08812",
+              "kind": "cortex-plan-materialization-intent/v1"
+            },
+            "work_id": "work-contract-01"
+          }
+        ]
+      }
+    },
+    {
       "expected": {
         "outcome": "conflict",
         "persist_attempts": 0,
@@ -893,7 +1183,7 @@
         "coupled_run_patch": {
           "fixture_patch_token": "coupled-to-brainstorm-event-01"
         },
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "brainstorm_artifact",
         "receipts": [
           {
@@ -901,7 +1191,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -911,22 +1201,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+            "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
             "published_object": {
               "kind": "spec",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
               "ref": "docs/superpowers/specs/contract-1029-spec.md",
               "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
             },
-            "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+            "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -936,7 +1226,7 @@
               "gate_ref": {
                 "kind": "brainstorm",
                 "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-                "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+                "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
               },
               "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
             },
@@ -946,22 +1236,22 @@
             },
             "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
             "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
             "producer_kind": "brainstorm_artifact",
-            "publication_id": "eaea60647b3fc2ea1005d1d1653a621d4f4a9afd7b33658b0529079e4d535a66",
+            "publication_id": "94e713fc48d747b4431bdaf4904e6019156e40a8171dd05226a8c78d87547842",
             "published_object": {
               "kind": "design",
               "output_pattern": "docs/superpowers/specs/*contract-1029*-design.md",
               "ref": "docs/superpowers/specs/contract-1029-design.md",
               "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
             },
-            "receipt_id": "4a27a6fcc722781d58b18b5d0e449866f4ac537b9a078c3fcf6c3e35c0bbafc0",
+            "receipt_id": "fcc8e4339daf84536666072b7bc0d0e1da439c506fbe0c6d1ac499fc202497ef",
             "repo": "example-org/demo",
             "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-              "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+              "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+              "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
               "kind": "cortex-planning-publication-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -1141,7 +1431,7 @@
           "gate_ref": {
             "kind": "brainstorm",
             "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-            "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+            "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
           },
           "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
         },
@@ -1151,22 +1441,22 @@
         },
         "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
         "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "brainstorm_artifact",
-        "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+        "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
         "published_object": {
           "kind": "spec",
           "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
           "ref": "docs/superpowers/specs/contract-1029-spec.md",
           "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
         },
-        "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+        "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
         "repo": "example-org/demo",
         "run_id": "run-contract-01",
         "schema": "cortex-self-publication-receipt/v2",
         "transaction": {
-          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-          "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+          "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
           "kind": "cortex-planning-publication-intent/v1"
         },
         "work_id": "work-contract-01"
@@ -1186,7 +1476,7 @@
           "gate_ref": {
             "kind": "brainstorm",
             "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-            "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+            "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
           },
           "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
         },
@@ -1196,22 +1486,22 @@
         },
         "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
         "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "unknown_producer",
-        "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+        "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
         "published_object": {
           "kind": "spec",
           "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
           "ref": "docs/superpowers/specs/contract-1029-spec.md",
           "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
         },
-        "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+        "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
         "repo": "example-org/demo",
         "run_id": "run-contract-01",
         "schema": "cortex-self-publication-receipt/v1",
         "transaction": {
-          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-          "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+          "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
           "kind": "cortex-planning-publication-intent/v1"
         },
         "work_id": "work-contract-01"
@@ -1374,7 +1664,7 @@
           "gate_ref": {
             "kind": "brainstorm",
             "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-            "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+            "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
           },
           "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
         },
@@ -1384,22 +1674,22 @@
         },
         "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
         "pre_publication_authority_sha256": "Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "brainstorm_artifact",
-        "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+        "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
         "published_object": {
           "kind": "spec",
           "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
           "ref": "docs/superpowers/specs/contract-1029-spec.md",
           "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
         },
-        "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+        "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
         "repo": "example-org/demo",
         "run_id": "run-contract-01",
         "schema": "cortex-self-publication-receipt/v1",
         "transaction": {
-          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-          "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+          "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
           "kind": "cortex-planning-publication-intent/v1"
         },
         "work_id": "work-contract-01"
@@ -1419,7 +1709,7 @@
           "gate_ref": {
             "kind": "brainstorm",
             "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-            "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+            "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
           },
           "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
         },
@@ -1429,22 +1719,22 @@
         },
         "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
         "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "brainstorm_artifact",
-        "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+        "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
         "published_object": {
           "kind": "spec",
           "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
           "ref": "docs/superpowers/specs/contract-1029-spec.md",
           "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
         },
-        "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+        "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
         "repo": "example-org/demo",
         "run_id": "run-contract-01",
         "schema": "cortex-self-publication-receipt/v1",
         "transaction": {
-          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-          "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+          "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
           "kind": "cortex-planning-publication-intent/v1"
         },
         "work_id": "work-contract-01"
@@ -1513,7 +1803,7 @@
       }
     },
     {
-      "boundary": "strict-receipt-value-parser",
+      "boundary": "sidecar-resolver-validation",
       "context": {
         "expected_event_basis": {
           "acceptance_facts_sha256": "5c5e0404912432a93466e99138219f52b2873560358e7cd0a793edce0fcb2eb2",
@@ -1579,7 +1869,7 @@
       }
     },
     {
-      "boundary": "strict-receipt-value-parser",
+      "boundary": "sidecar-resolver-validation",
       "context": {
         "expected_publication_basis": {
           "producer_event_id": "a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6",
@@ -1638,7 +1928,7 @@
       }
     },
     {
-      "boundary": "strict-receipt-value-parser",
+      "boundary": "sidecar-resolver-validation",
       "context": {
         "referenced_intent_core": {
           "acceptance_evidence": {
@@ -1725,6 +2015,55 @@
       "context": null,
       "expected": {
         "accepted": false,
+        "diagnostic_code": "invalid-digest",
+        "persist": false
+      },
+      "id": "receipt-id-contained-formula-mismatch",
+      "input": {
+        "acceptance_evidence": {
+          "card": "planning-contract",
+          "match_count": 1,
+          "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+          "phase": "plan",
+          "phase_attempt": 2,
+          "ref": "planning-input-snapshots/run-contract-01/plan/2/planning-contract.json",
+          "selected_index": 1,
+          "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
+          "sha256": "565045a4c7fa0734eda60b414c816bfd274a9f1409f521bf6a13c483cbb8928b"
+        },
+        "accepted_input": {
+          "kind": "plan",
+          "ref": "workstreams/demo/accepted-plan.md",
+          "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+        },
+        "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+        "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "producer_event_id": "a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6",
+        "producer_kind": "plan_materialization",
+        "publication_id": "c3fbfa69d94e6e64d48cdac29f890d17113248c69c2e75b6fe7b152fce29cc15",
+        "published_object": {
+          "kind": "plan",
+          "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+          "ref": "docs/superpowers/plans/receipt-contract.md",
+          "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+        },
+        "receipt_id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "repo": "example-org/demo",
+        "run_id": "run-contract-01",
+        "schema": "cortex-self-publication-receipt/v1",
+        "transaction": {
+          "intent_ref": "planning-publication-intents/run-contract-01/plan/a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6.json",
+          "intent_sha256": "ac8247c4f2b658da75f5438168baeb3d960bca583cdd2b9fdd6295fe2f7b5e88",
+          "kind": "cortex-plan-materialization-intent/v1"
+        },
+        "work_id": "work-contract-01"
+      }
+    },
+    {
+      "boundary": "strict-receipt-value-parser",
+      "context": null,
+      "expected": {
+        "accepted": false,
         "diagnostic_code": "malformed-known-v1",
         "persist": false
       },
@@ -1781,19 +2120,12 @@
       }
     },
     {
-      "boundary": "raw-registry-decoder",
+      "boundary": "isolated-raw-registry-row-decoder",
       "expected": {
-        "append": "conflict",
-        "history_loads": true,
-        "persist": false
-      },
-      "expected_after_from_dict_to_dict": {
-        "diagnostic": {
-          "code": "duplicate-json-key",
-          "index": 0
-        },
-        "kind": "cortex-publication-receipt-invalid-json-row/v1",
-        "raw_json": "{\"schema\": \"v1\", \"schema\": \"v2\"}"
+        "append": "not-run",
+        "history_loads": false,
+        "persist": false,
+        "row_decoder": "classified-invalid-json-row"
       },
       "expected_invalid_row": {
         "diagnostic": {
@@ -1803,8 +2135,10 @@
         "kind": "cortex-publication-receipt-invalid-json-row/v1",
         "raw_json": "{\"schema\": \"v1\", \"schema\": \"v2\"}"
       },
-      "id": "duplicate-json-key-in-receipt-row",
-      "input_raw_document": "{\"publication_receipts\":[{\"schema\": \"v1\", \"schema\": \"v2\"}]}"
+      "id": "duplicate-json-key-in-workflow-receipt-row",
+      "input_raw_row": "{\"schema\": \"v1\", \"schema\": \"v2\"}",
+      "registry_json_pointer": "/workflows/0/publication_receipts/0",
+      "scope_note": "Isolated raw receipt-row decoder fixture invoked at the real registry field pointer. It is not a complete registry document or loadable WorkflowRun; history_loads is false and this vector claims decoder classification only."
     },
     {
       "boundary": "workflow-run-value-round-trip",
@@ -2672,7 +3006,7 @@
       }
     },
     {
-      "boundary": "strict-receipt-value-parser",
+      "boundary": "sidecar-resolver-validation",
       "context": {
         "expected_request_metadata_sha256": "4da5b2c8409100d9fed287947b0dbbee14810f6b682e89040be772d3b7645158"
       },
@@ -2734,7 +3068,7 @@
       }
     },
     {
-      "boundary": "strict-receipt-value-parser",
+      "boundary": "sidecar-resolver-validation",
       "context": {
         "intent_head": {
           "branch": "feature/receipt-contract",
@@ -2808,8 +3142,172 @@
       "status": "pending-unconstructible-without-a-cryptographic-collision"
     }
   ],
+  "pr_get_raw_body_vectors": [
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 1,
+      "expected": {
+        "accepted": true,
+        "reason": null
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "id": "exact-rendered-body-accepted",
+      "line_ending_normalized_get_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "normalized_get_body_equals_rendered_body": true,
+      "raw_marker_like_lines": [
+        "<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->"
+      ]
+    },
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 1,
+      "expected": {
+        "accepted": true,
+        "reason": null
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Summary\r\nCloses #42\r\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "id": "crlf-rendered-body-accepted-after-line-ending-normalization",
+      "line_ending_normalized_get_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "normalized_get_body_equals_rendered_body": true,
+      "raw_marker_like_lines": [
+        "<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->"
+      ]
+    },
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 1,
+      "expected": {
+        "accepted": true,
+        "reason": null
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Summary\rCloses #42\r<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "id": "cr-rendered-body-accepted-after-line-ending-normalization",
+      "line_ending_normalized_get_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "normalized_get_body_equals_rendered_body": true,
+      "raw_marker_like_lines": [
+        "<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->"
+      ]
+    },
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 2,
+      "expected": {
+        "accepted": false,
+        "reason": "marker-like-line-count"
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "id": "duplicate-exact-marker-lines-rejected",
+      "line_ending_normalized_get_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "normalized_get_body_equals_rendered_body": false,
+      "raw_marker_like_lines": [
+        "<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+        "<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->"
+      ]
+    },
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 0,
+      "expected": {
+        "accepted": false,
+        "reason": "malformed-marker-like-line"
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Summary\nCloses #42\n <!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "id": "leading-whitespace-marker-line-rejected",
+      "line_ending_normalized_get_body": "Summary\nCloses #42\n <!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "normalized_get_body_equals_rendered_body": false,
+      "raw_marker_like_lines": [
+        " <!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->"
+      ]
+    },
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 0,
+      "expected": {
+        "accepted": false,
+        "reason": "malformed-marker-like-line"
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 --> ",
+      "id": "trailing-whitespace-marker-line-rejected",
+      "line_ending_normalized_get_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 --> ",
+      "normalized_get_body_equals_rendered_body": false,
+      "raw_marker_like_lines": [
+        "<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 --> "
+      ]
+    },
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 0,
+      "expected": {
+        "accepted": false,
+        "reason": "malformed-marker-like-line"
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Summary\nCloses #42\n<!-- CORTEX-SELF-PUBLICATION-INTENT:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "id": "case-altered-marker-line-rejected",
+      "line_ending_normalized_get_body": "Summary\nCloses #42\n<!-- CORTEX-SELF-PUBLICATION-INTENT:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "normalized_get_body_equals_rendered_body": false,
+      "raw_marker_like_lines": [
+        "<!-- CORTEX-SELF-PUBLICATION-INTENT:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->"
+      ]
+    },
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 0,
+      "expected": {
+        "accepted": false,
+        "reason": "malformed-marker-like-line"
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -->",
+      "id": "wrong-publication-id-marker-line-rejected",
+      "line_ending_normalized_get_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -->",
+      "normalized_get_body_equals_rendered_body": false,
+      "raw_marker_like_lines": [
+        "<!-- cortex-self-publication-intent:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -->"
+      ]
+    },
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 0,
+      "expected": {
+        "accepted": false,
+        "reason": "malformed-marker-like-line"
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v2:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "id": "malformed-version-marker-line-rejected",
+      "line_ending_normalized_get_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v2:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "normalized_get_body_equals_rendered_body": false,
+      "raw_marker_like_lines": [
+        "<!-- cortex-self-publication-intent:v2:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->"
+      ]
+    },
+    {
+      "boundary": "github-get-raw-response-body",
+      "exact_expected_marker_line_count": 1,
+      "expected": {
+        "accepted": false,
+        "reason": "normalized-body-not-equal-rendered-body"
+      },
+      "expected_rendered_marker_bearing_body": "Summary\nCloses #42\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "get_response_raw_body_utf8": "Changed summary\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "id": "marker-present-but-body-differs-from-rendered-body-rejected",
+      "line_ending_normalized_get_body": "Changed summary\n<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+      "normalized_get_body_equals_rendered_body": false,
+      "raw_marker_like_lines": [
+        "<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->"
+      ]
+    }
+  ],
   "pr_request_normalization_vectors": [
     {
+      "boundary": "resolved-intent-sidecar-pure-value-validation",
       "expected": {
         "accepted": true
       },
@@ -2843,6 +3341,7 @@
           "work_id": "work-contract-01"
         }
       },
+      "intent_value_source": "parsed value from referenced immutable PR intent sidecar",
       "marker": "<!-- cortex-self-publication-intent:v1:1b62f820372bf148a6a5164cb5c58c9077650ea8d6f39ccda64ca51132e2eac5 -->",
       "normalized_request_metadata": {
         "body": "Summary\nCloses #42\nDetails café\nEnd",
@@ -2924,18 +3423,952 @@
       }
     },
     {
+      "boundary": "github-get-raw-response-body",
       "expected": {
         "accepted": false,
-        "diagnostic_code": "duplicate-label-after-NFC"
+        "diagnostic_code": "malformed-marker-like-line"
       },
-      "id": "duplicate-labels-after-nfc-are-rejected",
+      "id": "marker-publication-id-mismatch-in-readback-body-is-rejected",
+      "raw_get_response_body_utf8": "Summary\n<!-- cortex-self-publication-intent:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -->"
+    },
+    {
+      "expected": {
+        "accepted": true
+      },
+      "expected_normalized_labels": [
+        "café",
+        "enhancement",
+        "receipt"
+      ],
+      "id": "duplicate-labels-after-nfc-are-deduplicated",
       "raw_request_metadata": {
         "body": "Summary",
         "labels": [
+          "receipt",
+          "café",
           "café",
-          "café"
+          "enhancement"
         ],
         "title": "feat: duplicate labels"
+      }
+    }
+  ],
+  "producer_operation_eligibility_vectors": [
+    {
+      "all_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        },
+        {
+          "kind": "plan",
+          "ref": "workstreams/demo/todo.md",
+          "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "captured_run_scope": {
+        "planning_source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "repo": "example-org/demo",
+        "work_id": "work-contract-01"
+      },
+      "expected": {
+        "mint_receipt": true,
+        "reason": null
+      },
+      "id": "brainstorm-spec-unique-evidence-operation-join",
+      "matching_integration_rows": [
+        {
+          "content": "---\nstatus: accepted\n---\n\n# Specification\n\n## Requirements\n\nDefine receipt identity and validation requirements.\n",
+          "kind": "spec",
+          "path": "docs/superpowers/specs/contract-1029-spec.md"
+        }
+      ],
+      "matching_peer_evidence_rows": [
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "operation": {
+        "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+        "before_exists": false,
+        "before_sha256": null,
+        "kind": "artifact",
+        "mutation": true,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/specs/contract-1029-spec.md"
+      },
+      "peer_evidence_gate_ref": {
+        "kind": "brainstorm",
+        "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+        "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
+      },
+      "peer_evidence_ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+      "peer_evidence_scope": {
+        "repo": "example-org/demo",
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "work_id": "work-contract-01"
+      },
+      "peer_evidence_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+      "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
+      "scope_matches_captured_run": true,
+      "transaction_join": {
+        "matching_evidence_write_operations": [
+          {
+            "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "evidence",
+            "mutation": true,
+            "path_domain": "coordinator",
+            "ref": "evidence/brainstorm/run-contract-01.json"
+          }
+        ],
+        "selected_output_operation_in_journal": true
+      }
+    },
+    {
+      "all_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        },
+        {
+          "kind": "plan",
+          "ref": "workstreams/demo/todo.md",
+          "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "captured_run_scope": {
+        "planning_source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "repo": "example-org/demo",
+        "work_id": "work-contract-01"
+      },
+      "expected": {
+        "mint_receipt": true,
+        "reason": null
+      },
+      "id": "brainstorm-design-unique-evidence-operation-join",
+      "matching_integration_rows": [
+        {
+          "content": "---\nstatus: accepted\n---\n\n# Design\n\n## Decisions\n\nDescribe the component boundary.\n",
+          "kind": "design",
+          "path": "docs/superpowers/specs/contract-1029-design.md"
+        }
+      ],
+      "matching_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        }
+      ],
+      "operation": {
+        "after_sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e",
+        "before_exists": false,
+        "before_sha256": null,
+        "kind": "artifact",
+        "mutation": true,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/specs/contract-1029-design.md"
+      },
+      "peer_evidence_gate_ref": {
+        "kind": "brainstorm",
+        "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+        "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
+      },
+      "peer_evidence_ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+      "peer_evidence_scope": {
+        "repo": "example-org/demo",
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "work_id": "work-contract-01"
+      },
+      "peer_evidence_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+      "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
+      "scope_matches_captured_run": true,
+      "transaction_join": {
+        "matching_evidence_write_operations": [
+          {
+            "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "evidence",
+            "mutation": true,
+            "path_domain": "coordinator",
+            "ref": "evidence/brainstorm/run-contract-01.json"
+          }
+        ],
+        "selected_output_operation_in_journal": true
+      }
+    },
+    {
+      "all_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        },
+        {
+          "kind": "plan",
+          "ref": "workstreams/demo/todo.md",
+          "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "captured_run_scope": {
+        "planning_source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "repo": "example-org/demo",
+        "work_id": "work-contract-01"
+      },
+      "expected": {
+        "mint_receipt": false,
+        "reason": "operation-did-not-mutate"
+      },
+      "id": "brainstorm-unchanged-no-write-same-byte-does-not-mint",
+      "matching_integration_rows": [
+        {
+          "content": "---\nstatus: accepted\n---\n\n# Specification\n\n## Requirements\n\nDefine receipt identity and validation requirements.\n",
+          "kind": "spec",
+          "path": "docs/superpowers/specs/contract-1029-spec.md"
+        }
+      ],
+      "matching_peer_evidence_rows": [
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "operation": {
+        "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+        "before_exists": true,
+        "before_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+        "kind": "artifact",
+        "mutation": false,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/specs/contract-1029-spec.md"
+      },
+      "peer_evidence_gate_ref": {
+        "kind": "brainstorm",
+        "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+        "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
+      },
+      "peer_evidence_ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+      "peer_evidence_scope": {
+        "repo": "example-org/demo",
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "work_id": "work-contract-01"
+      },
+      "peer_evidence_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+      "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
+      "scope_matches_captured_run": true,
+      "transaction_join": {
+        "matching_evidence_write_operations": [
+          {
+            "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "evidence",
+            "mutation": true,
+            "path_domain": "coordinator",
+            "ref": "evidence/brainstorm/run-contract-01.json"
+          }
+        ],
+        "selected_output_operation_in_journal": false
+      }
+    },
+    {
+      "all_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        },
+        {
+          "kind": "plan",
+          "ref": "workstreams/demo/todo.md",
+          "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "captured_run_scope": {
+        "planning_source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "repo": "example-org/demo",
+        "work_id": "work-contract-01"
+      },
+      "expected": {
+        "mint_receipt": true,
+        "reason": null
+      },
+      "id": "brainstorm-overwrite-existing-authority-owned-artifact-mints",
+      "matching_integration_rows": [
+        {
+          "content": "---\nstatus: accepted\n---\n\n# Specification\n\n## Requirements\n\nDefine receipt identity and validation requirements.\n",
+          "kind": "spec",
+          "path": "docs/superpowers/specs/contract-1029-spec.md"
+        }
+      ],
+      "matching_peer_evidence_rows": [
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "operation": {
+        "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+        "before_exists": true,
+        "before_sha256": "ae1ec20b2e6007c7e2836327852a08b958ee42c1ee35eadb3710293795fa4ba4",
+        "kind": "artifact",
+        "mutation": true,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/specs/contract-1029-spec.md"
+      },
+      "peer_evidence_gate_ref": {
+        "kind": "brainstorm",
+        "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+        "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
+      },
+      "peer_evidence_ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+      "peer_evidence_scope": {
+        "repo": "example-org/demo",
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "work_id": "work-contract-01"
+      },
+      "peer_evidence_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+      "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
+      "scope_matches_captured_run": true,
+      "transaction_join": {
+        "matching_evidence_write_operations": [
+          {
+            "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "evidence",
+            "mutation": true,
+            "path_domain": "coordinator",
+            "ref": "evidence/brainstorm/run-contract-01.json"
+          }
+        ],
+        "selected_output_operation_in_journal": true
+      }
+    },
+    {
+      "all_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        },
+        {
+          "kind": "plan",
+          "ref": "workstreams/demo/todo.md",
+          "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "captured_run_scope": {
+        "planning_source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "repo": "example-org/demo",
+        "work_id": "work-contract-01"
+      },
+      "expected": {
+        "mint_receipt": false,
+        "reason": "operation-evidence-join-ineligible"
+      },
+      "id": "brainstorm-duplicate-peer-evidence-row-does-not-mint",
+      "matching_integration_rows": [
+        {
+          "content": "---\nstatus: accepted\n---\n\n# Specification\n\n## Requirements\n\nDefine receipt identity and validation requirements.\n",
+          "kind": "spec",
+          "path": "docs/superpowers/specs/contract-1029-spec.md"
+        }
+      ],
+      "matching_peer_evidence_rows": [
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "operation": {
+        "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+        "before_exists": false,
+        "before_sha256": null,
+        "kind": "artifact",
+        "mutation": true,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/specs/contract-1029-spec.md"
+      },
+      "peer_evidence_gate_ref": {
+        "kind": "brainstorm",
+        "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+        "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
+      },
+      "peer_evidence_ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+      "peer_evidence_scope": {
+        "repo": "example-org/demo",
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "work_id": "work-contract-01"
+      },
+      "peer_evidence_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+      "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
+      "scope_matches_captured_run": true,
+      "transaction_join": {
+        "matching_evidence_write_operations": [
+          {
+            "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "evidence",
+            "mutation": true,
+            "path_domain": "coordinator",
+            "ref": "evidence/brainstorm/run-contract-01.json"
+          }
+        ],
+        "selected_output_operation_in_journal": true
+      }
+    },
+    {
+      "all_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        },
+        {
+          "kind": "plan",
+          "ref": "workstreams/demo/todo.md",
+          "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      ],
+      "captured_run_scope": {
+        "planning_source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "repo": "example-org/demo",
+        "work_id": "work-contract-01"
+      },
+      "expected": {
+        "mint_receipt": false,
+        "reason": "operation-evidence-join-ineligible"
+      },
+      "id": "brainstorm-peer-evidence-hash-mismatch-does-not-mint",
+      "matching_integration_rows": [
+        {
+          "content": "---\nstatus: accepted\n---\n\n# Specification\n\n## Requirements\n\nDefine receipt identity and validation requirements.\n",
+          "kind": "spec",
+          "path": "docs/superpowers/specs/contract-1029-spec.md"
+        }
+      ],
+      "matching_peer_evidence_rows": [],
+      "operation": {
+        "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+        "before_exists": false,
+        "before_sha256": null,
+        "kind": "artifact",
+        "mutation": true,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/specs/contract-1029-spec.md"
+      },
+      "peer_evidence_gate_ref": {
+        "kind": "brainstorm",
+        "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+        "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
+      },
+      "peer_evidence_ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+      "peer_evidence_scope": {
+        "repo": "example-org/demo",
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "work_id": "work-contract-01"
+      },
+      "peer_evidence_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+      "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
+      "scope_matches_captured_run": true,
+      "transaction_join": {
+        "matching_evidence_write_operations": [
+          {
+            "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "evidence",
+            "mutation": true,
+            "path_domain": "coordinator",
+            "ref": "evidence/brainstorm/run-contract-01.json"
+          }
+        ],
+        "selected_output_operation_in_journal": true
+      }
+    },
+    {
+      "all_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        },
+        {
+          "kind": "plan",
+          "ref": "workstreams/demo/todo.md",
+          "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+        }
+      ],
+      "captured_run_scope": {
+        "planning_source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "repo": "example-org/demo",
+        "work_id": "work-contract-01"
+      },
+      "expected": {
+        "mint_receipt": false,
+        "reason": "operation-evidence-join-ineligible"
+      },
+      "id": "brainstorm-peer-evidence-row-missing-does-not-mint",
+      "matching_integration_rows": [
+        {
+          "content": "---\nstatus: accepted\n---\n\n# Specification\n\n## Requirements\n\nDefine receipt identity and validation requirements.\n",
+          "kind": "spec",
+          "path": "docs/superpowers/specs/contract-1029-spec.md"
+        }
+      ],
+      "matching_peer_evidence_rows": [],
+      "operation": {
+        "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+        "before_exists": false,
+        "before_sha256": null,
+        "kind": "artifact",
+        "mutation": true,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/specs/contract-1029-spec.md"
+      },
+      "peer_evidence_gate_ref": {
+        "kind": "brainstorm",
+        "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+        "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
+      },
+      "peer_evidence_ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+      "peer_evidence_scope": {
+        "repo": "example-org/demo",
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "work_id": "work-contract-01"
+      },
+      "peer_evidence_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+      "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
+      "scope_matches_captured_run": true,
+      "transaction_join": {
+        "matching_evidence_write_operations": [
+          {
+            "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "evidence",
+            "mutation": true,
+            "path_domain": "coordinator",
+            "ref": "evidence/brainstorm/run-contract-01.json"
+          }
+        ],
+        "selected_output_operation_in_journal": true
+      }
+    },
+    {
+      "all_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        },
+        {
+          "kind": "plan",
+          "ref": "workstreams/demo/todo.md",
+          "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "boundary": "brainstorm-peer-evidence-scope-and-transaction-join",
+      "captured_run_scope": {
+        "planning_source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "repo": "example-org/demo",
+        "work_id": "work-contract-01"
+      },
+      "event_basis": {
+        "accepted_input_sha256": "c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def",
+        "brainstorm_evidence": {
+          "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+          "sha256": "151c10dea63be2f6476b78181845060e9c29dfede9372244d22a7e3955462cab"
+        },
+        "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+        "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "question_pack_id": "qp-e9e6ef5058abe3c28d31a246",
+        "repo": "example-org/demo",
+        "run_id": "run-contract-01",
+        "work_id": "work-contract-01"
+      },
+      "expected": {
+        "mint_receipt": false,
+        "reason": "peer-evidence-scope-mismatch"
+      },
+      "id": "brainstorm-peer-evidence-scope-source-revision-mismatch-does-not-mint",
+      "matching_integration_rows": [
+        {
+          "content": "---\nstatus: accepted\n---\n\n# Specification\n\n## Requirements\n\nDefine receipt identity and validation requirements.\n",
+          "kind": "spec",
+          "path": "docs/superpowers/specs/contract-1029-spec.md"
+        }
+      ],
+      "matching_peer_evidence_rows": [
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "operation": {
+        "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+        "before_exists": false,
+        "before_sha256": null,
+        "kind": "artifact",
+        "mutation": true,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/specs/contract-1029-spec.md"
+      },
+      "peer_evidence_gate_ref": {
+        "kind": "brainstorm",
+        "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+        "sha256": "151c10dea63be2f6476b78181845060e9c29dfede9372244d22a7e3955462cab"
+      },
+      "peer_evidence_payload": {
+        "artifacts": [
+          {
+            "kind": "design",
+            "ref": "docs/superpowers/specs/contract-1029-design.md",
+            "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+          },
+          {
+            "kind": "plan",
+            "ref": "workstreams/demo/todo.md",
+            "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+          },
+          {
+            "kind": "spec",
+            "ref": "docs/superpowers/specs/contract-1029-spec.md",
+            "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+          }
+        ],
+        "kind": "brainstorm-peer",
+        "primary_integration": {
+          "artifacts": [
+            {
+              "content": "---\nstatus: accepted\n---\n\n# Specification\n\n## Requirements\n\nDefine receipt identity and validation requirements.\n",
+              "kind": "spec",
+              "path": "docs/superpowers/specs/contract-1029-spec.md"
+            },
+            {
+              "content": "---\nstatus: accepted\n---\n\n# Design\n\n## Decisions\n\nDescribe the component boundary.\n",
+              "kind": "design",
+              "path": "docs/superpowers/specs/contract-1029-design.md"
+            }
+          ],
+          "question_pack_id": "qp-e9e6ef5058abe3c28d31a246",
+          "resolutions": [
+            {
+              "artifact_kind": "spec",
+              "artifact_refs": [
+                "docs/superpowers/specs/contract-1029-spec.md"
+              ],
+              "decision": "Add the accepted spec artifact.",
+              "question_id": "q-df4aa821a3fa77ff"
+            },
+            {
+              "artifact_kind": "design",
+              "artifact_refs": [
+                "docs/superpowers/specs/contract-1029-design.md"
+              ],
+              "decision": "Add the accepted design artifact.",
+              "question_id": "q-77064250f4775eb4"
+            }
+          ],
+          "schema_version": 1,
+          "secondary_evidence_hash": "af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed"
+        },
+        "question_pack": {
+          "pack_id": "qp-e9e6ef5058abe3c28d31a246",
+          "questions": [
+            {
+              "kind": "missing-spec",
+              "prompt": "What authoritative content is required to create an accepted spec?",
+              "question_id": "q-df4aa821a3fa77ff",
+              "source_refs": [
+                "workstreams/demo/todo.md"
+              ]
+            },
+            {
+              "kind": "missing-design",
+              "prompt": "What authoritative content is required to create an accepted design?",
+              "question_id": "q-77064250f4775eb4",
+              "source_refs": [
+                "workstreams/demo/todo.md"
+              ]
+            }
+          ],
+          "schema_version": 1
+        },
+        "schema_version": 1,
+        "scope": {
+          "repo": "example-org/demo",
+          "source_revision": "ffffffffffffffffffffffffffffffffffffffff",
+          "work_id": "work-contract-01"
+        },
+        "secondary_evidence": {
+          "evidence": [
+            {
+              "claims": [
+                "An accepted spec artifact is required."
+              ],
+              "question_id": "q-df4aa821a3fa77ff",
+              "source_refs": [
+                "workstreams/demo/todo.md"
+              ]
+            },
+            {
+              "claims": [
+                "An accepted design artifact is required."
+              ],
+              "question_id": "q-77064250f4775eb4",
+              "source_refs": [
+                "workstreams/demo/todo.md"
+              ]
+            }
+          ],
+          "question_pack_id": "qp-e9e6ef5058abe3c28d31a246",
+          "schema_version": 1
+        },
+        "secondary_evidence_hash": "af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed",
+        "secondary_identity": {
+          "executor": "agy",
+          "independence_domain": "external-fixture",
+          "model_id": "fixture-model"
+        }
+      },
+      "peer_evidence_ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+      "peer_evidence_scope": {
+        "repo": "example-org/demo",
+        "source_revision": "ffffffffffffffffffffffffffffffffffffffff",
+        "work_id": "work-contract-01"
+      },
+      "peer_evidence_sha256": "151c10dea63be2f6476b78181845060e9c29dfede9372244d22a7e3955462cab",
+      "peer_evidence_sha256_recomputed": "151c10dea63be2f6476b78181845060e9c29dfede9372244d22a7e3955462cab",
+      "peer_evidence_stored_bytes_utf8": "{\"artifacts\":[{\"kind\":\"design\",\"ref\":\"docs/superpowers/specs/contract-1029-design.md\",\"sha256\":\"d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e\"},{\"kind\":\"plan\",\"ref\":\"workstreams/demo/todo.md\",\"sha256\":\"73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d\"},{\"kind\":\"spec\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\",\"sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\"}],\"kind\":\"brainstorm-peer\",\"primary_integration\":{\"artifacts\":[{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Specification\\n\\n## Requirements\\n\\nDefine receipt identity and validation requirements.\\n\",\"kind\":\"spec\",\"path\":\"docs/superpowers/specs/contract-1029-spec.md\"},{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Design\\n\\n## Decisions\\n\\nDescribe the component boundary.\\n\",\"kind\":\"design\",\"path\":\"docs/superpowers/specs/contract-1029-design.md\"}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"resolutions\":[{\"artifact_kind\":\"spec\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-spec.md\"],\"decision\":\"Add the accepted spec artifact.\",\"question_id\":\"q-df4aa821a3fa77ff\"},{\"artifact_kind\":\"design\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-design.md\"],\"decision\":\"Add the accepted design artifact.\",\"question_id\":\"q-77064250f4775eb4\"}],\"schema_version\":1,\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\"},\"question_pack\":{\"pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"questions\":[{\"kind\":\"missing-spec\",\"prompt\":\"What authoritative content is required to create an accepted spec?\",\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"kind\":\"missing-design\",\"prompt\":\"What authoritative content is required to create an accepted design?\",\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"schema_version\":1},\"schema_version\":1,\"scope\":{\"repo\":\"example-org/demo\",\"source_revision\":\"ffffffffffffffffffffffffffffffffffffffff\",\"work_id\":\"work-contract-01\"},\"secondary_evidence\":{\"evidence\":[{\"claims\":[\"An accepted spec artifact is required.\"],\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"claims\":[\"An accepted design artifact is required.\"],\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"schema_version\":1},\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\",\"secondary_identity\":{\"executor\":\"agy\",\"independence_domain\":\"external-fixture\",\"model_id\":\"fixture-model\"}}\n",
+      "producer_event_id": "6a1ee924284a96d68de8cd4237d08b1728a8d1c8653590e07d9cc83f8ccc2d5d",
+      "scope_matches_captured_run": false,
+      "transaction_join": {
+        "matching_evidence_write_operations": [
+          {
+            "after_sha256": "151c10dea63be2f6476b78181845060e9c29dfede9372244d22a7e3955462cab",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "evidence",
+            "mutation": true,
+            "path_domain": "coordinator",
+            "ref": "evidence/brainstorm/run-contract-01.json"
+          }
+        ],
+        "selected_output_operation_in_journal": true
+      },
+      "transaction_operations": [
+        {
+          "after_sha256": "151c10dea63be2f6476b78181845060e9c29dfede9372244d22a7e3955462cab",
+          "before_exists": false,
+          "before_sha256": null,
+          "kind": "evidence",
+          "mutation": true,
+          "path_domain": "coordinator",
+          "ref": "evidence/brainstorm/run-contract-01.json"
+        },
+        {
+          "after_sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e",
+          "before_exists": false,
+          "before_sha256": null,
+          "kind": "artifact",
+          "mutation": true,
+          "path_domain": "workspace",
+          "ref": "docs/superpowers/specs/contract-1029-design.md"
+        },
+        {
+          "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+          "before_exists": false,
+          "before_sha256": null,
+          "kind": "artifact",
+          "mutation": true,
+          "path_domain": "workspace",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md"
+        }
+      ]
+    },
+    {
+      "all_peer_evidence_rows": [
+        {
+          "kind": "design",
+          "ref": "docs/superpowers/specs/contract-1029-design.md",
+          "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
+        },
+        {
+          "kind": "plan",
+          "ref": "workstreams/demo/todo.md",
+          "sha256": "73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d"
+        },
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "captured_run_scope": {
+        "planning_source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "repo": "example-org/demo",
+        "work_id": "work-contract-01"
+      },
+      "expected": {
+        "mint_receipt": false,
+        "reason": "peer-evidence-transaction-join-mismatch"
+      },
+      "id": "brainstorm-coordinator-domain-artifact-does-not-mint",
+      "matching_integration_rows": [
+        {
+          "content": "---\nstatus: accepted\n---\n\n# Specification\n\n## Requirements\n\nDefine receipt identity and validation requirements.\n",
+          "kind": "spec",
+          "path": "docs/superpowers/specs/contract-1029-spec.md"
+        }
+      ],
+      "matching_peer_evidence_rows": [
+        {
+          "kind": "spec",
+          "ref": "docs/superpowers/specs/contract-1029-spec.md",
+          "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
+        }
+      ],
+      "operation": {
+        "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
+        "before_exists": false,
+        "before_sha256": null,
+        "kind": "artifact",
+        "mutation": true,
+        "path_domain": "coordinator",
+        "ref": "docs/superpowers/specs/contract-1029-spec.md"
+      },
+      "peer_evidence_gate_ref": {
+        "kind": "brainstorm",
+        "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+        "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
+      },
+      "peer_evidence_ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
+      "peer_evidence_scope": {
+        "repo": "example-org/demo",
+        "source_revision": "0123456789abcdef0123456789abcdef01234567",
+        "work_id": "work-contract-01"
+      },
+      "peer_evidence_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+      "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
+      "scope_matches_captured_run": true,
+      "transaction_join": {
+        "matching_evidence_write_operations": [
+          {
+            "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+            "before_exists": false,
+            "before_sha256": null,
+            "kind": "evidence",
+            "mutation": true,
+            "path_domain": "coordinator",
+            "ref": "evidence/brainstorm/run-contract-01.json"
+          }
+        ],
+        "selected_output_operation_in_journal": false
+      }
+    },
+    {
+      "expected": {
+        "mint_receipt": true
+      },
+      "id": "plan-new-workspace-target-mints-eligible-operation",
+      "operation": {
+        "after_sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323",
+        "before_exists": false,
+        "before_sha256": null,
+        "kind": "artifact",
+        "mutation": true,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/plans/receipt-contract.md"
+      },
+      "producer_event_id": "a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6",
+      "target": {
+        "kind": "plan",
+        "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+        "ref": "docs/superpowers/plans/receipt-contract.md",
+        "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+      }
+    },
+    {
+      "existing_target_sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323",
+      "expected": {
+        "mint_receipt": false,
+        "reason": "target-existed-and-was-not-mutated"
+      },
+      "id": "plan-existing-same-byte-target-does-not-mint",
+      "operation": {
+        "after_sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323",
+        "before_exists": true,
+        "before_sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323",
+        "kind": "artifact",
+        "mutation": false,
+        "path_domain": "workspace",
+        "ref": "docs/superpowers/plans/receipt-contract.md"
+      },
+      "producer_event_id": "a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6",
+      "target": {
+        "kind": "plan",
+        "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+        "ref": "docs/superpowers/plans/receipt-contract.md",
+        "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
       }
     }
   ],
@@ -3043,14 +4476,14 @@
         "docs/superpowers/specs/*contract-1029*-design.md"
       ],
       "event": {
-        "canonical_utf8": "{\"accepted_input_sha256\":\"c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def\",\"brainstorm_evidence\":{\"ref\":\"/fixture/coordinator/evidence/brainstorm/run-contract-01.json\",\"sha256\":\"fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909\"},\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"work_id\":\"work-contract-01\"}",
+        "canonical_utf8": "{\"accepted_input_sha256\":\"c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def\",\"brainstorm_evidence\":{\"ref\":\"/fixture/coordinator/evidence/brainstorm/run-contract-01.json\",\"sha256\":\"a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454\"},\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"work_id\":\"work-contract-01\"}",
         "domain": "cortex-self-publication-event/brainstorm/v1",
-        "sha256": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "sha256": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "value": {
           "accepted_input_sha256": "c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def",
           "brainstorm_evidence": {
             "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-            "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+            "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
           },
           "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
           "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -3061,15 +4494,15 @@
         }
       },
       "intent_core": {
-        "canonical_utf8": "{\"acceptance_evidence\":{\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"ref\":\"/fixture/coordinator/evidence/brainstorm/run-contract-01.json\",\"sha256\":\"fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909\"},\"accepted_input\":{\"ref\":\"planning-input-snapshots/run-contract-01/brainstorm/1.json\",\"sha256\":\"c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def\"},\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"operations\":[{\"after_sha256\":\"fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"evidence\",\"mutation\":true,\"path_domain\":\"coordinator\",\"ref\":\"evidence/brainstorm/run-contract-01.json\"},{\"after_sha256\":\"d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-design.md\"},{\"after_sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\"}],\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"schema\":\"cortex-planning-publication-intent/v1\",\"work_id\":\"work-contract-01\"}",
-        "ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-        "sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
-        "stored_bytes_utf8": "{\"acceptance_evidence\":{\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"ref\":\"/fixture/coordinator/evidence/brainstorm/run-contract-01.json\",\"sha256\":\"fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909\"},\"accepted_input\":{\"ref\":\"planning-input-snapshots/run-contract-01/brainstorm/1.json\",\"sha256\":\"c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def\"},\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"operations\":[{\"after_sha256\":\"fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"evidence\",\"mutation\":true,\"path_domain\":\"coordinator\",\"ref\":\"evidence/brainstorm/run-contract-01.json\"},{\"after_sha256\":\"d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-design.md\"},{\"after_sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\"}],\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"schema\":\"cortex-planning-publication-intent/v1\",\"work_id\":\"work-contract-01\"}",
+        "canonical_utf8": "{\"acceptance_evidence\":{\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"ref\":\"/fixture/coordinator/evidence/brainstorm/run-contract-01.json\",\"sha256\":\"a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454\"},\"accepted_input\":{\"ref\":\"planning-input-snapshots/run-contract-01/brainstorm/1.json\",\"sha256\":\"c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def\"},\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"operations\":[{\"after_sha256\":\"a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"evidence\",\"mutation\":true,\"path_domain\":\"coordinator\",\"ref\":\"evidence/brainstorm/run-contract-01.json\"},{\"after_sha256\":\"d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-design.md\"},{\"after_sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\"}],\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"schema\":\"cortex-planning-publication-intent/v1\",\"work_id\":\"work-contract-01\"}",
+        "ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+        "sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
+        "stored_bytes_utf8": "{\"acceptance_evidence\":{\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"ref\":\"/fixture/coordinator/evidence/brainstorm/run-contract-01.json\",\"sha256\":\"a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454\"},\"accepted_input\":{\"ref\":\"planning-input-snapshots/run-contract-01/brainstorm/1.json\",\"sha256\":\"c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def\"},\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"operations\":[{\"after_sha256\":\"a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"evidence\",\"mutation\":true,\"path_domain\":\"coordinator\",\"ref\":\"evidence/brainstorm/run-contract-01.json\"},{\"after_sha256\":\"d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-design.md\"},{\"after_sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\"}],\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"schema\":\"cortex-planning-publication-intent/v1\",\"work_id\":\"work-contract-01\"}",
         "value": {
           "acceptance_evidence": {
             "question_pack_id": "qp-e9e6ef5058abe3c28d31a246",
             "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-            "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+            "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
           },
           "accepted_input": {
             "ref": "planning-input-snapshots/run-contract-01/brainstorm/1.json",
@@ -3078,7 +4511,7 @@
           "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
           "operations": [
             {
-              "after_sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909",
+              "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
               "before_exists": false,
               "before_sha256": null,
               "kind": "evidence",
@@ -3118,7 +4551,7 @@
             "gate_ref": {
               "kind": "brainstorm",
               "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-              "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+              "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
             },
             "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
           },
@@ -3128,22 +4561,22 @@
           },
           "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
           "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+          "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
           "producer_kind": "brainstorm_artifact",
-          "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+          "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
           "published_object": {
             "kind": "spec",
             "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
             "ref": "docs/superpowers/specs/contract-1029-spec.md",
             "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
           },
-          "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+          "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
           "repo": "example-org/demo",
           "run_id": "run-contract-01",
           "schema": "cortex-self-publication-receipt/v1",
           "transaction": {
-            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-            "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+            "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
             "kind": "cortex-planning-publication-intent/v1"
           },
           "work_id": "work-contract-01"
@@ -3153,7 +4586,7 @@
             "gate_ref": {
               "kind": "brainstorm",
               "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-              "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+              "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
             },
             "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
           },
@@ -3163,22 +4596,22 @@
           },
           "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
           "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+          "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
           "producer_kind": "brainstorm_artifact",
-          "publication_id": "eaea60647b3fc2ea1005d1d1653a621d4f4a9afd7b33658b0529079e4d535a66",
+          "publication_id": "94e713fc48d747b4431bdaf4904e6019156e40a8171dd05226a8c78d87547842",
           "published_object": {
             "kind": "design",
             "output_pattern": "docs/superpowers/specs/*contract-1029*-design.md",
             "ref": "docs/superpowers/specs/contract-1029-design.md",
             "sha256": "d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e"
           },
-          "receipt_id": "4a27a6fcc722781d58b18b5d0e449866f4ac537b9a078c3fcf6c3e35c0bbafc0",
+          "receipt_id": "fcc8e4339daf84536666072b7bc0d0e1da439c506fbe0c6d1ac499fc202497ef",
           "repo": "example-org/demo",
           "run_id": "run-contract-01",
           "schema": "cortex-self-publication-receipt/v1",
           "transaction": {
-            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-            "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+            "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
             "kind": "cortex-planning-publication-intent/v1"
           },
           "work_id": "work-contract-01"
@@ -3186,7 +4619,7 @@
       ],
       "operations": [
         {
-          "after_sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909",
+          "after_sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
           "before_exists": false,
           "before_sha256": null,
           "kind": "evidence",
@@ -3215,7 +4648,7 @@
       ],
       "peer_evidence": {
         "payload": {
-          "canonical_utf8": "{\"artifacts\":[{\"kind\":\"design\",\"ref\":\"docs/superpowers/specs/contract-1029-design.md\",\"sha256\":\"d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e\"},{\"kind\":\"plan\",\"ref\":\"workstreams/demo/todo.md\",\"sha256\":\"73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d\"},{\"kind\":\"spec\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\",\"sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\"}],\"kind\":\"brainstorm-peer\",\"primary_integration\":{\"artifacts\":[{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Specification\\n\\n## Requirements\\n\\nDefine receipt identity and validation requirements.\\n\",\"kind\":\"spec\",\"path\":\"docs/superpowers/specs/contract-1029-spec.md\"},{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Design\\n\\n## Decisions\\n\\nDescribe the component boundary.\\n\",\"kind\":\"design\",\"path\":\"docs/superpowers/specs/contract-1029-design.md\"}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"resolutions\":[{\"artifact_kind\":\"spec\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-spec.md\"],\"decision\":\"Add the accepted spec artifact.\",\"question_id\":\"q-df4aa821a3fa77ff\"},{\"artifact_kind\":\"design\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-design.md\"],\"decision\":\"Add the accepted design artifact.\",\"question_id\":\"q-77064250f4775eb4\"}],\"schema_version\":1,\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\"},\"question_pack\":{\"pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"questions\":[{\"kind\":\"missing-spec\",\"prompt\":\"What authoritative content is required to create an accepted spec?\",\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"kind\":\"missing-design\",\"prompt\":\"What authoritative content is required to create an accepted design?\",\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"schema_version\":1},\"schema_version\":1,\"scope\":{\"repo\":\"example-org/demo\",\"source_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"work_id\":\"work-contract-01\"},\"secondary_evidence\":{\"evidence\":[{\"claims\":[\"An accepted spec artifact is required.\"],\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"claims\":[\"An accepted design artifact is required.\"],\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"schema_version\":1},\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\",\"secondary_identity\":{\"executor\":\"agy\",\"independence_domain\":\"external-fixture\",\"model_id\":\"fixture-model\"}}",
+          "canonical_utf8": "{\"artifacts\":[{\"kind\":\"design\",\"ref\":\"docs/superpowers/specs/contract-1029-design.md\",\"sha256\":\"d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e\"},{\"kind\":\"plan\",\"ref\":\"workstreams/demo/todo.md\",\"sha256\":\"73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d\"},{\"kind\":\"spec\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\",\"sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\"}],\"kind\":\"brainstorm-peer\",\"primary_integration\":{\"artifacts\":[{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Specification\\n\\n## Requirements\\n\\nDefine receipt identity and validation requirements.\\n\",\"kind\":\"spec\",\"path\":\"docs/superpowers/specs/contract-1029-spec.md\"},{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Design\\n\\n## Decisions\\n\\nDescribe the component boundary.\\n\",\"kind\":\"design\",\"path\":\"docs/superpowers/specs/contract-1029-design.md\"}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"resolutions\":[{\"artifact_kind\":\"spec\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-spec.md\"],\"decision\":\"Add the accepted spec artifact.\",\"question_id\":\"q-df4aa821a3fa77ff\"},{\"artifact_kind\":\"design\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-design.md\"],\"decision\":\"Add the accepted design artifact.\",\"question_id\":\"q-77064250f4775eb4\"}],\"schema_version\":1,\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\"},\"question_pack\":{\"pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"questions\":[{\"kind\":\"missing-spec\",\"prompt\":\"What authoritative content is required to create an accepted spec?\",\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"kind\":\"missing-design\",\"prompt\":\"What authoritative content is required to create an accepted design?\",\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"schema_version\":1},\"schema_version\":1,\"scope\":{\"repo\":\"example-org/demo\",\"source_revision\":\"0123456789abcdef0123456789abcdef01234567\",\"work_id\":\"work-contract-01\"},\"secondary_evidence\":{\"evidence\":[{\"claims\":[\"An accepted spec artifact is required.\"],\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"claims\":[\"An accepted design artifact is required.\"],\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"schema_version\":1},\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\",\"secondary_identity\":{\"executor\":\"agy\",\"independence_domain\":\"external-fixture\",\"model_id\":\"fixture-model\"}}",
           "value": {
             "artifacts": [
               {
@@ -3295,7 +4728,7 @@
             "schema_version": 1,
             "scope": {
               "repo": "example-org/demo",
-              "source_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "source_revision": "0123456789abcdef0123456789abcdef01234567",
               "work_id": "work-contract-01"
             },
             "secondary_evidence": {
@@ -3330,8 +4763,8 @@
             }
           }
         },
-        "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909",
-        "stored_bytes_utf8": "{\"artifacts\":[{\"kind\":\"design\",\"ref\":\"docs/superpowers/specs/contract-1029-design.md\",\"sha256\":\"d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e\"},{\"kind\":\"plan\",\"ref\":\"workstreams/demo/todo.md\",\"sha256\":\"73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d\"},{\"kind\":\"spec\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\",\"sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\"}],\"kind\":\"brainstorm-peer\",\"primary_integration\":{\"artifacts\":[{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Specification\\n\\n## Requirements\\n\\nDefine receipt identity and validation requirements.\\n\",\"kind\":\"spec\",\"path\":\"docs/superpowers/specs/contract-1029-spec.md\"},{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Design\\n\\n## Decisions\\n\\nDescribe the component boundary.\\n\",\"kind\":\"design\",\"path\":\"docs/superpowers/specs/contract-1029-design.md\"}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"resolutions\":[{\"artifact_kind\":\"spec\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-spec.md\"],\"decision\":\"Add the accepted spec artifact.\",\"question_id\":\"q-df4aa821a3fa77ff\"},{\"artifact_kind\":\"design\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-design.md\"],\"decision\":\"Add the accepted design artifact.\",\"question_id\":\"q-77064250f4775eb4\"}],\"schema_version\":1,\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\"},\"question_pack\":{\"pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"questions\":[{\"kind\":\"missing-spec\",\"prompt\":\"What authoritative content is required to create an accepted spec?\",\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"kind\":\"missing-design\",\"prompt\":\"What authoritative content is required to create an accepted design?\",\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"schema_version\":1},\"schema_version\":1,\"scope\":{\"repo\":\"example-org/demo\",\"source_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"work_id\":\"work-contract-01\"},\"secondary_evidence\":{\"evidence\":[{\"claims\":[\"An accepted spec artifact is required.\"],\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"claims\":[\"An accepted design artifact is required.\"],\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"schema_version\":1},\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\",\"secondary_identity\":{\"executor\":\"agy\",\"independence_domain\":\"external-fixture\",\"model_id\":\"fixture-model\"}}\n"
+        "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454",
+        "stored_bytes_utf8": "{\"artifacts\":[{\"kind\":\"design\",\"ref\":\"docs/superpowers/specs/contract-1029-design.md\",\"sha256\":\"d62db2e986ec3c7bf64b4fdebac2e38d7a19702689b2a8fd9f3c83dc22c5e70e\"},{\"kind\":\"plan\",\"ref\":\"workstreams/demo/todo.md\",\"sha256\":\"73e5577ad444ee9cf63351afb6559213b0c58bf291ef5a757e812af74bc1b89d\"},{\"kind\":\"spec\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\",\"sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\"}],\"kind\":\"brainstorm-peer\",\"primary_integration\":{\"artifacts\":[{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Specification\\n\\n## Requirements\\n\\nDefine receipt identity and validation requirements.\\n\",\"kind\":\"spec\",\"path\":\"docs/superpowers/specs/contract-1029-spec.md\"},{\"content\":\"---\\nstatus: accepted\\n---\\n\\n# Design\\n\\n## Decisions\\n\\nDescribe the component boundary.\\n\",\"kind\":\"design\",\"path\":\"docs/superpowers/specs/contract-1029-design.md\"}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"resolutions\":[{\"artifact_kind\":\"spec\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-spec.md\"],\"decision\":\"Add the accepted spec artifact.\",\"question_id\":\"q-df4aa821a3fa77ff\"},{\"artifact_kind\":\"design\",\"artifact_refs\":[\"docs/superpowers/specs/contract-1029-design.md\"],\"decision\":\"Add the accepted design artifact.\",\"question_id\":\"q-77064250f4775eb4\"}],\"schema_version\":1,\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\"},\"question_pack\":{\"pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"questions\":[{\"kind\":\"missing-spec\",\"prompt\":\"What authoritative content is required to create an accepted spec?\",\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"kind\":\"missing-design\",\"prompt\":\"What authoritative content is required to create an accepted design?\",\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"schema_version\":1},\"schema_version\":1,\"scope\":{\"repo\":\"example-org/demo\",\"source_revision\":\"0123456789abcdef0123456789abcdef01234567\",\"work_id\":\"work-contract-01\"},\"secondary_evidence\":{\"evidence\":[{\"claims\":[\"An accepted spec artifact is required.\"],\"question_id\":\"q-df4aa821a3fa77ff\",\"source_refs\":[\"workstreams/demo/todo.md\"]},{\"claims\":[\"An accepted design artifact is required.\"],\"question_id\":\"q-77064250f4775eb4\",\"source_refs\":[\"workstreams/demo/todo.md\"]}],\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\",\"schema_version\":1},\"secondary_evidence_hash\":\"af222e98866af5c3ce2140a02901563ecdbfc54b4c366db8894bc86217ace1ed\",\"secondary_identity\":{\"executor\":\"agy\",\"independence_domain\":\"external-fixture\",\"model_id\":\"fixture-model\"}}\n"
       },
       "publication_bases": [
         {
@@ -3344,7 +4777,7 @@
             "path_domain": "workspace",
             "ref": "docs/superpowers/specs/contract-1029-spec.md"
           },
-          "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5"
+          "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6"
         },
         {
           "operation": {
@@ -3356,12 +4789,12 @@
             "path_domain": "workspace",
             "ref": "docs/superpowers/specs/contract-1029-design.md"
           },
-          "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5"
+          "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6"
         }
       ],
       "publication_id": {
         "basis": {
-          "canonical_utf8": "{\"operation\":{\"after_sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\"},\"producer_event_id\":\"9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5\"}",
+          "canonical_utf8": "{\"operation\":{\"after_sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\",\"before_exists\":false,\"before_sha256\":null,\"kind\":\"artifact\",\"mutation\":true,\"path_domain\":\"workspace\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\"},\"producer_event_id\":\"99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6\"}",
           "value": {
             "operation": {
               "after_sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28",
@@ -3372,11 +4805,11 @@
               "path_domain": "workspace",
               "ref": "docs/superpowers/specs/contract-1029-spec.md"
             },
-            "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5"
+            "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6"
           }
         },
         "domain": "cortex-self-publication-publication/brainstorm/v1",
-        "value": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845"
+        "value": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526"
       },
       "question_pack_derivation": {
         "accepted_question_pack_equals_default": true,
@@ -3465,7 +4898,7 @@
           "gate_ref": {
             "kind": "brainstorm",
             "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-            "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+            "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
           },
           "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
         },
@@ -3475,36 +4908,36 @@
         },
         "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
         "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+        "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
         "producer_kind": "brainstorm_artifact",
-        "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+        "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
         "published_object": {
           "kind": "spec",
           "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
           "ref": "docs/superpowers/specs/contract-1029-spec.md",
           "sha256": "3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28"
         },
-        "receipt_id": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+        "receipt_id": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
         "repo": "example-org/demo",
         "run_id": "run-contract-01",
         "schema": "cortex-self-publication-receipt/v1",
         "transaction": {
-          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-          "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+          "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+          "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
           "kind": "cortex-planning-publication-intent/v1"
         },
         "work_id": "work-contract-01"
       },
       "receipt_id": {
-        "canonical_utf8": "{\"acceptance_evidence\":{\"gate_ref\":{\"kind\":\"brainstorm\",\"ref\":\"/fixture/coordinator/evidence/brainstorm/run-contract-01.json\",\"sha256\":\"fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909\"},\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\"},\"accepted_input\":{\"ref\":\"planning-input-snapshots/run-contract-01/brainstorm/1.json\",\"sha256\":\"c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def\"},\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"producer_event_id\":\"9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5\",\"producer_kind\":\"brainstorm_artifact\",\"publication_id\":\"7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845\",\"published_object\":{\"kind\":\"spec\",\"output_pattern\":\"docs/superpowers/specs/*contract-1029*-spec.md\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\",\"sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\"},\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"schema\":\"cortex-self-publication-receipt/v1\",\"transaction\":{\"intent_ref\":\"planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json\",\"intent_sha256\":\"4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094\",\"kind\":\"cortex-planning-publication-intent/v1\"},\"work_id\":\"work-contract-01\"}",
+        "canonical_utf8": "{\"acceptance_evidence\":{\"gate_ref\":{\"kind\":\"brainstorm\",\"ref\":\"/fixture/coordinator/evidence/brainstorm/run-contract-01.json\",\"sha256\":\"a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454\"},\"question_pack_id\":\"qp-e9e6ef5058abe3c28d31a246\"},\"accepted_input\":{\"ref\":\"planning-input-snapshots/run-contract-01/brainstorm/1.json\",\"sha256\":\"c8278ec446b93d7d1c4b9ce7e89be1857b3be818876660a6802fd600d6861def\"},\"claim_key\":\"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\"pre_publication_authority_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"producer_event_id\":\"99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6\",\"producer_kind\":\"brainstorm_artifact\",\"publication_id\":\"6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526\",\"published_object\":{\"kind\":\"spec\",\"output_pattern\":\"docs/superpowers/specs/*contract-1029*-spec.md\",\"ref\":\"docs/superpowers/specs/contract-1029-spec.md\",\"sha256\":\"3e43e727f63aa443658c6cc305188b85bb7019ee997b9fe951935f1119d75d28\"},\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-01\",\"schema\":\"cortex-self-publication-receipt/v1\",\"transaction\":{\"intent_ref\":\"planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json\",\"intent_sha256\":\"fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40\",\"kind\":\"cortex-planning-publication-intent/v1\"},\"work_id\":\"work-contract-01\"}",
         "domain": "cortex-self-publication-receipt/v1",
-        "sha256": "1aae9f609fe21f6a7c6a0e8d2d0cf37a7e7418a19d59717730091a8f89944ee1",
+        "sha256": "aa902f0d31528781b6a8952218f1bd6ab61328a04dc1d0720b43262cc5f1f640",
         "value": {
           "acceptance_evidence": {
             "gate_ref": {
               "kind": "brainstorm",
               "ref": "/fixture/coordinator/evidence/brainstorm/run-contract-01.json",
-              "sha256": "fee4860f4538890d306dccf6a3e9e9b1ed9d17a1766ca65a8d049feb1c9ee909"
+              "sha256": "a3cb14ad0ffd9d4031199ad41dfca5c9062be3b7724082c5116a151e4f59d454"
             },
             "question_pack_id": "qp-e9e6ef5058abe3c28d31a246"
           },
@@ -3514,9 +4947,9 @@
           },
           "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
           "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "producer_event_id": "9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5",
+          "producer_event_id": "99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6",
           "producer_kind": "brainstorm_artifact",
-          "publication_id": "7b9aaa2ece93af72962bf930f80917b3bd599ccbdc67cd72d18e7bf5d68d3845",
+          "publication_id": "6bc63179831f24192c59ad3e1353890e19b30578c8c95e3c3494024fa64fc526",
           "published_object": {
             "kind": "spec",
             "output_pattern": "docs/superpowers/specs/*contract-1029*-spec.md",
@@ -3527,8 +4960,8 @@
           "run_id": "run-contract-01",
           "schema": "cortex-self-publication-receipt/v1",
           "transaction": {
-            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/9e687f03b626a741d6f3d8df32a3d1753bb4fd59ccd02b43749aa24964f8b9a5.json",
-            "intent_sha256": "4b0c17c188d28da7524ebc1c7e769246949658ea45ce1fdda81cbd151e5f0094",
+            "intent_ref": "planning-publication-intents/run-contract-01/brainstorm/99d1d0f58d66690d1a71d4ecb1f2f36eb9b13213a92fdab081b1c5b1d5965ad6.json",
+            "intent_sha256": "fd33f642b33343dd6f7e9931ee1e3fe5a7501684740041ff3d5d36d66e4f8f40",
             "kind": "cortex-planning-publication-intent/v1"
           },
           "work_id": "work-contract-01"
@@ -4176,6 +5609,7 @@
           "work_id": "work-contract-01"
         }
       ],
+      "expected_reload_state": "typed-valid-value; provenance-unverified",
       "id": "valid-row-round-trip",
       "input_publication_receipts_member": [
         {
@@ -4227,6 +5661,130 @@
             "kind": "cortex-manager-pr-intent/v1"
           },
           "work_id": "work-contract-01"
+        }
+      ],
+      "sidecar_resolver_calls_during_from_dict": 0
+    },
+    {
+      "expected_after_to_dict_and_reload": [
+        {
+          "acceptance_evidence": {
+            "card": "planning-contract",
+            "match_count": 1,
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "phase": "plan",
+            "phase_attempt": 2,
+            "ref": "planning-input-snapshots/run-contract-01/plan/2/planning-contract.json",
+            "selected_index": 1,
+            "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
+            "sha256": "565045a4c7fa0734eda60b414c816bfd274a9f1409f521bf6a13c483cbb8928b"
+          },
+          "accepted_input": {
+            "kind": "plan",
+            "ref": "workstreams/demo/accepted-plan.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "producer_event_id": "a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6",
+          "producer_kind": "plan_materialization",
+          "publication_id": "c3fbfa69d94e6e64d48cdac29f890d17113248c69c2e75b6fe7b152fce29cc15",
+          "published_object": {
+            "kind": "plan",
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "ref": "docs/superpowers/plans/receipt-contract.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "receipt_id": "725e0a8d2ea88433c22f2a076c6bcfa6c9ab9e2340213b4f5e6b7b015a0aad7c",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-01",
+          "schema": "cortex-self-publication-receipt/v1",
+          "transaction": {
+            "intent_ref": "planning-publication-intents/run-contract-01/plan/a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6.json",
+            "intent_sha256": "ac8247c4f2b658da75f5438168baeb3d960bca583cdd2b9fdd6295fe2f7b5e88",
+            "kind": "cortex-plan-materialization-intent/v1"
+          },
+          "work_id": "work-contract-01"
+        }
+      ],
+      "expected_reload_state": "typed-valid-value; provenance-unverified",
+      "id": "typed-valid-reload-without-sidecars",
+      "input_publication_receipts_member": [
+        {
+          "acceptance_evidence": {
+            "card": "planning-contract",
+            "match_count": 1,
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "phase": "plan",
+            "phase_attempt": 2,
+            "ref": "planning-input-snapshots/run-contract-01/plan/2/planning-contract.json",
+            "selected_index": 1,
+            "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
+            "sha256": "565045a4c7fa0734eda60b414c816bfd274a9f1409f521bf6a13c483cbb8928b"
+          },
+          "accepted_input": {
+            "kind": "plan",
+            "ref": "workstreams/demo/accepted-plan.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "producer_event_id": "a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6",
+          "producer_kind": "plan_materialization",
+          "publication_id": "c3fbfa69d94e6e64d48cdac29f890d17113248c69c2e75b6fe7b152fce29cc15",
+          "published_object": {
+            "kind": "plan",
+            "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
+            "ref": "docs/superpowers/plans/receipt-contract.md",
+            "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
+          },
+          "receipt_id": "725e0a8d2ea88433c22f2a076c6bcfa6c9ab9e2340213b4f5e6b7b015a0aad7c",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-01",
+          "schema": "cortex-self-publication-receipt/v1",
+          "transaction": {
+            "intent_ref": "planning-publication-intents/run-contract-01/plan/a61c0e3f715e19a18698986044c3f19d41338b85d73e887111fb2d7b8d29ade6.json",
+            "intent_sha256": "ac8247c4f2b658da75f5438168baeb3d960bca583cdd2b9fdd6295fe2f7b5e88",
+            "kind": "cortex-plan-materialization-intent/v1"
+          },
+          "work_id": "work-contract-01"
+        }
+      ],
+      "sidecar_resolver_calls_during_from_dict": 0,
+      "sidecars_available_to_from_dict": false
+    },
+    {
+      "boundary": "workflow-run-value-round-trip-after-decoder-classification",
+      "expected_after_from_dict": [
+        {
+          "diagnostic": {
+            "code": "duplicate-json-key",
+            "index": 0
+          },
+          "kind": "cortex-publication-receipt-invalid-json-row/v1",
+          "raw_json": "{\"schema\": \"v1\", \"schema\": \"v2\"}"
+        }
+      ],
+      "expected_after_to_dict_and_reload": [
+        {
+          "diagnostic": {
+            "code": "duplicate-json-key",
+            "index": 0
+          },
+          "kind": "cortex-publication-receipt-invalid-json-row/v1",
+          "raw_json": "{\"schema\": \"v1\", \"schema\": \"v2\"}"
+        }
+      ],
+      "full_registry_load_claimed": false,
+      "id": "invalid-json-row-wrapper-value-round-trip-after-isolated-decoding",
+      "input_publication_receipts_member": [
+        {
+          "diagnostic": {
+            "code": "duplicate-json-key",
+            "index": 0
+          },
+          "kind": "cortex-publication-receipt-invalid-json-row/v1",
+          "raw_json": "{\"schema\": \"v1\", \"schema\": \"v2\"}"
         }
       ]
     },

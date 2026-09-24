@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import fnmatch
 import json
+import re
 import unicodedata
 from pathlib import Path
 
@@ -51,6 +52,7 @@ repo = "example-org/demo"
 work_id = "work-contract-01"
 run_id = "run-contract-01"
 authority_sha = "a" * 64
+brain_source_revision = "0123456789abcdef0123456789abcdef01234567"
 claim_key = "claim:v1:" + sha(
     j({"repo": repo, "work_id": work_id, "authority_digest": authority_sha})
 )
@@ -181,7 +183,7 @@ brain_evidence_payload = {
     "scope": {
         "repo": repo,
         "work_id": work_id,
-        "source_revision": authority_sha,
+        "source_revision": brain_source_revision,
     },
     "question_pack": question_pack,
     "secondary_identity": {
@@ -808,6 +810,302 @@ vectors = {
 }
 
 
+def brainstorm_join_vector(
+    vector_id: str,
+    output_kind: str,
+    operation: dict[str, object],
+    evidence_rows: list[dict[str, object]],
+    *,
+    peer_scope: dict[str, object] | None = None,
+    peer_evidence_ref: str = brain_evidence_abs_ref,
+    peer_evidence_sha256: str = brain_evidence_sha,
+    producer_event_id: str = brain_event_id,
+    transaction_operations: list[dict[str, object]] | None = None,
+    integration_artifacts: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    scope = peer_scope if peer_scope is not None else brain_evidence_payload["scope"]
+    run_scope = {
+        "repo": repo,
+        "work_id": work_id,
+        "planning_source_revision": brain_source_revision,
+    }
+    scope_matches = (
+        set(scope) == {"repo", "work_id", "source_revision"}
+        and scope["repo"] == run_scope["repo"]
+        and scope["work_id"] == run_scope["work_id"]
+        and scope["source_revision"] == run_scope["planning_source_revision"]
+    )
+    before_state_valid = (
+        (operation["before_exists"] is False and operation["before_sha256"] is None)
+        or (
+            operation["before_exists"] is True
+            and isinstance(operation["before_sha256"], str)
+            and re.fullmatch(r"[0-9a-f]{64}", operation["before_sha256"]) is not None
+        )
+    )
+    tx_operations = (
+        transaction_operations
+        if transaction_operations is not None
+        else brain_operations
+    )
+    integration_rows_source = (
+        integration_artifacts
+        if integration_artifacts is not None
+        else brain_evidence_payload["primary_integration"]["artifacts"]
+    )
+    output_rows = [
+        row
+        for row in evidence_rows
+        if row.get("kind") == output_kind
+        and row.get("ref") == operation["ref"]
+        and row.get("sha256") == operation["after_sha256"]
+    ]
+    integration_rows = [
+        row
+        for row in integration_rows_source
+        if row.get("kind") == output_kind
+        and row.get("path") == operation["ref"]
+    ]
+    evidence_write_operations = [
+        row
+        for row in tx_operations
+        if row.get("path_domain") == "coordinator"
+        and row.get("kind") == "evidence"
+        and row.get("ref") == brain_evidence_operation["ref"]
+        and row.get("after_sha256") == peer_evidence_sha256
+    ]
+    selected_operation_in_journal = operation in tx_operations
+    transaction_join_valid = (
+        peer_evidence_ref == brain_evidence_abs_ref
+        and len(evidence_write_operations) == 1
+        and selected_operation_in_journal
+    )
+    eligibility_ok = (
+        operation["path_domain"] == "workspace"
+        and operation["kind"] == "artifact"
+        and before_state_valid
+        and operation["mutation"] is True
+        and scope_matches
+        and transaction_join_valid
+        and len(output_rows) == 1
+        and len(integration_rows) == 1
+    )
+    if not scope_matches:
+        reason = "peer-evidence-scope-mismatch"
+    elif operation["mutation"] is not True:
+        reason = "operation-did-not-mutate"
+    elif not transaction_join_valid:
+        reason = "peer-evidence-transaction-join-mismatch"
+    elif eligibility_ok:
+        reason = None
+    else:
+        reason = "operation-evidence-join-ineligible"
+    return {
+        "id": vector_id,
+        "producer_event_id": producer_event_id,
+        "peer_evidence_ref": peer_evidence_ref,
+        "peer_evidence_sha256": peer_evidence_sha256,
+        "peer_evidence_scope": scope,
+        "captured_run_scope": run_scope,
+        "scope_matches_captured_run": scope_matches,
+        "peer_evidence_gate_ref": {
+            "kind": "brainstorm",
+            "ref": peer_evidence_ref,
+            "sha256": peer_evidence_sha256,
+        },
+        "transaction_join": {
+            "matching_evidence_write_operations": evidence_write_operations,
+            "selected_output_operation_in_journal": selected_operation_in_journal,
+        },
+        "operation": operation,
+        "matching_peer_evidence_rows": output_rows,
+        "matching_integration_rows": integration_rows,
+        "all_peer_evidence_rows": evidence_rows,
+        "expected": {
+            "mint_receipt": eligibility_ok,
+            "reason": reason,
+        },
+    }
+
+
+brainstorm_operation_vectors = [
+    brainstorm_join_vector(
+        f"brainstorm-{output['kind']}-unique-evidence-operation-join",
+        output["kind"],
+        operation,
+        brain_evidence_payload["artifacts"],
+    )
+    for output, operation in zip(
+        brain_outputs, brain_artifact_operations, strict=True
+    )
+]
+unchanged_brain_operation = {
+    **brain_artifact_operations[0],
+    "before_exists": True,
+    "before_sha256": brain_artifact_operations[0]["after_sha256"],
+    "mutation": False,
+}
+brainstorm_operation_vectors.append(
+    brainstorm_join_vector(
+        "brainstorm-unchanged-no-write-same-byte-does-not-mint",
+        brain_outputs[0]["kind"],
+        unchanged_brain_operation,
+        brain_evidence_payload["artifacts"],
+    )
+)
+overwrite_brain_operation = {
+    **brain_artifact_operations[0],
+    "before_exists": True,
+    "before_sha256": sha(b"previous authority-owned brainstorm artifact bytes\n"),
+    "mutation": True,
+}
+overwrite_transaction_operations = [
+    overwrite_brain_operation if row == brain_artifact_operations[0] else row
+    for row in brain_operations
+]
+brainstorm_operation_vectors.append(
+    brainstorm_join_vector(
+        "brainstorm-overwrite-existing-authority-owned-artifact-mints",
+        brain_outputs[0]["kind"],
+        overwrite_brain_operation,
+        brain_evidence_payload["artifacts"],
+        transaction_operations=overwrite_transaction_operations,
+    )
+)
+duplicate_brain_evidence = [
+    *brain_evidence_payload["artifacts"],
+    next(
+        row
+        for row in brain_evidence_payload["artifacts"]
+        if row["kind"] == brain_outputs[0]["kind"]
+        and row["ref"] == brain_outputs[0]["ref"]
+        and row["sha256"] == brain_outputs[0]["sha256"]
+    ),
+]
+brainstorm_operation_vectors.append(
+    brainstorm_join_vector(
+        "brainstorm-duplicate-peer-evidence-row-does-not-mint",
+        brain_outputs[0]["kind"],
+        brain_artifact_operations[0],
+        duplicate_brain_evidence,
+    )
+)
+changed_peer_evidence = [
+    {
+        **row,
+        "sha256": "f" * 64,
+    }
+    if row["kind"] == brain_outputs[0]["kind"]
+    and row["ref"] == brain_outputs[0]["ref"]
+    else row
+    for row in brain_evidence_payload["artifacts"]
+]
+brainstorm_operation_vectors.append(
+    brainstorm_join_vector(
+        "brainstorm-peer-evidence-hash-mismatch-does-not-mint",
+        brain_outputs[0]["kind"],
+        brain_artifact_operations[0],
+        changed_peer_evidence,
+    )
+)
+missing_peer_evidence = [
+    row
+    for row in brain_evidence_payload["artifacts"]
+    if row["kind"] != brain_outputs[0]["kind"]
+    or row["ref"] != brain_outputs[0]["ref"]
+    or row["sha256"] != brain_outputs[0]["sha256"]
+]
+brainstorm_operation_vectors.append(
+    brainstorm_join_vector(
+        "brainstorm-peer-evidence-row-missing-does-not-mint",
+        brain_outputs[0]["kind"],
+        brain_artifact_operations[0],
+        missing_peer_evidence,
+    )
+)
+wrong_scope_payload = json.loads(json.dumps(brain_evidence_payload))
+wrong_scope_payload["scope"]["source_revision"] = "f" * 40
+wrong_scope_evidence_bytes = j(wrong_scope_payload) + b"\n"
+wrong_scope_evidence_sha = sha(wrong_scope_evidence_bytes)
+wrong_scope_event_basis = json.loads(json.dumps(brain_event_basis))
+wrong_scope_event_basis["brainstorm_evidence"]["sha256"] = wrong_scope_evidence_sha
+wrong_scope_event_id = h(
+    "cortex-self-publication-event/brainstorm/v1", wrong_scope_event_basis
+)
+wrong_scope_transaction_operations = json.loads(json.dumps(brain_operations))
+for row in wrong_scope_transaction_operations:
+    if row["kind"] == "evidence":
+        row["after_sha256"] = wrong_scope_evidence_sha
+wrong_scope_transaction_operations.sort(
+    key=lambda row: (row["path_domain"], row["ref"], row["kind"], row["after_sha256"])
+)
+wrong_scope_vector = brainstorm_join_vector(
+    "brainstorm-peer-evidence-scope-source-revision-mismatch-does-not-mint",
+    brain_outputs[0]["kind"],
+    brain_artifact_operations[0],
+    wrong_scope_payload["artifacts"],
+    peer_scope=wrong_scope_payload["scope"],
+    peer_evidence_sha256=wrong_scope_evidence_sha,
+    producer_event_id=wrong_scope_event_id,
+    transaction_operations=wrong_scope_transaction_operations,
+    integration_artifacts=wrong_scope_payload["primary_integration"]["artifacts"],
+)
+wrong_scope_vector.update(
+    {
+        "boundary": "brainstorm-peer-evidence-scope-and-transaction-join",
+        "peer_evidence_payload": wrong_scope_payload,
+        "peer_evidence_stored_bytes_utf8": wrong_scope_evidence_bytes.decode("utf-8"),
+        "peer_evidence_sha256_recomputed": wrong_scope_evidence_sha,
+        "event_basis": wrong_scope_event_basis,
+        "transaction_operations": wrong_scope_transaction_operations,
+        "expected": {
+            "mint_receipt": False,
+            "reason": "peer-evidence-scope-mismatch",
+        },
+    }
+)
+brainstorm_operation_vectors.append(wrong_scope_vector)
+wrong_domain_operation = {
+    **brain_artifact_operations[0],
+    "path_domain": "coordinator",
+}
+brainstorm_operation_vectors.append(
+    brainstorm_join_vector(
+        "brainstorm-coordinator-domain-artifact-does-not-mint",
+        brain_outputs[0]["kind"],
+        wrong_domain_operation,
+        brain_evidence_payload["artifacts"],
+    )
+)
+plan_unchanged_operation = {
+    **plan_operation,
+    "before_exists": True,
+    "before_sha256": plan_source_sha,
+    "mutation": False,
+}
+vectors["producer_operation_eligibility_vectors"] = [
+    *brainstorm_operation_vectors,
+    {
+        "id": "plan-new-workspace-target-mints-eligible-operation",
+        "producer_event_id": plan_event_id,
+        "target": plan_target,
+        "operation": plan_operation,
+        "expected": {"mint_receipt": True},
+    },
+    {
+        "id": "plan-existing-same-byte-target-does-not-mint",
+        "producer_event_id": plan_event_id,
+        "target": plan_target,
+        "existing_target_sha256": plan_source_sha,
+        "operation": plan_unchanged_operation,
+        "expected": {
+            "mint_receipt": False,
+            "reason": "target-existed-and-was-not-mutated",
+        },
+    },
+]
+
+
 # Negative fixtures are full literal values derived from the positive fixtures.
 # Re-seal mutations when the intended failure is a deeper cross-binding check.
 def reseal(receipt: dict[str, object]) -> dict[str, object]:
@@ -894,6 +1192,7 @@ add_negative(
     "event-id-does-not-match-basis",
     mutated,
     "cross-binding",
+    boundary="sidecar-resolver-validation",
     context={"expected_event_basis": plan_event_basis},
 )
 
@@ -904,6 +1203,7 @@ add_negative(
     "publication-id-does-not-match-basis",
     mutated,
     "cross-binding",
+    boundary="sidecar-resolver-validation",
     context={"expected_publication_basis": plan_publication_basis},
 )
 
@@ -914,8 +1214,13 @@ add_negative(
     "published-object-does-not-match-intent-operation",
     mutated,
     "cross-binding",
+    boundary="sidecar-resolver-validation",
     context={"referenced_intent_core": plan_intent},
 )
+
+mutated = clone(base_plan)
+mutated["receipt_id"] = "0" * 64
+add_negative("receipt-id-contained-formula-mismatch", mutated, "invalid-digest")
 
 mutated = clone(base_pr)
 mutated["acceptance_evidence"]["post_witness"]["number"] = True
@@ -926,20 +1231,22 @@ add_negative("boolean-is-not-positive-integer", mutated, "malformed-known-v1")
 negative_vectors.extend(
     [
         {
-            "id": "duplicate-json-key-in-receipt-row",
-            "boundary": "raw-registry-decoder",
-            "input_raw_document": '{"publication_receipts":[{"schema": "v1", "schema": "v2"}]}',
+            "id": "duplicate-json-key-in-workflow-receipt-row",
+            "boundary": "isolated-raw-registry-row-decoder",
+            "registry_json_pointer": "/workflows/0/publication_receipts/0",
+            "input_raw_row": '{"schema": "v1", "schema": "v2"}',
+            "scope_note": "Isolated raw receipt-row decoder fixture invoked at the real registry field pointer. It is not a complete registry document or loadable WorkflowRun; history_loads is false and this vector claims decoder classification only.",
             "expected_invalid_row": {
                 "kind": "cortex-publication-receipt-invalid-json-row/v1",
                 "raw_json": '{"schema": "v1", "schema": "v2"}',
                 "diagnostic": {"code": "duplicate-json-key", "index": 0},
             },
-            "expected_after_from_dict_to_dict": {
-                "kind": "cortex-publication-receipt-invalid-json-row/v1",
-                "raw_json": '{"schema": "v1", "schema": "v2"}',
-                "diagnostic": {"code": "duplicate-json-key", "index": 0},
+            "expected": {
+                "row_decoder": "classified-invalid-json-row",
+                "history_loads": False,
+                "append": "not-run",
+                "persist": False,
             },
-            "expected": {"history_loads": True, "append": "conflict", "persist": False},
         },
         {
             "id": "invalid-non-list-container-round-trip",
@@ -1106,6 +1413,7 @@ add_negative(
     "read-back-metadata-digest-mismatch",
     mutated,
     "cross-binding",
+    boundary="sidecar-resolver-validation",
     context={"expected_request_metadata_sha256": pr_metadata_sha},
 )
 
@@ -1116,6 +1424,7 @@ add_negative(
     "pr-accepted-input-candidate-does-not-match-intent",
     mutated,
     "cross-binding",
+    boundary="sidecar-resolver-validation",
     context={"intent_head": pr_intent["head"]},
 )
 vectors["negative_vectors"] = negative_vectors
@@ -1128,7 +1437,12 @@ raw_metadata = {
 normalized_metadata = {
     "title": unicodedata.normalize("NFC", raw_metadata["title"]),
     "body": raw_metadata["body"].replace("\r\n", "\n").replace("\r", "\n"),
-    "labels": sorted(unicodedata.normalize("NFC", label) for label in raw_metadata["labels"]),
+    "labels": sorted(
+        {
+            unicodedata.normalize("NFC", label)
+            for label in raw_metadata["labels"]
+        }
+    ),
 }
 normalized_metadata_sha = h(
     "cortex-manager-pr-request-metadata/v1", normalized_metadata
@@ -1143,6 +1457,8 @@ normalized_marker = (
 vectors["pr_request_normalization_vectors"] = [
     {
         "id": "nfc-and-line-ending-normalization",
+        "boundary": "resolved-intent-sidecar-pure-value-validation",
+        "intent_value_source": "parsed value from referenced immutable PR intent sidecar",
         "raw_request_metadata": raw_metadata,
         "normalized_request_metadata": normalized_metadata,
         "request_metadata_digest": structured(
@@ -1166,15 +1482,104 @@ vectors["pr_request_normalization_vectors"] = [
         "expected": {"accepted": False, "diagnostic_code": "marker-like-line"},
     },
     {
-        "id": "duplicate-labels-after-nfc-are-rejected",
+        "id": "marker-publication-id-mismatch-in-readback-body-is-rejected",
+        "boundary": "github-get-raw-response-body",
+        "raw_get_response_body_utf8": "Summary\n<!-- cortex-self-publication-intent:v1:" + "b" * 64 + " -->",
+        "expected": {"accepted": False, "diagnostic_code": "malformed-marker-like-line"},
+    },
+    {
+        "id": "duplicate-labels-after-nfc-are-deduplicated",
         "raw_request_metadata": {
             "title": "feat: duplicate labels",
             "body": "Summary",
-            "labels": ["café", "cafe\u0301"],
+            "labels": ["receipt", "cafe\u0301", "café", "enhancement"],
         },
-        "expected": {"accepted": False, "diagnostic_code": "duplicate-label-after-NFC"},
+        "expected_normalized_labels": ["café", "enhancement", "receipt"],
+        "expected": {"accepted": True},
     },
 ]
+
+
+def get_body_vector(vector_id: str, raw_body: str) -> dict[str, object]:
+    marker_like_lines = [
+        line
+        for line in re.split(r"\r\n|\r|\n", raw_body)
+        if "cortex-self-publication-intent:" in line.casefold()
+    ]
+    exact_marker_lines = [line for line in marker_like_lines if line == pr_marker]
+    normalized_get_body = raw_body.replace("\r\n", "\n").replace("\r", "\n")
+    body_matches_rendered = normalized_get_body == pr_rendered_body
+    accepted = (
+        len(marker_like_lines) == 1
+        and len(exact_marker_lines) == 1
+        and body_matches_rendered
+    )
+    if accepted:
+        reason = None
+    elif len(marker_like_lines) != 1:
+        reason = "marker-like-line-count"
+    elif len(exact_marker_lines) != 1:
+        reason = "malformed-marker-like-line"
+    else:
+        reason = "normalized-body-not-equal-rendered-body"
+    return {
+        "id": vector_id,
+        "boundary": "github-get-raw-response-body",
+        "get_response_raw_body_utf8": raw_body,
+        "line_ending_normalized_get_body": normalized_get_body,
+        "expected_rendered_marker_bearing_body": pr_rendered_body,
+        "raw_marker_like_lines": marker_like_lines,
+        "exact_expected_marker_line_count": len(exact_marker_lines),
+        "normalized_get_body_equals_rendered_body": body_matches_rendered,
+        "expected": {"accepted": accepted, "reason": reason},
+    }
+
+
+vectors["pr_get_raw_body_vectors"] = [
+    get_body_vector("exact-rendered-body-accepted", pr_rendered_body),
+    get_body_vector(
+        "crlf-rendered-body-accepted-after-line-ending-normalization",
+        pr_rendered_body.replace("\n", "\r\n"),
+    ),
+    get_body_vector(
+        "cr-rendered-body-accepted-after-line-ending-normalization",
+        pr_rendered_body.replace("\n", "\r"),
+    ),
+    get_body_vector(
+        "duplicate-exact-marker-lines-rejected", pr_rendered_body + "\n" + pr_marker
+    ),
+    get_body_vector(
+        "leading-whitespace-marker-line-rejected",
+        pr_metadata["body"] + "\n " + pr_marker,
+    ),
+    get_body_vector(
+        "trailing-whitespace-marker-line-rejected",
+        pr_metadata["body"] + "\n" + pr_marker + " ",
+    ),
+    get_body_vector(
+        "case-altered-marker-line-rejected",
+        pr_metadata["body"]
+        + "\n"
+        + pr_marker.replace(
+            "cortex-self-publication-intent", "CORTEX-SELF-PUBLICATION-INTENT"
+        ),
+    ),
+    get_body_vector(
+        "wrong-publication-id-marker-line-rejected",
+        pr_metadata["body"]
+        + "\n"
+        + pr_marker.replace(pr_publication_id, "b" * 64),
+    ),
+    get_body_vector(
+        "malformed-version-marker-line-rejected",
+        pr_metadata["body"] + "\n" + pr_marker.replace(":v1:", ":v2:"),
+    ),
+    get_body_vector(
+        "marker-present-but-body-differs-from-rendered-body-rejected",
+        "Changed summary\n" + pr_marker,
+    ),
+]
+
 vectors["receipt_history_round_trip_vectors"] = [
     {
         "id": "legacy-field-absent-materializes-empty-on-write",
@@ -1193,6 +1598,42 @@ vectors["receipt_history_round_trip_vectors"] = [
         "input_publication_receipts_member": [pr_receipt],
         "expected_after_from_dict": [pr_receipt],
         "expected_after_to_dict_and_reload": [pr_receipt],
+        "sidecar_resolver_calls_during_from_dict": 0,
+        "expected_reload_state": "typed-valid-value; provenance-unverified",
+    },
+    {
+        "id": "typed-valid-reload-without-sidecars",
+        "input_publication_receipts_member": [plan_receipt],
+        "sidecars_available_to_from_dict": False,
+        "sidecar_resolver_calls_during_from_dict": 0,
+        "expected_reload_state": "typed-valid-value; provenance-unverified",
+        "expected_after_to_dict_and_reload": [plan_receipt],
+    },
+    {
+        "id": "invalid-json-row-wrapper-value-round-trip-after-isolated-decoding",
+        "boundary": "workflow-run-value-round-trip-after-decoder-classification",
+        "input_publication_receipts_member": [
+            {
+                "kind": "cortex-publication-receipt-invalid-json-row/v1",
+                "raw_json": '{"schema": "v1", "schema": "v2"}',
+                "diagnostic": {"code": "duplicate-json-key", "index": 0},
+            }
+        ],
+        "expected_after_from_dict": [
+            {
+                "kind": "cortex-publication-receipt-invalid-json-row/v1",
+                "raw_json": '{"schema": "v1", "schema": "v2"}',
+                "diagnostic": {"code": "duplicate-json-key", "index": 0},
+            }
+        ],
+        "expected_after_to_dict_and_reload": [
+            {
+                "kind": "cortex-publication-receipt-invalid-json-row/v1",
+                "raw_json": '{"schema": "v1", "schema": "v2"}',
+                "diagnostic": {"code": "duplicate-json-key", "index": 0},
+            }
+        ],
+        "full_registry_load_claimed": False,
     },
     {
         "id": "opaque-non-list-container-round-trip",
@@ -1212,6 +1653,63 @@ vectors["receipt_history_round_trip_vectors"] = [
 ]
 
 
+def plan_receipt_for_attempt(attempt: int) -> dict[str, object]:
+    snapshot = clone(plan_snapshot)
+    snapshot["phase_attempt"] = attempt
+    snapshot_ref = (
+        f"planning-input-snapshots/run-contract-01/plan/{attempt}/planning-contract.json"
+    )
+    snapshot_bytes = j(snapshot)
+    snapshot_sha = sha(snapshot_bytes)
+    acceptance = clone(plan_acceptance)
+    acceptance["ref"] = snapshot_ref
+    acceptance["sha256"] = snapshot_sha
+    acceptance["phase_attempt"] = attempt
+    facts = clone(plan_acceptance_facts)
+    facts["phase_attempt"] = attempt
+    facts_sha = h("cortex-plan-acceptance-facts/v1", facts)
+    event_basis = clone(plan_event_basis)
+    event_basis["phase_attempt"] = attempt
+    event_basis["acceptance_facts_sha256"] = facts_sha
+    event_id = h("cortex-self-publication-event/plan/v1", event_basis)
+    intent = clone(plan_intent)
+    intent["acceptance_evidence"] = acceptance
+    intent_bytes = j(intent)
+    intent_sha = sha(intent_bytes)
+    intent_ref = (
+        f"planning-publication-intents/run-contract-01/plan/{event_id}.json"
+    )
+    publication_basis = {"producer_event_id": event_id, "target": plan_target}
+    publication_id = h(
+        "cortex-self-publication-publication/plan/v1", publication_basis
+    )
+    receipt = clone(plan_receipt)
+    receipt["producer_event_id"] = event_id
+    receipt["publication_id"] = publication_id
+    receipt["acceptance_evidence"] = acceptance
+    receipt["transaction"]["intent_ref"] = intent_ref
+    receipt["transaction"]["intent_sha256"] = intent_sha
+    receipt = reseal(receipt)
+    return {
+        "snapshot": snapshot,
+        "snapshot_ref": snapshot_ref,
+        "snapshot_stored_bytes_utf8": snapshot_bytes.decode("utf-8"),
+        "snapshot_sha256": snapshot_sha,
+        "acceptance_facts": facts,
+        "acceptance_facts_sha256": facts_sha,
+        "event_basis": event_basis,
+        "producer_event_id": event_id,
+        "intent_core": intent,
+        "intent_stored_bytes_utf8": intent_bytes.decode("utf-8"),
+        "intent_sha256": intent_sha,
+        "intent_ref": intent_ref,
+        "publication_basis": publication_basis,
+        "publication_id": publication_id,
+        "receipt": receipt,
+    }
+
+
+plan_attempt3 = plan_receipt_for_attempt(3)
 alternate_same_pair = pr_receipt_with_witness(
     base_pr, 8, 7008, "PR_kwDOExample0002"
 )
@@ -1301,13 +1799,47 @@ append_vectors = [
             "alternate_intent_hashes": pr_receipt_with_new_metadata(
                 base_pr, "feat(workflow): café revised"
             )[2],
-            "same_resource_key": {"repository": repo, "number": pr_witness["number"]},
+            "proposed_pr_resource_key": {
+                "repository": repo,
+                "number": pr_witness["number"],
+            },
         },
         "expected": {"outcome": "conflict", "persist_attempts": 0, "rows_added": 0},
     },
     {
+        "id": "same-planning-ref-different-event-conflicts",
+        "history": [plan_receipt],
+        "incoming_batch": {
+            "producer_kind": "plan_materialization",
+            "producer_event_id": plan_attempt3["producer_event_id"],
+            "coupled_run_patch": {"fixture_patch_token": "plan-attempt-3"},
+            "receipts": [plan_attempt3["receipt"]],
+        },
+        "context": {
+            **plan_attempt3,
+            "proposed_planning_object_key": {
+                "run_id": run_id,
+                "claim_key": claim_key,
+                "producer_kind": "plan_materialization",
+                "workspace_ref": plan_target_ref,
+            },
+            "history_workspace_ref": plan_receipt["published_object"]["ref"],
+            "incoming_workspace_ref": plan_attempt3["receipt"]["published_object"]["ref"],
+        },
+        "expected": {
+            "outcome": "conflict",
+            "reason": "same-planning-object-key-across-events",
+            "persist_attempts": 0,
+            "rows_added": 0,
+        },
+    },
+    {
         "id": "opaque-invalid-container-conflicts",
-        "history": vectors["negative_vectors"][13]["expected_serialized_field"],
+        "history": next(
+            row["expected_serialized_field"]
+            for row in vectors["negative_vectors"]
+            if row.get("id") == "invalid-non-list-container-round-trip"
+        ),
         "incoming_batch": two_receipt_batch,
         "expected": {"outcome": "conflict", "persist_attempts": 0, "rows_added": 0},
     },
