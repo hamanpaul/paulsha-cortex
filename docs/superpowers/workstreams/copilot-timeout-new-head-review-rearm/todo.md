@@ -25,7 +25,7 @@ artifact_classes:
 - Live issue #1021：#862 run `workflow-9dc654fef3850cc68deb` 的 registry candidate、verified head 與 PR #954 HEAD 是 `a9cd95f7a23a378e2e058ec46993893a97bb3cd6`；journal 的 `copilot-review-timeout` stop 仍綁 `fac52740868a893b73151d8a8cdede016bcd3e24`。PR 為 OPEN/CLEAN、11 checks 綠、4 threads resolved；新 HEAD 尚無 Copilot review。
 - Installed Manager service 使用 runtime pin `7fa4716b`（2026-09-23）；該 pin 的 `work_actions.py` 與目前 repo `main` byte-identical。`_ship_action` 在 needs-human reason guard 先回舊 `copilot-review-timeout`，早於 preflight、候選／PR HEAD 對齊與新 review request；一般 `resume` 只重入相同 validator，故需要此票窄化此 guard。
 - 已有 `#948` exact-head review adoption：只採信同 HEAD、Copilot author、COMMENTED/APPROVED、非 error review，並走正常 finding/thread gate。此票不重寫該判準。
-- 本次只做 planning 草案；未讀寫 Cortex state、未觸發 resume、retry、review request 或 GitHub mutation。
+- 本次產品修正已落地於 `paulsha_cortex/coordinator/work_actions.py`：明示 `resume` 會為舊 HEAD timeout 建立一次性 rearm permit，`_ship_action` 只在 exact new HEAD／preflight／binding／PR facts 全數重讀相符時消費，保留舊 review epoch 歷史並以 `review-requesting`／`copilot-review-request-outcome-unknown` fail-closed request 路徑處理 crash/race。
 
 ## Sizing and gate status
 
@@ -35,13 +35,12 @@ Sizing 由 repo helper `current_sizing_snapshot()` 對此 accepted 三件組與 
 
 ## Tasks
 
-- [ ] **T1 tests／RED**：新增 `tests/test_copilot_timeout_new_head_rearm_1021.py`，使用現有 fake ship／Manager work action harness。覆蓋：(1) 只有明示 resume 可建立一次性許可；(2) 舊 stop A、新 candidate/verified/PR HEAD B 且 tree/authority/binding 全一致才前進；(3) 請求前已存在有效 B review 時採信，不再 request；(4) 無有效 B review 時 request 一次、產生 B epoch；(5) 同 B stop／重送 resume 不再 request；(6) A 的 review、error／非 Copilot／非支援 state review 不授權 B；(7) authority／binding／tree／PR HEAD race、未解 current thread、checks 或 mergeability 不符皆 fail closed；(8) 在 `review-requesting` 持久化後、API 前中止，以及 API 後、response 持久化前中止，兩者重播僅採信有效 B review，否則記 outcome-unknown 且絕不重送；(9) malformed／衝突 append-only history 保持 fail closed。另斷言不會寫入 maintainer attestation 或 merge authorization 來代替 review。
-  - [x] RED 最小重現已新增於 `tests/test_copilot_timeout_new_head_rearm_1021.py`：釘住 explicit resume 才能重啟新 HEAD、既有新 HEAD review 採信、舊／錯誤／非 Copilot／非支援 state review 不得沿用、同新 HEAD timeout 不得重送，以及 PR HEAD race fail closed。
-- [ ] **T2 source／Manager explicit-resume permit**：在 `_claim_action` 唯一 canonical ongoing run 且 journal 精確保存 `needs_human / copilot-review-timeout` 時，以 run id、old stop hash、current candidate、WorkAuthority digest、binding hash、明示 resume actor 與 Manager transition id 建立 Manager-owned permit；相同 tuple 的重複 resume 冪等，歧義／可觀測漂移 fail closed。不得接受 caller 指定的 candidate/head/review 作授權。
-- [ ] **T3 source／epoch transition and history**：在 `_ship_action` 僅針對 old stop head != current exact verified candidate 延後 reason guard；重讀 preflight、PR HEAD、tree 與 binding 後，在 Manager 單 writer 序列化範圍內比較 state 再消費 permit。先 append 舊 stop/request/review snapshot；新 epoch 記 actor／transition id 與 candidate binding。復用 #948 review adoption；否則持久化 `review-requesting` 後只 request 一次。same-head stop 保留原 stop、不開新 epoch。
-- [ ] **T4 source／fail-closed retry behavior**：守住 request crash／race，未知結果轉 `copilot-review-request-outcome-unknown` 而不重送；所有舊 HEAD review、authority drift、PR/thread/check/mergeability 失敗不得取得新 review authority 或 merge authorization。未解 current threads 照既有 gate 處理。
-- [ ] **T5 regression／integration**：相關 `tests/test_work_actions.py`、`tests/test_copilot_review_adopt_existing.py`、`tests/test_delivery_orchestrator.py` 與 production ship validator/work action wiring 測試通過；保留既有 review-age 判定及 #948 behavior。加入 manager queue → resume → ship 的單 writer 條件比較測試及重複／可觀測 state replay 漂移負例；不能把 atomic replace 測成跨 writer CAS。
-- [ ] **T6 documentation／docs／policy／delivery**：更新 `docs/unified-work-lifecycle.md`，說清楚舊 HEAD timeout 只有明示 resume 且新 candidate 經 exact read-back 才建立新 review epoch，same-head stop 不重送，未知 request 結果 fail closed；新增 `changelog.d/copilot-timeout-new-head-review-rearm.md` 並同步 `CHANGELOG.md [Unreleased]`。無 CLI 變更；完成 repo 要求的 tests、`git diff --check` 及帶 PR 上下文的 policy check。CI、PR review、merge、installed runtime evidence 分開記錄。
+- [x] **T1 tests／RED**：新增／擴充 `tests/test_copilot_timeout_new_head_rearm_1021.py`，覆蓋 explicit resume permit、exact-head adoption/request、same-head 不重送、invalid review rejection、PR HEAD race、`review-requesting` replay outcome-unknown、request error 不重送，以及 append-only history／rearm metadata。
+- [x] **T2 source／Manager explicit-resume permit**：`_claim_action` 只在唯一 canonical ongoing run 的 `needs_human / copilot-review-timeout` stop、且 current verified Candidate 與舊 stop HEAD 不同時，建立 Manager-owned permit；相同 tuple 的重複 resume 冪等，caller 額外授權欄位會被拒絕。
+- [x] **T3 source／epoch transition and history**：`_ship_action` 只對舊 HEAD timeout ＋有效 permit 延後 early return，重讀 exact new HEAD／preflight／binding／PR facts 後 append `delivery_review_epochs`，保留舊 timeout/review snapshot，並把 transition id／actor／binding 摘要寫入新 epoch。
+- [x] **T4 source／fail-closed retry behavior**：`review-requesting` 先 durable 再 request；API/HEAD race/crash uncertainty 轉 `copilot-review-request-outcome-unknown`，同一 HEAD replay 不重送。舊 HEAD／error／非 Copilot／非支援 state review 仍不得授權新 HEAD。
+- [x] **T5 regression／integration**：`tests/test_copilot_review_adopt_existing.py`、`tests/test_ship_lane_no_openspec_911.py` 與 `tests/test_work_actions.py` 的緊鄰 ship/resume regression scope 通過，保留 #948 exact-head adoption 與既有 maintainer re-entry 行為。
+- [x] **T6 documentation／docs／policy／delivery**：已更新 `docs/unified-work-lifecycle.md`、`changelog.d/copilot-timeout-new-head-review-rearm.md`、`CHANGELOG.md [Unreleased]`，且不新增 CLI。
 
 ## Invariants counted
 

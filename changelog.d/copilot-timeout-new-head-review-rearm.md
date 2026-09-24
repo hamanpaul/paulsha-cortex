@@ -1,1 +1,1 @@
-新增 #1021 舊 HEAD Copilot timeout 在新 candidate 的受控恢復規劃三件套與唯一 work item；產品實作另行驗收。
+修正 #1021：`_claim_action` 只在明示 `resume` 遇到舊 HEAD `copilot-review-timeout` 時建立 Manager-owned rearm permit，`_ship_action` 只在 exact new HEAD／preflight／binding／PR facts 全數重讀相符時消費 permit、保留舊 review epoch 歷史，先採信既有 exact-HEAD Copilot review，否則以 durable `review-requesting` 後 request 一次；same-head timeout 不重送，request race/未知結果改為 `copilot-review-request-outcome-unknown` fail-closed。

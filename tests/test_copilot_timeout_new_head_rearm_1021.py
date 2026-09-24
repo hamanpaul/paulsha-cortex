@@ -107,6 +107,12 @@ def _journal_row(path: Path, run_id: str) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))["runs"][run_id]
 
 
+def _write_journal_row(path: Path, run_id: str, row: dict[str, Any]) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["runs"][run_id] = row
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def _pr_metadata(
     path: Path,
     *,
@@ -351,6 +357,64 @@ def _resume(
     )
 
 
+def test_explicit_resume_writes_a_manager_owned_idempotent_rearm_permit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, _orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch
+    )
+    _advance_run_to_ship(registry, run_id, candidate_head=OLD_HEAD)
+    _create_timeout_stop(
+        tmp_path,
+        monkeypatch,
+        authority=authority,
+        state=state,
+        registry=registry,
+        github=github,
+    )
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=NEW_HEAD,
+        verified_head=NEW_HEAD,
+    )
+
+    _resume(snapshot=snapshot, state=state, registry=registry, at=4_000.0)
+    first_row = _journal_row(state, run_id)
+    permit = first_row["copilot_review_rearm_permit"]
+    assert permit["run_id"] == run_id
+    assert permit["old_head"] == OLD_HEAD
+    assert permit["candidate_head"] == NEW_HEAD
+    assert permit["authority_digest"] == work_actions.work_authority_digest(authority)
+    assert permit["delivery_binding_hash"] == work_actions._delivery_binding_hash(
+        first_row["delivery_binding"]
+    )
+    assert permit["history_prefix_hash"] == work_actions.verification.canonical_json_hash([])
+    assert permit["requested_by"] == "operator"
+    assert permit["transition_id"].startswith("manager-transition-")
+
+    _resume(snapshot=snapshot, state=state, registry=registry, at=4_001.0)
+    second_row = _journal_row(state, run_id)
+
+    assert second_row["copilot_review_rearm_permit"] == permit
+
+
+def test_resume_rejects_caller_supplied_rearm_authority_inputs(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", changes=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+
+    with pytest.raises(ValueError, match="resume rejects caller evidence/input: head"):
+        work_actions.execute_work_action(
+            args={"action": "resume", "repo": REPO, "work_id": WORK_ID, "head": NEW_HEAD},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 200,
+            workflow_registry=registry,
+        )
+
+
 def test_explicit_resume_is_required_to_rearm_a_timed_out_old_head_on_new_exact_head(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -404,8 +468,24 @@ def test_explicit_resume_is_required_to_rearm_a_timed_out_old_head_on_new_exact_
     assert row["ship"]["phase"] == "review-requested"
     assert row["ship"]["head"] == NEW_HEAD
     assert row["ship"]["tree_hash"] == NEW_TREE
+    assert row["ship"]["rearm"] == {
+        "run_id": run_id,
+        "from_head": OLD_HEAD,
+        "authority_digest": work_actions.work_authority_digest(authority),
+        "delivery_binding_hash": work_actions._delivery_binding_hash(row["delivery_binding"]),
+        "requested_by": "operator",
+        "transition_id": row["ship"]["rearm"]["transition_id"],
+    }
     assert "adopted_review_id" not in row["ship"]
     assert "merge_authorization" not in row["ship"]
+    assert "copilot_review_rearm_permit" not in row
+    assert len(row["delivery_review_epochs"]) == 1
+    archived_epoch = row["delivery_review_epochs"][0]
+    assert archived_epoch["schema"] == work_actions._DELIVERY_REVIEW_EPOCH_SCHEMA
+    assert archived_epoch["ship"]["reason"] == "copilot-review-timeout"
+    assert archived_epoch["ship"]["head"] == OLD_HEAD
+    assert archived_epoch["ship_hash"] == work_actions._ship_state_hash(archived_epoch["ship"])
+    assert archived_epoch["rearm"]["transition_id"] == row["ship"]["rearm"]["transition_id"]
 
 
 def test_explicit_resume_adopts_an_existing_new_head_copilot_review(
@@ -469,7 +549,7 @@ def test_explicit_resume_adopts_an_existing_new_head_copilot_review(
     assert row["ship"]["requested_at_epoch"] == 4_500.0
     assert row["ship"]["phase"] in {"merge-authorized", "merged"}
     if orch_holder:
-        assert "merge-if-ready" in orch_holder[0].calls
+        assert any("merge-if-ready" in orch.calls for orch in orch_holder)
 
 
 @pytest.mark.parametrize(
@@ -630,6 +710,68 @@ def test_same_new_head_timeout_does_not_request_again_after_a_second_explicit_re
     assert replay["action"] == "needs_human"
     assert replay["reason"] == "copilot-review-timeout"
     assert github.request_copilot_calls == 2
+    assert "copilot_review_rearm_permit" not in _journal_row(state, run_id)
+
+
+def test_rearm_fails_closed_when_delivery_review_history_was_rewritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, _orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch
+    )
+    _advance_run_to_ship(registry, run_id, candidate_head=OLD_HEAD)
+    _create_timeout_stop(
+        tmp_path,
+        monkeypatch,
+        authority=authority,
+        state=state,
+        registry=registry,
+        github=github,
+    )
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=NEW_HEAD,
+        verified_head=NEW_HEAD,
+    )
+    github.remote_head = NEW_HEAD
+    github.reviews = ()
+    _set_preflight(monkeypatch, head=NEW_HEAD, tree_hash=NEW_TREE)
+
+    _resume(snapshot=snapshot, state=state, registry=registry, at=4_850.0)
+    row = _journal_row(state, run_id)
+    fake_ship = {
+        "phase": "needs_human",
+        "reason": "copilot-review-timeout",
+        "head": "f" * 40,
+        "tree_hash": "1" * 40,
+        "requested_at_epoch": 123.0,
+        "epoch_started_at": 123.0,
+        "fix_rounds": 0,
+        "pr_number": 954,
+        "change": None,
+        "todo_paths": [TODO_PATH],
+    }
+    row["delivery_review_epochs"] = [
+        {
+            "schema": work_actions._DELIVERY_REVIEW_EPOCH_SCHEMA,
+            "ship": fake_ship,
+            "ship_hash": work_actions._ship_state_hash(fake_ship),
+            "archived_at_epoch": 124.0,
+            "rearm": row["copilot_review_rearm_permit"],
+        }
+    ]
+    _write_journal_row(state, run_id, row)
+
+    with pytest.raises(RuntimeError, match="copilot timeout rearm permit conflicts with current state"):
+        _invoke_ship(
+            tmp_path,
+            authority=authority,
+            state=state,
+            registry=registry,
+            head=NEW_HEAD,
+            now=4_851.0,
+        )
 
 
 def test_explicit_resume_stays_fail_closed_when_the_exact_pr_head_has_raced(
@@ -669,3 +811,133 @@ def test_explicit_resume_stays_fail_closed_when_the_exact_pr_head_has_raced(
             now=4_901.0,
         )
     assert github.request_copilot_calls == 1
+
+
+def test_review_requesting_replay_without_exact_head_review_fails_closed_without_resending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, _orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch
+    )
+    _advance_run_to_ship(registry, run_id, candidate_head=OLD_HEAD)
+    _create_timeout_stop(
+        tmp_path,
+        monkeypatch,
+        authority=authority,
+        state=state,
+        registry=registry,
+        github=github,
+    )
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=NEW_HEAD,
+        verified_head=NEW_HEAD,
+    )
+    github.remote_head = NEW_HEAD
+    github.reviews = ()
+    _set_preflight(monkeypatch, head=NEW_HEAD, tree_hash=NEW_TREE)
+
+    _resume(snapshot=snapshot, state=state, registry=registry, at=4_950.0)
+    row = _journal_row(state, run_id)
+    permit = row["copilot_review_rearm_permit"]
+    old_ship = dict(row["ship"])
+    row["delivery_review_epochs"] = [
+        {
+            "schema": work_actions._DELIVERY_REVIEW_EPOCH_SCHEMA,
+            "ship": old_ship,
+            "ship_hash": work_actions._ship_state_hash(old_ship),
+            "archived_at_epoch": 4_951.0,
+            "rearm": permit,
+        }
+    ]
+    row.pop("copilot_review_rearm_permit")
+    row["ship"] = {
+        "phase": "review-requesting",
+        "head": NEW_HEAD,
+        "tree_hash": NEW_TREE,
+        "requested_at_epoch": 4_951.0,
+        "epoch_started_at": 4_951.0,
+        "fix_rounds": 1,
+        "pr_number": 954,
+        "change": None,
+        "todo_paths": [TODO_PATH],
+        "rearm": work_actions._copilot_epoch_rearm_record(permit),
+    }
+    _write_journal_row(state, run_id, row)
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        head=NEW_HEAD,
+        now=4_952.0,
+    )
+
+    assert result["action"] == "needs_human"
+    assert result["reason"] == "copilot-review-request-outcome-unknown"
+    assert github.request_copilot_calls == 1
+    persisted = _journal_row(state, run_id)
+    assert persisted["ship"]["phase"] == "needs_human"
+    assert persisted["ship"]["reason"] == "copilot-review-request-outcome-unknown"
+
+
+def test_explicit_resume_request_error_becomes_outcome_unknown_and_never_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, _orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch
+    )
+    _advance_run_to_ship(registry, run_id, candidate_head=OLD_HEAD)
+    _create_timeout_stop(
+        tmp_path,
+        monkeypatch,
+        authority=authority,
+        state=state,
+        registry=registry,
+        github=github,
+    )
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=NEW_HEAD,
+        verified_head=NEW_HEAD,
+    )
+    github.remote_head = NEW_HEAD
+    github.reviews = ()
+    _set_preflight(monkeypatch, head=NEW_HEAD, tree_hash=NEW_TREE)
+
+    def raising_request(**kwargs):
+        github.request_copilot_calls += 1
+        raise RuntimeError("transient gh failure")
+
+    github.request_copilot = raising_request
+
+    _resume(snapshot=snapshot, state=state, registry=registry, at=5_000.0)
+
+    first = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        head=NEW_HEAD,
+        now=5_001.0,
+    )
+
+    assert first["action"] == "needs_human"
+    assert first["reason"] == "copilot-review-request-outcome-unknown"
+    assert github.request_copilot_calls == 2
+
+    second = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        head=NEW_HEAD,
+        now=5_002.0,
+    )
+
+    assert second["action"] == "needs_human"
+    assert second["reason"] == "copilot-review-request-outcome-unknown"
+    assert github.request_copilot_calls == 2
