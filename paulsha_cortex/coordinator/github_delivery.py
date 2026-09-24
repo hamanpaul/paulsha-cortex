@@ -155,7 +155,7 @@ def evaluate_delivery_gate(*, facts: DeliveryFacts, policy: DeliveryPolicy) -> G
             reasons.append("copilot-error-review")
         elif any(review.state.upper() not in {"COMMENTED", "APPROVED"} for review in current_reviews):
             reasons.append("copilot-review-state-invalid")
-    elif policy.review_kind != "maintainer-review":
+    elif policy.review_kind not in {"maintainer-review", "pre-review"}:
         reasons.append("delivery-review-policy-invalid")
 
     if any(thread.blocks_merge for thread in facts.review_threads):

@@ -1,4 +1,4 @@
-"""#1021 RED: exact-head rearm after a timed-out Copilot stop."""
+"""#1021: exact-head rearm after a timed-out Copilot stop."""
 
 from __future__ import annotations
 
@@ -492,6 +492,89 @@ def test_explicit_resume_is_required_to_rearm_a_timed_out_old_head_on_new_exact_
     assert archived_epoch["ship"]["head"] == OLD_HEAD
     assert archived_epoch["ship_hash"] == work_actions._ship_state_hash(archived_epoch["ship"])
     assert archived_epoch["rearm"]["transition_id"] == row["ship"]["rearm"]["transition_id"]
+
+
+@pytest.mark.parametrize(
+    ("checks", "mergeable", "mergeable_state", "threads", "reason"),
+    (
+        (
+            (GitHubCheck("pytest", "completed", "failure"),),
+            True,
+            "clean",
+            (),
+            "checks-not-terminal-green",
+        ),
+        (
+            (GitHubCheck("pytest", "completed", "success"),),
+            False,
+            "dirty",
+            (),
+            "not-mergeable",
+        ),
+        (
+            (GitHubCheck("pytest", "completed", "success"),),
+            True,
+            "clean",
+            (ReviewThread("current", resolved=False, outdated=False),),
+            "review-thread-open",
+        ),
+    ),
+    ids=("red-ci", "dirty-mergeability", "unresolved-current-thread"),
+)
+def test_timeout_rearm_requires_remote_delivery_readiness_before_review_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checks: tuple[GitHubCheck, ...],
+    mergeable: bool,
+    mergeable_state: str,
+    threads: tuple[ReviewThread, ...],
+    reason: str,
+) -> None:
+    github, _orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch
+    )
+    _advance_run_to_ship(registry, run_id, candidate_head=OLD_HEAD)
+    _create_timeout_stop(
+        tmp_path,
+        monkeypatch,
+        authority=authority,
+        state=state,
+        registry=registry,
+        github=github,
+    )
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=NEW_HEAD,
+        verified_head=NEW_HEAD,
+    )
+    github.remote_head = NEW_HEAD
+    github.reviews = ()
+    github.checks = checks
+    github.mergeable = mergeable
+    github.mergeable_state = mergeable_state
+    github.threads = threads
+    _set_preflight(monkeypatch, head=NEW_HEAD, tree_hash=NEW_TREE)
+    _resume(snapshot=snapshot, state=state, registry=registry, at=4_000.0)
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"copilot timeout rearm pre-request gate blocked: .*{reason}",
+    ):
+        _invoke_ship(
+            tmp_path,
+            authority=authority,
+            state=state,
+            registry=registry,
+            head=NEW_HEAD,
+            now=4_001.0,
+        )
+
+    row = _journal_row(state, run_id)
+    assert row["ship"]["phase"] == "needs_human"
+    assert row["ship"]["reason"] == "copilot-review-timeout"
+    assert row["copilot_review_rearm_permit"]["candidate_head"] == NEW_HEAD
+    assert "delivery_review_epochs" not in row
+    assert github.request_copilot_calls == 1
 
 
 def test_explicit_resume_adopts_an_existing_new_head_copilot_review(

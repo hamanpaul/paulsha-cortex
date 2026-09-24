@@ -6466,6 +6466,20 @@ def _ship_action(
         or previous_head != preflight.head
         or ship.get("phase") not in {"review-requested", "merge-authorized"}
     ):
+        if rearm_permit is not None:
+            pre_request_gate = evaluate_delivery_gate(
+                facts=remote,
+                policy=DeliveryPolicy(
+                    expected_head=preflight.head,
+                    required_closing_issues=(),
+                    review_kind="pre-review",
+                ),
+            )
+            if not pre_request_gate.allowed:
+                raise RuntimeError(
+                    "copilot timeout rearm pre-request gate blocked: "
+                    f"{', '.join(pre_request_gate.reasons)}"
+                )
         adopted_review = _pick_adoptable_copilot_review(
             remote.copilot_reviews,
             head=preflight.head,
