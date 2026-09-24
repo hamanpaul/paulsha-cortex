@@ -510,7 +510,7 @@ def test_ship_orchestrator_blocks_stale_provider_or_non_exact_preflight(tmp_path
         orchestrator.merge_if_ready(**base)
 
 
-def test_ship_orchestrator_rejects_stale_non_adopted_copilot_request(
+def test_ship_orchestrator_rejects_truly_late_non_adopted_copilot_review(
     tmp_path: Path,
 ) -> None:
     class GitHub:
@@ -520,6 +520,7 @@ def test_ship_orchestrator_rejects_stale_non_adopted_copilot_request(
         def commit_merge(self, **kwargs):
             raise AssertionError("stale request must not reach GitHub")
 
+    copilot = replace(_copilot_decision(), submitted_at_epoch=1_001.0)
     with pytest.raises(RuntimeError, match="Copilot review epoch has not passed"):
         ShipOrchestrator(github=GitHub(), now=lambda: 1_001.0).merge_if_ready(
             repo="acme/demo",
@@ -529,7 +530,7 @@ def test_ship_orchestrator_rejects_stale_non_adopted_copilot_request(
             expected_tree_hash=HEAD2,
             authority=_authority(tmp_path, last_success=1_000.0),
             preflight=_preflight(),
-            copilot=_copilot_decision(),
+            copilot=copilot,
             foreign_review=_foreign_review(tmp_path),
         )
 
@@ -578,6 +579,44 @@ def test_ship_orchestrator_accepts_review_submitted_before_deadline_when_observe
 
     assert result.expected_head == HEAD1
     assert calls == ["evaluate_final_gate", "commit_merge"]
+
+
+@pytest.mark.parametrize(
+    ("submitted_at_epoch", "now_epoch"),
+    (
+        (None, 200.0),
+        (99.0, 200.0),
+        (201.0, 200.0),
+        (float("nan"), 200.0),
+        (float("inf"), 200.0),
+    ),
+)
+def test_ship_orchestrator_rejects_invalid_request_bound_submitted_at_epoch(
+    tmp_path: Path,
+    submitted_at_epoch: float | None,
+    now_epoch: float,
+) -> None:
+    class GitHub:
+        def evaluate_final_gate(self, **kwargs):
+            raise AssertionError("malformed epochs must not reach GitHub")
+
+        def commit_merge(self, **kwargs):
+            raise AssertionError("malformed epochs must not reach GitHub")
+
+    copilot = replace(_copilot_decision(), submitted_at_epoch=submitted_at_epoch)
+
+    with pytest.raises(RuntimeError, match="Copilot review epoch has not passed"):
+        ShipOrchestrator(github=GitHub(), now=lambda: now_epoch).merge_if_ready(
+            repo="acme/demo",
+            pr_number=7,
+            change="work",
+            expected_head=HEAD1,
+            expected_tree_hash=HEAD2,
+            authority=_authority(tmp_path, last_success=150.0),
+            preflight=_preflight(),
+            copilot=copilot,
+            foreign_review=_foreign_review(tmp_path),
+        )
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])

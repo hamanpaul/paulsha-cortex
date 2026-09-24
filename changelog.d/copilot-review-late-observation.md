@@ -1,1 +1,1 @@
-新增 #1020 準時提交、晚觀測的 Copilot review 規劃三件套與唯一 work item；產品實作另行驗收。
+#1020 Copilot review 提交時間逾時修正：`ReviewLoop` 與 `ShipOrchestrator` 對 request-bound Copilot review 改以 `submitted_at - requested_at` 判定 15 分鐘 deadline，準時提交但晚觀測的 exact-HEAD review 不再誤判 timeout；既有 adopted review 仍沿用 `adopted_at` 視窗，merge 授權前的 current thread／checks／mergeability 等 final gate 行為維持不變。
