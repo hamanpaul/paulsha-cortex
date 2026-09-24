@@ -25,6 +25,8 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 
 ## 開一個 dogfood 批次
 
+僅在綁定 issue 與 operator 已授權該批次的規劃、work item 和調度時執行以下步驟。
+
 1. 從 accepted planning artifact 開始：spec/plan/frontmatter 必須有 `status: accepted`、`work_item`、必要章節與 `target_branch`。
 2. 在 `.cortex/work-items.yaml` 加入對應 work item 並對齊 `issue`。
 3. 把 `docs/superpowers/plans/driving-cortex-skill.md` 參考為本批次來源之一，並補齊對應 `openspec/changes/2026-07-26-driving-cortex-skill/tasks.md`。
@@ -53,6 +55,8 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 
 ## 每批 merge 後部署
 
+只有綁定 issue 明列部署／cutover 驗收且 operator 已授權時，才執行以下步驟；一般 PR merge 只記錄待部署狀態，不自行變更 installed runtime 或重啟 service。
+
 1. 在 target repo 以 `pipx install --force <repo>` 重新安裝，讓新 code 可被服務載入。
 2. 依序 restart manager/monitor，確保新 manifest、workflow 入口與身份配置同步。
 3. 開始下一批前先清點 `systemctl --user status`、`cortex status` 與 monitor snapshot。
@@ -62,7 +66,7 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 ## 生命週期特性
 
 - run closure 常有一批延遲：批次 N 在 N+1 合併前，可能維持在 `ongoing / review / needs_human`。
-- 非故障情境下，不建議卡住 N，以免阻斷 N+1 先行 claim；優先先完成 N+1 的規劃與 merge，待前序條件滿足後再 resume N。
+- 非故障情境下，先記錄 N 的等待依賴。只有 N+1 已由自己的 issue、accepted plan、唯一 owner 和交付 gate 獨立授權，才能推進 N+1 的規劃與 merge；不得借 N 的 run 權限跨票 claim 或交付。
 - 最後一批必須有獨立 PR 確認 todo 勾選完成，避免 done record 先行封裝。
 
 ## 已知坑
