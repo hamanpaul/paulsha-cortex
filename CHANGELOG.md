@@ -10,7 +10,7 @@
 - **Copilot 規劃 Yellow gate 修正**：在 #1020、#1021 的 Tasks 明列 `documentation`，使既有文件交付項目符合 `artifact_classes` 完整性檢查；不變更產品驗收範圍。
 - **driving-cortex 單票授權界線**：要求 agent 只處理綁定 issue 的已授權驗收，將範圍外問題附證據記錄到既有或新 issue，再獨立規劃與派工；跨票推進及 merge 後部署均須各自授權。
 - **#1021 舊 HEAD timeout 恢復規劃**：新增明示 resume 後對新 candidate 重啟 Copilot review 的 accepted spec／design／todo 與唯一 work item；產品修正另待正式 run 驗收。
-- **#1020 Copilot review 提交時間逾時修正**：`ReviewLoop` 與 `ShipOrchestrator` 對 request-bound Copilot review 改以 `submitted_at - requested_at` 判定 15 分鐘 deadline，準時提交但晚觀測的 exact-HEAD review 不再誤判 timeout；既有 adopted review 仍沿用 `adopted_at` 視窗，merge 授權前的 current thread／checks／mergeability 等 final gate 行為維持不變。
+- **#1020 Copilot review 提交時間逾時修正**：`ReviewLoop` 保留通過驗證的 submission/observation epochs，`ShipOrchestrator` 在 merge admission 依原 observation 視窗 fail-closed 重驗 request-bound submission evidence，避免晚於已觀測 review 的竄改時間戳誤過關；既有 adopted review 仍沿用 `adopted_at` 視窗判 timeout，但 submission evidence 同樣必須保留且通過重驗，merge 授權前的 current thread／checks／mergeability 等 final gate 行為維持不變。
 - **preflight visudo 測試環境**：sudoers 整合測試將系統 sbin 加入個別測試的 PATH，避免 #862 exact-Candidate preflight 因 service PATH 差異誤判失敗。
 - **Refine 0.1.11 Registry CAS 進件**：為 #966 新增 accepted spec／design／todo 與唯一 work item，作為 #818 多進程寫入防護的第一階段；產品實作與 #967 owner lock 仍待獨立驗收。
 - **Refine 0.1.11 子票進件**：為 #961 發布已審核的 accepted 規劃與唯一 work item，更新 #887／#847／#818／#547／#943 的拆票依賴與定版執行表；產品實作與發版仍待各自驗收。
