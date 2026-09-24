@@ -11,7 +11,7 @@ work_item: copilot-timeout-new-head-review-rearm
 
 沿用 `execute_work_action(action="resume")` 的 operator 路徑；只在該路徑辨識 `copilot-review-timeout` 且舊 stop HEAD 不同於唯一 canonical ongoing run 的目前 candidate 時建立單次恢復許可。許可由 Manager 從 registry、WorkAuthority、journal 事實導出，不接受 caller 傳入的任意 HEAD、tree、review id 或 authority digest。`work_actions.py` 是現行 resume 與 `_ship_action` 共用的 Manager-owned mutation seam，避免增加 CLI/API 或直接編輯狀態。
 
-### D2 journal 轉態採 run 與 state CAS
+### D2 journal 轉態採 run 與 state 條件比較
 
 許可記錄 `run_id`、舊 stop 的 canonical hash、目前 `candidate_head`、WorkAuthority digest、PR binding hash、明示 action 的 `requested_by` actor 及 Manager 在 `_claim_action` 內產生的 transition id。`manager_daemon` 目前不把 control queue 的 `req_id` 傳至此層，所以 transition id 僅識別本地轉態，不聲稱是原始 queue request id。寫入前在 daemon 單 writer／flock 序列化範圍內，再次比較讀取的 journal `ship` 與所選 canonical run；任何可觀測的 stale state 或多個 ongoing run 都拒絕。Ship validator 重新讀取全部 authority／remote facts，只有 tuple 完整相等才可消費許可。重複 resume 對同一 tuple 冪等；不同 tuple 或已消費的 transition 不得覆寫舊 history。這是單 writer 條件比較，不宣稱跨 writer 的原子 CAS。
 

@@ -45,7 +45,7 @@ Sizing 由 repo helper `current_sizing_snapshot()` 對此 accepted 三件組與 
 ## Invariants counted
 
 1. Explicit resume is the only permit source.
-2. Exact run, authority, candidate, tree and delivery binding form the CAS tuple.
+2. Exact run, authority, candidate, tree and delivery binding form the comparison tuple.
 3. Only old-stop HEAD → different verified new HEAD can rearm.
 4. Old stop/review epoch history is append-only and remains readable.
 5. New-head review is adopted/requested once; old-head review is never carried forward.
