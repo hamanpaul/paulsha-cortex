@@ -2454,6 +2454,8 @@ def _candidate_tree_matching_archive_entries(
         candidate=candidate,
         pathspec=f"openspec/changes/{change}/",
     )
+    # Archive-only ship flows still force this probe so candidate-tree inspection
+    # failures surface even after the active change subtree has already moved.
     archive_paths = _candidate_tree_paths(
         workspace_root=workspace_root,
         candidate=candidate,
