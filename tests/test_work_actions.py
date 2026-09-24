@@ -381,7 +381,11 @@ def test_periodic_auto_claim_scan_does_not_retry_needs_human_run(tmp_path: Path)
 def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
     tmp_path: Path,
 ) -> None:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        source_revisions=("issue:12@open",),
+        changes=(),
+    )
     authority = work_actions.load_work_authority(
         repo="acme/demo", work_id="demo", snapshot_path=snapshot
     )
@@ -476,7 +480,11 @@ def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
 def test_retry_build_preserves_only_manager_owned_archive_authority(
     tmp_path: Path,
 ) -> None:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        source_revisions=("issue:12@open",),
+        changes=(),
+    )
     authority = work_actions.load_work_authority(
         repo="acme/demo", work_id="demo", snapshot_path=snapshot
     )
@@ -566,7 +574,11 @@ def test_retry_build_preserves_only_manager_owned_archive_authority(
 def test_retry_build_recovers_unbound_builder_terminalization(
     tmp_path: Path,
 ) -> None:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        source_revisions=("issue:12@open",),
+        changes=(),
+    )
     authority = work_actions.load_work_authority(
         repo="acme/demo", work_id="demo", snapshot_path=snapshot
     )

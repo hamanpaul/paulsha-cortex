@@ -49,9 +49,9 @@ def _git(repo: Path, *args: str, input: str | None = None) -> str:
     ).stdout.strip()
 
 
-def _fix_standard_manifest_steps() -> tuple[WorkflowStep, ...]:
+def _combo_manifest_steps(combo_id: str) -> tuple[WorkflowStep, ...]:
     cards = load_cards(DEFAULT_CARDS_PATH)
-    combo = load_combo(DEFAULT_COMBOS_DIR / "fix-standard.yaml", cards)
+    combo = load_combo(DEFAULT_COMBOS_DIR / f"{combo_id}.yaml", cards)
     result = compile_combo(
         combo,
         cards,
@@ -64,10 +64,21 @@ def _fix_standard_manifest_steps() -> tuple[WorkflowStep, ...]:
     return result.workflow_manifest.steps
 
 
+def _fix_standard_manifest_steps() -> tuple[WorkflowStep, ...]:
+    return _combo_manifest_steps("fix-standard")
+
+
 def _review_complete_fix_standard_steps() -> tuple[WorkflowStep, ...]:
     return tuple(
         replace(step, gate_result="passed") if step.phase != "ship" else step
         for step in _fix_standard_manifest_steps()
+    )
+
+
+def _review_complete_combo_steps(combo_id: str) -> tuple[WorkflowStep, ...]:
+    return tuple(
+        replace(step, gate_result="passed") if step.phase != "ship" else step
+        for step in _combo_manifest_steps(combo_id)
     )
 
 
@@ -109,6 +120,7 @@ def _create_fix_standard_run(
     repo_root: Path,
     snapshot: Path,
     candidate: str,
+    combo: str = "fix-standard",
     steps: tuple[WorkflowStep, ...] | None = None,
     current_phase: str = "review",
     verified_head: str | None = None,
@@ -123,9 +135,9 @@ def _create_fix_standard_run(
         claim_key="claim:v1:" + "1" * 64,
         source_revision=work_authority_digest(authority),
         workspace_root=str(repo_root),
-        combo="fix-standard",
+        combo=combo,
         current_phase=current_phase,
-        steps=steps or _review_complete_fix_standard_steps(),
+        steps=steps or _review_complete_combo_steps(combo),
         issue_refs=(f"{REPO}#14",),
         openspec_refs=authority.mapped_openspec,
         pr_refs=(),
@@ -721,8 +733,10 @@ def test_retry_build_ignores_dirty_worktree_when_exact_candidate_tree_is_clean(
     assert "pre-archive work" not in action
 
 
-def test_retry_build_tree_inspection_failure_raises_before_reset(
+@pytest.mark.parametrize("combo", ("fix-standard", "feature-oneshot"))
+def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_shape(
     tmp_path: Path,
+    combo: str,
 ) -> None:
     repo, candidate = _repo(
         tmp_path / "retry-build-tree-failure-source",
@@ -738,9 +752,14 @@ def test_retry_build_tree_inspection_failure_raises_before_reset(
         repo_root=bad_workspace,
         snapshot=snapshot,
         candidate=candidate,
+        combo=combo,
         facets=("needs_human",),
         gate_status="failed",
     )
+    assert any(
+        step.phase == "ship" and step.card == "openspec-archive"
+        for step in run.steps
+    ) is (combo == "feature-oneshot")
     _record_manager_ship_job(
         registry=registry,
         state_root=tmp_path / "state",

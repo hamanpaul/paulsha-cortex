@@ -2519,10 +2519,6 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
     from . import manager
 
-    declared_archive_step = any(
-        step.phase == "ship" and step.card == "openspec-archive"
-        for step in run.steps
-    )
     archive_applied = manager._manager_archive_applied(
         run,
         registry=workflow_registry,
@@ -2534,7 +2530,6 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
             workspace_root=Path(str(run.workspace_root)),
             candidate=run.candidate_head,
             change=change,
-            required=not declared_archive_step,
         )
         if archive_entries:
             warnings.append(
