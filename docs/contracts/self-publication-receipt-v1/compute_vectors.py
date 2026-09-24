@@ -798,8 +798,8 @@ vectors = {
     },
     "raw_rejection_inputs": [
         {
-            "raw": '{"schema":"v1","schema":"v2"}',
-            "reason": "duplicate object key",
+        "raw": '{"schema":"v1","sch\\u0065ma":"v2"}',
+        "reason": "duplicate decoded object member name",
             "expected": "reject strict value; if inside publication_receipts[i], preserve exact row source in invalid-json-row wrapper",
         },
         {"raw": '{"value":NaN}', "reason": "non-finite JSON number", "expected": "reject"},
@@ -822,18 +822,24 @@ def brainstorm_join_vector(
     producer_event_id: str = brain_event_id,
     transaction_operations: list[dict[str, object]] | None = None,
     integration_artifacts: list[dict[str, object]] | None = None,
+    planning_source_revision: str | None = brain_source_revision,
 ) -> dict[str, object]:
     scope = peer_scope if peer_scope is not None else brain_evidence_payload["scope"]
     run_scope = {
         "repo": repo,
         "work_id": work_id,
-        "planning_source_revision": brain_source_revision,
+        "planning_source_revision": planning_source_revision,
     }
     scope_matches = (
         set(scope) == {"repo", "work_id", "source_revision"}
         and scope["repo"] == run_scope["repo"]
         and scope["work_id"] == run_scope["work_id"]
-        and scope["source_revision"] == run_scope["planning_source_revision"]
+        and isinstance(scope["source_revision"], str)
+        and bool(scope["source_revision"])
+        and (
+            run_scope["planning_source_revision"] is None
+            or scope["source_revision"] == run_scope["planning_source_revision"]
+        )
     )
     before_state_valid = (
         (operation["before_exists"] is False and operation["before_sha256"] is None)
@@ -865,6 +871,8 @@ def brainstorm_join_vector(
         for row in integration_rows_source
         if row.get("kind") == output_kind
         and row.get("path") == operation["ref"]
+        and isinstance(row.get("content"), str)
+        and sha(row["content"].encode("utf-8")) == operation["after_sha256"]
     ]
     evidence_write_operations = [
         row
@@ -875,10 +883,20 @@ def brainstorm_join_vector(
         and row.get("after_sha256") == peer_evidence_sha256
     ]
     selected_operation_in_journal = operation in tx_operations
+    matching_selected_operations = [
+        row
+        for row in tx_operations
+        if row.get("path_domain") == "workspace"
+        and row.get("kind") == "artifact"
+        and row.get("ref") == operation["ref"]
+        and row.get("after_sha256") == operation["after_sha256"]
+        and row.get("mutation") is True
+    ]
     transaction_join_valid = (
         peer_evidence_ref == brain_evidence_abs_ref
         and len(evidence_write_operations) == 1
         and selected_operation_in_journal
+        and len(matching_selected_operations) == 1
     )
     eligibility_ok = (
         operation["path_domain"] == "workspace"
@@ -915,6 +933,7 @@ def brainstorm_join_vector(
         },
         "transaction_join": {
             "matching_evidence_write_operations": evidence_write_operations,
+            "matching_selected_output_operations": matching_selected_operations,
             "selected_output_operation_in_journal": selected_operation_in_journal,
         },
         "operation": operation,
@@ -1065,6 +1084,36 @@ wrong_scope_vector.update(
     }
 )
 brainstorm_operation_vectors.append(wrong_scope_vector)
+brainstorm_operation_vectors.append(
+    brainstorm_join_vector(
+        "brainstorm-initial-run-without-planning-source-revision-remains-scope-bound",
+        brain_outputs[0]["kind"],
+        brain_artifact_operations[0],
+        brain_evidence_payload["artifacts"],
+        planning_source_revision=None,
+    )
+)
+brainstorm_operation_vectors.append(
+    brainstorm_join_vector(
+        "brainstorm-gate-reference-hash-not-journal-after-hash-does-not-mint",
+        brain_outputs[0]["kind"],
+        brain_artifact_operations[0],
+        brain_evidence_payload["artifacts"],
+        peer_evidence_sha256="b" * 64,
+    )
+)
+brainstorm_operation_vectors.append(
+    brainstorm_join_vector(
+        "brainstorm-duplicate-selected-operation-in-journal-does-not-mint",
+        brain_outputs[0]["kind"],
+        brain_artifact_operations[0],
+        brain_evidence_payload["artifacts"],
+        transaction_operations=[
+            *brain_operations,
+            brain_artifact_operations[0],
+        ],
+    )
+)
 wrong_domain_operation = {
     **brain_artifact_operations[0],
     "path_domain": "coordinator",
@@ -1230,24 +1279,6 @@ add_negative("boolean-is-not-positive-integer", mutated, "malformed-known-v1")
 
 negative_vectors.extend(
     [
-        {
-            "id": "duplicate-json-key-in-workflow-receipt-row",
-            "boundary": "isolated-raw-registry-row-decoder",
-            "registry_json_pointer": "/workflows/0/publication_receipts/0",
-            "input_raw_row": '{"schema": "v1", "schema": "v2"}',
-            "scope_note": "Isolated raw receipt-row decoder fixture invoked at the real registry field pointer. It is not a complete registry document or loadable WorkflowRun; history_loads is false and this vector claims decoder classification only.",
-            "expected_invalid_row": {
-                "kind": "cortex-publication-receipt-invalid-json-row/v1",
-                "raw_json": '{"schema": "v1", "schema": "v2"}',
-                "diagnostic": {"code": "duplicate-json-key", "index": 0},
-            },
-            "expected": {
-                "row_decoder": "classified-invalid-json-row",
-                "history_loads": False,
-                "append": "not-run",
-                "persist": False,
-            },
-        },
         {
             "id": "invalid-non-list-container-round-trip",
             "boundary": "workflow-run-value-round-trip",
@@ -1427,6 +1458,129 @@ add_negative(
     boundary="sidecar-resolver-validation",
     context={"intent_head": pr_intent["head"]},
 )
+
+mutated = clone(base_pr)
+mutated["acceptance_evidence"]["intent_ref"] += ".other"
+mutated = reseal(mutated)
+add_negative(
+    "pr-acceptance-evidence-intent-ref-differs-from-transaction",
+    mutated,
+    "cross-binding",
+    context={
+        "acceptance_evidence_intent_ref": mutated["acceptance_evidence"]["intent_ref"],
+        "transaction_intent_ref": mutated["transaction"]["intent_ref"],
+    },
+)
+
+mutated = clone(base_pr)
+mutated["acceptance_evidence"]["intent_sha256"] = "b" * 64
+mutated = reseal(mutated)
+add_negative(
+    "pr-acceptance-evidence-intent-hash-differs-from-transaction",
+    mutated,
+    "cross-binding",
+    context={
+        "acceptance_evidence_intent_sha256": mutated["acceptance_evidence"]["intent_sha256"],
+        "transaction_intent_sha256": mutated["transaction"]["intent_sha256"],
+    },
+)
+
+mutated = clone(base_pr)
+mutated["transaction"]["intent_sha256"] = "B" + "b" * 63
+mutated = reseal(mutated)
+add_negative(
+    "pr-invalid-intent-hash-precedes-ref-hash-cross-binding",
+    mutated,
+    "invalid-digest",
+    context={"acceptance_evidence_intent_sha256": pr_acceptance["intent_sha256"]},
+)
+
+for vector_id, changes, expected_code in (
+    (
+        "precedence-unknown-schema-before-all-other-defects",
+        {"schema": "future/v9", "producer_kind": "future_kind", "receipt_id": "BAD"},
+        "unknown-schema",
+    ),
+    (
+        "precedence-unknown-kind-before-known-v1-shape",
+        {"producer_kind": "future_kind", "transaction": {}},
+        "unknown-producer-kind",
+    ),
+    (
+        "precedence-known-v1-shape-before-contained-digest",
+        {"transaction": {"unexpected": "bad-key"}, "receipt_id": "BAD"},
+        "malformed-known-v1",
+    ),
+    (
+        "precedence-contained-digest-before-cross-binding",
+        {
+            "transaction": {"intent_sha256": "B" + "b" * 63},
+            "acceptance_evidence": {"intent_sha256": "c" * 64},
+        },
+        "invalid-digest",
+    ),
+):
+    mutated = clone(base_pr)
+    for path, value in changes.items():
+        if path in {"schema", "producer_kind", "receipt_id"}:
+            mutated[path] = value
+        else:
+            mutated[path].update(value)
+    if vector_id not in {
+        "precedence-unknown-schema-before-all-other-defects",
+        "precedence-unknown-kind-before-known-v1-shape",
+    }:
+        mutated = reseal(mutated)
+    add_negative(
+        vector_id,
+        mutated,
+        expected_code,
+        context={"proposed_precedence_order": ["unknown-schema", "unknown-producer-kind", "malformed-known-v1", "invalid-digest", "cross-binding"]},
+    )
+
+for diagnostic_index in (True, -1, 1.0):
+    add_negative(
+        f"diagnostic-index-rejects-{str(diagnostic_index).lower()}",
+        {
+            "kind": "cortex-publication-receipt-invalid-json-row/v1",
+            "raw_json": '{"schema":"v1","sch\\u0065ma":"v2"}',
+            "diagnostic": {"code": "duplicate-json-key", "index": diagnostic_index},
+        },
+        "malformed-known-v1",
+        boundary="workflow-run-value-round-trip",
+        context={"required_index_rule": "type(index) is int and index >= 0; bool is not an int here"},
+    )
+
+for vector_id, mutate, expected_code in (
+    (
+        "missing-schema-is-malformed-not-unknown-schema",
+        lambda value: value.pop("schema"),
+        "malformed-known-v1",
+    ),
+    (
+        "nonstring-schema-is-malformed-not-unknown-schema",
+        lambda value: value.update({"schema": None}),
+        "malformed-known-v1",
+    ),
+    (
+        "missing-producer-kind-is-malformed-not-unknown-kind",
+        lambda value: value.pop("producer_kind"),
+        "malformed-known-v1",
+    ),
+    (
+        "nonstring-producer-kind-is-malformed-not-unknown-kind",
+        lambda value: value.update({"producer_kind": 7}),
+        "malformed-known-v1",
+    ),
+):
+    value = clone(base_pr)
+    mutate(value)
+    add_negative(
+        vector_id,
+        value,
+        expected_code,
+        context={"diagnostic_rule": "unknown codes require explicit string discriminator values"},
+    )
 vectors["negative_vectors"] = negative_vectors
 
 raw_metadata = {
@@ -1525,7 +1679,7 @@ def get_body_vector(vector_id: str, raw_body: str) -> dict[str, object]:
     return {
         "id": vector_id,
         "boundary": "github-get-raw-response-body",
-        "get_response_raw_body_utf8": raw_body,
+        "get_response_raw_body_unicode": raw_body,
         "line_ending_normalized_get_body": normalized_get_body,
         "expected_rendered_marker_bearing_body": pr_rendered_body,
         "raw_marker_like_lines": marker_like_lines,
@@ -1610,30 +1764,30 @@ vectors["receipt_history_round_trip_vectors"] = [
         "expected_after_to_dict_and_reload": [plan_receipt],
     },
     {
-        "id": "invalid-json-row-wrapper-value-round-trip-after-isolated-decoding",
-        "boundary": "workflow-run-value-round-trip-after-decoder-classification",
-        "input_publication_receipts_member": [
-            {
-                "kind": "cortex-publication-receipt-invalid-json-row/v1",
-                "raw_json": '{"schema": "v1", "schema": "v2"}',
-                "diagnostic": {"code": "duplicate-json-key", "index": 0},
-            }
-        ],
-        "expected_after_from_dict": [
-            {
-                "kind": "cortex-publication-receipt-invalid-json-row/v1",
-                "raw_json": '{"schema": "v1", "schema": "v2"}',
-                "diagnostic": {"code": "duplicate-json-key", "index": 0},
-            }
-        ],
-        "expected_after_to_dict_and_reload": [
-            {
-                "kind": "cortex-publication-receipt-invalid-json-row/v1",
-                "raw_json": '{"schema": "v1", "schema": "v2"}',
-                "diagnostic": {"code": "duplicate-json-key", "index": 0},
-            }
-        ],
-        "full_registry_load_claimed": False,
+            "id": "invalid-json-row-wrapper-value-round-trip-after-isolated-decoding",
+            "boundary": "workflow-run-value-round-trip-after-decoder-classification",
+            "input_publication_receipts_member": [
+                {
+                    "kind": "cortex-publication-receipt-invalid-json-row/v1",
+                    "raw_json": '{ "schema":"v1", "sch\\u0065ma" : "v2" }',
+                    "diagnostic": {"code": "duplicate-json-key", "index": 1},
+                }
+            ],
+            "expected_after_from_dict": [
+                {
+                    "kind": "cortex-publication-receipt-invalid-json-row/v1",
+                    "raw_json": '{ "schema":"v1", "sch\\u0065ma" : "v2" }',
+                    "diagnostic": {"code": "duplicate-json-key", "index": 1},
+                }
+            ],
+            "expected_after_to_dict_and_reload": [
+                {
+                    "kind": "cortex-publication-receipt-invalid-json-row/v1",
+                    "raw_json": '{ "schema":"v1", "sch\\u0065ma" : "v2" }',
+                    "diagnostic": {"code": "duplicate-json-key", "index": 1},
+                }
+            ],
+            "full_registry_load_claimed": True,
     },
     {
         "id": "opaque-non-list-container-round-trip",
@@ -1653,11 +1807,153 @@ vectors["receipt_history_round_trip_vectors"] = [
 ]
 
 
-def plan_receipt_for_attempt(attempt: int) -> dict[str, object]:
+def registry_workflow_base(
+    fixture_run_id: str, fixture_work_id: str, fixture_claim_key: str, root: str
+) -> dict[str, object]:
+    return {
+        "run_id": fixture_run_id,
+        "work_id": fixture_work_id,
+        "repo": repo,
+        "claim_key": fixture_claim_key,
+        "source_revision": "c" * 64,
+        "workspace_root": root,
+        "combo": "fixture",
+        "current_phase": "claim",
+        "steps": [],
+        "issue_refs": [],
+        "openspec_refs": [],
+        "pr_refs": [],
+        "attempts": {},
+        "evidence_refs": [],
+        "facets": [],
+        "gate_status": "pending",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+
+
+registry_row0 = registry_workflow_base(
+    "registry-run-with-row-duplicate",
+    "registry-work-duplicate",
+    "claim:v1:" + "e" * 64,
+    "/fixture/workspaces/duplicate",
+)
+registry_row1 = registry_workflow_base(
+    "registry-sibling-workflow",
+    "registry-work-sibling",
+    "claim:v1:" + "f" * 64,
+    "/fixture/workspaces/sibling",
+)
+registry_duplicate_receipt_row = '{ "schema":"v1", "sch\\u0065ma" : "v2" }'
+registry_row0_base_json = json.dumps(
+    registry_row0, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+)
+registry_row1_base_json = json.dumps(
+    registry_row1, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+)
+registry_row0_full = (
+    registry_row0_base_json[:-1]
+    + ',"publication_receipts":[{"schema":"future-receipt/v9","value":3},'
+    + registry_duplicate_receipt_row
+    + "]}"
+)
+registry_row0_empty = registry_row0_base_json[:-1] + ',"publication_receipts":[]} '
+registry_row1_full = registry_row1_base_json[:-1] + ',"publication_receipts":[]} '
+registry_legacy = {
+    "source_schema_version": 1,
+    "seq": 0,
+    "jobs": [],
+    "slices": [],
+}
+registry_document_with_row_duplicate = (
+    '{"schema_version":2,"seq":0,"jobs":[],"slices":[],"workflows":['
+    + registry_row0_full
+    + ","
+    + registry_row1_full
+    + '],"legacy_records":'
+    + json.dumps(registry_legacy, sort_keys=True, separators=(",", ":"))
+    + "}"
+)
+registry_document_plain = (
+    '{"schema_version":2,"seq":0,"jobs":[],"slices":[],"workflows":['
+    + registry_row0_empty.rstrip()
+    + ","
+    + registry_row1_full.rstrip()
+    + '],"legacy_records":'
+    + json.dumps(registry_legacy, sort_keys=True, separators=(",", ":"))
+    + "}"
+)
+registry_document_with_root_duplicate = registry_document_plain.replace(
+    '"schema_version":2,',
+    '"schema_version":2,"schema\\u005fversion":2,',
+    1,
+)
+vectors["registry_raw_document_vectors"] = [
+    {
+        "id": "duplicate-json-key-inside-real-workflow-receipt-row-preserves-row-and-loads-sibling",
+        "boundary": "full-v2-registry-load-raw-aware-receipt-row-decoder",
+        "registry_json_pointer": "/workflows/0/publication_receipts/1",
+        "input_raw_document": registry_document_with_row_duplicate,
+        "duplicate_row_source_exact": registry_duplicate_receipt_row,
+        "expected_registry_load": {
+            "accepted": True,
+            "workflow_count": 2,
+            "workflow_run_ids": [
+                "registry-run-with-row-duplicate",
+                "registry-sibling-workflow",
+            ],
+            "first_workflow_publication_receipts": [
+                {
+                    "kind": "cortex-publication-receipt-invalid-row/v1",
+                    "raw": {"schema": "future-receipt/v9", "value": 3},
+                    "diagnostic": {"code": "unknown-schema", "index": 0},
+                },
+                {
+                    "kind": "cortex-publication-receipt-invalid-json-row/v1",
+                    "raw_json": registry_duplicate_receipt_row,
+                    "diagnostic": {"code": "duplicate-json-key", "index": 1},
+                },
+            ],
+            "sibling_workflow_publication_receipts": [],
+        },
+        "expected_append_after_load": {
+            "outcome": "conflict",
+            "reason": "any-invalid-or-opaque-history-blocks-append",
+            "persist_attempts": 0,
+        },
+    },
+    {
+        "id": "decoded-duplicate-registry-root-key-fails-whole-load",
+        "boundary": "full-v2-registry-raw-json-decoder",
+        "registry_json_pointer": "/schema_version",
+        "input_raw_document": registry_document_with_root_duplicate,
+        "duplicate_decoded_name": "schema_version",
+        "expected_registry_load": {
+            "accepted": False,
+            "failure": "duplicate-json-key-outside-publication-receipt-row",
+            "workflow_rows_loaded": 0,
+            "preserve_partial_registry": False,
+        },
+    },
+]
+
+
+def plan_receipt_for_attempt(
+    attempt: int,
+    *,
+    run_id_value: str = run_id,
+    work_id_value: str = work_id,
+    claim_key_value: str = claim_key,
+    authority_digest: str = authority_sha,
+) -> dict[str, object]:
     snapshot = clone(plan_snapshot)
+    snapshot["run_id"] = run_id_value
+    snapshot["work_id"] = work_id_value
+    snapshot["claim_key"] = claim_key_value
+    snapshot["pre_publication_authority_sha256"] = authority_digest
     snapshot["phase_attempt"] = attempt
     snapshot_ref = (
-        f"planning-input-snapshots/run-contract-01/plan/{attempt}/planning-contract.json"
+        f"planning-input-snapshots/{run_id_value}/plan/{attempt}/planning-contract.json"
     )
     snapshot_bytes = j(snapshot)
     snapshot_sha = sha(snapshot_bytes)
@@ -1669,21 +1965,35 @@ def plan_receipt_for_attempt(attempt: int) -> dict[str, object]:
     facts["phase_attempt"] = attempt
     facts_sha = h("cortex-plan-acceptance-facts/v1", facts)
     event_basis = clone(plan_event_basis)
+    event_basis["run_id"] = run_id_value
+    event_basis["work_id"] = work_id_value
+    event_basis["claim_key"] = claim_key_value
+    event_basis["pre_publication_authority_sha256"] = authority_digest
     event_basis["phase_attempt"] = attempt
     event_basis["acceptance_facts_sha256"] = facts_sha
     event_id = h("cortex-self-publication-event/plan/v1", event_basis)
     intent = clone(plan_intent)
+    intent["run_id"] = run_id_value
+    intent["work_id"] = work_id_value
+    intent["claim_key"] = claim_key_value
+    intent["pre_publication_authority_sha256"] = authority_digest
+    intent["accepted_input"] = clone(plan_accepted_input)
     intent["acceptance_evidence"] = acceptance
     intent_bytes = j(intent)
     intent_sha = sha(intent_bytes)
     intent_ref = (
-        f"planning-publication-intents/run-contract-01/plan/{event_id}.json"
+        f"planning-publication-intents/{run_id_value}/plan/{event_id}.json"
     )
     publication_basis = {"producer_event_id": event_id, "target": plan_target}
     publication_id = h(
         "cortex-self-publication-publication/plan/v1", publication_basis
     )
     receipt = clone(plan_receipt)
+    receipt["run_id"] = run_id_value
+    receipt["work_id"] = work_id_value
+    receipt["claim_key"] = claim_key_value
+    receipt["pre_publication_authority_sha256"] = authority_digest
+    receipt["accepted_input"] = clone(plan_accepted_input)
     receipt["producer_event_id"] = event_id
     receipt["publication_id"] = publication_id
     receipt["acceptance_evidence"] = acceptance
@@ -1710,6 +2020,16 @@ def plan_receipt_for_attempt(attempt: int) -> dict[str, object]:
 
 
 plan_attempt3 = plan_receipt_for_attempt(3)
+plan_other_run = plan_receipt_for_attempt(2, run_id_value="run-contract-02")
+new_claim_key = "claim:v1:" + sha(
+    j({"repo": repo, "work_id": work_id, "authority_digest": "b" * 64})
+)
+plan_new_claim_era = plan_receipt_for_attempt(
+    2,
+    run_id_value="run-contract-03",
+    claim_key_value=new_claim_key,
+    authority_digest="b" * 64,
+)
 alternate_same_pair = pr_receipt_with_witness(
     base_pr, 8, 7008, "PR_kwDOExample0002"
 )
@@ -1807,7 +2127,7 @@ append_vectors = [
         "expected": {"outcome": "conflict", "persist_attempts": 0, "rows_added": 0},
     },
     {
-        "id": "same-planning-ref-different-event-conflicts",
+        "id": "same-run-claim-producer-ref-different-event-conflicts",
         "history": [plan_receipt],
         "incoming_batch": {
             "producer_kind": "plan_materialization",
@@ -1821,14 +2141,14 @@ append_vectors = [
                 "run_id": run_id,
                 "claim_key": claim_key,
                 "producer_kind": "plan_materialization",
-                "workspace_ref": plan_target_ref,
+                "canonical_workspace_ref": plan_target_ref,
             },
-            "history_workspace_ref": plan_receipt["published_object"]["ref"],
-            "incoming_workspace_ref": plan_attempt3["receipt"]["published_object"]["ref"],
+            "history_canonical_workspace_ref": plan_receipt["published_object"]["ref"],
+            "incoming_canonical_workspace_ref": plan_attempt3["receipt"]["published_object"]["ref"],
         },
         "expected": {
             "outcome": "conflict",
-            "reason": "same-planning-object-key-across-events",
+            "reason": "same-run-claim-producer-canonical-workspace-ref",
             "persist_attempts": 0,
             "rows_added": 0,
         },
@@ -1855,7 +2175,385 @@ append_vectors = [
         "expected": {"outcome": "conflict", "persist_attempts": 0, "rows_added": 0},
     },
 ]
+append_vectors.extend(
+    [
+        {
+            "id": "same-workspace-ref-in-different-run-is-allowed",
+            "history": [plan_receipt],
+            "incoming_batch": {
+                "producer_kind": "plan_materialization",
+                "producer_event_id": plan_other_run["producer_event_id"],
+                "coupled_run_patch": {"fixture_patch_token": "different-run"},
+                "receipts": [plan_other_run["receipt"]],
+            },
+            "context": {
+                "history_key": {
+                    "run_id": run_id,
+                    "claim_key": claim_key,
+                    "producer_kind": "plan_materialization",
+                    "canonical_workspace_ref": plan_target_ref,
+                },
+                "incoming_key": {
+                    "run_id": "run-contract-02",
+                    "claim_key": claim_key,
+                    "producer_kind": "plan_materialization",
+                    "canonical_workspace_ref": plan_target_ref,
+                },
+                "incoming_receipt": plan_other_run["receipt"],
+            },
+            "expected": {"outcome": "appended", "persist_attempts": 1, "rows_added": 1},
+        },
+        {
+            "id": "same-workspace-ref-in-new-claim-era-is-allowed",
+            "history": [plan_receipt],
+            "incoming_batch": {
+                "producer_kind": "plan_materialization",
+                "producer_event_id": plan_new_claim_era["producer_event_id"],
+                "coupled_run_patch": {"fixture_patch_token": "new-claim-era"},
+                "receipts": [plan_new_claim_era["receipt"]],
+            },
+            "context": {
+                "history_key": {
+                    "run_id": run_id,
+                    "claim_key": claim_key,
+                    "producer_kind": "plan_materialization",
+                    "canonical_workspace_ref": plan_target_ref,
+                },
+                "incoming_key": {
+                    "run_id": "run-contract-03",
+                    "claim_key": new_claim_key,
+                    "producer_kind": "plan_materialization",
+                    "canonical_workspace_ref": plan_target_ref,
+                },
+                "incoming_receipt": plan_new_claim_era["receipt"],
+            },
+            "expected": {"outcome": "appended", "persist_attempts": 1, "rows_added": 1},
+        },
+        {
+            "id": "same-run-claim-ref-in-different-producer-variant-is-distinct-key",
+            "boundary": "planning-object-key-comparison-after-producer-side-validation",
+            "history_key": {
+                "run_id": run_id,
+                "claim_key": claim_key,
+                "producer_kind": "plan_materialization",
+                "canonical_workspace_ref": "docs/superpowers/specs/contract-1029-spec.md",
+            },
+            "incoming_key": {
+                "run_id": run_id,
+                "claim_key": claim_key,
+                "producer_kind": "brainstorm_artifact",
+                "canonical_workspace_ref": "docs/superpowers/specs/contract-1029-spec.md",
+            },
+            "scope_note": "This vector exercises only the #993 key comparator after each producer has independently validated its receipt; it does not claim the current brainstorm output-pattern fixture can publish a plan-materialization target.",
+            "expected": {"keys_equal": False, "object_key_conflict": False},
+        },
+        {
+            "id": "stale-expected-revision-conflicts-even-with-exact-full-batch-replay",
+            "history": brain_receipts,
+            "incoming_batch": two_receipt_batch,
+            "current_registry_revision": 9,
+            "expected_revision": 8,
+            "expected": {
+                "outcome": "conflict",
+                "reason": "stale-expected-revision-before-replay-recognition",
+                "persist_attempts": 0,
+                "rows_added": 0,
+            },
+        },
+        {
+            "id": "invalid-row-history-blocks-otherwise-new-batch",
+            "history": [
+                {
+                    "kind": "cortex-publication-receipt-invalid-row/v1",
+                    "raw": {"schema": "future/v9"},
+                    "diagnostic": {"code": "unknown-schema", "index": 0},
+                }
+            ],
+            "incoming_batch": two_receipt_batch,
+            "expected": {
+                "outcome": "conflict",
+                "reason": "any-invalid-or-opaque-history-blocks-append",
+                "persist_attempts": 0,
+                "rows_added": 0,
+            },
+        },
+        {
+            "id": "invalid-json-row-history-blocks-otherwise-new-batch",
+            "history": [
+                {
+                    "kind": "cortex-publication-receipt-invalid-json-row/v1",
+                    "raw_json": registry_duplicate_receipt_row,
+                    "diagnostic": {"code": "duplicate-json-key", "index": 1},
+                }
+            ],
+            "incoming_batch": two_receipt_batch,
+            "expected": {
+                "outcome": "conflict",
+                "reason": "any-invalid-or-opaque-history-blocks-append",
+                "persist_attempts": 0,
+                "rows_added": 0,
+            },
+        },
+    ]
+)
 vectors["append_replay_conflict_vectors"] = append_vectors
+
+
+def identity_subset(value: dict[str, object]) -> dict[str, object]:
+    return {
+        key: value[key]
+        for key in (
+            "repo",
+            "work_id",
+            "run_id",
+            "claim_key",
+            "pre_publication_authority_sha256",
+        )
+    }
+
+
+def pr_identity_subset(value: dict[str, object]) -> dict[str, object]:
+    return {
+        key: value[key]
+        for key in ("repo", "work_id", "run_id", "claim_key")
+    }
+
+
+pr_bad_post_repo_receipt = clone(pr_receipt)
+pr_bad_post_repo_receipt["acceptance_evidence"]["post_witness"]["repository"] = "example-org/other"
+pr_bad_post_repo_receipt["published_object"]["repository"] = "example-org/other"
+pr_bad_post_repo_receipt = reseal(pr_bad_post_repo_receipt)
+vectors["producer_receipt_sidecar_join_vectors"] = [
+    {
+        "id": "brainstorm-receipt-snapshot-intent-gate-and-peer-evidence-join",
+        "producer_kind": "brainstorm_artifact",
+        "receipt": brain_receipt,
+        "accepted_input_snapshot": {
+            "ref": brain_snapshot_ref,
+            "stored_bytes_utf8": brain_snapshot_bytes.decode("utf-8"),
+            "sha256": brain_snapshot_sha,
+            "envelope_identity": identity_subset(brain_snapshot),
+        },
+        "resolved_intent": {
+            "ref": brain_intent_ref,
+            "stored_bytes_utf8": brain_intent_bytes.decode("utf-8"),
+            "sha256": brain_intent_sha,
+            "core": brain_intent,
+            "envelope_identity": identity_subset(brain_intent),
+        },
+        "reread_gate_evidence": {
+            "kind": "brainstorm",
+            "ref": brain_evidence_abs_ref,
+            "sha256": brain_evidence_sha,
+            "scope": brain_evidence_payload["scope"],
+            "same_journal_evidence_operation": brain_evidence_operation,
+            "selected_output_operation": brain_artifact_operation,
+            "matching_peer_artifact_row": next(
+                row
+                for row in brain_evidence_payload["artifacts"]
+                if row["kind"] == brain_published["kind"]
+                and row["ref"] == brain_published["ref"]
+                and row["sha256"] == brain_published["sha256"]
+            ),
+            "source_text_utf8": brain_output_text,
+        },
+        "expected": {"accepted": True},
+    },
+    {
+        "id": "plan-receipt-snapshot-intent-source-text-and-new-target-join",
+        "producer_kind": "plan_materialization",
+        "receipt": plan_receipt,
+        "accepted_input_snapshot": {
+            "ref": plan_snapshot_ref,
+            "stored_bytes_utf8": plan_snapshot_bytes.decode("utf-8"),
+            "sha256": plan_snapshot_sha,
+            "envelope_identity": identity_subset(plan_snapshot),
+            "ordered_assessments_with_source_text": plan_snapshot["assessments"],
+            "selected_source_utf8": plan_accepted_text,
+        },
+        "resolved_intent": {
+            "ref": plan_intent_ref,
+            "stored_bytes_utf8": plan_intent_bytes.decode("utf-8"),
+            "sha256": plan_intent_sha,
+            "core": plan_intent,
+            "envelope_identity": identity_subset(plan_intent),
+        },
+        "expected": {"accepted": True},
+    },
+    {
+        "id": "pr-receipt-acceptance-intent-reference-and-hash-equal-transaction",
+        "producer_kind": "manager_pull_request",
+        "receipt": pr_receipt,
+        "resolved_intent": {
+            "ref": pr_intent_ref,
+            "stored_bytes_utf8": pr_intent_bytes.decode("utf-8"),
+            "sha256": pr_intent_sha,
+            "core": pr_intent,
+            "envelope_identity": pr_identity_subset(pr_intent),
+        },
+        "join_inputs": {
+            "acceptance_evidence_intent_ref": pr_acceptance["intent_ref"],
+            "transaction_intent_ref": pr_receipt["transaction"]["intent_ref"],
+            "acceptance_evidence_intent_sha256": pr_acceptance["intent_sha256"],
+            "transaction_intent_sha256": pr_receipt["transaction"]["intent_sha256"],
+            "accepted_input": pr_receipt["accepted_input"],
+            "intent_repo": pr_intent["repo"],
+            "intent_head": pr_intent["head"],
+            "post_witness": pr_witness,
+            "canonical_post_target_repository": pr_intent["repo"],
+            "successful_post_response_repository": pr_witness["repository"],
+        },
+        "expected": {"accepted": True},
+    },
+    {
+        "id": "pr-post-witness-repository-must-bind-to-post-target-not-get-only",
+        "producer_kind": "manager_pull_request",
+        "receipt": pr_bad_post_repo_receipt,
+        "intent_core": pr_intent,
+        "post_response_repository": "example-org/other",
+        "canonical_post_target_repository": repo,
+        "get_observation_repository": "example-org/other",
+        "expected": {
+            "accepted": False,
+            "boundary": "producer-side-post-witness-validation-before-get",
+            "diagnostic_code": "cross-binding",
+        },
+    },
+    {
+        "id": "pr-acceptance-evidence-intent-ref-hash-mismatch-rejected",
+        "producer_kind": "manager_pull_request",
+        "receipt": next(
+            row["input"]
+            for row in negative_vectors
+            if row["id"] == "pr-acceptance-evidence-intent-hash-differs-from-transaction"
+        ),
+        "intent_ref": pr_intent_ref,
+        "intent_sha256": pr_intent_sha,
+        "expected": {"accepted": False, "diagnostic_code": "cross-binding"},
+    },
+    {
+        "id": "pr-resolved-intent-sidecar-byte-hash-mismatch-is-invalid-digest",
+        "producer_kind": "manager_pull_request",
+        "receipt": pr_receipt,
+        "intent_ref": pr_intent_ref,
+        "receipt_expected_intent_sha256": pr_intent_sha,
+        "resolved_sidecar_bytes_utf8": pr_intent_bytes.decode("utf-8") + "\n",
+        "resolved_sidecar_bytes_sha256": sha(pr_intent_bytes + b"\n"),
+        "expected": {
+            "accepted": False,
+            "boundary": "resolved-intent-sidecar-byte-verification",
+            "diagnostic_code": "invalid-digest",
+        },
+    },
+]
+
+immutable_sidecars = [
+    ("brainstorm-snapshot", brain_snapshot_ref, brain_snapshot_bytes),
+    ("brainstorm-intent", brain_intent_ref, brain_intent_bytes),
+    ("plan-snapshot", plan_snapshot_ref, plan_snapshot_bytes),
+    ("plan-intent", plan_intent_ref, plan_intent_bytes),
+    ("pr-intent", pr_intent_ref, pr_intent_bytes),
+]
+vectors["immutable_sidecar_replay_vectors"] = [
+    {
+        "id": f"{name}-same-ref-exact-byte-replay-accepted",
+        "ref": ref,
+        "stored_bytes_utf8": stored.decode("utf-8"),
+        "stored_sha256": sha(stored),
+        "existing_bytes_utf8": stored.decode("utf-8"),
+        "expected": {"accepted": True, "reason": "exact-byte-idempotent-replay"},
+    }
+    for name, ref, stored in immutable_sidecars
+] + [
+    {
+        "id": f"{name}-same-ref-different-byte-overwrite-rejected",
+        "ref": ref,
+        "stored_bytes_utf8": stored.decode("utf-8"),
+        "stored_sha256": sha(stored),
+        "existing_bytes_utf8": stored.decode("utf-8") + "\n",
+        "existing_sha256": sha(stored + b"\n"),
+        "expected": {
+            "accepted": False,
+            "reason": "immutable-ref-already-has-different-bytes",
+            "diagnostic_code": "invalid-digest",
+            "overwrite": False,
+        },
+    }
+    for name, ref, stored in immutable_sidecars
+]
+
+vectors["pr_post_witness_binding_vectors"] = [
+    {
+        "id": "canonical-post-target-response-and-witness-repository-match",
+        "intent_repository": repo,
+        "canonical_post_target_repository": repo,
+        "post_response_repository": repo,
+        "post_witness_repository": repo,
+        "get_observation_repository": repo,
+        "expected": {"post_witness_valid": True},
+    },
+    {
+        "id": "get-repository-cannot-repair-wrong-post-witness-repository",
+        "intent_repository": repo,
+        "canonical_post_target_repository": repo,
+        "post_response_repository": "example-org/other",
+        "post_witness_repository": "example-org/other",
+        "get_observation_repository": "example-org/other",
+        "expected": {
+            "post_witness_valid": False,
+            "reason": "repository-not-bound-to-canonical-post-target",
+            "get_can_repair": False,
+        },
+    },
+]
+
+vectors["pr_delivery_ordering_vectors"] = [
+    {
+        "id": "successful-new-pr-receipt-evidence-order",
+        "trace": [
+            "verify-trusted-authority-origin-and-captured-run-revision",
+            "write-create-once-canonical-intent-sidecar",
+            "append-intent-to-delivery-journal",
+            "confirm-intent-append-at-current-revision",
+            "POST-canonical-target",
+            "durably-confirm-successful-structured-post-witness",
+            "authenticated-read-only-GET",
+            "compare-complete-tuple-metadata-marker-and-rendered-body",
+            "set-published-object-request-metadata-digest",
+            "append-receipt",
+        ],
+        "expected": {"eligible_for_receipt": True},
+    },
+    {
+        "id": "unknown-intent-append-is-resolved-before-post",
+        "trace": [
+            "append-intent-outcome-unknown",
+            "resolve-delivery-journal-at-current-revision",
+            "only-then-allow-post-or-fail-closed",
+        ],
+        "expected": {"post_before_resolution": False},
+    },
+    {
+        "id": "lost-post-response-does-not-use-get-as-creator-proof",
+        "trace": ["POST-outcome-unknown", "fail-closed"],
+        "expected": {"authenticated_get_as_creator_proof": False, "receipt": False},
+    },
+    {
+        "id": "get-waits-for-durably-confirmed-successful-post-witness",
+        "trace": ["successful-POST-response", "witness-append-outcome-unknown"],
+        "expected": {"GET_before_witness_resolution": False, "receipt": False},
+    },
+    {
+        "id": "published-metadata-digest-waits-for-complete-get-equality",
+        "get_observation": pr_published,
+        "request_metadata_sha256": pr_metadata_sha,
+        "expected": {
+            "request_metadata_sha256_admitted_before_get_equality": False,
+            "admitted_after_full_get_equality": True,
+        },
+    },
+]
+
 vectors["pending_vectors"] = [
     {
         "id": "distinct-receipts-with-a-sha256-receipt-id-collision",
