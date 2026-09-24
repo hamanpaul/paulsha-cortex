@@ -1384,6 +1384,57 @@ def pr_receipt_with_new_metadata(
     }
 
 
+def pr_receipt_for_identity(
+    base: dict[str, object],
+    *,
+    run_id_value: str,
+    work_id_value: str,
+    claim_key_value: str,
+    authority_digest: str,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    intent = clone(pr_intent)
+    intent.update(
+        {
+            "run_id": run_id_value,
+            "work_id": work_id_value,
+            "claim_key": claim_key_value,
+        }
+    )
+    intent_bytes = j(intent)
+    intent_sha256 = sha(intent_bytes)
+    publication_id = h("cortex-manager-pr-intent/v1", intent)
+    marker = f"<!-- cortex-self-publication-intent:v1:{publication_id} -->"
+    intent_ref = (
+        f"delivery-intents/{run_id_value}/manager-pull-request/{publication_id}.json"
+    )
+    event_basis = clone(pr_event_basis)
+    event_basis.update(
+        {
+            "run_id": run_id_value,
+            "work_id": work_id_value,
+            "claim_key": claim_key_value,
+        }
+    )
+    producer_event_id = h("cortex-self-publication-event/manager-pr/v1", event_basis)
+    receipt = clone(base)
+    receipt.update(
+        {
+            "run_id": run_id_value,
+            "work_id": work_id_value,
+            "claim_key": claim_key_value,
+            "pre_publication_authority_sha256": authority_digest,
+            "producer_event_id": producer_event_id,
+            "publication_id": publication_id,
+        }
+    )
+    receipt["acceptance_evidence"]["intent_ref"] = intent_ref
+    receipt["acceptance_evidence"]["intent_sha256"] = intent_sha256
+    receipt["transaction"]["intent_ref"] = intent_ref
+    receipt["transaction"]["intent_sha256"] = intent_sha256
+    receipt["published_object"]["marker"] = marker
+    return reseal(receipt), intent, event_basis
+
+
 mutated = clone(base_pr)
 mutated["published_object"]["number"] += 1
 mutated = reseal(mutated)
@@ -1535,7 +1586,16 @@ for vector_id, changes, expected_code in (
         vector_id,
         mutated,
         expected_code,
-        context={"proposed_precedence_order": ["unknown-schema", "unknown-producer-kind", "malformed-known-v1", "invalid-digest", "cross-binding"]},
+        context={
+            "confirmed_diagnostic_precedence": [
+                "raw-duplicate-json-key-before-object-mapping",
+                "unknown-schema",
+                "unknown-producer-kind",
+                "malformed-known-v1",
+                "invalid-digest",
+                "cross-binding",
+            ]
+        },
     )
 
 for diagnostic_index in (True, -1, 1.0):
@@ -2025,8 +2085,8 @@ new_claim_key = "claim:v1:" + sha(
     j({"repo": repo, "work_id": work_id, "authority_digest": "b" * 64})
 )
 plan_new_claim_era = plan_receipt_for_attempt(
-    2,
-    run_id_value="run-contract-03",
+    4,
+    run_id_value=run_id,
     claim_key_value=new_claim_key,
     authority_digest="b" * 64,
 )
@@ -2036,6 +2096,27 @@ alternate_same_pair = pr_receipt_with_witness(
 alternate_same_object = pr_receipt_with_new_metadata(
     base_pr, "feat(workflow): café revised"
 )[0]
+cross_history_run_id = "run-contract-pr-cross-history"
+cross_history_work_id = "work-contract-pr-cross-history"
+cross_history_authority_sha = "d" * 64
+cross_history_claim_key = "claim:v1:" + sha(
+    j(
+        {
+            "repo": repo,
+            "work_id": cross_history_work_id,
+            "authority_digest": cross_history_authority_sha,
+        }
+    )
+)
+cross_history_pr, cross_history_pr_intent, cross_history_pr_event_basis = (
+    pr_receipt_for_identity(
+        base_pr,
+        run_id_value=cross_history_run_id,
+        work_id_value=cross_history_work_id,
+        claim_key_value=cross_history_claim_key,
+        authority_digest=cross_history_authority_sha,
+    )
+)
 second_event_basis = clone(pr_event_basis)
 second_event_basis["ship_attempt"] = 2
 second_event_id = h("cortex-self-publication-event/manager-pr/v1", second_event_basis)
@@ -2119,12 +2200,57 @@ append_vectors = [
             "alternate_intent_hashes": pr_receipt_with_new_metadata(
                 base_pr, "feat(workflow): café revised"
             )[2],
-            "proposed_pr_resource_key": {
+            "pr_resource_key": {
                 "repository": repo,
                 "number": pr_witness["number"],
             },
         },
         "expected": {"outcome": "conflict", "persist_attempts": 0, "rows_added": 0},
+    },
+    {
+        "id": "same-pr-resource-across-run-claim-event-and-publication-conflicts",
+        "history": [base_pr],
+        "incoming_batch": {
+            "producer_kind": "manager_pull_request",
+            "producer_event_id": cross_history_pr["producer_event_id"],
+            "coupled_run_patch": {"fixture_patch_token": "cross-history-same-pr"},
+            "receipts": [cross_history_pr],
+        },
+        "context": {
+            "history_identity": {
+                "run_id": base_pr["run_id"],
+                "claim_key": base_pr["claim_key"],
+                "producer_event_id": base_pr["producer_event_id"],
+                "publication_id": base_pr["publication_id"],
+            },
+            "incoming_identity": {
+                "run_id": cross_history_pr["run_id"],
+                "claim_key": cross_history_pr["claim_key"],
+                "producer_event_id": cross_history_pr["producer_event_id"],
+                "publication_id": cross_history_pr["publication_id"],
+            },
+            "incoming_intent_core": cross_history_pr_intent,
+            "incoming_intent_sidecar": {
+                "ref": cross_history_pr["transaction"]["intent_ref"],
+                "stored_bytes_utf8": j(cross_history_pr_intent).decode("utf-8"),
+                "raw_sha256": sha(j(cross_history_pr_intent)),
+            },
+            "incoming_producer_event": structured(
+                "cortex-self-publication-event/manager-pr/v1",
+                cross_history_pr_event_basis,
+            ),
+            "incoming_event_basis": cross_history_pr_event_basis,
+            "pr_resource_key": {
+                "repository": repo,
+                "number": pr_witness["number"],
+            },
+        },
+        "expected": {
+            "outcome": "conflict",
+            "reason": "same-canonical-repository-positive-number-across-registry-history",
+            "persist_attempts": 0,
+            "rows_added": 0,
+        },
     },
     {
         "id": "same-run-claim-producer-ref-different-event-conflicts",
@@ -2220,11 +2346,19 @@ append_vectors.extend(
                     "canonical_workspace_ref": plan_target_ref,
                 },
                 "incoming_key": {
-                    "run_id": "run-contract-03",
+                    "run_id": run_id,
                     "claim_key": new_claim_key,
                     "producer_kind": "plan_materialization",
                     "canonical_workspace_ref": plan_target_ref,
                 },
+                "authority_restart": {
+                    "prior_pre_publication_authority_sha256": authority_sha,
+                    "new_pre_publication_authority_sha256": "b" * 64,
+                    "same_run_id": True,
+                    "same_producer_kind": True,
+                    "same_canonical_workspace_ref": True,
+                },
+                "workspace_target_absent_after_authority_restart": True,
                 "incoming_receipt": plan_new_claim_era["receipt"],
             },
             "expected": {"outcome": "appended", "persist_attempts": 1, "rows_added": 1},
@@ -2507,11 +2641,59 @@ vectors["pr_post_witness_binding_vectors"] = [
     },
 ]
 
+def pr_registry_raw_fixture(
+    *,
+    fixture_run_id: str = run_id,
+    fixture_work_id: str = work_id,
+    fixture_claim_key: str = claim_key,
+    fixture_authority_sha: str = authority_sha,
+    seq: int = 0,
+) -> bytes:
+    workflow = registry_workflow_base(
+        fixture_run_id,
+        fixture_work_id,
+        fixture_claim_key,
+        "/fixture/workspaces/pr-ordering",
+    )
+    workflow["source_revision"] = fixture_authority_sha
+    workflow["publication_receipts"] = []
+    payload = {
+        "schema_version": 2,
+        "seq": seq,
+        "jobs": [],
+        "slices": [],
+        "workflows": [workflow],
+        "legacy_records": registry_legacy,
+    }
+    # Match coordinator registry's persisted JSON writer: sorted keys, UTF-8,
+    # two-space indent, and no extra trailing newline.
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode(
+        "utf-8"
+    )
+
+
+pr_registry_capture_bytes = pr_registry_raw_fixture()
+pr_registry_capture_text = pr_registry_capture_bytes.decode("utf-8")
+pr_registry_capture_sha = sha(pr_registry_capture_bytes)
+pr_registry_stale_bytes = pr_registry_raw_fixture(seq=1)
+pr_registry_stale_text = pr_registry_stale_bytes.decode("utf-8")
+pr_registry_stale_sha = sha(pr_registry_stale_bytes)
+pr_registry_binding = {
+    "repo": repo,
+    "work_id": work_id,
+    "run_id": run_id,
+    "claim_key": claim_key,
+    "pre_publication_authority_sha256": authority_sha,
+}
+
+
 vectors["pr_delivery_ordering_vectors"] = [
     {
         "id": "successful-new-pr-receipt-evidence-order",
         "trace": [
-            "verify-trusted-authority-origin-and-captured-run-revision",
+            "read-full-registry-raw-bytes-and-capture-SHA256-before-first-metadata-write",
+            "verify-trusted-WorkAuthority-origin-and-run-work-repo-claim-authority-binding",
+            "hold-exact-registry-revision-and-verified-binding",
             "write-create-once-canonical-intent-sidecar",
             "append-intent-to-delivery-journal",
             "confirm-intent-append-at-current-revision",
@@ -2520,9 +2702,67 @@ vectors["pr_delivery_ordering_vectors"] = [
             "authenticated-read-only-GET",
             "compare-complete-tuple-metadata-marker-and-rendered-body",
             "set-published-object-request-metadata-digest",
-            "append-receipt",
+            "append-receipt-with-exact-held-registry-revision-as-#993-expected_revision",
         ],
-        "expected": {"eligible_for_receipt": True},
+        "captured_full_registry_file_utf8": pr_registry_capture_text,
+        "registry_revision": {
+            "algorithm": "SHA-256 of exact full-registry file bytes as read",
+            "captured_raw_sha256": pr_registry_capture_sha,
+            "current_raw_sha256_at_append": pr_registry_capture_sha,
+            "exact_value_passed_to_#993_expected_revision": pr_registry_capture_sha,
+            "binding_verified_against_workflow_row": pr_registry_binding,
+            "delivery_journal_revision_scope": "separate #983 compare-and-swap revision domain",
+        },
+        "expected": {
+            "eligible_for_receipt": True,
+            "registry_revision_passed_unchanged": True,
+            "registry_binding_unchanged": True,
+        },
+    },
+    {
+        "id": "stale-full-registry-revision-fails-append-without-rebase",
+        "captured_full_registry_file_utf8": pr_registry_capture_text,
+        "current_full_registry_file_utf8_at_append": pr_registry_stale_text,
+        "captured_registry_raw_sha256": pr_registry_capture_sha,
+        "current_registry_raw_sha256_at_append": pr_registry_stale_sha,
+        "binding_verified_before_first_metadata_write": pr_registry_binding,
+        "held_expected_revision_passed_to_#993_append": pr_registry_capture_sha,
+        "trace": [
+            "capture-full-registry-raw-byte-revision-before-first-metadata-write",
+            "verify-and-hold-run-claim-authority-binding",
+            "write-intent-and-resolve-delivery-journal-under-separate-#983-revision",
+            "POST-and-confirm-witness-then-GET-equality",
+            "registry-file-changes-before-receipt-append",
+            "#993-append-rejects-stale-held-revision-without-reread-or-rebase",
+        ],
+        "expected": {
+            "outcome": "conflict",
+            "reason": "stale-full-registry-raw-byte-revision",
+            "receipt_appended": False,
+            "persist_attempts": 0,
+            "held_revision_replaced": False,
+        },
+    },
+    {
+        "id": "changed-run-claim-binding-fails-before-first-metadata-write",
+        "captured_full_registry_file_utf8": pr_registry_capture_text,
+        "captured_registry_raw_sha256": pr_registry_capture_sha,
+        "registry_workflow_row_binding": pr_registry_binding,
+        "producer_verified_binding": {
+            **pr_registry_binding,
+            "claim_key": "claim:v1:" + "9" * 64,
+        },
+        "trace": [
+            "capture-full-registry-raw-byte-revision",
+            "compare-verified-run-claim-authority-binding-to-captured-registry-row",
+            "binding-mismatch-fails-before-first-metadata-write",
+        ],
+        "expected": {
+            "eligible_for_receipt": False,
+            "first_metadata_write": False,
+            "reason": "verified-run-claim-binding-changed",
+            "registry_revision_reread_or_replaced": False,
+        },
     },
     {
         "id": "unknown-intent-append-is-resolved-before-post",

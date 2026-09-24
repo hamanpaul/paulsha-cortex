@@ -750,7 +750,7 @@
           "marker": "<!-- cortex-self-publication-intent:v1:90985b1d495079c75f90a534929f92c66acb6bcc3a77e3f5c202f5beb1b40d01 -->",
           "request_metadata_sha256": "7b36daff7bccd3c162636d35a8ab0ec707ab81b0b245910029264982202d3f96"
         },
-        "proposed_pr_resource_key": {
+        "pr_resource_key": {
           "number": 7,
           "repository": "example-org/demo"
         }
@@ -869,6 +869,211 @@
               "kind": "cortex-manager-pr-intent/v1"
             },
             "work_id": "work-contract-01"
+          }
+        ]
+      }
+    },
+    {
+      "context": {
+        "history_identity": {
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "producer_event_id": "fe0d3a55a4a04e3172556e577041f9814272a049e52a6abbe6073064f868a610",
+          "publication_id": "b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214",
+          "run_id": "run-contract-01"
+        },
+        "incoming_event_basis": {
+          "candidate": {
+            "branch": "feature/receipt-contract",
+            "repository": "example-org/demo",
+            "sha": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "claim_key": "claim:v1:7421e969a90d8c1b9a481d9469c58c97ae29f1601e4146326d2b28f7ad75ad2f",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-pr-cross-history",
+          "ship_attempt": 1,
+          "ship_step": {
+            "card": "open-pr",
+            "phase": "ship"
+          },
+          "work_id": "work-contract-pr-cross-history"
+        },
+        "incoming_identity": {
+          "claim_key": "claim:v1:7421e969a90d8c1b9a481d9469c58c97ae29f1601e4146326d2b28f7ad75ad2f",
+          "producer_event_id": "668f1aaf2a45090da50de438b837ff30557c31dacc88128d0f66140eefe55c47",
+          "publication_id": "64976b1b4bfc4fe9bc089c3588985d543c126eb290f7400e05624b0a3c1fd2f6",
+          "run_id": "run-contract-pr-cross-history"
+        },
+        "incoming_intent_core": {
+          "base": {
+            "branch": "main",
+            "repository": "example-org/demo"
+          },
+          "claim_key": "claim:v1:7421e969a90d8c1b9a481d9469c58c97ae29f1601e4146326d2b28f7ad75ad2f",
+          "head": {
+            "branch": "feature/receipt-contract",
+            "repository": "example-org/demo",
+            "sha": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "repo": "example-org/demo",
+          "request_metadata": {
+            "body": "Summary\nCloses #42",
+            "labels": [
+              "enhancement",
+              "receipt"
+            ],
+            "title": "feat(workflow): café"
+          },
+          "request_metadata_sha256": "4da5b2c8409100d9fed287947b0dbbee14810f6b682e89040be772d3b7645158",
+          "run_id": "run-contract-pr-cross-history",
+          "schema": "cortex-manager-pr-intent/v1",
+          "work_id": "work-contract-pr-cross-history"
+        },
+        "incoming_intent_sidecar": {
+          "raw_sha256": "1968b4ad7b490e42f884f546e0644613b0ec8328149c690c3623a521485330a1",
+          "ref": "delivery-intents/run-contract-pr-cross-history/manager-pull-request/64976b1b4bfc4fe9bc089c3588985d543c126eb290f7400e05624b0a3c1fd2f6.json",
+          "stored_bytes_utf8": "{\"base\":{\"branch\":\"main\",\"repository\":\"example-org/demo\"},\"claim_key\":\"claim:v1:7421e969a90d8c1b9a481d9469c58c97ae29f1601e4146326d2b28f7ad75ad2f\",\"head\":{\"branch\":\"feature/receipt-contract\",\"repository\":\"example-org/demo\",\"sha\":\"0123456789abcdef0123456789abcdef01234567\"},\"repo\":\"example-org/demo\",\"request_metadata\":{\"body\":\"Summary\\nCloses #42\",\"labels\":[\"enhancement\",\"receipt\"],\"title\":\"feat(workflow): café\"},\"request_metadata_sha256\":\"4da5b2c8409100d9fed287947b0dbbee14810f6b682e89040be772d3b7645158\",\"run_id\":\"run-contract-pr-cross-history\",\"schema\":\"cortex-manager-pr-intent/v1\",\"work_id\":\"work-contract-pr-cross-history\"}"
+        },
+        "incoming_producer_event": {
+          "canonical_utf8": "{\"candidate\":{\"branch\":\"feature/receipt-contract\",\"repository\":\"example-org/demo\",\"sha\":\"0123456789abcdef0123456789abcdef01234567\"},\"claim_key\":\"claim:v1:7421e969a90d8c1b9a481d9469c58c97ae29f1601e4146326d2b28f7ad75ad2f\",\"repo\":\"example-org/demo\",\"run_id\":\"run-contract-pr-cross-history\",\"ship_attempt\":1,\"ship_step\":{\"card\":\"open-pr\",\"phase\":\"ship\"},\"work_id\":\"work-contract-pr-cross-history\"}",
+          "domain": "cortex-self-publication-event/manager-pr/v1",
+          "sha256": "668f1aaf2a45090da50de438b837ff30557c31dacc88128d0f66140eefe55c47",
+          "value": {
+            "candidate": {
+              "branch": "feature/receipt-contract",
+              "repository": "example-org/demo",
+              "sha": "0123456789abcdef0123456789abcdef01234567"
+            },
+            "claim_key": "claim:v1:7421e969a90d8c1b9a481d9469c58c97ae29f1601e4146326d2b28f7ad75ad2f",
+            "repo": "example-org/demo",
+            "run_id": "run-contract-pr-cross-history",
+            "ship_attempt": 1,
+            "ship_step": {
+              "card": "open-pr",
+              "phase": "ship"
+            },
+            "work_id": "work-contract-pr-cross-history"
+          }
+        },
+        "pr_resource_key": {
+          "number": 7,
+          "repository": "example-org/demo"
+        }
+      },
+      "expected": {
+        "outcome": "conflict",
+        "persist_attempts": 0,
+        "reason": "same-canonical-repository-positive-number-across-registry-history",
+        "rows_added": 0
+      },
+      "history": [
+        {
+          "acceptance_evidence": {
+            "intent_ref": "delivery-intents/run-contract-01/manager-pull-request/b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214.json",
+            "intent_sha256": "22be708c2d358b534c28667ad5246ef603df2d870ddf6fbf7095e02c1b503993",
+            "post_witness": {
+              "id": 7007,
+              "node_id": "PR_kwDOExample0001",
+              "number": 7,
+              "repository": "example-org/demo"
+            }
+          },
+          "accepted_input": {
+            "branch": "feature/receipt-contract",
+            "candidate_sha": "0123456789abcdef0123456789abcdef01234567",
+            "repository": "example-org/demo"
+          },
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "producer_event_id": "fe0d3a55a4a04e3172556e577041f9814272a049e52a6abbe6073064f868a610",
+          "producer_kind": "manager_pull_request",
+          "publication_id": "b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214",
+          "published_object": {
+            "base": {
+              "branch": "main",
+              "repository": "example-org/demo"
+            },
+            "head": {
+              "branch": "feature/receipt-contract",
+              "repository": "example-org/demo",
+              "sha": "0123456789abcdef0123456789abcdef01234567"
+            },
+            "id": 7007,
+            "marker": "<!-- cortex-self-publication-intent:v1:b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214 -->",
+            "node_id": "PR_kwDOExample0001",
+            "number": 7,
+            "repository": "example-org/demo",
+            "request_metadata_sha256": "4da5b2c8409100d9fed287947b0dbbee14810f6b682e89040be772d3b7645158",
+            "state": "open"
+          },
+          "receipt_id": "dc7bebe86ae347ab0cd38772b68ff110c25b5e50d0c58fc83c058cebf6318d49",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-01",
+          "schema": "cortex-self-publication-receipt/v1",
+          "transaction": {
+            "intent_ref": "delivery-intents/run-contract-01/manager-pull-request/b98875269b3f1918f51424b7f77670077299566630fbe923503bfd5855274214.json",
+            "intent_sha256": "22be708c2d358b534c28667ad5246ef603df2d870ddf6fbf7095e02c1b503993",
+            "kind": "cortex-manager-pr-intent/v1"
+          },
+          "work_id": "work-contract-01"
+        }
+      ],
+      "id": "same-pr-resource-across-run-claim-event-and-publication-conflicts",
+      "incoming_batch": {
+        "coupled_run_patch": {
+          "fixture_patch_token": "cross-history-same-pr"
+        },
+        "producer_event_id": "668f1aaf2a45090da50de438b837ff30557c31dacc88128d0f66140eefe55c47",
+        "producer_kind": "manager_pull_request",
+        "receipts": [
+          {
+            "acceptance_evidence": {
+              "intent_ref": "delivery-intents/run-contract-pr-cross-history/manager-pull-request/64976b1b4bfc4fe9bc089c3588985d543c126eb290f7400e05624b0a3c1fd2f6.json",
+              "intent_sha256": "1968b4ad7b490e42f884f546e0644613b0ec8328149c690c3623a521485330a1",
+              "post_witness": {
+                "id": 7007,
+                "node_id": "PR_kwDOExample0001",
+                "number": 7,
+                "repository": "example-org/demo"
+              }
+            },
+            "accepted_input": {
+              "branch": "feature/receipt-contract",
+              "candidate_sha": "0123456789abcdef0123456789abcdef01234567",
+              "repository": "example-org/demo"
+            },
+            "claim_key": "claim:v1:7421e969a90d8c1b9a481d9469c58c97ae29f1601e4146326d2b28f7ad75ad2f",
+            "pre_publication_authority_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "producer_event_id": "668f1aaf2a45090da50de438b837ff30557c31dacc88128d0f66140eefe55c47",
+            "producer_kind": "manager_pull_request",
+            "publication_id": "64976b1b4bfc4fe9bc089c3588985d543c126eb290f7400e05624b0a3c1fd2f6",
+            "published_object": {
+              "base": {
+                "branch": "main",
+                "repository": "example-org/demo"
+              },
+              "head": {
+                "branch": "feature/receipt-contract",
+                "repository": "example-org/demo",
+                "sha": "0123456789abcdef0123456789abcdef01234567"
+              },
+              "id": 7007,
+              "marker": "<!-- cortex-self-publication-intent:v1:64976b1b4bfc4fe9bc089c3588985d543c126eb290f7400e05624b0a3c1fd2f6 -->",
+              "node_id": "PR_kwDOExample0001",
+              "number": 7,
+              "repository": "example-org/demo",
+              "request_metadata_sha256": "4da5b2c8409100d9fed287947b0dbbee14810f6b682e89040be772d3b7645158",
+              "state": "open"
+            },
+            "receipt_id": "9fde8db03e2b3fe77bb7c1c0f65c1f8fbbf0d45942ac9de13f86abdbed2c8c46",
+            "repo": "example-org/demo",
+            "run_id": "run-contract-pr-cross-history",
+            "schema": "cortex-self-publication-receipt/v1",
+            "transaction": {
+              "intent_ref": "delivery-intents/run-contract-pr-cross-history/manager-pull-request/64976b1b4bfc4fe9bc089c3588985d543c126eb290f7400e05624b0a3c1fd2f6.json",
+              "intent_sha256": "1968b4ad7b490e42f884f546e0644613b0ec8328149c690c3623a521485330a1",
+              "kind": "cortex-manager-pr-intent/v1"
+            },
+            "work_id": "work-contract-pr-cross-history"
           }
         ]
       }
@@ -1529,6 +1734,13 @@
     },
     {
       "context": {
+        "authority_restart": {
+          "new_pre_publication_authority_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "prior_pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "same_canonical_workspace_ref": true,
+          "same_producer_kind": true,
+          "same_run_id": true
+        },
         "history_key": {
           "canonical_workspace_ref": "docs/superpowers/plans/receipt-contract.md",
           "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
@@ -1539,7 +1751,7 @@
           "canonical_workspace_ref": "docs/superpowers/plans/receipt-contract.md",
           "claim_key": "claim:v1:10462d7327f5d7000924d02c86be1c4f2ddb0f3e3e63c5e28136c4a533d314e8",
           "producer_kind": "plan_materialization",
-          "run_id": "run-contract-03"
+          "run_id": "run-contract-01"
         },
         "incoming_receipt": {
           "acceptance_evidence": {
@@ -1547,11 +1759,11 @@
             "match_count": 1,
             "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
             "phase": "plan",
-            "phase_attempt": 2,
-            "ref": "planning-input-snapshots/run-contract-03/plan/2/planning-contract.json",
+            "phase_attempt": 4,
+            "ref": "planning-input-snapshots/run-contract-01/plan/4/planning-contract.json",
             "selected_index": 1,
             "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
-            "sha256": "daadd7e0125c08543a5ef3ab1a8f2db63332573a9f367a102ac097445d8666d6"
+            "sha256": "e1528ca29a89ab927367500d64dfacbb4c2882b0faebde329df4d7d7d7d30460"
           },
           "accepted_input": {
             "kind": "plan",
@@ -1560,26 +1772,27 @@
           },
           "claim_key": "claim:v1:10462d7327f5d7000924d02c86be1c4f2ddb0f3e3e63c5e28136c4a533d314e8",
           "pre_publication_authority_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-          "producer_event_id": "e925a803afd76d7b5e186a63dba891dc8a36af64ecdbb07ef3db9e0fdcf7fa4b",
+          "producer_event_id": "9195210c683fc3af92d0d3c1ced42d976244ca908b3ee98922919f86be6dca6a",
           "producer_kind": "plan_materialization",
-          "publication_id": "21f2794976cfcc4852d0be1f752739a83f9ace51f725cffc739b3437d5b50566",
+          "publication_id": "cdebdf0fb283a3931516761339b3a06bd4255602d817524751e818efef48f6a7",
           "published_object": {
             "kind": "plan",
             "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
             "ref": "docs/superpowers/plans/receipt-contract.md",
             "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
           },
-          "receipt_id": "597a05563af694116a0dd67af8395e1f3da68100a140719b6e97f0ad87a6b32e",
+          "receipt_id": "e2029595d8d8ee2e00c354887f40c6e670bdee8a4b2b2b00657c7c7dddec9fd1",
           "repo": "example-org/demo",
-          "run_id": "run-contract-03",
+          "run_id": "run-contract-01",
           "schema": "cortex-self-publication-receipt/v1",
           "transaction": {
-            "intent_ref": "planning-publication-intents/run-contract-03/plan/e925a803afd76d7b5e186a63dba891dc8a36af64ecdbb07ef3db9e0fdcf7fa4b.json",
-            "intent_sha256": "533656136efc0fd7a14783835e1f09f3d94824601d84dfe7fd137d40d35330d2",
+            "intent_ref": "planning-publication-intents/run-contract-01/plan/9195210c683fc3af92d0d3c1ced42d976244ca908b3ee98922919f86be6dca6a.json",
+            "intent_sha256": "0264164085fa0c31286b892fd6a685ee109ad0f66e30b66232f11497e77ef6ee",
             "kind": "cortex-plan-materialization-intent/v1"
           },
           "work_id": "work-contract-01"
-        }
+        },
+        "workspace_target_absent_after_authority_restart": true
       },
       "expected": {
         "outcome": "appended",
@@ -1632,7 +1845,7 @@
         "coupled_run_patch": {
           "fixture_patch_token": "new-claim-era"
         },
-        "producer_event_id": "e925a803afd76d7b5e186a63dba891dc8a36af64ecdbb07ef3db9e0fdcf7fa4b",
+        "producer_event_id": "9195210c683fc3af92d0d3c1ced42d976244ca908b3ee98922919f86be6dca6a",
         "producer_kind": "plan_materialization",
         "receipts": [
           {
@@ -1641,11 +1854,11 @@
               "match_count": 1,
               "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
               "phase": "plan",
-              "phase_attempt": 2,
-              "ref": "planning-input-snapshots/run-contract-03/plan/2/planning-contract.json",
+              "phase_attempt": 4,
+              "ref": "planning-input-snapshots/run-contract-01/plan/4/planning-contract.json",
               "selected_index": 1,
               "selection_rule": "first_accepted_kind_plan_in_assessment_order/v1",
-              "sha256": "daadd7e0125c08543a5ef3ab1a8f2db63332573a9f367a102ac097445d8666d6"
+              "sha256": "e1528ca29a89ab927367500d64dfacbb4c2882b0faebde329df4d7d7d7d30460"
             },
             "accepted_input": {
               "kind": "plan",
@@ -1654,22 +1867,22 @@
             },
             "claim_key": "claim:v1:10462d7327f5d7000924d02c86be1c4f2ddb0f3e3e63c5e28136c4a533d314e8",
             "pre_publication_authority_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "producer_event_id": "e925a803afd76d7b5e186a63dba891dc8a36af64ecdbb07ef3db9e0fdcf7fa4b",
+            "producer_event_id": "9195210c683fc3af92d0d3c1ced42d976244ca908b3ee98922919f86be6dca6a",
             "producer_kind": "plan_materialization",
-            "publication_id": "21f2794976cfcc4852d0be1f752739a83f9ace51f725cffc739b3437d5b50566",
+            "publication_id": "cdebdf0fb283a3931516761339b3a06bd4255602d817524751e818efef48f6a7",
             "published_object": {
               "kind": "plan",
               "output_pattern": "docs/superpowers/plans/*receipt-contract.md",
               "ref": "docs/superpowers/plans/receipt-contract.md",
               "sha256": "3b80d0e69a557846c84afd5492993b18cd02a67232644870fbef9f3f3759e323"
             },
-            "receipt_id": "597a05563af694116a0dd67af8395e1f3da68100a140719b6e97f0ad87a6b32e",
+            "receipt_id": "e2029595d8d8ee2e00c354887f40c6e670bdee8a4b2b2b00657c7c7dddec9fd1",
             "repo": "example-org/demo",
-            "run_id": "run-contract-03",
+            "run_id": "run-contract-01",
             "schema": "cortex-self-publication-receipt/v1",
             "transaction": {
-              "intent_ref": "planning-publication-intents/run-contract-03/plan/e925a803afd76d7b5e186a63dba891dc8a36af64ecdbb07ef3db9e0fdcf7fa4b.json",
-              "intent_sha256": "533656136efc0fd7a14783835e1f09f3d94824601d84dfe7fd137d40d35330d2",
+              "intent_ref": "planning-publication-intents/run-contract-01/plan/9195210c683fc3af92d0d3c1ced42d976244ca908b3ee98922919f86be6dca6a.json",
+              "intent_sha256": "0264164085fa0c31286b892fd6a685ee109ad0f66e30b66232f11497e77ef6ee",
               "kind": "cortex-plan-materialization-intent/v1"
             },
             "work_id": "work-contract-01"
@@ -4111,7 +4324,8 @@
     {
       "boundary": "strict-receipt-value-parser",
       "context": {
-        "proposed_precedence_order": [
+        "confirmed_diagnostic_precedence": [
+          "raw-duplicate-json-key-before-object-mapping",
           "unknown-schema",
           "unknown-producer-kind",
           "malformed-known-v1",
@@ -4179,7 +4393,8 @@
     {
       "boundary": "strict-receipt-value-parser",
       "context": {
-        "proposed_precedence_order": [
+        "confirmed_diagnostic_precedence": [
+          "raw-duplicate-json-key-before-object-mapping",
           "unknown-schema",
           "unknown-producer-kind",
           "malformed-known-v1",
@@ -4247,7 +4462,8 @@
     {
       "boundary": "strict-receipt-value-parser",
       "context": {
-        "proposed_precedence_order": [
+        "confirmed_diagnostic_precedence": [
+          "raw-duplicate-json-key-before-object-mapping",
           "unknown-schema",
           "unknown-producer-kind",
           "malformed-known-v1",
@@ -4316,7 +4532,8 @@
     {
       "boundary": "strict-receipt-value-parser",
       "context": {
-        "proposed_precedence_order": [
+        "confirmed_diagnostic_precedence": [
+          "raw-duplicate-json-key-before-object-mapping",
           "unknown-schema",
           "unknown-producer-kind",
           "malformed-known-v1",
@@ -4698,12 +4915,31 @@
   ],
   "pr_delivery_ordering_vectors": [
     {
+      "captured_full_registry_file_utf8": "{\n  \"jobs\": [],\n  \"legacy_records\": {\n    \"jobs\": [],\n    \"seq\": 0,\n    \"slices\": [],\n    \"source_schema_version\": 1\n  },\n  \"schema_version\": 2,\n  \"seq\": 0,\n  \"slices\": [],\n  \"workflows\": [\n    {\n      \"attempts\": {},\n      \"claim_key\": \"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\n      \"combo\": \"fixture\",\n      \"created_at\": \"2026-01-01T00:00:00+00:00\",\n      \"current_phase\": \"claim\",\n      \"evidence_refs\": [],\n      \"facets\": [],\n      \"gate_status\": \"pending\",\n      \"issue_refs\": [],\n      \"openspec_refs\": [],\n      \"pr_refs\": [],\n      \"publication_receipts\": [],\n      \"repo\": \"example-org/demo\",\n      \"run_id\": \"run-contract-01\",\n      \"source_revision\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n      \"steps\": [],\n      \"updated_at\": \"2026-01-01T00:00:00+00:00\",\n      \"work_id\": \"work-contract-01\",\n      \"workspace_root\": \"/fixture/workspaces/pr-ordering\"\n    }\n  ]\n}",
       "expected": {
-        "eligible_for_receipt": true
+        "eligible_for_receipt": true,
+        "registry_binding_unchanged": true,
+        "registry_revision_passed_unchanged": true
       },
       "id": "successful-new-pr-receipt-evidence-order",
+      "registry_revision": {
+        "algorithm": "SHA-256 of exact full-registry file bytes as read",
+        "binding_verified_against_workflow_row": {
+          "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+          "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repo": "example-org/demo",
+          "run_id": "run-contract-01",
+          "work_id": "work-contract-01"
+        },
+        "captured_raw_sha256": "52566d19dcd22198b2dc672be1e9d5686ae4843ea1963dcd007ca06f492d3748",
+        "current_raw_sha256_at_append": "52566d19dcd22198b2dc672be1e9d5686ae4843ea1963dcd007ca06f492d3748",
+        "delivery_journal_revision_scope": "separate #983 compare-and-swap revision domain",
+        "exact_value_passed_to_#993_expected_revision": "52566d19dcd22198b2dc672be1e9d5686ae4843ea1963dcd007ca06f492d3748"
+      },
       "trace": [
-        "verify-trusted-authority-origin-and-captured-run-revision",
+        "read-full-registry-raw-bytes-and-capture-SHA256-before-first-metadata-write",
+        "verify-trusted-WorkAuthority-origin-and-run-work-repo-claim-authority-binding",
+        "hold-exact-registry-revision-and-verified-binding",
         "write-create-once-canonical-intent-sidecar",
         "append-intent-to-delivery-journal",
         "confirm-intent-append-at-current-revision",
@@ -4712,7 +4948,67 @@
         "authenticated-read-only-GET",
         "compare-complete-tuple-metadata-marker-and-rendered-body",
         "set-published-object-request-metadata-digest",
-        "append-receipt"
+        "append-receipt-with-exact-held-registry-revision-as-#993-expected_revision"
+      ]
+    },
+    {
+      "binding_verified_before_first_metadata_write": {
+        "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+        "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "repo": "example-org/demo",
+        "run_id": "run-contract-01",
+        "work_id": "work-contract-01"
+      },
+      "captured_full_registry_file_utf8": "{\n  \"jobs\": [],\n  \"legacy_records\": {\n    \"jobs\": [],\n    \"seq\": 0,\n    \"slices\": [],\n    \"source_schema_version\": 1\n  },\n  \"schema_version\": 2,\n  \"seq\": 0,\n  \"slices\": [],\n  \"workflows\": [\n    {\n      \"attempts\": {},\n      \"claim_key\": \"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\n      \"combo\": \"fixture\",\n      \"created_at\": \"2026-01-01T00:00:00+00:00\",\n      \"current_phase\": \"claim\",\n      \"evidence_refs\": [],\n      \"facets\": [],\n      \"gate_status\": \"pending\",\n      \"issue_refs\": [],\n      \"openspec_refs\": [],\n      \"pr_refs\": [],\n      \"publication_receipts\": [],\n      \"repo\": \"example-org/demo\",\n      \"run_id\": \"run-contract-01\",\n      \"source_revision\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n      \"steps\": [],\n      \"updated_at\": \"2026-01-01T00:00:00+00:00\",\n      \"work_id\": \"work-contract-01\",\n      \"workspace_root\": \"/fixture/workspaces/pr-ordering\"\n    }\n  ]\n}",
+      "captured_registry_raw_sha256": "52566d19dcd22198b2dc672be1e9d5686ae4843ea1963dcd007ca06f492d3748",
+      "current_full_registry_file_utf8_at_append": "{\n  \"jobs\": [],\n  \"legacy_records\": {\n    \"jobs\": [],\n    \"seq\": 0,\n    \"slices\": [],\n    \"source_schema_version\": 1\n  },\n  \"schema_version\": 2,\n  \"seq\": 1,\n  \"slices\": [],\n  \"workflows\": [\n    {\n      \"attempts\": {},\n      \"claim_key\": \"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\n      \"combo\": \"fixture\",\n      \"created_at\": \"2026-01-01T00:00:00+00:00\",\n      \"current_phase\": \"claim\",\n      \"evidence_refs\": [],\n      \"facets\": [],\n      \"gate_status\": \"pending\",\n      \"issue_refs\": [],\n      \"openspec_refs\": [],\n      \"pr_refs\": [],\n      \"publication_receipts\": [],\n      \"repo\": \"example-org/demo\",\n      \"run_id\": \"run-contract-01\",\n      \"source_revision\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n      \"steps\": [],\n      \"updated_at\": \"2026-01-01T00:00:00+00:00\",\n      \"work_id\": \"work-contract-01\",\n      \"workspace_root\": \"/fixture/workspaces/pr-ordering\"\n    }\n  ]\n}",
+      "current_registry_raw_sha256_at_append": "bb243481df3814b8b6369d6f2a940fb0fb82182570b004e923b7b9a1124563f2",
+      "expected": {
+        "held_revision_replaced": false,
+        "outcome": "conflict",
+        "persist_attempts": 0,
+        "reason": "stale-full-registry-raw-byte-revision",
+        "receipt_appended": false
+      },
+      "held_expected_revision_passed_to_#993_append": "52566d19dcd22198b2dc672be1e9d5686ae4843ea1963dcd007ca06f492d3748",
+      "id": "stale-full-registry-revision-fails-append-without-rebase",
+      "trace": [
+        "capture-full-registry-raw-byte-revision-before-first-metadata-write",
+        "verify-and-hold-run-claim-authority-binding",
+        "write-intent-and-resolve-delivery-journal-under-separate-#983-revision",
+        "POST-and-confirm-witness-then-GET-equality",
+        "registry-file-changes-before-receipt-append",
+        "#993-append-rejects-stale-held-revision-without-reread-or-rebase"
+      ]
+    },
+    {
+      "captured_full_registry_file_utf8": "{\n  \"jobs\": [],\n  \"legacy_records\": {\n    \"jobs\": [],\n    \"seq\": 0,\n    \"slices\": [],\n    \"source_schema_version\": 1\n  },\n  \"schema_version\": 2,\n  \"seq\": 0,\n  \"slices\": [],\n  \"workflows\": [\n    {\n      \"attempts\": {},\n      \"claim_key\": \"claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae\",\n      \"combo\": \"fixture\",\n      \"created_at\": \"2026-01-01T00:00:00+00:00\",\n      \"current_phase\": \"claim\",\n      \"evidence_refs\": [],\n      \"facets\": [],\n      \"gate_status\": \"pending\",\n      \"issue_refs\": [],\n      \"openspec_refs\": [],\n      \"pr_refs\": [],\n      \"publication_receipts\": [],\n      \"repo\": \"example-org/demo\",\n      \"run_id\": \"run-contract-01\",\n      \"source_revision\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n      \"steps\": [],\n      \"updated_at\": \"2026-01-01T00:00:00+00:00\",\n      \"work_id\": \"work-contract-01\",\n      \"workspace_root\": \"/fixture/workspaces/pr-ordering\"\n    }\n  ]\n}",
+      "captured_registry_raw_sha256": "52566d19dcd22198b2dc672be1e9d5686ae4843ea1963dcd007ca06f492d3748",
+      "expected": {
+        "eligible_for_receipt": false,
+        "first_metadata_write": false,
+        "reason": "verified-run-claim-binding-changed",
+        "registry_revision_reread_or_replaced": false
+      },
+      "id": "changed-run-claim-binding-fails-before-first-metadata-write",
+      "producer_verified_binding": {
+        "claim_key": "claim:v1:9999999999999999999999999999999999999999999999999999999999999999",
+        "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "repo": "example-org/demo",
+        "run_id": "run-contract-01",
+        "work_id": "work-contract-01"
+      },
+      "registry_workflow_row_binding": {
+        "claim_key": "claim:v1:eed11660467944696df92a27a9cec69fc8f2020b25237890206893f483664eae",
+        "pre_publication_authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "repo": "example-org/demo",
+        "run_id": "run-contract-01",
+        "work_id": "work-contract-01"
+      },
+      "trace": [
+        "capture-full-registry-raw-byte-revision",
+        "compare-verified-run-claim-authority-binding-to-captured-registry-row",
+        "binding-mismatch-fails-before-first-metadata-write"
       ]
     },
     {
