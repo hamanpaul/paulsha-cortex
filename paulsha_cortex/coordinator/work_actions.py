@@ -2530,6 +2530,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
             workspace_root=Path(str(run.workspace_root)),
             candidate=run.candidate_head,
             change=change,
+            required=True,
         )
         if archive_entries:
             warnings.append(

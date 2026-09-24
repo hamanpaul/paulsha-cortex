@@ -736,6 +736,7 @@ def test_retry_build_ignores_dirty_worktree_when_exact_candidate_tree_is_clean(
 @pytest.mark.parametrize("combo", ("fix-standard", "feature-oneshot"))
 def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_shape(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     combo: str,
 ) -> None:
     repo, candidate = _repo(
@@ -743,13 +744,11 @@ def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_
         active_change=True,
         archived_change=False,
     )
-    bad_workspace = tmp_path / "not-a-git-repo"
-    bad_workspace.mkdir()
     snapshot = _snapshot(tmp_path / "snapshot.json")
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     run = _create_fix_standard_run(
         registry=registry,
-        repo_root=bad_workspace,
+        repo_root=repo,
         snapshot=snapshot,
         candidate=candidate,
         combo=combo,
@@ -760,14 +759,24 @@ def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_
         step.phase == "ship" and step.card == "openspec-archive"
         for step in run.steps
     ) is (combo == "feature-oneshot")
-    _record_manager_ship_job(
-        registry=registry,
-        state_root=tmp_path / "state",
-        run=run,
-        repo=repo,
-        card="openspec-archive",
-        subject_head=candidate,
-    )
+    candidate_tree_calls: list[tuple[str, bool]] = []
+    active_pathspec = f"openspec/changes/{WORK_ID}/"
+
+    def fake_candidate_tree_paths(
+        *, workspace_root: Path, candidate: str, pathspec: str, required: bool = True
+    ) -> tuple[str, ...]:
+        candidate_tree_calls.append((pathspec, required))
+        assert workspace_root == repo
+        assert candidate == run.candidate_head
+        if pathspec == active_pathspec:
+            return (f"openspec/changes/{WORK_ID}/proposal.md",)
+        if pathspec == "openspec/changes/archive/":
+            if required:
+                raise RuntimeError("retry-build exact candidate tree inspection failed")
+            return ()
+        raise AssertionError(f"unexpected pathspec {pathspec}")
+
+    monkeypatch.setattr(work_actions, "_candidate_tree_paths", fake_candidate_tree_paths)
     reset_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     original_reset = registry._manager_reset_workflow_for_retry_build
 
@@ -793,6 +802,10 @@ def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_
             workflow_registry=registry,
         )
     assert reset_calls == []
+    assert candidate_tree_calls == [
+        (active_pathspec, True),
+        ("openspec/changes/archive/", True),
+    ]
 
 
 @pytest.mark.parametrize("stream", ("stdout", "stderr"))
