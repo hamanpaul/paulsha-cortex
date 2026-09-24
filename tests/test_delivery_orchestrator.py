@@ -551,7 +551,11 @@ def test_ship_orchestrator_rejects_truly_late_non_adopted_copilot_review(
         def commit_merge(self, **kwargs):
             raise AssertionError("stale request must not reach GitHub")
 
-    copilot = replace(_copilot_decision(), submitted_at_epoch=1_001.0)
+    copilot = replace(
+        _copilot_decision(),
+        submitted_at_epoch=1_001.0,
+        observed_at_epoch=1_001.0,
+    )
     with pytest.raises(RuntimeError, match="Copilot review epoch has not passed"):
         ShipOrchestrator(github=GitHub(), now=lambda: 1_001.0).merge_if_ready(
             repo="acme/demo",
