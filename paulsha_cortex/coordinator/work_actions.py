@@ -1974,6 +1974,11 @@ def _maybe_record_copilot_timeout_rearm_permit(
         return
     if old_head == candidate_head:
         if active.get("copilot_review_rearm_permit") is not None:
+            _invalidate_copilot_rearm_permit(
+                active=active,
+                state=state,
+                state_path=state_path,
+            )
             raise RuntimeError("copilot timeout rearm permit is stale")
         return
     binding = active.get("delivery_binding")
@@ -2008,6 +2013,11 @@ def _maybe_record_copilot_timeout_rearm_permit(
         and existing["requested_by"] == desired["requested_by"]
     )
     if not same_tuple:
+        _invalidate_copilot_rearm_permit(
+            active=active,
+            state=state,
+            state_path=state_path,
+        )
         raise RuntimeError("copilot timeout rearm permit conflicts with current state")
 
 
@@ -5957,8 +5967,18 @@ def _ship_action(
             or permit["delivery_binding_hash"] != _delivery_binding_hash(binding)
             or permit["history_prefix_hash"] != _delivery_review_history_hash(active)
         ):
+            _invalidate_copilot_rearm_permit(
+                active=active,
+                state=state,
+                state_path=state_path,
+            )
             raise RuntimeError("persisted copilot timeout rearm permit conflicts with current state")
         if permit["old_head"] == current_head:
+            _invalidate_copilot_rearm_permit(
+                active=active,
+                state=state,
+                state_path=state_path,
+            )
             raise RuntimeError("copilot timeout rearm permit no longer targets a new HEAD")
         rearm_permit = permit
 
@@ -6307,6 +6327,13 @@ def _ship_action(
     if not isinstance(fix_rounds, int) or isinstance(fix_rounds, bool) or fix_rounds < 0:
         raise ValueError("ship fix round state malformed")
     if maintainer_recovery or args.get("maintainer_review_path") is not None:
+        if (
+            ship is not None
+            and ship.get("phase") == "needs_human"
+            and ship.get("reason") == "copilot-review-timeout"
+            and ship.get("head") != preflight.head
+        ):
+            raise RuntimeError("copilot timeout rearm requires exact-HEAD Copilot review")
         return _ship_with_maintainer_review(
             args=args,
             active=active,
