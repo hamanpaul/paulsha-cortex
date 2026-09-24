@@ -1,1 +1,1 @@
-新增 #1020 準時提交、晚觀測的 Copilot review 規劃三件套與唯一 work item；產品實作另行驗收。
+#1020 Copilot review 提交時間逾時修正：`ReviewLoop` 保留通過驗證的 submission/observation epochs，`ShipOrchestrator` 在 merge admission 依原 observation 視窗 fail-closed 重驗 request-bound submission evidence，避免晚於已觀測 review 的竄改時間戳誤過關；既有 adopted review 仍沿用 `adopted_at` 視窗判 timeout，但 submission evidence 同樣必須保留且通過重驗，merge 授權前的 current thread／checks／mergeability 等 final gate 行為維持不變。
