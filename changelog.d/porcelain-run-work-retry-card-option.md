@@ -1,0 +1,1 @@
+**#1030 retry-card porcelain 規劃（docs-only）**：加入 accepted spec、design 與 todo，將 `--card` 的 action 限制、request mapping、`--payload` 相容性及未來 help／README／測試驗收收斂為單一 work item。本次未改 CLI、測試或 Manager；issue 保持 open，WorkAuthority 尚未註冊。
