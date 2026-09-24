@@ -2739,6 +2739,58 @@ def _retry_card_model_chain_override(
     return override
 
 
+def _candidate_tree_paths(
+    *, workspace_root: Path, candidate: str, pathspec: str
+) -> tuple[str, ...]:
+    listed = subprocess.run(
+        [
+            "git", "-C", str(workspace_root), "ls-tree", "-r", "--name-only", "-z",
+            candidate, "--", pathspec,
+        ],
+        shell=False,
+        capture_output=True,
+    )
+    if listed.returncode != 0:
+        raise RuntimeError("retry-build exact candidate tree inspection failed")
+    try:
+        return tuple(
+            value.decode("utf-8")
+            for value in listed.stdout.split(b"\0")
+            if value
+        )
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("retry-build exact candidate tree inspection failed") from exc
+
+
+def _candidate_tree_matching_archive_entries(
+    *,
+    workspace_root: Path,
+    candidate: str,
+    change: str,
+) -> tuple[str, ...]:
+    active_paths = _candidate_tree_paths(
+        workspace_root=workspace_root,
+        candidate=candidate,
+        pathspec=f"openspec/changes/{change}/",
+    )
+    archive_paths = _candidate_tree_paths(
+        workspace_root=workspace_root,
+        candidate=candidate,
+        pathspec="openspec/changes/archive/",
+    )
+    if not active_paths:
+        return ()
+    suffix = f"-{change}"
+    entries = {
+        parts[3]
+        for parts in (PurePosixPath(path).parts for path in archive_paths)
+        if len(parts) > 4
+        and parts[:3] == ("openspec", "changes", "archive")
+        and (parts[3] == change or parts[3].endswith(suffix))
+    }
+    return tuple(sorted(entries))
+
+
 def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None) -> dict[str, Any]:
     """Reopen the final builder card with exact-Candidate CAS after a human stop."""
 
@@ -2782,13 +2834,32 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         raise RuntimeError("retry-build requires build/verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
-    retry_classification = _classify_retry(run, workflow_registry)
-    archive_applied = any(
-        step.phase == "ship"
-        and step.card == "openspec-archive"
-        and step.gate_result == "passed"
-        for step in run.steps
+    from . import manager
+
+    archive_applied = manager._manager_archive_applied(
+        run,
+        registry=workflow_registry,
     )
+    warnings: list[dict[str, object]] = []
+    if len(authority.mapped_openspec) == 1:
+        change = authority.mapped_openspec[0]
+        archive_entries = _candidate_tree_matching_archive_entries(
+            workspace_root=Path(str(run.workspace_root)),
+            candidate=run.candidate_head,
+            change=change,
+        )
+        if archive_entries:
+            warnings.append(
+                {
+                    "change": change,
+                    "archive_entries": list(archive_entries),
+                    "message": (
+                        "exact Candidate tree contains both the active OpenSpec change and its "
+                        "official archive entry; fix the coexistence before the next review"
+                    ),
+                }
+            )
+    retry_classification = _classify_retry(run, workflow_registry)
     if run.current_phase == "build":
         repair_action = (
             "Recover the exact Candidate after a builder terminalization failure. Preserve all "
@@ -2803,7 +2874,10 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
             "Inspect any existing worktree repair commits. Preserve the Manager-owned official "
             "OpenSpec archive and fix only real Candidate failures identified by the current "
             "verification/review evidence. Do not recreate the active change or claim merge, issue "
-            "closure, or done. Commit or adopt a tested descendant Candidate."
+            "closure, or done. If the Candidate already contains a re-created active change "
+            "directory for the archived change under openspec/changes/ (outside "
+            "openspec/changes/archive/), delete it and keep only the official archive. "
+            "Commit or adopt a tested descendant Candidate."
         )
     else:
         repair_action = (
@@ -2834,6 +2908,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         "adjudication": operator_adjudication_receipt(adjudication_evidence, card="subagent-build"),
         "reason": "candidate-repair-dispatched",
         "expected_candidate": expected_candidate.lower(),
+        "warnings": warnings,
         "run": updated.to_dict(),
         "retry_classification": retry_classification,
     }

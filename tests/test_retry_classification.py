@@ -112,7 +112,7 @@ def _init_repo(root: Path, repo: str = "acme/demo") -> Path:
     return root
 
 
-def _snapshot(path: Path) -> Path:
+def _snapshot(path: Path, *, mapped_openspec: tuple[str, ...] = ("demo",)) -> Path:
     _init_repo(path.parent)
     path.write_text(
         json.dumps(
@@ -132,11 +132,12 @@ def _snapshot(path: Path) -> Path:
                         "work_id": "demo",
                         "mapped_issues": [12],
                         "mapped_prs": [8],
-                        "mapped_openspec": ["demo"],
+                        "mapped_openspec": list(mapped_openspec),
                         "mapped_todo_paths": ["docs/todo.md"],
                         "confirmed_todo": True,
                         "auto_label": True,
-                        "source_revisions": ["issue:12@open", "openspec:demo@1"],
+                        "source_revisions": ["issue:12@open"]
+                        + [f"openspec:{change}@1" for change in mapped_openspec],
                     }
                 ],
             }
@@ -293,7 +294,7 @@ def test_classification_ignores_build_attempt_generation_count(tmp_path: Path) -
 def test_retry_build_result_carries_orchestrator_retry_for_unbound_terminalization(
     tmp_path: Path,
 ) -> None:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(tmp_path / "snapshot.json", mapped_openspec=())
     authority = work_actions.load_work_authority(
         repo="acme/demo", work_id="demo", snapshot_path=snapshot
     )
@@ -362,7 +363,7 @@ def test_retry_build_result_carries_orchestrator_retry_for_unbound_terminalizati
 def test_retry_build_result_carries_model_repair_after_review_needs_human(
     tmp_path: Path,
 ) -> None:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(tmp_path / "snapshot.json", mapped_openspec=())
     authority = work_actions.load_work_authority(
         repo="acme/demo", work_id="demo", snapshot_path=snapshot
     )

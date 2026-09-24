@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **#885 fix-standard-archive-step-evidence**：fix-standard 現在可用唯一 Manager `openspec-archive`
+  job 加 Git ancestry 判定 archive-applied；`retry-build` 會按 exact Candidate Git tree 偵測
+  active/archive 並存並回報 warning，Git tree 無法檢查時不派工；ship/local-closeout 對
+  `openspec archive` Aborted、未搬移 active change 與 post-archive 並存一律 fail-closed。
 - **#1030 retry-card porcelain selector**：`cortex run work retry-card` 新增 retry-card 專用 `--card`，避免 payload 靜默覆寫明示 selector，並保留 payload-only workaround；不改 Manager retry contract。
 - **#1029 self-publication receipt v1 契約**：凍結經 #992／#993／#994／#979／#980 範圍審查對齊的 exact wire appendix、可重算 golden vectors 與決策紀錄；未實作或啟用 receipt。
 - **#1030 retry-card porcelain 規劃（PR #1034，docs-only）**：新增 accepted spec／design／todo，界定 `--card` action 限制、request mapping、payload 相容與後續 help／README／測試驗收。

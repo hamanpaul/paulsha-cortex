@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Mapping
 from uuid import uuid4
 
@@ -977,14 +977,46 @@ def _manager_ship_workspace(
     return created
 
 
-def _manager_archive_applied(run) -> bool:
+def _matching_archive_entries(root: Path, *, change: str) -> tuple[str, ...]:
+    archive_root = root / "openspec" / "changes" / "archive"
+    if archive_root.is_symlink() or not archive_root.is_dir():
+        return ()
+    suffix = f"-{change}"
+    matches = [
+        entry.name
+        for entry in archive_root.iterdir()
+        if not entry.is_symlink()
+        and entry.is_dir()
+        and (entry.name == change or entry.name.endswith(suffix))
+    ]
+    return tuple(sorted(matches))
+
+
+def _path_exists_or_is_symlink(path: Path) -> bool:
+    try:
+        return path.exists() or path.is_symlink()
+    except OSError as exc:  # pragma: no cover - fail-closed filesystem guard
+        raise RuntimeError("active OpenSpec change path inspection failed") from exc
+
+
+def _changed_contains_archive_relocation(changed: set[str], *, change: str) -> bool:
+    suffix = f"-{change}"
+    return any(
+        len(parts) > 4
+        and parts[:3] == ("openspec", "changes", "archive")
+        and (parts[3] == change or parts[3].endswith(suffix))
+        for parts in (PurePosixPath(path).parts for path in changed)
+    )
+
+
+def _manager_archive_applied(run, *, registry=None) -> bool:
     # 對齊 manager._manager_archive_applied 的語意：必須「恰好一筆」passed 的
     # openspec-archive step 才算已完成；crash/retry 造成的多筆 passed step 視為
     # 尚未完成（fail-closed），不得靠第二套判定漂移出不同結論。單一真實實作放在
     # manager，這裡改為委派而非重寫一份，避免兩處各自演化。
     from . import manager
 
-    return manager._manager_archive_applied(run)
+    return manager._manager_archive_applied(run, registry=registry)
 
 
 def _push_exact_candidate(
@@ -1339,7 +1371,13 @@ def _commit_archive_and_require_reverification(
         for value in tracked.stdout.split(b"\0") + untracked.stdout.split(b"\0")
         if value
     }
-    if not changed or any(not _archive_path_allowed(path, change=change) for path in changed):
+    active_change = worktree / "openspec" / "changes" / change
+    if _path_exists_or_is_symlink(active_change) or not _changed_contains_archive_relocation(
+        changed,
+        change=change,
+    ):
+        raise RuntimeError("official OpenSpec archive relocation missing")
+    if any(not _archive_path_allowed(path, change=change) for path in changed):
         raise RuntimeError("archive diff escaped strict OpenSpec/docs/changelog allowlist")
     added = subprocess.run(
         ["git", "-C", str(worktree), "add", "-A", "--", *sorted(changed)],
@@ -1917,7 +1955,16 @@ def build_production_ship_validator(
         )
         change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
         active_change = worktree / "openspec" / "changes" / str(change) if change else None
-        if active_change is not None and active_change.is_dir() and not _manager_archive_applied(run):
+        archive_applied = _manager_archive_applied(run, registry=registry)
+        active_change_present = (
+            _path_exists_or_is_symlink(active_change) if active_change is not None else False
+        )
+        if active_change_present and archive_applied:
+            if _matching_archive_entries(worktree, change=str(change)):
+                raise RuntimeError(
+                    "post-archive candidate re-created active OpenSpec change alongside its official archive"
+                )
+        if active_change_present and not archive_applied:
             from . import work_actions
 
             validate_ship_stage_transition("local-closeout", "pr-preflight")
@@ -1942,6 +1989,12 @@ def build_production_ship_validator(
             )
             if getattr(archived, "returncode", None) != 0:
                 raise RuntimeError("official OpenSpec archive failed")
+            output = (
+                f"{getattr(archived, 'stdout', '') or ''}"
+                f"{getattr(archived, 'stderr', '') or ''}"
+            )
+            if "Aborted" in output:
+                raise RuntimeError("official OpenSpec archive aborted: no files were changed")
             reset = _commit_archive_and_require_reverification(
                 registry=registry,
                 state_root=state_root,
