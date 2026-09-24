@@ -5,7 +5,7 @@
 ## 範圍與基準
 
 - 原始盤點以 `main` 的 `7fa4716b` 與 97 張 open issue 為基準，含總帳 #868。逐票 triage 覆蓋其餘 96 張；其中 25 張不在 #868 原 137 張分類表內。2026-09-23 14:51 UTC 最新合併的修復 PR 為 #984，`main` 是 `e74750dd`，`VERSION` 仍為 `0.1.10`；版本 `0.1.11` 尚未建立。
-- 盤點後建立 #961–#973、#975–#980、#982–#983、#987–#990、#992–#994、#995–#997、#999–#1005、#1006–#1017 共 50 張 issue，分解 #887／#847／#818／#547／#943 的 Red 規模；它們不在原始 97 張之內。#974／#981 是已合併規劃 PR，#984 是已合併的 preflight 環境修復 PR；#985 是待合併的第三批規劃 PR，#986／#991／#998 是產品 PR，皆不是 issue。父票維持 open，完整 aggregate acceptance 不因拆票縮減。
+- 盤點後建立 #961–#973、#975–#980、#982–#983、#987–#990、#992–#994、#995–#997、#999–#1005、#1006–#1017 共 50 張 issue，分解 #887／#847／#818／#547／#943 的 Red 規模；它們不在原始 97 張之內。後續另開 #1020 記錄 Copilot review 準時提交、Manager 晚觀測卻誤判 timeout 的獨立缺口，不併入 #871。#974／#981 是已合併規劃 PR，#984 是已合併的 preflight 環境修復 PR；#985 是待合併的第三批規劃 PR，#986／#991／#998 是產品 PR，皆不是 issue。父票維持 open，完整 aggregate acceptance 不因拆票縮減。
 - 交付前置：#862 的 run `workflow-9dc654fef3850cc68deb` 與 PR #954。只有 PR merge、issue closed、run 合法收尾且後續原語可用，才解除 #818/#481 等依賴。#497 的其他 B/C/D 交付不由 #862 冒稱完成。
 - 原始 14 張定版票、18 張可並行後續票、61 張 deferred 票、#564/#807 兩張待重新核對的關票候選，加上 #862 與 #868，共 97 張。新建的 50 張 issue 承接五張 Red 父票與其必要前置，不重複計入原始分類。這是排程分類，不變更 issue label 或關票狀態。
 
@@ -16,7 +16,7 @@
 | Ship/closure | #987 → #988 → #989 → #990（父票 #972）→ #973 的真 merge／D gates 切片（父票 #943）→ #885 → #810 | #987–#990 分別固定 main probe、typed C/M、recovery action、durable Manager context；#972 四票與整合驗收完成前不解除 #973 前置。#973 的完整 8/Red 範圍由 #1006–#1017 承接，其中 #1016/#1017 維持 Red aggregate；產品與整合驗收仍待閉合。真 Git 合併、雙方 CHANGELOG 條目、D 的 exact-head CI 與 merge/closure 分階段驗收。 |
 | Authority | #992 → #993、#994；#979 等 #992+#993，#982 等 #992+#994，#980 等 #992–#994+#982+#983；#978 aggregate 後接 #964 → #965（父票 #847）；#961 → #975 → #976 → #977（父票 #962／#887） | #978 保持 Red umbrella，直到 schema/store/read-back 與 #979/#980 producers 全部驗收；#993 額外等 #966 全檔 CAS，不能以 #862 slice CAS 取代。#977 另等 #995 唯讀 closure inspection、#996 CompletionRecord 條件建立與 #997 Outbox CAS 合併，並需 #975 凍結完整 proof consumer shape；#847 AC10 loaded-runtime canary 保持獨立 gate。 |
 | State integrity | #862 → #966 → #967（父票 #818）→ #481；#479 → #968 → #969 → #970 → #971（父票 #547） | #968 A1 與 #547 AC7 的 #999–#1005 已拆為無循環子票；#862 owner contract acceptance、#969 marker 與跨 UID proof 仍是前置，#547 保持 open。重疊的 registry／Manager recovery 修改由單一 owner 串行。 |
-| Recovery/UI | #956、#874、#812、#871；#803 → #579 | #579 job900 的 19 項 pytest 失敗均在 Claude review sandbox 的 `setfacl -R`；同候選 Manager full-suite ledger 為綠但 verifier 未採信。#803 的 exact-candidate ledger consumer 或經驗證的 ACL-capable disposable 測試環境是重新驗證前置；其他票依重疊模組錯開 merge，皆以正式 action 的可達性與錯誤終態驗收。 |
+| Recovery/UI | #956、#874、#812、#871；#803 → #579；#1020 獨立處理 review 晚觀測 | #579 job900 的 19 項 pytest 失敗均在 Claude review sandbox 的 `setfacl -R`；同候選 Manager full-suite ledger 為綠但 verifier 未採信。#803 的 exact-candidate ledger consumer 或經驗證的 ACL-capable disposable 測試環境是重新驗證前置；#1020 只修正準時提交的 exact-HEAD review 被晚輪詢誤判 timeout，不解除 #871 既有的 mergeable／CI gate。其他票依重疊模組錯開 merge，皆以正式 action 的可達性與錯誤終態驗收。 |
 
 實作可使用 Copilot `gpt-5.4`（較大修改）、Codex `gpt-6-luna(max)`（較窄修改），或使用者確認的 agy `gemini-3.8-flash-high`；`gpt-6-sol` 做獨立對抗審查。agy Builder fallback 曾出現無 terminal envelope 的失敗（#928／#945），派工前須核對目前 runtime 健康，不能將 job exit 0 當作完成。每票使用獨立 worktree、唯一 work item 與 run owner；merge 前重新檢查 exact PR head 和 review threads。並行數量以實際資源與重疊模組風險調度。
 
