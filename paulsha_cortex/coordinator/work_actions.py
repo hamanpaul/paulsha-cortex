@@ -2420,7 +2420,7 @@ def _retry_card_model_chain_override(
 
 
 def _candidate_tree_paths(
-    *, workspace_root: Path, candidate: str, pathspec: str, required: bool = True
+    *, workspace_root: Path, candidate: str, pathspec: str
 ) -> tuple[str, ...]:
     listed = subprocess.run(
         [
@@ -2431,9 +2431,7 @@ def _candidate_tree_paths(
         capture_output=True,
     )
     if listed.returncode != 0:
-        if required:
-            raise RuntimeError("retry-build exact candidate tree inspection failed")
-        return ()
+        raise RuntimeError("retry-build exact candidate tree inspection failed")
     try:
         return tuple(
             value.decode("utf-8")
@@ -2441,19 +2439,16 @@ def _candidate_tree_paths(
             if value
         )
     except UnicodeDecodeError as exc:
-        if required:
-            raise RuntimeError("retry-build exact candidate tree inspection failed") from exc
-        return ()
+        raise RuntimeError("retry-build exact candidate tree inspection failed") from exc
 
 
 def _candidate_tree_matching_archive_entries(
-    *, workspace_root: Path, candidate: str, change: str, required: bool = True
+    *, workspace_root: Path, candidate: str, change: str
 ) -> tuple[str, ...]:
     active_paths = _candidate_tree_paths(
         workspace_root=workspace_root,
         candidate=candidate,
         pathspec=f"openspec/changes/{change}/",
-        required=True,
     )
     if not active_paths:
         return ()
@@ -2461,7 +2456,6 @@ def _candidate_tree_matching_archive_entries(
         workspace_root=workspace_root,
         candidate=candidate,
         pathspec="openspec/changes/archive/",
-        required=True,
     )
     suffix = f"-{change}"
     entries = {
