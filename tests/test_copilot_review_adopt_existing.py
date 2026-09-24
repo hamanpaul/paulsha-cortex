@@ -204,9 +204,11 @@ class FakeShipOrchestrator:
         self._github = github
         self._now = now
         self.calls: list[str] = []
+        self.merge_kwargs: list[dict[str, Any]] = []
 
     def merge_if_ready(self, **kwargs):
         self.calls.append("merge-if-ready")
+        self.merge_kwargs.append(kwargs)
         self._github.merged = True
         return SimpleNamespace(
             expected_head=kwargs["expected_head"],
@@ -546,7 +548,13 @@ def test_request_bound_copilot_review_submitted_before_deadline_survives_late_ob
     assert ship_state.get("requested_at_epoch") == requested_at
     assert "adopted_review_id" not in ship_state
     assert orch_holder
-    assert any("merge-if-ready" in orchestrator.calls for orchestrator in orch_holder)
+    merge_orchestrator = next(
+        orchestrator for orchestrator in orch_holder if "merge-if-ready" in orchestrator.calls
+    )
+    assert merge_orchestrator.merge_kwargs
+    copilot = merge_orchestrator.merge_kwargs[-1]["copilot"]
+    assert copilot.submitted_at_epoch == 1162.0
+    assert copilot.observed_at_epoch == 1944.0
 
 
 def test_persisted_copilot_needs_human_stop_returns_list_shaped_next_actions(
