@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 COPILOT_REVIEWER_LOGIN = "copilot-pull-request-reviewer[bot]"
+REVIEW_TIMEOUT_SECONDS = 15 * 60
 _SHIP_CAPABILITY = object()
 COPILOT_ERROR_MARKERS = (
     "encountered an error",
@@ -91,6 +92,7 @@ class DeliveryPolicy:
     copilot_review_id: int | None = None
     copilot_requested_at_epoch: float | None = None
     review_kind: str = "copilot"
+    copilot_adopted_at_epoch: float | None = None
 
 
 @dataclass(frozen=True)
@@ -141,14 +143,36 @@ def evaluate_delivery_gate(*, facts: DeliveryFacts, policy: DeliveryPolicy) -> G
             reasons.append("copilot-review-policy-invalid")
             current_reviews = ()
         else:
-            current_reviews = tuple(
-                review
-                for review in facts.copilot_reviews
-                if review.commit_id == policy.expected_head
-                and review.review_id == policy.copilot_review_id
-                and review.author == COPILOT_REVIEWER_LOGIN
-                and review.submitted_at_epoch >= policy.copilot_requested_at_epoch
-            )
+            try:
+                requested_at = float(policy.copilot_requested_at_epoch)
+                timeout_base = (
+                    float(policy.copilot_adopted_at_epoch)
+                    if policy.copilot_adopted_at_epoch is not None
+                    else requested_at
+                )
+            except (TypeError, ValueError, OverflowError):
+                requested_at = float("nan")
+                timeout_base = float("nan")
+            if (
+                not math.isfinite(requested_at)
+                or not math.isfinite(timeout_base)
+                or timeout_base < requested_at
+            ):
+                reasons.append("copilot-review-policy-invalid")
+                current_reviews = ()
+            else:
+                review_deadline = timeout_base + REVIEW_TIMEOUT_SECONDS
+                current_reviews = tuple(
+                    review
+                    for review in facts.copilot_reviews
+                    if review.commit_id == policy.expected_head
+                    and review.review_id == policy.copilot_review_id
+                    and review.author == COPILOT_REVIEWER_LOGIN
+                    and isinstance(review.submitted_at_epoch, (int, float))
+                    and not isinstance(review.submitted_at_epoch, bool)
+                    and math.isfinite(review.submitted_at_epoch)
+                    and requested_at <= review.submitted_at_epoch <= review_deadline
+                )
         if not current_reviews:
             reasons.append("copilot-current-head-review-missing")
         elif any(review.is_error for review in current_reviews):

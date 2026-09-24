@@ -6209,6 +6209,7 @@ def _ship_action(
             required_closing_issues=authority.mapped_issues,
             copilot_review_id=copilot.review_id,
             copilot_requested_at_epoch=copilot.loop.requested_at,
+            copilot_adopted_at_epoch=copilot.loop.adopted_at,
         ),
     )
     if not remote_gate.allowed:

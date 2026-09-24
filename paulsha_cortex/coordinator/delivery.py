@@ -22,6 +22,7 @@ from .github_delivery import (
     GateResult,
     GitHubDeliveryClient,
     RemoteClosureFacts,
+    REVIEW_TIMEOUT_SECONDS,
     evaluate_remote_closure,
     _SHIP_CAPABILITY,
 )
@@ -33,7 +34,6 @@ CONVENTIONAL_ZH_TW_TITLE_RE = re.compile(
     r"^(?:feat|fix|docs|test|chore|refactor|perf|build|ci)(?:\([a-z0-9._/-]+\))?!?:\s+.*[\u3400-\u9fff]"
 )
 CLOSING_RE_TEMPLATE = r"(?im)^\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#{issue}\b"
-REVIEW_TIMEOUT_SECONDS = 15 * 60
 # band 未掛（None）時的向後相容預設值（#222 H.2 fail-soft 既定行為，不得因本次
 # band 參數化而改變既有沒有 sizing_band 的 work item 的既定上限）。
 MAX_FIX_ROUNDS = 2
@@ -601,6 +601,7 @@ class ShipOrchestrator:
             required_closing_issues=authority.mapped_issues,
             copilot_review_id=copilot.review_id if copilot is not None else None,
             copilot_requested_at_epoch=(float(requested_at) if copilot is not None else None),
+            copilot_adopted_at_epoch=(adopted_at if copilot is not None else None),
             review_kind=review_kind,
         )
         # The exact-candidate final verdict must be evaluated and already

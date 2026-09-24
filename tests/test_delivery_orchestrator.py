@@ -514,6 +514,7 @@ def test_ship_orchestrator_accepts_recently_adopted_exact_head_copilot_review(
     assert result.expected_head == HEAD1
     assert github.policy.copilot_review_id == 88
     assert github.policy.copilot_requested_at_epoch == 1_000.0
+    assert github.policy.copilot_adopted_at_epoch == 3_400.0
 
 
 def test_ship_orchestrator_blocks_stale_provider_or_non_exact_preflight(tmp_path: Path) -> None:
