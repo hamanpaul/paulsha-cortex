@@ -1309,6 +1309,7 @@ def _settle_recovery_dispatch_failure(
     launch_job_id: str | None,
     exc: Exception,
 ) -> None:
+    restored = False
     if repinned:
         try:
             restored = _restore_recovery_slice(
@@ -1348,6 +1349,15 @@ def _settle_recovery_dispatch_failure(
             type(action_exc).__name__,
             action_exc,
         )
+        return
+    logger.info(
+        "recovery dispatch failure settled",
+        extra={
+            "slice_id": slice_id,
+            "restored": restored,
+            "error_summary": f"{type(exc).__name__}: {exc}",
+        },
+    )
 
 
 def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dict:

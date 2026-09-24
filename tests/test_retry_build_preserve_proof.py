@@ -364,7 +364,9 @@ def _new_jobs(registry: JobRegistry, *, existing_ids: set[str]) -> list[dict[str
     return [job for job in registry.list_jobs() if job["job_id"] not in existing_ids]
 
 
-def test_retry_build_worktree_failure_preserves_existing_proof(tmp_path: Path) -> None:
+def test_retry_build_worktree_failure_preserves_existing_proof(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     repo_root = tmp_path / "repo"
     make_fake_repo(repo_root)
     registry = JobRegistry(state_path=tmp_path / "runtime" / "coordinator" / "jobs.json")
@@ -381,17 +383,18 @@ def test_retry_build_worktree_failure_preserves_existing_proof(tmp_path: Path) -
     dispatcher = Dispatcher(registry, pane_sender=None, worktree_creator=worktree_creator, git_runner=_git_runner)
     launcher = _RecordingLauncher()
 
-    with pytest.raises(autonomy.DispatchReadyError):
-        manager.apply_slice_action(
-            dispatcher,
-            slice_id="slice-a",
-            action="retry-build",
-            actor="operator",
-            specs_dir=str(repo_root / "specs"),
-            handoff_dir=str(tmp_path / "handoff"),
-            launcher=launcher,
-            git_runner=_git_runner,
-        )
+    with caplog.at_level("INFO", logger=autonomy.__name__):
+        with pytest.raises(autonomy.DispatchReadyError):
+            manager.apply_slice_action(
+                dispatcher,
+                slice_id="slice-a",
+                action="retry-build",
+                actor="operator",
+                specs_dir=str(repo_root / "specs"),
+                handoff_dir=str(tmp_path / "handoff"),
+                launcher=launcher,
+                git_runner=_git_runner,
+            )
 
     restored = registry.get_slice("slice-a")
     assert restored["spec"]["hash"] == snapshot["spec_hash"]
@@ -400,6 +403,19 @@ def test_retry_build_worktree_failure_preserves_existing_proof(tmp_path: Path) -
     assert manager.allowed_slice_actions(registry, restored) == expected_actions
     assert worktree_creator.calls == [("feature/slice-a", "f" * 40, "slice-a")]
     assert launcher.calls == []
+    success_logs = [
+        record
+        for record in caplog.records
+        if record.name == autonomy.__name__
+        and record.getMessage() == "recovery dispatch failure settled"
+    ]
+    assert len(success_logs) == 1
+    assert success_logs[0].slice_id == "slice-a"
+    assert success_logs[0].restored is True
+    assert (
+        success_logs[0].error_summary
+        == "ValueError: existing worktree branch has commits outside requested base"
+    )
 
 
 @pytest.mark.parametrize(
