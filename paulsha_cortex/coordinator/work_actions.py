@@ -2443,20 +2443,24 @@ def _candidate_tree_paths(
 
 
 def _candidate_tree_matching_archive_entries(
-    *, workspace_root: Path, candidate: str, change: str
+    *,
+    workspace_root: Path,
+    candidate: str,
+    change: str,
+    inspect_archive_without_active: bool = False,
 ) -> tuple[str, ...]:
     active_paths = _candidate_tree_paths(
         workspace_root=workspace_root,
         candidate=candidate,
         pathspec=f"openspec/changes/{change}/",
     )
-    if not active_paths:
-        return ()
     archive_paths = _candidate_tree_paths(
         workspace_root=workspace_root,
         candidate=candidate,
         pathspec="openspec/changes/archive/",
-    )
+    ) if active_paths or inspect_archive_without_active else ()
+    if not active_paths:
+        return ()
     suffix = f"-{change}"
     entries = {
         parts[3]
@@ -2517,6 +2521,10 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         run,
         registry=workflow_registry,
     )
+    declared_archive_step = any(
+        step.phase == "ship" and step.card == "openspec-archive"
+        for step in run.steps
+    )
     warnings: list[dict[str, object]] = []
     if len(authority.mapped_openspec) == 1:
         change = authority.mapped_openspec[0]
@@ -2524,6 +2532,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
             workspace_root=Path(str(run.workspace_root)),
             candidate=run.candidate_head,
             change=change,
+            inspect_archive_without_active=declared_archive_step,
         )
         if archive_entries:
             warnings.append(

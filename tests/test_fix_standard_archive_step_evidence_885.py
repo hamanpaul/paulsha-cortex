@@ -734,14 +734,32 @@ def test_retry_build_ignores_dirty_worktree_when_exact_candidate_tree_is_clean(
 
 
 @pytest.mark.parametrize(
-    ("failing_pathspec", "expected_calls"),
+    (
+        "failing_pathspec",
+        "active_paths",
+        "inspect_archive_without_active",
+        "expected_calls",
+    ),
     (
         (
             f"openspec/changes/{WORK_ID}/",
+            (),
+            False,
             (f"openspec/changes/{WORK_ID}/",),
         ),
         (
             "openspec/changes/archive/",
+            (f"openspec/changes/{WORK_ID}/proposal.md",),
+            False,
+            (
+                f"openspec/changes/{WORK_ID}/",
+                "openspec/changes/archive/",
+            ),
+        ),
+        (
+            "openspec/changes/archive/",
+            (),
+            True,
             (
                 f"openspec/changes/{WORK_ID}/",
                 "openspec/changes/archive/",
@@ -753,6 +771,8 @@ def test_candidate_tree_matching_archive_entries_raises_on_tree_probe_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failing_pathspec: str,
+    active_paths: tuple[str, ...],
+    inspect_archive_without_active: bool,
     expected_calls: tuple[str, ...],
 ) -> None:
     repo, candidate = _repo(
@@ -773,7 +793,7 @@ def test_candidate_tree_matching_archive_entries_raises_on_tree_probe_failure(
         if pathspec == failing_pathspec:
             raise RuntimeError("retry-build exact candidate tree inspection failed")
         if pathspec == active_pathspec:
-            return (f"openspec/changes/{WORK_ID}/proposal.md",)
+            return active_paths
         if pathspec == "openspec/changes/archive/":
             return (f"openspec/changes/archive/2026-09-14-{WORK_ID}/proposal.md",)
         raise AssertionError(f"unexpected pathspec {pathspec}")
@@ -785,15 +805,38 @@ def test_candidate_tree_matching_archive_entries_raises_on_tree_probe_failure(
             workspace_root=repo,
             candidate=candidate,
             change=WORK_ID,
+            inspect_archive_without_active=inspect_archive_without_active,
         )
     assert tuple(candidate_tree_calls) == expected_calls
 
 
-@pytest.mark.parametrize("combo", ("fix-standard", "feature-oneshot"))
+@pytest.mark.parametrize(
+    ("combo", "active_paths", "failing_pathspec", "expected_calls"),
+    (
+        (
+            "fix-standard",
+            (),
+            f"openspec/changes/{WORK_ID}/",
+            [f"openspec/changes/{WORK_ID}/"],
+        ),
+        (
+            "feature-oneshot",
+            (),
+            "openspec/changes/archive/",
+            [
+                f"openspec/changes/{WORK_ID}/",
+                "openspec/changes/archive/",
+            ],
+        ),
+    ),
+)
 def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_shape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     combo: str,
+    active_paths: tuple[str, ...],
+    failing_pathspec: str,
+    expected_calls: list[str],
 ) -> None:
     repo, candidate = _repo(
         tmp_path / "retry-build-tree-failure-source",
@@ -824,10 +867,12 @@ def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_
         candidate_tree_calls.append(pathspec)
         assert workspace_root == repo
         assert candidate == run.candidate_head
-        if pathspec == active_pathspec:
-            return (f"openspec/changes/{WORK_ID}/proposal.md",)
-        if pathspec == "openspec/changes/archive/":
+        if pathspec == failing_pathspec:
             raise RuntimeError("retry-build exact candidate tree inspection failed")
+        if pathspec == active_pathspec:
+            return active_paths
+        if pathspec == "openspec/changes/archive/":
+            return ()
         raise AssertionError(f"unexpected pathspec {pathspec}")
 
     monkeypatch.setattr(work_actions, "_candidate_tree_paths", fake_candidate_tree_paths)
@@ -856,10 +901,7 @@ def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_
             workflow_registry=registry,
         )
     assert reset_calls == []
-    assert candidate_tree_calls == [
-        active_pathspec,
-        "openspec/changes/archive/",
-    ]
+    assert candidate_tree_calls == expected_calls
 
 
 @pytest.mark.parametrize("stream", ("stdout", "stderr"))
