@@ -1420,3 +1420,15 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/registry-revision-cas-design.md'
     excludes: []
+  copilot-timeout-new-head-review-rearm:
+    title: 'copilot-timeout-new-head-review-rearm'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1021'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/copilot-timeout-new-head-review-rearm/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/copilot-timeout-new-head-review-rearm-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/copilot-timeout-new-head-review-rearm-design.md'
+    excludes: []
