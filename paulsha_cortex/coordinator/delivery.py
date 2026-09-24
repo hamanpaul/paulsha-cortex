@@ -22,6 +22,7 @@ from .github_delivery import (
     GateResult,
     GitHubDeliveryClient,
     RemoteClosureFacts,
+    REVIEW_TIMEOUT_SECONDS,
     evaluate_remote_closure,
     _SHIP_CAPABILITY,
 )
@@ -33,7 +34,6 @@ CONVENTIONAL_ZH_TW_TITLE_RE = re.compile(
     r"^(?:feat|fix|docs|test|chore|refactor|perf|build|ci)(?:\([a-z0-9._/-]+\))?!?:\s+.*[\u3400-\u9fff]"
 )
 CLOSING_RE_TEMPLATE = r"(?im)^\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#{issue}\b"
-REVIEW_TIMEOUT_SECONDS = 15 * 60
 # band 未掛（None）時的向後相容預設值（#222 H.2 fail-soft 既定行為，不得因本次
 # band 參數化而改變既有沒有 sizing_band 的 work item 的既定上限）。
 MAX_FIX_ROUNDS = 2
@@ -214,15 +214,24 @@ class ReviewLoop:
         _require_finite_epoch(submitted_at_epoch, field="review submitted epoch")
         if self.requested_at is None:
             raise ValueError("Copilot review was not requested for current HEAD")
+        _require_finite_epoch(self.requested_at, field="review request epoch")
         if head != self.head:
             return ReviewDecision(self, "needs_human", "copilot-old-head-review")
         if not isinstance(review_id, int) or isinstance(review_id, bool) or review_id <= 0:
             raise ValueError("review_id must be a positive integer")
         submitted_at = float(submitted_at_epoch)
-        if (self.adopted_at is None and submitted_at < self.requested_at) or submitted_at > float(now_epoch):
+        requested_at = float(self.requested_at)
+        observed_at = float(now_epoch)
+        adopted_at = None
+        if self.adopted_at is not None:
+            _require_finite_epoch(self.adopted_at, field="review adoption epoch")
+            adopted_at = float(self.adopted_at)
+        if submitted_at < requested_at or submitted_at > observed_at:
             return ReviewDecision(self, "needs_human", "copilot-review-outside-request-epoch")
-        base_epoch = self.adopted_at if self.adopted_at is not None else self.requested_at
-        elapsed = float(now_epoch) - base_epoch
+        if adopted_at is not None:
+            elapsed = observed_at - adopted_at
+        else:
+            elapsed = submitted_at - requested_at
         if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
             return ReviewDecision(self, "needs_human", "copilot-review-timeout")
         if error:
@@ -236,6 +245,8 @@ class ReviewLoop:
                 None,
                 head=self.head,
                 review_id=review_id,
+                submitted_at_epoch=submitted_at,
+                observed_at_epoch=observed_at,
             )
         if self.fix_rounds >= self.max_fix_rounds:
             return ReviewDecision(
@@ -253,6 +264,8 @@ class ReviewDecision:
     reason: str | None
     head: str | None = None
     review_id: int | None = None
+    submitted_at_epoch: float | None = None
+    observed_at_epoch: float | None = None
 
 
 @dataclass(frozen=True)
@@ -536,6 +549,19 @@ class ShipOrchestrator:
                 raise RuntimeError("Copilot review epoch has not passed")
             try:
                 _require_finite_epoch(requested_at, field="Copilot review request epoch")
+                requested_at_epoch = float(requested_at)
+                submitted_at = getattr(copilot, "submitted_at_epoch")
+                observed_at = getattr(copilot, "observed_at_epoch")
+                _require_finite_epoch(
+                    submitted_at,
+                    field="Copilot review submitted epoch",
+                )
+                _require_finite_epoch(
+                    observed_at,
+                    field="Copilot review observation epoch",
+                )
+                submitted_at_epoch = float(submitted_at)
+                observed_at_epoch = float(observed_at)
                 adopted_at = None
                 if copilot.loop.adopted_at is not None:
                     _require_finite_epoch(
@@ -545,8 +571,18 @@ class ShipOrchestrator:
                     adopted_at = float(copilot.loop.adopted_at)
             except ValueError as exc:
                 raise RuntimeError("Copilot review epoch has not passed") from exc
-            timeout_basis = adopted_at if adopted_at is not None else float(requested_at)
-            elapsed = float(now_epoch) - timeout_basis
+            if observed_at_epoch > float(now_epoch):
+                raise RuntimeError("Copilot review epoch has not passed")
+            if submitted_at_epoch > observed_at_epoch:
+                raise RuntimeError("Copilot review epoch has not passed")
+            if submitted_at_epoch < requested_at_epoch:
+                raise RuntimeError("Copilot review epoch has not passed")
+            if adopted_at is not None and observed_at_epoch < adopted_at:
+                raise RuntimeError("Copilot review epoch has not passed")
+            if adopted_at is not None:
+                elapsed = float(now_epoch) - adopted_at
+            else:
+                elapsed = submitted_at_epoch - requested_at_epoch
             if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
                 raise RuntimeError("Copilot review epoch has not passed")
             review_kind = "copilot"
@@ -565,6 +601,7 @@ class ShipOrchestrator:
             required_closing_issues=authority.mapped_issues,
             copilot_review_id=copilot.review_id if copilot is not None else None,
             copilot_requested_at_epoch=(float(requested_at) if copilot is not None else None),
+            copilot_adopted_at_epoch=(adopted_at if copilot is not None else None),
             review_kind=review_kind,
         )
         # The exact-candidate final verdict must be evaluated and already

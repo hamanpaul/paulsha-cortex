@@ -3408,6 +3408,21 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     with pytest.raises(ValueError, match="internal"):
         executor(fake_ship)
     current = registry.get_workflow_run(run.run_id)
+    current = registry._manager_update_workflow_run(
+        run.run_id,
+        steps=tuple(
+            replace(
+                step,
+                executor="cortex-manager",
+                model="deterministic",
+                domain="cortex",
+                gate_result="passed",
+            )
+            if step.phase == "ship" and step.card == "openspec-archive"
+            else step
+            for step in current.steps
+        ),
+    )
     for card in ("openspec-archive", "policy-commit"):
         work_bridge._record_manager_ship_job(
             registry=registry,

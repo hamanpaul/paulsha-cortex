@@ -51,7 +51,8 @@ class PaginatedResult(Result):
 class FakeRunner:
     """Golden-path remote fixture: PR HEAD green, one closing issue, no blocking thread."""
 
-    def __init__(self):
+    def __init__(self, *, review_submitted_at: str = "1970-01-01T00:01:40Z"):
+        self.review_submitted_at = review_submitted_at
         self.calls = []
 
     def __call__(self, argv, **kwargs):
@@ -93,7 +94,7 @@ class FakeRunner:
                             "commit_id": HEAD,
                             "state": "COMMENTED",
                             "body": "clean",
-                            "submitted_at": "2026-07-17T00:00:00Z",
+                            "submitted_at": self.review_submitted_at,
                         }
                     ]
                 ]

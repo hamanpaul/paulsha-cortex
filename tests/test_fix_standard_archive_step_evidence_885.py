@@ -483,6 +483,51 @@ def test_fix_standard_ship_audit_rejects_exact_match_archive_job_with_wrong_iden
         )
 
 
+def test_declared_archive_step_ship_audit_rejects_exact_match_job_until_step_passes(
+    tmp_path: Path,
+) -> None:
+    repo, candidate = _repo(
+        tmp_path / "ship-audit-declared-step-repo",
+        active_change=False,
+        archived_change=False,
+    )
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    run = _create_fix_standard_run(
+        registry=registry,
+        repo_root=repo,
+        snapshot=snapshot,
+        candidate=candidate,
+        combo="feature-oneshot",
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="openspec-archive",
+        subject_head=candidate,
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="policy-commit",
+        subject_head=candidate,
+    )
+
+    assert manager._manager_archive_applied(run, registry=registry) is False
+    with pytest.raises(ValueError, match="missing or ambiguous: openspec-archive"):
+        manager._validated_ship_steps(
+            registry,
+            run=run,
+            candidate=candidate,
+            coordinator_root=coordinator,
+        )
+
+
 def test_fix_standard_ship_audit_rejects_exact_match_when_archive_jobs_are_ambiguous(
     tmp_path: Path,
 ) -> None:
@@ -737,20 +782,17 @@ def test_retry_build_ignores_dirty_worktree_when_exact_candidate_tree_is_clean(
     (
         "failing_pathspec",
         "active_paths",
-        "inspect_archive_without_active",
         "expected_calls",
     ),
     (
         (
             f"openspec/changes/{WORK_ID}/",
             (),
-            False,
             (f"openspec/changes/{WORK_ID}/",),
         ),
         (
             "openspec/changes/archive/",
             (f"openspec/changes/{WORK_ID}/proposal.md",),
-            False,
             (
                 f"openspec/changes/{WORK_ID}/",
                 "openspec/changes/archive/",
@@ -759,7 +801,6 @@ def test_retry_build_ignores_dirty_worktree_when_exact_candidate_tree_is_clean(
         (
             "openspec/changes/archive/",
             (),
-            True,
             (
                 f"openspec/changes/{WORK_ID}/",
                 "openspec/changes/archive/",
@@ -772,7 +813,6 @@ def test_candidate_tree_matching_archive_entries_raises_on_tree_probe_failure(
     monkeypatch: pytest.MonkeyPatch,
     failing_pathspec: str,
     active_paths: tuple[str, ...],
-    inspect_archive_without_active: bool,
     expected_calls: tuple[str, ...],
 ) -> None:
     repo, candidate = _repo(
@@ -805,23 +845,28 @@ def test_candidate_tree_matching_archive_entries_raises_on_tree_probe_failure(
             workspace_root=repo,
             candidate=candidate,
             change=WORK_ID,
-            inspect_archive_without_active=inspect_archive_without_active,
         )
     assert tuple(candidate_tree_calls) == expected_calls
 
 
 @pytest.mark.parametrize(
-    ("combo", "active_paths", "failing_pathspec", "expected_calls"),
+    ("combo", "failing_pathspec", "expected_calls"),
     (
         (
             "fix-standard",
-            (),
             f"openspec/changes/{WORK_ID}/",
             [f"openspec/changes/{WORK_ID}/"],
         ),
         (
+            "fix-standard",
+            "openspec/changes/archive/",
+            [
+                f"openspec/changes/{WORK_ID}/",
+                "openspec/changes/archive/",
+            ],
+        ),
+        (
             "feature-oneshot",
-            (),
             "openspec/changes/archive/",
             [
                 f"openspec/changes/{WORK_ID}/",
@@ -834,7 +879,6 @@ def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     combo: str,
-    active_paths: tuple[str, ...],
     failing_pathspec: str,
     expected_calls: list[str],
 ) -> None:
@@ -854,10 +898,6 @@ def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_
         facets=("needs_human",),
         gate_status="failed",
     )
-    assert any(
-        step.phase == "ship" and step.card == "openspec-archive"
-        for step in run.steps
-    ) is (combo == "feature-oneshot")
     candidate_tree_calls: list[str] = []
     active_pathspec = f"openspec/changes/{WORK_ID}/"
 
@@ -870,7 +910,7 @@ def test_retry_build_tree_inspection_failure_raises_before_reset_for_each_combo_
         if pathspec == failing_pathspec:
             raise RuntimeError("retry-build exact candidate tree inspection failed")
         if pathspec == active_pathspec:
-            return active_paths
+            return ()
         if pathspec == "openspec/changes/archive/":
             return ()
         raise AssertionError(f"unexpected pathspec {pathspec}")

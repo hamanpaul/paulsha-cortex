@@ -7926,20 +7926,14 @@ def _workflow_report_cleanup_allows_missing(
 def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: str | Path):
     def matches_candidate(card: str, job: Mapping[str, object]) -> bool:
         subject = job.get("subject_head")
-        if subject == candidate and card != "openspec-archive":
-            return True
-        declares_archive_step = any(
-            step.phase == "ship" and step.card == "openspec-archive"
-            for step in run.steps
-        )
+        if card != "openspec-archive":
+            return subject == candidate
         archive_applied = _manager_archive_applied(run, registry=registry)
+        if not archive_applied:
+            return False
         if subject == candidate:
-            return declares_archive_step or archive_applied
-        if (
-            card != "openspec-archive"
-            or not archive_applied
-            or not isinstance(subject, str)
-        ):
+            return True
+        if not isinstance(subject, str):
             return False
         return _manager_archive_subject_applies(
             workspace_root=run.workspace_root,
