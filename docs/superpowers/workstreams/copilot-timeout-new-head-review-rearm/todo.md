@@ -18,7 +18,7 @@ artifact_classes:
 - 唯一預期 production module：`paulsha_cortex/coordinator/work_actions.py`；其中 `_claim_action` 接收 Manager queued explicit resume，`_ship_action` 驗證／消費 rearm 許可、保留 epoch 並依既有 gate 推進。action 種類與 `requested_by` actor 可在此 module 取得；Manager 自產 transition id，不宣稱持有 queue `req_id`。若實作證據證明必須跨出此 module，先停止、記錄具體缺口並另開 issue，不以擴權或 caller payload 繞過。
 - 會新增／更新測試、`docs/unified-work-lifecycle.md`、`changelog.d/copilot-timeout-new-head-review-rearm.md` 及 `CHANGELOG.md [Unreleased]`；不新增 CLI。
 - 不改 `manager.py`、`work_bridge.py`、`registry.py`、control schema、WorkflowRun schema、deck、model identity、review-attest、merge authorization、reviewer、timeout 長度或 finding budget。#1020（準時提交晚觀測）、#948（request 前既有 review）、#871（maintainer authorization）與 #935（其它 review/thread 情境）維持各自範圍；本票只沿用其已落地 gate。
-- Work item mapping id `copilot-timeout-new-head-review-rearm` 在目前 `.cortex/work-items.yaml` 無同名項，與既有 `copilot-review-adopt-existing` 分開。
+- 本規劃 PR 已在 `.cortex/work-items.yaml` 新增唯一 work item `copilot-timeout-new-head-review-rearm`，與既有 `copilot-review-adopt-existing` 分開。
 
 ## 現況證據
 
