@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **#1037 ship audit 適用性**：沒有 mapped OpenSpec 且 workflow 未宣告 `openspec-archive` 時，只稽核 `policy-commit`；mapped change 或明確宣告 archive 卡仍要求真實、通過身分與 ancestry 驗證的 archive job/evidence。
 - **#885 fix-standard-archive-step-evidence**：fix-standard 現在可用唯一 Manager `openspec-archive`
   job 加 Git ancestry 判定 archive-applied；`retry-build` 會按 exact Candidate Git tree 偵測
   active/archive 並存並回報 warning，Git tree 無法檢查時不派工；ship/local-closeout 對

@@ -7935,7 +7935,11 @@ def _workflow_report_cleanup_allows_missing(
 
 def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: str | Path):
     workflow_jobs = registry.list_jobs()
-    archive_applied = _manager_archive_applied(
+    archive_required = bool(run.openspec_refs) or any(
+        step.phase == "ship" and step.card == "openspec-archive"
+        for step in run.steps
+    )
+    archive_applied = archive_required and _manager_archive_applied(
         run,
         registry=registry,
         jobs=workflow_jobs,
@@ -7958,7 +7962,11 @@ def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: st
         )
 
     steps = run.steps
-    for card in ("openspec-archive", "policy-commit"):
+    ship_cards = (
+        (("openspec-archive",) if archive_required else ())
+        + ("policy-commit",)
+    )
+    for card in ship_cards:
         jobs = [
             job
             for job in workflow_jobs
