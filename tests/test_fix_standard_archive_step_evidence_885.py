@@ -214,12 +214,14 @@ class _ArchiveCommandRunner(SpyRunner):
         stderr: str = "",
         returncode: int = 0,
         move_archive: bool,
+        lingering_active_change: str | None = None,
     ) -> None:
         super().__init__(repo=repo)
         self._archive_stdout = stdout
         self._archive_stderr = stderr
         self._archive_returncode = returncode
         self._move_archive = move_archive
+        self._lingering_active_change = lingering_active_change
 
     def __call__(self, argv, **kwargs):
         command = [str(value) for value in argv]
@@ -227,12 +229,33 @@ class _ArchiveCommandRunner(SpyRunner):
             self.calls.append(command)
             if self._move_archive:
                 self._apply_archive(command[-1], cwd=kwargs.get("cwd"))
+                self._leave_lingering_active_change(command[-1], cwd=kwargs.get("cwd"))
             return RunnerResult(
                 self._archive_returncode,
                 stdout=self._archive_stdout,
                 stderr=self._archive_stderr,
             )
         return super().__call__(argv, **kwargs)
+
+    def _leave_lingering_active_change(self, change: str, *, cwd: str | None = None) -> None:
+        if self._lingering_active_change is None:
+            return
+        root = Path(cwd) if cwd else self.repo
+        active = root / "openspec" / "changes" / change
+        if active.exists() or active.is_symlink():
+            if active.is_dir():
+                shutil.rmtree(active)
+            else:
+                active.unlink()
+        if self._lingering_active_change == "file":
+            active.write_text("# lingering active change\n", encoding="utf-8")
+            return
+        if self._lingering_active_change == "broken-symlink":
+            active.symlink_to("missing-active-change")
+            return
+        raise AssertionError(
+            f"unexpected lingering active change kind {self._lingering_active_change}"
+        )
 
 
 def test_fix_standard_archive_applied_uses_registry_ship_evidence_and_step_priority(
@@ -419,6 +442,66 @@ def test_fix_standard_ship_audit_accepts_archive_job_ancestor_after_retry_build(
             candidate=final_candidate,
             coordinator_root=unrelated_root,
         )
+
+
+def test_fix_standard_ship_audit_reads_registry_jobs_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, archive_candidate = _repo(
+        tmp_path / "ship-audit-single-scan-repo",
+        active_change=False,
+        archived_change=False,
+    )
+    (repo / "repair.txt").write_text("repair\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "repair.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "repair"], check=True)
+    final_candidate = _git(repo, "rev-parse", "HEAD")
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    run = _create_fix_standard_run(
+        registry=registry,
+        repo_root=repo,
+        snapshot=snapshot,
+        candidate=final_candidate,
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="openspec-archive",
+        subject_head=archive_candidate,
+    )
+    run = registry._manager_update_workflow_run(run.run_id, source_revision="e" * 64)
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="policy-commit",
+        subject_head=final_candidate,
+    )
+    jobs = registry.list_jobs()
+    list_job_calls = 0
+
+    def counted_list_jobs():
+        nonlocal list_job_calls
+        list_job_calls += 1
+        return jobs
+
+    monkeypatch.setattr(registry, "list_jobs", counted_list_jobs)
+
+    audited = manager._validated_ship_steps(
+        registry,
+        run=run,
+        candidate=final_candidate,
+        coordinator_root=coordinator,
+    )
+
+    assert next(step for step in audited if step.card == "policy-commit").gate_result == "passed"
+    assert list_job_calls == 1
 
 
 def test_fix_standard_ship_audit_rejects_exact_match_archive_job_with_wrong_identity(
@@ -1002,6 +1085,47 @@ def test_ship_validator_requires_archive_relocation_before_commit(
         repo=harness.worktree,
         move_archive=False,
         returncode=0,
+    )
+    monkeypatch.setattr(work_bridge, "load_preflight_command", lambda: ("preflight",))
+    monkeypatch.setattr(work_bridge, "GitHubDeliveryClient", FakeGitHubDeliveryClient)
+    _swap_ship_runner(harness, runner)
+
+    outcome = _capture(harness.validator, run=harness.run, candidate=harness.candidate)
+    updated = harness.registry.get_workflow_run(harness.run_id)
+    archive_jobs = [
+        job
+        for job in harness.registry.list_jobs()
+        if job.get("workflow_run_id") == harness.run_id
+        and job.get("workflow_card") == "openspec-archive"
+    ]
+
+    assert isinstance(outcome.exception, RuntimeError)
+    assert "official OpenSpec archive relocation missing" in str(outcome.exception)
+    assert updated.candidate_head == harness.candidate
+    assert archive_jobs == []
+    assert (
+        job_workspace.source_branch_head(harness.repo, "feature/14-work")
+        == harness.candidate
+    )
+
+
+@pytest.mark.parametrize("lingering_active_change", ("file", "broken-symlink"))
+def test_ship_validator_rejects_lingering_active_change_path_after_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lingering_active_change: str,
+) -> None:
+    harness = _ship_harness(
+        tmp_path,
+        monkeypatch,
+        active_change=True,
+        archived_change=False,
+    )
+    _use_fix_standard_ship_steps(harness)
+    runner = _ArchiveCommandRunner(
+        repo=harness.worktree,
+        move_archive=True,
+        lingering_active_change=lingering_active_change,
     )
     monkeypatch.setattr(work_bridge, "load_preflight_command", lambda: ("preflight",))
     monkeypatch.setattr(work_bridge, "GitHubDeliveryClient", FakeGitHubDeliveryClient)

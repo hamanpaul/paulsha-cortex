@@ -992,6 +992,13 @@ def _matching_archive_entries(root: Path, *, change: str) -> tuple[str, ...]:
     return tuple(sorted(matches))
 
 
+def _path_exists_or_is_symlink(path: Path) -> bool:
+    try:
+        return path.exists() or path.is_symlink()
+    except OSError as exc:  # pragma: no cover - fail-closed filesystem guard
+        raise RuntimeError("active OpenSpec change path inspection failed") from exc
+
+
 def _changed_contains_archive_relocation(changed: set[str], *, change: str) -> bool:
     suffix = f"-{change}"
     return any(
@@ -1364,11 +1371,14 @@ def _commit_archive_and_require_reverification(
         for value in tracked.stdout.split(b"\0") + untracked.stdout.split(b"\0")
         if value
     }
-    if not changed or any(not _archive_path_allowed(path, change=change) for path in changed):
-        raise RuntimeError("archive diff escaped strict OpenSpec/docs/changelog allowlist")
     active_change = worktree / "openspec" / "changes" / change
-    if active_change.is_dir() or not _changed_contains_archive_relocation(changed, change=change):
+    if _path_exists_or_is_symlink(active_change) or not _changed_contains_archive_relocation(
+        changed,
+        change=change,
+    ):
         raise RuntimeError("official OpenSpec archive relocation missing")
+    if any(not _archive_path_allowed(path, change=change) for path in changed):
+        raise RuntimeError("archive diff escaped strict OpenSpec/docs/changelog allowlist")
     added = subprocess.run(
         ["git", "-C", str(worktree), "add", "-A", "--", *sorted(changed)],
         shell=False,
@@ -1946,12 +1956,15 @@ def build_production_ship_validator(
         change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
         active_change = worktree / "openspec" / "changes" / str(change) if change else None
         archive_applied = _manager_archive_applied(run, registry=registry)
-        if active_change is not None and active_change.is_dir() and archive_applied:
+        active_change_present = (
+            _path_exists_or_is_symlink(active_change) if active_change is not None else False
+        )
+        if active_change_present and archive_applied:
             if _matching_archive_entries(worktree, change=str(change)):
                 raise RuntimeError(
                     "post-archive candidate re-created active OpenSpec change alongside its official archive"
                 )
-        if active_change is not None and active_change.is_dir() and not archive_applied:
+        if active_change_present and not archive_applied:
             from . import work_actions
 
             validate_ship_stage_transition("local-closeout", "pr-preflight")

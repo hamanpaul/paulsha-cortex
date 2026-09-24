@@ -3275,7 +3275,7 @@ def _manager_archive_job_matches(job: Mapping[str, object], *, run_id: str) -> b
     )
 
 
-def _manager_archive_job_applied(registry, run) -> bool:
+def _manager_archive_job_applied(registry, run, *, jobs: Iterable[Mapping[str, object]] | None = None) -> bool:
     run_id = getattr(run, "run_id", None)
     candidate = getattr(run, "candidate_head", None)
     if (
@@ -3284,9 +3284,14 @@ def _manager_archive_job_applied(registry, run) -> bool:
         or verification.SAFE_SHA_RE.fullmatch(candidate) is None
     ):
         return False
+    source_jobs = jobs
+    if source_jobs is None:
+        if registry is None:
+            return False
+        source_jobs = registry.list_jobs()
     jobs = [
         job
-        for job in registry.list_jobs()
+        for job in source_jobs
         if _manager_archive_job_matches(job, run_id=run_id)
     ]
     if len(jobs) != 1:
@@ -3301,7 +3306,12 @@ def _manager_archive_job_applied(registry, run) -> bool:
     )
 
 
-def _manager_archive_applied(run, *, registry=None) -> bool:
+def _manager_archive_applied(
+    run,
+    *,
+    registry=None,
+    jobs: Iterable[Mapping[str, object]] | None = None,
+) -> bool:
     declared = [
         step
         for step in run.steps
@@ -3314,9 +3324,9 @@ def _manager_archive_applied(run, *, registry=None) -> bool:
             archives[0].model,
             archives[0].domain,
         ) == ("cortex-manager", "deterministic", "cortex")
-    if registry is None:
+    if registry is None and jobs is None:
         return False
-    return _manager_archive_job_applied(registry, run)
+    return _manager_archive_job_applied(registry, run, jobs=jobs)
 
 
 def _planning_artifact_relative_path_after_archive(
@@ -7924,11 +7934,17 @@ def _workflow_report_cleanup_allows_missing(
 
 
 def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: str | Path):
+    workflow_jobs = registry.list_jobs()
+    archive_applied = _manager_archive_applied(
+        run,
+        registry=registry,
+        jobs=workflow_jobs,
+    )
+
     def matches_candidate(card: str, job: Mapping[str, object]) -> bool:
         subject = job.get("subject_head")
         if card != "openspec-archive":
             return subject == candidate
-        archive_applied = _manager_archive_applied(run, registry=registry)
         if not archive_applied:
             return False
         if subject == candidate:
@@ -7945,7 +7961,7 @@ def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: st
     for card in ("openspec-archive", "policy-commit"):
         jobs = [
             job
-            for job in registry.list_jobs()
+            for job in workflow_jobs
             if (
                 (
                     _manager_archive_job_matches(job, run_id=run.run_id)
