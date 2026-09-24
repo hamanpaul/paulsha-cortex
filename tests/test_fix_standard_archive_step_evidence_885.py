@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from dataclasses import replace
@@ -80,6 +81,20 @@ def _review_complete_combo_steps(combo_id: str) -> tuple[WorkflowStep, ...]:
         replace(step, gate_result="passed") if step.phase != "ship" else step
         for step in _combo_manifest_steps(combo_id)
     )
+
+
+def _snapshot_without_openspec(path: Path) -> Path:
+    _snapshot(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    item = payload["work_items"][0]
+    item["mapped_openspec"] = []
+    item["source_revisions"] = [
+        revision
+        for revision in item["source_revisions"]
+        if not revision.startswith("openspec:")
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def _archive_job(
@@ -441,6 +456,96 @@ def test_fix_standard_ship_audit_accepts_archive_job_ancestor_after_retry_build(
             run=unrelated_run,
             candidate=final_candidate,
             coordinator_root=unrelated_root,
+        )
+
+
+def test_fix_standard_ship_audit_skips_archive_when_no_openspec_is_mapped_or_declared(
+    tmp_path: Path,
+) -> None:
+    repo, candidate = _repo(
+        tmp_path / "ship-audit-no-openspec-repo",
+        active_change=False,
+        archived_change=False,
+    )
+    snapshot = _snapshot_without_openspec(tmp_path / "no-openspec-snapshot.json")
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    run = _create_fix_standard_run(
+        registry=registry,
+        repo_root=repo,
+        snapshot=snapshot,
+        candidate=candidate,
+    )
+    assert run.openspec_refs == ()
+    assert not any(
+        step.phase == "ship" and step.card == "openspec-archive"
+        for step in run.steps
+    )
+
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="policy-commit",
+        subject_head=candidate,
+    )
+
+    audited = manager._validated_ship_steps(
+        registry,
+        run=run,
+        candidate=candidate,
+        coordinator_root=coordinator,
+    )
+
+    assert [
+        step.card for step in audited if step.phase == "ship"
+    ] == ["policy-commit"]
+    assert {
+        job["workflow_card"]
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+    } == {"policy-commit"}
+
+
+def test_fix_standard_ship_audit_still_requires_declared_archive_without_mapping(
+    tmp_path: Path,
+) -> None:
+    repo, candidate = _repo(
+        tmp_path / "ship-audit-declared-no-mapping-repo",
+        active_change=False,
+        archived_change=False,
+    )
+    snapshot = _snapshot_without_openspec(tmp_path / "no-openspec-snapshot.json")
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    run = _create_fix_standard_run(
+        registry=registry,
+        repo_root=repo,
+        snapshot=snapshot,
+        candidate=candidate,
+        combo="feature-oneshot",
+    )
+    assert run.openspec_refs == ()
+    assert any(
+        step.phase == "ship" and step.card == "openspec-archive"
+        for step in run.steps
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        repo=repo,
+        card="policy-commit",
+        subject_head=candidate,
+    )
+
+    with pytest.raises(ValueError, match="missing or ambiguous: openspec-archive"):
+        manager._validated_ship_steps(
+            registry,
+            run=run,
+            candidate=candidate,
+            coordinator_root=coordinator,
         )
 
 
