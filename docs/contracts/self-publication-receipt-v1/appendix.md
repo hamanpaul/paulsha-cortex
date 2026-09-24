@@ -1,8 +1,8 @@
-# Proposed appendix: self-publication receipt v1 wire contract
+# Self-publication receipt v1 wire contract
 
-**Status:** draft proposal for owner alignment under issue [#1029](https://github.com/hamanpaul/paulsha-cortex/issues/1029). This document is not an accepted or implemented contract. The accompanying vectors are synthetic and are computed independently in `compute_vectors.py`.
+**Status:** accepted schema and vector contract under issue [#1029](https://github.com/hamanpaul/paulsha-cortex/issues/1029), after scoped alignment by the #992, #993, #994, #979, and #980 owner reviewers at PR #1031 HEAD `b983ce93`. This document is not implementation evidence. The accompanying vectors are synthetic and are computed independently in `compute_vectors.py`.
 
-This proposal stays within the #1029 schema boundary. It does not change producer behavior, publication eligibility, registry write ordering, or any issue owner's production scope. The parent envelope and digest rules below are inherited from [#992](https://github.com/hamanpaul/paulsha-cortex/issues/992), not redefined.
+This contract stays within the #1029 schema boundary. It does not change producer behavior, publication eligibility, registry write ordering, or any issue owner's production scope. The parent envelope and digest rules below are inherited from [#992](https://github.com/hamanpaul/paulsha-cortex/issues/992), not redefined.
 
 ## 1. Shared encoding and primitive rules
 
@@ -311,7 +311,7 @@ Normalize the request before computing any ID:
 - in `body`, replace CRLF and lone CR with LF and preserve every other code point; reject any existing marker line or marker-like line containing `cortex-self-publication-intent:` under case-fold comparison;
 - NFC-normalize labels, reject empty labels, deduplicate equal normalized labels, then sort the remaining labels by Unicode code-point order.
 
-`request_metadata` has exactly `title`, `body`, `labels`. `request_metadata_sha256 = H("cortex-manager-pr-request-metadata/v1", request_metadata)`. For this proposal the immutable intent retains the normalized request values as well as that digest, allowing the digest and later read-back to be recomputed from durable facts.
+`request_metadata` has exactly `title`, `body`, `labels`. `request_metadata_sha256 = H("cortex-manager-pr-request-metadata/v1", request_metadata)`. For this contract the immutable intent retains the normalized request values as well as that digest, allowing the digest and later read-back to be recomputed from durable facts.
 
 The immutable PR intent core has exactly:
 
@@ -408,7 +408,7 @@ Allowed row diagnostic codes are `unknown-schema`, `unknown-producer-kind`, `mal
 {"kind":"cortex-publication-receipt-invalid-json-row/v1","raw_json":"<exact row source text>","diagnostic":{"code":"duplicate-json-key","index":j}}
 ```
 
-The source slice includes the row's original whitespace and escapes. `raw_json` is a string, not reparsed data. At `/workflows[i]/publication_receipts[j]`, preserve only that row as an invalid-JSON-row wrapper with `diagnostic.index == j`; valid sibling workflows still load. Duplicate object member names are compared after JSON string escape decoding (for example, `"schema"` and `"sch\\u0065ma"` are duplicates). The full-registry vector below includes a loadable v2 registry with two complete WorkflowRun objects, one duplicate-key receipt row, and an unrelated workflow that must still load. Any duplicate key outside a receipt row, including a decoded duplicate registry-root name, rejects the entire registry load. The raw-aware registry decoder must identify the row before constructing its mapping; a post-`json.loads` value parser cannot meet this rule. This load behavior is accepted by #993; implementation remains in #993, not this schema-only proposal.
+The source slice includes the row's original whitespace and escapes. `raw_json` is a string, not reparsed data. At `/workflows[i]/publication_receipts[j]`, preserve only that row as an invalid-JSON-row wrapper with `diagnostic.index == j`; valid sibling workflows still load. Duplicate object member names are compared after JSON string escape decoding (for example, `"schema"` and `"sch\\u0065ma"` are duplicates). The full-registry vector below includes a loadable v2 registry with two complete WorkflowRun objects, one duplicate-key receipt row, and an unrelated workflow that must still load. Any duplicate key outside a receipt row, including a decoded duplicate registry-root name, rejects the entire registry load. The raw-aware registry decoder must identify the row before constructing its mapping; a post-`json.loads` value parser cannot meet this rule. This load behavior is accepted by #993; implementation remains in #993, not this schema-only contract.
 - A non-list container is represented by exactly:
 
 ```json
@@ -426,7 +426,7 @@ The raw decoder rejects duplicate keys after decoded-name comparison for envelop
 
 ### 4.3 Object-conflict keys
 
-The proposal uses these exact keys when append checks whether a different event already claimed the same published object:
+The contract uses these exact keys when append checks whether a different event already claimed the same published object:
 
 - Planning workspace object key: `(run_id, claim_key, producer_kind, canonical_workspace_ref)`, where `producer_kind` is the exact receipt union tag (`brainstorm_artifact` or `plan_materialization`) and `canonical_workspace_ref` is the exact canonical workspace-relative `published_object.ref`. This deliberately omits `repo`, `work_id`, and output kind because a run/claim/producer owns its own workspace namespace; producer variants remain separate. Same ref in a different run, a different claim era, or a different producer variant is allowed by this key. #979 withdrew its earlier broader key after reconciling with #993's issue text.
 - PR resource key: `(canonical_repository, positive_number)`, where the repository is bound to the canonical intent/POST target and the structured POST response, and the positive number comes from the POST witness. The later authenticated GET must confirm this tuple; it is not the source of creator identity and REST `id`/`node_id` are not the resource key. This key is checked across valid receipt history in the registry.
@@ -435,7 +435,7 @@ An exact replay of the same publication remains governed by the receipt identity
 
 ## 5. Canonical vectors and negative vectors
 
-`golden-vectors.json` contains complete synthetic instances of all three variants, each exact snapshot/evidence/intent fixture needed by the proposal, canonical `J` bytes for every hash input, and independently computed expected values for:
+`golden-vectors.json` contains complete synthetic instances of all three variants, each exact snapshot/evidence/intent fixture needed by the contract, canonical `J` bytes for every hash input, and independently computed expected values for:
 
 - raw snapshot/evidence/artifact/intent SHA256;
 - structured acceptance facts, event, publication, metadata, and receipt IDs;
@@ -448,8 +448,8 @@ Negative value vectors include full receipt objects for unknown schema/kind, mis
 
 One `#993` negative case is deliberately pending: a pair of distinct valid receipt preimages with one SHA-256 `receipt_id` cannot be produced as a golden vector without an actual cryptographic collision. The owner requirement remains explicit: detect the duplicate ID and reject before mutation. No forged digest is presented as a valid receipt. The complete current vector inventory and this pending item are recorded in the JSON's `pending_vectors` array and `decision-log.md`.
 
-These vectors are contract fixtures, not evidence that a production producer currently exists or that all owners accepted this proposal.
+These vectors are contract fixtures, not evidence that a production producer currently implements this contract.
 
 ## 6. Owner acceptance gate and scope
 
-This proposal supplies exact nested key/type/path/digest choices for review; it remains draft and unaccepted as a whole. The owner choices relayed for #992/#993/#994/#979/#980 are reflected in the appendix and vectors. The remaining executable-vector gap is one unconstructible cryptographic-collision case. #979's final narrow planning key is reflected after its withdrawal of the earlier broader key. The full-registry duplicate-row vector is a proposed load fixture, not evidence that production implements row isolation. No production module, registry, or service behavior is changed by this draft.
+This contract fixes the exact nested key/type/path/digest choices aligned by #992/#993/#994/#979/#980. The remaining executable-vector gap is one unconstructible cryptographic-collision case. #979's final narrow planning key is reflected after its withdrawal of the earlier broader key. The full-registry duplicate-row vector is a contract fixture, not evidence that production implements row isolation. No production module, registry, or service behavior is changed by this docs-only contract.
