@@ -6384,11 +6384,32 @@ def _ship_action(
                     "Copilot request outcome 無法確認，為避免重送已 fail-closed。"
                 ),
             )
+        requested_at = ship.get("requested_at_epoch")
+        if (
+            not isinstance(requested_at, (int, float))
+            or isinstance(requested_at, bool)
+            or not math.isfinite(float(requested_at))
+            or "adopted_review_id" in ship
+            or "adopted_at_epoch" in ship
+        ):
+            return _set_copilot_request_outcome_unknown(
+                active=active,
+                ship=ship,
+                state=state,
+                state_path=state_path,
+                workflow_registry=workflow_registry,
+                canonical_run=canonical_run,
+                authority=authority,
+                detail=(
+                    "已持久化的 review-requesting epoch 缺少有效 request epoch，或帶有不適用的 "
+                    "adoption 欄位；無法證明 review 屬於此 request，已 fail-closed。"
+                ),
+            )
         adopted_review = _pick_adoptable_copilot_review(
             remote.copilot_reviews,
             head=preflight.head,
         )
-        if adopted_review is None:
+        if adopted_review is None or adopted_review.submitted_at_epoch < float(requested_at):
             return _set_copilot_request_outcome_unknown(
                 active=active,
                 ship=ship,
@@ -6399,11 +6420,11 @@ def _ship_action(
                 authority=authority,
                 detail=(
                     "已持久化的 review-requesting epoch 重播時找不到有效的 exact-HEAD "
-                    "Copilot review；Copilot request outcome 無法確認，為避免重送已 fail-closed。"
+                    "request-bound Copilot review；Copilot request outcome 無法確認，為避免重送已 fail-closed。"
                 ),
             )
         logger.info(
-            "adopted existing Copilot review from review-requesting run_id=%s head=%s review_id=%s submitted_at=%s",
+            "recovered request-bound Copilot review from review-requesting run_id=%s head=%s review_id=%s submitted_at=%s",
             canonical_run.run_id,
             preflight.head,
             adopted_review.review_id,
@@ -6412,9 +6433,6 @@ def _ship_action(
         active["ship"] = {
             **ship,
             "phase": "review-requested",
-            "requested_at_epoch": float(adopted_review.submitted_at_epoch),
-            "adopted_review_id": adopted_review.review_id,
-            "adopted_at_epoch": float(now_epoch),
         }
         _save_runs(state_path, state)
         ship = active["ship"]
