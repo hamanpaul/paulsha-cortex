@@ -383,9 +383,10 @@ def test_explicit_resume_writes_a_manager_owned_idempotent_rearm_permit(
         verified_head=NEW_HEAD,
     )
 
-    _resume(snapshot=snapshot, state=state, registry=registry, at=4_000.0)
+    resumed = _resume(snapshot=snapshot, state=state, registry=registry, at=4_000.0)
     first_row = _journal_row(state, run_id)
     permit = first_row["copilot_review_rearm_permit"]
+    assert resumed["result"]["run"]["copilot_review_rearm_permit"] == permit
     assert permit["run_id"] == run_id
     assert permit["old_head"] == OLD_HEAD
     assert permit["candidate_head"] == NEW_HEAD
@@ -397,9 +398,10 @@ def test_explicit_resume_writes_a_manager_owned_idempotent_rearm_permit(
     assert permit["requested_by"] == "operator"
     assert permit["transition_id"].startswith("manager-transition-")
 
-    _resume(snapshot=snapshot, state=state, registry=registry, at=4_001.0)
+    resumed_again = _resume(snapshot=snapshot, state=state, registry=registry, at=4_001.0)
     second_row = _journal_row(state, run_id)
 
+    assert resumed_again["result"]["run"]["copilot_review_rearm_permit"] == permit
     assert second_row["copilot_review_rearm_permit"] == permit
 
 

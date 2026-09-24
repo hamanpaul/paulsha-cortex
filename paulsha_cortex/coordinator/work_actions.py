@@ -1942,14 +1942,14 @@ def _maybe_record_copilot_timeout_rearm_permit(
     state_path: Path,
     workflow_registry,
     canonical_run,
-) -> None:
+) -> dict[str, Any] | None:
     if args.get("action") != "resume":
-        return
+        return None
     extras = set(args) - {"action", "repo", "work_id", "issue"}
     if extras:
         raise ValueError(f"resume rejects caller evidence/input: {sorted(extras)[0]}")
     if canonical_run is None or canonical_run.status != "ongoing":
-        return
+        return None
     state, active, run = _load_work_run(
         state_path=state_path,
         workflow_registry=workflow_registry,
@@ -1958,11 +1958,11 @@ def _maybe_record_copilot_timeout_rearm_permit(
     _validate_current_run_authority(active, authority, run)
     ship = active.get("ship")
     if ship is None:
-        return
+        return None
     if not isinstance(ship, dict):
         raise ValueError("ship state malformed")
     if ship.get("phase") != "needs_human" or ship.get("reason") != "copilot-review-timeout":
-        return
+        return None
     old_head = ship.get("head")
     if (
         not isinstance(old_head, str)
@@ -1971,7 +1971,7 @@ def _maybe_record_copilot_timeout_rearm_permit(
         raise ValueError("copilot timeout ship state malformed")
     candidate_head = _exact_verified_candidate_head(run)
     if candidate_head is None:
-        return
+        return None
     if old_head == candidate_head:
         if active.get("copilot_review_rearm_permit") is not None:
             _invalidate_copilot_rearm_permit(
@@ -1980,7 +1980,7 @@ def _maybe_record_copilot_timeout_rearm_permit(
                 state_path=state_path,
             )
             raise RuntimeError("copilot timeout rearm permit is stale")
-        return
+        return None
     binding = active.get("delivery_binding")
     if not isinstance(binding, dict):
         raise RuntimeError("copilot timeout rearm requires persisted delivery binding")
@@ -2001,7 +2001,7 @@ def _maybe_record_copilot_timeout_rearm_permit(
     if existing is None:
         active["copilot_review_rearm_permit"] = desired
         _save_runs(state_path, state)
-        return
+        return desired
     same_tuple = (
         existing["run_id"] == desired["run_id"]
         and existing["ship_hash"] == desired["ship_hash"]
@@ -2019,6 +2019,7 @@ def _maybe_record_copilot_timeout_rearm_permit(
             state_path=state_path,
         )
         raise RuntimeError("copilot timeout rearm permit conflicts with current state")
+    return existing
 
 
 def _claim_action(
@@ -2457,7 +2458,7 @@ def _claim_action(
                 )
                 active["frozen_readiness"] = persisted.frozen_readiness
     if canonical_run is not None:
-        _maybe_record_copilot_timeout_rearm_permit(
+        rearm_permit = _maybe_record_copilot_timeout_rearm_permit(
             args=args,
             authority=authority,
             requested_by=requested_by,
@@ -2466,6 +2467,8 @@ def _claim_action(
             workflow_registry=workflow_registry,
             canonical_run=canonical_run,
         )
+        if active is not None and rearm_permit is not None:
+            active["copilot_review_rearm_permit"] = rearm_permit
     response: dict[str, Any] = {
         "action": decision.action,
         "reason": decision.reason,
