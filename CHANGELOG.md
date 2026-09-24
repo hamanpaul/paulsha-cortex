@@ -10,8 +10,8 @@
 - **#1029 self-publication receipt v1 契約草案**：加入待 producer／registry owners 書面對齊的 exact wire appendix、可重算 golden vectors 與決策紀錄；未實作或啟用 receipt。
 - **Copilot 規劃 Yellow gate 修正**：在 #1020、#1021 的 Tasks 明列 `documentation`，使既有文件交付項目符合 `artifact_classes` 完整性檢查；不變更產品驗收範圍。
 - **driving-cortex 單票授權界線**：要求 agent 只處理綁定 issue 的已授權驗收，將範圍外問題附證據記錄到既有或新 issue，再獨立規劃與派工；跨票推進及 merge 後部署均須各自授權。
-- **#1021 舊 HEAD timeout 恢復規劃**：新增明示 resume 後對新 candidate 重啟 Copilot review 的 accepted spec／design／todo 與唯一 work item；產品修正另待正式 run 驗收。
-- **#1020 Copilot review 輪詢逾時規劃**：新增準時提交、晚觀測的 accepted spec／design／todo 與唯一 work item；產品修正及交付另待正式 run 驗收。
+- **#1021 舊 HEAD timeout 新 HEAD 重啟 review**：`_claim_action` 只在明示 `resume` 且 journal 仍停在舊 HEAD `copilot-review-timeout` 時建立 Manager-owned rearm permit；`_ship_action` 只有在 exact new HEAD／preflight／delivery binding／PR facts／ForeignReview 全數重讀相符，且 checks 終態通過、PR mergeability 通過、沒有未解 current review thread 後才會消費 permit，並在觀察到 binding／PR-head／preflight-head／persisted permit drift 時立即持久化作廢該 permit，避免後續未經再次 `resume` 的重用。條件成立時會先保留舊 timeout/review epoch 歷史，再採信既有 exact-HEAD Copilot review 或以 durable `review-requesting` 後 request 一次；requesting 重播保留原 request epoch、使用 request-bound submission deadline，過期 review 維持 timeout，不套用採信 review 的 adoption 時間。same-head timeout 不重送，old-timeout/new-head rearm 也不得以 maintainer review 取代 Copilot review。request race／crash uncertainty 轉為 `copilot-review-request-outcome-unknown` fail-closed。
+- **#1020 Copilot review 提交時間逾時修正**：`ReviewLoop` 保留通過驗證的 submission/observation epochs，`ShipOrchestrator` 在 merge admission 依 request 或 adoption timeout 視窗，重新核對 fresh remote review 的提交時間；因此 caller 聲稱準時但遠端同 ID review 實際逾時時會阻擋，晚輪詢仍可採信期限內提交的 review，既有 adopted review 繼續使用 `adopted_at` timeout。
 - **preflight visudo 測試環境**：sudoers 整合測試將系統 sbin 加入個別測試的 PATH，避免 #862 exact-Candidate preflight 因 service PATH 差異誤判失敗。
 - **Refine 0.1.11 Registry CAS 進件**：為 #966 新增 accepted spec／design／todo 與唯一 work item，作為 #818 多進程寫入防護的第一階段；產品實作與 #967 owner lock 仍待獨立驗收。
 - **Refine 0.1.11 子票進件**：為 #961 發布已審核的 accepted 規劃與唯一 work item，更新 #887／#847／#818／#547／#943 的拆票依賴與定版執行表；產品實作與發版仍待各自驗收。

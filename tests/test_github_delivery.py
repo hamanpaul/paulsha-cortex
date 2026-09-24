@@ -262,6 +262,14 @@ def test_delivery_gate_requires_exact_bot_review_from_request_epoch() -> None:
         assert "copilot-current-head-review-missing" in result.reasons
 
 
+def test_delivery_gate_uses_adoption_epoch_for_existing_review_timeout() -> None:
+    review = _facts().copilot_reviews[0]
+    facts = replace(_facts(), copilot_reviews=(replace(review, submitted_at_epoch=100),))
+    policy = replace(_policy(), copilot_requested_at_epoch=90, copilot_adopted_at_epoch=1_000)
+
+    assert evaluate_delivery_gate(facts=facts, policy=policy).allowed
+
+
 def test_remote_closure_is_strict_conjunction() -> None:
     facts = RemoteClosureFacts(
         merge_commit="c" * 40,
