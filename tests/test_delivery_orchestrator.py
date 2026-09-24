@@ -347,6 +347,37 @@ def test_review_epochs_require_finite_timestamps(timestamp: float) -> None:
         ReviewLoop.start(head=HEAD1, now_epoch=timestamp)
 
 
+@pytest.mark.parametrize(
+    ("requested_at", "adopted_at"),
+    (
+        (float("nan"), None),
+        (float("inf"), None),
+        (100.0, float("nan")),
+        (100.0, float("inf")),
+    ),
+)
+def test_review_loop_rejects_non_finite_preserved_request_or_adoption_epochs(
+    requested_at: float,
+    adopted_at: float | None,
+) -> None:
+    loop = ReviewLoop(
+        head=HEAD1,
+        fix_rounds=0,
+        epoch_started_at=100.0,
+        requested_at=requested_at,
+        adopted_at=adopted_at,
+    )
+
+    with pytest.raises(ValueError, match="finite"):
+        loop.record_review(
+            head=HEAD1,
+            now_epoch=110.0,
+            finding_count=0,
+            review_id=1,
+            submitted_at_epoch=110.0,
+        )
+
+
 def _foreign_review(root: Path, *, head: str = HEAD1) -> ForeignReviewEvidence:
     payload = review.build_gate_evaluation(
         slice_id="ship-review",
@@ -741,6 +772,40 @@ def test_ship_orchestrator_rejects_invalid_adopted_submission_evidence(
             authority=_authority(tmp_path, last_success=3_400.0),
             preflight=_preflight(),
             copilot=copilot,
+            foreign_review=_foreign_review(tmp_path),
+        )
+
+
+def test_ship_orchestrator_rejects_adopted_submission_earlier_than_requested_epoch(
+    tmp_path: Path,
+) -> None:
+    class GitHub:
+        def evaluate_final_gate(self, **kwargs):
+            raise AssertionError("out-of-window submission evidence must not reach GitHub")
+
+        def commit_merge(self, **kwargs):
+            raise AssertionError("out-of-window submission evidence must not reach GitHub")
+
+    copilot = _adopted_copilot_decision(
+        submitted_at_epoch=1_000.0,
+        adopted_at_epoch=1_005.0,
+        observed_at_epoch=1_010.0,
+    )
+    tampered_copilot = replace(
+        copilot,
+        loop=replace(copilot.loop, requested_at=1_001.0),
+    )
+
+    with pytest.raises(RuntimeError, match="Copilot review epoch has not passed"):
+        ShipOrchestrator(github=GitHub(), now=lambda: 1_010.0).merge_if_ready(
+            repo="acme/demo",
+            pr_number=7,
+            change="work",
+            expected_head=HEAD1,
+            expected_tree_hash=HEAD2,
+            authority=_authority(tmp_path, last_success=1_005.0),
+            preflight=_preflight(),
+            copilot=tampered_copilot,
             foreign_review=_foreign_review(tmp_path),
         )
 

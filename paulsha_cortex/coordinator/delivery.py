@@ -214,6 +214,7 @@ class ReviewLoop:
         _require_finite_epoch(submitted_at_epoch, field="review submitted epoch")
         if self.requested_at is None:
             raise ValueError("Copilot review was not requested for current HEAD")
+        _require_finite_epoch(self.requested_at, field="review request epoch")
         if head != self.head:
             return ReviewDecision(self, "needs_human", "copilot-old-head-review")
         if not isinstance(review_id, int) or isinstance(review_id, bool) or review_id <= 0:
@@ -221,10 +222,14 @@ class ReviewLoop:
         submitted_at = float(submitted_at_epoch)
         requested_at = float(self.requested_at)
         observed_at = float(now_epoch)
-        if (self.adopted_at is None and submitted_at < requested_at) or submitted_at > observed_at:
-            return ReviewDecision(self, "needs_human", "copilot-review-outside-request-epoch")
+        adopted_at = None
         if self.adopted_at is not None:
-            elapsed = observed_at - float(self.adopted_at)
+            _require_finite_epoch(self.adopted_at, field="review adoption epoch")
+            adopted_at = float(self.adopted_at)
+        if submitted_at < requested_at or submitted_at > observed_at:
+            return ReviewDecision(self, "needs_human", "copilot-review-outside-request-epoch")
+        if adopted_at is not None:
+            elapsed = observed_at - adopted_at
         else:
             elapsed = submitted_at - requested_at
         if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
@@ -570,7 +575,7 @@ class ShipOrchestrator:
                 raise RuntimeError("Copilot review epoch has not passed")
             if submitted_at_epoch > observed_at_epoch:
                 raise RuntimeError("Copilot review epoch has not passed")
-            if adopted_at is None and submitted_at_epoch < requested_at_epoch:
+            if submitted_at_epoch < requested_at_epoch:
                 raise RuntimeError("Copilot review epoch has not passed")
             if adopted_at is not None:
                 elapsed = float(now_epoch) - adopted_at
