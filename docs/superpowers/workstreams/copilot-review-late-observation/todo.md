@@ -39,7 +39,7 @@ Repo sizing helper 結果：`current_sizing_snapshot(workspace_root=/tmp/cortex-
 
 ## Tasks
 
-- [ ] **T1 RED / 兩道逾時回歸**：新增或擴充 focused 測試：request=1000、exact-head review submission=1162、observation=1944 必須通過 `ReviewLoop` 並到達真實 `ShipOrchestrator.merge_if_ready()` 的 final admission；submission=1900（deadline exact）在晚觀測時仍通過；submission=1901 必須 `needs_human / copilot-review-timeout`。先確認原實作在 #1020 案例必 RED。
+- [x] **T1 RED / 兩道逾時回歸**：新增或擴充 focused 測試：request=1000、exact-head review submission=1162、observation=1944 必須通過 `ReviewLoop` 並到達真實 `ShipOrchestrator.merge_if_ready()` 的 final admission；submission=1900（deadline exact）在晚觀測時仍通過；submission=1901 必須 `needs_human / copilot-review-timeout`。先確認原實作在 #1020 案例必 RED。
 - [ ] **T2 source / request-bound deadline**：在 `delivery.py::ReviewLoop.record_review()` 僅對 `adopted_at is None` 以 `submitted_at - requested_at` 判 900 秒 deadline；成功 decision 保留經驗證的 submission epoch，`ShipOrchestrator.merge_if_ready()` 對 request-bound review 重新驗證有限數、`requested_at <= submitted_at <= now` 及 900 秒上界，缺失／篡改時 fail closed。維持 exact HEAD、review ID、fix budget 等判定。已採信 (`adopted_at != None`) 維持原 `now - adopted_at` 判式。
 - [ ] **T3 RED/GREEN / no-review and identity negatives**：期限後沒有 current review 仍 timeout；早於 request、future、缺失或非有限 submission 不通過；old HEAD、error review 不能通過。既有 #948 adoption test 保持原斷言。原先「request 很久就拒絕」的測試改為真正晚提交才拒絕，不得留下錯誤期待。
 - [ ] **T4 integration / 真實 `_ship_action` caller**：沿 `tests/test_copilot_review_adopt_existing.py` fake GitHub fixture 加獨立 #1020 case：ship journal 保存 request epoch，remote 回同 HEAD/Copilot/current review（+162s），Manager now 為 +944s；確認不落 `copilot-review-timeout` 且只沿既有 review 流程前進。另以真實 `ShipOrchestrator` 與 fake final GitHub gate 驗證第二道時限；原 caller fixture 的 fake orchestrator 無法驗這一點。不得呼叫真 GitHub、真模型或合併真 PR。

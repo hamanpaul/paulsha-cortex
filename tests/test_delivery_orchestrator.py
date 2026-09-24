@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -277,6 +278,34 @@ def test_review_loop_times_out_at_fifteen_minutes() -> None:
     assert result.reason == "copilot-review-timeout"
 
 
+@pytest.mark.parametrize(
+    ("submitted_at_epoch", "expected_action", "expected_reason"),
+    (
+        (1162.0, "passed", None),
+        (1900.0, "passed", None),
+        (1901.0, "needs_human", "copilot-review-timeout"),
+    ),
+)
+def test_review_loop_uses_submission_time_for_request_bound_timeout(
+    submitted_at_epoch: float,
+    expected_action: str,
+    expected_reason: str | None,
+) -> None:
+    loop = ReviewLoop.start(head=HEAD1, now_epoch=1000).mark_requested(
+        head=HEAD1,
+        now_epoch=1000,
+    )
+    result = loop.record_review(
+        head=HEAD1,
+        now_epoch=1944,
+        finding_count=0,
+        review_id=1,
+        submitted_at_epoch=submitted_at_epoch,
+    )
+    assert result.action == expected_action
+    assert result.reason == expected_reason
+
+
 def test_review_loop_requires_request_before_review() -> None:
     with pytest.raises(ValueError, match="not requested"):
         ReviewLoop.start(head=HEAD1, now_epoch=100).record_review(
@@ -503,6 +532,52 @@ def test_ship_orchestrator_rejects_stale_non_adopted_copilot_request(
             copilot=_copilot_decision(),
             foreign_review=_foreign_review(tmp_path),
         )
+
+
+def test_ship_orchestrator_accepts_review_submitted_before_deadline_when_observed_late(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    class GitHub:
+        def evaluate_final_gate(self, **kwargs):
+            calls.append("evaluate_final_gate")
+            return kwargs["policy"]
+
+        def commit_merge(self, **kwargs):
+            calls.append("commit_merge")
+            return object()
+
+    copilot = SimpleNamespace(
+        action="passed",
+        reason=None,
+        head=HEAD1,
+        review_id=77,
+        submitted_at_epoch=1162.0,
+        loop=ReviewLoop(
+            head=HEAD1,
+            fix_rounds=0,
+            epoch_started_at=1000.0,
+            requested_at=1000.0,
+            max_fix_rounds=2,
+            adopted_at=None,
+        ),
+    )
+
+    result = ShipOrchestrator(github=GitHub(), now=lambda: 1944.0).merge_if_ready(
+        repo="acme/demo",
+        pr_number=7,
+        change="work",
+        expected_head=HEAD1,
+        expected_tree_hash=HEAD2,
+        authority=_authority(tmp_path, last_success=1944.0),
+        preflight=_preflight(),
+        copilot=copilot,
+        foreign_review=_foreign_review(tmp_path),
+    )
+
+    assert result.expected_head == HEAD1
+    assert calls == ["evaluate_final_gate", "commit_merge"]
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])
