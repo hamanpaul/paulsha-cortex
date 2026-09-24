@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 - **#1021 舊 HEAD timeout 恢復規劃**：新增明示 resume 後對新 candidate 重啟 Copilot review 的 accepted spec／design／todo 與唯一 work item；產品修正另待正式 run 驗收。
+- **#1020 Copilot review 輪詢逾時規劃**：新增準時提交、晚觀測的 accepted spec／design／todo 與唯一 work item；產品修正及交付另待正式 run 驗收。
 
 - **preflight visudo 測試環境**：sudoers 整合測試將系統 sbin 加入個別測試的 PATH，避免 #862 exact-Candidate preflight 因 service PATH 差異誤判失敗。
 - **Refine 0.1.11 Registry CAS 進件**：為 #966 新增 accepted spec／design／todo 與唯一 work item，作為 #818 多進程寫入防護的第一階段；產品實作與 #967 owner lock 仍待獨立驗收。
