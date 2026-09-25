@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -1791,6 +1792,89 @@ def test_slice_action_request_runs_manager_action(monkeypatch, tmp_path):
     assert captured["slice_id"] == "slice-a"
     assert captured["action"] == "retry-build"
     assert captured["actor"] == "operator"
+
+
+def test_slice_action_conflict_writes_error_done_before_request_removal(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = "20260703T090012Z-abcdefabcdefabcdefabcdefabcdefab"
+    _write_request(
+        req_id,
+        type="slice-action",
+        args={"slice_id": "slice-a", "action": "abandon", "actor": "operator"},
+    )
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    registry.create_slice(
+        slice_id="slice-a",
+        spec_path="specs/slice-a.md",
+        spec_hash="spec-sha",
+        plan_path="plans/slice-a.md",
+        plan_hash="plan-sha",
+        target_branch="main",
+        dispatch_base="base-sha",
+        builder_job_id=None,
+        reviewer_job_id=None,
+        candidate=None,
+    )
+    registry.update_slice("slice-a", state="needs_human", gate_state="needs_human")
+    expected_revision = registry._loaded_revision
+    dispatcher = FakeDispatcher(registry, worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"))
+    request_executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=RecordingLauncher(),
+    )
+
+    original_allowed = manager.allowed_slice_actions
+    injected_actual_revision: dict[str, str] = {}
+    injected = False
+
+    def inject_conflict(registry_arg, slice_row):
+        nonlocal injected
+        actions = original_allowed(registry_arg, slice_row)
+        if not injected:
+            injected = True
+            competing = JobRegistry(state_path=state)
+            competing.record_action(
+                "slice-a",
+                action="builder-requeued",
+                actor="builder",
+                state="building",
+            )
+            injected_actual_revision["value"] = hashlib.sha256(state.read_bytes()).hexdigest()
+        return actions
+
+    monkeypatch.setattr(manager, "allowed_slice_actions", inject_conflict)
+    manager_daemon.run_loop(
+        request_executor=request_executor,
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {"dispatch_skipped": False},
+        poll_interval=0.0,
+        tick_interval=300.0,
+        now_fn=lambda: "2026-07-03T09:05:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=lambda _: None,
+        pid=1,
+        max_rounds=1,
+    )
+
+    done_path = constants.done_dir() / f"{req_id}.json"
+    request_path = constants.requests_dir() / f"{req_id}.json"
+    done = contract.read_json(done_path)
+    current_slice = JobRegistry(state_path=state).get_slice("slice-a")
+
+    assert done is not None
+    assert done["status"] == "error"
+    assert "RegistryRevisionConflict" in done["error"]
+    assert expected_revision in done["error"]
+    assert injected_actual_revision["value"] in done["error"]
+    assert str(registry.canonical_state_path) in done["error"]
+    assert done["status"] != "ok"
+    assert not request_path.exists()
+    assert done_path.exists()
+    assert current_slice["state"] == "building"
+    assert [entry["action"] for entry in current_slice["actions"]] == ["builder-requeued"]
 
 
 def test_slice_action_request_forwards_review_identity(monkeypatch, tmp_path):
