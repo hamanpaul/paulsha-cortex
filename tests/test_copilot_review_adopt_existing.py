@@ -1015,10 +1015,29 @@ def test_delivery_adapter_evidence_reflects_adopted_review_only_when_ship_state_
 
     monkeypatch.setattr(work_actions, "_ship_action", fake_ship_action)
 
+    def successful_main_probe_runner(argv, **kwargs):
+        command = [str(value) for value in argv]
+        git_args = command[3:]
+        if (
+            git_args[:3] == ["rev-parse", "--verify", "--quiet"]
+            and git_args[3] != "FETCH_HEAD"
+        ):
+            return SimpleNamespace(returncode=0, stdout=f"{HEAD}\n", stderr="")
+        if git_args[:2] == ["cat-file", "-t"]:
+            return SimpleNamespace(returncode=0, stdout="commit\n", stderr="")
+        if git_args[:4] == ["fetch", "--quiet", "--no-tags", "origin"] and git_args[4] == "main":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if git_args[:3] == ["rev-parse", "--verify", "--quiet"] and git_args[3] == "FETCH_HEAD":
+            return SimpleNamespace(returncode=0, stdout=f"{HEAD}\n", stderr="")
+        if git_args[:1] == ["merge-base"]:
+            return SimpleNamespace(returncode=0, stdout=f"{HEAD}\n", stderr="")
+        raise AssertionError(command)
+
     validator = work_bridge.build_production_ship_validator(
         registry=registry,
         coordinator_root=state_root,
         snapshot_path=snapshot,
+        probe_runner=successful_main_probe_runner,
     )
 
     result = validator(run=run, candidate=HEAD)
