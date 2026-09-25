@@ -370,7 +370,14 @@ def _drop_in_memory_and_persisted_bound_bindings(
             entry = job.get(field_name)
             if isinstance(entry, dict):
                 entry.pop("bound_binding", None)
-    return _drop_persisted_bound_bindings(state_path)
+    legacy_bytes = _drop_persisted_bound_bindings(state_path)
+    # 模擬 registry 載入的正是這份 legacy 檔：同步 #966 的 revision CAS 基準，
+    # 否則外部改寫會被（正確地）判成 RegistryRevisionConflict。
+    registry._record_loaded_snapshot(
+        registry._read_durable_snapshot(),
+        source_schema_version=registry._loaded_source_schema_version,
+    )
+    return legacy_bytes
 
 
 def _ordinary_binding_bump_via_repin(
