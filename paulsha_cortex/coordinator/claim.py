@@ -839,6 +839,7 @@ def _authority_from_canonical_row(
             todo_paths.append(ref)
     confirmed_todo = any(source.get("kind") in todo_kinds for source in confirmed)
     confirmed_sources = tuple(confirmed)
+    processed_confirmed_sources: list[dict] = []
     semantic_sources: dict[str, dict[str, tuple[dict, ...]]] = {}
     for source in confirmed_sources:
         source_id = source.get("source_id")
@@ -863,7 +864,7 @@ def _authority_from_canonical_row(
             if _has_unreconciled_semantic_conflict(
                 repo=repo,
                 observed_semantic_sources=semantic_sources,
-                confirmed_sources=confirmed_sources,
+                confirmed_sources=tuple(processed_confirmed_sources),
                 providers=providers,
             ):
                 raise _semantic_conflict_error(
@@ -871,6 +872,7 @@ def _authority_from_canonical_row(
                     work_id_label=work_id_label,
                 )
             raise
+        processed_confirmed_sources.append(source)
         if semantic is None:
             continue
         key, value = semantic
