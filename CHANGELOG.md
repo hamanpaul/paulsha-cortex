@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **#977 Manager merged-run finalizer 規劃**：新增 accepted spec／design／todo 與唯一 work item，明確定義前置 API freeze、CompletionRecord／outcome／Registry 次序和 crash/re-entry 驗收；本次僅規劃，尚未實作 completion recovery。
 - **#961 Yellow plan review 完整性**：將既有 T6 文件交付項目明列為 `documentation`，使 accepted plan 的 task 文字符合 `artifact_classes`；驗收範圍不變。
 - **#1037 ship audit 適用性**：沒有 mapped OpenSpec 且 workflow 未宣告 `openspec-archive` 時，只稽核 `policy-commit`；mapped change 或明確宣告 archive 卡仍要求真實、通過身分與 ancestry 驗證的 archive job/evidence。
 - **#885 fix-standard-archive-step-evidence**：fix-standard 現在可用唯一 Manager `openspec-archive`
