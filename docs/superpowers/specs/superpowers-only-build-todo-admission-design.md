@@ -8,52 +8,74 @@ issue: 1054
 
 ## Decisions
 
-### D1 — 在 Manager 實際 plan→build 派工邊界 admission
+### D1 — 把 gate 放在 first Builder 實際派工點
 
-在 `manager._dispatch_workflow_card()` 的第一張 Builder card 路徑加入一個窄的 admission decision。判定必須位於任何 provider selection/preflight side effect、job id reservation、worktree creation、`registry.create_job()` 或 `launcher.launch()` 之前。只有 Manager 回報可用的 admission outcome 才繼續既有 Builder 派工；zero、multiple、snapshot 無效或 snapshot 尚未更新均回傳帶 `DiagnosticReason` 的 stop，且不得建立第一個 Builder side effect。
+`manager._dispatch_workflow_card()` 的 first Builder 路徑，在 provider selection/preflight、job id reservation、Builder worktree creation、`registry.create_job()` 和 `launcher.launch()` 前做 admission。plan final card 先轉入 build 再走到 dispatch seam 是既有時序；只在 plan-final transition 設 gate 會漏掉 direct resume，故相同 admission helper 也要由 `resume_workflow_run()` 對尚無 Builder job 的 exact run 呼叫。
 
-檢查只負責尚未建立第一個 Builder job 的首次轉換。已有 Candidate／Builder job 的 resume/retry 與其 evidence 世代轉換留給現有 Manager 規則或 #1051 recovery 子票；不因這張票重新計算 claim key、source revisions 或 delivery binding。
+此 gate 只對每 run 第一個 Builder job 生效。已有 Builder job 的 run 不在此票的重置範圍；已有 Candidate/PR 的正式 recovery 屬 #1055。
 
-### D2 — 重用 WorkAuthority loader 與既有 source scanner
+### D2 — 將 Todo qualification 和 fresh Monitor authority 當前置契約
 
-Manager 以 `(run.repo, run.work_id)` 呼叫既有 strict `load_work_authority()` 從 Monitor 的 confirmed snapshot 取得唯一 WorkAuthority，消費其 `mapped_todo_paths`、`source_revisions` 與 snapshot identity。不可直接讀 `.cortex/work-items.yaml` 作通過依據；不可在 Manager 內重建 YAML parser 或建立第二套 path/symlink guard。link 的既存 scanner source 驗證、Monitor correlation 與 source revision 仍由既有責任層執行。
+Manager 不把現有 scanner/link code 誤當語意驗證。#1063 負責 qualified canonical Todo result 與已存在 safe scanner source 的 link admission；#1064 負責 latest Monitor attempt/generation/input watermark；#1065 負責 strict WorkAuthority reader，且先驗 freshness 再選 row。#1054 的 code only consumes these typed facts and fails closed on missing/unknown fields.
 
-對 authority missing/ambiguous、snapshot refresh error 或 source path 不符合 canonical workstream Todo 條件，轉成可讀且可行動的 fail-closed outcome。有效 source 的 frontmatter `issue` 必須與該 work item 的 issue identity 相符，`work_item` 必須與 authority work_id 相符，並有具體 Tasks；這些欄位由既有 Monitor scanner/canonical parser 定義，測試使用同一 parser，而不是只比對字串 basename。
+Trusted Monitor result 必須證明 latest attempt successful、snapshot 年齡在明確上限、current `.cortex/work-items.yaml` correlation input revision 與成功 generation 一致、Todo source revision 出自同一 generation。只讀到 old last-good WorkAuthority row 或重算其 payload hash不算 fresh。
 
-### D3 — 使用現有 typed diagnostic 合約
+### D3 — First Builder gate 內做 exact run/claim reconciliation
 
-分別持久化 `missing-canonical-todo-source` 與 `ambiguous-canonical-todo-source`，使用現有 `DiagnosticReason` 的 `reason`、`detail`、`source`、`context` 和 `next_step_hint`。context 至少包括 run_id、work_id、mapped count 與 `authority_ref`（snapshot hash 加 source revision 摘要）；multiple 診斷須提供讓 operator 選擇移除哪個多餘 path 的具體引用。zero 的提示只走 owner 發布→link existing path→fresh Monitor snapshot→正式 start/intake；multiple 才給精確 `unlink --kind path --ref` 範例。
+從 loader 取得與 `(run.repo, run.work_id)` 精確匹配的 WorkAuthority。計算 `authority_digest_without_planning_outputs(authority)`，其結果必須與持久化 `run.source_revision` 相等；它只排除本 workflow 產生的 `superpowers_spec:` / `superpowers_plan:` revisions，Todo mapping、Todo source revision、issue/PR/openspec authority 仍必須比對。
 
-### D4 — 保留 ship backstop 與分離子票的責任
+再用 `claim_key_for_authority_digest(repo=run.repo, work_id=run.work_id, authority_digest=run.source_revision)` 重算並比對 `run.claim_key`，同時確認 registry 中 exact run id 仍是該 WorkAuthority 的 pre-Builder ongoing run。Mismatch 產生 `stale-pre-builder-claim`。不得把 current full digest 的差異默認成無害 plan drift；也不得把 old run 的 claim key／source revision 原位改新。
 
-不修改 `work_actions._ship_action()` 既有要求與 `delivery-needs-human` 行為。此 gate 不建立 Todo，也不處理 #983 類已有 Candidate／PR 的恢復。#810 的 merge 後 checkbox closure、#972/#973 的 main conflict，以及 #911 無 OpenSpec ship lane仍用現有 owners 和各自 acceptance。
+### D4 — Typed outcome 與可執行修復指引
 
-### D5 — 真實 Manager/WorkAuthority 邊界測試
+零 Todo、multiple Todo、authority 無效/不可信、stale pre-Builder claim 各自有穩定 reason、detail、source、context、run/work identity 和 authority ref。zero 說明 owner publish → link existing qualified path → 等 trusted successful generation；multiple 列出 extra mapped paths 和 exact unlink action。Authority revision 改變後，next action 明示不要 resume 舊 run。
 
-使用既有 Manager dispatch seam、strict WorkAuthority loader、Monitor source parser 和 path guard 建立 fixture。以計數器 spy 只觀察 job reservation/creation、worktree creator 和 launcher spawn；對 missing、ambiguous、invalid/stale authority 均需證明計數為零。測試唯一 verified mapping 的正向派工，並證明 link override 寫入不等於 Monitor snapshot 已確認。
+若仍需繼續工作，只有符合「無任何 Builder job、無 Candidate、無 PR、無 active job」的未交付舊 run 才能走既有 exact-CAS `cortex work abandon ... --expected-run-id`，然後 formal `start`/`intake` 新 generation。此為 operator 取消/放棄舊 run，非舊 run 成功或 recovery；old claim/evidence 不重寫。Candidate/PR 已存在時指向 #1055，不建議 abandon。Todo owner source 不得被 abandon 的 planning-artifact GC 移除，應以 fixture 驗證。
 
-## Error and recovery behavior
+### D5 — 以真實 dispatch seam 量測 side effect
 
-| admission input | result | side effects | operator action |
-|---|---|---|---|
-| fresh authority maps 0 Todo paths | `missing-canonical-todo-source` typed stop | Builder job/worktree/agent dispatch = 0 | owner publish canonical issue-backed Todo; link existing path; wait for fresh Monitor snapshot; use formal `start`/`intake` |
-| fresh authority maps >1 Todo paths | `ambiguous-canonical-todo-source` typed stop | Builder job/worktree/agent dispatch = 0 | remove only extra path mapping; wait for fresh Monitor snapshot; use formal Manager admission |
-| authority missing, invalid, or refresh failed | fail-closed typed stop with snapshot diagnostic | Builder job/worktree/agent dispatch = 0 | repair Monitor/source state and obtain a successful fresh snapshot |
-| exactly 1 valid path in fresh authority | admission passes | existing Manager Builder dispatch proceeds | none |
+用 Manager 與真 WorkAuthority/Monitor/source qualification fixture，包裝計數器觀察 Builder job reservation/creation、worktree create 和 launcher dispatch。缺少/不唯一/不合格/stale/untrusted/claim drift 與 direct resume 皆需在三者之前停止；只有一筆 current-generation qualified Todo 且 exact run/claim match 時才抵達正常 Builder 派工。Tests 不連外、不操作正式 state。
+
+### D6 — 將依賴、責任邊界與交付 gates 留在 issue-backed plan
+
+#1054 被 #1063（Todo qualification/path）、#1065（strict WorkAuthority freshness consumer）阻擋；#1065 等 #1064（Monitor generation producer）。#1055 仍 hard-blocked by #1054，且只處理已有 Candidate/PR。保留 #810 closure、#911 OpenSpec=0 lane、#972/#973 conflict scope 和 ship 唯一 Todo backstop。
+
+Implementation 必須更新 lifecycle docs 和 changelog fragment/Unreleased；執行 focused tests、完整 tests、OpenSpec、PR-context policy 和 diff check。planning PR 不 intake/merge、不改產品 code、正式 run、Monitor snapshot、registry、journal 或 PR。
+
+## Admission matrix
+
+| First-Builder input | Outcome | Builder job/worktree/agent |
+|---|---|---|
+| 0 qualified Todo | `missing-canonical-todo-source` | 0 / 0 / 0 |
+| 2+ qualified Todo | `ambiguous-canonical-todo-source`, list paths | 0 / 0 / 0 |
+| Last refresh failed, old successful Todo row remains | trusted authority unavailable | 0 / 0 / 0 |
+| link override newer than last successful generation, or snapshot stale/unknown | trusted authority unavailable | 0 / 0 / 0 |
+| invalid issue/work_item/Tasks/path qualification | source not counted; typed stop | 0 / 0 / 0 |
+| Todo/source digest differs from exact pre-Builder run claim | `stale-pre-builder-claim`; no direct resume | 0 / 0 / 0 |
+| only workflow spec/plan revisions differ; derived claim still matches | admission continues if one qualified Todo is otherwise current | normal dispatch |
+| exactly 1 qualified Todo, same trusted generation, exact claim match | admission passes | existing Builder flow |
 
 ## Projected five-dimension sizing
 
-Scope is only the pre-first-Builder Manager admission and diagnostic contract in #1054. It does not absorb #1051's existing-Candidate recovery.
+This child is only Manager's first-Builder gate, stale direct-resume stop and typed diagnostic integration. Source semantic validation/path existence are #1063; generation producer is #1064; trusted WorkAuthority reader is #1065. No new durable field/store or claim mutation is in this implementation scope.
 
 | Dimension | Score | Basis |
 |---|---:|---|
-| `domain_breadth` | 0 | One production responsibility and one production module: Manager dispatch admission. WorkAuthority, Monitor scanner, typed diagnostics, CLI link behavior and ship backstop are consumed through existing contracts. |
-| `state_consistency` | 0 | No new durable store, claim era, CAS, source revision writer or delivery transition. The gate reads confirmed WorkAuthority and writes the existing Manager-owned typed stop. |
-| `acceptance_surfaces` | 2 | `fix-standard` contributes two core gate-spine entries; R-09/R-16/R-19 are applicable to a code PR, so the sizing signal is above two. |
-| `spec_stability` | 0 | Spec, design and Todo are accepted and complete with no blocking markers (`stability-risk-v2`). |
-| `orchestration` | 2 | The loaded `fix-standard` combo has nine cards with multiple persona bindings. |
-| **Total** | **4 / Yellow** | Official `current_sizing_snapshot()` result is required before this packet is relied on for implementation intake. |
+| `domain_breadth` | 0 | One production responsibility in `manager.py`; consume existing claim digest helpers and issue-backed WorkAuthority APIs. |
+| `state_consistency` | 0 | Read-only comparison to persisted `source_revision`/`claim_key`; no claim rewrite or new state. Existing operator abandon/start APIs are not modified. |
+| `acceptance_surfaces` | 2 | `fix-standard` gate spine plus repo-wide R-09/R-16/R-19 process surfaces. |
+| `spec_stability` | 0 | Complete accepted spec/design/Todo triad without blocking marker. |
+| `orchestration` | 2 | `fix-standard` has nine cards with multiple persona bindings. |
+| **Total** | **4 / Yellow** | Must be recomputed with the official current snapshot before implementation intake. All three source prerequisites must land first. |
+
+## Non-goals
+
+- No semantic Todo parser, path-existence/link-write guard, Monitor refresh generation or WorkAuthority freshness implementation.
+- No changing claim digest rules or rewriting/superseding an old claim automatically.
+- No abandon/recovery implementation. The plan only directs an operator to the existing exact-CAS pre-delivery abandon action under R4/R5 predicates.
+- No #1055 existing Candidate/PR recovery; no #810 checkbox closure; no #972/#973 PR conflict; no OpenSpec requirement added to #911's supported lane.
+- No change to `work_actions._ship_action()` unique-Todo backstop, CLI commands, or runtime service.
 
 ## Implementation boundary
 
-Primary source module is `paulsha_cortex/coordinator/manager.py`; tests exercise the existing WorkAuthority and scanner/path-guard implementation without changing its ownership. If implementation requires edits to a second production module, a new persistent field/store, claim-key or source-revision updates, a new CLI command, or a change to ship semantics, re-evaluate the dimensions and acceptance scope before proceeding. A Red result requires an issue-backed split, not a lowered declaration.
+Primary production module is `paulsha_cortex/coordinator/manager.py`. If code work needs changes to source qualification, provider refresh state, WorkAuthority loader, claim keys, persisted run state or delivery semantics, stop and resolve the named prerequisite/issue before implementation; do not silently expand this Yellow slice.

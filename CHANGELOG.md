@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#1054 build 前 Todo admission 規劃**：新增獨立 spec／design／canonical Todo 與唯一 issue-backed work-item binding，定義 Manager 僅在 fresh WorkAuthority 確認唯一 Todo 後才可建立第一個 Builder job；本 PR 僅交付規劃，不含產品程式碼或正式 intake。
+- **#1054 build 前 Todo admission 規劃**：修正 Manager first-Builder gate 契約，明定 Todo qualification、latest successful Monitor generation 與 WorkAuthority freshness 由硬依賴 #1063/#1064/#1065 提供；加入 exact run/claim reconciliation、stale direct resume fail-closed 和 pre-Builder exact abandon→new start 邊界。本 Draft PR 僅交付規劃，不含產品程式碼或正式 intake。
 - **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
 - **#966 Yellow plan review 完整性**：將 T6 既有文件交付項目明列為 `documentation`，對齊 accepted plan 的 `artifact_classes`；產品驗收範圍不變。
 - **#1040 driving-cortex resume 範例**：移除 resume 不接受的 `--expected-run-id`，補上唯讀核對 repo/work item/唯一 ongoing run 的步驟，並讓 retry-build 範例明示必需的 exact Candidate。
