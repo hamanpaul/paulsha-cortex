@@ -1492,6 +1492,20 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/copilot-review-late-observation/todo.md'
     excludes: []
+  same-run-authority-restart:
+    title: 'same-run-authority-restart'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1069'
+      - kind: openspec
+        ref: 'same-run-authority-restart'
+      - kind: path
+        ref: 'docs/superpowers/specs/same-run-authority-restart-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/same-run-authority-restart-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/same-run-authority-restart/todo.md'
+    excludes: []
   main-probe-gate:
     title: 'main-probe-gate'
     links:

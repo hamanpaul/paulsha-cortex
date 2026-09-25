@@ -1,0 +1,1 @@
+- **#1069 規劃：既有 Candidate run 的 same-run authority restart**：綁定唯一 issue/work item/OpenSpec，界定明確 operator resume、fresh WorkAuthority、#1068 exact CAS 與重驗同一 Candidate/PR 的邊界；此 PR 僅發布 draft planning artifacts，不 intake 或實作。
