@@ -71,14 +71,15 @@ def _wait_for_json_file(path: Path, proc: subprocess.Popen[str], *, label: str) 
     return _read_json(_wait_for_file(path, proc, label=label))
 
 
-def _spawn_worker(
+def _spawn_child(
     *,
+    command: str,
     worker: str,
     state_path: Path,
     control_dir: Path,
-    slice_id: str,
-    action: str,
-    actor: str,
+    slice_id: str | None = None,
+    action: str | None = None,
+    actor: str | None = None,
     state: str | None = None,
     gate_state: str | None = None,
 ) -> subprocess.Popen[str]:
@@ -93,19 +94,21 @@ def _spawn_worker(
         sys.executable,
         str(Path(__file__).resolve()),
         "--child",
+        "--command",
+        command,
         "--worker",
         worker,
         "--state-path",
         str(state_path),
         "--control-dir",
         str(control_dir),
-        "--slice-id",
-        slice_id,
-        "--action",
-        action,
-        "--actor",
-        actor,
     ]
+    if slice_id is not None:
+        argv.extend(["--slice-id", slice_id])
+    if action is not None:
+        argv.extend(["--action", action])
+    if actor is not None:
+        argv.extend(["--actor", actor])
     if state is not None:
         argv.extend(["--state", state])
     if gate_state is not None:
@@ -117,6 +120,60 @@ def _spawn_worker(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+    )
+
+
+def _spawn_worker(
+    *,
+    worker: str,
+    state_path: Path,
+    control_dir: Path,
+    slice_id: str,
+    action: str,
+    actor: str,
+    state: str | None = None,
+    gate_state: str | None = None,
+) -> subprocess.Popen[str]:
+    return _spawn_child(
+        command="record-action",
+        worker=worker,
+        state_path=state_path,
+        control_dir=control_dir,
+        slice_id=slice_id,
+        action=action,
+        actor=actor,
+        state=state,
+        gate_state=gate_state,
+    )
+
+
+def _spawn_lock_holder(
+    *,
+    worker: str,
+    state_path: Path,
+    control_dir: Path,
+) -> subprocess.Popen[str]:
+    return _spawn_child(
+        command="hold-lock",
+        worker=worker,
+        state_path=state_path,
+        control_dir=control_dir,
+    )
+
+
+def _spawn_create_slice(
+    *,
+    worker: str,
+    state_path: Path,
+    control_dir: Path,
+    slice_id: str,
+) -> subprocess.Popen[str]:
+    return _spawn_child(
+        command="create-slice",
+        worker=worker,
+        state_path=state_path,
+        control_dir=control_dir,
+        slice_id=slice_id,
     )
 
 
@@ -263,6 +320,40 @@ def test_same_slice_same_revision_second_writer_gets_conflict_not_success(tmp_pa
     assert [entry["action"] for entry in slice_a["actions"]] == ["builder-started"]
 
 
+def test_transaction_lock_crash_releases_sidecar_without_owner_bytes(tmp_path: Path) -> None:
+    state_path = tmp_path / "jobs.json"
+    control_dir = tmp_path / "control"
+    control_dir.mkdir()
+
+    holder = _spawn_lock_holder(
+        worker="lock-holder",
+        state_path=state_path,
+        control_dir=control_dir,
+    )
+    locked = _wait_for_json_file(control_dir / "lock-holder.locked.json", holder, label="lock-holder")
+    lock_path = Path(str(locked["lock_path"]))
+
+    holder.kill()
+    holder.wait(timeout=WAIT_TIMEOUT_SECONDS)
+
+    writer = _spawn_create_slice(
+        worker="writer-after-kill",
+        state_path=state_path,
+        control_dir=control_dir,
+        slice_id="slice-a",
+    )
+    result = _finish_worker(
+        writer,
+        control_dir / "writer-after-kill.result.json",
+        label="writer-after-kill",
+    )
+
+    assert result["status"] == "ok"
+    assert lock_path.exists()
+    assert lock_path.read_bytes() == b""
+    assert json.loads(state_path.read_text(encoding="utf-8"))["slices"][0]["slice_id"] == "slice-a"
+
+
 def _wait_for_release(path: Path) -> None:
     deadline = time.monotonic() + WAIT_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -275,6 +366,53 @@ def _wait_for_release(path: Path) -> None:
 def _worker_main(args: argparse.Namespace) -> int:
     state_path = Path(args.state_path)
     control_dir = Path(args.control_dir)
+    if args.command == "hold-lock":
+        registry = JobRegistry(state_path=state_path)
+        with registry._hold_state_transaction_lock():
+            _write_json(
+                control_dir / f"{args.worker}.locked.json",
+                {
+                    "worker": args.worker,
+                    "lock_path": str(registry.state_transaction_lock_path),
+                },
+            )
+            _wait_for_release(control_dir / f"{args.worker}.go")
+        return 0
+    if args.command == "create-slice":
+        registry = JobRegistry(state_path=state_path)
+        try:
+            created = registry.create_slice(
+                slice_id=args.slice_id,
+                spec_path=f"specs/{args.slice_id}.md",
+                spec_hash=f"{args.slice_id}-spec-sha",
+                plan_path=f"plans/{args.slice_id}.md",
+                plan_hash=f"{args.slice_id}-plan-sha",
+                target_branch=f"feature/{args.slice_id}",
+                dispatch_base=f"{args.slice_id}-base-sha",
+                builder_job_id=None,
+                reviewer_job_id=None,
+                candidate=None,
+            )
+        except Exception as exc:  # noqa: BLE001 - child must report exact exception surface.
+            _write_json(
+                control_dir / f"{args.worker}.result.json",
+                {
+                    "worker": args.worker,
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
+            return 0
+        _write_json(
+            control_dir / f"{args.worker}.result.json",
+            {
+                "worker": args.worker,
+                "status": "ok",
+                "slice_id": created["slice_id"],
+            },
+        )
+        return 0
     registry = JobRegistry(state_path=state_path)
     loaded_revision = hashlib.sha256(state_path.read_bytes()).hexdigest()
     _write_json(
@@ -325,6 +463,7 @@ def _worker_main(args: argparse.Namespace) -> int:
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--child", action="store_true")
+    parser.add_argument("--command", default="record-action")
     parser.add_argument("--worker")
     parser.add_argument("--state-path")
     parser.add_argument("--control-dir")

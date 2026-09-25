@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from paulsha_cortex.coordinator import registry as registry_module
-from paulsha_cortex.coordinator.registry import JobRegistry
+from paulsha_cortex.coordinator.registry import JobRegistry, RegistryRevisionConflict
 from paulsha_cortex.coordinator.workflow import (
     PlanningArtifactAuthority,
     SHIP_TRANSITION_STAGES,
@@ -333,3 +333,188 @@ def test_terminal_workflow_evidence_locator_is_single_assignment_and_durable(tmp
             locator={**locator, "hash": "c" * 64},
             subject_head="b" * 40,
         )
+
+
+def test_conflict_restores_latest_durable_snapshot_and_fields(tmp_path: Path) -> None:
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    registry.create_job(
+        task="slice-a",
+        persona="builder",
+        branch="feature/slice-a",
+        pane="%0",
+        worktree="/wt/slice-a",
+    )
+    registry.create_slice(
+        slice_id="slice-a",
+        spec_path="specs/slice-a.md",
+        spec_hash="spec-sha",
+        plan_path="plans/slice-a.md",
+        plan_hash="plan-sha",
+        target_branch="main",
+        dispatch_base="base-sha",
+        builder_job_id=None,
+        reviewer_job_id=None,
+        candidate=None,
+    )
+    workflow = _create_run(registry)
+
+    stale = JobRegistry(state_path=state)
+    expected_revision = hashlib.sha256(state.read_bytes()).hexdigest()
+
+    fresh = JobRegistry(state_path=state)
+    fresh.record_action(
+        "slice-a",
+        action="builder-started",
+        actor="builder",
+        state="running",
+    )
+    actual_revision = hashlib.sha256(state.read_bytes()).hexdigest()
+
+    with pytest.raises(RegistryRevisionConflict) as excinfo:
+        stale.record_action(
+            "slice-a",
+            action="operator-abandon",
+            actor="operator",
+            state="failed",
+            gate_state="failed",
+        )
+
+    restored = JobRegistry(state_path=state)
+    conflict = excinfo.value
+    assert conflict.expected_revision == expected_revision
+    assert conflict.actual_revision == actual_revision
+    assert conflict.state_path == stale.canonical_state_path
+    assert stale.list_jobs() == restored.list_jobs()
+    assert stale.list_slices() == restored.list_slices()
+    assert stale.list_workflow_runs() == restored.list_workflow_runs()
+    assert stale.list_legacy_records() == restored.list_legacy_records()
+    assert stale.list_reclaim_resets() == restored.list_reclaim_resets()
+    assert stale.get_workflow_run(workflow.run_id) == restored.get_workflow_run(workflow.run_id)
+    assert stale._seq == restored._seq
+    assert stale._loaded_revision == actual_revision
+
+
+def test_canonical_state_path_collapses_symlinked_directory_spellings(tmp_path: Path) -> None:
+    actual_dir = tmp_path / "actual"
+    actual_dir.mkdir()
+    alias_dir = tmp_path / "alias"
+    alias_dir.symlink_to(actual_dir, target_is_directory=True)
+
+    direct = JobRegistry(state_path=actual_dir / "jobs.json")
+    aliased = JobRegistry(state_path=alias_dir / "jobs.json")
+    aliased.create_slice(
+        slice_id="slice-a",
+        spec_path="specs/slice-a.md",
+        spec_hash="spec-sha",
+        plan_path="plans/slice-a.md",
+        plan_hash="plan-sha",
+        target_branch="main",
+        dispatch_base="base-sha",
+        builder_job_id=None,
+        reviewer_job_id=None,
+        candidate=None,
+    )
+
+    assert direct.canonical_state_path == actual_dir / "jobs.json"
+    assert aliased.canonical_state_path == direct.canonical_state_path
+    assert aliased.state_transaction_lock_path == actual_dir / "jobs.json.transaction.lock"
+    assert aliased.state_transaction_lock_path.read_bytes() == b""
+
+
+def test_canonical_state_path_expands_home_spellings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    registry = JobRegistry(state_path="~/jobs.json")
+
+    assert registry.canonical_state_path == tmp_path.resolve() / "jobs.json"
+    assert registry.state_transaction_lock_path == (
+        tmp_path.resolve() / "jobs.json.transaction.lock"
+    )
+
+
+def test_state_file_symlink_replacement_keeps_target_unchanged(tmp_path: Path) -> None:
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target_state = target_dir / "jobs.json"
+    seeded = JobRegistry(state_path=target_state)
+    seeded.create_slice(
+        slice_id="slice-a",
+        spec_path="specs/slice-a.md",
+        spec_hash="spec-sha",
+        plan_path="plans/slice-a.md",
+        plan_hash="plan-sha",
+        target_branch="main",
+        dispatch_base="base-sha",
+        builder_job_id=None,
+        reviewer_job_id=None,
+        candidate=None,
+    )
+    original_target_bytes = target_state.read_bytes()
+
+    link_dir = tmp_path / "links"
+    link_dir.mkdir()
+    link_state = link_dir / "jobs-link.json"
+    link_state.symlink_to(target_state)
+
+    registry = JobRegistry(state_path=link_state)
+    registry.record_action(
+        "slice-a",
+        action="via-symlink",
+        actor="builder",
+        state="running",
+    )
+
+    assert registry.canonical_state_path == link_dir.resolve() / "jobs-link.json"
+    assert registry.state_transaction_lock_path == (
+        link_dir.resolve() / "jobs-link.json.transaction.lock"
+    )
+    assert registry.state_transaction_lock_path.read_bytes() == b""
+    assert not link_state.is_symlink()
+    assert target_state.read_bytes() == original_target_bytes
+
+    payload = json.loads(link_state.read_text(encoding="utf-8"))
+    assert payload["slices"][0]["actions"][0]["action"] == "via-symlink"
+    assert payload["slices"][0]["state"] == "running"
+
+
+def test_stale_v1_migration_has_no_backup_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = tmp_path / "jobs.json"
+    original = json.dumps(_legacy_v1_payload(), ensure_ascii=False, indent=2).encode("utf-8")
+    state.write_bytes(original)
+    replacement_payload = {
+        "schema_version": 2,
+        "seq": 7,
+        "jobs": [],
+        "slices": [],
+        "workflows": [],
+        "legacy_records": {"source_schema_version": 1, "seq": 0, "jobs": [], "slices": []},
+        "reclaim_resets": [],
+    }
+    replacement_bytes = json.dumps(
+        replacement_payload,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8")
+
+    original_read = registry_module.JobRegistry._read_durable_snapshot
+    call_count = 0
+
+    def race_read(self):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            state.write_bytes(replacement_bytes)
+        return original_read(self)
+
+    monkeypatch.setattr(registry_module.JobRegistry, "_read_durable_snapshot", race_read)
+    registry = JobRegistry(state_path=state)
+
+    assert state.read_bytes() == replacement_bytes
+    assert list(tmp_path.glob("jobs.json.v1.*.bak")) == []
+    assert registry.list_jobs() == []
+    assert registry.list_slices() == []
+    assert registry.list_legacy_records() == replacement_payload["legacy_records"]
+    assert registry._loaded_revision == hashlib.sha256(replacement_bytes).hexdigest()
