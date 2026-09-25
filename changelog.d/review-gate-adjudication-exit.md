@@ -1,0 +1,1 @@
+#956 review gate operator 裁決出口：`retry-review --reason` 保存裁決 evidence 並供 reviewer prompt 使用；blocking-findings 的 status／resume 顯示 retry-review／retry-build 出口與指令提示；rejected review gate 的 `review-attest` 明確 fail closed。同步更新 coordinator help 與 lifecycle 文件。
