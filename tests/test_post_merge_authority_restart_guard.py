@@ -18,6 +18,7 @@ WORK_ID = "archive-proof"
 CHANGE = "canary"
 ISSUE_NUMBER = 7
 PR_NUMBER = 9
+SECOND_PR_NUMBER = 10
 NOW = "2026-09-23T00:00:00Z"
 _MISSING = object()
 
@@ -44,11 +45,16 @@ def _source(
     return payload
 
 
-def _default_remote_pr_row() -> dict[str, object]:
+def _default_remote_pr_row(
+    *,
+    pr_number: int = PR_NUMBER,
+    candidate: str = "a" * 40,
+    merge_revision: str = "b" * 40,
+) -> dict[str, object]:
     return {
-        "source_id": f"github_pr:{REPO}#{PR_NUMBER}",
-        "candidate": "a" * 40,
-        "merge_revision": "b" * 40,
+        "source_id": f"github_pr:{REPO}#{pr_number}",
+        "candidate": candidate,
+        "merge_revision": merge_revision,
         "merged_with_merge_commit": True,
     }
 
@@ -286,14 +292,20 @@ def _add_late_malformed_github_pr_status(payload: dict[str, object]) -> None:
     )
 
 
-def _append_qualifying_pr_source(payload: dict[str, object]) -> None:
+def _append_qualifying_pr_source(
+    payload: dict[str, object],
+    *,
+    pr_number: int = PR_NUMBER,
+    status: str = "closed",
+    revision: str | None = None,
+) -> None:
     payload["work_items"][0]["sources"].append(
         _source(
-            source_id=f"github_pr:{REPO}#{PR_NUMBER}",
+            source_id=f"github_pr:{REPO}#{pr_number}",
             kind="github_pr",
-            ref=f"{REPO}#{PR_NUMBER}",
-            revision="github:pr:9",
-            status="closed",
+            ref=f"{REPO}#{pr_number}",
+            revision=revision or f"github:pr:{pr_number}",
+            status=status,
             provider=f"github:{REPO}",
         )
     )
@@ -307,6 +319,56 @@ def test_exact_remote_merge_proof_prefers_archived_authority(tmp_path: Path) -> 
     expected = _load(expected_path)
 
     snapshot = _write_snapshot(tmp_path / "active-plus-archived.json", _snapshot_payload())
+    authority = _load(snapshot)
+
+    assert authority.source_revisions == expected.source_revisions
+    assert work_authority_digest(authority) == work_authority_digest(expected)
+    assert authority.mapped_openspec == expected.mapped_openspec == (CHANGE,)
+
+
+def test_archive_reconciliation_accepts_multiple_confirmed_pr_sources_with_unique_remote_proofs(
+    tmp_path: Path,
+) -> None:
+    remote_prs = [
+        _default_remote_pr_row(),
+        _default_remote_pr_row(
+            pr_number=SECOND_PR_NUMBER,
+            candidate="c" * 40,
+            merge_revision="f" * 40,
+        ),
+    ]
+    expected_payload = _snapshot_payload(
+        include_local_active=False,
+        remote_prs=[dict(row) for row in remote_prs],
+    )
+    _append_qualifying_pr_source(expected_payload, pr_number=SECOND_PR_NUMBER)
+    expected = _load(
+        _write_snapshot(tmp_path / "archived-only-two-prs.json", expected_payload)
+    )
+
+    payload = _snapshot_payload(remote_prs=[dict(row) for row in remote_prs])
+    _append_qualifying_pr_source(payload, pr_number=SECOND_PR_NUMBER)
+    authority = _load(_write_snapshot(tmp_path / "active-plus-two-prs.json", payload))
+
+    assert authority.source_revisions == expected.source_revisions
+    assert work_authority_digest(authority) == work_authority_digest(expected)
+    assert authority.mapped_openspec == expected.mapped_openspec == (CHANGE,)
+
+
+def test_exact_remote_merge_proof_accepts_merged_pr_status(tmp_path: Path) -> None:
+    expected_path = _write_snapshot(
+        tmp_path / "archived-only-merged.json",
+        _snapshot_payload(
+            include_local_active=False,
+            pr_status="merged",
+        ),
+    )
+    expected = _load(expected_path)
+
+    snapshot = _write_snapshot(
+        tmp_path / "active-plus-archived-merged.json",
+        _snapshot_payload(pr_status="merged"),
+    )
     authority = _load(snapshot)
 
     assert authority.source_revisions == expected.source_revisions
