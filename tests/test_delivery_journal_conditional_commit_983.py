@@ -168,6 +168,36 @@ def test_legacy_revisionless_journal_loads_and_upgrades_on_first_change(
     assert set(persisted["runs"]) == {"run-a", "run-b"}
 
 
+def test_load_and_save_fail_closed_on_malformed_current_journal(
+    tmp_path: Path,
+) -> None:
+    journal_path = tmp_path / "delivery-journal.json"
+    _initialize_run(journal_path)
+
+    state = work_actions._load_runs(journal_path)
+    state["runs"]["run-b"] = _run_row("run-b")
+
+    malformed = (
+        json.dumps(
+            {
+                "schema": "cortex-delivery-journal/v1",
+                "runs": [],
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    journal_path.write_text(malformed, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="work run state malformed"):
+        work_actions._load_runs(journal_path)
+
+    with pytest.raises(ValueError, match="work run state malformed"):
+        work_actions._save_runs(journal_path, state)
+
+    assert journal_path.read_text(encoding="utf-8") == malformed
+
+
 def test_lock_is_stable_across_processes_and_times_out_when_held(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -369,6 +399,7 @@ def test_append_delivery_publication_event_enforces_replay_and_order(
         ("after-file-fsync", False),
         ("after-replace", True),
         ("after-directory-fsync", True),
+        ("after-readback", True),
     ],
 )
 def test_append_unknown_retries_resolve_exact_event_state(
