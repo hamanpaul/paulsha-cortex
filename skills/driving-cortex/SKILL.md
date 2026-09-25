@@ -37,14 +37,19 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 
 - 每次 run 啟動順序：
   - `cortex work start --workflow-action`（依 manager 指示）
-  - `cortex work resume --expected-run-id`（run 卡住時）
-  - `cortex work retry-build --payload ...`（build 後重試）
+  - run 卡住時，先依下方唯讀檢查確認唯一 ongoing run，再執行 `cortex run work resume <work_id> --repo <owner/repo> --wait --json`；resume 不接受 `--expected-run-id`
+  - `cortex run work retry-build <work_id> --repo <owner/repo> --expected-candidate <exact-candidate-sha> --wait --json`（build 後重試；必須提供 exact Candidate）
   - `cortex work review-attest --payload ...`（有 `review-attest` evidence 時）
 - 恢復桿（依序操作）：
-  - [ ] run 停留在 `needs_human` 時，先看 run/facet 的 blocking reason，補齊對應 artifact 再 resume。
-  - [ ] 驗證卡片 evidence 的 binding 是否可重讀，必要時用 `cortex work retry-build`。
-  - [ ] review-thread 未關閉但 merge-ready 前先在 remote 解決 thread，再以 `cortex work resume` 重繼。
-  - [ ] merge 後發現 run 尚未前進時，等待下一 run 合併後再 resume（避免手動強推）。
+  - [ ] run 停留在 `needs_human` 時，先看 run/facet 的 blocking reason，補齊對應 artifact，再依下方唯讀檢查後 resume。
+  - [ ] 驗證卡片 evidence 的 binding 是否可重讀；必要時以該 run 的 exact Candidate 執行 `cortex run work retry-build <work_id> --repo <owner/repo> --expected-candidate <exact-candidate-sha>`。
+  - [ ] review-thread 未關閉但 merge-ready 前先在 remote 解決 thread，再依下方唯讀檢查後 resume。
+  - [ ] merge 後發現 run 尚未前進時，等待下一 run 合併，再依下方唯讀檢查後 resume（避免手動強推）。
+
+### Resume 前的唯讀檢查
+
+- 先執行 `cortex work show <work_id> --repo <owner/repo> --json`，確認 `item.repo`、`item.work_id` 與授權 issue 符合預期；在 `item.sources` 中篩選 `kind == "workflow_run"` 且 `status == "ongoing"` 的來源，必須恰好一筆，並核對其 `ref` 是預期 run。
+- 確認唯一 ongoing run 後，以 `cortex run work resume <work_id> --repo <owner/repo> --wait --json` 恢復。不要附 `--expected-run-id`：parser 雖接受此旗標，Manager 的 resume admission 會拒絕 caller-supplied run evidence。若沒有 ongoing run 或結果不唯一，先停下並釐清 Manager/Monitor 狀態。
 
 ## 執行器設定
 

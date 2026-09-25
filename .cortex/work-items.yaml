@@ -1408,6 +1408,18 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/openspec-remote-archive-authority-reconciliation-design.md'
     excludes: []
+  merged-run-completion-finalizer:
+    title: 'merged-run-completion-finalizer'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#977'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/merged-run-completion-finalizer/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/merged-run-completion-finalizer-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/merged-run-completion-finalizer-design.md'
+    excludes: []
   registry-revision-cas:
     title: 'registry-revision-cas'
     links:
@@ -1479,4 +1491,16 @@ work_items:
         ref: 'docs/superpowers/specs/copilot-review-late-observation-design.md'
       - kind: path
         ref: 'docs/superpowers/workstreams/copilot-review-late-observation/todo.md'
+    excludes: []
+  main-probe-gate:
+    title: 'main-probe-gate'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#987'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-probe-gate/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-probe-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-probe-design.md'
     excludes: []
