@@ -16,7 +16,7 @@ sizing: yellow
 
 ### D1. Probe result 與失敗資訊同型
 
-以 `MainSyncProbe | MainSyncProbeFailure` 傳回 validator。不得透過 `base_sha_probe` 或 default Git runner 探測，因兩者沒有保留所有 command failure stage/returncode 與明確 timeout 的契約。使用 direct argument-vector subprocess calls，逐階段記錄 Candidate resolve/validation、fetch、`FETCH_HEAD` resolve/validation、merge-base、merge-tree、path parse；每次呼叫均設有限 timeout、捕捉原始 returncode/stdout/stderr，timeout 記 `returncode=None,error_kind=timeout`。Failure 的 `main_head` 在合法 M 尚未 resolve 時為 None；FETCH_HEAD 取得合法 M 後的任何錯誤都必須保留 M。驗證 M/C 是 repository object format 的 full object ID 且可解析為 commit，避免將縮寫或非 commit SHA 傳入 ancestry command。
+以 `MainSyncProbe | MainSyncProbeFailure` 傳回 validator。不得透過 `base_sha_probe` 或 default Git runner 探測，因兩者沒有保留所有 command failure stage/returncode 與明確 timeout 的契約。使用 direct argument-vector subprocess calls，逐階段記錄 Candidate resolve/validation、fetch、`FETCH_HEAD` resolve/validation、merge-base、merge-tree、path parse；每次呼叫均設有限 timeout、捕捉原始 returncode/stdout/stderr，timeout 記 `returncode=None,error_kind=timeout`。Failure 的 `main_head` 在合法 M 尚未 resolve 時為 None；FETCH_HEAD 取得合法 M 後的任何錯誤都必須保留 M。此處的 `None` 是 Python 物件值；寫入 D2 的 JSON evidence 時序列化為 `null`。驗證 M/C 是 repository object format 的 full object ID 且可解析為 commit，避免將縮寫或非 commit SHA 傳入 ancestry command。
 
 ### D2. Durable delivery evidence preserves the typed failure
 
