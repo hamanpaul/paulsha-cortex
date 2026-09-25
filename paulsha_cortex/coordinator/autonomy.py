@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import inspect
 import logging
 import os
@@ -655,6 +656,7 @@ def dispatch_ready(
     errors: list[tuple[str, Exception]] = []
     for m in ready:
         slice_id = m["slice_id"]
+        snapshot = _recovery_slice_snapshot(dispatcher, slice_id)
         job: dict | None = None
         pinned_inputs: dict | None = None
         early_dispatch_head: str | None = None
@@ -665,6 +667,8 @@ def dispatch_ready(
         launch_executor: str | None = None
         launch_model_id: str | None = None
         slice_recorded = False
+        launched = False
+        written_dispatch_base: str | None = None
         try:
             pinned_inputs = pin_dispatch_inputs(m)
             # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查
@@ -744,6 +748,7 @@ def dispatch_ready(
                 dispatch_base=early_dispatch_head,
             )
             slice_recorded = True
+            written_dispatch_base = early_dispatch_head
             # #503：builder 只拿 task id＋plan 路徑不是 authority——controller 重釘 spec
             # 加進的 recovery 指示會在模型邊界被靜默丟掉。slice row 登記後重讀 spec、hash
             # 必須等於 pin 值（launch-time equality），逐字交付進 prompt，並把交付的 hash
@@ -797,6 +802,8 @@ def dispatch_ready(
                 builder_job_id=job.get("job_id"),
                 dispatch_base=base_sha or dispatch_head,
             )
+            if base_sha or dispatch_head:
+                written_dispatch_base = base_sha or dispatch_head
             # #381：真正 spawn 前才 admit——記錄下這次要用的 job row 之後、
             # Popen 之前，讓等待時間不計入「job 已在跑」的錯覺。
             limiter.admit(
@@ -819,10 +826,11 @@ def dispatch_ready(
                 worktree=worktree,
                 log_dir=log_dir,
             )
+            launched = True
             job = _attach_launch_handle(dispatcher=dispatcher, job=job, handle=handle)
             jobs.append(job)
         except Exception as exc:
-            if pinned_inputs is not None and not slice_recorded:
+            if pinned_inputs is not None and not slice_recorded and snapshot is None:
                 try:
                     _record_pending_slice(
                         dispatcher=dispatcher,
@@ -841,7 +849,19 @@ def dispatch_ready(
                     exc=exc,
                 )
             if pinned_inputs is not None:
-                _mark_slice_needs_human(dispatcher, slice_id, reason=str(exc))
+                if snapshot is not None and not launched:
+                    _settle_recovery_dispatch_failure(
+                        dispatcher,
+                        slice_id,
+                        prior=snapshot,
+                        repinned=slice_recorded,
+                        pinned_inputs=pinned_inputs,
+                        written_dispatch_base=written_dispatch_base,
+                        launch_job_id=job.get("job_id") if job is not None else None,
+                        exc=exc,
+                    )
+                else:
+                    _mark_slice_needs_human(dispatcher, slice_id, reason=str(exc))
             errors.append((slice_id, exc))
     if errors:
         raise DispatchReadyError(errors, jobs)
@@ -974,6 +994,26 @@ def _resolve_target_base_sha(
         if ancestor["status"] != "ok":
             raise ValueError(f"dependency candidate stale: {dep}")
     return target_sha
+
+
+def _recovery_slice_snapshot(dispatcher, slice_id: str) -> dict | None:
+    registry = getattr(dispatcher, "_registry", None)
+    get_slice = getattr(registry, "get_slice", None)
+    if not callable(get_slice):
+        return None
+    try:
+        slice_row = get_slice(slice_id)
+    except Exception:
+        return None
+    if not isinstance(slice_row, dict):
+        return None
+    if slice_row.get("state") not in {"needs_human", "failed"}:
+        return None
+    try:
+        snapshot = copy.deepcopy(slice_row)
+    except Exception:
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
 
 
 def _launcher_worktree(dispatcher, slice_id: str, *, base_sha: str | None = None) -> str:
@@ -1152,6 +1192,172 @@ def _mark_slice_needs_human(dispatcher, slice_id: str, *, reason: str) -> None:
         )
     except Exception:
         _ = reason
+
+
+def _restore_recovery_slice(
+    dispatcher,
+    slice_id: str,
+    *,
+    prior: dict,
+    pinned_inputs: dict,
+    written_dispatch_base: str | None,
+    launch_job_id: str | None,
+) -> bool:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        return False
+    try:
+        current = registry.get_slice(slice_id)
+    except Exception:
+        return False
+    if not isinstance(current, dict):
+        return False
+
+    spec = current.get("spec")
+    plan = current.get("plan")
+    verification_row = current.get("verification")
+    actions = current.get("actions")
+    evidence_history = current.get("evidence_history")
+    evaluation_history = current.get("evaluation_history")
+    if not isinstance(spec, dict) or not isinstance(plan, dict) or not isinstance(verification_row, dict):
+        return False
+    if not isinstance(actions, list) or not isinstance(evidence_history, list) or not isinstance(
+        evaluation_history, list
+    ):
+        return False
+
+    prior_spec = prior.get("spec")
+    prior_plan = prior.get("plan")
+    prior_verification = prior.get("verification")
+    if (
+        not isinstance(prior_spec, dict)
+        or not isinstance(prior_plan, dict)
+        or not isinstance(prior_verification, dict)
+    ):
+        return False
+
+    builder_job_id = current.get("builder_job_id")
+    current_state = current.get("state")
+    if (
+        spec.get("path") != pinned_inputs["spec_path"]
+        or spec.get("hash") != pinned_inputs["spec_hash"]
+        or plan.get("path") != pinned_inputs["plan_path"]
+        or plan.get("hash") != pinned_inputs["plan_hash"]
+        or verification_row.get("hash") != pinned_inputs["verification_hash"]
+        or current.get("target_branch") != pinned_inputs["target_branch"]
+        or current.get("target_remote") != pinned_inputs["target_remote"]
+        or current.get("dispatch_base") != written_dispatch_base
+        or builder_job_id not in (None, launch_job_id)
+        or current.get("reviewer_job_id") is not None
+        or current.get("candidate") is not None
+        or current.get("current_evidence_refs") != []
+        or current.get("current_evaluation_refs") != []
+        or current.get("current_verification_evidence_hash") is not None
+        or current.get("gate_state") != "pending"
+        or not (
+            current_state == prior["state"]
+            or (current_state == "building" and builder_job_id == launch_job_id)
+        )
+        or len(actions) != len(prior.get("actions") or [])
+        or len(evidence_history) != len(prior.get("evidence_history") or [])
+        or len(evaluation_history) != len(prior.get("evaluation_history") or [])
+    ):
+        return False
+
+    if current_state not in {"pending", "needs_human", "failed"}:
+        registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+    registry.repin_slice(
+        slice_id,
+        spec_path=prior_spec["path"],
+        spec_hash=prior_spec["hash"],
+        plan_path=prior_plan["path"],
+        plan_hash=prior_plan["hash"],
+        target_branch=prior["target_branch"],
+        target_remote=prior["target_remote"],
+        verification_hash=prior_verification["hash"],
+        verification=prior_verification.get("contract"),
+        dispatch_base=prior.get("dispatch_base"),
+    )
+    update_kwargs = {
+        "state": prior["state"],
+        "gate_state": prior["gate_state"],
+        "current_evidence_refs": list(prior.get("current_evidence_refs") or []),
+        "current_evaluation_refs": list(prior.get("current_evaluation_refs") or []),
+    }
+    if prior.get("builder_job_id") is not None:
+        update_kwargs["builder_job_id"] = prior["builder_job_id"]
+    if prior.get("reviewer_job_id") is not None:
+        update_kwargs["reviewer_job_id"] = prior["reviewer_job_id"]
+    if prior.get("candidate") is not None:
+        update_kwargs["candidate"] = prior["candidate"]
+    if prior.get("current_verification_evidence_hash") is not None:
+        update_kwargs["current_verification_evidence_hash"] = prior[
+            "current_verification_evidence_hash"
+        ]
+    registry.update_slice(slice_id, **update_kwargs)
+    return True
+
+
+def _settle_recovery_dispatch_failure(
+    dispatcher,
+    slice_id: str,
+    *,
+    prior: dict,
+    repinned: bool,
+    pinned_inputs: dict,
+    written_dispatch_base: str | None,
+    launch_job_id: str | None,
+    exc: Exception,
+) -> None:
+    restored = False
+    if repinned:
+        try:
+            restored = _restore_recovery_slice(
+                dispatcher,
+                slice_id,
+                prior=prior,
+                pinned_inputs=pinned_inputs,
+                written_dispatch_base=written_dispatch_base,
+                launch_job_id=launch_job_id,
+            )
+        except Exception as restore_exc:
+            logger.warning(
+                "recovery slice restore raised for slice_id=%s; falling back to needs_human: %s: %s",
+                slice_id,
+                type(restore_exc).__name__,
+                restore_exc,
+            )
+            _mark_slice_needs_human(dispatcher, slice_id, reason=str(exc))
+            return
+        if not restored:
+            logger.warning(
+                "recovery slice restore preconditions failed for slice_id=%s; falling back to needs_human",
+                slice_id,
+            )
+            _mark_slice_needs_human(dispatcher, slice_id, reason=str(exc))
+            return
+
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        return
+    try:
+        registry.record_action(slice_id, action="dispatch-failed", actor="manager")
+    except Exception as action_exc:
+        logger.warning(
+            "failed to record dispatch-failed action for recovery slice_id=%s: %s: %s",
+            slice_id,
+            type(action_exc).__name__,
+            action_exc,
+        )
+        return
+    logger.info(
+        "recovery dispatch failure settled",
+        extra={
+            "slice_id": slice_id,
+            "restored": restored,
+            "error_summary": f"{type(exc).__name__}: {exc}",
+        },
+    )
 
 
 def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dict:
