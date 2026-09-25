@@ -204,9 +204,11 @@ class FakeShipOrchestrator:
         self._github = github
         self._now = now
         self.calls: list[str] = []
+        self.merge_kwargs: list[dict[str, Any]] = []
 
     def merge_if_ready(self, **kwargs):
         self.calls.append("merge-if-ready")
+        self.merge_kwargs.append(kwargs)
         self._github.merged = True
         return SimpleNamespace(
             expected_head=kwargs["expected_head"],
@@ -499,6 +501,184 @@ def test_r6_f_copilot_review_timeout_next_actions_includes_review_attest(
     resume_actions = resume_resp["result"].get("next_actions", ())
     assert isinstance(resume_actions, list)
     assert "review-attest" in resume_actions
+
+
+def test_request_bound_copilot_review_submitted_before_deadline_survives_late_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    requested_at = 1000.0
+    first = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at,
+    )
+    assert first.get("action") == "awaiting-copilot"
+
+    github.reviews = (
+        CopilotReview(
+            review_id=47,
+            commit_id=HEAD,
+            state="COMMENTED",
+            body="LGTM, no findings.",
+            author=COPILOT_REVIEWER_LOGIN,
+            submitted_at_epoch=1162.0,
+        ),
+    )
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=1944.0,
+    )
+
+    assert github.request_copilot_calls == 1
+    assert result.get("action") != "awaiting-copilot"
+    assert result.get("reason") != "copilot-review-timeout"
+    row = _journal_row(state, run_id)
+    ship_state = row["ship"]
+    assert ship_state.get("phase") in {"merge-authorized", "merged"}
+    assert ship_state.get("requested_at_epoch") == requested_at
+    assert "adopted_review_id" not in ship_state
+    assert orch_holder
+    merge_orchestrator = next(
+        orchestrator for orchestrator in orch_holder if "merge-if-ready" in orchestrator.calls
+    )
+    assert merge_orchestrator.merge_kwargs
+    copilot = merge_orchestrator.merge_kwargs[-1]["copilot"]
+    assert copilot.submitted_at_epoch == 1162.0
+    assert copilot.observed_at_epoch == 1944.0
+
+
+def _simulate_requesting_phase_crash(
+    tmp_path: Path,
+    *,
+    authority,
+    state: Path,
+    registry: JobRegistry,
+    run_id: str,
+    requested_at: float,
+) -> None:
+    first = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at,
+    )
+    assert first.get("action") == "awaiting-copilot"
+    assert _journal_row(state, run_id)["ship"]["phase"] == "review-requested"
+
+    # The external request completed, but the process crashed before its
+    # response was persisted, leaving the durable pre-request phase behind.
+    row = _journal_row(state, run_id)
+    row["ship"]["phase"] = "review-requesting"
+    _write_journal_row(state, run_id, row)
+
+
+def test_review_requesting_crash_replay_rejects_exact_head_review_submitted_after_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    requested_at = 1000.0
+    _simulate_requesting_phase_crash(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        run_id=run_id,
+        requested_at=requested_at,
+    )
+    github.reviews = (
+        CopilotReview(
+            review_id=48,
+            commit_id=HEAD,
+            state="COMMENTED",
+            body="LGTM, no findings.",
+            author=COPILOT_REVIEWER_LOGIN,
+            submitted_at_epoch=requested_at + REVIEW_TIMEOUT_SECONDS + 1,
+        ),
+    )
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at + REVIEW_TIMEOUT_SECONDS + 2,
+    )
+
+    assert github.request_copilot_calls == 1
+    assert result.get("action") == "needs_human"
+    assert result.get("reason") == "copilot-review-timeout"
+    assert not any("merge-if-ready" in orchestrator.calls for orchestrator in orch_holder)
+    ship_state = _journal_row(state, run_id)["ship"]
+    assert ship_state.get("phase") == "needs_human"
+    assert ship_state.get("requested_at_epoch") == requested_at
+    assert "adopted_review_id" not in ship_state
+    assert "adopted_at_epoch" not in ship_state
+
+
+def test_review_requesting_crash_replay_preserves_deadline_for_timely_late_observed_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    requested_at = 1000.0
+    _simulate_requesting_phase_crash(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        run_id=run_id,
+        requested_at=requested_at,
+    )
+    github.reviews = (
+        CopilotReview(
+            review_id=49,
+            commit_id=HEAD,
+            state="COMMENTED",
+            body="LGTM, no findings.",
+            author=COPILOT_REVIEWER_LOGIN,
+            submitted_at_epoch=requested_at + 162.0,
+        ),
+    )
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=requested_at + REVIEW_TIMEOUT_SECONDS + 44.0,
+    )
+
+    assert github.request_copilot_calls == 1
+    assert result.get("action") != "awaiting-copilot"
+    assert result.get("reason") != "copilot-review-timeout"
+    ship_state = _journal_row(state, run_id)["ship"]
+    assert ship_state.get("phase") in {"merge-authorized", "merged"}
+    assert ship_state.get("requested_at_epoch") == requested_at
+    assert "adopted_review_id" not in ship_state
+    assert "adopted_at_epoch" not in ship_state
+    assert orch_holder
+    merge_orchestrator = next(
+        orchestrator for orchestrator in orch_holder if "merge-if-ready" in orchestrator.calls
+    )
+    copilot = merge_orchestrator.merge_kwargs[-1]["copilot"]
+    assert copilot.submitted_at_epoch == requested_at + 162.0
+    assert copilot.observed_at_epoch == requested_at + REVIEW_TIMEOUT_SECONDS + 44.0
 
 
 def test_persisted_copilot_needs_human_stop_returns_list_shaped_next_actions(
@@ -835,10 +1015,29 @@ def test_delivery_adapter_evidence_reflects_adopted_review_only_when_ship_state_
 
     monkeypatch.setattr(work_actions, "_ship_action", fake_ship_action)
 
+    def successful_main_probe_runner(argv, **kwargs):
+        command = [str(value) for value in argv]
+        git_args = command[3:]
+        if (
+            git_args[:3] == ["rev-parse", "--verify", "--quiet"]
+            and git_args[3] != "FETCH_HEAD"
+        ):
+            return SimpleNamespace(returncode=0, stdout=f"{HEAD}\n", stderr="")
+        if git_args[:2] == ["cat-file", "-t"]:
+            return SimpleNamespace(returncode=0, stdout="commit\n", stderr="")
+        if git_args[:4] == ["fetch", "--quiet", "--no-tags", "origin"] and git_args[4] == "main":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if git_args[:3] == ["rev-parse", "--verify", "--quiet"] and git_args[3] == "FETCH_HEAD":
+            return SimpleNamespace(returncode=0, stdout=f"{HEAD}\n", stderr="")
+        if git_args[:1] == ["merge-base"]:
+            return SimpleNamespace(returncode=0, stdout=f"{HEAD}\n", stderr="")
+        raise AssertionError(command)
+
     validator = work_bridge.build_production_ship_validator(
         registry=registry,
         coordinator_root=state_root,
         snapshot_path=snapshot,
+        probe_runner=successful_main_probe_runner,
     )
 
     result = validator(run=run, candidate=HEAD)

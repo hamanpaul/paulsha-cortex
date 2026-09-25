@@ -12,6 +12,8 @@ from paulsha_cortex.control import constants, contract
 
 RUN_SCHEMA = "cortex-porcelain/run/v1"
 REQUEST_ID = "20260723T010203Z-" + "a" * 32
+RETRY_CARD_RUN_ID = "workflow-e45c1bd257ceec1c8285"
+RETRY_CARD_WORK_ID = "copilot-review-late-observation"
 
 
 def _load_cli():
@@ -45,6 +47,18 @@ def _submitted_request() -> dict[str, object]:
     payload = contract.read_json(constants.requests_dir() / f"{REQUEST_ID}.json")
     assert payload is not None
     return payload
+
+
+def _retry_card_command(*options: str) -> list[str]:
+    return [
+        "run",
+        "work",
+        "retry-card",
+        RETRY_CARD_WORK_ID,
+        "--repo",
+        "hamanpaul/paulsha-cortex",
+        *options,
+    ]
 
 
 def _write_done(
@@ -276,7 +290,177 @@ def test_run_work_payload_help_describes_json_file_path(
 
     captured = capsys.readouterr()
     assert "JSON 檔案路徑" in captured.out
+    assert "--card" in captured.out
+    assert "retry-card 專用" in captured.out
     assert captured.err == ""
+
+
+def test_run_work_retry_card_forwards_card_and_run_scoped_builder_override(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        _run_cli(
+            _retry_card_command(
+                "--expected-run-id",
+                RETRY_CARD_RUN_ID,
+                "--card",
+                "worktree-isolation",
+                "--builder-executor",
+                "copilot",
+                "--builder-model",
+                "gpt-5.4",
+            )
+        )
+        == 3
+    )
+
+    request = _submitted_request()
+    assert request["type"] == "work-action"
+    assert request["args"] == {
+        "action": "retry-card",
+        "work_id": RETRY_CARD_WORK_ID,
+        "repo": "hamanpaul/paulsha-cortex",
+        "expected_run_id": RETRY_CARD_RUN_ID,
+        "card": "worktree-isolation",
+        "builder_executor": "copilot",
+        "builder_model": "gpt-5.4",
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_run_work_retry_card_preserves_payload_only_card_workaround(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "retry-card.json"
+    payload_path.write_text(json.dumps({"card": "worktree-isolation"}), encoding="utf-8")
+
+    assert (
+        _run_cli(
+            _retry_card_command(
+                "--expected-run-id",
+                RETRY_CARD_RUN_ID,
+                "--payload",
+                str(payload_path),
+            )
+        )
+        == 3
+    )
+
+    request = _submitted_request()
+    assert request["args"]["card"] == "worktree-isolation"
+    assert request["args"]["expected_run_id"] == RETRY_CARD_RUN_ID
+    assert capsys.readouterr().err == ""
+
+
+def test_run_work_retry_card_allows_matching_payload_card_and_preserves_supported_fields(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "retry-card.json"
+    payload_path.write_text(
+        json.dumps({"card": "worktree-isolation", "actor": "operator"}),
+        encoding="utf-8",
+    )
+
+    assert (
+        _run_cli(
+            _retry_card_command(
+                "--expected-run-id",
+                RETRY_CARD_RUN_ID,
+                "--card",
+                "worktree-isolation",
+                "--payload",
+                str(payload_path),
+            )
+        )
+        == 3
+    )
+
+    request = _submitted_request()
+    assert request["args"]["card"] == "worktree-isolation"
+    assert request["args"]["actor"] == "operator"
+    assert capsys.readouterr().err == ""
+
+
+def test_run_work_retry_card_rejects_conflicting_payload_card_before_request_write(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "retry-card.json"
+    payload_path.write_text(json.dumps({"card": "review-verdict"}), encoding="utf-8")
+
+    assert (
+        _run_cli(
+            _retry_card_command(
+                "--expected-run-id",
+                RETRY_CARD_RUN_ID,
+                "--card",
+                "worktree-isolation",
+                "--payload",
+                str(payload_path),
+            )
+        )
+        == 2
+    )
+
+    assert contract.read_json(constants.requests_dir() / f"{REQUEST_ID}.json") is None
+    assert "conflicts with --card" in capsys.readouterr().err
+
+
+def test_run_work_card_is_rejected_for_non_retry_card_action_before_request_write(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        _run_cli(
+            [
+                "run",
+                "work",
+                "resume",
+                RETRY_CARD_WORK_ID,
+                "--repo",
+                "hamanpaul/paulsha-cortex",
+                "--card",
+                "worktree-isolation",
+            ]
+        )
+        == 2
+    )
+
+    assert contract.read_json(constants.requests_dir() / f"{REQUEST_ID}.json") is None
+    assert "only valid for retry-card" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("options", "expected_error"),
+    [
+        (("--expected-run-id", RETRY_CARD_RUN_ID), "requires exact card id"),
+        (
+            ("--expected-run-id", RETRY_CARD_RUN_ID, "--card", "Bad card"),
+            "requires exact card id",
+        ),
+        (("--card", "worktree-isolation"), "requires exact expected_run_id"),
+        (
+            ("--expected-run-id", "stale-run-id", "--card", "worktree-isolation"),
+            "requires exact expected_run_id",
+        ),
+    ],
+)
+def test_run_work_retry_card_contract_rejects_invalid_card_or_run_id_before_request_write(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    options: tuple[str, ...],
+    expected_error: str,
+) -> None:
+    assert _run_cli(_retry_card_command(*options)) == 2
+
+    assert contract.read_json(constants.requests_dir() / f"{REQUEST_ID}.json") is None
+    assert expected_error in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

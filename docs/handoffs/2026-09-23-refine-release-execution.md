@@ -4,27 +4,29 @@
 
 ## 範圍與基準
 
-- `main` 基準 `7fa4716b`；`VERSION` 仍為 `0.1.10`。Manager 已載入該 revision；版本 `0.1.11` 尚未建立。
-- GitHub 有 97 張 open issue，含總帳 #868。逐票 triage 覆蓋其餘 96 張；其中 25 張不在 #868 原 137 張分類表內。未發現 triage 後新增的票。
+- 原始盤點以 `main` 的 `7fa4716b` 與 97 張 open issue 為基準，含總帳 #868。逐票 triage 覆蓋其餘 96 張；其中 25 張不在 #868 原 137 張分類表內。2026-09-23 14:51 UTC 最新合併的修復 PR 為 #984，`main` 是 `e74750dd`，`VERSION` 仍為 `0.1.10`；版本 `0.1.11` 尚未建立。
+- 盤點後建立 #961–#973、#975–#980、#982–#983 共 21 張 issue，分解 #887／#847／#818／#547／#943 的 Red 規模；它們不在原始 97 張之內。#974／#981 是已合併規劃 PR，#984 是已合併的 preflight 環境修復 PR，皆不是 issue。父票維持 open，完整 aggregate acceptance 不因拆票縮減。
 - 交付前置：#862 的 run `workflow-9dc654fef3850cc68deb` 與 PR #954。只有 PR merge、issue closed、run 合法收尾且後續原語可用，才解除 #818/#481 等依賴。#497 的其他 B/C/D 交付不由 #862 冒稱完成。
-- 14 張定版票、18 張可並行後續票、61 張 deferred 票、#564/#807 兩張待重新核對的關票候選，加上 #862 與 #868，共 97 張。這是排程分類，不變更 issue label 或關票狀態。
+- 原始 14 張定版票、18 張可並行後續票、61 張 deferred 票、#564/#807 兩張待重新核對的關票候選，加上 #862 與 #868，共 97 張。新建的 21 張 issue 承接五張 Red 父票與其必要前置，不重複計入原始分類。這是排程分類，不變更 issue label 或關票狀態。
 
 ## 定版票與工作線
 
 | 工作線 | 依賴順序 | 唯一實作 owner 與關鍵驗收 |
 | --- | --- | --- |
-| Ship/closure | #943 → #885 → #810 | 各票獨立 Cortex run；#943 要證明落後的 main 在 push 前合入、保留兩方 CHANGELOG；#885 要證明 archive/retry 不迴圈；#810 要證明 merge 後自行完成 closure。 |
-| Authority | #847 → #887 | 各票獨立 run；自產 planning 的等價證明與已 merge run 的 completion 路由各自驗收，不以跳過 restart 代替完成。 |
-| State integrity | #862 → #818 → #481；#479 → #547 | 同一時間只讓一位 owner 修改 registry/manager recovery 面；雙 writer、舊 terminal 重播、retry proof 與跨 work item recovery 均須有失敗注入或多 process 回歸。 |
+| Ship/closure | #972 的四個 Yellow 前置 → #973 的真 merge／D gates 切片（父票 #943）→ #885 → #810 | #972 先固定 main probe、typed C/M 與 durable recovery；#973 的完整 7/Red 範圍仍需 issue-backed 子票閉合。真 Git 合併、雙方 CHANGELOG 條目、D 的 exact-head CI 與 merge/closure 分階段驗收。 |
+| Authority | #978 的 receipt schema/store/read-back 子切片 → #979 與 #982／#983／#980 → #964 → #965（父票 #847）；#961 → #975 → #976 → #977（父票 #962／#887） | #978 仍是 Red umbrella，實作前須發布 Yellow 子票並凍結 producer identity。#977 另需純唯讀 closure inspection 前置；父票的完整 AC、#847 AC10 loaded-runtime canary 保持獨立 gate。 |
+| State integrity | #862 → #966 → #967（父票 #818）→ #481；#479 → #968 → #969 → #970 → #971（父票 #547） | #968 的 legacy AC7 與 #969 marker 存在依賴循環，需拆出在 #969 後執行的 durable migration/verifier 子票；#547 保持 open。重疊的 registry／Manager recovery 修改由單一 owner 串行。 |
 | Recovery/UI | #956、#874、#812、#871、#579 | 依重疊模組錯開 merge；每票以正式 action 的可達性與錯誤終態作驗收。 |
 
-實作可使用 Copilot `gpt-5.4`（較大修改）或 Codex `gpt-6-luna(max)`（較窄修改）。`gpt-6-sol` 做獨立對抗審查；agy `gemini-2.8-flash (high)` 先通過目前 roster、launcher、terminal contract 的 admission 才派工。建議最多三條互不衝突的 run 同時進行。每票使用獨立 worktree、唯一 work item 與 run owner；merge 前重新檢查 exact PR head 和 review threads。
+實作可使用 Copilot `gpt-5.4`（較大修改）或 Codex `gpt-6-luna(max)`（較窄修改）。`gpt-6-sol` 做獨立對抗審查；agy 指定的 `gemini-2.8-flash (high)` 未在現行 roster，現行可見的是 `gemini-3.8-flash-high`，不得自行視為同型號替代。每票使用獨立 worktree、唯一 work item 與 run owner；merge 前重新檢查 exact PR head 和 review threads。並行數量以實際資源與重疊模組風險調度。
 
 ## 進件材料狀態
 
-14 票各有 spec/design/todo 草稿。本次進件 PR 先帶 #579/#812/#874/#956 四組及 work item；其他十組仍在 session scratchpad，均無 Cortex run。對抗意見後的修訂版須逐票確認：issue 最新正文與留言、互相一致的 Requirements/Decisions/Tasks、無 open question、實算 sizing 與所需測試。草稿 frontmatter 的 `accepted` 不等於已發布的 authority；本 PR merge 前，四組也尚未發布。
+PR #958／#959／#960／#974／#981 已合併，正式發布 #579／#812／#874／#956／#479／#481／#810／#871／#885／#961／#966 的 accepted 規劃與 work item。#579／#812／#874／#956／#479／#871／#885／#961 有 Cortex 產品 run；#481 等 #862，#810 等 #943，#966 等 #862。#862 run `workflow-9dc654fef3850cc68deb` 的候選曾通過 verify/review，但既有 PR #954 的 preflight 因 service PATH 缺少 sbin 導致 sudoers 測試固定失敗；#984 已修正測試 fixture 並合併，目前 #862 正由原 run 正式 retry-build 採納最新 main，後續 gates 須重新執行。#862 的 PR、issue 與 run 均未交付。
 
-下一批優先修訂並發布 #943 的三件套與 work item；它的規格須涵蓋「main 落後但 merge-tree clean」及「CHANGELOG 衝突」兩種路徑，並以真 merge 產物驗證兩邊條目保留。其餘按工作線分批進件；每張 planning PR 的 body 只用 `Refs #N` 時，需依 policy 附 `policy-exempt:issue-link` 與理由，實作 PR 才使用 `Closes #N`。
+#975／#976／#983 的 accepted 三件套與 work item 已在第三批規劃分支，產品實作各待前置合併。#978、#972、#973 與 #968 是 umbrella／Red 或含依賴循環的草稿；正在以各自 issue-backed Yellow 切片補齊，尚不能直接 dispatch。#979／#980／#982 的 producer 契約需等 #978 schema 和 read-back 子票凍結；#977 還需唯讀 closure inspector。#964／#965／#967／#969／#970／#971 依前置合併順序進件。草稿 frontmatter 的 `accepted` 不等於已發布 authority。
+
+#972 須完成精確 main SHA 的 durable binding，以及 probe 失敗階段與 return code 的結構化結果；#973 須補 archive 後 Candidate 來源，涵蓋「main 落後但 merge-tree clean」及「CHANGELOG 衝突」兩種路徑，並以真 merge 產物驗證兩邊條目保留。每張 planning PR 的 body 只用 `Refs #N` 時，需依 policy 附 `policy-exempt:issue-link` 與理由，實作 PR 才使用 `Closes #N`。
 
 ## Release gate
 

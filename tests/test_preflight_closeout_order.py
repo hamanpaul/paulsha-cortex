@@ -149,6 +149,31 @@ class SpyRunner:
         return None
 
 
+def _successful_main_probe_runner(candidate: str):
+    state = {"candidate": candidate}
+
+    def runner(argv, **kwargs):
+        command = [str(value) for value in argv]
+        git_args = command[3:]
+        if (
+            git_args[:3] == ["rev-parse", "--verify", "--quiet"]
+            and git_args[3] != "FETCH_HEAD"
+        ):
+            state["candidate"] = git_args[3].lower()
+            return RunnerResult(0, stdout=f"{state['candidate']}\n")
+        if git_args[:2] == ["cat-file", "-t"]:
+            return RunnerResult(0, stdout="commit\n")
+        if git_args[:4] == ["fetch", "--quiet", "--no-tags", "origin"] and git_args[4] == "main":
+            return RunnerResult(0)
+        if git_args[:3] == ["rev-parse", "--verify", "--quiet"] and git_args[3] == "FETCH_HEAD":
+            return RunnerResult(0, stdout=f"{state['candidate']}\n")
+        if git_args[:1] == ["merge-base"]:
+            return RunnerResult(0, stdout=f"{state['candidate']}\n")
+        raise AssertionError(command)
+
+    return runner
+
+
 class FakeGitHubDeliveryClient:
     def __init__(self, *, runner) -> None:
         self._runner = runner
@@ -438,6 +463,7 @@ def _ship_harness(
     active_change: bool,
     archived_change: bool,
     metadata_preflight_returncode: int = 0,
+    probe_runner=None,
 ) -> ShipHarness:
     repo, candidate = _repo(
         tmp_path / "repo",
@@ -485,6 +511,7 @@ def _ship_harness(
         coordinator_root=state_root,
         snapshot_path=snapshot,
         runner=runner,
+        probe_runner=probe_runner or _successful_main_probe_runner(candidate),
     )
     return ShipHarness(
         repo=repo,

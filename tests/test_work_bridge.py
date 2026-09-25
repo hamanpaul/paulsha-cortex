@@ -193,6 +193,31 @@ def _steps() -> tuple[WorkflowStep, ...]:
     )
 
 
+def _successful_main_probe_runner(candidate: str):
+    state = {"candidate": candidate}
+
+    def runner(argv, **kwargs):
+        command = [str(value) for value in argv]
+        git_args = command[3:]
+        if (
+            git_args[:3] == ["rev-parse", "--verify", "--quiet"]
+            and git_args[3] != "FETCH_HEAD"
+        ):
+            state["candidate"] = git_args[3].lower()
+            return SimpleNamespace(returncode=0, stdout=f"{state['candidate']}\n", stderr="")
+        if git_args[:2] == ["cat-file", "-t"]:
+            return SimpleNamespace(returncode=0, stdout="commit\n", stderr="")
+        if git_args[:4] == ["fetch", "--quiet", "--no-tags", "origin"] and git_args[4] == "main":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if git_args[:3] == ["rev-parse", "--verify", "--quiet"] and git_args[3] == "FETCH_HEAD":
+            return SimpleNamespace(returncode=0, stdout=f"{state['candidate']}\n", stderr="")
+        if git_args[:1] == ["merge-base"]:
+            return SimpleNamespace(returncode=0, stdout=f"{state['candidate']}\n", stderr="")
+        raise AssertionError(command)
+
+    return runner
+
+
 @pytest.mark.parametrize(
     ("action", "expected"),
     [
@@ -433,6 +458,7 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         coordinator_root=tmp_path / "state",
         snapshot_path=snapshot,
         runner=delivery_runner,
+        probe_runner=_successful_main_probe_runner(candidate),
     )
     initial_source_revision = run.source_revision
     work_actions._load_work_run(
@@ -1094,6 +1120,7 @@ identities:
         registry=registry,
         coordinator_root=coordinator_root,
         runner=delivery_runner,
+        probe_runner=_successful_main_probe_runner(candidate),
     )
     executor = manager_daemon.build_request_executor(
         dispatcher=dispatcher,
