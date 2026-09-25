@@ -213,6 +213,14 @@ def _wrong_type_remote_prs(payload: dict[str, object]) -> None:
     }
 
 
+def _null_terminal_observations(payload: dict[str, object]) -> None:
+    payload["providers"][f"github-terminal:{REPO}"]["observations"] = None
+
+
+def _list_terminal_observations(payload: dict[str, object]) -> None:
+    payload["providers"][f"github-terminal:{REPO}"]["observations"] = []
+
+
 def _mismatch_remote_pr_source_id(payload: dict[str, object]) -> None:
     payload["providers"][f"github-terminal:{REPO}"]["observations"]["remote_prs"] = [
         {
@@ -590,6 +598,8 @@ def test_reconcilable_archive_seam_preserves_malformed_status_with_late_pr_proof
         _set_pr_open,
         _drop_remote_prs,
         _wrong_type_remote_prs,
+        _null_terminal_observations,
+        _list_terminal_observations,
         _mismatch_remote_pr_source_id,
         _remote_pr_not_merged_with_merge_commit,
         _duplicate_true_remote_pr_rows,
@@ -604,6 +614,8 @@ def test_reconcilable_archive_seam_preserves_malformed_status_with_late_pr_proof
         "pr-not-closed-or-merged",
         "remote-prs-missing",
         "remote-prs-wrong-type",
+        "terminal-observations-null",
+        "terminal-observations-not-object",
         "remote-pr-source-id-mismatch",
         "remote-pr-not-merge-commit-proven",
         "duplicate-remote-pr-rows-both-true",
