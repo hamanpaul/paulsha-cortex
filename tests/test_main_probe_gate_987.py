@@ -429,6 +429,36 @@ def test_main_sync_probe_detects_clean_behind_with_real_bare_origin(
     assert probe.path_classification is None
 
 
+def test_main_sync_probe_classifies_zero_path_merge_tree_conflict_as_generic_conflict(
+    tmp_path: Path,
+) -> None:
+    candidate = "a" * 40
+    main_head = "b" * 40
+    merge_base = "c" * 40
+    tree_oid = "d" * 40
+
+    probe = work_bridge._probe_main_sync(
+        worktree=tmp_path,
+        candidate=candidate,
+        runner=_SequencedProbeRunner(
+            [
+                *_probe_success_prefix(
+                    candidate=candidate,
+                    main_head=main_head,
+                    merge_base=merge_base,
+                ),
+                _probe_result(1, stdout=f"{tree_oid}\0"),
+            ]
+        ),
+        timeout_seconds=0.1,
+    )
+
+    assert isinstance(probe, work_bridge.MainSyncProbe)
+    assert probe.relation == "conflict"
+    assert probe.conflict_paths == ()
+    assert probe.path_classification == "conflict"
+
+
 def test_main_sync_probe_classifies_changelog_top_insert_conflict(tmp_path: Path) -> None:
     repo = _init_probe_repo(
         tmp_path / "repo",

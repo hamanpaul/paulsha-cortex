@@ -855,6 +855,8 @@ def _classify_main_sync_conflicts(
     runner: Callable[..., object],
     timeout_seconds: float,
 ) -> str:
+    if not conflict_paths:
+        return "conflict"
     if len(conflict_paths) != 1:
         return "multiple-conflicts"
     if conflict_paths[0] == "CHANGELOG.md" and _is_changelog_top_insert_conflict(

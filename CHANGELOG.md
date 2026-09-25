@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#987 main-probe regressions**：新增 `tests/test_main_probe_gate_987.py` bare-origin regressions，覆蓋 clean-behind Candidate 於 preflight／push／建 PR 前 fail-closed、`origin/main` fetch failure 會回 `main-sync-unavailable` 並在 operator `resume` 修復後重新 probe，以及 full candidate SHA 以大小寫不敏感比對維持 exact object-id gate。
+- **#987 main-probe conflict classification**：`git merge-tree --write-tree --name-only --no-messages -z` 在 exit `1`、tree OID 有效且 conflicted path 清單為空時，現在會維持 generic `conflict` 分類，不再誤判成 `multiple-conflicts`；既有的 `CHANGELOG.md` 頂端插入特例、單一路徑非 changelog conflict、多重 conflict path，以及 clean-behind／in-sync／failure 行為維持不變。
 - **#987 main-probe gate**：ship validator 現在會在 Manager-owned ship clone 內以 bounded direct git probe `origin/main`，於 preflight 前與必要 push 前重讀 main；只有 Candidate 已含最新 M 時才可進 preflight／push／建 PR。`merge-tree --write-tree --name-only --no-messages -z` 改走 NUL-safe path parser，clean-behind 與 conflict 會在 preflight 前 fail-closed；fetch／merge-base／merge-tree／path-parser failure 會寫入 content-addressed `main-sync-probe` evidence，持久化 `candidate`／`stage`／`returncode`／`error_kind`／`main_head`，並讓 `main-sync-unavailable` stop 與 operator resume 可讀回同一份證據。重用既有 Manager ship workspace 時若來源 repo 已無有效 `origin`，現在也會先移除工作區殘留的 `origin`，避免 stale remote 被錯誤探測成 `in-sync`。
 - **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
 - **#966 JobRegistry revision CAS**：`jobs.json` 現在以 exact durable-byte SHA-256 revision 與 canonical transaction-lock sidecar 做 compare-and-persist；stale writer 會明確回 `RegistryRevisionConflict`、完整重載 durable snapshot，v1 migration／verification-hash normalization 也納入同一 CAS 邊界，daemon request queue 會把這類衝突持久化成 error done 而不是造假成功。
