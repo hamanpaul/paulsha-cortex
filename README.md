@@ -334,12 +334,16 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    cortex run work resume porcelain-run-recover --repo hamanpaul/paulsha-cortex --actor operator
    cortex run work start per-work-model-chain --repo hamanpaul/paulsha-cortex \
      --builder-executor codex --builder-model "gpt-5.3-codex-spark"
+   cortex run work retry-card "$WORK_ID" --repo "$OWNER/$REPO" \
+     --expected-run-id "$WORKFLOW_RUN_ID" --card "$CARD_ID" \
+     --builder-executor copilot --builder-model "gpt-5.4"
    ```
 
    `--executor`／`--model` 省略時由 daemon 採用部署設定；帶 `--wait [--timeout N]` 時成功為 exit 0、terminal failure 為 exit 1、逾時仍為 exit 3。所有 queue mutation 都可加 `--json` 取得 `cortex-porcelain/run/v1` 輸出。
    若 spec frontmatter 成對宣告 optional `executor`／`model_id`，fanout/tick 會逐 slice 覆寫這裡的 builder 預設值；命令列明確指定與 spec frontmatter 宣告的 `(executor, model_id)` 都會先查 `model-identities.yaml`，unknown identity 直接 fail-closed 並列出可用 candidates。
    `run fanout`／`run tick` 的 JSON 結果固定帶 `dispatch_skipped_by_backoff`；若 `dispatch` request 或 `slice-action retry-build` 因 durable executor backoff 沒有派出 job，也會回同名欄位而不是造假 `job_id`。元素若是已知 cooldown，形狀正好是 `{"slice_id","executor","model_id","retry_after_epoch"}`；若 store 狀態未知，則改為 `retry_after_epoch: null` 並帶 `reason`（目前為 `executor-backoff-store-unknown`）。**unknown 只代表 durable backoff state 無法可信判定，不代表 quota/額度已可用。**
    `cortex run work start/resume/...` 額外支援 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model`：run-scoped 覆寫該 work item 這次 claim 的 planner/builder/reviewer 模型鏈，三段各自獨立、未指定的段落回退共享 `model-identities.yaml`。覆寫只影響這個 run，不改共享設定檔、不影響其他 active run 尚未派出的 card；於 claim（或首次 dispatch）時凍結，之後 resume／retry 沿用凍結值。指定的 identity 仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 CLI 直接回報錯誤原因並列出可用 identity，不會靜默退回共享預設。
+   `run work retry-card` 的 `--card` 只接受 retry-card action，需搭配 exact 活動 WorkflowRun ID 與該 run 的待派 card；run-scoped builder override 仍受既有 identity 與 Manager 檢查。`--payload` 可用來傳遞各 action 原本支援的其他欄位，不是選擇 retry card 的必要輸入；retry-card 仍拒絕既有 allowlist 以外的 caller fields。
 
 11. 用 `recover` 家族執行受限復原；slice/work mutation 的 `--actor` 為必要審計欄位：
 
@@ -505,7 +509,7 @@ cortex slice-action "$SLICE_ID" retry-review --actor operator
 cortex slice-action "$SLICE_ID" abandon      --actor operator
 ```
 
-`fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
+`fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。共享 coordinator root 內的 `jobs.json` 另以 exact durable-byte SHA-256 revision ＋ canonical `jobs.json.transaction.lock` sidecar 做 compare-and-persist：stale request 不會被靜默重播，daemon 會先把 `RegistryRevisionConflict`（含 expected/actual revision 與 canonical path）持久化成 `done` error，再移除 request file。
 
 Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|auto|review-attest|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS；`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
@@ -519,7 +523,7 @@ Merge authorization 只雜湊 stable preflight 結果（argv、return code、HEA
 
 ### 5. 由 Manager 完成交付
 
-Work Item workflow 通過 build、deterministic verification 與 foreign review 後，由 Manager 依序 archive OpenSpec（若 `mapped_openspec == ()` 則跳過）、跑 policy/pinned preflight、建立或更新 PR，再要求恰好一種current-HEAD delivery review：authenticated Copilot review，或透過`review-attest`建立的immutable maintainer evidence。Manager接著重讀checks、threads、closing refs與mergeability；只有全部gate對同一HEAD成立時才執行merge commit。Maintainer evidence保留`maintainer-review` kind，絕不偽裝成Copilot。
+Work Item workflow 通過 build、deterministic verification 與 foreign review 後，由 Manager 依序 archive OpenSpec（若 `mapped_openspec == ()` 則跳過）、在自己的 ship clone 內用 bounded direct git subprocess probe `origin/main`、跑 policy/pinned preflight、建立或更新 PR，再要求恰好一種current-HEAD delivery review：authenticated Copilot review，或透過`review-attest`建立的immutable maintainer evidence。main probe 會依序 resolve/validate Candidate、fetch、resolve/validate `FETCH_HEAD`、算 merge-base，必要時再跑 `merge-tree --write-tree --name-only --no-messages -z` 與 NUL-safe path parser；只有 Candidate 已含最新 `origin/main` 時才可進 preflight，clean-behind／conflict／probe failure 都會在 preflight／push／PR 前 fail-closed。fetch／merge-base／merge-tree／path-parser failure 會把 `candidate`／`stage`／`returncode`（timeout 為 null）／`error_kind`／`main_head` 寫成 content-addressed `main-sync-probe` evidence；若真的要 push，preflight 後與 `git push` 前還會再 probe 一次。已進 merged/done closure 與 terminal refresh 則跳過 main probe，直接走既有 closure reconciliation。Manager接著重讀checks、threads、closing refs與mergeability；只有全部gate對同一HEAD成立時才執行merge commit。Maintainer evidence保留`maintainer-review` kind，絕不偽裝成Copilot。
 
 Headless build card會在dispatch前解析declared inputs。異質brainstorm發布的新artifact會先由canonical brainstorm evidence的ref/kind/hash與不可變發證source revision原子併入WorkflowRun planning authority；legacy active run也只透過相同evidence reconcile，不從mutable檔案猜測。後續PR refresh即使更新run目前source revision，也不會改寫planning發證revision；brainstorm-required run缺evidence一律停止。Accepted planning artifact只接受該authority的ref/hash；獨立builder worktree缺檔時由Manager原子seed。Codex固定使用`workspace-write`；workflow中`commit_policy=required`的builder，以及legacy fanout／dispatch／retry-build的builder persona，取得明確commit capability，linked worktree才額外開放Git驗證出的current worktree gitdir、shared objects、current branch ref與reflog parent directories。Launcher會清除inherited Git repository selectors；planner、verify與review不取得這些Git write directories，symlink、detached HEAD或invalid metadata一律拒絕required-commit launch。Job、versioned bounded prompt與canonical evidence保存同一份input snapshot，terminalize再驗hash。Build card可把Candidate單調推進到目前Candidate的exact descendant worktree HEAD；verify/review仍須完全等於凍結Candidate。Dead job，或plan/build workflow card以schema/binding正確的terminal明示`failed|needs_human`，轉`needs_human`後periodic runner都不會自動重派；explicit resume保留舊job/log並重試同一run/card。verify／review reviewer card若以形狀合法的 `failed`／`needs_human` terminal 誠實要求停止，Manager 會落 `verification-terminal-explicit-stop`／`review-terminal-explicit-stop`、保留模型原文與 job log evidence ref，periodic runner 同樣不自動重派；這條路的 explicit resume 只會重落同一個停止，不會重派新 reviewer job，實際重派出口仍是 `retry-card`／`retry-build`。若已完成的Candidate在delivery preflight才發現真實缺陷，operator可用`retry-build`加上exact `expected_candidate`；Manager通常只在ongoing `needs_human` verify/review run、無active job且舊build全部passed時，以窄化registry recovery原子重開最後一張builder card。若final builder已成功退出（`exited/0`）但因immutable input／evidence驗證失敗而未綁定，則只允許同一Candidate CAS在build phase重派，且前置build card必須全passed、最後card仍pending、最新同card job必須成功退出且無workflow evidence；真正的failed job不走此入口。所有retry-build recovery prompt都要求先檢查worktree是否已有repair commit，並允許builder提交或採用已測試的descendant Candidate；Manager仍會獨立驗證exact舊Candidate CAS與單調ancestry。terminalization recovery另要求保留declared input snapshot並先檢查未綁定commit。兩條路徑都清除失效的下游authority，並要求新HEAD為舊Candidate的descendant。Dispatch失敗會恢復stop facet，必須修正authority後再由operator重試。
 
@@ -840,6 +844,8 @@ cortex skill restore <skill_id> --approved-by "$ACTOR"
 | worktree root | `<repo>-worktrees` sibling（由 repo root 推導，因此同樣 fail-closed） | `PSC_WORKTREE_ROOT` |
 
 Multi-issue workflow build 階段將以 `issue` 清單中最小號碼作為主 branch，並始終以 run repository 作為 `ScriptWorktreeCreator` 的 git來源，以確保 builder worktree 在對應 repo 池內建立。
+
+同一個 shared `coordinator root` 內，`jobs.json` 的 durable identity 取 **canonical state path**：resolve parent directory（non-strict）後再接回原始檔名，因此 symlink-directory spellings 共用同一把 transaction lock；state file 本身若是 symlink，則保留該檔名自己的 replace / sidecar 語意，不會跟著 target path 重新命名。
 
 **repo root 是 fail-closed 的（issue #612）**：`paths.repo_root()` 舊實作在 `PSC_REPO_ROOT` 未宣告時退回 `Path.cwd()`，而 manager daemon 的 `WorkingDirectory` 正是 operator 的真實 checkout——於是任何解析不出目標 repo 的呼叫都不是失敗，而是**靜默落在錯的樹上**（實測形態：相對 spec 路徑使 `complete_tick` 對真實 repo 跑 `git fetch --no-tags origin main`；同一族還有 `worktree_reclaim` 的 `git worktree remove --force`／`prune` 這類寫入動作）。現行契約：
 
