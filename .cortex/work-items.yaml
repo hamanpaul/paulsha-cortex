@@ -1504,3 +1504,15 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/main-probe-design.md'
     excludes: []
+  verify-planning-drift-recovery:
+    title: 'verify planning-drift recovery (#1046)'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1046'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/verify-planning-drift-recovery/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/verify-planning-drift-recovery-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/verify-planning-drift-recovery-design.md'
+    excludes: []
