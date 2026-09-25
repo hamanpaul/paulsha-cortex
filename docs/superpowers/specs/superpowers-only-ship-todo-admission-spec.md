@@ -17,11 +17,11 @@ Manager MUST 在第一次派發 builder job 前確認當前 `WorkAuthority` 恰�
 
 Accepted Superpowers spec、design、plan 是規劃 authority；它們本身不構成 `mapped_todo_paths`。不得只憑檔名、checkbox、規劃完成狀態或已存在的 `planning_authority` 將 plan 推升成 Todo source。此草案選擇要求一個獨立且由 `WorkAuthority` 確認的 Todo path；在該 source 未成立前，Superpowers-only 工作停在 build admission。
 
-若未來要讓 Manager 把 accepted plan 轉成 Todo，該轉換必須另定可驗證的 owner、來源 ref／revision、輸出 hash、持久化位置和 CAS 契約，並證明 generated path 會由 Monitor 正式納入 `WorkAuthority`。在該契約被審核前不得採用隱式轉換。
+若未來要讓 Manager 把 accepted plan 轉成 Todo，該轉換必須另定可驗證的 owner、來源 ref／revision、輸出 hash、持久化位置和 CAS 契約，並證明 generated path 會由 Monitor 正式納入 `WorkAuthority`。在該契約被審核前不得採用隱式轉換。現行修復路徑是由 owner 發布有 issue provenance、matching `work_item` metadata 與具體 tasks 的 canonical `docs/superpowers/workstreams/<slug>/todo.md`，再用 `cortex work link <work_id> --repo <owner/repo> --kind path --ref <repo-relative-todo-path>` link 已存在 path；CLI link 本身不會創造 Todo，WorkAuthority 必須等 Monitor correlation 的 fresh snapshot 確認。
 
 ### R3 — 缺少 Todo 的 diagnostic 指出真正缺口
 
-對未經新 build gate 的既有 run，ship 仍須在任何外部交付副作用之前 fail closed。當 `mapped_todo_paths=0` 時，diagnostic MUST 明說缺少唯一的已確認 Todo source，提供可執行的正式 link／refresh／re-intake 或受支援恢復路徑，且不得只建議 `unlink`。`unlink` 只適用於多餘來源；`mapped_todo_paths>1` 的診斷可以建議移除多餘 mapping。
+對未經新 build gate 的既有 run，ship 仍須在任何外部交付副作用之前 fail closed。當 `mapped_todo_paths=0` 時，diagnostic MUST 明說缺少唯一的已確認 Todo source。對尚未開工的新 work，提示 owner 建立具 provenance 的 canonical workstream Todo、link 已存在 source path、等待 fresh Monitor snapshot，再由正式 start/intake gate 判定。對已有 run/candidate/PR，不得提示直接 resume/re-intake；須交由 Recovery child 凍結的 CAS/evidence transition。任何情境都不得只建議 `unlink`；`unlink` 只適用於多餘來源；`mapped_todo_paths>1` 的診斷可以建議移除多餘 mapping。
 
 ### R4 — 已有 exact Candidate 與 PR 的 run 必須有正式恢復契約
 

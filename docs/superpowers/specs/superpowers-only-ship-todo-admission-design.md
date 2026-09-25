@@ -15,7 +15,7 @@ GitHub #1051 記錄的正式 run `workflow-52d048b72adbd5cae06f` 已完成 build
 
 此草案不把 Superpowers plan 轉成 Todo。Superpowers `spec/design/plan` 的 `planning_authority` 由 run 持有；ship binding 與 remote closure 使用的是 WorkAuthority 的 `mapped_todo_paths`。兩個來源身份不同，靠檔名或 checkbox 把它們視為同一來源會跳過 owner、revision 和 correlation 證明。
 
-若要補上 Todo，必須由 owner 將 canonical Todo path 透過受支援的 work link 納入 `.cortex/work-items.yaml`／來源設定，等待 Monitor snapshot 重新載入後，以新的 WorkAuthority 為準。link 寫入成功不等於 snapshot 已採信；同一個 intake 呼叫不得假裝已完成 refresh。
+若要補上 Todo，owner 必須先發布具 issue provenance、matching `work_item` metadata 與具體交付 tasks 的 canonical `docs/superpowers/workstreams/<slug>/todo.md`。`cortex work link <work_id> --repo <owner/repo> --kind path --ref <repo-relative-todo-path>` 只會把已存在、由 Monitor provider 掃描的 source path 加入 override；它不會創造 Todo source，也不等於 snapshot 已採信。必須等待 Monitor correlation 產生 fresh snapshot，再以新的 WorkAuthority 為準；同一個 intake 呼叫不得假裝已完成 refresh。對已存在 run/candidate/PR，這個新 mapping 不授權直接 resume/re-intake，必須走 Recovery child 凍結的 transition。
 
 ### D3 — 先 gate builder，再保留 ship backstop
 
@@ -63,15 +63,18 @@ GitHub #1051 記錄的正式 run `workflow-52d048b72adbd5cae06f` 已完成 build
 ### Child A — build 前唯一 Todo admission 與零來源 diagnostic
 
 - 建議標題：`fix(work): Superpowers-only work 在 builder dispatch 前要求唯一 Todo source`。
-- 範圍：D2–D3 的 owner/mapping 規則與 build admission gate；對 zero/multiple mapping 分類並提供有效 next action；ship 保留 backstop。
-- 驗收：#1051 AC1–2；測試 Superpowers-only／無 OpenSpec／唯一 Todo／缺 Todo／多 Todo／偽造 path link，證明缺少或歧義時 builder job 為零，正式 source link 尚未進 fresh snapshot 時不放行。
+- Owner：Manager admission/diagnostic；WorkAuthority／Monitor snapshot 提供唯一 source of truth。
+- 範圍：D2–D3 的 owner/mapping 規則與 build admission gate；對 zero/multiple mapping 分類並提供有效 next action；ship 保留 backstop。missing-Todo repair 要求 owner 先發布具 issue provenance、matching `work_item` metadata 與具體 tasks 的 canonical workstream `todo.md`，再以 `--kind path` link 已存在 source，等 fresh snapshot 才能通過。
+- 驗收：#1051 AC1–2 與 AC4 前五種 source/build admission case；測試 Superpowers-only／無 OpenSpec／唯一 Todo／缺 Todo／多 Todo／偽造或尚未反映的 path link，證明缺少或歧義時 builder job 為零，正式 source 尚未進 fresh snapshot 時不放行。
 - 邊界：不處理既有 candidate／PR run 的 claim era rebase、delivery journal recovery 或 merge 重入。
 
 ### Child B — authority 前進後 exact Candidate／PR 的正式恢復
 
 - 建議標題：`fix(recovery): Todo authority 加入後安全恢復已有 candidate 與 PR 的 run`。
+- Owner：Manager recovery，與 claim/evidence/delivery owners 協作；以 GitHub PR facts 作遠端事實。
+- Dependency：硬依賴 Child A 已落地的 unique-Todo admission 與 zero/multiple diagnostic contract；Child B 不重開 source classification 或改寫 Child A 的 gate。
 - 範圍：#983 型 stopped run；在 WorkAuthority、claim/run、evidence、delivery journal 和 GitHub PR 之間定義同 run CAS 或新 run adoption 的唯一合法方式。
-- 驗收：#1051 AC3 及 AC4 的「已存在 PR」情境；驗證 old/new revisions、claim CAS、證據失效／重驗範圍、exact candidate／PR head、無重複 push／PR／merge，並在 unknown/conflict 時明確 fail-closed。
+- 驗收：#1051 AC3 及 AC4 的既有 candidate/PR case；驗證 old/new revisions、claim CAS、證據失效／重驗範圍、exact candidate／PR head、無重複 push／PR／merge，並在 unknown/conflict 時明確 fail-closed。
 - 邊界：不處理 PR #1049 的 CHANGELOG/main conflict（#972／#973），不手改正式 registry、journal 或 source revision。
 
 ## Risks
