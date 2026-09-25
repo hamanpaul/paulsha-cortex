@@ -20,7 +20,7 @@ sizing: yellow
 
 ```json
 {
-  "candidate": "<full object id>",
+  "candidate": "<validated full object id or null before a valid Candidate exists>",
   "main_head": "<full object id or null>",
   "conflict_paths": ["<full path>", "..."],
   "repair_kind": "clean-behind | changelog-top-insert | other-conflict | unavailable",
@@ -34,9 +34,13 @@ sizing: yellow
 }
 ```
 
-`failure` 可為 null。`candidate` 必須是 40 或 64 位 hex full object id；`main_head` 與 `failure.main_head` 可為 null，否則同為 full object id 且彼此相等。傳入 valid M 後的 failure 必須保留 M。`conflict_paths` 是 JSON string array，逐項完整保存，不設 200 字欄位上限、不合併成一個字串。Git object format 與是否為 commit object 由 probe/action 層按 repository 驗證；schema layer 只驗完整 hash 語法及欄位一致性。
+`candidate` 欄位只表示已驗證的 Candidate C，不是原始 `WorkflowRun.candidate_head` 輸入。`failure` 一般可為 null；若 `candidate` 為 null，`failure` 必須存在，且 `failure.stage` 只能是跨 #987/#988 固定的 `candidate-resolve` 或 `candidate-validate`。這兩個 stage 表示 producer 尚未取得合法 full Candidate C；此狀態要求 `main_head=null`、`failure.main_head=null`、`conflict_paths=[]`、`repair_kind="unavailable"`、`skipped_reason=null`。#987 的 content-addressed delivery evidence 保留 validator 收到的原始 Candidate 輸入（包括缺值、非法或縮寫值）及 typed failure；原始輸入不得複製進 `MainSyncContext.candidate`，也不得供 recovery 使用。
 
-Wire contract 的巢狀失敗欄位固定使用 `context.main_sync.failure`，並與 live issue AC 的 `failure.stage`、`failure.returncode`、`failure.error_kind`、`failure.main_head` 路徑一致；其值使用 #987 producer `MainSyncProbeFailure` 的 typed shape。`returncode` 為整數或 null；`stage`、`error_kind` 是 #987 producer vocabulary 的非空字串。`repair_kind` 是 `clean-behind`、`changelog-top-insert`、`other-conflict` 或 `unavailable` 之一；`skipped_reason` 為 null 或非空穩定分類碼，包含後續 writer 會使用的 `repair-budget-exhausted`、`registry-reset-refused`。`conflict_paths` 每項是非空字串，保留空白及換行原樣。
+若 `candidate` 非 null，必須是 40 或 64 位 hex full object id。`main_head` 與 `failure.main_head` 可為 null，否則同為 full object id 且彼此相等；取得 valid M 後的 failure 必須保留 M。`conflict_paths` 是 JSON string array，逐項完整保存，不設 200 字欄位上限、不合併成一個字串。Git object format 與是否為 commit object 由 probe/action 層按 repository 驗證；schema layer 只驗完整 hash 語法及欄位一致性。
+
+`candidate=null` 是 pre-valid-C fail-closed stop，永遠不具備 `retry-build` 資格；consumer 不得由失敗證據、原始輸入或縮寫 SHA 推導/合成 Candidate。#989 action/status consumer 與 #990 Manager writer/read-back 必須保留此不可重試語意。實作前需核對 #987 producer 使用上述兩個精確 stage 字串；若 producer literal 不同，先同步修訂 #987/#988 契約，不在 schema reader 中做別名猜測。
+
+Wire contract 的巢狀失敗欄位固定使用 `context.main_sync.failure`，並與 live issue AC 的 `failure.stage`、`failure.returncode`、`failure.error_kind`、`failure.main_head` 路徑一致；其值使用 #987 producer `MainSyncProbeFailure` 的 typed shape。`returncode` 為整數或 null；`stage`、`error_kind` 是 #987 producer vocabulary 的非空字串，其中 pre-valid-C failure 的 stage literal 固定為 `candidate-resolve` 或 `candidate-validate`。`repair_kind` 是 `clean-behind`、`changelog-top-insert`、`other-conflict` 或 `unavailable` 之一；`skipped_reason` 為 null 或非空穩定分類碼，包含後續 writer 會使用的 `repair-budget-exhausted`、`registry-reset-refused`。`conflict_paths` 每項是非空字串，保留空白及換行原樣。
 
 `DiagnosticReason` schema version 3 在原 `context` 下序列化這個 reserved object，保留其餘 legacy string 欄位與既有上限。Reader 接受 v1/v2，正規化為 v3；v1/v2 或舊 caller 的 `context.main_sync` string 仍視為 legacy string，不能被誤讀為 typed object；新 typed writer 必須使用專用參數 `main_sync_context`，同一筆 reason 不可同時帶 legacy string 與 typed object。任何無法辨識或不完整的 main_sync object fail closed；不可透過 `**context` 將 arbitrary mapping stringified。
 

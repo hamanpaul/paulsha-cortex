@@ -24,11 +24,13 @@ sizing: yellow
 
 ### D3. Hash syntax and Git object truth have separate owners
 
-此 module 檢查 40/64 hex full object-id syntax，並保證 `failure.main_head == context.main_head`。Probe 與 action 必須按當前 repo object format 使用 Git 檢查 SHA 長度及 commit object；模型不能僅由看似合法的字串授權 action。
+此 module 對非 null 的 `candidate`、`main_head` 及 `failure.main_head` 檢查 40/64 hex full object-id syntax，並保證 `failure.main_head == context.main_head`。`candidate=null` 僅表示 pre-valid-C failure：`failure` 必填，stage 必須是 #987/#988 共用的精確 literal `candidate-resolve` 或 `candidate-validate`，兩個 main-head 都必須 null、paths 必須為空、repair kind 必須是 `unavailable`、skipped reason 必須為 null。非法／縮寫原始輸入僅由 #987 的 content-addressed delivery evidence 保存，不是 typed Candidate，也不能授權任何 recovery action。Probe 與 action 必須按當前 repo object format 使用 Git 檢查 SHA 長度及 commit object；模型不能僅由看似合法的字串授權 action。
+
+`candidate=null` 的 MainSyncContext 永遠不可用於 `retry-build`。`#989` 必須拒絕並隱藏該 action；`#990` 必須將 null Candidate 與 pre-valid-C failure 寫入同一 WorkflowRun context 並 exact read-back，且 status/action projection 不得宣稱 retry-build 可用。這延伸 #972 的 illegal/missing SHA fail-closed 條件，不放寬原驗收。
 
 ### D4. Round-trip proof before integration
 
-建立含多條 >200 字 conflict paths、C/M 與 fetch 後 failure M 的 reason；做 `DiagnosticReason.from_dict(reason.to_dict())` 及 WorkflowRun JSON encode/decode fixture，逐欄斷言巢狀 object、每條 path 和 `failure.main_head=M` 原樣相等。額外載入 v1/v2 fixtures，驗舊 reason 保留、schema 輸出升至 v3；舊 flat `context.main_sync` string 仍是 string。涵蓋 null M、40/64 位合法 SHA、非法/縮寫 SHA、未知欄位、缺欄、failure/main M 不一致與 failure/skip 型別錯誤。Manager store transaction 和 budget/reset-refusal caller 留 child 04。
+建立含多條 >200 字 conflict paths、C/M 與 fetch 後 failure M 的 reason；做 `DiagnosticReason.from_dict(reason.to_dict())` 及 WorkflowRun JSON encode/decode fixture，逐欄斷言巢狀 object、每條 path 和 `failure.main_head=M` 原樣相等。另建立 pre-valid-C fixture：`candidate=null`、stage 分別為 `candidate-resolve`／`candidate-validate`、兩個 main-head 為 null、空 paths、unavailable repair；Reason 與 WorkflowRun JSON read-back 必須逐欄相等。負例拒絕把非法／縮寫原始輸入放入 typed `candidate`、用非 pre-valid-C stage 搭配 null Candidate、null Candidate 搭配非 null main-head／paths／其他 repair kind／skipped reason、pre-valid-C stage 搭配非-null Candidate，以及缺少 failure。該輸入只在 #987 probe evidence fixture 保留；本票不得將它轉成 typed authority。額外載入 v1/v2 fixtures，驗舊 reason 保留、schema 輸出升至 v3；舊 flat `context.main_sync` string 仍是 string。涵蓋 null M、40/64 位合法 SHA、未知欄位、缺欄、failure/main M 不一致與 failure/skip 型別錯誤。Manager store transaction 與 budget/reset-refusal caller 留 child 04；#989/#990 負責驗證 null Candidate 無 retry-build action。
 
 ### D5. Sizing (#208)
 
@@ -36,4 +38,4 @@ sizing: yellow
 
 ### D6. Scope boundary and dependency
 
-此票 production scope 僅 `paulsha_cortex/coordinator/diagnostics.py`；新增測試可以經現有 `WorkflowRun` serializer 驗 JSON encode/decode，不修改 `workflow.py`、Manager wrapper、recovery actions、CLI 或 probe。#987 尚未完成前不得進入實作或把 schema 視為 probe producer contract；任何 producer shape 漂移先回到本三件套與 #988 issue 一起修訂。CLI help 僅檢查沒有新增 CLI surface；如實作後發現需要 CLI 改動，另立有 issue authority 的工作項目。
+此票 production scope 僅 `paulsha_cortex/coordinator/diagnostics.py`；新增測試可以經現有 `WorkflowRun` serializer 驗 JSON encode/decode，不修改 `workflow.py`、Manager wrapper、recovery actions、CLI 或 probe。#987 尚未完成前不得進入實作或把 schema 視為 probe producer contract；其 producer 必須輸出 `candidate-resolve`／`candidate-validate` 作為 pre-valid-C failure stage。Builder 產物可讀時，在 #988 intake 前逐字核對該 stage literal；不一致先修 #987/#988 契約，不做隱式別名。CLI help 僅檢查沒有新增 CLI surface；如實作後發現需要 CLI 改動，另立有 issue authority 的工作項目。
