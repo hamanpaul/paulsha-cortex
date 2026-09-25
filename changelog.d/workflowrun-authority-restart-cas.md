@@ -1,0 +1,1 @@
+- **#1068 WorkflowRun authority-restart CAS 規劃**：新增 issue-backed spec/design/todo 與 own OpenSpec，將 exact WorkflowRun tuple transition 明確阻擋至 #966 durable registry CAS 合併後；本次僅發布規劃文件，不實作 registry、Manager recovery 或 delivery journal 行為。

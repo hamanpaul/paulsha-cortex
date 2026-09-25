@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **#1068 WorkflowRun authority-restart CAS 規劃**：新增 issue-backed spec/design/todo 與 own OpenSpec，將 exact WorkflowRun tuple transition 明確阻擋至 #966 durable registry CAS 合併後；本次僅發布規劃文件，不實作 registry、Manager recovery 或 delivery journal 行為。
 - **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
 - **#966 Yellow plan review 完整性**：將 T6 既有文件交付項目明列為 `documentation`，對齊 accepted plan 的 `artifact_classes`；產品驗收範圍不變。
 - **#1040 driving-cortex resume 範例**：移除 resume 不接受的 `--expected-run-id`，補上唯讀核對 repo/work item/唯一 ongoing run 的步驟，並讓 retry-build 範例明示必需的 exact Candidate。
