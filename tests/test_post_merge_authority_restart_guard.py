@@ -365,6 +365,39 @@ def test_fail_closed_archive_reconciliation_never_warns(
     assert messages == []
 
 
+def test_existing_conflict_wins_over_late_semantic_validation_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = _snapshot_payload()
+    _add_non_openspec_conflict(payload)
+    payload["work_items"][0]["sources"].append(
+        _source(
+            source_id=f"github_issue:{REPO}#11",
+            kind="github_issue",
+            ref=f"{REPO}#11",
+            revision="github:issue:11",
+            status="stalled",
+            provider=f"github:{REPO}",
+        )
+    )
+    snapshot = _write_snapshot(tmp_path / "conflict-before-malformed.json", payload)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=claim.__name__),
+        pytest.raises(AuthorityValidationError) as excinfo,
+    ):
+        _load(snapshot)
+
+    _assert_conflict(excinfo)
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == claim.__name__ and record.levelno == logging.WARNING
+    ]
+    assert messages == []
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

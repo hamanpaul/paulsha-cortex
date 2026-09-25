@@ -240,6 +240,42 @@ def _merged_remote_archive_resolution(
     return archived_value
 
 
+def _semantic_conflict_error(
+    *, repo_label: str | None, work_id_label: str | None
+) -> AuthorityValidationError:
+    return AuthorityValidationError(
+        "confirmed semantic work authority revisions conflict",
+        reason_code=REASON_ROW_MALFORMED,
+        repo=repo_label,
+        work_id=work_id_label,
+        field="source_revisions",
+    )
+
+
+def _has_unreconciled_semantic_conflict(
+    *,
+    repo: str,
+    observed_semantic_sources: dict[str, dict[str, tuple[dict, ...]]],
+    confirmed_sources: tuple[dict, ...],
+    providers: dict,
+) -> bool:
+    for key, observed in observed_semantic_sources.items():
+        if len(observed) < 2:
+            continue
+        if (
+            _merged_remote_archive_resolution(
+                repo=repo,
+                key=key,
+                observed_sources=observed,
+                confirmed_sources=confirmed_sources,
+                providers=providers,
+            )
+            is None
+        ):
+            return True
+    return False
+
+
 @dataclass(frozen=True, init=False)
 class WorkAuthority:
     repo: str
@@ -802,22 +838,39 @@ def _authority_from_canonical_row(
                 )
             todo_paths.append(ref)
     confirmed_todo = any(source.get("kind") in todo_kinds for source in confirmed)
+    confirmed_sources = tuple(confirmed)
     semantic_sources: dict[str, dict[str, tuple[dict, ...]]] = {}
-    for source in confirmed:
+    for source in confirmed_sources:
         source_id = source.get("source_id")
         source_revision = source.get("revision")
         kind = source.get("kind")
         ref = source.get("ref")
         if not all(isinstance(value, str) and value for value in (source_id, source_revision, kind, ref)):
             continue
-        semantic = semantic_source_revision(
-            repo=repo,
-            kind=kind,
-            ref=ref,
-            source_id=source_id,
-            revision=source_revision,
-            status=source.get("status") if isinstance(source.get("status"), str) else None,
-        )
+        try:
+            semantic = semantic_source_revision(
+                repo=repo,
+                kind=kind,
+                ref=ref,
+                source_id=source_id,
+                revision=source_revision,
+                status=source.get("status") if isinstance(source.get("status"), str) else None,
+            )
+        except AuthorityValidationError:
+            # #961 允許 active↔archived OpenSpec seam 延後裁決；但若在這之前
+            # 已經看到無法收斂的 semantic conflict，後續的 status malformed
+            # 不能覆寫既有的 conflict contract。
+            if _has_unreconciled_semantic_conflict(
+                repo=repo,
+                observed_semantic_sources=semantic_sources,
+                confirmed_sources=confirmed_sources,
+                providers=providers,
+            ):
+                raise _semantic_conflict_error(
+                    repo_label=repo_label,
+                    work_id_label=work_id_label,
+                )
+            raise
         if semantic is None:
             continue
         key, value = semantic
@@ -833,16 +886,13 @@ def _authority_from_canonical_row(
             repo=repo,
             key=key,
             observed_sources=observed,
-            confirmed_sources=tuple(confirmed),
+            confirmed_sources=confirmed_sources,
             providers=providers,
         )
         if resolved is None:
-            raise AuthorityValidationError(
-                "confirmed semantic work authority revisions conflict",
-                reason_code=REASON_ROW_MALFORMED,
-                repo=repo_label,
-                work_id=work_id_label,
-                field="source_revisions",
+            raise _semantic_conflict_error(
+                repo_label=repo_label,
+                work_id_label=work_id_label,
             )
         resolved_semantic_sources[key] = resolved
         deferred_reconciliation_warnings.append(
