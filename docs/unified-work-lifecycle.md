@@ -55,6 +55,9 @@ production 路徑仍是 `registry.update_headless_result()` 先寫 terminal outc
 
 GitHub terminal closure scan 會以 authenticated default revision 的 Contents API 讀取 remote Todo，並重驗 path、blob SHA 與 base64 encoding；production 只對 canonical WorkflowRegistry 已連結的 PR 做 merge ancestry compare。只有 HTTP 502/503/504 會有限次 backoff retry，auth、rate-limit、其他 HTTP error、malformed JSON 或 identity mismatch 都立即保留 last-good 並標 degraded。
 
+當同一個 `openspec:{repo}:{ref}` authority key 同時看到本機 `repo:{repo}` 的
+`active` source 與 `github-terminal:{repo}` 的 `archived` source 時，claim 只在一個極窄條件下收斂成 archived：必須至少有一筆 confirmed `github_pr` source、每筆 PR source 的狀態都已是 `closed` 或 `merged`，且 `github-terminal:{repo}` 這份 **ok** snapshot 的 `observations.remote_prs` 對每筆 confirmed PR source 都恰好有一筆相同 `source_id` 的 row，並且 `merged_with_merge_commit is True`。缺 PR、terminal provider 缺席／degraded、`remote_prs` 缺席或型別不符、`source_id` 不匹配、同 `source_id` 重複，或任何其他 semantic conflict，一律維持原本的 authority conflict fail-closed，不做自動裁決。
+
 ## Correlation authority
 
 可授權 mutation 的關聯只來自：

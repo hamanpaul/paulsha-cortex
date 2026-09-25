@@ -57,13 +57,13 @@ Sizing inputs were read from current source, not copied from the #887 aggregate.
 
 ## Tasks
 
-- [ ] **T0 acceptance freeze and fixture inventory**：核對 live #961/#887 dependency與 current source evidence；準備 canonical snapshot fixtures，明確標示 repo provider、terminal provider、confirmed github_pr 及同 source_id remote_pr row。不得新增或 commit 本票 scope 外的檔案。
-- [ ] **T1 tests／RED**：在 tests/test_post_merge_authority_restart_guard.py 加 Child A public-boundary tests。正例要證明嚴格 proof 下選 archived，輸出等於移除 local source；負例逐條否定條件並精確斷言錯誤欄位。先確認現行 setdefault 路徑對 active+archived fixture RED。
-- [ ] **T2 source／兩階段收集與裁決**：在 claim._authority_from_canonical_row 先 collect observed values per semantic key，再呼叫純 _merged_remote_archive_resolution。一般單值沿用原值；只有 spec R961.2 全部條件成立回 archived；其他衝突 raise 現有 AuthorityValidationError。semantic_source_revision 的過濾/驗證與 mapped_openspec aggregation 不改。
-- [ ] **T3 audit／determinism tests**：測來源列正反順序、source_revisions/digest/mapped_openspec exact equality、每 key 一行 warning 及 diagnostic label 路徑清理；確保無 provider network、registry write、filesystem mutation。
-- [ ] **T4 R7 fail-closed matrix**：覆蓋 no PRs、PR status/remote merge 不正面、remote_prs 缺席／錯型／source_id 不匹配／同 source_id 重複（皆 true 與 true/false）、terminal provider missing/degraded、provider role swapped、third value、non-OpenSpec conflict；每例維持同 message/reason_code/field。
-- [ ] **T5 regression**：保留並執行 tests/test_work_claim.py、tests/test_claim_provider_scope_530.py、tests/test_monitor_work_review_regressions.py 的既有斷言；新增測試只改新 fixture，不以放寬舊 oracle 轉綠。
-- [ ] **T6 documentation/changelog/policy**：依 repo policy 加 changelog fragment 並同步 CHANGELOG.md [Unreleased]；docs/unified-work-lifecycle.md 說明唯一允許收斂的 source/provider/PR-ancestry 條件與其他衝突 fail-closed。CLI 沒有變更，驗證 cortex work --help 輸出未變。
+- [x] **T0 acceptance freeze and fixture inventory**：核對 live #961/#887 dependency與 current source evidence；準備 canonical snapshot fixtures，明確標示 repo provider、terminal provider、confirmed github_pr 及同 source_id remote_pr row。不得新增或 commit 本票 scope 外的檔案。
+- [x] **T1 tests／RED**：在 tests/test_post_merge_authority_restart_guard.py 加 Child A public-boundary tests。正例要證明嚴格 proof 下選 archived，輸出等於移除 local source；負例逐條否定條件並精確斷言錯誤欄位。先確認現行 setdefault 路徑對 active+archived fixture RED。
+- [x] **T2 source／兩階段收集與裁決**：在 claim._authority_from_canonical_row 先 collect observed values per semantic key，再呼叫純 _merged_remote_archive_resolution。一般單值沿用原值；只有 spec R961.2 全部條件成立回 archived；其他衝突 raise 現有 AuthorityValidationError。semantic_source_revision 的過濾/驗證與 mapped_openspec aggregation 不改。
+- [x] **T3 audit／determinism tests**：測來源列正反順序、source_revisions/digest/mapped_openspec exact equality、每 key 一行 warning 及 diagnostic label 路徑清理；確保無 provider network、registry write、filesystem mutation。
+- [x] **T4 R7 fail-closed matrix**：覆蓋 no PRs、PR status/remote merge 不正面、remote_prs 缺席／錯型／source_id 不匹配／同 source_id 重複（皆 true 與 true/false）、terminal provider missing/degraded、provider role swapped、third value、non-OpenSpec conflict；每例維持同 message/reason_code/field。
+- [x] **T5 regression**：保留並執行 tests/test_work_claim.py、tests/test_claim_provider_scope_530.py、tests/test_monitor_work_review_regressions.py 的既有斷言；新增測試只改新 fixture，不以放寬舊 oracle 轉綠。
+- [x] **T6 documentation/changelog/policy**：依 repo policy 加 changelog fragment 並同步 CHANGELOG.md [Unreleased]；docs/unified-work-lifecycle.md 說明唯一允許收斂的 source/provider/PR-ancestry 條件與其他衝突 fail-closed。CLI 沒有變更，驗證 cortex work --help 輸出未變。
 - [ ] **T7 PR gates and child handoff**：在實作 worktree 執行 focused tests、上列 regression tests、全 repo required CI 與帶 PR context 的 policy_check；PR body 使用 Closes #961 並完成 repo checklist。合併後通知/解鎖 #962 dependency；不關閉 #887，完整 parent AC 留待兩 child integrated gate。
 
 ## Completion boundary
