@@ -29,6 +29,7 @@
 - **#862 job disposition replay**：`record_job_supersession()` 與
   `record_job_consumption()` 的省略 `at` retry 會保留第一次寫入的 disposition 時間，
   exact replay 不再重複持久化；呼叫者明示不同 `at` 仍維持 conflict。
+- **#871 maintainer fallback authorization v2**：同一 run/head 若已存在 Copilot v1 merge authorization，maintainer fallback 現在會保留 immutable v1 為 superseded 稽核，另建以 payload digest 定址的 v2 並在 payload 內綁定 v1 ref/hash；replay 會驗證 superseded v1 wrapper 不可變且身分一致，`merge-authorized` 前置檢查與 trusted evidence refs 仍維持既有 fail-closed 邊界。
 
 - **#987 main-probe conflict classification**：`git merge-tree --write-tree --name-only --no-messages -z` 在 exit `1`、tree OID 有效且 conflicted path 清單為空時，現在會維持 generic `conflict` 分類，不再誤判成 `multiple-conflicts`；既有的 `CHANGELOG.md` 頂端插入特例、單一路徑非 changelog conflict、多重 conflict path，以及 clean-behind／in-sync／failure 行為維持不變。
 - **#987 main-probe gate**：ship validator 現在會在 Manager-owned ship clone 內以 bounded direct git probe `origin/main`，於 preflight 前與必要 push 前重讀 main；只有 Candidate 已含最新 M 時才可進 preflight／push／建 PR。`merge-tree --write-tree --name-only --no-messages -z` 改走 NUL-safe path parser，clean-behind 與 conflict 會在 preflight 前 fail-closed；fetch／merge-base／merge-tree／path-parser failure 會寫入 content-addressed `main-sync-probe` evidence，持久化 `candidate`／`stage`／`returncode`／`error_kind`／`main_head`，並讓 `main-sync-unavailable` stop 與 operator resume 可讀回同一份證據。重用既有 Manager ship workspace 時若來源 repo 已無有效 `origin`，現在也會先移除工作區殘留的 `origin`，避免 stale remote 被錯誤探測成 `in-sync`。

@@ -1098,6 +1098,7 @@ def _merge_authorization_body(
     copilot: object | None,
     foreign_review: ForeignReviewEvidence,
     maintainer_review: MaintainerReviewEvidence | None = None,
+    superseded_authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_foreign = _validate_foreign_review(
         foreign_review,
@@ -1124,13 +1125,19 @@ def _merge_authorization_body(
     if maintainer_review is not None:
         if copilot is not None:
             raise ValueError("merge authorization review authority is ambiguous")
-        return {
+        body = {
             "schema": "cortex-merge-authorization/v2",
             **common,
             "review_kind": "maintainer-review",
             "review_ref": maintainer_review.path,
             "review_hash": maintainer_review.expected_hash.lower(),
         }
+        if superseded_authorization is not None:
+            body["superseded_authorization_ref"] = superseded_authorization["path"]
+            body["superseded_authorization_hash"] = superseded_authorization["hash"]
+        return body
+    if superseded_authorization is not None:
+        raise ValueError("merge authorization superseded evidence requires maintainer review")
     if copilot is None:
         raise ValueError("merge authorization review authority missing")
     return {
@@ -1154,6 +1161,7 @@ def _authorization_record(
     digest = verification.canonical_json_hash(body)
     run_id = body.get("run_id")
     head = body.get("head")
+    schema = body.get("schema")
     if (
         not isinstance(run_id, str)
         or re.fullmatch(r"workflow-[0-9a-f]{20}", run_id) is None
@@ -1163,7 +1171,12 @@ def _authorization_record(
         raise ValueError("merge authorization identity malformed")
     root = state_path.resolve().parent / "evidence" / "merge-authorization"
     root.mkdir(parents=True, exist_ok=True)
-    target = root / f"{run_id}-{head.lower()}.json"
+    if schema == "cortex-merge-authorization/v1":
+        target = root / f"{run_id}-{head.lower()}.json"
+    elif schema == "cortex-merge-authorization/v2":
+        target = root / f"{run_id}-{head.lower()}-{digest}.json"
+    else:
+        raise ValueError("merge authorization identity malformed")
     wrapper = {"payload": body, "hash": digest}
     if target.exists():
         if (
@@ -1194,6 +1207,68 @@ def _authorization_record(
         finally:
             temporary.unlink(missing_ok=True)
     return {"payload": body, "hash": digest, "path": str(target)}
+
+
+def _authorization_schema(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    payload = value.get("payload")
+    schema = payload.get("schema") if isinstance(payload, dict) else None
+    return schema if isinstance(schema, str) else None
+
+
+def _read_immutable_evidence_wrapper(path_value: object) -> tuple[dict[str, Any], str] | None:
+    if not isinstance(path_value, str):
+        return None
+    evidence_path = Path(path_value)
+    if (
+        not evidence_path.is_absolute()
+        or evidence_path.is_symlink()
+        or not evidence_path.is_file()
+    ):
+        return None
+    try:
+        if evidence_path.stat().st_mode & 0o222:
+            return None
+        wrapper = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(wrapper, dict) or set(wrapper) != {"payload", "hash"}:
+        return None
+    payload = wrapper.get("payload")
+    digest = wrapper.get("hash")
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or verification.canonical_json_hash(payload) != digest
+    ):
+        return None
+    return payload, digest
+
+
+def _superseded_authorization_valid(body: dict[str, Any]) -> bool:
+    superseded_ref = body.get("superseded_authorization_ref")
+    superseded_hash = body.get("superseded_authorization_hash")
+    if (
+        not isinstance(superseded_ref, str)
+        or not isinstance(superseded_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", superseded_hash) is None
+    ):
+        return False
+    wrapper = _read_immutable_evidence_wrapper(superseded_ref)
+    if wrapper is None:
+        return False
+    payload, digest = wrapper
+    return (
+        digest == superseded_hash
+        and payload.get("schema") == "cortex-merge-authorization/v1"
+        and payload.get("run_id") == body.get("run_id")
+        and payload.get("repo") == body.get("repo")
+        and payload.get("work_id") == body.get("work_id")
+        and payload.get("head") == body.get("head")
+        and payload.get("tree_hash") == body.get("tree_hash")
+    )
 
 
 def _authorization_matches(
@@ -1253,35 +1328,47 @@ def _authorization_identity_matches(
         "preflight_hash",
         "checks_hash",
     }
-    schema = body.get("schema") if isinstance(body, dict) else None
-    review_required = (
-        {"copilot_requested_at_epoch", "copilot_review_id", "copilot_hash"}
-        if schema == "cortex-merge-authorization/v1"
-        else {"review_kind", "review_ref", "review_hash"}
-        if schema == "cortex-merge-authorization/v2"
-        else set()
-    )
+    if not isinstance(body, dict):
+        return False
+    body_keys = set(body)
+    schema = body.get("schema")
+    if schema == "cortex-merge-authorization/v1":
+        required_keys = common_required | {
+            "copilot_requested_at_epoch",
+            "copilot_review_id",
+            "copilot_hash",
+        }
+        if body_keys != required_keys:
+            return False
+        has_superseded = False
+    elif schema == "cortex-merge-authorization/v2":
+        required_keys = common_required | {
+            "review_kind",
+            "review_ref",
+            "review_hash",
+        }
+        superseded_keys = {
+            "superseded_authorization_ref",
+            "superseded_authorization_hash",
+        }
+        if body_keys == required_keys:
+            has_superseded = False
+        elif body_keys == required_keys | superseded_keys:
+            has_superseded = True
+        else:
+            return False
+    else:
+        return False
+    wrapper = _read_immutable_evidence_wrapper(evidence_path)
     if (
-        not isinstance(body, dict)
-        or not review_required
-        or set(body) != common_required | review_required
-        or verification.canonical_json_hash(body) != digest
-        or not isinstance(evidence_path, str)
-        or not Path(evidence_path).is_absolute()
-        or Path(evidence_path).is_symlink()
-        or not Path(evidence_path).is_file()
-        or Path(evidence_path).stat().st_mode & 0o222
+        wrapper is None or verification.canonical_json_hash(body) != digest
     ):
         return False
-    try:
-        evidence_wrapper = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    if evidence_wrapper != {"payload": body, "hash": digest}:
+    evidence_payload, evidence_digest = wrapper
+    if evidence_payload != body or evidence_digest != digest:
         return False
     common_valid = (
-        schema in {"cortex-merge-authorization/v1", "cortex-merge-authorization/v2"}
-        and body.get("run_id") == active.get("run_id")
+        body.get("run_id") == active.get("run_id")
         and body.get("workflow_step_ids") == active.get("workflow_step_ids")
         and body.get("repo") == authority.repo
         and body.get("work_id") == authority.work_id
@@ -1324,6 +1411,8 @@ def _authorization_identity_matches(
             and isinstance(body.get("copilot_hash"), str)
             and re.fullmatch(r"[0-9a-f]{64}", body["copilot_hash"]) is not None
         )
+    if has_superseded and not _superseded_authorization_valid(body):
+        return False
     review_ref = body.get("review_ref")
     if not (
         body.get("review_kind") == "maintainer-review"
@@ -1634,23 +1723,51 @@ def _ship_with_maintainer_review(
     )
     if not remote_gate.allowed:
         raise RuntimeError(f"merge authorization blocked: {', '.join(remote_gate.reasons)}")
-    authorization = _authorization_record(
-        _merge_authorization_body(
+    existing_authorization = ship.get("merge_authorization") if ship else None
+    superseded_authorization = (
+        ship.get("superseded_merge_authorization") if ship else None
+    )
+    if _authorization_schema(existing_authorization) == "cortex-merge-authorization/v1":
+        if (
+            superseded_authorization is not None
+            and superseded_authorization != existing_authorization
+        ):
+            raise RuntimeError("persisted merge authorization differs from current gate evidence")
+        superseded_authorization = existing_authorization
+        existing_authorization = None
+    if superseded_authorization is not None and (
+        _authorization_schema(superseded_authorization) != "cortex-merge-authorization/v1"
+        or not _authorization_identity_matches(
+            superseded_authorization,
             active=active,
             authority=authority,
             binding=binding,
-            preflight=preflight,
-            remote=remote,
-            copilot=None,
-            foreign_review=foreign_review,
-            maintainer_review=maintainer,
-        ),
-        state_path=state_path,
+            head=preflight.head,
+            tree_hash=preflight.tree_hash,
+            terminal_reconciliation=True,
+        )
+    ):
+        raise RuntimeError("persisted merge authorization differs from current gate evidence")
+    body = _merge_authorization_body(
+        active=active,
+        authority=authority,
+        binding=binding,
+        preflight=preflight,
+        remote=remote,
+        copilot=None,
+        foreign_review=foreign_review,
+        maintainer_review=maintainer,
+        superseded_authorization=superseded_authorization,
     )
-    existing_authorization = ship.get("merge_authorization") if ship else None
+    if existing_authorization is not None and (
+        not isinstance(existing_authorization, dict)
+        or existing_authorization.get("payload") != body
+    ):
+        raise RuntimeError("persisted merge authorization differs from current gate evidence")
+    authorization = _authorization_record(body, state_path=state_path)
     if existing_authorization is not None and existing_authorization != authorization:
         raise RuntimeError("persisted merge authorization differs from current gate evidence")
-    active["ship"] = {
+    next_ship = {
         **(ship or {}),
         "phase": "merge-authorized",
         "head": preflight.head,
@@ -1663,6 +1780,11 @@ def _ship_with_maintainer_review(
         "todo_paths": list(binding["todo_paths"]),
         "merge_authorization": authorization,
     }
+    if superseded_authorization is not None:
+        next_ship["superseded_merge_authorization"] = superseded_authorization
+    else:
+        next_ship.pop("superseded_merge_authorization", None)
+    active["ship"] = next_ship
     _save_runs(state_path, state)
     try:
         merged = orchestrator.merge_if_ready(
