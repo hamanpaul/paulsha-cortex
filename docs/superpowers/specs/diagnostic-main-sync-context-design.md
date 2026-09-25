@@ -38,4 +38,4 @@ sizing: yellow
 
 ### D6. Scope boundary and dependency
 
-此票 production scope 僅 `paulsha_cortex/coordinator/diagnostics.py`；新增測試可以經現有 `WorkflowRun` serializer 驗 JSON encode/decode，不修改 `workflow.py`、Manager wrapper、recovery actions、CLI 或 probe。#987 尚未完成前不得進入實作或把 schema 視為 probe producer contract；其 producer 必須輸出 `candidate-resolve`／`candidate-validate` 作為 pre-valid-C failure stage。Builder 產物可讀時，在 #988 intake 前逐字核對該 stage literal；不一致先修 #987/#988 契約，不做隱式別名。CLI help 僅檢查沒有新增 CLI surface；如實作後發現需要 CLI 改動，另立有 issue authority 的工作項目。
+此票 production scope 僅 `paulsha_cortex/coordinator/diagnostics.py`；新增測試可以經現有 `WorkflowRun` serializer 驗 JSON encode/decode，不修改 `workflow.py`、Manager wrapper、recovery actions、CLI 或 probe。#987 已由 PR #1083 合併；`work_bridge.py` producer 對 pre-valid-C failure 使用精確的 `candidate-resolve`／`candidate-validate` stage literal，與本契約一致。CLI help 僅檢查沒有新增 CLI surface；如實作後發現需要 CLI 改動，另立有 issue authority 的工作項目。
