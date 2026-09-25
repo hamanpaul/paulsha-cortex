@@ -1492,6 +1492,18 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/copilot-review-late-observation/todo.md'
     excludes: []
+  main-sync-recovery-actions:
+    title: 'main-sync-recovery-actions'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#989'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-sync-recovery-actions/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-sync-recovery-actions-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-sync-recovery-actions-design.md'
+    excludes: []
   main-probe-gate:
     title: 'main-probe-gate'
     links:
