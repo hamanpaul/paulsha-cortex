@@ -1504,3 +1504,17 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/main-probe-design.md'
     excludes: []
+  monitor-canonical-todo-qualification:
+    title: 'Monitor canonical Todo qualification'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1063'
+      - kind: openspec
+        ref: 'monitor-canonical-todo-qualification'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-canonical-todo-qualification/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-canonical-todo-qualification-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-canonical-todo-qualification-design.md'
+    excludes: []

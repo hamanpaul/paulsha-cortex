@@ -1,0 +1,1 @@
+#1063 planning packet: add issue-backed Todo qualification and safe path-link contracts, plus a unique work-item/OpenSpec binding. This PR records the plan only; product implementation remains pending.
