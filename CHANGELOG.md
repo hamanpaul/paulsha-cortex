@@ -63,6 +63,8 @@
 - **launcher：`gpt-6-luna` 明示 max reasoning effort**：`build_codex_argv` 對 `gpt-6-luna` 帶
   `-c model_reasoning_effort="max"`，與 `gpt-5.6-luna` 一致，不再受 host ambient codex config 影響。
 
+- **#812 planning 產出目的地綁定改為精確 stem**：`planning_kind_bound`、planning publication 與 authority 重驗現在一致只接受 canonical／dated／anchor slug 的 docs 目的地，關閉 prefix／suffix／middle／`-v2` 這類 substring 誤放行，同時保留 change slug ≠ work_id 的合法 planning anchor。combo manifest 的 `*<task-slug>*` outputs pattern 仍供 `openspec/changes/<change>/...` 使用，但不再單獨放行 `docs/superpowers/{specs,plans}`；本次也同步更正 #802 對 DiagnosticReason v2 降級風險與 kind-bound 文法的文字敘述。
+
 - **#948 ship 段採信既有 exact-HEAD Copilot review**：`_ship_action` 在呼叫 `request_copilot` 前先檢查 `remote.copilot_reviews`，存在 exact-HEAD、Copilot、COMMENTED／APPROVED 且非 error review 時直接採信（多筆取最新 `(submitted_at_epoch, review_id)`），同 tick 進入 review 判定而不重複 request；`ReviewLoop` 支援 `adopted_at` 基準，採信 review 不受請求前 epoch 或 15 分鐘 timeout 誤判；候選 HEAD 前進時重新評估不沿用舊 review；`copilot-*` stop 的 `next_actions` 補齊 `review-attest` 重入出口並提示指令形式。
 
 - **Refine B2 進度 handoff（2026-09-23）**：新增 `docs/handoffs/2026-09-23-refine-b2-handoff.md`——#819／#946／#849
@@ -354,11 +356,13 @@
   `needs_human` 回應同步提供補件、`abandon` 與重新 intake 的下一步提示，
   並將提示持久化在 `needs_human_reason` payload；補齊多 combo、路徑邊界與
   超長提示的回歸保護。`DiagnosticReason` 以加法欄位 bump 至 schema v2，
-  仍相容讀取缺少 `next_step_hint` 的 v1 payload；這是單向遷移，已寫入 hint
-  記錄後不可將 Manager 降級回不認得該欄位的舊版本；三條 operator hint 分支改用
-  正體中文，保留內嵌的 `cortex work abandon` 指令；kind-bound 判定以 accepted
-  basename glob 比對，並由四段相對路徑、目錄家族與正規化守衛限制作用範圍；包含
-  work item 的合法 slug 不得因 combo manifest 缺少 brainstorming 而被拒。**
+  任何 `schema_version: 2` 記錄（不論是否帶 `next_step_hint`）都會被舊版
+  `__post_init__` 拒收；Manager 一旦寫過 v2 `needs_human_reason` 就不可降級回舊版。
+  三條 operator hint 分支改用正體中文，保留內嵌的 `cortex work abandon`
+  指令；kind-bound 判定改由 #812 的精確 stem 文法比對 spec／design 的
+  `<base>-<kind>.md` 與 plan 的 `<base>.md`／`<base>-plan.md`，並由四段相對路徑、
+  目錄家族與正規化守衛限制作用範圍；包含 work item 的合法 slug 不得因 combo
+  manifest 缺少 brainstorming 而被拒。**
 
 - **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
   最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留

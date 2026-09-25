@@ -101,6 +101,7 @@ WORKFLOW_LANE_GATE_REASON = "workflow-lane-job"
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
 SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"})
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
+_PLANNING_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
 def _utcnow() -> str:
@@ -3459,6 +3460,7 @@ def _validated_brainstorm_planning_authority(
         if step.persona == "planner" and step.phase == "plan"
         for pattern in step.outputs
     )
+    anchor_slugs = _planning_anchor_slugs(run)
     persisted = {item.ref: item for item in run.planning_authority}
     scanned: dict[str, PlanningArtifactAuthority] = {}
     workspace = Path(run.workspace_root).resolve()
@@ -3515,10 +3517,20 @@ def _validated_brainstorm_planning_authority(
             )
         existing = persisted.get(ref)
         if existing is None:
-            if not (
-                any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns)
-                or planning_kind_bound(kind, ref, run.work_id)
-            ):
+            docs_family = Path(ref).parts[:3] in {
+                ("docs", "superpowers", "specs"),
+                ("docs", "superpowers", "plans"),
+            }
+            if docs_family:
+                bound = planning_kind_bound(
+                    kind,
+                    ref,
+                    run.work_id,
+                    anchor_slugs=anchor_slugs,
+                )
+            else:
+                bound = any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns)
+            if not bound:
                 raise ValueError(
                     f"workflow brainstorm artifact outside planner outputs: ref={ref} "
                     f"(declared={','.join(declared_patterns) or '-'})"
@@ -9021,14 +9033,44 @@ def _record_planning_artifact_rejection_evidence(
         return None
 
 
-def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bool:
-    """Whether a planning artifact uses its canonical work-item destination.
+def _planning_anchor_slugs(run) -> tuple[str, ...]:
+    anchors: set[str] = set()
+    for ref in getattr(run, "openspec_refs", ()) or ():
+        if isinstance(ref, str) and _PLANNING_SLUG_RE.fullmatch(ref) is not None:
+            anchors.add(ref)
+    for authority in getattr(run, "planning_authority", ()) or ():
+        if getattr(authority, "work_id", None) != getattr(run, "work_id", None):
+            continue
+        ref = getattr(authority, "ref", None)
+        if not isinstance(ref, str):
+            continue
+        relative = Path(ref)
+        if (
+            relative.as_posix() != ref
+            or len(relative.parts) != 5
+            or relative.parts[:3] != ("docs", "superpowers", "workstreams")
+            or relative.parts[4] != "todo.md"
+        ):
+            continue
+        slug = relative.parts[3]
+        if _PLANNING_SLUG_RE.fullmatch(slug) is not None:
+            anchors.add(slug)
+    return tuple(sorted(anchors))
 
-    The planning runtime always materializes the accepted spec/design/plan
-    triplet, even when a combo's manifest omits the optional brainstorming card
-    (for example ``fix-standard``).  Keep that runtime contract independent of
-    the combo's flattened output list while still binding each kind to its own
-    destination family and work item.
+
+def planning_kind_bound(
+    kind: object,
+    path_value: object,
+    work_id: object,
+    *,
+    anchor_slugs: tuple[str, ...] = (),
+) -> bool:
+    """Whether a planning artifact uses an exact-stem governed destination.
+
+    The normalized relative-path and directory-family guards decide the
+    governed docs roots. ``is_absolute()`` and ``..`` remain as
+    defense-in-depth even though the family guards already reject them on
+    POSIX.
     """
 
     if (
@@ -9036,7 +9078,7 @@ def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bo
         or not isinstance(path_value, str)
         or not path_value
         or not isinstance(work_id, str)
-        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None
+        or _PLANNING_SLUG_RE.fullmatch(work_id) is None
     ):
         return False
     relative = Path(path_value)
@@ -9047,21 +9089,37 @@ def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bo
         or len(relative.parts) != 4
     ):
         return False
+    valid_anchor_slugs = {
+        slug
+        for slug in anchor_slugs
+        if isinstance(slug, str) and _PLANNING_SLUG_RE.fullmatch(slug) is not None
+    }
+
+    def _base_allowed(base: str) -> bool:
+        return (
+            base == work_id
+            or base in valid_anchor_slugs
+            or re.fullmatch(
+                rf"[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}-{re.escape(work_id)}",
+                base,
+            )
+            is not None
+        )
+
     if kind in {"spec", "design"}:
         if relative.parts[:3] != ("docs", "superpowers", "specs"):
             return False
-        pattern = f"docs/superpowers/specs/*{work_id}*-{kind}.md"
-    else:
-        if relative.parts[:3] != ("docs", "superpowers", "plans"):
-            return False
-        pattern = f"docs/superpowers/plans/*{work_id}*.md"
-    if relative.suffix != ".md":
+        suffix = f"-{kind}.md"
+        return relative.suffix == ".md" and relative.name.endswith(suffix) and _base_allowed(
+            relative.name[: -len(suffix)]
+        )
+    if relative.parts[:3] != ("docs", "superpowers", "plans") or relative.suffix != ".md":
         return False
-    # The accepted planning contract intentionally permits any basename slug
-    # containing the work item.  The directory, four-part relative path and
-    # normalized-path guards above keep this basename glob from crossing into
-    # another governed root or escaping the workspace.
-    return fnmatch.fnmatch(path_value, pattern)
+    stem = relative.stem
+    candidates = {stem}
+    if stem.endswith("-plan"):
+        candidates.add(stem[: -len("-plan")])
+    return any(_base_allowed(candidate) for candidate in candidates)
 
 
 def _publish_planning_artifacts(
@@ -9070,6 +9128,7 @@ def _publish_planning_artifacts(
     *,
     work_id: str,
     allowed_refs: tuple[str, ...],
+    anchor_slugs: tuple[str, ...] = (),
     authorities: tuple[PlanningArtifactAuthority, ...] = (),
     transaction: _PlanningPublicationTransaction | None = None,
     coordinator_root: str | Path | None = None,
@@ -9107,12 +9166,20 @@ def _publish_planning_artifacts(
             and relative.parts[2] != "archive"
         )
         manifest_bound = any(fnmatch.fnmatch(path_value, pattern) for pattern in allowed_refs)
-        kind_bound = planning_kind_bound(row.get("kind"), path_value, work_id)
+        kind_bound = planning_kind_bound(
+            row.get("kind"),
+            path_value,
+            work_id,
+            anchor_slugs=anchor_slugs,
+        )
         if (
             relative.is_absolute()
             or ".." in relative.parts
+            # 等價但非正規化的字串（`./`、`//`、尾端 `/`）不得成為另一個 authority ref。
+            or relative.as_posix() != path_value
             or not (docs_bound or openspec_bound)
-            or not (manifest_bound or kind_bound)
+            or (docs_bound and not kind_bound)
+            or (openspec_bound and not manifest_bound)
             or relative.suffix != ".md"
         ):
             raise ValueError("planning artifact path outside governed roots")
@@ -13358,6 +13425,7 @@ def apply_workflow_action(
             allowed_refs=tuple(
                 ref for step in manifest.steps for ref in step.outputs
             ),
+            anchor_slugs=_planning_anchor_slugs(run),
             authorities=run.planning_authority,
             transaction=publication,
             # #511：拒收 evidence 必須落在 coordinator_root，不能落在
