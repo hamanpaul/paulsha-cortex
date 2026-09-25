@@ -1492,3 +1492,15 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/copilot-review-late-observation/todo.md'
     excludes: []
+  planning-review-source-receipt:
+    title: 'planning-review-source-receipt'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1045'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/planning-review-source-receipt/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/planning-review-source-receipt-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/planning-review-source-receipt-design.md'
+    excludes: []

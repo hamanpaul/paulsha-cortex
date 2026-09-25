@@ -1,0 +1,1 @@
+- 新增 #1045 plan review 來源證明、ready receipt 與 baseline 原子凍結的 draft spec/design/todo 及唯一 work item；本次只完成規劃，尚未接受進件或實作 runtime。

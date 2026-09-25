@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **#1045 plan review source receipt 規劃草稿**：新增逐檔 WorkAuthority 來源證明、明確 ready receipt、受限 baseline CAS、Green/no-band/Yellow None 負例與 Red 拆分提案；本次只規劃，未 intake 或實作 runtime。
 - **#1040 driving-cortex resume 範例**：移除 resume 不接受的 `--expected-run-id`，補上唯讀核對 repo/work item/唯一 ongoing run 的步驟，並讓 retry-build 範例明示必需的 exact Candidate。
 - **#977 Manager merged-run finalizer 規劃**：新增 accepted spec／design／todo 與唯一 work item，明確定義前置 API freeze、CompletionRecord／outcome／Registry 次序和 crash/re-entry 驗收；本次僅規劃，尚未實作 completion recovery。
 - **#961 Yellow plan review 完整性**：將既有 T6 文件交付項目明列為 `documentation`，使 accepted plan 的 task 文字符合 `artifact_classes`；驗收範圍不變。
