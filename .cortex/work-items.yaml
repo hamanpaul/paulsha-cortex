@@ -1504,3 +1504,15 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/main-probe-design.md'
     excludes: []
+  superpowers-only-ship-todo-admission:
+    title: 'superpowers-only-ship-todo-admission'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1051'
+      - kind: path
+        ref: 'docs/superpowers/specs/superpowers-only-ship-todo-admission-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/superpowers-only-ship-todo-admission-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/superpowers-only-ship-todo-admission/todo.md'
+    excludes: []
