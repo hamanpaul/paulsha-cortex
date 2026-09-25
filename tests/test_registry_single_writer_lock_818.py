@@ -253,10 +253,7 @@ def test_different_slice_same_revision_writers_do_not_silently_lose_an_update(tm
     explicit_conflict = {
         first_result.get("error_type"),
         second_result.get("error_type"),
-    } == {"RegistryRevisionConflict", None} or {
-        first_result.get("error_type"),
-        second_result.get("error_type"),
-    } == {None, "RegistryRevisionConflict"}
+    } == {"RegistryRevisionConflict", None}
 
     assert both_mutations_durable or explicit_conflict, (
         "two writers loaded the same revision for different slices, but the second writer "
