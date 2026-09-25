@@ -20,7 +20,7 @@ Stop 在任何首次 Builder side effect 之前：不得 reserve/create Builder 
 
 此資格由 #1063 的 Monitor/correlation source contract 提供。當前 `providers.py` glob/safe-file/revision、`_frontmatter_work_item_text()` 的單欄位抽取、correlation 的 `resolve(strict=False)` path guard 和 `_mutate_override()` 均不滿足全部條件，不能在本票中假設已驗證。Manager 只消費 #1063 輸出的 qualified source，不重寫 parser、不從 basename 或 accepted plan 推斷資格。spec/design/plan、checkbox 或手動 path override 本身均不可替代 Todo。
 
-`cortex work link <work_id> --repo <owner/repo> --kind path --ref <repo-relative-todo-path>` 僅在 source 已存在、位於 repo 內、安全、可掃描且符合 qualification 時得成功；此 guard 由 #1063 負責。link 寫 override 不等於已更新 WorkAuthority。#1064/#1065 提供 latest successful correlation generation 對目前 override input 的證據；未觀察 link 變更的舊 snapshot 不可信。
+`cortex work link <work_id> --repo <owner/repo> --kind path --ref <repo-relative-todo-path>` 僅在 source 已存在、位於 repo 內、安全且屬 Monitor 支援的 scanner source 時得成功；一般 path link 可保留其他 scanner source 類型用途。此 existence/path guard 由 #1063 負責；本票的 Todo admission 另只計數符合 #1063 semantic Todo qualification 的 source。存在的 path 或 override 不代表 Todo 合格，也不等於 WorkAuthority 已更新。#1064/#1065 提供 latest successful correlation generation 對目前 override input 的證據；未觀察 link 變更的舊 snapshot 不可信。
 
 ### R3 — zero／multiple diagnostics 可操作且不會指錯修復
 
