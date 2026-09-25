@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import copy
+import fcntl
 import hashlib
 import json
 import logging
 import math
 import os
 import re
+import stat as statmod
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -601,20 +604,151 @@ def _run_state_path() -> Path:
     return paths.coordinator_root() / "delivery-journal.json"
 
 
-def _load_runs(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"schema": "cortex-delivery-journal/v1", "runs": {}}
+_DELIVERY_JOURNAL_SCHEMA = "cortex-delivery-journal/v1"
+_DELIVERY_JOURNAL_BASELINE_FIELD = "_delivery_journal_baseline"
+_DELIVERY_JOURNAL_REVISION_FIELD = "revision"
+_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD = "publication_events"
+_DELIVERY_JOURNAL_LOCK_SUFFIX = ".lock"
+_DELIVERY_JOURNAL_LOCK_TIMEOUT_SECONDS = 5.0
+_DELIVERY_JOURNAL_LOCK_RETRY_SECONDS = 0.01
+_DELIVERY_JOURNAL_TEST_HOOK: Callable[..., None] | None = None
+
+
+class _DeliveryJournalConflict(RuntimeError):
+    """The caller must reload and recompute against the latest durable journal."""
+
+
+class _DeliveryJournalUnknown(RuntimeError):
+    """The write may have become visible, but this call could not prove it."""
+
+
+def _delivery_journal_test_hook(stage: str, **context: object) -> None:
+    hook = _DELIVERY_JOURNAL_TEST_HOOK
+    if hook is not None:
+        hook(stage=stage, **context)
+
+
+def _delivery_journal_text(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or len(value) > 200
+        or "\n" in value
+        or not value.isprintable()
+    ):
+        raise ValueError(f"{field} malformed")
+    return value
+
+
+def _delivery_journal_revision(value: object, *, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} malformed")
+    return value
+
+
+def _delivery_journal_digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _delivery_journal_canonical_payload(
+    value: object, *, field: str
+) -> tuple[object, str]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("work run state unreadable") from exc
+        canonical = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} malformed") from exc
+    return json.loads(canonical), _delivery_journal_digest(canonical.encode("utf-8"))
+
+
+def _delivery_journal_entry(
+    value: object, *, field: str
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"payload", "payload_sha256"}
+        or not isinstance(value.get("payload_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["payload_sha256"]) is None
+    ):
+        raise ValueError(f"{field} malformed")
+    payload, digest = _delivery_journal_canonical_payload(
+        value.get("payload"), field=field
+    )
+    if digest != value["payload_sha256"]:
+        raise ValueError(f"{field} malformed")
+    return {"payload": payload, "payload_sha256": digest}
+
+
+def _delivery_journal_publication_events(
+    value: object, *, field: str
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} malformed")
+    normalized: dict[str, dict[str, Any]] = {}
+    for event_id, row in value.items():
+        normalized_id = _delivery_journal_text(
+            event_id, field=f"{field}[event_id]"
+        )
+        if (
+            not isinstance(row, dict)
+            or set(row) not in (
+                {"event_id", "kind", "intent"},
+                {"event_id", "kind", "intent", "result"},
+            )
+            or row.get("event_id") != normalized_id
+        ):
+            raise ValueError(f"{field} malformed")
+        normalized_row = {
+            "event_id": normalized_id,
+            "kind": _delivery_journal_text(
+                row.get("kind"), field=f"{field}[{normalized_id}].kind"
+            ),
+            "intent": _delivery_journal_entry(
+                row.get("intent"), field=f"{field}[{normalized_id}].intent"
+            ),
+        }
+        if "result" in row:
+            normalized_row["result"] = _delivery_journal_entry(
+                row.get("result"), field=f"{field}[{normalized_id}].result"
+            )
+        normalized[normalized_id] = normalized_row
+    return normalized
+
+
+def _delivery_journal_publication_index(
+    runs: dict[str, Any],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    return {
+        run_id: row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD]
+        for run_id, row in runs.items()
+        if row.get(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD)
+    }
+
+
+def _delivery_journal_payload(
+    payload: object, *, revision: int
+) -> dict[str, Any]:
     if (
         not isinstance(payload, dict)
-        or payload.get("schema") != "cortex-delivery-journal/v1"
+        or payload.get("schema") != _DELIVERY_JOURNAL_SCHEMA
         or not isinstance(payload.get("runs"), dict)
     ):
         raise ValueError("work run state malformed")
-    for key, row in payload["runs"].items():
+    if _DELIVERY_JOURNAL_REVISION_FIELD in payload:
+        _delivery_journal_revision(
+            payload.get(_DELIVERY_JOURNAL_REVISION_FIELD),
+            field="work run state revision",
+        )
+    normalized = copy.deepcopy(payload)
+    normalized.pop(_DELIVERY_JOURNAL_BASELINE_FIELD, None)
+    normalized[_DELIVERY_JOURNAL_REVISION_FIELD] = revision
+    for key, row in normalized["runs"].items():
         if (
             not isinstance(key, str)
             or not isinstance(row, dict)
@@ -628,27 +762,391 @@ def _load_runs(path: Path) -> dict[str, Any]:
             or not isinstance(row.get("workflow_step_ids"), list)
         ):
             raise ValueError("work run record malformed")
-    return payload
+        if _DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD in row:
+            events = _delivery_journal_publication_events(
+                row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD],
+                field=f"work run record {key} publication events",
+            )
+            if events:
+                row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD] = events
+            else:
+                row.pop(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD, None)
+        else:
+            row.pop(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD, None)
+    return normalized
 
 
-def _save_runs(path: Path, payload: dict[str, Any]) -> None:
+def _delivery_journal_logical_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    logical = copy.deepcopy(payload)
+    logical.pop(_DELIVERY_JOURNAL_REVISION_FIELD, None)
+    return logical
+
+
+def _delivery_journal_baseline(
+    *, exists: bool, revision: int, content_sha256: str | None
+) -> dict[str, Any]:
+    return {
+        "exists": exists,
+        "revision": revision,
+        "content_sha256": content_sha256,
+    }
+
+
+def _validated_delivery_journal_baseline(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "exists",
+        "revision",
+        "content_sha256",
+    }:
+        raise ValueError("work run state baseline missing")
+    exists = value.get("exists")
+    revision = _delivery_journal_revision(
+        value.get("revision"), field="work run state baseline"
+    )
+    digest = value.get("content_sha256")
+    if not isinstance(exists, bool):
+        raise ValueError("work run state baseline missing")
+    if exists:
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("work run state baseline missing")
+    elif digest is not None:
+        raise ValueError("work run state baseline missing")
+    return _delivery_journal_baseline(
+        exists=exists,
+        revision=revision,
+        content_sha256=digest,
+    )
+
+
+def _refresh_delivery_journal_baseline(
+    payload: dict[str, Any], *, exists: bool, revision: int, content_sha256: str | None
+) -> None:
+    payload[_DELIVERY_JOURNAL_REVISION_FIELD] = revision
+    payload[_DELIVERY_JOURNAL_BASELINE_FIELD] = _delivery_journal_baseline(
+        exists=exists,
+        revision=revision,
+        content_sha256=content_sha256,
+    )
+
+
+def _delivery_journal_snapshot(path: Path) -> SimpleNamespace:
+    if path.is_symlink():
+        raise ValueError("work run state unreadable")
+    if not path.exists():
+        payload = _delivery_journal_payload(
+            {
+                "schema": _DELIVERY_JOURNAL_SCHEMA,
+                "runs": {},
+            },
+            revision=0,
+        )
+        return SimpleNamespace(
+            payload=payload,
+            exists=False,
+            revision=0,
+            content_sha256=None,
+        )
+    if not path.is_file():
+        raise ValueError("work run state unreadable")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError("work run state unreadable") from exc
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("work run state unreadable") from exc
+    revision = _delivery_journal_revision(
+        payload.get(_DELIVERY_JOURNAL_REVISION_FIELD, 0),
+        field="work run state revision",
+    )
+    normalized = _delivery_journal_payload(payload, revision=revision)
+    return SimpleNamespace(
+        payload=normalized,
+        exists=True,
+        revision=revision,
+        content_sha256=_delivery_journal_digest(raw),
+    )
+
+
+def _delivery_journal_lock_path(path: Path) -> Path:
+    return path.parent / f"{path.name}{_DELIVERY_JOURNAL_LOCK_SUFFIX}"
+
+
+def _delivery_journal_lock_fd(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _delivery_journal_lock_path(path)
+    if lock_path.is_symlink():
+        raise RuntimeError("work run state lock path invalid")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError("work run state lock unavailable") from exc
+    try:
+        if not statmod.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError("work run state lock path invalid")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class _DeliveryJournalLock:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fd: int | None = None
+
+    def __enter__(self) -> None:
+        fd = _delivery_journal_lock_fd(self._path)
+        deadline = time.monotonic() + _DELIVERY_JOURNAL_LOCK_TIMEOUT_SECONDS
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("work run state lock timeout")
+                    time.sleep(_DELIVERY_JOURNAL_LOCK_RETRY_SECONDS)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return None
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        assert self._fd is not None
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+        return None
+
+
+def _write_delivery_journal_candidate(
+    path: Path, candidate_payload: dict[str, Any]
+) -> SimpleNamespace:
+    try:
+        content = (
+            json.dumps(
+                candidate_payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("work run state malformed") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
     try:
-        with temporary.open("x", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
+        with temporary.open("xb") as handle:
+            handle.write(content)
             handle.flush()
+            _delivery_journal_test_hook(
+                "before-file-fsync", path=path, candidate=candidate_payload
+            )
             os.fsync(handle.fileno())
+        _delivery_journal_test_hook(
+            "after-file-fsync", path=path, candidate=candidate_payload
+        )
         os.replace(temporary, path)
+        _delivery_journal_test_hook(
+            "after-replace", path=path, candidate=candidate_payload
+        )
         directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    except BaseException:
+        _delivery_journal_test_hook(
+            "after-directory-fsync", path=path, candidate=candidate_payload
+        )
+        confirmed = _delivery_journal_snapshot(path)
+        if (
+            confirmed.revision != candidate_payload[_DELIVERY_JOURNAL_REVISION_FIELD]
+            or _delivery_journal_logical_payload(confirmed.payload)
+            != _delivery_journal_logical_payload(candidate_payload)
+        ):
+            raise RuntimeError("work run state confirmation drift")
+        _delivery_journal_test_hook(
+            "after-readback",
+            path=path,
+            candidate=candidate_payload,
+            confirmed=confirmed.payload,
+        )
+        return confirmed
+    except Exception as exc:
+        # KeyboardInterrupt／SystemExit 等控制流程照原樣傳遞，不改寫成 unknown outcome。
+        raise _DeliveryJournalUnknown("work run state outcome unknown") from exc
+    finally:
         temporary.unlink(missing_ok=True)
-        raise
+
+
+def _save_runs_result(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    baseline = _validated_delivery_journal_baseline(
+        payload.get(_DELIVERY_JOURNAL_BASELINE_FIELD)
+    )
+    with _DeliveryJournalLock(path):
+        current = _delivery_journal_snapshot(path)
+        if baseline != _delivery_journal_baseline(
+            exists=current.exists,
+            revision=current.revision,
+            content_sha256=current.content_sha256,
+        ):
+            return {"outcome": "conflict", "reason": "stale-baseline"}
+        candidate_logical = _delivery_journal_payload(
+            payload, revision=current.revision
+        )
+        if (
+            _delivery_journal_publication_index(candidate_logical["runs"])
+            != _delivery_journal_publication_index(current.payload["runs"])
+        ):
+            return {
+                "outcome": "conflict",
+                "reason": "publication-entry-conflict",
+            }
+        if _delivery_journal_logical_payload(candidate_logical) == _delivery_journal_logical_payload(
+            current.payload
+        ):
+            _refresh_delivery_journal_baseline(
+                payload,
+                exists=current.exists,
+                revision=current.revision,
+                content_sha256=current.content_sha256,
+            )
+            return {"outcome": "committed", "revision": current.revision}
+        candidate_to_write = copy.deepcopy(candidate_logical)
+        candidate_to_write[_DELIVERY_JOURNAL_REVISION_FIELD] = current.revision + 1
+        confirmed = _write_delivery_journal_candidate(path, candidate_to_write)
+        _refresh_delivery_journal_baseline(
+            payload,
+            exists=True,
+            revision=confirmed.revision,
+            content_sha256=confirmed.content_sha256,
+        )
+        return {"outcome": "committed", "revision": confirmed.revision}
+
+
+def _load_runs(path: Path) -> dict[str, Any]:
+    snapshot = _delivery_journal_snapshot(path)
+    payload = snapshot.payload
+    _refresh_delivery_journal_baseline(
+        payload,
+        exists=snapshot.exists,
+        revision=snapshot.revision,
+        content_sha256=snapshot.content_sha256,
+    )
+    return payload
+
+
+def _save_runs(path: Path, payload: dict[str, Any]) -> None:
+    result = _save_runs_result(path, payload)
+    outcome = result["outcome"]
+    if outcome == "committed":
+        return None
+    if outcome == "conflict":
+        raise _DeliveryJournalConflict(
+            f"work run state conflict: {result['reason']}"
+        )
+    raise _DeliveryJournalUnknown(
+        f"work run state outcome unknown: {result.get('reason', 'unknown')}"
+    )
+
+
+def _append_delivery_publication_event(
+    path: Path,
+    *,
+    run_id: str,
+    event_id: str,
+    event_kind: str,
+    entry_kind: str,
+    payload: object,
+) -> dict[str, Any]:
+    normalized_run_id = _delivery_journal_text(run_id, field="publication run_id")
+    normalized_event_id = _delivery_journal_text(
+        event_id, field="publication event_id"
+    )
+    normalized_event_kind = _delivery_journal_text(
+        event_kind, field="publication event kind"
+    )
+    if entry_kind not in {"intent", "result"}:
+        raise ValueError("publication entry kind malformed")
+    normalized_payload, payload_sha256 = _delivery_journal_canonical_payload(
+        payload, field="publication payload"
+    )
+    with _DeliveryJournalLock(path):
+        current = _delivery_journal_snapshot(path)
+        row = current.payload["runs"].get(normalized_run_id)
+        if not isinstance(row, dict):
+            return {"outcome": "conflict", "reason": "run-missing"}
+        existing_events = copy.deepcopy(
+            row.get(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD, {})
+        )
+        current_event = existing_events.get(normalized_event_id)
+        if current_event is not None:
+            if current_event["kind"] != normalized_event_kind:
+                return {"outcome": "conflict", "reason": "event-kind-conflict"}
+            existing_entry = current_event.get(entry_kind)
+            if existing_entry is not None:
+                if existing_entry == {
+                    "payload": normalized_payload,
+                    "payload_sha256": payload_sha256,
+                }:
+                    return {
+                        "outcome": "committed",
+                        "revision": current.revision,
+                        "event_id": normalized_event_id,
+                        "entry_kind": entry_kind,
+                        "payload_sha256": payload_sha256,
+                    }
+                return {"outcome": "conflict", "reason": "payload-conflict"}
+            if entry_kind == "intent":
+                return {"outcome": "conflict", "reason": "intent-conflict"}
+            current_event["result"] = {
+                "payload": normalized_payload,
+                "payload_sha256": payload_sha256,
+            }
+        else:
+            if entry_kind != "intent":
+                return {"outcome": "conflict", "reason": "result-before-intent"}
+            existing_events[normalized_event_id] = {
+                "event_id": normalized_event_id,
+                "kind": normalized_event_kind,
+                "intent": {
+                    "payload": normalized_payload,
+                    "payload_sha256": payload_sha256,
+                },
+            }
+        candidate = copy.deepcopy(current.payload)
+        candidate_row = candidate["runs"][normalized_run_id]
+        candidate_row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD] = existing_events
+        candidate[_DELIVERY_JOURNAL_REVISION_FIELD] = current.revision + 1
+        try:
+            confirmed = _write_delivery_journal_candidate(path, candidate)
+        except _DeliveryJournalUnknown:
+            return {
+                "outcome": "unknown",
+                "reason": "write-unconfirmed",
+                "event_id": normalized_event_id,
+                "entry_kind": entry_kind,
+                "payload_sha256": payload_sha256,
+            }
+        return {
+            "outcome": "committed",
+            "revision": confirmed.revision,
+            "event_id": normalized_event_id,
+            "entry_kind": entry_kind,
+            "payload_sha256": payload_sha256,
+        }
 
 
 def _canonical_workflow_run(*, workflow_registry, authority):
