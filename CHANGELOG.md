@@ -8,6 +8,31 @@
 ## [Unreleased]
 
 - **#479 retry-build launch 前失敗保留既有 proof**：票面主缺陷已由 #941 修正；本次補齊殘項，讓恢復態 slice 在 `retry-build` 的 launch 前失敗時保留既有 candidate、verification／review refs、builder／reviewer 綁定與 slice state；未真正 launch 的新 failed build job 在 `complete_tick` 只保留稽核，不再覆寫現任 slice manifest。
+- **#987 main-probe conflict classification**：`git merge-tree --write-tree --name-only --no-messages -z` 在 exit `1`、tree OID 有效且 conflicted path 清單為空時，現在會維持 generic `conflict` 分類，不再誤判成 `multiple-conflicts`；既有的 `CHANGELOG.md` 頂端插入特例、單一路徑非 changelog conflict、多重 conflict path，以及 clean-behind／in-sync／failure 行為維持不變。
+- **#987 main-probe gate**：ship validator 現在會在 Manager-owned ship clone 內以 bounded direct git probe `origin/main`，於 preflight 前與必要 push 前重讀 main；只有 Candidate 已含最新 M 時才可進 preflight／push／建 PR。`merge-tree --write-tree --name-only --no-messages -z` 改走 NUL-safe path parser，clean-behind 與 conflict 會在 preflight 前 fail-closed；fetch／merge-base／merge-tree／path-parser failure 會寫入 content-addressed `main-sync-probe` evidence，持久化 `candidate`／`stage`／`returncode`／`error_kind`／`main_head`，並讓 `main-sync-unavailable` stop 與 operator resume 可讀回同一份證據。重用既有 Manager ship workspace 時若來源 repo 已無有效 `origin`，現在也會先移除工作區殘留的 `origin`，避免 stale remote 被錯誤探測成 `in-sync`。
+- **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
+- **#966 JobRegistry revision CAS**：`jobs.json` 現在以 exact durable-byte SHA-256 revision 與 canonical transaction-lock sidecar 做 compare-and-persist；stale writer 會明確回 `RegistryRevisionConflict`、完整重載 durable snapshot，v1 migration／verification-hash normalization 也納入同一 CAS 邊界，daemon request queue 會把這類衝突持久化成 error done 而不是造假成功。
+- **#966 Yellow plan review 完整性**：將 T6 既有文件交付項目明列為 `documentation`，對齊 accepted plan 的 `artifact_classes`；產品驗收範圍不變。
+- **#1040 driving-cortex resume 範例**：移除 resume 不接受的 `--expected-run-id`，補上唯讀核對 repo/work item/唯一 ongoing run 的步驟，並讓 retry-build 範例明示必需的 exact Candidate。
+- **#977 Manager merged-run finalizer 規劃**：新增 accepted spec／design／todo 與唯一 work item，明確定義前置 API freeze、CompletionRecord／outcome／Registry 次序和 crash/re-entry 驗收；本次僅規劃，尚未實作 completion recovery。
+- **#961 Yellow plan review 完整性**：將既有 T6 文件交付項目明列為 `documentation`，使 accepted plan 的 task 文字符合 `artifact_classes`；驗收範圍不變。
+- **#1037 ship audit 適用性**：沒有 mapped OpenSpec 且 workflow 未宣告 `openspec-archive` 時，只稽核 `policy-commit`；mapped change 或明確宣告 archive 卡仍要求真實、通過身分與 ancestry 驗證的 archive job/evidence。
+- **#885 fix-standard-archive-step-evidence**：fix-standard 現在可用唯一 Manager `openspec-archive`
+  job 加 Git ancestry 判定 archive-applied；`retry-build` 會按 exact Candidate Git tree 偵測
+  active/archive 並存並回報 warning，Git tree 無法檢查時不派工；ship/local-closeout 對
+  `openspec archive` Aborted、未搬移 active change 與 post-archive 並存一律 fail-closed。
+- **#1030 retry-card porcelain selector**：`cortex run work retry-card` 新增 retry-card 專用 `--card`，避免 payload 靜默覆寫明示 selector，並保留 payload-only workaround；不改 Manager retry contract。
+- **#1029 self-publication receipt v1 契約**：凍結經 #992／#993／#994／#979／#980 範圍審查對齊的 exact wire appendix、可重算 golden vectors 與決策紀錄；未實作或啟用 receipt。
+- **#1030 retry-card porcelain 規劃（PR #1034，docs-only）**：新增 accepted spec／design／todo，界定 `--card` action 限制、request mapping、payload 相容與後續 help／README／測試驗收。
+- **Copilot 規劃 Yellow gate 修正**：在 #1020、#1021 的 Tasks 明列 `documentation`，使既有文件交付項目符合 `artifact_classes` 完整性檢查；不變更產品驗收範圍。
+- **driving-cortex 單票授權界線**：要求 agent 只處理綁定 issue 的已授權驗收，將範圍外問題附證據記錄到既有或新 issue，再獨立規劃與派工；跨票推進及 merge 後部署均須各自授權。
+- **#1021 舊 HEAD timeout 新 HEAD 重啟 review**：`_claim_action` 只在明示 `resume` 且 journal 仍停在舊 HEAD `copilot-review-timeout` 時建立 Manager-owned rearm permit；`_ship_action` 只有在 exact new HEAD／preflight／delivery binding／PR facts／ForeignReview 全數重讀相符，且 checks 終態通過、PR mergeability 通過、沒有未解 current review thread 後才會消費 permit，並在觀察到 binding／PR-head／preflight-head／persisted permit drift 時立即持久化作廢該 permit，避免後續未經再次 `resume` 的重用。條件成立時會先保留舊 timeout/review epoch 歷史，再採信既有 exact-HEAD Copilot review 或以 durable `review-requesting` 後 request 一次；requesting 重播保留原 request epoch、使用 request-bound submission deadline，過期 review 維持 timeout，不套用採信 review 的 adoption 時間。same-head timeout 不重送，old-timeout/new-head rearm 也不得以 maintainer review 取代 Copilot review。request race／crash uncertainty 轉為 `copilot-review-request-outcome-unknown` fail-closed。
+- **#1020 Copilot review 提交時間逾時修正**：`ReviewLoop` 保留通過驗證的 submission/observation epochs，`ShipOrchestrator` 在 merge admission 依 request 或 adoption timeout 視窗，重新核對 fresh remote review 的提交時間；因此 caller 聲稱準時但遠端同 ID review 實際逾時時會阻擋，晚輪詢仍可採信期限內提交的 review，既有 adopted review 繼續使用 `adopted_at` timeout。
+- **preflight visudo 測試環境**：sudoers 整合測試將系統 sbin 加入個別測試的 PATH，避免 #862 exact-Candidate preflight 因 service PATH 差異誤判失敗。
+- **Refine 0.1.11 子票進件（第三批）**：為 #975、#976、#983 發布已審核的 accepted 規劃與 work item；#975／#976 的合併 run closure 與 #983 的 delivery journal 條件寫入仍待各自前置及產品實作驗收。
+- **Refine 0.1.11 Registry CAS 進件**：為 #966 新增 accepted spec／design／todo 與唯一 work item，作為 #818 多進程寫入防護的第一階段；產品實作與 #967 owner lock 仍待獨立驗收。
+- **Refine 0.1.11 子票進件**：為 #961 發布已審核的 accepted 規劃與唯一 work item，更新 #887／#847／#818／#547／#943 的拆票依賴與定版執行表；產品實作與發版仍待各自驗收。
+- **Refine 0.1.11 定版進件（第三批）**：為 #885 新增 accepted spec／design／todo 與唯一 work item 綁定；archive 修復仍待產品實作與驗收。
 - **Refine 0.1.11 定版進件（第二批）**：為 #479、#481、#810、#871 新增 accepted
   spec／design／todo 與 work item 綁定，供後續 Cortex 分票派工；產品實作仍待正式驗收。
 - **Refine 0.1.11 定版進件（第一批）**：新增接手與驗收表，並為 #579、#812、#874、#956

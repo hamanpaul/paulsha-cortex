@@ -3248,19 +3248,100 @@ def _materialize_plan_card_output(
     return artifacts + (materialized,), authority, transaction
 
 
-def _manager_archive_applied(run) -> bool:
-    archives = [
+def _manager_archive_subject_applies(
+    *, workspace_root: str | Path, subject_head: str, candidate_head: str
+) -> bool:
+    if subject_head == candidate_head:
+        return True
+    if (
+        verification.SAFE_SHA_RE.fullmatch(subject_head) is None
+        or verification.SAFE_SHA_RE.fullmatch(candidate_head) is None
+    ):
+        return False
+    try:
+        ancestry = subprocess.run(
+            [
+                "git", "-C", str(workspace_root), "merge-base", "--is-ancestor",
+                subject_head, candidate_head,
+            ],
+            shell=False,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return ancestry.returncode == 0
+
+
+def _manager_archive_job_matches(job: Mapping[str, object], *, run_id: str) -> bool:
+    return (
+        job.get("workflow_run_id") == run_id
+        and job.get("workflow_phase") == "ship"
+        and job.get("workflow_card") == "openspec-archive"
+        and job.get("persona") == "manager"
+        and job.get("executor") == "cortex-manager"
+        and job.get("model_id") == "deterministic"
+        and job.get("independence_domain") == "cortex"
+        and job.get("status") == "exited"
+        and job.get("exit_code") == 0
+        and isinstance(job.get("workflow_evidence"), dict)
+        and job["workflow_evidence"].get("kind") == "ship"
+    )
+
+
+def _manager_archive_job_applied(registry, run, *, jobs: Iterable[Mapping[str, object]] | None = None) -> bool:
+    run_id = getattr(run, "run_id", None)
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(run_id, str)
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+    ):
+        return False
+    source_jobs = jobs
+    if source_jobs is None:
+        if registry is None:
+            return False
+        source_jobs = registry.list_jobs()
+    jobs = [
+        job
+        for job in source_jobs
+        if _manager_archive_job_matches(job, run_id=run_id)
+    ]
+    if len(jobs) != 1:
+        return False
+    subject = jobs[0].get("subject_head")
+    if not isinstance(subject, str) or verification.SAFE_SHA_RE.fullmatch(subject) is None:
+        return False
+    return _manager_archive_subject_applies(
+        workspace_root=getattr(run, "workspace_root", ""),
+        subject_head=subject,
+        candidate_head=candidate,
+    )
+
+
+def _manager_archive_applied(
+    run,
+    *,
+    registry=None,
+    jobs: Iterable[Mapping[str, object]] | None = None,
+) -> bool:
+    declared = [
         step
         for step in run.steps
-        if step.phase == "ship"
-        and step.card == "openspec-archive"
-        and step.gate_result == "passed"
+        if step.phase == "ship" and step.card == "openspec-archive"
     ]
-    return len(archives) == 1 and (
-        archives[0].executor,
-        archives[0].model,
-        archives[0].domain,
-    ) == ("cortex-manager", "deterministic", "cortex")
+    if declared:
+        archives = [step for step in declared if step.gate_result == "passed"]
+        return len(archives) == 1 and (
+            archives[0].executor,
+            archives[0].model,
+            archives[0].domain,
+        ) == ("cortex-manager", "deterministic", "cortex")
+    if registry is None and jobs is None:
+        return False
+    return _manager_archive_job_applied(registry, run, jobs=jobs)
 
 
 def _planning_artifact_relative_path_after_archive(
@@ -7868,45 +7949,55 @@ def _workflow_report_cleanup_allows_missing(
 
 
 def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: str | Path):
+    workflow_jobs = registry.list_jobs()
+    archive_required = bool(run.openspec_refs) or any(
+        step.phase == "ship" and step.card == "openspec-archive"
+        for step in run.steps
+    )
+    archive_applied = archive_required and _manager_archive_applied(
+        run,
+        registry=registry,
+        jobs=workflow_jobs,
+    )
+
     def matches_candidate(card: str, job: Mapping[str, object]) -> bool:
         subject = job.get("subject_head")
+        if card != "openspec-archive":
+            return subject == candidate
+        if not archive_applied:
+            return False
         if subject == candidate:
             return True
-        if (
-            card != "openspec-archive"
-            or not _manager_archive_applied(run)
-            or not isinstance(subject, str)
-            or verification.SAFE_SHA_RE.fullmatch(subject) is None
-            or verification.SAFE_SHA_RE.fullmatch(candidate) is None
-        ):
+        if not isinstance(subject, str):
             return False
-        try:
-            ancestry = subprocess.run(
-                [
-                    "git", "-C", str(run.workspace_root), "merge-base", "--is-ancestor",
-                    subject, candidate,
-                ],
-                shell=False,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except OSError:
-            return False
-        return ancestry.returncode == 0
+        return _manager_archive_subject_applies(
+            workspace_root=run.workspace_root,
+            subject_head=subject,
+            candidate_head=candidate,
+        )
 
     steps = run.steps
-    for card in ("openspec-archive", "policy-commit"):
+    ship_cards = (
+        (("openspec-archive",) if archive_required else ())
+        + ("policy-commit",)
+    )
+    for card in ship_cards:
         jobs = [
             job
-            for job in registry.list_jobs()
-            if job.get("workflow_run_id") == run.run_id
-            and job.get("workflow_phase") == "ship"
-            and job.get("workflow_card") == card
-            and job.get("persona") == "manager"
+            for job in workflow_jobs
+            if (
+                (
+                    _manager_archive_job_matches(job, run_id=run.run_id)
+                    if card == "openspec-archive"
+                    else job.get("workflow_run_id") == run.run_id
+                    and job.get("workflow_phase") == "ship"
+                    and job.get("workflow_card") == card
+                    and job.get("persona") == "manager"
+                    and job.get("status") == "exited"
+                    and job.get("exit_code") == 0
+                )
+            )
             and matches_candidate(card, job)
-            and job.get("status") == "exited"
-            and job.get("exit_code") == 0
         ]
         if len(jobs) != 1:
             raise ValueError(f"workflow ship card audit missing or ambiguous: {card}")
@@ -12390,6 +12481,68 @@ def apply_workflow_action(
                 raise ValueError("ship validator completion binding invalid")
         return str(status), normalized
 
+    def delivery_needs_human_update(
+        *,
+        current,
+        card_id: str,
+        candidate: str | None,
+        trusted: dict[str, object],
+        source: str,
+    ) -> tuple[str, tuple[str, ...], object, dict[str, object]]:
+        delivery_reason = str(trusted.get("reason") or "delivery-needs-human")
+        main_sync = trusted.get("main_sync")
+        evidence_ref = trusted.get("ref")
+        evidence_hash = trusted.get("hash")
+        context: dict[str, object] = {}
+        evidence_refs: tuple[str, ...] = ()
+        updated_evidence_refs = current.evidence_refs
+        result: dict[str, object] = {}
+        if isinstance(main_sync, dict):
+            context["main_sync"] = json.dumps(
+                {
+                    key: main_sync.get(key)
+                    for key in (
+                        "candidate",
+                        "stage",
+                        "returncode",
+                        "error_kind",
+                        "main_head",
+                    )
+                    if key in main_sync
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if isinstance(evidence_ref, str) and evidence_ref:
+                evidence_refs = (evidence_ref,)
+                updated_evidence_refs = tuple(
+                    dict.fromkeys((*current.evidence_refs, evidence_ref))
+                )
+                result["evidence_ref"] = evidence_ref
+            if isinstance(evidence_hash, str) and len(evidence_hash) == 64:
+                context["main_sync_evidence_hash"] = evidence_hash
+                result["evidence_hash"] = evidence_hash
+            result["main_sync"] = dict(main_sync)
+        return (
+            delivery_reason,
+            updated_evidence_refs,
+            diagnostic_reason(
+                "delivery-needs-human",
+                "ship validator 判定交付需要人工介入："
+                f"{delivery_reason}",
+                source=source,
+                evidence_refs=evidence_refs,
+                run_id=current.run_id,
+                work_id=current.work_id,
+                card=card_id,
+                candidate=candidate,
+                delivery_reason=delivery_reason,
+                **context,
+            ),
+            result,
+        )
+
     if action == "refresh-completion":
         if not trusted_terminal:
             raise ValueError("workflow completion refresh is internal to terminal polling")
@@ -12512,27 +12665,30 @@ def apply_workflow_action(
                         "reason": "delivery-in-progress",
                     }
                 if status == "needs_human":
-                    delivery_reason = trusted.get("reason") or "delivery-needs-human"
+                    (
+                        delivery_reason,
+                        evidence_refs,
+                        needs_human_reason,
+                        result_fields,
+                    ) = delivery_needs_human_update(
+                        current=current,
+                        card_id=card_id,
+                        candidate=current.candidate_head,
+                        trusted=trusted,
+                        source="manager.apply_workflow_action:advance-ship",
+                    )
                     updated = registry._manager_update_workflow_run(
                         run_id,
                         facets=("needs_human",),
                         gate_status="running",
-                        needs_human_reason=diagnostic_reason(
-                            "delivery-needs-human",
-                            "ship validator 判定交付需要人工介入："
-                            f"{delivery_reason}",
-                            source="manager.apply_workflow_action:advance-ship",
-                            run_id=run_id,
-                            work_id=current.work_id,
-                            card=card_id,
-                            candidate=current.candidate_head,
-                            delivery_reason=str(delivery_reason),
-                        ),
+                        evidence_refs=evidence_refs,
+                        needs_human_reason=needs_human_reason,
                     )
                     return {
                         "run_id": updated.run_id,
                         "current_phase": updated.current_phase,
                         "reason": delivery_reason,
+                        **result_fields,
                     }
                 refs = {item.kind: item for item in current.gate_refs}
                 review_kind = trusted["review_kind"]
@@ -12744,6 +12900,8 @@ def apply_workflow_action(
         # 診斷 invariant：下面兩條會把 run 推進 needs_human 的分支各自帶上理由，
         # 交給同一個 `_manager_update_workflow_run` 呼叫寫入（見結尾）。
         facets_reason = None
+        facets_evidence_refs = current.evidence_refs
+        result_fields: dict[str, object] = {}
         if current.current_phase == "review" and phase_done and next_phase == "ship":
             if ship_validator is None:
                 next_phase = "review"
@@ -12808,15 +12966,17 @@ def apply_workflow_action(
                     next_phase = "review"
                     gate_status = "running"
                     facets = ("needs_human",)
-                    facets_reason = diagnostic_reason(
-                        "delivery-needs-human",
-                        "ship validator 判定交付需要人工介入："
-                        f"{trusted.get('reason') or 'delivery-needs-human'}",
-                        source="manager.apply_workflow_action:advance-phase",
-                        run_id=run_id,
-                        work_id=current.work_id,
-                        card=card_id,
+                    (
+                        _delivery_reason,
+                        facets_evidence_refs,
+                        facets_reason,
+                        result_fields,
+                    ) = delivery_needs_human_update(
+                        current=current,
+                        card_id=card_id,
                         candidate=candidate,
+                        trusted=trusted,
+                        source="manager.apply_workflow_action:advance-phase",
                     )
         updated = registry._manager_update_workflow_run(
             run_id,
@@ -12844,6 +13004,7 @@ def apply_workflow_action(
             candidate_head=candidate,
             verified_head=verified,
             facets=facets,
+            evidence_refs=facets_evidence_refs,
             status=(
                 "done"
                 if current.current_phase == "review"
@@ -12934,7 +13095,12 @@ def apply_workflow_action(
                 )
             )
         )
-        return {"run_id": updated.run_id, "current_phase": updated.current_phase, "reason": reason}
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": reason,
+            **result_fields,
+        }
     if action != "start":
         raise ValueError(f"unsupported workflow action: {action}")
 

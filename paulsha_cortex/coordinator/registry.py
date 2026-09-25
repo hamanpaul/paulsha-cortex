@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import tempfile
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -221,6 +223,50 @@ def _empty_legacy_records() -> dict[str, Any]:
 _CURRENT_VERIFICATION_EVIDENCE_HASH = "current_verification_evidence_hash"
 
 
+@dataclass(frozen=True)
+class _DurableStateSnapshot:
+    raw_bytes: bytes | None
+    revision: str | None
+    mtime_ns: int | None
+    size: int | None
+
+
+def canonical_state_path(state_path: str | Path) -> Path:
+    state_path = Path(state_path).expanduser()
+    return state_path.parent.resolve(strict=False) / state_path.name
+
+
+def state_transaction_lock_path(state_path: str | Path) -> Path:
+    return Path(f"{canonical_state_path(state_path)}.transaction.lock")
+
+
+def _state_revision(raw_bytes: bytes) -> str:
+    return hashlib.sha256(raw_bytes).hexdigest()
+
+
+def _serialize_state_payload(payload: Mapping[str, Any]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+
+
+class RegistryRevisionConflict(RuntimeError):
+    def __init__(
+        self,
+        *,
+        expected_revision: str | None,
+        actual_revision: str | None,
+        state_path: Path,
+    ) -> None:
+        self.expected_revision = expected_revision
+        self.actual_revision = actual_revision
+        self.state_path = Path(state_path)
+        super().__init__(
+            "registry revision conflict: "
+            f"expected_revision={expected_revision}, "
+            f"actual_revision={actual_revision}, "
+            f"state_path={self.state_path}"
+        )
+
+
 def _is_sha256_digest(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -354,7 +400,12 @@ class JobRegistry:
     """Versioned coordinator state with atomic single-file persistence."""
 
     def __init__(self, state_path: str | Path | None = None, seq_start: int = 0) -> None:
-        self._state_path = Path(state_path) if state_path is not None else _default_state_path()
+        self._state_path = (
+            Path(state_path).expanduser() if state_path is not None else _default_state_path()
+        )
+        self.canonical_state_path = canonical_state_path(self._state_path)
+        self.state_transaction_lock_path = state_transaction_lock_path(self._state_path)
+        self._seq_start = seq_start
         self._jobs: list[dict[str, Any]] = []
         self._slices: list[dict[str, Any]] = []
         self._workflows: list[WorkflowRun] = []
@@ -363,35 +414,119 @@ class JobRegistry:
         self._seq = seq_start
         self._state_mtime_ns: int | None = None
         self._state_size: int | None = None
+        self._loaded_revision: str | None = None
+        self._loaded_source_schema_version: int | None = None
+        self._pending_previous_raw_bytes: bytes | None = None
         self._load()
 
-    def _record_state_file_metadata(self) -> None:
+    def _record_loaded_snapshot(
+        self,
+        snapshot: _DurableStateSnapshot,
+        *,
+        source_schema_version: int | None,
+    ) -> None:
+        self._loaded_revision = snapshot.revision
+        self._loaded_source_schema_version = source_schema_version
+        self._state_mtime_ns = snapshot.mtime_ns
+        self._state_size = snapshot.size
+
+    def _restore_absent_snapshot(self, snapshot: _DurableStateSnapshot) -> None:
+        self._jobs = []
+        self._slices = []
+        self._workflows = []
+        self._legacy_records = _empty_legacy_records()
+        self._reclaim_resets = []
+        self._seq = self._seq_start
+        self._record_loaded_snapshot(snapshot, source_schema_version=None)
+
+    def _read_durable_snapshot(self) -> _DurableStateSnapshot:
         try:
-            stat = self._state_path.stat()
-        except OSError:
-            self._state_mtime_ns = None
-            self._state_size = None
-            return
-        self._state_mtime_ns = stat.st_mtime_ns
-        self._state_size = stat.st_size
+            fd = os.open(self._state_path, os.O_RDONLY)
+        except FileNotFoundError:
+            return _DurableStateSnapshot(
+                raw_bytes=None,
+                revision=None,
+                mtime_ns=None,
+                size=None,
+            )
+        try:
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            stat = os.fstat(fd)
+        finally:
+            os.close(fd)
+        raw_bytes = b"".join(chunks)
+        return _DurableStateSnapshot(
+            raw_bytes=raw_bytes,
+            revision=_state_revision(raw_bytes),
+            mtime_ns=stat.st_mtime_ns,
+            size=stat.st_size,
+        )
+
+    @contextmanager
+    def _hold_state_transaction_lock(self):
+        lock_path = self.state_transaction_lock_path
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        created = not lock_path.exists()
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if created:
+                _fsync_directory(lock_path.parent)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def _reload_if_changed(self) -> None:
-        try:
-            stat = self._state_path.stat()
-        except OSError:
+        snapshot = self._read_durable_snapshot()
+        if snapshot.revision == self._loaded_revision:
+            if (
+                snapshot.mtime_ns != self._state_mtime_ns
+                or snapshot.size != self._state_size
+            ):
+                self._record_loaded_snapshot(
+                    snapshot,
+                    source_schema_version=self._loaded_source_schema_version,
+                )
             return
-        if self._state_mtime_ns == stat.st_mtime_ns and self._state_size == stat.st_size:
-            return
-        self._load()
+        self._load(snapshot=snapshot)
 
-    def _load(self) -> None:
-        if not self._state_path.is_file():
-            self._state_mtime_ns = None
-            self._state_size = None
+    def _load(
+        self,
+        *,
+        snapshot: _DurableStateSnapshot | None = None,
+        allow_repairs: bool = True,
+    ) -> None:
+        pending = snapshot
+        while True:
+            active_snapshot = pending if pending is not None else self._read_durable_snapshot()
+            try:
+                self._restore_from_snapshot(active_snapshot, allow_repairs=allow_repairs)
+                return
+            except RegistryRevisionConflict:
+                if not allow_repairs:
+                    raise
+                pending = None
+
+    def _restore_from_snapshot(
+        self,
+        snapshot: _DurableStateSnapshot,
+        *,
+        allow_repairs: bool,
+    ) -> None:
+        if snapshot.revision is None:
+            self._restore_absent_snapshot(snapshot)
             return
+        assert snapshot.raw_bytes is not None
         try:
-            original = self._state_path.read_bytes()
-            payload = json.loads(original.decode("utf-8"))
+            payload = json.loads(snapshot.raw_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(
                 f"coordinator 狀態檔解析失敗（fail-closed）: {self._state_path}: {exc}"
@@ -400,7 +535,7 @@ class JobRegistry:
             raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
         schema_version = payload.get("schema_version")
         if schema_version == 1:
-            jobs, slices, seq = self._validate_state_records(payload)
+            _, _, seq = self._validate_state_records(payload)
             legacy_records = {
                 "source_schema_version": 1,
                 "seq": seq,
@@ -410,19 +545,15 @@ class JobRegistry:
                 "jobs": _deepcopy_json(payload["jobs"]),
                 "slices": _deepcopy_json(payload["slices"]),
             }
-            migrated = {
-                "schema_version": COORDINATOR_STATE_SCHEMA_VERSION,
-                "seq": seq,
-                "jobs": [],
-                "slices": [],
-                "workflows": [],
-                "legacy_records": legacy_records,
-            }
-            self._write_v1_backup(original)
-            self._write_payload_atomically(migrated)
+            self._jobs = []
+            self._slices = []
+            self._workflows = []
             self._legacy_records = _deepcopy_json(legacy_records)
-            self._seq = max(seq, self._seq)
-            self._record_state_file_metadata()
+            self._reclaim_resets = []
+            self._seq = seq
+            self._record_loaded_snapshot(snapshot, source_schema_version=1)
+            if allow_repairs:
+                self._persist()
             return
         if schema_version != COORDINATOR_STATE_SCHEMA_VERSION:
             if schema_version is None:
@@ -474,14 +605,16 @@ class JobRegistry:
         self._workflows = validated_workflows
         self._legacy_records = _deepcopy_json(legacy_records)
         self._reclaim_resets = reclaim_resets
-        self._seq = max(seq, self._seq)
-        if slices != payload["slices"]:
+        self._seq = seq
+        self._record_loaded_snapshot(
+            snapshot,
+            source_schema_version=COORDINATOR_STATE_SCHEMA_VERSION,
+        )
+        if slices != payload["slices"] and allow_repairs:
             # #501：the additive evidence-hash field and deterministic repair
             # must survive a restart, otherwise the same legacy row would be
             # reclassified on every load.
             self._persist()
-        else:
-            self._record_state_file_metadata()
 
     def _validate_reclaim_resets(self, value: object) -> list[dict[str, Any]]:
         """#519：semantic-reclaim 重置水位的載入驗證（malformed 一律 fail-closed）。"""
@@ -569,17 +702,22 @@ class JobRegistry:
         tmp.unlink(missing_ok=True)
         return backup
 
-    def _write_payload_atomically(self, payload: dict[str, Any]) -> None:
+    def _write_payload_atomically(
+        self,
+        payload: dict[str, Any],
+    ) -> _DurableStateSnapshot:
+        raw_bytes = _serialize_state_payload(payload)
+        previous_raw_bytes = self._pending_previous_raw_bytes
         directory = self._state_path.parent
         directory.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=str(directory), suffix=".tmp")
         tmp = Path(tmp_name)
         backup: Path | None = None
-        had_original = self._state_path.is_file()
+        had_original = previous_raw_bytes is not None
         replaced = False
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(raw_bytes)
                 handle.flush()
                 os.fsync(handle.fileno())
             if had_original:
@@ -588,12 +726,20 @@ class JobRegistry:
                 )
                 backup = Path(backup_name)
                 with os.fdopen(backup_fd, "wb") as handle:
-                    handle.write(self._state_path.read_bytes())
+                    assert previous_raw_bytes is not None
+                    handle.write(previous_raw_bytes)
                     handle.flush()
                     os.fsync(handle.fileno())
             os.replace(tmp, self._state_path)
             replaced = True
             _fsync_directory(directory)
+            stat = self._state_path.stat()
+            return _DurableStateSnapshot(
+                raw_bytes=raw_bytes,
+                revision=_state_revision(raw_bytes),
+                mtime_ns=stat.st_mtime_ns,
+                size=stat.st_size,
+            )
         except BaseException as original_error:
             tmp.unlink(missing_ok=True)
             if replaced:
@@ -614,8 +760,8 @@ class JobRegistry:
             if backup is not None:
                 backup.unlink(missing_ok=True)
 
-    def _persist(self) -> None:
-        payload = {
+    def _build_payload(self) -> dict[str, Any]:
+        return {
             "schema_version": COORDINATOR_STATE_SCHEMA_VERSION,
             "seq": self._seq,
             "jobs": self._jobs,
@@ -624,20 +770,40 @@ class JobRegistry:
             "legacy_records": self._legacy_records,
             "reclaim_resets": self._reclaim_resets,
         }
+
+    def _persist(self) -> None:
+        payload = self._build_payload()
         try:
-            self._write_payload_atomically(payload)
-            self._record_state_file_metadata()
+            with self._hold_state_transaction_lock():
+                current_snapshot = self._read_durable_snapshot()
+                expected_revision = self._loaded_revision
+                if current_snapshot.revision != expected_revision:
+                    self._restore_from_snapshot(current_snapshot, allow_repairs=False)
+                    raise RegistryRevisionConflict(
+                        expected_revision=expected_revision,
+                        actual_revision=current_snapshot.revision,
+                        state_path=self.canonical_state_path,
+                    )
+                if self._loaded_source_schema_version == 1 and current_snapshot.raw_bytes is not None:
+                    self._write_v1_backup(current_snapshot.raw_bytes)
+                self._pending_previous_raw_bytes = current_snapshot.raw_bytes
+                try:
+                    written_snapshot = self._write_payload_atomically(payload)
+                finally:
+                    self._pending_previous_raw_bytes = None
+                if not isinstance(written_snapshot, _DurableStateSnapshot):
+                    written_snapshot = self._read_durable_snapshot()
+                self._record_loaded_snapshot(
+                    written_snapshot,
+                    source_schema_version=COORDINATOR_STATE_SCHEMA_VERSION,
+                )
+        except RegistryRevisionConflict:
+            raise
         except BaseException:
-            # _write_payload_atomically restores the previous durable file.
-            # Reload that exact snapshot so every mutation site, including
-            # legacy job/slice methods, rolls memory back consistently too.
-            self._jobs = []
-            self._slices = []
-            self._workflows = []
-            self._legacy_records = _empty_legacy_records()
-            self._reclaim_resets = []
-            self._seq = 0
-            self._load()
+            # _write_payload_atomically restores the previous durable file on
+            # replace/fsync faults. Always reload the exact current durable
+            # snapshot here without taking the transaction lock again.
+            self._restore_from_snapshot(self._read_durable_snapshot(), allow_repairs=False)
             raise
 
     def _validate_loaded_job(self, job: object) -> dict[str, Any]:
@@ -1001,19 +1167,52 @@ class JobRegistry:
             "actions": _copy_json_list(slice_row["actions"]),
         }
 
-    def _find_job(self, job_id: str) -> dict[str, Any]:
-        self._reload_if_changed()
+    def _lookup_with_cross_instance_visibility(self, lookup: Callable[[], Any]) -> Any:
+        expected_revision = self._loaded_revision
+        try:
+            return lookup()
+        except KeyError as missing:
+            snapshot = self._read_durable_snapshot()
+            if (
+                snapshot.revision == self._loaded_revision
+                and snapshot.mtime_ns == self._state_mtime_ns
+                and snapshot.size == self._state_size
+            ):
+                raise missing
+            self._restore_from_snapshot(snapshot, allow_repairs=False)
+            try:
+                visible = lookup()
+            except KeyError:
+                raise missing
+            if snapshot.revision != expected_revision:
+                raise RegistryRevisionConflict(
+                    expected_revision=expected_revision,
+                    actual_revision=snapshot.revision,
+                    state_path=self.canonical_state_path,
+                )
+            return visible
+
+    def _find_job_in_memory(self, job_id: str) -> dict[str, Any]:
         for job in self._jobs:
             if job["job_id"] == job_id:
                 return job
         raise KeyError(f"job 不存在: {job_id}")
 
-    def _find_slice(self, slice_id: str) -> dict[str, Any]:
-        self._reload_if_changed()
+    def _find_job(self, job_id: str) -> dict[str, Any]:
+        return self._lookup_with_cross_instance_visibility(
+            lambda: self._find_job_in_memory(job_id)
+        )
+
+    def _find_slice_in_memory(self, slice_id: str) -> dict[str, Any]:
         for slice_row in self._slices:
             if slice_row["slice_id"] == slice_id:
                 return slice_row
         raise KeyError(f"slice 不存在: {slice_id}")
+
+    def _find_slice(self, slice_id: str) -> dict[str, Any]:
+        return self._lookup_with_cross_instance_visibility(
+            lambda: self._find_slice_in_memory(slice_id)
+        )
 
     def _copy_slice(self, slice_row: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1222,6 +1421,7 @@ class JobRegistry:
         return [_deepcopy_json(job) for job in self._jobs]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
+        self._reload_if_changed()
         return _deepcopy_json(self._find_job(job_id))
 
     def update_job(
@@ -1750,27 +1950,36 @@ class JobRegistry:
         self._persist()
         return self._copy_slice(slice_row)
 
-    def _find_workflow_run_index(self, run_id: str) -> int:
+    def _find_workflow_run_index_in_memory(self, run_id: str) -> int:
         for index, run in enumerate(self._workflows):
             if run.run_id == run_id:
                 return index
         raise KeyError(f"workflow run 不存在: {run_id}")
 
+    def _find_workflow_run_index(self, run_id: str) -> int:
+        return self._lookup_with_cross_instance_visibility(
+            lambda: self._find_workflow_run_index_in_memory(run_id)
+        )
+
     def _copy_workflow_run(self, run: WorkflowRun) -> WorkflowRun:
         return WorkflowRun.from_dict(run.to_dict())
 
     def list_legacy_records(self) -> dict[str, Any]:
+        self._reload_if_changed()
         return _deepcopy_json(self._legacy_records)
 
     def list_workflow_runs(self) -> list[WorkflowRun]:
+        self._reload_if_changed()
         return [self._copy_workflow_run(run) for run in self._workflows]
 
     def get_workflow_run(self, run_id: str) -> WorkflowRun:
+        self._reload_if_changed()
         return self._copy_workflow_run(self._workflows[self._find_workflow_run_index(run_id)])
 
     def list_reclaim_resets(self) -> list[dict[str, Any]]:
         """#519：唯讀列出所有 semantic-reclaim 熔斷重置授權（append-only 稽核列）。"""
 
+        self._reload_if_changed()
         return _deepcopy_json(self._reclaim_resets)
 
     def reclaim_reset_cleared_run_ids(self, *, repo: str, work_id: str) -> frozenset[str]:
@@ -1780,6 +1989,7 @@ class JobRegistry:
         存在的世代——重置之後新產生的 superseded 世代照常累加，熔斷會再次上膛。
         """
 
+        self._reload_if_changed()
         cleared: set[str] = set()
         for entry in self._reclaim_resets:
             if entry.get("repo") == repo and entry.get("work_id") == work_id:

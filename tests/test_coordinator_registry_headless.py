@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,7 @@ from paulsha_cortex.coordinator import verification
 from paulsha_cortex.coordinator.registry import (
     COORDINATOR_STATE_SCHEMA_VERSION,
     JobRegistry,
+    RegistryRevisionConflict,
 )
 
 
@@ -60,6 +62,37 @@ class VersionedRegistryTests(unittest.TestCase):
             reg = JobRegistry(state_path=Path(d) / "absent.json")
             self.assertEqual(reg.list_jobs(), [])
             self.assertEqual(reg.list_slices(), [])
+
+    def test_missing_durable_state_resets_to_seq_start_baseline_on_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            reg = JobRegistry(state_path=state, seq_start=42)
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha",
+                target_branch="main",
+                dispatch_base="base-sha",
+            )
+            expected_revision = reg._loaded_revision
+            state.unlink()
+
+            with self.assertRaises(RegistryRevisionConflict) as ctx:
+                reg.record_action(
+                    "slice-a",
+                    action="builder-started",
+                    actor="builder",
+                    state="running",
+                )
+
+            self.assertEqual(ctx.exception.expected_revision, expected_revision)
+            self.assertIsNone(ctx.exception.actual_revision)
+            self.assertEqual(reg.list_jobs(), [])
+            self.assertEqual(reg.list_slices(), [])
+            self.assertEqual(reg.list_workflow_runs(), [])
+            self.assertEqual(reg._seq, 42)
 
     def test_persisted_root_includes_schema_version_jobs_and_slices(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -417,6 +450,94 @@ class SliceRecordTests(unittest.TestCase):
             self.assertEqual(
                 persisted["slices"][0]["current_verification_evidence_hash"],
                 legacy_evidence_hash,
+            )
+
+    def test_reload_detects_same_size_bytes_with_restored_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            reg = JobRegistry(state_path=state)
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha",
+                target_branch="main",
+                dispatch_base="base-sha",
+            )
+
+            original_stat = state.stat()
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            payload["slices"][0]["state"] = "running"
+            rewritten = json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+
+            self.assertEqual(len(rewritten), original_stat.st_size)
+            state.write_bytes(rewritten)
+            os.utime(state, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+            self.assertEqual(reg.get_slice("slice-a")["state"], "running")
+
+    def test_stale_normalization_reload_keeps_newer_durable_state(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            reg = JobRegistry(state_path=state)
+            contract = {"docs_class": "code", "review_policy": "required"}
+            contract_hash = verification.canonical_json_hash(contract)
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha",
+                target_branch="main",
+                verification_hash=contract_hash,
+                verification=contract,
+                dispatch_base="base-sha",
+            )
+
+            stale_payload = json.loads(state.read_text(encoding="utf-8"))
+            stale_payload["slices"][0]["verification"]["hash"] = "e" * 64
+            stale_payload["slices"][0].pop("current_verification_evidence_hash")
+            state.write_text(
+                json.dumps(stale_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            replacement_payload = json.loads(state.read_text(encoding="utf-8"))
+            replacement_payload["slices"][0]["state"] = "running"
+            replacement_payload["slices"][0]["verification"]["hash"] = contract_hash
+            replacement_payload["slices"][0]["current_verification_evidence_hash"] = "f" * 64
+            replacement_payload["slices"][0]["current_evidence_refs"] = ["fresh-evidence.json"]
+            replacement_bytes = json.dumps(
+                replacement_payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8")
+
+            original_read = JobRegistry._read_durable_snapshot
+            call_count = 0
+
+            def race_read(registry_self):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 2:
+                    state.write_bytes(replacement_bytes)
+                return original_read(registry_self)
+
+            with mock.patch.object(JobRegistry, "_read_durable_snapshot", new=race_read):
+                reloaded = JobRegistry(state_path=state)
+
+            self.assertEqual(state.read_bytes(), replacement_bytes)
+            self.assertEqual(reloaded.get_slice("slice-a")["state"], "running")
+            self.assertEqual(
+                reloaded.get_slice("slice-a")["current_verification_evidence_hash"],
+                "f" * 64,
             )
 
     def test_repin_slice_recovers_failed_state_by_resetting_gate_only(self) -> None:

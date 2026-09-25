@@ -70,6 +70,28 @@ def _init_repo(root: Path, repo: str = "acme/demo") -> Path:
     return root
 
 
+def _candidate_workspace(root: Path) -> tuple[Path, str]:
+    repo = _init_repo(root)
+    proposal = repo / "openspec" / "changes" / "demo" / "proposal.md"
+    proposal.parent.mkdir(parents=True)
+    proposal.write_text("# Candidate fixture\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Tests", "-c",
+            "user.email=tests@example.invalid", "commit", "-qm", "fixture candidate",
+        ],
+        check=True,
+    )
+    candidate = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return repo, candidate
+
+
 def _snapshot(path: Path, *, source_revisions: list[str] | None = None) -> Path:
     _init_repo(path.parent)
     path.write_text(
@@ -119,6 +141,7 @@ def _make_run(
     claim_key: str,
     current_phase: str,
     steps: tuple[WorkflowStep, ...],
+    workspace_root: Path = Path("/tmp/workspace"),
     candidate_head: str | None = None,
     verified_head: str | None = None,
     facets: tuple[str, ...] = (),
@@ -130,7 +153,7 @@ def _make_run(
         repo=authority.repo,
         claim_key=claim_key,
         source_revision=source_revision or work_actions.work_authority_digest(authority),
-        workspace_root="/tmp/workspace",
+        workspace_root=str(workspace_root),
         combo="feature-oneshot",
         current_phase=current_phase,
         steps=steps,
@@ -170,6 +193,7 @@ def test_retry_build_invalidates_verify_and_review_but_reruns_only_builder(
     authority, snapshot = _authority(tmp_path)
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     claim_key = work_actions._expected_claim_key(authority)
+    repo, candidate = _candidate_workspace(tmp_path / "repo")
     steps = _base_steps(verify_result="passed", review_result="passed")
     run = _make_run(
         registry,
@@ -177,8 +201,9 @@ def test_retry_build_invalidates_verify_and_review_but_reruns_only_builder(
         claim_key=claim_key,
         current_phase="review",
         steps=steps,
-        candidate_head=HEAD,
-        verified_head=HEAD,
+        workspace_root=repo,
+        candidate_head=candidate,
+        verified_head=candidate,
         facets=("needs_human",),
     )
     result = work_actions.execute_work_action(
@@ -188,7 +213,7 @@ def test_retry_build_invalidates_verify_and_review_but_reruns_only_builder(
             "work_id": "demo",
             "issue": 12,
             "actor": "operator",
-            "expected_candidate": HEAD,
+            "expected_candidate": candidate,
         },
         requested_by="operator",
         snapshot_path=snapshot,
