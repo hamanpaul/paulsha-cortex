@@ -10,7 +10,7 @@ issue: 1064
 
 ### D1 — 唯一綁定與先後依賴
 
-唯一 planned child owner 是 `hamanpaul/paulsha-cortex` issue 1064，唯一 `work_id` 是 `monitor-correlation-refresh-generation`。本 bundle 由下列 Superpowers views 與自己的 OpenSpec change 組成；每份均帶相同 issue/work item，沒有第二個 work ID 或 sibling mapping：
+唯一 planning umbrella owner 是 `hamanpaul/paulsha-cortex` issue 1064，唯一 parent `work_id` 是 `monitor-correlation-refresh-generation`。本 bundle 有七個 parent refs：Superpowers spec/design/todo與OpenSpec proposal/design/tasks六份規劃文件均以frontmatter帶相同issue/work item；OpenSpec capability spec是由change directory綁定的delta payload，不另加frontmatter。實作拆成另外兩個issue與work item，各自有獨立draft spec/design/todo，不與parent binding混用：
 
 | Kind | Canonical ref |
 |---|---|
@@ -22,7 +22,14 @@ issue: 1064
 | OpenSpec capability spec | `openspec/changes/monitor-correlation-refresh-generation/specs/monitor-correlation-refresh-generation/spec.md` |
 | OpenSpec tasks | `openspec/changes/monitor-correlation-refresh-generation/tasks.md` |
 
-此唯一文件集合尚未透過 Monitor registry 或正式 Cortex intake 建立 live source binding。本規劃先依賴 #1063 的 qualification/path contract；#1064 是其後的 producer，#1065 消費本 API，#1054 保有 pre-Builder run/claim reconciliation、first-Builder Manager gate、stale direct-resume stop與typed diagnostics。依賴順序為 #1063 → #1064 → #1065 → #1054；本 PR 只建立 #1064 規劃，不宣稱任一 implementation child 完成。
+此唯一 parent文件集合尚未透過 Monitor registry 或正式 Cortex intake建立 live source binding。實作 slices與依賴如下；各自的 `work_id` 不等於 parent work item：
+
+| Issue | Work item | Owner boundary | Dependency |
+|---|---|---|---|
+| #1077 | `monitor-refresh-attempt-ledger` | durable generation allocation、running/failure marker、restart/concurrency behavior | #1063 |
+| #1078 | `monitor-trusted-freshness` | exact input/source revisions、snapshot read-back、success marker、read-only freshness API | #1077（transitively #1063） |
+
+依賴順序為 #1063 → #1077 → #1078 → #1064 umbrella completion → #1065 → #1054。此 PR只建立parent與兩個child planning bundles，不建立Cortex live source binding或啟動任一intake。
 
 ### D2 — 獨立、持久、單調的 attempt ledger
 
@@ -60,7 +67,7 @@ marker是獨立 sidecar，既有 `work-items-snapshot/v1` payload及last-good ro
 
 ### D7 — Validation 與分工
 
-本票集中修改 Monitor provider/correlation, marker persistence/read-back 與 read API；預定 production modules 限 `paulsha_cortex/monitor/{work_api,work_snapshot,correlation}.py`。Regression tests與上述七份 planning artifacts / changelog為未來實作交付。#1065只在本票 API合併後改 WorkAuthority reader；#1054只在 #1063 qualification、#1064 generation與#1065 consumer均完成後落地 admission。若 source/path contract需要改動，回到 #1063；若跨出 Monitor或增加第二個 consumer，停下重裁 issue與 sizing。
+整體 producer最終修改範圍限 `paulsha_cortex/monitor/{work_api,work_snapshot,correlation}.py`。#1077先落generation/failure marker；#1078再落exact input/source capture、snapshot read-back與read API。Focused regression suites分屬兩票，parent與child planning docs/changelog隨本規劃PR交付。#1065只在#1064 umbrella完成後改WorkAuthority reader；#1054只在 #1063/#1064/#1065完成後落地 admission。若source/path contract需要改動，回到#1063；若跨出Monitor或增加第二個consumer，停下重裁issue與sizing。
 
 ## Goals / Non-Goals
 
@@ -78,4 +85,4 @@ marker是獨立 sidecar，既有 `work-items-snapshot/v1` payload及last-good ro
 
 ## Open Questions
 
-- 無待 implementation 自由裁定的產品問題。跨程序多writer若在實際runtime path存在，需按 D2 採 durable lock/CAS，不能降低generation保障。
+- 無。

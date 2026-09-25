@@ -10,13 +10,17 @@ issue: 1064
 
 此design與`docs/superpowers/specs/monitor-correlation-refresh-generation-design.md`是同一issue/work_item的平行view。現行`WorkSnapshotStore` durable寫入整份last-good payload；`WorkModelRefresher.refresh()`會先從上一份snapshot承接provider state，呼叫`correlate_work_sources()`讀`.cortex/work-items.yaml`後投影WorkItem；provider degraded時可能保留last-good source。`ProjectMonitorService._refresh_work_model()`只在exception時呼叫`record_refresh_failure()`，其錯誤由`WorkReadModelStore`記憶體持有；這些資料不能證明latest durable correlation是否成功或涵蓋目前override。
 
-Owner為live issue 1064。依賴次序為#1063 qualification/path admission → 本票Monitor generation producer → #1065 WorkAuthority consumer → #1054 Manager gate。source qualification屬#1063；consumer、gate、recovery與ship均不在此change。
+Parent owner為live issue 1064。producer slices依賴次序為#1063 qualification/path admission → #1077 durable attempt ledger → #1078 source/snapshot binding與freshness API → #1064 umbrella completion → #1065 WorkAuthority consumer → #1054 Manager gate。source qualification屬#1063；consumer、gate、recovery與ship均不在此change。
 
 ## Goals / Non-Goals
 
 **Goals:** persistent monotonic attempts；failure marker與last-good payload分離；成功record綁定實際override/source revisions及durable snapshot read-back；提供唯一read-only repo/work trusted freshness API。
 
 **Non-Goals:**改claim authority rules、Manager dispatch/claim gate、Todo qualification、path guard/override mutation、pre-Candidate或Candidate/PR recovery、ship semantics、CLI command、live intake、implementation/deployment。
+
+### D0 — Producer split and dependency contract
+
+#1077 only publishes durable generation/running/failure state. #1078 depends on that marker contract and adds exact consumed revisions, read-back verification, success publication, and the trusted freshness API. #1064 is the umbrella and is complete only after both slices; no consumer or Manager gate is moved into either producer issue.
 
 ## Decisions
 

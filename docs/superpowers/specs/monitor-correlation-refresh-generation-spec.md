@@ -8,7 +8,7 @@ issue: 1064
 
 ## Requirements
 
-Owner 是 [issue #1064](https://github.com/hamanpaul/paulsha-cortex/issues/1064)，唯一 `work_item` 為 `monitor-correlation-refresh-generation`。本規格由 live issue 與 `origin/main` `6a32a3e5e0af841794f340313c11f60f2999f6ae` 形成 draft；#1063 是前置的 canonical source qualification/path contract，#1065 是 freshness consumer，#1054 保有 Manager admission。status 尚未 accepted，因此不是 freeze、intake 或產品授權。
+Owner 是 producer umbrella [issue #1064](https://github.com/hamanpaul/paulsha-cortex/issues/1064)，唯一 `work_item` 為 `monitor-correlation-refresh-generation`。本規格由 live issue 與 `origin/main` `6a32a3e5e0af841794f340313c11f60f2999f6ae` 形成 draft；#1063 是前置的 canonical source qualification/path contract；#1077 與 #1078 是依序交付本 producer 的兩個 issue-backed slices；#1065 是 freshness consumer，#1054 保有 Manager admission。status 尚未 accepted，因此不是 freeze、intake 或產品授權。
 
 ### R1 — 每次 attempt 都有單調 generation
 
@@ -78,7 +78,7 @@ Monitor MUST 提供一個 repo/work-item scoped freshness API，輸入確切 rep
 
 ### R7 — dependency 與 owner 邊界
 
-#1064 implementation MUST 依賴 #1063 提供的 deterministic Todo/source qualification 與 existing-path admission contract；#1064 只記錄 Monitor 實際 consumed correlation inputs，不複製 qualification、path guard 或寫 override admission。#1065 才把此 freshness API 接入 WorkAuthority reader。#1054 仍獨佔 pre-Builder run/claim reconciliation、first-Builder Manager gate、stale direct-resume stop、typed zero/multiple diagnostics 與無 Builder side effect 的 admission 行為。#1064 不實作 claim loader、Manager dispatch/claim gate、Todo metadata qualification、pre-Candidate recovery、#1055 Candidate/PR recovery 或 ship 語意。
+#1064 producer umbrella MUST 依賴 #1063 提供的 deterministic Todo/source qualification 與 existing-path admission contract；#1077 只交付 durable generation/running/failure ledger，#1078 再將 success 綁定實際 consumed correlation inputs、source snapshot read-back與 freshness API，不複製 qualification、path guard 或寫 override admission。#1064 umbrella僅在兩個 producer slices完成後交付；#1065 才把 freshness API 接入 WorkAuthority reader。#1054 仍獨佔 pre-Builder run/claim reconciliation、first-Builder Manager gate、stale direct-resume stop、typed zero/multiple diagnostics 與無 Builder side effect 的 admission 行為。#1064/#1077/#1078 不實作 claim loader、Manager dispatch/claim gate、Todo metadata qualification、pre-Candidate recovery、#1055 Candidate/PR recovery 或 ship 語意。
 
 #### 驗收案例
 
@@ -86,6 +86,15 @@ Monitor MUST 提供一個 repo/work-item scoped freshness API，輸入確切 rep
 - **THEN** Monitor API 可供後續 caller 使用，但 claim／Manager 行為未被本票宣稱修復
 - **WHEN** source qualification/path admission 所有權要求變更
 - **THEN** 停止本票並重裁依賴與 sizing，不在 Monitor refresh producer 內複製 #1063 contract
+
+### R9 — producer slices 有序交付
+
+Monitor producer MUST 依序完成 #1077 attempt-generation/failure-marker ledger與 #1078 source/snapshot success evidence及freshness API。#1077依賴#1063；#1078依賴#1077；producer umbrella #1064只有在兩者完成後才可關閉。此順序不改 #1065 WorkAuthority consumer與 #1054 Manager admission的 owner。
+
+#### 驗收案例
+
+- **WHEN** 查核 producer issue dependency chain
+- **THEN** 順序為 #1063 → #1077 → #1078 → #1064 → #1065 → #1054，且各票只宣稱其列明的 owner boundary
 
 ### R8 — deterministic regression oracle
 

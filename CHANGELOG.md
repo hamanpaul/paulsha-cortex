@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#1064 Monitor correlation refresh generation 規劃**：新增唯一 work item 的 Superpowers 與 own OpenSpec draft，定義單調 attempt/failure marker、source snapshot read-back與trusted freshness API，保留 #1063 → #1064 → #1065 → #1054 的依賴分工；本次不含產品實作或intake。
+- **#1064 Monitor correlation refresh generation 規劃**：新增 producer umbrella draft與有序 child issues #1077（attempt/failure ledger）、#1078（source/snapshot read-back與trusted freshness API）；官方 sizing為parent draft 9/10 Red、完整 accepted-status projection 7/10 Red，每個child accepted-status projection 6/10 Yellow；保留 #1063 → #1077 → #1078 → #1064 → #1065 → #1054 依賴分工，本次不含產品實作或intake。
 - **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
 - **#966 Yellow plan review 完整性**：將 T6 既有文件交付項目明列為 `documentation`，對齊 accepted plan 的 `artifact_classes`；產品驗收範圍不變。
 - **#1040 driving-cortex resume 範例**：移除 resume 不接受的 `--expected-run-id`，補上唯讀核對 repo/work item/唯一 ongoing run 的步驟，並讓 retry-build 範例明示必需的 exact Candidate。

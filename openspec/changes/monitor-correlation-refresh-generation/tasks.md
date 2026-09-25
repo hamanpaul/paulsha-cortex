@@ -15,6 +15,8 @@ artifact_classes:
 
 All unchecked tasks are future product implementation work for issue 1064. This planning PR does not complete them.
 
+## Tasks
+
 ## 1. Attempt generation and marker
 
 - [ ] 1.1 Define the versioned independent attempt-marker record/store with strict parsing, monotonic generation allocation, and an atomic `running` write before source scanning.
@@ -36,4 +38,4 @@ All unchecked tasks are future product implementation work for issue 1064. This 
 - [ ] 4.1 Add isolated tests for success, failure after a matching last-good row, degraded provider, changed-but-unrefreshed override, refreshed override, unknown marker, age expiry, mixed source generation, read-back mismatch, marker-write failure, and interrupted `running` marker.
 - [ ] 4.2 Test exact durable bytes and API outcomes with temporary paths, fake providers, and fake time; ensure no GitHub/model/live state is touched.
 - [ ] 4.3 Update Monitor docs, changelog fragment and Unreleased entry; run focused/full tests, strict OpenSpec, CI-parity preflight, actual PR-context policy, and diff checks.
-- [ ] 4.4 Preserve dependency order: 1063 producer input contract → 1064 Monitor producer → 1065 WorkAuthority consumer → 1054 pre-Builder Manager admission, run/claim reconciliation, stale direct-resume stop, and diagnostics. Do not add consumer or gate changes to this issue.
+- [ ] 4.4 Preserve dependency order: #1063 producer input contract → #1077 attempt/failure ledger → #1078 source/snapshot-bound success and freshness API → #1064 umbrella completion → #1065 WorkAuthority consumer → #1054 pre-Builder Manager admission, run/claim reconciliation, stale direct-resume stop, and diagnostics. Do not add consumer or gate changes to this issue.

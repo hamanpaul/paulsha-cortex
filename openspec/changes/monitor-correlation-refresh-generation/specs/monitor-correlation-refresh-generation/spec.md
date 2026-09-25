@@ -54,8 +54,8 @@ Monitor SHALL expose one read-only API scoped by exact repo and work ID. It SHAL
 
 ### Requirement: Monitor generation producer preserves adjacent work ownership
 
-The producer SHALL consume source qualification/path facts owned by issue 1063 and SHALL NOT reimplement them. It SHALL NOT change WorkAuthority consumer semantics owned by issue 1065 or issue 1054's pre-Builder run/claim reconciliation, first-Builder admission, stale direct-resume stop, and typed diagnostics. It SHALL NOT implement Todo qualification, claims, Manager dispatch, candidate/PR recovery, or ship semantics.
+The producer SHALL consume source qualification/path facts owned by issue 1063 and SHALL NOT reimplement them. Producer implementation is ordered as issue 1077 (durable attempt-generation/failure ledger), then issue 1078 (exact source/snapshot success evidence and freshness API), then umbrella issue 1064 completion. It SHALL NOT change WorkAuthority consumer semantics owned by issue 1065 or issue 1054's pre-Builder run/claim reconciliation, first-Builder admission, stale direct-resume stop, and typed diagnostics. It SHALL NOT implement Todo qualification, claims, Manager dispatch, candidate/PR recovery, or ship semantics.
 
 #### Scenario: Producer completes before consumer
 - **WHEN** the Monitor freshness API is implemented but the WorkAuthority reader and Manager gate remain pending
-- **THEN** the producer contract is complete only for issue 1064 and no consumer/gate behavior is claimed
+- **THEN** the producer contract is complete only after issues 1077 and 1078 satisfy umbrella issue 1064, and no consumer/gate behavior is claimed
