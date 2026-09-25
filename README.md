@@ -509,7 +509,7 @@ cortex slice-action "$SLICE_ID" retry-review --actor operator
 cortex slice-action "$SLICE_ID" abandon      --actor operator
 ```
 
-`fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
+`fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。共享 coordinator root 內的 `jobs.json` 另以 exact durable-byte SHA-256 revision ＋ canonical `jobs.json.transaction.lock` sidecar 做 compare-and-persist：stale request 不會被靜默重播，daemon 會先把 `RegistryRevisionConflict`（含 expected/actual revision 與 canonical path）持久化成 `done` error，再移除 request file。
 
 Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|auto|review-attest|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS；`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
@@ -844,6 +844,8 @@ cortex skill restore <skill_id> --approved-by "$ACTOR"
 | worktree root | `<repo>-worktrees` sibling（由 repo root 推導，因此同樣 fail-closed） | `PSC_WORKTREE_ROOT` |
 
 Multi-issue workflow build 階段將以 `issue` 清單中最小號碼作為主 branch，並始終以 run repository 作為 `ScriptWorktreeCreator` 的 git來源，以確保 builder worktree 在對應 repo 池內建立。
+
+同一個 shared `coordinator root` 內，`jobs.json` 的 durable identity 取 **canonical state path**：resolve parent directory（non-strict）後再接回原始檔名，因此 symlink-directory spellings 共用同一把 transaction lock；state file 本身若是 symlink，則保留該檔名自己的 replace / sidecar 語意，不會跟著 target path 重新命名。
 
 **repo root 是 fail-closed 的（issue #612）**：`paths.repo_root()` 舊實作在 `PSC_REPO_ROOT` 未宣告時退回 `Path.cwd()`，而 manager daemon 的 `WorkingDirectory` 正是 operator 的真實 checkout——於是任何解析不出目標 repo 的呼叫都不是失敗，而是**靜默落在錯的樹上**（實測形態：相對 spec 路徑使 `complete_tick` 對真實 repo 跑 `git fetch --no-tags origin main`；同一族還有 `worktree_reclaim` 的 `git worktree remove --force`／`prune` 這類寫入動作）。現行契約：
 
