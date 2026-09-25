@@ -1,0 +1,1 @@
+Wave R 整合交付：由 operator 合併 cortex 已產出但卡在 pipeline 的 8 個實作 PR（#954 #986 #991 #998 #1018 #1027 #1049 #1050），並補上 review 修正——planning publication 拒收非正規化 governed path、delivery journal lock fd 加 `O_CLOEXEC` 且控制流程例外不改寫、retry-review／retry-card／retry-build 先落裁決 evidence 再重置 run、#862 legacy 模擬對齊 #966 revision CAS。
