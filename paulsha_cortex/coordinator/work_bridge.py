@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Mapping
@@ -53,6 +54,42 @@ from .planning import (
 )
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
 from .workflow import MODEL_CHAIN_PERSONAS, validate_ship_stage_transition
+
+
+MAIN_SYNC_UNAVAILABLE_REASON = "main-sync-unavailable"
+MAIN_SYNC_PROBE_TIMEOUT_SECONDS = 15.0
+MAIN_SYNC_FULL_OBJECT_ID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+
+
+@dataclass
+class MainSyncProbeStageOutcome:
+    stage: str
+    argv: tuple[str, ...]
+    returncode: int | None
+    stdout: bytes
+    stderr: bytes
+    error_kind: str | None = None
+
+
+@dataclass
+class MainSyncProbe:
+    candidate: str
+    main_head: str
+    merge_base: str
+    relation: str
+    conflict_paths: tuple[str, ...] = ()
+    path_classification: str | None = None
+    raw: dict[str, MainSyncProbeStageOutcome] | None = None
+
+
+@dataclass
+class MainSyncProbeFailure:
+    candidate: str
+    stage: str
+    returncode: int | None
+    error_kind: str
+    main_head: str | None
+    raw: dict[str, MainSyncProbeStageOutcome]
 
 
 def extract_model_chain_override(args: Mapping[str, object]) -> dict[str, dict[str, str]] | None:
@@ -603,6 +640,588 @@ def _write_json_evidence(root: Path, category: str, payload: dict) -> dict[str, 
     return {"ref": str(target), "hash": digest}
 
 
+def _main_sync_output_bytes(value: object) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="surrogateescape")
+    return str(value).encode("utf-8", errors="surrogateescape")
+
+
+def _main_sync_object_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if MAIN_SYNC_FULL_OBJECT_ID_RE.fullmatch(normalized) is None:
+        return None
+    return normalized
+
+
+def _run_main_sync_stage(
+    *,
+    worktree: Path,
+    stage: str,
+    argv: tuple[str, ...],
+    runner: Callable[..., object],
+    timeout_seconds: float,
+) -> MainSyncProbeStageOutcome:
+    command = ("git", "-C", str(worktree), *argv)
+    try:
+        completed = runner(
+            list(command),
+            shell=False,
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return MainSyncProbeStageOutcome(
+            stage=stage,
+            argv=command,
+            returncode=None,
+            stdout=_main_sync_output_bytes(exc.stdout),
+            stderr=_main_sync_output_bytes(exc.stderr),
+            error_kind="timeout",
+        )
+    except OSError as exc:
+        return MainSyncProbeStageOutcome(
+            stage=stage,
+            argv=command,
+            returncode=None,
+            stdout=b"",
+            stderr=str(exc).encode("utf-8", errors="replace"),
+            error_kind="launch-failed",
+        )
+    return MainSyncProbeStageOutcome(
+        stage=stage,
+        argv=command,
+        returncode=int(getattr(completed, "returncode", 1)),
+        stdout=_main_sync_output_bytes(getattr(completed, "stdout", b"")),
+        stderr=_main_sync_output_bytes(getattr(completed, "stderr", b"")),
+    )
+
+
+def _main_sync_failure(
+    *,
+    candidate: str,
+    stage: str,
+    outcome: MainSyncProbeStageOutcome,
+    error_kind: str,
+    raw: dict[str, MainSyncProbeStageOutcome],
+    main_head: str | None,
+) -> MainSyncProbeFailure:
+    return MainSyncProbeFailure(
+        candidate=candidate,
+        stage=stage,
+        returncode=outcome.returncode,
+        error_kind=error_kind,
+        main_head=main_head,
+        raw=dict(raw),
+    )
+
+
+def _main_sync_command_failure_kind(stage: str, outcome: MainSyncProbeStageOutcome) -> str:
+    if outcome.error_kind is not None:
+        return outcome.error_kind
+    text = (
+        f"{outcome.stdout.decode('utf-8', errors='replace')}\n"
+        f"{outcome.stderr.decode('utf-8', errors='replace')}"
+    ).lower()
+    if stage == "merge-tree" and (
+        outcome.returncode == 129 or "unknown option" in text or "usage:" in text
+    ):
+        return "unsupported-option"
+    return "command-failed"
+
+
+def _parse_main_sync_merge_tree(
+    outcome: MainSyncProbeStageOutcome,
+) -> tuple[str, tuple[str, ...]]:
+    separator = outcome.stdout.find(b"\0")
+    if separator <= 0:
+        raise ValueError("merge-tree output missing tree separator")
+    tree_oid = _main_sync_object_id(
+        outcome.stdout[:separator].decode("ascii", errors="strict")
+    )
+    if tree_oid is None:
+        raise ValueError("merge-tree tree object malformed")
+    remainder = outcome.stdout[separator + 1 :]
+    if outcome.returncode == 0:
+        if remainder:
+            raise ValueError("clean merge-tree output carried trailing records")
+        return tree_oid, ()
+    if outcome.returncode != 1:
+        raise ValueError("merge-tree output parsed for unexpected returncode")
+    if not remainder:
+        return tree_oid, ()
+    parts = remainder.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    if any(part == b"" for part in parts):
+        raise ValueError("merge-tree conflicted file list malformed")
+    return tree_oid, tuple(
+        part.decode("utf-8", errors="surrogateescape") for part in parts
+    )
+
+
+def _git_show_text(
+    worktree: Path,
+    *,
+    revision: str,
+    path: str,
+    runner: Callable[..., object],
+    timeout_seconds: float,
+) -> str | None:
+    outcome = _run_main_sync_stage(
+        worktree=worktree,
+        stage="path-classifier",
+        argv=("show", f"{revision}:{path}"),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    if outcome.error_kind is not None or outcome.returncode != 0:
+        return None
+    try:
+        return outcome.stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+
+def _split_unreleased_section(text: str) -> tuple[str, str, str] | None:
+    match = re.search(r"(?ms)^## \[Unreleased\]\s*(.*?)(?=^## |\Z)", text)
+    if match is None:
+        return None
+    return text[: match.start(1)], match.group(1), text[match.end(1) :]
+
+
+def _is_changelog_top_insert_conflict(
+    *,
+    worktree: Path,
+    merge_base: str,
+    candidate: str,
+    main_head: str,
+    runner: Callable[..., object],
+    timeout_seconds: float,
+) -> bool:
+    base_text = _git_show_text(
+        worktree,
+        revision=merge_base,
+        path="CHANGELOG.md",
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    candidate_text = _git_show_text(
+        worktree,
+        revision=candidate,
+        path="CHANGELOG.md",
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    main_text = _git_show_text(
+        worktree,
+        revision=main_head,
+        path="CHANGELOG.md",
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    if base_text is None or candidate_text is None or main_text is None:
+        return False
+    base_parts = _split_unreleased_section(base_text)
+    candidate_parts = _split_unreleased_section(candidate_text)
+    main_parts = _split_unreleased_section(main_text)
+    if base_parts is None or candidate_parts is None or main_parts is None:
+        return False
+    base_prefix, base_body, base_suffix = base_parts
+    candidate_prefix, candidate_body, candidate_suffix = candidate_parts
+    main_prefix, main_body, main_suffix = main_parts
+    return bool(
+        candidate_prefix == main_prefix == base_prefix
+        and candidate_suffix == main_suffix == base_suffix
+        and candidate_body != base_body
+        and main_body != base_body
+        and candidate_body.endswith(base_body)
+        and main_body.endswith(base_body)
+    )
+
+
+def _classify_main_sync_conflicts(
+    *,
+    worktree: Path,
+    merge_base: str,
+    candidate: str,
+    main_head: str,
+    conflict_paths: tuple[str, ...],
+    runner: Callable[..., object],
+    timeout_seconds: float,
+) -> str:
+    if len(conflict_paths) != 1:
+        return "multiple-conflicts"
+    if conflict_paths[0] == "CHANGELOG.md" and _is_changelog_top_insert_conflict(
+        worktree=worktree,
+        merge_base=merge_base,
+        candidate=candidate,
+        main_head=main_head,
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    ):
+        return "changelog-top-insert"
+    return "conflict"
+
+
+def _probe_main_sync(
+    *,
+    worktree: Path,
+    candidate: str,
+    runner: Callable[..., object] = subprocess.run,
+    timeout_seconds: float = MAIN_SYNC_PROBE_TIMEOUT_SECONDS,
+) -> MainSyncProbe | MainSyncProbeFailure:
+    raw: dict[str, MainSyncProbeStageOutcome] = {}
+    candidate_resolve = _run_main_sync_stage(
+        worktree=worktree,
+        stage="candidate-resolve",
+        argv=("rev-parse", "--verify", "--quiet", candidate),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    raw[candidate_resolve.stage] = candidate_resolve
+    if candidate_resolve.error_kind is not None or candidate_resolve.returncode != 0:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=candidate_resolve.stage,
+            outcome=candidate_resolve,
+            error_kind=_main_sync_command_failure_kind(
+                candidate_resolve.stage, candidate_resolve
+            ),
+            raw=raw,
+            main_head=None,
+        )
+    resolved_candidate = candidate_resolve.stdout.decode(
+        "ascii", errors="replace"
+    ).strip().lower()
+    candidate_validate = _run_main_sync_stage(
+        worktree=worktree,
+        stage="candidate-validate",
+        argv=("cat-file", "-t", resolved_candidate),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    raw[candidate_validate.stage] = candidate_validate
+    if candidate_validate.error_kind is not None or candidate_validate.returncode != 0:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=candidate_validate.stage,
+            outcome=candidate_validate,
+            error_kind=_main_sync_command_failure_kind(
+                candidate_validate.stage, candidate_validate
+            ),
+            raw=raw,
+            main_head=None,
+        )
+    candidate_oid = _main_sync_object_id(resolved_candidate)
+    if candidate_oid is None or candidate_oid != candidate.lower():
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=candidate_validate.stage,
+            outcome=candidate_validate,
+            error_kind="bad-sha",
+            raw=raw,
+            main_head=None,
+        )
+    if candidate_validate.stdout.decode("utf-8", errors="replace").strip() != "commit":
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=candidate_validate.stage,
+            outcome=candidate_validate,
+            error_kind="non-commit",
+            raw=raw,
+            main_head=None,
+        )
+
+    fetch = _run_main_sync_stage(
+        worktree=worktree,
+        stage="fetch",
+        argv=("fetch", "--quiet", "--no-tags", "origin", "main"),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    raw[fetch.stage] = fetch
+    if fetch.error_kind is not None or fetch.returncode != 0:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=fetch.stage,
+            outcome=fetch,
+            error_kind=_main_sync_command_failure_kind(fetch.stage, fetch),
+            raw=raw,
+            main_head=None,
+        )
+
+    fetch_head_resolve = _run_main_sync_stage(
+        worktree=worktree,
+        stage="fetch-head-resolve",
+        argv=("rev-parse", "--verify", "--quiet", "FETCH_HEAD"),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    raw[fetch_head_resolve.stage] = fetch_head_resolve
+    if fetch_head_resolve.error_kind is not None or fetch_head_resolve.returncode != 0:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=fetch_head_resolve.stage,
+            outcome=fetch_head_resolve,
+            error_kind=_main_sync_command_failure_kind(
+                fetch_head_resolve.stage, fetch_head_resolve
+            ),
+            raw=raw,
+            main_head=None,
+        )
+    resolved_main_head = fetch_head_resolve.stdout.decode(
+        "ascii", errors="replace"
+    ).strip().lower()
+    fetch_head_validate = _run_main_sync_stage(
+        worktree=worktree,
+        stage="fetch-head-validate",
+        argv=("cat-file", "-t", resolved_main_head),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    raw[fetch_head_validate.stage] = fetch_head_validate
+    if fetch_head_validate.error_kind is not None or fetch_head_validate.returncode != 0:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=fetch_head_validate.stage,
+            outcome=fetch_head_validate,
+            error_kind=_main_sync_command_failure_kind(
+                fetch_head_validate.stage, fetch_head_validate
+            ),
+            raw=raw,
+            main_head=None,
+        )
+    main_head = _main_sync_object_id(resolved_main_head)
+    if main_head is None:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=fetch_head_validate.stage,
+            outcome=fetch_head_validate,
+            error_kind="bad-sha",
+            raw=raw,
+            main_head=None,
+        )
+    if fetch_head_validate.stdout.decode("utf-8", errors="replace").strip() != "commit":
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=fetch_head_validate.stage,
+            outcome=fetch_head_validate,
+            error_kind="non-commit",
+            raw=raw,
+            main_head=None,
+        )
+
+    merge_base = _run_main_sync_stage(
+        worktree=worktree,
+        stage="merge-base",
+        argv=("merge-base", candidate_oid, main_head),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    raw[merge_base.stage] = merge_base
+    if merge_base.error_kind is not None or merge_base.returncode != 0:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=merge_base.stage,
+            outcome=merge_base,
+            error_kind=_main_sync_command_failure_kind(merge_base.stage, merge_base),
+            raw=raw,
+            main_head=main_head,
+        )
+    merge_base_oid = _main_sync_object_id(
+        merge_base.stdout.decode("ascii", errors="replace")
+    )
+    if merge_base_oid is None:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=merge_base.stage,
+            outcome=merge_base,
+            error_kind="output-malformed",
+            raw=raw,
+            main_head=main_head,
+        )
+    if merge_base_oid == main_head:
+        return MainSyncProbe(
+            candidate=candidate_oid,
+            main_head=main_head,
+            merge_base=merge_base_oid,
+            relation="in-sync",
+            raw=dict(raw),
+        )
+
+    merge_tree = _run_main_sync_stage(
+        worktree=worktree,
+        stage="merge-tree",
+        argv=(
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+            f"--merge-base={merge_base_oid}",
+            candidate_oid,
+            main_head,
+        ),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    raw[merge_tree.stage] = merge_tree
+    if merge_tree.error_kind is not None or merge_tree.returncode not in {0, 1}:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=merge_tree.stage,
+            outcome=merge_tree,
+            error_kind=_main_sync_command_failure_kind(merge_tree.stage, merge_tree),
+            raw=raw,
+            main_head=main_head,
+        )
+    path_parser = MainSyncProbeStageOutcome(
+        stage="path-parser",
+        argv=merge_tree.argv,
+        returncode=merge_tree.returncode,
+        stdout=merge_tree.stdout,
+        stderr=merge_tree.stderr,
+    )
+    raw[path_parser.stage] = path_parser
+    try:
+        _tree_oid, conflict_paths = _parse_main_sync_merge_tree(merge_tree)
+    except ValueError:
+        raw[path_parser.stage] = MainSyncProbeStageOutcome(
+            stage=path_parser.stage,
+            argv=path_parser.argv,
+            returncode=path_parser.returncode,
+            stdout=path_parser.stdout,
+            stderr=path_parser.stderr,
+            error_kind="output-malformed",
+        )
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=path_parser.stage,
+            outcome=raw[path_parser.stage],
+            error_kind="output-malformed",
+            raw=raw,
+            main_head=main_head,
+        )
+    if merge_tree.returncode == 0:
+        return MainSyncProbe(
+            candidate=candidate_oid,
+            main_head=main_head,
+            merge_base=merge_base_oid,
+            relation="clean-behind",
+            raw=dict(raw),
+        )
+    return MainSyncProbe(
+        candidate=candidate_oid,
+        main_head=main_head,
+        merge_base=merge_base_oid,
+        relation="conflict",
+        conflict_paths=conflict_paths,
+        path_classification=_classify_main_sync_conflicts(
+            worktree=worktree,
+            merge_base=merge_base_oid,
+            candidate=candidate_oid,
+            main_head=main_head,
+            conflict_paths=conflict_paths,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+        ),
+        raw=dict(raw),
+    )
+
+
+def _main_sync_probe_payload(
+    probe: MainSyncProbe | MainSyncProbeFailure,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema": "cortex-main-sync-probe/v1",
+        "candidate": probe.candidate,
+        "main_head": probe.main_head,
+    }
+    if isinstance(probe, MainSyncProbeFailure):
+        payload.update(
+            {
+                "outcome": "failure",
+                "stage": probe.stage,
+                "returncode": probe.returncode,
+                "error_kind": probe.error_kind,
+            }
+        )
+        return payload
+    payload.update(
+        {
+            "outcome": probe.relation,
+            "merge_base": probe.merge_base,
+            "conflict_paths": list(probe.conflict_paths),
+            "path_classification": probe.path_classification,
+        }
+    )
+    return payload
+
+
+def _main_sync_stop_result(
+    *,
+    state_root: Path,
+    probe: MainSyncProbe | MainSyncProbeFailure,
+) -> dict[str, object]:
+    payload = _main_sync_probe_payload(probe)
+    evidence = _write_json_evidence(state_root, "main-sync-probe", payload)
+    if isinstance(probe, MainSyncProbeFailure):
+        reason = MAIN_SYNC_UNAVAILABLE_REASON
+    elif probe.relation == "clean-behind":
+        reason = "candidate-behind-main"
+    else:
+        reason = "candidate-conflicts-with-main"
+    return {
+        "trusted": True,
+        "status": "needs_human",
+        "head": probe.candidate,
+        "commit_id": probe.candidate,
+        "reason": reason,
+        "main_sync": payload,
+        **evidence,
+    }
+
+
+def _delivery_closure_phase(
+    *, state_root: Path, run_id: str, candidate: str
+) -> str | None:
+    journal_path = state_root / "delivery-journal.json"
+    if journal_path.is_symlink() or not journal_path.is_file():
+        return None
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    rows = journal.get("runs") if isinstance(journal, dict) else None
+    row = rows.get(run_id) if isinstance(rows, dict) else None
+    ship = row.get("ship") if isinstance(row, dict) else None
+    phase = ship.get("phase") if isinstance(ship, dict) else None
+    if (
+        phase in {"merged", "done"}
+        and ship.get("head") == candidate
+        and isinstance(ship.get("merge_commit"), str)
+    ):
+        return str(phase)
+    return None
+
+
+def _should_probe_main_sync(*, run, state_root: Path, candidate: str) -> bool:
+    terminal_refresh = (
+        run.current_phase == "ship" and getattr(run, "status", None) == "done"
+    )
+    if terminal_refresh:
+        return False
+    return _delivery_closure_phase(
+        state_root=state_root, run_id=run.run_id, candidate=candidate
+    ) is None
+
+
 def _pr_metadata(run) -> dict[str, object]:
     issues = []
     for ref in run.issue_refs:
@@ -849,6 +1468,42 @@ def _require_pristine_ship_workspace(worktree: Path, *, branch: str, candidate: 
         raise RuntimeError("manager ship workspace is not pristine")
 
 
+def _sync_ship_workspace_origin(*, source_repo: Path, worktree: Path) -> None:
+    source_remote = subprocess.run(
+        ["git", "-C", str(source_repo), "remote", "get-url", "origin"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    upstream = source_remote.stdout.strip() if source_remote.returncode == 0 else ""
+    if not upstream:
+        return
+    worktree_remote = subprocess.run(
+        ["git", "-C", str(worktree), "remote", "get-url", "origin"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if worktree_remote.returncode == 0 and worktree_remote.stdout.strip() == upstream:
+        return
+    if worktree_remote.returncode == 0:
+        updated = subprocess.run(
+            ["git", "-C", str(worktree), "remote", "set-url", "origin", upstream],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        updated = subprocess.run(
+            ["git", "-C", str(worktree), "remote", "add", "origin", upstream],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+    if updated.returncode != 0:
+        raise RuntimeError("manager ship workspace origin sync failed")
+
+
 def _reset_ship_workspace(worktree: Path, *, branch: str, candidate: str) -> bool:
     """把一棵**既有的** ship 工作區打回 `candidate` 的原狀；做不到就回 False。
 
@@ -964,6 +1619,7 @@ def _manager_ship_workspace(
         if reusable and _reset_ship_workspace(
             target, branch=branch, candidate=candidate
         ):
+            _sync_ship_workspace_origin(source_repo=source, worktree=target)
             return target
         if not job_workspace.is_job_clone(target):
             # 認不出這是什麼就**不刪**（#478 的爆炸半徑教訓）。這條路徑只該在
@@ -973,6 +1629,7 @@ def _manager_ship_workspace(
     if creator is None:
         creator = seams.ScriptWorktreeCreator(repo=source, wt_root=pool, base="main")
     created = Path(creator.create(branch, job_id=workspace_id, base_sha=candidate))
+    _sync_ship_workspace_origin(source_repo=source, worktree=created)
     _require_pristine_ship_workspace(created, branch=branch, candidate=candidate)
     return created
 
@@ -1897,6 +2554,8 @@ def build_production_ship_validator(
     now: Callable[[], float] = time.time,
     snapshot_path: str | Path | None = None,
     workspace_creator=None,
+    probe_runner: Callable[..., object] = subprocess.run,
+    probe_timeout_seconds: float = MAIN_SYNC_PROBE_TIMEOUT_SECONDS,
 ):
     """Bind review completion to the authenticated, resumable delivery state machine.
 
@@ -2027,6 +2686,32 @@ def build_production_ship_validator(
             }
         metadata = _pr_metadata(run)
         metadata_path = _metadata_file(state_root, run, metadata)
+        should_probe_main_sync = _should_probe_main_sync(
+            run=run,
+            state_root=state_root,
+            candidate=candidate,
+        )
+        if should_probe_main_sync:
+            probe = _probe_main_sync(
+                worktree=worktree,
+                candidate=candidate,
+                runner=probe_runner,
+                timeout_seconds=probe_timeout_seconds,
+            )
+            if isinstance(probe, MainSyncProbeFailure) or probe.relation != "in-sync":
+                return _main_sync_stop_result(state_root=state_root, probe=probe)
+
+        def post_preflight_main_sync() -> dict[str, object] | None:
+            probe = _probe_main_sync(
+                worktree=worktree,
+                candidate=candidate,
+                runner=probe_runner,
+                timeout_seconds=probe_timeout_seconds,
+            )
+            if isinstance(probe, MainSyncProbeFailure) or probe.relation != "in-sync":
+                return _main_sync_stop_result(state_root=state_root, probe=probe)
+            return None
+
         pr_numbers = []
         for ref in run.pr_refs:
             prefix = f"{run.repo}#"
@@ -2062,6 +2747,9 @@ def build_production_ship_validator(
                     reason="pr-preflight-blocked",
                     next_action="resume-after-preflight-fix",
                 )
+            second_probe = post_preflight_main_sync()
+            if second_probe is not None:
+                return second_probe
             _push_exact_candidate(
                 registry=registry,
                 run=run,
@@ -2125,42 +2813,50 @@ def build_production_ship_validator(
             run=run,
             authority=authority,
         )
-        existing = _run_exact_candidate_preflight(
-            worktree=worktree,
-            branch=branch,
-            candidate=candidate,
-            command=load_preflight_command(),
-            request=PreflightRequest(
-                pr_number=number,
-                skip_tests=_candidate_skip_tests_request(
-                    worktree=worktree, candidate=candidate, now=now
-                ),
-            ),
-            runner=runner,
-            now=now,
-        )
-        if not existing.passed or existing.head != candidate:
-            return _preflight_result_evidence(
-                state_root=state_root,
-                run=run,
-                candidate=candidate,
-                stage="existing-pr",
-                preflight=existing,
-                status="needs_human",
-                reason="pr-preflight-blocked",
-                next_action="resume-after-preflight-fix",
-            )
-
-        _push_exact_candidate(
-            registry=registry,
-            run=run,
-            authority=authority,
+        closure_only = terminal_refresh or _delivery_closure_phase(
             state_root=state_root,
-            worktree=worktree,
-            branch=branch,
+            run_id=run.run_id,
             candidate=candidate,
-            runner=runner,
-        )
+        ) in {"merged", "done"}
+        if not closure_only:
+            existing = _run_exact_candidate_preflight(
+                worktree=worktree,
+                branch=branch,
+                candidate=candidate,
+                command=load_preflight_command(),
+                request=PreflightRequest(
+                    pr_number=number,
+                    skip_tests=_candidate_skip_tests_request(
+                        worktree=worktree, candidate=candidate, now=now
+                    ),
+                ),
+                runner=runner,
+                now=now,
+            )
+            if not existing.passed or existing.head != candidate:
+                return _preflight_result_evidence(
+                    state_root=state_root,
+                    run=run,
+                    candidate=candidate,
+                    stage="existing-pr",
+                    preflight=existing,
+                    status="needs_human",
+                    reason="pr-preflight-blocked",
+                    next_action="resume-after-preflight-fix",
+                )
+            second_probe = post_preflight_main_sync()
+            if second_probe is not None:
+                return second_probe
+            _push_exact_candidate(
+                registry=registry,
+                run=run,
+                authority=authority,
+                state_root=state_root,
+                worktree=worktree,
+                branch=branch,
+                candidate=candidate,
+                runner=runner,
+            )
         from . import work_actions
         from . import review as review_evidence
 

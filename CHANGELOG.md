@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#987 main-probe RED regressions**：新增 bare-origin RED regressions，固定 clean-behind Candidate 目前仍會誤進 preflight／push／建 PR，以及 `origin/main` fetch 不可用時 `resume` 仍誤回 `delivery-in-progress`；本票只交付 failing regression tests，尚未接 production main probe。
+- **#987 main-probe gate**：ship validator 現在會在 Manager-owned ship clone 內以 bounded direct git probe `origin/main`，於 preflight 前與必要 push 前重讀 main；只有 Candidate 已含最新 M 時才可進 preflight／push／建 PR。`merge-tree --write-tree --name-only --no-messages -z` 改走 NUL-safe path parser，clean-behind 與 conflict 會在 preflight 前 fail-closed；fetch／merge-base／merge-tree／path-parser failure 會寫入 content-addressed `main-sync-probe` evidence，持久化 `candidate`／`stage`／`returncode`／`error_kind`／`main_head`，並讓 `main-sync-unavailable` stop 與 operator resume 可讀回同一份證據。
 - **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
 - **#966 Yellow plan review 完整性**：將 T6 既有文件交付項目明列為 `documentation`，對齊 accepted plan 的 `artifact_classes`；產品驗收範圍不變。
 - **#1040 driving-cortex resume 範例**：移除 resume 不接受的 `--expected-run-id`，補上唯讀核對 repo/work item/唯一 ongoing run 的步驟，並讓 retry-build 範例明示必需的 exact Candidate。

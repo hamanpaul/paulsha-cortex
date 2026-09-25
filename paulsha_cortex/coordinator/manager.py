@@ -12466,6 +12466,68 @@ def apply_workflow_action(
                 raise ValueError("ship validator completion binding invalid")
         return str(status), normalized
 
+    def delivery_needs_human_update(
+        *,
+        current,
+        card_id: str,
+        candidate: str | None,
+        trusted: dict[str, object],
+        source: str,
+    ) -> tuple[str, tuple[str, ...], object, dict[str, object]]:
+        delivery_reason = str(trusted.get("reason") or "delivery-needs-human")
+        main_sync = trusted.get("main_sync")
+        evidence_ref = trusted.get("ref")
+        evidence_hash = trusted.get("hash")
+        context: dict[str, object] = {}
+        evidence_refs: tuple[str, ...] = ()
+        updated_evidence_refs = current.evidence_refs
+        result: dict[str, object] = {}
+        if isinstance(main_sync, dict):
+            context["main_sync"] = json.dumps(
+                {
+                    key: main_sync.get(key)
+                    for key in (
+                        "candidate",
+                        "stage",
+                        "returncode",
+                        "error_kind",
+                        "main_head",
+                    )
+                    if key in main_sync
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if isinstance(evidence_ref, str) and evidence_ref:
+                evidence_refs = (evidence_ref,)
+                updated_evidence_refs = tuple(
+                    dict.fromkeys((*current.evidence_refs, evidence_ref))
+                )
+                result["evidence_ref"] = evidence_ref
+            if isinstance(evidence_hash, str) and len(evidence_hash) == 64:
+                context["main_sync_evidence_hash"] = evidence_hash
+                result["evidence_hash"] = evidence_hash
+            result["main_sync"] = dict(main_sync)
+        return (
+            delivery_reason,
+            updated_evidence_refs,
+            diagnostic_reason(
+                "delivery-needs-human",
+                "ship validator 判定交付需要人工介入："
+                f"{delivery_reason}",
+                source=source,
+                evidence_refs=evidence_refs,
+                run_id=current.run_id,
+                work_id=current.work_id,
+                card=card_id,
+                candidate=candidate,
+                delivery_reason=delivery_reason,
+                **context,
+            ),
+            result,
+        )
+
     if action == "refresh-completion":
         if not trusted_terminal:
             raise ValueError("workflow completion refresh is internal to terminal polling")
@@ -12588,27 +12650,30 @@ def apply_workflow_action(
                         "reason": "delivery-in-progress",
                     }
                 if status == "needs_human":
-                    delivery_reason = trusted.get("reason") or "delivery-needs-human"
+                    (
+                        delivery_reason,
+                        evidence_refs,
+                        needs_human_reason,
+                        result_fields,
+                    ) = delivery_needs_human_update(
+                        current=current,
+                        card_id=card_id,
+                        candidate=current.candidate_head,
+                        trusted=trusted,
+                        source="manager.apply_workflow_action:advance-ship",
+                    )
                     updated = registry._manager_update_workflow_run(
                         run_id,
                         facets=("needs_human",),
                         gate_status="running",
-                        needs_human_reason=diagnostic_reason(
-                            "delivery-needs-human",
-                            "ship validator 判定交付需要人工介入："
-                            f"{delivery_reason}",
-                            source="manager.apply_workflow_action:advance-ship",
-                            run_id=run_id,
-                            work_id=current.work_id,
-                            card=card_id,
-                            candidate=current.candidate_head,
-                            delivery_reason=str(delivery_reason),
-                        ),
+                        evidence_refs=evidence_refs,
+                        needs_human_reason=needs_human_reason,
                     )
                     return {
                         "run_id": updated.run_id,
                         "current_phase": updated.current_phase,
                         "reason": delivery_reason,
+                        **result_fields,
                     }
                 refs = {item.kind: item for item in current.gate_refs}
                 review_kind = trusted["review_kind"]
@@ -12820,6 +12885,8 @@ def apply_workflow_action(
         # 診斷 invariant：下面兩條會把 run 推進 needs_human 的分支各自帶上理由，
         # 交給同一個 `_manager_update_workflow_run` 呼叫寫入（見結尾）。
         facets_reason = None
+        facets_evidence_refs = current.evidence_refs
+        result_fields: dict[str, object] = {}
         if current.current_phase == "review" and phase_done and next_phase == "ship":
             if ship_validator is None:
                 next_phase = "review"
@@ -12884,15 +12951,17 @@ def apply_workflow_action(
                     next_phase = "review"
                     gate_status = "running"
                     facets = ("needs_human",)
-                    facets_reason = diagnostic_reason(
-                        "delivery-needs-human",
-                        "ship validator 判定交付需要人工介入："
-                        f"{trusted.get('reason') or 'delivery-needs-human'}",
-                        source="manager.apply_workflow_action:advance-phase",
-                        run_id=run_id,
-                        work_id=current.work_id,
-                        card=card_id,
+                    (
+                        _delivery_reason,
+                        facets_evidence_refs,
+                        facets_reason,
+                        result_fields,
+                    ) = delivery_needs_human_update(
+                        current=current,
+                        card_id=card_id,
                         candidate=candidate,
+                        trusted=trusted,
+                        source="manager.apply_workflow_action:advance-phase",
                     )
         updated = registry._manager_update_workflow_run(
             run_id,
@@ -12920,6 +12989,7 @@ def apply_workflow_action(
             candidate_head=candidate,
             verified_head=verified,
             facets=facets,
+            evidence_refs=facets_evidence_refs,
             status=(
                 "done"
                 if current.current_phase == "review"
@@ -13010,7 +13080,12 @@ def apply_workflow_action(
                 )
             )
         )
-        return {"run_id": updated.run_id, "current_phase": updated.current_phase, "reason": reason}
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": reason,
+            **result_fields,
+        }
     if action != "start":
         raise ValueError(f"unsupported workflow action: {action}")
 
