@@ -286,6 +286,19 @@ def _add_late_malformed_github_pr_status(payload: dict[str, object]) -> None:
     )
 
 
+def _append_qualifying_pr_source(payload: dict[str, object]) -> None:
+    payload["work_items"][0]["sources"].append(
+        _source(
+            source_id=f"github_pr:{REPO}#{PR_NUMBER}",
+            kind="github_pr",
+            ref=f"{REPO}#{PR_NUMBER}",
+            revision="github:pr:9",
+            status="closed",
+            provider=f"github:{REPO}",
+        )
+    )
+
+
 def test_exact_remote_merge_proof_prefers_archived_authority(tmp_path: Path) -> None:
     expected_path = _write_snapshot(
         tmp_path / "archived-only.json",
@@ -424,6 +437,60 @@ def test_reconcilable_archive_seam_preserves_late_github_pr_status_error(
     seam_payload = _snapshot_payload()
     _add_late_malformed_github_pr_status(seam_payload)
     seam_snapshot = _write_snapshot(tmp_path / "with-seam.json", seam_payload)
+
+    with pytest.raises(AuthorityValidationError) as seam_excinfo:
+        _load(seam_snapshot)
+
+    expected_contract = (
+        "canonical github_pr lifecycle status invalid",
+        "row-malformed",
+        REPO,
+        None,
+        None,
+        "status",
+    )
+    assert (
+        control_excinfo.value.base_message,
+        control_excinfo.value.reason_code,
+        control_excinfo.value.repo,
+        control_excinfo.value.work_id,
+        control_excinfo.value.provider_id,
+        control_excinfo.value.field,
+    ) == expected_contract
+    assert (
+        seam_excinfo.value.base_message,
+        seam_excinfo.value.reason_code,
+        seam_excinfo.value.repo,
+        seam_excinfo.value.work_id,
+        seam_excinfo.value.provider_id,
+        seam_excinfo.value.field,
+    ) == expected_contract
+
+
+def test_reconcilable_archive_seam_preserves_malformed_status_with_late_pr_proof(
+    tmp_path: Path,
+) -> None:
+    control_payload = _snapshot_payload(
+        include_local_active=False,
+        include_pr_source=False,
+    )
+    _add_late_malformed_github_pr_status(control_payload)
+    _append_qualifying_pr_source(control_payload)
+    control_snapshot = _write_snapshot(
+        tmp_path / "no-seam-late-proof.json",
+        control_payload,
+    )
+
+    with pytest.raises(AuthorityValidationError) as control_excinfo:
+        _load(control_snapshot)
+
+    seam_payload = _snapshot_payload(include_pr_source=False)
+    _add_late_malformed_github_pr_status(seam_payload)
+    _append_qualifying_pr_source(seam_payload)
+    seam_snapshot = _write_snapshot(
+        tmp_path / "with-seam-late-proof.json",
+        seam_payload,
+    )
 
     with pytest.raises(AuthorityValidationError) as seam_excinfo:
         _load(seam_snapshot)
