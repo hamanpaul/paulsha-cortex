@@ -688,8 +688,6 @@ def _delivery_journal_entry(
 def _delivery_journal_publication_events(
     value: object, *, field: str
 ) -> dict[str, dict[str, Any]]:
-    if value is None:
-        return {}
     if not isinstance(value, dict):
         raise ValueError(f"{field} malformed")
     normalized: dict[str, dict[str, Any]] = {}
@@ -764,12 +762,15 @@ def _delivery_journal_payload(
             or not isinstance(row.get("workflow_step_ids"), list)
         ):
             raise ValueError("work run record malformed")
-        events = _delivery_journal_publication_events(
-            row.get(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD),
-            field=f"work run record {key} publication events",
-        )
-        if events:
-            row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD] = events
+        if _DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD in row:
+            events = _delivery_journal_publication_events(
+                row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD],
+                field=f"work run record {key} publication events",
+            )
+            if events:
+                row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD] = events
+            else:
+                row.pop(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD, None)
         else:
             row.pop(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD, None)
     return normalized

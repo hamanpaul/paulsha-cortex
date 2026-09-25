@@ -1,1 +1,1 @@
-- `work_actions._load_runs/_save_runs` 現在以固定 sibling lock、revision＋raw-byte digest baseline 與確認後 reread 保護 `delivery-journal.json`，stale overwrite、direct publication forgery 與 uncertain crash outcome 都會 fail-closed。
+- `work_actions._load_runs/_save_runs` 現在以固定 sibling lock、revision＋raw-byte digest baseline 與確認後 reread 保護 `delivery-journal.json`；顯式 `publication_events: null` 會視為 malformed current journal 並 fail-closed，stale overwrite、direct publication forgery 與 uncertain crash outcome 也都會 fail-closed。

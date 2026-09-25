@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#983 delivery journal conditional commit**：`work_actions._load_runs/_save_runs` 現在以固定 sibling lock、revision＋raw-byte digest baseline 與確認後 reread 保護 `delivery-journal.json`；stale full-file overwrite、直接偽造 publication event、以及 crash window 的 uncertain outcome 都會 fail-closed，並新增 focused race／unknown replay 測試。
+- **#983 delivery journal conditional commit**：`work_actions._load_runs/_save_runs` 現在以固定 sibling lock、revision＋raw-byte digest baseline 與確認後 reread 保護 `delivery-journal.json`；顯式 `publication_events: null` 會視為 malformed current journal 並 fail-closed，stale full-file overwrite、直接偽造 publication event、以及 crash window 的 uncertain outcome 也都會 fail-closed，並新增 focused race／unknown replay 測試。
 - **#977 Manager merged-run finalizer 規劃**：新增 accepted spec／design／todo 與唯一 work item，明確定義前置 API freeze、CompletionRecord／outcome／Registry 次序和 crash/re-entry 驗收；本次僅規劃，尚未實作 completion recovery。
 - **#961 Yellow plan review 完整性**：將既有 T6 文件交付項目明列為 `documentation`，使 accepted plan 的 task 文字符合 `artifact_classes`；驗收範圍不變。
 - **#1037 ship audit 適用性**：沒有 mapped OpenSpec 且 workflow 未宣告 `openspec-archive` 時，只稽核 `policy-commit`；mapped change 或明確宣告 archive 卡仍要求真實、通過身分與 ancestry 驗證的 archive job/evidence。

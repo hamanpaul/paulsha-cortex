@@ -198,6 +198,29 @@ def test_load_and_save_fail_closed_on_malformed_current_journal(
     assert journal_path.read_text(encoding="utf-8") == malformed
 
 
+def test_load_and_save_fail_closed_on_explicit_null_publication_events(
+    tmp_path: Path,
+) -> None:
+    journal_path = tmp_path / "delivery-journal.json"
+    _initialize_run(journal_path)
+
+    state = work_actions._load_runs(journal_path)
+    state["runs"]["run-b"] = _run_row("run-b")
+
+    malformed_payload = _raw_journal(journal_path)
+    malformed_payload["runs"]["run-a"]["publication_events"] = None
+    malformed = json.dumps(malformed_payload, sort_keys=True) + "\n"
+    journal_path.write_text(malformed, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="publication events malformed"):
+        work_actions._load_runs(journal_path)
+
+    with pytest.raises(ValueError, match="publication events malformed"):
+        work_actions._save_runs(journal_path, state)
+
+    assert journal_path.read_text(encoding="utf-8") == malformed
+
+
 def test_lock_is_stable_across_processes_and_times_out_when_held(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
