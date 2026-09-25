@@ -5214,6 +5214,39 @@ def _terminal_parse_diagnostics(
     )
 
 
+def _gate_terminal_stop_diagnostics(
+    job: Mapping[str, object],
+    raw: Mapping[str, object],
+) -> terminal_contract.TerminalDiagnostics:
+    observed = job.get("subject_head")
+    if not isinstance(observed, str) or not observed:
+        observed = job.get("dispatch_head")
+    phase = str(job.get("workflow_phase"))
+    label = "verification" if phase == "verify" else "review"
+    diagnostics_rows: dict[str, object] = {}
+    if phase == "verify":
+        diagnostics_rows["summary"] = raw.get("summary")
+        details = raw.get("details")
+        if isinstance(details, dict):
+            for key, value in details.items():
+                diagnostics_rows[f"details.{key}"] = value
+        else:
+            diagnostics_rows["details"] = details
+    else:
+        diagnostics_rows["reason"] = raw.get("reason")
+        for index, finding in enumerate(raw.get("findings", [])):
+            diagnostics_rows[f"findings[{index}]"] = finding
+    return terminal_contract.TerminalDiagnostics(
+        job_id=str(job.get("job_id")),
+        observed_head=observed if isinstance(observed, str) and observed else None,
+        reason=(
+            f"workflow {label} terminal reported non-passing status: {raw.get('status')}"
+        ),
+        validation_path="$.status",
+        model_diagnostics=_model_terminal_diagnostics({"diagnostics": diagnostics_rows}),
+    )
+
+
 # #261 R2：會實際跑確定性 gate 的 phase。這些 phase 的 `passed` 必須有 manager 獨立
 # 產生的 gate ledger 背書；plan card 不改動 candidate、不跑 gate，故不在此列。
 # #313：verify 亦不在此列——verification 卡以 review-only 沙箱啟動，
@@ -5656,6 +5689,77 @@ def _declared_card_terminal_status(job: Mapping[str, object]) -> str | None:
         return None
     status = raw.get("status")
     return status if isinstance(status, str) and status else None
+
+
+def _explicit_stop_terminal_reports_valid(reports: object) -> bool:
+    if not isinstance(reports, list):
+        return False
+    for item in reports:
+        if not isinstance(item, dict) or set(item) != {"path", "body"}:
+            return False
+        path = item.get("path")
+        body = item.get("body")
+        if (
+            not isinstance(path, str)
+            or not path.strip()
+            or not isinstance(body, str)
+            or not body.strip()
+        ):
+            return False
+    return True
+
+
+def _explicit_stop_gate_terminal(job: Mapping[str, object]) -> dict[str, object] | None:
+    """Recognize verify/review non-passing terminals that must land as explicit stops."""
+
+    phase = job.get("workflow_phase")
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or phase not in {"verify", "review"}
+    ):
+        return None
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return None
+    if not _explicit_stop_terminal_reports_valid(raw.get("reports")):
+        return None
+    if phase == "verify":
+        details = raw.get("details")
+        if (
+            set(raw) != {"schema_version", "kind", "status", "summary", "details", "reports"}
+            or type(raw.get("schema_version")) is not int
+            or raw.get("schema_version") != 1
+            or raw.get("kind") != "workflow-verification-result"
+            or raw.get("status") not in terminal_contract.NON_PASSING_STATUSES
+            or not isinstance(raw.get("summary"), str)
+            or not str(raw["summary"]).strip()
+            or not (
+                isinstance(details, dict)
+                or (isinstance(details, str) and details.strip())
+            )
+        ):
+            return None
+        return raw
+    if (
+        set(raw) not in (
+            {"schema_version", "kind", "status", "reason", "findings", "reports"},
+            {"schema_version", "kind", "status", "reason", "findings", "reports", "authority_hashes"},
+        )
+        or type(raw.get("schema_version")) is not int
+        or raw.get("schema_version") != 1
+        or raw.get("kind") != "workflow-review-result"
+        or raw.get("status") not in terminal_contract.NON_PASSING_STATUSES
+        or not isinstance(raw.get("reason"), str)
+        or not str(raw["reason"]).strip()
+        or not isinstance(raw.get("findings"), list)
+        or any(not isinstance(item, dict) for item in raw["findings"])
+    ):
+        return None
+    return raw
 
 
 def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
@@ -12206,6 +12310,80 @@ def resume_workflow_run(
             "reason": "card-terminal-explicit-stop",
             "declared_status": declared_status,
             # #261 R4／D6：唯讀診斷與授權欄位分離——模型講的話同樣不授權。
+            "terminal_diagnostics": diagnostics.as_dict(),
+        }
+    raw_explicit_stop = _explicit_stop_gate_terminal(job)
+    if raw_explicit_stop is not None:
+        diagnostics = _gate_terminal_stop_diagnostics(job, raw_explicit_stop)
+        declared_status = str(raw_explicit_stop["status"])
+        label = "verification" if step.phase == "verify" else "review"
+        model_text = diagnostics.model_diagnostics_text()
+        reason_code = (
+            "verification-terminal-explicit-stop"
+            if step.phase == "verify"
+            else "review-terminal-explicit-stop"
+        )
+        log_path = job.get("log_path")
+        evidence_refs = (log_path,) if isinstance(log_path, str) and log_path else ()
+        try:
+            _discard_reviewer_sandbox(
+                job,
+                coordinator_root=coordinator_root,
+                require_candidate_unchanged=True,
+            )
+        except ValueError as exc:
+            current = registry.get_workflow_run(run.run_id)
+            updated = registry._manager_update_workflow_run(
+                run.run_id,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                gate_status="running",
+                needs_human_reason=diagnostic_reason(
+                    "reviewer-candidate-drift",
+                    f"{label} terminal 明示要求停止（status={declared_status}），"
+                    f"但 reviewer sandbox 回收失敗：{summarize_exception(exc)}",
+                    source="manager._poll_workflow_job:explicit-stop",
+                    evidence_refs=evidence_refs,
+                    run_id=run.run_id,
+                    work_id=run.work_id,
+                    job_id=str(job["job_id"]),
+                    card=step.card,
+                    declared_status=declared_status,
+                    phase=step.phase,
+                ),
+            )
+            return {
+                "run_id": run.run_id,
+                "current_phase": updated.current_phase,
+                "job_id": job["job_id"],
+                "reason": "reviewer-candidate-drift",
+                "declared_status": declared_status,
+                "terminal_diagnostics": diagnostics.as_dict(),
+            }
+        current = registry.get_workflow_run(run.run_id)
+        updated = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                reason_code,
+                f"{label} terminal 明示要求停止（status={declared_status}）："
+                f"{model_text}",
+                source="manager._poll_workflow_job:explicit-stop",
+                evidence_refs=evidence_refs,
+                run_id=run.run_id,
+                work_id=run.work_id,
+                job_id=str(job["job_id"]),
+                card=step.card,
+                declared_status=declared_status,
+                phase=step.phase,
+            ),
+        )
+        return {
+            "run_id": run.run_id,
+            "current_phase": updated.current_phase,
+            "job_id": job["job_id"],
+            "reason": reason_code,
+            "declared_status": declared_status,
             "terminal_diagnostics": diagnostics.as_dict(),
         }
     if _malformed_workflow_card_terminal(job):
