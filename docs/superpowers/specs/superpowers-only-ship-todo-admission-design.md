@@ -34,7 +34,7 @@ GitHub #1051 記錄的正式 run `workflow-52d048b72adbd5cae06f` 已完成 build
 3. 舊 verify／review evidence、workflow job binding、delivery binding、merge authorization 分別依其 authority/input hash 定義有效性；未有明文等價證明即失效，需從 exact candidate 重做必要 gates。
 4. 既存 PR 只作 GitHub 遠端事實採信，不因 resume 重送 push/create/merge。外部 outcome unknown 時停在 needs-human，由 operator 使用明確 evidence 裁決。
 
-這些前提牽涉多個 durable owner 和不可逆 GitHub side effects；現有證據尚不足以證明同 run resume 或新 run adoption 哪個完整可行。因此 R4 不得由單一 admission PR 以假定取代實作研究，須拆出 recovery 子票，凍結可執行的 CAS／invalidation／no-duplicate protocol 後再進件。
+這些前提牽涉多個 durable owner 和不可逆 GitHub side effects；現有證據尚不足以證明同 run resume 或新 run adoption 哪個完整可行。因此 R4 不由 admission child 解決；由 recovery child [#1055](https://github.com/hamanpaul/paulsha-cortex/issues/1055) 凍結可執行的 CAS／invalidation／no-duplicate protocol，且 hard-depends on [#1054](https://github.com/hamanpaul/paulsha-cortex/issues/1054) 的來源 admission contract。
 
 ### D5 — 相關 issue 的適用邊界
 
@@ -56,26 +56,27 @@ GitHub #1051 記錄的正式 run `workflow-52d048b72adbd5cae06f` 已完成 build
 | `orchestration` | 2 | 多個 workflow card、Manager、Monitor/WorkAuthority owner 和外部 GitHub facts 交互。 |
 | **Total** | **10 / Red** | 依 `planning.compute_sizing_score()` 的現行五維算法。 |
 
-## Proposed issue-backed split
+## Issue-backed child allocation
 
-這是待 maintainer 依 R1–R5 與正式 sizing gate 建票的建議，不代表 child issue 已建立，也不授權進入 intake。
+父票 #1051 維持 draft／10 Red；以下兩張 child issue 已建立但都尚未 intake 或實作。本分配不把 parent packet 改成 accepted，也不擴張 #1051 authority。
 
-### Child A — build 前唯一 Todo admission 與零來源 diagnostic
+### Child A — issue #1054：build 前唯一 Todo admission 與零來源 diagnostic
 
-- 建議標題：`fix(work): Superpowers-only work 在 builder dispatch 前要求唯一 Todo source`。
+- Issue：[#1054 — fix(work): Superpowers-only work 在 Builder dispatch 前要求唯一 Todo source](https://github.com/hamanpaul/paulsha-cortex/issues/1054)。
 - Owner：Manager admission/diagnostic；WorkAuthority／Monitor snapshot 提供唯一 source of truth。
+- Dependency：none；本票不處理既有 candidate／PR 的 recovery。
 - 範圍：D2–D3 的 owner/mapping 規則與 build admission gate；對 zero/multiple mapping 分類並提供有效 next action；ship 保留 backstop。missing-Todo repair 要求 owner 先發布具 issue provenance、matching `work_item` metadata 與具體 tasks 的 canonical workstream `todo.md`，再以 `--kind path` link 已存在 source，等 fresh snapshot 才能通過。
-- 驗收：#1051 AC1–2 與 AC4 前五種 source/build admission case；測試 Superpowers-only／無 OpenSpec／唯一 Todo／缺 Todo／多 Todo／偽造或尚未反映的 path link，證明缺少或歧義時 builder job 為零，正式 source 尚未進 fresh snapshot 時不放行。
+- 驗收：#1054 的五項 acceptance criteria，對齊 #1051 AC1–2 與 AC4 前五種 source/build admission case；測試 Superpowers-only／無 OpenSpec／唯一 Todo／缺 Todo／多 Todo／偽造或尚未反映的 path link，證明缺少或歧義時 builder job 為零，正式 source 尚未進 fresh snapshot 時不放行。
 - 邊界：不處理既有 candidate／PR run 的 claim era rebase、delivery journal recovery 或 merge 重入。
 
-### Child B — authority 前進後 exact Candidate／PR 的正式恢復
+### Child B — issue #1055：authority 前進後 exact Candidate／PR 的正式恢復
 
-- 建議標題：`fix(recovery): Todo authority 加入後安全恢復已有 candidate 與 PR 的 run`。
+- Issue：[#1055 — fix(recovery): Todo authority 加入後安全恢復已有 Candidate 與 PR 的 run](https://github.com/hamanpaul/paulsha-cortex/issues/1055)。
 - Owner：Manager recovery，與 claim/evidence/delivery owners 協作；以 GitHub PR facts 作遠端事實。
-- Dependency：硬依賴 Child A 已落地的 unique-Todo admission 與 zero/multiple diagnostic contract；Child B 不重開 source classification 或改寫 Child A 的 gate。
+- Dependency：Blocked by #1054。硬依賴 Child A 已落地的 unique-Todo admission 與 zero/multiple diagnostic contract；本票不重開 source classification 或改寫 Child A 的 gate。
 - 範圍：#983 型 stopped run；在 WorkAuthority、claim/run、evidence、delivery journal 和 GitHub PR 之間定義同 run CAS 或新 run adoption 的唯一合法方式。
-- 驗收：#1051 AC3 及 AC4 的既有 candidate/PR case；驗證 old/new revisions、claim CAS、證據失效／重驗範圍、exact candidate／PR head、無重複 push／PR／merge，並在 unknown/conflict 時明確 fail-closed。
-- 邊界：不處理 PR #1049 的 CHANGELOG/main conflict（#972／#973），不手改正式 registry、journal 或 source revision。
+- 驗收：#1055 的五項 acceptance criteria，對齊 #1051 AC3 及 AC4 的既有 candidate/PR case；驗證 old/new revisions、claim CAS、證據失效／重驗範圍、exact candidate／PR head、無重複 push／PR／merge，並在 unknown/conflict 時明確 fail-closed。
+- 邊界：不處理 PR #1049 的 main conflict（#972／#973），不手改正式 registry、journal 或 source revision。
 
 ## Risks
 

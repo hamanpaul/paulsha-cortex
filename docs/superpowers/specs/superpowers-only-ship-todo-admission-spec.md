@@ -35,6 +35,12 @@ Accepted Superpowers spec、design、plan 是規劃 authority；它們本身不�
 
 測試 MUST 覆蓋 Superpowers-only、無 OpenSpec、有唯一 Todo、缺 Todo、偽造 path link、以及已有 PR 的停機恢復。它們 MUST 驗證 missing／ambiguous Todo 在 builder dispatch 前停止、path 僅在 WorkAuthority 正式確認後可用、claim／evidence 的 CAS 與失效範圍正確，並確認不會重複 push／PR／merge。測試不得連線到真 GitHub、改動正式 registry／journal 或使用真實 issue run。
 
+## Child allocation
+
+- **#1054** owns R1–R3 and the new-work admission cases: Manager admission/diagnostic consumes WorkAuthority/Monitor as source of truth; no dependency on the recovery work.
+- **#1055** owns R4 and the existing-candidate/PR recovery case: Manager recovery works with claim/evidence/delivery owners and GitHub PR facts. It is **Blocked by #1054** and consumes the admission/diagnostic contract delivered there.
+- Both child issues remain separate implementation authorities under parent #1051. This draft stays `status: draft`, 10/Red; creating the child issues does not accept or intake this packet.
+
 ## Authority boundaries
 
 - Manager 擁有 intake、planning/build admission、ship admission 及受支援的 run transition。
