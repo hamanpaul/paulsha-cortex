@@ -244,6 +244,28 @@ def test_main_sync_probe_rejects_abbreviated_candidate_sha(tmp_path: Path) -> No
     assert probe.main_head is None
 
 
+def test_main_sync_probe_accepts_uppercase_full_candidate_sha(tmp_path: Path) -> None:
+    canonical = "a" * 40
+    probe = work_bridge._probe_main_sync(
+        worktree=tmp_path,
+        candidate=canonical.upper(),
+        runner=_SequencedProbeRunner(
+            _probe_success_prefix(
+                candidate=canonical,
+                main_head=canonical,
+                merge_base=canonical,
+            )
+        ),
+        timeout_seconds=0.1,
+    )
+
+    assert isinstance(probe, work_bridge.MainSyncProbe)
+    assert probe.candidate == canonical
+    assert probe.main_head == canonical
+    assert probe.merge_base == canonical
+    assert probe.relation == "in-sync"
+
+
 def test_main_sync_probe_rejects_non_commit_candidate_object(tmp_path: Path) -> None:
     repo = _init_probe_repo(tmp_path / "repo", files={"README.md": "demo\n"})
     blob = subprocess.run(

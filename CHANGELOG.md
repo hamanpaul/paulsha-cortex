@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **#987 main-probe regressions**：新增 `tests/test_main_probe_gate_987.py` bare-origin regressions，覆蓋 clean-behind Candidate 於 preflight／push／建 PR 前 fail-closed、`origin/main` fetch failure 會回 `main-sync-unavailable` 並在 operator `resume` 修復後重新 probe，以及 full candidate SHA 以大小寫不敏感比對維持 exact object-id gate。
 - **#987 main-probe gate**：ship validator 現在會在 Manager-owned ship clone 內以 bounded direct git probe `origin/main`，於 preflight 前與必要 push 前重讀 main；只有 Candidate 已含最新 M 時才可進 preflight／push／建 PR。`merge-tree --write-tree --name-only --no-messages -z` 改走 NUL-safe path parser，clean-behind 與 conflict 會在 preflight 前 fail-closed；fetch／merge-base／merge-tree／path-parser failure 會寫入 content-addressed `main-sync-probe` evidence，持久化 `candidate`／`stage`／`returncode`／`error_kind`／`main_head`，並讓 `main-sync-unavailable` stop 與 operator resume 可讀回同一份證據。重用既有 Manager ship workspace 時若來源 repo 已無有效 `origin`，現在也會先移除工作區殘留的 `origin`，避免 stale remote 被錯誤探測成 `in-sync`。
 - **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
 - **#966 Yellow plan review 完整性**：將 T6 既有文件交付項目明列為 `documentation`，對齊 accepted plan 的 `artifact_classes`；產品驗收範圍不變。
