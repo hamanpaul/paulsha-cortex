@@ -416,6 +416,10 @@ def test_canonical_state_path_collapses_symlinked_directory_spellings(tmp_path: 
         candidate=None,
     )
 
+    assert registry_module.canonical_state_path(alias_dir / "jobs.json") == actual_dir / "jobs.json"
+    assert registry_module.state_transaction_lock_path(alias_dir / "jobs.json") == (
+        actual_dir / "jobs.json.transaction.lock"
+    )
     assert direct.canonical_state_path == actual_dir / "jobs.json"
     assert aliased.canonical_state_path == direct.canonical_state_path
     assert aliased.state_transaction_lock_path == actual_dir / "jobs.json.transaction.lock"
@@ -428,6 +432,10 @@ def test_canonical_state_path_expands_home_spellings(
     monkeypatch.setenv("HOME", str(tmp_path))
     registry = JobRegistry(state_path="~/jobs.json")
 
+    assert registry_module.canonical_state_path("~/jobs.json") == tmp_path.resolve() / "jobs.json"
+    assert registry_module.state_transaction_lock_path("~/jobs.json") == (
+        tmp_path.resolve() / "jobs.json.transaction.lock"
+    )
     assert registry.canonical_state_path == tmp_path.resolve() / "jobs.json"
     assert registry.state_transaction_lock_path == (
         tmp_path.resolve() / "jobs.json.transaction.lock"
@@ -466,6 +474,10 @@ def test_state_file_symlink_replacement_keeps_target_unchanged(tmp_path: Path) -
         state="running",
     )
 
+    assert registry_module.canonical_state_path(link_state) == link_dir.resolve() / "jobs-link.json"
+    assert registry_module.state_transaction_lock_path(link_state) == (
+        link_dir.resolve() / "jobs-link.json.transaction.lock"
+    )
     assert registry.canonical_state_path == link_dir.resolve() / "jobs-link.json"
     assert registry.state_transaction_lock_path == (
         link_dir.resolve() / "jobs-link.json.transaction.lock"

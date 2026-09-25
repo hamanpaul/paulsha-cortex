@@ -231,12 +231,13 @@ class _DurableStateSnapshot:
     size: int | None
 
 
-def _canonicalize_state_path(state_path: Path) -> Path:
+def canonical_state_path(state_path: str | Path) -> Path:
+    state_path = Path(state_path).expanduser()
     return state_path.parent.resolve(strict=False) / state_path.name
 
 
-def _state_transaction_lock_path(state_path: Path) -> Path:
-    return Path(f"{_canonicalize_state_path(state_path)}.transaction.lock")
+def state_transaction_lock_path(state_path: str | Path) -> Path:
+    return Path(f"{canonical_state_path(state_path)}.transaction.lock")
 
 
 def _state_revision(raw_bytes: bytes) -> str:
@@ -402,8 +403,8 @@ class JobRegistry:
         self._state_path = (
             Path(state_path).expanduser() if state_path is not None else _default_state_path()
         )
-        self.canonical_state_path = _canonicalize_state_path(self._state_path)
-        self.state_transaction_lock_path = _state_transaction_lock_path(self._state_path)
+        self.canonical_state_path = canonical_state_path(self._state_path)
+        self.state_transaction_lock_path = state_transaction_lock_path(self._state_path)
         self._seq_start = seq_start
         self._jobs: list[dict[str, Any]] = []
         self._slices: list[dict[str, Any]] = []
