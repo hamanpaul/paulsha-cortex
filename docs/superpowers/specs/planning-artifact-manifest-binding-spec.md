@@ -9,7 +9,7 @@ work_item: planning-artifact-manifest-binding
 
 - define 階段 planner 落檔的三種 planning kinds（spec／design／plan）MUST 恆被 governed-roots 檢查接受：`docs/superpowers/specs`
   只接受 `<base>-spec.md`／`<base>-design.md`，`docs/superpowers/plans` 只接受 `<base>.md`／`<base>-plan.md`，其中 `<base>` 只能是
-  `work_id`、`YYYY-MM-DD-<work_id>`，或 run authority 導出的合法 planning anchor slug；比對 MUST 使用精確 stem 文法、不得使用
+  `work_id`、`YYYY-MM-DD-<work_id>`，或由 `run.openspec_refs` 與同 work item 的 `docs/superpowers/workstreams/<slug>/todo.md` planning authority 導出的合法 planning anchor slug；比對 MUST 使用精確 stem 文法、不得使用
   substring glob，且 **不依賴** combo manifest 是否含 `brainstorming` 卡。
 - 既有 governed-roots 的其他拒絕條件 MUST 維持：絕對路徑、`..`、非 `.md`、`openspec/changes/<非本 work_id>/`、symlink 一律拒。
 - combo 卡片 outputs 宣告的其他路徑（`openspec/changes/<change>/{proposal,tasks}.md`、reports）行為不變。

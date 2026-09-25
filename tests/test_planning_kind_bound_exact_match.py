@@ -404,3 +404,28 @@ def test_planning_anchor_slugs_collects_and_filters_all_sources() -> None:
         "bbb-anchor",
         "zzz-anchor",
     )
+
+
+@pytest.mark.parametrize("combo_name", ("fix-standard", "small-fix", "feature-oneshot"))
+@pytest.mark.parametrize(
+    "path_value",
+    (
+        f"openspec/changes/{WORK_ID}/./proposal.md",
+        f"openspec/changes//{WORK_ID}/proposal.md",
+        f"openspec/changes/{WORK_ID}/proposal.md/",
+        f"docs/superpowers/specs/./{WORK_ID}-spec.md",
+    ),
+)
+def test_publish_rejects_non_canonical_governed_paths(
+    tmp_path: Path, combo_name: str, path_value: str
+) -> None:
+    allowed = _manifest_outputs(combo_name, task_slug=WORK_ID) + (
+        f"openspec/changes/{WORK_ID}/*",
+    )
+    with pytest.raises(ValueError, match="outside governed roots"):
+        manager._publish_planning_artifacts(
+            str(tmp_path),
+            [_artifact_row("spec", path_value)],
+            work_id=WORK_ID,
+            allowed_refs=allowed,
+        )

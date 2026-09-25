@@ -9175,6 +9175,8 @@ def _publish_planning_artifacts(
         if (
             relative.is_absolute()
             or ".." in relative.parts
+            # 等價但非正規化的字串（`./`、`//`、尾端 `/`）不得成為另一個 authority ref。
+            or relative.as_posix() != path_value
             or not (docs_bound or openspec_bound)
             or (docs_bound and not kind_bound)
             or (openspec_bound and not manifest_bound)
