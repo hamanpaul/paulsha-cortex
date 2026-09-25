@@ -2907,6 +2907,15 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
             "Do not claim archive, merge, issue closure, or done before Manager performs those "
             "actions. Commit or adopt a tested descendant Candidate."
         )
+    # 先落 content-addressed 裁決 evidence 再重置 run：evidence 寫入失敗時
+    # run 維持 needs_human，不會在缺裁決的情況下重派。
+    adjudication_evidence = _record_operator_adjudication(
+        run=run,
+        card="subagent-build",
+        args=args,
+        state_path=state_path,
+        now_epoch=now_epoch,
+    )
     updated = workflow_registry._manager_reset_workflow_for_retry_build(
         run.run_id,
         expected_candidate=expected_candidate.lower(),
@@ -2915,13 +2924,6 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         model_chain_override=model_chain_override,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
-    adjudication_evidence = _record_operator_adjudication(
-        run=run,
-        card="subagent-build",
-        args=args,
-        state_path=state_path,
-        now_epoch=now_epoch,
-    )
     return {
         "action": "retry-build",
         "adjudication_evidence": adjudication_evidence,
@@ -3278,6 +3280,18 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         workflow_registry,
         trigger=_RETRY_CARD_PHASE_TRIGGERS.get(run.current_phase),
     )
+    # #752／#755：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由
+    # `manager._operator_adjudications()` 讀回、進 retry_context 的
+    # `operator_adjudications` 鍵（bounded CLI、Manager-owned，非 candidate 內容）。
+    # 先落 content-addressed 裁決 evidence 再重置 run：evidence 寫入失敗時
+    # run 維持 needs_human，不會在缺裁決的情況下重派。
+    adjudication_evidence = _record_operator_adjudication(
+        run=run,
+        card=card,
+        args=args,
+        state_path=state_path,
+        now_epoch=now_epoch,
+    )
     updated = workflow_registry._manager_reset_workflow_for_retry_card(
         run.run_id,
         expected_run_id=expected_run_id,
@@ -3286,16 +3300,6 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         model_chain_override=model_chain_override,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
-    # #752／#755：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由
-    # `manager._operator_adjudications()` 讀回、進 retry_context 的
-    # `operator_adjudications` 鍵（bounded CLI、Manager-owned，非 candidate 內容）。
-    adjudication_evidence = _record_operator_adjudication(
-        run=run,
-        card=card,
-        args=args,
-        state_path=state_path,
-        now_epoch=now_epoch,
-    )
     return {
         "action": "retry-card",
         "adjudication_evidence": adjudication_evidence,
@@ -3445,12 +3449,8 @@ def _retry_review_action(
     retry_classification = _classify_retry(
         run, workflow_registry, trigger="review-handoff-failure"
     )
-    updated = workflow_registry._manager_reset_workflow_for_retry_review(
-        run.run_id,
-        expected_candidate=expected_candidate.lower(),
-        retry_classification=retry_classification.value,
-    )
-    updated = _recompute_and_persist_sizing(workflow_registry, updated)
+    # 先落 content-addressed 裁決 evidence 再重置 run：evidence 寫入失敗時
+    # run 維持 needs_human，不會在缺裁決的情況下重派。
     adjudication_evidence = _record_operator_adjudication(
         run=run,
         card=card,
@@ -3458,6 +3458,12 @@ def _retry_review_action(
         state_path=state_path,
         now_epoch=now_epoch,
     )
+    updated = workflow_registry._manager_reset_workflow_for_retry_review(
+        run.run_id,
+        expected_candidate=expected_candidate.lower(),
+        retry_classification=retry_classification.value,
+    )
+    updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
         "action": "retry-review",
         "adjudication_evidence": adjudication_evidence,

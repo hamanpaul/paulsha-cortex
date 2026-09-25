@@ -531,3 +531,36 @@ def test_work_reason_help_mentions_retry_review_operator_adjudication_limit() ->
 
     assert "retry-review" in reason.help
     assert "4000" in reason.help
+
+
+def test_retry_review_evidence_write_failure_keeps_run_needs_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot, _authority, registry, run = _review_fixture(tmp_path)
+
+    def _fail(*_args, **_kwargs):
+        raise OSError("evidence volume unavailable")
+
+    monkeypatch.setattr(work_actions, "_write_supersede_evidence", _fail)
+    with pytest.raises(OSError, match="evidence volume unavailable"):
+        work_actions.execute_work_action(
+            args={
+                "action": "retry-review",
+                "repo": REPO,
+                "work_id": WORK_ID,
+                "issue": 12,
+                "actor": "operator",
+                "expected_candidate": HEAD,
+                "reason": "accept the documented scope-bypass finding",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=tmp_path / "runs.json",
+            workflow_registry=registry,
+        )
+    unchanged = registry.get_workflow_run(run.run_id)
+    assert unchanged.facets == ("needs_human",)
+    assert (
+        next(step for step in unchanged.steps if step.phase == "review").gate_result
+        == "needs_human"
+    )
