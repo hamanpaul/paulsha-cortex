@@ -1,0 +1,1 @@
+#990 durable main-sync recovery context 規劃：發布 accepted spec/design/todo、OpenSpec 與唯一 work-item binding；依更新後 #988 typed contract 保存 invalid/abbreviated pre-validation C failure、M=null 且不曝光 retry-build；#987/#988/#989 完成前不進本票 intake 或實作。

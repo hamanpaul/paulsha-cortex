@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 - **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
+- **#990 durable main-sync recovery context 規劃**：發布 accepted spec／design／todo、OpenSpec 與唯一 work-item binding；依更新後 #988 contract 保存 invalid/abbreviated pre-validation C failure、M=null 且不曝光 retry-build；#987／#988／#989 完成前不進本票 intake 或實作。
 - **#966 Yellow plan review 完整性**：將 T6 既有文件交付項目明列為 `documentation`，對齊 accepted plan 的 `artifact_classes`；產品驗收範圍不變。
 - **#1040 driving-cortex resume 範例**：移除 resume 不接受的 `--expected-run-id`，補上唯讀核對 repo/work item/唯一 ongoing run 的步驟，並讓 retry-build 範例明示必需的 exact Candidate。
 - **#977 Manager merged-run finalizer 規劃**：新增 accepted spec／design／todo 與唯一 work item，明確定義前置 API freeze、CompletionRecord／outcome／Registry 次序和 crash/re-entry 驗收；本次僅規劃，尚未實作 completion recovery。
