@@ -302,28 +302,38 @@ def test_archive_reconciliation_is_order_independent_and_warns_once_per_load(
         tmp_path / "reversed.json",
         _snapshot_payload(reverse_sources=True),
     )
+    expected_warning = (
+        "reconciled remote archived OpenSpec authority to archived "
+        f"(repo={REPO}, work_id={WORK_ID}, openspec_ref={CHANGE})"
+    )
+
+    def assert_single_sanitized_warning() -> None:
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == claim.__name__ and record.levelno == logging.WARNING
+        ]
+        assert messages == [expected_warning]
+        assert str(tmp_path) not in messages[0]
+        assert "openspec/changes/" not in messages[0]
+        assert "docs/superpowers/" not in messages[0]
 
     with caplog.at_level(logging.WARNING, logger=claim.__name__):
         forward_authority = _load(forward)
-        reversed_authority = _load(reversed_order)
 
     assert forward_authority.source_revisions == expected.source_revisions
-    assert reversed_authority.source_revisions == expected.source_revisions
     assert work_authority_digest(forward_authority) == work_authority_digest(expected)
-    assert work_authority_digest(reversed_authority) == work_authority_digest(expected)
+    assert forward_authority.mapped_openspec == expected.mapped_openspec == (CHANGE,)
+    assert_single_sanitized_warning()
 
-    messages = [
-        record.getMessage()
-        for record in caplog.records
-        if REPO in record.getMessage()
-        and WORK_ID in record.getMessage()
-        and CHANGE in record.getMessage()
-    ]
-    assert len(messages) == 2
-    for message in messages:
-        assert str(tmp_path) not in message
-        assert "openspec/changes/" not in message
-        assert "docs/superpowers/" not in message
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=claim.__name__):
+        reversed_authority = _load(reversed_order)
+
+    assert reversed_authority.source_revisions == expected.source_revisions
+    assert work_authority_digest(reversed_authority) == work_authority_digest(expected)
+    assert reversed_authority.mapped_openspec == expected.mapped_openspec == (CHANGE,)
+    assert_single_sanitized_warning()
 
 
 @pytest.mark.parametrize(
