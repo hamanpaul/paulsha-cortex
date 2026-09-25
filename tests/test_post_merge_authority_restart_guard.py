@@ -337,6 +337,35 @@ def test_archive_reconciliation_is_order_independent_and_warns_once_per_load(
 
 
 @pytest.mark.parametrize(
+    "reverse_sources",
+    [False, True],
+    ids=["forward-order", "reversed-order"],
+)
+def test_fail_closed_archive_reconciliation_never_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    reverse_sources: bool,
+) -> None:
+    payload = _snapshot_payload(reverse_sources=reverse_sources)
+    _add_non_openspec_conflict(payload)
+    snapshot = _write_snapshot(tmp_path / f"conflict-{reverse_sources}.json", payload)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=claim.__name__),
+        pytest.raises(AuthorityValidationError) as excinfo,
+    ):
+        _load(snapshot)
+
+    _assert_conflict(excinfo)
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == claim.__name__ and record.levelno == logging.WARNING
+    ]
+    assert messages == []
+
+
+@pytest.mark.parametrize(
     "mutate",
     [
         _remove_pr_source,

@@ -824,6 +824,7 @@ def _authority_from_canonical_row(
         observed = semantic_sources.setdefault(key, {})
         observed[value] = observed.get(value, ()) + (source,)
     resolved_semantic_sources: dict[str, str] = {}
+    deferred_reconciliation_warnings: list[str] = []
     for key, observed in semantic_sources.items():
         if len(observed) == 1:
             resolved_semantic_sources[key] = next(iter(observed))
@@ -844,11 +845,8 @@ def _authority_from_canonical_row(
                 field="source_revisions",
             )
         resolved_semantic_sources[key] = resolved
-        logger.warning(
-            "reconciled remote archived OpenSpec authority to archived (repo=%s, work_id=%s, openspec_ref=%s)",
-            repo_label or "<redacted>",
-            work_id_label or "<redacted>",
-            _diagnostic_label(key[len(f'openspec:{repo}:') :]) or "<redacted>",
+        deferred_reconciliation_warnings.append(
+            _diagnostic_label(key[len(f"openspec:{repo}:") :]) or "<redacted>"
         )
     source_revisions = tuple(
         f"{source_id}@{resolved_semantic_sources[source_id]}"
@@ -861,6 +859,13 @@ def _authority_from_canonical_row(
             repo=repo_label,
             work_id=work_id_label,
             field="source_revisions",
+        )
+    for openspec_ref in deferred_reconciliation_warnings:
+        logger.warning(
+            "reconciled remote archived OpenSpec authority to archived (repo=%s, work_id=%s, openspec_ref=%s)",
+            repo_label or "<redacted>",
+            work_id_label or "<redacted>",
+            openspec_ref,
         )
     return WorkAuthority._verified(
         repo=repo,
