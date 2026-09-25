@@ -1504,3 +1504,17 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/main-probe-design.md'
     excludes: []
+  existing-pr-journal-authority-readback:
+    title: 'Existing Candidate PR journal authority read-back'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1070'
+      - kind: openspec
+        ref: 'existing-pr-journal-authority-readback'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/existing-pr-journal-authority-readback/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/existing-pr-journal-authority-readback-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/existing-pr-journal-authority-readback-design.md'
+    excludes: []

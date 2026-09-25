@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **#1070 既有 PR journal authority read-back 規劃**：新增 draft spec／design／todo、OpenSpec change 與唯一 work item binding；明確分開 #1069 唯讀 journal identity/revision 與 #1070 existing-row conditional reconciliation。#983 等硬依賴尚未 landed，未 intake 或實作。
+
 - **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
 - **#966 Yellow plan review 完整性**：將 T6 既有文件交付項目明列為 `documentation`，對齊 accepted plan 的 `artifact_classes`；產品驗收範圍不變。
 - **#1040 driving-cortex resume 範例**：移除 resume 不接受的 `--expected-run-id`，補上唯讀核對 repo/work item/唯一 ongoing run 的步驟，並讓 retry-build 範例明示必需的 exact Candidate。
