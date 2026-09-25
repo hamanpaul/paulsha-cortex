@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -49,6 +50,7 @@ REASON_AUTHORITY_NOT_STARTABLE = "authority-not-startable"
 REASON_AUTHORITY_NO_TODO_SOURCE = "authority-no-confirmed-todo-source"
 
 _UNSAFE_LABEL_PREFIXES = ("/", "~")
+logger = logging.getLogger(__name__)
 
 
 def _diagnostic_label(value: object, *, max_len: int = 200) -> str | None:
@@ -168,6 +170,74 @@ def semantic_source_revision(
             )
         return f"openspec:{repo}:{ref}", f"identity:{ref};state:{state}"
     return source_id, revision
+
+
+def _merged_remote_archive_resolution(
+    *,
+    repo: str,
+    key: str,
+    observed_sources: dict[str, tuple[dict, ...]],
+    confirmed_sources: tuple[dict, ...],
+    providers: dict,
+) -> str | None:
+    """Resolve the single allowed active→archived OpenSpec authority merge.
+
+    The canonical row normally treats any semantic-value conflict as malformed.
+    The only exception is #961's narrow post-merge convergence seam: the local
+    repo provider still reports an active OpenSpec source while the GitHub
+    terminal snapshot already reports the same ref as archived, and every
+    confirmed PR source has exact remote ancestry proof of a merge commit.
+    """
+
+    key_prefix = f"openspec:{repo}:"
+    if not key.startswith(key_prefix):
+        return None
+    ref = key[len(key_prefix) :]
+    active_value = f"identity:{ref};state:active"
+    archived_value = f"identity:{ref};state:archived"
+    if set(observed_sources) != {active_value, archived_value}:
+        return None
+
+    active_sources = observed_sources.get(active_value, ())
+    archived_sources = observed_sources.get(archived_value, ())
+    if not active_sources or not archived_sources:
+        return None
+
+    local_provider = f"repo:{repo}"
+    terminal_provider = f"github-terminal:{repo}"
+    if any(source.get("provider") != local_provider for source in active_sources):
+        return None
+    if any(source.get("provider") != terminal_provider for source in archived_sources):
+        return None
+
+    pr_source_ids: list[str] = []
+    for source in confirmed_sources:
+        if source.get("kind") != "github_pr":
+            continue
+        source_id = source.get("source_id")
+        status = str(source.get("status") or "").lower()
+        if not isinstance(source_id, str) or not source_id or status not in {"closed", "merged"}:
+            return None
+        pr_source_ids.append(source_id)
+    if not pr_source_ids:
+        return None
+
+    terminal = providers.get(terminal_provider)
+    if not isinstance(terminal, dict) or terminal.get("status") != "ok":
+        return None
+    observations = terminal.get("observations")
+    remote_prs = observations.get("remote_prs") if isinstance(observations, dict) else None
+    if not isinstance(remote_prs, list):
+        return None
+    for source_id in pr_source_ids:
+        matches = [
+            row
+            for row in remote_prs
+            if isinstance(row, dict) and row.get("source_id") == source_id
+        ]
+        if len(matches) != 1 or matches[0].get("merged_with_merge_commit") is not True:
+            return None
+    return archived_value
 
 
 @dataclass(frozen=True, init=False)
@@ -732,7 +802,7 @@ def _authority_from_canonical_row(
                 )
             todo_paths.append(ref)
     confirmed_todo = any(source.get("kind") in todo_kinds for source in confirmed)
-    semantic_sources: dict[str, str] = {}
+    semantic_sources: dict[str, dict[str, tuple[dict, ...]]] = {}
     for source in confirmed:
         source_id = source.get("source_id")
         source_revision = source.get("revision")
@@ -751,8 +821,21 @@ def _authority_from_canonical_row(
         if semantic is None:
             continue
         key, value = semantic
-        previous = semantic_sources.setdefault(key, value)
-        if previous != value:
+        observed = semantic_sources.setdefault(key, {})
+        observed[value] = observed.get(value, ()) + (source,)
+    resolved_semantic_sources: dict[str, str] = {}
+    for key, observed in semantic_sources.items():
+        if len(observed) == 1:
+            resolved_semantic_sources[key] = next(iter(observed))
+            continue
+        resolved = _merged_remote_archive_resolution(
+            repo=repo,
+            key=key,
+            observed_sources=observed,
+            confirmed_sources=tuple(confirmed),
+            providers=providers,
+        )
+        if resolved is None:
             raise AuthorityValidationError(
                 "confirmed semantic work authority revisions conflict",
                 reason_code=REASON_ROW_MALFORMED,
@@ -760,8 +843,16 @@ def _authority_from_canonical_row(
                 work_id=work_id_label,
                 field="source_revisions",
             )
+        resolved_semantic_sources[key] = resolved
+        logger.warning(
+            "reconciled remote archived OpenSpec authority to archived (repo=%s, work_id=%s, openspec_ref=%s)",
+            repo_label or "<redacted>",
+            work_id_label or "<redacted>",
+            _diagnostic_label(key[len(f'openspec:{repo}:') :]) or "<redacted>",
+        )
     source_revisions = tuple(
-        f"{source_id}@{semantic_sources[source_id]}" for source_id in sorted(semantic_sources)
+        f"{source_id}@{resolved_semantic_sources[source_id]}"
+        for source_id in sorted(resolved_semantic_sources)
     )
     if not source_revisions:
         raise AuthorityValidationError(

@@ -201,12 +201,24 @@ def _drop_remote_prs(payload: dict[str, object]) -> None:
     observations.pop("remote_prs", None)
 
 
+def _wrong_type_remote_prs(payload: dict[str, object]) -> None:
+    payload["providers"][f"github-terminal:{REPO}"]["observations"]["remote_prs"] = {
+        "source_id": f"github_pr:{REPO}#{PR_NUMBER}"
+    }
+
+
 def _mismatch_remote_pr_source_id(payload: dict[str, object]) -> None:
     payload["providers"][f"github-terminal:{REPO}"]["observations"]["remote_prs"] = [
         {
             **_default_remote_pr_row(),
             "source_id": f"github_pr:{REPO}#10",
         }
+    ]
+
+
+def _remote_pr_not_merged_with_merge_commit(payload: dict[str, object]) -> None:
+    payload["providers"][f"github-terminal:{REPO}"]["observations"]["remote_prs"] = [
+        {**_default_remote_pr_row(), "merged_with_merge_commit": False}
     ]
 
 
@@ -230,6 +242,10 @@ def _degrade_terminal_provider(payload: dict[str, object]) -> None:
     payload["providers"][f"github-terminal:{REPO}"]["status"] = "degraded"
 
 
+def _remove_terminal_provider(payload: dict[str, object]) -> None:
+    payload["providers"].pop(f"github-terminal:{REPO}")
+
+
 def _add_non_openspec_conflict(payload: dict[str, object]) -> None:
     payload["work_items"][0]["sources"].append(
         _source(
@@ -241,6 +257,20 @@ def _add_non_openspec_conflict(payload: dict[str, object]) -> None:
             provider=f"github:{REPO}",
         )
     )
+
+
+def _add_non_openspec_third_value_conflict(payload: dict[str, object]) -> None:
+    for status, revision in (("merged", "github:pr:9-merged"), ("open", "github:pr:9-open")):
+        payload["work_items"][0]["sources"].append(
+            _source(
+                source_id=f"github_pr:{REPO}#{PR_NUMBER}",
+                kind="github_pr",
+                ref=f"{REPO}#{PR_NUMBER}",
+                revision=revision,
+                status=status,
+                provider=f"github:{REPO}",
+            )
+        )
 
 
 def test_exact_remote_merge_proof_prefers_archived_authority(tmp_path: Path) -> None:
@@ -302,21 +332,29 @@ def test_archive_reconciliation_is_order_independent_and_warns_once_per_load(
         _remove_pr_source,
         _set_pr_open,
         _drop_remote_prs,
+        _wrong_type_remote_prs,
         _mismatch_remote_pr_source_id,
+        _remote_pr_not_merged_with_merge_commit,
         _duplicate_true_remote_pr_rows,
         _duplicate_mixed_remote_pr_rows,
+        _remove_terminal_provider,
         _degrade_terminal_provider,
         _add_non_openspec_conflict,
+        _add_non_openspec_third_value_conflict,
     ],
     ids=[
         "no-confirmed-pr-source",
         "pr-not-closed-or-merged",
         "remote-prs-missing",
+        "remote-prs-wrong-type",
         "remote-pr-source-id-mismatch",
+        "remote-pr-not-merge-commit-proven",
         "duplicate-remote-pr-rows-both-true",
         "duplicate-remote-pr-rows-mixed-true-false",
+        "terminal-provider-missing",
         "terminal-provider-not-ok",
         "non-openspec-conflict",
+        "non-openspec-third-value-conflict",
     ],
 )
 def test_ineligible_archive_reconciliation_preserves_conflict_error(

@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+- **#961 OpenSpec 遠端 archive authority reconciliation**：`coordinator/claim.py`
+  現在會先收集每個 semantic authority key 的所有 observed values，僅在同一個
+  `openspec:{repo}:{ref}` 同時看到本機 `active` 與 GitHub terminal `archived`
+  source，且每筆 confirmed PR 都有唯一、`merged_with_merge_commit is True` 的
+  remote ancestry 證據時，才收斂成 archived；其餘衝突維持既有
+  `AuthorityValidationError` fail-closed。同步補齊 deterministic／fail-closed
+  regression tests 與 unified work lifecycle 文件說明。
 - **#961 Yellow plan review 完整性**：將既有 T6 文件交付項目明列為 `documentation`，使 accepted plan 的 task 文字符合 `artifact_classes`；驗收範圍不變。
 - **#1037 ship audit 適用性**：沒有 mapped OpenSpec 且 workflow 未宣告 `openspec-archive` 時，只稽核 `policy-commit`；mapped change 或明確宣告 archive 卡仍要求真實、通過身分與 ancestry 驗證的 archive job/evidence。
 - **#885 fix-standard-archive-step-evidence**：fix-standard 現在可用唯一 Manager `openspec-archive`
