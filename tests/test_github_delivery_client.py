@@ -33,7 +33,8 @@ class PaginatedResult(Result):
 
 
 class FakeRunner:
-    def __init__(self):
+    def __init__(self, *, review_submitted_at: str = "1970-01-01T00:01:40Z"):
+        self.review_submitted_at = review_submitted_at
         self.calls = []
 
     def __call__(self, argv, **kwargs):
@@ -70,7 +71,7 @@ class FakeRunner:
                         "commit_id": HEAD,
                         "state": "COMMENTED",
                         "body": "clean",
-                        "submitted_at": "2026-07-17T00:00:00Z",
+                        "submitted_at": self.review_submitted_at,
                     }
                 ]]
             )
@@ -585,6 +586,30 @@ def test_merge_if_ready_does_not_merge_when_final_reread_blocks() -> None:
                 copilot_review_id=9,
                 copilot_requested_at_epoch=1,
             ),
+            _capability=_SHIP_CAPABILITY,
+        )
+    assert not any(call[0][:4] == ["gh", "pr", "merge", "7"] for call in runner.calls)
+
+
+def test_final_gate_rejects_remote_review_submitted_after_request_deadline() -> None:
+    runner = FakeRunner(review_submitted_at="1970-01-01T00:31:41Z")
+    client = GitHubDeliveryClient(runner=runner)
+    policy = DeliveryPolicy(
+        expected_head=HEAD,
+        required_closing_issues=(14,),
+        copilot_review_id=9,
+        copilot_requested_at_epoch=1_000.0,
+    )
+
+    # The decision may claim a timely submission at 1162; the final gate must
+    # evaluate the fresh remote review at 1901 against the 1900 deadline.
+    with pytest.raises(RuntimeError, match="copilot-current-head-review-missing"):
+        client.evaluate_final_gate(
+            repo="acme/demo",
+            pr_number=7,
+            change="unified-work-lifecycle",
+            policy=policy,
+            authority_digest="digest-1",
             _capability=_SHIP_CAPABILITY,
         )
     assert not any(call[0][:4] == ["gh", "pr", "merge", "7"] for call in runner.calls)

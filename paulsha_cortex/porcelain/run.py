@@ -59,6 +59,7 @@ def _add_work_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--failure-reason")
     parser.add_argument("--expected-candidate")
     parser.add_argument("--expected-run-id")
+    parser.add_argument("--card", help="retry-card 專用：指定要重派的 exact card ID")
     parser.add_argument("--reason")
     parser.add_argument(
         "--combo",
@@ -130,6 +131,9 @@ def _complete_args(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _work_args(args: argparse.Namespace) -> dict[str, Any]:
+    if args.card is not None and args.action != "retry-card":
+        raise ValueError("--card is only valid for retry-card")
+
     provided_names = (
         "issue",
         "kind",
@@ -148,6 +152,8 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
         "reviewer_executor",
         "reviewer_model",
     )
+    if args.action == "retry-card":
+        provided_names = provided_names + ("card",)
     # combo 只在 start／intake action 有意義（--combo 為 start／intake 專用
     # override，intake 內部等價於 start）；其餘 action 一律不送出，避免未經
     # 驗證的 combo 被夾帶進 manager（見 code review finding，
@@ -167,6 +173,8 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
         protected = {"action", "repo", "work_id"}
         if protected & set(extra):
             raise ValueError("work payload cannot override action/repo/work_id")
+        if args.card is not None and "card" in extra and extra["card"] != args.card:
+            raise ValueError("work payload card conflicts with --card")
         payload.update(extra)
     return payload
 
