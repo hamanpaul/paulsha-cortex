@@ -1,0 +1,1 @@
+- 新增 issue #1077 的 Monitor attempt ledger 規劃文件與獨立 OpenSpec change；產品實作仍待後續 review、sizing、正式 intake 與交付 gates。
