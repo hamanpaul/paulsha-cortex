@@ -15,7 +15,7 @@ artifact_classes:
 
 ## Boundary
 
-唯一 child owner [#862](https://github.com/hamanpaul/paulsha-cortex/issues/862)，`work_id: recovery-registry-receipt`；父項 #497；[spec](../../specs/recovery-registry-receipt-spec.md)／[design](../../specs/recovery-registry-receipt-design.md)。Root 已接受原四件加 own OpenSpec 四件，共八份內容，status=accepted；本輪只更新接受狀態，尚未正式發布、註冊/binding 或產品執行授權。唯一未來 production 檔是 `paulsha_cortex/coordinator/registry.py`；產品 tests/runbook/changelog 是將來 Cortex 實作交付責任，本輪不建立或改動它們。
+唯一 child owner [#862](https://github.com/hamanpaul/paulsha-cortex/issues/862)，`work_id: recovery-registry-receipt`；父項 #497；[spec](../../../docs/superpowers/specs/recovery-registry-receipt-spec.md)／[design](../../../docs/superpowers/specs/recovery-registry-receipt-design.md)。Root 已接受原四件加 own OpenSpec 四件，共八份內容，status=accepted；本輪只更新接受狀態，尚未正式發布、註冊/binding 或產品執行授權。唯一未來 production 檔是 `paulsha_cortex/coordinator/registry.py`；產品 tests/runbook/changelog 是將來 Cortex 實作交付責任，本輪不建立或改動它們。
 
 A→C→B→D2，D1→D2 是人工規劃骨架；A 只完成 registry AC，C/B/D 負責其餘 producer/consumer。舊 API None semantics、既有證據和母 S01–S13 均保留。root 2026-09-08 已裁決 OQ01/OQ02，確認八件 fresh review PASS 後正式接受內容。六份 consumer views 均應 accepted，但現行 accepted sizing 為8 Red；#831 的6 Yellow只作 loaded 後的條件投影，不能當派工依據。新增顯式 checkpoint 為 I09，原八組 AC 不刪，state=2 不降。現行算法對不完整材料反而降分，不得把 Yellow 數字當作 readiness。
 

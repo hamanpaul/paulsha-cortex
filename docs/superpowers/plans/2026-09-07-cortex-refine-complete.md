@@ -359,7 +359,7 @@ PatchMUD #37仍是外部producer gate，真人qualification核可若生效也需
   分工維持 A→C→B→D2、D1→D2，不冒稱 #833 已自動分解或替母票完成。
 - [Spec](../specs/recovery-registry-receipt-spec.md)、[design](../specs/recovery-registry-receipt-design.md)、
   [todo](../workstreams/recovery-registry-receipt/todo.md) 與
-  [own OpenSpec](../../../openspec/changes/recovery-registry-receipt/proposal.md) 皆為已審內容；
+  [own OpenSpec](../../../openspec/changes/archive/2026-09-22-recovery-registry-receipt/proposal.md) 皆為已審內容；
   [審查紀錄](../../../reports/review/refine-recovery-registry-20260907.md) 保留歷史草稿與接受後證據分帳。
 - I01–I09 保留 exact request/digest、全域 ID、CAS/ABA、prepared/complete、單 snapshot
   原子 commit、supersession/consumption、deep-copy/history、failure matrix 與顯式 checkpoint。

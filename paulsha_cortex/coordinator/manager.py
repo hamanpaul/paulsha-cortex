@@ -101,6 +101,7 @@ WORKFLOW_LANE_GATE_REASON = "workflow-lane-job"
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
 SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"})
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
+_PLANNING_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
 def _utcnow() -> str:
@@ -272,6 +273,19 @@ def _slice_for_job(registry, slice_id: str, job_id: str) -> dict | None:
     if slice_row.get("builder_job_id") != job_id:
         return None
     return slice_row
+
+
+def _is_unbound_launch_failed_build_job(registry, slice_id: str, job: dict) -> bool:
+    if registry is None or job.get("status") != "failed" or _is_workflow_lane_job(job):
+        return False
+    job_id = job.get("job_id")
+    if not isinstance(job_id, str) or _runtime_diagnostic_reason(job.get("runtime_diagnostic")) != "launch-failed":
+        return False
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return False
+    return slice_row.get("builder_job_id") != job_id
 
 
 def _slice_for_reviewer_job(registry, slice_id: str, job_id: str) -> dict | None:
@@ -1073,7 +1087,10 @@ def workflow_status_entry(
         run_id=getattr(run, "run_id", None),
     )
     try:
-        from .work_actions import _phase_recovery_actions
+        from .work_actions import (
+            _phase_recovery_actions,
+            blocking_findings_next_step_hint,
+        )
 
         next_actions = (
             *next_actions,
@@ -1083,6 +1100,16 @@ def workflow_status_entry(
                 if item not in next_actions
             ),
         )
+        if (
+            persisted_next_step_hint is None
+            and reason_code == "blocking-findings"
+            and "retry-review" in next_actions
+        ):
+            next_step_hint = blocking_findings_next_step_hint(
+                work_id=getattr(run, "work_id", None),
+                repo=getattr(run, "repo", None),
+                candidate=getattr(run, "candidate_head", None),
+            )
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         pass
     try:
@@ -2474,6 +2501,8 @@ def complete_tick(
                 slice_row = _slice_for_job(registry, slice_id, job_id)
                 if slice_row is not None and slice_row.get("reviewer_job_id"):
                     continue
+                if slice_row is None and _is_unbound_launch_failed_build_job(registry, slice_id, job):
+                    continue
             repo_root = _repo_root_for_slice_row(slice_row)
             state_path = getattr(registry, "_state_path", None)
             coordinator_root = Path(state_path).parent if state_path is not None else None
@@ -3459,6 +3488,7 @@ def _validated_brainstorm_planning_authority(
         if step.persona == "planner" and step.phase == "plan"
         for pattern in step.outputs
     )
+    anchor_slugs = _planning_anchor_slugs(run)
     persisted = {item.ref: item for item in run.planning_authority}
     scanned: dict[str, PlanningArtifactAuthority] = {}
     workspace = Path(run.workspace_root).resolve()
@@ -3515,10 +3545,20 @@ def _validated_brainstorm_planning_authority(
             )
         existing = persisted.get(ref)
         if existing is None:
-            if not (
-                any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns)
-                or planning_kind_bound(kind, ref, run.work_id)
-            ):
+            docs_family = Path(ref).parts[:3] in {
+                ("docs", "superpowers", "specs"),
+                ("docs", "superpowers", "plans"),
+            }
+            if docs_family:
+                bound = planning_kind_bound(
+                    kind,
+                    ref,
+                    run.work_id,
+                    anchor_slugs=anchor_slugs,
+                )
+            else:
+                bound = any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns)
+            if not bound:
                 raise ValueError(
                     f"workflow brainstorm artifact outside planner outputs: ref={ref} "
                     f"(declared={','.join(declared_patterns) or '-'})"
@@ -5189,6 +5229,39 @@ def _terminal_parse_diagnostics(
     )
 
 
+def _gate_terminal_stop_diagnostics(
+    job: Mapping[str, object],
+    raw: Mapping[str, object],
+) -> terminal_contract.TerminalDiagnostics:
+    observed = job.get("subject_head")
+    if not isinstance(observed, str) or not observed:
+        observed = job.get("dispatch_head")
+    phase = str(job.get("workflow_phase"))
+    label = "verification" if phase == "verify" else "review"
+    diagnostics_rows: dict[str, object] = {}
+    if phase == "verify":
+        diagnostics_rows["summary"] = raw.get("summary")
+        details = raw.get("details")
+        if isinstance(details, dict):
+            for key, value in details.items():
+                diagnostics_rows[f"details.{key}"] = value
+        else:
+            diagnostics_rows["details"] = details
+    else:
+        diagnostics_rows["reason"] = raw.get("reason")
+        for index, finding in enumerate(raw.get("findings", [])):
+            diagnostics_rows[f"findings[{index}]"] = finding
+    return terminal_contract.TerminalDiagnostics(
+        job_id=str(job.get("job_id")),
+        observed_head=observed if isinstance(observed, str) and observed else None,
+        reason=(
+            f"workflow {label} terminal reported non-passing status: {raw.get('status')}"
+        ),
+        validation_path="$.status",
+        model_diagnostics=_model_terminal_diagnostics({"diagnostics": diagnostics_rows}),
+    )
+
+
 # #261 R2：會實際跑確定性 gate 的 phase。這些 phase 的 `passed` 必須有 manager 獨立
 # 產生的 gate ledger 背書；plan card 不改動 candidate、不跑 gate，故不在此列。
 # #313：verify 亦不在此列——verification 卡以 review-only 沙箱啟動，
@@ -5631,6 +5704,77 @@ def _declared_card_terminal_status(job: Mapping[str, object]) -> str | None:
         return None
     status = raw.get("status")
     return status if isinstance(status, str) and status else None
+
+
+def _explicit_stop_terminal_reports_valid(reports: object) -> bool:
+    if not isinstance(reports, list):
+        return False
+    for item in reports:
+        if not isinstance(item, dict) or set(item) != {"path", "body"}:
+            return False
+        path = item.get("path")
+        body = item.get("body")
+        if (
+            not isinstance(path, str)
+            or not path.strip()
+            or not isinstance(body, str)
+            or not body.strip()
+        ):
+            return False
+    return True
+
+
+def _explicit_stop_gate_terminal(job: Mapping[str, object]) -> dict[str, object] | None:
+    """Recognize verify/review non-passing terminals that must land as explicit stops."""
+
+    phase = job.get("workflow_phase")
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or phase not in {"verify", "review"}
+    ):
+        return None
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return None
+    if not _explicit_stop_terminal_reports_valid(raw.get("reports")):
+        return None
+    if phase == "verify":
+        details = raw.get("details")
+        if (
+            set(raw) != {"schema_version", "kind", "status", "summary", "details", "reports"}
+            or type(raw.get("schema_version")) is not int
+            or raw.get("schema_version") != 1
+            or raw.get("kind") != "workflow-verification-result"
+            or raw.get("status") not in terminal_contract.NON_PASSING_STATUSES
+            or not isinstance(raw.get("summary"), str)
+            or not str(raw["summary"]).strip()
+            or not (
+                isinstance(details, dict)
+                or (isinstance(details, str) and details.strip())
+            )
+        ):
+            return None
+        return raw
+    if (
+        set(raw) not in (
+            {"schema_version", "kind", "status", "reason", "findings", "reports"},
+            {"schema_version", "kind", "status", "reason", "findings", "reports", "authority_hashes"},
+        )
+        or type(raw.get("schema_version")) is not int
+        or raw.get("schema_version") != 1
+        or raw.get("kind") != "workflow-review-result"
+        or raw.get("status") not in terminal_contract.NON_PASSING_STATUSES
+        or not isinstance(raw.get("reason"), str)
+        or not str(raw["reason"]).strip()
+        or not isinstance(raw.get("findings"), list)
+        or any(not isinstance(item, dict) for item in raw["findings"])
+    ):
+        return None
+    return raw
 
 
 def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
@@ -9021,14 +9165,44 @@ def _record_planning_artifact_rejection_evidence(
         return None
 
 
-def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bool:
-    """Whether a planning artifact uses its canonical work-item destination.
+def _planning_anchor_slugs(run) -> tuple[str, ...]:
+    anchors: set[str] = set()
+    for ref in getattr(run, "openspec_refs", ()) or ():
+        if isinstance(ref, str) and _PLANNING_SLUG_RE.fullmatch(ref) is not None:
+            anchors.add(ref)
+    for authority in getattr(run, "planning_authority", ()) or ():
+        if getattr(authority, "work_id", None) != getattr(run, "work_id", None):
+            continue
+        ref = getattr(authority, "ref", None)
+        if not isinstance(ref, str):
+            continue
+        relative = Path(ref)
+        if (
+            relative.as_posix() != ref
+            or len(relative.parts) != 5
+            or relative.parts[:3] != ("docs", "superpowers", "workstreams")
+            or relative.parts[4] != "todo.md"
+        ):
+            continue
+        slug = relative.parts[3]
+        if _PLANNING_SLUG_RE.fullmatch(slug) is not None:
+            anchors.add(slug)
+    return tuple(sorted(anchors))
 
-    The planning runtime always materializes the accepted spec/design/plan
-    triplet, even when a combo's manifest omits the optional brainstorming card
-    (for example ``fix-standard``).  Keep that runtime contract independent of
-    the combo's flattened output list while still binding each kind to its own
-    destination family and work item.
+
+def planning_kind_bound(
+    kind: object,
+    path_value: object,
+    work_id: object,
+    *,
+    anchor_slugs: tuple[str, ...] = (),
+) -> bool:
+    """Whether a planning artifact uses an exact-stem governed destination.
+
+    The normalized relative-path and directory-family guards decide the
+    governed docs roots. ``is_absolute()`` and ``..`` remain as
+    defense-in-depth even though the family guards already reject them on
+    POSIX.
     """
 
     if (
@@ -9036,7 +9210,7 @@ def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bo
         or not isinstance(path_value, str)
         or not path_value
         or not isinstance(work_id, str)
-        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None
+        or _PLANNING_SLUG_RE.fullmatch(work_id) is None
     ):
         return False
     relative = Path(path_value)
@@ -9047,21 +9221,37 @@ def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bo
         or len(relative.parts) != 4
     ):
         return False
+    valid_anchor_slugs = {
+        slug
+        for slug in anchor_slugs
+        if isinstance(slug, str) and _PLANNING_SLUG_RE.fullmatch(slug) is not None
+    }
+
+    def _base_allowed(base: str) -> bool:
+        return (
+            base == work_id
+            or base in valid_anchor_slugs
+            or re.fullmatch(
+                rf"[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}-{re.escape(work_id)}",
+                base,
+            )
+            is not None
+        )
+
     if kind in {"spec", "design"}:
         if relative.parts[:3] != ("docs", "superpowers", "specs"):
             return False
-        pattern = f"docs/superpowers/specs/*{work_id}*-{kind}.md"
-    else:
-        if relative.parts[:3] != ("docs", "superpowers", "plans"):
-            return False
-        pattern = f"docs/superpowers/plans/*{work_id}*.md"
-    if relative.suffix != ".md":
+        suffix = f"-{kind}.md"
+        return relative.suffix == ".md" and relative.name.endswith(suffix) and _base_allowed(
+            relative.name[: -len(suffix)]
+        )
+    if relative.parts[:3] != ("docs", "superpowers", "plans") or relative.suffix != ".md":
         return False
-    # The accepted planning contract intentionally permits any basename slug
-    # containing the work item.  The directory, four-part relative path and
-    # normalized-path guards above keep this basename glob from crossing into
-    # another governed root or escaping the workspace.
-    return fnmatch.fnmatch(path_value, pattern)
+    stem = relative.stem
+    candidates = {stem}
+    if stem.endswith("-plan"):
+        candidates.add(stem[: -len("-plan")])
+    return any(_base_allowed(candidate) for candidate in candidates)
 
 
 def _publish_planning_artifacts(
@@ -9070,6 +9260,7 @@ def _publish_planning_artifacts(
     *,
     work_id: str,
     allowed_refs: tuple[str, ...],
+    anchor_slugs: tuple[str, ...] = (),
     authorities: tuple[PlanningArtifactAuthority, ...] = (),
     transaction: _PlanningPublicationTransaction | None = None,
     coordinator_root: str | Path | None = None,
@@ -9107,12 +9298,20 @@ def _publish_planning_artifacts(
             and relative.parts[2] != "archive"
         )
         manifest_bound = any(fnmatch.fnmatch(path_value, pattern) for pattern in allowed_refs)
-        kind_bound = planning_kind_bound(row.get("kind"), path_value, work_id)
+        kind_bound = planning_kind_bound(
+            row.get("kind"),
+            path_value,
+            work_id,
+            anchor_slugs=anchor_slugs,
+        )
         if (
             relative.is_absolute()
             or ".." in relative.parts
+            # 等價但非正規化的字串（`./`、`//`、尾端 `/`）不得成為另一個 authority ref。
+            or relative.as_posix() != path_value
             or not (docs_bound or openspec_bound)
-            or not (manifest_bound or kind_bound)
+            or (docs_bound and not kind_bound)
+            or (openspec_bound and not manifest_bound)
             or relative.suffix != ".md"
         ):
             raise ValueError("planning artifact path outside governed roots")
@@ -9882,6 +10081,18 @@ OPERATOR_ADJUDICATION_REVIEWER_DIRECTIVE = _OPERATOR_ADJUDICATION_PREAMBLE + (
     "criterion for the candidate—report any ruling the candidate leaves unaddressed as a "
     "blocking finding that names the ruling, and do not accept the candidate on the strength "
     "of findings the operator has already overruled."
+) + (
+    " When a ruling explicitly accepts or waives a specific finding or deviation, do not "
+    "report that finding again under a blocking category ("
+    + ", ".join(sorted(foreign_review.BLOCKING_FINDING_CATEGORIES))
+    + "); if you still record it, use a non-blocking category ("
+    + ", ".join(
+        sorted(
+            foreign_review.VALID_FINDING_CATEGORIES
+            - foreign_review.BLOCKING_FINDING_CATEGORIES
+        )
+    )
+    + ") and cite the ruling in its recommendation."
 )
 RETRY_CONTEXT_MESSAGE_LIMIT = 600
 
@@ -12116,6 +12327,80 @@ def resume_workflow_run(
             # #261 R4／D6：唯讀診斷與授權欄位分離——模型講的話同樣不授權。
             "terminal_diagnostics": diagnostics.as_dict(),
         }
+    raw_explicit_stop = _explicit_stop_gate_terminal(job)
+    if raw_explicit_stop is not None:
+        diagnostics = _gate_terminal_stop_diagnostics(job, raw_explicit_stop)
+        declared_status = str(raw_explicit_stop["status"])
+        label = "verification" if step.phase == "verify" else "review"
+        model_text = diagnostics.model_diagnostics_text()
+        reason_code = (
+            "verification-terminal-explicit-stop"
+            if step.phase == "verify"
+            else "review-terminal-explicit-stop"
+        )
+        log_path = job.get("log_path")
+        evidence_refs = (log_path,) if isinstance(log_path, str) and log_path else ()
+        try:
+            _discard_reviewer_sandbox(
+                job,
+                coordinator_root=coordinator_root,
+                require_candidate_unchanged=True,
+            )
+        except ValueError as exc:
+            current = registry.get_workflow_run(run.run_id)
+            updated = registry._manager_update_workflow_run(
+                run.run_id,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                gate_status="running",
+                needs_human_reason=diagnostic_reason(
+                    "reviewer-candidate-drift",
+                    f"{label} terminal 明示要求停止（status={declared_status}），"
+                    f"但 reviewer sandbox 回收失敗：{summarize_exception(exc)}",
+                    source="manager._poll_workflow_job:explicit-stop",
+                    evidence_refs=evidence_refs,
+                    run_id=run.run_id,
+                    work_id=run.work_id,
+                    job_id=str(job["job_id"]),
+                    card=step.card,
+                    declared_status=declared_status,
+                    phase=step.phase,
+                ),
+            )
+            return {
+                "run_id": run.run_id,
+                "current_phase": updated.current_phase,
+                "job_id": job["job_id"],
+                "reason": "reviewer-candidate-drift",
+                "declared_status": declared_status,
+                "terminal_diagnostics": diagnostics.as_dict(),
+            }
+        current = registry.get_workflow_run(run.run_id)
+        updated = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                reason_code,
+                f"{label} terminal 明示要求停止（status={declared_status}）："
+                f"{model_text}",
+                source="manager._poll_workflow_job:explicit-stop",
+                evidence_refs=evidence_refs,
+                run_id=run.run_id,
+                work_id=run.work_id,
+                job_id=str(job["job_id"]),
+                card=step.card,
+                declared_status=declared_status,
+                phase=step.phase,
+            ),
+        )
+        return {
+            "run_id": run.run_id,
+            "current_phase": updated.current_phase,
+            "job_id": job["job_id"],
+            "reason": reason_code,
+            "declared_status": declared_status,
+            "terminal_diagnostics": diagnostics.as_dict(),
+        }
     if _malformed_workflow_card_terminal(job):
         # #261 R3／D5：同一個確定性 schema mismatch 不得無限回派模型。計數持久化在
         # run.attempts（既有的可觀測欄位），逾限即停止並讓 operator 接手。
@@ -13358,6 +13643,7 @@ def apply_workflow_action(
             allowed_refs=tuple(
                 ref for step in manifest.steps for ref in step.outputs
             ),
+            anchor_slugs=_planning_anchor_slugs(run),
             authorities=run.planning_authority,
             transaction=publication,
             # #511：拒收 evidence 必須落在 coordinator_root，不能落在

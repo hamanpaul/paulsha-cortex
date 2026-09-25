@@ -7,6 +7,47 @@
 
 ## [Unreleased]
 
+- **#862 recovery registry receipt contract**：`JobRegistry` 現在依 OpenSpec 實作
+  recovery registry 的 versioned request/receipt/checkpoint 契約：fresh /
+  checkpointed slice 會持久化 `binding_version`／`binding_revision`，
+  `prepare_recovery()`／`commit_pre_candidate_recovery()` 以
+  `cortex/recovery-registry-request/v1` digest、exact binding CAS、required-step
+  receipts 與 idempotent replay 寫入 `cortex/recovery-registry-receipt/v1`；舊
+  builder/reviewer job 會落 `cortex/job-supersession/v1`，`record_job_consumption()`
+  另以 `cortex/job-consumption/v1` 保存獨立 completion proof，而
+  `checkpoint_legacy_binding()` 可用 fingerprint + provenance 建立 revision 1 的
+  `cortex/legacy-binding-checkpoint-receipt/v1`，不清 binding、不改歷史欄位；另補上
+  pre-`bound_binding` job disposition persisted state 的 backward-compatible
+  loader / replay 正規化，且 ordinary `repin_slice()` / `update_slice()` /
+  `record_action()` binding bump 會在 drift 前先補寫缺失 witness，不需 schema bump。
+  同步補上
+  rename/fsync/rollback fault injection、checkpoint drift/replay 與 planning-gate
+  regression，並更新 `docs/unified-work-lifecycle.md` 說明 recovery/checkpoint
+  仍屬 registry-only contract、既有 CLI 不新增 public 動詞，另留 `docs/evidence/`
+  的 pre-archive local validation record。
+
+- **#862 job disposition replay**：`record_job_supersession()` 與
+  `record_job_consumption()` 的省略 `at` retry 會保留第一次寫入的 disposition 時間，
+  exact replay 不再重複持久化；呼叫者明示不同 `at` 仍維持 conflict。
+- **#871 maintainer fallback authorization v2**：同一 run/head 若已存在 Copilot v1 merge authorization，maintainer fallback 現在會保留 immutable v1 為 superseded 稽核，另建以 payload digest 定址的 v2 並在 payload 內綁定 v1 ref/hash；replay 會驗證 superseded v1 wrapper 不可變且身分一致，`merge-authorized` 前置檢查與 trusted evidence refs 仍維持既有 fail-closed 邊界。
+- **#956 review gate operator 裁決出口**：`retry-review --reason` 接受裁決並保存完整 immutable evidence，後續 reviewer prompt 注入前 2000 字；`blocking-findings` attention／resume 顯示可行的 `retry-review`／`retry-build` 出口與指令提示，`review-attest` 對 rejected review gate fail closed。同步補上 reviewer directive、coordinator CLI help 與 lifecycle 文件。
+- **#874 verify/review 誠實 non-passing terminal 落 needs_human 明示停止**：`resume_workflow_run`
+  現在會把 verify/review 合法的 `failed`／`needs_human` terminal 直接落成
+  `verification-terminal-explicit-stop`／`review-terminal-explicit-stop`，保留模型原文與
+  job log evidence ref，不再包成 `terminalize-workflow-job-failed`／`resume-workflow-failed`。
+  periodic runner 不自動重派；explicit resume 也只會重落同一個停止，實際重派出口仍是
+  `retry-card`／`retry-build`。
+
+- **#479 retry-build launch 前失敗保留既有 proof**：票面主缺陷已由 #941 修正；本次補齊殘項，讓恢復態 slice 在 `retry-build` 的 launch 前失敗時保留既有 candidate、verification／review refs、builder／reviewer 綁定與 slice state；未真正 launch 的新 failed build job 在 `complete_tick` 只保留稽核，不再覆寫現任 slice manifest。
+- **#983 delivery journal conditional commit**：`work_actions._load_runs/_save_runs` 現在以固定 sibling lock、revision＋raw-byte digest baseline 與確認後 reread 保護 `delivery-journal.json`；顯式 `publication_events: null` 會視為 malformed current journal 並 fail-closed，stale full-file overwrite、直接偽造 publication event、以及 crash window 的 uncertain outcome 也都會 fail-closed，並新增 focused race／unknown replay 測試。
+- **#961 OpenSpec 遠端 archive authority reconciliation**：`coordinator/claim.py`
+  現在會先收集每個 semantic authority key 的所有 observed values，僅在同一個
+  `openspec:{repo}:{ref}` 同時看到本機 `active` 與 GitHub terminal `archived`
+  source，且每筆 confirmed PR 都有唯一、`merged_with_merge_commit is True` 的
+  remote ancestry 證據時，才收斂成 archived；其餘衝突維持既有
+  `AuthorityValidationError` fail-closed，且既有 non-reconcilable semantic
+  conflict 不會再被後續 malformed semantic source 覆寫。同步補齊
+  deterministic／fail-closed regression tests 與 unified work lifecycle 文件說明。
 - **#987 main-probe conflict classification**：`git merge-tree --write-tree --name-only --no-messages -z` 在 exit `1`、tree OID 有效且 conflicted path 清單為空時，現在會維持 generic `conflict` 分類，不再誤判成 `multiple-conflicts`；既有的 `CHANGELOG.md` 頂端插入特例、單一路徑非 changelog conflict、多重 conflict path，以及 clean-behind／in-sync／failure 行為維持不變。
 - **#987 main-probe gate**：ship validator 現在會在 Manager-owned ship clone 內以 bounded direct git probe `origin/main`，於 preflight 前與必要 push 前重讀 main；只有 Candidate 已含最新 M 時才可進 preflight／push／建 PR。`merge-tree --write-tree --name-only --no-messages -z` 改走 NUL-safe path parser，clean-behind 與 conflict 會在 preflight 前 fail-closed；fetch／merge-base／merge-tree／path-parser failure 會寫入 content-addressed `main-sync-probe` evidence，持久化 `candidate`／`stage`／`returncode`／`error_kind`／`main_head`，並讓 `main-sync-unavailable` stop 與 operator resume 可讀回同一份證據。重用既有 Manager ship workspace 時若來源 repo 已無有效 `origin`，現在也會先移除工作區殘留的 `origin`，避免 stale remote 被錯誤探測成 `in-sync`。
 - **#987 main-probe Yellow 規劃**：發布 accepted spec／design／todo 與唯一 work item 綁定；此規劃不交付產品實作。
@@ -39,6 +80,8 @@
 
 - **launcher：`gpt-6-luna` 明示 max reasoning effort**：`build_codex_argv` 對 `gpt-6-luna` 帶
   `-c model_reasoning_effort="max"`，與 `gpt-5.6-luna` 一致，不再受 host ambient codex config 影響。
+
+- **#812 planning 產出目的地綁定改為精確 stem**：`planning_kind_bound`、planning publication 與 authority 重驗現在一致只接受 canonical／dated／anchor slug 的 docs 目的地，關閉 prefix／suffix／middle／`-v2` 這類 substring 誤放行，同時保留 change slug ≠ work_id 的合法 planning anchor。combo manifest 的 `*<task-slug>*` outputs pattern 仍供 `openspec/changes/<change>/...` 使用，但不再單獨放行 `docs/superpowers/{specs,plans}`；本次也同步更正 #802 對 DiagnosticReason v2 降級風險與 kind-bound 文法的文字敘述。
 
 - **#948 ship 段採信既有 exact-HEAD Copilot review**：`_ship_action` 在呼叫 `request_copilot` 前先檢查 `remote.copilot_reviews`，存在 exact-HEAD、Copilot、COMMENTED／APPROVED 且非 error review 時直接採信（多筆取最新 `(submitted_at_epoch, review_id)`），同 tick 進入 review 判定而不重複 request；`ReviewLoop` 支援 `adopted_at` 基準，採信 review 不受請求前 epoch 或 15 分鐘 timeout 誤判；候選 HEAD 前進時重新評估不沿用舊 review；`copilot-*` stop 的 `next_actions` 補齊 `review-attest` 重入出口並提示指令形式。
 
@@ -331,11 +374,13 @@
   `needs_human` 回應同步提供補件、`abandon` 與重新 intake 的下一步提示，
   並將提示持久化在 `needs_human_reason` payload；補齊多 combo、路徑邊界與
   超長提示的回歸保護。`DiagnosticReason` 以加法欄位 bump 至 schema v2，
-  仍相容讀取缺少 `next_step_hint` 的 v1 payload；這是單向遷移，已寫入 hint
-  記錄後不可將 Manager 降級回不認得該欄位的舊版本；三條 operator hint 分支改用
-  正體中文，保留內嵌的 `cortex work abandon` 指令；kind-bound 判定以 accepted
-  basename glob 比對，並由四段相對路徑、目錄家族與正規化守衛限制作用範圍；包含
-  work item 的合法 slug 不得因 combo manifest 缺少 brainstorming 而被拒。**
+  任何 `schema_version: 2` 記錄（不論是否帶 `next_step_hint`）都會被舊版
+  `__post_init__` 拒收；Manager 一旦寫過 v2 `needs_human_reason` 就不可降級回舊版。
+  三條 operator hint 分支改用正體中文，保留內嵌的 `cortex work abandon`
+  指令；kind-bound 判定改由 #812 的精確 stem 文法比對 spec／design 的
+  `<base>-<kind>.md` 與 plan 的 `<base>.md`／`<base>-plan.md`，並由四段相對路徑、
+  目錄家族與正規化守衛限制作用範圍；包含 work item 的合法 slug 不得因 combo
+  manifest 缺少 brainstorming 而被拒。**
 
 - **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
   最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留
@@ -582,6 +627,8 @@
 - runbook 的「M2′ 之後仍未涵蓋的」清單更正兩條陳舊項（gate 執行身分 #629 已完成、reviewer 憑證 refresh 已由 #685 解決），並加上「not-covered 清單本身也是宣稱」的約束（#696）。
 
 ### Fixed
+
+- Wave R 整合交付：operator 合併 8 個卡在 cortex pipeline 的實作 PR，並補 review 修正（非正規化 governed path、journal lock `O_CLOEXEC`、裁決 evidence 先於 run 重置、#862 測試對齊 #966 CAS）。
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、
   逐條宣稱更正，以及切換當下才撞得到的那一個阻斷**。四分部署的
   `PSC_JOB_RUNNER=systemd-template` 讓 `planning_runtime._select_planning_invoker()`

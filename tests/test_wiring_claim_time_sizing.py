@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from recovery_registry_receipt_support import recovery_registry_receipt_openspec_refs
 from paulsha_cortex.coordinator import work_bridge
 from paulsha_cortex.coordinator.claim import load_work_authority
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -132,6 +133,25 @@ def _snapshot(path: Path) -> Path:
 def _authority(tmp_path: Path):
     snapshot = _snapshot(tmp_path / "snapshot.json")
     return load_work_authority(repo="acme/demo", work_id="work", snapshot_path=snapshot)
+
+
+def _tracked_recovery_registry_receipt_rows() -> dict[str, list[dict[str, str]]]:
+    openspec_refs = recovery_registry_receipt_openspec_refs(Path(__file__).resolve().parents[1])
+    superpowers = [
+        {"kind": "spec", "ref": "docs/superpowers/specs/recovery-registry-receipt-spec.md"},
+        {"kind": "design", "ref": "docs/superpowers/specs/recovery-registry-receipt-design.md"},
+        {"kind": "plan", "ref": "docs/superpowers/workstreams/recovery-registry-receipt/todo.md"},
+    ]
+    openspec = [
+        {"kind": "spec", "ref": openspec_refs["proposal"]},
+        {"kind": "design", "ref": openspec_refs["design"]},
+        {"kind": "plan", "ref": openspec_refs["tasks"]},
+    ]
+    return {
+        "superpowers": superpowers,
+        "openspec": openspec,
+        "combined": superpowers + openspec,
+    }
 
 
 def test_claim_time_sizing_computed_when_plan_and_combo_available(tmp_path: Path) -> None:
@@ -268,6 +288,19 @@ def test_current_sizing_snapshot_invalid_dimensions_fail_soft(
         combo_name="small-fix",
         artifact_rows=rows,
     ) == (None, None)
+
+
+def test_recovery_registry_receipt_real_accepted_views_keep_current_yellow_projection() -> None:
+    root = Path(__file__).resolve().parents[1]
+    bundles = _tracked_recovery_registry_receipt_rows()
+
+    for combo_name in ("feature-oneshot", "small-fix"):
+        for rows in bundles.values():
+            assert work_bridge.current_sizing_snapshot(
+                workspace_root=root,
+                combo_name=combo_name,
+                artifact_rows=rows,
+            ) == (6, "yellow")
 
 
 # ---------------------------------------------------------------------------

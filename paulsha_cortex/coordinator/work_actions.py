@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import copy
+import fcntl
 import hashlib
 import json
 import logging
 import math
 import os
 import re
+import stat as statmod
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -601,20 +604,151 @@ def _run_state_path() -> Path:
     return paths.coordinator_root() / "delivery-journal.json"
 
 
-def _load_runs(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"schema": "cortex-delivery-journal/v1", "runs": {}}
+_DELIVERY_JOURNAL_SCHEMA = "cortex-delivery-journal/v1"
+_DELIVERY_JOURNAL_BASELINE_FIELD = "_delivery_journal_baseline"
+_DELIVERY_JOURNAL_REVISION_FIELD = "revision"
+_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD = "publication_events"
+_DELIVERY_JOURNAL_LOCK_SUFFIX = ".lock"
+_DELIVERY_JOURNAL_LOCK_TIMEOUT_SECONDS = 5.0
+_DELIVERY_JOURNAL_LOCK_RETRY_SECONDS = 0.01
+_DELIVERY_JOURNAL_TEST_HOOK: Callable[..., None] | None = None
+
+
+class _DeliveryJournalConflict(RuntimeError):
+    """The caller must reload and recompute against the latest durable journal."""
+
+
+class _DeliveryJournalUnknown(RuntimeError):
+    """The write may have become visible, but this call could not prove it."""
+
+
+def _delivery_journal_test_hook(stage: str, **context: object) -> None:
+    hook = _DELIVERY_JOURNAL_TEST_HOOK
+    if hook is not None:
+        hook(stage=stage, **context)
+
+
+def _delivery_journal_text(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or len(value) > 200
+        or "\n" in value
+        or not value.isprintable()
+    ):
+        raise ValueError(f"{field} malformed")
+    return value
+
+
+def _delivery_journal_revision(value: object, *, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} malformed")
+    return value
+
+
+def _delivery_journal_digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _delivery_journal_canonical_payload(
+    value: object, *, field: str
+) -> tuple[object, str]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("work run state unreadable") from exc
+        canonical = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} malformed") from exc
+    return json.loads(canonical), _delivery_journal_digest(canonical.encode("utf-8"))
+
+
+def _delivery_journal_entry(
+    value: object, *, field: str
+) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"payload", "payload_sha256"}
+        or not isinstance(value.get("payload_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["payload_sha256"]) is None
+    ):
+        raise ValueError(f"{field} malformed")
+    payload, digest = _delivery_journal_canonical_payload(
+        value.get("payload"), field=field
+    )
+    if digest != value["payload_sha256"]:
+        raise ValueError(f"{field} malformed")
+    return {"payload": payload, "payload_sha256": digest}
+
+
+def _delivery_journal_publication_events(
+    value: object, *, field: str
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} malformed")
+    normalized: dict[str, dict[str, Any]] = {}
+    for event_id, row in value.items():
+        normalized_id = _delivery_journal_text(
+            event_id, field=f"{field}[event_id]"
+        )
+        if (
+            not isinstance(row, dict)
+            or set(row) not in (
+                {"event_id", "kind", "intent"},
+                {"event_id", "kind", "intent", "result"},
+            )
+            or row.get("event_id") != normalized_id
+        ):
+            raise ValueError(f"{field} malformed")
+        normalized_row = {
+            "event_id": normalized_id,
+            "kind": _delivery_journal_text(
+                row.get("kind"), field=f"{field}[{normalized_id}].kind"
+            ),
+            "intent": _delivery_journal_entry(
+                row.get("intent"), field=f"{field}[{normalized_id}].intent"
+            ),
+        }
+        if "result" in row:
+            normalized_row["result"] = _delivery_journal_entry(
+                row.get("result"), field=f"{field}[{normalized_id}].result"
+            )
+        normalized[normalized_id] = normalized_row
+    return normalized
+
+
+def _delivery_journal_publication_index(
+    runs: dict[str, Any],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    return {
+        run_id: row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD]
+        for run_id, row in runs.items()
+        if row.get(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD)
+    }
+
+
+def _delivery_journal_payload(
+    payload: object, *, revision: int
+) -> dict[str, Any]:
     if (
         not isinstance(payload, dict)
-        or payload.get("schema") != "cortex-delivery-journal/v1"
+        or payload.get("schema") != _DELIVERY_JOURNAL_SCHEMA
         or not isinstance(payload.get("runs"), dict)
     ):
         raise ValueError("work run state malformed")
-    for key, row in payload["runs"].items():
+    if _DELIVERY_JOURNAL_REVISION_FIELD in payload:
+        _delivery_journal_revision(
+            payload.get(_DELIVERY_JOURNAL_REVISION_FIELD),
+            field="work run state revision",
+        )
+    normalized = copy.deepcopy(payload)
+    normalized.pop(_DELIVERY_JOURNAL_BASELINE_FIELD, None)
+    normalized[_DELIVERY_JOURNAL_REVISION_FIELD] = revision
+    for key, row in normalized["runs"].items():
         if (
             not isinstance(key, str)
             or not isinstance(row, dict)
@@ -628,27 +762,391 @@ def _load_runs(path: Path) -> dict[str, Any]:
             or not isinstance(row.get("workflow_step_ids"), list)
         ):
             raise ValueError("work run record malformed")
-    return payload
+        if _DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD in row:
+            events = _delivery_journal_publication_events(
+                row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD],
+                field=f"work run record {key} publication events",
+            )
+            if events:
+                row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD] = events
+            else:
+                row.pop(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD, None)
+        else:
+            row.pop(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD, None)
+    return normalized
 
 
-def _save_runs(path: Path, payload: dict[str, Any]) -> None:
+def _delivery_journal_logical_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    logical = copy.deepcopy(payload)
+    logical.pop(_DELIVERY_JOURNAL_REVISION_FIELD, None)
+    return logical
+
+
+def _delivery_journal_baseline(
+    *, exists: bool, revision: int, content_sha256: str | None
+) -> dict[str, Any]:
+    return {
+        "exists": exists,
+        "revision": revision,
+        "content_sha256": content_sha256,
+    }
+
+
+def _validated_delivery_journal_baseline(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "exists",
+        "revision",
+        "content_sha256",
+    }:
+        raise ValueError("work run state baseline missing")
+    exists = value.get("exists")
+    revision = _delivery_journal_revision(
+        value.get("revision"), field="work run state baseline"
+    )
+    digest = value.get("content_sha256")
+    if not isinstance(exists, bool):
+        raise ValueError("work run state baseline missing")
+    if exists:
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("work run state baseline missing")
+    elif digest is not None:
+        raise ValueError("work run state baseline missing")
+    return _delivery_journal_baseline(
+        exists=exists,
+        revision=revision,
+        content_sha256=digest,
+    )
+
+
+def _refresh_delivery_journal_baseline(
+    payload: dict[str, Any], *, exists: bool, revision: int, content_sha256: str | None
+) -> None:
+    payload[_DELIVERY_JOURNAL_REVISION_FIELD] = revision
+    payload[_DELIVERY_JOURNAL_BASELINE_FIELD] = _delivery_journal_baseline(
+        exists=exists,
+        revision=revision,
+        content_sha256=content_sha256,
+    )
+
+
+def _delivery_journal_snapshot(path: Path) -> SimpleNamespace:
+    if path.is_symlink():
+        raise ValueError("work run state unreadable")
+    if not path.exists():
+        payload = _delivery_journal_payload(
+            {
+                "schema": _DELIVERY_JOURNAL_SCHEMA,
+                "runs": {},
+            },
+            revision=0,
+        )
+        return SimpleNamespace(
+            payload=payload,
+            exists=False,
+            revision=0,
+            content_sha256=None,
+        )
+    if not path.is_file():
+        raise ValueError("work run state unreadable")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError("work run state unreadable") from exc
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("work run state unreadable") from exc
+    revision = _delivery_journal_revision(
+        payload.get(_DELIVERY_JOURNAL_REVISION_FIELD, 0),
+        field="work run state revision",
+    )
+    normalized = _delivery_journal_payload(payload, revision=revision)
+    return SimpleNamespace(
+        payload=normalized,
+        exists=True,
+        revision=revision,
+        content_sha256=_delivery_journal_digest(raw),
+    )
+
+
+def _delivery_journal_lock_path(path: Path) -> Path:
+    return path.parent / f"{path.name}{_DELIVERY_JOURNAL_LOCK_SUFFIX}"
+
+
+def _delivery_journal_lock_fd(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _delivery_journal_lock_path(path)
+    if lock_path.is_symlink():
+        raise RuntimeError("work run state lock path invalid")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError("work run state lock unavailable") from exc
+    try:
+        if not statmod.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError("work run state lock path invalid")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class _DeliveryJournalLock:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fd: int | None = None
+
+    def __enter__(self) -> None:
+        fd = _delivery_journal_lock_fd(self._path)
+        deadline = time.monotonic() + _DELIVERY_JOURNAL_LOCK_TIMEOUT_SECONDS
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("work run state lock timeout")
+                    time.sleep(_DELIVERY_JOURNAL_LOCK_RETRY_SECONDS)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return None
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        assert self._fd is not None
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+        return None
+
+
+def _write_delivery_journal_candidate(
+    path: Path, candidate_payload: dict[str, Any]
+) -> SimpleNamespace:
+    try:
+        content = (
+            json.dumps(
+                candidate_payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("work run state malformed") from exc
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
     try:
-        with temporary.open("x", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
+        with temporary.open("xb") as handle:
+            handle.write(content)
             handle.flush()
+            _delivery_journal_test_hook(
+                "before-file-fsync", path=path, candidate=candidate_payload
+            )
             os.fsync(handle.fileno())
+        _delivery_journal_test_hook(
+            "after-file-fsync", path=path, candidate=candidate_payload
+        )
         os.replace(temporary, path)
+        _delivery_journal_test_hook(
+            "after-replace", path=path, candidate=candidate_payload
+        )
         directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    except BaseException:
+        _delivery_journal_test_hook(
+            "after-directory-fsync", path=path, candidate=candidate_payload
+        )
+        confirmed = _delivery_journal_snapshot(path)
+        if (
+            confirmed.revision != candidate_payload[_DELIVERY_JOURNAL_REVISION_FIELD]
+            or _delivery_journal_logical_payload(confirmed.payload)
+            != _delivery_journal_logical_payload(candidate_payload)
+        ):
+            raise RuntimeError("work run state confirmation drift")
+        _delivery_journal_test_hook(
+            "after-readback",
+            path=path,
+            candidate=candidate_payload,
+            confirmed=confirmed.payload,
+        )
+        return confirmed
+    except Exception as exc:
+        # KeyboardInterrupt／SystemExit 等控制流程照原樣傳遞，不改寫成 unknown outcome。
+        raise _DeliveryJournalUnknown("work run state outcome unknown") from exc
+    finally:
         temporary.unlink(missing_ok=True)
-        raise
+
+
+def _save_runs_result(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    baseline = _validated_delivery_journal_baseline(
+        payload.get(_DELIVERY_JOURNAL_BASELINE_FIELD)
+    )
+    with _DeliveryJournalLock(path):
+        current = _delivery_journal_snapshot(path)
+        if baseline != _delivery_journal_baseline(
+            exists=current.exists,
+            revision=current.revision,
+            content_sha256=current.content_sha256,
+        ):
+            return {"outcome": "conflict", "reason": "stale-baseline"}
+        candidate_logical = _delivery_journal_payload(
+            payload, revision=current.revision
+        )
+        if (
+            _delivery_journal_publication_index(candidate_logical["runs"])
+            != _delivery_journal_publication_index(current.payload["runs"])
+        ):
+            return {
+                "outcome": "conflict",
+                "reason": "publication-entry-conflict",
+            }
+        if _delivery_journal_logical_payload(candidate_logical) == _delivery_journal_logical_payload(
+            current.payload
+        ):
+            _refresh_delivery_journal_baseline(
+                payload,
+                exists=current.exists,
+                revision=current.revision,
+                content_sha256=current.content_sha256,
+            )
+            return {"outcome": "committed", "revision": current.revision}
+        candidate_to_write = copy.deepcopy(candidate_logical)
+        candidate_to_write[_DELIVERY_JOURNAL_REVISION_FIELD] = current.revision + 1
+        confirmed = _write_delivery_journal_candidate(path, candidate_to_write)
+        _refresh_delivery_journal_baseline(
+            payload,
+            exists=True,
+            revision=confirmed.revision,
+            content_sha256=confirmed.content_sha256,
+        )
+        return {"outcome": "committed", "revision": confirmed.revision}
+
+
+def _load_runs(path: Path) -> dict[str, Any]:
+    snapshot = _delivery_journal_snapshot(path)
+    payload = snapshot.payload
+    _refresh_delivery_journal_baseline(
+        payload,
+        exists=snapshot.exists,
+        revision=snapshot.revision,
+        content_sha256=snapshot.content_sha256,
+    )
+    return payload
+
+
+def _save_runs(path: Path, payload: dict[str, Any]) -> None:
+    result = _save_runs_result(path, payload)
+    outcome = result["outcome"]
+    if outcome == "committed":
+        return None
+    if outcome == "conflict":
+        raise _DeliveryJournalConflict(
+            f"work run state conflict: {result['reason']}"
+        )
+    raise _DeliveryJournalUnknown(
+        f"work run state outcome unknown: {result.get('reason', 'unknown')}"
+    )
+
+
+def _append_delivery_publication_event(
+    path: Path,
+    *,
+    run_id: str,
+    event_id: str,
+    event_kind: str,
+    entry_kind: str,
+    payload: object,
+) -> dict[str, Any]:
+    normalized_run_id = _delivery_journal_text(run_id, field="publication run_id")
+    normalized_event_id = _delivery_journal_text(
+        event_id, field="publication event_id"
+    )
+    normalized_event_kind = _delivery_journal_text(
+        event_kind, field="publication event kind"
+    )
+    if entry_kind not in {"intent", "result"}:
+        raise ValueError("publication entry kind malformed")
+    normalized_payload, payload_sha256 = _delivery_journal_canonical_payload(
+        payload, field="publication payload"
+    )
+    with _DeliveryJournalLock(path):
+        current = _delivery_journal_snapshot(path)
+        row = current.payload["runs"].get(normalized_run_id)
+        if not isinstance(row, dict):
+            return {"outcome": "conflict", "reason": "run-missing"}
+        existing_events = copy.deepcopy(
+            row.get(_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD, {})
+        )
+        current_event = existing_events.get(normalized_event_id)
+        if current_event is not None:
+            if current_event["kind"] != normalized_event_kind:
+                return {"outcome": "conflict", "reason": "event-kind-conflict"}
+            existing_entry = current_event.get(entry_kind)
+            if existing_entry is not None:
+                if existing_entry == {
+                    "payload": normalized_payload,
+                    "payload_sha256": payload_sha256,
+                }:
+                    return {
+                        "outcome": "committed",
+                        "revision": current.revision,
+                        "event_id": normalized_event_id,
+                        "entry_kind": entry_kind,
+                        "payload_sha256": payload_sha256,
+                    }
+                return {"outcome": "conflict", "reason": "payload-conflict"}
+            if entry_kind == "intent":
+                return {"outcome": "conflict", "reason": "intent-conflict"}
+            current_event["result"] = {
+                "payload": normalized_payload,
+                "payload_sha256": payload_sha256,
+            }
+        else:
+            if entry_kind != "intent":
+                return {"outcome": "conflict", "reason": "result-before-intent"}
+            existing_events[normalized_event_id] = {
+                "event_id": normalized_event_id,
+                "kind": normalized_event_kind,
+                "intent": {
+                    "payload": normalized_payload,
+                    "payload_sha256": payload_sha256,
+                },
+            }
+        candidate = copy.deepcopy(current.payload)
+        candidate_row = candidate["runs"][normalized_run_id]
+        candidate_row[_DELIVERY_JOURNAL_PUBLICATION_EVENTS_FIELD] = existing_events
+        candidate[_DELIVERY_JOURNAL_REVISION_FIELD] = current.revision + 1
+        try:
+            confirmed = _write_delivery_journal_candidate(path, candidate)
+        except _DeliveryJournalUnknown:
+            return {
+                "outcome": "unknown",
+                "reason": "write-unconfirmed",
+                "event_id": normalized_event_id,
+                "entry_kind": entry_kind,
+                "payload_sha256": payload_sha256,
+            }
+        return {
+            "outcome": "committed",
+            "revision": confirmed.revision,
+            "event_id": normalized_event_id,
+            "entry_kind": entry_kind,
+            "payload_sha256": payload_sha256,
+        }
 
 
 def _canonical_workflow_run(*, workflow_registry, authority):
@@ -1098,6 +1596,7 @@ def _merge_authorization_body(
     copilot: object | None,
     foreign_review: ForeignReviewEvidence,
     maintainer_review: MaintainerReviewEvidence | None = None,
+    superseded_authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_foreign = _validate_foreign_review(
         foreign_review,
@@ -1124,13 +1623,19 @@ def _merge_authorization_body(
     if maintainer_review is not None:
         if copilot is not None:
             raise ValueError("merge authorization review authority is ambiguous")
-        return {
+        body = {
             "schema": "cortex-merge-authorization/v2",
             **common,
             "review_kind": "maintainer-review",
             "review_ref": maintainer_review.path,
             "review_hash": maintainer_review.expected_hash.lower(),
         }
+        if superseded_authorization is not None:
+            body["superseded_authorization_ref"] = superseded_authorization["path"]
+            body["superseded_authorization_hash"] = superseded_authorization["hash"]
+        return body
+    if superseded_authorization is not None:
+        raise ValueError("merge authorization superseded evidence requires maintainer review")
     if copilot is None:
         raise ValueError("merge authorization review authority missing")
     return {
@@ -1154,6 +1659,7 @@ def _authorization_record(
     digest = verification.canonical_json_hash(body)
     run_id = body.get("run_id")
     head = body.get("head")
+    schema = body.get("schema")
     if (
         not isinstance(run_id, str)
         or re.fullmatch(r"workflow-[0-9a-f]{20}", run_id) is None
@@ -1163,7 +1669,12 @@ def _authorization_record(
         raise ValueError("merge authorization identity malformed")
     root = state_path.resolve().parent / "evidence" / "merge-authorization"
     root.mkdir(parents=True, exist_ok=True)
-    target = root / f"{run_id}-{head.lower()}.json"
+    if schema == "cortex-merge-authorization/v1":
+        target = root / f"{run_id}-{head.lower()}.json"
+    elif schema == "cortex-merge-authorization/v2":
+        target = root / f"{run_id}-{head.lower()}-{digest}.json"
+    else:
+        raise ValueError("merge authorization identity malformed")
     wrapper = {"payload": body, "hash": digest}
     if target.exists():
         if (
@@ -1194,6 +1705,68 @@ def _authorization_record(
         finally:
             temporary.unlink(missing_ok=True)
     return {"payload": body, "hash": digest, "path": str(target)}
+
+
+def _authorization_schema(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    payload = value.get("payload")
+    schema = payload.get("schema") if isinstance(payload, dict) else None
+    return schema if isinstance(schema, str) else None
+
+
+def _read_immutable_evidence_wrapper(path_value: object) -> tuple[dict[str, Any], str] | None:
+    if not isinstance(path_value, str):
+        return None
+    evidence_path = Path(path_value)
+    if (
+        not evidence_path.is_absolute()
+        or evidence_path.is_symlink()
+        or not evidence_path.is_file()
+    ):
+        return None
+    try:
+        if evidence_path.stat().st_mode & 0o222:
+            return None
+        wrapper = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(wrapper, dict) or set(wrapper) != {"payload", "hash"}:
+        return None
+    payload = wrapper.get("payload")
+    digest = wrapper.get("hash")
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or verification.canonical_json_hash(payload) != digest
+    ):
+        return None
+    return payload, digest
+
+
+def _superseded_authorization_valid(body: dict[str, Any]) -> bool:
+    superseded_ref = body.get("superseded_authorization_ref")
+    superseded_hash = body.get("superseded_authorization_hash")
+    if (
+        not isinstance(superseded_ref, str)
+        or not isinstance(superseded_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", superseded_hash) is None
+    ):
+        return False
+    wrapper = _read_immutable_evidence_wrapper(superseded_ref)
+    if wrapper is None:
+        return False
+    payload, digest = wrapper
+    return (
+        digest == superseded_hash
+        and payload.get("schema") == "cortex-merge-authorization/v1"
+        and payload.get("run_id") == body.get("run_id")
+        and payload.get("repo") == body.get("repo")
+        and payload.get("work_id") == body.get("work_id")
+        and payload.get("head") == body.get("head")
+        and payload.get("tree_hash") == body.get("tree_hash")
+    )
 
 
 def _authorization_matches(
@@ -1253,35 +1826,47 @@ def _authorization_identity_matches(
         "preflight_hash",
         "checks_hash",
     }
-    schema = body.get("schema") if isinstance(body, dict) else None
-    review_required = (
-        {"copilot_requested_at_epoch", "copilot_review_id", "copilot_hash"}
-        if schema == "cortex-merge-authorization/v1"
-        else {"review_kind", "review_ref", "review_hash"}
-        if schema == "cortex-merge-authorization/v2"
-        else set()
-    )
+    if not isinstance(body, dict):
+        return False
+    body_keys = set(body)
+    schema = body.get("schema")
+    if schema == "cortex-merge-authorization/v1":
+        required_keys = common_required | {
+            "copilot_requested_at_epoch",
+            "copilot_review_id",
+            "copilot_hash",
+        }
+        if body_keys != required_keys:
+            return False
+        has_superseded = False
+    elif schema == "cortex-merge-authorization/v2":
+        required_keys = common_required | {
+            "review_kind",
+            "review_ref",
+            "review_hash",
+        }
+        superseded_keys = {
+            "superseded_authorization_ref",
+            "superseded_authorization_hash",
+        }
+        if body_keys == required_keys:
+            has_superseded = False
+        elif body_keys == required_keys | superseded_keys:
+            has_superseded = True
+        else:
+            return False
+    else:
+        return False
+    wrapper = _read_immutable_evidence_wrapper(evidence_path)
     if (
-        not isinstance(body, dict)
-        or not review_required
-        or set(body) != common_required | review_required
-        or verification.canonical_json_hash(body) != digest
-        or not isinstance(evidence_path, str)
-        or not Path(evidence_path).is_absolute()
-        or Path(evidence_path).is_symlink()
-        or not Path(evidence_path).is_file()
-        or Path(evidence_path).stat().st_mode & 0o222
+        wrapper is None or verification.canonical_json_hash(body) != digest
     ):
         return False
-    try:
-        evidence_wrapper = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    if evidence_wrapper != {"payload": body, "hash": digest}:
+    evidence_payload, evidence_digest = wrapper
+    if evidence_payload != body or evidence_digest != digest:
         return False
     common_valid = (
-        schema in {"cortex-merge-authorization/v1", "cortex-merge-authorization/v2"}
-        and body.get("run_id") == active.get("run_id")
+        body.get("run_id") == active.get("run_id")
         and body.get("workflow_step_ids") == active.get("workflow_step_ids")
         and body.get("repo") == authority.repo
         and body.get("work_id") == authority.work_id
@@ -1324,6 +1909,8 @@ def _authorization_identity_matches(
             and isinstance(body.get("copilot_hash"), str)
             and re.fullmatch(r"[0-9a-f]{64}", body["copilot_hash"]) is not None
         )
+    if has_superseded and not _superseded_authorization_valid(body):
+        return False
     review_ref = body.get("review_ref")
     if not (
         body.get("review_kind") == "maintainer-review"
@@ -1530,6 +2117,14 @@ def _review_attest_action(
         authority=authority,
     )
     _validate_current_run_authority(active, authority, run)
+    if any(
+        step.phase == "review" and step.gate_result == "needs_human"
+        for step in run.steps
+    ):
+        raise RuntimeError(
+            "review-attest does not adjudicate review-gate blocking findings; "
+            "use retry-review --reason to accept or retry-build --reason to reject"
+        )
     foreign = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]
     change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
     if (
@@ -1634,23 +2229,51 @@ def _ship_with_maintainer_review(
     )
     if not remote_gate.allowed:
         raise RuntimeError(f"merge authorization blocked: {', '.join(remote_gate.reasons)}")
-    authorization = _authorization_record(
-        _merge_authorization_body(
+    existing_authorization = ship.get("merge_authorization") if ship else None
+    superseded_authorization = (
+        ship.get("superseded_merge_authorization") if ship else None
+    )
+    if _authorization_schema(existing_authorization) == "cortex-merge-authorization/v1":
+        if (
+            superseded_authorization is not None
+            and superseded_authorization != existing_authorization
+        ):
+            raise RuntimeError("persisted merge authorization differs from current gate evidence")
+        superseded_authorization = existing_authorization
+        existing_authorization = None
+    if superseded_authorization is not None and (
+        _authorization_schema(superseded_authorization) != "cortex-merge-authorization/v1"
+        or not _authorization_identity_matches(
+            superseded_authorization,
             active=active,
             authority=authority,
             binding=binding,
-            preflight=preflight,
-            remote=remote,
-            copilot=None,
-            foreign_review=foreign_review,
-            maintainer_review=maintainer,
-        ),
-        state_path=state_path,
+            head=preflight.head,
+            tree_hash=preflight.tree_hash,
+            terminal_reconciliation=True,
+        )
+    ):
+        raise RuntimeError("persisted merge authorization differs from current gate evidence")
+    body = _merge_authorization_body(
+        active=active,
+        authority=authority,
+        binding=binding,
+        preflight=preflight,
+        remote=remote,
+        copilot=None,
+        foreign_review=foreign_review,
+        maintainer_review=maintainer,
+        superseded_authorization=superseded_authorization,
     )
-    existing_authorization = ship.get("merge_authorization") if ship else None
+    if existing_authorization is not None and (
+        not isinstance(existing_authorization, dict)
+        or existing_authorization.get("payload") != body
+    ):
+        raise RuntimeError("persisted merge authorization differs from current gate evidence")
+    authorization = _authorization_record(body, state_path=state_path)
     if existing_authorization is not None and existing_authorization != authorization:
         raise RuntimeError("persisted merge authorization differs from current gate evidence")
-    active["ship"] = {
+    next_ship = {
         **(ship or {}),
         "phase": "merge-authorized",
         "head": preflight.head,
@@ -1663,6 +2286,11 @@ def _ship_with_maintainer_review(
         "todo_paths": list(binding["todo_paths"]),
         "merge_authorization": authorization,
     }
+    if superseded_authorization is not None:
+        next_ship["superseded_merge_authorization"] = superseded_authorization
+    else:
+        next_ship.pop("superseded_merge_authorization", None)
+    active["ship"] = next_ship
     _save_runs(state_path, state)
     try:
         merged = orchestrator.merge_if_ready(
@@ -2494,7 +3122,19 @@ def _claim_action(
         ]
         if extra:
             response["next_actions"] = [*response.get("next_actions", []), *extra]
-            if "review-attest" in extra and authority is not None:
+            reason_payload = canonical_run.needs_human_reason
+            reason_code = (
+                reason_payload.get("reason")
+                if isinstance(reason_payload, dict)
+                else None
+            )
+            if "retry-review" in extra and reason_code == "blocking-findings":
+                response["next_step_hint"] = blocking_findings_next_step_hint(
+                    work_id=canonical_run.work_id,
+                    repo=canonical_run.repo,
+                    candidate=canonical_run.candidate_head,
+                )
+            elif "review-attest" in extra and authority is not None:
                 response["next_step_hint"] = (
                     f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
                 )
@@ -2887,6 +3527,15 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
             "Do not claim archive, merge, issue closure, or done before Manager performs those "
             "actions. Commit or adopt a tested descendant Candidate."
         )
+    # 先落 content-addressed 裁決 evidence 再重置 run：evidence 寫入失敗時
+    # run 維持 needs_human，不會在缺裁決的情況下重派。
+    adjudication_evidence = _record_operator_adjudication(
+        run=run,
+        card="subagent-build",
+        args=args,
+        state_path=state_path,
+        now_epoch=now_epoch,
+    )
     updated = workflow_registry._manager_reset_workflow_for_retry_build(
         run.run_id,
         expected_candidate=expected_candidate.lower(),
@@ -2895,13 +3544,6 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         model_chain_override=model_chain_override,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
-    adjudication_evidence = _record_operator_adjudication(
-        run=run,
-        card="subagent-build",
-        args=args,
-        state_path=state_path,
-        now_epoch=now_epoch,
-    )
     return {
         "action": "retry-build",
         "adjudication_evidence": adjudication_evidence,
@@ -2912,6 +3554,89 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         "run": updated.to_dict(),
         "retry_classification": retry_classification,
     }
+
+
+def _blocking_findings_recovery_actions(run) -> tuple[str, ...]:
+    """Return only blocking-findings exits whose reset preconditions are met."""
+
+    reason_payload = getattr(run, "needs_human_reason", None)
+    reason_code = (
+        reason_payload.get("reason")
+        if isinstance(reason_payload, dict)
+        else str(reason_payload or "")
+    )
+    if (
+        getattr(run, "current_phase", None) != "review"
+        or getattr(run, "status", None) != "ongoing"
+        or "needs_human" not in getattr(run, "facets", ())
+        or reason_code != "blocking-findings"
+    ):
+        return ()
+
+    actions: list[str] = []
+    candidate = getattr(run, "candidate_head", None)
+    verify_steps = [step for step in run.steps if step.phase == "verify"]
+    if (
+        isinstance(candidate, str)
+        and candidate == getattr(run, "verified_head", None)
+        and any(item.kind == "plan" for item in run.planning_authority)
+        and verify_steps
+        and all(step.gate_result == "passed" for step in verify_steps)
+    ):
+        actions.append("retry-review")
+
+    build_steps = [step for step in run.steps if step.phase == "build"]
+    passed_ship_steps = [
+        step
+        for step in run.steps
+        if step.phase == "ship" and step.gate_result == "passed"
+    ]
+    if (
+        isinstance(candidate, str)
+        and build_steps
+        and all(step.gate_result == "passed" for step in build_steps)
+        and len(passed_ship_steps) <= 1
+        and all(
+            step.card == "openspec-archive"
+            and step.executor == "cortex-manager"
+            and step.model == "deterministic"
+            and step.domain == "cortex"
+            for step in passed_ship_steps
+        )
+    ):
+        actions.append("retry-build")
+    return tuple(actions)
+
+
+def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
+    """Format the two operator exits for a blocking review finding."""
+
+    work_value = (
+        work_id
+        if isinstance(work_id, str)
+        and re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id)
+        else "<work-id>"
+    )
+    repo_value = (
+        repo
+        if isinstance(repo, str)
+        and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+        else "<owner/repo>"
+    )
+    candidate_value = (
+        candidate
+        if isinstance(candidate, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", candidate)
+        else "<candidate-sha>"
+    )
+    prefix = f"cortex run work {{action}} {work_value} --repo {repo_value} --expected-candidate {candidate_value} --actor <operator> --reason '<裁決>'"
+    return (
+        "接受 finding：`"
+        + prefix.format(action="retry-review")
+        + "`\n駁回 finding：`"
+        + prefix.format(action="retry-build")
+        + "`\n兩者都不適用時才執行 `abandon`。"
+    )
 
 
 def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
@@ -2934,6 +3659,12 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
     宣告更糟——這是 #382 已經付過學費的教訓。
     """
 
+    reason_code = (
+        run.needs_human_reason.get("reason")
+        if isinstance(getattr(run, "needs_human_reason", None), dict)
+        else str(getattr(run, "needs_human_reason", None) or "")
+    )
+
     from .manager import _current_workflow_step
     from .manager import GATE_LEDGER_REQUIRED_PHASES
     from .registry import (
@@ -2952,8 +3683,10 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
 
     actions: list[str] = []
     if run.current_phase in RETRY_CARD_PHASE_PERSONA:
+        jobs_readable = False
         try:
             jobs = list(workflow_registry.list_jobs())
+            jobs_readable = True
         except Exception:  # pragma: no cover - 曝光面不得因讀取失敗而讓 resume 死掉
             jobs = []
         run_jobs = [job for job in jobs if job.get("workflow_run_id") == run.run_id]
@@ -2984,11 +3717,13 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
                 ):
                     actions.append("retry-card")
 
-    reason_code = (
-        run.needs_human_reason.get("reason")
-        if isinstance(getattr(run, "needs_human_reason", None), dict)
-        else str(getattr(run, "needs_human_reason", None) or "")
-    )
+            if jobs_readable:
+                actions.extend(
+                    action
+                    for action in _blocking_findings_recovery_actions(run)
+                    if action not in actions
+                )
+
     if reason_code.startswith("copilot-") and "review-attest" not in actions:
         actions.append("review-attest")
     return tuple(actions)
@@ -3165,6 +3900,18 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         workflow_registry,
         trigger=_RETRY_CARD_PHASE_TRIGGERS.get(run.current_phase),
     )
+    # #752／#755：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由
+    # `manager._operator_adjudications()` 讀回、進 retry_context 的
+    # `operator_adjudications` 鍵（bounded CLI、Manager-owned，非 candidate 內容）。
+    # 先落 content-addressed 裁決 evidence 再重置 run：evidence 寫入失敗時
+    # run 維持 needs_human，不會在缺裁決的情況下重派。
+    adjudication_evidence = _record_operator_adjudication(
+        run=run,
+        card=card,
+        args=args,
+        state_path=state_path,
+        now_epoch=now_epoch,
+    )
     updated = workflow_registry._manager_reset_workflow_for_retry_card(
         run.run_id,
         expected_run_id=expected_run_id,
@@ -3173,16 +3920,6 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         model_chain_override=model_chain_override,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
-    # #752／#755：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由
-    # `manager._operator_adjudications()` 讀回、進 retry_context 的
-    # `operator_adjudications` 鍵（bounded CLI、Manager-owned，非 candidate 內容）。
-    adjudication_evidence = _record_operator_adjudication(
-        run=run,
-        card=card,
-        args=args,
-        state_path=state_path,
-        now_epoch=now_epoch,
-    )
     return {
         "action": "retry-card",
         "adjudication_evidence": adjudication_evidence,
@@ -3259,7 +3996,14 @@ def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) 
     }
 
 
-def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+def _retry_review_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    workflow_registry,
+    state_path: Path | None = None,
+    now_epoch: float | None = None,
+) -> dict[str, Any]:
     """Relaunch foreign review only for the exact verified Candidate（#216 AC3）。
 
     build／verify phase 完全不動：不重跑 builder、不重建 candidate。若 run 缺少
@@ -3268,10 +4012,13 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
     """
 
     extras = set(args) - {
-        "action", "repo", "work_id", "issue", "actor", "expected_candidate",
+        "action", "repo", "work_id", "issue", "actor", "expected_candidate", "reason",
     }
     if extras:
         raise ValueError(f"retry-review rejects caller evidence/input: {sorted(extras)[0]}")
+    _validate_operator_adjudication_args(
+        args, state_path=state_path, action="retry-review"
+    )
     expected_candidate = args.get("expected_candidate")
     if (
         not isinstance(expected_candidate, str)
@@ -3307,9 +4054,29 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
         raise RuntimeError("retry-review expected Candidate CAS mismatch")
     if not any(item.kind == "plan" for item in run.planning_authority):
         raise RuntimeError("retry-review requires frozen plan authority pre-dispatch")
+    from .manager import _current_workflow_step
+
+    target = _current_workflow_step(run)
+    card = (
+        target.card
+        if target is not None
+        else next(
+            (step.card for step in reversed(run.steps) if step.phase == "review"),
+            "review",
+        )
+    )
     # 重跑 review 本身即是 review 交接修復：candidate 未變，不是 model repair。
     retry_classification = _classify_retry(
         run, workflow_registry, trigger="review-handoff-failure"
+    )
+    # 先落 content-addressed 裁決 evidence 再重置 run：evidence 寫入失敗時
+    # run 維持 needs_human，不會在缺裁決的情況下重派。
+    adjudication_evidence = _record_operator_adjudication(
+        run=run,
+        card=card,
+        args=args,
+        state_path=state_path,
+        now_epoch=now_epoch,
     )
     updated = workflow_registry._manager_reset_workflow_for_retry_review(
         run.run_id,
@@ -3319,6 +4086,8 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
         "action": "retry-review",
+        "adjudication_evidence": adjudication_evidence,
+        "adjudication": operator_adjudication_receipt(adjudication_evidence, card=card),
         "reason": "foreign-review-rerun-dispatched",
         "expected_candidate": expected_candidate.lower(),
         "run": updated.to_dict(),
@@ -7022,6 +7791,8 @@ def execute_work_action(
             args=args,
             authority=authority,
             workflow_registry=workflow_registry,
+            state_path=resolved_state_path,
+            now_epoch=now_epoch,
         )
     elif action == "recover-planning":
         result = _recover_planning_action(

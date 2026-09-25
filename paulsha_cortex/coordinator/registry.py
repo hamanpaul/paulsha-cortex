@@ -3,7 +3,9 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -214,6 +216,1596 @@ def _copy_json_list(value: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _deepcopy_json(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+_MAX_SAFE_JSON_INTEGER = 9_007_199_254_740_991
+_SLICE_BINDING_VERSION = "cortex/slice-binding/v1"
+_RECOVERY_REQUEST_VERSION = "cortex/recovery-registry-request/v1"
+_RECOVERY_RECEIPT_VERSION = "cortex/recovery-registry-receipt/v1"
+_JOB_SUPERSESSION_VERSION = "cortex/job-supersession/v1"
+_JOB_CONSUMPTION_VERSION = "cortex/job-consumption/v1"
+_CHECKPOINT_REQUEST_VERSION = "cortex/legacy-binding-checkpoint-request/v1"
+_CHECKPOINT_SNAPSHOT_VERSION = "cortex/legacy-binding-snapshot/v1"
+_CHECKPOINT_RECEIPT_VERSION = "cortex/legacy-binding-checkpoint-receipt/v1"
+_BOUND_BINDING_FIELD = "bound_binding"
+_RECOVERY_REQUIRED_STEP_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
+_RECOVERY_REQUEST_FIELDS = frozenset({"version", "request_id", "payload", "request_digest"})
+_RECOVERY_REQUEST_PAYLOAD_FIELDS = frozenset(
+    {
+        "request_type",
+        "action",
+        "target",
+        "expected_binding",
+        "required_steps",
+        "actor",
+        "requested_by",
+        "created_at",
+    }
+)
+_RECOVERY_TARGET_FIELDS = frozenset({"repo", "work_id", "slice_id"})
+_SLICE_BINDING_FIELDS = frozenset(
+    {
+        "binding_version",
+        "binding_revision",
+        "builder_job_id",
+        "reviewer_job_id",
+        "candidate",
+        "state",
+        "gate_state",
+        "spec",
+        "plan",
+        "verification_hash",
+        "target_branch",
+        "target_remote",
+        "dispatch_base",
+    }
+)
+_LEGACY_BINDING_FIELDS = frozenset(field for field in _SLICE_BINDING_FIELDS if not field.startswith("binding_"))
+_RECOVERY_RECEIPT_FIELDS = frozenset(
+    {
+        "version",
+        "request_id",
+        "request_digest",
+        "payload",
+        "phase",
+        "prepared_at",
+        "completed_at",
+        "applied_binding",
+        "affected_job_ids",
+        "required_steps",
+        "step_receipts",
+        "result",
+    }
+)
+_RECOVERY_STEP_RECEIPT_FIELDS = frozenset({"step_id", "ref", "sha256"})
+_JOB_SUPERSESSION_FIELDS = frozenset(
+    {
+        "version",
+        "job_id",
+        "slice_id",
+        "binding_revision",
+        "actor",
+        "at",
+        "reason",
+        "superseding_identity",
+        _BOUND_BINDING_FIELD,
+    }
+)
+_JOB_SUPERSESSION_REQUIRED_FIELDS = _JOB_SUPERSESSION_FIELDS - {_BOUND_BINDING_FIELD}
+_JOB_CONSUMPTION_FIELDS = frozenset(
+    {
+        "version",
+        "job_id",
+        "slice_id",
+        "binding_revision",
+        "actor",
+        "at",
+        "completion_identity",
+        "proof_refs",
+        _BOUND_BINDING_FIELD,
+    }
+)
+_JOB_CONSUMPTION_REQUIRED_FIELDS = _JOB_CONSUMPTION_FIELDS - {_BOUND_BINDING_FIELD}
+_CHECKPOINT_REQUEST_FIELDS = frozenset({"version", "request_id", "payload", "request_digest"})
+_CHECKPOINT_REQUEST_PAYLOAD_FIELDS = frozenset(
+    {
+        "operation",
+        "target",
+        "expected_legacy_row",
+        "expected_legacy_binding",
+        "expected_job_refs",
+        "legacy_snapshot_fingerprint",
+        "actor",
+        "requested_by",
+        "created_at",
+        "provenance",
+    }
+)
+_CHECKPOINT_JOB_REF_FIELDS = frozenset({"builder_job_id", "reviewer_job_id"})
+_CHECKPOINT_PROVENANCE_FIELDS = frozenset(
+    {"owner_action_ref", "observed_at", "authority_ref", "proof_refs"}
+)
+_PROOF_REF_FIELDS = frozenset({"ref", "sha256"})
+_REQUEST_IDENTITY_FIELDS = frozenset({"request_id", "request_digest"})
+_BINDING_IDENTITY_FIELDS = frozenset(
+    {"binding_version", "binding_revision", "builder_job_id", "reviewer_job_id", "candidate"}
+)
+_CHECKPOINT_RECEIPT_FIELDS = frozenset(
+    {
+        "version",
+        "request_id",
+        "request_digest",
+        "payload",
+        "phase",
+        "checkpointed_at",
+        "applied_binding",
+        "provenance",
+        "result",
+    }
+)
+
+
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _prefixed_canonical_json_digest(prefix: str, payload: Any) -> str:
+    return hashlib.sha256(prefix.encode("utf-8") + b"\n" + _canonical_json_bytes(payload)).hexdigest()
+
+
+def _contract_error(
+    code: str,
+    *,
+    state_path: Path,
+    detail: str | None = None,
+) -> ValueError:
+    suffix = f": {detail}" if detail else ""
+    return ValueError(f"{code}{suffix}（fail-closed）: {state_path}")
+
+
+def _same_disposition_except_at(existing: object, proposed: Mapping[str, Any]) -> bool:
+    if not isinstance(existing, Mapping) or "at" not in existing or "at" not in proposed:
+        return False
+    return (
+        {key: value for key, value in existing.items() if key != "at"}
+        == {key: value for key, value in proposed.items() if key != "at"}
+    )
+
+
+def _require_non_empty_string(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> str:
+    if not isinstance(value, str) or not value:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label) from exc
+    return value
+
+
+def _require_exact_dict_keys(
+    value: object,
+    *,
+    expected: frozenset[str],
+    label: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    normalized = dict(value)
+    if set(normalized) != expected:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    return normalized
+
+
+def _require_dict_keys_with_optional(
+    value: object,
+    *,
+    required: frozenset[str],
+    optional: frozenset[str],
+    label: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    normalized = dict(value)
+    keys = set(normalized)
+    if not required.issubset(keys) or keys - required - optional:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    return normalized
+
+
+def _require_optional_string(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> str | None:
+    if value is None:
+        return None
+    return _require_non_empty_string(value, label=label, state_path=state_path)
+
+
+def _require_sha256_hex(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> str:
+    normalized = _require_non_empty_string(value, label=label, state_path=state_path)
+    if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    return normalized
+
+
+def _require_safe_integer(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+    minimum: int = 1,
+) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum or value > _MAX_SAFE_JSON_INTEGER:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    return value
+
+
+def _validate_json_tree(
+    value: Any,
+    *,
+    allow_bool: bool,
+    allow_float: bool,
+    label: str,
+    state_path: Path,
+    _stack: set[int] | None = None,
+) -> Any:
+    stack = set() if _stack is None else _stack
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label) from exc
+        return value
+    if isinstance(value, bool):
+        if not allow_bool:
+            raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not allow_float or not math.isfinite(value):
+            raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+        return value
+    if isinstance(value, list):
+        object_id = id(value)
+        if object_id in stack:
+            raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+        stack.add(object_id)
+        try:
+            return [
+                _validate_json_tree(
+                    item,
+                    allow_bool=allow_bool,
+                    allow_float=allow_float,
+                    label=label,
+                    state_path=state_path,
+                    _stack=stack,
+                )
+                for item in value
+            ]
+        finally:
+            stack.remove(object_id)
+    if isinstance(value, Mapping):
+        object_id = id(value)
+        if object_id in stack:
+            raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+        stack.add(object_id)
+        normalized: dict[str, Any] = {}
+        try:
+            for key, nested in value.items():
+                if not isinstance(key, str):
+                    raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+                try:
+                    key.encode("utf-8")
+                except UnicodeEncodeError as exc:
+                    raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label) from exc
+                normalized[key] = _validate_json_tree(
+                    nested,
+                    allow_bool=allow_bool,
+                    allow_float=allow_float,
+                    label=label,
+                    state_path=state_path,
+                    _stack=stack,
+                )
+            return normalized
+        finally:
+            stack.remove(object_id)
+    raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+
+
+def _validate_spec_meta(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> dict[str, str]:
+    meta = _require_exact_dict_keys(
+        value,
+        expected=frozenset({"path", "hash"}),
+        label=label,
+        state_path=state_path,
+    )
+    return {
+        "path": _require_non_empty_string(meta.get("path"), label=f"{label}.path", state_path=state_path),
+        "hash": _require_non_empty_string(meta.get("hash"), label=f"{label}.hash", state_path=state_path),
+    }
+
+
+def _validate_job_ref(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> str | None:
+    return _require_optional_string(value, label=label, state_path=state_path)
+
+
+def _validate_candidate(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> str | None:
+    return _require_optional_string(value, label=label, state_path=state_path)
+
+
+def _validate_target(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> dict[str, str | None]:
+    target = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_TARGET_FIELDS,
+        label=label,
+        state_path=state_path,
+    )
+    return {
+        "repo": _require_non_empty_string(target.get("repo"), label=f"{label}.repo", state_path=state_path),
+        "work_id": _require_optional_string(
+            target.get("work_id"),
+            label=f"{label}.work_id",
+            state_path=state_path,
+        ),
+        "slice_id": _require_non_empty_string(
+            target.get("slice_id"),
+            label=f"{label}.slice_id",
+            state_path=state_path,
+        ),
+    }
+
+
+def _validate_required_steps(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    normalized = [
+        _require_non_empty_string(item, label=f"{label}[]", state_path=state_path)
+        for item in value
+    ]
+    if any(_RECOVERY_REQUIRED_STEP_RE.fullmatch(item) is None for item in normalized):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    if normalized != sorted(normalized) or len(set(normalized)) != len(normalized):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    return normalized
+
+
+def _validate_proof_refs(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+    required: bool,
+) -> list[dict[str, str]]:
+    if not isinstance(value, list) or (required and not value):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    seen: set[str] = set()
+    normalized: list[dict[str, str]] = []
+    for item in value:
+        proof = _require_exact_dict_keys(
+            item,
+            expected=_PROOF_REF_FIELDS,
+            label=f"{label}[]",
+            state_path=state_path,
+        )
+        ref = _require_non_empty_string(proof.get("ref"), label=f"{label}[].ref", state_path=state_path)
+        sha256 = _require_sha256_hex(
+            proof.get("sha256"),
+            label=f"{label}[].sha256",
+            state_path=state_path,
+        )
+        if ref in seen:
+            raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+        seen.add(ref)
+        normalized.append({"ref": ref, "sha256": sha256})
+    return normalized
+
+
+def _validate_disposition_identity(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    normalized = dict(value)
+    keys = frozenset(normalized)
+    if keys == _REQUEST_IDENTITY_FIELDS:
+        return {
+            "request_id": _require_non_empty_string(
+                normalized.get("request_id"),
+                label=f"{label}.request_id",
+                state_path=state_path,
+            ),
+            "request_digest": _require_sha256_hex(
+                normalized.get("request_digest"),
+                label=f"{label}.request_digest",
+                state_path=state_path,
+            ),
+        }
+    if keys == _BINDING_IDENTITY_FIELDS:
+        binding_version = _require_non_empty_string(
+            normalized.get("binding_version"),
+            label=f"{label}.binding_version",
+            state_path=state_path,
+        )
+        if binding_version != _SLICE_BINDING_VERSION:
+            raise _contract_error("unsupported-recovery-version", state_path=state_path, detail=label)
+        return {
+            "binding_version": binding_version,
+            "binding_revision": _require_safe_integer(
+                normalized.get("binding_revision"),
+                label=f"{label}.binding_revision",
+                state_path=state_path,
+            ),
+            "builder_job_id": _validate_job_ref(
+                normalized.get("builder_job_id"),
+                label=f"{label}.builder_job_id",
+                state_path=state_path,
+            ),
+            "reviewer_job_id": _validate_job_ref(
+                normalized.get("reviewer_job_id"),
+                label=f"{label}.reviewer_job_id",
+                state_path=state_path,
+            ),
+            "candidate": _validate_candidate(
+                normalized.get("candidate"),
+                label=f"{label}.candidate",
+                state_path=state_path,
+            ),
+        }
+    raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+
+
+def _validate_slice_binding_snapshot(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    binding = _require_exact_dict_keys(
+        value,
+        expected=_SLICE_BINDING_FIELDS,
+        label=label,
+        state_path=state_path,
+    )
+    state = _require_non_empty_string(binding.get("state"), label=f"{label}.state", state_path=state_path)
+    gate_state = _require_non_empty_string(
+        binding.get("gate_state"),
+        label=f"{label}.gate_state",
+        state_path=state_path,
+    )
+    if state not in VALID_SLICE_STATES or gate_state not in VALID_GATE_STATES:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    binding_version = _require_non_empty_string(
+        binding.get("binding_version"),
+        label=f"{label}.binding_version",
+        state_path=state_path,
+    )
+    if binding_version != _SLICE_BINDING_VERSION:
+        raise _contract_error("unsupported-recovery-version", state_path=state_path, detail=label)
+    return {
+        "binding_version": binding_version,
+        "binding_revision": _require_safe_integer(
+            binding.get("binding_revision"),
+            label=f"{label}.binding_revision",
+            state_path=state_path,
+        ),
+        "builder_job_id": _validate_job_ref(
+            binding.get("builder_job_id"),
+            label=f"{label}.builder_job_id",
+            state_path=state_path,
+        ),
+        "reviewer_job_id": _validate_job_ref(
+            binding.get("reviewer_job_id"),
+            label=f"{label}.reviewer_job_id",
+            state_path=state_path,
+        ),
+        "candidate": _validate_candidate(
+            binding.get("candidate"),
+            label=f"{label}.candidate",
+            state_path=state_path,
+        ),
+        "state": state,
+        "gate_state": gate_state,
+        "spec": _validate_spec_meta(binding.get("spec"), label=f"{label}.spec", state_path=state_path),
+        "plan": _validate_spec_meta(binding.get("plan"), label=f"{label}.plan", state_path=state_path),
+        "verification_hash": _require_non_empty_string(
+            binding.get("verification_hash"),
+            label=f"{label}.verification_hash",
+            state_path=state_path,
+        ),
+        "target_branch": _require_non_empty_string(
+            binding.get("target_branch"),
+            label=f"{label}.target_branch",
+            state_path=state_path,
+        ),
+        "target_remote": _require_non_empty_string(
+            binding.get("target_remote"),
+            label=f"{label}.target_remote",
+            state_path=state_path,
+        ),
+        "dispatch_base": _require_optional_string(
+            binding.get("dispatch_base"),
+            label=f"{label}.dispatch_base",
+            state_path=state_path,
+        ),
+    }
+
+
+def _validate_legacy_binding_snapshot(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    binding = _require_exact_dict_keys(
+        value,
+        expected=_LEGACY_BINDING_FIELDS,
+        label=label,
+        state_path=state_path,
+    )
+    state = _require_non_empty_string(binding.get("state"), label=f"{label}.state", state_path=state_path)
+    gate_state = _require_non_empty_string(
+        binding.get("gate_state"),
+        label=f"{label}.gate_state",
+        state_path=state_path,
+    )
+    if state not in VALID_SLICE_STATES or gate_state not in VALID_GATE_STATES:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    return {
+        "builder_job_id": _validate_job_ref(
+            binding.get("builder_job_id"),
+            label=f"{label}.builder_job_id",
+            state_path=state_path,
+        ),
+        "reviewer_job_id": _validate_job_ref(
+            binding.get("reviewer_job_id"),
+            label=f"{label}.reviewer_job_id",
+            state_path=state_path,
+        ),
+        "candidate": _validate_candidate(
+            binding.get("candidate"),
+            label=f"{label}.candidate",
+            state_path=state_path,
+        ),
+        "state": state,
+        "gate_state": gate_state,
+        "spec": _validate_spec_meta(binding.get("spec"), label=f"{label}.spec", state_path=state_path),
+        "plan": _validate_spec_meta(binding.get("plan"), label=f"{label}.plan", state_path=state_path),
+        "verification_hash": _require_non_empty_string(
+            binding.get("verification_hash"),
+            label=f"{label}.verification_hash",
+            state_path=state_path,
+        ),
+        "target_branch": _require_non_empty_string(
+            binding.get("target_branch"),
+            label=f"{label}.target_branch",
+            state_path=state_path,
+        ),
+        "target_remote": _require_non_empty_string(
+            binding.get("target_remote"),
+            label=f"{label}.target_remote",
+            state_path=state_path,
+        ),
+        "dispatch_base": _require_optional_string(
+            binding.get("dispatch_base"),
+            label=f"{label}.dispatch_base",
+            state_path=state_path,
+        ),
+    }
+
+
+def _validate_job_refs_snapshot(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> dict[str, str | None]:
+    refs = _require_exact_dict_keys(
+        value,
+        expected=_CHECKPOINT_JOB_REF_FIELDS,
+        label=label,
+        state_path=state_path,
+    )
+    return {
+        "builder_job_id": _validate_job_ref(
+            refs.get("builder_job_id"),
+            label=f"{label}.builder_job_id",
+            state_path=state_path,
+        ),
+        "reviewer_job_id": _validate_job_ref(
+            refs.get("reviewer_job_id"),
+            label=f"{label}.reviewer_job_id",
+            state_path=state_path,
+        ),
+    }
+
+
+def _validate_recovery_request_payload(
+    value: object,
+    *,
+    expected_slice_id: str | None,
+    state_path: Path,
+) -> dict[str, Any]:
+    payload = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_REQUEST_PAYLOAD_FIELDS,
+        label="recovery payload",
+        state_path=state_path,
+    )
+    target = _validate_target(payload.get("target"), label="recovery payload.target", state_path=state_path)
+    if expected_slice_id is not None and target["slice_id"] != expected_slice_id:
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="slice_id")
+    expected_binding = _validate_slice_binding_snapshot(
+        payload.get("expected_binding"),
+        label="recovery payload.expected_binding",
+        state_path=state_path,
+    )
+    if expected_binding["candidate"] is not None or expected_binding["state"] not in {"needs_human", "failed"}:
+        raise _contract_error("recovery-binding-required", state_path=state_path)
+    if (
+        expected_binding["builder_job_id"] is None
+        and expected_binding["reviewer_job_id"] is None
+    ):
+        raise _contract_error("recovery-binding-required", state_path=state_path)
+    action = _require_non_empty_string(payload.get("action"), label="recovery payload.action", state_path=state_path)
+    if action != "recover-pre-candidate":
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="action")
+    request_type = _require_non_empty_string(
+        payload.get("request_type"),
+        label="recovery payload.request_type",
+        state_path=state_path,
+    )
+    if request_type not in {"slice-action", "work-action"}:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="request_type")
+    return {
+        "request_type": request_type,
+        "action": action,
+        "target": target,
+        "expected_binding": expected_binding,
+        "required_steps": _validate_required_steps(
+            payload.get("required_steps"),
+            label="recovery payload.required_steps",
+            state_path=state_path,
+        ),
+        "actor": _require_non_empty_string(
+            payload.get("actor"),
+            label="recovery payload.actor",
+            state_path=state_path,
+        ),
+        "requested_by": _require_non_empty_string(
+            payload.get("requested_by"),
+            label="recovery payload.requested_by",
+            state_path=state_path,
+        ),
+        "created_at": _require_non_empty_string(
+            payload.get("created_at"),
+            label="recovery payload.created_at",
+            state_path=state_path,
+        ),
+    }
+
+
+def _validate_checkpoint_provenance(
+    value: object,
+    *,
+    label: str,
+    state_path: Path,
+) -> dict[str, Any]:
+    provenance = _require_exact_dict_keys(
+        value,
+        expected=_CHECKPOINT_PROVENANCE_FIELDS,
+        label=label,
+        state_path=state_path,
+    )
+    return {
+        "owner_action_ref": _require_non_empty_string(
+            provenance.get("owner_action_ref"),
+            label=f"{label}.owner_action_ref",
+            state_path=state_path,
+        ),
+        "observed_at": _require_non_empty_string(
+            provenance.get("observed_at"),
+            label=f"{label}.observed_at",
+            state_path=state_path,
+        ),
+        "authority_ref": _require_non_empty_string(
+            provenance.get("authority_ref"),
+            label=f"{label}.authority_ref",
+            state_path=state_path,
+        ),
+        "proof_refs": _validate_proof_refs(
+            provenance.get("proof_refs"),
+            label=f"{label}.proof_refs",
+            state_path=state_path,
+            required=True,
+        ),
+    }
+
+
+def _checkpoint_fingerprint_payload(
+    *,
+    expected_legacy_row: Mapping[str, Any],
+    expected_legacy_binding: Mapping[str, Any],
+    expected_job_refs: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "version": _CHECKPOINT_SNAPSHOT_VERSION,
+        "slice": dict(expected_legacy_row),
+        "binding": dict(expected_legacy_binding),
+        "job_refs": dict(expected_job_refs),
+    }
+
+
+def _compute_checkpoint_fingerprint(
+    *,
+    expected_legacy_row: Mapping[str, Any],
+    expected_legacy_binding: Mapping[str, Any],
+    expected_job_refs: Mapping[str, Any],
+) -> str:
+    return _prefixed_canonical_json_digest(
+        _CHECKPOINT_SNAPSHOT_VERSION,
+        _checkpoint_fingerprint_payload(
+            expected_legacy_row=expected_legacy_row,
+            expected_legacy_binding=expected_legacy_binding,
+            expected_job_refs=expected_job_refs,
+        ),
+    )
+
+
+def _validate_checkpoint_request_payload(
+    value: object,
+    *,
+    expected_slice_id: str | None,
+    state_path: Path,
+) -> dict[str, Any]:
+    payload = _require_exact_dict_keys(
+        value,
+        expected=_CHECKPOINT_REQUEST_PAYLOAD_FIELDS,
+        label="checkpoint payload",
+        state_path=state_path,
+    )
+    operation = _require_non_empty_string(
+        payload.get("operation"),
+        label="checkpoint payload.operation",
+        state_path=state_path,
+    )
+    if operation != "checkpoint-legacy-binding":
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="operation")
+    target = _validate_target(payload.get("target"), label="checkpoint payload.target", state_path=state_path)
+    if expected_slice_id is not None and target["slice_id"] != expected_slice_id:
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="slice_id")
+    expected_legacy_row = _validate_json_tree(
+        payload.get("expected_legacy_row"),
+        allow_bool=True,
+        allow_float=True,
+        label="checkpoint payload.expected_legacy_row",
+        state_path=state_path,
+    )
+    if not isinstance(expected_legacy_row, dict):
+        raise _contract_error(
+            "malformed-recovery-context",
+            state_path=state_path,
+            detail="checkpoint payload.expected_legacy_row",
+        )
+    if any(field in expected_legacy_row for field in ("binding_version", "binding_revision", "binding_checkpoint_receipt")):
+        raise _contract_error("legacy-checkpoint-not-applicable", state_path=state_path)
+    expected_legacy_binding = _validate_legacy_binding_snapshot(
+        payload.get("expected_legacy_binding"),
+        label="checkpoint payload.expected_legacy_binding",
+        state_path=state_path,
+    )
+    expected_job_refs = _validate_job_refs_snapshot(
+        payload.get("expected_job_refs"),
+        label="checkpoint payload.expected_job_refs",
+        state_path=state_path,
+    )
+    try:
+        row_binding_source = {
+            "builder_job_id": expected_legacy_row["builder_job_id"],
+            "reviewer_job_id": expected_legacy_row["reviewer_job_id"],
+            "candidate": expected_legacy_row["candidate"],
+            "state": expected_legacy_row["state"],
+            "gate_state": expected_legacy_row["gate_state"],
+            "spec": expected_legacy_row["spec"],
+            "plan": expected_legacy_row["plan"],
+            "verification_hash": expected_legacy_row["verification"]["hash"],
+            "target_branch": expected_legacy_row["target_branch"],
+            "target_remote": expected_legacy_row["target_remote"],
+            "dispatch_base": expected_legacy_row["dispatch_base"],
+        }
+    except (KeyError, TypeError) as exc:
+        raise _contract_error(
+            "malformed-recovery-context",
+            state_path=state_path,
+            detail="expected_legacy_row",
+        ) from exc
+    row_binding = _validate_legacy_binding_snapshot(
+        row_binding_source,
+        label="checkpoint payload.expected_legacy_row.binding",
+        state_path=state_path,
+    )
+    if row_binding != expected_legacy_binding:
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="expected_legacy_binding")
+    row_job_refs = _validate_job_refs_snapshot(
+        {field: expected_legacy_row.get(field) for field in _CHECKPOINT_JOB_REF_FIELDS},
+        label="checkpoint payload.expected_legacy_row.refs",
+        state_path=state_path,
+    )
+    if row_job_refs != expected_job_refs or row_job_refs != {
+        "builder_job_id": expected_legacy_binding["builder_job_id"],
+        "reviewer_job_id": expected_legacy_binding["reviewer_job_id"],
+    }:
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="expected_job_refs")
+    legacy_snapshot_fingerprint = _require_sha256_hex(
+        payload.get("legacy_snapshot_fingerprint"),
+        label="checkpoint payload.legacy_snapshot_fingerprint",
+        state_path=state_path,
+    )
+    expected_fingerprint = _compute_checkpoint_fingerprint(
+        expected_legacy_row=expected_legacy_row,
+        expected_legacy_binding=expected_legacy_binding,
+        expected_job_refs=expected_job_refs,
+    )
+    if legacy_snapshot_fingerprint != expected_fingerprint:
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="legacy_snapshot_fingerprint")
+    return {
+        "operation": operation,
+        "target": target,
+        "expected_legacy_row": expected_legacy_row,
+        "expected_legacy_binding": expected_legacy_binding,
+        "expected_job_refs": expected_job_refs,
+        "legacy_snapshot_fingerprint": legacy_snapshot_fingerprint,
+        "actor": _require_non_empty_string(
+            payload.get("actor"),
+            label="checkpoint payload.actor",
+            state_path=state_path,
+        ),
+        "requested_by": _require_non_empty_string(
+            payload.get("requested_by"),
+            label="checkpoint payload.requested_by",
+            state_path=state_path,
+        ),
+        "created_at": _require_non_empty_string(
+            payload.get("created_at"),
+            label="checkpoint payload.created_at",
+            state_path=state_path,
+        ),
+        "provenance": _validate_checkpoint_provenance(
+            payload.get("provenance"),
+            label="checkpoint payload.provenance",
+            state_path=state_path,
+        ),
+    }
+
+
+def _validate_recovery_request(
+    value: object,
+    *,
+    expected_slice_id: str | None,
+    state_path: Path,
+) -> dict[str, Any]:
+    request = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_REQUEST_FIELDS,
+        label="recovery request",
+        state_path=state_path,
+    )
+    version = _require_non_empty_string(
+        request.get("version"),
+        label="recovery request.version",
+        state_path=state_path,
+    )
+    if version != _RECOVERY_REQUEST_VERSION:
+        raise _contract_error("unsupported-recovery-version", state_path=state_path)
+    request_id = _require_non_empty_string(
+        request.get("request_id"),
+        label="recovery request.request_id",
+        state_path=state_path,
+    )
+    payload = _validate_recovery_request_payload(
+        request.get("payload"),
+        expected_slice_id=expected_slice_id,
+        state_path=state_path,
+    )
+    request_digest = _require_sha256_hex(
+        request.get("request_digest"),
+        label="recovery request.request_digest",
+        state_path=state_path,
+    )
+    expected_digest = _prefixed_canonical_json_digest(
+        _RECOVERY_REQUEST_VERSION,
+        {"version": version, "request_id": request_id, "payload": payload},
+    )
+    if request_digest != expected_digest:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="request_digest")
+    return {
+        "version": version,
+        "request_id": request_id,
+        "payload": payload,
+        "request_digest": request_digest,
+    }
+
+
+def _validate_checkpoint_request(
+    value: object,
+    *,
+    expected_slice_id: str | None,
+    state_path: Path,
+) -> dict[str, Any]:
+    request = _require_exact_dict_keys(
+        value,
+        expected=_CHECKPOINT_REQUEST_FIELDS,
+        label="checkpoint request",
+        state_path=state_path,
+    )
+    version = _require_non_empty_string(
+        request.get("version"),
+        label="checkpoint request.version",
+        state_path=state_path,
+    )
+    if version != _CHECKPOINT_REQUEST_VERSION:
+        raise _contract_error("unsupported-recovery-version", state_path=state_path)
+    request_id = _require_non_empty_string(
+        request.get("request_id"),
+        label="checkpoint request.request_id",
+        state_path=state_path,
+    )
+    payload = _validate_checkpoint_request_payload(
+        request.get("payload"),
+        expected_slice_id=expected_slice_id,
+        state_path=state_path,
+    )
+    request_digest = _require_sha256_hex(
+        request.get("request_digest"),
+        label="checkpoint request.request_digest",
+        state_path=state_path,
+    )
+    expected_digest = _prefixed_canonical_json_digest(
+        _CHECKPOINT_REQUEST_VERSION,
+        {"version": version, "request_id": request_id, "payload": payload},
+    )
+    if request_digest != expected_digest:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="request_digest")
+    return {
+        "version": version,
+        "request_id": request_id,
+        "payload": payload,
+        "request_digest": request_digest,
+    }
+
+
+def _expected_affected_job_ids(expected_binding: Mapping[str, Any]) -> list[str]:
+    return [
+        job_id
+        for job_id in (
+            expected_binding.get("builder_job_id"),
+            expected_binding.get("reviewer_job_id"),
+        )
+        if isinstance(job_id, str)
+    ]
+
+
+def _expected_recovery_applied_binding(expected_binding: Mapping[str, Any]) -> dict[str, Any]:
+    applied = _deepcopy_json(expected_binding)
+    applied["binding_revision"] = int(expected_binding["binding_revision"]) + 1
+    applied["builder_job_id"] = None
+    applied["reviewer_job_id"] = None
+    applied["candidate"] = None
+    applied["state"] = "pending"
+    applied["gate_state"] = "pending"
+    return applied
+
+
+def _expected_checkpoint_applied_binding(expected_legacy_binding: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "binding_version": _SLICE_BINDING_VERSION,
+        "binding_revision": 1,
+        **_deepcopy_json(expected_legacy_binding),
+    }
+
+
+def _validate_affected_job_ids(
+    value: object,
+    *,
+    expected_binding: Mapping[str, Any],
+    label: str,
+    state_path: Path,
+) -> list[str]:
+    if not isinstance(value, list):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label)
+    normalized = [
+        _require_non_empty_string(item, label=f"{label}[]", state_path=state_path)
+        for item in value
+    ]
+    if normalized != _expected_affected_job_ids(expected_binding):
+        raise _contract_error("request-content-conflict", state_path=state_path, detail=label)
+    return normalized
+
+
+def _validate_step_receipts(
+    value: object,
+    *,
+    required_steps: list[str],
+    label: str,
+    state_path: Path,
+) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise _contract_error("incomplete-recovery-proof", state_path=state_path)
+    normalized: list[dict[str, str]] = []
+    seen_steps: set[str] = set()
+    for item in value:
+        receipt = _require_exact_dict_keys(
+            item,
+            expected=_RECOVERY_STEP_RECEIPT_FIELDS,
+            label=f"{label}[]",
+            state_path=state_path,
+        )
+        step_id = _require_non_empty_string(
+            receipt.get("step_id"),
+            label=f"{label}[].step_id",
+            state_path=state_path,
+        )
+        if step_id not in required_steps or step_id in seen_steps:
+            raise _contract_error("incomplete-recovery-proof", state_path=state_path)
+        seen_steps.add(step_id)
+        normalized.append(
+            {
+                "step_id": step_id,
+                "ref": _require_non_empty_string(
+                    receipt.get("ref"),
+                    label=f"{label}[].ref",
+                    state_path=state_path,
+                ),
+                "sha256": _require_sha256_hex(
+                    receipt.get("sha256"),
+                    label=f"{label}[].sha256",
+                    state_path=state_path,
+                ),
+            }
+        )
+    if seen_steps != set(required_steps):
+        raise _contract_error("incomplete-recovery-proof", state_path=state_path)
+    return normalized
+
+
+def _validate_recovery_receipt(
+    value: object,
+    *,
+    slice_row: Mapping[str, Any],
+    state_path: Path,
+) -> dict[str, Any]:
+    receipt = _require_exact_dict_keys(
+        value,
+        expected=_RECOVERY_RECEIPT_FIELDS,
+        label="recovery receipt",
+        state_path=state_path,
+    )
+    version = _require_non_empty_string(
+        receipt.get("version"),
+        label="recovery receipt.version",
+        state_path=state_path,
+    )
+    if version != _RECOVERY_RECEIPT_VERSION:
+        raise _contract_error("unsupported-recovery-version", state_path=state_path)
+    request_id = _require_non_empty_string(
+        receipt.get("request_id"),
+        label="recovery receipt.request_id",
+        state_path=state_path,
+    )
+    payload = _validate_recovery_request_payload(
+        receipt.get("payload"),
+        expected_slice_id=str(slice_row["slice_id"]),
+        state_path=state_path,
+    )
+    request_digest = _require_sha256_hex(
+        receipt.get("request_digest"),
+        label="recovery receipt.request_digest",
+        state_path=state_path,
+    )
+    expected_digest = _prefixed_canonical_json_digest(
+        _RECOVERY_REQUEST_VERSION,
+        {"version": _RECOVERY_REQUEST_VERSION, "request_id": request_id, "payload": payload},
+    )
+    if request_digest != expected_digest:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="request_digest")
+    phase = _require_non_empty_string(
+        receipt.get("phase"),
+        label="recovery receipt.phase",
+        state_path=state_path,
+    )
+    if phase not in {"prepared", "complete"}:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="phase")
+    normalized = {
+        "version": version,
+        "request_id": request_id,
+        "request_digest": request_digest,
+        "payload": payload,
+        "phase": phase,
+        "prepared_at": _require_non_empty_string(
+            receipt.get("prepared_at"),
+            label="recovery receipt.prepared_at",
+            state_path=state_path,
+        ),
+        "completed_at": None,
+        "applied_binding": None,
+        "affected_job_ids": _validate_affected_job_ids(
+            receipt.get("affected_job_ids"),
+            expected_binding=payload["expected_binding"],
+            label="recovery receipt.affected_job_ids",
+            state_path=state_path,
+        ),
+        "required_steps": _validate_required_steps(
+            receipt.get("required_steps"),
+            label="recovery receipt.required_steps",
+            state_path=state_path,
+        ),
+        "step_receipts": [],
+        "result": None,
+    }
+    if normalized["required_steps"] != payload["required_steps"]:
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="required_steps")
+    if phase == "prepared":
+        if (
+            receipt.get("completed_at") is not None
+            or receipt.get("applied_binding") is not None
+            or receipt.get("result") is not None
+            or receipt.get("step_receipts") != []
+        ):
+            raise _contract_error("malformed-recovery-context", state_path=state_path, detail="prepared-phase")
+        return normalized
+    normalized["completed_at"] = _require_non_empty_string(
+        receipt.get("completed_at"),
+        label="recovery receipt.completed_at",
+        state_path=state_path,
+    )
+    normalized["applied_binding"] = _validate_slice_binding_snapshot(
+        receipt.get("applied_binding"),
+        label="recovery receipt.applied_binding",
+        state_path=state_path,
+    )
+    if normalized["applied_binding"] != _expected_recovery_applied_binding(payload["expected_binding"]):
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="applied_binding")
+    normalized["step_receipts"] = _validate_step_receipts(
+        receipt.get("step_receipts"),
+        required_steps=normalized["required_steps"],
+        label="recovery receipt.step_receipts",
+        state_path=state_path,
+    )
+    normalized["result"] = _require_non_empty_string(
+        receipt.get("result"),
+        label="recovery receipt.result",
+        state_path=state_path,
+    )
+    return normalized
+
+
+def _validate_checkpoint_receipt(
+    value: object,
+    *,
+    slice_row: Mapping[str, Any],
+    state_path: Path,
+) -> dict[str, Any]:
+    receipt = _require_exact_dict_keys(
+        value,
+        expected=_CHECKPOINT_RECEIPT_FIELDS,
+        label="checkpoint receipt",
+        state_path=state_path,
+    )
+    version = _require_non_empty_string(
+        receipt.get("version"),
+        label="checkpoint receipt.version",
+        state_path=state_path,
+    )
+    if version != _CHECKPOINT_RECEIPT_VERSION:
+        raise _contract_error("unsupported-recovery-version", state_path=state_path)
+    request_id = _require_non_empty_string(
+        receipt.get("request_id"),
+        label="checkpoint receipt.request_id",
+        state_path=state_path,
+    )
+    payload = _validate_checkpoint_request_payload(
+        receipt.get("payload"),
+        expected_slice_id=str(slice_row["slice_id"]),
+        state_path=state_path,
+    )
+    request_digest = _require_sha256_hex(
+        receipt.get("request_digest"),
+        label="checkpoint receipt.request_digest",
+        state_path=state_path,
+    )
+    expected_digest = _prefixed_canonical_json_digest(
+        _CHECKPOINT_REQUEST_VERSION,
+        {"version": _CHECKPOINT_REQUEST_VERSION, "request_id": request_id, "payload": payload},
+    )
+    if request_digest != expected_digest:
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="request_digest")
+    phase = _require_non_empty_string(
+        receipt.get("phase"),
+        label="checkpoint receipt.phase",
+        state_path=state_path,
+    )
+    if phase != "complete":
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="phase")
+    applied_binding = _validate_slice_binding_snapshot(
+        receipt.get("applied_binding"),
+        label="checkpoint receipt.applied_binding",
+        state_path=state_path,
+    )
+    if applied_binding != _expected_checkpoint_applied_binding(payload["expected_legacy_binding"]):
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="applied_binding")
+    provenance = _validate_checkpoint_provenance(
+        receipt.get("provenance"),
+        label="checkpoint receipt.provenance",
+        state_path=state_path,
+    )
+    if provenance != payload["provenance"]:
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="provenance")
+    result = _require_non_empty_string(
+        receipt.get("result"),
+        label="checkpoint receipt.result",
+        state_path=state_path,
+    )
+    if result != "checkpoint-created":
+        raise _contract_error("request-content-conflict", state_path=state_path, detail="result")
+    return {
+        "version": version,
+        "request_id": request_id,
+        "request_digest": request_digest,
+        "payload": payload,
+        "phase": phase,
+        "checkpointed_at": _require_non_empty_string(
+            receipt.get("checkpointed_at"),
+            label="checkpoint receipt.checkpointed_at",
+            state_path=state_path,
+        ),
+        "applied_binding": applied_binding,
+        "provenance": provenance,
+        "result": result,
+    }
+
+
+def _validate_job_supersession(
+    value: object,
+    *,
+    state_path: Path,
+) -> dict[str, Any]:
+    supersession = _require_dict_keys_with_optional(
+        value,
+        required=_JOB_SUPERSESSION_REQUIRED_FIELDS,
+        optional=frozenset({_BOUND_BINDING_FIELD}),
+        label="job supersession",
+        state_path=state_path,
+    )
+    version = _require_non_empty_string(
+        supersession.get("version"),
+        label="job supersession.version",
+        state_path=state_path,
+    )
+    if version != _JOB_SUPERSESSION_VERSION:
+        raise _contract_error("unsupported-recovery-version", state_path=state_path)
+    job_id = _require_non_empty_string(
+        supersession.get("job_id"),
+        label="job supersession.job_id",
+        state_path=state_path,
+    )
+    binding_revision = _require_safe_integer(
+        supersession.get("binding_revision"),
+        label="job supersession.binding_revision",
+        state_path=state_path,
+    )
+    normalized = {
+        "version": version,
+        "job_id": job_id,
+        "slice_id": _require_non_empty_string(
+            supersession.get("slice_id"),
+            label="job supersession.slice_id",
+            state_path=state_path,
+        ),
+        "binding_revision": binding_revision,
+        "actor": _require_non_empty_string(
+            supersession.get("actor"),
+            label="job supersession.actor",
+            state_path=state_path,
+        ),
+        "at": _require_non_empty_string(
+            supersession.get("at"),
+            label="job supersession.at",
+            state_path=state_path,
+        ),
+        "reason": _require_non_empty_string(
+            supersession.get("reason"),
+            label="job supersession.reason",
+            state_path=state_path,
+        ),
+        "superseding_identity": _validate_disposition_identity(
+            supersession.get("superseding_identity"),
+            label="job supersession.superseding_identity",
+            state_path=state_path,
+        ),
+    }
+    if _BOUND_BINDING_FIELD in supersession:
+        normalized[_BOUND_BINDING_FIELD] = _validate_slice_binding_snapshot(
+            supersession.get(_BOUND_BINDING_FIELD),
+            label=f"job supersession.{_BOUND_BINDING_FIELD}",
+            state_path=state_path,
+        )
+        if (
+            int(normalized[_BOUND_BINDING_FIELD]["binding_revision"]) != binding_revision
+            or not _job_id_in_binding_snapshot(job_id, normalized[_BOUND_BINDING_FIELD])
+        ):
+            raise _contract_error(
+                "request-content-conflict",
+                state_path=state_path,
+                detail=f"job supersession.{_BOUND_BINDING_FIELD}",
+            )
+    return normalized
+
+
+def _validate_job_consumption(
+    value: object,
+    *,
+    state_path: Path,
+) -> dict[str, Any]:
+    consumption = _require_dict_keys_with_optional(
+        value,
+        required=_JOB_CONSUMPTION_REQUIRED_FIELDS,
+        optional=frozenset({_BOUND_BINDING_FIELD}),
+        label="job consumption",
+        state_path=state_path,
+    )
+    version = _require_non_empty_string(
+        consumption.get("version"),
+        label="job consumption.version",
+        state_path=state_path,
+    )
+    if version != _JOB_CONSUMPTION_VERSION:
+        raise _contract_error("unsupported-recovery-version", state_path=state_path)
+    job_id = _require_non_empty_string(
+        consumption.get("job_id"),
+        label="job consumption.job_id",
+        state_path=state_path,
+    )
+    binding_revision = _require_safe_integer(
+        consumption.get("binding_revision"),
+        label="job consumption.binding_revision",
+        state_path=state_path,
+    )
+    normalized = {
+        "version": version,
+        "job_id": job_id,
+        "slice_id": _require_non_empty_string(
+            consumption.get("slice_id"),
+            label="job consumption.slice_id",
+            state_path=state_path,
+        ),
+        "binding_revision": binding_revision,
+        "actor": _require_non_empty_string(
+            consumption.get("actor"),
+            label="job consumption.actor",
+            state_path=state_path,
+        ),
+        "at": _require_non_empty_string(
+            consumption.get("at"),
+            label="job consumption.at",
+            state_path=state_path,
+        ),
+        "completion_identity": _validate_disposition_identity(
+            consumption.get("completion_identity"),
+            label="job consumption.completion_identity",
+            state_path=state_path,
+        ),
+        "proof_refs": _validate_proof_refs(
+            consumption.get("proof_refs"),
+            label="job consumption.proof_refs",
+            state_path=state_path,
+            required=True,
+        ),
+    }
+    if _BOUND_BINDING_FIELD in consumption:
+        normalized[_BOUND_BINDING_FIELD] = _validate_slice_binding_snapshot(
+            consumption.get(_BOUND_BINDING_FIELD),
+            label=f"job consumption.{_BOUND_BINDING_FIELD}",
+            state_path=state_path,
+        )
+        if (
+            int(normalized[_BOUND_BINDING_FIELD]["binding_revision"]) != binding_revision
+            or not _job_id_in_binding_snapshot(job_id, normalized[_BOUND_BINDING_FIELD])
+        ):
+            raise _contract_error(
+                "request-content-conflict",
+                state_path=state_path,
+                detail=f"job consumption.{_BOUND_BINDING_FIELD}",
+            )
+    return normalized
+
+
+def _slice_binding_from_row(slice_row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "binding_version": slice_row["binding_version"],
+        "binding_revision": slice_row["binding_revision"],
+        "builder_job_id": slice_row["builder_job_id"],
+        "reviewer_job_id": slice_row["reviewer_job_id"],
+        "candidate": slice_row["candidate"],
+        "state": slice_row["state"],
+        "gate_state": slice_row["gate_state"],
+        "spec": dict(slice_row["spec"]),
+        "plan": dict(slice_row["plan"]),
+        "verification_hash": slice_row["verification"]["hash"],
+        "target_branch": slice_row["target_branch"],
+        "target_remote": slice_row["target_remote"],
+        "dispatch_base": slice_row["dispatch_base"],
+    }
+
+
+def _legacy_binding_from_row(slice_row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "builder_job_id": slice_row["builder_job_id"],
+        "reviewer_job_id": slice_row["reviewer_job_id"],
+        "candidate": slice_row["candidate"],
+        "state": slice_row["state"],
+        "gate_state": slice_row["gate_state"],
+        "spec": dict(slice_row["spec"]),
+        "plan": dict(slice_row["plan"]),
+        "verification_hash": slice_row["verification"]["hash"],
+        "target_branch": slice_row["target_branch"],
+        "target_remote": slice_row["target_remote"],
+        "dispatch_base": slice_row["dispatch_base"],
+    }
+
+
+def _job_id_in_binding_snapshot(job_id: str, binding: Mapping[str, Any]) -> bool:
+    return job_id in {
+        binding.get("builder_job_id"),
+        binding.get("reviewer_job_id"),
+    }
+
+
+def _validate_optional_recovery_slice_fields(
+    slice_row: Mapping[str, Any],
+    *,
+    state_path: Path,
+) -> dict[str, Any]:
+    if "_binding_history" in slice_row:
+        raise _contract_error(
+            "malformed-recovery-context",
+            state_path=state_path,
+            detail="_binding_history",
+        )
+    has_binding_version = "binding_version" in slice_row
+    has_binding_revision = "binding_revision" in slice_row
+    has_recovery_receipts = "recovery_receipts" in slice_row
+    has_checkpoint_receipt = "binding_checkpoint_receipt" in slice_row
+    if has_binding_version != has_binding_revision:
+        raise _contract_error("legacy-binding-unversioned", state_path=state_path)
+    if not has_binding_version:
+        if has_recovery_receipts or has_checkpoint_receipt:
+            raise _contract_error("legacy-binding-unversioned", state_path=state_path)
+        return {}
+    binding_version = _require_non_empty_string(
+        slice_row.get("binding_version"),
+        label="slice.binding_version",
+        state_path=state_path,
+    )
+    if binding_version != _SLICE_BINDING_VERSION:
+        raise _contract_error("unsupported-recovery-version", state_path=state_path)
+    binding_revision = _require_safe_integer(
+        slice_row.get("binding_revision"),
+        label="slice.binding_revision",
+        state_path=state_path,
+    )
+    recovery_receipts = slice_row.get("recovery_receipts")
+    if not isinstance(recovery_receipts, list):
+        raise _contract_error("malformed-recovery-context", state_path=state_path, detail="recovery_receipts")
+    validated: dict[str, Any] = {
+        "binding_version": binding_version,
+        "binding_revision": binding_revision,
+        "recovery_receipts": [
+            _validate_recovery_receipt(item, slice_row=slice_row, state_path=state_path)
+            for item in recovery_receipts
+        ],
+    }
+    if has_checkpoint_receipt:
+        validated["binding_checkpoint_receipt"] = _validate_checkpoint_receipt(
+            slice_row.get("binding_checkpoint_receipt"),
+            slice_row=slice_row,
+            state_path=state_path,
+        )
+    return validated
+
+
+def _iter_registry_request_receipts(
+    slice_row: Mapping[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    receipts: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(slice_row.get("recovery_receipts"), list):
+        for receipt in slice_row["recovery_receipts"]:
+            if isinstance(receipt, dict):
+                receipts.append(("recovery", receipt))
+    checkpoint = slice_row.get("binding_checkpoint_receipt")
+    if isinstance(checkpoint, dict):
+        receipts.append(("checkpoint", checkpoint))
+    return receipts
+
+
+def _slice_binding_witnesses(slice_row: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    witnesses: list[Mapping[str, Any]] = []
+    if "binding_version" in slice_row and "binding_revision" in slice_row:
+        witnesses.append(_slice_binding_from_row(slice_row))
+    for kind, receipt in _iter_registry_request_receipts(slice_row):
+        if kind == "recovery":
+            payload = receipt.get("payload")
+            if isinstance(payload, Mapping):
+                expected_binding = payload.get("expected_binding")
+                if isinstance(expected_binding, Mapping):
+                    witnesses.append(expected_binding)
+        applied_binding = receipt.get("applied_binding")
+        if isinstance(applied_binding, Mapping):
+            witnesses.append(applied_binding)
+    return witnesses
+
+
+def _validate_recovery_request_id_collisions(
+    slices: list[Mapping[str, Any]],
+    *,
+    state_path: Path,
+) -> None:
+    seen: set[str] = set()
+    for slice_row in slices:
+        for _kind, receipt in _iter_registry_request_receipts(slice_row):
+            request_id = str(receipt["request_id"])
+            if request_id in seen:
+                raise _contract_error("request-content-conflict", state_path=state_path, detail="request_id")
+            seen.add(request_id)
 
 
 def _empty_legacy_records() -> dict[str, Any]:
@@ -664,6 +2256,26 @@ class JobRegistry:
                     f"{self._state_path}"
                 )
         validated_slices = [self._validate_loaded_slice(slice_row, job_ids) for slice_row in slices]
+        _validate_recovery_request_id_collisions(validated_slices, state_path=self._state_path)
+        slices_by_id = {str(slice_row["slice_id"]): slice_row for slice_row in validated_slices}
+        for job in validated_jobs:
+            for field_name in ("supersession", "consumption"):
+                entry = job.get(field_name)
+                if not isinstance(entry, dict):
+                    continue
+                slice_row = slices_by_id.get(str(entry["slice_id"]))
+                if slice_row is None:
+                    raise _contract_error(
+                        "request-content-conflict",
+                        state_path=self._state_path,
+                        detail=f"{field_name}.binding",
+                    )
+                self._validate_loaded_job_disposition_binding(
+                    job,
+                    field_name=field_name,
+                    entry=entry,
+                    slice_row=slice_row,
+                )
         return validated_jobs, validated_slices, seq
 
     def _validate_legacy_records(self, value: object) -> None:
@@ -1078,7 +2690,22 @@ class JobRegistry:
                     f"coordinator 狀態檔 workflow_output_baseline 格式錯誤（fail-closed）: {self._state_path}"
                 )
             baseline_paths.add(row["path"])
-        return dict(job)
+        validated_job = dict(job)
+        if "supersession" in job:
+            validated_job["supersession"] = _validate_job_supersession(
+                job.get("supersession"),
+                state_path=self._state_path,
+            )
+            if validated_job["supersession"]["job_id"] != validated_job["job_id"]:
+                raise _contract_error("request-content-conflict", state_path=self._state_path, detail="supersession.job_id")
+        if "consumption" in job:
+            validated_job["consumption"] = _validate_job_consumption(
+                job.get("consumption"),
+                state_path=self._state_path,
+            )
+            if validated_job["consumption"]["job_id"] != validated_job["job_id"]:
+                raise _contract_error("request-content-conflict", state_path=self._state_path, detail="consumption.job_id")
+        return validated_job
 
     def _validate_loaded_slice(self, slice_row: object, job_ids: set[str]) -> dict[str, Any]:
         if not isinstance(slice_row, dict):
@@ -1126,6 +2753,14 @@ class JobRegistry:
             raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
         if not isinstance(slice_row["target_remote"], str) or not slice_row["target_remote"]:
             raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
+        if slice_row.get("dispatch_base") is not None and (
+            not isinstance(slice_row.get("dispatch_base"), str) or not slice_row["dispatch_base"]
+        ):
+            raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
+        if slice_row.get("candidate") is not None and (
+            not isinstance(slice_row.get("candidate"), str) or not slice_row["candidate"]
+        ):
+            raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
         verification_meta = slice_row["verification"]
         if not (
             isinstance(verification_meta, dict)
@@ -1155,6 +2790,10 @@ class JobRegistry:
             ):
                 raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
         normalized_slice = _normalize_loaded_slice_verification(slice_row)
+        additive_fields = _validate_optional_recovery_slice_fields(
+            normalized_slice,
+            state_path=self._state_path,
+        )
         return {
             **normalized_slice,
             "spec": dict(slice_row["spec"]),
@@ -1165,6 +2804,7 @@ class JobRegistry:
             "evidence_history": _copy_json_list(slice_row["evidence_history"]),
             "evaluation_history": _copy_json_list(slice_row["evaluation_history"]),
             "actions": _copy_json_list(slice_row["actions"]),
+            **additive_fields,
         }
 
     def _lookup_with_cross_instance_visibility(self, lookup: Callable[[], Any]) -> Any:
@@ -1215,16 +2855,496 @@ class JobRegistry:
         )
 
     def _copy_slice(self, slice_row: dict[str, Any]) -> dict[str, Any]:
+        return _deepcopy_json(slice_row)
+
+    def _slice_is_versioned(self, slice_row: Mapping[str, Any]) -> bool:
+        return "binding_version" in slice_row and "binding_revision" in slice_row
+
+    def _next_binding_revision(self, current_revision: int) -> int:
+        if current_revision >= _MAX_SAFE_JSON_INTEGER:
+            raise ValueError("binding_revision exhausted")
+        return current_revision + 1
+
+    def _require_versioned_slice_binding(self, slice_row: Mapping[str, Any]) -> dict[str, Any]:
+        if not self._slice_is_versioned(slice_row):
+            raise _contract_error("legacy-binding-unversioned", state_path=self._state_path)
+        return _slice_binding_from_row(slice_row)
+
+    def _maybe_bump_binding_revision(
+        self,
+        slice_row: dict[str, Any],
+        *,
+        previous_binding: dict[str, Any] | None,
+        force: bool = False,
+    ) -> None:
+        if not self._slice_is_versioned(slice_row):
+            return
+        current_binding = _slice_binding_from_row(slice_row)
+        if force or previous_binding != current_binding:
+            slice_row["binding_revision"] = self._next_binding_revision(int(slice_row["binding_revision"]))
+
+    def _locate_registry_request_receipt(
+        self,
+        request_id: str,
+    ) -> tuple[dict[str, Any], str, dict[str, Any], int | None] | None:
+        for slice_row in self._slices:
+            receipts = slice_row.get("recovery_receipts")
+            if isinstance(receipts, list):
+                for index, receipt in enumerate(receipts):
+                    if isinstance(receipt, dict) and receipt.get("request_id") == request_id:
+                        return slice_row, "recovery", receipt, index
+            checkpoint = slice_row.get("binding_checkpoint_receipt")
+            if isinstance(checkpoint, dict) and checkpoint.get("request_id") == request_id:
+                return slice_row, "checkpoint", checkpoint, None
+        return None
+
+    def _ensure_matching_request_receipt(
+        self,
+        located: tuple[dict[str, Any], str, dict[str, Any], int | None],
+        *,
+        expected_kind: str,
+        request: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], int | None]:
+        slice_row, kind, receipt, index = located
+        if (
+            kind != expected_kind
+            or receipt.get("request_digest") != request["request_digest"]
+            or receipt.get("payload") != request["payload"]
+        ):
+            raise _contract_error("request-content-conflict", state_path=self._state_path, detail="request_id")
+        return slice_row, receipt, index
+
+    def _revalidate_recovery_binding(
+        self,
+        slice_row: dict[str, Any],
+        *,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        current_binding = self._require_versioned_slice_binding(slice_row)
+        expected_binding = request["payload"]["expected_binding"]
+        if current_binding != expected_binding:
+            raise _contract_error("stale-binding", state_path=self._state_path)
+        for field_name in ("builder_job_id", "reviewer_job_id"):
+            job_id = expected_binding[field_name]
+            if job_id is not None:
+                self._validate_existing_job_ref(field_name, job_id)
+        return current_binding
+
+    def _revalidate_legacy_checkpoint_snapshot(
+        self,
+        slice_row: dict[str, Any],
+        *,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if self._slice_is_versioned(slice_row):
+            raise _contract_error("legacy-checkpoint-not-applicable", state_path=self._state_path)
+        expected_row = request["payload"]["expected_legacy_row"]
+        current_row = self._copy_slice(slice_row)
+        if _canonical_json_bytes(current_row) != _canonical_json_bytes(expected_row):
+            raise _contract_error("stale-binding", state_path=self._state_path)
+        current_binding = _legacy_binding_from_row(slice_row)
+        if current_binding != request["payload"]["expected_legacy_binding"]:
+            raise _contract_error("stale-binding", state_path=self._state_path)
+        current_job_refs = {
+            "builder_job_id": slice_row["builder_job_id"],
+            "reviewer_job_id": slice_row["reviewer_job_id"],
+        }
+        if current_job_refs != request["payload"]["expected_job_refs"]:
+            raise _contract_error("stale-binding", state_path=self._state_path)
+        current_fingerprint = _compute_checkpoint_fingerprint(
+            expected_legacy_row=current_row,
+            expected_legacy_binding=current_binding,
+            expected_job_refs=current_job_refs,
+        )
+        if current_fingerprint != request["payload"]["legacy_snapshot_fingerprint"]:
+            raise _contract_error("stale-binding", state_path=self._state_path)
+        for field_name, job_id in current_job_refs.items():
+            if job_id is not None:
+                self._validate_existing_job_ref(field_name, job_id)
+        return current_binding
+
+    def _legacy_job_disposition_binding_witness(
+        self,
+        slice_row: Mapping[str, Any],
+        *,
+        job_id: str,
+        binding_revision: int,
+        detail: str,
+    ) -> dict[str, Any] | None:
+        witness: dict[str, Any] | None = None
+        for candidate in _slice_binding_witnesses(slice_row):
+            if int(candidate["binding_revision"]) != binding_revision or not _job_id_in_binding_snapshot(job_id, candidate):
+                continue
+            normalized = _deepcopy_json(candidate)
+            if witness is None:
+                witness = normalized
+            elif witness != normalized:
+                raise _contract_error("request-content-conflict", state_path=self._state_path, detail=detail)
+        return witness
+
+    def _recorded_job_bound_binding_details(
+        self,
+        job: Mapping[str, Any],
+        *,
+        slice_row: Mapping[str, Any],
+        slice_id: str,
+        binding_revision: int,
+        mutate_missing: bool,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        job_id = str(job["job_id"])
+        explicit_witness: dict[str, Any] | None = None
+        missing_entries: list[dict[str, Any]] = []
+        for field_name in ("supersession", "consumption"):
+            entry = job.get(field_name)
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get("slice_id") != slice_id or int(entry["binding_revision"]) != binding_revision:
+                continue
+            if _BOUND_BINDING_FIELD not in entry:
+                if isinstance(entry, dict):
+                    missing_entries.append(entry)
+                continue
+            bound_binding = entry.get(_BOUND_BINDING_FIELD)
+            if not isinstance(bound_binding, Mapping):
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail=f"{field_name}.{_BOUND_BINDING_FIELD}",
+                )
+            normalized = _deepcopy_json(bound_binding)
+            if (
+                int(normalized["binding_revision"]) != binding_revision
+                or not _job_id_in_binding_snapshot(job_id, normalized)
+            ):
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail=f"{field_name}.{_BOUND_BINDING_FIELD}",
+                )
+            if explicit_witness is None:
+                explicit_witness = normalized
+            elif explicit_witness != normalized:
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail=f"{field_name}.{_BOUND_BINDING_FIELD}",
+                )
+        witness = explicit_witness
+        if witness is None and missing_entries:
+            witness = self._legacy_job_disposition_binding_witness(
+                slice_row,
+                job_id=job_id,
+                binding_revision=binding_revision,
+                detail="binding",
+            )
+        if witness is None:
+            return None, missing_entries
+        if mutate_missing:
+            for entry in missing_entries:
+                entry[_BOUND_BINDING_FIELD] = _deepcopy_json(witness)
+        return witness, missing_entries
+
+    def _recorded_job_bound_binding(
+        self,
+        job: Mapping[str, Any],
+        *,
+        slice_row: Mapping[str, Any],
+        slice_id: str,
+        binding_revision: int,
+    ) -> dict[str, Any] | None:
+        witness, _missing_entries = self._recorded_job_bound_binding_details(
+            job,
+            slice_row=slice_row,
+            slice_id=slice_id,
+            binding_revision=binding_revision,
+            mutate_missing=True,
+        )
+        return witness
+
+    def _stage_current_binding_disposition_backfills(
+        self,
+        *,
+        slice_row: Mapping[str, Any],
+        current_binding: Mapping[str, Any],
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        slice_id = str(slice_row["slice_id"])
+        binding_revision = int(current_binding["binding_revision"])
+        staged: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for job in self._jobs:
+            witness, missing_entries = self._recorded_job_bound_binding_details(
+                job,
+                slice_row=slice_row,
+                slice_id=slice_id,
+                binding_revision=binding_revision,
+                mutate_missing=False,
+            )
+            if witness is None:
+                if missing_entries:
+                    raise _contract_error(
+                        "request-content-conflict",
+                        state_path=self._state_path,
+                        detail="binding",
+                    )
+                continue
+            if witness != current_binding:
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail="binding",
+                )
+            for entry in missing_entries:
+                staged.append((entry, witness))
+        return staged
+
+    def _resolve_job_disposition_binding(
+        self,
+        job: Mapping[str, Any],
+        *,
+        slice_row: Mapping[str, Any],
+        binding_revision: int,
+    ) -> dict[str, Any]:
+        if not self._slice_is_versioned(slice_row):
+            raise _contract_error("legacy-binding-unversioned", state_path=self._state_path)
+        current_binding = _slice_binding_from_row(slice_row)
+        current_revision = int(current_binding["binding_revision"])
+        if binding_revision == current_revision:
+            if not _job_id_in_binding_snapshot(str(job["job_id"]), current_binding):
+                raise _contract_error(
+                    "request-content-conflict",
+                    state_path=self._state_path,
+                    detail="job_id",
+                )
+            return current_binding
+        if binding_revision > current_revision:
+            raise _contract_error("stale-binding", state_path=self._state_path)
+        witness = self._recorded_job_bound_binding(
+            job,
+            slice_row=slice_row,
+            slice_id=str(slice_row["slice_id"]),
+            binding_revision=binding_revision,
+        )
+        if witness is None:
+            raise _contract_error("stale-binding", state_path=self._state_path)
+        return witness
+
+    def _validate_loaded_job_disposition_binding(
+        self,
+        job: Mapping[str, Any],
+        *,
+        field_name: str,
+        entry: Mapping[str, Any],
+        slice_row: Mapping[str, Any],
+    ) -> None:
+        if not self._slice_is_versioned(slice_row):
+            raise _contract_error("legacy-binding-unversioned", state_path=self._state_path)
+        current_binding = _slice_binding_from_row(slice_row)
+        entry_revision = int(entry["binding_revision"])
+        if entry_revision > int(current_binding["binding_revision"]):
+            raise _contract_error(
+                "request-content-conflict",
+                state_path=self._state_path,
+                detail=f"{field_name}.binding",
+            )
+        bound_binding = self._recorded_job_bound_binding(
+            job,
+            slice_row=slice_row,
+            slice_id=str(entry["slice_id"]),
+            binding_revision=entry_revision,
+        )
+        if bound_binding is None:
+            raise _contract_error(
+                "request-content-conflict",
+                state_path=self._state_path,
+                detail=f"{field_name}.binding",
+            )
+        if entry_revision == int(current_binding["binding_revision"]) and bound_binding != current_binding:
+            raise _contract_error(
+                "request-content-conflict",
+                state_path=self._state_path,
+                detail=f"{field_name}.{_BOUND_BINDING_FIELD}",
+            )
+
+    def _persist_recovery_change(self) -> None:
+        try:
+            self._persist()
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(f"recovery-persistence-failed: {exc}") from exc
+
+    def _build_job_supersession(
+        self,
+        job: Mapping[str, Any],
+        *,
+        slice_id: str,
+        binding_revision: int,
+        bound_binding: Mapping[str, Any],
+        actor: str,
+        reason: str,
+        superseding_identity: Mapping[str, Any],
+        at: str,
+    ) -> dict[str, Any]:
         return {
-            **dict(slice_row),
-            "spec": dict(slice_row["spec"]),
-            "plan": dict(slice_row["plan"]),
-            "verification": dict(slice_row["verification"]),
-            "current_evidence_refs": list(slice_row["current_evidence_refs"]),
-            "current_evaluation_refs": list(slice_row["current_evaluation_refs"]),
-            "evidence_history": _copy_json_list(slice_row["evidence_history"]),
-            "evaluation_history": _copy_json_list(slice_row["evaluation_history"]),
-            "actions": _copy_json_list(slice_row["actions"]),
+            "version": _JOB_SUPERSESSION_VERSION,
+            "job_id": job["job_id"],
+            "slice_id": slice_id,
+            "binding_revision": binding_revision,
+            "actor": actor,
+            "at": at,
+            "reason": reason,
+            "superseding_identity": _validate_disposition_identity(
+                superseding_identity,
+                label="job supersession.superseding_identity",
+                state_path=self._state_path,
+            ),
+            _BOUND_BINDING_FIELD: _validate_slice_binding_snapshot(
+                bound_binding,
+                label=f"job supersession.{_BOUND_BINDING_FIELD}",
+                state_path=self._state_path,
+            ),
+        }
+
+    def _build_job_consumption(
+        self,
+        job: Mapping[str, Any],
+        *,
+        slice_id: str,
+        binding_revision: int,
+        bound_binding: Mapping[str, Any],
+        actor: str,
+        completion_identity: Mapping[str, Any],
+        proof_refs: list[Mapping[str, Any]],
+        at: str,
+    ) -> dict[str, Any]:
+        return {
+            "version": _JOB_CONSUMPTION_VERSION,
+            "job_id": job["job_id"],
+            "slice_id": slice_id,
+            "binding_revision": binding_revision,
+            "actor": actor,
+            "at": at,
+            "completion_identity": _validate_disposition_identity(
+                completion_identity,
+                label="job consumption.completion_identity",
+                state_path=self._state_path,
+            ),
+            "proof_refs": _validate_proof_refs(
+                proof_refs,
+                label="job consumption.proof_refs",
+                state_path=self._state_path,
+                required=True,
+            ),
+            _BOUND_BINDING_FIELD: _validate_slice_binding_snapshot(
+                bound_binding,
+                label=f"job consumption.{_BOUND_BINDING_FIELD}",
+                state_path=self._state_path,
+            ),
+        }
+
+    def _record_job_supersession_inplace(
+        self,
+        job: dict[str, Any],
+        *,
+        slice_id: str,
+        binding_revision: int,
+        bound_binding: Mapping[str, Any],
+        actor: str,
+        reason: str,
+        superseding_identity: Mapping[str, Any],
+        at: str,
+        at_was_omitted: bool = False,
+    ) -> bool:
+        supersession = self._build_job_supersession(
+            job,
+            slice_id=slice_id,
+            binding_revision=binding_revision,
+            bound_binding=bound_binding,
+            actor=actor,
+            reason=reason,
+            superseding_identity=superseding_identity,
+            at=at,
+        )
+        existing = job.get("supersession")
+        if existing is not None:
+            if existing == supersession or (at_was_omitted and _same_disposition_except_at(existing, supersession)):
+                return False
+            raise _contract_error("request-content-conflict", state_path=self._state_path, detail="supersession")
+        job["supersession"] = supersession
+        return True
+
+    def _record_job_consumption_inplace(
+        self,
+        job: dict[str, Any],
+        *,
+        slice_id: str,
+        binding_revision: int,
+        bound_binding: Mapping[str, Any],
+        actor: str,
+        completion_identity: Mapping[str, Any],
+        proof_refs: list[Mapping[str, Any]],
+        at: str,
+        at_was_omitted: bool = False,
+    ) -> bool:
+        consumption = self._build_job_consumption(
+            job,
+            slice_id=slice_id,
+            binding_revision=binding_revision,
+            bound_binding=bound_binding,
+            actor=actor,
+            completion_identity=completion_identity,
+            proof_refs=proof_refs,
+            at=at,
+        )
+        existing = job.get("consumption")
+        if existing is not None:
+            if existing == consumption or (at_was_omitted and _same_disposition_except_at(existing, consumption)):
+                return False
+            raise _contract_error("request-content-conflict", state_path=self._state_path, detail="consumption")
+        job["consumption"] = consumption
+        return True
+
+    def _build_recovery_receipt(
+        self,
+        request: Mapping[str, Any],
+        *,
+        phase: str,
+        prepared_at: str,
+        completed_at: str | None = None,
+        applied_binding: Mapping[str, Any] | None = None,
+        step_receipts: list[Mapping[str, Any]] | None = None,
+        result: str | None = None,
+    ) -> dict[str, Any]:
+        required_steps = list(request["payload"]["required_steps"])
+        return {
+            "version": _RECOVERY_RECEIPT_VERSION,
+            "request_id": request["request_id"],
+            "request_digest": request["request_digest"],
+            "payload": _deepcopy_json(request["payload"]),
+            "phase": phase,
+            "prepared_at": prepared_at,
+            "completed_at": completed_at,
+            "applied_binding": None if applied_binding is None else _deepcopy_json(applied_binding),
+            "affected_job_ids": _expected_affected_job_ids(request["payload"]["expected_binding"]),
+            "required_steps": required_steps,
+            "step_receipts": [] if step_receipts is None else _deepcopy_json(step_receipts),
+            "result": result,
+        }
+
+    def _build_checkpoint_receipt(
+        self,
+        request: Mapping[str, Any],
+        *,
+        checkpointed_at: str,
+        applied_binding: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "version": _CHECKPOINT_RECEIPT_VERSION,
+            "request_id": request["request_id"],
+            "request_digest": request["request_digest"],
+            "payload": _deepcopy_json(request["payload"]),
+            "phase": "complete",
+            "checkpointed_at": checkpointed_at,
+            "applied_binding": _deepcopy_json(applied_binding),
+            "provenance": _deepcopy_json(request["payload"]["provenance"]),
+            "result": "checkpoint-created",
         }
 
     def _validate_existing_job_ref(self, field: str, job_id: str | None) -> None:
@@ -1695,6 +3815,8 @@ class JobRegistry:
             "plan": {"path": plan_path, "hash": plan_hash},
             "target_branch": target_branch,
             "target_remote": target_remote,
+            "binding_version": _SLICE_BINDING_VERSION,
+            "binding_revision": 1,
             "verification": {
                 "hash": verification_hash or ("0" * 64),
                 "contract": dict(verification) if isinstance(verification, dict) else None,
@@ -1711,6 +3833,7 @@ class JobRegistry:
             "evidence_history": [],
             "evaluation_history": [],
             "actions": [],
+            "recovery_receipts": [],
             "created_at": now,
             "updated_at": now,
         }
@@ -1733,6 +3856,14 @@ class JobRegistry:
         dispatch_base: str | None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+        previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
+        staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        if previous_binding is not None:
+            self._next_binding_revision(int(slice_row["binding_revision"]))
+            staged_binding_backfills = self._stage_current_binding_disposition_backfills(
+                slice_row=slice_row,
+                current_binding=previous_binding,
+            )
         if str(slice_row["state"]) not in REPINNABLE_SLICE_STATES:
             raise ValueError(
                 f"非法 slice state repin: {slice_row['state']!r}"
@@ -1744,6 +3875,8 @@ class JobRegistry:
             new="pending",
             allowed=GATE_STATE_TRANSITIONS,
         )
+        for entry, witness in staged_binding_backfills:
+            entry[_BOUND_BINDING_FIELD] = _deepcopy_json(witness)
         slice_row["spec"] = {"path": spec_path, "hash": spec_hash}
         slice_row["plan"] = {"path": plan_path, "hash": plan_hash}
         slice_row["target_branch"] = target_branch
@@ -1760,6 +3893,7 @@ class JobRegistry:
         slice_row[_CURRENT_VERIFICATION_EVIDENCE_HASH] = None
         slice_row["current_evidence_refs"] = []
         slice_row["current_evaluation_refs"] = []
+        self._maybe_bump_binding_revision(slice_row, previous_binding=previous_binding, force=True)
         slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)
@@ -1771,6 +3905,296 @@ class JobRegistry:
     def get_slice(self, slice_id: str) -> dict[str, Any]:
         self._reload_if_changed()
         return self._copy_slice(self._find_slice(slice_id))
+
+    def lookup_registry_request_receipt(self, request_id: str) -> dict[str, Any] | None:
+        request_key = _require_non_empty_string(
+            request_id,
+            label="lookup_registry_request_receipt.request_id",
+            state_path=self._state_path,
+        )
+        self._reload_if_changed()
+        located = self._locate_registry_request_receipt(request_key)
+        if located is None:
+            return None
+        slice_row, kind, receipt, _index = located
+        return {
+            "slice_id": slice_row["slice_id"],
+            "kind": kind,
+            "receipt": _deepcopy_json(receipt),
+        }
+
+    def prepare_recovery(
+        self,
+        slice_id: str,
+        *,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        normalized_request = _validate_recovery_request(
+            request,
+            expected_slice_id=slice_id,
+            state_path=self._state_path,
+        )
+        self._reload_if_changed()
+        located = self._locate_registry_request_receipt(normalized_request["request_id"])
+        if located is not None:
+            slice_row, receipt, _index = self._ensure_matching_request_receipt(
+                located,
+                expected_kind="recovery",
+                request=normalized_request,
+            )
+            if slice_row["slice_id"] != slice_id:
+                raise _contract_error("request-content-conflict", state_path=self._state_path, detail="slice_id")
+            if receipt["phase"] == "complete":
+                return _deepcopy_json(receipt)
+            self._revalidate_recovery_binding(slice_row, request=normalized_request)
+            return _deepcopy_json(receipt)
+        slice_row = self._find_slice(slice_id)
+        self._revalidate_recovery_binding(slice_row, request=normalized_request)
+        receipt = self._build_recovery_receipt(
+            normalized_request,
+            phase="prepared",
+            prepared_at=_now_iso(),
+        )
+        slice_row["recovery_receipts"].append(receipt)
+        self._persist_recovery_change()
+        return _deepcopy_json(receipt)
+
+    def commit_pre_candidate_recovery(
+        self,
+        slice_id: str,
+        *,
+        request: Mapping[str, Any],
+        step_receipts: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        normalized_request = _validate_recovery_request(
+            request,
+            expected_slice_id=slice_id,
+            state_path=self._state_path,
+        )
+        self._reload_if_changed()
+        located = self._locate_registry_request_receipt(normalized_request["request_id"])
+        if located is None:
+            raise _contract_error("invalid-recovery-phase", state_path=self._state_path)
+        slice_row, receipt, receipt_index = self._ensure_matching_request_receipt(
+            located,
+            expected_kind="recovery",
+            request=normalized_request,
+        )
+        if slice_row["slice_id"] != slice_id or receipt_index is None:
+            raise _contract_error("request-content-conflict", state_path=self._state_path, detail="slice_id")
+        if receipt["phase"] == "complete":
+            normalized_step_receipts = _validate_step_receipts(
+                step_receipts,
+                required_steps=list(normalized_request["payload"]["required_steps"]),
+                label="commit_pre_candidate_recovery.step_receipts",
+                state_path=self._state_path,
+            )
+            if normalized_step_receipts != receipt["step_receipts"]:
+                raise _contract_error("request-content-conflict", state_path=self._state_path, detail="step_receipts")
+            return _deepcopy_json(receipt)
+        if receipt["phase"] != "prepared":
+            raise _contract_error("invalid-recovery-phase", state_path=self._state_path)
+        current_binding = self._revalidate_recovery_binding(slice_row, request=normalized_request)
+        normalized_step_receipts = _validate_step_receipts(
+            step_receipts,
+            required_steps=list(normalized_request["payload"]["required_steps"]),
+            label="commit_pre_candidate_recovery.step_receipts",
+            state_path=self._state_path,
+        )
+        old_jobs = [
+            self._find_job(job_id)
+            for job_id in (
+                current_binding["builder_job_id"],
+                current_binding["reviewer_job_id"],
+            )
+            if job_id is not None
+        ]
+        completed_at = _now_iso()
+        superseding_identity = {
+            "request_id": normalized_request["request_id"],
+            "request_digest": normalized_request["request_digest"],
+        }
+        old_revision = int(current_binding["binding_revision"])
+        next_binding_revision = self._next_binding_revision(old_revision)
+        staged_supersessions: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for job in old_jobs:
+            supersession = self._build_job_supersession(
+                job,
+                slice_id=slice_id,
+                binding_revision=old_revision,
+                bound_binding=current_binding,
+                actor=normalized_request["payload"]["actor"],
+                reason="recover-pre-candidate",
+                superseding_identity=superseding_identity,
+                at=completed_at,
+            )
+            existing = job.get("supersession")
+            if existing is not None and existing != supersession:
+                raise _contract_error("request-content-conflict", state_path=self._state_path, detail="supersession")
+            staged_supersessions.append((job, supersession))
+        for job, supersession in staged_supersessions:
+            job["supersession"] = supersession
+        slice_row["state"] = "pending"
+        slice_row["gate_state"] = "pending"
+        slice_row["builder_job_id"] = None
+        slice_row["reviewer_job_id"] = None
+        slice_row["candidate"] = None
+        slice_row["binding_revision"] = next_binding_revision
+        applied_binding = _slice_binding_from_row(slice_row)
+        slice_row["actions"].append(
+            {
+                "action": "recover-pre-candidate",
+                "actor": normalized_request["payload"]["actor"],
+                "state": slice_row["state"],
+                "gate_state": slice_row["gate_state"],
+                "requested_at": normalized_request["payload"]["created_at"],
+                "at": completed_at,
+                "result": "recovery-complete",
+            }
+        )
+        slice_row["updated_at"] = completed_at
+        completed_receipt = self._build_recovery_receipt(
+            normalized_request,
+            phase="complete",
+            prepared_at=receipt["prepared_at"],
+            completed_at=completed_at,
+            applied_binding=applied_binding,
+            step_receipts=normalized_step_receipts,
+            result="recovery-complete",
+        )
+        slice_row["recovery_receipts"][receipt_index] = completed_receipt
+        self._persist_recovery_change()
+        return _deepcopy_json(completed_receipt)
+
+    def record_job_supersession(
+        self,
+        job_id: str,
+        *,
+        slice_id: str,
+        binding_revision: int,
+        actor: str,
+        reason: str,
+        superseding_identity: Mapping[str, Any],
+        at: str | None = None,
+    ) -> dict[str, Any]:
+        job = self._find_job(job_id)
+        slice_row = self._find_slice(slice_id)
+        normalized_binding_revision = _require_safe_integer(
+            binding_revision,
+            label="record_job_supersession.binding_revision",
+            state_path=self._state_path,
+        )
+        bound_binding = self._resolve_job_disposition_binding(
+            job,
+            slice_row=slice_row,
+            binding_revision=normalized_binding_revision,
+        )
+        at_was_omitted = at is None
+        changed = self._record_job_supersession_inplace(
+            job,
+            slice_id=slice_id,
+            binding_revision=normalized_binding_revision,
+            bound_binding=bound_binding,
+            actor=_require_non_empty_string(actor, label="record_job_supersession.actor", state_path=self._state_path),
+            reason=_require_non_empty_string(reason, label="record_job_supersession.reason", state_path=self._state_path),
+            superseding_identity=superseding_identity,
+            at=_now_iso() if at_was_omitted else _require_non_empty_string(
+                at,
+                label="record_job_supersession.at",
+                state_path=self._state_path,
+            ),
+            at_was_omitted=at_was_omitted,
+        )
+        if changed:
+            self._persist_recovery_change()
+        return _deepcopy_json(job)
+
+    def record_job_consumption(
+        self,
+        job_id: str,
+        *,
+        slice_id: str,
+        binding_revision: int,
+        actor: str,
+        completion_identity: Mapping[str, Any],
+        proof_refs: list[Mapping[str, Any]],
+        at: str | None = None,
+    ) -> dict[str, Any]:
+        job = self._find_job(job_id)
+        slice_row = self._find_slice(slice_id)
+        normalized_binding_revision = _require_safe_integer(
+            binding_revision,
+            label="record_job_consumption.binding_revision",
+            state_path=self._state_path,
+        )
+        bound_binding = self._resolve_job_disposition_binding(
+            job,
+            slice_row=slice_row,
+            binding_revision=normalized_binding_revision,
+        )
+        at_was_omitted = at is None
+        changed = self._record_job_consumption_inplace(
+            job,
+            slice_id=slice_id,
+            binding_revision=normalized_binding_revision,
+            bound_binding=bound_binding,
+            actor=_require_non_empty_string(actor, label="record_job_consumption.actor", state_path=self._state_path),
+            completion_identity=completion_identity,
+            proof_refs=proof_refs,
+            at=_now_iso() if at_was_omitted else _require_non_empty_string(
+                at,
+                label="record_job_consumption.at",
+                state_path=self._state_path,
+            ),
+            at_was_omitted=at_was_omitted,
+        )
+        if changed:
+            self._persist_recovery_change()
+        return _deepcopy_json(job)
+
+    def checkpoint_legacy_binding(
+        self,
+        slice_id: str,
+        *,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        normalized_request = _validate_checkpoint_request(
+            request,
+            expected_slice_id=slice_id,
+            state_path=self._state_path,
+        )
+        self._reload_if_changed()
+        located = self._locate_registry_request_receipt(normalized_request["request_id"])
+        if located is not None:
+            slice_row, receipt, _index = self._ensure_matching_request_receipt(
+                located,
+                expected_kind="checkpoint",
+                request=normalized_request,
+            )
+            if slice_row["slice_id"] != slice_id:
+                raise _contract_error("request-content-conflict", state_path=self._state_path, detail="slice_id")
+            return _deepcopy_json(receipt)
+        slice_row = self._find_slice(slice_id)
+        legacy_binding = self._revalidate_legacy_checkpoint_snapshot(
+            slice_row,
+            request=normalized_request,
+        )
+        slice_row["binding_version"] = _SLICE_BINDING_VERSION
+        slice_row["binding_revision"] = 1
+        slice_row["recovery_receipts"] = []
+        applied_binding = {
+            "binding_version": _SLICE_BINDING_VERSION,
+            "binding_revision": 1,
+            **legacy_binding,
+        }
+        checkpoint_receipt = self._build_checkpoint_receipt(
+            normalized_request,
+            checkpointed_at=_now_iso(),
+            applied_binding=applied_binding,
+        )
+        slice_row["binding_checkpoint_receipt"] = checkpoint_receipt
+        self._persist_recovery_change()
+        return _deepcopy_json(checkpoint_receipt)
 
     def update_slice(
         self,
@@ -1788,6 +4212,8 @@ class JobRegistry:
         current_verification_evidence_hash: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+        previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
+        staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
         # Phase 1 — validate every provided field against the live row
         # *without* mutating anything. #382: the previous validate-then-write
@@ -1837,8 +4263,26 @@ class JobRegistry:
             self._validate_existing_job_ref("builder_job_id", builder_job_id)
         if reviewer_job_id is not None:
             self._validate_existing_job_ref("reviewer_job_id", reviewer_job_id)
+        if previous_binding is not None:
+            will_bump_binding = (
+                (state is not None and state != slice_row["state"])
+                or (gate_state is not None and gate_state != slice_row["gate_state"])
+                or (builder_job_id is not None and builder_job_id != slice_row["builder_job_id"])
+                or (reviewer_job_id is not None and reviewer_job_id != slice_row["reviewer_job_id"])
+                or (candidate is not None and candidate != slice_row["candidate"])
+                or (dispatch_base is not None and dispatch_base != slice_row["dispatch_base"])
+                or (target_remote is not None and target_remote != slice_row["target_remote"])
+            )
+            if will_bump_binding:
+                self._next_binding_revision(int(slice_row["binding_revision"]))
+                staged_binding_backfills = self._stage_current_binding_disposition_backfills(
+                    slice_row=slice_row,
+                    current_binding=previous_binding,
+                )
 
         # Phase 2 — everything validated; apply every field together.
+        for entry, witness in staged_binding_backfills:
+            entry[_BOUND_BINDING_FIELD] = _deepcopy_json(witness)
         if state is not None:
             slice_row["state"] = state
         if gate_state is not None:
@@ -1859,6 +4303,7 @@ class JobRegistry:
             slice_row["target_remote"] = target_remote
         if current_verification_evidence_hash is not None:
             slice_row[_CURRENT_VERIFICATION_EVIDENCE_HASH] = current_verification_evidence_hash
+        self._maybe_bump_binding_revision(slice_row, previous_binding=previous_binding)
         slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)
@@ -1879,6 +4324,8 @@ class JobRegistry:
         result: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+        previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
+        staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
         # Phase 1 — validate every provided field before mutating anything
         # (#382, same rationale as update_slice above): a rejected multi-field
@@ -1913,9 +4360,23 @@ class JobRegistry:
                 new=gate_state,
                 allowed=GATE_STATE_TRANSITIONS,
             )
+        if previous_binding is not None:
+            will_bump_binding = (
+                (state is not None and state != slice_row["state"])
+                or (gate_state is not None and gate_state != slice_row["gate_state"])
+                or (candidate is not None and candidate != slice_row["candidate"])
+            )
+            if will_bump_binding:
+                self._next_binding_revision(int(slice_row["binding_revision"]))
+                staged_binding_backfills = self._stage_current_binding_disposition_backfills(
+                    slice_row=slice_row,
+                    current_binding=previous_binding,
+                )
 
         # Phase 2 — everything validated; apply every field together, then
         # persist exactly once.
+        for entry, witness in staged_binding_backfills:
+            entry[_BOUND_BINDING_FIELD] = _deepcopy_json(witness)
         if state is not None:
             slice_row["state"] = state
         if gate_state is not None:
@@ -1932,6 +4393,7 @@ class JobRegistry:
             )
         if candidate is not None:
             slice_row["candidate"] = candidate
+        self._maybe_bump_binding_revision(slice_row, previous_binding=previous_binding)
         action_entry: dict[str, Any] = {
             "action": action,
             "actor": actor,
