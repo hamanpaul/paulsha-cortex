@@ -18,7 +18,12 @@ import pytest
 from paulsha_cortex.coordinator import manager, work_bridge
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 
-from test_preflight_closeout_order import ShipHarness, _capture, _ship_harness
+from test_preflight_closeout_order import (
+    ShipHarness,
+    _capture,
+    _seed_foreign_review,
+    _ship_harness,
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -94,6 +99,18 @@ class _SequencedProbeRunner:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class _RecordingProbeRunner:
+    def __init__(self) -> None:
+        self.fetch_returncodes: list[int] = []
+
+    def __call__(self, argv, **kwargs):
+        result = subprocess.run(argv, **kwargs)
+        command = [str(value) for value in argv]
+        if command[3:] == ["fetch", "--quiet", "--no-tags", "origin", "main"]:
+            self.fetch_returncodes.append(int(getattr(result, "returncode", 1)))
+        return result
 
 
 def _probe_success_prefix(
@@ -524,6 +541,60 @@ def test_ship_validator_blocks_clean_but_behind_candidate_before_preflight_or_pr
     assert harness.registry.get_workflow_run(harness.run_id).pr_refs == ()
 
 
+def test_ship_validator_blocks_conflicting_candidate_before_preflight_or_pr(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    harness = _ship_harness(
+        tmp_path,
+        monkeypatch,
+        active_change=False,
+        archived_change=True,
+        probe_runner=subprocess.run,
+    )
+    default_branch = _git(harness.repo, "branch", "--show-current")
+    _git(harness.repo, "checkout", "--quiet", "feature/14-work")
+    (harness.repo / "README.md").write_text("feature branch\n", encoding="utf-8")
+    _git(harness.repo, "add", "README.md")
+    _git(harness.repo, "commit", "-qm", "feature readme")
+    harness.candidate = _git(harness.repo, "rev-parse", "HEAD")
+    _git(harness.repo, "checkout", "--quiet", default_branch)
+    run = harness.registry._manager_update_workflow_run(
+        harness.run_id,
+        candidate_head=harness.candidate,
+        verified_head=harness.candidate,
+    )
+    _seed_foreign_review(
+        registry=harness.registry,
+        run=run,
+        repo=harness.repo,
+        candidate=harness.candidate,
+        state_root=harness.state_root,
+        worktree=harness.worktree,
+    )
+    origin = _wire_local_origin(harness, tmp_path / "origin-fixture")
+    _advance_origin_with(
+        origin,
+        tmp_path / "origin-conflict",
+        files={"README.md": "main branch\n"},
+        message="main readme",
+    )
+
+    outcome = _capture(harness.validator, run=harness.run, candidate=harness.candidate)
+
+    assert outcome.exception is None
+    assert isinstance(outcome.result, dict)
+    assert outcome.result["status"] == "needs_human"
+    assert outcome.result["reason"] == "candidate-conflicts-with-main"
+    assert outcome.result["main_sync"]["outcome"] == "conflict"
+    assert outcome.result["main_sync"]["conflict_paths"] == ["README.md"]
+    assert outcome.result["main_sync"]["path_classification"] == "conflict"
+    assert not any(call and call[0] == "preflight" for call in harness.runner.calls)
+    assert not harness.runner.saw_push()
+    assert not harness.runner.saw_gh()
+    assert harness.registry.get_workflow_run(harness.run_id).pr_refs == ()
+
+
 def test_ship_validator_allows_in_sync_candidate_through_two_main_probes_and_local_push(
     tmp_path: Path,
     monkeypatch,
@@ -729,12 +800,13 @@ def test_resume_persists_fetch_failure_evidence_and_reprobes_after_remote_repair
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    probe_runner = _RecordingProbeRunner()
     harness = _ship_harness(
         tmp_path,
         monkeypatch,
         active_change=False,
         archived_change=True,
-        probe_runner=subprocess.run,
+        probe_runner=probe_runner,
     )
     if _git(harness.repo, "branch", "--show-current") != "main":
         _git(harness.repo, "branch", "-M", "main")
@@ -749,7 +821,7 @@ def test_resume_persists_fetch_failure_evidence_and_reprobes_after_remote_repair
     assert result["evidence_hash"] == work_bridge.verification.canonical_json_hash(payload)
     assert payload["candidate"] == harness.candidate
     assert payload["stage"] == "fetch"
-    assert payload["returncode"] not in {0, None}
+    assert probe_runner.fetch_returncodes == [payload["returncode"]]
     assert payload["error_kind"] == "command-failed"
     assert payload["main_head"] is None
     assert persisted.facets == ("needs_human",)
