@@ -1408,6 +1408,18 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/openspec-remote-archive-authority-reconciliation-design.md'
     excludes: []
+  merged-run-completion-finalizer:
+    title: 'merged-run-completion-finalizer'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#977'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/merged-run-completion-finalizer/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/merged-run-completion-finalizer-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/merged-run-completion-finalizer-design.md'
+    excludes: []
   registry-revision-cas:
     title: 'registry-revision-cas'
     links:
@@ -1419,4 +1431,76 @@ work_items:
         ref: 'docs/superpowers/specs/registry-revision-cas-spec.md'
       - kind: path
         ref: 'docs/superpowers/specs/registry-revision-cas-design.md'
+    excludes: []
+  authorized-merged-run-proof-admission:
+    title: 'authorized-merged-run-proof-admission'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#975'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/authorized-merged-run-proof-admission/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/authorized-merged-run-proof-admission-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/authorized-merged-run-proof-admission-design.md'
+    excludes: []
+  merged-verify-registry-transition:
+    title: 'merged-verify-registry-transition'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#976'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/merged-verify-registry-transition/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/merged-verify-registry-transition-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/merged-verify-registry-transition-design.md'
+    excludes: []
+  delivery-journal-conditional-commit:
+    title: 'delivery-journal-conditional-commit'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#983'
+      - kind: path
+        ref: 'docs/superpowers/plans/delivery-journal-conditional-commit.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/delivery-journal-conditional-commit-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/delivery-journal-conditional-commit-design.md'
+    excludes: []
+  copilot-timeout-new-head-review-rearm:
+    title: 'copilot-timeout-new-head-review-rearm'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1021'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/copilot-timeout-new-head-review-rearm/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/copilot-timeout-new-head-review-rearm-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/copilot-timeout-new-head-review-rearm-design.md'
+    excludes: []
+  copilot-review-late-observation:
+    title: 'copilot-review-late-observation'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1020'
+      - kind: path
+        ref: 'docs/superpowers/specs/copilot-review-late-observation-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/copilot-review-late-observation-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/copilot-review-late-observation/todo.md'
+    excludes: []
+  main-probe-gate:
+    title: 'main-probe-gate'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#987'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/main-probe-gate/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-probe-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/main-probe-design.md'
     excludes: []

@@ -63,7 +63,7 @@ Sizing inputs were read from current source, not copied from the #887 aggregate.
 - [ ] **T3 audit／determinism tests**：測來源列正反順序、source_revisions/digest/mapped_openspec exact equality、每 key 一行 warning 及 diagnostic label 路徑清理；確保無 provider network、registry write、filesystem mutation。
 - [ ] **T4 R7 fail-closed matrix**：覆蓋 no PRs、PR status/remote merge 不正面、remote_prs 缺席／錯型／source_id 不匹配／同 source_id 重複（皆 true 與 true/false）、terminal provider missing/degraded、provider role swapped、third value、non-OpenSpec conflict；每例維持同 message/reason_code/field。
 - [ ] **T5 regression**：保留並執行 tests/test_work_claim.py、tests/test_claim_provider_scope_530.py、tests/test_monitor_work_review_regressions.py 的既有斷言；新增測試只改新 fixture，不以放寬舊 oracle 轉綠。
-- [ ] **T6 docs/changelog/policy**：依 repo policy 加 changelog fragment 並同步 CHANGELOG.md [Unreleased]；docs/unified-work-lifecycle.md 說明唯一允許收斂的 source/provider/PR-ancestry 條件與其他衝突 fail-closed。CLI 沒有變更，驗證 cortex work --help 輸出未變。
+- [ ] **T6 documentation/changelog/policy**：依 repo policy 加 changelog fragment 並同步 CHANGELOG.md [Unreleased]；docs/unified-work-lifecycle.md 說明唯一允許收斂的 source/provider/PR-ancestry 條件與其他衝突 fail-closed。CLI 沒有變更，驗證 cortex work --help 輸出未變。
 - [ ] **T7 PR gates and child handoff**：在實作 worktree 執行 focused tests、上列 regression tests、全 repo required CI 與帶 PR context 的 policy_check；PR body 使用 Closes #961 並完成 repo checklist。合併後通知/解鎖 #962 dependency；不關閉 #887，完整 parent AC 留待兩 child integrated gate。
 
 ## Completion boundary

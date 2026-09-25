@@ -62,7 +62,10 @@ def _manifest_steps():
     return result.workflow_manifest.steps
 
 
-def _snapshot(path: Path) -> Path:
+def _snapshot(path: Path, *, mapped_openspec: tuple[str, ...] = ("demo",)) -> Path:
+    source_revisions = ["issue:12@open"] + [
+        f"openspec:{change}@1" for change in mapped_openspec
+    ]
     path.write_text(
         json.dumps(
             {
@@ -81,11 +84,11 @@ def _snapshot(path: Path) -> Path:
                         "work_id": WORK_ID,
                         "mapped_issues": [12],
                         "mapped_prs": [],
-                        "mapped_openspec": ["demo"],
+                        "mapped_openspec": list(mapped_openspec),
                         "mapped_todo_paths": ["docs/todo.md"],
                         "confirmed_todo": True,
                         "auto_label": True,
-                        "source_revisions": ["issue:12@open", "openspec:demo@1"],
+                        "source_revisions": source_revisions,
                     }
                 ],
             }
@@ -115,12 +118,19 @@ def _plan_file(tmp_path: Path) -> None:
     plan.write_text("# midchain retry plan\n", encoding="utf-8")
 
 
-def _stuck_run(tmp_path: Path, *, stopped_at: str = "tdd-red"):
+def _stuck_run(
+    tmp_path: Path,
+    *,
+    stopped_at: str = "tdd-red",
+    mapped_openspec: tuple[str, ...] = ("demo",),
+):
     """重建現場：needs_human 的 build phase run，停在一張**中段** builder 卡，
     該卡已有一顆終止但 evidence 未綁定的 job（採信失敗，envelope 不可用）。"""
 
     _plan_file(tmp_path)
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json", mapped_openspec=mapped_openspec
+    )
     authority = work_actions.load_work_authority(
         repo=REPO, work_id=WORK_ID, snapshot_path=snapshot
     )
@@ -259,7 +269,9 @@ def test_retry_card_preserves_the_card_contract(tmp_path: Path) -> None:
 def test_retry_build_still_refuses_the_midchain_card(tmp_path: Path) -> None:
     """回歸樁：`retry-build` 的「只受理最後一張 builder 卡」語意不得被放寬。"""
 
-    snapshot, registry, run, _job_id = _stuck_run(tmp_path)
+    snapshot, registry, run, _job_id = _stuck_run(
+        tmp_path, mapped_openspec=()
+    )
 
     with pytest.raises(ValueError, match="only the final builder card pending"):
         work_actions.execute_work_action(

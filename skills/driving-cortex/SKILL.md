@@ -1,4 +1,5 @@
 ---
+name: driving-cortex
 description: "driving cortex、派工 cortex、cortex work 導向的協作 skill（issue #177）"
 ---
 
@@ -16,7 +17,15 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 - deck 是上游契約入口：先形成 accepted planning artifact 後，依 `claim → define → plan → build → verify → review → ship` 進入生產化 workflow。
 - `cortex work start`、`resume`、`retry-build`、`review-attest` 是 build 之後的人機協作邊界；`5s` 類 timeout 本身通常只是「未達結果」，不代表系統已失敗。
 
+## 單票授權與問題分流
+
+- 每個 run 只完成綁定 issue、accepted spec/plan 與 operator 裁決已授權的驗收範圍；先核對唯一 owner、exact run/candidate、PR head 和當前 job。不得把順手發現的問題、別張票的 AC、部署或額外權限塞入本票，亦不得用裁決或 reviewer 建議擴大原授權。
+- 遇到範圍內的阻擋問題，保留證據並沿原 run 的正式 action 修復與重驗。遇到範圍外的問題，先查是否已有 issue；有則補上關聯與證據，沒有就新開 issue，記錄重現方式、預期／實際結果、影響、run/candidate/PR、前置依賴。把新 issue 排入後續規劃，**不在本票直接實作**。
+- 回報時分清本票完成、進行中、阻塞及新 issue 的狀態；job exit 0、綠色 CI 或已開 PR 均不能代替本票所需的 review、merge、run closure 與 loaded-runtime 證據。
+
 ## 開一個 dogfood 批次
+
+僅在綁定 issue 與 operator 已授權該批次的規劃、work item 和調度時執行以下步驟。
 
 1. 從 accepted planning artifact 開始：spec/plan/frontmatter 必須有 `status: accepted`、`work_item`、必要章節與 `target_branch`。
 2. 在 `.cortex/work-items.yaml` 加入對應 work item 並對齊 `issue`。
@@ -28,14 +37,19 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 
 - 每次 run 啟動順序：
   - `cortex work start --workflow-action`（依 manager 指示）
-  - `cortex work resume --expected-run-id`（run 卡住時）
-  - `cortex work retry-build --payload ...`（build 後重試）
+  - run 卡住時，先依下方唯讀檢查確認唯一 ongoing run，再執行 `cortex run work resume <work_id> --repo <owner/repo> --wait --json`；resume 不接受 `--expected-run-id`
+  - `cortex run work retry-build <work_id> --repo <owner/repo> --expected-candidate <exact-candidate-sha> --wait --json`（build 後重試；必須提供 exact Candidate）
   - `cortex work review-attest --payload ...`（有 `review-attest` evidence 時）
 - 恢復桿（依序操作）：
-  - [ ] run 停留在 `needs_human` 時，先看 run/facet 的 blocking reason，補齊對應 artifact 再 resume。
-  - [ ] 驗證卡片 evidence 的 binding 是否可重讀，必要時用 `cortex work retry-build`。
-  - [ ] review-thread 未關閉但 merge-ready 前先在 remote 解決 thread，再以 `cortex work resume` 重繼。
-  - [ ] merge 後發現 run 尚未前進時，等待下一 run 合併後再 resume（避免手動強推）。
+  - [ ] run 停留在 `needs_human` 時，先看 run/facet 的 blocking reason，補齊對應 artifact，再依下方唯讀檢查後 resume。
+  - [ ] 驗證卡片 evidence 的 binding 是否可重讀；必要時以該 run 的 exact Candidate 執行 `cortex run work retry-build <work_id> --repo <owner/repo> --expected-candidate <exact-candidate-sha>`。
+  - [ ] review-thread 未關閉但 merge-ready 前先在 remote 解決 thread，再依下方唯讀檢查後 resume。
+  - [ ] merge 後發現 run 尚未前進時，等待下一 run 合併，再依下方唯讀檢查後 resume（避免手動強推）。
+
+### Resume 前的唯讀檢查
+
+- 先執行 `cortex work show <work_id> --repo <owner/repo> --json`，確認 `item.repo`、`item.work_id` 與授權 issue 符合預期；在 `item.sources` 中篩選 `kind == "workflow_run"` 且 `status == "ongoing"` 的來源，必須恰好一筆，並核對其 `ref` 是預期 run。
+- 確認唯一 ongoing run 後，以 `cortex run work resume <work_id> --repo <owner/repo> --wait --json` 恢復。不要附 `--expected-run-id`：parser 雖接受此旗標，Manager 的 resume admission 會拒絕 caller-supplied run evidence。若沒有 ongoing run 或結果不唯一，先停下並釐清 Manager/Monitor 狀態。
 
 ## 執行器設定
 
@@ -46,6 +60,8 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 
 ## 每批 merge 後部署
 
+只有綁定 issue 明列部署／cutover 驗收且 operator 已授權時，才執行以下步驟；一般 PR merge 只記錄待部署狀態，不自行變更 installed runtime 或重啟 service。
+
 1. 在 target repo 以 `pipx install --force <repo>` 重新安裝，讓新 code 可被服務載入。
 2. 依序 restart manager/monitor，確保新 manifest、workflow 入口與身份配置同步。
 3. 開始下一批前先清點 `systemctl --user status`、`cortex status` 與 monitor snapshot。
@@ -55,7 +71,7 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 ## 生命週期特性
 
 - run closure 常有一批延遲：批次 N 在 N+1 合併前，可能維持在 `ongoing / review / needs_human`。
-- 非故障情境下，不建議卡住 N，以免阻斷 N+1 先行 claim；優先先完成 N+1 的規劃與 merge，待前序條件滿足後再 resume N。
+- 非故障情境下，先記錄 N 的等待依賴。只有 N+1 已由自己的 issue、accepted plan、唯一 owner 和交付 gate 獨立授權，才能推進 N+1 的規劃與 merge；不得借 N 的 run 權限跨票 claim 或交付。
 - 最後一批必須有獨立 PR 確認 todo 勾選完成，避免 done record 先行封裝。
 
 ## 已知坑
