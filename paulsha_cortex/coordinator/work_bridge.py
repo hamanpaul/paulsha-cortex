@@ -1476,14 +1476,24 @@ def _sync_ship_workspace_origin(*, source_repo: Path, worktree: Path) -> None:
         text=True,
     )
     upstream = source_remote.stdout.strip() if source_remote.returncode == 0 else ""
-    if not upstream:
-        return
     worktree_remote = subprocess.run(
         ["git", "-C", str(worktree), "remote", "get-url", "origin"],
         shell=False,
         capture_output=True,
         text=True,
     )
+    if not upstream:
+        if worktree_remote.returncode != 0:
+            return
+        removed = subprocess.run(
+            ["git", "-C", str(worktree), "remote", "remove", "origin"],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        if removed.returncode != 0:
+            raise RuntimeError("manager ship workspace origin sync failed")
+        return
     if worktree_remote.returncode == 0 and worktree_remote.stdout.strip() == upstream:
         return
     if worktree_remote.returncode == 0:

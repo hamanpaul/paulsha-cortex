@@ -848,3 +848,49 @@ def test_resume_persists_fetch_failure_evidence_and_reprobes_after_remote_repair
     assert any(call and call[0] == "preflight" for call in harness.runner.calls)
     assert harness.runner.saw_push()
     assert harness.runner.saw_gh()
+
+
+def test_reused_ship_workspace_fail_closes_after_source_origin_removal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    harness = _ship_harness(
+        tmp_path,
+        monkeypatch,
+        active_change=False,
+        archived_change=True,
+        probe_runner=subprocess.run,
+    )
+    origin = _wire_local_origin(harness, tmp_path / "origin-fixture")
+
+    first = work_bridge._manager_ship_workspace(
+        run=harness.run,
+        branch="feature/14-work",
+        candidate=harness.candidate,
+    )
+    assert _git(first, "remote", "get-url", "origin") == str(origin)
+
+    _git(harness.repo, "remote", "remove", "origin")
+
+    reused = work_bridge._manager_ship_workspace(
+        run=harness.run,
+        branch="feature/14-work",
+        candidate=harness.candidate,
+    )
+    origin_url = subprocess.run(
+        ["git", "-C", str(reused), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    probe = work_bridge._probe_main_sync(
+        worktree=reused,
+        candidate=harness.candidate,
+        runner=subprocess.run,
+    )
+
+    assert reused == first
+    assert origin_url.returncode != 0
+    assert isinstance(probe, work_bridge.MainSyncProbeFailure)
+    assert probe.stage == "fetch"
+    assert probe.error_kind == "command-failed"
+    assert probe.main_head is None
