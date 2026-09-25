@@ -1504,3 +1504,17 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/main-probe-design.md'
     excludes: []
+  todo-authority-existing-run-recovery:
+    title: 'todo-authority-existing-run-recovery'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1055'
+      - kind: openspec
+        ref: 'todo-authority-existing-run-recovery'
+      - kind: path
+        ref: 'docs/superpowers/specs/todo-authority-existing-run-recovery-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/todo-authority-existing-run-recovery-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/todo-authority-existing-run-recovery/todo.md'
+    excludes: []
