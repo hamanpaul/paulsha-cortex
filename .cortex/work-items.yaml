@@ -1504,3 +1504,15 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/main-probe-design.md'
     excludes: []
+  diagnostic-main-sync-context:
+    title: 'diagnostic-main-sync-context'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#988'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/diagnostic-main-sync-context/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/diagnostic-main-sync-context-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/diagnostic-main-sync-context-design.md'
+    excludes: []
