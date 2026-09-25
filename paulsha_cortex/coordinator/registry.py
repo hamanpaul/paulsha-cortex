@@ -1167,17 +1167,52 @@ class JobRegistry:
             "actions": _copy_json_list(slice_row["actions"]),
         }
 
-    def _find_job(self, job_id: str) -> dict[str, Any]:
+    def _lookup_with_cross_instance_visibility(self, lookup: Callable[[], Any]) -> Any:
+        expected_revision = self._loaded_revision
+        try:
+            return lookup()
+        except KeyError as missing:
+            snapshot = self._read_durable_snapshot()
+            if (
+                snapshot.revision == self._loaded_revision
+                and snapshot.mtime_ns == self._state_mtime_ns
+                and snapshot.size == self._state_size
+            ):
+                raise missing
+            self._restore_from_snapshot(snapshot, allow_repairs=False)
+            try:
+                visible = lookup()
+            except KeyError:
+                raise missing
+            if snapshot.revision != expected_revision:
+                raise RegistryRevisionConflict(
+                    expected_revision=expected_revision,
+                    actual_revision=snapshot.revision,
+                    state_path=self.canonical_state_path,
+                )
+            return visible
+
+    def _find_job_in_memory(self, job_id: str) -> dict[str, Any]:
         for job in self._jobs:
             if job["job_id"] == job_id:
                 return job
         raise KeyError(f"job 不存在: {job_id}")
 
-    def _find_slice(self, slice_id: str) -> dict[str, Any]:
+    def _find_job(self, job_id: str) -> dict[str, Any]:
+        return self._lookup_with_cross_instance_visibility(
+            lambda: self._find_job_in_memory(job_id)
+        )
+
+    def _find_slice_in_memory(self, slice_id: str) -> dict[str, Any]:
         for slice_row in self._slices:
             if slice_row["slice_id"] == slice_id:
                 return slice_row
         raise KeyError(f"slice 不存在: {slice_id}")
+
+    def _find_slice(self, slice_id: str) -> dict[str, Any]:
+        return self._lookup_with_cross_instance_visibility(
+            lambda: self._find_slice_in_memory(slice_id)
+        )
 
     def _copy_slice(self, slice_row: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1915,11 +1950,16 @@ class JobRegistry:
         self._persist()
         return self._copy_slice(slice_row)
 
-    def _find_workflow_run_index(self, run_id: str) -> int:
+    def _find_workflow_run_index_in_memory(self, run_id: str) -> int:
         for index, run in enumerate(self._workflows):
             if run.run_id == run_id:
                 return index
         raise KeyError(f"workflow run 不存在: {run_id}")
+
+    def _find_workflow_run_index(self, run_id: str) -> int:
+        return self._lookup_with_cross_instance_visibility(
+            lambda: self._find_workflow_run_index_in_memory(run_id)
+        )
 
     def _copy_workflow_run(self, run: WorkflowRun) -> WorkflowRun:
         return WorkflowRun.from_dict(run.to_dict())

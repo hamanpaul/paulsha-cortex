@@ -214,6 +214,58 @@ def test_workflow_run_update_is_typed_persisted_and_rejects_phase_regression(tmp
         registry._manager_update_workflow_run(created.run_id, current_phase="plan")
 
 
+def test_stale_instance_conflicts_when_other_instance_creates_mutation_targets(tmp_path: Path) -> None:
+    state = tmp_path / "jobs.json"
+    stale = JobRegistry(state_path=state)
+    writer = JobRegistry(state_path=state)
+
+    job_expected_revision = stale._loaded_revision
+    created_job = writer.create_job(
+        task="slice-a",
+        persona="builder",
+        branch="feature/slice-a",
+        pane="%0",
+        worktree="/wt/slice-a",
+    )
+    job_actual_revision = hashlib.sha256(state.read_bytes()).hexdigest()
+    with pytest.raises(RegistryRevisionConflict) as job_ctx:
+        stale.update_status(created_job["job_id"], "running")
+    assert job_ctx.value.expected_revision == job_expected_revision
+    assert job_ctx.value.actual_revision == job_actual_revision
+    assert stale.get_job(created_job["job_id"]) == created_job
+
+    slice_expected_revision = stale._loaded_revision
+    created_slice = writer.create_slice(
+        slice_id="slice-b",
+        spec_path="specs/slice-b.md",
+        spec_hash="spec-b-sha",
+        plan_path="plans/slice-b.md",
+        plan_hash="plan-b-sha",
+        target_branch="feature/slice-b",
+        dispatch_base="base-b-sha",
+    )
+    slice_actual_revision = hashlib.sha256(state.read_bytes()).hexdigest()
+    with pytest.raises(RegistryRevisionConflict) as slice_ctx:
+        stale.record_action(
+            "slice-b",
+            action="builder-started",
+            actor="builder",
+            state="building",
+        )
+    assert slice_ctx.value.expected_revision == slice_expected_revision
+    assert slice_ctx.value.actual_revision == slice_actual_revision
+    assert stale.get_slice("slice-b") == created_slice
+
+    workflow_expected_revision = stale._loaded_revision
+    created_run = _create_run(writer)
+    workflow_actual_revision = hashlib.sha256(state.read_bytes()).hexdigest()
+    with pytest.raises(RegistryRevisionConflict) as workflow_ctx:
+        stale._manager_update_workflow_run(created_run.run_id, current_phase="build")
+    assert workflow_ctx.value.expected_revision == workflow_expected_revision
+    assert workflow_ctx.value.actual_revision == workflow_actual_revision
+    assert stale.get_workflow_run(created_run.run_id) == created_run
+
+
 @pytest.mark.parametrize(
     ("current", "new"),
     [
