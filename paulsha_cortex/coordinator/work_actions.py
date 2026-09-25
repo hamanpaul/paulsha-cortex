@@ -879,6 +879,8 @@ def _delivery_journal_lock_fd(path: Path) -> int:
     if lock_path.is_symlink():
         raise RuntimeError("work run state lock path invalid")
     flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -982,7 +984,8 @@ def _write_delivery_journal_candidate(
             confirmed=confirmed.payload,
         )
         return confirmed
-    except BaseException as exc:
+    except Exception as exc:
+        # KeyboardInterrupt／SystemExit 等控制流程照原樣傳遞，不改寫成 unknown outcome。
         raise _DeliveryJournalUnknown("work run state outcome unknown") from exc
     finally:
         temporary.unlink(missing_ok=True)
