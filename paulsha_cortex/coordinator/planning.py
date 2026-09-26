@@ -1104,15 +1104,20 @@ def summarize_planning_exception(
     """`<ExceptionTypeName>: <訊息>`——四個 `except` 分支共用的例外摘要。
 
     #397 起這四處就併入例外型別與訊息，本票只改兩件事：預算由 160 放寬到
-    `PLANNING_FAILURE_DETAIL_LIMIT`（逐欄差異裝不進 160），以及截斷改為
-    **就地記帳** `…+Nc`（原本是裸切，讀的人看不出還有沒有下文）。單行化與
-    型別名在前的順序不變——`outcome_taxonomy` 的 `timeoutexpired` 這類 marker
-    靠的就是型別名活著。
+    `PLANNING_FAILURE_DETAIL_LIMIT`（逐欄差異裝不進 160），以及截斷改為頭尾各留一半，
+    並以 `…+Nc` 記帳超出預算的字元數。單行化與型別名在前的順序不變——
+    `outcome_taxonomy` 的 `timeoutexpired` 這類 marker 靠的就是型別名活著。
     """
 
     message = " ".join(_DIAGNOSTIC_CONTROL_RE.sub(" ", str(exc)).split())
     if len(message) > limit:
-        message = f"{message[:limit]}…+{len(message) - limit}c"
+        omitted = len(message) - limit
+        if limit >= 2:
+            head = (limit + 1) // 2
+            tail = limit - head
+            message = f"{message[:head]}…{message[-tail:]}…+{omitted}c"
+        else:
+            message = f"{message[:limit]}…+{omitted}c"
     return f"{type(exc).__name__}: {message}"
 
 
@@ -1637,7 +1642,8 @@ ARTIFACT_EVIDENCE_CONTENT_REASONS = frozenset(
 ARTIFACT_EVIDENCE_ENVIRONMENT_REASONS = frozenset(
     {
         "artifact-root-unresolvable",
-        "artifact-path-escapes-root",
+        # `artifact-path-escapes-root` 刻意不列入：它由模型回傳的 ref 字面
+        # （絕對路徑或含 `..`）觸發，是模型輸出內容錯誤，維持 content。
         "artifact-symlink-rejected",
         "artifact-not-a-regular-file",
         "artifact-unreadable",
@@ -1909,6 +1915,13 @@ class BrainstormResult:
     secondary_domain: str | None
     gate_refs: PlanningGateRefs
     integration: Mapping[str, object] | None = None
+    model_input: Mapping[str, object] | None = None
+
+
+def _snapshot_model_input(stage: str, *args: object) -> dict[str, object]:
+    """以 JSON 值複製單一階段實際收到的參數，避免 callback 修改原始輸入。"""
+
+    return {"stage": stage, "args": json.loads(_canonical_json(list(args)))}
 
 
 def _write_immutable_json(path: Path, payload: object) -> None:
@@ -2023,6 +2036,7 @@ def run_heterogeneous_brainstorm(
             **report.to_dict(),
             QUESTIONER_INPUT_PACK_KEY: report.default_question_pack.to_dict(),
         }
+        questioner_model_input = _snapshot_model_input("questioner", questioner_input)
         pack = validate_question_pack(primary_questioner(questioner_input), report=report)
     except Exception as exc:
         # issue #397：這三處 `except Exception` 過去把底層例外整段壓平成單一
@@ -2043,10 +2057,13 @@ def run_heterogeneous_brainstorm(
             None,
             empty_refs,
             None,
+            model_input=questioner_model_input,
         )
+    secondary_input = pack.to_dict()
+    secondary_model_input = _snapshot_model_input("secondary", secondary_input)
     try:
         secondary = validate_secondary_evidence(
-            secondary_planner(pack.to_dict(), selection.identity),
+            secondary_planner(secondary_input, selection.identity),
             question_pack=pack,
         )
     except Exception as exc:
@@ -2056,13 +2073,18 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=secondary_model_input,
         )
     secondary_payload = secondary.to_dict()
     evidence_hash = _hash_payload(secondary_payload)
     callback_payload = {**secondary_payload, "evidence_hash": evidence_hash}
+    integrator_input = pack.to_dict()
+    integrator_model_input = _snapshot_model_input(
+        "integrator", integrator_input, callback_payload
+    )
     try:
         integration = _validate_primary_integration(
-            primary_integrator(pack.to_dict(), callback_payload),
+            primary_integrator(integrator_input, callback_payload),
             question_pack=pack,
             secondary_evidence_hash=evidence_hash,
         )
@@ -2073,6 +2095,7 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=integrator_model_input,
         )
     rollback_publication: Callable[[], None] | None = None
     if artifact_writer is not None:
@@ -2099,6 +2122,7 @@ def run_heterogeneous_brainstorm(
                 selection.identity.independence_domain,
                 empty_refs,
                 None,
+                model_input=integrator_model_input,
             )
     artifact_evidence = _post_integration_artifact_evidence(
         integration,
@@ -2118,6 +2142,7 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=integrator_model_input,
         )
     evidence_payload = {
         "schema_version": BRAINSTORM_EVIDENCE_SCHEMA_VERSION,
@@ -2147,6 +2172,7 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=integrator_model_input,
         )
     except OSError:
         if rollback_publication is not None:
@@ -2157,6 +2183,7 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=integrator_model_input,
         )
     refs = PlanningGateRefs(
         brainstorm_peer=GateEvidenceRef(

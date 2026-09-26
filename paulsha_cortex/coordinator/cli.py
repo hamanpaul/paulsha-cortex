@@ -222,7 +222,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--expected-run-id",
         help=(
             "abandon／retire-delivered／recover-superseded／regenerate-gates／"
-            "retry-card／refreeze-base 使用的 exact WorkflowRun CAS"
+            "retry-card／refreeze-base 使用的 exact WorkflowRun CAS；retry-build 改用 expected_candidate"
         ),
     )
     p_work.add_argument(
@@ -417,6 +417,12 @@ def main(
         )
 
     if args.cmd == "work":
+        if args.action == "retry-build" and args.expected_run_id is not None:
+            print(
+                "錯誤: retry-build 不接受 --expected-run-id；請改用 --payload 的 expected_candidate CAS。",
+                file=sys.stderr,
+            )
+            return 2
         request_args = {
             "action": args.action,
             "repo": args.repo,
@@ -458,6 +464,12 @@ def main(
                 print("錯誤: work payload cannot override action/repo/work_id", file=sys.stderr)
                 return 2
             request_args.update(extra)
+        if args.action == "retry-build" and "expected_run_id" in request_args:
+            print(
+                "錯誤: retry-build 不接受 expected_run_id；請改用 --payload 的 expected_candidate CAS。",
+                file=sys.stderr,
+            )
+            return 2
         return _submit_mutation_request(
             "work-action",
             request_args,

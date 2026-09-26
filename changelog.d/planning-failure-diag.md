@@ -1,0 +1,1 @@
+修正 #572 的 planning 檔案系統與解碼拒收分類，讓 symlink、非一般檔案及讀取／解碼失敗可使用 `recover-planning`；模型回傳 `..`／絕對路徑 ref 與內容驗收拒收維持 content；修正 #707，於 planning failure evidence 保存失敗階段的 questioner、secondary planner 或 integrator 輸入摘錄，套用分類標記遮罩並限制為 2 KiB。

@@ -21,7 +21,7 @@ from ..persona.contract import PersonaContract, validate_persona_schema
 
 VERIFICATION_SCHEMA_VERSION = 1
 VALID_DOCS_CLASSES = frozenset({"normative", "informational", "trivial", "code"})
-SAFE_SLICE_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
+SAFE_SLICE_ID_RE = re.compile(r"[\w.-]+", re.UNICODE)
 SAFE_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 SAFE_REMOTE_RE = re.compile(r"[A-Za-z0-9._-]+")
 SAFE_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "VIRTUAL_ENV")

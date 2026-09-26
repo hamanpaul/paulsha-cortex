@@ -73,8 +73,8 @@ MAX_PROVIDER_RETRIES = 2
 #   之內已經自動回派了幾次。`registry._manager_reset_workflow_for_retry_card`
 #   會把它清掉——operator 的顯式重派語意上就是「重新給一輪額度」。
 # - `schema-mismatch-total:<card>`（**累計**觀測）：這張卡從頭到尾一共撞過幾次
-#   確定性 mismatch，跨 `retry-card` 世代累加、永不清零，供成本診斷與 #555 之後
-#   的 per-card 熔斷有一個既有的機械來源可接。
+#   確定性 mismatch，跨 `retry-card` 世代累加、永不清零，供成本診斷；#555 的
+#   per-card 熔斷另以 `retry-card:<card>` attempts 與歷史 job 數計算 operator 重派。
 #
 # 兩者共用同一個 `(n/N)` 正是 #717 追加觀察裡 operator 被誤導的原因：attention 上
 # 寫「已達上限（2/2）」，實際上這一輪只跑過一次，額度是上一輪燒掉的。

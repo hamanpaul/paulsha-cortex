@@ -20,6 +20,7 @@ from .diagnostics import (
     DiagnosticInvariantError,
     DiagnosticReason,
     coerce_diagnostic_reason,
+    diagnostic_reason,
 )
 from .usage_extractors import extract_usage
 from .workflow import (
@@ -46,6 +47,51 @@ RETRY_CARD_PHASE_PERSONA = {
     "verify": "reviewer",
     "review": "reviewer",
 }
+
+# #555：同一張卡最多接受三次 operator 明示 retry-card 重派；此計數跨重派世代保留。
+MAX_RETRY_CARD_REDISPATCHES = 3
+
+
+def _retry_card_attempt_key(card_id: str) -> str:
+    """同一張卡跨 retry-card 世代累計的 operator 重派次數。"""
+
+    return f"retry-card:{card_id}"
+
+
+def _retry_card_redispatch_count(
+    attempts: Mapping[str, int], *, matching_job_count: int, card_id: str
+) -> int:
+    """只計 operator 明示 retry-card 的持久計數。
+
+    不以卡片 job 數回推：同卡的 schema 自動重派也會產生 job，回推會把自動重派
+    誤算成 operator 重派而提早耗盡額度。舊 run 沒有這個鍵時從 0 起算。
+    """
+
+    del matching_job_count
+    return attempts.get(_retry_card_attempt_key(card_id), 0)
+
+
+def _retry_card_budget_message(card_id: str, count: int) -> str:
+    return (
+        f"retry-card per-card limit reached for card {card_id} "
+        f"({count}/{MAX_RETRY_CARD_REDISPATCHES}); use abandon or retry-build when eligible"
+    )
+
+
+def _retry_card_budget_reason(
+    card_id: str, count: int, *, source: str
+) -> DiagnosticReason:
+    return diagnostic_reason(
+        "retry-card-budget-exhausted",
+        f"卡片 {card_id} 的 retry-card 重派已達上限（{count}/{MAX_RETRY_CARD_REDISPATCHES}）。",
+        source=source,
+        next_step_hint=(
+            "請執行 abandon；若 retry-build 的前置條件成立，可先修復 Candidate 後重派。"
+        ),
+        card=card_id,
+        redispatch_count=count,
+        retry_limit=MAX_RETRY_CARD_REDISPATCHES,
+    )
 
 VALID_SLICE_STATES = frozenset(
     {
@@ -5103,6 +5149,21 @@ class JobRegistry:
         )
         if accepted_evidence and not superseded_by_failed_builder:
             raise ValueError("retry-card reset refuses a card with accepted evidence")
+        retry_card_count = _retry_card_redispatch_count(
+            current.attempts,
+            matching_job_count=len(matching_card_jobs),
+            card_id=card,
+        )
+        if retry_card_count >= MAX_RETRY_CARD_REDISPATCHES:
+            self._manager_update_workflow_run(
+                current.run_id,
+                needs_human_reason=_retry_card_budget_reason(
+                    card,
+                    retry_card_count,
+                    source="coordinator.registry._manager_reset_workflow_for_retry_card",
+                ),
+            )
+            raise ValueError(_retry_card_budget_message(card, retry_card_count))
         steps = tuple(
             # 只清掉「上一次是誰跑的」這類解析結果，讓下一次 dispatch 重新解析
             # identity；`action`／`inputs`／`outputs`／`test_policy` 等卡片契約
@@ -5113,6 +5174,8 @@ class JobRegistry:
             else step
             for step in current.steps
         )
+        # #555：operator 的顯式重派次數跨世代累計，不得被下方 schema retry reset 清掉。
+        # 舊 run 若尚無這個 attempts key，從 0 起算（不以 job 數回推，見 _retry_card_redispatch_count）。
         # #717：operator 的顯式重派＝**重新給一輪 schema retry 額度**。
         #
         # 過去只 bump `attempts[phase]`，同一個 dict 上的 `schema-mismatch:<card>`
@@ -5122,10 +5185,8 @@ class JobRegistry:
         # attention 卻寫「已達上限（2/2）」——operator 讀成「它剛剛試了兩次」。
         #
         # 本輪額度清零，但**累計觀測不清**：值搬到 `schema-mismatch-total:<card>`
-        # 累加，因此成本診斷與 #555 之後要接的 per-card 熔斷仍有一個單調遞增、
-        # 跨世代的機械來源。這裡不新增熔斷（#555 仍 open）——`retry-card` 本身就
-        # 沒有次數上限，清這個鍵並未移除任何**既有的**熔斷，只是移除了跨世代的
-        # 意外殘留。
+        # 累加供成本診斷；operator 重派的 per-card 上限由獨立的
+        # `retry-card:<card>` attempts 鍵計數，避免混淆兩種重派來源。
         card_retry_key = terminal_contract.schema_retry_attempt_key(card)
         card_total_key = terminal_contract.schema_mismatch_total_key(card)
         attempts = {
@@ -5134,6 +5195,7 @@ class JobRegistry:
             if key != card_retry_key
         }
         attempts[phase] = current.attempts.get(phase, 0) + 1
+        attempts[_retry_card_attempt_key(card)] = retry_card_count + 1
         carried = current.attempts.get(card_retry_key, 0)
         if carried:
             attempts[card_total_key] = current.attempts.get(card_total_key, 0) + carried

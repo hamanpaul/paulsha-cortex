@@ -325,6 +325,107 @@ def test_retry_card_refuses_a_card_with_accepted_evidence(tmp_path: Path) -> Non
     assert registry.get_job(job_id)["workflow_evidence"]["hash"] == "e" * 64
 
 
+def test_retry_card_stops_after_three_per_card_redispatches(tmp_path: Path) -> None:
+    """#555：同一張卡最多接受三次 operator retry-card 重派。"""
+
+    snapshot, registry, run, _job_id = _stuck_run(tmp_path)
+    for attempt in range(1, 4):
+        _retry_card(
+            tmp_path,
+            snapshot,
+            registry,
+            expected_run_id=run.run_id,
+            card="tdd-red",
+        )
+        assert (
+            registry.get_workflow_run(run.run_id).attempts["retry-card:tdd-red"]
+            == attempt
+        )
+        # 模擬新派出的卡再度失敗，接著由 operator 嘗試下一次 retry-card。
+        registry._manager_update_workflow_run(
+            run.run_id,
+            facets=("needs_human",),
+            gate_status="failed",
+            needs_human_reason=fixture_needs_human_reason(),
+        )
+        job = registry.create_job(
+            task=f"wf-tdd-red-retry-{attempt}",
+            persona="builder",
+            branch="feature/12-demo",
+            pane="",
+            worktree=str(tmp_path),
+            workflow_run_id=run.run_id,
+            workflow_card="tdd-red",
+            workflow_phase="build",
+        )
+        registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+
+    with pytest.raises(RuntimeError, match=r"per-card.*tdd-red.*3/3.*abandon"):
+        _retry_card(
+            tmp_path,
+            snapshot,
+            registry,
+            expected_run_id=run.run_id,
+            card="tdd-red",
+        )
+
+    blocked = registry.get_workflow_run(run.run_id)
+    assert "needs_human" in blocked.facets
+    assert blocked.needs_human_reason["reason"] == "retry-card-budget-exhausted"
+    assert "tdd-red" in blocked.needs_human_reason["detail"]
+    entry = manager.workflow_status_entry(registry, blocked)
+    assert entry["blocking_reason"]["reason"] == "retry-card-budget-exhausted"
+    assert "abandon" in entry["next_actions"]
+    assert "retry-card" not in entry["next_actions"]
+
+
+def test_retry_card_registry_reset_enforces_the_card_budget(tmp_path: Path) -> None:
+    """#555：registry 是最後一道原子門，直接呼叫也不能繞過熔斷。"""
+
+    _snapshot, registry, run, _job_id = _stuck_run(tmp_path)
+    registry._manager_update_workflow_run(
+        run.run_id,
+        attempts={**run.attempts, "retry-card:tdd-red": 3},
+    )
+
+    with pytest.raises(ValueError, match=r"per-card.*tdd-red.*3/3.*abandon"):
+        registry._manager_reset_workflow_for_retry_card(
+            run.run_id,
+            expected_run_id=run.run_id,
+            card="tdd-red",
+        )
+
+    blocked = registry.get_workflow_run(run.run_id)
+    assert "needs_human" in blocked.facets
+    assert blocked.needs_human_reason["reason"] == "retry-card-budget-exhausted"
+
+
+def test_retry_card_budget_ignores_schema_auto_redispatch_jobs(tmp_path: Path) -> None:
+    """#555：schema 自動重派產生的同卡 job 不得被算成 operator 的 retry-card。"""
+
+    _snapshot, registry, run, _job_id = _stuck_run(tmp_path)
+    for index in range(2):
+        auto = registry.create_job(
+            task=f"wf-tdd-red-schema-retry-{index}",
+            persona="builder",
+            branch="feature/12-demo",
+            pane="",
+            worktree=str(tmp_path),
+            workflow_run_id=run.run_id,
+            workflow_card="tdd-red",
+            workflow_phase="build",
+        )
+        registry.update_headless_result(auto["job_id"], status="failed", exit_code=1)
+
+    reset = registry._manager_reset_workflow_for_retry_card(
+        run.run_id,
+        expected_run_id=run.run_id,
+        card="tdd-red",
+    )
+
+    assert reset.attempts["retry-card:tdd-red"] == 1
+
+
 def test_retry_card_reopens_after_a_newer_failed_builder_attempt(
     tmp_path: Path,
 ) -> None:

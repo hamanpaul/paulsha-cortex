@@ -19,6 +19,7 @@ coordinator root 上就躺著兩份這種孤兒 journal。
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -130,7 +131,7 @@ def test_prepare_commit_seals_the_file_side_of_the_transaction(tmp_path: Path) -
     transaction, _, _ = _publish_generation(workspace, coordinator)
 
     body = json.loads(_journal(coordinator).read_text(encoding="utf-8"))
-    assert body["schema_version"] == 3
+    assert body["schema_version"] == 4
     assert body["phase"] == "publishing"
 
     transaction.prepare_commit()
@@ -218,6 +219,7 @@ def test_sweep_heals_legacy_v2_journal_of_a_superseded_run(tmp_path: Path) -> No
     journal = _journal(coordinator)
     legacy = json.loads(journal.read_text(encoding="utf-8"))
     legacy.pop("phase")
+    legacy.pop("expected_planning_authority", None)
     legacy["schema_version"] = 2
     journal.write_text(json.dumps(legacy, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -275,6 +277,42 @@ def test_sweep_leaves_in_flight_journals_alone(tmp_path: Path) -> None:
     assert [row["outcome"] for row in report] == ["in-flight"]
     assert all(path.is_file() for path in artifacts)
     assert _journal(coordinator).is_file()
+
+
+def test_reconcile_planning_transactions_scopes_requested_run(tmp_path: Path) -> None:
+    coordinator = tmp_path / "coordinator"
+    coordinator.mkdir()
+    workspace_one = tmp_path / "workspace-one"
+    workspace_two = tmp_path / "workspace-two"
+    workspace_one.mkdir()
+    workspace_two.mkdir()
+    _, artifacts_one, _ = _publish_generation(
+        workspace_one, coordinator, run_id="workflow-one", with_evidence=False
+    )
+    _, artifacts_two, _ = _publish_generation(
+        workspace_two, coordinator, run_id="workflow-two", with_evidence=False
+    )
+    for run_id in ("workflow-one", "workflow-two"):
+        os.utime(_journal(coordinator, run_id), (0, 0))
+    registry = _FakeRegistry(
+        [
+            _fake_run(run_id="workflow-one", workspace_root=workspace_one),
+            _fake_run(run_id="workflow-two", workspace_root=workspace_two),
+        ]
+    )
+
+    report = manager.reconcile_planning_transactions(
+        registry=registry,
+        coordinator_root=coordinator,
+        run_id="workflow-one",
+        now=time.time() + 10_000,
+    )
+
+    assert [row["run_id"] for row in report] == ["workflow-one"]
+    assert not any(path.exists() for path in artifacts_one)
+    assert all(path.is_file() for path in artifacts_two)
+    assert not _journal(coordinator, "workflow-one").exists()
+    assert _journal(coordinator, "workflow-two").is_file()
 
 
 def test_sweep_surfaces_drift_instead_of_forcing_a_rollback(tmp_path: Path) -> None:

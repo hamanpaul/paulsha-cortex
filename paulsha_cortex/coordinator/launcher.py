@@ -28,6 +28,12 @@ _AGY_PRINT_TIMEOUT_BUFFER_SECONDS = 600
 _AGY_PRINT_TIMEOUT_MAX_SECONDS = 9223372036
 _AGY_PRINT_TIMEOUT_MAX_SECONDS_TEXT = str(_AGY_PRINT_TIMEOUT_MAX_SECONDS)
 _AGY_CANONICAL_DURATION_RE = re.compile(r"[1-9][0-9]*s")
+_AGY_BUILDER_FOREGROUND_INSTRUCTION = (
+    "Run tests and long-running commands directly in the foreground, "
+    "synchronously, and wait for each to finish before continuing. "
+    "Do not start background tasks or background processes for tests or "
+    "long-running commands."
+)
 
 
 def _claude_review_json_schema(kind: str) -> str:
@@ -1430,7 +1436,8 @@ def build_agy_argv(
             argv.extend(["--add-dir", str(Path(worktree).resolve())])
     else:
         worktree = str(Path(worktree).resolve())
-        argv = ["agy", "--print", prompt, "--mode", "accept-edits"]
+        builder_prompt = f"{prompt}\n\n{_AGY_BUILDER_FOREGROUND_INSTRUCTION}"
+        argv = ["agy", "--print", builder_prompt, "--mode", "accept-edits"]
         argv.extend(["--add-dir", worktree])
         if commit_required:
             for git_write_dir in _linked_worktree_git_write_dirs(worktree):

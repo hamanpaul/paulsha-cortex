@@ -467,6 +467,37 @@ def test_install_service_installs_monitor_unit(tmp_path, monkeypatch):
     assert "cortex-manager.env" in monitor_unit
 
 
+def test_install_enables_manager_service_at_boot(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+
+    home = tmp_path / "home"
+    repo_root = tmp_path / "repo"
+    home.mkdir()
+    repo_root.mkdir()
+    calls: list[tuple[str, ...]] = []
+
+    def fake_systemctl_step(*args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: True)
+    monkeypatch.setattr(installer, "_run_systemctl_install_step", fake_systemctl_step)
+
+    result = installer.install_service_result("beta", 120, repo_root)
+
+    assert result.exit_code == 0
+    assert "[Install]\nWantedBy=default.target" in installer.render_units("beta", 120)[
+        "beta-manager.service"
+    ]
+    assert calls == [
+        ("daemon-reload",),
+        ("enable", "beta-monitor.service"),
+        ("enable", "beta-manager.service"),
+        ("enable", "beta-manager.timer"),
+    ]
+
+
 def test_install_rejects_unsafe_instance_name(tmp_path, monkeypatch, capsys):
     from paulsha_cortex.deploy import installer
 
@@ -498,6 +529,7 @@ def test_install_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
     [
         (["systemctl", "--user", "daemon-reload"],),
         (["systemctl", "--user", "enable", "beta-monitor.service"],),
+        (["systemctl", "--user", "enable", "beta-manager.service"],),
         (["systemctl", "--user", "enable", "beta-manager.timer"],),
     ],
 )
@@ -519,6 +551,7 @@ def test_install_service_and_install_reports_systemctl_step_error(
         identity_probe_command,
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "beta-monitor.service"],
+        ["systemctl", "--user", "enable", "beta-manager.service"],
         ["systemctl", "--user", "enable", "beta-manager.timer"],
     ]
     failure_index = expected_commands.index(failure_command)

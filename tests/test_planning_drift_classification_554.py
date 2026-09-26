@@ -334,6 +334,49 @@ def test_recover_planning_is_available_for_drift(tmp_path: Path, message: str) -
     assert decision.blocking_reason == f"planning-failure:environment:{reason}"
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "primary-artifact-invalid: artifact-symlink-rejected "
+        "ref=docs/superpowers/specs/demo-spec.md symlink rejected",
+        "primary-artifact-invalid: artifact-unreadable "
+        "ref=docs/superpowers/specs/demo-spec.md UnicodeDecodeError",
+    ],
+)
+def test_recover_planning_is_available_for_artifact_environment_failures(
+    tmp_path: Path, reason: str
+) -> None:
+    """#572：檔案系統／解碼拒收歸 environment，define 才能提供 recover-planning。"""
+
+    decision = _resume_decision(_needs_human_candidate(tmp_path, reason=reason))
+
+    assert decision.next_actions == ("recover-planning", "abandon")
+
+
+def test_model_supplied_path_escape_stays_content(tmp_path: Path) -> None:
+    """模型回傳 `../`／絕對路徑 ref 是輸出內容錯誤，不得開出 recover-planning。"""
+
+    reason = (
+        "primary-artifact-invalid: artifact-path-escapes-root "
+        "ref=../outside.md artifact ref escapes artifact root"
+    )
+    decision = _resume_decision(_needs_human_candidate(tmp_path, reason=reason))
+
+    assert decision.next_actions == ("abandon",)
+
+
+def test_artifact_assessment_rejection_stays_content(tmp_path: Path) -> None:
+    """#572：planner 產物未通過內容驗收仍維持 content fail-closed。"""
+
+    reason = (
+        "primary-artifact-invalid: artifact-assessment-rejected "
+        "reasons=status-not-accepted"
+    )
+    decision = _resume_decision(_needs_human_candidate(tmp_path, reason=reason))
+
+    assert decision.next_actions == ("abandon",)
+
+
 def test_content_failures_still_only_offer_abandon(tmp_path: Path) -> None:
     """#393 的 fail-closed 一字未動：內容缺陷仍不得由本路徑繞過。"""
 

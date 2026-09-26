@@ -56,8 +56,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             for combo_id, combo_file in iter_combo_files(package_dir=DEFAULT_COMBOS_DIR):
                 combo = load_combo(combo_file, cards)
                 print(f"{combo.id}\t(task_type={combo.task_type}, cards={len(combo.cards)})")
-            for card in cards.values():
-                print(f"  card: {card.id}\t[{card.type}/{card.card_class}]")
+                for entry in combo.cards:
+                    card = cards[entry.ref]
+                    print(f"  card: {card.id}\t[{card.type}/{card.card_class}]")
+                if combo.band_triggered is not None:
+                    # band 觸發（例如 sizing 達門檻）時 compile 會併入的加掛卡，另行標示。
+                    for entry in combo.band_triggered.cards:
+                        card = cards[entry.ref]
+                        print(
+                            f"  card: {card.id}\t[{card.type}/{card.card_class}]"
+                            f"\t(band≥{combo.band_triggered.trigger})"
+                        )
             return 0
 
         if args.command == "compile":

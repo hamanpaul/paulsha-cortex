@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from paulsha_cortex.coordinator import work_actions
+from paulsha_cortex.coordinator import manager, work_actions
 from paulsha_cortex.coordinator.github_delivery import (
     COPILOT_REVIEWER_LOGIN,
     CopilotReview,
@@ -1239,6 +1239,48 @@ def test_abandon_gc_removes_untracked_planning_artifact_matching_baseline_hash(
         "（issue #416：否則下一世代 brainstorm 重新發佈同一路徑時會被 authority"
         " 檢查必拒）"
     )
+
+
+def test_abandon_reconciles_uncommitted_planning_publication_journal(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    transaction = manager._PlanningPublicationTransaction(
+        root=Path(run.workspace_root),
+        run_id=run_id,
+        journal_root=tmp_path,
+    )
+    target = Path(run.workspace_root) / "docs/superpowers/specs/fix-558-residue.md"
+    transaction.publish(
+        target,
+        b"# Uncommitted publication residue\n",
+        baseline_hash=None,
+        kind="artifact",
+    )
+    assert transaction.journal_path is not None
+
+    work_actions.execute_work_action(
+        args=_abandon_args(run_id),
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+
+    assert not target.exists(), "abandon 必須由 transaction journal 回收未提交發佈殘留"
+    assert not transaction.journal_path.exists()
 
 
 def test_abandon_gc_preserves_planning_artifact_with_hash_drift(tmp_path: Path) -> None:
@@ -3643,7 +3685,7 @@ def test_archive_requires_change_specific_changelog(tmp_path: Path) -> None:
     def runner(argv, **kwargs):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    with pytest.raises(RuntimeError, match="changelog-missing"):
+    with pytest.raises(RuntimeError, match="change-specific-changelog-entry-missing"):
         work_actions.execute_work_action(
             args={
                 "action": "ship",
@@ -3661,6 +3703,28 @@ def test_archive_requires_change_specific_changelog(tmp_path: Path) -> None:
             now=lambda: 200,
             runner=runner,
         )
+
+
+def test_local_archive_gate_accepts_issue_prefixed_changelog_fragment(
+    tmp_path: Path,
+) -> None:
+    change = "footer-agent-selection"
+    tasks = tmp_path / "openspec" / "changes" / change / "tasks.md"
+    tasks.parent.mkdir(parents=True)
+    tasks.write_text("- [x] complete\n", encoding="utf-8")
+    fragment = tmp_path / "changelog.d" / f"341-{change}.md"
+    fragment.parent.mkdir(parents=True)
+    fragment.write_text("# 341: 修正頁尾 agent 選擇\n", encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text("## [Unreleased]\n", encoding="utf-8")
+
+    def runner(argv, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    work_actions._validate_local_archive_inputs(
+        repo_root=tmp_path,
+        change=change,
+        runner=runner,
+    )
 
 
 def test_archive_allows_advisory_r22_doc_reference_warning(tmp_path: Path) -> None:

@@ -18,7 +18,10 @@ deterministic pass 之前（見 `_plan_card_declared_outputs_present` /
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
+
+import pytest
 
 from paulsha_cortex.coordinator import manager
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
@@ -165,6 +168,109 @@ def test_todo_anchored_plan_outputs_missing_get_materialized_not_skipped(tmp_pat
     assert materialized.work_id == TASK_SLUG
     assert materialized.baseline_sha256 == hashlib.sha256(_TODO_BODY.encode("utf-8")).hexdigest()
     assert registry.list_jobs() == []
+
+
+def test_materialized_plan_publication_journals_before_registry_commit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    registry, _repo, run = _make_run(tmp_path, plan_ref=TODO_REF, plan_body=_TODO_BODY)
+    coordinator = tmp_path / "coordinator"
+    journal = coordinator / "planning-transactions" / f"{run.run_id}.json"
+    original_update = registry._manager_update_workflow_run
+
+    def observe_commit(run_id: str, **kwargs):
+        assert journal.is_file(), "missing planning journal before plan registry commit"
+        payload = json.loads(journal.read_text(encoding="utf-8"))
+        assert payload["phase"] == "prepared"
+        assert payload["expected_planning_authority"] == kwargs["planning_authority"][-1].to_dict()
+        return original_update(run_id, **kwargs)
+
+    monkeypatch.setattr(registry, "_manager_update_workflow_run", observe_commit)
+    manager.dispatch_workflow_card(
+        _dispatcher(registry),
+        run=run,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=_must_not_launch,
+        coordinator_root=coordinator,
+    )
+
+    assert not journal.exists()
+
+
+class _HardCrash(BaseException):
+    pass
+
+
+def test_materialized_plan_journal_rolls_back_when_registry_commit_did_not_happen(
+    tmp_path: Path, monkeypatch
+) -> None:
+    registry, repo, run = _make_run(tmp_path, plan_ref=TODO_REF, plan_body=_TODO_BODY)
+    coordinator = tmp_path / "coordinator"
+    canonical = repo / CANONICAL_PLAN_REF
+    original_rollback = manager._PlanningPublicationTransaction.rollback
+    monkeypatch.setattr(manager._PlanningPublicationTransaction, "rollback", lambda self, **kwargs: ())
+
+    def crash_before_commit(_run_id: str, **_kwargs):
+        raise _HardCrash("before registry commit")
+
+    monkeypatch.setattr(registry, "_manager_update_workflow_run", crash_before_commit)
+    with pytest.raises(_HardCrash, match="before registry commit"):
+        manager.dispatch_workflow_card(
+            _dispatcher(registry),
+            run=run,
+            identities=IdentityRegistry.from_rows([]),
+            launcher_factory=_must_not_launch,
+            coordinator_root=coordinator,
+        )
+
+    monkeypatch.setattr(manager._PlanningPublicationTransaction, "rollback", original_rollback)
+    journal = coordinator / "planning-transactions" / f"{run.run_id}.json"
+    assert canonical.is_file()
+    assert journal.is_file()
+    report = manager.reconcile_planning_transactions(
+        registry=registry, coordinator_root=coordinator, now=10**12, grace_seconds=0
+    )
+
+    assert report[0]["outcome"] == "rolled-back"
+    assert not canonical.exists()
+    assert not journal.exists()
+
+
+def test_materialized_plan_journal_commits_when_registry_update_preceded_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    registry, repo, run = _make_run(tmp_path, plan_ref=TODO_REF, plan_body=_TODO_BODY)
+    coordinator = tmp_path / "coordinator"
+    canonical = repo / CANONICAL_PLAN_REF
+    original_update = registry._manager_update_workflow_run
+    original_rollback = manager._PlanningPublicationTransaction.rollback
+    monkeypatch.setattr(manager._PlanningPublicationTransaction, "rollback", lambda self, **kwargs: ())
+
+    def crash_after_commit(run_id: str, **kwargs):
+        original_update(run_id, **kwargs)
+        raise _HardCrash("after registry commit")
+
+    monkeypatch.setattr(registry, "_manager_update_workflow_run", crash_after_commit)
+    with pytest.raises(_HardCrash, match="after registry commit"):
+        manager.dispatch_workflow_card(
+            _dispatcher(registry),
+            run=run,
+            identities=IdentityRegistry.from_rows([]),
+            launcher_factory=_must_not_launch,
+            coordinator_root=coordinator,
+        )
+
+    monkeypatch.setattr(manager._PlanningPublicationTransaction, "rollback", original_rollback)
+    journal = coordinator / "planning-transactions" / f"{run.run_id}.json"
+    assert canonical.is_file()
+    assert journal.is_file()
+    report = manager.reconcile_planning_transactions(
+        registry=registry, coordinator_root=coordinator, now=10**12, grace_seconds=0
+    )
+
+    assert report[0]["outcome"] == "committed"
+    assert canonical.read_text(encoding="utf-8") == _TODO_BODY
+    assert not journal.exists()
 
 
 def test_build_dispatch_after_materialize_finds_declared_input(tmp_path: Path) -> None:

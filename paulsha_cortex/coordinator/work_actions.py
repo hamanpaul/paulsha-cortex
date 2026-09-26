@@ -38,6 +38,7 @@ from .claim import (
     decide_auto_claim,
     decide_manual_start,
     load_work_authorities,
+    load_work_authorities_with_snapshot_items,
     load_work_authority,
     work_authority_digest,
 )
@@ -245,14 +246,31 @@ def _validate_local_archive_inputs(
         r"(?ms)^## \[Unreleased\]\s*(.*?)(?=^## |\Z)", changelog
     )
     unreleased = unreleased_match.group(1) if unreleased_match else ""
-    fragments = tuple(
+    fragments = {
         repo_root / directory / f"{change}.md"
         for directory in ("changelog.d", "changes")
+    }
+    fragment_dir = repo_root / "changelog.d"
+    if not fragment_dir.is_symlink() and fragment_dir.is_dir():
+        fragments.update(fragment_dir.glob("*.md"))
+    change_token = re.compile(
+        rf"(?i)(?<![a-z0-9-]){re.escape(change)}(?![a-z0-9-])"
     )
-    fragment_present = any(
-        path.is_file() and not path.is_symlink() and path.read_text(encoding="utf-8").strip()
-        for path in fragments
-    )
+    fragment_present = False
+    for path in sorted(fragments):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            fragment_text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if fragment_text.strip() and (
+            path.name == f"{change}.md"
+            or path.name.endswith(f"-{change}.md")
+            or change_token.search(fragment_text)
+        ):
+            fragment_present = True
+            break
     facts = ArchiveGateFacts(
         tasks_complete=bool(task_states) and all(state.lower() == "x" for state in task_states),
         canonical_specs_valid=getattr(canonical, "returncode", None) == 0,
@@ -3669,8 +3687,10 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
     from .manager import GATE_LEDGER_REQUIRED_PHASES
     from .registry import (
         ACTIVE_JOB_STATUSES,
+        MAX_RETRY_CARD_REDISPATCHES,
         RETRY_CARD_PHASE_PERSONA,
         TERMINAL_JOB_STATUSES,
+        _retry_card_redispatch_count,
     )
 
     if (
@@ -3714,6 +3734,12 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
                     card_jobs
                     and card_jobs[-1].get("status") in TERMINAL_JOB_STATUSES
                     and all(job.get("workflow_evidence") is None for job in card_jobs)
+                    and _retry_card_redispatch_count(
+                        run.attempts,
+                        matching_job_count=len(card_jobs),
+                        card_id=target.card,
+                    )
+                    < MAX_RETRY_CARD_REDISPATCHES
                 ):
                     actions.append("retry-card")
 
@@ -3804,7 +3830,14 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     # 與 dispatch 端共用同一個「下一張要派哪張卡」判準——宣告可行的重派必須
     # 真的落在同一張卡上（#382：宣告與實作不得各自為政）。
     from .manager import _current_workflow_step
-    from .registry import RETRY_CARD_PHASE_PERSONA, TERMINAL_JOB_STATUSES
+    from .registry import (
+        MAX_RETRY_CARD_REDISPATCHES,
+        RETRY_CARD_PHASE_PERSONA,
+        TERMINAL_JOB_STATUSES,
+        _retry_card_budget_message,
+        _retry_card_budget_reason,
+        _retry_card_redispatch_count,
+    )
 
     extras = set(args) - {
         "action", "repo", "work_id", "issue", "actor", "expected_run_id", "card",
@@ -3892,6 +3925,21 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         raise RuntimeError("retry-card refuses a card with accepted evidence")
     if not card_jobs or latest_card_job.get("status") not in TERMINAL_JOB_STATUSES:
         raise RuntimeError("retry-card requires a terminal job for the card")
+    retry_card_count = _retry_card_redispatch_count(
+        run.attempts,
+        matching_job_count=len(card_jobs),
+        card_id=card,
+    )
+    if retry_card_count >= MAX_RETRY_CARD_REDISPATCHES:
+        workflow_registry._manager_update_workflow_run(
+            run.run_id,
+            needs_human_reason=_retry_card_budget_reason(
+                card,
+                retry_card_count,
+                source="coordinator.work_actions._retry_card_action",
+            ),
+        )
+        raise RuntimeError(_retry_card_budget_message(card, retry_card_count))
     # candidate 完全沒變的 reviewer 重派不是模型修復，比照 `retry-verify`／
     # `retry-review` 的既有分類（#208 根因3：不得計入 model failure 指標，也不得
     # 吃 #218 的 repair budget）。build phase 維持 #545 的狀態推論不變。
@@ -4430,7 +4478,12 @@ def _gc_one_abandoned_planning_artifact(item, *, workspace_root: Path) -> None:
     logger.info("planning-artifact-gc-removed ref=%s", item.ref)
 
 
-def _gc_abandoned_planning_artifacts(run) -> None:
+def _gc_abandoned_planning_artifacts(
+    run,
+    *,
+    workflow_registry=None,
+    coordinator_root: Path | None = None,
+) -> None:
     """abandon 終態化之後，盡力回收已發佈未提交的 planning artifacts。
 
     #416 根因：`_PlanningPublicationTransaction` 的 rollback 只在 define 流程
@@ -4445,6 +4498,28 @@ def _gc_abandoned_planning_artifacts(run) -> None:
     效果，不得讓 abandon 本身因為 GC 失敗而失敗，失敗只記 diagnostics。
     """
 
+    if workflow_registry is not None and coordinator_root is not None:
+        try:
+            from . import manager
+
+            report = manager.reconcile_planning_transactions(
+                registry=workflow_registry,
+                coordinator_root=coordinator_root,
+                run_id=run.run_id,
+                grace_seconds=0,
+            )
+            for item in report:
+                logger.info(
+                    "planning-transaction-abandon-reconcile run_id=%s outcome=%s",
+                    item.get("run_id"),
+                    item.get("outcome", "unchanged"),
+                )
+        except Exception as exc:  # noqa: BLE001 - best-effort：GC 不得讓 abandon 失敗
+            logger.warning(
+                "planning-transaction-abandon-reconcile-failed run_id=%s error=%s: %s",
+                run.run_id, type(exc).__name__, str(exc)[:200],
+            )
+
     workspace_root = Path(run.workspace_root)
     for item in run.planning_authority:
         try:
@@ -4457,7 +4532,7 @@ def _gc_abandoned_planning_artifacts(run) -> None:
 
 
 def _reclaim_abandoned_build_worktrees(run, workflow_registry, *, state_path: Path) -> None:
-    """#478／#527：run 被 supersede（abandon）之後回收它名下的 build worktree。
+    """#478／#527／#613：abandon 後回收 build worktree，並安全退役 build branch。
 
     #527 的根因之一是 supersede 只改 run 狀態、不動 build worktree——那份
     worktree 連同它在 git registry 的記錄留著，下一世代重派同名分支時
@@ -4485,25 +4560,195 @@ def _reclaim_abandoned_build_worktrees(run, workflow_registry, *, state_path: Pa
         and isinstance(job.get("worktree"), str)
         and job.get("worktree")
     ]
-    if not targets:
-        return
-    try:
-        results = worktree_reclaim.reclaim_worktrees(
-            targets, preserve_root=state_path.resolve().parent / "evidence"
-        )
-    except Exception as exc:  # noqa: BLE001 - best-effort：不得讓 abandon 失敗
-        logger.warning(
-            "build-worktree-reclaim-failed run_id=%s error=%s: %s",
-            run.run_id, type(exc).__name__, str(exc)[:200],
-        )
-        return
+    results = []
+    if targets:
+        try:
+            reclaim_options = {
+                "preserve_root": state_path.resolve().parent / "evidence"
+            }
+            if isinstance(getattr(run, "workspace_root", None), str):
+                reclaim_options["repo_root"] = Path(run.workspace_root)
+            results = worktree_reclaim.reclaim_worktrees(targets, **reclaim_options)
+        except Exception as exc:  # noqa: BLE001 - best-effort：不得讓 abandon 失敗
+            logger.warning(
+                "build-worktree-reclaim-failed run_id=%s error=%s: %s",
+                run.run_id, type(exc).__name__, str(exc)[:200],
+            )
+            return
+    failed = False
     for result in results:
         if result.ok:
             continue
+        failed = True
         logger.warning(
             "build-worktree-reclaim-failed run_id=%s path=%s detail=%s",
             run.run_id, result.path, result.detail,
         )
+    if failed:
+        return
+
+    try:
+        from . import manager
+
+        repo_root = Path(run.workspace_root).resolve()
+        branch = manager.workflow_build_branch(run)
+    except Exception as exc:  # noqa: BLE001 - best-effort：不得讓 abandon 失敗
+        logger.warning(
+            "build-branch-reclaim-identity-failed run_id=%s error=%s: %s",
+            run.run_id, type(exc).__name__, str(exc)[:200],
+        )
+        return
+    try:
+        other_runs = workflow_registry.list_workflow_runs()
+    except Exception as exc:  # noqa: BLE001 - 無法排除其他 run 使用時保留 branch
+        logger.warning(
+            "build-branch-reclaim-run-list-failed run_id=%s error=%s: %s",
+            run.run_id, type(exc).__name__, str(exc)[:200],
+        )
+        return
+    for other in other_runs:
+        if (
+            other.run_id == run.run_id
+            or other.status != "ongoing"
+            or other.repo != run.repo
+        ):
+            continue
+        try:
+            other_branch = manager.workflow_build_branch(other)
+        except Exception as exc:  # noqa: BLE001 - 無法判斷時 fail-closed 保留 branch
+            logger.warning(
+                "build-branch-reclaim-other-run-identity-failed run_id=%s other_run_id=%s error=%s: %s",
+                run.run_id, getattr(other, "run_id", "unknown"), type(exc).__name__, str(exc)[:200],
+            )
+            return
+        if other_branch == branch:
+            logger.info(
+                "build-branch-reclaim-in-use run_id=%s other_run_id=%s branch=%s",
+                run.run_id, other.run_id, branch,
+            )
+            return
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+        )
+
+    top_level = git("rev-parse", "--show-toplevel")
+    if (
+        top_level.returncode != 0
+        or Path(top_level.stdout.strip()).resolve() != repo_root
+    ):
+        logger.warning("build-branch-reclaim-repo-unavailable run_id=%s", run.run_id)
+        return
+    if git("check-ref-format", "--branch", branch).returncode != 0:
+        logger.warning("build-branch-reclaim-name-invalid run_id=%s", run.run_id)
+        return
+    branch_ref = f"refs/heads/{branch}"
+    branch_exists = git("show-ref", "--verify", "--quiet", branch_ref)
+    if branch_exists.returncode == 1:
+        logger.info("build-branch-reclaim-absent run_id=%s branch=%s", run.run_id, branch)
+        return
+    if branch_exists.returncode != 0:
+        logger.warning(
+            "build-branch-reclaim-read-failed run_id=%s branch=%s detail=%s",
+            run.run_id, branch, branch_exists.stderr.strip()[:200],
+        )
+        return
+    branch_proc = git("rev-parse", "--verify", f"{branch_ref}^{{commit}}")
+    if branch_proc.returncode != 0:
+        logger.warning(
+            "build-branch-reclaim-read-failed run_id=%s branch=%s detail=%s",
+            run.run_id, branch, branch_proc.stderr.strip()[:200],
+        )
+        return
+    branch_sha = branch_proc.stdout.strip().lower()
+
+    base_sha = None
+    frozen = getattr(run, "frozen_readiness", None)
+    if isinstance(frozen, dict):
+        candidate_base = frozen.get("base_sha")
+        if isinstance(candidate_base, str) and verification.SAFE_SHA_RE.fullmatch(candidate_base):
+            base_sha = candidate_base.lower()
+    if base_sha is None:
+        for job in jobs:
+            if (
+                job.get("workflow_run_id") == run.run_id
+                and job.get("persona") == "builder"
+                and job.get("workflow_phase") == "build"
+            ):
+                dispatch_head = job.get("dispatch_head")
+                if isinstance(dispatch_head, str) and verification.SAFE_SHA_RE.fullmatch(dispatch_head):
+                    base_sha = dispatch_head.lower()
+                    break
+    if base_sha is None:
+        main_proc = git("rev-parse", "--verify", "refs/heads/main^{commit}")
+        if main_proc.returncode == 0:
+            base_sha = main_proc.stdout.strip().lower()
+    if base_sha is None:
+        logger.warning("build-branch-reclaim-base-unavailable run_id=%s branch=%s", run.run_id, branch)
+        return
+
+    count_proc = git("rev-list", "--count", f"{base_sha}..{branch_sha}")
+    if count_proc.returncode != 0:
+        logger.warning(
+            "build-branch-reclaim-ancestry-unavailable run_id=%s branch=%s detail=%s",
+            run.run_id, branch, count_proc.stderr.strip()[:200],
+        )
+        return
+    try:
+        has_unbased_commits = int(count_proc.stdout.strip()) > 0
+    except ValueError:
+        logger.warning("build-branch-reclaim-count-invalid run_id=%s branch=%s", run.run_id, branch)
+        return
+
+    archive_tag = None
+    if has_unbased_commits:
+        safe_work_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(run.work_id)).strip(".-") or "work"
+        archive_tag = f"archive/{safe_work_id}-{branch_sha[:8]}"
+        tag_ref = f"refs/tags/{archive_tag}"
+        if git("check-ref-format", tag_ref).returncode != 0:
+            logger.warning(
+                "build-branch-reclaim-archive-tag-invalid run_id=%s tag=%s",
+                run.run_id, archive_tag,
+            )
+            return
+        existing = git("show-ref", "--verify", "--quiet", tag_ref)
+        if existing.returncode == 0:
+            existing_sha = git("rev-parse", "--verify", f"{tag_ref}^{{commit}}")
+            if existing_sha.returncode != 0 or existing_sha.stdout.strip().lower() != branch_sha:
+                logger.warning(
+                    "build-branch-reclaim-archive-tag-conflict run_id=%s tag=%s",
+                    run.run_id, archive_tag,
+                )
+                return
+        elif existing.returncode == 1:
+            created = git("tag", archive_tag, branch_sha)
+            if created.returncode != 0:
+                logger.warning(
+                    "build-branch-reclaim-archive-tag-failed run_id=%s tag=%s detail=%s",
+                    run.run_id, archive_tag, created.stderr.strip()[:200],
+                )
+                return
+        else:
+            logger.warning(
+                "build-branch-reclaim-archive-tag-check-failed run_id=%s tag=%s detail=%s",
+                run.run_id, archive_tag, existing.stderr.strip()[:200],
+            )
+            return
+
+    removed = git("branch", "-D", "--", branch)
+    if removed.returncode != 0:
+        logger.warning(
+            "build-branch-reclaim-failed run_id=%s branch=%s detail=%s",
+            run.run_id, branch, removed.stderr.strip()[:200],
+        )
+        return
+    logger.info(
+        "build-branch-reclaimed run_id=%s branch=%s sha=%s archive_tag=%s",
+        run.run_id, branch, branch_sha, archive_tag or "none",
+    )
 
 
 def _superseded_abandon_body(
@@ -4762,7 +5007,11 @@ def _abandon_action(
         # #416：重入分支同樣要嘗試 GC——覆蓋「第一次 GC 之後、下一次 abandon
         # 呼叫之前殘留仍未清乾淨」的窗口；已清過的項目在這裡自然是 no-op
         # （`_gc_one_abandoned_planning_artifact` 對已不存在的檔案直接略過）。
-        _gc_abandoned_planning_artifacts(updated)
+        _gc_abandoned_planning_artifacts(
+            updated,
+            workflow_registry=workflow_registry,
+            coordinator_root=state_path.resolve().parent,
+        )
         _reclaim_abandoned_build_worktrees(
             updated, workflow_registry, state_path=state_path
         )
@@ -4840,7 +5089,11 @@ def _abandon_action(
     # #416：run 終態化為 superseded 之後，盡力回收已發佈未提交的 planning
     # artifacts——放在狀態轉換之後，確保只有 abandon 真的成立時才動檔案；
     # GC 本身 best-effort、不 raise，失敗不得讓已經成功的 abandon 跟著失敗。
-    _gc_abandoned_planning_artifacts(updated)
+    _gc_abandoned_planning_artifacts(
+        updated,
+        workflow_registry=workflow_registry,
+        coordinator_root=state_path.resolve().parent,
+    )
     # #478／#527：supersede 也要回收 build worktree，紀律同上（best-effort）。
     _reclaim_abandoned_build_worktrees(updated, workflow_registry, state_path=state_path)
     return {
@@ -6512,7 +6765,9 @@ def run_auto_claim_scan(
     """Project the durable Monitor snapshot into Manager-owned auto claims."""
 
     try:
-        authorities = load_work_authorities(snapshot_path=snapshot_path)
+        authorities, snapshot_items = load_work_authorities_with_snapshot_items(
+            snapshot_path=snapshot_path
+        )
     except ValueError as exc:
         if "snapshot unavailable" in str(exc):
             return []
@@ -6656,6 +6911,10 @@ def run_auto_claim_scan(
                     **result,
                 }
             )
+    not_claimable.sweep_missing(
+        not_claimable.ledger_path(resolved_state.parent),
+        present_items=snapshot_items,
+    )
     return results
 
 

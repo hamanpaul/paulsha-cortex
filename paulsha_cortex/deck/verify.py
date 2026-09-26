@@ -12,13 +12,14 @@ class DeckVerifyError(ValueError):
 
 
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+_TASK_SLUG_RE = re.compile(r"[^\W_](?:[^\W_]|-)*", re.UNICODE)
 
 
 def _validate_name(label: str, value: str) -> str:
-    if not _NAME_RE.fullmatch(value):
-        raise DeckVerifyError(
-            f"{label} 名稱不合法（僅允許 [a-z0-9-]，不可含 glob/path metacharacters）: {value!r}"
-        )
+    name_re = _TASK_SLUG_RE if label == "task_slug" else _NAME_RE
+    if not name_re.fullmatch(value):
+        allowed = "Unicode 字母、數字與連字號" if label == "task_slug" else "[a-z0-9-]"
+        raise DeckVerifyError(f"{label} 名稱不合法（僅允許 {allowed}，不可含 glob/path metacharacters）: {value!r}")
     return value
 
 

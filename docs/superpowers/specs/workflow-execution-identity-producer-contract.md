@@ -35,6 +35,10 @@ fields:
 - A `planned` row has no `job_id` and only exposes values explicitly present on
   the workflow step. A deterministic manager step is represented as
   `cortex-manager` / `deterministic`.
+- `recent_done` 的 `exited_at` 來自已綁定的 registry job，與 manifest 完成時間
+  `at` 分開。workflow job 另帶 registry run 的 `run_id`、`work_id` 與
+  `run_status`（`ongoing`／`superseded`／`done`）；缺少已驗證的 registry 綁定時，
+  無法取得的欄位為 `null`。
 - An `unknown` row has `executor`, `model`, and `job_id` all set to `null`.
   Consumers must not infer identity from `phase`, `persona`, branch, worktree,
   or a job belonging to another run, repository, card, or phase.

@@ -161,6 +161,50 @@ def test_auto_scan_leaves_no_durable_run_for_a_workstream_without_issue(
     assert not state.exists()
 
 
+def test_auto_claim_scan_removes_ledger_entries_missing_from_snapshot(
+    tmp_path: Path,
+) -> None:
+    """#912：掃描快照不再包含的 work item，其 not-claimable 記錄須回收。"""
+
+    snapshot = _snapshot(tmp_path / "work" / "snapshot.json")
+    state = tmp_path / "work" / "runs.json"
+    registry = JobRegistry(state_path=state.parent / "jobs.json")
+    ledger = _ledger(state)
+    not_claimable.record(
+        ledger,
+        repo="acme/demo",
+        work_id="cost-governance-cluster",
+        reason="missing_issue",
+        detail="仍在快照中的項目",
+        source="test",
+        next_step_hint="維持可查詢",
+        now="2026-09-25T00:00:00+00:00",
+    )
+    not_claimable.record(
+        ledger,
+        repo="acme/demo",
+        work_id="removed-work-item",
+        reason="missing_issue",
+        detail="已不在快照中的項目",
+        source="test",
+        next_step_hint="由 claim scan 回收",
+        now="2026-09-24T00:00:00+00:00",
+    )
+
+    work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+        workflow_starter=_refusing_starter,
+    )
+
+    entries = not_claimable.list_entries(ledger)
+    assert [(row["repo"], row["work_id"]) for row in entries] == [
+        ("acme/demo", "cost-governance-cluster")
+    ]
+
+
 # --- 2. 跳過必須可查詢 ---------------------------------------------------------
 
 
