@@ -185,6 +185,28 @@ def test_oversized_spec_body_still_verifies_hash_against_full_content() -> None:
         )
 
 
+def test_truncated_spec_with_worktree_boundary_allows_reading_only_the_spec_path() -> None:
+    """#477 × #503：截斷時完整 spec 只能從 [SPEC] 路徑讀，worktree 邊界要對它開唯讀例外。"""
+    from paulsha_cortex.coordinator.contract_command import PINNED_SPEC_BODY_LIMIT
+
+    body = "x" * (PINNED_SPEC_BODY_LIMIT + 100)
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    prompt = build_dispatch_prompt(
+        "builder", task="t", plan_path="p.md", worktree_root="/wt/demo",
+        spec_path="/specs/t.md", spec_hash=digest, spec_body=body,
+    )
+    assert "truncated at" in prompt
+    assert "[SPEC] 列出的 pinned spec 檔案可唯讀讀取" in prompt
+
+    short = "short spec"
+    short_prompt = build_dispatch_prompt(
+        "builder", task="t", plan_path="p.md", worktree_root="/wt/demo",
+        spec_path="/specs/t.md", spec_hash=hashlib.sha256(short.encode("utf-8")).hexdigest(),
+        spec_body=short,
+    )
+    assert "可唯讀讀取" not in short_prompt
+
+
 def test_non_builder_persona_dispatch_keeps_three_line_prompt(repo: Path, tmp_path: Path) -> None:
     """reviewer persona 不交付 spec body，prompt 形狀逐字不變，spec 不可讀也不擋派工。"""
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
