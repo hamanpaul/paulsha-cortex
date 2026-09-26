@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from ..config import paths
+from ..runtime_attestation import (
+    artifact_identity,
+    configuration_revision,
+    record_runtime_startup,
+    trust_root_receipt_summary,
+)
 from .config import load_config
 from .scanner import scan_workspaces
 from .service import ProjectMonitorService
@@ -59,6 +67,26 @@ def main(argv: list[str] | None = None) -> int:
     previous_sigterm = None
     try:
         service = ProjectMonitorService(config=config)
+        try:
+            runtime_configuration = asdict(config)
+            record_runtime_startup(
+                service="monitor",
+                instance=os.environ.get("PSC_INSTANCE", "cortex"),
+                state_root=paths.monitor_state_root(),
+                configuration=runtime_configuration,
+                config_components={
+                    "effective_revision": configuration_revision(runtime_configuration)
+                },
+                artifact=artifact_identity(),
+                trust_root=trust_root_receipt_summary(
+                    os.environ.get("PSC_TRUST_ROOT_INSTALL_RECEIPT")
+                ),
+            )
+        except Exception:  # noqa: BLE001 — 診斷寫入失敗時維持 fail closed，但不停止 Monitor。
+            print(
+                "monitor loaded-runtime receipt unavailable; runtime status remains unknown",
+                file=sys.stderr,
+            )
         previous_sigterm = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, lambda _signum, _frame: service.stop())
         service.run_forever()

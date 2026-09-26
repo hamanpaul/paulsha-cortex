@@ -127,6 +127,12 @@ cortex stat --combo-selections
 cortex doctor --probe-live --repo owner/repo --json
 ```
 
+### 已載入 runtime 身分（#841）
+
+`cortex service status --json` 與 `cortex doctor --json` 共用 `loaded_runtime` 安全投影：`operator_cli` 說明目前執行命令的套件／設定觀測，`service_declaration` 對照磁碟 unit，Manager／Monitor 則取自各自長駐程序在 startup 寫下的 immutable receipt。receipt 只保存 artifact digest、package/source revision、instance-root digest、PID、process start time 與有效 config revision，不保存完整環境或憑證。磁碟 package/config 與載入值不同時標 drift；source override、缺漏／損壞 receipt、未知 schema 或無法核對目前 unit PID 都保持 unknown。
+
+這份 read model 不授權安裝、更新、重啟或回滾。`transition_safe` 固定為 false；in-flight 數量未知時維持 unknown，非零時為 `blocked-in-flight`，即使為零也只表示 `clear-not-authorized`。既有 Trust Root preflight、CAS、authority 與 review gates 照常裁決。欄位、receipt 路徑與受控 live 驗收步驟見[已載入 runtime 身分證據](loaded-runtime-attestation.md)。
+
 ### Combo 自動選擇
 
 `cortex work start` 與 auto claim 建立 workflow 時，Manager 會先讀 durable snapshot 內已確認的 GitHub issue title，交給 `paulsha_cortex/deck/task_types.py` 的 taxonomy 做機械分類，再映射到 combo。現況 `feat` 會選 `feature-oneshot`、`fix` 會選 `fix-standard`；`docs`／`test`／`ci`／`refactor` 目前仍是明示缺口，會帶 `bypass-default` provenance 沿用既有 `feature-oneshot`。
