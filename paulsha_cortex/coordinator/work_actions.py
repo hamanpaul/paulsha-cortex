@@ -6980,6 +6980,20 @@ def _ship_action(
         or len(authority.mapped_openspec) > 1
         or len(authority.mapped_todo_paths) != 1
     ):
+        if not authority.mapped_todo_paths:
+            detail = (
+                "目前 WorkAuthority 沒有 canonical workstream Todo mapping（Todo=0）；"
+                "請先發布 canonical Todo、link path，等 Monitor 更新後再 resume。"
+            )
+            next_step_hint = "發布 canonical Todo → link path → 等 Monitor 更新 → resume。"
+        else:
+            detail = (
+                "work item 的交付 correlation 尚未收斂到 ship lane 支援的唯一組合"
+                f"（需要 pr=1、todo=1、openspec=0 或 1；觀察到 prs={len(authority.mapped_prs)} "
+                f"openspec={len(authority.mapped_openspec)} todo={len(authority.mapped_todo_paths)}）。"
+                "請先用 `cortex work unlink` 修正多餘的 delivery correlation，待 snapshot 更新後再 `resume`。"
+            )
+            next_step_hint = "用 cortex work unlink 移除多餘 mapping，等 Monitor 更新後 resume。"
         active["ship"] = {
             "phase": "needs_human",
             "reason": "multiple-delivery-targets-unsupported",
@@ -6991,11 +7005,9 @@ def _ship_action(
             gate_status="running",
             needs_human_reason=diagnostic_reason(
                 "multiple-delivery-targets-unsupported",
-                "work item 的交付 correlation 尚未收斂到 ship lane 支援的唯一組合"
-                f"（需要 pr=1、todo=1、openspec=0 或 1；觀察到 prs={len(authority.mapped_prs)} "
-                f"openspec={len(authority.mapped_openspec)} todo={len(authority.mapped_todo_paths)}）。"
-                "請先用 `cortex work unlink` 修正多餘的 delivery correlation，待 snapshot 更新後再 `resume`。",
+                detail,
                 source="work_actions._ship_action:delivery-targets",
+                next_step_hint=next_step_hint,
                 run_id=canonical_run.run_id,
                 work_id=canonical_run.work_id,
                 repo=authority.repo,
