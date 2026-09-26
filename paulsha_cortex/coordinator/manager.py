@@ -46,7 +46,12 @@ from . import terminal_contract
 from . import verification
 from . import worktree_reclaim
 from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
-from .registry import RETRY_CARD_PHASE_PERSONA, slice_repin_eligible
+from .registry import (
+    RETRY_CARD_PHASE_PERSONA,
+    describe_stage_execution_mismatch,
+    slice_repin_eligible,
+    stage_execution_receipt,
+)
 from ..config.paths import worktree_root_for
 from .claim import (
     AuthorityValidationError,
@@ -12977,6 +12982,159 @@ def _append_task_memory_inline(prompt: str, prepared) -> str:
     return prompt + "\n".join(rows)
 
 
+#: #844：目前唯一明文可列舉、可由正常 producer 產生的 stage-evidence reuse
+#: 安全 cohort——同 repo/work/run、同 claim-era、exact candidate，且產物可用
+#: 現行 domain validator（`_read_job_workflow_evidence`／`foreign_review.
+#: validate_gate_evaluation`）重新驗證的 verify／review 卡。build 卡的輸出
+#: 就是 candidate 本身（不是既有輸入的重驗），reuse 語意與 verify/review
+#: 不同，且已有既有 job-checkpoint（`_dispatch_workflow_card` 的
+#: `matching`/`reusable`）處理同 run/era/candidate 的去重；不納入本票 cohort，
+#: 列為明確 gap（見 #844 交付報告）。
+STAGE_EXECUTION_REUSE_SUPPORTED_PHASES = frozenset({"verify", "review"})
+
+#: #844：producer 側計算 stage_execution_key 時固定使用的 action 字面值。
+#: probe（`_workflow_stage_reuse_probe`）與正式派工（`_dispatch_workflow_card`）
+#: 必須用同一個字面值，否則同一次 dispatch 決策會算出兩個不同的 key。
+_WORKFLOW_STAGE_EXECUTION_ACTION = "workflow-dispatch"
+
+
+def _workflow_stage_execution_context(
+    *,
+    run,
+    step,
+    identity,
+    profile_binding,
+) -> dict[str, object] | None:
+    """#844：verify／review 卡的受信 stage-execution 逐欄快照（S02）。
+
+    只由正常 producer（`_dispatch_workflow_card` 的正式派工路徑、
+    `_workflow_stage_reuse_probe` 的相容性複核）呼叫，用當下已經解析出的
+    trusted 欄位（run/step/identity/#835 execution profile binding）計算，
+    不接受任何 caller 自行拼裝的 key。build 卡或未解析出 profile binding
+    （persona=="manager" 的 deterministic 卡）不在安全 cohort，回 None——
+    呼叫端據此維持 #844 之前的行為，不強行補一個假 key。
+    """
+
+    if step.phase not in STAGE_EXECUTION_REUSE_SUPPORTED_PHASES or profile_binding is None:
+        return None
+    candidate_sha = run.candidate_head
+    if not isinstance(candidate_sha, str) or verification.SAFE_SHA_RE.fullmatch(candidate_sha) is None:
+        return None
+    # frozen_input_hashes：verify／review 卡的「既有輸入」是 candidate 那顆
+    # commit（已由 candidate_sha 定址，tree 內容 100% 決定）之外，還受
+    # planning authority（spec/plan/tasks 等 rubric）左右——candidate 不變、
+    # plan 改了，reviewer 的驗收標準就變了（WorkflowPlanningInputDrift 抓的
+    # 正是這個維度）。用 `run.planning_authority`（純記憶體資料，無需重新
+    # hash 磁碟檔案）而不是每次重新算 input_snapshot，讓相容性複核
+    # （`_workflow_stage_reuse_probe`）不必先 provision 一份 sandbox 才能比對。
+    frozen_input_hashes = tuple(
+        sorted(f"{item.ref}:{item.baseline_sha256}" for item in run.planning_authority)
+    )
+    return stage_execution_receipt(
+        repo=run.repo,
+        work_id=run.work_id,
+        run_id=run.run_id,
+        claim_key=run.claim_key,
+        card=step.card,
+        phase=step.phase,
+        executor=identity.executor,
+        model=identity.model_id,
+        base_sha=run.source_revision,
+        candidate_sha=candidate_sha,
+        frozen_input_hashes=frozen_input_hashes,
+        action=_WORKFLOW_STAGE_EXECUTION_ACTION,
+        test_policy=step.test_policy or "none",
+        execution_profile_key=profile_binding.resolved_key,
+    )
+
+
+def _workflow_stage_reuse_probe(
+    *,
+    run,
+    step,
+    jobs: Sequence[Mapping[str, object]],
+    identities: IdentityRegistry,
+    launcher_factory: Callable[[object], object],
+    coordinator_root: str | Path,
+    registry,
+) -> tuple[str, dict[str, object] | None]:
+    """#844 S04／S07：既有 terminal job 的相容性複核。
+
+    只在 verify／review 且該 job 帶有 producer 產生的
+    `workflow_stage_execution_key` 時才啟動；任何解析失敗、缺前置條件都回
+    ``("legacy", None)``，讓呼叫端維持 #844 之前的行為（S10：舊資料不補值、
+    不新增拒絕面；probe 本身失敗不得變成新的失敗模式）。
+
+    回傳 ``(kind, context)``：
+
+    - ``("legacy", None)``：不在安全 cohort，或無法完成複核；呼叫端沿用既
+      有 `jobs[-1]` 短路（S10）。
+    - ``("reused", context)``：現在會派出的 executor/model/native
+      effort/adapter/tool 版本與既有 job 完全相容，`jobs[-1]` 可安全沿用，
+      不需要新的 model invocation（S01）。
+    - ``("stale", context)``：偵測到不相容變動（S04），`context` 帶
+      `mismatched_fields` 逐欄診斷；呼叫端必須以 `force_new_card=True`
+      派出新 attempt，不得沿用舊 evidence。
+    """
+
+    if not jobs:
+        return "legacy", None
+    latest = jobs[-1]
+    if latest.get("status") != "exited" or latest.get("exit_code") != 0:
+        return "legacy", None
+    if step.phase not in STAGE_EXECUTION_REUSE_SUPPORTED_PHASES:
+        return "legacy", None
+    stored_key = latest.get("workflow_stage_execution_key")
+    if not isinstance(stored_key, str) or not stored_key:
+        return "legacy", None
+    try:
+        candidate_pool = _workflow_identity_candidates(run, step, identities)
+        backoff_report = _executor_backoff_admission_report(
+            candidate_pool,
+            coordinator_root=coordinator_root,
+            now=time.time(),
+            registry=registry,
+        )
+        eligible = tuple(backoff_report["eligible"])
+        if not eligible:
+            return "legacy", None
+        identity = _select_workflow_identity(run, step, identities, candidates=eligible)
+        launcher = launcher_factory(identity)
+        if launcher is None:
+            return "legacy", None
+        launcher = _specialize_workflow_launcher(launcher, step)
+        profile_binding, _launcher = _bind_workflow_execution_profile(
+            run,
+            step,
+            identity,
+            launcher,
+            qualification_policy=getattr(identities, "qualification_policy", "disabled"),
+        )
+        context = _workflow_stage_execution_context(
+            run=run,
+            step=step,
+            identity=identity,
+            profile_binding=profile_binding,
+        )
+    except Exception:  # noqa: BLE001 - probe 失敗必須 fail-soft 回既有行為，不當作新拒絕面
+        return "legacy", None
+    if context is None:
+        return "legacy", None
+    if context["key"] == stored_key:
+        return "reused", context
+    stored_receipt = latest.get("workflow_stage_execution_receipt")
+    mismatched_fields = (
+        describe_stage_execution_mismatch(context, stored_receipt)
+        if isinstance(stored_receipt, dict)
+        else ("unknown-legacy-receipt",)
+    )
+    return "stale", {
+        **context,
+        "superseded_key": stored_key,
+        "mismatched_fields": list(mismatched_fields),
+    }
+
+
 def _dispatch_workflow_card(
     dispatcher,
     *,
@@ -13470,6 +13628,16 @@ def _dispatch_workflow_card(
         identities,
         execution_profile_binding=profile_binding,
     )
+    # #844 S02：正常 producer 在此計算受信 stage_execution_key／receipt（沿
+    # 用剛解析出的 identity／#835 profile binding，不接受任何 caller 自行
+    # 拼裝的 key）。verify／review 以外的卡（build／planner／manager）回
+    # None，`registry.create_job()` 原樣寫 None，行為與 #844 之前完全相同。
+    stage_execution_context = _workflow_stage_execution_context(
+        run=run,
+        step=step,
+        identity=identity,
+        profile_binding=profile_binding,
+    )
     builder_jobs = [
         job
         for job in registry.list_jobs()
@@ -13782,6 +13950,15 @@ def _dispatch_workflow_card(
             workflow_sandbox_hash=sandbox_hash,
             workflow_output_baseline=output_baseline,
             workflow_builder_job_id=builder_job_id if step.persona == "reviewer" else None,
+            # #844 S02：producer 產生的受信 stage_execution_key／receipt；
+            # 非 verify/review 卡（context 為 None）維持 #844 之前的行為，
+            # 不補一個假 key。
+            workflow_stage_execution_key=(
+                stage_execution_context["key"]
+                if stage_execution_context is not None
+                else None
+            ),
+            workflow_stage_execution_receipt=stage_execution_context,
             # #379：派工當下 pin 住這張卡的驗收判準（test_policy），供 harvest 時
             # 與 registry 現有 WorkflowRun.steps 的現值比對出 drift（見
             # manager._workflow_acceptance_definition_drifted）。
@@ -14686,6 +14863,7 @@ def resume_workflow_run(
         *,
         retry: bool = False,
         retry_recovery_job_id: str | None = None,
+        force_new_card: bool = False,
     ):
         try:
             builder_todo_admission = builder_todo_admission_for(bound_run)
@@ -14708,6 +14886,12 @@ def resume_workflow_run(
                 launcher_factory=launcher_factory,
                 coordinator_root=coordinator_root,
                 retry_failed=retry,
+                # #844 S04：既有 terminal evidence 與現在會派出的
+                # executor/model/profile 不相容時，`_workflow_stage_reuse_probe`
+                # 判定為 "stale"，這裡強制走 force_new_card 派出新 attempt，
+                # 不得沿用舊 evidence（同一份判準比照 retry-card/retry-verify
+                # 既有的 force_new_card 用法）。
+                force_new_card=force_new_card,
                 spawn_admission=spawn_admission,
                 builder_todo_admission=builder_todo_admission,
             )
@@ -14888,7 +15072,43 @@ def resume_workflow_run(
             or job.get("dispatch_head") == post_archive_candidate
         )
     ]
-    job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
+    # #844 S01／S04／S07：既有 `jobs[-1]` 短路只認 run/era/card/phase/candidate，
+    # 不驗 executor/model/native effort/adapter/tool/config 是否仍相容——這是
+    # #844 要接上的缺口。probe 只在 verify/review 且該 job 帶 producer 產生的
+    # `workflow_stage_execution_key` 時才動作，其餘一律回 "legacy"（S10：舊
+    # 資料、非 cohort 卡維持 #844 之前的行為，不補值）。
+    stage_reuse_kind, stage_reuse_context = _workflow_stage_reuse_probe(
+        run=run,
+        step=step,
+        jobs=jobs,
+        identities=identities,
+        launcher_factory=launcher_factory,
+        coordinator_root=coordinator_root,
+        registry=registry,
+    )
+    if stage_reuse_kind == "stale":
+        # 不相容變動：不得沿用 `jobs[-1]` 的舊 evidence，強制新 attempt（不算
+        # operator retry-card，`retry_failed` 語意不變）。
+        job = dispatch_or_stop(run, force_new_card=True)
+    else:
+        job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
+    if stage_reuse_context is not None:
+        # #844 S11：純 provenance 快照，供 status／`cortex status` 辨識這張卡
+        # 是 reuse 還是重新執行；不是 admission authority，不影響上面已經做
+        # 完的裁決。
+        stage_reuse_receipts = dict(getattr(run, "stage_reuse_receipts", None) or {})
+        stage_reuse_receipts[step.card] = {
+            "decision": "reused" if stage_reuse_kind == "reused" else "fresh",
+            "stage_execution_key": stage_reuse_context["key"],
+            **(
+                {"mismatched_fields": list(stage_reuse_context.get("mismatched_fields", ()))}
+                if stage_reuse_kind == "stale"
+                else {}
+            ),
+        }
+        registry._manager_update_workflow_run(
+            run.run_id, stage_reuse_receipts=stage_reuse_receipts
+        )
     if (
         recovery_job_id is not None
         and job is not None

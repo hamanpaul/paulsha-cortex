@@ -177,12 +177,30 @@ def slice_repin_eligible(slice_row: dict[str, Any]) -> bool:
     return "pending" in GATE_STATE_TRANSITIONS.get(gate_state, frozenset())
 
 
-# StageExecutionKey 涵蓋的內容定址欄位（#214）：repo/work_id/card/phase/executor/
-# model/base_sha/candidate_sha/frozen_input_hashes/action/test_policy 任一改變都必須
-# 產生不同 key，讓 authority／candidate／model 任一變更精準 invalidate reuse 判定。
+# StageExecutionKey 涵蓋的內容定址欄位（#214／#844）：repo/work_id/run_id/
+# claim_key/card/phase/executor/model/base_sha/candidate_sha/
+# frozen_input_hashes/action/test_policy/execution_profile_key 任一改變都必須
+# 產生不同 key，讓 authority／candidate／model／execution profile 任一變更
+# 精準 invalidate reuse 判定。
+#
+# #844 在 #214 的欄位集合上新增三項：
+# - run_id／claim_key：把「同 run、同 claim-era」直接烤進雜湊本身，讓跨
+#   run／跨 claim-era 的重用在雜湊層就不可能發生（不是靠呼叫端另外過濾）。
+#   #829 已裁定跨 run/era 的採信不在本票安全 cohort，這裡是把那條邊界做成
+#   結構性事實，不是慣例。
+# - execution_profile_key：#835 版本化 execution profile 的 resolved-plane
+#   profile_key（涵蓋 adapter／effort／loadout／toolset／sandbox／
+#   permissions／toolchain；pricing 等不影響執行語意的欄位刻意不在
+#   profile_key 涵蓋範圍內，見 execution_profile.py 的 conditions／metadata
+#   欄位切分），補上舊 key schema 缺的「完整原生 effort/adapter/config
+#   compatibility 描述」。
+STAGE_EXECUTION_KEY_SCHEMA_VERSION = 2
+
 STAGE_EXECUTION_KEY_STRING_FIELDS = (
     "repo",
     "work_id",
+    "run_id",
+    "claim_key",
     "card",
     "phase",
     "executor",
@@ -191,6 +209,15 @@ STAGE_EXECUTION_KEY_STRING_FIELDS = (
     "candidate_sha",
     "action",
     "test_policy",
+    "execution_profile_key",
+)
+
+#: `stage_execution_receipt()` 逐欄快照與 `describe_stage_execution_mismatch()`
+#: 比對時共用的欄位順序；刻意排除 `frozen_input_hashes`（另外處理排序後比對）
+#: 與 `key`／`schema_version`（衍生欄位，不是比對輸入）。
+_STAGE_EXECUTION_RECEIPT_COMPARISON_FIELDS = tuple(
+    field_name
+    for field_name in STAGE_EXECUTION_KEY_STRING_FIELDS
 )
 
 
@@ -198,6 +225,8 @@ def compute_stage_execution_key(
     *,
     repo: str,
     work_id: str,
+    run_id: str,
+    claim_key: str,
     card: str,
     phase: str,
     executor: str,
@@ -207,18 +236,22 @@ def compute_stage_execution_key(
     frozen_input_hashes: tuple[str, ...] | list[str],
     action: str,
     test_policy: str,
+    execution_profile_key: str,
 ) -> str:
     """把 stage 執行的內容定址欄位收斂成單一雜湊 key（建立在既有 phase 級
     checkpoint／claim key 之上，只是把顆粒度從 phase 降到 stage）。
 
-    涵蓋 repo/work_id/card/phase/executor/model/base_sha/candidate_sha/
-    frozen_input_hashes/action/test_policy；任一欄位變更都會產生不同的
-    64-hex key，讓 authority／candidate／model 任一變更即精準 invalidate
-    既有 reuse 判定，不需要額外的比對邏輯。
+    涵蓋 repo/work_id/run_id/claim_key/card/phase/executor/model/base_sha/
+    candidate_sha/frozen_input_hashes/action/test_policy/
+    execution_profile_key；任一欄位變更都會產生不同的 64-hex key，讓
+    authority／candidate／model／execution profile 任一變更即精準
+    invalidate 既有 reuse 判定，不需要額外的比對邏輯。
     """
     values = {
         "repo": repo,
         "work_id": work_id,
+        "run_id": run_id,
+        "claim_key": claim_key,
         "card": card,
         "phase": phase,
         "executor": executor,
@@ -227,6 +260,7 @@ def compute_stage_execution_key(
         "candidate_sha": candidate_sha,
         "action": action,
         "test_policy": test_policy,
+        "execution_profile_key": execution_profile_key,
     }
     for field_name in STAGE_EXECUTION_KEY_STRING_FIELDS:
         value = values[field_name]
@@ -237,8 +271,97 @@ def compute_stage_execution_key(
     ):
         raise ValueError("stage execution key frozen_input_hashes 必須為非空字串的 list/tuple")
     payload = dict(values)
+    payload["schema_version"] = STAGE_EXECUTION_KEY_SCHEMA_VERSION
     payload["frozen_input_hashes"] = sorted(frozen_input_hashes)
     return verification.canonical_json_hash(payload)
+
+
+def stage_execution_receipt(
+    *,
+    repo: str,
+    work_id: str,
+    run_id: str,
+    claim_key: str,
+    card: str,
+    phase: str,
+    executor: str,
+    model: str,
+    base_sha: str,
+    candidate_sha: str,
+    frozen_input_hashes: tuple[str, ...] | list[str],
+    action: str,
+    test_policy: str,
+    execution_profile_key: str,
+) -> dict[str, Any]:
+    """#844：與 `compute_stage_execution_key()` 完全對齊的逐欄快照＋key。
+
+    key 本身是不透明雜湊，無法回答「到底哪個欄位不相容」；本函式回傳同一組
+    輸入欄位的明文快照（連同算出的 key），供 `describe_stage_execution_mismatch()`
+    逐欄比對，把拒絕原因具體到欄位名稱，而不是只回一個雜湊不同（S03／S04）。
+    正常 producer（`manager._dispatch_workflow_card`）建立 job 時呼叫本函式
+    產生受信 receipt，不接受任意 caller 自行拼裝。
+    """
+    key = compute_stage_execution_key(
+        repo=repo,
+        work_id=work_id,
+        run_id=run_id,
+        claim_key=claim_key,
+        card=card,
+        phase=phase,
+        executor=executor,
+        model=model,
+        base_sha=base_sha,
+        candidate_sha=candidate_sha,
+        frozen_input_hashes=frozen_input_hashes,
+        action=action,
+        test_policy=test_policy,
+        execution_profile_key=execution_profile_key,
+    )
+    return {
+        "schema_version": STAGE_EXECUTION_KEY_SCHEMA_VERSION,
+        "repo": repo,
+        "work_id": work_id,
+        "run_id": run_id,
+        "claim_key": claim_key,
+        "card": card,
+        "phase": phase,
+        "executor": executor,
+        "model": model,
+        "base_sha": base_sha,
+        "candidate_sha": candidate_sha,
+        "frozen_input_hashes": sorted(frozen_input_hashes),
+        "action": action,
+        "test_policy": test_policy,
+        "execution_profile_key": execution_profile_key,
+        "key": key,
+    }
+
+
+def describe_stage_execution_mismatch(
+    current: Mapping[str, Any], stored: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """#844 S03／S04：逐欄比較兩份 `stage_execution_receipt()`，回傳不相容欄位。
+
+    僅描述「哪裡不一樣」，不做任何 reuse 裁決——呼叫端已經用 key 是否相等決定
+    要不要 reuse，這裡只是把拒絕原因翻成逐欄診斷，供 status／診斷訊息使用。
+    任一側缺席也算不相容（legacy receipt 缺欄位時不補值，見 `describe`
+    呼叫端對缺席 receipt 的處理）。
+    """
+    mismatched: list[str] = []
+    for field_name in _STAGE_EXECUTION_RECEIPT_COMPARISON_FIELDS:
+        if current.get(field_name) != stored.get(field_name):
+            mismatched.append(field_name)
+    current_inputs = current.get("frozen_input_hashes")
+    stored_inputs = stored.get("frozen_input_hashes")
+    normalized_current = (
+        sorted(current_inputs) if isinstance(current_inputs, (list, tuple)) else current_inputs
+    )
+    normalized_stored = (
+        sorted(stored_inputs) if isinstance(stored_inputs, (list, tuple)) else stored_inputs
+    )
+    if normalized_current != normalized_stored:
+        mismatched.append("frozen_input_hashes")
+    return tuple(mismatched)
 
 
 def _default_state_path() -> Path:
@@ -2768,6 +2891,34 @@ class JobRegistry:
             raise ValueError(
                 f"coordinator 狀態檔 workflow_stage_execution_key 格式錯誤（fail-closed）: {self._state_path}"
             )
+        # #844：受信 stage-execution 逐欄快照，只由正常 producer 附掛
+        # `workflow_stage_execution_key` 時一併寫入；舊狀態檔／只帶 key 沒帶
+        # receipt 的既有測試 fixture 缺席時維持 None，不補值（S10）。
+        stage_execution_receipt = job.get("workflow_stage_execution_receipt")
+        if stage_execution_receipt is not None:
+            required_receipt_keys = set(STAGE_EXECUTION_KEY_STRING_FIELDS) | {
+                "schema_version", "frozen_input_hashes", "key",
+            }
+            if (
+                not isinstance(stage_execution_receipt, dict)
+                or set(stage_execution_receipt) != required_receipt_keys
+                or stage_execution_receipt.get("schema_version") != STAGE_EXECUTION_KEY_SCHEMA_VERSION
+                or stage_execution_receipt.get("key") != stage_execution_key
+                or not isinstance(stage_execution_receipt.get("frozen_input_hashes"), list)
+                or any(
+                    not isinstance(item, str) or not item
+                    for item in stage_execution_receipt["frozen_input_hashes"]
+                )
+                or any(
+                    not isinstance(stage_execution_receipt.get(field_name), str)
+                    or not stage_execution_receipt[field_name]
+                    for field_name in STAGE_EXECUTION_KEY_STRING_FIELDS
+                )
+            ):
+                raise ValueError(
+                    "coordinator 狀態檔 workflow_stage_execution_receipt 格式錯誤"
+                    f"（fail-closed）: {self._state_path}"
+                )
         for field in ("pid", "exit_code"):
             value = job.get(field)
             if value is not None and not isinstance(value, int):
@@ -3682,6 +3833,7 @@ class JobRegistry:
         workflow_output_baseline: tuple[dict[str, str], ...] = (),
         workflow_builder_job_id: str | None = None,
         workflow_stage_execution_key: str | None = None,
+        workflow_stage_execution_receipt: Mapping[str, Any] | None = None,
         workflow_test_policy: str | None = None,
         review_verdict_channel: str | None = None,
         runtime_principal: str | None = None,
@@ -3764,6 +3916,11 @@ class JobRegistry:
             "workflow_output_baseline": [dict(row) for row in workflow_output_baseline],
             "workflow_builder_job_id": workflow_builder_job_id,
             "workflow_stage_execution_key": workflow_stage_execution_key,
+            "workflow_stage_execution_receipt": (
+                None
+                if workflow_stage_execution_receipt is None
+                else dict(workflow_stage_execution_receipt)
+            ),
             # #379：派工當下 pin 住的驗收判準快照（deck 卡片的 test_policy），
             # harvest 時與 registry 現有 WorkflowRun.steps 的現值比對，drift 一律
             # fail closed（見 manager._workflow_acceptance_definition_drifted）。
@@ -5064,6 +5221,7 @@ class JobRegistry:
         execution_profile_bindings: dict[str, dict[str, Any]] | None = None,
         model_qualification: dict[str, str] | None = None,
         combo_selection: dict[str, Any] | None = None,
+        stage_reuse_receipts: dict[str, dict[str, Any]] | None = None,
         needs_human_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
@@ -5191,6 +5349,11 @@ class JobRegistry:
             ),
             combo_selection=(
                 current.combo_selection if combo_selection is None else combo_selection
+            ),
+            stage_reuse_receipts=(
+                current.stage_reuse_receipts
+                if stage_reuse_receipts is None
+                else stage_reuse_receipts
             ),
             frozen_readiness=(
                 current.frozen_readiness if frozen_readiness is None else frozen_readiness
