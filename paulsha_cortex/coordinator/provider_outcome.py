@@ -33,12 +33,15 @@ hint 不升 authoritative」vs. recovery matrix 期待 rate_limited 在 copilot
 
 **#499／#500／#487（2026-08-15）**：分類器本身移交
 :mod:`paulsha_cortex.coordinator.outcome_taxonomy`——三個 lane 共用同一份
-markers 表與同一套證據分層，本模組只保留 build lane 的六值詞彙
+markers 表與同一套證據分層，本模組只保留 build lane 的 outcome 詞彙
 （:class:`ProviderOutcome`）與 authority 分級。三個實質修正隨之落地：
 
 - 結構化終局證據優先於文字關鍵字（#499：`rate_limit_event` / 429 終局狀態）。
 - nested tool result 與 init metadata 不再是分類證據（#500 / #487）。
 - rate-limit 帶回 provider 給的權威重置時刻（:attr:`ProviderFailureClassification.reset_at`）。
+
+#582 另將精確的 ``error_during_execution``／``aborted_tools`` 終局分類為
+``tool_aborted``：family 為 environment，且允許有界重試。
 """
 
 from __future__ import annotations
@@ -72,6 +75,7 @@ class ProviderOutcome(str, Enum):
     EFFORT_NOT_SUPPORTED = "effort_not_supported"
     EXECUTABLE_NOT_FOUND = "executable_not_found"
     LAUNCH_FAILED = "launch_failed"
+    TOOL_ABORTED = "tool_aborted"
     TRANSIENT = "transient"
     CONTENT = "content"
     UNKNOWN = "unknown"
@@ -85,12 +89,14 @@ class SignalAuthority(str, Enum):
     HINT = "hint"
 
 
-# 只有這兩類「重試大概率會解決」：rate limit 會隨時間窗重置、transient 是
-# 網路/服務暫時性錯誤。auth／content／quota／unknown 盲目重試不會改善結果
-# （auth 需要人工重新登入；content 是模型對這個 prompt 的決定，重跑同一個
-# candidate 不會變；quota 通常是固定週期額度，短時間內重試沒有意義；unknown
-# 沒有訊號可支持任何自動決策）。
-RETRYABLE_OUTCOMES = frozenset({ProviderOutcome.RATE_LIMITED, ProviderOutcome.TRANSIENT})
+# 這些類別有足夠訊號支援 bounded retry：rate limit 會隨時間窗重置、transient
+# 是網路/服務暫時性錯誤，tool_aborted 則是工具鏈被外部生命週期中斷。auth／
+# content／quota／unknown 盲目重試不會改善結果（auth 需要人工重新登入；content
+# 是模型對這個 prompt 的決定，重跑同一個 candidate 不會變；quota 通常是固定週期
+# 額度，短時間內重試沒有意義；unknown 沒有訊號可支持任何自動決策）。
+RETRYABLE_OUTCOMES = frozenset(
+    {ProviderOutcome.RATE_LIMITED, ProviderOutcome.TRANSIENT, ProviderOutcome.TOOL_ABORTED}
+)
 _REROUTABLE_OUTCOMES = frozenset(
     {ProviderOutcome.EFFORT_NOT_SUPPORTED, ProviderOutcome.EXECUTABLE_NOT_FOUND}
 )
@@ -118,7 +124,7 @@ _PROVIDER_OUTCOME_FIELDS = frozenset({"outcome", "authority", "reason", "retryab
 _PROVIDER_OUTCOME_OPTIONAL_FIELDS = frozenset({"reset_at"})
 
 # markers 表已移交 outcome_taxonomy（#499／#500／#487／#485：三個 lane 共用
-# 單一真源）。以下對照表把 taxonomy 的細分訊號翻回本 lane 的六值詞彙。
+# 單一真源）。以下對照表把 taxonomy 的細分訊號翻回本 lane 的詞彙。
 _OUTCOME_BY_TEXT_SIGNAL: dict[outcome_taxonomy.TextSignal, ProviderOutcome] = {
     outcome_taxonomy.TextSignal.RATE_LIMIT: ProviderOutcome.RATE_LIMITED,
     outcome_taxonomy.TextSignal.QUOTA: ProviderOutcome.QUOTA,
@@ -139,6 +145,7 @@ _OUTCOME_BY_STRUCTURED_KIND: dict[outcome_taxonomy.StructuredKind, ProviderOutco
     outcome_taxonomy.StructuredKind.AUTH: ProviderOutcome.AUTH,
     outcome_taxonomy.StructuredKind.EXECUTABLE_NOT_FOUND: ProviderOutcome.EXECUTABLE_NOT_FOUND,
     outcome_taxonomy.StructuredKind.LAUNCH_FAILED: ProviderOutcome.LAUNCH_FAILED,
+    outcome_taxonomy.StructuredKind.TOOL_ABORTED: ProviderOutcome.TOOL_ABORTED,
     outcome_taxonomy.StructuredKind.INTERRUPTED: ProviderOutcome.UNKNOWN,
 }
 
@@ -311,7 +318,8 @@ def classify_provider_failure(
 
     1. **結構化終局證據優先**（:func:`outcome_taxonomy.classify_structured_evidence`）
        ——provider 自己用機器可讀欄位講明白的事（`rate_limit_event.status =
-       rejected`、終局 `api_error_status = 429`、controller 中斷）具
+       rejected`、終局 `api_error_status = 429`、`aborted_tools` 工具鏈中止、
+       controller interruption）具
        ``STRUCTURED`` authority，不該被下一層的關鍵字比對翻案。#499 的 429 與
        #500 的 `aborted_streaming` 都在這一層定案。
     2. **文字關鍵字**（:func:`outcome_taxonomy.classify_text`）——只掃

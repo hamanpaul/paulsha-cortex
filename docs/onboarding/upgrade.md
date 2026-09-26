@@ -46,6 +46,10 @@ pipx install --force ./paulsha_cortex-0.1.0-py3-none-any.whl
 
 3. 重啟 manager service/timer，讓 systemd 重新載入目前安裝位置。
 
+   重啟前先執行 `cortex status`，檢查 `in_flight` 是否有 `state` 為
+   `dispatched`／`running` 且 `executor` 為 `claude` 的 job。若有，先等 job 結束；
+   若必須立即重啟，先接受該 job 作廢，並在 service 恢復後重派。
+
 ```bash
 cortex service restart --instance cortex
 ```

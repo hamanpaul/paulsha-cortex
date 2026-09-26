@@ -43,10 +43,10 @@ lane 各自實作了一次——
    "authenticate"／"login" 字樣，rate limit 必須先判。
 
 四大類 outcome family（:class:`OutcomeFamily`）是跨 lane 的共同語彙；各 lane
-仍保有自己的既有詞彙（build lane 的六值 :class:`ProviderOutcome`、planning lane
-的 content／environment 二值），由本模組提供對照表，**不改各 lane 對每一類
-outcome 的後續處置**（retry／needs_human／終止一律維持現狀）——本模組只修
-「分錯類」本身。
+仍保有自己的詞彙（build lane 的 :class:`ProviderOutcome`、planning lane 的
+content／environment 二值），由本模組提供對照表。既有 outcome 的後續處置維持
+原狀；#582 新增的精確 ``aborted_tools`` 終局由 build lane 映射為可有界重試的
+環境中斷。
 """
 
 from __future__ import annotations
@@ -96,8 +96,9 @@ class OutcomeFamily(str, Enum):
     - ``CONTENT``：模型輸出本身的問題（內容政策拒答、回散文不回 JSON、schema
       不合）。重跑同一個 candidate 不會變，維持既有 fail-closed 意圖。
     - ``ENVIRONMENT``：本機／狀態層問題（殘留 worktree、額度需人工處理的帳單
-      與方案上限、不支援的 effort、缺失的啟動 executable、launch 失敗）。
-      要人動手，但不是模型內容缺陷。
+      與方案上限、不支援的 effort、缺失的啟動 executable、launch 失敗，或外部
+      service 生命週期造成的工具鏈中止）。不是模型內容缺陷；明確的工具鏈中止可
+      進入有界重試。
     - ``AUTH``：憑證失效，需要人工重新登入。
     """
 
@@ -134,6 +135,7 @@ class StructuredKind(str, Enum):
     AUTH = "auth"
     EXECUTABLE_NOT_FOUND = "executable_not_found"
     LAUNCH_FAILED = "launch_failed"
+    TOOL_ABORTED = "tool_aborted"
     INTERRUPTED = "interrupted"
 
 
@@ -393,6 +395,7 @@ FAMILY_BY_STRUCTURED_KIND: dict[StructuredKind, OutcomeFamily] = {
     StructuredKind.AUTH: OutcomeFamily.AUTH,
     StructuredKind.EXECUTABLE_NOT_FOUND: OutcomeFamily.ENVIRONMENT,
     StructuredKind.LAUNCH_FAILED: OutcomeFamily.ENVIRONMENT,
+    StructuredKind.TOOL_ABORTED: OutcomeFamily.ENVIRONMENT,
     # 中斷不是四大類的任何一類——它是「我們自己停的」，故落 UNKNOWN 哨兵，
     # 由呼叫端維持既有的不自動重試處置。
     StructuredKind.INTERRUPTED: OutcomeFamily.UNKNOWN,
@@ -743,11 +746,18 @@ def _terminal_is_interrupted(terminal: dict[str, Any]) -> bool:
     return any(marker in haystack for marker in INTERRUPTION_MARKERS)
 
 
+def _terminal_is_tool_aborted(terminal: dict[str, Any]) -> bool:
+    return (
+        terminal.get("subtype") == "error_during_execution"
+        and terminal.get("terminal_reason") == "aborted_tools"
+    )
+
+
 def classify_structured_evidence(evidence: StreamEvidence) -> StructuredSignal | None:
     """結構化終局證據的分類——沒有可判定的結構化訊號時回 ``None``（呼叫端退回
     文字關鍵字層）。
 
-    判定順序：provider 明講的限流事件 → 終局 HTTP status → 中斷樣態。前兩者
+    判定順序：provider 明講的限流事件 → 終局 HTTP status → 工具鏈中止 → 中斷樣態。前兩者
     是 provider 對「發生了什麼」的權威陳述（#499 的 429 即在此浮現）；中斷樣態
     排最後，因為一個先被限流、後被我們停掉的 job，限流才是根因。
     """
@@ -773,6 +783,12 @@ def classify_structured_evidence(evidence: StreamEvidence) -> StructuredSignal |
         return StructuredSignal(
             kind=kind,
             detail=f"structured terminal result api status {status}",
+        )
+
+    if _terminal_is_tool_aborted(terminal):
+        return StructuredSignal(
+            kind=StructuredKind.TOOL_ABORTED,
+            detail="structured terminal result reports tool-chain abort",
         )
 
     if _terminal_is_interrupted(terminal):
