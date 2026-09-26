@@ -1740,6 +1740,12 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         IngressKind.MANAGER_INTERNAL,
     ),
     TrustRootAsset(
+        "control-activity", _T0, _MO, "paulsha_cortex.control.constants:activity_path",
+        (Principal.MANAGER,), (Principal.OPERATOR,),
+        IngressKind.MANAGER_INTERNAL,
+        note="#1028：Manager 執行長 request／tick 時的活動標記，status 依此判讀 busy／stalled。",
+    ),
+    TrustRootAsset(
         "control-daemon-lock", _T0, _MO, "paulsha_cortex.control.constants:lock_path",
         (Principal.MANAGER,), (Principal.OPERATOR,),
         IngressKind.MANAGER_INTERNAL,

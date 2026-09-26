@@ -14470,6 +14470,9 @@ def resume_workflow_run(
                     card=step.card,
                     validation_path=diagnostics.validation_path,
                     schema_mismatch_observed=observed,
+                    # #922：停止時保留解析脈絡，operator 才找得到出錯的 log。
+                    job_log_path=str(job.get("log_path") or ""),
+                    envelope_parse_error=diagnostics.reason or "",
                 ),
             )
             return {

@@ -2125,6 +2125,7 @@ STICKY_JOB_WRITABLE_DIR_ASSETS: frozenset[str] = frozenset(
 _FILE_ASSET_IDS = frozenset({
     "control-daemon-lock",
     "control-status",
+    "control-activity",
     # #666：`~/.config/gh/` 底下的兩個檔——那一層目錄必須維持 root-owned，`hosts.yml`
     # 與 `config.yml` 才能是**不同 owner** 的兩個檔。
     "manager-gh-credential",
@@ -3574,6 +3575,7 @@ class PathLayout:
             "control-request-queue": f"{ctl}/requests",
             "control-done-queue": f"{ctl}/done",
             "control-status": f"{ctl}/status.json",
+            "control-activity": f"{ctl}/activity.json",
             "control-daemon-lock": f"{ctl}/manager.lock",
             # #623：per-job clone 的來源樹（容器；每個受治理 repo 一格 <此根>/<slug>）。
             "repo-source-tree": self.repo_source_root,
