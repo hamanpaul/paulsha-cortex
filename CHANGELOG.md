@@ -638,6 +638,7 @@
 - **#897(1)／#937(1) 部分修正：**候選 harvest 會在更新來源 branch 前檢查所有 pinned planning 檔案；僅容忍 plan 類 `tasks.md`／`todo.md` 的 checkbox-only 差異，其他 bytes 差異拒收並指出檔案與雜湊前綴，缺檔則指出路徑。#897 其餘子項及 #937 其餘子項留待後續批次。
 - **#821 registry 持久化衛生**：相同 durable bytes 不再重寫；rollback 優先以硬連結保留舊狀態，不支援時退回複製；slice 的三種 history 預設限 500 筆，可由環境變數調整並累計截斷數；啟動時在 grace 與既有 transaction lock 保護下清理本目錄 stale tmp。
 - **#882 verify operator attestation**：新增 exact Candidate 綁定的 `verify-attest` work action，要求 operator 附 full-suite 指令與 passed/failed 摘要（failed 必須為 0），將 immutable evidence 寫入 registry 後推進 review；`review-attest` 維持 review-only。
+- **#481／#497 terminal job 重播**：`complete_tick` 只終局化仍綁定 slice 的 builder／reviewer；同 job manifest 已反映到 slice 時不再重驗，recovery 後的舊 job 保留稽核而不再寫 evidence 或回退 slice。state mutation 未落地時仍允許同 job 修復重試。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加
