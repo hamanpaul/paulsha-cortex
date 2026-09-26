@@ -1,0 +1,1 @@
+#883：retry-card 在 registry reset 前依既有 capability 與 reviewer independence 判準驗證 identity override，驗證失敗不寫入 run；retry-verify 於同一個 work-action request 派出新的 verification job，並保留 #577 精準復原舊 reviewer job 的 `exited` 狀態。

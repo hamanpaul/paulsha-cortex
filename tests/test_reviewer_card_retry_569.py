@@ -337,7 +337,7 @@ def test_retry_card_reopens_the_stuck_verification_card(tmp_path: Path) -> None:
 
 
 def test_retry_card_can_pin_reviewer_without_changing_luna_builder(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Recovery may replace the failed reviewer lane while preserving Luna builder."""
 
@@ -347,6 +347,20 @@ def test_retry_card_can_pin_reviewer_without_changing_luna_builder(
     }
     snapshot, registry, run, _job_id = _stuck_reviewer_run(
         tmp_path, model_chain_override=original_override
+    )
+    monkeypatch.setattr(
+        manager,
+        "load_model_identities",
+        lambda: IdentityRegistry.from_rows(
+            [
+                {
+                    "executor": "claude",
+                    "model_id": "claude-opus-5",
+                    "independence_domain": "anthropic",
+                    "capabilities": ["review"],
+                }
+            ]
+        ),
     )
 
     _retry_card(
@@ -364,6 +378,45 @@ def test_retry_card_can_pin_reviewer_without_changing_luna_builder(
         "builder": {"executor": "codex", "model_id": "gpt-5.6-luna"},
         "reviewer": {"executor": "claude", "model_id": "claude-opus-5"},
     }
+
+
+def test_retry_card_rejects_independent_reviewer_override_before_registry_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_override = {
+        "builder": {"executor": "codex", "model_id": "gpt-5.6-luna"},
+    }
+    snapshot, registry, run, old_job_id = _stuck_reviewer_run(
+        tmp_path, model_chain_override=original_override
+    )
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": BUILDER_DOMAIN,
+                "capabilities": ["build", "review"],
+            }
+        ]
+    )
+    monkeypatch.setattr(manager, "load_model_identities", lambda: identities)
+
+    with pytest.raises(ValueError, match="independence_domain 與 builder 相同"):
+        _retry_card(
+            tmp_path,
+            snapshot,
+            registry,
+            expected_run_id=run.run_id,
+            card="verification",
+            reviewer_executor="codex",
+            reviewer_model="gpt-primary",
+        )
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert persisted.model_chain_override == original_override
+    assert persisted.attempts["verify"] == run.attempts["verify"]
+    assert "needs_human" in persisted.facets
+    assert registry.get_job(old_job_id)["status"] == "exited"
 
 
 def test_retry_card_rejects_a_builder_override_for_reviewer_phase(
@@ -894,6 +947,76 @@ def test_public_work_retry_card_forces_one_new_manager_dispatched_reviewer(
 
     assert calls == [True]
     assert result["result"]["job_id"] == registry.list_jobs()[-1]["job_id"]
+
+
+def test_public_work_retry_verify_dispatches_new_job_and_preserves_old_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot, registry, run, old_job_id = _stuck_reviewer_run(tmp_path)
+    authority = work_actions.load_work_authority(
+        repo=REPO, work_id=WORK_ID, snapshot_path=snapshot
+    )
+    calls: list[bool] = []
+
+    def retry_verify_action(**_kwargs):
+        action = work_actions._retry_verify_action(
+            args={
+                "action": "retry-verify",
+                "issue": 12,
+                "expected_candidate": run.candidate_head,
+            },
+            authority=authority,
+            workflow_registry=registry,
+            reviewer_recovery_checker=lambda job, current: (
+                job["job_id"] == old_job_id and current.run_id == run.run_id
+            ),
+        )
+        return {"work_id": run.work_id, "repo": run.repo, "result": action}
+
+    def forced_dispatch(_dispatcher, **kwargs):
+        calls.append(kwargs.get("force_new_card"))
+        current = registry.get_workflow_run(run.run_id)
+        return registry.create_job(
+            task="replacement-verification",
+            persona="reviewer",
+            kind="review",
+            branch="feature/replacement-verification",
+            pane="",
+            worktree=str(tmp_path / "replacement-verification"),
+            workflow_run_id=current.run_id,
+            workflow_claim_key=current.claim_key,
+            workflow_repo=current.repo,
+            workflow_card="verification",
+            workflow_phase="verify",
+        )
+
+    monkeypatch.setattr(manager, "dispatch_workflow_card", forced_dispatch)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        workflow_identity_registry=_reviewer_identities(),
+        work_action_fn=retry_verify_action,
+    )
+    request = build_request(
+        req_type="work-action",
+        args={
+            "action": "retry-verify",
+            "repo": REPO,
+            "work_id": WORK_ID,
+            "expected_candidate": run.candidate_head,
+        },
+        requested_by="operator",
+    )
+
+    result = executor(request)
+
+    assert calls == [True]
+    assert result["result"]["dispatch"]["kind"] == "job"
+    assert result["result"]["job_id"] == registry.list_jobs()[-1]["job_id"]
+    assert result["result"]["job_id"] != old_job_id
+    assert registry.get_job(old_job_id)["status"] == "exited"
 
 
 def test_public_work_retry_card_restores_needs_human_when_reviewer_dispatch_fails(

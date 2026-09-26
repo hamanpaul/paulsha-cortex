@@ -4685,6 +4685,21 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         workflow_registry,
         trigger=_RETRY_CARD_PHASE_TRIGGERS.get(run.current_phase),
     )
+    if model_chain_override is not None:
+        # dispatch 本來會驗 run-scoped override 的 identity 是否存在、具備 persona
+        # capability 且符合 reviewer independence。先用相同判準檢查暫存的合併值，
+        # 避免驗證失敗時 retry-card 已把 override 寫進 WorkflowRun。
+        from . import manager
+
+        effective_override = {
+            **dict(run.model_chain_override or {}),
+            **{persona: dict(row) for persona, row in model_chain_override.items()},
+        }
+        manager._workflow_identity_candidates(
+            replace(run, model_chain_override=effective_override),
+            target,
+            manager.load_model_identities(),
+        )
     # #752／#755：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由
     # `manager._operator_adjudications()` 讀回、進 retry_context 的
     # `operator_adjudications` 鍵（bounded CLI、Manager-owned，非 candidate 內容）。
