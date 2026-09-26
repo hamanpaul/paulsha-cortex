@@ -1597,6 +1597,7 @@ def test_retire_delivered_without_authority_keeps_fail_closed_admission(
         "provider-null",
         "provider-list",
         "provider-string",
+        "provider-timestamp-unparseable",
     ],
 )
 def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
@@ -1608,6 +1609,13 @@ def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
     ``provider-string`` 模擬 ``providers["github:<repo>"]`` 條目存在但格式
     不正確（非 mapping）——這種畸形不可被誤判成「provider 根本不存在」而
     放行確定缺席，必須與 degraded／rate-limited 一樣 fail-closed。
+
+    #1093 對抗審查第三輪 MAJOR：``provider-timestamp-unparseable`` 模擬
+    ``providers["github:<repo>"]`` 條目 schema 表面完整（``status: ok``、
+    ``revision`` 非空）但 ``last_success_at`` 是無法解析的字串
+    （``"not-a-timestamp"``）——這種畸形先前會被舊的 ``healthy`` 判斷
+    （只檢查非空字串）誤判為健康，讓 canonical provider 誤判成「根本不
+    存在」而放行 ``WorkAuthorityConfirmedAbsent``（registry-only 退休）。
     """
     snapshot = _snapshot(tmp_path / failure / "snapshot.json")
     state = tmp_path / failure / "runs.json"
@@ -1639,6 +1647,18 @@ def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
         payload = {
             "schema": "work-items-snapshot/v1",
             "providers": {"github:acme/demo": malformed_provider},
+            "work_items": [],
+        }
+    elif failure == "provider-timestamp-unparseable":
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {
+                "github:acme/demo": {
+                    "status": "ok",
+                    "revision": "gh-1",
+                    "last_success_at": "not-a-timestamp",
+                }
+            },
             "work_items": [],
         }
     else:
@@ -1680,7 +1700,7 @@ def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
         )
 
     assert work_actions.work_authority_projection_state(
-        repo="acme/demo", work_id="demo"
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
     ) == "unavailable"
     status = manager.workflow_status_entry(
         registry,

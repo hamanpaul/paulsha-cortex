@@ -605,6 +605,38 @@ def _auto_label_from_observations(github: dict, issues: list[int]) -> bool:
     return any(number in labeled for number in issues)
 
 
+def _validate_canonical_provider_timestamp(
+    last_success_at: str,
+    *,
+    repo_label: str | None,
+    work_id_label: str | None,
+    provider_id: str,
+) -> float:
+    """驗證 canonical GitHub provider 的 ``last_success_at`` 可解析成時間。
+
+    這是 canonical provider 健康度判斷唯一的時間解析規則，被
+    ``_authority_from_canonical_row``（逐列解析時）與
+    ``load_work_authority``（#1093：目標 (repo, work_id) 完全沒有列在
+    work_items 時，對 canonical provider 本身的最後一道健康檢查）共用
+    ——不可各寫一套。#1093 對抗審查第三輪 MAJOR：後者原本只檢查
+    ``last_success_at`` 是非空字串就視為健康，像 ``"not-a-timestamp"``
+    這種無法解析的畸形值會被誤判為健康，讓 provider 誤判為「根本不存在」
+    而放行 ``WorkAuthorityConfirmedAbsent``（registry-only 退休）。
+    """
+
+    try:
+        return datetime.fromisoformat(last_success_at.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise AuthorityValidationError(
+            "durable GitHub provider timestamp invalid",
+            reason_code=REASON_PROVIDER_INVALID_CANONICAL,
+            repo=repo_label,
+            work_id=work_id_label,
+            provider_id=provider_id,
+            field="last_success_at",
+        ) from exc
+
+
 def _authority_from_canonical_row(
     *,
     row: dict,
@@ -805,17 +837,12 @@ def _authority_from_canonical_row(
             )
         # else：rate-limited 但被退休語境豁免——沿用 last-known-good 的
         # revision/last_success_at 繼續建構 authority。
-    try:
-        last_success = datetime.fromisoformat(last_success_at.replace("Z", "+00:00")).timestamp()
-    except ValueError as exc:
-        raise AuthorityValidationError(
-            "durable GitHub provider timestamp invalid",
-            reason_code=REASON_PROVIDER_INVALID_CANONICAL,
-            repo=repo_label,
-            work_id=work_id_label,
-            provider_id=provider_id,
-            field="last_success_at",
-        ) from exc
+    last_success = _validate_canonical_provider_timestamp(
+        last_success_at,
+        repo_label=repo_label,
+        work_id_label=work_id_label,
+        provider_id=provider_id,
+    )
     issues: list[int] = []
     prs: list[int] = []
     changes: list[str] = []
@@ -1225,6 +1252,20 @@ def load_work_authority(
                         provider_id=canonical_provider_id,
                         field="status",
                     )
+                # #1093 對抗審查第三輪 MAJOR：上面的 `healthy` 只檢查
+                # `last_success_at` 是非空字串，沒有驗證它真的能解析成時間
+                # ——`"not-a-timestamp"` 這類畸形值會被誤判為健康，讓下面的
+                # `WorkAuthorityConfirmedAbsent` 誤判「確定缺席」、放行
+                # registry-only 退休。沿用 `_authority_from_canonical_row`
+                # 對 canonical GitHub provider 已經在用的同一套 ISO8601
+                # 解析規則（`_validate_canonical_provider_timestamp`），
+                # 而不是另寫一套較寬鬆的健康判斷。
+                _validate_canonical_provider_timestamp(
+                    last_success_at,
+                    repo_label=_diagnostic_label(repo),
+                    work_id_label=_diagnostic_label(work_id),
+                    provider_id=canonical_provider_id,
+                )
             else:
                 # provider 條目存在，但格式不正確（`null`／list／字串等非
                 # mapping）——健康度無法判斷，不可當作「provider 不存在」

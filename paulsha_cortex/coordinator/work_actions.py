@@ -6296,18 +6296,27 @@ def _retire_delivered_pr_terminal_status(
     return statuses
 
 
-def work_authority_projection_state(*, repo: str, work_id: str) -> str:
+def work_authority_projection_state(
+    *, repo: str, work_id: str, snapshot_path: str | Path | None = None
+) -> str:
     """Classify the authority available to status/read-model projections.
 
     ``missing`` is the narrow, expected state that ``retire-delivered`` can
     handle from a registry run. Other read failures are ``unavailable`` and
     must not be presented as an actionable recovery path.
+
+    ``snapshot_path`` 預設 ``None``（沿用 ``canonical_work_snapshot_path()``
+    的正式 durable snapshot），僅供測試以明確路徑驅動——#1093 對抗審查第三
+    輪 BLOCKER：先前完全沒有這個參數，測試建的畸形 snapshot fixture 永遠寫
+    在別的路徑，實際驅動的是（可能不存在，或是這台機器上真正的）canonical
+    snapshot，斷言恆真、驗不到回歸。
     """
 
     try:
         load_work_authority(
             repo=repo,
             work_id=work_id,
+            snapshot_path=snapshot_path,
             allow_rate_limited_last_known_good=True,
         )
     except ValueError as error:
