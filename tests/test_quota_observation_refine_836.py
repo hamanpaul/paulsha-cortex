@@ -1326,6 +1326,62 @@ def test_review5_major2_pre_snapshot_completed_job_replay_is_ignored_not_poisone
 # _observation() 假資料覆蓋 window_instance。
 
 
+def test_review8_blocker_two_profiles_same_poll_equal_value_is_not_conflict():
+    """BLOCKER quota_ledger.py:109 — 同一輪輪詢以 PROFILE_A、PROFILE_B 對同一
+    共享 pool／window、同一 observed_at_ms 各自 record_provider_read()，讀到
+    相同值時 derived key 相同但 digest 含 profile 而被記成 conflict，真實
+    producer 路徑把該 pool 打成 source-conflict unknown。值相同必須視為一致；
+    值不同才是衝突。"""
+    sources, _, shadow_module = _feature_api()
+    percent_unit = "provider:openai-codex-app-server/rate-limit-percent/v2"
+    descriptor = _pool_descriptor(
+        unit_id="codex-percent", semantics_ref=percent_unit, windows=(("short", 300_000),)
+    )
+    service = shadow_module.QuotaShadowService.in_memory()
+    reset_seconds = _NOW // 1000 + 300
+
+    def read(profile, used_percent):
+        binding = _binding((descriptor,), profile)
+        target = sources.ProviderQuotaTarget(
+            resource_key="codex:shared:primary", binding=binding,
+            descriptor=descriptor, window_id="short",
+        )
+        return service.record_provider_read(
+            "codex",
+            {"result": {"rateLimits": {
+                "limitId": "shared",
+                "primary": {
+                    "usedPercent": used_percent,
+                    "windowDurationMins": 5,
+                    "resetsAt": reset_seconds,
+                },
+            }}},
+            profile_key=profile,
+            targets=(target,),
+            descriptors=(descriptor,),
+            unit_catalog=(),
+            observed_at_ms=_NOW,
+        )
+
+    read(_PROFILE_A, 40)
+    read(_PROFILE_B, 40)
+    report = service.project(descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 100)
+    row = _pool_row(report, "pool-shared", "short")
+    assert "source-conflict" not in json.dumps(row)
+    assert row["remaining"]["state"] == "observed"
+    assert row["remaining"]["amount"] == {"kind": "exact", "value": "60"}
+
+    # 同一時點值不同仍必須是衝突。
+    conflicting = shadow_module.QuotaShadowService.in_memory()
+    service = conflicting
+    read(_PROFILE_A, 40)
+    read(_PROFILE_B, 55)
+    report = service.project(descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 100)
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] != "observed"
+    assert "source-conflict" in json.dumps(row)
+
+
 def test_review6_blocker1_provider_snapshot_window_epoch_enables_terminal_usage_deduction():
     """BLOCKER quota_sources.py:431 — record_provider_read() 產生的真實
     provider snapshot 之前一律 window_instance=unknown，即使收到含 reset 的

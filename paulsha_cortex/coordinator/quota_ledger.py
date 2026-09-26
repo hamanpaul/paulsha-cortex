@@ -114,7 +114,9 @@ class QuotaEventLedger:
                 return LedgerAppendResult("conflict", conflicts=1, idempotency_key=key)
             if previous:
                 prior_digest = previous[0].get("payload_sha256")
-                if prior_digest == digest:
+                if prior_digest == digest or _same_snapshot_value(
+                    previous[0].get("observation"), wire
+                ):
                     return LedgerAppendResult("duplicate", duplicates=1, idempotency_key=key)
                 conflict = {
                     "schema_version": 1,
@@ -353,6 +355,32 @@ def _semantic_scope_identity(wire):
 
 
 _SNAPSHOT_LIKE_MEASUREMENT_KINDS = frozenset(("remaining_snapshot", "gauge_snapshot"))
+
+
+def _same_snapshot_value(prior_wire, wire):
+    """同一語意 key 下兩筆 snapshot 類量測（remaining／gauge）是否觀測到同一個
+    量值。同一輪輪詢由不同 profile／來源對同一共享 pool 在同一時點讀到相同值
+    時，payload digest 會因 profile_ref 等欄位不同而不同，但那是一致的觀測，
+    不是衝突（#836 對抗審查第八輪 BLOCKER quota_ledger.py:109）；量值不同才是
+    衝突。usage_delta 等累加型事件不走這條（仍以完整 digest 判定）。"""
+    if not isinstance(prior_wire, dict) or not isinstance(wire, dict):
+        return False
+    prior_measurement = prior_wire.get("measurement")
+    measurement = wire.get("measurement")
+    if not isinstance(prior_measurement, dict) or not isinstance(measurement, dict):
+        return False
+    if (
+        prior_measurement.get("kind") not in _SNAPSHOT_LIKE_MEASUREMENT_KINDS
+        or measurement.get("kind") != prior_measurement.get("kind")
+    ):
+        return False
+    prior_id = _semantic_scope_identity(prior_wire)
+    current_id = _semantic_scope_identity(wire)
+    if prior_id is None or current_id is None or _canonical_bytes(prior_id) != _canonical_bytes(current_id):
+        return False
+    return _canonical_bytes(prior_measurement.get("quantity")) == _canonical_bytes(
+        measurement.get("quantity")
+    )
 
 
 def _cross_identity_conflict_digest(records, wire, digest):

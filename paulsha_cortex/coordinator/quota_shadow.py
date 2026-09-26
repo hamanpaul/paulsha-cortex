@@ -43,7 +43,7 @@ class _MemoryLedger:
                             terminal_job_started_at_ms=None, terminal_job_finished_at_ms=None):
         from .quota_ledger import (
             _canonical_bytes, _idempotency_key as make_key,
-            _observation_digest_payload, _terminal_usage_metadata,
+            _observation_digest_payload, _same_snapshot_value, _terminal_usage_metadata,
         )
 
         wire = observation.to_dict()
@@ -63,7 +63,9 @@ class _MemoryLedger:
         if conflict:
             return LedgerAppendResult("conflict", conflicts=1, idempotency_key=key)
         if prior:
-            if prior["payload_sha256"] == digest:
+            if prior["payload_sha256"] == digest or _same_snapshot_value(
+                prior.get("observation"), wire
+            ):
                 return LedgerAppendResult("duplicate", duplicates=1, idempotency_key=key)
             self.events.append({
                 "schema_version": 1, "kind": "conflict", "idempotency_key": key,

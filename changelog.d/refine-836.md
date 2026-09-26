@@ -124,3 +124,4 @@ unknown 並附上 `usage-unresolvable` gap；完全無法定位目標 pool 時�
 視為所有已知 pool 都可能受影響。非 usage 事件（例如舊 revision 的
 remaining snapshot）維持既有的 `stale-pool-revision` 軟性標記，不強制整個
 pool 轉 unknown。
+- #836 對抗審查修復（第八輪）：同一輪輪詢中不同 profile 對同一共享 pool／window、同一時點讀到相同 snapshot 值時視為一致（duplicate），不再因 digest 含 profile 而記成 conflict；值不同仍為衝突。
