@@ -22,7 +22,16 @@ Adapter 是受信任的 Python 實作，透過 `ExecutionAdapter` 註冊。Descr
 
 Manager 在已選定 identity 並套用 persona launcher policy 後建立 profile，執行硬條件檢查，再透過既有 launcher 啟動。Generic autonomy dispatch 與 planning invocation 同樣綁定並驗證 profile。`SubprocessLauncher` 在建 job／執行 process 前再次核對 executor、model、effort 與 sandbox，阻止持久化的 profile 和實際啟動參數漂移。
 
-未知 persona role、與 resolved identity 不符的 pin、同 independence domain reviewer、既有 Trust Root 不相容，或缺少要求的 exact-profile qualification 都會 fail-closed。已 sizing 的 workflow 若尚無與 resolved key、role、完整 coverage 綁定且未撤銷的 #842 qualification，Manager 會記錄 `needs_human` 並停止在 spawn 前；profile/quota 不會繞過人工 review 或既有 authorization/CAS。
+未知 persona role、與 resolved identity 不符的 pin、同 independence domain reviewer，以及既有 Trust Root 不相容都會 fail-closed。Sized workflow 的 exact-profile qualification 是 opt-in gate：預設未啟用，以維持 #842 qualification receipt lifecycle 尚未部署時的既有派工能力。預設情況下 Manager 仍保留 sizing band，並在 `resolved_model_chain[persona].qualification` 記錄 `not-enforced`。
+
+要啟用，operator 必須在生效 config root 的 `model-identities.yaml` host overlay 加上明確政策：
+
+```yaml
+qualification_policy:
+  sized_dispatch: enforce # 可設 disabled；缺省等同 disabled
+```
+
+config root 由 `PSC_PROJECT_CONFIG_ROOT` 決定。只有 operator overlay 的 `sized_dispatch: enforce` 會啟用此 gate；缺少此區塊、設為 `disabled`、或只在 packaged identity roster 宣告，都不會啟用。啟用後，sized workflow 若缺少與 resolved key、role、完整 coverage 綁定且未撤銷的 #842 qualification，Manager 會在 spawn 前記錄 `needs_human` 並停止。Profile/quota 不會繞過人工 review 或既有 authorization/CAS。
 
 ## 持久化與升級
 

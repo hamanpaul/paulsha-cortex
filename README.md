@@ -834,8 +834,20 @@ key 不一致或 launch 條件與 resolved profile 不符時拒絕派工。
 Adapter descriptor 是資料，不會載入 descriptor 提供的程式碼；adapter 實作由 Cortex
 可信註冊表提供，並沿用現有 launcher 的 argv、terminal、usage、cancel/timeout、工具與
 sandbox 邊界。quota 能力預設為 unknown，usage 不代表剩餘額度。正式 dispatch 會重新
-驗證 role、pin、reviewer independence 與既有 Trust Root；有最低品質要求的 run 必須
-取得 #842 exact-profile qualification，未知／不足時在 spawn 前進入 `needs_human`。
+驗證 role、pin、reviewer independence 與既有 Trust Root。Sized run 的 #842
+exact-profile qualification gate 預設未啟用，讓尚未部署 qualification receipt
+lifecycle 的環境可繼續派工；這類 dispatch 會在 `resolved_model_chain` 留下
+`qualification: not-enforced`。只有 host overlay `model-identities.yaml` 明確宣告
+以下政策時，缺少／撤銷／不匹配的 receipt 才會在 spawn 前轉為 `needs_human`：
+
+```yaml
+qualification_policy:
+  sized_dispatch: enforce # disabled（預設）或 enforce
+```
+
+此 overlay 位於目前生效的 project config root（`PSC_PROJECT_CONFIG_ROOT`）。只有
+operator overlay 的這個明示值會啟用 gate；packaged identity roster 不會啟用。啟用前
+需先部署 #842 qualification lifecycle 並提供 exact-profile receipts。
 
 PatchMUD #37 的報告由 Cortex consumer 驗證 schema、source revision、digest 與 exact
 profile key；Cortex 不 runtime import PatchMUD。此 worktree 使用固定 fixture 驗證

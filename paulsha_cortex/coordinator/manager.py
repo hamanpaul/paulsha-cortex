@@ -10827,7 +10827,13 @@ def _runtime_preflight_gate(
         key = id(identity)
         if key not in specialized:
             launcher = _specialize_workflow_launcher(launcher_factory(identity), step)
-            _, launcher = _bind_workflow_execution_profile(run, step, identity, launcher)
+            _, launcher = _bind_workflow_execution_profile(
+                run,
+                step,
+                identity,
+                launcher,
+                qualification_policy=getattr(identities, "qualification_policy", "disabled"),
+            )
             specialized[key] = launcher
             if compatibility_for is not None:
                 model_resolution.validate_identity_compatibility(
@@ -11087,6 +11093,11 @@ def _record_resolved_model_chain(
         "source": source,
         "envelope_source": envelope_source,
     }
+    if getattr(run, "sizing_band", None) is not None:
+        qualification_policy = getattr(identities, "qualification_policy", "disabled")
+        resolved[step.persona]["qualification"] = (
+            "enforced" if qualification_policy == "enforce" else "not-enforced"
+        )
     update = {"resolved_model_chain": resolved}
     if execution_profile_binding is not None:
         profile_bindings = dict(getattr(run, "execution_profile_bindings", None) or {})
@@ -11099,7 +11110,9 @@ def _record_resolved_model_chain(
     registry._manager_update_workflow_run(run.run_id, **update)
 
 
-def _bind_workflow_execution_profile(run, step, identity, launcher):
+def _bind_workflow_execution_profile(
+    run, step, identity, launcher, *, qualification_policy: str = "disabled"
+):
     """Join selected identity and specialized launch policy before dispatch."""
 
     if step.persona == "manager":
@@ -11148,7 +11161,10 @@ def _bind_workflow_execution_profile(run, step, identity, launcher):
         binding,
         identity=identity,
         builder_domains=builder_domains,
-        qualification_required=getattr(run, "sizing_band", None) is not None,
+        qualification_required=(
+            getattr(run, "sizing_band", None) is not None
+            and qualification_policy == "enforce"
+        ),
         qualification=getattr(identity, "execution_qualification", None),
     )
     return binding, bind_launcher_profile(launcher, binding)
@@ -12833,7 +12849,11 @@ def _dispatch_workflow_card(
     if profile_binding is None:
         try:
             profile_binding, launcher = _bind_workflow_execution_profile(
-                run, step, identity, launcher
+                run,
+                step,
+                identity,
+                launcher,
+                qualification_policy=getattr(identities, "qualification_policy", "disabled"),
             )
         except Exception as exc:
             from .execution_adapters import ExecutionAdapterError

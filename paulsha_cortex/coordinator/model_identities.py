@@ -359,6 +359,16 @@ class IdentityRegistry:
     resolution: "model_resolution.ResolutionContext | None" = field(
         default=None, compare=False, hash=False
     )
+    # Qualification enforcement is opt-in through the host model-identities
+    # overlay. Packaged/default registries preserve the non-blocking behavior.
+    qualification_policy: str = field(default="disabled", compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.qualification_policy, str)
+            or self.qualification_policy not in {"disabled", "enforce"}
+        ):
+            raise ValueError("qualification_policy must be 'disabled' or 'enforce'")
 
     @property
     def resolution_context(self) -> "model_resolution.ResolutionContext":
@@ -500,14 +510,14 @@ def _load_model_identity_file(
         raise ValueError(f"model-identities unreadable: {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"model-identities invalid root: {path}")
-    # #534：新增兩個**選配**頂層區塊——`packaged_overrides`（demote／park packaged
-    # 身分）與 `resolution_policy`（packaged fallback 政策）。既有 overlay 檔案不
-    # 帶這兩個 key 照舊合法，不需為升級改任何一行。
+    # #534：新增選配的 packaged identity resolution 區塊；#835 另增選配
+    # qualification_policy，明示啟用前不改變既有 sized dispatch 行為。
     extras = set(payload) - {
         "schema_version",
         "identities",
         "packaged_overrides",
         "resolution_policy",
+        "qualification_policy",
     }
     if extras:
         raise ValueError(f"model-identities unexpected top-level key: {sorted(extras)[0]}")
@@ -549,6 +559,30 @@ def _load_model_identity_file(
     registry = IdentityRegistry.from_rows(
         rows, schema_version=int(schema_version), origin=origin
     )
+    qualification_payload = payload.get("qualification_policy")
+    if qualification_payload is None:
+        qualification_policy = "disabled"
+    else:
+        sized_dispatch_policy = (
+            qualification_payload.get("sized_dispatch")
+            if isinstance(qualification_payload, Mapping)
+            else None
+        )
+        if (
+            not isinstance(qualification_payload, Mapping)
+            or set(qualification_payload) != {"sized_dispatch"}
+            or not isinstance(sized_dispatch_policy, str)
+            or sized_dispatch_policy not in {"disabled", "enforce"}
+        ):
+            raise ValueError(
+                "model-identities qualification_policy must contain only "
+                "sized_dispatch: disabled|enforce"
+            )
+        qualification_policy = sized_dispatch_policy
+    # Only the operator overlay may turn on a runtime gate. A packaged roster is
+    # a candidate source, never an operator's qualification-policy declaration.
+    if origin != model_resolution.IDENTITY_ORIGIN_OVERLAY:
+        qualification_policy = "disabled"
     overrides = model_resolution.parse_packaged_overrides(payload.get("packaged_overrides"))
     # 沒有 overlay 檔案的部署＝operator 未宣告任何東西，packaged roster 就是全世界
     # ——此時 fallback 預設 allow（僅留 provenance）；有 overlay 檔案時預設 warn
@@ -563,7 +597,11 @@ def _load_model_identity_file(
         config_root=str(path.parent),
         overlay_present=origin == model_resolution.IDENTITY_ORIGIN_OVERLAY,
     )
-    return replace(registry, resolution=context)
+    return replace(
+        registry,
+        resolution=context,
+        qualification_policy=qualification_policy,
+    )
 
 
 def load_model_identities(
@@ -703,6 +741,7 @@ def load_model_identities(
         schema_version=MODEL_IDENTITY_SCHEMA_VERSION,
         identities=tuple(additions) + tuple(retained),
         resolution=context,
+        qualification_policy=custom.qualification_policy,
     )
 
 

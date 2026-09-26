@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from paulsha_cortex.coordinator import autonomy, execution_adapters, launcher, manager, planning_runtime
-from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+from paulsha_cortex.coordinator.model_identities import IdentityRegistry, load_model_identities
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowRun
 from paulsha_cortex.deck.compile import compile_combo
@@ -242,8 +243,202 @@ def test_a3_manager_blocks_sized_dispatch_without_exact_qualification(monkeypatc
         executor=identity.executor, model=identity.model_id
     ).as_commit_required()
     with pytest.raises(ValueError, match="exact-profile qualification is unknown"):
-        manager._bind_workflow_execution_profile(run, step, identity, launcher_instance)
+        manager._bind_workflow_execution_profile(
+            run, step, identity, launcher_instance, qualification_policy="enforce"
+        )
     assert spawn_calls == []
+
+
+@pytest.mark.parametrize("executor", ("claude", "codex", "copilot", "agy"))
+@pytest.mark.parametrize(
+    ("phase", "persona", "card"),
+    (
+        ("build", "builder", "tdd-red"),
+        ("verify", "reviewer", "verification"),
+        ("review", "reviewer", "code-review"),
+    ),
+)
+@pytest.mark.parametrize(
+    ("qualification_policy", "expected_action"),
+    (("disabled", "dispatch"), ("enforce", "needs_human")),
+)
+def test_a3_sized_dispatch_requires_exact_qualification_only_under_explicit_policy(
+    executor: str,
+    phase: str,
+    persona: str,
+    card: str,
+    qualification_policy: str,
+    expected_action: str,
+    monkeypatch,
+) -> None:
+    from paulsha_cortex.coordinator import runtime_preflight
+
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": executor,
+                "model_id": f"fixture-{executor}-model",
+                "independence_domain": f"domain-{executor}",
+                "capabilities": ["build", "review"],
+            }
+        ]
+    )
+    if qualification_policy == "enforce":
+        identities = replace(identities, qualification_policy=qualification_policy)
+    identity = identities.identities[0]
+    builder_step = SimpleNamespace(
+        phase="build",
+        persona="builder",
+        card="tdd-red",
+        gate_result="passed",
+        commit_policy="required",
+        domain="builder-domain",
+        outputs=(),
+    )
+    step = SimpleNamespace(
+        phase=phase,
+        persona=persona,
+        card=card,
+        gate_result="pending",
+        commit_policy="required" if persona == "builder" else None,
+        domain="builder-domain" if persona == "builder" else None,
+        outputs=(),
+    )
+    run = SimpleNamespace(
+        run_id="run:qualification-policy",
+        steps=(builder_step, step) if persona == "reviewer" else (step,),
+        primary_domain=None,
+        model_chain_override=None,
+        sizing_band="L2",
+    )
+
+    class FakeLauncher:
+        def __init__(self):
+            self._commit_required = False
+            self._review_only = False
+
+        def as_commit_required(self):
+            self._commit_required = True
+            return self
+
+        def as_review_only(self, *, terminal_kind):
+            self._review_only = True
+            self._terminal_kind = terminal_kind
+            return self
+
+        def executor_environment(self):
+            return runtime_preflight.host_environment(name=f"{executor}:fixture")
+
+    monkeypatch.setattr(
+        runtime_preflight,
+        "card_runtime_requirements",
+        lambda *_args, **_kwargs: (runtime_preflight.RuntimeCapability("module", "pytest"),),
+    )
+    monkeypatch.setattr(
+        runtime_preflight,
+        "run_runtime_preflight",
+        lambda *, card, identity, environment, **_kwargs: runtime_preflight.RuntimePreflightResult(
+            card=card,
+            identity_token=f"{identity.executor}/{identity.model_id}",
+            environment=environment,
+            findings=(),
+            checked_at=0.0,
+        ),
+    )
+    monkeypatch.setattr(manager.model_resolution, "compatibility_checker_for", lambda _persona: None)
+
+    decision = manager._runtime_preflight_gate(
+        run,
+        step,
+        identities=identities,
+        launcher_factory=lambda _identity: FakeLauncher(),
+    )
+
+    assert decision is not None
+    assert decision.action == expected_action
+    if qualification_policy == "disabled":
+        assert decision.identity is identity
+        assert decision.launcher is not None
+    else:
+        assert decision.identity is None
+        assert decision.launcher is None
+        assert "exact-profile qualification is unknown" in (decision.reason or "")
+
+
+def test_qualification_enforcement_requires_explicit_model_identity_overlay_policy(
+    tmp_path: Path,
+) -> None:
+    overlay = tmp_path / "model-identities.yaml"
+    overlay.write_text(
+        """\
+schema_version: 4
+qualification_policy:
+  sized_dispatch: enforce
+identities:
+  - executor: claude
+    model_id: fixture-claude-model
+    independence_domain: anthropic
+    capabilities: [build]
+""",
+        encoding="utf-8",
+    )
+
+    identities = load_model_identities(tmp_path)
+
+    assert identities.qualification_policy == "enforce"
+
+
+def test_qualification_enforcement_defaults_disabled_without_host_overlay(tmp_path: Path) -> None:
+    identities = load_model_identities(tmp_path)
+
+    assert identities.qualification_policy == "disabled"
+
+
+def test_sized_dispatch_records_unenforced_qualification_diagnostic(tmp_path: Path) -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "fixture-codex-model",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            }
+        ]
+    )
+    identity = identities.identities[0]
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "feature-oneshot.yaml", cards)
+    manifest = compile_combo(
+        combo, cards, "qualification-diagnostic", change="qualification-diagnostic"
+    ).workflow_manifest
+    assert manifest is not None
+    registry = JobRegistry(tmp_path / "qualification-diagnostic.json")
+    run = registry._manager_create_workflow_run(
+        work_id="qualification-diagnostic",
+        repo="owner/repo",
+        claim_key="claim:qualification-diagnostic",
+        source_revision="revision",
+        workspace_root=str(tmp_path),
+        combo=manifest.combo,
+        current_phase="build",
+        steps=manifest.steps,
+        sizing_score=5,
+        sizing_band="yellow",
+    )
+    step = SimpleNamespace(persona="builder")
+    binding = execution_adapters.resolve_profile(identity, "builder")
+    manager._record_resolved_model_chain(
+        registry,
+        run,
+        step,
+        identity,
+        identities,
+        execution_profile_binding=binding,
+    )
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert persisted.resolved_model_chain["builder"]["qualification"] == "not-enforced"
+    assert persisted.execution_profile_bindings["builder"]["resolved_key"] == binding.resolved_key
 
 
 def test_a4_actual_key_tracks_conditions_and_never_infers_observed_values() -> None:

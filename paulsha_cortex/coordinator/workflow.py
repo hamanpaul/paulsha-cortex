@@ -66,19 +66,20 @@ def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
     independence_domain, source, envelope_source?}}。
 
     ``source`` ∈ MODEL_CHAIN_RESOLUTION_SOURCES（#534 的四個解析層，外加
-    #534 之前的 legacy 值以便舊 run 紀錄照舊可載入）；``envelope_source`` 為
-    #534 新增的**選配**欄位，缺席即為 #534 之前的紀錄。"""
+    #534 之前的 legacy 值以便舊 run 紀錄照舊可載入）；``envelope_source`` 與
+    #835 ``qualification`` 是選配欄位，缺席代表舊紀錄或未到 sized dispatch。"""
     if value is None:
         return
     if not isinstance(value, dict):
         raise ValueError(f"workflow run {field_name} 必須為null或dict")
     required_keys = {"executor", "model_id", "independence_domain", "source"}
+    optional_keys = {"envelope_source", "qualification"}
     for persona, row in value.items():
         if persona not in MODEL_CHAIN_PERSONAS:
             raise ValueError(f"workflow run {field_name} persona 非法: {persona!r}")
         if not isinstance(row, dict) or not required_keys <= set(row):
             raise ValueError(f"workflow run {field_name}[{persona!r}] 格式錯誤")
-        if set(row) - (required_keys | {"envelope_source"}):
+        if set(row) - (required_keys | optional_keys):
             raise ValueError(f"workflow run {field_name}[{persona!r}] 格式錯誤")
         if (
             "envelope_source" in row
@@ -87,6 +88,18 @@ def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
             raise ValueError(
                 f"workflow run {field_name}[{persona!r}].envelope_source 非法: "
                 f"{row.get('envelope_source')!r}"
+            )
+        if (
+            "qualification" in row
+            and (
+                not isinstance(row["qualification"], str)
+                or row["qualification"]
+                not in {"not-required", "not-enforced", "enforced"}
+            )
+        ):
+            raise ValueError(
+                f"workflow run {field_name}[{persona!r}].qualification 非法: "
+                f"{row.get('qualification')!r}"
             )
         for key in ("executor", "model_id", "independence_domain"):
             if not isinstance(row.get(key), str) or not row[key]:
