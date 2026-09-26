@@ -140,9 +140,12 @@ def _loaded_runtime_probe(
             home=Path(environment.get("HOME", str(Path.home()))),
         )
         units = service_runtime.get("units", {})
-        service_declaration = service_declaration_projection(
-            units, instance=instance
-        )
+        service_declaration = service_runtime.get("service_declaration")
+        if not isinstance(service_declaration, Mapping):
+            service_declaration = service_declaration_projection(
+                units,
+                instance=instance,
+            )
         manager_artifact = service_declaration["manager"].get("artifact")
         monitor_artifact = service_declaration["monitor"].get("artifact")
 

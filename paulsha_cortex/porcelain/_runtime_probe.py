@@ -2,11 +2,27 @@ from __future__ import annotations
 
 import importlib.metadata
 import os
+import re
 import shlex
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping
+
+
+_SHOW_PROPERTIES = (
+    "Id",
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "MainPID",
+    "ExecStart",
+    "Environment",
+    "EnvironmentFiles",
+    "DropInPaths",
+    "FragmentPath",
+    "WorkingDirectory",
+)
 
 
 def _installed_version() -> str:
@@ -19,9 +35,13 @@ def _installed_version() -> str:
 def _systemctl_unit_rows(unit_names: tuple[str, ...]) -> dict[str, dict[str, Any]]:
     if shutil.which("systemctl") is None:
         return {}
+    arguments = ["systemctl", "--user", "show"]
+    for property_name in _SHOW_PROPERTIES:
+        arguments.extend(("-p", property_name))
+    arguments.extend(unit_names)
     try:
         raw = subprocess.run(
-            ["systemctl", "--user", "show", "--property=Id,LoadState,ActiveState,SubState,MainPID", *unit_names],
+            arguments,
             check=False,
             capture_output=True,
             text=True,
@@ -34,23 +54,39 @@ def _systemctl_unit_rows(unit_names: tuple[str, ...]) -> dict[str, dict[str, Any
     rows: dict[str, dict[str, Any]] = {}
     current: dict[str, Any] = {}
     current_id: str | None = None
+
+    def save_current() -> None:
+        nonlocal current, current_id
+        if current_id is not None:
+            rows[current_id] = dict(current)
+        current = {}
+        current_id = None
+
     for line in raw.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            if current_id is not None:
-                rows[current_id] = dict(current)
-            current = {}
-            current_id = None
+        if not line.strip():
+            save_current()
             continue
-        key, separator, value = stripped.partition("=")
+        key, separator, value = line.partition("=")
         if not separator:
             continue
+        key = key.strip()
         if key == "Id":
+            save_current()
             current_id = value
+        if key in current:
+            current["_malformed_show_output"] = True
         current[key] = value
-    if current_id is not None:
-        rows[current_id] = dict(current)
+    save_current()
     return rows
+
+
+def _systemctl_exec_path(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    matches = re.findall(r"\bpath=([^ ;}]+)", value)
+    if len(matches) != 1 or not matches[0].startswith("/"):
+        return None
+    return matches[0]
 
 
 def _unit_exec_path(unit_path: Path) -> str | None:
@@ -128,9 +164,33 @@ def probe_service_runtime(
     units: dict[str, dict[str, Any]] = {}
     for unit_name in unit_names:
         unit_path = unit_root / unit_name
-        exec_path = _unit_exec_path(unit_path) if unit_name.endswith(".service") else None
+        live = live_rows.get(unit_name)
+        systemd_properties = (
+            {name: live[name] for name in _SHOW_PROPERTIES if name in live}
+            if live is not None
+            else None
+        )
+        if live is not None and live.get("_malformed_show_output") is True:
+            systemd_properties = {**(systemd_properties or {}), "_malformed": True}
+        fragment_path = (
+            systemd_properties.get("FragmentPath")
+            if isinstance(systemd_properties, Mapping)
+            else None
+        )
+        if isinstance(fragment_path, str) and fragment_path.startswith("/"):
+            unit_path = Path(fragment_path)
+        exec_path = None
+        if unit_name.endswith(".service"):
+            if systemd_properties is None:
+                exec_path = _unit_exec_path(unit_path)
+            elif "ExecStart" in systemd_properties:
+                exec_path = _systemctl_exec_path(systemd_properties.get("ExecStart"))
+            else:
+                # Legacy status-only output is sufficient for the stale-path hint,
+                # but remains incomplete for the artifact projection.
+                exec_path = _unit_exec_path(unit_path)
         stale = _exec_path_stale(exec_path)
-        units[unit_name] = {
+        row: dict[str, Any] = {
             "path": str(unit_path),
             "present": unit_path.exists(),
             "status": _unit_status(unit_name, unit_path, live_rows),
@@ -140,10 +200,23 @@ def probe_service_runtime(
             "suggested_commands": _stale_suggested_commands(instance, unit_name) if stale else [],
             "suggestion": _stale_suggestion(instance, unit_name) if stale else None,
         }
+        if systemd_properties is not None:
+            # Kept only until the safe projection below consumes the effective values.
+            row["systemd"] = systemd_properties
+        else:
+            row["_systemd_unavailable"] = True
+        units[unit_name] = row
+    from ..runtime_attestation import service_declaration_projection
+
+    service_declaration = service_declaration_projection(units, instance=instance)
+    for row in units.values():
+        row.pop("systemd", None)
+        row.pop("_systemd_unavailable", None)
     mode = "systemd" if any(unit["present"] for unit in units.values()) else "unmanaged"
     return {
         "instance": instance,
         "mode": mode,
         "version": _installed_version(),
         "units": units,
+        "service_declaration": service_declaration,
     }

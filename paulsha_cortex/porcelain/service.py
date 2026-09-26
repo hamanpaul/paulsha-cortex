@@ -349,6 +349,7 @@ def _loaded_runtime_payload(
     manager_pid: int | None,
     monitor_pid: int | None,
     units: Any = None,
+    service_declaration: Any = None,
 ) -> dict[str, object]:
     environment = _fallback_environment(instance)
     current_artifact = artifact_identity()
@@ -358,11 +359,13 @@ def _loaded_runtime_payload(
         artifact=current_artifact,
     )
     unit_rows = units if isinstance(units, dict) else {}
-    service_declaration = service_declaration_projection(
-        unit_rows, instance=instance
+    declarations = (
+        service_declaration
+        if isinstance(service_declaration, dict)
+        else service_declaration_projection(unit_rows, instance=instance)
     )
-    manager_artifact = service_declaration["manager"].get("artifact")
-    monitor_artifact = service_declaration["monitor"].get("artifact")
+    manager_artifact = declarations["manager"].get("artifact")
+    monitor_artifact = declarations["monitor"].get("artifact")
     try:
         manager_root = resolve_runtime_root(
             "PSC_COORDINATOR_ROOT", environment=environment
@@ -400,13 +403,13 @@ def _loaded_runtime_payload(
         unknown = _unknown_runtime_report("runtime-declaration-unavailable", current_artifact)
         return {
             "operator_cli": operator_cli,
-            "service_declaration": service_declaration,
+            "service_declaration": declarations,
             "manager": unknown,
             "monitor": unknown,
         }
     return {
         "operator_cli": operator_cli,
-        "service_declaration": service_declaration,
+        "service_declaration": declarations,
         "manager": manager_report,
         "monitor": monitor_report,
     }
@@ -426,6 +429,7 @@ def _status_payload(instance: str) -> dict[str, Any]:
             manager_pid=_unit_pid(units, manager_service),
             monitor_pid=_unit_pid(units, monitor_service),
             units=units,
+            service_declaration=probe.get("service_declaration"),
         )
         return payload
     fallback = _fallback_runtime(instance, str(probe.get("version", "0.0.0+unknown")), probe.get("units", {}))
@@ -436,6 +440,7 @@ def _status_payload(instance: str) -> dict[str, Any]:
             manager_pid=fallback.get("pid") if type(fallback.get("pid")) is int else None,
             monitor_pid=_unit_pid(units, f"{instance}-monitor.service"),
             units=units,
+            service_declaration=probe.get("service_declaration"),
         )
         return fallback
     return {
@@ -448,6 +453,7 @@ def _status_payload(instance: str) -> dict[str, Any]:
             manager_pid=-1,
             monitor_pid=-1,
             units=probe.get("units", {}),
+            service_declaration=probe.get("service_declaration"),
         ),
         "suggested_commands": [f"cortex service install --instance {instance}"],
     }

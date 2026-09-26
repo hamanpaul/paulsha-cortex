@@ -409,7 +409,12 @@ def test_inspect_doctor_human_and_json_report_same_probe_summary(
 def test_inspect_service_flags_unit_pointing_to_missing_venv(
     inspect_runtime: dict[str, Path],
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # 本測試以磁碟上的假 unit 檔驗證 stale ExecStart 偵測；停用 systemctl，避免
+    # 本機若剛好也在跑真實的 cortex-monitor.service（例如同機 dogfood daemon），
+    # 讓探測邏輯改採 systemd 有效值而讀到與測試無關的真實 ExecStart。
+    monkeypatch.setattr("shutil.which", lambda _name: None)
     missing_python = inspect_runtime["home"] / "venvs" / "missing" / "bin" / "python"
     (inspect_runtime["unit_root"] / "cortex-monitor.service").write_text(
         "[Unit]\n"

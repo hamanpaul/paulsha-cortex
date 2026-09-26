@@ -1,1 +1,1 @@
-#841 service declaration drop-ins：service declaration 現依主 unit 後的檔名字典序套用同層 drop-in，支援 `ExecStart=` 清除及 `/usr/bin/env` Python module 的 `PYTHONPATH` artifact 定位；unit digest 納入有序檔名與內容摘要。無法解析或安全讀取時 artifact fail-closed，並同步更新 loaded-runtime 文件與回歸測試。
+#841 service declaration drop-ins：改以 `systemctl show` 有效屬性定位 service artifact，涵蓋跨 systemd 搜尋目錄的 drop-in；解析有效 `Environment=`／`EnvironmentFiles=` 的 PythonPath，對不安全讀取、來源衝突或無法證明完整檔案範圍 fail-closed。probe 對外只保留安全投影，status／doctor 共用結果，並同步更新 loaded-runtime 文件與回歸測試。

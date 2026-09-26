@@ -507,6 +507,184 @@ def test_service_dropins_project_pinned_manager_and_monitor_artifacts_against_re
     ).hexdigest()
 
 
+def test_systemctl_effective_dropin_paths_override_user_unit_fragment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home = tmp_path / "home"
+    user_units = home / ".config" / "systemd" / "user"
+    system_dropin = tmp_path / "etc" / "systemd" / "user" / "test-monitor.service.d" / "20-pin.conf"
+    old_site = tmp_path / "old-site"
+    new_site = tmp_path / "new-site"
+    _write_fake_install(old_site, "old")
+    new_root = _write_fake_install(new_site, "new")
+    user_units.mkdir(parents=True)
+    fragment = user_units / "test-monitor.service"
+    fragment.write_text(
+        "[Service]\nExecStart=/usr/bin/python3 -m paulsha_cortex.monitor\n",
+        encoding="utf-8",
+    )
+    system_dropin.parent.mkdir(parents=True)
+    system_dropin.write_text("[Service]\nExecStart=...\n", encoding="utf-8")
+    show_output = (
+        "Id=test-monitor.service\nLoadState=loaded\nActiveState=active\n"
+        "SubState=running\nMainPID=322\n"
+        f"FragmentPath={fragment}\nDropInPaths={system_dropin}\n"
+        "WorkingDirectory=/\nEnvironmentFiles=\nEnvironment=DECLARATION_SECRET=hidden-systemd-value\n"
+        "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env PYTHONPATH="
+        f"{new_site} /usr/bin/python3 -m paulsha_cortex.monitor ; "
+        "ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; "
+        "code=(null) ; status=0/0 }\n\n"
+        "Id=test-manager.service\nLoadState=not-found\nActiveState=inactive\n"
+        "SubState=dead\nMainPID=0\n\n"
+        "Id=test-manager.timer\nLoadState=not-found\nActiveState=inactive\n"
+        "SubState=dead\nMainPID=0\n"
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+
+    def fake_run(argv, **_kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout=show_output)
+
+    monkeypatch.setattr(_runtime_probe.subprocess, "run", fake_run)
+
+    probe = _runtime_probe.probe_service_runtime("test", home=home)
+
+    assert "ExecStart" in calls[0] and "DropInPaths" in calls[0]
+    assert probe["service_declaration"]["monitor"]["artifact"]["sha256"] == (
+        artifact_identity_from_package_root(new_root)["sha256"]
+    )
+    assert probe["service_declaration"]["monitor"]["artifact"]["sha256"] != (
+        artifact_identity_from_package_root(
+            old_site / "paulsha_cortex"
+        )["sha256"]
+    )
+    assert str(new_site) not in json.dumps(probe)
+    assert "hidden-systemd-value" not in json.dumps(probe)
+
+
+def test_systemd_environment_pythonpath_locates_the_declared_artifact(
+    tmp_path: Path,
+) -> None:
+    pin_site = tmp_path / "environment-pin"
+    pin_root = _write_fake_install(pin_site, "environment-pin")
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main="/usr/bin/true",
+        monitor_main="/usr/bin/python3 -m paulsha_cortex.monitor",
+    )
+    units["test-monitor.service"]["systemd"] = {
+        "ExecStart": (
+            "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -m "
+            "paulsha_cortex.monitor ; ignore_errors=no }"
+        ),
+        "Environment": f"PYTHONPATH={pin_site}",
+        "EnvironmentFiles": "",
+        "DropInPaths": "",
+        "FragmentPath": units["test-monitor.service"]["path"],
+        "WorkingDirectory": "/",
+    }
+
+    projected = service_declaration_projection(units, instance="test")
+
+    assert projected["monitor"]["artifact"]["sha256"] == (
+        artifact_identity_from_package_root(pin_root)["sha256"]
+    )
+    assert str(pin_site) not in json.dumps(projected)
+
+
+def test_unparseable_environment_file_makes_declared_artifact_unknown(
+    tmp_path: Path,
+) -> None:
+    pin_site = tmp_path / "environment-pin"
+    _write_fake_install(pin_site, "environment-pin")
+    environment_file = tmp_path / "service.env"
+    environment_file.write_text("PYTHONPATH='unterminated\n", encoding="utf-8")
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main="/usr/bin/true",
+        monitor_main=(
+            f"/usr/bin/env PYTHONPATH={pin_site} /usr/bin/python3 -m "
+            "paulsha_cortex.monitor"
+        ),
+    )
+    units["test-monitor.service"]["systemd"] = {
+        "ExecStart": (
+            "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -m "
+            "paulsha_cortex.monitor ; ignore_errors=no }"
+        ),
+        "Environment": "",
+        "EnvironmentFiles": f"{environment_file} (ignore_errors=no)",
+        "DropInPaths": "",
+        "FragmentPath": units["test-monitor.service"]["path"],
+        "WorkingDirectory": "/",
+    }
+
+    projected = service_declaration_projection(units, instance="test")["monitor"]
+
+    assert projected["artifact"]["kind"] == "unknown"
+    assert projected["artifact"]["sha256"] is None
+
+
+@pytest.mark.parametrize("failure", ["dropin-symlink", "dropin-oversized", "multiple-execstart", "envfile-conflict"])
+def test_unsafe_effective_systemd_declaration_never_falls_back_to_fragment(
+    tmp_path: Path, failure: str
+) -> None:
+    fragment_package = _write_fake_install(tmp_path / "fragment-site", "fragment")
+    unit_path = tmp_path / "test-monitor.service"
+    unit_path.write_text(
+        "[Service]\nExecStart=/usr/bin/env PYTHONPATH="
+        f"{fragment_package.parent} /usr/bin/python3 -m paulsha_cortex.monitor\n",
+        encoding="utf-8",
+    )
+    properties: dict[str, str] = {
+        "ExecStart": (
+            "{ path=/usr/bin/env ; argv[]=/usr/bin/env PYTHONPATH="
+            f"{fragment_package.parent} /usr/bin/python3 -m paulsha_cortex.monitor ; "
+            "ignore_errors=no }"
+        ),
+        "Environment": "",
+        "EnvironmentFiles": "",
+        "DropInPaths": "",
+        "FragmentPath": str(unit_path),
+        "WorkingDirectory": "/",
+    }
+    if failure in {"dropin-symlink", "dropin-oversized"}:
+        dropin = tmp_path / "20-unsafe.conf"
+        if failure == "dropin-symlink":
+            target = tmp_path / "outside.conf"
+            target.write_text("[Service]\n", encoding="utf-8")
+            dropin.symlink_to(target)
+        else:
+            dropin.write_bytes(b"x" * (300 * 1024))
+        properties["DropInPaths"] = str(dropin)
+    elif failure == "multiple-execstart":
+        properties["ExecStart"] += (
+            " { path=/usr/bin/true ; argv[]=/usr/bin/true ; ignore_errors=no }"
+        )
+    else:
+        environment_file = tmp_path / "service.env"
+        environment_file.write_text(
+            f"PYTHONPATH={tmp_path / 'other-site'}\n", encoding="utf-8"
+        )
+        properties["Environment"] = f"PYTHONPATH={fragment_package.parent}"
+        properties["EnvironmentFiles"] = (
+            f"{environment_file} (ignore_errors=no)"
+        )
+
+    projected = service_declaration_projection(
+        {"test-monitor.service": {"path": str(unit_path), "systemd": properties}},
+        instance="test",
+    )["monitor"]
+
+    assert projected["artifact"]["kind"] == "unknown"
+    assert projected["artifact"]["sha256"] is None
+
+
 def test_service_dropin_empty_execstart_clears_main_command_and_is_unknown(
     tmp_path: Path,
 ) -> None:

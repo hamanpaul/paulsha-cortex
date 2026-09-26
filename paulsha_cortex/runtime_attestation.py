@@ -274,6 +274,31 @@ def _unit_files_digest(files: list[tuple[str, bytes]] | None) -> str | None:
     return hashlib.sha256(_canonical_bytes(entries)).hexdigest()
 
 
+def _systemd_unit_files(
+    fragment_path: object, drop_in_paths: object
+) -> list[tuple[str, bytes]] | None:
+    """安全讀取 systemd 回報的完整 fragment/drop-in 集合。"""
+
+    if not isinstance(fragment_path, str) or not fragment_path:
+        return None
+    if not Path(fragment_path).is_absolute() or not isinstance(drop_in_paths, str):
+        return None
+    try:
+        dropins = shlex.split(drop_in_paths)
+    except ValueError:
+        return None
+    if any(not Path(path).is_absolute() or "\\" in path for path in dropins):
+        return None
+    paths = [fragment_path, *dropins]
+    files: list[tuple[str, bytes]] = []
+    for path in paths:
+        content = _read_small_unit_file(path)
+        if content is None:
+            return None
+        files.append((path, content))
+    return files
+
+
 def _unit_exec_start(files: list[tuple[str, bytes]] | None) -> list[str] | None:
     if files is None:
         return None
@@ -317,6 +342,179 @@ def _unit_exec_start(files: list[tuple[str, bytes]] | None) -> list[str] | None:
     return commands[0] if len(commands) == 1 else None
 
 
+def _systemd_exec_start(value: object) -> list[str] | None:
+    """解析 systemctl show 的 ExecStart 結構化輸出，不重讀 unit 語法。"""
+
+    if not isinstance(value, str) or not value:
+        return None
+    matches = list(re.finditer(r"\bargv\[\]=", value))
+    if len(matches) != 1:
+        return None
+    start = matches[0].end()
+    end_match = re.search(r"\s*;\s*ignore_errors=|\s*}", value[start:])
+    if end_match is None:
+        return None
+    raw_argv = value[start : start + end_match.start()]
+    try:
+        argv = shlex.split(raw_argv)
+    except ValueError:
+        return None
+    return argv or None
+
+
+def _systemd_environment(value: object) -> dict[str, str] | None:
+    if not isinstance(value, str):
+        return None
+    if not value.strip():
+        return {}
+    try:
+        entries = shlex.split(value)
+    except ValueError:
+        return None
+    environment: dict[str, str] = {}
+    for entry in entries:
+        match = _ENV_ASSIGNMENT_RE.fullmatch(entry)
+        if match is None:
+            return None
+        environment[match.group(1)] = match.group(2)
+    return environment
+
+
+def _environment_file_paths(value: object) -> list[tuple[str, bool]] | None:
+    if not isinstance(value, str):
+        return None
+    if not value.strip():
+        return []
+    pattern = re.compile(r"([^\s()]+) \(ignore_errors=(yes|no)\)")
+    paths: list[tuple[str, bool]] = []
+    offset = 0
+    for match in pattern.finditer(value):
+        if value[offset : match.start()].strip():
+            return None
+        path = match.group(1)
+        if not Path(path).is_absolute() or "\\" in path:
+            return None
+        paths.append((path, match.group(2) == "yes"))
+        offset = match.end()
+    if value[offset:].strip():
+        return None
+    return paths
+
+
+def _parse_environment_file(content: bytes) -> dict[str, str] | None:
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeError:
+        return None
+    environment: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.lstrip()
+        if not line or line.startswith("#"):
+            continue
+        if "\\" in line or "\x00" in line:
+            return None
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+        if match is None:
+            return None
+        value = match.group(2)
+        if value.startswith(("'", '"')):
+            quote = value[0]
+            quoted = re.fullmatch(re.escape(quote) + r"([^'\"]*)" + re.escape(quote) + r"\s*", value)
+            if quoted is None:
+                return None
+            value = quoted.group(1)
+        elif any(character.isspace() or character in "'\"" for character in value):
+            return None
+        environment[match.group(1)] = value
+    return environment
+
+
+def _systemd_environment_sources(
+    properties: Mapping[str, object],
+) -> tuple[dict[str, str], dict[str, str]] | None:
+    environment = _systemd_environment(properties.get("Environment"))
+    paths = _environment_file_paths(properties.get("EnvironmentFiles"))
+    if environment is None or paths is None:
+        return None
+    from_files: dict[str, str] = {}
+    for path, ignore_errors in paths:
+        content = _read_small_unit_file(path)
+        if content is None:
+            if ignore_errors and not os.path.lexists(path):
+                continue
+            return None
+        parsed = _parse_environment_file(content)
+        if parsed is None:
+            return None
+        from_files.update(parsed)
+    if (
+        "PYTHONPATH" in environment
+        and "PYTHONPATH" in from_files
+        and environment["PYTHONPATH"] != from_files["PYTHONPATH"]
+    ):
+        return None
+    return environment, from_files
+
+
+def _working_directory_artifact(path: object) -> dict[str, object] | None:
+    """若工作目錄會遮蔽安裝套件，回傳該來源；無法證明時回傳 unknown。"""
+
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        return _safe_artifact({})
+    candidate = Path(path) / "paulsha_cortex"
+    try:
+        info = os.lstat(candidate)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _safe_artifact({})
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return _safe_artifact({})
+    return artifact_identity_from_package_root(candidate)
+
+
+def _env_command_assignments(argv: list[str]) -> tuple[dict[str, str], int]:
+    if not argv or argv[0] != "/usr/bin/env":
+        return {}, 0
+    index = 1
+    assignments: dict[str, str] = {}
+    while index < len(argv):
+        assignment = _ENV_ASSIGNMENT_RE.fullmatch(argv[index])
+        if assignment is None:
+            break
+        assignments[assignment.group(1)] = assignment.group(2)
+        index += 1
+    return assignments, index
+
+
+def _effective_pythonpath(
+    *,
+    env_assignments: Mapping[str, str],
+    environment: Mapping[str, str],
+    from_files: Mapping[str, str],
+) -> tuple[bool, str | None]:
+    env_value = environment.get("PYTHONPATH")
+    file_value = from_files.get("PYTHONPATH")
+    command_value = env_assignments.get("PYTHONPATH")
+    if file_value is not None and any(
+        value is not None and value != file_value
+        for value in (env_value, command_value)
+    ):
+        return False, None
+    if command_value is not None:
+        return True, command_value
+    if file_value is not None:
+        return True, file_value
+    return True, env_value
+
+
+def _pythonpath_artifact(pythonpath: str) -> dict[str, object]:
+    package_parent = pythonpath.split(os.pathsep, 1)[0]
+    if not package_parent or not Path(package_parent).is_absolute():
+        return _safe_artifact({})
+    return artifact_identity_from_package_root(Path(package_parent) / "paulsha_cortex")
+
+
 def _is_python_executable(value: str) -> bool:
     return re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", Path(value).name) is not None
 
@@ -324,31 +522,43 @@ def _is_python_executable(value: str) -> bool:
 def _env_python_module_artifact(
     argv: list[str], *, module: str
 ) -> dict[str, object] | None:
-    if not argv or argv[0] != "/usr/bin/env":
+    return _python_module_artifact(argv, module=module, environment={}, from_files={})
+
+
+def _python_module_artifact(
+    argv: list[str],
+    *,
+    module: str,
+    environment: Mapping[str, str],
+    from_files: Mapping[str, str],
+    working_directory: str | None = None,
+) -> dict[str, object] | None:
+    if not argv:
         return None
-    index = 1
-    environment: dict[str, str] = {}
-    while index < len(argv):
-        assignment = _ENV_ASSIGNMENT_RE.fullmatch(argv[index])
-        if assignment is None:
-            break
-        environment[assignment.group(1)] = assignment.group(2)
-        index += 1
+    env_assignments, command_index = _env_command_assignments(argv)
     if (
-        index + 2 >= len(argv)
-        or not _is_python_executable(argv[index])
-        or argv[index + 1 : index + 3] != ["-m", module]
+        command_index + 2 >= len(argv)
+        or not _is_python_executable(argv[command_index])
+        or argv[command_index + 1 : command_index + 3] != ["-m", module]
     ):
         return None
-    pythonpath = environment.get("PYTHONPATH")
-    if pythonpath is None:
-        return artifact_identity_from_python(argv[index])
-    package_parent = pythonpath.split(os.pathsep, 1)[0]
-    if not package_parent or not Path(package_parent).is_absolute():
-        return _safe_artifact({})
-    return artifact_identity_from_package_root(
-        Path(package_parent) / "paulsha_cortex"
+    path_known, pythonpath = _effective_pythonpath(
+        env_assignments=env_assignments,
+        environment=environment,
+        from_files=from_files,
     )
+    if not path_known:
+        return _safe_artifact({})
+    if pythonpath is None:
+        workdir_artifact = (
+            _working_directory_artifact(working_directory)
+            if working_directory is not None
+            else None
+        )
+        if workdir_artifact is not None:
+            return workdir_artifact
+        return artifact_identity_from_python(argv[command_index])
+    return _pythonpath_artifact(pythonpath)
 
 
 def _declared_service_artifact(
@@ -356,6 +566,9 @@ def _declared_service_artifact(
     *,
     exec_path: str | None,
     argv: list[str] | None,
+    environment: Mapping[str, str] | None = None,
+    from_files: Mapping[str, str] | None = None,
+    working_directory: str | None = None,
 ) -> dict[str, object]:
     if not argv:
         return _safe_artifact({})
@@ -364,22 +577,42 @@ def _declared_service_artifact(
         "monitor": "paulsha_cortex.monitor",
     }.get(service)
     if module is not None:
-        env_artifact = _env_python_module_artifact(argv, module=module)
-        if env_artifact is not None:
-            return env_artifact
+        module_artifact = _python_module_artifact(
+            argv,
+            module=module,
+            environment=environment or {},
+            from_files=from_files or {},
+            working_directory=working_directory,
+        )
+        if module_artifact is not None:
+            return module_artifact
     if service == "monitor":
         if len(argv) < 3 or argv[0] != exec_path or argv[1:3] != ["-m", "paulsha_cortex.monitor"]:
             return _safe_artifact({})
         return artifact_identity_from_python(exec_path)
     if service == "manager":
-        if len(argv) < 3 or argv[0] != "/usr/bin/env" or argv[1] != "bash":
+        env_assignments, command_index = _env_command_assignments(argv)
+        if len(argv) <= command_index + 1 or argv[command_index] != "bash":
             return _safe_artifact({})
-        script = Path(argv[2])
+        script = Path(argv[command_index + 1])
         if script.name != "service-manager.sh" or script.parent.name != "scripts":
             return _safe_artifact({})
         package_root = script.parent.parent
         if package_root.name != "paulsha_cortex":
             return _safe_artifact({})
+        path_known, pythonpath = _effective_pythonpath(
+            env_assignments=env_assignments,
+            environment=environment or {},
+            from_files=from_files or {},
+        )
+        if not path_known:
+            return _safe_artifact({})
+        if pythonpath is not None:
+            return _pythonpath_artifact(pythonpath)
+        if working_directory is not None:
+            workdir_artifact = _working_directory_artifact(working_directory)
+            if workdir_artifact is not None:
+                return workdir_artifact
         return artifact_identity_from_package_root(package_root)
     return _safe_artifact({})
 
@@ -407,10 +640,50 @@ def service_declaration_projection(
             continue
         exec_path = row.get("exec_path")
         path_value = exec_path if isinstance(exec_path, str) else None
-        unit_path = row.get("path")
-        unit_files = _read_unit_files(unit_path if isinstance(unit_path, str) else None)
+        properties = row.get("systemd")
+        environment: dict[str, str] | None = None
+        from_files: dict[str, str] | None = None
+        declaration_known = True
+        if isinstance(properties, Mapping):
+            required_properties = {
+                "ExecStart",
+                "Environment",
+                "EnvironmentFiles",
+                "DropInPaths",
+                "FragmentPath",
+                "WorkingDirectory",
+            }
+            if not required_properties.issubset(properties):
+                declaration_known = False
+                unit_files = None
+                effective_argv = None
+            else:
+                unit_files = _systemd_unit_files(
+                    properties.get("FragmentPath"),
+                    properties.get("DropInPaths"),
+                )
+                effective_argv = _systemd_exec_start(properties.get("ExecStart"))
+                environment_sources = _systemd_environment_sources(properties)
+                if environment_sources is None:
+                    declaration_known = False
+                else:
+                    environment, from_files = environment_sources
+                declaration_known = declaration_known and unit_files is not None
+                declaration_known = declaration_known and effective_argv is not None
+        elif row.get("_systemd_unavailable") is True:
+            # Without systemd's effective property set, the probe cannot prove that its
+            # file-only view covers every configured unit/drop-in search directory.
+            declaration_known = False
+            unit_files = None
+            effective_argv = None
+        else:
+            unit_path = row.get("path")
+            unit_files = _read_unit_files(
+                unit_path if isinstance(unit_path, str) else None
+            )
+            effective_argv = _unit_exec_start(unit_files)
+            declaration_known = unit_files is not None and effective_argv is not None
         unit_digest = _unit_files_digest(unit_files)
-        effective_argv = _unit_exec_start(unit_files)
         effective_exec_path = effective_argv[0] if effective_argv else None
         result[service] = {
             "unit": unit_name,
@@ -422,10 +695,21 @@ def service_declaration_projection(
                 else None
             ),
             "disk_unit_sha256": unit_digest,
-            "artifact": _declared_service_artifact(
-                service,
-                exec_path=path_value,
-                argv=effective_argv,
+            "artifact": (
+                _declared_service_artifact(
+                    service,
+                    exec_path=path_value,
+                    argv=effective_argv,
+                    environment=environment,
+                    from_files=from_files,
+                    working_directory=(
+                        properties.get("WorkingDirectory")
+                        if isinstance(properties, Mapping)
+                        else None
+                    ),
+                )
+                if declaration_known
+                else _safe_artifact({})
             ),
             "stale": row.get("stale") if type(row.get("stale")) is bool else None,
         }
