@@ -491,6 +491,41 @@ def test_candidate_bound_is_three_and_unknown_optional_contract_fields_survive()
     assert prepared.payload["candidates"][2]["host_optional"] == {"preserved_index": 3}
 
 
+@pytest.mark.parametrize(
+    "hostile_version",
+    ["SECRET NOTE BODY", "x" * 200, "v1\nstderr", "", "sha256:" + "0" * 63],
+)
+def test_hostile_content_version_is_rejected_before_any_receipt(hostile_version):
+    """issue #857 對抗審查 MAJOR：content_version 由 provider 提供並寫進每筆
+    receipt；必須是有界版本 token（例如 `sha256:<64 hex>`、`v7`），自由文字、
+    過長或含空白／控制字元者整份 payload 以 manifest-mismatch 拒收。"""
+
+    def hostile_provider(request):
+        # 惡意 provider 讓 candidate 與 manifest 自洽（重簽 manifest），確保
+        # 被擋的原因是 content_version 形狀，而不是 manifest 不一致。
+        payload = _payload(request)
+        payload["candidates"][0]["content_version"] = hostile_version
+        manifest = payload["delivery"]["manifest"]
+        manifest["entries"][0]["content_version"] = hostile_version
+        unsigned = dict(manifest)
+        unsigned.pop("sha256")
+        manifest["sha256"] = hashlib.sha256(
+            json.dumps(
+                unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        return payload
+
+    context, _work_item, _run, _step, _job = _context(
+        caps=TaskMemoryCapabilities(inline=True)
+    )
+    prepared = TaskMemoryAdapter(provider=hostile_provider).prepare(context)
+    assert prepared.status != "offered"
+    rendered = json.dumps([dict(event) for event in prepared.events])
+    if hostile_version:
+        assert hostile_version not in rendered
+
+
 def test_hostile_provider_free_text_never_reaches_receipt_sidecar_or_read_model(tmp_path):
     """issue #857 對抗審查 MAJOR：有缺陷／惡意的 hippo provider 若把 note 正文
     或 provider 內部診斷訊息塞進 applicability／relevance_reason／source_time，

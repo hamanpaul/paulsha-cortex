@@ -34,6 +34,12 @@ MAX_SIDECAR_BYTES = 8 * 1024 * 1024
 MAX_APPLIED_ARTIFACT_BYTES = 64 * 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _NOTE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+# content_version 由 provider 提供並寫進每筆 receipt：只接受有界版本 token。
+# `sha256:` 前綴者必須是完整 64 hex，其餘為 ≤64 字元、無空白／控制字元的
+# 版本字樣（例如 `v7`）；自由文字一律視為 manifest-mismatch，不得入帳。
+_CONTENT_VERSION_RE = re.compile(
+    r"^(?:sha256:[0-9a-f]{64}|(?!sha256:)[A-Za-z0-9][A-Za-z0-9._:+-]{0,63})$"
+)
 _SCHEMA_MAJOR_RE = re.compile(r"(?:^|/)v?(\d+)(?:\.\d+)?$")
 _SECRET_RE = re.compile(
     r"(?i)(api[_-]?key|token|password|secret)(\s*[=:]\s*)[^\s,;]+"
@@ -865,7 +871,7 @@ def _validate_payload(
             not isinstance(content_hash, str)
             or _SHA256_RE.fullmatch(content_hash) is None
             or not isinstance(content_version, str)
-            or not content_version
+            or _CONTENT_VERSION_RE.fullmatch(content_version) is None
         ):
             raise TaskMemoryError("manifest-mismatch")
         project = raw.get("project", context.project)
@@ -1581,7 +1587,8 @@ def _validate_event(value: object) -> dict[str, Any]:
     ):
         raise ValueError("task memory receipt candidate binding missing")
     if row.get("content_version") is not None and (
-        not isinstance(row["content_version"], str) or not row["content_version"]
+        not isinstance(row["content_version"], str)
+        or _CONTENT_VERSION_RE.fullmatch(row["content_version"]) is None
     ):
         raise ValueError("task memory receipt content_version invalid")
     if row["event"] in {"read-failed", "ineligible"} and row.get("reason") is None:
