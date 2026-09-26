@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#477 builder dispatch worktree 邊界**：在 prompt 組裝前解析 canonical worktree 根目錄並附上隔離指示，明確禁止存取主 checkout；含空白及 shell 特殊字元的路徑以純文字資料傳遞。
 - Wave R 整合交付：operator 合併 8 個卡在 cortex pipeline 的實作 PR，並補 review 修正（非正規化 governed path、journal lock `O_CLOEXEC`、裁決 evidence 先於 run 重置、#862 測試對齊 #966 CAS）。
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、
   逐條宣稱更正，以及切換當下才撞得到的那一個阻斷**。四分部署的
