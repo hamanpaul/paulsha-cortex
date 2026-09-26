@@ -12302,6 +12302,22 @@ def _red_decomposition_publication(
         "links": [{"kind": "path", "ref": todo_ref}],
         "excludes": [],
     }
+    def _overlapping_identity(existing: str) -> bool:
+        # #812：不同 work item 之間不得有 `<id>-…` 的前綴／後綴占用（任一方向）。
+        return existing != child_work_id and (
+            existing.startswith(f"{child_work_id}-") or child_work_id.startswith(f"{existing}-")
+        )
+
+    workstreams_root = root / "docs" / "superpowers" / "workstreams"
+    existing_workstreams = (
+        [entry.name for entry in workstreams_root.iterdir() if entry.is_dir()]
+        if workstreams_root.is_dir()
+        else []
+    )
+    if any(_overlapping_identity(existing) for existing in (*work_items, *existing_workstreams)):
+        raise ValueError(
+            "decomposition child work item overlaps an existing work item identity (#812)"
+        )
     for existing_id, row in work_items.items():
         if not isinstance(row, dict):
             raise ValueError("red child work-items manifest is invalid")

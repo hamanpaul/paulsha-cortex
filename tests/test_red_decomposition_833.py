@@ -641,3 +641,46 @@ def test_periodic_resume_supplies_standard_red_child_intake(
         "registry": registry,
         "runtime_factory": manager_daemon.planning_runtime.build_production_planning_runtime,
     }]
+
+
+@pytest.mark.parametrize("existing_id", ["accepted-child-833-v2", "accepted-child"])
+def test_red_child_publication_rejects_prefix_or_suffix_overlap(
+    tmp_path: Path, monkeypatch, existing_id: str
+) -> None:
+    """#812：child 不得與既有 work item 形成 `<id>-…` 前綴／後綴占用（任一方向）。"""
+    registry, run = _make_run(tmp_path, with_decomposition_step=True)
+    job = _create_terminal_planner_job(registry, run)
+    _reviewed_plan(job)
+    monkeypatch.setattr(manager, "_malformed_workflow_card_terminal", lambda _job: False)
+    monkeypatch.setattr(manager, "_retryable_nonpassing_workflow_terminal", lambda _job: False)
+    monkeypatch.setattr(manager, "_explicit_stop_gate_terminal", lambda _job: None)
+    monkeypatch.setattr(manager, "terminalize_workflow_job", lambda *_a, **_kw: job)
+    monkeypatch.setattr(manager, "_evaluate_yellow_plan_review", _ready_review)
+
+    repo_root = Path(run.workspace_root)
+    manifest = repo_root / ".cortex" / "work-items.yaml"
+    manifest.parent.mkdir(parents=True)
+    original_manifest = (
+        "version: 1\n"
+        "work_items:\n"
+        f"  {existing_id}:\n"
+        f"    title: '{existing_id}'\n"
+        "    links: []\n"
+        "    excludes: []\n"
+    )
+    manifest.write_text(original_manifest, encoding="utf-8")
+    intake_calls: list[str] = []
+
+    result = manager.resume_workflow_run(
+        _dispatcher(registry),
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=_no_launch,
+        coordinator_root=tmp_path / "coordinator",
+        decomposition_intake=lambda work_id: intake_calls.append(work_id),
+    )
+
+    assert manifest.read_text(encoding="utf-8") == original_manifest
+    assert not (repo_root / "docs/superpowers/workstreams/accepted-child-833/todo.md").exists()
+    assert intake_calls == []
+    assert result.get("reason") != "decomposition-child-awaiting-monitor"
