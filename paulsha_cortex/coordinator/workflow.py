@@ -934,7 +934,7 @@ class WorkflowRun:
             object.__setattr__(self, "needs_human_reason", reason.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "run_id": self.run_id,
             "work_id": self.work_id,
             "repo": self.repo,
@@ -972,16 +972,6 @@ class WorkflowRun:
             "sizing_band": self.sizing_band,
             "decomposition_depth": self.decomposition_depth,
             "plan_review_passed": self.plan_review_passed,
-            "plan_review_receipt": (
-                self.plan_review_receipt.to_dict()
-                if self.plan_review_receipt is not None
-                else None
-            ),
-            "planning_drift_stop": (
-                self.planning_drift_stop.to_dict()
-                if self.planning_drift_stop is not None
-                else None
-            ),
             "frozen_readiness": (
                 dict(self.frozen_readiness) if self.frozen_readiness is not None else None
             ),
@@ -1002,6 +992,12 @@ class WorkflowRun:
                 dict(self.needs_human_reason) if self.needs_human_reason is not None else None
             ),
         }
+        # 向前相容：新欄位只在有值時寫出，舊版 Monitor 的封閉白名單讀新版 jobs.json 不會拒收。
+        if self.plan_review_receipt is not None:
+            payload["plan_review_receipt"] = self.plan_review_receipt.to_dict()
+        if self.planning_drift_stop is not None:
+            payload["planning_drift_stop"] = self.planning_drift_stop.to_dict()
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> WorkflowRun:
