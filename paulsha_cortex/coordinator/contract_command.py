@@ -97,4 +97,11 @@ def build_dispatch_prompt(
             "[SPEC BODY END]",
         ]
     )
+    if worktree_root is not None and len(spec_body) > PINNED_SPEC_BODY_LIMIT:
+        # 截斷時唯一的完整來源是 [SPEC] 路徑；它可能只存在於主 checkout，
+        # 因此對這一個檔案開唯讀例外，否則 worktree 邊界會讓 builder 讀不到完整 spec。
+        lines.append(
+            "例外：上方 [SPEC] 列出的 pinned spec 檔案可唯讀讀取（即使位於主 checkout），"
+            "讀取後以 sha256 核對；不得寫入或讀取主 checkout 的其他任何檔案。"
+        )
     return "\n".join(lines)
