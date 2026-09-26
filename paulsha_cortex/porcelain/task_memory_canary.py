@@ -33,7 +33,11 @@ _MODES = ("note_fetch", "snapshot", "inline")
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cortex task-memory",
-        description="對指定 Hippo projects 執行唯讀 provide/fetch live canary，輸出 bounded JSON。",
+        description=(
+            "對指定 Hippo projects 執行唯讀 provide/fetch live canary，輸出 bounded JSON。"
+            "須以 PSC_TASK_MEMORY_HIPPO_CMD 明示 Hippo CLI 命令（第一個元素必須是絕對路徑）；"
+            "未設、空白或非絕對路徑一律視為 provider 缺席，不會搜尋 PATH。"
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
     canary = sub.add_parser("canary", help="驗證 provide/fetch、scope 與 permission controls")

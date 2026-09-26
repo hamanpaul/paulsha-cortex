@@ -884,6 +884,11 @@ def _validate_payload(
             raise TaskMemoryError("malformed-payload")
         if "excerpt" in raw:
             row["excerpt"] = _safe_public_text(raw.get("excerpt"), limit=MAX_PUBLIC_FIELD_CHARS)
+        # 注意（issue #857 對抗審查 MAJOR）：以下三個欄位是 provider 回傳的
+        # 自由文字，僅做長度界限與已知密鑰／路徑樣式的最基本清洗，仍可能夾帶
+        # note 正文或 provider 內部診斷訊息。這裡保留的值只在本次請求內存活，
+        # 供 `_event()` 收斂為 SHA-256 摘要／受界 ISO8601 後才寫入 receipt；
+        # 不得由本函式或任何呼叫端把這裡的原文直接持久化到 receipt／sidecar。
         applicability = raw.get("applicability", ())
         if not isinstance(applicability, Sequence) or isinstance(applicability, (str, bytes)):
             raise TaskMemoryError("malformed-payload")
@@ -1069,9 +1074,13 @@ def _event(
     if evidence is not None:
         row["evidence"] = dict(evidence)
     if candidate:
-        row["applicability"] = list(candidate.get("applicability", ()))
-        row["relevance_reason"] = candidate.get("relevance_reason", "")
-        row["source_time"] = candidate.get("source_time")
+        # MAJOR 修復（issue #857 對抗審查）：provider 回傳的 applicability／
+        # relevance_reason 是不受信任的自由文字，可能夾帶 note 正文或內部
+        # 診斷訊息；receipt／sidecar 只保留其 SHA-256 摘要，原文不得持久化。
+        # source_time 只在可解析為受界 ISO8601 時原樣保留，否則記為 unknown。
+        row["applicability_sha256"] = _digest_public_list(candidate.get("applicability"))
+        row["relevance_reason_sha256"] = _digest_public_text(candidate.get("relevance_reason"))
+        row["source_time"] = _bounded_source_time(candidate.get("source_time"))
     if event_name == "content-returned":
         # Hippo's strict funnel treats inline and snapshot as not-read.
         row["counts_as_read"] = mode == "note_fetch"
@@ -1473,8 +1482,9 @@ def _validate_event(value: object) -> dict[str, Any]:
         "session_proxy", "repo", "work_id", "workflow_run_id", "job_id", "card",
         "executor", "model_id", "tool", "project", "task_kind", "mode",
         "eligible_authorized", "note_id", "content_hash", "content_version", "timestamp",
-        "reason", "permission_layer", "snapshot_id", "applicability", "relevance_reason",
-        "source_time", "evidence", "counts_as_read", "provider_code",
+        "reason", "permission_layer", "snapshot_id", "applicability_sha256",
+        "relevance_reason_sha256", "source_time", "evidence", "counts_as_read",
+        "provider_code",
     }
     if set(row) - allowed:
         raise ValueError("task memory receipt contains unsupported fields")
@@ -1583,21 +1593,23 @@ def _validate_event(value: object) -> dict[str, Any]:
         or _SHA256_RE.fullmatch(row["snapshot_id"]) is None
     ):
         raise ValueError("task memory receipt snapshot id invalid")
-    if row.get("applicability") is not None and (
-        not isinstance(row["applicability"], list)
-        or any(
-            not isinstance(item, str) or len(item) > MAX_PUBLIC_FIELD_CHARS
-            for item in row["applicability"]
-        )
+    # MAJOR 修復（issue #857 對抗審查）：receipt 不再持久化自由文字本身，
+    # applicability／relevance_reason 只允許受界 SHA-256 摘要；source_time
+    # 只允許 "unknown" 或受界長度、可解析的 ISO8601 字串。
+    if row.get("applicability_sha256") is not None and (
+        not isinstance(row["applicability_sha256"], str)
+        or _SHA256_RE.fullmatch(row["applicability_sha256"]) is None
     ):
-        raise ValueError("task memory receipt applicability invalid")
-    if row.get("relevance_reason") is not None and (
-        not isinstance(row["relevance_reason"], str)
-        or len(row["relevance_reason"]) > MAX_PUBLIC_FIELD_CHARS
+        raise ValueError("task memory receipt applicability digest invalid")
+    if row.get("relevance_reason_sha256") is not None and (
+        not isinstance(row["relevance_reason_sha256"], str)
+        or _SHA256_RE.fullmatch(row["relevance_reason_sha256"]) is None
     ):
-        raise ValueError("task memory receipt relevance reason invalid")
+        raise ValueError("task memory receipt relevance reason digest invalid")
     if row.get("source_time") is not None and (
-        not isinstance(row["source_time"], str) or len(row["source_time"]) > 100
+        not isinstance(row["source_time"], str)
+        or len(row["source_time"]) > _MAX_SOURCE_TIME_CHARS
+        or not _is_bounded_source_time(row["source_time"])
     ):
         raise ValueError("task memory receipt source time invalid")
     evidence = row.get("evidence")
@@ -1725,6 +1737,55 @@ def _stable_task_id(repo: str, work_id: str, run_id: str) -> str:
 
 def _bounded_reason(reason: str) -> str:
     return reason if reason in _FAILURE_REASONS else "provider-error"
+
+
+_MAX_SOURCE_TIME_CHARS = 40
+
+
+def _digest_public_text(value: object) -> str | None:
+    """把自由文字欄位收斂成 SHA-256 摘要；receipt 不得持久化原文本身。"""
+
+    if not isinstance(value, str) or not value:
+        return None
+    return _sha256(value.encode("utf-8"))
+
+
+def _digest_public_list(value: object) -> str | None:
+    """把自由文字清單收斂成單一 SHA-256 摘要；receipt 不得持久化原文本身。"""
+
+    if not isinstance(value, (list, tuple)):
+        return None
+    items = [item for item in value if isinstance(item, str) and item]
+    if not items:
+        return None
+    canonical = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+    return _sha256(canonical.encode("utf-8"))
+
+
+def _is_bounded_source_time(value: str) -> bool:
+    """source_time 只接受受界長度、可解析的 ISO8601（或 literal "unknown"）。"""
+
+    if value == "unknown":
+        return True
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        datetime.fromisoformat(candidate)
+    except ValueError:
+        return False
+    return True
+
+
+def _bounded_source_time(value: object) -> str:
+    """source_time 未受界、非字串或無法解析為 ISO8601 時，記為 unknown。"""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_SOURCE_TIME_CHARS
+        or not _is_bounded_source_time(value)
+    ):
+        return "unknown"
+    return value
 
 
 def _safe_public_text(value: object, *, limit: int) -> str:

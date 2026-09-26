@@ -387,8 +387,17 @@ def test_delivery_paths_emit_bound_receipts_and_keep_inline_out_of_read(tmp_path
     assert prepared.events[0]["note_id"] == "note-1"
     assert prepared.events[0]["content_hash"] == NOTE_HASH
     assert prepared.events[0]["content_version"] == "v7"
-    assert prepared.events[0]["applicability"] == ["same repository", "parser task"]
-    assert prepared.events[0]["relevance_reason"] == "The current task changes parsing behavior."
+    # MAJOR 修復（issue #857 對抗審查）：receipt 只保留自由文字的 SHA-256 摘要，
+    # 不持久化 applicability／relevance_reason 原文；source_time 可解析為
+    # ISO8601 時原樣保留。
+    assert "applicability" not in prepared.events[0]
+    assert "relevance_reason" not in prepared.events[0]
+    assert prepared.events[0]["applicability_sha256"] == hashlib.sha256(
+        json.dumps(["same repository", "parser task"], ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert prepared.events[0]["relevance_reason_sha256"] == hashlib.sha256(
+        "The current task changes parsing behavior.".encode()
+    ).hexdigest()
     assert prepared.events[0]["source_time"] == "2026-09-25T12:00:00Z"
     assert prepared.payload["future_optional"] == {"preserved": True}
 
@@ -480,6 +489,57 @@ def test_candidate_bound_is_three_and_unknown_optional_contract_fields_survive()
     assert prepared.status == "offered"
     assert len(prepared.candidates) == 3
     assert prepared.payload["candidates"][2]["host_optional"] == {"preserved_index": 3}
+
+
+def test_hostile_provider_free_text_never_reaches_receipt_sidecar_or_read_model(tmp_path):
+    """issue #857 對抗審查 MAJOR：有缺陷／惡意的 hippo provider 若把 note 正文
+    或 provider 內部診斷訊息塞進 applicability／relevance_reason／source_time，
+    receipt／sidecar／read model 都不得含有那段原文，只能含其 SHA-256 摘要，
+    且格式不對的 source_time 必須落 "unknown"。
+    """
+
+    hostile_note_body = "SECRET NOTE BODY: do not exfiltrate this stderr dump"
+    hostile_reason = "traceback: internal provider stderr leaked here " + ("x" * 700)
+
+    def hostile_provider(request):
+        payload = _payload(request)
+        payload["candidates"][0]["applicability"] = [hostile_note_body]
+        payload["candidates"][0]["relevance_reason"] = hostile_reason
+        payload["candidates"][0]["source_time"] = "not-a-real-timestamp"
+        return payload
+
+    context, work_item, run, _step, job = _context(caps=TaskMemoryCapabilities(inline=True))
+    adapter = TaskMemoryAdapter(provider=hostile_provider)
+    prepared = adapter.prepare(context)
+    assert prepared.status == "offered"
+    event = prepared.events[0]
+    assert "applicability" not in event
+    assert "relevance_reason" not in event
+    assert hostile_note_body not in json.dumps(event)
+    assert hostile_reason not in json.dumps(event)
+    assert event["source_time"] == "unknown"
+    assert len(event["applicability_sha256"]) == 64
+    assert len(event["relevance_reason_sha256"]) == 64
+
+    store = TaskMemoryReceiptStore(tmp_path / "coordinator")
+    store.append(event)
+    sidecar_text = store.sidecar_path(
+        context.repo, context.work_id, context.workflow_run_id
+    ).read_text(encoding="utf-8")
+    assert hostile_note_body not in sidecar_text
+    assert hostile_reason not in sidecar_text
+    assert "not-a-real-timestamp" not in sidecar_text
+
+    view = project_task_memory_read_model(
+        work_item=work_item,
+        runs=(run,),
+        jobs=(job,),
+        receipts=store,
+    )
+    rendered = json.dumps(view)
+    assert hostile_note_body not in rendered
+    assert hostile_reason not in rendered
+    assert "not-a-real-timestamp" not in rendered
 
 
 def test_denied_candidate_is_rejected_without_copying_denied_summary_to_receipt():

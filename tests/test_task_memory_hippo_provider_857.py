@@ -441,6 +441,36 @@ def test_command_prefix_accepts_json_argv_and_shlex_and_missing_is_unavailable(
     assert resolve_hippo_command(env) is None
 
 
+def test_unset_blank_or_relative_hippo_cmd_never_searches_path(tmp_path):
+    """issue #857 對抗審查 MAJOR：啟用 task-memory 時必須明示
+    PSC_TASK_MEMORY_HIPPO_CMD 且第一個元素為絕對路徑；未設、空白或相對路徑
+    一律視為 provider 缺席，即使 PATH 上真的有一個可執行的 `hippo` 也不能被
+    意外執行到（避免 PSC_TASK_MEMORY_ENABLED=1 意外跑到 PATH 優先 binary）。
+    """
+
+    path_dir = tmp_path / "on-path"
+    path_dir.mkdir()
+    path_hippo = path_dir / "hippo"
+    path_hippo.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
+    path_hippo.chmod(0o700)
+    base_env = {"PATH": f"{path_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+    # 未設環境變數
+    assert resolve_hippo_command(dict(base_env)) is None
+    # 空白字串
+    assert resolve_hippo_command({**base_env, HIPPO_COMMAND_ENV: "   "}) is None
+    # 相對 bare name，即使 PATH 上有同名可執行檔也不得被搜到
+    assert resolve_hippo_command({**base_env, HIPPO_COMMAND_ENV: "hippo"}) is None
+    assert resolve_hippo_command({**base_env, HIPPO_COMMAND_ENV: json.dumps(["hippo"])}) is None
+    # 相對路徑（有子路徑但非絕對）
+    assert resolve_hippo_command({**base_env, HIPPO_COMMAND_ENV: "./hippo"}) is None
+
+    # 明示絕對路徑才會被接受
+    absolute = str(path_hippo)
+    resolved = resolve_hippo_command({**base_env, HIPPO_COMMAND_ENV: absolute})
+    assert resolved == (absolute,)
+
+
 def test_optional_real_hippo_cli_integration():
     if not os.environ.get(HIPPO_COMMAND_ENV):
         pytest.skip(

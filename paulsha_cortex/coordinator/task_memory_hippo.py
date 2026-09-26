@@ -66,29 +66,35 @@ class _HippoTimeout(TimeoutError):
 
 
 def resolve_hippo_command(environ: Mapping[str, str] | None = None) -> tuple[str, ...] | None:
-    """Resolve a JSON argv array or shlex command without invoking a shell."""
+    """解析 `PSC_TASK_MEMORY_HIPPO_CMD` 的 JSON argv array 或 shlex command。
+
+    MAJOR 修復（issue #857 對抗審查）：啟用 task-memory 時必須由操作者明示
+    這個環境變數，且第一個 argv 元素必須是絕對路徑；未設、空白字串或非絕對
+    路徑一律視為 provider 缺席（回傳 None，沿用既有 fail-closed 行為），
+    不再對第一個元素做 PATH 搜尋——否則 `PSC_TASK_MEMORY_ENABLED=1` 可能
+    意外執行 PATH 上第一個叫 `hippo` 的任意 binary。不呼叫 shell，避免注入。
+    """
 
     env = os.environ if environ is None else environ
     raw = env.get(HIPPO_COMMAND_ENV)
     if raw is None or not raw.strip():
-        argv = ["hippo"]
-    else:
-        value = raw.strip()
-        try:
-            if value.startswith("["):
-                decoded = json.loads(value)
-                if not isinstance(decoded, list) or any(
-                    not isinstance(item, str) or not item or "\x00" in item for item in decoded
-                ):
-                    return None
-                argv = decoded
-            else:
-                argv = shlex.split(value)
-        except (json.JSONDecodeError, ValueError):
-            return None
-    if not argv:
         return None
-    executable = shutil.which(argv[0], path=env.get("PATH"))
+    value = raw.strip()
+    try:
+        if value.startswith("["):
+            decoded = json.loads(value)
+            if not isinstance(decoded, list) or any(
+                not isinstance(item, str) or not item or "\x00" in item for item in decoded
+            ):
+                return None
+            argv = decoded
+        else:
+            argv = shlex.split(value)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not argv or not os.path.isabs(argv[0]):
+        return None
+    executable = shutil.which(argv[0])
     if executable is None:
         return None
     argv[0] = executable
