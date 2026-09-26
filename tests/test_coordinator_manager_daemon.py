@@ -28,6 +28,33 @@ from paulsha_cortex.coordinator.registry import JobRegistry
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_claude_launcher_resolves_executable_from_registered_identity(tmp_path: Path) -> None:
+    executable = tmp_path / "claude-compatible"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "claude",
+                "model_id": "gemma-test",
+                "independence_domain": "local",
+                "executable": str(executable),
+            }
+        ],
+        schema_version=4,
+    )
+
+    resolved = manager_daemon._resolve_launcher(
+        "claude",
+        None,
+        allow_unsafe=False,
+        model="gemma-test",
+        identity_registry=identities,
+    )
+
+    assert resolved.executable == str(executable.resolve())
+
+
 def _assert_in_flight_shape(rows: list[dict]) -> None:
     """in_flight 條目的既有三欄逐字不變，外加 #731 (C) 的 `candidate_git_base`。
 

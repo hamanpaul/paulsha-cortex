@@ -680,6 +680,51 @@ work_items:
     assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] == "done"
 
 
+def test_unchecked_workstream_todo_is_advisory_after_valid_completion(tmp_path):
+    override = """version: 1
+work_items:
+  umbrella:
+    title: Completed work
+    links:
+      - kind: github_issue
+        ref: example/acme#7
+      - kind: github_pr
+        ref: example/acme#9
+      - kind: openspec
+        ref: canary
+    excludes: []
+"""
+    github = (
+        _github_entity("github_issue", 7, "closed"),
+        _github_entity("github_pr", 9, "closed"),
+    )
+    base_terminal = _closure_terminal(
+        openspec_refs=("canary",), prs=((9, True),)
+    )
+    terminal = _provider(
+        base_terminal.provider_id,
+        base_terminal.sources,
+        observations={
+            **base_terminal.observations,
+            "remote_todos": [
+                *base_terminal.observations["remote_todos"],
+                {
+                    "work_id": "umbrella",
+                    "path": "docs/superpowers/workstreams/umbrella/todo.md",
+                    "revision": "e" * 40,
+                    "complete": False,
+                },
+            ],
+        },
+    )
+
+    store, _, _ = _run_closure_projection(
+        tmp_path, override_text=override, github_sources=github, terminal=terminal
+    )
+
+    assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] == "done"
+
+
 def test_all_confirmed_mapped_prs_must_be_terminal_merge_commits(tmp_path):
     override = """version: 1
 work_items:

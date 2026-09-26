@@ -323,6 +323,47 @@ class WorkActionFlagTests(unittest.TestCase):
             self.assertEqual(request["args"]["verdict"], "approved")
             self.assertEqual(request["args"]["findings"], [])
 
+    def test_verify_attest_parser_writes_exact_candidate_and_full_suite_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            payload_path = Path(root) / "verify.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "full_suite_command": "python -m pytest -q",
+                        "result_summary": {"passed": 100, "failed": 0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            req_ids: list[str] = []
+
+            def done(req_id, *_args, **_kwargs):
+                req_ids.append(req_id)
+                return {"status": "ok", "result": {"action": "verify-attested"}}
+
+            with mock.patch.dict(os.environ, {"PSC_CONTROL_ROOT": root}, clear=False):
+                with redirect_stdout(io.StringIO()):
+                    rc = cli.main(
+                        [
+                            "work", "verify-attest", "demo", "--repo", "acme/demo",
+                            "--actor", "operator", "--expected-candidate", "a" * 40,
+                            "--payload", str(payload_path),
+                        ],
+                        control_read_status=lambda: {"degraded": False},
+                        control_submit_request=control_client.submit_request,
+                        control_poll_done=done,
+                    )
+
+            self.assertEqual(rc, 0)
+            request = control_contract.read_json(
+                Path(root) / "requests" / f"{req_ids[0]}.json"
+            )
+            self.assertIsNotNone(request)
+            self.assertEqual(request["args"]["action"], "verify-attest")
+            self.assertEqual(request["args"]["actor"], "operator")
+            self.assertEqual(request["args"]["expected_candidate"], "a" * 40)
+            self.assertEqual(request["args"]["result_summary"], {"passed": 100, "failed": 0})
+
     def test_review_disposition_parser_writes_operator_decision_request(self) -> None:
         submitted = []
 

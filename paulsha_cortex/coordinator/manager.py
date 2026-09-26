@@ -2137,6 +2137,7 @@ def _launch_foreign_review(
             reviewer_job["job_id"],
             executor=handle.executor,
             model_id=handle.model_id,
+            executable=handle.executable,
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,
@@ -2969,13 +2970,43 @@ def complete_tick(
                     {"job_id": job_id, "error": f"handoff manifest path 拒絕 symlink: {manifest_path}"}
                 )
                 continue
+
+            workflow_lane_job = _is_workflow_lane_job(job)
+            slice_row = None
+            if not workflow_lane_job:
+                try:
+                    slice_row = registry.get_slice(slice_id)
+                except KeyError:
+                    pass  # 真正缺少 slice row 時，保留既有 missing-slice-proof 流程。
+                else:
+                    binding_field = "reviewer_job_id" if job.get("kind") == "review" else "builder_job_id"
+                    if slice_row.get(binding_field) != job_id:
+                        continue  # 已不屬於目前 attempt 的 terminal job 僅保留稽核。
+                    if job.get("kind") != "review" and slice_row.get("reviewer_job_id"):
+                        continue
+
+            # 綁定中的 slice job 若同 job manifest 已反映到 slice，就不再重驗，避免
+            # 每個 tick 重複寫 evidence/action。前次 state mutation 失敗時保留修復重試；
+            # 缺少 slice 的舊 job仍走 _existing_manifest_job_id 的既有修復行為。
+            existing_manifest = _read_manifest_payload(manifest_path)
+            if slice_row is not None and existing_manifest is not None:
+                if existing_manifest.get("job_id") == job_id:
+                    gate_reason = existing_manifest.get("gate_reason")
+                    transition_not_applied = gate_reason == "verification-state-update-error" or (
+                        gate_reason == "verification-runner-error"
+                        and (slice_row.get("state") != "needs_human" or slice_row.get("gate_state") != "needs_human")
+                    )
+                    if not transition_not_applied:
+                        continue
             if _existing_manifest_job_id(manifest_path) == job_id:
                 continue  # 真冪等：同一個 terminal job 已落盤（同 job_id → skip；異 job_id/壞檔 → overwrite）
 
             if job.get("kind") == "review":
-                slice_row = _slice_for_reviewer_job(registry, slice_id, job_id)
+                if workflow_lane_job:
+                    slice_row = _slice_for_reviewer_job(registry, slice_id, job_id)
             else:
-                slice_row = _slice_for_job(registry, slice_id, job_id)
+                if workflow_lane_job:
+                    slice_row = _slice_for_job(registry, slice_id, job_id)
                 if slice_row is not None and slice_row.get("reviewer_job_id"):
                     continue
                 if slice_row is None and _is_unbound_launch_failed_build_job(registry, slice_id, job):
@@ -3132,6 +3163,7 @@ def complete_tick(
                     except Exception as exc:
                         gate_status = "needs_human"
                         gate_reason = "verification-runner-error"
+                        state_update_started = False
                         try:
                             evidence = _write_status_evidence(
                                 slice_row=slice_row,
@@ -3144,11 +3176,16 @@ def complete_tick(
                                 details={"error": str(exc)},
                             )
                             if evidence is not None:
+                                state_update_started = True
                                 _apply_verification_result(registry, slice_id, evidence)
                                 publish_evidence = True
                             else:
+                                state_update_started = True
                                 registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
                         except Exception:
+                            if state_update_started:
+                                gate_reason = "verification-state-update-error"
+                            publish_evidence = False
                             try:
                                 registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
                             except Exception:
@@ -4537,8 +4574,10 @@ def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
 
         來源樹的 `refs/heads/<branch>` == `run.candidate_head`
 
-    在每一張 build 卡被採信之後成立，下一張卡只要以 `run.candidate_head` 為 base
-    去 clone，拿到的就是前一張卡的成果——**完全不必讀前一張卡的工作區**。
+    在每一張允許 commit 的 build 卡被採信之後成立，下一張卡只要以
+    `run.candidate_head` 為 base 去 clone，拿到的就是前一張卡的成果——**完全不必
+    讀前一張卡的工作區**。`commit_policy=forbidden` 的卡（例如
+    `worktree-isolation`）不產生 Candidate，通過後仍維持未錨定狀態。
 
     為什麼是 `run.candidate_head` 而不是「去讀來源樹的 branch tip」：candidate 是
     Manager 採信鏈（#540）的產物，branch tip 只是磁碟現況。以採信值為準，兩者一旦
@@ -4553,9 +4592,10 @@ def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
     目錄，既不會撞名（#601 的 `worktree target already exists` 在這條 lane 結構上
     消失），也不會被下一次 provision 讀到。
 
-    **`candidate_head` 尚未錨定時不走這條路**：那代表 run 還沒採信過任何 build
-    成果（首張卡、或首張卡的 terminal 壞掉正在重派），呼叫端會退回「首張 build 卡」
-    的凍結 base。判準寫在呼叫端而不是這裡，因為那是「有沒有東西要交接」的問題。
+    **`candidate_head` 尚未錨定時不走這條路**：那代表還沒有任何允許 commit 的
+    build 結果被採信（例如 isolation 已通過，或首張可 commit 卡的 terminal 尚未
+    被採信），呼叫端會沿用未錨定時的 base。判準寫在呼叫端而不是這裡，因為那是
+    「有沒有東西要交接」的問題。
 
     推不出合法 SHA 時 raise：**不得**退回 creator 的預設 base（那是 `main`，等於把
     整個 run 已採信的成果 reset 掉）。
@@ -4573,6 +4613,58 @@ def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
         "這代表上一張卡的成果回收（#637 bundle ＋ spool）沒有走完——不得以 run 的原始 "
         "base 重新 provision，那會丟掉已採信的 commit"
     )
+
+
+def _validate_candidate_planning_authority(run, *, source_repo: Path, candidate: str) -> None:
+    """在候選分支更新前核對 candidate tree 內的 pinned planning bytes。"""
+
+    authorities = tuple(getattr(run, "planning_authority", ()) or ())
+    if not authorities:
+        return
+
+    operator_root = Path(run.workspace_root).resolve()
+    drift_rows: list[dict[str, str]] = []
+    for authority in authorities:
+        content = subprocess.run(
+            ["git", "-C", str(source_repo), "show", f"{candidate}:{authority.ref}"],
+            capture_output=True,
+            check=False,
+        )
+        if content.returncode != 0:
+            raise ValueError(
+                "workflow planning input drift at candidate harvest: "
+                f"{authority.ref} is missing from the candidate"
+            )
+        current_bytes = content.stdout
+        current_digest = hashlib.sha256(current_bytes).hexdigest()
+        if current_digest == authority.baseline_sha256:
+            continue
+
+        if (
+            authority.kind == "plan"
+            and Path(authority.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
+        ):
+            baseline_matches = _safe_input_matches(operator_root, authority.ref)
+            if len(baseline_matches) == 1:
+                baseline_bytes = baseline_matches[0].read_bytes()
+                if (
+                    hashlib.sha256(baseline_bytes).hexdigest() == authority.baseline_sha256
+                    and _checkbox_insensitive_equal(baseline_bytes, current_bytes)
+                ):
+                    continue
+        drift_rows.append(
+            {
+                "ref": authority.ref,
+                "kind": authority.kind,
+                "expected_sha256": authority.baseline_sha256,
+                "current_sha256": current_digest,
+            }
+        )
+
+    if drift_rows:
+        raise WorkflowPlanningInputDrift(
+            tuple(drift_rows), diagnostic_stage="candidate harvest"
+        )
 
 
 def _harvest_build_candidate(
@@ -4620,6 +4712,30 @@ def _harvest_build_candidate(
         if existing is not None and existing == candidate.lower():
             job_workspace.seal_commit_spool(bundle)
             return candidate
+    if getattr(run, "planning_authority", ()):
+        fetched = subprocess.run(
+            [
+                "git",
+                "-C",
+                source_repo,
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                str(bundle),
+                f"refs/heads/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if fetched.returncode != 0:
+            detail = (fetched.stderr or fetched.stdout).strip()
+            raise job_workspace.WorkspaceError(
+                f"job workspace planning input candidate unavailable: {detail}"
+            )
+        _validate_candidate_planning_authority(
+            run, source_repo=Path(source_repo), candidate=candidate.lower()
+        )
     harvested = job_workspace.harvest_branch(
         source_repo=source_repo, bundle=bundle, branch=branch
     )
@@ -6870,9 +6986,24 @@ def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict
 class WorkflowPlanningInputDrift(ValueError):
     """保存與 frozen hash 不符的 planning input 逐檔差異。"""
 
-    def __init__(self, rows: tuple[dict[str, str], ...]) -> None:
+    def __init__(
+        self,
+        rows: tuple[dict[str, str], ...],
+        *,
+        diagnostic_stage: str | None = None,
+    ) -> None:
         self.drift_rows = tuple(dict(row) for row in rows)
-        super().__init__("workflow planning input drift")
+        message = "workflow planning input drift"
+        if diagnostic_stage is not None and self.drift_rows:
+            first = self.drift_rows[0]
+            message += (
+                f" at {diagnostic_stage}: {first['ref']} "
+                f"expected={first['expected_sha256'][:12]} "
+                f"current={first['current_sha256'][:12]}"
+            )
+            if len(self.drift_rows) > 1:
+                message += f" (+{len(self.drift_rows) - 1} more)"
+        super().__init__(message)
 
 
 def _workflow_input_snapshot(
@@ -7922,6 +8053,21 @@ def _grant_reviewer_sandbox_access(sandbox: Path) -> str | None:
     )
 
 
+def _reviewer_sandbox_name(
+    *,
+    run_id: str,
+    card: str,
+    candidate: str,
+    job_id: str | None,
+) -> str:
+    preimage = (
+        f"{run_id}:{card}:{candidate}:{job_id}"
+        if job_id is not None
+        else f"{run_id}:{card}:{candidate}"
+    )
+    return hashlib.sha256(preimage.encode()).hexdigest()[:32]
+
+
 def _create_reviewer_sandbox(
     *,
     run,
@@ -7930,16 +8076,24 @@ def _create_reviewer_sandbox(
     candidate_root: Path,
     coordinator_root: str | Path,
     input_snapshot: tuple[dict[str, str], ...],
+    job_id: str,
 ) -> tuple[Path, Path]:
     candidate = run.candidate_head
     if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
         raise ValueError("workflow reviewer candidate invalid")
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("workflow reviewer job id invalid")
     parent = _reviewer_sandbox_parent(
         coordinator_root=coordinator_root,
         candidate_root=candidate_root,
     )
     _prepare_reviewer_sandbox_container(parent)
-    name = hashlib.sha256(f"{run.run_id}:{step.card}:{candidate}".encode()).hexdigest()[:32]
+    name = _reviewer_sandbox_name(
+        run_id=run.run_id,
+        card=step.card,
+        candidate=candidate,
+        job_id=job_id,
+    )
     sandbox = parent / name
     if sandbox.exists() or sandbox.is_symlink():
         raise ValueError("stale reviewer sandbox requires reconciliation")
@@ -8046,19 +8200,35 @@ def _reviewer_sandbox_path(job: Mapping[str, object], coordinator_root: str | Pa
     run_id = job.get("workflow_run_id")
     card = job.get("workflow_card")
     candidate = job.get("subject_head")
+    job_id = job.get("job_id")
     if (
         not isinstance(run_id, str)
         or not isinstance(card, str)
         or not isinstance(candidate, str)
+        or not isinstance(job_id, str)
+        or not job_id
         or verification.SAFE_SHA_RE.fullmatch(candidate) is None
     ):
         raise ValueError("reviewer sandbox identity missing")
-    expected_name = hashlib.sha256(f"{run_id}:{card}:{candidate}".encode()).hexdigest()[:32]
+    expected_names = {
+        _reviewer_sandbox_name(
+            run_id=run_id,
+            card=card,
+            candidate=candidate,
+            job_id=job_id,
+        ),
+        _reviewer_sandbox_name(
+            run_id=run_id,
+            card=card,
+            candidate=candidate,
+            job_id=None,
+        ),
+    }
     if (
         not path.is_absolute()
         or path.is_symlink()
         or path.parent != allowed
-        or path.name != expected_name
+        or path.name not in expected_names
     ):
         raise ValueError("reviewer sandbox path invalid")
     return path
@@ -8111,6 +8281,43 @@ def _discard_reviewer_sandbox(
         raise ValueError("reviewer sandbox cleanup incomplete")
     if require_candidate_unchanged and not unchanged:
         raise ValueError("workflow reviewer modified Candidate checkout")
+
+
+def _reclaim_superseded_era_reviewer_sandboxes(
+    matching: Sequence[Mapping[str, object]],
+    *,
+    run,
+    coordinator_root: str | Path,
+) -> None:
+    current_worktrees = {
+        worktree
+        for job in matching
+        if job.get("workflow_claim_key") in (None, run.claim_key)
+        and isinstance((worktree := job.get("worktree")), str)
+    }
+    for job in matching:
+        claim_key = job.get("workflow_claim_key")
+        if (
+            job.get("persona") != "reviewer"
+            or not isinstance(claim_key, str)
+            or claim_key == run.claim_key
+            or job.get("status") not in TERMINAL_STATUSES
+            or job.get("worktree") in current_worktrees
+        ):
+            continue
+        try:
+            _discard_reviewer_sandbox(
+                job,
+                coordinator_root=coordinator_root,
+                require_candidate_unchanged=False,
+            )
+        except (ValueError, OSError) as exc:
+            logger.warning(
+                "workflow reviewer sandbox reclaim failed for run %s job %s: %s",
+                run.run_id,
+                job.get("job_id"),
+                summarize_exception(exc),
+            )
 
 
 def terminalize_workflow_job(
@@ -10419,6 +10626,16 @@ def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> ob
     except ValueError:
         return None
     reason = "; ".join(provider.diagnostics) if provider.diagnostics else None
+    structured_reason = provider.diagnostic_reason
+    if provider.status == "degraded" and structured_reason is None:
+        # 舊 snapshot 沒有此 optional 欄位時維持降級狀態，並在 preflight 投影補上
+        # 通用結構化理由；不從自由文字推導或改判 provider 狀態。
+        structured_reason = diagnostic_reason(
+            "provider-degraded",
+            "provider snapshot is degraded",
+            source="coordinator.manager._monitor_provider_snapshot_lookup",
+            provider_id=provider.provider_id,
+        )
     return ProviderFreshness(
         provider_id=provider.provider_id,
         status=provider.status,
@@ -10426,6 +10643,7 @@ def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> ob
         ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
         source="monitor-snapshot",
         reason=reason,
+        diagnostic_reason=structured_reason,
     )
 
 
@@ -10453,6 +10671,12 @@ def _executor_auth_snapshot_lookup(provider_id: str) -> object | None:
         ttl_seconds=EXECUTOR_AUTH_TTL_SECONDS,
         source="cold-start",
         reason="no prior executor auth probe",
+        diagnostic_reason=diagnostic_reason(
+            "executor-auth-not-probed",
+            "no prior executor auth probe",
+            source="coordinator.manager._executor_auth_snapshot_lookup",
+            executor=provider_id,
+        ),
     )
 
 
@@ -10498,9 +10722,10 @@ def _runtime_preflight_gate(
 ):
     """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
 
-    回傳 None 代表這張 card 未宣告任何 capability，呼叫端照原路徑走；否則回傳
-    `DispatchGateDecision`，其中 `launcher` 只在通過 preflight 的 identity 上建立
-    ——被擋下的 identity 不會產生任何 model session。
+    沒有 capability 宣告且候選中沒有 overlay Copilot identity 時回傳 None。overlay
+    Copilot identity 另做一次限時模型探測；CLI 無法判定時只留診斷，不阻擋派工。
+    `DispatchGateDecision` 的 `launcher` 只在通過 preflight 的 identity 上建立；
+    被擋下的 identity 不會產生 model session 或 workflow Job。
 
     `snapshot_store` 預設 None 時延後到真正需要時才建立
     `monitor.work_snapshot.WorkSnapshotStore()`（讀既有 monitor durable
@@ -10516,15 +10741,20 @@ def _runtime_preflight_gate(
     try:
         requirements = card_runtime_requirements(step.card)
     except Exception:  # noqa: BLE001 - deck 載入問題不得把 dispatch 一起拖垮
-        return None
-    if not requirements:
-        return None
+        requirements = ()
 
     active_candidates = (
         _workflow_identity_candidates(run, step, identities)
         if candidates is None
         else list(candidates)
     )
+    has_overlay_copilot_candidate = any(
+        getattr(identity, "executor", None) == "copilot"
+        and getattr(identity, "origin", None) == model_resolution.IDENTITY_ORIGIN_OVERLAY
+        for identity in active_candidates
+    )
+    if not requirements and not has_overlay_copilot_candidate:
+        return None
     compatibility_for = model_resolution.compatibility_checker_for(step.persona)
 
     # 每個 identity 只 specialize 一次並記憶：preflight 與最終 dispatch 共用同一
@@ -10553,16 +10783,16 @@ def _runtime_preflight_gate(
 
         return host_environment()
 
+    provider_requirements = tuple(
+        requirement for requirement in requirements if requirement.kind == "provider"
+    )
     active_store = snapshot_store
-    if active_store is None:
+    if provider_requirements and active_store is None:
         from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
 
         active_store = WorkSnapshotStore()
 
     projected_attempts: list[runtime_preflight.RuntimePreflightResult] = []
-    provider_requirements = tuple(
-        requirement for requirement in requirements if requirement.kind == "provider"
-    )
     checked_at = time.time()
     if provider_requirements:
         seen_projected: set[str] = set()
@@ -10600,6 +10830,12 @@ def _runtime_preflight_gate(
                             ttl_seconds=runtime_preflight.DEFAULT_PROVIDER_TTL_SECONDS,
                             source="executor-backoff",
                             reason=f"retry_after_epoch={retry_after}",
+                            diagnostic_reason=diagnostic_reason(
+                                "executor-auth-backoff",
+                                f"executor authentication probe paused until epoch {retry_after}",
+                                source="coordinator.manager._runtime_preflight_gate",
+                                executor=provider_id,
+                            ),
                         ),
                     )
                 )
@@ -10614,18 +10850,133 @@ def _runtime_preflight_gate(
                     )
                 )
 
-    gate = evaluate_dispatch_gate(
-        card=step.card,
-        requirements=requirements,
-        candidates=active_candidates,
-        environment_for=_environment_for,
-        launcher_factory=_launcher_for,
-        snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
-        provider_prober=_combined_provider_prober,
+    attempts = list(projected_attempts)
+    availability_rerouted = False
+    runtime_rerouted = False
+    probe_budget = runtime_preflight.ProbeBudget()
+    for identity_index, identity in enumerate(active_candidates):
+        availability_finding = None
+        if (
+            getattr(identity, "executor", None) == "copilot"
+            and getattr(identity, "origin", None) == model_resolution.IDENTITY_ORIGIN_OVERLAY
+        ):
+            from .executor_auth import cached_copilot_model_availability
+
+            status, reason = cached_copilot_model_availability(identity.model_id)
+            capability = runtime_preflight.RuntimeCapability(
+                "provider", f"model:{identity.executor}/{identity.model_id}"
+            )
+            outcome = {
+                "available": runtime_preflight.PreflightOutcome.OK,
+                "unavailable": runtime_preflight.PreflightOutcome.PROVIDER_UNAVAILABLE,
+                "unknown": runtime_preflight.PreflightOutcome.PROBE_INCONCLUSIVE,
+            }.get(status, runtime_preflight.PreflightOutcome.PROBE_INCONCLUSIVE)
+            freshness = runtime_preflight.ProviderFreshness(
+                provider_id=capability.name,
+                status={
+                    "available": "ok",
+                    "unavailable": "unavailable",
+                    "unknown": "unknown",
+                }.get(status, "unknown"),
+                observed_at=checked_at,
+                ttl_seconds=runtime_preflight.DEFAULT_PROVIDER_TTL_SECONDS,
+                source="model-availability-probe",
+                reason=reason,
+                diagnostic_reason=(
+                    None
+                    if status == "available"
+                    else diagnostic_reason(
+                        f"model-availability-{status}",
+                        reason,
+                        source="coordinator.manager._workflow_dispatch_gate:model-availability",
+                        executor=identity.executor,
+                        model_id=identity.model_id,
+                    )
+                ),
+            )
+            availability_finding = runtime_preflight.CapabilityFinding(
+                capability=capability,
+                outcome=outcome,
+                reason=reason,
+                freshness=freshness,
+            )
+            if outcome is runtime_preflight.PreflightOutcome.PROBE_INCONCLUSIVE:
+                logger.warning(
+                    "workflow run=%s card=%s model=%s/%s %s",
+                    getattr(run, "run_id", None),
+                    step.card,
+                    identity.executor,
+                    identity.model_id,
+                    reason,
+                )
+            if outcome is runtime_preflight.PreflightOutcome.PROVIDER_UNAVAILABLE:
+                attempts.append(
+                    runtime_preflight.RuntimePreflightResult(
+                        card=step.card,
+                        identity_token=runtime_preflight._identity_token(identity),
+                        environment=runtime_preflight.ExecutorEnvironment(
+                            name="manager:copilot-model-probe",
+                            interpreter=("copilot",),
+                            path="<manager PATH>",
+                            home="<manager HOME>",
+                            provider_identity=capability.name,
+                        ),
+                        findings=(availability_finding,),
+                        checked_at=checked_at,
+                    )
+                )
+                availability_rerouted = True
+                continue
+
+        candidate_gate = evaluate_dispatch_gate(
+            card=step.card,
+            requirements=requirements,
+            candidates=(identity,),
+            environment_for=_environment_for,
+            launcher_factory=_launcher_for,
+            snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
+            provider_prober=_combined_provider_prober,
+            budget=probe_budget,
+        )
+        if availability_finding is not None:
+            result = replace(
+                candidate_gate.result,
+                findings=(*candidate_gate.result.findings, availability_finding),
+            )
+            candidate_gate = replace(
+                candidate_gate, result=result, attempts=(result,)
+            )
+        attempts.extend(candidate_gate.attempts)
+        if candidate_gate.action == "needs_human":
+            runtime_rerouted = True
+            continue
+
+        rerouted = availability_rerouted or runtime_rerouted or identity_index > 0
+        reason = (
+            "model-availability-rerouted"
+            if availability_rerouted
+            else "capability-missing-rerouted"
+            if runtime_rerouted or identity_index > 0
+            else candidate_gate.reason
+        )
+        return replace(
+            candidate_gate,
+            action="reroute" if rerouted else candidate_gate.action,
+            reason=reason,
+            attempts=tuple(attempts),
+        )
+
+    reasons = [attempt.blocking_reason() for attempt in attempts]
+    reason = "runtime preflight blocked all candidates -- " + " | ".join(
+        item for item in reasons if item
     )
-    if projected_attempts:
-        gate = replace(gate, attempts=tuple(projected_attempts) + gate.attempts)
-    return gate
+    return runtime_preflight.DispatchGateDecision(
+        action="needs_human",
+        identity=None,
+        reason=reason,
+        result=attempts[-1],
+        attempts=tuple(attempts),
+    )
 
 
 def _record_resolved_model_chain(
@@ -11810,11 +12161,10 @@ def _dispatch_workflow_card(
     )
     if reusable and not retryable_latest:
         return reusable[-1]
-    # #569：reviewer 卡的強制重派要先回收被取代 job 的 sandbox。sandbox 目錄名是
-    # `sha256(run_id:card:candidate)`（見 `_create_reviewer_sandbox`），重派同一
-    # 張卡＋同一個 candidate 必然撞上「stale reviewer sandbox requires
-    # reconciliation」而派不出去。`require_candidate_unchanged=True` 讓「reviewer
-    # 動過 candidate」fail closed——重派不得成為蓋掉這個事實的名義。刻意只掛在
+    # #569：reviewer 卡的強制重派要先回收被取代 job 的 sandbox。sandbox 目錄名
+    # 現在以 `sha256(run_id:card:candidate:job_id)` 綁 job；legacy
+    # `sha256(run_id:card:candidate)` 名只保留為容忍／回收面。`require_candidate_unchanged=True`
+    # 讓「reviewer 動過 candidate」fail closed——重派不得成為蓋掉這個事實的名義。刻意只掛在
     # forced 路徑上：其餘既有路徑的 sandbox 已由 terminalize／resume 的既有回收
     # 點處理，行為一個字節都不動。
     if force_new_card and matching and step.persona == "reviewer":
@@ -11822,6 +12172,12 @@ def _dispatch_workflow_card(
             matching[-1],
             coordinator_root=coordinator_root,
             require_candidate_unchanged=True,
+        )
+    if step.persona == "reviewer":
+        _reclaim_superseded_era_reviewer_sandboxes(
+            matching,
+            run=run,
+            coordinator_root=coordinator_root,
         )
     if matching and step.persona == "planner":
         _discard_failed_planner_sandbox(
@@ -12015,9 +12371,9 @@ def _dispatch_workflow_card(
             if publication is not None:
                 publication.commit()
             return None
-    # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
-    # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
-    # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。
+    # #262／#600 dispatch gate：在建立 worktree／sandbox／job row／model session 前，
+    # 驗證 card capability／provider 新鮮度，並探測 overlay Copilot 型號；沒有這些
+    # 檢查需求的 card 維持原有直通路徑。
     candidate_pool = _workflow_identity_candidates(run, step, identities)
     backoff_report = _executor_backoff_admission_report(
         candidate_pool,
@@ -12267,9 +12623,10 @@ def _dispatch_workflow_card(
                 run, builder_jobs=builder_jobs, card=step.card
             )
         else:
-            # 首張 build 卡：#208 收口 wiring 5（#211 閉環）——凍結集存在時必須以
-            # frozen_readiness["base_sha"] 為基底，不得讓 dispatch 自行重新推導一個
-            # 可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2 的 stale-base 缺陷）。
+            # 尚未錨定 Candidate 的 build 卡：#208 收口 wiring 5（#211 閉環）——
+            # 凍結集存在時必須以 frozen_readiness["base_sha"] 為基底，不得讓 dispatch
+            # 自行重新推導一個可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2
+            # 的 stale-base 缺陷）。
             build_base_sha = None
             if isinstance(run.frozen_readiness, dict):
                 candidate_base_sha = run.frozen_readiness.get("base_sha")
@@ -12350,6 +12707,7 @@ def _dispatch_workflow_card(
                 candidate_root=reviewer_target,
                 coordinator_root=coordinator_root,
                 input_snapshot=input_snapshot,
+                job_id=reserved_job_id,
             )
             sandbox_hash = planning_runtime._tree_snapshot(reviewer_target)
             repo_root = str(reviewer_target)
@@ -12495,6 +12853,7 @@ def _dispatch_workflow_card(
             str(job["job_id"]),
             executor=identity.executor,
             model_id=identity.model_id,
+            executable=handle.executable,
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,
@@ -14728,7 +15087,14 @@ def apply_workflow_action(
                 if kind in by_kind
             ),
             gate_status=gate_status,
-            candidate_head=candidate,
+            # #556：forbidden build 卡（例如 worktree-isolation）只檢查工作區，
+            # 不產生可綁定的 Candidate。保留既有值；首張允許 commit 的卡通過採信
+            # 後才把它驗證過的 exact HEAD 綁到 run。
+            candidate_head=(
+                current.candidate_head
+                if current.current_phase == "build" and step.commit_policy == "forbidden"
+                else candidate
+            ),
             verified_head=verified,
             facets=facets,
             evidence_refs=facets_evidence_refs,

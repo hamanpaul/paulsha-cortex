@@ -17,6 +17,7 @@ from .._yaml import YAMLError, safe_load
 from . import completion
 from . import executor_backoff
 from . import provider_outcome
+from . import review as foreign_review
 from . import verification
 from .contract_command import build_dispatch_prompt
 from .diagnostics import DiagnosticReason, diagnostic_reason
@@ -710,6 +711,17 @@ def dispatch_ready(
             # inputs、建立 registry row 或碰 workspace。
             owner_identity = _confirmed_owner_identity(m, slice_id=slice_id)
             pinned_inputs = pin_dispatch_inputs(m)
+            verification_contract = pinned_inputs.get("verification")
+            review_policy = (
+                verification_contract.get("review_policy")
+                if isinstance(verification_contract, dict)
+                else None
+            )
+            if persona == "builder" and review_policy != "not-required":
+                # #492：required foreign review 的 tier 設定在 builder 派工前驗證，
+                # 避免候選與完整測試都完成後才因缺 tier 落入 needs_human。
+                repo_root = _infer_repo_root(Path(pinned_inputs["spec_path"]))
+                foreign_review.read_repo_tier(repo_root)
             # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查
             # 或 base_sha 解析若晚點失敗，slice 落 needs_human 後 dispatch_base 不會
             # 再被更新（見下方 _mark_slice_needs_human），故先嘗試取現有 branch head
@@ -1463,7 +1475,7 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
     """Fill in the launch handle on the pre-launch job row."""
     registry = getattr(dispatcher, "_registry", None)
     if registry is None or "job_id" not in job:
-        return {
+        attached = {
             **job,
             "executor": handle.executor,
             "session_name": handle.session_name,
@@ -1477,9 +1489,13 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
             "prompt_path": handle.prompt_path,
             "control_log_path": handle.control_log_path,
         }
+        if handle.executable is not None:
+            attached["executable"] = handle.executable
+        return attached
     kwargs = {
         "executor": handle.executor,
         "model_id": handle.model_id,
+        "executable": handle.executable,
         "session_name": handle.session_name,
         "pid": handle.pid,
         "log_path": handle.log_path,

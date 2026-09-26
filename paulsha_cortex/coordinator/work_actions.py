@@ -2229,6 +2229,143 @@ def _review_attest_action(
     return {"action": "review-attested", "head": run.candidate_head, **record}
 
 
+_VERIFY_ATTEST_SCOPED_COMMAND_RE = re.compile(
+    r"\.py\b|::|(?:^|\s)-k(?:\s|=|$)|--deselect\b|--lf\b|--last-failed\b|--co\b|--collect-only\b"
+)
+
+
+def _verify_attest_command_is_scoped(command: str) -> bool:
+    """#882：verify-attest 只接受 full suite；指定單檔、node id、-k 等縮小範圍的指令一律拒絕。"""
+
+    return _VERIFY_ATTEST_SCOPED_COMMAND_RE.search(command) is not None
+
+
+def _verify_attest_action(
+    *,
+    args: dict[str, Any],
+    requested_by: str,
+    authority,
+    now_epoch: float,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """以 operator evidence 覆核被阻塞的 verify 階段，並綁定 exact Candidate。"""
+
+    allowed = {
+        "action",
+        "repo",
+        "work_id",
+        "actor",
+        "expected_candidate",
+        "full_suite_command",
+        "result_summary",
+    }
+    extras = set(args) - allowed
+    if extras:
+        raise ValueError(f"verify-attest rejects caller evidence/input: {sorted(extras)[0]}")
+    actor = args.get("actor")
+    expected_candidate = args.get("expected_candidate")
+    full_suite_command = args.get("full_suite_command")
+    result_summary = args.get("result_summary")
+    if (
+        not isinstance(actor, str)
+        or not actor.strip()
+        or len(actor) > 128
+        or "\n" in actor
+        or not isinstance(expected_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(expected_candidate) is None
+        or not isinstance(full_suite_command, str)
+        or not full_suite_command.strip()
+        or len(full_suite_command) > 4000
+        or "\x00" in full_suite_command
+        or not isinstance(result_summary, dict)
+        or set(result_summary) != {"passed", "failed"}
+        or type(result_summary.get("passed")) is not int
+        or result_summary["passed"] <= 0
+        or type(result_summary.get("failed")) is not int
+        or result_summary["failed"] != 0
+        or _verify_attest_command_is_scoped(full_suite_command)
+        or not isinstance(now_epoch, (int, float))
+        or isinstance(now_epoch, bool)
+        or not math.isfinite(float(now_epoch))
+    ):
+        raise ValueError("verify-attest payload invalid")
+
+    _state, active, run = _load_work_run(
+        state_path=state_path,
+        workflow_registry=workflow_registry,
+        authority=authority,
+    )
+    _validate_current_run_authority(active, authority, run)
+    if (
+        run.status != "ongoing"
+        or run.current_phase != "verify"
+        or "needs_human" not in run.facets
+    ):
+        raise RuntimeError("verify-attest requires needs_human verify-phase workflow")
+    if (
+        not isinstance(run.candidate_head, str)
+        or verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is None
+        or run.candidate_head.lower() != expected_candidate.lower()
+    ):
+        raise RuntimeError("verify-attest expected Candidate CAS mismatch")
+    if not any(step.phase == "verify" for step in run.steps):
+        raise RuntimeError("verify-attest requires verify-phase steps")
+    if any(
+        step.phase == "build" and step.gate_result != "passed"
+        for step in run.steps
+    ) or not any(step.phase == "build" for step in run.steps):
+        raise RuntimeError("verify-attest requires completed build phase")
+    from .registry import ACTIVE_JOB_STATUSES
+
+    jobs = workflow_registry.list_jobs()
+    if any(
+        not isinstance(job, dict)
+        or (
+            job.get("workflow_run_id") == run.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+        )
+        for job in jobs
+    ):
+        raise RuntimeError("verify-attest refuses active workflow job or malformed job row")
+
+    candidate = run.candidate_head.lower()
+    body = {
+        "schema": "cortex-verify-attestation/v1",
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "run_id": run.run_id,
+        "authority_digest": work_authority_digest(authority),
+        "candidate": candidate,
+        "actor": actor.strip(),
+        "requested_by": requested_by,
+        "full_suite_command": full_suite_command.strip(),
+        "result_summary": {
+            "passed": result_summary["passed"],
+            "failed": result_summary["failed"],
+        },
+        "attested_at_epoch": float(now_epoch),
+    }
+    record = _write_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="verify-attest",
+        label="verify-attest",
+        max_size=16_384,
+    )
+    updated = workflow_registry._manager_advance_verify_attest(
+        run.run_id,
+        expected_candidate=candidate,
+        evidence_ref=record["ref"],
+    )
+    return {
+        "action": "verify-attested",
+        "head": candidate,
+        "current_phase": updated.current_phase,
+        **record,
+    }
+
+
 _REVIEW_DISPOSITION_SCHEMA = "cortex-review-disposition/v1"
 
 
@@ -4383,8 +4520,9 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     - ``retry-build`` 只受理最後一張 builder 卡（tdd-red 是中段卡），且它是
       candidate 修復語意——會把該卡的 ``action`` 覆寫成 repair 文案，中段卡走那
       條路等於把卡片本身的指示抹掉。
-    - ``recover-pre-candidate`` 要求 null candidate（worktree-isolation 早已錨定
-      candidate）。
+    - ``recover-pre-candidate`` 要求 null candidate。``worktree-isolation`` 的
+      ``commit_policy=forbidden``，通過時不錨定 candidate；只有允許 commit 的 builder
+      卡完成採信後，這個 pre-candidate reset 才不再適用。
     - ``abandon`` 會燒掉合格的 RED commit 與一個世代。
 
     現場二（#569，**同一個 run** 的 verify phase）：verification job
@@ -6076,7 +6214,13 @@ def _close_delivered_action(
         expected_head=facts.pr_head,
     )
     if not gate.allowed:
-        raise RuntimeError(f"close-delivered remote closure blocked: {', '.join(gate.reasons)}")
+        reasons = list(gate.reasons)
+        if not facts.todo_complete:
+            reasons.append("todo-incomplete")
+        raise RuntimeError(f"close-delivered remote closure blocked: {', '.join(reasons)}")
+    # 外部交付的人工補記維持原本要求：mapped Todo 與 archived tasks 必須全勾。
+    if not facts.todo_complete:
+        raise RuntimeError("close-delivered remote closure blocked: todo-incomplete")
 
     source_revisions: dict[str, str] = {}
     for value in authority.source_revisions:
@@ -6713,9 +6857,10 @@ def _regenerate_gates_action(
     時 ledger 是 ``gates: []``，builder 交付的合格 RED commit 撞
     ``gate-ledger-missing-expected-gate``；operator 補上宣告並重啟之後，契約內
     卻沒有任何路徑能讓那份 ledger 重新產生——``resume`` 只是重讀同一份舊 ledger
-    再拒一次，``retry-build`` 只受理「最後一張 builder 卡」（tdd-red 是中段卡），
-    ``recover-pre-candidate`` 要求 null candidate（worktree-isolation 早已錨定
-    candidate）。唯一出路是 operator 手動跑 gate_ledger CLI。
+    再拒一次，``retry-build`` 只受理「最後一張 builder 卡」（tdd-red 是中段卡）。
+    ``recover-pre-candidate`` 只在尚未採信允許 commit 的 builder candidate 時
+    可用；它會重設 pre-candidate slice，不保留未採信工作區成果。唯一能只重跑 gate
+    而保留工作區的既有路徑，是 operator 手動跑 gate_ledger CLI。
 
     本動作把那個手動步驟收進契約，但**只重跑 gate、不改判**：它重新執行
     operator 宣告的 gate 命令、原子覆寫 ledger，然後就結束；run 仍停在
@@ -8717,6 +8862,7 @@ def execute_work_action(
         "close-delivered",
         "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+        "verify-attest",
         "review-disposition",
         "intake",
     }:
@@ -8894,6 +9040,15 @@ def execute_work_action(
             requested_by=requested_by,
             authority=authority,
             runner=runner,
+            now_epoch=now_epoch,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "verify-attest":
+        result = _verify_attest_action(
+            args=args,
+            requested_by=requested_by,
+            authority=authority,
             now_epoch=now_epoch,
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,

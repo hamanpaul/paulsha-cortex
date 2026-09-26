@@ -1,0 +1,1 @@
+- **#564**：gate ledger writer 返回後才寫入 wrapper sentinel，保留模型 exit code，避免 gate 執行中的 harvest 將缺少 ledger 誤判為終局；缺少 ledger 時維持 fail-closed。

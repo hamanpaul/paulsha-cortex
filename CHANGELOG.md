@@ -628,6 +628,18 @@
 
 ### Fixed
 
+- **#492 foreign review tier 前置檢查**：required review 的 builder slice 會在建立工作區與啟動 builder 前驗證 project policy tier；缺少或非法值會指出選定 manifest 路徑及允許值，無 manifest 時維持 `shareable` 預設。
+- **#571、#579 reviewer 路徑綁定**：review gate evaluation 檔名納入 candidate 短 SHA；reviewer sandbox 目錄名納入 job id，並於新 reviewer 派工前回收前代 claim era 已終止的孤兒 sandbox，回收失敗時記錄 warning 並繼續派工。
+- **#810 merge 後 Todo 勾選狀態僅供診斷**：已合併 WorkflowRun 的遠端結案與 Monitor 不再因 workstream Todo 未勾而阻擋有效交付；Todo 證據仍須存在且可讀，archived OpenSpec tasks 的完成要求維持不變。
+- **#564 gate ledger 與 completion sentinel 競態**：plain 與 publishing wrapper 都先保存模型 exit code，gate ledger writer 返回後才寫 sentinel，避免 harvest 在 gate 執行期間因 ledger 尚未落地而誤判終局；結束時仍還原模型 exit code，缺少 ledger 時維持 fail-closed。
+- **#600 overlay Copilot 模型可用性**：dispatch 建立 Job 前以限時短 prompt 探測 overlay 選出的模型；明確不可用時 reroute，CLI 無法判定時記錄診斷並照常派工。
+- **#556 worktree-isolation 不再提早綁定 Candidate**：`commit_policy=forbidden` 的 isolation 卡通過採信後維持 null candidate；第一張允許 commit 的 builder 卡採信後才綁定 exact HEAD，保留 `recover-pre-candidate` 的前置條件。
+- **#573 degraded 理由 invariant**：Monitor provider、runtime preflight 與 doctor 的 degraded／非 pass 輸出現在附帶既有 `DiagnosticReason` 的 reason、detail、source；新增 AST 掃描 invariant 與各路徑回歸測試，原有狀態判定不變。
+- **#897(1)／#937(1) 部分修正：**候選 harvest 會在更新來源 branch 前檢查所有 pinned planning 檔案；僅容忍 plan 類 `tasks.md`／`todo.md` 的 checkbox-only 差異，其他 bytes 差異拒收並指出檔案與雜湊前綴，缺檔則指出路徑。#897 其餘子項及 #937 其餘子項留待後續批次。
+- **#821 registry 持久化衛生**：相同 durable bytes 不再重寫；rollback 優先以硬連結保留舊狀態，不支援時退回複製；slice 的三種 history 預設限 500 筆，可由環境變數調整並累計截斷數；啟動時在 grace 與既有 transaction lock 保護下清理本目錄 stale tmp。
+- **#882 verify operator attestation**：新增 exact Candidate 綁定的 `verify-attest` work action，要求 operator 附 full-suite 指令與 passed/failed 摘要（failed 必須為 0），將 immutable evidence 寫入 registry 後推進 review；`review-attest` 維持 review-only。
+- **#481／#497 terminal job 重播**：`complete_tick` 只終局化仍綁定 slice 的 builder／reviewer；同 job manifest 已反映到 slice 時不再重驗，recovery 後的舊 job 保留稽核而不再寫 evidence 或回退 slice。state mutation 未落地時仍允許同 job 修復重試。
+- **#475 Claude executable 綁定**：model identity schema v4 可為 Claude 設定絕對 executable；launcher 與 doctor probe 共用並驗證該路徑，job 記錄保存解析後路徑，無效時不回退 PATH。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加

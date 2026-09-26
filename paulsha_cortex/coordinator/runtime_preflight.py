@@ -23,6 +23,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .diagnostics import DiagnosticReason
+
 __all__ = [
     "CAPABILITY_KINDS",
     "DEFAULT_PROBE_TIMEOUT_SECONDS",
@@ -190,6 +192,13 @@ class ProviderFreshness:
     ttl_seconds: float = DEFAULT_PROVIDER_TTL_SECONDS
     source: str = "snapshot"
     reason: str | None = None
+    diagnostic_reason: DiagnosticReason | None = None
+
+    def __post_init__(self) -> None:
+        if self.diagnostic_reason is not None and not isinstance(
+            self.diagnostic_reason, DiagnosticReason
+        ):
+            raise ValueError("provider freshness diagnostic_reason must be a DiagnosticReason")
 
     def age_seconds(self, *, now: float) -> float:
         return float(now) - float(self.observed_at)
@@ -207,6 +216,8 @@ class ProviderFreshness:
             "source": self.source,
             "reason": self.reason,
         }
+        if self.diagnostic_reason is not None:
+            payload["diagnostic_reason"] = self.diagnostic_reason.to_dict()
         if now is not None:
             payload["age_seconds"] = self.age_seconds(now=now)
             payload["fresh"] = self.is_fresh(now=now)

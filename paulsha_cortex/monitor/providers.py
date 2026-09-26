@@ -17,6 +17,7 @@ import yaml
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator import candidate_base
+from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
 from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
 
 from .git_mirror import (
@@ -118,6 +119,11 @@ class RepoWorkProvider:
                 diagnostics=(f"repo scan unavailable: {error}",),
                 sources=(),
                 observations={},
+                diagnostic_reason=diagnostic_reason(
+                    "repo-scan-unavailable",
+                    f"repo scan unavailable: {type(error).__name__}",
+                    source="monitor.RepoWorkProvider.scan",
+                ),
             )
         if collisions:
             return ProviderSnapshot(
@@ -131,6 +137,11 @@ class RepoWorkProvider:
                 ),
                 sources=sources,
                 observations=observations,
+                diagnostic_reason=diagnostic_reason(
+                    "active-archive-collision",
+                    "active/archive source collision",
+                    source="monitor.RepoWorkProvider.scan",
+                ),
             )
         return ProviderSnapshot(
             provider_id=self.provider_id,
@@ -461,6 +472,11 @@ class WorkflowRegistryProvider:
                 diagnostics=(f"workflow registry unavailable: {error}",),
                 sources=(),
                 observations={},
+                diagnostic_reason=diagnostic_reason(
+                    "workflow-registry-unavailable",
+                    f"workflow registry unavailable: {type(error).__name__}",
+                    source="monitor.WorkflowRegistryProvider.scan",
+                ),
             )
         return ProviderSnapshot(
             provider_id=self.provider_id,
@@ -1823,6 +1839,11 @@ class GitHubWorkProvider:
             revision=None,
             diagnostics=(diagnostic,),
             sources=(),
+            diagnostic_reason=diagnostic_reason(
+                "github-provider-unavailable",
+                diagnostic,
+                source="monitor.GitHubWorkProvider._failure",
+            ),
         )
 
 
@@ -2204,6 +2225,11 @@ class GitHubTerminalProvider:
             diagnostics=(diagnostic,),
             sources=(),
             observations={},
+            diagnostic_reason=diagnostic_reason(
+                "github-terminal-provider-unavailable",
+                diagnostic,
+                source="monitor.GitHubTerminalProvider._failure",
+            ),
         )
 
     def _mirror(self) -> LocalGitMirror:

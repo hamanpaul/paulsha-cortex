@@ -15,6 +15,11 @@ from typing import Callable, Mapping, Sequence
 from urllib.parse import quote
 from unittest.mock import patch
 
+from .coordinator.diagnostics import (
+    DiagnosticInvariantError,
+    DiagnosticReason,
+    diagnostic_reason,
+)
 from .github_rate_limit import is_rate_limit_signal
 from .monitor.socket_path import socket_path_fits, socket_path_limit_detail
 
@@ -33,18 +38,30 @@ class ProbeResult:
     status: str
     detail: str
     required: bool
+    diagnostic_reason: DiagnosticReason | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"pass", "warn", "fail"}:
             raise ValueError(f"invalid doctor probe status: {self.status}")
+        if self.status != "pass" and not isinstance(self.diagnostic_reason, DiagnosticReason):
+            raise DiagnosticInvariantError(
+                f"doctor probe {self.name} status={self.status} requires DiagnosticReason"
+            )
+        if self.status == "pass" and self.diagnostic_reason is not None:
+            raise DiagnosticInvariantError(
+                f"doctor probe {self.name} status=pass cannot carry DiagnosticReason"
+            )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "name": self.name,
             "status": self.status,
             "detail": self.detail,
             "required": self.required,
         }
+        if self.diagnostic_reason is not None:
+            payload["diagnostic_reason"] = self.diagnostic_reason.to_dict()
+        return payload
 
 
 @dataclass(frozen=True)
@@ -61,6 +78,23 @@ class DoctorReport:
             "ok": self.ok,
             "probes": [probe.to_dict() for probe in self.probes],
         }
+
+
+def _probe_result(name: str, status: str, detail: str, required: bool) -> ProbeResult:
+    structured_reason = None
+    if status != "pass":
+        structured_reason = diagnostic_reason(
+            f"doctor-{name}-{status}",
+            detail,
+            source=f"doctor.probe:{name}",
+        )
+    return ProbeResult(
+        name=name,
+        status=status,
+        detail=detail,
+        required=required,
+        diagnostic_reason=structured_reason,
+    )
 
 
 def _process(
@@ -99,21 +133,21 @@ def _gh_auth_probe(runner: Runner) -> ProbeResult:
     try:
         raw = runner(["gh", "auth", "status"], shell=False, capture_output=True, text=True, timeout=45)
     except Exception:
-        return ProbeResult("gh-auth", "fail", "authentication failed", True)
+        return _probe_result("gh-auth", "fail", "authentication failed", True)
     returncode = getattr(raw, "returncode", None)
     if returncode == 0:
-        return ProbeResult("gh-auth", "pass", "authenticated", True)
+        return _probe_result("gh-auth", "pass", "authenticated", True)
     stderr = getattr(raw, "stderr", "")
     stdout = getattr(raw, "stdout", "")
     message = "\n".join(value for value in (stderr, stdout) if isinstance(value, str))
     if is_rate_limit_signal(message):
-        return ProbeResult(
+        return _probe_result(
             "gh-auth",
             "warn",
             "GitHub rate limit exceeded -- wait for the window to reset before treating this as a credential failure",
             False,
         )
-    return ProbeResult("gh-auth", "fail", "authentication failed", True)
+    return _probe_result("gh-auth", "fail", "authentication failed", True)
 
 
 def _valid_repo(value: str | None) -> bool:
@@ -127,8 +161,8 @@ def _preflight_probe(env: Mapping[str, str]) -> ProbeResult:
     try:
         _load_runtime_preflight_command(env)
     except (ImportError, OSError, ValueError) as exc:
-        return ProbeResult("preflight", "fail", _preflight_failure_detail(exc), True)
-    return ProbeResult("preflight", "pass", "runtime validator accepted typed executable", True)
+        return _probe_result("preflight", "fail", _preflight_failure_detail(exc), True)
+    return _probe_result("preflight", "pass", "runtime validator accepted typed executable", True)
 
 
 def _preflight_failure_detail(exc: BaseException) -> str:
@@ -207,7 +241,7 @@ def _gate_declaration_probe(env: Mapping[str, str]) -> ProbeResult:
     except Exception:
         # Deck data unavailable/invalid is a different probe's business; never
         # let it masquerade as a gate declaration failure.
-        return ProbeResult(
+        return _probe_result(
             "gate-declarations",
             "warn",
             "packaged deck cards could not be read; gate declaration coverage not checked",
@@ -216,7 +250,7 @@ def _gate_declaration_probe(env: Mapping[str, str]) -> ProbeResult:
     try:
         declared = frozenset(declared_gate_names(env))
     except GateSpecError:
-        return ProbeResult(
+        return _probe_result(
             "gate-declarations",
             "fail",
             f"{GATE_ENV_PREFIX}* declaration is invalid (typed argv required, shell wrappers "
@@ -227,7 +261,7 @@ def _gate_declaration_probe(env: Mapping[str, str]) -> ProbeResult:
     missing = sorted(required - declared)
     if missing:
         example = f"{GATE_ENV_PREFIX}{missing[0].upper()}"
-        return ProbeResult(
+        return _probe_result(
             "gate-declarations",
             "fail",
             f"{GATE_ENV_PREFIX}* does not cover the gate(s) the deck's acceptance criteria "
@@ -238,14 +272,14 @@ def _gate_declaration_probe(env: Mapping[str, str]) -> ProbeResult:
             True,
         )
     if not declared:
-        return ProbeResult(
+        return _probe_result(
             "gate-declarations",
             "warn",
             f"no {GATE_ENV_PREFIX}* declared; the gate ledger will always be empty, so passed "
             "cards carry no independent evidence",
             False,
         )
-    return ProbeResult(
+    return _probe_result(
         "gate-declarations",
         "pass",
         f"{GATE_ENV_PREFIX}* declares {sorted(declared)} and covers the deck-required gate(s) "
@@ -263,8 +297,8 @@ def _identity_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
     except Exception as exc:
         # Catch identity validation failures broadly to avoid leaking runtime payloads
         # while preserving fail-closed behavior for unknown future errors.
-        return ProbeResult("model-identities", "fail", _identity_failure_detail(exc), True)
-    return ProbeResult(
+        return _probe_result("model-identities", "fail", _identity_failure_detail(exc), True)
+    return _probe_result(
         "model-identities",
         "pass",
         f"runtime-validated schema v{schema_version} with resolvable planning identity",
@@ -292,7 +326,7 @@ def _model_resolution_probe(env: Mapping[str, str], agents_root: Path) -> ProbeR
         registry = load_model_identities(config_root)
     except Exception:
         # registry 本身載不起來由 model-identities probe 負責報告，這裡不重複噪音。
-        return ProbeResult(
+        return _probe_result(
             "model-resolution",
             "fail",
             f"identity registry unavailable at {config_root}; see model-identities probe",
@@ -378,14 +412,14 @@ def _model_resolution_probe(env: Mapping[str, str], agents_root: Path) -> ProbeR
             )
     detail_tail = f"（config root: {config_root}）"
     if failures:
-        return ProbeResult(
+        return _probe_result(
             "model-resolution", "fail", "; ".join(failures) + detail_tail, True
         )
     if warnings:
-        return ProbeResult(
+        return _probe_result(
             "model-resolution", "warn", "; ".join(warnings) + detail_tail, False
         )
-    return ProbeResult(
+    return _probe_result(
         "model-resolution",
         "pass",
         "resolution chain consistent: " + ", ".join(summary) + detail_tail,
@@ -483,20 +517,65 @@ def _review_sandbox_probe(
 
         registry = load_model_identities(config_root)
     except (ImportError, OSError, ValueError):
-        return ProbeResult(
+        return _probe_result(
             "review-sandbox", "fail", "review identity registry unavailable", True
         )
+    configured_executable = next(
+        (
+            identity.executable
+            for identity in registry.identities
+            if identity.executor == "claude" and identity.executable is not None
+        ),
+        None,
+    )
     declared = any(
         identity.executor == "claude" and "review" in identity.capabilities
         for identity in registry.identities
     )
     if not declared:
-        return ProbeResult(
-            "review-sandbox", "warn", "no Claude review identity configured", False
+        if configured_executable is None:
+            return _probe_result(
+                "review-sandbox", "warn", "no Claude review identity configured", False
+            )
+        try:
+            from .coordinator.launcher import resolve_claude_executable
+
+            resolved_executable = resolve_claude_executable(configured_executable)
+        except ValueError as exc:
+            return _probe_result(
+                "review-sandbox",
+                "fail",
+                f"configured Claude executable invalid: {exc}",
+                True,
+            )
+        return _probe_result(
+            "review-sandbox",
+            "pass",
+            f"Claude executable {resolved_executable} configured; no review identity",
+            False,
         )
-    result = _review_sandbox_checks(env, runner=runner, live=live)
-    if result.status == "fail" and not _custom_overlay_declares_claude_review(config_root):
-        return ProbeResult(
+    # review 實際啟動用的是 claude review identity 自己的 executable（未綁定則走
+    # PATH）；不得拿 build identity 綁定的路徑代驗，否則 doctor 會假綠。
+    review_executable = next(
+        (
+            identity.executable
+            for identity in registry.identities
+            if identity.executor == "claude" and "review" in identity.capabilities
+        ),
+        None,
+    )
+    result = _review_sandbox_checks(
+        env,
+        runner=runner,
+        live=live,
+        claude_executable=review_executable,
+    )
+    if (
+        result.status == "fail"
+        and review_executable is None
+        and not _custom_overlay_declares_claude_review(config_root)
+    ):
+        return _probe_result(
             "review-sandbox",
             "warn",
             f"{result.detail} (packaged claude review identity is a candidate "
@@ -511,15 +590,32 @@ def _review_sandbox_checks(
     *,
     runner: Runner,
     live: bool,
+    claude_executable: str | None = None,
 ) -> ProbeResult:
     search_path = env.get("PATH")
+    if claude_executable is None:
+        claude = shutil.which("claude", path=search_path)
+    else:
+        try:
+            from .coordinator.launcher import resolve_claude_executable
+
+            claude = resolve_claude_executable(claude_executable)
+        except ValueError as exc:
+            return _probe_result(
+                "review-sandbox",
+                "fail",
+                f"configured Claude executable invalid: {exc}",
+                True,
+            )
     executables = {
         name: shutil.which(name, path=search_path)
         for name in REVIEW_SANDBOX_EXECUTABLES
+        if name != "claude"
     }
+    executables["claude"] = claude
     missing = [name for name, path in executables.items() if path is None]
     if missing:
-        return ProbeResult(
+        return _probe_result(
             "review-sandbox",
             "fail",
             f"missing required executable(s): {','.join(missing)}",
@@ -537,10 +633,10 @@ def _review_sandbox_checks(
         or version_match is None
         or tuple(int(part) for part in version_match.groups()) < (2, 1, 187)
     ):
-        return ProbeResult(
+        return _probe_result(
             "review-sandbox",
             "fail",
-            "Claude Code 2.1.187 or newer is required",
+            f"Claude Code 2.1.187 or newer is required at {claude}",
             True,
         )
     help_code, help_text = _process(runner, [claude, "--help"])
@@ -554,12 +650,15 @@ def _review_sandbox_checks(
         "--tools",
     }
     if help_code != 0 or any(flag not in help_text for flag in required_flags):
-        return ProbeResult(
-            "review-sandbox", "fail", "Claude review sandbox CLI surface unavailable", True
+        return _probe_result(
+            "review-sandbox",
+            "fail",
+            f"Claude review sandbox CLI surface unavailable at {claude}",
+            True,
         )
     dependency_commands = ([bwrap, "--version"], [socat, "-V"], [srt, "--version"])
     if any(_process(runner, list(argv))[0] != 0 for argv in dependency_commands):
-        return ProbeResult(
+        return _probe_result(
             "review-sandbox", "fail", "Claude sandbox dependency execution failed", True
         )
     if live:
@@ -580,7 +679,7 @@ def _review_sandbox_checks(
             ],
         )
         if smoke_code != 0:
-            return ProbeResult(
+            return _probe_result(
                 "review-sandbox", "fail", "native read-only sandbox smoke failed", True
             )
         try:
@@ -621,11 +720,14 @@ def _review_sandbox_checks(
         except (KeyError, OSError, TypeError, ValueError):
             unix_socket_code = 2
         if unix_socket_code != 0:
-            return ProbeResult(
+            return _probe_result(
                 "review-sandbox", "fail", "configured reviewer sandbox smoke failed", True
             )
-    return ProbeResult(
-        "review-sandbox", "pass", "Claude native Bash sandbox runtime ready", True
+    return _probe_result(
+        "review-sandbox",
+        "pass",
+        f"Claude executable {claude}: native Bash sandbox runtime ready",
+        True,
     )
 
 
@@ -798,7 +900,7 @@ def _service_environment_probe(
 ) -> tuple[ProbeResult, dict[str, str]]:
     if INSTANCE_RE.fullmatch(instance) is None:
         return (
-            ProbeResult("service-paths", "fail", "instance name is invalid", True),
+            _probe_result("service-paths", "fail", "instance name is invalid", True),
             _runtime_defaults(base_env, home=home, instance="cortex"),
         )
     timer = home / ".config" / "systemd" / "user" / f"{instance}-manager.timer"
@@ -812,7 +914,7 @@ def _service_environment_probe(
             raise FileNotFoundError("manager timer missing")
     except FileNotFoundError:
         return (
-            ProbeResult(
+            _probe_result(
                 "service-paths",
                 "fail" if live else "warn",
                 "managed service bootstrap path(s) missing",
@@ -822,11 +924,11 @@ def _service_environment_probe(
         )
     except (OSError, ValueError):
         return (
-            ProbeResult("service-paths", "fail", "managed bootstrap environment is invalid", True),
+            _probe_result("service-paths", "fail", "managed bootstrap environment is invalid", True),
             _runtime_defaults(base_env, home=home, instance=instance),
         )
     return (
-        ProbeResult("service-paths", "pass", "effective service environment is valid", live),
+        _probe_result("service-paths", "pass", "effective service environment is valid", live),
         effective,
     )
 
@@ -839,11 +941,11 @@ def _repo_identity_probe(effective: Mapping[str, str]) -> ProbeResult:
     repo_root_raw = effective.get("PSC_REPO_ROOT", "").strip()
     stamp = effective.get("PSC_REPO_IDENTITY", "").strip()
     if not repo_root_raw:
-        return ProbeResult(
+        return _probe_result(
             "repo-identity", "warn", "PSC_REPO_ROOT not set; identity drift not checked", False
         )
     if not stamp:
-        return ProbeResult(
+        return _probe_result(
             "repo-identity",
             "warn",
             "PSC_REPO_IDENTITY stamp missing (env predates #366 identity guard); "
@@ -853,18 +955,18 @@ def _repo_identity_probe(effective: Mapping[str, str]) -> ProbeResult:
     try:
         actual = _resolve_repo_identity(Path(repo_root_raw))
     except Exception:
-        return ProbeResult(
+        return _probe_result(
             "repo-identity", "warn", "unable to resolve current repo identity for PSC_REPO_ROOT", False
         )
     if actual != stamp:
-        return ProbeResult(
+        return _probe_result(
             "repo-identity",
             "fail",
             f"PSC_REPO_ROOT identity drift: recorded PSC_REPO_IDENTITY={stamp!r} but "
             f"PSC_REPO_ROOT={repo_root_raw!r} currently resolves to {actual!r}",
             True,
         )
-    return ProbeResult("repo-identity", "pass", "PSC_REPO_ROOT matches recorded PSC_REPO_IDENTITY stamp", False)
+    return _probe_result("repo-identity", "pass", "PSC_REPO_ROOT matches recorded PSC_REPO_IDENTITY stamp", False)
 
 
 # #371／#375：managed_env 的 `preserve_existing` 曾把 PSC_PROJECT_CONFIG_ROOT
@@ -904,7 +1006,7 @@ def _managed_path_drift_probe(
         if actual != derived:
             drifted.append(f"{key}: effective={actual} derived={derived}")
     if drifted:
-        return ProbeResult(
+        return _probe_result(
             "managed-path-drift",
             "fail",
             "managed path drift detected (rerun `cortex install service` to repair): "
@@ -912,7 +1014,7 @@ def _managed_path_drift_probe(
             True,
         )
     if missing:
-        return ProbeResult(
+        return _probe_result(
             "managed-path-drift",
             "warn",
             "managed path(s) not yet written by installer (legacy install predates this "
@@ -920,7 +1022,7 @@ def _managed_path_drift_probe(
             "to adopt): " + ", ".join(missing),
             False,
         )
-    return ProbeResult(
+    return _probe_result(
         "managed-path-drift",
         "pass",
         "managed paths match current PSC_AGENTS_ROOT-derived values",
@@ -934,7 +1036,7 @@ def _shared_project_config_root_probe(
     """Detect shared project config roots from local bootstrap env files only."""
     raw_root = effective.get("PSC_PROJECT_CONFIG_ROOT", "").strip()
     if not raw_root:
-        return ProbeResult(
+        return _probe_result(
             "shared-project-config-root",
             "pass",
             "PSC_PROJECT_CONFIG_ROOT is not set; shared-root check not applicable",
@@ -962,7 +1064,7 @@ def _shared_project_config_root_probe(
         name for name, candidate in owners.items() if candidate == project_root
     )
     if len(shared_instances) < 2:
-        return ProbeResult(
+        return _probe_result(
             "shared-project-config-root",
             "pass",
             "project config root is not shared by multiple local instances",
@@ -984,7 +1086,7 @@ def _shared_project_config_root_probe(
         if repo_paths
         else "repeated scan repos=unknown"
     )
-    return ProbeResult(
+    return _probe_result(
         "shared-project-config-root",
         "warn",
         f"project config root {project_root} is shared by instances "
@@ -1037,31 +1139,31 @@ def _monitor_path_probes(
 ) -> tuple[ProbeResult, ProbeResult]:
     state_root = Path(state_root).expanduser()
     if not state_root.is_absolute():
-        state = ProbeResult("monitor-state", "fail", "monitor state root must be absolute", True)
+        state = _probe_result("monitor-state", "fail", "monitor state root must be absolute", True)
     elif not _root_is_creatable(state_root):
-        state = ProbeResult("monitor-state", "fail", "monitor state root is not writable/creatable", True)
+        state = _probe_result("monitor-state", "fail", "monitor state root is not writable/creatable", True)
     else:
-        state = ProbeResult("monitor-state", "pass", "durable state root is writable/creatable", True)
+        state = _probe_result("monitor-state", "pass", "durable state root is writable/creatable", True)
 
     socket_path = Path(socket_path).expanduser()
     run_root = socket_path.parent
     if not socket_path.is_absolute():
-        monitor_socket = ProbeResult("monitor-socket", "fail", "monitor socket root must be absolute", True)
+        monitor_socket = _probe_result("monitor-socket", "fail", "monitor socket root must be absolute", True)
     elif not socket_path_fits(socket_path):
         # #608：`sun_path` 只有 108 bytes。超限時 bind/connect 會失敗成一句
         # 沒有數字的 `OSError`，在 live probe 下會被記成「socket 沒在聽」——
         # 與「monitor 根本沒跑」無法區分。在 live probe 之前先量，讓 doctor
         # 直接說出這是路徑長度的環境限制，附實際 byte 數。
-        monitor_socket = ProbeResult(
+        monitor_socket = _probe_result(
             "monitor-socket",
             "fail",
             socket_path_limit_detail(socket_path, role="monitor socket"),
             True,
         )
     elif not _root_is_creatable(run_root):
-        monitor_socket = ProbeResult("monitor-socket", "fail", "monitor socket root is not writable/creatable", True)
+        monitor_socket = _probe_result("monitor-socket", "fail", "monitor socket root is not writable/creatable", True)
     elif not live:
-        monitor_socket = ProbeResult("monitor-socket", "warn", "socket connectivity not probed", False)
+        monitor_socket = _probe_result("monitor-socket", "warn", "socket connectivity not probed", False)
     else:
         try:
             response = _request_runtime_monitor(
@@ -1069,9 +1171,9 @@ def _monitor_path_probes(
                 {"kind": "list_work_items", "states": [], "include_done": False, "explain": False},
             )
         except OSError:
-            monitor_socket = ProbeResult("monitor-socket", "fail", "monitor socket is not listening", True)
+            monitor_socket = _probe_result("monitor-socket", "fail", "monitor socket is not listening", True)
         except (ImportError, RuntimeError, ValueError):
-            monitor_socket = ProbeResult("monitor-socket", "fail", "monitor work API probe failed", True)
+            monitor_socket = _probe_result("monitor-socket", "fail", "monitor work API probe failed", True)
         else:
             data = response.get("data") if isinstance(response, dict) else None
             if (
@@ -1081,9 +1183,9 @@ def _monitor_path_probes(
                 or data.get("schema") != "cortex-work/v1"
                 or not isinstance(data.get("items"), list)
             ):
-                monitor_socket = ProbeResult("monitor-socket", "fail", "monitor work API protocol invalid", True)
+                monitor_socket = _probe_result("monitor-socket", "fail", "monitor work API protocol invalid", True)
             else:
-                monitor_socket = ProbeResult("monitor-socket", "pass", "cortex-work/v1 read API ready", True)
+                monitor_socket = _probe_result("monitor-socket", "pass", "cortex-work/v1 read API ready", True)
     return state, monitor_socket
 
 
@@ -1152,7 +1254,7 @@ def run_doctor(
             socket_path=Path(effective["PSC_RUN_ROOT"]) / "project-monitor.sock",
             live=False,
         )
-        socket_probe = ProbeResult(
+        socket_probe = _probe_result(
             "monitor-socket",
             "fail",
             "production Monitor config did not resolve a socket path",
@@ -1185,19 +1287,19 @@ def run_doctor(
     if not probe_live:
         probes.extend(
             (
-                ProbeResult("gh-auth", "warn", "live probe skipped", False),
-                ProbeResult("gh-permissions", "warn", "live probe skipped", False),
-                ProbeResult("auto-label", "warn", "live probe skipped", False),
-                ProbeResult("agy", "warn", "live probe skipped", False),
+                _probe_result("gh-auth", "warn", "live probe skipped", False),
+                _probe_result("gh-permissions", "warn", "live probe skipped", False),
+                _probe_result("auto-label", "warn", "live probe skipped", False),
+                _probe_result("agy", "warn", "live probe skipped", False),
             )
         )
         return DoctorReport(tuple(probes))
     if not _valid_repo(repo):
         probes.extend(
             (
-                ProbeResult("gh-auth", "fail", "--repo owner/name is required", True),
-                ProbeResult("gh-permissions", "fail", "repository unavailable", True),
-                ProbeResult("auto-label", "fail", "repository label unavailable", True),
+                _probe_result("gh-auth", "fail", "--repo owner/name is required", True),
+                _probe_result("gh-permissions", "fail", "repository unavailable", True),
+                _probe_result("auto-label", "fail", "repository label unavailable", True),
             )
         )
     else:
@@ -1211,7 +1313,7 @@ def run_doctor(
             payload, scopes = _parse_included_github_response(repo_stdout)
             permission = payload is not None and _github_write_capabilities_proven(payload, scopes)
         probes.append(
-            ProbeResult(
+            _probe_result(
                 "gh-permissions",
                 "pass" if permission else "fail",
                 (
@@ -1227,11 +1329,11 @@ def run_doctor(
             ["gh", "api", f"repos/{repo}/labels/{quote(AUTO_LABEL, safe='')}"],
         )
         probes.append(
-            ProbeResult("auto-label", "pass" if label_code == 0 else "fail", "auto label exists" if label_code == 0 else "auto label missing", True)
+            _probe_result("auto-label", "pass" if label_code == 0 else "fail", "auto label exists" if label_code == 0 else "auto label missing", True)
         )
     ready, _diagnostic = (agy_probe or _default_agy_probe)()
     probes.append(
-        ProbeResult("agy", "pass" if ready else "fail", "safe plan/sandbox capability ready" if ready else "safe agy capability unavailable", True)
+        _probe_result("agy", "pass" if ready else "fail", "safe plan/sandbox capability ready" if ready else "safe agy capability unavailable", True)
     )
     return DoctorReport(tuple(probes))
 

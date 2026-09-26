@@ -6,7 +6,9 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -34,6 +36,9 @@ from .workflow import (
 )
 
 COORDINATOR_STATE_SCHEMA_VERSION = 2
+DEFAULT_SLICE_HISTORY_LIMIT = 500
+MIN_REGISTRY_SWEEP_GRACE_SECONDS = 30.0
+_UNSET_HISTORY_LIMIT = object()
 
 VALID_JOB_STATUSES = frozenset({"dispatched", "running", "exited", "failed"})
 ACTIVE_JOB_STATUSES = frozenset({"dispatched", "running"})
@@ -1909,8 +1914,12 @@ def _state_revision(raw_bytes: bytes) -> str:
     return hashlib.sha256(raw_bytes).hexdigest()
 
 
+def _serialize_state_payload_text(payload: Mapping[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+
+
 def _serialize_state_payload(payload: Mapping[str, Any]) -> bytes:
-    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+    return _serialize_state_payload_text(payload).encode("utf-8")
 
 
 class RegistryRevisionConflict(RuntimeError):
@@ -2064,7 +2073,47 @@ def _validate_slice_job_ref_in_state(
 class JobRegistry:
     """Versioned coordinator state with atomic single-file persistence."""
 
-    def __init__(self, state_path: str | Path | None = None, seq_start: int = 0) -> None:
+    def __init__(
+        self,
+        state_path: str | Path | None = None,
+        seq_start: int = 0,
+        *,
+        history_limit: int | object = _UNSET_HISTORY_LIMIT,
+        sweep_grace_seconds: float = MIN_REGISTRY_SWEEP_GRACE_SECONDS,
+    ) -> None:
+        resolved_history_limit: int
+        if history_limit is _UNSET_HISTORY_LIMIT:
+            configured_limit = os.environ.get("PSC_COORDINATOR_SLICE_HISTORY_LIMIT")
+            if configured_limit is None:
+                resolved_history_limit = DEFAULT_SLICE_HISTORY_LIMIT
+            elif not re.fullmatch(r"[0-9]+", configured_limit):
+                raise ValueError(
+                    "PSC_COORDINATOR_SLICE_HISTORY_LIMIT 必須是正十進位整數"
+                )
+            else:
+                resolved_history_limit = int(configured_limit)
+                if resolved_history_limit <= 0:
+                    raise ValueError(
+                        "PSC_COORDINATOR_SLICE_HISTORY_LIMIT 必須是正十進位整數"
+                    )
+        elif (
+            isinstance(history_limit, bool)
+            or not isinstance(history_limit, int)
+            or history_limit <= 0
+        ):
+            raise ValueError("history_limit 必須為正整數")
+        else:
+            resolved_history_limit = int(history_limit)
+        if (
+            isinstance(sweep_grace_seconds, bool)
+            or not isinstance(sweep_grace_seconds, (int, float))
+            or not math.isfinite(sweep_grace_seconds)
+            or sweep_grace_seconds < MIN_REGISTRY_SWEEP_GRACE_SECONDS
+        ):
+            raise ValueError(
+                "sweep_grace_seconds 必須是有限數值且不得小於 "
+                f"{MIN_REGISTRY_SWEEP_GRACE_SECONDS:g} 秒"
+            )
         self._state_path = (
             Path(state_path).expanduser() if state_path is not None else _default_state_path()
         )
@@ -2082,6 +2131,12 @@ class JobRegistry:
         self._loaded_revision: str | None = None
         self._loaded_source_schema_version: int | None = None
         self._pending_previous_raw_bytes: bytes | None = None
+        self._history_limit = resolved_history_limit
+        self._sweep_grace_seconds = float(sweep_grace_seconds)
+        self._sweep_stale_temp_files(
+            now=time.time(),
+            grace_seconds=self._sweep_grace_seconds,
+        )
         self._load()
 
     def _record_loaded_snapshot(
@@ -2148,6 +2203,52 @@ class JobRegistry:
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+    def _temp_file_prefix(self) -> str:
+        """本 registry 專屬的暫存檔前綴，讓啟動 sweep 不會誤刪同目錄其他 registry 的檔案。"""
+
+        return f".{self._state_path.name}."
+
+    def _sweep_stale_temp_files(
+        self,
+        *,
+        now: float,
+        grace_seconds: float,
+    ) -> list[Path]:
+        """在載入前清掉本 registry 目錄中已過寬限期的暫存檔。"""
+
+        directory = self._state_path.parent
+        try:
+            if not directory.is_dir():
+                return []
+            # 與既有寫入共用 transaction lock；等待中 writer 完成後才檢查其暫存檔。
+            with self._hold_state_transaction_lock():
+                removed: list[Path] = []
+                cutoff = now - grace_seconds
+                try:
+                    entries = list(directory.iterdir())
+                except OSError:
+                    return []
+                for path in entries:
+                    # 只清本 registry 前綴的暫存檔；同目錄其他 registry 的暫存檔
+                    # 不受本 registry 的 transaction lock 保護，一律不碰。
+                    if not (
+                        path.name.startswith(self._temp_file_prefix())
+                        and path.name.endswith((".tmp", ".backup.tmp", ".rollback.bak"))
+                    ):
+                        continue
+                    try:
+                        file_stat = path.lstat()
+                        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_mtime >= cutoff:
+                            continue
+                        path.unlink()
+                    except OSError:
+                        continue
+                    removed.append(path)
+                return removed
+        except OSError:
+            # 清理失敗不應取代 _load() 原本的狀態檔讀取結果。
+            return []
 
     def _reload_if_changed(self) -> None:
         snapshot = self._read_durable_snapshot()
@@ -2371,7 +2472,9 @@ class JobRegistry:
         digest = hashlib.sha256(original).hexdigest()
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup = directory / f"{self._state_path.name}.v1.{timestamp}.{digest}.bak"
-        fd, tmp_name = tempfile.mkstemp(dir=str(directory), suffix=".backup.tmp")
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(directory), prefix=self._temp_file_prefix(), suffix=".backup.tmp"
+        )
         tmp = Path(tmp_name)
         try:
             with os.fdopen(fd, "wb") as handle:
@@ -2390,12 +2493,19 @@ class JobRegistry:
     def _write_payload_atomically(
         self,
         payload: dict[str, Any],
+        *,
+        serialized: str | None = None,
     ) -> _DurableStateSnapshot:
-        raw_bytes = _serialize_state_payload(payload)
+        serialized_text = (
+            serialized if serialized is not None else _serialize_state_payload_text(payload)
+        )
+        raw_bytes = serialized_text.encode("utf-8")
         previous_raw_bytes = self._pending_previous_raw_bytes
         directory = self._state_path.parent
         directory.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=str(directory), suffix=".tmp")
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(directory), prefix=self._temp_file_prefix(), suffix=".tmp"
+        )
         tmp = Path(tmp_name)
         backup: Path | None = None
         had_original = previous_raw_bytes is not None
@@ -2407,14 +2517,26 @@ class JobRegistry:
                 os.fsync(handle.fileno())
             if had_original:
                 backup_fd, backup_name = tempfile.mkstemp(
-                    dir=str(directory), suffix=".rollback.bak"
+                    dir=str(directory),
+                    prefix=self._temp_file_prefix(),
+                    suffix=".rollback.bak",
                 )
                 backup = Path(backup_name)
-                with os.fdopen(backup_fd, "wb") as handle:
-                    assert previous_raw_bytes is not None
-                    handle.write(previous_raw_bytes)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                os.close(backup_fd)
+                backup.unlink()
+                try:
+                    os.link(self._state_path, backup)
+                except OSError:
+                    fallback_fd = os.open(
+                        backup,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                    )
+                    with os.fdopen(fallback_fd, "wb") as handle:
+                        assert previous_raw_bytes is not None
+                        handle.write(previous_raw_bytes)
+                        handle.flush()
+                        os.fsync(handle.fileno())
             os.replace(tmp, self._state_path)
             replaced = True
             _fsync_directory(directory)
@@ -2458,6 +2580,8 @@ class JobRegistry:
 
     def _persist(self) -> None:
         payload = self._build_payload()
+        serialized = _serialize_state_payload_text(payload)
+        raw_bytes = serialized.encode("utf-8")
         try:
             with self._hold_state_transaction_lock():
                 current_snapshot = self._read_durable_snapshot()
@@ -2469,11 +2593,16 @@ class JobRegistry:
                         actual_revision=current_snapshot.revision,
                         state_path=self.canonical_state_path,
                     )
+                if current_snapshot.raw_bytes == raw_bytes:
+                    return
                 if self._loaded_source_schema_version == 1 and current_snapshot.raw_bytes is not None:
                     self._write_v1_backup(current_snapshot.raw_bytes)
                 self._pending_previous_raw_bytes = current_snapshot.raw_bytes
                 try:
-                    written_snapshot = self._write_payload_atomically(payload)
+                    written_snapshot = self._write_payload_atomically(
+                        payload,
+                        serialized=serialized,
+                    )
                 finally:
                     self._pending_previous_raw_bytes = None
                 if not isinstance(written_snapshot, _DurableStateSnapshot):
@@ -2505,6 +2634,7 @@ class JobRegistry:
             raise ValueError(f"coordinator 狀態檔 job kind 非法（fail-closed）: {self._state_path}")
         for field in (
             "executor", "session_name", "log_path", "model_id", "independence_domain",
+            "executable",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
             "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
             "workflow_sandbox_hash", "workflow_builder_job_id", "workflow_stage_execution_key",
@@ -2780,6 +2910,51 @@ class JobRegistry:
                 raise _contract_error("request-content-conflict", state_path=self._state_path, detail="consumption.job_id")
         return validated_job
 
+    def _validate_history_truncated(self, slice_row: Mapping[str, Any]) -> dict[str, int] | None:
+        if "history_truncated" not in slice_row:
+            return None
+        counters = slice_row["history_truncated"]
+        valid_keys = {"evidence_history", "evaluation_history", "actions"}
+        if not isinstance(counters, dict):
+            raise ValueError(
+                f"coordinator 狀態檔 history_truncated 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        validated: dict[str, int] = {}
+        for key, value in counters.items():
+            if (
+                key not in valid_keys
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError(
+                    "coordinator 狀態檔 history_truncated 欄位錯誤（fail-closed）: "
+                    f"{self._state_path}: {key}"
+                )
+            validated[key] = value
+        return validated
+
+    def _trim_slice_history(self, slice_row: dict[str, Any], key: str) -> None:
+        history = slice_row[key]
+        dropped = len(history) - self._history_limit
+        if dropped <= 0:
+            return
+        if self._history_limit == 1:
+            slice_row[key] = history[-1:]
+        else:
+            slice_row[key] = [history[0], *history[-(self._history_limit - 1) :]]
+        counters = slice_row.setdefault("history_truncated", {})
+        counters[key] = counters.get(key, 0) + dropped
+
+    def _append_bounded_history(
+        self,
+        slice_row: dict[str, Any],
+        key: str,
+        entry: dict[str, Any],
+    ) -> None:
+        slice_row[key].append(entry)
+        self._trim_slice_history(slice_row, key)
+
     def _validate_loaded_slice(self, slice_row: object, job_ids: set[str]) -> dict[str, Any]:
         if not isinstance(slice_row, dict):
             raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
@@ -2862,12 +3037,13 @@ class JobRegistry:
                 isinstance(item, dict) for item in slice_row[key]
             ):
                 raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
+        history_truncated = self._validate_history_truncated(slice_row)
         normalized_slice = _normalize_loaded_slice_verification(slice_row)
         additive_fields = _validate_optional_recovery_slice_fields(
             normalized_slice,
             state_path=self._state_path,
         )
-        return {
+        validated_slice = {
             **normalized_slice,
             "spec": dict(slice_row["spec"]),
             "plan": dict(slice_row["plan"]),
@@ -2879,6 +3055,11 @@ class JobRegistry:
             "actions": _copy_json_list(slice_row["actions"]),
             **additive_fields,
         }
+        if history_truncated is not None:
+            validated_slice["history_truncated"] = history_truncated
+        for key in ("evidence_history", "evaluation_history", "actions"):
+            self._trim_slice_history(validated_slice, key)
+        return validated_slice
 
     def _lookup_with_cross_instance_visibility(self, lookup: Callable[[], Any]) -> Any:
         expected_revision = self._loaded_revision
@@ -3746,6 +3927,7 @@ class JobRegistry:
         *,
         executor: str | None = None,
         model_id: str | None = None,
+        executable: str | None = None,
         session_name: str | None = None,
         pid: int | None = None,
         log_path: str | None = None,
@@ -3763,6 +3945,8 @@ class JobRegistry:
         job["executor"] = executor
         if model_id is not None:
             job["model_id"] = model_id
+        if executable is not None:
+            job["executable"] = executable
         job["session_name"] = session_name
         job["pid"] = pid
         job["log_path"] = log_path
@@ -4163,7 +4347,9 @@ class JobRegistry:
         slice_row["candidate"] = None
         slice_row["binding_revision"] = next_binding_revision
         applied_binding = _slice_binding_from_row(slice_row)
-        slice_row["actions"].append(
+        self._append_bounded_history(
+            slice_row,
+            "actions",
             {
                 "action": "recover-pre-candidate",
                 "actor": normalized_request["payload"]["actor"],
@@ -4172,7 +4358,7 @@ class JobRegistry:
                 "requested_at": normalized_request["payload"]["created_at"],
                 "at": completed_at,
                 "result": "recovery-complete",
-            }
+            },
         )
         slice_row["updated_at"] = completed_at
         completed_receipt = self._build_recovery_receipt(
@@ -4537,13 +4723,17 @@ class JobRegistry:
             slice_row["gate_state"] = gate_state
         if new_evidence_refs is not None:
             slice_row["current_evidence_refs"] = new_evidence_refs
-            slice_row["evidence_history"].append(
-                {"action": action, "actor": actor, "refs": new_evidence_refs, "at": _now_iso()}
+            self._append_bounded_history(
+                slice_row,
+                "evidence_history",
+                {"action": action, "actor": actor, "refs": new_evidence_refs, "at": _now_iso()},
             )
         if new_evaluation_refs is not None:
             slice_row["current_evaluation_refs"] = new_evaluation_refs
-            slice_row["evaluation_history"].append(
-                {"action": action, "actor": actor, "refs": new_evaluation_refs, "at": _now_iso()}
+            self._append_bounded_history(
+                slice_row,
+                "evaluation_history",
+                {"action": action, "actor": actor, "refs": new_evaluation_refs, "at": _now_iso()},
             )
         if candidate is not None:
             slice_row["candidate"] = candidate
@@ -4571,7 +4761,7 @@ class JobRegistry:
             action_entry["expected_binding_revision"] = normalized_expected_binding_revision
         if normalized_diagnostic_reason is not None:
             action_entry["diagnostic_reason"] = normalized_diagnostic_reason.to_dict()
-        slice_row["actions"].append(action_entry)
+        self._append_bounded_history(slice_row, "actions", action_entry)
         slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)
@@ -4994,6 +5184,65 @@ class JobRegistry:
                 current.frozen_readiness if frozen_readiness is None else frozen_readiness
             ),
             needs_human_reason=resolved_needs_human_reason,
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_advance_verify_attest(
+        self,
+        run_id: str,
+        *,
+        expected_candidate: str,
+        evidence_ref: str,
+    ) -> WorkflowRun:
+        """原子採信指定 Candidate 的 operator verify attestation 並推進至 review。"""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if (
+            current.status != "ongoing"
+            or current.current_phase != "verify"
+            or "needs_human" not in current.facets
+        ):
+            raise ValueError("verify-attest requires active needs_human verify workflow")
+        if (
+            not isinstance(expected_candidate, str)
+            or verification.SAFE_SHA_RE.fullmatch(expected_candidate) is None
+            or not isinstance(current.candidate_head, str)
+            or verification.SAFE_SHA_RE.fullmatch(current.candidate_head) is None
+            or current.candidate_head.lower() != expected_candidate.lower()
+        ):
+            raise ValueError("verify-attest Candidate CAS mismatch")
+        if not isinstance(evidence_ref, str) or not evidence_ref.strip():
+            raise ValueError("verify-attest evidence ref is required")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("verify-attest refuses active workflow job")
+        build_steps = [step for step in current.steps if step.phase == "build"]
+        verify_steps = [step for step in current.steps if step.phase == "verify"]
+        if not build_steps or any(step.gate_result != "passed" for step in build_steps):
+            raise ValueError("verify-attest requires completed build phase")
+        if not verify_steps:
+            raise ValueError("verify-attest requires verify-phase steps")
+
+        validate_workflow_phase_transition(current.current_phase, "review")
+        updated = replace(
+            current,
+            current_phase="review",
+            steps=tuple(
+                replace(step, gate_result="passed") if step.phase == "verify" else step
+                for step in current.steps
+            ),
+            verified_head=current.candidate_head.lower(),
+            facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            gate_status="running",
+            evidence_refs=tuple(dict.fromkeys((*current.evidence_refs, evidence_ref))),
+            needs_human_reason=None,
+            updated_at=_now_iso(),
         )
         self._workflows[index] = updated
         self._persist()

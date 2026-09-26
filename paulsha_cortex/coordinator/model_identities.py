@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 
 # #452 B：schema v3 新增封套四欄位＋profile_provenance（全選填）。v1/v2 檔案
 # 照載（缺省欄位由查表投影套 DEFAULT_ENVELOPE，見 project_envelope）。
-MODEL_IDENTITY_SCHEMA_VERSION = 3
-SUPPORTED_MODEL_IDENTITY_SCHEMAS = frozenset({1, 2, 3})
+MODEL_IDENTITY_SCHEMA_VERSION = 4
+SUPPORTED_MODEL_IDENTITY_SCHEMAS = frozenset({1, 2, 3, 4})
 # `agy models` 現在輸出 kebab id（例如 `gemini-3.1-pro-high`），不是顯示名。
 # 這裡的常數就是 registry 用來比對／查找的 canonical model_id，必須跟 CLI
 # 實際輸出一致，否則 probe_agy_capability 會字面比對失敗（issue #255）。
@@ -310,6 +310,8 @@ class ModelIdentity:
     operator_action: str | None = field(default=None, compare=False, hash=False)
     #: overlay 是否明示宣告本列覆寫同鍵 packaged 身分（#509「合法覆寫語意」）。
     override_packaged: bool = field(default=False, compare=False, hash=False)
+    #: Claude-compatible executable 綁定（schema v4）；未設定時維持既有 PATH 解析。
+    executable: str | None = None
 
     def legacy_dict(self) -> dict[str, str]:
         return {
@@ -323,6 +325,8 @@ class ModelIdentity:
         payload["capabilities"] = list(self.capabilities)
         if self.live_probe is not None:
             payload["live_probe"] = self.live_probe
+        if self.executable is not None:
+            payload["executable"] = self.executable
         if self.accepts_bands is not None:
             payload["accepts_bands"] = list(self.accepts_bands)
         if self.invariant_ceiling is not None:
@@ -385,6 +389,8 @@ class IdentityRegistry:
             # allow_envelope 參數預設 True，讓「封套欄位是 v3 才有的契約」只在
             # 檔案載入層成立、建構層可繞過）。
             allowed |= set(ENVELOPE_FIELDS) | {"profile_provenance"}
+        if int(schema_version) >= 4:
+            allowed.add("executable")
         for index, row in enumerate(rows):
             if not isinstance(row, Mapping):
                 raise ValueError(f"model-identities[{index}] must be an object")
@@ -411,6 +417,21 @@ class IdentityRegistry:
                 if live_probe_raw is None
                 else _nonempty(live_probe_raw, f"model-identities[{index}].live_probe")
             )
+            executable_raw = row.get("executable")
+            if "executable" in row:
+                if executor != "claude":
+                    raise ValueError(
+                        f"model-identities[{index}].executable is only supported for claude"
+                    )
+                executable = _nonempty(
+                    executable_raw, f"model-identities[{index}].executable"
+                )
+                if not Path(executable).is_absolute():
+                    raise ValueError(
+                        f"model-identities[{index}].executable must be an absolute path"
+                    )
+            else:
+                executable = None
             override_packaged = row.get("override_packaged", False)
             if not isinstance(override_packaged, bool):
                 raise ValueError(
@@ -435,6 +456,7 @@ class IdentityRegistry:
                     independence_domain=domain,
                     capabilities=capabilities,
                     live_probe=live_probe,
+                    executable=executable,
                     origin=origin,
                     override_packaged=override_packaged,
                     **envelope,

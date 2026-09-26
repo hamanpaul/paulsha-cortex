@@ -314,3 +314,13 @@ def git_origin(tmp_path: Path):
         return fixture
 
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _clear_model_availability_cache():
+    """#600 的探測快取是行程級狀態，測試間不得互相污染。"""
+    from paulsha_cortex.coordinator import executor_auth
+
+    executor_auth.clear_model_availability_cache()
+    yield
+    executor_auth.clear_model_availability_cache()

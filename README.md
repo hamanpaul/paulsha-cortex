@@ -407,7 +407,7 @@ cortex list --repo hamanpaul/paulsha-cortex --state on-going --explain
 cortex work show unified-work-lifecycle --repo hamanpaul/paulsha-cortex --json
 ```
 
-Monitor 只允許 override、frontmatter、GitHub closing reference 與通過typed refs驗證的workflow metadata提供 confirmed association；override exclusion 優先抑制所有同work的 confirmed edge。PR body、issue title、artifact／branch slug 等 fuzzy 訊號只顯示。未被 confirmed mapping 擁有的 archived OpenSpec 與 closed GitHub issue／PR 只提供終態證據，不會單獨建立 work item。`done` 的 Todo completion 只採遠端 default branch 的 Todo blob與 archived OpenSpec task checklist revision，不採本機 overlay；所有 mapped PR 都必須是至少雙 parent且可證明已進 default branch 的 merge commit，且 CompletionRecord 保存的 source revisions、PR candidate與merge revision必須逐一符合目前remote truth；所有 mapped OpenSpec refs 也必須完成 archive。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state並加上 degraded facet；`cortex-work/v1.hard_gates`只依查詢中的repo/work item authority關閉auto claim與merge，跨repo整體狀態另由`fleet_health`回報。
+Monitor 只允許 override、frontmatter、GitHub closing reference 與通過typed refs驗證的workflow metadata提供 confirmed association；override exclusion 優先抑制所有同work的 confirmed edge。PR body、issue title、artifact／branch slug 等 fuzzy 訊號只顯示。未被 confirmed mapping 擁有的 archived OpenSpec 與 closed GitHub issue／PR 只提供終態證據，不會單獨建立 work item。`done` 的 Todo 證據只採遠端 default branch blob與 archived OpenSpec task checklist revision，不採本機 overlay；Monitor 仍要求可驗證的遠端 Todo evidence，但 workstream Todo 未勾 checkbox 只供診斷，不阻擋有效 CompletionRecord 的 `done`；archived OpenSpec tasks 的完成要求維持不變；所有 mapped PR 都必須是至少雙 parent且可證明已進 default branch 的 merge commit，且 CompletionRecord 保存的 source revisions、PR candidate與merge revision必須逐一符合目前remote truth；所有 mapped OpenSpec refs 也必須完成 archive。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state並加上 degraded facet；`cortex-work/v1.hard_gates`只依查詢中的repo/work item authority關閉auto claim與merge，跨repo整體狀態另由`fleet_health`回報。
 
 Monitor 採 last-good 語意：workspace 或 project subtree 暫時無法讀取時，既有項目會保留並帶 `degraded` scan signal，不會發布 removal；只有後續成功掃描父層、確認項目真的消失時才移除。`poll_interval_seconds`、`rescan_interval_seconds` 與 `watch_debounce_ms` 必須全部大於零，錯誤設定會在 service 啟動前直接失敗。
 
@@ -544,7 +544,7 @@ actor/reason/CAS 重送會回報已完成且不新增 audit。
 
 `fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。共享 coordinator root 內的 `jobs.json` 另以 exact durable-byte SHA-256 revision ＋ canonical `jobs.json.transaction.lock` sidecar 做 compare-and-persist：stale request 不會被靜默重播，daemon 會先把 `RegistryRevisionConflict`（含 expected/actual revision 與 canonical path）持久化成 `done` error，再移除 request file。
 
-Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|retire-delivered|close-delivered|auto|review-attest|review-disposition|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，CLI 會拒絕 `expected_run_id`；`cortex run work retry-build` 使用 `--expected-candidate`，不接受共用旗標 `--expected-run-id`。`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord；終態化後也會逐 run reconcile planning transaction、回收 build worktree，並退役 build branch。有超出 base 的 branch commit 會先保留在 `archive/<work_id>-<shortsha>` tag。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|retire-delivered|close-delivered|auto|verify-attest|review-attest|review-disposition|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，CLI 會拒絕 `expected_run_id`；`cortex run work retry-build` 使用 `--expected-candidate`，不接受共用旗標 `--expected-run-id`。`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord；終態化後也會逐 run reconcile planning transaction、回收 build worktree，並退役 build branch。有超出 base 的 branch commit 會先保留在 `archive/<work_id>-<shortsha>` tag。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
 沒有 `WorkflowRun` 的管線外交付可用 `cortex work close-delivered <work-id> --repo <owner/repo> --actor <actor> --reason <reason>` 補建 immutable CompletionRecord。Manager 會重驗 issue、PR merge commit、OpenSpec archive、mapped Todo 與 archived OpenSpec tasks；所有既有 remote closure 條件通過才寫入 actor/reason 證據，命令不會建立 WorkflowRun。
 
@@ -570,7 +570,7 @@ Legacy headless builder 的 dispatch prompt 會帶入 Manager 解析後的 workt
 
 **#582 sandbox 工具中止分類**：終局 `subtype=error_during_execution` 且 `terminal_reason=aborted_tools` 表示工具鏈被外部生命週期中斷，分類為 `environment`／`tool_aborted`，可進入 bounded retry；這不同於維持 `unknown` 的一般 controller interruption。
 
-Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、Todo 與 CompletionRecord；若 work item 有 mapped OpenSpec，另要求 active OpenSpec 消失且 archive 成立。`mapped_openspec == ()` 時 remote closure 以 PR merged＋issue 全 closed＋Todo 全勾＋CompletionRecord 有效為準。部分完成不會提早標 `done`。
+Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、mapped Todo 存在且內容可讀、CompletionRecord；workstream Todo 未勾 checkbox 只作觀測，不阻擋 remote closure。若 work item 有 mapped OpenSpec，仍要求 active OpenSpec 消失且 archive 成立，archived tasks 仍須通過既有 archive gate；`mapped_openspec == ()` 時不要求 archive。其餘 closure 證據不成立時不會提早標 `done`。
 
 若舊版 `authority-restart` 已把 run reset 到 `verify`，但同一 run 的完整 merge authorization 與 delivery journal 仍確認 Candidate 已 merge，`resume` 會停止且不重派 verify，並提示 `cortex work <work-id> retire-delivered`。此出口保留退休／abandoned 語意，不代表 shipped completion。
 `close-delivered` 使用相同的 strict closure 條件，僅補足缺失的 operator CompletionRecord；遠端 issue、PR、OpenSpec 或 Todo 證據未全通過時不會結案。
@@ -580,7 +580,7 @@ Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit anc
 - 沒有 Web UI；任務意圖仍以 Markdown spec 維護。
 - Copilot finding 只允許兩輪 bounded fix/re-review；超過預算需由 operator recovery。Maintainer路徑仍要求ForeignReview、terminal-green checks與resolved/outdated threads。
 - verification 的 sanitized env 不等於 network / filesystem sandbox。
-- v1 自動 foreign review 限 `tier: shareable`。
+- v1 自動 foreign review 限 `tier: shareable`；required review 的 builder slice 會在派工前檢查所選 project policy 的 `tier`。manifest 缺少或填入非法值時會指出檔案路徑與允許值；完全沒有 manifest 時維持 `shareable` 預設。
 - merge commit 是目前受支援路徑；auto/squash/rebase/cherry-pick 會 fail-closed。
 - installer/service 尚無 periodic builder/reviewer model pin；需要固定 model 時，使用帶 `--model` / `--review-model` 的手動 `cortex tick`。
 
@@ -638,7 +638,7 @@ verification:
 
 Manager 在建立 worktree／sandbox／job row／model session **之前**，會依 card 宣告在
 「即將實際被使用的 executor 環境」執行低成本 preflight。card 未宣告任何 capability
-時 preflight 是 no-op，行為與先前相同。
+時 runtime capability 檢查是 no-op；overlay 選出的 Copilot identity 仍會接受下述模型探測。
 
 `paulsha_cortex/deck/data/cards.yaml` 的 card 可宣告 `runtime_capabilities`，形式為
 `<kind>:<name>`，kind 為 `module`／`executable`／`bridge`／`provider`：
@@ -674,6 +674,11 @@ source 與 reason；TTL 內直接採信，逾期的 degraded **不會**被當成
 | `stale_snapshot` | 快照逾期且無法探測，需刷新 | 否 |
 | `probe_inconclusive` | 探測 timeout／額度耗盡／無定論 | 否 |
 
+degraded 的 Monitor provider snapshot 與 runtime preflight provider freshness 另帶
+`diagnostic_reason` 物件，提供機器可讀 `reason`、人可讀 `detail` 與來源 `source`；
+`cortex doctor --json` 的非 pass probe 也以相同欄位呈現理由。這些診斷不改變原有
+status、hard block 或 reroute 判定。
+
 live probe 以 provider identity 為鍵共用 TTL 快取與 rate-limit 額度（沿用
 `claim_readiness` 的 `LiveProbeCache` 模式），同批次多張 card 對同一 provider 只探測
 一次。preflight 失敗時，Manager 會在既有 identity 順序與 independence domain 規則內
@@ -681,6 +686,12 @@ live probe 以 provider identity 為鍵共用 TTL 快取與 rate-limit 額度（
 `needs_human`（`reason` 形如 `runtime-preflight-capability_missing`，並保留 blocking
 finding 的診斷內容）。builder 候選會排除 zero-tool 的 `cg` executor。整個 gate 位於
 model session 建立之前，被擋下時 model invocation 維持 0。
+
+Manager 選到 operator overlay 中的 Copilot identity 時，會在建立 Cortex Job 前以
+`copilot -p`、指定 `--model` 與 10 秒上限送出一次短 prompt。CLI 明確回報該模型不可用時，
+會沿既有候選順序 reroute；若 CLI、認證或網路狀態無法判定，會記錄「模型可用性無法驗證」
+診斷並繼續派工。這不是 Job，也不建立 remote session 或 log directory；短 prompt 仍可能
+消耗一次 Copilot 請求。此探測只涵蓋 overlay Copilot 模型，不代表其他 executor 的可用性。
 
 `cortex inspect status` 會顯示缺少的 capability、使用中的 executor environment
 （名稱／interpreter／`PATH`／`HOME`）與每個 provider 的 snapshot 新鮮度
@@ -691,7 +702,7 @@ model session 建立之前，被擋下時 model invocation 維持 0。
 `PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`：
 
 ```yaml
-schema_version: 2
+schema_version: 4
 identities:
   - executor: agy
     model_id: gemini-3.1-pro-high
@@ -706,12 +717,13 @@ identities:
     model_id: "<reviewer-model-id>"
     independence_domain: "<different-reviewer-domain>"
     capabilities: [planning, review]
+    executable: /opt/cortex/bin/claude-compatible
 ```
 
-- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 提供 canonical agy 候選；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。`cortex doctor` 依解析政策確認至少有一個可用的 planning identity，不要求部署保留 canonical agy；agy discovery 與 smoke probe 只判定 agy 是否可用。
+- schema v1–v3 仍可讀取；schema v2 起可設 `capabilities` / `live_probe`，schema v3 起可設封套欄位，schema v4 可為 Claude identity 選填 `executable` 絕對路徑。Claude job 與 `cortex doctor` 的 review-sandbox probe 共用該路徑；路徑必須指向一般可執行檔，無效時拒絕啟動且不回退 PATH，job 記錄保存解析後路徑。packaged registry 提供 canonical agy 候選；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。`cortex doctor` 依解析政策確認至少有一個可用的 planning identity，不要求部署保留 canonical agy；agy discovery 與 smoke probe 只判定 agy 是否可用。
 - planner/builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析；agy 只有在 `doctor --probe-live` 的 model discovery 與 plan/sandbox smoke 都吻合時才可用。
 - fanout/tick 明確指定的 builder `(executor, model_id)`，以及 spec frontmatter 成對宣告的 `executor`／`model_id`，都會先查這份 registry；unknown identity 會在派工前 fail-closed 並列出可用 candidates。
-- workflow reviewer 只會選擇明示 `capabilities: [review]` 且與會產出 Candidate commit 的 build card 不同 independence domain 的 schema v2 identity；`commit_policy=forbidden` 的隔離確認卡不計為 Builder；legacy v1 identity 只取得 planning capability，不能被猜成 reviewer。
+- workflow reviewer 只會選擇明示 `capabilities: [review]` 且與會產出 Candidate commit 的 build card 不同 independence domain 的 schema v2 以上 identity；`commit_policy=forbidden` 的隔離確認卡不計為 Builder；legacy v1 identity 只取得 planning capability，不能被猜成 reviewer。
 - Verify/Review 以 executor 的 enforced read-only mode在exact Candidate的remote-free disposable clone檢查；Claude reviewer固定使用`dontAsk`與`safe-mode`，只暴露OS-sandboxed Bash並要求structured JSON object，不載入Candidate `CLAUDE.md`/skills/plugins/MCP/remote session，也不進Plan Mode。Filesystem預設拒讀整個home、`/run/user`與Docker sockets，只重開Candidate與Python user-site工具鏈，並對Candidate clone設deny-write；review subprocess只保留`PATH`、`HOME`、locale、`TMPDIR`、`VIRTUAL_ENV`等非密鑰基礎環境，且不啟動login shell。Linux/WSL host必須安裝`bubblewrap`、`socat`與官方sandbox runtime（Ubuntu可用`sudo apt-get install bubblewrap socat`，再用`npm install -g @anthropic-ai/sandbox-runtime`）；任一依賴缺失、Unix-socket seccomp失效或命令要求unsandboxed fallback都拒絕啟動。Manager在所有terminal/launch failure/operator retry路徑重驗原Candidate完整tree snapshot後清除clone。agent只回傳substantive result、findings與inline report body；report僅能發布至phase專屬的`reports/verify/*.md`或`reports/review/*.md`，並由durable publication journal把多檔CAS、canonical evidence與registry bind組成可rollback/roll-forward的transaction。Manager會從durable Job注入Candidate、builder/reviewer job ID與launch identity，agent不取得report或Candidate寫入權。
 - `cortex doctor`會在identity registry配置Claude `review` capability時把Claude Code 2.1.187+、必要CLI flags、`bubblewrap`、`socat`與`srt`執行能力列為required probe；`--probe-live`另跑native read-only與Unix-socket seccomp smoke。沒有Claude reviewer的部署只顯示非必要warn。Claude的protected bind targets位於deterministic disposable session root，exact Candidate則固定在其無污染的`candidate/` checkout。
 - 同 domain、未知 identity、缺 model 都會得到 `foreign-review-absent`（fail-closed）。
@@ -811,10 +823,16 @@ cortex slice-action "$SLICE_ID" supersede    --actor "$ACTOR" \
 cortex work abandon "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
   --expected-run-id "$RUN_ID" --reason "$REASON"
 
+# verify 卡停在 needs_human 時，operator 以 exact Candidate 提交 full-suite 摘要：
+cortex work verify-attest "$WORK_ID" --repo "$REPO" \
+  --expected-candidate "$CANDIDATE" --actor "$ACTOR" --payload verify-attest.json
+
 # PR已建立且foreign review綁定current HEAD後，建立typed maintainer evidence：
 cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
   --payload review-attest.json
 ```
+
+`verify-attest.json` 接受 `{"full_suite_command":"python -m pytest -q","result_summary":{"passed":5987,"failed":0}}`。這是 operator 提交的測試命令與結果聲明，Manager 不會代跑該命令。Manager 只在 ongoing、停於 verify/needs_human、exact Candidate 相符、build 已通過且沒有 active job 時，寫入綁定 repo/work/run/authority/candidate 的 immutable evidence 並推進 review；review 與後續 ship gate 照常執行，`review-attest` 仍只處理 review。
 
 `review-attest.json`接受`{"verdict":"approved","summary":"...","findings":[]}`，並可選填 `evidence_refs`（只接受 `{"kind":"operator-reproduction","ref":"<absolute path>","sha256":"<64 hex>"}` 陣列）。path/hash 仍由 Manager 生成，caller 不得注入。若 work item 尚無 mapped PR，Manager 會在 `verified_head == candidate_head` 時先建立 `pr_number: null` 的 immutable maintainer evidence；後續 ship 建 PR 時再把它綁進 delivery gate。若已有 PR，Manager 仍會重讀 authenticated PR HEAD 並將 evidence 綁定 repo/work/run/authority/PR/candidate/actor。
 

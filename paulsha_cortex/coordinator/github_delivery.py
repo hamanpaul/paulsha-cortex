@@ -297,8 +297,7 @@ def evaluate_remote_closure(
             reasons.append("active-openspec-present")
         if not facts.archive_present:
             reasons.append("openspec-archive-missing")
-    if not facts.todo_complete:
-        reasons.append("todo-incomplete")
+    # merge 後的 Todo 勾選狀態保留為觀測事實，不作遠端結案門檻。
     if not facts.completion_record_valid:
         reasons.append("completion-record-invalid")
     normalized = _unique_reasons(reasons)

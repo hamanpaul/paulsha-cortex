@@ -2898,7 +2898,7 @@ def test_build_card_advances_candidate_only_to_exact_descendant_head(tmp_path: P
         pr_refs=(),
         attempts={"build": 1},
         gate_status="running",
-        candidate_head=base,
+        candidate_head=None,
     )
     log = tmp_path / "tdd-red.jsonl"
     log.write_text(json.dumps({
@@ -2994,6 +2994,114 @@ def test_build_card_advances_candidate_only_to_exact_descendant_head(tmp_path: P
             {**terminal, "subject_head": sibling},
             previous_candidate=candidate,
         )
+
+
+def test_forbidden_isolation_card_does_not_bind_pre_candidate_run(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "canary@example.invalid")
+    git("config", "user.name", "Canary")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    git("add", "README.md")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+
+    steps = _manifest().steps
+    isolation = next(step for step in steps if step.card == "worktree-isolation")
+    assert isolation.commit_policy == "forbidden"
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"build": 1},
+        gate_status="running",
+        candidate_head=None,
+    )
+    log = tmp_path / "worktree-isolation.jsonl"
+    log.write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": run.run_id,
+        "card_id": "worktree-isolation",
+        "candidate": base,
+        "outputs": [],
+    }) + "\n", encoding="utf-8")
+    job = registry.create_job(
+        task="wf-worktree-isolation",
+        persona="builder",
+        branch="feature/14-production-wiring",
+        pane="",
+        worktree=str(repo),
+        dispatch_head=base,
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain="openai",
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="worktree-isolation",
+        workflow_phase="build",
+        workflow_repo_root=str(repo),
+        source_revision=run.source_revision,
+    )
+    registry.attach_launch_handle(
+        job["job_id"],
+        executor="codex",
+        model_id="gpt-primary",
+        session_name="wf-worktree-isolation",
+        log_path=str(log),
+    )
+    _gate_ledger_passed(log)
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    terminal = manager.terminalize_workflow_job(
+        registry,
+        job_id=str(job["job_id"]),
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    manager.apply_workflow_action(
+        registry,
+        args={
+            "action": "advance",
+            "run_id": run.run_id,
+            "card_id": "worktree-isolation",
+            "job_id": terminal["job_id"],
+            "current_phase": "build",
+        },
+        identity_registry=IdentityRegistry.from_rows([{
+            "executor": "codex",
+            "model_id": "gpt-primary",
+            "independence_domain": "openai",
+            "capabilities": [],
+        }]),
+        coordinator_root=tmp_path / "coordinator",
+        trusted_terminal=True,
+    )
+
+    updated = registry.get_workflow_run(run.run_id)
+    assert updated.candidate_head is None
+    isolation_step = next(step for step in updated.steps if step.card == "worktree-isolation")
+    assert isolation_step.gate_result == "passed"
 
 
 def test_operator_resume_reconciles_brainstorm_artifact_authority_before_dispatch(
@@ -6178,6 +6286,8 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
     run = SimpleNamespace(run_id="workflow-review", candidate_head=candidate)
     step = SimpleNamespace(card="verification")
     coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    review_job_id = registry.reserve_job_id("review-mutation")
     sandbox, checkout = manager._create_reviewer_sandbox(
         run=run,
         step=step,
@@ -6185,6 +6295,7 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
         candidate_root=repo,
         coordinator_root=coordinator,
         input_snapshot=(),
+        job_id=review_job_id,
     )
     assert sandbox != repo
     assert subprocess.run(
@@ -6205,9 +6316,8 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
         ["git", "-C", str(checkout), "push", "origin", "HEAD:refs/heads/forbidden"],
         capture_output=True, text=True, check=False,
     ).returncode != 0
-    registry = JobRegistry(state_path=coordinator / "jobs.json")
     job = registry.create_job(
-        task="review-mutation", persona="reviewer", kind="review", branch="feature/work",
+        task="review-mutation", job_id=review_job_id, persona="reviewer", kind="review", branch="feature/work",
         pane="", worktree=str(sandbox), executor="claude", model_id="reviewer",
         independence_domain="anthropic", subject_head=candidate,
         workflow_run_id="workflow-review", workflow_claim_key="claim", workflow_repo="owner/repo",
@@ -6311,6 +6421,7 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     )
     registry.update_headless_result(builder["job_id"], status="exited", exit_code=0)
     verify_step = next(step for step in run.steps if step.card == "verification")
+    legacy_job_id = registry.reserve_job_id("wf-verification")
     sandbox, checkout = manager._create_reviewer_sandbox(
         run=run,
         step=verify_step,
@@ -6318,11 +6429,13 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
         candidate_root=repo,
         coordinator_root=coordinator,
         input_snapshot=(),
+        job_id=legacy_job_id,
     )
     log_root = coordinator / "logs" / "workflow"
     log_root.mkdir(parents=True)
     legacy = registry.create_job(
         task="wf-verification",
+        job_id=legacy_job_id,
         persona="reviewer",
         kind="review",
         branch="feature/14-production-wiring",
@@ -6470,11 +6583,19 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     assert resumed["job_id"] != legacy["job_id"]
     assert [row[0] for row in launched] == [resumed["job_id"]]
     assert '"candidate_checkout": "."' in launched[0][1]
-    assert launched[0][2] == str(sandbox)
     replacement = registry.get_job(resumed["job_id"])
-    assert Path(replacement["worktree"]) == sandbox
-    assert Path(replacement["workflow_input_root"]) == sandbox
-    assert sandbox.is_dir()
+    replacement_worktree = Path(str(replacement["worktree"]))
+    assert launched[0][2] == str(replacement_worktree)
+    assert replacement_worktree.parent == sandbox.parent
+    assert replacement_worktree.name == manager._reviewer_sandbox_name(
+        run_id=run.run_id,
+        card=verify_step.card,
+        candidate=candidate,
+        job_id=str(resumed["job_id"]),
+    )
+    assert Path(replacement["workflow_input_root"]) == replacement_worktree
+    assert replacement_worktree.is_dir()
+    assert not sandbox.exists()
     assert registry.get_job(legacy["job_id"])["workflow_evidence"] is None
 
 
@@ -6761,7 +6882,7 @@ def test_brainstorm_publication_reconciles_registry_commit_boundary(
     real_write = registry._write_payload_atomically
     failed = False
 
-    def fail_plan_transition(payload):
+    def fail_plan_transition(payload, **kwargs):
         nonlocal failed
         if not failed and any(
             row.get("current_phase") == "plan" and row.get("gate_refs")
@@ -6769,9 +6890,9 @@ def test_brainstorm_publication_reconciles_registry_commit_boundary(
         ):
             failed = True
             if commit_before_error:
-                real_write(payload)
+                real_write(payload, **kwargs)
             raise OSError("registry save fault")
-        real_write(payload)
+        real_write(payload, **kwargs)
 
     monkeypatch.setattr(registry, "_write_payload_atomically", fail_plan_transition)
     with pytest.raises(OSError, match="registry save fault"):

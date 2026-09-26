@@ -427,6 +427,10 @@ def _call_with_supported_kwargs(func, *args, **kwargs):
     return func(*args, **filtered_kwargs)
 
 
+def _resolve_launcher_compat(*args, **kwargs):
+    return _call_with_supported_kwargs(_resolve_launcher, *args, **kwargs)
+
+
 def _held_reasons(
     meta: dict[str, Any],
     is_satisfied: Callable[[str], bool],
@@ -670,24 +674,35 @@ def build_request_executor(
         requested_model = args.get("model", default_model)
         requested_review_executor = args.get("review_executor", default_review_executor)
         requested_review_model = args.get("review_model", default_review_model)
+        review_identity_registry = workflow_identity_registry
+        if (
+            review_identity_registry is None
+            and launcher is None
+            and requested_review_executor == "claude"
+            and isinstance(requested_review_model, str)
+            and requested_review_model
+        ):
+            review_identity_registry = load_model_identities()
         request_type = request["type"]
         needs_builder_identity_launcher = request_type in {"dispatch", "fanout", "tick"} or (
             request_type == "slice-action" and args.get("action") == "retry-build"
         )
-        active_review_launcher = _resolve_launcher(
+        active_review_launcher = _resolve_launcher_compat(
             requested_review_executor,
             launcher,
             allow_unsafe=allow_unsafe,
             model=requested_review_model,
+            identity_registry=review_identity_registry,
         )
         builder_identity_registry = None
         builder_launcher_factory = None
         if needs_builder_identity_launcher:
-            builder_launcher_factory = lambda identity: _resolve_launcher(
+            builder_launcher_factory = lambda identity: _resolve_launcher_compat(
                 identity.executor,
                 launcher,
                 allow_unsafe=allow_unsafe,
                 model=identity.model_id,
+                identity=identity,
             )
         if request_type in {"dispatch", "fanout", "tick"}:
             builder_identity_registry = workflow_identity_registry or load_model_identities()
@@ -712,11 +727,12 @@ def build_request_executor(
                 if state_path is not None
                 else paths.coordinator_root().resolve()
             )
-            launcher_factory = lambda identity: _resolve_launcher(
+            launcher_factory = lambda identity: _resolve_launcher_compat(
                 identity.executor,
                 launcher,
                 allow_unsafe=False,
                 model=identity.model_id,
+                identity=identity,
             )
             if args.get("action") == "resume":
                 extras = set(args) - {"action", "run_id"}
@@ -842,11 +858,12 @@ def build_request_executor(
                         if state_path is not None
                         else paths.coordinator_root().resolve()
                     )
-                    launcher_factory = lambda identity: _resolve_launcher(
+                    launcher_factory = lambda identity: _resolve_launcher_compat(
                         identity.executor,
                         launcher,
                         allow_unsafe=False,
                         model=identity.model_id,
+                        identity=identity,
                     )
                     if args.get("action") == "resume" and run.current_phase in {
                         "plan",
@@ -982,11 +999,12 @@ def build_request_executor(
                 expected_binding_revision=args.get("expected_binding_revision"),
                 specs_dir=request_specs_dir,
                 handoff_dir=request_handoff_dir,
-                launcher=_resolve_launcher(
+                launcher=_resolve_launcher_compat(
                     args.get("executor", default_executor),
                     launcher,
                     allow_unsafe=allow_unsafe,
                     model=requested_model,
+                    identity_registry=builder_identity_registry,
                 ),
                 review_launcher=active_review_launcher,
                 persona=persona,
@@ -1026,11 +1044,12 @@ def build_request_executor(
                 for job in registry.list_jobs()
             ):
                 raise ValueError("already-active")
-            active_launcher = _resolve_launcher(
+            active_launcher = _resolve_launcher_compat(
                 args.get("executor", default_executor),
                 launcher,
                 allow_unsafe=allow_unsafe,
                 model=requested_model,
+                identity_registry=builder_identity_registry,
             )
             backoff_skips: list[dict[str, Any]] = []
             dispatched = _call_with_supported_kwargs(
@@ -1074,11 +1093,12 @@ def build_request_executor(
                 result["requested_by"] = request["requested_by"]
             return result
         _refuse_unsafe_fanout(metas, predicate, allow_unsafe=allow_unsafe)
-        active_launcher = _resolve_launcher(
+        active_launcher = _resolve_launcher_compat(
             args.get("executor", default_executor),
             launcher,
             allow_unsafe=allow_unsafe,
             model=requested_model,
+            identity_registry=builder_identity_registry,
         )
         if request_type == "fanout":
             # issue #383：手動 `cortex fanout` 過去直接把全部 metas 餵給
@@ -1183,11 +1203,12 @@ def build_periodic_tick_runner(
 
     def execute() -> dict[str, Any]:
         identities = workflow_identity_registry or load_model_identities()
-        workflow_launcher_factory = lambda identity: _resolve_launcher(
+        workflow_launcher_factory = lambda identity: _resolve_launcher_compat(
             identity.executor,
             launcher,
             allow_unsafe=False,
             model=identity.model_id,
+            identity=identity,
         )
         registry = getattr(dispatcher, "_registry", None)
         auto_claim_error: str | None = None
@@ -1331,17 +1352,19 @@ def build_periodic_tick_runner(
                 model_id=default_model,
                 context="periodic tick 預設 identity 不存在於 registry",
             )
-        active_launcher = _resolve_launcher(
+        active_launcher = _resolve_launcher_compat(
             default_executor,
             launcher,
             allow_unsafe=default_allow_unsafe,
             model=default_model,
+            identity_registry=identities,
         )
-        active_review_launcher = _resolve_launcher(
+        active_review_launcher = _resolve_launcher_compat(
             default_review_executor,
             launcher,
             allow_unsafe=default_allow_unsafe,
             model=default_review_model,
+            identity_registry=identities,
         )
         run_tick_kwargs = {
             "metas": metas,
@@ -1353,11 +1376,12 @@ def build_periodic_tick_runner(
             "max_load": default_max_load,
             "reaper": reaper,
             "identity_registry": identities,
-            "launcher_factory": lambda identity: _resolve_launcher(
+            "launcher_factory": lambda identity: _resolve_launcher_compat(
                 identity.executor,
                 launcher,
                 allow_unsafe=default_allow_unsafe,
                 model=identity.model_id,
+                identity=identity,
             ),
             "spawn_admission": spawn_admission,
         }

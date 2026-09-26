@@ -525,6 +525,133 @@ def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
     assert "/var/run/docker.sock" not in configured_sandbox["filesystem"]["denyRead"]
 
 
+def test_review_sandbox_probe_uses_model_identity_executable_and_reports_provenance(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    executable = tmp_path / "claude-compatible"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    (config / "model-identities.yaml").write_text(
+        "schema_version: 4\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: local-reviewer\n"
+        "    independence_domain: local\n"
+        "    capabilities: [review]\n"
+        f"    executable: {executable}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: f"/tools/{name}",
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv, **_kwargs):
+        calls.append(list(argv))
+        if argv == [str(executable.resolve()), "--version"]:
+            return Result(raw="2.1.214 (Claude Code)\n")
+        if argv == [str(executable.resolve()), "--help"]:
+            return Result(
+                raw=" ".join(
+                    (
+                        "--disable-slash-commands",
+                        "--json-schema",
+                        "--permission-mode",
+                        "--safe-mode",
+                        "--setting-sources",
+                        "--settings",
+                        "--tools",
+                    )
+                )
+            )
+        return Result()
+
+    result = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/tools"},
+        tmp_path,
+        runner=runner,
+    )
+
+    assert result.status == "pass"
+    assert result.required is True
+    assert [str(executable.resolve()), "--version"] in calls
+    assert ["/tools/claude", "--version"] not in calls
+    assert str(executable.resolve()) in result.detail
+
+
+def test_review_sandbox_probe_does_not_fallback_from_invalid_bound_executable(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    missing = tmp_path / "missing-claude"
+    (config / "model-identities.yaml").write_text(
+        "schema_version: 4\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: local-reviewer\n"
+        "    independence_domain: local\n"
+        "    capabilities: [review]\n"
+        f"    executable: {missing}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: f"/tools/{name}",
+    )
+    calls: list[list[str]] = []
+
+    result = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/tools"},
+        tmp_path,
+        runner=lambda argv, **_kwargs: calls.append(list(argv)) or Result(),
+    )
+
+    assert result.status == "fail"
+    assert result.required is True
+    assert "configured Claude executable" in result.detail
+    assert not any(argv[0] == "/tools/claude" for argv in calls)
+
+
+def test_doctor_reports_bound_claude_executable_without_review_capability(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+
+    executable = tmp_path / "claude-compatible"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "claude",
+                "model_id": "local-builder",
+                "independence_domain": "local",
+                "capabilities": ["build"],
+                "executable": str(executable),
+            }
+        ],
+        schema_version=4,
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.model_identities.load_model_identities",
+        lambda *_args, **_kwargs: registry,
+    )
+
+    result = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(tmp_path / "config"), "PATH": "/tools"},
+        tmp_path,
+        runner=lambda *_args, **_kwargs: pytest.fail("review probe should not run"),
+    )
+
+    assert result.status == "pass"
+    assert result.required is False
+    assert str(executable.resolve()) in result.detail
+
+
 def test_review_sandbox_probe_rejects_unsupported_claude_version(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -1158,3 +1285,46 @@ def test_doctor_cli_json_and_help(monkeypatch, capsys) -> None:
     help_output = capsys.readouterr().out
     assert "--probe-live" in help_output
     assert "Monitor socket" in help_output
+
+
+def test_review_sandbox_probe_does_not_validate_review_with_build_executable(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """build identity 綁定 executable、review identity 走 PATH 時，不得拿 build 路徑代驗 review。"""
+    config = tmp_path / "config"
+    config.mkdir()
+    build_executable = tmp_path / "claude-build"
+    build_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    build_executable.chmod(0o755)
+    (config / "model-identities.yaml").write_text(
+        "schema_version: 4\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: local-builder\n"
+        "    independence_domain: local\n"
+        "    capabilities: [build]\n"
+        f"    executable: {build_executable}\n"
+        "  - executor: claude\n"
+        "    model_id: local-reviewer\n"
+        "    independence_domain: local-review\n"
+        "    capabilities: [review]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: None if name == "claude" else f"/tools/{name}",
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv, **_kwargs):
+        calls.append(list(argv))
+        return Result()
+
+    result = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/tools"},
+        tmp_path,
+        runner=runner,
+    )
+
+    assert result.status != "pass"
+    assert not any(str(build_executable.resolve()) in argv for argv in calls)
