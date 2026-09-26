@@ -499,6 +499,9 @@ def test_explicit_stop_preserves_state_and_operator_resume_is_idempotent(
     assert first["reason"] == "review-terminal-explicit-stop"
     assert second["reason"] == "review-terminal-explicit-stop"
     assert second["declared_status"] == "failed"
+    assert manager._malformed_workflow_card_terminal(
+        registry.get_job(review_job["job_id"])
+    ) is False
     persisted = registry.get_workflow_run(run.run_id)
     assert persisted.attempts == initial_attempts
     assert persisted.candidate_head == run.candidate_head
@@ -509,6 +512,97 @@ def test_explicit_stop_preserves_state_and_operator_resume_is_idempotent(
     entry = manager.workflow_status_entry(registry, persisted)
     assert {"abandon", "retry-card"}.issubset(set(entry["next_actions"]))
     assert dict(persisted.needs_human_reason)["evidence_refs"] == [str(log_path)]
+
+
+@pytest.mark.parametrize("phase", ("verify", "review"))
+@pytest.mark.parametrize("malformed_kind", ("empty", "banner"))
+def test_periodic_retry_bounds_malformed_reviewer_terminals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    malformed_kind: str,
+) -> None:
+    registry, run, initial_job, _authority_hashes, coordinator_root = _reviewer_terminal_fixture(
+        tmp_path,
+        current_phase=phase,
+        executor="claude",
+        model_id="claude-opus-5",
+        independence_domain="anthropic",
+    )
+    dispatched: list[str] = []
+
+    def write_malformed(job_id: str) -> None:
+        job = registry.get_job(job_id)
+        path = Path(job["log_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if malformed_kind == "empty":
+            path.write_text("", encoding="utf-8")
+        else:
+            path.write_text("Starting reviewer runtime...\nnot-json\n", encoding="utf-8")
+        registry.update_headless_result(job_id, status="exited", exit_code=0)
+
+    def fake_dispatch(dispatcher, *, run, retry_failed: bool, **_kwargs):
+        assert retry_failed is True
+        step = manager._current_workflow_step(run)
+        assert step is not None and step.phase == phase
+        previous_job_id = dispatched[-1] if dispatched else initial_job["job_id"]
+        previous = registry.get_job(previous_job_id)
+        replacement = registry.create_job(
+            task=step.card,
+            persona="reviewer",
+            kind="review",
+            branch="feature/work",
+            pane="",
+            worktree=str(previous["worktree"]),
+            dispatch_head=run.candidate_head,
+            executor="claude",
+            model_id="claude-opus-5",
+            independence_domain="anthropic",
+            subject_head=run.candidate_head,
+            workflow_run_id=run.run_id,
+            workflow_claim_key=run.claim_key,
+            workflow_repo=run.repo,
+            workflow_card=step.card,
+            workflow_phase=step.phase,
+            workflow_repo_root=run.workspace_root,
+            workflow_input_root=str(previous["workflow_input_root"]),
+            workflow_inputs=tuple(previous["workflow_inputs"]),
+            workflow_input_snapshot=tuple(previous["workflow_input_snapshot"]),
+            workflow_outputs=tuple(step.outputs),
+            workflow_output_baseline=tuple(previous["workflow_output_baseline"]),
+            workflow_builder_job_id=str(previous["workflow_builder_job_id"]),
+            source_revision=run.source_revision,
+        )
+        log_path = Path(replacement["worktree"]) / f"{replacement['job_id']}.jsonl"
+        registry.attach_launch_handle(replacement["job_id"], log_path=str(log_path))
+        dispatched.append(replacement["job_id"])
+        return registry.get_job(replacement["job_id"])
+
+    monkeypatch.setattr(manager, "dispatch_workflow_card", fake_dispatch)
+    initial_log = Path(initial_job["worktree"]) / f"{initial_job['job_id']}.jsonl"
+    registry.attach_launch_handle(initial_job["job_id"], log_path=str(initial_log))
+    write_malformed(initial_job["job_id"])
+
+    first = _resume(registry, run.run_id, coordinator_root=coordinator_root)
+    assert first["reason"] == "card-terminal-malformed-retry"
+    assert first["schema_retry_count"] == 1
+    assert first["job_id"] != initial_job["job_id"]
+
+    for expected_count in range(2, manager.terminal_contract.MAX_SCHEMA_RETRIES + 1):
+        write_malformed(str(first["job_id"]))
+        first = _resume(registry, run.run_id, coordinator_root=coordinator_root)
+        assert first["reason"] == "card-terminal-malformed-retry"
+        assert first["schema_retry_count"] == expected_count
+
+    write_malformed(str(first["job_id"]))
+    exhausted = _resume(registry, run.run_id, coordinator_root=coordinator_root)
+    assert exhausted["reason"] == "card-terminal-schema-retry-exhausted"
+    assert exhausted["schema_retry_count"] == manager.terminal_contract.MAX_SCHEMA_RETRIES
+    assert len(dispatched) == manager.terminal_contract.MAX_SCHEMA_RETRIES
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" in persisted.facets
+    retry_key = manager._schema_retry_attempt_key(initial_job["workflow_card"])
+    assert persisted.attempts[retry_key] == manager.terminal_contract.MAX_SCHEMA_RETRIES
 
 
 def test_periodic_runner_preserves_explicit_stop_reason(tmp_path: Path) -> None:
@@ -786,8 +880,57 @@ def test_counterexample_terminals_stay_fail_closed(
 
     assert _explicit_stop_gate_terminal(job) is None
     assert manager._retryable_nonpassing_workflow_terminal(job) is False
+    assert manager._malformed_workflow_card_terminal(job) is True
     with pytest.raises(ValueError):
         _resume(registry, run.run_id, coordinator_root=coordinator_root)
+
+
+@pytest.mark.parametrize(
+    ("phase", "payload"),
+    (
+        (
+            "verify",
+            _verification_payload(
+                status="verified",
+                summary="驗證完成",
+                details={"result": "passed"},
+            ),
+        ),
+        (
+            "review",
+            {
+                "schema_version": 1,
+                "kind": "workflow-review-result",
+                "reason": "accepted",
+                "findings": [],
+                "reports": [],
+                "authority_hashes": {
+                    "docs/superpowers/plans/reviewer-honest-stop-terminal.md": "0" * 64
+                },
+            },
+        ),
+    ),
+)
+def test_well_formed_gate_terminals_stay_outside_malformed_retry(
+    tmp_path: Path,
+    phase: str,
+    payload: dict[str, object],
+) -> None:
+    registry, _run, job, _authority_hashes, _coordinator_root = _reviewer_terminal_fixture(
+        tmp_path,
+        current_phase=phase,
+        executor="claude",
+        model_id="claude-opus-5",
+        independence_domain="anthropic",
+    )
+    _attach_terminal_log(
+        registry,
+        job,
+        log_path=_write_claude_terminal_log(job, payload),
+    )
+
+    assert manager._explicit_stop_gate_terminal(registry.get_job(job["job_id"])) is None
+    assert manager._malformed_workflow_card_terminal(registry.get_job(job["job_id"])) is False
 
 
 def test_plan_and_build_jobs_do_not_match_reviewer_explicit_stop_predicate(
