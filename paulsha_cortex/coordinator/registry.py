@@ -105,6 +105,7 @@ VALID_SLICE_STATES = frozenset(
         "completed",
         "needs_human",
         "failed",
+        "superseded",
     }
 )
 VALID_GATE_STATES = frozenset({"pending", "passed", "failed", "needs_human"})
@@ -124,7 +125,7 @@ SLICE_STATE_TRANSITIONS = {
     "reviewing": frozenset({"reviewing", "needs_human", "verified", "failed"}),
     "verified": frozenset({"verified", "completed", "needs_human"}),
     "completed": frozenset({"completed"}),
-    "needs_human": frozenset({"needs_human", "pending", "building", "reviewing", "verified", "failed", "completed"}),
+    "needs_human": frozenset({"needs_human", "pending", "building", "reviewing", "verified", "failed", "completed", "superseded"}),
     # "building" 併入 failed 的合法離開路徑（#382）：repin_slice() 刻意保留
     # slice state（同 needs_human 的既有行為，見
     # test_repin_slice_preserves_needs_human_until_explicit_retry_transition），
@@ -133,7 +134,8 @@ SLICE_STATE_TRANSITIONS = {
     # repin 前的原值直接轉成 "building"。needs_human 早就允許這條直接跳轉，
     # failed 原本沒有，導致 repin 成功後下一步 _mark_slice_building 仍會
     # raise，retry-build 整條路徑還是走不完。
-    "failed": frozenset({"failed", "pending", "needs_human", "building"}),
+    "failed": frozenset({"failed", "pending", "needs_human", "building", "superseded"}),
+    "superseded": frozenset({"superseded"}),
 }
 GATE_STATE_TRANSITIONS = {
     "pending": frozenset({"pending", "passed", "failed", "needs_human"}),
@@ -4442,10 +4444,36 @@ class JobRegistry:
         requested_at: str | None = None,
         consumed_at: str | None = None,
         result: str | None = None,
+        reason: str | None = None,
+        expected_binding_revision: int | None = None,
+        diagnostic_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
         if not isinstance(clear_builder_binding, bool) or not isinstance(clear_candidate, bool):
             raise ValueError("clear binding flags 必須為布林值")
+        normalized_diagnostic_reason = coerce_diagnostic_reason(diagnostic_reason)
+        if diagnostic_reason is not None and normalized_diagnostic_reason is None:
+            raise ValueError("diagnostic_reason 必須符合 DiagnosticReason 契約")
+        normalized_expected_binding_revision = None
+        if expected_binding_revision is not None:
+            normalized_expected_binding_revision = _require_safe_integer(
+                expected_binding_revision,
+                label="record_action.expected_binding_revision",
+                state_path=self._state_path,
+            )
+            if slice_row.get("binding_revision") != normalized_expected_binding_revision:
+                raise ValueError(
+                    "record_action expected_binding_revision mismatch: "
+                    f"expected={normalized_expected_binding_revision}, "
+                    f"actual={slice_row.get('binding_revision')}"
+                )
+        if reason is not None and (
+            not isinstance(reason, str)
+            or reason != reason.strip()
+            or not 1 <= len(reason) <= 500
+            or not reason.isprintable()
+        ):
+            raise ValueError("record_action reason 必須為 1–500 字可列印單行文字")
         previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
         staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
@@ -4535,6 +4563,12 @@ class JobRegistry:
             action_entry["consumed_at"] = consumed_at
         if result is not None:
             action_entry["result"] = result
+        if reason is not None:
+            action_entry["reason"] = reason
+        if normalized_expected_binding_revision is not None:
+            action_entry["expected_binding_revision"] = normalized_expected_binding_revision
+        if normalized_diagnostic_reason is not None:
+            action_entry["diagnostic_reason"] = normalized_diagnostic_reason.to_dict()
         slice_row["actions"].append(action_entry)
         slice_row["updated_at"] = _now_iso()
         self._persist()

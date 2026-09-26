@@ -129,12 +129,13 @@ cortex 既有命令面（`fanout/tick/complete/slice-action/work/status/jobs/sta
 
 | 命令 | 映射 |
 |---|---|
-| `recover slice <slice_id> <retry-build\|retry-verify\|retry-review\|abandon> --actor A [--wait]` | `slice-action` |
+| `recover slice <slice_id> <retry-build\|retry-verify\|retry-review\|abandon\|supersede> --actor A [--wait]` | `slice-action` |
 | `recover work <work_id> <retry-build\|resume\|abandon> --repo R [--wait]` | `work-action` |
 | `recover brokers reap [--apply]` | `reap-brokers` |
 | `recover service restart` | `service restart` 別名 |
 
 mutation 類輸出一律含 request_id。`--actor` 為必填（審計要求），不提供預設值。
+`supersede` 另需 `--reason R --expected-binding-revision N`，只對單筆沒有 in-flight job 的 slice 生效。
 
 ### 6.7 `cortex init-sample` — 第一個 sample workflow
 

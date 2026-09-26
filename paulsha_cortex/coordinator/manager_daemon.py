@@ -526,6 +526,7 @@ def build_runtime_status_provider(
             mirror_root=candidate_base.default_mirror_root(),
             git_runner=git_runner,
         )
+        manager.reconcile_building_slices(registry)
         metas = scan_specs_fn(specs_dir)
         predicate = lambda slice_id: autonomy.default_is_satisfied(
             slice_id,
@@ -962,6 +963,8 @@ def build_request_executor(
                 slice_id=slice_id,
                 action=action,
                 actor=actor,
+                reason=args.get("reason"),
+                expected_binding_revision=args.get("expected_binding_revision"),
                 specs_dir=request_specs_dir,
                 handoff_dir=request_handoff_dir,
                 launcher=_resolve_launcher(

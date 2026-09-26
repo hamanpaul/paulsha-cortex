@@ -15,7 +15,7 @@ porcelain 計畫（epic #84）B6：`cortex run` 與 `cortex recover` 家族—�
 
 ### recover 家族命令
 
-`cortex recover` SHALL 提供四個 mutation 子命令並映射既有復原 primitives：`slice <slice_id> <retry-build|retry-verify|retry-review|abandon> --actor A [--wait]` → `slice-action`；`work <work_id> <retry-build|resume|abandon> --repo R [--wait]` → `work-action`；`brokers reap [--apply]` → `reap-brokers`；`service restart` → B4 `service restart` 別名。`--actor` MUST 為必填，不提供預設值（審計要求）。
+`cortex recover` SHALL 提供四個 mutation 子命令並映射既有復原 primitives：`slice <slice_id> <retry-build|retry-verify|retry-review|abandon|supersede> --actor A [--wait]` → `slice-action`；`supersede` 另需 `--reason R --expected-binding-revision N`；`work <work_id> <retry-build|resume|abandon> --repo R [--wait]` → `work-action`；`brokers reap [--apply]` → `reap-brokers`；`service restart` → B4 `service restart` 別名。`--actor` MUST 為必填，不提供預設值（審計要求）。
 
 ### request_id 顯性化與 --wait
 

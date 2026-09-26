@@ -257,6 +257,32 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or not reason.isprintable()
             ):
                 raise ValueError(f"work-action {action} requires bounded reason")
+    elif req_type == "slice-action" and args.get("action") == "supersede":
+        actor = args.get("actor")
+        reason = args.get("reason")
+        expected_binding_revision = args.get("expected_binding_revision")
+        if (
+            not isinstance(actor, str)
+            or actor != actor.strip()
+            or not 1 <= len(actor) <= 128
+            or not actor.isprintable()
+        ):
+            raise ValueError("slice-action supersede requires bounded actor")
+        if (
+            not isinstance(reason, str)
+            or reason != reason.strip()
+            or not 1 <= len(reason) <= 500
+            or not reason.isprintable()
+        ):
+            raise ValueError("slice-action supersede requires bounded reason")
+        if (
+            not isinstance(expected_binding_revision, int)
+            or isinstance(expected_binding_revision, bool)
+            or expected_binding_revision < 1
+        ):
+            raise ValueError(
+                "slice-action supersede requires exact expected_binding_revision"
+            )
     requested_by = payload.get("requested_by")
     if not isinstance(requested_by, str) or not requested_by:
         raise ValueError("request requested_by must be a non-empty string")
