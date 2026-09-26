@@ -133,3 +133,55 @@ py`／`test_github_delivery_client.py`／`test_delivery_orchestrator.py`
 （148 個）與 `-k "delivery or remote_closure or retire"`（287 個）全數維持
 通過，確認未影響共用 gate（`evaluate_remote_closure`／
 `delivery._validate_work_authority`）對其他呼叫者的既有語意。
+
+對抗審查第七輪修正（BLOCKER：`live_receipt_validator` 從未接上 production
+caller）：`porcelain/delivery.py` 的 `cortex delivery gaps／reconcile` 是
+`inspect_delivery`／`reconcile_delivery` 唯一的 production caller，卻從未傳入
+`live_receipt_validator`；`refine-requirements-v1.json` 每條需求都把 `live`
+列為 required stage，因此即使 producer 交付合法 live receipt，也固定產生
+`governed-live-receipt-validator-unavailable`，已交付的需求永遠無法 `ready`。
+
+新增 `paulsha_cortex/coordinator/live_receipt_validators.py`：以
+`receipt["kind"]` 為 key 的封閉登記表，只認得本 repo 既有、可機械驗證的兩種
+live receipt kind，未登記 kind 一律 `False`（fail closed）：
+
+1. `cortex/deployment-canary-qualification/v1`：deployment-canary
+   `qualification.json`（`schema_version: 2`、`profile: deployment-canary`、
+   `status: passed`）；直接呼叫 `qualification/validate.py` 既有 `validate()`
+   做結構與 fail-closed 判定，不另寫一套，只額外綁定
+   `evidence.candidate_sha`／`evidence.wheel.sha256` 精確等於該需求 claim 的
+   `target.candidate_sha`／`target.artifact_sha256`。`qualification/` 不隨
+   wheel 一起發佈，lazy import 失敗一律 fail closed。
+2. `cortex/task-memory-live-canary/v1`：#857 task-memory canary evidence——
+   `passed: true`；`content_retrieval` 與 `paths.{context-delivered,
+   snapshot-ready,note-fetch}` 三個 delivery path 各自 `attempts ≥ 5` 且
+   `successes/attempts ≥ 0.95`（並重新驗算 `success_rate` 與
+   `attempts`/`successes` 一致）；`negative_controls` 覆蓋
+   `permission-denied` 與 `cross-scope-rejection` 兩個固定案例且
+   `status: passed`；`cross_project` 至少兩個不同 repo 且 `status: passed`；
+   `evidence.target` 必須與 receipt 外層已驗證的 target（同時期 #841
+   loaded-runtime receipt 的 artifact digest／source revision）逐欄位相等，
+   無法綁定即拒絕。
+
+`governed_live_receipt_validator` 只接收已由 `_verify_live` 驗過
+schema／hash／target／期限／authority／independence 的 receipt 物件（不拿
+`evidence_root`、不讀檔、不觸網），任何解析例外一律視為未通過；已接進
+`porcelain/delivery.py` 的 `common["live_receipt_validator"]`，是
+`inspect_delivery`／`reconcile_delivery` 目前唯一的 production caller。
+
+先以 RED 測試確認可重現：暫時把 `paulsha_cortex/porcelain/delivery.py` 還原
+成 `git show HEAD:` 版本、移除新模組，`tests/test_requirement_delivery.py`／
+`tests/test_requirement_delivery_cli.py` 因 `ImportError` 收集失敗（RED）；
+復原後 GREEN。新增 9 個 regression 測試（`test_requirement_delivery.py` 7
+個直接驗證封閉登記表：兩種 kind 的 ready、未知 kind、qualification
+候選 target 綁定不符、qualification 未通過、task-memory 低於門檻、
+task-memory target 綁定不符各一，加一個 receipt 檔案 hash 被竄改仍 fail
+closed 的 regression；`test_requirement_delivery_cli.py` 2 個端到端走
+`cortex delivery gaps` CLI 入口，monkeypatch 掉唯一會觸網／觸 loaded-runtime
+service 投影的邊界，其餘走 production code path，證明合法 fixture receipt
+真的能讓需求 `ready`，未知 kind 會產生具體 `failed` gap）。`README.md` 與
+`docs/superpowers/specs/requirement-delivery-accounting.md` 補上支援 kind
+與綁定規則表。`tests/test_requirement_delivery.py`／
+`test_requirement_delivery_cli.py`／`test_github_delivery_client.py`／
+`test_delivery_orchestrator.py`／`test_phase2_qualification.py`
+（218 個）與 `-k "delivery or qualification"`（444 個）全數通過。

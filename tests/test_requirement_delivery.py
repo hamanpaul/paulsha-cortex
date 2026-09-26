@@ -10,7 +10,7 @@ from threading import Barrier
 
 import pytest
 
-from paulsha_cortex.coordinator import completion, claim, review, verification
+from paulsha_cortex.coordinator import completion, claim, live_receipt_validators, review, verification
 from paulsha_cortex.coordinator.github_delivery import RemoteClosureFacts
 from paulsha_cortex import runtime_attestation
 from paulsha_cortex.coordinator.requirement_delivery import (
@@ -21,6 +21,7 @@ from paulsha_cortex.coordinator.requirement_delivery import (
     reconcile_delivery,
     validate_manifest,
 )
+from qualification.validate import REQUIRED_PROVIDERS
 
 
 HEAD = "1" * 40
@@ -1211,3 +1212,241 @@ def test_a12_true_completion_runtime_fixture_rebuilds_only_missing_index_entry(t
     assert len(resumed["index"]["mappings"]) == 1
     assert resumed["index"]["mappings"][0]["evidence"]["test"]["validator"] == "completion/v1"
     assert resumed["index"]["mappings"][0]["evidence"]["installed"]["validator"] == "loaded-runtime-attestation/v1"
+
+
+# --- #845 對抗審查 BLOCKER：`live_receipt_validator` 從未接上 production caller ------
+#
+# 下列測試改用 `live_receipt_validators.governed_live_receipt_validator`（實際
+# 掛進 `porcelain/delivery.py` 的同一顆 callable），不是 `_context()` 預設的
+# `lambda receipt: True` stub，證明封閉登記表本身可機械驗證 deployment-canary
+# qualification 與 #857 task-memory canary 兩種 receipt kind，並對未知 kind、
+# 內容綁定不符、canary 未通過與門檻不足各自 fail closed。
+
+
+def _qualification_payload(*, candidate_sha: str, wheel_sha256: str, status: str = "passed") -> dict:
+    providers = [
+        {
+            "provider": name,
+            "requested_model": model,
+            "runtime_model": model,
+            "requested_effort": effort,
+            "runtime_effort": effort,
+            "status": "passed",
+            "quota": "available",
+            "fallback": False,
+        }
+        for name, (model, effort) in REQUIRED_PROVIDERS.items()
+    ]
+    return {
+        "schema_version": 2,
+        "profile": "deployment-canary",
+        "status": status,
+        "candidate_sha": candidate_sha,
+        "wheel": {"filename": "paulsha_cortex-1.0.0-py3-none-any.whl", "sha256": wheel_sha256},
+        "bundle": {"sha256": "b" * 64},
+        "image": {"digest": "sha256:" + "c" * 64},
+        "services": [
+            {"name": "cortex-manager.service", "uid": 991, "gid": 991, "active": True},
+            {"name": "cortex-monitor.service", "uid": 991, "gid": 991, "active": True},
+            {"name": "cortex-egress-proxy.service", "uid": 950, "gid": 950, "active": True},
+        ],
+        "providers": providers,
+        "tests": [
+            {"name": "fresh-install", "status": "passed"},
+            {"name": "full-dispatch-closeout", "status": "passed"},
+        ],
+        "artifacts": [{"path": "evidence/summary.json", "sha256": "d" * 64}],
+    }
+
+
+def _rate_row(attempts: int, successes: int) -> dict:
+    return {"attempts": attempts, "successes": successes, "success_rate": successes / attempts}
+
+
+def _task_memory_payload(*, target: dict) -> dict:
+    return {
+        "schema": live_receipt_validators.KIND_TASK_MEMORY_LIVE_CANARY,
+        "passed": True,
+        "target": target,
+        "content_retrieval": _rate_row(40, 38),
+        "paths": {
+            "context-delivered": _rate_row(6, 6),
+            "snapshot-ready": _rate_row(20, 19),
+            "note-fetch": _rate_row(25, 24),
+        },
+        "negative_controls": [
+            {"case": "permission-denied", "status": "passed"},
+            {"case": "cross-scope-rejection", "status": "passed"},
+        ],
+        "cross_project": [
+            {"repo": "hamanpaul/paulsha-cortex", "status": "passed"},
+            {"repo": "hamanpaul/paulsha-hippo", "status": "passed"},
+        ],
+    }
+
+
+def _write_governed_live(
+    root: Path,
+    *,
+    requirement_id: str,
+    revision: str,
+    criterion_id: str,
+    kind: str,
+    evidence: dict,
+    target: dict,
+) -> dict:
+    payload = {
+        "schema": "cortex/live-canary-receipt/v1",
+        "result": "passed",
+        "requirement_id": requirement_id,
+        "requirement_revision": revision,
+        "acceptance_id": criterion_id,
+        "observed_at": "2026-09-25T00:00:00+00:00",
+        "target": target,
+        "authority": {"id": "release-operator", "version": "1", "receipt": "approval:123"},
+        "independence": {"canary_domain": "loaded-runtime", "review_domain": "reviewer-domain"},
+        "kind": kind,
+        "evidence": evidence,
+    }
+    path = root / f"live-governed-{requirement_id}-{abs(hash((kind, requirement_id, revision)))}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    return {"locator": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _governed_case(tmp_path: Path, *, kind: str, evidence_factory) -> tuple[dict, dict, dict]:
+    specs = [("R01", "r1")]
+    manifest = _manifest(tmp_path, specs)
+    snapshot = _snapshot(tmp_path, manifest, specs, with_live=False)
+    target = snapshot["mappings"][0]["target"]
+    live_ref = _write_governed_live(
+        tmp_path,
+        requirement_id="R01",
+        revision="r1",
+        criterion_id="R01-AC1",
+        kind=kind,
+        evidence=evidence_factory(target),
+        target=target,
+    )
+    snapshot["mappings"][0]["live_receipt"] = live_ref
+    context = _context(tmp_path, live_validator=live_receipt_validators.governed_live_receipt_validator)
+    return manifest, snapshot, context
+
+
+def test_a04_delivery_governed_qualification_live_receipt_reaches_ready(tmp_path: Path) -> None:
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=lambda target: _qualification_payload(
+            candidate_sha=target["candidate_sha"], wheel_sha256=target["artifact_sha256"]
+        ),
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] == "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "verified"
+
+
+def test_a04_delivery_governed_task_memory_live_receipt_reaches_ready(tmp_path: Path) -> None:
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_TASK_MEMORY_LIVE_CANARY,
+        evidence_factory=lambda target: _task_memory_payload(target=target),
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] == "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "verified"
+
+
+def test_a03_delivery_unknown_live_receipt_kind_is_rejected_fail_closed(tmp_path: Path) -> None:
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind="cortex/some-unregistered-kind/v1",
+        evidence_factory=lambda target: _qualification_payload(
+            candidate_sha=target["candidate_sha"], wheel_sha256=target["artifact_sha256"]
+        ),
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    live = report["mappings"][0]["evidence"]["live"]
+    assert live["status"] == "failed"
+    assert live["reason"] == "governed-live-receipt-validator-rejected"
+
+
+def test_a03_delivery_qualification_wheel_digest_not_bound_to_target_is_rejected(tmp_path: Path) -> None:
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=lambda target: _qualification_payload(
+            candidate_sha=target["candidate_sha"], wheel_sha256="f" * 64
+        ),
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a03_delivery_qualification_not_passed_is_rejected(tmp_path: Path) -> None:
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=lambda target: _qualification_payload(
+            candidate_sha=target["candidate_sha"], wheel_sha256=target["artifact_sha256"], status="failed"
+        ),
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a03_delivery_task_memory_below_success_threshold_is_rejected(tmp_path: Path) -> None:
+    def weak_evidence(target: dict) -> dict:
+        payload = _task_memory_payload(target=target)
+        payload["paths"]["note-fetch"] = _rate_row(20, 18)  # 0.90 < 0.95 門檻
+        return payload
+
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_TASK_MEMORY_LIVE_CANARY,
+        evidence_factory=weak_evidence,
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a04_delivery_task_memory_target_binding_mismatch_is_rejected(tmp_path: Path) -> None:
+    def unbound_evidence(target: dict) -> dict:
+        payload = _task_memory_payload(target=target)
+        payload["target"] = {**target, "candidate_sha": "9" * 40}
+        return payload
+
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_TASK_MEMORY_LIVE_CANARY,
+        evidence_factory=unbound_evidence,
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a03_delivery_governed_live_receipt_hash_mismatch_still_fails_closed(tmp_path: Path) -> None:
+    """封閉登記表接上後，receipt 檔案本身被竄改仍必須在 `_verify_live` 就地擋下，
+    不會因為換了 production validator 而略過既有 sha256 綁定規則。"""
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=lambda target: _qualification_payload(
+            candidate_sha=target["candidate_sha"], wheel_sha256=target["artifact_sha256"]
+        ),
+    )
+    locator = snapshot["mappings"][0]["live_receipt"]["locator"]
+    live_path = tmp_path / locator
+    doc = json.loads(live_path.read_text(encoding="utf-8"))
+    doc["evidence"]["status"] = "failed"
+    live_path.write_text(json.dumps(doc, sort_keys=True), encoding="utf-8")
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    live = report["mappings"][0]["evidence"]["live"]
+    assert live["status"] == "failed"
+    assert live["reason"] == "live-canary-hash-mismatch"

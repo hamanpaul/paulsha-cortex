@@ -145,8 +145,12 @@ cortex delivery gaps --manifest docs/superpowers/specs/refine-requirements-v1.js
 
 `status` 是最近一次 reconcile 的唯讀投影；`gaps` 即時重驗但不寫入；`reconcile` 才以 CAS
 更新 Trust Root 登記的可重建索引。命令不派工、不呼叫模型、不 merge、不部署、不改 issue
-或關票。installed 證據沿用 #841 receipt；若缺少 owner 提供的 live receipt 或正式
-validator，狀態會保留 unknown/gap。
+或關票。installed 證據沿用 #841 receipt；live 證據已固定接上
+`paulsha_cortex/coordinator/live_receipt_validators.py` 的封閉登記表 validator，只認得
+deployment-canary `qualification.json`（沿用 `qualification/validate.py`）與 #857
+`cortex/task-memory-live-canary/v1` 兩種 receipt kind，兩者都綁定該需求 claim 的
+artifact/target；receipt 缺失、kind 不在登記表內或內容不符綁定規則時保留具體 gap，
+規則詳見[需求交付總帳契約](docs/superpowers/specs/requirement-delivery-accounting.md)。
 
 ### 10 分鐘上手：`cortex bootstrap`
 

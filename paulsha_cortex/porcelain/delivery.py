@@ -12,7 +12,12 @@ from typing import Any, Sequence
 from paulsha_cortex import runtime_attestation
 from paulsha_cortex.config import paths
 from paulsha_cortex.config.runtime import selected_instance
-from paulsha_cortex.coordinator import claim, github_delivery, requirement_delivery
+from paulsha_cortex.coordinator import (
+    claim,
+    github_delivery,
+    live_receipt_validators,
+    requirement_delivery,
+)
 
 from . import COMMANDS, PorcelainCommand, register
 
@@ -158,6 +163,7 @@ def main(argv: Sequence[str]) -> int:
             "now_epoch": time.time(),
             "runtime_state_resolver": _runtime_state_root,
             "runtime_status_resolver": _runtime_status_report,
+            "live_receipt_validator": live_receipt_validators.governed_live_receipt_validator,
         }
         if args.command == "gaps":
             _emit(requirement_delivery.inspect_delivery(manifest, snapshot, **common))

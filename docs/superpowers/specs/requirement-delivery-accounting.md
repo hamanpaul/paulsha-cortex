@@ -14,7 +14,25 @@ evidence producer 以 `cortex/requirement-evidence-snapshot/v1` 提供 `captured
 | test / review | 正式 CompletionRecord domain validator、hash-bound verification/review receipts、candidate 綁定、fresh WorkAuthority 與不同 reviewer independence domain。verification evidence 的 run 層級狀態（`reviewing`／`verified`）只表示整體驗證通過，不可直接推定覆蓋某 acceptance criterion；test 階段只採信 `details.tests` 中明確以 `acceptance_ids` 綁定該 criterion且 `status: passed` 的測試，未綁定或未過即為該 criterion 的 test gap。 |
 | merge | 以 WorkAuthority 授權的 PR 重新讀 GitHub closure facts，交既有 `evaluate_remote_closure` 驗 exact head、merge ancestry、issue 是否 closed、OpenSpec；只讀 API 查詢，不執行 closure。`evaluate_remote_closure` 本身只看 issue 目前是否 closed，不驗證是不是被這個 PR 關閉、也不把 Todo 勾選狀態當結案門檻（該語意留給 #808/#810 的 Todo/issue 擁有者，不能改共用 gate）；本 consumer 在此之上另外加嚴：mapped issue 必須出現在這條 PR 實際 `closingIssuesReferences`（`RemoteClosureFacts.closing_issues`），mapped todo.md 遠端內容必須全數勾選完成（`RemoteClosureFacts.todo_complete`），任一不成立即 `failed` 並留下具體 gap，不得只憑 issue 目前 closed 或既有 gate allowed 就記 verified。CompletionRecord 的 `target_ref_sha` 是合併當下捕捉、不可變的歷史快照；其他 PR 之後推進 default branch 是正常事件，consumer 不要求它與「目前」remote default head 相等，只沿用 `evaluate_remote_closure` 已驗證的 merge ancestry（merge commit 是目前 default head 的祖先），避免已完成的交付因之後的正常推進而退化。merge evidence 的 digest／身分只綁這筆交付不可變的事實（merge commit、PR head、PR number、mapped issues、todo 完成狀態）；「目前」default head 只作為驗證輸入，回傳值另外附上 `target_sha` 供報告參考，但索引持久化與同 generation 內容比對前一律剔除，因此其他 PR 之後再推進 default branch 不會被誤判成內容改變。 |
 | installed | 消費 #841 既有 `cortex service status` loaded-runtime projection，以 service declaration 的實際 unit PID 比對 loaded artifact digest/source revision；再核對 service/instance、profile/config revision、target 與 Trust Root。CLI 只從既有 Manager coordinator root/Monitor state root 讀取，忽略 snapshot 的 root hint。 |
-| live | 驗 `cortex/live-canary-receipt/v1` hash、scope、target、期限、核可 authority 與 reviewer/canary 獨立性；最後仍需正式 live receipt validator。沒有 validator 時為 `unknown`。 |
+| live | 驗 `cortex/live-canary-receipt/v1` hash、scope、target、期限、核可 authority 與 reviewer/canary 獨立性；通過後交 production `live_receipt_validator`（`paulsha_cortex/coordinator/live_receipt_validators.py` 的 `governed_live_receipt_validator`，已接在 `porcelain/delivery.py` 的 `cortex delivery gaps／reconcile`）依 `receipt["kind"]` 封閉登記表逐 kind 檢查；未登記 kind 一律 fail closed。 |
+
+### Live receipt 封閉登記表（#845 A04）
+
+`governed_live_receipt_validator` 只接受 ``receipt["kind"]`` 命中下列封閉登記表的
+receipt；其他任何 kind（包含空值／型別不符）一律回傳 `False`（fail closed），不得
+因為看不懂就放行。任何解析例外也一律視為未通過，不外露例外內容。receipt 本身的
+schema／hash／target／期限／authority／independence 已由 `_verify_live` 驗過，
+validator 只再檢查 ``receipt["evidence"]`` 這份同一份已 hash 綁定內容：
+
+| kind | 內容與綁定規則 |
+|---|---|
+| `cortex/deployment-canary-qualification/v1` | `receipt["evidence"]` 是完整 `qualification.json`（`schema_version: 2`、`profile: deployment-canary`、`status: passed`），直接呼叫 `qualification/validate.py` 既有 `validate()` 做結構與 fail-closed 判定（provider 需求、必備 base tests 等），不另寫一套；額外要求 `evidence.candidate_sha` 與 `evidence.wheel.sha256` 精確等於這條需求 claim 的 `target.candidate_sha`／`target.artifact_sha256`，不符即拒絕。因為 validator 只拿到 receipt 本身（無 `evidence_root`），這裡不做 evidence tree 的逐檔案 byte 級核對，只做 payload 結構與身分綁定；receipt 整份內容仍由 `_verify_live` 的 sha256 綁定防止竄改。 |
+| `cortex/task-memory-live-canary/v1` | `receipt["evidence"]` 是 #857 task-memory canary（`cortex task-memory canary --evidence-path` 產物）：`passed: true`；`content_retrieval` 與 `paths.{context-delivered,snapshot-ready,note-fetch}` 三個 delivery path 各自 `attempts ≥ 5` 且 `successes/attempts ≥ 0.95`（`success_rate` 必須與 `attempts`/`successes` 一致，不可只填數字不驗算）；`negative_controls` 需覆蓋 `permission-denied` 與 `cross-scope-rejection` 兩個固定案例且 `status: passed`；`cross_project` 至少兩個不同 repo 且 `status: passed`。`evidence.target` 必須與 receipt 外層已驗證的 `target`（即這條需求 claim 的 artifact digest／source revision／service／instance／profile／config revision，與同時期 #841 loaded-runtime receipt 綁定同一身分）逐欄位相等；無法綁定即拒絕。 |
+
+未知 kind、上述任一綁定或門檻不成立、embedded 內容格式錯誤，都回傳 `False`，對應
+`_verify_live` 的 `governed-live-receipt-validator-rejected` gap（`status: failed`），
+不是 `unknown`——因為到這一步 schema／hash／target／期限／authority／independence
+都已驗過，內容本身不符是明確 fail，不是「無法判斷」。
 
 `owner.work_ids` 的 `owner/repo#issue` 必須與正式 WorkAuthority 的 repo 及 mapped issue 相符；只有相同標籤、PR closed 或別的 work 完成不會覆蓋該需求。每列 coverage 依自身列出的 required stages 計算；缺 stage、failed、stale 或 unknown 都不能 ready。同一次 snapshot 若對同一 requirement／criterion／repo／work／run 邏輯範圍同時含多個 source_generation 的 mapping row（例如較舊 covered 與較新 blocked 同時存在、producer 尚未清理掉舊紀錄），判定該 criterion covered 與否只信這個邏輯範圍內最高 generation 的 row，不是只要任一 row covered 就通過；未選中的較舊 generation row 不影響判定，也不會蓋掉較新事實的 gap 回報。此規則與下方索引跨 mapping generation 守門共用同一套「以最高 generation 為單一真相」邏輯。
 
@@ -26,7 +44,7 @@ evidence producer 以 `cortex/requirement-evidence-snapshot/v1` 提供 `captured
 
 ## Live 操作
 
-本 repo 的 fixture E2E 使用正式 CompletionRecord shape、remote closure facts 與 #841 runtime receipt。受治理環境需先由各工作 owner 提供 snapshot 和正式 live validator/receipt producer；本 CLI 未收到外部 live validator 時會明確保留 live gap。source 測試或本機 checkout 不可當成安裝/實際載入證據。
+本 repo 的 fixture E2E 使用正式 CompletionRecord shape、remote closure facts 與 #841 runtime receipt。`cortex delivery gaps／reconcile` 已固定接上 `live_receipt_validators.governed_live_receipt_validator`（見上方封閉登記表），producer 交付上表兩種 kind 之一的合法 receipt 即可通過；receipt kind 不在登記表內或內容不符綁定規則時，明確保留 `failed` live gap，不會因為看不懂 kind 就放行。source 測試或本機 checkout 不可當成安裝/實際載入證據。
 
 在有受治理 runtime、有效 Monitor WorkAuthority snapshot、GitHub read authentication 與 producer snapshot 的環境執行：
 
