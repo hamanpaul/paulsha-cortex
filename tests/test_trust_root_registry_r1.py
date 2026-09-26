@@ -188,6 +188,31 @@ def test_quota_observation_ledger_is_manager_written_monitor_readable(tmp_path: 
         assert entry.reader_accounts == frozenset({scheme.resolve(Principal.MANAGER)})
 
 
+def test_quota_reservation_authority_is_manager_written_monitor_readable(tmp_path: Path, monkeypatch) -> None:
+    """#838 跨 instance 共享的 reservation authority：唯一 resolver，headless 無寫入權。"""
+    from paulsha_cortex.trust_root import permgen
+
+    asset = registry.asset_by_id("quota-reservation-authority")
+    assert asset.tier is AssetTier.TIER_1
+    assert asset.tree is TrustTree.MANAGER_OWNED
+    assert asset.writers == (Principal.MANAGER,)
+    assert asset.readers == (Principal.MANAGER, Principal.MONITOR)
+    assert asset.path_resolver == "paulsha_cortex.config.paths:quota_reservation_root"
+    assert asset.headless_writable() is False
+    coordinator = tmp_path / "coordinator"
+    monkeypatch.setenv("PSC_COORDINATOR_ROOT", str(coordinator))
+    assert paths.quota_reservation_root() == coordinator / "quota-reservations"
+    assert permgen.DEFAULT_LAYOUT.asset_paths()["quota-reservation-authority"] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/quota-reservations"
+    )
+    for scheme in (permgen.TWO_WAY_SCHEME, permgen.THREE_WAY_SCHEME):
+        assert scheme.resolve(Principal.MANAGER) == scheme.resolve(Principal.MONITOR)
+        entry = permgen.generate_plan(scheme).by_id("quota-reservation-authority")
+        assert entry.writer_accounts == frozenset({scheme.resolve(Principal.MANAGER)})
+        assert entry.reader_accounts == frozenset({scheme.resolve(Principal.MANAGER)})
+    assert check_registry_equation().ok
+
+
 def test_all_three_headless_personas_covered() -> None:
     """spec §R1：盤點必須涵蓋 builder／reviewer／planner 三者，不能只封 builder。"""
     assert registry.personas_covered() == HEADLESS_PERSONAS

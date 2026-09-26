@@ -3566,6 +3566,7 @@ class PathLayout:
             "project-config-tree": self.project_config_root,
             "coverage-shadow-telemetry": f"{c}/coverage-shadow",
             "quota-observation-events": f"{c}/quota-observations",
+            "quota-reservation-authority": f"{c}/quota-reservations",
             "monitor-state-tree": mon,
             "monitor-work-items-snapshot": f"{mon}/work-items.snapshot.json",
             "monitor-github-sync-cursor": f"{mon}/github-issue-sync.json",

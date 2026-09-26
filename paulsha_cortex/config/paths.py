@@ -121,6 +121,20 @@ def quota_observation_root() -> Path:
     return coordinator_root() / QUOTA_OBSERVATION_DIRNAME
 
 
+QUOTA_RESERVATION_DIRNAME = "quota-reservations"
+
+
+def quota_reservation_root() -> Path:
+    """#838 Manager-owned 跨 instance 共享 quota reservation authority 根。
+
+    與 `quota_observation_root()` 同層但獨立目錄：reservation 的原子生命週期
+    （reserve／bind／settle／release）與 #836 的觀測事件 ledger 是兩個不同的
+    寫入面，分開落地才能各自套用最適合自己的 file-lock／corruption 邊界，
+    不必互相牽動對方已審查過的 schema。
+    """
+    return coordinator_root() / QUOTA_RESERVATION_DIRNAME
+
+
 #: `review_verdict_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數
 #: 是為了讓 `coordinator/review.py` 的 per-job 定址與本 resolver 共用同一個字面量
 #: （R1 登記表的「重複路徑推導」Scenario 要求單一真相）。

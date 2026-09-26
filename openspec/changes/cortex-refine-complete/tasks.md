@@ -81,7 +81,7 @@
 ## 5. B4 動態派工與恢復
 
 - [ ] 5.1 由 #839 完成 qualified feasible candidate selection，維持 explicit pin、permissions、role、independence 硬條件。
-- [ ] 5.2 由 #838 完成多池/多時間窗原子 reservation 與同主機多 instance contention 測試。
+- [x] 5.2 由 #838 完成多池/多時間窗原子 reservation 與同主機多 instance contention 測試（`coordinator/quota_reservation.py`；`multiprocessing`＋`Barrier` 真實競爭、failpoint crash matrix、bounded worker 壓力/耐久 audit）；本模組刻意不接線任何 spawn path、不做候選排序/fallback/forecast，`reservation_authority_enabled()` 預設關閉即 shadow，留給 #839 整合。
 - [ ] 5.3 完成 consumption reconciliation、crash/restart uncertain liveness 與 lease 不誤釋放。
 - [ ] 5.4 完成 card/attempt 安全邊界的 fallback、supersession 與 artifact preservation；同耗盡 pool 不可繞過。
 - [ ] 5.5 由 #843 補 R07 recovery matrix 與 exact-run/card CAS、late evidence、重送冪等、abandon owner-aware 資源處置；#497/#547/#577等原producer缺陷仍須修正。

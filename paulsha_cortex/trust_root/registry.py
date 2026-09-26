@@ -1816,6 +1816,17 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             "兩者共用部署帳號，headless persona 無寫入權。"
         ),
     ),
+    TrustRootAsset(
+        "quota-reservation-authority", _T1, _MO,
+        "paulsha_cortex.config.paths:quota_reservation_root",
+        (Principal.MANAGER,), (Principal.MANAGER, Principal.MONITOR),
+        IngressKind.MANAGER_INTERNAL,
+        note=(
+            "#838 跨 instance 共享的原子 quota reservation authority（reserve／bind／"
+            "settle／release 生命週期事件）。同帳號下多個 Manager instance 以檔案鎖"
+            "序列化寫入同一份檔案；headless persona 無寫入權，Monitor 唯讀投影。"
+        ),
+    ),
     # ---- monitor state 族 --------------------------------------------------
     TrustRootAsset(
         "monitor-state-tree", _T1, _MO, "paulsha_cortex.config.paths:monitor_state_root",

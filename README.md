@@ -45,6 +45,29 @@ producer/consumer 使用，不接 workflow chain、排序、reservation、admiss
 事件；未覆蓋的外部來源仍標 gap。這些 API 不代表 provider live read 或安裝 runtime
 已驗收。
 
+## Quota reservation authority
+
+`paulsha_cortex.coordinator.quota_reservation`（#838）提供跨 instance 共享的
+原子 `reserve`／`bind`／`settle`／`release`／`reconcile` 生命週期，讓同帳號下
+多個 Manager instance 對同一個共享 pool/window 的預留有單一權威來源：以檔案鎖
+序列化同一份 append-only JSONL 事件檔，同池競爭最後一單位時恰好一個成功，
+多 pool 需求 all-or-none（任一不足即整份拒絕，不留半張 grant，也不扣其他池）。
+`pool_ref`／`window_id` 沿用上面 #836 shadow 的契約，刻意不含 model 維度。
+
+每筆 reservation 綁定 `run_id`／`card_id`／`decision_id`／`attempt_id` 與
+observation／demand 版本；`bind()`／`settle()`／`release()` 皆需驗證 owner
+token、attempt id 與 CAS `expected_sequence`，錯誤呼叫端一律拒絕而不是靜默
+生效。crash／restart 之後，lease 到期本身**永不**證明可以釋放容量——只有
+`reconcile()` 帶入耐久 job 存活證據並給出 `confirmed-terminated` 才會釋放，
+`inconclusive` 或未 reconcile 一律回報 `uncertain` 並持續佔用容量。同一個
+decision 用相同組成重複呼叫 `reserve()`／terminal 事件重送皆冪等回放；組成
+不同則回報 `conflict`，不會靜默選邊。
+
+本模組刻意**不**做候選排序、fallback 或 forecast（留給 #839），也**不**接線
+任何實際 spawn path——在有呼叫端明確 import 之前，它是完全 dormant 的
+library primitive。`reservation_authority_enabled()` 是保留給未來整合者的
+opt-in 開關，預設關閉即等於 shadow／rollback，不需要改動任何程式碼。
+
 ## Execution profile schema／key core
 
 `paulsha_cortex.coordinator.execution_profile` 是 #849 的純 stdlib
