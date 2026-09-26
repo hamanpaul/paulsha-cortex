@@ -160,12 +160,52 @@ def test_group_and_other_never_writable(scheme) -> None:
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
 def test_manager_owned_acls_are_read_only(scheme) -> None:
-    """Manager-owned/deployment 上的 ACL 只能是唯讀（跨帳號讀），永不授寫。"""
-    plan = _plan(scheme)
+    """Manager-owned/deployment ACL 唯一寫入例外是明列的 operator receipt store。"""
+    resolved = _resolved(scheme)
+    plan = generate_plan(resolved)
     for e in plan.entries:
         if e.owner_class in (OwnerClass.MANAGER_STATE, OwnerClass.DEPLOYMENT):
             for acl in e.acls:
-                assert not acl.writable, (e.asset_id, acl.account, acl.perms)
+                if e.asset_id == "execution-qualification-operator-receipts":
+                    assert acl.account in {
+                        resolved.resolve(Principal.OPERATOR), resolved.durable_state_owner
+                    }
+                else:
+                    assert not acl.writable, (e.asset_id, acl.account, acl.perms)
+
+
+@pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
+def test_operator_qualification_receipts_are_writable_only_by_operator_and_manager(scheme) -> None:
+    resolved = _resolved(scheme)
+    entry = generate_plan(resolved).by_id("execution-qualification-operator-receipts")
+    operator = resolved.resolve(Principal.OPERATOR)
+    manager = resolved.durable_state_owner
+    jobs = {
+        account
+        for principal in permgen.UNTRUSTED_EXECUTION_PRINCIPALS
+        if (account := resolved.resolve(principal)) is not None
+        and account != manager
+    }
+
+    assert entry.owner_class is OwnerClass.MANAGER_STATE
+    assert entry.owner == manager
+    assert entry.writer_accounts == frozenset({manager, operator})
+    assert entry.acls
+    assert any(acl.account == operator and acl.writable for acl in entry.acls)
+    assert any(acl.account == operator and acl.default and acl.writable for acl in entry.acls)
+    assert any(acl.account == manager and acl.default and acl.writable for acl in entry.acls)
+    # The legacy two-way scheme aliases manager and planner/reviewer into one UID. That
+    # alias is excluded here because the systemd job namespace still mounts Manager state RO.
+    assert not (entry.writer_accounts & jobs)
+
+    authority_index = generate_plan(resolved).by_id(
+        "execution-qualification-operator-receipt-index"
+    )
+    assert authority_index.writer_accounts == frozenset({manager})
+    assert not any(acl.writable for acl in authority_index.acls)
+    assert operator not in authority_index.writer_accounts
+    job_properties = permgen.render_job_writable_properties(instance="qualification-job")
+    assert not any("execution-qualification" in prop for prop in job_properties)
 
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)

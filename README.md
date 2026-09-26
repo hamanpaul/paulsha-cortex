@@ -60,6 +60,12 @@ descriptor 與單一 `requested`／`resolved`／`observed` record，提供
 - core 不新增 flags、commands、model／agent／effort 固定清單或 runtime probe；既有
   CLI `--help` 仍是唯一 help contract。
 
+## Execution qualification lifecycle
+
+`cortex model qualification` 將 PatchMUD report v2 綁定精確 execution profile、角色、完整 deck coverage 與來源 digest，建立不可變 candidate；只有技術證據完整且帶明示核可 receipt 的紀錄才能進 approved roster。CAS revision／冪等鍵保護核可與撤銷，legacy 資格維持 `unknown`。預設 sized-dispatch policy 為 disabled；只有 host overlay 設 `qualification_policy.sized_dispatch: enforce` 時，Manager 才查詢有效 roster 資格。測試 receipt 不會在 live policy 下生效。
+
+CLI 用法、資料狀態、legacy migration 與 live 驗收界線見 [`docs/execution-qualification.md`](docs/execution-qualification.md)。`cortex model profile --apply` 僅套用封套 profile，不核可 execution qualification。
+
 
 ## 架構與工作流程驗收
 

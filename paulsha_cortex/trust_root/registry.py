@@ -1683,6 +1683,62 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         note="jobs.json／evidence 樹／journal 的容器；實測 drwxrwxr-x（group-writable）。",
     ),
     TrustRootAsset(
+        "execution-qualification-tree", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_root",
+        (Principal.MANAGER,), (Principal.MANAGER, Principal.OPERATOR), IngressKind.MANAGER_INTERNAL,
+        note=(
+            "#842 qualification lifecycle 共用容器；獨立登記使子資產各自有明確的 "
+            "managed parent，operator 對 operator-receipts 的 traverse ACL 才有處掛。"
+            "沿用 control-root-tree 的既有模式（容器 Operator 可讀，特定子資產才可寫）。"
+        ),
+    ),
+    TrustRootAsset(
+        "execution-qualification-candidates", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_candidates_root",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note="#842 immutable report-bound candidates；未知與 legacy 證據不可升格。",
+    ),
+    TrustRootAsset(
+        "execution-qualification-receipts", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_receipts_root",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note="#842 immutable human-review 與撤銷 receipts；授權只綁 exact candidate。",
+    ),
+    TrustRootAsset(
+        "execution-qualification-operator-receipts", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_operator_receipts_root",
+        (Principal.MANAGER, Principal.OPERATOR), (Principal.MANAGER, Principal.OPERATOR),
+        IngressKind.MANAGER_INTERNAL,
+        note=(
+            "#842 operator CLI 核發的人工作業 receipt；僅 Operator／Manager 可寫，"
+            "降權 job 不可寫，Manager 發布前仍核對 receipt digest 與 candidate binding。"
+        ),
+    ),
+    TrustRootAsset(
+        "execution-qualification-operator-receipt-index", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_operator_receipt_registry_path",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note=(
+            "#842 對抗審查第四輪 BLOCKER 1：writers/readers 都是 Manager-only，"
+            "operator 帳號讀不到也寫不進去；operator 核發 receipt 因此不再依賴、"
+            "也不再嘗試寫入這份 index——receipt 檔本身的 content-addressed id／digest "
+            "才是驗證權威，這份 index 只在讀得到時提供額外佐證，缺席或不可讀不得擋下 "
+            "operator 自己核發的 receipt 用於 publish 或 roster 查詢。"
+        ),
+    ),
+    TrustRootAsset(
+        "execution-qualification-roster", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_roster_path",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note="#842 approved roster projection；舊 Manager 不讀此獨立檔案。",
+    ),
+    TrustRootAsset(
+        "execution-qualification-index", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_index_path",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note="#842 revision/CAS 唯一 lifecycle 真值；receipt 缺失時查詢 fail-closed。",
+    ),
+    TrustRootAsset(
         "dispatch-specs-tree", _T0, _MO, "paulsha_cortex.config.paths:specs_root",
         (Principal.MANAGER, Principal.PLANNER, Principal.ANY_SAME_UID),
         (Principal.MANAGER,),
