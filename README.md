@@ -136,7 +136,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
      --repo-root "$(git rev-parse --show-toplevel)"
    ```
 
-   Installer 會 render/copy units、執行 `daemon-reload`，並 enable manager timer 與 monitor service；**不會 start service**。`--interval` 只調整 deprecated timer 的 `OnUnitActiveSec`；長駐 daemon 的 tick 週期由 `PSC_MANAGER_INTERVAL_SECONDS` 控制。兩個 service 都會設定 `WorkingDirectory=<PSC_REPO_ROOT>`，因此服務執行時不受 `cwd` 影響。
+   Installer 會 render/copy units、執行 `daemon-reload`，並 enable manager service、manager timer 與 monitor service；manager service 透過 `WantedBy=default.target` 隨 user systemd 啟動。deprecated timer 仍保留，`--interval` 只調整它的 `OnUnitActiveSec`；長駐 daemon 的 tick 週期由 `PSC_MANAGER_INTERVAL_SECONDS` 控制。安裝時**不會 start service**。兩個 service 都會設定 `WorkingDirectory=<PSC_REPO_ROOT>`，因此服務執行時不受 `cwd` 影響。
 
    若既有 `$HOME/.agents/config/paulsha/project-cortex.yaml` 已包含其他 workspace，
    installer 只會在末端追加目前目標，並在替換前建立 `project-cortex.yaml.bak-*`；既有

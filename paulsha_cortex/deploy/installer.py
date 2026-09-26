@@ -727,6 +727,7 @@ def install_service_result(
     for stage, args in (
         ("daemon-reload", ("daemon-reload",)),
         ("enable monitor service", ("enable", f"{instance}-monitor.service")),
+        ("enable manager service", ("enable", f"{instance}-manager.service")),
         ("enable manager timer", ("enable", f"{instance}-manager.timer")),
     ):
         result = _run_systemctl_install_step(*args)
