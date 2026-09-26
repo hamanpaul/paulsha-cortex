@@ -735,11 +735,9 @@ def test_ship_action_emits_shipped_outcome_before_terminal_transition(
             append_failure["value"] = False
             journal = json.loads(state.read_text(encoding="utf-8"))
             journal_ship = journal["runs"][run_id]["ship"]
-            assert journal_ship["phase"] == "done"
-            assert journal_ship["completion_record"] == {
-                "path": "/evidence/completion.json",
-                "hash": "d" * 64,
-            }
+            # outcome 必須在 journal 標 ship done 之前 durable；此刻 journal 仍停在 merged。
+            assert journal_ship["phase"] == "merged"
+            assert "completion_record" not in journal_ship
             raise OSError("injected outbox write failure")
         return original_append(store, record)
 
@@ -911,3 +909,196 @@ def test_cli_outcome_list_show_replay(monkeypatch, tmp_path: Path, capsys) -> No
     assert coordinator_cli.main(["outcome", "replay", "--repo", "acme/demo"]) == 0
     replayed = json.loads(capsys.readouterr().out)
     assert replayed == [record]
+
+
+def test_shipped_outcome_failure_keeps_journal_retryable_before_done(
+    monkeypatch, tmp_path: Path
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    # 這裡把一般 review→ship advance 走到底；shipped outcome 必須在 Manager
+    # 將 WorkflowRun 標成 done 前持久化。
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    # 維持 build 與 reviewer independence domain 分離，並讓 review 卡已通過，
+    # 以重現 resume 在 review→ship 的 advance 路徑。
+    def _advance_step(step):
+        if step.phase == "build":
+            return replace(step, domain="openai")
+        if step.phase in {"verify", "review"}:
+            return replace(step, domain="google", gate_result="passed")
+        if step.phase == "ship":
+            return replace(step, gate_result="passed")
+        return step
+
+    passed_steps = tuple(
+        _advance_step(step) for step in registry.get_workflow_run(run_id).steps
+    )
+    registry._manager_update_workflow_run(
+        run_id,
+        current_phase="review",
+        steps=passed_steps,
+        gate_status="passed",
+        gate_refs=(
+            GateEvidenceRef(kind="foreign-review", ref="evidence-ref-1"),
+            GateEvidenceRef(kind="maintainer-review", ref="evidence-ref-2"),
+        ),
+        candidate_head=HEAD,
+        verified_head=HEAD,
+    )
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text("{}", encoding="utf-8")
+    completion = tmp_path / "completion.json"
+    completion.write_text("{}", encoding="utf-8")
+    review_available = {"value": False}
+    merged_state = {"value": False}
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def ensure_pr_metadata(self, **kwargs):
+            pass
+
+        def fetch_delivery_facts(self, **kwargs):
+            reviews = ()
+            if review_available["value"]:
+                from paulsha_cortex.coordinator.github_delivery import COPILOT_REVIEWER_LOGIN
+
+                reviews = (
+                    CopilotReview(
+                        review_id=9,
+                        commit_id=HEAD,
+                        state="COMMENTED",
+                        body="ok",
+                        author=COPILOT_REVIEWER_LOGIN,
+                        submitted_at_epoch=205,
+                    ),
+                )
+            return DeliveryFacts(
+                head=HEAD,
+                mergeable=True,
+                mergeable_state="clean",
+                checks=(GitHubCheck("pytest", "completed", "success"),),
+                copilot_reviews=reviews,
+                review_threads=(),
+                closing_issues=(12,),
+                active_openspec_absent=True,
+                archive_present=True,
+            )
+
+        def request_copilot(self, **kwargs):
+            pass
+
+        def fetch_merge_status(self, **kwargs):
+            return MergeStatus(
+                merged=merged_state["value"],
+                pr_head=HEAD,
+                merge_commit="c" * 40 if merged_state["value"] else None,
+            )
+
+    class Orchestrator:
+        def __init__(self, *, github, now):
+            pass
+
+        def merge_if_ready(self, **kwargs):
+            merged_state["value"] = True
+            return SimpleNamespace(expected_head=HEAD, expected_tree_hash=TREE)
+
+        def verify_remote_closure(self, **kwargs):
+            return SimpleNamespace(
+                facts=SimpleNamespace(merge_commit="c" * 40),
+                completion_record={"path": "/evidence/completion.json", "hash": "d" * 64},
+            )
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    monkeypatch.setattr(work_actions, "ShipOrchestrator", Orchestrator)
+    foreign_normalized = {"state": "passed", "candidate": HEAD}
+    monkeypatch.setattr(
+        work_actions,
+        "_validate_foreign_review",
+        lambda *args, **kwargs: foreign_normalized,
+    )
+    monkeypatch.setattr(work_actions, "load_preflight_command", lambda: ("preflight",))
+    monkeypatch.setattr(
+        work_actions,
+        "run_preflight",
+        lambda **kwargs: PreflightResult(
+            passed=True,
+            failed_stage=None,
+            policy=CommandResult(("policy",), 0, "", ""),
+            ci_parity=CommandResult(("preflight",), 0, "", ""),
+            head=HEAD,
+            tree_hash=TREE,
+        ),
+    )
+    base = {
+        "action": "ship",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "repo_root": str(tmp_path),
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+        "foreign_review_path": str(foreign),
+        "foreign_review_hash": work_actions.verification.canonical_json_hash(foreign_normalized),
+        "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+    }
+    first = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    assert first["result"]["action"] == "awaiting-copilot"
+
+    outcome_store = engineering_outcome.OutcomeStore(
+        engineering_outcome.outcome_store_path(state, repo="acme/demo")
+    )
+    # 尚未 merge：不得提早 emit「shipped」outcome。
+    assert list(outcome_store.list_outcomes()) == []
+
+    review_available["value"] = True
+    second = work_actions.execute_work_action(
+        args=base,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+    assert second["result"]["action"] == "merged-awaiting-closure"
+    assert list(outcome_store.list_outcomes()) == []
+
+    import json as _json
+
+    def failing_emit(*_args, **_kwargs):
+        raise RuntimeError("outcome store unavailable")
+
+    monkeypatch.setattr(engineering_outcome, "emit_shipped_outcome", failing_emit)
+    with pytest.raises(RuntimeError, match="outcome store unavailable"):
+        work_actions.execute_work_action(
+            args={**base, "completion_record_path": str(completion)},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 220,
+            workflow_registry=registry,
+        )
+    # outcome 寫入失敗時 journal 不得先標 ship done，否則重入只剩 abandon。
+    journal = _json.loads(state.read_text(encoding="utf-8"))
+    assert journal["runs"][run_id]["ship"]["phase"] == "merged"
+
+    monkeypatch.undo()

@@ -8012,6 +8012,20 @@ def _ship_action(
             workflow_step_ids=tuple(active["workflow_step_ids"]),
             trusted_evidence_refs=_trusted_evidence_refs(authorization),
         )
+        if canonical_run.current_phase in {"review", "ship"}:
+            # #1086：一般 review→ship advance 仍處於 review；先 durable 寫入
+            # shipped outcome，production ship validator 才能回傳 passed，讓
+            # Manager 後續將 Registry 標成 done。重入會重驗 closure，並以
+            # CompletionRecord hash 重用同一筆 outcome。必須在 journal 標 ship done
+            # 之前完成：寫入失敗時 journal 仍停在 merged，resume 可重入重試。
+            persist_shipped_outcome(
+                expected_head=expected_head,
+                pr_number=pr_number,
+                change=change,
+                todo_paths=todo_paths_value,
+                authorization=authorization,
+                closure=closure,
+            )
         active["ship"] = {
             **ship,
             "phase": "done",
@@ -8024,19 +8038,6 @@ def _ship_action(
             for source in authority.source_revisions
             if "@" in source
         }
-        if canonical_run.current_phase in {"review", "ship"}:
-            # #1086：一般 review→ship advance 仍處於 review；先 durable 寫入
-            # shipped outcome，production ship validator 才能回傳 passed，讓
-            # Manager 後續將 Registry 標成 done。重入會重驗 closure，並以
-            # CompletionRecord hash 重用同一筆 outcome。
-            persist_shipped_outcome(
-                expected_head=expected_head,
-                pr_number=pr_number,
-                change=change,
-                todo_paths=todo_paths_value,
-                authorization=authorization,
-                closure=closure,
-            )
 
         if canonical_run.current_phase == "ship":
             workflow_registry._manager_update_workflow_run(
