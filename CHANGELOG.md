@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#897(1)／#937(1) 部分修正：**候選 harvest 會在更新來源 branch 前檢查所有 pinned planning 檔案；僅容忍 plan 類 `tasks.md`／`todo.md` 的 checkbox-only 差異，其他 bytes 差異拒收並指出檔案與雜湊前綴，缺檔則指出路徑。#897 其餘子項及 #937 其餘子項留待後續批次。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加
