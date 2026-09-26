@@ -789,15 +789,30 @@ def _verify_remote_merge(
             return _stage("failed", "remote-todo-incomplete")
         if not gate.allowed:
             return _stage("failed", "remote-closure-blocked:" + ",".join(gate.reasons))
+        # 對抗審查第五輪 MAJOR：這個 digest／mapping 身分只能綁這筆交付不可變
+        # 的事實（merge commit、PR head、mapped issues、todo 狀態）；「目前」
+        # default head 只是驗證輸入（見上方 merge ancestry 檢查），不能入身分
+        # ——否則其他 PR 之後正常推進 default branch 就會讓同一筆已驗證的
+        # merge 證據被判定成內容改變，把 main 正常前進誤判成
+        # same-source-generation-content-drift。
         result = _stage(
             "verified", "exact-remote-closure-passed",
             locator=f"pull/{authority.mapped_prs[0]}/merge/{facts.merge_commit.lower()}",
-            digest=canonical_json_sha256({"merge": facts.merge_commit.lower(), "head": facts.pr_head.lower(), "target": facts.default_head.lower()}),
+            digest=canonical_json_sha256({
+                "merge": facts.merge_commit.lower(),
+                "head": facts.pr_head.lower(),
+                "pr_number": authority.mapped_prs[0],
+                "mapped_issues": sorted(authority.mapped_issues),
+                "todo_complete": facts.todo_complete,
+            }),
             validator="remote-closure/v1",
         )
         result.update({
             "merge_sha": facts.merge_commit.lower(),
             "head_sha": facts.pr_head.lower(),
+            # `target_sha` 只是驗證當下觀察到的「目前」default head，供報告
+            # 參考；不是不可變事實，因此不進上面的 digest，且持久化到索引
+            # 前會由 `_stable_evidence` 剔除，不列入同 generation 內容比對。
             "target_sha": facts.default_head.lower(),
         })
         return result
@@ -1037,6 +1052,33 @@ def _verify_waiver(
         return _stage("failed", f"waiver-invalid:{type(exc).__name__}")
 
 
+def _current_generation_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """對抗審查第五輪 BLOCKER：同一 requirement／criterion 下，若同一 repo／
+    work／run 邏輯範圍在單次 source_snapshot 內同時出現多個 source_generation
+    的 mapping row（例如較舊 covered 與較新 blocked 同時存在、producer 尚未
+    清理掉舊紀錄），判定 covered／blocked／missing 前必須先依這個邏輯範圍
+    只留最高 generation 的 row 決定——與 reconcile_delivery 跨 mapping
+    generation 守門同一套「以最高 generation 為單一真相」規則，不能只要看到
+    任一 covered row 就通過，讓已被取代的較舊 covered row 蓋過較新的
+    blocked／missing 事實。"""
+    best_generation: dict[tuple[str, str, str], int] = {}
+    best_rows: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in matches:
+        scope = (row["repo"], row["work_id"], row["run_id"])
+        generation = row.get("source_generation")
+        generation = generation if isinstance(generation, int) else -1
+        current_best = best_generation.get(scope)
+        if current_best is None or generation > current_best:
+            best_generation[scope] = generation
+            best_rows[scope] = [row]
+        elif generation == current_best:
+            best_rows[scope].append(row)
+    effective: list[dict[str, Any]] = []
+    for scope_rows in best_rows.values():
+        effective.extend(scope_rows)
+    return effective
+
+
 def inspect_delivery(
     manifest: object,
     source_snapshot: object,
@@ -1236,11 +1278,14 @@ def inspect_delivery(
         owner = requirement["evidence_policy"]["owner"]
         for criterion in requirement["acceptance_criteria"]:
             matches = mapping_results.get((requirement["id"], criterion["id"]), [])
-            criterion_covered = any(row["status"] == "covered" for row in matches)
-            criterion_status = "covered" if criterion_covered else ("blocked" if matches else "missing")
+            # 判定 covered 與否只信該邏輯範圍內最高 generation 的 row（見
+            # `_current_generation_matches`），較舊 generation 不得蓋過較新事實。
+            effective_matches = _current_generation_matches(matches)
+            criterion_covered = any(row["status"] == "covered" for row in effective_matches)
+            criterion_status = "covered" if criterion_covered else ("blocked" if effective_matches else "missing")
             criterion_results.append({"acceptance_id": criterion["id"], "status": criterion_status, "mapping_ids": [row["mapping_id"] for row in matches]})
             if not criterion_covered:
-                candidate_stages = matches[0]["evidence"] if matches else {}
+                candidate_stages = effective_matches[0]["evidence"] if effective_matches else {}
                 for stage_name in requirement["evidence_policy"]["required_stages"]:
                     evidence = candidate_stages.get(stage_name)
                     if evidence is None:
@@ -1257,7 +1302,7 @@ def inspect_delivery(
                             "reason": reason,
                             "owner": copy.deepcopy(owner),
                             "recovery": owner["recovery"],
-                            "mapping_id": matches[0]["mapping_id"] if matches else None,
+                            "mapping_id": effective_matches[0]["mapping_id"] if effective_matches else None,
                         })
         status = "covered" if all(row["status"] == "covered" for row in criterion_results) else ("blocked" if any(row["status"] == "blocked" for row in criterion_results) else "missing")
         requirement_results.append({
@@ -1281,9 +1326,36 @@ def inspect_delivery(
     }
 
 
+# 對抗審查第五輪 MAJOR：各階段 evidence 中，哪些欄位只是驗證當下觀察到的
+# 「目前」事實（會隨時間正常變動、不是這筆交付的不可變身分），持久化與同
+# generation 內容比對前必須先剔除——目前只有 merge 階段的 `target_sha`
+# （目前 default head）。
+_VOLATILE_EVIDENCE_FIELDS: dict[str, tuple[str, ...]] = {
+    "merge": ("target_sha",),
+}
+
+
+def _stable_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    """剔除 `_VOLATILE_EVIDENCE_FIELDS` 列出的驗證當下觀察值，只留下可作為
+    這筆交付身分依據的不可變事實，供索引持久化與同 generation 內容比對
+    使用；即時查詢（`inspect_delivery` 的回傳值）仍保留完整欄位供人工/報告
+    參考。"""
+    stable: dict[str, Any] = {}
+    for stage_name, stage in evidence.items():
+        drop = _VOLATILE_EVIDENCE_FIELDS.get(stage_name)
+        if drop and isinstance(stage, Mapping):
+            stage = {key: value for key, value in stage.items() if key not in drop}
+        stable[stage_name] = stage
+    return stable
+
+
 def _read_completion_review_for_history(mapping: Mapping[str, Any], *, evidence_root: Path) -> dict[str, Any]:
     # 僅保留 opaque-safe provenance；stage verdict 已由 inspect_delivery 正式驗證。
-    return {key: mapping.get(key) for key in ("mapping_id", "requirement_id", "requirement_revision", "acceptance_id", "repo", "work_id", "run_id", "workflow_step_ids", "pr_number", "change", "todo_paths", "candidate_sha", "merge_sha", "profile_key", "config_revision", "policy_version", "completion_record", "source_generation", "source_revision_sha256", "authority_sha256", "status", "evidence", "target", "observed_at")}
+    projected = {key: mapping.get(key) for key in ("mapping_id", "requirement_id", "requirement_revision", "acceptance_id", "repo", "work_id", "run_id", "workflow_step_ids", "pr_number", "change", "todo_paths", "candidate_sha", "merge_sha", "profile_key", "config_revision", "policy_version", "completion_record", "source_generation", "source_revision_sha256", "authority_sha256", "status", "evidence", "target", "observed_at")}
+    evidence = projected.get("evidence")
+    if isinstance(evidence, Mapping):
+        projected["evidence"] = _stable_evidence(evidence)
+    return projected
 
 
 def _evidence_weakened(previous_evidence: object, incoming_evidence: object) -> bool:

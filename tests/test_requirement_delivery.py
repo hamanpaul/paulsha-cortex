@@ -423,6 +423,39 @@ def test_a01_versioned_multi_work_mapping_covers_only_exact_criteria(tmp_path: P
     assert report["requirements"][1]["status"] == "covered"
 
 
+def test_a01_snapshot_with_mixed_generation_rows_uses_highest_generation_for_coverage(tmp_path: Path) -> None:
+    """對抗審查第五輪 BLOCKER：inspect_delivery 對同一 requirement／criterion
+    只要看到任一 covered row 就算通過；source snapshot 若同時含同一 repo／
+    work／run 邏輯範圍內較舊 covered 與較新 blocked 的兩個 source_generation
+    row（例如 producer 尚未清理掉舊紀錄），判定前必須先依 logical 範圍只留
+    最高 generation 的 row 決定 covered 與否，不能讓已被取代的較舊 covered
+    row 蓋過較新的 blocked 事實。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    covered_row = snapshot["mappings"][0]
+    assert covered_row["source_generation"] == 1
+    blocked_row = copy.deepcopy(covered_row)
+    blocked_row["source_generation"] = 2
+    blocked_row["completion_record"] = _write_completion(
+        tmp_path,
+        run_id=covered_row["run_id"],
+        slice_id="newer-generation-review-conflict",
+        same_review_domain=True,
+    )
+    snapshot["mappings"].append(blocked_row)
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    assert report["closure_readiness"] == "not-ready"
+    requirement = next(r for r in report["requirements"] if r["requirement_id"] == "R01")
+    assert requirement["status"] == "blocked"
+    criterion = requirement["acceptance_criteria"][0]
+    assert criterion["status"] == "blocked"
+    assert any(
+        g["requirement_id"] == "R01" and g["stage"] == "review" and g["status"] == "failed"
+        for g in report["gaps"]
+    )
+
+
 def test_a01_missing_acceptance_or_evidence_policy_is_rejected(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path, [("R01", "r1")])
     del manifest["requirements"][0]["acceptance_criteria"]
@@ -774,6 +807,33 @@ def test_a07_same_generation_reread_with_weaker_evidence_does_not_replace_covere
     assert result.get("pending_reason") is not None
     stored = read_index(index_path)
     assert len(stored["mappings"]) == 1
+    assert stored["mappings"][0]["mapping_id"] == covered_mapping_id
+    assert stored["mappings"][0]["status"] == "covered"
+
+
+def test_a07_default_head_further_advancing_between_reconciles_does_not_drift(tmp_path: Path) -> None:
+    """對抗審查第五輪 MAJOR：merge 改看 ancestry 後，evidence.merge 的
+    ``target_sha``／digest 仍隨「目前」default head 改變；同一 generation
+    重跑 reconcile 時，main 在兩次呼叫之間正常再往前推進，不能被誤判成
+    same-source-generation-content-drift 而卡住既有 covered mapping。merge
+    evidence 的 digest／mapping 身分只能綁不可變事實（merge commit、PR
+    head、mapped issues、todo 狀態），「目前」default head 只是驗證輸入。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    index_path = tmp_path / "index.json"
+
+    context["github_client"] = _GitHub(default_head="9" * 40)
+    first = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+    assert first["report"]["closure_readiness"] == "ready"
+    covered_mapping_id = first["index"]["mappings"][0]["mapping_id"]
+
+    context["github_client"] = _GitHub(default_head="8" * 40)
+    second = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+
+    assert second["report"]["closure_readiness"] == "ready"
+    assert second.get("pending_reason") is None
+    assert second["report"].get("source_generation_drift") is None
+    assert second["changed"] is False
+    stored = read_index(index_path)
     assert stored["mappings"][0]["mapping_id"] == covered_mapping_id
     assert stored["mappings"][0]["status"] == "covered"
 

@@ -56,3 +56,35 @@ GREEN；既有 `test_requirement_delivery*.py`／`test_github_delivery_client.py
 `test_delivery_orchestrator.py` 與 `-k "delivery or remote_closure or retire"`
 全數維持通過，確認未影響共用 gate 對其他呼叫者（ship/merge 時的新鮮記錄
 校驗）的既有語意。
+
+對抗審查第五輪修正（單一真相與 merge evidence 身分，共兩條）：
+
+1. BLOCKER：`inspect_delivery` 對同一 requirement／criterion 判定 covered
+   時，先前只要在 `mapping_results` 內看到任一 `covered` row 就通過；若同一
+   次 source snapshot 內、同一 repo／work／run 邏輯範圍同時含較舊 covered
+   與較新 blocked 的兩個 source_generation row（例如 producer 尚未清理掉舊
+   紀錄），首次 `cortex delivery gaps`／`reconcile` 仍會回報 `ready`。新增
+   `_current_generation_matches`：判定與 gap 回報前，先依邏輯範圍（
+   requirement／criterion／repo／work／run）只保留最高 generation 的 row，
+   與 `reconcile_delivery` 既有跨 mapping generation 守門共用同一套「以最高
+   generation 為單一真相」規則，不再讓已被取代的較舊 covered row 蓋過較新
+   的 blocked 事實；gap 回報也改用同一組有效 row，避免落選的較舊 covered
+   row 讓真正阻擋原因消失不報。
+2. MAJOR：merge 改看 ancestry 後，`_verify_remote_merge` 的 evidence digest
+   與 `target_sha` 仍嵌入「目前」remote default head；其他 PR 之後正常推進
+   default branch，會讓同一 generation、同一 mapping_id 的重讀在
+   `reconcile_delivery` 的內容比對中被判定成
+   `same-source-generation-content-drift`，使本已 covered 的交付卡在
+   pending。改為：digest 只綁不可變事實（merge commit、PR head、PR
+   number、mapped issues、todo 完成狀態），不再納入 default head；新增
+   `_stable_evidence`／`_VOLATILE_EVIDENCE_FIELDS`，在 `_read_completion_
+   review_for_history` 持久化與同 generation 內容比對前，把 merge 階段的
+   `target_sha`（僅供報告參考的目前觀察值）從身分中剔除。`inspect_delivery`
+   即時回傳值仍保留完整 `target_sha` 供人工/報告查看。
+
+兩條同樣先以 RED 測試確認可重現後再修：`test_a01_snapshot_with_mixed_
+generation_rows_uses_highest_generation_for_coverage`、
+`test_a07_default_head_further_advancing_between_reconciles_does_not_drift`。
+`tests/test_requirement_delivery.py`／`test_requirement_delivery_cli.py`／
+`test_github_delivery_client.py`／`test_delivery_orchestrator.py`（141 個）
+與 `-k "delivery or remote_closure or retire"`（280 個）全數維持通過。
