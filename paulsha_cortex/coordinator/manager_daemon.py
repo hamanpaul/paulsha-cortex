@@ -323,6 +323,7 @@ def _in_flight_status(
         )
     )
     in_flight = []
+    accepted_results_by_run: dict[str, list[dict[str, Any]]] = {}
     for job in registry.list_jobs():
         status = job.get("status")
         if status not in manager.IN_FLIGHT_STATUSES:
@@ -338,15 +339,29 @@ def _in_flight_status(
         execution_identity = manager._job_execution_identity(
             job, identity_source="in-flight"
         )
+        workflow_run_id = job.get("workflow_run_id")
+        accepted_results: list[dict[str, Any]] = []
+        if isinstance(workflow_run_id, str) and workflow_run_id:
+            if workflow_run_id not in accepted_results_by_run:
+                try:
+                    run = registry.get_workflow_run(workflow_run_id)
+                except Exception:  # noqa: BLE001 - status enrichment is fail-soft
+                    accepted_results_by_run[workflow_run_id] = []
+                else:
+                    accepted_results_by_run[workflow_run_id] = (
+                        manager.workflow_accepted_results_for_run(registry, run)
+                    )
+            accepted_results = accepted_results_by_run[workflow_run_id]
         # ``job_id`` 只來自 execution_identity 的投影（單一來源）。
-        in_flight.append(
-            {
-                "slice_id": job.get("task"),
-                "state": status,
-                "candidate_git_base": git_base,
-                **execution_identity,
-            }
-        )
+        row = {
+            "slice_id": job.get("task"),
+            "state": status,
+            "candidate_git_base": git_base,
+            **execution_identity,
+        }
+        if accepted_results:
+            row["accepted_workflow_results"] = accepted_results
+        in_flight.append(row)
     return in_flight
 
 

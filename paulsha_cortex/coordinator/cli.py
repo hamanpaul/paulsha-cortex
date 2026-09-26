@@ -75,6 +75,10 @@ def _attribute_job(job: dict[str, Any], reg: JobRegistry) -> dict[str, Any]:
         except KeyError:
             run = None
     job.update(_workflow_run_attribution(run))
+    if run is not None:
+        from . import manager
+
+        job.update(manager.workflow_job_result_presentation(job, run))
     return job
 
 
@@ -83,7 +87,12 @@ def _attribute_jobs(jobs: list[dict[str, Any]], reg: JobRegistry) -> list[dict[s
     避免對每個 job 各自線性掃描 registry 的 workflow run 列表。"""
     runs_by_id = {run.run_id: run for run in reg.list_workflow_runs()}
     for job in jobs:
-        job.update(_workflow_run_attribution(runs_by_id.get(job.get("workflow_run_id"))))
+        run = runs_by_id.get(job.get("workflow_run_id"))
+        job.update(_workflow_run_attribution(run))
+        if run is not None:
+            from . import manager
+
+            job.update(manager.workflow_job_result_presentation(job, run))
     return jobs
 
 
