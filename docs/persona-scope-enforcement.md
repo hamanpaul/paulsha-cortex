@@ -75,6 +75,15 @@ python -m paulsha_cortex.persona.replay --limit 30 --ref main
 的角色歸戶邏輯），絕不可放寬 `PersonaGuardrail` 的判定強度或擴大豁免範圍來
 讓回放通過——那會讓「零誤殺」變成自我實現的空話（D2）。
 
+## Coordinator 候選驗證的 slice 路徑（#489）
+
+slice 的 `verification` contract 可宣告 `write_paths`，內容為 repo 根目錄下的明確
+相對檔案路徑清單，不接受 glob。候選驗證會分別保留 builder persona 與 slice 路徑的
+違規，再以兩者交集判定 `scope.status`；任一路徑不在其中一份 allowlist 就回報
+`violated` 並阻擋候選。舊 pinned contract 若沒有 `write_paths`，仍保留 persona 檢查，
+但成功證據標成 `persona-only`，不宣稱已驗證 slice 任務邊界。這是候選驗證 gate，
+不宣稱能在 executor 寫入當下即時攔截越界操作。
+
 ## 違規訊息格式（R2 / D3）
 
 `persona-scope.yml` 的 stdout 為單行 JSON verdict，違規時（`ok: false`）包含
