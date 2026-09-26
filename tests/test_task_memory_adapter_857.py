@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1131,3 +1134,195 @@ def test_adapter_has_no_project_or_task_kind_special_case(repo, work_id, phase):
     assert result.context.task_kind == phase
     assert result.events[0]["project"] == repo
     assert result.events[0]["project"] == context.project
+
+
+def test_task_memory_work_item_title_reads_durable_work_snapshot(tmp_path, monkeypatch):
+    """#857 對抗審查第四輪：goal/intent 的標題來源改讀 Monitor 落地的 durable
+    last-good work snapshot（``WorkSnapshotStore``），不是即時 IPC，也不是
+    憑空造字串。"""
+
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.monitor import work_snapshot as work_snapshot_module
+    from paulsha_cortex.monitor.work_snapshot import WorkSnapshot, WorkSnapshotStore
+
+    snapshot_path = tmp_path / "work-items-snapshot.json"
+    monkeypatch.setattr(work_snapshot_module, "work_items_snapshot_path", lambda: snapshot_path)
+
+    item = WorkItem(
+        work_id="demo",
+        repo="acme/demo",
+        title="Ship the task memory adapter for #857",
+        state="ongoing",
+        phase="build",
+        facets=(),
+        sources=(),
+        next_actions=(),
+        workflow_run_id=None,
+        updated_at="2026-09-26T00:01:00Z",
+    )
+    snapshot = WorkSnapshot(
+        sequence=1,
+        written_at="2026-09-26T00:00:00Z",
+        providers={},
+        work_items=(item,),
+        source_owners={},
+        exclusions=(),
+    )
+    WorkSnapshotStore(path=snapshot_path).write(snapshot)
+
+    assert (
+        manager._task_memory_work_item_title("acme/demo", "demo")
+        == "Ship the task memory adapter for #857"
+    )
+    # 不同 repo／不同 work_id：不得誤配到別的 Work Item。
+    assert manager._task_memory_work_item_title("acme/demo", "other-work") is None
+    assert manager._task_memory_work_item_title("other/repo", "demo") is None
+
+    # snapshot 不存在：fail-soft 回 None，不炸 dispatch。
+    monkeypatch.setattr(
+        work_snapshot_module, "work_items_snapshot_path", lambda: tmp_path / "missing.json"
+    )
+    assert manager._task_memory_work_item_title("acme/demo", "demo") is None
+
+
+def test_dispatch_envelope_uses_work_item_title_issue_refs_and_prior_attempt_facts(
+    tmp_path, monkeypatch
+):
+    """MAJOR 修復（issue #857 對抗審查第四輪）：正式 dispatch 路徑（
+    ``manager._prepare_task_memory_dispatch``）過去自造 SimpleNamespace
+    work_item、goal 固定寫死 `Complete <phase> work <card>...`，也沒傳
+    related_files/related_errors——開 PSC_TASK_MEMORY_ENABLED=1 時 Hippo 永遠
+    收不到真實任務上下文。修復後 goal 取正式 Work Item 標題＋issue refs（沒
+    有 Work Item 時才退回卡片描述），related_files 取 run 既有的 planning
+    artifact 路徑與上一個 attempt 既有的 output baseline 檔案清單，
+    related_errors 取前一 attempt 既有的 bounded 採信錯誤。"""
+
+    from paulsha_cortex.coordinator import manager
+
+    _work_item, run, step, job = _run(repo="acme/demo", work_id="demo", phase="build")
+
+    monkeypatch.setattr(
+        manager,
+        "_task_memory_work_item_title",
+        lambda repo, work_id: (
+            "Ship the task memory adapter for #857"
+            if (repo, work_id) == (run.repo, run.work_id)
+            else None
+        ),
+    )
+    monkeypatch.setenv("PSC_TASK_MEMORY_ENABLED", "1")
+    monkeypatch.delenv("PSC_TASK_MEMORY_HIPPO_CMD", raising=False)
+
+    prior_log = tmp_path / "prior-attempt.log"
+    prior_log.write_text("no terminal evidence in this attempt\n", encoding="utf-8")
+    matching = [
+        {
+            "job_id": "job-prior-attempt",
+            "workflow_run_id": run.run_id,
+            "workflow_card": step.card,
+            "workflow_phase": step.phase,
+            "status": "exited",
+            "log_path": str(prior_log),
+            "workflow_output_baseline": [
+                {"path": "src/existing_module.py", "sha256": "a" * 64},
+            ],
+        }
+    ]
+
+    class Registry:
+        def get_workflow_run(self, run_id):
+            assert run_id == run.run_id
+            return run
+
+        def list_jobs(self):
+            return [job]
+
+    result = manager._prepare_task_memory_dispatch(
+        run=run,
+        step=step,
+        job=job,
+        registry=Registry(),
+        coordinator_root=tmp_path / "coordinator",
+        matching=matching,
+    )
+    assert result is not None
+    _adapter, prepared = result
+    context = prepared.context
+
+    assert context.goal.startswith("Ship the task memory adapter for #857")
+    assert f"{run.repo}#857" in context.goal
+    assert "docs/superpowers/specs/task-memory-delivery-adapter-spec.md" in context.related_files
+    assert "docs/superpowers/plans/task-memory-delivery-adapter.md" in context.related_files
+    assert "src/existing_module.py" in context.related_files
+    assert any("no JSON evidence" in item for item in context.related_errors)
+
+
+def test_dispatch_envelope_falls_back_to_card_description_without_work_item():
+    """沒有正式 Work Item（snapshot 查無或未安裝 Monitor）時，goal 仍退回既
+    有卡片描述樣板，行為與修復前一致，不因新來源缺席而擋掉 dispatch。"""
+
+    from paulsha_cortex.coordinator import manager
+
+    _work_item, run, step, _job = _run(repo="acme/untracked", work_id="untracked", phase="build")
+    run = replace(run, issue_refs=())
+    assert (
+        manager._task_memory_goal(run, step)
+        == f"Complete {step.phase} work {step.card} for {run.repo}."
+    )
+
+
+def test_events_for_run_reader_takes_append_lock_and_never_observes_partial_write(tmp_path):
+    """MAJOR 修復（issue #857 對抗審查第四輪）：append 端有 exclusive
+    ``.lock``，但 reader（``events_for_run``）先前完全不拿鎖；``cortex work
+    show --task-memory`` 撞上 Manager 正在 append 下一筆 receipt 時，會讀到
+    寫一半、沒有換行結尾的最後一行，被當成「incomplete row」直接報錯。修復
+    後 reader 取同一把鎖的 shared lock：append 持有 exclusive lock 期間，
+    reader 必須等待，永遠讀不到寫一半的半行。"""
+
+    store = TaskMemoryReceiptStore(tmp_path / "coordinator")
+    context, *_ = _context()
+    prepared = TaskMemoryAdapter(provider=_provider_for("inline")).prepare(context)
+    committed = store.append(prepared.events[0])
+
+    path = store.sidecar_path(context.repo, context.work_id, context.workflow_run_id)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+
+    writer_lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(writer_lock_fd, fcntl.LOCK_EX)
+    partial = b'{"event_id": "tmr-in-flight-and-never-newline-terminated"'
+    result: dict[str, object] = {}
+    reader: threading.Thread | None = None
+    try:
+        # 模擬 append() 正在寫下一筆：檔尾補一段沒有換行的半行 JSONL。
+        with open(path, "ab") as handle:
+            handle.write(partial)
+
+        def _read() -> None:
+            try:
+                result["rows"] = store.events_for_run(
+                    context.repo, context.work_id, context.workflow_run_id
+                )
+            except Exception as exc:  # noqa: BLE001 - 帶回主執行緒斷言
+                result["error"] = exc
+
+        reader = threading.Thread(target=_read, daemon=True)
+        reader.start()
+        reader.join(timeout=0.3)
+        assert reader.is_alive(), "reader 應被 append 持有的 exclusive lock 擋住，不能立刻讀到半行"
+        assert "rows" not in result and "error" not in result
+
+        # append() 真正完成前一定會把這一行補齊、換行結尾才釋放鎖；這裡把半
+        # 行清掉，還原成「這次 append 還沒發生」的最後已知一致狀態，模擬
+        # append() 真正收尾（成功或中止都不會把半行留在鎖釋放之後）。
+        with open(path, "rb+") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.truncate(path.stat().st_size - len(partial))
+    finally:
+        fcntl.flock(writer_lock_fd, fcntl.LOCK_UN)
+        os.close(writer_lock_fd)
+
+    assert reader is not None
+    reader.join(timeout=5)
+    assert not reader.is_alive(), "reader 在鎖釋放後應該已經讀完，不應卡住"
+    assert "error" not in result, f"reader 不應撞見殘留半行: {result.get('error')!r}"
+    assert result.get("rows") == [committed]

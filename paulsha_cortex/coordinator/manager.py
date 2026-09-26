@@ -12730,6 +12730,93 @@ def _record_task_memory_events(
             logger.warning("task-memory receipt write failed (%s)", type(exc).__name__)
 
 
+def _task_memory_work_item_title(repo: str, work_id: str) -> str | None:
+    """#857 對抗審查 R4：goal/intent 優先取正式 Work Item 標題。
+
+    讀 Monitor 落地的 durable last-good snapshot（與
+    ``_runtime_preflight_gate`` 讀 provider freshness 走同一個
+    ``WorkSnapshotStore``，不對 Monitor daemon 發即時 IPC）。snapshot 不存
+    在、壞掉或找不到對應 Work Item 時一律回 ``None``——由呼叫端退回卡片描
+    述，不得因這裡失敗而擋掉整個 dispatch。
+    """
+
+    try:
+        from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+        snapshot = WorkSnapshotStore().load()
+    except Exception:
+        return None
+    if snapshot is None:
+        return None
+    for item in snapshot.work_items:
+        if item.repo == repo and item.work_id == work_id:
+            title = item.title.strip()
+            return title or None
+    return None
+
+
+def _task_memory_goal(run, step) -> str:
+    """#857 對抗審查 R4：goal 取正式 Work Item 標題＋issue refs；沒有 Work
+    Item 時才退回卡片描述（既有樣板文字，行為不變）。長度界限與 redaction
+    由下游 ``task_memory_context_from_cortex``（``_safe_public_text``）統一
+    處理，這裡只組候選文字，不重複那套規則。
+    """
+
+    title = _task_memory_work_item_title(run.repo, run.work_id)
+    base = title if title else f"Complete {step.phase} work {step.card} for {run.repo}."
+    issue_refs = tuple(dict.fromkeys(run.issue_refs))
+    if issue_refs:
+        return f"{base} (issue: {', '.join(issue_refs)})"
+    return base
+
+
+_TASK_MEMORY_RELATED_FILES_LIMIT = 20
+
+
+def _task_memory_related_files(
+    run, matching: Sequence[Mapping[str, object]]
+) -> tuple[str, ...]:
+    """#857 對抗審查 R4：related_files 只取 run 既有的持久化事實——
+    planning artifact 路徑（``run.planning_authority``）與（若有）上一個
+    attempt 既有的 output baseline 檔案清單（``_workflow_output_baseline``
+    在該次 dispatch 時已經算好、已持久化在 job row 上）；不重新掃工作區、
+    不猜測沒有紀錄的變更。
+    """
+
+    files: list[str] = [authority.ref for authority in run.planning_authority]
+    if matching:
+        baseline_rows = matching[-1].get("workflow_output_baseline")
+        if isinstance(baseline_rows, list):
+            for row in baseline_rows:
+                if isinstance(row, Mapping):
+                    path = row.get("path")
+                    if isinstance(path, str) and path:
+                        files.append(path)
+    return tuple(dict.fromkeys(files))[:_TASK_MEMORY_RELATED_FILES_LIMIT]
+
+
+def _task_memory_related_errors(
+    matching: Sequence[Mapping[str, object]], *, registry
+) -> tuple[str, ...]:
+    """#857 對抗審查 R4：related_errors 只取前一 attempt 既有的 bounded 採信
+    錯誤——與 ``_workflow_retry_context`` 同一支 ``_prior_card_acceptance_error``
+    （同一份 log、同一份 gate ledger、同一組判準函式重新導出），不重新讀
+    raw log 或 prompt 全文。首派（``matching`` 為空）或讀不到舊證據一律回
+    空 tuple。
+    """
+
+    if not matching:
+        return ()
+    error = _prior_card_acceptance_error(matching[-1], registry=registry)
+    if error is None:
+        return ()
+    message = str(error.get("message") or "").strip()
+    if not message:
+        return ()
+    error_class = str(error.get("error_class") or "").strip()
+    return (f"{error_class}: {message}" if error_class else message,)
+
+
 def _prepare_task_memory_dispatch(
     *,
     run,
@@ -12737,6 +12824,7 @@ def _prepare_task_memory_dispatch(
     job: Mapping[str, Any],
     registry,
     coordinator_root: str | Path,
+    matching: Sequence[Mapping[str, object]] = (),
 ):
     """Prepare optional inline context after exact run/job routing is persisted."""
 
@@ -12766,7 +12854,9 @@ def _prepare_task_memory_dispatch(
             # executor prompt. Snapshot and note-fetch are verified by canary;
             # they need a separate executor-facing capability before dispatch use.
             capabilities=TaskMemoryCapabilities(inline=True),
-            goal=f"Complete {step.phase} work {step.card} for {run.repo}.",
+            goal=_task_memory_goal(run, step),
+            related_files=_task_memory_related_files(run, matching),
+            related_errors=_task_memory_related_errors(matching, registry=registry),
             allowed_evidence_sources=("hippo",),
         )
         client = HippoTaskMemoryClient.from_environment()
@@ -13624,6 +13714,7 @@ def _dispatch_workflow_card(
             job=job,
             registry=registry,
             coordinator_root=coordinator_root,
+            matching=matching,
         )
         prompt = _workflow_job_prompt(
             run,

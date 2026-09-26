@@ -1172,7 +1172,42 @@ class TaskMemoryReceiptStore:
             os.close(lock_fd)
 
     def events_for_run(self, repo: str, work_id: str, run_id: str) -> list[dict[str, Any]]:
-        return self._read_path(self.sidecar_path(repo, work_id, run_id))
+        return self._read_path_locked(self.sidecar_path(repo, work_id, run_id))
+
+    def _read_path_locked(self, path: Path) -> list[dict[str, Any]]:
+        """在 :meth:`append` 用的同一把 ``.lock`` 上取 shared lock 再讀。
+
+        MAJOR 修復（issue #857 對抗審查第四輪）：append 端有 exclusive
+        lock，但先前的 reader（``events_for_run`` → ``_read_path``）完全
+        不拿鎖——``cortex work show --task-memory`` 或
+        ``record_task_memory_receipt()`` 剛好撞上 Manager 正在 append 一筆
+        receipt 時，會讀到寫一半的最後一行，被 ``_read_path`` 當成
+        「incomplete row」直接報錯，而不是穩定讀出 in-flight run。這裡改
+        成與 :meth:`append` 同一把鎖的 shared lock：append 持有 exclusive
+        lock 時，reader 在此阻塞等寫入完成才讀，讀到的必是完整寫入的一份
+        快照；append 之間彼此仍是 exclusive，reader 之間彼此可並行（shared
+        lock）。sidecar 目錄尚未建立（append 從未執行過）視為空集合，不算
+        鎖失敗；中段真正損毀（非「檔尾未換行」）仍由 ``_read_path`` 本身
+        fail-closed。
+        """
+
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        try:
+            lock_fd = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except FileNotFoundError:
+            return []
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            try:
+                return self._read_path(path)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
     def _read_path(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
