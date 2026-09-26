@@ -11093,12 +11093,14 @@ def _record_resolved_model_chain(
         "source": source,
         "envelope_source": envelope_source,
     }
+    update = {"resolved_model_chain": resolved}
     if getattr(run, "sizing_band", None) is not None:
         qualification_policy = getattr(identities, "qualification_policy", "disabled")
-        resolved[step.persona]["qualification"] = (
+        qualification = dict(getattr(run, "model_qualification", None) or {})
+        qualification[step.persona] = (
             "enforced" if qualification_policy == "enforce" else "not-enforced"
         )
-    update = {"resolved_model_chain": resolved}
+        update["model_qualification"] = qualification
     if execution_profile_binding is not None:
         profile_bindings = dict(getattr(run, "execution_profile_bindings", None) or {})
         profile_bindings[step.persona] = (

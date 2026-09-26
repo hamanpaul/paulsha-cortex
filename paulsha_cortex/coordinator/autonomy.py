@@ -994,7 +994,12 @@ def _bind_dispatch_execution_profile(
         persona,
         requirements=requirements,
     )
-    validate_dispatch_requirements(binding, identity=identity)
+    # slice lane 只在 spec 同時明示 executor/model_id 時才綁 profile；#381 起
+    # 這條路徑從不以 capability 宣告篩選 spec 指名的 identity（manager 路徑的
+    # capability 約束在候選篩選階段已處理），這裡維持同一語意，不新增門檻。
+    validate_dispatch_requirements(
+        binding, identity=identity, require_role_capability=False
+    )
     return bind_launcher_profile(launcher, binding)
 
 

@@ -18,6 +18,7 @@ from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowRun
 from paulsha_cortex.deck.compile import compile_combo
 from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
+from paulsha_cortex.monitor.providers import _validate_workflow_v2_row
 
 
 def _identity(
@@ -437,8 +438,22 @@ def test_sized_dispatch_records_unenforced_qualification_diagnostic(tmp_path: Pa
     )
 
     persisted = registry.get_workflow_run(run.run_id)
-    assert persisted.resolved_model_chain["builder"]["qualification"] == "not-enforced"
+    assert persisted.model_qualification == {"builder": "not-enforced"}
     assert persisted.execution_profile_bindings["builder"]["resolved_key"] == binding.resolved_key
+    # 舊版 Manager 的 resolved_model_chain row 驗證是封閉集合（required＋
+    # envelope_source）；qualification 塞進 row 會讓 rollback 後整份 registry
+    # 載入 fail-closed，所以只能落在舊版 from_dict 會忽略的頂層新欄位。
+    legacy_row_keys = {
+        "executor",
+        "model_id",
+        "independence_domain",
+        "source",
+        "envelope_source",
+    }
+    assert set(persisted.resolved_model_chain["builder"]) <= legacy_row_keys
+    # 同版 Monitor 的 canonical v2 projection 先 round-trip WorkflowRun 再以
+    # 封閉白名單驗 row；新欄位漏登記會讓整份 workflow projection degraded。
+    _validate_workflow_v2_row(persisted.to_dict())
 
 
 def test_a4_actual_key_tracks_conditions_and_never_infers_observed_values() -> None:

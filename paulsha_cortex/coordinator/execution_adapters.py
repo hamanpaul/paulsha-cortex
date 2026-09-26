@@ -533,11 +533,16 @@ def validate_dispatch_requirements(
     builder_domains: Sequence[str] = (),
     trust_root_valid: bool = True,
     quota: Mapping[str, object] | None = None,
+    require_role_capability: bool = True,
 ) -> None:
     """Recheck profile-bound hard gates at the final pre-spawn boundary.
 
     Quota is accepted only for observability; it is intentionally excluded from
     the permission calculation.
+
+    ``require_role_capability=False`` 只給既有契約本來就不看 capability 宣告的
+    入口（slice lane 的 spec 明示 executor/model_id）；unknown role、pin、
+    independence、Trust Root 與 qualification 仍照常硬擋。
     """
 
     del quota
@@ -552,7 +557,7 @@ def validate_dispatch_requirements(
     role = role_value.get("value") if role_value.get("state") == "known" else None
     if role not in _ROLE_CAPABILITY.values():
         raise ExecutionAdapterError("unknown role cannot enter the execution candidate pool")
-    if role not in getattr(identity, "capabilities", ()):
+    if require_role_capability and role not in getattr(identity, "capabilities", ()):
         raise ExecutionAdapterError(f"identity lacks required role capability: {role}")
     pin = binding.resolved.requirements["pin"]
     if pin.get("state") == "known" and pin.get("value") is not None:

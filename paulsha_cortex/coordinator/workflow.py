@@ -66,14 +66,18 @@ def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
     independence_domain, source, envelope_source?}}。
 
     ``source`` ∈ MODEL_CHAIN_RESOLUTION_SOURCES（#534 的四個解析層，外加
-    #534 之前的 legacy 值以便舊 run 紀錄照舊可載入）；``envelope_source`` 與
-    #835 ``qualification`` 是選配欄位，缺席代表舊紀錄或未到 sized dispatch。"""
+    #534 之前的 legacy 值以便舊 run 紀錄照舊可載入）；``envelope_source`` 為
+    #534 新增的**選配**欄位，缺席即為 #534 之前的紀錄。
+
+    row 的鍵集合刻意維持封閉且不再擴充：舊版 Manager／Monitor 以同一份封閉
+    集合驗證，row 多一個鍵就會讓 rollback 後整份 registry 載入 fail-closed。
+    #835 的 qualification 診斷因此落在頂層 ``model_qualification``。"""
     if value is None:
         return
     if not isinstance(value, dict):
         raise ValueError(f"workflow run {field_name} 必須為null或dict")
     required_keys = {"executor", "model_id", "independence_domain", "source"}
-    optional_keys = {"envelope_source", "qualification"}
+    optional_keys = {"envelope_source"}
     for persona, row in value.items():
         if persona not in MODEL_CHAIN_PERSONAS:
             raise ValueError(f"workflow run {field_name} persona 非法: {persona!r}")
@@ -88,18 +92,6 @@ def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
             raise ValueError(
                 f"workflow run {field_name}[{persona!r}].envelope_source 非法: "
                 f"{row.get('envelope_source')!r}"
-            )
-        if (
-            "qualification" in row
-            and (
-                not isinstance(row["qualification"], str)
-                or row["qualification"]
-                not in {"not-required", "not-enforced", "enforced"}
-            )
-        ):
-            raise ValueError(
-                f"workflow run {field_name}[{persona!r}].qualification 非法: "
-                f"{row.get('qualification')!r}"
             )
         for key in ("executor", "model_id", "independence_domain"):
             if not isinstance(row.get(key), str) or not row[key]:
@@ -142,6 +134,25 @@ def _validate_execution_profile_bindings(
         ):
             raise ValueError(
                 f"workflow run execution_profile_bindings[{persona!r}] identity 不符"
+            )
+
+
+MODEL_QUALIFICATION_STATES = frozenset({"not-enforced", "enforced"})
+
+
+def _validate_model_qualification(value: object) -> None:
+    """#835：sized dispatch 的 qualification 診斷——{persona: state}。"""
+
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("workflow run model_qualification 必須為null或dict")
+    for persona, state in value.items():
+        if persona not in MODEL_CHAIN_PERSONAS:
+            raise ValueError(f"workflow run model_qualification persona 非法: {persona!r}")
+        if state not in MODEL_QUALIFICATION_STATES:
+            raise ValueError(
+                f"workflow run model_qualification[{persona!r}] 非法: {state!r}"
             )
 
 
@@ -759,6 +770,10 @@ class WorkflowRun:
     # #835：與 legacy chain 並存的版本化 profile binding。只在實際解析後
     # 增寫，不回填舊 run；缺欄位的舊 registry 仍是 legacy/unknown。
     execution_profile_bindings: dict[str, dict[str, Any]] | None = None
+    # #835：sized dispatch 時各段的 qualification 診斷（"enforced"／
+    # "not-enforced"）。頂層新欄位而非塞進 resolved_model_chain row：舊版
+    # from_dict 忽略未知頂層鍵，row 內新鍵則會被舊版封閉驗證拒收。
+    model_qualification: dict[str, str] | None = None
     combo_selection: dict[str, Any] | None = None
     # 診斷 invariant 家族（#527／#514／#515／#511／#482）：把 run 轉入
     # `needs_human` 的那一刻必須同時落一份結構化理由（`diagnostics.
@@ -981,6 +996,7 @@ class WorkflowRun:
         _validate_execution_profile_bindings(
             self.execution_profile_bindings, self.resolved_model_chain
         )
+        _validate_model_qualification(self.model_qualification)
         _validate_combo_selection(self.combo_selection)
         if self.needs_human_reason is not None:
             # 形狀驗證：DiagnosticReason.from_dict 自己 fail-closed（reason 必須
@@ -1065,6 +1081,8 @@ class WorkflowRun:
                 persona: dict(binding)
                 for persona, binding in self.execution_profile_bindings.items()
             }
+        if self.model_qualification is not None:
+            payload["model_qualification"] = dict(self.model_qualification)
         return payload
 
     @classmethod
@@ -1156,6 +1174,7 @@ class WorkflowRun:
             model_chain_override=payload.get("model_chain_override"),
             resolved_model_chain=payload.get("resolved_model_chain"),
             execution_profile_bindings=payload.get("execution_profile_bindings"),
+            model_qualification=payload.get("model_qualification"),
             combo_selection=payload.get("combo_selection"),
             # 既有部署的狀態檔沒有這個欄位；缺席時維持 None（facet 有、理由沒有
             # 的 legacy run 照常載入，見上方 __post_init__ 的說明）。facet 已清
