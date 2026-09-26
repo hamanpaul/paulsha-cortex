@@ -12,7 +12,7 @@ evidence producer 以 `cortex/requirement-evidence-snapshot/v1` 提供 `captured
 |---|---|
 | source | manifest 指定 locator 的可信 source-root bytes 與 SHA-256。 |
 | test / review | 正式 CompletionRecord domain validator、hash-bound verification/review receipts、candidate 綁定、fresh WorkAuthority 與不同 reviewer independence domain。verification evidence 的 run 層級狀態（`reviewing`／`verified`）只表示整體驗證通過，不可直接推定覆蓋某 acceptance criterion；test 階段只採信 `details.tests` 中明確以 `acceptance_ids` 綁定該 criterion且 `status: passed` 的測試，未綁定或未過即為該 criterion 的 test gap。 |
-| merge | 以 WorkAuthority 授權的 PR 重新讀 GitHub closure facts，交既有 `evaluate_remote_closure` 驗 exact head、merge、issues、OpenSpec、Todo；只讀 API 查詢，不執行 closure。 |
+| merge | 以 WorkAuthority 授權的 PR 重新讀 GitHub closure facts，交既有 `evaluate_remote_closure` 驗 exact head、merge ancestry、issue 是否 closed、OpenSpec；只讀 API 查詢，不執行 closure。`evaluate_remote_closure` 本身只看 issue 目前是否 closed，不驗證是不是被這個 PR 關閉、也不把 Todo 勾選狀態當結案門檻（該語意留給 #808/#810 的 Todo/issue 擁有者，不能改共用 gate）；本 consumer 在此之上另外加嚴：mapped issue 必須出現在這條 PR 實際 `closingIssuesReferences`（`RemoteClosureFacts.closing_issues`），mapped todo.md 遠端內容必須全數勾選完成（`RemoteClosureFacts.todo_complete`），任一不成立即 `failed` 並留下具體 gap，不得只憑 issue 目前 closed 或既有 gate allowed 就記 verified。 |
 | installed | 消費 #841 既有 `cortex service status` loaded-runtime projection，以 service declaration 的實際 unit PID 比對 loaded artifact digest/source revision；再核對 service/instance、profile/config revision、target 與 Trust Root。CLI 只從既有 Manager coordinator root/Monitor state root 讀取，忽略 snapshot 的 root hint。 |
 | live | 驗 `cortex/live-canary-receipt/v1` hash、scope、target、期限、核可 authority 與 reviewer/canary 獨立性；最後仍需正式 live receipt validator。沒有 validator 時為 `unknown`。 |
 
@@ -20,7 +20,7 @@ evidence producer 以 `cortex/requirement-evidence-snapshot/v1` 提供 `captured
 
 ## 索引與恢復
 
-索引是 Manager-owned 的唯讀可重建 sidecar，位置由 Trust Root `requirement-delivery-index` 登記；它不取代 WorkflowRun、CompletionRecord、GitHub 或 #841 receipt。reconcile 先讀並重驗可信來源，再核對 WorkAuthority digest，最後以檔案鎖、精確 index revision CAS、同目錄暫存檔、fsync 與原子替換發布。replay 不重寫來源證據；舊 source generation 不可覆蓋較新值；candidate/profile/config/policy/requirement revision 變化只使相符歷史 mapping stale。未知的同版本欄位保留於 extensions；未知 future index schema 拒絕自動降版或覆寫。
+索引是 Manager-owned 的唯讀可重建 sidecar，位置由 Trust Root `requirement-delivery-index` 登記；它不取代 WorkflowRun、CompletionRecord、GitHub 或 #841 receipt。reconcile 先讀並重驗可信來源，再核對 WorkAuthority digest，最後以檔案鎖、精確 index revision CAS、同目錄暫存檔、fsync 與原子替換發布。replay 不重寫來源證據；舊 source generation 不可覆蓋較新值——generation 比較以 requirement/criterion（含 repo/work/run）範圍為準、跨 mapping_id 比對，即使 candidate/completion_record 變動換了 mapping_id，從未入索引過的舊 generation 仍不得把已落地的較新 covered mapping 標成 stale 並取而代之；candidate/profile/config/policy/requirement revision 變化只使相符歷史 mapping stale。未知的同版本欄位保留於 extensions；未知 future index schema 拒絕自動降版或覆寫。
 
 索引 gap 保存最後 reconcile 的機讀投影。`status` 僅讀這份投影；`gaps` 重新查可信來源並產生即時缺額但不寫索引；`reconcile` 才寫 sidecar。三者都不呼叫模型、不派工、不 merge、不部署、不改 issue，也不關票。waiver 必須精確限定 requirement/revision/acceptance/stage、理由、核可 authority/version、期限與 receipt，並由外部核可 validator 確認；installed/live 永不可 waiver。此 manifest 目前不授權任何 waiver，保留其必要階段。
 

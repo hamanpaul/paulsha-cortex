@@ -750,6 +750,7 @@ def _verify_remote_merge(
             required_issues=authority.mapped_issues,
             todo_paths=authority.mapped_todo_paths,
             canonical_checkout=checkout,
+            include_closing_issues=True,
         )
         if not isinstance(facts, github_delivery.RemoteClosureFacts):
             raise ValueError("remote closure facts have an unknown shape")
@@ -770,6 +771,15 @@ def _verify_remote_merge(
         target = row.get("target")
         if isinstance(target, Mapping) and target.get("source_revision", "").lower() != facts.merge_commit.lower():
             return _stage("failed", "installed-source-revision-does-not-match-merge")
+        # `evaluate_remote_closure` 只看 issue 目前是否 closed，不驗證是「這個」PR
+        # 關閉的——issue 可能被人工或另一個 PR 關閉，mapped todo 也可能仍有未勾選項。
+        # 這兩條是本 consumer（requirement-delivery）對 merge 階段加嚴的必要條件，
+        # 不能改共用 gate 的語意，因此在這裡另外檢查。
+        unreferenced_issues = set(authority.mapped_issues) - set(facts.closing_issues)
+        if unreferenced_issues:
+            return _stage("failed", "remote-closing-issue-reference-missing")
+        if not facts.todo_complete:
+            return _stage("failed", "remote-todo-incomplete")
         if not gate.allowed:
             return _stage("failed", "remote-closure-blocked:" + ",".join(gate.reasons))
         result = _stage(
@@ -1338,10 +1348,28 @@ def reconcile_delivery(
         logical = tuple(new_row.get(key) for key in ("requirement_id", "acceptance_id", "repo", "work_id", "run_id"))
         for old_id, old_row in old_rows.items():
             old_logical = tuple(old_row.get(key) for key in ("requirement_id", "acceptance_id", "repo", "work_id", "run_id"))
-            if old_id != new_row["mapping_id"] and old_logical == logical and old_row.get("status") == "covered":
-                old_row["status"] = "stale"
-                old_row["stale_reason"] = "mapping-context-updated"
-                old_row["superseded_by"] = new_row["mapping_id"]
+            if old_id == new_row["mapping_id"] or old_logical != logical or old_row.get("status") != "covered":
+                continue
+            # 這裡是「同一 requirement／criterion 範圍、不同 mapping_id」的比較，
+            # 不能只看 mapping_id 是否相同就直接標 stale：mapping_id 會因
+            # candidate/completion_record 等內容變動而改變，若晚到的舊
+            # generation（例如從未入索引過的 gen1）先被當成 new_row 走到這裡，
+            # 會把已落地、較新且仍合法的 covered mapping 誤標成 stale，等於讓舊
+            # snapshot 回滾新結果。generation 比較必須跨 mapping_id、以此 logical
+            # 範圍為準；較舊 generation 不得覆蓋或使較新有效 mapping stale。
+            old_generation = old_row.get("source_generation")
+            new_generation = new_row.get("source_generation")
+            if (
+                type(old_generation) is int
+                and type(new_generation) is int
+                and new_generation < old_generation
+            ):
+                report["closure_readiness"] = "pending"
+                report["source_generation_drift"] = True
+                return {"report": report, "index": base, "changed": False, "index_revision": base_revision, "pending_reason": "late-source-generation-ignored"}
+            old_row["status"] = "stale"
+            old_row["stale_reason"] = "mapping-context-updated"
+            old_row["superseded_by"] = new_row["mapping_id"]
     for mapping_id, incoming in new_by_id.items():
         previous = old_rows.get(mapping_id)
         if previous is not None:

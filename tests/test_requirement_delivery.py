@@ -34,10 +34,28 @@ NOW = 1_790_380_800.0
 
 
 class _GitHub:
-    def __init__(self, *, merge: str = MERGE, head: str = HEAD, issue_state: str = "closed") -> None:
+    """可控 remote closure 事實的假 GitHub client。
+
+    ``closing_issues`` 與 ``todo_complete`` 必須能各自獨立變動，才能表達
+    「issue 目前 closed 但不是被這個 PR 關閉」與「mapped todo 仍有未勾選項」
+    兩種與 issue_state／merge 無關的負例（見 requirement_delivery 對抗審查
+    第三輪 BLOCKER：舊版 stub 把兩者都固定成通過值，測試永遠驗不到這兩條）。
+    """
+
+    def __init__(
+        self,
+        *,
+        merge: str = MERGE,
+        head: str = HEAD,
+        issue_state: str = "closed",
+        closing_issues: tuple[int, ...] = (845,),
+        todo_complete: bool = True,
+    ) -> None:
         self.merge = merge
         self.head = head
         self.issue_state = issue_state
+        self.closing_issues = closing_issues
+        self.todo_complete = todo_complete
         self.calls: list[dict] = []
 
     def fetch_remote_closure(self, **kwargs):
@@ -52,9 +70,10 @@ class _GitHub:
             issue_states={845: self.issue_state},
             active_openspec_absent=True,
             archive_present=True,
-            todo_complete=True,
+            todo_complete=self.todo_complete,
             todo_revisions={"docs/todo.md": "6" * 40},
             completion_record_valid=True,
+            closing_issues=self.closing_issues,
         )
 
 
@@ -503,7 +522,11 @@ def test_a02_each_delivery_stage_is_accounted_separately(tmp_path: Path) -> None
 
 @pytest.mark.parametrize(
     "defect",
-    ["bad-hash", "wrong-repo", "wrong-work", "wrong-run", "wrong-candidate", "wrong-pr", "old-revision", "wrong-merge"],
+    [
+        "bad-hash", "wrong-repo", "wrong-work", "wrong-run", "wrong-candidate",
+        "wrong-pr", "old-revision", "wrong-merge",
+        "issue-not-referenced-by-pr", "todo-incomplete",
+    ],
 )
 def test_a03_invalid_or_cross_bound_evidence_fails_closed(tmp_path: Path, defect: str) -> None:
     manifest, snapshot, context = _ready_case(tmp_path)
@@ -525,7 +548,41 @@ def test_a03_invalid_or_cross_bound_evidence_fails_closed(tmp_path: Path, defect
         row["requirement_revision"] = "r0"
     elif defect == "wrong-merge":
         context["github_client"] = _GitHub(merge="0" * 40)
+    elif defect == "issue-not-referenced-by-pr":
+        # issue 目前 closed，但不是被這個 PR 的 closingIssuesReferences 關閉
+        # （例如人工關閉或被別的 PR 關閉）；merge 不能就此記 verified。
+        context["github_client"] = _GitHub(closing_issues=())
+    elif defect == "todo-incomplete":
+        # mapped todo.md 遠端仍有未勾選項；merge 不能記 verified。
+        context["github_client"] = _GitHub(todo_complete=False)
     report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] == "not-ready"
+
+
+def test_a03_merge_requires_pr_to_actually_close_the_mapped_issue(tmp_path: Path) -> None:
+    """issue closed 是觀測事實，但唯有這個 PR 的 closingIssuesReferences 真正
+    綁定該 issue，merge 階段才可記 verified；否則須留下具體 gap。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    context["github_client"] = _GitHub(closing_issues=())
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    merge_gap = next(gap for gap in report["gaps"] if gap["stage"] == "merge")
+    assert merge_gap["status"] == "failed"
+    assert merge_gap["reason"] == "remote-closing-issue-reference-missing"
+    assert report["closure_readiness"] == "not-ready"
+
+
+def test_a03_merge_requires_mapped_todo_to_be_complete(tmp_path: Path) -> None:
+    """mapped todo.md 遠端仍有未勾選項時，merge 階段不可記 verified。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    context["github_client"] = _GitHub(todo_complete=False)
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    merge_gap = next(gap for gap in report["gaps"] if gap["stage"] == "merge")
+    assert merge_gap["status"] == "failed"
+    assert merge_gap["reason"] == "remote-todo-incomplete"
     assert report["closure_readiness"] == "not-ready"
 
 
@@ -618,6 +675,45 @@ def test_a06_candidate_change_stales_only_its_mapping(tmp_path: Path) -> None:
     assert statuses[("R01", HEAD)] == "stale"
     assert statuses[("R01", "9" * 40)] == "blocked"
     assert statuses[("R02", HEAD)] == "covered"
+
+
+def test_a06_never_indexed_older_generation_cannot_roll_back_newer_covered_mapping(tmp_path: Path) -> None:
+    """對抗審查第三輪 MAJOR：先落地新 candidate／generation 2 為 covered，之後
+    收到一條「從未入索引過」的舊 candidate／generation 1（同一 requirement、
+    criterion、work、run，僅 completion_record 內容不同故 mapping_id 不同）。
+    generation 比較必須跨 mapping_id、以 requirement/criterion 範圍為準；
+    較舊 generation 不得把較新有效 covered mapping 標成 stale 而取而代之。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    index_path = tmp_path / "index.json"
+    row = snapshot["mappings"][0]
+
+    newer = copy.deepcopy(snapshot)
+    newer["snapshot_revision"] = 2
+    newer["mappings"][0]["source_generation"] = 2
+    first = reconcile_delivery(manifest, newer, index_path=index_path, **context)
+    assert first["report"]["closure_readiness"] == "ready"
+    assert first["index"]["mappings"][0]["status"] == "covered"
+    newer_mapping_id = first["index"]["mappings"][0]["mapping_id"]
+
+    late_arrival = copy.deepcopy(snapshot)
+    late_arrival["snapshot_revision"] = 3
+    late_row = late_arrival["mappings"][0]
+    late_row["source_generation"] = 1
+    late_row["completion_record"] = _write_completion(
+        tmp_path,
+        run_id=row["run_id"],
+        slice_id="never-indexed-old-generation",
+        acceptance_ids=["R01-AC1"],
+    )
+
+    result = reconcile_delivery(manifest, late_arrival, index_path=index_path, **context)
+
+    assert result["changed"] is False
+    assert result["pending_reason"] == "late-source-generation-ignored"
+    stored = read_index(index_path)
+    assert len(stored["mappings"]) == 1
+    assert stored["mappings"][0]["mapping_id"] == newer_mapping_id
+    assert stored["mappings"][0]["status"] == "covered"
 
 
 def test_a06_evidence_policy_revision_stales_only_its_requirement(tmp_path: Path) -> None:

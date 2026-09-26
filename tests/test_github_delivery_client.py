@@ -237,6 +237,33 @@ class ClosureRunner:
         self.calls.append((list(argv), kwargs))
         if argv[:1] == ["git"]:
             return subprocess.run(argv, **kwargs)
+        if argv[:3] == ["gh", "api", "graphql"]:
+            # fetch_remote_closure 也要靠 closingIssuesReferences 判定「issue 是
+            # 不是被這個 PR 真正關閉」，不能只看 issue 目前 state；回傳同一顆 PR
+            # 綁定的 issue 14，和其他測試假設的 required_issues=(14,) 對齊。
+            return Result(
+                {
+                    "data": {
+                        "repository": {
+                            "pullRequest": {
+                                "closingIssuesReferences": {
+                                    "nodes": [
+                                        {
+                                            "number": 14,
+                                            "repository": {"nameWithOwner": "acme/demo"},
+                                        }
+                                    ],
+                                    "pageInfo": {"hasNextPage": False, "endCursor": "I1"},
+                                },
+                                "reviewThreads": {
+                                    "nodes": [],
+                                    "pageInfo": {"hasNextPage": False, "endCursor": "T1"},
+                                },
+                            }
+                        }
+                    }
+                }
+            )
         endpoint = argv[-1]
         if endpoint == "repos/acme/demo/pulls/7":
             return Result(
@@ -315,6 +342,26 @@ def test_fetch_delivery_facts_uses_latest_legacy_status_per_context() -> None:
     assert legacy_checks[0].terminal_green
 
 
+def test_fetch_remote_closure_does_not_query_closing_issues_unless_requested(
+    tmp_path: Path,
+) -> None:
+    """#845：closingIssuesReferences 查詢是 opt-in。ship／retire-delivered／work
+    bridge 等既有呼叫者不帶旗標時不得多打 GraphQL，也不因該查詢失敗而失敗。"""
+
+    checkout, _bare, expected = _closure_repositories(tmp_path)
+    runner = ClosureRunner(expected)
+    facts = GitHubDeliveryClient(runner=runner).fetch_remote_closure(
+        repo="acme/demo",
+        pr_number=7,
+        change="unified-work-lifecycle",
+        required_issues=(14,),
+        todo_paths=("docs/todo.md",),
+        canonical_checkout=checkout,
+    )
+    assert facts.closing_issues == ()
+    assert not any(argv[:3] == ["gh", "api", "graphql"] for argv, _kwargs in runner.calls)
+
+
 def test_fetch_remote_closure_verifies_merge_ancestor_issues_and_archive(
     tmp_path: Path,
 ) -> None:
@@ -327,12 +374,14 @@ def test_fetch_remote_closure_verifies_merge_ancestor_issues_and_archive(
         required_issues=(14,),
         todo_paths=("docs/todo.md",),
         canonical_checkout=checkout,
+        include_closing_issues=True,
     )
     assert facts.merge_commit == expected["merge_commit"]
     assert facts.merge_is_ancestor
     assert facts.merge_is_merge_commit
     assert expected["pr_head"] in facts.merge_parents
     assert facts.issue_states == {14: "closed"}
+    assert facts.closing_issues == (14,)
     assert facts.archive_present
     assert facts.todo_complete
     assert facts.default_head == expected["default_head"]
