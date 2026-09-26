@@ -6178,6 +6178,8 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
     run = SimpleNamespace(run_id="workflow-review", candidate_head=candidate)
     step = SimpleNamespace(card="verification")
     coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    review_job_id = registry.reserve_job_id("review-mutation")
     sandbox, checkout = manager._create_reviewer_sandbox(
         run=run,
         step=step,
@@ -6185,6 +6187,7 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
         candidate_root=repo,
         coordinator_root=coordinator,
         input_snapshot=(),
+        job_id=review_job_id,
     )
     assert sandbox != repo
     assert subprocess.run(
@@ -6205,9 +6208,8 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
         ["git", "-C", str(checkout), "push", "origin", "HEAD:refs/heads/forbidden"],
         capture_output=True, text=True, check=False,
     ).returncode != 0
-    registry = JobRegistry(state_path=coordinator / "jobs.json")
     job = registry.create_job(
-        task="review-mutation", persona="reviewer", kind="review", branch="feature/work",
+        task="review-mutation", job_id=review_job_id, persona="reviewer", kind="review", branch="feature/work",
         pane="", worktree=str(sandbox), executor="claude", model_id="reviewer",
         independence_domain="anthropic", subject_head=candidate,
         workflow_run_id="workflow-review", workflow_claim_key="claim", workflow_repo="owner/repo",
@@ -6311,6 +6313,7 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     )
     registry.update_headless_result(builder["job_id"], status="exited", exit_code=0)
     verify_step = next(step for step in run.steps if step.card == "verification")
+    legacy_job_id = registry.reserve_job_id("wf-verification")
     sandbox, checkout = manager._create_reviewer_sandbox(
         run=run,
         step=verify_step,
@@ -6318,11 +6321,13 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
         candidate_root=repo,
         coordinator_root=coordinator,
         input_snapshot=(),
+        job_id=legacy_job_id,
     )
     log_root = coordinator / "logs" / "workflow"
     log_root.mkdir(parents=True)
     legacy = registry.create_job(
         task="wf-verification",
+        job_id=legacy_job_id,
         persona="reviewer",
         kind="review",
         branch="feature/14-production-wiring",
@@ -6470,11 +6475,19 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     assert resumed["job_id"] != legacy["job_id"]
     assert [row[0] for row in launched] == [resumed["job_id"]]
     assert '"candidate_checkout": "."' in launched[0][1]
-    assert launched[0][2] == str(sandbox)
     replacement = registry.get_job(resumed["job_id"])
-    assert Path(replacement["worktree"]) == sandbox
-    assert Path(replacement["workflow_input_root"]) == sandbox
-    assert sandbox.is_dir()
+    replacement_worktree = Path(str(replacement["worktree"]))
+    assert launched[0][2] == str(replacement_worktree)
+    assert replacement_worktree.parent == sandbox.parent
+    assert replacement_worktree.name == manager._reviewer_sandbox_name(
+        run_id=run.run_id,
+        card=verify_step.card,
+        candidate=candidate,
+        job_id=str(resumed["job_id"]),
+    )
+    assert Path(replacement["workflow_input_root"]) == replacement_worktree
+    assert replacement_worktree.is_dir()
+    assert not sandbox.exists()
     assert registry.get_job(legacy["job_id"])["workflow_evidence"] is None
 
 

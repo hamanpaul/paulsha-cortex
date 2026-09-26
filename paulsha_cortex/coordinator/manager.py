@@ -7922,6 +7922,21 @@ def _grant_reviewer_sandbox_access(sandbox: Path) -> str | None:
     )
 
 
+def _reviewer_sandbox_name(
+    *,
+    run_id: str,
+    card: str,
+    candidate: str,
+    job_id: str | None,
+) -> str:
+    preimage = (
+        f"{run_id}:{card}:{candidate}:{job_id}"
+        if job_id is not None
+        else f"{run_id}:{card}:{candidate}"
+    )
+    return hashlib.sha256(preimage.encode()).hexdigest()[:32]
+
+
 def _create_reviewer_sandbox(
     *,
     run,
@@ -7930,16 +7945,24 @@ def _create_reviewer_sandbox(
     candidate_root: Path,
     coordinator_root: str | Path,
     input_snapshot: tuple[dict[str, str], ...],
+    job_id: str,
 ) -> tuple[Path, Path]:
     candidate = run.candidate_head
     if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
         raise ValueError("workflow reviewer candidate invalid")
+    if not isinstance(job_id, str) or not job_id:
+        raise ValueError("workflow reviewer job id invalid")
     parent = _reviewer_sandbox_parent(
         coordinator_root=coordinator_root,
         candidate_root=candidate_root,
     )
     _prepare_reviewer_sandbox_container(parent)
-    name = hashlib.sha256(f"{run.run_id}:{step.card}:{candidate}".encode()).hexdigest()[:32]
+    name = _reviewer_sandbox_name(
+        run_id=run.run_id,
+        card=step.card,
+        candidate=candidate,
+        job_id=job_id,
+    )
     sandbox = parent / name
     if sandbox.exists() or sandbox.is_symlink():
         raise ValueError("stale reviewer sandbox requires reconciliation")
@@ -8046,19 +8069,35 @@ def _reviewer_sandbox_path(job: Mapping[str, object], coordinator_root: str | Pa
     run_id = job.get("workflow_run_id")
     card = job.get("workflow_card")
     candidate = job.get("subject_head")
+    job_id = job.get("job_id")
     if (
         not isinstance(run_id, str)
         or not isinstance(card, str)
         or not isinstance(candidate, str)
+        or not isinstance(job_id, str)
+        or not job_id
         or verification.SAFE_SHA_RE.fullmatch(candidate) is None
     ):
         raise ValueError("reviewer sandbox identity missing")
-    expected_name = hashlib.sha256(f"{run_id}:{card}:{candidate}".encode()).hexdigest()[:32]
+    expected_names = {
+        _reviewer_sandbox_name(
+            run_id=run_id,
+            card=card,
+            candidate=candidate,
+            job_id=job_id,
+        ),
+        _reviewer_sandbox_name(
+            run_id=run_id,
+            card=card,
+            candidate=candidate,
+            job_id=None,
+        ),
+    }
     if (
         not path.is_absolute()
         or path.is_symlink()
         or path.parent != allowed
-        or path.name != expected_name
+        or path.name not in expected_names
     ):
         raise ValueError("reviewer sandbox path invalid")
     return path
@@ -8111,6 +8150,43 @@ def _discard_reviewer_sandbox(
         raise ValueError("reviewer sandbox cleanup incomplete")
     if require_candidate_unchanged and not unchanged:
         raise ValueError("workflow reviewer modified Candidate checkout")
+
+
+def _reclaim_superseded_era_reviewer_sandboxes(
+    matching: Sequence[Mapping[str, object]],
+    *,
+    run,
+    coordinator_root: str | Path,
+) -> None:
+    current_worktrees = {
+        worktree
+        for job in matching
+        if job.get("workflow_claim_key") in (None, run.claim_key)
+        and isinstance((worktree := job.get("worktree")), str)
+    }
+    for job in matching:
+        claim_key = job.get("workflow_claim_key")
+        if (
+            job.get("persona") != "reviewer"
+            or not isinstance(claim_key, str)
+            or claim_key == run.claim_key
+            or job.get("status") not in TERMINAL_STATUSES
+            or job.get("worktree") in current_worktrees
+        ):
+            continue
+        try:
+            _discard_reviewer_sandbox(
+                job,
+                coordinator_root=coordinator_root,
+                require_candidate_unchanged=False,
+            )
+        except (ValueError, OSError) as exc:
+            logger.warning(
+                "workflow reviewer sandbox reclaim failed for run %s job %s: %s",
+                run.run_id,
+                job.get("job_id"),
+                summarize_exception(exc),
+            )
 
 
 def terminalize_workflow_job(
@@ -11810,11 +11886,10 @@ def _dispatch_workflow_card(
     )
     if reusable and not retryable_latest:
         return reusable[-1]
-    # #569：reviewer 卡的強制重派要先回收被取代 job 的 sandbox。sandbox 目錄名是
-    # `sha256(run_id:card:candidate)`（見 `_create_reviewer_sandbox`），重派同一
-    # 張卡＋同一個 candidate 必然撞上「stale reviewer sandbox requires
-    # reconciliation」而派不出去。`require_candidate_unchanged=True` 讓「reviewer
-    # 動過 candidate」fail closed——重派不得成為蓋掉這個事實的名義。刻意只掛在
+    # #569：reviewer 卡的強制重派要先回收被取代 job 的 sandbox。sandbox 目錄名
+    # 現在以 `sha256(run_id:card:candidate:job_id)` 綁 job；legacy
+    # `sha256(run_id:card:candidate)` 名只保留為容忍／回收面。`require_candidate_unchanged=True`
+    # 讓「reviewer 動過 candidate」fail closed——重派不得成為蓋掉這個事實的名義。刻意只掛在
     # forced 路徑上：其餘既有路徑的 sandbox 已由 terminalize／resume 的既有回收
     # 點處理，行為一個字節都不動。
     if force_new_card and matching and step.persona == "reviewer":
@@ -11822,6 +11897,12 @@ def _dispatch_workflow_card(
             matching[-1],
             coordinator_root=coordinator_root,
             require_candidate_unchanged=True,
+        )
+    if step.persona == "reviewer":
+        _reclaim_superseded_era_reviewer_sandboxes(
+            matching,
+            run=run,
+            coordinator_root=coordinator_root,
         )
     if matching and step.persona == "planner":
         _discard_failed_planner_sandbox(
@@ -12350,6 +12431,7 @@ def _dispatch_workflow_card(
                 candidate_root=reviewer_target,
                 coordinator_root=coordinator_root,
                 input_snapshot=input_snapshot,
+                job_id=reserved_job_id,
             )
             sandbox_hash = planning_runtime._tree_snapshot(reviewer_target)
             repo_root = str(reviewer_target)

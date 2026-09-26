@@ -400,10 +400,9 @@ def seal_review_verdict_spool(path: str | Path) -> None:
 #     新結果照常落地（`missing → unknown → registered` 這條合法的設定推進不再
 #     需要刪 evidence 才能前進）。
 #
-# **範圍**：只改 absent 這一支的命名。reviewer job 已存在時的
-# `{slice_id}-{reviewer_job_id}.json` 一字未動——那條路徑的 job id 重用碰撞是
-# 另一個獨立缺陷（見 issue #482 的 0812 留言），改它會動到 workflow lane 已
-# 落地的全部 evidence 路徑，不在本次診斷修正的範圍內。
+# **範圍**：本段只說明 absent evidence 的原因＋身分 key。reviewer job 已存在時，
+# 路徑另以 `reviewer_job_id` 加 candidate 短 SHA 命名（#571），避免重用 job id
+# 時不同 candidate 共用 immutable evidence 檔。
 ABSENT_EVALUATION_KEY_LENGTH = 12
 
 
@@ -445,7 +444,7 @@ def gate_evaluation_path(
                 raise ValueError(f"unsafe absent evaluation key: {absent_key!r}")
             suffix = f"{suffix}-{absent_key}"
     else:
-        suffix = reviewer_job_id
+        suffix = f"{reviewer_job_id}-{candidate.lower()[:12]}"
     return root.resolve() / "evidence" / "review" / f"{slice_id}-{suffix}.json"
 
 

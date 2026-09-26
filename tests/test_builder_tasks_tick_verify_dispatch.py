@@ -150,6 +150,7 @@ def _dispatch_reviewer_like(
     sandbox, checkout = manager._create_reviewer_sandbox(
         run=run, step=step, executor="codex", candidate_root=repo,
         coordinator_root=coordinator_root, input_snapshot=input_snapshot,
+        job_id="wf-reviewer-test",
     )
     manager._validate_workflow_input_snapshot(
         checkout, list(input_snapshot), coordinator_root=coordinator_root,
