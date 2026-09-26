@@ -67,6 +67,7 @@ from .model_identities import (
 )
 from .planning import (
     ACCEPTANCE_SURFACE_RULES,
+    ARTIFACT_EVIDENCE_ENVIRONMENT_REASONS,
     ArtifactAssessment,
     PlanningArtifact,
     PlanningScope,
@@ -74,6 +75,7 @@ from .planning import (
     assess_planning_completeness,
     plan_review_gate,
     run_heterogeneous_brainstorm,
+    _guard_classification_markers,
 )
 from .workflow import (
     BRAINSTORM_AUTHORITY_MISSING,
@@ -8964,11 +8966,21 @@ def _is_planning_candidate_rejection_environment_failure(reason: str | None) -> 
     return is_environment_grade_rejection_reason(reason)
 
 
+def _is_planning_artifact_environment_failure(reason: str | None) -> bool:
+    """判斷整合後 artifact 的檔案系統／編碼拒因是否屬 environment 類。"""
+
+    prefix = "primary-artifact-invalid: "
+    if reason is None or not reason.startswith(prefix):
+        return False
+    failure_code = reason[len(prefix) :].split(" ", 1)[0]
+    return failure_code in ARTIFACT_EVIDENCE_ENVIRONMENT_REASONS
+
+
 def _classify_planning_failure(reason: str | None) -> str:
     """brainstorm not-ready 的 reason → `environment` / `content` 的**單一判準**。
 
     #393 的預設是 `content`（fail-closed，`_resume_decision` 不浮現
-    `recover-planning`）。四個具名例外改歸 `environment`：
+    `recover-planning`）。五個具名例外改歸 `environment`：
 
     1. `_is_planning_authority_residue_failure`（#416）——abandon 未回滾的發佈
        殘留撞見 authority fail-closed，是狀態殘留而非模型內容缺陷。
@@ -8979,8 +8991,10 @@ def _classify_planning_failure(reason: str | None) -> str:
     4. `_is_planning_candidate_rejection_environment_failure`（#682／#672 票 A）
        ——`no-heterogeneous-planner` 的逐候選拒因表裡有 environment 級拒因
        （job 起不來、executor 異常退出）。
+    5. `_is_planning_artifact_environment_failure`（#572）——整合後 artifact 的
+       symlink、路徑逃逸、非一般檔案或讀取／解碼失敗。
 
-    四個判準合成一個具名函式，是為了讓「reason → classification」這條映射有
+    五個判準合成一個具名函式，是為了讓「reason → classification」這條映射有
     單一可測的入口（過去它只以三元表達式活在 `_run_define_stage` 中段，測不到
     也看不見）。
     """
@@ -8990,6 +9004,7 @@ def _classify_planning_failure(reason: str | None) -> str:
         or _is_planning_transient_service_failure(reason)
         or _is_planning_worktree_drift_failure(reason)
         or _is_planning_candidate_rejection_environment_failure(reason)
+        or _is_planning_artifact_environment_failure(reason)
     ):
         return "environment"
     return "content"
@@ -12583,12 +12598,44 @@ def resume_workflow_run(
     return result
 
 
+PLANNING_FAILURE_INPUT_EXCERPT_MAX_BYTES = 2048
+
+
+def _planning_failure_input_excerpt(
+    model_input: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    """把單一 planning 階段輸入序列化、遮罩分類標記並限制在 2 KiB。"""
+
+    if not isinstance(model_input, Mapping):
+        return None
+    stage = model_input.get("stage")
+    args = model_input.get("args")
+    if stage not in {"questioner", "secondary", "integrator"} or not isinstance(args, list):
+        return None
+    try:
+        serialized = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+    guarded = _guard_classification_markers(serialized)
+    encoded = guarded.encode("utf-8")
+    excerpt = encoded[:PLANNING_FAILURE_INPUT_EXCERPT_MAX_BYTES].decode(
+        "utf-8", errors="ignore"
+    )
+    return {
+        "stage": stage,
+        "input_json": excerpt,
+        "truncated": len(encoded) > PLANNING_FAILURE_INPUT_EXCERPT_MAX_BYTES,
+        "content_length_bytes": len(encoded),
+    }
+
+
 def _write_planning_failure_evidence(
     *,
     coordinator_root: Path,
     run_id: str,
     classification: str,
     reason: str,
+    model_input: Mapping[str, object] | None = None,
 ) -> str:
     """#393：define needs_human 三條靜默失敗路徑落 `cortex-planning-failure/v1`
     evidence，供 `work_actions._read_planning_failure_record`／
@@ -12612,6 +12659,9 @@ def _write_planning_failure_evidence(
         "reason": reason,
         "created_at": _utcnow(),
     }
+    input_excerpt = _planning_failure_input_excerpt(model_input)
+    if input_excerpt is not None:
+        body["model_input"] = input_excerpt
     digest = verification.canonical_json_hash(body)
     directory = coordinator_root.resolve() / "evidence" / "planning-recovery"
     directory.mkdir(parents=True, exist_ok=True)
@@ -12647,6 +12697,7 @@ def _record_planning_failure_evidence(
     coordinator_root: Path,
     classification: str,
     reason: str,
+    model_input: Mapping[str, object] | None = None,
 ) -> tuple[str, ...]:
     """呼叫端 wrapper：evidence 寫入失敗不得讓 define 路徑爆炸（fail-open
     僅限 evidence 記錄本身），失敗時只 log 註記、`run.evidence_refs` 原樣
@@ -12660,6 +12711,7 @@ def _record_planning_failure_evidence(
             run_id=run.run_id,
             classification=classification,
             reason=reason,
+            model_input=model_input,
         )
     except Exception as exc:  # noqa: BLE001 - evidence 記錄本身 fail-open
         logger.error(
@@ -13705,6 +13757,7 @@ def apply_workflow_action(
             coordinator_root=transaction_root,
             classification=brainstorm_classification,
             reason=brainstorm_not_ready_reason,
+            model_input=result.model_input,
         )
         run = registry._manager_update_workflow_run(
             run.run_id,

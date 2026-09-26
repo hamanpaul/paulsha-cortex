@@ -525,6 +525,10 @@ def test_brainstorm_authority_residue_write_rejection_records_environment_and_re
         "primary-artifact-write-rejected: ValueError: planning artifact lacks current "
         "planning authority: docs/superpowers/specs/fix-416-design.md"
     )
+    model_input = {
+        "stage": "integrator",
+        "args": [{"pack_id": "qp-test"}, {"evidence_hash": "hash-test"}],
+    }
     monkeypatch.setattr(
         manager,
         "run_heterogeneous_brainstorm",
@@ -533,6 +537,7 @@ def test_brainstorm_authority_residue_write_rejection_records_environment_and_re
             reason=residue_reason,
             secondary_domain=None,
             gate_refs=PlanningGateRefs(),
+            model_input=model_input,
         ),
     )
 
@@ -555,6 +560,13 @@ def test_brainstorm_authority_residue_write_rejection_records_environment_and_re
         classification="environment",
         reason=residue_reason,
     )
+    evidence_path = next(
+        (tmp_path / "evidence" / "planning-recovery").glob(f"{persisted.run_id}-*.json")
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["model_input"]["stage"] == "integrator"
+    assert evidence["model_input"]["truncated"] is False
+    assert json.loads(evidence["model_input"]["input_json"]) == model_input["args"]
 
 
 def test_public_work_resume_routes_through_phase_aware_poll_terminalize_advance(

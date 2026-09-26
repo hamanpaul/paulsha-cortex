@@ -1909,6 +1909,13 @@ class BrainstormResult:
     secondary_domain: str | None
     gate_refs: PlanningGateRefs
     integration: Mapping[str, object] | None = None
+    model_input: Mapping[str, object] | None = None
+
+
+def _snapshot_model_input(stage: str, *args: object) -> dict[str, object]:
+    """以 JSON 值複製單一階段實際收到的參數，避免 callback 修改原始輸入。"""
+
+    return {"stage": stage, "args": json.loads(_canonical_json(list(args)))}
 
 
 def _write_immutable_json(path: Path, payload: object) -> None:
@@ -2023,6 +2030,7 @@ def run_heterogeneous_brainstorm(
             **report.to_dict(),
             QUESTIONER_INPUT_PACK_KEY: report.default_question_pack.to_dict(),
         }
+        questioner_model_input = _snapshot_model_input("questioner", questioner_input)
         pack = validate_question_pack(primary_questioner(questioner_input), report=report)
     except Exception as exc:
         # issue #397：這三處 `except Exception` 過去把底層例外整段壓平成單一
@@ -2043,10 +2051,13 @@ def run_heterogeneous_brainstorm(
             None,
             empty_refs,
             None,
+            model_input=questioner_model_input,
         )
+    secondary_input = pack.to_dict()
+    secondary_model_input = _snapshot_model_input("secondary", secondary_input)
     try:
         secondary = validate_secondary_evidence(
-            secondary_planner(pack.to_dict(), selection.identity),
+            secondary_planner(secondary_input, selection.identity),
             question_pack=pack,
         )
     except Exception as exc:
@@ -2056,13 +2067,18 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=secondary_model_input,
         )
     secondary_payload = secondary.to_dict()
     evidence_hash = _hash_payload(secondary_payload)
     callback_payload = {**secondary_payload, "evidence_hash": evidence_hash}
+    integrator_input = pack.to_dict()
+    integrator_model_input = _snapshot_model_input(
+        "integrator", integrator_input, callback_payload
+    )
     try:
         integration = _validate_primary_integration(
-            primary_integrator(pack.to_dict(), callback_payload),
+            primary_integrator(integrator_input, callback_payload),
             question_pack=pack,
             secondary_evidence_hash=evidence_hash,
         )
@@ -2073,6 +2089,7 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=integrator_model_input,
         )
     rollback_publication: Callable[[], None] | None = None
     if artifact_writer is not None:
@@ -2099,6 +2116,7 @@ def run_heterogeneous_brainstorm(
                 selection.identity.independence_domain,
                 empty_refs,
                 None,
+                model_input=integrator_model_input,
             )
     artifact_evidence = _post_integration_artifact_evidence(
         integration,
@@ -2118,6 +2136,7 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=integrator_model_input,
         )
     evidence_payload = {
         "schema_version": BRAINSTORM_EVIDENCE_SCHEMA_VERSION,
@@ -2147,6 +2166,7 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=integrator_model_input,
         )
     except OSError:
         if rollback_publication is not None:
@@ -2157,6 +2177,7 @@ def run_heterogeneous_brainstorm(
             selection.identity.independence_domain,
             empty_refs,
             None,
+            model_input=integrator_model_input,
         )
     refs = PlanningGateRefs(
         brainstorm_peer=GateEvidenceRef(
