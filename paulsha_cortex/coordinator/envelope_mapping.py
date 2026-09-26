@@ -1,6 +1,6 @@
 """#454（`#452` 子項）：patchmud ranked 榜 → 封套四欄位的映射純函式。
 
-輸入 patchmud ``report.yaml``（schema v1）解析後的 dict＋身分／deck 識別資訊，
+輸入 PatchMUD report v2 解析後的 dict＋身分／deck／cohort 識別資訊，
 輸出封套四欄位（`accepts_bands`／`invariant_ceiling`／`consistency_scope`／
 `acceptance_modes`）與逐欄 provenance 標記。定案全文見
 ``docs/superpowers/specs/envelope-mapping-spec.md``；四個票面待決的結論：
@@ -18,6 +18,7 @@ raise :class:`EnvelopeMappingError`，比照 ``model_identities.IdentityRegistry
 
 from __future__ import annotations
 
+import re
 from typing import Mapping
 
 from paulsha_cortex.deck.schema import BAND_LEVELS
@@ -34,8 +35,20 @@ from .model_identities import (
 )
 from .workflow import MODEL_CHAIN_PERSONAS
 
-#: 本模組支援的 patchmud report schema 版本（report.yaml 頂層 ``schema_version``）。
-REPORT_SCHEMA_VERSION_SUPPORTED = 1
+#: 新版只允許 v2 report 進入排名映射；v1 可被外層 opaque 讀取，但不可排名。
+REPORT_SCHEMA_VERSION_SUPPORTED = 2
+_REPORT_V1_OPAQUE_MESSAGE = (
+    "PatchMUD report v1 僅能 opaque 保留，不具 v2 cohort identity，不能進入排名映射"
+)
+_PROFILE_KEY_RE = re.compile(r"epk:v1:(?:request|resolved|observed):[0-9a-f]{64}\Z")
+_SHA256_REF_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_COHORT_FIELDS = (
+    "role",
+    "benchmark_type",
+    "profile_id",
+    "deck_digest",
+    "evaluator_revision",
+)
 
 #: band 門檻規則識別碼。門檻常數屬於規則的一部分：任何門檻調整 MUST 換新
 #: rule id（例如 ``clear-rate-ladder-v2``），使 provenance 中的 rule id ＋同一份
@@ -53,6 +66,7 @@ REASON_BELOW_GREEN_FLOOR = f"measured:{BAND_RULE_ID}:below-green-floor"
 REASON_PERSONA_DIMENSION_UNMEASURED = "persona-dimension-unmeasured"
 REASON_IDENTITY_NOT_IN_REPORT = "identity-not-in-report"
 REASON_INCOMPLETE_DECK_SAMPLE = "incomplete-deck-sample"
+REASON_COHORT_NOT_RANKABLE = "cohort-not-ranked"
 REASON_NO_DIRECT_OBSERVABLE = "not-measurable:no-direct-observable"
 REASON_NO_ARTIFACT_CLASS_ANNOTATION = (
     "not-measurable:deck-cards-lack-artifact-class-annotation"
@@ -130,20 +144,51 @@ def _clear_rate_rows(report: Mapping[str, object]) -> list[Mapping[str, object]]
     return rows
 
 
-def _find_group_row(
-    rows: list[Mapping[str, object]], model: str, loadout: str
+def _cohort_query(
+    *,
+    execution_profile_key: object,
+    role: object,
+    benchmark_type: object,
+    deck_digest: object,
+    evaluator_revision: object,
+    persona: str,
+) -> tuple[str, str, str, str, str]:
+    profile_key = _require_nonempty_str(execution_profile_key, "execution_profile_key")
+    if not _PROFILE_KEY_RE.fullmatch(profile_key):
+        raise EnvelopeMappingError("execution_profile_key 不是 Cortex execution_profile profile_key")
+    cohort_role = _require_nonempty_str(role, "role")
+    if cohort_role != persona:
+        raise EnvelopeMappingError(
+            f"role 與 Cortex persona 不符：{cohort_role!r} != {persona!r}"
+        )
+    benchmark = _require_nonempty_str(benchmark_type, "benchmark_type")
+    deck = _require_nonempty_str(deck_digest, "deck_digest")
+    evaluator = _require_nonempty_str(evaluator_revision, "evaluator_revision")
+    if not _SHA256_REF_RE.fullmatch(deck):
+        raise EnvelopeMappingError("deck_digest 必須是 sha256:<64 位小寫十六進位>")
+    if not _SHA256_REF_RE.fullmatch(evaluator):
+        raise EnvelopeMappingError("evaluator_revision 必須是 sha256:<64 位小寫十六進位>")
+    return cohort_role, benchmark, profile_key, deck, evaluator
+
+
+def _find_v2_group_row(
+    rows: list[Mapping[str, object]],
+    query: tuple[str, str, str, str, str],
 ) -> Mapping[str, object] | None:
-    matches = [
-        row
-        for row in rows
-        if row.get("model") == model and row.get("loadout") == loadout
-    ]
+    matches = []
+    for row in rows:
+        row_key = tuple(row.get(field) for field in _COHORT_FIELDS)
+        if row_key == query:
+            if row.get("cohort_identity_complete") is not True:
+                raise EnvelopeMappingError(
+                    "clear_rate cohort identity 命中但未標示完整，拒絕排名映射"
+                )
+            matches.append(row)
     if not matches:
         return None
     if len(matches) > 1:
-        # (model, loadout) 是 report 的聚合鍵，重複列＝report 損毀，fail-closed。
         raise EnvelopeMappingError(
-            f"clear_rate 榜對聚合鍵 ({model!r}, {loadout!r}) 出現 {len(matches)} 列"
+            f"clear_rate 榜對完整 cohort identity {query!r} 出現 {len(matches)} 列"
         )
     return matches[0]
 
@@ -238,15 +283,19 @@ def map_report_to_envelope(
     persona: str,
     deck: Mapping[str, object],
     patchmud_version: str,
-    report_model: str,
-    report_loadout: str,
+    execution_profile_key: str | None = None,
+    role: str | None = None,
+    benchmark_type: str | None = None,
+    deck_digest: str | None = None,
+    evaluator_revision: str | None = None,
+    report_model: str | None = None,
+    report_loadout: str | None = None,
 ) -> dict:
-    """patchmud report dict → 封套四欄位＋逐欄 provenance（純函式）。
+    """PatchMUD report v2 dict → 封套四欄位＋逐欄 provenance（純函式）。
 
     參數：
-      report: ``report.yaml``（schema v1）解析後的 dict；本函式只消費頂層
-        ``schema_version`` 與 ``leaderboards.clear_rate.rows``（``runs``／
-        ``clears`` 整數對，不用浮點 ``value``）。
+      report: report JSON／YAML 解析後的 dict；僅接受 schema v2。v1 按
+        PatchMUD 遷移契約只能 opaque 保留，不具排名資格；未知版本拒收。
       executor / model_id / persona: cortex 側身分三元（persona 必屬
         ``workflow.MODEL_CHAIN_PERSONAS``）。
       deck: deck 識別資訊 dict——``deck_id``／``content_sha256``／
@@ -254,8 +303,11 @@ def map_report_to_envelope(
         ``measured_personas``（該 deck 實際量測的 persona 維度；pilot-v1 為
         ``["builder"]``）。
       patchmud_version: 產出該 report 的 patchmud 版本（評測指紋成分）。
-      report_model / report_loadout: 該身分在 report 聚合鍵 (model, loadout)
-        中對應的鍵值（由呼叫端提供，本函式不猜測對應關係）。
+      execution_profile_key / role / benchmark_type / deck_digest /
+        evaluator_revision: 完整 v2 cohort identity 查詢鍵；不得以 model/loadout
+        代替或合併 cohort。
+      report_model / report_loadout: 舊呼叫端的相容參數，只作向後 API 相容；不參與
+        v2 查詢。僅傳這兩欄不足以映射 v2；v1 仍 fail-closed。
 
     回傳 ``{"envelope": {...四欄...}, "provenance": {...}}``；provenance 含
     `#455` §4.1 定案的六元評測指紋（executor, model_id, persona, deck_id,
@@ -268,21 +320,30 @@ def map_report_to_envelope(
             f"report 必須是 mapping：{type(report).__name__}"
         )
     schema_version = report.get("schema_version")
+    if schema_version == 1:
+        raise EnvelopeMappingError(_REPORT_V1_OPAQUE_MESSAGE)
     if schema_version != REPORT_SCHEMA_VERSION_SUPPORTED:
         raise EnvelopeMappingError(
             "report schema_version 不支援："
-            f"{schema_version!r}（僅支援 {REPORT_SCHEMA_VERSION_SUPPORTED}）"
+            f"{schema_version!r}（只接受 {REPORT_SCHEMA_VERSION_SUPPORTED}；未知版本 fail-closed）"
         )
+    del report_model, report_loadout
     executor = _require_nonempty_str(executor, "executor")
     model_id = _require_nonempty_str(model_id, "model_id")
     patchmud_version = _require_nonempty_str(patchmud_version, "patchmud_version")
-    report_model = _require_nonempty_str(report_model, "report_model")
-    report_loadout = _require_nonempty_str(report_loadout, "report_loadout")
     if persona not in MODEL_CHAIN_PERSONAS:
         raise EnvelopeMappingError(
             f"persona 非法：{persona!r}（允許 {sorted(MODEL_CHAIN_PERSONAS)}）"
         )
     deck_info = _validate_deck(deck)
+    query = _cohort_query(
+        execution_profile_key=execution_profile_key,
+        role=role,
+        benchmark_type=benchmark_type,
+        deck_digest=deck_digest,
+        evaluator_revision=evaluator_revision,
+        persona=persona,
+    )
 
     fingerprint = {
         "executor": executor,
@@ -294,8 +355,11 @@ def map_report_to_envelope(
     }
     observation: dict = {
         "report_schema_version": schema_version,
-        "model": report_model,
-        "loadout": report_loadout,
+        "role": query[0],
+        "benchmark_type": query[1],
+        "profile_id": query[2],
+        "deck_digest": query[3],
+        "evaluator_revision": query[4],
     }
 
     rows = _clear_rate_rows(report)
@@ -308,12 +372,20 @@ def map_report_to_envelope(
             observation=observation,
         )
 
-    row = _find_group_row(rows, report_model, report_loadout)
+    row = _find_v2_group_row(rows, query)
     if row is None:
         return _all_default_result(
             fingerprint=fingerprint,
             persona=persona,
             reason=REASON_IDENTITY_NOT_IN_REPORT,
+            observation=observation,
+        )
+
+    if row.get("ranked") is not True:
+        return _all_default_result(
+            fingerprint=fingerprint,
+            persona=persona,
+            reason=REASON_COHORT_NOT_RANKABLE,
             observation=observation,
         )
 
@@ -323,12 +395,18 @@ def map_report_to_envelope(
         raise EnvelopeMappingError(
             f"clear_rate row clears > runs：{clears} > {runs}"
         )
-    observation = {**observation, "runs": runs, "clears": clears}
+    row_model = _require_nonempty_str(row.get("model"), "clear_rate row model")
+    row_loadout = _require_nonempty_str(row.get("loadout"), "clear_rate row loadout")
+    observation = {
+        **observation,
+        "model": row_model,
+        "loadout": row_loadout,
+        "runs": runs,
+        "clears": clears,
+    }
 
-    if runs < deck_info["encounter_count"]:
-        # #455 §4.3 定案 8 關全跑不抽樣；不足全 deck 的樣本不得產出實測封套。
-        # 註：report schema v1 的 run 列無 encounter 欄位，全覆蓋無法從
-        # report 本身驗證，本判準是必要非充分條件（spec R2 記載上游缺口）。
+    if row.get("coverage_complete") is not True or runs < deck_info["encounter_count"]:
+        # v2 明列 cohort coverage；再保留 Cortex deck encounter count 作第二道必要檢查。
         return _all_default_result(
             fingerprint=fingerprint,
             persona=persona,

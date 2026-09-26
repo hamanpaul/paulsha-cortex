@@ -143,40 +143,80 @@ def _encounter_dirs(deck_dir: Path) -> list[Path]:
     return sorted(p for p in deck_dir.iterdir() if p.is_dir())
 
 
-def _report_group_key(report: object) -> tuple[str, str]:
-    """profile report 的聚合鍵 (model, loadout)：從 report 本身取，不猜測。
+_REPORT_COHORT_FIELDS = (
+    "role",
+    "benchmark_type",
+    "profile_id",
+    "deck_digest",
+    "evaluator_revision",
+)
 
-    patchmud PR #15 起 run.yaml 記 `normalize_model_spec()` 展開後的完整
-    model spec——不是 CLI 別名，且 anthropic↔claude CLI fallback 隨執行當下
-    憑證狀態浮動，別名查表必落空（cortex#466 A-1）。profile 的 runs_root 為
-    單一身分專用，report 內必恰一組聚合鍵；多於一組＝runs_root 被污染，
-    fail-closed。
+
+def _report_group_key(
+    report: object, *, persona: str, deck_id: str, loadout: str
+) -> dict[str, str]:
+    """取得本次 profile runs 唯一的 v2 cohort identity。
+
+    `model`／`loadout` 不再是榜列查詢鍵。這個 CLI 每次只為一個 persona、deck
+    和 loadout 執行評測，因此封存的 runs 必須對應單一 v2 cohort；若 runs 混入
+    不同 profile、role、benchmark、deck digest 或 evaluator revision，拒絕猜選。
     """
 
     if not isinstance(report, Mapping):
         raise ValueError("report 必須是 mapping")
-    leaderboards = report.get("leaderboards")
-    board = leaderboards.get("clear_rate") if isinstance(leaderboards, Mapping) else None
-    rows = board.get("rows") if isinstance(board, Mapping) else None
-    if not isinstance(rows, list) or not rows:
-        raise ValueError("report 缺 leaderboards.clear_rate.rows")
-    keys: set[tuple[str, str]] = set()
-    for row in rows:
-        if not isinstance(row, Mapping):
-            raise ValueError(f"clear_rate row 必須是 mapping：{row!r}")
-        model = row.get("model")
-        loadout = row.get("loadout")
-        if not isinstance(model, str) or not model.strip():
-            raise ValueError(f"clear_rate row 缺非空 model：{row!r}")
-        if not isinstance(loadout, str) or not loadout.strip():
-            raise ValueError(f"clear_rate row 缺非空 loadout：{row!r}")
-        keys.add((model.strip(), loadout.strip()))
-    if len(keys) != 1:
+    schema_version = report.get("schema_version")
+    if schema_version == 1:
         raise ValueError(
-            "profile report 應恰含一組 (model, loadout)，實得："
-            + "; ".join(f"{model}/{loadout}" for model, loadout in sorted(keys))
+            "PatchMUD report v1 僅能 opaque 保留，不可排名；請從 RunStore 重建 v2 report"
         )
-    return next(iter(keys))
+    if schema_version != 2:
+        raise ValueError(f"PatchMUD report schema_version 不支援：{schema_version!r}")
+    runs = report.get("runs")
+    if not isinstance(runs, list) or not runs:
+        raise ValueError("v2 report 缺 runs list")
+    keys: set[tuple[str, ...]] = set()
+    run_models: set[str] = set()
+    run_loadouts: set[str] = set()
+    run_deck_ids: set[str] = set()
+    for index, run in enumerate(runs):
+        if not isinstance(run, Mapping):
+            raise ValueError(f"report runs[{index}] 必須是 mapping")
+        values = []
+        for field_name in _REPORT_COHORT_FIELDS:
+            value = run.get(field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"report runs[{index}] 缺非空 {field_name}")
+            values.append(value.strip())
+        keys.add(tuple(values))
+        for field_name, bucket in (
+            ("model", run_models),
+            ("loadout", run_loadouts),
+            ("deck_id", run_deck_ids),
+        ):
+            value = run.get(field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"report runs[{index}] 缺非空 {field_name}")
+            bucket.add(value.strip())
+    if len(keys) != 1:
+        raise ValueError(f"v2 report runs 混有 {len(keys)} 組 cohort identity")
+    identity = next(iter(keys))
+    cohort = dict(zip(_REPORT_COHORT_FIELDS, identity, strict=True))
+    query = {
+        "role": cohort["role"],
+        "benchmark_type": cohort["benchmark_type"],
+        "execution_profile_key": cohort["profile_id"],
+        "deck_digest": cohort["deck_digest"],
+        "evaluator_revision": cohort["evaluator_revision"],
+    }
+    if query["role"] != persona:
+        raise ValueError(f"report role 與評測 persona 不符：{query['role']!r} != {persona!r}")
+    if run_deck_ids != {deck_id}:
+        raise ValueError(f"report deck_id 與本次 deck 不符：{sorted(run_deck_ids)!r}")
+    if run_loadouts != {loadout}:
+        raise ValueError(f"report loadout 與本次 loadout 不符：{sorted(run_loadouts)!r}")
+    if len(run_models) != 1:
+        raise ValueError("v2 report runs 混有多個 model identity")
+    return query
 
 
 def _emit_scalar(value: object) -> str:
@@ -538,12 +578,19 @@ def run_model_profile(
             cell["detail"] = f"{type(exc).__name__}: {exc}"
             continue
         try:
-            # cortex#466 A-1：聚合鍵從 report 本身取（run.yaml 記 normalize
-            # 後的完整 spec，別名查表必落空且隨憑證狀態浮動）。
-            report_model, report_loadout = _report_group_key(report)
+            query = _report_group_key(
+                report,
+                persona=persona,
+                deck_id=options.deck_id,
+                loadout=options.loadout,
+            )
         except ValueError as exc:
             cell["status"] = "failed"
-            cell["reason"] = "report-group-ambiguous"
+            cell["reason"] = (
+                "report-schema-unsupported"
+                if "schema_version" in str(exc) or "僅能 opaque" in str(exc)
+                else "report-group-ambiguous"
+            )
             cell["detail"] = str(exc)
             continue
         try:
@@ -554,8 +601,7 @@ def run_model_profile(
                 persona=persona,
                 deck=deck_info,
                 patchmud_version=patchmud_version,
-                report_model=report_model,
-                report_loadout=report_loadout,
+                **query,
             )
         except EnvelopeMappingError as exc:
             cell["status"] = "failed"
