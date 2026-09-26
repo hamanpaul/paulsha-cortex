@@ -538,6 +538,8 @@ Job `exited` 只代表 Agent process 以 exit code 0 結束，**不代表任務�
 先從 `cortex status` 的 `attention[].next_actions` 選擇當下允許的動作，不要手動改 `jobs.json`：
 `cortex list` 與 `cortex work show` 的 needs_human work item 也會投影同一份目前可受理的 recovery actions，包含符合 owner-bound 前置條件時的 `recover-pre-candidate`。
 
+Recovery action 的正式 work／slice 名稱、`cortex recover` 有界 alias、前置條件、CAS、派工時點與可觀測結果見[契約矩陣](docs/recovery-action-contract-matrix.md)。coordinator `cortex work` 的 `--expected-candidate` 支援 `retry-build`、`retry-verify`、`retry-review` 與 `recover-repair-commit` 的 exact SHA CAS；同時提供 JSON payload 時兩者必須一致。work 與 slice 同名 action 仍沿用各自的 authority 與資源契約。
+
 ```bash
 cortex slice-action "$SLICE_ID" retry-build  --actor operator
 cortex slice-action "$SLICE_ID" retry-verify --actor operator

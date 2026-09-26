@@ -1009,6 +1009,87 @@ def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
         )
 
 
+@pytest.mark.parametrize(
+    "crash_point",
+    ["before-registry-transition", "after-registry-transition", "after-reclaim"],
+)
+def test_abandon_crash_restart_reuses_audit_and_outcome_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_point: str
+) -> None:
+    """abandon 在 durable 寫入邊界 crash 後可重送且不重複採信/處置。"""
+
+    from paulsha_cortex.coordinator import engineering_outcome
+
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    registry_path = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=registry_path)
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    args = {
+        "action": "abandon",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "issue": 12,
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "Superseded after the recovery review.",
+    }
+
+    original_transition = registry._manager_abandon_workflow_run
+    original_reclaim = work_actions._reclaim_abandoned_build_worktrees
+
+    def crash_transition(target_run_id, **fields):
+        if crash_point == "before-registry-transition":
+            raise RuntimeError("injected crash before registry transition")
+        result = original_transition(target_run_id, **fields)
+        if crash_point == "after-registry-transition":
+            raise RuntimeError("injected crash after registry transition")
+        return result
+
+    def crash_reclaim(run, workflow_registry, *, state_path):
+        original_reclaim(run, workflow_registry, state_path=state_path)
+        if crash_point == "after-reclaim":
+            raise RuntimeError("injected crash after reclaim")
+
+    monkeypatch.setattr(registry, "_manager_abandon_workflow_run", crash_transition)
+    monkeypatch.setattr(work_actions, "_reclaim_abandoned_build_worktrees", crash_reclaim)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+    monkeypatch.undo()
+    restarted = JobRegistry(state_path=registry_path)
+    replay = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=restarted,
+    )
+    abandoned = restarted.get_workflow_run(run_id)
+    assert abandoned.status == "superseded"
+    assert replay["result"]["action"] == "abandoned"
+    records = list((tmp_path / "evidence" / "work-abandon").glob("*.json"))
+    assert len(records) == 1
+    outcomes = engineering_outcome.OutcomeStore(
+        engineering_outcome.outcome_store_path(state, repo="acme/demo")
+    )
+    assert len(list(outcomes.list_outcomes(repo="acme/demo", work_id="demo"))) == 1
+
+
 def _pr_lifecycle_runner(states: dict[int, dict]):
     """Fake ``gh`` runner answering ``gh api repos/<repo>/pulls/<N>`` from a
     map of PR number -> raw pull payload (``state`` / ``merged_at``)."""

@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **#843 recovery action conformance**：新增版本化 action registry 與 13 家族契約矩陣，並以 dispatcher、control contract、coordinator CLI、`cortex recover` work/slice alias 雙向核對正式名稱與 CAS 欄位；補上 retry candidate CLI CAS、recover/abandon crash/restart 參數化特性與 frozen same-domain reviewer pin 零派工負控制。既有 producer gap 和 live 驗收界線記錄於矩陣。
+
 ### Fixed
 
 - **#502 verify／review 通過後的阻斷修復入口**：exact-candidate `retry-build` 現可接受尚未進入 `needs_human` 的後續阻斷裁決；必須提供 `--reason`，以既有 immutable operator-adjudication evidence 記錄後重跑 verify／review，已完成 run 仍拒絕重開。

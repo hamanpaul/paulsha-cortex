@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+
 from paulsha_cortex.coordinator import work_actions
 from paulsha_cortex.coordinator.claim import claim_key_for_authority_digest
 from paulsha_cortex.coordinator.registry import JobRegistry, WorkflowStep
@@ -188,6 +189,63 @@ class RecoverSupersededActionTests(unittest.TestCase):
             )
             self.assertEqual(evidence["schema"], "cortex-work-recover-superseded/v1")
             self.assertEqual(evidence["run_id"], run.run_id)
+
+    def test_recover_superseded_crash_restart_boundaries_remain_observable(self) -> None:
+        """保留兩次 registry 寫入之間及完成後不能 exact-replay 的 producer 缺口。"""
+
+        for crash_point in (
+            "before-status-restore",
+            "after-status-restore",
+            "after-authority-reset",
+        ):
+            with self.subTest(crash_point=crash_point):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    registry = _make_registry(root)
+                    run = _create_run(registry)
+                    registry._manager_update_workflow_run(
+                        run.run_id, status="superseded", facets=("blocked",)
+                    )
+
+                    original_restore = registry._manager_update_workflow_run
+                    original_reset = registry._manager_reset_workflow_for_authority_restart
+
+                    def crash_restore(run_id, **fields):
+                        if crash_point == "before-status-restore":
+                            raise RuntimeError("injected crash before status restore")
+                        restored = original_restore(run_id, **fields)
+                        if crash_point == "after-status-restore":
+                            raise RuntimeError("injected crash after status restore")
+                        return restored
+
+                    def crash_reset(*args, **kwargs):
+                        result = original_reset(*args, **kwargs)
+                        if crash_point == "after-authority-reset":
+                            raise RuntimeError("injected crash after authority reset")
+                        return result
+
+                    registry._manager_update_workflow_run = crash_restore
+                    registry._manager_reset_workflow_for_authority_restart = crash_reset
+                    with self.assertRaisesRegex(RuntimeError, "injected crash"):
+                        self._recover(registry, root / "jobs.json", run.run_id)
+
+                    restarted = _make_registry(root)
+                    persisted = restarted.get_workflow_run(run.run_id)
+                    if crash_point == "after-status-restore":
+                        self.assertEqual(persisted.status, "ongoing")
+                        self.assertEqual(persisted.current_phase, "verify")
+                        self.assertNotIn("blocked", persisted.facets)
+                        with self.assertRaisesRegex(RuntimeError, "requires superseded run"):
+                            self._recover(restarted, root / "jobs.json", run.run_id)
+                    elif crash_point == "after-authority-reset":
+                        self.assertEqual(persisted.status, "ongoing")
+                        self.assertEqual(persisted.current_phase, "verify")
+                        with self.assertRaisesRegex(RuntimeError, "requires superseded run"):
+                            self._recover(restarted, root / "jobs.json", run.run_id)
+                    else:
+                        self.assertEqual(persisted.status, "superseded")
+                        replay = self._recover(restarted, root / "jobs.json", run.run_id)
+                        self.assertEqual(replay["action"], "recovered-superseded")
 
     def test_rejects_non_superseded_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

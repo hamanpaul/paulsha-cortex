@@ -25,6 +25,7 @@ from uuid import uuid4
 from paulsha_cortex.config import paths
 from paulsha_cortex._yaml import safe_load
 from paulsha_cortex.github_rate_limit import is_rate_limit_signal
+from paulsha_cortex.recovery_action_contracts import WORK_ACTIONS
 
 from .diagnostics import diagnostic_reason
 from .claim import (
@@ -9244,17 +9245,7 @@ def execute_work_action(
     action = args.get("action")
     repo = args.get("repo")
     work_id = args.get("work_id")
-    if action not in {
-        "link", "unlink", "start", "resume", "retry-build", "retry-card",
-        "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
-        "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
-        "close-delivered",
-        "recover-superseded",
-        "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
-        "verify-attest",
-        "review-disposition",
-        "intake",
-    }:
+    if action not in WORK_ACTIONS:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
     if not isinstance(work_id, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
