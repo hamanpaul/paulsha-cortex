@@ -88,3 +88,4 @@ generation_rows_uses_highest_generation_for_coverage`、
 `tests/test_requirement_delivery.py`／`test_requirement_delivery_cli.py`／
 `test_github_delivery_client.py`／`test_delivery_orchestrator.py`（141 個）
 與 `-k "delivery or remote_closure or retire"`（280 個）全數維持通過。
+- #845 對抗審查修復（第六輪）：同一 repo／work／run 在最高 generation 內 covered 與非 covered 並存時，該範圍不算 covered（只有範圍內每筆 row 皆 covered 才成立），缺額優先指向非 covered 的 row。

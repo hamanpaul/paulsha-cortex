@@ -1281,11 +1281,24 @@ def inspect_delivery(
             # 判定 covered 與否只信該邏輯範圍內最高 generation 的 row（見
             # `_current_generation_matches`），較舊 generation 不得蓋過較新事實。
             effective_matches = _current_generation_matches(matches)
-            criterion_covered = any(row["status"] == "covered" for row in effective_matches)
+            # 同一邏輯範圍（repo／work／run）在最高 generation 內若 covered 與非
+            # covered 並存，代表事實互相矛盾（例如同代弱化重讀與舊結果並存），
+            # 該範圍不得算 covered；只有某範圍的每一筆 row 都 covered 才成立。
+            scope_rows: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+            for row in effective_matches:
+                scope_rows.setdefault(
+                    (row["repo"], row["work_id"], row["run_id"]), []
+                ).append(row)
+            criterion_covered = any(
+                all(row["status"] == "covered" for row in rows)
+                for rows in scope_rows.values()
+            )
             criterion_status = "covered" if criterion_covered else ("blocked" if effective_matches else "missing")
             criterion_results.append({"acceptance_id": criterion["id"], "status": criterion_status, "mapping_ids": [row["mapping_id"] for row in matches]})
             if not criterion_covered:
-                candidate_stages = effective_matches[0]["evidence"] if effective_matches else {}
+                # 回報缺額時優先取非 covered 的 row，讓 gap 指向實際失敗的階段。
+                gap_rows = [row for row in effective_matches if row["status"] != "covered"] or effective_matches
+                candidate_stages = gap_rows[0]["evidence"] if gap_rows else {}
                 for stage_name in requirement["evidence_policy"]["required_stages"]:
                     evidence = candidate_stages.get(stage_name)
                     if evidence is None:

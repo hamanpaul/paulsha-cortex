@@ -456,6 +456,29 @@ def test_a01_snapshot_with_mixed_generation_rows_uses_highest_generation_for_cov
     )
 
 
+def test_a01_same_generation_covered_and_blocked_rows_are_not_covered(tmp_path: Path) -> None:
+    """對抗審查（第五輪 review）MAJOR：同一 repo／work／run、同一 source_generation
+    在單次 snapshot 內同時殘留 covered 與 blocked row（例如同代弱化重讀與舊結果
+    並存）時，該邏輯範圍的事實互相矛盾，不得以 any(covered) 判為 covered。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    covered_row = snapshot["mappings"][0]
+    conflicting_row = copy.deepcopy(covered_row)
+    conflicting_row["completion_record"] = _write_completion(
+        tmp_path,
+        run_id=covered_row["run_id"],
+        slice_id="same-generation-review-conflict",
+        same_review_domain=True,
+    )
+    snapshot["mappings"].append(conflicting_row)
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    assert report["closure_readiness"] == "not-ready"
+    requirement = next(r for r in report["requirements"] if r["requirement_id"] == "R01")
+    criterion = requirement["acceptance_criteria"][0]
+    assert criterion["status"] != "covered"
+
+
 def test_a01_missing_acceptance_or_evidence_policy_is_rejected(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path, [("R01", "r1")])
     del manifest["requirements"][0]["acceptance_criteria"]
