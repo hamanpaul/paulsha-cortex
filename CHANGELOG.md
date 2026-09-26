@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#877 manager／monitor 冪等啟動入口**：新增 `cortex service ensure-running`，已持有 `manager.lock` 時直接回報；systemd user units 可用時啟動既有 units 並等待 manager lock，否則以目前 Cortex interpreter 本地啟動 manager 與 monitor，固定輸出一行 JSON。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

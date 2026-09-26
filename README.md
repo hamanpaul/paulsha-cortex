@@ -317,10 +317,13 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    ```bash
    cortex service install --instance cortex --repo-root "$(git rev-parse --show-toplevel)"
    cortex service start --instance cortex --json
+   cortex service ensure-running --instance cortex
    cortex service status --instance cortex --json
    cortex service logs --instance cortex -n 50
    cortex service uninstall --instance cortex --purge --json
    ```
+
+   自動化呼叫可用 `cortex service ensure-running`：若 `manager.lock` 已由 live manager 持有，就不重啟並回報 `mode=already-running`；systemd user units 齊備且可用時會啟動 manager service/timer 與 monitor service，並等待 manager lock 最多 10 秒；否則以目前執行中的 Cortex Python 啟動本地 manager 與 monitor。此命令固定輸出一行 `cortex-porcelain/service/v1` JSON，fallback log 寫入 `manager.log`，不會安裝或修改 units。
 
    `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
    `cortex service install` 寫入 unit 後，若 `daemon-reload` 或 `enable` 任一階段非零，會直接回報 `mode=systemd`、非零 exit code，訊息僅包含 systemd stderr、unit 落檔位置、重試 command（`systemctl --user ...`），並明確指出「unit 已寫入但僅 reload/enable 尚未完成」，不會輸出 traceback 或 stdout 內容，並不再繼續後續步驟。
