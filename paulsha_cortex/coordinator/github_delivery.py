@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import math
 import re
@@ -11,6 +9,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable, Mapping
 from urllib.parse import quote
@@ -380,6 +379,126 @@ class GitHubDeliveryClient:
     def _api(self, endpoint: str) -> object:
         return self._run(["gh", "api", endpoint], expect_json=True)
 
+    def _run_local_git(self, checkout: Path, *args: str) -> tuple[int, bytes]:
+        try:
+            result = self._runner(
+                ["git", "-C", str(checkout), *args],
+                shell=False,
+                capture_output=True,
+            )
+        except OSError as exc:
+            raise RuntimeError("closure local Git command unavailable") from exc
+        returncode = getattr(result, "returncode", None)
+        stdout = getattr(result, "stdout", None)
+        if not isinstance(returncode, int) or not isinstance(stdout, bytes):
+            raise RuntimeError("closure local Git command returned malformed output")
+        return returncode, stdout
+
+    def _local_git_text(
+        self,
+        checkout: Path,
+        *args: str,
+        failure_message: str,
+    ) -> str:
+        returncode, stdout = self._run_local_git(checkout, *args)
+        if returncode != 0:
+            raise RuntimeError(failure_message)
+        try:
+            return stdout.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(failure_message) from exc
+
+    def _canonical_checkout(self, value: object) -> Path:
+        if not isinstance(value, (str, Path)) or not value:
+            raise RuntimeError("closure canonical checkout unavailable")
+        raw = Path(value)
+        if not raw.is_absolute() or raw.is_symlink():
+            raise RuntimeError("closure canonical checkout unavailable")
+        try:
+            checkout = raw.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError("closure canonical checkout unavailable") from exc
+        if raw.absolute() != checkout or not checkout.is_dir():
+            raise RuntimeError("closure canonical checkout unavailable")
+        top_level = self._local_git_text(
+            checkout,
+            "rev-parse",
+            "--show-toplevel",
+            failure_message="closure canonical checkout is not a Git top-level",
+        )
+        try:
+            resolved_top = Path(top_level.strip()).resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError("closure canonical checkout is not a Git top-level") from exc
+        if resolved_top != checkout:
+            raise RuntimeError("closure canonical checkout must be a Git top-level")
+        return checkout
+
+    def _fetch_closure_default_head(self, checkout: Path, *, branch: str) -> str:
+        returncode, _stdout = self._run_local_git(
+            checkout,
+            "fetch",
+            "--no-tags",
+            "origin",
+            f"refs/heads/{branch}",
+        )
+        if returncode != 0:
+            raise RuntimeError("closure canonical checkout fetch failed")
+        shallow = self._local_git_text(
+            checkout,
+            "rev-parse",
+            "--is-shallow-repository",
+            failure_message="closure canonical checkout shallow state unavailable",
+        ).strip()
+        if shallow == "true":
+            raise RuntimeError(
+                "closure canonical checkout is shallow; full history is required and automatic unshallow is disabled"
+            )
+        if shallow != "false":
+            raise RuntimeError("closure canonical checkout shallow state malformed")
+        default_head = self._local_git_text(
+            checkout,
+            "rev-parse",
+            "--verify",
+            "FETCH_HEAD^{commit}",
+            failure_message="closure fetched default branch commit unavailable",
+        ).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", default_head) is None:
+            raise RuntimeError("closure fetched default branch commit malformed")
+        return default_head
+
+    def _local_commit_tree_paths(
+        self,
+        *,
+        canonical_checkout: Path,
+        commit: str,
+    ) -> tuple[str, ...]:
+        output = self._local_git_text(
+            canonical_checkout,
+            "ls-tree",
+            "-r",
+            "-t",
+            "-z",
+            commit,
+            failure_message="closure local Git tree unavailable",
+        )
+        paths: list[str] = []
+        rows = output.split("\0")
+        if rows and rows[-1] == "":
+            rows.pop()
+        for row in rows:
+            metadata, separator, path = row.partition("\t")
+            fields = metadata.split(" ")
+            if (
+                not separator
+                or len(fields) != 3
+                or re.fullmatch(r"[0-9a-fA-F]{40}", fields[2]) is None
+                or not path
+            ):
+                raise RuntimeError("closure local Git tree malformed")
+            paths.append(path)
+        return tuple(paths)
+
     def _metadata_json(self, argv: list[str]) -> object:
         """Retry only the idempotent PR-metadata transaction surface."""
 
@@ -536,7 +655,19 @@ class GitHubDeliveryClient:
             paths.append(row["path"])
         return tuple(paths)
 
-    def _commit_tree_paths(self, *, repo: str, commit: str) -> tuple[str, ...]:
+    def _commit_tree_paths(
+        self,
+        *,
+        repo: str,
+        commit: str,
+        canonical_checkout: str | Path | None = None,
+    ) -> tuple[str, ...]:
+        if canonical_checkout is not None:
+            checkout = self._canonical_checkout(canonical_checkout)
+            return self._local_commit_tree_paths(
+                canonical_checkout=checkout,
+                commit=commit,
+            )
         payload = self._api(f"repos/{repo}/git/commits/{commit}")
         try:
             tree_sha = payload["tree"]["sha"]  # type: ignore[index]
@@ -777,8 +908,10 @@ class GitHubDeliveryClient:
         change: str | None,
         required_issues: tuple[int, ...],
         todo_paths: tuple[str, ...],
+        canonical_checkout: str | Path | None = None,
     ) -> RemoteClosureFacts:
         self._repo_parts(repo)
+        checkout = self._canonical_checkout(canonical_checkout)
         pull = self._api(f"repos/{repo}/pulls/{pr_number}")
         repository = self._api(f"repos/{repo}")
         if not isinstance(pull, dict) or not isinstance(repository, dict):
@@ -792,50 +925,46 @@ class GitHubDeliveryClient:
         if (
             pull.get("merged_at") is None
             or not isinstance(merge_commit, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", merge_commit) is None
             or not isinstance(default_branch, str)
+            or not default_branch
             or not isinstance(pr_head, str)
             or re.fullmatch(r"[0-9a-fA-F]{40}", pr_head) is None
         ):
             raise RuntimeError("GitHub merge evidence incomplete")
-        encoded_branch = quote(default_branch, safe="")
-        default_ref = self._api(f"repos/{repo}/git/ref/heads/{encoded_branch}")
-        try:
-            default_head = default_ref["object"]["sha"]  # type: ignore[index]
-        except (KeyError, TypeError) as exc:
-            raise RuntimeError("GitHub default branch ref malformed") from exc
-        if (
-            not isinstance(default_head, str)
-            or re.fullmatch(r"[0-9a-fA-F]{40}", default_head) is None
-        ):
-            raise RuntimeError("GitHub default branch ref malformed")
-        default_head = default_head.lower()
-        comparison = self._api(
-            f"repos/{repo}/compare/{merge_commit}...{default_head}"
+        merge_commit = merge_commit.lower()
+        default_head = self._fetch_closure_default_head(checkout, branch=default_branch)
+        ancestry_status, _ancestry_output = self._run_local_git(
+            checkout,
+            "merge-base",
+            "--is-ancestor",
+            merge_commit,
+            default_head,
         )
-        if not isinstance(comparison, dict):
-            raise RuntimeError("GitHub ancestry comparison malformed")
-        merge_payload = self._api(f"repos/{repo}/git/commits/{merge_commit}")
-        if not isinstance(merge_payload, dict) or not isinstance(
-            merge_payload.get("parents"), list
-        ):
-            raise RuntimeError("GitHub merge commit payload malformed")
-        parent_rows = merge_payload["parents"]
-        merge_parents: list[str] = []
-        for parent in parent_rows:
-            if (
-                not isinstance(parent, dict)
-                or not isinstance(parent.get("sha"), str)
-                or re.fullmatch(r"[0-9a-fA-F]{40}", parent["sha"]) is None
-            ):
-                raise RuntimeError("GitHub merge commit parent malformed")
-            merge_parents.append(parent["sha"].lower())
+        if ancestry_status not in {0, 1}:
+            raise RuntimeError("closure local Git ancestry check failed")
+        parents_text = self._local_git_text(
+            checkout,
+            "show",
+            "-s",
+            "--format=%P",
+            merge_commit,
+            failure_message="closure local Git merge commit unavailable",
+        )
+        merge_parents = tuple(parent.lower() for parent in parents_text.split())
+        if any(re.fullmatch(r"[0-9a-f]{40}", parent) is None for parent in merge_parents):
+            raise RuntimeError("closure local Git merge commit malformed")
         issue_states: dict[int, str] = {}
         for issue in required_issues:
             payload = self._api(f"repos/{repo}/issues/{issue}")
             if not isinstance(payload, dict) or not isinstance(payload.get("state"), str):
                 raise RuntimeError("GitHub issue state malformed")
             issue_states[issue] = payload["state"]
-        paths = self._commit_tree_paths(repo=repo, commit=default_head)
+        paths = self._commit_tree_paths(
+            repo=repo,
+            commit=default_head,
+            canonical_checkout=checkout,
+        )
         active_absent, archive_present = self._openspec_facts(paths, change)
         if not todo_paths:
             raise ValueError("remote Todo paths are required for closure")
@@ -851,37 +980,45 @@ class GitHubDeliveryClient:
                 or pure.suffix.lower() != ".md"
             ):
                 raise ValueError("Todo path must be a safe repo-relative markdown path")
-            encoded_path = quote(todo_path, safe="/")
-            encoded_ref = quote(default_head, safe="")
-            payload = self._api(
-                f"repos/{repo}/contents/{encoded_path}?ref={encoded_ref}"
+            todo_revision = self._local_git_text(
+                checkout,
+                "rev-parse",
+                "--verify",
+                f"{default_head}:{todo_path}",
+                failure_message="GitHub remote Todo payload malformed",
+            ).strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", todo_revision) is None:
+                raise RuntimeError("GitHub remote Todo payload malformed")
+            object_type = self._local_git_text(
+                checkout,
+                "cat-file",
+                "-t",
+                todo_revision,
+                failure_message="GitHub remote Todo payload malformed",
+            ).strip()
+            if object_type != "blob":
+                raise RuntimeError("GitHub remote Todo payload malformed")
+            content_bytes_status, content_bytes = self._run_local_git(
+                checkout,
+                "show",
+                f"{default_head}:{todo_path}",
             )
-            if (
-                not isinstance(payload, dict)
-                or payload.get("type") != "file"
-                or payload.get("encoding") != "base64"
-                or not isinstance(payload.get("content"), str)
-                or not isinstance(payload.get("sha"), str)
-                or re.fullmatch(r"[0-9a-fA-F]{40}", payload["sha"]) is None
-            ):
+            if content_bytes_status != 0:
                 raise RuntimeError("GitHub remote Todo payload malformed")
             try:
-                encoded_content = "".join(payload["content"].split())
-                content = base64.b64decode(
-                    encoded_content, validate=True
-                ).decode("utf-8")
-            except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
+                content = content_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
                 raise RuntimeError("GitHub remote Todo content malformed") from exc
             task_states = task_pattern.findall(content)
             if not task_states or any(state == " " for state in task_states):
                 todo_complete = False
-            todo_revisions[todo_path] = payload["sha"].lower()
+            todo_revisions[todo_path] = todo_revision
         return RemoteClosureFacts(
             merge_commit=merge_commit,
             pr_head=pr_head.lower(),
             merge_parents=tuple(merge_parents),
             default_head=default_head,
-            merge_is_ancestor=comparison.get("status") in {"ahead", "identical"},
+            merge_is_ancestor=ancestry_status == 0,
             merge_is_merge_commit=len(merge_parents) >= 2,
             issue_states=issue_states,
             active_openspec_absent=active_absent,
