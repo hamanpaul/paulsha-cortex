@@ -607,7 +607,7 @@ class QualificationStore:
             "schema_version", "kind", "candidate_id", "candidate_digest", "report_digest",
             "profile_digest", "profile_key", "role", "coverage", "verdict", "reviewer",
             "actor", "reason", "policy_revision", "reviewed_at", "expires_at", "test_only",
-            "receipt_id",
+            "receipt_id", "binding_generation",
         }
         optional = {"approval_receipt_id", "approval_receipt_digest"}
         if not required <= set(payload) or set(payload) - required - optional:
@@ -621,6 +621,8 @@ class QualificationStore:
             or payload.get("reviewer") != payload.get("actor")
             or registry_entry.get("candidate_id") != payload.get("candidate_id")
             or registry_entry.get("verdict") != payload.get("verdict")
+            or type(payload.get("binding_generation")) is not int
+            or payload.get("binding_generation") < 0
         ):
             raise QualificationError("operator qualification receipt identity is invalid")
         _nonempty(payload.get("reviewer"), "operator receipt reviewer")
@@ -642,6 +644,7 @@ class QualificationStore:
         expected_digest: str | None = None,
         approval_receipt_id: str | None = None,
         approval_receipt_digest: str | None = None,
+        expected_binding_generation: int | None = None,
         now: datetime | None = None,
     ) -> tuple[dict[str, object], str]:
         payload, digest = self._read_operator_receipt(receipt_id, expected_digest=expected_digest)
@@ -670,6 +673,15 @@ class QualificationStore:
             raise QualificationError("operator revocation receipt binding mismatch")
         if verdict == "approved" and ("approval_receipt_id" in payload or "approval_receipt_digest" in payload):
             raise QualificationError("operator approval receipt has unexpected revocation binding")
+        if (
+            expected_binding_generation is not None
+            and payload.get("binding_generation") != expected_binding_generation
+        ):
+            # 這張人類 receipt 綁定的 binding generation 已被後續 approve／revoke 推進；
+            # 撤銷或到期的世代不可再被舊 receipt 重播復活，必須換發綁新世代的 receipt。
+            raise QualificationError(
+                "operator receipt is bound to a superseded qualification generation"
+            )
         if now is not None:
             reviewed = _timestamp(payload.get("reviewed_at"), "operator receipt reviewed_at")
             expires = _timestamp(payload.get("expires_at"), "operator receipt expires_at")
@@ -726,10 +738,15 @@ class QualificationStore:
                 candidate["profile_key"], candidate["subject"]["role"],
             )
             binding = index["bindings"].get(binding_id)
+            if not isinstance(binding, Mapping):
+                raise QualificationError("qualification candidate has no lifecycle binding")
+            # 綁定核發當下的 binding generation；之後任何 approve／revoke 都會推進世代，
+            # 使這張人類 receipt 的雜湊與內容都與新世代不同，重跑相同參數不會拿回舊 receipt。
+            binding_generation = int(binding.get("generation", 0))
             approval_receipt_id = None
             approval_receipt_digest = None
             if verdict == "revoked":
-                if not isinstance(binding, Mapping) or binding.get("candidate_id") != candidate_id or binding.get("state") != "approved":
+                if binding.get("candidate_id") != candidate_id or binding.get("state") != "approved":
                     raise QualificationConflict("candidate is not the current approved qualification")
                 approval_receipt_id = binding.get("approval_receipt_id")
                 approval_meta = index["receipts"].get(approval_receipt_id)
@@ -756,6 +773,7 @@ class QualificationStore:
                 "reviewed_at": _timestamp_text(reviewed),
                 "expires_at": _timestamp_text(expires),
                 "test_only": False,
+                "binding_generation": binding_generation,
             }
             if verdict == "revoked":
                 draft["approval_receipt_id"] = approval_receipt_id
@@ -1464,6 +1482,13 @@ class QualificationStore:
             replay = self._replay(index, idempotency_key=idem, request_digest=request_digest)
             if replay is not None:
                 return replay
+            # 取得鎖後、寫入前重新量測時間：若他 process 持鎖到 receipt 過期後才放，
+            # 這裡必須用鎖後的真實時間重新判斷，不能沿用取鎖前的舊快照放行過期核可。
+            current_time = _parse_now(now)
+            if reviewed > current_time:
+                raise QualificationError("reviewed_at timestamp is in the future")
+            if verdict == "approved" and expires <= current_time:
+                raise QualificationError("expires_at timestamp is already expired")
             current_revision = self._check_expected_revision(index, expected_revision)
             candidate = self._candidate(index, candidate_id)
             if candidate["test_only"] is not test_only:
@@ -1471,22 +1496,6 @@ class QualificationStore:
             candidate_row = index["candidates"].get(candidate_id)
             if not isinstance(candidate_row, Mapping) or not isinstance(candidate_row.get("digest"), str):
                 raise QualificationError("qualification candidate digest is unavailable")
-            if not test_only:
-                assert operator_receipt_id is not None and operator_receipt_digest is not None
-                operator_receipt, checked_operator_digest = self._validate_operator_receipt(
-                    operator_receipt_id,
-                    candidate,
-                    candidate_row["digest"],
-                    verdict=verdict,
-                    expected_digest=operator_receipt_digest,
-                    now=current_time,
-                )
-                if checked_operator_digest != operator_receipt_digest:
-                    raise QualificationError("operator receipt digest mismatch")
-                reviewer = str(operator_receipt["reviewer"])
-                policy_revision = str(operator_receipt["policy_revision"])
-                reviewed = _timestamp(operator_receipt["reviewed_at"], "operator receipt reviewed_at")
-                expires = _timestamp(operator_receipt["expires_at"], "operator receipt expires_at")
             subject = candidate["subject"]
             binding_id = _binding_key(
                 subject["executor"], subject["model_id"], candidate["profile_key"], subject["role"]
@@ -1496,6 +1505,25 @@ class QualificationStore:
             binding = bindings.get(binding_id)
             if not isinstance(binding, dict):
                 raise QualificationError("candidate has no lifecycle binding")
+            if not test_only:
+                assert operator_receipt_id is not None and operator_receipt_digest is not None
+                operator_receipt, checked_operator_digest = self._validate_operator_receipt(
+                    operator_receipt_id,
+                    candidate,
+                    candidate_row["digest"],
+                    verdict=verdict,
+                    expected_digest=operator_receipt_digest,
+                    # 這張人類 receipt 必須綁在 binding 當前世代；一旦候選被撤銷／到期並推進
+                    # 世代，舊 receipt 就不再匹配，不能重播復活已撤銷的資格（Q05）。
+                    expected_binding_generation=binding.get("generation", 0),
+                    now=current_time,
+                )
+                if checked_operator_digest != operator_receipt_digest:
+                    raise QualificationError("operator receipt digest mismatch")
+                reviewer = str(operator_receipt["reviewer"])
+                policy_revision = str(operator_receipt["policy_revision"])
+                reviewed = _timestamp(operator_receipt["reviewed_at"], "operator receipt reviewed_at")
+                expires = _timestamp(operator_receipt["expires_at"], "operator receipt expires_at")
             current_candidate = self._candidate(index, binding["candidate_id"])
             if (
                 binding.get("candidate_id") != candidate_id
@@ -1657,6 +1685,11 @@ class QualificationStore:
             replay = self._replay(index, idempotency_key=idem, request_digest=request_digest)
             if replay is not None:
                 return replay
+            # 取得鎖後、寫入前重新量測時間，理由同 review_candidate：不能沿用取鎖前的
+            # 舊快照放行「revoked_at 在未來」這類判斷。
+            current_time = _parse_now(now)
+            if revoked > current_time:
+                raise QualificationError("revoked_at timestamp is in the future")
             current_revision = self._check_expected_revision(index, expected_revision)
             candidate = self._candidate(index, candidate_id)
             if candidate["test_only"] is not test_only:
@@ -1671,6 +1704,9 @@ class QualificationStore:
                 raise QualificationConflict("candidate is not the current qualification generation")
             if binding.get("state") != "approved" or not binding.get("approval_receipt_id"):
                 raise QualificationConflict("only an approved qualification can be revoked")
+            # 撤銷後這個世代必須永久結束；先固定住「被撤銷的世代」再遞增計數器，
+            # 使日後任何綁在此世代（或更舊）的 receipt 都無法再核可回 approved（Q05）。
+            revoked_generation = int(binding.get("generation", 0))
             approval = self._receipt(index, binding["approval_receipt_id"])
             approval_meta = index["receipts"].get(binding["approval_receipt_id"])
             if not isinstance(approval_meta, Mapping) or not isinstance(approval_meta.get("digest"), str):
@@ -1698,6 +1734,9 @@ class QualificationStore:
                     expected_digest=operator_receipt_digest,
                     approval_receipt_id=binding["approval_receipt_id"],
                     approval_receipt_digest=approval_meta["digest"],
+                    # 撤銷 receipt 本身也必須綁在 binding 當前世代，避免用陳舊撤銷 receipt
+                    # 對已經前進到別的世代的候選重播。
+                    expected_binding_generation=revoked_generation,
                     now=current_time,
                 )
                 if checked_operator_digest != operator_receipt_digest:
@@ -1709,7 +1748,7 @@ class QualificationStore:
                 **request,
                 "candidate_digest": candidate_row["digest"],
                 "approval_receipt_id": binding["approval_receipt_id"],
-                "generation": binding["generation"],
+                "generation": revoked_generation,
             }
             receipt_id = "qrcpt:v1:" + hashlib.sha256(_canonical_bytes(receipt_request)).hexdigest()
             receipt = {
@@ -1736,7 +1775,7 @@ class QualificationStore:
                 "reason": reason,
                 "revoked_at": _timestamp_text(revoked),
                 "test_only": test_only,
-                "generation": binding["generation"],
+                "generation": revoked_generation,
             }
             # 撤銷 receipt 也必須可連回原核可 receipt，否則不能發布撤銷狀態。
             if approval.get("receipt_id") != binding["approval_receipt_id"]:
@@ -1755,6 +1794,7 @@ class QualificationStore:
             binding["revocation_receipt_id"] = receipt_id
             binding["revoked_at"] = _timestamp_text(revoked)
             binding["revocation_reason"] = reason
+            binding["generation"] = revoked_generation + 1
             binding["history"].append(receipt_id)
             index["candidates"][candidate_id]["state"] = "revoked"
             index["revision"] = current_revision + 1

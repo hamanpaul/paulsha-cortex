@@ -271,7 +271,11 @@ def _review(
     )
 
 
-def _race_mutation(kind: str, root: str, candidate_id: str, barrier, result_queue) -> None:
+def _race_live_mutation(
+    kind: str, root: str, candidate_id: str, operator_receipt_id: str, barrier, result_queue
+) -> None:
+    """以真正的 operator receipt store（非 test-only receipt）競爭 approve／revoke。"""
+
     store = QualificationStore(root=Path(root))
     barrier.wait(timeout=10)
     try:
@@ -279,27 +283,20 @@ def _race_mutation(kind: str, root: str, candidate_id: str, barrier, result_queu
             result = store.review_candidate(
                 candidate_id,
                 verdict="approved",
-                reviewer="fixture-reviewer",
-                reviewer_authority="test-only",
-                policy_revision="qualification-policy-v1",
-                reviewed_at="2026-09-26T00:00:00Z",
-                expires_at="2026-09-27T00:00:00Z",
-                test_only=True,
+                operator_receipt_id=operator_receipt_id,
+                test_only=False,
                 expected_revision=2,
-                idempotency_key="race-approve",
+                idempotency_key="race-live-approve",
                 now=NOW,
             )
             result_queue.put((kind, "ok", result["revision"]))
         else:
             result = store.revoke_qualification(
                 candidate_id,
-                reviewer="fixture-reviewer",
-                reviewer_authority="test-only",
-                reason="競爭驗收",
-                revoked_at=NOW,
-                test_only=True,
+                operator_receipt_id=operator_receipt_id,
+                test_only=False,
                 expected_revision=2,
-                idempotency_key="race-revoke",
+                idempotency_key="race-live-revoke",
                 now=NOW,
             )
             result_queue.put((kind, "ok", result["revision"]))
@@ -859,6 +856,142 @@ def test_q05_fake_clock_expiry_revoke_timezone_and_clock_rollback(tmp_path: Path
             )
 
 
+def test_q05_operator_receipt_reissue_after_revoke_binds_new_generation(tmp_path: Path) -> None:
+    """#842 對抗審查第三輪 issue 1：重跑完全相同參數的 approve 不能拿回撤銷前的舊人類 receipt。"""
+
+    report, binding = _complete_report_binding()
+    store = QualificationStore(root=tmp_path / "state")
+    imported = _import_bound_report(
+        store, report, binding, expected_revision=0,
+        idempotency_key="regen-candidate", test_only=False,
+    )
+    candidate_id = imported["candidate_id"]
+    approve_kwargs = dict(
+        actor="operator-regen", reason="完全相同參數的核可", policy_revision="qualification-policy-v1",
+        reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", now=NOW,
+    )
+
+    first_authority = store.issue_operator_receipt(candidate_id, verdict="approved", **approve_kwargs)
+    store.review_candidate(
+        candidate_id, verdict="approved", operator_receipt_id=first_authority["operator_receipt_id"],
+        test_only=False, expected_revision=1, idempotency_key="regen-approve-1", now=NOW,
+    )
+    revoke_authority = store.issue_operator_receipt(
+        candidate_id, verdict="revoked", actor="operator-regen-revoke", reason="撤銷測試",
+        policy_revision="qualification-policy-v1", reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", now=NOW,
+    )
+    store.revoke_qualification(
+        candidate_id, operator_receipt_id=revoke_authority["operator_receipt_id"], test_only=False,
+        expected_revision=2, idempotency_key="regen-revoke-1", now=NOW,
+    )
+
+    # 用「完全相同」的 actor/reason/policy_revision/reviewed_at/expires_at 再次核發：
+    # 撤銷已推進 binding 世代，receipt 身分必須不同，不能沿用撤銷前發出的舊 receipt。
+    second_authority = store.issue_operator_receipt(candidate_id, verdict="approved", **approve_kwargs)
+    assert second_authority["operator_receipt_id"] != first_authority["operator_receipt_id"]
+    assert second_authority["operator_receipt_digest"] != first_authority["operator_receipt_digest"]
+
+    approved_again = store.review_candidate(
+        candidate_id, verdict="approved", operator_receipt_id=second_authority["operator_receipt_id"],
+        test_only=False, expected_revision=3, idempotency_key="regen-approve-2", now=NOW,
+    )
+    assert approved_again["state"] == "approved"
+
+
+def test_q05_revoked_generation_rejects_replay_of_old_approval_receipt(tmp_path: Path) -> None:
+    """#842 對抗審查第三輪 issue 2：撤銷後重播撤銷前的舊核可 receipt 不能把 binding 翻回 approved。"""
+
+    report, binding = _complete_report_binding()
+    store = QualificationStore(root=tmp_path / "state")
+    imported = _import_bound_report(
+        store, report, binding, expected_revision=0,
+        idempotency_key="replay-candidate", test_only=False,
+    )
+    candidate_id = imported["candidate_id"]
+    approve_authority = store.issue_operator_receipt(
+        candidate_id, verdict="approved", actor="operator-replay",
+        reason="首次核可", policy_revision="qualification-policy-v1",
+        reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", now=NOW,
+    )
+    store.review_candidate(
+        candidate_id, verdict="approved", operator_receipt_id=approve_authority["operator_receipt_id"],
+        test_only=False, expected_revision=1, idempotency_key="replay-approve-1", now=NOW,
+    )
+    revoke_authority = store.issue_operator_receipt(
+        candidate_id, verdict="revoked", actor="operator-replay-revoke", reason="撤銷測試",
+        policy_revision="qualification-policy-v1", reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", now=NOW,
+    )
+    store.revoke_qualification(
+        candidate_id, operator_receipt_id=revoke_authority["operator_receipt_id"], test_only=False,
+        expected_revision=2, idempotency_key="replay-revoke-1", now=NOW,
+    )
+    assert store.qualification_status(
+        "copilot", "fixture-model", binding.resolved_key, "build", now=NOW,
+    )["state"] == "revoked"
+
+    # 重播撤銷前發出的舊核可 receipt：即使檔案本身仍完整有效，binding 世代已被撤銷推進，
+    # 也不能把已撤銷的資格翻回 approved（Q05）。
+    with pytest.raises(ValueError, match="generation"):
+        store.review_candidate(
+            candidate_id, verdict="approved",
+            operator_receipt_id=approve_authority["operator_receipt_id"], test_only=False,
+            expected_revision=3, idempotency_key="replay-approve-2", now=NOW,
+        )
+    assert store.qualification_status(
+        "copilot", "fixture-model", binding.resolved_key, "build", now=NOW,
+    )["state"] == "revoked"
+
+
+def test_q05_review_candidate_rechecks_expiry_with_the_real_time_after_acquiring_the_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#842 對抗審查第三輪 issue 4：時間判定必須在持鎖後、寫入前重新取得，不能沿用取鎖前的舊快照。"""
+
+    store = QualificationStore(root=tmp_path / "state")
+    candidate = _import_test_candidate(store)
+    reviewed_at = "2026-09-26T00:00:00Z"
+    expires_at = "2026-09-26T00:00:01Z"
+
+    # 「取鎖前」是 expires_at 之前的即時；「取鎖後」是 expires_at 之後的即時。用只覆寫
+    # now() 的 datetime 子類別模擬他 process 持鎖到過期後才放的情境，其餘方法
+    # （fromisoformat／astimezone…）仍是真正 datetime 的行為，不影響其他時間解析。
+    instants = iter(
+        [
+            datetime(2026, 9, 26, 0, 0, 0, 500000, tzinfo=timezone.utc),
+            datetime(2026, 9, 26, 0, 0, 2, 0, tzinfo=timezone.utc),
+        ]
+    )
+
+    class _FakeClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(instants)
+
+    from paulsha_cortex.coordinator import qualification_lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "datetime", _FakeClock)
+    with pytest.raises(ValueError, match="expired"):
+        store.review_candidate(
+            candidate["candidate_id"],
+            verdict="approved",
+            reviewer="fixture-reviewer",
+            reviewer_authority="test-only",
+            policy_revision="qualification-policy-v1",
+            reviewed_at=reviewed_at,
+            expires_at=expires_at,
+            test_only=True,
+            expected_revision=1,
+            idempotency_key="toctou-approve",
+            now=None,
+        )
+    with pytest.raises(StopIteration):
+        next(instants)
+    assert store.revision == 1
+    assert store.qualification_status(
+        "copilot", "fixture-model", candidate["profile_key"], "build", now="2026-09-26T00:00:02Z",
+    )["state"] == "unknown"
+
+
 def test_q06_idempotency_cas_and_old_receipt_replay_do_not_revive(tmp_path: Path) -> None:
     store = QualificationStore(root=tmp_path / "state")
     first = _import_test_candidate(store, idempotency_key="import-1")
@@ -900,23 +1033,56 @@ def test_q06_idempotency_cas_and_old_receipt_replay_do_not_revive(tmp_path: Path
 
 
 def test_q07_two_process_publish_revoke_compete_with_one_cas_winner(tmp_path: Path) -> None:
+    # Q07 必須走真正的 operator receipt store（live, test_only=False），
+    # 否則測不到「缺有效人類 receipt 的 approved row」這條 Q05/Q07 的真實風險。
+    report, binding = _complete_report_binding()
     store = QualificationStore(root=tmp_path / "state")
-    candidate = _import_test_candidate(store)
-    _review(store, candidate, expected_revision=1)
-    candidate_path = store.paths.candidates_root / f"{candidate['candidate_id']}.json"
+    imported = _import_bound_report(
+        store, report, binding, expected_revision=0,
+        idempotency_key="race-live-candidate", test_only=False,
+    )
+    candidate_id = imported["candidate_id"]
     # Worker arguments use this fixed path only after the parent confirms its immutable id.
-    fixed_candidate_id = candidate["candidate_id"]
-    assert fixed_candidate_id.startswith("qcan:v1:")
+    assert candidate_id.startswith("qcan:v1:")
+
+    baseline_authority = store.issue_operator_receipt(
+        candidate_id, verdict="approved", actor="operator-race-baseline",
+        reason="建立競爭前的 baseline 核可", policy_revision="qualification-policy-v1",
+        reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", now=NOW,
+    )
+    baseline = store.review_candidate(
+        candidate_id, verdict="approved",
+        operator_receipt_id=baseline_authority["operator_receipt_id"], test_only=False,
+        expected_revision=1, idempotency_key="race-live-baseline-approve", now=NOW,
+    )
+    assert baseline["revision"] == 2
+
+    # 兩張各自綁在目前（baseline）世代的人類 receipt：一張再次核可、一張撤銷；
+    # 兩個子 process 各自只消費自己的合法 receipt，不共用、不重播。
+    reapprove_authority = store.issue_operator_receipt(
+        candidate_id, verdict="approved", actor="operator-race-approve",
+        reason="競爭中的第二次核可", policy_revision="qualification-policy-v1",
+        reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", now=NOW,
+    )
+    revoke_authority = store.issue_operator_receipt(
+        candidate_id, verdict="revoked", actor="operator-race-revoke",
+        reason="競爭中的撤銷", policy_revision="qualification-policy-v1",
+        reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", now=NOW,
+    )
+    candidate_path = store.paths.candidates_root / f"{candidate_id}.json"
 
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(2)
     result_queue = context.Queue()
     processes = [
         context.Process(
-            target=_race_mutation,
-            args=(kind, str(tmp_path / "state"), candidate["candidate_id"], barrier, result_queue),
+            target=_race_live_mutation,
+            args=(kind, str(tmp_path / "state"), candidate_id, receipt_id, barrier, result_queue),
         )
-        for kind in ("approve", "revoke")
+        for kind, receipt_id in (
+            ("approve", reapprove_authority["operator_receipt_id"]),
+            ("revoke", revoke_authority["operator_receipt_id"]),
+        )
     ]
     for process in processes:
         process.start()
@@ -927,13 +1093,15 @@ def test_q07_two_process_publish_revoke_compete_with_one_cas_winner(tmp_path: Pa
     assert sum(result[1] == "ok" for result in results) == 1
     assert sum(result[1] == "conflict" for result in results) == 1
     assert store.revision == 3
-    # The final roster points to one current generation with a durable matching receipt.
-    state = store.qualification_status(
-        "copilot", "fixture-model", candidate["profile_key"], "build", now=NOW,
-        allow_test_receipts=True,
+
+    # 新消費者：全新 QualificationStore 實例重新從磁碟驗證整條鏈；
+    # 只有帶著目前有效人類 receipt 的 approved row 才會通過，不會看到半狀態。
+    fresh_store = QualificationStore(root=tmp_path / "state")
+    state = fresh_store.qualification_status(
+        "copilot", "fixture-model", binding.resolved_key, "build", now=NOW,
     )
     assert state["state"] in {"approved", "revoked"}
-    assert store.verify_current_binding("copilot", "fixture-model", candidate["profile_key"], "build")
+    assert fresh_store.verify_current_binding("copilot", "fixture-model", binding.resolved_key, "build")
     assert candidate_path.is_file()
 
 
