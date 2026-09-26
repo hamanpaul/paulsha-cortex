@@ -857,10 +857,13 @@ def _validate_reserve_row(row: dict[str, Any]) -> None:
     for item in row["pools"]:
         if not isinstance(item, dict) or set(item) != {"pool_ref", "window_id", "amount"}:
             raise ReservationCorrupt("reservation-store-invalid-record")
-        _validate_pool_ref(item["pool_ref"])
+        try:
+            _validate_pool_ref(item["pool_ref"])
+            _validate_amount(item["amount"])
+        except ValueError as exc:
+            raise ReservationCorrupt("reservation-store-invalid-record") from exc
         if not isinstance(item["window_id"], str) or not _ID_RE.fullmatch(item["window_id"]):
             raise ReservationCorrupt("reservation-store-invalid-record")
-        _validate_amount(item["amount"])
     capacity_rows = row["capacity_by_pool"]
     if not isinstance(capacity_rows, list) or len(capacity_rows) != len(row["pools"]):
         raise ReservationCorrupt("reservation-store-invalid-record")
@@ -883,7 +886,11 @@ def _validate_reserve_row(row: dict[str, Any]) -> None:
     # 損毀導致 pools 少一格時，遺失的容量不得被靜默重新 grant。
     if len(set(pool_keys)) != len(pool_keys) or sorted(pool_keys) != sorted(capacity_keys):
         raise ReservationCorrupt("reservation-store-invalid-record")
-    if type(row["lease_expires_at_ms"]) is not int or type(row["created_at_ms"]) is not int:
+    for field_name in ("lease_expires_at_ms", "created_at_ms", "event_at_ms"):
+        value = row[field_name]
+        if type(value) is not int or value < 0 or value > _MAX_TIMESTAMP_MS:
+            raise ReservationCorrupt("reservation-store-invalid-record")
+    if row["lease_expires_at_ms"] < row["created_at_ms"]:
         raise ReservationCorrupt("reservation-store-invalid-record")
 
 

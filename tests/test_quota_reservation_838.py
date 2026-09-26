@@ -441,7 +441,8 @@ def test_ac4_malformed_reconcile_numbers_fail_closed_not_type_error(tmp_path: Pa
     )
     _append_raw_row(path, {
         "schema_version": 1, "kind": "reconcile", "reservation_id": granted.reservation_id,
-        "sequence": 1, "resolution": "confirmed-alive", "evidence": {},
+        # evidence 必須合法（有 kind），才能確實驗到數值欄位的 fail-closed。
+        "sequence": 1, "resolution": "confirmed-alive", "evidence": {"kind": "job-registry"},
         "renew_lease_ms": "1000", "event_at_ms": NOW + 1,
     })
     with pytest.raises(ReservationCorrupt):
@@ -550,6 +551,57 @@ def test_first_grant_fsyncs_new_store_directory(tmp_path: Path, monkeypatch) -> 
         demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
     )
     assert str(tmp_path) in synced and str(tmp_path / "quota-reservations") in synced
+
+
+def test_ac1_distinct_windows_of_same_pool_are_accounted_independently(tmp_path: Path) -> None:
+    """多時間窗：同一 pool 的 short／week 兩個 window 各自計帳；short 滿不影響
+    week，反之亦然，且同一 reservation 同時要求兩窗時 all-or-none。"""
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    capacity = {**_cap("1", window_id="short"), **_cap("1", window_id="week")}
+    first = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-short", attempt_id="attempt-1",
+        pools=(_demand("1", window_id="short"),), capacity_by_pool=capacity,
+        observation_version="obs-v1", demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert first.status == "granted"
+    week_only = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-week", attempt_id="attempt-1",
+        pools=(_demand("1", window_id="week"),), capacity_by_pool=capacity,
+        observation_version="obs-v1", demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert week_only.status == "granted"
+    both = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-both", attempt_id="attempt-1",
+        pools=(_demand("1", window_id="short"), _demand("1", window_id="week")),
+        capacity_by_pool=capacity,
+        observation_version="obs-v1", demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert both.status == "denied"
+    assert {row["window_id"] for row in both.denied_pools} == {"short", "week"}
+
+
+def test_ac4_tampered_reserve_row_values_fail_closed(tmp_path: Path) -> None:
+    import json as _json
+
+    for mutate in (
+        lambda row: row["pools"][0].__setitem__("amount", "nan"),
+        lambda row: row.__setitem__("event_at_ms", "bad"),
+        lambda row: row.__setitem__("lease_expires_at_ms", -1),
+    ):
+        path = tmp_path / f"reservations-{id(mutate)}.jsonl"
+        QuotaReservationAuthority(path).reserve(
+            run_id="run-1", card_id="card-1", decision_id="decision-tamper", attempt_id="attempt-1",
+            pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+            demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+        )
+        rows = [_json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        mutate(rows[0])
+        path.write_text(
+            "".join(_json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        with pytest.raises(ReservationCorrupt):
+            QuotaReservationAuthority(path).committed(now_ms=NOW + 1)
 
 
 def test_ac4_negative_or_non_finite_amount_rejected() -> None:
