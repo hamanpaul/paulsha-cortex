@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#557 regenerate-gates 卡片定錨**：新增 `--card` 以選擇要重跑 gate 的 build 卡；同一 run 有多張符合條件的卡時，未指定便拒絕執行，並同步更新 CLI、porcelain help 與生命週期文件。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

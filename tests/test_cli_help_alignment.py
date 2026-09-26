@@ -57,6 +57,15 @@ def test_work_help_lists_gc_subcommand() -> None:
     assert "回收" in umbrella_cli._WORK_HELP
 
 
+def test_work_help_explains_regenerate_gates_card_selector() -> None:
+    line = next(
+        item for item in umbrella_cli._WORK_HELP.splitlines()
+        if item.startswith("  regenerate-gates ")
+    )
+    assert "--card" in line
+    assert "多張 build 卡" in line
+
+
 def test_work_help_lists_intake_and_claim_precondition() -> None:
     # #389：`cortex work intake` 先前完全缺席於 umbrella `_WORK_HELP`（雖然
     # 實際呼叫會透傳給 coordinator CLI 執行），且 claim 的 lifecycle 前置

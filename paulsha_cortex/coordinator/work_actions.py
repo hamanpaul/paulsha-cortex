@@ -5981,12 +5981,18 @@ def _regenerate_gates_action(
     from .manager import GATE_LEDGER_REQUIRED_PHASES
 
     extras = set(args) - {
-        "action", "repo", "work_id", "issue", "actor", "expected_run_id",
+        "action", "repo", "work_id", "issue", "actor", "expected_run_id", "card",
     }
     if extras:
         raise ValueError(
             f"regenerate-gates rejects caller evidence/input: {sorted(extras)[0]}"
         )
+    card = args.get("card")
+    if card is not None and (
+        not isinstance(card, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None
+    ):
+        raise ValueError("regenerate-gates requires exact card id")
     expected_run_id = args.get("expected_run_id")
     if (
         not isinstance(expected_run_id, str)
@@ -6026,8 +6032,19 @@ def _regenerate_gates_action(
         and job.get("log_path")
         and Path(job["log_path"]).is_file()
     ]
+    if card is not None:
+        candidates = [job for job in candidates if job.get("workflow_card") == card]
+    elif candidates:
+        first_card = candidates[0].get("workflow_card")
+        if any(job.get("workflow_card") != first_card for job in candidates[1:]):
+            raise RuntimeError(
+                "regenerate-gates requires --card when multiple build cards are eligible"
+            )
     if not candidates:
-        raise RuntimeError("regenerate-gates requires a terminal builder job log")
+        detail = " for the requested card" if card is not None else ""
+        raise RuntimeError(
+            f"regenerate-gates requires a terminal builder job log{detail}"
+        )
     job = candidates[-1]
     worktree = job.get("worktree")
     if not isinstance(worktree, str) or not Path(worktree).is_dir():

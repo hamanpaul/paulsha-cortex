@@ -918,6 +918,27 @@ def test_every_entrypoint_registers_retry_card() -> None:
     assert "retry-card" in umbrella_cli._WORK_HELP
 
 
+def test_regenerate_gates_card_is_described_by_coordinator_and_recover_help(
+    capsys,
+) -> None:
+    coordinator_parser = coordinator_cli._build_parser()
+    with pytest.raises(SystemExit) as exc:
+        coordinator_parser.parse_args(
+            ["work", "regenerate-gates", WORK_ID, "--repo", REPO, "--help"]
+        )
+    assert exc.value.code == 0
+    assert "regenerate-gates 專用" in capsys.readouterr().out
+
+    recover_parser = porcelain_recover._build_parser()
+    with pytest.raises(SystemExit) as exc:
+        recover_parser.parse_args(
+            ["work", WORK_ID, "regenerate-gates", "--repo", REPO,
+             "--actor", "operator", "--help"]
+        )
+    assert exc.value.code == 0
+    assert "regenerate-gates 專用" in capsys.readouterr().out
+
+
 def test_coordinator_cli_forwards_card_to_the_control_request() -> None:
     submitted: list[tuple[str, dict, str]] = []
 
