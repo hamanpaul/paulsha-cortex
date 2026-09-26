@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#943／#972／#989／#990 main-sync 人工恢復出口**：Candidate clean-behind 或與 main 衝突而停在 `needs_human` 時，只有 reset 前置條件、C/M 摘要與 stop evidence 都相符才會在 status 顯示 `retry-build`；重試指示引用原 evidence 與 main SHA，重開 Builder 後仍須重跑既有 verify、review 與 ship probe。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、路徑逃逸、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用，內容驗收拒收維持
   content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
