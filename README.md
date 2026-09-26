@@ -207,6 +207,10 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    probe containment（#851）仍是獨立工作項；本 session 修正不新增 cancel/timeout/probe
    語意，也不宣稱這些 issue 已完成或關閉。
 
+   **#498 Claude headless builder 的 steering 邊界**：Claude builder 以 `-p` 執行時不附加
+   `--remote-control`；執行中的 headless job 不支援即時 steering。spool 保留的
+   `steering` 事件不代表指令已送達或被採納。
+
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 
    ```bash

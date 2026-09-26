@@ -103,7 +103,8 @@ D1–D3 把常態讀取壓下來的代價是**發現延遲**——fleet 自己�
 - **記帳**：`github:` provider 的 observations 多一個 `event_spool` 欄位（未接 spool
   時不出現）。
 - **其他事件型別**：`steering` / `job`（#498）與未知型別一律**原地保留只記 log**，
-  等各自的 consumer 落地。
+  等各自的 consumer 落地。`steering` 目前只是保留型事件，不是 Claude `-p` headless
+  job 的即時控制或採納確認通道。
 
 ### producer：headless job 的 hook（#506 / D5）
 

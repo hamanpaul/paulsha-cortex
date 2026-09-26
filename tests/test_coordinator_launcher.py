@@ -306,7 +306,7 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(argv[0], "claude")
         self.assertIn("-p", argv)
         self.assertIn("PROMPT", argv)
-        self.assertIn("--remote-control", argv)
+        self.assertNotIn("--remote-control", argv)
         self.assertIn("--add-dir", argv)
         self.assertIn("/wt/slice-a", argv)
         self.assertIn("--output-format", argv)
