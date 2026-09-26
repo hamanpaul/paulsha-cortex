@@ -628,9 +628,9 @@
 
 ### Fixed
 
-- **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、路徑逃逸、非一般檔案
-  及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用，內容驗收拒收維持
-  content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
+- **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
+  及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
+  路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
   經分類標記遮罩且限 2 KiB。
 - Wave R 整合交付：operator 合併 8 個卡在 cortex pipeline 的實作 PR，並補 review 修正（非正規化 governed path、journal lock `O_CLOEXEC`、裁決 evidence 先於 run 重置、#862 測試對齊 #966 CAS）。
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、

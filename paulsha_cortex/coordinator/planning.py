@@ -1637,7 +1637,8 @@ ARTIFACT_EVIDENCE_CONTENT_REASONS = frozenset(
 ARTIFACT_EVIDENCE_ENVIRONMENT_REASONS = frozenset(
     {
         "artifact-root-unresolvable",
-        "artifact-path-escapes-root",
+        # `artifact-path-escapes-root` 刻意不列入：它由模型回傳的 ref 字面
+        # （絕對路徑或含 `..`）觸發，是模型輸出內容錯誤，維持 content。
         "artifact-symlink-rejected",
         "artifact-not-a-regular-file",
         "artifact-unreadable",
