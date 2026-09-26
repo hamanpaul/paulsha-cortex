@@ -685,6 +685,9 @@ def test_live_canary_rejects_fewer_than_five_successful_provides_per_repo_path(
         for mode in report["paths"].values()
         for row in mode["per_repo"].values()
     )
+    # 聚合指標也必須套用每 repo／path 至少 5 次的門檻，不能只看成功率。
+    assert report["content_retrieval"]["passed"] is False
+    assert report["inline_delivery"]["passed"] is False
 
 
 def test_task_memory_canary_appears_in_umbrella_help(capsys):

@@ -789,7 +789,9 @@ class TaskMemoryAdapter:
         event = _event(
             context,
             event_name,
-            mode=requested_mode,
+            # ineligible receipt 的 mode 固定為 "ineligible"（receipt 契約：
+            # event/mode 必須一致）；原先請求的交付模式仍保留在回傳值的 mode。
+            mode="ineligible" if event_name == "ineligible" else requested_mode,
             reason=reason,
             permission_layer=permission_layer,
             provider_code=provider_code,

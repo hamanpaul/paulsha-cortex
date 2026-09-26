@@ -529,6 +529,41 @@ def test_hostile_content_version_is_rejected_before_any_receipt(hostile_version)
         assert hostile_version not in rendered
 
 
+@pytest.mark.parametrize("mode_caps", ["inline", "snapshot", "note_fetch"])
+def test_zero_candidate_response_emits_valid_ineligible_receipt(tmp_path, mode_caps):
+    """對抗審查 BLOCKER：合法的 0-candidate Hippo 回應走 ineligible，receipt
+    必須通過 _validate_event 並能寫入 sidecar，不得因 mode 不符被拒或靜默丟失。"""
+
+    def empty_provider(request):
+        payload = _payload(request)
+        payload["candidates"] = []
+        manifest = payload["delivery"]["manifest"]
+        manifest["entries"] = []
+        unsigned = dict(manifest)
+        unsigned.pop("sha256")
+        manifest["sha256"] = hashlib.sha256(
+            json.dumps(
+                unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        return payload
+
+    caps = TaskMemoryCapabilities(**{mode_caps: True})
+    context, _work_item, _run, _step, _job = _context(caps=caps)
+    kwargs = {"note_fetch": lambda _t, _n: NOTE_CONTENT} if mode_caps == "note_fetch" else {}
+    adapter = TaskMemoryAdapter(provider=empty_provider, **kwargs)
+    prepare_kwargs = (
+        {"snapshot_root": tmp_path / "snapshots"} if mode_caps == "snapshot" else {}
+    )
+    prepared = adapter.prepare(context, **prepare_kwargs)
+    assert prepared.status == "ineligible"
+    assert prepared.reason == "no-authorized-candidates"
+    store = TaskMemoryReceiptStore(tmp_path / "coordinator")
+    for event in prepared.events:
+        store.append(event)
+    assert store.events_for_run(context.repo, context.work_id, context.workflow_run_id)
+
+
 def test_hostile_provider_free_text_never_reaches_receipt_sidecar_or_read_model(tmp_path):
     """issue #857 對抗審查 MAJOR：有缺陷／惡意的 hippo provider 若把 note 正文
     或 provider 內部診斷訊息塞進 applicability／relevance_reason／source_time，

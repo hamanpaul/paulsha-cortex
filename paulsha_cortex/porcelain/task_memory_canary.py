@@ -340,8 +340,12 @@ def _run_canary(repos: Sequence[str], runs: int, client: HippoTaskMemoryClient |
     )
     retrieval_successes = sum(paths[mode]["successes"] for mode in retrieval_modes)
     retrieval_rate = retrieval_successes / retrieval_attempts if retrieval_attempts else None
+    # 聚合門檻＝成功率 ≥95% 且每條 retrieval path 各自通過（每 repo／path
+    # 至少 5 次成功）；只看成功率會讓 --runs 1 的 canary 誤報通過。
     content_retrieval_passed = bool(
-        retrieval_rate is not None and retrieval_rate >= 0.95
+        retrieval_rate is not None
+        and retrieval_rate >= 0.95
+        and all(paths[mode]["passed"] for mode in retrieval_modes)
     )
     inline_path = paths["inline"]
     inline_delivery_rate = inline_path["eligible_authorized_success_rate"]
