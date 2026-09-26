@@ -6453,7 +6453,7 @@ def _explicit_stop_gate_terminal(job: Mapping[str, object]) -> dict[str, object]
 
 
 def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
-    """Recognize plan/build terminals that cannot be bound as a passed workflow-card.
+    """辨識可交由既有 per-card schema retry 額度處理的 malformed terminal。
 
     #717 迴歸釘住：**合法的明示停止不得被判成 schema mismatch**。這條保證由下面
     第一行的早退提供——:func:`_retryable_nonpassing_workflow_terminal` 認得的形狀
@@ -6461,22 +6461,74 @@ def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
     JSON」的，不是給「執行環境壞掉」的）。下面 ``status != "passed"`` 那一行看似
     「任何非 passed 一律當 schema mismatch」，但它只會看到早退**沒有**接住的殘餘：
     真的形狀壞掉、或綁定對不上（run_id／card_id 不符）的 payload。
+
+    verify／review 只把無法解析或不符合該 phase terminal 外層 schema 的輸出視為
+    malformed；合法明示停止、有效 envelope 後續遇到的 gate／authority 錯誤不重派。
     """
 
     if _retryable_nonpassing_workflow_terminal(job):
         return False
+    phase = job.get("workflow_phase")
     if (
         job.get("workflow_evidence") is not None
         or job.get("status") != "exited"
         or type(job.get("exit_code")) is not int
         or job.get("exit_code") != 0
-        or job.get("workflow_phase") not in {"plan", "build"}
+        or phase not in {"plan", "build", "verify", "review"}
     ):
         return False
     try:
         raw = _extract_terminal_json(job.get("log_path"))
     except ValueError:
         return True
+    if phase in {"verify", "review"}:
+        if _explicit_stop_gate_terminal(job) is not None:
+            return False
+        if phase == "verify":
+            verify_keys = {
+                "schema_version", "kind", "status", "summary", "details", "reports"
+            }
+            details = raw.get("details")
+            return not (
+                set(raw) == verify_keys
+                and type(raw.get("schema_version")) is int
+                and raw.get("schema_version") == 1
+                and raw.get("kind") == "workflow-verification-result"
+                and raw.get("status") in {"verified", "passed"}
+                and isinstance(raw.get("summary"), str)
+                and bool(str(raw["summary"]).strip())
+                and (
+                    isinstance(details, dict)
+                    or (isinstance(details, str) and bool(details.strip()))
+                )
+                and _explicit_stop_terminal_reports_valid(raw.get("reports"))
+            )
+
+        review_raw = dict(raw)
+        if "status" in review_raw:
+            if review_raw.get("status") != "passed":
+                return True
+            review_raw.pop("status")
+        snapshot = job.get("workflow_input_snapshot")
+        has_planning_authority = isinstance(snapshot, list) and any(
+            isinstance(row, dict) and row.get("authority") == "planning-authority"
+            for row in snapshot
+        )
+        required = {"schema_version", "kind", "reason", "findings", "reports"}
+        allowed = required | (
+            {"authority_hashes"} if has_planning_authority else set()
+        )
+        return not (
+            set(review_raw) == allowed
+            and type(review_raw.get("schema_version")) is int
+            and review_raw.get("schema_version") == 1
+            and review_raw.get("kind") == "workflow-review-result"
+            and isinstance(review_raw.get("reason"), str)
+            and bool(str(review_raw["reason"]).strip())
+            and isinstance(review_raw.get("findings"), list)
+            and all(isinstance(item, dict) for item in review_raw["findings"])
+            and _explicit_stop_terminal_reports_valid(review_raw.get("reports"))
+        )
     if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
         raw = _canonicalize_card_terminal(raw)
     required = {
@@ -6492,7 +6544,7 @@ def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
     if raw.get("status") != "passed":
         return True
     candidate = raw.get("candidate")
-    if job.get("workflow_phase") == "build":
+    if phase == "build":
         return (
             not isinstance(candidate, str)
             or verification.SAFE_SHA_RE.fullmatch(candidate) is None

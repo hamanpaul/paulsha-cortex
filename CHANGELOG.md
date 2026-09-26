@@ -635,6 +635,7 @@
 - **#617 slice-review category 語意**：prompt 明列阻擋交付與可交付 follow-up 的 category，要求 review 結論與 blocking findings 一致，並說明 severity 只表示影響程度。
 - **#1006 post-archive Builder 綁定 exact Candidate**：resume 與 dispatch 僅重用以目前 Candidate 派出的 build job；新 job 的 `dispatch_head` 記錄實際採用的 clone base，並同步 lifecycle 文件。
 - **#489 slice write_paths 範圍驗證**：verification contract 可固定有限的 repo 相對檔案清單；候選變更須同時符合 builder persona 與 slice 限制，未宣告 slice 路徑的舊 contract 則明示為 `persona-only`。
+- **#578 verify／review malformed terminal 有界自動重派**：periodic resume 現在會將無法解析或不符合 phase 外層 schema 的 verify／review terminal 送入既有 per-card schema retry 額度；達上限後停在 `needs_human`，合法明示停止與有效 envelope 的 gate／authority 採信錯誤不重派，operator 的 `retry-card` 熔斷維持 #555 規則。
 - **#492 foreign review tier 前置檢查**：required review 的 builder slice 會在建立工作區與啟動 builder 前驗證 project policy tier；缺少或非法值會指出選定 manifest 路徑及允許值，無 manifest 時維持 `shareable` 預設。
 - **#571、#579 reviewer 路徑綁定**：review gate evaluation 檔名納入 candidate 短 SHA；reviewer sandbox 目錄名納入 job id，並於新 reviewer 派工前回收前代 claim era 已終止的孤兒 sandbox，回收失敗時記錄 warning 並繼續派工。
 - **#810 merge 後 Todo 勾選狀態僅供診斷**：已合併 WorkflowRun 的遠端結案與 Monitor 不再因 workstream Todo 未勾而阻擋有效交付；Todo 證據仍須存在且可讀，archived OpenSpec tasks 的完成要求維持不變。
