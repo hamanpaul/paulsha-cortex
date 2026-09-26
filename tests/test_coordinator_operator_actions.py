@@ -361,4 +361,6 @@ def test_runtime_status_provider_includes_attention_next_actions(tmp_path):
     assert attention["slice_state"] == "needs_human"
     assert attention["reason"] == "foreign-review-absent"
     assert attention["repo"] == "hamanpaul/paulsha-cortex"
-    assert set(attention["next_actions"]) == {"retry-build", "retry-verify", "retry-review", "abandon"}
+    assert set(attention["next_actions"]) == {
+        "retry-build", "retry-verify", "retry-review", "abandon", "supersede"
+    }

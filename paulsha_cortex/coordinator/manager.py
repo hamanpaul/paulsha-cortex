@@ -54,7 +54,12 @@ from .claim import (
     needs_human_next_step_hint,
 )
 from . import model_resolution
-from .diagnostics import DiagnosticReason, diagnostic_reason, summarize_exception
+from .diagnostics import (
+    DiagnosticReason,
+    coerce_diagnostic_reason,
+    diagnostic_reason,
+    summarize_exception,
+)
 from .model_identities import (
     AGY_DOMAIN,
     AGY_LIVE_PROBE,
@@ -101,7 +106,7 @@ TERMINAL_STATUSES = frozenset({"exited", "failed"})
 WORKFLOW_LANE_GATE_STATUS = "workflow-tracked"
 WORKFLOW_LANE_GATE_REASON = "workflow-lane-job"
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
-SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"})
+SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"})
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
 _PLANNING_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
@@ -210,7 +215,7 @@ def _supersede_handoff_manifest(
     actor: str,
     clock: Callable[[], str] = _utcnow,
 ) -> None:
-    """操作者復原動作（recover-pre-candidate／abandon）後，替殘留 handoff manifest
+    """操作者 slice action 後，替殘留 handoff manifest
     補上 superseded 稽核標記（issue #383）。
 
     `run_tick()`/`dispatch_gate_scan()` 的 fanout 放行判定改成與 registry 現況
@@ -678,12 +683,19 @@ def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
         actions = ["recover-pre-candidate", "abandon"] if not valid_candidate else ["abandon"]
         if slice_repin_eligible(slice_row):
             actions = ["retry-build"] + actions
+        if not _slice_has_in_flight_job(registry, slice_row):
+            actions.append("supersede")
         return actions
     if state != "needs_human":
         return []
     if not valid_candidate:
-        return ["recover-pre-candidate", "abandon"]
+        actions = ["recover-pre-candidate", "abandon"]
+        if not _slice_has_in_flight_job(registry, slice_row):
+            actions.append("supersede")
+        return actions
     actions = ["retry-build", "abandon"]
+    if not _slice_has_in_flight_job(registry, slice_row):
+        actions.append("supersede")
     builder_job_id = slice_row.get("builder_job_id")
     if not isinstance(builder_job_id, str):
         return actions
@@ -705,6 +717,127 @@ def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
     ):
         actions.append("retry-review")
     return actions
+
+
+def _slice_has_in_flight_job(registry, slice_row: dict) -> bool:
+    slice_id = slice_row.get("slice_id")
+    if not isinstance(slice_id, str):
+        return True
+    list_jobs = getattr(registry, "list_jobs", None)
+    if callable(list_jobs):
+        try:
+            return any(
+                job.get("task") == slice_id and job.get("status") in IN_FLIGHT_STATUSES
+                for job in list_jobs()
+                if isinstance(job, dict)
+            )
+        except Exception:  # noqa: BLE001 - 無法證明沒有 active job 時 fail-closed
+            return True
+    get_job = getattr(registry, "get_job", None)
+    if not callable(get_job):
+        return True
+    for key in ("builder_job_id", "reviewer_job_id"):
+        job_id = slice_row.get(key)
+        if not isinstance(job_id, str):
+            continue
+        try:
+            if get_job(job_id).get("status") in IN_FLIGHT_STATUSES:
+                return True
+        except Exception:  # noqa: BLE001 - 無法證明沒有 active job 時 fail-closed
+            return True
+    return False
+
+
+def reconcile_building_slices(
+    registry,
+    *,
+    clock: Callable[[], str] = _utcnow,
+    errors: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """把沒有 current in-flight builder 的 building slice 收斂為 needs_human。"""
+    list_jobs = getattr(registry, "list_jobs", None)
+    list_slices = getattr(registry, "list_slices", None)
+    if not callable(list_jobs) or not callable(list_slices):
+        return []
+    try:
+        jobs = list_jobs()
+        slices = list_slices()
+    except Exception as exc:  # noqa: BLE001 - reconcile 失敗不得遮住 status/tick 結果
+        detail = {"stage": "reconcile-building-slices", "error": str(exc)}
+        if errors is not None:
+            errors.append(detail)
+        else:
+            logger.warning("building slice reconciliation failed: %s", exc)
+        return []
+    jobs_by_id = {
+        job.get("job_id"): job
+        for job in jobs
+        if isinstance(job, dict) and isinstance(job.get("job_id"), str)
+    }
+    reconciled: list[str] = []
+    for slice_row in slices:
+        if not isinstance(slice_row, dict) or slice_row.get("state") != "building":
+            continue
+        slice_id = slice_row.get("slice_id")
+        if not isinstance(slice_id, str) or not slice_id:
+            continue
+        builder_job_id = slice_row.get("builder_job_id")
+        builder_job = jobs_by_id.get(builder_job_id) if isinstance(builder_job_id, str) else None
+        if (
+            isinstance(builder_job, dict)
+            and builder_job.get("task") == slice_id
+            and builder_job.get("status") in IN_FLIGHT_STATUSES
+            and builder_job.get("kind") != "review"
+        ):
+            continue
+        observed_at = clock()
+        reason = diagnostic_reason(
+            "building-without-inflight-job",
+            "slice 標示為 building，但目前沒有綁定的 in-flight builder job。",
+            source="paulsha_cortex.coordinator.manager.reconcile_building_slices",
+            next_step_hint=(
+                "請檢視 slice 與 job 狀態；可用 retry-build 重派，或依明確理由執行 supersede。"
+            ),
+            recorded_at=observed_at,
+            slice_id=slice_id,
+            builder_job_id=builder_job_id,
+        )
+        gate_state = slice_row.get("gate_state")
+        action_kwargs: dict[str, Any] = {}
+        if gate_state in {"pending", "failed", "needs_human"}:
+            action_kwargs["gate_state"] = "needs_human"
+        expected_binding_revision = slice_row.get("binding_revision")
+        try:
+            registry.record_action(
+                slice_id,
+                action="manager-reconcile-building-without-inflight-job",
+                actor="manager",
+                state="needs_human",
+                requested_at=observed_at,
+                consumed_at=observed_at,
+                result="reconciled",
+                diagnostic_reason=reason,
+                **(
+                    {"expected_binding_revision": expected_binding_revision}
+                    if isinstance(expected_binding_revision, int)
+                    and not isinstance(expected_binding_revision, bool)
+                    else {}
+                ),
+                **action_kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - report the failed CAS/write and continue
+            detail = {
+                "slice_id": slice_id,
+                "stage": "reconcile-building-slices",
+                "error": str(exc),
+            }
+            if errors is not None:
+                errors.append(detail)
+            else:
+                logger.warning("building slice reconciliation failed for %s: %s", slice_id, exc)
+            continue
+        reconciled.append(slice_id)
+    return reconciled
 
 
 def _resolve_ancestry_status(slice_row: dict, *, git_runner) -> dict[str, Any]:
@@ -1007,6 +1140,7 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
         gate_reason = manifest.get("gate_reason")
         if isinstance(gate_reason, str) and gate_reason:
             reason = gate_reason
+    diagnostic_payload = None
     if reason is None:
         actions = slice_row.get("actions")
         if isinstance(actions, list) and actions:
@@ -1015,6 +1149,12 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
                 latest_action = latest.get("action")
                 if isinstance(latest_action, str) and latest_action:
                     reason = latest_action
+    actions = slice_row.get("actions")
+    if isinstance(actions, list) and actions and isinstance(actions[-1], dict):
+        latest_diagnostic = coerce_diagnostic_reason(actions[-1].get("diagnostic_reason"))
+        if latest_diagnostic is not None:
+            diagnostic_payload = latest_diagnostic.to_dict()
+            reason = latest_diagnostic.rendered()
     # #384：manifest 上的 typed provider failure 分類（None 除非本輪終局是
     # build-phase failure 且分類得到結果，見上面 write_manifest 的呼叫端）。
     # 投影出來讓 `cortex inspect status` 不必自己解析 `reason` 字串。
@@ -1035,12 +1175,14 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
         "slice_id": slice_id,
         "slice_state": slice_row.get("state"),
         "gate_state": slice_row.get("gate_state"),
+        "binding_revision": slice_row.get("binding_revision"),
         "job_state": reviewer_job_state or builder_job_state,
         "builder_job_id": builder_job_id,
         "builder_job_state": builder_job_state,
         "reviewer_job_id": reviewer_job_id,
         "reviewer_job_state": reviewer_job_state,
         "reason": reason,
+        "diagnostic_reason": diagnostic_payload,
         "provider_outcome": manifest_provider_outcome,
         "repo": repo,
         "candidate": slice_row.get("candidate"),
@@ -2028,6 +2170,8 @@ def apply_slice_action(
     action: str,
     actor: str,
     specs_dir: str,
+    reason: str | None = None,
+    expected_binding_revision: int | None = None,
     handoff_dir: str = autonomy.DEFAULT_HANDOFF_DIR,
     launcher=None,
     review_launcher=None,
@@ -2050,10 +2194,51 @@ def apply_slice_action(
         raise ValueError(f"unsupported-slice-action:{action}")
     if not isinstance(actor, str) or not actor.strip():
         raise ValueError("slice-action actor must be a non-empty string")
+    if action == "supersede":
+        if actor != actor.strip() or len(actor) > 128 or not actor.isprintable():
+            raise ValueError("supersede requires bounded actor")
+        if (
+            not isinstance(reason, str)
+            or reason != reason.strip()
+            or not 1 <= len(reason) <= 500
+            or not reason.isprintable()
+        ):
+            raise ValueError("supersede requires bounded reason")
+        if (
+            not isinstance(expected_binding_revision, int)
+            or isinstance(expected_binding_revision, bool)
+            or expected_binding_revision < 1
+        ):
+            raise ValueError("supersede requires exact expected_binding_revision")
     try:
         slice_row = registry.get_slice(slice_id)
     except KeyError as exc:
         raise ValueError("unknown-slice") from exc
+    if action == "supersede" and slice_row.get("state") == "superseded":
+        actions = slice_row.get("actions")
+        latest_action = actions[-1] if isinstance(actions, list) and actions else None
+        if (
+            isinstance(latest_action, dict)
+            and latest_action.get("action") == "operator-supersede"
+            and latest_action.get("actor") == actor
+            and latest_action.get("reason") == reason
+            and latest_action.get("expected_binding_revision") == expected_binding_revision
+            and latest_action.get("result") == "ok"
+        ):
+            return {
+                "slice_id": slice_id,
+                "action": action,
+                "slice_state": slice_row.get("state"),
+                "gate_state": slice_row.get("gate_state"),
+                "result": "already-superseded",
+                "requested_at": latest_action.get("requested_at"),
+                "consumed_at": latest_action.get("consumed_at"),
+            }
+    if action == "supersede" and slice_row.get("binding_revision") != expected_binding_revision:
+        raise ValueError(
+            "supersede expected_binding_revision mismatch: "
+            f"expected={expected_binding_revision}, actual={slice_row.get('binding_revision')}"
+        )
     if action not in allowed_slice_actions(registry, slice_row):
         raise ValueError(f"action-not-allowed:{action}")
 
@@ -2077,6 +2262,37 @@ def apply_slice_action(
             handoff_dir=handoff_dir,
             slice_id=slice_id,
             action="operator-abandon",
+            actor=actor,
+            clock=clock,
+        )
+        latest = registry.get_slice(slice_id)
+        return {
+            "slice_id": slice_id,
+            "action": action,
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+            "result": "ok",
+            "requested_at": requested_at,
+            "consumed_at": consumed_at,
+        }
+
+    if action == "supersede":
+        consumed_at = clock()
+        registry.record_action(
+            slice_id,
+            action="operator-supersede",
+            actor=actor,
+            state="superseded",
+            requested_at=requested_at,
+            consumed_at=consumed_at,
+            result="ok",
+            reason=reason,
+            expected_binding_revision=expected_binding_revision,
+        )
+        _supersede_handoff_manifest(
+            handoff_dir=handoff_dir,
+            slice_id=slice_id,
+            action="operator-supersede",
             actor=actor,
             clock=clock,
         )
@@ -2838,6 +3054,7 @@ def complete_tick(
         except Exception as exc:
             errors.append({"job_id": job_id, "error": str(exc)})
 
+    reconcile_building_slices(registry, clock=clock, errors=errors)
     summary: dict = {
         "polled": polled,
         "completed": completed,

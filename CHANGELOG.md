@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#817 building invariant 與單筆 supersede**：complete/status 會將沒有目前綁定 in-flight builder job 的 `building` slice reconcile 為帶 `DiagnosticReason` 的 `needs_human`；新增需 actor、reason 與 exact `binding_revision` CAS 的單筆 `supersede`，保留 slice/audit 並使其離開 attention，相同 CAS 重送冪等，不支援 bulk closure 或 diagnosis intent。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

@@ -484,11 +484,13 @@ systemctl --user status cortex-manager.service cortex-monitor.service
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。builder／reviewer 失敗若已有
   durable `provider_outcome`，`gate_reason` 會帶具名後綴（例如 `builder-failed-rate_limited`、
   `builder-failed-effort_not_supported`、`foreign-review-provider-launch_failed`），而不是把所有
-  provider 層與 launch 層失敗壓平成同一句。
+  provider 層與 launch 層失敗壓平成同一句；每筆也帶目前的 `binding_revision`，供單筆
+  `supersede` action 做 exact CAS。
 - `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及
   `candidate_git_base`。workflow job 的 provider 類失敗會另外投影 `provider_outcome` 與
   `provider_outcome_authority`；`runtime-contract-failed` 仍與 provider 分類分層，不會被
-  `exit 127` 或關鍵字比對覆蓋。
+  `exit 127` 或關鍵字比對覆蓋。`building` slice 若沒有目前綁定的 in-flight builder job，
+  complete/status reconcile 會將它轉成帶 `DiagnosticReason` 的 `needs_human`。
 - `candidate_git_base`（#731）：這條 run／這張卡的**候選 git base**——真正那個 40-hex commit SHA，以及它落後 mirror 上 `origin/main` 幾個 commit。欄位含 `sha`、`sha_source`（`frozen-readiness-base-sha` 或 `first-build-job-dispatch-head`）、`behind_origin_main`、`mirror_origin_main`、`threshold_commits`、`reason`、`measured_against`、`fetched`。
   - **與 `source_revision` 是兩件事**：`source_revision` 是 work item 來源材料的 sha256（authority digest，64-hex），與 git 無關、也不隨 `origin/main` 前進而改變。過去候選基底只存在於候選 worktree 的 `.git` 裡，operator 只能 `git -C <候選 worktree> rev-parse HEAD` 才問得到，於是把診斷掛在 `source_revision` 上而誤判。
   - 落後達 `threshold_commits`（預設 10，可用 `PSC_CANDIDATE_BASE_STALE_THRESHOLD_COMMITS` 覆寫）時，`reason` 為具名診斷 `candidate-git-base-stale`——代表「這條 run 的基底過舊、已 merge 的 test-only 修復進不去」。
@@ -508,7 +510,14 @@ cortex slice-action "$SLICE_ID" retry-build  --actor operator
 cortex slice-action "$SLICE_ID" retry-verify --actor operator
 cortex slice-action "$SLICE_ID" retry-review --actor operator
 cortex slice-action "$SLICE_ID" abandon      --actor operator
+cortex slice-action "$SLICE_ID" supersede    --actor operator \
+  --reason "後續 retry 已接手此分析" --expected-binding-revision "$BINDING_REVISION"
 ```
+
+`supersede` 是單筆終結動作，只接受沒有 in-flight job 的 `needs_human`／`failed` slice；必須帶
+`--actor`、單行 `--reason` 與 status 所列的 `--expected-binding-revision`。它會保留舊 slice 與
+action audit，將 state 標為 `superseded`，不建立 CompletionRecord，也不釋放 dependency；相同
+actor/reason/CAS 重送會回報已完成且不新增 audit。
 
 `fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。共享 coordinator root 內的 `jobs.json` 另以 exact durable-byte SHA-256 revision ＋ canonical `jobs.json.transaction.lock` sidecar 做 compare-and-persist：stale request 不會被靜默重播，daemon 會先把 `RegistryRevisionConflict`（含 expected/actual revision 與 canonical path）持久化成 `done` error，再移除 request file。
 
@@ -762,6 +771,8 @@ cortex slice-action "$SLICE_ID" retry-build  --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" retry-verify --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" retry-review --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
+cortex slice-action "$SLICE_ID" supersede    --actor "$ACTOR" \
+  --reason "$REASON" --expected-binding-revision "$BINDING_REVISION"
 
 # 明確淘汰沒有delivery side effect的舊WorkflowRun：
 cortex work abandon "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \

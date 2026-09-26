@@ -78,20 +78,21 @@ v1 將現行 `done` 改名為 `exited`，避免把 process completion 誤寫成 
 | `exited` | 有可信 exit evidence 且 exit code為 0；只代表本次 agent execution 結束 | dispatcher poller | 無 | 是 | 無；必須由 SliceRecord 進 verification/review | late duplicate evidence冪等忽略 |
 | `failed` | non-zero exit、process 消失且無可信 sentinel、launch failure | launcher/dispatcher | 無 | 是 | 無 | 新的人工 retry建立新 Job，不覆寫舊 Job |
 
-Job history 保留為獨立 rows；v1 不實作自動 fix/retry loop，因此不需要 Attempt lineage、superseded等額外 states。
+Job history 保留為獨立 rows；不實作自動 fix/retry loop 或 Attempt lineage。#817 增加的 `superseded` 只表示 operator 對單筆 Slice 的明示終結，不建立 generation link 或自動 retry 關係。
 
 ### 4.2 Slice states
 
 | State | 精確定義 | Writer / 進入條件 | 合法離開 | Terminal | 對 DAG 的效果 | Restart / human action |
 | --- | --- | --- | --- | --- | --- | --- |
 | `pending` | spec ready，但尚無 active builder Job | manager 掃描 ready slice | `building`、`failed` | 否 | 無 | 可安全重新 dispatch |
-| `building` | builder Job 已建立，等待 terminal Job result | manager dispatch | `verifying`、`needs_human` | 否 | 無 | 由 Job state重建；不得重派第二個 builder |
+| `building` | builder Job 已建立，等待 terminal Job result | manager dispatch | `verifying`、`needs_human` | 否 | 無 | complete/status 會核對目前綁定的 in-flight builder；缺少時轉為帶 `DiagnosticReason` 的 `needs_human`，不得重派第二個 builder |
 | `verifying` | builder Job exited，正在跑 deterministic checks | manager | `reviewing`、`needs_human` | 否 | 無 | evidence完整可冪等重讀；缺/壞 evidence重跑 verification |
 | `reviewing` | verification passed，reviewer Job 已建立或 verdict待驗 | manager | `verified`、`needs_human` | 否 | 無 | verdict必須綁exact Candidate；stale evaluation留audit並建立fresh evaluation |
 | `verified` | deterministic checks passed，且依review policy取得passed GateEvaluation或明確`not-required` proof；尚未證明合入target branch | manager | `completed`、`needs_human` | 否 | 無 | 每tick重驗target ancestry；branch ref偏離pinned Candidate則needs_human |
 | `completed` | verified Candidate 是 target branch ancestor，CompletionRecord 已寫入 | manager | 無 | 是 | 唯一可滿足 `depends_on` | restart 後重驗 record schema與 ancestry；不符則 fail-closed |
-| `needs_human` | verification reject、review reject/absent、stale/invalid evidence或無法安全判斷 | manager | `building`、`verifying`、`reviewing`、`failed` | 否 | 無 | v1只在本機status集中呈現；本機operator顯式retry-build/retry-verify/retry-review或abandon |
-| `failed` | 人類明確 abandon，或 slice 無法再繼續 | manager/local operator | 無 | 是 | 無；downstream保持 blocked | 重新處理需建立新的 slice/spec，不復活舊 record |
+| `needs_human` | verification reject、review reject/absent、stale/invalid evidence或無法安全判斷 | manager | `building`、`verifying`、`reviewing`、`failed`、`superseded` | 否 | 無 | 本機operator可顯式 retry-build/retry-verify/retry-review/abandon；沒有 in-flight job 時，可用單筆 `supersede` 並提供 actor、reason 與 exact `binding_revision` CAS；相同 CAS 重送不增加 audit |
+| `failed` | 人類明確 abandon，或 slice 無法再繼續 | manager/local operator | `superseded` | 是 | 無；downstream保持 blocked | 重新處理需建立新的 slice/spec，不復活舊 record |
+| `superseded` | operator 以單筆 `supersede` 將舊 generation 移出 active attention | local operator | 無 | 是 | 無；不建立 CompletionRecord、不釋放 downstream | 保留 slice 與 actor/reason/CAS action audit；不執行 bulk closure |
 
 ### 4.3 Gate states
 
@@ -106,7 +107,7 @@ Job history 保留為獨立 rows；v1 不實作自動 fix/retry loop，因此不
 
 v1 不支援 agent 自行 override gate。人類若不同意 finding，修正 task或由本機顯式重跑 review；remote signed override、digest與standing authorization延後。
 
-Foundation plan必須提供本機operator actions：`retry-build`建立新builder Job、`retry-verify`重跑deterministic checks、`retry-review`建立新reviewer Job、`abandon`把Slice標failed。CLI只能沿用現有atomic control request queue送`slice-action`，由daemon/manager這個state單一writer驗證並持久化requested action、actor字串與result；CLI不得直接競寫`jobs.json`。v1只信任本機檔案權限/CLI執行者，不開放remote override API。
+Foundation plan提供本機operator actions：`retry-build`建立新builder Job、`retry-verify`重跑deterministic checks、`retry-review`建立新reviewer Job、`abandon`把Slice標failed。另有單筆 `supersede`，只接受無 in-flight job 的 `needs_human`／`failed` slice，並以 actor、reason 與 exact `binding_revision` CAS 留下 action audit。CLI只能沿用現有atomic control request queue送`slice-action`，由daemon/manager這個state單一writer驗證並持久化requested action、actor/reason/CAS與result；CLI不得直接競寫`jobs.json`。v1只信任本機檔案權限/CLI執行者，不開放remote override API。
 
 ## 5. v1 完成資料流
 
@@ -139,7 +140,7 @@ stateDiagram-v2
 5. Candidate合入target branch且ancestry成立後，才寫 CompletionRecord並進 `completed`。
 6. `default_is_satisfied` 只接受合法 CompletionRecord + ancestry proof，才釋放 downstream。
 
-既有低階`cortex dispatch --task ...`沒有spec/plan/target/verification metadata，且尚無正式runtime caller，v1直接移除，不保留第二套execution-only mutation path。`dispatch/fanout/tick/complete/slice-action`等所有coordinator state mutation都必須經既有atomic control request queue，由daemon/manager單一writer執行；daemon未運行時明確拒絕。`jobs/stat/ready/status`可直接讀atomic snapshot但不得寫state。
+既有低階`cortex dispatch --task ...`沒有spec/plan/target/verification metadata，且尚無正式runtime caller，v1直接移除，不保留第二套execution-only mutation path。`dispatch/fanout/tick/complete/slice-action`等所有operator mutation都必須經既有atomic control request queue，由daemon/manager這個state單一writer執行；daemon未運行時明確拒絕。`jobs/stat/ready/cortex status` CLI只讀atomic snapshot；daemon產生 status snapshot 時會先 reconcile 沒有目前綁定 in-flight builder 的 `building` slice，並以 `DiagnosticReason` 將其收斂至 `needs_human`。
 
 ## 6. P0-A：ResultVerification
 

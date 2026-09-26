@@ -183,10 +183,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_complete.add_argument("--review-model", default=None, help="foreign reviewer model ID")
 
-    p_slice_action = sub.add_parser("slice-action", help="對 needs_human slice 送出本機 recovery action")
+    p_slice_action = sub.add_parser("slice-action", help="對需要處置的 slice 送出本機 action")
     p_slice_action.add_argument("slice_id")
-    p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"])
+    p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"])
     p_slice_action.add_argument("--actor", required=True)
+    p_slice_action.add_argument("--reason", default=None, help="supersede 的單行稽核理由")
+    p_slice_action.add_argument(
+        "--expected-binding-revision",
+        type=int,
+        default=None,
+        help="supersede 的 slice binding revision CAS",
+    )
     # #396 item 4：retry-review／retry-verify 落 needs_human(reviewer-identity-missing)
     # 時，先前只能靠 tick/complete 的 request 級參數補 foreign reviewer identity——
     # slice-action 本身沒有對應旗標可帶。比照 complete/tick 既有的 identity
@@ -404,6 +411,10 @@ def main(
 
     if args.cmd == "slice-action":
         slice_action_args = {"slice_id": args.slice_id, "action": args.action, "actor": args.actor}
+        if args.reason is not None:
+            slice_action_args["reason"] = args.reason
+        if args.expected_binding_revision is not None:
+            slice_action_args["expected_binding_revision"] = args.expected_binding_revision
         if args.review_executor is not None:
             slice_action_args["review_executor"] = args.review_executor
         if args.review_model is not None:
