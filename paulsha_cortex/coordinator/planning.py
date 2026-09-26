@@ -1104,15 +1104,20 @@ def summarize_planning_exception(
     """`<ExceptionTypeName>: <訊息>`——四個 `except` 分支共用的例外摘要。
 
     #397 起這四處就併入例外型別與訊息，本票只改兩件事：預算由 160 放寬到
-    `PLANNING_FAILURE_DETAIL_LIMIT`（逐欄差異裝不進 160），以及截斷改為
-    **就地記帳** `…+Nc`（原本是裸切，讀的人看不出還有沒有下文）。單行化與
-    型別名在前的順序不變——`outcome_taxonomy` 的 `timeoutexpired` 這類 marker
-    靠的就是型別名活著。
+    `PLANNING_FAILURE_DETAIL_LIMIT`（逐欄差異裝不進 160），以及截斷改為頭尾各留一半，
+    並以 `…+Nc` 記帳超出預算的字元數。單行化與型別名在前的順序不變——
+    `outcome_taxonomy` 的 `timeoutexpired` 這類 marker 靠的就是型別名活著。
     """
 
     message = " ".join(_DIAGNOSTIC_CONTROL_RE.sub(" ", str(exc)).split())
     if len(message) > limit:
-        message = f"{message[:limit]}…+{len(message) - limit}c"
+        omitted = len(message) - limit
+        if limit >= 2:
+            head = (limit + 1) // 2
+            tail = limit - head
+            message = f"{message[:head]}…{message[-tail:]}…+{omitted}c"
+        else:
+            message = f"{message[:limit]}…+{omitted}c"
     return f"{type(exc).__name__}: {message}"
 
 

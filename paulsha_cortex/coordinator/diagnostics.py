@@ -309,10 +309,20 @@ def coerce_diagnostic_reason(value: object) -> DiagnosticReason | None:
 
 
 def summarize_exception(exc: BaseException, *, limit: int = 200) -> str:
-    """例外的單行摘要：`<型別>: <訊息前 N 字>`。
+    """例外的單行摘要：`<型別>: <訊息頭尾>`。
 
-    沿用 #397／#408 已定案的格式（`f"{type(exc).__name__}: {str(exc)[:160]}"`），
-    只是收成一份實作——五個現場各自手寫一次正是理由格式漂移的來源。
+    沿用 #397／#408 的例外型別前綴與摘要上限，只改長訊息的截斷方式；五個現場
+    各自手寫一次正是理由格式漂移的來源。長訊息平分字數保留頭尾，避免
+    `TimeoutExpired` 的長 argv 蓋掉訊息尾端的逾時原因。
     """
 
-    return _single_line(f"{type(exc).__name__}: {str(exc)[:limit]}")
+    message = str(exc)
+    if len(message) > limit:
+        if limit >= 3:
+            retained = limit - 1  # 為省略號保留一個字元位置。
+            head = (retained + 1) // 2
+            tail = retained - head
+            message = f"{message[:head]}…{message[-tail:]}"
+        else:
+            message = message[:limit]
+    return _single_line(f"{type(exc).__name__}: {message}")
