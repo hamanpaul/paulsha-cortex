@@ -102,16 +102,33 @@ def _authority_record(authority, *, run_id: str = "run-1", merge: str = MERGE) -
     }
 
 
-def _write_completion(root: Path, *, authority=None, run_id: str = "run-1", candidate: str = HEAD, slice_id: str = "delivery-slice", same_review_domain: bool = False) -> dict:
+def _write_completion(
+    root: Path,
+    *,
+    authority=None,
+    run_id: str = "run-1",
+    candidate: str = HEAD,
+    slice_id: str = "delivery-slice",
+    same_review_domain: bool = False,
+    verification_status: str = "reviewing",
+    test_results: list[dict] | None = None,
+    acceptance_ids: list[str] | None = None,
+) -> dict:
     authority = authority or _authority()
+    if test_results is None:
+        test_results = [{
+            "name": "targeted-test",
+            "status": "passed",
+            "acceptance_ids": acceptance_ids or ["R01-AC1"],
+        }]
     verify_ref = verification.write_verification_evidence(
         {
             "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
             "slice_id": slice_id,
             "candidate": candidate,
-            "status": "reviewing",
+            "status": verification_status,
             "summary": "verification-succeeded",
-            "details": {"ok": True},
+            "details": {"ok": True, "tests": test_results},
         },
         coordinator_root=root,
     )
@@ -210,22 +227,41 @@ def _write_live(root: Path, *, requirement_id: str, revision: str, criterion_id:
 
 def _manifest(root: Path, specs: list[tuple[str, str]], *, required=None, waiver_policy=None) -> dict:
     required = required or ["source", "test", "review", "merge", "installed", "live"]
+    authority_locator = "authority/accepted-plan.md"
+    authority_path = root / authority_locator
+    authority_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_rows = [
+        "| ID／問題 | 本版明確納入的修正 | 既有落點／需要補的範圍 | 必須取得的驗收證據 |",
+        "| --- | --- | --- | --- |",
+    ]
+    for requirement_id, _revision in specs:
+        plan_rows.append(
+            f"| {requirement_id} 需求 {requirement_id} | 範圍 {requirement_id} | "
+            f"交付脈絡 {requirement_id} | 逐項驗收 {requirement_id} |"
+        )
+    authority_path.write_text(
+        "---\nstatus: accepted\n---\n\n# Accepted requirement plan\n\n"
+        + "\n".join(plan_rows)
+        + "\n",
+        encoding="utf-8",
+    )
+    authority_sha256 = hashlib.sha256(authority_path.read_bytes()).hexdigest()
     requirements = []
     for requirement_id, revision in specs:
-        source = root / "specs" / f"{requirement_id}.md"
-        source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_text(f"{requirement_id} {revision}\n", encoding="utf-8")
         requirements.append(
             {
                 "id": requirement_id,
                 "revision": revision,
                 "title": f"需求 {requirement_id}",
                 "source_ref": {
-                    "locator": str(source.relative_to(root)),
-                    "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    "locator": authority_locator,
+                    "sha256": authority_sha256,
                 },
                 "acceptance_criteria": [
-                    {"id": f"{requirement_id}-AC1", "description": "逐項驗收"}
+                    {
+                        "id": f"{requirement_id}-AC1",
+                        "description": f"範圍 {requirement_id}; 交付脈絡 {requirement_id}; 逐項驗收 {requirement_id}",
+                    }
                 ],
                 "evidence_policy": {
                     "required_stages": list(required),
@@ -239,7 +275,11 @@ def _manifest(root: Path, specs: list[tuple[str, str]], *, required=None, waiver
     result = {
         "schema": "cortex/requirement-manifest/v1",
         "manifest_id": "test-requirements",
-        "authority_ref": {"kind": "accepted-plan", "revision": "plan-v1"},
+        "authority_ref": {
+            "kind": "accepted-plan",
+            "locator": authority_locator,
+            "revision": authority_sha256,
+        },
         "requirements": requirements,
         "waiver_policy": waiver_policy or {"authorities": []},
     }
@@ -253,7 +293,13 @@ def _snapshot(root: Path, manifest: dict, specs: list[tuple[str, str]], *, profi
         run_id = f"run-{index + 1}"
         authority = _authority(work_id=work_id)
         target = _target(profile_key=profile_key, config_revision=config_revision)
-        completion_ref = _write_completion(root, authority=authority, run_id=run_id, slice_id=f"delivery-{index + 1}")
+        completion_ref = _write_completion(
+            root,
+            authority=authority,
+            run_id=run_id,
+            slice_id=f"delivery-{index + 1}",
+            acceptance_ids=[f"{requirement_id}-AC1"],
+        )
         _write_runtime(root, target=target, pid=555 + index, state_name=f"runtime-{index}")
         live_ref = _write_live(
             root,
@@ -346,18 +392,94 @@ def test_a01_missing_acceptance_or_evidence_policy_is_rejected(tmp_path: Path) -
     manifest = _manifest(tmp_path, [("R01", "r1")])
     del manifest["requirements"][0]["acceptance_criteria"]
     with pytest.raises(ValueError, match="acceptance"):
-        validate_manifest(manifest)
+        validate_manifest(manifest, authority_root=tmp_path)
     manifest = _manifest(tmp_path, [("R01", "r1")])
     del manifest["requirements"][0]["evidence_policy"]
     with pytest.raises(ValueError, match="evidence policy"):
-        validate_manifest(manifest)
+        validate_manifest(manifest, authority_root=tmp_path)
+
+
+def test_a13_manifest_authority_digest_must_match_accepted_source(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path, [("R01", "r1")])
+    validate_manifest(manifest, authority_root=tmp_path)
+
+    authority_path = tmp_path / manifest["authority_ref"]["locator"]
+    authority_path.write_text(authority_path.read_text(encoding="utf-8") + "\nupdated\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="authority.*digest"):
+        validate_manifest(manifest, authority_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        # 缺漏：保留同一 accepted revision 卻整條需求被拿掉。
+        lambda manifest: manifest["requirements"].pop(),
+        # 多出：manifest 宣稱了 accepted authority 沒有的需求。
+        lambda manifest: manifest["requirements"].append(copy.deepcopy(manifest["requirements"][0]) | {"id": "R99"}),
+        # 縮減：需求仍在，但驗收條件被清空，不能用「非空檢查」矇混過關。
+        lambda manifest: manifest["requirements"][0]["acceptance_criteria"].pop(),
+        # 竄改：需求 id 保留，但標題與 accepted authority 記載的不一致。
+        lambda manifest: manifest["requirements"][0].update({"title": "被竄改的標題"}),
+    ],
+)
+def test_a13_manifest_must_match_accepted_requirement_and_criterion_inventory(tmp_path: Path, mutate) -> None:
+    manifest = _manifest(tmp_path, [("R01", "r1"), ("R02", "r2")])
+    mutate(manifest)
+
+    with pytest.raises(ValueError, match="accepted authority"):
+        validate_manifest(manifest, authority_root=tmp_path)
+
+
+def test_a02_reviewing_verification_without_criterion_test_binding_is_a_test_gap(tmp_path: Path) -> None:
+    manifest, snapshot, context = _ready_case(tmp_path)
+    row = snapshot["mappings"][0]
+    row["completion_record"] = _write_completion(
+        tmp_path,
+        run_id=row["run_id"],
+        slice_id="reviewing-without-tests",
+        verification_status="reviewing",
+        test_results=[],
+    )
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    test_gap = next(gap for gap in report["gaps"] if gap["stage"] == "test")
+    assert test_gap["acceptance_id"] == "R01-AC1"
+    assert test_gap["status"] == "missing"
+    assert report["closure_readiness"] == "not-ready"
+
+
+@pytest.mark.parametrize(
+    "test_result",
+    [
+        {"name": "unbound", "status": "passed"},
+        {"name": "failed", "status": "failed", "acceptance_ids": ["R01-AC1"]},
+        {"name": "wrong-criterion", "status": "passed", "acceptance_ids": ["R01-AC2"]},
+    ],
+)
+def test_a02_only_passing_test_explicitly_bound_to_criterion_covers_it(tmp_path: Path, test_result: dict) -> None:
+    manifest, snapshot, context = _ready_case(tmp_path)
+    row = snapshot["mappings"][0]
+    row["completion_record"] = _write_completion(
+        tmp_path,
+        run_id=row["run_id"],
+        slice_id="criterion-test-binding",
+        verification_status="reviewing",
+        test_results=[test_result],
+    )
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    test_gap = next(gap for gap in report["gaps"] if gap["stage"] == "test")
+    assert test_gap["acceptance_id"] == "R01-AC1"
+    assert report["closure_readiness"] == "not-ready"
 
 
 def test_production_manifest_pins_all_refine_requirements_and_sources() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     manifest_path = repo_root / "docs/superpowers/specs/refine-requirements-v1.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    normalized = validate_manifest(manifest)
+    normalized = validate_manifest(manifest, authority_root=repo_root)
     assert [row["id"] for row in normalized["requirements"]] == [f"R{number:02d}" for number in range(1, 15)]
     assert all(row["evidence_policy"]["required_stages"] == ["source", "test", "review", "merge", "installed", "live"] for row in normalized["requirements"])
     plan = repo_root / "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md"

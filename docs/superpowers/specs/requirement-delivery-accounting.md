@@ -2,6 +2,8 @@
 
 `refine-requirements-v1.json` 是 Cortex refine R01–R14 的版本化 requirement manifest。每列固定 requirement revision、accepted plan 原文 SHA-256、acceptance criterion、必要證據階段與 owner work refs。新增需求若缺 acceptance criterion 或 evidence policy，validator 拒絕載入。source root 內對應文件的 bytes 必須符合 manifest hash；改需求時應更新 revision 與 manifest，不沿用舊 mapping。
 
+`validate_manifest` 要求呼叫端提供 `authority_root`：先以 `authority_ref.locator` 讀出實際 accepted plan／spec 內容，核對 `authority_ref.revision` 即該內容的 SHA-256（不只檢查非空），再解析其 requirement inventory 表格，鎖定 requirement id 與標題集合。manifest 在沿用同一 accepted revision 時，需求識別碼缺漏或多出、標題被竄改、acceptance criteria 被清空，都會 fail closed；驗收條件本身的操作化措辭仍由 manifest 定義，不強求與計畫散文逐字一致。
+
 ## Evidence snapshot 與逐階段驗證
 
 evidence producer 以 `cortex/requirement-evidence-snapshot/v1` 提供 `captured_at`、單調 `snapshot_revision`、mapping 與 scoped waivers。每個 mapping 至少綁定 requirement/revision、acceptance ID、repo、work、run、workflow step IDs、source generation、candidate SHA、PR、OpenSpec change、Todo paths、execution profile/config/policy revision 及 CompletionRecord locator/hash。snapshot 是候選關聯資料，不是通過證據；consumer 會逐一重新驗證：
@@ -9,7 +11,7 @@ evidence producer 以 `cortex/requirement-evidence-snapshot/v1` 提供 `captured
 | 階段 | 採信來源 |
 |---|---|
 | source | manifest 指定 locator 的可信 source-root bytes 與 SHA-256。 |
-| test / review | 正式 CompletionRecord domain validator、hash-bound verification/review receipts、candidate 綁定、fresh WorkAuthority 與不同 reviewer independence domain。 |
+| test / review | 正式 CompletionRecord domain validator、hash-bound verification/review receipts、candidate 綁定、fresh WorkAuthority 與不同 reviewer independence domain。verification evidence 的 run 層級狀態（`reviewing`／`verified`）只表示整體驗證通過，不可直接推定覆蓋某 acceptance criterion；test 階段只採信 `details.tests` 中明確以 `acceptance_ids` 綁定該 criterion且 `status: passed` 的測試，未綁定或未過即為該 criterion 的 test gap。 |
 | merge | 以 WorkAuthority 授權的 PR 重新讀 GitHub closure facts，交既有 `evaluate_remote_closure` 驗 exact head、merge、issues、OpenSpec、Todo；只讀 API 查詢，不執行 closure。 |
 | installed | 消費 #841 既有 `cortex service status` loaded-runtime projection，以 service declaration 的實際 unit PID 比對 loaded artifact digest/source revision；再核對 service/instance、profile/config revision、target 與 Trust Root。CLI 只從既有 Manager coordinator root/Monitor state root 讀取，忽略 snapshot 的 root hint。 |
 | live | 驗 `cortex/live-canary-receipt/v1` hash、scope、target、期限、核可 authority 與 reviewer/canary 獨立性；最後仍需正式 live receipt validator。沒有 validator 時為 `unknown`。 |

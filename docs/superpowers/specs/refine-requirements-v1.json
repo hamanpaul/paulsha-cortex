@@ -126,7 +126,7 @@
     {
       "id": "R04",
       "revision": "2026-09-07:R04:v1",
-      "title": "Registry 寫入放大",
+      "title": "registry 寫入放大",
       "source_ref": {
         "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
         "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"

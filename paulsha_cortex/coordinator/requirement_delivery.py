@@ -85,7 +85,102 @@ def _locator(value: object, *, field: str) -> str:
     return path.as_posix()
 
 
-def validate_manifest(payload: object) -> dict[str, Any]:
+def _accepted_plan_inventory(content: bytes, *, kind: str) -> dict[str, str]:
+    """讀取已接受計畫中的 requirement id → 標題 inventory，作為 manifest 需求集合的鎖定基準。
+
+    計畫表格逐需求一列，不逐條 acceptance criterion 拆列；驗收條件的具體措辭是 manifest
+    自身的操作化定義，不強求與計畫散文逐字一致（否則會把任何合理改寫誤判為縮減範圍）。
+    這裡只鎖定「需求識別碼與標題集合」不得在沿用同一 accepted revision 時被悄悄增減。"""
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("accepted authority is not UTF-8") from exc
+    frontmatter = re.match(r"\A---\r?\n(?P<body>.*?)\r?\n---(?:\r?\n|\Z)", text, re.DOTALL)
+    if frontmatter is None:
+        raise ValueError("accepted authority frontmatter is missing")
+    status_values = re.findall(r"(?m)^status:\s*([^\s#]+)\s*$", frontmatter.group("body"))
+    if status_values != ["accepted"]:
+        raise ValueError("accepted authority status is not accepted")
+
+    expected_headers = [
+        "ID／問題",
+        "本版明確納入的修正",
+        "既有落點／需要補的範圍",
+        "必須取得的驗收證據",
+    ]
+    lines = text.splitlines()
+
+    def cells(line: str) -> list[str] | None:
+        stripped = line.strip()
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            return None
+        return [cell.strip() for cell in stripped[1:-1].split("|")]
+
+    headers = [index for index, line in enumerate(lines) if cells(line) == expected_headers]
+    if len(headers) != 1:
+        raise ValueError("accepted authority requirement inventory table is missing or ambiguous")
+    inventory: dict[str, str] = {}
+    for line in lines[headers[0] + 1:]:
+        row = cells(line)
+        if row is None:
+            if inventory:
+                break
+            continue
+        if len(row) != len(expected_headers):
+            if row[0].startswith("R"):
+                raise ValueError("accepted authority requirement row is malformed")
+            continue
+        match = re.fullmatch(r"(R[0-9]{2})\s+(.+)", row[0])
+        if match is None:
+            if row[0].startswith("R"):
+                raise ValueError("accepted authority requirement identity is malformed")
+            continue
+        requirement_id, title = match.groups()
+        if requirement_id in inventory:
+            raise ValueError(f"accepted authority repeats requirement {requirement_id}")
+        inventory[requirement_id] = title
+    if not inventory:
+        raise ValueError(f"accepted {kind} contains no supported requirement inventory")
+    return inventory
+
+
+def _validate_manifest_authority(manifest: Mapping[str, Any], *, authority_root: Path) -> None:
+    """驗證 authority_ref 綁定到真正的 accepted 內容 digest，並鎖定 manifest 的需求識別碼
+    與標題集合；同一 accepted revision 下不得悄悄增減需求，讓未完整交付的範圍逃過缺額判定。"""
+    authority_ref = manifest["authority_ref"]
+    locator = authority_ref["locator"]
+    expected_digest = authority_ref["revision"]
+    try:
+        content = _read_beneath(authority_root, locator)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"accepted authority is unavailable: {type(exc).__name__}") from exc
+    actual_digest = hashlib.sha256(content).hexdigest()
+    if actual_digest != expected_digest:
+        raise ValueError("accepted authority digest mismatch")
+    inventory = _accepted_plan_inventory(content, kind=authority_ref["kind"])
+
+    manifest_rows = {row["id"]: row for row in manifest["requirements"]}
+    if set(manifest_rows) != set(inventory):
+        missing = sorted(set(inventory) - set(manifest_rows))
+        extra = sorted(set(manifest_rows) - set(inventory))
+        raise ValueError(
+            "accepted authority requirement inventory mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+    for requirement_id, expected_title in inventory.items():
+        row = manifest_rows[requirement_id]
+        source_ref = row["source_ref"]
+        if source_ref["locator"] != locator or source_ref["sha256"].lower() != expected_digest:
+            raise ValueError(f"accepted authority source binding mismatch for {requirement_id}")
+        if row["title"] != expected_title:
+            raise ValueError(f"accepted authority requirement title mismatch for {requirement_id}")
+
+
+def validate_manifest(
+    payload: object,
+    *,
+    authority_root: str | Path | None = None,
+) -> dict[str, Any]:
     """驗證版本化 requirement authority；空驗收或空 evidence policy 一律拒絕。"""
     if not isinstance(payload, dict) or payload.get("schema") != MANIFEST_SCHEMA:
         raise ValueError("requirement manifest schema is unknown")
@@ -94,10 +189,13 @@ def validate_manifest(payload: object) -> dict[str, Any]:
         raise ValueError("requirement manifest has missing or unexpected fields")
     _nonempty(payload.get("manifest_id"), field="manifest_id")
     authority_ref = payload.get("authority_ref")
-    if not isinstance(authority_ref, dict) or not authority_ref:
-        raise ValueError("requirement manifest authority_ref is required")
-    _nonempty(authority_ref.get("kind"), field="authority_ref.kind")
-    _nonempty(authority_ref.get("revision"), field="authority_ref.revision")
+    if not isinstance(authority_ref, dict) or set(authority_ref) != {"kind", "locator", "revision"}:
+        raise ValueError("requirement manifest authority_ref must bind kind, locator, and revision digest")
+    kind = _nonempty(authority_ref.get("kind"), field="authority_ref.kind")
+    if kind not in {"accepted-plan", "accepted-spec"}:
+        raise ValueError("requirement manifest authority_ref kind is unsupported")
+    _locator(authority_ref.get("locator"), field="authority_ref.locator")
+    _digest(authority_ref.get("revision"), field="authority_ref.revision")
     requirements = payload.get("requirements")
     if not isinstance(requirements, list) or not requirements:
         raise ValueError("requirement manifest must contain requirements")
@@ -124,7 +222,9 @@ def validate_manifest(payload: object) -> dict[str, Any]:
         _digest(source_ref.get("sha256"), field=f"{requirement_id}.source_ref.sha256")
         criteria = row.get("acceptance_criteria")
         if not isinstance(criteria, list) or not criteria:
-            raise ValueError(f"{requirement_id} acceptance criteria are required")
+            # 空 acceptance_criteria 一定與 accepted authority 的 inventory 不符（後者至少有一條），
+            # 訊息一併標明避免被誤讀成單純結構檢查而繞過縮減範圍偵測。
+            raise ValueError(f"{requirement_id} acceptance criteria are required by accepted authority")
         criterion_ids: set[str] = set()
         for criterion in criteria:
             if not isinstance(criterion, dict) or set(criterion) != {"id", "description"}:
@@ -179,6 +279,9 @@ def validate_manifest(payload: object) -> dict[str, Any]:
         if identity in seen_authorities:
             raise ValueError("duplicate waiver authority")
         seen_authorities.add(identity)
+    if authority_root is None:
+        raise ValueError("accepted authority root is required")
+    _validate_manifest_authority(payload, authority_root=Path(authority_root))
     return copy.deepcopy(payload)
 
 
@@ -567,12 +670,14 @@ def _read_completion_stages(
     *,
     row: Mapping[str, Any],
     context: Mapping[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, object | None]:
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any], dict[str, Any] | None, object | None]:
+    """回傳 row 層級的 test/review 階段結果；test_result 為 "verified" 時仍須由呼叫端
+    以 verification_doc 逐條 acceptance criterion 判定明確綁定的通過測試，不可直接採信。"""
     locator = ref.get("locator") if isinstance(ref, Mapping) else None
     digest = ref.get("sha256") if isinstance(ref, Mapping) else None
     if ref is None:
         missing = _stage("missing", "completion-record-missing")
-        return missing, missing.copy(), None, None
+        return missing, None, missing.copy(), None, None
     try:
         record, _ref_doc = _completion_record(
             ref,
@@ -595,6 +700,8 @@ def _read_completion_stages(
             raise ValueError("verification evidence candidate mismatch")
         if verification_doc["status"] not in {"reviewing", "verified"}:
             raise ValueError("verification evidence is not passed")
+        # 只表示 run 層級的驗證通過；是否覆蓋某 acceptance criterion 交給呼叫端
+        # 依 verification_doc 的逐條測試綁定重新判定，不可用此 run 狀態直接推定通過。
         test_result = _stage("verified", "completion-verification-passed", locator=verification_locator, digest=str(record["verification_evidence_hash"]), validator="completion/v1")
         review_result = _stage("missing", "review-evidence-missing")
         review_payload: object | None = None
@@ -615,14 +722,14 @@ def _read_completion_stages(
             if not isinstance(builder_domain, str) or not isinstance(reviewer_domain, str) or builder_domain == reviewer_domain:
                 raise ValueError("review independence domains are not distinct")
             review_result = _stage("verified", "independent-review-passed", locator=review_locator, digest=str(record["review_evaluation_hash"]), validator="foreign-review/v1")
-        return test_result, review_result, record, authority
+        return test_result, verification_doc, review_result, record, authority
     except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RuntimeError, TypeError) as exc:
         message = str(exc).casefold()
         status = "unknown" if "fresh" in message or "stale" in message else (
             "stale" if "candidate mismatch" in message or "revision mismatch" in message else "failed"
         )
         result = _stage(status, f"completion-invalid:{type(exc).__name__}", locator=str(locator) if locator else None, digest=str(digest) if digest else None)
-        return result, result.copy(), None, None
+        return result, None, result.copy(), None, None
 
 
 def _verify_remote_merge(
@@ -842,6 +949,42 @@ def _verify_live(
         return _stage("unknown", f"live-canary-unverified:{type(exc).__name__}")
 
 
+def _test_stage_for_criterion(
+    verification_doc: Mapping[str, Any] | None,
+    acceptance_id: str,
+    *,
+    locator: str | None,
+    digest: str | None,
+) -> dict[str, Any]:
+    """只採信 CompletionRecord 驗證證據中明確綁定該 acceptance criterion 且通過的測試；
+    verification run 的整體狀態（reviewing／ongoing 等）不可用來推定該 criterion 已通過。"""
+    tests: object = None
+    if isinstance(verification_doc, Mapping):
+        details = verification_doc.get("details")
+        if isinstance(details, Mapping):
+            tests = details.get("tests")
+    if not isinstance(tests, list):
+        return _stage("missing", "verification-evidence-has-no-criterion-bound-tests")
+    bound = [
+        entry
+        for entry in tests
+        if isinstance(entry, Mapping)
+        and isinstance(entry.get("acceptance_ids"), list)
+        and acceptance_id in entry["acceptance_ids"]
+    ]
+    if not bound:
+        return _stage("missing", "no-test-bound-to-acceptance-criterion")
+    if any(entry.get("status") == "passed" for entry in bound):
+        return _stage(
+            "verified",
+            "criterion-bound-test-passed",
+            locator=locator,
+            digest=digest,
+            validator="completion/v1",
+        )
+    return _stage("failed", "criterion-bound-test-not-passed")
+
+
 def _verify_waiver(
     waiver: Mapping[str, Any],
     *,
@@ -895,7 +1038,7 @@ def inspect_delivery(
     waiver_validator: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> dict[str, Any]:
     """唯讀重驗 requirement/evidence；永不派工、merge、部署或改 issue。"""
-    manifest_doc = validate_manifest(manifest)
+    manifest_doc = validate_manifest(manifest, authority_root=source_root)
     snapshot = _validate_snapshot(source_snapshot)
     if isinstance(now_epoch, bool) or not isinstance(now_epoch, (int, float)):
         raise ValueError("now_epoch must be finite numeric")
@@ -946,12 +1089,13 @@ def inspect_delivery(
             orphan_mappings.append({"requirement_id": requirement["id"], "reason": "work-identity-missing"})
             continue
         source_result = _verify_source(requirement, source_root=Path(source_root))
+        verification_doc: Mapping[str, Any] | None = None
         if row.get("policy_version") != requirement["evidence_policy"]["policy_version"]:
             policy_drift = _stage("stale", "requirement-evidence-policy-revision-changed")
             test_result = review_result = merge_result = installed_result = policy_drift
             record = authority = None
         else:
-            test_result, review_result, record, authority = _read_completion_stages(
+            test_result, verification_doc, review_result, record, authority = _read_completion_stages(
                 row.get("completion_record"), row=row, context=context
             )
             owner_bound = authority is None or _requirement_owner_matches(requirement, authority)
@@ -981,9 +1125,20 @@ def inspect_delivery(
                 validator=live_receipt_validator,
                 review_document=review_doc,
             )
+            # test_result 為 "verified" 只表示 run 層級驗證通過；仍須逐條 acceptance
+            # criterion 找到明確綁定且通過的測試才算 covered，不可用 run 狀態推定。
+            if test_result["status"] == "verified":
+                acceptance_test_result = _test_stage_for_criterion(
+                    verification_doc,
+                    acceptance_id,
+                    locator=test_result.get("locator"),
+                    digest=test_result.get("sha256"),
+                )
+            else:
+                acceptance_test_result = test_result
             stages = {
                 "source": source_result,
-                "test": test_result,
+                "test": acceptance_test_result,
                 "review": review_result,
                 "merge": merge_result,
                 "installed": installed_result,
@@ -1163,7 +1318,7 @@ def reconcile_delivery(
         "waiver_validator": waiver_validator,
     }
     report = inspect_delivery(manifest, source_snapshot, **context)
-    manifest_doc = validate_manifest(manifest)
+    manifest_doc = validate_manifest(manifest, authority_root=source_root)
     snapshot = _validate_snapshot(source_snapshot)
     _checkpoint("after-validation")
     for (repo, work_id), before_digest in authority_digests.items():
