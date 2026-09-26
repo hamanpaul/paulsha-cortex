@@ -407,7 +407,7 @@ cortex list --repo hamanpaul/paulsha-cortex --state on-going --explain
 cortex work show unified-work-lifecycle --repo hamanpaul/paulsha-cortex --json
 ```
 
-Monitor 只允許 override、frontmatter、GitHub closing reference 與通過typed refs驗證的workflow metadata提供 confirmed association；override exclusion 優先抑制所有同work的 confirmed edge。PR body、issue title、artifact／branch slug 等 fuzzy 訊號只顯示。未被 confirmed mapping 擁有的 archived OpenSpec 與 closed GitHub issue／PR 只提供終態證據，不會單獨建立 work item。`done` 的 Todo completion 只採遠端 default branch 的 Todo blob與 archived OpenSpec task checklist revision，不採本機 overlay；所有 mapped PR 都必須是至少雙 parent且可證明已進 default branch 的 merge commit，且 CompletionRecord 保存的 source revisions、PR candidate與merge revision必須逐一符合目前remote truth；所有 mapped OpenSpec refs 也必須完成 archive。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state並加上 degraded facet；`cortex-work/v1.hard_gates`只依查詢中的repo/work item authority關閉auto claim與merge，跨repo整體狀態另由`fleet_health`回報。
+Monitor 只允許 override、frontmatter、GitHub closing reference 與通過typed refs驗證的workflow metadata提供 confirmed association；override exclusion 優先抑制所有同work的 confirmed edge。PR body、issue title、artifact／branch slug 等 fuzzy 訊號只顯示。未被 confirmed mapping 擁有的 archived OpenSpec 與 closed GitHub issue／PR 只提供終態證據，不會單獨建立 work item。`done` 的 Todo 證據只採遠端 default branch blob與 archived OpenSpec task checklist revision，不採本機 overlay；Monitor 仍要求可驗證的遠端 Todo evidence，但 workstream Todo 未勾 checkbox 只供診斷，不阻擋有效 CompletionRecord 的 `done`；archived OpenSpec tasks 的完成要求維持不變；所有 mapped PR 都必須是至少雙 parent且可證明已進 default branch 的 merge commit，且 CompletionRecord 保存的 source revisions、PR candidate與merge revision必須逐一符合目前remote truth；所有 mapped OpenSpec refs 也必須完成 archive。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state並加上 degraded facet；`cortex-work/v1.hard_gates`只依查詢中的repo/work item authority關閉auto claim與merge，跨repo整體狀態另由`fleet_health`回報。
 
 Monitor 採 last-good 語意：workspace 或 project subtree 暫時無法讀取時，既有項目會保留並帶 `degraded` scan signal，不會發布 removal；只有後續成功掃描父層、確認項目真的消失時才移除。`poll_interval_seconds`、`rescan_interval_seconds` 與 `watch_debounce_ms` 必須全部大於零，錯誤設定會在 service 啟動前直接失敗。
 
@@ -570,7 +570,7 @@ Legacy headless builder 的 dispatch prompt 會帶入 Manager 解析後的 workt
 
 **#582 sandbox 工具中止分類**：終局 `subtype=error_during_execution` 且 `terminal_reason=aborted_tools` 表示工具鏈被外部生命週期中斷，分類為 `environment`／`tool_aborted`，可進入 bounded retry；這不同於維持 `unknown` 的一般 controller interruption。
 
-Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、Todo 與 CompletionRecord；若 work item 有 mapped OpenSpec，另要求 active OpenSpec 消失且 archive 成立。`mapped_openspec == ()` 時 remote closure 以 PR merged＋issue 全 closed＋Todo 全勾＋CompletionRecord 有效為準。部分完成不會提早標 `done`。
+Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、mapped Todo 存在且內容可讀、CompletionRecord；workstream Todo 未勾 checkbox 只作觀測，不阻擋 remote closure。若 work item 有 mapped OpenSpec，仍要求 active OpenSpec 消失且 archive 成立，archived tasks 仍須通過既有 archive gate；`mapped_openspec == ()` 時不要求 archive。其餘 closure 證據不成立時不會提早標 `done`。
 
 若舊版 `authority-restart` 已把 run reset 到 `verify`，但同一 run 的完整 merge authorization 與 delivery journal 仍確認 Candidate 已 merge，`resume` 會停止且不重派 verify，並提示 `cortex work <work-id> retire-delivered`。此出口保留退休／abandoned 語意，不代表 shipped completion。
 `close-delivered` 使用相同的 strict closure 條件，僅補足缺失的 operator CompletionRecord；遠端 issue、PR、OpenSpec 或 Todo 證據未全通過時不會結案。
