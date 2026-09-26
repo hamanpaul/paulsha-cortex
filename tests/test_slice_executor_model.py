@@ -498,6 +498,119 @@ def test_dispatch_ready_no_declaration_behavior_unchanged(tmp_path: Path) -> Non
     assert default_launcher.calls[0]["slice_id"] == "slice-plain"
 
 
+def _tier_preflight_meta(tmp_path: Path, slice_id: str) -> tuple[Path, dict]:
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    (repo_root / ".git" / "HEAD").write_text(
+        "ref: refs/heads/main\n",
+        encoding="utf-8",
+    )
+    spec_path, spec_hash = materialize_spec(repo_root / "specs" / f"{slice_id}.md")
+    meta = _meta(slice_id)
+    meta["path"] = spec_path
+    meta["_pinned_inputs"]["spec_path"] = spec_path
+    meta["_pinned_inputs"]["spec_hash"] = spec_hash
+    meta["_pinned_inputs"]["plan_path"] = str(repo_root / "docs" / "plan.md")
+    return repo_root, meta
+
+
+def test_required_foreign_review_tier_is_rejected_before_builder_launch(
+    tmp_path: Path,
+) -> None:
+    repo_root, meta = _tier_preflight_meta(tmp_path, "tier-required")
+    manifest = repo_root / ".project-policy.yml"
+    manifest.write_text(
+        "policy_profile: flat\npolicy_version: 1.0.17\n",
+        encoding="utf-8",
+    )
+    registry = FakeRegistry()
+    worktree_creator = FakeWorktreeCreator(tmp_path / "worktrees")
+    dispatcher = FakeDispatcher(
+        registry,
+        worktree_creator=worktree_creator,
+    )
+    launcher = RecordingLauncher(executor="copilot", model_id=None, label="default")
+
+    with pytest.raises(DispatchReadyError) as excinfo:
+        dispatch_ready(
+            [meta],
+            is_satisfied=lambda _slice_id: True,
+            dispatcher=dispatcher,
+            persona="builder",
+            launcher=launcher,
+            git_runner=_default_git_runner,
+        )
+
+    assert launcher.calls == []
+    assert worktree_creator.calls == []
+    assert registry.list_jobs() == []
+    diagnostic = str(excinfo.value.errors[0][1])
+    assert str(manifest) in diagnostic
+    assert "shareable, work, personal" in diagnostic
+    assert "None" in diagnostic
+
+
+@pytest.mark.parametrize("tier", [None, "shareable"])
+def test_required_foreign_review_tier_allows_default_and_valid_shareable(
+    tmp_path: Path,
+    tier: str | None,
+) -> None:
+    repo_root, meta = _tier_preflight_meta(tmp_path, f"tier-allowed-{tier or 'default'}")
+    if tier is not None:
+        (repo_root / ".project-policy.yml").write_text(
+            f"policy_profile: flat\npolicy_version: 1.0.17\ntier: {tier}\n",
+            encoding="utf-8",
+        )
+    registry = FakeRegistry()
+    dispatcher = FakeDispatcher(
+        registry,
+        worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"),
+    )
+    launcher = RecordingLauncher(executor="copilot", model_id=None, label="default")
+
+    jobs = dispatch_ready(
+        [meta],
+        is_satisfied=lambda _slice_id: True,
+        dispatcher=dispatcher,
+        persona="builder",
+        launcher=launcher,
+        git_runner=_default_git_runner,
+    )
+
+    assert [job["task"] for job in jobs] == [meta["slice_id"]]
+    assert [call["slice_id"] for call in launcher.calls] == [meta["slice_id"]]
+
+
+def test_not_required_foreign_review_does_not_preflight_project_tier(
+    tmp_path: Path,
+) -> None:
+    repo_root, meta = _tier_preflight_meta(tmp_path, "tier-not-required")
+    (repo_root / ".project-policy.yml").write_text(
+        "policy_profile: flat\npolicy_version: 1.0.17\n",
+        encoding="utf-8",
+    )
+    meta["verification"]["docs_class"] = "informational"
+    meta["verification"]["review_policy"] = "not-required"
+    registry = FakeRegistry()
+    dispatcher = FakeDispatcher(
+        registry,
+        worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"),
+    )
+    launcher = RecordingLauncher(executor="copilot", model_id=None, label="default")
+
+    jobs = dispatch_ready(
+        [meta],
+        is_satisfied=lambda _slice_id: True,
+        dispatcher=dispatcher,
+        persona="builder",
+        launcher=launcher,
+        git_runner=_default_git_runner,
+    )
+
+    assert [job["task"] for job in jobs] == [meta["slice_id"]]
+    assert [call["slice_id"] for call in launcher.calls] == [meta["slice_id"]]
+
+
 def test_held_reasons_classified(tmp_path: Path) -> None:
     handoff_dir = tmp_path / "handoff"
     handoff_dir.mkdir()

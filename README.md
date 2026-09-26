@@ -580,7 +580,7 @@ Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit anc
 - 沒有 Web UI；任務意圖仍以 Markdown spec 維護。
 - Copilot finding 只允許兩輪 bounded fix/re-review；超過預算需由 operator recovery。Maintainer路徑仍要求ForeignReview、terminal-green checks與resolved/outdated threads。
 - verification 的 sanitized env 不等於 network / filesystem sandbox。
-- v1 自動 foreign review 限 `tier: shareable`。
+- v1 自動 foreign review 限 `tier: shareable`；required review 的 builder slice 會在派工前檢查所選 project policy 的 `tier`。manifest 缺少或填入非法值時會指出檔案路徑與允許值；完全沒有 manifest 時維持 `shareable` 預設。
 - merge commit 是目前受支援路徑；auto/squash/rebase/cherry-pick 會 fail-closed。
 - installer/service 尚無 periodic builder/reviewer model pin；需要固定 model 時，使用帶 `--model` / `--review-model` 的手動 `cortex tick`。
 
