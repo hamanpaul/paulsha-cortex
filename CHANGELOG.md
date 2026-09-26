@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#1084 Architecture HTML CDP timeout 診斷與有限重試**：workflow 僅對 Chrome CDP `Target.getTargets: timed out after 15000ms` 進行最多兩次重試，逐次保存 visual-check 輸出與診斷；其他錯誤立即失敗，持續逾時仍 fail closed。
 - Wave R 整合交付：operator 合併 8 個卡在 cortex pipeline 的實作 PR，並補 review 修正（非正規化 governed path、journal lock `O_CLOEXEC`、裁決 evidence 先於 run 重置、#862 測試對齊 #966 CAS）。
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、
   逐條宣稱更正，以及切換當下才撞得到的那一個阻斷**。四分部署的
