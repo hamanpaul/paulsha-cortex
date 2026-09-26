@@ -7,9 +7,11 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from paulsha_cortex.config.runtime import resolve_runtime_root
 from paulsha_cortex.control import constants
 from paulsha_cortex.deploy import installer
 
@@ -17,6 +19,8 @@ from . import COMMANDS, PorcelainCommand, register
 from ._runtime_probe import probe_service_runtime
 
 SERVICE_SCHEMA = "cortex-porcelain/service/v1"
+_ENSURE_START_TIMEOUT_SECONDS = 10.0
+_ENSURE_POLL_INTERVAL_SECONDS = 0.1
 _AGENTS_ROOT_INSTALL_HINT = (
     "porcelain 請改用 cortex install service --agents-root PATH"
 )
@@ -51,6 +55,9 @@ def _build_parser() -> argparse.ArgumentParser:
         cmd = sub.add_parser(command_name, help=help_text)
         cmd.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
         cmd.add_argument("--json", action="store_true", help="輸出 cortex-porcelain/service/v1 JSON")
+
+    ensure = sub.add_parser("ensure-running", help="確保 manager／monitor 正在執行（輸出 JSON）")
+    ensure.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
 
     logs = sub.add_parser("logs", help="讀取 service logs")
     logs.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
@@ -269,8 +276,17 @@ def _fallback_runtime(instance: str, version: str, units: dict[str, Any]) -> dic
     }
 
 
-def _read_lock_payload() -> dict[str, Any]:
-    path = constants.lock_path()
+def _read_lock_payload(instance: str | None = None) -> dict[str, Any]:
+    if instance is None:
+        path = constants.lock_path()
+    else:
+        path = (
+            resolve_runtime_root(
+                "PSC_CONTROL_ROOT",
+                environment=_fallback_environment(instance),
+            )
+            / "manager.lock"
+        )
     if not path.is_file() or path.is_symlink():
         return {}
     try:
@@ -327,6 +343,257 @@ def _mode_error(command: str, instance: str, *, json_output: bool, message: str)
         message=message,
         service=service,
     )
+
+
+def _live_manager_lock_pid(instance: str) -> int | None:
+    pid = _read_lock_payload(instance).get("pid")
+    return pid if isinstance(pid, int) and _pid_is_live(pid) else None
+
+
+def _wait_for_manager_lock(instance: str, process: Any | None = None) -> int | None:
+    deadline = time.monotonic() + _ENSURE_START_TIMEOUT_SECONDS
+    while True:
+        pid = _live_manager_lock_pid(instance)
+        if pid is not None:
+            return pid
+        poll = getattr(process, "poll", None)
+        if callable(poll) and poll() is not None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(_ENSURE_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _ensure_payload(
+    instance: str,
+    *,
+    mode: str,
+    exit_code: int,
+    pids: dict[str, int],
+    units: list[str],
+    error: str | None = None,
+) -> dict[str, Any]:
+    payload = _service_envelope(
+        "ensure-running",
+        instance,
+        mode=mode,
+        pids=pids,
+        units=units,
+        result={"exit_code": exit_code},
+    )
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _reported_unit_names(service: dict[str, Any]) -> list[str]:
+    units = service.get("units", {})
+    if not isinstance(units, dict):
+        return []
+    return [
+        name
+        for name in _unit_names(str(service.get("instance", "cortex")))
+        if isinstance(units.get(name), dict) and units[name].get("present")
+    ]
+
+
+def _reported_monitor_pid(service: dict[str, Any], instance: str) -> int | None:
+    units = service.get("units", {})
+    row = units.get(f"{instance}-monitor.service") if isinstance(units, dict) else None
+    pid = row.get("pid") if isinstance(row, dict) else None
+    return pid if isinstance(pid, int) and _pid_is_live(pid) else None
+
+
+def _ensure_systemd_running(instance: str) -> dict[str, Any]:
+    manager_service, manager_timer, monitor_service = _unit_names(instance)
+    started = start(instance=instance)
+    exit_code = int(started.get("result", {}).get("exit_code", 1))
+    if exit_code != 0:
+        return _ensure_payload(
+            instance,
+            mode="systemd",
+            exit_code=exit_code,
+            pids={},
+            units=[manager_service, manager_timer, monitor_service],
+            error=str(started.get("error") or "systemd manager 啟動失敗"),
+        )
+
+    monitor_result = _run_systemctl("start", monitor_service)
+    if monitor_result.returncode != 0:
+        return _ensure_payload(
+            instance,
+            mode="systemd",
+            exit_code=monitor_result.returncode or 1,
+            pids={},
+            units=[manager_service, manager_timer, monitor_service],
+            error=_completed_process_error(
+                monitor_result,
+                fallback=f"systemctl start failed for {monitor_service}",
+            ),
+        )
+
+    manager_pid = _wait_for_manager_lock(instance)
+    if manager_pid is None:
+        return _ensure_payload(
+            instance,
+            mode="systemd",
+            exit_code=1,
+            pids={},
+            units=[manager_service, manager_timer, monitor_service],
+            error=(
+                f"等待 manager.lock 最多 {_ENSURE_START_TIMEOUT_SECONDS:g} 秒，"
+                "仍未確認 live manager 持有鎖。"
+            ),
+        )
+    service = _status_payload(instance)
+    pids = {"manager": manager_pid}
+    monitor_pid = _reported_monitor_pid(service, instance)
+    if monitor_pid is not None:
+        pids["monitor"] = monitor_pid
+    return _ensure_payload(
+        instance,
+        mode="systemd",
+        exit_code=0,
+        pids=pids,
+        units=[manager_service, manager_timer, monitor_service],
+    )
+
+
+def _fallback_environment(instance: str) -> dict[str, str]:
+    runtime_dir = _runtime_env_path(instance).parent
+    env = os.environ.copy()
+    for path in (runtime_dir / f"{instance}.env", _runtime_env_path(instance)):
+        env.update(installer._read_plain_env(path))
+    env["PSC_INSTANCE"] = instance
+    env["PY"] = sys.executable
+    return env
+
+
+def _terminate_process(process: Any | None) -> None:
+    if process is None:
+        return
+    poll = getattr(process, "poll", None)
+    terminate = getattr(process, "terminate", None)
+    if not callable(poll) or not callable(terminate) or poll() is not None:
+        return
+    try:
+        terminate()
+        process.wait(timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _ensure_fallback_running(instance: str) -> dict[str, Any]:
+    manager_process = None
+    try:
+        env = _fallback_environment(instance)
+        specs_dir = env.get("PSC_MANAGER_SPECS_DIR") or str(
+            Path(os.environ.get("HOME", str(Path.home()))).expanduser() / ".agents" / "specs"
+        )
+        log_path = _fallback_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as log_file:
+            manager_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "paulsha_cortex.coordinator.manager_daemon",
+                    "--specs-dir",
+                    specs_dir,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=env.get("PSC_REPO_ROOT") or None,
+                start_new_session=True,
+            )
+            manager_pid = _wait_for_manager_lock(instance, manager_process)
+            if manager_pid is None:
+                _terminate_process(manager_process)
+                return _ensure_payload(
+                    instance,
+                    mode="fallback",
+                    exit_code=1,
+                    pids={},
+                    units=[],
+                    error=(
+                        f"本地 manager 未能在 {_ENSURE_START_TIMEOUT_SECONDS:g} 秒內"
+                        "取得 manager.lock；詳見 manager.log。"
+                    ),
+                )
+            monitor_process = subprocess.Popen(
+                [sys.executable, "-m", "paulsha_cortex.monitor"],
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=env.get("PSC_REPO_ROOT") or None,
+                start_new_session=True,
+            )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        _terminate_process(manager_process)
+        return _ensure_payload(
+            instance,
+            mode="fallback",
+            exit_code=1,
+            pids={},
+            units=[],
+            error=f"本地 fallback 啟動失敗：{exc}",
+        )
+    return _ensure_payload(
+        instance,
+        mode="fallback",
+        exit_code=0,
+        pids={"manager": manager_pid, "monitor": monitor_process.pid},
+        units=[],
+    )
+
+
+def _run_ensure_running(instance: str) -> int:
+    service: dict[str, Any] = {}
+    mode = "none"
+    try:
+        service = _status_payload(instance)
+        service_units = service.get("units", {})
+        unit_names = _unit_names(instance)
+        units_available = isinstance(service_units, dict) and all(
+            isinstance(service_units.get(name), dict)
+            and service_units[name].get("present")
+            for name in unit_names
+        )
+        mode = "systemd" if units_available else "fallback"
+        manager_pid = _live_manager_lock_pid(instance)
+        if manager_pid is not None:
+            pids = {"manager": manager_pid}
+            monitor_pid = _reported_monitor_pid(service, instance)
+            if monitor_pid is not None:
+                pids["monitor"] = monitor_pid
+            payload = _ensure_payload(
+                instance,
+                mode="already-running",
+                exit_code=0,
+                pids=pids,
+                units=_reported_unit_names(service),
+            )
+        elif units_available and _systemd_control_available():
+            mode = "systemd"
+            payload = _ensure_systemd_running(instance)
+        else:
+            mode = "fallback"
+            payload = _ensure_fallback_running(instance)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        payload = _ensure_payload(
+            instance,
+            mode=mode,
+            exit_code=1,
+            pids={},
+            units=_reported_unit_names(service),
+            error=f"ensure-running 執行失敗：{exc}",
+        )
+    _json_dump(payload)
+    return int(payload.get("result", {}).get("exit_code", 1))
 
 
 def _print_status(service: dict[str, Any]) -> None:
@@ -646,6 +913,8 @@ def main(argv: Sequence[str]) -> int:
                 json_output=args.json,
                 rebind=args.rebind,
             )
+        if args.command == "ensure-running":
+            return _run_ensure_running(instance)
         if args.command in {"start", "stop", "restart"}:
             return _run_lifecycle(args.command, instance=instance, json_output=args.json)
         if args.command == "status":
