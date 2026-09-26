@@ -218,7 +218,9 @@ def _create_slice(
         reg.update_slice(slice_id, state="building", builder_job_id=job["job_id"])
 
 
-def _launch_foreign_review_with_exception(exc: Exception) -> tuple[dict, dict, dict]:
+def _launch_foreign_review_with_exception(
+    exc: Exception, *, launch_log_dirs: list[tuple[str, str]] | None = None
+) -> tuple[dict, dict, dict]:
     with tempfile.TemporaryDirectory() as d:
         reg = _reg(d)
         root = Path(d)
@@ -252,6 +254,8 @@ def _launch_foreign_review_with_exception(exc: Exception) -> tuple[dict, dict, d
 
         class _FailingReviewLauncher:
             def launch(self, *, slice_id, prompt, worktree, log_dir):
+                if launch_log_dirs is not None:
+                    launch_log_dirs.append((str(root / "coordinator"), log_dir))
                 raise exc
 
         with (
@@ -955,6 +959,23 @@ class CompleteTickWorkflowLaneGateTests(unittest.TestCase):
 
             manifest = json.loads((hdir / "slice-declared-repo.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["workflow_repo"], "hamanpaul/paulsha-cortex")
+
+
+class ForeignReviewLaunchTests(unittest.TestCase):
+    def test_slice_lane_reviewer_log_dir_uses_coordinator_root(self) -> None:
+        launch_log_dirs: list[tuple[str, str]] = []
+        _, reviewer_job, _ = _launch_foreign_review_with_exception(
+            RuntimeError("capture log_dir"), launch_log_dirs=launch_log_dirs
+        )
+
+        self.assertEqual(len(launch_log_dirs), 1)
+        coordinator_root, log_dir = launch_log_dirs[0]
+        self.assertEqual(
+            Path(log_dir),
+            Path(coordinator_root).resolve()
+            / "slice-review-logs"
+            / reviewer_job["job_id"],
+        )
 
 
 class CompleteTickVerificationTests(unittest.TestCase):

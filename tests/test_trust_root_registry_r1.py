@@ -88,6 +88,24 @@ def test_every_asset_fully_classified() -> None:
         assert a.ingress_kind is not None, a.asset_id
 
 
+def test_slice_review_log_is_registered_as_manager_only(tmp_path: Path) -> None:
+    """slice-lane reviewer 的終局 log 必須落在受管且 job 不可寫的根。"""
+    from paulsha_cortex.trust_root import permgen
+
+    asset = registry.asset_by_id("slice-review-log")
+    assert asset.tier is AssetTier.TIER_0
+    assert asset.tree is TrustTree.MANAGER_OWNED
+    assert asset.writers == (Principal.MANAGER,)
+    assert asset.readers == (Principal.MANAGER,)
+    assert asset.path_resolver == "paulsha_cortex.config.paths:slice_review_log_root"
+    assert paths.slice_review_log_root(tmp_path / "coordinator") == (
+        tmp_path / "coordinator" / "slice-review-logs"
+    )
+    assert permgen.DEFAULT_LAYOUT.asset_paths()["slice-review-log"] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/slice-review-logs"
+    )
+
+
 def test_all_three_headless_personas_covered() -> None:
     """spec §R1：盤點必須涵蓋 builder／reviewer／planner 三者，不能只封 builder。"""
     assert registry.personas_covered() == HEADLESS_PERSONAS

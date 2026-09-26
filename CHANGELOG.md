@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#602 slice-lane reviewer log 路徑**：將 `log_dir` 從 repo 工作樹相對路徑改為 `<coordinator_root>/slice-review-logs/<reviewer_job_id>/`，並列入 Manager-only trust-root 資產，避免 builder 透過可寫工作樹改寫 review 終局 log。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
