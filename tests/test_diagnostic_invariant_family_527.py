@@ -911,8 +911,8 @@ def test_issue_482_absent_key_carries_reason_and_identity() -> None:
     assert len(missing) == review.ABSENT_EVALUATION_KEY_LENGTH
 
 
-def test_issue_482_reviewer_job_keyed_path_is_unchanged(tmp_path: Path) -> None:
-    """範圍紀律：reviewer job 已存在時的落點一字未動。"""
+def test_issue_482_reviewer_job_keyed_path_includes_candidate(tmp_path: Path) -> None:
+    """reviewer job 的落點須同時區分候選。"""
 
     path = review.gate_evaluation_path(
         slice_id="slice-482",
@@ -921,7 +921,35 @@ def test_issue_482_reviewer_job_keyed_path_is_unchanged(tmp_path: Path) -> None:
         reviewer_job_id="reviewer-9",
         coordinator_root=tmp_path,
     )
-    assert path.name == "slice-482-reviewer-9.json"
+    assert path.name == "slice-482-reviewer-9-aaaaaaaaaaaa.json"
+
+
+def test_issue_571_reviewer_evidence_is_bound_to_candidate(tmp_path: Path) -> None:
+    """同一 reviewer job 重用於不同 candidate 時，兩份 immutable evidence 都可讀。"""
+
+    evaluations = [
+        review.build_gate_evaluation(
+            slice_id="slice-571",
+            state="passed",
+            reason="review completed",
+            builder_job_id="builder-1",
+            reviewer_job_id="reviewer-9",
+            candidate=candidate,
+            launch_identity={"builder": _BUILDER, "reviewer": _REVIEWER},
+        )
+        for candidate in ("a" * 40, "b" * 40)
+    ]
+
+    written = [
+        review.write_gate_evaluation(payload, coordinator_root=tmp_path)
+        for payload in evaluations
+    ]
+
+    assert written[0]["path"] != written[1]["path"]
+    for result, expected in zip(written, evaluations, strict=True):
+        path = Path(result["path"])
+        assert path.is_file()
+        assert json.loads(path.read_text(encoding="utf-8"))["candidate"] == expected["candidate"]
 
 
 def test_issue_527_provider_projects_the_reason_without_degrading(tmp_path: Path) -> None:

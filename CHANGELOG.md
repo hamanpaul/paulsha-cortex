@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#571、#579 reviewer 路徑綁定**：review gate evaluation 檔名納入 candidate 短 SHA；reviewer sandbox 目錄名納入 job id，並於新 reviewer 派工前回收前代 claim era 已終止的孤兒 sandbox，回收失敗時記錄 warning 並繼續派工。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加

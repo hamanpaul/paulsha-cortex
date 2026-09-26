@@ -734,8 +734,7 @@ def test_forced_retry_dispatches_a_new_reviewer_job_with_a_re_resolved_identity(
 
 
 def test_forced_retry_recycles_the_superseded_reviewer_sandbox(tmp_path: Path) -> None:
-    """sandbox 目錄名是 `sha256(run_id:card:candidate)`——重派同一張卡＋同一個
-    candidate 必然撞名，舊 sandbox 沒回收就永遠派不出去。"""
+    """forced retry 仍須回收升級前不含 job id 的 legacy sandbox。"""
 
     snapshot, registry, run, old_job_id = _stuck_reviewer_run(tmp_path, with_git=True)
     coordinator_root = tmp_path / "coordinator"
@@ -768,7 +767,7 @@ def test_forced_retry_recycles_the_superseded_reviewer_sandbox(tmp_path: Path) -
     replacement = _dispatch(tmp_path, registry, run.run_id, [])
 
     assert replacement is not None
-    # 同一個路徑被回收後重建：陳舊內容不得留給新 reviewer 看。
+    # legacy 路徑已回收：陳舊內容不得留給新 reviewer 看。
     assert not (old_sandbox / "stale-marker").exists()
     assert Path(replacement["worktree"]).is_dir()
 
