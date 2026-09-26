@@ -57,6 +57,34 @@ class CompletionTests(unittest.TestCase):
 
 
 class VersionedRegistryTests(unittest.TestCase):
+    def test_launch_handle_persists_executable_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state_path = Path(d) / "jobs.json"
+            reg = JobRegistry(state_path=state_path)
+            job = reg.create_job(
+                task="slice-a",
+                persona="builder",
+                branch="feature/slice-a",
+                pane="%0",
+                worktree="/wt/slice-a",
+                executor="claude",
+                model_id="gemma-test",
+            )
+
+            updated = reg.attach_launch_handle(
+                job["job_id"],
+                executor="claude",
+                model_id="gemma-test",
+                executable="/opt/cortex/bin/claude-compatible",
+                session_name="slice-a",
+                pid=123,
+                log_path="/logs/slice-a.jsonl",
+            )
+            reloaded = JobRegistry(state_path=state_path).get_job(job["job_id"])
+
+        self.assertEqual(updated["executable"], "/opt/cortex/bin/claude-compatible")
+        self.assertEqual(reloaded["executable"], "/opt/cortex/bin/claude-compatible")
+
     def test_clean_start_missing_state_is_valid(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = JobRegistry(state_path=Path(d) / "absent.json")

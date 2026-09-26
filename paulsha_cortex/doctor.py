@@ -486,16 +486,51 @@ def _review_sandbox_probe(
         return ProbeResult(
             "review-sandbox", "fail", "review identity registry unavailable", True
         )
+    configured_executable = next(
+        (
+            identity.executable
+            for identity in registry.identities
+            if identity.executor == "claude" and identity.executable is not None
+        ),
+        None,
+    )
     declared = any(
         identity.executor == "claude" and "review" in identity.capabilities
         for identity in registry.identities
     )
     if not declared:
+        if configured_executable is None:
+            return ProbeResult(
+                "review-sandbox", "warn", "no Claude review identity configured", False
+            )
+        try:
+            from .coordinator.launcher import resolve_claude_executable
+
+            resolved_executable = resolve_claude_executable(configured_executable)
+        except ValueError as exc:
+            return ProbeResult(
+                "review-sandbox",
+                "fail",
+                f"configured Claude executable invalid: {exc}",
+                True,
+            )
         return ProbeResult(
-            "review-sandbox", "warn", "no Claude review identity configured", False
+            "review-sandbox",
+            "pass",
+            f"Claude executable {resolved_executable} configured; no review identity",
+            False,
         )
-    result = _review_sandbox_checks(env, runner=runner, live=live)
-    if result.status == "fail" and not _custom_overlay_declares_claude_review(config_root):
+    result = _review_sandbox_checks(
+        env,
+        runner=runner,
+        live=live,
+        claude_executable=configured_executable,
+    )
+    if (
+        result.status == "fail"
+        and configured_executable is None
+        and not _custom_overlay_declares_claude_review(config_root)
+    ):
         return ProbeResult(
             "review-sandbox",
             "warn",
@@ -511,12 +546,29 @@ def _review_sandbox_checks(
     *,
     runner: Runner,
     live: bool,
+    claude_executable: str | None = None,
 ) -> ProbeResult:
     search_path = env.get("PATH")
+    if claude_executable is None:
+        claude = shutil.which("claude", path=search_path)
+    else:
+        try:
+            from .coordinator.launcher import resolve_claude_executable
+
+            claude = resolve_claude_executable(claude_executable)
+        except ValueError as exc:
+            return ProbeResult(
+                "review-sandbox",
+                "fail",
+                f"configured Claude executable invalid: {exc}",
+                True,
+            )
     executables = {
         name: shutil.which(name, path=search_path)
         for name in REVIEW_SANDBOX_EXECUTABLES
+        if name != "claude"
     }
+    executables["claude"] = claude
     missing = [name for name, path in executables.items() if path is None]
     if missing:
         return ProbeResult(
@@ -540,7 +592,7 @@ def _review_sandbox_checks(
         return ProbeResult(
             "review-sandbox",
             "fail",
-            "Claude Code 2.1.187 or newer is required",
+            f"Claude Code 2.1.187 or newer is required at {claude}",
             True,
         )
     help_code, help_text = _process(runner, [claude, "--help"])
@@ -555,7 +607,10 @@ def _review_sandbox_checks(
     }
     if help_code != 0 or any(flag not in help_text for flag in required_flags):
         return ProbeResult(
-            "review-sandbox", "fail", "Claude review sandbox CLI surface unavailable", True
+            "review-sandbox",
+            "fail",
+            f"Claude review sandbox CLI surface unavailable at {claude}",
+            True,
         )
     dependency_commands = ([bwrap, "--version"], [socat, "-V"], [srt, "--version"])
     if any(_process(runner, list(argv))[0] != 0 for argv in dependency_commands):
@@ -625,7 +680,10 @@ def _review_sandbox_checks(
                 "review-sandbox", "fail", "configured reviewer sandbox smoke failed", True
             )
     return ProbeResult(
-        "review-sandbox", "pass", "Claude native Bash sandbox runtime ready", True
+        "review-sandbox",
+        "pass",
+        f"Claude executable {claude}: native Bash sandbox runtime ready",
+        True,
     )
 
 

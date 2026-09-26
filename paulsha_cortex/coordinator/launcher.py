@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -685,6 +686,8 @@ class LaunchHandle:
     #: canonical log in their writable spool, so the sentinel/ledger cannot
     #: be reconstructed from ``log_path`` alone.
     control_log_path: str | None = None
+    #: 本次 job 使用的 executable；None 表示沿用 PATH 解析。
+    executable: str | None = None
 
 
 def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
@@ -926,6 +929,23 @@ def build_copilot_argv(
     return argv
 
 
+def resolve_claude_executable(executable: str | None) -> str | None:
+    """解析 Claude launcher 綁定，回傳實際執行的一般可執行檔絕對路徑。"""
+
+    if executable is None:
+        return None
+    if not isinstance(executable, str) or not Path(executable).is_absolute():
+        raise ValueError("Claude executable must be an absolute path")
+    try:
+        resolved = Path(executable).resolve(strict=True)
+        mode = resolved.stat().st_mode
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Claude executable is unavailable: {executable}") from exc
+    if not stat.S_ISREG(mode) or not os.access(resolved, os.X_OK):
+        raise ValueError(f"Claude executable must be a regular executable: {executable}")
+    return str(resolved)
+
+
 def build_claude_argv(
     *,
     prompt: str,
@@ -935,6 +955,7 @@ def build_claude_argv(
     remote: str | None = None,
     allow_unsafe: bool = False,
     model: str | None = None,
+    executable: str | None = None,
     read_only: bool = False,
     review_only: bool = False,
     review_terminal_kind: str | None = None,
@@ -958,7 +979,7 @@ def build_claude_argv(
         review_schema = None
     # allow_unsafe（明確 opt-in）→ bypassPermissions（不再逐筆授權）；
     # 預設用 acceptEdits（仍受權限模式把關，最小放權）。
-    argv = ["claude", "-p"]
+    argv = [resolve_claude_executable(executable) or "claude", "-p"]
     if not prompt_via_stdin:
         argv.append(prompt)
     argv += [
@@ -1588,6 +1609,7 @@ class SubprocessLauncher:
         codex_remote: str = "psc",
         allow_unsafe: bool = False,
         model: str | None = None,
+        executable: str | None = None,
         read_only: bool = False,
         review_only: bool = False,
         commit_required: bool = False,
@@ -1598,6 +1620,8 @@ class SubprocessLauncher:
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
+        if executable is not None and executor != "claude":
+            raise ValueError("executable binding is only supported for claude")
         if executor == "cg" and allow_unsafe:
             raise ValueError("cg executor refuses unsafe mode")
         if (read_only or review_only) and executor == "copilot":
@@ -1639,6 +1663,9 @@ class SubprocessLauncher:
         # claude bypassPermissions）。預設 False，採最小放權，避免無意間關掉沙箱。
         self._allow_unsafe = allow_unsafe
         self._model = model
+        self._executable = (
+            resolve_claude_executable(executable) if executor == "claude" else None
+        )
         self._read_only = read_only
         self._review_only = review_only
         self._commit_required = commit_required
@@ -1671,6 +1698,11 @@ class SubprocessLauncher:
         """公開 launcher 綁定的 model id（未 pin 時為 ``None``）。"""
         return self._model
 
+    @property
+    def executable(self) -> str | None:
+        """設定的 Claude executable 絕對路徑；None 表示沿用 PATH 解析。"""
+        return self._executable
+
     def as_read_only(self) -> "SubprocessLauncher":
         """Return an equivalent launcher with the executor's strict planning contract."""
 
@@ -1680,6 +1712,7 @@ class SubprocessLauncher:
             codex_remote=self._codex_remote,
             allow_unsafe=False,
             model=self._model,
+            executable=self._executable,
             read_only=True,
             review_only=False,
             commit_required=False,
@@ -1695,6 +1728,7 @@ class SubprocessLauncher:
             codex_remote=self._codex_remote,
             allow_unsafe=False,
             model=self._model,
+            executable=self._executable,
             read_only=False,
             review_only=True,
             commit_required=False,
@@ -1727,6 +1761,7 @@ class SubprocessLauncher:
             codex_remote=self._codex_remote,
             allow_unsafe=False,
             model=self._model,
+            executable=self._executable,
             read_only=False,
             review_only=False,
             commit_required=False,
@@ -1752,6 +1787,7 @@ class SubprocessLauncher:
             codex_remote=self._codex_remote,
             allow_unsafe=False,
             model=self._model,
+            executable=self._executable,
             read_only=False,
             review_only=False,
             commit_required=True,
@@ -1791,6 +1827,7 @@ class SubprocessLauncher:
             codex_remote=self._codex_remote,
             allow_unsafe=False,
             model=self._model,
+            executable=self._executable,
             read_only=False,
             review_only=False,
             commit_required=False,
@@ -1997,6 +2034,8 @@ class SubprocessLauncher:
         )
 
     def launch(self, *, slice_id: str, prompt: str, worktree: str, log_dir: str) -> LaunchHandle:
+        # 在建立 job 檔案前重新驗證；設定路徑失效時立即失敗，不回退至 PATH。
+        resolved_executable = resolve_claude_executable(self._executable)
         # Phase 2a 降權啟動器（#584 未決 1 裁決＝systemd-run transient unit）。
         # 這一行在**任何**副作用（mkdir／清 sentinel／Popen）之前求值：`PSC_JOB_RUNNER`
         # 非法或 builder 帳號不存在時，本次派工必須在還沒改動任何狀態前就 fail-closed，
@@ -2140,6 +2179,8 @@ class SubprocessLauncher:
             builder_kwargs["verdict_spool_dir"] = self._verdict_spool_dir
         if self._executor in {"claude", "agy"}:
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
+        if self._executor == "claude":
+            builder_kwargs["executable"] = resolved_executable
         if self._executor == "claude":
             # Claude's complete workflow envelope can exceed Linux's per-argv
             # limit.  The wrapper receives it over stdin instead.
@@ -2556,4 +2597,5 @@ class SubprocessLauncher:
             credential_publish=bool(degraded and self._executor == "codex"),
             prompt_path=prompt_file,
             control_log_path=manager_log_path if degraded else None,
+            executable=resolved_executable,
         )

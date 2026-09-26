@@ -2505,6 +2505,7 @@ class JobRegistry:
             raise ValueError(f"coordinator 狀態檔 job kind 非法（fail-closed）: {self._state_path}")
         for field in (
             "executor", "session_name", "log_path", "model_id", "independence_domain",
+            "executable",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
             "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
             "workflow_sandbox_hash", "workflow_builder_job_id", "workflow_stage_execution_key",
@@ -3746,6 +3747,7 @@ class JobRegistry:
         *,
         executor: str | None = None,
         model_id: str | None = None,
+        executable: str | None = None,
         session_name: str | None = None,
         pid: int | None = None,
         log_path: str | None = None,
@@ -3763,6 +3765,8 @@ class JobRegistry:
         job["executor"] = executor
         if model_id is not None:
             job["model_id"] = model_id
+        if executable is not None:
+            job["executable"] = executable
         job["session_name"] = session_name
         job["pid"] = pid
         job["log_path"] = log_path

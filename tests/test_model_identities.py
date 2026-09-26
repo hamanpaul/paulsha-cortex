@@ -51,7 +51,7 @@ identities:
 
     registry = load_model_identities(tmp_path, use_packaged_default=True)
 
-    assert registry.schema_version == 3
+    assert registry.schema_version == 4
     assert registry.require("agy", AGY_MODEL_ID).independence_domain == "google"
     assert registry.require("codex", "gpt-primary").independence_domain == "openai"
 
@@ -161,6 +161,55 @@ identities:
     path.write_text("schema_version: true\nidentities: []\n", encoding="utf-8")
     with pytest.raises(ValueError, match="schema_version"):
         load_model_identities(tmp_path)
+
+
+def test_v4_claude_identity_binds_an_absolute_executable(tmp_path: Path) -> None:
+    executable = tmp_path / "claude-compatible"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    (tmp_path / "model-identities.yaml").write_text(
+        "schema_version: 4\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: gemma-test\n"
+        "    independence_domain: local\n"
+        "    capabilities: [build]\n"
+        f"    executable: {executable}\n",
+        encoding="utf-8",
+    )
+
+    registry = load_model_identities(tmp_path, use_packaged_default=False)
+
+    identity = registry.require("claude", "gemma-test")
+    assert identity.executable == str(executable)
+    assert identity.to_dict()["executable"] == str(executable)
+
+
+def test_v4_executable_rejects_relative_path_and_non_claude_executor(tmp_path: Path) -> None:
+    path = tmp_path / "model-identities.yaml"
+    path.write_text(
+        "schema_version: 4\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: gemma-test\n"
+        "    independence_domain: local\n"
+        "    executable: ./claude-compatible\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="absolute"):
+        load_model_identities(tmp_path, use_packaged_default=False)
+
+    path.write_text(
+        "schema_version: 4\n"
+        "identities:\n"
+        "  - executor: codex\n"
+        "    model_id: codex-test\n"
+        "    independence_domain: openai\n"
+        "    executable: /opt/cortex/bin/codex\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="only supported for claude"):
+        load_model_identities(tmp_path, use_packaged_default=False)
 
 
 def test_foreign_review_uses_v2_registry_without_leaking_planner_metadata(tmp_path: Path) -> None:

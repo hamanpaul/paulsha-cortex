@@ -20,6 +20,69 @@ from paulsha_cortex.coordinator.launcher import (
 
 
 class ArgvTests(unittest.TestCase):
+    def test_claude_argv_uses_bound_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            executable = Path(d) / "claude-compatible"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+
+            argv = build_claude_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir="/lg",
+                executable=str(executable),
+            )
+
+        self.assertEqual(argv[0], str(executable.resolve()))
+
+    def test_claude_argv_rejects_invalid_bound_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            non_executable = Path(d) / "not-executable"
+            non_executable.write_text("not a launcher\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Claude executable"):
+                build_claude_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir="/lg",
+                    executable=str(non_executable),
+                )
+            directory = Path(d) / "directory"
+            directory.mkdir()
+            with self.assertRaisesRegex(ValueError, "Claude executable"):
+                build_claude_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir="/lg",
+                    executable=str(directory),
+                )
+
+    def test_subprocess_launcher_uses_and_records_bound_claude_executable(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 123
+
+        def _fake_popen(argv, **_kwargs):
+            calls.append(argv)
+            return _FakeProc()
+
+        with tempfile.TemporaryDirectory() as d:
+            executable = Path(d) / "claude-compatible"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o755)
+            with mock.patch.object(launcher_module.subprocess, "Popen", _fake_popen):
+                handle = SubprocessLauncher(
+                    "claude", model="gemma-test", executable=str(executable)
+                ).launch(
+                    slice_id="slice-claude-bound",
+                    prompt="PROMPT",
+                    worktree=d,
+                    log_dir=str(Path(d) / "logs"),
+                )
+
+        self.assertEqual(handle.executable, str(executable.resolve()))
+        self.assertIn(str(executable), calls[0][2])
+
     def test_claude_commit_permissions_are_per_job_and_exact(self) -> None:
         gate = "env -u PSC_REPO_ROOT /opt/test/bin/python -m pytest -q"
         with mock.patch.dict(os.environ, {"PSC_GATE_CMD_PYTEST": gate}, clear=True):

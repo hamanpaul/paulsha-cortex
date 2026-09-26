@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#475 Claude executable 綁定**：model identity schema v4 可為 Claude 設定絕對 executable；launcher 與 doctor probe 共用並驗證該路徑，job 記錄保存解析後路徑，無效時不回退 PATH。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加
