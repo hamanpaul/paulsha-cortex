@@ -3943,6 +3943,17 @@ def _manager_archive_applied(
     return _manager_archive_job_applied(registry, run, jobs=jobs)
 
 
+def _post_archive_candidate(run, *, registry, jobs) -> str | None:
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or not _manager_archive_applied(run, registry=registry, jobs=jobs)
+    ):
+        return None
+    return candidate.lower()
+
+
 def _planning_artifact_relative_path_after_archive(
     run,
     *,
@@ -12102,15 +12113,24 @@ def _dispatch_workflow_card(
     )
     if admission_stop is not None:
         return admission_stop
+    job_rows = registry.list_jobs()
+    post_archive_candidate = _post_archive_candidate(
+        run, registry=registry, jobs=job_rows
+    )
     matching = [
         job
-        for job in registry.list_jobs()
+        for job in job_rows
         if job.get("workflow_run_id") == run.run_id
         and job.get("workflow_card") == step.card
         and job.get("workflow_phase") == step.phase
         and (
             step.phase not in {"verify", "review"}
             or job.get("subject_head") == run.candidate_head
+        )
+        and (
+            step.phase != "build"
+            or post_archive_candidate is None
+            or job.get("dispatch_head") == post_archive_candidate
         )
     ]
     # #765：reuse／retry 判定只認**本 claim era** 的 job（None 容忍比照 #766/#768）。
@@ -12608,7 +12628,12 @@ def _dispatch_workflow_card(
             and verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is not None
             else None
         )
-        if builder_jobs and accepted_candidate is not None:
+        if post_archive_candidate is not None:
+            # post-archive Builder 的工作區必須從 archive 已採信的 exact
+            # Candidate 出發；歷史 Builder 的 dispatch_head 是 run 起始基底，不能
+            # 拿來當這張新卡的 clone base。
+            build_base_sha = post_archive_candidate
+        elif builder_jobs and accepted_candidate is not None:
             # 中段／後續 build 卡：base 是**來源樹上這條 branch 現在的位置**，也就是
             # 前一張卡 harvest 回來（#637 bundle ＋ append-only spool）之後被採信的
             # candidate。交接因此完全走 Manager 自己的 object store，不依賴前一張卡的
@@ -12732,7 +12757,14 @@ def _dispatch_workflow_card(
         output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
     dispatch_base: str | None = None
     if step.phase == "build":
-        if builder_jobs:
+        if post_archive_candidate is not None:
+            if (
+                not isinstance(build_base_sha, str)
+                or verification.SAFE_SHA_RE.fullmatch(build_base_sha) is None
+            ):
+                raise ValueError("workflow build phase base is unavailable")
+            dispatch_base = build_base_sha.lower()
+        elif builder_jobs:
             persisted_base = builder_jobs[0].get("dispatch_head")
             if (
                 not isinstance(persisted_base, str)
@@ -13856,9 +13888,15 @@ def resume_workflow_run(
                     return rate_limited
                 raise
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "no-pending-card"}
+    job_rows = registry.list_jobs()
+    post_archive_candidate = (
+        _post_archive_candidate(run, registry=registry, jobs=job_rows)
+        if step.phase == "build"
+        else None
+    )
     jobs = [
         job
-        for job in registry.list_jobs()
+        for job in job_rows
         if job.get("workflow_run_id") == run.run_id
         and job.get("workflow_card") == step.card
         and job.get("workflow_phase") == step.phase
@@ -13874,6 +13912,11 @@ def resume_workflow_run(
         and (
             step.phase not in {"verify", "review"}
             or job.get("subject_head") == run.candidate_head
+        )
+        and (
+            step.phase != "build"
+            or post_archive_candidate is None
+            or job.get("dispatch_head") == post_archive_candidate
         )
     ]
     job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
