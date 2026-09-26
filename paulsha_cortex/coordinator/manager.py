@@ -4537,8 +4537,10 @@ def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
 
         來源樹的 `refs/heads/<branch>` == `run.candidate_head`
 
-    在每一張 build 卡被採信之後成立，下一張卡只要以 `run.candidate_head` 為 base
-    去 clone，拿到的就是前一張卡的成果——**完全不必讀前一張卡的工作區**。
+    在每一張允許 commit 的 build 卡被採信之後成立，下一張卡只要以
+    `run.candidate_head` 為 base 去 clone，拿到的就是前一張卡的成果——**完全不必
+    讀前一張卡的工作區**。`commit_policy=forbidden` 的卡（例如
+    `worktree-isolation`）不產生 Candidate，通過後仍維持未錨定狀態。
 
     為什麼是 `run.candidate_head` 而不是「去讀來源樹的 branch tip」：candidate 是
     Manager 採信鏈（#540）的產物，branch tip 只是磁碟現況。以採信值為準，兩者一旦
@@ -4553,9 +4555,10 @@ def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
     目錄，既不會撞名（#601 的 `worktree target already exists` 在這條 lane 結構上
     消失），也不會被下一次 provision 讀到。
 
-    **`candidate_head` 尚未錨定時不走這條路**：那代表 run 還沒採信過任何 build
-    成果（首張卡、或首張卡的 terminal 壞掉正在重派），呼叫端會退回「首張 build 卡」
-    的凍結 base。判準寫在呼叫端而不是這裡，因為那是「有沒有東西要交接」的問題。
+    **`candidate_head` 尚未錨定時不走這條路**：那代表還沒有任何允許 commit 的
+    build 結果被採信（例如 isolation 已通過，或首張可 commit 卡的 terminal 尚未
+    被採信），呼叫端會沿用未錨定時的 base。判準寫在呼叫端而不是這裡，因為那是
+    「有沒有東西要交接」的問題。
 
     推不出合法 SHA 時 raise：**不得**退回 creator 的預設 base（那是 `main`，等於把
     整個 run 已採信的成果 reset 掉）。
@@ -12267,9 +12270,10 @@ def _dispatch_workflow_card(
                 run, builder_jobs=builder_jobs, card=step.card
             )
         else:
-            # 首張 build 卡：#208 收口 wiring 5（#211 閉環）——凍結集存在時必須以
-            # frozen_readiness["base_sha"] 為基底，不得讓 dispatch 自行重新推導一個
-            # 可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2 的 stale-base 缺陷）。
+            # 尚未錨定 Candidate 的 build 卡：#208 收口 wiring 5（#211 閉環）——
+            # 凍結集存在時必須以 frozen_readiness["base_sha"] 為基底，不得讓 dispatch
+            # 自行重新推導一個可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2
+            # 的 stale-base 缺陷）。
             build_base_sha = None
             if isinstance(run.frozen_readiness, dict):
                 candidate_base_sha = run.frozen_readiness.get("base_sha")
@@ -14728,7 +14732,14 @@ def apply_workflow_action(
                 if kind in by_kind
             ),
             gate_status=gate_status,
-            candidate_head=candidate,
+            # #556：forbidden build 卡（例如 worktree-isolation）只檢查工作區，
+            # 不產生可綁定的 Candidate。保留既有值；首張允許 commit 的卡通過採信
+            # 後才把它驗證過的 exact HEAD 綁到 run。
+            candidate_head=(
+                current.candidate_head
+                if current.current_phase == "build" and step.commit_policy == "forbidden"
+                else candidate
+            ),
             verified_head=verified,
             facets=facets,
             evidence_refs=facets_evidence_refs,

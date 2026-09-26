@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#556 worktree-isolation 不再提早綁定 Candidate**：`commit_policy=forbidden` 的 isolation 卡通過採信後維持 null candidate；第一張允許 commit 的 builder 卡採信後才綁定 exact HEAD，保留 `recover-pre-candidate` 的前置條件。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加

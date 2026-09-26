@@ -11,8 +11,8 @@ builder 卡」這條路：
 - ``retry-build`` 只受理最後一張 builder 卡（tdd-red 是中段卡），而且它是
   candidate 修復語意——會把該卡的 ``action`` 覆寫成 repair 文案，中段卡走那條
   路等於把卡片自己的指示（「寫一個 RED regression test」）抹掉。
-- ``recover-pre-candidate`` 要求 null candidate（worktree-isolation 早已錨定
-  candidate）。
+- ``recover-pre-candidate`` 要求 null candidate；本測試保留舊 run 已綁 candidate 的
+  快照，驗證該狀態下的 ``retry-card`` 行為。
 - ``abandon`` 會連合格的 RED commit 與一個世代一起燒掉。
 
 本檔釘住新增的 ``retry-card`` work action：以 exact WorkflowRun CAS 加卡名定
@@ -152,8 +152,8 @@ def _stuck_run(
         gate_status="failed",
         needs_human_reason=fixture_needs_human_reason(),
     )
-    # worktree-isolation 已錨定 candidate（現場即如此，所以 recover-pre-candidate
-    # 也走不通）。
+    # 這個 fixture 保留修正前 run 已綁 candidate 的快照；#556 修正只影響新採信流程，
+    # 不回寫既有 WorkflowRun。
     anchor = registry.create_job(
         task="wf-anchor",
         persona="builder",

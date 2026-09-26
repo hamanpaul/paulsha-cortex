@@ -4383,8 +4383,9 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     - ``retry-build`` 只受理最後一張 builder 卡（tdd-red 是中段卡），且它是
       candidate 修復語意——會把該卡的 ``action`` 覆寫成 repair 文案，中段卡走那
       條路等於把卡片本身的指示抹掉。
-    - ``recover-pre-candidate`` 要求 null candidate（worktree-isolation 早已錨定
-      candidate）。
+    - ``recover-pre-candidate`` 要求 null candidate。``worktree-isolation`` 的
+      ``commit_policy=forbidden``，通過時不錨定 candidate；只有允許 commit 的 builder
+      卡完成採信後，這個 pre-candidate reset 才不再適用。
     - ``abandon`` 會燒掉合格的 RED commit 與一個世代。
 
     現場二（#569，**同一個 run** 的 verify phase）：verification job
@@ -6713,9 +6714,10 @@ def _regenerate_gates_action(
     時 ledger 是 ``gates: []``，builder 交付的合格 RED commit 撞
     ``gate-ledger-missing-expected-gate``；operator 補上宣告並重啟之後，契約內
     卻沒有任何路徑能讓那份 ledger 重新產生——``resume`` 只是重讀同一份舊 ledger
-    再拒一次，``retry-build`` 只受理「最後一張 builder 卡」（tdd-red 是中段卡），
-    ``recover-pre-candidate`` 要求 null candidate（worktree-isolation 早已錨定
-    candidate）。唯一出路是 operator 手動跑 gate_ledger CLI。
+    再拒一次，``retry-build`` 只受理「最後一張 builder 卡」（tdd-red 是中段卡）。
+    ``recover-pre-candidate`` 只在尚未採信允許 commit 的 builder candidate 時
+    可用；它會重設 pre-candidate slice，不保留未採信工作區成果。唯一能只重跑 gate
+    而保留工作區的既有路徑，是 operator 手動跑 gate_ledger CLI。
 
     本動作把那個手動步驟收進契約，但**只重跑 gate、不改判**：它重新執行
     operator 宣告的 gate 命令、原子覆寫 ledger，然後就結束；run 仍停在
