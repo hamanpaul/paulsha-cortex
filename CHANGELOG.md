@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#821 registry 持久化衛生**：相同 durable bytes 不再重寫；rollback 優先以硬連結保留舊狀態，不支援時退回複製；slice 的三種 history 預設限 500 筆，可由環境變數調整並累計截斷數；啟動時在 grace 與既有 transaction lock 保護下清理本目錄 stale tmp。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加
