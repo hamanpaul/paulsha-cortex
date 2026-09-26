@@ -131,7 +131,7 @@ def test_prepare_commit_seals_the_file_side_of_the_transaction(tmp_path: Path) -
     transaction, _, _ = _publish_generation(workspace, coordinator)
 
     body = json.loads(_journal(coordinator).read_text(encoding="utf-8"))
-    assert body["schema_version"] == 3
+    assert body["schema_version"] == 4
     assert body["phase"] == "publishing"
 
     transaction.prepare_commit()
@@ -219,6 +219,7 @@ def test_sweep_heals_legacy_v2_journal_of_a_superseded_run(tmp_path: Path) -> No
     journal = _journal(coordinator)
     legacy = json.loads(journal.read_text(encoding="utf-8"))
     legacy.pop("phase")
+    legacy.pop("expected_planning_authority", None)
     legacy["schema_version"] = 2
     journal.write_text(json.dumps(legacy, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
 

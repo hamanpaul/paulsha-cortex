@@ -339,6 +339,13 @@ class RuntimePreflightResult:
             parts.append("missing capabilities: " + ", ".join(self.missing_capabilities))
         if self.unavailable_providers:
             parts.append("providers unavailable: " + ", ".join(self.unavailable_providers))
+        reasons = [
+            f"{finding.capability.token}: {finding.reason}"
+            for finding in self.findings
+            if finding.outcome in _BLOCKING_OUTCOMES and finding.reason
+        ]
+        if reasons:
+            parts.append("findings: " + " | ".join(reasons))
         return f"[{self.identity_token} @ {self.environment.name}] " + "; ".join(parts)
 
     def to_dict(self) -> dict[str, object]:
