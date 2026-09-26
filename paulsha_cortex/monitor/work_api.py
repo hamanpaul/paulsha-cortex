@@ -1091,12 +1091,14 @@ def _parse_closure_evidence(
             if source.kind == "openspec" and source.confidence == "confirmed"
         }
         if observations.get("remote_openspec_observed") is True:
-            combined[group.work_id]["remote_active_openspec_absent"] = bool(
-                openspec_refs
-            ) and all(ref not in active for ref in openspec_refs)
-            combined[group.work_id]["remote_archive_present"] = bool(
-                openspec_refs
-            ) and all(ref in archived for ref in openspec_refs)
+            # 沒有 mapped OpenSpec 時 archive 條件不適用（與 #1037 的 remote closure
+            # 一致：以 PR merged＋issue 全關＋Todo 全勾＋CompletionRecord 為準）。
+            combined[group.work_id]["remote_active_openspec_absent"] = all(
+                ref not in active for ref in openspec_refs
+            )
+            combined[group.work_id]["remote_archive_present"] = all(
+                ref in archived for ref in openspec_refs
+            )
         doc_todos = [todo for todo in remote_todos if todo.get("work_id") == group.work_id]
         openspec_todos = [
             todo for todo in remote_todos if todo.get("openspec_ref") in openspec_refs
