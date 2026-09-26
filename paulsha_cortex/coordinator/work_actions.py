@@ -29,7 +29,7 @@ from .diagnostics import diagnostic_reason
 from .claim import (
     AUTO_LABEL,
     ClaimCandidate,
-    authority_digest_without_planning_outputs,
+    authority_matches_claim_era,
     build_claim_key,
     build_label_argv,
     claim_identity_digest,
@@ -40,6 +40,8 @@ from .claim import (
     load_work_authorities,
     load_work_authorities_with_snapshot_items,
     load_work_authority,
+    manager_pr_refs_compatible,
+    self_only_authority_drift_matches,
     work_authority_digest,
 )
 from .delivery import (
@@ -1168,13 +1170,12 @@ def _append_delivery_publication_event(
 
 
 def _canonical_workflow_run(*, workflow_registry, authority):
-    digest = work_authority_digest(authority)
     matches = [
         run
         for run in workflow_registry.list_workflow_runs()
         if run.repo == authority.repo
         and run.work_id == authority.work_id
-        and run.source_revision == digest
+        and authority_matches_claim_era(authority, run)
         and run.issue_refs
         == tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
         # A workflow's planning cards may create the active OpenSpec change
@@ -1184,8 +1185,7 @@ def _canonical_workflow_run(*, workflow_registry, authority):
         # bind that run instead of treating its own planning output as a new
         # identity.
         and _openspec_refs_compatible(run, authority)
-        and run.pr_refs
-        == tuple(f"{authority.repo}#{number}" for number in authority.mapped_prs)
+        and manager_pr_refs_compatible(authority, run)
     ]
     # A re-claimed work item legitimately leaves superseded historical runs
     # with the same authority refs.  Delivery must bind to the one live run;
@@ -1276,7 +1276,10 @@ def _validate_current_run_authority(active: dict[str, Any], authority, canonical
         "mapped_openspec": list(authority.mapped_openspec),
         "mapped_todo_paths": list(authority.mapped_todo_paths),
     }
-    if any(active.get(field) != value for field, value in expected.items()):
+    if (
+        not authority_matches_claim_era(authority, canonical_run)
+        or any(active.get(field) != value for field, value in expected.items())
+    ):
         raise RuntimeError("persisted workflow does not match current WorkAuthority")
     step_ids = active.get("workflow_step_ids")
     if (
@@ -2765,18 +2768,17 @@ def _claim_action(
             #     `run.status` 又會把 needs_human／needs_decomposition／blocked
             #     的 run 誤納入保護。
             #
-            # (2)「漂移完全來自 run 自己的產出」：把 planning phase 自產的
-            #     `superpowers_spec:`／`superpowers_plan:` source 剝掉之後重算的
-            #     authority digest，必須與 run 持久化的 `source_revision`（claim
-            #     當下的 `work_authority_digest`）逐字相符。相符即代表「除了這個
-            #     run 自己寫出來的 spec/design/plan 以外，authority 一個字都沒
-            #     變」，此時換代純屬自我作廢。
+            # (2)「漂移完全來自 run 自己的產出」：共用判定會逐項核對 run 已接受
+            #     的 planning artifact ref/kind/hash 與目前 bytes、run 宣告的
+            #     OpenSpec proposal，以及 Manager PR refs 綁定的 exact verified
+            #     Candidate。只有把這些精確對應的新增項目還原後，authority digest
+            #     才能逐字等於原 `source_revision`。source prefix、檔名或 caller
+            #     自述都不足以豁免；任何其他欄位變更仍走既有 restart。
             #
             # 判準 (2) 同時守住既有的 operator 逃生口：issue 開關、openspec
             # revision、todo 成員變動等**真正的** authority 變更不會被剝除，
             # digest 依然不同，`start` 照舊開新世代（見
             # tests/test_work_actions.py::test_source_change_starts_new_canonical_run）。
-            inflight_digest = authority_digest_without_planning_outputs(authority)
             inflight = [
                 run
                 for run in all_runs
@@ -2784,7 +2786,7 @@ def _claim_action(
                 and run.work_id == authority.work_id
                 and run.status == "ongoing"
                 and workflow_status(run) == "ongoing"
-                and run.source_revision == inflight_digest
+                and authority_matches_claim_era(authority, run)
             ]
             if len(inflight) > 1:
                 raise RuntimeError("active workflow identity is ambiguous")
@@ -2881,6 +2883,12 @@ def _claim_action(
         # 沒有 in-flight job 時才符合精準 invalidation 的前置條件；不符合時
         # （build/claim/define/plan phase、或有 active job）維持既有『原樣
         # resume』行為，不強行 invalidate。
+        if self_only_authority_drift_matches(authority, canonical_run):
+            return {
+                "action": "resume",
+                "reason": "active-workflow",
+                "run": canonical_run.to_dict(),
+            }
         new_digest = work_authority_digest(authority)
         authority_restart_classification = None
         if canonical_run.current_phase in {"verify", "review"}:

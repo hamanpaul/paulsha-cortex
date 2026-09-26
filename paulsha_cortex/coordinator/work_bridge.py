@@ -1713,12 +1713,6 @@ def _push_exact_candidate(
     from . import work_actions
 
     state_path = state_root / "delivery-journal.json"
-    current_digest = work_authority_digest(authority)
-    if run.source_revision != current_digest:
-        run = registry._manager_update_workflow_run(
-            run.run_id,
-            source_revision=current_digest,
-        )
     journal = work_actions._load_runs(state_path)
     if run.run_id in journal["runs"]:
         _rebase_delivery_journal_authority(
@@ -2784,7 +2778,6 @@ def build_production_ship_validator(
             authority = _authority_with_manager_pr(authority, number)
             updated = registry._manager_update_workflow_run(
                 run.run_id,
-                source_revision=work_authority_digest(authority),
                 pr_refs=(f"{run.repo}#{number}",),
             )
             _rebase_delivery_journal_authority(
@@ -2801,7 +2794,7 @@ def build_production_ship_validator(
                     "candidate": candidate,
                     "action": "pr-created",
                     "pr_number": number,
-                    "authority_digest": updated.source_revision,
+                    "authority_digest": work_authority_digest(authority),
                 },
             )
             return {
@@ -2815,11 +2808,6 @@ def build_production_ship_validator(
         if authority.mapped_prs not in {(), (number,)}:
             raise RuntimeError("workflow PR differs from current WorkAuthority")
         authority = _authority_with_manager_pr(authority, number)
-        if run.source_revision != work_authority_digest(authority):
-            run = registry._manager_update_workflow_run(
-                run.run_id,
-                source_revision=work_authority_digest(authority),
-            )
         _rebase_delivery_journal_authority(
             state_root=state_root,
             run=run,

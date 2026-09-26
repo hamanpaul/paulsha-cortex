@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -90,10 +91,19 @@ def _snapshot(path: Path, *, source_revisions: list[str]) -> Path:
 _BASE_REVISIONS = [f"todo:{_REPO}:docs/superpowers/workstreams/{_WORK_ID}/todo.md@identity:todo"]
 # run 自己的 brainstorming／writing-plans 卡發佈後，monitor 併入的新 confirmed
 # source——這正是讓 claim_key 漂移的那三筆。
+_PLANNING_ARTIFACTS = (
+    (f"docs/superpowers/specs/{_WORK_ID}-spec.md", "spec", b"# Accepted spec\n"),
+    (f"docs/superpowers/specs/{_WORK_ID}-design.md", "design", b"# Accepted design\n"),
+    (f"docs/superpowers/plans/{_WORK_ID}.md", "plan", b"# Accepted plan\n"),
+)
 _PLANNING_REVISIONS = [
-    f"superpowers_spec:{_REPO}:docs/superpowers/specs/{_WORK_ID}-spec.md@identity:spec",
-    f"superpowers_spec:{_REPO}:docs/superpowers/specs/{_WORK_ID}-design.md@identity:design",
-    f"superpowers_plan:{_REPO}:docs/superpowers/plans/{_WORK_ID}.md@identity:plan",
+    f"superpowers_spec:{_REPO}:{ref}@identity:{ref}"
+    for ref, kind, _content in _PLANNING_ARTIFACTS
+    if kind in {"spec", "design"}
+] + [
+    f"superpowers_plan:{_REPO}:{ref}@identity:{ref}"
+    for ref, kind, _content in _PLANNING_ARTIFACTS
+    if kind == "plan"
 ]
 
 
@@ -146,6 +156,22 @@ def test_inflight_run_survives_claim_after_own_planning_artifacts_drift_claim_ke
     assert inflight.status == "ongoing"
     assert inflight.current_phase == "build"
     assert inflight.facets == ()
+
+    # 確認 run 已接受的 ref/kind/hash 與 workspace 實際 bytes，不能只靠 source prefix。
+    accepted = []
+    for ref, kind, content in _PLANNING_ARTIFACTS:
+        path = Path(inflight.workspace_root) / ref
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        accepted.append(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind=kind,
+                work_id=_WORK_ID,
+                baseline_sha256=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    registry._manager_update_workflow_run(run_id, planning_authority=tuple(accepted))
 
     # planning artifact 併入 authority -> digest 改變 -> claim_key 漂移。
     after = load_work_authority(
