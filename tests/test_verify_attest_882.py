@@ -193,6 +193,26 @@ def test_verify_attest_rejects_candidate_mismatch_without_evidence(tmp_path: Pat
             },
             "payload invalid",
         ),
+        (
+            {
+                "full_suite_command": "python -m pytest -q",
+                "result_summary": {"passed": 0, "failed": 0},
+            },
+            "payload invalid",
+        ),
+        *[
+            (
+                {"full_suite_command": command, "result_summary": {"passed": 5, "failed": 0}},
+                "payload invalid",
+            )
+            for command in (
+                "python -m pytest tests/test_one.py -q",
+                "python -m pytest -q tests/test_one.py::test_case",
+                "python -m pytest -q -k verify",
+                "python -m pytest -q --deselect tests/test_x.py::t",
+                "python -m pytest -q --lf",
+            )
+        ],
     ],
 )
 def test_verify_attest_requires_full_suite_command_and_zero_failures(

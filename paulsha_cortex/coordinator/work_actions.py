@@ -2229,6 +2229,17 @@ def _review_attest_action(
     return {"action": "review-attested", "head": run.candidate_head, **record}
 
 
+_VERIFY_ATTEST_SCOPED_COMMAND_RE = re.compile(
+    r"\.py\b|::|(?:^|\s)-k(?:\s|=|$)|--deselect\b|--lf\b|--last-failed\b|--co\b|--collect-only\b"
+)
+
+
+def _verify_attest_command_is_scoped(command: str) -> bool:
+    """#882：verify-attest 只接受 full suite；指定單檔、node id、-k 等縮小範圍的指令一律拒絕。"""
+
+    return _VERIFY_ATTEST_SCOPED_COMMAND_RE.search(command) is not None
+
+
 def _verify_attest_action(
     *,
     args: dict[str, Any],
@@ -2270,9 +2281,10 @@ def _verify_attest_action(
         or not isinstance(result_summary, dict)
         or set(result_summary) != {"passed", "failed"}
         or type(result_summary.get("passed")) is not int
-        or result_summary["passed"] < 0
+        or result_summary["passed"] <= 0
         or type(result_summary.get("failed")) is not int
         or result_summary["failed"] != 0
+        or _verify_attest_command_is_scoped(full_suite_command)
         or not isinstance(now_epoch, (int, float))
         or isinstance(now_epoch, bool)
         or not math.isfinite(float(now_epoch))
