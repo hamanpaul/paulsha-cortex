@@ -207,6 +207,13 @@ def build_review_prompt(
         f"{', '.join(sorted(VALID_FINDING_CATEGORIES))}\n"
         "合法 finding severity（severity）值："
         f"{', '.join(sorted(VALID_SEVERITIES))}\n"
+        "finding category 決定是否阻擋交付；severity 只表示影響程度，不會改變 category 是否阻擋交付。\n"
+        "阻擋交付的 category（候選含不可交付缺陷）："
+        f"{', '.join(sorted(BLOCKING_FINDING_CATEGORIES))}\n"
+        "可交付的 follow-up category（可記錄後續事項）："
+        f"{', '.join(sorted(VALID_FINDING_CATEGORIES - BLOCKING_FINDING_CATEGORIES))}\n"
+        "整體結論必須與 blocking category 一致：有任一 blocking finding 就必須 reject，"
+        "不能寫 Recommend merge 或將它描述為可交付 follow-up；沒有 blocking finding 時必須 approve／可建議 merge。\n"
         "Verdict schema（只能輸出此 JSON 結構）:\n"
         f"{json.dumps(verdict_template, ensure_ascii=False, indent=2, sort_keys=True)}\n"
     )

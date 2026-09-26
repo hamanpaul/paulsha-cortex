@@ -719,6 +719,30 @@ def test_review_prompt_enumerates_validator_enums_and_accepts_blocking_security_
     assert verdict["state"] == "rejected"
 
 
+def test_slice_review_prompt_explains_category_and_conclusion_semantics(tmp_path: Path) -> None:
+    prompt = foreign_review.build_review_prompt(
+        slice_id="slice-x",
+        plan_path="plans/slice-x.md",
+        verdict_path=str(tmp_path / "verdict.json"),
+        builder_job_id="slice-x-1",
+        reviewer_job_id="slice-x-7",
+        candidate=CANDIDATE,
+        launch_identity=dict(REVIEWER_IDENTITY),
+    )
+    blocking = ", ".join(sorted(foreign_review.BLOCKING_FINDING_CATEGORIES))
+    follow_up = ", ".join(
+        sorted(foreign_review.VALID_FINDING_CATEGORIES - foreign_review.BLOCKING_FINDING_CATEGORIES)
+    )
+
+    assert f"阻擋交付的 category（候選含不可交付缺陷）：{blocking}" in prompt
+    assert f"可交付的 follow-up category（可記錄後續事項）：{follow_up}" in prompt
+    assert "severity 只表示影響程度，不會改變 category 是否阻擋交付。" in prompt
+    assert (
+        "整體結論必須與 blocking category 一致：有任一 blocking finding 就必須 reject，"
+        "不能寫 Recommend merge 或將它描述為可交付 follow-up；沒有 blocking finding 時必須 approve／可建議 merge。"
+    ) in prompt
+
+
 # ---------------------------------------------------------------------------
 # 6. 過渡期 legacy fallback
 # ---------------------------------------------------------------------------
