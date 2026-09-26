@@ -1,0 +1,119 @@
+{
+  "descriptor": {
+    "adapter": {
+      "id": "patchmud.scripted",
+      "protocol_id": "patchmud.complete",
+      "protocol_version": "1",
+      "runtime_version": "patchmud-unknown;adapter-sha256:f8905765f6c7bbac1467523948fc0c4a9ee3b06e0535ad711dc9b04a80301702;config-v1;parameters-sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    "effort_grammar": {
+      "type": "none"
+    },
+    "id": "scripted:offline-scripted",
+    "metadata": {
+      "discovery": {
+        "model_parameters": {}
+      }
+    },
+    "model": {
+      "id": "offline-scripted",
+      "revision": "patchmud-script-v1"
+    },
+    "provenance": [
+      {
+        "kind": "descriptor-source",
+        "ref": "patchmud:adapter-profile-v1"
+      }
+    ],
+    "schema_version": 1
+  },
+  "profile": {
+    "conditions": {
+      "adapter": {
+        "state": "known",
+        "value": {
+          "id": "patchmud.scripted",
+          "protocol_id": "patchmud.complete",
+          "protocol_version": "1",
+          "runtime_version": "patchmud-unknown;adapter-sha256:f8905765f6c7bbac1467523948fc0c4a9ee3b06e0535ad711dc9b04a80301702;config-v1;parameters-sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        }
+      },
+      "effort": {
+        "state": "not_applicable"
+      },
+      "loadout": {
+        "state": "known",
+        "value": {
+          "id": "P0T0R0",
+          "version": "patchmud-loadout-v1"
+        }
+      },
+      "model": {
+        "state": "known",
+        "value": {
+          "id": "offline-scripted",
+          "revision": "patchmud-script-v1"
+        }
+      },
+      "permissions": {
+        "state": "known",
+        "value": [
+          {
+            "id": "patchmud.permissions.no-tools",
+            "version": "1"
+          }
+        ]
+      },
+      "sandbox": {
+        "state": "known",
+        "value": {
+          "id": "patchmud.offline-scripted",
+          "version": "1"
+        }
+      },
+      "toolchain": {
+        "state": "known",
+        "value": {
+          "id": "patchmud",
+          "version": "unknown"
+        }
+      },
+      "toolset": {
+        "state": "known",
+        "value": [
+          {
+            "id": "patchmud.tool-mode.none",
+            "version": "1"
+          }
+        ]
+      }
+    },
+    "metadata": {},
+    "plane": "unexpected-plane",
+    "provenance": [
+      {
+        "kind": "profile-source",
+        "ref": "patchmud:adapter-resolver-v1"
+      }
+    ],
+    "requirements": {
+      "independence": {
+        "reason": "not requested by execution CLI",
+        "state": "unknown"
+      },
+      "minimum_quality": {
+        "reason": "not requested by execution CLI",
+        "state": "unknown"
+      },
+      "pin": {
+        "reason": "not requested by execution CLI",
+        "state": "unknown"
+      },
+      "role": {
+        "reason": "role is assigned by report cohort",
+        "state": "unknown"
+      }
+    },
+    "schema_version": 1
+  }
+}

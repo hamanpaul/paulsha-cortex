@@ -1,0 +1,1 @@
+#841 loaded-runtime 身分證據：Manager／Monitor startup 寫入不可覆寫的 artifact/config receipt；service status 與 doctor 分開呈現 operator CLI、磁碟 service declaration 與長駐程序。Drift、缺漏、source override、未知 PID/schema 與 in-flight 狀態採 fail-closed；新增隔離安裝、receipt chain、instance-root 與安全投影測試及操作文件。Live install/restart/rollback 仍由 operator 另行驗收。

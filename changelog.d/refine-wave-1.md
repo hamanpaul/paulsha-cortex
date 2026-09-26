@@ -1,0 +1,1 @@
+- refine 第一波整合（#716、#835、#841、#843 與 PatchMUD report v2 consumer）：Trust Root 模板 unit 內的 codex 改由外層 systemd 加固承擔沙箱（唯讀契約走 `cortex-job-ro-jit@`、job 模式 planner 同步）；execution profile 接進正式派工（qualification gate 僅在 overlay 明示 enforce 時生效）；長駐程序 loaded runtime attestation；recovery action 契約矩陣與 recover-superseded 單一 CAS；整合修正 profile report consumer 對齊 PatchMUD report v2 fingerprint 契約。

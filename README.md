@@ -211,6 +211,15 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    同為**必填**，未宣告時 Manager 在派工前即 fail-closed。值由產生器導出，不要手打：
    `python3 -m paulsha_cortex.trust_root unit four-way --job | grep '^Environment=PATH='`。
 
+   **Codex 0.157 的 Trust Root 沙箱邊界（#716 選項 B）**：只有 launcher 成功完成
+   `systemd-template` preflight、確定本次命令會由 root-owned job template unit 執行時，
+   Codex argv 才使用 `--sandbox danger-full-access` 並省略 legacy Landlock 旗標。
+   0.157 在該 unit 下啟用 legacy Landlock 會因 app-server socket 隔離需求而 panic；停用
+   legacy 則預設 bubblewrap 因 namespace 權限被拒。此路徑的唯一安全邊界是外層 systemd
+   unit（含 `RestrictNamespaces=yes` 等既有加固及精確 `ReadWritePaths`）與既有 egress
+   proxy；不因停用內層沙箱而放寬任何 unit 鍵值。`direct` 與 transient `systemd-run`
+   沒有同一份 template 加固面，仍使用原先依卡片契約導出的內層 sandbox argv。
+
    **#823 headless session 的生命週期邊界**：每個合法 headless `Popen` 嘗試（含
    `systemd-run`／`systemd-template` 的 Manager-side client wrapper 與窄 `stdin` retry）都帶
    `start_new_session=True`。direct child 因此有自己的 POSIX session/process group；這是
@@ -318,6 +327,12 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    patchmud 目前僅有 anthropic adapter，roster 內只有 `claude/sonnet` 可被驅動；
    其餘身分會逐一回報 `adapter-unavailable` 並誠實維持預設封套。
 
+   PatchMUD report consumer 僅將 schema v2 完整 cohort identity
+   (`role`、`benchmark_type`、Cortex `execution_profile` key、`deck_digest`、
+   `evaluator_revision`) 對應到榜列；`model`／`loadout` 不再作為查詢鍵。Report
+   v1 按上游遷移契約只可 opaque 保留、不可排名；未知版本拒絕。詳見
+   [PatchMUD report v2 consumer](docs/patchmud-report-v2-consumer.md)。
+
    `cortex inspect models` 另顯示每列的 `layer=`，即該身分在三層解析鏈中的位置
    （`operator-overlay`／`evaluated-roster`／`packaged-fallback`／`parked`）。
 
@@ -342,6 +357,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    自動化呼叫可用 `cortex service ensure-running`：若 `manager.lock` 已由 live manager 持有，就不重啟並回報 `mode=already-running`；systemd user units 齊備且可用時會啟動 manager service/timer 與 monitor service，並等待 manager lock 最多 10 秒；否則以目前執行中的 Cortex Python 啟動本地 manager 與 monitor。此命令固定輸出一行 `cortex-porcelain/service/v1` JSON，fallback log 寫入 `manager.log`，不會安裝或修改 units。
 
    `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
+   `cortex service status --json` 另含 `loaded_runtime`：分開列出執行 status 命令的 `operator_cli`、磁碟上的 `service_declaration`，以及 Manager／Monitor 啟動時實際載入的 artifact/config receipt。只有 process PID、artifact 與可比對配置都能核對時才回報 match；磁碟更新會顯示 drift，缺 receipt、source override 或無法證實的欄位維持 unknown。`cortex doctor --json` 使用同一份安全投影。欄位與 live 驗收界線見[已載入 runtime 身分證據](docs/loaded-runtime-attestation.md)。
    `cortex service install` 寫入 unit 後，若 `daemon-reload` 或 `enable` 任一階段非零，會直接回報 `mode=systemd`、非零 exit code，訊息僅包含 systemd stderr、unit 落檔位置、重試 command（`systemctl --user ...`），並明確指出「unit 已寫入但僅 reload/enable 尚未完成」，不會輸出 traceback 或 stdout 內容，並不再繼續後續步驟。
 
 10. 用 `run` 家族提交高階 mutation；不加 `--wait` 時會回傳 request ID 並以 exit 3 表示 accepted-pending：
@@ -537,6 +553,8 @@ Job `exited` 只代表 Agent process 以 exit code 0 結束，**不代表任務�
 
 先從 `cortex status` 的 `attention[].next_actions` 選擇當下允許的動作，不要手動改 `jobs.json`：
 `cortex list` 與 `cortex work show` 的 needs_human work item 也會投影同一份目前可受理的 recovery actions，包含符合 owner-bound 前置條件時的 `recover-pre-candidate`。
+
+Recovery action 的正式 work／slice 名稱、`cortex recover` 有界 alias、前置條件、CAS、派工時點與可觀測結果見[契約矩陣](docs/recovery-action-contract-matrix.md)。coordinator `cortex work` 的 `--expected-candidate` 支援 `retry-build`、`retry-verify`、`retry-review` 與 `recover-repair-commit` 的 exact SHA CAS；同時提供 JSON payload 時兩者必須一致。work 與 slice 同名 action 仍沿用各自的 authority 與資源契約。
 
 ```bash
 cortex slice-action "$SLICE_ID" retry-build  --actor operator
@@ -774,24 +792,31 @@ planner／builder／reviewer 的身分解析依序走三層，**層級是排序�
 即空清單；可手工維護）：
 
 ```yaml
-schema_version: 1
+schema_version: 2
 entries:
   - executor: claude
     model_id: sonnet
-    roles: [build, review]        # planning / build / review
-    verdict: pass                 # pass / fail / pending（patchmud 評估結果）
-    evaluated_at: "2026-08-14"
-    eval_source: patchmud
-    eval_ref: patchmud-deck-v1/report-2026-08-14   # 選配：評估證據指標
-    review_status: approved       # approved / rejected / pending（人工複核）
-    reviewer: operator            # approved 時必填
-    reviewed_at: "2026-08-14"     # approved 時必填
+    role: builder
+    execution_profile_key: epk:v1:resolved:<64 lowercase hex digits>
+    benchmark_type: issue-resolution
+    deck_digest: sha256:<64 lowercase hex digits>
+    evaluator_revision: sha256:<64 lowercase hex digits>
+    verdict: pass
+    evaluated_at: "2026-09-26"
+    eval_source: patchmud-report-v2
+    eval_ref: <report fingerprint 或 evidence 參照>
+    review_status: approved
+    reviewer: operator
+    reviewed_at: "2026-09-26"
 ```
 
-只有 `verdict: pass` **且** `review_status: approved` **且**角色列於 `roles` 的
-身分才進第 2 層——「評估過」不等於「人工核可」。清單解析失敗時第 2 層視為空
-（保守方向，絕不因錯誤多授予資格），並由 `cortex doctor` 的 `model-resolution`
-probe 回報，不會中止 periodic tick。
+schema v2 每列只綁一個 report role、execution profile 與完整 cohort evidence；
+resolver 必須取得並比對五個 cohort 欄位才會將身分放入第 2 層。不同 deck 或
+evaluator revision 可各有獨立核可列，重複完整 identity 會拒收。Schema v1 的 `roles`
+清單仍可讀，沿用舊的 identity-level approval。所有版本都要求
+`verdict: pass`、`review_status: approved` 及可稽核 reviewer/date；「評估過」不等於
+「人工核可」。清單解析失敗時第 2 層視為空（保守方向，絕不因錯誤多授予資格），
+並由 `cortex doctor` 的 `model-resolution` probe 回報，不會中止 periodic tick。
 
 **overlay 的解析指令**（皆為選配，既有 overlay 檔案不改也照舊合法）：
 
@@ -817,6 +842,42 @@ fail-closed 並列出補救路徑（列入 overlay，或評估合格後加入 ev
 `cortex doctor` 的 `model-resolution` probe 走與 tick 相同的載入器與排序函式，
 回報每個 persona 的生效解析與所在層、使用的 config root；overlay 宣告了某角色
 卻不是生效解析（不變式被破壞）、或有 persona 無候選時 FAIL。
+
+### Execution profile（#835）
+
+每次實際派工會在既有身分解析結果之外，建立 versioned execution profile：
+`requested` 記錄明示偏好／pin，`resolved` 記錄 Cortex 選定的 adapter、model、native
+effort、persona loadout、工具與 sandbox，`observed` 只接受可信來源對 exact resolved
+key 的完整觀測。無可信觀測時維持 `unknown`；不會把 descriptor、要求值或 launcher
+設定冒充成 runtime 實測。
+
+Profile 以 `WorkflowRun.execution_profile_bindings` 作為獨立 sibling 欄位持久化，
+不改寫凍結的 `resolved_model_chain`、attempt 或歷史 evidence。舊 run 缺少該欄位時
+仍按 legacy 載入；新版讀舊資料不補造 profile。格式版本未知、descriptor 不完整、
+key 不一致或 launch 條件與 resolved profile 不符時拒絕派工。
+
+Adapter descriptor 是資料，不會載入 descriptor 提供的程式碼；adapter 實作由 Cortex
+可信註冊表提供，並沿用現有 launcher 的 argv、terminal、usage、cancel/timeout、工具與
+sandbox 邊界。quota 能力預設為 unknown，usage 不代表剩餘額度。正式 dispatch 會重新
+驗證 role、pin、reviewer independence 與既有 Trust Root。Sized run 的 #842
+exact-profile qualification gate 預設未啟用，讓尚未部署 qualification receipt
+lifecycle 的環境可繼續派工；這類 dispatch 會在 `resolved_model_chain` 留下
+`qualification: not-enforced`。只有 host overlay `model-identities.yaml` 明確宣告
+以下政策時，缺少／撤銷／不匹配的 receipt 才會在 spawn 前轉為 `needs_human`：
+
+```yaml
+qualification_policy:
+  sized_dispatch: enforce # disabled（預設）或 enforce
+```
+
+此 overlay 位於目前生效的 project config root（`PSC_PROJECT_CONFIG_ROOT`）。只有
+operator overlay 的這個明示值會啟用 gate；packaged identity roster 不會啟用。啟用前
+需先部署 #842 qualification lifecycle 並提供 exact-profile receipts。
+
+PatchMUD #37 的報告由 Cortex consumer 驗證 schema、source revision、digest 與 exact
+profile key；Cortex 不 runtime import PatchMUD。此 worktree 使用固定 fixture 驗證
+consumer，真實 immutable producer fixture／revision 與安裝後 launcher 仍需外部驗收。
+欄位與擴充契約見 [Execution profile 操作與相容性](docs/execution-profile.md)。
 
 ### Merge 限制與 completion/restart
 

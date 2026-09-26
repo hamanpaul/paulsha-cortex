@@ -8,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence, runtime_checkable
@@ -1107,6 +1108,16 @@ def build_claude_argv(
     return argv
 
 
+def _codex_default_effort(model: str) -> str | None:
+    """Return the existing model-specific native Codex effort override."""
+
+    return {
+        "gpt-5.6-luna": "max",
+        "gpt-6-luna": "max",
+        "gpt-5.3-codex-spark": "xhigh",
+    }.get(model)
+
+
 def build_codex_argv(
     *,
     prompt: str,
@@ -1120,6 +1131,7 @@ def build_codex_argv(
     review_only: bool = False,
     commit_required: bool = False,
     write_forbidden: bool = False,
+    trust_root_outer_unit: bool = False,
     verdict_spool_dir: str | None = None,
     last_message_path: str | None = None,
 ) -> list[str]:
@@ -1165,6 +1177,7 @@ def build_codex_argv(
             review_only=review_only,
             commit_required=commit_required,
             write_forbidden=write_forbidden,
+            trust_root_outer_unit=trust_root_outer_unit,
         )]
         if read_only or review_only:
             # planner／reviewer 的既有旗標，**逐字不變**：它們的工作區可能根本不是
@@ -1176,20 +1189,16 @@ def build_codex_argv(
         if commit_required:
             for git_write_dir in _linked_worktree_git_write_dirs(worktree):
                 argv += ["--add-dir", git_write_dir]
-    # #714／#716 B 後半：codex 的**內層沙箱形態**。預設是 bubblewrap，而 bwrap 在本
-    # 系統的加固面下要付四條放寬（`ProcSubset`／`RestrictNamespaces`／
-    # `RestrictAddressFamilies`／`SystemCallFilter` 加 `@mount`），其中兩條放寬的
-    # 正是 user namespace 與 mount——外層加固面存在的理由本身。改走
-    # landlock ＋ seccomp 之後外層一條都不必動（見 `permgen.CODEX_LEGACY_LANDLOCK`）。
+    # #714／#716：非 template/direct 的 Codex 仍按下方登記表附上 legacy Landlock。
+    # codex-cli 0.157 在 Trust Root template unit 下，legacy 路徑要求 bwrap 隔離
+    # app-server sockets；預設 bwrap 又被 namespace 限制擋下。因此只有已完成
+    # systemd-template preflight 的呼叫，才由外層 unit 作唯一沙箱邊界。
     #
     # **形態由登記表導出，附掛條件由寫入契約導出，兩者都不在這裡寫死**：
-    # `permgen.EXECUTOR_TOOLS` 那一列同時是「需要放行哪些 syscall 群組」的來源
-    # （permgen import 當下由 `_validate_inner_sandbox_support()` 強制）；「這張卡
-    # 附不附」住在 `registry.SANDBOX_MODE_DERIVATION` 的 `attaches_inner_sandbox`
-    # 欄（registry import 當下與 mode 的一致性被釘死）——read-only 族附（landlock
-    # 今天是好的、真的在擋），`danger-full-access` 那列不附（沒有內層可附，帶著
-    # 旗標只會在 job log 開頭多印 deprecation 噪音），`allow_unsafe` 那列不附
-    # （`--dangerously-bypass-approvals-and-sandbox` 已整個關掉，再選形態沒有意義）。
+    # 非 template 的附掛條件由 `registry.SANDBOX_MODE_DERIVATION` 的
+    # `attaches_inner_sandbox` 導出；template unit 則使用同表的 outer-unit 欄位，
+    # 發 `danger-full-access` 並不附 legacy 旗標。systemd-template preflight 成功
+    # 是唯一可關閉 Codex 內層沙箱的證據，不能從 persona、env 或卡片資料推測。
     argv += list(
         _codex_inner_sandbox_argv(
             allow_unsafe=allow_unsafe,
@@ -1197,6 +1206,7 @@ def build_codex_argv(
             review_only=review_only,
             commit_required=commit_required,
             write_forbidden=write_forbidden,
+            trust_root_outer_unit=trust_root_outer_unit,
         )
     )
     for spool_dir in _verdict_spool_add_dirs(
@@ -1205,11 +1215,7 @@ def build_codex_argv(
         argv += ["--add-dir", spool_dir]
     if model is not None:
         argv += ["--model", model]
-        reasoning_effort = {
-            "gpt-5.6-luna": "max",
-            "gpt-6-luna": "max",
-            "gpt-5.3-codex-spark": "xhigh",
-        }.get(model)
+        reasoning_effort = _codex_default_effort(model)
         if reasoning_effort is not None:
             # Codex reads this as a CLI config override, so an ambient
             # ~/.codex/config.toml cannot silently choose a different effort.
@@ -1233,6 +1239,7 @@ def _codex_inner_sandbox_argv(
     review_only: bool = False,
     commit_required: bool = False,
     write_forbidden: bool = False,
+    trust_root_outer_unit: bool = False,
 ) -> tuple[str, ...]:
     """codex 的內層沙箱形態 argv（#714），依寫入契約決定附不附（#716 B 後半）。
 
@@ -1268,7 +1275,9 @@ def _codex_inner_sandbox_argv(
         commit_required=commit_required,
         write_forbidden=write_forbidden,
     )
-    if not registry.inner_sandbox_attached_for(contract):
+    if not registry.inner_sandbox_attached_for(
+        contract, trust_root_outer_unit=trust_root_outer_unit
+    ):
         return ()
     spec = permgen.executor_inner_sandbox("codex")
     return () if spec is None else tuple(spec.argv)
@@ -1281,6 +1290,7 @@ def _codex_sandbox_mode(
     review_only: bool,
     commit_required: bool,
     write_forbidden: bool,
+    trust_root_outer_unit: bool = False,
 ) -> str:
     """codex `--sandbox` 的值（`registry.SANDBOX_MODE_DERIVATION` 是唯一真相，#716）。
 
@@ -1305,7 +1315,9 @@ def _codex_sandbox_mode(
         commit_required=commit_required,
         write_forbidden=write_forbidden,
     )
-    mode = registry.sandbox_mode_for(contract)
+    mode = registry.sandbox_mode_for(
+        contract, trust_root_outer_unit=trust_root_outer_unit
+    )
     if mode is None:
         raise ValueError(
             f"寫入契約 {contract.value} 不發 --sandbox，不該走到 argv 的沙箱分支（#716）"
@@ -1674,6 +1686,7 @@ class SubprocessLauncher:
         effort: str | None = None,
         verdict_spool_dir: str | None = None,
         effective_tools: Sequence[str] | None = None,
+        execution_profile: object | None = None,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
@@ -1752,6 +1765,23 @@ class SubprocessLauncher:
             if effective_tools is not None and not write_forbidden
             else None
         )
+        self._execution_profile_binding = None
+        if execution_profile is not None:
+            from .execution_adapters import load_profile_binding, validate_profile_for_launch
+
+            binding = (
+                execution_profile
+                if hasattr(execution_profile, "resolved_key")
+                else load_profile_binding(execution_profile)
+            )
+            validate_profile_for_launch(
+                binding,
+                executor=self._executor,
+                model=self._model,
+                effort=self._effort,
+                sandbox_mode=self._execution_profile_sandbox_mode(),
+            )
+            self._execution_profile_binding = binding
 
     @property
     def executor(self) -> str:
@@ -1773,6 +1803,39 @@ class SubprocessLauncher:
         """設定的 Claude executable 絕對路徑；None 表示沿用 PATH 解析。"""
         return self._executable
 
+    @property
+    def execution_profile_binding(self) -> dict[str, object] | None:
+        binding = self._execution_profile_binding
+        return binding.to_dict() if binding is not None else None
+
+    def _execution_profile_sandbox_mode(self) -> str:
+        if self._review_only:
+            return "review-only"
+        if self._read_only:
+            return "read-only"
+        if self._write_forbidden:
+            return "write-forbidden"
+        if self._allow_unsafe:
+            return "unsafe-opt-in"
+        return "workspace-write"
+
+    def with_execution_profile(self, binding: object) -> "SubprocessLauncher":
+        """Return this launcher bound to one exact resolved profile."""
+
+        from .execution_adapters import load_profile_binding, validate_profile_for_launch
+
+        parsed = binding if hasattr(binding, "resolved_key") else load_profile_binding(binding)
+        validate_profile_for_launch(
+            parsed,
+            executor=self._executor,
+            model=self._model,
+            effort=self._effort,
+            sandbox_mode=self._execution_profile_sandbox_mode(),
+        )
+        clone = copy(self)
+        clone._execution_profile_binding = parsed
+        return clone
+
     def as_read_only(self) -> "SubprocessLauncher":
         """Return an equivalent launcher with the executor's strict planning contract."""
 
@@ -1787,6 +1850,7 @@ class SubprocessLauncher:
             review_only=False,
             commit_required=False,
             effort=self._effort,
+            execution_profile=self._execution_profile_binding,
         )
 
     def as_review_only(self, *, terminal_kind: str) -> "SubprocessLauncher":
@@ -1804,6 +1868,7 @@ class SubprocessLauncher:
             commit_required=False,
             review_terminal_kind=terminal_kind,
             effort=self._effort,
+            execution_profile=self._execution_profile_binding,
         )
 
     def as_verdict_spool_writer(self, spool_dir: str) -> "SubprocessLauncher":
@@ -1838,6 +1903,7 @@ class SubprocessLauncher:
             write_forbidden=self._write_forbidden,
             effort=self._effort,
             verdict_spool_dir=spool_dir,
+            execution_profile=self._execution_profile_binding,
         )
 
     def as_commit_required(self) -> "SubprocessLauncher":
@@ -1863,6 +1929,7 @@ class SubprocessLauncher:
             commit_required=True,
             effort=self._effort,
             effective_tools=self._effective_tools,
+            execution_profile=self._execution_profile_binding,
         )
 
     def as_write_forbidden(self) -> "SubprocessLauncher":
@@ -1906,6 +1973,7 @@ class SubprocessLauncher:
             effort=self._effort,
             verdict_spool_dir=self._verdict_spool_dir,
             effective_tools=self._effective_tools,
+            execution_profile=self._execution_profile_binding,
         )
 
     def _should_run_gates(self, env: Mapping[str, str]) -> bool:
@@ -2106,6 +2174,16 @@ class SubprocessLauncher:
         )
 
     def launch(self, *, slice_id: str, prompt: str, worktree: str, log_dir: str) -> LaunchHandle:
+        if self._execution_profile_binding is not None:
+            from .execution_adapters import validate_profile_for_launch
+
+            validate_profile_for_launch(
+                self._execution_profile_binding,
+                executor=self._executor,
+                model=self._model,
+                effort=self._effort,
+                sandbox_mode=self._execution_profile_sandbox_mode(),
+            )
         # 在建立 job 檔案前重新驗證；設定路徑失效時立即失敗，不回退至 PATH。
         resolved_executable = resolve_claude_executable(self._executable)
         # Phase 2a 降權啟動器（#584 未決 1 裁決＝systemd-run transient unit）。
@@ -2133,7 +2211,11 @@ class SubprocessLauncher:
             # （`job_runner.SPEC_FORBIDDEN_KEYS`）。未登記的 executor 在這裡
             # fail-closed，不會落到放寬的那一份剖面。
             template_plan = job_runner.prepare_systemd_template(
-                os.environ, job_id=slice_id, executor=self._executor, role=job_role
+                os.environ,
+                job_id=slice_id,
+                executor=self._executor,
+                role=job_role,
+                workspace_read_only=self._write_forbidden,
             )
         degraded = runner_mode is not None
         resolved_worktree = Path(worktree).resolve(strict=True)
@@ -2225,6 +2307,13 @@ class SubprocessLauncher:
         # 只是與其餘 builder 的呼叫形狀一致、defense-in-depth，不改變行為。
         if self._executor in {"codex", "copilot", "claude", "agy", "cg"}:
             builder_kwargs["commit_required"] = self._commit_required
+        if self._executor == "codex":
+            # Codex 0.157 在 Trust Root 加固 unit 內無法使用 bwrap，也無法使用
+            # legacy Landlock（需要 bubblewrap 隔離 app-server sockets）。只在已通過
+            # preflight 的 root-owned template plan 存在時，改由外層 unit 作唯一邊界。
+            # `direct` 與 transient `systemd-run` 都不具備這份完整 template 加固面，
+            # 因此維持原先按卡片契約導出的 Codex sandbox argv。
+            builder_kwargs["trust_root_outer_unit"] = template_plan is not None
         # #716：只有 codex 的 argv 上有 `--sandbox <mode>` 這個維度可表達。其餘 executor
         # 沒有對應旗標（`build_claude_argv` 走 `--permission-mode`、`build_copilot_argv`
         # 走 `--allow-all`／`--deny-tool`、agy 走 plan 或 accept-edits、cg 是
@@ -2268,9 +2357,9 @@ class SubprocessLauncher:
             builder_kwargs["last_message_path"] = last_message_path
         if self._executor == "agy":
             builder_kwargs["print_timeout"] = resolve_agy_print_timeout(os.environ)
-        inner_argv = _ARGV_BUILDERS[self._executor](
-            **builder_kwargs,
-        )
+        from .execution_adapters import adapter_for
+
+        inner_argv = adapter_for(self._executor).build_argv(builder_kwargs)
         # PSC_REPO_ROOT 讓已安裝 hook 的 `${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh`
         # 在 cwd=worktree（≠repo）時仍可解（worktree 雖是 repo checkout，但 hook 為全域安裝、
         # 不可依賴相對 cwd；互動 session 亦不應因相對路徑找不到 script 而報錯）。

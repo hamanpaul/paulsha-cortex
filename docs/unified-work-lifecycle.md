@@ -127,6 +127,12 @@ cortex stat --combo-selections
 cortex doctor --probe-live --repo owner/repo --json
 ```
 
+### 已載入 runtime 身分（#841）
+
+`cortex service status --json` 與 `cortex doctor --json` 共用 `loaded_runtime` 安全投影：`operator_cli` 說明目前執行命令的套件／設定觀測，`service_declaration` 對照磁碟 unit，Manager／Monitor 則取自各自長駐程序在 startup 寫下的 immutable receipt。receipt 只保存 artifact digest、package/source revision、instance-root digest、PID、process start time 與有效 config revision，不保存完整環境或憑證。磁碟 package/config 與載入值不同時標 drift；source override、缺漏／損壞 receipt、未知 schema 或無法核對目前 unit PID 都保持 unknown。
+
+這份 read model 不授權安裝、更新、重啟或回滾。`transition_safe` 固定為 false；in-flight 數量未知時維持 unknown，非零時為 `blocked-in-flight`，即使為零也只表示 `clear-not-authorized`。既有 Trust Root preflight、CAS、authority 與 review gates 照常裁決。欄位、receipt 路徑與受控 live 驗收步驟見[已載入 runtime 身分證據](loaded-runtime-attestation.md)。
+
 ### Combo 自動選擇
 
 `cortex work start` 與 auto claim 建立 workflow 時，Manager 會先讀 durable snapshot 內已確認的 GitHub issue title，交給 `paulsha_cortex/deck/task_types.py` 的 taxonomy 做機械分類，再映射到 combo。現況 `feat` 會選 `feature-oneshot`、`fix` 會選 `fix-standard`；`docs`／`test`／`ci`／`refactor` 目前仍是明示缺口，會帶 `bypass-default` provenance 沿用既有 `feature-oneshot`。
@@ -222,6 +228,8 @@ transaction、凍結 authority 做 abandon CAS、不放寬 `claim.py` 既有的�
 `#862` 仍只提供 registry 內部原語：`lookup_registry_request_receipt()`、`prepare_recovery()`、`commit_pre_candidate_recovery()`、`record_job_supersession()`、`record_job_consumption()` 與 `checkpoint_legacy_binding()`。這些不是新的 public CLI 動詞；本次 recovery 沿用現有 action/history 與 handoff 契約，不新增第二套 receipt／CAS。直接使用 #862 recovery primitive 的 caller 仍須在 allowed-action gate 內提供 exact control pins——`target={repo,work_id,slice_id}`、完整 binding snapshot（含 `binding_version`／`binding_revision`／builder/reviewer refs／spec/plan hash／verification hash／target remote/branch／dispatch base）、非空 `required_steps`、immutable `request_id`／`request_digest` 與 proof refs；A 只驗 schema、digest、CAS 與 required-step closure，不會憑 `actor`／`requested_by` 或 repo 字串授權，不讀外部 proof ref，也不替 queue/done、CompletionRecord 或 terminal lifecycle 做 reconciliation。
 
 `checkpoint_legacy_binding()` 同樣是 registry-only primitive：caller 必須以**另一個** immutable request ID/digest，帶完整 observed legacy row、legacy binding projection、job refs、fingerprint 與 provenance 明示觀測。成功時它只把這次觀測定錨成 `binding_revision=1` 的新起點，保留既有 candidate/history/actions/job disposition，不清 binding、不自動連帶 recovery。它只證明「觀測當下的 row 與 commit 當下相符」，**不是** legacy 歷史 A→B→A 的 ABA 追證，也不是 done/ship 權威；本次 #547 recovery 不呼叫這個 primitive，已存在的 unbound row 即使有 checkpoint 也不會自動遷移或回收。
+
+**Recovery action 正式入口矩陣（#843）。** Work recovery action 與 `cortex recover work` 有界 alias、slice action 與 `cortex recover slice` alias 各自共用版本化註冊資料；[矩陣](recovery-action-contract-matrix.md)逐列記錄 13 個 work 契約家族、正式名稱、authority／CAS、owner/job 限制、保留證據、派工時點、合法 `next_actions` 與已知 gap。`retry-verify`／`retry-review` 在 workflow 與 slice namespace 的同名項目不代表同一狀態機；凍結的 reviewer identity 若與 builder 同 independence domain，仍在建立 job／launcher 前拒絕，fallback 不改寫明示 pin。矩陣測試只驗既有 contract consumers，不增加 recovery schema 或 dispatcher。
 
 `abandon`只處理尚未進入delivery的舊run：exact run CAS、current WorkAuthority refs、actor與單行reason全部重驗，且任何active Job、PR ref、passed ship step或CompletionRecord都會拒絕。成功後把該run標成`superseded`，並以immutable `cortex-work-abandon/v1` evidence保存reason；不勾未完成tasks、不建立CompletionRecord，也不把abandoned work投影成done。終態化後會立即對該run reconcile planning transaction，並 best-effort 回收未提交 planning artifact 與 build worktree；build branch 若有超出其 base 的 commit，先建立 `archive/<work_id>-<shortsha>` tag 保留，再刪 branch，沒有額外 commit 就直接刪除。重送同一CAS/reason冪等，不同reason或已有另一個active run則fail-closed。
 

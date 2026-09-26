@@ -1,0 +1,233 @@
+{
+  "coverage": {
+    "gaps": [
+      {
+        "reason": "provider-field-not-reported",
+        "scope": "input_uncached"
+      },
+      {
+        "reason": "provider-field-not-reported",
+        "scope": "input_cached"
+      },
+      {
+        "reason": "provider-field-not-reported",
+        "scope": "output_visible"
+      },
+      {
+        "reason": "provider-field-not-reported",
+        "scope": "reasoning"
+      },
+      {
+        "reason": "provider-field-not-reported",
+        "scope": "billed_output_total"
+      },
+      {
+        "reason": "provider-does-not-report-field",
+        "scope": "unallocated"
+      }
+    ],
+    "state": "partial"
+  },
+  "fields": {
+    "billed_input_total": {
+      "calculation": {
+        "operation": "copy_total",
+        "source_fields": [
+          "prompt_tokens"
+        ]
+      },
+      "method": "executor_usage",
+      "semantics": {
+        "aggregation": "sum_usage_deltas",
+        "relation": "total"
+      },
+      "source": {
+        "adapter_version": "openai-compat/fixture-v1",
+        "source_id": "openai",
+        "source_schema": "openai-usage/v1"
+      },
+      "state": "observed",
+      "unit_ref": {
+        "state": "known",
+        "value": {
+          "unit_id": "token",
+          "version": "1"
+        }
+      },
+      "value": 100
+    },
+    "billed_output_total": {
+      "calculation": {
+        "operation": "copy_total",
+        "source_fields": [
+          "completion_tokens"
+        ]
+      },
+      "method": "executor_usage",
+      "reason": "provider-field-not-reported",
+      "semantics": {
+        "aggregation": "sum_usage_deltas",
+        "relation": "total"
+      },
+      "source": {
+        "adapter_version": "openai-compat/fixture-v1",
+        "source_id": "openai",
+        "source_schema": "openai-usage/v1"
+      },
+      "state": "unknown",
+      "unit_ref": {
+        "state": "known",
+        "value": {
+          "unit_id": "token",
+          "version": "1"
+        }
+      },
+      "value": 0
+    },
+    "input_cached": {
+      "calculation": {
+        "operation": "copy",
+        "source_fields": [
+          "prompt_tokens_details.cached_tokens"
+        ]
+      },
+      "method": "executor_usage",
+      "reason": "provider-field-not-reported",
+      "semantics": {
+        "aggregation": "sum_usage_deltas",
+        "partition": "input",
+        "relation": "subset",
+        "subset_of": "billed_input_total"
+      },
+      "source": {
+        "adapter_version": "openai-compat/fixture-v1",
+        "source_id": "openai",
+        "source_schema": "openai-usage/v1"
+      },
+      "state": "unknown",
+      "unit_ref": {
+        "state": "known",
+        "value": {
+          "unit_id": "token",
+          "version": "1"
+        }
+      }
+    },
+    "input_uncached": {
+      "calculation": {
+        "operation": "subtract_subset",
+        "source_fields": [
+          "prompt_tokens",
+          "prompt_tokens_details.cached_tokens"
+        ]
+      },
+      "method": "executor_usage",
+      "reason": "provider-field-not-reported",
+      "semantics": {
+        "aggregation": "sum_usage_deltas",
+        "partition": "input",
+        "relation": "partition_component"
+      },
+      "source": {
+        "adapter_version": "openai-compat/fixture-v1",
+        "source_id": "openai",
+        "source_schema": "openai-usage/v1"
+      },
+      "state": "unknown",
+      "unit_ref": {
+        "state": "known",
+        "value": {
+          "unit_id": "token",
+          "version": "1"
+        }
+      }
+    },
+    "output_visible": {
+      "calculation": {
+        "operation": "subtract_subset",
+        "source_fields": [
+          "completion_tokens",
+          "completion_tokens_details.reasoning_tokens"
+        ]
+      },
+      "method": "executor_usage",
+      "reason": "provider-field-not-reported",
+      "semantics": {
+        "aggregation": "sum_usage_deltas",
+        "partition": "output",
+        "relation": "partition_component"
+      },
+      "source": {
+        "adapter_version": "openai-compat/fixture-v1",
+        "source_id": "openai",
+        "source_schema": "openai-usage/v1"
+      },
+      "state": "unknown",
+      "unit_ref": {
+        "state": "known",
+        "value": {
+          "unit_id": "token",
+          "version": "1"
+        }
+      }
+    },
+    "reasoning": {
+      "calculation": {
+        "operation": "copy",
+        "source_fields": [
+          "completion_tokens_details.reasoning_tokens"
+        ]
+      },
+      "method": "executor_usage",
+      "reason": "provider-field-not-reported",
+      "semantics": {
+        "aggregation": "sum_usage_deltas",
+        "partition": "output",
+        "relation": "subset",
+        "subset_of": "billed_output_total"
+      },
+      "source": {
+        "adapter_version": "openai-compat/fixture-v1",
+        "source_id": "openai",
+        "source_schema": "openai-usage/v1"
+      },
+      "state": "unknown",
+      "unit_ref": {
+        "state": "known",
+        "value": {
+          "unit_id": "token",
+          "version": "1"
+        }
+      }
+    },
+    "unallocated": {
+      "calculation": {
+        "operation": "copy_residual",
+        "source_fields": []
+      },
+      "method": "executor_usage",
+      "reason": "provider-does-not-report-field",
+      "semantics": {
+        "aggregation": "sum_usage_deltas",
+        "relation": "residual"
+      },
+      "source": {
+        "adapter_version": "openai-compat/fixture-v1",
+        "source_id": "openai",
+        "source_schema": "openai-usage/v1"
+      },
+      "state": "unknown",
+      "unit_ref": {
+        "state": "known",
+        "value": {
+          "unit_id": "token",
+          "version": "1"
+        }
+      }
+    }
+  },
+  "quantity_kind": "usage_delta",
+  "role": "author",
+  "schema_version": 1,
+  "turn": 1
+}

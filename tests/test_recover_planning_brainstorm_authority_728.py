@@ -202,6 +202,47 @@ def test_recover_phase_and_gate_refs_matrix(
     assert after.brainstorm_required == before.brainstorm_required
 
 
+@pytest.mark.parametrize("crash_point", ["before-registry-commit", "after-registry-commit"])
+def test_recover_planning_crash_restart_replays_one_immutable_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_point: str
+) -> None:
+    """持久化前後 crash 都可由 fresh registry 重送同一正式 action。"""
+
+    run_id, registry, state, snapshot = _seed(
+        tmp_path, brainstorm_required=False
+    )
+    original_update = registry._manager_update_workflow_run
+
+    def crash_at_registry_commit(target_run_id, **fields):
+        if crash_point == "before-registry-commit":
+            raise RuntimeError("injected crash before registry commit")
+        original_update(target_run_id, **fields)
+        raise RuntimeError("injected crash after registry commit")
+
+    monkeypatch.setattr(registry, "_manager_update_workflow_run", crash_at_registry_commit)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        _recover(run_id, registry, state, snapshot)
+
+    monkeypatch.undo()
+    restarted = JobRegistry(state_path=registry._state_path)
+    result = _recover(run_id, restarted, state, snapshot)
+    run = restarted.get_workflow_run(run_id)
+
+    assert run.current_phase == "plan"
+    assert "needs_human" not in run.facets
+    assert result["reason"] in {"planning-recovery-dispatched", "already-recovered"}
+    records = [
+        path
+        for path in (tmp_path / "evidence" / "planning-recovery").glob("*.json")
+        if json.loads(path.read_text(encoding="utf-8")).get("schema")
+        == "cortex-work-planning-recovery/v1"
+    ]
+    assert len(records) == 1
+    record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert record["schema"] == "cortex-work-planning-recovery/v1"
+    assert record["run_id"] == run_id
+
+
 # ==========================================================================
 # 段 2：迴歸釘住——recover 的出口狀態 ≡ reconciliation 的合法入口狀態
 # ==========================================================================

@@ -80,6 +80,10 @@ work item commands:
   review-disposition  裁決已 resolved 的 exact-HEAD ship finding
   ship      執行 fail-closed delivery state machine
 
+recovery actions `retry-build`、`retry-verify`、`retry-review` 與
+`recover-repair-commit` 可使用 `--expected-candidate` 提供 exact Candidate SHA CAS；
+JSON payload 若同時提供此欄位，值必須相同。
+
 `cortex stat --combo-selections` 可彙總自動選牌／override／bypass 的來源與 task_type。
 
 claim 前置條件（intake／start 共用）：work item 必須先進到 lifecycle `todo`

@@ -12,6 +12,12 @@ artifact_classes:
 
 # Execution profile 契約 Todo
 
+## Owner ruling for issue #835
+
+原 intake boundary 下方記載「本 intake 不實作」；本 worktree 的明確 owner 裁決要求依 issue #835 原始 A1–A6 完整實作 refine 功能群，故該邊界不限制本次 source/tests delivery。此裁決不轉移 #842 qualification lifecycle、#581 producer 或 PatchMUD #37 immutable fixture 的 owner，也不構成 installed/live runtime 核可。schema-core 沿用，不重寫。
+
+本次在 worktree 完成 adapter/schema-core 接線、resolver/launcher/manager/generic dispatch/planning consumer、versioned WorkflowRun sibling、#835 AC regression tests 與文件/changelog。#842 exact-profile qualification 尚無正式 producer receipt 時，sized dispatch 維持 fail-closed；PatchMUD #37、installed launcher 與真人/live 驗收仍待外部證據。此記錄不代表 commit、PR、merge 或 deployed 狀態。
+
 ## Authority
 
 Issue [#835](https://github.com/hamanpaul/paulsha-cortex/issues/835)，parent #829，

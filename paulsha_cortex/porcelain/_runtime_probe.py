@@ -114,8 +114,10 @@ def _unit_pid(unit_name: str, live_rows: Mapping[str, Mapping[str, Any]]) -> int
     return pid if pid > 0 else None
 
 
-def probe_service_runtime(instance: str) -> dict[str, Any]:
-    home = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+def probe_service_runtime(
+    instance: str, *, home: Path | None = None
+) -> dict[str, Any]:
+    home = (home or Path(os.environ.get("HOME", str(Path.home())))).expanduser()
     unit_root = home / ".config" / "systemd" / "user"
     unit_names = (
         f"{instance}-manager.service",

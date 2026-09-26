@@ -20,6 +20,7 @@ from .coordinator.diagnostics import (
     DiagnosticReason,
     diagnostic_reason,
 )
+from .config.runtime import resolve_runtime_root
 from .github_rate_limit import is_rate_limit_signal
 from .monitor.socket_path import socket_path_fits, socket_path_limit_detail
 
@@ -39,6 +40,7 @@ class ProbeResult:
     detail: str
     required: bool
     diagnostic_reason: DiagnosticReason | None = None
+    context: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in {"pass", "warn", "fail"}:
@@ -61,6 +63,8 @@ class ProbeResult:
         }
         if self.diagnostic_reason is not None:
             payload["diagnostic_reason"] = self.diagnostic_reason.to_dict()
+        if self.context is not None:
+            payload["context"] = dict(self.context)
         return payload
 
 
@@ -80,7 +84,14 @@ class DoctorReport:
         }
 
 
-def _probe_result(name: str, status: str, detail: str, required: bool) -> ProbeResult:
+def _probe_result(
+    name: str,
+    status: str,
+    detail: str,
+    required: bool,
+    *,
+    context: Mapping[str, object] | None = None,
+) -> ProbeResult:
     structured_reason = None
     if status != "pass":
         structured_reason = diagnostic_reason(
@@ -94,6 +105,117 @@ def _probe_result(name: str, status: str, detail: str, required: bool) -> ProbeR
         detail=detail,
         required=required,
         diagnostic_reason=structured_reason,
+        context=context,
+    )
+
+
+def _loaded_runtime_probe(
+    *, instance: str, environment: Mapping[str, str]
+) -> ProbeResult:
+    from .runtime_attestation import (
+        artifact_identity,
+        cli_runtime_observation,
+        manager_environment_revision,
+        monitor_configuration_revision_from_environment,
+        runtime_status_report,
+        service_declaration_projection,
+    )
+    from .porcelain._runtime_probe import probe_service_runtime
+
+    try:
+        manager_root = resolve_runtime_root(
+            "PSC_COORDINATOR_ROOT", environment=environment
+        )
+        monitor_root = resolve_runtime_root(
+            "PSC_MONITOR_STATE_ROOT", environment=environment
+        )
+        current = artifact_identity()
+        operator_cli = cli_runtime_observation(
+            instance=instance,
+            environment=environment,
+            artifact=current,
+        )
+        service_runtime = probe_service_runtime(
+            instance,
+            home=Path(environment.get("HOME", str(Path.home()))),
+        )
+        units = service_runtime.get("units", {})
+        service_declaration = service_declaration_projection(
+            units, instance=instance
+        )
+        manager_artifact = service_declaration["manager"].get("artifact")
+        monitor_artifact = service_declaration["monitor"].get("artifact")
+
+        def unit_pid(unit_name: str) -> int | None:
+            row = units.get(unit_name) if isinstance(units, Mapping) else None
+            pid = row.get("pid") if isinstance(row, Mapping) else None
+            return pid if type(pid) is int else None
+
+        manager = runtime_status_report(
+            manager_root,
+            service="manager",
+            instance=instance,
+            declared_config_revision=manager_environment_revision(environment),
+            declared_config_component="environment_revision",
+            expected_pid=unit_pid(f"{instance}-manager.service"),
+            require_process_match=True,
+            current_artifact=(
+                manager_artifact
+                if isinstance(manager_artifact, Mapping)
+                else {"kind": "unknown"}
+            ),
+        )
+        monitor = runtime_status_report(
+            monitor_root,
+            service="monitor",
+            instance=instance,
+            declared_config_revision=monitor_configuration_revision_from_environment(
+                environment
+            ),
+            expected_pid=unit_pid(f"{instance}-monitor.service"),
+            require_process_match=True,
+            current_artifact=(
+                monitor_artifact
+                if isinstance(monitor_artifact, Mapping)
+                else {"kind": "unknown"}
+            ),
+        )
+    except Exception:  # noqa: BLE001 — 宣告無法讀取時維持 unknown。
+        context: Mapping[str, object] = {
+            "operator_cli": (
+                operator_cli
+                if "operator_cli" in locals()
+                else {"status": "unknown", "instance": instance}
+            ),
+            "service_declaration": service_declaration_projection(None, instance=instance),
+            "manager": {"status": "unknown", "reason": "runtime-declaration-unavailable"},
+            "monitor": {"status": "unknown", "reason": "runtime-declaration-unavailable"},
+        }
+        return _probe_result(
+            "loaded-runtime",
+            "warn",
+            "loaded artifact/config identity is unknown",
+            False,
+            context=context,
+        )
+    context = {
+        "operator_cli": operator_cli,
+        "service_declaration": service_declaration,
+        "manager": manager,
+        "monitor": monitor,
+    }
+    status = (
+        "pass"
+        if manager.get("status") == "match" and monitor.get("status") == "match"
+        else "warn"
+    )
+    detail = (
+        "loaded artifact/config identity matches current declarations"
+        if status == "pass"
+        else "loaded artifact/config identity is drifted or unknown"
+    )
+    return _probe_result(
+        "loaded-runtime", status, detail, False, context=context
     )
 
 
@@ -1283,6 +1405,10 @@ def run_doctor(
         _shared_project_config_root_probe(effective, home=home_path, instance=instance),
         state_probe,
         socket_probe,
+        _loaded_runtime_probe(
+            instance=instance,
+            environment=effective,
+        ),
     ]
     if not probe_live:
         probes.extend(
@@ -1341,7 +1467,7 @@ def run_doctor(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="cortex doctor",
-        description="檢查 unified lifecycle 的本機設定；--probe-live 會執行 gh、agy 與 Monitor socket probes。",
+        description="檢查 Monitor socket 與已載入 runtime 身分；--probe-live 會執行 gh、agy probes。",
     )
     parser.add_argument(
         "--probe-live",

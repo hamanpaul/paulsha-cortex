@@ -25,6 +25,7 @@ from uuid import uuid4
 from paulsha_cortex.config import paths
 from paulsha_cortex._yaml import safe_load
 from paulsha_cortex.github_rate_limit import is_rate_limit_signal
+from paulsha_cortex.recovery_action_contracts import WORK_ACTIONS
 
 from .diagnostics import diagnostic_reason
 from .claim import (
@@ -5167,6 +5168,34 @@ def _validate_abandon_evidence_target(
         raise RuntimeError(f"workflow {label} evidence conflict")
 
 
+def _existing_supersede_evidence(
+    body: dict[str, Any],
+    *,
+    state_path: Path,
+    subdir: str,
+    label: str,
+    max_size: int = 4096,
+) -> dict[str, str] | None:
+    """Return an exact existing content-addressed audit without writing it."""
+
+    digest = verification.canonical_json_hash(body)
+    root = state_path.resolve().parent / "evidence" / subdir
+    target = root / f"{body['run_id']}-{digest}.json"
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise RuntimeError(f"workflow {label} evidence conflict") from error
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    _validate_abandon_evidence_target(
+        target, content, label=label, max_size=max_size
+    )
+    return {"ref": str(target), "hash": digest}
+
+
 # #776：helper 下沉至 claim.py 供 work_bridge 的 ship 守衛共用（work_bridge
 # 不能反向 import 本模組）；底線別名保留既有呼叫點與測試的引用名。
 _planning_declared_openspec_changes = claim_planning_declared_openspec_changes
@@ -5920,9 +5949,9 @@ def _recover_superseded_action(
     只受理「有 candidate_head、pr_refs 非空、phase 停在 verify/review、同
     (repo, work_id) 無 ongoing run、無 active job」的 superseded run——即
     build 成果與 PR 都在、只是識別鏈斷裂被錯誤作廢的那種。動作＝status 復歸
-    ongoing 後立即走 official ``_manager_reset_workflow_for_authority_restart``
-    （#216 AC5 語意：verify/review 打回 pending、claim_key/source_revision 對齊
-    現 authority、build/candidate/PR 保留），不發明第三種恢復語意。
+    由 registry 單一 revision-CAS transition 同時恢復 status 與 official
+    authority-restart 語意（#216 AC5：verify/review 打回 pending、
+    claim_key/source_revision 對齊現 authority、build/candidate/PR 保留）。
     """
 
     from .registry import ACTIVE_JOB_STATUSES
@@ -5965,6 +5994,31 @@ def _recover_superseded_action(
     if len(exact) != 1:
         raise RuntimeError("recover-superseded expected WorkflowRun CAS mismatch")
     run = exact[0]
+    authority_digest = work_authority_digest(authority)
+    body = {
+        "schema": "cortex-work-recover-superseded/v1",
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "run_id": run.run_id,
+        "authority_digest": authority_digest,
+        "actor": actor,
+        "reason": reason,
+    }
+    record = _existing_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="work-recover-superseded",
+        label="recover-superseded",
+    )
+    if record is not None and record["ref"] in run.evidence_refs:
+        return {
+            "action": "recovered-superseded",
+            "actor": actor,
+            "reason": reason,
+            "expected_run_id": expected_run_id,
+            "evidence": record,
+            "run": run.to_dict(),
+        }
     if run.status != "superseded":
         raise RuntimeError("recover-superseded requires superseded run")
     if not run.candidate_head or not run.pr_refs:
@@ -5981,33 +6035,19 @@ def _recover_superseded_action(
         for job in workflow_registry.list_jobs()
     ):
         raise RuntimeError("recover-superseded refuses active workflow job")
-    body = {
-        "schema": "cortex-work-recover-superseded/v1",
-        "repo": authority.repo,
-        "work_id": authority.work_id,
-        "run_id": run.run_id,
-        "authority_digest": work_authority_digest(authority),
-        "actor": actor,
-        "reason": reason,
-    }
-    record = _write_supersede_evidence(
-        body,
-        state_path=state_path,
-        subdir="work-recover-superseded",
-        label="recover-superseded",
-    )
-    # 兩步走：先復歸 ongoing 並剝掉 supersede 迴圈附加的 blocked facet（保留
-    # needs_human facet＋理由，維持 `_resolve_needs_human_reason` 的 facet⟷理由
-    # invariant），再交給 official restart 一步清 needs_human 並打回 verify。
-    restored_run = workflow_registry._manager_update_workflow_run(
+    if record is None:
+        record = _write_supersede_evidence(
+            body,
+            state_path=state_path,
+            subdir="work-recover-superseded",
+            label="recover-superseded",
+        )
+    updated = workflow_registry._manager_recover_superseded_workflow_run(
         run.run_id,
-        status="ongoing",
-        facets=tuple(facet for facet in run.facets if facet != "blocked"),
-    )
-    updated = workflow_registry._manager_reset_workflow_for_authority_restart(
-        run.run_id,
-        expected_run=restored_run,
-        authority_digest=work_authority_digest(authority),
+        expected_run=run,
+        authority_digest=authority_digest,
+        evidence_ref=record["ref"],
+        evidence_hash=record["hash"],
     )
     return {
         "action": "recovered-superseded",
@@ -9255,17 +9295,7 @@ def execute_work_action(
     action = args.get("action")
     repo = args.get("repo")
     work_id = args.get("work_id")
-    if action not in {
-        "link", "unlink", "start", "resume", "retry-build", "retry-card",
-        "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
-        "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
-        "close-delivered",
-        "recover-superseded",
-        "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
-        "verify-attest",
-        "review-disposition",
-        "intake",
-    }:
+    if action not in WORK_ACTIONS:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
     if not isinstance(work_id, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
