@@ -674,6 +674,11 @@ source 與 reason；TTL 內直接採信，逾期的 degraded **不會**被當成
 | `stale_snapshot` | 快照逾期且無法探測，需刷新 | 否 |
 | `probe_inconclusive` | 探測 timeout／額度耗盡／無定論 | 否 |
 
+degraded 的 Monitor provider snapshot 與 runtime preflight provider freshness 另帶
+`diagnostic_reason` 物件，提供機器可讀 `reason`、人可讀 `detail` 與來源 `source`；
+`cortex doctor --json` 的非 pass probe 也以相同欄位呈現理由。這些診斷不改變原有
+status、hard block 或 reroute 判定。
+
 live probe 以 provider identity 為鍵共用 TTL 快取與 rate-limit 額度（沿用
 `claim_readiness` 的 `LiveProbeCache` 模式），同批次多張 card 對同一 provider 只探測
 一次。preflight 失敗時，Manager 會在既有 identity 順序與 independence domain 規則內

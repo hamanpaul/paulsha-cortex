@@ -10498,6 +10498,16 @@ def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> ob
     except ValueError:
         return None
     reason = "; ".join(provider.diagnostics) if provider.diagnostics else None
+    structured_reason = provider.diagnostic_reason
+    if provider.status == "degraded" and structured_reason is None:
+        # 舊 snapshot 沒有此 optional 欄位時維持降級狀態，並在 preflight 投影補上
+        # 通用結構化理由；不從自由文字推導或改判 provider 狀態。
+        structured_reason = diagnostic_reason(
+            "provider-degraded",
+            "provider snapshot is degraded",
+            source="coordinator.manager._monitor_provider_snapshot_lookup",
+            provider_id=provider.provider_id,
+        )
     return ProviderFreshness(
         provider_id=provider.provider_id,
         status=provider.status,
@@ -10505,6 +10515,7 @@ def _monitor_provider_snapshot_lookup(provider_id: str, *, snapshot_store) -> ob
         ttl_seconds=DEFAULT_PROVIDER_TTL_SECONDS,
         source="monitor-snapshot",
         reason=reason,
+        diagnostic_reason=structured_reason,
     )
 
 
@@ -10532,6 +10543,12 @@ def _executor_auth_snapshot_lookup(provider_id: str) -> object | None:
         ttl_seconds=EXECUTOR_AUTH_TTL_SECONDS,
         source="cold-start",
         reason="no prior executor auth probe",
+        diagnostic_reason=diagnostic_reason(
+            "executor-auth-not-probed",
+            "no prior executor auth probe",
+            source="coordinator.manager._executor_auth_snapshot_lookup",
+            executor=provider_id,
+        ),
     )
 
 
@@ -10685,6 +10702,12 @@ def _runtime_preflight_gate(
                             ttl_seconds=runtime_preflight.DEFAULT_PROVIDER_TTL_SECONDS,
                             source="executor-backoff",
                             reason=f"retry_after_epoch={retry_after}",
+                            diagnostic_reason=diagnostic_reason(
+                                "executor-auth-backoff",
+                                f"executor authentication probe paused until epoch {retry_after}",
+                                source="coordinator.manager._runtime_preflight_gate",
+                                executor=provider_id,
+                            ),
                         ),
                     )
                 )

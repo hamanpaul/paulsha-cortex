@@ -634,6 +634,7 @@
 - **#564 gate ledger 與 completion sentinel 競態**：plain 與 publishing wrapper 都先保存模型 exit code，gate ledger writer 返回後才寫 sentinel，避免 harvest 在 gate 執行期間因 ledger 尚未落地而誤判終局；結束時仍還原模型 exit code，缺少 ledger 時維持 fail-closed。
 - **#600 overlay Copilot 模型可用性**：dispatch 建立 Job 前以限時短 prompt 探測 overlay 選出的模型；明確不可用時 reroute，CLI 無法判定時記錄診斷並照常派工。
 - **#556 worktree-isolation 不再提早綁定 Candidate**：`commit_policy=forbidden` 的 isolation 卡通過採信後維持 null candidate；第一張允許 commit 的 builder 卡採信後才綁定 exact HEAD，保留 `recover-pre-candidate` 的前置條件。
+- **#573 degraded 理由 invariant**：Monitor provider、runtime preflight 與 doctor 的 degraded／非 pass 輸出現在附帶既有 `DiagnosticReason` 的 reason、detail、source；新增 AST 掃描 invariant 與各路徑回歸測試，原有狀態判定不變。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加

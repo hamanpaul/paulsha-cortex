@@ -1,21 +1,20 @@
-"""診斷 invariant 家族：#527／#514／#515／#511／#482 一次收編。
+"""診斷 invariant 家族：#527／#514／#515／#511／#482／#573 一次收編。
 
 0813–0814 五次獨立命中同一條 invariant 的缺口，逐案補洞已證明無效。本檔把
 invariant 本身變成測試對象：
 
-> 任何把 run 轉入 ``needs_human``、把 evidence 標為 absent 的狀態變更，必須
-> 同時落一份結構化理由（機器可讀 reason ＋ 人可讀 detail ＋ 來源位置）到 run
-> 或 evidence，並可由 ``cortex status``／``work show`` 曝光。
+> 把 run 轉入 ``needs_human``、把 evidence 標為 absent，或將 provider／preflight／
+> doctor probe 標為 degraded 的狀態變更，必須同時提供結構化理由（機器可讀 reason
+> ＋ 人可讀 detail ＋ 來源位置）。
 
 三層測試：
 
-1. **掃描式 invariant**（``test_every_needs_human_setter_supplies_a_reason``）——
-   AST 枚舉全庫所有把 ``needs_human`` 寫進 facets 的設置點，斷言每一個都同時
-   帶 ``needs_human_reason``。新增一個忘了帶理由的設置點會在這裡炸，不必等到
-   dogfooding 現場。
+1. **掃描式 invariant**——AST 枚舉全庫把 ``needs_human`` 寫進 facets 的設置點，
+   以及 Monitor provider、runtime preflight、doctor 的 degraded／非 pass 輸出；
+   新出口漏帶結構化理由時測試失敗。
 2. **執行期強制**——registry 的狀態轉移 API 對「沒帶理由」fail-closed，對
    「清了 facet」自動清理由。
-3. **五張 issue 的原始現場**各自成為 fixture。
+3. **issue 的原始現場**各自成為 fixture。
 """
 
 from __future__ import annotations
@@ -26,7 +25,9 @@ from pathlib import Path
 
 import pytest
 
+from paulsha_cortex import doctor
 from paulsha_cortex.coordinator import manager, manager_daemon, review
+from paulsha_cortex.coordinator import runtime_preflight
 from paulsha_cortex.coordinator.diagnostics import (
     DiagnosticInvariantError,
     DiagnosticReason,
@@ -40,6 +41,7 @@ from paulsha_cortex.coordinator.planning import (
 )
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowRun, WorkflowStep
+from paulsha_cortex.monitor.providers import RepoWorkProvider
 
 from diagnostic_fixtures import fixture_needs_human_reason
 
@@ -143,6 +145,55 @@ def _needs_human_setter_sites(source_root: Path = PACKAGE_ROOT) -> list[tuple[Pa
     return sites
 
 
+def _degraded_setter_kind(call: ast.Call) -> str | None:
+    """找出 provider、preflight 與 doctor 的 degraded 輸出建構點。"""
+
+    func = call.func
+    name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+    status = next(
+        (keyword.value for keyword in call.keywords if keyword.arg == "status"),
+        None,
+    )
+    if status is None and name == "ProbeResult" and len(call.args) >= 2:
+        status = call.args[1]
+    if status is None:
+        return None
+    if (
+        name == "replace"
+        and isinstance(status, ast.Constant)
+        and status.value == "degraded"
+    ):
+        return "replace"
+    if not isinstance(status, ast.Constant) or not isinstance(status.value, str):
+        # Manager 會把 provider snapshot 的動態狀態帶進 preflight；這些出口也
+        # 必須有結構化理由欄位，不能只掃得到字面值 degraded 的分支。
+        if name in {"ProviderFreshness", "ProbeResult"}:
+            return name
+        return None
+    if name in {"ProviderSnapshot", "ProviderFreshness"} and status.value == "degraded":
+        return name
+    if name == "ProbeResult" and status.value != "pass":
+        return name
+    return None
+
+
+def _degraded_setter_sites(source_root: Path = PACKAGE_ROOT) -> list[tuple[Path, ast.Call, str]]:
+    sites: list[tuple[Path, ast.Call, str]] = []
+    for path in sorted(source_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            kind = _degraded_setter_kind(node)
+            if kind is not None:
+                sites.append((path, node, kind))
+    return sites
+
+
+def _supplies_diagnostic_reason(call: ast.Call) -> bool:
+    return any(keyword.arg == "diagnostic_reason" for keyword in call.keywords)
+
+
 def test_scan_finds_the_known_needs_human_setters() -> None:
     """掃描器本身必須真的掃得到東西——否則上面那條 invariant 是空的通過。"""
 
@@ -204,6 +255,105 @@ def test_the_scan_actually_catches_a_missing_reason(tmp_path: Path) -> None:
     assert flagged == {"offender.py"}
     # 「把 needs_human 濾掉」的形態不得被誤判為設置點。
     assert "filtering.py" not in {path.name for path, _ in sites}
+
+
+def test_scan_finds_the_known_degraded_setters() -> None:
+    sites = _degraded_setter_sites()
+    assert len(sites) >= 10, sites
+    files = {path.name for path, _, _ in sites}
+    assert "providers.py" in files
+    assert "work_api.py" in files
+    assert "doctor.py" in files
+    assert "manager.py" in files
+    assert "executor_auth.py" in files
+
+
+def test_every_degraded_setter_supplies_a_diagnostic_reason() -> None:
+    offenders = [
+        f"{path.relative_to(PACKAGE_ROOT.parent)}:{node.lineno} ({kind})\n{ast.unparse(node)[:300]}"
+        for path, node, kind in _degraded_setter_sites()
+        if not _supplies_diagnostic_reason(node)
+    ]
+    assert offenders == [], "以下 degraded 設置點未提供 DiagnosticReason：\n" + "\n\n".join(
+        offenders
+    )
+
+
+def test_degraded_reason_scan_catches_missing_provider_preflight_and_doctor_reasons(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "setters.py"
+    source.write_text(
+        "ProviderSnapshot(provider_id='repo:x', status='degraded')\n"
+        "ProviderFreshness(provider_id='x', status='degraded')\n"
+        "ProbeResult('gh-auth', 'fail', 'failed', True)\n"
+        "replace(snapshot, status='degraded')\n",
+        encoding="utf-8",
+    )
+    sites = _degraded_setter_sites(tmp_path)
+    assert {kind for _, _, kind in sites} == {
+        "ProviderSnapshot",
+        "ProviderFreshness",
+        "ProbeResult",
+        "replace",
+    }
+    assert all(not _supplies_diagnostic_reason(node) for _, node, _ in sites)
+
+
+def test_monitor_provider_failure_exposes_diagnostic_reason(tmp_path: Path) -> None:
+    provider = RepoWorkProvider(tmp_path, repo="example/repo")
+
+    def fail_scan():
+        raise OSError("scan unavailable")
+
+    provider._scan_sources = fail_scan  # type: ignore[method-assign]
+    result = provider.scan()
+
+    assert result.status == "degraded"
+    assert result.diagnostic_reason.reason == "repo-scan-unavailable"
+    assert result.diagnostic_reason.detail == "repo scan unavailable: OSError"
+    assert result.diagnostic_reason.source == "monitor.RepoWorkProvider.scan"
+    assert result.to_dict()["diagnostic_reason"] == result.diagnostic_reason.to_dict()
+
+
+def test_doctor_failure_exposes_diagnostic_reason() -> None:
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "invalid credential"
+
+    probe = doctor._gh_auth_probe(lambda *_args, **_kwargs: Result())
+
+    assert probe.status == "fail"
+    assert probe.diagnostic_reason.reason == "doctor-gh-auth-fail"
+    assert probe.diagnostic_reason.detail == probe.detail
+    assert probe.diagnostic_reason.source == "doctor.probe:gh-auth"
+    assert probe.to_dict()["diagnostic_reason"] == probe.diagnostic_reason.to_dict()
+
+
+def test_runtime_preflight_preserves_provider_diagnostic_reason() -> None:
+    reason = diagnostic_reason(
+        "github-rate-limited",
+        "GitHub rate limit exceeded",
+        source="tests.runtime_preflight",
+    )
+    outcome, _detail, freshness = runtime_preflight._resolve_provider_freshness(
+        "github:example/repo",
+        snapshot_lookup=lambda _provider_id: runtime_preflight.ProviderFreshness(
+            provider_id="github:example/repo",
+            status="degraded",
+            observed_at=100.0,
+            reason="GitHub rate limit exceeded",
+            diagnostic_reason=reason,
+        ),
+        provider_prober=None,
+        budget=None,
+        now=110.0,
+    )
+
+    assert outcome is runtime_preflight.PreflightOutcome.PROVIDER_UNAVAILABLE
+    assert freshness is not None
+    assert freshness.to_dict()["diagnostic_reason"] == reason.to_dict()
 
 
 # ---------------------------------------------------------------------------

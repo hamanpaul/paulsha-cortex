@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from paulsha_cortex.control import constants, contract
+from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.doctor import DoctorReport, ProbeResult
 
@@ -375,7 +376,17 @@ def test_inspect_doctor_human_and_json_report_same_probe_summary(
     report = DoctorReport(
         (
             ProbeResult("service-paths", "pass", "effective service environment is valid", True),
-            ProbeResult("gh-auth", "warn", "live probe skipped", False),
+            ProbeResult(
+                "gh-auth",
+                "warn",
+                "live probe skipped",
+                False,
+                diagnostic_reason=diagnostic_reason(
+                    "doctor-gh-auth-warn",
+                    "live probe skipped",
+                    source="doctor.probe:gh-auth",
+                ),
+            ),
         )
     )
     monkeypatch.setattr(doctor_module, "run_doctor", lambda **_kwargs: report)
