@@ -414,6 +414,76 @@ def test_template_plan_matches_the_generated_template_unit() -> None:
     assert build_job_unit(TWO_WAY_SCHEME, DEFAULT_LAYOUT).unit_name == "cortex-job@.service"
 
 
+@pytest.mark.parametrize("profile", permgen.HARDENING_PROFILES, ids=lambda p: p.profile_id)
+def test_read_only_builder_template_removes_worktree_write_mount_only(profile) -> None:
+    """A forbidden-write card gets an outer RO mount while normal builders stay writable."""
+    writable = build_job_unit(
+        TWO_WAY_SCHEME, DEFAULT_LAYOUT, profile=profile
+    )
+    readonly = build_job_unit(
+        TWO_WAY_SCHEME,
+        DEFAULT_LAYOUT,
+        profile=profile,
+        workspace_read_only=True,
+    )
+    worktree = f"{DEFAULT_LAYOUT.worktree_root}/%i"
+    source_repos = DEFAULT_LAYOUT.repo_source_root
+
+    assert writable.unit_name == f"cortex-job{profile.unit_suffix}@.service"
+    assert readonly.unit_name == f"cortex-job-ro{profile.unit_suffix}@.service"
+    assert readonly.account == "cortex-builder"
+    assert "ProtectSystem=strict\n" in readonly.content
+    assert worktree in writable.read_write_paths
+    assert worktree not in readonly.read_write_paths
+    assert source_repos not in readonly.read_write_paths
+    assert worktree in readonly.read_only_paths
+    assert source_repos in readonly.read_only_paths
+    assert f"ReadOnlyPaths={worktree}\n" in readonly.content
+    assert f"ReadOnlyPaths={source_repos}\n" in readonly.content
+
+    # ACL still grants the builder write access. The readonly guarantee must come
+    # from this unit's mount layout rather than silently depending on DAC changes.
+    workspace_asset = generate_plan(TWO_WAY_SCHEME).by_id("repo-worktree")
+    assert "cortex-builder" in generate_plan(TWO_WAY_SCHEME).all_writable_accounts(
+        workspace_asset
+    )
+
+    path_keys = {"ReadWritePaths", "ReadOnlyPaths"}
+    normal_directives = [
+        pair for pair in permgen._unit_service_directives(writable.content)
+        if pair[0] not in path_keys
+    ]
+    readonly_directives = [
+        pair for pair in permgen._unit_service_directives(readonly.content)
+        if pair[0] not in path_keys
+    ]
+    assert readonly_directives == normal_directives
+
+
+def test_reviewer_planner_template_has_no_writable_workspace_paths() -> None:
+    """Planner/reviewer cards use the reviewer-planner identity and no workspace RWP."""
+    reviewer = build_job_unit(
+        permgen.THREE_WAY_SCHEME,
+        DEFAULT_LAYOUT,
+        principal=Principal.REVIEWER,
+    )
+    worktree = f"{DEFAULT_LAYOUT.worktree_root}/%i"
+    source_repos = DEFAULT_LAYOUT.repo_source_root
+
+    assert reviewer.account == "cortex-reviewer-planner"
+    assert "User=cortex-reviewer-planner\n" in reviewer.content
+    assert "ProtectSystem=strict\n" in reviewer.content
+    assert worktree not in reviewer.read_write_paths
+    assert source_repos not in reviewer.read_write_paths
+    plan = generate_plan(permgen.THREE_WAY_SCHEME)
+    for asset_id in ("repo-source-tree", "planning-scratch-pool"):
+        workspace_asset = plan.by_id(asset_id)
+        assert "cortex-reviewer-planner" in workspace_asset.reader_accounts
+        assert "cortex-reviewer-planner" not in plan.all_writable_accounts(
+            workspace_asset
+        )
+
+
 @pytest.mark.parametrize("plan", ALL_PLANS, ids=lambda p: p.value)
 def test_polkit_rule_has_exactly_one_grant(plan) -> None:
     """審查者的一眼結論：全檔只有一個 YES 出口。"""

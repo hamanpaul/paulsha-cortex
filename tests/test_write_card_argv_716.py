@@ -33,8 +33,9 @@ headless `codex exec -s danger-full-access` 在真實加固面複本（54 條 pr
 請求，不需要 `--approve-for-me`。逐字證據在該列的
 `registry.SANDBOX_MODE_DERIVATION` note 與 PR body。
 
-OS 層語意（真的沒有內層、出口真的關著）由 `trust_root inner-sandbox-probe` 的
-a／b 兩段涵蓋，單 UID／無 systemd 的 CI 重現不了，不在此假驗。
+Trust Root template 的外層 OS 邊界由相容命令名 `trust_root inner-sandbox-probe`
+檢查加固鍵值、工作區寫入範圍與 egress；它不執行 Codex 內層沙箱命令，也不宣稱
+單 UID／無 systemd 的 CI 證明了真實 unit 或完整 agent loop。
 """
 from __future__ import annotations
 

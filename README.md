@@ -211,6 +211,15 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    同為**必填**，未宣告時 Manager 在派工前即 fail-closed。值由產生器導出，不要手打：
    `python3 -m paulsha_cortex.trust_root unit four-way --job | grep '^Environment=PATH='`。
 
+   **Codex 0.157 的 Trust Root 沙箱邊界（#716 選項 B）**：只有 launcher 成功完成
+   `systemd-template` preflight、確定本次命令會由 root-owned job template unit 執行時，
+   Codex argv 才使用 `--sandbox danger-full-access` 並省略 legacy Landlock 旗標。
+   0.157 在該 unit 下啟用 legacy Landlock 會因 app-server socket 隔離需求而 panic；停用
+   legacy 則預設 bubblewrap 因 namespace 權限被拒。此路徑的唯一安全邊界是外層 systemd
+   unit（含 `RestrictNamespaces=yes` 等既有加固及精確 `ReadWritePaths`）與既有 egress
+   proxy；不因停用內層沙箱而放寬任何 unit 鍵值。`direct` 與 transient `systemd-run`
+   沒有同一份 template 加固面，仍使用原先依卡片契約導出的內層 sandbox argv。
+
    **#823 headless session 的生命週期邊界**：每個合法 headless `Popen` 嘗試（含
    `systemd-run`／`systemd-template` 的 Manager-side client wrapper 與窄 `stdin` retry）都帶
    `start_new_session=True`。direct child 因此有自己的 POSIX session/process group；這是

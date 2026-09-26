@@ -13,10 +13,9 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                         [--external-reader-account <帳號名|none>]
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
     python -m paulsha_cortex.trust_root unit [four-way|three-way|two-way]
-                                        [--manager|--monitor|--egress-proxy
-                                         |--job|--review-job|--gate-job
-                                         |--job-properties]
-                                        [--profile strict|jit]
+                                        [--manager|--monitor|--egress-proxy|--job
+                                         |--review-job|--gate-job|--job-properties]
+                                        [--workspace-read-only] [--profile strict|jit]
                                                     # Phase 2b systemd unit 內容
                                                     # （--monitor＝monitor 的 system-level
                                                     #   unit：與 manager 同帳號、同加固段，
@@ -81,16 +80,12 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     # gate ledger 與 exit sentinel）。
                                                     # 同樣**不含任何 --setenv=**（D13）。
     python -m paulsha_cortex.trust_root inner-sandbox-probe [four-way|three-way|two-way] [codex]
-                                                    # #714：反向不變式的實機探針——
-                                                    # executor **自帶的內層沙箱**在
-                                                    # 真實加固面下裝不裝得上、以及它
-                                                    # 到底有沒有在擋。四個方向：不帶
-                                                    # 旗標必須仍失敗（外層沒被偷偷
-                                                    # 放寬）、旗標必須還存在（不得回
-                                                    # `Unknown feature flag`）、帶了
-                                                    # 就通、且寫工作區外／對外連線
-                                                    # 必須被擋。同樣**不含任何
-                                                    # --setenv=**（D13）。
+                                                    # #716：相容保留的命令名稱；
+                                                    # 現行 Codex 探針檢查 Trust Root
+                                                    # template 的外層加固／寫入／
+                                                    # egress 邊界。它不再執行 Codex
+                                                    # 內層沙箱命令，也不證明完整
+                                                    # agent loop。
     python -m paulsha_cortex.trust_root workspace-probe [four-way|three-way|two-way]
     python -m paulsha_cortex.trust_root git-trust-probe [four-way|three-way|two-way]
                                                     # #710：反向不變式的實機探針——
@@ -384,6 +379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         which = "manager"
         profile_id = permgen.DEFAULT_HARDENING_PROFILE.profile_id
         expect_profile = False
+        workspace_read_only = False
         for token in rest:
             if expect_profile:
                 if token not in permgen.HARDENING_PROFILES_BY_ID:
@@ -403,6 +399,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 which = "egress-proxy"
             elif token == "--job":
                 which = "job"
+            elif token == "--workspace-read-only":
+                workspace_read_only = True
             elif token == "--review-job":
                 which = "review-job"
             elif token == "--gate-job":
@@ -431,6 +429,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         scheme = permgen.SCHEMES[scheme_id]
         profile = permgen.HARDENING_PROFILES_BY_ID[profile_id]
+        if workspace_read_only and which != "job":
+            print("--workspace-read-only 只適用於 builder 的 --job", file=sys.stderr)
+            return 2
         if which == "job-properties":
             print("# 方案 A（systemd-run transient unit）的 --property= 建議清單。")
             print("# 與方案 B 的模板 unit 同源（同一加固表 ＋ 同一份登記表導出的 RWP）。")
@@ -441,7 +442,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(prop)
             return 0
         if which == "job":
-            print(permgen.build_job_unit(scheme, profile=profile).content, end="")
+            print(
+                permgen.build_job_unit(
+                    scheme,
+                    profile=profile,
+                    workspace_read_only=workspace_read_only,
+                ).content,
+                end="",
+            )
             return 0
         if which in ("review-job", "gate-job"):
             # #615 M2：reviewer＋planner 的模板（同一份，兩者同帳號）。

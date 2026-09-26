@@ -676,9 +676,19 @@ class PolkitReviewStemTests(unittest.TestCase):
         head = pattern[1 : -len(tail)]
         stems = permgen.job_unit_stems(LAYOUT, permgen.DOWNGRADED_JOB_PRINCIPALS)
         self.assertEqual(head, "(?:" + "|".join(stems) + ")")
-        self.assertEqual(len(stems), len(permgen.DOWNGRADED_JOB_PRINCIPALS) * len(
-            permgen.HARDENING_PROFILES
-        ))
+        self.assertEqual(
+            len(stems),
+            (
+                len(permgen.DOWNGRADED_JOB_PRINCIPALS)
+                + (
+                    1
+                    if permgen.Principal.BUILDER
+                    in permgen.DOWNGRADED_JOB_PRINCIPALS
+                    else 0
+                )
+            )
+            * len(permgen.HARDENING_PROFILES),
+        )
         for wildcard in (".*", "[^", "\\w", "+", "?", "|.", ".|"):
             self.assertNotIn(wildcard, head.replace("(?:", "").replace(")", ""), wildcard)
 

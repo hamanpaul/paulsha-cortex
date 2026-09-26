@@ -330,6 +330,7 @@ TEMPLATE_UNIT_ENV = "PSC_JOB_TEMPLATE_UNIT"
 TEMPLATE_UNIT_PREFIX = "cortex-job@"
 TEMPLATE_UNIT_SUFFIX = ".service"
 DEFAULT_TEMPLATE_UNIT = f"{TEMPLATE_UNIT_PREFIX}{TEMPLATE_UNIT_SUFFIX}"
+READ_ONLY_WORKSPACE_TEMPLATE_SUFFIX = "-ro"
 
 # ---------------------------------------------------------------------------
 # per-principal spec spool（#657）
@@ -2068,6 +2069,39 @@ def template_unit_for_profile(template: str, profile: str) -> str:
     return f"{stem}{suffix}@{TEMPLATE_UNIT_SUFFIX}"
 
 
+def template_unit_for_workspace_contract(
+    template: str, *, workspace_read_only: bool
+) -> str:
+    """Select the separately generated builder template for a no-worktree-write card.
+
+    The readonly template name is a deployment contract (`cortex-job-ro@.service`);
+    missing installations fail in the ordinary preflight and never fall back to the
+    writable builder template.
+    """
+
+    if not workspace_read_only:
+        return template
+    if not template.endswith(f"@{TEMPLATE_UNIT_SUFFIX}"):
+        raise _fail(
+            "job-runner-template-unit-invalid",
+            f"{TEMPLATE_UNIT_ENV} 必須是 `<name>@{TEMPLATE_UNIT_SUFFIX}` 形狀，收到 {template!r}",
+            source="template_unit_for_workspace_contract",
+            requested=template,
+        )
+    stem = template[: -len(f"@{TEMPLATE_UNIT_SUFFIX}")]
+    if stem.endswith(READ_ONLY_WORKSPACE_TEMPLATE_SUFFIX) or any(
+        profile_suffix and stem.endswith(profile_suffix)
+        for profile_suffix in TEMPLATE_UNIT_SUFFIX_BY_PROFILE.values()
+    ):
+        raise _fail(
+            "job-runner-template-unit-invalid",
+            f"唯讀工作區選擇器必須收到基底模板名，收到 {template!r}",
+            source="template_unit_for_workspace_contract",
+            requested=template,
+        )
+    return f"{stem}{READ_ONLY_WORKSPACE_TEMPLATE_SUFFIX}@{TEMPLATE_UNIT_SUFFIX}"
+
+
 def resolve_template_unit(env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDER) -> str:
     """該角色的**基底**模板 unit 名（未套加固剖面後綴前）。"""
 
@@ -3066,6 +3100,7 @@ def prepare_systemd_template(
     job_id: str,
     executor: str | None,
     role: str = JOB_ROLE_BUILDER,
+    workspace_read_only: bool = False,
     unit_active: Callable[[str, str], bool] | None = None,
 ) -> SystemdTemplatePlan:
     """模板派工的前置：解析 config、決定加固剖面、靜態 preflight、算 instance／unit／
@@ -3100,6 +3135,10 @@ def prepare_systemd_template(
     account = resolve_job_account(env, role=role)
     group = resolve_job_group(env, role=role)
     base_template = resolve_template_unit(env, role=role)
+    if workspace_read_only and role_config.role_id == JOB_ROLE_BUILDER:
+        base_template = template_unit_for_workspace_contract(
+            base_template, workspace_read_only=True
+        )
     profile = _resolve_profile_for_role(env, role=role, executor=executor)
     template = template_unit_for_profile(base_template, profile)
     shim = resolve_job_shim(env)
