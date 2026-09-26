@@ -130,6 +130,36 @@ def _pr_metadata(path: Path, *, title="fix(work): 修正工作流程", body="Clo
     return path
 
 
+def _seed_verified_run_with_gate(
+    registry: JobRegistry,
+    run_id: str,
+    *,
+    phase: str = "verify",
+    pr_refs: tuple[str, ...] = (),
+    facets: tuple[str, ...] = ("needs_human",),
+    verify_attempts: int = 2,
+) -> object:
+    for current in ("plan", "build", "verify", "review"):
+        if current == "review" and phase != "review":
+            break
+        registry._manager_update_workflow_run(run_id, current_phase=current)
+    attempts = {"claim": 1, "plan": 1, "build": 1, "verify": verify_attempts}
+    if phase == "review":
+        attempts["review"] = 1
+    return registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        pr_refs=pr_refs,
+        attempts=attempts,
+        evidence_refs=("reports/verify/accepted.md",),
+        gate_refs=(GateEvidenceRef("foreign-review", "reports/review/accepted.md", "e" * 64),),
+        gate_status="passed",
+        facets=facets,
+        needs_human_reason=fixture_needs_human_reason(),
+    )
+
+
 def _snapshot(
     path: Path,
     *,
@@ -1458,7 +1488,10 @@ def test_abandon_evidence_rejects_oversized_target_without_reading(
 def test_review_attest_writes_immutable_exact_head_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
     state = tmp_path / "runs.json"
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     started = work_actions.execute_work_action(
@@ -1470,17 +1503,38 @@ def test_review_attest_writes_immutable_exact_head_evidence(
         workflow_registry=registry,
     )
     run_id = started["result"]["run"]["run_id"]
-    for phase in ("plan", "build", "verify", "review"):
-        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    _seed_verified_run_with_gate(
+        registry,
+        run_id,
+        phase="review",
+        pr_refs=("acme/demo#8",),
+        facets=("needs_human", "degraded"),
+    )
+    plan_ref = "docs/superpowers/plans/demo.md"
+    plan_bytes = b"# Accepted plan\n"
+    plan_path = Path(registry.get_workflow_run(run_id).workspace_root) / plan_ref
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_bytes(plan_bytes)
     registry._manager_update_workflow_run(
         run_id,
-        candidate_head=HEAD,
-        verified_head=HEAD,
-        pr_refs=("acme/demo#8",),
-        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/foreign.json", "f" * 64),),
-        gate_status="passed",
-        facets=("needs_human", "degraded"),
-        needs_human_reason=fixture_needs_human_reason(),
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=plan_ref,
+                kind="plan",
+                work_id="demo",
+                baseline_sha256=hashlib.sha256(plan_bytes).hexdigest(),
+            ),
+        ),
+    )
+    original_claim = registry.get_workflow_run(run_id)
+    _snapshot(
+        snapshot,
+        source_revisions=(
+            "issue:12@open",
+            "openspec:demo@1",
+            f"superpowers_plan:acme/demo:{plan_ref}@identity:{plan_ref}",
+        ),
+        provider_revision="gh-2",
     )
 
     class GitHub:
@@ -1518,6 +1572,8 @@ def test_review_attest_writes_immutable_exact_head_evidence(
     review = next(ref for ref in persisted.gate_refs if ref.kind == "maintainer-review")
     assert review.ref == str(evidence)
     assert review.sha256 == first["result"]["hash"]
+    assert persisted.claim_key == original_claim.claim_key
+    assert persisted.source_revision == original_claim.source_revision
     assert persisted.facets == ("degraded",)
 
 
@@ -1807,7 +1863,11 @@ def test_source_change_starts_new_canonical_run(tmp_path: Path) -> None:
 def test_auto_scan_does_not_supersede_active_run_when_planning_adds_sources(
     tmp_path: Path,
 ) -> None:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        prs=(),
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
     state = tmp_path / "runs.json"
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     first = work_actions.execute_work_action(
@@ -1818,12 +1878,35 @@ def test_auto_scan_does_not_supersede_active_run_when_planning_adds_sources(
         now=lambda: 200,
         workflow_registry=registry,
     )
+    run_id = first["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    plan_ref = "docs/superpowers/plans/demo.md"
+    plan_bytes = b"# Accepted plan\n"
+    plan_path = Path(run.workspace_root) / plan_ref
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_bytes(plan_bytes)
+    registry._manager_update_workflow_run(
+        run_id,
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=plan_ref,
+                kind="plan",
+                work_id="demo",
+                baseline_sha256=hashlib.sha256(plan_bytes).hexdigest(),
+            ),
+        ),
+    )
+    before = _seed_verified_run_with_gate(
+        registry, run_id, verify_attempts=3
+    )
+    initial_job_count = len(registry.list_jobs())
     _snapshot(
         snapshot,
+        prs=(),
         source_revisions=(
             "issue:12@open",
             "openspec:demo@1",
-            "superpowers_plan:docs/demo.md@active",
+            f"superpowers_plan:acme/demo:{plan_ref}@identity:{plan_ref}",
         ),
         provider_revision="gh-2",
     )
@@ -1841,9 +1924,291 @@ def test_auto_scan_does_not_supersede_active_run_when_planning_adds_sources(
     )
 
     assert result[0]["action"] == "resume"
-    assert result[0]["run"]["run_id"] == first["result"]["run"]["run_id"]
+    assert result[0]["run"]["run_id"] == run_id
     assert len(registry.list_workflow_runs()) == 1
-    assert registry.list_workflow_runs()[0].status == "ongoing"
+    after = registry.get_workflow_run(run_id)
+    assert after.status == "ongoing"
+    assert after.claim_key == before.claim_key
+    assert after.source_revision == before.source_revision
+    assert after.current_phase == before.current_phase
+    assert after.candidate_head == before.candidate_head
+    assert after.verified_head == before.verified_head
+    assert after.steps == before.steps
+    assert after.attempts == before.attempts
+    assert after.evidence_refs == before.evidence_refs
+    assert after.gate_refs == before.gate_refs
+    assert after.gate_status == before.gate_status
+    assert after.needs_human_reason == before.needs_human_reason
+    assert len(registry.list_jobs()) == initial_job_count
+
+
+def test_resume_does_not_reset_gates_when_manager_pr_becomes_authority_source(
+    tmp_path: Path,
+) -> None:
+    original_sources = ("issue:12@open", "openspec:demo@1")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json", prs=(), source_revisions=original_sources
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    before = _seed_verified_run_with_gate(
+        registry, run_id, phase="review", pr_refs=("acme/demo#17",)
+    )
+    initial_job_count = len(registry.list_jobs())
+    pr_source = "github_pr:acme/demo#17@identity:acme/demo#17;state:open"
+    _snapshot(
+        snapshot,
+        prs=(17,),
+        source_revisions=(*original_sources, pr_source),
+        provider_revision="gh-2",
+    )
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["action"] == "resume"
+    assert result["result"]["run"]["run_id"] == run_id
+    after = registry.get_workflow_run(run_id)
+    assert after.claim_key == before.claim_key
+    assert after.source_revision == before.source_revision
+    assert after.current_phase == before.current_phase
+    assert after.candidate_head == before.candidate_head
+    assert after.verified_head == before.verified_head
+    assert after.steps == before.steps
+    assert after.attempts == before.attempts
+    assert after.gate_refs == before.gate_refs
+    assert after.evidence_refs == before.evidence_refs
+    assert after.needs_human_reason == before.needs_human_reason
+    assert len(registry.list_jobs()) == initial_job_count
+
+
+def test_resume_restarts_exactly_once_for_a_real_authority_change(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        prs=(),
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    before = _seed_verified_run_with_gate(registry, run_id)
+    _snapshot(
+        snapshot,
+        prs=(),
+        source_revisions=("issue:12@closed", "openspec:demo@1"),
+        provider_revision="gh-2",
+    )
+
+    first = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+    reset = registry.get_workflow_run(run_id)
+    second = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 220,
+        workflow_registry=registry,
+    )
+    settled = registry.get_workflow_run(run_id)
+
+    assert first["result"]["run"]["run_id"] == run_id
+    assert second["result"]["run"]["run_id"] == run_id
+    assert reset.claim_key == work_actions._expected_claim_key(
+        work_actions.load_work_authority(
+            repo="acme/demo", work_id="demo", snapshot_path=snapshot
+        )
+    )
+    assert reset.source_revision != before.source_revision
+    assert reset.attempts["verify"] == before.attempts["verify"] + 1
+    assert reset.gate_refs == ()
+    assert settled.attempts == reset.attempts
+    assert settled.gate_refs == reset.gate_refs
+
+
+def test_resume_does_not_exempt_foreign_planning_source_by_prefix(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        prs=(),
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    before = _seed_verified_run_with_gate(registry, run_id)
+    foreign_ref = "docs/superpowers/plans/foreign.md"
+    _snapshot(
+        snapshot,
+        prs=(),
+        source_revisions=(
+            "issue:12@open",
+            "openspec:demo@1",
+            f"superpowers_plan:acme/demo:{foreign_ref}@identity:{foreign_ref}",
+        ),
+        provider_revision="gh-2",
+    )
+
+    work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    after = registry.get_workflow_run(run_id)
+    assert after.source_revision != before.source_revision
+    assert after.attempts["verify"] == before.attempts["verify"] + 1
+    assert after.gate_refs == ()
+
+
+def test_resume_restarts_when_accepted_planning_bytes_drift(tmp_path: Path) -> None:
+    base_sources = ("issue:12@open", "openspec:demo@1")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json", prs=(), source_revisions=base_sources
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    ref = "docs/superpowers/plans/demo.md"
+    accepted_bytes = b"# Accepted plan\n"
+    path = Path(run.workspace_root) / ref
+    path.parent.mkdir(parents=True)
+    path.write_bytes(accepted_bytes)
+    registry._manager_update_workflow_run(
+        run_id,
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind="plan",
+                work_id="demo",
+                baseline_sha256=hashlib.sha256(accepted_bytes).hexdigest(),
+            ),
+        ),
+    )
+    before = _seed_verified_run_with_gate(registry, run_id)
+    path.write_bytes(b"# Drifted plan\n")
+    source = f"superpowers_plan:acme/demo:{ref}@identity:{ref}"
+    _snapshot(
+        snapshot,
+        prs=(),
+        source_revisions=(*base_sources, source),
+        provider_revision="gh-2",
+    )
+
+    work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    after = registry.get_workflow_run(run_id)
+    assert after.source_revision != before.source_revision
+    assert after.attempts["verify"] == before.attempts["verify"] + 1
+    assert after.gate_refs == ()
+
+
+@pytest.mark.parametrize("mismatch", ["pr-ref", "pr-candidate"])
+def test_resume_restarts_when_manager_pr_does_not_match_run_candidate(
+    tmp_path: Path, mismatch: str
+) -> None:
+    base_sources = ("issue:12@open", "openspec:demo@1")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json", prs=(), source_revisions=base_sources
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run_pr_refs = ("acme/demo#18",) if mismatch == "pr-ref" else ("acme/demo#17",)
+    before = _seed_verified_run_with_gate(
+        registry, run_id, phase="review", pr_refs=run_pr_refs
+    )
+    if mismatch == "pr-candidate":
+        registry._manager_update_workflow_run(run_id, verified_head="f" * 40)
+        before = registry.get_workflow_run(run_id)
+    source = "github_pr:acme/demo#17@identity:acme/demo#17;state:open"
+    _snapshot(
+        snapshot,
+        prs=(17,),
+        source_revisions=(*base_sources, source),
+        provider_revision="gh-2",
+    )
+
+    work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    after = registry.get_workflow_run(run_id)
+    assert after.source_revision != before.source_revision
+    assert after.attempts["verify"] == before.attempts["verify"] + 1
+    assert after.gate_refs == ()
 
 
 def test_canonical_claim_excludes_derived_sources_and_volatile_github_revisions(

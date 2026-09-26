@@ -628,6 +628,8 @@
 
 ### Fixed
 
+- **#847／#964／#965／#979／#980 self-publication drift**：同 run 已接受且 bytes 符合 baseline 的 planning publication，以及綁定 exact verified Candidate 的 Manager PR 納入 WorkAuthority 時保留 claim-era 與既有 gate；其他 authority 變更仍觸發 restart。
+
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、路徑逃逸、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用，內容驗收拒收維持
   content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
