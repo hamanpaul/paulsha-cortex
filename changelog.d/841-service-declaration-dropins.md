@@ -1,0 +1,1 @@
+#841 service declaration drop-ins：service declaration 現依主 unit 後的檔名字典序套用同層 drop-in，支援 `ExecStart=` 清除及 `/usr/bin/env` Python module 的 `PYTHONPATH` artifact 定位；unit digest 納入有序檔名與內容摘要。無法解析或安全讀取時 artifact fail-closed，並同步更新 loaded-runtime 文件與回歸測試。

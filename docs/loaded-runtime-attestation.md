@@ -18,7 +18,11 @@ cortex doctor --instance cortex --json
 `loaded_runtime` 把三種觀測分開：
 
 - `operator_cli`：目前這次 CLI 的 package/source digest、instance、安全環境 revision、PID 與觀測時間。從 checkout 執行時會標 `source-override`，不會偽裝成已安裝 wheel。
-- `service_declaration`：磁碟 unit 的狀態、PID、ExecStart path digest、unit file digest，以及可由 unit 宣告定位到的 Manager／Monitor 套件 artifact；不輸出 unit 內容或環境值。
+- `service_declaration`：磁碟 unit 的狀態、PID、有效 ExecStart path digest、unit file digest，以及可由 unit 宣告定位到的 Manager／Monitor 套件 artifact；不輸出 unit 內容或環境值。
+
+投影會先讀主 unit，再依檔名字典序套用同目錄的 `<unit>.d/*.conf`；這同時涵蓋 user unit 與 system unit。`ExecStart=` 空值會清除之前的命令，最後必須恰有一個有效命令才能辨識 artifact。`disk_unit_sha256` 以有序檔名和各檔內容摘要涵蓋主 unit 與 drop-in，因此 `WorkingDirectory=`、`Environment=` 等 drop-in 變更也會反映在摘要中。drop-in 讀取失敗、symlink、超過大小上限、無法解析或仍有多個有效 `ExecStart` 時，artifact 維持 `unknown`，不回退採用主 unit。
+
+Manager 的 `service-manager.sh` 與直接宣告 `<python> -m paulsha_cortex.monitor` 維持可辨識。由 `/usr/bin/env` 啟動的 Python module 命令也會辨識；若 env 前綴含 `PYTHONPATH`，只用其第一個路徑項目定位 `paulsha_cortex` 套件樹，否則依 Python executable 的 prefix 定位。輸出僅包含摘要與 artifact 欄位，不包含路徑或環境值。
 - `manager`／`monitor`：各 service 啟動 receipt、由 service declaration 定位的安裝 artifact、effective config 比對、目前 unit PID 比對，以及前次 process start 與 Trust Root receipt 摘要。
 
 `match` 要求 receipt 存在、目前 unit PID 與 receipt 相同，且 service 宣告 artifact/config 可比較。套件或 Monitor 有效配置與 receipt 不同時為 `drift`。Manager invocation 參數不能由目前 service declaration 確認時，該配置維持 unknown。checkout source override、缺漏／損壞 receipt、未知 schema、instance-root mismatch、缺少目前 PID 或未知 revision 都不會升成 match。status 命令本身只是唯讀 consumer，不會用磁碟 `VERSION` 重寫 loaded identity。

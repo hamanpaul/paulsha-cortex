@@ -31,6 +31,7 @@ _SECRET_KEY_RE = re.compile(
 )
 _MAX_RECEIPT_BYTES = 256 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
+_ENV_ASSIGNMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)\Z")
 
 
 class RuntimeAttestationError(ValueError):
@@ -141,15 +142,8 @@ def cli_runtime_observation(
     }
 
 
-def _read_small_unit_file(unit_path: str) -> bytes | None:
-    descriptor = -1
+def _read_small_unit_descriptor(descriptor: int) -> bytes | None:
     try:
-        descriptor = os.open(
-            unit_path,
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_RECEIPT_BYTES:
             return None
@@ -171,37 +165,208 @@ def _read_small_unit_file(unit_path: str) -> bytes | None:
         return bytes(content)
     except OSError:
         return None
+
+
+def _read_small_unit_file(unit_path: str) -> bytes | None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            unit_path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        return _read_small_unit_descriptor(descriptor)
+    except (OSError, UnicodeError, ValueError):
+        return None
     finally:
         if descriptor >= 0:
             os.close(descriptor)
 
 
-def _unit_exec_start(unit_bytes: bytes | None) -> list[str] | None:
-    if unit_bytes is None:
+def _read_unit_files(unit_path: str | None) -> list[tuple[str, bytes]] | None:
+    if not isinstance(unit_path, str) or not unit_path:
+        return None
+    main_path = Path(unit_path)
+    if not main_path.is_absolute():
         return None
     try:
-        lines = unit_bytes.decode("utf-8").splitlines()
+        main_path.name.encode("utf-8")
     except UnicodeError:
         return None
-    for raw in lines:
-        line = raw.strip()
-        if not line.startswith("ExecStart="):
-            continue
-        value = line.partition("=")[2].lstrip("-@:+!")
-        try:
-            arguments = shlex.split(value)
-        except ValueError:
+    main_bytes = _read_small_unit_file(unit_path)
+    if main_bytes is None:
+        return None
+
+    files = [(main_path.name, main_bytes)]
+    dropin_dir = main_path.with_name(f"{main_path.name}.d")
+    try:
+        dropin_info = os.lstat(dropin_dir)
+    except FileNotFoundError:
+        return files
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if stat.S_ISLNK(dropin_info.st_mode) or not stat.S_ISDIR(dropin_info.st_mode):
+        return None
+    directory_fd = -1
+    try:
+        directory_fd = os.open(
+            dropin_dir,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+    try:
+        before = os.fstat(directory_fd)
+        if not stat.S_ISDIR(before.st_mode):
             return None
-        return arguments or None
-    return None
+        try:
+            names = sorted(name for name in os.listdir(directory_fd) if name.endswith(".conf"))
+            for name in names:
+                name.encode("utf-8")
+        except (OSError, UnicodeError):
+            return None
+        for name in names:
+            descriptor = -1
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_fd,
+                )
+                content = _read_small_unit_descriptor(descriptor)
+            except (OSError, UnicodeError, ValueError):
+                return None
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            if content is None:
+                return None
+            files.append((f"{dropin_dir.name}/{name}", content))
+        after = os.fstat(directory_fd)
+        if (before.st_dev, before.st_ino, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mtime_ns,
+        ):
+            return None
+        return files
+    except (OSError, UnicodeError, ValueError):
+        return None
+    finally:
+        os.close(directory_fd)
+
+
+def _unit_files_digest(files: list[tuple[str, bytes]] | None) -> str | None:
+    if files is None:
+        return None
+    entries = [
+        (name, hashlib.sha256(content).hexdigest()) for name, content in files
+    ]
+    return hashlib.sha256(_canonical_bytes(entries)).hexdigest()
+
+
+def _unit_exec_start(files: list[tuple[str, bytes]] | None) -> list[str] | None:
+    if files is None:
+        return None
+    commands: list[list[str]] = []
+    for _name, unit_bytes in files:
+        try:
+            lines = unit_bytes.decode("utf-8").splitlines()
+        except UnicodeError:
+            return None
+        section = ""
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("["):
+                if not line.endswith("]") or "]" in line[1:-1]:
+                    return None
+                section = line[1:-1].strip()
+                continue
+            if section != "Service":
+                continue
+            match = re.match(r"^\s*ExecStart\s*=(.*)$", raw)
+            if match is None:
+                if re.match(r"^ExecStart(?:\s|:|$)", line):
+                    return None
+                continue
+            value = match.group(1)
+            if not value.strip():
+                commands.clear()
+                continue
+            try:
+                arguments = shlex.split(value)
+            except ValueError:
+                return None
+            if not arguments:
+                return None
+            arguments[0] = arguments[0].lstrip("-@:+!")
+            if not arguments[0]:
+                return None
+            commands.append(arguments)
+    return commands[0] if len(commands) == 1 else None
+
+
+def _is_python_executable(value: str) -> bool:
+    return re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", Path(value).name) is not None
+
+
+def _env_python_module_artifact(
+    argv: list[str], *, module: str
+) -> dict[str, object] | None:
+    if not argv or argv[0] != "/usr/bin/env":
+        return None
+    index = 1
+    environment: dict[str, str] = {}
+    while index < len(argv):
+        assignment = _ENV_ASSIGNMENT_RE.fullmatch(argv[index])
+        if assignment is None:
+            break
+        environment[assignment.group(1)] = assignment.group(2)
+        index += 1
+    if (
+        index + 2 >= len(argv)
+        or not _is_python_executable(argv[index])
+        or argv[index + 1 : index + 3] != ["-m", module]
+    ):
+        return None
+    pythonpath = environment.get("PYTHONPATH")
+    if pythonpath is None:
+        return artifact_identity_from_python(argv[index])
+    package_parent = pythonpath.split(os.pathsep, 1)[0]
+    if not package_parent or not Path(package_parent).is_absolute():
+        return _safe_artifact({})
+    return artifact_identity_from_package_root(
+        Path(package_parent) / "paulsha_cortex"
+    )
 
 
 def _declared_service_artifact(
-    service: str, *, exec_path: str | None, unit_bytes: bytes | None
+    service: str,
+    *,
+    exec_path: str | None,
+    argv: list[str] | None,
 ) -> dict[str, object]:
-    argv = _unit_exec_start(unit_bytes)
     if not argv:
         return _safe_artifact({})
+    module = {
+        "manager": "paulsha_cortex.coordinator.manager_daemon",
+        "monitor": "paulsha_cortex.monitor",
+    }.get(service)
+    if module is not None:
+        env_artifact = _env_python_module_artifact(argv, module=module)
+        if env_artifact is not None:
+            return env_artifact
     if service == "monitor":
         if len(argv) < 3 or argv[0] != exec_path or argv[1:3] != ["-m", "paulsha_cortex.monitor"]:
             return _safe_artifact({})
@@ -243,22 +408,24 @@ def service_declaration_projection(
         exec_path = row.get("exec_path")
         path_value = exec_path if isinstance(exec_path, str) else None
         unit_path = row.get("path")
-        unit_bytes = _read_small_unit_file(unit_path) if isinstance(unit_path, str) else None
-        unit_digest = hashlib.sha256(unit_bytes).hexdigest() if unit_bytes is not None else None
+        unit_files = _read_unit_files(unit_path if isinstance(unit_path, str) else None)
+        unit_digest = _unit_files_digest(unit_files)
+        effective_argv = _unit_exec_start(unit_files)
+        effective_exec_path = effective_argv[0] if effective_argv else None
         result[service] = {
             "unit": unit_name,
             "status": row.get("status") if isinstance(row.get("status"), str) else "unknown",
             "pid": row.get("pid") if type(row.get("pid")) is int else None,
             "exec_path_sha256": (
-                hashlib.sha256(os.fsencode(path_value)).hexdigest()
-                if path_value is not None
+                hashlib.sha256(os.fsencode(effective_exec_path)).hexdigest()
+                if effective_exec_path is not None
                 else None
             ),
             "disk_unit_sha256": unit_digest,
             "artifact": _declared_service_artifact(
                 service,
                 exec_path=path_value,
-                unit_bytes=unit_bytes,
+                argv=effective_argv,
             ),
             "stale": row.get("stale") if type(row.get("stale")) is bool else None,
         }

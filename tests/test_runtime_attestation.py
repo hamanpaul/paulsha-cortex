@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ import pytest
 from paulsha_cortex.runtime_attestation import (
     RUNTIME_ATTESTATION_SCHEMA,
     artifact_identity,
+    artifact_identity_from_package_root,
     compare_runtime_state,
     configuration_revision,
     manager_configuration_snapshot,
@@ -31,6 +33,49 @@ def _artifact(digest: str, *, kind: str = "installed-wheel") -> dict[str, object
         "source_revision": "unknown",
         "sha256": digest,
     }
+
+
+def _write_fake_install(site: Path, marker: str) -> Path:
+    package_root = site / "paulsha_cortex"
+    (package_root / "scripts").mkdir(parents=True)
+    (package_root / "coordinator").mkdir()
+    (package_root / "monitor").mkdir()
+    (package_root / "__init__.py").write_text(f"MARKER = {marker!r}\n", encoding="utf-8")
+    (package_root / "scripts" / "service-manager.sh").write_text(
+        f"# {marker}\n", encoding="utf-8"
+    )
+    (package_root / "coordinator" / "manager_daemon.py").write_text(
+        f"MARKER = {marker!r}\n", encoding="utf-8"
+    )
+    (package_root / "monitor" / "__init__.py").write_text(
+        f"MARKER = {marker!r}\n", encoding="utf-8"
+    )
+    metadata = site / "paulsha_cortex-0.1.10.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: paulsha-cortex\nVersion: 0.1.10\n",
+        encoding="utf-8",
+    )
+    return package_root
+
+
+def _service_units_with_dropins(
+    tmp_path: Path, *, manager_main: str, monitor_main: str
+) -> dict[str, dict[str, object]]:
+    rows: dict[str, dict[str, object]] = {}
+    for service, command in (("manager", manager_main), ("monitor", monitor_main)):
+        unit_name = f"test-{service}.service"
+        unit_path = tmp_path / "user" / unit_name
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
+        unit_path.write_text(f"[Service]\nExecStart={command}\n", encoding="utf-8")
+        rows[unit_name] = {
+            "path": str(unit_path),
+            "status": "active/running",
+            "pid": 321 if service == "manager" else 322,
+            "exec_path": "/usr/bin/env",
+            "stale": False,
+        }
+    return rows
 
 
 def test_checkout_source_override_has_digest_but_is_not_an_installed_artifact(
@@ -359,7 +404,9 @@ def test_service_declaration_projection_hashes_paths_and_unit_contents_without_e
 ) -> None:
     unit_path = tmp_path / "manager.service"
     unit_path.write_text(
-        "[Service]\nEnvironment=API_TOKEN=declaration-secret\n", encoding="utf-8"
+        "[Service]\nExecStart=/opt/cortex/bin/python\n"
+        "Environment=API_TOKEN=declaration-secret\n",
+        encoding="utf-8",
     )
     projected = service_declaration_projection(
         {
@@ -381,6 +428,254 @@ def test_service_declaration_projection_hashes_paths_and_unit_contents_without_e
     assert projected["manager"]["artifact"]["kind"] == "unknown"
     assert "declaration-secret" not in json.dumps(projected)
     assert projected["monitor"]["disk_unit_sha256"] is None
+
+
+def test_service_dropins_project_pinned_manager_and_monitor_artifacts_against_receipts(
+    tmp_path: Path,
+) -> None:
+    checkout_root = _write_fake_install(tmp_path / "checkout-a", "checkout-a")
+    pin_site = tmp_path / "pin-b"
+    pin_root = _write_fake_install(pin_site, "pin-b")
+    checkout_python = "/opt/checkout-a/bin/python"
+    manager_script = checkout_root / "scripts" / "service-manager.sh"
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main=f"/usr/bin/env bash {manager_script}",
+        monitor_main=f"{checkout_python} -m paulsha_cortex.monitor",
+    )
+    units["test-monitor.service"]["exec_path"] = checkout_python
+    manager_unit = Path(str(units["test-manager.service"]["path"]))
+    monitor_unit = Path(str(units["test-monitor.service"]["path"]))
+    manager_dropin = manager_unit.with_name(manager_unit.name + ".d")
+    monitor_dropin = monitor_unit.with_name(monitor_unit.name + ".d")
+    manager_dropin.mkdir()
+    monitor_dropin.mkdir()
+    manager_command = (
+        "/usr/bin/env PYTHONDONTWRITEBYTECODE=1 "
+        f"PYTHONPATH={pin_site} /usr/bin/python3 -m "
+        "paulsha_cortex.coordinator.manager_daemon --specs-dir /srv/specs "
+        "--no-require-idle"
+    )
+    monitor_command = (
+        "/usr/bin/env PYTHONDONTWRITEBYTECODE=1 "
+        f"PYTHONPATH={pin_site} /usr/bin/python3 -m paulsha_cortex.monitor"
+    )
+    for directory, command in (
+        (manager_dropin, manager_command),
+        (monitor_dropin, monitor_command),
+    ):
+        (directory / "zz-refine-runtime-pin.conf").write_text(
+            "[Service]\nWorkingDirectory=/srv/pin\nEnvironment=DECLARATION_SECRET=hidden\n"
+            "ExecStart=\n"
+            f"ExecStart={command}\n",
+            encoding="utf-8",
+        )
+
+    projected = service_declaration_projection(units, instance="test")
+    pin_artifact = artifact_identity_from_package_root(pin_root)
+    for service, pid in (("manager", 321), ("monitor", 322)):
+        declared = projected[service]["artifact"]
+        assert declared["sha256"] == pin_artifact["sha256"]
+        assert declared["kind"] == "installed-wheel"
+        state_root = tmp_path / f"{service}-runtime"
+        record_runtime_startup(
+            service=service,
+            instance="test",
+            state_root=state_root,
+            configuration={"revision": "same"},
+            artifact=pin_artifact,
+            started_at="2026-09-26T00:00:00Z",
+            pid=pid,
+        )
+        receipt_state = inspect_runtime_state(
+            state_root, service=service, instance="test"
+        )
+        comparison = compare_runtime_state(
+            receipt_state,
+            current_artifact=declared,
+            declared_config_revision=configuration_revision({"revision": "same"}),
+            expected_pid=pid,
+            require_process_match=True,
+        )
+        assert comparison["status"] == "match"
+
+    encoded = json.dumps(projected)
+    assert str(pin_site) not in encoded
+    assert "DECLARATION_SECRET" not in encoded
+    assert projected["monitor"]["exec_path_sha256"] == hashlib.sha256(
+        os.fsencode("/usr/bin/env")
+    ).hexdigest()
+
+
+def test_service_dropin_empty_execstart_clears_main_command_and_is_unknown(
+    tmp_path: Path,
+) -> None:
+    checkout_root = _write_fake_install(tmp_path / "checkout-a", "checkout-a")
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main=(
+            f"/usr/bin/env bash {checkout_root / 'scripts' / 'service-manager.sh'}"
+        ),
+        monitor_main="/usr/bin/python3 -m paulsha_cortex.monitor",
+    )
+    manager_unit = Path(str(units["test-manager.service"]["path"]))
+    dropin_dir = manager_unit.with_name(manager_unit.name + ".d")
+    dropin_dir.mkdir()
+    (dropin_dir / "20-clear.conf").write_text(
+        "[Service]\nExecStart=\n", encoding="utf-8"
+    )
+
+    projected = service_declaration_projection(units, instance="test")
+
+    assert projected["manager"]["artifact"]["kind"] == "unknown"
+    assert projected["manager"]["artifact"]["sha256"] is None
+
+
+def test_service_dropins_apply_in_filename_order_and_change_unit_digest(
+    tmp_path: Path,
+) -> None:
+    first_site = tmp_path / "pin-a"
+    second_site = tmp_path / "pin-b"
+    _write_fake_install(first_site, "pin-a")
+    second_root = _write_fake_install(second_site, "pin-b")
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main="/usr/bin/true",
+        monitor_main="/usr/bin/true",
+    )
+    unit_path = Path(str(units["test-manager.service"]["path"]))
+    dropin_dir = unit_path.with_name(unit_path.name + ".d")
+    dropin_dir.mkdir()
+    for name, site in (("10-first.conf", first_site), ("20-second.conf", second_site)):
+        (dropin_dir / name).write_text(
+            "[Service]\nExecStart=\nExecStart=/usr/bin/env PYTHONPATH="
+            f"{site} /usr/bin/python3 -m "
+            "paulsha_cortex.coordinator.manager_daemon\n",
+            encoding="utf-8",
+        )
+
+    before = service_declaration_projection(units, instance="test")["manager"]
+    second_artifact = artifact_identity_from_package_root(second_root)
+    assert before["artifact"]["sha256"] == second_artifact["sha256"]
+    original_digest = before["disk_unit_sha256"]
+    (dropin_dir / "20-second.conf").write_text(
+        (dropin_dir / "20-second.conf").read_text(encoding="utf-8")
+        + "Environment=RUNTIME_PIN_REVISION=two\n",
+        encoding="utf-8",
+    )
+    after = service_declaration_projection(units, instance="test")["manager"]
+
+    assert after["disk_unit_sha256"] != original_digest
+
+
+def test_service_env_python_module_without_pythonpath_uses_interpreter_prefix(
+    tmp_path: Path,
+) -> None:
+    prefix = tmp_path / "venv"
+    package_root = _write_fake_install(
+        prefix / "lib" / "python3.12" / "site-packages", "venv"
+    )
+    python = prefix / "bin" / "python3.12"
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main="/usr/bin/true",
+        monitor_main=(
+            f"/usr/bin/env PYTHONDONTWRITEBYTECODE=1 {python} "
+            "-m paulsha_cortex.monitor"
+        ),
+    )
+
+    projected = service_declaration_projection(units, instance="test")
+
+    assert projected["monitor"]["artifact"]["sha256"] == (
+        artifact_identity_from_package_root(package_root)["sha256"]
+    )
+
+
+def test_service_declaration_with_multiple_effective_execstarts_is_unknown(
+    tmp_path: Path,
+) -> None:
+    checkout_root = _write_fake_install(tmp_path / "checkout-a", "checkout-a")
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main=(
+            f"/usr/bin/env bash {checkout_root / 'scripts' / 'service-manager.sh'}"
+        ),
+        monitor_main="/usr/bin/true",
+    )
+    unit_path = Path(str(units["test-manager.service"]["path"]))
+    dropin_dir = unit_path.with_name(unit_path.name + ".d")
+    dropin_dir.mkdir()
+    (dropin_dir / "30-second-command.conf").write_text(
+        "[Service]\nExecStart=/usr/bin/false\n", encoding="utf-8"
+    )
+
+    projected = service_declaration_projection(units, instance="test")["manager"]
+
+    assert projected["artifact"]["kind"] == "unknown"
+    assert projected["artifact"]["sha256"] is None
+    assert projected["exec_path_sha256"] is None
+
+
+def test_service_declaration_with_unparseable_execstart_is_unknown(
+    tmp_path: Path,
+) -> None:
+    checkout_root = _write_fake_install(tmp_path / "checkout-a", "checkout-a")
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main=(
+            f"/usr/bin/env bash {checkout_root / 'scripts' / 'service-manager.sh'}"
+        ),
+        monitor_main="/usr/bin/true",
+    )
+    unit_path = Path(str(units["test-manager.service"]["path"]))
+    dropin_dir = unit_path.with_name(unit_path.name + ".d")
+    dropin_dir.mkdir()
+    (dropin_dir / "30-invalid-command.conf").write_text(
+        "[Service]\nExecStart /usr/bin/false\n", encoding="utf-8"
+    )
+
+    projected = service_declaration_projection(units, instance="test")["manager"]
+
+    assert projected["artifact"]["kind"] == "unknown"
+    assert projected["artifact"]["sha256"] is None
+
+
+@pytest.mark.parametrize(
+    "unsafe_file", ["symlink", "symlink-directory", "oversized"]
+)
+def test_service_dropin_read_failure_fails_closed(
+    tmp_path: Path, unsafe_file: str
+) -> None:
+    checkout_root = _write_fake_install(tmp_path / "checkout-a", "checkout-a")
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main=(
+            f"/usr/bin/env bash {checkout_root / 'scripts' / 'service-manager.sh'}"
+        ),
+        monitor_main="/usr/bin/python3 -m paulsha_cortex.monitor",
+    )
+    manager_unit = Path(str(units["test-manager.service"]["path"]))
+    dropin_dir = manager_unit.with_name(manager_unit.name + ".d")
+    if unsafe_file == "symlink-directory":
+        target_dir = tmp_path / "dropins-target"
+        target_dir.mkdir()
+        dropin_dir.symlink_to(target_dir, target_is_directory=True)
+    else:
+        dropin_dir.mkdir()
+    dropin_path = dropin_dir / "50-unsafe.conf"
+    if unsafe_file == "symlink":
+        target = tmp_path / "outside.conf"
+        target.write_text("[Service]\nExecStart=/usr/bin/false\n", encoding="utf-8")
+        dropin_path.symlink_to(target)
+    elif unsafe_file == "oversized":
+        dropin_path.write_bytes(b"[Service]\n" + b"X" * (300 * 1024))
+
+    projected = service_declaration_projection(units, instance="test")["manager"]
+
+    assert projected["artifact"]["kind"] == "unknown"
+    assert projected["artifact"]["sha256"] is None
+    assert projected["disk_unit_sha256"] is None
 
 
 def test_service_status_requires_loaded_receipt_pid_to_match_unit_pid(
