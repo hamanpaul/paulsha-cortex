@@ -9,7 +9,7 @@
 
 ### Added
 
-- **#857 task-memory host adapter 與唯讀 read model**：新增 public Hippo payload v1 consumer、capability-aware inline/snapshot/note-fetch 路徑、manifest/hash/scope fail-closed 驗證、Manager 綁定 run/job/routing 的 append-only receipt sidecar 與 `cortex work show --task-memory` read model。fixture 驗證每種 delivery path 五次成功與五次負例，inline 不計 legacy Read、receipt 有序且 evidence-bound；真正 provider/runtime integration 與 installed/live ≥95% canary 仍待外部驗收。
+- **#857 task-memory Hippo subprocess provider 與 live canary**：新增有界 `hippo task-memory provide/fetch` CLI client、exit-code/stderr allowlist、per-task manifest-bound fetch callback，以及預設關閉的 `PSC_TASK_MEMORY_ENABLED=1` Manager inline dispatch；receipt 僅寫 Cortex sidecar。新增 `cortex task-memory canary`，對兩個以上 repo 實跑 note-fetch/snapshot/inline、permission-denied 與跨 project 負例，輸出不含 note 正文的 JSON。離線 fake-CLI 與 Manager dispatch 測試已涵蓋；真實 Hippo CLI／installed service 的 ≥95%、各 path 5/5 驗收仍待執行。
 
 ### Fixed
 

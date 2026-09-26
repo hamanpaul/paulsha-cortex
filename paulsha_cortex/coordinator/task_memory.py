@@ -74,6 +74,19 @@ _FAILURE_REASONS = frozenset(
         "action-evidence-missing",
     }
 )
+_PROVIDER_DIAGNOSTIC_CODES = frozenset(
+    {
+        "permission-denied",
+        "timeout",
+        "scope-mismatch",
+        "hash-mismatch",
+        "unsupported-schema",
+        "manifest-mismatch",
+        "invalid-request",
+        "size-limit",
+        "provider-error",
+    }
+)
 
 
 class TaskMemoryError(ValueError):
@@ -84,6 +97,15 @@ class TaskMemoryError(ValueError):
             reason = "malformed-payload"
         self.reason = reason
         super().__init__(message or reason)
+
+
+class TaskMemoryProviderError(RuntimeError):
+    """Provider protocol error carrying only a bounded diagnostic code."""
+
+    def __init__(self, code: str, *, reason: str = "provider-error") -> None:
+        self.code = code if code in _PROVIDER_DIAGNOSTIC_CODES else "provider-error"
+        self.reason = reason if reason in _FAILURE_REASONS else "provider-error"
+        super().__init__(self.code)
 
 
 @dataclass(frozen=True)
@@ -395,20 +417,32 @@ class TaskMemoryAdapter:
         request = context.to_envelope(mode=mode)
         try:
             response = self.provider(request)
-        except PermissionError:
+        except PermissionError as exc:
             return self._failure(
                 context,
                 status="read-failed",
                 reason="permission-denied",
                 requested_mode=mode,
-                permission_layer="unknown",
+                permission_layer=(
+                    "provider" if getattr(exc, "provider_code", None) == "permission-denied" else "unknown"
+                ),
+                provider_code=getattr(exc, "provider_code", None),
             )
-        except TimeoutError:
+        except TimeoutError as exc:
             return self._failure(
                 context,
                 status="read-failed",
                 reason="provider-timeout",
                 requested_mode=mode,
+                provider_code=getattr(exc, "provider_code", None),
+            )
+        except TaskMemoryProviderError as exc:
+            return self._failure(
+                context,
+                status="parked" if exc.reason == "unsupported-schema-major" else "read-failed",
+                reason=exc.reason,
+                requested_mode=mode,
+                provider_code=exc.code,
             )
         except Exception:
             return self._failure(
@@ -563,25 +597,39 @@ class TaskMemoryAdapter:
             return TaskMemoryFetch(content=None, events=(attempted, failed), reason="provider-unavailable")
         try:
             content = self.note_fetch(prepared.context.task_id, note_id)
-        except PermissionError:
+        except PermissionError as exc:
             failed = _event(
                 prepared.context,
                 "read-failed",
                 mode="note_fetch",
                 candidate=candidate,
                 reason="permission-denied",
-                permission_layer="unknown",
+                permission_layer=(
+                    "provider" if getattr(exc, "provider_code", None) == "permission-denied" else "unknown"
+                ),
+                provider_code=getattr(exc, "provider_code", None),
             )
             return TaskMemoryFetch(content=None, events=(attempted, failed), reason="permission-denied")
-        except TimeoutError:
+        except TimeoutError as exc:
             failed = _event(
                 prepared.context,
                 "read-failed",
                 mode="note_fetch",
                 candidate=candidate,
                 reason="provider-timeout",
+                provider_code=getattr(exc, "provider_code", None),
             )
             return TaskMemoryFetch(content=None, events=(attempted, failed), reason="provider-timeout")
+        except TaskMemoryProviderError as exc:
+            failed = _event(
+                prepared.context,
+                "read-failed",
+                mode="note_fetch",
+                candidate=candidate,
+                reason=exc.reason,
+                provider_code=exc.code,
+            )
+            return TaskMemoryFetch(content=None, events=(attempted, failed), reason=exc.reason)
         except Exception:
             failed = _event(
                 prepared.context,
@@ -598,6 +646,7 @@ class TaskMemoryAdapter:
                 mode="note_fetch",
                 candidate=candidate,
                 reason="content-hash-mismatch",
+                provider_code="hash-mismatch",
             )
             return TaskMemoryFetch(content=None, events=(attempted, failed), reason="content-hash-mismatch")
         prepared.returned_note_ids.add(note_id)
@@ -718,6 +767,7 @@ class TaskMemoryAdapter:
         reason: str,
         requested_mode: str,
         permission_layer: str | None = None,
+        provider_code: str | None = None,
     ) -> PreparedTaskMemory:
         event_name = "ineligible" if status == "ineligible" else "read-failed"
         event = _event(
@@ -726,6 +776,7 @@ class TaskMemoryAdapter:
             mode=requested_mode,
             reason=reason,
             permission_layer=permission_layer,
+            provider_code=provider_code,
         )
         return PreparedTaskMemory(
             context=context,
@@ -965,6 +1016,7 @@ def _event(
     candidate: Mapping[str, Any] | None = None,
     reason: str | None = None,
     permission_layer: str | None = None,
+    provider_code: str | None = None,
     snapshot_id: str | None = None,
     evidence: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -1000,6 +1052,8 @@ def _event(
         row["reason"] = _bounded_reason(reason)
     if permission_layer is not None:
         row["permission_layer"] = permission_layer if permission_layer in {"unknown", "host", "provider", "executor"} else "unknown"
+    if provider_code in _PROVIDER_DIAGNOSTIC_CODES:
+        row["provider_code"] = provider_code
     if snapshot_id is not None:
         row["snapshot_id"] = snapshot_id
     if evidence is not None:
@@ -1359,7 +1413,7 @@ def _validate_event(value: object) -> dict[str, Any]:
         "executor", "model_id", "tool", "project", "task_kind", "mode",
         "eligible_authorized", "note_id", "content_hash", "content_version", "timestamp",
         "reason", "permission_layer", "snapshot_id", "applicability", "relevance_reason",
-        "source_time", "evidence", "counts_as_read",
+        "source_time", "evidence", "counts_as_read", "provider_code",
     }
     if set(row) - allowed:
         raise ValueError("task memory receipt contains unsupported fields")
@@ -1405,6 +1459,8 @@ def _validate_event(value: object) -> dict[str, Any]:
             raise ValueError(f"task memory receipt {field_name} invalid")
     if row.get("reason") is not None and row["reason"] not in _FAILURE_REASONS:
         raise ValueError("task memory receipt reason invalid")
+    if row.get("provider_code") is not None and row["provider_code"] not in _PROVIDER_DIAGNOSTIC_CODES:
+        raise ValueError("task memory provider diagnostic code invalid")
     if row.get("permission_layer") is not None and row["permission_layer"] not in {
         "unknown",
         "host",

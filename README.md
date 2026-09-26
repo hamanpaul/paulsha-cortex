@@ -408,7 +408,16 @@ cortex work show unified-work-lifecycle --repo hamanpaul/paulsha-cortex --json
 cortex work show task-memory-delivery-adapter --repo owner/repo --task-memory --json
 ```
 
-`--task-memory` 以 `cortex/task-memory-read-model/v1` 回查 Work Item、WorkflowRun、Job routing、planning revisions、receipt sidecar 與 test/review gate evidence；它只讀取既有紀錄，不會啟動 memory retrieval。未帶旗標時仍輸出 `cortex-work/v1`。adapter/provider 缺席、schema major 不支援或 scope/manifest 不符時會留下 bounded failure 並 fail closed；Cortex 不讀取全域 memory root，也不寫 Hippo strict ledger。正式執行的 provider 與 installed/live canary 尚需外部驗收。
+`--task-memory` 以 `cortex/task-memory-read-model/v1` 回查 Work Item、WorkflowRun、Job routing、planning revisions、receipt sidecar 與 test/review gate evidence；它只讀取既有紀錄，不會啟動 memory retrieval。未帶旗標時仍輸出 `cortex-work/v1`。Cortex 透過可選 `hippo task-memory` CLI subprocess 讀取；不 import Hippo、不新增 package dependency，也不讀全域 memory root。Manager retrieval 預設關閉，只在 service 的 per-instance manager overlay（`$HOME/.agents/core/runtime/<instance>-manager.env`）設 `PSC_TASK_MEMORY_ENABLED=1` 才會於派工時請求 bounded inline excerpt。CLI 預設由 `PATH` 解析 `hippo`，可用 `PSC_TASK_MEMORY_HIPPO_CMD` 覆寫成 JSON argv array 或 shlex command；`PSC_TASK_MEMORY_HIPPO_TIMEOUT_SECONDS` 可設 0.05–60 秒，預設 10 秒。stdin 上限 64 KiB、stdout 上限 512 KiB。命令缺席時留下 `provider-unavailable` receipt；Hippo exit 10/11 分別為 `permission-denied`/`provider-timeout`。exit 12/13/14/15 分別記為 scope mismatch、content hash mismatch、unsupported schema park、manifest mismatch；16/17/18 統一為 `provider-error`，並在 receipt 只保留 bounded code。stderr 只檢查第一行 allowlisted code，其他內容不進 log 或 receipt。所有 failure 都不改 workflow lifecycle；receipt 只寫 Cortex sidecar，不寫 Hippo ledger。
+
+正式 live 驗收可對至少兩個已登記 Hippo project 一次跑完三條 capability path、permission-denied 與 cross-project 負例：
+
+```bash
+cortex task-memory canary --repo owner/project-a --repo owner/project-b --runs 5 \
+  --evidence-path "$HOME/.agents/core/runtime/task-memory-canary-857.json"
+```
+
+`--evidence-path` 是選填；省略時只輸出機讀 JSON，不在 repository 建立預設 evidence 檔。回傳 0 要求每個 repo/path 至少五次 eligible authorized provide 且至少五次成功 delivery，provide 與 note 成功率都至少 95%；預設 `--runs 5` 即每個 repo/path 5/5。輸出 JSON 同時提供 provide 次數與 candidate-level eligible 成功率，不含 note 正文或本機絕對路徑。Manager production dispatch 目前使用 inline capability；canary 另以真 CLI 實際驗證 note-fetch 與 snapshot。若 service 以 `cortex-manager` Trust Root 帳號執行，Hippo memory root 權限仍由 Hippo registry 與 OS 判定；Cortex 不提升權限。
 
 Monitor 只允許 override、frontmatter、GitHub closing reference 與通過typed refs驗證的workflow metadata提供 confirmed association；override exclusion 優先抑制所有同work的 confirmed edge。PR body、issue title、artifact／branch slug 等 fuzzy 訊號只顯示。未被 confirmed mapping 擁有的 archived OpenSpec 與 closed GitHub issue／PR 只提供終態證據，不會單獨建立 work item。`done` 的 Todo 證據只採遠端 default branch blob與 archived OpenSpec task checklist revision，不採本機 overlay；Monitor 仍要求可驗證的遠端 Todo evidence，但 workstream Todo 未勾 checkbox 只供診斷，不阻擋有效 CompletionRecord 的 `done`；archived OpenSpec tasks 的完成要求維持不變；所有 mapped PR 都必須是至少雙 parent且可證明已進 default branch 的 merge commit，且 CompletionRecord 保存的 source revisions、PR candidate與merge revision必須逐一符合目前remote truth；所有 mapped OpenSpec refs 也必須完成 archive。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state並加上 degraded facet；`cortex-work/v1.hard_gates`只依查詢中的repo/work item authority關閉auto claim與merge，跨repo整體狀態另由`fleet_health`回報。
 
