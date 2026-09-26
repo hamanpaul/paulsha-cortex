@@ -4,10 +4,12 @@ import copy
 import inspect
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
 from typing import Callable
+from uuid import uuid4
 
 from paulsha_cortex.config import paths
 
@@ -94,6 +96,7 @@ def parse_spec_frontmatter(path) -> dict:
         "executor": None,
         "model_id": None,
         "repo": None,
+        "work_id": None,
         "parse_error": None,
     }
     if block is None:
@@ -127,6 +130,7 @@ def parse_spec_frontmatter(path) -> dict:
         meta["executor"] = data.get("executor") if isinstance(data.get("executor"), str) else None
         meta["model_id"] = data.get("model_id") if isinstance(data.get("model_id"), str) else None
         meta["repo"] = data.get("repo") if isinstance(data.get("repo"), str) else None
+        meta["work_id"] = data.get("work_id") if isinstance(data.get("work_id"), str) else None
         meta["parse_error"] = exc.as_payload()
         return meta
     except RepoRootResolutionError as exc:
@@ -154,6 +158,7 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
         "executor",
         "model_id",
         "repo",
+        "work_id",
         "parse_error",
     }
     extras = set(data) - allowed
@@ -174,6 +179,7 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
         "executor": None,
         "model_id": None,
         "repo": None,
+        "work_id": None,
         "parse_error": None,
     }
     plan = data.get("plan")
@@ -241,6 +247,17 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
                 "repo", "repo must be an explicit owner/repo string"
             )
         meta["repo"] = repo_value
+    work_id_value = data.get("work_id")
+    if work_id_value is not None:
+        if not isinstance(work_id_value, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id_value) is None:
+            raise verification.ContractValidationError(
+                "work_id", "work_id must be an explicit lowercase slug"
+            )
+        meta["work_id"] = work_id_value
+    if repo_value is None and work_id_value is not None:
+        raise verification.ContractValidationError(
+            "repo", "owner binding requires an explicit repo"
+        )
     if data.get("parse_error") is not None:
         raise verification.ContractValidationError(
             "parse_error",
@@ -597,6 +614,23 @@ class DispatchReadyRequiresLauncherError(RuntimeError):
     """fan-out 需 headless launcher 卻未提供時 fail-fast 拋出（zh-tw）。"""
 
 
+def _confirmed_owner_identity(meta: dict, *, slice_id: str) -> dict[str, str] | None:
+    """只將已確認 WorkAuthority 的 repo/Work Item 綁定到 slice。"""
+
+    work_id = meta.get("work_id")
+    if work_id is None:
+        return None
+    repo = meta.get("repo")
+    if not isinstance(repo, str) or not isinstance(work_id, str):
+        raise ValueError("owner identity requires explicit repo and work_id")
+    from . import claim
+
+    authority = claim.load_work_authority(repo=repo, work_id=work_id)
+    if authority.repo != repo or authority.work_id != work_id:
+        raise ValueError("confirmed WorkAuthority identity mismatch")
+    return {"repo": authority.repo, "work_id": authority.work_id, "slice_id": slice_id}
+
+
 def dispatch_ready(
     metas: list[dict],
     is_satisfied: IsSatisfied,
@@ -669,7 +703,12 @@ def dispatch_ready(
         slice_recorded = False
         launched = False
         written_dispatch_base: str | None = None
+        attempt_id = uuid4().hex
+        owner_identity = None
         try:
+            # 若 spec 要求 owner binding，先確認 WorkAuthority；錯誤時不得 pin
+            # inputs、建立 registry row 或碰 workspace。
+            owner_identity = _confirmed_owner_identity(m, slice_id=slice_id)
             pinned_inputs = pin_dispatch_inputs(m)
             # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查
             # 或 base_sha 解析若晚點失敗，slice 落 needs_human 後 dispatch_base 不會
@@ -746,6 +785,8 @@ def dispatch_ready(
                 slice_id=slice_id,
                 pinned_inputs=pinned_inputs,
                 dispatch_base=early_dispatch_head,
+                owner_identity=owner_identity,
+                attempt_id=attempt_id,
             )
             slice_recorded = True
             written_dispatch_base = early_dispatch_head
@@ -762,7 +803,17 @@ def dispatch_ready(
                 handoff_dir=handoff_dir,
                 git_runner=runner,
             )
-            worktree = str(Path(_launcher_worktree(dispatcher, slice_id, base_sha=base_sha)).resolve())
+            worktree = str(
+                Path(
+                    _launcher_worktree(
+                        dispatcher,
+                        slice_id,
+                        base_sha=base_sha,
+                        owner_identity=owner_identity,
+                        attempt_id=attempt_id,
+                    )
+                ).resolve()
+            )
             if persona == "builder":
                 prompt = build_dispatch_prompt(
                     persona,
@@ -793,6 +844,8 @@ def dispatch_ready(
                 # 不推斷）；寫進 job record 既有 workflow_repo 欄，終局 manifest
                 # 與 slices/attention 讀取端（#465/#349）即可投影。
                 workflow_repo=m.get("repo"),
+                owner_identity=owner_identity,
+                attempt_id=attempt_id,
                 # #503：attestation——這顆 job 實際拿到的 spec／plan 就是這兩個 hash。
                 spec_hash=str(pinned_inputs["spec_hash"]),
                 plan_hash=str(pinned_inputs["plan_hash"]),
@@ -838,6 +891,8 @@ def dispatch_ready(
                         slice_id=slice_id,
                         pinned_inputs=pinned_inputs,
                         dispatch_base=early_dispatch_head,
+                        owner_identity=owner_identity,
+                        attempt_id=attempt_id,
                     )
                 except Exception:
                     pass
@@ -1017,7 +1072,14 @@ def _recovery_slice_snapshot(dispatcher, slice_id: str) -> dict | None:
     return snapshot if isinstance(snapshot, dict) else None
 
 
-def _launcher_worktree(dispatcher, slice_id: str, *, base_sha: str | None = None) -> str:
+def _launcher_worktree(
+    dispatcher,
+    slice_id: str,
+    *,
+    base_sha: str | None = None,
+    owner_identity: dict[str, str] | None = None,
+    attempt_id: str | None = None,
+) -> str:
     """provision 這條 slice 的 build 工作區。
 
     #645：目錄名由 **slice_id** 導出（`job_workspace.job_segment()`），而
@@ -1029,13 +1091,27 @@ def _launcher_worktree(dispatcher, slice_id: str, *, base_sha: str | None = None
 
     worktree_creator = getattr(dispatcher, "_worktree_creator", None)
     if worktree_creator is None:
+        if owner_identity is not None:
+            raise ValueError("owner-bound recovery requires an identity-aware workspace creator")
         return str(Path.cwd())
     branch = _branch_for_slice(slice_id)
+    identity_kwargs = (
+        {"owner_identity": owner_identity, "attempt_id": attempt_id}
+        if owner_identity is not None
+        else {}
+    )
     if base_sha is None:
-        return worktree_creator.create(branch, job_id=slice_id)
+        return worktree_creator.create(branch, job_id=slice_id, **identity_kwargs)
     try:
-        return worktree_creator.create(branch, job_id=slice_id, base_sha=base_sha)
+        return worktree_creator.create(
+            branch,
+            job_id=slice_id,
+            base_sha=base_sha,
+            **identity_kwargs,
+        )
     except TypeError:
+        if owner_identity is not None:
+            raise
         return worktree_creator.create(branch, job_id=slice_id)
 
 
@@ -1073,13 +1149,15 @@ def _record_launching_job(
     worktree: str,
     dispatch_head: str | None = None,
     workflow_repo: str | None = None,
+    owner_identity: dict[str, str] | None = None,
+    attempt_id: str | None = None,
     spec_hash: str | None = None,
     plan_hash: str | None = None,
 ) -> dict:
     """Persist the job row *before* launch (handle fields filled in later)."""
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
-        return {
+        job = {
             "task": slice_id,
             "persona": persona,
             "worktree": worktree,
@@ -1093,6 +1171,15 @@ def _record_launching_job(
             "spec_hash": spec_hash,
             "plan_hash": plan_hash,
         }
+        if owner_identity is not None:
+            job["owner_identity"] = owner_identity
+            job["attempt_id"] = attempt_id
+        return job
+    owner_kwargs = (
+        {"owner_identity": owner_identity, "attempt_id": attempt_id}
+        if owner_identity is not None
+        else {}
+    )
     return registry.create_job(
         task=slice_id,
         persona=persona,
@@ -1108,6 +1195,7 @@ def _record_launching_job(
         # #469：slice-lane 的 repo 歸屬只來自 spec 顯式宣告；lane 判定看
         # workflow_run_id（manager._is_workflow_lane_job），帶此欄不會誤判 lane。
         workflow_repo=workflow_repo,
+        **owner_kwargs,
         # #503：builder 實際拿到的 pinned inputs（完成側據此對照 slice 釘住的值）。
         spec_hash=spec_hash,
         plan_hash=plan_hash,
@@ -1120,10 +1208,17 @@ def _record_pending_slice(
     slice_id: str,
     pinned_inputs: dict,
     dispatch_base: str | None,
+    owner_identity: dict[str, str] | None = None,
+    attempt_id: str | None = None,
 ) -> None:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
         return
+    owner_kwargs = (
+        {"owner_identity": owner_identity, "attempt_id": attempt_id}
+        if owner_identity is not None
+        else {}
+    )
     try:
         registry.create_slice(
             slice_id=slice_id,
@@ -1139,6 +1234,7 @@ def _record_pending_slice(
             builder_job_id=None,
             reviewer_job_id=None,
             candidate=None,
+            **owner_kwargs,
         )
     except ValueError as exc:
         if "slice 已存在" not in str(exc):
@@ -1154,6 +1250,8 @@ def _record_pending_slice(
             verification_hash=pinned_inputs["verification_hash"],
             verification=pinned_inputs.get("verification"),
             dispatch_base=dispatch_base,
+            **owner_kwargs,
+            **({"replace_owner_identity": True} if owner_identity is not None else {}),
         )
 
 

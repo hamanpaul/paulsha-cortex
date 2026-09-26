@@ -411,9 +411,10 @@ def _render_frontmatter(
         f"plan: {json.dumps(plan_ref, ensure_ascii=False)}",
         f"depends_on: {depends_on}",
         f"target_branch: {json.dumps(target_branch, ensure_ascii=False)}",
-        # #469：repo 歸屬為 optional 顯式宣告——emit 只出 null 佔位，操作者翻
-        # dispatch: auto 前自行補 owner/repo；自動自 claim/work item 帶入為 follow-up。
+        # #469：repo 歸屬與 Work Item owner 是 optional 顯式宣告；翻
+        # dispatch: auto 前由操作者補值，從已確認 WorkAuthority 帶入為 follow-up。
         "repo: null",
+        "work_id: null",
     ]
     lines.append("verification:")
     lines.append(f"  docs_class: {_format_scalar(verification.get('docs_class'))}")

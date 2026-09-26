@@ -324,9 +324,21 @@ def test_resolve_git_runner_falls_back_to_production_default(tmp_path: Path) -> 
 
 def _seed_recoverable_slice(
     registry: JobRegistry, *, slice_id: str, branch: str, worktree: Path
-) -> None:
+) -> tuple[dict[str, str], str]:
+    owner_identity = {
+        "repo": "hamanpaul/example",
+        "work_id": slice_id,
+        "slice_id": slice_id,
+    }
+    attempt_id = f"attempt-{slice_id}"
     builder_job = registry.create_job(
-        task=slice_id, persona="builder", branch=branch, pane="", worktree=str(worktree)
+        task=slice_id,
+        persona="builder",
+        branch=branch,
+        pane="",
+        worktree=str(worktree),
+        owner_identity=owner_identity,
+        attempt_id=attempt_id,
     )
     registry.update_headless_result(builder_job["job_id"], status="failed", exit_code=1)
     registry.create_slice(
@@ -339,8 +351,11 @@ def _seed_recoverable_slice(
         builder_job_id=builder_job["job_id"],
         reviewer_job_id=None,
         candidate=None,
+        owner_identity=owner_identity,
+        attempt_id=attempt_id,
     )
     registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+    return owner_identity, attempt_id
 
 
 def test_recover_pre_candidate_clears_registry_and_allows_redispatch(
@@ -361,8 +376,13 @@ def test_recover_pre_candidate_clears_registry_and_allows_redispatch(
     monkeypatch.setenv("PSC_WORKTREE_ROOT", str(pool))
 
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
-    _seed_recoverable_slice(
+    owner_identity, attempt_id = _seed_recoverable_slice(
         registry, slice_id="slice-e", branch="feature/slice-e", worktree=worktree
+    )
+    monkeypatch.setattr(
+        manager.job_workspace,
+        "read_marker",
+        lambda _path: {"owner_identity": owner_identity, "attempt_id": attempt_id},
     )
     dispatcher = Dispatcher(
         registry, pane_sender=MagicMock(), worktree_creator=MagicMock()
@@ -405,8 +425,13 @@ def test_recover_pre_candidate_self_heals_orphan_registry_entry(
     monkeypatch.setenv("PSC_WORKTREE_ROOT", str(pool))
 
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
-    _seed_recoverable_slice(
+    owner_identity, attempt_id = _seed_recoverable_slice(
         registry, slice_id="slice-f", branch="feature/slice-f", worktree=worktree
+    )
+    monkeypatch.setattr(
+        manager.job_workspace,
+        "read_marker",
+        lambda _path: {"owner_identity": owner_identity, "attempt_id": attempt_id},
     )
     dispatcher = Dispatcher(
         registry, pane_sender=MagicMock(), worktree_creator=MagicMock()
@@ -441,8 +466,13 @@ def test_recover_pre_candidate_fails_closed_when_reclaim_fails(
     monkeypatch.setenv("PSC_WORKTREE_ROOT", str(pool))
 
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
-    _seed_recoverable_slice(
+    owner_identity, attempt_id = _seed_recoverable_slice(
         registry, slice_id="slice-g", branch="feature/slice-g", worktree=worktree
+    )
+    monkeypatch.setattr(
+        manager.job_workspace,
+        "read_marker",
+        lambda _path: {"owner_identity": owner_identity, "attempt_id": attempt_id},
     )
     dispatcher = Dispatcher(
         registry, pane_sender=MagicMock(), worktree_creator=MagicMock()

@@ -635,6 +635,7 @@
 - **#847／#964／#965／#979／#980 self-publication drift**：同 run 已接受且 bytes 符合 baseline 的 planning publication，以及綁定 exact verified Candidate 的 Manager PR 納入 WorkAuthority 時保留 claim-era 與既有 gate；其他 authority 變更仍觸發 restart。
 - **#887／#962／#975 已合併 run 防重驗護欄**：authority 前進且 merge authorization 與 delivery journal 完整綁定時，保留原 run phase；舊 `authority_restart` verify-reset merged run 則 fail-closed 停止並提示 `retire-delivered`。
 
+- **#547／#968–#971 owner-bound recover-pre-candidate**：work action 只依 WorkAuthority 的 repo／Work Item 唯一解析持久 owner identity，移除 slice 名稱、spec suffix 與全表 fallback；legacy unbound、缺失、歧義或 attempt／workspace marker 不一致時，回收與 registry mutation 前即拒絕。Manager slice action 與 work action 共用 recovery core，成功後清除 builder binding、寫入 pending action、supersede handoff manifest 並驗證 read-back。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、路徑逃逸、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用，內容驗收拒收維持
   content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

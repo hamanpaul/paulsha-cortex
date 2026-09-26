@@ -31,7 +31,15 @@ class WorktreeCreator(Protocol):
     checkout 哪一條，**不再**決定目錄叫什麼。
     """
 
-    def create(self, branch: str, *, job_id: str, base_sha: str | None = None) -> str: ...
+    def create(
+        self,
+        branch: str,
+        *,
+        job_id: str,
+        base_sha: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> str: ...
 
 
 class TmuxPaneSender:
@@ -188,7 +196,15 @@ class ScriptWorktreeCreator:
     def _source(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         return self._run(["-C", str(self._repo), *args])
 
-    def create(self, branch: str, *, job_id: str, base_sha: str | None = None) -> str:
+    def create(
+        self,
+        branch: str,
+        *,
+        job_id: str,
+        base_sha: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> str:
         #: #645：目錄名由 **job id** 導出，不再是 branch slug。降權派工的模板 unit
         #: 只有 `%i` 可用（`ReadWritePaths=<pool>/%i`），推不出 branch slug，因此
         #: 兩個名字要對齊，只能讓目錄名這一側讓步。推導點只有
@@ -235,7 +251,13 @@ class ScriptWorktreeCreator:
                 branch_touched = False
                 raise ValueError(f"git worktree add failed: {moved.stderr.strip()}")
             target_created = True
-            self._clone(branch=branch, target=target, exact_base=exact_base)
+            self._clone(
+                branch=branch,
+                target=target,
+                exact_base=exact_base,
+                owner_identity=owner_identity,
+                attempt_id=attempt_id,
+            )
         except ValueError:
             self._rollback(
                 branch=branch,
@@ -258,7 +280,15 @@ class ScriptWorktreeCreator:
 
     # -- clone 與善後 -----------------------------------------------------------
 
-    def _clone(self, *, branch: str, target: Path, exact_base: str) -> None:
+    def _clone(
+        self,
+        *,
+        branch: str,
+        target: Path,
+        exact_base: str,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> None:
         cloned = self._run(
             [
                 "clone",
@@ -337,7 +367,12 @@ class ScriptWorktreeCreator:
             raise ValueError(f"git worktree add failed: {pinned.stderr.strip()}")
 
         job_workspace.write_marker(
-            target, branch=branch, base=exact_base, source_repo=self._repo
+            target,
+            branch=branch,
+            base=exact_base,
+            source_repo=self._repo,
+            owner_identity=owner_identity,
+            attempt_id=attempt_id,
         )
 
     def _rollback(

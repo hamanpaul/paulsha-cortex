@@ -255,6 +255,181 @@ def _reclaim_preserve_root(registry) -> Path:
     return paths.coordinator_root() / "evidence"
 
 
+def _owner_identity_matches(row: dict, *, expected: dict | None = None) -> dict[str, str]:
+    identity = row.get("owner_identity")
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"repo", "work_id", "slice_id"}
+        or any(not isinstance(identity.get(key), str) or not identity[key] for key in identity)
+        or identity.get("slice_id") != row.get("slice_id")
+    ):
+        raise RuntimeError("recover-pre-candidate requires complete owner identity")
+    if not isinstance(row.get("attempt_id"), str) or not row["attempt_id"]:
+        raise RuntimeError("recover-pre-candidate requires complete owner identity attempt")
+    if expected is not None and (
+        identity["repo"] != expected.get("repo")
+        or identity["work_id"] != expected.get("work_id")
+    ):
+        raise RuntimeError("recover-pre-candidate owner identity differs from WorkAuthority")
+    return identity
+
+
+def _resolve_work_owner_slice(registry, *, repo: str, work_id: str) -> dict:
+    """以完整 WorkAuthority repo/work_id 唯一解析 slice，拒絕啟發式 fallback。"""
+    lookup = getattr(registry, "list_slices_by_owner", None)
+    if not callable(lookup):
+        raise RuntimeError("recover-pre-candidate owner lookup API unavailable")
+    rows = lookup(repo=repo, work_id=work_id)
+    matches = []
+    malformed = False
+    for row in rows:
+        identity = row.get("owner_identity") if isinstance(row, dict) else None
+        if not isinstance(identity, dict):
+            continue
+        if identity.get("repo") != repo or identity.get("work_id") != work_id:
+            continue
+        try:
+            _owner_identity_matches(row, expected={"repo": repo, "work_id": work_id})
+        except RuntimeError:
+            malformed = True
+            continue
+        matches.append(row)
+    if malformed:
+        raise RuntimeError("recover-pre-candidate owner identity is incomplete or malformed")
+    if len(matches) > 1:
+        raise RuntimeError("recover-pre-candidate owner identity is ambiguous")
+    if not matches:
+        raise RuntimeError("recover-pre-candidate requires exactly one owner identity match")
+    return matches[0]
+
+
+def _recover_pre_candidate_core(
+    registry,
+    *,
+    slice_id: str,
+    actor: str,
+    handoff_dir: str,
+    clock: Callable[[], str] = _utcnow,
+    git_runner=None,
+    expected_owner: dict | None = None,
+) -> dict:
+    """兩個入口共用的 owner-bound admission、reclaim、transition 與 handoff 更新。"""
+    try:
+        row = registry.get_slice(slice_id)
+    except KeyError as exc:
+        raise RuntimeError("recover-pre-candidate target slice is unavailable") from exc
+    owner_identity = _owner_identity_matches(row, expected=expected_owner)
+    candidate = row.get("candidate")
+    # 與 needs_human 動作清單（valid_candidate）同一判準：非合法 SHA 的殘值視同尚無
+    # candidate，仍可 recover；只有合法 SHA candidate 才拒絕。
+    if isinstance(candidate, str) and verification.SAFE_SHA_RE.fullmatch(candidate) is not None:
+        raise ValueError("recover-pre-candidate requires null candidate")
+    if row.get("state") not in {"needs_human", "failed", "pending"}:
+        raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")
+    builder_job_id = row.get("builder_job_id")
+    if row.get("state") == "pending" and builder_job_id is None:
+        return {
+            "action": "recover-pre-candidate",
+            "reason": "already-recovered",
+            "slice_id": slice_id,
+            "slice_state": "pending",
+            "gate_state": "pending",
+            "result": "ok",
+        }
+    if not isinstance(builder_job_id, str) or not builder_job_id:
+        raise RuntimeError("recover-pre-candidate requires an owner-bound builder job")
+    try:
+        builder_job = registry.get_job(builder_job_id)
+    except Exception as exc:
+        raise RuntimeError("recover-pre-candidate owner-bound builder job is unavailable") from exc
+    if (
+        builder_job.get("owner_identity") != owner_identity
+        or builder_job.get("attempt_id") != row.get("attempt_id")
+    ):
+        raise RuntimeError("recover-pre-candidate builder job identity mismatch")
+
+    worktree = builder_job.get("worktree")
+    if isinstance(worktree, str) and worktree and Path(worktree).exists():
+        marker = job_workspace.read_marker(worktree)
+        if (
+            not isinstance(marker, dict)
+            or marker.get("owner_identity") != owner_identity
+            or marker.get("attempt_id") != row.get("attempt_id")
+        ):
+            raise RuntimeError("recover-pre-candidate workspace marker identity mismatch")
+    branch_hint = row.get("branch")
+    reclaim = worktree_reclaim.reclaim_recorded_or_derived(
+        recorded_path=worktree if isinstance(worktree, (str, Path)) and worktree else None,
+        pool_root=None,
+        job_id=slice_id,
+        branch=branch_hint if isinstance(branch_hint, str) else None,
+        git_runner=git_runner,
+        preserve_root=_reclaim_preserve_root(registry),
+    )
+    if reclaim is not None and not reclaim.ok:
+        raise RuntimeError(
+            "recover-pre-candidate worktree reclaim failed: "
+            f"{reclaim.detail or reclaim.status} ({reclaim.path})"
+        )
+
+    requested_at = clock()
+    consumed_at = clock()
+    registry.record_action(
+        slice_id,
+        action="operator-recover-pre-candidate",
+        actor=actor,
+        state="pending",
+        gate_state="pending",
+        clear_builder_binding=True,
+        clear_candidate=True,
+        requested_at=requested_at,
+        consumed_at=consumed_at,
+        result="ok",
+    )
+    updated = registry.get_slice(slice_id)
+    if (
+        updated.get("state") != "pending"
+        or updated.get("gate_state") != "pending"
+        or updated.get("builder_job_id") is not None
+        or updated.get("candidate") is not None
+        or updated.get("owner_identity") != owner_identity
+    ):
+        raise RuntimeError("recover-pre-candidate registry read-back mismatch")
+
+    manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+    manifest_was_present = manifest_path.is_file() and not manifest_path.is_symlink()
+    action = "operator-recover-pre-candidate"
+    _supersede_handoff_manifest(
+        handoff_dir=handoff_dir,
+        slice_id=slice_id,
+        action=action,
+        actor=actor,
+        clock=clock,
+    )
+    if manifest_was_present:
+        manifest = _read_manifest_payload(manifest_path)
+        if (
+            manifest is None
+            or not isinstance(manifest.get("superseded_at"), str)
+            or manifest.get("superseded_by") != actor
+            or manifest.get("superseded_reason") != action
+        ):
+            raise RuntimeError("recover-pre-candidate handoff manifest read-back mismatch")
+    payload = {
+        "slice_id": slice_id,
+        "action": "recover-pre-candidate",
+        "reason": "pre-candidate-slice-reset",
+        "slice_state": updated.get("state"),
+        "gate_state": updated.get("gate_state"),
+        "result": "ok",
+        "requested_at": requested_at,
+        "consumed_at": consumed_at,
+    }
+    if reclaim is not None:
+        payload["worktree_reclaim"] = reclaim.to_dict()
+    return payload
+
+
 def _is_workflow_lane_job(job: dict) -> bool:
     """job 屬於 workflow lane 的判定（issue #264）。
 
@@ -2060,7 +2235,12 @@ def apply_slice_action(
         slice_row = registry.get_slice(slice_id)
     except KeyError as exc:
         raise ValueError("unknown-slice") from exc
-    if action not in allowed_slice_actions(registry, slice_row):
+    already_recovered = (
+        action == "recover-pre-candidate"
+        and slice_row.get("state") == "pending"
+        and slice_row.get("builder_job_id") is None
+    )
+    if action not in allowed_slice_actions(registry, slice_row) and not already_recovered:
         raise ValueError(f"action-not-allowed:{action}")
 
     requested_at = clock()
@@ -2098,104 +2278,14 @@ def apply_slice_action(
         }
 
     if action == "recover-pre-candidate":
-        cand = slice_row.get("candidate")
-        if isinstance(cand, str) and verification.SAFE_SHA_RE.fullmatch(cand) is not None:
-            raise ValueError("action-not-allowed:recover-pre-candidate")
-
-        if slice_row.get("state") == "pending" and slice_row.get("builder_job_id") is None:
-            consumed_at = clock()
-            return {
-                "slice_id": slice_id,
-                "action": action,
-                "slice_state": "pending",
-                "gate_state": "pending",
-                "result": "ok",
-                "reason": "already-recovered",
-                "requested_at": requested_at,
-                "consumed_at": consumed_at,
-            }
-
-        builder_job_id = slice_row.get("builder_job_id")
-        wt_path = None
-        if isinstance(builder_job_id, str):
-            try:
-                b_job = registry.get_job(builder_job_id)
-                wt_path = b_job.get("worktree")
-            except Exception:
-                pass
-        if not wt_path:
-            wt_path = slice_row.get("worktree")
-
-        # #478：舊碼在 `runner is None`（生產 dispatcher 的合法狀態）時整段跳過
-        # git 清理只 rmtree 目錄，registry 記錄留下來讓下一 tick 的
-        # `git worktree add` 必失敗；且清理只在「目錄還在」時觸發，既存的
-        # 「目錄已消失、registry 殘留」壞狀態永遠自癒不了。改走單一回收函式：
-        # 預設 runner 由 `worktree_reclaim` 自行 fallback，後置條件（目錄不存在
-        # ＋ registry 無該筆）驗證不過就 fail closed，不再回報 ok。
-        # #645：記錄沒有 worktree 時的反推改走共用 helper，新舊兩種目錄形狀都試。
-        # pool root **只在真的要反推時才解析**——`paths.worktree_root()` 在
-        # `PSC_REPO_ROOT` 未宣告時是 fail-closed 的（#612），記錄已有路徑卻因此炸掉
-        # 會讓回收比 #645 之前更脆弱。
-        recorded = wt_path if isinstance(wt_path, (str, Path)) and wt_path else None
-        pool_root = None
-        if recorded is None:
-            try:
-                pool_root = paths.worktree_root()
-            except Exception:
-                pool_root = None
-        branch_hint = slice_row.get("branch")
-        reclaim = worktree_reclaim.reclaim_recorded_or_derived(
-            recorded_path=recorded,
-            pool_root=pool_root,
-            job_id=slice_id,
-            branch=branch_hint if isinstance(branch_hint, str) else None,
-            git_runner=runner,
-            preserve_root=_reclaim_preserve_root(registry),
-        )
-        if reclaim is not None and not reclaim.ok:
-            raise RuntimeError(
-                "recover-pre-candidate worktree reclaim failed: "
-                f"{reclaim.detail or reclaim.status} ({reclaim.path})"
-            )
-
-        consumed_at = clock()
-        registry.record_action(
-            slice_id,
-            action="operator-recover-pre-candidate",
-            actor=actor,
-            state="pending",
-            gate_state="pending",
-            requested_at=requested_at,
-            consumed_at=consumed_at,
-            result="ok",
-        )
-        registry.update_slice(
-            slice_id,
-            state="pending",
-            gate_state="pending",
-            builder_job_id=None,
-            candidate=None,
-        )
-        _supersede_handoff_manifest(
-            handoff_dir=handoff_dir,
+        return _recover_pre_candidate_core(
+            registry,
             slice_id=slice_id,
-            action="operator-recover-pre-candidate",
             actor=actor,
+            handoff_dir=handoff_dir,
             clock=clock,
+            git_runner=runner,
         )
-        latest = registry.get_slice(slice_id)
-        payload = {
-            "slice_id": slice_id,
-            "action": action,
-            "slice_state": latest.get("state"),
-            "gate_state": latest.get("gate_state"),
-            "result": "ok",
-            "requested_at": requested_at,
-            "consumed_at": consumed_at,
-        }
-        if reclaim is not None:
-            payload["worktree_reclaim"] = reclaim.to_dict()
-        return payload
 
     if action == "retry-build":
         metas = scan_specs_fn(specs_dir)

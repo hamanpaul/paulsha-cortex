@@ -504,6 +504,8 @@ def write_marker(
     branch: str,
     base: str,
     source_repo: str | Path,
+    owner_identity: dict[str, str] | None = None,
+    attempt_id: str | None = None,
 ) -> Path:
     path = marker_path(workspace)
     payload = {
@@ -514,6 +516,10 @@ def write_marker(
         "source_repo": str(source_repo),
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if owner_identity is not None:
+        payload["owner_identity"] = dict(owner_identity)
+    if attempt_id is not None:
+        payload["attempt_id"] = attempt_id
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
