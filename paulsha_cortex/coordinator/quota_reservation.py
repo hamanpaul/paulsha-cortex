@@ -853,6 +853,32 @@ def _validate_reconcile_row(row: dict[str, Any]) -> None:
         raise ReservationCorrupt("reservation-store-invalid-record")
     if not isinstance(row["evidence"], dict):
         raise ReservationCorrupt("reservation-store-invalid-record")
+    renew = row["renew_lease_ms"]
+    if renew is not None and (type(renew) is not int or renew < 0 or renew > _MAX_LEASE_MS):
+        raise ReservationCorrupt("reservation-store-invalid-record")
+
+
+def _validate_transition_time(row: dict[str, Any]) -> None:
+    """所有轉移事件的 event_at_ms／sequence 都必須是合法整數；壞檔案不得在
+    折疊時噴裸 TypeError，而是一致地 ReservationCorrupt。"""
+    event_at_ms = row.get("event_at_ms")
+    if type(event_at_ms) is not int or event_at_ms < 0 or event_at_ms > _MAX_TIMESTAMP_MS:
+        raise ReservationCorrupt("reservation-store-invalid-record")
+    sequence = row.get("sequence")
+    if type(sequence) is not int or sequence < 0:
+        raise ReservationCorrupt("reservation-store-invalid-record")
+
+
+# 折疊時允許的狀態轉移（與公開 API 的前置條件一致）：終局（settled／
+# released）之後不得再有任何轉移；bind 只能從 reserved 發生。損毀但 shape
+# 合法的歷史（例如 reserve→settle→bind）必須 fail-closed，不得復活已終局的
+# reservation 並重新占用容量。
+_ALLOWED_FROM_STATE: dict[str, frozenset[str]] = {
+    "bind": frozenset({"reserved"}),
+    "settle": frozenset({"reserved", "bound"}),
+    "release": frozenset({"reserved", "bound"}),
+    "reconcile": frozenset({"reserved", "bound"}),
+}
 
 
 _EVENT_VALIDATORS: dict[str, Callable[[dict[str, Any]], None]] = {
@@ -901,8 +927,12 @@ def _fold(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         current = folded.get(reservation_id)
         if current is None:
             raise ReservationCorrupt("reservation-store-orphan-transition")
+        _validate_transition_time(row)
         if row["sequence"] != current["sequence"] + 1:
             raise ReservationCorrupt("reservation-store-sequence-gap")
+        allowed = _ALLOWED_FROM_STATE.get(row["kind"])
+        if allowed is None or current["state"] not in allowed:
+            raise ReservationCorrupt("reservation-store-illegal-transition")
         current["sequence"] = row["sequence"]
         current["last_event_at_ms"] = row["event_at_ms"]
         if row["kind"] == "bind":

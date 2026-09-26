@@ -26,3 +26,4 @@ crash matrix（reserve／bind／settle／release 各階段）、negative（lease
 非活 job、liveness unknown、錯 owner/CAS/attempt、torn-write 損毀 store、
 負值/非有限需求）、replay/reset 冪等性，以及 bounded worker 壓力測試與固定
 輪數 release／reacquire 耐久 audit。
+- #838 對抗審查修復：reservation 事件折疊驗證合法狀態轉移（終局後不得再轉移、bind 只能從 reserved），並驗證 reconcile 的 renew_lease_ms 與所有轉移的 event_at_ms／sequence 型別；損毀但 shape 合法的歷史一律 ReservationCorrupt。

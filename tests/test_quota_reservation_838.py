@@ -391,6 +391,55 @@ def test_ac4_corrupt_store_fails_closed_never_treated_as_empty(tmp_path: Path) -
         )
 
 
+def _append_raw_row(path: Path, row: dict) -> None:
+    import json as _json
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(_json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def test_ac4_illegal_transition_history_fails_closed(tmp_path: Path) -> None:
+    """損毀但 shape 合法的歷史（reserve→settle→bind）不得把已終局 reservation
+    復活成 bound 並重新占用容量；讀回必須 ReservationCorrupt。"""
+    path = tmp_path / "reservations.jsonl"
+    authority = QuotaReservationAuthority(path)
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-illegal", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    settled = authority.settle(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", outcome="succeeded", expected_sequence=0, now_ms=NOW + 1,
+    )
+    assert settled.status == "ok"
+    _append_raw_row(path, {
+        "schema_version": 1, "kind": "bind", "reservation_id": granted.reservation_id,
+        "sequence": 2, "job_id": "job-revived", "event_at_ms": NOW + 2,
+    })
+    with pytest.raises(ReservationCorrupt):
+        QuotaReservationAuthority(path).committed(now_ms=NOW + 3)
+
+
+def test_ac4_malformed_reconcile_numbers_fail_closed_not_type_error(tmp_path: Path) -> None:
+    """reconcile row 的 renew_lease_ms／event_at_ms 型別錯誤必須一致地
+    ReservationCorrupt，不得噴裸 TypeError。"""
+    path = tmp_path / "reservations.jsonl"
+    authority = QuotaReservationAuthority(path)
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-reconcile", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    _append_raw_row(path, {
+        "schema_version": 1, "kind": "reconcile", "reservation_id": granted.reservation_id,
+        "sequence": 1, "resolution": "confirmed-alive", "evidence": {},
+        "renew_lease_ms": "1000", "event_at_ms": NOW + 1,
+    })
+    with pytest.raises(ReservationCorrupt):
+        QuotaReservationAuthority(path).committed(now_ms=NOW + 2)
+
+
 def test_ac4_negative_or_non_finite_amount_rejected() -> None:
     for bad in ("-1", "nan", "inf", "-inf", "abc", ""):
         with pytest.raises(ValueError):
