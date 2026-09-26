@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#473 Deck spec repo 宣告**：`cortex deck compile --repo owner/name` 會將明示的 repo 寫入輸出 spec；未指定時維持 `repo: null`，不從本機路徑或 git remote 推斷。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

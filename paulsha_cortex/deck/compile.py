@@ -402,6 +402,7 @@ def _render_frontmatter(
     deps: Sequence[str],
     target_branch: str,
     verification: dict[str, object],
+    repo: str | None,
 ) -> str:
     depends_on = "[" + ", ".join(deps) + "]" if deps else "[]"
     lines = [
@@ -411,9 +412,8 @@ def _render_frontmatter(
         f"plan: {json.dumps(plan_ref, ensure_ascii=False)}",
         f"depends_on: {depends_on}",
         f"target_branch: {json.dumps(target_branch, ensure_ascii=False)}",
-        # #469：repo 歸屬為 optional 顯式宣告——emit 只出 null 佔位，操作者翻
-        # dispatch: auto 前自行補 owner/repo；自動自 claim/work item 帶入為 follow-up。
-        "repo: null",
+        # #469：只採用明示的 owner/repo；省略時保留 null，不從路徑或 remote 推斷。
+        f"repo: {_format_scalar(repo)}",
     ]
     lines.append("verification:")
     lines.append(f"  docs_class: {_format_scalar(verification.get('docs_class'))}")
@@ -620,6 +620,7 @@ def compile_combo(
     allow_external: bool = False,
     plan_ref: str | None = None,
     band: str | None = None,
+    repo: str | None = None,
     repo_root: str | Path | None = None,
 ) -> CompileResult:
     # #612：`cortex deck compile` 是 operator 手動 CLI，未帶 `repo_root` 時「以當下
@@ -700,6 +701,7 @@ def compile_combo(
                 deps,
                 target_branch,
                 verification_skeleton,
+                repo,
             )
             + "\n"
             + f"# {slice_id}\n\n"

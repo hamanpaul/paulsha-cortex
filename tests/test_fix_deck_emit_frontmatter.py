@@ -75,6 +75,7 @@ def test_emit_frontmatter_non_empty_target_branch_and_verification_contract(tmp_
         full_suite = verification.get("full_suite")
         frontmatter = yaml.safe_load(emitted.read_text(encoding="utf-8").split("---", 2)[1])
         assert set(frontmatter).issuperset({"target_branch", "verification"})
+        assert frontmatter["repo"] is None
         assert set(verification).issuperset({"docs_class", "checks", "tests", "full_suite"})
         assert isinstance(checks, list) and checks
         assert any(check.get("kind") == "persona-scope" for check in checks)
@@ -84,3 +85,23 @@ def test_emit_frontmatter_non_empty_target_branch_and_verification_contract(tmp_
         assert isinstance(tests, list) and tests
         assert full_suite is not None
         assert full_suite.get("baseline") == "no-regression"
+
+
+def test_emit_frontmatter_preserves_explicit_repo(tmp_path):
+    cards, combo = _seed(tmp_path)
+    result = compile_combo(
+        combo,
+        cards,
+        "fix deck emit frontmatter",
+        change="101",
+        allow_external=True,
+        repo="acme/demo",
+    )
+    output_dir = tmp_path / "specs"
+    emit(result, output_dir)
+
+    emitted_specs = sorted(output_dir.glob("*.md"))
+    assert emitted_specs
+    for emitted in emitted_specs:
+        frontmatter = yaml.safe_load(emitted.read_text(encoding="utf-8").split("---", 2)[1])
+        assert frontmatter["repo"] == "acme/demo"
