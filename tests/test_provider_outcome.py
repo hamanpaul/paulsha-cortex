@@ -8,10 +8,12 @@ Root cause：`completion.classify_completion` 只有 exited/failed 兩值，`man
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from paulsha_cortex.coordinator import outcome_taxonomy
 from paulsha_cortex.coordinator.provider_outcome import (
     RETRYABLE_OUTCOMES,
     ProviderFailureClassification,
@@ -200,6 +202,31 @@ def test_no_signal_classifies_as_unknown_hint_and_not_retryable():
     assert result.retryable is False
 
 
+def test_aborted_tools_terminal_classifies_as_retryable_environment_failure():
+    output = json.dumps(
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "result": "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+            "errors": [
+                "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"
+            ],
+            "terminal_reason": "aborted_tools",
+        }
+    )
+    evidence = outcome_taxonomy.parse_stream_evidence(output)
+    structured = outcome_taxonomy.classify_structured_evidence(evidence)
+
+    assert structured is not None
+    assert structured.family is outcome_taxonomy.OutcomeFamily.ENVIRONMENT
+
+    result = classify_provider_failure(exit_code=1, output=output)
+    assert result.outcome is ProviderOutcome.TOOL_ABORTED
+    assert result.authority is SignalAuthority.STRUCTURED
+    assert result.retryable is True
+
+
 def test_none_output_does_not_raise():
     result = classify_provider_failure(exit_code=1, output=None)
     assert result.outcome is ProviderOutcome.UNKNOWN
@@ -214,8 +241,12 @@ def test_exit_127_without_readable_output_stays_unknown_hint():
     assert "not enough to prove missing executable" in result.reason
 
 
-def test_only_rate_limited_and_transient_are_retryable_outcomes():
-    assert RETRYABLE_OUTCOMES == {ProviderOutcome.RATE_LIMITED, ProviderOutcome.TRANSIENT}
+def test_retryable_outcomes_include_tool_aborts():
+    assert RETRYABLE_OUTCOMES == {
+        ProviderOutcome.RATE_LIMITED,
+        ProviderOutcome.TRANSIENT,
+        ProviderOutcome.TOOL_ABORTED,
+    }
 
 
 # --------------------------------------------------------------- authority level design

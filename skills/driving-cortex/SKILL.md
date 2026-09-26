@@ -63,7 +63,10 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 只有綁定 issue 明列部署／cutover 驗收且 operator 已授權時，才執行以下步驟；一般 PR merge 只記錄待部署狀態，不自行變更 installed runtime 或重啟 service。
 
 1. 在 target repo 以 `pipx install --force <repo>` 重新安裝，讓新 code 可被服務載入。
-2. 依序 restart manager/monitor，確保新 manifest、workflow 入口與身份配置同步。
+2. restart manager 前先執行 `cortex status`，確認 `in_flight` 沒有 `state` 為
+   `dispatched`／`running` 且 `executor` 為 `claude` 的 job；若有，等它結束，或接受
+   job 作廢並於 service 恢復後重派。再依序 restart manager/monitor，確保新 manifest、
+   workflow 入口與身份配置同步。
 3. 開始下一批前先清點 `systemctl --user status`、`cortex status` 與 monitor snapshot。
 4. 注意順序：daemon 啟動若過快，可能先看到舊 mtime；可在重啟前後比較部署時間與檔案 mtime 判斷是否已切到新版本。
 5. 複核 env/unit：有些 venv 或外部注入會覆寫 `F44` 相關變數，重啟前以 `grep` 將其列出。
