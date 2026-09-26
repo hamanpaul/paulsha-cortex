@@ -365,6 +365,40 @@ def test_rate_limited_failure_triggers_bounded_retry_and_reroutes_to_next_candid
     assert new_job["independence_domain"] == "anthropic"
 
 
+def test_quota_failure_falls_back_to_next_identity_without_retrying_failed_provider(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    base_head = _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, steps=_build_only_steps())
+    _seed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        executor="codex",
+        model_id="gpt-primary",
+        domain="openai",
+        outcome=ProviderOutcome.QUOTA,
+        reason="monthly limit reached",
+    )
+
+    result = manager.resume_workflow_run(
+        _ResumeDispatcher(registry, worktree),
+        run_id=run.run_id,
+        identities=_two_builder_identities(),
+        launcher_factory=_launcher_factory,
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    assert result["reason"] == "provider-failure-retry"
+    assert result["provider_outcome"] == "quota"
+    replacement = registry.get_job(result["job_id"])
+    assert replacement["executor"] == "claude"
+    assert replacement["independence_domain"] == "anthropic"
+
+
 def test_provider_failure_retry_reuses_preflight_approved_launcher(
     tmp_path: Path,
 ) -> None:

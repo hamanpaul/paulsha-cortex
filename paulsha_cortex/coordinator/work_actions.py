@@ -5267,6 +5267,87 @@ def _gc_abandoned_planning_artifacts(
             )
 
 
+def _retire_missing_pinned_path_links(run, *, authority) -> tuple[str, ...]:
+    """退休後只解除已回收、且仍由本 work item 明確映射的 pinned path link。"""
+
+    workspace_value = getattr(run, "workspace_root", None)
+    if not isinstance(workspace_value, str) or not workspace_value:
+        return ()
+    workspace = Path(workspace_value)
+    if workspace.is_symlink():
+        return ()
+    try:
+        root = workspace.resolve(strict=True)
+        if not root.is_dir():
+            return ()
+        override = root / ".cortex" / "work-items.yaml"
+        if (root / ".cortex").is_symlink() or override.is_symlink():
+            return ("work-item override symlink; path links retained",)
+        if not override.is_file():
+            return ()
+
+        from paulsha_cortex.monitor.correlation import (
+            SourceLink,
+            load_work_item_overrides,
+            unlink_work_source,
+        )
+
+        overrides = load_work_item_overrides(root)
+        item = overrides.work_items.get(authority.work_id)
+        if item is None:
+            return ()
+        mapped_refs = set(getattr(authority, "mapped_todo_paths", ()) or ())
+        pinned_refs = {
+            entry.ref for entry in (getattr(run, "planning_authority", ()) or ())
+        }
+        eligible_refs = mapped_refs & pinned_refs
+        if not eligible_refs:
+            return ()
+
+        warnings: list[str] = []
+        for link in item.links:
+            if link.kind != "path" or link.ref not in eligible_refs:
+                continue
+            target = root
+            missing = False
+            safe = True
+            for part in Path(link.ref).parts:
+                target = target / part
+                try:
+                    mode = target.lstat().st_mode
+                except FileNotFoundError:
+                    missing = True
+                    break
+                except OSError:
+                    safe = False
+                    break
+                if statmod.S_ISLNK(mode):
+                    safe = False
+                    break
+            if not safe or not missing:
+                continue
+            try:
+                unlink_work_source(root, authority.work_id, SourceLink("path", link.ref))
+            except Exception as exc:  # noqa: BLE001 - retirement is already durable
+                logger.warning(
+                    "retire-delivered-path-link-cleanup-failed run_id=%s ref=%s error=%s: %s",
+                    run.run_id,
+                    link.ref,
+                    type(exc).__name__,
+                    str(exc)[:200],
+                )
+                warnings.append(f"stale path link retained: {link.ref}")
+        return tuple(warnings)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not undo retirement
+        logger.warning(
+            "retire-delivered-path-link-cleanup-failed run_id=%s error=%s: %s",
+            getattr(run, "run_id", "unknown"),
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        return ("work-item path link cleanup failed",)
+
+
 def _reclaim_abandoned_build_worktrees(run, workflow_registry, *, state_path: Path) -> None:
     """#478／#527／#613：abandon 後回收 build worktree，並安全退役 build branch。
 
@@ -6043,7 +6124,10 @@ def _retire_delivered_action(
             evidence_ref=record["ref"],
         )
         _gc_abandoned_planning_artifacts(updated)
-        return {
+        cleanup_warnings = _retire_missing_pinned_path_links(
+            updated, authority=authority
+        )
+        result = {
             "action": "retired-delivered",
             "reason": reason,
             "actor": actor,
@@ -6052,6 +6136,9 @@ def _retire_delivered_action(
             "evidence": record,
             "run": updated.to_dict(),
         }
+        if cleanup_warnings:
+            result["warnings"] = list(cleanup_warnings)
+        return result
     if any(item.status == "ongoing" and item.run_id != run.run_id for item in related):
         raise RuntimeError("retire-delivered refuses a different active WorkflowRun")
     if not run.pr_refs:
@@ -6098,7 +6185,10 @@ def _retire_delivered_action(
         evidence_ref=record["ref"],
     )
     _gc_abandoned_planning_artifacts(updated)
-    return {
+    cleanup_warnings = _retire_missing_pinned_path_links(
+        updated, authority=authority
+    )
+    result = {
         "action": "retired-delivered",
         "reason": reason,
         "actor": actor,
@@ -6107,6 +6197,9 @@ def _retire_delivered_action(
         "evidence": record,
         "run": updated.to_dict(),
     }
+    if cleanup_warnings:
+        result["warnings"] = list(cleanup_warnings)
+    return result
 
 
 def _close_delivered_action(

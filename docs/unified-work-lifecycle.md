@@ -46,6 +46,8 @@ Planning publication 對 `docs/superpowers/specs`／`docs/superpowers/plans` 現
 
 combo manifest 既有的 `*<task-slug>*` outputs pattern 仍保留給 `openspec/changes/<change>/...` 使用，但不再單獨放行 `docs/superpowers/{specs,plans}`。這會同時關掉 substring prefix／suffix／middle／`-v2` 家族誤放行，以及「manifest pattern 命中但 kind 寫錯路徑」的 docs publication 入口；authority 重驗也與同一條 exact-stem 判準對齊。
 
+OpenSpec publication 的 `<change>` 可使用目前 Work Item 明確映射的 anchor slug，即使它不同於 `work_id`；仍須符合該 combo manifest 的 outputs，archive 路徑不接受 planning publication。
+
 ### Quota observation schema boundary
 
 `paulsha_cortex.coordinator.quota_observation` 是 #866 交付的純 schema／helper
@@ -129,7 +131,7 @@ cortex doctor --probe-live --repo owner/repo --json
 
 `cortex work start` 與 auto claim 建立 workflow 時，Manager 會先讀 durable snapshot 內已確認的 GitHub issue title，交給 `paulsha_cortex/deck/task_types.py` 的 taxonomy 做機械分類，再映射到 combo。現況 `feat` 會選 `feature-oneshot`、`fix` 會選 `fix-standard`；`docs`／`test`／`ci`／`refactor` 目前仍是明示缺口，會帶 `bypass-default` provenance 沿用既有 `feature-oneshot`。
 
-若標題是 `unknown_type`、scope 不在受控詞典、或多個 mapped issue 得到互斥 type，claim 會 fail-closed，且不建立 WorkflowRun。修法只有兩種：修正 issue title，或用 `cortex work start <work_id> --repo <owner/repo> --combo <id>` 做 authoritative override。override 永遠優先於自動選牌，並會在 run 的 `combo_selection` 留下 `explicit-override` 來源。
+若標題是 `unknown_type`、scope 不在受控詞典、或多個 mapped issue 得到互斥 type，claim 會 fail-closed，且不建立 WorkflowRun。錯誤會列出允許的 scope；外部 repo 可用 `cortex work start <work_id> --repo <owner/repo> --combo <id>` 明示 combo。修正 issue title 或明示 combo 都不會放寬未知 scope 的自動分類。override 永遠優先於自動選牌，並會在 run 的 `combo_selection` 留下 `explicit-override` 來源。
 
 `cortex stat --combo-selections` 會彙總 `source × task_type`，直接看出多少 run 是自動選牌、多少走 override、多少因 title 缺席／unparseable／combo 缺口而 bypass。`fix-standard` 雖然比 comment 草稿多了 `openspec-propose` 與 `writing-plans` 兩張 planner 卡，但這是為了滿足 `validate_manager_spine` 的完整 phase spine；verification 與 code-review 兩條核心 gate 維持不變。
 
@@ -290,7 +292,7 @@ Manager 是唯一 writer。每次 push 都會使上一個 delivery review epoch 
 
 V1 terminal delivery 僅支援 GitHub。其他 forge 仍可顯示 read model，但 ship 會停在 `needs_human`。
 
-Authority 前進時，claim 會先讀取收到的 delivery journal；若 review run 的完整 merge authorization、workflow step、PR binding 與 Candidate 都相符，便保留原 phase，不執行 authority-restart reset。舊版已標記 `retry_classification=authority_restart` 且 reset 到 `verify` 的 merged run，`resume` 會 fail-closed 回報 `merged-run-reset-to-verify`、不派 verify，並提供 `cortex work <work-id> retire-delivered --repo <owner/repo> --expected-run-id <run-id> --actor <operator> --reason '<single-line reason>'`。`retire-delivered` 只退休孤兒 run，維持 abandoned/superseded 語意；它不補寫 CompletionRecord 或 shipped outcome，也不把 run 標成 done。
+Authority 前進時，claim 會先讀取收到的 delivery journal；若 review run 的完整 merge authorization、workflow step、PR binding 與 Candidate 都相符，便保留原 phase，不執行 authority-restart reset。舊版已標記 `retry_classification=authority_restart` 且 reset 到 `verify` 的 merged run，`resume` 會 fail-closed 回報 `merged-run-reset-to-verify`、不派 verify，並提供 `cortex work <work-id> retire-delivered --repo <owner/repo> --expected-run-id <run-id> --actor <operator> --reason '<single-line reason>'`。`retire-delivered` 只退休孤兒 run，維持 abandoned/superseded 語意；它不補寫 CompletionRecord 或 shipped outcome，也不把 run 標成 done。退休後只會解除同時屬於該 run pinned planning authority 與目前 mapped Todo 的缺失 path link；仍存在、為 symlink、或未被這兩者確認的連結會保留。
 
 ## Terminal lifecycle canary
 
@@ -360,7 +362,7 @@ JSON string data 中的原始 Unicode NEL（`U+0085`）、line separator（`U+20
 **Registry history 有界保留（#821）**：每個 slice 的 `evidence_history`、`evaluation_history` 與 `actions` 預設最多保留 500 筆，可用正整數環境變數 `PSC_COORDINATOR_SLICE_HISTORY_LIMIT` 覆寫；超出時保留首筆與最近紀錄，每種列表的丟棄數記在 `history_truncated`。這些列表不代表完整封存；current refs 與必要 evidence 維持原有保存契約。
 
 **slice-lane builder 拿到的是 pinned spec 逐字內容，且由 Cortex 自己 attest（#503）。** 舊 prompt 只有 `[TASK] <slice_id>` 與 `[PLAN: path]`，controller 重釘 spec 後補進的 recovery 指示與必做回歸測試在模型邊界被靜默丟掉，registry 卻顯示新 spec hash——稽核只證明「選了哪個 hash」，不證明模型讀到了它。現在 dispatch 在登記 slice row 之後重讀 spec，其 sha256 必須等於 pin 值（不等或不可讀就對該 slice fail-closed 成 needs_human、不派 job），prompt 附 `[SPEC: path sha256=…]`、固定明示語句與逐字 `[SPEC BODY]`（超過上限截斷並指示讀檔），builder 角色缺 spec 即拒絕組 prompt；job row 記錄實際交付的 `spec_hash`／`plan_hash`，完成側除了檔案漂移檢查，另比對 builder job 記錄的 hash 與 slice 釘住的值（`builder-input-spec-hash`／`builder-input-plan-hash` → pinned-input-mismatch，candidate 不得通過）；foreign review prompt 也附同一份 `[SPEC …]` 行。
-**operator 裁決（`--reason`）是必須執行的指令，不是 metadata（#814）。** `retry-build`／`retry-card`／`retry-review` 帶 `--reason` 會落一筆 immutable `cortex-operator-adjudication/v1` evidence，完整保存最多 4000 字。Manager 於該 run 之後每一次 dispatch（builder 與 reviewer 皆然，#757）把最近 ≤3 筆放進 contract 的 `operator_adjudications` 區塊；每筆 reason 只注入前 2000 字，超出部分仍保留在 evidence。builder directive 要求實作適用裁決；reviewer directive 將裁決作為唯讀驗收判準，若裁決明示接受或豁免某 finding／偏離，不得再以 blocking 類別回報該 finding；仍需記錄時用 non-blocking 類別並在 recommendation 引用裁決。CLI 回傳的 `adjudication.next_step_hint` 會告訴 operator 裁決已記錄、將於下一次哪張卡 dispatch 注入；不需要再繞 reviewer findings 轉述一輪。
+**operator 裁決（`--reason`）是必須執行的指令，不是 metadata（#814）。** `retry-build`／`retry-card`／`retry-review` 帶 `--reason` 會落一筆 immutable `cortex-operator-adjudication/v1` evidence，完整保存最多 4000 字。Manager 於該 run 之後每一次 dispatch（builder 與 reviewer 皆然，#757）把最近 ≤3 筆放進 contract 的 `operator_adjudications` 區塊；每筆 reason 只注入前 2000 字，超出部分仍保留在 evidence。builder directive 要求實作適用裁決；reviewer directive 將裁決作為唯讀驗收判準，若裁決明示接受或豁免某 finding／偏離，不得再以 blocking 類別回報該 finding；仍需記錄時用 non-blocking 類別並在 recommendation 引用裁決。CLI 回傳的 `adjudication.next_step_hint` 會告訴 operator 裁決已記錄、將於下一次哪張卡 dispatch 注入；不需要再繞 reviewer findings 轉述一輪。reviewer 會先依 actor、card、preconditions、目前 candidate 歷史與 Manager actions 判斷裁決適用性；範圍或歸因不成立時要求 operator 重新裁決。測試與 policy 結果須引用目前 Manager 提供的 gate evidence，沒有相符證據時標示 `not measured`，不沿用舊 ruling 當成目前結果。
 
 **升級與運維。** 派工 prompt 現在發的是 canonical envelope（`schema_version: 2`，多帶 `diagnostics` 與 `gate_evidence`）。不帶該版本的舊 payload 仍走相容讀取路徑，不會因版本差異被拒收。切換當下已在飛行、且沒有 gate ledger 的 build／verify run，其 `passed` terminal 會 fail closed 並轉 `needs_human`——這是預期行為（沒有獨立證據就不放行），不是資料損毀：candidate 與 worktree 都還在，只是未被授權。處理方式是對該 run 重新派工該張 card（resume 會以新的 wrapper 重跑並產生 ledger），不需要 abandon 整個 work item；只有在 candidate 本身已被判定不可用時才需要 abandon 重跑。
 
@@ -369,5 +371,7 @@ JSON string data 中的原始 Unicode NEL（`U+0085`）、line separator（`U+20
 **診斷與授權分離。** terminal parse 失敗時，`_terminal_parse_diagnostics` 保留 observed HEAD、job id 與失敗原因的唯讀診斷（`terminal_diagnostics`），但該 payload 明確標示 `authority_granted: false`，且不含任何 candidate authority 欄位——可觀測不等於可授權。
 
 **provider／launch 失敗詞彙維持分層，且只對有證據的 executable 問題 reroute（#826）。** 結構化 terminal 與 controller interruption 仍優先於文字關鍵字；其後才接受可證實的 `exit 127` 空輸出，最後才走 provider text 的 `rate limit → quota → auth → effort_not_supported → executable_not_found → content → transient` 次序。`not found` 只有在已知 launcher／executor 的 shell `command not found` 上下文、同一行帶 `exec`／`execvpe`／`execve`／`spawn`／`Popen` 與 `No such file or directory` 的 launcher ENOENT（若同一行也附帶 `: <target>`，該 target 必須是已知 launcher executable，且不能只是缺失的 cwd/path；若沒有明示 target，則 bare launch-call ENOENT 仍可成立；未知 explicit target 一律維持 non-reroutable）、可信的空 `127`（不是缺 log／讀不到 log），或 launch 例外可證明缺的是 provider executable（如 `copilot`／`codex`／`claude`／`agy`／`cg` 或精確 executor 名）時，才會進 `executable_not_found`；HTTP 404、model not found、一般工作檔案 `No such file or directory`，以及 `bash`／`sh`／`git`／`systemctl`／`systemd-run` 這類 shared launch infrastructure 缺失，都不會借題發揮成 reroute。新的環境類詞彙是 `effort_not_supported`／`executable_not_found`／`launch_failed`：前兩者在 authority 不是 `hint` 時可有界 reroute，`launch_failed` 只保留原始 exception／缺 handle 診斷，三條 launch-failure producer path 都會同步保存 matching `launch-failed` runtime diagnostic，不自動 retry 或 reroute；真正的 `runtime-contract-failed` 與 reviewer candidate drift 仍比 provider routing 更強，持續 fail-closed。
+
+quota outcome 不會在失敗 identity 上重試；Builder roster 尚有其他合格 identity 時，Manager 會改派下一位。沒有替代 identity 時依既有停止語意處理；rate-limit、transient 與其他 provider outcome 的政策不變。
 
 **#582 sandbox 工具中止分類**：終局 `subtype=error_during_execution` 且 `terminal_reason=aborted_tools` 表示工具鏈被外部生命週期中斷，分類為 `environment`／`tool_aborted`，可進入 bounded retry；這不同於維持 `unknown` 的一般 controller interruption。

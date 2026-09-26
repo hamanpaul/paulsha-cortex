@@ -1019,6 +1019,79 @@ def test_retire_delivered_supersedes_ongoing_run_when_all_prs_terminal(
         )
 
 
+def test_retire_delivered_unlinks_missing_pinned_todo_path(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    repo_root = Path(run.workspace_root)
+    todo_ref = "docs/todo.md"
+    todo = repo_root / todo_ref
+    todo.parent.mkdir(parents=True, exist_ok=True)
+    content = b"---\nwork_item: demo\n---\n- [ ] pinned task\n"
+    todo.write_bytes(content)
+    registry._manager_update_workflow_run(
+        run_id,
+        pr_refs=("acme/demo#110",),
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=todo_ref,
+                kind="plan",
+                work_id="demo",
+                baseline_sha256=hashlib.sha256(content).hexdigest(),
+            ),
+        ),
+    )
+    override = repo_root / ".cortex" / "work-items.yaml"
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text(
+        "version: 1\n"
+        "work_items:\n"
+        "  demo:\n"
+        "    title: Demo\n"
+        "    links:\n"
+        "      - kind: path\n"
+        f"        ref: {todo_ref}\n"
+        "    excludes: []\n",
+        encoding="utf-8",
+    )
+
+    result = work_actions.execute_work_action(
+        args={
+            "action": "retire-delivered",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "actor": "operator",
+            "expected_run_id": run_id,
+            "reason": "已交付，清除已回收的規劃連結。",
+        },
+        requested_by="operator",
+        runner=_pr_lifecycle_runner(
+            {110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+        ),
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["action"] == "retired-delivered"
+    assert not todo.exists()
+    from paulsha_cortex.monitor.correlation import SourceLink, load_work_item_overrides
+
+    overrides = load_work_item_overrides(repo_root)
+    assert overrides.work_items["demo"].links == ()
+    assert overrides.work_items["demo"].excludes == (SourceLink("path", todo_ref),)
+
+
 def test_abandon_still_refuses_any_pr_refs_run(tmp_path: Path) -> None:
     """Gap 1 guard: the new retire path must NOT weaken abandon — a run with
     pr_refs is still rejected by the strict pre-delivery gate."""

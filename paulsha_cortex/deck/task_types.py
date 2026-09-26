@@ -156,7 +156,7 @@ def classify_title(title: str, taxonomy: TaskTypeTaxonomy) -> TitleClassificatio
                 disposition="fail_closed",
                 reason=(
                     f"ambiguous: scope {scope!r} 不在受控詞典"
-                    f"（允許: {', '.join(taxonomy.scopes)}）"
+                    f"（允許: {', '.join(taxonomy.scopes)}）；外部 repo 請明示 --combo <id>"
                 ),
             )
         return TitleClassification(

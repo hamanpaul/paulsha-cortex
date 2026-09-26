@@ -193,6 +193,24 @@ def test_publish_rejects_glob_only_docs_destinations(
         assert not (tmp_path / row["path"]).exists()
 
 
+def test_publish_accepts_mapped_openspec_slug_distinct_from_work_id(
+    tmp_path: Path,
+) -> None:
+    mapped_slug = "descriptive-change-name"
+    ref = f"openspec/changes/{mapped_slug}/proposal.md"
+    rollback = manager._publish_planning_artifacts(
+        str(tmp_path),
+        [_artifact_row("spec", ref)],
+        work_id=WORK_ID,
+        allowed_refs=(ref,),
+        anchor_slugs=(mapped_slug,),
+    )
+    try:
+        assert (tmp_path / ref).read_text(encoding="utf-8") == _artifact_content("spec")
+    finally:
+        rollback()
+
+
 @pytest.mark.parametrize("combo_name", ("small-fix", "feature-oneshot"))
 def test_publish_rejects_cross_kind_and_unknown_docs_kinds(
     tmp_path: Path, combo_name: str
