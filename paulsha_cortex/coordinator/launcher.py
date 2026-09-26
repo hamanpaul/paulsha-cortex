@@ -978,8 +978,6 @@ def build_claude_argv(
             )
         ),
     ]
-    if not review_only:
-        argv.append("--remote-control")
     if read_only:
         argv += ["--tools", ""]
     elif review_only:
