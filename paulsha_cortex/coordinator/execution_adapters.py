@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 import json
+import re
 from typing import Any, Callable
 
 from . import execution_profile as schema
@@ -671,34 +672,82 @@ def profile_report_consumer(
     source_digest: str,
     envelope_context: Mapping[str, object] | None = None,
 ) -> Mapping[str, object]:
-    """Validate a profile-aware file and optionally map its legacy envelope view.
+    """Validate a profile-aware PatchMUD report and optionally map its envelope view.
 
-    Report acceptance is provenance only.  The optional existing envelope
-    mapping is a compatibility projection and never creates qualification.
+    Report acceptance is provenance only.  The optional envelope mapping is a
+    projection and never creates qualification.
+
+    PatchMUD report v2 本身不帶 producer revision；內容完整性由 producer 寫入的
+    ``report_fingerprint``（去掉 ``generated_at`` 與自身後的 canonical JSON
+    SHA-256，``ensure_ascii=False``）承擔。呼叫端以 ``source_digest`` 釘住該
+    fingerprint、以 ``source_revision`` 記錄產出報表的 PatchMUD revision（只作
+    provenance，報表內無可比對欄位）。
     """
 
     if not isinstance(payload, Mapping):
         raise ExecutionAdapterError("profile report must be an object")
-    if payload.get("schema_version") != 1:
-        raise ExecutionAdapterError("unsupported profile report schema")
-    canonical = json.dumps(
-        dict(payload), ensure_ascii=True, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
     if (
-        payload.get("source_revision") != source_revision
+        type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 2
+    ):
+        raise ExecutionAdapterError(
+            "unsupported profile report schema; only PatchMUD v2 is accepted"
+        )
+    fingerprint = payload.get("report_fingerprint")
+    if not isinstance(fingerprint, str) or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", fingerprint
+    ) is None:
+        raise ExecutionAdapterError("profile report fingerprint is missing or malformed")
+    stable = {
+        key: value
+        for key, value in payload.items()
+        if key not in ("generated_at", "report_fingerprint")
+    }
+    try:
+        canonical = json.dumps(
+            stable,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ExecutionAdapterError("profile report is not finite JSON") from exc
+    if "sha256:" + sha256(canonical).hexdigest() != fingerprint:
+        raise ExecutionAdapterError("profile report fingerprint does not match content")
+    if (
+        not isinstance(source_revision, str)
+        or not source_revision.strip()
         or not isinstance(source_digest, str)
-        or sha256(canonical).hexdigest() != source_digest
+        or source_digest.removeprefix("sha256:") != fingerprint.removeprefix("sha256:")
     ):
         raise ExecutionAdapterError("profile report source revision/digest mismatch")
-    if payload.get("profile_key") != expected_profile_key:
+    leaderboards = payload.get("leaderboards")
+    matching_profile_row = False
+    if isinstance(leaderboards, Mapping):
+        for board in leaderboards.values():
+            if not isinstance(board, Mapping):
+                continue
+            rows = board.get("rows")
+            if not isinstance(rows, list):
+                continue
+            if any(
+                isinstance(row, Mapping)
+                and row.get("profile_id") == expected_profile_key
+                for row in rows
+            ):
+                matching_profile_row = True
+                break
+    if not matching_profile_row:
         raise ExecutionAdapterError("profile report does not match exact resolved profile")
     if payload.get("pricing") is not None and not isinstance(payload.get("pricing"), Mapping):
         raise ExecutionAdapterError("profile report pricing metadata must be an object")
     result = dict(payload)
+    result["source_revision"] = source_revision
     if envelope_context is not None:
         expected_context = {
             "executor", "model_id", "persona", "deck", "patchmud_version",
-            "report_model", "report_loadout",
+            "role", "benchmark_type", "deck_digest", "evaluator_revision",
         }
         if set(envelope_context) != expected_context:
             raise ExecutionAdapterError("profile report envelope context is incomplete")
@@ -712,8 +761,11 @@ def profile_report_consumer(
                 persona=envelope_context["persona"],
                 deck=envelope_context["deck"],
                 patchmud_version=envelope_context["patchmud_version"],
-                report_model=envelope_context["report_model"],
-                report_loadout=envelope_context["report_loadout"],
+                execution_profile_key=expected_profile_key,
+                role=envelope_context["role"],
+                benchmark_type=envelope_context["benchmark_type"],
+                deck_digest=envelope_context["deck_digest"],
+                evaluator_revision=envelope_context["evaluator_revision"],
             )
         except (EnvelopeMappingError, TypeError, ValueError) as exc:
             raise ExecutionAdapterError("profile report envelope mapping failed") from exc

@@ -55,6 +55,54 @@ def _descriptor(executor="copilot", model_id="fictional-model", *, effort_values
     }
 
 
+def _refingerprint(report: dict) -> dict:
+    """模擬 producer 對改寫後內容重新簽 fingerprint（PatchMUD report_schema 規則）。"""
+
+    stable = {
+        key: value
+        for key, value in report.items()
+        if key not in ("generated_at", "report_fingerprint")
+    }
+    encoded = json.dumps(
+        stable, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    report["report_fingerprint"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return report
+
+
+def _patchmud_v2_consumer_case():
+    report_path = Path(__file__).parent / "fixtures/patchmud/report-v2/positive.json"
+    # 逐位元組使用 PatchMUD 產出的 fixture（不加欄位、不重簽），證明真報表可消費。
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    # 產出該 fixture 的 PatchMUD revision（見 consumer 文件）；報表內沒有此欄，
+    # consumer 只記為 provenance。
+    source_revision = "421fadc7dc16b6ee9020bdc2333ff6fe856accaa"
+    row = report["leaderboards"]["clear_rate"]["rows"][0]
+    envelope_context = {
+        "executor": "copilot",
+        "model_id": "fictional-model",
+        "persona": "builder",
+        "deck": {
+            "deck_id": row["deck_id"],
+            "content_sha256": row["deck_digest"].removeprefix("sha256:"),
+            "encounter_count": len(row["coverage_expected_encounters"]),
+            "measured_personas": [row["role"]],
+        },
+        "patchmud_version": report["producer"]["version"],
+        "role": row["role"],
+        "benchmark_type": row["benchmark_type"],
+        "deck_digest": row["deck_digest"],
+        "evaluator_revision": row["evaluator_revision"],
+    }
+    return (
+        report,
+        row["profile_id"],
+        source_revision,
+        report["report_fingerprint"],
+        envelope_context,
+    )
+
+
 def test_a1_descriptor_only_model_and_native_effort_resolve_exact_profiles() -> None:
     identity = _identity()
     descriptor = _descriptor(effort_values=("fixture-native-v2",))
@@ -669,56 +717,156 @@ def test_a6_workflow_generic_and_planning_consumers_bind_the_profile_before_laun
     missing_revision = deepcopy(binding.to_dict())
     assert execution_adapters.load_profile_binding(missing_revision).actual_key is None
 
-    report = {
-        "schema_version": 1,
-        "source_revision": "patchmud-fixture-r1",
-        "profile_key": binding.resolved_key,
-        "runs_included": 8,
-        "runs_skipped": [],
-        "leaderboards": {
-            "clear_rate": {
-                "status": "ok",
-                "rows": [
-                    {
-                        "model": "fixture-model-spec",
-                        "loadout": "P0T0R0",
-                        "runs": 8,
-                        "clears": 7,
-                    }
-                ],
-            }
-        },
-        "pricing": {"usd": 0.01},
-    }
-    canonical = json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
+    report, expected_profile_key, source_revision, source_digest, envelope_context = (
+        _patchmud_v2_consumer_case()
+    )
     consumed = execution_adapters.profile_report_consumer(
         report,
-        expected_profile_key=binding.resolved_key,
-        source_revision="patchmud-fixture-r1",
-        source_digest=hashlib.sha256(canonical).hexdigest(),
-        envelope_context={
-            "executor": "copilot",
-            "model_id": "fictional-model",
-            "persona": "builder",
-            "deck": {
-                "deck_id": "fixture-deck",
-                "content_sha256": "a" * 64,
-                "encounter_count": 8,
-                "measured_personas": ["builder"],
-            },
-            "patchmud_version": "fixture-patchmud-r1",
-            "report_model": "fixture-model-spec",
-            "report_loadout": "P0T0R0",
-        },
+        expected_profile_key=expected_profile_key,
+        source_revision=source_revision,
+        source_digest=source_digest,
+        envelope_context=envelope_context,
     )
-    assert consumed["profile_key"] == binding.resolved_key
-    assert consumed["envelope_mapping"]["provenance"]["registry_writable"] is True
-    with pytest.raises(ValueError, match="profile report"):
+    assert consumed["schema_version"] == 2
+    assert consumed["source_revision"] == source_revision
+    assert consumed["envelope_mapping"]["provenance"]["registry_writable"] is False
+    observation = consumed["envelope_mapping"]["provenance"]["observation"]
+    assert observation["profile_id"] == expected_profile_key
+    assert observation["role"] == envelope_context["role"]
+    assert observation["benchmark_type"] == envelope_context["benchmark_type"]
+    assert observation["deck_digest"] == envelope_context["deck_digest"]
+    assert observation["evaluator_revision"] == envelope_context["evaluator_revision"]
+    with pytest.raises(
+        ValueError, match="profile report does not match exact resolved profile"
+    ):
         execution_adapters.profile_report_consumer(
             report,
             expected_profile_key="epk:v1:resolved:" + "0" * 64,
-            source_revision="patchmud-fixture-r1",
-            source_digest=hashlib.sha256(canonical).hexdigest(),
+            source_revision=source_revision,
+            source_digest=source_digest,
+        )
+
+
+def test_profile_report_consumer_rejects_v1_and_invalid_source_provenance() -> None:
+    report, expected_profile_key, source_revision, source_digest, _ = (
+        _patchmud_v2_consumer_case()
+    )
+    legacy_path = Path(__file__).parent / "fixtures/patchmud/legacy-v1/report.json"
+    legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+    with pytest.raises(ValueError, match="profile report"):
+        execution_adapters.profile_report_consumer(
+            legacy,
+            expected_profile_key=expected_profile_key,
+            source_revision=source_revision,
+            source_digest=source_digest,
+        )
+    tampered = deepcopy(report)
+    tampered["leaderboards"]["clear_rate"]["rows"][0]["clears"] += 1
+    with pytest.raises(ValueError, match="fingerprint does not match content"):
+        execution_adapters.profile_report_consumer(
+            tampered,
+            expected_profile_key=expected_profile_key,
+            source_revision=source_revision,
+            source_digest=source_digest,
+        )
+    unsigned = deepcopy(report)
+    del unsigned["report_fingerprint"]
+    with pytest.raises(ValueError, match="fingerprint is missing or malformed"):
+        execution_adapters.profile_report_consumer(
+            unsigned,
+            expected_profile_key=expected_profile_key,
+            source_revision=source_revision,
+            source_digest=source_digest,
+        )
+    # 內容合法重簽，但呼叫端釘住的仍是原 fingerprint：不得接受。
+    resigned = _refingerprint(deepcopy(tampered))
+    with pytest.raises(ValueError, match="source revision/digest mismatch"):
+        execution_adapters.profile_report_consumer(
+            resigned,
+            expected_profile_key=expected_profile_key,
+            source_revision=source_revision,
+            source_digest=source_digest,
+        )
+    for bad_revision in ("", "   "):
+        with pytest.raises(ValueError, match="source revision/digest mismatch"):
+            execution_adapters.profile_report_consumer(
+                report,
+                expected_profile_key=expected_profile_key,
+                source_revision=bad_revision,
+                source_digest=source_digest,
+            )
+    with pytest.raises(ValueError, match="source revision/digest mismatch"):
+        execution_adapters.profile_report_consumer(
+            report,
+            expected_profile_key=expected_profile_key,
+            source_revision=source_revision,
+            source_digest="0" * 64,
+        )
+    # generated_at 不進 fingerprint：重跑時間不同不影響採信。
+    regenerated = deepcopy(report)
+    regenerated["generated_at"] = "2026-09-27T00:00:00Z"
+    assert execution_adapters.profile_report_consumer(
+        regenerated,
+        expected_profile_key=expected_profile_key,
+        source_revision=source_revision,
+        source_digest=source_digest,
+    )["schema_version"] == 2
+
+
+def test_profile_report_consumer_accepts_exact_key_on_non_ranked_row() -> None:
+    report, _, source_revision, _, _ = _patchmud_v2_consumer_case()
+    non_ranked_row = next(
+        row
+        for board in report["leaderboards"].values()
+        for row in board.get("rows", [])
+        if row.get("ranked") is False
+    )
+    expected_profile_key = non_ranked_row["profile_id"]
+    retained = False
+    for board in report["leaderboards"].values():
+        rows = board.get("rows")
+        if not isinstance(rows, list):
+            continue
+        filtered_rows = []
+        for row in rows:
+            if row.get("profile_id") != expected_profile_key:
+                filtered_rows.append(row)
+            elif row is non_ranked_row and not retained:
+                filtered_rows.append(row)
+                retained = True
+        board["rows"] = filtered_rows
+    _refingerprint(report)
+    consumed = execution_adapters.profile_report_consumer(
+        report,
+        expected_profile_key=expected_profile_key,
+        source_revision=source_revision,
+        source_digest=report["report_fingerprint"],
+    )
+    assert consumed["schema_version"] == 2
+
+
+def test_profile_report_consumer_requires_exact_v2_envelope_context() -> None:
+    report, expected_profile_key, source_revision, source_digest, context = (
+        _patchmud_v2_consumer_case()
+    )
+    missing = dict(context)
+    del missing["evaluator_revision"]
+    with pytest.raises(ValueError, match="envelope context is incomplete"):
+        execution_adapters.profile_report_consumer(
+            report,
+            expected_profile_key=expected_profile_key,
+            source_revision=source_revision,
+            source_digest=source_digest,
+            envelope_context=missing,
+        )
+    extra = {**context, "report_model": "must-not-be-a-cohort-key"}
+    with pytest.raises(ValueError, match="envelope context is incomplete"):
+        execution_adapters.profile_report_consumer(
+            report,
+            expected_profile_key=expected_profile_key,
+            source_revision=source_revision,
+            source_digest=source_digest,
+            envelope_context=extra,
         )
 
 
