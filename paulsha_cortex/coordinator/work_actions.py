@@ -216,6 +216,15 @@ def _ensure_openspec_change_scaffold(*, repo_root: Path, change: str) -> None:
         )
 
 
+def _is_manager_only_authoritative_preflight_task(description: str) -> bool:
+    """只辨識 #808 的 Manager authoritative preflight 任務，避免放寬其他未勾項。"""
+    return (
+        re.match(r"(?i)^Manager\b", description.strip()) is not None
+        and re.search(r"(?i)\bauthoritative\s+preflight\b", description) is not None
+        and re.search(r"(?i)\bCandidate\b", description) is not None
+    )
+
+
 def _validate_local_archive_inputs(
     *,
     repo_root: Path,
@@ -227,7 +236,11 @@ def _validate_local_archive_inputs(
         tasks_text = tasks_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise RuntimeError("OpenSpec tasks unavailable") from exc
-    task_states = re.findall(r"(?m)^\s*[-*]\s+\[([ xX])\]\s+", tasks_text)
+    task_items = []
+    for line in tasks_text.splitlines():
+        match = re.match(r"^\s*[-*]\s+\[([ xX])\]\s+(.*)$", line)
+        if match is not None:
+            task_items.append(match.groups())
     canonical = runner(
         build_openspec_validate_change_argv(change),
         cwd=str(repo_root),
@@ -276,7 +289,12 @@ def _validate_local_archive_inputs(
             fragment_present = True
             break
     facts = ArchiveGateFacts(
-        tasks_complete=bool(task_states) and all(state.lower() == "x" for state in task_states),
+        tasks_complete=bool(task_items)
+        and all(
+            state.lower() == "x"
+            or _is_manager_only_authoritative_preflight_task(description)
+            for state, description in task_items
+        ),
         canonical_specs_valid=getattr(canonical, "returncode", None) == 0,
         doc_references_valid=getattr(policy, "returncode", None) == 0,
         changelog_present=(
