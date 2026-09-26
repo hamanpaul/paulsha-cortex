@@ -115,8 +115,13 @@ def read_repo_tier(repo_root: str | Path | None = None) -> str:
     if resolution.payload is None:
         return "shareable"
     tier = resolution.payload.get("tier")
-    if tier not in {"shareable", "work", "personal"}:
-        raise ValueError(f"unsupported project tier: {tier!r}")
+    allowed_tiers = ("shareable", "work", "personal")
+    if not isinstance(tier, str) or tier not in allowed_tiers:
+        allowed = ", ".join(allowed_tiers)
+        raise ValueError(
+            f"unsupported project tier {tier!r} in {resolution.path}; "
+            f"expected one of: {allowed}"
+        )
     return str(tier)
 
 

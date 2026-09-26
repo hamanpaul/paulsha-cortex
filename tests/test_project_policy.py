@@ -92,6 +92,58 @@ def test_malformed_canonical_manifest_fails_closed(tmp_path: Path) -> None:
         resolve_project_policy(tmp_path)
 
 
+def test_missing_tier_reports_manifest_and_allowed_values(tmp_path: Path) -> None:
+    manifest = tmp_path / CANONICAL_NAME
+    manifest.write_text(
+        "policy_profile: flat\npolicy_version: 1.0.17\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        read_repo_tier(tmp_path)
+
+    message = str(excinfo.value)
+    assert str(manifest) in message
+    assert "shareable, work, personal" in message
+    assert "None" in message
+
+
+def test_invalid_tier_reports_manifest_and_allowed_values(tmp_path: Path) -> None:
+    manifest = tmp_path / CANONICAL_NAME
+    _write(manifest, tier="internal")
+
+    with pytest.raises(ValueError) as excinfo:
+        read_repo_tier(tmp_path)
+
+    message = str(excinfo.value)
+    assert str(manifest) in message
+    assert "shareable, work, personal" in message
+    assert "internal" in message
+
+
+def test_non_scalar_tier_reports_manifest_and_allowed_values(tmp_path: Path) -> None:
+    manifest = tmp_path / CANONICAL_NAME
+    manifest.write_text("policy_profile: flat\ntier: []\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as excinfo:
+        read_repo_tier(tmp_path)
+
+    message = str(excinfo.value)
+    assert str(manifest) in message
+    assert "shareable, work, personal" in message
+    assert "[]" in message
+
+
+def test_missing_policy_defaults_to_shareable_and_explicit_shareable_is_valid(
+    tmp_path: Path,
+) -> None:
+    assert read_repo_tier(tmp_path) == "shareable"
+
+    _write(tmp_path / CANONICAL_NAME, tier="shareable")
+
+    assert read_repo_tier(tmp_path) == "shareable"
+
+
 @pytest.mark.parametrize("manifest_name", [CANONICAL_NAME, LEGACY_NAME])
 def test_symlinked_manifest_is_rejected_fail_closed(
     tmp_path: Path,
