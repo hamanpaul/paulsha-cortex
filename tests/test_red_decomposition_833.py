@@ -8,6 +8,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import manager, manager_daemon
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -301,6 +303,8 @@ def test_red_dispatch_starts_one_planner_and_reuses_it_on_resubmission(
     assert "decomposition_plan" in launcher.calls[0]["prompt"]
     assert "invariant_count" in launcher.calls[0]["prompt"]
     assert "changelog" in launcher.calls[0]["prompt"]
+    assert "新的 child work item" in launcher.calls[0]["prompt"]
+    assert "Current Sprint" in launcher.calls[0]["prompt"]
 
 
 def test_decomposition_plan_review_failure_blocks_normal_child_intake(
@@ -427,6 +431,212 @@ def test_manager_daemon_routes_reviewed_child_through_standard_work_intake(
             "repo": run.repo,
             "work_id": "accepted-child-833",
         },
+        "requested_by": "manager-daemon",
+        "registry": registry,
+        "runtime_factory": manager_daemon.planning_runtime.build_production_planning_runtime,
+    }]
+
+
+def test_reviewed_child_is_published_then_waits_for_monitor_authority(
+    tmp_path: Path, monkeypatch
+) -> None:
+    registry, run = _make_run(tmp_path, with_decomposition_step=True)
+    job = _create_terminal_planner_job(registry, run)
+    _reviewed_plan(job)
+    monkeypatch.setattr(manager, "_malformed_workflow_card_terminal", lambda _job: False)
+    monkeypatch.setattr(manager, "_retryable_nonpassing_workflow_terminal", lambda _job: False)
+    monkeypatch.setattr(manager, "_explicit_stop_gate_terminal", lambda _job: None)
+    monkeypatch.setattr(manager, "terminalize_workflow_job", lambda *_a, **_kw: job)
+    monkeypatch.setattr(manager, "_evaluate_yellow_plan_review", _ready_review)
+
+    repo_root = Path(run.workspace_root)
+    manifest = repo_root / ".cortex" / "work-items.yaml"
+    manifest.parent.mkdir(parents=True)
+    original_manifest = (
+        "version: 1\n"
+        "work_items:\n"
+        "  unrelated-work:\n"
+        "    title: 'Unrelated work'\n"
+        "    links: []\n"
+        "    excludes: []\n"
+    )
+    manifest.write_text(original_manifest, encoding="utf-8")
+
+    monitor_confirmed = False
+    intake_calls: list[str] = []
+    todo_ref = "docs/superpowers/workstreams/accepted-child-833/todo.md"
+    todo_path = repo_root / todo_ref
+
+    def intake(work_id: str):
+        nonlocal monitor_confirmed
+        intake_calls.append(work_id)
+        assert work_id == "accepted-child-833"
+        payload = manager.safe_load(manifest.read_text(encoding="utf-8"))
+        assert payload["work_items"]["unrelated-work"] == {
+            "title": "Unrelated work",
+            "links": [],
+            "excludes": [],
+        }
+        assert payload["work_items"][work_id]["links"] == [
+            {"kind": "path", "ref": todo_ref}
+        ]
+        assert todo_path.is_file()
+        todo_text = todo_path.read_text(encoding="utf-8")
+        assert "## Current Sprint" in todo_text
+        assert "- [ ] 實作 accepted child 的 code 範圍。" in todo_text
+        if not monitor_confirmed:
+            raise ValueError("confirmed work authority missing or ambiguous")
+        return {"action": "claim", "run": {"run_id": "child-run-833"}}
+
+    kwargs = {
+        "identities": IdentityRegistry.from_rows([]),
+        "launcher_factory": _no_launch,
+        "coordinator_root": tmp_path / "coordinator",
+        "decomposition_intake": intake,
+    }
+    waiting = manager.resume_workflow_run(
+        _dispatcher(registry), run_id=run.run_id, **kwargs
+    )
+
+    assert waiting["reason"] == "decomposition-child-awaiting-monitor"
+    waiting_manifest = manifest.read_text(encoding="utf-8")
+    assert waiting_manifest.startswith(original_manifest)
+    assert "  accepted-child-833:" in waiting_manifest
+    assert "needs_human" not in registry.get_workflow_run(run.run_id).facets
+    assert registry.get_workflow_run(run.run_id).facets == ("needs_decomposition",)
+    assert intake_calls == ["accepted-child-833"]
+
+    monitor_confirmed = True
+    accepted = manager.resume_workflow_run(
+        _dispatcher(registry), run_id=run.run_id, **kwargs
+    )
+
+    assert accepted["reason"] == "decomposition-child-intake-started"
+    assert accepted["child_work_id"] == "accepted-child-833"
+    assert manifest.read_text(encoding="utf-8") == waiting_manifest
+    assert intake_calls == ["accepted-child-833", "accepted-child-833"]
+
+
+def test_red_child_publication_rejects_non_exact_destinations(tmp_path: Path) -> None:
+    manifest_content = (
+        "version: 1\n"
+        "work_items:\n"
+        "  child-833:\n"
+        "    title: 'child-833'\n"
+        "    links:\n"
+        "      - kind: path\n"
+        "        ref: 'docs/superpowers/workstreams/child-833/todo.md'\n"
+        "    excludes: []\n"
+    )
+    todo_content = "# child-833\n\n## Current Sprint\n\n- [ ] Complete child work.\n"
+
+    rollback = manager._publish_planning_artifacts(
+        str(tmp_path),
+        [
+            {"kind": "work-item", "path": ".cortex/work-items.yaml", "content": manifest_content},
+            {
+                "kind": "workstream-todo",
+                "path": "docs/superpowers/workstreams/child-833/todo.md",
+                "content": todo_content,
+            },
+        ],
+        work_id="child-833",
+        allowed_refs=(),
+    )
+    assert (tmp_path / ".cortex" / "work-items.yaml").read_text(encoding="utf-8") == manifest_content
+    assert (
+        tmp_path / "docs/superpowers/workstreams/child-833/todo.md"
+    ).read_text(encoding="utf-8") == todo_content
+    rollback()
+
+    expanded_manifest = manifest_content.replace(
+        "  child-833:\n",
+        "  unrelated-work:\n    title: 'unrelated-work'\n    links: []\n    excludes: []\n"
+        "  child-833:\n",
+    )
+    with pytest.raises(ValueError, match="only add its work item"):
+        manager._publish_planning_artifacts(
+            str(tmp_path),
+            [{"kind": "work-item", "path": ".cortex/work-items.yaml", "content": expanded_manifest}],
+            work_id="child-833",
+            allowed_refs=(),
+        )
+
+    with pytest.raises(ValueError, match="outside governed roots"):
+        manager._publish_planning_artifacts(
+            str(tmp_path),
+            [
+                {
+                    "kind": "workstream-todo",
+                    "path": "docs/superpowers/workstreams/other-child/todo.md",
+                    "content": todo_content,
+                }
+            ],
+            work_id="child-833",
+            allowed_refs=(),
+        )
+
+
+def test_periodic_resume_supplies_standard_red_child_intake(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workflow = SimpleNamespace(
+        run_id="workflow-periodic-red-child",
+        work_id="red-parent",
+        repo=REPO,
+        status="ongoing",
+        facets=("needs_decomposition",),
+        current_phase="plan",
+        claim_key="claim:legacy:red-parent",
+        source_revision="",
+    )
+    registry = SimpleNamespace(
+        _state_path=str(tmp_path / "jobs.json"),
+        list_workflow_runs=lambda: [workflow],
+    )
+    dispatcher = SimpleNamespace(_registry=registry, _git_runner=lambda _args: "")
+    intake_calls: list[dict] = []
+
+    def standard_work_action(**kwargs):
+        intake_calls.append(kwargs)
+        return {"action": "claim", "run": {"run_id": "child-run"}}
+
+    resume_calls: list[str] = []
+
+    def resume_workflow(_dispatcher, **kwargs):
+        resume_calls.append(kwargs["run_id"])
+        assert kwargs["decomposition_intake"] is not None
+        return kwargs["decomposition_intake"]("child-833")
+
+    monkeypatch.setattr(manager_daemon.manager, "apply_work_action", standard_work_action)
+    monkeypatch.setattr(manager_daemon.manager, "resume_workflow_run", resume_workflow)
+    monkeypatch.setattr(
+        manager_daemon.manager,
+        "reconcile_planning_transactions",
+        lambda **_kwargs: [],
+    )
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=object(),
+        run_tick_fn=lambda *_args, **_kwargs: {
+            "dispatch_skipped": False,
+            "dispatched": [],
+            "completed": [],
+            "errors": [],
+            "reaped": None,
+        },
+        scan_specs_fn=lambda _specs_dir: [],
+        auto_claim_fn=lambda: [],
+        workflow_identity_registry=IdentityRegistry.from_rows([]),
+    )
+
+    runner()
+
+    assert resume_calls == [workflow.run_id]
+    assert intake_calls == [{
+        "args": {"action": "intake", "repo": REPO, "work_id": "child-833"},
         "requested_by": "manager-daemon",
         "registry": registry,
         "runtime_factory": manager_daemon.planning_runtime.build_production_planning_runtime,
