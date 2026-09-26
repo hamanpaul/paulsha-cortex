@@ -13,6 +13,8 @@
 
 ### Fixed
 
+- **#843 R07 `recover-superseded` crash/replay**：run status、`blocked`/`needs_human` 清理、authority restart 的 verify/review gate reset、`claim_key`/`source_revision` 更新與 audit reference 改由單一 registry revision CAS 寫入；同 run/actor/reason 的 content-addressed audit exact replay 回傳已完成結果，不重寫 audit 或 registry。三個 crash/reload 邊界均驗證無 ongoing wedge。#497/#547/#577 已關閉，不列作本次外部阻塞。
+
 - **#502 verify／review 通過後的阻斷修復入口**：exact-candidate `retry-build` 現可接受尚未進入 `needs_human` 的後續阻斷裁決；必須提供 `--reason`，以既有 immutable operator-adjudication evidence 記錄後重跑 verify／review，已完成 run 仍拒絕重開。
 
 - **#862 recovery registry receipt contract**：`JobRegistry` 現在依 OpenSpec 實作
