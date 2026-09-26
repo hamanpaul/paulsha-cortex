@@ -185,6 +185,13 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None
             ):
                 raise ValueError("work-action retry-card requires exact card id")
+        if action == "regenerate-gates" and args.get("card") is not None:
+            card = args.get("card")
+            if (
+                not isinstance(card, str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None
+            ):
+                raise ValueError("work-action regenerate-gates requires exact card id")
         if action in {"abandon", "retire-delivered", "recover-superseded"}:
             expected_run_id = args.get("expected_run_id")
             actor = args.get("actor")

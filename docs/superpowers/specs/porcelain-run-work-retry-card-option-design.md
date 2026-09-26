@@ -10,9 +10,9 @@ issue: 1030
 
 ### D1 — Extend only the existing porcelain argument builder
 
-在 `paulsha_cortex/porcelain/run.py::_add_work_options()` 加 `--card`，help 標示 retry-card 專用。由於 positional `action` 與 options 共用 parser，在 `_work_args()` 於 request 組裝前檢查：有 `args.card` 而 action 不是 `retry-card` 時 raise `ValueError`；對 retry-card 才把 `card` 加入 `provided_names`。`main()` 已在呼叫 `submit_request()` 前建立 args，會把此錯誤轉成 exit 2；不發送 request。
+在 `paulsha_cortex/porcelain/run.py::_add_work_options()` 加 `--card`，原供 retry-card 使用；#557 後亦供 regenerate-gates 選擇 build job。由於 positional `action` 與 options 共用 parser，在 `_work_args()` 於 request 組裝前檢查：有 `args.card` 而 action 不是 `retry-card` 或 `regenerate-gates` 時 raise `ValueError`；兩個 action 都把明示的 `card` 加入 `provided_names`。`main()` 已在呼叫 `submit_request()` 前建立 args，會把此錯誤轉成 exit 2；不發送 request。
 
-缺少或不合格式的 card 與 missing/stale `expected_run_id` 繼續由現有 `control.contract.validate_request()` fail closed。該 contract 已要求 retry-card 帶 exact run ID 與 regex 限定的 card ID，因此不改 coordinator、control 或 Manager 的 action admission。
+缺少或不合格式的 card 與 missing/stale `expected_run_id` 繼續由 `control.contract.validate_request()` fail closed。retry-card 仍要求 exact run ID 與 regex 限定的 card ID；#557 另讓 contract 驗證 regenerate-gates 選填 card 的相同格式，不改 retry-card 的 action admission。
 
 ### D2 — Prevent explicit option shadowing while keeping the workaround
 

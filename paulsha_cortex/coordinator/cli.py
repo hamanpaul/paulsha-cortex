@@ -244,7 +244,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_work.add_argument(
         "--card",
-        help="retry-card 專用：要重派的 builder／reviewer card id（必須是下一張待派的卡）",
+        help="retry-card／regenerate-gates 專用：card id；retry-card 須是下一張待派的卡",
     )
     p_work.add_argument(
         "--reason",

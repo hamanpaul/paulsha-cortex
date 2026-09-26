@@ -62,7 +62,10 @@ def _add_work_options(parser: argparse.ArgumentParser) -> None:
         "--expected-run-id",
         help="retry-build 不支援此旗標；該 action 使用 --expected-candidate CAS",
     )
-    parser.add_argument("--card", help="retry-card 專用：指定要重派的 exact card ID")
+    parser.add_argument(
+        "--card",
+        help="retry-card／regenerate-gates 專用：指定 exact card ID",
+    )
     parser.add_argument("--reason")
     parser.add_argument(
         "--combo",
@@ -134,8 +137,8 @@ def _complete_args(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _work_args(args: argparse.Namespace) -> dict[str, Any]:
-    if args.card is not None and args.action != "retry-card":
-        raise ValueError("--card is only valid for retry-card")
+    if args.card is not None and args.action not in {"retry-card", "regenerate-gates"}:
+        raise ValueError("--card is only valid for retry-card or regenerate-gates")
     if args.action == "retry-build" and args.expected_run_id is not None:
         raise ValueError(
             "retry-build 不接受 --expected-run-id；請改用 --expected-candidate CAS。"
@@ -159,7 +162,7 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
         "reviewer_executor",
         "reviewer_model",
     )
-    if args.action == "retry-card":
+    if args.action in {"retry-card", "regenerate-gates"}:
         provided_names = provided_names + ("card",)
     # combo 只在 start／intake action 有意義（--combo 為 start／intake 專用
     # override，intake 內部等價於 start）；其餘 action 一律不送出，避免未經
