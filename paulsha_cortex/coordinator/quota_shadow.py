@@ -37,7 +37,7 @@ class _MemoryLedger:
         self.events: list[dict[str, Any]] = []
 
     def append_observation(self, observation, *, idempotency_key=None, associations=(),
-                            terminal_job_started_at_ms=None):
+                            terminal_job_started_at_ms=None, terminal_job_finished_at_ms=None):
         from .quota_ledger import (
             _canonical_bytes, _idempotency_key as make_key,
             _observation_digest_payload, _terminal_usage_metadata,
@@ -46,9 +46,11 @@ class _MemoryLedger:
         wire = observation.to_dict()
         key = "caller:" + idempotency_key if idempotency_key else make_key(observation, wire, None)
         normalized = list(associations)
-        # 與持久化 ledger 對齊：終局 usage 的開始時間一併納入 digest，
-        # 避免記憶體版 ledger 在測試中漏掉 straddling 判定所需的來源資料。
-        terminal_metadata = _terminal_usage_metadata(wire, terminal_job_started_at_ms)
+        # 與持久化 ledger 對齊：終局 usage 的起訖原始事實一併納入 digest，
+        # 避免記憶體版 ledger 在測試中與持久化版本的行為分歧。
+        terminal_metadata = _terminal_usage_metadata(
+            wire, terminal_job_started_at_ms, terminal_job_finished_at_ms
+        )
         digest_payload = _observation_digest_payload(wire, normalized, terminal_metadata)
         digest = hashlib.sha256(_canonical_bytes(digest_payload)).hexdigest()
         prior = next((row for row in self.events if row.get("idempotency_key") == key
@@ -264,23 +266,17 @@ class QuotaShadowService:
                     else {"state": "known", "value": target["scope"]}
                 )
                 pool_scope = target["association"] if target else associations
-                # 這筆 usage 所屬的 window instance：僅在能從 ledger 已知的
-                # remaining_snapshot 唯一判定 job 起訖時間整段落在哪一個 interval
-                # 時才標 known，跨窗口或資訊不足一律 unknown（見 #836 對抗審查
-                # 第四輪 BLOCKER：terminal usage 不能永遠標 unknown，否則永遠
-                # 無法投影扣減）。
-                window_instance = (
-                    _infer_terminal_usage_window_instance(
-                        self.ledger,
-                        pool_ref=target["scope"]["pool_ref"],
-                        window_id=target["window_id"],
-                        started_at_ms=terminal_job_started_at_ms,
-                        finished_at_ms=terminal_job_finished_at_ms,
-                        recorded_at_ms=observed_at_ms,
-                    )
-                    if target is not None
-                    else {"kind": "unknown", "reason": "usage-window-instance-unavailable"}
-                )
+                # 終局 usage 只記錄原始事實（job 起訖時間，見上方
+                # terminal_job_started_at_ms／terminal_job_finished_at_ms），
+                # 不在記錄當下依 ledger 現況推導並持久化 window instance：
+                # window 歸屬改到 project() 時依當下 ledger 內的 snapshot 動態
+                # 判定。記錄當下推導會讓 observation identity 隨 ledger 狀態
+                # 變動——同一 job 重播時若 ledger 內容已不同（例如中途補進了
+                # snapshot），payload 就會改變並被誤判為 conflict；而且「先記
+                # usage、涵蓋同一 window 的較舊 snapshot 之後才補進」的情境會
+                # 永遠卡在 unknown，shadow 永不收斂（見 #836 對抗審查第五輪
+                # MAJOR quota_shadow.py:273）。
+                window_instance = dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
                 try:
                     observation = _usage_observation(
                         job_id=job_id, executor=executor, metric=metric, profile_key=profile_key,
@@ -312,6 +308,7 @@ class QuotaShadowService:
                     idempotency_key=key,
                     associations=tuple(pool_scope) if target is None else (),
                     terminal_job_started_at_ms=terminal_job_started_at_ms,
+                    terminal_job_finished_at_ms=terminal_job_finished_at_ms,
                 )
                 accepted += result.accepted
                 duplicates += result.duplicates
@@ -556,17 +553,23 @@ class QuotaShadowService:
             if measured_at > now_utc_ms:
                 invalidated = "clock-rollback"
                 continue
-            if _is_terminal_usage_observation(wire):
-                # 終局 usage 是整段 job 的累計量：只有已知 job 開始時間不早於
-                # 這張 snapshot 的 observed_at，才有證據證明整筆消耗都落在
-                # snapshot 之後、可以安全整筆扣減。已知開始時間早於 snapshot
-                # （跨越 snapshot）沒有可切分的增量證據，一律視為無法切分，
-                # 不整筆扣除也不忽略。開始時間未知的 job 同樣無法切分；由於
-                # 終局 usage 目前一律沒有可比對的 window_instance，仍會被下方
-                # window/epoch 檢查判定為 unknown，不會被誤判為可扣減。
+            is_terminal_usage = _is_terminal_usage_observation(wire)
+            started_at = finished_at = None
+            if is_terminal_usage:
+                # 終局 usage 只保存原始事實（job 起訖時間），window 歸屬與
+                # 是否已被 snapshot 反映一律在這裡依當下已知的 snapshot 動態
+                # 推導，不讀取 wire 內的 window_instance（該欄位對終局 usage
+                # 一律是 unknown；見 #836 對抗審查第五輪 MAJOR
+                # quota_shadow.py:273）。
                 started_at = record.get("terminal_job_started_at_ms") if isinstance(record, dict) else None
-                if type(baseline) is int and type(started_at) is int and started_at < baseline:
-                    invalidated = "straddling-usage"
+                finished_at = record.get("terminal_job_finished_at_ms") if isinstance(record, dict) else None
+                if (type(finished_at) is int and type(baseline) is int
+                        and finished_at <= baseline):
+                    # 整個 job 早在這張 snapshot 之前就已結束，snapshot 的
+                    # 餘額已經反映過這筆消耗；即使因重啟才在 snapshot 之後
+                    # 重播寫入 ledger（measured_at 較晚），也不得再次扣減，
+                    # 也不得判為 straddling 而毒化餘額（見 #836 對抗審查第
+                    # 五輪 MAJOR quota_shadow.py:567）。
                     continue
             measurement = wire.get("measurement", {})
             if not isinstance(measurement, dict) or measurement.get("kind") != "usage_delta":
@@ -575,14 +578,38 @@ class QuotaShadowService:
             if usage_unit != baseline_unit:
                 invalidated = "usage-unit-not-comparable"
                 continue
-            usage_window = wire.get("window_instance")
             if not baseline_epoch_known:
                 invalidated = "window-epoch-unknown"
                 continue
-            if isinstance(baseline_window, dict) and baseline_window.get("kind") == "interval":
-                if not isinstance(usage_window, dict) or usage_window.get("kind") != "interval" or usage_window != baseline_window:
-                    invalidated = "usage-window-unresolved"
+            if is_terminal_usage:
+                # job 起訖時間（缺 finished_at 時以這筆 usage 實際寫入 ledger
+                # 的時間 measured_at 當保守上界——終局 usage 必然在被記錄之前
+                # 就已結束）整段落在同一已知 window 內，才有證據可以安全整筆
+                # 扣減；已知開始時間早於 snapshot（跨越 snapshot）沒有可切分
+                # 的增量證據，一律視為無法切分，不整筆扣除也不忽略；其餘
+                # （起訖時間不足以判定、或跨窗口）一律 unknown。
+                effective_finished_at = finished_at if type(finished_at) is int else measured_at
+                fits_known_window = (
+                    type(started_at) is int and type(baseline) is int and started_at >= baseline
+                    and isinstance(baseline_window, dict) and baseline_window.get("kind") == "interval"
+                    and type(baseline_window.get("start_ms")) is int
+                    and type(baseline_window.get("end_ms")) is int
+                    and baseline_window["start_ms"] <= started_at
+                    and type(effective_finished_at) is int
+                    and effective_finished_at <= baseline_window["end_ms"]
+                )
+                if not fits_known_window:
+                    if type(started_at) is int and type(baseline) is int and started_at < baseline:
+                        invalidated = "straddling-usage"
+                    else:
+                        invalidated = "usage-window-unresolved"
                     continue
+            else:
+                usage_window = wire.get("window_instance")
+                if isinstance(baseline_window, dict) and baseline_window.get("kind") == "interval":
+                    if not isinstance(usage_window, dict) or usage_window.get("kind") != "interval" or usage_window != baseline_window:
+                        invalidated = "usage-window-unresolved"
+                        continue
             usage_quantity = measurement.get("quantity", {})
             if not isinstance(usage_quantity, dict) or usage_quantity.get("state") != "observed":
                 invalidated = "usage-quantity-unknown"
@@ -673,58 +700,6 @@ def _usage_observation(*, job_id, executor, metric, profile_key, unit, unit_ref,
 _TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN = {
     "kind": "unknown", "reason": "usage-window-instance-unavailable",
 }
-
-
-def _infer_terminal_usage_window_instance(
-    ledger, *, pool_ref, window_id, started_at_ms, finished_at_ms, recorded_at_ms,
-):
-    """依 ledger 已知的 remaining_snapshot window_instance 推導終局 usage 所屬窗口。
-
-    只在 job 起訖時間唯一落在單一已知 interval 內時才回傳該 interval（標 known）；
-    起訖時間不明、找不到覆蓋區間，或同時符合多個不同 interval（跨窗口或有歧義）
-    一律回傳 unknown，不得臆測，避免把跨窗口的終局 usage 誤判成可整筆扣減。
-
-    這裡直接讀 ledger 內既有的原始 observation dict（寫入時已通過 schema 驗證），
-    不重新呼叫 parse_observation，因此不受呼叫端目前傳入的 descriptors/unit_catalog
-    是否涵蓋舊 revision 影響（見 #836 對抗審查第四輪 MAJOR：revision 升版議題）。
-    """
-    if type(started_at_ms) is not int:
-        return dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
-    effective_end_ms = finished_at_ms if type(finished_at_ms) is int else recorded_at_ms
-    if type(effective_end_ms) is not int or effective_end_ms < started_at_ms:
-        return dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
-    try:
-        ledger_snapshot = ledger.read()
-    except (LedgerCorrupt, OSError):
-        return dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
-    candidates: dict[tuple[int, int, str], dict[str, Any]] = {}
-    for record in ledger_snapshot.events:
-        if not isinstance(record, dict) or record.get("kind") != "observation":
-            continue
-        raw = record.get("observation")
-        if not isinstance(raw, dict):
-            continue
-        scope = _scope_summary(raw)
-        if (scope.get("state") != "known" or scope.get("pool_ref") != pool_ref
-                or scope.get("window_id") != window_id):
-            continue
-        measurement = raw.get("measurement")
-        if not isinstance(measurement, dict) or measurement.get("kind") != "remaining_snapshot":
-            continue
-        window_instance = raw.get("window_instance")
-        if not isinstance(window_instance, dict) or window_instance.get("kind") != "interval":
-            continue
-        start_ms, end_ms = window_instance.get("start_ms"), window_instance.get("end_ms")
-        if type(start_ms) is not int or type(end_ms) is not int:
-            continue
-        if not (start_ms <= started_at_ms and effective_end_ms <= end_ms):
-            continue
-        key = (start_ms, end_ms, json.dumps(window_instance.get("epoch"), sort_keys=True))
-        candidates[key] = window_instance
-    if len(candidates) != 1:
-        return dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
-    (only_window,) = candidates.values()
-    return dict(only_window)
 
 
 def _binding_constraints(binding_wire, descriptors):

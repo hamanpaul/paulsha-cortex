@@ -56,3 +56,24 @@ ledger 內舊 revision 事件對不上）都會被當成 `ledger-corrupt` 毒化
 projection、連未變動的其他 pool 也遭殃。現在只有 ledger 檔案本身結構損毀
 才會整份標 `ledger-corrupt`；個別事件解析失敗改為逐筆處理，只讓對應的 pool
 標記 `stale-pool-revision`，不影響其他 pool 的投影結果。
+
+修正終局 usage 依記錄當下的 ledger 內容一次性推導並持久化 `window_instance`
+的根本問題：先記 usage、涵蓋同一 window 的較舊 snapshot 之後才補進的情境會
+永遠卡在 unknown 無法收斂；且同一個 job 若在兩次記錄之間 ledger 內容已改變
+（例如中途補進了 snapshot），重新推導出的 `window_instance` 會與前次不同，
+使 payload 隨之改變、被誤判成 conflict 而非 duplicate。終局 usage 的 ledger
+記錄現在只保存原始事實（job 起訖時間，任一缺失即記為 unknown）；
+observation identity／digest 只由這些原始事實決定，重播不論當下 ledger
+內容是否變動都會得到相同 digest。window 歸屬與扣減一律改到 `project()`
+時依當下 ledger 內已知的 snapshot 動態推導：job 整段完整落於 snapshot 之後
+的同一已知 window 才扣減；job 起訖時間跨越 snapshot 的 observed_at 一律標
+`straddling-usage`，維持保守不扣減。
+
+修正終局 usage 只持久化 `terminal_job_started_at_ms`、`project()` 看不到
+`finished_at` 而導致的誤判：job 整段（起訖時間皆早於 snapshot 的
+observed_at）本已完整反映於 snapshot，只是因為 manager 重啟才在 snapshot
+之後才被重播寫入 ledger 時，先前只看 `started_at < observed_at` 會誤判為
+`straddling-usage`，把本應忽略的 pre-snapshot usage 變成毒化餘額的
+unknown。ledger 現在同時保存 `terminal_job_finished_at_ms`；`finished_at`
+已知且不晚於 snapshot 的 observed_at 時，這筆 usage 視為已反映於 snapshot，
+直接忽略、不扣減也不判為 straddling。

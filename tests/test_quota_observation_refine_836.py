@@ -1155,3 +1155,166 @@ def test_review4_major4_stale_pool_revision_does_not_poison_other_pools(tmp_path
     untouched_row = _pool_row(report, "pool-untouched", "short")
     assert untouched_row["remaining"]["state"] == "observed"
     assert untouched_row["remaining"]["amount"] == {"kind": "exact", "value": "30"}
+
+
+# #836 對抗審查第五輪：以下三個測試對應審查稿指出的兩條 MAJOR（同根因）——
+# record_terminal_usage() 之前依記錄當下的 ledger 內容一次性推導並持久化
+# window_instance，且只保存 terminal_job_started_at_ms、不保存 finished_at。
+
+
+def test_review5_major1_usage_recorded_before_late_snapshot_converges_to_deduction():
+    """MAJOR quota_shadow.py:273 — usage 先落 ledger、涵蓋同一 window 的
+    較舊 snapshot 之後才補進來時，記錄當下推導的 window_instance 永遠是
+    unknown（因為當時 ledger 內還沒有那張 snapshot），shadow 永不收斂。
+    改為 project() 時依當下 ledger 動態推導後，晚到的 snapshot 補進來即可
+    讓先記的 usage 正確扣減。"""
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    # usage 先記：此時 ledger 內完全沒有任何 remaining_snapshot。
+    result = service.record_terminal_usage(
+        {
+            "id": "job-usage-before-snapshot",
+            "executor": "codex",
+            "started_at": _iso_utc_ms(_NOW + 1),
+            "finished_at": _iso_utc_ms(_NOW + 2),
+            "usage": {"input_tokens": 2},
+        },
+        profile_key=_PROFILE_A,
+        binding=binding,
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 5,
+    )
+    assert result.accepted == 1
+
+    early_report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 6
+    )
+    early_row = _pool_row(early_report, "pool-shared", "short")
+    assert early_row["remaining"]["state"] == "unknown"
+    assert "missing-snapshot" in early_row["coverage_gaps"]
+
+    # 較舊、涵蓋同一 window 的 snapshot 之後才補進 ledger（append-only：
+    # 補進順序不影響任何一筆事件本身的內容或 identity）。
+    snapshot = _observation(
+        descriptor, "short", value="20", observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 300_000,
+    )
+    assert service.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 10
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "observed"
+    assert row["remaining"]["amount"] == {"kind": "exact", "value": "18"}
+
+
+def test_review5_major1_terminal_usage_replay_across_ledger_changes_stays_duplicate():
+    """MAJOR quota_shadow.py:273 — 舊實作在記錄當下依 ledger 現況推導
+    window_instance 並直接烘進 observation payload；同一個 job 重播時，若
+    兩次呼叫之間 ledger 內容已經不同（例如中途補進了 snapshot），第二次推導
+    出的 window_instance 就會與第一次不同，payload 隨之改變、被誤判成
+    conflict。改為只保存原始事實、window 歸屬全部移到 project() 時動態推導
+    後，重播不論 ledger 內容是否變動都必須是 duplicate，且只扣減一次。"""
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+    job = {
+        "id": "job-replay-across-ledger-change",
+        "executor": "codex",
+        "started_at": _iso_utc_ms(_NOW + 1),
+        "finished_at": _iso_utc_ms(_NOW + 2),
+        "usage": {"input_tokens": 4},
+    }
+    first = service.record_terminal_usage(
+        deepcopy(job), profile_key=_PROFILE_A, binding=binding,
+        descriptors=(descriptor,), unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 5,
+    )
+    assert first.accepted == 1
+
+    # ledger 內容在兩次呼叫之間改變：補進一張涵蓋同一 window 的 snapshot。
+    snapshot = _observation(
+        descriptor, "short", value="20", observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 300_000,
+    )
+    assert service.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    replay = service.record_terminal_usage(
+        deepcopy(job), profile_key=_PROFILE_A, binding=binding,
+        descriptors=(descriptor,), unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 500_000,
+    )
+    assert replay.duplicates == 1
+    assert replay.conflicts == 0
+
+    # 重播嘗試的 observed_at_ms 遠晚於首次記錄，但因為是 duplicate、沒有寫入
+    # 新事件，投影仍以首次記錄時的 ledger 內容為準，snapshot 也仍在 fresh
+    # 範圍內；只需確認扣減只發生一次（16 = 20 - 4，不是 20 - 4 - 4）。
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 20
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "observed"
+    assert row["remaining"]["amount"] == {"kind": "exact", "value": "16"}
+
+
+def test_review5_major2_pre_snapshot_completed_job_replay_is_ignored_not_poisoned():
+    """MAJOR quota_shadow.py:567 — 舊實作只持久化
+    terminal_job_started_at_ms，project() 看不到 finished_at；job 整段
+    （started_at 與 finished_at）都早於 snapshot.observed_at、只是因為
+    manager 重啟才在 snapshot 之後被重播寫入 ledger 時，只看
+    started_at < observed_at 就會誤判為 straddling-usage，把本應忽略、
+    早已反映於 snapshot 的 pre-snapshot usage 變成毒化餘額的 unknown。"""
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    snapshot = _observation(
+        descriptor, "short", value="20", observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 300_000,
+    )
+    assert service.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    # job 在 snapshot 之前就已整段完整結束（started_at 與 finished_at 都早
+    # 於 snapshot.observed_at），只是因為 manager 重啟才在 snapshot 之後被
+    # 重播寫入 ledger（observed_at_ms 遠晚於實際結束時間）。
+    result = service.record_terminal_usage(
+        {
+            "id": "job-finished-before-snapshot",
+            "executor": "codex",
+            "started_at": _iso_utc_ms(_NOW - 20),
+            "finished_at": _iso_utc_ms(_NOW - 10),
+            "usage": {"input_tokens": 9},
+        },
+        profile_key=_PROFILE_A,
+        binding=binding,
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 100,
+    )
+    assert result.accepted == 1
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 200
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "observed"
+    assert row["remaining"]["amount"] == {"kind": "exact", "value": "20"}
+    assert "straddling-usage" not in row["coverage_gaps"]

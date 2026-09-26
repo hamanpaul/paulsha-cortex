@@ -63,12 +63,19 @@ class QuotaEventLedger:
         idempotency_key: str | None = None,
         associations: tuple[dict[str, Any], ...] = (),
         terminal_job_started_at_ms: int | None = None,
+        terminal_job_finished_at_ms: int | None = None,
     ) -> LedgerAppendResult:
         if not isinstance(observation, schema.QuotaObservation):
             raise TypeError("observation must be parser-sealed")
         wire = observation.to_dict()
         normalized_associations = _validate_associations(associations)
-        terminal_metadata = _terminal_usage_metadata(wire, terminal_job_started_at_ms)
+        # 只保存原始事實（job 起訖時間），不保存任何依 ledger 現況推導出的
+        # 衍生值：observation identity／digest 只由這些原始事實決定，重播時
+        # 不論 ledger 內容是否變動都會得到相同 digest（見 #836 對抗審查第
+        # 五輪 MAJOR）。
+        terminal_metadata = _terminal_usage_metadata(
+            wire, terminal_job_started_at_ms, terminal_job_finished_at_ms
+        )
         key = _idempotency_key(observation, wire, idempotency_key)
         payload_bytes = _canonical_bytes(
             _observation_digest_payload(wire, normalized_associations, terminal_metadata)
@@ -186,7 +193,9 @@ class QuotaEventLedger:
                 raise LedgerCorrupt("ledger-unknown-record-version")
             if row.get("kind") == "observation":
                 required = {"schema_version", "kind", "idempotency_key", "payload_sha256", "observation"}
-                optional = {"associations", "terminal_job_started_at_ms"}
+                optional = {
+                    "associations", "terminal_job_started_at_ms", "terminal_job_finished_at_ms",
+                }
                 if (not required.issubset(row)
                         or not set(row).issubset(required | optional)
                         or not isinstance(row.get("idempotency_key"), str)
@@ -199,15 +208,23 @@ class QuotaEventLedger:
                 has_associations = "associations" in row
                 associations = _validate_associations(tuple(row.get("associations", [])))
                 terminal_metadata = {}
-                if "terminal_job_started_at_ms" in row:
+                has_terminal_started = "terminal_job_started_at_ms" in row
+                has_terminal_finished = "terminal_job_finished_at_ms" in row
+                if has_terminal_started or has_terminal_finished:
+                    # 起訖兩個原始事實欄位一律成對出現；只有其中一個代表
+                    # ledger 本身結構已不完整。
+                    if not (has_terminal_started and has_terminal_finished):
+                        raise LedgerCorrupt("ledger-invalid-terminal-job-timestamps")
                     try:
                         if not _is_terminal_usage_observation(row["observation"]):
-                            raise ValueError("terminal start time on non-terminal usage")
+                            raise ValueError("terminal job timestamps on non-terminal usage")
                         terminal_metadata = _terminal_usage_metadata(
-                            row["observation"], row["terminal_job_started_at_ms"]
+                            row["observation"],
+                            row["terminal_job_started_at_ms"],
+                            row["terminal_job_finished_at_ms"],
                         )
                     except (TypeError, ValueError) as exc:
-                        raise LedgerCorrupt("ledger-invalid-terminal-job-start-time") from exc
+                        raise LedgerCorrupt("ledger-invalid-terminal-job-timestamps") from exc
                 digest_payload = _observation_digest_payload(
                     row["observation"], associations if has_associations else (), terminal_metadata
                 )
@@ -303,16 +320,22 @@ def _is_terminal_usage_observation(wire):
     )
 
 
-def _terminal_usage_metadata(wire, started_at_ms):
+def _terminal_usage_metadata(wire, started_at_ms, finished_at_ms=None):
+    """終局 usage 的原始事實中繼資料：只保存 job 起訖時間本身，不保存任何
+    依 ledger 現況推導出的衍生值（例如 window instance）。任一時間缺失即
+    以 None 記為 unknown，仍照樣寫入（見 #836 對抗審查第五輪 MAJOR）。"""
     if not _is_terminal_usage_observation(wire):
-        if started_at_ms is not None:
-            raise ValueError("terminal job start time requires terminal usage observation")
+        if started_at_ms is not None or finished_at_ms is not None:
+            raise ValueError("terminal job timestamps require terminal usage observation")
         return {}
-    if (started_at_ms is not None
-            and (type(started_at_ms) is not int or started_at_ms < 0
-                 or started_at_ms > _MAX_TIMESTAMP_MS)):
-        raise ValueError("invalid terminal job start time")
-    return {"terminal_job_started_at_ms": started_at_ms}
+    for value in (started_at_ms, finished_at_ms):
+        if (value is not None
+                and (type(value) is not int or value < 0 or value > _MAX_TIMESTAMP_MS)):
+            raise ValueError("invalid terminal job timestamp")
+    return {
+        "terminal_job_started_at_ms": started_at_ms,
+        "terminal_job_finished_at_ms": finished_at_ms,
+    }
 
 
 _TERMINAL_USAGE_REPLAY_TIME_EXCLUDED = "terminal-usage-replay-time-excluded-from-identity"
