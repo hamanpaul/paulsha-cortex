@@ -705,7 +705,7 @@ identities:
     capabilities: [planning, review]
 ```
 
-- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 已登錄 canonical agy identity；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。
+- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 提供 canonical agy 候選；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。`cortex doctor` 依解析政策確認至少有一個可用的 planning identity，不要求部署保留 canonical agy；agy discovery 與 smoke probe 只判定 agy 是否可用。
 - planner/builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析；agy 只有在 `doctor --probe-live` 的 model discovery 與 plan/sandbox smoke 都吻合時才可用。
 - fanout/tick 明確指定的 builder `(executor, model_id)`，以及 spec frontmatter 成對宣告的 `executor`／`model_id`，都會先查這份 registry；unknown identity 會在派工前 fail-closed 並列出可用 candidates。
 - workflow reviewer 只會選擇明示 `capabilities: [review]` 且與會產出 Candidate commit 的 build card 不同 independence domain 的 schema v2 identity；`commit_policy=forbidden` 的隔離確認卡不計為 Builder；legacy v1 identity 只取得 planning capability，不能被猜成 reviewer。
