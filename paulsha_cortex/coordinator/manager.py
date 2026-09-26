@@ -12940,11 +12940,16 @@ def apply_workflow_action(
                 context["main_sync_evidence_hash"] = evidence_hash
                 result["evidence_hash"] = evidence_hash
             result["main_sync"] = dict(main_sync)
+        diagnostic_code = (
+            delivery_reason
+            if delivery_reason in {"review-disposition-required", "review-threads-unresolved"}
+            else "delivery-needs-human"
+        )
         return (
             delivery_reason,
             updated_evidence_refs,
             diagnostic_reason(
-                "delivery-needs-human",
+                diagnostic_code,
                 "ship validator 判定交付需要人工介入："
                 f"{delivery_reason}",
                 source=source,

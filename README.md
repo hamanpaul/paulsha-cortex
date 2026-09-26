@@ -512,7 +512,7 @@ cortex slice-action "$SLICE_ID" abandon      --actor operator
 
 `fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。共享 coordinator root 內的 `jobs.json` 另以 exact durable-byte SHA-256 revision ＋ canonical `jobs.json.transaction.lock` sidecar 做 compare-and-persist：stale request 不會被靜默重播，daemon 會先把 `RegistryRevisionConflict`（含 expected/actual revision 與 canonical path）持久化成 `done` error，再移除 request file。
 
-Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|auto|review-attest|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，CLI 會拒絕 `expected_run_id`；`cortex run work retry-build` 使用 `--expected-candidate`，不接受共用旗標 `--expected-run-id`。`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord；終態化後也會逐 run reconcile planning transaction、回收 build worktree，並退役 build branch。有超出 base 的 branch commit 會先保留在 `archive/<work_id>-<shortsha>` tag。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|auto|review-attest|review-disposition|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，CLI 會拒絕 `expected_run_id`；`cortex run work retry-build` 使用 `--expected-candidate`，不接受共用旗標 `--expected-run-id`。`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord；終態化後也會逐 run reconcile planning transaction、回收 build worktree，並退役 build branch。有超出 base 的 branch commit 會先保留在 `archive/<work_id>-<shortsha>` tag。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
 Sizing 的五個維度仍各為 0–2 分，Green／Yellow／Red 仍是 0–3／4–6／7–10。`spec_stability` 使用可識別的 `stability-risk-v2` 風險映射：完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind 或任何 blocker／未 accepted artifact 為 2；空白或不一致資料保守為 2。這不會取代 accepted/readiness gate。新 claim／reclaim／明示 retry 重算才採用新映射；舊 run、frozen planning、CompletionRecord 與 immutable evidence 不會因讀取或重啟被回填，缺算法來源的歷史分數標為 legacy／unversioned，需正式重新評估才取得新分數。
 
@@ -773,6 +773,14 @@ cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
 ```
 
 `review-attest.json`接受`{"verdict":"approved","summary":"...","findings":[]}`，並可選填 `evidence_refs`（只接受 `{"kind":"operator-reproduction","ref":"<absolute path>","sha256":"<64 hex>"}` 陣列）。path/hash 仍由 Manager 生成，caller 不得注入。若 work item 尚無 mapped PR，Manager 會在 `verified_head == candidate_head` 時先建立 `pr_number: null` 的 immutable maintainer evidence；後續 ship 建 PR 時再把它綁進 delivery gate。若已有 PR，Manager 仍會重讀 authenticated PR HEAD 並將 evidence 綁定 repo/work/run/authority/PR/candidate/actor。
+
+同 HEAD 的 Copilot finding 已完成討論時，operator 可用 `cortex work review-disposition <work-id> --repo <owner/repo> --actor <operator> --reason <理由>` 提交續行裁決。Manager 只在 run／PR／latest Copilot review 仍綁同一 exact HEAD、fresh GitHub snapshot 的所有 review threads 均 resolved，且 thread snapshot 與裁決時一致時寫入 immutable evidence 並清除 needs-human facet；ship 保留原 finding/disposition 歷史。之後明示 `cortex work resume` 會再次執行既有 delivery gates。HEAD、review 或 thread snapshot 改變、仍有未 resolved thread，或沒有 operator disposition 時都會繼續阻擋；單獨 resolve thread 不授權 merge。
+
+```bash
+cortex work review-disposition "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
+  --reason "$REASON"
+cortex work resume "$WORK_ID" --repo "$REPO"
+```
 
 - `slice-action` 一律透過 control request queue，由 daemon/manager 單一 writer 消費。
 - `slice-action retry-build` 若在 agent 真正 launch 前失敗，現在會保留既有

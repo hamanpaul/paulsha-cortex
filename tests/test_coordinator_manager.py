@@ -100,6 +100,59 @@ def _proc_fail(returncode: int) -> SimpleNamespace:
     return SimpleNamespace(returncode=returncode, stdout="", stderr="")
 
 
+def test_advance_ship_keeps_review_disposition_blocker_specific(tmp_path: Path) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    step = WorkflowStep(
+        phase="review",
+        persona="reviewer",
+        card="review-card",
+        executor=None,
+        model=None,
+        domain=None,
+        inputs=(),
+        outputs=(),
+        gate_result="passed",
+    )
+    run = registry._manager_create_workflow_run(
+        work_id="demo",
+        repo="acme/demo",
+        claim_key="claim:review-disposition",
+        source_revision="a" * 64,
+        workspace_root=str(tmp_path),
+        combo="fix-standard",
+        current_phase="review",
+        steps=(step,),
+        candidate_head="b" * 40,
+        verified_head="b" * 40,
+        gate_status="running",
+    )
+
+    result = manager.apply_workflow_action(
+        registry,
+        args={
+            "action": "advance",
+            "run_id": run.run_id,
+            "card_id": "review-card",
+            "current_phase": "ship",
+        },
+        ship_validator=lambda **_kwargs: {
+            "trusted": True,
+            "status": "needs_human",
+            "head": "b" * 40,
+            "commit_id": "b" * 40,
+            "ref": "delivery-adapter.json",
+            "hash": "c" * 64,
+            "reason": "review-disposition-required",
+        },
+        trusted_terminal=True,
+    )
+
+    assert result["reason"] == "review-disposition-required"
+    assert registry.get_workflow_run(run.run_id).needs_human_reason["reason"] == (
+        "review-disposition-required"
+    )
+
+
 def _persona_catalog(*, builder_paths: list[str]) -> str:
     # 先組好再內插：Python 3.11 以前不允許 f-string 表達式含反斜線（PEP 701
     # 才放寬），內嵌 f'\"{path}\"' 會讓本檔在 3.10／3.11 連 parse 都失敗。

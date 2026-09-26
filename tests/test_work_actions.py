@@ -3215,6 +3215,246 @@ def test_ship_fix_required_persists_capped_reviewer_findings(
     ]
 
 
+def test_review_disposition_requires_resolved_same_head_and_resumes_ship(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    foreign_path = tmp_path / "foreign-review.json"
+    foreign_payload = {"state": "passed", "candidate": HEAD}
+    foreign_path.write_text(json.dumps(foreign_payload), encoding="utf-8")
+    foreign_hash = work_actions.verification.canonical_json_hash(foreign_payload)
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        pr_refs=("acme/demo#8",),
+        gate_refs=(GateEvidenceRef("foreign-review", str(foreign_path), foreign_hash),),
+        gate_status="passed",
+        facets=("needs_human",),
+        needs_human_reason=fixture_needs_human_reason(),
+    )
+    current = {
+        "head": HEAD,
+        "threads": (ReviewThread("thread-1", False, False, "src/demo.py", 7, "finding"),),
+        "merged": False,
+    }
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def ensure_pr_metadata(self, **kwargs):
+            pass
+
+        def fetch_delivery_facts(self, **kwargs):
+            return DeliveryFacts(
+                head=current["head"],
+                mergeable=True,
+                mergeable_state="clean",
+                checks=(GitHubCheck("ci", "completed", "success"),),
+                copilot_reviews=(
+                    CopilotReview(
+                        review_id=9,
+                        commit_id=HEAD,
+                        state="COMMENTED",
+                        body="finding",
+                        author=COPILOT_REVIEWER_LOGIN,
+                        submitted_at_epoch=205,
+                    ),
+                ),
+                review_threads=current["threads"],
+                closing_issues=(12,),
+                active_openspec_absent=True,
+                archive_present=True,
+            )
+
+        def fetch_merge_status(self, **kwargs):
+            return MergeStatus(current["merged"], current["head"], "c" * 40 if current["merged"] else None)
+
+        def request_copilot(self, **kwargs):
+            raise AssertionError("existing exact-HEAD Copilot review must be reused")
+
+    class Orchestrator:
+        def __init__(self, *, github, now):
+            self.github = github
+
+        def merge_if_ready(self, **kwargs):
+            current["merged"] = True
+            return SimpleNamespace(
+                expected_head=kwargs["expected_head"],
+                expected_tree_hash=kwargs["expected_tree_hash"],
+            )
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    monkeypatch.setattr(work_actions, "ShipOrchestrator", Orchestrator)
+    monkeypatch.setattr(work_actions, "load_preflight_command", lambda: ("preflight",))
+    monkeypatch.setattr(
+        work_actions,
+        "run_preflight",
+        lambda **kwargs: PreflightResult(
+            True,
+            None,
+            CommandResult(("policy",), 0, "", ""),
+            CommandResult(("preflight",), 0, "", ""),
+            HEAD,
+            TREE,
+        ),
+    )
+    monkeypatch.setattr(
+        work_actions,
+        "_validate_foreign_review",
+        lambda *_args, **_kwargs: foreign_payload,
+    )
+    base = {
+        "repo_root": str(tmp_path),
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+        "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+        "foreign_review_path": str(foreign_path),
+        "foreign_review_hash": foreign_hash,
+    }
+
+    def ship(now_epoch: float) -> dict:
+        return work_actions.execute_work_action(
+            args={"action": "ship", "repo": "acme/demo", "work_id": "demo", **base},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: now_epoch,
+            workflow_registry=registry,
+        )["result"]
+
+    finding = ship(207)
+    assert finding["action"] == "fix-required"
+    assert _only_journal_row(state)["ship"]["phase"] == "needs-fix"
+
+    still_open = ship(208)
+    assert still_open["action"] == "fix-required"
+    assert still_open["reason"] == "review-threads-unresolved"
+    assert still_open["next_actions"] == ["review-disposition"]
+    disposition_args = {
+        "action": "review-disposition",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "actor": "maintainer",
+        "reason": "討論已完成，此 finding 不阻擋合併。",
+    }
+    with pytest.raises(RuntimeError, match="all PR review threads resolved"):
+        work_actions.execute_work_action(
+            args=disposition_args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 209,
+            workflow_registry=registry,
+        )
+    assert not (tmp_path / "evidence" / "review-disposition").exists()
+
+    current["threads"] = (ReviewThread("thread-1", True, False, "src/demo.py", 7, "finding"),)
+    still_needs_operator = ship(210)
+    assert still_needs_operator["action"] == "fix-required"
+    assert still_needs_operator["reason"] == "review-disposition-required"
+    assert still_needs_operator["next_actions"] == ["review-disposition"]
+    registry._manager_update_workflow_run(
+        run_id,
+        facets=("needs_human",),
+        gate_status="running",
+        needs_human_reason=work_actions.diagnostic_reason(
+            "review-disposition-required",
+            "PR review threads 已 resolved，仍需要 operator disposition。",
+            source="test_review_disposition_935",
+            run_id=run_id,
+            work_id="demo",
+            head=HEAD,
+        ),
+    )
+    resumed_attention = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 211,
+        workflow_registry=registry,
+        workflow_starter=lambda *_args: registry.get_workflow_run(run_id),
+    )["result"]
+    assert "review-disposition" in resumed_attention["next_actions"]
+    assert "cortex work review-disposition" in resumed_attention["next_step_hint"]
+
+    current["head"] = "c" * 40
+    with pytest.raises(RuntimeError, match="PR HEAD mismatch"):
+        work_actions.execute_work_action(
+            args=disposition_args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 212,
+            workflow_registry=registry,
+        )
+
+    current["head"] = HEAD
+    recorded = work_actions.execute_work_action(
+        args=disposition_args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 212,
+        workflow_registry=registry,
+    )["result"]
+    assert recorded["action"] == "review-disposition-recorded"
+    record_path = Path(recorded["ref"])
+    assert record_path.is_file()
+    assert record_path.stat().st_mode & 0o222 == 0
+    row = _only_journal_row(state)
+    assert row["ship"]["phase"] == "needs-fix"
+    assert row["ship"]["findings"] == [
+        {"path": "src/demo.py", "line": 7, "body": "finding"}
+    ]
+    assert row["review_dispositions"] == [
+        {"ref": str(record_path), "hash": recorded["hash"]}
+    ]
+    assert "needs_human" not in registry.get_workflow_run(run_id).facets
+
+    current["threads"] = (
+        ReviewThread("thread-1", True, False, "src/demo.py", 7, "finding"),
+        ReviewThread("thread-2", True, False, "src/other.py", 8, "new thread"),
+    )
+    stale_thread_set = ship(213)
+    assert stale_thread_set["action"] == "fix-required"
+    assert stale_thread_set["reason"] == "review-disposition-required"
+    current["threads"] = (
+        ReviewThread("thread-1", True, False, "src/demo.py", 7, "finding"),
+    )
+
+    current["head"] = "c" * 40
+    with pytest.raises(RuntimeError, match="ship HEAD differs from authenticated GitHub PR"):
+        ship(214)
+    current["head"] = HEAD
+
+    resumed = ship(216)
+    assert resumed == {"action": "merged-awaiting-closure", "head": HEAD}
+    row = _only_journal_row(state)
+    assert row["review_finding_history"][0]["finding_count"] == 1
+    assert row["review_finding_history"][0]["review_id"] == 9
+    assert row["review_finding_history"][0]["disposition_ref"] == str(record_path)
+    assert row["review_dispositions"] == [
+        {"ref": str(record_path), "hash": recorded["hash"]}
+    ]
+
+
 def test_external_merge_without_durable_authorization_needs_human(monkeypatch, tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"

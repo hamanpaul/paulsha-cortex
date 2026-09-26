@@ -207,6 +207,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
             "recover-superseded",
             "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+            "review-disposition",
             "intake",
         ],
     )

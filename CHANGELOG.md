@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#935 review disposition 續行**：新增 operator 明示裁決入口；Manager 重新驗證同 HEAD 的 PR、latest Copilot review 與 resolved threads，並保留 immutable finding/disposition 歷史，確認未漂移後才允許沿原 workflow 重跑 delivery gates。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
