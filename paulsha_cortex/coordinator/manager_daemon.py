@@ -837,14 +837,14 @@ def build_request_executor(
                     args=dict(args),
                     requested_by=request["requested_by"],
                 )
-            # #545／#569：`retry-card` 與 `retry-build` 共用同一條「強制重派當前
-            # 卡」的 dispatch 路徑（含失敗時把 needs_human 補回去的補償），差別
-            # 只在 work action 層允許的卡片位置與 reset 語意。#569 之後
-            # `retry-card` 也涵蓋 verify／review 的 reviewer 卡，因此這個旗標
-            # 不再只針對 builder。
-            forced_card_retry = args.get("action") in {"retry-build", "retry-card"}
+            # #545／#569／#883：retry-card、retry-build、retry-verify 共用同一條
+            # 「強制重派當前卡」路徑及失敗補償。retry-verify 先做 phase reset，
+            # 再由此處派新 verification job；精準可復原的舊 reviewer job 保留原狀。
+            forced_card_retry = args.get("action") in {
+                "retry-build", "retry-card", "retry-verify",
+            }
             if args.get("action") in {
-                "start", "resume", "retry-build", "retry-card", "intake",
+                "start", "resume", "retry-build", "retry-card", "retry-verify", "intake",
             }:
                 registry = getattr(dispatcher, "_registry", None)
                 run_payload = result.get("result", {}).get("run") if isinstance(result, dict) else None
