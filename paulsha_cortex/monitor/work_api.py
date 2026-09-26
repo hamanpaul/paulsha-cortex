@@ -1107,9 +1107,12 @@ def _parse_closure_evidence(
         openspec_tasks_complete = not openspec_refs or openspec_refs.issubset(
             {str(todo.get("openspec_ref")) for todo in openspec_todos}
         )
-        combined[group.work_id]["todo_tasks_complete"] = bool(todo_evidence) and all(
-            todo["complete"] is True for todo in todo_evidence
-        ) and openspec_tasks_complete
+        # Workstream Todo 仍須存在；只有已封存的 OpenSpec tasks 要求全數勾選。
+        combined[group.work_id]["todo_tasks_complete"] = (
+            bool(todo_evidence)
+            and all(todo["complete"] is True for todo in openspec_todos)
+            and openspec_tasks_complete
+        )
     return {
         work_id: ClosureEvidence(
             **{name: facts.get(name, False) for name in fields}

@@ -293,7 +293,6 @@ def test_remote_closure_is_strict_conjunction() -> None:
         "merge_is_merge_commit",
         "active_openspec_absent",
         "archive_present",
-        "todo_complete",
         "completion_record_valid",
     ):
         assert not evaluate_remote_closure(
@@ -301,6 +300,13 @@ def test_remote_closure_is_strict_conjunction() -> None:
             required_issues=(14,),
             expected_head=HEAD,
         ).allowed
+    unchecked_todo = evaluate_remote_closure(
+        facts=replace(facts, todo_complete=False),
+        required_issues=(14,),
+        expected_head=HEAD,
+    )
+    assert unchecked_todo.allowed
+    assert unchecked_todo.reasons == ()
     assert not evaluate_remote_closure(
         facts=replace(facts, issue_states={14: "open"}),
         required_issues=(14,),

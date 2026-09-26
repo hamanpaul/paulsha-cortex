@@ -47,7 +47,7 @@ Builder 使用 `feature/<issue>-<slug>` worktree；deterministic verification �
 
 Ship 由 Manager 執行：官方 `openspec archive -y`、tasks/spec/docs/changelog 檢查、zh-TW PR metadata、快速 policy、`PSC_PREFLIGHT_CMD` CI-parity preflight、GitHub checks、typed current-HEAD delivery review、resolved/outdated threads、final HEAD race check、`gh pr merge --merge`。tasks.md 未勾項仍會阻擋 archive，僅以 Manager 為主詞且明確描述 authoritative preflight 並採信 Candidate 的 Manager 專屬項目不阻擋。Copilot路徑每次push重請review且最多兩輪fix/re-review、每HEAD等15分鐘；maintainer路徑由Manager寫exact-HEAD immutable attestation。逾限或任一authority drift轉needs_human。
 
-Merge 後 fetch default branch，確認 merge ancestry、issues closed、active OpenSpec 消失、remote archive 存在、Todo tasks 完成，再寫 CompletionRecord。只有全部成立才投影 done。
+Merge 後 fetch default branch，確認 merge ancestry、issues closed、mapped Todo 存在且可讀，再寫入並驗證 CompletionRecord；workstream Todo 未勾 checkbox 只作觀測，不阻擋有效 closure。若有 mapped OpenSpec，仍須確認 active OpenSpec 消失、remote archive 存在，且 archived tasks 通過既有 archive gate，才投影 done。
 
 ### 6. 公開 contract versioned，舊 ProjectState 暫時相容
 

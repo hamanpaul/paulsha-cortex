@@ -983,8 +983,9 @@ def test_maintainer_review_evidence_rejects_legacy_prless_attestation_for_opensp
 
 
 @pytest.mark.parametrize("review_kind", ["copilot", "maintainer-review"])
+@pytest.mark.parametrize("todo_complete", [True, False])
 def test_remote_closure_reads_and_validates_completion_record(
-    tmp_path: Path, review_kind: str
+    tmp_path: Path, review_kind: str, todo_complete: bool
 ) -> None:
     authority = _authority(tmp_path, last_success=0)
     verification_ref = verification.write_verification_evidence(
@@ -1064,7 +1065,7 @@ def test_remote_closure_reads_and_validates_completion_record(
                 issue_states={14: "closed"},
                 active_openspec_absent=True,
                 archive_present=True,
-                todo_complete=True,
+                todo_complete=todo_complete,
                 todo_revisions={"docs/todo.md": HEAD3},
                 completion_record_valid=False,
             )

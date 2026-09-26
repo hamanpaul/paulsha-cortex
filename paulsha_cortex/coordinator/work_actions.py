@@ -6076,7 +6076,13 @@ def _close_delivered_action(
         expected_head=facts.pr_head,
     )
     if not gate.allowed:
-        raise RuntimeError(f"close-delivered remote closure blocked: {', '.join(gate.reasons)}")
+        reasons = list(gate.reasons)
+        if not facts.todo_complete:
+            reasons.append("todo-incomplete")
+        raise RuntimeError(f"close-delivered remote closure blocked: {', '.join(reasons)}")
+    # 外部交付的人工補記維持原本要求：mapped Todo 與 archived tasks 必須全勾。
+    if not facts.todo_complete:
+        raise RuntimeError("close-delivered remote closure blocked: todo-incomplete")
 
     source_revisions: dict[str, str] = {}
     for value in authority.source_revisions:
