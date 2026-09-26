@@ -641,6 +641,7 @@
 - **#1084 Architecture HTML CDP timeout 診斷與有限重試**：workflow 僅對 Chrome CDP `Target.getTargets: timed out after 15000ms` 進行最多兩次重試，逐次保存 visual-check 輸出與診斷；其他錯誤立即失敗，持續逾時仍 fail closed。
 - **#875、#881、#559**：builder 候選排除 zero-tool 的 `cg` 並保留 preflight finding 原因；reviewer independence domain 僅依會產出 commit 的 build 卡計算；plan output materialize 改用可恢復的 publication journal。
 - **#555 `retry-card` per-card 重派熔斷**：每張卡最多接受三次 operator 重派；超限後維持 `needs_human`、在 `blocking_reason` 指明卡片並提供 `abandon`／符合條件時 `retry-build` 的出口，status 不再宣告該卡可 `retry-card`。
+- **#912 recent_done 與 not_claimable 狀態收斂**：recent_done 增列 registry job 的實際 `exited_at` 與所屬 workflow 的 `run_id`、`work_id`、`run_status`；auto-claim scan 收尾會移除不再存在於 work snapshot 的 not-claimable 記錄。
 - Wave R 整合交付：operator 合併 8 個卡在 cortex pipeline 的實作 PR，並補 review 修正（非正規化 governed path、journal lock `O_CLOEXEC`、裁決 evidence 先於 run 重置、#862 測試對齊 #966 CAS）。
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、
   逐條宣稱更正，以及切換當下才撞得到的那一個阻斷**。四分部署的

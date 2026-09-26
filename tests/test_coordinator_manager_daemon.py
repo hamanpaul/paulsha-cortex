@@ -1207,6 +1207,72 @@ def test_recent_done_provider_projects_gate_reason_job_id_branch(monkeypatch, tm
     assert entries["slice-sparse"]["repo"] is None
 
 
+@pytest.mark.parametrize("run_status", ["ongoing", "superseded", "done"])
+def test_recent_done_provider_projects_job_exit_and_workflow_run_state(
+    monkeypatch, tmp_path, run_status
+):
+    """#912：recent_done 顯示 job 真正退出時間及所屬 work/run 狀態。"""
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    (handoff_dir / "wf-run-1-build-1.json").write_text(
+        json.dumps(
+            {
+                "slice_id": "wf-run-1-build-1",
+                "gate_status": "workflow-tracked",
+                "completed_at": "2026-07-03T09:03:00+00:00",
+                "job_id": "job-1",
+                "workflow_run_id": "run-1",
+                "workflow_repo": "acme/demo",
+                "workflow_card": "build",
+                "workflow_phase": "build",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class WorkflowRegistry(FakeRegistry):
+        def list_workflow_runs(self):
+            return [
+                SimpleNamespace(
+                    run_id="run-1",
+                    work_id="work-1",
+                    status=run_status,
+                )
+            ]
+
+    registry = WorkflowRegistry(
+        [
+            {
+                "job_id": "job-1",
+                "task": "work-1",
+                "status": "exited",
+                "exited_at": "2026-07-03T08:59:00+00:00",
+                "workflow_run_id": "run-1",
+                "workflow_repo": "acme/demo",
+                "workflow_card": "build",
+                "workflow_phase": "build",
+            }
+        ]
+    )
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=registry,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+        scan_specs_fn=lambda _: [],
+        ready_units_fn=lambda metas, predicate: [],
+        now_fn=lambda: "2026-07-03T09:10:00+00:00",
+    )
+
+    entry = provider()["recent_done"][0]
+
+    assert entry["at"] == "2026-07-03T09:03:00+00:00"
+    assert entry["exited_at"] == "2026-07-03T08:59:00+00:00"
+    assert entry["run_id"] == "run-1"
+    assert entry["work_id"] == "work-1"
+    assert entry["run_status"] == run_status
+
+
 def test_recent_done_provider_projects_repo_from_workflow_repo(monkeypatch, tmp_path):
     """#465：workflow-lane manifest 帶 workflow_repo 時 repo 投影該值；null 時維持 repo=None。"""
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))

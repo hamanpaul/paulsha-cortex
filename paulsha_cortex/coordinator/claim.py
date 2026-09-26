@@ -1055,7 +1055,11 @@ def _load_work_authorities_with_diagnostics(
     *,
     snapshot_path: str | Path | None = None,
     allow_rate_limited_last_known_good: bool = False,
-) -> tuple[tuple[WorkAuthority, ...], tuple[AuthorityValidationError, ...]]:
+) -> tuple[
+    tuple[WorkAuthority, ...],
+    tuple[AuthorityValidationError, ...],
+    tuple[tuple[str, str], ...],
+]:
     """Parse every row independently (#206 AC4): one row's validation failure
     is recorded as ``AuthorityValidationError`` diagnostics and the row is
     dropped from the result, but parsing continues for the remaining rows —
@@ -1069,6 +1073,15 @@ def _load_work_authorities_with_diagnostics(
     """
     payload, digest = _load_snapshot(snapshot_path)
     providers = payload["providers"]
+    snapshot_items = tuple(
+        (row["repo"], row["work_id"])
+        for row in payload["work_items"]
+        if isinstance(row, dict)
+        and isinstance(row.get("repo"), str)
+        and row["repo"]
+        and isinstance(row.get("work_id"), str)
+        and row["work_id"]
+    )
     parsed: list[WorkAuthority] = []
     skipped: list[AuthorityValidationError] = []
     for row in payload["work_items"]:
@@ -1104,14 +1117,27 @@ def _load_work_authorities_with_diagnostics(
             owner = owners.setdefault(key, authority.work_id)
             if owner != authority.work_id:
                 raise ValueError("confirmed work authority missing or ambiguous")
-    return authorities, tuple(skipped)
+    return authorities, tuple(skipped), snapshot_items
 
 
 def load_work_authorities(
     *, snapshot_path: str | Path | None = None
 ) -> tuple[WorkAuthority, ...]:
-    authorities, _skipped = _load_work_authorities_with_diagnostics(snapshot_path=snapshot_path)
+    authorities, _skipped, _snapshot_items = _load_work_authorities_with_diagnostics(
+        snapshot_path=snapshot_path
+    )
     return authorities
+
+
+def load_work_authorities_with_snapshot_items(
+    *, snapshot_path: str | Path | None = None
+) -> tuple[tuple[WorkAuthority, ...], tuple[tuple[str, str], ...]]:
+    """載入 claim authority，並保留快照中所有可辨識的 work item 身分。"""
+
+    authorities, _skipped, snapshot_items = _load_work_authorities_with_diagnostics(
+        snapshot_path=snapshot_path
+    )
+    return authorities, snapshot_items
 
 
 def load_work_authority(
@@ -1133,7 +1159,7 @@ def load_work_authority(
     strict default and needs fresh authority.
     """
 
-    authorities, skipped = _load_work_authorities_with_diagnostics(
+    authorities, skipped, _snapshot_items = _load_work_authorities_with_diagnostics(
         snapshot_path=snapshot_path,
         allow_rate_limited_last_known_good=allow_rate_limited_last_known_good,
     )

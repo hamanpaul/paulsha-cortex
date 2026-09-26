@@ -860,9 +860,15 @@ def _manifest_execution_identity(
     workflow_phase: object = None,
 ) -> dict[str, Any]:
     """Resolve a handoff manifest's job binding without trusting its identity fields."""
+    lifecycle_fields = {
+        "exited_at": None,
+        "run_id": None,
+        "work_id": None,
+        "run_status": None,
+    }
     job = _registry_job(registry, job_id)
     if job is None:
-        return _unknown_execution_identity(card=workflow_card)
+        return {**_unknown_execution_identity(card=workflow_card), **lifecycle_fields}
     if isinstance(workflow_run_id, str) and workflow_run_id:
         if not isinstance(workflow_card, str) or not workflow_card:
             # A run binding without a card is still an explicit job binding;
@@ -885,13 +891,43 @@ def _manifest_execution_identity(
         if isinstance(workflow_phase, str) and workflow_phase:
             bound = bound and job.get("workflow_phase") == workflow_phase
     if not bound:
-        return _unknown_execution_identity(card=workflow_card)
+        return {**_unknown_execution_identity(card=workflow_card), **lifecycle_fields}
+    lifecycle_fields["exited_at"] = job.get("exited_at")
+    run_id = job.get("workflow_run_id")
+    if isinstance(run_id, str) and run_id:
+        lifecycle_fields["run_id"] = run_id
+        lister = getattr(registry, "list_workflow_runs", None)
+        if callable(lister):
+            try:
+                run = next(
+                    (
+                        item
+                        for item in lister()
+                        if getattr(item, "run_id", None) == run_id
+                    ),
+                    None,
+                )
+            except Exception:  # noqa: BLE001 - status projection is fail-soft
+                run = None
+            if run is not None:
+                work_id = getattr(run, "work_id", None)
+                run_status = getattr(run, "status", None)
+                lifecycle_fields["work_id"] = work_id if isinstance(work_id, str) else None
+                lifecycle_fields["run_status"] = (
+                    run_status if isinstance(run_status, str) else None
+                )
     status = job.get("status")
     if status in IN_FLIGHT_STATUSES:
-        return _job_execution_identity(job, identity_source="in-flight", card=workflow_card)
-    if status in TERMINAL_STATUSES:
-        return _job_execution_identity(job, identity_source="last-execution", card=workflow_card)
-    return _unknown_execution_identity(card=workflow_card)
+        identity = _job_execution_identity(
+            job, identity_source="in-flight", card=workflow_card
+        )
+    elif status in TERMINAL_STATUSES:
+        identity = _job_execution_identity(
+            job, identity_source="last-execution", card=workflow_card
+        )
+    else:
+        identity = _unknown_execution_identity(card=workflow_card)
+    return {**identity, **lifecycle_fields}
 
 
 def _workflow_execution_identity(registry, run) -> dict[str, Any]:
