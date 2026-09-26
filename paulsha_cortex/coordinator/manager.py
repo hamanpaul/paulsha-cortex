@@ -10574,9 +10574,10 @@ def _runtime_preflight_gate(
 ):
     """#262：dispatch 前的 runtime capability／provider 新鮮度 gate。
 
-    回傳 None 代表這張 card 未宣告任何 capability，呼叫端照原路徑走；否則回傳
-    `DispatchGateDecision`，其中 `launcher` 只在通過 preflight 的 identity 上建立
-    ——被擋下的 identity 不會產生任何 model session。
+    沒有 capability 宣告且候選中沒有 overlay Copilot identity 時回傳 None。overlay
+    Copilot identity 另做一次限時模型探測；CLI 無法判定時只留診斷，不阻擋派工。
+    `DispatchGateDecision` 的 `launcher` 只在通過 preflight 的 identity 上建立；
+    被擋下的 identity 不會產生 model session 或 workflow Job。
 
     `snapshot_store` 預設 None 時延後到真正需要時才建立
     `monitor.work_snapshot.WorkSnapshotStore()`（讀既有 monitor durable
@@ -10592,15 +10593,20 @@ def _runtime_preflight_gate(
     try:
         requirements = card_runtime_requirements(step.card)
     except Exception:  # noqa: BLE001 - deck 載入問題不得把 dispatch 一起拖垮
-        return None
-    if not requirements:
-        return None
+        requirements = ()
 
     active_candidates = (
         _workflow_identity_candidates(run, step, identities)
         if candidates is None
         else list(candidates)
     )
+    has_overlay_copilot_candidate = any(
+        getattr(identity, "executor", None) == "copilot"
+        and getattr(identity, "origin", None) == model_resolution.IDENTITY_ORIGIN_OVERLAY
+        for identity in active_candidates
+    )
+    if not requirements and not has_overlay_copilot_candidate:
+        return None
     compatibility_for = model_resolution.compatibility_checker_for(step.persona)
 
     # 每個 identity 只 specialize 一次並記憶：preflight 與最終 dispatch 共用同一
@@ -10629,16 +10635,16 @@ def _runtime_preflight_gate(
 
         return host_environment()
 
+    provider_requirements = tuple(
+        requirement for requirement in requirements if requirement.kind == "provider"
+    )
     active_store = snapshot_store
-    if active_store is None:
+    if provider_requirements and active_store is None:
         from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
 
         active_store = WorkSnapshotStore()
 
     projected_attempts: list[runtime_preflight.RuntimePreflightResult] = []
-    provider_requirements = tuple(
-        requirement for requirement in requirements if requirement.kind == "provider"
-    )
     checked_at = time.time()
     if provider_requirements:
         seen_projected: set[str] = set()
@@ -10690,18 +10696,122 @@ def _runtime_preflight_gate(
                     )
                 )
 
-    gate = evaluate_dispatch_gate(
-        card=step.card,
-        requirements=requirements,
-        candidates=active_candidates,
-        environment_for=_environment_for,
-        launcher_factory=_launcher_for,
-        snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
-        provider_prober=_combined_provider_prober,
+    attempts = list(projected_attempts)
+    availability_rerouted = False
+    runtime_rerouted = False
+    probe_budget = runtime_preflight.ProbeBudget()
+    for identity_index, identity in enumerate(active_candidates):
+        availability_finding = None
+        if (
+            getattr(identity, "executor", None) == "copilot"
+            and getattr(identity, "origin", None) == model_resolution.IDENTITY_ORIGIN_OVERLAY
+        ):
+            from .executor_auth import cached_copilot_model_availability
+
+            status, reason = cached_copilot_model_availability(identity.model_id)
+            capability = runtime_preflight.RuntimeCapability(
+                "provider", f"model:{identity.executor}/{identity.model_id}"
+            )
+            outcome = {
+                "available": runtime_preflight.PreflightOutcome.OK,
+                "unavailable": runtime_preflight.PreflightOutcome.PROVIDER_UNAVAILABLE,
+                "unknown": runtime_preflight.PreflightOutcome.PROBE_INCONCLUSIVE,
+            }.get(status, runtime_preflight.PreflightOutcome.PROBE_INCONCLUSIVE)
+            freshness = runtime_preflight.ProviderFreshness(
+                provider_id=capability.name,
+                status={
+                    "available": "ok",
+                    "unavailable": "unavailable",
+                    "unknown": "unknown",
+                }.get(status, "unknown"),
+                observed_at=checked_at,
+                ttl_seconds=runtime_preflight.DEFAULT_PROVIDER_TTL_SECONDS,
+                source="model-availability-probe",
+                reason=reason,
+            )
+            availability_finding = runtime_preflight.CapabilityFinding(
+                capability=capability,
+                outcome=outcome,
+                reason=reason,
+                freshness=freshness,
+            )
+            if outcome is runtime_preflight.PreflightOutcome.PROBE_INCONCLUSIVE:
+                logger.warning(
+                    "workflow run=%s card=%s model=%s/%s %s",
+                    getattr(run, "run_id", None),
+                    step.card,
+                    identity.executor,
+                    identity.model_id,
+                    reason,
+                )
+            if outcome is runtime_preflight.PreflightOutcome.PROVIDER_UNAVAILABLE:
+                attempts.append(
+                    runtime_preflight.RuntimePreflightResult(
+                        card=step.card,
+                        identity_token=runtime_preflight._identity_token(identity),
+                        environment=runtime_preflight.ExecutorEnvironment(
+                            name="manager:copilot-model-probe",
+                            interpreter=("copilot",),
+                            path="<manager PATH>",
+                            home="<manager HOME>",
+                            provider_identity=capability.name,
+                        ),
+                        findings=(availability_finding,),
+                        checked_at=checked_at,
+                    )
+                )
+                availability_rerouted = True
+                continue
+
+        candidate_gate = evaluate_dispatch_gate(
+            card=step.card,
+            requirements=requirements,
+            candidates=(identity,),
+            environment_for=_environment_for,
+            launcher_factory=_launcher_for,
+            snapshot_lookup=_combined_provider_snapshot_lookup(snapshot_store=active_store),
+            provider_prober=_combined_provider_prober,
+            budget=probe_budget,
+        )
+        if availability_finding is not None:
+            result = replace(
+                candidate_gate.result,
+                findings=(*candidate_gate.result.findings, availability_finding),
+            )
+            candidate_gate = replace(
+                candidate_gate, result=result, attempts=(result,)
+            )
+        attempts.extend(candidate_gate.attempts)
+        if candidate_gate.action == "needs_human":
+            runtime_rerouted = True
+            continue
+
+        rerouted = availability_rerouted or runtime_rerouted or identity_index > 0
+        reason = (
+            "model-availability-rerouted"
+            if availability_rerouted
+            else "capability-missing-rerouted"
+            if runtime_rerouted or identity_index > 0
+            else candidate_gate.reason
+        )
+        return replace(
+            candidate_gate,
+            action="reroute" if rerouted else candidate_gate.action,
+            reason=reason,
+            attempts=tuple(attempts),
+        )
+
+    reasons = [attempt.blocking_reason() for attempt in attempts]
+    reason = "runtime preflight blocked all candidates -- " + " | ".join(
+        item for item in reasons if item
     )
-    if projected_attempts:
-        gate = replace(gate, attempts=tuple(projected_attempts) + gate.attempts)
-    return gate
+    return runtime_preflight.DispatchGateDecision(
+        action="needs_human",
+        identity=None,
+        reason=reason,
+        result=attempts[-1],
+        attempts=tuple(attempts),
+    )
 
 
 def _record_resolved_model_chain(
@@ -12096,9 +12206,9 @@ def _dispatch_workflow_card(
             if publication is not None:
                 publication.commit()
             return None
-    # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
-    # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
-    # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。
+    # #262／#600 dispatch gate：在建立 worktree／sandbox／job row／model session 前，
+    # 驗證 card capability／provider 新鮮度，並探測 overlay Copilot 型號；沒有這些
+    # 檢查需求的 card 維持原有直通路徑。
     candidate_pool = _workflow_identity_candidates(run, step, identities)
     backoff_report = _executor_backoff_admission_report(
         candidate_pool,

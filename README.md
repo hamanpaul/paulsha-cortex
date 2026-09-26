@@ -638,7 +638,7 @@ verification:
 
 Manager 在建立 worktree／sandbox／job row／model session **之前**，會依 card 宣告在
 「即將實際被使用的 executor 環境」執行低成本 preflight。card 未宣告任何 capability
-時 preflight 是 no-op，行為與先前相同。
+時 runtime capability 檢查是 no-op；overlay 選出的 Copilot identity 仍會接受下述模型探測。
 
 `paulsha_cortex/deck/data/cards.yaml` 的 card 可宣告 `runtime_capabilities`，形式為
 `<kind>:<name>`，kind 為 `module`／`executable`／`bridge`／`provider`：
@@ -681,6 +681,12 @@ live probe 以 provider identity 為鍵共用 TTL 快取與 rate-limit 額度（
 `needs_human`（`reason` 形如 `runtime-preflight-capability_missing`，並保留 blocking
 finding 的診斷內容）。builder 候選會排除 zero-tool 的 `cg` executor。整個 gate 位於
 model session 建立之前，被擋下時 model invocation 維持 0。
+
+Manager 選到 operator overlay 中的 Copilot identity 時，會在建立 Cortex Job 前以
+`copilot -p`、指定 `--model` 與 10 秒上限送出一次短 prompt。CLI 明確回報該模型不可用時，
+會沿既有候選順序 reroute；若 CLI、認證或網路狀態無法判定，會記錄「模型可用性無法驗證」
+診斷並繼續派工。這不是 Job，也不建立 remote session 或 log directory；短 prompt 仍可能
+消耗一次 Copilot 請求。此探測只涵蓋 overlay Copilot 模型，不代表其他 executor 的可用性。
 
 `cortex inspect status` 會顯示缺少的 capability、使用中的 executor environment
 （名稱／interpreter／`PATH`／`HOME`）與每個 provider 的 snapshot 新鮮度
