@@ -473,6 +473,12 @@ class QuotaReservationAuthority:
                 return None, TransitionResult(status="conflict", state=current["state"], reason="release-reason-mismatch")
             if current["state"] == "settled":
                 return None, TransitionResult(status="conflict", state=current["state"], reason="reservation-already-terminal")
+            if current["state"] == "bound":
+                # 已 spawn（bound）的 reservation 只能經 settle（job 終局）或
+                # reconcile（可信 liveness 證據）結束；release 只給 spawn 前使用。
+                # reserve() 冪等回放會交回 owner_token，若允許 release bound，
+                # 重放者就能在活 job 仍占用時釋放 lease 並讓容量被重新 grant。
+                return None, TransitionResult(status="conflict", state=current["state"], reason="reservation-bound-requires-settle-or-reconcile")
             if current["sequence"] != expected_sequence:
                 return None, TransitionResult(status="conflict", state=current["state"], sequence=current["sequence"], reason="sequence-mismatch")
             entry = {
@@ -822,6 +828,8 @@ def _validate_reserve_row(row: dict[str, Any]) -> None:
         if not isinstance(item, dict) or set(item) != {"pool_ref", "window_id", "amount"}:
             raise ReservationCorrupt("reservation-store-invalid-record")
         _validate_pool_ref(item["pool_ref"])
+        if not isinstance(item["window_id"], str) or not _ID_RE.fullmatch(item["window_id"]):
+            raise ReservationCorrupt("reservation-store-invalid-record")
         _validate_amount(item["amount"])
     if type(row["lease_expires_at_ms"]) is not int or type(row["created_at_ms"]) is not int:
         raise ReservationCorrupt("reservation-store-invalid-record")
@@ -851,7 +859,14 @@ def _validate_reconcile_row(row: dict[str, Any]) -> None:
     _require_keys(row, _RECONCILE_REQUIRED)
     if row["resolution"] not in _RECONCILE_RESOLUTIONS:
         raise ReservationCorrupt("reservation-store-invalid-record")
-    if not isinstance(row["evidence"], dict):
+    evidence = row["evidence"]
+    # 與 reconcile() API 相同的 evidence 契約：必須有非空字串 kind 且有界。
+    if (
+        not isinstance(evidence, dict)
+        or not isinstance(evidence.get("kind"), str)
+        or not evidence.get("kind")
+        or len(_canonical_bytes(evidence)) > 4096
+    ):
         raise ReservationCorrupt("reservation-store-invalid-record")
     renew = row["renew_lease_ms"]
     if renew is not None and (type(renew) is not int or renew < 0 or renew > _MAX_LEASE_MS):
@@ -876,7 +891,7 @@ def _validate_transition_time(row: dict[str, Any]) -> None:
 _ALLOWED_FROM_STATE: dict[str, frozenset[str]] = {
     "bind": frozenset({"reserved"}),
     "settle": frozenset({"reserved", "bound"}),
-    "release": frozenset({"reserved", "bound"}),
+    "release": frozenset({"reserved"}),
     "reconcile": frozenset({"reserved", "bound"}),
 }
 

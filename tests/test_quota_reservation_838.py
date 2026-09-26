@@ -194,7 +194,8 @@ def test_ac3_crash_failpoints_never_apply_a_half_transition(tmp_path: Path, stag
         demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
     )
     assert granted.status == "granted"
-    if stage in ("settle-before-append", "release-before-append"):
+    # release 只允許在 spawn 前（reserved）；bound 之後的取消走 settle(cancelled)。
+    if stage == "settle-before-append":
         bound = seed.bind(
             reservation_id=granted.reservation_id, owner_token=granted.owner_token,
             attempt_id="attempt-1", job_id="job-1", expected_sequence=0, now_ms=NOW,
@@ -221,12 +222,19 @@ def test_ac3_crash_failpoints_never_apply_a_half_transition(tmp_path: Path, stag
         else:
             crashing.release(
                 reservation_id=granted.reservation_id, owner_token=granted.owner_token,
-                attempt_id="attempt-1", reason="cancelled", expected_sequence=1, now_ms=NOW,
+                attempt_id="attempt-1", reason="fail-before-spawn", expected_sequence=0, now_ms=NOW,
             )
 
     restarted = QuotaReservationAuthority(path)
     status = restarted.status(granted.reservation_id, now_ms=NOW)
-    if stage == "bind-before-append":
+    if stage == "release-before-append":
+        assert status.state == "reserved"
+        retry = restarted.release(
+            reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+            attempt_id="attempt-1", reason="fail-before-spawn", expected_sequence=0, now_ms=NOW,
+        )
+        assert retry.status == "ok"
+    elif stage == "bind-before-append":
         assert status.state == "reserved"
         retry = restarted.bind(
             reservation_id=granted.reservation_id, owner_token=granted.owner_token,
@@ -239,11 +247,6 @@ def test_ac3_crash_failpoints_never_apply_a_half_transition(tmp_path: Path, stag
             retry = restarted.settle(
                 reservation_id=granted.reservation_id, owner_token=granted.owner_token,
                 attempt_id="attempt-1", outcome="succeeded", expected_sequence=1, now_ms=NOW,
-            )
-        else:
-            retry = restarted.release(
-                reservation_id=granted.reservation_id, owner_token=granted.owner_token,
-                attempt_id="attempt-1", reason="cancelled", expected_sequence=1, now_ms=NOW,
             )
         assert retry.status == "ok"
 
@@ -438,6 +441,67 @@ def test_ac4_malformed_reconcile_numbers_fail_closed_not_type_error(tmp_path: Pa
     })
     with pytest.raises(ReservationCorrupt):
         QuotaReservationAuthority(path).committed(now_ms=NOW + 2)
+
+
+def test_ac4_bound_reservation_cannot_be_released_even_with_replayed_owner_token(tmp_path: Path) -> None:
+    """reserve() 冪等回放會交回 owner_token；bound（已 spawn）之後不得再以
+    release 釋放 lease 並讓容量被重新 grant——只能 settle 或 reconcile。"""
+    path = tmp_path / "reservations.jsonl"
+    authority = QuotaReservationAuthority(path)
+    kwargs = dict(
+        run_id="run-1", card_id="card-1", decision_id="decision-bound", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    granted = authority.reserve(**kwargs)
+    bound = authority.bind(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", job_id="job-live", expected_sequence=0, now_ms=NOW,
+    )
+    assert bound.status == "ok"
+    replay = QuotaReservationAuthority(path).reserve(**kwargs)
+    assert replay.status == "duplicate"
+    released = QuotaReservationAuthority(path).release(
+        reservation_id=replay.reservation_id, owner_token=replay.owner_token,
+        attempt_id="attempt-1", reason="cancelled", expected_sequence=replay.sequence, now_ms=NOW + 1,
+    )
+    assert released.status == "conflict"
+    other = QuotaReservationAuthority(path).reserve(**{**kwargs, "decision_id": "decision-other"})
+    assert other.status != "granted"
+
+
+def test_ac4_reconcile_and_reserve_rows_are_revalidated_on_reload(tmp_path: Path) -> None:
+    path = tmp_path / "reservations.jsonl"
+    authority = QuotaReservationAuthority(path)
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-reload", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    _append_raw_row(path, {
+        "schema_version": 1, "kind": "reconcile", "reservation_id": granted.reservation_id,
+        "sequence": 1, "resolution": "confirmed-terminated", "evidence": {},
+        "renew_lease_ms": None, "event_at_ms": NOW + 1,
+    })
+    with pytest.raises(ReservationCorrupt):
+        QuotaReservationAuthority(path).committed(now_ms=NOW + 2)
+
+    import json as _json
+
+    second = tmp_path / "second.jsonl"
+    QuotaReservationAuthority(second).reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-window", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    rows = [_json.loads(line) for line in second.read_text(encoding="utf-8").splitlines()]
+    rows[0]["pools"][0]["window_id"] = 1
+    second.write_text(
+        "".join(_json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReservationCorrupt):
+        QuotaReservationAuthority(second).committed(now_ms=NOW + 2)
 
 
 def test_ac4_negative_or_non_finite_amount_rejected() -> None:
