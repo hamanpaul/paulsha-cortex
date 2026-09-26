@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **#502 verify／review 通過後的阻斷修復入口**：exact-candidate `retry-build` 現可接受尚未進入 `needs_human` 的後續阻斷裁決；必須提供 `--reason`，以既有 immutable operator-adjudication evidence 記錄後重跑 verify／review，已完成 run 仍拒絕重開。
+
 - **#862 recovery registry receipt contract**：`JobRegistry` 現在依 OpenSpec 實作
   recovery registry 的 versioned request/receipt/checkpoint 契約：fresh /
   checkpointed slice 會持久化 `binding_version`／`binding_revision`，

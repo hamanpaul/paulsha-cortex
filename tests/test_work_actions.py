@@ -507,6 +507,176 @@ def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
     )
 
 
+def _post_pass_retry_build_fixture(tmp_path: Path, *, completed: bool = False):
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        source_revisions=("issue:12@open",),
+        changes=(),
+    )
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    initial = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, work_actions._expected_claim_key(authority), None)
+    passed = tuple(
+        replace(step, gate_result="passed")
+        if step.phase in {"build", "verify", "review"}
+        else step
+        for step in initial.steps
+    )
+    for phase in ("plan", "build", "verify"):
+        registry._manager_update_workflow_run(initial.run_id, current_phase=phase)
+    values = {
+        "current_phase": "review",
+        "steps": passed,
+        "attempts": {"build": 1, "verify": 1, "review": 1},
+        "candidate_head": HEAD,
+        "verified_head": HEAD,
+        "facets": (),
+        "gate_refs": (
+            GateEvidenceRef("foreign-review", "reports/review/accepted.md", "f" * 64),
+        ),
+        "gate_status": "passed",
+    }
+    if completed:
+        values.update(
+            status="done",
+            completion_record_path="evidence/completion.json",
+            completion_record_hash="c" * 64,
+            completion_record_revision="revision-1",
+            completion_source_revisions={"github": "gh-1"},
+            pr_candidate=HEAD,
+            merge_revision="d" * 40,
+        )
+    registry._manager_update_workflow_run(initial.run_id, **values)
+    return snapshot, registry, initial, tmp_path / "runs.json"
+
+
+def test_retry_build_accepts_post_pass_blocker_with_exact_candidate_and_records_adjudication(
+    tmp_path: Path,
+) -> None:
+    snapshot, registry, initial, state_path = _post_pass_retry_build_fixture(tmp_path)
+
+    result = work_actions.execute_work_action(
+        args={
+            "action": "retry-build",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "issue": 12,
+            "actor": "operator",
+            "expected_candidate": HEAD,
+            "reason": "後續實測重現資料遺失，退回修復。",
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state_path,
+        workflow_registry=registry,
+    )
+
+    reset = registry.get_workflow_run(initial.run_id)
+    evidence = result["result"]["adjudication_evidence"]
+    evidence_path = Path(evidence["ref"])
+    body = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert result["result"]["action"] == "retry-build"
+    assert evidence_path.parent.name == "operator-adjudication"
+    assert body["schema"] == "cortex-operator-adjudication/v1"
+    assert body["run_id"] == initial.run_id
+    assert body["card"] == "subagent-build"
+    assert body["phase"] == "review"
+    assert body["reason"] == "後續實測重現資料遺失，退回修復。"
+    assert reset.current_phase == "build"
+    assert reset.candidate_head == HEAD
+    assert reset.verified_head is None
+    assert reset.facets == ()
+    assert all(
+        step.gate_result == "pending"
+        for step in reset.steps
+        if step.phase in {"verify", "review"}
+    )
+
+
+def test_retry_build_post_pass_adjudication_requires_reason_before_reset(
+    tmp_path: Path,
+) -> None:
+    snapshot, registry, initial, state_path = _post_pass_retry_build_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="post-pass adjudication requires --reason"):
+        work_actions.execute_work_action(
+            args={
+                "action": "retry-build",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "issue": 12,
+                "actor": "operator",
+                "expected_candidate": HEAD,
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state_path,
+            workflow_registry=registry,
+        )
+
+    unchanged = registry.get_workflow_run(initial.run_id)
+    assert unchanged.current_phase == "review"
+    assert unchanged.candidate_head == HEAD
+    assert not (tmp_path / "evidence" / "operator-adjudication").exists()
+
+
+def test_retry_build_post_pass_candidate_mismatch_writes_no_adjudication(
+    tmp_path: Path,
+) -> None:
+    snapshot, registry, initial, state_path = _post_pass_retry_build_fixture(tmp_path)
+
+    with pytest.raises(RuntimeError, match="expected Candidate CAS mismatch"):
+        work_actions.execute_work_action(
+            args={
+                "action": "retry-build",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "issue": 12,
+                "actor": "operator",
+                "expected_candidate": "c" * 40,
+                "reason": "後續實測發現阻斷缺陷。",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state_path,
+            workflow_registry=registry,
+        )
+
+    unchanged = registry.get_workflow_run(initial.run_id)
+    assert unchanged.current_phase == "review"
+    assert unchanged.candidate_head == HEAD
+    assert not (tmp_path / "evidence" / "operator-adjudication").exists()
+
+
+def test_retry_build_post_pass_rejects_completed_run(tmp_path: Path) -> None:
+    snapshot, registry, _initial, state_path = _post_pass_retry_build_fixture(
+        tmp_path, completed=True
+    )
+
+    with pytest.raises(RuntimeError, match="one active canonical WorkflowRun"):
+        work_actions.execute_work_action(
+            args={
+                "action": "retry-build",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "issue": 12,
+                "actor": "operator",
+                "expected_candidate": HEAD,
+                "reason": "完成後不得重開；缺陷需另走處理流程。",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state_path,
+            workflow_registry=registry,
+        )
+
+    assert not (tmp_path / "evidence" / "operator-adjudication").exists()
+
+
 def test_retry_build_preserves_only_manager_owned_archive_authority(
     tmp_path: Path,
 ) -> None:
