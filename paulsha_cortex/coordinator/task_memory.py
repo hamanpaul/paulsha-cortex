@@ -52,6 +52,16 @@ _EVENT_NAMES = frozenset(
         "applied-with-evidence",
     }
 )
+CANARY_SUCCESS_EVENT_BY_MODE = {
+    "inline": "context-delivered",
+    "snapshot": "content-returned",
+    "note_fetch": "content-returned",
+}
+CANARY_SUCCESS_SEMANTICS = {
+    "note_fetch": "content-returned after note content hash match",
+    "snapshot": "content-returned after snapshot read-back and hash match; snapshot-ready is not a read",
+    "inline": "context-delivered delivery only; counts_as_read=false",
+}
 _FAILURE_REASONS = frozenset(
     {
         "provider-unavailable",
@@ -1193,7 +1203,7 @@ def summarize_canary(
     legacy_schema_compatible: bool = True,
     observed_blockers: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """計算版本化取得指標；不讀取或修改 strict KPI state。"""
+    """分開計算路徑成功率、內容取回率與 inline delivery；不修改 strict KPI。"""
 
     if minimum_successes < 1 or not 0.0 <= minimum_rate <= 1.0:
         raise ValueError("canary gate bounds invalid")
@@ -1255,7 +1265,8 @@ def summarize_canary(
                     str(event.get("note_id") or ""),
                     str(event.get("content_hash") or ""),
                 )
-                succeeded[mode].add(identity)
+                if event.get("event") == CANARY_SUCCESS_EVENT_BY_MODE[mode]:
+                    succeeded[mode].add(identity)
                 returned_all.add(identity)
                 if identity not in selected_all:
                     blockers.add("receipt-without-candidate")
@@ -1274,21 +1285,68 @@ def summarize_canary(
     for mode, row in by_path.items():
         eligible = set(selected.get(mode, {}))
         successes = eligible & succeeded.get(mode, set())
+        metric_kind = "delivery" if mode == "inline" else "content-retrieval"
         row["authorized_attempts"] = len(eligible)
         row["successes"] = len(successes)
         row["authorized_failures"] = len(eligible - successes)
         row["permission_denials"] = len(denials.get(mode, set()))
         row["success_rate"] = len(successes) / len(eligible) if eligible else None
+        row["metric_kind"] = metric_kind
+        row["success_event"] = CANARY_SUCCESS_EVENT_BY_MODE[mode]
+        row["success_semantics"] = CANARY_SUCCESS_SEMANTICS[mode]
+        row["counts_as_read"] = mode == "note_fetch"
+        if mode == "inline":
+            row["delivery_rate"] = row["success_rate"]
+        else:
+            row["content_retrieval_success_rate"] = row["success_rate"]
         row["passed"] = (
             len(successes) >= minimum_successes
             and row["success_rate"] is not None
             and row["success_rate"] >= minimum_rate
         )
+    retrieval_paths = ("note_fetch", "snapshot")
+    retrieval_attempts = sum(
+        by_path.get(mode, {}).get("authorized_attempts", 0)
+        for mode in retrieval_paths
+    )
+    retrieval_successes = sum(
+        by_path.get(mode, {}).get("successes", 0)
+        for mode in retrieval_paths
+    )
+    retrieval_rate = (
+        retrieval_successes / retrieval_attempts if retrieval_attempts else None
+    )
+    retrieval_passed = bool(
+        retrieval_rate is not None and retrieval_rate >= minimum_rate
+    )
+    inline_row = by_path.get("inline", {})
+    inline_attempts = inline_row.get("authorized_attempts", 0)
+    inline_deliveries = inline_row.get("successes", 0)
+    inline_delivery_rate = inline_row.get("delivery_rate")
     if not legacy_schema_compatible:
         blockers.add("legacy-output-schema-break")
     return {
         "schema": "cortex/task-memory-canary/v1",
         "paths": by_path,
+        "content_retrieval": {
+            "paths": list(retrieval_paths),
+            "eligible_authorized_attempts": retrieval_attempts,
+            "successes": retrieval_successes,
+            "success_rate": retrieval_rate,
+            "minimum_rate": minimum_rate,
+            "passed": retrieval_passed,
+        },
+        "inline_delivery": {
+            "eligible_authorized_attempts": inline_attempts,
+            "successful_deliveries": inline_deliveries,
+            "delivery_rate": inline_delivery_rate,
+            "minimum_rate": minimum_rate,
+            "counts_as_read": False,
+            "passed": bool(
+                inline_row.get("passed", False)
+                and inline_row.get("counts_as_read") is False
+            ),
+        },
         "ineligible_count": sum(
             1 for event in events if event.get("event") == "ineligible"
         ),
@@ -1300,7 +1358,10 @@ def summarize_canary(
         ),
         "blockers": sorted(blockers),
         "legacy_strict_kpi_mutated": False,
-        "passed": bool(by_path) and all(row["passed"] for row in by_path.values()) and not blockers,
+        "passed": bool(by_path)
+        and all(row["passed"] for row in by_path.values())
+        and retrieval_passed
+        and not blockers,
     }
 
 

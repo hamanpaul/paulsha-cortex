@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from paulsha_cortex.coordinator.task_memory import (
+    CANARY_SUCCESS_EVENT_BY_MODE,
+    CANARY_SUCCESS_SEMANTICS,
     TaskMemoryAdapter,
     TaskMemoryCapabilities,
     TaskMemoryProviderError,
@@ -26,12 +28,11 @@ from paulsha_cortex.coordinator.task_memory import (
 from paulsha_cortex.coordinator.task_memory_hippo import HippoTaskMemoryClient
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _MODES = ("note_fetch", "snapshot", "inline")
-_SUCCESS_EVENTS = frozenset({"content-returned", "context-delivered"})
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="cortex task-memory canary",
+        prog="cortex task-memory",
         description="對指定 Hippo projects 執行唯讀 provide/fetch live canary，輸出 bounded JSON。",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -198,7 +199,7 @@ def _run_canary(repos: Sequence[str], runs: int, client: HippoTaskMemoryClient |
                     successful = {
                         (event.get("task_id"), event.get("note_id"), event.get("content_hash"))
                         for event in events
-                        if event.get("event") in _SUCCESS_EVENTS
+                        if event.get("event") == CANARY_SUCCESS_EVENT_BY_MODE[mode]
                     }
                     selected_by_task: dict[str, set[tuple[Any, Any, Any]]] = {}
                     successful_by_task: dict[str, set[tuple[Any, Any, Any]]] = {}
@@ -302,6 +303,10 @@ def _run_canary(repos: Sequence[str], runs: int, client: HippoTaskMemoryClient |
             per_repo[mode][repo]["successful_provides"] for repo in repos
         )
         paths[mode] = {
+            "metric_kind": "delivery" if mode == "inline" else "content-retrieval",
+            "success_event": CANARY_SUCCESS_EVENT_BY_MODE[mode],
+            "success_semantics": CANARY_SUCCESS_SEMANTICS[mode],
+            "counts_as_read": mode == "note_fetch",
             "attempted_provide": sum(
                 per_repo[mode][repo]["attempted_provide"] for repo in repos
             ),
@@ -315,9 +320,27 @@ def _run_canary(repos: Sequence[str], runs: int, client: HippoTaskMemoryClient |
             "eligible_authorized_attempts": aggregate["authorized_attempts"],
             "successes": aggregate["successes"],
             "eligible_authorized_success_rate": aggregate["success_rate"],
+            "eligible_authorized_delivery_rate": (
+                aggregate["success_rate"] if mode == "inline" else None
+            ),
+            "eligible_authorized_content_retrieval_success_rate": (
+                aggregate["success_rate"] if mode != "inline" else None
+            ),
             "per_repo": repo_rows,
             "passed": bool(aggregate["passed"] and each_repo_passed),
         }
+
+    retrieval_modes = ("note_fetch", "snapshot")
+    retrieval_attempts = sum(
+        paths[mode]["eligible_authorized_attempts"] for mode in retrieval_modes
+    )
+    retrieval_successes = sum(paths[mode]["successes"] for mode in retrieval_modes)
+    retrieval_rate = retrieval_successes / retrieval_attempts if retrieval_attempts else None
+    content_retrieval_passed = bool(
+        retrieval_rate is not None and retrieval_rate >= 0.95
+    )
+    inline_path = paths["inline"]
+    inline_delivery_rate = inline_path["eligible_authorized_success_rate"]
 
     scope_checks_passed = scope_checked >= 5 and scope_leaks == 0
     permission_checks_passed = negative_attempts == negative_denials
@@ -327,6 +350,7 @@ def _run_canary(repos: Sequence[str], runs: int, client: HippoTaskMemoryClient |
     passed = (
         client is not None
         and all(row["passed"] for row in paths.values())
+        and content_retrieval_passed
         and scope_checks_passed
         and permission_checks_passed
         and cross_project_checks_passed
@@ -339,6 +363,22 @@ def _run_canary(repos: Sequence[str], runs: int, client: HippoTaskMemoryClient |
         "requested_runs_per_repo_path": runs,
         "repositories": list(repos),
         "paths": paths,
+        "content_retrieval": {
+            "paths": list(retrieval_modes),
+            "eligible_authorized_attempts": retrieval_attempts,
+            "successes": retrieval_successes,
+            "success_rate": retrieval_rate,
+            "minimum_rate": 0.95,
+            "passed": content_retrieval_passed,
+        },
+        "inline_delivery": {
+            "eligible_authorized_attempts": inline_path["eligible_authorized_attempts"],
+            "successful_deliveries": inline_path["successes"],
+            "delivery_rate": inline_delivery_rate,
+            "minimum_rate": 0.95,
+            "counts_as_read": False,
+            "passed": inline_path["passed"],
+        },
         "permission_negative_control": {
             "attempted": negative_attempts,
             "permission_denied": negative_denials,

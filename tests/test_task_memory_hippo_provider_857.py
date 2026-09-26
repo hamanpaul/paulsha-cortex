@@ -609,6 +609,22 @@ def test_live_canary_cli_emits_bounded_machine_json_and_private_evidence(
         for row in mode["per_repo"].values()
     )
     assert all(report["paths"][mode]["eligible_authorized_success_rate"] == 1.0 for mode in report["paths"])
+    assert report["content_retrieval"]["paths"] == ["note_fetch", "snapshot"]
+    assert report["content_retrieval"]["eligible_authorized_attempts"] == 20
+    assert report["content_retrieval"]["successes"] == 20
+    assert report["content_retrieval"]["success_rate"] == 1.0
+    assert report["content_retrieval"]["passed"] is True
+    assert report["paths"]["note_fetch"]["success_semantics"] == (
+        "content-returned after note content hash match"
+    )
+    assert report["paths"]["snapshot"]["success_semantics"] == (
+        "content-returned after snapshot read-back and hash match; snapshot-ready is not a read"
+    )
+    assert report["paths"]["inline"]["metric_kind"] == "delivery"
+    assert report["paths"]["inline"]["eligible_authorized_delivery_rate"] == 1.0
+    assert report["paths"]["inline"]["counts_as_read"] is False
+    assert report["inline_delivery"]["delivery_rate"] == 1.0
+    assert report["inline_delivery"]["counts_as_read"] is False
     assert report["permission_negative_control"]["passed"] is True
     assert report["scope_checks"]["scope_leaks"] == 0
     assert report["cross_project_checks"]["passed"] is True

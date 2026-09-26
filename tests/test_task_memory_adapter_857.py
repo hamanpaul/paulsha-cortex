@@ -646,6 +646,26 @@ def test_each_canary_path_has_five_positive_and_permission_negative_controls(tmp
     assert denied_report["legacy_strict_kpi_mutated"] is False
 
 
+def test_inline_context_delivery_does_not_pass_content_retrieval_gate():
+    context, *_ = _context(caps=TaskMemoryCapabilities(inline=True))
+    adapter = TaskMemoryAdapter(provider=_provider_for("inline"))
+    prepared = adapter.prepare(context)
+    events = (*prepared.events, *adapter.confirm_context_delivered(prepared))
+
+    report = summarize_canary(events, minimum_successes=1, minimum_rate=0.95)
+
+    assert report["content_retrieval"]["eligible_authorized_attempts"] == 0
+    assert report["content_retrieval"]["successes"] == 0
+    assert report["content_retrieval"]["success_rate"] is None
+    assert report["content_retrieval"]["passed"] is False
+    assert report["passed"] is False
+    assert report["paths"]["inline"]["successes"] == 1
+    assert report["paths"]["inline"]["passed"] is True
+    assert report["paths"]["inline"]["metric_kind"] == "delivery"
+    assert report["paths"]["inline"]["success_event"] == "context-delivered"
+    assert report["paths"]["inline"]["counts_as_read"] is False
+
+
 def test_canary_scope_relay_and_legacy_schema_observations_are_blockers():
     context, *_ = _context()
     prepared = TaskMemoryAdapter(provider=_provider_for("inline")).prepare(context)

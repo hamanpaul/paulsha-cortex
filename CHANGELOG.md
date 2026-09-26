@@ -9,7 +9,7 @@
 
 ### Added
 
-- **#857 task-memory Hippo subprocess provider 與 live canary**：新增有界 `hippo task-memory provide/fetch` CLI client、exit-code/stderr allowlist、per-task manifest-bound fetch callback，以及預設關閉的 `PSC_TASK_MEMORY_ENABLED=1` Manager inline dispatch；receipt 僅寫 Cortex sidecar。新增 `cortex task-memory canary`，對兩個以上 repo 實跑 note-fetch/snapshot/inline、permission-denied 與跨 project 負例，輸出不含 note 正文的 JSON。離線 fake-CLI 與 Manager dispatch 測試已涵蓋；真實 Hippo CLI／installed service 的 ≥95%、各 path 5/5 驗收仍待執行。
+- **#857 task-memory Hippo subprocess provider 與 live canary**：新增有界 `hippo task-memory provide/fetch` CLI client、exit-code/stderr allowlist、per-task manifest-bound fetch callback，以及預設關閉的 `PSC_TASK_MEMORY_ENABLED=1` Manager inline dispatch；receipt 僅寫 Cortex sidecar。Canary 明確分開 note-fetch／snapshot 的內容取回率與 inline delivery rate：只將 hash 相符的 `content-returned` 納入 retrieval，snapshot 必須讀回內容且 hash 相符（`snapshot-ready` 不算成功），inline `context-delivered` 標記 `counts_as_read=false` 並獨立計 delivery。聚合 retrieval 僅含 note-fetch/snapshot 且須 ≥95%，各 repo/path 仍各自要求至少 5 次成功 provide；同步修正 help 不再重複 `canary`。真實 Hippo CLI／installed service 驗收仍待執行。
 - **#843 recovery action conformance**：新增版本化 action registry 與 13 家族契約矩陣，並以 dispatcher、control contract、coordinator CLI、`cortex recover` work/slice alias 雙向核對正式名稱與 CAS 欄位；補上 retry candidate CLI CAS、recover/abandon crash/restart 參數化特性與 frozen same-domain reviewer pin 零派工負控制。既有 producer gap 和 live 驗收界線記錄於矩陣。
 
 ### Fixed
