@@ -497,6 +497,8 @@ systemctl --user status cortex-manager.service cortex-monitor.service
   `execution_state`。workflow 的 `attention`／`recent_done` 也使用同一組身份欄位：
   `identity_source` 為 `in-flight`、`last-execution`、`planned` 或 `unknown`；沒有
   registry 證據時不從 phase／persona 推測 executor 或 model。
+  若 job log 超過 30 分鐘未更新，條目會附 `last_progress_at`／`progress_age_seconds`；job
+  仍保持 in-flight，並在 `attention` 以 `reason: stale-in-flight` 提醒檢視。Cortex 不會自動中斷該 job。
   下游可直接使用去識別化 producer snapshot fixture
   `tests/fixtures/workflow-execution-identity-828-status.json`；欄位與 selection
   語意見 `docs/superpowers/specs/workflow-execution-identity-producer-contract.md`。
@@ -509,11 +511,18 @@ systemctl --user status cortex-manager.service cortex-monitor.service
   `builder-failed-effort_not_supported`、`foreign-review-provider-launch_failed`），而不是把所有
   provider 層與 launch 層失敗壓平成同一句；每筆也帶目前的 `binding_revision`，供單筆
   `supersede` action 做 exact CAS。
-- `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及
+- `attention`：`needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及
   `candidate_git_base`。workflow job 的 provider 類失敗會另外投影 `provider_outcome` 與
   `provider_outcome_authority`；`runtime-contract-failed` 仍與 provider 分類分層，不會被
   `exit 127` 或關鍵字比對覆蓋。`building` slice 若沒有目前綁定的 in-flight builder job，
-  complete/status reconcile 會將它轉成帶 `DiagnosticReason` 的 `needs_human`。
+  complete/status reconcile 會將它轉成帶 `DiagnosticReason` 的 `needs_human`。另外，job log
+  超過 30 分鐘未更新時會出現 `kind: job`／`reason: stale-in-flight`，附最後進度時間及檢視提示。
+- Manager 正在處理 `ship` 控制請求（包含 preflight）時，status 會附 `busy: true` 與 `activity`，
+  顯示 request、action、repo/work item 與活動檔最後寫入時間。此狀態只表示 Manager 有近期活動，
+  不代表任何 preflight 或交付 gate 通過；活動檔超過 30 分鐘未更新仍顯示 `stalled`。
+- Manager daemon 預設每 3 秒輪詢；沒有 queued request、in-flight job 且 periodic tick 未到期時，
+  間隔有限遞增至最多 10 秒。發現 request、in-flight job 或執行 periodic tick 時，間隔回到
+  `--poll-interval` 設定值。
 - `candidate_git_base`（#731）：這條 run／這張卡的**候選 git base**——真正那個 40-hex commit SHA，以及它落後 mirror 上 `origin/main` 幾個 commit。欄位含 `sha`、`sha_source`（`frozen-readiness-base-sha` 或 `first-build-job-dispatch-head`）、`behind_origin_main`、`mirror_origin_main`、`threshold_commits`、`reason`、`measured_against`、`fetched`。
   - **與 `source_revision` 是兩件事**：`source_revision` 是 work item 來源材料的 sha256（authority digest，64-hex），與 git 無關、也不隨 `origin/main` 前進而改變。過去候選基底只存在於候選 worktree 的 `.git` 裡，operator 只能 `git -C <候選 worktree> rev-parse HEAD` 才問得到，於是把診斷掛在 `source_revision` 上而誤判。
   - 落後達 `threshold_commits`（預設 10，可用 `PSC_CANDIDATE_BASE_STALE_THRESHOLD_COMMITS` 覆寫）時，`reason` 為具名診斷 `candidate-git-base-stale`——代表「這條 run 的基底過舊、已 merge 的 test-only 修復進不去」。

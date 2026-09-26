@@ -493,3 +493,89 @@ def test_read_status_live_but_stalled_is_degraded(monkeypatch, tmp_path):
     status = client.read_status()
     assert status["degraded"] is True
     assert status["degraded_reason"] == "stalled"
+
+
+def test_read_status_reports_recent_matching_activity_as_busy(monkeypatch, tmp_path):
+    import os
+
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    _write_status_file(
+        tmp_path, pid=os.getpid(), age_seconds=constants.STATUS_STALLED_AFTER_SECONDS + 30
+    )
+    activity_path = tmp_path / "activity.json"
+    contract.atomic_write_json(
+        activity_path,
+        {
+            "pid": os.getpid(),
+            "request_id": "request-ship-1",
+            "request_type": "work-action",
+            "action": "ship",
+            "repo": "acme/demo",
+            "work_id": "demo",
+        },
+    )
+    activity_mtime = time.time() - 300
+    os.utime(activity_path, (activity_mtime, activity_mtime))
+
+    status = client.read_status()
+
+    assert status["degraded"] is False
+    assert status["busy"] is True
+    assert status["activity"]["request_id"] == "request-ship-1"
+    assert status["activity"]["action"] == "ship"
+    assert status["activity"]["repo"] == "acme/demo"
+    assert status["activity"]["last_progress_at"]
+
+
+def test_read_status_stalls_when_activity_mtime_exceeds_30_minutes(monkeypatch, tmp_path):
+    import os
+
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    _write_status_file(
+        tmp_path, pid=os.getpid(), age_seconds=constants.STATUS_STALLED_AFTER_SECONDS + 30
+    )
+    activity_path = tmp_path / "activity.json"
+    contract.atomic_write_json(
+        activity_path,
+        {"pid": os.getpid(), "request_id": "request-old", "request_type": "work-action", "action": "ship"},
+    )
+    activity_mtime = time.time() - 1801
+    os.utime(activity_path, (activity_mtime, activity_mtime))
+
+    status = client.read_status()
+
+    assert status["degraded"] is True
+    assert status["degraded_reason"] == "stalled"
+    assert status["activity"]["request_id"] == "request-old"
+    assert status["activity"]["progress_age_seconds"] >= 1800
+
+
+def test_text_status_displays_busy_activity_identity_and_progress_time(capsys):
+    from paulsha_cortex.porcelain import inspect
+
+    inspect._print_status(
+        {
+            "updated_at": "2026-09-26T00:00:00+00:00",
+            "degraded": False,
+            "busy": True,
+            "activity": {
+                "request_id": "request-ship-1",
+                "request_type": "work-action",
+                "action": "ship",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "last_progress_at": "2026-09-25T23:55:00+00:00",
+            },
+            "ready": [],
+            "held": [],
+            "attention": [],
+            "in_flight": [],
+            "recent_done": [],
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "manager_activity: busy" in output
+    assert "action=ship" in output
+    assert "repo=acme/demo" in output
+    assert "last_progress_at=2026-09-25T23:55:00+00:00" in output
