@@ -4578,6 +4578,58 @@ def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
     )
 
 
+def _validate_candidate_planning_authority(run, *, source_repo: Path, candidate: str) -> None:
+    """在候選分支更新前核對 candidate tree 內的 pinned planning bytes。"""
+
+    authorities = tuple(getattr(run, "planning_authority", ()) or ())
+    if not authorities:
+        return
+
+    operator_root = Path(run.workspace_root).resolve()
+    drift_rows: list[dict[str, str]] = []
+    for authority in authorities:
+        content = subprocess.run(
+            ["git", "-C", str(source_repo), "show", f"{candidate}:{authority.ref}"],
+            capture_output=True,
+            check=False,
+        )
+        if content.returncode != 0:
+            raise ValueError(
+                "workflow planning input drift at candidate harvest: "
+                f"{authority.ref} is missing from the candidate"
+            )
+        current_bytes = content.stdout
+        current_digest = hashlib.sha256(current_bytes).hexdigest()
+        if current_digest == authority.baseline_sha256:
+            continue
+
+        if (
+            authority.kind == "plan"
+            and Path(authority.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
+        ):
+            baseline_matches = _safe_input_matches(operator_root, authority.ref)
+            if len(baseline_matches) == 1:
+                baseline_bytes = baseline_matches[0].read_bytes()
+                if (
+                    hashlib.sha256(baseline_bytes).hexdigest() == authority.baseline_sha256
+                    and _checkbox_insensitive_equal(baseline_bytes, current_bytes)
+                ):
+                    continue
+        drift_rows.append(
+            {
+                "ref": authority.ref,
+                "kind": authority.kind,
+                "expected_sha256": authority.baseline_sha256,
+                "current_sha256": current_digest,
+            }
+        )
+
+    if drift_rows:
+        raise WorkflowPlanningInputDrift(
+            tuple(drift_rows), diagnostic_stage="candidate harvest"
+        )
+
+
 def _harvest_build_candidate(
     job: Mapping[str, object],
     *,
@@ -4623,6 +4675,30 @@ def _harvest_build_candidate(
         if existing is not None and existing == candidate.lower():
             job_workspace.seal_commit_spool(bundle)
             return candidate
+    if getattr(run, "planning_authority", ()):
+        fetched = subprocess.run(
+            [
+                "git",
+                "-C",
+                source_repo,
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                str(bundle),
+                f"refs/heads/{branch}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if fetched.returncode != 0:
+            detail = (fetched.stderr or fetched.stdout).strip()
+            raise job_workspace.WorkspaceError(
+                f"job workspace planning input candidate unavailable: {detail}"
+            )
+        _validate_candidate_planning_authority(
+            run, source_repo=Path(source_repo), candidate=candidate.lower()
+        )
     harvested = job_workspace.harvest_branch(
         source_repo=source_repo, bundle=bundle, branch=branch
     )
@@ -6873,9 +6949,24 @@ def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict
 class WorkflowPlanningInputDrift(ValueError):
     """保存與 frozen hash 不符的 planning input 逐檔差異。"""
 
-    def __init__(self, rows: tuple[dict[str, str], ...]) -> None:
+    def __init__(
+        self,
+        rows: tuple[dict[str, str], ...],
+        *,
+        diagnostic_stage: str | None = None,
+    ) -> None:
         self.drift_rows = tuple(dict(row) for row in rows)
-        super().__init__("workflow planning input drift")
+        message = "workflow planning input drift"
+        if diagnostic_stage is not None and self.drift_rows:
+            first = self.drift_rows[0]
+            message += (
+                f" at {diagnostic_stage}: {first['ref']} "
+                f"expected={first['expected_sha256'][:12]} "
+                f"current={first['current_sha256'][:12]}"
+            )
+            if len(self.drift_rows) > 1:
+                message += f" (+{len(self.drift_rows) - 1} more)"
+        super().__init__(message)
 
 
 def _workflow_input_snapshot(

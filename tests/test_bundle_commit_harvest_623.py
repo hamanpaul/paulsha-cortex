@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import time
@@ -25,6 +26,7 @@ import pytest
 
 from paulsha_cortex.coordinator import job_workspace, launcher, manager, verification
 from paulsha_cortex.coordinator.seams import ScriptWorktreeCreator
+from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority
 
 _BRANCH = "feature/623-bundle-harvest"
 #: #645：工作區目錄名由 job id 導出（branch 名不變）。
@@ -790,6 +792,121 @@ def test_canonical_lane_accepts_a_card_that_produced_no_commit(tmp_path: Path) -
             candidate="0" * 40,
             coordinator_root=tmp_path / "coordinator",
         )
+
+
+_HARVEST_TASKS_REF = "docs/superpowers/workstreams/planning-harvest/todo.md"
+_HARVEST_SPEC_REF = "docs/superpowers/specs/planning-harvest-spec.md"
+_HARVEST_TASKS_BASELINE = "# Todo\n\n- [ ] 1. 保留任務文字。\n"
+_HARVEST_SPEC_BASELINE = "# 規格\n\n候選必須保留 pinned bytes。\n"
+
+
+def _planning_harvest_fixture(tmp_path: Path):
+    repo = _source_repo(tmp_path)
+    for ref, content in (
+        (_HARVEST_TASKS_REF, _HARVEST_TASKS_BASELINE),
+        (_HARVEST_SPEC_REF, _HARVEST_SPEC_BASELINE),
+    ):
+        path = repo / ref
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    _git(repo, "add", _HARVEST_TASKS_REF, _HARVEST_SPEC_REF)
+    _git(repo, "commit", "-qm", "pin planning baseline")
+    baseline = _git(repo, "rev-parse", "HEAD")
+    workspace = _workspace(repo, tmp_path / "pool")
+    bundle = _dispatch(tmp_path)
+    run = SimpleNamespace(
+        workspace_root=str(repo),
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=_HARVEST_TASKS_REF,
+                kind="plan",
+                work_id="planning-harvest",
+                baseline_sha256=hashlib.sha256(_HARVEST_TASKS_BASELINE.encode()).hexdigest(),
+            ),
+            PlanningArtifactAuthority(
+                ref=_HARVEST_SPEC_REF,
+                kind="spec",
+                work_id="planning-harvest",
+                baseline_sha256=hashlib.sha256(_HARVEST_SPEC_BASELINE.encode()).hexdigest(),
+            ),
+        ),
+    )
+    return repo, workspace, bundle, run, baseline
+
+
+def _harvest_planning_candidate(workspace: Path, bundle: Path, run) -> str:
+    candidate = _git(workspace, "rev-parse", "HEAD")
+    result = _run_bundle_step(workspace, bundle)
+    assert result.returncode == 0, result.stderr
+    job = _job(bundle, workspace=workspace)
+    assert job_workspace.commit_bundle_path_for_job(
+        job, coordinator_root=bundle.parents[2]
+    ) == bundle
+    assert bundle.is_file()
+    return manager._harvest_build_candidate(
+        job,
+        run=run,
+        candidate=candidate,
+        coordinator_root=bundle.parents[2],
+    )
+
+
+def test_harvest_rejects_non_checkbox_tasks_drift_before_advancing_branch(
+    tmp_path: Path,
+) -> None:
+    repo, workspace, bundle, run, baseline = _planning_harvest_fixture(tmp_path)
+    rewritten = _HARVEST_TASKS_BASELINE.replace("保留任務文字", "改寫任務內容")
+    (workspace / _HARVEST_TASKS_REF).write_text(rewritten, encoding="utf-8")
+    _git(workspace, "add", _HARVEST_TASKS_REF)
+    _git(workspace, "commit", "-qm", "rewrite pinned todo")
+
+    with pytest.raises(manager.WorkflowPlanningInputDrift) as caught:
+        _harvest_planning_candidate(workspace, bundle, run)
+
+    assert "candidate harvest" in str(caught.value)
+    assert _HARVEST_TASKS_REF in str(caught.value)
+    assert run.planning_authority[0].baseline_sha256[:12] in str(caught.value)
+    assert hashlib.sha256(rewritten.encode()).hexdigest()[:12] in str(caught.value)
+    assert (
+        caught.value.drift_rows[0]["expected_sha256"]
+        == run.planning_authority[0].baseline_sha256
+    )
+    assert _git(repo, "rev-parse", f"refs/heads/{_BRANCH}") == baseline
+
+
+def test_harvest_rejects_spec_drift_before_advancing_branch(tmp_path: Path) -> None:
+    repo, workspace, bundle, run, baseline = _planning_harvest_fixture(tmp_path)
+    (workspace / _HARVEST_SPEC_REF).write_text(
+        _HARVEST_SPEC_BASELINE.replace("pinned bytes", "任意改寫"), encoding="utf-8"
+    )
+    _git(workspace, "add", _HARVEST_SPEC_REF)
+    _git(workspace, "commit", "-qm", "rewrite pinned spec")
+
+    with pytest.raises(manager.WorkflowPlanningInputDrift) as caught:
+        _harvest_planning_candidate(workspace, bundle, run)
+
+    assert "candidate harvest" in str(caught.value)
+    assert _HARVEST_SPEC_REF in str(caught.value)
+    assert _git(repo, "rev-parse", f"refs/heads/{_BRANCH}") == baseline
+
+
+def test_harvest_allows_checkbox_only_tasks_change(tmp_path: Path) -> None:
+    repo, workspace, bundle, run, _baseline = _planning_harvest_fixture(tmp_path)
+    ticked = _HARVEST_TASKS_BASELINE.replace("- [ ]", "- [x]")
+    (workspace / _HARVEST_TASKS_REF).write_text(ticked, encoding="utf-8")
+    _git(workspace, "add", _HARVEST_TASKS_REF)
+    _git(workspace, "commit", "-qm", "tick pinned todo")
+    candidate = _git(workspace, "rev-parse", "HEAD")
+    result = _run_bundle_step(workspace, bundle)
+    assert result.returncode == 0, result.stderr
+
+    assert manager._harvest_build_candidate(
+        _job(bundle, workspace=workspace),
+        run=run,
+        candidate=candidate,
+        coordinator_root=bundle.parents[2],
+    ) == candidate
+    assert _git(repo, "rev-parse", f"refs/heads/{_BRANCH}") == candidate
 
 
 def test_canonical_lane_is_a_noop_for_a_job_without_a_spool_grant(
