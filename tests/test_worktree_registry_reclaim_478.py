@@ -60,6 +60,112 @@ def _runner_for(repo: Path):
     return _runner
 
 
+def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True
+    )
+
+
+def _abandoned_run(repo: Path, base_sha: str):
+    return SimpleNamespace(
+        run_id="workflow-" + "a" * 20,
+        repo="acme/demo",
+        work_id="demo",
+        issue_refs=("acme/demo#613",),
+        workspace_root=str(repo),
+        frozen_readiness={"base_sha": base_sha},
+    )
+
+
+def _abandon_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    commit: bool,
+    another_active_run: bool = False,
+):
+    repo = _init_repo(tmp_path / "source")
+    base_sha = _git(repo, "rev-parse", "main").strip()
+    run = _abandoned_run(repo, base_sha)
+    branch = manager.workflow_build_branch(run)
+    worktree = tmp_path / "build-worktree"
+    _git(repo, "worktree", "add", "-q", str(worktree), "-b", branch, base_sha)
+    if commit:
+        (worktree / "change.txt").write_text("candidate\n", encoding="utf-8")
+        _git(worktree, "add", "change.txt")
+        _git(
+            worktree,
+            "-c", "user.email=reclaim@example.invalid",
+            "-c", "user.name=reclaim-test",
+            "commit", "-qm", "candidate change",
+        )
+    branch_sha = _git(repo, "rev-parse", f"refs/heads/{branch}").strip()
+    monkeypatch.setenv("PSC_REPO_ROOT", str(repo))
+    jobs = [
+            {
+                "workflow_run_id": run.run_id,
+                "workflow_phase": "build",
+                "workflow_card": "subagent-build",
+                "persona": "builder",
+                "dispatch_head": base_sha,
+                "branch": branch,
+                "worktree": str(worktree),
+            }
+        ]
+    active_run = SimpleNamespace(
+        run_id="workflow-" + "b" * 20,
+        repo=run.repo,
+        work_id=run.work_id,
+        issue_refs=run.issue_refs,
+        workspace_root=run.workspace_root,
+        status="ongoing",
+    )
+    workflow_registry = SimpleNamespace(
+        list_jobs=lambda: jobs,
+        list_workflow_runs=lambda: [run, active_run] if another_active_run else [run],
+    )
+    work_actions._reclaim_abandoned_build_worktrees(
+        run, workflow_registry, state_path=tmp_path / "jobs.json"
+    )
+    return repo, branch, worktree, branch_sha
+
+
+def test_abandon_reclaims_build_branch_and_archives_commits_outside_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, branch, worktree, branch_sha = _abandon_branch(
+        tmp_path, monkeypatch, commit=True
+    )
+    archive_tag = f"archive/demo-{branch_sha[:8]}"
+
+    assert not worktree.exists()
+    assert _run_git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 1
+    assert _run_git(repo, "rev-parse", f"refs/tags/{archive_tag}").stdout.strip() == branch_sha
+
+
+def test_abandon_deletes_build_branch_without_archive_when_it_has_no_new_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, branch, worktree, _branch_sha = _abandon_branch(
+        tmp_path, monkeypatch, commit=False
+    )
+
+    assert not worktree.exists()
+    assert _run_git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 1
+    assert _run_git(repo, "tag", "--list", "archive/demo-*").stdout.splitlines() == []
+
+
+def test_abandon_preserves_build_branch_shared_with_another_active_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, branch, _worktree, _branch_sha = _abandon_branch(
+        tmp_path, monkeypatch, commit=True, another_active_run=True
+    )
+
+    assert _run_git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
+    assert _run_git(repo, "tag", "--list", "archive/demo-*").stdout.splitlines() == []
+
+
 # --------------------------------------------------------------------------
 # reclaim_worktree 本身
 # --------------------------------------------------------------------------

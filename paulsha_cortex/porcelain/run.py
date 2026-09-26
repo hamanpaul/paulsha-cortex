@@ -58,7 +58,10 @@ def _add_work_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--failure-classification")
     parser.add_argument("--failure-reason")
     parser.add_argument("--expected-candidate")
-    parser.add_argument("--expected-run-id")
+    parser.add_argument(
+        "--expected-run-id",
+        help="retry-build 不支援此旗標；該 action 使用 --expected-candidate CAS",
+    )
     parser.add_argument("--card", help="retry-card 專用：指定要重派的 exact card ID")
     parser.add_argument("--reason")
     parser.add_argument(
@@ -133,6 +136,10 @@ def _complete_args(args: argparse.Namespace) -> dict[str, Any]:
 def _work_args(args: argparse.Namespace) -> dict[str, Any]:
     if args.card is not None and args.action != "retry-card":
         raise ValueError("--card is only valid for retry-card")
+    if args.action == "retry-build" and args.expected_run_id is not None:
+        raise ValueError(
+            "retry-build 不接受 --expected-run-id；請改用 --expected-candidate CAS。"
+        )
 
     provided_names = (
         "issue",
@@ -176,6 +183,10 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
         if args.card is not None and "card" in extra and extra["card"] != args.card:
             raise ValueError("work payload card conflicts with --card")
         payload.update(extra)
+    if args.action == "retry-build" and "expected_run_id" in payload:
+        raise ValueError(
+            "retry-build 不接受 expected_run_id；請改用 --expected-candidate CAS。"
+        )
     return payload
 
 

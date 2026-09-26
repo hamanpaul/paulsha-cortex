@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -202,6 +202,60 @@ class WorkActionFlagTests(unittest.TestCase):
         )
         self.assertEqual(args.action, "retry-build")
         self.assertEqual(args.payload, "repair.json")
+
+    def test_work_retry_build_rejects_expected_run_id_flag(self) -> None:
+        submitted = []
+        error = io.StringIO()
+        with redirect_stderr(error):
+            rc = cli.main(
+                [
+                    "work", "retry-build", "demo", "--repo", "acme/demo",
+                    "--expected-run-id", "workflow-" + "a" * 20,
+                ],
+                control_read_status=lambda: {"degraded": False},
+                control_submit_request=lambda kind, args, actor: submitted.append(args)
+                or "req-1",
+                control_poll_done=lambda *_args, **_kwargs: {
+                    "status": "ok",
+                    "result": {"action": "retry-build"},
+                },
+            )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(submitted, [])
+        self.assertIn("expected_candidate", error.getvalue())
+
+    def test_work_retry_build_rejects_expected_run_id_in_payload(self) -> None:
+        submitted = []
+        error = io.StringIO()
+        with tempfile.TemporaryDirectory() as root:
+            payload = f"{root}/retry-build.json"
+            with open(payload, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "expected_candidate": "a" * 40,
+                        "expected_run_id": "workflow-" + "a" * 20,
+                    },
+                    handle,
+                )
+            with redirect_stderr(error):
+                rc = cli.main(
+                    [
+                        "work", "retry-build", "demo", "--repo", "acme/demo",
+                        "--payload", payload,
+                    ],
+                    control_read_status=lambda: {"degraded": False},
+                    control_submit_request=lambda kind, args, actor: submitted.append(args)
+                    or "req-1",
+                    control_poll_done=lambda *_args, **_kwargs: {
+                        "status": "ok",
+                        "result": {"action": "retry-build"},
+                    },
+                )
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(submitted, [])
+        self.assertIn("expected_candidate", error.getvalue())
 
     def test_work_ship_enqueues_payload_without_executing_delivery(self) -> None:
         submitted = []

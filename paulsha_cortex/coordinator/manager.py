@@ -8737,6 +8737,7 @@ def reconcile_planning_transactions(
     *,
     registry,
     coordinator_root: str | Path,
+    run_id: str | None = None,
     now: float | None = None,
     grace_seconds: float = _PLANNING_TRANSACTION_GRACE_SECONDS,
 ) -> list[dict[str, object]]:
@@ -8751,7 +8752,8 @@ def reconcile_planning_transactions(
     隱形」。實測 coordinator root 上就躺著兩份這種孤兒 journal（其中一份正是
     #536 現場的 `workflow-7a430d31eff66ef13630`，run 已 superseded）。
 
-    這個 sweep 是**唯一**的恢復路徑：不管 run 是 ongoing、superseded 還是
+    `run_id` 可把呼叫限縮到單一 run（abandon 終態化時使用）；省略時維持
+    原有全目錄 sweep。這個 sweep 是**唯一**的恢復路徑：不管 run 是 ongoing、superseded 還是
     done，只要 journal 還在就把它收斂掉，因此既有殘留與未來崩潰走同一條
     程式路徑自癒。每一份 journal 的結果都會回報並落 log，不得靜默。
     """
@@ -8763,7 +8765,10 @@ def reconcile_planning_transactions(
     runs = {run.run_id: run for run in registry.list_workflow_runs()}
     moment = time.time() if now is None else now
     report: list[dict[str, object]] = []
-    for path in sorted(directory.glob("*.json")):
+    journals = sorted(directory.glob("*.json"))
+    if run_id is not None:
+        journals = [path for path in journals if path.name == f"{run_id}.json"]
+    for path in journals:
         run_id = path.name[: -len(".json")]
         record: dict[str, object] = {"run_id": run_id}
         if path.is_symlink() or not path.is_file():
