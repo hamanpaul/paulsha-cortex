@@ -646,6 +646,7 @@
 - **#546 recovery action 投影對齊 admission**：claim、Monitor work list/show 與 status attention 共用實際可受理的 recovery actions；owner-bound slice 條件成立時會列出 `recover-pre-candidate`。
 - **#833 Red 拆分接續**：Red run 只派出一個可重用的拆分 planner；計畫通過既有 plan review gate 後，child 由標準 work-action intake 受理，未受理時 parent 停在 `needs_human`。
 - **#897、#937、#953 規劃與交付收尾：** quota 失敗改派下一個合格 Builder identity；`retire-delivered` 清除已不存在且仍由本 run 與 mapped Todo 共同確認的 path link；外部 scope 診斷提供明示 `--combo` 出口，OpenSpec publication 接受 mapped anchor slug；reviewer 依裁決適用範圍及目前 gate evidence 驗收。#937(4) 依 owner 裁決保留現有 reclaim 熔斷。
+- **#488、#1028、#781 狀態活動可觀測性**：以 job log／Manager 活動檔最後寫入時間呈現 30 分鐘過期／忙碌狀態；Manager 閒置輪詢有限遞增並以 10 秒為上限，活動期間仍維持原輪詢間隔。
 - **#492 foreign review tier 前置檢查**：required review 的 builder slice 會在建立工作區與啟動 builder 前驗證 project policy tier；缺少或非法值會指出選定 manifest 路徑及允許值，無 manifest 時維持 `shareable` 預設。
 - **#571、#579 reviewer 路徑綁定**：review gate evaluation 檔名納入 candidate 短 SHA；reviewer sandbox 目錄名納入 job id，並於新 reviewer 派工前回收前代 claim era 已終止的孤兒 sandbox，回收失敗時記錄 warning 並繼續派工。
 - **#810 merge 後 Todo 勾選狀態僅供診斷**：已合併 WorkflowRun 的遠端結案與 Monitor 不再因 workstream Todo 未勾而阻擋有效交付；Todo 證據仍須存在且可讀，archived OpenSpec tasks 的完成要求維持不變。

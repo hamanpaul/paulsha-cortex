@@ -87,6 +87,29 @@ def doctor_summary(
 def _print_status(status: dict[str, Any]) -> None:
     sys.stdout.write(f"updated_at: {status.get('updated_at')}\n")
     sys.stdout.write(f"degraded: {status.get('degraded')}\n")
+    activity = status.get("activity")
+    if isinstance(activity, dict):
+        activity_state = (
+            "busy"
+            if status.get("busy") is True
+            else "stalled"
+            if status.get("degraded_reason") == "stalled"
+            else "observed"
+        )
+        fields = [
+            f"{key}={activity[key]}"
+            for key in (
+                "request_id",
+                "request_type",
+                "action",
+                "repo",
+                "work_id",
+                "last_progress_at",
+                "progress_age_seconds",
+            )
+            if key in activity
+        ]
+        sys.stdout.write(f"manager_activity: {activity_state} " + " ".join(fields) + "\n")
     sys.stdout.write("ready: " + json.dumps(status.get("ready", []), ensure_ascii=False, sort_keys=True) + "\n")
     sys.stdout.write("held: " + json.dumps(status.get("held", []), ensure_ascii=False, sort_keys=True) + "\n")
     # issue #372 複驗點名的缺漏：attention（needs_human slice）過去只有 --json

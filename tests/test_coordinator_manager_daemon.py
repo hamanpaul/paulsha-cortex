@@ -613,6 +613,146 @@ def test_run_loop_drains_tick_request_writes_done_and_updates_status(monkeypatch
     assert status["daemon"]["last_tick_at"] == "2026-07-03T09:05:00+00:00"
 
 
+def test_run_loop_publishes_ship_activity_while_request_is_running(monkeypatch, tmp_path):
+    from paulsha_cortex.control import client
+
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    monkeypatch.setattr(client.os, "kill", lambda pid, sig: None)
+    request_id = "request-ship-activity"
+    _write_request(
+        request_id,
+        type="work-action",
+        args={"action": "ship", "repo": "acme/demo", "work_id": "demo", "pr_number": 17},
+    )
+    contract.atomic_write_json(
+        constants.status_path(),
+        {
+            "schema_version": constants.SCHEMA_VERSION,
+            "updated_at": "2000-01-01T00:00:00+00:00",
+            "daemon": {"pid": 4321},
+            "ready": [],
+            "held": [],
+            "in_flight": [],
+            "recent_done": [],
+        },
+    )
+    observed = []
+
+    def request_executor(_request: dict) -> dict:
+        observed.append(client.read_status())
+        return {"action": "ship"}
+
+    manager_daemon.run_loop(
+        request_executor=request_executor,
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {"dispatch_skipped": False},
+        poll_interval=0.0,
+        tick_interval=300.0,
+        now_fn=lambda: "2026-09-26T00:00:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=lambda _: None,
+        pid=4321,
+        max_rounds=1,
+    )
+
+    assert observed[0]["degraded"] is False
+    assert observed[0]["busy"] is True
+    assert observed[0]["activity"]["request_id"] == request_id
+    assert observed[0]["activity"]["action"] == "ship"
+    assert observed[0]["activity"]["repo"] == "acme/demo"
+    assert not constants.activity_path().exists()
+
+
+def test_run_loop_idle_poll_backoff_is_bounded_at_ten_seconds(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    sleeps = []
+
+    manager_daemon.run_loop(
+        request_executor=lambda req: {},
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {},
+        poll_interval=3.0,
+        tick_interval=100000.0,
+        now_fn=lambda: "2026-09-26T00:00:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=sleeps.append,
+        pid=4321,
+        max_rounds=5,
+    )
+
+    assert sleeps == [3.0, 6.0, 10.0, 10.0]
+
+
+def test_run_loop_resets_idle_poll_backoff_when_request_is_seen(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    _write_request("request-resets-idle-backoff")
+    sleeps = []
+
+    manager_daemon.run_loop(
+        request_executor=lambda req: {},
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {},
+        poll_interval=3.0,
+        tick_interval=100000.0,
+        now_fn=lambda: "2026-09-26T00:00:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=sleeps.append,
+        pid=4321,
+        max_rounds=5,
+    )
+
+    assert sleeps == [3.0, 3.0, 6.0, 10.0]
+
+
+def test_run_loop_resets_idle_poll_backoff_while_job_is_in_flight(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    sleeps = []
+    provider_calls = 0
+
+    def status_provider():
+        nonlocal provider_calls
+        provider_calls += 1
+        in_flight = [{"job_id": "job-1"}] if provider_calls == 4 else []
+        return {"ready": [], "in_flight": in_flight, "recent_done": []}
+
+    manager_daemon.run_loop(
+        request_executor=lambda req: {},
+        status_provider=status_provider,
+        periodic_tick_runner=lambda: {},
+        poll_interval=3.0,
+        tick_interval=100000.0,
+        now_fn=lambda: "2026-09-26T00:00:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=sleeps.append,
+        pid=4321,
+        max_rounds=6,
+    )
+
+    assert sleeps == [3.0, 6.0, 10.0, 3.0, 3.0]
+
+
+def test_run_loop_resets_idle_poll_backoff_when_tick_is_due(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    sleeps = []
+    ticks = []
+
+    manager_daemon.run_loop(
+        request_executor=lambda req: {},
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: ticks.append("tick") or {},
+        poll_interval=3.0,
+        tick_interval=0.0,
+        now_fn=lambda: "2026-09-26T00:00:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=sleeps.append,
+        pid=4321,
+        max_rounds=4,
+    )
+
+    assert ticks == ["tick", "tick", "tick", "tick"]
+    assert sleeps == [3.0, 3.0, 3.0]
+
+
 def test_built_executor_and_status_provider_use_injected_dispatcher_and_registry(monkeypatch, tmp_path):
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
     registry = FakeRegistry([{"job_id": "job-1", "task": "slice-b", "status": "running"}])
@@ -1182,6 +1322,53 @@ def test_runtime_status_provider_lists_recent_done_by_completion_time(monkeypatc
         "candidate-git-base-absent"
     )
     assert [entry["slice_id"] for entry in status["recent_done"]] == ["slice-b", "slice-a"]
+
+
+def test_runtime_status_marks_inflight_job_stale_from_old_log_mtime(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path / "control"))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    log_path = tmp_path / "job.jsonl"
+    log_path.write_text('{"type":"tool_result"}\n', encoding="utf-8")
+    old_mtime = time.time() - 1801
+    os.utime(log_path, (old_mtime, old_mtime))
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=FakeRegistry(
+            [{"job_id": "job-stale", "task": "slice-stale", "status": "dispatched", "log_path": str(log_path)}]
+        ),
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+        scan_specs_fn=lambda _: [],
+    )
+
+    status = provider()
+
+    stale = [entry for entry in status["attention"] if entry.get("reason") == "stale-in-flight"]
+    assert len(stale) == 1
+    assert stale[0]["job_id"] == "job-stale"
+    assert stale[0]["progress_age_seconds"] >= 1800
+    assert status["in_flight"][0]["state"] == "dispatched"
+
+
+def test_runtime_status_keeps_recent_inflight_job_out_of_stale_attention(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path / "control"))
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    log_path = tmp_path / "job.jsonl"
+    log_path.write_text('{"type":"tool_result"}\n', encoding="utf-8")
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=FakeRegistry(
+            [{"job_id": "job-active", "task": "slice-active", "status": "running", "log_path": str(log_path)}]
+        ),
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(handoff_dir),
+        scan_specs_fn=lambda _: [],
+    )
+
+    status = provider()
+
+    assert not any(entry.get("reason") == "stale-in-flight" for entry in status["attention"])
+    assert status["in_flight"][0]["state"] == "running"
 
 
 def test_recent_done_provider_projects_gate_reason_job_id_branch(monkeypatch, tmp_path):
