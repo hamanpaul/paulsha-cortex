@@ -1,0 +1,59 @@
+{
+  "schema_version": "1",
+  "task_id": "task-857-fixture",
+  "intent": "Reuse the scoped parser memory for this work item.",
+  "project": "acme/demo",
+  "candidates": [
+    {
+      "ref": "fixture-note-1",
+      "note_id": "fixture-note-1",
+      "rank": 1,
+      "summary": "Keep retrieval task-local.",
+      "authorization": {
+        "status": "authorized"
+      },
+      "availability": {
+        "status": "available"
+      },
+      "content_hash": "77d6d1dc19f91c4832d0b4238cc30bbbc327d7f53539dce1bbfa09368ea6e477",
+      "content_version": "sha256:77d6d1dc19f91c4832d0b4238cc30bbbc327d7f53539dce1bbfa09368ea6e477",
+      "applicability": [
+        "same repository"
+      ],
+      "relevance_reason": "The request uses the same task-local boundary.",
+      "source_time": "2026-09-25T12:00:00Z",
+      "project": "acme/demo"
+    }
+  ],
+  "delivery": {
+    "mode": "note_fetch",
+    "capabilities": {
+      "inline": true,
+      "snapshot": true,
+      "note_fetch": true
+    },
+    "manifest": {
+      "schema": "hippo/task-memory-manifest/v1",
+      "task_id": "task-857-fixture",
+      "project": "acme/demo",
+      "entries": [
+        {
+          "note_id": "fixture-note-1",
+          "content_hash": "77d6d1dc19f91c4832d0b4238cc30bbbc327d7f53539dce1bbfa09368ea6e477",
+          "content_version": "sha256:77d6d1dc19f91c4832d0b4238cc30bbbc327d7f53539dce1bbfa09368ea6e477",
+          "project": "acme/demo"
+        }
+      ],
+      "sha256": "93b08c84a9dc07d1cedd49e72025f6f084d05be96f66477571810b014d374555"
+    }
+  },
+  "evidence": [],
+  "producer": {
+    "id": "hippo-task-memory-provider",
+    "version": "1"
+  },
+  "adapter": {
+    "id": "cortex-host-adapter",
+    "version": "1"
+  }
+}

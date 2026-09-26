@@ -28,7 +28,7 @@ setup and workflow commands:
   monitor          掃描專案文件並輸出 Project Monitor 狀態
   egress-proxy     出口 proxy 服務（#716；--check 只印生效設定與白名單）
   list             列出統一 Work Item read model
-  work show        顯示單一 Work Item 與可解釋關聯
+  work show        顯示單一 Work Item；可選回查 task-memory receipts
   doctor           檢查 gh、preflight、model identity、agy 與 service paths
   control lock-path 印出 manager.lock 契約路徑（shell wrapper／daemon 同源，整合用途）
   relay-hook       執行封裝內 relay hook（整合用途）
@@ -53,7 +53,7 @@ _WORK_HELP = """\
 usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-card|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|close-delivered|recover-superseded|reset-reclaim-budget|refreeze-base|auto|verify-attest|review-attest|review-disposition|ship> ...
 
 work item commands:
-  show      從 Monitor 讀取 Work Item 與關聯解釋
+  show      從 Monitor 讀取 Work Item；--task-memory 顯示 task-memory/run/job/receipt read model
   gc        proposal-first 回收殘留 build worktree 與已 merge local branch（唯讀 registry）
   link      由 Manager 寫入 confirmed association
   unlink    由 Manager 寫入 exclusion
@@ -119,7 +119,13 @@ def _help_text() -> str:
     return "\n".join(lines)
 
 
-def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    work_client=None,
+    task_memory_registry=None,
+    task_memory_receipts=None,
+) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
         sys.stderr.write(_USAGE)
@@ -171,7 +177,12 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
             sys.stdout.write(_WORK_HELP)
             return 0
         if args[1] == "show":
-            return _work_read_main(args, work_client=work_client)
+            return _work_read_main(
+                args,
+                work_client=work_client,
+                task_memory_registry=task_memory_registry,
+                task_memory_receipts=task_memory_receipts,
+            )
         if args[1] == "gc":
             from paulsha_cortex.coordinator import gc as gc_module
 
@@ -215,8 +226,17 @@ def _build_work_parser() -> argparse.ArgumentParser:
     show = work_sub.add_parser("show", help="顯示單一 Work Item")
     show.add_argument("work_id")
     show.add_argument("--repo", default=None, help="指定 owner/repo 以消除同名歧義")
-    show.add_argument("--json", action="store_true", help="輸出 cortex-work/v1 JSON")
+    show.add_argument(
+        "--json",
+        action="store_true",
+        help="輸出 cortex-work/v1 JSON；搭配 --task-memory 時輸出 task-memory read model",
+    )
     show.add_argument("--explain", action="store_true", help="附 correlation/reducer 解釋")
+    show.add_argument(
+        "--task-memory",
+        action="store_true",
+        help="輸出 task-memory read model，含 run/job/routing/receipt/test/review evidence",
+    )
     return parser
 
 
@@ -258,7 +278,13 @@ def _format_candidate_git_base(payload: object) -> list[str]:
     return lines
 
 
-def _work_read_main(args: list[str], *, work_client=None) -> int:
+def _work_read_main(
+    args: list[str],
+    *,
+    work_client=None,
+    task_memory_registry=None,
+    task_memory_receipts=None,
+) -> int:
     from paulsha_cortex.monitor.work_api import MonitorSocketClient
 
     parsed = _build_work_parser().parse_args(args)
@@ -290,6 +316,45 @@ def _work_read_main(args: list[str], *, work_client=None) -> int:
     if not isinstance(data, dict):
         print("錯誤: Monitor response data 不是 JSON object", file=sys.stderr)
         return 1
+    task_memory_view = None
+    if parsed.command == "work" and parsed.task_memory:
+        item_data = data.get("item")
+        if not isinstance(item_data, dict):
+            print("錯誤: Monitor Work Item 缺少 task-memory read model 所需欄位", file=sys.stderr)
+            return 1
+        try:
+            from paulsha_cortex.config import paths
+            from paulsha_cortex.coordinator.registry import JobRegistry
+            from paulsha_cortex.coordinator.task_memory import (
+                TaskMemoryReceiptStore,
+                project_task_memory_read_model,
+            )
+            from paulsha_cortex.monitor.work_models import WorkItem
+
+            work_item = WorkItem.from_dict(item_data)
+            registry = (
+                task_memory_registry
+                if task_memory_registry is not None
+                else JobRegistry()
+            )
+            receipts = (
+                task_memory_receipts
+                if task_memory_receipts is not None
+                else TaskMemoryReceiptStore(paths.coordinator_root())
+            )
+            task_memory_view = project_task_memory_read_model(
+                work_item=work_item,
+                runs=registry.list_workflow_runs(),
+                jobs=registry.list_jobs(),
+                receipts=receipts,
+                blocking_reason=data.get("blocking_reason"),
+            )
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
+            print(f"錯誤: 無法讀取 task-memory sidecar/read model：{error}", file=sys.stderr)
+            return 1
+        if parsed.json:
+            print(json.dumps(task_memory_view, ensure_ascii=False, sort_keys=True))
+            return 0
     if parsed.json:
         print(json.dumps(data, ensure_ascii=False, sort_keys=True))
         return 0
@@ -312,6 +377,18 @@ def _work_read_main(args: list[str], *, work_client=None) -> int:
         print(f"{item.get('work_id', '-')}  {item.get('state', '-')}  {item.get('title', '-')}")
         print(f"repo: {item.get('repo', '-')}")
         print(f"phase: {item.get('phase') or '-'}")
+        if task_memory_view is not None:
+            print("task-memory read model:")
+            if not task_memory_view["runs"]:
+                print("  workflow_runs: none")
+            for run in task_memory_view["runs"]:
+                receipt_view = run["receipts"]
+                print(
+                    f"  run: {run['run_id']} state={run['state']} status={run['status']} "
+                    f"jobs={len(run['jobs'])} receipts={receipt_view['event_count']}"
+                )
+                if receipt_view["sidecar_ref"]:
+                    print(f"    receipts: {receipt_view['sidecar_ref']}")
         # 診斷 invariant（#527）：run 掛著 needs_human 時的結構化理由。過去
         # `work show` 只印 work_id/state/title/repo/phase，理由（若存在）連
         # `--json` 都拿不到——這是「四個介面同時沉默」的其中一個。

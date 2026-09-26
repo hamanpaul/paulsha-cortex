@@ -52,6 +52,15 @@ def test_subcommand_help_uses_installed_cortex_invocations() -> None:
     assert build_monitor_parser().prog == "cortex monitor"
 
 
+def test_task_memory_canary_help_does_not_repeat_subcommand(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        umbrella_cli.main(["task-memory", "canary", "--help"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "usage: cortex task-memory canary " in output
+    assert "usage: cortex task-memory canary canary" not in output
+
+
 def test_work_help_lists_gc_subcommand() -> None:
     assert "gc" in umbrella_cli._WORK_HELP
     assert "回收" in umbrella_cli._WORK_HELP

@@ -11,6 +11,7 @@
 
 - **#842 execution qualification lifecycle**：live 核可改由需 actor、reason 與確認的 operator CLI 核發 content-addressed receipt；receipt 檔本身的 id/digest 綁住 exact candidate/report/profile/role/coverage/policy/expiry 自證身分，偽造或遭竄改的檔案不能發布或通過 roster query（可選的 Manager-only index 讀得到時提供額外佐證，缺席不擋）。generation、review 與 expiry 比較統一解析 timezone-aware 時間；test-only receipt 不通過 sized-dispatch enforcement。操作與 Trust Root 權限見 `docs/execution-qualification.md`。
 
+- **#857 task-memory Hippo subprocess provider 與 live canary**：新增有界 `hippo task-memory provide/fetch` CLI client、exit-code/stderr allowlist、per-task manifest-bound fetch callback，以及預設關閉的 `PSC_TASK_MEMORY_ENABLED=1` Manager inline dispatch；receipt 僅寫 Cortex sidecar。Canary 明確分開 note-fetch／snapshot 的內容取回率與 inline delivery rate：只將 hash 相符的 `content-returned` 納入 retrieval，snapshot 必須讀回內容且 hash 相符（`snapshot-ready` 不算成功），inline `context-delivered` 標記 `counts_as_read=false` 並獨立計 delivery。聚合 retrieval 僅含 note-fetch/snapshot 且須 ≥95%，各 repo/path 仍各自要求至少 5 次成功 provide；同步修正 help 不再重複 `canary`。真實 Hippo CLI／installed service 驗收仍待執行。對抗審查另修 2 個 MAJOR：receipt／sidecar 不再持久化 provider 回傳的 `applicability`／`relevance_reason` 自由文字（只留 SHA-256 摘要），`source_time` 非受界 ISO8601 時記為 `unknown`；`PSC_TASK_MEMORY_HIPPO_CMD` 未明示絕對路徑時一律視為 provider 缺席，不再對 `PATH` 做搜尋。對抗審查第四輪另修 2 個 MAJOR：正式 dispatch 路徑改以既有 Work Item 標題（讀 Monitor durable last-good snapshot）、issue refs、run 既有的 planning artifact 路徑與上一個 attempt 既有的 output baseline 檔案清單、前一 attempt 既有的 bounded 採信錯誤組 task-memory envelope，不再寫死固定樣板也不漏傳 related_files/related_errors；receipt reader 改與 append 共用同一把 `.lock` 的 shared lock 再讀，避免撞上 in-flight append 時把半行 JSONL 誤判為損毀。
 - **#843 recovery action conformance**：新增版本化 action registry 與 13 家族契約矩陣，並以 dispatcher、control contract、coordinator CLI、`cortex recover` work/slice alias 雙向核對正式名稱與 CAS 欄位；補上 retry candidate CLI CAS、recover/abandon crash/restart 參數化特性與 frozen same-domain reviewer pin 零派工負控制。既有 producer gap 和 live 驗收界線記錄於矩陣。
 
 ### Fixed
@@ -329,10 +330,6 @@
 - **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
   子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。
   本項只有規劃進件；既存 generic carrier 殘餘與產品、部署驗收保持分帳。
-
-
-
-- **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
 
 
 

@@ -1,0 +1,38 @@
+{
+  "schema_version": "1",
+  "task_id": "task-857-fixture",
+  "intent": "Reuse the scoped parser memory for this work item.",
+  "candidates": [],
+  "delivery": {
+    "mode": "note_fetch",
+    "capabilities": {
+      "inline": true,
+      "snapshot": true,
+      "note_fetch": true
+    },
+    "host_scope": {
+      "repo": "acme/demo",
+      "work_id": "demo",
+      "workflow_run_id": "workflow-demo",
+      "card": "build-card",
+      "read_scope": {
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "workflow_run_id": "workflow-demo",
+        "card": "build-card"
+      },
+      "allowed_evidence_sources": [
+        "work-item",
+        "workflow-run",
+        "planning-authority",
+        "hippo"
+      ],
+      "related_files": ["src/parser.py"],
+      "related_errors": []
+    }
+  },
+  "evidence": [],
+  "producer": {"id": "cortex-host"},
+  "adapter": {"id": "cortex-task-memory", "version": "1"},
+  "project": "acme/demo"
+}
