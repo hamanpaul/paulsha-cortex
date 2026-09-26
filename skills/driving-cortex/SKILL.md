@@ -36,7 +36,7 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 ## 驅動桿
 
 - 每次 run 啟動順序：
-  - `cortex work start --workflow-action`（依 manager 指示）
+  - `cortex run work start <work_id> --repo <owner/repo> --wait --json`
   - run 卡住時，先依下方唯讀檢查確認唯一 ongoing run，再執行 `cortex run work resume <work_id> --repo <owner/repo> --wait --json`；resume 不接受 `--expected-run-id`
   - `cortex run work retry-build <work_id> --repo <owner/repo> --expected-candidate <exact-candidate-sha> --wait --json`（build 後重試；必須提供 exact Candidate）
   - `cortex work review-attest --payload ...`（有 `review-attest` evidence 時）
