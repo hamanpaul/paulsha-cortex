@@ -2969,13 +2969,43 @@ def complete_tick(
                     {"job_id": job_id, "error": f"handoff manifest path 拒絕 symlink: {manifest_path}"}
                 )
                 continue
+
+            workflow_lane_job = _is_workflow_lane_job(job)
+            slice_row = None
+            if not workflow_lane_job:
+                try:
+                    slice_row = registry.get_slice(slice_id)
+                except KeyError:
+                    pass  # 真正缺少 slice row 時，保留既有 missing-slice-proof 流程。
+                else:
+                    binding_field = "reviewer_job_id" if job.get("kind") == "review" else "builder_job_id"
+                    if slice_row.get(binding_field) != job_id:
+                        continue  # 已不屬於目前 attempt 的 terminal job 僅保留稽核。
+                    if job.get("kind") != "review" and slice_row.get("reviewer_job_id"):
+                        continue
+
+            # 綁定中的 slice job 若同 job manifest 已反映到 slice，就不再重驗，避免
+            # 每個 tick 重複寫 evidence/action。前次 state mutation 失敗時保留修復重試；
+            # 缺少 slice 的舊 job仍走 _existing_manifest_job_id 的既有修復行為。
+            existing_manifest = _read_manifest_payload(manifest_path)
+            if slice_row is not None and existing_manifest is not None:
+                if existing_manifest.get("job_id") == job_id:
+                    gate_reason = existing_manifest.get("gate_reason")
+                    transition_not_applied = gate_reason == "verification-state-update-error" or (
+                        gate_reason == "verification-runner-error"
+                        and (slice_row.get("state") != "needs_human" or slice_row.get("gate_state") != "needs_human")
+                    )
+                    if not transition_not_applied:
+                        continue
             if _existing_manifest_job_id(manifest_path) == job_id:
                 continue  # 真冪等：同一個 terminal job 已落盤（同 job_id → skip；異 job_id/壞檔 → overwrite）
 
             if job.get("kind") == "review":
-                slice_row = _slice_for_reviewer_job(registry, slice_id, job_id)
+                if workflow_lane_job:
+                    slice_row = _slice_for_reviewer_job(registry, slice_id, job_id)
             else:
-                slice_row = _slice_for_job(registry, slice_id, job_id)
+                if workflow_lane_job:
+                    slice_row = _slice_for_job(registry, slice_id, job_id)
                 if slice_row is not None and slice_row.get("reviewer_job_id"):
                     continue
                 if slice_row is None and _is_unbound_launch_failed_build_job(registry, slice_id, job):
@@ -3132,6 +3162,7 @@ def complete_tick(
                     except Exception as exc:
                         gate_status = "needs_human"
                         gate_reason = "verification-runner-error"
+                        state_update_started = False
                         try:
                             evidence = _write_status_evidence(
                                 slice_row=slice_row,
@@ -3144,11 +3175,16 @@ def complete_tick(
                                 details={"error": str(exc)},
                             )
                             if evidence is not None:
+                                state_update_started = True
                                 _apply_verification_result(registry, slice_id, evidence)
                                 publish_evidence = True
                             else:
+                                state_update_started = True
                                 registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
                         except Exception:
+                            if state_update_started:
+                                gate_reason = "verification-state-update-error"
+                            publish_evidence = False
                             try:
                                 registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
                             except Exception:

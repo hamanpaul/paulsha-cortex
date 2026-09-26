@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#481／#497 terminal job 重播**：`complete_tick` 只終局化仍綁定 slice 的 builder／reviewer；同 job manifest 已反映到 slice 時不再重驗，recovery 後的舊 job 保留稽核而不再寫 evidence 或回退 slice。state mutation 未落地時仍允許同 job 修復重試。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加

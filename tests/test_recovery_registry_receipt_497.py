@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
 import pytest
 
+from paulsha_cortex.coordinator import manager
 from paulsha_cortex.coordinator import registry as registry_module
 from paulsha_cortex.coordinator.registry import JobRegistry
 
@@ -736,6 +738,89 @@ def test_commit_pre_candidate_recovery_supersedes_jobs_and_is_idempotent(tmp_pat
             request=request,
             step_receipts=conflicting_steps,
         )
+
+
+def test_complete_tick_skips_recovered_builder_after_registry_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slice_id = "slice-recovered-terminal"
+    state_path = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state_path)
+    builder = _create_job(registry, task=slice_id, worktree=tmp_path / "wt" / slice_id)
+    registry.update_headless_result(builder["job_id"], status="exited", exit_code=0)
+    registry.create_slice(
+        slice_id=slice_id,
+        spec_path=f"specs/{slice_id}.md",
+        spec_hash="spec-sha",
+        plan_path=f"plans/{slice_id}.md",
+        plan_hash="plan-sha",
+        target_branch=f"feature/{slice_id}",
+        verification={"docs_class": "code"},
+        dispatch_base="a" * 40,
+        builder_job_id=builder["job_id"],
+        reviewer_job_id=None,
+        candidate=None,
+    )
+    registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+    slice_row = registry.get_slice(slice_id)
+    request = _recovery_request(slice_row)
+    registry.prepare_recovery(slice_id, request=request)
+    registry.commit_pre_candidate_recovery(
+        slice_id,
+        request=request,
+        step_receipts=_step_receipts(),
+    )
+    assert registry.get_slice(slice_id)["builder_job_id"] is None
+    assert registry.get_job(builder["job_id"])["supersession"]["reason"] == "recover-pre-candidate"
+
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    manifest_path = handoff_dir / f"{slice_id}.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "slice_id": slice_id,
+                "job_id": builder["job_id"],
+                "gate_status": "needs_human",
+                "gate_reason": "verification-runner-error",
+                "verification_evidence_path": None,
+                "superseded_at": "T1",
+                "superseded_by": "operator",
+                "superseded_reason": "operator-recover-pre-candidate",
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_before = manifest_path.read_bytes()
+    monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path))
+    git_calls: list[tuple[str, ...]] = []
+
+    def git_runner(args):
+        git_calls.append(tuple(args))
+        return SimpleNamespace(returncode=0, stdout="c" * 40, stderr="")
+
+    reloaded = JobRegistry(state_path=state_path)
+    slice_before_tick = reloaded.get_slice(slice_id)
+    summary = manager.complete_tick(
+        SimpleNamespace(_registry=reloaded),
+        handoff_dir=str(handoff_dir),
+        clock=lambda: "T2",
+        git_runner=git_runner,
+    )
+
+    assert summary["completed"] == []
+    assert summary["completed_jobs"] == []
+    assert summary["errors"] == []
+    assert git_calls == []
+    assert manifest_path.read_bytes() == manifest_before
+    slice_after_tick = reloaded.get_slice(slice_id)
+    assert slice_after_tick["state"] == "pending"
+    assert slice_after_tick["gate_state"] == "pending"
+    assert slice_after_tick["builder_job_id"] is None
+    assert slice_after_tick["actions"] == slice_before_tick["actions"]
+    assert slice_after_tick["evidence_history"] == slice_before_tick["evidence_history"]
+    evidence_dir = tmp_path / "evidence" / "verification"
+    assert not evidence_dir.exists() or not list(evidence_dir.glob("*.json"))
 
 
 def test_commit_pre_candidate_recovery_rejects_incomplete_proof(tmp_path: Path) -> None:

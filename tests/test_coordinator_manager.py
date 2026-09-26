@@ -660,6 +660,131 @@ class CompleteTickReconcileTests(unittest.TestCase):
             self.assertIn(manifest["job_id"], {first["job_id"], second["job_id"]})
             self.assertEqual(summary["completed"][0]["gate_status"], manifest["gate_status"])
 
+    def test_only_current_builder_terminal_is_finalized_across_ticks(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            first = _make_job(reg, "slice-terminal-replay")
+            reg.update_headless_result(first["job_id"], status="failed", exit_code=1)
+            second = _make_job(reg, "slice-terminal-replay")
+            reg.update_headless_result(second["job_id"], status="failed", exit_code=1)
+            current = _make_job(reg, "slice-terminal-replay")
+            reg.update_headless_result(current["job_id"], status="failed", exit_code=1)
+            _create_slice(reg, Path(d), current)
+            disp = FakeDispatcher(reg)
+            hdir = Path(d) / "handoff"
+
+            first_tick = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            self.assertEqual(
+                [job["job_id"] for job in first_tick["completed_jobs"]],
+                [current["job_id"]],
+            )
+            self.assertEqual(first_tick["warnings"], [])
+            manifest_path = hdir / "slice-terminal-replay.json"
+            first_manifest = manifest_path.read_bytes()
+            first_registry = (Path(d) / "jobs.json").read_bytes()
+
+            second_tick = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T1")
+
+            self.assertEqual(second_tick["completed"], [])
+            self.assertEqual(second_tick["completed_jobs"], [])
+            self.assertEqual(manifest_path.read_bytes(), first_manifest)
+            self.assertEqual((Path(d) / "jobs.json").read_bytes(), first_registry)
+
+    def test_stale_reviewer_terminal_is_not_finalized_for_current_reviewer_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"PSC_REPO_ROOT": d}):
+            reg = _reg(d)
+            builder = _make_job(reg, "slice-review-terminal-replay")
+            stale_reviewer = reg.create_job(
+                task="slice-review-terminal-replay",
+                persona="reviewer",
+                kind="review",
+                branch="feature/slice-review-terminal-replay",
+                pane="",
+                worktree=str(Path(d) / "wt" / "stale-reviewer"),
+            )
+            reg.update_headless_result(stale_reviewer["job_id"], status="failed", exit_code=1)
+            current_reviewer = reg.create_job(
+                task="slice-review-terminal-replay",
+                persona="reviewer",
+                kind="review",
+                branch="feature/slice-review-terminal-replay",
+                pane="",
+                worktree=str(Path(d) / "wt" / "current-reviewer"),
+            )
+            reg.create_slice(
+                slice_id="slice-review-terminal-replay",
+                spec_path=f"{d}/specs/slice-review-terminal-replay.md",
+                spec_hash="spec-sha",
+                plan_path=f"{d}/plans/slice-review-terminal-replay.md",
+                plan_hash="plan-sha",
+                target_branch="main",
+                builder_job_id=builder["job_id"],
+                reviewer_job_id=current_reviewer["job_id"],
+                candidate=None,
+                verification={"docs_class": "code"},
+            )
+            hdir = Path(d) / "handoff"
+
+            summary = manager.complete_tick(FakeDispatcher(reg), handoff_dir=str(hdir))
+
+            self.assertEqual(summary["completed"], [])
+            self.assertEqual(summary["errors"], [])
+            self.assertFalse((hdir / "slice-review-terminal-replay.json").exists())
+
+    def test_bound_terminal_with_verification_runner_error_manifest_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            job = _make_job(reg, "slice-terminal-error")
+            _create_slice(reg, root, job)
+            reg.update_headless_result(job["job_id"], status="exited", exit_code=0)
+            reg.update_slice(
+                "slice-terminal-error",
+                state="needs_human",
+                gate_state="needs_human",
+                candidate="b" * 40,
+            )
+            hdir = root / "handoff"
+            hdir.mkdir()
+            manifest_path = hdir / "slice-terminal-error.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "slice_id": "slice-terminal-error",
+                        "job_id": job["job_id"],
+                        "gate_status": "needs_human",
+                        "completion": "exited",
+                        "gate_reason": "verification-runner-error",
+                        "verification_evidence_path": None,
+                        "completed_at": "T0",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before_manifest = manifest_path.read_bytes()
+            before_slice = reg.get_slice("slice-terminal-error")
+            runner_calls: list[str] = []
+
+            def unexpected_replay(**_kwargs):
+                runner_calls.append(job["job_id"])
+                raise RuntimeError("verification runner replayed")
+
+            summary = manager.complete_tick(
+                FakeDispatcher(reg),
+                handoff_dir=str(hdir),
+                clock=lambda: "T1",
+                verification_runner=unexpected_replay,
+            )
+
+            self.assertEqual(runner_calls, [])
+            self.assertEqual(summary["completed"], [])
+            self.assertEqual(summary["errors"], [])
+            self.assertEqual(manifest_path.read_bytes(), before_manifest)
+            after_slice = reg.get_slice("slice-terminal-error")
+            self.assertEqual(after_slice["actions"], before_slice["actions"])
+            self.assertEqual(after_slice["evidence_history"], before_slice["evidence_history"])
+
     def test_requeue_overwrites_manifest_for_new_job_id(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
