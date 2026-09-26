@@ -178,7 +178,15 @@ def probe_service_runtime(
             else None
         )
         if isinstance(fragment_path, str) and fragment_path.startswith("/"):
-            unit_path = Path(fragment_path)
+            if Path(fragment_path) != unit_path:
+                # systemd 回報的有效宣告其實指向另一個檔案位置——例如這個
+                # instance 名稱剛好撞到使用者 systemd session 底下另一個真正
+                # 在跑的 unit（不是這次要探查的 home 底下管理的那個）。這種宣告
+                # 與這個 home 無關，不可信任，視為 systemd 對這個 unit 不可用，
+                # 改走檔案 fallback，避免把不相關的真實環境／artifact 誤植進來。
+                systemd_properties = None
+            else:
+                unit_path = Path(fragment_path)
         exec_path = None
         if unit_name.endswith(".service"):
             if systemd_properties is None:

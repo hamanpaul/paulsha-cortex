@@ -515,6 +515,81 @@ def test_service_status_reports_none_mode_with_install_hint(
     assert payload["service"]["suggested_commands"] == ["cortex service install --instance beta"]
 
 
+def test_loaded_runtime_uses_systemd_effective_environment_over_stale_fallback_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#841 對抗審查：manager unit 被 drop-in 改了 ``PSC_COORDINATOR_ROOT`` 時，
+    ``loaded_runtime`` 必須採用 ``systemctl show`` 的有效值來決定 root，不能
+    繼續固定讀 ``~/.agents/core/runtime/<instance>-manager.env``——那個檔案
+    可能還留著舊 root，drop-in 換了 state root 後會對錯宣告，PID 重用時甚至
+    可能誤報 match。"""
+    from paulsha_cortex.porcelain import service
+
+    home = tmp_path / "home"
+    runtime_dir = home / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    stale_root = tmp_path / "stale-coordinator-root"
+    pinned_root = tmp_path / "pinned-coordinator-root"
+    stale_root.mkdir()
+    pinned_root.mkdir()
+    (runtime_dir / "cortex-manager.env").write_text(
+        f"PSC_COORDINATOR_ROOT={stale_root}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    manager_unit_path = tmp_path / "cortex-manager.service"
+    monitor_unit_path = tmp_path / "cortex-monitor.service"
+    manager_unit_path.write_text("[Service]\n", encoding="utf-8")
+    monitor_unit_path.write_text("[Service]\n", encoding="utf-8")
+    units = {
+        "cortex-manager.service": {
+            "path": str(manager_unit_path),
+            "status": "active/running",
+            "pid": 321,
+            "exec_path": "/usr/bin/env",
+            "stale": False,
+            "systemd": {
+                "ExecStart": "{ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }",
+                "Environment": f"PSC_COORDINATOR_ROOT={pinned_root}",
+                "EnvironmentFiles": "",
+                "DropInPaths": "",
+                "FragmentPath": str(manager_unit_path),
+                "WorkingDirectory": "/",
+            },
+        },
+        "cortex-monitor.service": {
+            "path": str(monitor_unit_path),
+            "status": "active/running",
+            "pid": 322,
+            "exec_path": "/usr/bin/env",
+            "stale": False,
+            "_systemd_unavailable": True,
+        },
+    }
+
+    calls: list[tuple[str, dict[str, str]]] = []
+    original_resolve_runtime_root = service.resolve_runtime_root
+
+    def spy_resolve_runtime_root(name, *, environment):
+        calls.append((name, dict(environment)))
+        return original_resolve_runtime_root(name, environment=environment)
+
+    monkeypatch.setattr(service, "resolve_runtime_root", spy_resolve_runtime_root)
+
+    payload = service._loaded_runtime_payload(
+        "cortex", manager_pid=321, monitor_pid=322, units=units,
+    )
+
+    assert payload["environment_source"]["manager"] == "systemd-effective"
+    assert payload["environment_source"]["monitor"] == "direct-fallback"
+    manager_calls = [
+        environment for name, environment in calls if name == "PSC_COORDINATOR_ROOT"
+    ]
+    assert manager_calls, "resolve_runtime_root 未被呼叫來決定 manager 的 root"
+    assert manager_calls[0]["PSC_COORDINATOR_ROOT"] == str(pinned_root)
+
+
 def test_service_logs_uses_journalctl_when_systemd_units_exist(
     service_runtime: dict[str, Path],
     capsys: pytest.CaptureFixture[str],

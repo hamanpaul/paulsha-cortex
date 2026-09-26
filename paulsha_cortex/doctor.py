@@ -972,6 +972,51 @@ def _runtime_defaults(
     return effective
 
 
+def _finalize_effective_environment(
+    effective: dict[str, str], *, home: Path, instance: str
+) -> dict[str, str]:
+    effective = _runtime_defaults(effective, home=home, instance=instance)
+    roots = ("PSC_AGENTS_ROOT", "PSC_RUN_ROOT", "PSC_MONITOR_STATE_ROOT", "PSC_PROJECT_CONFIG_ROOT")
+    if any(not Path(effective[name]).expanduser().is_absolute() for name in roots):
+        raise ValueError("effective runtime root is not absolute")
+    return effective
+
+
+def _systemd_declared_environment(
+    *, home: Path, instance: str, manager_unit: Path, monitor_unit: Path
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """#841：與 ``cortex service status`` 共用同一份有效環境判定（single source
+    of truth）——systemd 可用時必須套用 drop-in 已覆寫的 ``Environment=``／
+    ``EnvironmentFiles=``，不能只讀主 unit 檔宣告；systemd 本身不可用時，回傳
+    空宣告讓呼叫端退回既有逐檔讀取的 direct-mode fallback。
+
+    probe 回報的 unit 路徑若與這次要驗證的 ``home`` 不一致（例如測試環境下
+    巧合存在同名的真實 unit），視為與這個 home 無關、不採信，確保這個判定是
+    hermetic 的，不會讀到本機真實 unit。"""
+    from .porcelain._runtime_probe import probe_service_runtime
+    from .runtime_attestation import service_declaration_projection
+
+    service_runtime = probe_service_runtime(instance, home=home)
+    probed_units = service_runtime.get("units")
+    probed_units = probed_units if isinstance(probed_units, Mapping) else {}
+    declarations = service_runtime.get("service_declaration")
+    if not isinstance(declarations, Mapping):
+        declarations = service_declaration_projection(probed_units, instance=instance)
+
+    def trusted(unit_name: str, expected_unit: Path, key: str) -> Mapping[str, object]:
+        row = probed_units.get(unit_name)
+        declared_path = row.get("path") if isinstance(row, Mapping) else None
+        if declared_path != str(expected_unit):
+            return {}
+        declaration = declarations.get(key)
+        return declaration if isinstance(declaration, Mapping) else {}
+
+    return (
+        trusted(f"{instance}-manager.service", manager_unit, "manager"),
+        trusted(f"{instance}-monitor.service", monitor_unit, "monitor"),
+    )
+
+
 def _load_bootstrap_environment(
     *,
     home: Path,
@@ -985,6 +1030,25 @@ def _load_bootstrap_environment(
     monitor_unit = unit_root / f"{instance}-monitor.service"
     if manager_unit.is_symlink() or monitor_unit.is_symlink():
         raise ValueError("managed units must not be symlinks")
+
+    manager_declaration, monitor_declaration = _systemd_declared_environment(
+        home=home, instance=instance, manager_unit=manager_unit, monitor_unit=monitor_unit
+    )
+    manager_source = manager_declaration.get("environment_source")
+    monitor_source = monitor_declaration.get("environment_source")
+
+    if manager_source == "systemd-effective" and monitor_source == "systemd-effective":
+        manager_overlay = manager_declaration.get("environment")
+        monitor_overlay = monitor_declaration.get("environment")
+        if manager_overlay != monitor_overlay:
+            raise ValueError("manager/monitor effective environment differs")
+        effective = dict(base_env)
+        if isinstance(manager_overlay, Mapping):
+            effective.update(manager_overlay)
+        return _finalize_effective_environment(effective, home=home, instance=instance)
+    if "unknown" in (manager_source, monitor_source):
+        raise ValueError("managed bootstrap environment is invalid")
+
     manager_files = _unit_environment_files(
         manager_unit,
         home=home,
@@ -1009,11 +1073,7 @@ def _load_bootstrap_environment(
         loaded_files.add(env_path)
     if bootstrap_env not in loaded_files:
         raise ValueError("managed bootstrap EnvironmentFile missing")
-    effective = _runtime_defaults(effective, home=home, instance=instance)
-    roots = ("PSC_AGENTS_ROOT", "PSC_RUN_ROOT", "PSC_MONITOR_STATE_ROOT", "PSC_PROJECT_CONFIG_ROOT")
-    if any(not Path(effective[name]).expanduser().is_absolute() for name in roots):
-        raise ValueError("effective runtime root is not absolute")
-    return effective
+    return _finalize_effective_environment(effective, home=home, instance=instance)
 
 
 def _service_environment_probe(

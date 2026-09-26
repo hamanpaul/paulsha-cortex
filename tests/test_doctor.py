@@ -839,6 +839,53 @@ def test_default_monitor_socket_is_scoped_to_installed_instance(tmp_path: Path) 
     )
 
 
+def test_bootstrap_environment_uses_systemd_effective_dropin_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#841 對抗審查：manager／monitor unit 被 drop-in 換了
+    ``PSC_MONITOR_STATE_ROOT`` 時，doctor 的有效環境判定必須套用
+    ``systemctl show`` 已經套用 drop-in 的有效值，不能只讀主 unit 檔宣告的
+    ``EnvironmentFile=``（那會漏掉 drop-in，對錯 monitor state root）。
+    mock 掉 ``shutil.which``／``subprocess.run``，不讀到本機真實 unit。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home, env = _layout(tmp_path)
+    unit_root = home / ".config" / "systemd" / "user"
+    manager_unit = unit_root / "cortex-manager.service"
+    monitor_unit = unit_root / "cortex-monitor.service"
+    pinned_root = tmp_path / "pinned-monitor-state"
+
+    def show_block(unit_path: Path) -> str:
+        lines = [
+            f"Id={unit_path.name}",
+            "LoadState=loaded",
+            "ActiveState=active",
+            "SubState=running",
+            "MainPID=0",
+            "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }",
+            f"Environment=PSC_MONITOR_STATE_ROOT={pinned_root}",
+            "EnvironmentFiles=",
+            "DropInPaths=",
+            f"FragmentPath={unit_path}",
+            "WorkingDirectory=/",
+        ]
+        return "\n".join(lines) + "\n"
+
+    show_output = show_block(manager_unit) + "\n" + show_block(monitor_unit)
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=show_output)
+
+    monkeypatch.setattr(_runtime_probe.subprocess, "run", fake_run)
+
+    effective = _load_bootstrap_environment(home=home, instance="cortex", base_env=env)
+
+    assert effective["PSC_MONITOR_STATE_ROOT"] == str(pinned_root)
+
+
 def test_github_permission_probe_fails_without_token_scope_proof(tmp_path: Path, monkeypatch) -> None:
     home, env = _layout(tmp_path)
     monkeypatch.setattr(

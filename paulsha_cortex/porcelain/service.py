@@ -343,6 +343,32 @@ def _unknown_runtime_report(reason: str, current_artifact: dict[str, object]) ->
     }
 
 
+def _service_declared_environment(
+    instance: str, declaration: Any
+) -> tuple[dict[str, str], str]:
+    """依 service 宣告目前的 ``environment_source`` 決定該 service 實際會拿到
+    的環境變數。
+
+    systemd 有效宣告可用時直接採用它（已反映 drop-in 對 ``Environment=``／
+    ``EnvironmentFiles=`` 的覆寫，不必重讀 ``~/.agents/core/runtime/*.env``）；
+    只有 systemd 本身不可用的 direct 模式，才退回既有的 fallback 讀檔。宣告
+    存在但無法安全解析時回傳空環境並標示 unknown，不得靜默沿用舊 fallback去
+    對錯 root／config（那正是 #841 對抗審查抓到的回歸）。"""
+    source = (
+        declaration.get("environment_source")
+        if isinstance(declaration, dict)
+        else None
+    )
+    overlay = declaration.get("environment") if isinstance(declaration, dict) else None
+    if source == "systemd-effective" and isinstance(overlay, dict):
+        environment = dict(os.environ)
+        environment.update(overlay)
+        return environment, "systemd-effective"
+    if source == "unavailable":
+        return _fallback_environment(instance), "direct-fallback"
+    return {}, "unknown"
+
+
 def _loaded_runtime_payload(
     instance: str,
     *,
@@ -351,7 +377,6 @@ def _loaded_runtime_payload(
     units: Any = None,
     service_declaration: Any = None,
 ) -> dict[str, object]:
-    environment = _fallback_environment(instance)
     current_artifact = artifact_identity()
     operator_cli = cli_runtime_observation(
         instance=instance,
@@ -366,52 +391,78 @@ def _loaded_runtime_payload(
     )
     manager_artifact = declarations["manager"].get("artifact")
     monitor_artifact = declarations["monitor"].get("artifact")
-    try:
-        manager_root = resolve_runtime_root(
-            "PSC_COORDINATOR_ROOT", environment=environment
+    manager_environment, manager_environment_source = _service_declared_environment(
+        instance, declarations.get("manager")
+    )
+    monitor_environment, monitor_environment_source = _service_declared_environment(
+        instance, declarations.get("monitor")
+    )
+
+    if manager_environment_source == "unknown":
+        manager_report = _unknown_runtime_report(
+            "service-environment-unknown", current_artifact
         )
-        monitor_root = resolve_runtime_root(
-            "PSC_MONITOR_STATE_ROOT", environment=environment
+    else:
+        try:
+            manager_root = resolve_runtime_root(
+                "PSC_COORDINATOR_ROOT", environment=manager_environment
+            )
+            manager_report = runtime_status_report(
+                manager_root,
+                service="manager",
+                instance=instance,
+                declared_config_revision=manager_environment_revision(
+                    manager_environment
+                ),
+                declared_config_component="environment_revision",
+                declared_invocation_revision=None,
+                expected_pid=manager_pid,
+                require_process_match=True,
+                current_artifact=(
+                    manager_artifact if isinstance(manager_artifact, dict) else None
+                ),
+            )
+        except Exception:  # noqa: BLE001 — 無效宣告時維持 unknown。
+            manager_report = _unknown_runtime_report(
+                "runtime-declaration-unavailable", current_artifact
+            )
+
+    if monitor_environment_source == "unknown":
+        monitor_report = _unknown_runtime_report(
+            "service-environment-unknown", current_artifact
         )
-        manager_report = runtime_status_report(
-            manager_root,
-            service="manager",
-            instance=instance,
-            declared_config_revision=manager_environment_revision(environment),
-            declared_config_component="environment_revision",
-            declared_invocation_revision=None,
-            expected_pid=manager_pid,
-            require_process_match=True,
-            current_artifact=(
-                manager_artifact if isinstance(manager_artifact, dict) else None
-            ),
-        )
-        monitor_report = runtime_status_report(
-            monitor_root,
-            service="monitor",
-            instance=instance,
-            declared_config_revision=monitor_configuration_revision_from_environment(
-                environment
-            ),
-            expected_pid=monitor_pid,
-            require_process_match=True,
-            current_artifact=(
-                monitor_artifact if isinstance(monitor_artifact, dict) else None
-            ),
-        )
-    except Exception:  # noqa: BLE001 — 無效宣告時維持 unknown。
-        unknown = _unknown_runtime_report("runtime-declaration-unavailable", current_artifact)
-        return {
-            "operator_cli": operator_cli,
-            "service_declaration": declarations,
-            "manager": unknown,
-            "monitor": unknown,
-        }
+    else:
+        try:
+            monitor_root = resolve_runtime_root(
+                "PSC_MONITOR_STATE_ROOT", environment=monitor_environment
+            )
+            monitor_report = runtime_status_report(
+                monitor_root,
+                service="monitor",
+                instance=instance,
+                declared_config_revision=monitor_configuration_revision_from_environment(
+                    monitor_environment
+                ),
+                expected_pid=monitor_pid,
+                require_process_match=True,
+                current_artifact=(
+                    monitor_artifact if isinstance(monitor_artifact, dict) else None
+                ),
+            )
+        except Exception:  # noqa: BLE001 — 無效宣告時維持 unknown。
+            monitor_report = _unknown_runtime_report(
+                "runtime-declaration-unavailable", current_artifact
+            )
+
     return {
         "operator_cli": operator_cli,
         "service_declaration": declarations,
         "manager": manager_report,
         "monitor": monitor_report,
+        "environment_source": {
+            "manager": manager_environment_source,
+            "monitor": monitor_environment_source,
+        },
     }
 
 

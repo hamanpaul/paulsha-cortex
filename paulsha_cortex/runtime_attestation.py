@@ -509,10 +509,24 @@ def _effective_pythonpath(
 
 
 def _pythonpath_artifact(pythonpath: str) -> dict[str, object]:
-    package_parent = pythonpath.split(os.pathsep, 1)[0]
-    if not package_parent or not Path(package_parent).is_absolute():
-        return _safe_artifact({})
-    return artifact_identity_from_package_root(Path(package_parent) / "paulsha_cortex")
+    """依 Python 實際匯入順序（依序走訪 PYTHONPATH 各路徑段）找出第一個提供
+    ``paulsha_cortex`` 套件的位置；只看第一段會在套件其實裝在後面段落時誤判
+    unknown。第一個命中的段落若是 symlink 或非目錄，視為不安全，直接回傳
+    unknown，不再往後找（避免攻擊者用假的第一段掩蓋真正被載入的位置）。"""
+    for segment in pythonpath.split(os.pathsep):
+        if not segment or not Path(segment).is_absolute():
+            continue
+        candidate = Path(segment) / "paulsha_cortex"
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return _safe_artifact({})
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return _safe_artifact({})
+        return artifact_identity_from_package_root(candidate)
+    return _safe_artifact({})
 
 
 def _is_python_executable(value: str) -> bool:
@@ -620,7 +634,12 @@ def _declared_service_artifact(
 def service_declaration_projection(
     units: object, *, instance: str
 ) -> dict[str, dict[str, object]]:
-    """投影 service 宣告欄位，不回傳環境值或檔案內容。"""
+    """投影 service 宣告欄位，不回傳環境值或檔案內容。
+
+    附帶回傳每個 service 目前的有效環境（僅 ``PSC_*``／``PAULSHACLAW_*``、已剔除機敏
+    欄位的安全投影）與其來源標示（``environment_source``），讓 service status／
+    doctor 可以共用同一份「systemctl show 有效值優先於 fallback 讀檔」判定，
+    不必各自重新解析 unit 檔或 EnvironmentFile。"""
 
     rows = units if isinstance(units, Mapping) else {}
     result: dict[str, dict[str, object]] = {}
@@ -636,6 +655,8 @@ def service_declaration_projection(
                 "disk_unit_sha256": None,
                 "artifact": _safe_artifact({}),
                 "stale": None,
+                "environment_source": "unavailable",
+                "environment": {},
             }
             continue
         exec_path = row.get("exec_path")
@@ -644,7 +665,13 @@ def service_declaration_projection(
         environment: dict[str, str] | None = None
         from_files: dict[str, str] | None = None
         declaration_known = True
+        # 環境來源判定與 artifact 判定分開計算：exec artifact 需要能雜湊 unit/
+        # drop-in 檔案內容才算「known」，但有效環境只要 Environment=／
+        # EnvironmentFiles= 能安全解析即可信任，不需要連帶依賴 unit 檔雜湊成功。
+        environment_source = "unavailable"
+        effective_environment: dict[str, str] = {}
         if isinstance(properties, Mapping):
+            environment_source = "unknown"
             required_properties = {
                 "ExecStart",
                 "Environment",
@@ -668,11 +695,30 @@ def service_declaration_projection(
                     declaration_known = False
                 else:
                     environment, from_files = environment_sources
+                    # 優先序：ExecStart 的 `/usr/bin/env KEY=VALUE` 前綴 ＞
+                    # Environment= ＞ EnvironmentFiles=；drop-in 覆寫的值已經
+                    # 反映在 systemctl show 的有效屬性裡，不需要另外重讀 unit 檔。
+                    env_assignments: dict[str, str] = {}
+                    if effective_argv:
+                        env_assignments, _index = _env_command_assignments(
+                            effective_argv
+                        )
+                    merged_environment = {
+                        **from_files,
+                        **environment,
+                        **env_assignments,
+                    }
+                    environment_source = "systemd-effective"
+                    effective_environment = safe_environment_projection(
+                        merged_environment
+                    )
                 declaration_known = declaration_known and unit_files is not None
                 declaration_known = declaration_known and effective_argv is not None
         elif row.get("_systemd_unavailable") is True:
             # Without systemd's effective property set, the probe cannot prove that its
             # file-only view covers every configured unit/drop-in search directory.
+            # 環境同理：無法確認是否有 drop-in 覆寫，呼叫端應改用既有 direct-mode
+            # fallback（environment_source 維持預設的 "unavailable"）。
             declaration_known = False
             unit_files = None
             effective_argv = None
@@ -712,6 +758,8 @@ def service_declaration_projection(
                 else _safe_artifact({})
             ),
             "stale": row.get("stale") if type(row.get("stale")) is bool else None,
+            "environment_source": environment_source,
+            "environment": effective_environment,
         }
     return result
 

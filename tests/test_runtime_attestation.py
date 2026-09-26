@@ -597,6 +597,42 @@ def test_systemd_environment_pythonpath_locates_the_declared_artifact(
     assert str(pin_site) not in json.dumps(projected)
 
 
+def test_multi_segment_pythonpath_locates_artifact_by_python_import_order(
+    tmp_path: Path,
+) -> None:
+    """#841 對抗審查：``_pythonpath_artifact`` 只看 PYTHONPATH 第一段時，若
+    ``paulsha_cortex`` 其實裝在第二段（例如 ``PYTHONPATH=/opt/helpers:/srv/pin``），
+    會誤判成 unknown。修法後應依 Python 實際匯入順序，找第一個真正提供該套件
+    的路徑段。"""
+    unrelated = tmp_path / "unrelated-helpers"
+    unrelated.mkdir()
+    pin_site = tmp_path / "environment-pin"
+    pin_root = _write_fake_install(pin_site, "environment-pin")
+    units = _service_units_with_dropins(
+        tmp_path,
+        manager_main="/usr/bin/true",
+        monitor_main="/usr/bin/python3 -m paulsha_cortex.monitor",
+    )
+    units["test-monitor.service"]["systemd"] = {
+        "ExecStart": (
+            "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -m "
+            "paulsha_cortex.monitor ; ignore_errors=no }"
+        ),
+        "Environment": f"PYTHONPATH={unrelated}{os.pathsep}{pin_site}",
+        "EnvironmentFiles": "",
+        "DropInPaths": "",
+        "FragmentPath": units["test-monitor.service"]["path"],
+        "WorkingDirectory": "/",
+    }
+
+    projected = service_declaration_projection(units, instance="test")
+
+    assert projected["monitor"]["artifact"]["sha256"] == (
+        artifact_identity_from_package_root(pin_root)["sha256"]
+    )
+    assert projected["monitor"]["artifact"]["kind"] == "installed-wheel"
+
+
 def test_unparseable_environment_file_makes_declared_artifact_unknown(
     tmp_path: Path,
 ) -> None:

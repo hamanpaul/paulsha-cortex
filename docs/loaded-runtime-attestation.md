@@ -18,13 +18,15 @@ cortex doctor --instance cortex --json
 `loaded_runtime` 把三種觀測分開：
 
 - `operator_cli`：目前這次 CLI 的 package/source digest、instance、安全環境 revision、PID 與觀測時間。從 checkout 執行時會標 `source-override`，不會偽裝成已安裝 wheel。
-- `service_declaration`：磁碟 unit 的狀態、PID、有效 ExecStart path digest、unit file digest，以及可由 unit 宣告定位到的 Manager／Monitor 套件 artifact；不輸出 unit 內容或環境值。
+- `service_declaration`：磁碟 unit 的狀態、PID、有效 ExecStart path digest、unit file digest，可由 unit 宣告定位到的 Manager／Monitor 套件 artifact，以及該 service 目前有效環境的安全投影（僅 `PSC_*`／`PAULSHACLAW_*`，已剔除機敏欄位）與其來源標示 `environment_source`；不輸出 unit 內容或其他環境值。
 
 probe 以 `systemctl --user show` 取得 systemd 已合併的 `ExecStart`、`Environment`、`EnvironmentFiles`、`DropInPaths`、`FragmentPath` 與 `WorkingDirectory`；不自行重建 systemd 的 drop-in 搜尋與合併規則。`disk_unit_sha256` 讀取 systemd 回報的 fragment 與完整 drop-in 清單，以檔名和內容摘要計算。任何列出的檔案不可安全讀取、是 symlink、超過大小上限，或屬性集合不完整時，artifact 維持 `unknown`，不退回主 unit。systemctl 不可用且無法證明檔案退路涵蓋完整 unit 搜尋路徑時也維持 `unknown`。
 
-最後必須恰有一個有效 `ExecStart` 才能辨識 artifact。Python module 的 `PYTHONPATH` 依有效來源定位套件：`/usr/bin/env KEY=VALUE` 前綴優先於 `Environment=`；`EnvironmentFiles` 會在安全讀取並解析後納入比對，無法解析、讀取失敗或與其他來源的 `PYTHONPATH` 衝突時一律 unknown。沒有 `PYTHONPATH` 時以有效 `WorkingDirectory` 檢查是否有遮蔽套件，再依 Python executable 的 prefix 定位。環境值與檔案內容只在記憶體內解析，不會輸出或寫入摘要。
+最後必須恰有一個有效 `ExecStart` 才能辨識 artifact。Python module 的 `PYTHONPATH` 依有效來源定位套件：`/usr/bin/env KEY=VALUE` 前綴優先於 `Environment=`；`EnvironmentFiles` 會在安全讀取並解析後納入比對，無法解析、讀取失敗或與其他來源的 `PYTHONPATH` 衝突時一律 unknown。`PYTHONPATH` 本身可能有多段（如 `/opt/helpers:/srv/pin`）：判定依 Python 實際匯入順序逐段搜尋，取第一個真正提供 `paulsha_cortex` 套件的段落，不是只看第一段；命中的段落若是 symlink 或非目錄視為不安全，直接回 unknown，不再往後找。沒有 `PYTHONPATH` 時以有效 `WorkingDirectory` 檢查是否有遮蔽套件，再依 Python executable 的 prefix 定位。環境值與檔案內容只在記憶體內解析，不會輸出或寫入摘要。
 
-Manager 的 `service-manager.sh` 與直接宣告 `<python> -m paulsha_cortex.monitor` 維持可辨識。service status 與 doctor 共用同一份安全投影，避免再次從主 unit 推算。輸出僅包含摘要與 artifact 欄位，不包含環境值或 EnvironmentFile 內容。
+Manager 的 `service-manager.sh` 與直接宣告 `<python> -m paulsha_cortex.monitor` 維持可辨識。service status 與 doctor 共用同一份安全投影（`service_declaration_projection`），避免再次從主 unit 推算。輸出僅包含摘要與 artifact 欄位，不包含環境值或 EnvironmentFile 內容。
+
+`PSC_COORDINATOR_ROOT`／`PSC_MONITOR_STATE_ROOT` 與 config revision 的判定同樣以這份有效宣告為準，不再固定讀 `~/.agents/core/runtime/*.env`：`environment_source` 為 `systemd-effective` 時，採用 probe 取得的有效環境（優先序 env 前綴 ＞ `Environment=` ＞ `EnvironmentFiles=`；任一來源無法安全解析時該 service 標 `unknown`，不靜默退回舊值）；只有 `environment_source` 為 `unavailable`（systemd 本身不可用的 direct 模式）才退回既有的 fallback 讀檔，並在輸出以 `unavailable`／`direct-fallback` 標示來源。drop-in 改了 root 或 config 時，`cortex service status` 與 `cortex doctor` 都會照新值判定，不會因為讀到舊 fallback 檔而對錯 state root 或誤報 config drift／match。
 - `manager`／`monitor`：各 service 啟動 receipt、由 service declaration 定位的安裝 artifact、effective config 比對、目前 unit PID 比對，以及前次 process start 與 Trust Root receipt 摘要。
 
 `match` 要求 receipt 存在、目前 unit PID 與 receipt 相同，且 service 宣告 artifact/config 可比較。套件或 Monitor 有效配置與 receipt 不同時為 `drift`。Manager invocation 參數不能由目前 service declaration 確認時，該配置維持 unknown。checkout source override、缺漏／損壞 receipt、未知 schema、instance-root mismatch、缺少目前 PID 或未知 revision 都不會升成 match。status 命令本身只是唯讀 consumer，不會用磁碟 `VERSION` 重寫 loaded identity。
