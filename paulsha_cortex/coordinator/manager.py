@@ -11572,6 +11572,77 @@ def _verification_gate_ledger_context(
     }
 
 
+def record_task_memory_receipt(
+    registry,
+    receipt: Mapping[str, object],
+    *,
+    coordinator_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """由 Manager 寫入綁定 attempt 的 task-memory receipt sidecar。
+
+    worker 不可直接 append sidecar 或 Hippo ledger。receipt 必須先符合已持久化
+    WorkflowRun 與 Job routing identity，才會交給 append-only store。
+    """
+
+    from .task_memory import TaskMemoryReceiptStore, _validate_event, _verify_applied_artifact
+
+    event = _validate_event(receipt)
+    run = registry.get_workflow_run(event["workflow_run_id"])
+    if run.repo != event["repo"] or run.work_id != event["work_id"]:
+        raise ValueError("task memory receipt does not match WorkflowRun authority")
+    matching = [
+        job
+        for job in registry.list_jobs()
+        if job.get("job_id") == event["job_id"]
+        and job.get("workflow_run_id") == event["workflow_run_id"]
+    ]
+    if len(matching) != 1:
+        raise ValueError("task memory receipt does not match a unique registered Job")
+    job = matching[0]
+    expected_session_id = job.get("session_id")
+    expected_session_proxy = None if expected_session_id else f"job:{job.get('job_id')}"
+    if (
+        job.get("workflow_card") != event["card"]
+        or job.get("workflow_phase") != event["task_kind"]
+        or job.get("executor") != event["executor"]
+        or job.get("model_id") != event.get("model_id")
+        or (job.get("tool") or job.get("executor")) != event["tool"]
+        or expected_session_id != event.get("session_id")
+        or expected_session_proxy != event.get("session_proxy")
+        or event["attempt_id"] != job.get("job_id")
+    ):
+        raise ValueError("task memory receipt routing identity mismatch")
+    root = Path(coordinator_root) if coordinator_root is not None else paths.coordinator_root()
+    store = TaskMemoryReceiptStore(root)
+    prior = store.events_for_run(event["repo"], event["work_id"], event["workflow_run_id"])
+    if any(item["event_id"] == event["event_id"] for item in prior):
+        return store.append(event)
+    if event["event"] == "applied-with-evidence":
+        _verify_applied_artifact(job.get("worktree"), event["evidence"])
+    matching_prior = [
+        item
+        for item in prior
+        if item["task_id"] == event["task_id"]
+        and item["attempt_id"] == event["attempt_id"]
+        and item.get("note_id") == event.get("note_id")
+        and item.get("content_hash") == event.get("content_hash")
+    ]
+    prior_names = {item["event"] for item in matching_prior}
+    required_prior = {
+        "offer-emitted": {"candidate-selected"},
+        "snapshot-ready": {"offer-emitted"},
+        "read-attempted": {"offer-emitted"},
+        "content-returned": {"read-attempted"},
+        "context-delivered": {"offer-emitted"},
+        "applied-with-evidence": {"content-returned", "context-delivered"},
+    }.get(event["event"])
+    if required_prior is not None and not prior_names.intersection(required_prior):
+        raise ValueError(
+            f"task memory {event['event']} receipt has no matching prior delivery evidence"
+        )
+    return store.append(event)
+
+
 def _workflow_job_prompt(
     run,
     step,

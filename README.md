@@ -405,7 +405,10 @@ Project Monitor 不會代替 coordinator 狀態：前者提供 `topic`／`todo`�
 ```bash
 cortex list --repo hamanpaul/paulsha-cortex --state on-going --explain
 cortex work show unified-work-lifecycle --repo hamanpaul/paulsha-cortex --json
+cortex work show task-memory-delivery-adapter --repo owner/repo --task-memory --json
 ```
+
+`--task-memory` 以 `cortex/task-memory-read-model/v1` 回查 Work Item、WorkflowRun、Job routing、planning revisions、receipt sidecar 與 test/review gate evidence；它只讀取既有紀錄，不會啟動 memory retrieval。未帶旗標時仍輸出 `cortex-work/v1`。adapter/provider 缺席、schema major 不支援或 scope/manifest 不符時會留下 bounded failure 並 fail closed；Cortex 不讀取全域 memory root，也不寫 Hippo strict ledger。正式執行的 provider 與 installed/live canary 尚需外部驗收。
 
 Monitor 只允許 override、frontmatter、GitHub closing reference 與通過typed refs驗證的workflow metadata提供 confirmed association；override exclusion 優先抑制所有同work的 confirmed edge。PR body、issue title、artifact／branch slug 等 fuzzy 訊號只顯示。未被 confirmed mapping 擁有的 archived OpenSpec 與 closed GitHub issue／PR 只提供終態證據，不會單獨建立 work item。`done` 的 Todo 證據只採遠端 default branch blob與 archived OpenSpec task checklist revision，不採本機 overlay；Monitor 仍要求可驗證的遠端 Todo evidence，但 workstream Todo 未勾 checkbox 只供診斷，不阻擋有效 CompletionRecord 的 `done`；archived OpenSpec tasks 的完成要求維持不變；所有 mapped PR 都必須是至少雙 parent且可證明已進 default branch 的 merge commit，且 CompletionRecord 保存的 source revisions、PR candidate與merge revision必須逐一符合目前remote truth；所有 mapped OpenSpec refs 也必須完成 archive。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state並加上 degraded facet；`cortex-work/v1.hard_gates`只依查詢中的repo/work item authority關閉auto claim與merge，跨repo整體狀態另由`fleet_health`回報。
 
