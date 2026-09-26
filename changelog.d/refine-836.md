@@ -23,3 +23,10 @@ scope/window、measurement 與 observation 時間推導 identity；相同 identi
 修正 shadow projection：remaining snapshot 的 window epoch 未知時，後續同 unit usage
 不再與 snapshot 合成確定餘額；projection 回報 unknown 並附 `window-epoch-unknown` gap。
 已知且相符的 window epoch 仍可扣算 usage。
+
+修正終局 usage 跨越 snapshot 時的重複扣減：ledger 新增 `terminal_job_started_at_ms`，
+隨終局 usage observation 一併記入且納入 payload digest；shadow projection 只在
+job 已知開始時間不早於該 snapshot 的 observed_at 時，才視為整筆消耗都落在
+snapshot 之後、可安全整筆扣減。已知開始時間早於 snapshot（跨越 snapshot）時不再
+整筆扣除，projection 回報 unknown 並附 `straddling-usage` gap；schema 目前尚未支援
+可切分的增量事件，故此情形無法精確扣減，僅能保守標示 unknown。

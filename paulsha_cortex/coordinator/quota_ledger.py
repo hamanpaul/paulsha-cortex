@@ -19,6 +19,8 @@ _MAX_LEDGER_BYTES = 32 * 1024 * 1024
 _MAX_LEDGER_EVENTS = 100_000
 _MAX_IDEMPOTENCY_CHARS = 512
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_TIMESTAMP_MS = 253402300799999
+_TERMINAL_USAGE_SOURCE_SCHEMA = "cortex-terminal-usage-v1"
 
 
 class LedgerCorrupt(ValueError):
@@ -60,15 +62,16 @@ class QuotaEventLedger:
         *,
         idempotency_key: str | None = None,
         associations: tuple[dict[str, Any], ...] = (),
+        terminal_job_started_at_ms: int | None = None,
     ) -> LedgerAppendResult:
         if not isinstance(observation, schema.QuotaObservation):
             raise TypeError("observation must be parser-sealed")
         wire = observation.to_dict()
         normalized_associations = _validate_associations(associations)
+        terminal_metadata = _terminal_usage_metadata(wire, terminal_job_started_at_ms)
         key = _idempotency_key(observation, wire, idempotency_key)
-        payload_bytes = (
-            _canonical_bytes({"observation": wire, "associations": normalized_associations})
-            if normalized_associations else _canonical_bytes(wire)
+        payload_bytes = _canonical_bytes(
+            _observation_digest_payload(wire, normalized_associations, terminal_metadata)
         )
         digest = hashlib.sha256(payload_bytes).hexdigest()
         entry = {
@@ -78,6 +81,7 @@ class QuotaEventLedger:
             "payload_sha256": digest,
             "observation": wire,
         }
+        entry.update(terminal_metadata)
         if normalized_associations:
             entry["associations"] = normalized_associations
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -181,8 +185,10 @@ class QuotaEventLedger:
                     or row.get("schema_version") != 1):
                 raise LedgerCorrupt("ledger-unknown-record-version")
             if row.get("kind") == "observation":
-                allowed = {"schema_version", "kind", "idempotency_key", "payload_sha256", "observation", "associations"}
-                if (set(row) not in (allowed, allowed - {"associations"})
+                required = {"schema_version", "kind", "idempotency_key", "payload_sha256", "observation"}
+                optional = {"associations", "terminal_job_started_at_ms"}
+                if (not required.issubset(row)
+                        or not set(row).issubset(required | optional)
                         or not isinstance(row.get("idempotency_key"), str)
                         or not row["idempotency_key"]
                         or len(row["idempotency_key"]) > _MAX_IDEMPOTENCY_CHARS + len("caller:")
@@ -192,9 +198,18 @@ class QuotaEventLedger:
                     raise LedgerCorrupt("ledger-invalid-observation-record")
                 has_associations = "associations" in row
                 associations = _validate_associations(tuple(row.get("associations", [])))
-                digest_payload = (
-                    {"observation": row["observation"], "associations": associations}
-                    if has_associations else row["observation"]
+                terminal_metadata = {}
+                if "terminal_job_started_at_ms" in row:
+                    try:
+                        if not _is_terminal_usage_observation(row["observation"]):
+                            raise ValueError("terminal start time on non-terminal usage")
+                        terminal_metadata = _terminal_usage_metadata(
+                            row["observation"], row["terminal_job_started_at_ms"]
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise LedgerCorrupt("ledger-invalid-terminal-job-start-time") from exc
+                digest_payload = _observation_digest_payload(
+                    row["observation"], associations if has_associations else (), terminal_metadata
                 )
                 digest = hashlib.sha256(_canonical_bytes(digest_payload)).hexdigest()
                 if digest != row["payload_sha256"]:
@@ -277,6 +292,38 @@ def _idempotency_key(observation, wire, caller_key):
         "source_id": observation.source_id,
         "observation_id": observation.observation_id,
     })).hexdigest()
+
+
+def _is_terminal_usage_observation(wire):
+    source = wire.get("source", {}) if isinstance(wire, dict) else {}
+    return (
+        isinstance(source, dict)
+        and source.get("source_schema") == _TERMINAL_USAGE_SOURCE_SCHEMA
+        and source.get("method") == "executor_usage"
+    )
+
+
+def _terminal_usage_metadata(wire, started_at_ms):
+    if not _is_terminal_usage_observation(wire):
+        if started_at_ms is not None:
+            raise ValueError("terminal job start time requires terminal usage observation")
+        return {}
+    if (started_at_ms is not None
+            and (type(started_at_ms) is not int or started_at_ms < 0
+                 or started_at_ms > _MAX_TIMESTAMP_MS)):
+        raise ValueError("invalid terminal job start time")
+    return {"terminal_job_started_at_ms": started_at_ms}
+
+
+def _observation_digest_payload(wire, associations, terminal_metadata):
+    if associations:
+        payload = {"observation": wire, "associations": associations}
+    else:
+        payload = wire
+    if terminal_metadata:
+        payload = dict(payload)
+        payload.update(terminal_metadata)
+    return payload
 
 
 def _scope_summary(wire):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from importlib import import_module
 import json
 from pathlib import Path
@@ -210,6 +211,11 @@ def _pool_row(report, pool_id: str, window_id: str):
         row for row in report["pools"]
         if row["pool_ref"]["pool_id"] == pool_id and row["window_id"] == window_id
     )
+
+
+def _iso_utc_ms(value: int) -> str:
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (epoch + timedelta(milliseconds=value)).isoformat()
 
 
 def test_ac2_codex_app_server_v2_camel_case_fields_are_observed():
@@ -420,6 +426,41 @@ def test_ac5_known_snapshot_epoch_still_projects_matching_usage():
     row = _pool_row(report, "pool-shared", "short")
     assert row["remaining"]["state"] == "observed"
     assert row["remaining"]["amount"] == {"kind": "exact", "value": "18"}
+
+
+def test_ac5_terminal_job_straddling_snapshot_is_not_deducted_as_a_whole():
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+    snapshot = _observation(
+        descriptor, "short", value="20", observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 300_000,
+    )
+    assert service.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+    assert service.record_terminal_usage(
+        {
+            "id": "job-straddles-snapshot",
+            "executor": "codex",
+            "started_at": _iso_utc_ms(_NOW - 1),
+            "usage": {"input_tokens": 3},
+        },
+        profile_key=_PROFILE_A,
+        binding=binding,
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 10,
+    ).accepted == 1
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 20
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "unknown"
+    assert "straddling-usage" in row["coverage_gaps"]
 
 
 def test_ac1_multimodel_shared_pool_independent_pool_and_all_windows_are_separate():

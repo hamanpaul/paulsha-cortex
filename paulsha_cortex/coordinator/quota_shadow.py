@@ -10,8 +10,10 @@ import re
 from typing import Any
 
 from . import quota_observation as schema
-from .quota_ledger import LedgerAppendResult, LedgerCorrupt, QuotaEventLedger
-from .quota_sources import CoverageGap, ProviderCapture, ProviderQuotaTarget, capture_provider_quota
+from .quota_ledger import LedgerAppendResult, LedgerCorrupt, QuotaEventLedger, _is_terminal_usage_observation
+from .quota_sources import (
+    CoverageGap, ProviderCapture, ProviderQuotaTarget, capture_provider_quota, _parse_iso_epoch_ms,
+)
 
 
 _PROFILE_KEY_RE = re.compile(r"epk:v1:resolved:[0-9a-f]{64}\Z")
@@ -34,14 +36,20 @@ class _MemoryLedger:
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
 
-    def append_observation(self, observation, *, idempotency_key=None, associations=()):
-        from .quota_ledger import _canonical_bytes, _idempotency_key as make_key
+    def append_observation(self, observation, *, idempotency_key=None, associations=(),
+                            terminal_job_started_at_ms=None):
+        from .quota_ledger import (
+            _canonical_bytes, _idempotency_key as make_key,
+            _observation_digest_payload, _terminal_usage_metadata,
+        )
 
         wire = observation.to_dict()
         key = "caller:" + idempotency_key if idempotency_key else make_key(observation, wire, None)
         normalized = list(associations)
-        digest_payload = ({"observation": wire, "associations": normalized}
-                          if normalized else wire)
+        # 與持久化 ledger 對齊：終局 usage 的開始時間一併納入 digest，
+        # 避免記憶體版 ledger 在測試中漏掉 straddling 判定所需的來源資料。
+        terminal_metadata = _terminal_usage_metadata(wire, terminal_job_started_at_ms)
+        digest_payload = _observation_digest_payload(wire, normalized, terminal_metadata)
         digest = hashlib.sha256(_canonical_bytes(digest_payload)).hexdigest()
         prior = next((row for row in self.events if row.get("idempotency_key") == key
                       and row.get("kind") == "observation"), None)
@@ -61,6 +69,7 @@ class _MemoryLedger:
             return LedgerAppendResult("conflict", conflicts=1, idempotency_key=key)
         row = {"schema_version": 1, "kind": "observation", "idempotency_key": key,
                "payload_sha256": digest, "observation": wire}
+        row.update(terminal_metadata)
         if normalized:
             row["associations"] = normalized
         self.events.append(row)
@@ -198,6 +207,11 @@ class QuotaShadowService:
         if not constraints:
             return ShadowRecordResult("unknown", gaps=(CoverageGap("terminal-usage", "binding-scope-unresolved"),))
 
+        # job 開始時間隨終局 usage 一併存進 ledger：投影階段要靠它判定這筆 usage
+        # 是否整段落在 snapshot 之後，才可安全整筆扣減；解析不出時視為未知，
+        # 不得因此擋下這筆終局 usage 的記錄（仍先接受，投影時保守處理）。
+        terminal_job_started_at_ms = _parse_iso_epoch_ms(job.get("started_at"))
+
         accepted = duplicates = conflicts = 0
         unit_map: dict[tuple[str, str], schema.UnitDefinition] = {}
         for descriptor in descriptors:
@@ -263,6 +277,7 @@ class QuotaShadowService:
                     observation,
                     idempotency_key=key,
                     associations=tuple(pool_scope) if target is None else (),
+                    terminal_job_started_at_ms=terminal_job_started_at_ms,
                 )
                 accepted += result.accepted
                 duplicates += result.duplicates
@@ -493,6 +508,18 @@ class QuotaShadowService:
             if measured_at > now_utc_ms:
                 invalidated = "clock-rollback"
                 continue
+            if _is_terminal_usage_observation(wire):
+                # 終局 usage 是整段 job 的累計量：只有已知 job 開始時間不早於
+                # 這張 snapshot 的 observed_at，才有證據證明整筆消耗都落在
+                # snapshot 之後、可以安全整筆扣減。已知開始時間早於 snapshot
+                # （跨越 snapshot）沒有可切分的增量證據，一律視為無法切分，
+                # 不整筆扣除也不忽略。開始時間未知的 job 同樣無法切分；由於
+                # 終局 usage 目前一律沒有可比對的 window_instance，仍會被下方
+                # window/epoch 檢查判定為 unknown，不會被誤判為可扣減。
+                started_at = record.get("terminal_job_started_at_ms") if isinstance(record, dict) else None
+                if type(baseline) is int and type(started_at) is int and started_at < baseline:
+                    invalidated = "straddling-usage"
+                    continue
             measurement = wire.get("measurement", {})
             if not isinstance(measurement, dict) or measurement.get("kind") != "usage_delta":
                 continue
