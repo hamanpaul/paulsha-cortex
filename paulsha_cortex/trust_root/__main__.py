@@ -13,10 +13,9 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                         [--external-reader-account <帳號名|none>]
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
     python -m paulsha_cortex.trust_root unit [four-way|three-way|two-way]
-                                        [--manager|--monitor|--egress-proxy
-                                         |--job|--review-job|--gate-job
-                                         |--job-properties]
-                                        [--profile strict|jit]
+                                        [--manager|--monitor|--egress-proxy|--job
+                                         |--review-job|--gate-job|--job-properties]
+                                        [--workspace-read-only] [--profile strict|jit]
                                                     # Phase 2b systemd unit 內容
                                                     # （--monitor＝monitor 的 system-level
                                                     #   unit：與 manager 同帳號、同加固段，
@@ -380,6 +379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         which = "manager"
         profile_id = permgen.DEFAULT_HARDENING_PROFILE.profile_id
         expect_profile = False
+        workspace_read_only = False
         for token in rest:
             if expect_profile:
                 if token not in permgen.HARDENING_PROFILES_BY_ID:
@@ -399,6 +399,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 which = "egress-proxy"
             elif token == "--job":
                 which = "job"
+            elif token == "--workspace-read-only":
+                workspace_read_only = True
             elif token == "--review-job":
                 which = "review-job"
             elif token == "--gate-job":
@@ -427,6 +429,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         scheme = permgen.SCHEMES[scheme_id]
         profile = permgen.HARDENING_PROFILES_BY_ID[profile_id]
+        if workspace_read_only and which != "job":
+            print("--workspace-read-only 只適用於 builder 的 --job", file=sys.stderr)
+            return 2
         if which == "job-properties":
             print("# 方案 A（systemd-run transient unit）的 --property= 建議清單。")
             print("# 與方案 B 的模板 unit 同源（同一加固表 ＋ 同一份登記表導出的 RWP）。")
@@ -437,7 +442,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(prop)
             return 0
         if which == "job":
-            print(permgen.build_job_unit(scheme, profile=profile).content, end="")
+            print(
+                permgen.build_job_unit(
+                    scheme,
+                    profile=profile,
+                    workspace_read_only=workspace_read_only,
+                ).content,
+                end="",
+            )
             return 0
         if which in ("review-job", "gate-job"):
             # #615 M2：reviewer＋planner 的模板（同一份，兩者同帳號）。

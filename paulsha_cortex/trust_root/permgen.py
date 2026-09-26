@@ -6604,6 +6604,8 @@ def job_unit_stem(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     principal: Principal = Principal.BUILDER,
     profile: HardeningProfile = DEFAULT_HARDENING_PROFILE,
+    *,
+    workspace_read_only: bool = False,
 ) -> str:
     """降權 job 模板 unit 的字幹（不含 `@.service`）。
 
@@ -6612,8 +6614,9 @@ def job_unit_stem(
     `Environment=HOME=`／`XDG_CACHE_HOME=`、`ReadWritePaths=` 全部跟著 scheme 導出，
     `build_job_unit()`／`build_polkit_rule()`／`build_job_shim()` 三支產生器**一行
     都沒有改**（M2 只改了「預設涵蓋哪些 principal」與 RWP 的除役集合）。
-    builder 的字幹維持 `cortex-job`（與 `coordinator/job_runner` 的
-    `TEMPLATE_UNIT_PREFIX` ＋ polkit pattern 成對契約），逐字不變。
+    builder 的一般可寫字幹維持 `cortex-job`（與 `coordinator/job_runner` 的
+    `TEMPLATE_UNIT_PREFIX` ＋ polkit pattern 成對契約），逐字不變。明確禁止工作區寫入的
+    builder 卡另用 `workspace_read_only=True` 得到 `cortex-job-ro`，不能共用可寫模板。
 
     `profile` 是 **#643 的第二個擴充點**：加固剖面不同 ⇒ 必須是不同的 unit 檔
     （加固指令寫在檔案裡，一個模板只有一份），因此字幹尾端掛剖面後綴。嚴格剖面的
@@ -6623,8 +6626,11 @@ def job_unit_stem(
     （`User=cortex-gate`）。產生器同樣一行都沒有改。
     """
     layout = layout if layout is not None else DEFAULT_LAYOUT
+    if workspace_read_only and principal is not Principal.BUILDER:
+        raise ValueError("workspace-read-only job template is only defined for builder")
     if principal is Principal.BUILDER:
-        return f"{layout.instance}-job{profile.unit_suffix}"
+        readonly_suffix = "-ro" if workspace_read_only else ""
+        return f"{layout.instance}-job{readonly_suffix}{profile.unit_suffix}"
     return f"{layout.instance}-{principal.value}-job{profile.unit_suffix}"
 
 
@@ -6641,7 +6647,8 @@ class SystemdUnit:
     content: str
     #: 生效的加固剖面 id（#643）。Manager／monitor unit 恆為 `strict`。
     hardening_profile: str = DEFAULT_HARDENING_PROFILE.profile_id
-    #: 巢狀在 `read_write_paths` 之內、被重新收回唯讀的路徑（#698 的 enforcement 檔）。
+    #: `ReadOnlyPaths` 明確掛載唯讀的路徑，包含 `ReadWritePaths` 內的 enforcement
+    #: 檔，也包含 readonly builder template 的 worktree／來源 repo 覆蓋。
     read_only_paths: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
@@ -6715,6 +6722,7 @@ def _hardening_lines(
 def _rwp_lines(
     owners: Mapping[str, tuple[str, ...]],
     read_only: tuple[str, ...] = (),
+    workspace_read_only: tuple[str, ...] = (),
 ) -> list[str]:
     lines = [
         "# --- ReadWritePaths：由 R1 登記表機械導出（permgen），勿手擴 ---",
@@ -6735,6 +6743,14 @@ def _rwp_lines(
             "# 而一個植得進 hooks 的 job 不該起得來（與上方 RWP 的 fail-closed 立場一致）。",
         ]
         for path in read_only:
+            lines.append(f"ReadOnlyPaths={path}")
+    if workspace_read_only:
+        lines += [
+            "",
+            "# --- ReadOnlyPaths：唯讀卡的 worktree 與 repo-source clone ---",
+            "# 這些路徑刻意不在任何 ReadWritePaths；即使 builder 的 ACL 可寫，mount 仍唯讀。",
+        ]
+        for path in workspace_read_only:
             lines.append(f"ReadOnlyPaths={path}")
     return lines
 
@@ -7138,7 +7154,11 @@ def _job_unit_credential_lines(job_layout: "PathLayout", account: str) -> list[s
 
 
 def _job_unit_workspace_lines(
-    job_layout: "PathLayout", principal: Principal, account: str
+    job_layout: "PathLayout",
+    principal: Principal,
+    account: str,
+    *,
+    workspace_read_only: bool = False,
 ) -> list[str]:
     """模板 unit 的「本 job 的工作區長什麼樣」那一段，由 :data:`registry.JOB_WORKSPACE_REACH` 導出（#710）。
 
@@ -7219,6 +7239,13 @@ def _job_unit_workspace_lines(
             "#   可寫面由**同一次** per-job setfacl 一起落地（登記表 repo-worktree 的",
             "#   readers 宣告了本帳號，#629）。",
         ]
+    if workspace_read_only:
+        lines += [
+            "# 本模板只供明確禁止工作區寫入的 builder 卡使用。",
+            "# User= 仍沿用 builder 的一般 ACL，因此必須由 mount 邊界收緊：",
+            f"# ReadOnlyPaths={job_layout.worktree_root}/%i 與 {job_layout.repo_source_root}。",
+            "# 兩條路徑都不在 ReadWritePaths；ProtectSystem=strict 與其他加固維持不變。",
+        ]
     lines += _job_unit_git_trust_lines(job_layout, principal, account)
     return lines
 
@@ -7276,6 +7303,8 @@ def build_job_unit(
     principal: Principal = Principal.BUILDER,
     plan: PermissionPlan | None = None,
     profile: HardeningProfile = DEFAULT_HARDENING_PROFILE,
+    *,
+    workspace_read_only: bool = False,
 ) -> SystemdUnit:
     """降權 job 的**模板** unit（`cortex-job@.service`）。
 
@@ -7296,19 +7325,22 @@ def build_job_unit(
     **shim 在已降權之後**依 spec 的 `log_path` 自行接管（見 `coordinator/job_shim.py`），
     unit 這層只留 journal 給 shim 讀 spec 失敗時的診斷。
 
-    **`profile`（#643）**：加固剖面。同一個 principal 會產出**兩份** unit——
-    `cortex-job@.service`（strict）與 `cortex-job-jit@.service`（jit）——兩份共用
-    同一張 `_HARDENING` 表，只在 `PROFILE_DIVERGENCE_KEYS` 那一項分岔。哪個 job 用
-    哪一份由 **executor** 決定（:func:`executor_hardening_profile`），而 executor 是
-    Manager 的 dispatch 決定；job 自己（spec 也好、worktree 內容也好）碰不到這個選擇。
+    **`profile`（#643）**：加固剖面。同一個工作區契約產出**兩份** unit——strict 與
+    jit；兩份共用同一張 `_HARDENING` 表，只在 `PROFILE_DIVERGENCE_KEYS` 那一項分岔。
+    哪個 job 用哪一份由 **executor** 決定（:func:`executor_hardening_profile`），而
+    executor 是 Manager 的 dispatch 決定；job 自己（spec 也好、worktree 內容也好）碰不到。
 
-    **`principal`（#615 M2）**：`BUILDER` ＋ `REVIEWER` 兩個角色各兩份剖面＝**四份**
-    unit（見 :data:`DOWNGRADED_JOB_PRINCIPALS`）。四份共用**同一張** `_HARDENING` 表
-    與**同一條** `ReadWritePaths` 導出規則——角色之間的全部差異都是「帳號」帶出來的
-    （`User=`／`Group=`／HOME／cache／登記表上該帳號的可寫面），本函式沒有任何一行
-    `if principal is …`。planner 不另產一份：它與 reviewer 同帳號，見
-    :data:`JOB_PRINCIPAL_PERSONAS`。
+    **`principal`（#615 M2）**：builder、reviewer/planner、gate 三種身分共六份普通 unit
+    （各 strict／jit）；builder 另有兩份唯讀工作區 unit，總共八份。它們共用同一張
+    `_HARDENING` 表；builder 唯讀變體只在 `ReadWritePaths`／`ReadOnlyPaths` 上收緊。
+    planner 不另產一份：它與 reviewer 同帳號，見 :data:`JOB_PRINCIPAL_PERSONAS`。
+
+    `workspace_read_only=True` 只供 builder 的明確唯讀卡使用，產生獨立 `cortex-job-ro@`
+    模板：保留 builder 身分、HOME、cache、egress 與全部加固鍵，只從可寫面移除 per-job
+    worktree，並以 `ReadOnlyPaths` 覆蓋該 worktree 與來源 repo 樹。普通 builder 模板不變。
     """
+    if workspace_read_only and principal is not Principal.BUILDER:
+        raise ValueError("workspace-read-only job template is only defined for builder")
     plan = plan or generate_plan(scheme)
     account = scheme.resolve(principal)
     if account is None:
@@ -7333,7 +7365,25 @@ def build_job_unit(
         if "%i" in path and not any(path == root for root in shared_roots)
     }
     owners.update(job_surface_owners(principal=principal, instance="%i", layout=layout))
-    stem = job_unit_stem(layout, principal, profile)
+    workspace_read_only_paths: tuple[str, ...] = ()
+    if workspace_read_only:
+        workspace_root = f"{job_layout.worktree_root}/%i"
+        source_root = job_layout.repo_source_root
+        workspace_read_only_paths = tuple(sorted({workspace_root, source_root}))
+        # The builder ACL remains read/write for normal builder jobs. The dedicated
+        # readonly template must therefore omit every mount that can expose either
+        # the per-job clone or its Manager-owned source tree as writable.
+        owners = {
+            path: covered
+            for path, covered in owners.items()
+            if not any(
+                _is_within(path, readonly_path) or _is_within(readonly_path, path)
+                for readonly_path in workspace_read_only_paths
+            )
+        }
+    stem = job_unit_stem(
+        layout, principal, profile, workspace_read_only=workspace_read_only
+    )
     unit_name = f"{stem}@.service"
     profile_users = sorted(
         name
@@ -7353,6 +7403,7 @@ def build_job_unit(
         f"# 由 permgen 機械產生（scheme={scheme.scheme_id}, profile={profile.profile_id}）",
         "# ——勿手改；重跑：",
         f"#   python3 -m paulsha_cortex.trust_root unit {scheme.scheme_id} {unit_flag}"
+        + (" --workspace-read-only" if workspace_read_only else "")
         + (f" --profile {profile.profile_id}" if profile is not DEFAULT_HARDENING_PROFILE else ""),
         "#",
         "# 降權/提權分界線：User= 在本 root-owned 檔內硬寫死。Manager"
@@ -7427,7 +7478,12 @@ def build_job_unit(
         "# per-job 目錄尚未建立而在 exec 前就失敗（那會讓 log 裡沒有任何線索）。",
         f"WorkingDirectory={job_layout.worktree_root}",
     ]
-    body += _job_unit_workspace_lines(job_layout, principal, account)
+    body += _job_unit_workspace_lines(
+        job_layout,
+        principal,
+        account,
+        workspace_read_only=workspace_read_only,
+    )
     body += [
         "# --- 成果回收（登記表 commit-spool，#623／#634）---",
         f"#   {job_layout.commit_spool_root}/%i/：job 在**自己的** clone `git bundle create`",
@@ -7493,8 +7549,8 @@ def build_job_unit(
         f"Environment=XDG_CACHE_HOME={_surface_slot(writable_surface(f'{principal.value}-runtime-cache'), '%i', layout=layout) if principal in (Principal.BUILDER, Principal.REVIEWER) else job_layout.cache_of(account)}",
         "",
         f"# --- 加固（與 Manager 同一張 _HARDENING 表；剖面={profile.profile_id}）---",
-        "# 兩份 job unit 共用這張表，只在下方以 ※ 標出的那一項分岔；",
-        "# 日後往表裡加一項，兩份 unit 會自動同時拿到。",
+        "# 同一工作區契約的 strict／jit unit 共用這張表，只在下方以 ※ 標出的那一項分岔；",
+        "# builder 唯讀變體只在工作區掛載清單收緊。往表裡加一項，各 unit 都會拿到。",
     ]
     body += _hardening_lines(profile)
     body += [""]
@@ -7511,7 +7567,7 @@ def build_job_unit(
             f"{codex_home}/{leaf}"
             for leaf in ("plugins", "skills", "config.toml", "hooks.json")
         )
-    body += _rwp_lines(owners, read_only)
+    body += _rwp_lines(owners, read_only, workspace_read_only_paths)
     body += [
         "",
         "# job 為一次性，不自動重啟（`CollectMode` 在上方 [Unit] 段）。",
@@ -7530,7 +7586,7 @@ def build_job_unit(
         exec_start=f"{job_layout.job_shim} %i",
         environment_file=None,
         read_write_paths=tuple(owners.keys()),
-        read_only_paths=read_only,
+        read_only_paths=tuple(sorted(set(read_only) | set(workspace_read_only_paths))),
         content="\n".join(body) + "\n",
         hardening_profile=profile.profile_id,
     )
@@ -8284,19 +8340,28 @@ def job_unit_stems(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     principals: "Principal | Sequence[Principal]" = Principal.BUILDER,
 ) -> tuple[str, ...]:
-    """這些 principal 的**全部**模板字幹（principal × 加固剖面），依表順序。
+    """這些 principal 的**全部**模板字幹（principal × 工作區契約 × 加固剖面），依表順序。
 
     `principals` 收單一 principal 或一組：前者是既有呼叫端（builder 一族），後者是
-    #615 之後真正落檔的集合（:data:`DOWNGRADED_JOB_PRINCIPALS`）。**兩層都是列舉**
-    ——字幹數 = principal 數 × 剖面數，沒有任何一層是萬用字元。
+    #615 之後真正落檔的集合（:data:`DOWNGRADED_JOB_PRINCIPALS`）。三層都是列舉：builder
+    另有唯讀工作區模板，所有模板仍由具名字幹組成，沒有任何一層使用萬用字元。
     """
 
     layout = layout if layout is not None else DEFAULT_LAYOUT
-    return tuple(
-        job_unit_stem(layout, principal, profile)
-        for principal in _as_principals(principals)
-        for profile in HARDENING_PROFILES
-    )
+    stems: list[str] = []
+    for principal in _as_principals(principals):
+        worktree_modes = (False, True) if principal is Principal.BUILDER else (False,)
+        for workspace_read_only in worktree_modes:
+            for profile in HARDENING_PROFILES:
+                stems.append(
+                    job_unit_stem(
+                        layout,
+                        principal,
+                        profile,
+                        workspace_read_only=workspace_read_only,
+                    )
+                )
+    return tuple(stems)
 
 
 def job_unit_pattern(
@@ -8306,16 +8371,18 @@ def job_unit_pattern(
 ) -> str:
     """被授權的 unit 名 regex（錨定）。
 
-    **字幹段是一個列舉的交替，不是萬用字元**，而且是**兩層**列舉：
+    **字幹段是一個列舉的交替，不是萬用字元**，而且是三層列舉：
 
     - `principal`（#615 M2）：`cortex-job`（builder）與 `cortex-reviewer-job`
       （reviewer＋planner），由 :data:`DOWNGRADED_JOB_PRINCIPALS` 導出；
     - 加固剖面（#643）：每份剖面各有一份 root-owned 模板檔，因此各有一個字幹後綴
       （空字串 / `-jit`），由 :data:`HARDENING_PROFILES` 導出。
+    - builder 工作區契約（#716）：一般 `cortex-job` 保持可寫；`cortex-job-ro` 專供
+      明確唯讀 builder 卡，移除 worktree 的 `ReadWritePaths` 並加唯讀 mount。
 
-    兩層都是**具名模板的列舉**：前後都錨定，instance 段的字元類逐字未變，`^` 與 `@`
-    之間不允許任何未列舉的字幹。放行面因此從「兩個具名模板」變成「四個具名模板」，
-    **不是**「任意 unit」——四份 unit 檔全部 root-owned、`User=`／`ExecStart=` 都寫死，
+    三層都是**具名模板的列舉**：前後都錨定，instance 段的字元類逐字未變，`^` 與 `@`
+    之間不允許任何未列舉的字幹。唯讀變體只增加明確列出的 root-owned builder unit，
+    **不是**「任意 unit」——各份 unit 的 `User=`／`ExecStart=` 都寫死，
     呼叫端能選的只是「哪一份具名模板」。
 
     **為什麼仍然只有一條 `polkit.addRule`**（#643 立下、#615 沿用）：第二條規則會把
@@ -8414,12 +8481,20 @@ def build_polkit_rule(
         )
     else:
         stems = job_unit_stems(layout, ordered)
-        profile_lines = "".join(
-            f"//     - {job_unit_stem(layout, principal, p)}@<id>.service"
-            f"（User={scheme.resolve(principal)}，剖面 {p.profile_id}："
-            f"{'完整加固表' if not p.overrides else '、'.join(f'{k}={v}' for k, v in sorted(p.overrides.items())) + '，其餘逐項同 strict'}）\n"
+        template_rows = [
+            (principal, workspace_read_only, profile)
             for principal in ordered
-            for p in HARDENING_PROFILES
+            for workspace_read_only in (
+                (False, True) if principal is Principal.BUILDER else (False,)
+            )
+            for profile in HARDENING_PROFILES
+        ]
+        profile_lines = "".join(
+            f"//     - {job_unit_stem(layout, principal, p, workspace_read_only=readonly)}@<id>.service"
+            f"（User={scheme.resolve(principal)}，剖面 {p.profile_id}，"
+            f"{'worktree／來源 repo 掛 ReadOnlyPaths，' if readonly else ''}"
+            f"{'完整加固表' if not p.overrides else '、'.join(f'{k}={v}' for k, v in sorted(p.overrides.items())) + '，其餘逐項同 strict'}）\n"
+            for principal, readonly, p in template_rows
         )
         headline = (
             f"// 方案 B（root-owned 模板 unit）：{svc} 只能 start/stop 下列**具名模板**的實例：\n"
@@ -8435,17 +8510,19 @@ def build_polkit_rule(
             + "\n"
             f"// 這些屬性全部只存在於 root-owned 的模板檔裡，呼叫端連提都提不了。\n"
             f"//\n"
-            f"// ===== 為什麼字幹段是一個交替（兩層列舉）=====\n"
+            f"// ===== 為什麼字幹段是一個交替（三層列舉）=====\n"
             f"// (a) **加固剖面**（#643）：加固指令寫在 unit 檔裡，一個模板只有一份 ⇒\n"
             f"//     兩種剖面必然是兩個檔、兩個名字。\n"
             f"// (b) **job 角色**（#615 M2）：builder 與 reviewer／planner 是**不同的 UID**，\n"
             f"//     而 User= 同樣寫死在 unit 檔裡 ⇒ 同樣必然是不同的檔、不同的名字。\n"
+            f"// (c) **builder 工作區契約**（#716）：唯讀 builder 卡使用另外兩份 `cortex-job-ro`，\n"
+            f"//     其 ReadOnlyPaths 固定覆蓋 worktree 與來源 repo。\n"
             f"// 上面的 pattern 因此是**列舉的交替**（{'、'.join(stems)}），\n"
             f"// 不是萬用字元：`^` 與 `@` 之間不允許任何未列舉的字幹，instance 段的字元類\n"
             f"// 一字未改。{svc} 選得了「哪一份模板」，但每一份都是 root-owned、User= 都寫死，\n"
             f"// 也都不含任何可由呼叫端注入的東西——能選的只是「哪個 job 帳號、多一項或少\n"
             f"// 一項加固」。放寬的那一項（MemoryDenyWriteExecute）擋的是**本 job 自己位址\n"
-            f"// 空間內**的 W+X，不是跨 UID 的邊界；而帳號的選擇本身不構成提權——四份模板\n"
+            f"// 空間內**的 W+X，不是跨 UID 的邊界；而帳號的選擇本身不構成提權——所有模板\n"
             f"// 的 User= 全部是無 sudo、無 root、彼此互不可寫的降權服務帳號，沒有任何一份\n"
             f"// 比 {svc} 自己更有權限。真正決定用哪一份的是 persona ＋ executor（都是\n"
             f"// Manager 的 dispatch 決定），job 側完全碰不到。\n"

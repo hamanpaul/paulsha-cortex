@@ -1017,7 +1017,11 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
             "`as_read_only()`＝workflow lane 的 planner 卡。direct／非 template runner"
             "仍依契約使用 `read-only`；Trust Root template 因 codex-cli 0.157 在外層"
             "namespace 限制下要求 bwrap 而改用 `danger-full-access`，安全邊界由 template"
-            "unit 與 egress proxy 提供。"
+            "unit 與 egress proxy 提供。launcher 將它固定派到 reviewer template，以"
+            "`cortex-reviewer-planner` 執行；該 unit 的 `ProtectSystem=strict` 與 RWP"
+            "不含 job worktree／repo source tree。reviewer 的 worktree 與 planner 的 scratch"
+            "分別繼承自 `repo-source-tree`／`planning-scratch-pool` 的 `rX` reader ACL，沒有寫入"
+            "ACL；unit 的唯讀掛載與 DAC 一起保證不可寫。"
         ),
     ),
     SandboxModeDerivation(
@@ -1030,8 +1034,11 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
         trust_root_attaches_inner_sandbox=False,
         note=(
             "`as_review_only()`＝workflow lane 的 reviewer 卡，保留獨立列涵蓋它的"
-            "`--tools`／`--settings`／verdict spool 建構契約；Trust Root template 下由外層"
-            "unit 限制寫入與網路，Codex 內層沙箱不啟用。"
+            "`--tools`／`--settings`／verdict spool 建構契約；Trust Root template 下固定"
+            "使用 `cortex-reviewer-job(-jit)@`，以 `cortex-reviewer-planner` 執行。該 unit"
+            "的 `ProtectSystem=strict`、不含 worktree／repo source tree 的 RWP，加上"
+            "review worktree 從 `repo-source-tree` 繼承的 `rX` reader ACL，保證外層不可寫；"
+            "verdict spool 是獨立輸出通道，Codex 內層沙箱不啟用。"
         ),
     ),
     SandboxModeDerivation(
@@ -1057,7 +1064,12 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
             "**隱性邊界（#721）**：`-s read-only` 之下**任何需要暫存檔的命令都會失敗**，"
             "`/tmp` 也不例外（`tempfile` 建不出檔，實測 `python3 -m pytest -q` 死於 "
             "`No usable temporary directory available`）——「不寫工作區」不等於「不寫任何"
-            "地方」。落這一格的卡其 action 必須是純檢視。"
+            "地方」。落這一格的卡其 action 必須是純檢視。Trust Root template 固定選"
+            "`cortex-job-ro(-jit)@`，仍以 `cortex-builder` 執行；builder 原有 ACL 對"
+            "per-job clone 可寫，因此這份 unit 將 job worktree 的 `%i` 路徑與 repo source"
+            "root 加入 `ReadOnlyPaths`，並從 `ReadWritePaths` 排除兩者。這項外層掛載才是"
+            "唯讀保證；一般 `cortex-job(-jit)@` 仍保留 worktree 寫入，供"
+            "`builder-workspace-write` 使用。"
         ),
     ),
     SandboxModeDerivation(
@@ -1094,6 +1106,9 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
             "（三）**#718 記著今天就存在的四個缺口**（與本列裁決無關、也不因本列而"
             "改變）：`$CODEX_HOME` 非 hooks.json 面可寫、commit-spool 整棵可寫、"
             "event-spool 整棵可寫、資源零上限。\n"
+            "Trust Root template 使用一般 `cortex-job(-jit)@`；它的 RWP 仍包含自己的"
+            "per-job worktree，故此列保持可寫。唯讀契約改用獨立 RO template，不依賴這份"
+            "可寫單元。\n"
             "**刻意不用 `--dangerously-bypass-approvals-and-sandbox`**："
             "`build_codex_argv` 把它與 `--dangerously-bypass-hook-trust` 綁在一起"
             "（launcher.py 的 allow_unsafe 分支，0819 當時是 862-869 行），那會連 #698 "

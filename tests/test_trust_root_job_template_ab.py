@@ -618,6 +618,24 @@ class M2ExtensionPointTests(unittest.TestCase):
                     "YES",
                     stem,
                 )
+        for profile in permgen.HARDENING_PROFILES:
+            stem = permgen.job_unit_stem(
+                permgen.DEFAULT_LAYOUT,
+                Principal.BUILDER,
+                profile,
+                workspace_read_only=True,
+            )
+            self.assertEqual(
+                permgen.evaluate_polkit(
+                    rule,
+                    user=rule.subject_account,
+                    action_id=permgen.POLKIT_ACTION,
+                    unit=f"{stem}@readonly.service",
+                    verb="start",
+                ),
+                "YES",
+                stem,
+            )
         self.assertEqual(
             rule.target_accounts,
             ("cortex-builder", "cortex-reviewer-planner", "cortex-gate"),
@@ -897,12 +915,44 @@ class JobSpecContentTests(unittest.TestCase):
             _launch_template(SubprocessLauncher("codex").as_read_only(), popen=popen)
 
         self.assertIs(observed.get("trust_root_outer_unit"), True)
+        self.assertTrue(
+            _unwrap_exit_recorder(popen.call["argv"])[4].startswith(
+                "cortex-reviewer-job-jit@"
+            )
+        )
         self.assertEqual(
             launched_argv[launched_argv.index("--sandbox") + 1],
             "danger-full-access",
         )
         self.assertNotIn("--enable", launched_argv)
         self.assertNotIn("use_legacy_landlock", launched_argv)
+
+    def test_reviewer_review_only_template_uses_reviewer_planner_identity(self) -> None:
+        popen = _RecordingPopen()
+        _launch_template(
+            SubprocessLauncher("codex").as_review_only(
+                terminal_kind="workflow-review-result"
+            ),
+            popen=popen,
+        )
+        argv = _unwrap_exit_recorder(popen.call["argv"])
+
+        self.assertTrue(argv[4].startswith("cortex-reviewer-job-jit@"), argv[4])
+
+    def test_write_forbidden_builder_uses_read_only_outer_template(self) -> None:
+        """Codex outer-only mode still needs a template with no writable worktree mount."""
+        popen = _RecordingPopen()
+        _launch_template(
+            SubprocessLauncher("codex").as_write_forbidden(), popen=popen
+        )
+        argv = _unwrap_exit_recorder(popen.call["argv"])
+
+        self.assertEqual(
+            argv[4],
+            "cortex-job-ro-jit@"
+            + job_runner.template_instance_id("psc-0042-template")
+            + ".service",
+        )
 
     def test_spec_never_carries_identity(self) -> None:
         """User 不在 spec 裡——它在 root-owned 的 unit 檔。"""

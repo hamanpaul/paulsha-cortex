@@ -2138,7 +2138,11 @@ class SubprocessLauncher:
             # （`job_runner.SPEC_FORBIDDEN_KEYS`）。未登記的 executor 在這裡
             # fail-closed，不會落到放寬的那一份剖面。
             template_plan = job_runner.prepare_systemd_template(
-                os.environ, job_id=slice_id, executor=self._executor, role=job_role
+                os.environ,
+                job_id=slice_id,
+                executor=self._executor,
+                role=job_role,
+                workspace_read_only=self._write_forbidden,
             )
         degraded = runner_mode is not None
         resolved_worktree = Path(worktree).resolve(strict=True)

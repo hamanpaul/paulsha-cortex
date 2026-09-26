@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- **#716 Trust Root Codex 0.157 外層獨占沙箱**：只有已通過 root-owned `systemd-template` preflight 的 job，才使用 `--sandbox danger-full-access` 並略過 Codex 內層沙箱；`direct` 與 transient `systemd-run` 維持既有卡片契約沙箱。保留 template unit 全部既有加固鍵值、精確工作區寫入範圍與 egress proxy，並將反向探針改為檢查外層邊界。
+- **#716 Trust Root Codex 0.157 外層獨占沙箱**：template 模式的唯讀 builder 卡改走 `cortex-job-ro[-jit]`，以 `ReadOnlyPaths=` 覆蓋 job worktree 與 repo clone，避免 `danger-full-access` 繞過 Codex 內層唯讀沙箱時污染工作區；planner／reviewer 維持 `cortex-reviewer-planner` 的唯讀 ACL 與 reviewer unit。`builder-workspace-write` 保留一般 builder unit 的寫入路徑；`direct` 與 transient `systemd-run` 維持既有卡片契約沙箱，既有加固鍵與 egress proxy 不變。
 
 - **#502 verify／review 通過後的阻斷修復入口**：exact-candidate `retry-build` 現可接受尚未進入 `needs_human` 的後續阻斷裁決；必須提供 `--reason`，以既有 immutable operator-adjudication evidence 記錄後重跑 verify／review，已完成 run 仍拒絕重開。
 

@@ -1,1 +1,1 @@
-#716 Trust Root Codex 0.157 外層獨占沙箱：只有已通過 root-owned systemd-template preflight 的 job，才使用 --sandbox danger-full-access 並略過 Codex 內層沙箱；direct 與 transient systemd-run 維持既有卡片契約沙箱。保留 template unit 全部既有加固鍵值、精確工作區寫入範圍與 egress proxy，並將反向探針改為檢查外層邊界。
+#716 Trust Root Codex 0.157 外層獨占沙箱：唯讀 builder 卡在 template 模式改走 cortex-job-ro[-jit]，以 ReadOnlyPaths= 保護 job worktree 與 repo clone；planner／reviewer 維持 reviewer-planner 帳號的唯讀 ACL 與 reviewer unit。builder-workspace-write 保留一般 builder unit 的寫入權限；direct 與 transient systemd-run 維持既有卡片契約沙箱，其他加固與 egress proxy 不變。

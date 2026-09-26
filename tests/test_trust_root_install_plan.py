@@ -202,6 +202,11 @@ def test_plan_is_exact_artifact_bound_four_way_structured_desired_state(
         "gitconfigs",
         "toolchain_wrappers",
     }
+    assert "cortex-job-ro@.service" in doc["generated"]["units"]
+    assert "cortex-job-ro-jit@.service" in doc["generated"]["units"]
+    assert f'ReadOnlyPaths={doc["roots"]["state"]}/worktree/%i' in doc[
+        "generated"
+    ]["units"]["cortex-job-ro@.service"]["content"]
     state_root = next(
         step
         for step in doc["apply_order"]

@@ -605,6 +605,18 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
         self.assertIn("--skip-git-repo-check", codex)
 
+    def test_write_forbidden_builder_direct_keeps_inner_read_only_sandbox(self) -> None:
+        codex = build_codex_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            write_forbidden=True,
+        )
+
+        self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
+        self.assertIn("--enable", codex)
+        self.assertIn("use_legacy_landlock", codex)
+
     def test_reviewer_read_only_argv_allows_inspection_but_never_edit_permissions(self) -> None:
         with mock.patch.object(
             launcher_module,
