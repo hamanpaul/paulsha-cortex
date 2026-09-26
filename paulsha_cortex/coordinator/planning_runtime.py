@@ -731,14 +731,19 @@ def _copy_stable_planning_baseline(worktree: Path, baseline: Path) -> str | None
     """建立與來源內容一致的 baseline；不穩時重取一次，仍不穩則回 None。"""
 
     for attempt in range(2):
-        source_before = _tree_snapshot(worktree)
-        _copy_planning_sandbox(worktree, baseline)
-        copied = _tree_snapshot(baseline)
-        source_after = _tree_snapshot(worktree)
-        if source_before == copied == source_after:
+        try:
+            source_before = _tree_snapshot(worktree)
+            _copy_planning_sandbox(worktree, baseline)
+            copied = _tree_snapshot(baseline)
+            source_after = _tree_snapshot(worktree)
+        except (OSError, shutil.Error):
+            # 複製期間來源檔被刪除／替換屬同一類「來源不穩定」：與 hash 不一致同樣
+            # 重取一次，仍失敗交由呼叫端走 operator drift（environment）路徑。
+            source_before, copied, source_after = None, None, None
+        if source_before is not None and source_before == copied == source_after:
             return source_after
         if attempt == 0:
-            shutil.rmtree(baseline)
+            shutil.rmtree(baseline, ignore_errors=True)
     return None
 
 

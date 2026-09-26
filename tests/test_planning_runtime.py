@@ -1705,3 +1705,34 @@ def test_invoke_json_does_not_set_env_override_for_non_claude_executors(
 
     assert result == {"ok": True}
     assert captured["has_env"] is False
+
+
+def test_planning_runtime_retries_when_baseline_copy_raises_on_vanished_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """複製期間來源檔消失（copytree 丟例外）屬來源不穩定：重試一次而非變成 content failure。"""
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    (tmp_path / "tracked.md").write_text("initial\n", encoding="utf-8")
+    real_copy = planning_runtime._copy_planning_sandbox
+    copy_count = 0
+
+    def vanish_during_first_copy(source: Path, destination: Path) -> None:
+        nonlocal copy_count
+        copy_count += 1
+        if copy_count == 1:
+            destination.mkdir(parents=True, exist_ok=True)
+            raise FileNotFoundError("source vanished during copytree")
+        real_copy(source, destination)
+
+    monkeypatch.setattr(planning_runtime, "_copy_planning_sandbox", vanish_during_first_copy)
+
+    result = planning_runtime._invoke_json(
+        identity,
+        "return JSON",
+        worktree=tmp_path,
+        runner=lambda *_a, **_k: _completed(json.dumps({"ok": True})),
+        timeout_seconds=30,
+    )
+
+    assert result == {"ok": True}
+    assert copy_count == 2
