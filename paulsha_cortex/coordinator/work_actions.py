@@ -2528,8 +2528,10 @@ def _review_disposition_action(
         authority=authority,
     )
     _validate_current_run_authority(active, authority, run)
+    # 只有 Cortex 自己的 review gate 全部通過、剩下 ship 段 Copilot finding 時，operator 才能裁決續行；
+    # review gate 未過一律走 retry-review／retry-build，不得以 disposition 繞過。
     if any(
-        step.phase == "review" and step.gate_result == "needs_human"
+        step.phase == "review" and step.gate_result != "passed"
         for step in run.steps
     ):
         raise RuntimeError(

@@ -3585,6 +3585,16 @@ def test_ship_fix_required_persists_capped_reviewer_findings(
     ]
 
 
+def _review_steps_passed(steps):
+    """走到 ship needs-fix 時，Cortex 自己的 review gate 必然已通過。"""
+    import dataclasses
+
+    return tuple(
+        dataclasses.replace(step, gate_result="passed") if step.phase == "review" else step
+        for step in steps
+    )
+
+
 def test_review_disposition_requires_resolved_same_head_and_resumes_ship(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3615,6 +3625,7 @@ def test_review_disposition_requires_resolved_same_head_and_resumes_ship(
         gate_status="passed",
         facets=("needs_human",),
         needs_human_reason=fixture_needs_human_reason(),
+        steps=_review_steps_passed(registry.get_workflow_run(run_id).steps),
     )
     current = {
         "head": HEAD,
@@ -4608,3 +4619,40 @@ def test_intake_without_any_authority_or_link_args_fails_closed_without_creating
         )
 
     assert registry.list_workflow_runs() == []
+
+
+def test_review_disposition_refuses_when_cortex_review_gate_not_passed(tmp_path: Path) -> None:
+    """disposition 只裁決 ship 段 Copilot finding；Cortex review gate 未通過不得繞過。"""
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id, candidate_head=HEAD, verified_head=HEAD, facets=("needs_human",),
+        needs_human_reason=fixture_needs_human_reason(),
+    )
+    with pytest.raises(RuntimeError, match="only applies to ship Copilot findings"):
+        work_actions.execute_work_action(
+            args={
+                "action": "review-disposition",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "maintainer",
+                "reason": "review gate 尚未通過時不得裁決續行。",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 209,
+            workflow_registry=registry,
+        )
