@@ -1,0 +1,741 @@
+"""Issue #836 B/C/D：來源 adapter、耐久 ledger 與 shadow 投影契約。"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from importlib import import_module
+import json
+from pathlib import Path
+
+import pytest
+
+from paulsha_cortex.coordinator import quota_observation as schema
+
+
+_PROFILE_A = "epk:v1:resolved:" + "a" * 64
+_PROFILE_B = "epk:v1:resolved:" + "b" * 64
+_NOW = 1_800_000_000_000
+
+
+def _feature_api():
+    try:
+        sources = import_module("paulsha_cortex.coordinator.quota_sources")
+        ledger = import_module("paulsha_cortex.coordinator.quota_ledger")
+        shadow = import_module("paulsha_cortex.coordinator.quota_shadow")
+    except ImportError as exc:
+        pytest.fail(f"RED: #836 B/C/D public API is not implemented: {exc}")
+    required = (
+        (sources, "ProviderQuotaTarget"),
+        (sources, "capture_provider_quota"),
+        (sources, "provider_read_contract"),
+        (ledger, "QuotaEventLedger"),
+        (shadow, "QuotaShadowService"),
+    )
+    missing = [name for module, name in required if not hasattr(module, name)]
+    assert not missing, f"RED: #836 B/C/D API missing: {missing}"
+    return sources, ledger, shadow
+
+
+def _profile_ref(key: str) -> dict[str, object]:
+    return {"state": "known", "value": {"schema_version": 1, "key": key}}
+
+
+def _pool_descriptor(
+    *,
+    account: str = "account-shared",
+    pool: str = "pool-shared",
+    unit_id: str = "token",
+    semantics_ref: str = "fixture:native-token/v1",
+    quantity_kind: str = "amount",
+    windows: tuple[tuple[str, int], ...] = (("short", 300_000), ("week", 604_800_000)),
+):
+    unit = {
+        "unit_id": unit_id,
+        "version": "1",
+        "quantity_kind": quantity_kind,
+        "semantics_ref": semantics_ref,
+    }
+    return schema.parse_pool_descriptor(
+        {
+            "schema_version": 1,
+            "authority_id": "operator-budget-authority",
+            "account_id": account,
+            "pool_id": pool,
+            "revision": "1",
+            "authority_ref": "fixture:operator-pool-map/v1",
+            "provenance_refs": ["fixture:pool-map/v1"],
+            "units": [unit],
+            "windows": [
+                {
+                    "window_id": window_id,
+                    "kind": "instantaneous" if quantity_kind == "gauge" else "rolling",
+                    "unit_ref": {"unit_id": unit_id, "version": "1"},
+                    **({} if quantity_kind == "gauge" else {"duration_ms": duration_ms}),
+                }
+                for window_id, duration_ms in windows
+            ],
+        }
+    )
+
+
+def _binding(descriptors, key: str, constraints=None, *, binding_id="binding"):
+    if constraints is None:
+        constraints = [
+            {
+                "state": "known",
+                "value": {
+                    "pool_ref": {
+                        "authority_id": descriptor.authority_id,
+                        "account_id": descriptor.account_id,
+                        "pool_id": descriptor.pool_id,
+                        "revision": descriptor.revision,
+                    },
+                    "window_id": window_id,
+                },
+            }
+            for descriptor, window_id in constraints_from(descriptors)
+        ]
+    return schema.parse_binding(
+        {
+            "schema_version": 1,
+            "binding_id": binding_id,
+            "revision": "1",
+            "subject": {"kind": "profile", "profile_ref": _profile_ref(key)},
+            "constraints": constraints,
+            "coverage": {"state": "complete", "gaps": []},
+        },
+        descriptors=tuple(descriptors),
+    )
+
+
+def constraints_from(descriptors):
+    for descriptor in descriptors:
+        for window in descriptor.to_dict()["windows"]:
+            yield descriptor, window["window_id"]
+
+
+def _observation(
+    descriptor,
+    window_id: str,
+    *,
+    value: str | None,
+    observed_at_ms: int,
+    reset_at_ms: int | None = None,
+    profile_key: str = _PROFILE_A,
+    unit_id: str = "token",
+    metric_id: str = "remaining",
+    measurement_kind: str = "remaining_snapshot",
+    source_method: str = "provider_status",
+    event_id: str | None = None,
+    ttl_ms: int = 60_000,
+):
+    descriptor_wire = descriptor.to_dict()
+    window = next(item for item in descriptor_wire["windows"] if item["window_id"] == window_id)
+    duration_ms = window.get("duration_ms")
+    if reset_at_ms is not None and duration_ms is not None:
+        window_instance = {
+            "kind": "interval",
+            "start_ms": reset_at_ms - duration_ms,
+            "end_ms": reset_at_ms,
+            "epoch": {"state": "known", "value": f"reset-{reset_at_ms}"},
+        }
+    else:
+        window_instance = {"kind": "unknown", "reason": "missing-window-instance"}
+    quantity = (
+        {"state": "unknown", "reason": "missing-remaining"}
+        if value is None
+        else {"state": "observed", "amount": {"kind": "exact", "value": value}}
+    )
+    source_event = (
+        {"state": "unknown", "reason": "provider-has-no-event-id"}
+        if event_id is None
+        else {
+            "state": "known",
+            "namespace": "fixture-provider",
+            "epoch": "1",
+            "event_id": event_id,
+        }
+    )
+    payload = {
+        "schema_version": 1,
+        "observation_id": f"fixture-{metric_id}-{observed_at_ms}",
+        "scope": {
+            "state": "known",
+            "value": {
+                "pool_ref": {
+                    "authority_id": descriptor.authority_id,
+                    "account_id": descriptor.account_id,
+                    "pool_id": descriptor.pool_id,
+                    "revision": descriptor.revision,
+                },
+                "window_id": window_id,
+            },
+        },
+        "profile_ref": _profile_ref(profile_key),
+        "unit_ref": {"state": "known", "value": {"unit_id": unit_id, "version": "1"}},
+        "window_instance": window_instance,
+        "measurement": {
+            "kind": measurement_kind,
+            "metric_id": metric_id,
+            "quantity": quantity,
+        },
+        "observed_at_ms": {"state": "known", "value": observed_at_ms},
+        "received_at_ms": observed_at_ms,
+        "ttl_ms": {"state": "known", "value": ttl_ms},
+        "reset_at_ms": (
+            {"state": "unknown", "reason": "missing-reset"}
+            if reset_at_ms is None
+            else {"state": "known", "value": reset_at_ms}
+        ),
+        "source": {
+            "source_id": "fixture-provider",
+            "source_schema": "fixture-quota-v1",
+            "adapter_version": "fixture-adapter-v1",
+            "authority_ref": "fixture:provider-contract/v1",
+            "method": source_method,
+            "provenance_refs": ["fixture:source-document/v1"],
+            "event_identity": source_event,
+        },
+        "coverage": {"state": "complete", "gaps": []},
+    }
+    return schema.parse_observation(
+        payload,
+        descriptors=(descriptor,),
+        unit_catalog=(),
+    )
+
+
+def _pool_row(report, pool_id: str, window_id: str):
+    return next(
+        row for row in report["pools"]
+        if row["pool_ref"]["pool_id"] == pool_id and row["window_id"] == window_id
+    )
+
+
+def test_ac1_multimodel_shared_pool_independent_pool_and_all_windows_are_separate():
+    _, _, shadow_module = _feature_api()
+    descriptor_shared = _pool_descriptor()
+    descriptor_other = _pool_descriptor(account="account-other", pool="pool-independent")
+    descriptor_concurrency = _pool_descriptor(
+        account="account-concurrency", pool="pool-concurrency", unit_id="active-jobs",
+        quantity_kind="gauge", windows=(("active", 1_000),),
+    )
+    service = shadow_module.QuotaShadowService.in_memory()
+    observations = (
+        _observation(descriptor_shared, "short", value="8", observed_at_ms=_NOW),
+        _observation(descriptor_shared, "week", value="3", observed_at_ms=_NOW),
+        _observation(descriptor_shared, "short", value="8", observed_at_ms=_NOW,
+                     profile_key=_PROFILE_B),
+        _observation(descriptor_other, "short", value="20", observed_at_ms=_NOW, profile_key=_PROFILE_B),
+        _observation(descriptor_concurrency, "active", value="2", observed_at_ms=_NOW,
+                     unit_id="active-jobs", measurement_kind="gauge_snapshot"),
+    )
+    for index, observation in enumerate(observations):
+        service.record_observation(
+            observation.to_dict(),
+            descriptors=(descriptor_shared, descriptor_other, descriptor_concurrency),
+            unit_catalog=(),
+            idempotency_key=f"fake-provider-{index}",
+        )
+    report = service.project(
+        descriptors=(descriptor_shared, descriptor_other, descriptor_concurrency),
+        unit_catalog=(),
+        now_utc_ms=_NOW + 1,
+        demand_by_window={
+            (("operator-budget-authority", "account-shared", "pool-shared", "1"), "short"): "5",
+            (("operator-budget-authority", "account-shared", "pool-shared", "1"), "week"): "5",
+        },
+    )
+    assert report["mode"] == "shadow"
+    assert report["dispatch_effect"] == "none"
+    assert _pool_row(report, "pool-shared", "short")["assessment"] == "sufficient"
+    assert _pool_row(report, "pool-shared", "week")["assessment"] == "insufficient"
+    assert sum(row["pool_ref"]["pool_id"] == "pool-shared"
+               and row["window_id"] == "short" for row in report["pools"]) == 1
+    assert _pool_row(report, "pool-independent", "short")["remaining"]["amount"] == {
+        "kind": "exact",
+        "value": "20",
+    }
+    concurrency = _pool_row(report, "pool-concurrency", "active")
+    assert concurrency["gauge"]["state"] == "observed"
+    assert concurrency["gauge"]["amount"] == {"kind": "exact", "value": "2"}
+    assert concurrency["assessment"] == "unknown"
+
+
+def test_ac2_provider_missing_stale_corrupt_and_invalid_values_remain_unknown(tmp_path):
+    sources, _, shadow_module = _feature_api()
+    percent_unit = "provider:openai-codex-app-server/rate-limit-percent/v2"
+    descriptor = _pool_descriptor(
+        unit_id="codex-percent",
+        semantics_ref=percent_unit,
+        windows=(("short", 300_000),),
+    )
+    profile_binding = _binding((descriptor,), _PROFILE_A)
+    target = sources.ProviderQuotaTarget(
+        resource_key="codex:shared:primary",
+        binding=profile_binding,
+        descriptor=descriptor,
+        window_id="short",
+    )
+    missing = sources.capture_provider_quota(
+        "codex",
+        None,
+        profile_key=_PROFILE_A,
+        targets=(target,),
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        observed_at_ms=_NOW,
+    )
+    assert missing.observations
+    assert missing.gaps
+    assert missing.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
+
+    codex = sources.capture_provider_quota(
+        "codex",
+        {
+            "limit_id": "shared",
+            "primary": {"used_percent": 40, "window_duration_mins": 5,
+                        "resets_at": 1_800_001_000},
+        },
+        profile_key=_PROFILE_A, targets=(target,), descriptors=(descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW,
+    )
+    assert not codex.gaps
+    codex_observation = codex.observations[0].to_dict()
+    assert codex_observation["measurement"]["quantity"]["amount"] == {
+        "kind": "exact", "value": "60"
+    }
+    assert codex_observation["unit_ref"]["value"]["unit_id"] == "codex-percent"
+
+    invalid = sources.capture_provider_quota(
+        "codex",
+        {
+            "limit_id": "shared",
+            "primary": {"used_percent": 140, "window_duration_mins": 5, "resets_at": 1_800_001_000},
+        },
+        profile_key=_PROFILE_A,
+        targets=(target,),
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        observed_at_ms=_NOW,
+    )
+    assert invalid.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
+    assert "invalid-provider-value" in {gap.reason for gap in invalid.gaps}
+    nonfinite = sources.capture_provider_quota(
+        "codex",
+        {
+            "limit_id": "shared",
+            "primary": {"used_percent": float("nan"), "window_duration_mins": 5,
+                        "resets_at": 1_800_001_000},
+        },
+        profile_key=_PROFILE_A, targets=(target,), descriptors=(descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW,
+    )
+    assert nonfinite.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
+    negative = sources.capture_provider_quota(
+        "codex",
+        {
+            "limit_id": "shared",
+            "primary": {"used_percent": -1, "window_duration_mins": 5,
+                        "resets_at": 1_800_001_000},
+        },
+        profile_key=_PROFILE_A, targets=(target,), descriptors=(descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW,
+    )
+    assert negative.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
+    infinity = sources.capture_provider_quota(
+        "codex",
+        {
+            "limit_id": "shared",
+            "primary": {"used_percent": float("inf"), "window_duration_mins": 5,
+                        "resets_at": 1_800_001_000},
+        },
+        profile_key=_PROFILE_A, targets=(target,), descriptors=(descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW,
+    )
+    assert infinity.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
+    unsupported = sources.capture_provider_quota(
+        "claude", {"quota": "not-a-supported-interface"}, profile_key=_PROFILE_A,
+        targets=(target,), descriptors=(descriptor,), unit_catalog=(), observed_at_ms=_NOW,
+    )
+    assert unsupported.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
+    assert "no-documented-machine-readable-quota-remaining-interface" in {
+        gap.reason for gap in unsupported.gaps
+    }
+
+    bad_unit = _observation(
+        descriptor, "short", value="8", observed_at_ms=_NOW, unit_id="codex-percent"
+    ).to_dict()
+    bad_unit["unit_ref"]["value"]["unit_id"] = "unregistered-unit"
+    with pytest.raises(schema.QuotaContractError) as unknown_unit_error:
+        schema.parse_observation(bad_unit, descriptors=(descriptor,), unit_catalog=())
+    assert unknown_unit_error.value.code == "unresolved_reference"
+    reversed_bounds = _observation(
+        descriptor, "short", value="8", observed_at_ms=_NOW, unit_id="codex-percent"
+    ).to_dict()
+    reversed_bounds["measurement"]["quantity"]["amount"] = {
+        "kind": "bounds", "lower": "9", "upper": "2"
+    }
+    with pytest.raises(schema.QuotaContractError) as bounds_error:
+        schema.parse_observation(reversed_bounds, descriptors=(descriptor,), unit_catalog=())
+    assert bounds_error.value.code == "invalid_bounds"
+
+    expired = _observation(
+        descriptor, "short", value="80", observed_at_ms=_NOW - 120_000,
+        unit_id="codex-percent",
+    )
+    service = shadow_module.QuotaShadowService.in_memory()
+    service.record_observation(expired.to_dict(), descriptors=(descriptor,), unit_catalog=())
+    stale_report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW
+    )
+    assert _pool_row(stale_report, "pool-shared", "short")["remaining"]["state"] == "unknown"
+    assert "stale-snapshot" in _pool_row(stale_report, "pool-shared", "short")["coverage_gaps"]
+
+    corrupt_file = tmp_path / "quota-events.jsonl"
+    corrupt_file.write_text("{broken\n", encoding="utf-8")
+    corrupt = shadow_module.QuotaShadowService(
+        __import__("paulsha_cortex.coordinator.quota_ledger", fromlist=["QuotaEventLedger"])
+        .QuotaEventLedger(corrupt_file)
+    ).project(descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW)
+    assert corrupt["state"] == "unknown"
+    assert "ledger-corrupt" in corrupt["coverage_gaps"]
+
+
+def test_ac2_copilot_and_antigravity_official_quota_payloads_keep_native_units():
+    sources, _, _ = _feature_api()
+    copilot_unit = "provider:github-copilot-sdk/requests/v1"
+    copilot_descriptor = _pool_descriptor(
+        account="copilot-account", pool="premium-requests", unit_id="requests",
+        semantics_ref=copilot_unit, windows=(("month", 2_678_400_000),),
+    )
+    copilot_target = sources.ProviderQuotaTarget(
+        resource_key="copilot:premium_interactions",
+        binding=_binding((copilot_descriptor,), _PROFILE_A),
+        descriptor=copilot_descriptor,
+        window_id="month",
+    )
+    copilot = sources.capture_provider_quota(
+        "copilot",
+        {"quotaSnapshots": {"premium_interactions": {
+            "entitlementRequests": 12, "usedRequests": 3,
+            "remainingPercentage": 75, "resetDate": "2027-01-15T08:13:20Z",
+        }}},
+        profile_key=_PROFILE_A, targets=(copilot_target,),
+        descriptors=(copilot_descriptor,), unit_catalog=(), observed_at_ms=_NOW,
+    )
+    assert not copilot.gaps
+    assert copilot.observations[0].to_dict()["measurement"]["quantity"]["amount"] == {
+        "kind": "exact", "value": "9"
+    }
+
+    agy_unit = "provider:google-antigravity-cli/quota-fraction/v1"
+    agy_descriptor = _pool_descriptor(
+        account="agy-account", pool="gemini-window", unit_id="fraction",
+        semantics_ref=agy_unit, windows=(("rolling", 300_000),),
+    )
+    agy_target = sources.ProviderQuotaTarget(
+        resource_key="agy:gemini-pro", binding=_binding((agy_descriptor,), _PROFILE_A),
+        descriptor=agy_descriptor, window_id="rolling",
+    )
+    agy = sources.capture_provider_quota(
+        "agy", {"quota": {"gemini-pro": {
+            "remaining_fraction": 0.25, "reset_time": "2027-01-15T08:13:20Z",
+        }}},
+        profile_key=_PROFILE_A, targets=(agy_target,), descriptors=(agy_descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW,
+    )
+    assert not agy.gaps
+    assert agy.observations[0].to_dict()["measurement"]["quantity"]["amount"] == {
+        "kind": "exact", "value": "0.25"
+    }
+
+
+def test_ac3_usage_never_converts_tokens_to_subscription_credits_and_provenance_stays_typed():
+    _, _, shadow_module = _feature_api()
+    credit_descriptor = _pool_descriptor(
+        unit_id="premium-credit",
+        semantics_ref="provider:github-copilot-sdk/premium-interactions/v1",
+        windows=(("month", 2_678_400_000),),
+    )
+    token_unit = schema.parse_unit_definition(
+        {
+            "schema_version": 1,
+            "unit_id": "executor-token",
+            "version": "1",
+            "quantity_kind": "amount",
+            "semantics_ref": "cortex:executor-usage/token/v1",
+        }
+    )
+    binding = _binding((credit_descriptor,), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+    result = service.record_terminal_usage(
+        {
+            "id": "job-builder-1",
+            "executor": "codex",
+            "usage": {"input_tokens": 120, "output_tokens": 30},
+        },
+        profile_key=_PROFILE_A,
+        binding=binding,
+        descriptors=(credit_descriptor,),
+        unit_catalog=(token_unit,),
+        unit_ref_by_metric={
+            "input_tokens": ("executor-token", "1"),
+            "output_tokens": ("executor-token", "1"),
+        },
+        observed_at_ms=_NOW,
+    )
+    assert result.gaps
+    report = service.project(
+        descriptors=(credit_descriptor,), unit_catalog=(token_unit,), now_utc_ms=_NOW + 1
+    )
+    row = _pool_row(report, "pool-shared", "month")
+    assert row["remaining"]["state"] == "unknown"
+    assert "usage-unit-not-comparable" in row["coverage_gaps"]
+    usage_events = [event for event in report["events"] if event["measurement_kind"] == "usage_delta"]
+    assert {event["unit_ref"]["unit_id"] for event in usage_events} == {"executor-token"}
+    assert all(event["source_method"] == "executor_usage" for event in usage_events)
+    assert all(event["source_schema"] == "cortex-terminal-usage-v1" for event in usage_events)
+
+    provenance_service = shadow_module.QuotaShadowService.in_memory()
+    observed = _observation(
+        credit_descriptor, "month", value="10", observed_at_ms=_NOW - 4,
+        unit_id="premium-credit",
+    )
+    provenance_service.record_observation(
+        observed.to_dict(), descriptors=(credit_descriptor,), unit_catalog=()
+    )
+    estimated = _observation(
+        credit_descriptor, "month", value="9", observed_at_ms=_NOW - 3,
+        unit_id="premium-credit",
+    ).to_dict()
+    estimated["measurement"]["quantity"] = {
+        "state": "estimated", "amount": {"kind": "exact", "value": "9"},
+        "method_ref": "fixture:budget-estimate/v1",
+    }
+    estimated["source"]["method"] = "estimate"
+    estimated["source"]["source_schema"] = "fixture-estimate-v1"
+    estimated["source"]["adapter_version"] = "fixture-estimate-adapter-v1"
+    provenance_service.record_observation(
+        estimated, descriptors=(credit_descriptor,), unit_catalog=()
+    )
+    unknown = _observation(
+        credit_descriptor, "month", value=None, observed_at_ms=_NOW - 2,
+        unit_id="premium-credit",
+    )
+    provenance_service.record_observation(
+        unknown.to_dict(), descriptors=(credit_descriptor,), unit_catalog=()
+    )
+    provenance = provenance_service.project(
+        descriptors=(credit_descriptor,), unit_catalog=(), now_utc_ms=_NOW + 1
+    )
+    quantity_states = {event["quantity"]["state"] for event in provenance["events"]}
+    assert quantity_states == {"observed", "estimated", "unknown"}
+    assert any(event["source_schema"] == "fixture-estimate-v1" for event in provenance["events"])
+
+
+def test_ac4_manager_worker_reviewer_replays_deduplicate_and_external_gap_is_visible():
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000), ("week", 604_800_000)))
+    unit = schema.parse_unit_definition(
+        {
+            "schema_version": 1,
+            "unit_id": "token",
+            "version": "1",
+            "quantity_kind": "amount",
+            "semantics_ref": "fixture:native-token/v1",
+        }
+    )
+    binding = _binding((descriptor,), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+    service.record_observation(
+        _observation(descriptor, "short", value="20", observed_at_ms=_NOW).to_dict(),
+        descriptors=(descriptor,),
+        unit_catalog=(unit,),
+        idempotency_key="provider-snapshot-1",
+    )
+    service.record_observation(
+        _observation(descriptor, "week", value="50", observed_at_ms=_NOW).to_dict(),
+        descriptors=(descriptor,), unit_catalog=(unit,), idempotency_key="provider-snapshot-week-1",
+    )
+    jobs = [
+        {"id": "job-controller", "executor": "codex", "usage": {"input_tokens": 2}},
+        {"id": "job-worker", "executor": "codex", "usage": {"input_tokens": 3}},
+        {"id": "job-reviewer", "executor": "codex", "usage": {"input_tokens": 1}},
+    ]
+    for job in jobs:
+        first = service.record_terminal_usage(
+            job,
+            profile_key=_PROFILE_A,
+            binding=binding,
+            descriptors=(descriptor,),
+            unit_catalog=(unit,),
+            unit_ref_by_metric={"input_tokens": ("token", "1")},
+            observed_at_ms=_NOW + 10,
+        )
+        replay = service.record_terminal_usage(
+            deepcopy(job),
+            profile_key=_PROFILE_A,
+            binding=binding,
+            descriptors=(descriptor,),
+            unit_catalog=(unit,),
+            unit_ref_by_metric={"input_tokens": ("token", "1")},
+            observed_at_ms=_NOW + 10,
+        )
+        assert first.accepted == 2
+        assert replay.duplicates == 2
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(unit,), now_utc_ms=_NOW + 20
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["amount"] == {"kind": "exact", "value": "14"}
+    assert "external-session-unobserved" in row["coverage_gaps"]
+    week = _pool_row(report, "pool-shared", "week")
+    assert week["remaining"]["amount"] == {"kind": "exact", "value": "44"}
+    assert "external-session-unobserved" in week["coverage_gaps"]
+    assert report["dispatch_effect"] == "none"
+
+    bounded_service = shadow_module.QuotaShadowService.in_memory()
+    bounded_payload = _observation(
+        descriptor, "short", value="15", observed_at_ms=_NOW
+    ).to_dict()
+    bounded_payload["measurement"]["quantity"]["amount"] = {
+        "kind": "bounds", "lower": "10", "upper": "20"
+    }
+    bounded_observation = schema.parse_observation(
+        bounded_payload, descriptors=(descriptor,), unit_catalog=(unit,)
+    )
+    bounded_service.record_observation(
+        bounded_observation, descriptors=(descriptor,), unit_catalog=(unit,),
+        idempotency_key="bounded-provider-snapshot",
+    )
+    bounded_service.record_terminal_usage(
+        {"id": "job-bounded", "executor": "codex", "usage": {"input_tokens": 3}},
+        profile_key=_PROFILE_A, binding=binding, descriptors=(descriptor,),
+        unit_catalog=(unit,), unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 10,
+    )
+    bounded_report = bounded_service.project(
+        descriptors=(descriptor,), unit_catalog=(unit,), now_utc_ms=_NOW + 20
+    )
+    assert _pool_row(bounded_report, "pool-shared", "short")["remaining"]["amount"] == {
+        "kind": "bounds", "lower": "7", "upper": "17"
+    }
+
+    external_service = shadow_module.QuotaShadowService.in_memory()
+    external_payload = _observation(
+        descriptor, "short", value="16", observed_at_ms=_NOW
+    ).to_dict()
+    external_payload["source"].update({
+        "source_id": "external-read-host",
+        "source_schema": "fixture-external-read-v1",
+        "adapter_version": "external-reader-v1",
+        "authority_ref": "fixture:external-read-authority/v1",
+        "method": "structured_event",
+        "provenance_refs": ["fixture:external-host-read/v1"],
+    })
+    external = external_service.record_external_observation(
+        external_payload, descriptors=(descriptor,), unit_catalog=(unit,),
+        idempotency_key="external-read-1",
+    )
+    assert external.accepted == 1
+    external_report = external_service.project(
+        descriptors=(descriptor,), unit_catalog=(unit,), now_utc_ms=_NOW + 1
+    )
+    assert any(event["source_schema"] == "fixture-external-read-v1"
+               for event in external_report["events"])
+    assert "external-session-unobserved" in _pool_row(
+        external_report, "pool-shared", "short"
+    )["coverage_gaps"]
+
+
+def test_ac5_restart_replay_reset_clock_rollback_and_conflicts_do_not_wash_out_usage(tmp_path):
+    _, ledger_module, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    state_path = tmp_path / "quota-events.jsonl"
+    first = shadow_module.QuotaShadowService(ledger_module.QuotaEventLedger(state_path))
+    snapshot = _observation(
+        descriptor,
+        "short",
+        value="18",
+        observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 300_000,
+        event_id="snapshot-1",
+    )
+    assert first.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+    assert first.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).duplicates == 1
+
+    restarted = shadow_module.QuotaShadowService(ledger_module.QuotaEventLedger(state_path))
+    clock_rollback = restarted.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW - 1
+    )
+    assert _pool_row(clock_rollback, "pool-shared", "short")["remaining"]["state"] == "unknown"
+    assert "clock-rollback" in _pool_row(clock_rollback, "pool-shared", "short")["coverage_gaps"]
+    older = _observation(
+        descriptor,
+        "short",
+        value="99",
+        observed_at_ms=_NOW - 10,
+        reset_at_ms=_NOW + 300_000,
+        event_id="snapshot-older",
+    )
+    restarted.record_observation(older.to_dict(), descriptors=(descriptor,), unit_catalog=())
+    rollback = restarted.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 1
+    )
+    assert _pool_row(rollback, "pool-shared", "short")["remaining"]["amount"]["value"] == "18"
+
+    conflict = deepcopy(snapshot.to_dict())
+    conflict["measurement"]["quantity"]["amount"]["value"] = "7"
+    conflict_record = schema.parse_observation(
+        conflict, descriptors=(descriptor,), unit_catalog=()
+    )
+    assert restarted.record_observation(
+        conflict_record.to_dict(),
+        descriptors=(descriptor,),
+        unit_catalog=(),
+    ).status == "conflict"
+    after_conflict = restarted.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 2
+    )
+    assert _pool_row(after_conflict, "pool-shared", "short")["remaining"]["state"] == "unknown"
+    assert "source-conflict" in _pool_row(after_conflict, "pool-shared", "short")["coverage_gaps"]
+
+    reset_snapshot = _observation(
+        descriptor,
+        "short",
+        value="25",
+        observed_at_ms=_NOW + 300_001,
+        reset_at_ms=_NOW + 600_000,
+        event_id="snapshot-reset-2",
+    )
+    restarted.record_observation(reset_snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=())
+    reset_report = restarted.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 300_002
+    )
+    assert _pool_row(reset_report, "pool-shared", "short")["remaining"]["amount"]["value"] == "25"
+
+
+def test_ac6_provider_read_interfaces_and_shadow_fixture_do_not_touch_dispatch_or_credentials():
+    sources, _, shadow_module = _feature_api()
+    assert sources.provider_read_contract("agy")["argv"] == (
+        "agy", "-p", "/usage", "--output-format", "json"
+    )
+    assert sources.provider_read_contract("codex")["method"] == "account/rateLimits/read"
+    assert sources.provider_read_contract("copilot")["method"] == "account.getQuota"
+    assert sources.provider_read_contract("claude")["state"] == "unsupported"
+    assert sources.provider_read_contract("cg")["state"] == "unknown"
+
+    positive = json.loads(
+        Path("tests/fixtures/patchmud/usage-provenance-v1/positive.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert positive["fields"]["billed_input_total"]["state"] == "observed"
+    assert positive["fields"]["reasoning"]["state"] == "unknown"
+    service = shadow_module.QuotaShadowService.in_memory()
+    assert service.project(descriptors=(), unit_catalog=(), now_utc_ms=_NOW)["dispatch_effect"] == "none"

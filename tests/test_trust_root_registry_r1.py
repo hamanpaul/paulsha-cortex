@@ -106,6 +106,30 @@ def test_slice_review_log_is_registered_as_manager_only(tmp_path: Path) -> None:
     )
 
 
+def test_quota_observation_ledger_is_manager_written_monitor_readable(tmp_path: Path, monkeypatch) -> None:
+    """#836 durable shadow state has one resolver and no headless write access."""
+    from paulsha_cortex.trust_root import permgen
+
+    asset = registry.asset_by_id("quota-observation-events")
+    assert asset.tier is AssetTier.TIER_1
+    assert asset.tree is TrustTree.MANAGER_OWNED
+    assert asset.writers == (Principal.MANAGER,)
+    assert asset.readers == (Principal.MANAGER, Principal.MONITOR)
+    assert asset.path_resolver == "paulsha_cortex.config.paths:quota_observation_root"
+    assert asset.headless_writable() is False
+    coordinator = tmp_path / "coordinator"
+    monkeypatch.setenv("PSC_COORDINATOR_ROOT", str(coordinator))
+    assert paths.quota_observation_root() == coordinator / "quota-observations"
+    assert permgen.DEFAULT_LAYOUT.asset_paths()["quota-observation-events"] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/quota-observations"
+    )
+    for scheme in (permgen.TWO_WAY_SCHEME, permgen.THREE_WAY_SCHEME):
+        assert scheme.resolve(Principal.MANAGER) == scheme.resolve(Principal.MONITOR)
+        entry = permgen.generate_plan(scheme).by_id("quota-observation-events")
+        assert entry.writer_accounts == frozenset({scheme.resolve(Principal.MANAGER)})
+        assert entry.reader_accounts == frozenset({scheme.resolve(Principal.MANAGER)})
+
+
 def test_all_three_headless_personas_covered() -> None:
     """spec §R1：盤點必須涵蓋 builder／reviewer／planner 三者，不能只封 builder。"""
     assert registry.personas_covered() == HEADLESS_PERSONAS

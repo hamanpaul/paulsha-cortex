@@ -1750,6 +1750,16 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         IngressKind.MANAGER_INTERNAL,
         note="v4 R1 coverage shadow disagreement telemetry；本票撰寫期間新增的 durable state。",
     ),
+    TrustRootAsset(
+        "quota-observation-events", _T1, _MO,
+        "paulsha_cortex.config.paths:quota_observation_root",
+        (Principal.MANAGER,), (Principal.MANAGER, Principal.MONITOR),
+        IngressKind.MANAGER_INTERNAL,
+        note=(
+            "#836 shadow quota event ledger；Manager append-only 寫入，Monitor 唯讀投影。"
+            "兩者共用部署帳號，headless persona 無寫入權。"
+        ),
+    ),
     # ---- monitor state 族 --------------------------------------------------
     TrustRootAsset(
         "monitor-state-tree", _T1, _MO, "paulsha_cortex.config.paths:monitor_state_root",

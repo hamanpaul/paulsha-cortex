@@ -74,6 +74,21 @@ def test_every_entry_fully_populated(scheme) -> None:
         assert e.rationale, e.asset_id
 
 
+@pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
+def test_quota_observation_ledger_is_manager_state_and_monitor_read_only(scheme) -> None:
+    entry = _plan(scheme).by_id("quota-observation-events")
+    manager = scheme.resolve(Principal.MANAGER)
+    monitor = scheme.resolve(Principal.MONITOR)
+    assert manager == monitor
+    assert entry.owner == scheme.durable_state_owner
+    assert entry.writer_accounts == frozenset({manager})
+    assert entry.reader_accounts == frozenset({manager})
+    for persona in (Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER):
+        account = scheme.resolve(persona)
+        if account != manager:
+            assert account not in entry.writer_accounts
+
+
 # ---------------------------------------------------------------------------
 # 核心不變式（兩個 scheme 都成立）
 # ---------------------------------------------------------------------------
