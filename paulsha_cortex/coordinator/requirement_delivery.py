@@ -764,8 +764,15 @@ def _verify_remote_merge(
             raise ValueError("CompletionRecord WorkAuthority missing")
         if wire.get("merge_commit") != facts.merge_commit.lower():
             return _stage("failed", "remote-merge-commit-mismatch")
-        if record.get("target_ref_sha") != facts.default_head.lower():
-            return _stage("failed", "remote-default-head-mismatch")
+        # 對抗審查第四輪 BLOCKER：`record.target_ref_sha` 是合併當下捕捉、不可變
+        # 的歷史快照；其他 PR 之後推進 default branch 是正常事件，會讓「目前」
+        # `facts.default_head` 不再等於它。已完成的交付只要求這條 PR 的
+        # merge commit 仍是「目前」default head 的祖先（merge ancestry）——這正是
+        # `evaluate_remote_closure` 透過 `facts.merge_is_ancestor`（對目前 default
+        # head 即時計算）已經驗證的條件，不需要、也不應該再對歷史快照要求相等，
+        # 否則會讓已 covered 的需求因為之後的正常推進而退化。這裡不改
+        # `evaluate_remote_closure` 本身的語意（其他呼叫者仍照舊），只是不在
+        # consumer 端疊加這條錯誤的額外相等檢查。
         if facts.pr_head.lower() != str(row.get("candidate_sha", "")).lower():
             return _stage("failed", "remote-pr-head-mismatch")
         target = row.get("target")
@@ -1279,6 +1286,27 @@ def _read_completion_review_for_history(mapping: Mapping[str, Any], *, evidence_
     return {key: mapping.get(key) for key in ("mapping_id", "requirement_id", "requirement_revision", "acceptance_id", "repo", "work_id", "run_id", "workflow_step_ids", "pr_number", "change", "todo_paths", "candidate_sha", "merge_sha", "profile_key", "config_revision", "policy_version", "completion_record", "source_generation", "source_revision_sha256", "authority_sha256", "status", "evidence", "target", "observed_at")}
 
 
+def _evidence_weakened(previous_evidence: object, incoming_evidence: object) -> bool:
+    """對抗審查第四輪 MAJOR：同一 generation 重讀時，任何原本 ``verified`` 的
+    階段（例如 merge／installed）在新讀取中不再是 ``verified``，即視為弱化——
+    這通常是暫時性讀取失敗（網路抖動、API 短暫不可用），不是真的失效，不可
+    用來取代既有已驗證結果。"""
+    if not isinstance(previous_evidence, Mapping):
+        return False
+    if not isinstance(incoming_evidence, Mapping):
+        return any(
+            isinstance(stage, Mapping) and stage.get("status") == "verified"
+            for stage in previous_evidence.values()
+        )
+    for stage_name, previous_stage in previous_evidence.items():
+        if not (isinstance(previous_stage, Mapping) and previous_stage.get("status") == "verified"):
+            continue
+        incoming_stage = incoming_evidence.get(stage_name)
+        if not (isinstance(incoming_stage, Mapping) and incoming_stage.get("status") == "verified"):
+            return True
+    return False
+
+
 def reconcile_delivery(
     manifest: object,
     source_snapshot: object,
@@ -1344,21 +1372,30 @@ def reconcile_delivery(
             return {"report": report, "index": base, "changed": False, "index_revision": base_revision, "pending_reason": "work-authority-unavailable-before-commit"}
     new_by_id = {row["mapping_id"]: _read_completion_review_for_history(row, evidence_root=Path(evidence_root)) for row in report["mappings"]}
     old_rows = {row.get("mapping_id"): copy.deepcopy(row) for row in base["mappings"] if isinstance(row, dict) and isinstance(row.get("mapping_id"), str)}
+    # 依「同一 requirement／criterion／repo／work／run」的 logical 範圍索引既有
+    # rows（不論目前狀態），供下面的 generation 守門查詢用；mapping_id 會因
+    # candidate/completion_record 等內容變動而改變，不能只用 mapping_id 相同來
+    # 判斷是否為同一份需求交付。
+    old_rows_by_logical: dict[tuple[Any, ...], list[str]] = {}
+    for old_id, old_row in old_rows.items():
+        old_logical = tuple(old_row.get(key) for key in ("requirement_id", "acceptance_id", "repo", "work_id", "run_id"))
+        old_rows_by_logical.setdefault(old_logical, []).append(old_id)
     for new_row in new_by_id.values():
         logical = tuple(new_row.get(key) for key in ("requirement_id", "acceptance_id", "repo", "work_id", "run_id"))
-        for old_id, old_row in old_rows.items():
-            old_logical = tuple(old_row.get(key) for key in ("requirement_id", "acceptance_id", "repo", "work_id", "run_id"))
-            if old_id == new_row["mapping_id"] or old_logical != logical or old_row.get("status") != "covered":
+        new_generation = new_row.get("source_generation")
+        for old_id in old_rows_by_logical.get(logical, ()):
+            if old_id == new_row["mapping_id"]:
                 continue
-            # 這裡是「同一 requirement／criterion 範圍、不同 mapping_id」的比較，
-            # 不能只看 mapping_id 是否相同就直接標 stale：mapping_id 會因
-            # candidate/completion_record 等內容變動而改變，若晚到的舊
-            # generation（例如從未入索引過的 gen1）先被當成 new_row 走到這裡，
-            # 會把已落地、較新且仍合法的 covered mapping 誤標成 stale，等於讓舊
-            # snapshot 回滾新結果。generation 比較必須跨 mapping_id、以此 logical
-            # 範圍為準；較舊 generation 不得覆蓋或使較新有效 mapping stale。
+            old_row = old_rows[old_id]
             old_generation = old_row.get("source_generation")
-            new_generation = new_row.get("source_generation")
+            # 對抗審查第四輪 MAJOR（跨 mapping generation 守門）：晚到的舊
+            # generation（例如從未入索引過的 gen1）若先被當成 new_row 走到這
+            # 裡，不論該 logical 範圍內既有 row 目前是 covered／blocked／stale
+            # 哪個狀態，都是已見過的較新事實之前的舊輸入，不得插入或讓 index
+            # 的 closure_readiness 翻回 ready——generation 比較必須跨 mapping_id
+            # 且不論既有 row 狀態，以此 logical 範圍內已見過的最高 generation
+            # 為準；只看 covered rows 會讓已 blocked／stale 的較新 generation
+            # 被遲到的較舊 generation 繞過。
             if (
                 type(old_generation) is int
                 and type(new_generation) is int
@@ -1367,6 +1404,23 @@ def reconcile_delivery(
                 report["closure_readiness"] = "pending"
                 report["source_generation_drift"] = True
                 return {"report": report, "index": base, "changed": False, "index_revision": base_revision, "pending_reason": "late-source-generation-ignored"}
+            if old_row.get("status") != "covered":
+                continue
+            # 對抗審查第四輪 MAJOR（同 generation 弱化重讀）：mapping_id 不同但
+            # logical 範圍、generation 都相同，代表這是同一份交付的重新讀取，
+            # 不是新的一代——若重讀結果比既有 covered 弱（任何原本 verified 的
+            # 階段變成非 verified，例如 merge／installed 證據因暫時性讀取失敗
+            # 而遺失），必須保留既有 covered、記 pending／drift，不得讓暫時性
+            # 弱讀取靜默取代已驗證結果。
+            if (
+                type(old_generation) is int
+                and type(new_generation) is int
+                and new_generation == old_generation
+                and _evidence_weakened(old_row.get("evidence"), new_row.get("evidence"))
+            ):
+                report["closure_readiness"] = "pending"
+                report["source_generation_drift"] = True
+                return {"report": report, "index": base, "changed": False, "index_revision": base_revision, "pending_reason": "same-generation-weaker-evidence-ignored"}
             old_row["status"] = "stale"
             old_row["stale_reason"] = "mapping-context-updated"
             old_row["superseded_by"] = new_row["mapping_id"]

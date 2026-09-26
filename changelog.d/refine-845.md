@@ -18,3 +18,41 @@ generation 不得覆蓋或使較新有效 mapping stale，偵測到即回報
 `late-source-generation-ignored` 並不落盤。測試補上可獨立表達 PR
 closingIssuesReferences 與 todo 完成度的負例，以及舊 generation 回滾的 regression
 測試。
+
+對抗審查第四輪修正（reconcile fail-closed 加嚴，共三條）：
+
+1. BLOCKER：`_verify_remote_merge` 先前額外要求 CompletionRecord 的
+   `target_ref_sha`（合併當下捕捉、不可變）等於「目前」remote default head，
+   導致其他 PR 之後推進 default branch 只是正常事件，也會讓已完成、原本
+   covered 的交付在下一次 `cortex delivery gaps／reconcile` 重跑時被誤判為
+   `remote-default-head-mismatch` 而退化。已完成的交付現在只要求這條 PR 的
+   merge commit 仍是「目前」default head 的祖先（merge ancestry）——這正是
+   共用 gate `evaluate_remote_closure` 透過 `facts.merge_is_ancestor`（對目前
+   default head 即時計算）已經驗證的條件，因此直接移除這條錯誤的額外相等
+   檢查，不改 `evaluate_remote_closure` 本身語意，其他呼叫者（例如
+   `ShipOrchestrator.verify_remote_closure`，其在合併當下寫入全新記錄，要求
+   相等本身是對的）不受影響。
+2. MAJOR：`reconcile_delivery` 跨 mapping 的 generation 守門先前只掃既有
+   `covered` rows；若同一 requirement／criterion／repo／work／run 範圍內較新
+   的 generation 已是 `blocked`／`stale`，遲到的舊 generation（不同
+   CompletionRecord，因而 mapping_id 不同）會直接跳過守門、被當成新
+   coverage 插入，把 index 翻回 `ready`。現改為以該 logical 範圍內**已見過
+   的最高 generation（不論狀態）**為準；較舊 generation 一律回報
+   `late-source-generation-ignored` 並不落盤，不再侵限於「既有 row 恰好是
+   covered」的狀況。
+3. MAJOR：`same-source-generation-content-drift` 先前只在 incoming row 與既有
+   row 保持**相同 mapping_id** 時才比對；同一 generation 重讀若暫時失去已
+   驗證欄位（例如 merge 證據因網路抖動短暫讀取失敗，導致 `merge_sha` 從實際
+   值變成缺欄位），會改變 mapping_id 而完全繞過這條偵測，讓暫時性弱讀取
+   靜默把既有 covered 換成 blocked／unknown。現在同一 logical 範圍、同一
+   generation 但 mapping_id 不同時，會另外比較兩者的 stage evidence：只要
+   任一原本 `verified` 的階段在新讀取中不再是 `verified`，即視為弱化，保留
+   既有 covered、回報 `same-generation-weaker-evidence-ignored` 並不落盤，
+   不讓暫時性讀取失敗覆蓋已驗證結果。
+
+三條均先以 RED 測試（`git show HEAD:` 還原生產碼跑新測試）確認可重現後再修，
+`tests/test_requirement_delivery.py` 新增三個對應 regression 測試，全數
+GREEN；既有 `test_requirement_delivery*.py`／`test_github_delivery_client.py`／
+`test_delivery_orchestrator.py` 與 `-k "delivery or remote_closure or retire"`
+全數維持通過，確認未影響共用 gate 對其他呼叫者（ship/merge 時的新鮮記錄
+校驗）的既有語意。

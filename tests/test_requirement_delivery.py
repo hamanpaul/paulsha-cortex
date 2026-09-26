@@ -50,12 +50,20 @@ class _GitHub:
         issue_state: str = "closed",
         closing_issues: tuple[int, ...] = (845,),
         todo_complete: bool = True,
+        default_head: str | None = None,
+        merge_is_ancestor: bool = True,
     ) -> None:
         self.merge = merge
         self.head = head
         self.issue_state = issue_state
         self.closing_issues = closing_issues
         self.todo_complete = todo_complete
+        # 對抗審查第四輪 BLOCKER：其他 PR 之後推進 default branch 時，
+        # `default_head` 會跟這條 PR 的 merge_commit 不同（但 merge_commit
+        # 仍是它的祖先）；預設沿用舊行為（等於 merge），只在測試明確要模擬
+        # 「default branch 之後又推進」時才覆寫。
+        self.default_head = default_head if default_head is not None else merge
+        self.merge_is_ancestor = merge_is_ancestor
         self.calls: list[dict] = []
 
     def fetch_remote_closure(self, **kwargs):
@@ -64,8 +72,8 @@ class _GitHub:
             merge_commit=self.merge,
             pr_head=self.head,
             merge_parents=(MERGE, self.head),
-            default_head=self.merge,
-            merge_is_ancestor=True,
+            default_head=self.default_head,
+            merge_is_ancestor=self.merge_is_ancestor,
             merge_is_merge_commit=True,
             issue_states={845: self.issue_state},
             active_openspec_absent=True,
@@ -75,6 +83,14 @@ class _GitHub:
             completion_record_valid=True,
             closing_issues=self.closing_issues,
         )
+
+
+class _FlakyGitHub:
+    """對抗審查第四輪 MAJOR（同 generation 重讀弱化）用：模擬短暫網路抖動，
+    讓 merge 階段暫時失去已驗證欄位（回退成 unknown），而不是真的失效。"""
+
+    def fetch_remote_closure(self, **kwargs):
+        raise RuntimeError("transient network hiccup")
 
 
 def _authority(*, work_id: str = WORK, last_success: float = NOW - 1, snapshot_hash: str = "b" * 64, source_revision: str = "a" * 40):
@@ -675,6 +691,91 @@ def test_a06_candidate_change_stales_only_its_mapping(tmp_path: Path) -> None:
     assert statuses[("R01", HEAD)] == "stale"
     assert statuses[("R01", "9" * 40)] == "blocked"
     assert statuses[("R02", HEAD)] == "covered"
+
+
+def test_a06_default_head_advancing_after_merge_keeps_completed_delivery_covered(tmp_path: Path) -> None:
+    """對抗審查第四輪 BLOCKER：其他 PR 推進 default branch 後重跑
+    delivery gaps／reconcile，已完成交付的 CompletionRecord.target_ref_sha
+    （合併當下捕捉、不可變）不會再等於「目前」default head——只要這條 PR
+    的 merge commit 仍是目前 default head 的祖先（merge ancestry），已
+    covered 的需求不能因為之後的正常推進而退化成 remote-default-head-mismatch。
+    """
+    manifest, snapshot, context = _ready_case(tmp_path)
+    advanced_default_head = "9" * 40
+    context["github_client"] = _GitHub(default_head=advanced_default_head)
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    assert report["closure_readiness"] == "ready"
+    merge_evidence = report["mappings"][0]["evidence"]["merge"]
+    assert merge_evidence["status"] == "verified"
+    assert merge_evidence["target_sha"] == advanced_default_head
+
+
+def test_a07_late_lower_generation_cannot_flip_blocked_scope_back_to_covered(tmp_path: Path) -> None:
+    """對抗審查第四輪 MAJOR：跨 mapping 的 generation 守門原本只看既有
+    covered rows；若同一 requirement／criterion／repo／work／run 的
+    generation 2 已是 blocked，遲到的 generation 1（不同 CompletionRecord，
+    mapping_id 因而不同）不能被當新 coverage 插入、把 index 翻回 ready。
+    守門必須以該 logical 範圍內已見過的最高 generation（不論狀態）為準。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    index_path = tmp_path / "index.json"
+    row = snapshot["mappings"][0]
+
+    blocked_gen2 = copy.deepcopy(snapshot)
+    blocked_gen2["snapshot_revision"] = 2
+    blocked_gen2["mappings"][0]["source_generation"] = 2
+    blocked_context = {**context, "github_client": _GitHub(merge="0" * 40)}
+    first = reconcile_delivery(manifest, blocked_gen2, index_path=index_path, **blocked_context)
+    assert first["report"]["closure_readiness"] == "not-ready"
+    assert first["index"]["mappings"][0]["status"] == "blocked"
+
+    late_gen1 = copy.deepcopy(snapshot)
+    late_gen1["snapshot_revision"] = 3
+    late_row = late_gen1["mappings"][0]
+    late_row["source_generation"] = 1
+    late_row["completion_record"] = _write_completion(
+        tmp_path,
+        run_id=row["run_id"],
+        slice_id="late-lower-generation-under-blocked-scope",
+        acceptance_ids=["R01-AC1"],
+    )
+
+    result = reconcile_delivery(manifest, late_gen1, index_path=index_path, **context)
+
+    assert result["changed"] is False
+    assert result["pending_reason"] == "late-source-generation-ignored"
+    stored = read_index(index_path)
+    assert len(stored["mappings"]) == 1
+    assert stored["mappings"][0]["status"] == "blocked"
+    assert stored["mappings"][0]["source_generation"] == 2
+
+
+def test_a07_same_generation_reread_with_weaker_evidence_does_not_replace_covered(tmp_path: Path) -> None:
+    """對抗審查第四輪 MAJOR：same-source-generation-content-drift 只在
+    incoming row 維持相同 mapping_id 時才檢查；同一 generation 重讀若暫時
+    失去已驗證欄位（例如 merge evidence 因網路抖動短暫拿不到），merge_sha
+    從實際值變成缺欄位、mapping_id 因而改變，不能被靜默當成新 mapping 插入、
+    讓已 covered 的 requirement 被 blocked/unknown 取代。應保留既有 covered，
+    記 pending／drift。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    index_path = tmp_path / "index.json"
+
+    first = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+    assert first["report"]["closure_readiness"] == "ready"
+    covered_mapping_id = first["index"]["mappings"][0]["mapping_id"]
+
+    flaky = copy.deepcopy(snapshot)
+    flaky_context = {**context, "github_client": _FlakyGitHub()}
+
+    result = reconcile_delivery(manifest, flaky, index_path=index_path, **flaky_context)
+
+    assert result["changed"] is False
+    assert result.get("pending_reason") is not None
+    stored = read_index(index_path)
+    assert len(stored["mappings"]) == 1
+    assert stored["mappings"][0]["mapping_id"] == covered_mapping_id
+    assert stored["mappings"][0]["status"] == "covered"
 
 
 def test_a06_never_indexed_older_generation_cannot_roll_back_newer_covered_mapping(tmp_path: Path) -> None:
