@@ -247,10 +247,9 @@ def test_agy_probe_and_builder_shapes_do_not_gain_reviewer_schema(tmp_path: Path
         log_dir=str(tmp_path / "logs"),
         worktree=str(tmp_path / "builder"),
     )
-    assert builder == [
-        "agy",
-        "--print",
-        "implement",
+    assert builder[:2] == ["agy", "--print"]
+    assert builder[2].startswith("implement\n\n")
+    assert builder[3:] == [
         "--mode",
         "accept-edits",
         "--add-dir",

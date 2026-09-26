@@ -92,18 +92,33 @@ def test_agy_builder_argv_uses_accept_edits_and_scopes_worktree(tmp_path) -> Non
         worktree=str(worktree),
     )
 
-    assert argv[:5] == [
-        "agy",
-        "--print",
-        "implement",
-        "--mode",
-        "accept-edits",
-    ]
+    assert argv[:2] == ["agy", "--print"]
+    assert argv[2].startswith("implement\n\n")
+    assert argv[3:5] == ["--mode", "accept-edits"]
     assert argv[5:7] == ["--add-dir", str(worktree.resolve())]
     assert argv[argv.index("--output-format") + 1] == "json"
     _assert_print_timeout(argv, "2400s")
     assert "--sandbox" not in argv
     assert "--dangerously-skip-permissions" not in argv
+
+
+def test_agy_builder_prompt_requires_foreground_synchronous_commands(tmp_path) -> None:
+    argv = build_agy_argv(
+        prompt="implement",
+        slice_id="build-foreground",
+        log_dir=str(tmp_path / "logs"),
+        worktree=str(tmp_path / "builder-checkout"),
+    )
+
+    builder_prompt = argv[argv.index("--print") + 1]
+    assert (
+        "Run tests and long-running commands directly in the foreground, "
+        "synchronously, and wait for each to finish before continuing."
+    ) in builder_prompt
+    assert (
+        "Do not start background tasks or background processes for tests or "
+        "long-running commands."
+    ) in builder_prompt
 
 
 def test_agy_builder_unsafe_argv_adds_permission_bypass(tmp_path) -> None:
@@ -116,13 +131,9 @@ def test_agy_builder_unsafe_argv_adds_permission_bypass(tmp_path) -> None:
         allow_unsafe=True,
     )
 
-    assert argv[:5] == [
-        "agy",
-        "--print",
-        "implement",
-        "--mode",
-        "accept-edits",
-    ]
+    assert argv[:2] == ["agy", "--print"]
+    assert argv[2].startswith("implement\n\n")
+    assert argv[3:5] == ["--mode", "accept-edits"]
     assert argv[5:7] == ["--add-dir", str(worktree.resolve())]
     _assert_print_timeout(argv, "2400s")
     assert "--sandbox" not in argv
@@ -293,6 +304,7 @@ def test_agy_commit_required_argv_adds_linked_git_write_dirs(monkeypatch, tmp_pa
         if value == "--add-dir"
     ]
     assert add_dirs == [str(worktree.resolve()), *git_write_dirs]
+    assert "--dangerously-skip-permissions" not in argv
     _assert_print_timeout(argv, "2400s")
 
 
@@ -433,14 +445,11 @@ def test_agy_commit_required_launcher_emits_real_scoped_git_dirs(monkeypatch, tm
         for index, value in enumerate(inner_argv)
         if value == "--add-dir"
     ]
-    assert inner_argv[:5] == [
-        "agy",
-        "--print",
-        prompt,
-        "--mode",
-        "accept-edits",
-    ]
+    assert inner_argv[:2] == ["agy", "--print"]
+    assert inner_argv[2].startswith(f"{prompt}\n\n")
+    assert inner_argv[3:5] == ["--mode", "accept-edits"]
     assert add_dirs == [str(tmp_path.resolve()), *git_write_dirs]
+    assert "--dangerously-skip-permissions" not in inner_argv
     _assert_print_timeout(inner_argv, "2400s")
     assert "--sandbox" not in inner_argv
 
@@ -591,10 +600,9 @@ def test_build_agy_argv_accepts_explicit_canonical_print_timeout_keyword(tmp_pat
         print_timeout="900s",
     )
 
-    assert argv == [
-        "agy",
-        "--print",
-        prompt,
+    assert argv[:2] == ["agy", "--print"]
+    assert argv[2].startswith(f"{prompt}\n\n")
+    assert argv[3:] == [
         "--mode",
         "accept-edits",
         "--add-dir",
@@ -750,7 +758,9 @@ def test_agy_launcher_emits_single_resolved_print_timeout_in_wrapper_script(
 
     assert calls
     inner_argv = _script_inner_argv(calls[0][2])
-    assert inner_argv[inner_argv.index("--print") + 1] == prompt
+    assert inner_argv[inner_argv.index("--print") + 1].startswith(
+        f"{prompt}\n\n"
+    )
     _assert_print_timeout(inner_argv, expected_timeout)
 
 
