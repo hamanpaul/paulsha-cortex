@@ -288,15 +288,19 @@ def _idempotency_key(observation, wire, caller_key):
     measurement = wire.get("measurement", {})
     scope = _scope_summary(wire)
     observed_at_ms = _known_value(wire.get("observed_at_ms"))
-    source = wire.get("source", {})
     if scope.get("state") == "known" and type(observed_at_ms) is int:
         # Without a provider event ID, use stable observation coordinates rather
-        # than content: a changed quantity at the same source/scope/time must
-        # collide and create a conflict receipt.
+        # than content: a changed quantity at the same scope/time must collide
+        # and create a conflict receipt. The key intentionally excludes
+        # source_id/source_schema/method: conflict detection must compare
+        # across sources on semantic scope (pool/window/observed_at), not only
+        # within one source. Keying on source fields let a manager provider
+        # read and an imported external read (or the same source before/after
+        # an adapter-schema rollback) report different remaining values for
+        # the same pool/window/observed_at without ever colliding, so
+        # project() silently picked one arbitrarily instead of raising a
+        # conflict receipt (see #836 對抗審查第六輪 MAJOR quota_ledger.py:296).
         derived_identity = {
-            "source_id": source.get("source_id"),
-            "source_schema": source.get("source_schema"),
-            "method": source.get("method"),
             "scope": scope,
             "metric_id": measurement.get("metric_id"),
             "kind": measurement.get("kind"),

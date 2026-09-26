@@ -77,3 +77,26 @@ observed_at）本已完整反映於 snapshot，只是因為 manager 重啟才在
 unknown。ledger 現在同時保存 `terminal_job_finished_at_ms`；`finished_at`
 已知且不晚於 snapshot 的 observed_at 時，這筆 usage 視為已反映於 snapshot，
 直接忽略、不扣減也不判為 straddling。
+
+修正真實 producer 路徑（`record_provider_read`）產生的 provider snapshot
+一律 `window_instance=unknown` 的問題：即使收到含 reset 的 fresh snapshot，
+`project()` 之前仍只會報 `window-epoch-unknown` 而不扣減，matching-usage 的
+AC 仍只能靠手工假資料覆蓋才會通過。現在依 adapter 正式回報的 reset 時間與
+pool 契約既有的 window duration 推導可比對的 window epoch（能唯一判定才
+標 known），並新增以 `record_provider_read` → `record_terminal_usage` →
+`project()` 端到端驗證會正確扣減的測試。
+
+修正同一 binding 同時含可比對 unit 的 pool（例如 tokens）與不可換算 unit
+的 pool（premium credit／request）時，`record_terminal_usage()` 只要有任一
+constraint 命中可比對 unit 就整批視為「已比對」，導致不可換算的那個 pool
+完全拿不到任何證據、既有 snapshot 的餘額被當確定值。現在逐個 constraint
+各自判定是否可比對；有耗用但無法換算的 pool，snapshot 之後的 remaining
+必須轉為 unknown 並附 `usage-unit-not-comparable` gap。
+
+修正 derived identity 把 `source_id`／`source_schema`／`method` 綁進
+idempotency key，導致同一 pool／window／observed_at 的衝突快照（manager
+provider read 與匯入的外部 read，或同一來源 rollback 前後不同 adapter
+schema）因為 source 欄位不同永遠不會撞成同一個 key，`project()` 因此任選
+一筆、看不到衝突。衝突偵測現在以 pool／window／observed_at（語意範圍）為
+準跨 source 比較：不同 source 在同一時點給出不同 remaining 時產生 conflict
+receipt 並使該 pool 保持 unknown，相同值仍視為一致、不衝突。

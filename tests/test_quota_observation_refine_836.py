@@ -1318,3 +1318,165 @@ def test_review5_major2_pre_snapshot_completed_job_replay_is_ignored_not_poisone
     assert row["remaining"]["state"] == "observed"
     assert row["remaining"]["amount"] == {"kind": "exact", "value": "20"}
     assert "straddling-usage" not in row["coverage_gaps"]
+
+
+# #836 對抗審查第六輪：以下三個測試分別對應審查稿逐條列出的
+# BLOCKER/MAJOR。BLOCKER1 全程走真實 producer 路徑
+# （record_provider_read → record_terminal_usage → project()），不用手工
+# _observation() 假資料覆蓋 window_instance。
+
+
+def test_review6_blocker1_provider_snapshot_window_epoch_enables_terminal_usage_deduction():
+    """BLOCKER quota_sources.py:431 — record_provider_read() 產生的真實
+    provider snapshot 之前一律 window_instance=unknown，即使收到含 reset 的
+    fresh snapshot、且終局 usage 完整落在該窗口內，project() 仍只會報
+    window-epoch-unknown 而不會扣減，AC 的 matching-usage 仍只能靠手工
+    _observation() 假資料覆蓋才會通過。"""
+    sources, _, shadow_module = _feature_api()
+    percent_unit = "provider:openai-codex-app-server/rate-limit-percent/v2"
+    descriptor = _pool_descriptor(
+        unit_id="codex-percent", semantics_ref=percent_unit, windows=(("short", 300_000),)
+    )
+    binding = _binding((descriptor,), _PROFILE_A)
+    target = sources.ProviderQuotaTarget(
+        resource_key="codex:shared:primary", binding=binding,
+        descriptor=descriptor, window_id="short",
+    )
+    service = shadow_module.QuotaShadowService.in_memory()
+    reset_seconds = _NOW // 1000 + 300  # 5 分鐘後 reset，恰等於 window duration。
+    capture = service.record_provider_read(
+        "codex",
+        {"result": {"rateLimits": {
+            "limitId": "shared",
+            "primary": {
+                "usedPercent": 40,
+                "windowDurationMins": 5,
+                "resetsAt": reset_seconds,
+            },
+        }}},
+        profile_key=_PROFILE_A,
+        targets=(target,),
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        observed_at_ms=_NOW,
+    )
+    assert not capture.gaps
+    snapshot_wire = capture.observations[0].to_dict()
+    assert snapshot_wire["window_instance"]["kind"] == "interval"
+    assert snapshot_wire["measurement"]["quantity"]["amount"] == {"kind": "exact", "value": "60"}
+
+    result = service.record_terminal_usage(
+        {
+            "id": "job-real-producer-path",
+            "executor": "codex",
+            "started_at": _iso_utc_ms(_NOW + 10),
+            "finished_at": _iso_utc_ms(_NOW + 20),
+            "usage": {"input_tokens": 5},
+        },
+        profile_key=_PROFILE_A,
+        binding=binding,
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("codex-percent", "1")},
+        observed_at_ms=_NOW + 50,
+    )
+    assert result.accepted == 1
+    assert not result.gaps
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 100
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "observed"
+    assert row["remaining"]["amount"] == {"kind": "exact", "value": "55"}
+
+
+def test_review6_major2_mixed_comparable_and_incomparable_pool_flags_gap_and_invalidates_snapshot():
+    """MAJOR quota_shadow.py:251 — 同一 binding 同時含可比對 unit 的 pool
+    （tokens）與不可換算 unit 的 pool（premium credit）時，
+    record_terminal_usage() 之前只要有任一 constraint 命中 same_unit 就整批
+    視為「已比對」，導致不可換算的那個 pool 完全拿不到 usage-unit-not-
+    comparable 的證據，既有 snapshot 的餘額被當確定值。"""
+    _, _, shadow_module = _feature_api()
+    token_descriptor = _pool_descriptor(
+        account="acct-tokens", pool="pool-tokens", unit_id="token",
+        windows=(("month", 2_678_400_000),),
+    )
+    credit_descriptor = _pool_descriptor(
+        account="acct-credit", pool="pool-credit", unit_id="premium-credit",
+        semantics_ref="provider:github-copilot-sdk/premium-interactions/v1",
+        windows=(("month", 2_678_400_000),),
+    )
+    binding = _binding((token_descriptor, credit_descriptor), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    # 不可換算的 pool 先有一張確定的 remaining snapshot。
+    credit_snapshot = _observation(
+        credit_descriptor, "month", value="10", observed_at_ms=_NOW, unit_id="premium-credit",
+    )
+    assert service.record_observation(
+        credit_snapshot.to_dict(), descriptors=(credit_descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    result = service.record_terminal_usage(
+        {"id": "job-mixed-pools", "executor": "codex", "usage": {"input_tokens": 3}},
+        profile_key=_PROFILE_A,
+        binding=binding,
+        descriptors=(token_descriptor, credit_descriptor),
+        unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 10,
+    )
+    # token pool 記到一筆可比對 usage_delta，credit pool 記到一筆「有耗用但
+    # 不可換算」的證據——兩筆都是新事件。
+    assert result.accepted == 2
+    assert any(gap.reason == "usage-unit-not-comparable" for gap in result.gaps)
+
+    report = service.project(
+        descriptors=(token_descriptor, credit_descriptor), unit_catalog=(), now_utc_ms=_NOW + 20
+    )
+    credit_row = _pool_row(report, "pool-credit", "month")
+    assert credit_row["remaining"]["state"] == "unknown"
+    assert "usage-unit-not-comparable" in credit_row["coverage_gaps"]
+
+
+def test_review6_major3_cross_source_snapshot_conflict_at_same_scope_and_time_is_detected():
+    """MAJOR quota_ledger.py:296 — derived identity 之前把 source_id／
+    source_schema 綁進 key，manager provider read 與匯入的外部 read（或同一
+    來源 rollback 前後不同 adapter schema）在同一 pool／window／observed_at
+    給出不同 remaining 時，因為 source 欄位不同永遠不會撞成同一個
+    idempotency key；project() 因此任選一筆，看不到衝突。"""
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    manager_read = _observation(descriptor, "short", value="18", observed_at_ms=_NOW)
+    assert service.record_observation(
+        manager_read.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    # 同一 pool／window／observed_at，但由匯入的外部 read 給出不同 remaining，
+    # 且來源身分（source_id/source_schema/method）與 manager provider read
+    # 完全不同——語意上仍是同一時點的衝突觀測。
+    external_read_payload = deepcopy(manager_read.to_dict())
+    external_read_payload["observation_id"] = "fixture-external-conflicting-read"
+    external_read_payload["measurement"]["quantity"]["amount"]["value"] = "9"
+    external_read_payload["source"].update({
+        "source_id": "external-read-host",
+        "source_schema": "fixture-external-read-v1",
+        "adapter_version": "external-reader-v1",
+        "authority_ref": "fixture:external-read-authority/v1",
+        "method": "structured_event",
+        "provenance_refs": ["fixture:external-host-read/v1"],
+    })
+    result = service.record_observation(
+        external_read_payload, descriptors=(descriptor,), unit_catalog=()
+    )
+    assert result.status == "conflict"
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 1
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "unknown"
+    assert "source-conflict" in row["coverage_gaps"]

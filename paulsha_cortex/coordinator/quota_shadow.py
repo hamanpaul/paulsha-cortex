@@ -248,24 +248,29 @@ class QuotaShadowService:
             else:
                 quantity = {"state": "observed", "amount": {"kind": "exact", "value": str(value)}}
 
-            same_unit = [item for item in constraints if item["unit_ref"] == unit_ref]
-            associations = [item["association"] for item in constraints]
-            scopes = same_unit or []
-            if not same_unit:
-                # 不同 unit 的 usage 仍保留原生 provenance，以已驗證 binding 關聯
-                # 標示「有耗用但不可換算」，不改寫成 subscription credit。
-                gaps.append(CoverageGap(metric, "usage-unit-not-comparable"))
-                scopes = [None]
-            elif len(same_unit) > 1:
-                # 一筆 job usage 同時關聯多個重疊 windows；各 scope 各有穩定 replay key。
-                pass
-            for target in scopes:
-                scope = (
-                    {"state": "unknown", "reason": "usage-pool-unit-not-comparable"}
-                    if target is None
-                    else {"state": "known", "value": target["scope"]}
-                )
-                pool_scope = target["association"] if target else associations
+            # 逐個 constraint（每個 pool/window）各自判定 unit 是否可比對，不能
+            # 整批依「是否存在任何可比對 constraint」決定。同一 binding 同時
+            # 含可比對 unit 的 pool（例如 tokens）與不可換算 unit 的 pool
+            # （premium credit／request）時，先前只要有任一 constraint 命中
+            # same_unit 就整批視為「已比對」，導致不可換算的那個 pool 完全
+            # 拿不到任何證據、既有 snapshot 的餘額被當確定值（見 #836 對抗
+            # 審查第六輪 MAJOR quota_shadow.py:251）。
+            not_comparable_gap_emitted = False
+            for constraint in constraints:
+                comparable = constraint["unit_ref"] == unit_ref
+                if comparable:
+                    scope = {"state": "known", "value": constraint["scope"]}
+                    observation_associations: tuple[dict[str, Any], ...] = ()
+                else:
+                    # 不同 unit 的 usage 仍保留原生 provenance，以已驗證 binding
+                    # 關聯標示「有耗用但不可換算」，不改寫成 subscription
+                    # credit；每個不可換算的 pool 都各自留下 association 證據，
+                    # 一個 metric 的 gap 只回報一次即可。
+                    scope = {"state": "unknown", "reason": "usage-pool-unit-not-comparable"}
+                    observation_associations = (constraint["association"],)
+                    if not not_comparable_gap_emitted:
+                        gaps.append(CoverageGap(metric, "usage-unit-not-comparable"))
+                        not_comparable_gap_emitted = True
                 # 終局 usage 只記錄原始事實（job 起訖時間，見上方
                 # terminal_job_started_at_ms／terminal_job_finished_at_ms），
                 # 不在記錄當下依 ledger 現況推導並持久化 window instance：
@@ -290,23 +295,22 @@ class QuotaShadowService:
                 # replay key 納入 pool identity（含 revision）：同一 binding 把
                 # 同 metric/unit 映到兩個 pool、且 window_id 恰好同名時（例如
                 # shared-account 多角色都叫 month），不得因 window_id 相同而互相
-                # 撞成 conflict（見 #836 對抗審查第四輪 MAJOR）。
-                pool_component = (
-                    hashlib.sha256(
-                        json.dumps(
-                            target["scope"]["pool_ref"], sort_keys=True, separators=(",", ":"),
-                        ).encode()
-                    ).hexdigest()[:16]
-                    if target else "unmapped"
-                )
+                # 撞成 conflict（見 #836 對抗審查第四輪 MAJOR）。每個 constraint
+                # 本身的 pool_ref/window_id 已足夠穩定區分，可比對與不可換算
+                # 兩種情形共用同一套 key 規則。
+                pool_component = hashlib.sha256(
+                    json.dumps(
+                        constraint["scope"]["pool_ref"], sort_keys=True, separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()[:16]
                 key = (
                     f"terminal-usage:v1:{job_id}:{profile_key}:{metric}:{pool_component}:"
-                    + (target["window_id"] if target else "unmapped")
+                    + constraint["window_id"]
                 )
                 result = self.ledger.append_observation(
                     observation,
                     idempotency_key=key,
-                    associations=tuple(pool_scope) if target is None else (),
+                    associations=observation_associations,
                     terminal_job_started_at_ms=terminal_job_started_at_ms,
                     terminal_job_finished_at_ms=terminal_job_finished_at_ms,
                 )

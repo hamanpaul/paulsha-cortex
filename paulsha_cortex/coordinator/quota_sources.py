@@ -402,6 +402,35 @@ def _unknown_capture(executor, targets, profile_key, observed_at_ms, ttl_ms, rea
     return ProviderCapture(executor, tuple(observations), tuple(gaps))
 
 
+def _provider_window_instance(target_info: dict[str, object], reset_at_ms: int | None) -> dict[str, object]:
+    """由 provider 正式回報的 reset 時間與 pool 契約既有的 window duration
+    推導可比對的 window epoch；缺 reset 或無法唯一判定時維持 unknown，不臆測。
+
+    真實 producer 路徑（record_provider_read）先前一律回報
+    window_instance=unknown，即使收到含 reset 的 fresh snapshot，project() 仍
+    只能報 window-epoch-unknown 而不會扣減終局 usage（見 #836 對抗審查第六輪
+    BLOCKER quota_sources.py:431）。target_info["window"] 的 duration_ms 只在
+    `_validate_targets()` 確認過 quantity_kind 為 amount 的 fixed/rolling 窗口
+    才會有值；schema 進一步要求 window_instance 的 end_ms-start_ms 恰等於該
+    duration_ms，因此可用 reset_at_ms 當窗口右界、往回推 duration_ms 當左界。
+    """
+
+    if reset_at_ms is None:
+        return {"kind": "unknown", "reason": "provider-window-instance-unavailable"}
+    duration_ms = target_info["window"].get("duration_ms")
+    if type(duration_ms) is not int or duration_ms <= 0:
+        return {"kind": "unknown", "reason": "provider-window-instance-unavailable"}
+    start_ms = reset_at_ms - duration_ms
+    if start_ms < 0 or reset_at_ms > _TIME_MAX_MS:
+        return {"kind": "unknown", "reason": "provider-window-instance-unavailable"}
+    return {
+        "kind": "interval",
+        "start_ms": start_ms,
+        "end_ms": reset_at_ms,
+        "epoch": {"state": "known", "value": f"provider-reset:{reset_at_ms}"},
+    }
+
+
 def _observation(*, executor, resource_key, profile_key, target, target_info, amount, reason,
                  observed_at_ms, ttl_ms, reset_at_ms, unit_catalog, descriptors):
     contract = provider_read_contract(executor)
@@ -428,7 +457,7 @@ def _observation(*, executor, resource_key, profile_key, target, target_info, am
         "scope": {"state": "known", "value": {"pool_ref": pool_ref, "window_id": target.window_id}},
         "profile_ref": {"state": "known", "value": {"schema_version": 1, "key": profile_key}},
         "unit_ref": {"state": "known", "value": {"unit_id": unit_ref[0], "version": unit_ref[1]}},
-        "window_instance": {"kind": "unknown", "reason": "provider-window-instance-unavailable"},
+        "window_instance": _provider_window_instance(target_info, reset_at_ms),
         "measurement": {
             "kind": "remaining_snapshot", "metric_id": "remaining",
             "quantity": ({"state": "unknown", "reason": reason}
