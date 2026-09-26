@@ -9845,7 +9845,7 @@ def _is_planning_transient_service_failure(reason: str | None) -> bool:
     return outcome_taxonomy.matches_transient_service_markers(reason)
 
 
-# --- issue #554：operator worktree drift 是環境事件，不是內容缺陷 -------------
+# --- issue #554／#562：operator worktree drift 是環境事件 -------------------
 #
 # #507 前，drift 的處置是把 operator worktree 整棵抹除再從 baseline 還原——
 # 那確實會銷毀資料，把它歸 `content`（fail-closed、不給 recover-planning）
@@ -9855,26 +9855,10 @@ def _is_planning_transient_service_failure(reason: str | None) -> bool:
 # planning 就好。維持 `content` 只會讓唯一出口是 abandon（燒一個世代），
 # 這是 #507 comment 2 記錄、#543 明文留待後續的死鎖。
 #
-# 判準只認 `planning_runtime` 匯出的穩定前綴：訊息尾段已在 #543 改過一次
-# （`changes rolled back` → `operator content preserved`），計數與 evidence 路徑
-# 每次都不同，任何依賴尾段字面的判準都會再壞一次。
-_PLANNING_WORKTREE_DRIFT_MARKER = planning_runtime.PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX
+def _is_planning_worktree_drift_failure(failure_kind: str | None) -> bool:
+    """只依 planning runtime 傳來的固定 kind 辨識 operator worktree drift。"""
 
-
-def _is_planning_worktree_drift_failure(reason: str | None) -> bool:
-    """判斷 planning 失敗的 reason 是否為 operator worktree drift（#507／#554）。
-
-    reason 的實際樣貌是 `run_heterogeneous_brainstorm` 對 launcher 例外包出的
-    `<stage>-<kind>: ValueError: <drift message>`，因此比對用 `in` 而非
-    `startswith`——前綴指的是「drift 訊息自己的前綴」，不是整個 reason 的前綴。
-
-    判準刻意窄：只認 operator worktree 這一族。同一段 finally 另有
-    `planning launcher modified disposable read-only sandbox`（launcher 寫壞了
-    拋棄式沙箱）——那是 launcher 行為異常而非環境並行編輯，不在此列，維持
-    既有 `content` 分類。
-    """
-
-    return reason is not None and _PLANNING_WORKTREE_DRIFT_MARKER in reason
+    return failure_kind == planning_runtime.PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
 
 
 # --- issue #682（#672 票 A）：拒因表裡的 environment 級拒因 -------------------
@@ -9906,8 +9890,10 @@ def _is_planning_artifact_environment_failure(reason: str | None) -> bool:
     return failure_code in ARTIFACT_EVIDENCE_ENVIRONMENT_REASONS
 
 
-def _classify_planning_failure(reason: str | None) -> str:
-    """brainstorm not-ready 的 reason → `environment` / `content` 的**單一判準**。
+def _classify_planning_failure(
+    reason: str | None, *, failure_kind: str | None = None
+) -> str:
+    """brainstorm not-ready 的 evidence → `environment` / `content` 的單一判準。
 
     #393 的預設是 `content`（fail-closed，`_resume_decision` 不浮現
     `recover-planning`）。五個具名例外改歸 `environment`：
@@ -9916,23 +9902,23 @@ def _classify_planning_failure(reason: str | None) -> str:
        殘留撞見 authority fail-closed，是狀態殘留而非模型內容缺陷。
     2. `_is_planning_transient_service_failure`（#533）——launcher/service 層
        的暫時性錯誤（503／限流／逾時），幾分鐘後自癒。
-    3. `_is_planning_worktree_drift_failure`（#507／#554）——operator worktree
-       在 planning 視窗內被動過；#543 之後不再銷毀資料，是環境事件。
+    3. `_is_planning_worktree_drift_failure`（#507／#554／#562）——planning runtime
+       明確回報 operator worktree drift；不解析 reason 自然語言。
     4. `_is_planning_candidate_rejection_environment_failure`（#682／#672 票 A）
        ——`no-heterogeneous-planner` 的逐候選拒因表裡有 environment 級拒因
        （job 起不來、executor 異常退出）。
     5. `_is_planning_artifact_environment_failure`（#572）——整合後 artifact 的
        symlink、路徑逃逸、非一般檔案或讀取／解碼失敗。
 
-    五個判準合成一個具名函式，是為了讓「reason → classification」這條映射有
+    五個判準合成一個具名函式，是為了讓「failure evidence → classification」有
     單一可測的入口（過去它只以三元表達式活在 `_run_define_stage` 中段，測不到
     也看不見）。
     """
 
     if (
-        _is_planning_authority_residue_failure(reason)
+        _is_planning_worktree_drift_failure(failure_kind)
+        or _is_planning_authority_residue_failure(reason)
         or _is_planning_transient_service_failure(reason)
-        or _is_planning_worktree_drift_failure(reason)
         or _is_planning_candidate_rejection_environment_failure(reason)
         or _is_planning_artifact_environment_failure(reason)
     ):
@@ -14486,6 +14472,7 @@ def _write_planning_failure_evidence(
     run_id: str,
     classification: str,
     reason: str,
+    failure_kind: str | None = None,
     model_input: Mapping[str, object] | None = None,
 ) -> str:
     """#393：define needs_human 三條靜默失敗路徑落 `cortex-planning-failure/v1`
@@ -14510,6 +14497,8 @@ def _write_planning_failure_evidence(
         "reason": reason,
         "created_at": _utcnow(),
     }
+    if failure_kind is not None:
+        body["failure_kind"] = failure_kind
     input_excerpt = _planning_failure_input_excerpt(model_input)
     if input_excerpt is not None:
         body["model_input"] = input_excerpt
@@ -14548,6 +14537,7 @@ def _record_planning_failure_evidence(
     coordinator_root: Path,
     classification: str,
     reason: str,
+    failure_kind: str | None = None,
     model_input: Mapping[str, object] | None = None,
 ) -> tuple[str, ...]:
     """呼叫端 wrapper：evidence 寫入失敗不得讓 define 路徑爆炸（fail-open
@@ -14562,6 +14552,7 @@ def _record_planning_failure_evidence(
             run_id=run.run_id,
             classification=classification,
             reason=reason,
+            failure_kind=failure_kind,
             model_input=model_input,
         )
     except Exception as exc:  # noqa: BLE001 - evidence 記錄本身 fail-open
@@ -15602,15 +15593,23 @@ def apply_workflow_action(
         # 例外二——`_is_planning_transient_service_failure`：launcher/service 層
         # 的暫時性錯誤（503/限流/逾時；agy 實測會印錯誤文字但 exit 0），同歸
         # `environment`。一個幾分鐘後自癒的服務錯誤不得被判成 `content` 死路。
-        # 例外三（#554）——`_is_planning_worktree_drift_failure`：operator
-        # worktree 在 planning 視窗內被動過。#543 之後 drift 不再銷毀任何資料
-        # （只備份與報告），語意上就是環境事件，同歸 `environment`。
+        # 例外三（#554／#562）——planning runtime 以固定 failure_kind 回報
+        # operator worktree drift。#543 之後 drift 不再銷毀資料，只備份與報告。
         brainstorm_not_ready_reason = result.reason or "brainstorm-not-ready"
-        # #554／PR #560：分類收斂進具名的 `_classify_planning_failure`（reason →
-        # classification 的單一可測入口，含 worktree drift 的 environment 例外）。
+        brainstorm_failure_kind = getattr(result, "failure_kind", None)
+        if (
+            brainstorm_failure_kind
+            != planning_runtime.PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
+        ):
+            brainstorm_failure_kind = None
+        # 分類收斂進 `_classify_planning_failure`；drift 依結構化 kind，既有其他
+        # 窄分類仍依各自的 reason 判準。
         # 這裡把它 hoist 成區域變數，好讓 evidence 與 needs_human_reason 兩者
         # 引用**同一個**判定結果，不各算一次。
-        brainstorm_classification = _classify_planning_failure(brainstorm_not_ready_reason)
+        brainstorm_classification = _classify_planning_failure(
+            brainstorm_not_ready_reason,
+            failure_kind=brainstorm_failure_kind,
+        )
         brainstorm_next_step_hint = needs_human_next_step_hint(
             phase=run.current_phase,
             planning_failure_classification=brainstorm_classification,
@@ -15623,6 +15622,7 @@ def apply_workflow_action(
             coordinator_root=transaction_root,
             classification=brainstorm_classification,
             reason=brainstorm_not_ready_reason,
+            failure_kind=brainstorm_failure_kind,
             model_input=result.model_input,
         )
         run = registry._manager_update_workflow_run(

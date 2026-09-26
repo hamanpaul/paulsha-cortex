@@ -19,9 +19,8 @@ nested tool result）／#487（`oauth` 命中 `doc-coauthoring`）的同族缺�
 
 **缺陷二——worktree drift 仍歸 `content` → `recover-planning` 禁用 → 永久死鎖。**
 #543 之後 drift 的處置已改為「一個位元組都不動、只備份與報告」，語意上是環境
-事件，改判 `environment` 讓 `recover-planning` 可用。判準用穩定前綴，不得依賴
-訊息尾段——尾段已經在 #543 改過一次（`changes rolled back` →
-`operator content preserved`）。
+事件。planning runtime 現以固定 `failure_kind` 表示 drift；reason 文字只供人讀，
+改寫或截斷都不影響 `environment` 分類與 `recover-planning` 判斷。
 """
 
 from __future__ import annotations
@@ -48,8 +47,7 @@ from paulsha_cortex.coordinator.planning_runtime import _operator_drift_message
 # `except` 分支共用）：`<stage>-<kind>: <ExceptionTypeName>: <str(exc)[:160]>`。
 _WRAP = "primary-integration-malformed: ValueError: "
 
-# #543 之前的 drift 訊息尾段。留在測試裡是為了釘住「判準不依賴尾段」——這串字
-# 已經被改過一次，再改一次也必須照樣分類正確。
+# #543 之前的 drift 訊息尾段，只作舊 evidence 的診斷樣本；分類不讀取這段文字。
 _LEGACY_DRIFT_MESSAGE = (
     "planning launcher modified operator worktree; changes rolled back "
     "(added=1 modified=0 removed=0); evidence=/tmp/psc/report.json"
@@ -172,27 +170,46 @@ def test_shared_marker_table_stays_the_single_source() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 缺陷二：drift 判準用穩定前綴，分類落 environment
+# 缺陷二：drift 以結構化 kind 分類為 environment
 # ---------------------------------------------------------------------------
 
 
-def test_drift_predicate_matches_both_message_generations() -> None:
-    """新舊兩種訊息字串都要被認出來——尾段已在 #543 改過一次。"""
+def test_drift_classification_uses_known_failure_kind_not_reason_text() -> None:
+    reason = "planning execution ended with rewritten diagnostic wording"
+    drift_reason = _WRAP + _drift_message(report_path="/tmp/psc-report.json")
+
+    assert (
+        manager._classify_planning_failure(
+            reason, failure_kind="operator_worktree_drift"
+        )
+        == "environment"
+    )
+    assert manager._classify_planning_failure(drift_reason) == "content"
+    assert (
+        manager._classify_planning_failure(
+            drift_reason, failure_kind="unknown-planning-failure"
+        )
+        == "content"
+    )
+
+
+def test_drift_kind_classifies_both_message_generations() -> None:
+    """reason 尾段改寫不影響已攜帶的 drift kind。"""
 
     current = _WRAP + _drift_message(report_path="/tmp/psc-report.json")
     legacy = _WRAP + _LEGACY_DRIFT_MESSAGE
 
-    assert manager._is_planning_worktree_drift_failure(current) is True
-    assert manager._is_planning_worktree_drift_failure(legacy) is True
-    # 連退化到佔位符的那一版也要認得。
-    assert manager._is_planning_worktree_drift_failure(_WRAP + _drift_message()) is True
+    for reason in (current, legacy, _WRAP + _drift_message()):
+        assert manager._classify_planning_failure(
+            reason, failure_kind="operator_worktree_drift"
+        ) == "environment"
 
 
 def test_drift_predicate_rejects_the_sandbox_family() -> None:
     """拋棄式沙箱被寫壞是 launcher 行為異常，不是環境事件——維持 `content`。"""
 
     sandbox = _WRAP + "planning launcher modified disposable read-only sandbox"
-    assert manager._is_planning_worktree_drift_failure(sandbox) is False
+    assert manager._is_planning_worktree_drift_failure(None) is False
     assert manager._classify_planning_failure(sandbox) == "content"
 
 
@@ -206,7 +223,7 @@ def test_drift_predicate_rejects_the_sandbox_family() -> None:
     ],
 )
 def test_drift_predicate_does_not_touch_other_reasons(reason: str | None) -> None:
-    assert manager._is_planning_worktree_drift_failure(reason) is False
+    assert manager._is_planning_worktree_drift_failure(None) is False
     assert manager._classify_planning_failure(reason) == "content"
 
 
@@ -221,18 +238,25 @@ def test_drift_predicate_does_not_touch_other_reasons(reason: str | None) -> Non
     ],
 )
 def test_drift_classifies_as_environment(message: str) -> None:
-    assert manager._classify_planning_failure(_WRAP + message) == "environment"
+    reason = _WRAP + message
+    assert manager._classify_planning_failure(reason) == "content"
+    assert (
+        manager._classify_planning_failure(
+            reason, failure_kind="operator_worktree_drift"
+        )
+        == "environment"
+    )
 
 
 def test_prefix_constant_is_actually_the_message_prefix() -> None:
-    """常數與訊息不得漂開——判準整個建立在這條上。"""
+    """人工診斷訊息保留可辨識前綴，分類則使用獨立的結構化 kind。"""
 
     assert _drift_message().startswith(planning_runtime.PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX)
     assert _LEGACY_DRIFT_MESSAGE.startswith(
         planning_runtime.PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX
     )
-    assert manager._PLANNING_WORKTREE_DRIFT_MARKER == (
-        planning_runtime.PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX
+    assert planning_runtime.PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT == (
+        "operator_worktree_drift"
     )
 
 
@@ -283,7 +307,9 @@ def _authority(tmp_path: Path) -> WorkAuthority:
     )
 
 
-def _needs_human_candidate(tmp_path: Path, *, reason: str) -> ClaimCandidate:
+def _needs_human_candidate(
+    tmp_path: Path, *, reason: str, failure_kind: str | None = None
+) -> ClaimCandidate:
     authority = _authority(tmp_path)
     base = ClaimCandidate(
         authority=authority,
@@ -308,7 +334,9 @@ def _needs_human_candidate(tmp_path: Path, *, reason: str) -> ClaimCandidate:
         active_phase="define",
         # 分類刻意由**產品判準**算出來，測試不自己填答案——這條就是把
         # 「drift → environment」與「environment → recover-planning」綁在一起。
-        active_planning_failure_classification=manager._classify_planning_failure(reason),
+        active_planning_failure_classification=manager._classify_planning_failure(
+            reason, failure_kind=failure_kind
+        ),
         active_planning_failure_reason=reason,
     )
 
@@ -327,7 +355,13 @@ def test_recover_planning_is_available_for_drift(tmp_path: Path, message: str) -
     """drift 卡在 define 時，唯一出口不再只有 abandon。"""
 
     reason = _WRAP + message
-    decision = _resume_decision(_needs_human_candidate(tmp_path, reason=reason))
+    decision = _resume_decision(
+        _needs_human_candidate(
+            tmp_path,
+            reason=reason,
+            failure_kind="operator_worktree_drift",
+        )
+    )
 
     assert decision.action == "needs_human"
     assert decision.next_actions == ("recover-planning", "abandon")

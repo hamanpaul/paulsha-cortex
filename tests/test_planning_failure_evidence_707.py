@@ -5,14 +5,40 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from paulsha_cortex.coordinator import manager, planning
+from paulsha_cortex.coordinator import manager, planning, work_actions
 from paulsha_cortex.coordinator.model_identities import CapabilityProbe, IdentityRegistry
 
 
 _ACCEPTED_SPEC = "---\nstatus: accepted\n---\n# Spec\n\n## Requirements\n\nBound.\n"
+
+
+def test_planning_failure_kind_survives_evidence_readback(tmp_path: Path) -> None:
+    evidence_ref = manager._write_planning_failure_evidence(
+        coordinator_root=tmp_path,
+        run_id="workflow-drift-kind",
+        classification="environment",
+        reason="planning diagnostic text may change",
+        failure_kind="operator_worktree_drift",
+    )
+    run = SimpleNamespace(
+        run_id="workflow-drift-kind",
+        evidence_refs=(evidence_ref,),
+    )
+
+    body = json.loads(Path(evidence_ref).read_text(encoding="utf-8"))
+    record = work_actions._read_planning_failure_record(
+        run=run, run_id=run.run_id
+    )
+    hint = work_actions._planning_failure_hint(run)
+
+    assert body["failure_kind"] == "operator_worktree_drift"
+    assert record["failure_kind"] == "operator_worktree_drift"
+    assert hint is not None
+    assert hint["failure_kind"] == "operator_worktree_drift"
 
 
 def _brainstorm(tmp_path: Path, *, questioner, secondary, integrator):

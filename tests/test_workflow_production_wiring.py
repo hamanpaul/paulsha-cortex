@@ -569,6 +569,57 @@ def test_brainstorm_authority_residue_write_rejection_records_environment_and_re
     assert json.loads(evidence["model_input"]["input_json"]) == model_input["args"]
 
 
+def test_brainstorm_operator_drift_kind_reaches_failure_evidence_and_recovery_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    args = _workflow_args(manifest_path, tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "gpt-primary",
+                "independence_domain": "openai", "capabilities": ["planning"],
+            }
+        ]
+    )
+    reason = "planner failure wording intentionally changed"
+    monkeypatch.setattr(
+        manager,
+        "run_heterogeneous_brainstorm",
+        lambda **_: BrainstormResult(
+            state="needs_human",
+            reason=reason,
+            secondary_domain=None,
+            gate_refs=PlanningGateRefs(),
+            failure_kind="operator_worktree_drift",
+        ),
+    )
+
+    result = manager.apply_workflow_action(
+        registry,
+        args=args,
+        identity_registry=identities,
+        primary_questioner=lambda *a, **k: None,
+        secondary_planner=lambda *a, **k: None,
+        primary_integrator=lambda *a, **k: None,
+        coordinator_root=tmp_path,
+    )
+
+    persisted = registry.get_workflow_run(result["run_id"])
+    failure = work_actions._read_planning_failure_record(
+        run=persisted, run_id=persisted.run_id
+    )
+    hint = work_actions._planning_failure_hint(persisted)
+    assert failure["classification"] == "environment"
+    assert failure["reason"] == reason
+    assert failure["failure_kind"] == "operator_worktree_drift"
+    assert hint is not None
+    assert hint["failure_kind"] == "operator_worktree_drift"
+
+
 def test_public_work_resume_routes_through_phase_aware_poll_terminalize_advance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

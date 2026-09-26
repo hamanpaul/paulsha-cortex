@@ -638,6 +638,7 @@
 - **#578 verify／review malformed terminal 有界自動重派**：periodic resume 現在會將無法解析或不符合 phase 外層 schema 的 verify／review terminal 送入既有 per-card schema retry 額度；達上限後停在 `needs_human`，合法明示停止與有效 envelope 的 gate／authority 採信錯誤不重派，operator 的 `retry-card` 熔斷維持 #555 規則。
 - **#883 retry-card override／retry-verify 重派**：reviewer identity override 在 registry reset 前依既有 capability／independence 判準驗證，拒絕時不寫入 run；retry-verify 於同一個 work-action request 派出新的 verification job，並保留 #577 精準復原舊 job 的 `exited` 狀態。
 
+- **#551、#562 planning worktree drift**：snapshot 不再因 uid/gid／xattr 差異誤判，baseline 複製前後比對並至多重試一次；持續變動仍 fail-closed。drift 另以結構化 `failure_kind` 傳至 Manager 與 `recover-planning`，不再依賴 reason 字串分類。
 - **#492 foreign review tier 前置檢查**：required review 的 builder slice 會在建立工作區與啟動 builder 前驗證 project policy tier；缺少或非法值會指出選定 manifest 路徑及允許值，無 manifest 時維持 `shareable` 預設。
 - **#571、#579 reviewer 路徑綁定**：review gate evaluation 檔名納入 candidate 短 SHA；reviewer sandbox 目錄名納入 job id，並於新 reviewer 派工前回收前代 claim era 已終止的孤兒 sandbox，回收失敗時記錄 warning 並繼續派工。
 - **#810 merge 後 Todo 勾選狀態僅供診斷**：已合併 WorkflowRun 的遠端結案與 Monitor 不再因 workstream Todo 未勾而阻擋有效交付；Todo 證據仍須存在且可讀，archived OpenSpec tasks 的完成要求維持不變。

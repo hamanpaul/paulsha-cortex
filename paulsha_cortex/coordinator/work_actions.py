@@ -72,6 +72,7 @@ from .github_delivery import (
 from . import candidate_base
 from . import engineering_outcome
 from . import not_claimable
+from .planning_runtime import PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
 from . import verification
 from . import worktree_reclaim
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
@@ -5087,16 +5088,27 @@ def _read_planning_failure_record(
             continue
         classification = record.get("classification")
         reason = record.get("reason")
+        failure_kind = record.get("failure_kind")
+        if (
+            failure_kind is not None
+            and failure_kind != PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
+        ):
+            continue
         if (
             classification not in {"environment", "content"}
             or not isinstance(reason, str)
             or not reason.strip()
+            or (
+                failure_kind == PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
+                and classification != "environment"
+            )
         ):
             continue
         matches.append(
             {
                 "classification": classification,
                 "reason": reason,
+                "failure_kind": failure_kind,
                 "evidence_ref": path_value,
             }
         )

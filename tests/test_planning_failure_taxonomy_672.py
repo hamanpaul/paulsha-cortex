@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from paulsha_cortex.coordinator import manager
+from paulsha_cortex.coordinator import manager, planning_runtime
 from paulsha_cortex.coordinator.model_identities import (
     ENVIRONMENT_GRADE_PLANNING_FAMILIES,
     PLANNING_FAILURE_EXECUTOR,
@@ -146,7 +146,7 @@ def _probes(*, agy_reason: str, agy_diagnostic: str) -> dict:
     }
 
 
-def _brainstorm(tmp_path: Path, probes) -> object:
+def _brainstorm(tmp_path: Path, probes, *, primary_questioner=None) -> object:
     report = assess_planning_completeness(
         [PlanningArtifact(kind="spec", ref="docs/spec.md", text=INCOMPLETE_SPEC)]
     )
@@ -159,10 +159,34 @@ def _brainstorm(tmp_path: Path, probes) -> object:
         evidence_dir=tmp_path,
         artifact_root=tmp_path,
         scope=SCOPE,
-        primary_questioner=lambda _: report.default_question_pack.to_dict(),
+        primary_questioner=(
+            primary_questioner or (lambda _: report.default_question_pack.to_dict())
+        ),
         secondary_planner=lambda *_: {},
         primary_integrator=lambda *_: {},
     )
+
+
+def test_brainstorm_preserves_structured_operator_drift_failure_kind(
+    tmp_path: Path,
+) -> None:
+    class StructuredDriftError(ValueError):
+        failure_kind = "operator_worktree_drift"
+
+    def fail_questioner(_payload):
+        raise StructuredDriftError("operator tree wording changed")
+
+    result = _brainstorm(
+        tmp_path,
+        {("agy", "gemini-3.1-pro-high"): CapabilityProbe.ready_for(
+            "agy", "gemini-3.1-pro-high", "google"
+        )},
+        primary_questioner=fail_questioner,
+    )
+
+    assert result.state == "needs_human"
+    assert "operator tree wording changed" in result.reason
+    assert result.failure_kind == "operator_worktree_drift"
 
 
 # ---------------------------------------------------------------------------

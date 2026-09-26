@@ -404,10 +404,9 @@ codex/…[openai]: same-domain)
 **分類改判**：`_classify_planning_failure()` 目前對 `no-heterogeneous-planner` 一律
 落 `content`，而 `content` 在 `_resume_decision` 一律不浮現 `recover-planning` ⇒ 死路。
 改成：拒因表中**只要有一條是 environment 級**（job 起不來、executor 死、probe 快取
-損毀），整體改判 `environment`，讓 recover-planning 有路。這與 #416／#533／#554 已經
-建立的三條例外是同一個模式（`_is_planning_authority_residue_failure`、
-`_is_planning_transient_service_failure`、`_is_planning_worktree_drift_failure`），
-不是新發明。
+損毀），整體改判 `environment`，讓 recover-planning 有路。既有的 #416／#533 例外仍
+沿用各自的窄 reason 判準；#554／#562 的 worktree drift 例外則使用固定
+`failure_kind`，避免依賴截斷後的 reason 文字。
 
 ### D9 instance 命名與併發：一次 planning 呼叫 = 一個 unit 實例
 
