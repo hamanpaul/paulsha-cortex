@@ -52,6 +52,8 @@ producer/consumer 使用，不接 workflow chain、排序、reservation、admiss
 多個 Manager instance 對同一個共享 pool/window 的預留有單一權威來源：以檔案鎖
 序列化同一份 append-only JSONL 事件檔，同池競爭最後一單位時恰好一個成功，
 多 pool 需求 all-or-none（任一不足即整份拒絕，不留半張 grant，也不扣其他池）。
+
+消費端協定固定為 **reserve → 建立 job 記錄取得 job_id → bind(job_id) → 才 spawn**：`reserved` 恆表示「尚未 spawn」，`release` 只用於 bind 前放棄；`settle` 只接受 `bound`（job 終局，含 spawn 失敗）；crash 或 lease 過期由 `reconcile` 依可信 liveness 證據處理。如此 reserve 的冪等回放即使交回 owner_token，也無法釋放已 spawn 的 job 所占用的額度。
 `pool_ref`／`window_id` 沿用上面 #836 shadow 的契約，刻意不含 model 維度。
 
 每筆 reservation 綁定 `run_id`／`card_id`／`decision_id`／`attempt_id` 與

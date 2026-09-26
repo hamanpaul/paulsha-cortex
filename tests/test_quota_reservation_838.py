@@ -411,14 +411,19 @@ def test_ac4_illegal_transition_history_fails_closed(tmp_path: Path) -> None:
         pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
         demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
     )
+    bound = authority.bind(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", job_id="job-1", expected_sequence=0, now_ms=NOW + 1,
+    )
+    assert bound.status == "ok"
     settled = authority.settle(
         reservation_id=granted.reservation_id, owner_token=granted.owner_token,
-        attempt_id="attempt-1", outcome="succeeded", expected_sequence=0, now_ms=NOW + 1,
+        attempt_id="attempt-1", outcome="succeeded", expected_sequence=1, now_ms=NOW + 1,
     )
     assert settled.status == "ok"
     _append_raw_row(path, {
         "schema_version": 1, "kind": "bind", "reservation_id": granted.reservation_id,
-        "sequence": 2, "job_id": "job-revived", "event_at_ms": NOW + 2,
+        "sequence": 3, "job_id": "job-revived", "event_at_ms": NOW + 2,
     })
     with pytest.raises(ReservationCorrupt):
         QuotaReservationAuthority(path).committed(now_ms=NOW + 3)
@@ -502,6 +507,49 @@ def test_ac4_reconcile_and_reserve_rows_are_revalidated_on_reload(tmp_path: Path
     )
     with pytest.raises(ReservationCorrupt):
         QuotaReservationAuthority(second).committed(now_ms=NOW + 2)
+
+
+def test_ac4_reserved_cannot_settle_and_pool_capacity_mismatch_fails_closed(tmp_path: Path) -> None:
+    """協定：reserve → bind(job_id) → spawn。reserved 恆為「尚未 spawn」，
+    settle 只接受 bound；reserve row 的 pools 與 capacity_by_pool 必須逐一對應。"""
+    import json as _json
+
+    path = tmp_path / "reservations.jsonl"
+    authority = QuotaReservationAuthority(path)
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-settle", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    settled = authority.settle(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", outcome="failed", expected_sequence=0, now_ms=NOW + 1,
+    )
+    assert settled.status == "conflict"
+
+    rows = [_json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["capacity_by_pool"].append(dict(rows[0]["capacity_by_pool"][0], window_id="other-window"))
+    path.write_text(
+        "".join(_json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReservationCorrupt):
+        QuotaReservationAuthority(path).committed(now_ms=NOW + 2)
+
+
+def test_first_grant_fsyncs_new_store_directory(tmp_path: Path, monkeypatch) -> None:
+    import paulsha_cortex.coordinator.quota_reservation as module
+
+    synced: list[str] = []
+    real = module._fsync_directory
+    monkeypatch.setattr(module, "_fsync_directory", lambda path: (synced.append(str(path)), real(path)))
+    path = tmp_path / "quota-reservations" / "reservations.jsonl"
+    QuotaReservationAuthority(path).reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-fsync", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert str(tmp_path) in synced and str(tmp_path / "quota-reservations") in synced
 
 
 def test_ac4_negative_or_non_finite_amount_rejected() -> None:

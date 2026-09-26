@@ -272,14 +272,7 @@ class QuotaReservationAuthority:
         ).hexdigest()
         pools_signature = _pools_signature(pools)
 
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._check_parent()
-        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(self.path, flags, 0o600)
-        except OSError as exc:
-            raise ReservationCorrupt("reservation-store-open-failed") from exc
+        fd = self._open_for_append()
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             info = os.fstat(fd)
@@ -432,6 +425,11 @@ class QuotaReservationAuthority:
                 return None, TransitionResult(status="conflict", state=current["state"], reason="settle-outcome-mismatch")
             if current["state"] == "released":
                 return None, TransitionResult(status="conflict", state=current["state"], reason="reservation-already-terminal")
+            if current["state"] != "bound":
+                # 協定：reserve → 建 job 記錄 → bind(job_id) → 才 spawn。reserved
+                # 恆表示「尚未 spawn」，因此 settle（job 終局，含 spawn 失敗）只接受
+                # bound；reserved 只能 release（bind 前放棄）或由 reconcile 處理。
+                return None, TransitionResult(status="conflict", state=current["state"], reason="settle-requires-bound")
             if current["sequence"] != expected_sequence:
                 return None, TransitionResult(status="conflict", state=current["state"], sequence=current["sequence"], reason="sequence-mismatch")
             entry = {
@@ -665,14 +663,7 @@ class QuotaReservationAuthority:
         now_ms: int,
         failpoint_stage: str,
     ) -> TransitionResult:
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._check_parent()
-        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(self.path, flags, 0o600)
-        except OSError as exc:
-            raise ReservationCorrupt("reservation-store-open-failed") from exc
+        fd = self._open_for_append()
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             info = os.fstat(fd)
@@ -690,6 +681,31 @@ class QuotaReservationAuthority:
             return result
         finally:
             os.close(fd)
+
+    def _open_for_append(self) -> int:
+        """開啟（必要時建立）store 供寫入。首次建立目錄或檔案時一併 fsync 其
+        父目錄，確保主機崩潰後第一筆 grant 的 dirent 仍在，重啟不會看到空
+        ledger 而把同一容量再 grant 一次。"""
+        parent = self.path.parent
+        parent_existed = parent.exists()
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not parent_existed:
+            _fsync_directory(parent.parent)
+        self._check_parent()
+        file_existed = self.path.exists()
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except OSError as exc:
+            raise ReservationCorrupt("reservation-store-open-failed") from exc
+        if not file_existed:
+            try:
+                _fsync_directory(parent)
+            except BaseException:
+                os.close(fd)
+                raise
+        return fd
 
     # -- 內部：檔案安全（比照 #836 quota_ledger 的硬化模式） ------------------
 
@@ -784,6 +800,20 @@ class QuotaReservationAuthority:
 # ---------------------------------------------------------------------------
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        dir_fd = os.open(path, flags)
+    except OSError as exc:
+        raise ReservationCorrupt("reservation-store-dir-fsync-failed") from exc
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        raise ReservationCorrupt("reservation-store-dir-fsync-failed") from exc
+    finally:
+        os.close(dir_fd)
+
+
 def _require_keys(row: dict[str, Any], required: frozenset[str], optional: frozenset[str] = frozenset()) -> None:
     keys = set(row)
     if not required.issubset(keys) or not keys.issubset(required | optional):
@@ -831,6 +861,28 @@ def _validate_reserve_row(row: dict[str, Any]) -> None:
         if not isinstance(item["window_id"], str) or not _ID_RE.fullmatch(item["window_id"]):
             raise ReservationCorrupt("reservation-store-invalid-record")
         _validate_amount(item["amount"])
+    capacity_rows = row["capacity_by_pool"]
+    if not isinstance(capacity_rows, list) or len(capacity_rows) != len(row["pools"]):
+        raise ReservationCorrupt("reservation-store-invalid-record")
+    pool_keys = []
+    for item in row["pools"]:
+        pool_keys.append((tuple(item["pool_ref"][k] for k in _POOL_REF_KEYS), item["window_id"]))
+    capacity_keys = []
+    for item in capacity_rows:
+        if not isinstance(item, dict) or set(item) != {"pool_ref", "window_id", "capacity"}:
+            raise ReservationCorrupt("reservation-store-invalid-record")
+        try:
+            _validate_pool_ref(item["pool_ref"])
+            _validate_amount(item["capacity"])
+        except ValueError as exc:
+            raise ReservationCorrupt("reservation-store-invalid-record") from exc
+        if not isinstance(item["window_id"], str) or not _ID_RE.fullmatch(item["window_id"]):
+            raise ReservationCorrupt("reservation-store-invalid-record")
+        capacity_keys.append((tuple(item["pool_ref"][k] for k in _POOL_REF_KEYS), item["window_id"]))
+    # pools 與 capacity_by_pool 必須逐一對應（同一組 pool／window、無重複）；
+    # 損毀導致 pools 少一格時，遺失的容量不得被靜默重新 grant。
+    if len(set(pool_keys)) != len(pool_keys) or sorted(pool_keys) != sorted(capacity_keys):
+        raise ReservationCorrupt("reservation-store-invalid-record")
     if type(row["lease_expires_at_ms"]) is not int or type(row["created_at_ms"]) is not int:
         raise ReservationCorrupt("reservation-store-invalid-record")
 
@@ -890,7 +942,7 @@ def _validate_transition_time(row: dict[str, Any]) -> None:
 # reservation 並重新占用容量。
 _ALLOWED_FROM_STATE: dict[str, frozenset[str]] = {
     "bind": frozenset({"reserved"}),
-    "settle": frozenset({"reserved", "bound"}),
+    "settle": frozenset({"bound"}),
     "release": frozenset({"reserved"}),
     "reconcile": frozenset({"reserved", "bound"}),
 }
