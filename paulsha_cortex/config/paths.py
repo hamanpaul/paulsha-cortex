@@ -73,6 +73,21 @@ def coverage_shadow_telemetry_root() -> Path:
 #: （R1 登記表的「重複路徑推導」Scenario 要求單一真相）。
 REVIEW_VERDICT_SPOOL_DIRNAME = "review-verdicts"
 
+# slice-lane reviewer 的 Manager-side log 根；相對於 coordinator_root 的目錄名。
+SLICE_REVIEW_LOG_DIRNAME = "slice-review-logs"
+
+
+def slice_review_log_root(
+    coordinator_root_override: str | Path | None = None,
+) -> Path:
+    """slice-lane reviewer 的 Manager-owned 終局 log 根（#602）。"""
+    root = (
+        Path(coordinator_root_override).expanduser()
+        if coordinator_root_override is not None
+        else coordinator_root()
+    )
+    return root / SLICE_REVIEW_LOG_DIRNAME
+
 
 def review_verdict_spool_root() -> Path:
     """trust-root Phase 2a（spec §R2）：reviewer verdict 的 per-job 單向 spool 根。

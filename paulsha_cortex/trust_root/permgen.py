@@ -3024,6 +3024,11 @@ class PathLayout:
         """
         return f"{self.coordinator_root}/review-verdicts"
 
+    @property
+    def slice_review_log_root(self) -> str:
+        """slice-lane reviewer 終局 log 的 Manager-only 根（#602）。"""
+        return f"{self.coordinator_root}/{paths.SLICE_REVIEW_LOG_DIRNAME}"
+
     def job_log_spool_root(self, principal: Principal) -> str:
         """該降權 principal 的 job log spool 根（登記表資產由 `JOB_LOG_SPOOLS` 導出）。
 
@@ -3637,6 +3642,7 @@ class PathLayout:
             "workflow-inputs": f"{c}/evidence/workflow-inputs",
             "workflow-evidence": f"{c}/evidence/workflow",
             "gate-ledger": self.dispatch_log_root,
+            "slice-review-log": self.slice_review_log_root,
             "delivery-journal": f"{c}/delivery-journal.json",
             "provider-backoff": f"{c}/provider-rate-limit-backoff.json",
             # #684：planning probe 的跨 tick 快取。Manager-owned 葉檔，**不**列入

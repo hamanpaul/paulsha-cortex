@@ -55,6 +55,7 @@ OS UID、同一個 HOME**，本票逐檔核對後確認下列全部成立。
 | workflow evidence（job-addressed） | `<coordinator_root>/evidence/workflow/<sha256(job_id)>.json` | `coordinator/work_bridge.py:947` |
 | PR metadata／planning／report-cleanup 等 evidence | `<coordinator_root>/evidence/<category>/` | `coordinator/work_bridge.py:514,553-579,605-620,1245,1503` |
 | gate ledger | `<manager log_dir>/<stem>.gates.json` | `coordinator/terminal_contract.py:488-494` |
+| slice-lane reviewer log | `<coordinator_root>/slice-review-logs/<reviewer_job_id>/<reviewer_job_id>.jsonl` | `config/paths.py:slice_review_log_root`; `coordinator/manager.py:_launch_foreign_review` |
 | delivery journal | `<coordinator_root>/delivery-journal.json` | `coordinator/work_actions.py:516-517`（另五處重複推導） |
 | provider backoff | `<coordinator_root>/provider-rate-limit-backoff.json` | `coordinator/provider_backoff.py:22,38-39` |
 | workflow report 發佈 journal | `<coordinator_root>/workflow-report-transactions/<sha256>.json` | `coordinator/manager.py:4434` |

@@ -2120,7 +2120,14 @@ def _launch_foreign_review(
             slice_id=reviewer_job["job_id"],
             prompt=prompt,
             worktree=str(review_worktree),
-            log_dir=str(Path("runtime/review") / slice_id),
+            log_dir=str(
+                (
+                    paths.slice_review_log_root(
+                        coordinator_root_override=coordinator_root
+                    )
+                    / reviewer_job["job_id"]
+                ).resolve()
+            ),
         )
         registry.attach_launch_handle(
             reviewer_job["job_id"],
