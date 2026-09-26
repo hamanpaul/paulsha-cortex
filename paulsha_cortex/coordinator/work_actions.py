@@ -4059,7 +4059,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
     }
     if extras:
         raise ValueError(f"retry-build rejects caller evidence/input: {sorted(extras)[0]}")
-    # #755：選填 operator 指示——repair 回合過去只有 stale 的跨卡回饋可看。
+    # #755：既有 needs_human recovery 的 operator 指示維持選填；通過後新發現阻斷時另要求裁決理由。
     _validate_operator_adjudication_args(args, state_path=state_path, action="retry-build")
     model_chain_override = _retry_build_model_chain_override(args)
     expected_candidate = args.get("expected_candidate")
@@ -4086,12 +4086,25 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
     if len(active) != 1:
         raise RuntimeError("retry-build requires one active canonical WorkflowRun")
     run = active[0]
-    if "needs_human" not in run.facets:
+    verify_steps = [step for step in run.steps if step.phase == "verify"]
+    review_steps = [step for step in run.steps if step.phase == "review"]
+    post_pass_adjudication = (
+        "needs_human" not in run.facets
+        and run.current_phase == "review"
+        and run.candidate_head is not None
+        and run.verified_head == run.candidate_head
+        and bool(verify_steps)
+        and bool(review_steps)
+        and all(step.gate_result == "passed" for step in (*verify_steps, *review_steps))
+    )
+    if "needs_human" not in run.facets and not post_pass_adjudication:
         raise RuntimeError("retry-build requires needs_human workflow")
     if run.current_phase not in {"build", "verify", "review"}:
         raise RuntimeError("retry-build requires build/verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
+    if post_pass_adjudication and not args.get("reason"):
+        raise ValueError("retry-build post-pass adjudication requires --reason")
     reason_payload = run.needs_human_reason
     reason_context = reason_payload.get("context") if isinstance(reason_payload, dict) else None
     delivery_reason = reason_context.get("delivery_reason") if isinstance(reason_context, dict) else None
@@ -4180,6 +4193,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         repair_action=repair_action,
         retry_classification=retry_classification.value,
         model_chain_override=model_chain_override,
+        post_pass_adjudicated=post_pass_adjudication,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
