@@ -6882,7 +6882,7 @@ def test_brainstorm_publication_reconciles_registry_commit_boundary(
     real_write = registry._write_payload_atomically
     failed = False
 
-    def fail_plan_transition(payload):
+    def fail_plan_transition(payload, **kwargs):
         nonlocal failed
         if not failed and any(
             row.get("current_phase") == "plan" and row.get("gate_refs")
@@ -6890,9 +6890,9 @@ def test_brainstorm_publication_reconciles_registry_commit_boundary(
         ):
             failed = True
             if commit_before_error:
-                real_write(payload)
+                real_write(payload, **kwargs)
             raise OSError("registry save fault")
-        real_write(payload)
+        real_write(payload, **kwargs)
 
     monkeypatch.setattr(registry, "_write_payload_atomically", fail_plan_transition)
     with pytest.raises(OSError, match="registry save fault"):

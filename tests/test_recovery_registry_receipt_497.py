@@ -788,7 +788,7 @@ def test_commit_pre_candidate_recovery_persist_failure_rolls_back_prepared_state
     registry.prepare_recovery("slice-a", request=request)
     prepared_bytes = state_path.read_bytes()
 
-    def fail_write(_payload: object) -> None:
+    def fail_write(_payload: object, **kwargs: object) -> None:
         raise OSError("disk-full")
 
     monkeypatch.setattr(registry, "_write_payload_atomically", fail_write)
@@ -1535,7 +1535,7 @@ def test_checkpoint_legacy_binding_persist_failure_rolls_back_legacy_row(
     request = _checkpoint_request(slice_row)
     before_bytes = state_path.read_bytes()
 
-    def fail_write(_payload: object) -> None:
+    def fail_write(_payload: object, **kwargs: object) -> None:
         raise OSError("disk-full")
 
     monkeypatch.setattr(registry, "_write_payload_atomically", fail_write)

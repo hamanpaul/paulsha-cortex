@@ -588,13 +588,13 @@ def test_hard_crash_between_publication_and_state_update_is_healed_by_the_sweep(
     original_commit = manager._PlanningPublicationTransaction.commit
     real_write = registry._write_payload_atomically
 
-    def crash_on_plan_transition(payload):
+    def crash_on_plan_transition(payload, **kwargs):
         if any(
             row.get("current_phase") == "plan" and row.get("gate_refs")
             for row in payload.get("workflows", [])
         ):
             raise _HardCrash("manager process killed at the commit boundary")
-        real_write(payload)
+        real_write(payload, **kwargs)
 
     monkeypatch.setattr(
         manager._PlanningPublicationTransaction, "rollback", lambda self, **kwargs: ()
