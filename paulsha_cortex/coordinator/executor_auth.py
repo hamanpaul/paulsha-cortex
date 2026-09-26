@@ -24,6 +24,7 @@ import subprocess
 import time
 from typing import Callable
 
+from .diagnostics import diagnostic_reason
 from .runtime_preflight import DEFAULT_PROVIDER_TTL_SECONDS, ProviderFreshness
 
 __all__ = [
@@ -136,6 +137,12 @@ def check_executor_auth(
             ttl_seconds=ttl_seconds,
             source="live-probe",
             reason=f"unsupported executor: {executor}",
+            diagnostic_reason=diagnostic_reason(
+                "executor-auth-unsupported",
+                f"unsupported executor: {executor}",
+                source="coordinator.executor_auth.check_executor_auth",
+                executor=executor,
+            ),
         )
     argv = list(_EXECUTOR_AUTH_ARGV[executor])
     try:
@@ -148,6 +155,12 @@ def check_executor_auth(
             ttl_seconds=ttl_seconds,
             source="live-probe",
             reason=f"executor auth probe failed: {type(exc).__name__}: {exc}",
+            diagnostic_reason=diagnostic_reason(
+                "executor-auth-probe-failed",
+                f"executor auth probe failed: {type(exc).__name__}",
+                source="coordinator.executor_auth.check_executor_auth",
+                executor=executor,
+            ),
         )
     combined = (completed.stdout or "") + (completed.stderr or "")
     status, detail = classify_cli_output(completed.returncode, combined)
@@ -160,4 +173,14 @@ def check_executor_auth(
         ttl_seconds=ttl_seconds,
         source="live-probe",
         reason=reason,
+        diagnostic_reason=(
+            None
+            if status == "ok"
+            else diagnostic_reason(
+                f"executor-auth-{status.replace('_', '-')}",
+                reason or f"{executor}: {detail}",
+                source="coordinator.executor_auth.check_executor_auth",
+                executor=executor,
+            )
+        ),
     )

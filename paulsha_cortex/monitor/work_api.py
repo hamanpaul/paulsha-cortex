@@ -26,6 +26,7 @@ from .providers import (
     WorkflowRegistryProvider,
 )
 from .socket_path import validate_socket_path
+from ..coordinator.diagnostics import diagnostic_reason
 from ..coordinator.terminal_contract import MAX_SCHEMA_RETRIES as SCHEMA_RETRY_LIMIT
 from .work_models import ProviderSnapshot
 from .work_models import WorkItem
@@ -635,6 +636,12 @@ class WorkModelRefresher:
                                 )
                             )
                         ),
+                        diagnostic_reason=diagnostic_reason(
+                            "provider-snapshot-stale",
+                            "provider snapshot is stale",
+                            source="monitor.WorkModelRefresher.refresh",
+                            provider_id=authority_id,
+                        ),
                     )
                     providers[authority_id] = stale
                     relevant = [
@@ -668,6 +675,11 @@ class WorkModelRefresher:
                         revision=None,
                         diagnostics=correlation.diagnostics,
                         sources=(),
+                        diagnostic_reason=diagnostic_reason(
+                            "work-source-collision",
+                            "confirmed work source ownership collision",
+                            source="monitor.WorkModelRefresher.refresh",
+                        ),
                     )
                     local = _retain_last_good(previous_local, collision_result)
                     providers[local.provider_id] = local
@@ -754,6 +766,11 @@ class WorkModelRefresher:
                                     f"{type(error).__name__}: {error}",
                                 )
                             )
+                        ),
+                        diagnostic_reason=diagnostic_reason(
+                            "work-model-projection-retained",
+                            f"work model projection retained after {type(error).__name__}",
+                            source="monitor.WorkModelRefresher.refresh",
                         ),
                     )
                     for provider_id, provider in providers.items()

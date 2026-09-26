@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from paulsha_cortex.config.paths import work_items_snapshot_path
+from ..coordinator.diagnostics import diagnostic_reason
 
 from .work_models import ProviderSnapshot, WorkItem, parse_timestamp
 
@@ -210,6 +211,12 @@ class WorkSnapshotStore:
                 last_attempt_at=attempted_at,
                 diagnostics=tuple(
                     dict.fromkeys((*provider.diagnostics, "awaiting live refresh"))
+                ),
+                diagnostic_reason=diagnostic_reason(
+                    "awaiting-live-refresh",
+                    "awaiting live refresh",
+                    source="monitor.WorkSnapshotStore.load_for_bootstrap",
+                    provider_id=provider_id,
                 ),
             )
             for provider_id, provider in snapshot.providers.items()

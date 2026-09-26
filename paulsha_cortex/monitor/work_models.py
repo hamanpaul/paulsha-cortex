@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping
 
+from ..coordinator.diagnostics import DiagnosticReason, coerce_diagnostic_reason
+
 
 WORK_SOURCE_KINDS = frozenset(
     {
@@ -116,6 +118,7 @@ class ProviderSnapshot:
     diagnostics: tuple[str, ...]
     sources: tuple[WorkSource, ...]
     observations: Mapping[str, Any] = field(default_factory=dict)
+    diagnostic_reason: DiagnosticReason | None = None
 
     def __post_init__(self) -> None:
         if not self.provider_id:
@@ -136,6 +139,10 @@ class ProviderSnapshot:
             raise ValueError("provider snapshot contains duplicate source_id")
         if any(source.provider != self.provider_id for source in self.sources):
             raise ValueError("provider snapshot contains foreign provider source")
+        if self.diagnostic_reason is not None and not isinstance(
+            self.diagnostic_reason, DiagnosticReason
+        ):
+            raise ValueError("provider diagnostic_reason must be a DiagnosticReason")
         observations = self.observations
         if not isinstance(observations, Mapping):
             raise ValueError("provider observations must be an object")
@@ -146,7 +153,7 @@ class ProviderSnapshot:
         object.__setattr__(self, "observations", normalized_observations)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "status": self.status,
             "last_attempt_at": self.last_attempt_at,
             "last_success_at": self.last_success_at,
@@ -155,6 +162,9 @@ class ProviderSnapshot:
             "sources": [source.to_dict() for source in self.sources],
             "observations": dict(self.observations),
         }
+        if self.diagnostic_reason is not None:
+            payload["diagnostic_reason"] = self.diagnostic_reason.to_dict()
+        return payload
 
     @classmethod
     def from_dict(cls, provider_id: str, payload: object) -> "ProviderSnapshot":
@@ -163,6 +173,7 @@ class ProviderSnapshot:
         sources = payload.get("sources")
         if not isinstance(sources, list):
             raise ValueError("provider sources must be an array")
+        diagnostic_payload = payload.get("diagnostic_reason")
         return cls(
             provider_id=provider_id,
             status=_required_string(payload, "status"),
@@ -176,6 +187,7 @@ class ProviderSnapshot:
                 if isinstance(payload.get("observations", {}), Mapping)
                 else _invalid_observations()
             ),
+            diagnostic_reason=coerce_diagnostic_reason(diagnostic_payload),
         )
 
 

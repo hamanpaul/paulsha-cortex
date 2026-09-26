@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#573 degraded 理由 invariant**：Monitor provider、runtime preflight 與 doctor 的 degraded／非 pass 輸出現在附帶既有 `DiagnosticReason` 的 reason、detail、source；新增 AST 掃描 invariant 與各路徑回歸測試，原有狀態判定不變。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加

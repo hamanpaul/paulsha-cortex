@@ -17,7 +17,7 @@ Monitor 對每個 repo/work item 只公開 `topic`、`todo`、`on-going`、`done
 
 驗證成功後，Manager 會寫入含 actor、reason、authority 與遠端 closure facts 的 immutable `cortex-work-close-delivered/v1` CompletionRecord。Monitor 只把這類固定目錄中 hash 與唯讀檔案驗證通過的紀錄納入 CompletionRecord 投影；原有 `done` reducer 與所有 closure 條件維持不變，不會建立或偽造 `WorkflowRun`。若其他 strict closure evidence 尚未成立，work item 仍不會投影為 `done`。
 
-Provider 失敗時會保留 last-good snapshot 並標 `degraded`。GitHub provider 超過 900 秒沒有成功 snapshot 時，auto claim 與 merge 都會 fail-closed。
+Provider 失敗時會保留 last-good snapshot 並標 `degraded`，snapshot 另帶 `diagnostic_reason` 的 reason/detail/source；runtime preflight 的 degraded freshness 與 `doctor --json` 非 pass probe 使用相同結構。這些欄位補足診斷，不改變原有狀態或 gate 判定。GitHub provider 超過 900 秒沒有成功 snapshot 時，auto claim 與 merge 都會 fail-closed。
 
 ### Workflow admission 的 executor backoff
 
@@ -264,6 +264,7 @@ Verify/Review dispatch只接受schema v2明示`review` capability、且independe
 - Work snapshot：`$PSC_MONITOR_STATE_ROOT/work-items.snapshot.json`；未設定時為 `$PSC_AGENTS_ROOT/monitor/work-items.snapshot.json`。
 - Installed service 先依 unit 宣告順序合併 `<instance>.env` 與 `<instance>-manager.env`；預設 socket 為 `$PSC_AGENTS_ROOT/run/<instance>/project-monitor.sock`，`monitor.socket_path` override 優先。
 - `doctor --probe-live` 必須以 production Monitor config 解出 socket，再用 read-only `list_work_items` 驗證 `ok` 與 `cortex-work/v1` envelope；裸 listener 或只完成 connect 都視為失敗。Identity registry若配置Claude `review` capability，doctor亦把Claude Code版本/CLI surface、`bubblewrap`、`socat`、`srt`、live native與Unix-socket seccomp smoke列為required probe；未配置Claude reviewer時只回非必要warn。
+- `cortex doctor --json` 的 warn／fail probe 與 degraded provider/preflight 輸出會附帶 `diagnostic_reason`（reason、detail、source）；舊版 snapshot 缺少此 optional 欄位時仍可讀取。
 - Snapshot schema：`work-items-snapshot/v1`，mode `0600`，atomic replace + file/directory fsync。
 - Coordinator registry：首次載入合法 v1 時先建立 read-only、content-hash 命名的 backup，再升級為 v2。
 - 舊 jobs/slices 只進 `legacy_records`，不會猜測 work item association。
