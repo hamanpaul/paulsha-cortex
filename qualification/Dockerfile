@@ -31,6 +31,8 @@ RUN apt-get update \
         console-getty.service
 
 COPY validate.py /usr/local/libexec/cortex-qualification-validate
+COPY contract.py /usr/local/libexec/qualification/contract.py
+COPY __init__.py /usr/local/libexec/qualification/__init__.py
 COPY verify_bundle.py /usr/local/libexec/cortex-qualification-verify-bundle
 COPY driver.py /usr/local/libexec/cortex-release-qualification
 COPY qualification.schema.json /usr/local/share/cortex/qualification.schema.json

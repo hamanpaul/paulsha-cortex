@@ -69,6 +69,10 @@ tree 外 artifact 都會失敗。這能避免上傳內容存在未受 hash inven
 - variables：`CORTEX_RC_PROBE_REPOSITORY`、`CORTEX_RC_PROBE_WORK_ID`、
   `CORTEX_RC_PROBE_ISSUE`
 
+probe repository 的範本、建立步驟、各 secret 的檔案形狀與每次 canary 後的重置方式見
+`docs/superpowers/runbooks/deployment-canary-probe.md`；toolchain 與模型的唯一宣告在
+`qualification/contract.py`。
+
 builder/agy credential 只在 install plan 的 `required_credentials` 明列該組合時匯入；預設
 packaged config 仍只列 builder/codex。canary 會產生 `deployment-canary-<sha>`，其 evidence profile 必須是
 `deployment-canary`。provider login/quota/model mismatch、fallback、Manager dry-run ref drift 或

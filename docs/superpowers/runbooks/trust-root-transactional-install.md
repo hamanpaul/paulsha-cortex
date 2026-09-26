@@ -753,10 +753,34 @@ source path；若 host overlay 將 builder executor 選為 AGY，plan 會再列�
 source path 都必須由 operator 逐一指定到正確檔案；不要從任何 HOME 自動探索，也不要把
 secret 值放進環境變數或命令列。
 
+各 provider 的 source basename 由 installer 的 credential adapter 決定（allowlist，檔名不符
+即拒絕），內容只驗結構、不記錄：
+
+| principal／provider | source basename | 來源 | 安裝落點（該帳號 HOME 下） |
+| --- | --- | --- | --- |
+| builder／codex | `auth.json` | codex 登入後的 `$CODEX_HOME/auth.json` | `.codex/auth.json` |
+| reviewer-planner／agy、builder／agy | `antigravity-oauth-token` | agy 1.2.11 登入後的 `~/.gemini/antigravity-cli/antigravity-oauth-token` | `cache/gemini/antigravity-cli/antigravity-oauth-token` |
+| reviewer-planner／copilot | `config.json` | copilot 1.0.88 登入後的 `~/.copilot/config.json` | `.copilot/config.json` |
+| manager／github | `hosts.yml` | gh 的 `~/.config/gh/hosts.yml` | `.config/gh/hosts.yml` |
+
+- AGY 的 basename 與落點由 permgen 的 `ExecutorCredential("agy", token_leaf=...,
+  cache_target="gemini")` 導出：`~/.gemini` 是指向 `cache/gemini` 的 symlink，installer
+  直接寫實體目標，不跟隨 HOME 內的 symlink。舊的 gemini-cli `oauth_creds.json` 對 agy 1.2.11
+  無效（authentication failed）。
+- Copilot 1.0.88 不再讀 `~/.config/github-copilot/hosts.json`。installer 採 Copilot 自己的
+  `config.json`（`copilotTokens`／`loggedInUsers`／`lastLoggedInUser`），不採 gh 的
+  `hosts.yml`：job 帳號依 #666 刻意沒有 `~/.config/gh`（GitHub 寫入一律由 Manager 代理），
+  放進 gh token 會讓 job 內的 `gh` 重新取得寫入通道；Manager 派 Copilot job 時也是把
+  `PSC_COPILOT_OAUTH_CONFIG` 複製成 `$COPILOT_HOME/config.json`，兩條路徑是同一種檔。
+  匯入要求 `copilotTokens` 為非空物件，錯誤訊息不含任何來源內容。建議來源只保留上述三個
+  鍵，不要帶入其他 CLI 偏好設定。
+- `antigravity-cli/` 與 `.copilot/` 是 CLI 自己的狀態目錄；缺少時 installer 以 0700 建立並
+  交給該帳號擁有，既有時必須已屬該帳號，否則匯入失敗。
+
 ```bash
 cortex_builder_codex_source=/absolute/operator-selected/path/auth.json
-cortex_reviewer_agy_source=/absolute/operator-selected/path/oauth_creds.json
-cortex_reviewer_copilot_source=/absolute/operator-selected/path/hosts.json
+cortex_reviewer_agy_source=/absolute/operator-selected/path/antigravity-oauth-token
+cortex_reviewer_copilot_source=/absolute/operator-selected/path/config.json
 cortex_manager_github_source=/absolute/operator-selected/path/hosts.yml
 
 cortex_root_cli install trust-root credentials import --receipt "$cortex_receipt_path" \
@@ -778,7 +802,7 @@ cortex_root_cli install trust-root credentials import --receipt "$cortex_receipt
 `reviewer-planner` 的登入態共用；若 plan 沒有這一列，這筆命令應保持不執行。
 
 ```bash
-cortex_builder_agy_source=/absolute/operator-selected/path/oauth_creds.json
+cortex_builder_agy_source=/absolute/operator-selected/path/antigravity-oauth-token
 cortex_root_cli install trust-root credentials import --receipt "$cortex_receipt_path" \
   --principal builder --provider agy --source "$cortex_builder_agy_source" \
   --maintenance-token "$cortex_maintenance_token"
@@ -927,4 +951,5 @@ production host verify 與 protected GitHub deployment canary 是兩個 gate。c
 四份 GitHub environment secrets 與三個非秘密 variables；workflow 會在 disposable
 container 內安裝 exact wheel、跑完整 intake-to-closeout，並要求 `worktree-isolation`
 確實由指定 Codex model 自主產生至少一筆成功且有輸出的 command event。沒有成功的 live
-canary run 時，#716 必須維持 open。
+canary run 時，#716 必須維持 open。probe repository 的準備、secret 形狀與重置見
+`docs/superpowers/runbooks/deployment-canary-probe.md`。

@@ -9,6 +9,16 @@ from pathlib import Path
 import pytest
 import yaml
 
+from qualification.contract import (
+    CANARY_BUILDER,
+    CANARY_REVIEWER,
+    PROVIDERS,
+    TOOLCHAIN,
+    canary_identity,
+    github_environment,
+    model_identity_overlay,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 SHA_PIN_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
@@ -258,6 +268,93 @@ def test_deployment_canary_is_manual_protected_and_separate_from_release() -> No
         "release qualification and deployment canary must build the exact candidate "
         "through one byte-identical recipe"
     )
+
+
+def test_qualification_toolchain_and_provider_models_have_one_workflow_source() -> None:
+    """toolchain／模型只在 qualification/contract.py 宣告一次，其他地方全由它導出。"""
+
+    env = github_environment()
+    for name, tool in TOOLCHAIN.items():
+        for field, value in tool.items():
+            assert env[f"TOOL_{name.upper()}_{field.upper()}"] == value
+    assert not any(key.startswith("PROVIDER_") for key in env)
+
+    for name in ("deployment-canary.yml", "rc-qualification.yml"):
+        payload = _load_workflow(name)
+        steps = payload["jobs"]["qualification"]["steps"]
+        names = [row.get("name") for row in steps]
+        contract_step = steps[names.index("Load shared qualification contract")]
+        assert contract_step["run"] == (
+            'python qualification/contract.py --github-env "$GITHUB_ENV"'
+        )
+        assert names.index("Load shared qualification contract") < names.index(
+            "Build exact wheel, wheelhouse, and bundle"
+        )
+        raw = (WORKFLOWS / name).read_text(encoding="utf-8")
+        for tool_name, tool in TOOLCHAIN.items():
+            # 版本、套件、integrity、URL、sha256 都不得在 workflow 內再寫一份字面值。
+            for field, value in tool.items():
+                if field in {"archive_path", "entrypoint"}:
+                    continue
+                assert value not in raw, (name, tool_name, field)
+                assert f"$TOOL_{tool_name.upper()}_{field.upper()}" in raw
+        for provider in PROVIDERS.values():
+            assert provider["model_id"] not in raw
+
+    dockerfile = (REPO_ROOT / "qualification" / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY contract.py /usr/local/libexec/qualification/contract.py" in dockerfile
+    for tool in TOOLCHAIN.values():
+        assert tool["version"] not in dockerfile
+
+    from qualification import driver, validate
+
+    assert driver.PROVIDERS == {
+        name: (row["model_id"], row["effort"], row["account"])
+        for name, row in PROVIDERS.items()
+    }
+    assert validate.REQUIRED_PROVIDERS == {
+        name: (row["model_id"], row["effort"]) for name, row in PROVIDERS.items()
+    }
+    assert driver.PROVIDER_PREFLIGHTS["codex"].version == TOOLCHAIN["codex"]["version"]
+    assert driver.PROVIDER_PREFLIGHTS["agy"].version == TOOLCHAIN["agy"]["version"]
+    assert (
+        driver.DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
+        driver.DEPLOYMENT_CANARY_BUILDER_MODEL,
+    ) == canary_identity(CANARY_BUILDER)
+    assert (validate.CANARY_BUILDER_EXECUTOR, validate.CANARY_BUILDER_MODEL) == (
+        canary_identity(CANARY_BUILDER)
+    )
+
+
+def test_canary_codex_effort_matches_the_production_launcher() -> None:
+    """contract 不能 import paulsha_cortex；codex effort 與 launcher 的對照由此釘住。"""
+
+    from paulsha_cortex.coordinator.launcher import _codex_default_effort
+
+    codex = PROVIDERS[str(CANARY_BUILDER["provider"])]
+    assert _codex_default_effort(codex["model_id"]) == codex["effort"]
+
+
+def test_canary_model_identity_overlay_is_derived_from_provider_contract() -> None:
+    overlay = model_identity_overlay()
+    assert overlay["resolution_policy"] == {"packaged_fallback": "deny"}
+    identities = {
+        (row["executor"], row["model_id"]): row for row in overlay["identities"]
+    }
+    assert set(identities) == {
+        canary_identity(CANARY_BUILDER),
+        canary_identity(CANARY_REVIEWER),
+    }
+    builder = identities[canary_identity(CANARY_BUILDER)]
+    reviewer = identities[canary_identity(CANARY_REVIEWER)]
+    assert canary_identity(CANARY_BUILDER) == ("codex", PROVIDERS["codex"]["model_id"])
+    assert canary_identity(CANARY_REVIEWER) == (
+        "agy",
+        f"{PROVIDERS['agy']['model_id']}-{PROVIDERS['agy']['effort']}",
+    )
+    assert builder["capabilities"] == ["build"]
+    assert {"planning", "review"} <= set(reviewer["capabilities"])
+    assert builder["independence_domain"] != reviewer["independence_domain"]
 
 
 def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish() -> (

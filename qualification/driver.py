@@ -28,14 +28,40 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from paulsha_cortex.coordinator import job_runner, spool_slot
+from paulsha_cortex.trust_root.registry import (
+    JobWriteContract,
+    inner_sandbox_attached_for,
+    sandbox_mode_for,
+)
 from paulsha_cortex.trust_root.surfaces import writable_surface
+
+try:
+    from qualification.contract import (
+        CANARY_BUILDER,
+        CANARY_REVIEWER,
+        PROVIDERS as PROVIDER_CONTRACTS,
+        TOOLCHAIN,
+        canary_identity,
+    )
+except ModuleNotFoundError:  # 直接以 qualification/driver.py 執行時 sys.path[0] 是 qualification/
+    from contract import (  # type: ignore[no-redef]
+        CANARY_BUILDER,
+        CANARY_REVIEWER,
+        PROVIDERS as PROVIDER_CONTRACTS,
+        TOOLCHAIN,
+        canary_identity,
+    )
 
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 WORK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-DEPLOYMENT_CANARY_BUILDER_EXECUTOR = "codex"
-DEPLOYMENT_CANARY_BUILDER_MODEL = "gpt-5.3-codex-spark"
+DEPLOYMENT_CANARY_BUILDER_EXECUTOR, DEPLOYMENT_CANARY_BUILDER_MODEL = canary_identity(
+    CANARY_BUILDER
+)
+DEPLOYMENT_CANARY_REVIEWER_EXECUTOR, DEPLOYMENT_CANARY_REVIEWER_MODEL = canary_identity(
+    CANARY_REVIEWER
+)
 DEPLOYMENT_CANARY_PROBE_CARD = "worktree-isolation"
 DEPLOYMENT_CANARY_BUILDER_PATH = "/opt/cortex/toolchain/bin:/usr/bin:/bin"
 MAX_AGENT_LOOP_LOG_BYTES = 128 * 1024 * 1024
@@ -43,9 +69,8 @@ MAX_AGENT_LOOP_COMMANDS = 128
 MAX_DISPATCH_ARTIFACTS = 128
 MAX_DISPATCH_ARTIFACT_PATH_CHARS = 128
 PROVIDERS = {
-    "agy": ("gemini-3.7-flash", "high", "cortex-reviewer-planner"),
-    "copilot": ("gpt-5.4", "xhigh", "cortex-reviewer-planner"),
-    "codex": ("gpt-5.3-codex-spark", "xhigh", "cortex-builder"),
+    name: (row["model_id"], row["effort"], row["account"])
+    for name, row in PROVIDER_CONTRACTS.items()
 }
 SERVICES = (
     "cortex-egress-proxy.service",
@@ -63,10 +88,10 @@ class ProviderPreflightAdapter:
 
 
 PROVIDER_PREFLIGHTS = {
-    # agy 1.1.18 exposes the read-only /quota slash command as a structured
+    # The pinned AGY exposes the read-only /quota slash command as a structured
     # print-mode response; do not pass a made-up "status" subcommand.
     "agy": ProviderPreflightAdapter(
-        version="1.1.18",
+        version=TOOLCHAIN["agy"]["version"],
         version_command=("/opt/cortex/toolchain/bin/agy", "--version"),
         status_command=(
             "/opt/cortex/toolchain/bin/agy",
@@ -95,7 +120,7 @@ PROVIDER_PREFLIGHTS = {
     # protocol.  ``doctor --json`` only reports local health and is not a
     # provider capability proof.
     "codex": ProviderPreflightAdapter(
-        version="0.149.0",
+        version=TOOLCHAIN["codex"]["version"],
         version_command=("/opt/cortex/toolchain/bin/codex", "--version"),
         status_command=(
             "/opt/cortex/toolchain/bin/codex",
@@ -194,6 +219,10 @@ def _account_env(account: str) -> dict[str, str]:
     home = pwd.getpwnam(account).pw_dir
     env = {
         "HOME": home,
+        # 與產生的 job unit 相同（`Environment=XDG_CACHE_HOME=<HOME>/cache`）：HOME 本身
+        # root-owned，帳號唯一可寫的是 `cache`；copilot 1.0.88 會把自身 pkg 解到
+        # `$XDG_CACHE_HOME/copilot/pkg`，沒有這一格就會嘗試建立不可寫的 `~/.cache`。
+        "XDG_CACHE_HOME": f"{home}/cache",
         "PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
         "NO_COLOR": "1",
         "CI": "true",
@@ -1812,7 +1841,7 @@ def _codex_thread_runtime_identity(
     result = _codex_provider_thread_result(thread_id, codex_home=codex_home)
     if (
         result.get("model") != DEPLOYMENT_CANARY_BUILDER_MODEL
-        or result.get("reasoningEffort") != "xhigh"
+        or result.get("reasoningEffort") != PROVIDERS["codex"][1]
         or result.get("modelProvider") != "openai"
         or result.get("persistedModelProvider") != "openai"
         or result.get("persistedCwd") != expected_worktree
@@ -1822,7 +1851,7 @@ def _codex_thread_runtime_identity(
         )
     return {
         "runtime_model": DEPLOYMENT_CANARY_BUILDER_MODEL,
-        "runtime_effort": "xhigh",
+        "runtime_effort": PROVIDERS["codex"][1],
         "model_provider": "openai",
         "thread_sha256": hashlib.sha256(thread_id.encode()).hexdigest(),
     }
@@ -2260,8 +2289,64 @@ def _has_exact_final_assistant_response(records: Sequence[object]) -> bool:
     return final_contents == ["QUALIFICATION_OK"]
 
 
+def _codex_registry_sandbox_argv(
+    contract: JobWriteContract, *, trust_root_outer_unit: bool
+) -> tuple[str, ...]:
+    """由 `registry.SANDBOX_MODE_DERIVATION` 導出 Codex 的 `--sandbox` argv。
+
+    與 `launcher.build_codex_argv()` 消費同一格：mode 取 `sandbox_mode_for()`，
+    是否附掛內層沙箱取 `inner_sandbox_attached_for()`。qualification 只接受「不附掛」
+    的列——codex 0.157 的 legacy Landlock（`--enable use_legacy_landlock`）起不來，
+    登記表若把附掛改回來，這裡 fail-closed，而不是默默發出必死的 argv。
+    """
+
+    mode = sandbox_mode_for(contract, trust_root_outer_unit=trust_root_outer_unit)
+    if mode is None or inner_sandbox_attached_for(
+        contract, trust_root_outer_unit=trust_root_outer_unit
+    ):
+        raise QualificationFailure(
+            f"Codex sandbox row {contract.value} is not usable for qualification"
+        )
+    return ("--sandbox", mode)
+
+
+def _codex_provider_smoke_sandbox_argv() -> tuple[str, ...]:
+    """Codex provider smoke 的 sandbox argv。
+
+    smoke 由 driver 以 `runuser` 直接啟動，**不在** Trust Root 模板 unit 內，因此取
+    登記表的 direct 欄（`trust_root_outer_unit=False`）。它以 `cortex-builder` 執行、
+    沒有卡片契約，登記表對「builder 且契約缺欄」的裁決是 `BUILDER_WORKSPACE_WRITE`，
+    該列 direct 發 `danger-full-access` 且不附內層沙箱——與 canary builder 卡
+    （`worktree-isolation`，`BUILDER_WRITE_FORBIDDEN`）在模板 unit 內 outer-unit 欄
+    發出的 `--sandbox` 完全相同。
+
+    `--skip-git-repo-check` 沿用 launcher 對「工作區不是 repo」的既有規則
+    （planner／reviewer 列同樣附帶）：smoke 的 cwd 是容器根目錄而不是 per-job clone，
+    codex 0.157.1 沒有此旗標會以「Not inside a trusted directory」直接結束。
+    """
+
+    return (
+        *_codex_registry_sandbox_argv(
+            JobWriteContract.BUILDER_WORKSPACE_WRITE, trust_root_outer_unit=False
+        ),
+        "--skip-git-repo-check",
+    )
+
+
+def _codex_canary_builder_sandbox_argv() -> tuple[str, ...]:
+    """canary builder 卡在 Trust Root 模板 unit 內實際收到的 sandbox argv。"""
+
+    return _codex_registry_sandbox_argv(
+        JobWriteContract.BUILDER_WRITE_FORBIDDEN, trust_root_outer_unit=True
+    )
+
+
 def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
     prompt = "Return exactly QUALIFICATION_OK and do not use tools."
+    agy_model, agy_effort, _agy_account = PROVIDERS["agy"]
+    copilot_model, copilot_effort, _copilot_account = PROVIDERS["copilot"]
+    codex_model, codex_effort, _codex_account = PROVIDERS["codex"]
+    codex_sandbox_argv = _codex_provider_smoke_sandbox_argv()
     commands = {
         "agy": (
             "/opt/cortex/toolchain/bin/agy",
@@ -2271,9 +2356,9 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             "plan",
             "--sandbox",
             "--model",
-            "gemini-3.7-flash",
+            agy_model,
             "--effort",
-            "high",
+            agy_effort,
             "--output-format",
             "json",
             "--disable-slash-commands",
@@ -2283,9 +2368,9 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             "--prompt",
             prompt,
             "--model",
-            "gpt-5.4",
+            copilot_model,
             "--effort",
-            "xhigh",
+            copilot_effort,
             "--output-format",
             "json",
             "--available-tools=__none__",
@@ -2301,15 +2386,11 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             "--ignore-user-config",
             prompt,
             "--json",
-            "--sandbox",
-            "read-only",
-            "--enable",
-            "use_legacy_landlock",
+            *codex_sandbox_argv,
             "--model",
-            "gpt-5.3-codex-spark",
+            codex_model,
             "-c",
-            'model_reasoning_effort="xhigh"',
-            "--skip-git-repo-check",
+            f'model_reasoning_effort="{codex_effort}"',
         ),
     }
     verdicts: list[dict[str, object]] = []
@@ -2721,8 +2802,8 @@ def _is_expected_head_probe(
     The job spec already fixes ``working_directory`` and Codex ``-C`` to the
     Manager-owned worktree. Requiring the absolute system Git path prevents a
     repository-local ``./git`` or PATH substitution, while exact argv equality
-    rejects pipes, boolean fallbacks, redirections, aliases, and suffixes. Codex
-    0.149 serializes shell-tool executions as a three-argument Bash ``-c``/``-lc``
+    rejects pipes, boolean fallbacks, redirections, aliases, and suffixes. The
+    Codex CLI serializes shell-tool executions as a three-argument Bash ``-c``/``-lc``
     argv; only that exact outer shape is unwrapped once.
     """
 
@@ -2984,7 +3065,7 @@ def _bound_codex_builder_spec(
             "Codex agent-loop git safe.directory is not the exact bound worktree"
         )
     segments = _shell_segments(command[2])
-    if not segments or len(segments[0]) != 17:
+    if not segments or len(segments[0]) < 4:
         raise QualificationFailure("Codex agent-loop job command identity is invalid")
     prompt = segments[0][3]
     if prompt != _expected_worktree_isolation_prompt(job, workflow):
@@ -2998,14 +3079,11 @@ def _bound_codex_builder_spec(
         "--ignore-user-config",
         prompt,
         "--json",
-        "--sandbox",
-        "read-only",
-        "--enable",
-        "use_legacy_landlock",
+        *_codex_canary_builder_sandbox_argv(),
         "--model",
         DEPLOYMENT_CANARY_BUILDER_MODEL,
         "-c",
-        'model_reasoning_effort="xhigh"',
+        f'model_reasoning_effort="{PROVIDERS["codex"][1]}"',
         "-o",
         str(expected_last_message),
         "-C",
@@ -3619,6 +3697,51 @@ def _validate_dispatch_closeout(
     )
 
 
+def _validate_canary_dispatch_model_identities(
+    runtime_env: Mapping[str, str],
+) -> None:
+    """intake 前確認已安裝的 roster 能授權 canary builder 與獨立 reviewer。
+
+    builder override 的語意檢查要到 build 卡派工時才發生（intake 只驗語法），
+    planning 卻在 intake 當下同步執行；這裡先以 Manager 實際讀取的
+    `PSC_PROJECT_CONFIG_ROOT` 載入 roster，缺身分、缺能力、domain 相同或 hardened
+    相容性不符都 fail-closed，不讓 canary 燒掉一次 planning 才在 build 卡失敗。
+    """
+
+    config_root = runtime_env.get("PSC_PROJECT_CONFIG_ROOT")
+    if not isinstance(config_root, str) or not config_root:
+        raise QualificationFailure("installed model identity overlay root is unavailable")
+    from paulsha_cortex.coordinator.model_identities import load_model_identities
+    from paulsha_cortex.coordinator.model_resolution import (
+        validate_identity_compatibility,
+    )
+
+    try:
+        identities = load_model_identities(config_root)
+        builder = identities.require(
+            DEPLOYMENT_CANARY_BUILDER_EXECUTOR, DEPLOYMENT_CANARY_BUILDER_MODEL
+        )
+        reviewer = identities.require(
+            DEPLOYMENT_CANARY_REVIEWER_EXECUTOR, DEPLOYMENT_CANARY_REVIEWER_MODEL
+        )
+        if (
+            not set(CANARY_BUILDER["capabilities"]) <= set(builder.capabilities)
+            or builder.independence_domain != CANARY_BUILDER["independence_domain"]
+            or not set(CANARY_REVIEWER["capabilities"]) <= set(reviewer.capabilities)
+            or reviewer.independence_domain != CANARY_REVIEWER["independence_domain"]
+            or reviewer.independence_domain == builder.independence_domain
+        ):
+            raise ValueError("canary identity capability or independence mismatch")
+        validate_identity_compatibility("builder", builder)
+        for persona in ("planner", "reviewer"):
+            validate_identity_compatibility(persona, reviewer)
+    except (KeyError, ValueError) as exc:
+        raise QualificationFailure(
+            "installed model identity roster cannot authorize the canary builder "
+            "and independent reviewer"
+        ) from exc
+
+
 def _full_dispatch(
     *,
     repository: str,
@@ -3635,6 +3758,7 @@ def _full_dispatch(
     ):
         raise QualificationFailure("protected full-dispatch work identity is missing")
     runtime_env = _installed_runtime_env()
+    _validate_canary_dispatch_model_identities(runtime_env)
     intake = _run(
         (
             "/opt/cortex/venv/bin/cortex",

@@ -1,0 +1,12 @@
+version: 1
+work_items:
+  deployment-canary-probe:
+    title: "Deployment canary probe task"
+    links:
+      # 每次 canary 前由 operator 加上本次 issue（OWNER/REPO#N，大小寫與
+      # CORTEX_RC_PROBE_REPOSITORY 完全一致）：
+      # - kind: github_issue
+      #   ref: "OWNER/REPO#N"
+      - kind: openspec
+        ref: "deployment-canary-probe"
+    excludes: []

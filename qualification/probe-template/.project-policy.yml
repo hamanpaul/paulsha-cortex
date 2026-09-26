@@ -1,0 +1,17 @@
+policy_profile: flat
+policy_version: 1.0.17
+tier: shareable
+agent_files:
+  mode: symlink
+conventions_engine:
+  mode: pip
+preflight:
+  steps:
+    - name: syntax
+      kind: validation
+      argv: ["python3", "-m", "compileall", "-q", "src"]
+      timeout_seconds: 60
+    - name: tests
+      kind: tests
+      argv: ["python3", "-m", "unittest", "discover", "-s", "tests", "-q"]
+      timeout_seconds: 60

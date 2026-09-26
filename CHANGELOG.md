@@ -13,6 +13,8 @@
 
 ### Fixed
 
+- **#716 deployment canary 基礎設施更新**：qualification toolchain 與模型改由 `qualification/contract.py` 單一宣告（codex 0.157.1／`gpt-6-luna`、copilot 1.0.88／`gpt-5.4`、agy 1.2.11／`gemini-3.8-flash`），workflow、driver、validator 全由它導出；codex smoke 與 canary builder 預期 argv 由 sandbox 登記表導出，移除 0.157 起不來的 legacy Landlock 旗標；canary 容器安裝同源的 model identity overlay 並在 intake 前驗證；credential adapter 對齊 agy `antigravity-oauth-token` 與 copilot `~/.copilot/config.json`，CLI 狀態目錄交由帳號擁有；新增 probe repository 範本與 `deployment-canary-probe` runbook。
+
 - **PatchMUD report v2 consumer**：封套 mapper 以 role、execution-profile key、benchmark、deck digest 與 evaluator revision 精確選取 cohort；v1 報表僅 opaque 保留並 fail-closed 不排名，未知版本拒收。`model-eval-roster.yaml` 新增 profile-bound schema v2，保留既有 roster v1 相容讀取。
 
 - **#833 Red child 自動進件**：拆分計畫通過 review 後，Manager 以 planning transaction 冪等發布 child work item 與 Todo；Monitor snapshot 確認 WorkAuthority 後由 periodic resume 自動標準 intake。

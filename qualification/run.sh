@@ -132,6 +132,26 @@ docker exec "$container_name" cortex install trust-root plan \
     --output "$plan_path"
 plan_sha=$(docker exec "$container_name" sha256sum "$plan_path" | awk '{print $1}')
 
+# Credential source basenames come from the installer's adapter allowlist
+# (AGY is derived from the permgen credential row), never from harness literals.
+# The candidate wheel is installed into the system interpreter above; the
+# deployment venv does not exist until apply.
+credential_source_basename() {
+    docker exec "$container_name" python3 -c \
+        'import sys; from paulsha_cortex.trust_root.install.core import credential_source_basename; print(credential_source_basename(sys.argv[1], sys.argv[2]))' \
+        "$1" "$2"
+}
+
+agy_auth_leaf=$(credential_source_basename reviewer-planner agy)
+builder_agy_auth_leaf=$(credential_source_basename builder agy)
+copilot_auth_leaf=$(credential_source_basename reviewer-planner copilot)
+manager_github_auth_leaf=$(credential_source_basename manager github)
+for credential_leaf in "$agy_auth_leaf" "$builder_agy_auth_leaf" \
+    "$copilot_auth_leaf" "$manager_github_auth_leaf"; do
+    [[ "$credential_leaf" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+        die "credential adapter returned an unsafe source basename"
+done
+
 # The packaged release config keeps the builder on Codex. A host overlay may
 # opt into AGY, in which case the plan is the authority for whether a separate
 # builder credential must be supplied. Treat an unreadable/malformed plan as a
@@ -222,7 +242,13 @@ import_secret() {
 
 import_fixture() {
     local principal=$1 provider=$2 source_path=$3
-    printf '%s' '{}' | docker exec -i "$container_name" \
+    local fixture='{}'
+    if [[ "$provider" == copilot ]]; then
+        # The adapter validates the Copilot config.json shape; the fixture is
+        # structurally valid but carries no usable credential.
+        fixture='{"copilotTokens":{"qualification-fixture":"non-secret-qualification-fixture"}}'
+    fi
+    printf '%s' "$fixture" | docker exec -i "$container_name" \
         sh -eu -c 'umask 077; cat > "$1"' sh "$source_path"
     docker exec "$container_name" cortex install trust-root credentials import \
         --receipt "$receipt_path" \
@@ -235,21 +261,48 @@ import_fixture() {
 if [[ "$profile" == deployment-canary ]]; then
     import_secret CORTEX_RC_CODEX_AUTH builder codex /run/auth.json
     if (( builder_agy_required )); then
-        import_secret CORTEX_RC_BUILDER_AGY_AUTH builder agy /run/oauth_creds.json
+        import_secret CORTEX_RC_BUILDER_AGY_AUTH builder agy "/run/$builder_agy_auth_leaf"
     fi
-    import_secret CORTEX_RC_AGY_AUTH reviewer-planner agy /run/oauth_creds.json
-    import_secret CORTEX_RC_COPILOT_AUTH reviewer-planner copilot /run/hosts.json
-    import_secret CORTEX_RC_MANAGER_GITHUB_AUTH manager github /run/hosts.yml
+    import_secret CORTEX_RC_AGY_AUTH reviewer-planner agy "/run/$agy_auth_leaf"
+    import_secret CORTEX_RC_COPILOT_AUTH reviewer-planner copilot "/run/$copilot_auth_leaf"
+    import_secret CORTEX_RC_MANAGER_GITHUB_AUTH manager github "/run/$manager_github_auth_leaf"
 else
     # Exercise the production import/activation path without introducing a
     # credential or external authority into release qualification.
     import_fixture builder codex /run/auth.json
     if (( builder_agy_required )); then
-        import_fixture builder agy /run/oauth_creds.json
+        import_fixture builder agy "/run/$builder_agy_auth_leaf"
     fi
-    import_fixture reviewer-planner agy /run/oauth_creds.json
-    import_fixture reviewer-planner copilot /run/hosts.json
-    import_fixture manager github /run/hosts.yml
+    import_fixture reviewer-planner agy "/run/$agy_auth_leaf"
+    import_fixture reviewer-planner copilot "/run/$copilot_auth_leaf"
+    import_fixture manager github "/run/$manager_github_auth_leaf"
+fi
+
+if [[ "$profile" == deployment-canary ]]; then
+    # The packaged roster has neither the canary builder nor its independent
+    # planner/reviewer. Install the operator overlay rendered by the same
+    # qualification contract as the provider smokes and builder override, at the
+    # PSC_PROJECT_CONFIG_ROOT the installed Manager actually reads.
+    model_config_root=$(docker exec "$container_name" python3 -c '
+import json, sys
+for raw in open("/opt/cortex/etc/cortex-manager.env", encoding="utf-8"):
+    key, _sep, value = raw.rstrip("\n").partition("=")
+    if key == "PSC_PROJECT_CONFIG_ROOT":
+        print(json.loads(value))
+        break
+else:
+    sys.exit("PSC_PROJECT_CONFIG_ROOT is not installed")
+')
+    [[ "$model_config_root" == /var/lib/cortex/* ]] || die "model identity overlay root is outside qualification state"
+    docker exec "$container_name" sh -eu -c '
+        [ -d "$1" ] || install -d -o root -g root -m 0755 "$1"
+        rm -f /run/cortex-install/model-identities.yaml
+        python3 /usr/local/libexec/qualification/contract.py \
+            --model-identity-overlay /run/cortex-install/model-identities.yaml
+        install -o root -g root -m 0644 /run/cortex-install/model-identities.yaml "$1/model-identities.yaml"
+        rm -f /run/cortex-install/model-identities.yaml
+        python3 -c "import sys; from paulsha_cortex.coordinator.model_identities import load_model_identities; load_model_identities(sys.argv[1])" "$1"
+    ' sh "$model_config_root"
 fi
 
 # Imported Codex material lands in the account's legacy ``~/.codex`` path. Run

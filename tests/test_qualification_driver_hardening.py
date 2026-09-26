@@ -10,6 +10,20 @@ from types import SimpleNamespace
 
 import pytest
 
+from qualification.contract import (
+    CANARY_BUILDER,
+    CANARY_REVIEWER,
+    PROVIDERS as PROVIDER_CONTRACTS,
+    TOOLCHAIN,
+    canary_identity,
+    render_model_identity_overlay,
+)
+
+
+PROVIDER_MODELS = {name: row["model_id"] for name, row in PROVIDER_CONTRACTS.items()}
+PROVIDER_EFFORTS = {name: row["effort"] for name, row in PROVIDER_CONTRACTS.items()}
+TOOL_VERSIONS = {name: row["version"] for name, row in TOOLCHAIN.items()}
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "qualification" / "driver.py"
@@ -49,11 +63,11 @@ def _preflight(**overrides) -> dict[str, object]:
 
 def _smoke(provider: str, *, extra_model: str | None = None) -> str:
     models = {
-        "agy": "gemini-3.7-flash",
-        "copilot": "gpt-5.4",
-        "codex": "gpt-5.3-codex-spark",
+        "agy": PROVIDER_MODELS["agy"],
+        "copilot": PROVIDER_MODELS["copilot"],
+        "codex": PROVIDER_MODELS["codex"],
     }
-    efforts = {"agy": "high", "copilot": "xhigh", "codex": "xhigh"}
+    efforts = PROVIDER_EFFORTS
     rows = [
         {
             "provider": provider,
@@ -101,8 +115,8 @@ def test_provider_smokes_use_live_preflight_and_unique_runtime_metadata(
         "_codex_provider_thread_result",
         lambda _thread_id, **_kwargs: {
             "thread": {"id": "thread-provider-smoke"},
-            "model": "gpt-5.3-codex-spark",
-            "reasoningEffort": "xhigh",
+            "model": PROVIDER_MODELS["codex"],
+            "reasoningEffort": PROVIDER_EFFORTS["codex"],
             "modelProvider": "openai",
         },
     )
@@ -111,9 +125,9 @@ def test_provider_smokes_use_live_preflight_and_unique_runtime_metadata(
         (row["provider"], row["runtime_model"], row["runtime_effort"])
         for row in verdicts
     ] == [
-        ("agy", "gemini-3.7-flash", "high"),
-        ("copilot", "gpt-5.4", "xhigh"),
-        ("codex", "gpt-5.3-codex-spark", "xhigh"),
+        ("agy", PROVIDER_MODELS["agy"], PROVIDER_EFFORTS["agy"]),
+        ("copilot", PROVIDER_MODELS["copilot"], PROVIDER_EFFORTS["copilot"]),
+        ("codex", PROVIDER_MODELS["codex"], PROVIDER_EFFORTS["codex"]),
     ]
     assert [kind for kind, _argv in calls] == [
         "smoke",
@@ -129,10 +143,36 @@ def test_provider_smokes_use_live_preflight_and_unique_runtime_metadata(
         row["preflight"]["fallback"] is False for row in evidence["providers"].values()
     )
     codex_argv = calls[-1][1]
-    assert codex_argv[codex_argv.index("--model") + 1] == "gpt-5.3-codex-spark"
+    assert codex_argv[codex_argv.index("--model") + 1] == PROVIDER_MODELS["codex"]
     assert codex_argv[codex_argv.index("-c") + 1] == (
-        'model_reasoning_effort="xhigh"'
+        f'model_reasoning_effort="{PROVIDER_EFFORTS["codex"]}"'
     )
+    from paulsha_cortex.coordinator.launcher import build_codex_argv
+    from paulsha_cortex.trust_root.registry import JobWriteContract, sandbox_mode_for
+
+    # smoke 在模板 unit 外直接執行：取登記表 direct 欄的 builder 預設列，且與
+    # canary builder 在模板 unit 內收到的 `--sandbox` 相同；legacy Landlock 不得出現。
+    assert codex_argv[codex_argv.index("--sandbox") + 1] == sandbox_mode_for(
+        JobWriteContract.BUILDER_WORKSPACE_WRITE
+    )
+    assert codex_argv[codex_argv.index("--sandbox") + 1] == sandbox_mode_for(
+        JobWriteContract.BUILDER_WRITE_FORBIDDEN, trust_root_outer_unit=True
+    )
+    assert "--enable" not in codex_argv
+    assert "use_legacy_landlock" not in codex_argv
+    # 除了工作區（cwd 不是 repo → `--skip-git-repo-check`；沒有 `-o`／`-C`）之外，
+    # smoke 與 production launcher 為同一模型發出的 argv 逐字相同。
+    production = build_codex_argv(
+        prompt="Return exactly QUALIFICATION_OK and do not use tools.",
+        slice_id="provider-smoke",
+        log_dir="/nonexistent",
+        model=PROVIDER_MODELS["codex"],
+    )
+    production = production[: production.index("-o")]
+    sandbox_at = production.index("--sandbox") + 2
+    production[sandbox_at:sandbox_at] = ["--skip-git-repo-check"]
+    assert list(codex_argv[1:]) == production[1:]
+    assert codex_argv[0] == "/opt/cortex/toolchain/bin/codex"
 
 
 def test_provider_smokes_reject_requested_plus_fallback_metadata(
@@ -155,8 +195,8 @@ def test_provider_smokes_reject_requested_plus_fallback_metadata(
         "_codex_provider_thread_result",
         lambda _thread_id, **_kwargs: {
             "thread": {"id": "thread-provider-smoke"},
-            "model": "gpt-5.3-codex-spark",
-            "reasoningEffort": "xhigh",
+            "model": PROVIDER_MODELS["codex"],
+            "reasoningEffort": PROVIDER_EFFORTS["codex"],
             "modelProvider": "openai",
         },
     )
@@ -169,7 +209,7 @@ def test_provider_preflight_uses_only_supported_pinned_argv() -> None:
     driver = _load_driver()
     adapters = driver.PROVIDER_PREFLIGHTS
 
-    assert adapters["agy"].version == "1.1.18"
+    assert adapters["agy"].version == TOOL_VERSIONS["agy"]
     assert adapters["agy"].version_command[-1] == "--version"
     assert adapters["agy"].status_command[-4:] == (
         "-p",
@@ -185,7 +225,7 @@ def test_provider_preflight_uses_only_supported_pinned_argv() -> None:
         "--no-auto-login",
     )
     assert adapters["copilot"].status_kind == "copilot-app-server"
-    assert adapters["codex"].version == "0.149.0"
+    assert adapters["codex"].version == TOOL_VERSIONS["codex"]
     assert adapters["codex"].status_command[-2:] == ("app-server", "--stdio")
     assert adapters["codex"].status_kind == "codex-app-server"
     serialized = repr(adapters)
@@ -214,7 +254,7 @@ def test_agy_preflight_accepts_machine_readable_quota_without_prompt_or_retry(
     def fake_run(argv, **_kwargs):
         calls.append(tuple(argv))
         if argv[-1] == "--version":
-            return _result(driver, argv, stdout="agy version 1.1.18\n")
+            return _result(driver, argv, stdout=f"agy version {TOOL_VERSIONS['agy']}\n")
         return _result(driver, argv, stdout=json.dumps(quota))
 
     monkeypatch.setattr(driver, "_run", fake_run)
@@ -236,7 +276,7 @@ def test_agy_preflight_rejects_exhausted_machine_readable_quota(
 
     def fake_run(argv, **_kwargs):
         if argv[-1] == "--version":
-            return _result(driver, argv, stdout="agy version 1.1.18\n")
+            return _result(driver, argv, stdout=f"agy version {TOOL_VERSIONS['agy']}\n")
         return _result(
             driver,
             argv,
@@ -265,7 +305,7 @@ def test_copilot_app_server_accepts_authenticated_quota_snapshots(
 
     def fake_run(argv, **_kwargs):
         calls.append(tuple(argv))
-        return _result(driver, argv, stdout="Copilot CLI 1.0.80\n")
+        return _result(driver, argv, stdout=f"Copilot CLI {TOOL_VERSIONS['copilot']}\n")
 
     monkeypatch.setattr(driver, "_run", fake_run)
     monkeypatch.setattr(
@@ -311,7 +351,9 @@ def test_copilot_app_server_without_auth_or_quota_fails_closed(
     monkeypatch.setattr(
         driver,
         "_run",
-        lambda argv, **_kwargs: _result(driver, argv, stdout="Copilot CLI 1.0.80\n"),
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"Copilot CLI {TOOL_VERSIONS['copilot']}\n"
+        ),
     )
     monkeypatch.setattr(
         driver,
@@ -340,7 +382,7 @@ def test_codex_app_server_accepts_authenticated_rate_limits(
 
     def fake_run(argv, **_kwargs):
         calls.append(tuple(argv))
-        return _result(driver, argv, stdout="codex-cli 0.149.0\n")
+        return _result(driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n")
 
     monkeypatch.setattr(driver, "_run", fake_run)
     monkeypatch.setattr(
@@ -394,7 +436,7 @@ def test_codex_app_server_without_live_account_or_rate_limits_fails_closed_once(
 
     def fake_run(argv, **_kwargs):
         calls.append(tuple(argv))
-        return _result(driver, argv, stdout="codex-cli 0.149.0\n")
+        return _result(driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n")
 
     monkeypatch.setattr(driver, "_run", fake_run)
     monkeypatch.setattr(
@@ -426,8 +468,8 @@ def test_codex_agent_loop_uses_provider_persisted_thread_identity(
         "_codex_provider_thread_result",
         lambda _thread_id, **_kwargs: {
             "thread": {"id": "thread-build-job"},
-            "model": "gpt-5.3-codex-spark",
-            "reasoningEffort": "xhigh",
+            "model": PROVIDER_MODELS["codex"],
+            "reasoningEffort": PROVIDER_EFFORTS["codex"],
             "modelProvider": "openai",
             "persistedModelProvider": "openai",
             "persistedCwd": "/var/lib/cortex/worktree/build-job",
@@ -441,8 +483,8 @@ def test_codex_agent_loop_uses_provider_persisted_thread_identity(
     )
 
     assert identity == {
-        "runtime_model": "gpt-5.3-codex-spark",
-        "runtime_effort": "xhigh",
+        "runtime_model": PROVIDER_MODELS["codex"],
+        "runtime_effort": PROVIDER_EFFORTS["codex"],
         "model_provider": "openai",
         "thread_sha256": hashlib.sha256(b"thread-build-job").hexdigest(),
     }
@@ -472,8 +514,8 @@ def test_codex_provider_thread_combines_read_and_resume_metadata(
                 "id": 3,
                 "result": {
                     "thread": {"id": "thread-build-job"},
-                    "model": "gpt-5.3-codex-spark",
-                    "reasoningEffort": "xhigh",
+                    "model": PROVIDER_MODELS["codex"],
+                    "reasoningEffort": PROVIDER_EFFORTS["codex"],
                     "modelProvider": "openai",
                     "cwd": "/builder",
                 },
@@ -492,7 +534,7 @@ def test_codex_provider_thread_combines_read_and_resume_metadata(
 
     assert result["persistedCwd"] == "/reclaimed/build-job"
     assert result["persistedModelProvider"] == "openai"
-    assert result["model"] == "gpt-5.3-codex-spark"
+    assert result["model"] == PROVIDER_MODELS["codex"]
     assert observed_env["HOME"] == "/builder"
     assert observed_env["CODEX_HOME"] == "/runtime/codex-home/build-job"
 
@@ -500,7 +542,7 @@ def test_codex_provider_thread_combines_read_and_resume_metadata(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("model", "gpt-5.4"),
+        ("model", "different-model"),
         ("reasoningEffort", "normal"),
         ("modelProvider", "fallback"),
         ("persistedModelProvider", "fallback"),
@@ -514,8 +556,8 @@ def test_codex_agent_loop_rejects_provider_thread_identity_drift(
     monkeypatch.setattr(driver, "_account_env", lambda _account: {})
     result = {
         "thread": {"id": "thread-build-job"},
-        "model": "gpt-5.3-codex-spark",
-        "reasoningEffort": "xhigh",
+        "model": PROVIDER_MODELS["codex"],
+        "reasoningEffort": PROVIDER_EFFORTS["codex"],
         "modelProvider": "openai",
         "persistedModelProvider": "openai",
         "persistedCwd": "/var/lib/cortex/worktree/build-job",
@@ -533,6 +575,106 @@ def test_codex_agent_loop_rejects_provider_thread_identity_drift(
             expected_worktree="/var/lib/cortex/worktree/build-job",
             codex_home=Path("/var/lib/cortex/runtime/codex-home/builder/build-job"),
         )
+
+
+def test_generated_canary_identity_overlay_authorizes_independent_dispatch(
+    tmp_path: Path,
+) -> None:
+    driver = _load_driver()
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    (config_root / "model-identities.yaml").write_text(
+        render_model_identity_overlay(), encoding="utf-8"
+    )
+
+    from paulsha_cortex.coordinator.model_identities import load_model_identities
+    from paulsha_cortex.coordinator.model_resolution import PACKAGED_FALLBACK_DENY
+
+    roster = load_model_identities(config_root)
+    assert roster.resolution_context.policy.packaged_fallback == PACKAGED_FALLBACK_DENY
+    builder = roster.require(*canary_identity(CANARY_BUILDER))
+    reviewer = roster.require(*canary_identity(CANARY_REVIEWER))
+    assert (builder.executor, builder.model_id) == (
+        driver.DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
+        driver.DEPLOYMENT_CANARY_BUILDER_MODEL,
+    )
+    assert "build" in builder.capabilities
+    assert {"planning", "review"} <= set(reviewer.capabilities)
+    assert builder.independence_domain == "openai"
+    assert reviewer.independence_domain == "google"
+    # AGY 的 identity id 以 `<model>-<effort>` 表達 effort，由 provider 契約導出。
+    assert reviewer.model_id == (
+        f"{PROVIDER_MODELS['agy']}-{PROVIDER_EFFORTS['agy']}"
+    )
+    driver._validate_canary_dispatch_model_identities(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config_root)}
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing-overlay", "same-domain-reviewer", "builder-without-build"]
+)
+def test_canary_identity_preflight_rejects_unusable_roster(
+    tmp_path: Path, mutation: str
+) -> None:
+    driver = _load_driver()
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    overlay = render_model_identity_overlay()
+    if mutation == "same-domain-reviewer":
+        overlay = overlay.replace('independence_domain: "google"', 'independence_domain: "openai"')
+        overlay = overlay.replace('    live_probe: "agy-plan-sandbox"\n', "")
+        overlay = overlay.replace('["planning", "review"]', '["review"]')
+    elif mutation == "builder-without-build":
+        overlay = overlay.replace('capabilities: ["build"]', 'capabilities: ["review"]')
+    if mutation != "missing-overlay":
+        (config_root / "model-identities.yaml").write_text(overlay, encoding="utf-8")
+
+    with pytest.raises(driver.QualificationFailure, match="model identity roster"):
+        driver._validate_canary_dispatch_model_identities(
+            {"PSC_PROJECT_CONFIG_ROOT": str(config_root)}
+        )
+
+
+def test_canary_builder_argv_matches_the_production_template_launcher(
+    tmp_path: Path,
+) -> None:
+    """closeout 期待的 builder argv 必須與 #716 後 launcher 在模板 unit 內發出的逐字相同。"""
+
+    driver = _load_driver()
+    from paulsha_cortex.coordinator.launcher import build_codex_argv
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    last = tmp_path / "job.last.json"
+    production = build_codex_argv(
+        prompt="PROMPT",
+        slice_id="job",
+        log_dir=str(tmp_path),
+        worktree=str(worktree),
+        model=driver.DEPLOYMENT_CANARY_BUILDER_MODEL,
+        write_forbidden=True,
+        trust_root_outer_unit=True,
+        last_message_path=str(last),
+    )
+    expected = [
+        "codex",
+        "exec",
+        "--ignore-user-config",
+        "PROMPT",
+        "--json",
+        *driver._codex_canary_builder_sandbox_argv(),
+        "--model",
+        driver.DEPLOYMENT_CANARY_BUILDER_MODEL,
+        "-c",
+        f'model_reasoning_effort="{PROVIDER_EFFORTS["codex"]}"',
+        "-o",
+        str(last),
+        "-C",
+        str(worktree.resolve()),
+    ]
+    assert production == expected
+    assert "--enable" not in production
 
 
 @pytest.mark.parametrize(
@@ -853,7 +995,7 @@ def _dispatch_fixture(tmp_path: Path, driver):
                 {
                     "persona": "builder",
                     "executor": "codex",
-                    "model_id": "gpt-5.3-codex-spark",
+                    "model_id": PROVIDER_MODELS["codex"],
                     "runtime_principal": "builder",
                     "runtime_mode": "systemd-template",
                     "runtime_surface": "builder-codex-home",
@@ -873,25 +1015,19 @@ def _dispatch_fixture(tmp_path: Path, driver):
                 },
             )
             last_message = log.with_name("job.last.json")
-            codex_argv = [
-                "codex",
-                "exec",
-                "--ignore-user-config",
-                prompt,
-                "--json",
-                "--sandbox",
-                "read-only",
-                "--enable",
-                "use_legacy_landlock",
-                "--model",
-                "gpt-5.3-codex-spark",
-                "-c",
-                'model_reasoning_effort="xhigh"',
-                "-o",
-                str(last_message),
-                "-C",
-                str(worktree),
-            ]
+            # Manager 在 Trust Root 模板 unit 內實際發出的 argv（#716 之後）。
+            from paulsha_cortex.coordinator.launcher import build_codex_argv
+
+            codex_argv = build_codex_argv(
+                prompt=prompt,
+                slice_id=job_id,
+                log_dir=str(log.parent),
+                worktree=str(worktree),
+                model=PROVIDER_MODELS["codex"],
+                write_forbidden=True,
+                trust_root_outer_unit=True,
+                last_message_path=str(last_message),
+            )
             bundle_part = coordinator / "commit-spool" / job_id / "commits.bundle.part"
             bundle_final = coordinator / "commit-spool" / job_id / "commits.bundle"
             script = "; ".join(
@@ -1098,13 +1234,13 @@ def _dispatch_fixture(tmp_path: Path, driver):
         "model_chain_override": {
             "builder": {
                 "executor": "codex",
-                "model_id": "gpt-5.3-codex-spark",
+                "model_id": PROVIDER_MODELS["codex"],
             }
         },
         "resolved_model_chain": {
             "builder": {
                 "executor": "codex",
-                "model_id": "gpt-5.3-codex-spark",
+                "model_id": PROVIDER_MODELS["codex"],
                 "independence_domain": "openai",
                 "source": "run-override",
                 "envelope_source": "default",
@@ -1126,8 +1262,8 @@ def _dispatch_fixture(tmp_path: Path, driver):
     )
     artifacts.append(registry)
     driver._codex_thread_runtime_identity = lambda thread_id, **_kwargs: {
-        "runtime_model": "gpt-5.3-codex-spark",
-        "runtime_effort": "xhigh",
+        "runtime_model": PROVIDER_MODELS["codex"],
+        "runtime_effort": PROVIDER_EFFORTS["codex"],
         "model_provider": "openai",
         "thread_sha256": hashlib.sha256(thread_id.encode()).hexdigest(),
     }
@@ -1220,7 +1356,7 @@ def test_dispatch_closeout_binds_structured_authority_hashes_and_reclaim(
     assert agent_loop_probe == {
         "schema_version": 1,
         "executor": "codex",
-        "model_id": "gpt-5.3-codex-spark",
+        "model_id": PROVIDER_MODELS["codex"],
         "card_id": "worktree-isolation",
         "builder_job_ids": ["build-job"],
         "successful_command_count": 1,
@@ -1229,8 +1365,8 @@ def test_dispatch_closeout_binds_structured_authority_hashes_and_reclaim(
         "output_sha256": agent_loop_probe["output_sha256"],
         "log_sha256": agent_loop_probe["log_sha256"],
         "thread_sha256": agent_loop_probe["thread_sha256"],
-        "runtime_model": "gpt-5.3-codex-spark",
-        "runtime_effort": "xhigh",
+        "runtime_model": PROVIDER_MODELS["codex"],
+        "runtime_effort": PROVIDER_EFFORTS["codex"],
         "model_provider": "openai",
         "probe_candidate_sha": fixture["probe_candidate"],
     }
@@ -1432,7 +1568,7 @@ def test_dispatch_closeout_requires_exact_codex_agent_loop_observation(
     elif mutation == "resolved-executor":
         workflow["resolved_model_chain"]["builder"]["executor"] = "copilot"
     elif mutation == "job-model":
-        build_job["model_id"] = "gpt-5.4"
+        build_job["model_id"] = "different-model"
     elif mutation == "runtime-mode":
         build_job["runtime_mode"] = "direct"
     elif mutation == "log-path":
@@ -1459,14 +1595,14 @@ def test_dispatch_closeout_requires_exact_codex_agent_loop_observation(
             )
         elif mutation == "spec-short-model":
             spec["command"][2] = spec["command"][2].replace(
-                "--model gpt-5.3-codex-spark",
-                "--model gpt-5.3-codex-spark -m gpt-5.4",
+                f"--model {PROVIDER_MODELS['codex']}",
+                f"--model {PROVIDER_MODELS['codex']} -m {PROVIDER_MODELS['copilot']}",
                 1,
             )
         elif mutation == "spec-short-sandbox":
             spec["command"][2] = spec["command"][2].replace(
-                "--sandbox read-only",
-                "--sandbox read-only -s danger-full-access",
+                "--sandbox danger-full-access",
+                "--sandbox danger-full-access -s read-only",
                 1,
             )
         elif mutation == "spec-approve-for-me":
@@ -1672,7 +1808,7 @@ def test_full_dispatch_pins_codex_builder_and_persists_observation(
     observation = {
         "schema_version": 1,
         "executor": "codex",
-        "model_id": "gpt-5.3-codex-spark",
+        "model_id": PROVIDER_MODELS["codex"],
         "card_id": "worktree-isolation",
         "builder_job_ids": ["build-job"],
         "successful_command_count": 1,
@@ -1681,16 +1817,24 @@ def test_full_dispatch_pins_codex_builder_and_persists_observation(
         "output_sha256": "b" * 64,
         "log_sha256": "c" * 64,
         "thread_sha256": "d" * 64,
-        "runtime_model": "gpt-5.3-codex-spark",
-        "runtime_effort": "xhigh",
+        "runtime_model": PROVIDER_MODELS["codex"],
+        "runtime_effort": PROVIDER_EFFORTS["codex"],
         "model_provider": "openai",
         "probe_candidate_sha": "9" * 40,
     }
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    (config_root / "model-identities.yaml").write_text(
+        render_model_identity_overlay(), encoding="utf-8"
+    )
     monkeypatch.setattr(driver, "_run", fake_run)
     monkeypatch.setattr(
         driver,
         "_installed_runtime_env",
-        lambda: {"PSC_COORDINATOR_ROOT": str(tmp_path / "coordinator")},
+        lambda: {
+            "PSC_COORDINATOR_ROOT": str(tmp_path / "coordinator"),
+            "PSC_PROJECT_CONFIG_ROOT": str(config_root),
+        },
     )
     monkeypatch.setattr(
         driver,
@@ -1730,7 +1874,7 @@ def test_full_dispatch_pins_codex_builder_and_persists_observation(
         "--builder-executor",
         "codex",
         "--builder-model",
-        "gpt-5.3-codex-spark",
+        PROVIDER_MODELS["codex"],
         "--wait",
         "--timeout",
         "60",
