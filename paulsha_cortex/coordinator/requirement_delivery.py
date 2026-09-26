@@ -615,7 +615,11 @@ def _authority_matches(row: Mapping[str, Any], authority: object, record: Mappin
         raise ValueError("mapping PR is not authorized by WorkAuthority")
     if row.get("change") not in authority.mapped_openspec:
         raise ValueError("mapping OpenSpec change is not authorized")
-    if tuple(row.get("todo_paths", ())) != authority.mapped_todo_paths:
+    # 對抗審查第六輪 MAJOR：多 todo 授權時，這裡曾以 tuple 逐序比對；同一組
+    # 已授權路徑只因 producer 紀錄順序不同（例如 row 與 authority 排序不一致）
+    # 就會被誤判 not-ready。改以集合比對——缺漏或多餘路徑（不論是否重複）
+    # 仍會讓集合不相等而 fail closed，只是不再要求順序一致。
+    if set(row.get("todo_paths", ())) != set(authority.mapped_todo_paths):
         raise ValueError("mapping Todo paths are not authorized")
     wire = record.get("work_authority")
     if not isinstance(wire, Mapping):
@@ -751,6 +755,11 @@ def _verify_remote_merge(
             todo_paths=authority.mapped_todo_paths,
             canonical_checkout=checkout,
             include_closing_issues=True,
+            # 對抗審查第六輪 BLOCKER：`todo_complete` 若讀「目前」default head，
+            # PR 合併當下 mapped todo 尚未全勾、之後別的無關 commit 才補勾，重跑
+            # reconcile 會把這筆交付從 blocked 誤判成 covered——todo 完成度必須
+            # 綁這筆 merge 當下（merge commit 的 tree）的內容，不是「現在」。
+            todo_at_merge_commit=True,
         )
         if not isinstance(facts, github_delivery.RemoteClosureFacts):
             raise ValueError("remote closure facts have an unknown shape")
@@ -1522,10 +1531,19 @@ def reconcile_delivery(
                 previous_comparable = {key: value for key, value in previous.items() if key != "observed_at"}
                 incoming_comparable = {key: value for key, value in incoming.items() if key != "observed_at"}
                 if previous_comparable != incoming_comparable:
-                    report["closure_readiness"] = "pending"
-                    report["source_generation_drift"] = True
-                    return {"report": report, "index": base, "changed": False, "index_revision": base_revision, "pending_reason": "same-source-generation-content-drift"}
-                incoming = copy.deepcopy(previous)
+                    # 對抗審查第六輪 MAJOR：這條「同代重讀內容不得漂移」的保護，
+                    # 原意是擋暫時性弱讀取（見 `_evidence_weakened`）靜默取代已
+                    # 驗證結果；但若無差別地把「任何內容差異」都當漂移拒絕，會
+                    # 連「先缺 live receipt 記為 blocked、之後補上合法 live
+                    # receipt 重跑」這種證據變強也一起擋掉，讓 gap 永遠清不掉。
+                    # 只有真的變弱（原本 verified 的階段退回非 verified）才 pending；
+                    # 其餘階段不弱化的變強／持平內容差異必須接受更新。
+                    if _evidence_weakened(previous.get("evidence"), incoming.get("evidence")):
+                        report["closure_readiness"] = "pending"
+                        report["source_generation_drift"] = True
+                        return {"report": report, "index": base, "changed": False, "index_revision": base_revision, "pending_reason": "same-source-generation-content-drift"}
+                else:
+                    incoming = copy.deepcopy(previous)
         old_rows[mapping_id] = incoming
     current_rows = list(old_rows.values())
     current_revisions = {row["id"]: row["revision"] for row in manifest_doc["requirements"]}

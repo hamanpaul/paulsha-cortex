@@ -89,3 +89,47 @@ generation_rows_uses_highest_generation_for_coverage`、
 `test_github_delivery_client.py`／`test_delivery_orchestrator.py`（141 個）
 與 `-k "delivery or remote_closure or retire"`（280 個）全數維持通過。
 - #845 對抗審查修復（第六輪）：同一 repo／work／run 在最高 generation 內 covered 與非 covered 並存時，該範圍不算 covered（只有範圍內每筆 row 皆 covered 才成立），缺額優先指向非 covered 的 row。
+
+對抗審查第六輪修正（續，共三條）：
+
+1. BLOCKER：`_verify_remote_merge` 判定 mapped todo 是否完成時，先前只看
+   `fetch_remote_closure` 讀「目前」remote default head 的 todo.md 內容；若
+   這條 PR 合併當下 mapped todo 尚未全勾、之後另一個無關 commit 才把它補
+   勾，重跑 `cortex delivery gaps／reconcile` 會把同一筆原本 `merge` 階段
+   `failed`（`remote-todo-incomplete`）的交付，靜默翻成 `verified`／
+   `covered`——即使這筆 PR／merge 本身從未讓 todo 完成。`github_delivery.
+   fetch_remote_closure` 新增 opt-in 參數 `todo_at_merge_commit`（預設
+   `False`，其餘既有呼叫者 ship／retire-delivered／work bridge 不受影響、
+   語意不變，仍讀「目前」default head）；為 `True` 時改讀 merge commit 當下
+   的 tree 內容判定 `todo_complete`／`todo_revisions`。
+   `requirement_delivery._verify_remote_merge` 呼叫時帶上
+   `todo_at_merge_commit=True`，把 merge 階段的 todo 完成度綁回這筆 PR／
+   merge 本身，不再受之後正常推進的無關 commit 影響。
+2. MAJOR：`reconcile_delivery` 對同一 mapping_id（同 generation）重讀時，先
+   前只要內容與既有持久化的 row 有任何差異，即無差別回報
+   `same-source-generation-content-drift` 並拒絕更新——這條保護原意是擋
+   `_evidence_weakened` 偵測到的暫時性弱讀取（見第四輪修正），卻連「先因缺
+   live receipt 記為 `missing`／`blocked`、之後補上合法 live receipt 重跑」
+   這種證據**變強**也一起擋掉，導致這筆交付的 gap 永遠清不掉。改為只在
+   `_evidence_weakened(previous.evidence, incoming.evidence)` 為真（真的有
+   原本 `verified` 的階段退回非 `verified`）時才回報 drift 並拒絕；其餘階段
+   不弱化的內容變強／持平差異，一律接受 incoming 的更新結果。
+3. MAJOR：`_authority_matches` 驗證 mapped todo 授權時，先前以 `tuple` 逐序
+   比對 `row.get("todo_paths")` 與 `authority.mapped_todo_paths`；同一組已
+   授權路徑只因兩邊記錄順序不同，就會被誤判 `mapping Todo paths are not
+   authorized` 而 fail closed，即使集合完全相同。改以集合比對——缺漏或多
+   餘路徑仍會讓集合不相等而正確 fail closed，只是不再要求順序一致。目前
+   這行比對之前必經共用 gate `delivery._validate_work_authority`（無條件要
+   求 `len(mapped_todo_paths) == 1`），因此真實呼叫路徑上尚不會出現多 todo
+   path 的 `WorkAuthority`；regression 測試改為直接呼叫
+   `_authority_matches` 並暫時中和該共用 gate，證明一旦上游放寬單一
+   delivery target 限制，這行比對本身已是順序無關且 fail-closed 的正確
+   實作，不必等放寬後才發現另一個 bug。
+
+三條均先以 RED 測試（`git show HEAD:` 還原生產碼跑新測試）確認可重現後再
+修，`tests/test_requirement_delivery.py`／`tests/test_github_delivery_client.
+py` 新增對應 regression 測試，全數 GREEN；既有 `test_requirement_delivery*.
+py`／`test_github_delivery_client.py`／`test_delivery_orchestrator.py`
+（148 個）與 `-k "delivery or remote_closure or retire"`（287 個）全數維持
+通過，確認未影響共用 gate（`evaluate_remote_closure`／
+`delivery._validate_work_authority`）對其他呼叫者的既有語意。

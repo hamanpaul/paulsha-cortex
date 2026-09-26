@@ -946,6 +946,7 @@ class GitHubDeliveryClient:
         todo_paths: tuple[str, ...],
         canonical_checkout: str | Path | None = None,
         include_closing_issues: bool = False,
+        todo_at_merge_commit: bool = False,
     ) -> RemoteClosureFacts:
         self._repo_parts(repo)
         checkout = self._canonical_checkout(canonical_checkout)
@@ -1019,6 +1020,14 @@ class GitHubDeliveryClient:
         todo_revisions: dict[str, str] = {}
         todo_complete = True
         task_pattern = re.compile(r"(?m)^\s*[-*]\s+\[([ xX])\]\s+")
+        # 對抗審查第六輪 BLOCKER：`todo_complete` 預設仍讀「目前」default head
+        # 的內容——ship／retire-delivered／work bridge 等既有呼叫者要的正是
+        # 「現在是否勾完」，語意不變。但 requirement-delivery 的 merge 階段判定
+        # 的是「這筆 PR／merge 交付當下」是否勾完；若沿用 default head，PR 合併
+        # 時 todo 尚未全勾、之後別的無關 commit 才補勾，會讓同一筆已 blocked 的
+        # 交付在重跑時被誤判成 covered。opt-in 旗標讓這類 consumer 改讀 merge
+        # commit 當下的 tree 內容，不影響其他呼叫者。
+        todo_ref = merge_commit if todo_at_merge_commit else default_head
         for todo_path in todo_paths:
             pure = PurePosixPath(todo_path)
             if (
@@ -1032,7 +1041,7 @@ class GitHubDeliveryClient:
                 checkout,
                 "rev-parse",
                 "--verify",
-                f"{default_head}:{todo_path}",
+                f"{todo_ref}:{todo_path}",
                 failure_message="GitHub remote Todo payload malformed",
             ).strip().lower()
             if re.fullmatch(r"[0-9a-f]{40}", todo_revision) is None:
@@ -1049,7 +1058,7 @@ class GitHubDeliveryClient:
             content_bytes_status, content_bytes = self._run_local_git(
                 checkout,
                 "show",
-                f"{default_head}:{todo_path}",
+                f"{todo_ref}:{todo_path}",
             )
             if content_bytes_status != 0:
                 raise RuntimeError("GitHub remote Todo payload malformed")

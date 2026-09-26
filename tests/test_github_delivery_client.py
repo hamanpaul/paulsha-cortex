@@ -171,7 +171,16 @@ def _git(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _closure_repositories(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
+def _closure_repositories(
+    tmp_path: Path,
+    *,
+    base_todo: str = "- [x] initial\n",
+    writer_todo: str = "- [x] complete\n",
+) -> tuple[Path, Path, dict[str, str]]:
+    """建立 closure 測試用的三顆 repo。``base_todo`` 是 PR 合併當下（merge
+    commit）docs/todo.md 的內容；``writer_todo`` 是合併之後另一次無關 commit
+    推進 default branch 時改寫的內容——兩者可以不同，才能表達「合併當下未
+    勾完、之後才被無關 commit 補勾」這種對抗審查第六輪 BLOCKER 的負例。"""
     bare = tmp_path / "origin.git"
     checkout = tmp_path / "canonical"
     subprocess.run(
@@ -189,7 +198,7 @@ def _closure_repositories(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     _git(checkout, "config", "user.name", "Closure Test")
     _git(checkout, "config", "user.email", "closure@example.invalid")
     (checkout / "docs").mkdir()
-    (checkout / "docs" / "todo.md").write_text("- [x] initial\n", encoding="utf-8")
+    (checkout / "docs" / "todo.md").write_text(base_todo, encoding="utf-8")
     archived = checkout / "openspec/changes/archive/2026-07-17-unified-work-lifecycle"
     archived.mkdir(parents=True)
     (archived / "tasks.md").write_text("- [x] archived\n", encoding="utf-8")
@@ -203,6 +212,9 @@ def _closure_repositories(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     _git(checkout, "checkout", "main")
     _git(checkout, "merge", "--no-ff", "feature/closure-test", "-m", "merge PR")
     merge_commit = _git(checkout, "rev-parse", "HEAD")
+    # merge commit 未再改動 docs/todo.md，此刻的 tree 內容即「這筆 PR／merge
+    # 交付當下」的 todo 狀態——不受之後 writer 那次無關 commit 影響。
+    merge_todo_revision = _git(checkout, "rev-parse", f"{merge_commit}:docs/todo.md")
     _git(checkout, "remote", "add", "origin", str(bare))
     _git(checkout, "push", "-u", "origin", "main")
 
@@ -215,7 +227,7 @@ def _closure_repositories(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     )
     _git(writer, "config", "user.name", "Closure Test")
     _git(writer, "config", "user.email", "closure@example.invalid")
-    (writer / "docs" / "todo.md").write_text("- [x] complete\n", encoding="utf-8")
+    (writer / "docs" / "todo.md").write_text(writer_todo, encoding="utf-8")
     _git(writer, "commit", "-am", "advance default branch")
     _git(writer, "push", "origin", "main")
     default_head = _git(writer, "rev-parse", "HEAD")
@@ -225,6 +237,7 @@ def _closure_repositories(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
         "merge_commit": merge_commit,
         "default_head": default_head,
         "todo_revision": todo_revision,
+        "merge_todo_revision": merge_todo_revision,
     }
 
 
@@ -400,6 +413,52 @@ def test_fetch_remote_closure_verifies_merge_ancestor_issues_and_archive(
     assert any(args[:2] == ["merge-base", "--is-ancestor"] for args in git_args)
     assert any(args[:4] == ["ls-tree", "-r", "-t", "-z"] for args in git_args)
     assert any(args[:2] == ["show", "-s"] for args in git_args)
+
+
+def test_fetch_remote_closure_todo_completion_defaults_to_current_default_head(
+    tmp_path: Path,
+) -> None:
+    """既有呼叫者（ship／retire-delivered／work bridge）不帶新旗標時，
+    `todo_complete` 仍讀「目前」default head 的內容，語意不變——即使 merge
+    commit 當下 todo 尚未全勾，只要 default head 之後補勾了就算完成。"""
+    checkout, _bare, expected = _closure_repositories(
+        tmp_path, base_todo="- [ ] initial\n", writer_todo="- [x] complete\n"
+    )
+    runner = ClosureRunner(expected)
+    facts = GitHubDeliveryClient(runner=runner).fetch_remote_closure(
+        repo="acme/demo",
+        pr_number=7,
+        change="unified-work-lifecycle",
+        required_issues=(14,),
+        todo_paths=("docs/todo.md",),
+        canonical_checkout=checkout,
+    )
+    assert facts.todo_complete
+    assert facts.todo_revisions == {"docs/todo.md": expected["todo_revision"]}
+
+
+def test_fetch_remote_closure_todo_at_merge_commit_ignores_later_unrelated_completion(
+    tmp_path: Path,
+) -> None:
+    """對抗審查第六輪 BLOCKER：merge 驗證只看「目前」`todo_complete`，沒綁這個
+    PR／merge 的 todo revision——若 PR 合併時 mapped todo 尚未全勾、之後別的
+    無關 commit 才補勾，`todo_at_merge_commit=True` 必須仍回報未完成，不能被
+    後續正常推進的 default head 靜默補齊。"""
+    checkout, _bare, expected = _closure_repositories(
+        tmp_path, base_todo="- [ ] initial\n", writer_todo="- [x] complete\n"
+    )
+    runner = ClosureRunner(expected)
+    facts = GitHubDeliveryClient(runner=runner).fetch_remote_closure(
+        repo="acme/demo",
+        pr_number=7,
+        change="unified-work-lifecycle",
+        required_issues=(14,),
+        todo_paths=("docs/todo.md",),
+        canonical_checkout=checkout,
+        todo_at_merge_commit=True,
+    )
+    assert not facts.todo_complete
+    assert facts.todo_revisions == {"docs/todo.md": expected["merge_todo_revision"]}
 
 
 def test_fetch_remote_closure_treats_openspec_as_optional_when_change_is_none(

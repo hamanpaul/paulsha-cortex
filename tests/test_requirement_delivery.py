@@ -93,14 +93,21 @@ class _FlakyGitHub:
         raise RuntimeError("transient network hiccup")
 
 
-def _authority(*, work_id: str = WORK, last_success: float = NOW - 1, snapshot_hash: str = "b" * 64, source_revision: str = "a" * 40):
+def _authority(
+    *,
+    work_id: str = WORK,
+    last_success: float = NOW - 1,
+    snapshot_hash: str = "b" * 64,
+    source_revision: str = "a" * 40,
+    mapped_todo_paths: tuple[str, ...] = ("docs/todo.md",),
+):
     return claim.WorkAuthority._verified(
         repo=REPO,
         work_id=work_id,
         mapped_issues=(845,),
         mapped_prs=(7,),
         mapped_openspec=("delivery-work",),
-        mapped_todo_paths=("docs/todo.md",),
+        mapped_todo_paths=mapped_todo_paths,
         confirmed_todo=True,
         auto_label=False,
         source_revisions=(source_revision,),
@@ -124,7 +131,7 @@ def _authority_record(authority, *, run_id: str = "run-1", merge: str = MERGE) -
         "mapped_todo_paths": list(authority.mapped_todo_paths),
         "pr_number": 7,
         "change": "delivery-work",
-        "todo_paths": ["docs/todo.md"],
+        "todo_paths": sorted(authority.mapped_todo_paths),
         "merge_commit": merge,
         "run_id": run_id,
         "workflow_step_ids": ["build-1", "verify-1", "review-1", "ship-1"],
@@ -658,6 +665,78 @@ def test_a03_merge_requires_mapped_todo_to_be_complete(tmp_path: Path) -> None:
     assert report["closure_readiness"] == "not-ready"
 
 
+def test_a03_merge_requests_todo_completion_bound_to_merge_commit(tmp_path: Path) -> None:
+    """對抗審查第六輪 BLOCKER：merge 階段的 todo 完成度不能只看「目前」
+    default head——PR 合併當下 mapped todo 尚未全勾、之後別的無關 commit 才
+    補勾，重跑 reconcile 不能把同一筆已 blocked 的交付誤判成 covered。
+    consumer 必須明確要求 `fetch_remote_closure` 以這個 PR／merge 當下（merge
+    commit 的 tree）內容判定 todo_complete，不是「現在」。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    github = _GitHub()
+    context["github_client"] = github
+
+    inspect_delivery(manifest, snapshot, **context)
+
+    assert github.calls
+    assert github.calls[0]["todo_at_merge_commit"] is True
+
+
+def test_a03_authority_matches_todo_paths_ignores_row_order(monkeypatch) -> None:
+    """對抗審查第六輪 MAJOR：`_authority_matches` 曾以 tuple 逐序比對
+    `todo_paths`；同一組已授權的 mapped todo 路徑，只因 row 記錄的順序跟
+    `WorkAuthority.mapped_todo_paths` 不同，就會被誤判為 unauthorized。必須
+    改用集合比對，不能因順序不同就 fail closed。
+
+    直接測 `_authority_matches` 本身，並把它一定會先呼叫的共用 gate
+    `delivery._validate_work_authority`（強制單一 todo path，見
+    `delivery.py:458`）暫時中和：那條 gate 目前讓多 todo path 的
+    `WorkAuthority` 連進到這行比對前就先被拒絕，多 todo 授權情境要等它放寬
+    才會在真實呼叫路徑上出現；這裡先確保「一旦放寬」，這行比對本身是
+    順序無關且 fail-closed 的正確實作，不是等共用 gate 放寬後才發現另一個
+    bug。CompletionRecord schema（另一個 domain validator，非本票 scope）
+    同樣目前只允許單一 todo path 落盤，不能拿來當端到端 fixture。"""
+    import paulsha_cortex.coordinator.requirement_delivery as rd
+
+    monkeypatch.setattr(rd.delivery, "_validate_work_authority", lambda authority, *, now_epoch: None)
+    paths = ("docs/todo.md", "docs/todo2.md")
+    authority = _authority(mapped_todo_paths=paths)
+    row = {
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "pr_number": 7,
+        "change": "delivery-work",
+        "todo_paths": list(reversed(paths)),
+        "run_id": "run-1",
+        "workflow_step_ids": ["build-1", "verify-1", "review-1", "ship-1"],
+    }
+    record = {"work_authority": _authority_record(authority, run_id="run-1")}
+
+    rd._authority_matches(row, authority, record, now_epoch=NOW)
+
+
+def test_a03_authority_matches_todo_paths_still_fails_closed_on_missing_path(monkeypatch) -> None:
+    """集合比對仍須 fail closed：row 缺一條授權路徑就不能通過（見上一測試對
+    `_validate_work_authority` 中和的說明）。"""
+    import paulsha_cortex.coordinator.requirement_delivery as rd
+
+    monkeypatch.setattr(rd.delivery, "_validate_work_authority", lambda authority, *, now_epoch: None)
+    paths = ("docs/todo.md", "docs/todo2.md")
+    authority = _authority(mapped_todo_paths=paths)
+    row = {
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "pr_number": 7,
+        "change": "delivery-work",
+        "todo_paths": ["docs/todo.md"],
+        "run_id": "run-1",
+        "workflow_step_ids": ["build-1", "verify-1", "review-1", "ship-1"],
+    }
+    record = {"work_authority": _authority_record(authority, run_id="run-1")}
+
+    with pytest.raises(ValueError, match="Todo paths"):
+        rd._authority_matches(row, authority, record, now_epoch=NOW)
+
+
 def test_a03_work_must_be_authorized_for_the_requirement_owner(tmp_path: Path) -> None:
     manifest, snapshot, context = _ready_case(tmp_path)
     manifest["requirements"][0]["evidence_policy"]["owner"]["work_ids"] = ["hamanpaul/paulsha-cortex#999"]
@@ -831,6 +910,36 @@ def test_a07_same_generation_reread_with_weaker_evidence_does_not_replace_covere
     stored = read_index(index_path)
     assert len(stored["mappings"]) == 1
     assert stored["mappings"][0]["mapping_id"] == covered_mapping_id
+    assert stored["mappings"][0]["status"] == "covered"
+
+
+def test_a06_same_generation_reread_accepts_strengthened_live_evidence(tmp_path: Path) -> None:
+    """對抗審查第六輪 MAJOR：同一 source_generation（同一 mapping_id）先因缺
+    live receipt 記為 missing，之後補上合法 live receipt 重跑時，其餘階段皆
+    未弱化——不能被 same-source-generation-content-drift 擋下而拒絕更新，
+    否則這條 gap 永遠清不掉。同代重讀的弱化保護只能擋證據變弱，證據變強
+    必須接受。"""
+    manifest, snapshot, context = _ready_case(tmp_path, with_live=False)
+    index_path = tmp_path / "index.json"
+
+    first = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+    assert first["report"]["closure_readiness"] == "not-ready"
+    assert first["index"]["mappings"][0]["status"] == "missing"
+    blocked_mapping_id = first["index"]["mappings"][0]["mapping_id"]
+
+    strengthened = copy.deepcopy(snapshot)
+    strengthened["mappings"][0]["live_receipt"] = _write_live(
+        tmp_path, requirement_id="R01", revision="r1", criterion_id="R01-AC1"
+    )
+
+    result = reconcile_delivery(manifest, strengthened, index_path=index_path, **context)
+
+    assert result.get("pending_reason") is None
+    assert result["report"].get("source_generation_drift") is None
+    assert result["changed"] is True
+    assert result["report"]["closure_readiness"] == "ready"
+    stored = read_index(index_path)
+    assert stored["mappings"][0]["mapping_id"] == blocked_mapping_id
     assert stored["mappings"][0]["status"] == "covered"
 
 
