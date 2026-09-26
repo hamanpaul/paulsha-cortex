@@ -207,6 +207,31 @@ def test_candidate_contract_failure_reroutes_to_next_identity(tmp_path):
     assert "missing builder credential grant" in decision.attempts[0].findings[0].reason
 
 
+def test_blocking_reason_preserves_launcher_contract_error(tmp_path):
+    cg = ModelIdentity(
+        executor="cg",
+        model_id="glm-5.2",
+        independence_domain="openai",
+        capabilities=("build",),
+    )
+    launcher_error = "cg executor requires read-only or review-only mode"
+
+    def reject_builder(_identity):
+        raise ValueError(launcher_error)
+
+    decision = evaluate_dispatch_gate(
+        card="subagent-build",
+        requirements=(),
+        candidates=(cg,),
+        environment_for=lambda _identity: _host_env(tmp_path),
+        launcher_factory=reject_builder,
+    )
+
+    assert decision.action == "needs_human"
+    assert "bridge:dispatch-contract" in (decision.reason or "")
+    assert launcher_error in (decision.reason or "")
+
+
 def test_preflight_uses_executor_environment_not_host(tmp_path):
     """R2：host 有而 executor 環境沒有的 module，必須判為缺失。
 

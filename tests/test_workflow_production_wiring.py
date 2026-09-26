@@ -3771,6 +3771,33 @@ def test_builder_identity_selection_requires_build_capability_before_domain_pref
     assert (selected.executor, selected.model_id) == ("copilot", "builder-openai")
 
 
+def test_builder_identity_candidates_exclude_zero_tool_cg() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "cg",
+                "model_id": "glm-5.2",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "codex",
+                "model_id": "gpt-5.6-luna",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+        ]
+    )
+
+    candidates = manager._workflow_identity_candidates_for_persona(
+        _workflow_identity_run(primary_domain=None), "builder", identities
+    )
+
+    assert [(item.executor, item.model_id) for item in candidates] == [
+        ("codex", "gpt-5.6-luna")
+    ]
+
+
 def test_builder_identity_selection_still_prefers_primary_domain_after_build_filter() -> None:
     identities = IdentityRegistry.from_rows(
         [
@@ -3836,6 +3863,140 @@ def test_reviewer_identity_selection_excludes_builder_domains() -> None:
     )
 
     assert (selected.executor, selected.model_id) == ("claude", "review-anthropic")
+
+
+def test_reviewer_candidates_ignore_passed_commit_forbidden_build_step() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "claude",
+                "model_id": "reviewer-anthropic",
+                "independence_domain": "anthropic",
+                "capabilities": ["review"],
+            },
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["review"],
+                "live_probe": AGY_LIVE_PROBE,
+            },
+        ]
+    )
+    run = SimpleNamespace(
+        steps=[
+            SimpleNamespace(
+                phase="build", gate_result="passed", domain="anthropic",
+                commit_policy="forbidden",
+            ),
+            SimpleNamespace(
+                phase="build", gate_result="passed", domain="openai",
+                commit_policy="required",
+            ),
+        ]
+    )
+
+    candidates = manager._workflow_identity_candidates_for_persona(
+        run, "reviewer", identities
+    )
+
+    assert candidates[0].executor == "claude"
+
+
+def test_review_terminal_allows_domain_used_only_by_commit_forbidden_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = "a" * 40
+    steps = tuple(
+        replace(
+            step,
+            gate_result=(
+                "pending" if step.card == "code-review" else
+                "passed" if step.phase in {"claim", "define", "plan", "build", "verify"} else
+                step.gate_result
+            ),
+            domain=(
+                "anthropic" if step.card == "worktree-isolation" else
+                "openai" if step.phase == "build" and step.commit_policy != "forbidden" else
+                step.domain
+            ),
+        )
+        for step in _manifest().steps
+    )
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="independence-check",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=steps,
+        candidate_head=candidate,
+        verified_head=candidate,
+        attempts={"review": 1},
+        gate_status="running",
+    )
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "builder",
+                "independence_domain": "openai", "capabilities": ["build"],
+            },
+            {
+                "executor": "claude", "model_id": "reviewer",
+                "independence_domain": "anthropic", "capabilities": ["review"],
+            },
+        ]
+    )
+    builder_identity = identities.require("codex", "builder")
+    reviewer_identity = identities.require("claude", "reviewer")
+    review_job = {"job_id": "review-job"}
+    evaluation = {
+        "schema_version": review.REVIEW_SCHEMA_VERSION,
+        "slice_id": f"{run.run_id}-code-review",
+        "state": "passed",
+        "reason": "no findings",
+        "builder_job_id": "builder-job",
+        "reviewer_job_id": "review-job",
+        "candidate": candidate,
+        "launch_identity": {
+            "builder": builder_identity.legacy_dict(),
+            "reviewer": reviewer_identity.legacy_dict(),
+        },
+        "findings": [],
+    }
+    monkeypatch.setattr(manager, "_job_for_workflow_card", lambda *args, **kwargs: (review_job, reviewer_identity))
+    monkeypatch.setattr(manager, "_verify_exact_candidate", lambda *args, **kwargs: candidate)
+    monkeypatch.setattr(
+        manager,
+        "_read_job_workflow_evidence",
+        lambda *args, **kwargs: (evaluation, ("reports/review/independence-check.md",), "review.json", "b" * 64),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_review_builder_job",
+        lambda *args, **kwargs: ({"job_id": "builder-job"}, builder_identity),
+    )
+
+    result = manager.apply_workflow_action(
+        registry,
+        args={
+            "action": "advance",
+            "run_id": run.run_id,
+            "card_id": "code-review",
+            "job_id": "review-job",
+            "current_phase": "review",
+        },
+        identity_registry=identities,
+        coordinator_root=tmp_path / "coordinator",
+        trusted_terminal=True,
+    )
+
+    assert result["current_phase"] == "review"
+    updated = registry.get_workflow_run(run.run_id)
+    assert next(step for step in updated.steps if step.card == "code-review").gate_result == "passed"
 
 
 def test_manager_rejects_planner_artifacts_outside_governed_roots(tmp_path: Path) -> None:

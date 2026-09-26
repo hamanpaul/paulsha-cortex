@@ -3199,6 +3199,7 @@ def _materialize_plan_card_output(
     step,
     artifacts: tuple[PlanningArtifact, ...],
     workspace_root: Path,
+    journal_root: Path,
 ):
     """把已 accepted 的 kind=plan 規劃內容原樣 materialize 到 ``step`` 宣告
     的（唯一）output pattern 之 canonical 路徑，透過既有 planning
@@ -3212,13 +3213,9 @@ def _materialize_plan_card_output(
     ``transaction.rollback()``。不可 materialize 時回傳 ``None``（不寫檔、
     不動 registry）。
 
-    ``journal_root=None``：此次寫入與呼叫端的 registry 提交在同一次
-    dispatch 呼叫內完成，不借用 brainstorm 那份跨 run 的
-    crash-recoverable journal（避免與其 `reconcile()` 語意〔預期
-    kind=evidence 的 brainstorm gate ref〕互相干擾）；殘餘風險是寫入成功
-    後、registry 提交前這極窄的視窗內若 manager 崩潰，materialize 出的
-    檔案會變成未登記的孤兒——下一輪 dispatch 會重新判定 outputs 是否存在
-    並可能需要人工介入，但不劣於修復前 100% 必炸的現狀。
+    發佈意圖寫入 coordinator 的 planning transaction journal，並以新增的
+    planning authority 作為 registry commit proof；manager 若在檔案發佈與
+    registry 提交之間崩潰，reconcile 可回滾未提交檔案或保留已提交產物。
     """
     if len(step.outputs) != 1:
         return None
@@ -3245,13 +3242,6 @@ def _materialize_plan_card_output(
         if cursor.is_symlink():
             return None
     content = accepted_plan.text.encode("utf-8")
-    transaction = _PlanningPublicationTransaction(
-        root=workspace_root, run_id=run.run_id, journal_root=None,
-    )
-    try:
-        transaction.publish(destination, content, baseline_hash=None, mode=0o644, kind="artifact")
-    except ValueError:
-        return None
     materialized = PlanningArtifact(kind="plan", ref=canonical_relative, text=accepted_plan.text)
     authority = PlanningArtifactAuthority(
         ref=canonical_relative,
@@ -3259,6 +3249,14 @@ def _materialize_plan_card_output(
         work_id=run.work_id,
         baseline_sha256=hashlib.sha256(content).hexdigest(),
     )
+    transaction = _PlanningPublicationTransaction(
+        root=workspace_root, run_id=run.run_id, journal_root=journal_root,
+    )
+    transaction.expected_planning_authority = authority.to_dict()
+    try:
+        transaction.publish(destination, content, baseline_hash=None, mode=0o644, kind="artifact")
+    except ValueError:
+        return None
     return artifacts + (materialized,), authority, transaction
 
 
@@ -8180,23 +8178,23 @@ class PlanningPublicationDrift(RuntimeError):
     """A durable planning intent cannot be safely committed or rolled back."""
 
 
-# #536：journal 的 schema 版本。v3 新增 `phase` 欄位（見
+# #536：journal 的 schema 版本。v3 新增 `phase` 欄位，v4 新增 plan authority
+# commit proof。恢復路徑持續接受 v2／v3，避免升級時要求 operator 手動搬遷。
+# v3 的 phase 欄位（見
 # `_PlanningPublicationTransaction.prepare_commit`），把「發佈 artifacts」與
 # 「registry 提交 run 狀態」之間那條事務邊界寫成 durable 事實，恢復路徑才能
-# 分辨「崩在發佈中途」與「崩在提交邊界」。v2 是升級前既有 journal 的格式，
-# 恢復路徑必須繼續接受它——實際部署上就有 v2 的殘留（#536 現場的
-# `workflow-7a430d31eff66ef13630`），自癒不能要求 operator 先手動搬遷。
-_PLANNING_TRANSACTION_SCHEMA_VERSION = 3
-_PLANNING_TRANSACTION_SCHEMA_VERSIONS = (2, _PLANNING_TRANSACTION_SCHEMA_VERSION)
+# 分辨「崩在發佈中途」與「崩在提交邊界」。
+_PLANNING_TRANSACTION_SCHEMA_VERSION = 4
+_PLANNING_TRANSACTION_SCHEMA_VERSIONS = (2, 3, _PLANNING_TRANSACTION_SCHEMA_VERSION)
 _PLANNING_TRANSACTION_PHASES = ("publishing", "prepared")
 
 
 class _PlanningPublicationTransaction:
-    """Recoverable filesystem side of the brainstorm -> registry commit.
+    """Recoverable filesystem side of planning publication and registry commit.
 
     Every intended mutation is durably journaled before it is applied.  A
     registry save fault can roll the group back immediately; after a crash,
-    Manager reconciles the journal against the persisted brainstorm gate.
+    Manager reconciles the journal against its persisted commit proof.
     """
 
     def __init__(
@@ -8210,10 +8208,11 @@ class _PlanningPublicationTransaction:
         self.run_id = run_id
         self.operations: list[dict[str, object]] = []
         self.expected_gate_ref: dict[str, str] | None = None
+        self.expected_planning_authority: dict[str, str] | None = None
         # #536：`publishing` = 檔案側還在發佈中，registry 提交尚未被嘗試；
         # `prepared` = 檔案側已全部落地且已 fsync，下一步就是唯一的 commit
         # point（registry 的 durable run row）。兩者都不改變 commit 判準
-        # （判準永遠是 registry row 上有沒有這次的 brainstorm gate ref），
+        # （判準由 journal 指定的 commit proof 與 registry row 比對），
         # 只讓恢復路徑能誠實描述殘留是哪一種。
         self.phase = "publishing"
         self.journal_root = journal_root.resolve() if journal_root is not None else None
@@ -8232,6 +8231,7 @@ class _PlanningPublicationTransaction:
             "phase": self.phase,
             "operations": self.operations,
             "expected_gate_ref": self.expected_gate_ref,
+            "expected_planning_authority": self.expected_planning_authority,
         }
 
     def prepare_commit(self) -> None:
@@ -8613,9 +8613,10 @@ class _PlanningPublicationTransaction:
     ) -> dict[str, object] | None:
         """把一份 durable 發佈意圖收斂到與 registry 權威狀態一致。
 
-        判準只有一條：**registry 的 run row 上有沒有這次的 brainstorm gate
-        ref**。有 → 前滾（驗證每個已提交產物仍逐位元組吻合，然後退役
-        journal）；沒有 → 回退（把檔案側還原成發佈前的樣子）。沒有 journal
+        判準只有一條：**registry 的 run row 上有沒有 journal 指定的 commit
+        proof**（brainstorm gate ref 或 plan artifact authority）。有 → 前滾
+        （驗證每個已提交產物仍逐位元組吻合，然後退役 journal）；沒有 → 回退
+        （把檔案側還原成發佈前的樣子）。沒有 journal
         時回傳 ``None``；其餘回傳 ``{"outcome", "phase", "skipped"}``。
         """
 
@@ -8637,6 +8638,10 @@ class _PlanningPublicationTransaction:
             or not isinstance(payload.get("operations"), list)
             or payload.get("expected_gate_ref") is not None
             and not isinstance(payload.get("expected_gate_ref"), dict)
+            or payload.get("schema_version") == _PLANNING_TRANSACTION_SCHEMA_VERSION
+            and "expected_planning_authority" not in payload
+            or payload.get("expected_planning_authority") is not None
+            and not isinstance(payload.get("expected_planning_authority"), dict)
         ):
             raise PlanningPublicationDrift("planning transaction journal is invalid")
         # #536：v2 沒有 phase 欄位，一律視為 `publishing`（升級前的 journal
@@ -8652,6 +8657,10 @@ class _PlanningPublicationTransaction:
                 raise PlanningPublicationDrift("planning transaction phase is invalid")
         transaction = cls(root=root, run_id=run.run_id, journal_root=journal_root)
         transaction.phase = phase
+        if payload.get("expected_gate_ref") is not None and payload.get(
+            "expected_planning_authority"
+        ) is not None:
+            raise PlanningPublicationDrift("planning transaction commit proof is ambiguous")
         expected_gate_ref = payload["expected_gate_ref"]
         expected: GateEvidenceRef | None = None
         if expected_gate_ref is not None:
@@ -8662,6 +8671,18 @@ class _PlanningPublicationTransaction:
             if expected.kind != "brainstorm" or expected.sha256 is None:
                 raise PlanningPublicationDrift("planning expected gate ref is invalid")
             transaction.expected_gate_ref = expected.to_dict()
+        expected_planning_authority = payload.get("expected_planning_authority")
+        authority: PlanningArtifactAuthority | None = None
+        if expected_planning_authority is not None:
+            try:
+                authority = PlanningArtifactAuthority.from_dict(expected_planning_authority)
+            except ValueError as exc:
+                raise PlanningPublicationDrift(
+                    "planning expected authority is invalid"
+                ) from exc
+            if authority.kind != "plan" or authority.work_id != run.work_id:
+                raise PlanningPublicationDrift("planning expected authority is invalid")
+            transaction.expected_planning_authority = authority.to_dict()
         try:
             transaction.operations = [
                 transaction._validate_loaded_operation(operation)
@@ -8676,7 +8697,25 @@ class _PlanningPublicationTransaction:
         ]
         if expected is not None and len(evidence_operations) != 1:
             raise PlanningPublicationDrift("planning committed evidence operation is invalid")
-        committed = expected is not None and any(ref == expected for ref in run.gate_refs)
+        if authority is not None:
+            authority_path = str(root.resolve() / authority.ref)
+            matching_operations = [
+                operation
+                for operation in transaction.operations
+                if operation.get("kind") == "artifact"
+                and operation.get("path") == authority_path
+                and operation.get("after_hash") == authority.baseline_sha256
+            ]
+            if expected is not None or len(matching_operations) != 1:
+                raise PlanningPublicationDrift(
+                    "planning expected authority operation is invalid"
+                )
+        committed = (
+            expected is not None and any(ref == expected for ref in run.gate_refs)
+        ) or (
+            authority is not None
+            and authority in (getattr(run, "planning_authority", ()) or ())
+        )
         if committed:
             for operation in transaction.operations:
                 transaction._validate_committed_operation(operation)
@@ -9402,6 +9441,9 @@ def _identity_candidates_for_persona(persona: str, identities: IdentityRegistry,
     # catch-all 行為，deck 目前只會派出 planner/build/reviewer 三種 persona）。
     capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona, "build")
     candidates = [item for item in identities.identities if capability in item.capabilities]
+    if persona == "builder":
+        # cg 是 zero-tool executor，不能承接需要 workspace-write 的 builder 卡。
+        candidates = [item for item in candidates if item.executor != "cg"]
     if persona == "reviewer":
         candidates = [item for item in candidates if item.independence_domain not in builder_domains]
     return candidates
@@ -9462,7 +9504,10 @@ def _workflow_identity_candidates_for_persona(
     builder_domains = {
         item.domain
         for item in run.steps
-        if item.phase == "build" and item.gate_result == "passed" and item.domain is not None
+        if item.phase == "build"
+        and item.gate_result == "passed"
+        and getattr(item, "commit_policy", None) != "forbidden"
+        and item.domain is not None
     }
     # #205 R1/D1/D3/D4：run-scoped 覆寫先於共享 registry 選擇；三段各自獨立，
     # 未覆寫的段落回退既有共享 registry 選擇邏輯（下方 fallback 完全不動）。
@@ -11046,7 +11091,11 @@ def _dispatch_workflow_card(
             publication: _PlanningPublicationTransaction | None = None
             if not _plan_card_declared_outputs_present(workspace_root, step.outputs):
                 materialize_result = _materialize_plan_card_output(
-                    run=run, step=step, artifacts=artifacts, workspace_root=workspace_root,
+                    run=run,
+                    step=step,
+                    artifacts=artifacts,
+                    workspace_root=workspace_root,
+                    journal_root=Path(coordinator_root),
                 )
                 if materialize_result is None:
                     return {
@@ -11064,6 +11113,8 @@ def _dispatch_workflow_card(
                     next_phase: run.attempts.get(next_phase, 0) + 1,
                 }
             try:
+                if publication is not None:
+                    publication.prepare_commit()
                 registry._manager_update_workflow_run(
                     run.run_id,
                     current_phase=next_phase,
@@ -11088,6 +11139,8 @@ def _dispatch_workflow_card(
                 if publication is not None:
                     publication.rollback()
                 raise
+            if publication is not None:
+                publication.commit()
             return None
     # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
     # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
@@ -13058,7 +13111,10 @@ def apply_workflow_action(
         builder_domains = {
             item.domain
             for item in current.steps
-            if item.phase == "build" and item.gate_result == "passed" and item.domain is not None
+            if item.phase == "build"
+            and item.gate_result == "passed"
+            and getattr(item, "commit_policy", None) != "forbidden"
+            and item.domain is not None
         }
         if current.current_phase in {"verify", "review"} and identity.independence_domain in builder_domains:
             raise ValueError("workflow reviewer must use a foreign independence domain")

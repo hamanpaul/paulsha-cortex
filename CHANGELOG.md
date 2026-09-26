@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#875、#881、#559**：builder 候選排除 zero-tool 的 `cg` 並保留 preflight finding 原因；reviewer independence domain 僅依會產出 commit 的 build 卡計算；plan output materialize 改用可恢復的 publication journal。
 - Wave R 整合交付：operator 合併 8 個卡在 cortex pipeline 的實作 PR，並補 review 修正（非正規化 governed path、journal lock `O_CLOEXEC`、裁決 evidence 先於 run 重置、#862 測試對齊 #966 CAS）。
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、
   逐條宣稱更正，以及切換當下才撞得到的那一個阻斷**。四分部署的
