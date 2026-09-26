@@ -51,6 +51,21 @@ jobs:
             --dest qualification-input/wheelhouse \
             dist/*.whl
 
+          # Ship preflight backend (policy-check == probe policy_version) from the
+          # pinned conventions runtime bundle; archive and wheel are both hash-locked.
+          curl --fail --location --silent --show-error \
+            --output qualification-staging/policy-check.tar.gz \
+            "$WHEEL_POLICY_CHECK_URL"
+          printf '%s  %s\n' \
+            "$WHEEL_POLICY_CHECK_SHA256" \
+            qualification-staging/policy-check.tar.gz | sha256sum --check --strict -
+          policy_check_wheel="qualification-input/wheelhouse/$(basename "$WHEEL_POLICY_CHECK_ARCHIVE_PATH")"
+          tar -xzf qualification-staging/policy-check.tar.gz \
+            -O "$WHEEL_POLICY_CHECK_ARCHIVE_PATH" > "$policy_check_wheel"
+          printf '%s  %s\n' \
+            "$WHEEL_POLICY_CHECK_WHEEL_SHA256" \
+            "$policy_check_wheel" | sha256sum --check --strict -
+
           [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]] || {
             echo "::error::checkout HEAD does not match the workflow candidate SHA"
             exit 1

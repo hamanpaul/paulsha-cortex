@@ -2023,3 +2023,376 @@ def test_dispatch_closeout_resolves_every_delivery_gate_ref(
             },
             coordinator_root=fixture["coordinator"],
         )
+
+
+# ---------------------------------------------------------------------------
+# #716：probe repo 的 intake 前準備（clone／登記／預檢／等 authority）
+# ---------------------------------------------------------------------------
+
+
+def _probe_receipt(tmp_path: Path) -> tuple[dict, Path, Path]:
+    state = tmp_path / "state"
+    source_root = state / "repos"
+    config_root = state / "config" / "paulsha"
+    source_root.mkdir(parents=True)
+    config_root.mkdir(parents=True)
+    receipt = {
+        "plan": {
+            "roots": {"state": str(state)},
+            "source_repositories": ["paulsha-cortex"],
+            "assets": [
+                {
+                    "asset_id": "repo-source-tree",
+                    "path": str(source_root),
+                    "is_directory": True,
+                }
+            ],
+        }
+    }
+    return receipt, source_root, config_root
+
+
+def _patch_probe_registration(
+    driver, monkeypatch: pytest.MonkeyPatch, config_root: Path, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(
+        driver,
+        "_installed_runtime_env",
+        lambda: {"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+    )
+    monkeypatch.setattr(driver, "_account_runtime_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver, "_account_env", lambda _account: {"HOME": str(tmp_path / "home")}
+    )
+    monkeypatch.setattr(driver, "_require_installed_manager_gitconfig", lambda _p: None)
+    monkeypatch.setattr(driver.os, "chown", lambda *_args: None)
+
+
+def test_probe_registration_clones_as_manager_and_writes_exact_project_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from paulsha_cortex.monitor.config import load_config
+    from qualification.contract import CANARY_GIT_IDENTITY
+
+    driver = _load_driver()
+    receipt, source_root, config_root = _probe_receipt(tmp_path)
+    _patch_probe_registration(driver, monkeypatch, config_root, tmp_path)
+    checkout = source_root / "probe-repo"
+    remote = "https://github.com/owner/probe-repo.git"
+    calls: list[tuple[tuple[str, ...], str | None]] = []
+
+    def fake_run(argv, *, user=None, **_kwargs):
+        calls.append((tuple(argv), user))
+        if "clone" in argv:
+            checkout.mkdir()
+            return _result(driver, argv)
+        if "get-url" in argv:
+            return _result(driver, argv, stdout=remote + "\n")
+        if "symbolic-ref" in argv:
+            return _result(driver, argv, stdout="main\n")
+        if argv[0] == "/opt/cortex/venv/bin/python":
+            assert (config_root / "project-cortex.yaml").is_file()
+            payload = {"workspaces": [str(checkout)], "resolved": str(checkout)}
+            return _result(driver, argv, stdout=json.dumps(payload) + "\n")
+        return _result(driver, argv)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+
+    assert driver._register_probe_checkout(
+        receipt=receipt, repository="owner/probe-repo"
+    ) == checkout
+
+    assert calls[0] == (
+        ("/usr/bin/git", "clone", "--quiet", "--", remote, str(checkout)),
+        "cortex-manager",
+    )
+    identity = {
+        argv[-2]: argv[-1] for argv, _user in calls if "config" in argv and "--local" in argv
+    }
+    assert identity == {
+        "user.name": CANARY_GIT_IDENTITY["name"],
+        "user.email": CANARY_GIT_IDENTITY["email"],
+    }
+    assert all(user == "cortex-manager" for argv, user in calls if argv[0] != "systemctl")
+    assert (("systemctl", "restart", "cortex-monitor.service"), None) in calls
+    project_config = config_root / "project-cortex.yaml"
+    assert oct(project_config.stat().st_mode & 0o777) == "0o644"
+    config = load_config(config_path=project_config)
+    assert [(row.name, row.path, row.exact_project) for row in config.workspaces] == [
+        ("probe-repo", checkout, True)
+    ]
+
+
+def test_probe_registration_refuses_existing_config_or_installed_slug(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    receipt, _source_root, config_root = _probe_receipt(tmp_path)
+    _patch_probe_registration(driver, monkeypatch, config_root, tmp_path)
+
+    def unexpected_run(argv, **_kwargs):
+        raise AssertionError(f"must fail before running {argv}")
+
+    monkeypatch.setattr(driver, "_run", unexpected_run)
+    with pytest.raises(driver.QualificationFailure, match="checkout name"):
+        driver._register_probe_checkout(
+            receipt=receipt, repository="owner/paulsha-cortex"
+        )
+    (config_root / "project-cortex.yaml").write_text("workspaces: []\n", encoding="utf-8")
+    with pytest.raises(driver.QualificationFailure, match="already exists"):
+        driver._register_probe_checkout(receipt=receipt, repository="owner/probe-repo")
+
+
+def test_probe_registration_rolls_back_config_when_manager_resolves_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    receipt, source_root, config_root = _probe_receipt(tmp_path)
+    _patch_probe_registration(driver, monkeypatch, config_root, tmp_path)
+    checkout = source_root / "probe-repo"
+
+    def fake_run(argv, **_kwargs):
+        if "clone" in argv:
+            checkout.mkdir()
+        if "get-url" in argv:
+            return _result(driver, argv, stdout="https://github.com/owner/probe-repo.git\n")
+        if "symbolic-ref" in argv:
+            return _result(driver, argv, stdout="main\n")
+        if argv[0] == "/opt/cortex/venv/bin/python":
+            payload = {"workspaces": [str(checkout)], "resolved": "/elsewhere"}
+            return _result(driver, argv, stdout=json.dumps(payload))
+        if argv[0] == "systemctl":
+            raise AssertionError("Monitor must not restart on a failed registration")
+        return _result(driver, argv)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    with pytest.raises(driver.QualificationFailure, match="does not resolve"):
+        driver._register_probe_checkout(receipt=receipt, repository="owner/probe-repo")
+    assert not (config_root / "project-cortex.yaml").exists()
+
+
+def _probe_github(driver, **overrides):
+    labels = driver._production_pr_labels("owner/probe", "probe-work", 7)
+    responses = {
+        "repos/owner/probe": (
+            0,
+            {
+                "archived": False,
+                "default_branch": "main",
+                "has_issues": True,
+                "allow_merge_commit": True,
+                "permissions": {"push": True},
+            },
+        ),
+        "repos/owner/probe/issues/7": (0, {"state": "open"}),
+        "repos/owner/probe/rules/branches/main": (0, []),
+        "repos/owner/probe/branches/main/protection/required_pull_request_reviews": (
+            1,
+            None,
+        ),
+        **{f"repos/owner/probe/labels/{label}": (0, {"name": label}) for label in labels},
+    }
+    responses.update(overrides)
+    return lambda path, **_kwargs: responses[path]
+
+
+def test_probe_repository_prerequisites_accept_a_mergeable_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    assert driver._production_pr_labels("owner/probe", "probe-work", 7)
+    monkeypatch.setattr(driver, "_manager_gh_api", _probe_github(driver))
+    driver._probe_repository_prerequisites("owner/probe", "probe-work", 7)
+
+
+def test_probe_repository_prerequisites_report_every_blocking_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    label = driver._production_pr_labels("owner/probe", "probe-work", 7)[0]
+    fake = _probe_github(
+        driver,
+        **{
+            "repos/owner/probe": (
+                0,
+                {
+                    "archived": False,
+                    "default_branch": "main",
+                    "has_issues": True,
+                    "allow_merge_commit": False,
+                    "permissions": {"push": True},
+                },
+            ),
+            f"repos/owner/probe/labels/{label}": (1, None),
+            "repos/owner/probe/rules/branches/main": (
+                0,
+                [
+                    {
+                        "type": "pull_request",
+                        "parameters": {"required_approving_review_count": 1},
+                    }
+                ],
+            ),
+        },
+    )
+    monkeypatch.setattr(driver, "_manager_gh_api", fake)
+    with pytest.raises(driver.QualificationFailure) as failure:
+        driver._probe_repository_prerequisites("owner/probe", "probe-work", 7)
+    message = str(failure.value)
+    assert "merge commits are not allowed" in message
+    assert f"PR label {label!r} does not exist" in message
+    assert "ruleset requires approving reviews" in message
+
+
+def test_probe_runtime_prerequisites_check_gate_pytest_policy_check_and_ctags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qualification.contract import PROBE_GATE_PYTEST_VERSION, WHEELS
+
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    calls: list[tuple[tuple[str, ...], str | None]] = []
+    versions = {
+        "/opt/cortex/venv/bin/python3": WHEELS["policy_check"]["version"],
+        "/usr/bin/python3": WHEELS["policy_check"]["version"],
+    }
+
+    def fake_run(argv, *, user=None, **_kwargs):
+        calls.append((tuple(argv), user))
+        if argv[:3] == ("python3", "-m", "pytest"):
+            return _result(driver, argv, stdout=f"pytest {PROBE_GATE_PYTEST_VERSION}\n")
+        if argv[0] in versions:
+            return _result(driver, argv, stdout=versions[argv[0]] + "\n")
+        if argv[0] == "ctags":
+            return _result(driver, argv, stdout="Universal Ctags 5.9.0\n")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    driver._probe_runtime_prerequisites()
+    assert (("python3", "-m", "pytest", "--version"), "cortex-gate") in calls
+    assert {user for argv, user in calls if argv[0] != "python3"} == {"cortex-manager"}
+
+    versions["/usr/bin/python3"] = "1.0.0"
+    with pytest.raises(driver.QualificationFailure, match="/usr/bin/python3"):
+        driver._probe_runtime_prerequisites()
+
+
+def test_probe_policy_version_must_match_the_installed_engine(tmp_path: Path) -> None:
+    from qualification.contract import WHEELS
+
+    driver = _load_driver()
+    policy = tmp_path / ".project-policy.yml"
+    policy.write_text(
+        f"policy_version: {WHEELS['policy_check']['version']}\n", encoding="utf-8"
+    )
+    driver._probe_policy_version(tmp_path)
+    policy.write_text("policy_version: 0.0.1\n", encoding="utf-8")
+    with pytest.raises(driver.QualificationFailure, match="policy_version"):
+        driver._probe_policy_version(tmp_path)
+
+
+def test_probe_authority_wait_requires_the_linked_issue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_runtime_env", lambda _account: {})
+    monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
+    states = [
+        {"ok": False, "reason": "confirmed work authority missing or ambiguous"},
+        {"ok": True, "mapped_issues": [], "mapped_openspec": ["probe"]},
+        {"ok": True, "mapped_issues": [7], "mapped_openspec": ["probe"]},
+    ]
+    calls: list[tuple[tuple[str, ...], str | None]] = []
+
+    def fake_run(argv, *, user=None, **_kwargs):
+        calls.append((tuple(argv), user))
+        return _result(driver, argv, stdout=json.dumps(states.pop(0)) + "\n")
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    driver._wait_for_probe_authority(
+        repository="owner/probe", work_id="probe-work", issue=7, timeout=60
+    )
+    assert len(calls) == 3
+    assert all(argv[-2:] == ("owner/probe", "probe-work") for argv, _ in calls)
+    assert {user for _argv, user in calls} == {"cortex-manager"}
+
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=json.dumps({"ok": True, "mapped_issues": [3]})
+        ),
+    )
+    with pytest.raises(driver.QualificationFailure, match="issue #7 is not linked"):
+        driver._wait_for_probe_authority(
+            repository="owner/probe", work_id="probe-work", issue=7, timeout=0
+        )
+
+
+def test_prepare_probe_dispatch_runs_prechecks_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    order: list[str] = []
+    monkeypatch.setattr(
+        driver, "_probe_repository_prerequisites", lambda *_a: order.append("remote")
+    )
+    monkeypatch.setattr(
+        driver, "_probe_runtime_prerequisites", lambda: order.append("runtime")
+    )
+
+    def register(**_kwargs):
+        order.append("register")
+        return Path("/checkout")
+
+    monkeypatch.setattr(driver, "_register_probe_checkout", register)
+    monkeypatch.setattr(driver, "_probe_policy_version", lambda _c: order.append("policy"))
+    monkeypatch.setattr(
+        driver, "_wait_for_probe_authority", lambda **_k: order.append("authority")
+    )
+    driver._prepare_probe_dispatch(
+        receipt={}, repository="owner/probe", work_id="probe-work", issue=7
+    )
+    assert order == ["remote", "runtime", "register", "policy", "authority"]
+
+
+def test_full_dispatch_reports_the_structured_needs_human_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    (config_root / "model-identities.yaml").write_text(
+        render_model_identity_overlay(), encoding="utf-8"
+    )
+    terminal = {
+        "item": {"work_id": "probe-work", "state": "on-going", "facets": ["needs_human"]},
+        "blocking_reason": {
+            "reason": "copilot-current-head-review-missing",
+            "detail": "Copilot review was not submitted",
+        },
+    }
+
+    def fake_run(argv, **_kwargs):
+        if "show" in argv:
+            return _result(driver, argv, stdout=json.dumps(terminal) + "\n")
+        return _result(driver, argv)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    monkeypatch.setattr(
+        driver,
+        "_installed_runtime_env",
+        lambda: {"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+    )
+    with pytest.raises(
+        driver.QualificationFailure, match="copilot-current-head-review-missing"
+    ):
+        driver._full_dispatch(
+            repository="owner/probe",
+            work_id="probe-work",
+            issue=7,
+            release_candidate_sha="a" * 40,
+            timeout=30,
+            evidence_dir=tmp_path / "evidence",
+        )

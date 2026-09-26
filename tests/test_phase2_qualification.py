@@ -1273,6 +1273,7 @@ def test_release_driver_never_calls_live_provider_or_repository_functions(
 
     monkeypatch.setattr(driver, "_provider_smokes", unexpected_live_call)
     monkeypatch.setattr(driver, "_manager_github_probe", unexpected_live_call)
+    monkeypatch.setattr(driver, "_prepare_probe_dispatch", unexpected_live_call)
     monkeypatch.setattr(driver, "_full_dispatch", unexpected_live_call)
     monkeypatch.setattr(
         sys,

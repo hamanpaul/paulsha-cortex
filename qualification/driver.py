@@ -38,17 +38,23 @@ from paulsha_cortex.trust_root.surfaces import writable_surface
 try:
     from qualification.contract import (
         CANARY_BUILDER,
+        CANARY_GIT_IDENTITY,
         CANARY_REVIEWER,
+        PROBE_GATE_PYTEST_VERSION,
         PROVIDERS as PROVIDER_CONTRACTS,
         TOOLCHAIN,
+        WHEELS,
         canary_identity,
     )
 except ModuleNotFoundError:  # 直接以 qualification/driver.py 執行時 sys.path[0] 是 qualification/
     from contract import (  # type: ignore[no-redef]
         CANARY_BUILDER,
+        CANARY_GIT_IDENTITY,
         CANARY_REVIEWER,
+        PROBE_GATE_PYTEST_VERSION,
         PROVIDERS as PROVIDER_CONTRACTS,
         TOOLCHAIN,
+        WHEELS,
         canary_identity,
     )
 
@@ -2655,6 +2661,485 @@ def _manager_github_probe(
     )
 
 
+PROBE_DEFAULT_BRANCH = "main"
+PROBE_AUTHORITY_TIMEOUT_SECONDS = 900
+PROBE_AUTHORITY_POLL_SECONDS = 15
+PROBE_CHECKOUT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+PROJECT_CONFIG_NAME = "project-cortex.yaml"
+
+
+def _manager_gh_api(path: str, *, timeout: int = 60) -> tuple[int, object]:
+    """以 Manager 身分與其已匯入的 gh 登入態讀一個 GitHub REST 資源（只讀）。"""
+
+    account = "cortex-manager"
+    result = _run(
+        ("/usr/bin/gh", "api", path),
+        user=account,
+        env=_account_env(account),
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        return result.returncode, None
+    try:
+        return 0, json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise QualificationFailure(
+            f"GitHub API returned malformed JSON for {path}"
+        ) from exc
+
+
+def _production_pr_labels(repository: str, work_id: str, issue: int) -> tuple[str, ...]:
+    """ship lane 實際會掛上 PR 的 labels，直接由 production 的 PR metadata 導出。"""
+
+    from types import SimpleNamespace
+
+    from paulsha_cortex.coordinator.work_bridge import _pr_metadata
+
+    metadata = _pr_metadata(
+        SimpleNamespace(
+            repo=repository, work_id=work_id, issue_refs=(f"{repository}#{issue}",)
+        )
+    )
+    labels = metadata.get("labels")
+    if not isinstance(labels, list) or not all(
+        isinstance(label, str) and label for label in labels
+    ):
+        raise QualificationFailure("production PR metadata labels are malformed")
+    return tuple(labels)
+
+
+def _probe_repository_prerequisites(repository: str, work_id: str, issue: int) -> None:
+    """intake 前以 Manager 身分預檢 probe repo 的遠端前置條件（runbook §3）。
+
+    這些條件若不成立，canary 會在燒掉 plan／build 之後才於 ship 失敗，而且失敗原因
+    只剩一個 needs_human。Copilot code review 的可用性沒有公開 API 可在開 PR 前確認，
+    由 runbook 列為前置條件；它不成立時 `_full_dispatch` 會帶出 review gate 的
+    blocking reason。
+    """
+
+    status, repo = _manager_gh_api(f"repos/{repository}")
+    if status != 0 or not isinstance(repo, Mapping):
+        raise QualificationFailure(
+            "Manager GitHub account cannot read the probe repository"
+        )
+    permissions = repo.get("permissions")
+    problems: list[str] = []
+    if repo.get("archived") is not False:
+        problems.append("repository is archived")
+    if repo.get("default_branch") != PROBE_DEFAULT_BRANCH:
+        problems.append(f"default branch is not {PROBE_DEFAULT_BRANCH}")
+    if repo.get("has_issues") is not True:
+        problems.append("issues are disabled")
+    if repo.get("allow_merge_commit") is not True:
+        problems.append("merge commits are not allowed (Cortex merges with --merge)")
+    if not isinstance(permissions, Mapping) or permissions.get("push") is not True:
+        problems.append("Manager account lacks push permission")
+    status, issue_payload = _manager_gh_api(f"repos/{repository}/issues/{issue}")
+    if status != 0 or not isinstance(issue_payload, Mapping):
+        problems.append(f"issue #{issue} is not readable")
+    elif "pull_request" in issue_payload or issue_payload.get("state") != "open":
+        problems.append(f"#{issue} is not an open issue")
+    from urllib.parse import quote
+
+    for label in _production_pr_labels(repository, work_id, issue):
+        status, _label = _manager_gh_api(
+            f"repos/{repository}/labels/{quote(label, safe='')}"
+        )
+        if status != 0:
+            problems.append(f"PR label {label!r} does not exist")
+    # 規則集（任何有讀權的帳號都讀得到）與 classic branch protection（需要 admin；
+    # 讀不到代表未設或無權，皆不當成違規）。approving review 規則會讓 Cortex 的
+    # `gh pr merge --match-head-commit` 永遠卡住。
+    status, rules = _manager_gh_api(
+        f"repos/{repository}/rules/branches/{PROBE_DEFAULT_BRANCH}"
+    )
+    if status == 0 and isinstance(rules, list):
+        for rule in rules:
+            parameters = rule.get("parameters") if isinstance(rule, Mapping) else None
+            if (
+                isinstance(rule, Mapping)
+                and rule.get("type") == "pull_request"
+                and isinstance(parameters, Mapping)
+                and int(parameters.get("required_approving_review_count") or 0) > 0
+            ):
+                problems.append("a ruleset requires approving reviews on main")
+                break
+    status, reviews = _manager_gh_api(
+        f"repos/{repository}/branches/{PROBE_DEFAULT_BRANCH}"
+        "/protection/required_pull_request_reviews"
+    )
+    if (
+        status == 0
+        and isinstance(reviews, Mapping)
+        and int(reviews.get("required_approving_review_count") or 0) > 0
+    ):
+        problems.append("branch protection requires approving reviews on main")
+    if problems:
+        raise QualificationFailure(
+            "probe repository prerequisites are not met: " + "; ".join(problems)
+        )
+
+
+def _installed_policy_check_version(interpreter: str) -> str:
+    code = (
+        "import importlib.metadata as m, policy_check.preflight\n"
+        "print(m.version('policy-check'))\n"
+    )
+    account = "cortex-manager"
+    result = _run(
+        (interpreter, "-c", code), user=account, env=_account_env(account), timeout=60
+    )
+    if result.returncode != 0:
+        raise QualificationFailure(
+            f"policy-check is not importable by the Manager through {interpreter}"
+        )
+    return result.stdout.strip()
+
+
+def _probe_runtime_prerequisites() -> None:
+    """intake 前確認 image／部署 venv 已提供 probe 派工會用到的釘版本工具。"""
+
+    gate = "cortex-gate"
+    pytest_version = _run(
+        ("python3", "-m", "pytest", "--version"),
+        user=gate,
+        env=_account_env(gate),
+        timeout=60,
+    )
+    pytest_text = pytest_version.stdout + pytest_version.stderr
+    if (
+        pytest_version.returncode != 0
+        or f"pytest {PROBE_GATE_PYTEST_VERSION}" not in pytest_text
+    ):
+        raise QualificationFailure(
+            "gate identity cannot run the pinned system pytest "
+            f"{PROBE_GATE_PYTEST_VERSION} (PSC_GATE_CMD_PYTEST would fail every card)"
+        )
+    expected = WHEELS["policy_check"]["version"]
+    # 部署 venv：PSC_PREFLIGHT_CMD 的 backend；系統層：Manager 以相對名 `python3 -m
+    # policy_check` 跑的 preflight policy stage 與 archive gate。
+    for interpreter in ("/opt/cortex/venv/bin/python3", "/usr/bin/python3"):
+        installed = _installed_policy_check_version(interpreter)
+        if installed != expected:
+            raise QualificationFailure(
+                f"{interpreter} has policy-check {installed!r}, expected {expected}"
+            )
+    account = "cortex-manager"
+    ctags = _run(
+        ("ctags", "--version"), user=account, env=_account_env(account), timeout=30
+    )
+    if ctags.returncode != 0 or "Universal Ctags" not in ctags.stdout:
+        raise QualificationFailure(
+            "universal-ctags is unavailable to the Manager (policy-check R-22 needs it)"
+        )
+
+
+@dataclass(frozen=True)
+class ProbeSourceLayout:
+    """已安裝 plan 導出的 probe 落點：state root、來源 repo 容器與既有 slug。"""
+
+    state_root: Path
+    source_root: Path
+    installed_slugs: frozenset[str]
+
+
+def _plan_probe_layout(receipt: Mapping[str, Any]) -> ProbeSourceLayout:
+    """由已安裝 plan 的 `roots.state` 與 `repo-source-tree` 資產導出 Manager 的來源 repo 容器。"""
+
+    plan = receipt.get("plan")
+    assets = plan.get("assets") if isinstance(plan, Mapping) else None
+    slugs = plan.get("source_repositories") if isinstance(plan, Mapping) else None
+    roots = plan.get("roots") if isinstance(plan, Mapping) else None
+    state = roots.get("state") if isinstance(roots, Mapping) else None
+    matches = [
+        asset
+        for asset in (assets if isinstance(assets, list) else [])
+        if isinstance(asset, Mapping) and asset.get("asset_id") == "repo-source-tree"
+    ]
+    if len(matches) != 1 or not isinstance(slugs, list):
+        raise QualificationFailure("plan must declare exactly one repo-source-tree")
+    raw = matches[0].get("path")
+    if (
+        not isinstance(raw, str)
+        or not raw.startswith("/")
+        or not isinstance(state, str)
+        or not state.startswith("/")
+        or matches[0].get("is_directory") is not True
+    ):
+        raise QualificationFailure("repo-source-tree asset shape is invalid")
+    state_root = Path(state)
+    root = Path(raw)
+    if (
+        root.is_symlink()
+        or not root.is_dir()
+        or root.resolve() != root
+        or root.parent != state_root
+        or root.stat().st_uid != _manager_uid()
+    ):
+        raise QualificationFailure("repo-source-tree is absent, unsafe, or not Manager-owned")
+    return ProbeSourceLayout(
+        state_root=state_root,
+        source_root=root,
+        installed_slugs=frozenset(str(slug) for slug in slugs),
+    )
+
+
+def _render_project_config(name: str, path: Path) -> str:
+    """`project-cortex.yaml` 的 workspace 列；形狀與 `cortex install service` 寫的相同。"""
+
+    return (
+        "workspaces:\n"
+        f"  - name: {json.dumps(name)}\n"
+        f"    path: {json.dumps(str(path))}\n"
+        "    exact_project: true\n"
+    )
+
+
+def _install_root_file(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("x", encoding="utf-8") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chown(temporary, 0, 0)
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, path)
+
+
+_PROBE_RESOLUTION_CODE = r"""
+import json
+import sys
+
+from paulsha_cortex.coordinator.work_bridge import resolve_trusted_repo_root
+from paulsha_cortex.monitor.config import load_config
+
+config = load_config()
+print(json.dumps({
+    "workspaces": [str(row.path) for row in config.workspaces],
+    "resolved": str(resolve_trusted_repo_root(sys.argv[1])),
+}))
+""".strip()
+
+
+def _register_probe_checkout(*, receipt: Mapping[str, Any], repository: str) -> Path:
+    """以 Manager 身分 clone probe repo 並登記成 Monitor／Manager 認得的 project。
+
+    - 落點：已安裝 plan 的 `repo-source-tree`（`<state>/repos/<name>`），與 installer 放
+      受治理 repo 的位置同一個 Manager-owned 容器，job 帳號的唯讀 default ACL 自動繼承。
+    - clone 走 Manager 的 root-owned gitconfig（gh credential helper）與 egress proxy，
+      與 `_manager_github_probe` 同一條傳輸路徑。
+    - 登記：寫 `PSC_PROJECT_CONFIG_ROOT/project-cortex.yaml` 的 exact-project
+      workspace——Monitor 的 `load_config()` 與 Manager 的 `resolve_trusted_repo_root()`
+      都讀這份設定；不碰 coordinator registry 或 snapshot。寫完以 installed runtime 驗證
+      Manager 會把 `owner/name` 恰好解析到這份 checkout，再重啟 Monitor 讓它重讀設定。
+    """
+
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise QualificationFailure("protected GitHub probe repository is missing or invalid")
+    layout = _plan_probe_layout(receipt)
+    name = repository.split("/", 1)[1]
+    if (
+        PROBE_CHECKOUT_NAME.fullmatch(name) is None
+        or name in {".", ".."}
+        or name in layout.installed_slugs
+    ):
+        raise QualificationFailure("probe repository name cannot be a Manager checkout name")
+    checkout = layout.source_root / name
+    if checkout.exists() or checkout.is_symlink():
+        raise QualificationFailure("probe checkout already exists in the Manager source tree")
+    runtime_env = _installed_runtime_env()
+    config_root = Path(runtime_env.get("PSC_PROJECT_CONFIG_ROOT", ""))
+    project_config = config_root / PROJECT_CONFIG_NAME
+    if (
+        not config_root.is_absolute()
+        or config_root.is_symlink()
+        or not config_root.is_dir()
+        or not config_root.is_relative_to(layout.state_root)
+    ):
+        raise QualificationFailure("installed project config root is unavailable or unsafe")
+    if os.path.lexists(project_config):
+        raise QualificationFailure(
+            "project-cortex.yaml already exists; refusing to merge into operator config"
+        )
+
+    account = "cortex-manager"
+    env = _account_env(account)
+    _require_installed_manager_gitconfig(Path(env["HOME"]) / ".gitconfig")
+    remote = f"https://github.com/{repository}.git"
+    _require_success(
+        _run(
+            ("/usr/bin/git", "clone", "--quiet", "--", remote, str(checkout)),
+            user=account,
+            env=env,
+            timeout=300,
+        ),
+        "Manager probe repository clone",
+    )
+    origin = _run(
+        ("/usr/bin/git", "-C", str(checkout), "remote", "get-url", "origin"),
+        user=account,
+        env=env,
+    )
+    branch = _run(
+        ("/usr/bin/git", "-C", str(checkout), "symbolic-ref", "--short", "HEAD"),
+        user=account,
+        env=env,
+    )
+    if origin.stdout.strip() != remote or branch.stdout.strip() != PROBE_DEFAULT_BRANCH:
+        raise QualificationFailure("probe checkout origin or default branch is unexpected")
+    for key in ("name", "email"):
+        _require_success(
+            _run(
+                (
+                    "/usr/bin/git",
+                    "-C",
+                    str(checkout),
+                    "config",
+                    "--local",
+                    f"user.{key}",
+                    CANARY_GIT_IDENTITY[key],
+                ),
+                user=account,
+                env=env,
+            ),
+            f"probe checkout user.{key}",
+        )
+
+    _install_root_file(project_config, _render_project_config(name, checkout))
+    resolution = _run(
+        ("/opt/cortex/venv/bin/python", "-c", _PROBE_RESOLUTION_CODE, repository),
+        user=account,
+        env=_account_runtime_env(account),
+        timeout=60,
+    )
+    try:
+        _require_success(resolution, "installed runtime probe repository resolution")
+        records = _json_records(resolution.stdout)
+        resolved = records[-1] if records else None
+        if (
+            not isinstance(resolved, Mapping)
+            or resolved.get("resolved") != str(checkout)
+            or str(checkout) not in (resolved.get("workspaces") or [])
+        ):
+            raise QualificationFailure(
+                "installed runtime does not resolve the probe repository to its checkout"
+            )
+    except QualificationFailure:
+        project_config.unlink(missing_ok=True)
+        raise
+    _require_success(
+        _run(("systemctl", "restart", "cortex-monitor.service"), timeout=90),
+        "Monitor restart after probe registration",
+    )
+    _require_success(
+        _run(("systemctl", "is-active", "cortex-monitor.service")),
+        "Monitor active after probe registration",
+    )
+    return checkout
+
+
+def _probe_policy_version(checkout: Path) -> None:
+    """probe 的 `policy_version` 必須等於已安裝的 policy-check（引擎 --offline 會驗）。"""
+
+    from paulsha_cortex.project_policy import ProjectPolicyError, resolve_project_policy
+
+    try:
+        resolution = resolve_project_policy(checkout)
+    except ProjectPolicyError as exc:
+        raise QualificationFailure("probe project policy is unreadable") from exc
+    payload = resolution.payload if isinstance(resolution.payload, Mapping) else {}
+    declared = str(payload.get("policy_version") or "").strip()
+    expected = WHEELS["policy_check"]["version"]
+    if declared != expected:
+        raise QualificationFailure(
+            f"probe policy_version {declared!r} does not match installed policy-check {expected}"
+        )
+
+
+_PROBE_AUTHORITY_CODE = r"""
+import json
+import sys
+
+from paulsha_cortex.coordinator.claim import load_work_authority
+
+try:
+    authority = load_work_authority(repo=sys.argv[1], work_id=sys.argv[2])
+except ValueError as exc:
+    reason = getattr(exc, "reason_code", None) or str(exc)
+    print(json.dumps({"ok": False, "reason": str(reason)[:300]}))
+    raise SystemExit(0)
+print(json.dumps({
+    "ok": True,
+    "mapped_issues": list(authority.mapped_issues),
+    "mapped_openspec": list(authority.mapped_openspec),
+}))
+""".strip()
+
+
+def _wait_for_probe_authority(
+    *,
+    repository: str,
+    work_id: str,
+    issue: int,
+    timeout: int = PROBE_AUTHORITY_TIMEOUT_SECONDS,
+) -> None:
+    """等 Monitor snapshot 產生 intake 會採信的 confirmed authority 再進件。
+
+    判準就是 intake 自己用的 `load_work_authority()`（含 GitHub provider 的 durable
+    snapshot），而且 `--issue N` 必須已在 `mapped_issues`：intake 雖會寫 override link，
+    但同一次呼叫不會重新採信。
+    """
+
+    account = "cortex-manager"
+    deadline = time.monotonic() + timeout
+    last = "no Monitor snapshot yet"
+    while True:
+        result = _run(
+            ("/opt/cortex/venv/bin/python", "-c", _PROBE_AUTHORITY_CODE, repository, work_id),
+            user=account,
+            env=_account_runtime_env(account),
+            timeout=60,
+        )
+        records = _json_records(result.stdout)
+        state = records[-1] if records else None
+        if result.returncode != 0 or not isinstance(state, Mapping):
+            tail = (result.stderr.strip().splitlines() or [""])[-1][:200]
+            last = f"authority probe failed rc={result.returncode}: {tail}".rstrip(": ")
+        elif state.get("ok") is not True:
+            last = str(state.get("reason") or "authority unavailable")
+        elif issue not in (state.get("mapped_issues") or []):
+            last = (
+                f"issue #{issue} is not linked in .cortex/work-items.yaml on "
+                f"{PROBE_DEFAULT_BRANCH}"
+            )
+        else:
+            return
+        if time.monotonic() >= deadline:
+            raise QualificationFailure(
+                f"Monitor did not publish a confirmed {repository}/{work_id} authority "
+                f"within {timeout}s: {last}"
+            )
+        time.sleep(PROBE_AUTHORITY_POLL_SECONDS)
+
+
+def _prepare_probe_dispatch(
+    *,
+    receipt: Mapping[str, Any],
+    repository: str,
+    work_id: str,
+    issue: int,
+) -> None:
+    """intake 前的 probe 準備：遠端預檢 → 本機工具預檢 → clone／登記 → 等 authority。"""
+
+    if WORK_ID.fullmatch(work_id) is None or issue <= 0:
+        raise QualificationFailure("protected full-dispatch work identity is missing")
+    _probe_repository_prerequisites(repository, work_id, issue)
+    _probe_runtime_prerequisites()
+    checkout = _register_probe_checkout(receipt=receipt, repository=repository)
+    _probe_policy_version(checkout)
+    _wait_for_probe_authority(repository=repository, work_id=work_id, issue=issue)
+
+
 def _manager_uid() -> int:
     try:
         return pwd.getpwnam("cortex-manager").pw_uid
@@ -3742,6 +4227,21 @@ def _validate_canary_dispatch_model_identities(
         ) from exc
 
 
+def _dispatch_blocking_summary(terminal: object) -> str:
+    """把 `cortex work show --json` 的結構化 blocking reason 帶進失敗訊息。
+
+    例如 Manager 帳號對 private probe 請不到 Copilot review 時，review gate 逾時轉
+    needs_human；沒有這段，operator 只看得到一句 needs_human。
+    """
+
+    blocking = terminal.get("blocking_reason") if isinstance(terminal, Mapping) else None
+    if not isinstance(blocking, Mapping) or not blocking.get("reason"):
+        return ""
+    detail = str(blocking.get("detail") or "").replace("\n", " ").strip()[:300]
+    summary = f": {blocking.get('reason')}"
+    return f"{summary} ({detail})" if detail else summary
+
+
 def _full_dispatch(
     *,
     repository: str,
@@ -3817,6 +4317,7 @@ def _full_dispatch(
                 if "needs_human" in rendered or '"failed"' in rendered:
                     raise QualificationFailure(
                         "full dispatch reached a failed/needs_human terminal"
+                        + _dispatch_blocking_summary(terminal)
                     )
         time.sleep(10)
     else:
@@ -3946,6 +4447,12 @@ def main() -> int:
                 args.probe_repository, args.candidate_sha, args.evidence_dir
             )
             tests.append({"name": "manager-github-dry-run-push", "status": "passed"})
+            _prepare_probe_dispatch(
+                receipt=receipt,
+                repository=args.probe_repository,
+                work_id=args.probe_work_id,
+                issue=args.probe_issue,
+            )
             _full_dispatch(
                 repository=args.probe_repository,
                 work_id=args.probe_work_id,

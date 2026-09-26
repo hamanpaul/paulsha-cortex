@@ -55,6 +55,52 @@ TOOLCHAIN: Mapping[str, Mapping[str, str]] = {
     },
 }
 
+#: 部署 venv 需要、但不是 cortex 相依的 python 發行版（permgen
+#: `DEPLOYMENT_PYTHON_DISTRIBUTIONS`）。`policy-check` 是 ship preflight 的 backend
+#: （`PSC_PREFLIGHT_CMD` → `paulsha_cortex.preflight_ci` → `policy_check.preflight
+#: --offline`），版本必須逐字等於 probe `.project-policy.yml` 的 `policy_version`。
+#: 來源是 paulsha-conventions 該版 release workflow 發行的 cp312 runtime bundle：
+#: archive 與其中 wheel 各以 sha256 釘住，`release_commit` 等於 R-23 的 engine pin。
+#: workflow 以 `WHEEL_<NAME>_<FIELD>` 取用；wheel 放進 wheelhouse 後隨 bundle 進部署 venv，
+#: run.sh 的系統層安裝也涵蓋 Manager 以相對名 `python3 -m policy_check` 跑的 gate。
+WHEELS: Mapping[str, Mapping[str, str]] = {
+    "policy_check": {
+        "version": "1.0.17",
+        "release_commit": "9e7fabbf0b5eea9ad933fa6798764b723934a0b7",
+        "url": "https://github.com/hamanpaul/paulsha-conventions/releases/download/v1.0.17/paulsha-conventions-v1.0.17-cp312.tar.gz",
+        "sha256": "6e9e31e40e200509de244ba578f06cfce8d75325577cba3ecb23b830adc630e8",
+        "archive_path": "paulsha-conventions-v1.0.17/wheels/policy_check-1.0.17-py3-none-any.whl",
+        "wheel_sha256": "41cf79f49a354db9216e11ab4e3a1727e90afd1e6e56bf893cecce38274e66a4",
+    },
+}
+
+#: reference image 以 apt 釘版本安裝的系統層套件（Ubuntu 24.04 release pocket 的版本）。
+#: `qualification/Dockerfile` 逐字鏡射這張表（測試釘住）；driver 在 intake 前以 gate／
+#: Manager 身分驗證它們真的可用。
+#: - pytest（與它的三個 python 相依）：`PSC_GATE_CMD_PYTEST="python3 -m pytest -q"` 由
+#:   gate 身分以系統層 `/usr/bin/python3` 執行（permgen `SYSTEM_PYTHON_DISTRIBUTIONS`）。
+#: - universal-ctags：policy-check 帶 PR 上下文時 R-22 以 ctags 做 symbol 分析，缺它
+#:   policy 階段直接 RuntimeError（conventions runtime bundle 的 prerequisites 也列它）。
+IMAGE_APT_PINS: Mapping[str, str] = {
+    "python3-iniconfig": "1.1.1-2",
+    "python3-packaging": "24.0-1",
+    "python3-pluggy": "1.4.0-1",
+    "python3-pytest": "7.4.4-1",
+    "universal-ctags": "5.9.20210829.0-1",
+}
+
+#: probe gate 實際跑到的 pytest 上游版本（`python3 -m pytest --version`）。
+PROBE_GATE_PYTEST_VERSION = "7.4.4"
+
+#: probe checkout 的本地 git identity。容器 hostname 沒有網域，git 自動推導的 email 會是
+#: `<user>@<host>.(none)` 而拒絕 commit；`coordinator/seams.py` 把來源 repo 的本地
+#: `user.name`／`user.email` 複製進 per-job clone，Manager 的 archive commit 也在同一族
+#: checkout 上。`.invalid` 是 RFC 2606 保留網域，不會對應到任何真實帳號。
+CANARY_GIT_IDENTITY: Mapping[str, str] = {
+    "name": "Cortex deployment canary",
+    "email": "cortex-deployment-canary@example.invalid",
+}
+
 #: provider smoke 要求的 (model, effort) 與執行帳號；operator 2026-09-26 實測可用。
 #: codex 的 effort 另由 production `launcher._codex_default_effort()` 對同一模型發出，
 #: 兩者一致由測試釘住（此檔不能 import `paulsha_cortex`）。
@@ -148,13 +194,17 @@ def render_model_identity_overlay() -> str:
 
 
 def github_environment() -> dict[str, str]:
-    """把釘選的 toolchain 攤平成 GitHub Actions 環境變數（`TOOL_<NAME>_<FIELD>`）。"""
+    """把釘選的 toolchain／wheel 攤平成 GitHub Actions 環境變數。
+
+    toolchain 為 `TOOL_<NAME>_<FIELD>`，部署 venv 的額外 wheel 為 `WHEEL_<NAME>_<FIELD>`。
+    """
 
     values: dict[str, str] = {}
-    for name, row in TOOLCHAIN.items():
-        prefix = f"TOOL_{name.upper()}_"
-        for field, value in row.items():
-            values[prefix + field.upper()] = value
+    for kind, table in (("TOOL", TOOLCHAIN), ("WHEEL", WHEELS)):
+        for name, row in table.items():
+            prefix = f"{kind}_{name.upper()}_"
+            for field, value in row.items():
+                values[prefix + field.upper()] = value
     return values
 
 

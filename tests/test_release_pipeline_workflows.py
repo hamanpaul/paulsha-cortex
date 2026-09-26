@@ -12,8 +12,11 @@ import yaml
 from qualification.contract import (
     CANARY_BUILDER,
     CANARY_REVIEWER,
+    IMAGE_APT_PINS,
+    PROBE_GATE_PYTEST_VERSION,
     PROVIDERS,
     TOOLCHAIN,
+    WHEELS,
     canary_identity,
     github_environment,
     model_identity_overlay,
@@ -300,6 +303,15 @@ def test_qualification_toolchain_and_provider_models_have_one_workflow_source() 
                 assert f"$TOOL_{tool_name.upper()}_{field.upper()}" in raw
         for provider in PROVIDERS.values():
             assert provider["model_id"] not in raw
+        for wheel_name, wheel in WHEELS.items():
+            prefix = f"WHEEL_{wheel_name.upper()}_"
+            for field in ("url", "sha256", "wheel_sha256"):
+                assert wheel[field] not in raw, (name, wheel_name, field)
+            for field in ("url", "sha256", "archive_path", "wheel_sha256"):
+                assert f"${prefix}{field.upper()}" in raw, (name, wheel_name, field)
+    for wheel_name, wheel in WHEELS.items():
+        for field, value in wheel.items():
+            assert env[f"WHEEL_{wheel_name.upper()}_{field.upper()}"] == value
 
     dockerfile = (REPO_ROOT / "qualification" / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY contract.py /usr/local/libexec/qualification/contract.py" in dockerfile
@@ -355,6 +367,50 @@ def test_canary_model_identity_overlay_is_derived_from_provider_contract() -> No
     assert builder["capabilities"] == ["build"]
     assert {"planning", "review"} <= set(reviewer["capabilities"])
     assert builder["independence_domain"] != reviewer["independence_domain"]
+
+
+def test_reference_image_apt_pins_mirror_the_contract() -> None:
+    """#716：probe gate 的 pytest 與 R-22 的 ctags 以 apt 釘版本進 image，唯一真相在 contract。"""
+
+    dockerfile = (REPO_ROOT / "qualification" / "Dockerfile").read_text(encoding="utf-8")
+    pinned = dict(
+        re.findall(r"(?m)^\s+([a-z0-9][a-z0-9.+-]*)=(\S+)\s*\\?\s*$", dockerfile)
+    )
+    assert pinned == dict(IMAGE_APT_PINS)
+    assert IMAGE_APT_PINS["python3-pytest"].split("-", 1)[0] == PROBE_GATE_PYTEST_VERSION
+    assert "pip install" not in dockerfile.split("COPY", 1)[0]
+
+
+def test_policy_check_wheel_matches_probe_policy_and_engine_pin() -> None:
+    """#716：部署 venv 的 policy-check 必須等於 probe 的 policy_version（引擎 --offline 會驗）。"""
+
+    wheel = WHEELS["policy_check"]
+    version = wheel["version"]
+    probe_policy = yaml.safe_load(
+        (REPO_ROOT / "qualification" / "probe-template" / ".project-policy.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert str(probe_policy["policy_version"]) == version
+    assert probe_policy["conventions_engine"] == {"mode": "pip"}
+    assert f"/releases/download/v{version}/" in wheel["url"]
+    assert wheel["url"].endswith("-cp312.tar.gz")
+    assert re.fullmatch(
+        rf"paulsha-conventions-v{re.escape(version)}/wheels/"
+        rf"policy_check-{re.escape(version)}-py3-none-any\.whl",
+        wheel["archive_path"],
+    )
+    for field in ("sha256", "wheel_sha256"):
+        assert re.fullmatch(r"[0-9a-f]{64}", wheel[field])
+    cortex_policy = yaml.safe_load(
+        (REPO_ROOT / ".project-policy.yml").read_text(encoding="utf-8")
+    )
+    if str(cortex_policy["policy_version"]) == version:
+        policy_workflow = _load_workflow("policy-check.yml")
+        assert (
+            policy_workflow["jobs"]["policy"]["with"]["policy_engine_ref"]
+            == wheel["release_commit"]
+        )
 
 
 def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish() -> (

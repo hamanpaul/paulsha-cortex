@@ -3,6 +3,8 @@ FROM ubuntu:24.04
 ARG DEBIAN_FRONTEND=noninteractive
 ENV container=docker
 
+# `name=version` 的列逐字鏡射 qualification/contract.py 的 IMAGE_APT_PINS（測試釘住）：
+# probe gate 的系統層 pytest 與 policy-check R-22 需要的 universal-ctags。
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         acl \
@@ -15,12 +17,17 @@ RUN apt-get update \
         nodejs \
         polkitd \
         python3 \
+        python3-iniconfig=1.1.1-2 \
+        python3-packaging=24.0-1 \
         python3-pip \
+        python3-pluggy=1.4.0-1 \
+        python3-pytest=7.4.4-1 \
         python3-venv \
         socat \
         sudo \
         systemd \
         systemd-sysv \
+        universal-ctags=5.9.20210829.0-1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && systemctl mask \
