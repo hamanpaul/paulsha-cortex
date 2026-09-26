@@ -191,6 +191,21 @@ def _launch_template(
 ) -> dict[str, str]:
     """在完全受控的 seam 下跑一次 template 模式 launch，回傳現場路徑。"""
 
+    def prepare_prompt_spool_without_host_acl(directory: str, *, account=None) -> str:
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        target.chmod(0o710)
+        return str(target)
+
+    def write_prompt_without_host_acl(
+        prompt_path: str, prompt: str, *, account=None, max_bytes=None
+    ) -> str:
+        target = Path(prompt_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(prompt, encoding="utf-8")
+        target.chmod(0o600)
+        return str(target)
+
     original = launcher_module.subprocess.Popen
     launcher_module.subprocess.Popen = popen
     created = tempfile.TemporaryDirectory() if workdir is None else None
@@ -211,7 +226,33 @@ def _launch_template(
         with oauth_context as oauth_env:
             env = _template_env(spool_dir, **oauth_env, **(env_overrides or {}))
             with mock.patch.dict(os.environ, env, clear=True):
-                with _nested(_preflight_patches() if patches is None else patches):
+                launch_patches = (
+                    _preflight_patches() if patches is None else list(patches)
+                )
+                # This helper verifies generated template launch shape. Named
+                # ACL behavior is covered by dedicated spool tests; the supplied
+                # restricted worktree filesystem does not support setfacl.
+                launch_patches.append(
+                    mock.patch.object(launcher_module.spool_slot, "_apply_slot_acl")
+                )
+                # Prompt spool ACL semantics have dedicated tests. This helper
+                # only verifies template selection and generated launch shape.
+                launch_patches.extend(
+                    [
+                        mock.patch.object(job_runner, "_grant_prompt_traverse"),
+                        mock.patch.object(
+                            job_runner,
+                            "prepare_private_prompt_spool",
+                            side_effect=prepare_prompt_spool_without_host_acl,
+                        ),
+                        mock.patch.object(
+                            job_runner,
+                            "write_job_prompt",
+                            side_effect=write_prompt_without_host_acl,
+                        ),
+                    ]
+                )
+                with _nested(launch_patches):
                     launcher.launch(
                         slice_id=slice_id,
                         prompt="PROMPT",
@@ -577,6 +618,24 @@ class M2ExtensionPointTests(unittest.TestCase):
                     "YES",
                     stem,
                 )
+        for profile in permgen.HARDENING_PROFILES:
+            stem = permgen.job_unit_stem(
+                permgen.DEFAULT_LAYOUT,
+                Principal.BUILDER,
+                profile,
+                workspace_read_only=True,
+            )
+            self.assertEqual(
+                permgen.evaluate_polkit(
+                    rule,
+                    user=rule.subject_account,
+                    action_id=permgen.POLKIT_ACTION,
+                    unit=f"{stem}@readonly.service",
+                    verb="start",
+                ),
+                "YES",
+                stem,
+            )
         self.assertEqual(
             rule.target_accounts,
             ("cortex-builder", "cortex-reviewer-planner", "cortex-gate"),
@@ -835,6 +894,65 @@ class JobSpecContentTests(unittest.TestCase):
         self.assertTrue(argv[4].endswith(".service"))
         self.assertEqual(popen.call["cwd"], None)
         self.assertEqual(popen.call["stdin"], subprocess.DEVNULL)
+
+    def test_codex_template_launch_uses_outer_only_sandbox_argv(self) -> None:
+        """Only a prepared, hardened template plan selects the outer-only Codex argv."""
+
+        original_builder = launcher_module._ARGV_BUILDERS["codex"]
+        observed: dict[str, object] = {}
+        launched_argv: list[str] = []
+
+        def capture_builder(**kwargs):
+            observed.update(kwargs)
+            argv = original_builder(**kwargs)
+            launched_argv.extend(argv)
+            return argv
+
+        popen = _RecordingPopen()
+        with mock.patch.dict(
+            launcher_module._ARGV_BUILDERS, {"codex": capture_builder}
+        ), mock.patch.object(launcher_module.spool_slot, "_apply_slot_acl"):
+            _launch_template(SubprocessLauncher("codex").as_read_only(), popen=popen)
+
+        self.assertIs(observed.get("trust_root_outer_unit"), True)
+        self.assertTrue(
+            _unwrap_exit_recorder(popen.call["argv"])[4].startswith(
+                "cortex-reviewer-job-jit@"
+            )
+        )
+        self.assertEqual(
+            launched_argv[launched_argv.index("--sandbox") + 1],
+            "danger-full-access",
+        )
+        self.assertNotIn("--enable", launched_argv)
+        self.assertNotIn("use_legacy_landlock", launched_argv)
+
+    def test_reviewer_review_only_template_uses_reviewer_planner_identity(self) -> None:
+        popen = _RecordingPopen()
+        _launch_template(
+            SubprocessLauncher("codex").as_review_only(
+                terminal_kind="workflow-review-result"
+            ),
+            popen=popen,
+        )
+        argv = _unwrap_exit_recorder(popen.call["argv"])
+
+        self.assertTrue(argv[4].startswith("cortex-reviewer-job-jit@"), argv[4])
+
+    def test_write_forbidden_builder_uses_read_only_outer_template(self) -> None:
+        """Codex outer-only mode still needs a template with no writable worktree mount."""
+        popen = _RecordingPopen()
+        _launch_template(
+            SubprocessLauncher("codex").as_write_forbidden(), popen=popen
+        )
+        argv = _unwrap_exit_recorder(popen.call["argv"])
+
+        self.assertEqual(
+            argv[4],
+            "cortex-job-ro-jit@"
+            + job_runner.template_instance_id("psc-0042-template")
+            + ".service",
+        )
 
     def test_spec_never_carries_identity(self) -> None:
         """User 不在 spec 裡——它在 root-owned 的 unit 檔。"""
@@ -1243,7 +1361,12 @@ class NoRegressionTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d, mock.patch.dict(
                 os.environ, env, clear=True
             ):
-                with _nested(patches):
+                with _nested(
+                    [
+                        *patches,
+                        mock.patch.object(launcher_module.spool_slot, "_apply_slot_acl"),
+                    ]
+                ):
                     SubprocessLauncher("codex").launch(
                         slice_id="psc-0001-demo",
                         prompt="PROMPT",
@@ -1279,7 +1402,12 @@ class NoRegressionTests(unittest.TestCase):
                     os.environ,
                     _template_env(str(Path(d) / "job-specs")),
                     clear=True,
-                ), _nested(_preflight_patches()):
+                ), _nested(
+                    [
+                        *_preflight_patches(),
+                        mock.patch.object(launcher_module.spool_slot, "_apply_slot_acl"),
+                    ]
+                ):
                     Path(d, "job-specs").mkdir(parents=True, exist_ok=True)
                     launcher.launch(
                         slice_id="psc-0002-review",

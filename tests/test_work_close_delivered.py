@@ -122,6 +122,7 @@ def test_close_delivered_creates_completion_record_without_workflow_run(
 ) -> None:
     authority = _authority()
     remote_calls = []
+    canonical_checkout = tmp_path / "canonical"
 
     def fetch_remote_closure(self, **kwargs):
         remote_calls.append(kwargs)
@@ -130,6 +131,11 @@ def test_close_delivered_creates_completion_record_without_workflow_run(
         )
 
     monkeypatch.setattr(work_actions, "load_work_authority", lambda **_kwargs: authority)
+    monkeypatch.setattr(
+        work_actions,
+        "resolve_trusted_repo_root",
+        lambda _repo: canonical_checkout,
+    )
     monkeypatch.setattr(
         work_actions.GitHubDeliveryClient, "fetch_remote_closure", fetch_remote_closure
     )
@@ -170,6 +176,7 @@ def test_close_delivered_creates_completion_record_without_workflow_run(
             "change": "demo",
             "required_issues": (12,),
             "todo_paths": ("docs/todo.md",),
+            "canonical_checkout": canonical_checkout,
         },
         {
             "repo": REPO,
@@ -177,6 +184,7 @@ def test_close_delivered_creates_completion_record_without_workflow_run(
             "change": "demo",
             "required_issues": (12,),
             "todo_paths": ("docs/todo.md", ARCHIVED_TASKS),
+            "canonical_checkout": canonical_checkout,
         },
     ]
     assert registry.list_workflow_runs() == []
@@ -187,6 +195,11 @@ def test_close_delivered_fails_closed_when_remote_closure_is_incomplete(
 ) -> None:
     authority = _authority()
     monkeypatch.setattr(work_actions, "load_work_authority", lambda **_kwargs: authority)
+    monkeypatch.setattr(
+        work_actions,
+        "resolve_trusted_repo_root",
+        lambda _repo: tmp_path / "canonical",
+    )
     monkeypatch.setattr(
         work_actions.GitHubDeliveryClient,
         "fetch_remote_closure",
@@ -224,6 +237,11 @@ def test_close_delivered_refuses_a_work_item_with_any_workflow_run(
 ) -> None:
     authority = _authority()
     monkeypatch.setattr(work_actions, "load_work_authority", lambda **_kwargs: authority)
+    monkeypatch.setattr(
+        work_actions,
+        "resolve_trusted_repo_root",
+        lambda _repo: tmp_path / "canonical",
+    )
     run = SimpleNamespace(repo=REPO, work_id=WORK_ID, status="superseded")
 
     with pytest.raises(RuntimeError, match="requires a work item with no WorkflowRun"):
@@ -254,6 +272,11 @@ def test_close_delivered_refuses_incomplete_delivery_proof(
 ) -> None:
     authority = _authority()
     monkeypatch.setattr(work_actions, "load_work_authority", lambda **_kwargs: authority)
+    monkeypatch.setattr(
+        work_actions,
+        "resolve_trusted_repo_root",
+        lambda _repo: tmp_path / "canonical",
+    )
     monkeypatch.setattr(
         work_actions.GitHubDeliveryClient,
         "fetch_remote_closure",

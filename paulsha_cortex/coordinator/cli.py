@@ -6,6 +6,12 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from paulsha_cortex.recovery_action_contracts import (
+    RECOVERY_EXPECTED_CANDIDATE_ACTIONS,
+    RECOVER_SLICE_ACTION_CHOICES,
+    WORK_ACTION_CHOICES,
+)
+
 from . import autonomy, broker_reaper, engineering_outcome
 from .launcher import _ARGV_BUILDERS, AgentLauncher, SubprocessLauncher
 from .registry import JobRegistry
@@ -217,7 +223,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_slice_action = sub.add_parser("slice-action", help="對需要處置的 slice 送出本機 action")
     p_slice_action.add_argument("slice_id")
-    p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"])
+    p_slice_action.add_argument("action", choices=RECOVER_SLICE_ACTION_CHOICES)
     p_slice_action.add_argument("--actor", required=True)
     p_slice_action.add_argument("--reason", default=None, help="supersede 的單行稽核理由")
     p_slice_action.add_argument(
@@ -240,17 +246,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work = sub.add_parser("work", help="透過 manager daemon 執行 work lifecycle mutation")
     p_work.add_argument(
         "action",
-        choices=[
-            "link", "unlink", "start", "resume", "retry-build", "retry-card",
-            "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
-            "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
-            "close-delivered",
-            "recover-superseded",
-            "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
-            "verify-attest",
-            "review-disposition",
-            "intake",
-        ],
+        choices=WORK_ACTION_CHOICES,
     )
     p_work.add_argument("work_id")
     p_work.add_argument("--repo", required=True)
@@ -269,7 +265,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_work.add_argument(
         "--expected-candidate",
-        help="verify-attest 專用：exact Candidate SHA CAS",
+        help=(
+            "retry-build／retry-verify／retry-review／recover-repair-commit／"
+            "verify-attest 專用：exact Candidate SHA CAS"
+        ),
     )
     p_work.add_argument(
         "--card",
@@ -478,8 +477,9 @@ def main(
                 file=sys.stderr,
             )
             return 2
-        if args.action != "verify-attest" and args.expected_candidate is not None:
-            print("錯誤: --expected-candidate 僅供 verify-attest 使用。", file=sys.stderr)
+        candidate_actions = RECOVERY_EXPECTED_CANDIDATE_ACTIONS | {"verify-attest"}
+        if args.action not in candidate_actions and args.expected_candidate is not None:
+            print("錯誤: --expected-candidate 不適用於此 work action。", file=sys.stderr)
             return 2
         if args.action == "close-delivered" and (args.actor is None or args.reason is None):
             print("錯誤: close-delivered 必須提供 --actor 與 --reason。", file=sys.stderr)
@@ -511,6 +511,9 @@ def main(
             request_args["expected_run_id"] = args.expected_run_id
         if args.action == "verify-attest":
             request_args["expected_candidate"] = args.expected_candidate
+        elif args.action in RECOVERY_EXPECTED_CANDIDATE_ACTIONS:
+            if args.expected_candidate is not None:
+                request_args["expected_candidate"] = args.expected_candidate
         if args.card is not None:
             request_args["card"] = args.card
         if args.reason is not None:
@@ -534,6 +537,18 @@ def main(
             if protected & set(extra):
                 print("錯誤: work payload cannot override action/repo/work_id", file=sys.stderr)
                 return 2
+            if (
+                args.action in RECOVERY_EXPECTED_CANDIDATE_ACTIONS
+                and args.expected_candidate is not None
+                and "expected_candidate" in extra
+            ):
+                if extra["expected_candidate"] != args.expected_candidate:
+                    print(
+                        "錯誤: --expected-candidate 與 payload expected_candidate 不一致。",
+                        file=sys.stderr,
+                    )
+                    return 2
+                del extra["expected_candidate"]
             request_args.update(extra)
         if args.action == "retry-build" and "expected_run_id" in request_args:
             print(

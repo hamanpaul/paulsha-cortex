@@ -2354,6 +2354,7 @@ def _completion_draft(
     candidate: str,
     pr_number: int,
     foreign_ref,
+    canonical_checkout: str | Path,
     runner,
     now,
 ) -> Path | None:
@@ -2415,6 +2416,7 @@ def _completion_draft(
         change=change,
         required_issues=authority.mapped_issues,
         todo_paths=authority.mapped_todo_paths,
+        canonical_checkout=canonical_checkout,
     )
     default_branch = github.fetch_default_branch(repo=authority.repo)
     by_kind: dict[str, list[str]] = {"spec": [], "plan": []}
@@ -2881,6 +2883,7 @@ def build_production_ship_validator(
             candidate=candidate,
             pr_number=number,
             foreign_ref=foreign[0],
+            canonical_checkout=worktree,
             runner=runner,
             now=now,
         )

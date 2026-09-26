@@ -14,6 +14,14 @@ from typing import Any, Sequence
 from paulsha_cortex.config.runtime import resolve_runtime_root
 from paulsha_cortex.control import constants
 from paulsha_cortex.deploy import installer
+from paulsha_cortex.runtime_attestation import (
+    artifact_identity,
+    cli_runtime_observation,
+    manager_environment_revision,
+    monitor_configuration_revision_from_environment,
+    runtime_status_report,
+    service_declaration_projection,
+)
 
 from . import COMMANDS, PorcelainCommand, register
 from ._runtime_probe import probe_service_runtime
@@ -50,7 +58,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ("start", "啟動 manager service/timer"),
         ("stop", "停止 manager service/timer"),
         ("restart", "重啟 manager service/timer"),
-        ("status", "顯示 service runtime 狀態"),
+        ("status", "顯示 service runtime 與已載入 artifact/config 身分"),
     ):
         cmd = sub.add_parser(command_name, help=help_text)
         cmd.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
@@ -296,23 +304,151 @@ def _read_lock_payload(instance: str | None = None) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _unit_pid(units: Any, service_name: str) -> int | None:
+    if not isinstance(units, dict):
+        return None
+    row = units.get(service_name)
+    if not isinstance(row, dict):
+        return None
+    pid = row.get("pid")
+    return pid if type(pid) is int else None
+
+
+def _unknown_runtime_report(reason: str, current_artifact: dict[str, object]) -> dict[str, object]:
+    is_installed = current_artifact.get("kind") == "installed-wheel"
+    return {
+        "status": "unknown",
+        "reason": reason,
+        "loaded": None,
+        "installed_artifact": current_artifact if is_installed else {
+            "kind": "unknown",
+            "package": current_artifact.get("package"),
+            "package_version": "unknown",
+            "source_revision": "unknown",
+            "sha256": None,
+        },
+        "current_artifact": current_artifact,
+        "comparison": {
+            "status": "unknown",
+            "reason": reason,
+            "artifact_status": "unknown",
+            "config_status": "unknown",
+            "transition_disposition": "unknown-in-flight-state",
+            "transition_safe": False,
+        },
+        "initial_config_revision": None,
+        "effective_config_revision": None,
+        "previous_process_start": None,
+        "trust_root": {"status": "unknown"},
+    }
+
+
+def _loaded_runtime_payload(
+    instance: str,
+    *,
+    manager_pid: int | None,
+    monitor_pid: int | None,
+    units: Any = None,
+) -> dict[str, object]:
+    environment = _fallback_environment(instance)
+    current_artifact = artifact_identity()
+    operator_cli = cli_runtime_observation(
+        instance=instance,
+        environment=os.environ,
+        artifact=current_artifact,
+    )
+    unit_rows = units if isinstance(units, dict) else {}
+    service_declaration = service_declaration_projection(
+        unit_rows, instance=instance
+    )
+    manager_artifact = service_declaration["manager"].get("artifact")
+    monitor_artifact = service_declaration["monitor"].get("artifact")
+    try:
+        manager_root = resolve_runtime_root(
+            "PSC_COORDINATOR_ROOT", environment=environment
+        )
+        monitor_root = resolve_runtime_root(
+            "PSC_MONITOR_STATE_ROOT", environment=environment
+        )
+        manager_report = runtime_status_report(
+            manager_root,
+            service="manager",
+            instance=instance,
+            declared_config_revision=manager_environment_revision(environment),
+            declared_config_component="environment_revision",
+            declared_invocation_revision=None,
+            expected_pid=manager_pid,
+            require_process_match=True,
+            current_artifact=(
+                manager_artifact if isinstance(manager_artifact, dict) else None
+            ),
+        )
+        monitor_report = runtime_status_report(
+            monitor_root,
+            service="monitor",
+            instance=instance,
+            declared_config_revision=monitor_configuration_revision_from_environment(
+                environment
+            ),
+            expected_pid=monitor_pid,
+            require_process_match=True,
+            current_artifact=(
+                monitor_artifact if isinstance(monitor_artifact, dict) else None
+            ),
+        )
+    except Exception:  # noqa: BLE001 — 無效宣告時維持 unknown。
+        unknown = _unknown_runtime_report("runtime-declaration-unavailable", current_artifact)
+        return {
+            "operator_cli": operator_cli,
+            "service_declaration": service_declaration,
+            "manager": unknown,
+            "monitor": unknown,
+        }
+    return {
+        "operator_cli": operator_cli,
+        "service_declaration": service_declaration,
+        "manager": manager_report,
+        "monitor": monitor_report,
+    }
+
+
 def _status_payload(instance: str) -> dict[str, Any]:
     probe = probe_service_runtime(instance)
     if probe["mode"] == "systemd":
         units = probe.get("units", {})
         manager_service = f"{instance}-manager.service"
+        monitor_service = f"{instance}-monitor.service"
         payload = dict(probe)
         payload["pid"] = units.get(manager_service, {}).get("pid")
         payload["env"] = _env_summary(instance)
+        payload["loaded_runtime"] = _loaded_runtime_payload(
+            instance,
+            manager_pid=_unit_pid(units, manager_service),
+            monitor_pid=_unit_pid(units, monitor_service),
+            units=units,
+        )
         return payload
     fallback = _fallback_runtime(instance, str(probe.get("version", "0.0.0+unknown")), probe.get("units", {}))
     if fallback is not None:
+        units = fallback.get("units", {})
+        fallback["loaded_runtime"] = _loaded_runtime_payload(
+            instance,
+            manager_pid=fallback.get("pid") if type(fallback.get("pid")) is int else None,
+            monitor_pid=_unit_pid(units, f"{instance}-monitor.service"),
+            units=units,
+        )
         return fallback
     return {
         "instance": instance,
         "mode": "none",
         "version": probe.get("version", "0.0.0+unknown"),
         "units": probe.get("units", {}),
+        "loaded_runtime": _loaded_runtime_payload(
+            instance,
+            manager_pid=-1,
+            monitor_pid=-1,
+            units=probe.get("units", {}),
+        ),
         "suggested_commands": [f"cortex service install --instance {instance}"],
     }
 
@@ -606,6 +742,13 @@ def _print_status(service: dict[str, Any]) -> None:
     env = service.get("env")
     if isinstance(env, dict):
         sys.stdout.write("env: " + json.dumps(env, ensure_ascii=False, sort_keys=True) + "\n")
+    loaded_runtime = service.get("loaded_runtime")
+    if isinstance(loaded_runtime, dict):
+        sys.stdout.write(
+            "loaded_runtime: "
+            + json.dumps(loaded_runtime, ensure_ascii=False, sort_keys=True)
+            + "\n"
+        )
     log_path = service.get("log_path")
     if isinstance(log_path, str):
         sys.stdout.write(f"log_path: {log_path}\n")

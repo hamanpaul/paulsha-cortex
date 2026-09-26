@@ -5061,6 +5061,8 @@ class JobRegistry:
         frozen_readiness: dict[str, Any] | None = None,
         model_chain_override: dict[str, dict[str, str]] | None = None,
         resolved_model_chain: dict[str, dict[str, str]] | None = None,
+        execution_profile_bindings: dict[str, dict[str, Any]] | None = None,
+        model_qualification: dict[str, str] | None = None,
         combo_selection: dict[str, Any] | None = None,
         needs_human_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> WorkflowRun:
@@ -5176,6 +5178,16 @@ class JobRegistry:
                 current.resolved_model_chain
                 if resolved_model_chain is None
                 else resolved_model_chain
+            ),
+            execution_profile_bindings=(
+                current.execution_profile_bindings
+                if execution_profile_bindings is None
+                else execution_profile_bindings
+            ),
+            model_qualification=(
+                current.model_qualification
+                if model_qualification is None
+                else model_qualification
             ),
             combo_selection=(
                 current.combo_selection if combo_selection is None else combo_selection
@@ -6166,6 +6178,96 @@ class JobRegistry:
             needs_human_reason=None,
             gate_status="running",
             retry_classification="authority_restart",
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_recover_superseded_workflow_run(
+        self,
+        run_id: str,
+        *,
+        expected_run: WorkflowRun,
+        authority_digest: str,
+        evidence_ref: str,
+        evidence_hash: str,
+    ) -> WorkflowRun:
+        """Atomically recover one delivered superseded run for current authority.
+
+        This is the superseded-only counterpart to
+        ``_manager_reset_workflow_for_authority_restart``. Restoring status,
+        invalidating authority-sensitive gates, and binding the content-addressed
+        operator audit reference are persisted by one existing revision CAS.
+        """
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if current != expected_run:
+            raise ValueError("recover-superseded snapshot mismatch")
+        if current.status != "superseded":
+            raise ValueError("recover-superseded requires superseded workflow")
+        if current.current_phase not in {"verify", "review"}:
+            raise ValueError("recover-superseded requires verify/review workflow")
+        if not current.candidate_head or not current.pr_refs:
+            raise ValueError("recover-superseded requires delivered candidate and PR refs")
+        if any(
+            run.repo == current.repo
+            and run.work_id == current.work_id
+            and run.run_id != current.run_id
+            and run.status == "ongoing"
+            for run in self._workflows
+        ):
+            raise ValueError("recover-superseded refuses another ongoing workflow")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("recover-superseded refuses active workflow job")
+        if (
+            not isinstance(authority_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", authority_digest) is None
+        ):
+            raise ValueError("recover-superseded requires exact authority digest")
+        if (
+            not isinstance(evidence_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", evidence_hash) is None
+            or not isinstance(evidence_ref, str)
+            or Path(evidence_ref).name != f"{current.run_id}-{evidence_hash}.json"
+        ):
+            raise ValueError("recover-superseded requires content-addressed audit evidence")
+
+        updated = replace(
+            current,
+            status="ongoing",
+            current_phase="verify",
+            steps=tuple(
+                replace(step, gate_result="pending")
+                if step.phase in {"verify", "review"}
+                else step
+                for step in current.steps
+            ),
+            attempts={
+                **current.attempts,
+                "verify": current.attempts.get("verify", 0) + 1,
+            },
+            gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            claim_key=claim_key_for_authority_digest(
+                repo=current.repo,
+                work_id=current.work_id,
+                authority_digest=authority_digest,
+            ),
+            source_revision=authority_digest,
+            verified_head=None,
+            facets=tuple(
+                facet for facet in current.facets
+                if facet not in {"blocked", "needs_human"}
+            ),
+            needs_human_reason=None,
+            gate_status="running",
+            retry_classification="authority_restart",
+            evidence_refs=tuple(dict.fromkeys((*current.evidence_refs, evidence_ref))),
             updated_at=_now_iso(),
         )
         self._workflows[index] = updated

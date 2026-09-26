@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import base64
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -159,6 +161,100 @@ class FakeRunner:
         raise AssertionError(f"unexpected argv: {argv}")
 
 
+def _git(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _closure_repositories(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
+    bare = tmp_path / "origin.git"
+    checkout = tmp_path / "canonical"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(bare)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(checkout)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    _git(checkout, "config", "user.name", "Closure Test")
+    _git(checkout, "config", "user.email", "closure@example.invalid")
+    (checkout / "docs").mkdir()
+    (checkout / "docs" / "todo.md").write_text("- [x] initial\n", encoding="utf-8")
+    archived = checkout / "openspec/changes/archive/2026-07-17-unified-work-lifecycle"
+    archived.mkdir(parents=True)
+    (archived / "tasks.md").write_text("- [x] archived\n", encoding="utf-8")
+    _git(checkout, "add", ".")
+    _git(checkout, "commit", "-m", "base")
+    _git(checkout, "checkout", "-b", "feature/closure-test")
+    (checkout / "README.md").write_text("closure candidate\n", encoding="utf-8")
+    _git(checkout, "add", "README.md")
+    _git(checkout, "commit", "-m", "PR head")
+    pr_head = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "checkout", "main")
+    _git(checkout, "merge", "--no-ff", "feature/closure-test", "-m", "merge PR")
+    merge_commit = _git(checkout, "rev-parse", "HEAD")
+    _git(checkout, "remote", "add", "origin", str(bare))
+    _git(checkout, "push", "-u", "origin", "main")
+
+    writer = tmp_path / "remote-writer"
+    subprocess.run(
+        ["git", "clone", str(bare), str(writer)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    _git(writer, "config", "user.name", "Closure Test")
+    _git(writer, "config", "user.email", "closure@example.invalid")
+    (writer / "docs" / "todo.md").write_text("- [x] complete\n", encoding="utf-8")
+    _git(writer, "commit", "-am", "advance default branch")
+    _git(writer, "push", "origin", "main")
+    default_head = _git(writer, "rev-parse", "HEAD")
+    todo_revision = _git(writer, "rev-parse", f"{default_head}:docs/todo.md")
+    return checkout, bare, {
+        "pr_head": pr_head,
+        "merge_commit": merge_commit,
+        "default_head": default_head,
+        "todo_revision": todo_revision,
+    }
+
+
+class ClosureRunner:
+    def __init__(self, facts: dict[str, str]):
+        self.facts = facts
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((list(argv), kwargs))
+        if argv[:1] == ["git"]:
+            return subprocess.run(argv, **kwargs)
+        endpoint = argv[-1]
+        if endpoint == "repos/acme/demo/pulls/7":
+            return Result(
+                {
+                    "head": {"sha": self.facts["pr_head"]},
+                    "merged_at": "2026-07-17T00:00:00Z",
+                    "merge_commit_sha": self.facts["merge_commit"],
+                }
+            )
+        if endpoint == "repos/acme/demo":
+            return Result({"default_branch": "main"})
+        if endpoint == "repos/acme/demo/git/ref/heads/main":
+            return Result({"object": {"sha": self.facts["default_head"]}})
+        if endpoint == "repos/acme/demo/issues/14":
+            return Result({"state": "closed"})
+        raise AssertionError(f"unexpected API endpoint: {endpoint}")
+
+
 def test_fetch_delivery_facts_uses_authenticated_typed_gh_api() -> None:
     runner = FakeRunner()
     facts = GitHubDeliveryClient(runner=runner).fetch_delivery_facts(
@@ -219,38 +315,104 @@ def test_fetch_delivery_facts_uses_latest_legacy_status_per_context() -> None:
     assert legacy_checks[0].terminal_green
 
 
-def test_fetch_remote_closure_verifies_merge_ancestor_issues_and_archive() -> None:
-    runner = FakeRunner()
+def test_fetch_remote_closure_verifies_merge_ancestor_issues_and_archive(
+    tmp_path: Path,
+) -> None:
+    checkout, _bare, expected = _closure_repositories(tmp_path)
+    runner = ClosureRunner(expected)
     facts = GitHubDeliveryClient(runner=runner).fetch_remote_closure(
         repo="acme/demo",
         pr_number=7,
         change="unified-work-lifecycle",
         required_issues=(14,),
         todo_paths=("docs/todo.md",),
+        canonical_checkout=checkout,
     )
-    assert facts.merge_commit == MERGE
+    assert facts.merge_commit == expected["merge_commit"]
     assert facts.merge_is_ancestor
     assert facts.merge_is_merge_commit
+    assert expected["pr_head"] in facts.merge_parents
     assert facts.issue_states == {14: "closed"}
     assert facts.archive_present
     assert facts.todo_complete
-    assert facts.default_head == DEFAULT_HEAD
-    assert facts.todo_revisions == {"docs/todo.md": "f" * 40}
+    assert facts.default_head == expected["default_head"]
+    assert facts.todo_revisions == {"docs/todo.md": expected["todo_revision"]}
     assert not facts.completion_record_valid
+    endpoints = [argv[-1] for argv, _kwargs in runner.calls if argv[:2] == ["gh", "api"]]
+    assert not any(
+        "/compare/" in endpoint
+        or "/git/commits/" in endpoint
+        or "/git/trees/" in endpoint
+        or "/contents/" in endpoint
+        for endpoint in endpoints
+    )
+    git_args = [argv[3:] for argv, _kwargs in runner.calls if argv[:1] == ["git"]]
+    assert any(args[:1] == ["fetch"] for args in git_args)
+    assert any(args[:2] == ["merge-base", "--is-ancestor"] for args in git_args)
+    assert any(args[:4] == ["ls-tree", "-r", "-t", "-z"] for args in git_args)
+    assert any(args[:2] == ["show", "-s"] for args in git_args)
 
 
-def test_fetch_remote_closure_treats_openspec_as_optional_when_change_is_none() -> None:
-    facts = GitHubDeliveryClient(runner=FakeRunner()).fetch_remote_closure(
+def test_fetch_remote_closure_treats_openspec_as_optional_when_change_is_none(
+    tmp_path: Path,
+) -> None:
+    checkout, _bare, expected = _closure_repositories(tmp_path)
+    facts = GitHubDeliveryClient(runner=ClosureRunner(expected)).fetch_remote_closure(
         repo="acme/demo",
         pr_number=7,
         change=None,
         required_issues=(14,),
         todo_paths=("docs/todo.md",),
+        canonical_checkout=checkout,
     )
 
     assert facts.active_openspec_absent
     assert facts.archive_present
     assert facts.openspec_required is False
+
+
+def test_fetch_remote_closure_fails_with_diagnostic_without_canonical_checkout(
+    tmp_path: Path,
+) -> None:
+    _checkout, _bare, expected = _closure_repositories(tmp_path)
+
+    with pytest.raises(RuntimeError, match="canonical checkout.*unavailable"):
+        GitHubDeliveryClient(runner=ClosureRunner(expected)).fetch_remote_closure(
+            repo="acme/demo",
+            pr_number=7,
+            change="unified-work-lifecycle",
+            required_issues=(14,),
+            todo_paths=("docs/todo.md",),
+            canonical_checkout=tmp_path / "missing",
+        )
+
+
+def test_fetch_remote_closure_fails_closed_for_shallow_checkout_without_unshallow(
+    tmp_path: Path,
+) -> None:
+    _checkout, bare, expected = _closure_repositories(tmp_path)
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "--depth=1", bare.as_uri(), str(shallow)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    runner = ClosureRunner(expected)
+
+    with pytest.raises(RuntimeError, match="shallow"):
+        GitHubDeliveryClient(runner=runner).fetch_remote_closure(
+            repo="acme/demo",
+            pr_number=7,
+            change="unified-work-lifecycle",
+            required_issues=(14,),
+            todo_paths=("docs/todo.md",),
+            canonical_checkout=shallow,
+        )
+
+    git_args = [argv[3:] for argv, _kwargs in runner.calls if argv[:1] == ["git"]]
+    assert any(args[:1] == ["fetch"] for args in git_args)
+    assert not any("--unshallow" in args for args in git_args)
 
 
 def test_fetch_merge_status_binds_merged_side_effect_to_exact_pr_head() -> None:

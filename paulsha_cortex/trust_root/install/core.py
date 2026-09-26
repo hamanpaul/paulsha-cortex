@@ -725,6 +725,17 @@ def _generated_inventory(
                     profile=profile,
                 )
             )
+            if principal is permgen.Principal.BUILDER:
+                units.append(
+                    permgen.build_job_unit(
+                        scheme,
+                        layout,
+                        principal=principal,
+                        plan=permission_plan,
+                        profile=profile,
+                        workspace_read_only=True,
+                    )
+                )
     unit_inventory = {
         unit.unit_name: _artifact_dict(
             content=unit.content,

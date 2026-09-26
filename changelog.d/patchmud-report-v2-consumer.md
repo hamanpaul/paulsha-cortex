@@ -1,0 +1,1 @@
+PatchMUD report consumer 改以 role、execution-profile key、benchmark、deck digest 與 evaluator revision 完整查詢 schema v2 榜列。Report v1 僅 opaque 保留、不進排名；未知版本 fail-closed。Cortex evaluated-roster schema v2 將核可綁定 report role 與 execution profile，並保留 v1 roster 讀取。

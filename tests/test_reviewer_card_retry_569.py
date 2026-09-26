@@ -786,6 +786,48 @@ def test_forced_retry_dispatches_a_new_reviewer_job_with_a_re_resolved_identity(
     assert "verification" in sink[0][0]
 
 
+def test_frozen_same_domain_reviewer_pin_fails_before_any_job_or_launcher(
+    tmp_path: Path,
+) -> None:
+    """凍結的 reviewer pin 不得為 fallback 靜默改寫或啟動同域 job。"""
+
+    override = {"reviewer": {"executor": "codex", "model_id": "gpt-primary"}}
+    _, registry, run, _old_job_id = _stuck_reviewer_run(
+        tmp_path,
+        card="code-review",
+        phase="review",
+        model_chain_override=override,
+        with_git=True,
+    )
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": BUILDER_DOMAIN,
+                "capabilities": ["build", "review"],
+            }
+        ]
+    )
+    before_jobs = [dict(row) for row in registry.list_jobs()]
+    launcher_calls: list[str] = []
+
+    with pytest.raises(ValueError, match="independence_domain 與 builder 相同"):
+        manager.dispatch_workflow_card(
+            type("D", (), {"_registry": registry, "_git_runner": None})(),
+            run=registry.get_workflow_run(run.run_id),
+            identities=identities,
+            launcher_factory=lambda identity: launcher_calls.append(identity.executor)
+            or _ReviewLauncher([]),
+            coordinator_root=tmp_path / "coordinator",
+            force_new_card=True,
+        )
+
+    assert registry.list_jobs() == before_jobs
+    assert launcher_calls == []
+    assert registry.get_workflow_run(run.run_id).model_chain_override == override
+
+
 def test_forced_retry_recycles_the_superseded_reviewer_sandbox(tmp_path: Path) -> None:
     """forced retry 仍須回收升級前不含 job id 的 legacy sandbox。"""
 

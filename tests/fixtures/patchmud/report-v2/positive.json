@@ -1,0 +1,1601 @@
+{
+  "generated_at": "2026-09-26T00:00:00Z",
+  "leaderboards": {
+    "clear_rate": {
+      "rows": [
+        {
+          "benchmark_type": "issue-resolution",
+          "clears": 1,
+          "cohort_id": "cohort:c3aca8efb7c1319fb340fba05ce45a4adde07c3ccc9e5d2e4a5bc10c4203bc67",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:fixer",
+          "profile_id": "epk:v1:resolved:8cd31f33deaa7a0c1b9be2d64278b31dc44f91450e43bb8f53f539d1587ee0f9",
+          "ranked": true,
+          "reason": "",
+          "role": "builder",
+          "runs": 1,
+          "value": 1.0
+        },
+        {
+          "benchmark_type": "issue-resolution",
+          "clears": 0,
+          "cohort_id": "cohort:ac2f712d40747bdc296446e1f284876ec8521dcfeeffaab263f56d49e4a8af47",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:quitter",
+          "profile_id": "epk:v1:resolved:b06beb774b26ab9f4a541997a75e589b914d294a4c92341befa3247826388bfa",
+          "ranked": true,
+          "reason": "",
+          "role": "builder",
+          "runs": 1,
+          "value": 0.0
+        }
+      ],
+      "status": "ok"
+    },
+    "control": {
+      "rows": [
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:ac2f712d40747bdc296446e1f284876ec8521dcfeeffaab263f56d49e4a8af47",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:quitter",
+          "profile_id": "epk:v1:resolved:b06beb774b26ab9f4a541997a75e589b914d294a4c92341befa3247826388bfa",
+          "ranked": true,
+          "reason": "",
+          "role": "builder",
+          "runs": 1,
+          "tau_uncalibrated": true,
+          "value": 100.0
+        },
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:c3aca8efb7c1319fb340fba05ce45a4adde07c3ccc9e5d2e4a5bc10c4203bc67",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:fixer",
+          "profile_id": "epk:v1:resolved:8cd31f33deaa7a0c1b9be2d64278b31dc44f91450e43bb8f53f539d1587ee0f9",
+          "ranked": true,
+          "reason": "",
+          "role": "builder",
+          "runs": 1,
+          "tau_uncalibrated": true,
+          "value": 100.0
+        }
+      ],
+      "status": "ok"
+    },
+    "cost_per_clear": {
+      "rows": [
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:ac2f712d40747bdc296446e1f284876ec8521dcfeeffaab263f56d49e4a8af47",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:quitter",
+          "profile_id": "epk:v1:resolved:b06beb774b26ab9f4a541997a75e589b914d294a4c92341befa3247826388bfa",
+          "ranked": false,
+          "reason": "未提供 --pricing snapshot，無法對 pin 的 hash 計價",
+          "role": "builder",
+          "value": "NA"
+        },
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:c3aca8efb7c1319fb340fba05ce45a4adde07c3ccc9e5d2e4a5bc10c4203bc67",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:fixer",
+          "profile_id": "epk:v1:resolved:8cd31f33deaa7a0c1b9be2d64278b31dc44f91450e43bb8f53f539d1587ee0f9",
+          "ranked": false,
+          "reason": "未提供 --pricing snapshot，無法對 pin 的 hash 計價",
+          "role": "builder",
+          "value": "NA"
+        }
+      ],
+      "status": "ok"
+    },
+    "eutb": {
+      "reason": "EuTB registered 預算檔無法讀取：analysis/registered/eutb_budget.yaml（[Errno 2] No such file or directory: 'analysis/registered/eutb_budget.yaml'）",
+      "status": "skipped"
+    },
+    "ftr": {
+      "rows": [
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:ac2f712d40747bdc296446e1f284876ec8521dcfeeffaab263f56d49e4a8af47",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "flood_create_tokens": 0,
+          "flood_repair_tokens": 0,
+          "loadout": "P0T0R0",
+          "model": "scripted:quitter",
+          "profile_id": "epk:v1:resolved:b06beb774b26ab9f4a541997a75e589b914d294a4c92341befa3247826388bfa",
+          "ranked": true,
+          "reason": "",
+          "role": "builder",
+          "runs": 1,
+          "value": 0.0
+        },
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:c3aca8efb7c1319fb340fba05ce45a4adde07c3ccc9e5d2e4a5bc10c4203bc67",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "flood_create_tokens": 0,
+          "flood_repair_tokens": 0,
+          "loadout": "P0T0R0",
+          "model": "scripted:fixer",
+          "profile_id": "epk:v1:resolved:8cd31f33deaa7a0c1b9be2d64278b31dc44f91450e43bb8f53f539d1587ee0f9",
+          "ranked": true,
+          "reason": "",
+          "role": "builder",
+          "runs": 1,
+          "value": 0.0
+        }
+      ],
+      "status": "ok"
+    },
+    "power": {
+      "rows": [
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:c3aca8efb7c1319fb340fba05ce45a4adde07c3ccc9e5d2e4a5bc10c4203bc67",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:fixer",
+          "profile_id": "epk:v1:resolved:8cd31f33deaa7a0c1b9be2d64278b31dc44f91450e43bb8f53f539d1587ee0f9",
+          "ranked": true,
+          "reason": "",
+          "role": "builder",
+          "runs": 1,
+          "value": 100.0
+        },
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:ac2f712d40747bdc296446e1f284876ec8521dcfeeffaab263f56d49e4a8af47",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:quitter",
+          "profile_id": "epk:v1:resolved:b06beb774b26ab9f4a541997a75e589b914d294a4c92341befa3247826388bfa",
+          "ranked": true,
+          "reason": "",
+          "role": "builder",
+          "runs": 1,
+          "value": 20.0
+        }
+      ],
+      "status": "ok"
+    },
+    "qaty": {
+      "non_ranking": false,
+      "rows": [
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:c3aca8efb7c1319fb340fba05ce45a4adde07c3ccc9e5d2e4a5bc10c4203bc67",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "disclosure_cohort": "full",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:fixer",
+          "non_ranking": false,
+          "observable": 1124.859392575928,
+          "profile_id": "epk:v1:resolved:8cd31f33deaa7a0c1b9be2d64278b31dc44f91450e43bb8f53f539d1587ee0f9",
+          "role": "builder",
+          "value": 1124.859392575928
+        },
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:ac2f712d40747bdc296446e1f284876ec8521dcfeeffaab263f56d49e4a8af47",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "disclosure_cohort": "full",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:quitter",
+          "non_ranking": false,
+          "observable": 0.0,
+          "profile_id": "epk:v1:resolved:b06beb774b26ab9f4a541997a75e589b914d294a4c92341befa3247826388bfa",
+          "role": "builder",
+          "value": 0.0
+        }
+      ],
+      "status": "ok"
+    },
+    "tokens_per_clear": {
+      "non_ranking": false,
+      "rows": [
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:c3aca8efb7c1319fb340fba05ce45a4adde07c3ccc9e5d2e4a5bc10c4203bc67",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "disclosure_cohort": "full",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:fixer",
+          "non_ranking": false,
+          "observable": 889.0,
+          "profile_id": "epk:v1:resolved:8cd31f33deaa7a0c1b9be2d64278b31dc44f91450e43bb8f53f539d1587ee0f9",
+          "role": "builder",
+          "value": 889.0
+        },
+        {
+          "benchmark_type": "issue-resolution",
+          "cohort_id": "cohort:ac2f712d40747bdc296446e1f284876ec8521dcfeeffaab263f56d49e4a8af47",
+          "cohort_identity_complete": true,
+          "coverage_complete": false,
+          "coverage_expected_encounters": [
+            "mini_encounter",
+            "second-encounter"
+          ],
+          "coverage_observed_encounters": [
+            "mini_encounter"
+          ],
+          "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+          "deck_id": "fixtures",
+          "disclosure_cohort": "full",
+          "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+          "loadout": "P0T0R0",
+          "model": "scripted:quitter",
+          "non_ranking": false,
+          "observable": "inf",
+          "profile_id": "epk:v1:resolved:b06beb774b26ab9f4a541997a75e589b914d294a4c92341befa3247826388bfa",
+          "role": "builder",
+          "value": "inf"
+        }
+      ],
+      "status": "ok"
+    }
+  },
+  "producer": {
+    "name": "paulsha-patchmud",
+    "version": "0.0.1"
+  },
+  "report_fingerprint": "sha256:bedf09398fbb306bc04d681260686ad937c5315cf34fe45b79286ca3f5fe3510",
+  "runs": [
+    {
+      "artifact_digests": {
+        "events.jsonl": "sha256:542aa6b831d346e4fcff442a72f9ed37fcac931696ea39465f6deac0207201c6",
+        "ledger.jsonl": "sha256:d48ac1a3eabbeac98fbaa4310bdc0d681826f931d506d5c0dd0c3dbfc6212c8b",
+        "result.yaml": "sha256:b433564b2c97073f2438fa2679ca837d1a4351ba7b3850dc65233f4cd50790dc",
+        "run.yaml": "sha256:053e483e491090f7a3703427629dd3ebf07a3ec87b883f7eb3ca037c8b367d3c",
+        "usage_evidence.jsonl": "sha256:06a46d59d4d748e07418d9523e8e768356b73a375003d973d8bd184aa9fe264b"
+      },
+      "benchmark_type": "issue-resolution",
+      "clear": 1,
+      "control": 100.0,
+      "cost": "NA",
+      "deck_coverage": {
+        "complete": false,
+        "expected_encounters": [
+          "mini_encounter",
+          "second-encounter"
+        ],
+        "observed_encounters": [
+          "mini_encounter"
+        ]
+      },
+      "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+      "deck_id": "fixtures",
+      "encounter": "mini_encounter",
+      "end_reason": "commit",
+      "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+      "failure_reason": null,
+      "failure_source": null,
+      "ftr": 0.0,
+      "loadout": "P0T0R0",
+      "measured_at": "2026-09-26T00:00:00Z",
+      "measured_dimensions": [
+        "clear",
+        "power",
+        "protocol"
+      ],
+      "model": "scripted:fixer",
+      "observable_tokens": 889,
+      "power_total": 100.0,
+      "profile_id": "epk:v1:resolved:8cd31f33deaa7a0c1b9be2d64278b31dc44f91450e43bb8f53f539d1587ee0f9",
+      "protocol_failed": false,
+      "role": "builder",
+      "run_digest": "sha256:df7e6eb3953cc8e56b61e136c80f1c61465a8b1169a656a93102418907543d2a",
+      "run_id": "report-fixer",
+      "tau_uncalibrated": true,
+      "unmeasured_dimensions": {
+        "planner": {
+          "reason": "role-not-assessed",
+          "state": "unknown"
+        },
+        "reviewer": {
+          "reason": "role-not-assessed",
+          "state": "unknown"
+        }
+      },
+      "usage_provenance": {
+        "calls": [
+          {
+            "coverage": {
+              "gaps": [
+                {
+                  "reason": "provider-does-not-report-field",
+                  "scope": "unallocated"
+                }
+              ],
+              "state": "partial"
+            },
+            "fields": {
+              "billed_input_total": {
+                "calculation": {
+                  "operation": "copy_total",
+                  "source_fields": [
+                    "prompt_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "relation": "total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 230
+              },
+              "billed_output_total": {
+                "calculation": {
+                  "operation": "copy_total",
+                  "source_fields": [
+                    "completion_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "relation": "total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 166
+              },
+              "input_cached": {
+                "calculation": {
+                  "operation": "copy",
+                  "source_fields": [
+                    "prompt_tokens_details.cached_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "input",
+                  "relation": "subset",
+                  "subset_of": "billed_input_total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 0
+              },
+              "input_uncached": {
+                "calculation": {
+                  "operation": "subtract_subset",
+                  "source_fields": [
+                    "prompt_tokens",
+                    "prompt_tokens_details.cached_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "input",
+                  "relation": "partition_component"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 230
+              },
+              "output_visible": {
+                "calculation": {
+                  "operation": "subtract_subset",
+                  "source_fields": [
+                    "completion_tokens",
+                    "completion_tokens_details.reasoning_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "output",
+                  "relation": "partition_component"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 166
+              },
+              "reasoning": {
+                "calculation": {
+                  "operation": "copy",
+                  "source_fields": [
+                    "completion_tokens_details.reasoning_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "output",
+                  "relation": "subset",
+                  "subset_of": "billed_output_total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 0
+              },
+              "unallocated": {
+                "calculation": {
+                  "operation": "copy_residual",
+                  "source_fields": []
+                },
+                "method": "executor_usage",
+                "reason": "provider-does-not-report-field",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "relation": "residual"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "unknown",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                }
+              }
+            },
+            "quantity_kind": "usage_delta",
+            "role": "author",
+            "schema_version": 1,
+            "seq": 1,
+            "turn": 1
+          },
+          {
+            "coverage": {
+              "gaps": [
+                {
+                  "reason": "provider-does-not-report-field",
+                  "scope": "unallocated"
+                }
+              ],
+              "state": "partial"
+            },
+            "fields": {
+              "billed_input_total": {
+                "calculation": {
+                  "operation": "copy_total",
+                  "source_fields": [
+                    "prompt_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "relation": "total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 490
+              },
+              "billed_output_total": {
+                "calculation": {
+                  "operation": "copy_total",
+                  "source_fields": [
+                    "completion_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "relation": "total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 3
+              },
+              "input_cached": {
+                "calculation": {
+                  "operation": "copy",
+                  "source_fields": [
+                    "prompt_tokens_details.cached_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "input",
+                  "relation": "subset",
+                  "subset_of": "billed_input_total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 0
+              },
+              "input_uncached": {
+                "calculation": {
+                  "operation": "subtract_subset",
+                  "source_fields": [
+                    "prompt_tokens",
+                    "prompt_tokens_details.cached_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "input",
+                  "relation": "partition_component"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 490
+              },
+              "output_visible": {
+                "calculation": {
+                  "operation": "subtract_subset",
+                  "source_fields": [
+                    "completion_tokens",
+                    "completion_tokens_details.reasoning_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "output",
+                  "relation": "partition_component"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 3
+              },
+              "reasoning": {
+                "calculation": {
+                  "operation": "copy",
+                  "source_fields": [
+                    "completion_tokens_details.reasoning_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "output",
+                  "relation": "subset",
+                  "subset_of": "billed_output_total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 0
+              },
+              "unallocated": {
+                "calculation": {
+                  "operation": "copy_residual",
+                  "source_fields": []
+                },
+                "method": "executor_usage",
+                "reason": "provider-does-not-report-field",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "relation": "residual"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "unknown",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                }
+              }
+            },
+            "quantity_kind": "usage_delta",
+            "role": "author",
+            "schema_version": 1,
+            "seq": 2,
+            "turn": 2
+          }
+        ],
+        "coverage": {
+          "gaps": [
+            {
+              "reason": "provider-does-not-report-field",
+              "scope": "unallocated"
+            }
+          ],
+          "state": "partial"
+        },
+        "fields": {
+          "billed_input_total": {
+            "calculation": {
+              "operations": [
+                "copy_total"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "relation": "total"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 720
+          },
+          "billed_output_total": {
+            "calculation": {
+              "operations": [
+                "copy_total"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "relation": "total"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 169
+          },
+          "input_cached": {
+            "calculation": {
+              "operations": [
+                "copy"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "partition": "input",
+              "relation": "subset",
+              "subset_of": "billed_input_total"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 0
+          },
+          "input_uncached": {
+            "calculation": {
+              "operations": [
+                "subtract_subset"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "partition": "input",
+              "relation": "partition_component"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 720
+          },
+          "output_visible": {
+            "calculation": {
+              "operations": [
+                "subtract_subset"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "partition": "output",
+              "relation": "partition_component"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 169
+          },
+          "reasoning": {
+            "calculation": {
+              "operations": [
+                "copy"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "partition": "output",
+              "relation": "subset",
+              "subset_of": "billed_output_total"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 0
+          },
+          "unallocated": {
+            "calculation": {
+              "operations": [
+                "copy_residual"
+              ]
+            },
+            "method": "executor_usage",
+            "reason": "provider-does-not-report-field",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "relation": "residual"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "unknown",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            }
+          }
+        },
+        "quantity_kind": "usage_delta",
+        "schema_version": 1,
+        "source": {
+          "adapter_version": "unknown",
+          "source_id": "openai",
+          "source_schema": "openai-usage/v1"
+        }
+      },
+      "work_tokens": 889
+    },
+    {
+      "artifact_digests": {
+        "events.jsonl": "sha256:ec38d9957cf33bca4f4be5e6aa53d0c4de7f8a609ce3942b41d6fcf631df4006",
+        "ledger.jsonl": "sha256:dcbe97944de5c5e9216aaebbd362b3fa417420cc6d8ced56cbf5d25c0a136041",
+        "result.yaml": "sha256:f93fdf3f1554ffb323caa702f3507f3b74e62b23e6a6dcc60fc582aa2a860e6f",
+        "run.yaml": "sha256:84c62a81a192a13e4d0ece74f752f1e04eff86abe1009cf8809cce5541380f22",
+        "usage_evidence.jsonl": "sha256:bb391b88713fce4ca2976f5cf2bea8b11c6af01f09d378072c7a750229aa1234"
+      },
+      "benchmark_type": "issue-resolution",
+      "clear": 0,
+      "control": 100.0,
+      "cost": "NA",
+      "deck_coverage": {
+        "complete": false,
+        "expected_encounters": [
+          "mini_encounter",
+          "second-encounter"
+        ],
+        "observed_encounters": [
+          "mini_encounter"
+        ]
+      },
+      "deck_digest": "sha256:715c3d425b91bc8e4879314425888ae453d700d662a0c155c57734bb293c6e9e",
+      "deck_id": "fixtures",
+      "encounter": "mini_encounter",
+      "end_reason": "commit",
+      "evaluator_revision": "sha256:87918a589629a23bd5412493700c87f29b1383d0f6b1e8716c4baad512d15734",
+      "failure_reason": "clear-gate-not-met",
+      "failure_source": "evaluator",
+      "ftr": 0.0,
+      "loadout": "P0T0R0",
+      "measured_at": "2026-09-26T00:00:00Z",
+      "measured_dimensions": [
+        "clear",
+        "power",
+        "protocol"
+      ],
+      "model": "scripted:quitter",
+      "observable_tokens": 233,
+      "power_total": 20.0,
+      "profile_id": "epk:v1:resolved:b06beb774b26ab9f4a541997a75e589b914d294a4c92341befa3247826388bfa",
+      "protocol_failed": false,
+      "role": "builder",
+      "run_digest": "sha256:b1be4ca466e303877830f51a45c73fce76c4912f3a690e3e35b63df3f6208f60",
+      "run_id": "report-quitter",
+      "tau_uncalibrated": true,
+      "unmeasured_dimensions": {
+        "planner": {
+          "reason": "role-not-assessed",
+          "state": "unknown"
+        },
+        "reviewer": {
+          "reason": "role-not-assessed",
+          "state": "unknown"
+        }
+      },
+      "usage_provenance": {
+        "calls": [
+          {
+            "coverage": {
+              "gaps": [
+                {
+                  "reason": "provider-does-not-report-field",
+                  "scope": "unallocated"
+                }
+              ],
+              "state": "partial"
+            },
+            "fields": {
+              "billed_input_total": {
+                "calculation": {
+                  "operation": "copy_total",
+                  "source_fields": [
+                    "prompt_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "relation": "total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 230
+              },
+              "billed_output_total": {
+                "calculation": {
+                  "operation": "copy_total",
+                  "source_fields": [
+                    "completion_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "relation": "total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 3
+              },
+              "input_cached": {
+                "calculation": {
+                  "operation": "copy",
+                  "source_fields": [
+                    "prompt_tokens_details.cached_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "input",
+                  "relation": "subset",
+                  "subset_of": "billed_input_total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 0
+              },
+              "input_uncached": {
+                "calculation": {
+                  "operation": "subtract_subset",
+                  "source_fields": [
+                    "prompt_tokens",
+                    "prompt_tokens_details.cached_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "input",
+                  "relation": "partition_component"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 230
+              },
+              "output_visible": {
+                "calculation": {
+                  "operation": "subtract_subset",
+                  "source_fields": [
+                    "completion_tokens",
+                    "completion_tokens_details.reasoning_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "output",
+                  "relation": "partition_component"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 3
+              },
+              "reasoning": {
+                "calculation": {
+                  "operation": "copy",
+                  "source_fields": [
+                    "completion_tokens_details.reasoning_tokens"
+                  ]
+                },
+                "method": "executor_usage",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "partition": "output",
+                  "relation": "subset",
+                  "subset_of": "billed_output_total"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "observed",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                },
+                "value": 0
+              },
+              "unallocated": {
+                "calculation": {
+                  "operation": "copy_residual",
+                  "source_fields": []
+                },
+                "method": "executor_usage",
+                "reason": "provider-does-not-report-field",
+                "semantics": {
+                  "aggregation": "sum_usage_deltas",
+                  "relation": "residual"
+                },
+                "source": {
+                  "adapter_version": "unknown",
+                  "source_id": "openai",
+                  "source_schema": "openai-usage/v1"
+                },
+                "state": "unknown",
+                "unit_ref": {
+                  "state": "known",
+                  "value": {
+                    "unit_id": "token",
+                    "version": "1"
+                  }
+                }
+              }
+            },
+            "quantity_kind": "usage_delta",
+            "role": "author",
+            "schema_version": 1,
+            "seq": 1,
+            "turn": 1
+          }
+        ],
+        "coverage": {
+          "gaps": [
+            {
+              "reason": "provider-does-not-report-field",
+              "scope": "unallocated"
+            }
+          ],
+          "state": "partial"
+        },
+        "fields": {
+          "billed_input_total": {
+            "calculation": {
+              "operations": [
+                "copy_total"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "relation": "total"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 230
+          },
+          "billed_output_total": {
+            "calculation": {
+              "operations": [
+                "copy_total"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "relation": "total"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 3
+          },
+          "input_cached": {
+            "calculation": {
+              "operations": [
+                "copy"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "partition": "input",
+              "relation": "subset",
+              "subset_of": "billed_input_total"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 0
+          },
+          "input_uncached": {
+            "calculation": {
+              "operations": [
+                "subtract_subset"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "partition": "input",
+              "relation": "partition_component"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 230
+          },
+          "output_visible": {
+            "calculation": {
+              "operations": [
+                "subtract_subset"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "partition": "output",
+              "relation": "partition_component"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 3
+          },
+          "reasoning": {
+            "calculation": {
+              "operations": [
+                "copy"
+              ]
+            },
+            "method": "executor_usage",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "partition": "output",
+              "relation": "subset",
+              "subset_of": "billed_output_total"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "observed",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            },
+            "value": 0
+          },
+          "unallocated": {
+            "calculation": {
+              "operations": [
+                "copy_residual"
+              ]
+            },
+            "method": "executor_usage",
+            "reason": "provider-does-not-report-field",
+            "semantics": {
+              "aggregation": "sum_usage_deltas",
+              "relation": "residual"
+            },
+            "sources": [
+              {
+                "adapter_version": "unknown",
+                "source_id": "openai",
+                "source_schema": "openai-usage/v1"
+              }
+            ],
+            "state": "unknown",
+            "unit_ref": {
+              "state": "known",
+              "value": {
+                "unit_id": "token",
+                "version": "1"
+              }
+            }
+          }
+        },
+        "quantity_kind": "usage_delta",
+        "schema_version": 1,
+        "source": {
+          "adapter_version": "unknown",
+          "source_id": "openai",
+          "source_schema": "openai-usage/v1"
+        }
+      },
+      "work_tokens": 233
+    }
+  ],
+  "runs_included": 2,
+  "runs_skipped": [],
+  "schema_version": 2
+}

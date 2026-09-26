@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from paulsha_cortex.control import client as control_client
+from paulsha_cortex.recovery_action_contracts import (
+    RECOVER_SLICE_ACTION_CHOICES,
+    RECOVER_WORK_ACTION_CHOICES,
+)
 
 from . import COMMANDS, PorcelainCommand, register
 from .request import DEFAULT_WAIT_TIMEOUT_SECONDS, track_submitted_request
@@ -40,7 +44,7 @@ def _build_parser() -> argparse.ArgumentParser:
     slice_cmd.add_argument("slice_id")
     slice_cmd.add_argument(
         "action",
-        choices=("retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"),
+        choices=RECOVER_SLICE_ACTION_CHOICES,
     )
     slice_cmd.add_argument("--actor", required=True)
     slice_cmd.add_argument("--reason", default=None, help="supersede 的單行稽核理由")
@@ -65,16 +69,14 @@ def _build_parser() -> argparse.ArgumentParser:
     work.add_argument("work_id")
     work.add_argument(
         "action",
-        choices=(
-            "retry-build", "retry-card", "resume", "recover-pre-candidate",
-            "recover-repair-commit", "regenerate-gates", "abandon",
-            "retire-delivered", "recover-superseded", "reset-reclaim-budget",
-            "refreeze-base",
-        ),
+        choices=RECOVER_WORK_ACTION_CHOICES,
     )
     work.add_argument("--repo", required=True)
     work.add_argument("--actor", required=True)
-    work.add_argument("--expected-candidate")
+    work.add_argument(
+        "--expected-candidate",
+        help="retry-build／recover-repair-commit 專用：exact Candidate SHA CAS",
+    )
     work.add_argument("--expected-run-id")
     work.add_argument(
         "--card",

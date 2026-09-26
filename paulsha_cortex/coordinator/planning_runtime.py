@@ -80,8 +80,15 @@ def _planning_argv(
     worktree: Path,
     *,
     last_message_path: str | Path,
+    execution_profile: object | None = None,
+    trust_root_outer_unit: bool = False,
 ) -> list[str]:
     """一次 planning 呼叫的 executor argv。
+
+    `trust_root_outer_unit` 只由 :class:`planning_job.JobPlanningInvoker` 傳 True——
+    它的每一次呼叫都落在 Trust Root 模板 unit（`RestrictNamespaces=yes`）內，codex
+    0.157 的內層沙箱（bwrap）在那裡起不來，唯讀邊界改由 unit 承擔（#716 B）。
+    direct 模式維持預設 False，codex 仍帶 `--sandbox read-only`。
 
     `last_message_path` 是**必填的關鍵字參數**，而且本函式不對它做任何推導——#714
     缺陷 2 的形狀逐字是「codex 的 `-o` 指著一個 job 寫不進去的路徑」，而它之所以
@@ -91,6 +98,20 @@ def _planning_argv(
     :func:`planning_last_message_path` 交出答案。
     """
 
+    from .execution_adapters import resolve_profile, validate_profile_for_launch
+
+    profile_binding = execution_profile or resolve_profile(
+        identity,
+        "planner",
+        launch_contract={"sandbox": "read-only", "tools": ()},
+    )
+    validate_profile_for_launch(
+        profile_binding,
+        executor=identity.executor,
+        model=identity.model_id,
+        effort=None,
+        sandbox_mode="read-only",
+    )
     if identity.executor == "agy":
         return build_agy_argv(
             prompt=prompt,
@@ -102,8 +123,15 @@ def _planning_argv(
             read_only=True,
         )
     if identity.executor == "codex":
+        from ..trust_root import registry as trust_registry
+
+        # 模式值只有一份真相：`SANDBOX_MODE_DERIVATION` 的 planner 唯讀列（#716）。
+        sandbox_mode = trust_registry.sandbox_mode_for(
+            trust_registry.JobWriteContract.PLANNER_READ_ONLY,
+            trust_root_outer_unit=trust_root_outer_unit,
+        )
         return [
-            "codex", "exec", prompt, "--json", "--sandbox", "read-only",
+            "codex", "exec", prompt, "--json", "--sandbox", str(sandbox_mode),
             "--model", identity.model_id, "-o", str(last_message_path),
             "-C", str(worktree), "--skip-git-repo-check",
         ]
@@ -1113,6 +1141,7 @@ class PlanningInvocation:
     worktree: Path
     evidence_root: str | Path | None = None
     run_id: str = "ephemeral"
+    execution_profile: object | None = None
 
 
 @dataclass(frozen=True)
@@ -1223,6 +1252,7 @@ class InProcessPlanningInvoker:
                 temp_dir,
                 sandbox,
                 last_message_path=output_path,
+                execution_profile=invocation.execution_profile,
             )
             run_kwargs: dict[str, object] = {}
             if identity.executor == "claude":
@@ -1353,6 +1383,7 @@ def _invoke_json(
     timeout_seconds: int,
     evidence_root: str | Path | None = None,
     run_id: str = "ephemeral",
+    execution_profile: object | None = None,
 ) -> object:
     """呼叫端這一半：組 invocation → 交 invoker → 判 rc → 抽 JSON。
 
@@ -1365,6 +1396,13 @@ def _invoke_json(
         invoker = InProcessPlanningInvoker(runner)
     elif runner is not None:
         raise ValueError("planning invoker and runner are mutually exclusive")
+    from .execution_adapters import resolve_profile
+
+    profile_binding = execution_profile or resolve_profile(
+        identity,
+        "planner",
+        launch_contract={"sandbox": "read-only", "tools": ()},
+    )
     outcome = invoker.run(
         PlanningInvocation(
             identity=identity,
@@ -1374,6 +1412,7 @@ def _invoke_json(
             worktree=Path(worktree),
             evidence_root=evidence_root,
             run_id=run_id,
+            execution_profile=profile_binding,
         )
     )
     detail = _outcome_diagnostic(outcome)

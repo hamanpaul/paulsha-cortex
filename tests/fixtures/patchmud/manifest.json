@@ -1,0 +1,93 @@
+{
+  "fixtures": [
+    {
+      "case": "positive",
+      "contract": "execution_profile",
+      "path": "execution-profile-v1/positive.json",
+      "sha256": "82f35c4e5eb45ed731b66996b1d6e2dc1f87741b4fe0781f8a2c1fea73c6f5f2"
+    },
+    {
+      "case": "negative",
+      "contract": "execution_profile",
+      "path": "execution-profile-v1/negative.json",
+      "sha256": "f58952c4a8b14ce9fe970f3c7dbffb2b0407bd01d1f2471d0983e333bc9113cb"
+    },
+    {
+      "case": "positive",
+      "contract": "usage_provenance",
+      "path": "usage-provenance-v1/positive.json",
+      "sha256": "eef1c55322a0de33ed5cba48fcb05fa0762b8d270f5bb82b8b8f94d472d46fd0"
+    },
+    {
+      "case": "negative",
+      "contract": "usage_provenance",
+      "path": "usage-provenance-v1/negative.json",
+      "sha256": "71f7d4a66173ef19cb0bc25381b13b5e764178adb4e37598733d0c0aa5eb8d2d"
+    },
+    {
+      "case": "positive",
+      "contract": "report",
+      "path": "report-v2/positive.json",
+      "sha256": "5babdf9d9f65635e0fb1c5cd2c71b1b303e90871bb09cbe132e8bb070f25e57b"
+    },
+    {
+      "case": "negative",
+      "contract": "report",
+      "path": "report-v2/negative.json",
+      "sha256": "9bf2018b139fcd5db94cadfbeb6a8ccda79c8fa9ce479208762972a61c7c5434"
+    },
+    {
+      "case": "legacy_positive",
+      "contract": "report",
+      "path": "legacy-v1/report.json",
+      "sha256": "eeccaa7533ecf10e312a4772f1bdc83773167d02fcc984b34b244c9df836e8bc"
+    },
+    {
+      "case": "legacy_positive",
+      "contract": "run",
+      "path": "legacy-v1/run/run.yaml",
+      "sha256": "1d78ebb215659c148dabf5ab3582054c7a4912c316409c514d5579076d7de8fa"
+    },
+    {
+      "case": "legacy_positive",
+      "contract": "result",
+      "path": "legacy-v1/run/result.yaml",
+      "sha256": "9bd80061ffc1d02966bf374d0920ddb40dba473d8fbb28484560514eedc500fd"
+    },
+    {
+      "case": "legacy_positive",
+      "contract": "event",
+      "path": "legacy-v1/run/events.jsonl",
+      "sha256": "f85d1635342f87a449da2c5d43bfdc45bc850ff9a315852d1bbc634183ce243e"
+    },
+    {
+      "case": "legacy_positive",
+      "contract": "ledger",
+      "path": "legacy-v1/run/ledger.jsonl",
+      "sha256": "02f77e1340e6b89cced5a1b028fe201a74be76f9f83af2dedde67e631282f351"
+    },
+    {
+      "case": "negative",
+      "contract": "report",
+      "path": "legacy-v1/negative/unknown-report.json",
+      "sha256": "59557ff14705454e641bde0b5b11b0322d28748176d12873530f7ba7a98f1643"
+    },
+    {
+      "case": "negative",
+      "contract": "result",
+      "path": "legacy-v1/negative/unknown-result.yaml",
+      "sha256": "6c17138944b5a033033d6780732f358e33a95afbbd8bedb6ff59911e417157bd"
+    }
+  ],
+  "manifest_version": 1,
+  "schema_versions": {
+    "event": 1,
+    "execution_profile": 1,
+    "ledger": 1,
+    "report": 2,
+    "result": 1,
+    "run": 1,
+    "usage_provenance": 1
+  },
+  "source_revision": "421fadc7dc16b6ee9020bdc2333ff6fe856accaa"
+}

@@ -495,7 +495,15 @@ class PolkitCoversBothProfilesTests(unittest.TestCase):
         self.assertTrue(pattern.startswith("^"))
         self.assertTrue(pattern.endswith(r"@[a-z0-9][a-z0-9._-]{0,62}\.service$"))
         builder_stems = permgen.job_unit_stems(permgen.DEFAULT_LAYOUT, Principal.BUILDER)
-        self.assertEqual(builder_stems, ("cortex-job", "cortex-job-jit"))
+        self.assertEqual(
+            builder_stems,
+            (
+                "cortex-job",
+                "cortex-job-jit",
+                "cortex-job-ro",
+                "cortex-job-ro-jit",
+            ),
+        )
         stems = permgen.job_unit_stems(
             permgen.DEFAULT_LAYOUT, permgen.DOWNGRADED_JOB_PRINCIPALS
         )

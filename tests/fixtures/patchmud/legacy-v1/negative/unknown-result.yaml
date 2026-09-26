@@ -1,0 +1,8 @@
+clear: 1
+end_reason: commit
+loadout: P0T0R0
+mode: run
+power:
+  total: 75.0
+protocol_failed: false
+schema_version: 2

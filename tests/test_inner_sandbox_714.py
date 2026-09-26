@@ -1,4 +1,4 @@
-"""#714：executor 自帶的內層沙箱 × systemd 外層加固面，以及 `last.json` 的落點。
+"""#714／#716：direct 內層沙箱與 Trust Root template 外層獨占模式。
 
 ## 這張票在修什麼
 
@@ -10,7 +10,7 @@
 模型最後合理地回 `needs_human`，Manager 端落成 `card-terminal-schema-retry-exhausted`
 ——**症狀離病因四層遠**。
 
-## 0819 實機逐條量測（`psc_run_under` 全量導出，D13）
+## 0819 歷史量測與 2026-09-26 的 runner 分流
 
 保留 bubblewrap（票上的路線 A）要付**四條**放寬：
 
@@ -20,10 +20,11 @@
     4  +AF_NETLINK             Failed to make / slave: Operation not permitted ← SystemCallFilter
     5  +SystemCallFilter 加 @mount  rc=0
 
-第 2、4 條放寬的正是 **user namespace ＋ mount**——外層加固面存在的理由本身；第 4 條
-的鍵還在 :data:`permgen.PROFILE_LOCKED_KEYS` 上。裁決因此更正為票上的 **C**：換一個
-不需要 bubblewrap 的執行形態（codex 的 landlock ＋ seccomp 路徑），外層**一條都不動**，
-只全域放行 `@sandbox`（四支只能讓行程把自己關得更緊的 syscall）。
+第 2、4 條放寬的正是 **user namespace ＋ mount**，不得採用。codex-cli 0.157 又確認
+legacy Landlock 需要 bubblewrap 隔離 app-server sockets；不開 legacy 時 bwrap 仍需要
+被 `RestrictNamespaces=yes` 禁止的 namespace。Trust Root template 因此採選項 B：
+`danger-full-access` + 外層 unit／egress proxy 唯一邊界。`@sandbox` 保留給 direct 模式
+下由 Manager unit 繼承 seccomp 的 Codex 子行程。
 
 ## 本檔釘住什麼
 
@@ -143,6 +144,7 @@ class SandboxRegistryTests(unittest.TestCase):
         self.assertEqual(spec.kind, "landlock-seccomp")
         self.assertEqual(spec.argv, ("--enable", "use_legacy_landlock"))
         self.assertEqual(spec.syscall_groups, ("@sandbox",))
+        self.assertEqual(spec.systemd_surfaces, (permgen.MANAGER_SURFACE,))
         # 取捨必須是明載的：#714 的 operator 指示逐字要求「沒有 PID namespace」這件事
         # 寫進登記表 note，不留成隱性假設。
         self.assertTrue(spec.accepted_loss)
@@ -162,7 +164,8 @@ class SandboxRegistryTests(unittest.TestCase):
     def test_surfaces_are_derived_and_satisfied(self) -> None:
         surfaces = permgen.inner_sandbox_surfaces()
         self.assertEqual(
-            {(item.program, item.surface) for item in surfaces}, {("codex", "codex")}
+            {(item.program, item.surface) for item in surfaces},
+            {("codex", permgen.MANAGER_SURFACE)},
         )
         for item in surfaces:
             self.assertTrue(item.satisfied, f"{item.program} @ {item.detail}")
@@ -216,6 +219,7 @@ class HardeningSurfaceTests(unittest.TestCase):
             for content in _all_units().values()
         }
         self.assertEqual(len(values), 1, values)
+        self.assertEqual(values, {"@system-service @sandbox"})
 
     def test_route_a_relaxations_are_absent_everywhere(self) -> None:
         """路線 A 那四條放寬，**一條都沒有**落在任何 unit 上。
@@ -225,6 +229,9 @@ class HardeningSurfaceTests(unittest.TestCase):
         """
 
         for name, content in _all_units().items():
+            self.assertEqual(_service_values(content, "NoNewPrivileges"), ["yes"], name)
+            self.assertEqual(_service_values(content, "ProtectSystem"), ["strict"], name)
+            self.assertEqual(_service_values(content, "ProtectHome"), ["yes"], name)
             self.assertEqual(_service_values(content, "ProcSubset"), ["pid"], name)
             self.assertEqual(
                 _service_values(content, "RestrictNamespaces"), ["yes"], name
@@ -409,20 +416,30 @@ class DegradedLaunchTests(unittest.TestCase):
                 }
                 log_dir = str(Path(root) / "logs")
                 with mock.patch.dict(os.environ, env, clear=True):
-                    with _nested(_template_seams()):
+                    with _nested(
+                        [
+                            *_template_seams(),
+                            # This launcher-shape suite runs in a restricted worktree
+                            # filesystem without named-ACL support. ACL semantics have
+                            # dedicated tests; keep this suite focused on argv/unit flow.
+                            mock.patch.object(
+                                launcher_module.spool_slot, "_apply_slot_acl"
+                            ),
+                        ]
+                    ):
                         SubprocessLauncher("codex").launch(
                             slice_id=slice_id,
                             prompt="PROMPT",
                             worktree=root,
                             log_dir=log_dir,
                         )
-                import json
+                    import json
 
-                spec = json.loads(
-                    sorted(Path(spool).glob("*.json"))[0].read_text(encoding="utf-8")
-                )
-                command = [str(item) for item in spec["command"]]
-                return command, str(spec["log_path"]), str(Path(log_dir).resolve())
+                    spec = json.loads(
+                        sorted(Path(spool).glob("*.json"))[0].read_text(encoding="utf-8")
+                    )
+                    command = [str(item) for item in spec["command"]]
+                    return command, str(spec["log_path"]), str(Path(log_dir).resolve())
         finally:
             launcher_module.subprocess.Popen = original
 
@@ -483,61 +500,39 @@ class ProbeGeneratorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.lines = permgen.build_inner_sandbox_probe(permgen.SCHEMES["four-way"])
         self.text = "\n".join(self.lines)
-
-    def test_all_four_directions_are_present(self) -> None:
-        # 1) 負向對照：不帶旗標必須仍然死在同一個字串上。
-        self.assertIn("Can't read /proc/sys/kernel/overflowuid", self.text)
-        # 2) 旗標還在。
-        self.assertIn("Unknown feature flag", self.text)
-        # 3) 正向。
-        self.assertIn("use_legacy_landlock", self.text)
-        # 4) 內層真的在擋（寫入 ＋ 網路）。
-        self.assertIn("Permission denied", self.text)
-        self.assertIn("getent hosts", self.text)
-
-    def test_the_enforcement_step_carries_paired_controls(self) -> None:
-        """「被擋」必須配一個「沒有內層沙箱時會過」的對照組。
-
-        少了對照組，最容易寫出的那條檢查是**假的**：拿「寫 job 的 HOME 被擋」當證據
-        ——那一格本來就不在 `ReadWritePaths=` 內，`ProtectSystem=strict` 會先回
-        `Read-only file system`，內層有沒有裝上完全看不出來。0819 第一版探針就是這樣
-        寫的，實跑才發現它在證明外層。
-        """
-
-        self.assertIn("OUTER_ALLOWS", self.text)
-        self.assertIn("INNER_LEAK", self.text)
-        # 被擋的那一格必須落在 job 的可寫面（worktree pool）之內。
-        self.assertIn(f"{permgen.DEFAULT_LAYOUT.worktree_root}/probe", self.text)
-        # 而不是 job 的 HOME——那是外層擋的，不是內層。
-        self.assertNotIn("psc-714-PWN", self.text)
-
-    def test_it_never_hand_assembles_the_hardening_surface(self) -> None:
-        """D13：加固面只有一份定義，探針一行 `--property=`／`--setenv=` 都不自組。"""
-
-        self.assertNotIn("--property=", self.text)
-        self.assertNotIn("--setenv=", self.text)
-        self.assertIn(permgen.PATH_PROBE_HELPER, self.text)
-
-    def test_the_flag_comes_from_the_registry(self) -> None:
-        spec = permgen.executor_inner_sandbox("codex")
-        assert spec is not None
-        self.assertIn(" ".join(spec.argv), self.text)
-
-    def test_it_watches_the_upstream_deprecation_notice(self) -> None:
-        """旗標**已被上游宣告要移除**，探針必須把那句話印出來當早期警報。
-
-        而且必須從**真實派工的 job log** 撈——`codex sandbox` 子命令不印那句話（0819
-        實測），對著它 grep 只會得到一個看起來很安心、其實什麼都沒驗到的空結果。
-        """
-
-        self.assertIn("deprecat", self.text)
-        self.assertIn("job.jsonl", self.text)
-        spec = permgen.executor_inner_sandbox("codex")
-        assert spec is not None
-        self.assertTrue(
-            any("deprecated" in item for item in spec.accepted_loss),
-            spec.accepted_loss,
+        self.executable = "\n".join(
+            line for line in self.lines
+            if line.strip() and not line.strip().startswith("#")
         )
+
+    def test_probe_checks_external_hardening_values(self) -> None:
+        for value in (
+            "NoNewPrivileges=yes",
+            "ProtectSystem=strict",
+            "ProtectHome=yes",
+            "ProcSubset=pid",
+            "RestrictNamespaces=yes",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "SystemCallFilter=@system-service @sandbox",
+            "SystemCallErrorNumber=EPERM",
+            "IPAddressDeny=any",
+        ):
+            self.assertIn(value, self.executable)
+        self.assertIn("danger-full-access", self.text)
+
+    def test_probe_checks_outer_write_and_egress_boundaries(self) -> None:
+        self.assertIn("PSC-716-OUTER-WRITE-OK", self.executable)
+        self.assertIn("socket.create_connection", self.executable)
+        self.assertIn("TimeoutError", self.text)
+        self.assertIn(f"{permgen.DEFAULT_LAYOUT.worktree_root}/probe", self.text)
+        self.assertIn("not the production-shaped Codex agent loop", self.text)
+
+    def test_probe_never_invokes_codex_inner_sandbox(self) -> None:
+        self.assertNotIn("codex sandbox", self.executable)
+        self.assertNotIn("use_legacy_landlock", self.executable)
+        self.assertNotIn("--property=", self.executable)
+        self.assertNotIn("--setenv=", self.executable)
+        self.assertIn(permgen.PATH_PROBE_HELPER, self.executable)
 
     def test_it_refuses_an_executor_without_a_measured_sandbox(self) -> None:
         with self.assertRaises(ValueError):
@@ -545,9 +540,7 @@ class ProbeGeneratorTests(unittest.TestCase):
                 permgen.SCHEMES["four-way"], executor="claude"
             )
 
-    def test_it_targets_the_unit_the_executor_actually_runs_on(self) -> None:
-        """字幹必須是 codex 真的會跑的那一份（jit 剖面），不是預設那一份。"""
-
+    def test_it_targets_the_codex_jit_template_unit(self) -> None:
         profile = permgen.executor_hardening_profile("codex")
         stem = permgen.job_unit_stem(
             permgen.DEFAULT_LAYOUT, Principal.BUILDER, profile

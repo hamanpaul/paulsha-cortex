@@ -1249,9 +1249,11 @@ identities:
         candidate=str(run.candidate_head),
         pr_number=17,
         foreign_ref=foreign_ref,
+        canonical_checkout=repo,
         runner=subprocess.run,
         now=lambda: 100.0,
     )
+    assert remote_closure_calls[-1]["canonical_checkout"] == repo
     assert draft is not None and draft.is_file()
     completion_payload = json.loads(draft.read_text(encoding="utf-8"))
     assert completion_payload["work_authority"]["run_id"] == run_id
@@ -1282,6 +1284,7 @@ identities:
         candidate=str(run.candidate_head),
         pr_number=17,
         foreign_ref=foreign_ref,
+        canonical_checkout=repo,
         runner=subprocess.run,
         now=lambda: 150.0,
     )
@@ -1300,12 +1303,12 @@ identities:
         candidate=str(run.candidate_head),
         pr_number=17,
         foreign_ref=foreign_ref,
+        canonical_checkout=repo,
         runner=subprocess.run,
         now=lambda: 200.0,
     )
     assert replay == draft
     assert json.loads(replay.read_text(encoding="utf-8")) == completion_payload
-
     # A default-branch advance is new closure semantics, so it gets a new
     # immutable revision instead of conflicting with or replacing the prior draft.
     default_head["value"] = "f" * 40
@@ -1317,6 +1320,7 @@ identities:
         candidate=candidate,
         pr_number=17,
         foreign_ref=foreign_ref,
+        canonical_checkout=repo,
         runner=subprocess.run,
         now=lambda: 300.0,
     )
@@ -1338,6 +1342,7 @@ identities:
         candidate=candidate,
         pr_number=17,
         foreign_ref=foreign_ref,
+        canonical_checkout=repo,
         runner=subprocess.run,
         now=lambda: 350.0,
     )
@@ -1353,6 +1358,7 @@ identities:
         candidate=candidate,
         pr_number=17,
         foreign_ref=foreign_ref,
+        canonical_checkout=repo,
         runner=subprocess.run,
         now=lambda: 400.0,
     )
@@ -1367,6 +1373,77 @@ identities:
             candidate=candidate,
             pr_number=17,
             foreign_ref=foreign_ref,
+            canonical_checkout=repo,
             runner=subprocess.run,
             now=lambda: 500.0,
         )
+
+
+def test_completion_draft_passes_canonical_checkout_to_remote_closure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    state_root = tmp_path / "coordinator"
+    state_root.mkdir()
+    (state_root / "delivery-journal.json").write_text(
+        json.dumps({"runs": {"run-1": {"ship": {"phase": "merged", "merge_authorization": {}}}}}),
+        encoding="utf-8",
+    )
+    canonical_checkout = tmp_path / "canonical"
+    closure_calls = []
+
+    def workflow_evidence_payload(*, phase, **_kwargs):
+        job = {"job_id": "reviewer-1"} if phase == "review" else None
+        return {}, job
+
+    monkeypatch.setattr(work_bridge, "_workflow_evidence_payload", workflow_evidence_payload)
+    monkeypatch.setattr(
+        verification,
+        "write_verification_evidence",
+        lambda *_args, **_kwargs: {"hash": "verification-hash"},
+    )
+    monkeypatch.setattr(
+        review,
+        "write_gate_evaluation",
+        lambda *_args, **_kwargs: {
+            "payload": {"builder_job_id": "builder-1", "reviewer_job_id": "reviewer-1"}
+        },
+    )
+
+    class StopClosure(Exception):
+        pass
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def fetch_remote_closure(self, **kwargs):
+            closure_calls.append(kwargs)
+            raise StopClosure
+
+    monkeypatch.setattr(work_bridge, "GitHubDeliveryClient", GitHub)
+    authority = SimpleNamespace(
+        repo="acme/demo",
+        mapped_openspec=(),
+        mapped_issues=(),
+        mapped_todo_paths=("docs/todo.md",),
+    )
+    run = SimpleNamespace(run_id="run-1")
+    registry = SimpleNamespace(
+        get_job=lambda _job_id: {"dispatch_head": "a" * 40, "branch": "feature/test"}
+    )
+
+    with pytest.raises(StopClosure):
+        work_bridge._completion_draft(
+            registry=registry,
+            state_root=state_root,
+            run=run,
+            authority=authority,
+            candidate="a" * 40,
+            pr_number=7,
+            foreign_ref=SimpleNamespace(ref="foreign-review"),
+            canonical_checkout=canonical_checkout,
+            runner=subprocess.run,
+            now=lambda: 0,
+        )
+
+    assert closure_calls[0]["canonical_checkout"] == canonical_checkout

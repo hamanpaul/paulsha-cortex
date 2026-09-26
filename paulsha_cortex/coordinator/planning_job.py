@@ -286,6 +286,10 @@ class JobPlanningInvoker:
             "/tmp",
             scratch_hint.cwd,
             last_message_path=last_message_path,
+            execution_profile=invocation.execution_profile,
+            # job 模式的唯一執行面是 Trust Root 模板 unit（`_dispatch` 先過
+            # `prepare_systemd_template` 才派），唯讀由 unit 加固承擔（#716 B）。
+            trust_root_outer_unit=True,
         )
         completed = self._dispatch(
             argv=argv,

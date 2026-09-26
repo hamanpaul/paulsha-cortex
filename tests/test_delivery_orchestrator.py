@@ -1053,8 +1053,11 @@ def test_remote_closure_reads_and_validates_completion_record(
         },
     }
 
+    remote_closure_calls = []
+
     class GitHub:
         def fetch_remote_closure(self, **kwargs):
+            remote_closure_calls.append(kwargs)
             return RemoteClosureFacts(
                 merge_commit=HEAD2,
                 pr_head=HEAD1,
@@ -1082,7 +1085,9 @@ def test_remote_closure_reads_and_validates_completion_record(
         workflow_step_ids=("step-build", "step-review", "step-ship"),
         trusted_evidence_refs=tuple(trusted_evidence_refs),
         coordinator_root=tmp_path,
+        canonical_checkout=tmp_path,
     )
+    assert remote_closure_calls[0]["canonical_checkout"] == tmp_path
     assert result.facts.completion_record_valid
     assert completion.read_completion_record(
         result.completion_record["path"],
@@ -1185,6 +1190,7 @@ def test_remote_closure_reuses_existing_completion_record_when_authority_metadat
         workflow_step_ids=("step-build", "step-review", "step-ship"),
         trusted_evidence_refs=tuple(trusted_evidence_refs),
         coordinator_root=tmp_path,
+        canonical_checkout=tmp_path,
     )
     replay_authority = authority.__class__._verified(
         repo=authority.repo,
@@ -1217,6 +1223,7 @@ def test_remote_closure_reuses_existing_completion_record_when_authority_metadat
         workflow_step_ids=("step-build", "step-review", "step-ship"),
         trusted_evidence_refs=tuple(trusted_evidence_refs),
         coordinator_root=tmp_path,
+        canonical_checkout=tmp_path,
     )
 
     assert second.completion_record == first.completion_record
@@ -1303,4 +1310,5 @@ def test_remote_closure_rejects_completion_bound_to_another_work(tmp_path: Path)
             workflow_step_ids=("step-build", "step-review", "step-ship"),
             trusted_evidence_refs=tuple(payload["work_authority"]["trusted_evidence_refs"]),
             coordinator_root=tmp_path,
+            canonical_checkout=tmp_path,
         )

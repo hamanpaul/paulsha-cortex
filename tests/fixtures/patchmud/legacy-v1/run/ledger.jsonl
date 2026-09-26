@@ -1,0 +1,1 @@
+{"api_calls": 1, "billed_input_total": 100, "billed_output_total": 40, "generated_bytes": 8, "input_cached": 0, "input_uncached": 100, "output_visible": 40, "pricing_snapshot_ref": "", "prompt_bytes": 12, "reasoning": 0, "role": "author", "schema_version": 1, "tool_calls": 0, "turn": 1, "unallocated": 0, "wall_clock_ms": 5}

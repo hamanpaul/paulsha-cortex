@@ -313,11 +313,177 @@ def test_eval_roster_is_strict_and_fail_closed() -> None:
                 {"schema_version": 1, "entries": [{**base, **mutation}]}
             )
     with pytest.raises(ValueError, match="schema_version"):
-        model_resolution.parse_eval_roster({"schema_version": 2, "entries": []})
+        model_resolution.parse_eval_roster({"schema_version": 9, "entries": []})
     with pytest.raises(ValueError, match="duplicate entry"):
         model_resolution.parse_eval_roster(
             {"schema_version": 1, "entries": [dict(base), dict(base)]}
         )
+
+
+def _v2_eval_entry(**overrides) -> dict:
+    entry = {
+        "executor": "claude",
+        "model_id": "sonnet",
+        "role": "builder",
+        "execution_profile_key": "epk:v1:resolved:" + "a" * 64,
+        "benchmark_type": "issue-resolution",
+        "deck_digest": "sha256:" + "b" * 64,
+        "evaluator_revision": "sha256:" + "c" * 64,
+        "verdict": "pass",
+        "evaluated_at": "2026-09-26",
+        "eval_source": "patchmud-report-v2",
+        "review_status": "approved",
+        "reviewer": "operator",
+        "reviewed_at": "2026-09-26",
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_eval_roster_v2_is_bound_to_profile_role_and_cohort_identity() -> None:
+    profile_key = "epk:v1:resolved:" + "a" * 64
+    cohort = {
+        key: _v2_eval_entry()[key]
+        for key in (
+            "role",
+            "benchmark_type",
+            "execution_profile_key",
+            "deck_digest",
+            "evaluator_revision",
+        )
+    }
+    cohort["profile_id"] = cohort.pop("execution_profile_key")
+    roster = model_resolution.parse_eval_roster(
+        {"schema_version": 2, "entries": [_v2_eval_entry()]}
+    )
+
+    assert roster.approves(
+        "claude",
+        "sonnet",
+        "build",
+        execution_profile_key=profile_key,
+        cohort_identity=cohort,
+    ) is True
+    assert roster.approves("claude", "sonnet", "build") is False
+    assert roster.approves(
+        "claude",
+        "sonnet",
+        "review",
+        execution_profile_key=profile_key,
+        cohort_identity=cohort,
+    ) is False
+    assert roster.approves(
+        "claude",
+        "sonnet",
+        "build",
+        execution_profile_key="epk:v1:resolved:" + "d" * 64,
+        cohort_identity=cohort,
+    ) is False
+    wrong_deck = {**cohort, "deck_digest": "sha256:" + "d" * 64}
+    assert roster.approves(
+        "claude",
+        "sonnet",
+        "build",
+        execution_profile_key=profile_key,
+        cohort_identity=wrong_deck,
+    ) is False
+
+    candidate = SimpleNamespace(
+        executor="claude",
+        model_id="sonnet",
+        origin="packaged",
+        execution_profile_key=profile_key,
+    )
+    assert model_resolution.identity_layer(
+        candidate, role="build", eval_roster=roster
+    ) == model_resolution.RESOLUTION_LAYER_PACKAGED
+    candidate.profile_provenance = {"observation": cohort}
+    assert model_resolution.identity_layer(
+        candidate, role="build", eval_roster=roster
+    ) == model_resolution.RESOLUTION_LAYER_EVALUATED
+
+
+def test_eval_roster_v2_keeps_distinct_cohorts_separate() -> None:
+    profile_key = "epk:v1:resolved:" + "a" * 64
+    first = _v2_eval_entry()
+    second = _v2_eval_entry(deck_digest="sha256:" + "d" * 64)
+    roster = model_resolution.parse_eval_roster(
+        {"schema_version": 2, "entries": [first, second]}
+    )
+    first_cohort = {
+        "role": first["role"],
+        "benchmark_type": first["benchmark_type"],
+        "profile_id": first["execution_profile_key"],
+        "deck_digest": first["deck_digest"],
+        "evaluator_revision": first["evaluator_revision"],
+    }
+    second_cohort = {**first_cohort, "deck_digest": second["deck_digest"]}
+    assert roster.approves(
+        "claude", "sonnet", "build", execution_profile_key=profile_key,
+        cohort_identity=first_cohort,
+    ) is True
+    assert roster.approves(
+        "claude", "sonnet", "build", execution_profile_key=profile_key,
+        cohort_identity=second_cohort,
+    ) is True
+    assert roster.approves(
+        "claude", "sonnet", "build", execution_profile_key=profile_key,
+        cohort_identity={**second_cohort, "evaluator_revision": "sha256:" + "e" * 64},
+    ) is False
+
+
+def test_eval_roster_v2_rejects_duplicate_complete_cohort() -> None:
+    with pytest.raises(ValueError, match="duplicate cohort qualification"):
+        model_resolution.parse_eval_roster(
+            {"schema_version": 2, "entries": [_v2_eval_entry(), _v2_eval_entry()]}
+        )
+
+
+def test_load_eval_roster_reads_v2_yaml_with_full_cohort(tmp_path: Path) -> None:
+    entry = _v2_eval_entry()
+    _write(
+        tmp_path,
+        "model-eval-roster.yaml",
+        f"""\
+schema_version: 2
+entries:
+  - executor: {entry['executor']}
+    model_id: {entry['model_id']}
+    role: {entry['role']}
+    execution_profile_key: {entry['execution_profile_key']}
+    benchmark_type: {entry['benchmark_type']}
+    deck_digest: {entry['deck_digest']}
+    evaluator_revision: {entry['evaluator_revision']}
+    verdict: {entry['verdict']}
+    evaluated_at: "{entry['evaluated_at']}"
+    eval_source: {entry['eval_source']}
+    review_status: {entry['review_status']}
+    reviewer: {entry['reviewer']}
+    reviewed_at: "{entry['reviewed_at']}"
+""",
+    )
+    roster = model_resolution.load_eval_roster(tmp_path)
+    assert roster.schema_version == 2
+    assert roster.entries[0].cohort_key == (
+        "builder",
+        "issue-resolution",
+        entry["execution_profile_key"],
+        entry["deck_digest"],
+        entry["evaluator_revision"],
+    )
+
+
+def test_eval_roster_v2_requires_valid_execution_and_report_identity() -> None:
+    for field, value in (
+        ("execution_profile_key", "sonnet/high"),
+        ("deck_digest", "unknown"),
+        ("evaluator_revision", "unknown"),
+        ("role", "build"),
+    ):
+        with pytest.raises(ValueError):
+            model_resolution.parse_eval_roster(
+                {"schema_version": 2, "entries": [_v2_eval_entry(**{field: value})]}
+            )
 
 
 def test_broken_eval_roster_degrades_instead_of_killing_the_tick(tmp_path: Path) -> None:

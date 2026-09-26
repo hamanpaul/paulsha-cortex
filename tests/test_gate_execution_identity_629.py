@@ -503,7 +503,11 @@ class PolkitGateStemTests(unittest.TestCase):
         self.assertEqual(head, "(?:" + "|".join(stems) + ")")
         self.assertEqual(
             len(stems),
-            len(permgen.DOWNGRADED_JOB_PRINCIPALS) * len(permgen.HARDENING_PROFILES),
+            (
+                len(permgen.DOWNGRADED_JOB_PRINCIPALS)
+                + (1 if Principal.BUILDER in permgen.DOWNGRADED_JOB_PRINCIPALS else 0)
+            )
+            * len(permgen.HARDENING_PROFILES),
         )
         bare = head.replace("(?:", "").replace(")", "")
         for wildcard in (".*", "[^", "\\w", "+", "?", "|.", ".|"):

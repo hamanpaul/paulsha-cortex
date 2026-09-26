@@ -1,0 +1,47 @@
+{
+  "leaderboards": {
+    "clear_rate": {
+      "rows": [],
+      "status": "ok"
+    },
+    "control": {
+      "rows": [],
+      "status": "ok"
+    },
+    "cost_per_clear": {
+      "rows": [],
+      "status": "ok"
+    },
+    "eutb": {
+      "rows": [],
+      "status": "ok"
+    },
+    "ftr": {
+      "rows": [],
+      "status": "ok"
+    },
+    "power": {
+      "rows": [],
+      "status": "ok"
+    },
+    "qaty": {
+      "rows": [],
+      "status": "ok"
+    },
+    "tokens_per_clear": {
+      "rows": [],
+      "status": "ok"
+    }
+  },
+  "runs": [
+    {
+      "clear": 1,
+      "loadout": "P0T0R0",
+      "model": "scripted:legacy-fixture",
+      "run_id": "golden-legacy-v1"
+    }
+  ],
+  "runs_included": 1,
+  "runs_skipped": [],
+  "schema_version": 3
+}
