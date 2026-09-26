@@ -3686,8 +3686,10 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
     from .manager import GATE_LEDGER_REQUIRED_PHASES
     from .registry import (
         ACTIVE_JOB_STATUSES,
+        MAX_RETRY_CARD_REDISPATCHES,
         RETRY_CARD_PHASE_PERSONA,
         TERMINAL_JOB_STATUSES,
+        _retry_card_redispatch_count,
     )
 
     if (
@@ -3731,6 +3733,12 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
                     card_jobs
                     and card_jobs[-1].get("status") in TERMINAL_JOB_STATUSES
                     and all(job.get("workflow_evidence") is None for job in card_jobs)
+                    and _retry_card_redispatch_count(
+                        run.attempts,
+                        matching_job_count=len(card_jobs),
+                        card_id=target.card,
+                    )
+                    < MAX_RETRY_CARD_REDISPATCHES
                 ):
                     actions.append("retry-card")
 
@@ -3821,7 +3829,14 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     # 與 dispatch 端共用同一個「下一張要派哪張卡」判準——宣告可行的重派必須
     # 真的落在同一張卡上（#382：宣告與實作不得各自為政）。
     from .manager import _current_workflow_step
-    from .registry import RETRY_CARD_PHASE_PERSONA, TERMINAL_JOB_STATUSES
+    from .registry import (
+        MAX_RETRY_CARD_REDISPATCHES,
+        RETRY_CARD_PHASE_PERSONA,
+        TERMINAL_JOB_STATUSES,
+        _retry_card_budget_message,
+        _retry_card_budget_reason,
+        _retry_card_redispatch_count,
+    )
 
     extras = set(args) - {
         "action", "repo", "work_id", "issue", "actor", "expected_run_id", "card",
@@ -3909,6 +3924,21 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         raise RuntimeError("retry-card refuses a card with accepted evidence")
     if not card_jobs or latest_card_job.get("status") not in TERMINAL_JOB_STATUSES:
         raise RuntimeError("retry-card requires a terminal job for the card")
+    retry_card_count = _retry_card_redispatch_count(
+        run.attempts,
+        matching_job_count=len(card_jobs),
+        card_id=card,
+    )
+    if retry_card_count >= MAX_RETRY_CARD_REDISPATCHES:
+        workflow_registry._manager_update_workflow_run(
+            run.run_id,
+            needs_human_reason=_retry_card_budget_reason(
+                card,
+                retry_card_count,
+                source="coordinator.work_actions._retry_card_action",
+            ),
+        )
+        raise RuntimeError(_retry_card_budget_message(card, retry_card_count))
     # candidate 完全沒變的 reviewer 重派不是模型修復，比照 `retry-verify`／
     # `retry-review` 的既有分類（#208 根因3：不得計入 model failure 指標，也不得
     # 吃 #218 的 repair budget）。build phase 維持 #545 的狀態推論不變。
