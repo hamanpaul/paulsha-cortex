@@ -89,7 +89,7 @@ def execution_qualification_operator_receipts_root() -> Path:
 
 
 def execution_qualification_operator_receipt_registry_path() -> Path:
-    """#842 Manager-only allowlist binding operator receipt ids to stored digests。"""
+    """#842 Manager-only 輔助清單；operator 帳號不讀不寫，缺席不擋 operator receipt 核發。"""
     return execution_qualification_root() / "operator-receipt-index.json"
 
 

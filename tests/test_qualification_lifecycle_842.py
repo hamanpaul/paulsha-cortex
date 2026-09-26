@@ -701,7 +701,10 @@ def test_q04_self_supplied_human_receipt_cannot_publish_live_approval(tmp_path: 
         encoding="utf-8",
     )
     forged_path.chmod(0o600)
-    with pytest.raises(ValueError, match="not registered"):
+    # #842 對抗審查第四輪 BLOCKER 1 修法後，operator-receipt-index.json 不再是
+    # 必要的登記關卡（operator 帳號寫不進 Manager-only 資產）；自簽檔案改在
+    # content-addressed 的身分自證上失敗（receipt_id 對不上內容雜湊)。
+    with pytest.raises(ValueError, match="identity mismatch"):
         store.review_candidate(
             candidate["candidate_id"], verdict="approved", operator_receipt_id=fake_id,
             test_only=False, expected_revision=1, idempotency_key="forged-receipt-file", now=NOW,
@@ -790,6 +793,95 @@ def test_q04_operator_approve_cli_requires_confirmation_and_writes_receipt(
     result = json.loads(capsys.readouterr().out)
     assert result["state"] == "approved"
     assert result["operator_receipt_id"].startswith("hqrcpt:v1:")
+
+
+def test_q04_operator_approve_revoke_cli_survives_manager_only_receipt_index_acl_separation(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """#842 對抗審查第四輪 BLOCKER 2。
+
+    上一個測試（test_q04_operator_approve_cli_requires_confirmation_and_writes_receipt）
+    的 ``QualificationStore()`` monkeypatch 換成同 UID 的 tmp store，全程對所有檔案都有
+    完整權限，因此永遠驗不到「operator 帳號與 Manager 帳號分離」這個真正要保護的情境。
+
+    這裡改用真實檔案權限模擬 ACL 分離：Trust Root 登記表對
+    ``execution-qualification-operator-receipt-index`` 宣告 writers=readers=MANAGER-only，
+    所以先讓該檔案存在（模擬 Manager 之前留下的登記），再 chmod 成對任何一般使用者
+    （包含這裡代表 operator 的行程）既不可讀也不可寫，逼真對應「operator 帳號讀不到、
+    寫不進 Manager-only 資產」的落點。要證明的是：即使這份 index 完全打不開，
+    operator CLI 的 approve／revoke 仍要能走完全程（不需要、也不嘗試去動它），
+    Manager 端後續查詢（qualification_status／read_roster）也要能正確採信這筆核可與撤銷。
+    """
+    from paulsha_cortex.porcelain import model_profile as porcelain_model
+
+    report, binding = _complete_report_binding()
+    store = QualificationStore(root=tmp_path / "state")
+    imported = _import_bound_report(
+        store, report, binding, expected_revision=0,
+        idempotency_key="cli-acl-sep-candidate", test_only=False,
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.qualification_lifecycle.QualificationStore",
+        lambda: store,
+    )
+
+    registry_path = store.paths.operator_receipt_registry_path
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps({"schema_version": 1, "receipts": {}}), encoding="utf-8"
+    )
+    registry_path.chmod(0o000)
+    try:
+        now = datetime.now(timezone.utc)
+        reviewed = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        expiry = (now.replace(microsecond=0) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+        approve_args = [
+            "qualification", "approve", imported["candidate_id"], "--actor", "operator-acl-sep",
+            "--reason", "ACL 分離下驗證 operator 仍能核可", "--policy-revision", "qualification-policy-v3",
+            "--reviewed-at", reviewed, "--expires-at", expiry, "--expected-revision", "1",
+            "--idempotency-key", "cli-acl-sep-approve", "--yes",
+        ]
+        assert porcelain_model.main(approve_args) == 0
+        approve_result = json.loads(capsys.readouterr().out)
+        assert approve_result["state"] == "approved"
+        assert approve_result["operator_receipt_id"].startswith("hqrcpt:v1:")
+
+        # Manager 端查詢：完全靠 receipt 檔本身的 content-addressed 自證，
+        # 不依賴（讀不到的）operator-receipt-index.json。
+        assert store.qualification_status(
+            "copilot", "fixture-model", binding.resolved_key, "build", now=now,
+        )["state"] == "approved"
+        roster_entries = store.read_roster()["entries"]
+        assert any(
+            entry.get("candidate_id") == imported["candidate_id"] and entry.get("state") == "approved"
+            for entry in roster_entries
+        )
+
+        # revoked_at 不可晚於真實牆鐘時間（CLI 未傳 now= 覆寫，issue_operator_receipt
+        # 一律用 datetime.now() 校驗「reviewed_at 不能在未來」)；沿用 approve 當下的
+        # reviewed 時間即可，此刻已是過去。
+        revoke_args = [
+            "qualification", "revoke", imported["candidate_id"], "--actor", "operator-acl-sep-revoke",
+            "--reason", "ACL 分離下驗證 operator 仍能撤銷", "--policy-revision", "qualification-policy-v3",
+            "--revoked-at", reviewed, "--expires-at", expiry, "--expected-revision", "2",
+            "--idempotency-key", "cli-acl-sep-revoke", "--yes",
+        ]
+        assert porcelain_model.main(revoke_args) == 0
+        revoke_result = json.loads(capsys.readouterr().out)
+        assert revoke_result["state"] == "revoked"
+
+        status_after_revoke = store.qualification_status(
+            "copilot", "fixture-model", binding.resolved_key, "build", now=now,
+        )
+        assert status_after_revoke["state"] == "revoked"
+        roster_after_revoke = store.read_roster()["entries"]
+        assert not any(
+            entry.get("candidate_id") == imported["candidate_id"] and entry.get("state") == "approved"
+            for entry in roster_after_revoke
+        )
+    finally:
+        # tmp_path 清理前恢復可寫，避免 pytest 的 tmp 目錄回收在某些平台上因權限被擋。
+        registry_path.chmod(0o600)
 
 
 def test_q05_fake_clock_expiry_revoke_timezone_and_clock_rollback(tmp_path: Path) -> None:

@@ -9,11 +9,13 @@
 
 ### Added
 
-- **#842 execution qualification lifecycle**：live 核可改由需 actor、reason 與確認的 operator CLI 核發 content-addressed receipt；Manager-only allowlist 綁住 receipt id/digest 與 exact candidate/report/profile/role/coverage/policy/expiry，未登記、偽造或遭竄改的檔案不能發布或通過 roster query。generation、review 與 expiry 比較統一解析 timezone-aware 時間；test-only receipt 不通過 sized-dispatch enforcement。操作與 Trust Root 權限見 `docs/execution-qualification.md`。
+- **#842 execution qualification lifecycle**：live 核可改由需 actor、reason 與確認的 operator CLI 核發 content-addressed receipt；receipt 檔本身的 id/digest 綁住 exact candidate/report/profile/role/coverage/policy/expiry 自證身分，偽造或遭竄改的檔案不能發布或通過 roster query（可選的 Manager-only index 讀得到時提供額外佐證，缺席不擋）。generation、review 與 expiry 比較統一解析 timezone-aware 時間；test-only receipt 不通過 sized-dispatch enforcement。操作與 Trust Root 權限見 `docs/execution-qualification.md`。
 
 - **#843 recovery action conformance**：新增版本化 action registry 與 13 家族契約矩陣，並以 dispatcher、control contract、coordinator CLI、`cortex recover` work/slice alias 雙向核對正式名稱與 CAS 欄位；補上 retry candidate CLI CAS、recover/abandon crash/restart 參數化特性與 frozen same-domain reviewer pin 零派工負控制。既有 producer gap 和 live 驗收界線記錄於矩陣。
 
 ### Fixed
+
+- **#842 execution qualification operator/Manager 帳號分離**：operator CLI 核發 approve／revoke receipt 不再嘗試寫入 Manager-only 的 `operator-receipt-index.json`（發布的 Trust Root ACL 下 writers/readers 都只有 Manager，operator 帳號寫不進、讀不到），改成只寫 operator 自己有權限的 immutable receipt 檔；讀取端據以改為「讀得到、對上了就多一層佐證，讀不到／查無此筆就退回單靠 receipt 檔本身 content-addressed 自證」，operator 帳號與 Manager 帳號分離時 approve／revoke 仍能完整核發、Manager 端查詢與 roster 依然正確採信。
 
 - **#842 execution qualification 撤銷後重播防護**：operator receipt 現在綁定核發當下的 lifecycle binding generation；approve／revoke 皆會推進 generation，重跑完全相同參數的 `qualification approve` 不再拿回撤銷前的舊人類 receipt，重播任何綁在舊世代的 receipt（含撤銷前的核可 receipt）也無法把已撤銷／到期的資格翻回 approved。`review_candidate`／`revoke_qualification` 改在取得 lifecycle lock 後、寫入前重新量測時間，避免他 process 持鎖到 receipt 過期後才放行卻仍以取鎖前的舊時間戳通過。
 

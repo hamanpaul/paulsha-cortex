@@ -1719,8 +1719,11 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         "paulsha_cortex.config.paths:execution_qualification_operator_receipt_registry_path",
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
         note=(
-            "#842 Manager-only allowlist；untrusted operator-receipt files without a matching "
-            "registered id and digest are never accepted for publish or roster queries."
+            "#842 對抗審查第四輪 BLOCKER 1：writers/readers 都是 Manager-only，"
+            "operator 帳號讀不到也寫不進去；operator 核發 receipt 因此不再依賴、"
+            "也不再嘗試寫入這份 index——receipt 檔本身的 content-addressed id／digest "
+            "才是驗證權威，這份 index 只在讀得到時提供額外佐證，缺席或不可讀不得擋下 "
+            "operator 自己核發的 receipt 用於 publish 或 roster 查詢。"
         ),
     ),
     TrustRootAsset(

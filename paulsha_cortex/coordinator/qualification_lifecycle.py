@@ -575,15 +575,31 @@ class QualificationStore:
         if not isinstance(receipt_id, str) or _OPERATOR_RECEIPT_ID_RE.fullmatch(receipt_id) is None:
             raise QualificationError("operator receipt id is invalid")
         _ensure_governed_dir(self.paths.operator_receipts_root)
-        registry = self._load_operator_receipt_index_unlocked()
-        registry_entry = registry["receipts"].get(receipt_id)
-        if not isinstance(registry_entry, Mapping):
-            raise QualificationError("operator receipt is not registered")
-        trusted_digest = registry_entry.get("digest")
-        if not isinstance(trusted_digest, str) or (
-            expected_digest is not None and expected_digest != trusted_digest
-        ):
-            raise QualificationError("operator qualification receipt registry digest mismatch")
+        # #842 對抗審查第四輪 BLOCKER 1：operator-receipt-index.json 是
+        # Manager-only 資產（writers=readers=MANAGER），operator 身分既無寫入
+        # 也無讀取權限；issue_operator_receipt() 已不再嘗試登記這份 index。
+        # 因此這裡把 index 當成「讀得到、有登記就多一層佐證」的最佳努力查核，
+        # 讀不到（不存在／權限不足）或查無此筆一律退回單靠 receipt 檔本身的
+        # content-addressed 自證去驗證——不可讓 operator 自己核發、尚未（也不會）
+        # 被登記的 receipt 反而被「查無登記」擋下。
+        registry_entry: Mapping[str, object] | None = None
+        try:
+            registry = self._load_operator_receipt_index_unlocked()
+        except (QualificationError, OSError):
+            registry = None
+        if registry is not None:
+            candidate_entry = registry["receipts"].get(receipt_id)
+            if candidate_entry is not None:
+                if not isinstance(candidate_entry, Mapping):
+                    raise QualificationError("operator receipt registry entry is invalid")
+                registry_entry = candidate_entry
+        trusted_digest: str | None = None
+        if registry_entry is not None:
+            trusted_digest = registry_entry.get("digest")
+            if not isinstance(trusted_digest, str) or (
+                expected_digest is not None and expected_digest != trusted_digest
+            ):
+                raise QualificationError("operator qualification receipt registry digest mismatch")
         envelope = _safe_read_json(
             self.paths.operator_receipts_root / f"{receipt_id}.json",
             label="operator qualification receipt",
@@ -595,7 +611,9 @@ class QualificationStore:
         if not isinstance(payload, dict):
             raise QualificationError("operator qualification receipt payload is invalid")
         digest = _sha256(payload)
-        if envelope.get("digest") != digest or trusted_digest != digest or (
+        if envelope.get("digest") != digest or (
+            trusted_digest is not None and trusted_digest != digest
+        ) or (
             expected_digest is not None and expected_digest != digest
         ):
             raise QualificationError("operator qualification receipt digest mismatch")
@@ -619,8 +637,8 @@ class QualificationStore:
             or payload.get("test_only") is not False
             or payload.get("verdict") not in {"approved", "revoked"}
             or payload.get("reviewer") != payload.get("actor")
-            or registry_entry.get("candidate_id") != payload.get("candidate_id")
-            or registry_entry.get("verdict") != payload.get("verdict")
+            or (registry_entry is not None and registry_entry.get("candidate_id") != payload.get("candidate_id"))
+            or (registry_entry is not None and registry_entry.get("verdict") != payload.get("verdict"))
             or type(payload.get("binding_generation")) is not int
             or payload.get("binding_generation") < 0
         ):
@@ -783,28 +801,20 @@ class QualificationStore:
             digest = _sha256(payload)
             if self._test_root:
                 _ensure_private_dir(self.paths.operator_receipts_root)
+            # #842 對抗審查第四輪 BLOCKER 1：發布的 Trust Root ACL 下，
+            # operator-receipts（本檔案落點）writers=MANAGER∪OPERATOR，
+            # 但 operator-receipt-index.json 是 writers=MANAGER-only 資產；
+            # operator 帳號與 Manager 帳號分離時寫不進去。這裡只寫 operator
+            # 自己有權限的 immutable receipt 檔（atomic、content-addressed、
+            # 同 id 不同內容即拒絕覆寫），不再嘗試登記到 Manager-only 的
+            # operator-receipt-index.json——任何路徑都不應要求 operator 寫
+            # Manager-only 資產，也不放寬該 index 的 ACL。receipt 本身的
+            # id／digest 已透過內容雜湊自證，_read_operator_receipt 的讀取端
+            # 直接核對檔案內容即可驗證，不依賴這份 index 是否存在。
             _atomic_write_governed_json(
                 self.paths.operator_receipts_root / f"{receipt_id}.json",
                 {"payload": payload, "digest": digest},
             )
-            receipt_index = self._load_operator_receipt_index_unlocked(create=True)
-            receipt_entries = receipt_index["receipts"]
-            assert isinstance(receipt_entries, dict)
-            registered = receipt_entries.get(receipt_id)
-            registration = {
-                "digest": digest,
-                "candidate_id": candidate_id,
-                "verdict": verdict,
-            }
-            if registered is not None and registered != registration:
-                raise QualificationConflict("operator receipt id is already registered differently")
-            if registered is None:
-                receipt_entries[receipt_id] = registration
-                _atomic_write_json(
-                    self.paths.operator_receipt_registry_path,
-                    receipt_index,
-                    governed_parent=not self._test_root,
-                )
             return {
                 "candidate_id": candidate_id,
                 "operator_receipt_id": receipt_id,
