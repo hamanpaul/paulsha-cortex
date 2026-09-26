@@ -21,6 +21,7 @@ WORK_ACTIONS = frozenset(
         "close-delivered",
         "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+        "verify-attest",
         "review-disposition",
         "intake",
     }

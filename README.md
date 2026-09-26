@@ -544,7 +544,7 @@ actor/reason/CAS 重送會回報已完成且不新增 audit。
 
 `fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。共享 coordinator root 內的 `jobs.json` 另以 exact durable-byte SHA-256 revision ＋ canonical `jobs.json.transaction.lock` sidecar 做 compare-and-persist：stale request 不會被靜默重播，daemon 會先把 `RegistryRevisionConflict`（含 expected/actual revision 與 canonical path）持久化成 `done` error，再移除 request file。
 
-Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|retire-delivered|close-delivered|auto|review-attest|review-disposition|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，CLI 會拒絕 `expected_run_id`；`cortex run work retry-build` 使用 `--expected-candidate`，不接受共用旗標 `--expected-run-id`。`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord；終態化後也會逐 run reconcile planning transaction、回收 build worktree，並退役 build branch。有超出 base 的 branch commit 會先保留在 `archive/<work_id>-<shortsha>` tag。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|retire-delivered|close-delivered|auto|verify-attest|review-attest|review-disposition|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，CLI 會拒絕 `expected_run_id`；`cortex run work retry-build` 使用 `--expected-candidate`，不接受共用旗標 `--expected-run-id`。`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord；終態化後也會逐 run reconcile planning transaction、回收 build worktree，並退役 build branch。有超出 base 的 branch commit 會先保留在 `archive/<work_id>-<shortsha>` tag。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
 沒有 `WorkflowRun` 的管線外交付可用 `cortex work close-delivered <work-id> --repo <owner/repo> --actor <actor> --reason <reason>` 補建 immutable CompletionRecord。Manager 會重驗 issue、PR merge commit、OpenSpec archive、mapped Todo 與 archived OpenSpec tasks；所有既有 remote closure 條件通過才寫入 actor/reason 證據，命令不會建立 WorkflowRun。
 
@@ -822,10 +822,16 @@ cortex slice-action "$SLICE_ID" supersede    --actor "$ACTOR" \
 cortex work abandon "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
   --expected-run-id "$RUN_ID" --reason "$REASON"
 
+# verify 卡停在 needs_human 時，operator 以 exact Candidate 提交 full-suite 摘要：
+cortex work verify-attest "$WORK_ID" --repo "$REPO" \
+  --expected-candidate "$CANDIDATE" --actor "$ACTOR" --payload verify-attest.json
+
 # PR已建立且foreign review綁定current HEAD後，建立typed maintainer evidence：
 cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
   --payload review-attest.json
 ```
+
+`verify-attest.json` 接受 `{"full_suite_command":"python -m pytest -q","result_summary":{"passed":5987,"failed":0}}`。這是 operator 提交的測試命令與結果聲明，Manager 不會代跑該命令。Manager 只在 ongoing、停於 verify/needs_human、exact Candidate 相符、build 已通過且沒有 active job 時，寫入綁定 repo/work/run/authority/candidate 的 immutable evidence 並推進 review；review 與後續 ship gate 照常執行，`review-attest` 仍只處理 review。
 
 `review-attest.json`接受`{"verdict":"approved","summary":"...","findings":[]}`，並可選填 `evidence_refs`（只接受 `{"kind":"operator-reproduction","ref":"<absolute path>","sha256":"<64 hex>"}` 陣列）。path/hash 仍由 Manager 生成，caller 不得注入。若 work item 尚無 mapped PR，Manager 會在 `verified_head == candidate_head` 時先建立 `pr_number: null` 的 immutable maintainer evidence；後續 ship 建 PR 時再把它綁進 delivery gate。若已有 PR，Manager 仍會重讀 authenticated PR HEAD 並將 evidence 綁定 repo/work/run/authority/PR/candidate/actor。
 
