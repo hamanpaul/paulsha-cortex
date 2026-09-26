@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#1042／#1045／#1046／#1058–#1060 plan review baseline 與 verify 恢復**：ready Yellow plan review 會原子保存受審逐檔 hash 並同步 run baseline；verify planning drift 會保存結構化 stop，operator resume 僅在原 Candidate、來源、receipt 與既有 workspace 均通過唯讀核對且尚無 verify job 時重綁並續跑。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、路徑逃逸、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用，內容驗收拒收維持
   content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

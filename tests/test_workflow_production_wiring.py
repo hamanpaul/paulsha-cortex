@@ -797,6 +797,594 @@ def test_plan_dispatch_passes_complete_planner_card_without_launch(tmp_path: Pat
     assert registry.list_jobs() == []
 
 
+def _reviewable_planning_fixture(root: Path) -> tuple[tuple[PlanningArtifactAuthority, ...], str, bytes]:
+    rows = (
+        (
+            "spec",
+            "docs/superpowers/specs/production-wiring-spec.md",
+            b"---\nstatus: accepted\n---\n# Spec\n## Requirements\nFixed.\n",
+        ),
+        (
+            "design",
+            "docs/superpowers/specs/production-wiring-design.md",
+            b"---\nstatus: accepted\n---\n# Design\n## Decisions\nFixed.\n",
+        ),
+        (
+            "plan",
+            "docs/superpowers/plans/production-wiring.md",
+            b"---\ninvariant_count: 1\nartifact_classes: [code, test]\nstatus: accepted\n---\n## Tasks\n- code test changelog CLI docs\n",
+        ),
+    )
+    authority = []
+    for kind, ref, content in rows:
+        target = root / ref
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        authority.append(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind=kind,
+                work_id="production-wiring",
+                baseline_sha256=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    todo_ref = "docs/superpowers/workstreams/production-wiring/todo.md"
+    old_todo = b"# Todo\n\n- [ ] accepted wording\n"
+    new_todo = b"# Todo\n\n- [ ] documentation/changelog/policy\n"
+    todo = root / todo_ref
+    todo.parent.mkdir(parents=True, exist_ok=True)
+    todo.write_bytes(old_todo)
+    authority.append(
+        PlanningArtifactAuthority(
+            ref=todo_ref,
+            kind="plan",
+            work_id="production-wiring",
+            baseline_sha256=hashlib.sha256(old_todo).hexdigest(),
+        )
+    )
+    todo.write_bytes(new_todo)
+    return tuple(authority), todo_ref, new_todo
+
+
+def test_ready_yellow_plan_review_freezes_reviewed_planning_bytes_and_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    authority, todo_ref, reviewed_todo = _reviewable_planning_fixture(repo)
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="test/cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="plan",
+        steps=_manifest().steps,
+        attempts={"plan": 1},
+        gate_status="running",
+        planning_authority=authority,
+        sizing_score=4,
+        sizing_band="yellow",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_evaluate_yellow_plan_review",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ready=True, terminal=False, failed_check=None
+        ),
+    )
+
+    manager.dispatch_workflow_card(
+        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        run=run,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    persisted = registry.get_workflow_run(run.run_id)
+    from paulsha_cortex.monitor.providers import _validate_workflow_v2_row
+
+    _validate_workflow_v2_row(persisted.to_dict())
+    frozen = {item.ref: item.baseline_sha256 for item in persisted.planning_authority}
+    receipt = persisted.plan_review_receipt
+    assert persisted.current_phase == "build"
+    assert persisted.plan_review_passed is True
+    assert frozen[todo_ref] == hashlib.sha256(reviewed_todo).hexdigest()
+    assert receipt is not None
+    assert receipt.run_id == run.run_id
+    assert receipt.review_card == "writing-plans"
+    assert receipt.ready is True
+    assert receipt.source_revision == run.source_revision
+    assert {item.ref: item.baseline_sha256 for item in receipt.artifacts}[todo_ref] == frozen[todo_ref]
+
+
+def test_plan_review_receipt_keeps_immutable_planning_source_after_provider_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    authority, _todo_ref, _reviewed_todo = _reviewable_planning_fixture(repo)
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="test/cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="plan",
+        steps=_manifest().steps,
+        attempts={"plan": 1},
+        gate_status="running",
+        planning_authority=authority,
+        sizing_score=4,
+        sizing_band="yellow",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_evaluate_yellow_plan_review",
+        lambda *_args, **_kwargs: SimpleNamespace(ready=True, terminal=False, failed_check=None),
+    )
+    manager.dispatch_workflow_card(
+        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        run=run,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    refreshed = registry._manager_update_workflow_run(run.run_id, source_revision="3" * 64)
+
+    assert refreshed.source_revision == "3" * 64
+    assert refreshed.planning_source_revision == "2" * 64
+    assert refreshed.plan_review_receipt is not None
+    assert refreshed.plan_review_receipt.source_revision == "2" * 64
+
+
+@pytest.mark.parametrize(
+    ("band", "review_outcome"),
+    [
+        ("yellow", SimpleNamespace(ready=False, terminal=False, failed_check="completeness")),
+        ("yellow", None),
+        ("green", None),
+    ],
+    ids=("review-not-ready", "review-unavailable", "green-does-not-review"),
+)
+def test_plan_review_without_ready_yellow_result_does_not_rebind_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    band: str,
+    review_outcome: object,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    authority, todo_ref, _reviewed_todo = _reviewable_planning_fixture(repo)
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="test/cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="plan",
+        steps=_manifest().steps,
+        attempts={"plan": 1},
+        gate_status="running",
+        planning_authority=authority,
+        sizing_score=1 if band == "green" else 4,
+        sizing_band=band,
+    )
+    monkeypatch.setattr(
+        manager, "_evaluate_yellow_plan_review", lambda *_args, **_kwargs: review_outcome
+    )
+
+    manager.dispatch_workflow_card(
+        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        run=run,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    persisted = registry.get_workflow_run(run.run_id)
+    old_todo = next(item for item in authority if item.ref == todo_ref)
+    assert persisted.plan_review_receipt is None
+    assert next(item for item in persisted.planning_authority if item.ref == todo_ref) == old_todo
+
+
+def test_verify_planning_input_drift_carries_exact_file_hashes(tmp_path: Path) -> None:
+    ref = "docs/superpowers/workstreams/production-wiring/todo.md"
+    operator_root = tmp_path / "operator"
+    candidate_root = tmp_path / "candidate"
+    source = operator_root / ref
+    candidate = candidate_root / ref
+    source.parent.mkdir(parents=True)
+    candidate.parent.mkdir(parents=True)
+    expected = b"# Todo\n\n- accepted wording\n"
+    current = b"# Todo\n\n- builder changed the task\n"
+    source.write_bytes(expected)
+    candidate.write_bytes(current)
+    authority = PlanningArtifactAuthority(
+        ref=ref,
+        kind="plan",
+        work_id="production-wiring",
+        baseline_sha256=hashlib.sha256(expected).hexdigest(),
+    )
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="test/cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(operator_root),
+        combo="feature-oneshot",
+        current_phase="verify",
+        steps=_manifest().steps,
+        candidate_head="a" * 40,
+        gate_status="running",
+        planning_authority=(authority,),
+    )
+    verify_card = manager._current_workflow_step(run).card
+
+    with pytest.raises(ValueError, match="workflow planning input drift") as caught:
+        manager._workflow_input_snapshot(
+            run=run,
+            repo_root=candidate_root,
+            patterns=(ref,),
+            coordinator_root=tmp_path / "coordinator",
+        )
+
+    assert caught.value.drift_rows == (
+        {
+            "ref": ref,
+            "kind": "plan",
+            "expected_sha256": hashlib.sha256(expected).hexdigest(),
+            "current_sha256": hashlib.sha256(current).hexdigest(),
+        },
+    )
+
+
+def test_verify_dispatch_persists_structured_drift_stop_before_any_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ref = "docs/superpowers/workstreams/production-wiring/todo.md"
+    baseline = b"# Todo\n\n- accepted wording\n"
+    expected_hash = hashlib.sha256(baseline).hexdigest()
+    current_hash = hashlib.sha256(b"# Todo\n\n- changed wording\n").hexdigest()
+    authority = PlanningArtifactAuthority(
+        ref=ref,
+        kind="plan",
+        work_id="production-wiring",
+        baseline_sha256=expected_hash,
+    )
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="test/cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path / "repo"),
+        combo="feature-oneshot",
+        current_phase="verify",
+        steps=_manifest().steps,
+        candidate_head="a" * 40,
+        gate_status="running",
+        planning_authority=(authority,),
+    )
+    verify_card = manager._current_workflow_step(run).card
+    drift = manager.WorkflowPlanningInputDrift(
+        (
+            {
+                "ref": ref,
+                "kind": "plan",
+                "expected_sha256": expected_hash,
+                "current_sha256": current_hash,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        manager,
+        "_validated_brainstorm_planning_authority",
+        lambda bound_run, **_kwargs: (bound_run.planning_authority, bound_run.planning_source_revision),
+    )
+    monkeypatch.setattr(manager, "dispatch_workflow_card", lambda *_args, **_kwargs: (_ for _ in ()).throw(drift))
+
+    result = manager.resume_workflow_run(
+        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: None,
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    persisted = registry.get_workflow_run(run.run_id)
+    stop = persisted.planning_drift_stop
+    from paulsha_cortex.monitor.providers import _validate_workflow_v2_row
+
+    _validate_workflow_v2_row(persisted.to_dict())
+    assert result["reason"] == "workflow-planning-input-drift"
+    assert stop is not None
+    assert stop.stop_code == "workflow-planning-input-drift"
+    assert stop.phase == "verify"
+    assert stop.run_id == run.run_id
+    assert stop.candidate_head == run.candidate_head
+    assert stop.card_id == verify_card
+    assert stop.verify_job_absent is True
+    assert stop.artifacts[0].expected_sha256 == expected_hash
+    assert stop.artifacts[0].current_sha256 == current_hash
+    assert "needs_human" in persisted.facets
+    assert registry.list_jobs() == []
+
+
+@pytest.mark.parametrize(
+    "candidate_change",
+    (
+        "checkbox",
+        "already-rebound",
+        "spec",
+        "design",
+        "plan",
+        "todo",
+        "legacy-no-receipt",
+        "verify-job-exists",
+        "cas-race",
+    ),
+    ids=(
+        "checkbox-only-accepted",
+        "already-rebound-retry-accepted",
+        "spec-edit-rejected",
+        "design-edit-rejected",
+        "plan-edit-rejected",
+        "todo-edit-rejected",
+        "legacy-no-receipt-rejected",
+        "existing-verify-job-rejected",
+        "registry-cas-race-rejected",
+    ),
+)
+def test_operator_resume_rebinds_exact_reviewed_candidate_before_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidate_change: str
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    authority, todo_ref, reviewed_todo = _reviewable_planning_fixture(repo)
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="test/cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="plan",
+        steps=_manifest().steps,
+        attempts={"plan": 1},
+        gate_status="running",
+        planning_authority=authority,
+        sizing_score=4,
+        sizing_band="yellow",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_evaluate_yellow_plan_review",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ready=True, terminal=False, failed_check=None
+        ),
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    manager.dispatch_workflow_card(
+        dispatcher,
+        run=run,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path / "coordinator",
+    )
+    run = registry.get_workflow_run(run.run_id)
+    receipt = run.plan_review_receipt
+    assert receipt is not None
+    candidate = "a" * 40
+    run = registry._manager_update_workflow_run(
+        run.run_id, current_phase="verify", candidate_head=candidate
+    )
+
+    # 建立已持久化的舊 baseline + ready receipt 組合，重現 plan review 與 run baseline
+    # 分開落盤時 verify 曾遇到的狀態；正常的新 review transition 已改為單次原子寫入。
+    stale = replace(run, planning_authority=authority)
+    registry._workflows[registry._find_workflow_run_index(run.run_id)] = stale
+    registry._persist()
+    run = registry.get_workflow_run(run.run_id)
+
+    candidate_root = tmp_path / "candidate"
+    for item in receipt.artifacts:
+        target = candidate_root / item.ref
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = reviewed_todo if item.ref == todo_ref else (repo / item.ref).read_bytes()
+        if candidate_change in {"checkbox", "already-rebound"} and item.ref == todo_ref:
+            content = content.replace(b"- [ ]", b"- [x]")
+        elif (
+            candidate_change == "spec" and item.ref.endswith("-spec.md")
+            or candidate_change == "design" and item.ref.endswith("-design.md")
+            or candidate_change == "plan" and item.ref == "docs/superpowers/plans/production-wiring.md"
+            or candidate_change == "todo" and item.ref == todo_ref
+        ):
+            content += b"\nBuilder changed accepted planning bytes.\n"
+        target.write_bytes(content)
+    build_step = next(step for step in run.steps if step.phase == "build" and step.persona == "builder")
+    builder = registry.create_job(
+        task="verified-candidate",
+        persona="builder",
+        branch="feature/production-wiring",
+        pane="",
+        worktree=str(candidate_root),
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain="openai",
+        subject_head=candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card=build_step.card,
+        workflow_phase="build",
+        workflow_repo_root=str(repo),
+        workflow_input_root=str(candidate_root),
+        source_revision=run.source_revision,
+    )
+    registry.update_headless_result(builder["job_id"], status="exited", exit_code=0)
+    todo_authority = next(item for item in authority if item.ref == todo_ref)
+    drift = manager.WorkflowPlanningInputDrift(
+        (
+            {
+                "ref": todo_ref,
+                "kind": "plan",
+                "expected_sha256": todo_authority.baseline_sha256,
+                "current_sha256": hashlib.sha256(
+                    (candidate_root / todo_ref).read_bytes()
+                ).hexdigest(),
+            },
+        )
+    )
+    monkeypatch.setattr(
+        manager,
+        "dispatch_workflow_card",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(drift),
+    )
+    stopped = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: None,
+        coordinator_root=tmp_path / "coordinator",
+    )
+    assert stopped["reason"] == "workflow-planning-input-drift"
+    verify_card = registry.get_workflow_run(run.run_id).planning_drift_stop.card_id
+
+    monkeypatch.setattr(
+        manager,
+        "_existing_reviewer_candidate_workspace",
+        lambda **_kwargs: candidate_root,
+    )
+    if candidate_change == "legacy-no-receipt":
+        current = registry.get_workflow_run(run.run_id)
+        registry._workflows[registry._find_workflow_run_index(run.run_id)] = replace(
+            current, plan_review_receipt=None
+        )
+        registry._persist()
+    elif candidate_change == "already-rebound":
+        registry._manager_update_workflow_run(
+            run.run_id,
+            planning_authority=receipt.artifacts,
+            planning_source_revision=receipt.source_revision,
+        )
+    elif candidate_change == "verify-job-exists":
+        registry.create_job(
+            task="existing-verify",
+            persona="verifier",
+            branch="feature/production-wiring",
+            pane="",
+            worktree=str(candidate_root),
+            subject_head=candidate,
+            workflow_run_id=run.run_id,
+            workflow_claim_key=run.claim_key,
+            workflow_repo=run.repo,
+            workflow_card=verify_card,
+            workflow_phase="verify",
+            workflow_repo_root=str(repo),
+            workflow_input_root=str(candidate_root),
+            source_revision=run.source_revision,
+        )
+    elif candidate_change == "cas-race":
+        rebind = registry._manager_rebind_planning_for_verify
+
+        def race_before_rebind(run_id, **kwargs):
+            current = registry.get_workflow_run(run_id)
+            index = registry._find_workflow_run_index(run_id)
+            registry._workflows[index] = replace(
+                current, updated_at="2099-01-01T00:00:00.000000+00:00"
+            )
+            registry._persist()
+            return rebind(run_id, **kwargs)
+
+        monkeypatch.setattr(registry, "_manager_rebind_planning_for_verify", race_before_rebind)
+    dispatched_runs = []
+
+    def record_verify_dispatch(_dispatcher, *, run, **_kwargs):
+        dispatched_runs.append(run)
+        if candidate_change in {"checkbox", "already-rebound"}:
+            registry.create_job(
+                task="verify-candidate",
+                persona="verifier",
+                branch="feature/production-wiring",
+                pane="",
+                worktree=str(candidate_root),
+                subject_head=candidate,
+                workflow_run_id=run.run_id,
+                workflow_claim_key=run.claim_key,
+                workflow_repo=run.repo,
+                workflow_card=verify_card,
+                workflow_phase="verify",
+                workflow_repo_root=str(repo),
+                workflow_input_root=str(candidate_root),
+                source_revision=run.source_revision,
+            )
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "verify-dispatch-recorded",
+        }
+
+    monkeypatch.setattr(manager, "dispatch_workflow_card", record_verify_dispatch)
+    resumed = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: None,
+        coordinator_root=tmp_path / "coordinator",
+        operator_resume=True,
+    )
+
+    persisted = registry.get_workflow_run(run.run_id)
+    if candidate_change in {"checkbox", "already-rebound"}:
+        assert resumed["reason"] == "verify-dispatch-recorded"
+        assert len(dispatched_runs) == 1
+        assert dispatched_runs[0].candidate_head == candidate
+        assert dispatched_runs[0].planning_authority == receipt.artifacts
+        assert dispatched_runs[0].planning_source_revision == receipt.source_revision
+        assert persisted.candidate_head == candidate
+        assert persisted.planning_authority == receipt.artifacts
+        assert persisted.plan_review_receipt == receipt
+        assert persisted.planning_drift_stop is not None
+        assert "needs_human" not in persisted.facets
+        assert len(registry.list_jobs()) == 2
+        monkeypatch.setattr(
+            dispatcher,
+            "poll_headless_done",
+            lambda job_id: registry.get_job(job_id),
+            raising=False,
+        )
+        retried = manager.resume_workflow_run(
+            dispatcher,
+            run_id=run.run_id,
+            identities=IdentityRegistry.from_rows([]),
+            launcher_factory=lambda _: None,
+            coordinator_root=tmp_path / "coordinator",
+            operator_resume=True,
+        )
+        assert retried["reason"] == "in-flight"
+        assert len(dispatched_runs) == 1
+        assert len(registry.list_jobs()) == 2
+    else:
+        assert resumed["reason"] == "workflow-planning-drift-recovery-ineligible"
+        assert dispatched_runs == []
+        assert persisted.candidate_head == candidate
+        assert persisted.planning_authority == authority
+        assert persisted.planning_drift_stop is not None
+        assert "needs_human" in persisted.facets
+        assert len(registry.list_jobs()) == (2 if candidate_change == "verify-job-exists" else 1)
+
+
 def test_plan_dispatch_launches_planner_when_artifacts_are_incomplete(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

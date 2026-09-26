@@ -81,7 +81,10 @@ from .workflow import (
     BRAINSTORM_AUTHORITY_MISSING,
     WORKFLOW_PHASES,
     GateEvidenceRef,
+    PlanningDriftArtifact,
     PlanningArtifactAuthority,
+    PlanReviewReceipt,
+    WorkflowPlanningDriftStop,
     WorkflowManifest,
     brainstorm_authority_bound,
     validate_workflow_phase_transition,
@@ -3183,6 +3186,78 @@ def _load_run_planning_artifacts(run) -> tuple[PlanningArtifact, ...] | None:
             return None
         artifacts.append(PlanningArtifact(kind=authority.kind, ref=authority.ref, text=text))
     return tuple(artifacts)
+
+
+def _plan_review_receipt(
+    *,
+    run,
+    review_card: str,
+    artifacts: tuple[PlanningArtifact, ...],
+    candidate_authority: tuple[PlanningArtifactAuthority, ...],
+) -> tuple[tuple[PlanningArtifactAuthority, ...], PlanReviewReceipt]:
+    """凍結 ready plan review 實際讀取的安全 workspace bytes。"""
+
+    source_revision = run.planning_source_revision or run.source_revision
+    current_by_ref = {item.ref: item for item in candidate_authority}
+    if len(current_by_ref) != len(candidate_authority):
+        raise ValueError("plan review planning authority contains duplicate refs")
+    artifact_by_ref = {item.ref: item for item in artifacts}
+    if (
+        len(artifact_by_ref) != len(artifacts)
+        or set(artifact_by_ref) != set(current_by_ref)
+        or any(
+            artifact_by_ref[ref].kind != authority.kind
+            for ref, authority in current_by_ref.items()
+        )
+    ):
+        raise ValueError("plan review artifacts differ from canonical planning authority")
+
+    root = Path(run.workspace_root).resolve()
+    frozen: list[PlanningArtifactAuthority] = []
+    for ref, authority in current_by_ref.items():
+        content, text = _read_planning_artifact_content(root, ref)
+        if text != artifact_by_ref[ref].text:
+            raise ValueError(f"plan review bytes changed before baseline freeze: {ref}")
+        frozen.append(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind=authority.kind,
+                work_id=run.work_id,
+                baseline_sha256=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    frozen_authority = tuple(frozen)
+    receipt = PlanReviewReceipt(
+        run_id=run.run_id,
+        work_id=run.work_id,
+        repo=run.repo,
+        claim_key=run.claim_key,
+        review_card=review_card,
+        source_revision=source_revision,
+        artifacts=frozen_authority,
+    )
+    return frozen_authority, receipt
+
+
+def _validate_plan_review_receipt_source(run) -> None:
+    """確認 receipt 綁定的受審規劃 bytes 仍未變更。"""
+
+    receipt = getattr(run, "plan_review_receipt", None)
+    if not isinstance(receipt, PlanReviewReceipt):
+        raise ValueError("workflow plan review receipt missing")
+    if (
+        receipt.run_id != run.run_id
+        or receipt.work_id != run.work_id
+        or receipt.repo != run.repo
+        or receipt.claim_key != run.claim_key
+        or receipt.source_revision != run.planning_source_revision
+    ):
+        raise ValueError("workflow plan review receipt binding drift")
+    root = Path(run.workspace_root).resolve()
+    for authority in receipt.artifacts:
+        content, _text = _read_planning_artifact_content(root, authority.ref)
+        if hashlib.sha256(content).hexdigest() != authority.baseline_sha256:
+            raise ValueError(f"workflow plan review receipt source drift: {authority.ref}")
 
 
 # --- #414：deterministic pass plan 卡前的 declared-outputs 驗證 -------------
@@ -6355,17 +6430,27 @@ def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict
     return mapping
 
 
+class WorkflowPlanningInputDrift(ValueError):
+    """保存與 frozen hash 不符的 planning input 逐檔差異。"""
+
+    def __init__(self, rows: tuple[dict[str, str], ...]) -> None:
+        self.drift_rows = tuple(dict(row) for row in rows)
+        super().__init__("workflow planning input drift")
+
+
 def _workflow_input_snapshot(
     *,
     run,
     repo_root: Path,
     patterns: tuple[str, ...],
     coordinator_root: str | Path,
+    persist_content: bool = True,
 ) -> tuple[dict[str, str], ...]:
     root = repo_root.resolve()
     operator_root = Path(run.workspace_root).resolve()
     authority = {item.ref: item for item in run.planning_authority}
     seeds: dict[str, bytes] = {}
+    drift_rows: list[dict[str, str]] = []
 
     for pattern in patterns:
         if _safe_input_matches(root, pattern):
@@ -6389,8 +6474,19 @@ def _workflow_input_snapshot(
             source = source_matches[0]
             data = source.read_bytes()
             if hashlib.sha256(data).hexdigest() != authority[ref].baseline_sha256:
-                raise ValueError("workflow planning input drift")
+                drift_rows.append(
+                    {
+                        "ref": ref,
+                        "kind": authority[ref].kind,
+                        "expected_sha256": authority[ref].baseline_sha256,
+                        "current_sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                )
+                continue
             seeds[ref] = data
+
+    if drift_rows:
+        raise WorkflowPlanningInputDrift(tuple(drift_rows))
 
     for ref, data in seeds.items():
         destination = root / ref
@@ -6453,7 +6549,14 @@ def _workflow_input_snapshot(
                         ):
                             tolerated = True
                 if not tolerated:
-                    raise ValueError("workflow planning input drift")
+                    drift_rows.append(
+                        {
+                            "ref": ref,
+                            "kind": bound.kind,
+                            "expected_sha256": bound.baseline_sha256,
+                            "current_sha256": digest,
+                        }
+                    )
             pattern_has_authority = any(
                 fnmatch.fnmatch(candidate_ref, pattern) for candidate_ref in authority
             )
@@ -6466,12 +6569,16 @@ def _workflow_input_snapshot(
             total_bytes += len(data)
             if total_bytes > 131072:
                 raise ValueError("workflow input envelope exceeds bound")
-            content_ref = _write_workflow_input_content(
-                coordinator_root=Path(coordinator_root),
-                run=run,
-                ref=ref,
-                digest=digest,
-                content=content,
+            content_ref = (
+                _write_workflow_input_content(
+                    coordinator_root=Path(coordinator_root),
+                    run=run,
+                    ref=ref,
+                    digest=digest,
+                    content=content,
+                )
+                if persist_content
+                else ""
             )
             rows.append(
                 {
@@ -6482,6 +6589,8 @@ def _workflow_input_snapshot(
                     "content_ref": content_ref,
                 }
             )
+    if drift_rows:
+        raise WorkflowPlanningInputDrift(tuple(drift_rows))
     return tuple(rows)
 
 
@@ -7242,6 +7351,28 @@ def _reviewer_candidate_workspace(
     created = Path(creator.create(branch, job_id=workspace_id, base_sha=candidate))
     _require_reviewer_candidate_workspace(created, branch=branch, candidate=candidate)
     return created
+
+
+def _existing_reviewer_candidate_workspace(
+    *, run, branch: str, candidate: str
+) -> Path:
+    """唯讀驗證既有 candidate tree，不建立或重建 workspace。"""
+
+    source = Path(run.workspace_root)
+    target = job_workspace.workspace_path(
+        worktree_root_for(source), _reviewer_candidate_workspace_id(run, candidate)
+    )
+    if target.is_symlink() or not target.is_dir() or not job_workspace.is_job_clone(target):
+        raise ValueError("workflow reviewer candidate workspace unavailable")
+    marker = job_workspace.read_marker(target)
+    if (
+        not isinstance(marker, dict)
+        or marker.get("branch") != branch
+        or str(marker.get("base", "")).lower() != candidate.lower()
+    ):
+        raise ValueError("workflow reviewer candidate workspace binding mismatch")
+    _require_reviewer_candidate_workspace(target, branch=branch, candidate=candidate)
+    return target.resolve()
 
 
 def _reviewer_sandbox_parent(
@@ -11160,6 +11291,17 @@ def _dispatch_workflow_card(
                         "reason": "plan-outputs-missing",
                     }
                 artifacts, new_authority, publication = materialize_result
+            next_authority = run.planning_authority + (
+                (new_authority,) if new_authority is not None else ()
+            )
+            review_receipt = None
+            if plan_review_passed_now:
+                next_authority, review_receipt = _plan_review_receipt(
+                    run=run,
+                    review_card=step.card,
+                    artifacts=artifacts,
+                    candidate_authority=next_authority,
+                )
             next_phase = run.current_phase
             attempts = run.attempts
             if is_last_pending:
@@ -11171,26 +11313,37 @@ def _dispatch_workflow_card(
             try:
                 if publication is not None:
                     publication.prepare_commit()
-                registry._manager_update_workflow_run(
-                    run.run_id,
-                    current_phase=next_phase,
-                    steps=_audit_phase_steps(
-                        run.steps,
-                        phase=run.current_phase,
-                        executor="cortex-manager",
-                        model="deterministic",
-                        domain="cortex",
-                        outputs=tuple(artifact.ref for artifact in artifacts),
-                        card_id=step.card,
-                    ),
-                    attempts=attempts,
-                    **({"plan_review_passed": True} if plan_review_passed_now else {}),
-                    **(
-                        {"planning_authority": run.planning_authority + (new_authority,)}
-                        if new_authority is not None
-                        else {}
-                    ),
+                audited_steps = _audit_phase_steps(
+                    run.steps,
+                    phase=run.current_phase,
+                    executor="cortex-manager",
+                    model="deterministic",
+                    domain="cortex",
+                    outputs=tuple(artifact.ref for artifact in artifacts),
+                    card_id=step.card,
                 )
+                if review_receipt is not None:
+                    registry._manager_accept_plan_review(
+                        run.run_id,
+                        expected_updated_at=run.updated_at,
+                        expected_phase=run.current_phase,
+                        expected_status=run.status,
+                        expected_candidate=run.candidate_head,
+                        expected_source_revision=run.source_revision,
+                        current_phase=next_phase,
+                        steps=audited_steps,
+                        attempts=attempts,
+                        planning_authority=next_authority,
+                        receipt=review_receipt,
+                    )
+                else:
+                    registry._manager_update_workflow_run(
+                        run.run_id,
+                        current_phase=next_phase,
+                        steps=audited_steps,
+                        attempts=attempts,
+                        **({"planning_authority": next_authority} if new_authority is not None else {}),
+                    )
             except BaseException:
                 if publication is not None:
                     publication.rollback()
@@ -11893,6 +12046,161 @@ def _provider_rate_limit_result(
     }
 
 
+def _rebind_reviewed_planning_for_verify(
+    dispatcher, *, registry, run, coordinator_root: str | Path
+) -> tuple[object | None, str | None]:
+    """先唯讀檢查資格，再執行一次 exact Registry CAS 並讀回確認。"""
+
+    receipt = run.plan_review_receipt
+    stop = run.planning_drift_stop
+    step = _current_workflow_step(run)
+    if (
+        not isinstance(receipt, PlanReviewReceipt)
+        or not isinstance(stop, WorkflowPlanningDriftStop)
+        or not run.plan_review_passed
+        or run.status != "ongoing"
+        or run.current_phase != "verify"
+        or step is None
+        or step.phase != "verify"
+        or stop.card_id != step.card
+        or stop.run_id != run.run_id
+        or stop.work_id != run.work_id
+        or stop.repo != run.repo
+        or stop.claim_key != run.claim_key
+        or stop.candidate_head != run.candidate_head
+        or stop.source_revision != run.source_revision
+        or receipt.run_id != run.run_id
+        or receipt.work_id != run.work_id
+        or receipt.repo != run.repo
+        or receipt.claim_key != run.claim_key
+        or receipt.source_revision != run.planning_source_revision
+        or not receipt.ready
+        or not isinstance(run.candidate_head, str)
+        or verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is None
+    ):
+        return None, "workflow-planning-drift-recovery-ineligible"
+
+    authority = {item.ref: item for item in run.planning_authority}
+    reviewed = {item.ref: item for item in receipt.artifacts}
+    if len(authority) != len(run.planning_authority) or len(reviewed) != len(receipt.artifacts):
+        return None, "workflow-planning-drift-recovery-ineligible"
+    baseline_already_rebound = (
+        run.planning_authority == receipt.artifacts
+        and run.planning_source_revision == receipt.source_revision
+    )
+    for drift in stop.artifacts:
+        old = authority.get(drift.ref)
+        accepted = reviewed.get(drift.ref)
+        if (
+            old is None
+            or accepted is None
+            or (
+                not baseline_already_rebound
+                and (
+                    old.kind != drift.kind
+                    or old.baseline_sha256 != drift.expected_sha256
+                )
+            )
+            or accepted.kind != drift.kind
+        ):
+            return None, "workflow-planning-drift-recovery-ineligible"
+
+    matching_verify_jobs = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_claim_key") in (None, run.claim_key)
+        and job.get("workflow_phase") == "verify"
+        and job.get("workflow_card") == stop.card_id
+        and job.get("subject_head") == run.candidate_head
+    ]
+    if matching_verify_jobs:
+        return None, "workflow-planning-drift-recovery-ineligible"
+    builder_jobs = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_claim_key") in (None, run.claim_key)
+        and job.get("workflow_phase") == "build"
+        and job.get("persona") == "builder"
+        and job.get("status") == "exited"
+        and job.get("exit_code") == 0
+        and job.get("subject_head") == run.candidate_head
+    ]
+    if not builder_jobs or not isinstance(builder_jobs[-1].get("branch"), str):
+        return None, "workflow-planning-drift-recovery-ineligible"
+
+    try:
+        _validate_plan_review_receipt_source(run)
+        candidate_root = _existing_reviewer_candidate_workspace(
+            run=run,
+            branch=builder_jobs[-1]["branch"],
+            candidate=run.candidate_head,
+        )
+        stop_rows = {item.ref: item for item in stop.artifacts}
+        for accepted in receipt.artifacts:
+            source_bytes, _ = _read_planning_artifact_content(
+                Path(run.workspace_root).resolve(), accepted.ref
+            )
+            if hashlib.sha256(source_bytes).hexdigest() != accepted.baseline_sha256:
+                return None, "workflow-planning-drift-recovery-ineligible"
+            candidate_bytes, _ = _read_planning_artifact_content(candidate_root, accepted.ref)
+            candidate_hash = hashlib.sha256(candidate_bytes).hexdigest()
+            stopped_row = stop_rows.get(accepted.ref)
+            if stopped_row is not None and candidate_hash != stopped_row.current_sha256:
+                return None, "workflow-planning-drift-recovery-ineligible"
+            if candidate_hash != accepted.baseline_sha256 and not (
+                accepted.kind == "plan"
+                and Path(accepted.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
+                and _checkbox_insensitive_equal(source_bytes, candidate_bytes)
+            ):
+                return None, "workflow-planning-drift-recovery-ineligible"
+
+        reviewed_run = replace(
+            run,
+            planning_authority=receipt.artifacts,
+            planning_source_revision=receipt.source_revision,
+        )
+        reviewed_step = _current_workflow_step(reviewed_run)
+        if reviewed_step is None:
+            return None, "workflow-planning-drift-recovery-ineligible"
+        patterns = _reviewer_input_patterns(
+            reviewed_run,
+            _effective_workflow_inputs(reviewed_run, reviewed_step),
+        )
+        _workflow_input_snapshot(
+            run=reviewed_run,
+            repo_root=candidate_root,
+            patterns=patterns,
+            coordinator_root=coordinator_root,
+            persist_content=False,
+        )
+        rebound = registry._manager_rebind_planning_for_verify(
+            run.run_id,
+            expected_updated_at=run.updated_at,
+            expected_candidate=run.candidate_head,
+            expected_authority=run.planning_authority,
+            expected_planning_source_revision=run.planning_source_revision,
+            receipt=receipt,
+        )
+        confirmed = registry.get_workflow_run(run.run_id)
+        if (
+            rebound != confirmed
+            or confirmed.current_phase != "verify"
+            or confirmed.status != "ongoing"
+            or confirmed.candidate_head != run.candidate_head
+            or confirmed.planning_authority != receipt.artifacts
+            or confirmed.planning_source_revision != receipt.source_revision
+            or confirmed.plan_review_receipt != receipt
+            or confirmed.planning_drift_stop != stop
+            or "needs_human" in confirmed.facets
+        ):
+            return None, "workflow-planning-drift-recovery-readback-failed"
+        return confirmed, None
+    except Exception:
+        return None, "workflow-planning-drift-recovery-ineligible"
+
+
 def resume_workflow_run(
     dispatcher,
     *,
@@ -11934,13 +12242,50 @@ def resume_workflow_run(
     pre_resume_gate_status = run.gate_status
     retry_failed = False
     recovery_job_id: str | None = None
+    if "needs_human" in run.facets and run.status == "ongoing" and not operator_resume:
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "operator-resume-required",
+        }
+    if run.planning_drift_stop is not None and run.status == "ongoing":
+        existing_verify_jobs = [
+            job
+            for job in registry.list_jobs()
+            if job.get("workflow_run_id") == run.run_id
+            and job.get("workflow_claim_key") in (None, run.claim_key)
+            and job.get("workflow_phase") == "verify"
+            and job.get("workflow_card") == run.planning_drift_stop.card_id
+            and job.get("subject_head") == run.planning_drift_stop.candidate_head
+        ]
+        already_rebound = (
+            run.plan_review_receipt is not None
+            and run.planning_authority == run.plan_review_receipt.artifacts
+            and run.planning_source_revision == run.plan_review_receipt.source_revision
+        )
+        if existing_verify_jobs:
+            if not already_rebound:
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "reason": "workflow-planning-drift-recovery-ineligible",
+                }
+        else:
+            rebound, reason = _rebind_reviewed_planning_for_verify(
+                dispatcher,
+                registry=registry,
+                run=run,
+                coordinator_root=coordinator_root,
+            )
+            if rebound is None:
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "reason": reason or "workflow-planning-drift-recovery-ineligible",
+                }
+            run = rebound
+            pre_resume_gate_status = run.gate_status
     if "needs_human" in run.facets and run.status == "ongoing":
-        if not operator_resume:
-            return {
-                "run_id": run.run_id,
-                "current_phase": run.current_phase,
-                "reason": "operator-resume-required",
-            }
         recovery_step = _current_workflow_step(run)
         if recovery_step is not None:
             recovery_jobs = [
@@ -12036,12 +12381,17 @@ def resume_workflow_run(
     )
     if not post_merge_closure:
         try:
-            planning_authority, planning_source_revision = (
-                _validated_brainstorm_planning_authority(
-                    run,
-                    coordinator_root=coordinator_root,
+            if run.plan_review_receipt is not None:
+                _validate_plan_review_receipt_source(run)
+                planning_authority = run.planning_authority
+                planning_source_revision = run.planning_source_revision
+            else:
+                planning_authority, planning_source_revision = (
+                    _validated_brainstorm_planning_authority(
+                        run,
+                        coordinator_root=coordinator_root,
+                    )
                 )
-            )
         except ValueError as exc:
             current = registry.get_workflow_run(run.run_id)
             updated = registry._manager_update_workflow_run(
@@ -12107,6 +12457,57 @@ def resume_workflow_run(
             )
         except Exception as exc:
             current = registry.get_workflow_run(bound_run.run_id)
+            current_step = _current_workflow_step(current)
+            if (
+                isinstance(exc, WorkflowPlanningInputDrift)
+                and current.current_phase == "verify"
+                and current.status == "ongoing"
+                and current_step is not None
+                and current_step.phase == "verify"
+                and isinstance(current.candidate_head, str)
+                and verification.SAFE_SHA_RE.fullmatch(current.candidate_head) is not None
+                and exc.drift_rows
+            ):
+                stop = WorkflowPlanningDriftStop(
+                    run_id=current.run_id,
+                    work_id=current.work_id,
+                    repo=current.repo,
+                    claim_key=current.claim_key,
+                    card_id=current_step.card,
+                    candidate_head=current.candidate_head,
+                    source_revision=current.source_revision,
+                    artifacts=tuple(
+                        PlanningDriftArtifact(
+                            ref=row["ref"],
+                            kind=row["kind"],
+                            expected_sha256=row["expected_sha256"],
+                            current_sha256=row["current_sha256"],
+                        )
+                        for row in exc.drift_rows
+                    ),
+                )
+                stopped = registry._manager_record_planning_drift_stop(
+                    current.run_id,
+                    expected_updated_at=current.updated_at,
+                    expected_candidate=current.candidate_head,
+                    stop=stop,
+                    reason=diagnostic_reason(
+                        "workflow-planning-input-drift",
+                        "verify 派工前的 planning input hash 與 frozen baseline 不符",
+                        source="manager.resume_workflow_run:verify-planning-drift",
+                        run_id=current.run_id,
+                        work_id=current.work_id,
+                        card=current_step.card,
+                        candidate=current.candidate_head,
+                        source_revision=current.source_revision,
+                        artifact_count=str(len(stop.artifacts)),
+                    ),
+                )
+                return {
+                    "run_id": stopped.run_id,
+                    "current_phase": stopped.current_phase,
+                    "reason": stop.stop_code,
+                }
             registry._manager_update_workflow_run(
                 bound_run.run_id,
                 facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
@@ -12221,7 +12622,11 @@ def resume_workflow_run(
         )
     ]
     job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
-    if job is not None and recovery_job_id == job.get("job_id"):
+    if (
+        recovery_job_id is not None
+        and job is not None
+        and recovery_job_id == job.get("job_id")
+    ):
         job = dispatch_or_stop(run, retry_recovery_job_id=recovery_job_id)
     elif retry_failed and job is not None and (
         _is_stale_terminalized_failed_job(job)
