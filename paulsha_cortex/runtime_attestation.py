@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 RUNTIME_ATTESTATION_SCHEMA = "cortex/loaded-runtime-attestation/v1"
 _SERVICES = frozenset({"manager", "monitor"})
@@ -811,6 +811,82 @@ def service_declaration_projection(
             "environment_digest": configuration_revision(effective_environment),
         }
     return result
+
+
+def unknown_runtime_report(
+    reason: str, current_artifact: Mapping[str, object]
+) -> dict[str, object]:
+    """單一 service 目前狀態判定不出來時的標準投影。
+
+    ``cortex service status`` 與 doctor 的 loaded-runtime 判定共用同一個
+    shape，確保兩邊在同一種「宣告存在但無法安全信任」情境下（例如
+    ``environment_source`` 判定為 ``unknown``，或有效環境算出來卻連不上
+    receipt）回報的結構完全一致——這是 #841 對抗審查第五輪修掉「doctor 另起
+    一份精簡版 unknown 結構，與 service status 對不起來」那組回歸的關鍵。"""
+
+    is_installed = current_artifact.get("kind") == "installed-wheel"
+    return {
+        "status": "unknown",
+        "reason": reason,
+        "loaded": None,
+        "installed_artifact": current_artifact if is_installed else {
+            "kind": "unknown",
+            "package": current_artifact.get("package"),
+            "package_version": "unknown",
+            "source_revision": "unknown",
+            "sha256": None,
+        },
+        "current_artifact": current_artifact,
+        "comparison": {
+            "status": "unknown",
+            "reason": reason,
+            "artifact_status": "unknown",
+            "config_status": "unknown",
+            "transition_disposition": "unknown-in-flight-state",
+            "transition_safe": False,
+        },
+        "initial_config_revision": None,
+        "effective_config_revision": None,
+        "previous_process_start": None,
+        "trust_root": {"status": "unknown"},
+    }
+
+
+def declared_service_environment(
+    declaration: object,
+    *,
+    direct_fallback: Callable[[], Mapping[str, str]],
+) -> tuple[dict[str, str], str]:
+    """單一 service 依目前 ``environment_source`` 判定會拿到的有效環境。
+
+    判定規則只有這裡一份：``systemd-effective`` 直接信任已套用 drop-in 的
+    有效值；``unavailable``（探測不到 systemd 有效屬性，需要退回既有讀法）
+    交給呼叫端提供的 ``direct_fallback``；``unknown``（屬性存在但無法安全
+    解析，例如 ``Environment=``／``EnvironmentFiles=`` 的 ``PYTHONPATH`` 互相
+    衝突）一律視為無法信任，回傳空環境，不得沿用另一個 service 的值或呼叫端
+    自己的殼層環境頂替。
+
+    ``cortex service status``（讀真實 ``os.environ`` 下的既有 EnvironmentFile）
+    與 doctor（可注入 ``home``／``base_env`` 的 hermetic 讀法）行為差異只在
+    各自的 ``direct_fallback`` 實作，兩邊都必須經過這個函式判斷分支，不得各自
+    重新判斷 source——這是 #841 對抗審查第五輪 MAJOR 指出「doctor 用 manager
+    的環境去比對 monitor，與 service status 不一致」那組回歸的修法核心。"""
+
+    source = (
+        declaration.get("environment_source")
+        if isinstance(declaration, Mapping)
+        else None
+    )
+    overlay = declaration.get("environment") if isinstance(declaration, Mapping) else None
+    if source == "systemd-effective" and isinstance(overlay, Mapping):
+        return dict(overlay), "systemd-effective"
+    if source == "unavailable":
+        try:
+            fallback = direct_fallback()
+        except Exception:
+            return {}, "unknown"
+        return dict(fallback), "direct-fallback"
+    return {}, "unknown"
 
 
 def monitor_configuration_revision_from_environment(

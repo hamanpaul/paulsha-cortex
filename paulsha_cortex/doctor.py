@@ -112,33 +112,42 @@ def _probe_result(
 def _loaded_runtime_probe(
     *, instance: str, environment: Mapping[str, str]
 ) -> ProbeResult:
+    """判定已載入的 manager／monitor artifact／config 身分。
+
+    #841 對抗審查第五輪 MAJOR：過去這裡拿同一份合併過的 ``environment`` 去
+    解析 manager／monitor 兩邊的 root／config，manager 這邊 systemd-effective、
+    monitor 這邊 unavailable（或 unknown）時，會誤拿 manager 的環境去比對
+    monitor，與 ``cortex service status``（`porcelain/service.py` 的
+    ``_loaded_runtime_payload``）逐 service 判定的結論不一致。這裡改成逐
+    service 呼叫與 ``cortex service status`` 共用的同一個判定規則
+    （``runtime_attestation.declared_service_environment``／
+    ``unknown_runtime_report``），只有「systemd 不可用時要退回讀哪個環境檔」
+    這一步各自實作：service status 讀真實 ``os.environ``，doctor 讀注入的
+    ``home``／``environment`` 以維持 hermetic 可測試性；分支判定與 unknown
+    shape 不重複實作第二套。"""
     from .runtime_attestation import (
         artifact_identity,
         cli_runtime_observation,
+        declared_service_environment,
         manager_environment_revision,
         monitor_configuration_revision_from_environment,
         runtime_status_report,
         service_declaration_projection,
+        unknown_runtime_report,
     )
     from .porcelain._runtime_probe import probe_service_runtime
 
+    home = Path(environment.get("HOME", str(Path.home())))
+    operator_cli: Mapping[str, object] | None = None
+    service_declaration: Mapping[str, object] | None = None
     try:
-        manager_root = resolve_runtime_root(
-            "PSC_COORDINATOR_ROOT", environment=environment
-        )
-        monitor_root = resolve_runtime_root(
-            "PSC_MONITOR_STATE_ROOT", environment=environment
-        )
         current = artifact_identity()
         operator_cli = cli_runtime_observation(
             instance=instance,
             environment=environment,
             artifact=current,
         )
-        service_runtime = probe_service_runtime(
-            instance,
-            home=Path(environment.get("HOME", str(Path.home()))),
-        )
+        service_runtime = probe_service_runtime(instance, home=home)
         units = service_runtime.get("units", {})
         service_declaration = service_runtime.get("service_declaration")
         if not isinstance(service_declaration, Mapping):
@@ -146,6 +155,11 @@ def _loaded_runtime_probe(
                 units,
                 instance=instance,
             )
+        environment_overlay = service_runtime.get("_environment_overlay")
+        if not isinstance(environment_overlay, Mapping):
+            from .runtime_attestation import service_environment_overlay
+
+            environment_overlay = service_environment_overlay(units, instance=instance)
         manager_artifact = service_declaration["manager"].get("artifact")
         monitor_artifact = service_declaration["monitor"].get("artifact")
 
@@ -154,40 +168,68 @@ def _loaded_runtime_probe(
             pid = row.get("pid") if isinstance(row, Mapping) else None
             return pid if type(pid) is int else None
 
-        manager = runtime_status_report(
-            manager_root,
-            service="manager",
-            instance=instance,
-            declared_config_revision=manager_environment_revision(environment),
+        def service_report(
+            service: str,
+            *,
+            root_key: str,
+            declared_config_revision: Callable[[Mapping[str, str]], str | None],
+            declared_config_component: str,
+            expected_pid: int | None,
+            current_artifact: object,
+        ) -> dict[str, object]:
+            def fallback() -> dict[str, str]:
+                return _loaded_runtime_direct_fallback(
+                    service=service,
+                    home=home,
+                    instance=instance,
+                    base_env=environment,
+                )
+
+            service_environment, service_source = declared_service_environment(
+                environment_overlay.get(service), direct_fallback=fallback
+            )
+            if service_source == "unknown":
+                return unknown_runtime_report("service-environment-unknown", current)
+            try:
+                service_root = resolve_runtime_root(root_key, environment=service_environment)
+                return runtime_status_report(
+                    service_root,
+                    service=service,
+                    instance=instance,
+                    declared_config_revision=declared_config_revision(service_environment),
+                    declared_config_component=declared_config_component,
+                    expected_pid=expected_pid,
+                    require_process_match=True,
+                    current_artifact=(
+                        current_artifact
+                        if isinstance(current_artifact, Mapping)
+                        else {"kind": "unknown"}
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — 這個 service 的宣告無法安全解析。
+                return unknown_runtime_report("runtime-declaration-unavailable", current)
+
+        manager = service_report(
+            "manager",
+            root_key="PSC_COORDINATOR_ROOT",
+            declared_config_revision=manager_environment_revision,
             declared_config_component="environment_revision",
             expected_pid=unit_pid(f"{instance}-manager.service"),
-            require_process_match=True,
-            current_artifact=(
-                manager_artifact
-                if isinstance(manager_artifact, Mapping)
-                else {"kind": "unknown"}
-            ),
+            current_artifact=manager_artifact,
         )
-        monitor = runtime_status_report(
-            monitor_root,
-            service="monitor",
-            instance=instance,
-            declared_config_revision=monitor_configuration_revision_from_environment(
-                environment
-            ),
+        monitor = service_report(
+            "monitor",
+            root_key="PSC_MONITOR_STATE_ROOT",
+            declared_config_revision=monitor_configuration_revision_from_environment,
+            declared_config_component="effective_revision",
             expected_pid=unit_pid(f"{instance}-monitor.service"),
-            require_process_match=True,
-            current_artifact=(
-                monitor_artifact
-                if isinstance(monitor_artifact, Mapping)
-                else {"kind": "unknown"}
-            ),
+            current_artifact=monitor_artifact,
         )
-    except Exception:  # noqa: BLE001 — 宣告無法讀取時維持 unknown。
+    except Exception:  # noqa: BLE001 — 宣告完全無法讀取時維持 unknown。
         context: Mapping[str, object] = {
             "operator_cli": (
                 operator_cli
-                if "operator_cli" in locals()
+                if operator_cli is not None
                 else {"status": "unknown", "instance": instance}
             ),
             "service_declaration": service_declaration_projection(None, instance=instance),
@@ -1040,6 +1082,17 @@ def _load_bootstrap_environment(
     )
     manager_source = manager_declaration.get("environment_source")
     monitor_source = monitor_declaration.get("environment_source")
+    if "unknown" in (manager_source, monitor_source):
+        # #841 對抗審查第五輪 MAJOR：這個判斷過去排在兩個 systemd-effective
+        # 分支之後，只有「兩邊都不是 systemd-effective」時才吃得到——manager
+        # 這邊 systemd-effective、monitor 這邊 unknown（例如 monitor unit 的
+        # ``Environment=``／``EnvironmentFiles=`` 宣告了互相衝突的
+        # ``PYTHONPATH``）時，manager 那個分支會提早 return，這個 guard 永遠
+        # 執行不到，service-paths 因此對明知有衝突的 monitor 蓋章 pass。
+        # ``unknown`` 是「宣告存在但無法安全解析」的真資料完整性問題，不是
+        # ``unavailable``（systemd 對這個 unit 探測不到、可正常退回檔案讀取）
+        # 那種預期過渡態，即使另一邊是 systemd-effective 也不能略過。
+        raise ValueError("managed bootstrap environment is invalid")
 
     def trusted_environment(overlay: object) -> dict[str, str]:
         # #841 對抗審查第四輪 MAJOR：systemd-effective 這條路徑只能用 unit
@@ -1068,8 +1121,6 @@ def _load_bootstrap_environment(
         return trusted_environment(manager_declaration.get("environment"))
     if monitor_source == "systemd-effective":
         return trusted_environment(monitor_declaration.get("environment"))
-    if "unknown" in (manager_source, monitor_source):
-        raise ValueError("managed bootstrap environment is invalid")
 
     manager_files = _unit_environment_files(
         manager_unit,
@@ -1081,10 +1132,29 @@ def _load_bootstrap_environment(
     )
     if manager_files != monitor_files:
         raise ValueError("manager/monitor EnvironmentFile order differs")
-    bootstrap_env = _authoritative_bootstrap_env(manager_files, home=home, instance=instance)
+    return _direct_fallback_environment(
+        manager_files, home=home, instance=instance, base_env=base_env
+    )
+
+
+def _direct_fallback_environment(
+    env_files: tuple[tuple[Path, bool], ...],
+    *,
+    home: Path,
+    instance: str,
+    base_env: Mapping[str, str],
+) -> dict[str, str]:
+    """讀一組 ``EnvironmentFile=`` 宣告，重建 systemd 不可用（direct-fallback）
+    時的有效環境。
+
+    供整體部署判定（``_load_bootstrap_environment``，要求 manager／monitor
+    宣告一致後合併成一份）與單一 service 的 loaded-runtime 判定
+    （``_loaded_runtime_direct_fallback``，只讀那一個 service 自己的宣告）
+    共用同一份讀檔／驗證規則，不得各自另外重寫一份（#841 對抗審查第五輪）。"""
+    bootstrap_env = _authoritative_bootstrap_env(env_files, home=home, instance=instance)
     effective = dict(base_env)
     loaded_files: set[Path] = set()
-    for env_path, optional in manager_files:
+    for env_path, optional in env_files:
         if not env_path.exists():
             if optional:
                 continue
@@ -1096,6 +1166,26 @@ def _load_bootstrap_environment(
     if bootstrap_env not in loaded_files:
         raise ValueError("managed bootstrap EnvironmentFile missing")
     return _finalize_effective_environment(effective, home=home, instance=instance)
+
+
+def _loaded_runtime_direct_fallback(
+    *, service: str, home: Path, instance: str, base_env: Mapping[str, str]
+) -> dict[str, str]:
+    """loaded-runtime 判定專用的單一 service direct-fallback：只讀這一個
+    service 自己的 unit 宣告，不要求另一個 service 的宣告與它一致。
+
+    #841 對抗審查第五輪 MAJOR：doctor 過去把 manager／monitor 混進同一份
+    ``_load_bootstrap_environment`` 合併結果餵給 loaded-runtime 判定，manager
+    systemd-effective、monitor unavailable 時會拿 manager 的環境去比對
+    monitor，與 ``cortex service status`` 逐 service 判定不一致。這裡改成
+    每個 service 各自解析；任何一步失敗都讓例外往上傳給
+    ``declared_service_environment``，由它統一轉成 unknown，不得沿用另一個
+    service 的值頂替。"""
+    unit_path = home / ".config" / "systemd" / "user" / f"{instance}-{service}.service"
+    env_files = _unit_environment_files(unit_path, home=home)
+    return _direct_fallback_environment(
+        env_files, home=home, instance=instance, base_env=base_env
+    )
 
 
 def _service_environment_probe(

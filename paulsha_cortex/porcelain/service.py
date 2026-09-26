@@ -17,11 +17,13 @@ from paulsha_cortex.deploy import installer
 from paulsha_cortex.runtime_attestation import (
     artifact_identity,
     cli_runtime_observation,
+    declared_service_environment,
     manager_environment_revision,
     monitor_configuration_revision_from_environment,
     runtime_status_report,
     service_declaration_projection,
     service_environment_overlay,
+    unknown_runtime_report,
 )
 
 from . import COMMANDS, PorcelainCommand, register
@@ -316,32 +318,9 @@ def _unit_pid(units: Any, service_name: str) -> int | None:
 
 
 def _unknown_runtime_report(reason: str, current_artifact: dict[str, object]) -> dict[str, object]:
-    is_installed = current_artifact.get("kind") == "installed-wheel"
-    return {
-        "status": "unknown",
-        "reason": reason,
-        "loaded": None,
-        "installed_artifact": current_artifact if is_installed else {
-            "kind": "unknown",
-            "package": current_artifact.get("package"),
-            "package_version": "unknown",
-            "source_revision": "unknown",
-            "sha256": None,
-        },
-        "current_artifact": current_artifact,
-        "comparison": {
-            "status": "unknown",
-            "reason": reason,
-            "artifact_status": "unknown",
-            "config_status": "unknown",
-            "transition_disposition": "unknown-in-flight-state",
-            "transition_safe": False,
-        },
-        "initial_config_revision": None,
-        "effective_config_revision": None,
-        "previous_process_start": None,
-        "trust_root": {"status": "unknown"},
-    }
+    # #841 對抗審查第五輪：shape 改由 runtime_attestation.unknown_runtime_report
+    # 唯一定義，doctor 的 loaded-runtime 判定共用同一份，避免兩邊結構各自漂移。
+    return unknown_runtime_report(reason, current_artifact)
 
 
 def _service_declared_environment(
@@ -350,11 +329,13 @@ def _service_declared_environment(
     """依 service 宣告目前的 ``environment_source`` 決定該 service 實際會拿到
     的環境變數。
 
-    systemd 有效宣告可用時直接採用它（已反映 drop-in 對 ``Environment=``／
-    ``EnvironmentFiles=`` 的覆寫，不必重讀 ``~/.agents/core/runtime/*.env``）；
-    只有 systemd 本身不可用的 direct 模式，才退回既有的 fallback 讀檔。宣告
-    存在但無法安全解析時回傳空環境並標示 unknown，不得靜默沿用舊 fallback去
-    對錯 root／config（那正是 #841 對抗審查抓到的回歸）。
+    分支判定（systemd-effective／unavailable／unknown）改由
+    ``runtime_attestation.declared_service_environment`` 唯一決定，doctor 的
+    loaded-runtime 判定共用同一條規則（#841 對抗審查第五輪修掉「doctor 用
+    manager 的環境去比對 monitor」那組回歸）；這裡只負責提供 ``cortex
+    service status`` 自己的 direct-fallback 讀法（讀真實 ``os.environ`` 下既有
+    的 ``~/.agents/core/runtime/*.env``），doctor 端則注入可 hermetic 測試的
+    讀法，兩邊分支邏輯不會各自漂移。
 
     #841 對抗審查第四輪 MAJOR：systemd-effective 分支只能用 unit 宣告本身，
     不得以呼叫者（操作 CLI）的殼層環境為底再覆蓋——否則殼層裡未被 unit 宣告
@@ -363,17 +344,9 @@ def _service_declared_environment(
     描述 operator CLI 本身（見 ``cli_runtime_observation``），不進這裡。缺的
     root 由 ``resolve_runtime_root`` 自行退回已安裝 instance／home 預設，不需
     要在這裡預先補值。"""
-    source = (
-        declaration.get("environment_source")
-        if isinstance(declaration, dict)
-        else None
+    return declared_service_environment(
+        declaration, direct_fallback=lambda: _fallback_environment(instance)
     )
-    overlay = declaration.get("environment") if isinstance(declaration, dict) else None
-    if source == "systemd-effective" and isinstance(overlay, dict):
-        return dict(overlay), "systemd-effective"
-    if source == "unavailable":
-        return _fallback_environment(instance), "direct-fallback"
-    return {}, "unknown"
 
 
 def _loaded_runtime_payload(
