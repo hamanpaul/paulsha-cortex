@@ -113,6 +113,14 @@ def coverage_shadow_telemetry_root() -> Path:
     return coordinator_root() / "coverage-shadow"
 
 
+QUOTA_OBSERVATION_DIRNAME = "quota-observations"
+
+
+def quota_observation_root() -> Path:
+    """#836 Manager-owned quota observation/event ledger 根。"""
+    return coordinator_root() / QUOTA_OBSERVATION_DIRNAME
+
+
 #: `review_verdict_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數
 #: 是為了讓 `coordinator/review.py` 的 per-job 定址與本 resolver 共用同一個字面量
 #: （R1 登記表的「重複路徑推導」Scenario 要求單一真相）。

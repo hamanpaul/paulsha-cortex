@@ -20,17 +20,30 @@ flowchart LR
 
 persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role profile + scope subject），不是執行中的 agent session；真正執行的是 AgentInstance，真正做安全判斷的是 guardrail / policy engine，它們只讀 persona 契約做 enforcement。
 
-## Quota observation schema core
+## Quota observation shadow
 
 `paulsha_cortex.coordinator.quota_observation` 是 #866 的純 stdlib wire-contract
 模組：它解析 standalone `UnitDefinition`、`PoolDescriptor`、
 `ProfilePoolBinding`、`QuotaObservation`，並計算 `binding_status()`、
-`freshness()`、`event_identity()`。目前這層只做 bounded validation、不可變
-record 與 helper，**沒有**接到 `registry.update_headless_result()`、
-`usage_extractors.extract_usage()`、durable quota ledger、admission 或派工裁決。
-現有 usage／reset 訊號路徑仍維持 `registry.update_headless_result() →
-extract_usage()` 與 `outcome_taxonomy.StreamEvidence`；若未來要把 quota 觀測接到
-來源 adapter／ledger／admission，仍屬 #836 的後續 B/C/D work item。
+`freshness()`、`event_identity()`。#836 沿用這個 schema-core，新增
+`quota_sources` 的純 payload adapter、`quota_ledger` 的 Manager-owned append-only
+event store，以及 `quota_shadow` 的唯讀 reconciliation。shadow 會按 pool/window
+分開顯示 observed、estimated、unknown、native usage 與 coverage gaps；不同 unit
+沒有已驗證 mapping 時不會換算或扣抵。Shadow consumer API 接受 controller、
+worker、reviewer 的既有 registry/#325 `extract_usage()` 結果，不另讀 log 或解析 token。
+
+provider adapter 接收呼叫端已取得的 Codex `account/rateLimits/read`、Copilot SDK
+`account.getQuota` 或 Antigravity CLI `/usage` JSON（參考 [Codex App Server
+protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs)、
+[Copilot SDK usage and billing](https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/usage-and-billing)、
+[Antigravity CLI usage](https://antigravity.google/docs/cli/commands/usage)）；adapter
+不啟動命令、不讀 credentials。沒有已核實 machine-readable quota 介面的 executor
+回傳 unknown 與 coverage gap。Ledger 位於 `quota_observation_root()`，以獨立事件檔
+保存，已登記於 Trust Root；corrupt／future／無法讀取資料 fail closed。這些 API 只供 shadow
+producer/consumer 使用，不接 workflow chain、排序、reservation、admission 或派工，
+亦可由 `record_external_observation()` 匯入呼叫端已唯讀取得的外部 host/session
+事件；未覆蓋的外部來源仍標 gap。這些 API 不代表 provider live read 或安裝 runtime
+已驗收。
 
 ## Execution profile schema／key core
 
