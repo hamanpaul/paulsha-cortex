@@ -152,33 +152,56 @@ def _rate_limit_payload(*, remaining: int, reset: int = 1_800_000_000):
     )
 
 
+def _terminal_pages(default_revision: str):
+    first = json.loads(json.dumps(_GRAPH))
+    first["data"]["repository"]["defaultBranchRef"]["target"]["oid"] = (
+        default_revision
+    )
+    first["data"]["repository"]["pullRequests"]["pageInfo"] = {
+        "hasNextPage": True,
+        "endCursor": "cursor-1",
+    }
+    second = json.loads(json.dumps(first))
+    second["data"]["repository"]["pullRequests"]["pageInfo"] = {
+        "hasNextPage": False,
+        "endCursor": None,
+    }
+    return [_completed(first), _completed(second)]
+
+
 # --------------------------------------------------------------------------
 # A. 請求節流／攤平
 # --------------------------------------------------------------------------
 
 
-def test_throttle_spaces_each_request_instead_of_bursting():
+def test_throttle_spaces_each_request_instead_of_bursting(git_origin):
+    repo = git_origin()
+    repo.commit({"README.md": "default\n"}, message="default")
     clock = FakeClock()
-    runner = ScriptedRunner([_completed(_GRAPH), _completed(_TREE)])
+    runner = ScriptedRunner(_terminal_pages(repo.head()))
 
     result = GitHubTerminalProvider(
         "example/acme",
         runner=runner,
+        repo_root=repo.checkout,
         pressure_gate=_gate(clock, interval_seconds=0.2, jitter_seconds=0.1),
     ).scan()
 
     assert result.status == "ok"
-    # 兩次 gh 請求 → 兩段節流間隔（jitter_source 固定 0 → 純 interval）。
+    # 兩頁 GraphQL → 兩段節流間隔；本機 tree 讀取不經 GitHub 節流閘。
     assert clock.sleeps == [0.2, 0.2]
 
 
-def test_throttle_jitter_is_added_on_top_of_interval():
+def test_throttle_jitter_is_added_on_top_of_interval(git_origin):
+    repo = git_origin()
+    repo.commit({"README.md": "default\n"}, message="default")
     clock = FakeClock()
-    runner = ScriptedRunner([_completed(_GRAPH), _completed(_TREE)])
+    runner = ScriptedRunner(_terminal_pages(repo.head()))
 
     GitHubTerminalProvider(
         "example/acme",
         runner=runner,
+        repo_root=repo.checkout,
         pressure_gate=_gate(clock, jitter=1.0, interval_seconds=0.2, jitter_seconds=0.1),
     ).scan()
 
@@ -199,20 +222,26 @@ def test_throttle_zero_interval_disables_throttling():
     assert clock.sleeps == []
 
 
-def test_throttle_budget_caps_total_sleep_and_resets_per_cycle():
+def test_throttle_budget_caps_total_sleep_and_resets_per_cycle(git_origin):
     """極端情況（repo 數暴增）不得讓節流本身吃掉整個 refresh interval。"""
+    repo = git_origin()
+    repo.commit({"README.md": "default\n"}, message="default")
     clock = FakeClock()
     gate = _gate(clock, interval_seconds=0.2, jitter_seconds=0.0, budget_seconds=0.25)
-    runner = ScriptedRunner([_completed(_GRAPH), _completed(_TREE)])
+    runner = ScriptedRunner(_terminal_pages(repo.head()))
 
-    GitHubTerminalProvider("example/acme", runner=runner, pressure_gate=gate).scan()
+    GitHubTerminalProvider(
+        "example/acme", runner=runner, repo_root=repo.checkout, pressure_gate=gate
+    ).scan()
 
     # 第二次只剩 0.05 預算，之後即使還有請求也不再 sleep。
     assert clock.sleeps == pytest.approx([0.2, 0.05])
 
     gate.begin_cycle()
-    runner = ScriptedRunner([_completed(_GRAPH), _completed(_TREE)])
-    GitHubTerminalProvider("example/acme", runner=runner, pressure_gate=gate).scan()
+    runner = ScriptedRunner(_terminal_pages(repo.head()))
+    GitHubTerminalProvider(
+        "example/acme", runner=runner, repo_root=repo.checkout, pressure_gate=gate
+    ).scan()
 
     assert clock.sleeps == pytest.approx([0.2, 0.05, 0.2, 0.05])
 

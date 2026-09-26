@@ -24,10 +24,10 @@ from .git_mirror import (
     GitMirrorError,
     GitRunner,
     LocalGitMirror,
-    unavailable_provenance,
 )
 from .event_spool import (
     EventSpool,
+    SpoolScan,
     TargetedRefresh,
     coalesce_hints,
     parse_event_timestamp,
@@ -1285,6 +1285,7 @@ class GitHubWorkProvider:
         sync_store: IssueSyncStore | None = None,
         full_sync_interval_seconds: float = DEFAULT_FULL_SYNC_INTERVAL_SECONDS,
         event_spool: EventSpool | None = None,
+        event_scan: SpoolScan | None = None,
         targeted_refresh_limit: int | None = None,
         now: Callable[[], str] | None = None,
     ) -> None:
@@ -1303,6 +1304,8 @@ class GitHubWorkProvider:
         # D4：沒有 spool（或 spool 目錄不存在，例如 D5 hook 尚未部署到這台機器）
         # 就完全維持 D3 行為——事件入口是**加速器**，不是任何東西的必要條件。
         self.event_spool = event_spool
+        # WorkModelRefresher 將同一輪的共享 spool scan 傳給每個 repo provider。
+        self.event_scan = event_scan
         self.targeted_refresh_limit = (
             self._TARGETED_LIMIT if targeted_refresh_limit is None else int(targeted_refresh_limit)
         )
@@ -1612,7 +1615,7 @@ class GitHubWorkProvider:
             "ignored": {},
             "foreign_schema": 0,
         }
-        scan = self.event_spool.scan(now=attempted_at)
+        scan = self.event_scan or self.event_spool.scan(now=attempted_at)
         report["quarantined"] = len(scan.quarantined)
         report["ignored"] = dict(scan.ignored)
         report["foreign_schema"] = scan.foreign_schema
@@ -1915,8 +1918,7 @@ class GitHubTerminalProvider:
         # closed（degraded），**不會**退回 REST，也不會當成「檔案不存在」。
         self.repo_root = None if repo_root is None else Path(repo_root)
         self.git_runner = git_runner
-        # #506：本 provider 仍是 REST 請求量最大的一支（graphql 分頁 + 1 次
-        # git tree），節流／退避沒接上它等於沒做減壓。
+        # #506：本 provider 的 GraphQL 分頁仍需共用 token 節流／退避。
         self.pressure_gate = pressure_gate
         if any(
             not isinstance(delay, (int, float))
@@ -1976,60 +1978,11 @@ class GitHubTerminalProvider:
             default_revision = default_branch_ref["target"]["oid"]
             if re.fullmatch(r"[0-9a-fA-F]{40}", default_revision) is None:
                 raise ValueError("default branch revision is invalid")
-            tree = self._json(
-                (
-                    "gh", "api", "--method", "GET",
-                    f"repos/{self.repo}/git/trees/{default_revision}?recursive=1",
-                )
-            )
-            if tree.get("truncated") is not False:
-                raise ValueError("default branch tree is truncated")
-            if not isinstance(tree.get("tree"), list):
-                raise ValueError("default branch tree entries are invalid")
-            todo_entries = self._remote_todo_entries(tree)
-            paths = {
-                row["path"]
-                for row in tree["tree"]
-                if isinstance(row, Mapping) and isinstance(row.get("path"), str)
-            }
-            active_changes = {
-                parts[2]
-                for path in paths
-                if len(parts := path.split("/")) >= 4
-                and parts[:2] == ["openspec", "changes"]
-                and parts[2] != "archive"
-            }
-            archived_changes = {
-                match.group("name")
-                for path in paths
-                if path.startswith("openspec/changes/archive/")
-                if len(path.split("/")) >= 5
-                if (match := _ARCHIVE_DATE_PREFIX.match(path.split("/")[3]))
-            }
-            if active_changes & archived_changes:
-                raise ValueError("remote active/archive OpenSpec collision")
-            sources = tuple(
-                WorkSource(
-                    source_id=f"github_openspec:{self.repo}:{ref}:{status}",
-                    kind="openspec",
-                    ref=ref,
-                    revision=f"github-tree:{default_revision.lower()}",
-                    status=status,
-                    confidence="confirmed",
-                    provider=self.provider_id,
-                    title=ref,
-                )
-                for status, refs in (
-                    ("active", sorted(active_changes)),
-                    ("archived", sorted(archived_changes)),
-                )
-                for ref in refs
-            )
             links: dict[str, str] = {}
             remote_prs: list[dict[str, object]] = []
             branches: list[dict[str, str]] = []
-            # D2：ancestry 不再逐 PR 打 ``compare``；先把候選收集起來，等本輪唯一
-            # 一次 ``mirror.require()`` 把物件備齊後再用本機 ``merge-base`` 判定。
+            # D2：ancestry 不再逐 PR 打 ``compare``；先收集候選，讓第一次
+            # ``mirror.require()`` 一併取得 default branch 與 PR refs，再用本機判定。
             ancestry_candidates: list[tuple[int, str, dict[str, object]]] = []
             for pull in pull_nodes:
                 number = pull["number"]
@@ -2086,9 +2039,20 @@ class GitHubTerminalProvider:
                         (number, str(row["merge_revision"]), row)
                     )
                 remote_prs.append(row)
-            mirror: LocalGitMirror | None = None
-            if todo_entries or ancestry_candidates:
-                mirror = self._mirror()
+            mirror = self._mirror()
+            mirror.require(
+                required=(default_revision.lower(),),
+                ancestry=tuple(
+                    (number, revision)
+                    for number, revision, _ in ancestry_candidates
+                ),
+                default_branch=default_branch,
+            )
+            tree_entries = mirror.list_tree(default_revision)
+            todo_entries = self._remote_todo_entries(tree_entries)
+            if todo_entries:
+                # partial object store 可能有 commit/tree 卻缺 Todo blob；同一 mirror
+                # 只補齊需要讀的 blob 與前面已收集的 ancestry refs。
                 mirror.require(
                     required=(
                         default_revision.lower(),
@@ -2100,12 +2064,45 @@ class GitHubTerminalProvider:
                     ),
                     default_branch=default_branch,
                 )
+            paths = {path for path, _kind, _revision in tree_entries}
+            active_changes = {
+                parts[2]
+                for path in paths
+                if len(parts := path.split("/")) >= 4
+                and parts[:2] == ["openspec", "changes"]
+                and parts[2] != "archive"
+            }
+            archived_changes = {
+                match.group("name")
+                for path in paths
+                if path.startswith("openspec/changes/archive/")
+                if len(path.split("/")) >= 5
+                if (match := _ARCHIVE_DATE_PREFIX.match(path.split("/")[3]))
+            }
+            if active_changes & archived_changes:
+                raise ValueError("remote active/archive OpenSpec collision")
+            sources = tuple(
+                WorkSource(
+                    source_id=f"github_openspec:{self.repo}:{ref}:{status}",
+                    kind="openspec",
+                    ref=ref,
+                    revision=f"github-tree:{default_revision.lower()}",
+                    status=status,
+                    confidence="confirmed",
+                    provider=self.provider_id,
+                    title=ref,
+                )
+                for status, refs in (
+                    ("active", sorted(active_changes)),
+                    ("archived", sorted(archived_changes)),
+                )
+                for ref in refs
+            )
             remote_todos = self._remote_todos(todo_entries, mirror=mirror)
-            if mirror is not None:
-                for _, merge_revision, row in ancestry_candidates:
-                    row["merged_with_merge_commit"] = mirror.is_ancestor(
-                        merge_revision, default_revision.lower()
-                    )
+            for _, merge_revision, row in ancestry_candidates:
+                row["merged_with_merge_commit"] = mirror.is_ancestor(
+                    merge_revision, default_revision.lower()
+                )
         except subprocess.TimeoutExpired:
             return self._failure(attempted_at, "github terminal timeout")
         except GitMirrorError as error:
@@ -2143,18 +2140,10 @@ class GitHubTerminalProvider:
             "default_revision": default_revision.lower(),
             "remote_todos": remote_todos,
             "branches": branches,
-            # D2 provenance：這一輪的 remote 檔案內容與 ancestry 是從哪裡、用哪些
+            # D2 provenance：這一輪的 remote tree、檔案內容與 ancestry 是從哪裡、用哪些
             # ref 讀來的。degraded 的那一輪不會走到這裡，因此 provenance 永遠對應
             # 一份成功的鏡像讀取。
-            "remote_reads": (
-                dict(mirror.provenance)
-                if mirror is not None
-                else dict(
-                    unavailable_provenance(
-                        "no remote artifact or ancestry required this cycle"
-                    )
-                )
-            ),
+            "remote_reads": dict(mirror.provenance),
         }
         if self.pressure_gate is not None:
             # #506：整支 scan 走完都沒被限流，退避窗可以關掉。
@@ -2191,8 +2180,8 @@ class GitHubTerminalProvider:
         completed = None
         for attempt in range(len(self.retry_delays) + 1):
             if self.pressure_gate is not None:
-                # #506：節流點在**每一次** REST 請求前（graphql 分頁與 git tree）。
-                # D2 之後逐檔 contents 與逐 PR compare 已改走本機 git，不經此路徑
+                # #506：節流點在**每一次** GitHub REST 請求前（graphql 分頁）。
+                # tree、逐檔 contents 與逐 PR compare 都走本機 git，不經此路徑
                 # ——git 協定不受 REST rate limit 管轄，節流它只是白白拖慢掃描。
                 self.pressure_gate.throttle()
             completed = self.runner.run(argv, timeout=self.timeout_seconds)
@@ -2246,21 +2235,15 @@ class GitHubTerminalProvider:
 
     @staticmethod
     def _remote_todo_entries(
-        tree: Mapping,
+        tree_entries: Sequence[tuple[str, str, str]],
     ) -> tuple[tuple[str, str, re.Match[str] | None], ...]:
-        """從 REST tree 挑出要讀的 blob（path、blob sha、archive match）。
+        """從本機 git tree 挑出要讀的 blob（path、blob sha、archive match）。
 
         只解析、不讀內容——內容統一在本輪唯一一次 ``git cat-file --batch`` 取得。
         """
 
         entries: list[tuple[str, str, re.Match[str] | None]] = []
-        for entry in tree.get("tree", []):
-            if not isinstance(entry, Mapping):
-                continue
-            path = entry.get("path")
-            revision = entry.get("sha")
-            if not isinstance(path, str):
-                continue
+        for path, kind, revision in tree_entries:
             is_todo = re.fullmatch(
                 r"docs/superpowers/workstreams/.+/todo\.md", path
             ) is not None
@@ -2270,9 +2253,7 @@ class GitHubTerminalProvider:
             )
             if not is_todo and archive_match is None:
                 continue
-            if entry.get("type") != "blob" or not isinstance(revision, str) or re.fullmatch(
-                r"[0-9a-fA-F]{40}", revision
-            ) is None:
+            if kind != "blob":
                 raise ValueError("remote Todo tree entry is invalid")
             entries.append((path, revision.lower(), archive_match))
         return tuple(entries)

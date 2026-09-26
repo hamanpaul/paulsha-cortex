@@ -13,7 +13,7 @@ from typing import Callable, Mapping, Sequence
 
 from .config import load_config
 from .correlation import InferredSignal, correlate_work_sources
-from .event_spool import EventSpool
+from .event_spool import EventSpool, SpoolScan
 from .git_mirror import GITHUB_HTTPS_REMOTE, GITHUB_SSH_REMOTE
 from .github_issue_sync import IssueSyncStore
 from .github_pressure import GitHubPressureGate
@@ -522,6 +522,16 @@ class WorkModelRefresher:
                 repo, is_github = _repo_identity(root, project.project_id)
                 repo_groups.setdefault(repo, []).append((project, root, is_github))
 
+            event_scan: SpoolScan | None = None
+            if include_github and self._uses_default_github_provider and any(
+                is_github
+                for group in repo_groups.values()
+                for _project, _root, is_github in group
+            ):
+                # #585：spool 共用 fleet 事件目錄，每輪只掃一次；各 repo provider
+                # 從同一快照篩選自己的 hint，仍只消費對應 repo 的事件。
+                event_scan = self.event_spool.scan(now=attempted_at)
+
             for repo, group in sorted(repo_groups.items(), key=lambda row: row[0]):
                 # Sort so main git repo (.git is dir) comes first, then shortest path
                 def _is_canonical(root: Path) -> int:
@@ -570,6 +580,7 @@ class WorkModelRefresher:
                             # D4：事件 spool 是加速器——沒有它就純粹退回 D3 的
                             # refresh 週期發現延遲，不影響正確性。
                             event_spool=self.event_spool,
+                            event_scan=event_scan,
                         )
                         if self._uses_default_github_provider
                         else self.github_provider_factory(repo)
