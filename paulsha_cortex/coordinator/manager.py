@@ -12730,7 +12730,9 @@ def _record_task_memory_events(
             logger.warning("task-memory receipt write failed (%s)", type(exc).__name__)
 
 
-def _task_memory_work_item_title(repo: str, work_id: str) -> str | None:
+def _task_memory_work_item_title(
+    repo: str, work_id: str, *, run_id: str | None = None
+) -> str | None:
     """#857 對抗審查 R4：goal/intent 優先取正式 Work Item 標題。
 
     讀 Monitor 落地的 durable last-good snapshot（與
@@ -12750,9 +12752,30 @@ def _task_memory_work_item_title(repo: str, work_id: str) -> str | None:
         return None
     for item in snapshot.work_items:
         if item.repo == repo and item.work_id == work_id:
+            # 第六輪：Work Item 已被 Monitor 重綁到別的 workflow run 時，不替
+            # 舊 run 採用其標題（退回卡片描述），避免錯 run 的任務歸因。
+            if (
+                run_id is not None
+                and item.workflow_run_id is not None
+                and item.workflow_run_id != run_id
+            ):
+                return None
             title = item.title.strip()
             return title or None
     return None
+
+
+def _task_memory_current_era_jobs(
+    run, matching: Sequence[Mapping[str, object]]
+) -> list[Mapping[str, object]]:
+    """第六輪：只採用與 run 目前 claim_key 同一 era 的前次 job；claim_key 變更
+    （authority restart／重新 claim）後，前一個 era 的產出與錯誤不屬於這次
+    任務，不得進入 task memory context。未標 era 的舊 row 同樣排除。"""
+
+    claim_key = getattr(run, "claim_key", None)
+    if not claim_key:
+        return []
+    return [job for job in matching if job.get("workflow_claim_key") == claim_key]
 
 
 def _task_memory_goal(run, step) -> str:
@@ -12762,7 +12785,9 @@ def _task_memory_goal(run, step) -> str:
     處理，這裡只組候選文字，不重複那套規則。
     """
 
-    title = _task_memory_work_item_title(run.repo, run.work_id)
+    title = _task_memory_work_item_title(
+        run.repo, run.work_id, run_id=getattr(run, "run_id", None)
+    )
     base = title if title else f"Complete {step.phase} work {step.card} for {run.repo}."
     issue_refs = tuple(dict.fromkeys(run.issue_refs))
     if issue_refs:
@@ -12784,8 +12809,9 @@ def _task_memory_related_files(
     """
 
     files: list[str] = [authority.ref for authority in run.planning_authority]
-    if matching:
-        baseline_rows = matching[-1].get("workflow_output_baseline")
+    era_jobs = _task_memory_current_era_jobs(run, matching)
+    if era_jobs:
+        baseline_rows = era_jobs[-1].get("workflow_output_baseline")
         if isinstance(baseline_rows, list):
             for row in baseline_rows:
                 if isinstance(row, Mapping):
@@ -12796,7 +12822,7 @@ def _task_memory_related_files(
 
 
 def _task_memory_related_errors(
-    matching: Sequence[Mapping[str, object]], *, registry
+    matching: Sequence[Mapping[str, object]], *, registry, run=None
 ) -> tuple[str, ...]:
     """#857 對抗審查 R4：related_errors 只取前一 attempt 既有的 bounded 採信
     錯誤——與 ``_workflow_retry_context`` 同一支 ``_prior_card_acceptance_error``
@@ -12805,9 +12831,12 @@ def _task_memory_related_errors(
     空 tuple。
     """
 
-    if not matching:
+    era_jobs = (
+        _task_memory_current_era_jobs(run, matching) if run is not None else list(matching)
+    )
+    if not era_jobs:
         return ()
-    error = _prior_card_acceptance_error(matching[-1], registry=registry)
+    error = _prior_card_acceptance_error(era_jobs[-1], registry=registry)
     if error is None:
         return ()
     message = str(error.get("message") or "").strip()
@@ -12856,7 +12885,9 @@ def _prepare_task_memory_dispatch(
             capabilities=TaskMemoryCapabilities(inline=True),
             goal=_task_memory_goal(run, step),
             related_files=_task_memory_related_files(run, matching),
-            related_errors=_task_memory_related_errors(matching, registry=registry),
+            related_errors=_task_memory_related_errors(
+                matching, registry=registry, run=run
+            ),
             allowed_evidence_sources=("hippo",),
         )
         client = HippoTaskMemoryClient.from_environment()

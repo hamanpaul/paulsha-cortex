@@ -1171,6 +1171,56 @@ def test_adapter_has_no_project_or_task_kind_special_case(repo, work_id, phase):
     assert result.events[0]["project"] == context.project
 
 
+def test_task_memory_envelope_ignores_rebound_work_item_and_prior_claim_era(tmp_path, monkeypatch):
+    """#857 對抗審查第六輪：(1) Monitor 已把 Work Item 重綁到別的 workflow run
+    時，不得替舊 run 採用該 Work Item 的標題；(2) claim_key 變更後，前一個
+    era 的 output baseline 與採信錯誤不得帶進 related_files／related_errors。"""
+
+    from types import SimpleNamespace
+
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.monitor import work_snapshot as work_snapshot_module
+    from paulsha_cortex.monitor.work_snapshot import WorkSnapshot, WorkSnapshotStore
+
+    snapshot_path = tmp_path / "work-items-snapshot.json"
+    monkeypatch.setattr(work_snapshot_module, "work_items_snapshot_path", lambda: snapshot_path)
+    item = WorkItem(
+        work_id="demo",
+        repo="acme/demo",
+        title="Rebound work item title",
+        state="ongoing",
+        phase="build",
+        facets=(),
+        sources=(),
+        next_actions=(),
+        workflow_run_id="workflow-new-run",
+        updated_at="2026-09-26T00:01:00Z",
+    )
+    WorkSnapshotStore(path=snapshot_path).write(
+        WorkSnapshot(
+            sequence=1,
+            written_at="2026-09-26T00:00:00Z",
+            providers={},
+            work_items=(item,),
+            source_owners={},
+            exclusions=(),
+        )
+    )
+    assert manager._task_memory_work_item_title("acme/demo", "demo", run_id="workflow-old-run") is None
+    assert (
+        manager._task_memory_work_item_title("acme/demo", "demo", run_id="workflow-new-run")
+        == "Rebound work item title"
+    )
+
+    run = SimpleNamespace(planning_authority=(), claim_key="claim:era-2")
+    prior_era_job = {
+        "workflow_claim_key": "claim:era-1",
+        "workflow_output_baseline": [{"path": "src/prior_era_only.py"}],
+    }
+    assert "src/prior_era_only.py" not in manager._task_memory_related_files(run, [prior_era_job])
+    assert manager._task_memory_related_errors([prior_era_job], registry=None, run=run) == ()
+
+
 def test_task_memory_work_item_title_reads_durable_work_snapshot(tmp_path, monkeypatch):
     """#857 對抗審查第四輪：goal/intent 的標題來源改讀 Monitor 落地的 durable
     last-good work snapshot（``WorkSnapshotStore``），不是即時 IPC，也不是
@@ -1239,7 +1289,7 @@ def test_dispatch_envelope_uses_work_item_title_issue_refs_and_prior_attempt_fac
     monkeypatch.setattr(
         manager,
         "_task_memory_work_item_title",
-        lambda repo, work_id: (
+        lambda repo, work_id, **_kwargs: (
             "Ship the task memory adapter for #857"
             if (repo, work_id) == (run.repo, run.work_id)
             else None
@@ -1254,6 +1304,8 @@ def test_dispatch_envelope_uses_work_item_title_issue_refs_and_prior_attempt_fac
         {
             "job_id": "job-prior-attempt",
             "workflow_run_id": run.run_id,
+            # 同一 claim era 的前次 attempt（第六輪：跨 era 的 job 不採用）。
+            "workflow_claim_key": run.claim_key,
             "workflow_card": step.card,
             "workflow_phase": step.phase,
             "status": "exited",
