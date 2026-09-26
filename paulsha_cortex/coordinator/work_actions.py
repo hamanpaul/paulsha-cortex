@@ -6529,6 +6529,11 @@ def _close_delivered_action(
     if not authority.mapped_todo_paths:
         raise RuntimeError("close-delivered requires mapped Todo paths")
 
+    try:
+        canonical_checkout = resolve_trusted_repo_root(authority.repo)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("close-delivered canonical checkout unavailable") from exc
+
     github = GitHubDeliveryClient(runner=runner)
     change = authority.mapped_openspec[0] if authority.mapped_openspec else None
     todo_paths = tuple(authority.mapped_todo_paths)
@@ -6538,13 +6543,16 @@ def _close_delivered_action(
         change=change,
         required_issues=authority.mapped_issues,
         todo_paths=todo_paths,
+        canonical_checkout=canonical_checkout,
     )
     if change is not None:
         archive_task_paths = tuple(
             sorted(
                 path
                 for path in github._commit_tree_paths(
-                    repo=authority.repo, commit=facts.default_head
+                    repo=authority.repo,
+                    commit=facts.default_head,
+                    canonical_checkout=canonical_checkout,
                 )
                 if re.fullmatch(
                     rf"openspec/changes/archive/\d{{4}}-\d{{2}}-\d{{2}}-"
@@ -6562,6 +6570,7 @@ def _close_delivered_action(
             change=change,
             required_issues=authority.mapped_issues,
             todo_paths=tuple(sorted(set(todo_paths) | set(archive_task_paths))),
+            canonical_checkout=canonical_checkout,
         )
         if (
             facts.default_head != first_facts.default_head
@@ -8372,6 +8381,7 @@ def _ship_action(
             repo=authority.repo,
             pr_number=pr_number,
             change=change,
+            canonical_checkout=repo_root,
             authority=authority,
             todo_paths=tuple(todo_paths_value),
             expected_head=expected_head,
@@ -8468,6 +8478,7 @@ def _ship_action(
             repo=authority.repo,
             pr_number=pr_number,
             change=change,
+            canonical_checkout=repo_root,
             authority=authority,
             todo_paths=tuple(todo_paths),
             expected_head=expected_head,

@@ -636,6 +636,7 @@ class ShipOrchestrator:
         repo: str,
         pr_number: int,
         change: str | None,
+        canonical_checkout: str | Path | None,
         authority: WorkAuthority,
         todo_paths: tuple[str, ...],
         expected_head: str,
@@ -655,6 +656,7 @@ class ShipOrchestrator:
             change=change,
             required_issues=authority.mapped_issues,
             todo_paths=todo_paths,
+            canonical_checkout=canonical_checkout,
         )
         pre_record = replace(facts, completion_record_valid=True)
         gate = evaluate_remote_closure(
