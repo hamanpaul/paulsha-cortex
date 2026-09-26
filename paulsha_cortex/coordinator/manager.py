@@ -90,6 +90,7 @@ from .workflow import (
     PlanningDriftArtifact,
     PlanningArtifactAuthority,
     PlanReviewReceipt,
+    WorkflowStep,
     WorkflowPlanningDriftStop,
     WorkflowManifest,
     brainstorm_authority_bound,
@@ -113,6 +114,7 @@ VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
 SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"})
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
 WORKFLOW_INPUT_ENVELOPE_MAX_BYTES = 131072
+RED_DECOMPOSITION_CARD = "red-decomposition"
 _PLANNING_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
@@ -312,6 +314,42 @@ def _resolve_work_owner_slice(registry, *, repo: str, work_id: str) -> dict:
     return matches[0]
 
 
+def _pre_candidate_recovery_admission(
+    registry, row: dict, *, expected_owner: dict | None = None
+) -> tuple[dict[str, str], dict | None]:
+    """讀取 recover-pre-candidate 的實際 owner/job 前置條件，不執行回收。"""
+    owner_identity = _owner_identity_matches(row, expected=expected_owner)
+    candidate = row.get("candidate")
+    if isinstance(candidate, str) and verification.SAFE_SHA_RE.fullmatch(candidate) is not None:
+        raise ValueError("recover-pre-candidate requires null candidate")
+    if row.get("state") not in {"needs_human", "failed", "pending"}:
+        raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")
+    builder_job_id = row.get("builder_job_id")
+    if row.get("state") == "pending" and builder_job_id is None:
+        return owner_identity, None
+    if not isinstance(builder_job_id, str) or not builder_job_id:
+        raise RuntimeError("recover-pre-candidate requires an owner-bound builder job")
+    try:
+        builder_job = registry.get_job(builder_job_id)
+    except Exception as exc:
+        raise RuntimeError("recover-pre-candidate owner-bound builder job is unavailable") from exc
+    if (
+        builder_job.get("owner_identity") != owner_identity
+        or builder_job.get("attempt_id") != row.get("attempt_id")
+    ):
+        raise RuntimeError("recover-pre-candidate builder job identity mismatch")
+    worktree = builder_job.get("worktree")
+    if isinstance(worktree, str) and worktree and Path(worktree).exists():
+        marker = job_workspace.read_marker(worktree)
+        if (
+            not isinstance(marker, dict)
+            or marker.get("owner_identity") != owner_identity
+            or marker.get("attempt_id") != row.get("attempt_id")
+        ):
+            raise RuntimeError("recover-pre-candidate workspace marker identity mismatch")
+    return owner_identity, builder_job
+
+
 def _recover_pre_candidate_core(
     registry,
     *,
@@ -327,14 +365,9 @@ def _recover_pre_candidate_core(
         row = registry.get_slice(slice_id)
     except KeyError as exc:
         raise RuntimeError("recover-pre-candidate target slice is unavailable") from exc
-    owner_identity = _owner_identity_matches(row, expected=expected_owner)
-    candidate = row.get("candidate")
-    # 與 needs_human 動作清單（valid_candidate）同一判準：非合法 SHA 的殘值視同尚無
-    # candidate，仍可 recover；只有合法 SHA candidate 才拒絕。
-    if isinstance(candidate, str) and verification.SAFE_SHA_RE.fullmatch(candidate) is not None:
-        raise ValueError("recover-pre-candidate requires null candidate")
-    if row.get("state") not in {"needs_human", "failed", "pending"}:
-        raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")
+    owner_identity, builder_job = _pre_candidate_recovery_admission(
+        registry, row, expected_owner=expected_owner
+    )
     builder_job_id = row.get("builder_job_id")
     if row.get("state") == "pending" and builder_job_id is None:
         return {
@@ -345,27 +378,8 @@ def _recover_pre_candidate_core(
             "gate_state": "pending",
             "result": "ok",
         }
-    if not isinstance(builder_job_id, str) or not builder_job_id:
-        raise RuntimeError("recover-pre-candidate requires an owner-bound builder job")
-    try:
-        builder_job = registry.get_job(builder_job_id)
-    except Exception as exc:
-        raise RuntimeError("recover-pre-candidate owner-bound builder job is unavailable") from exc
-    if (
-        builder_job.get("owner_identity") != owner_identity
-        or builder_job.get("attempt_id") != row.get("attempt_id")
-    ):
-        raise RuntimeError("recover-pre-candidate builder job identity mismatch")
-
+    assert builder_job is not None
     worktree = builder_job.get("worktree")
-    if isinstance(worktree, str) and worktree and Path(worktree).exists():
-        marker = job_workspace.read_marker(worktree)
-        if (
-            not isinstance(marker, dict)
-            or marker.get("owner_identity") != owner_identity
-            or marker.get("attempt_id") != row.get("attempt_id")
-        ):
-            raise RuntimeError("recover-pre-candidate workspace marker identity mismatch")
     branch_hint = row.get("branch")
     reclaim = worktree_reclaim.reclaim_recorded_or_derived(
         recorded_path=worktree if isinstance(worktree, (str, Path)) and worktree else None,
@@ -1562,13 +1576,10 @@ def workflow_status_entry(
             main_sync_retry_build_next_step_hint,
         )
 
-        next_actions = (
-            *next_actions,
-            *(
-                item
-                for item in _phase_recovery_actions(run, registry)
-                if item not in next_actions
-            ),
+        next_actions = needs_human_next_actions(
+            phase=getattr(run, "current_phase", None),
+            planning_failure_classification=hint_classification,
+            job_recovery_actions=_phase_recovery_actions(run, registry),
         )
         if (
             persisted_next_step_hint is None
@@ -3943,6 +3954,17 @@ def _manager_archive_applied(
     return _manager_archive_job_applied(registry, run, jobs=jobs)
 
 
+def _post_archive_candidate(run, *, registry, jobs) -> str | None:
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or not _manager_archive_applied(run, registry=registry, jobs=jobs)
+    ):
+        return None
+    return candidate.lower()
+
+
 def _planning_artifact_relative_path_after_archive(
     run,
     *,
@@ -6070,9 +6092,10 @@ def _assert_terminal_gate_consistency(
     只要有任何確定性 gate 的實際結果不是 passed，terminal 自稱的 ``passed`` 一律
     fail closed，並把「哪一個 gate、期望值、實際值」保留在錯誤訊息裡。
 
-    會跑 gate 的 phase（build／verify）若連 ledger 都不存在，代表 wrapper 的 gate
-    階段沒跑完，同樣 fail closed：模型文字、exit code 為 0、無明確錯誤三者皆不構成
-    成功授權。
+    會跑且要求本卡 gate ledger 的 phase（build）若連 ledger 都不存在，代表 wrapper
+    的 gate 階段沒跑完，同樣 fail closed：模型文字、exit code 為 0、無明確錯誤三者皆
+    不構成成功授權。verify phase 不要求 gate ledger，另由 deterministic verification
+    report 提供獨立證據。
 
     #307：``registry`` 為選填——提供時會用來解析目前 card 的 ``test_policy``，讓
     ``test_policy=red-required``（tdd-red）卡對測試 gate 的語意反轉在
@@ -6442,7 +6465,7 @@ def _explicit_stop_gate_terminal(job: Mapping[str, object]) -> dict[str, object]
 
 
 def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
-    """Recognize plan/build terminals that cannot be bound as a passed workflow-card.
+    """辨識可交由既有 per-card schema retry 額度處理的 malformed terminal。
 
     #717 迴歸釘住：**合法的明示停止不得被判成 schema mismatch**。這條保證由下面
     第一行的早退提供——:func:`_retryable_nonpassing_workflow_terminal` 認得的形狀
@@ -6450,22 +6473,74 @@ def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
     JSON」的，不是給「執行環境壞掉」的）。下面 ``status != "passed"`` 那一行看似
     「任何非 passed 一律當 schema mismatch」，但它只會看到早退**沒有**接住的殘餘：
     真的形狀壞掉、或綁定對不上（run_id／card_id 不符）的 payload。
+
+    verify／review 只把無法解析或不符合該 phase terminal 外層 schema 的輸出視為
+    malformed；合法明示停止、有效 envelope 後續遇到的 gate／authority 錯誤不重派。
     """
 
     if _retryable_nonpassing_workflow_terminal(job):
         return False
+    phase = job.get("workflow_phase")
     if (
         job.get("workflow_evidence") is not None
         or job.get("status") != "exited"
         or type(job.get("exit_code")) is not int
         or job.get("exit_code") != 0
-        or job.get("workflow_phase") not in {"plan", "build"}
+        or phase not in {"plan", "build", "verify", "review"}
     ):
         return False
     try:
         raw = _extract_terminal_json(job.get("log_path"))
     except ValueError:
         return True
+    if phase in {"verify", "review"}:
+        if _explicit_stop_gate_terminal(job) is not None:
+            return False
+        if phase == "verify":
+            verify_keys = {
+                "schema_version", "kind", "status", "summary", "details", "reports"
+            }
+            details = raw.get("details")
+            return not (
+                set(raw) == verify_keys
+                and type(raw.get("schema_version")) is int
+                and raw.get("schema_version") == 1
+                and raw.get("kind") == "workflow-verification-result"
+                and raw.get("status") in {"verified", "passed"}
+                and isinstance(raw.get("summary"), str)
+                and bool(str(raw["summary"]).strip())
+                and (
+                    isinstance(details, dict)
+                    or (isinstance(details, str) and bool(details.strip()))
+                )
+                and _explicit_stop_terminal_reports_valid(raw.get("reports"))
+            )
+
+        review_raw = dict(raw)
+        if "status" in review_raw:
+            if review_raw.get("status") != "passed":
+                return True
+            review_raw.pop("status")
+        snapshot = job.get("workflow_input_snapshot")
+        has_planning_authority = isinstance(snapshot, list) and any(
+            isinstance(row, dict) and row.get("authority") == "planning-authority"
+            for row in snapshot
+        )
+        required = {"schema_version", "kind", "reason", "findings", "reports"}
+        allowed = required | (
+            {"authority_hashes"} if has_planning_authority else set()
+        )
+        return not (
+            set(review_raw) == allowed
+            and type(review_raw.get("schema_version")) is int
+            and review_raw.get("schema_version") == 1
+            and review_raw.get("kind") == "workflow-review-result"
+            and isinstance(review_raw.get("reason"), str)
+            and bool(str(review_raw["reason"]).strip())
+            and isinstance(review_raw.get("findings"), list)
+            and all(isinstance(item, dict) for item in review_raw["findings"])
+            and _explicit_stop_terminal_reports_valid(review_raw.get("reports"))
+        )
     if raw.get("schema_version") == terminal_contract.TERMINAL_SCHEMA_VERSION:
         raw = _canonicalize_card_terminal(raw)
     required = {
@@ -6481,7 +6556,7 @@ def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
     if raw.get("status") != "passed":
         return True
     candidate = raw.get("candidate")
-    if job.get("workflow_phase") == "build":
+    if phase == "build":
         return (
             not isinstance(candidate, str)
             or verification.SAFE_SHA_RE.fullmatch(candidate) is None
@@ -9782,7 +9857,7 @@ def _is_planning_transient_service_failure(reason: str | None) -> bool:
     return outcome_taxonomy.matches_transient_service_markers(reason)
 
 
-# --- issue #554：operator worktree drift 是環境事件，不是內容缺陷 -------------
+# --- issue #554／#562：operator worktree drift 是環境事件 -------------------
 #
 # #507 前，drift 的處置是把 operator worktree 整棵抹除再從 baseline 還原——
 # 那確實會銷毀資料，把它歸 `content`（fail-closed、不給 recover-planning）
@@ -9792,26 +9867,10 @@ def _is_planning_transient_service_failure(reason: str | None) -> bool:
 # planning 就好。維持 `content` 只會讓唯一出口是 abandon（燒一個世代），
 # 這是 #507 comment 2 記錄、#543 明文留待後續的死鎖。
 #
-# 判準只認 `planning_runtime` 匯出的穩定前綴：訊息尾段已在 #543 改過一次
-# （`changes rolled back` → `operator content preserved`），計數與 evidence 路徑
-# 每次都不同，任何依賴尾段字面的判準都會再壞一次。
-_PLANNING_WORKTREE_DRIFT_MARKER = planning_runtime.PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX
+def _is_planning_worktree_drift_failure(failure_kind: str | None) -> bool:
+    """只依 planning runtime 傳來的固定 kind 辨識 operator worktree drift。"""
 
-
-def _is_planning_worktree_drift_failure(reason: str | None) -> bool:
-    """判斷 planning 失敗的 reason 是否為 operator worktree drift（#507／#554）。
-
-    reason 的實際樣貌是 `run_heterogeneous_brainstorm` 對 launcher 例外包出的
-    `<stage>-<kind>: ValueError: <drift message>`，因此比對用 `in` 而非
-    `startswith`——前綴指的是「drift 訊息自己的前綴」，不是整個 reason 的前綴。
-
-    判準刻意窄：只認 operator worktree 這一族。同一段 finally 另有
-    `planning launcher modified disposable read-only sandbox`（launcher 寫壞了
-    拋棄式沙箱）——那是 launcher 行為異常而非環境並行編輯，不在此列，維持
-    既有 `content` 分類。
-    """
-
-    return reason is not None and _PLANNING_WORKTREE_DRIFT_MARKER in reason
+    return failure_kind == planning_runtime.PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
 
 
 # --- issue #682（#672 票 A）：拒因表裡的 environment 級拒因 -------------------
@@ -9843,8 +9902,10 @@ def _is_planning_artifact_environment_failure(reason: str | None) -> bool:
     return failure_code in ARTIFACT_EVIDENCE_ENVIRONMENT_REASONS
 
 
-def _classify_planning_failure(reason: str | None) -> str:
-    """brainstorm not-ready 的 reason → `environment` / `content` 的**單一判準**。
+def _classify_planning_failure(
+    reason: str | None, *, failure_kind: str | None = None
+) -> str:
+    """brainstorm not-ready 的 evidence → `environment` / `content` 的單一判準。
 
     #393 的預設是 `content`（fail-closed，`_resume_decision` 不浮現
     `recover-planning`）。五個具名例外改歸 `environment`：
@@ -9853,23 +9914,23 @@ def _classify_planning_failure(reason: str | None) -> str:
        殘留撞見 authority fail-closed，是狀態殘留而非模型內容缺陷。
     2. `_is_planning_transient_service_failure`（#533）——launcher/service 層
        的暫時性錯誤（503／限流／逾時），幾分鐘後自癒。
-    3. `_is_planning_worktree_drift_failure`（#507／#554）——operator worktree
-       在 planning 視窗內被動過；#543 之後不再銷毀資料，是環境事件。
+    3. `_is_planning_worktree_drift_failure`（#507／#554／#562）——planning runtime
+       明確回報 operator worktree drift；不解析 reason 自然語言。
     4. `_is_planning_candidate_rejection_environment_failure`（#682／#672 票 A）
        ——`no-heterogeneous-planner` 的逐候選拒因表裡有 environment 級拒因
        （job 起不來、executor 異常退出）。
     5. `_is_planning_artifact_environment_failure`（#572）——整合後 artifact 的
        symlink、路徑逃逸、非一般檔案或讀取／解碼失敗。
 
-    五個判準合成一個具名函式，是為了讓「reason → classification」這條映射有
+    五個判準合成一個具名函式，是為了讓「failure evidence → classification」有
     單一可測的入口（過去它只以三元表達式活在 `_run_define_stage` 中段，測不到
     也看不見）。
     """
 
     if (
-        _is_planning_authority_residue_failure(reason)
+        _is_planning_worktree_drift_failure(failure_kind)
+        or _is_planning_authority_residue_failure(reason)
         or _is_planning_transient_service_failure(reason)
-        or _is_planning_worktree_drift_failure(reason)
         or _is_planning_candidate_rejection_environment_failure(reason)
         or _is_planning_artifact_environment_failure(reason)
     ):
@@ -10176,7 +10237,7 @@ def _publish_planning_artifacts(
         openspec_bound = (
             len(relative.parts) >= 4
             and relative.parts[:2] == ("openspec", "changes")
-            and relative.parts[2] == work_id
+            and relative.parts[2] in {work_id, *anchor_slugs}
             and relative.parts[2] != "archive"
         )
         manifest_bound = any(fnmatch.fnmatch(path_value, pattern) for pattern in allowed_refs)
@@ -11102,7 +11163,9 @@ _OPERATOR_ADJUDICATION_PREAMBLE = (
     " The operator_adjudications block of the contract below reproduces rulings the human "
     "operator issued through the Manager's bounded CLI (source operator-adjudication); "
     "builder, verification and review cards all read the same evidence. Those rulings are "
-    "authoritative and outrank model-generated findings; do not re-litigate them."
+    "authoritative within the actor, card and preconditions they state; check applicability "
+    "against the current candidate and Manager-recorded actions before applying them. "
+    "Within that scope they outrank model-generated findings; do not re-litigate them."
 )
 # builder 卡：裁決是要實作的指令。
 OPERATOR_ADJUDICATION_DIRECTIVE = _OPERATOR_ADJUDICATION_PREAMBLE + (
@@ -11128,6 +11191,14 @@ OPERATOR_ADJUDICATION_REVIEWER_DIRECTIVE = _OPERATOR_ADJUDICATION_PREAMBLE + (
         )
     )
     + ") and cite the ruling in its recommendation."
+) + (
+    " First check each ruling's applicability and preconditions against the current candidate, "
+    "its commit history and Manager-recorded actions. A ruling about Builder actions does not "
+    "make Manager-owned actions (including openspec-archive) a Builder violation; if scope or "
+    "attribution is no longer supported, request operator re-adjudication instead of reporting "
+    "a blocking candidate finding. For every test or policy gate result, cite current "
+    "Manager-supplied gate evidence; when the contract has no matching result, say `not measured` "
+    "and do not claim that gate passed or failed."
 )
 RETRY_CONTEXT_MESSAGE_LIMIT = 600
 
@@ -11718,6 +11789,17 @@ def _workflow_job_prompt(
                 "description": gate_evidence_description,
             },
         }
+        if step.card == RED_DECOMPOSITION_CARD:
+            terminal_schema["diagnostics"] = {
+                "type": "object",
+                "required": ["decomposition_plan"],
+                "properties": {
+                    "decomposition_plan": (
+                        "Markdown 計畫字串；frontmatter 必須含非負整數 invariant_count、非空字串列表 artifact_classes "
+                        "與唯一 child_work_id；Tasks 須涵蓋宣告的 classes 與既有 plan review 要求。"
+                    )
+                },
+            }
         if effective_test_policy == "red-required":
             # #540：#307 的反轉判準過去只存在於 manager 側；泛用 status_policy
             # 對 tdd-red 卡字面上要求回 failed，與實際採信規則相反。說明文字由
@@ -11769,12 +11851,20 @@ def _workflow_job_prompt(
         if isinstance(contract.get("openspec_ref"), str)
         else "openspec/changes/<change>/tasks.md"
     )
-    planner_contract = (
-        " This planner card is read-only: use the disposable checkout only, do not edit files, and "
-        "return only existing manifest-declared artifacts."
-        if step.persona == "planner"
-        else ""
-    )
+    planner_contract = ""
+    if step.persona == "planner" and step.card == RED_DECOMPOSITION_CARD:
+        planner_contract = (
+            " 此卡只能產生一個 child 計畫，不可建立多個 children。保持唯讀，不修改檔案；"
+            "在 terminal diagnostics.decomposition_plan 內直接回傳完整 Markdown。"
+            "frontmatter 必須宣告非負整數 invariant_count、非空 artifact_classes，並以合法 child_work_id 指定一個既有工作項目；"
+            "Tasks 必須涵蓋所有宣告的 artifact_classes，並保留 changelog、cli、test/測試等既有 plan review 要求；"
+            "計畫通過 Manager plan review 後才會呼叫標準 intake。"
+        )
+    elif step.persona == "planner":
+        planner_contract = (
+            " This planner card is read-only: use the disposable checkout only, do not edit files, and "
+            "return only existing manifest-declared artifacts."
+        )
     reviewer_contract = (
         " This reviewer card is read-only: inspect and run only non-mutating commands in the "
         "Candidate checkout. If candidate_checkout is present, change into that relative directory "
@@ -11979,6 +12069,123 @@ def _evaluate_yellow_plan_review(
         return None
 
 
+def _schedule_red_decomposition(registry, *, run, step, artifacts):
+    """把一個 Red 拆分 planner step 接在既有 plan 後，重送沿用同一張卡。"""
+
+    current = registry.get_workflow_run(run.run_id)
+    if any(item.card == RED_DECOMPOSITION_CARD for item in current.steps):
+        return current
+    audited = _audit_phase_steps(
+        current.steps,
+        phase="plan",
+        executor="cortex-manager",
+        model="deterministic",
+        domain="cortex",
+        outputs=tuple(item.ref for item in artifacts),
+        card_id=step.card,
+    )
+    plan_step = WorkflowStep(
+        phase="plan",
+        persona="planner",
+        card=RED_DECOMPOSITION_CARD,
+        executor=None,
+        model=None,
+        domain=None,
+        inputs=tuple(item.ref for item in current.planning_authority),
+        outputs=(),
+        skill_ref="superpowers:writing-plans",
+        action=(
+            "將此 Red 工作拆成恰好一個 child work item；輸出含 artifact_classes 與 child_work_id "
+            "欄位的拆分計畫，child_work_id 必須是可由正常 intake 載入的既有工作。"
+        ),
+    )
+    steps = list(audited)
+    insertion = max(
+        (index + 1 for index, item in enumerate(steps) if item.phase == "plan"),
+        default=len(steps),
+    )
+    steps.insert(insertion, plan_step)
+    return registry._manager_update_workflow_run(
+        current.run_id,
+        steps=tuple(steps),
+        facets=tuple(dict.fromkeys((*current.facets, "needs_decomposition"))),
+    )
+
+
+def _red_decomposition_child_work_id(plan_text: str) -> str | None:
+    """讀取拆分計畫唯一的 child work id；不接受多 child/fan-out 欄位。"""
+
+    lines = plan_text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    closing = next(
+        (index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
+        None,
+    )
+    if closing is None:
+        return None
+    try:
+        frontmatter = safe_load("\n".join(lines[1:closing]))
+    except YAMLError:
+        return None
+    if not isinstance(frontmatter, dict):
+        return None
+    child_work_id = frontmatter.get("child_work_id")
+    if (
+        not isinstance(child_work_id, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", child_work_id) is None
+    ):
+        return None
+    return child_work_id
+
+
+def _red_decomposition_plan_from_job(job: Mapping[str, object]) -> str | None:
+    """從 planner 的 workflow terminal diagnostics 取拆分計畫文字。"""
+
+    try:
+        terminal = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return None
+    diagnostics = terminal.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return None
+    plan_text = diagnostics.get("decomposition_plan")
+    if not isinstance(plan_text, str) or not plan_text.strip():
+        return None
+    if len(plan_text.encode("utf-8")) > WORKFLOW_INPUT_ENVELOPE_MAX_BYTES:
+        return None
+    return plan_text
+
+
+def _stop_red_decomposition(
+    registry,
+    *,
+    run,
+    reason: str,
+    detail: str,
+    source: str = "manager.resume_workflow_run:red-decomposition",
+) -> dict[str, object]:
+    current = registry.get_workflow_run(run.run_id)
+    updated = registry._manager_update_workflow_run(
+        current.run_id,
+        facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+        gate_status="running",
+        needs_human_reason=diagnostic_reason(
+            reason,
+            detail,
+            source=source,
+            run_id=current.run_id,
+            work_id=current.work_id,
+            decomposition_depth=str(current.decomposition_depth),
+        ),
+    )
+    return {
+        "run_id": updated.run_id,
+        "current_phase": updated.current_phase,
+        "reason": reason,
+    }
+
+
 @dataclass(frozen=True)
 class BuilderTodoAdmission:
     """目前受監控 WorkAuthority 的 Builder Todo admission 輸入。"""
@@ -12102,15 +12309,24 @@ def _dispatch_workflow_card(
     )
     if admission_stop is not None:
         return admission_stop
+    job_rows = registry.list_jobs()
+    post_archive_candidate = _post_archive_candidate(
+        run, registry=registry, jobs=job_rows
+    )
     matching = [
         job
-        for job in registry.list_jobs()
+        for job in job_rows
         if job.get("workflow_run_id") == run.run_id
         and job.get("workflow_card") == step.card
         and job.get("workflow_phase") == step.phase
         and (
             step.phase not in {"verify", "review"}
             or job.get("subject_head") == run.candidate_head
+        )
+        and (
+            step.phase != "build"
+            or post_archive_candidate is None
+            or job.get("dispatch_head") == post_archive_candidate
         )
     ]
     # #765：reuse／retry 判定只認**本 claim era** 的 job（None 容忍比照 #766/#768）。
@@ -12192,14 +12408,18 @@ def _dispatch_workflow_card(
             planning_complete = artifacts is not None and assess_planning_completeness(artifacts).complete
         except ValueError:
             planning_complete = False
-        if planning_complete:
+        if planning_complete and step.card != RED_DECOMPOSITION_CARD:
             pending_phase_steps = [
                 item
                 for item in run.steps
                 if item.phase == run.current_phase and item.gate_result != "passed"
             ]
             is_last_pending = bool(pending_phase_steps) and step.card == pending_phase_steps[-1].card
-            if is_last_pending and run.current_phase == "plan" and run.sizing_band == "red":
+            if (
+                is_last_pending
+                and run.current_phase == "plan"
+                and run.sizing_band == "red"
+            ):
                 # #223（design #208 H.3）：Red band 收斂到 needs_decomposition，
                 # 不推進到 build；current_phase 刻意保持在 plan
                 # （validate_workflow_phase_transition 只允許單調 +1，Red 決策
@@ -12213,14 +12433,31 @@ def _dispatch_workflow_card(
                     if route == "needs_human"
                     else "needs-decomposition"
                 )
-                updated = registry._manager_update_workflow_run(
-                    run.run_id,
-                    facets=tuple(dict.fromkeys((*run.facets, route))),
-                    # route 為 `needs_decomposition` 時不帶理由（那不是本 invariant
-                    # 的管轄範圍，且它自己就是可讀的路由結論）；只有轉入
-                    # `needs_human`（拆分深度已達 #223 的上限、不能再拆）才落理由。
-                    needs_human_reason=(
-                        diagnostic_reason(
+                if route == "needs_decomposition":
+                    updated = _schedule_red_decomposition(
+                        registry,
+                        run=run,
+                        step=step,
+                        artifacts=artifacts,
+                    )
+                    return _dispatch_workflow_card(
+                        dispatcher,
+                        run=updated,
+                        identities=identities,
+                        launcher_factory=launcher_factory,
+                        coordinator_root=coordinator_root,
+                        retry_failed=retry_failed,
+                        operator_recovery_job_id=operator_recovery_job_id,
+                        force_new_card=force_new_card,
+                        forced_identity=forced_identity,
+                        spawn_admission=spawn_admission,
+                        builder_todo_admission=builder_todo_admission,
+                    )
+                else:
+                    updated = registry._manager_update_workflow_run(
+                        run.run_id,
+                        facets=tuple(dict.fromkeys((*run.facets, route))),
+                        needs_human_reason=diagnostic_reason(
                             route_reason,
                             f"sizing_band=red 但 decomposition_depth 已達上限"
                             f"（depth={run.decomposition_depth}），不得再拆一層",
@@ -12229,11 +12466,8 @@ def _dispatch_workflow_card(
                             work_id=run.work_id,
                             sizing_band=run.sizing_band,
                             decomposition_depth=str(run.decomposition_depth),
-                        )
-                        if route == "needs_human"
-                        else None
-                    ),
-                )
+                        ),
+                    )
                 return {
                     "run_id": updated.run_id,
                     "current_phase": updated.current_phase,
@@ -12608,7 +12842,12 @@ def _dispatch_workflow_card(
             and verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is not None
             else None
         )
-        if builder_jobs and accepted_candidate is not None:
+        if post_archive_candidate is not None:
+            # post-archive Builder 的工作區必須從 archive 已採信的 exact
+            # Candidate 出發；歷史 Builder 的 dispatch_head 是 run 起始基底，不能
+            # 拿來當這張新卡的 clone base。
+            build_base_sha = post_archive_candidate
+        elif builder_jobs and accepted_candidate is not None:
             # 中段／後續 build 卡：base 是**來源樹上這條 branch 現在的位置**，也就是
             # 前一張卡 harvest 回來（#637 bundle ＋ append-only spool）之後被採信的
             # candidate。交接因此完全走 Manager 自己的 object store，不依賴前一張卡的
@@ -12732,7 +12971,14 @@ def _dispatch_workflow_card(
         output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
     dispatch_base: str | None = None
     if step.phase == "build":
-        if builder_jobs:
+        if post_archive_candidate is not None:
+            if (
+                not isinstance(build_base_sha, str)
+                or verification.SAFE_SHA_RE.fullmatch(build_base_sha) is None
+            ):
+                raise ValueError("workflow build phase base is unavailable")
+            dispatch_base = build_base_sha.lower()
+        elif builder_jobs:
             persisted_base = builder_jobs[0].get("dispatch_head")
             if (
                 not isinstance(persisted_base, str)
@@ -13438,6 +13684,7 @@ def resume_workflow_run(
     builder_todo_admission_loader: (
         Callable[[object], BuilderTodoAdmission | None] | None
     ) = None,
+    decomposition_intake: Callable[[str], object] | None = None,
 ) -> dict[str, object]:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -13856,9 +14103,15 @@ def resume_workflow_run(
                     return rate_limited
                 raise
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "no-pending-card"}
+    job_rows = registry.list_jobs()
+    post_archive_candidate = (
+        _post_archive_candidate(run, registry=registry, jobs=job_rows)
+        if step.phase == "build"
+        else None
+    )
     jobs = [
         job
-        for job in registry.list_jobs()
+        for job in job_rows
         if job.get("workflow_run_id") == run.run_id
         and job.get("workflow_card") == step.card
         and job.get("workflow_phase") == step.phase
@@ -13874,6 +14127,11 @@ def resume_workflow_run(
         and (
             step.phase not in {"verify", "review"}
             or job.get("subject_head") == run.candidate_head
+        )
+        and (
+            step.phase != "build"
+            or post_archive_candidate is None
+            or job.get("dispatch_head") == post_archive_candidate
         )
     ]
     job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
@@ -14212,6 +14470,9 @@ def resume_workflow_run(
                     card=step.card,
                     validation_path=diagnostics.validation_path,
                     schema_mismatch_observed=observed,
+                    # #922：停止時保留解析脈絡，operator 才找得到出錯的 log。
+                    job_log_path=str(job.get("log_path") or ""),
+                    envelope_parse_error=diagnostics.reason or "",
                 ),
             )
             return {
@@ -14288,6 +14549,109 @@ def resume_workflow_run(
             ),
         )
         raise
+    if step.card == RED_DECOMPOSITION_CARD:
+        plan_text = _red_decomposition_plan_from_job(job)
+        if plan_text is None:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-plan-output-invalid",
+                detail="拆分 planner terminal 缺少有效的 decomposition_plan 輸出。",
+            )
+        plan = PlanningArtifact(
+            kind="plan",
+            ref=f"red-decomposition:{run.run_id}",
+            text=plan_text,
+        )
+        review = _evaluate_yellow_plan_review(
+            (plan,),
+            envelope_lookup=_plan_review_envelope_lookup(run, identities),
+        )
+        if review is None:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-plan-review-unavailable",
+                detail="拆分計畫無法套用既有 plan review gate。",
+            )
+        if not review.ready:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-plan-review-failed",
+                detail=(
+                    "拆分計畫未通過既有 plan review gate"
+                    f"（failed_check={review.failed_check}）。"
+                ),
+            )
+        child_work_id = _red_decomposition_child_work_id(plan_text)
+        if child_work_id is None:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-child-work-id-invalid",
+                detail="通過 review 的拆分計畫必須包含唯一合法 child_work_id。",
+            )
+        if decomposition_intake is None:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-intake-unavailable",
+                detail="標準 work-action intake 尚未接線，不能建立 child workflow。",
+            )
+        try:
+            child_result = decomposition_intake(child_work_id)
+        except Exception as exc:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-child-intake-failed",
+                detail=f"child 標準 intake 失敗：{summarize_exception(exc)}",
+            )
+        result_payload = (
+            child_result.get("result", child_result)
+            if isinstance(child_result, Mapping)
+            else None
+        )
+        child_run = (
+            result_payload.get("run")
+            if isinstance(result_payload, Mapping)
+            else None
+        )
+        if (
+            not isinstance(result_payload, Mapping)
+            or result_payload.get("action") not in {"claim", "resume", "done"}
+            or not isinstance(child_run, Mapping)
+            or not isinstance(child_run.get("run_id"), str)
+        ):
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-child-intake-rejected",
+                detail="標準 intake 未回傳已接受的 child workflow。",
+            )
+        current = registry.get_workflow_run(run.run_id)
+        completed_steps = _audit_phase_steps(
+            current.steps,
+            phase="plan",
+            executor=str(job.get("executor") or "cortex-manager"),
+            model=str(job.get("model_id") or "deterministic"),
+            domain=str(job.get("independence_domain") or "cortex"),
+            outputs=(),
+            card_id=step.card,
+        )
+        registry._manager_update_workflow_run(
+            current.run_id,
+            steps=completed_steps,
+            needs_human_reason=None,
+        )
+        return {
+            "run_id": current.run_id,
+            "current_phase": current.current_phase,
+            "reason": "decomposition-child-intake-started",
+            "child_work_id": child_work_id,
+            "child_run_id": child_run["run_id"],
+        }
     phase_steps = [item for item in run.steps if item.phase == run.current_phase]
     is_last = step.card == phase_steps[-1].card
     next_phase = (
@@ -14391,6 +14755,7 @@ def _write_planning_failure_evidence(
     run_id: str,
     classification: str,
     reason: str,
+    failure_kind: str | None = None,
     model_input: Mapping[str, object] | None = None,
 ) -> str:
     """#393：define needs_human 三條靜默失敗路徑落 `cortex-planning-failure/v1`
@@ -14415,6 +14780,8 @@ def _write_planning_failure_evidence(
         "reason": reason,
         "created_at": _utcnow(),
     }
+    if failure_kind is not None:
+        body["failure_kind"] = failure_kind
     input_excerpt = _planning_failure_input_excerpt(model_input)
     if input_excerpt is not None:
         body["model_input"] = input_excerpt
@@ -14453,6 +14820,7 @@ def _record_planning_failure_evidence(
     coordinator_root: Path,
     classification: str,
     reason: str,
+    failure_kind: str | None = None,
     model_input: Mapping[str, object] | None = None,
 ) -> tuple[str, ...]:
     """呼叫端 wrapper：evidence 寫入失敗不得讓 define 路徑爆炸（fail-open
@@ -14467,6 +14835,7 @@ def _record_planning_failure_evidence(
             run_id=run.run_id,
             classification=classification,
             reason=reason,
+            failure_kind=failure_kind,
             model_input=model_input,
         )
     except Exception as exc:  # noqa: BLE001 - evidence 記錄本身 fail-open
@@ -15507,15 +15876,23 @@ def apply_workflow_action(
         # 例外二——`_is_planning_transient_service_failure`：launcher/service 層
         # 的暫時性錯誤（503/限流/逾時；agy 實測會印錯誤文字但 exit 0），同歸
         # `environment`。一個幾分鐘後自癒的服務錯誤不得被判成 `content` 死路。
-        # 例外三（#554）——`_is_planning_worktree_drift_failure`：operator
-        # worktree 在 planning 視窗內被動過。#543 之後 drift 不再銷毀任何資料
-        # （只備份與報告），語意上就是環境事件，同歸 `environment`。
+        # 例外三（#554／#562）——planning runtime 以固定 failure_kind 回報
+        # operator worktree drift。#543 之後 drift 不再銷毀資料，只備份與報告。
         brainstorm_not_ready_reason = result.reason or "brainstorm-not-ready"
-        # #554／PR #560：分類收斂進具名的 `_classify_planning_failure`（reason →
-        # classification 的單一可測入口，含 worktree drift 的 environment 例外）。
+        brainstorm_failure_kind = getattr(result, "failure_kind", None)
+        if (
+            brainstorm_failure_kind
+            != planning_runtime.PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
+        ):
+            brainstorm_failure_kind = None
+        # 分類收斂進 `_classify_planning_failure`；drift 依結構化 kind，既有其他
+        # 窄分類仍依各自的 reason 判準。
         # 這裡把它 hoist 成區域變數，好讓 evidence 與 needs_human_reason 兩者
         # 引用**同一個**判定結果，不各算一次。
-        brainstorm_classification = _classify_planning_failure(brainstorm_not_ready_reason)
+        brainstorm_classification = _classify_planning_failure(
+            brainstorm_not_ready_reason,
+            failure_kind=brainstorm_failure_kind,
+        )
         brainstorm_next_step_hint = needs_human_next_step_hint(
             phase=run.current_phase,
             planning_failure_classification=brainstorm_classification,
@@ -15528,6 +15905,7 @@ def apply_workflow_action(
             coordinator_root=transaction_root,
             classification=brainstorm_classification,
             reason=brainstorm_not_ready_reason,
+            failure_kind=brainstorm_failure_kind,
             model_input=result.model_input,
         )
         run = registry._manager_update_workflow_run(

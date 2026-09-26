@@ -241,11 +241,16 @@ def test_terminal_provider_skips_closed_unmerged_pr_closing_links(git_origin):
     }
 
 
-def test_terminal_provider_keeps_open_pr_closing_links():
+def test_terminal_provider_keeps_open_pr_closing_links(git_origin):
+    repo = git_origin()
+    repo.commit({"README.md": "default\n"}, message="default")
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": False},
                     "nodes": [
@@ -266,9 +271,10 @@ def test_terminal_provider_keeps_open_pr_closing_links():
             }
         }
     }
-    tree = {"truncated": False, "tree": []}
-    runner = _FakeRunner([_completed(graph), _completed(tree)])
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    runner = _FakeRunner([_completed(graph)])
+    result = GitHubTerminalProvider(
+        repo.repo, runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert result.status == "ok"
     assert result.observations["closing_links"] == {

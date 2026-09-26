@@ -33,6 +33,28 @@ class _FakeClock:
         self.value += seconds
 
 
+class _ElapsedWindowReached(Exception):
+    pass
+
+
+def _run_loop_for_elapsed(clock: _FakeClock, elapsed_seconds: float, **kwargs) -> bool:
+    """以模擬經過時間停止迴圈，維持輪詢間隔改變前後可比較的時間窗。"""
+    def sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        if clock.value >= elapsed_seconds:
+            raise _ElapsedWindowReached
+
+    try:
+        return manager_daemon.run_loop(
+            **kwargs,
+            monotonic_fn=clock.monotonic,
+            sleep_fn=sleep,
+            max_rounds=None,
+        )
+    except _ElapsedWindowReached:
+        return True
+
+
 def _write_request(req_id: str, **overrides) -> dict:
     request = {
         "schema_version": constants.SCHEMA_VERSION,
@@ -70,26 +92,24 @@ def test_periodic_tick_backoff_prevents_hot_retry_and_resets_after_success(monke
             raise ValueError("boom")
         return {"dispatch_skipped": False}
 
-    started = manager_daemon.run_loop(
+    started = _run_loop_for_elapsed(
+        clock,
+        85.0,
         request_executor=lambda req: {"dispatched": []},
         status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
         periodic_tick_runner=periodic_tick_runner,
         poll_interval=1.0,
         tick_interval=10.0,
         now_fn=lambda: "2026-07-03T09:05:00+00:00",
-        monotonic_fn=clock.monotonic,
-        sleep_fn=clock.sleep,
         pid=1,
-        max_rounds=85,
     )
 
     assert started is True
     # 1st attempt at t=10 (base tick_interval) fails; backoff to +20 -> 2nd
     # attempt at t=30 fails; backoff to +40 -> 3rd attempt at t=70 succeeds;
     # normal cadence resumes -> 4th attempt at t=80 (just +10, not +80).
+    # 模擬經過 85 秒後，tick 時間仍符合原本的回退與恢復週期。
     assert call_clocks == [10.0, 30.0, 70.0, 80.0]
-    # 85 rounds at a 1s poll would be ~85 calls under the old hot-loop bug;
-    # backoff keeps the call count nowhere near that.
     assert len(call_clocks) < 10
 
     status = contract.read_json(constants.status_path())
@@ -214,21 +234,19 @@ def test_periodic_tick_cadence_unaffected_when_no_failures_occur(monkeypatch, tm
         call_clocks.append(clock.value)
         return {"dispatch_skipped": False}
 
-    manager_daemon.run_loop(
+    _run_loop_for_elapsed(
+        clock,
+        35.0,
         request_executor=lambda req: {"dispatched": []},
         status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
         periodic_tick_runner=periodic_tick_runner,
         poll_interval=1.0,
         tick_interval=10.0,
         now_fn=lambda: "2026-07-03T09:05:00+00:00",
-        monotonic_fn=clock.monotonic,
-        sleep_fn=clock.sleep,
         pid=1,
-        max_rounds=35,
     )
 
-    # Untouched regression: three ticks land exactly on tick_interval
-    # multiples, with zero drift from the new backoff/circuit machinery.
+    # periodic tick 仍落在 tick_interval 的整數倍。
     assert call_clocks == [10.0, 20.0, 30.0]
 
 
@@ -241,17 +259,16 @@ def test_periodic_tick_not_idle_does_not_hot_loop(monkeypatch, tmp_path):
         call_clocks.append(clock.value)
         return {"dispatch_skipped": "not-idle"}
 
-    started = manager_daemon.run_loop(
+    started = _run_loop_for_elapsed(
+        clock,
+        85.0,
         request_executor=lambda req: {"dispatched": []},
         status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
         periodic_tick_runner=periodic_tick_runner,
         poll_interval=1.0,
         tick_interval=10.0,
         now_fn=lambda: "2026-07-03T09:05:00+00:00",
-        monotonic_fn=clock.monotonic,
-        sleep_fn=clock.sleep,
         pid=1,
-        max_rounds=85,
     )
 
     assert started is True

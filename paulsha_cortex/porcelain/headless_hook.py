@@ -53,15 +53,17 @@ GitHub 自己回的內容。``action`` 純屬診斷。
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 from paulsha_cortex.monitor.event_spool import EventSpool
@@ -148,6 +150,10 @@ _ENV_ASSIGNMENT = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*=")
 _PUNCTUATION = set("();<>|&")
 
 _GIT_REMOTE_TIMEOUT_SECONDS = 5.0
+# #495：限制的是「寫入檔案的新內容」而不是整個 tool_input；1000 bytes 只是某次
+# job 的 prompt 軟性要求，當硬上限會擋掉正常的中型修改。
+EDIT_PAYLOAD_MAX_BYTES = 32 * 1024
+_GUARDED_WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit"})
 
 _UNRESOLVED = object()
 
@@ -162,6 +168,96 @@ def register_commands() -> None:
             run=main,
         )
     )
+
+
+def _resolve_declared_worktree_file(
+    path: str,
+    *,
+    worktree_root: str | Path,
+    write_paths: Sequence[str],
+) -> tuple[Path, str]:
+    if not isinstance(path, str) or not path.strip() or "\x00" in path:
+        raise ValueError("builder file path must be a non-empty relative path")
+    normalized = path.replace("\\", "/")
+    relative = PurePosixPath(normalized)
+    relative_text = relative.as_posix()
+    if relative.is_absolute() or relative_text in {"", "."} or ".." in relative.parts:
+        raise ValueError("builder file path must stay inside the worktree")
+    if not any(fnmatch.fnmatch(relative_text, pattern) for pattern in write_paths):
+        raise ValueError("builder file path is outside declared write_paths")
+
+    root = Path(worktree_root).resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("builder worktree root must be a directory")
+    target = root
+    for part in relative.parts:
+        target = target / part
+        try:
+            target_mode = target.lstat().st_mode
+        except OSError as exc:
+            raise ValueError(f"builder file path is unavailable: {relative_text}") from exc
+        if stat.S_ISLNK(target_mode):
+            raise ValueError("builder file path contains a symlink")
+    if not stat.S_ISREG(target_mode):
+        raise ValueError("builder file path must name a regular file")
+    return target, relative_text
+
+
+def set_executable_file(
+    path: str,
+    *,
+    worktree_root: str | Path,
+    write_paths: Sequence[str],
+) -> Path:
+    """只替單一宣告檔設定 owner executable bit。"""
+
+    target, _relative = _resolve_declared_worktree_file(
+        path,
+        worktree_root=worktree_root,
+        write_paths=write_paths,
+    )
+    os.chmod(target, stat.S_IMODE(target.stat().st_mode) | stat.S_IXUSR)
+    return target
+
+
+def restore_declared_file(
+    path: str,
+    *,
+    worktree_root: str | Path,
+    write_paths: Sequence[str],
+) -> Path:
+    """只將一個宣告檔的 index 與 worktree 內容還原到目前 HEAD。"""
+
+    target, relative = _resolve_declared_worktree_file(
+        path,
+        worktree_root=worktree_root,
+        write_paths=write_paths,
+    )
+    root = Path(worktree_root).resolve(strict=True)
+    subprocess.run(
+        [
+            "git",
+            "--literal-pathspecs",
+            "-C",
+            str(root),
+            "restore",
+            "--source=HEAD",
+            "--staged",
+            "--worktree",
+            "--",
+            relative,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return target
+
+
+def _builder_write_paths() -> tuple[str, ...]:
+    from paulsha_cortex.persona.context import build_persona_context
+
+    return tuple(build_persona_context(role="builder")["write_paths"])
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +630,36 @@ def _read_stdin_payload(stream: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _edit_payload_rejection(payload: Mapping[str, Any]) -> str | None:
+    tool_name = payload.get("tool_name", "Edit")
+    if tool_name not in _GUARDED_WRITE_TOOLS:
+        return None
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return f"{tool_name} payload is malformed; tool_input must be an object"
+    if tool_name == "Write":
+        pieces = [tool_input.get("content")]
+    elif tool_name == "MultiEdit":
+        edits = tool_input.get("edits")
+        if not isinstance(edits, list) or not all(isinstance(item, dict) for item in edits):
+            return "MultiEdit payload is malformed; edits must be a list of objects"
+        pieces = [item.get("new_string") for item in edits]
+    else:
+        pieces = [tool_input.get("new_string")]
+    if not all(isinstance(piece, str) for piece in pieces):
+        return f"{tool_name} payload is malformed; new content must be a string"
+    try:
+        payload_size = sum(len(piece.encode("utf-8")) for piece in pieces)
+    except UnicodeError:
+        return f"{tool_name} payload is malformed; new content is not valid UTF-8"
+    if payload_size > EDIT_PAYLOAD_MAX_BYTES:
+        return (
+            f"{tool_name} new content exceeds {EDIT_PAYLOAD_MAX_BYTES} bytes "
+            f"(received {payload_size}); split the change into smaller edits"
+        )
+    return None
+
+
 def main(argv: Sequence[str]) -> int:
     import argparse
 
@@ -548,8 +674,69 @@ def main(argv: Sequence[str]) -> int:
         default=None,
         help="覆寫 monitor event spool 目錄（測試/fixture 注入用）",
     )
+    sub.add_parser(
+        "pre-tool-use",
+        help="在 Edit／Write／MultiEdit 執行前拒絕新內容超過 32 KiB 的寫入",
+    )
+    restore_file = sub.add_parser(
+        "restore-file",
+        help="將單一宣告檔的 index 與 worktree 復原到目前 HEAD",
+    )
+    restore_file.add_argument("--path", required=True, help="worktree 內的相對檔案路徑")
+    set_executable = sub.add_parser(
+        "set-executable",
+        help="替單一宣告檔設定 owner executable bit",
+    )
+    set_executable.add_argument("--path", required=True, help="worktree 內的相對檔案路徑")
 
     args = parser.parse_args(list(argv))
+    if args.command == "pre-tool-use":
+        payload = _read_stdin_payload(sys.stdin)
+        reason = _edit_payload_rejection(payload)
+        if reason is not None:
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": reason,
+                        }
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        return 0
+    if args.command == "restore-file":
+        if headless_job_id(os.environ) is None:
+            sys.stderr.write("builder file restore requires a headless job\n")
+            return 2
+        try:
+            restore_declared_file(
+                args.path,
+                worktree_root=Path.cwd(),
+                write_paths=_builder_write_paths(),
+            )
+        except Exception as error:  # noqa: BLE001 - single-file restore must stop on failure
+            sys.stderr.write(f"builder file restore rejected: {error}\n")
+            return 2
+        return 0
+    if args.command == "set-executable":
+        if headless_job_id(os.environ) is None:
+            sys.stderr.write("builder file-mode operation requires a headless job\n")
+            return 2
+        try:
+            set_executable_file(
+                args.path,
+                worktree_root=Path.cwd(),
+                write_paths=_builder_write_paths(),
+            )
+        except Exception as error:  # noqa: BLE001 - operation failure must stop the job
+            sys.stderr.write(f"builder file-mode operation rejected: {error}\n")
+            return 2
+        return 0
     if args.command != "post-tool-use":
         parser.error(f"unsupported headless-hook command: {args.command}")
         return 2

@@ -10,6 +10,7 @@ import pytest
 from paulsha_cortex.coordinator import registry as registry_module
 from paulsha_cortex.coordinator.registry import JobRegistry, RegistryRevisionConflict
 from paulsha_cortex.coordinator.workflow import (
+    GateEvidenceRef,
     PlanningArtifactAuthority,
     SHIP_TRANSITION_STAGES,
     WorkflowRun,
@@ -112,7 +113,6 @@ def test_v1_migration_creates_immutable_backup_and_isolates_legacy_records(tmp_p
     assert registry.list_jobs() == []
     assert registry.list_slices() == []
     assert registry.list_workflow_runs() == []
-
     legacy = registry.list_legacy_records()
     for record in legacy["jobs"] + legacy["slices"]:
         assert "work_id" not in record
@@ -123,6 +123,79 @@ def test_v1_migration_creates_immutable_backup_and_isolates_legacy_records(tmp_p
     assert len(backups) == 1
     assert backups[0].read_bytes() == original
     assert backups[0].stat().st_mode & 0o222 == 0
+
+
+def _authority_restart_run(registry: JobRegistry) -> WorkflowRun:
+    return registry._manager_create_workflow_run(
+        work_id="demo",
+        repo="acme/demo",
+        claim_key="claim-old",
+        source_revision="a" * 64,
+        workspace_root="workspace/demo",
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=(
+            WorkflowStep("build", "builder", "build", "agy", "model", "domain", (), (), "passed"),
+            WorkflowStep("verify", "gate", "verification", "cortex", "deterministic", "cortex", (), (), "passed"),
+            WorkflowStep("review", "reviewer", "review", "agy", "model", "domain", (), (), "passed"),
+        ),
+        pr_refs=("acme/demo#17",),
+        attempts={"build": 1, "verify": 2, "review": 1},
+        evidence_refs=("reports/build.md", "reports/verify.md", "reports/review.md"),
+        gate_refs=(
+            GateEvidenceRef("brainstorm", "reports/brainstorm.md", "b" * 64),
+            GateEvidenceRef("foreign-review", "reports/foreign-review.md", "c" * 64),
+        ),
+        candidate_head="d" * 40,
+        verified_head="d" * 40,
+        gate_status="passed",
+    )
+
+
+def test_authority_restart_rejects_workflow_snapshot_drift(tmp_path: Path) -> None:
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    observed = _authority_restart_run(registry)
+    drifted = registry._manager_update_workflow_run(
+        observed.run_id,
+        candidate_head="e" * 40,
+    )
+    before_rejected_transition = state.read_bytes()
+
+    with pytest.raises(ValueError, match="authority-restart snapshot mismatch"):
+        registry._manager_reset_workflow_for_authority_restart(
+            observed.run_id,
+            expected_run=observed,
+            authority_digest="f" * 64,
+        )
+
+    assert registry.get_workflow_run(observed.run_id) == drifted
+    assert state.read_bytes() == before_rejected_transition
+
+
+def test_authority_restart_resets_only_verify_and_review_for_exact_snapshot(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    observed = _authority_restart_run(registry)
+
+    updated = registry._manager_reset_workflow_for_authority_restart(
+        observed.run_id,
+        expected_run=observed,
+        authority_digest="f" * 64,
+    )
+
+    assert updated.current_phase == "verify"
+    assert updated.claim_key != observed.claim_key
+    assert updated.source_revision == "f" * 64
+    assert updated.candidate_head == observed.candidate_head
+    assert updated.verified_head is None
+    assert updated.pr_refs == observed.pr_refs
+    assert updated.steps[0].gate_result == "passed"
+    assert [step.gate_result for step in updated.steps[1:]] == ["pending", "pending"]
+    assert updated.gate_refs == observed.gate_refs[:1]
+
+
 
 
 def test_malformed_v1_rejected_without_backup_or_rewrite(tmp_path: Path) -> None:

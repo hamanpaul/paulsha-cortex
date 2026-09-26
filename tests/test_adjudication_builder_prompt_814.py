@@ -118,6 +118,24 @@ def test_builder_and_reviewer_prompts_consume_the_same_evidence(tmp_path: Path) 
     assert "blocking finding" in manager.OPERATOR_ADJUDICATION_REVIEWER_DIRECTIVE
 
 
+def test_reviewer_prompt_checks_ruling_scope_and_current_gate_evidence(tmp_path: Path) -> None:
+    run = _run()
+    _record(tmp_path, run)
+    rows = manager._operator_adjudications(run, tmp_path)
+    prompt = manager._workflow_job_prompt(
+        run,
+        _step("verification", phase="verify", persona="reviewer"),
+        builder_job_id="job-1",
+        coordinator_root=tmp_path,
+        operator_adjudications=rows,
+    )
+
+    assert "applicability and preconditions" in prompt
+    assert "Manager-owned actions" in prompt
+    assert "current Manager-supplied gate evidence" in prompt
+    assert "not measured" in prompt
+
+
 def test_dispatch_still_passes_run_level_adjudications_to_every_card() -> None:
     """#757 的接線不得被本票退回：裁決是 run 級、隨每次派工出現，不做「消費後不再注入」。"""
     source = inspect.getsource(manager._dispatch_workflow_card)

@@ -72,6 +72,7 @@ from .github_delivery import (
 from . import candidate_base
 from . import engineering_outcome
 from . import not_claimable
+from .planning_runtime import PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
 from . import verification
 from . import worktree_reclaim
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
@@ -1284,6 +1285,168 @@ def _expected_claim_key(authority) -> str:
             active_claim_key=None,
         )
     )
+
+
+def _candidate_recovery_block(run, reason: str) -> dict[str, Any]:
+    return {"action": "blocked", "reason": reason, "run": run.to_dict()}
+
+
+def _candidate_recovery_journal_snapshot(*, state_path: Path, run, authority):
+    journal = _load_runs(state_path)
+    row = journal["runs"].get(run.run_id)
+    if not isinstance(row, dict):
+        raise ValueError("existing-candidate-journal-missing")
+    expected = {
+        "run_id": run.run_id,
+        "claim_key": run.claim_key,
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "mapped_prs": list(authority.mapped_prs),
+        "workflow_step_ids": [
+            f"{run.run_id}:{step.phase}:{step.card}" for step in run.steps
+        ],
+    }
+    if any(row.get(field) != value for field, value in expected.items()):
+        raise ValueError("existing-candidate-journal-identity-mismatch")
+    return {"revision": journal["revision"], "row": copy.deepcopy(row)}
+
+
+def _existing_candidate_pr_facts(*, runner: Runner, repo: str, pr_number: int):
+    github = GitHubDeliveryClient(runner=runner)
+    lifecycle = github.fetch_pr_lifecycle_status(repo=repo, pr_number=pr_number)
+    if lifecycle.number != pr_number or lifecycle.state != "open" or lifecycle.terminal:
+        return lifecycle.state, None
+    merge_status = github.fetch_merge_status(repo=repo, pr_number=pr_number)
+    return lifecycle.state, merge_status.pr_head
+
+
+def _resume_existing_candidate_after_authority_change(
+    *,
+    run,
+    authority,
+    snapshot_path: str | Path | None,
+    state_path: Path,
+    workflow_registry,
+    runner: Runner,
+) -> dict[str, Any]:
+    from .registry import ACTIVE_JOB_STATUSES
+
+    if (
+        run.status != "ongoing"
+        or run.current_phase not in {"verify", "review", "ship"}
+        or not isinstance(run.candidate_head, str)
+        or verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is None
+        or run.verified_head != run.candidate_head
+        or len(authority.mapped_prs) != 1
+        or run.pr_refs != (f"{authority.repo}#{authority.mapped_prs[0]}",)
+        or run.issue_refs
+        != tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
+        or not _openspec_refs_compatible(run, authority)
+    ):
+        return _candidate_recovery_block(run, "existing-candidate-identity-mismatch")
+    if workflow_registry.get_workflow_run(run.run_id) != run:
+        return _candidate_recovery_block(run, "existing-candidate-registry-conflict")
+    if any(
+        job.get("workflow_run_id") == run.run_id
+        and job.get("status") in ACTIVE_JOB_STATUSES
+        for job in workflow_registry.list_jobs()
+    ):
+        return _candidate_recovery_block(run, "existing-candidate-active-job")
+    try:
+        journal_before = _candidate_recovery_journal_snapshot(
+            state_path=state_path, run=run, authority=authority
+        )
+    except (ValueError, OSError):
+        return _candidate_recovery_block(run, "existing-candidate-journal-mismatch")
+    journal_ship = journal_before["row"].get("ship")
+    if isinstance(journal_ship, dict) and (
+        journal_ship.get("merge_authorization") is not None
+        or journal_ship.get("phase") in {"merge-authorized", "merged", "done"}
+    ):
+        # 已授權或已進入 merge 的交付不得退回 verify；中止後應沿 ship 重入完成 merge。
+        return _candidate_recovery_block(run, "existing-candidate-merge-authorized")
+    pr_number = authority.mapped_prs[0]
+    try:
+        remote_before = _existing_candidate_pr_facts(
+            runner=runner, repo=authority.repo, pr_number=pr_number
+        )
+    except (RuntimeError, ValueError, OSError):
+        return _candidate_recovery_block(run, "existing-pr-facts-unavailable")
+    if remote_before != ("open", run.candidate_head):
+        return _candidate_recovery_block(run, "existing-pr-head-mismatch")
+
+    new_digest = work_authority_digest(authority)
+    try:
+        updated = workflow_registry._manager_reset_workflow_for_authority_restart(
+            run.run_id,
+            expected_run=run,
+            authority_digest=new_digest,
+        )
+    except (RuntimeError, ValueError):
+        return _candidate_recovery_block(
+            workflow_registry.get_workflow_run(run.run_id),
+            "existing-candidate-registry-conflict",
+        )
+
+    try:
+        fresh_authority = load_work_authority(
+            repo=authority.repo,
+            work_id=authority.work_id,
+            snapshot_path=snapshot_path,
+        )
+        journal_after = _candidate_recovery_journal_snapshot(
+            state_path=state_path, run=run, authority=authority
+        )
+        remote_after = _existing_candidate_pr_facts(
+            runner=runner, repo=authority.repo, pr_number=pr_number
+        )
+        confirmed = workflow_registry.get_workflow_run(run.run_id)
+    except (RuntimeError, ValueError, OSError):
+        return _candidate_recovery_block(
+            workflow_registry.get_workflow_run(run.run_id),
+            "existing-candidate-readback-failed",
+        )
+    if (
+        work_authority_digest(fresh_authority) != new_digest
+        or fresh_authority.mapped_prs != authority.mapped_prs
+        or journal_after != journal_before
+        or remote_after != remote_before
+        or confirmed != updated
+        or confirmed.status != "ongoing"
+        or confirmed.current_phase != "verify"
+        or confirmed.claim_key != _expected_claim_key(fresh_authority)
+        or confirmed.source_revision != new_digest
+        or confirmed.candidate_head != run.candidate_head
+        or confirmed.pr_refs != run.pr_refs
+        or confirmed.verified_head is not None
+        or any(
+            step.gate_result != "pending"
+            for step in confirmed.steps
+            if step.phase in {"verify", "review"}
+        )
+        or any(
+            job.get("workflow_run_id") == run.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in workflow_registry.list_jobs()
+        )
+    ):
+        return _candidate_recovery_block(
+            confirmed, "existing-candidate-readback-conflict"
+        )
+    active = confirmed.to_dict()
+    active.update(
+        {
+            "snapshot_hash": fresh_authority.snapshot_hash,
+            "source_revisions": list(fresh_authority.source_revisions),
+            "provider_revision": fresh_authority.github_provider_revision,
+            "authority_digest": new_digest,
+            "status": workflow_status(confirmed),
+            "retry_classification": _classify_retry(
+                confirmed, workflow_registry, trigger="authority-restart"
+            ),
+        }
+    )
+    return {"action": "resume", "reason": "active-workflow", "run": active}
 
 
 def _validate_current_run_authority(active: dict[str, Any], authority, canonical_run) -> None:
@@ -3238,6 +3401,8 @@ def _claim_action(
     workflow_registry=None,
     workflow_starter=None,
     readiness_checker=None,
+    runner: Runner = subprocess.run,
+    snapshot_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Claim decision for one authority.
 
@@ -3274,6 +3439,49 @@ def _claim_action(
         if len(matching) > 1:
             raise RuntimeError("canonical workflow claim is ambiguous")
         canonical_run = matching[0] if matching else None
+        mapped_pr_refs = tuple(
+            f"{authority.repo}#{number}" for number in authority.mapped_prs
+        )
+        existing_candidate_runs = [
+            run
+            for run in all_runs
+            if run.repo == authority.repo
+            and run.work_id == authority.work_id
+            and run.status == "ongoing"
+            and run.current_phase in {"verify", "review", "ship"}
+            and getattr(run, "candidate_head", None)
+            and getattr(run, "verified_head", None) == run.candidate_head
+            and mapped_pr_refs
+            and getattr(run, "pr_refs", ()) == mapped_pr_refs
+            and run.claim_key != expected_key
+        ]
+        if existing_candidate_runs:
+            from .manager import _merged_delivery_journal_bound
+
+            existing_candidate_runs = [
+                run
+                for run in existing_candidate_runs
+                if run.current_phase not in {"verify", "review"}
+                or not _merged_delivery_journal_bound(
+                    run, journal_path=Path(state_path)
+                )
+            ]
+        if len(existing_candidate_runs) > 1:
+            return _candidate_recovery_block(
+                existing_candidate_runs[0], "existing-candidate-identity-ambiguous"
+            )
+        if existing_candidate_runs:
+            existing_candidate = existing_candidate_runs[0]
+            if args.get("action") != "resume" or automatic:
+                return _candidate_recovery_block(
+                    existing_candidate,
+                    "candidate-recovery-requires-explicit-resume",
+                )
+            if canonical_run is not None and canonical_run.run_id != existing_candidate.run_id:
+                return _candidate_recovery_block(
+                    existing_candidate, "existing-candidate-identity-ambiguous"
+                )
+            canonical_run = existing_candidate
         if canonical_run is None and (automatic or args.get("action") == "resume"):
             active = [
                 run
@@ -3376,6 +3584,14 @@ def _claim_action(
     planning_failure_hint = (
         _planning_failure_hint(canonical_run) if canonical_run is not None else None
     )
+    active_recovery_actions: tuple[str, ...] = ()
+    if canonical_run is not None:
+        try:
+            active_recovery_actions = _phase_recovery_actions(
+                canonical_run, workflow_registry
+            )
+        except Exception:  # noqa: BLE001 - claim read projection remains fail-soft
+            active_recovery_actions = ()
     candidate = ClaimCandidate(
         authority=authority,
         repo=authority.repo,
@@ -3420,6 +3636,7 @@ def _claim_action(
         active_planning_failure_reason=(
             planning_failure_hint["reason"] if planning_failure_hint else None
         ),
+        active_recovery_actions=active_recovery_actions,
     )
     if (
         canonical_run is not None
@@ -3444,8 +3661,6 @@ def _claim_action(
                 "reason": "active-workflow",
                 "run": canonical_run.to_dict(),
             }
-        new_digest = work_authority_digest(authority)
-        authority_restart_classification = None
         if canonical_run.current_phase in {"verify", "review"}:
             from .manager import _merged_delivery_journal_bound
 
@@ -3463,7 +3678,7 @@ def _claim_action(
                         "snapshot_hash": authority.snapshot_hash,
                         "source_revisions": list(authority.source_revisions),
                         "provider_revision": authority.github_provider_revision,
-                        "authority_digest": new_digest,
+                        "authority_digest": work_authority_digest(authority),
                         "status": workflow_status(canonical_run),
                     }
                 )
@@ -3472,9 +3687,30 @@ def _claim_action(
                     "reason": "merged-delivery-closure",
                     "run": active,
                 }
+        if (
+            canonical_run.status == "ongoing"
+            and canonical_run.current_phase in {"verify", "review", "ship"}
+            and getattr(canonical_run, "candidate_head", None)
+            and getattr(canonical_run, "verified_head", None)
+            == canonical_run.candidate_head
+            and mapped_pr_refs
+            and getattr(canonical_run, "pr_refs", ()) == mapped_pr_refs
+        ):
+            return _resume_existing_candidate_after_authority_change(
+                run=canonical_run,
+                authority=authority,
+                snapshot_path=snapshot_path,
+                state_path=Path(state_path),
+                workflow_registry=workflow_registry,
+                runner=runner,
+            )
+        new_digest = work_authority_digest(authority)
+        authority_restart_classification = None
+        if canonical_run.current_phase in {"verify", "review"}:
             try:
                 canonical_run = workflow_registry._manager_reset_workflow_for_authority_restart(
                     canonical_run.run_id,
+                    expected_run=canonical_run,
                     authority_digest=new_digest,
                 )
                 authority_restart_classification = _classify_retry(
@@ -3714,42 +3950,32 @@ def _claim_action(
         response["next_actions"] = list(decision.next_actions)
     if decision.next_step_hint is not None:
         response["next_step_hint"] = decision.next_step_hint
-    # #546（部分）：卡片卡在 needs_human 時，`_resume_decision` 看不到 job 層
-    # 事實，宣告的唯一出口是 `abandon`（＝燒掉一個世代與合格的 commit）。
-    # 這裡把同樣以 run/job 事實判定為「真的會被受理」的復原動作補進去，順序維持
-    # 「既有決策優先、補充在後」，不重排既有值。#569：verify／review 的 reviewer
-    # 卡一併涵蓋——那個現場的 operator 正是因為 `next_actions` 只寫著 `abandon`
-    # 才轉而使用只重置不重派的 `retry-verify`。
+    # #546：ClaimCandidate 已帶入與 action admission 同源的 job／owner-slice 判準。
+    # 保留既有的動作專屬提示，動作本身不在回應層重算。
     if decision.action == "needs_human" and canonical_run is not None:
-        extra = [
-            item
-            for item in _phase_recovery_actions(canonical_run, workflow_registry)
-            if item not in response.get("next_actions", [])
-        ]
-        if extra:
-            response["next_actions"] = [*response.get("next_actions", []), *extra]
-            reason_payload = canonical_run.needs_human_reason
-            reason_code = (
-                reason_payload.get("reason")
-                if isinstance(reason_payload, dict)
-                else None
+        projected_actions = response.get("next_actions", [])
+        reason_payload = canonical_run.needs_human_reason
+        reason_code = (
+            reason_payload.get("reason")
+            if isinstance(reason_payload, dict)
+            else None
+        )
+        if "retry-review" in projected_actions and reason_code == "blocking-findings":
+            response["next_step_hint"] = blocking_findings_next_step_hint(
+                work_id=canonical_run.work_id,
+                repo=canonical_run.repo,
+                candidate=canonical_run.candidate_head,
             )
-            if "retry-review" in extra and reason_code == "blocking-findings":
-                response["next_step_hint"] = blocking_findings_next_step_hint(
-                    work_id=canonical_run.work_id,
-                    repo=canonical_run.repo,
-                    candidate=canonical_run.candidate_head,
-                )
-            elif "review-attest" in extra and authority is not None:
-                response["next_step_hint"] = (
-                    f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
-                )
-            elif "review-disposition" in extra and authority is not None:
-                response["next_step_hint"] = (
-                    "確認 PR review threads 全部 resolved 後，由 operator 提交 exact-HEAD 裁決："
-                    f"cortex work review-disposition {canonical_run.work_id} --repo {authority.repo} "
-                    "--actor <operator> --reason '<理由>'"
-                )
+        elif "review-attest" in projected_actions and authority is not None:
+            response["next_step_hint"] = (
+                f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+            )
+        elif "review-disposition" in projected_actions and authority is not None:
+            response["next_step_hint"] = (
+                "確認 PR review threads 全部 resolved 後，由 operator 提交 exact-HEAD 裁決："
+                f"cortex work review-disposition {canonical_run.work_id} --repo {authority.repo} "
+                "--actor <operator> --reason '<理由>'"
+            )
     if decision.blocking_reason is not None:
         response["blocking_reason"] = decision.blocking_reason
     return response
@@ -4059,7 +4285,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
     }
     if extras:
         raise ValueError(f"retry-build rejects caller evidence/input: {sorted(extras)[0]}")
-    # #755：選填 operator 指示——repair 回合過去只有 stale 的跨卡回饋可看。
+    # #755：既有 needs_human recovery 的 operator 指示維持選填；通過後新發現阻斷時另要求裁決理由。
     _validate_operator_adjudication_args(args, state_path=state_path, action="retry-build")
     model_chain_override = _retry_build_model_chain_override(args)
     expected_candidate = args.get("expected_candidate")
@@ -4086,12 +4312,25 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
     if len(active) != 1:
         raise RuntimeError("retry-build requires one active canonical WorkflowRun")
     run = active[0]
-    if "needs_human" not in run.facets:
+    verify_steps = [step for step in run.steps if step.phase == "verify"]
+    review_steps = [step for step in run.steps if step.phase == "review"]
+    post_pass_adjudication = (
+        "needs_human" not in run.facets
+        and run.current_phase == "review"
+        and run.candidate_head is not None
+        and run.verified_head == run.candidate_head
+        and bool(verify_steps)
+        and bool(review_steps)
+        and all(step.gate_result == "passed" for step in (*verify_steps, *review_steps))
+    )
+    if "needs_human" not in run.facets and not post_pass_adjudication:
         raise RuntimeError("retry-build requires needs_human workflow")
     if run.current_phase not in {"build", "verify", "review"}:
         raise RuntimeError("retry-build requires build/verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
+    if post_pass_adjudication and not args.get("reason"):
+        raise ValueError("retry-build post-pass adjudication requires --reason")
     reason_payload = run.needs_human_reason
     reason_context = reason_payload.get("context") if isinstance(reason_payload, dict) else None
     delivery_reason = reason_context.get("delivery_reason") if isinstance(reason_context, dict) else None
@@ -4180,6 +4419,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         repair_action=repair_action,
         retry_classification=retry_classification.value,
         model_chain_override=model_chain_override,
+        post_pass_adjudicated=post_pass_adjudication,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
@@ -4344,19 +4584,12 @@ def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
 
 
 def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
-    """#546（部分）：run 停在 needs_human 時真的可用的 recovery 動作。
+    """計算 needs_human run 中與 job／owner-slice admission 一致的 recovery 動作。
 
-    `claim._resume_decision` 只看得到 run 的 phase 與 planning failure 記錄，因此
-    卡片卡住時它宣告的唯一出口是 `abandon`——實測（run
-    ``workflow-084f75e2178cf7547476``）operator 因此以為只能燒掉一個世代，而
-    `regenerate-gates`／`retry-card` 其實都可用。這個 helper 在 work action 層
-    （拿得到 JobRegistry）補上那段曝光面。
-
-    #569 一般化到 verify／review：同一個現場的 verification 卡（reviewer job 輸出
-    損壞、evidence 綁不上）過去在 `next_actions` 裡同樣只看得到 `abandon`，
-    operator 因此改用 `retry-verify`——那條路只重置不重派，四小時後 needs_human
-    原地回鍋。函式名從 `_build_phase_recovery_actions` 一併改名，因為它已不再只
-    覆蓋 build phase。
+    #546 將此結果帶入 `ClaimCandidate`，並供 claim、status、Monitor work list 共用；
+    helper 只在能以 canonical registry 證據確認動作可受理時回傳該動作。既有
+    `regenerate-gates`／`retry-card`、#569 的 verify／review recovery，以及 owner-bound
+    `recover-pre-candidate` 都沿用各自 action 的 admission 判準。
 
     刻意**只宣告會被受理的動作**：每一項都用與該動作自身完全相同的前置驗
     （同一份 job/step 判準）判定，拿不準就不宣告。宣告一個保證失敗的動作比不
@@ -4474,6 +4707,21 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
         actions.append("review-attest")
     if reason_code in {"review-disposition-required", "review-threads-unresolved"}:
         actions.append("review-disposition")
+    try:
+        from . import manager as workflow_manager
+
+        owner_slice = workflow_manager._resolve_work_owner_slice(
+            workflow_registry, repo=run.repo, work_id=run.work_id
+        )
+        workflow_manager._pre_candidate_recovery_admission(
+            workflow_registry,
+            owner_slice,
+            expected_owner={"repo": run.repo, "work_id": run.work_id},
+        )
+        if "recover-pre-candidate" not in actions:
+            actions.append("recover-pre-candidate")
+    except Exception:  # noqa: BLE001 - incomplete owner/job evidence fails closed
+        pass
     return tuple(actions)
 
 
@@ -4671,6 +4919,21 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         workflow_registry,
         trigger=_RETRY_CARD_PHASE_TRIGGERS.get(run.current_phase),
     )
+    if model_chain_override is not None:
+        # dispatch 本來會驗 run-scoped override 的 identity 是否存在、具備 persona
+        # capability 且符合 reviewer independence。先用相同判準檢查暫存的合併值，
+        # 避免驗證失敗時 retry-card 已把 override 寫進 WorkflowRun。
+        from . import manager
+
+        effective_override = {
+            **dict(run.model_chain_override or {}),
+            **{persona: dict(row) for persona, row in model_chain_override.items()},
+        }
+        manager._workflow_identity_candidates(
+            replace(run, model_chain_override=effective_override),
+            target,
+            manager.load_model_identities(),
+        )
     # #752／#755：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由
     # `manager._operator_adjudications()` 讀回、進 retry_context 的
     # `operator_adjudications` 鍵（bounded CLI、Manager-owned，非 candidate 內容）。
@@ -5058,16 +5321,27 @@ def _read_planning_failure_record(
             continue
         classification = record.get("classification")
         reason = record.get("reason")
+        failure_kind = record.get("failure_kind")
+        if (
+            failure_kind is not None
+            and failure_kind != PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
+        ):
+            continue
         if (
             classification not in {"environment", "content"}
             or not isinstance(reason, str)
             or not reason.strip()
+            or (
+                failure_kind == PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
+                and classification != "environment"
+            )
         ):
             continue
         matches.append(
             {
                 "classification": classification,
                 "reason": reason,
+                "failure_kind": failure_kind,
                 "evidence_ref": path_value,
             }
         )
@@ -5265,6 +5539,87 @@ def _gc_abandoned_planning_artifacts(
                 "planning-artifact-gc-failed run_id=%s ref=%s error=%s: %s",
                 run.run_id, item.ref, type(exc).__name__, str(exc)[:200],
             )
+
+
+def _retire_missing_pinned_path_links(run, *, authority) -> tuple[str, ...]:
+    """退休後只解除已回收、且仍由本 work item 明確映射的 pinned path link。"""
+
+    workspace_value = getattr(run, "workspace_root", None)
+    if not isinstance(workspace_value, str) or not workspace_value:
+        return ()
+    workspace = Path(workspace_value)
+    if workspace.is_symlink():
+        return ()
+    try:
+        root = workspace.resolve(strict=True)
+        if not root.is_dir():
+            return ()
+        override = root / ".cortex" / "work-items.yaml"
+        if (root / ".cortex").is_symlink() or override.is_symlink():
+            return ("work-item override symlink; path links retained",)
+        if not override.is_file():
+            return ()
+
+        from paulsha_cortex.monitor.correlation import (
+            SourceLink,
+            load_work_item_overrides,
+            unlink_work_source,
+        )
+
+        overrides = load_work_item_overrides(root)
+        item = overrides.work_items.get(authority.work_id)
+        if item is None:
+            return ()
+        mapped_refs = set(getattr(authority, "mapped_todo_paths", ()) or ())
+        pinned_refs = {
+            entry.ref for entry in (getattr(run, "planning_authority", ()) or ())
+        }
+        eligible_refs = mapped_refs & pinned_refs
+        if not eligible_refs:
+            return ()
+
+        warnings: list[str] = []
+        for link in item.links:
+            if link.kind != "path" or link.ref not in eligible_refs:
+                continue
+            target = root
+            missing = False
+            safe = True
+            for part in Path(link.ref).parts:
+                target = target / part
+                try:
+                    mode = target.lstat().st_mode
+                except FileNotFoundError:
+                    missing = True
+                    break
+                except OSError:
+                    safe = False
+                    break
+                if statmod.S_ISLNK(mode):
+                    safe = False
+                    break
+            if not safe or not missing:
+                continue
+            try:
+                unlink_work_source(root, authority.work_id, SourceLink("path", link.ref))
+            except Exception as exc:  # noqa: BLE001 - retirement is already durable
+                logger.warning(
+                    "retire-delivered-path-link-cleanup-failed run_id=%s ref=%s error=%s: %s",
+                    run.run_id,
+                    link.ref,
+                    type(exc).__name__,
+                    str(exc)[:200],
+                )
+                warnings.append(f"stale path link retained: {link.ref}")
+        return tuple(warnings)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not undo retirement
+        logger.warning(
+            "retire-delivered-path-link-cleanup-failed run_id=%s error=%s: %s",
+            getattr(run, "run_id", "unknown"),
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        return ("work-item path link cleanup failed",)
 
 
 def _reclaim_abandoned_build_worktrees(run, workflow_registry, *, state_path: Path) -> None:
@@ -5644,13 +5999,14 @@ def _recover_superseded_action(
     # 兩步走：先復歸 ongoing 並剝掉 supersede 迴圈附加的 blocked facet（保留
     # needs_human facet＋理由，維持 `_resolve_needs_human_reason` 的 facet⟷理由
     # invariant），再交給 official restart 一步清 needs_human 並打回 verify。
-    workflow_registry._manager_update_workflow_run(
+    restored_run = workflow_registry._manager_update_workflow_run(
         run.run_id,
         status="ongoing",
         facets=tuple(facet for facet in run.facets if facet != "blocked"),
     )
     updated = workflow_registry._manager_reset_workflow_for_authority_restart(
         run.run_id,
+        expected_run=restored_run,
         authority_digest=work_authority_digest(authority),
     )
     return {
@@ -6043,7 +6399,10 @@ def _retire_delivered_action(
             evidence_ref=record["ref"],
         )
         _gc_abandoned_planning_artifacts(updated)
-        return {
+        cleanup_warnings = _retire_missing_pinned_path_links(
+            updated, authority=authority
+        )
+        result = {
             "action": "retired-delivered",
             "reason": reason,
             "actor": actor,
@@ -6052,6 +6411,9 @@ def _retire_delivered_action(
             "evidence": record,
             "run": updated.to_dict(),
         }
+        if cleanup_warnings:
+            result["warnings"] = list(cleanup_warnings)
+        return result
     if any(item.status == "ongoing" and item.run_id != run.run_id for item in related):
         raise RuntimeError("retire-delivered refuses a different active WorkflowRun")
     if not run.pr_refs:
@@ -6098,7 +6460,10 @@ def _retire_delivered_action(
         evidence_ref=record["ref"],
     )
     _gc_abandoned_planning_artifacts(updated)
-    return {
+    cleanup_warnings = _retire_missing_pinned_path_links(
+        updated, authority=authority
+    )
+    result = {
         "action": "retired-delivered",
         "reason": reason,
         "actor": actor,
@@ -6107,6 +6472,9 @@ def _retire_delivered_action(
         "evidence": record,
         "run": updated.to_dict(),
     }
+    if cleanup_warnings:
+        result["warnings"] = list(cleanup_warnings)
+    return result
 
 
 def _close_delivered_action(
@@ -7908,6 +8276,30 @@ def _ship_action(
         raise RuntimeError("ship delivery binding differs from persisted PR/OpenSpec/Todo refs")
     github = GitHubDeliveryClient(runner=runner)
     orchestrator = ShipOrchestrator(github=github, now=now)
+
+    def persist_shipped_outcome(
+        *, expected_head: str, pr_number: int, change: str | None,
+        todo_paths: list[str], authorization: dict[str, Any], closure,
+    ) -> None:
+        outcome_store = engineering_outcome.OutcomeStore(
+            engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
+        )
+        engineering_outcome.emit_shipped_outcome(
+            outcome_store,
+            run=canonical_run,
+            authority=authority,
+            jobs=workflow_registry.list_jobs(),
+            attempt_digest=str(closure.completion_record["hash"]),
+            candidate={
+                "pr_number": pr_number,
+                "openspec_change": change,
+                "sha": expected_head,
+                "merge_commit": closure.facts.merge_commit,
+            },
+            verification={"todo_paths": list(todo_paths)},
+            review={"merge_authorization_hash": authorization.get("hash")},
+        )
+
     rearm_permit = None
     if (
         isinstance(ship, dict)
@@ -7988,6 +8380,20 @@ def _ship_action(
             workflow_step_ids=tuple(active["workflow_step_ids"]),
             trusted_evidence_refs=_trusted_evidence_refs(authorization),
         )
+        if canonical_run.current_phase in {"review", "ship"}:
+            # #1086：一般 review→ship advance 仍處於 review；先 durable 寫入
+            # shipped outcome，production ship validator 才能回傳 passed，讓
+            # Manager 後續將 Registry 標成 done。重入會重驗 closure，並以
+            # CompletionRecord hash 重用同一筆 outcome。必須在 journal 標 ship done
+            # 之前完成：寫入失敗時 journal 仍停在 merged，resume 可重入重試。
+            persist_shipped_outcome(
+                expected_head=expected_head,
+                pr_number=pr_number,
+                change=change,
+                todo_paths=todo_paths_value,
+                authorization=authorization,
+                closure=closure,
+            )
         active["ship"] = {
             **ship,
             "phase": "done",
@@ -8000,36 +8406,8 @@ def _ship_action(
             for source in authority.source_revisions
             if "@" in source
         }
+
         if canonical_run.current_phase == "ship":
-            # #275：canonical engineering outcome 必須在 terminal transition
-            # （status="done"）之前 durable 寫入，讓外部 learning systems 有一個
-            # 不受 WorkflowRun in-place 覆寫影響的 append-only 記錄可讀。
-            # attempt_digest 用 completion record hash——同一次 merge 重跑
-            # ship（daemon restart／request retry）會算出同一個 hash，因此
-            # OutcomeStore.append 據此去重，不產生第二筆 outcome。
-            outcome_store = engineering_outcome.OutcomeStore(
-                engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
-            )
-            engineering_outcome.emit_outcome(
-                outcome_store,
-                run=canonical_run,
-                authority=authority,
-                jobs=workflow_registry.list_jobs(),
-                outcome="shipped",
-                attempt_digest=str(closure.completion_record["hash"]),
-                candidate={
-                    "pr_number": pr_number,
-                    "openspec_change": change,
-                    "sha": expected_head,
-                    "merge_commit": closure.facts.merge_commit,
-                },
-                verification={"todo_paths": list(todo_paths_value)},
-                review={
-                    "merge_authorization_hash": (
-                        authorization.get("hash") if isinstance(authorization, dict) else None
-                    ),
-                },
-            )
             workflow_registry._manager_update_workflow_run(
                 canonical_run.run_id,
                 status="done",
@@ -8103,6 +8481,17 @@ def _ship_action(
             "completion_record": dict(closure.completion_record),
         }
         _save_runs(state_path, state)
+        if canonical_run.current_phase == "review":
+            # Manager 若在 outcome 後轉態前中斷，重入時 journal 已是 done。
+            # 重驗 remote closure 後，以同一 CompletionRecord 綁定補齊或重用 outcome。
+            persist_shipped_outcome(
+                expected_head=expected_head,
+                pr_number=pr_number,
+                change=change,
+                todo_paths=todo_paths,
+                authorization=authorization,
+                closure=closure,
+            )
         return {
             "action": "done",
             "head": expected_head,
@@ -8911,6 +9300,8 @@ def execute_work_action(
             workflow_registry=workflow_registry,
             workflow_starter=workflow_starter,
             readiness_checker=readiness_checker,
+            runner=runner,
+            snapshot_path=snapshot_path,
         )
     elif action == "intake":
         result = _intake_action(

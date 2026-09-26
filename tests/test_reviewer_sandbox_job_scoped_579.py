@@ -227,7 +227,7 @@ def test_authority_restart_dispatch_reclaims_a_legacy_reviewer_sandbox(
     registry._persist()
 
     restarted = registry._manager_reset_workflow_for_authority_restart(
-        run.run_id, authority_digest="e" * 64
+        run.run_id, expected_run=run, authority_digest="e" * 64
     )
     launched: list[tuple[str, str]] = []
 
@@ -284,7 +284,7 @@ def test_authority_restart_dispatch_warns_but_keeps_going_when_reclaim_fails(
     registry._persist()
 
     restarted = registry._manager_reset_workflow_for_authority_restart(
-        run.run_id, authority_digest="e" * 64
+        run.run_id, expected_run=run, authority_digest="e" * 64
     )
 
     with caplog.at_level(logging.WARNING, logger=manager.logger.name):

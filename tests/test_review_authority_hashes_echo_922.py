@@ -368,6 +368,19 @@ def test_periodic_resume_surfaces_review_terminal_parse_context(tmp_path: Path) 
         review_job["job_id"], executor="claude", model_id="reviewer", log_path=str(log_path)
     )
     registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
+    # #578 之後格式損壞的 terminal 會先在 schema retry 額度內自動重派；#922 要求的是
+    # 「最後停下來時」保留解析脈絡，因此以額度已用盡的情境驗證停止時的診斷欄位。
+    from paulsha_cortex.coordinator import terminal_contract
+
+    current = registry.get_workflow_run(run.run_id)
+    registry._manager_update_workflow_run(
+        run.run_id,
+        attempts={
+            **current.attempts,
+            terminal_contract.schema_retry_attempt_key(review_job["workflow_card"]):
+                terminal_contract.MAX_SCHEMA_RETRIES,
+        },
+    )
 
     periodic = manager_daemon.build_periodic_tick_runner(
         dispatcher=_ResumeDispatcher(registry),
@@ -389,7 +402,7 @@ def test_periodic_resume_surfaces_review_terminal_parse_context(tmp_path: Path) 
 
     reason = registry.get_workflow_run(run.run_id).needs_human_reason
     assert reason is not None
-    assert reason["reason"] == "resume-workflow-failed"
+    assert reason["reason"] == "card-terminal-schema-retry-exhausted"
     assert reason["context"]["job_log_path"] == str(log_path)
     assert "workflow terminal log has no JSON evidence" in reason["context"]["envelope_parse_error"]
 

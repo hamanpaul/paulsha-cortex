@@ -5479,24 +5479,44 @@ class JobRegistry:
         repair_action: str,
         retry_classification: str | None = None,
         model_chain_override: dict[str, dict[str, str]] | None = None,
+        post_pass_adjudicated: bool = False,
     ) -> WorkflowRun:
-        """Atomically reopen only the final builder card after an explicit human stop.
+        """以 exact Candidate 重開最後 builder 卡，保留既有 evidence 與下游重驗契約。
 
-        ``model_chain_override`` is an optional, explicit recovery-time refinement.
-        It is merged onto the run-scoped claim override (rather than replacing the
-        planner/reviewer entries), and the selected identity is still validated by
-        the normal dispatch path before a job is created.
+        ``post_pass_adjudicated`` 僅供 work action 在 verify／review 全部通過且已記錄
+        operator 裁決理由後使用；此路徑仍須符合相同 exact Candidate 與無 active job 條件。
+        ``model_chain_override`` 則維持既有明示覆寫行為，派工前仍由一般路徑驗證 identity。
         """
 
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
+        verify_steps = [step for step in current.steps if step.phase == "verify"]
+        review_steps = [step for step in current.steps if step.phase == "review"]
+        valid_post_pass_adjudication = (
+            post_pass_adjudicated
+            and current.current_phase == "review"
+            and current.verified_head == expected_candidate
+            and bool(verify_steps)
+            and bool(review_steps)
+            and all(
+                step.gate_result == "passed"
+                for step in (*verify_steps, *review_steps)
+            )
+        )
         if (
             current.status != "ongoing"
             or current.current_phase not in {"build", "verify", "review"}
-            or "needs_human" not in current.facets
+            or (
+                "needs_human" not in current.facets
+                and not valid_post_pass_adjudication
+            )
         ):
             raise ValueError(
-                "retry-build reset requires active needs_human build/verify/review workflow"
+                "retry-build reset requires active needs_human workflow or exact post-pass adjudication"
+            )
+        if post_pass_adjudicated and not valid_post_pass_adjudication:
+            raise ValueError(
+                "retry-build post-pass adjudication requires passed exact-candidate verify/review"
             )
         if current.candidate_head != expected_candidate:
             raise ValueError("retry-build reset Candidate CAS mismatch")
@@ -6071,6 +6091,7 @@ class JobRegistry:
         self,
         run_id: str,
         *,
+        expected_run: WorkflowRun,
         authority_digest: str,
     ) -> WorkflowRun:
         """Atomically invalidate stale verify/review gates after a bound WorkAuthority
@@ -6095,9 +6116,15 @@ class JobRegistry:
 
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
-        if current.status != "ongoing" or current.current_phase not in {"verify", "review"}:
+        if current != expected_run:
+            raise ValueError("authority-restart snapshot mismatch")
+        if current.status != "ongoing" or current.current_phase not in {
+            "verify",
+            "review",
+            "ship",
+        }:
             raise ValueError(
-                "authority-restart reset requires ongoing verify/review workflow"
+                "authority-restart reset requires ongoing verify/review/ship workflow"
             )
         if (
             not isinstance(authority_digest, str)

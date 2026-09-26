@@ -116,10 +116,9 @@ def test_in_process_invoker_preserves_sandbox_contract(tmp_path: Path) -> None:
 def test_in_process_invoker_preserves_operator_drift_containment(tmp_path: Path) -> None:
     """D2 的 D-e／D-f：operator 樹任何內容變化 ⇒ fail-closed ＋ 唯讀收容。
 
-    `PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX` 是**下游分類契約**
-    （`manager._is_planning_worktree_drift_failure` 唯一能依賴的部分，見 #554），
-    因此逐字釘住；同時釘住「內容一個位元組都沒被改寫」與「evidence 報告落地」
-    ——#507 的教訓是這條防線的補救動作曾經比它要防的傷害更貴。
+    drift 以固定 `failure_kind` 作為下游分類契約；訊息前綴只供人工診斷。
+    同時釘住「內容一個位元組都沒被改寫」與「evidence 報告落地」——#507 的教訓
+    是這條防線的補救動作曾經比它要防的傷害更貴。
     """
 
     identity = ModelIdentity("codex", "primary", "openai", ("planning",))
@@ -140,6 +139,10 @@ def test_in_process_invoker_preserves_operator_drift_containment(tmp_path: Path)
 
     message = str(excinfo.value)
     assert message.startswith(planning_runtime.PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX)
+    assert (
+        excinfo.value.failure_kind
+        == planning_runtime.PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
+    )
     # 唯讀收容：operator 的內容原地保留，不得被「還原」抹掉。
     assert tracked.read_text(encoding="utf-8") == "polluted\n"
 

@@ -11,7 +11,7 @@ work_item: dispatch-decision-contract
 accepted 表示需求與測試邊界已定案，不表示已實作、可繞過 sizing，或已完成交付。
 
 1. **R1 結果分類**：所有正式派工消費端須辨識真正 Job、合法非 Job 決策、確定性 phase transition 與 None。不能以「非 None」推論為 Job；未知／malformed 結果須具體拒絕，不得降格為成功。
-2. **R2 非 Job 真實性**：needs-decomposition、runtime preflight refusal、plan-output missing／plan-review 待處理等合法決策不產生假 job_id、dispatched 或 model session。回應保留原 reason、run ID、最新持久化 phase/facets。
+2. **R2 非 Job 真實性**：runtime preflight refusal、plan-output missing／plan-review 待處理等合法決策不產生假 job_id、dispatched 或 model session。回應保留原 reason、run ID、最新持久化 phase/facets。Red 的一般拆分路徑由後續 #833 改為派出一個 planner Job；拆分深度逾限仍回傳非 Job 決策。
 3. **R3 入口一致性**：work start/intake、workflow-action 同步續推、explicit resume、periodic continuation、terminal 後續 dispatch／provider retry 的同型消費端使用同一契約；不能只修最早一個 KeyError。
 4. **R4 狀態保全**：合法拆分／等待不得因 adapter 例外變成一般 needs_human/resume-workflow-failed。確定性 transition 若已落盤、即使沒有 Job，回應仍反映新 phase；None 且沒有 transition 不假稱推進。
 5. **R5 冪等性**：start 已建立 run 後的無 Job 結果，重送不得新增重複 claim/run、改寫已採信 evidence 或重複派模型；真 Job 保留 exact job_id 與原有綁定。
@@ -25,6 +25,10 @@ accepted 表示需求與測試邊界已定案，不表示已實作、可繞過 s
 - Tests：既有 producer、daemon request、resume/periodic、provider retry、forced retry fixture；新增集中 contract matrix。
 - Documentation：`docs/unified-work-lifecycle.md`、必要 CLI 操作說明與 changelog。
 - 非目標：#831 stability 量表、#223 Red 自動拆分、quota 預測、#822 parser、語意 recovery 擴權。
+
+### 後續實作補充（#833）
+
+本 spec 記錄 #830 定案時的範圍；#833 後，Red plan 完成且未達深度上限時，Manager 會派出唯一拆分 planner Job。計畫通過既有 plan review gate 後，child work ID 經標準 work-action intake 受理；本次不改 sizing，也不建立 fan-out、全樹預算或通用 lineage 引擎。
 
 ## Evidence
 

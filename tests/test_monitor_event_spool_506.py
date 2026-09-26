@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -261,8 +262,9 @@ def test_emit_is_fire_and_forget_when_the_directory_is_unusable(tmp_path, caplog
 def test_emit_rejects_a_malformed_envelope_without_raising(spool):
     assert (
         spool.emit_github_object(repo="not-a-repo", kind="github_issue", number=11, source="h")
-        is not None
-    ), "repo 形狀由消費端判定為壞檔，寫入端不做語意驗證"
+        is None
+    ), "producer 不寫入 repo 形狀錯誤的事件"
+    assert not spool.root.exists()
     assert (
         spool.emit_github_object(repo=REPO, kind="github_issue", number=11, source=" ")
         is None
@@ -836,3 +838,111 @@ def test_github_object_hint_validates_its_payload():
             ),
             Path("x.json"),
         )
+
+
+def test_scan_removes_quarantine_files_older_than_thirty_days(spool):
+    spool.quarantine_root.mkdir(parents=True)
+    expired = spool.quarantine_root / "expired.json"
+    retained = spool.quarantine_root / "retained.json"
+    expired.write_text("expired", encoding="utf-8")
+    retained.write_text("retained", encoding="utf-8")
+    now = datetime.fromisoformat(CYCLE.replace("Z", "+00:00"))
+    expired_at = (now - timedelta(days=31)).timestamp()
+    os.utime(expired, (expired_at, expired_at))
+    retained_at = (now - timedelta(days=29)).timestamp()
+    os.utime(retained, (retained_at, retained_at))
+
+    spool.scan(now=CYCLE)
+
+    assert not expired.exists()
+    assert retained.exists()
+
+
+def test_newly_quarantined_events_get_a_full_thirty_day_retention(spool):
+    spool.root.mkdir(parents=True)
+    stale = spool.root / "bad.json"
+    stale.write_text("{", encoding="utf-8")
+    old = datetime.fromisoformat(CYCLE.replace("Z", "+00:00")) - timedelta(days=60)
+    os.utime(stale, (old.timestamp(), old.timestamp()))
+
+    spool.scan(now=CYCLE)
+
+    quarantined = spool.quarantine_root / stale.name
+    assert quarantined.exists()
+    assert quarantined.stat().st_mtime == pytest.approx(
+        datetime.fromisoformat(CYCLE.replace("Z", "+00:00")).timestamp()
+    )
+
+
+def test_refresher_scans_shared_event_spool_once_for_multiple_repositories(
+    tmp_path, monkeypatch
+):
+    from paulsha_cortex.monitor import work_api
+    from paulsha_cortex.monitor.models import ProjectState
+    from paulsha_cortex.monitor.work_api import WorkModelRefresher, WorkReadModelStore
+    from paulsha_cortex.monitor.work_models import ProviderSnapshot
+    from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+    spool = EventSpool(tmp_path / "event-spool")
+    original_scan = spool.scan
+    scans = []
+
+    def counted_scan(*, now=None):
+        result = original_scan(now=now)
+        scans.append(result)
+        return result
+
+    monkeypatch.setattr(spool, "scan", counted_scan)
+    projects = []
+    repo_by_path = {}
+    for name in ("first", "second"):
+        root = tmp_path / name
+        root.mkdir()
+        projects.append(ProjectState(project_id=name, workspace="", path=str(root)))
+        repo_by_path[str(root)] = f"acme/{name}"
+    monkeypatch.setattr(
+        work_api,
+        "_repo_identity",
+        lambda root, _project_id: (repo_by_path[str(root)], True),
+    )
+    providers = []
+
+    class _StubProvider:
+        def __init__(self, provider_id, *, event_scan=None):
+            self.provider_id = provider_id
+            self.event_scan = event_scan
+            providers.append(self)
+
+        def scan(self):
+            return ProviderSnapshot(
+                provider_id=self.provider_id,
+                status="ok",
+                last_attempt_at=CYCLE,
+                last_success_at=CYCLE,
+                revision=self.provider_id,
+                diagnostics=(),
+                sources=(),
+            )
+
+    class _GitHubStub(_StubProvider):
+        def __init__(self, repo, **kwargs):
+            super().__init__(f"github:{repo}", event_scan=kwargs.get("event_scan"))
+
+    monkeypatch.setattr(work_api, "GitHubWorkProvider", _GitHubStub)
+    refresher = WorkModelRefresher(
+        durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
+        read_store=WorkReadModelStore.empty(),
+        workflow_provider_factory=lambda repo: _StubProvider(f"workflow:{repo}"),
+        github_terminal_provider_factory=lambda repo: _StubProvider(
+            f"github-terminal:{repo}"
+        ),
+        event_spool=spool,
+        now=lambda: datetime.fromisoformat(CYCLE.replace("Z", "+00:00")),
+    )
+
+    refresher.refresh(projects, include_github=True)
+
+    github_providers = [provider for provider in providers if provider.provider_id.startswith("github:")]
+    assert len(github_providers) == 2
+    assert len(scans) == 1
+    assert all(provider.event_scan is scans[0] for provider in github_providers)

@@ -22,8 +22,8 @@
 請求齊發就會觸發 GitHub 的 secondary（abuse detection）rate limit，兩個 provider
 一起 degraded，連帶擋掉 `cortex work` 的 claim。
 
-D2 之後（見下節）`GitHubTerminalProvider` 的 REST 呼叫數已降為每輪固定 2 次
-（graphql PR 分頁 ＋ 1 次 git tree）；`GitHubWorkProvider` 仍是 O(issues 分頁)。
+D2 之後（見下節）`GitHubTerminalProvider` 的 REST 呼叫只剩 GraphQL PR 分頁；tree、
+Todo 與 ancestry 都由本機 git 讀取。`GitHubWorkProvider` 仍是 O(issues 分頁)。
 
 `monitor:` 區段新增下列鍵（全部可省略，預設值即保守值）：
 
@@ -60,9 +60,12 @@ git checkout 本來就有的東西：
 - 每個 workflow-linked merged PR 一次 `repos/{repo}/compare/{merge}...{default}`
   （判「merge commit 還在不在 default branch 上」）
 
-兩者已改由 `paulsha_cortex.monitor.git_mirror.LocalGitMirror` 以本機 git 回答，
-**一輪的 REST `contents` / `compare` 呼叫數固定為 0**。git 協定（fetch）不受
-REST rate limit 管轄。
+recursive tree、`contents` 與 `compare` 已改由
+`paulsha_cortex.monitor.git_mirror.LocalGitMirror` 以本機 git 回答：tree 用
+`git ls-tree -r -t -z` 對準 GraphQL 回傳的 default commit，Todo blob 用
+`git cat-file --batch` 讀取，ancestry 用 `git merge-base` 判定。**一輪的 REST
+tree／`contents`／`compare` 呼叫數固定為 0**。git 協定（fetch）不受 REST rate limit
+管轄。
 
 - **讀哪個 checkout**：`work_api` 把該 repo 在 workspace 的 canonical checkout
   （與 `RepoWorkProvider` 同一個 root）傳給 provider。
@@ -78,6 +81,8 @@ REST rate limit 管轄。
 - **provenance**：`github-terminal:` provider 的 observations 多一個 `remote_reads`
   欄位，記 transport、checkout 路徑、本輪 fetch 的 refspec、缺席物件、blob 讀取數
   與 ancestry 判定數。
+- **shallow checkout**：無法判定 merge ancestry 時維持 degraded，diagnostic 會指出
+  shallow 原因並提示先評估成本；Monitor 不會自動執行 `git fetch --unshallow`。
 
 ## 事件入口（spool）：事件是 hint，不是 authority（#506 / D4）
 
@@ -90,10 +95,14 @@ D1–D3 把常態讀取壓下來的代價是**發現延遲**——fleet 自己�
   （隨 `PSC_MONITOR_STATE_ROOT` / `PSC_AGENTS_ROOT` 移動）。壞事件檔隔離到同層的
   `quarantine/`。目錄由**寫入端**建立——monitor 掃到目錄不存在就是「這台機器沒有
   事件 producer」，不是錯誤。
+- **單輪掃描與保留**：`WorkModelRefresher` 每個 GitHub refresh 只掃一次共享 spool，
+  各 repo provider 從同一結果篩選並消費自己的事件。quarantine 檔自隔離時起保留 30
+  天，之後在 spool scan 時清理。
 - **一事件一檔、原子寫入**：temp 檔（`.` 前綴，掃描端跳過）→ fsync → `os.replace`，
   0600。消費就是 per-file `unlink`，不需要鎖或 offset 檔。
 - **fire-and-forget**：`EventSpool.emit()` 永不 raise，失敗只回 `None`。寫入端掛在
-  別人的工作路徑上，spool 寫不進去不得影響工作本體。
+  別人的工作路徑上，spool 寫不進去不得影響工作本體；`emit_github_object()` 會先
+  驗證 repo 是非空的 `owner/name`，無效時不落檔。
 - **事件不帶新狀態**：`github_object` 事件只說「哪個 repo 的哪個編號被動了」，鏡像
   只寫 GitHub 自己回的內容（`correlation` 的 inferred→confirmed 語彙）。
 - **targeted 驗證**：單物件 `repos/{repo}/issues/{number}`，帶 per-object ETag 的

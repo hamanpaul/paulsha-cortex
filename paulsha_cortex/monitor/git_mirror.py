@@ -1,10 +1,12 @@
-"""#506 / D2：git 的資料走 git——把 repo 檔案讀取與 ancestry 判定移出 REST。
+"""#506 / D2：git 的資料走 git——把 repo tree、檔案與 ancestry 讀取移出 REST。
 
 ## 問題
 
-``GitHubTerminalProvider`` 一輪掃描對 GitHub REST 發出的兩類請求，讀的全是本機
+``GitHubTerminalProvider`` 一輪掃描對 GitHub REST 發出的讀取，讀的全是本機
 git checkout 裡本來就有（或 ``git fetch`` 一次就有）的東西：
 
+- **recursive tree**：讀 default branch 的完整 path/type/blob SHA 清單；本機
+  ``git ls-tree -r -t -z`` 不受 GitHub REST 的 truncated tree 上限影響。
 - **``contents``**：每個 remote ``todo.md`` / archived ``tasks.md`` 各一次，實測一輪
   91 次——讀的是 default branch 上某個 blob 的內容。
 - **``compare``**：每個 workflow-linked merged PR 各一次——判的是「merge commit 還在
@@ -19,14 +21,16 @@ REST 有 primary／secondary rate limit；git 協定（fetch）不受它管轄�
 
 1. **身分先驗**：``origin`` 必須真的指向宣稱的 ``owner/name``，否則 fail closed。
    monitor 掃的 workspace 目錄不保證是我們以為的那個 repo。
-2. **sha 定址**：blob 一律用 REST tree 給的 blob sha 讀（``git cat-file --batch``），
-   不用 path 讀。內容識別由 sha 本身保證，取代舊的
+2. **commit 定址**：tree 以 GraphQL 回傳的 default commit SHA 執行
+   ``git ls-tree -r -t -z``；blob 再用該 tree 給的 SHA 透過
+   ``git cat-file --batch`` 讀，不用工作目錄 path 讀。內容識別由 SHA 本身保證，取代舊的
    ``remote Todo content identity mismatch`` 檢查。
-3. **一輪最多一次 fetch**：``require()`` 先批次查缺（一次 ``--batch-check``），有缺才
-   fetch，refspec 目的地一律落在私有 namespace ``refs/cortex/mirror/<hash>/*``，
-   並以 ``--refmap=`` 關掉 configured refspec 的順帶更新，**不動**
-   ``refs/remotes/origin/*``、工作區與使用者的任何分支。fetch 頻率因此沿用 monitor
-   既有的 refresh 週期。
+3. **有限 fetch**：``require()`` 先批次查缺（一次 ``--batch-check``），每次呼叫最多
+   fetch 一次；refspec 目的地一律落在私有 namespace
+   ``refs/cortex/mirror/<hash>/*``，並以 ``--refmap=`` 關掉 configured refspec 的
+   順帶更新，**不動** ``refs/remotes/origin/*``、工作區與使用者的任何分支。tree
+   commit 與 Todo blob 分開查缺，partial object store 缺少 blob 時可能需要第二次有限
+   fetch，不會自動 unshallow。
 4. **fail closed**：ref 不存在、fetch 失敗、物件讀不到、shallow checkout 無法判
    ancestry——一律 raise :class:`GitMirrorError`，由 provider 轉成 degraded 快照、
    上層 ``_retain_last_good`` 保留上一份鏡像。**絕不**把讀不到靜默當成「檔案不存在」
@@ -333,6 +337,35 @@ class LocalGitMirror:
             raise GitMirrorError("git cat-file --batch output has trailing data")
         return result
 
+    def list_tree(self, revision: str) -> tuple[tuple[str, str, str], ...]:
+        """以 NUL 分隔的 ``git ls-tree`` 讀取指定 commit 的完整路徑樹。"""
+
+        (normalized,) = _validate_object_ids((revision,))
+        completed = self._run(("ls-tree", "-r", "-t", "-z", normalized))
+        output = completed.stdout or b""
+        if not output:
+            return ()
+        if not output.endswith(b"\0"):
+            raise GitMirrorError("git ls-tree output is truncated")
+        rows: list[tuple[str, str, str]] = []
+        for record in output[:-1].split(b"\0"):
+            try:
+                metadata, raw_path = record.split(b"\t", 1)
+                mode, kind, revision_bytes = metadata.split()
+                path = raw_path.decode("utf-8")
+                oid = revision_bytes.decode("ascii")
+            except (ValueError, UnicodeDecodeError) as error:
+                raise GitMirrorError("git ls-tree output is malformed") from error
+            if (
+                not mode
+                or kind not in {b"blob", b"tree", b"commit"}
+                or _OBJECT_ID.fullmatch(oid) is None
+                or not path
+            ):
+                raise GitMirrorError("git ls-tree output is malformed")
+            rows.append((path, kind.decode("ascii"), oid.lower()))
+        return tuple(rows)
+
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         """``git merge-base --is-ancestor``（取代逐 PR ``compare``）。"""
 
@@ -346,7 +379,8 @@ class LocalGitMirror:
             # 此時無法判定，一律 fail closed。
             if self._is_shallow():
                 raise GitMirrorError(
-                    "shallow local checkout cannot decide merge ancestry"
+                    "shallow local checkout cannot decide merge ancestry; "
+                    "review the cost before running `git fetch --unshallow`"
                 )
             return False
         completed = self._run(

@@ -34,6 +34,8 @@ from .work_actions import safe_exception_summary
 
 DEFAULT_TICK_INTERVAL = 300.0
 DEFAULT_POLL_INTERVAL = 3.0
+MAX_IDLE_POLL_INTERVAL = 10.0
+JOB_PROGRESS_STALE_AFTER_SECONDS = 1800.0
 DEFAULT_PERSONA = "builder"
 DEFAULT_EXECUTOR = "copilot"
 DEFAULT_MAX_LOAD = 1.0
@@ -359,10 +361,45 @@ def _in_flight_status(
             "candidate_git_base": git_base,
             **execution_identity,
         }
+        log_path = job.get("log_path")
+        if isinstance(log_path, str) and log_path:
+            try:
+                progress_mtime = Path(log_path).stat().st_mtime
+            except OSError:
+                pass
+            else:
+                row["last_progress_at"] = datetime.fromtimestamp(
+                    progress_mtime, tz=timezone.utc
+                ).isoformat()
+                row["progress_age_seconds"] = max(0.0, time.time() - progress_mtime)
         if accepted_results:
             row["accepted_workflow_results"] = accepted_results
         in_flight.append(row)
     return in_flight
+
+
+def _stale_job_attention(in_flight: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """將 job log 超過 30 分鐘未更新的工作投影為 status attention。"""
+    attention = []
+    for job in in_flight:
+        age = job.get("progress_age_seconds")
+        if not isinstance(age, (int, float)) or age <= JOB_PROGRESS_STALE_AFTER_SECONDS:
+            continue
+        job_id = job.get("job_id")
+        attention.append(
+            {
+                "kind": "job",
+                "job_id": job_id,
+                "slice_id": job.get("slice_id"),
+                "reason": "stale-in-flight",
+                "last_progress_at": job.get("last_progress_at"),
+                "progress_age_seconds": age,
+                "next_step_hint": (
+                    f"檢視 cortex stat {job_id} 與 job log；Cortex 不會自動中斷此工作。"
+                ),
+            }
+        )
+    return attention
 
 
 def _not_claimable_status(registry) -> list[dict[str, Any]]:
@@ -467,9 +504,11 @@ def build_status_provider(
         probe = candidate_base.MirrorDistanceProbe(
             mirror_root=candidate_base.default_mirror_root()
         )
+        in_flight = _in_flight_status(registry, candidate_base_probe=probe)
         return {
             "ready": list(ready_provider()),
-            "in_flight": _in_flight_status(registry, candidate_base_probe=probe),
+            "in_flight": in_flight,
+            "attention": _stale_job_attention(in_flight),
             "recent_done": list(recent_done_provider()),
         }
 
@@ -614,12 +653,14 @@ def build_runtime_status_provider(
                         registry, run, candidate_base_probe=candidate_base_probe
                     )
                 )
+        in_flight = _in_flight_status(
+            registry, candidate_base_probe=candidate_base_probe
+        )
+        attention.extend(_stale_job_attention(in_flight))
         return {
             "ready": ready,
             "held": held,
-            "in_flight": _in_flight_status(
-                registry, candidate_base_probe=candidate_base_probe
-            ),
+            "in_flight": in_flight,
             "recent_done": recent_done_provider(),
             "slices": slices,
             "attention": attention,
@@ -660,6 +701,27 @@ def build_request_executor(
     stage_evidence_validator: Callable[[dict[str, str]], bool] | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    def decomposition_intake_for(repo: str, registry):
+        def intake(child_work_id: str):
+            args = {
+                "action": "intake",
+                "repo": repo,
+                "work_id": child_work_id,
+            }
+            if work_action_fn is not None:
+                return work_action_fn(args=args, requested_by="manager-daemon")
+            return manager.apply_work_action(
+                args=args,
+                requested_by="manager-daemon",
+                registry=registry,
+                runtime_factory=(
+                    workflow_runtime_factory
+                    or planning_runtime.build_production_planning_runtime
+                ),
+            )
+
+        return intake
+
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
         request_specs_dir = args.get("specs_dir") or specs_dir
@@ -762,6 +824,9 @@ def build_request_executor(
                     ship_validator=active_ship_validator,
                     operator_resume=True,
                     builder_todo_admission_loader=_builder_todo_admission_for_run,
+                    decomposition_intake=decomposition_intake_for(
+                        resume_run.repo, registry
+                    ),
                 )
             result = manager.apply_workflow_action(
                 registry,
@@ -837,14 +902,14 @@ def build_request_executor(
                     args=dict(args),
                     requested_by=request["requested_by"],
                 )
-            # #545／#569：`retry-card` 與 `retry-build` 共用同一條「強制重派當前
-            # 卡」的 dispatch 路徑（含失敗時把 needs_human 補回去的補償），差別
-            # 只在 work action 層允許的卡片位置與 reset 語意。#569 之後
-            # `retry-card` 也涵蓋 verify／review 的 reviewer 卡，因此這個旗標
-            # 不再只針對 builder。
-            forced_card_retry = args.get("action") in {"retry-build", "retry-card"}
+            # #545／#569／#883：retry-card、retry-build、retry-verify 共用同一條
+            # 「強制重派當前卡」路徑及失敗補償。retry-verify 先做 phase reset，
+            # 再由此處派新 verification job；精準可復原的舊 reviewer job 保留原狀。
+            forced_card_retry = args.get("action") in {
+                "retry-build", "retry-card", "retry-verify",
+            }
             if args.get("action") in {
-                "start", "resume", "retry-build", "retry-card", "intake",
+                "start", "resume", "retry-build", "retry-card", "retry-verify", "intake",
             }:
                 registry = getattr(dispatcher, "_registry", None)
                 run_payload = result.get("result", {}).get("run") if isinstance(result, dict) else None
@@ -893,6 +958,9 @@ def build_request_executor(
                             ship_validator=active_ship_validator,
                             operator_resume=True,
                             builder_todo_admission_loader=_builder_todo_admission_for_run,
+                            decomposition_intake=decomposition_intake_for(
+                                run.repo, registry
+                            ),
                         )
                         result["result"].update(resumed)
                         result["result"]["run"] = registry.get_workflow_run(
@@ -1567,6 +1635,7 @@ def run_loop(
     last_tick_at: str | None = None
     daemon_idle = True
     last_tick_monotonic = monotonic_fn()
+    idle_poll_interval = min(max(poll_interval, 0.0), MAX_IDLE_POLL_INTERVAL)
     rounds = 0
     consecutive_tick_failures = 0
     tick_circuit_open = False
@@ -1576,7 +1645,9 @@ def run_loop(
     try:
         while max_rounds is None or rounds < max_rounds:
             tick_ran_this_round = False
+            periodic_tick_attempted = False
             request_drain_interrupted = False
+            snapshot: dict[str, Any] = {}
             request_paths = sorted(constants.requests_dir().glob("*.json"), key=_request_sort_key)
             for request_path in request_paths:
                 if not request_path.exists():
@@ -1593,11 +1664,33 @@ def run_loop(
                     continue
 
                 started_at = now_fn()
+                activity_written = False
                 try:
                     try:
                         request = _load_request(request_path)
                     except FileNotFoundError:
                         continue
+                    args = request.get("args")
+                    if (
+                        request.get("type") == "work-action"
+                        and isinstance(args, dict)
+                        and args.get("action") == "ship"
+                    ):
+                        activity = {
+                            "pid": runtime_pid,
+                            "request_id": request_id,
+                            "request_type": request.get("type"),
+                            "requested_by": request.get("requested_by"),
+                        }
+                        for key in ("action", "repo", "work_id", "pr_number"):
+                            value = args.get(key)
+                            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                                activity[key] = value
+                        try:
+                            contract.atomic_write_json(constants.activity_path(), activity)
+                            activity_written = True
+                        except Exception as exc:  # noqa: BLE001 - 活動狀態寫入失敗仍繼續執行 request
+                            _log_error(exc)
                     summary = executor(request)
                     done_payload = contract.build_done(
                         req_id=request["req_id"],
@@ -1626,6 +1719,12 @@ def run_loop(
                         started_at=started_at,
                     )
                     _log_error(exc)
+                finally:
+                    if activity_written:
+                        try:
+                            constants.activity_path().unlink(missing_ok=True)
+                        except Exception as exc:  # noqa: BLE001 - 活動狀態清理失敗不改變 request 結果
+                            _log_error(exc)
                 try:
                     _persist_done(done_payload)
                     request_path.unlink(missing_ok=True)
@@ -1644,6 +1743,7 @@ def run_loop(
                 and not tick_ran_this_round
                 and monotonic_fn() - last_tick_monotonic >= effective_tick_interval
             ):
+                periodic_tick_attempted = True
                 try:
                     summary = periodic_runner()
                     skipped = isinstance(summary, dict) and summary.get("dispatch_skipped") == "not-idle"
@@ -1699,7 +1799,27 @@ def run_loop(
             if max_rounds is not None and rounds >= max_rounds:
                 break
             if poll_interval > 0:
-                sleep_fn(poll_interval)
+                active_round = (
+                    bool(request_paths)
+                    or bool(snapshot.get("in_flight", []))
+                    or periodic_tick_attempted
+                )
+                if active_round:
+                    sleep_interval = poll_interval
+                    idle_poll_interval = min(poll_interval, MAX_IDLE_POLL_INTERVAL)
+                else:
+                    sleep_interval = idle_poll_interval
+                    idle_poll_interval = min(
+                        MAX_IDLE_POLL_INTERVAL,
+                        max(poll_interval, idle_poll_interval * 2),
+                    )
+                    remaining_tick_seconds = max(
+                        0.0,
+                        effective_tick_interval - (monotonic_fn() - last_tick_monotonic),
+                    )
+                    if remaining_tick_seconds > 0:
+                        sleep_interval = min(sleep_interval, remaining_tick_seconds)
+                sleep_fn(sleep_interval)
     finally:
         held_lock.release()
 

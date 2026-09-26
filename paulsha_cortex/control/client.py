@@ -65,6 +65,14 @@ def read_status() -> dict[str, Any]:
     if daemon_pid_present and not daemon_alive:
         return _degraded_status("dead", payload)
     if daemon_alive:
+        activity = _read_manager_activity(payload)
+        if activity is not None:
+            if (
+                activity["progress_age_seconds"]
+                <= constants.STATUS_ACTIVITY_STALE_AFTER_SECONDS
+            ):
+                return _ok_status(payload, updated_at, activity=activity)
+            return _degraded_status("stalled", payload, activity=activity)
         # The daemon process is up (possibly busy on a long request). A busy
         # daemon is NOT degraded even if the status is older than the freshness
         # window; only flag it once it has stalled far beyond any real request.
@@ -77,8 +85,10 @@ def read_status() -> dict[str, Any]:
     return _ok_status(payload, updated_at)
 
 
-def _ok_status(payload: dict[str, Any], updated_at: object) -> dict[str, Any]:
-    return {
+def _ok_status(
+    payload: dict[str, Any], updated_at: object, *, activity: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    status = {
         "schema_version": payload.get("schema_version", constants.SCHEMA_VERSION),
         "updated_at": updated_at,
         "daemon": payload.get("daemon"),
@@ -95,6 +105,41 @@ def _ok_status(payload: dict[str, Any], updated_at: object) -> dict[str, Any]:
         "degraded": False,
         "degraded_reason": None,
     }
+    if activity is not None:
+        status["busy"] = True
+        status["activity"] = activity
+    return status
+
+
+def _read_manager_activity(payload: dict[str, Any]) -> dict[str, Any] | None:
+    recorded = contract.read_json(constants.activity_path())
+    daemon = payload.get("daemon")
+    if not isinstance(recorded, dict) or not isinstance(daemon, dict):
+        return None
+    if recorded.get("pid") != daemon.get("pid"):
+        return None
+    try:
+        mtime = constants.activity_path().stat().st_mtime
+    except OSError:
+        return None
+    age = max(0.0, time.time() - mtime)
+    activity = {
+        "last_progress_at": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+        "progress_age_seconds": age,
+    }
+    for key in (
+        "request_id",
+        "request_type",
+        "requested_by",
+        "action",
+        "repo",
+        "work_id",
+        "pr_number",
+    ):
+        value = recorded.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            activity[key] = value
+    return activity
 
 
 def _daemon_pid_present(payload: dict[str, Any]) -> bool:
@@ -129,8 +174,13 @@ def poll_done(req_id: str, timeout: float, poll_interval: float = 0.5) -> dict[s
             time.sleep(poll_interval)
 
 
-def _degraded_status(reason: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {
+def _degraded_status(
+    reason: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    activity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    status = {
         "schema_version": constants.SCHEMA_VERSION,
         "updated_at": None,
         "daemon": None,
@@ -146,6 +196,9 @@ def _degraded_status(reason: str, payload: dict[str, Any] | None = None) -> dict
         "degraded": True,
         "degraded_reason": reason,
     }
+    if activity is not None:
+        status["activity"] = activity
+    return status
 
 
 def _status_age_seconds(updated_at: object) -> float | None:

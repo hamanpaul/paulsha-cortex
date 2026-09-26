@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -63,8 +64,9 @@ def _contract(
     checks: list[dict] | None = None,
     tests: list[dict] | None = None,
     full_suite: dict | None = None,
+    write_paths: list[str] | None = None,
 ) -> dict:
-    return {
+    contract = {
         "docs_class": docs_class,
         "review_policy": "required" if docs_class in {"code", "normative"} else "not-required",
         "required_artifacts": list(required_artifacts or []),
@@ -90,6 +92,9 @@ def _contract(
             "baseline": "no-regression",
         },
     }
+    if write_paths is not None:
+        contract["write_paths"] = list(write_paths)
+    return contract
 
 
 def _write_spec_and_plan(root: Path, slice_id: str, contract: dict) -> tuple[Path, Path]:
@@ -107,11 +112,22 @@ def _write_spec_and_plan(root: Path, slice_id: str, contract: dict) -> tuple[Pat
             "target_branch: main\n"
             "verification:\n"
             f"  docs_class: {contract['docs_class']}\n"
-            "  required_artifacts:\n"
+            + (
+                "  write_paths:\n"
+                + "".join(f"    - {json.dumps(path, ensure_ascii=False)}\n" for path in contract["write_paths"])
+                if "write_paths" in contract
+                else ""
+            )
+            + "  required_artifacts:\n"
             + (
                 "".join(
                     f"    - path: {artifact['path']}\n"
                     f"      must_change: {'true' if artifact['must_change'] else 'false'}\n"
+                    + (
+                        f'      mode: "{artifact["mode"]}"\n'
+                        if "mode" in artifact
+                        else ""
+                    )
                     for artifact in contract["required_artifacts"]
                 )
                 or "    []\n"
@@ -258,6 +274,53 @@ class FakeSubprocessRunner:
 
 
 class ResultVerificationTests(unittest.TestCase):
+    def test_persona_scope_intersects_bounded_slice_write_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            base_catalog = _persona_catalog(builder_paths=["**"])
+            contract = _contract(write_paths=["src/a.py"])
+            slice_row = _slice_row(root, "slice-a", contract, dispatch_base="a" * 40, worktree=worktree)
+            job = _job("slice-a", worktree)
+            git_runner = FakeGitRunner(
+                {
+                    ("-C", str(root), "rev-parse", job["branch"]): _git_ok("b" * 40),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): [_git_ok("b" * 40), _git_ok("b" * 40)],
+                    ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): [_git_ok(""), _git_ok("")],
+                    ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
+                    ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok("src/a.py\ndocs/extra.md\n"),
+                }
+            )
+
+            evidence = verification.run_result_verification(
+                slice_row=slice_row,
+                job=job,
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                git_runner=git_runner,
+                subprocess_runner=FakeSubprocessRunner({}),
+            )
+
+            self.assertEqual(evidence["payload"]["status"], "needs_human")
+            self.assertEqual(evidence["payload"]["summary"], "persona-scope-violation")
+            scope = evidence["payload"]["details"]["scope"]
+            self.assertEqual(scope["status"], "violated")
+            self.assertEqual(scope["changed_paths"], ["src/a.py", "docs/extra.md"])
+            self.assertEqual(
+                scope["violations"],
+                [
+                    {
+                        "path": "docs/extra.md",
+                        "rule_id": "slice-scope",
+                        "reason": "path docs/extra.md outside slice write scope",
+                    }
+                ],
+            )
+
     def test_fails_when_required_artifact_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -292,6 +355,110 @@ class ResultVerificationTests(unittest.TestCase):
             self.assertEqual(evidence["payload"]["status"], "needs_human")
             self.assertEqual(evidence["payload"]["summary"], "required-artifact-missing")
             self.assertEqual(proc_runner.calls, [])
+
+    def test_fails_when_required_artifact_git_mode_is_not_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            script = worktree / "script" / "deliver.py"
+            script.parent.mkdir()
+            script.write_text("print('ready')\n", encoding="utf-8")
+            contract = _contract(
+                docs_class="informational",
+                required_artifacts=[
+                    {"path": "script/deliver.py", "must_change": False, "mode": "100755"}
+                ],
+            )
+            slice_row = _slice_row(root, "slice-mode", contract, dispatch_base="a" * 40, worktree=worktree)
+            job = _job("slice-mode", worktree)
+            git_runner = FakeGitRunner(
+                {
+                    ("-C", str(root), "rev-parse", job["branch"]): _git_ok("b" * 40),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
+                    ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): _git_ok(""),
+                    ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
+                    (
+                        "--literal-pathspecs", "-C", str(root), "ls-tree", "-z",
+                        "b" * 40, "--", "script/deliver.py",
+                    ): _git_ok("100644 blob " + "c" * 40 + "\tscript/deliver.py\0"),
+                }
+            )
+
+            evidence = verification.run_result_verification(
+                slice_row=slice_row,
+                job=job,
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                git_runner=git_runner,
+                subprocess_runner=FakeSubprocessRunner({}),
+            )
+
+            self.assertEqual(evidence["payload"]["status"], "needs_human")
+            self.assertEqual(evidence["payload"]["summary"], "required-artifact-mode-mismatch")
+            artifact = evidence["payload"]["details"]["required_artifacts"][0]
+            self.assertEqual(artifact["expected_mode"], "100755")
+            self.assertEqual(artifact["git_mode"], "100644")
+            self.assertEqual(artifact["status"], "mode-mismatch")
+
+    def test_required_artifact_git_mode_100755_passes_when_candidate_tree_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            script = worktree / "script" / "deliver.py"
+            script.parent.mkdir()
+            script.write_text("print('ready')\n", encoding="utf-8")
+            script.chmod(0o755)
+            contract = _contract(
+                docs_class="informational",
+                required_artifacts=[
+                    {"path": "script/deliver.py", "must_change": False, "mode": "100755"}
+                ],
+            )
+            slice_row = _slice_row(root, "slice-mode", contract, dispatch_base="a" * 40, worktree=worktree)
+            job = _job("slice-mode", worktree)
+            base_worktree = verification._temp_base_worktree_path(
+                repo_root=root, slice_id="slice-mode", dispatch_base="a" * 40,
+            )
+            git_runner = FakeGitRunner(
+                {
+                    ("-C", str(root), "rev-parse", job["branch"]): _git_ok("b" * 40),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
+                    ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
+                    ("--literal-pathspecs", "-C", str(root), "ls-tree", "-z", "b" * 40, "--", "script/deliver.py"):
+                        _git_ok("100755 blob " + "c" * 40 + "\tscript/deliver.py\0"),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40):
+                        _git_ok("script/deliver.py\n"),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"):
+                        _git_fail("persona catalog uses packaged default"),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40):
+                        _git_ok("script/deliver.py\n"),
+                    ("-C", str(root), "worktree", "add", "--detach", str(base_worktree), "a" * 40): _git_ok(""),
+                    ("-C", str(root), "worktree", "remove", "--force", str(base_worktree)): _git_ok(""),
+                }
+            )
+            proc_runner = FakeSubprocessRunner(
+                {
+                    ("python3", "-m", "pytest", "-q", "tests/policy.py"): _proc_ok(),
+                    ("python3", "-m", "pytest", "-q"): [_proc_ok(), _proc_ok()],
+                }
+            )
+
+            evidence = verification.run_result_verification(
+                slice_row=slice_row,
+                job=job,
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                git_runner=git_runner,
+                subprocess_runner=proc_runner,
+            )
+
+            self.assertEqual(evidence["payload"]["status"], "verified")
+            artifact = evidence["payload"]["details"]["required_artifacts"][0]
+            self.assertEqual(artifact["expected_mode"], "100755")
+            self.assertEqual(artifact["git_mode"], "100755")
+            self.assertEqual(artifact["status"], "passed")
 
     def test_fails_when_must_change_artifact_is_absent_from_diff(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -725,6 +892,10 @@ class ResultVerificationTests(unittest.TestCase):
                     )
 
                     self.assertEqual(evidence["payload"]["status"], expected)
+                    self.assertEqual(
+                        evidence["payload"]["details"]["scope"]["status"],
+                        "persona-only",
+                    )
 
     def test_dirty_candidate_worktree_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as d:

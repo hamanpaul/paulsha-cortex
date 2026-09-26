@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **#502 verify／review 通過後的阻斷修復入口**：exact-candidate `retry-build` 現可接受尚未進入 `needs_human` 的後續阻斷裁決；必須提供 `--reason`，以既有 immutable operator-adjudication evidence 記錄後重跑 verify／review，已完成 run 仍拒絕重開。
+
 - **#862 recovery registry receipt contract**：`JobRegistry` 現在依 OpenSpec 實作
   recovery registry 的 versioned request/receipt/checkpoint 契約：fresh /
   checkpointed slice 會持久化 `binding_version`／`binding_revision`，
@@ -628,6 +632,21 @@
 
 ### Fixed
 
+- **#617 slice-review category 語意**：prompt 明列阻擋交付與可交付 follow-up 的 category，要求 review 結論與 blocking findings 一致，並說明 severity 只表示影響程度。
+- **#1006 post-archive Builder 綁定 exact Candidate**：resume 與 dispatch 僅重用以目前 Candidate 派出的 build job；新 job 的 `dispatch_head` 記錄實際採用的 clone base，並同步 lifecycle 文件。
+- **#489 slice write_paths 範圍驗證**：verification contract 可固定有限的 repo 相對檔案清單；候選變更須同時符合 builder persona 與 slice 限制，未宣告 slice 路徑的舊 contract 則明示為 `persona-only`。
+- **#578 verify／review malformed terminal 有界自動重派**：periodic resume 現在會將無法解析或不符合 phase 外層 schema 的 verify／review terminal 送入既有 per-card schema retry 額度；達上限後停在 `needs_human`，合法明示停止與有效 envelope 的 gate／authority 採信錯誤不重派，operator 的 `retry-card` 熔斷維持 #555 規則。
+- **#883 retry-card override／retry-verify 重派**：reviewer identity override 在 registry reset 前依既有 capability／independence 判準驗證，拒絕時不寫入 run；retry-verify 於同一個 work-action request 派出新的 verification job，並保留 #577 精準復原舊 job 的 `exited` 狀態。
+
+- **#551、#562 planning worktree drift**：snapshot 不再因 uid/gid／xattr 差異誤判，baseline 複製前後比對並至多重試一次；持續變動仍 fail-closed。drift 另以結構化 `failure_kind` 傳至 Manager 與 `recover-planning`，不再依賴 reason 字串分類。
+- **#585、#567 Monitor spool 與 tree 讀取**：每輪只掃一次共享 spool，producer 拒絕 repo 形狀錯誤的事件，quarantine 自隔離起保留 30 天；Monitor 改由 canonical checkout 的本機 `git ls-tree -r -t -z` 讀 default-branch tree，shallow ancestry 無法判定時明確診斷且不自動 unshallow。
+- **#1086 review→ship outcome 順序**：一般 review→ship closure 先 durable 寫入唯一、綁定 CompletionRecord／Candidate／merge 的 shipped outcome，確認讀回後才由 Manager 將 WorkflowRun 標成 done；相同交付重入沿用原 row，append／讀回失敗或綁定衝突時不完成終態轉換。
+- **#1068、#1069、#1070、#1055 既有 Candidate／PR authority 恢復**：registry 以 exact WorkflowRun snapshot 重設 verify/review；已有 Candidate 與 open PR 僅能由明確 `resume` 恢復，並以同 run delivery journal read-back 驗證重入不重複寫入。
+- **#480、#494、#495 builder 工具契約**：Claude job 依 persona 投影窄工具授權並於派工前拒絕無法表達的工具；提供限單檔的 executable mode 與復原操作、Candidate Git mode 驗收，以及 Edit 超限前置拒絕。
+- **#546 recovery action 投影對齊 admission**：claim、Monitor work list/show 與 status attention 共用實際可受理的 recovery actions；owner-bound slice 條件成立時會列出 `recover-pre-candidate`。
+- **#833 Red 拆分接續**：Red run 只派出一個可重用的拆分 planner；計畫通過既有 plan review gate 後，child 由標準 work-action intake 受理，未受理時 parent 停在 `needs_human`。
+- **#897、#937、#953 規劃與交付收尾：** quota 失敗改派下一個合格 Builder identity；`retire-delivered` 清除已不存在且仍由本 run 與 mapped Todo 共同確認的 path link；外部 scope 診斷提供明示 `--combo` 出口，OpenSpec publication 接受 mapped anchor slug；reviewer 依裁決適用範圍及目前 gate evidence 驗收。#937(4) 依 owner 裁決保留現有 reclaim 熔斷。
+- **#488、#1028、#781 狀態活動可觀測性**：以 job log／Manager 活動檔最後寫入時間呈現 30 分鐘過期／忙碌狀態；Manager 閒置輪詢有限遞增並以 10 秒為上限，活動期間仍維持原輪詢間隔。
 - **#492 foreign review tier 前置檢查**：required review 的 builder slice 會在建立工作區與啟動 builder 前驗證 project policy tier；缺少或非法值會指出選定 manifest 路徑及允許值，無 manifest 時維持 `shareable` 預設。
 - **#571、#579 reviewer 路徑綁定**：review gate evaluation 檔名納入 candidate 短 SHA；reviewer sandbox 目錄名納入 job id，並於新 reviewer 派工前回收前代 claim era 已終止的孤兒 sandbox，回收失敗時記錄 warning 並繼續派工。
 - **#810 merge 後 Todo 勾選狀態僅供診斷**：已合併 WorkflowRun 的遠端結案與 Monitor 不再因 workstream Todo 未勾而阻擋有效交付；Todo 證據仍須存在且可讀，archived OpenSpec tasks 的完成要求維持不變。
@@ -635,7 +654,7 @@
 - **#600 overlay Copilot 模型可用性**：dispatch 建立 Job 前以限時短 prompt 探測 overlay 選出的模型；明確不可用時 reroute，CLI 無法判定時記錄診斷並照常派工。
 - **#556 worktree-isolation 不再提早綁定 Candidate**：`commit_policy=forbidden` 的 isolation 卡通過採信後維持 null candidate；第一張允許 commit 的 builder 卡採信後才綁定 exact HEAD，保留 `recover-pre-candidate` 的前置條件。
 - **#573 degraded 理由 invariant**：Monitor provider、runtime preflight 與 doctor 的 degraded／非 pass 輸出現在附帶既有 `DiagnosticReason` 的 reason、detail、source；新增 AST 掃描 invariant 與各路徑回歸測試，原有狀態判定不變。
-- **#897(1)／#937(1) 部分修正：**候選 harvest 會在更新來源 branch 前檢查所有 pinned planning 檔案；僅容忍 plan 類 `tasks.md`／`todo.md` 的 checkbox-only 差異，其他 bytes 差異拒收並指出檔案與雜湊前綴，缺檔則指出路徑。#897 其餘子項及 #937 其餘子項留待後續批次。
+- **#897(1)／#937(1) 部分修正：**候選 harvest 會在更新來源 branch 前檢查所有 pinned planning 檔案；僅容忍 plan 類 `tasks.md`／`todo.md` 的 checkbox-only 差異，其他 bytes 差異拒收並指出檔案與雜湊前綴，缺檔則指出路徑。#897 剩餘子項及 #937 的 6.1／6.4 已於下列批次收尾；#937(4)依 owner 裁決保留既有熔斷。
 - **#821 registry 持久化衛生**：相同 durable bytes 不再重寫；rollback 優先以硬連結保留舊狀態，不支援時退回複製；slice 的三種 history 預設限 500 筆，可由環境變數調整並累計截斷數；啟動時在 grace 與既有 transaction lock 保護下清理本目錄 stale tmp。
 - **#882 verify operator attestation**：新增 exact Candidate 綁定的 `verify-attest` work action，要求 operator 附 full-suite 指令與 passed/failed 摘要（failed 必須為 0），將 immutable evidence 寫入 registry 後推進 review；`review-attest` 維持 review-only。
 - **#481／#497 terminal job 重播**：`complete_tick` 只終局化仍綁定 slice 的 builder／reviewer；同 job manifest 已反映到 slice 時不再重驗，recovery 後的舊 job 保留稽核而不再寫 evidence 或回退 slice。state mutation 未落地時仍允許同 job 修復重試。

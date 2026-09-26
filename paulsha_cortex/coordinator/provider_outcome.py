@@ -91,14 +91,18 @@ class SignalAuthority(str, Enum):
 
 # 這些類別有足夠訊號支援 bounded retry：rate limit 會隨時間窗重置、transient
 # 是網路/服務暫時性錯誤，tool_aborted 則是工具鏈被外部生命週期中斷。auth／
-# content／quota／unknown 盲目重試不會改善結果（auth 需要人工重新登入；content
-# 是模型對這個 prompt 的決定，重跑同一個 candidate 不會變；quota 通常是固定週期
-# 額度，短時間內重試沒有意義；unknown 沒有訊號可支持任何自動決策）。
+# content／quota／unknown 不應重試原 identity（auth 需要人工重新登入；content
+# 是模型對這個 prompt 的決定；quota 換到 roster 中下一個 identity 才可能繼續；
+# unknown 沒有訊號可支持任何自動決策）。
 RETRYABLE_OUTCOMES = frozenset(
     {ProviderOutcome.RATE_LIMITED, ProviderOutcome.TRANSIENT, ProviderOutcome.TOOL_ABORTED}
 )
 _REROUTABLE_OUTCOMES = frozenset(
-    {ProviderOutcome.EFFORT_NOT_SUPPORTED, ProviderOutcome.EXECUTABLE_NOT_FOUND}
+    {
+        ProviderOutcome.EFFORT_NOT_SUPPORTED,
+        ProviderOutcome.EXECUTABLE_NOT_FOUND,
+        ProviderOutcome.QUOTA,
+    }
 )
 _KNOWN_PROVIDER_EXECUTABLE_TOKENS = frozenset({"agy", "cg", "claude", "codex", "copilot"})
 _SHARED_LAUNCH_INFRASTRUCTURE_TOKENS = frozenset(

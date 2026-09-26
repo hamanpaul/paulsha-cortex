@@ -11,8 +11,8 @@ work_item: closure-todo-advisory
 
 1. **R1 remote closure 不以 Todo checkbox 狀態阻擋**：`github_delivery.evaluate_remote_closure` 不再因 `facts.todo_complete is False` 產生 `todo-incomplete`。其餘 reason（`remote-default-unverified`、`merge-ancestry-unverified`、`merged-pr-head-unverified`、`merge-commit-required`、`issue-not-closed`、`active-openspec-present`、`openspec-archive-missing`、`completion-record-invalid`）的判式、產生順序與 `_unique_reasons` 去重完全不變。`RemoteClosureFacts` 欄位不增不減（`todo_complete`、`todo_revisions` 保留）。`GitHubDeliveryClient.fetch_remote_closure` 不改：`todo_paths` 為空仍 `ValueError`、Todo 路徑不安全仍 `ValueError`；default head 上 Todo payload 非 file／非 base64／sha 非 40-hex／內容非 UTF-8 仍 `RuntimeError`（Todo 必須存在於 default head 的 fail-closed 保留）；`todo_complete` 仍依現行 regex 計算，作為觀測事實回傳。
 2. **R2 已 merge run 自行收斂為 done**：journal `ship.phase == "merged"` 且其餘 remote facts 成立（雙親 merge commit 為 default head 祖先、PR head 等於授權 HEAD、mapped issues 全 closed、有 mapped OpenSpec 時 archive 成立且 active change 消失、CompletionRecord 語意一致）時，即使 default branch 上 mapped Todo 仍有 `- [ ]`，`ShipOrchestrator.verify_remote_closure` 必須寫出並回讀 CompletionRecord 成功，`work_actions._ship_action` 的 merged 分支把 journal ship 推到 `phase: "done"` 並回傳 `action == "done"`，不再擲 `remote closure blocked: todo-incomplete`。WorkflowRun 的 terminal transition 沿用現行兩條路徑、本票不改：
-   - daemon 路徑：`manager.apply_workflow_action` 的 review→ship `advance` 在 run 仍為 `current_phase == "review"` 時呼叫 ship validator，拿到 trusted completion 後由 manager 寫 `current_phase="ship"`、`status="done"`、`merge_revision`、`completion_record_path`／`completion_record_hash`。
-   - `canonical_run.current_phase == "ship"` 時（operator 直接 `cortex work ship`）：由 `_ship_action` 自己 emit `shipped` outcome 並寫同一組欄位。
+   - daemon 路徑：`manager.apply_workflow_action` 的 review→ship `advance` 在 run 仍為 `current_phase == "review"` 時呼叫 ship validator；remote closure 成功後先 durable 寫入並讀回唯一 shipped outcome，再回傳 trusted completion，由 manager 寫 `current_phase="ship"`、`status="done"`、`merge_revision`、`completion_record_path`／`completion_record_hash`。
+   - `canonical_run.current_phase == "ship"` 時（operator 直接 `cortex work ship`）：由 `_ship_action` 先 emit `shipped` outcome，再寫同一組欄位。
 
    cached `done` 重播路徑同樣不因 Todo 未勾失敗。
 3. **R3 advisory 可觀測、不影響 gate**：`_ship_action` merged 分支取得 `closure` 後，以 `getattr(closure.facts, "todo_complete", None)` 取值。值為 `False` 時 `logger.warning` 一行，含 `run_id`、`work_id`、`todo_paths`、`merge_commit`。值為 `True` 或非 bool（舊 fake、缺屬性）時不記 warning，也不擲例外。cached `done` 重播分支不加 warning。此值不進 CompletionRecord、`delivery_binding`、`merge_authorization`、engineering outcome（`emit_outcome` 的 `verification` 維持只有 `todo_paths`），也不改 `_ship_action` 的回傳 dict。
@@ -50,7 +50,7 @@ Production 只改四個模組：
 - 不做 Manager 在 local-closeout 自動翻勾 Todo：需要新 commit，進而觸發 reverification、registry reset、spool harvest，屬 cross-object durable 狀態；可與 #808 的「ship 自勾」合併另票。
 - 不新增 merge 前的 checkbox blocking gate。
 - 不改 archive gate 對 OpenSpec tasks 全勾的要求（#808）；Monitor 對 archived OpenSpec tasks 的全勾要求同樣保留。
-- 不在 engineering outcome 加 `todo_complete`：`_ship_action` 只在 `canonical_run.current_phase == "ship"` 時 emit `shipped` outcome，而 daemon 的 review→ship `advance` 呼叫 ship validator 時 run 仍在 `review`，這個欄位在主要 production 路徑不會出現；加上去還會改 durable outcome 形狀。advisory 以 warning 與 default branch 上的 Todo 內容本身觀測。
+- 不在 engineering outcome 加 `todo_complete`：Todo advisory 只透過 warning 與 default branch 內容觀測，不改 outcome durable 形狀；#1086 只補 review→ship 的 outcome 寫入順序與重入，不擴充 schema。
 - 不改 Monitor 的 superpowers source 恆為 `active`、無 CompletionRecord 的已交付 work item 投影（#895，該票非目標明列 #810）。本票的 R6 只處理「有 validated CompletionRecord」的 closure 計算。
 - 不改 `claim._resume_decision` 宣告 `abandon` 的行為。
 - 不改 `abandon`／`retire-delivered` 的受理條件。

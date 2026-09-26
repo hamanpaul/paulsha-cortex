@@ -17,8 +17,9 @@ issue 草案假設六種 outcome：`shipped`／`verified`／`rejected`／`failed
 `OUTCOME_STATUSES` 因此保留全部六種（`verified` 併入既有的 `passed`/`shipped`
 語意不重複定義，故 schema 仍以 issue 原文的五種扣除 `verified` 為準：
 `shipped`／`abandoned`／`rejected`／`failed`／`rolled_back`）作為 schema 合法值
-全集，但 v1 只在 `_ship_action`（`status="done"`）與 `_abandon_action`
-（`status="superseded"`）兩個既有終局轉換點呼叫 `emit_outcome`。
+全集。v1 的 `shipped` 由 `_ship_action` 產生：直接 ship 由它在終態寫入前 emit；一般
+review→ship 則由它在回傳 trusted completion 前 emit，之後 Manager 才把 run 標成
+`done`。`abandoned` 仍由 `_abandon_action` 在 `superseded` 前呼叫 `emit_outcome`。
 
 理由：`rejected`／`failed`（run 級）／`rolled_back` 目前靠 `needs_human` facet
 卡住、由人工決定下一步，不是一個「run 已終結且不可逆」的自動轉換；為了湊滿六種
@@ -41,9 +42,9 @@ lifecycle 狀態機的核心不變量，範圍失控且缺乏獨立驗收。sche
 
 理由：避免另外維護一份 idempotency 索引或 nonce——「這次轉換的內容本身就是它的
 身分」，兩次呼叫如果內容真的相同（同一次轉換），digest 就相同，`outcome_id` 就
-相同，`OutcomeStore.append` 據此去重。如果內容不同（例如換了一次不同的 merge
-commit），digest 不同，會被視為新的一筆 outcome——這是刻意的：不同次轉換不應該
-互相覆蓋或吞掉彼此。
+相同，`OutcomeStore.append` 據此去重。shipped caller 另確保同一 repo/work/run 只有
+一筆 shipped row：完全相同的交付重入沿用原 row；若 Candidate、merge、CompletionRecord
+或 attempt digest 衝突則 fail closed，不把同一 run 變成第二筆 shipped outcome。
 
 ### D3 append-only、一 repo 一檔的 JSONL outbox
 
@@ -92,14 +93,15 @@ session id 需要改 `dispatcher.py` 在派工當下把 session id 寫回 job re
 card 產出的」分析）不需要再反查一次 registry。同時採納 Hippo 在 issue comment 提
 出的第二點修正意見。
 
-### D6 終局轉換順序：先 emit_outcome，再改 WorkflowRun.status
+### D6 終局轉換順序：先 durable outcome，再改 WorkflowRun.status
 
-`_ship_action`／`_abandon_action` 在呼叫 `_manager_update_workflow_run`／
-`_manager_abandon_workflow_run` **之前**呼叫 `emit_outcome`。若
-`OutcomeStore.append` 拋例外（例如磁碟寫入失敗），terminal transition 不會執行，
-例外原樣往上傳播——不新增額外的補償或重試邏輯，維持既有的「未捕捉例外即代表這次
-呼叫沒有完成、下次 retry 會重新走一次」語意，且因為 D2 的 idempotency 設計，重試
-不會產生重複 record。
+直接 ship 的 `_ship_action` 與 `_abandon_action` 在呼叫各自的 registry terminal
+transition 前寫 outcome。一般 review→ship 則由 `_ship_action` 在回傳 trusted
+completion 前寫入 shipped row；Manager 只有在 validator 成功返回後才將 run 標成
+`done`。shipped 寫入後會讀回確認；寫入、讀回或交付綁定檢查失敗時例外往上傳播，
+terminal transition 不執行。若 outcome 已寫入但 Manager 終態寫入中斷，重入會重新驗證
+remote closure 並沿用同一筆 row。這是針對 shipped 路徑的冪等處理，不增加通用 receipt
+或 CAS 機制。
 
 理由：滿足 issue 的硬性要求「terminal transition 前先 durable 寫入」，讓
 「outcome 已記錄」永遠不會落後於「WorkflowRun 已終結」——反過來（run 已終結但

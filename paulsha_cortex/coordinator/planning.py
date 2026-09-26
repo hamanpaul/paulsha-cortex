@@ -1916,6 +1916,7 @@ class BrainstormResult:
     gate_refs: PlanningGateRefs
     integration: Mapping[str, object] | None = None
     model_input: Mapping[str, object] | None = None
+    failure_kind: str | None = None
 
 
 def _snapshot_model_input(stage: str, *args: object) -> dict[str, object]:
@@ -2058,6 +2059,7 @@ def run_heterogeneous_brainstorm(
             empty_refs,
             None,
             model_input=questioner_model_input,
+            failure_kind=getattr(exc, "failure_kind", None),
         )
     secondary_input = pack.to_dict()
     secondary_model_input = _snapshot_model_input("secondary", secondary_input)
@@ -2074,6 +2076,7 @@ def run_heterogeneous_brainstorm(
             empty_refs,
             None,
             model_input=secondary_model_input,
+            failure_kind=getattr(exc, "failure_kind", None),
         )
     secondary_payload = secondary.to_dict()
     evidence_hash = _hash_payload(secondary_payload)
@@ -2096,6 +2099,7 @@ def run_heterogeneous_brainstorm(
             empty_refs,
             None,
             model_input=integrator_model_input,
+            failure_kind=getattr(exc, "failure_kind", None),
         )
     rollback_publication: Callable[[], None] | None = None
     if artifact_writer is not None:
@@ -2123,6 +2127,7 @@ def run_heterogeneous_brainstorm(
                 empty_refs,
                 None,
                 model_input=integrator_model_input,
+                failure_kind=getattr(exc, "failure_kind", None),
             )
     artifact_evidence = _post_integration_artifact_evidence(
         integration,

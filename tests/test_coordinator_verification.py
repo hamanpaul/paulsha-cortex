@@ -13,6 +13,102 @@ def _write_spec(dirpath: Path, name: str, frontmatter: str, body: str = "body") 
 
 
 class VerificationContractFrontmatterTests(unittest.TestCase):
+    def test_parser_accepts_bounded_slice_write_paths(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "bounded-scope.md",
+                    "dispatch: auto\n"
+                    "slice_id: bounded-scope\n"
+                    "plan: docs/superpowers/plans/bounded-scope.md\n"
+                    "target_branch: main\n"
+                    "verification:\n"
+                    "  docs_class: code\n"
+                    "  write_paths: [src/a.py, docs/guide.md]\n"
+                    "  required_artifacts: []\n"
+                    "  checks:\n"
+                    "    - kind: persona-scope\n"
+                    "    - kind: command\n"
+                    "      name: policy\n"
+                    "      argv: [python3, -m, pytest, -q]\n"
+                    "      cwd: .\n"
+                    "      timeout_seconds: 30\n"
+                    "  tests: []\n"
+                    "  full_suite:\n"
+                    "    argv: [python3, -m, pytest, -q]\n"
+                    "    cwd: .\n"
+                    "    timeout_seconds: 30\n"
+                    "    baseline: no-regression",
+                )
+            )
+
+            self.assertEqual(meta["dispatch"], "auto")
+            self.assertIsNone(meta["parse_error"])
+            self.assertEqual(meta["verification"]["write_paths"], ["src/a.py", "docs/guide.md"])
+
+    def test_parser_rejects_unbounded_slice_write_paths(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "unbounded-scope.md",
+                    "dispatch: auto\n"
+                    "slice_id: unbounded-scope\n"
+                    "plan: docs/superpowers/plans/unbounded-scope.md\n"
+                    "target_branch: main\n"
+                    "verification:\n"
+                    "  docs_class: code\n"
+                    "  write_paths: [\"**\"]\n"
+                    "  required_artifacts: []\n"
+                    "  checks:\n"
+                    "    - kind: persona-scope\n"
+                    "    - kind: command\n"
+                    "      name: policy\n"
+                    "      argv: [python3, -m, pytest, -q]\n"
+                    "      cwd: .\n"
+                    "      timeout_seconds: 30\n"
+                    "  tests: []\n"
+                    "  full_suite:\n"
+                    "    argv: [python3, -m, pytest, -q]\n"
+                    "    cwd: .\n"
+                    "    timeout_seconds: 30\n"
+                    "    baseline: no-regression",
+                )
+            )
+
+            self.assertEqual(meta["dispatch"], "hold")
+            self.assertEqual(meta["parse_error"]["field"], "verification.write_paths[0]")
+            self.assertIn("bounded", meta["parse_error"]["message"])
+
+    def test_required_artifact_declares_expected_git_mode(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = verification.normalize_required_artifacts(
+                [{"path": "script/deliver.py", "must_change": True, "mode": "100755"}],
+                repo_root=Path(directory),
+            )
+
+        self.assertEqual(
+            artifacts,
+            [{"path": "script/deliver.py", "must_change": True, "mode": "100755"}],
+        )
+
+    def test_required_artifact_git_mode_rejects_unsupported_modes(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "mode must be 100644 or 100755"):
+                verification.normalize_required_artifacts(
+                    [{"path": "script/deliver.py", "mode": "120000"}],
+                    repo_root=Path(directory),
+                )
+
     def test_parser_rejects_non_string_target_branch_even_for_hold_specs(self) -> None:
         from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
 

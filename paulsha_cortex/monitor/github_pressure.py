@@ -9,13 +9,12 @@ Monitor 的 ``_github_refresh_loop``（``monitor/service.py``）每
 單輪的 ``gh`` 呼叫並不是 O(1)：
 
 - ``GitHubWorkProvider``：1 次 ``gh api --paginate``（issues；gh 內部再分頁）
-- ``GitHubTerminalProvider``：1 次 graphql（PR，可再分頁）＋ 1 次 git tree
-  ＋ **每個** remote todo／archived tasks.md 一次 ``contents`` ＋ **每個**
-  workflow-linked merged PR 一次 ``compare``
+- ``GitHubTerminalProvider``：1 次 graphql（PR，可再分頁）；本機另讀 default-branch
+  tree、remote todo／archived tasks.md blob 與 workflow-linked merged PR ancestry。
 
-  .. note:: #506 / D2 之後，上面那兩項「每個……一次」已改走本機 git
+  .. note:: #506 / D2 之後，上述 tree、Todo blob 與 ancestry 都改走本機 git
      （``monitor/git_mirror``），不再消耗 REST 配額；``GitHubTerminalProvider``
-     的 REST 只剩 graphql 分頁與 1 次 git tree。下面的問題描述與預算計算保留
+     的 REST 只剩 graphql 分頁。下面的問題描述與預算計算保留
      當時的實測基準，因為節流／退避機制本身沒有變。
 
   .. note:: #506 / D3 之後，``GitHubWorkProvider`` 改走
@@ -25,7 +24,8 @@ Monitor 的 ``_github_refresh_loop``（``monitor/service.py``）每
      ``--paginate``（gh 在行程內自己連發，閘門完全管不到）改成本地逐頁重建，
      因此**每一頁**都會經過 :meth:`GitHubPressureGate.throttle`。
 
-亦即 per-repo per-cycle 是 O(issues 分頁 + todo 檔數)。實際 workspace 約 40 個
+亦即 per-repo per-cycle 的 REST 請求是 O(issues 分頁 + PR GraphQL 分頁)，本機
+tree/Todo 處理則隨 tree entry 數增加。實際 workspace 約 40 個
 repo，一輪數百次請求在數秒內齊發，穩定觸發 GitHub secondary（abuse detection）
 rate limit——實測 ``github:`` 與 ``github-terminal:`` 兩個 provider 同時
 degraded 超過 35 分鐘，operator 的 ``cortex work`` 全被 ``coordinator/claim.py``

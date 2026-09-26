@@ -170,6 +170,7 @@ def test_select_combo_out_of_vocab_scope_fail_closed() -> None:
     message = str(exc.value)
     assert "claimx" in message
     assert "fix" in message
+    assert "--combo" in message
 
 
 def test_select_combo_absent_title_bypass_with_marker() -> None:

@@ -138,8 +138,8 @@ def normalize_required_artifacts(value: object, *, repo_root: Path) -> list[dict
         field = f"verification.required_artifacts[{index}]"
         if not isinstance(entry, dict):
             raise ContractValidationError(field, "artifact entry must be an object")
-        if set(entry) - {"path", "must_change"}:
-            extra = sorted(set(entry) - {"path", "must_change"})[0]
+        if set(entry) - {"path", "must_change", "mode"}:
+            extra = sorted(set(entry) - {"path", "must_change", "mode"})[0]
             raise ContractValidationError(f"{field}.{extra}", f"unknown artifact key: {extra}")
         must_change = entry.get("must_change", False)
         if not isinstance(must_change, bool):
@@ -147,17 +147,49 @@ def normalize_required_artifacts(value: object, *, repo_root: Path) -> list[dict
                 f"{field}.must_change",
                 "must_change must be a boolean",
             )
-        artifacts.append(
-            {
-                "path": normalize_repo_relative_path(
-                    entry.get("path"),
-                    repo_root=repo_root,
-                    field=f"{field}.path",
-                ),
-                "must_change": must_change,
-            }
-        )
+        artifact = {
+            "path": normalize_repo_relative_path(
+                entry.get("path"),
+                repo_root=repo_root,
+                field=f"{field}.path",
+            ),
+            "must_change": must_change,
+        }
+        if "mode" in entry:
+            mode = entry["mode"]
+            if not isinstance(mode, str) or mode not in {"100644", "100755"}:
+                raise ContractValidationError(
+                    f"{field}.mode",
+                    "mode must be 100644 or 100755",
+                )
+            artifact["mode"] = mode
+        artifacts.append(artifact)
     return artifacts
+
+
+def normalize_write_paths(value: object, *, repo_root: Path) -> list[str]:
+    """正規化 slice 的有限檔案路徑清單；不接受 glob 或 repo 外路徑。"""
+    if not isinstance(value, list) or not value:
+        raise ContractValidationError(
+            "verification.write_paths",
+            "write_paths must be a non-empty list of explicit repository-relative paths",
+        )
+    write_paths: list[str] = []
+    for index, entry in enumerate(value):
+        field = f"verification.write_paths[{index}]"
+        if not isinstance(entry, str) or not entry.strip():
+            raise ContractValidationError(field, "write path must be a non-empty string")
+        raw = entry.strip()
+        if any(marker in raw for marker in ("*", "?", "[")):
+            raise ContractValidationError(field, "write_paths must contain explicit bounded paths, not globs")
+        if any(part in {".", ".."} for part in raw.split("/")):
+            raise ContractValidationError(field, "write path must not contain '.' or '..' components")
+        if re.match(r"^[A-Za-z]:", raw):
+            raise ContractValidationError(field, f"write path must be repository-relative: {raw!r}")
+        write_paths.append(
+            normalize_repo_relative_path(raw, repo_root=repo_root, field=field)
+        )
+    return write_paths
 
 
 def normalize_command_like(
@@ -213,7 +245,15 @@ def validate_verification_contract(
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ContractValidationError("verification", "verification must be an object")
-    allowed = {"docs_class", "review_policy", "required_artifacts", "checks", "tests", "full_suite"}
+    allowed = {
+        "docs_class",
+        "review_policy",
+        "required_artifacts",
+        "checks",
+        "tests",
+        "full_suite",
+        "write_paths",
+    }
     extras = set(value) - allowed
     if extras:
         extra = sorted(extras)[0]
@@ -293,7 +333,7 @@ def validate_verification_contract(
                 "verification.checks",
                 "auto dispatch requires at least one named policy command check",
             )
-    return {
+    normalized = {
         "docs_class": docs_class,
         "review_policy": derived_review_policy,
         "required_artifacts": normalize_required_artifacts(value.get("required_artifacts"), repo_root=repo_root),
@@ -301,6 +341,11 @@ def validate_verification_contract(
         "tests": tests,
         "full_suite": full_suite,
     }
+    # 舊 pinned contract 沒有 slice path boundary 時仍可讀，但 evidence 會標成
+    # persona-only；保留缺欄位形狀，避免改變既有 contract hash。
+    if "write_paths" in value:
+        normalized["write_paths"] = normalize_write_paths(value["write_paths"], repo_root=repo_root)
+    return normalized
 
 
 def evidence_path(
@@ -865,11 +910,45 @@ def run_result_verification(
             "exists": artifact_path.exists(),
             "changed": None,
         }
+        if "mode" in artifact:
+            artifact_result["expected_mode"] = artifact["mode"]
         details["required_artifacts"].append(artifact_result)
         artifact_rows.append(artifact_result)
         if not artifact_result["exists"]:
             artifact_result["status"] = "missing"
             return _finish("needs_human", "required-artifact-missing")
+        if "mode" in artifact:
+            mode_result = _run_git(
+                [
+                    "--literal-pathspecs",
+                    "-C",
+                    str(resolved_repo_root),
+                    "ls-tree",
+                    "-z",
+                    candidate,
+                    "--",
+                    artifact["path"],
+                ],
+                git_runner,
+            )
+            artifact_result["git_mode_check"] = mode_result
+            if mode_result["status"] != "ok":
+                artifact_result["status"] = "mode-unreadable"
+                return _finish("needs_human", "required-artifact-mode-error")
+            matching_modes = []
+            for entry in mode_result["stdout"].split("\0"):
+                if "\t" not in entry:
+                    continue
+                metadata, entry_path = entry.split("\t", 1)
+                if entry_path == artifact["path"]:
+                    matching_modes.append(metadata.split(" ", 1)[0])
+            if len(matching_modes) != 1:
+                artifact_result["status"] = "mode-missing"
+                return _finish("needs_human", "required-artifact-mode-missing")
+            artifact_result["git_mode"] = matching_modes[0]
+            if matching_modes[0] != artifact["mode"]:
+                artifact_result["status"] = "mode-mismatch"
+                return _finish("needs_human", "required-artifact-mode-mismatch")
 
     artifact_diff = _run_git(
         [
@@ -974,12 +1053,35 @@ def run_result_verification(
         return _finish("needs_human", "persona-scope-error")
     changed_paths = [line for line in scope_diff["stdout"].splitlines() if line.strip()]
     verdict = gate.build_verdict(role="builder", changed_paths=changed_paths, manifest_ok=True, catalog=catalog)
+    persona_violations = list(verdict["violations"])
+    write_paths = contract.get("write_paths")
+    slice_violations = []
+    if isinstance(write_paths, list):
+        allowed_paths = set(write_paths)
+        slice_violations = [
+            {
+                "path": path,
+                "rule_id": "slice-scope",
+                "reason": f"path {path} outside slice write scope",
+            }
+            for path in changed_paths
+            if path not in allowed_paths
+        ]
+    violations = persona_violations + slice_violations
+    scope_ok = bool(verdict["ok"]) and not slice_violations
+    if not violations:
+        scope_status = "passed" if isinstance(write_paths, list) else "persona-only"
+    else:
+        scope_status = "violated"
     details["scope"] = {
-        "status": "passed" if verdict["ok"] else "violated",
+        "status": scope_status,
         "changed_paths": changed_paths,
-        "violations": verdict["violations"],
+        "write_paths": list(write_paths) if isinstance(write_paths, list) else None,
+        "persona_violations": persona_violations,
+        "slice_violations": slice_violations,
+        "violations": violations,
     }
-    if not verdict["ok"]:
+    if not scope_ok:
         return _finish("needs_human", "persona-scope-violation")
 
     env = _sanitized_env()
