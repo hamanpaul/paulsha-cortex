@@ -13,6 +13,7 @@ import re
 import stat as statmod
 import subprocess
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -66,6 +67,7 @@ from .github_delivery import (
     DeliveryPolicy,
     GitHubDeliveryClient,
     evaluate_delivery_gate,
+    evaluate_remote_closure,
 )
 from . import candidate_base
 from . import engineering_outcome
@@ -5545,6 +5547,170 @@ def _retire_delivered_action(
     }
 
 
+def _close_delivered_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    runner: Runner,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """為已交付但缺少記錄的 work item 建立 operator CompletionRecord。
+
+    僅接受沒有 WorkflowRun 的 work item。既有 remote closure gates 必須全數
+    通過，才會保存 actor／reason 與遠端事實。
+    """
+
+    extras = set(args) - {"action", "repo", "work_id", "actor", "reason"}
+    if extras:
+        raise ValueError(
+            f"close-delivered rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+    ):
+        raise ValueError("close-delivered requires bounded actor")
+    if (
+        not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+    ):
+        raise ValueError("close-delivered requires bounded reason")
+
+    related = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo and run.work_id == authority.work_id
+    ]
+    if related:
+        raise RuntimeError("close-delivered requires a work item with no WorkflowRun")
+    if not authority.mapped_issues:
+        raise RuntimeError("close-delivered requires mapped GitHub issues")
+    if len(authority.mapped_prs) != 1:
+        raise RuntimeError("close-delivered requires exactly one mapped PR")
+    if len(authority.mapped_openspec) > 1:
+        raise RuntimeError("close-delivered supports at most one mapped OpenSpec change")
+    if not authority.mapped_todo_paths:
+        raise RuntimeError("close-delivered requires mapped Todo paths")
+
+    github = GitHubDeliveryClient(runner=runner)
+    change = authority.mapped_openspec[0] if authority.mapped_openspec else None
+    todo_paths = tuple(authority.mapped_todo_paths)
+    facts = github.fetch_remote_closure(
+        repo=authority.repo,
+        pr_number=authority.mapped_prs[0],
+        change=change,
+        required_issues=authority.mapped_issues,
+        todo_paths=todo_paths,
+    )
+    if change is not None:
+        archive_task_paths = tuple(
+            sorted(
+                path
+                for path in github._commit_tree_paths(
+                    repo=authority.repo, commit=facts.default_head
+                )
+                if re.fullmatch(
+                    rf"openspec/changes/archive/\d{{4}}-\d{{2}}-\d{{2}}-"
+                    rf"{re.escape(change)}/tasks\.md",
+                    path,
+                )
+            )
+        )
+        if not archive_task_paths:
+            raise RuntimeError("close-delivered remote closure blocked: openspec-tasks-missing")
+        first_facts = facts
+        facts = github.fetch_remote_closure(
+            repo=authority.repo,
+            pr_number=authority.mapped_prs[0],
+            change=change,
+            required_issues=authority.mapped_issues,
+            todo_paths=tuple(sorted(set(todo_paths) | set(archive_task_paths))),
+        )
+        if (
+            facts.default_head != first_facts.default_head
+            or facts.merge_commit != first_facts.merge_commit
+            or facts.pr_head != first_facts.pr_head
+            or dict(facts.issue_states) != dict(first_facts.issue_states)
+            or facts.active_openspec_absent != first_facts.active_openspec_absent
+            or facts.archive_present != first_facts.archive_present
+            or any(
+                facts.todo_revisions.get(path) != revision
+                for path, revision in first_facts.todo_revisions.items()
+            )
+        ):
+            raise RuntimeError("close-delivered remote facts changed during verification")
+    gate = evaluate_remote_closure(
+        facts=replace(facts, completion_record_valid=True),
+        required_issues=authority.mapped_issues,
+        expected_head=facts.pr_head,
+    )
+    if not gate.allowed:
+        raise RuntimeError(f"close-delivered remote closure blocked: {', '.join(gate.reasons)}")
+
+    source_revisions: dict[str, str] = {}
+    for value in authority.source_revisions:
+        source_id, separator, revision = value.partition("@")
+        if not separator or not source_id or not revision:
+            raise RuntimeError("close-delivered WorkAuthority source revisions malformed")
+        if source_id in source_revisions:
+            raise RuntimeError("close-delivered WorkAuthority source revisions duplicated")
+        source_revisions[source_id] = revision
+    if not source_revisions:
+        raise RuntimeError("close-delivered requires confirmed source revisions")
+
+    body = {
+        "schema": "cortex-work-close-delivered/v1",
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "actor": actor,
+        "reason": reason,
+        "authority_digest": work_authority_digest(authority),
+        "source_revisions": dict(sorted(source_revisions.items())),
+        "issue_states": [
+            {"ref": f"{authority.repo}#{issue}", "state": facts.issue_states[issue]}
+            for issue in sorted(authority.mapped_issues)
+        ],
+        "pull_request": {
+            "ref": f"{authority.repo}#{authority.mapped_prs[0]}",
+            "candidate": facts.pr_head.lower(),
+            "merge_commit": facts.merge_commit.lower(),
+            "merge_parents": [parent.lower() for parent in facts.merge_parents],
+            "default_head": facts.default_head.lower(),
+            "merge_is_ancestor": facts.merge_is_ancestor,
+            "merge_is_merge_commit": facts.merge_is_merge_commit,
+        },
+        "openspec": {
+            "refs": list(authority.mapped_openspec),
+            "active_openspec_absent": facts.active_openspec_absent,
+            "archive_present": facts.archive_present,
+        },
+        "todo_revisions": dict(sorted(facts.todo_revisions.items())),
+    }
+    record = _write_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="work-close-delivered",
+        stem=authority.work_id,
+        label="close-delivered",
+        max_size=16384,
+    )
+    return {
+        "action": "closed-delivered",
+        "actor": actor,
+        "reason": reason,
+        "issue_states": body["issue_states"],
+        "pull_request": body["pull_request"],
+        "completion_record": record,
+    }
+
+
 def _validate_reclaim_reset_operator_inputs(args: dict[str, Any]) -> tuple[str, str]:
     """#519：`reset-reclaim-budget` 的 actor／reason 入場驗證。
 
@@ -8066,6 +8232,7 @@ def execute_work_action(
         "link", "unlink", "start", "resume", "retry-build", "retry-card",
         "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
+        "close-delivered",
         "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
         "intake",
@@ -8208,6 +8375,14 @@ def execute_work_action(
         )
     elif action == "retire-delivered":
         result = _retire_delivered_action(
+            args=args,
+            authority=authority,
+            runner=runner,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "close-delivered":
+        result = _close_delivered_action(
             args=args,
             authority=authority,
             runner=runner,
