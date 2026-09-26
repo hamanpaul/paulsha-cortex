@@ -56,8 +56,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             for combo_id, combo_file in iter_combo_files(package_dir=DEFAULT_COMBOS_DIR):
                 combo = load_combo(combo_file, cards)
                 print(f"{combo.id}\t(task_type={combo.task_type}, cards={len(combo.cards)})")
-            for card in cards.values():
-                print(f"  card: {card.id}\t[{card.type}/{card.card_class}]")
+                for entry in combo.cards:
+                    card = cards[entry.ref]
+                    print(f"  card: {card.id}\t[{card.type}/{card.card_class}]")
             return 0
 
         if args.command == "compile":

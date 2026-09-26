@@ -173,6 +173,24 @@ def test_list_shows_combos(tmp_path, capsys, monkeypatch):
     assert "feature-oneshot" in out and "mcu-feature" in out
 
 
+def test_list_groups_cards_under_their_combo(tmp_path, capsys, monkeypatch):
+    _seed_fixture(tmp_path, monkeypatch)
+    assert deck_cli.main(["list"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    feature_index = next(i for i, line in enumerate(lines) if line.startswith("feature-oneshot\t"))
+    mcu_index = next(i for i, line in enumerate(lines) if line.startswith("mcu-feature\t"))
+
+    def listed_refs(region):
+        return {line.strip().split("\t", 1)[0].removeprefix("card: ") for line in region if line.startswith("  card:")}
+
+    feature_refs = listed_refs(lines[feature_index + 1 : mcu_index])
+    mcu_refs = listed_refs(lines[mcu_index + 1 :])
+    assert "brainstorming" in feature_refs
+    assert "mcu-hw-evidence" not in feature_refs
+    assert "mcu-hw-evidence" in mcu_refs
+    assert "brainstorming" not in mcu_refs
+
+
 def test_compile_dry_run_writes_nothing(tmp_path, capsys, monkeypatch):
     _seed_fixture(tmp_path / "deck", monkeypatch)
     specs_root = tmp_path / "specs"

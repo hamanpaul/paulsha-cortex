@@ -18,6 +18,7 @@ from paulsha_cortex.deck.compile import (
     specs_dir,
 )
 from paulsha_cortex.deck.schema import load_cards, load_combo
+from paulsha_cortex.deck.verify import verify_card
 
 CARDS_YAML = """\
 version: 0
@@ -193,6 +194,30 @@ def _solo_adv(tmp_path):
 
 def test_slugify_basic():
     assert slugify_task("Add LED Blink Mode!") == "add-led-blink-mode"
+
+
+def test_slugify_preserves_cjk_semantic_text():
+    assert slugify_task("Task 5: 閘2 匯出樹乾淨重建") == "task-5-閘2-匯出樹乾淨重建"
+
+
+def test_compile_and_verify_accept_cjk_task_slug(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path / "deck")
+    task = "Task 5: 閘2 匯出樹乾淨重建"
+    result = compile_combo(combo, cards, task, change="demo", allow_external=True)
+    assert result.task_slug == "task-5-閘2-匯出樹乾淨重建"
+    assert result.slices[0].slice_id.startswith(result.task_slug)
+
+    repo_root = tmp_path / "repo"
+    artifact = repo_root / "docs/superpowers/specs" / f"{result.task_slug}-design.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("# Design\n", encoding="utf-8")
+    assert verify_card(cards["brainstorming"], result.task_slug, root=repo_root).ok
+
+
+def test_compile_warns_when_task_slug_has_too_little_information(tmp_path, capsys):
+    cards, combo = _feature_oneshot(tmp_path / "deck")
+    compile_combo(combo, cards, "Task 2: 閘1", change="demo", allow_external=True)
+    assert "task-slug 資訊量偏低" in capsys.readouterr().err
 
 
 def test_slugify_length_cap_60():
@@ -696,6 +721,7 @@ def test_verification_skeleton_placeholder_when_no_project_policy_file(tmp_path,
     err = capsys.readouterr().err
     assert "policy" in err.lower() or "驗證" in err
     assert "WARNING" in err or "警告" in err
+    assert "若本計畫的任務之一是建立 .project-policy.yml，請先手動完成該任務，再編譯後續 slice" in err
 
 
 def test_verification_skeleton_placeholder_when_preflight_steps_missing_kind(tmp_path, capsys):

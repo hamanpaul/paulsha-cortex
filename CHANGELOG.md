@@ -636,6 +636,7 @@
 - **#813／#945 AGY builder 權限與前景執行契約**：為 commit-required argv 補上不得含 `--dangerously-skip-permissions` 的負向回歸斷言；AGY builder prompt 現要求測試與長命令在前景同步執行並等待完成，不得交給背景任務。README 也註明 `--allow-unsafe` 對 AGY 會啟用全工具核可，其權限剖面尚未依 #716 逐 executor 量測。
 - **#477 builder dispatch worktree 邊界**：在 prompt 組裝前解析 canonical worktree 根目錄並附上隔離指示，明確禁止存取主 checkout；含空白及 shell 特殊字元的路徑以純文字資料傳遞。
 - **#878 manager 開機啟動**：`cortex install service` 現在也會 enable `<instance>-manager.service`，讓 manager 隨 user systemd 的 `default.target` 啟動，不再只依賴已標示 deprecated 的 timer。
+- **#474 deck compile 使用者體驗修正**：task slug 保留 CJK 與 Unicode 字母／數字，資訊量不足時發出警告；缺少 `.project-policy.yml` preflight 時提示建立設定檔任務的 bootstrap 順序；`deck list` 依 combo 分組列出卡片。
 - Wave R 整合交付：operator 合併 8 個卡在 cortex pipeline 的實作 PR，並補 review 修正（非正規化 governed path、journal lock `O_CLOEXEC`、裁決 evidence 先於 run 重置、#862 測試對齊 #966 CAS）。
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、
   逐條宣稱更正，以及切換當下才撞得到的那一個阻斷**。四分部署的
