@@ -1,10 +1,7 @@
-"""#830：派工結果的非 Job 決策契約——真 producer 的合法非 Job 決策不得在消費端炸 KeyError。
+"""#830：派工結果非 Job 決策的消費契約回歸測試。
 
-`manager._dispatch_workflow_card` 對 plan 完成且 sizing_band=red 的 run 合法回傳
-`{run_id, current_phase, reason: "needs-decomposition"}`（#223），不建立 Job；daemon 的
-start／work-action 消費端與 manager 的 resume／provider-retry 消費端過去只驗 `is not None`
-就讀 `["job_id"]`。本檔以 #223 的真 red producer fixture 接到各正式消費端重現，並鎖住
-分類契約：真 Job（registry 綁定相符）／合法 decision／確定性 transition／None／malformed。
+測試深度已達上限的 Red run，確認合法決策不會在 daemon、resume 消費端變成 KeyError；
+另保留真 Job、確定性 transition、None 與 malformed 結果的分類矩陣。
 """
 
 from __future__ import annotations
@@ -59,7 +56,7 @@ def _write_planning_artifacts(root: Path) -> tuple[PlanningArtifactAuthority, ..
     return tuple(authority)
 
 
-def _red_run(tmp_path: Path):
+def _red_run(tmp_path: Path, *, decomposition_depth: int = 0):
     repo = tmp_path / "repo"
     repo.mkdir()
     registry = JobRegistry(state_path=tmp_path / "registry.json")
@@ -81,7 +78,7 @@ def _red_run(tmp_path: Path):
         planning_authority=authority,
         sizing_score=8,
         sizing_band="red",
-        decomposition_depth=0,
+        decomposition_depth=decomposition_depth,
     )
     return registry, run
 
@@ -112,10 +109,10 @@ def _decision(run, reason: str = "needs-decomposition") -> dict:
 # --- 真 producer → daemon workflow-action start 消費端（manager_daemon 的第一個 job_id 讀取點） ---
 
 
-def test_daemon_start_consumes_real_red_decision_without_keyerror(
+def test_daemon_start_consumes_depth_limit_decision_without_keyerror(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    registry, run = _red_run(tmp_path)
+    registry, run = _red_run(tmp_path, decomposition_depth=2)
     monkeypatch.setattr(
         manager,
         "apply_workflow_action",
@@ -131,27 +128,26 @@ def test_daemon_start_consumes_real_red_decision_without_keyerror(
         "kind": "decision",
         "run_id": run.run_id,
         "current_phase": "plan",
-        "reason": "needs-decomposition",
+        "reason": "decomposition-depth-exceeded",
     }
     persisted = registry.get_workflow_run(run.run_id)
     assert persisted.current_phase == "plan"
-    assert persisted.facets == ("needs_decomposition",)
-    assert "needs_human" not in persisted.facets
+    assert persisted.facets == ("needs_human",)
     assert registry.list_jobs() == []
 
     # R5：同一 start 重送不得新增 run／Job，也不得改寫 decision。
     again = executor(request)
-    assert again["dispatch"]["reason"] == "needs-decomposition"
+    assert again["dispatch"]["reason"] == "decomposition-depth-exceeded"
     assert registry.list_jobs() == []
     assert len(registry.list_workflow_runs()) == 1
-    assert registry.get_workflow_run(run.run_id).facets == ("needs_decomposition",)
+    assert registry.get_workflow_run(run.run_id).facets == ("needs_human",)
 
 
 # --- 真 producer → manager.resume_workflow_run（explicit resume 與 periodic 共用） ---
 
 
-def test_resume_returns_real_red_decision_instead_of_job_failed(tmp_path: Path) -> None:
-    registry, run = _red_run(tmp_path)
+def test_resume_returns_depth_limit_decision_instead_of_job_failed(tmp_path: Path) -> None:
+    registry, run = _red_run(tmp_path, decomposition_depth=2)
 
     result = manager.resume_workflow_run(
         _dispatcher(registry),
@@ -164,12 +160,11 @@ def test_resume_returns_real_red_decision_instead_of_job_failed(tmp_path: Path) 
     assert result == {
         "run_id": run.run_id,
         "current_phase": "plan",
-        "reason": "needs-decomposition",
+        "reason": "decomposition-depth-exceeded",
     }
     persisted = registry.get_workflow_run(run.run_id)
-    assert "needs_human" not in persisted.facets
-    assert persisted.needs_human_reason is None
-    assert persisted.facets == ("needs_decomposition",)
+    assert "needs_human" in persisted.facets
+    assert persisted.needs_human_reason["reason"] == "decomposition-depth-exceeded"
     assert registry.list_jobs() == []
 
 

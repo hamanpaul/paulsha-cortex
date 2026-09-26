@@ -20,13 +20,12 @@ Issue [#835](https://github.com/hamanpaul/paulsha-cortex/issues/835)，parent #8
 為本計畫的完整 scope；accepted 不代表可直接派工。本件保留所有 A1–A6／I1–I10。
 production 跨 profile/identity/resolution、launcher/adapter、planning runtime、registry/workflow，
 故 domain_breadth=2；含 schema migration／重啟一致性，故 state_consistency=2。
-依 feature-oneshot，舊算法 10/Red；#831 修正 spec_stability 後預計 8/Red，仍須人工拆分。
+依 feature-oneshot，舊算法 10/Red；#831 修正 spec_stability 後仍為 8/Red。#833 已接上 Red 拆分 planner：一次提出經既有 plan review gate 檢查的 child，再走標準 intake；不降低母件 sizing，也不自行授予 child authority。
 
 ## Boundary
 
 產品碼與測試只由 Cortex 開發，本 intake 不實作；下列未勾工作是母範圍交付清單，
-不是將 Red 母件直接作單一 build 派工的指令。人工拆分須保留 parent AC owner、依賴、真實 sizing
-及正常 authority/registration/freeze，不能刪驗收／降分；#833 自動分解尚未可用。
+不是將 Red 母件直接作單一 build 派工的指令。#833 的拆分 planner 僅提出一個 child；child 仍須由標準 intake 依既有 authority/registration/freeze 受理。拆分須保留 parent AC owner、依賴與真實 sizing，不能刪驗收／降分；沒有可受理的 child authority 時由 intake 停止並交由 operator 處理。
 #842 是 qualification lifecycle owner；#581 保留五項解析／producer 原 scope，
 PatchMUD #37 只提供 CLI/file schema／immutable fixture，不引入 runtime import。
 

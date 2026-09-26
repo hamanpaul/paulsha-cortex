@@ -90,6 +90,7 @@ from .workflow import (
     PlanningDriftArtifact,
     PlanningArtifactAuthority,
     PlanReviewReceipt,
+    WorkflowStep,
     WorkflowPlanningDriftStop,
     WorkflowManifest,
     brainstorm_authority_bound,
@@ -113,6 +114,7 @@ VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
 SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"})
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
 WORKFLOW_INPUT_ENVELOPE_MAX_BYTES = 131072
+RED_DECOMPOSITION_CARD = "red-decomposition"
 _PLANNING_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
@@ -11718,6 +11720,17 @@ def _workflow_job_prompt(
                 "description": gate_evidence_description,
             },
         }
+        if step.card == RED_DECOMPOSITION_CARD:
+            terminal_schema["diagnostics"] = {
+                "type": "object",
+                "required": ["decomposition_plan"],
+                "properties": {
+                    "decomposition_plan": (
+                        "Markdown 計畫字串；frontmatter 必須含非負整數 invariant_count、非空字串列表 artifact_classes "
+                        "與唯一 child_work_id；Tasks 須涵蓋宣告的 classes 與既有 plan review 要求。"
+                    )
+                },
+            }
         if effective_test_policy == "red-required":
             # #540：#307 的反轉判準過去只存在於 manager 側；泛用 status_policy
             # 對 tdd-red 卡字面上要求回 failed，與實際採信規則相反。說明文字由
@@ -11769,12 +11782,20 @@ def _workflow_job_prompt(
         if isinstance(contract.get("openspec_ref"), str)
         else "openspec/changes/<change>/tasks.md"
     )
-    planner_contract = (
-        " This planner card is read-only: use the disposable checkout only, do not edit files, and "
-        "return only existing manifest-declared artifacts."
-        if step.persona == "planner"
-        else ""
-    )
+    planner_contract = ""
+    if step.persona == "planner" and step.card == RED_DECOMPOSITION_CARD:
+        planner_contract = (
+            " 此卡只能產生一個 child 計畫，不可建立多個 children。保持唯讀，不修改檔案；"
+            "在 terminal diagnostics.decomposition_plan 內直接回傳完整 Markdown。"
+            "frontmatter 必須宣告非負整數 invariant_count、非空 artifact_classes，並以合法 child_work_id 指定一個既有工作項目；"
+            "Tasks 必須涵蓋所有宣告的 artifact_classes，並保留 changelog、cli、test/測試等既有 plan review 要求；"
+            "計畫通過 Manager plan review 後才會呼叫標準 intake。"
+        )
+    elif step.persona == "planner":
+        planner_contract = (
+            " This planner card is read-only: use the disposable checkout only, do not edit files, and "
+            "return only existing manifest-declared artifacts."
+        )
     reviewer_contract = (
         " This reviewer card is read-only: inspect and run only non-mutating commands in the "
         "Candidate checkout. If candidate_checkout is present, change into that relative directory "
@@ -11977,6 +11998,123 @@ def _evaluate_yellow_plan_review(
         )
     except ValueError:
         return None
+
+
+def _schedule_red_decomposition(registry, *, run, step, artifacts):
+    """把一個 Red 拆分 planner step 接在既有 plan 後，重送沿用同一張卡。"""
+
+    current = registry.get_workflow_run(run.run_id)
+    if any(item.card == RED_DECOMPOSITION_CARD for item in current.steps):
+        return current
+    audited = _audit_phase_steps(
+        current.steps,
+        phase="plan",
+        executor="cortex-manager",
+        model="deterministic",
+        domain="cortex",
+        outputs=tuple(item.ref for item in artifacts),
+        card_id=step.card,
+    )
+    plan_step = WorkflowStep(
+        phase="plan",
+        persona="planner",
+        card=RED_DECOMPOSITION_CARD,
+        executor=None,
+        model=None,
+        domain=None,
+        inputs=tuple(item.ref for item in current.planning_authority),
+        outputs=(),
+        skill_ref="superpowers:writing-plans",
+        action=(
+            "將此 Red 工作拆成恰好一個 child work item；輸出含 artifact_classes 與 child_work_id "
+            "欄位的拆分計畫，child_work_id 必須是可由正常 intake 載入的既有工作。"
+        ),
+    )
+    steps = list(audited)
+    insertion = max(
+        (index + 1 for index, item in enumerate(steps) if item.phase == "plan"),
+        default=len(steps),
+    )
+    steps.insert(insertion, plan_step)
+    return registry._manager_update_workflow_run(
+        current.run_id,
+        steps=tuple(steps),
+        facets=tuple(dict.fromkeys((*current.facets, "needs_decomposition"))),
+    )
+
+
+def _red_decomposition_child_work_id(plan_text: str) -> str | None:
+    """讀取拆分計畫唯一的 child work id；不接受多 child/fan-out 欄位。"""
+
+    lines = plan_text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    closing = next(
+        (index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
+        None,
+    )
+    if closing is None:
+        return None
+    try:
+        frontmatter = safe_load("\n".join(lines[1:closing]))
+    except YAMLError:
+        return None
+    if not isinstance(frontmatter, dict):
+        return None
+    child_work_id = frontmatter.get("child_work_id")
+    if (
+        not isinstance(child_work_id, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", child_work_id) is None
+    ):
+        return None
+    return child_work_id
+
+
+def _red_decomposition_plan_from_job(job: Mapping[str, object]) -> str | None:
+    """從 planner 的 workflow terminal diagnostics 取拆分計畫文字。"""
+
+    try:
+        terminal = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return None
+    diagnostics = terminal.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return None
+    plan_text = diagnostics.get("decomposition_plan")
+    if not isinstance(plan_text, str) or not plan_text.strip():
+        return None
+    if len(plan_text.encode("utf-8")) > WORKFLOW_INPUT_ENVELOPE_MAX_BYTES:
+        return None
+    return plan_text
+
+
+def _stop_red_decomposition(
+    registry,
+    *,
+    run,
+    reason: str,
+    detail: str,
+    source: str = "manager.resume_workflow_run:red-decomposition",
+) -> dict[str, object]:
+    current = registry.get_workflow_run(run.run_id)
+    updated = registry._manager_update_workflow_run(
+        current.run_id,
+        facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+        gate_status="running",
+        needs_human_reason=diagnostic_reason(
+            reason,
+            detail,
+            source=source,
+            run_id=current.run_id,
+            work_id=current.work_id,
+            decomposition_depth=str(current.decomposition_depth),
+        ),
+    )
+    return {
+        "run_id": updated.run_id,
+        "current_phase": updated.current_phase,
+        "reason": reason,
+    }
 
 
 @dataclass(frozen=True)
@@ -12192,14 +12330,18 @@ def _dispatch_workflow_card(
             planning_complete = artifacts is not None and assess_planning_completeness(artifacts).complete
         except ValueError:
             planning_complete = False
-        if planning_complete:
+        if planning_complete and step.card != RED_DECOMPOSITION_CARD:
             pending_phase_steps = [
                 item
                 for item in run.steps
                 if item.phase == run.current_phase and item.gate_result != "passed"
             ]
             is_last_pending = bool(pending_phase_steps) and step.card == pending_phase_steps[-1].card
-            if is_last_pending and run.current_phase == "plan" and run.sizing_band == "red":
+            if (
+                is_last_pending
+                and run.current_phase == "plan"
+                and run.sizing_band == "red"
+            ):
                 # #223（design #208 H.3）：Red band 收斂到 needs_decomposition，
                 # 不推進到 build；current_phase 刻意保持在 plan
                 # （validate_workflow_phase_transition 只允許單調 +1，Red 決策
@@ -12213,14 +12355,31 @@ def _dispatch_workflow_card(
                     if route == "needs_human"
                     else "needs-decomposition"
                 )
-                updated = registry._manager_update_workflow_run(
-                    run.run_id,
-                    facets=tuple(dict.fromkeys((*run.facets, route))),
-                    # route 為 `needs_decomposition` 時不帶理由（那不是本 invariant
-                    # 的管轄範圍，且它自己就是可讀的路由結論）；只有轉入
-                    # `needs_human`（拆分深度已達 #223 的上限、不能再拆）才落理由。
-                    needs_human_reason=(
-                        diagnostic_reason(
+                if route == "needs_decomposition":
+                    updated = _schedule_red_decomposition(
+                        registry,
+                        run=run,
+                        step=step,
+                        artifacts=artifacts,
+                    )
+                    return _dispatch_workflow_card(
+                        dispatcher,
+                        run=updated,
+                        identities=identities,
+                        launcher_factory=launcher_factory,
+                        coordinator_root=coordinator_root,
+                        retry_failed=retry_failed,
+                        operator_recovery_job_id=operator_recovery_job_id,
+                        force_new_card=force_new_card,
+                        forced_identity=forced_identity,
+                        spawn_admission=spawn_admission,
+                        builder_todo_admission=builder_todo_admission,
+                    )
+                else:
+                    updated = registry._manager_update_workflow_run(
+                        run.run_id,
+                        facets=tuple(dict.fromkeys((*run.facets, route))),
+                        needs_human_reason=diagnostic_reason(
                             route_reason,
                             f"sizing_band=red 但 decomposition_depth 已達上限"
                             f"（depth={run.decomposition_depth}），不得再拆一層",
@@ -12229,11 +12388,8 @@ def _dispatch_workflow_card(
                             work_id=run.work_id,
                             sizing_band=run.sizing_band,
                             decomposition_depth=str(run.decomposition_depth),
-                        )
-                        if route == "needs_human"
-                        else None
-                    ),
-                )
+                        ),
+                    )
                 return {
                     "run_id": updated.run_id,
                     "current_phase": updated.current_phase,
@@ -13438,6 +13594,7 @@ def resume_workflow_run(
     builder_todo_admission_loader: (
         Callable[[object], BuilderTodoAdmission | None] | None
     ) = None,
+    decomposition_intake: Callable[[str], object] | None = None,
 ) -> dict[str, object]:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -14288,6 +14445,109 @@ def resume_workflow_run(
             ),
         )
         raise
+    if step.card == RED_DECOMPOSITION_CARD:
+        plan_text = _red_decomposition_plan_from_job(job)
+        if plan_text is None:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-plan-output-invalid",
+                detail="拆分 planner terminal 缺少有效的 decomposition_plan 輸出。",
+            )
+        plan = PlanningArtifact(
+            kind="plan",
+            ref=f"red-decomposition:{run.run_id}",
+            text=plan_text,
+        )
+        review = _evaluate_yellow_plan_review(
+            (plan,),
+            envelope_lookup=_plan_review_envelope_lookup(run, identities),
+        )
+        if review is None:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-plan-review-unavailable",
+                detail="拆分計畫無法套用既有 plan review gate。",
+            )
+        if not review.ready:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-plan-review-failed",
+                detail=(
+                    "拆分計畫未通過既有 plan review gate"
+                    f"（failed_check={review.failed_check}）。"
+                ),
+            )
+        child_work_id = _red_decomposition_child_work_id(plan_text)
+        if child_work_id is None:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-child-work-id-invalid",
+                detail="通過 review 的拆分計畫必須包含唯一合法 child_work_id。",
+            )
+        if decomposition_intake is None:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-intake-unavailable",
+                detail="標準 work-action intake 尚未接線，不能建立 child workflow。",
+            )
+        try:
+            child_result = decomposition_intake(child_work_id)
+        except Exception as exc:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-child-intake-failed",
+                detail=f"child 標準 intake 失敗：{summarize_exception(exc)}",
+            )
+        result_payload = (
+            child_result.get("result", child_result)
+            if isinstance(child_result, Mapping)
+            else None
+        )
+        child_run = (
+            result_payload.get("run")
+            if isinstance(result_payload, Mapping)
+            else None
+        )
+        if (
+            not isinstance(result_payload, Mapping)
+            or result_payload.get("action") not in {"claim", "resume", "done"}
+            or not isinstance(child_run, Mapping)
+            or not isinstance(child_run.get("run_id"), str)
+        ):
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-child-intake-rejected",
+                detail="標準 intake 未回傳已接受的 child workflow。",
+            )
+        current = registry.get_workflow_run(run.run_id)
+        completed_steps = _audit_phase_steps(
+            current.steps,
+            phase="plan",
+            executor=str(job.get("executor") or "cortex-manager"),
+            model=str(job.get("model_id") or "deterministic"),
+            domain=str(job.get("independence_domain") or "cortex"),
+            outputs=(),
+            card_id=step.card,
+        )
+        registry._manager_update_workflow_run(
+            current.run_id,
+            steps=completed_steps,
+            needs_human_reason=None,
+        )
+        return {
+            "run_id": current.run_id,
+            "current_phase": current.current_phase,
+            "reason": "decomposition-child-intake-started",
+            "child_work_id": child_work_id,
+            "child_run_id": child_run["run_id"],
+        }
     phase_steps = [item for item in run.steps if item.phase == run.current_phase]
     is_last = step.card == phase_steps[-1].card
     next_phase = (
