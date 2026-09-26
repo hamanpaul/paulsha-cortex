@@ -114,6 +114,18 @@ pipx install git+https://github.com/hamanpaul/paulsha-cortex.git
 - [Runbook](docs/onboarding/runbook.md)：把常見事故整理成可執行 SOP。
 - [driving-cortex skill](skills/driving-cortex/SKILL.md)：agent 編排 coordinator 視角，對應 issue #177 的 dogfood 派工實務。
 
+### 安裝 driving-cortex skill
+
+`skills/driving-cortex` 是此 skill 的唯一來源；Python 套件與 `cortex install service` 不會安裝它。支援 `$HOME/.agents/skills` 的 agent 可在此 repo checkout 建立 symlink，讓通用 skills root 發現該 skill：
+
+```bash
+repo_root="$(git rev-parse --show-toplevel)"
+mkdir -p "$HOME/.agents/skills"
+ln -s "$repo_root/skills/driving-cortex" "$HOME/.agents/skills/driving-cortex"
+```
+
+之後更新此 checkout 時，symlink 會讀到最新的 `SKILL.md`；若 repo 搬移，需重新建立入口。
+
 ## Usage
 
 ### 10 分鐘上手：`cortex bootstrap`

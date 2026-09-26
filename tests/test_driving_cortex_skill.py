@@ -97,3 +97,31 @@ def test_skill_no_personal_paths() -> None:
 def test_skill_no_unsafe_bypass_as_daily_guide() -> None:
     text = _read_skill_text()
     _assert_unsafe_flag_context(text)
+
+
+def test_skill_start_example_matches_porcelain_cli() -> None:
+    text = _read_skill_text()
+    example = "cortex run work start <work_id> --repo <owner/repo> --wait --json"
+    assert example in text, "SKILL.md must use the current run work start command"
+    assert "--workflow-action" not in text, "SKILL.md must not show the removed start option"
+
+    from paulsha_cortex.porcelain.run import _build_parser
+
+    args = _build_parser().parse_args(
+        ["work", "start", "work-id", "--repo", "owner/repo", "--wait", "--json"]
+    )
+    assert (args.action, args.work_id, args.repo, args.wait, args.json) == (
+        "start",
+        "work-id",
+        "owner/repo",
+        True,
+        True,
+    )
+
+
+def test_readme_documents_standard_skill_root_symlink() -> None:
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "### 安裝 driving-cortex skill" in readme, "README.md must document skill discovery setup"
+    section = readme.split("### 安裝 driving-cortex skill", 1)[1].split("\n### ", 1)[0]
+    assert 'mkdir -p "$HOME/.agents/skills"' in section
+    assert 'ln -s "$repo_root/skills/driving-cortex" "$HOME/.agents/skills/driving-cortex"' in section
