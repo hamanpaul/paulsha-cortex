@@ -436,6 +436,29 @@ def _require_non_empty_string(
     return value
 
 
+def _normalize_owner_identity(
+    value: Mapping[str, str] | None,
+    *,
+    state_path: Path,
+) -> dict[str, str] | None:
+    """驗證持久 repo／Work Item／slice 身分，不推測或回填 legacy row。"""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"repo", "work_id", "slice_id"}:
+        raise _contract_error("malformed-owner-identity", state_path=state_path)
+    repo = _require_non_empty_string(value.get("repo"), label="owner_identity.repo", state_path=state_path)
+    work_id = _require_non_empty_string(value.get("work_id"), label="owner_identity.work_id", state_path=state_path)
+    slice_id = _require_non_empty_string(value.get("slice_id"), label="owner_identity.slice_id", state_path=state_path)
+    repo_parts = repo.split("/")
+    if len(repo_parts) != 2 or any(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", part) is None for part in repo_parts
+    ):
+        raise _contract_error("malformed-owner-identity", state_path=state_path, detail="repo")
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
+        raise _contract_error("malformed-owner-identity", state_path=state_path, detail="work_id")
+    return {"repo": repo, "work_id": work_id, "slice_id": slice_id}
+
+
 def _require_exact_dict_keys(
     value: object,
     *,
@@ -3457,6 +3480,8 @@ class JobRegistry:
         workflow_run_id: str | None = None,
         workflow_claim_key: str | None = None,
         workflow_repo: str | None = None,
+        owner_identity: Mapping[str, str] | None = None,
+        attempt_id: str | None = None,
         workflow_card: str | None = None,
         workflow_phase: str | None = None,
         workflow_repo_root: str | None = None,
@@ -3487,6 +3512,11 @@ class JobRegistry:
             raise ValueError(f"slice 已有 active builder，不可重複派工: {task}")
         if kind not in {"build", "review"}:
             raise ValueError(f"非法 kind: {kind!r}")
+        normalized_owner = _normalize_owner_identity(owner_identity, state_path=self._state_path)
+        if normalized_owner is not None and normalized_owner["slice_id"] != task:
+            raise ValueError("owner_identity.slice_id 必須符合 job task")
+        if attempt_id is not None and (not isinstance(attempt_id, str) or not attempt_id.strip()):
+            raise ValueError("attempt_id 必須為非空字串")
         self._validate_existing_job_ref("workflow_builder_job_id", workflow_builder_job_id)
         if job_id is None:
             allocated = self._allocate_job_id(task)
@@ -3532,6 +3562,8 @@ class JobRegistry:
             "workflow_run_id": workflow_run_id,
             "workflow_claim_key": workflow_claim_key,
             "workflow_repo": workflow_repo,
+            "owner_identity": normalized_owner,
+            "attempt_id": attempt_id,
             "workflow_card": workflow_card,
             "workflow_phase": workflow_phase,
             "workflow_repo_root": workflow_repo_root,
@@ -3846,14 +3878,23 @@ class JobRegistry:
         builder_job_id: str | None = None,
         reviewer_job_id: str | None = None,
         candidate: str | None = None,
+        owner_identity: Mapping[str, str] | None = None,
+        attempt_id: str | None = None,
     ) -> dict[str, Any]:
         if any(row["slice_id"] == slice_id for row in self._slices):
             raise ValueError(f"slice 已存在: {slice_id}")
         self._validate_existing_job_ref("builder_job_id", builder_job_id)
         self._validate_existing_job_ref("reviewer_job_id", reviewer_job_id)
+        normalized_owner = _normalize_owner_identity(owner_identity, state_path=self._state_path)
+        if normalized_owner is not None and normalized_owner["slice_id"] != slice_id:
+            raise ValueError("owner_identity.slice_id 必須符合 slice_id")
+        if attempt_id is not None and (not isinstance(attempt_id, str) or not attempt_id.strip()):
+            raise ValueError("attempt_id 必須為非空字串")
         now = _now_iso()
         slice_row = {
             "slice_id": slice_id,
+            "owner_identity": normalized_owner,
+            "attempt_id": attempt_id,
             "spec": {"path": spec_path, "hash": spec_hash},
             "plan": {"path": plan_path, "hash": plan_hash},
             "target_branch": target_branch,
@@ -3897,8 +3938,24 @@ class JobRegistry:
         verification_hash: str,
         verification: dict[str, Any] | None,
         dispatch_base: str | None,
+        owner_identity: Mapping[str, str] | None = None,
+        attempt_id: str | None = None,
+        replace_owner_identity: bool = False,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+        normalized_owner = _normalize_owner_identity(owner_identity, state_path=self._state_path)
+        if replace_owner_identity and normalized_owner is not None and normalized_owner["slice_id"] != slice_id:
+            raise ValueError("owner_identity.slice_id 必須符合 slice_id")
+        if replace_owner_identity:
+            previous_owner = _normalize_owner_identity(
+                slice_row.get("owner_identity"), state_path=self._state_path
+            )
+            if previous_owner != normalized_owner:
+                if previous_owner is None:
+                    raise ValueError("cannot migrate legacy owner identity")
+                raise ValueError("cannot replace an established owner identity")
+        if attempt_id is not None and (not isinstance(attempt_id, str) or not attempt_id.strip()):
+            raise ValueError("attempt_id 必須為非空字串")
         previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
         staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
         if previous_binding is not None:
@@ -3929,6 +3986,10 @@ class JobRegistry:
             "contract": dict(verification) if isinstance(verification, dict) else None,
         }
         slice_row["dispatch_base"] = dispatch_base
+        if replace_owner_identity:
+            slice_row["owner_identity"] = normalized_owner
+        if attempt_id is not None:
+            slice_row["attempt_id"] = attempt_id
         slice_row["builder_job_id"] = None
         slice_row["reviewer_job_id"] = None
         slice_row["candidate"] = None
@@ -3944,6 +4005,17 @@ class JobRegistry:
     def list_slices(self) -> list[dict[str, Any]]:
         self._reload_if_changed()
         return [self._copy_slice(slice_row) for slice_row in self._slices]
+
+    def list_slices_by_owner(self, *, repo: str, work_id: str) -> list[dict[str, Any]]:
+        """依明示、持久的 repo／Work Item 身分列出 slice；不推測或回填舊 row。"""
+        self._reload_if_changed()
+        return [
+            self._copy_slice(row)
+            for row in self._slices
+            if isinstance(row.get("owner_identity"), dict)
+            and row["owner_identity"].get("repo") == repo
+            and row["owner_identity"].get("work_id") == work_id
+        ]
 
     def get_slice(self, slice_id: str) -> dict[str, Any]:
         self._reload_if_changed()
@@ -4362,11 +4434,15 @@ class JobRegistry:
         evidence_refs: list[str] | None = None,
         evaluation_refs: list[str] | None = None,
         candidate: str | None = None,
+        clear_builder_binding: bool = False,
+        clear_candidate: bool = False,
         requested_at: str | None = None,
         consumed_at: str | None = None,
         result: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+        if not isinstance(clear_builder_binding, bool) or not isinstance(clear_candidate, bool):
+            raise ValueError("clear binding flags 必須為布林值")
         previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
         staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
@@ -4408,6 +4484,8 @@ class JobRegistry:
                 (state is not None and state != slice_row["state"])
                 or (gate_state is not None and gate_state != slice_row["gate_state"])
                 or (candidate is not None and candidate != slice_row["candidate"])
+                or (clear_builder_binding and slice_row["builder_job_id"] is not None)
+                or (clear_candidate and slice_row["candidate"] is not None)
             )
             if will_bump_binding:
                 self._next_binding_revision(int(slice_row["binding_revision"]))
@@ -4436,6 +4514,10 @@ class JobRegistry:
             )
         if candidate is not None:
             slice_row["candidate"] = candidate
+        if clear_builder_binding:
+            slice_row["builder_job_id"] = None
+        if clear_candidate:
+            slice_row["candidate"] = None
         self._maybe_bump_binding_revision(slice_row, previous_binding=previous_binding)
         action_entry: dict[str, Any] = {
             "action": action,

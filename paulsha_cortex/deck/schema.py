@@ -19,6 +19,7 @@ EMITTED_FRONTMATTER_FIELDS = (
     "executor",
     "model_id",
     "repo",
+    "work_id",
     "parse_error",
 )
 CARD_KINDS = ("skill",)

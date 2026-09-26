@@ -6284,101 +6284,21 @@ def _recover_pre_candidate_action(
     issue = args.get("issue")
     if issue is not None and issue not in authority.mapped_issues:
         raise RuntimeError("recover-pre-candidate issue is not authorized by WorkAuthority")
+    from . import manager
 
-    matching_slices = [
-        s for s in workflow_registry.list_slices()
-        if s.get("slice_id") == authority.work_id or s.get("spec", {}).get("path", "").endswith(f"{authority.work_id}.md")
-    ]
-    if not matching_slices:
-        matching_slices = workflow_registry.list_slices()
-
-    target_slice = None
-    for s in matching_slices:
-        cand = s.get("candidate")
-        if not (isinstance(cand, str) and verification.SAFE_SHA_RE.fullmatch(cand) is not None):
-            target_slice = s
-            break
-
-    if target_slice is None:
-        raise RuntimeError("recover-pre-candidate requires a slice with null candidate")
-
-    slice_id = target_slice["slice_id"]
-    if target_slice.get("state") not in {"needs_human", "failed", "pending"}:
-        raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")
-
-    if target_slice.get("state") == "pending" and target_slice.get("builder_job_id") is None:
-        return {
-            "action": "recover-pre-candidate",
-            "reason": "already-recovered",
-            "slice_id": slice_id,
-            "slice_state": "pending",
-        }
-
-    builder_job_id = target_slice.get("builder_job_id")
-    wt_path = None
-    if isinstance(builder_job_id, str):
-        try:
-            b_job = workflow_registry.get_job(builder_job_id)
-            wt_path = b_job.get("worktree")
-        except Exception:
-            pass
-    if not wt_path:
-        wt_path = target_slice.get("worktree")
-
-    # #478：舊碼用裸 `subprocess.run(["git", "worktree", ...])`（無 `-C <repo>`，
-    # 實際跑在 manager 進程的 cwd 上）、`check=False` 吞錯，且只在目錄還在時
-    # 觸發——registry 殘留與「目錄已消失但 registry 還在」都清不掉。統一改走
-    # `worktree_reclaim`，後置條件不成立即 fail closed。
-    # #645：記錄沒有 worktree 時的反推走共用 helper（與 `manager.apply_slice_action`
-    # 同一份），新舊兩種目錄形狀都試；pool root 只在真的要反推時才解析（#612）。
-    recorded = wt_path if isinstance(wt_path, (str, Path)) and wt_path else None
-    pool_root = None
-    if recorded is None:
-        try:
-            pool_root = paths.worktree_root()
-        except Exception:
-            pool_root = None
-    branch_hint = target_slice.get("branch")
-    reclaim = worktree_reclaim.reclaim_recorded_or_derived(
-        recorded_path=recorded,
-        pool_root=pool_root,
-        job_id=slice_id,
-        branch=branch_hint if isinstance(branch_hint, str) else None,
-        preserve_root=state_path.resolve().parent / "evidence",
+    target_slice = manager._resolve_work_owner_slice(
+        workflow_registry,
+        repo=authority.repo,
+        work_id=authority.work_id,
     )
-    if reclaim is not None and not reclaim.ok:
-        raise RuntimeError(
-            "recover-pre-candidate worktree reclaim failed: "
-            f"{reclaim.detail or reclaim.status} ({reclaim.path})"
-        )
-
     actor = args.get("actor") or requested_by
-    workflow_registry.record_action(
-        slice_id,
-        action="operator-recover-pre-candidate",
+    return manager._recover_pre_candidate_core(
+        workflow_registry,
+        slice_id=target_slice["slice_id"],
         actor=actor,
-        state="pending",
-        gate_state="pending",
-        result="ok",
+        handoff_dir=manager.autonomy.DEFAULT_HANDOFF_DIR,
+        expected_owner={"repo": authority.repo, "work_id": authority.work_id},
     )
-    workflow_registry.update_slice(
-        slice_id,
-        state="pending",
-        gate_state="pending",
-        builder_job_id=None,
-        candidate=None,
-    )
-    updated = workflow_registry.get_slice(slice_id)
-    payload: dict[str, Any] = {
-        "action": "recover-pre-candidate",
-        "reason": "pre-candidate-slice-reset",
-        "slice_id": slice_id,
-        "slice_state": updated.get("state"),
-        "gate_state": updated.get("gate_state"),
-    }
-    if reclaim is not None:
-        payload["worktree_reclaim"] = reclaim.to_dict()
-    return payload
 
 
 def _find_repair_adoption_record(

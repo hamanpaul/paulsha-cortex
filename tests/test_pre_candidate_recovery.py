@@ -94,6 +94,8 @@ def test_recover_pre_candidate_removes_worktree_and_resets_slice(
         branch="feature/slice-3a",
         pane="",
         worktree=str(wt_dir),
+        owner_identity={"repo": "hamanpaul/example", "work_id": "slice-3a", "slice_id": "slice-3a"},
+        attempt_id="attempt-slice-3a",
     )
     reg.update_headless_result(builder_job["job_id"], status="failed", exit_code=1)
 
@@ -107,12 +109,22 @@ def test_recover_pre_candidate_removes_worktree_and_resets_slice(
         builder_job_id=builder_job["job_id"],
         reviewer_job_id=None,
         candidate=None,
+        owner_identity={"repo": "hamanpaul/example", "work_id": "slice-3a", "slice_id": "slice-3a"},
+        attempt_id="attempt-slice-3a",
     )
     reg.update_slice("slice-3a", state="needs_human", gate_state="needs_human")
 
     pane_sender = MagicMock()
     wt_creator = MagicMock()
     dispatcher = Dispatcher(reg, pane_sender=pane_sender, worktree_creator=wt_creator)
+    monkeypatch.setattr(
+        manager.job_workspace,
+        "read_marker",
+        lambda _path: {
+            "owner_identity": {"repo": "hamanpaul/example", "work_id": "slice-3a", "slice_id": "slice-3a"},
+            "attempt_id": "attempt-slice-3a",
+        },
+    )
 
     res = manager.apply_slice_action(
         dispatcher=dispatcher,
@@ -145,12 +157,16 @@ def test_recover_pre_candidate_supersedes_stale_handoff_manifest(tmp_path: Path,
     monkeypatch.setenv("PSC_REPO_ROOT", str(_seed_repo(tmp_path)))
     state_path = tmp_path / "jobs.json"
     reg = JobRegistry(state_path=state_path)
+    owner_identity = {"repo": "hamanpaul/example", "work_id": "slice-super", "slice_id": "slice-super"}
+    attempt_id = "attempt-slice-super"
     builder_job = reg.create_job(
         task="slice-super",
         persona="builder",
         branch="feature/slice-super",
         pane="",
         worktree=str(tmp_path / "wt" / "feature-slice-super"),
+        owner_identity=owner_identity,
+        attempt_id=attempt_id,
     )
     reg.update_headless_result(builder_job["job_id"], status="failed", exit_code=1)
     reg.create_slice(
@@ -163,6 +179,8 @@ def test_recover_pre_candidate_supersedes_stale_handoff_manifest(tmp_path: Path,
         builder_job_id=builder_job["job_id"],
         reviewer_job_id=None,
         candidate=None,
+        owner_identity=owner_identity,
+        attempt_id=attempt_id,
     )
     reg.update_slice("slice-super", state="needs_human", gate_state="needs_human")
 
