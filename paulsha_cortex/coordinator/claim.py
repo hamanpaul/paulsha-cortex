@@ -111,6 +111,22 @@ class AuthorityValidationError(ValueError):
         super().__init__(f"{message} ({', '.join(details)})")
 
 
+class WorkAuthorityConfirmedAbsent(ValueError):
+    """(repo, work_id) 在健康、非限流、非 ambiguous 的 snapshot 中查無任何
+    authority 來源時才拋出。
+
+    這是 ``retire-delivered`` registry-only 退休路徑唯一可信任「視為明確
+    缺席」的例外**型別**（#1093 對抗審查 MAJOR）：判斷方式必須是結構化的
+    型別檢查，不能靠比對錯誤訊息字串——重複 ``(repo, work_id)``、跨 work
+    的 issue owner 衝突（見 ``_load_work_authorities_with_diagnostics``）、
+    以及 snapshot 對應 provider degraded／限流（見
+    ``load_work_authority`` 尾端的 provider 健康檢查）都會讓查詢「找不到
+    唯一解」，但那些是歧義或不健康，不是確定缺席；它們一律維持一般
+    ``ValueError``／``AuthorityValidationError``（非本類別），讓呼叫端
+    （``work_actions._is_work_authority_absence``）繼續 fail-closed。
+    """
+
+
 def semantic_source_revision(
     *,
     repo: str,
@@ -1161,7 +1177,50 @@ def load_work_authority(
         raise ValueError(
             f"confirmed work authority missing or ambiguous (monitor refresh failed: {payload['last_refresh_error']})"
         )
-    raise ValueError("confirmed work authority missing or ambiguous")
+    # #1093 對抗審查：目標 (repo, work_id) 在 work_items 裡完全沒有任何一列
+    # ——但這不代表可以放行 registry-only 退休。canonical schema 下，一個
+    # repo 完全沒有列在 work_items，provider 健康度不會被上面逐列解析碰到
+    # （_authority_from_canonical_row 只在有列引用該 provider 時才檢查），
+    # 所以這裡補上針對「目標 repo 的 canonical provider」的最後一道健康檢查：
+    # provider 存在但 degraded／限流時，缺席「找不到」可能只是被中斷的掃描
+    # 掩蓋，必須 fail-closed（AuthorityValidationError，非本函式的確定缺席
+    # 型別）；provider 根本不存在（workspace 已從設定移除，或這個 work item
+    # 從不需要 GitHub 權威）才算確定缺席。
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    if isinstance(providers, dict):
+        canonical_provider_id = f"{GITHUB_PROVIDER_ID}:{repo}"
+        canonical = providers.get(canonical_provider_id)
+        if isinstance(canonical, dict):
+            revision = canonical.get("revision")
+            last_success_at = canonical.get("last_success_at")
+            healthy = (
+                canonical.get("status") == "ok"
+                and isinstance(revision, str)
+                and bool(revision)
+                and isinstance(last_success_at, str)
+                and bool(last_success_at)
+            )
+            if not healthy:
+                diagnostics = canonical.get("diagnostics")
+                rate_limited = isinstance(diagnostics, list) and any(
+                    isinstance(entry, str) and is_rate_limit_signal(entry)
+                    for entry in diagnostics
+                )
+                raise AuthorityValidationError(
+                    "durable GitHub provider authority rate-limited"
+                    if rate_limited
+                    else "durable GitHub provider authority invalid",
+                    reason_code=(
+                        REASON_PROVIDER_RATE_LIMITED_CANONICAL
+                        if rate_limited
+                        else REASON_PROVIDER_INVALID_CANONICAL
+                    ),
+                    repo=_diagnostic_label(repo),
+                    work_id=_diagnostic_label(work_id),
+                    provider_id=canonical_provider_id,
+                    field="status",
+                )
+    raise WorkAuthorityConfirmedAbsent("confirmed work authority missing or ambiguous")
 
 
 @dataclass(frozen=True)

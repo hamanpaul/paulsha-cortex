@@ -1455,6 +1455,91 @@ def test_retire_delivered_without_authority_keeps_fail_closed_admission(
     assert not (tmp_path / failure / "engineering-outcomes").exists()
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "duplicate-identity",
+        "issue-owner-conflict",
+        "provider-degraded",
+        "provider-rate-limited",
+    ],
+)
+def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
+    tmp_path: Path, failure: str
+) -> None:
+    """Registry-only retirement requires healthy, unambiguous snapshot absence."""
+    snapshot = _snapshot(tmp_path / failure / "snapshot.json")
+    state = tmp_path / failure / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / failure / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#110",))
+
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    if failure == "duplicate-identity":
+        payload["work_items"].append(json.loads(json.dumps(payload["work_items"][0])))
+    elif failure == "issue-owner-conflict":
+        other_owner = json.loads(json.dumps(payload["work_items"][0]))
+        other_owner["work_id"] = "other-work"
+        payload["work_items"].append(other_owner)
+    else:
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {
+                "github:acme/demo": {
+                    "status": "degraded",
+                    "revision": "gh-rev-lkg",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                    "diagnostics": [
+                        "github rate limit exceeded"
+                        if failure == "provider-rate-limited"
+                        else "github API unavailable"
+                    ],
+                }
+            },
+            "work_items": [],
+        }
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises((RuntimeError, ValueError)):
+        work_actions.execute_work_action(
+            args={
+                "action": "retire-delivered",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "operator",
+                "expected_run_id": run_id,
+                "reason": "Snapshot ambiguity or health failure must block registry-only retirement.",
+            },
+            requested_by="operator",
+            runner=_pr_lifecycle_runner(
+                {110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+            ),
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+    assert work_actions.work_authority_projection_state(
+        repo="acme/demo", work_id="demo"
+    ) == "unavailable"
+    status = manager.workflow_status_entry(
+        registry,
+        registry.get_workflow_run(run_id),
+        work_authority_state="unavailable",
+    )
+    assert "retire-delivered" not in status["next_actions"]
+    assert registry.get_workflow_run(run_id).status == "ongoing"
+    assert not (tmp_path / failure / "evidence" / "work-retire-delivered").exists()
+
+
 def test_abandon_does_not_bypass_missing_work_authority(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
     state = tmp_path / "runs.json"

@@ -42,6 +42,7 @@ from .claim import (
     planning_declared_openspec_changes as claim_planning_declared_openspec_changes,
     decide_auto_claim,
     decide_manual_start,
+    WorkAuthorityConfirmedAbsent,
     load_work_authorities,
     load_work_authorities_with_snapshot_items,
     load_work_authority,
@@ -6319,10 +6320,15 @@ def work_authority_projection_state(*, repo: str, work_id: str) -> str:
 
 
 def _is_work_authority_absence(error: ValueError) -> bool:
-    return (
-        type(error) is ValueError
-        and str(error) == "confirmed work authority missing or ambiguous"
-    )
+    # #1093 對抗審查 MAJOR：舊實作比對錯誤訊息字串，重複 (repo, work_id)、
+    # 跨 work 的 issue owner 衝突、snapshot degraded／限流都會讓
+    # ``load_work_authority`` 拋出**同一段文字**的 ``ValueError``，導致
+    # authority 歧義／不健康被誤判成明確缺席、放寬 registry-only 退休。改用
+    # ``claim.WorkAuthorityConfirmedAbsent`` 的結構化型別檢查：只有 claim.py
+    # 確認 snapshot 健康、非限流、且真的沒有任何一列 (repo, work_id) 時才會
+    # 拋出這個型別；其餘情境（含上述三種）維持一般 ``ValueError`` 或
+    # ``AuthorityValidationError``，一律落回 fail-closed。
+    return isinstance(error, WorkAuthorityConfirmedAbsent)
 
 
 def recovery_actions_without_work_authority(
