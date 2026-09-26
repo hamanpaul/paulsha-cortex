@@ -250,3 +250,18 @@ def test_verify_missing_change_returns_cli_error(tmp_path, capsys, monkeypatch):
     rc = deck_cli.main(["verify", "openspec-archive", "--task-slug", "demo-task"])
     assert rc == 1
     assert "deck:" in capsys.readouterr().err
+
+
+def test_list_includes_band_triggered_cards_of_packaged_combo(capsys):
+    """feature-oneshot 的 band_triggered 加掛卡（adversarial-review）也要列在該 combo 下。"""
+    assert deck_cli.main(["list"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("feature-oneshot\t"))
+    end = next(
+        (i for i in range(start + 1, len(lines)) if not lines[i].startswith("  ")),
+        len(lines),
+    )
+    region = lines[start + 1 : end]
+    assert any(
+        line.startswith("  card: adversarial-review\t") and "(band≥" in line for line in region
+    )
