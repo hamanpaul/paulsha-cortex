@@ -85,28 +85,35 @@ def _merged_pull(number: int, merge_revision: str, head_revision: str) -> dict:
     }
 
 
-def _tree(entries) -> dict:
-    return {
-        "truncated": False,
-        "tree": [
-            {"path": path, "type": "blob", "sha": sha} for path, sha in entries
-        ],
-    }
-
-
 TODO_TEXT = "---\nwork_item: work\n---\n- [x] one\n- [x] two\n"
 TODO_PATH = "docs/superpowers/workstreams/work/todo.md"
+
+
+class RecordingGitRunner:
+    def __init__(self, *, corrupt_tree_blob: str | None = None) -> None:
+        self.calls: list[tuple[str, ...]] = []
+        self.corrupt_tree_blob = corrupt_tree_blob
+
+    def run(self, argv, *, timeout, stdin=None):
+        argv = tuple(argv)
+        self.calls.append(argv)
+        result = subprocess.run(
+            list(argv),
+            capture_output=True,
+            input=b"" if stdin is None else stdin,
+            timeout=timeout,
+        )
+        if self.corrupt_tree_blob is not None and "ls-tree" in argv:
+            result.stdout = result.stdout.replace(
+                self.corrupt_tree_blob.encode("ascii"), b"0" * 40
+            )
+        return result
 
 
 def test_remote_todo_content_comes_from_local_git_objects(git_origin):
     repo = git_origin()
     repo.commit({TODO_PATH: TODO_TEXT}, message="add todo")
-    runner = RecordingRunner(
-        [
-            _graph(default_revision=repo.head()),
-            _tree([(TODO_PATH, repo.blob_sha(TODO_PATH))]),
-        ]
-    )
+    runner = RecordingRunner([_graph(default_revision=repo.head())])
 
     result = GitHubTerminalProvider(
         repo.repo, runner=runner, repo_root=repo.checkout
@@ -126,16 +133,49 @@ def test_remote_todo_content_comes_from_local_git_objects(git_origin):
     assert result.observations["remote_reads"]["blob_reads"] == 1
 
 
+def test_default_branch_tree_comes_from_canonical_checkout_ls_tree(git_origin):
+    repo = git_origin()
+    archived_tasks = "openspec/changes/archive/2026-09-01-done/tasks.md"
+    repo.commit(
+        {
+            TODO_PATH: TODO_TEXT,
+            "openspec/changes/active/spec.md": "active\n",
+            archived_tasks: "- [x] archived\n",
+        },
+        message="tree entries",
+    )
+    runner = RecordingRunner([_graph(default_revision=repo.head())])
+    git_runner = RecordingGitRunner()
+
+    result = GitHubTerminalProvider(
+        repo.repo,
+        runner=runner,
+        repo_root=repo.checkout,
+        git_runner=git_runner,
+    ).scan()
+
+    assert result.status == "ok"
+    assert result.observations["remote_openspec"] == {
+        "active": ["active"],
+        "archived": ["done"],
+    }
+    assert len(runner.calls) == 1
+    assert runner.calls[0][:3] == ("gh", "api", "graphql")
+    ls_tree = next(call for call in git_runner.calls if "ls-tree" in call)
+    assert ls_tree[ls_tree.index("-C") + 1] == str(repo.checkout)
+    assert ls_tree[ls_tree.index("ls-tree") + 1 :] == (
+        "-r",
+        "-t",
+        "-z",
+        repo.head(),
+    )
+
+
 def test_remote_archived_openspec_tasks_are_read_from_local_git(git_origin):
     repo = git_origin()
     tasks = "openspec/changes/archive/2026-08-15-canary/tasks.md"
     repo.commit({tasks: "- [x] task one\n- [x] task two\n"}, message="archive")
-    runner = RecordingRunner(
-        [
-            _graph(default_revision=repo.head()),
-            _tree([(tasks, repo.blob_sha(tasks))]),
-        ]
-    )
+    runner = RecordingRunner([_graph(default_revision=repo.head())])
 
     result = GitHubTerminalProvider(
         repo.repo, runner=runner, repo_root=repo.checkout
@@ -159,13 +199,7 @@ def test_merge_ancestry_uses_local_merge_base_not_compare(git_origin):
     head = repo.branch_commit("feature/9-work", {"src.py": "x = 1\n"})
     merge = repo.merge("feature/9-work")
     runner = RecordingRunner(
-        [
-            _graph(
-                default_revision=repo.head(),
-                pulls=[_merged_pull(9, merge, head)],
-            ),
-            _tree([]),
-        ]
+        [_graph(default_revision=repo.head(), pulls=[_merged_pull(9, merge, head)])]
     )
 
     result = GitHubTerminalProvider(
@@ -198,13 +232,7 @@ def test_merge_commit_off_default_branch_is_not_terminal(git_origin):
     repo.git("checkout", "--quiet", "main")
     repo.commit({"README.md": "# moved on\n"}, message="advance main")
     runner = RecordingRunner(
-        [
-            _graph(
-                default_revision=repo.head("main"),
-                pulls=[_merged_pull(9, merge, head)],
-            ),
-            _tree([]),
-        ]
+        [_graph(default_revision=repo.head("main"), pulls=[_merged_pull(9, merge, head)])]
     )
 
     result = GitHubTerminalProvider(
@@ -220,8 +248,8 @@ def test_scan_round_issues_zero_rest_contents_and_compare_calls(git_origin):
     """量化驗收：一輪掃描的 REST ``contents`` / ``compare`` 呼叫數 = 0。
 
     改動前這一輪會是 12 次 ``contents`` ＋ 3 次 ``compare`` = 15 次 REST（實測
-    生產 workspace 一輪是 91 次 contents）；改動後同一輪的 REST 只剩 graphql
-    與一次 git tree。
+    生產 workspace 一輪是 91 次 contents）；改動後同一輪的 REST 只剩 graphql，
+    tree 由 canonical checkout 的本機 git 讀取。
     """
 
     repo = git_origin()
@@ -247,8 +275,7 @@ def test_scan_round_issues_zero_rest_contents_and_compare_calls(git_origin):
                     _merged_pull(number, merge, head)
                     for number, merge, head in merges
                 ],
-            ),
-            _tree([(path, repo.blob_sha(path)) for path in todo_paths]),
+            )
         ]
     )
 
@@ -263,10 +290,10 @@ def test_scan_round_issues_zero_rest_contents_and_compare_calls(git_origin):
     )
     assert runner.rest_contents_calls == 0
     assert runner.rest_compare_calls == 0
-    # 一輪只剩 graphql（PR 分頁）＋ 1 次 git tree。
-    assert len(runner.calls) == 2
+    # GitHub 僅供 PR GraphQL；完整 tree 由 canonical checkout 的 git 讀取。
+    assert len(runner.calls) == 1
     assert runner.calls[0][:3] == ("gh", "api", "graphql")
-    assert "git/trees" in runner.calls[1][-1]
+    assert all("git/trees" not in arg for call in runner.calls for arg in call)
 
 
 def test_stale_checkout_fetches_missing_revision_before_reading(git_origin):
@@ -276,12 +303,7 @@ def test_stale_checkout_fetches_missing_revision_before_reading(git_origin):
     repo.commit({TODO_PATH: TODO_TEXT}, message="add todo")
     repo.publish()
     empty = repo.detach()
-    runner = RecordingRunner(
-        [
-            _graph(default_revision=repo.head()),
-            _tree([(TODO_PATH, repo.blob_sha(TODO_PATH))]),
-        ]
-    )
+    runner = RecordingRunner([_graph(default_revision=repo.head())])
 
     result = GitHubTerminalProvider(repo.repo, runner=runner, repo_root=empty).scan()
 
@@ -315,13 +337,7 @@ def test_pull_head_refspec_is_optional_when_origin_lacks_it(git_origin):
     repo.publish()
     empty = repo.detach()
     runner = RecordingRunner(
-        [
-            _graph(
-                default_revision=repo.head(),
-                pulls=[_merged_pull(9, merge, head)],
-            ),
-            _tree([]),
-        ]
+        [_graph(default_revision=repo.head(), pulls=[_merged_pull(9, merge, head)])]
     )
 
     result = GitHubTerminalProvider(repo.repo, runner=runner, repo_root=empty).scan()
@@ -340,13 +356,7 @@ def test_pull_head_refspec_is_fetched_when_merge_commit_is_missing(git_origin):
     repo.publish_pull_head(9, head)
     empty = repo.detach()
     runner = RecordingRunner(
-        [
-            _graph(
-                default_revision=repo.head(),
-                pulls=[_merged_pull(9, merge, head)],
-            ),
-            _tree([]),
-        ]
+        [_graph(default_revision=repo.head(), pulls=[_merged_pull(9, merge, head)])]
     )
 
     result = GitHubTerminalProvider(repo.repo, runner=runner, repo_root=empty).scan()
@@ -366,16 +376,11 @@ def test_unreadable_remote_blob_fails_closed_instead_of_absent(git_origin):
     repo = git_origin()
     repo.commit({TODO_PATH: TODO_TEXT}, message="add todo")
     repo.publish()
-    runner = RecordingRunner(
-        [
-            _graph(default_revision=repo.head()),
-            # tree 指向一個 origin 上根本不存在的 blob：fetch 成功，物件仍不在。
-            _tree([(TODO_PATH, "0" * 40)]),
-        ]
-    )
+    runner = RecordingRunner([_graph(default_revision=repo.head())])
+    git_runner = RecordingGitRunner(corrupt_tree_blob=repo.blob_sha(TODO_PATH))
 
     result = GitHubTerminalProvider(
-        repo.repo, runner=runner, repo_root=repo.checkout
+        repo.repo, runner=runner, repo_root=repo.checkout, git_runner=git_runner
     ).scan()
 
     assert result.status == "degraded"
@@ -389,12 +394,7 @@ def test_unreadable_remote_blob_fails_closed_instead_of_absent(git_origin):
 def test_missing_local_checkout_fails_closed(git_origin):
     repo = git_origin()
     repo.commit({TODO_PATH: TODO_TEXT}, message="add todo")
-    runner = RecordingRunner(
-        [
-            _graph(default_revision=repo.head()),
-            _tree([(TODO_PATH, repo.blob_sha(TODO_PATH))]),
-        ]
-    )
+    runner = RecordingRunner([_graph(default_revision=repo.head())])
 
     result = GitHubTerminalProvider(repo.repo, runner=runner).scan()
 
@@ -408,12 +408,7 @@ def test_missing_local_checkout_fails_closed(git_origin):
 def test_checkout_tracking_another_repo_fails_closed(git_origin):
     repo = git_origin()
     repo.commit({TODO_PATH: TODO_TEXT}, message="add todo")
-    runner = RecordingRunner(
-        [
-            _graph(default_revision=repo.head()),
-            _tree([(TODO_PATH, repo.blob_sha(TODO_PATH))]),
-        ]
-    )
+    runner = RecordingRunner([_graph(default_revision=repo.head())])
 
     result = GitHubTerminalProvider(
         "other/impostor", runner=runner, repo_root=repo.checkout
@@ -446,12 +441,7 @@ def test_fetch_failure_is_degraded_and_previous_mirror_is_retained(git_origin):
         check=True,
         capture_output=True,
     )
-    runner = RecordingRunner(
-        [
-            _graph(default_revision=repo.head()),
-            _tree([(TODO_PATH, repo.blob_sha(TODO_PATH))]),
-        ]
-    )
+    runner = RecordingRunner([_graph(default_revision=repo.head())])
 
     result = GitHubTerminalProvider(repo.repo, runner=runner, repo_root=empty).scan()
 
@@ -461,12 +451,7 @@ def test_fetch_failure_is_degraded_and_previous_mirror_is_retained(git_origin):
 
     previous = GitHubTerminalProvider(
         repo.repo,
-        runner=RecordingRunner(
-            [
-                _graph(default_revision=repo.head()),
-                _tree([(TODO_PATH, repo.blob_sha(TODO_PATH))]),
-            ]
-        ),
+        runner=RecordingRunner([_graph(default_revision=repo.head())]),
         repo_root=repo.checkout,
     ).scan()
     retained = _retain_last_good(previous, result)
@@ -514,13 +499,7 @@ def test_shallow_checkout_cannot_decide_ancestry(git_origin):
         capture_output=True,
     )
     runner = RecordingRunner(
-        [
-            _graph(
-                default_revision=repo.head("main"),
-                pulls=[_merged_pull(9, merge, head)],
-            ),
-            _tree([]),
-        ]
+        [_graph(default_revision=repo.head("main"), pulls=[_merged_pull(9, merge, head)])]
     )
 
     result = GitHubTerminalProvider(
@@ -529,6 +508,7 @@ def test_shallow_checkout_cannot_decide_ancestry(git_origin):
 
     assert result.status == "degraded"
     assert "shallow" in result.diagnostics[0]
+    assert "git fetch --unshallow" in result.diagnostics[0]
 
 
 def test_mirror_rejects_unsafe_default_branch_names(git_origin):

@@ -922,11 +922,16 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive(git_orig
     assert not any("/compare/" in argv[-1] for argv in runner.calls)
 
 
-def test_github_terminal_provider_aggregates_pull_requests_across_pages():
+def test_github_terminal_provider_aggregates_pull_requests_across_pages(git_origin):
+    repo = git_origin()
+    repo.commit({"README.md": "default\n"}, message="default")
     first_page = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
                     "nodes": [
@@ -977,11 +982,12 @@ def test_github_terminal_provider_aggregates_pull_requests_across_pages():
         [
             _completed(first_page),
             _completed(second_page),
-            _completed({"truncated": False, "tree": []}),
         ]
     )
 
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    result = GitHubTerminalProvider(
+        "example/acme", runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert result.status == "ok"
     assert result.observations["closing_links"] == {
@@ -1006,7 +1012,7 @@ def test_github_terminal_provider_aggregates_pull_requests_across_pages():
         },
     ]
     assert result.observations["default_branch"] == "main"
-    assert result.observations["default_revision"] == "d" * 40
+    assert result.observations["default_revision"] == repo.head()
     assert runner.calls[0] == (
         "gh",
         "api",
@@ -1069,11 +1075,16 @@ def test_github_terminal_provider_pull_request_page_limit_is_explicit_failure():
     assert all(call[:3] == ("gh", "api", "graphql") for call in runner.calls)
 
 
-def test_github_terminal_squash_merge_is_not_a_merge_commit():
+def test_github_terminal_squash_merge_is_not_a_merge_commit(git_origin):
+    repo = git_origin()
+    repo.commit({"README.md": "default\n"}, message="default")
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": False},
                     "nodes": [
@@ -1096,9 +1107,11 @@ def test_github_terminal_squash_merge_is_not_a_merge_commit():
             }
         }
     }
-    runner = SequenceRunner([_completed(graph), _completed({"truncated": False, "tree": []})])
+    runner = SequenceRunner([_completed(graph)])
 
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    result = GitHubTerminalProvider(
+        "example/acme", runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert result.status == "ok"
     assert not result.observations["remote_prs"][0]["merged_with_merge_commit"]
@@ -1140,9 +1153,7 @@ def test_github_terminal_merge_not_on_default_branch_is_not_terminal(git_origin)
             }
         }
     }
-    runner = SequenceRunner(
-        [_completed(graph), _completed({"truncated": False, "tree": []})]
-    )
+    runner = SequenceRunner([_completed(graph)])
 
     result = GitHubTerminalProvider(
         repo.repo, runner=runner, repo_root=repo.checkout
@@ -1206,8 +1217,8 @@ def test_github_terminal_resolves_ancestry_only_for_workflow_linked_prs(git_orig
     ).scan()
 
     assert result.status == "ok"
-    # D2：REST 只剩 graphql ＋ tree；ancestry 完全在本機解，且只解 workflow-linked 的那一個。
-    assert len(runner.calls) == 2
+    # GraphQL 提供 PR 中繼資料；tree 與 workflow-linked ancestry 都由本機 git 解。
+    assert len(runner.calls) == 1
     assert result.observations["remote_reads"]["ancestry_checks"] == 1
     by_number = {
         int(row["source_id"].rsplit("#", 1)[1]): row
@@ -1217,29 +1228,43 @@ def test_github_terminal_resolves_ancestry_only_for_workflow_linked_prs(git_orig
     assert by_number[9]["merged_with_merge_commit"] is True
 
 
-def test_github_terminal_truncated_tree_is_degraded():
+def test_github_terminal_tree_inventory_ignores_truncated_rest_endpoint(git_origin):
+    repo = git_origin()
+    repo.commit(
+        {"openspec/changes/active/spec.md": "# active\n"}, message="tree"
+    )
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             }
         }
     }
-    runner = SequenceRunner(
-        [_completed(graph), _completed({"truncated": True, "tree": []})]
-    )
+    runner = SequenceRunner([_completed(graph)])
 
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    result = GitHubTerminalProvider(
+        repo.repo, runner=runner, repo_root=repo.checkout
+    ).scan()
 
-    assert result.status == "degraded"
+    assert result.status == "ok"
+    assert result.observations["remote_openspec"]["active"] == ["active"]
+    assert len(runner.calls) == 1
 
 
-def test_github_terminal_retries_only_transient_gateway_failures():
+def test_github_terminal_retries_only_transient_gateway_failures(git_origin):
+    repo = git_origin()
+    repo.commit({"README.md": "default\n"}, message="default")
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             }
         }
@@ -1250,13 +1275,14 @@ def test_github_terminal_retries_only_transient_gateway_failures():
         stderr="gh: temporarily unavailable (HTTP 503)",
     )
     runner = SequenceRunner(
-        [transient, _completed(graph), _completed({"truncated": False, "tree": []})]
+        [transient, _completed(graph)]
     )
     sleeps = []
 
     result = GitHubTerminalProvider(
         "example/acme",
         runner=runner,
+        repo_root=repo.checkout,
         retry_delays=(0.25,),
         sleeper=sleeps.append,
     ).scan()
@@ -1317,17 +1343,7 @@ def test_remote_default_branch_todo_blob_is_only_completion_authority(
             }
         }
     }
-    tree = {
-        "truncated": False,
-        "tree": [
-            {
-                "path": todo_path,
-                "type": "blob",
-                "sha": repo.blob_sha(todo_path),
-            }
-        ],
-    }
-    runner = SequenceRunner([_completed(graph), _completed(tree)])
+    runner = SequenceRunner([_completed(graph)])
 
     remote = GitHubTerminalProvider(
         repo.repo, runner=runner, repo_root=repo.checkout
@@ -1342,7 +1358,7 @@ def test_remote_default_branch_todo_blob_is_only_completion_authority(
             "complete": True,
         }
     ]
-    assert len(runner.calls) == 2
+    assert len(runner.calls) == 1
     assert not any("/contents/" in argv[-1] for argv in runner.calls)
 
 
@@ -1361,17 +1377,7 @@ def test_remote_archived_openspec_tasks_are_todo_completion_evidence(git_origin)
             }
         }
     }
-    tree = {
-        "truncated": False,
-        "tree": [
-            {
-                "path": task_path,
-                "type": "blob",
-                "sha": repo.blob_sha(task_path),
-            }
-        ],
-    }
-    runner = SequenceRunner([_completed(graph), _completed(tree)])
+    runner = SequenceRunner([_completed(graph)])
 
     result = GitHubTerminalProvider(
         repo.repo, runner=runner, repo_root=repo.checkout
@@ -1414,14 +1420,27 @@ def test_remote_todo_blob_absent_from_git_is_degraded(git_origin):
             }
         }
     }
-    tree = {
-        "truncated": False,
-        "tree": [{"path": path, "type": "blob", "sha": "e" * 40}],
-    }
-    runner = SequenceRunner([_completed(graph), _completed(tree)])
+    runner = SequenceRunner([_completed(graph)])
+
+    class CorruptTreeRunner:
+        def run(self, argv, *, timeout, stdin=None):
+            result = subprocess.run(
+                list(argv),
+                capture_output=True,
+                input=b"" if stdin is None else stdin,
+                timeout=timeout,
+            )
+            if "ls-tree" in argv:
+                result.stdout = result.stdout.replace(
+                    repo.blob_sha(path).encode("ascii"), b"e" * 40
+                )
+            return result
 
     result = GitHubTerminalProvider(
-        repo.repo, runner=runner, repo_root=repo.checkout
+        repo.repo,
+        runner=runner,
+        repo_root=repo.checkout,
+        git_runner=CorruptTreeRunner(),
     ).scan()
 
     assert result.status == "degraded"
@@ -1429,11 +1448,16 @@ def test_remote_todo_blob_absent_from_git_is_degraded(git_origin):
     assert "git mirror" in result.diagnostics[0]
 
 
-def test_pr_body_work_item_is_not_confirmed_authority():
+def test_pr_body_work_item_is_not_confirmed_authority(git_origin):
+    repo = git_origin()
+    repo.commit({"README.md": "default\n"}, message="default")
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": False},
                     "nodes": [
@@ -1454,11 +1478,11 @@ def test_pr_body_work_item_is_not_confirmed_authority():
             }
         }
     }
-    runner = SequenceRunner(
-        [_completed(graph), _completed({"truncated": False, "tree": []})]
-    )
+    runner = SequenceRunner([_completed(graph)])
 
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    result = GitHubTerminalProvider(
+        "example/acme", runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert result.observations["closing_links"] == {
         "github_pr:example/acme#9": "github_issue:example/acme#7"

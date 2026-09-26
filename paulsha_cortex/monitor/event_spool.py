@@ -36,6 +36,9 @@ spool；monitor 每輪把 spool 掃一遍，對**被點名的物件**做一次 t
 ## #498 擴充點
 
 ``event_type`` 是封閉列舉的**擴充位**：本次只消費 ``github_object``。
+WorkModelRefresher 每輪只掃一次共享 spool，再由各 repo provider 篩選自己的事件；
+隔離檔自隔離時起保留 30 天，之後在 spool scan 時清理。
+
 ``steering``／``job``（#498）已在 :data:`RESERVED_EVENT_TYPES` 佔位，本模組掃到時
 **原地保留、只記 log 與計數**；``steering`` 目前不是 headless job 的即時控制通道，
 絕不刪除——那些事件屬於未來的另一個 consumer，這裡刪掉就是替它們決定生命週期。
@@ -79,6 +82,7 @@ GITHUB_OBJECT_KINDS = frozenset({"github_issue", "github_pr"})
 #: 沒有任何 consumer 認領的事件超過這個歲數就隔離——configured repo 清單變動、
 #: 或 producer 打錯 repo 名，都會留下永遠等不到 consumer 的孤兒事件。
 DEFAULT_EVENT_TTL_SECONDS = 7 * 86_400.0
+QUARANTINE_TTL_SECONDS = 30 * 86_400.0
 
 QUARANTINE_DIRNAME = "quarantine"
 
@@ -207,7 +211,7 @@ def github_object_hint(event: SpoolEvent, path: Path) -> GitHubObjectHint:
 
     payload = event.payload
     repo = payload.get("repo")
-    if not isinstance(repo, str) or repo.count("/") != 1 or not all(repo.split("/")):
+    if not _valid_repo_shape(repo):
         raise SpoolEventError(f"github_object repo must be owner/name: {repo!r}")
     kind = payload.get("kind")
     if kind not in GITHUB_OBJECT_KINDS:
@@ -216,6 +220,10 @@ def github_object_hint(event: SpoolEvent, path: Path) -> GitHubObjectHint:
     if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
         raise SpoolEventError(f"github_object number must be a positive int: {number!r}")
     return GitHubObjectHint(repo=repo, kind=kind, number=number, event=event, path=path)
+
+
+def _valid_repo_shape(repo: object) -> bool:
+    return isinstance(repo, str) and repo.count("/") == 1 and all(repo.split("/"))
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +402,10 @@ class EventSpool:
         自己回的內容。``action`` 只進診斷。
         """
 
+        if not _valid_repo_shape(repo):
+            logger.debug("monitor event spool rejected an invalid GitHub repo shape")
+            return None
+
         payload: dict[str, Any] = {"repo": repo, "kind": kind, "number": number}
         if action is not None:
             payload["action"] = action
@@ -456,7 +468,7 @@ class EventSpool:
                 # 另一個 consumer（或另一個 repo 的 provider）剛消費掉它。
                 continue
             except (OSError, UnicodeError, json.JSONDecodeError) as error:
-                quarantined.append(self._quarantine(path, reason=str(error)))
+                quarantined.append(self._quarantine(path, reason=str(error), at=horizon))
                 continue
             schema = document.get("schema_version") if isinstance(document, Mapping) else None
             if isinstance(schema, str) and schema and schema != EVENT_SCHEMA:
@@ -466,12 +478,12 @@ class EventSpool:
             try:
                 event = SpoolEvent.from_dict(document)
             except SpoolEventError as error:
-                quarantined.append(self._quarantine(path, reason=str(error)))
+                quarantined.append(self._quarantine(path, reason=str(error), at=horizon))
                 continue
             if (horizon - event.emitted_at_time).total_seconds() > self.ttl_seconds:
                 # 沒有任何 consumer 認領（repo 打錯／已從 configured 清單移除）的
                 # 孤兒事件，否則 spool 只會單調長大。隔離而非刪除：這是要給人看的。
-                quarantined.append(self._quarantine(path, reason="expired"))
+                quarantined.append(self._quarantine(path, reason="expired", at=horizon))
                 continue
             if event.event_type != EVENT_TYPE_GITHUB_OBJECT:
                 # #498 擴充點：steering／job／未知型別一律**原地保留**，只計數。
@@ -480,7 +492,8 @@ class EventSpool:
             try:
                 hints.append(github_object_hint(event, path))
             except SpoolEventError as error:
-                quarantined.append(self._quarantine(path, reason=str(error)))
+                quarantined.append(self._quarantine(path, reason=str(error), at=horizon))
+        self._cleanup_quarantine(now=horizon)
         if ignored:
             logger.info(
                 "monitor event spool holding %s unconsumed event(s) by type: %s",
@@ -513,18 +526,48 @@ class EventSpool:
             removed += 1
         return removed
 
-    def _quarantine(self, path: Path, *, reason: str) -> str:
-        """把壞檔移進 ``quarantine/``；移不動就留著並計數，絕不刪除證據。"""
+    def _quarantine(self, path: Path, *, reason: str, at: datetime) -> str:
+        """隔離壞檔並從隔離時起保留 30 天；移不動就留著並計數。"""
 
         logger.warning("monitor event spool quarantining %s: %s", path.name, reason)
         try:
             self.quarantine_root.mkdir(parents=True, exist_ok=True)
-            os.replace(path, self.quarantine_root / path.name)
+            destination = self.quarantine_root / path.name
+            os.replace(path, destination)
+            quarantined_at = at.timestamp()
+            os.utime(destination, (quarantined_at, quarantined_at))
         except FileNotFoundError:
             pass
         except OSError as error:
             logger.warning("monitor event spool could not quarantine %s: %s", path.name, error)
         return path.name
+
+    def _cleanup_quarantine(self, *, now: datetime) -> None:
+        """每次 spool 掃描時清除已保留滿 30 天的 quarantine 檔案。"""
+
+        cutoff = now.timestamp() - QUARANTINE_TTL_SECONDS
+        try:
+            entries = os.scandir(self.quarantine_root)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            logger.warning("monitor event spool quarantine is unreadable: %s", error)
+            return
+        with entries:
+            for entry in entries:
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.unlink(entry.path)
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    logger.warning(
+                        "monitor event spool could not clean quarantine %s: %s",
+                        entry.name,
+                        error,
+                    )
 
 
 def _event_filename(event: SpoolEvent) -> str:
