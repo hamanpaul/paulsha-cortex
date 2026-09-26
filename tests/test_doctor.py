@@ -1285,3 +1285,46 @@ def test_doctor_cli_json_and_help(monkeypatch, capsys) -> None:
     help_output = capsys.readouterr().out
     assert "--probe-live" in help_output
     assert "Monitor socket" in help_output
+
+
+def test_review_sandbox_probe_does_not_validate_review_with_build_executable(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """build identity 綁定 executable、review identity 走 PATH 時，不得拿 build 路徑代驗 review。"""
+    config = tmp_path / "config"
+    config.mkdir()
+    build_executable = tmp_path / "claude-build"
+    build_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    build_executable.chmod(0o755)
+    (config / "model-identities.yaml").write_text(
+        "schema_version: 4\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: local-builder\n"
+        "    independence_domain: local\n"
+        "    capabilities: [build]\n"
+        f"    executable: {build_executable}\n"
+        "  - executor: claude\n"
+        "    model_id: local-reviewer\n"
+        "    independence_domain: local-review\n"
+        "    capabilities: [review]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: None if name == "claude" else f"/tools/{name}",
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv, **_kwargs):
+        calls.append(list(argv))
+        return Result()
+
+    result = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/tools"},
+        tmp_path,
+        runner=runner,
+    )
+
+    assert result.status != "pass"
+    assert not any(str(build_executable.resolve()) in argv for argv in calls)

@@ -554,15 +554,25 @@ def _review_sandbox_probe(
             f"Claude executable {resolved_executable} configured; no review identity",
             False,
         )
+    # review 實際啟動用的是 claude review identity 自己的 executable（未綁定則走
+    # PATH）；不得拿 build identity 綁定的路徑代驗，否則 doctor 會假綠。
+    review_executable = next(
+        (
+            identity.executable
+            for identity in registry.identities
+            if identity.executor == "claude" and "review" in identity.capabilities
+        ),
+        None,
+    )
     result = _review_sandbox_checks(
         env,
         runner=runner,
         live=live,
-        claude_executable=configured_executable,
+        claude_executable=review_executable,
     )
     if (
         result.status == "fail"
-        and configured_executable is None
+        and review_executable is None
         and not _custom_overlay_declares_claude_review(config_root)
     ):
         return _probe_result(
