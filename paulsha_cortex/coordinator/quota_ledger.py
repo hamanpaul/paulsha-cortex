@@ -315,7 +315,19 @@ def _terminal_usage_metadata(wire, started_at_ms):
     return {"terminal_job_started_at_ms": started_at_ms}
 
 
+_TERMINAL_USAGE_REPLAY_TIME_EXCLUDED = "terminal-usage-replay-time-excluded-from-identity"
+
+
 def _observation_digest_payload(wire, associations, terminal_metadata):
+    if _is_terminal_usage_observation(wire):
+        # 終局 usage 的身分／衝突判定只綁 usage 內容與 job 終局事實
+        # （job_id 已在 idempotency key、job 開始時間在 terminal_metadata），
+        # 不綁重播當下的 observed_at_ms/received_at_ms：同一個已結束的 job
+        # 若在重啟後以較晚時間重播相同 usage，內容不變就必須判定為
+        # duplicate，不能因為記錄時間變了而被誤判成 conflict。
+        wire = dict(wire)
+        wire["observed_at_ms"] = _TERMINAL_USAGE_REPLAY_TIME_EXCLUDED
+        wire["received_at_ms"] = _TERMINAL_USAGE_REPLAY_TIME_EXCLUDED
     if associations:
         payload = {"observation": wire, "associations": associations}
     else:

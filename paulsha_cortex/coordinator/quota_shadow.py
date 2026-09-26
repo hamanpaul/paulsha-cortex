@@ -211,6 +211,10 @@ class QuotaShadowService:
         # 是否整段落在 snapshot 之後，才可安全整筆扣減；解析不出時視為未知，
         # 不得因此擋下這筆終局 usage 的記錄（仍先接受，投影時保守處理）。
         terminal_job_started_at_ms = _parse_iso_epoch_ms(job.get("started_at"))
+        # job 結束時間（若有）用來與 started_at 一起圈出這筆 usage 實際落在
+        # 哪一段 window instance；job 未帶 finished_at 時，以呼叫端傳入的
+        # observed_at_ms（記錄當下，必然不早於實際結束時間）作保守替代上界。
+        terminal_job_finished_at_ms = _parse_iso_epoch_ms(job.get("finished_at"))
 
         accepted = duplicates = conflicts = 0
         unit_map: dict[tuple[str, str], schema.UnitDefinition] = {}
@@ -260,18 +264,48 @@ class QuotaShadowService:
                     else {"state": "known", "value": target["scope"]}
                 )
                 pool_scope = target["association"] if target else associations
+                # 這筆 usage 所屬的 window instance：僅在能從 ledger 已知的
+                # remaining_snapshot 唯一判定 job 起訖時間整段落在哪一個 interval
+                # 時才標 known，跨窗口或資訊不足一律 unknown（見 #836 對抗審查
+                # 第四輪 BLOCKER：terminal usage 不能永遠標 unknown，否則永遠
+                # 無法投影扣減）。
+                window_instance = (
+                    _infer_terminal_usage_window_instance(
+                        self.ledger,
+                        pool_ref=target["scope"]["pool_ref"],
+                        window_id=target["window_id"],
+                        started_at_ms=terminal_job_started_at_ms,
+                        finished_at_ms=terminal_job_finished_at_ms,
+                        recorded_at_ms=observed_at_ms,
+                    )
+                    if target is not None
+                    else {"kind": "unknown", "reason": "usage-window-instance-unavailable"}
+                )
                 try:
                     observation = _usage_observation(
                         job_id=job_id, executor=executor, metric=metric, profile_key=profile_key,
                         unit=unit, unit_ref=unit_ref, scope=scope, quantity=quantity,
                         observed_at_ms=observed_at_ms, descriptors=descriptors,
-                        unit_catalog=unit_catalog,
+                        unit_catalog=unit_catalog, window_instance=window_instance,
                     )
                 except (schema.QuotaContractError, TypeError, ValueError):
                     gaps.append(CoverageGap(metric, "usage-observation-invalid"))
                     continue
-                key = f"terminal-usage:v1:{job_id}:{profile_key}:{metric}:" + (
-                    target["window_id"] if target else "unmapped"
+                # replay key 納入 pool identity（含 revision）：同一 binding 把
+                # 同 metric/unit 映到兩個 pool、且 window_id 恰好同名時（例如
+                # shared-account 多角色都叫 month），不得因 window_id 相同而互相
+                # 撞成 conflict（見 #836 對抗審查第四輪 MAJOR）。
+                pool_component = (
+                    hashlib.sha256(
+                        json.dumps(
+                            target["scope"]["pool_ref"], sort_keys=True, separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()[:16]
+                    if target else "unmapped"
+                )
+                key = (
+                    f"terminal-usage:v1:{job_id}:{profile_key}:{metric}:{pool_component}:"
+                    + (target["window_id"] if target else "unmapped")
                 )
                 result = self.ledger.append_observation(
                     observation,
@@ -307,21 +341,35 @@ class QuotaShadowService:
         try:
             snapshot = self.ledger.read()
             records = snapshot.events
-            parsed_records: list[tuple[dict[str, Any], schema.QuotaObservation]] = []
-            for record in records:
-                if record.get("kind") != "observation":
-                    continue
-                observation = schema.parse_observation(
-                    record.get("observation"), descriptors=descriptors, unit_catalog=unit_catalog,
-                )
-                parsed_records.append((record, observation))
-        except (LedgerCorrupt, OSError, TypeError, ValueError, schema.QuotaContractError):
+        except (LedgerCorrupt, OSError):
+            # ledger 檔案本身結構損毀（讀取/驗證失敗）：此時無法信任任何一筆
+            # 事件，整份投影標 unknown 是唯一安全的做法。
             for row in rows:
                 row["coverage_gaps"].append("ledger-corrupt")
             return {
                 "state": "unknown", "mode": "shadow", "dispatch_effect": "none",
                 "pools": rows, "events": [], "coverage_gaps": ["ledger-corrupt"],
             }
+
+        # ledger 檔案結構完好，但個別事件仍可能因為呼叫端目前傳入的
+        # descriptors/unit_catalog 而解析失敗——最常見的情況是 pool 已升版，
+        # 呼叫端只帶新 revision，ledger 內舊 revision 的事件因此對不上任何
+        # 描述集。這只是「目前解不開這一筆」，不代表整份 ledger 損毀，因此
+        # 逐筆 parse、逐筆處理失敗，只讓對應的 pool 標記，不毒化其他 pool
+        # （見 #836 對抗審查第四輪 MAJOR：舊 revision 事件不得讓整份 shadow
+        # projection 都變成 ledger-corrupt）。
+        parsed_records: list[tuple[dict[str, Any], schema.QuotaObservation]] = []
+        for record in records:
+            if record.get("kind") != "observation":
+                continue
+            try:
+                observation = schema.parse_observation(
+                    record.get("observation"), descriptors=descriptors, unit_catalog=unit_catalog,
+                )
+            except (TypeError, ValueError, schema.QuotaContractError):
+                _mark_unresolved_record(record, rows)
+                continue
+            parsed_records.append((record, observation))
 
         conflicts: dict[tuple[tuple[str, str, str, str], str], int] = {}
         for record in records:
@@ -582,18 +630,23 @@ class QuotaShadowService:
 
 
 def _usage_observation(*, job_id, executor, metric, profile_key, unit, unit_ref, scope,
-                       quantity, observed_at_ms, descriptors, unit_catalog):
+                       quantity, observed_at_ms, descriptors, unit_catalog, window_instance):
     profile_digest = hashlib.sha256(profile_key.encode()).hexdigest()[:12]
     scope_digest = hashlib.sha256(json.dumps(scope, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:12]
     payload = {
         "schema_version": 1,
+        # observation_id 不烘進 observed_at_ms（重播當下的記錄時間）：同一個
+        # job/metric/scope 的終局 usage 重播時必須產生同一個 observation_id，
+        # 否則即使 digest 已排除重播時間，wire 裡的 observation_id 仍會不同，
+        # 使 payload_sha256 跟著不同而被誤判成 conflict（見 #836 對抗審查
+        # 第四輪 MAJOR：quota_shadow.py:590）。
         "observation_id": "usage-" + hashlib.sha256(
-            f"{job_id}\0{metric}\0{profile_digest}\0{scope_digest}\0{observed_at_ms}".encode()
+            f"{job_id}\0{metric}\0{profile_digest}\0{scope_digest}".encode()
         ).hexdigest()[:32],
         "scope": scope,
         "profile_ref": {"state": "known", "value": {"schema_version": 1, "key": profile_key}},
         "unit_ref": {"state": "known", "value": {"unit_id": unit_ref[0], "version": unit_ref[1]}},
-        "window_instance": {"kind": "unknown", "reason": "usage-window-instance-unavailable"},
+        "window_instance": window_instance,
         "measurement": {"kind": "usage_delta", "metric_id": metric, "quantity": quantity},
         "observed_at_ms": {"state": "known", "value": observed_at_ms},
         "received_at_ms": observed_at_ms,
@@ -615,6 +668,63 @@ def _usage_observation(*, job_id, executor, metric, profile_key, unit, unit_ref,
     }
     combined_units = tuple(item for item in unit_catalog if item.ref != unit.ref) + (unit,)
     return schema.parse_observation(payload, descriptors=descriptors, unit_catalog=combined_units)
+
+
+_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN = {
+    "kind": "unknown", "reason": "usage-window-instance-unavailable",
+}
+
+
+def _infer_terminal_usage_window_instance(
+    ledger, *, pool_ref, window_id, started_at_ms, finished_at_ms, recorded_at_ms,
+):
+    """依 ledger 已知的 remaining_snapshot window_instance 推導終局 usage 所屬窗口。
+
+    只在 job 起訖時間唯一落在單一已知 interval 內時才回傳該 interval（標 known）；
+    起訖時間不明、找不到覆蓋區間，或同時符合多個不同 interval（跨窗口或有歧義）
+    一律回傳 unknown，不得臆測，避免把跨窗口的終局 usage 誤判成可整筆扣減。
+
+    這裡直接讀 ledger 內既有的原始 observation dict（寫入時已通過 schema 驗證），
+    不重新呼叫 parse_observation，因此不受呼叫端目前傳入的 descriptors/unit_catalog
+    是否涵蓋舊 revision 影響（見 #836 對抗審查第四輪 MAJOR：revision 升版議題）。
+    """
+    if type(started_at_ms) is not int:
+        return dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
+    effective_end_ms = finished_at_ms if type(finished_at_ms) is int else recorded_at_ms
+    if type(effective_end_ms) is not int or effective_end_ms < started_at_ms:
+        return dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
+    try:
+        ledger_snapshot = ledger.read()
+    except (LedgerCorrupt, OSError):
+        return dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
+    candidates: dict[tuple[int, int, str], dict[str, Any]] = {}
+    for record in ledger_snapshot.events:
+        if not isinstance(record, dict) or record.get("kind") != "observation":
+            continue
+        raw = record.get("observation")
+        if not isinstance(raw, dict):
+            continue
+        scope = _scope_summary(raw)
+        if (scope.get("state") != "known" or scope.get("pool_ref") != pool_ref
+                or scope.get("window_id") != window_id):
+            continue
+        measurement = raw.get("measurement")
+        if not isinstance(measurement, dict) or measurement.get("kind") != "remaining_snapshot":
+            continue
+        window_instance = raw.get("window_instance")
+        if not isinstance(window_instance, dict) or window_instance.get("kind") != "interval":
+            continue
+        start_ms, end_ms = window_instance.get("start_ms"), window_instance.get("end_ms")
+        if type(start_ms) is not int or type(end_ms) is not int:
+            continue
+        if not (start_ms <= started_at_ms and effective_end_ms <= end_ms):
+            continue
+        key = (start_ms, end_ms, json.dumps(window_instance.get("epoch"), sort_keys=True))
+        candidates[key] = window_instance
+    if len(candidates) != 1:
+        return dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
+    (only_window,) = candidates.values()
+    return dict(only_window)
 
 
 def _binding_constraints(binding_wire, descriptors):
@@ -690,6 +800,26 @@ def _scope_summary(wire):
     if not isinstance(value, dict) or not isinstance(value.get("pool_ref"), dict):
         return {"state": "unknown"}
     return {"state": "known", "pool_ref": value["pool_ref"], "window_id": value.get("window_id")}
+
+
+def _mark_unresolved_record(record, rows):
+    """單筆事件因目前描述集解析失敗時，只標記對應 pool（忽略 revision 比對
+    pool_id），不影響其他 pool 的投影結果。找不到對應 pool 時安全地忽略。"""
+    raw = record.get("observation") if isinstance(record, dict) else None
+    if not isinstance(raw, dict):
+        return
+    scope = _scope_summary(raw)
+    if scope.get("state") != "known":
+        return
+    pool_ref = scope.get("pool_ref")
+    window_id = scope.get("window_id")
+    if not isinstance(pool_ref, dict):
+        return
+    ref_key = tuple(pool_ref.get(name) for name in ("authority_id", "account_id", "pool_id"))
+    for row in rows:
+        row_key = tuple(row["pool_ref"].get(name) for name in ("authority_id", "account_id", "pool_id"))
+        if row_key == ref_key and row["window_id"] == window_id:
+            row["coverage_gaps"].append("stale-pool-revision")
 
 
 def _public_event(record, observation):

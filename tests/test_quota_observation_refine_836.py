@@ -992,3 +992,166 @@ def test_ac6_provider_read_interfaces_and_shadow_fixture_do_not_touch_dispatch_o
     assert positive["fields"]["reasoning"]["state"] == "unknown"
     service = shadow_module.QuotaShadowService.in_memory()
     assert service.project(descriptors=(), unit_catalog=(), now_utc_ms=_NOW)["dispatch_effect"] == "none"
+
+
+# #836 對抗審查第四輪：以下四個測試分別對應審查稿逐條列出的
+# BLOCKER/MAJOR，皆走正常 producer 路徑（record_terminal_usage / project），
+# 不用手工 record_observation 灌假資料覆蓋。
+
+
+def test_review4_blocker1_terminal_usage_deducts_via_real_producer_path():
+    """BLOCKER quota_shadow.py:596 — record_terminal_usage() 之前永遠把
+    window_instance 標 unknown，即使已有含 reset 的 fresh snapshot、且 job
+    完整落在該窗口內，投影仍只會得到 usage-window-unresolved 而不會扣減。"""
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+    snapshot = _observation(
+        descriptor, "short", value="20", observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 300_000,
+    )
+    assert service.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    result = service.record_terminal_usage(
+        {
+            "id": "job-fresh-within-window",
+            "executor": "codex",
+            "started_at": _iso_utc_ms(_NOW + 1),
+            "usage": {"input_tokens": 2},
+        },
+        profile_key=_PROFILE_A,
+        binding=binding,
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 5,
+    )
+    assert result.accepted == 1
+    assert not result.gaps
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 10
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "observed"
+    assert row["remaining"]["amount"] == {"kind": "exact", "value": "18"}
+
+
+def test_review4_major2_same_window_id_across_two_pools_does_not_collide():
+    """MAJOR quota_shadow.py:273 — replay key 之前只含
+    job_id/profile_key/metric/window_id；同一 binding 把同 metric/unit 映到
+    兩個 pool、且 window_id 恰好同名（shared-account 多角色都叫 month）時，
+    第二筆會撞到第一筆而被誤判成 conflict、錯拆池。"""
+    _, _, shadow_module = _feature_api()
+    pool_a = _pool_descriptor(
+        account="acct-role-a", pool="pool-role-a", windows=(("month", 2_678_400_000),),
+    )
+    pool_b = _pool_descriptor(
+        account="acct-role-b", pool="pool-role-b", windows=(("month", 2_678_400_000),),
+    )
+    binding = _binding((pool_a, pool_b), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    result = service.record_terminal_usage(
+        {"id": "job-shared-account", "executor": "codex", "usage": {"input_tokens": 5}},
+        profile_key=_PROFILE_A,
+        binding=binding,
+        descriptors=(pool_a, pool_b),
+        unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW,
+    )
+    assert result.accepted == 2
+    assert result.conflicts == 0
+
+    report = service.project(
+        descriptors=(pool_a, pool_b), unit_catalog=(), now_utc_ms=_NOW + 1
+    )
+    usage_events = [e for e in report["events"] if e["measurement_kind"] == "usage_delta"]
+    assert len(usage_events) == 2
+    assert {e["quantity"]["amount"]["value"] for e in usage_events} == {"5"}
+
+
+def test_review4_major3_terminal_usage_replay_with_later_recording_time_is_duplicate(tmp_path):
+    """MAJOR quota_shadow.py:590 — terminal usage payload 把 observed_at_ms
+    烘進 identity/digest，重啟後同一個已結束的 job 若以較晚時間重播相同
+    usage，會被誤判成 conflict 而不是 duplicate。真的改內容時仍必須是
+    conflict。"""
+    _, ledger_module, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    service = shadow_module.QuotaShadowService(
+        ledger_module.QuotaEventLedger(tmp_path / "quota-events.jsonl")
+    )
+    job = {
+        "id": "job-restart-replay",
+        "executor": "codex",
+        "started_at": _iso_utc_ms(_NOW + 1),
+        "usage": {"input_tokens": 4},
+    }
+    first = service.record_terminal_usage(
+        job, profile_key=_PROFILE_A, binding=binding, descriptors=(descriptor,),
+        unit_catalog=(), unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 5,
+    )
+    assert first.accepted == 1
+
+    # 模擬 manager 重啟後，以遠晚於原始記錄時間重播同一筆終局 usage。
+    replay = service.record_terminal_usage(
+        deepcopy(job), profile_key=_PROFILE_A, binding=binding, descriptors=(descriptor,),
+        unit_catalog=(), unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 500_000,
+    )
+    assert replay.duplicates == 1
+    assert replay.conflicts == 0
+
+    changed_job = deepcopy(job)
+    changed_job["usage"]["input_tokens"] = 9
+    changed = service.record_terminal_usage(
+        changed_job, profile_key=_PROFILE_A, binding=binding, descriptors=(descriptor,),
+        unit_catalog=(), unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 600_000,
+    )
+    assert changed.conflicts == 1
+
+
+def test_review4_major4_stale_pool_revision_does_not_poison_other_pools(tmp_path):
+    """MAJOR quota_shadow.py:314 — project() 之前用當前傳入的
+    descriptors/unit_catalog 重 parse 整份 append-only ledger；pool 升版後
+    caller 只帶新 revision，ledger 內舊 revision 的事件會被當
+    ledger-corrupt、毒化整份 shadow projection（連帶未升版的其他 pool也遭殃）。"""
+    _, ledger_module, shadow_module = _feature_api()
+    ledger_path = tmp_path / "quota-events.jsonl"
+    service = shadow_module.QuotaShadowService(ledger_module.QuotaEventLedger(ledger_path))
+
+    rotated_v1 = _pool_descriptor(pool="pool-rotates")
+    rotated_snapshot = _observation(rotated_v1, "short", value="20", observed_at_ms=_NOW)
+    assert service.record_observation(
+        rotated_snapshot.to_dict(), descriptors=(rotated_v1,), unit_catalog=(),
+    ).accepted == 1
+
+    untouched = _pool_descriptor(account="account-untouched", pool="pool-untouched")
+    untouched_snapshot = _observation(untouched, "short", value="30", observed_at_ms=_NOW)
+    assert service.record_observation(
+        untouched_snapshot.to_dict(), descriptors=(untouched,), unit_catalog=(),
+    ).accepted == 1
+
+    # pool-rotates 升版到 revision 2：caller 之後只帶新 revision 的描述集，
+    # ledger 內 revision 1 的事件對不上任何目前的 descriptor。
+    rotated_v2 = schema.parse_pool_descriptor({**rotated_v1.to_dict(), "revision": "2"})
+
+    report = service.project(
+        descriptors=(rotated_v2, untouched), unit_catalog=(), now_utc_ms=_NOW + 1
+    )
+    assert "ledger-corrupt" not in report["coverage_gaps"]
+
+    rotated_row = _pool_row(report, "pool-rotates", "short")
+    assert rotated_row["remaining"]["state"] == "unknown"
+    assert "stale-pool-revision" in rotated_row["coverage_gaps"]
+
+    untouched_row = _pool_row(report, "pool-untouched", "short")
+    assert untouched_row["remaining"]["state"] == "observed"
+    assert untouched_row["remaining"]["amount"] == {"kind": "exact", "value": "30"}
