@@ -4,18 +4,20 @@
 
 ## Evidence and state
 
-The manager-owned `execution-qualification` directory contains four durable records:
+The Trust Root `execution-qualification` tree is itself a registered, installer-managed asset (so every child directory has an unambiguous managed parent) and contains these durable records:
 
 - `candidates/`: immutable, digest-checked report/profile candidates.
-- `receipts/`: immutable approval, rejection, and revocation receipts.
+- `operator-receipts/`: immutable, content-addressed receipts created by the confirmed operator CLI. The directory is writable by Operator and Manager; job principals cannot write it.
+- `operator-receipt-index.json`: Manager-only allowlist of issued operator receipt ids and digests. A file copied or forged into `operator-receipts/` has no authority unless this index records its id and digest.
+- `receipts/`: immutable lifecycle approval, test review, and revocation receipts.
 - `index.json`: the authoritative lifecycle revision, current generation, idempotency records, and clock watermarks.
 - `approved-roster.json`: a rebuildable projection; it is not the lifecycle authority.
 
 Import accepts PatchMUD report schema v2 and checks its fingerprint, producer revision, artifact digest, exact resolved profile key, report/runtime role mapping, executor/model identity, cohort, per-run dimensions, and encounter coverage. A profile binding is parsed through the existing #835 schema core. Unknown observed conditions remain unknown; requested conditions never fill observation gaps. A different model, adapter/version, effort/profile key, loadout, role, deck, or coverage cannot borrow a neighboring row.
 
-An approval receipt is bound to the immutable candidate and its report/profile digests, exact role and coverage, policy revision, reviewer, authority reference, review time, and expiry. Approval is refused unless the report passes, coverage is complete, the exact resolved profile has a complete actual-condition key, and the target role is not marked unknown. Rejection can retain an incomplete candidate for audit. A test-only candidate requires a test-only receipt and is excluded from normal qualification queries and the default legacy parser projection.
+The operator receipt binds the immutable candidate, candidate/report/profile digests, exact profile key, role, coverage, policy revision, actor/reviewer, reason, reviewed time, expiry, and a digest derived from its canonical contents. The Manager registry must also contain the same receipt id and digest. Publishing and every roster query re-read both records and recheck the candidate binding; a caller-supplied string, unregistered file, altered file, or digest mismatch is rejected. Approval is refused unless the report passes, coverage is complete, the exact resolved profile has a complete actual-condition key, and the target role is not marked unknown. A test-only candidate requires a test-only receipt and is excluded from sized-dispatch enforcement and the default legacy parser projection.
 
-Each import, review, revoke, and migration supplies the current `--expected-revision` and an `--idempotency-key`. Stale revisions conflict; exact replays return the original result. Revocation and expiry block new admission. Query clock rollback, malformed times, missing/tampered receipts, invalid roster projections, and unknown state fail closed. Legacy roster entries are preserved as provenance with state `unknown`; migration never promotes them.
+Every compared timestamp is parsed as timezone-aware ISO-8601 and normalized to UTC. Naive or malformed timestamps fail closed. Import, review, revoke, and migration use the current `--expected-revision` and an `--idempotency-key`; stale revisions conflict and exact replays return the original result. Revocation and expiry block new admission. Query clock rollback, missing/tampered receipts, invalid roster projections, and unknown state fail closed. Legacy roster entries are preserved as provenance with state `unknown`; migration never promotes them.
 
 ## CLI
 
@@ -33,24 +35,23 @@ cortex model qualification import \
   --expected-revision <revision> --idempotency-key <stable-request-id>
 ```
 
-Review an exact candidate. Live review requires a reference issued by the governing human approval process; test receipts require the explicit `--test-only` flag:
+Approve an exact candidate through the operator entry. It records `--actor` as the reviewer, requires a reason, and prompts for confirmation on a terminal. Automation must pass `--yes` explicitly:
 
 ```bash
-cortex model qualification review <candidate-id> \
-  --verdict approved --reviewer <human-reviewer> \
-  --authority-ref <human-receipt-reference> \
+cortex model qualification approve <candidate-id> \
+  --actor <operator-id> --reason <review-reason> \
   --policy-revision <policy-revision> \
   --reviewed-at <timestamp-with-timezone> --expires-at <timestamp-with-timezone> \
-  --expected-revision <revision> --idempotency-key <stable-request-id>
+  --expected-revision <revision> --idempotency-key <stable-request-id> --yes
 ```
 
-Query one exact runtime identity with `qualification status --executor ... --model-id ... --profile-key ... --role ...`. Revoke its current generation with `qualification revoke <candidate-id>`, providing the reviewer, authority reference, reason, timestamp, expected revision, and idempotency key. `qualification migrate-legacy <roster-file>` preserves old rows as unknown and also uses revision CAS.
+`qualification review` is reserved for explicit `--test-only` lifecycle fixtures; it cannot create a live approval. To revoke, use `qualification revoke <candidate-id>` with `--actor`, `--reason`, `--policy-revision`, `--revoked-at`, `--expires-at`, `--expected-revision`, and `--idempotency-key`; it also prompts unless `--yes` is set. Query one exact runtime identity with `qualification status --executor ... --model-id ... --profile-key ... --role ...`. `qualification migrate-legacy <roster-file>` preserves old rows as unknown and also uses revision CAS.
 
-The `--authority-ref` value is recorded as receipt provenance. This local CLI does not authenticate an interactive account or validate an external human approval service; live acceptance must verify the reference with the authority that issued it. Issue, plan, agent review, and test-only receipt are not substitutes for approval of the exact qualification.
+The operator CLI writes the durable receipt, then the Manager records its id/digest in the Manager-only registry before publishing the lifecycle receipt. `--actor` is the audited reviewer label; authority to issue comes from the governed operator/Manager entry and its Trust Root write permissions. Issue, plan, agent review, and test-only receipt are not substitutes for approval of the exact qualification.
 
 ## Dispatch and compatibility
 
-The host overlay option `qualification_policy.sized_dispatch: enforce` enables the manager query for sized work. With the default `disabled` policy, Manager does not query qualification and dispatch behavior stays unchanged. Under enforcement, the query returns only an approved, unexpired, non-revoked record with the exact `profile_key`, runtime `role`, `coverage: complete`, and receipt digest. Legacy `Identity.execution_qualification` attributes are not consulted.
+The host overlay option `qualification_policy.sized_dispatch: enforce` enables the manager query for sized work. With the default `disabled` policy, Manager does not query qualification and dispatch behavior stays unchanged. Under enforcement, the query returns only an approved, unexpired, non-revoked live record with the exact `profile_key`, runtime `role`, complete coverage, and matching lifecycle/operator receipt digests. Test-only receipts and legacy `Identity.execution_qualification` attributes are not consulted.
 
 Qualification state lives in independent files and does not add keys to nested workflow rows consumed by older Manager/Monitor versions. The legacy `EvalRosterEntry` parser is reused only for the roster projection; its closed row schema remains unchanged. New profile `--apply` behavior remains behind its existing human review gate and does not create or approve qualification receipts.
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import multiprocessing
@@ -194,6 +194,7 @@ def _import_bound_report(
     *,
     expected_revision: int,
     idempotency_key: str,
+    test_only: bool = True,
 ) -> dict:
     artifact = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return store.import_report(
@@ -211,7 +212,7 @@ def _import_bound_report(
         ).hexdigest(),
         expected_revision=expected_revision,
         idempotency_key=idempotency_key,
-        test_only=True,
+        test_only=test_only,
     )
 
 
@@ -244,11 +245,22 @@ def _review(
     reviewed_at: str = "2026-09-26T00:00:00Z",
     expires_at: str = "2026-09-27T00:00:00Z",
 ) -> dict:
+    if not test_only:
+        authority = store.issue_operator_receipt(
+            candidate["candidate_id"], verdict=verdict, actor="fixture-reviewer",
+            reason="test fixture live approval path", policy_revision="qualification-policy-v1",
+            reviewed_at=reviewed_at, expires_at=expires_at, now=now,
+        )
+        return store.review_candidate(
+            candidate["candidate_id"], verdict=verdict,
+            operator_receipt_id=authority["operator_receipt_id"], test_only=False,
+            expected_revision=expected_revision, idempotency_key=idempotency_key, now=now,
+        )
     return store.review_candidate(
         candidate["candidate_id"],
         verdict=verdict,
         reviewer="fixture-reviewer",
-        reviewer_authority="test-only" if test_only else "human-receipt:fixture",
+        reviewer_authority="test-only",
         policy_revision="qualification-policy-v1",
         reviewed_at=reviewed_at,
         expires_at=expires_at,
@@ -376,6 +388,11 @@ def test_q01_patchmud_fixture_candidate_receipt_roster_query_round_trip(tmp_path
         "coverage": "complete", "revoked": False,
     }
     assert qualification["receipt"] == receipt["receipt_digest"]
+    from paulsha_cortex.coordinator import qualification_lifecycle
+
+    assert qualification_lifecycle.lookup_dispatch_qualification(
+        SimpleNamespace(executor="copilot", model_id="fixture-model"), binding, now=NOW,
+    ) is None
 
 
 @pytest.mark.parametrize(
@@ -644,12 +661,138 @@ def test_q04_model_qualification_cli_help_documents_review_receipt_controls(caps
     assert "qualification" in model_help and "profile" in model_help
 
     with pytest.raises(SystemExit) as qualification_exit:
-        porcelain_model.main(["qualification", "review", "--help"])
+        porcelain_model.main(["qualification", "approve", "--help"])
     assert qualification_exit.value.code == 0
     qualification_help = capsys.readouterr().out
     assert all(value in qualification_help for value in (
-        "--authority-ref", "--policy-revision", "--expires-at", "--expected-revision", "--test-only"
+        "--actor", "--reason", "--policy-revision", "--expires-at",
+        "--expected-revision", "--yes",
     ))
+
+
+def test_q04_self_supplied_human_receipt_cannot_publish_live_approval(tmp_path: Path) -> None:
+    report, binding = _complete_report_binding()
+    store = QualificationStore(root=tmp_path / "state")
+    imported = _import_bound_report(
+        store, report, binding, expected_revision=0,
+        idempotency_key="live-candidate", test_only=False,
+    )
+    candidate = json.loads(
+        (store.paths.candidates_root / f"{imported['candidate_id']}.json").read_text(encoding="utf-8")
+    )["payload"]
+
+    with pytest.raises(ValueError, match="operator receipt"):
+        store.review_candidate(
+            candidate["candidate_id"], verdict="approved", reviewer="self-selected-reviewer",
+            reviewer_authority="human-receipt:fake", policy_revision="qualification-policy-v1",
+            reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", test_only=False,
+            expected_revision=1, idempotency_key="fake-human-receipt", now=NOW,
+        )
+    assert store.query_qualification(
+        "copilot", "fixture-model", candidate["profile_key"], "build", now=NOW,
+    ) is None
+
+    fake_id = "hqrcpt:v1:" + "9" * 64
+    store.paths.operator_receipts_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    forged_payload = {"receipt_id": fake_id}
+    forged_digest = "sha256:" + hashlib.sha256(
+        json.dumps(forged_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    forged_path = store.paths.operator_receipts_root / f"{fake_id}.json"
+    forged_path.write_text(
+        json.dumps({"payload": forged_payload, "digest": forged_digest}),
+        encoding="utf-8",
+    )
+    forged_path.chmod(0o600)
+    with pytest.raises(ValueError, match="not registered"):
+        store.review_candidate(
+            candidate["candidate_id"], verdict="approved", operator_receipt_id=fake_id,
+            test_only=False, expected_revision=1, idempotency_key="forged-receipt-file", now=NOW,
+        )
+
+
+def test_q04_operator_receipt_binds_live_approval_and_query_rechecks_store(tmp_path: Path) -> None:
+    report, binding = _complete_report_binding()
+    store = QualificationStore(root=tmp_path / "state")
+    imported = _import_bound_report(
+        store, report, binding, expected_revision=0,
+        idempotency_key="bound-live-candidate", test_only=False,
+    )
+    candidate = json.loads(
+        (store.paths.candidates_root / f"{imported['candidate_id']}.json").read_text(encoding="utf-8")
+    )["payload"]
+    authority = store.issue_operator_receipt(
+        candidate["candidate_id"], verdict="approved", actor="operator-7",
+        reason="reviewed exact report and resolved profile", policy_revision="qualification-policy-v2",
+        reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", now=NOW,
+    )
+    path = store.paths.operator_receipts_root / f"{authority['operator_receipt_id']}.json"
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    payload = envelope["payload"]
+    assert payload["candidate_digest"] == imported["candidate_digest"]
+    assert payload["report_digest"] == candidate["source"]["report_digest"]
+    assert payload["profile_digest"] == "sha256:" + hashlib.sha256(
+        json.dumps(candidate["profile_observation"], ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+    assert (payload["role"], payload["coverage"], payload["policy_revision"], payload["reviewer"]) == (
+        "build", "complete", "qualification-policy-v2", "operator-7",
+    )
+    assert payload["test_only"] is False and payload["reason"]
+
+    approved = store.review_candidate(
+        candidate["candidate_id"], verdict="approved",
+        operator_receipt_id=authority["operator_receipt_id"], test_only=False,
+        expected_revision=1, idempotency_key="publish-live-approval", now=NOW,
+    )
+    assert approved["operator_receipt_digest"] == authority["operator_receipt_digest"]
+    assert store.query_qualification(
+        "copilot", "fixture-model", candidate["profile_key"], "build", now=NOW,
+    ) is not None
+
+    # The operator receipt remains an authority dependency after publication.
+    envelope["payload"]["reason"] = "tampered"
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    assert store.query_qualification(
+        "copilot", "fixture-model", candidate["profile_key"], "build", now=NOW,
+    ) is None
+    assert store.read_roster()["entries"] == []
+
+
+def test_q04_operator_approve_cli_requires_confirmation_and_writes_receipt(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from paulsha_cortex.porcelain import model_profile as porcelain_model
+
+    report, binding = _complete_report_binding()
+    store = QualificationStore(root=tmp_path / "state")
+    imported = _import_bound_report(
+        store, report, binding, expected_revision=0,
+        idempotency_key="cli-live-candidate", test_only=False,
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.qualification_lifecycle.QualificationStore",
+        lambda: store,
+    )
+    now = datetime.now(timezone.utc)
+    reviewed = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    expiry = (now.replace(microsecond=0) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    args = [
+        "qualification", "approve", imported["candidate_id"], "--actor", "operator-cli",
+        "--reason", "verified source and exact model profile", "--policy-revision", "qualification-policy-v2",
+        "--reviewed-at", reviewed, "--expires-at", expiry, "--expected-revision", "1",
+        "--idempotency-key", "cli-approve",
+    ]
+    assert porcelain_model.main(args) == 2
+    assert "requires explicit --yes" in capsys.readouterr().err
+    assert store.query_qualification(
+        "copilot", "fixture-model", binding.resolved_key, "build", now=now,
+    ) is None
+
+    assert porcelain_model.main([*args, "--yes"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "approved"
+    assert result["operator_receipt_id"].startswith("hqrcpt:v1:")
 
 
 def test_q05_fake_clock_expiry_revoke_timezone_and_clock_rollback(tmp_path: Path) -> None:
@@ -919,6 +1062,32 @@ def test_q09_late_report_cannot_replace_the_current_generation(tmp_path: Path) -
     roster = store.read_roster()
     assert len(roster["entries"]) == 1
     assert roster["entries"][0]["candidate_id"] == current["candidate_id"]
+
+
+def test_q09_generation_order_uses_instants_across_timezones(tmp_path: Path) -> None:
+    store = QualificationStore(root=tmp_path / "state")
+    report, binding = _complete_report_binding()
+    current_report = deepcopy(report)
+    current_report["generated_at"] = "2026-09-26T00:30:00Z"
+    late_report = deepcopy(report)
+    # This is 2026-09-25T23:00:00Z, 90 minutes older than current_report.
+    late_report["generated_at"] = "2026-09-26T01:00:00+02:00"
+    current = _import_bound_report(
+        store, current_report, binding, expected_revision=0,
+        idempotency_key="timezone-current",
+    )
+    late = _import_bound_report(
+        store, late_report, binding, expected_revision=1,
+        idempotency_key="timezone-late",
+    )
+    assert current["candidate_id"] != late["candidate_id"]
+    candidate = json.loads(
+        (store.paths.candidates_root / f"{current['candidate_id']}.json").read_text(encoding="utf-8")
+    )["payload"]
+
+    # The later-imported report must not displace the newer generation.
+    approved = _review(store, candidate, expected_revision=2, idempotency_key="approve-newest")
+    assert approved["candidate_id"] == current["candidate_id"]
 
 
 def test_q10_pricing_and_timestamp_do_not_become_execution_qualification(tmp_path: Path) -> None:

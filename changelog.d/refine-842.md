@@ -1,3 +1,3 @@
 # #842 execution qualification lifecycle
 
-新增 profile-bound qualification candidate、human review／revoke receipt、CAS 與 expiry lifecycle，並以 manager-only Trust Root 狀態與 exact roster query 接入 sized dispatch enforcement。預設 policy 維持 disabled；test-only receipts 和 legacy rows 不授予 live qualification。補上 CLI、README、操作文件與 Q01–Q11 自動化驗收。
+新增 profile-bound qualification candidate、confirmed operator approval CLI、content-addressed human receipt store 與 Manager-only id/digest allowlist。Receipt 綁定 candidate、report/profile digest、role/coverage、policy revision、actor/reviewer、reason、reviewed_at 與 expiry；偽造檔、未登記 id、digest 不符均不能發布或通過 roster query。Trust Root/permgen 明列 operator/Manager 寫入與 job 隔離；`execution-qualification` 容器本身獨立登記為資產，讓子資產各自有明確的 managed parent，install-plan 才能同時承接既有四項 candidates/receipts/roster/index 與新增兩項 operator receipt 的 traverse ACL。generation、review 與 expiry 比較使用 timezone-aware datetime；test-only receipts 不授予 sized-dispatch enforce 下的 live qualification。

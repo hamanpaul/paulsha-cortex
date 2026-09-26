@@ -20,6 +20,7 @@ import re
 import stat
 import tempfile
 from typing import Callable, Iterator, Mapping
+import uuid
 
 from ..config import paths as config_paths
 from . import execution_adapters, execution_profile, model_resolution
@@ -31,6 +32,7 @@ _PROFILE_KEY_RE = re.compile(r"epk:v1:resolved:[0-9a-f]{64}\Z")
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CANDIDATE_ID_RE = re.compile(r"qcan:v1:[0-9a-f]{64}\Z")
 _RECEIPT_ID_RE = re.compile(r"qrcpt:v1:[0-9a-f]{64}\Z")
+_OPERATOR_RECEIPT_ID_RE = re.compile(r"hqrcpt:v1:[0-9a-f]{64}\Z")
 _MAX_STATE_BYTES = 64 * 1024 * 1024
 _REPORT_ROLE_FOR_RUNTIME_ROLE = {
     "planning": "planner",
@@ -50,6 +52,7 @@ _INDEX_KEYS = frozenset(
         "clock_watermarks",
     }
 )
+_OPERATOR_RECEIPT_INDEX_KEYS = frozenset({"schema_version", "receipts"})
 
 
 class QualificationError(ValueError):
@@ -62,10 +65,12 @@ class QualificationConflict(QualificationError):
 
 @dataclass(frozen=True)
 class QualificationStorePaths:
-    """Trust Root 登記的四種 durable qualification state 落點。"""
+    """Trust Root 登記的 qualification state 與 operator receipt 落點。"""
 
     candidates_root: Path
     receipts_root: Path
+    operator_receipts_root: Path
+    operator_receipt_registry_path: Path
     roster_path: Path
     index_path: Path
 
@@ -78,6 +83,8 @@ def _default_paths() -> QualificationStorePaths:
     return QualificationStorePaths(
         candidates_root=config_paths.execution_qualification_candidates_root(),
         receipts_root=config_paths.execution_qualification_receipts_root(),
+        operator_receipts_root=config_paths.execution_qualification_operator_receipts_root(),
+        operator_receipt_registry_path=config_paths.execution_qualification_operator_receipt_registry_path(),
         roster_path=config_paths.execution_qualification_roster_path(),
         index_path=config_paths.execution_qualification_index_path(),
     )
@@ -88,6 +95,8 @@ def _paths_under(root: Path) -> QualificationStorePaths:
     return QualificationStorePaths(
         candidates_root=base / "candidates",
         receipts_root=base / "receipts",
+        operator_receipts_root=base / "operator-receipts",
+        operator_receipt_registry_path=base / "operator-receipt-index.json",
         roster_path=base / "approved-roster.json",
         index_path=base / "index.json",
     )
@@ -164,15 +173,15 @@ def _empty_index() -> dict[str, object]:
     }
 
 
-def _safe_read_json(path: Path, *, label: str) -> object:
-    raw = _safe_read_bytes(path, label=label)
+def _safe_read_json(path: Path, *, label: str, allow_group_acl: bool = False) -> object:
+    raw = _safe_read_bytes(path, label=label, allow_group_acl=allow_group_acl)
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise QualificationError(f"{label} is unreadable") from exc
 
 
-def _safe_read_bytes(path: Path, *, label: str) -> bytes:
+def _safe_read_bytes(path: Path, *, label: str, allow_group_acl: bool = False) -> bytes:
     """以 no-follow、單一 inode、bounded read 取回 manager-only state。"""
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -186,7 +195,8 @@ def _safe_read_bytes(path: Path, *, label: str) -> bytes:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             raise QualificationError(f"{label} must be a single-link regular file")
-        if stat.S_IMODE(before.st_mode) & 0o077:
+        exposed_bits = stat.S_IMODE(before.st_mode) & (0o007 if allow_group_acl else 0o077)
+        if exposed_bits:
             raise QualificationError(f"{label} permissions are too broad")
         if before.st_size > _MAX_STATE_BYTES:
             raise QualificationError(f"{label} exceeds the bounded file size")
@@ -225,11 +235,79 @@ def _ensure_private_dir(path: Path) -> None:
         raise QualificationError(f"qualification state directory permissions are too broad: {path.name}")
 
 
-def _atomic_write_json(path: Path, payload: object) -> None:
+def _ensure_governed_dir(path: Path) -> None:
+    """Check a Trust Root provisioned directory without chmod that could erase ACLs."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise QualificationError(f"governed qualification directory is not provisioned: {path.name}") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise QualificationError(f"governed qualification path is not a directory: {path.name}")
+    if stat.S_IMODE(info.st_mode) & 0o007:
+        raise QualificationError(f"governed qualification directory is other-accessible: {path.name}")
+
+
+def _atomic_write_governed_json(path: Path, payload: object) -> None:
+    """Atomically create a content-addressed operator receipt while preserving inherited ACLs."""
     data = _canonical_bytes(payload) + b"\n"
     if len(data) > _MAX_STATE_BYTES:
         raise QualificationError("qualification state exceeds the bounded file size")
-    _ensure_private_dir(path.parent)
+    _ensure_governed_dir(path.parent)
+    parent_fd = os.open(
+        path.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    fd = -1
+    try:
+        parent_info = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent_info.st_mode):
+            raise QualificationError("operator receipt parent changed during write")
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o660,
+            dir_fd=parent_fd,
+        )
+        os.fchmod(fd, 0o660)
+        with os.fdopen(fd, "wb", closefd=True) as stream:
+            fd = -1
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(
+                temporary,
+                path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            existing = _safe_read_json(path, label="operator qualification receipt", allow_group_acl=True)
+            if existing != payload:
+                raise QualificationConflict("immutable operator receipt already exists with different bytes")
+        finally:
+            os.unlink(temporary, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
+
+
+def _atomic_write_json(path: Path, payload: object, *, governed_parent: bool = False) -> None:
+    data = _canonical_bytes(payload) + b"\n"
+    if len(data) > _MAX_STATE_BYTES:
+        raise QualificationError("qualification state exceeds the bounded file size")
+    if governed_parent:
+        _ensure_governed_dir(path.parent)
+    else:
+        _ensure_private_dir(path.parent)
     fd = -1
     temporary: str | None = None
     try:
@@ -324,6 +402,7 @@ class QualificationStore:
         root: str | Path | None = None,
         failpoint: Callable[[str], None] | None = None,
     ) -> None:
+        self._test_root = root is not None
         self.paths = _paths_under(Path(root)) if root is not None else _default_paths()
         self._failpoint = failpoint
 
@@ -338,7 +417,12 @@ class QualificationStore:
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
-        _ensure_private_dir(self.paths.root)
+        if self._test_root:
+            _ensure_private_dir(self.paths.root)
+        else:
+            # The execution-qualification parent may carry an operator traverse ACL. Do not
+            # chmod it on every manager transaction; that would reset the generated ACL mask.
+            _ensure_governed_dir(self.paths.root)
         _ensure_private_dir(self.paths.candidates_root)
         _ensure_private_dir(self.paths.receipts_root)
         lock_path = self.paths.index_path.with_name(self.paths.index_path.name + ".lock")
@@ -360,7 +444,7 @@ class QualificationStore:
     def _load_index_unlocked(self) -> dict[str, object]:
         if not self.paths.index_path.exists():
             index = _empty_index()
-            _atomic_write_json(self.paths.index_path, index)
+            _atomic_write_json(self.paths.index_path, index, governed_parent=not self._test_root)
             return index
         payload = _safe_read_json(self.paths.index_path, label="qualification index")
         if not isinstance(payload, dict) or set(payload) != _INDEX_KEYS:
@@ -380,8 +464,38 @@ class QualificationStore:
                 raise QualificationError(f"qualification index {field} must be an object")
         return payload
 
+    def _load_operator_receipt_index_unlocked(self, *, create: bool = False) -> dict[str, object]:
+        path = self.paths.operator_receipt_registry_path
+        if not path.exists():
+            index: dict[str, object] = {"schema_version": 1, "receipts": {}}
+            if create:
+                _atomic_write_json(path, index, governed_parent=not self._test_root)
+            return index
+        payload = _safe_read_json(path, label="operator receipt registry")
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != _OPERATOR_RECEIPT_INDEX_KEYS
+            or type(payload.get("schema_version")) is not int
+            or payload.get("schema_version") != 1
+            or not isinstance(payload.get("receipts"), dict)
+        ):
+            raise QualificationError("operator receipt registry schema/keys are invalid")
+        for receipt_id, row in payload["receipts"].items():
+            if (
+                not isinstance(receipt_id, str)
+                or _OPERATOR_RECEIPT_ID_RE.fullmatch(receipt_id) is None
+                or not isinstance(row, Mapping)
+                or set(row) != {"digest", "candidate_id", "verdict"}
+                or not isinstance(row.get("digest"), str)
+                or _SHA256_RE.fullmatch(row["digest"]) is None
+                or not isinstance(row.get("candidate_id"), str)
+                or not isinstance(row.get("verdict"), str)
+            ):
+                raise QualificationError("operator receipt registry entry is invalid")
+        return payload
+
     def _write_index_unlocked(self, index: dict[str, object]) -> None:
-        _atomic_write_json(self.paths.index_path, index)
+        _atomic_write_json(self.paths.index_path, index, governed_parent=not self._test_root)
 
     def _read_immutable(
         self,
@@ -454,6 +568,233 @@ class QualificationStore:
             label="qualification receipt",
             expected_digest=row["digest"],
         )
+
+    def _read_operator_receipt(
+        self, receipt_id: str, *, expected_digest: str | None = None
+    ) -> tuple[dict[str, object], str]:
+        if not isinstance(receipt_id, str) or _OPERATOR_RECEIPT_ID_RE.fullmatch(receipt_id) is None:
+            raise QualificationError("operator receipt id is invalid")
+        _ensure_governed_dir(self.paths.operator_receipts_root)
+        registry = self._load_operator_receipt_index_unlocked()
+        registry_entry = registry["receipts"].get(receipt_id)
+        if not isinstance(registry_entry, Mapping):
+            raise QualificationError("operator receipt is not registered")
+        trusted_digest = registry_entry.get("digest")
+        if not isinstance(trusted_digest, str) or (
+            expected_digest is not None and expected_digest != trusted_digest
+        ):
+            raise QualificationError("operator qualification receipt registry digest mismatch")
+        envelope = _safe_read_json(
+            self.paths.operator_receipts_root / f"{receipt_id}.json",
+            label="operator qualification receipt",
+            allow_group_acl=True,
+        )
+        if not isinstance(envelope, dict) or set(envelope) != {"payload", "digest"}:
+            raise QualificationError("operator qualification receipt envelope is invalid")
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            raise QualificationError("operator qualification receipt payload is invalid")
+        digest = _sha256(payload)
+        if envelope.get("digest") != digest or trusted_digest != digest or (
+            expected_digest is not None and expected_digest != digest
+        ):
+            raise QualificationError("operator qualification receipt digest mismatch")
+        without_id = {key: value for key, value in payload.items() if key != "receipt_id"}
+        expected_id = "hqrcpt:v1:" + hashlib.sha256(_canonical_bytes(without_id)).hexdigest()
+        if payload.get("receipt_id") != receipt_id or expected_id != receipt_id:
+            raise QualificationError("operator qualification receipt identity mismatch")
+        required = {
+            "schema_version", "kind", "candidate_id", "candidate_digest", "report_digest",
+            "profile_digest", "profile_key", "role", "coverage", "verdict", "reviewer",
+            "actor", "reason", "policy_revision", "reviewed_at", "expires_at", "test_only",
+            "receipt_id",
+        }
+        optional = {"approval_receipt_id", "approval_receipt_digest"}
+        if not required <= set(payload) or set(payload) - required - optional:
+            raise QualificationError("operator qualification receipt fields are invalid")
+        if (
+            type(payload.get("schema_version")) is not int
+            or payload.get("schema_version") != 1
+            or payload.get("kind") != "qualification-operator-review"
+            or payload.get("test_only") is not False
+            or payload.get("verdict") not in {"approved", "revoked"}
+            or payload.get("reviewer") != payload.get("actor")
+            or registry_entry.get("candidate_id") != payload.get("candidate_id")
+            or registry_entry.get("verdict") != payload.get("verdict")
+        ):
+            raise QualificationError("operator qualification receipt identity is invalid")
+        _nonempty(payload.get("reviewer"), "operator receipt reviewer")
+        _nonempty(payload.get("reason"), "operator receipt reason")
+        _nonempty(payload.get("policy_revision"), "operator receipt policy_revision")
+        reviewed = _timestamp(payload.get("reviewed_at"), "operator receipt reviewed_at")
+        expires = _timestamp(payload.get("expires_at"), "operator receipt expires_at")
+        if expires <= reviewed:
+            raise QualificationError("operator receipt expiry must follow reviewed_at")
+        return payload, digest
+
+    def _validate_operator_receipt(
+        self,
+        receipt_id: str,
+        candidate: Mapping[str, object],
+        candidate_digest: str,
+        *,
+        verdict: str,
+        expected_digest: str | None = None,
+        approval_receipt_id: str | None = None,
+        approval_receipt_digest: str | None = None,
+        now: datetime | None = None,
+    ) -> tuple[dict[str, object], str]:
+        payload, digest = self._read_operator_receipt(receipt_id, expected_digest=expected_digest)
+        source = candidate.get("source")
+        subject = candidate.get("subject")
+        coverage = candidate.get("coverage")
+        if (
+            not isinstance(source, Mapping)
+            or not isinstance(subject, Mapping)
+            or not isinstance(coverage, Mapping)
+            or candidate.get("test_only") is not False
+            or payload.get("candidate_id") != candidate.get("candidate_id")
+            or payload.get("candidate_digest") != candidate_digest
+            or payload.get("report_digest") != source.get("report_digest")
+            or payload.get("profile_digest") != _sha256(candidate.get("profile_observation"))
+            or payload.get("profile_key") != candidate.get("profile_key")
+            or payload.get("role") != subject.get("role")
+            or payload.get("coverage") != coverage.get("state")
+            or payload.get("verdict") != verdict
+        ):
+            raise QualificationError("operator receipt binding mismatch")
+        if verdict == "revoked" and (
+            payload.get("approval_receipt_id") != approval_receipt_id
+            or payload.get("approval_receipt_digest") != approval_receipt_digest
+        ):
+            raise QualificationError("operator revocation receipt binding mismatch")
+        if verdict == "approved" and ("approval_receipt_id" in payload or "approval_receipt_digest" in payload):
+            raise QualificationError("operator approval receipt has unexpected revocation binding")
+        if now is not None:
+            reviewed = _timestamp(payload.get("reviewed_at"), "operator receipt reviewed_at")
+            expires = _timestamp(payload.get("expires_at"), "operator receipt expires_at")
+            if reviewed > now:
+                raise QualificationError("operator receipt reviewed_at timestamp is in the future")
+            if now >= expires:
+                raise QualificationError("operator receipt is expired")
+        return payload, digest
+
+    def issue_operator_receipt(
+        self,
+        candidate_id: str,
+        *,
+        verdict: str,
+        actor: str,
+        reason: str,
+        policy_revision: str,
+        reviewed_at: str,
+        expires_at: str,
+        now: object | None = None,
+    ) -> dict[str, object]:
+        """Create an immutable live receipt for a confirmed operator CLI action."""
+        actor = _nonempty(actor, "actor")
+        reason = _nonempty(reason, "reason")
+        policy_revision = _nonempty(policy_revision, "policy_revision")
+        reviewed = _timestamp(reviewed_at, "reviewed_at")
+        expires = _timestamp(expires_at, "expires_at")
+        current_time = _parse_now(now)
+        if verdict not in {"approved", "revoked"}:
+            raise QualificationError("operator receipt verdict must be approved or revoked")
+        if expires <= reviewed:
+            raise QualificationError("expires_at must be after reviewed_at")
+        if reviewed > current_time:
+            raise QualificationError("reviewed_at timestamp is in the future")
+        if expires <= current_time:
+            raise QualificationError("expires_at timestamp is already expired")
+
+        with self._locked():
+            index = self._load_index_unlocked()
+            candidate = self._candidate(index, candidate_id)
+            candidate_row = index["candidates"].get(candidate_id)
+            if not isinstance(candidate_row, Mapping) or not isinstance(candidate_row.get("digest"), str):
+                raise QualificationError("qualification candidate digest is unavailable")
+            if candidate.get("test_only") is not False:
+                raise QualificationError("operator receipts cannot be issued for test-only candidates")
+            if verdict == "approved":
+                blockers = _candidate_approval_blockers(candidate)
+                if blockers:
+                    raise QualificationError(
+                        "candidate is not eligible for approved roster: " + ", ".join(blockers)
+                    )
+            binding_id = _binding_key(
+                candidate["subject"]["executor"], candidate["subject"]["model_id"],
+                candidate["profile_key"], candidate["subject"]["role"],
+            )
+            binding = index["bindings"].get(binding_id)
+            approval_receipt_id = None
+            approval_receipt_digest = None
+            if verdict == "revoked":
+                if not isinstance(binding, Mapping) or binding.get("candidate_id") != candidate_id or binding.get("state") != "approved":
+                    raise QualificationConflict("candidate is not the current approved qualification")
+                approval_receipt_id = binding.get("approval_receipt_id")
+                approval_meta = index["receipts"].get(approval_receipt_id)
+                if not isinstance(approval_receipt_id, str) or not isinstance(approval_meta, Mapping):
+                    raise QualificationError("current approval receipt is unavailable")
+                approval_receipt_digest = approval_meta.get("digest")
+                if not isinstance(approval_receipt_digest, str):
+                    raise QualificationError("current approval receipt digest is unavailable")
+            draft: dict[str, object] = {
+                "schema_version": 1,
+                "kind": "qualification-operator-review",
+                "candidate_id": candidate_id,
+                "candidate_digest": candidate_row["digest"],
+                "report_digest": candidate["source"]["report_digest"],
+                "profile_digest": _sha256(candidate["profile_observation"]),
+                "profile_key": candidate["profile_key"],
+                "role": candidate["subject"]["role"],
+                "coverage": candidate["coverage"]["state"],
+                "verdict": verdict,
+                "reviewer": actor,
+                "actor": actor,
+                "reason": reason,
+                "policy_revision": policy_revision,
+                "reviewed_at": _timestamp_text(reviewed),
+                "expires_at": _timestamp_text(expires),
+                "test_only": False,
+            }
+            if verdict == "revoked":
+                draft["approval_receipt_id"] = approval_receipt_id
+                draft["approval_receipt_digest"] = approval_receipt_digest
+            receipt_id = "hqrcpt:v1:" + hashlib.sha256(_canonical_bytes(draft)).hexdigest()
+            payload = {**draft, "receipt_id": receipt_id}
+            digest = _sha256(payload)
+            if self._test_root:
+                _ensure_private_dir(self.paths.operator_receipts_root)
+            _atomic_write_governed_json(
+                self.paths.operator_receipts_root / f"{receipt_id}.json",
+                {"payload": payload, "digest": digest},
+            )
+            receipt_index = self._load_operator_receipt_index_unlocked(create=True)
+            receipt_entries = receipt_index["receipts"]
+            assert isinstance(receipt_entries, dict)
+            registered = receipt_entries.get(receipt_id)
+            registration = {
+                "digest": digest,
+                "candidate_id": candidate_id,
+                "verdict": verdict,
+            }
+            if registered is not None and registered != registration:
+                raise QualificationConflict("operator receipt id is already registered differently")
+            if registered is None:
+                receipt_entries[receipt_id] = registration
+                _atomic_write_json(
+                    self.paths.operator_receipt_registry_path,
+                    receipt_index,
+                    governed_parent=not self._test_root,
+                )
+            return {
+                "candidate_id": candidate_id,
+                "operator_receipt_id": receipt_id,
+                "operator_receipt_digest": digest,
+                "verdict": verdict,
+                "reviewer": actor,
+                "expires_at": payload["expires_at"],
+            }
 
     def _replay(
         self,
@@ -969,7 +1310,11 @@ class QualificationStore:
             }
         else:
             current = self._candidate(index, existing["candidate_id"])
-            if existing.get("state") == "pending" and str(candidate["measurement"]["evaluated_at"]) > str(current["measurement"]["evaluated_at"]):
+            if (
+                existing.get("state") == "pending"
+                and _timestamp(candidate["measurement"]["evaluated_at"], "candidate evaluated_at")
+                > _timestamp(current["measurement"]["evaluated_at"], "current candidate evaluated_at")
+            ):
                 existing["candidate_id"] = candidate_id
         index["revision"] = current_revision + 1
         result = {"candidate_id": candidate_id, "candidate_digest": candidate_digest, "revision": index["revision"]}
@@ -1050,47 +1395,65 @@ class QualificationStore:
         candidate_id: str,
         *,
         verdict: str,
-        reviewer: str,
-        reviewer_authority: str,
-        policy_revision: str,
-        reviewed_at: str,
-        expires_at: str,
+        reviewer: str | None = None,
+        reviewer_authority: str | None = None,
+        policy_revision: str | None = None,
+        reviewed_at: str | None = None,
+        expires_at: str | None = None,
+        operator_receipt_id: str | None = None,
         test_only: bool,
         expected_revision: int,
         idempotency_key: str,
         now: object | None = None,
     ) -> dict[str, object]:
-        """以新 immutable receipt 核可或拒絕 candidate。"""
+        """Publish a test review or one bound to a durable operator receipt."""
 
-        reviewer = _nonempty(reviewer, "reviewer")
-        reviewer_authority = _nonempty(reviewer_authority, "reviewer_authority")
-        policy_revision = _nonempty(policy_revision, "policy_revision")
-        reviewed = _timestamp(reviewed_at, "reviewed_at")
-        expires = _timestamp(expires_at, "expires_at")
         current_time = _parse_now(now)
         if verdict not in {"approved", "rejected"}:
             raise QualificationError("verdict must be approved or rejected")
+        operator_receipt: dict[str, object] | None = None
+        operator_receipt_digest: str | None = None
+        if test_only:
+            if operator_receipt_id is not None:
+                raise QualificationError("test-only review cannot use a live operator receipt")
+            reviewer = _nonempty(reviewer, "reviewer")
+            reviewer_authority = _nonempty(reviewer_authority, "reviewer_authority")
+            policy_revision = _nonempty(policy_revision, "policy_revision")
+            reviewed = _timestamp(reviewed_at, "reviewed_at")
+            expires = _timestamp(expires_at, "expires_at")
+            if reviewer_authority != "test-only":
+                raise QualificationError("test-only review requires reviewer_authority=test-only")
+        else:
+            if not operator_receipt_id:
+                raise QualificationError("live review requires a governed operator receipt")
+            if any(value is not None for value in (reviewer, reviewer_authority, policy_revision, reviewed_at, expires_at)):
+                raise QualificationError("live review details must come from the operator receipt")
+            operator_receipt, operator_receipt_digest = self._read_operator_receipt(operator_receipt_id)
+            reviewer = str(operator_receipt["reviewer"])
+            reviewer_authority = "operator-receipt:" + operator_receipt_id
+            policy_revision = str(operator_receipt["policy_revision"])
+            reviewed = _timestamp(operator_receipt["reviewed_at"], "operator receipt reviewed_at")
+            expires = _timestamp(operator_receipt["expires_at"], "operator receipt expires_at")
+        assert reviewer is not None and reviewer_authority is not None and policy_revision is not None
         if expires <= reviewed:
             raise QualificationError("expires_at must be after reviewed_at")
         if reviewed > current_time:
             raise QualificationError("reviewed_at timestamp is in the future")
         if verdict == "approved" and expires <= current_time:
             raise QualificationError("expires_at timestamp is already expired")
-        if test_only and reviewer_authority != "test-only":
-            raise QualificationError("test-only review requires reviewer_authority=test-only")
-        if not test_only and not reviewer_authority.startswith("human-receipt:"):
-            raise QualificationError("approval requires an explicit human receipt authority reference")
 
         idem = _nonempty(idempotency_key, "idempotency_key")
         request = {
             "operation": "review",
             "candidate_id": candidate_id,
             "verdict": verdict,
-            "reviewer": reviewer,
-            "reviewer_authority": reviewer_authority,
-            "policy_revision": policy_revision,
-            "reviewed_at": _timestamp_text(reviewed),
-            "expires_at": _timestamp_text(expires),
+            "operator_receipt_id": operator_receipt_id,
+            "operator_receipt_digest": operator_receipt_digest,
+            "reviewer": reviewer if test_only else None,
+            "reviewer_authority": reviewer_authority if test_only else None,
+            "policy_revision": policy_revision if test_only else None,
+            "reviewed_at": _timestamp_text(reviewed) if test_only else None,
+            "expires_at": _timestamp_text(expires) if test_only else None,
             "test_only": test_only,
             "expected_revision": expected_revision,
             "idempotency_key": idem,
@@ -1105,6 +1468,25 @@ class QualificationStore:
             candidate = self._candidate(index, candidate_id)
             if candidate["test_only"] is not test_only:
                 raise QualificationError("candidate and receipt test-only markers must match")
+            candidate_row = index["candidates"].get(candidate_id)
+            if not isinstance(candidate_row, Mapping) or not isinstance(candidate_row.get("digest"), str):
+                raise QualificationError("qualification candidate digest is unavailable")
+            if not test_only:
+                assert operator_receipt_id is not None and operator_receipt_digest is not None
+                operator_receipt, checked_operator_digest = self._validate_operator_receipt(
+                    operator_receipt_id,
+                    candidate,
+                    candidate_row["digest"],
+                    verdict=verdict,
+                    expected_digest=operator_receipt_digest,
+                    now=current_time,
+                )
+                if checked_operator_digest != operator_receipt_digest:
+                    raise QualificationError("operator receipt digest mismatch")
+                reviewer = str(operator_receipt["reviewer"])
+                policy_revision = str(operator_receipt["policy_revision"])
+                reviewed = _timestamp(operator_receipt["reviewed_at"], "operator receipt reviewed_at")
+                expires = _timestamp(operator_receipt["expires_at"], "operator receipt expires_at")
             subject = candidate["subject"]
             binding_id = _binding_key(
                 subject["executor"], subject["model_id"], candidate["profile_key"], subject["role"]
@@ -1117,7 +1499,8 @@ class QualificationStore:
             current_candidate = self._candidate(index, binding["candidate_id"])
             if (
                 binding.get("candidate_id") != candidate_id
-                and str(candidate["measurement"]["evaluated_at"]) < str(current_candidate["measurement"]["evaluated_at"])
+                and _timestamp(candidate["measurement"]["evaluated_at"], "candidate evaluated_at")
+                < _timestamp(current_candidate["measurement"]["evaluated_at"], "current candidate evaluated_at")
             ):
                 raise QualificationConflict("late report cannot replace the current qualification generation")
             if verdict == "approved":
@@ -1138,7 +1521,7 @@ class QualificationStore:
             }
             receipt_request = {
                 **request,
-                "candidate_digest": index["candidates"][candidate_id]["digest"],
+                "candidate_digest": candidate_row["digest"],
                 "scope": scope,
             }
             receipt_id = "qrcpt:v1:" + hashlib.sha256(_canonical_bytes(receipt_request)).hexdigest()
@@ -1147,7 +1530,7 @@ class QualificationStore:
                 "kind": "qualification-review",
                 "receipt_id": receipt_id,
                 "candidate_id": candidate_id,
-                "candidate_digest": index["candidates"][candidate_id]["digest"],
+                "candidate_digest": candidate_row["digest"],
                 "report_digest": candidate["source"]["report_digest"],
                 "profile_key": candidate["profile_key"],
                 "profile_digest": _sha256(candidate["profile_observation"]),
@@ -1157,10 +1540,17 @@ class QualificationStore:
                 "verdict": verdict,
                 "reviewer": reviewer,
                 "reviewer_authority": {
-                    "kind": "test-only" if test_only else "human",
+                    "kind": "test-only" if test_only else "operator",
                     "reference": reviewer_authority,
                     "policy_revision": policy_revision,
+                    **({
+                        "receipt_id": operator_receipt_id,
+                        "receipt_digest": operator_receipt_digest,
+                    } if not test_only else {}),
                 },
+                "operator_receipt_id": operator_receipt_id,
+                "operator_receipt_digest": operator_receipt_digest,
+                "reason": operator_receipt.get("reason") if operator_receipt is not None else None,
                 "policy_revision": policy_revision,
                 "reviewed_at": _timestamp_text(reviewed),
                 "expires_at": _timestamp_text(expires),
@@ -1198,6 +1588,8 @@ class QualificationStore:
                 "generation": binding["generation"],
                 "revision": index["revision"],
                 "test_only": test_only,
+                "operator_receipt_id": operator_receipt_id,
+                "operator_receipt_digest": operator_receipt_digest,
             }
             index["idempotency"][idem] = {"request_digest": request_digest, "result": result}
             self._write_index_unlocked(index)
@@ -1210,34 +1602,51 @@ class QualificationStore:
         self,
         candidate_id: str,
         *,
-        reviewer: str,
-        reviewer_authority: str,
-        reason: str,
-        revoked_at: str,
+        reviewer: str | None = None,
+        reviewer_authority: str | None = None,
+        reason: str | None = None,
+        revoked_at: str | None = None,
+        operator_receipt_id: str | None = None,
         test_only: bool,
         expected_revision: int,
         idempotency_key: str,
         now: object | None = None,
     ) -> dict[str, object]:
-        reviewer = _nonempty(reviewer, "reviewer")
-        reviewer_authority = _nonempty(reviewer_authority, "reviewer_authority")
-        reason = _nonempty(reason, "reason")
-        revoked = _timestamp(revoked_at, "revoked_at")
         current_time = _parse_now(now)
+        operator_receipt: dict[str, object] | None = None
+        operator_receipt_digest: str | None = None
+        if test_only:
+            if operator_receipt_id is not None:
+                raise QualificationError("test-only revoke cannot use a live operator receipt")
+            reviewer = _nonempty(reviewer, "reviewer")
+            reviewer_authority = _nonempty(reviewer_authority, "reviewer_authority")
+            reason = _nonempty(reason, "reason")
+            revoked = _timestamp(revoked_at, "revoked_at")
+            if reviewer_authority != "test-only":
+                raise QualificationError("test-only revoke requires reviewer_authority=test-only")
+        else:
+            if not operator_receipt_id:
+                raise QualificationError("live revoke requires a governed operator receipt")
+            if any(value is not None for value in (reviewer, reviewer_authority, reason, revoked_at)):
+                raise QualificationError("live revoke details must come from the operator receipt")
+            operator_receipt, operator_receipt_digest = self._read_operator_receipt(operator_receipt_id)
+            reviewer = str(operator_receipt["reviewer"])
+            reviewer_authority = "operator-receipt:" + operator_receipt_id
+            reason = str(operator_receipt["reason"])
+            revoked = _timestamp(operator_receipt["reviewed_at"], "operator receipt reviewed_at")
+        assert reviewer is not None and reviewer_authority is not None and reason is not None
         if revoked > current_time:
             raise QualificationError("revoked_at timestamp is in the future")
-        if test_only and reviewer_authority != "test-only":
-            raise QualificationError("test-only revoke requires reviewer_authority=test-only")
-        if not test_only and not reviewer_authority.startswith("human-receipt:"):
-            raise QualificationError("revoke requires an explicit human receipt authority reference")
         idem = _nonempty(idempotency_key, "idempotency_key")
         request = {
             "operation": "revoke",
             "candidate_id": candidate_id,
-            "reviewer": reviewer,
-            "reviewer_authority": reviewer_authority,
-            "reason": reason,
-            "revoked_at": _timestamp_text(revoked),
+            "operator_receipt_id": operator_receipt_id,
+            "operator_receipt_digest": operator_receipt_digest,
+            "reviewer": reviewer if test_only else None,
+            "reviewer_authority": reviewer_authority if test_only else None,
+            "reason": reason if test_only else None,
+            "revoked_at": _timestamp_text(revoked) if test_only else None,
             "test_only": test_only,
             "expected_revision": expected_revision,
             "idempotency_key": idem,
@@ -1252,6 +1661,9 @@ class QualificationStore:
             candidate = self._candidate(index, candidate_id)
             if candidate["test_only"] is not test_only:
                 raise QualificationError("candidate and receipt test-only markers must match")
+            candidate_row = index["candidates"].get(candidate_id)
+            if not isinstance(candidate_row, Mapping) or not isinstance(candidate_row.get("digest"), str):
+                raise QualificationError("qualification candidate digest is unavailable")
             subject = candidate["subject"]
             binding_id = _binding_key(subject["executor"], subject["model_id"], candidate["profile_key"], subject["role"])
             binding = index["bindings"].get(binding_id)
@@ -1260,9 +1672,42 @@ class QualificationStore:
             if binding.get("state") != "approved" or not binding.get("approval_receipt_id"):
                 raise QualificationConflict("only an approved qualification can be revoked")
             approval = self._receipt(index, binding["approval_receipt_id"])
+            approval_meta = index["receipts"].get(binding["approval_receipt_id"])
+            if not isinstance(approval_meta, Mapping) or not isinstance(approval_meta.get("digest"), str):
+                raise QualificationError("current approval receipt digest is unavailable")
+            if not test_only:
+                assert operator_receipt_id is not None and operator_receipt_digest is not None
+                if approval.get("test_only") is not False:
+                    raise QualificationError("live revoke cannot target a test-only approval")
+                approval_operator_id = approval.get("operator_receipt_id")
+                approval_operator_digest = approval.get("operator_receipt_digest")
+                if not isinstance(approval_operator_id, str) or not isinstance(approval_operator_digest, str):
+                    raise QualificationError("current approval lacks its operator receipt")
+                self._validate_operator_receipt(
+                    approval_operator_id,
+                    candidate,
+                    candidate_row["digest"],
+                    verdict="approved",
+                    expected_digest=approval_operator_digest,
+                )
+                operator_receipt, checked_operator_digest = self._validate_operator_receipt(
+                    operator_receipt_id,
+                    candidate,
+                    candidate_row["digest"],
+                    verdict="revoked",
+                    expected_digest=operator_receipt_digest,
+                    approval_receipt_id=binding["approval_receipt_id"],
+                    approval_receipt_digest=approval_meta["digest"],
+                    now=current_time,
+                )
+                if checked_operator_digest != operator_receipt_digest:
+                    raise QualificationError("operator receipt digest mismatch")
+                reviewer = str(operator_receipt["reviewer"])
+                reason = str(operator_receipt["reason"])
+                revoked = _timestamp(operator_receipt["reviewed_at"], "operator receipt reviewed_at")
             receipt_request = {
                 **request,
-                "candidate_digest": index["candidates"][candidate_id]["digest"],
+                "candidate_digest": candidate_row["digest"],
                 "approval_receipt_id": binding["approval_receipt_id"],
                 "generation": binding["generation"],
             }
@@ -1272,13 +1717,22 @@ class QualificationStore:
                 "kind": "qualification-revocation",
                 "receipt_id": receipt_id,
                 "candidate_id": candidate_id,
-                "candidate_digest": index["candidates"][candidate_id]["digest"],
+                "candidate_digest": candidate_row["digest"],
                 "approval_receipt_id": binding["approval_receipt_id"],
                 "approval_receipt_digest": index["receipts"][binding["approval_receipt_id"]]["digest"],
                 "profile_key": candidate["profile_key"],
                 "role": subject["role"],
                 "reviewer": reviewer,
-                "reviewer_authority": {"kind": "test-only" if test_only else "human", "reference": reviewer_authority},
+                "reviewer_authority": {
+                    "kind": "test-only" if test_only else "operator",
+                    "reference": reviewer_authority,
+                    **({
+                        "receipt_id": operator_receipt_id,
+                        "receipt_digest": operator_receipt_digest,
+                    } if not test_only else {}),
+                },
+                "operator_receipt_id": operator_receipt_id,
+                "operator_receipt_digest": operator_receipt_digest,
                 "reason": reason,
                 "revoked_at": _timestamp_text(revoked),
                 "test_only": test_only,
@@ -1312,6 +1766,8 @@ class QualificationStore:
                 "generation": binding["generation"],
                 "revision": index["revision"],
                 "test_only": test_only,
+                "operator_receipt_id": operator_receipt_id,
+                "operator_receipt_digest": operator_receipt_digest,
             }
             index["idempotency"][idem] = {"request_digest": request_digest, "result": result}
             self._write_index_unlocked(index)
@@ -1417,6 +1873,28 @@ class QualificationStore:
                 continue
             try:
                 candidate = self._candidate(index, binding["candidate_id"])
+                if binding.get("state") == "approved" and candidate.get("test_only") is False:
+                    approval_id = binding.get("approval_receipt_id")
+                    if not isinstance(approval_id, str):
+                        raise QualificationError("approved binding has no receipt id")
+                    approval = self._receipt(index, approval_id)
+                    operator_id = approval.get("operator_receipt_id")
+                    operator_digest = approval.get("operator_receipt_digest")
+                    candidate_meta = index["candidates"].get(binding["candidate_id"])
+                    if (
+                        not isinstance(operator_id, str)
+                        or not isinstance(operator_digest, str)
+                        or not isinstance(candidate_meta, Mapping)
+                        or not isinstance(candidate_meta.get("digest"), str)
+                    ):
+                        raise QualificationError("approved binding has no operator receipt")
+                    self._validate_operator_receipt(
+                        operator_id,
+                        candidate,
+                        candidate_meta["digest"],
+                        verdict="approved",
+                        expected_digest=operator_digest,
+                    )
                 eval_entry = self._eval_entry_for_binding(index, binding, candidate)
             except (QualificationError, KeyError, TypeError):
                 # 無法證明 index 指向的完整鏈時，投影不輸出該列；consumer 也會 fail closed。
@@ -1470,7 +1948,7 @@ class QualificationStore:
         except FileNotFoundError:
             current = None
         if current != desired:
-            _atomic_write_json(self.paths.roster_path, roster)
+            _atomic_write_json(self.paths.roster_path, roster, governed_parent=not self._test_root)
 
     def _prune_orphans_unlocked(self, index: Mapping[str, object]) -> None:
         indexed_candidates = index["candidates"]
@@ -1596,6 +2074,29 @@ class QualificationStore:
             or receipt.get("scope", {}).get("coverage") != candidate.get("coverage", {}).get("state")
         ):
             return {"state": "unknown", "reason": "receipt-binding-mismatch"}
+        if candidate.get("test_only") is False:
+            operator_id = receipt.get("operator_receipt_id")
+            operator_digest = receipt.get("operator_receipt_digest")
+            candidate_meta = index["candidates"].get(binding["candidate_id"])
+            if (
+                receipt.get("reviewer_authority", {}).get("kind") != "operator"
+                or not isinstance(operator_id, str)
+                or not isinstance(operator_digest, str)
+                or not isinstance(candidate_meta, Mapping)
+                or not isinstance(candidate_meta.get("digest"), str)
+            ):
+                return {"state": "unknown", "reason": "operator-receipt-unavailable"}
+            try:
+                self._validate_operator_receipt(
+                    operator_id,
+                    candidate,
+                    candidate_meta["digest"],
+                    verdict="approved",
+                    expected_digest=operator_digest,
+                    now=now,
+                )
+            except (QualificationError, OSError, KeyError, TypeError):
+                return {"state": "unknown", "reason": "operator-receipt-invalid"}
         coverage = candidate.get("coverage", {})
         if coverage.get("state") != "complete":
             return {"state": "unknown", "reason": "coverage-incomplete" if coverage.get("state") == "incomplete" else "coverage-unknown"}
@@ -1606,7 +2107,7 @@ class QualificationStore:
             return {"state": "unknown", "reason": "observed-profile-incomplete"}
         if candidate.get("measurement", {}).get("verdict") != "pass":
             return {"state": "unknown", "reason": "report-verdict-not-pass"}
-        if receipt.get("reviewer_authority", {}).get("kind") != ("test-only" if receipt.get("test_only") else "human"):
+        if receipt.get("reviewer_authority", {}).get("kind") != ("test-only" if receipt.get("test_only") else "operator"):
             return {"state": "unknown", "reason": "reviewer-authority-invalid"}
 
         watermarks = index["clock_watermarks"]
@@ -1753,7 +2254,27 @@ class QualificationStore:
                 candidate = self._candidate(index, binding["candidate_id"])
                 if binding.get("state") == "approved":
                     receipt = self._receipt(index, binding["approval_receipt_id"])
-                    return receipt.get("candidate_id") == candidate.get("candidate_id")
+                    if receipt.get("candidate_id") != candidate.get("candidate_id"):
+                        return False
+                    if receipt.get("test_only") is False:
+                        operator_id = receipt.get("operator_receipt_id")
+                        operator_digest = receipt.get("operator_receipt_digest")
+                        candidate_meta = index["candidates"].get(binding["candidate_id"])
+                        if (
+                            not isinstance(operator_id, str)
+                            or not isinstance(operator_digest, str)
+                            or not isinstance(candidate_meta, Mapping)
+                            or not isinstance(candidate_meta.get("digest"), str)
+                        ):
+                            return False
+                        self._validate_operator_receipt(
+                            operator_id,
+                            candidate,
+                            candidate_meta["digest"],
+                            verdict="approved",
+                            expected_digest=operator_digest,
+                        )
+                    return True
                 if binding.get("state") == "revoked":
                     receipt = self._receipt(index, binding["revocation_receipt_id"])
                     return receipt.get("approval_receipt_id") == binding.get("approval_receipt_id")

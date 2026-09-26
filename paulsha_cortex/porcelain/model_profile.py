@@ -74,11 +74,23 @@ def _build_parser() -> argparse.ArgumentParser:
     import_report.add_argument("--expected-revision", required=True, type=int, help="CAS index revision")
     import_report.add_argument("--idempotency-key", required=True, help="本次匯入的穩定冪等鍵")
 
-    review = qualification_sub.add_parser("review", help="對 exact candidate 發出 approved/rejected receipt")
+    approve = qualification_sub.add_parser(
+        "approve", help="經 operator 確認核發受治理 receipt，並發布 exact candidate"
+    )
+    approve.add_argument("candidate_id")
+    approve.add_argument("--actor", required=True, help="真人 operator／reviewer 識別")
+    approve.add_argument("--reason", required=True, help="核可理由，會寫入不可變 receipt")
+    approve.add_argument("--policy-revision", required=True, help="核可政策版本")
+    approve.add_argument("--reviewed-at", required=True, help="含時區的 ISO-8601 核可時間")
+    approve.add_argument("--expires-at", required=True, help="含時區的 ISO-8601 receipt 到期時間")
+    approve.add_argument("--expected-revision", required=True, type=int, help="CAS index revision")
+    approve.add_argument("--idempotency-key", required=True, help="本次核可的穩定冪等鍵")
+    approve.add_argument("--yes", action="store_true", help="明示確認；非互動呼叫必須提供")
+
+    review = qualification_sub.add_parser("review", help="測試專用 review；live 核可請用 approve")
     review.add_argument("candidate_id")
     review.add_argument("--verdict", required=True, choices=("approved", "rejected"))
     review.add_argument("--reviewer", required=True, help="真人複核者識別")
-    review.add_argument("--authority-ref", default=None, help="真人核可 receipt 參照；測試收據改用 --test-only")
     review.add_argument("--policy-revision", required=True, help="核可政策版本")
     review.add_argument("--reviewed-at", required=True, help="含時區的 ISO-8601 核可時間")
     review.add_argument("--expires-at", required=True, help="含時區的 ISO-8601 到期時間")
@@ -86,15 +98,17 @@ def _build_parser() -> argparse.ArgumentParser:
     review.add_argument("--expected-revision", required=True, type=int, help="CAS index revision")
     review.add_argument("--idempotency-key", required=True, help="本次複核的穩定冪等鍵")
 
-    revoke = qualification_sub.add_parser("revoke", help="撤銷目前 generation；不改寫既有 attempt/evidence")
+    revoke = qualification_sub.add_parser("revoke", help="經 operator 確認撤銷目前 generation")
     revoke.add_argument("candidate_id")
-    revoke.add_argument("--reviewer", required=True, help="執行撤銷者識別")
-    revoke.add_argument("--authority-ref", default=None, help="真人撤銷 authority receipt 參照；測試改用 --test-only")
+    revoke.add_argument("--actor", required=True, help="真人 operator／撤銷者識別")
     revoke.add_argument("--reason", required=True, help="撤銷理由")
+    revoke.add_argument("--policy-revision", required=True, help="撤銷政策版本")
     revoke.add_argument("--revoked-at", required=True, help="含時區的 ISO-8601 撤銷時間")
+    revoke.add_argument("--expires-at", required=True, help="含時區的 ISO-8601 receipt 到期時間")
     revoke.add_argument("--test-only", action="store_true", help="建立 live policy 永不採信的測試 receipt")
     revoke.add_argument("--expected-revision", required=True, type=int, help="CAS index revision")
     revoke.add_argument("--idempotency-key", required=True, help="本次撤銷的穩定冪等鍵")
+    revoke.add_argument("--yes", action="store_true", help="明示確認；非互動呼叫必須提供")
 
     status = qualification_sub.add_parser("status", help="精確查詢 roster qualification；不修改 workflow")
     status.add_argument("--executor", required=True)
@@ -183,6 +197,19 @@ def main(argv: Sequence[str]) -> int:
     return 0
 
 
+def _confirm_operator_action(args: argparse.Namespace, *, action: str) -> None:
+    if args.yes:
+        return
+    if not sys.stdin.isatty():
+        raise ValueError(f"non-interactive {action} requires explicit --yes")
+    answer = input(
+        f"確認 {action} candidate {args.candidate_id}，actor={args.actor!r}，"
+        f"reason={args.reason!r}？[y/N] "
+    )
+    if answer.strip().lower() not in {"y", "yes"}:
+        raise ValueError(f"{action} was not confirmed")
+
+
 def _qualification_main(args: argparse.Namespace) -> int:
     from paulsha_cortex.coordinator.qualification_lifecycle import QualificationStore
 
@@ -214,34 +241,70 @@ def _qualification_main(args: argparse.Namespace) -> int:
                 expected_revision=args.expected_revision,
                 idempotency_key=args.idempotency_key,
             )
+        elif args.qualification_command == "approve":
+            _confirm_operator_action(args, action="核可")
+            operator_receipt = store.issue_operator_receipt(
+                args.candidate_id,
+                verdict="approved",
+                actor=args.actor,
+                reason=args.reason,
+                policy_revision=args.policy_revision,
+                reviewed_at=args.reviewed_at,
+                expires_at=args.expires_at,
+            )
+            result = store.review_candidate(
+                args.candidate_id,
+                verdict="approved",
+                operator_receipt_id=operator_receipt["operator_receipt_id"],
+                test_only=False,
+                expected_revision=args.expected_revision,
+                idempotency_key=args.idempotency_key,
+            )
         elif args.qualification_command == "review":
-            if not args.test_only and not args.authority_ref:
-                raise ValueError("approved/rejected live review requires --authority-ref")
+            if not args.test_only:
+                raise ValueError("review is test-only; use qualification approve for a live approval")
             result = store.review_candidate(
                 args.candidate_id,
                 verdict=args.verdict,
                 reviewer=args.reviewer,
-                reviewer_authority="test-only" if args.test_only else f"human-receipt:{args.authority_ref}",
+                reviewer_authority="test-only",
                 policy_revision=args.policy_revision,
                 reviewed_at=args.reviewed_at,
                 expires_at=args.expires_at,
-                test_only=args.test_only,
+                test_only=True,
                 expected_revision=args.expected_revision,
                 idempotency_key=args.idempotency_key,
             )
         elif args.qualification_command == "revoke":
-            if not args.test_only and not args.authority_ref:
-                raise ValueError("live revoke requires --authority-ref")
-            result = store.revoke_qualification(
-                args.candidate_id,
-                reviewer=args.reviewer,
-                reviewer_authority="test-only" if args.test_only else f"human-receipt:{args.authority_ref}",
-                reason=args.reason,
-                revoked_at=args.revoked_at,
-                test_only=args.test_only,
-                expected_revision=args.expected_revision,
-                idempotency_key=args.idempotency_key,
-            )
+            if args.test_only:
+                result = store.revoke_qualification(
+                    args.candidate_id,
+                    reviewer=args.actor,
+                    reviewer_authority="test-only",
+                    reason=args.reason,
+                    revoked_at=args.revoked_at,
+                    test_only=True,
+                    expected_revision=args.expected_revision,
+                    idempotency_key=args.idempotency_key,
+                )
+            else:
+                _confirm_operator_action(args, action="撤銷")
+                operator_receipt = store.issue_operator_receipt(
+                    args.candidate_id,
+                    verdict="revoked",
+                    actor=args.actor,
+                    reason=args.reason,
+                    policy_revision=args.policy_revision,
+                    reviewed_at=args.revoked_at,
+                    expires_at=args.expires_at,
+                )
+                result = store.revoke_qualification(
+                    args.candidate_id,
+                    operator_receipt_id=operator_receipt["operator_receipt_id"],
+                    test_only=False,
+                    expected_revision=args.expected_revision,
+                    idempotency_key=args.idempotency_key,
+                )
         elif args.qualification_command == "status":
             result = store.qualification_status(
                 args.executor, args.model_id, args.profile_key, args.role

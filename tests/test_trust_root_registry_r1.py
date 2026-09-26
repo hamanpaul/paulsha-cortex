@@ -137,6 +137,33 @@ def test_execution_qualification_state_is_registered_manager_only() -> None:
     assert check_registry_equation().ok
 
 
+def test_execution_qualification_operator_receipts_are_governed_and_job_unwritable() -> None:
+    """Live approval receipts are operator/Manager writable and unavailable to job writers."""
+    from paulsha_cortex.trust_root import permgen
+
+    asset = registry.asset_by_id("execution-qualification-operator-receipts")
+    assert asset.tier is AssetTier.TIER_0
+    assert asset.tree is TrustTree.MANAGER_OWNED
+    assert asset.writers == (Principal.MANAGER, Principal.OPERATOR)
+    assert asset.readers == (Principal.MANAGER, Principal.OPERATOR)
+    assert asset.path_resolver == (
+        "paulsha_cortex.config.paths:execution_qualification_operator_receipts_root"
+    )
+    assert permgen.DEFAULT_LAYOUT.asset_paths()[asset.asset_id] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/execution-qualification/operator-receipts"
+    )
+    index = registry.asset_by_id("execution-qualification-operator-receipt-index")
+    assert index.writers == (Principal.MANAGER,)
+    assert index.readers == (Principal.MANAGER,)
+    assert index.path_resolver == (
+        "paulsha_cortex.config.paths:execution_qualification_operator_receipt_registry_path"
+    )
+    assert permgen.DEFAULT_LAYOUT.asset_paths()[index.asset_id] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/execution-qualification/operator-receipt-index.json"
+    )
+    assert check_registry_equation().ok
+
+
 def test_all_three_headless_personas_covered() -> None:
     """spec §R1：盤點必須涵蓋 builder／reviewer／planner 三者，不能只封 builder。"""
     assert registry.personas_covered() == HEADLESS_PERSONAS

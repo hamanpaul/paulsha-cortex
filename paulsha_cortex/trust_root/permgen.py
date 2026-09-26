@@ -2296,8 +2296,22 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
         writer_accounts = {owner}
         # 基準 owner-only（dir 0700／file 0600）；跨帳號讀取一律走精確 ACL（唯讀）。
         mode = _dir_file_mode(is_dir, 0o7 if is_dir else 0o6, 0, 0)
+        operator_writer = (
+            Principal.MANAGER in asset.writers
+            and Principal.OPERATOR in asset.writers
+        )
+        operator_account = scheme.resolve(Principal.OPERATOR) if operator_writer else None
+        if operator_account is not None and operator_account != owner:
+            # #842 operator approval receipts are the one Manager-state write surface shared
+            # with the operator. Default ACLs preserve both principals' access to files the
+            # other creates; no headless principal is part of this writer set.
+            acls.append(AclEntry(operator_account, "rwx" if is_dir else "rw"))
+            if is_dir:
+                acls.append(AclEntry(operator_account, "rwx", default=True))
+                acls.append(AclEntry(owner, "rwX", default=True))
+            writer_accounts.add(operator_account)
         for racct in sorted(reader_accounts):
-            if racct == owner:
+            if racct == owner or (operator_account is not None and racct == operator_account):
                 continue
             acls.append(AclEntry(racct, "rX" if is_dir else "r"))
         rationale = (
@@ -3531,8 +3545,14 @@ class PathLayout:
             "runtime-agents-tree": a,
             "control-root-tree": ctl,
             "coordinator-root-tree": c,
+            # 容器本身獨立登記為資產（見 config/paths.py 的
+            # execution_qualification_root 註解），子資產才有 managed parent
+            # 可承接 install-plan 的直接 parent 檢查與 operator traverse ACL。
+            "execution-qualification-tree": f"{c}/execution-qualification",
             "execution-qualification-candidates": f"{c}/execution-qualification/candidates",
             "execution-qualification-receipts": f"{c}/execution-qualification/receipts",
+            "execution-qualification-operator-receipts": f"{c}/execution-qualification/operator-receipts",
+            "execution-qualification-operator-receipt-index": f"{c}/execution-qualification/operator-receipt-index.json",
             "execution-qualification-roster": f"{c}/execution-qualification/approved-roster.json",
             "execution-qualification-index": f"{c}/execution-qualification/index.json",
             "dispatch-specs-tree": self.specs_root,

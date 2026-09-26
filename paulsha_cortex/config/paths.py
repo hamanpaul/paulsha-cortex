@@ -61,24 +61,46 @@ def coordinator_root() -> Path:
 _EXECUTION_QUALIFICATION_DIRNAME = "execution-qualification"
 
 
+def execution_qualification_root() -> Path:
+    """#842 qualification lifecycle 共用容器；本身即獨立登記的 Trust Root 資產。
+
+    獨立登記（而非留白讓子資產隱含建立）是必要的：Trust Root 的 install-plan
+    驗證要求每個 managed directory step 的直接 parent 也必須是 managed step，
+    而 operator 對 ``operator-receipts/`` 的跨帳號 traverse ACL grant 也只能
+    附掛在既有 managed step 上；未登記的共用子目錄兩者都無法承接（見
+    tests/test_trust_root_install_plan.py 的完整 plan 驗證）。
+    """
+    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME
+
+
 def execution_qualification_candidates_root() -> Path:
     """#842 immutable report-bound candidates；僅 Manager 可寫。"""
-    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME / "candidates"
+    return execution_qualification_root() / "candidates"
 
 
 def execution_qualification_receipts_root() -> Path:
     """#842 immutable human-review/revocation receipts；僅 Manager 可寫。"""
-    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME / "receipts"
+    return execution_qualification_root() / "receipts"
+
+
+def execution_qualification_operator_receipts_root() -> Path:
+    """#842 經 operator CLI 核發、由 Manager 消費的不可變核可 receipts。"""
+    return execution_qualification_root() / "operator-receipts"
+
+
+def execution_qualification_operator_receipt_registry_path() -> Path:
+    """#842 Manager-only allowlist binding operator receipt ids to stored digests。"""
+    return execution_qualification_root() / "operator-receipt-index.json"
 
 
 def execution_qualification_roster_path() -> Path:
     """#842 可重建的 approved qualification roster 投影。"""
-    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME / "approved-roster.json"
+    return execution_qualification_root() / "approved-roster.json"
 
 
 def execution_qualification_index_path() -> Path:
     """#842 CAS revision、binding 與 lifecycle index 唯一真值。"""
-    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME / "index.json"
+    return execution_qualification_root() / "index.json"
 
 
 def coverage_shadow_telemetry_root() -> Path:

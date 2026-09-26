@@ -1683,6 +1683,16 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         note="jobs.json／evidence 樹／journal 的容器；實測 drwxrwxr-x（group-writable）。",
     ),
     TrustRootAsset(
+        "execution-qualification-tree", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_root",
+        (Principal.MANAGER,), (Principal.MANAGER, Principal.OPERATOR), IngressKind.MANAGER_INTERNAL,
+        note=(
+            "#842 qualification lifecycle 共用容器；獨立登記使子資產各自有明確的 "
+            "managed parent，operator 對 operator-receipts 的 traverse ACL 才有處掛。"
+            "沿用 control-root-tree 的既有模式（容器 Operator 可讀，特定子資產才可寫）。"
+        ),
+    ),
+    TrustRootAsset(
         "execution-qualification-candidates", _T0, _MO,
         "paulsha_cortex.config.paths:execution_qualification_candidates_root",
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
@@ -1693,6 +1703,25 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         "paulsha_cortex.config.paths:execution_qualification_receipts_root",
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
         note="#842 immutable human-review 與撤銷 receipts；授權只綁 exact candidate。",
+    ),
+    TrustRootAsset(
+        "execution-qualification-operator-receipts", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_operator_receipts_root",
+        (Principal.MANAGER, Principal.OPERATOR), (Principal.MANAGER, Principal.OPERATOR),
+        IngressKind.MANAGER_INTERNAL,
+        note=(
+            "#842 operator CLI 核發的人工作業 receipt；僅 Operator／Manager 可寫，"
+            "降權 job 不可寫，Manager 發布前仍核對 receipt digest 與 candidate binding。"
+        ),
+    ),
+    TrustRootAsset(
+        "execution-qualification-operator-receipt-index", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_operator_receipt_registry_path",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note=(
+            "#842 Manager-only allowlist；untrusted operator-receipt files without a matching "
+            "registered id and digest are never accepted for publish or roster queries."
+        ),
     ),
     TrustRootAsset(
         "execution-qualification-roster", _T0, _MO,
