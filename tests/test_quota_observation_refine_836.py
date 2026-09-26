@@ -212,6 +212,138 @@ def _pool_row(report, pool_id: str, window_id: str):
     )
 
 
+def test_ac2_codex_app_server_v2_camel_case_fields_are_observed():
+    sources, _, _ = _feature_api()
+    semantics = "provider:openai-codex-app-server/rate-limit-percent/v2"
+    descriptor = _pool_descriptor(
+        unit_id="codex-percent", semantics_ref=semantics, windows=(("short", 300_000),)
+    )
+    target = sources.ProviderQuotaTarget(
+        resource_key="codex:shared:primary",
+        binding=_binding((descriptor,), _PROFILE_A),
+        descriptor=descriptor,
+        window_id="short",
+    )
+    capture = sources.capture_provider_quota(
+        "codex",
+        {"result": {"rateLimits": {
+            "limitId": "shared",
+            "primary": {
+                "usedPercent": 40,
+                "windowDurationMins": 5,
+                "resetsAt": 1_800_001_000,
+            },
+        }}},
+        profile_key=_PROFILE_A,
+        targets=(target,),
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        observed_at_ms=_NOW,
+    )
+    assert not capture.gaps
+    wire = capture.observations[0].to_dict()
+    assert wire["measurement"]["quantity"]["amount"] == {
+        "kind": "exact", "value": "60"
+    }
+    assert wire["reset_at_ms"] == {"state": "known", "value": 1_800_001_000_000}
+
+    reset_unavailable = sources.capture_provider_quota(
+        "codex",
+        {"result": {"rateLimits": {
+            "limitId": "shared",
+            "primary": {
+                "usedPercent": 40,
+                "windowDurationMins": None,
+                "resetsAt": None,
+            },
+        }}},
+        profile_key=_PROFILE_A,
+        targets=(target,),
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        observed_at_ms=_NOW,
+    )
+    assert not reset_unavailable.gaps
+    reset_wire = reset_unavailable.observations[0].to_dict()
+    assert reset_wire["measurement"]["quantity"]["amount"] == {
+        "kind": "exact", "value": "60"
+    }
+    assert reset_wire["reset_at_ms"] == {
+        "state": "unknown", "reason": "provider-reset-unavailable"
+    }
+
+    unknown_shape = sources.capture_provider_quota(
+        "codex",
+        {"result": {"rateLimits": {
+            "limitId": "shared",
+            "primary": {"used_pct": 40, "window_mins": 5, "resets": 1_800_001_000},
+        }}},
+        profile_key=_PROFILE_A,
+        targets=(target,),
+        descriptors=(descriptor,),
+        unit_catalog=(),
+        observed_at_ms=_NOW,
+    )
+    assert unknown_shape.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
+
+
+def test_ac5_missing_provider_event_derived_identity_conflict_is_unknown(tmp_path):
+    _, ledger_module, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    service = shadow_module.QuotaShadowService(
+        ledger_module.QuotaEventLedger(tmp_path / "quota-events.jsonl")
+    )
+    first = _observation(
+        descriptor, "short", value="18", observed_at_ms=_NOW, event_id=None,
+    )
+    conflicting = deepcopy(first.to_dict())
+    conflicting["measurement"]["quantity"]["amount"]["value"] = "7"
+
+    assert first.observation_id == schema.parse_observation(
+        conflicting, descriptors=(descriptor,), unit_catalog=()
+    ).observation_id
+    assert service.record_observation(
+        first.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+    result = service.record_observation(
+        conflicting, descriptors=(descriptor,), unit_catalog=()
+    )
+    assert result.status == "conflict"
+    records = ledger_module.QuotaEventLedger(tmp_path / "quota-events.jsonl").read().events
+    assert any(row.get("kind") == "conflict" for row in records)
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 1
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "unknown"
+    assert "source-conflict" in row["coverage_gaps"]
+
+
+def test_ac5_reset_expiration_makes_snapshot_unknown_before_ttl():
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    service = shadow_module.QuotaShadowService.in_memory()
+    snapshot = _observation(
+        descriptor,
+        "short",
+        value="0",
+        observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 100,
+        ttl_ms=60_000,
+    )
+    assert service.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 101
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "unknown"
+    assert "stale-snapshot" in row["coverage_gaps"]
+
+
 def test_ac1_multimodel_shared_pool_independent_pool_and_all_windows_are_separate():
     _, _, shadow_module = _feature_api()
     descriptor_shared = _pool_descriptor()

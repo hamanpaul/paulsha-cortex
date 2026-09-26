@@ -253,7 +253,30 @@ def _idempotency_key(observation, wire, caller_key):
             "metric_id": measurement.get("metric_id"),
             "kind": measurement.get("kind"),
         })).hexdigest()
-    return "content:" + hashlib.sha256(_canonical_bytes(wire)).hexdigest()
+    measurement = wire.get("measurement", {})
+    scope = _scope_summary(wire)
+    observed_at_ms = _known_value(wire.get("observed_at_ms"))
+    source = wire.get("source", {})
+    if scope.get("state") == "known" and type(observed_at_ms) is int:
+        # Without a provider event ID, use stable observation coordinates rather
+        # than content: a changed quantity at the same source/scope/time must
+        # collide and create a conflict receipt.
+        derived_identity = {
+            "source_id": source.get("source_id"),
+            "source_schema": source.get("source_schema"),
+            "method": source.get("method"),
+            "scope": scope,
+            "metric_id": measurement.get("metric_id"),
+            "kind": measurement.get("kind"),
+            "observed_at_ms": observed_at_ms,
+        }
+        return "derived:" + hashlib.sha256(_canonical_bytes(derived_identity)).hexdigest()
+    # Unknown coordinates cannot safely be coalesced across receipts. Keep
+    # replay detection stable by using the caller observation ID, not payload.
+    return "receipt:" + hashlib.sha256(_canonical_bytes({
+        "source_id": observation.source_id,
+        "observation_id": observation.observation_id,
+    })).hexdigest()
 
 
 def _scope_summary(wire):

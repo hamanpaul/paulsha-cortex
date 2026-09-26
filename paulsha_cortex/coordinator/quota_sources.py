@@ -255,7 +255,7 @@ def _parse_codex(payload: dict[str, Any], targets):
     limits = body.get("rateLimits", body.get("rate_limits", body))
     if not isinstance(limits, dict):
         return {}
-    limit_id = limits.get("limit_id", limits.get("limitId"))
+    limit_id = limits.get("limitId", limits.get("limit_id"))
     if not isinstance(limit_id, str) or not limit_id:
         return {}
     result = {}
@@ -267,22 +267,28 @@ def _parse_codex(payload: dict[str, Any], targets):
         window = limits.get(window_name)
         if not isinstance(window, dict):
             continue
-        used = window.get("used_percent")
-        duration = window.get("window_duration_mins")
-        reset_seconds = window.get("resets_at")
+        used = window.get("usedPercent", window.get("used_percent"))
+        duration = window.get("windowDurationMins", window.get("window_duration_mins"))
+        reset_seconds = window.get("resetsAt", window.get("resets_at"))
         expected = next((item.get("duration_ms") for item in target.descriptor.to_dict()["windows"]
                          if item.get("window_id") == target.window_id), None)
         if (type(used) is not int or used < 0 or used > 100
-                or type(duration) is not int or duration <= 0
-                or type(reset_seconds) is not int or reset_seconds < 0
-                or reset_seconds * 1000 > _TIME_MAX_MS
-                or expected is None or expected != duration * 60_000):
+                or (duration is not None and (
+                    type(duration) is not int or duration <= 0
+                    or expected is None or expected != duration * 60_000
+                ))
+                or (reset_seconds is not None and (
+                    type(reset_seconds) is not int or reset_seconds < 0
+                    or reset_seconds * 1000 > _TIME_MAX_MS
+                ))
+                or expected is None):
             result[target.resource_key] = (None, None, "invalid-provider-value")
             continue
         if _target_semantics(target) != _CODEX_UNIT:
             result[target.resource_key] = (None, None, "provider-unit-mapping-mismatch")
             continue
-        result[target.resource_key] = (str(100 - used), reset_seconds * 1000, None)
+        reset_at_ms = None if reset_seconds is None else reset_seconds * 1000
+        result[target.resource_key] = (str(100 - used), reset_at_ms, None)
     return result
 
 
