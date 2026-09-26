@@ -21,6 +21,8 @@ def test_umbrella_help_lists_public_command_families(capsys) -> None:
     assert "deck" in captured.out
     assert "monitor" in captured.out
     assert "tick" in captured.out
+    assert "delivery" in captured.out
+    assert "需求交付缺額" in captured.out
     assert "work             透過 Manager 單一 writer" in captured.out
     assert "dispatch         已停用" in captured.out
 

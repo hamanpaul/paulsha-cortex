@@ -58,6 +58,11 @@ def coordinator_root() -> Path:
     return resolve_runtime_root("PSC_COORDINATOR_ROOT")
 
 
+def requirement_delivery_index_root() -> Path:
+    """Manager-owned, read-only-rebuildable requirement delivery index root."""
+    return coordinator_root() / "requirement-delivery"
+
+
 def coverage_shadow_telemetry_root() -> Path:
     """v4 R1（方案 A）coverage validator shadow 的 disagreement telemetry 落點。
 

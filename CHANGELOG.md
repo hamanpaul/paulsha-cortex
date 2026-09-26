@@ -9,6 +9,8 @@
 
 ### Added
 
+- **#845 refine requirement delivery accounting**：新增 R01–R14 版本化 manifest、逐項 evidence stage validator 與機讀 gaps；consumer 重驗正式 CompletionRecord/WorkAuthority/remote closure，直接消費 #841 loaded-runtime receipt，並以 Trust Root 登記的 CAS 原子索引保存 provenance、stale history 與 recovery gaps。新增唯讀 `cortex delivery status/gaps` 及 sidecar-only `reconcile`，同步 README 與操作契約；無 live validator/receipt 時 fail-closed 保留缺額。
+
 - **#843 recovery action conformance**：新增版本化 action registry 與 13 家族契約矩陣，並以 dispatcher、control contract、coordinator CLI、`cortex recover` work/slice alias 雙向核對正式名稱與 CAS 欄位；補上 retry candidate CLI CAS、recover/abandon crash/restart 參數化特性與 frozen same-domain reviewer pin 零派工負控制。既有 producer gap 和 live 驗收界線記錄於矩陣。
 
 ### Fixed

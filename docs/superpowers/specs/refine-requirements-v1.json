@@ -1,0 +1,574 @@
+{
+  "schema": "cortex/requirement-manifest/v1",
+  "manifest_id": "cortex-refine-complete-r14",
+  "authority_ref": {
+    "kind": "accepted-plan",
+    "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+    "revision": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+  },
+  "requirements": [
+    {
+      "id": "R01",
+      "revision": "2026-09-07:R01:v1",
+      "title": "Monitor 堆積與 freshness",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R01-AC1",
+          "description": "有界 refresh worker、事件合併、provider 公平性與時間上限，並保留 last-good 與 stale 原因。 驗收證據：fake clock 壓力下 worker/backlog 有界；GitHub 不被本地刷新餓死；stop 可退出；故障保留 last-good。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#827",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#827"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R02",
+      "revision": "2026-09-07:R02:v1",
+      "title": "Manager tick 熱迴圈",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R02-AC1",
+          "description": "skip/success/failure 均有明確下次 eligibility，max_load/require_idle 有效值可見且可設定。 驗收證據：持續 not-idle 時 periodic 呼叫受 interval 限制；skip 不計 failure；非法與非有限配置可診斷；bypass 不冒充 idle。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#819",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#819"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R03",
+      "revision": "2026-09-07:R03:v1",
+      "title": "evidence／terminal 冪等",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R03-AC1",
+          "description": "同內容/狀態不重複產生 evidence；真變更僅記一次；舊 attempt 不得改現行 candidate 或 completion。 驗收證據：同 path 內容變更、重複 tick、restart、delayed terminal、retry generation 均有回歸；evidence hash 與 contract hash 語意分離。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#496",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#496",
+            "hamanpaul/paulsha-cortex#497",
+            "hamanpaul/paulsha-cortex#501"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R04",
+      "revision": "2026-09-07:R04:v1",
+      "title": "Registry 寫入放大",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R04-AC1",
+          "description": "no-op 不落盤、history 有界且必要 audit 可追、tmp sweep 受控，並控制 rollback 與相容性成本。 驗收證據：no-op 零寫入；history rotation 可追；crash recovery/migration/reader schema 通過；真變更正確持久化。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#821",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#821"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R05",
+      "revision": "2026-09-07:R05:v1",
+      "title": "額度／預估／fallback",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R05-AC1",
+          "description": "多池與時間窗觀測、任務需求預估、並行額度預留、動態候選選擇、持久退避與 reset reconciliation。 驗收證據：不足候選派前拒絕；同池切模型仍排除；跨池候選可選；並行不超額預留；restart 不丟狀態；不足預估/外部消耗可修正；未知額度不視為足夠。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#825",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#825",
+            "hamanpaul/paulsha-cortex#835",
+            "hamanpaul/paulsha-cortex#836",
+            "hamanpaul/paulsha-cortex#837",
+            "hamanpaul/paulsha-cortex#838",
+            "hamanpaul/paulsha-cortex#839"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R06",
+      "revision": "2026-09-07:R06:v1",
+      "title": "失敗分類失真",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R06-AC1",
+          "description": "保留結構化原始原因、phase、retryability、reset 與診斷鏈，planning/build/review 共用語意。 驗收證據：auth/quota/rate-limit/unsupported effort/127/missing handle/schema/content 有真 fixture；根因跨 phase 不失去恢復資訊；Unicode terminal 不誤判缺 JSON。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#826",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#826"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R07",
+      "revision": "2026-09-07:R07:v1",
+      "title": "Recovery 語意與可恢復性",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R07-AC1",
+          "description": "定義 resume/retry/recover/abandon 的前置條件、effect、generation、資源處置與合法 next_actions；解除綁定須生效。 驗收證據：狀態矩陣、重送冪等、CAS mismatch、restart、late evidence、merged work 禁止重派皆有證據；僅清受控 attempt 資源。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#497",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#497",
+            "hamanpaul/paulsha-cortex#545",
+            "hamanpaul/paulsha-cortex#546",
+            "hamanpaul/paulsha-cortex#547",
+            "hamanpaul/paulsha-cortex#577"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R08",
+      "revision": "2026-09-07:R08:v1",
+      "title": "model/agent/effort 彈性",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R08-AC1",
+          "description": "使用可擴充 capability/adapter；分離任務需求與執行配置；支援 effort 解析及 operator preference/pin。 驗收證據：新增 model/effort 只需 descriptor 即可走既有 adapter；新 runtime 只需 adapter/conformance；unsupported spawn 前拒絕；requested/resolved 可對照。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#483",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#483",
+            "hamanpaul/paulsha-cortex#581",
+            "hamanpaul/paulsha-cortex#835"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R09",
+      "revision": "2026-09-07:R09:v1",
+      "title": "評測／探活／實務紀錄",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R09-AC1",
+          "description": "整合 PatchMUD qualification、角色 deck、完整 profile fingerprint、版本化核可清單、TTL probe 與分層 track-record。 驗收證據：真 report 可連到核可條目與派工 profile；未測量維度為 unknown；effort/adapter/toolchain 變更不沿用不相容評分；評測不阻塞 tick。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#452",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#452",
+            "hamanpaul/paulsha-cortex#454",
+            "hamanpaul/paulsha-cortex#466",
+            "hamanpaul/paulsha-cortex#534",
+            "hamanpaul/paulsha-patchmud#37"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R10",
+      "revision": "2026-09-07:R10:v1",
+      "title": "狀態真實性與可解釋性",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R10-AC1",
+          "description": "呈現 actual/planned/last execution、facets、等待額度/恢復原因、有效配置及選模依據；read model 不寫 workflow。 驗收證據：retry 換模型、多卡同 phase、跨 repo、未派工/已退出皆不猜測；needs_human 保留；status sections 與 source job binding 一致。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#828",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#828",
+            "hamanpaul/paulsha-cortex#840"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R11",
+      "revision": "2026-09-07:R11:v1",
+      "title": "runtime／release 一致性",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R11-AC1",
+          "description": "辨識 CLI 安裝、服務載入 revision、設定 revision、artifact digest，並保留受治理 upgrade/restart/rollback 與 source override receipt。 驗收證據：checkout 外 CLI 與服務長駐程序分別取證；source merge 不冒稱程序已更新；upgrade/rollback 不丟 active jobs。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#841",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#841"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R12",
+      "revision": "2026-09-07:R12:v1",
+      "title": "instance／工作所有權",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R12-AC1",
+          "description": "隔離 instance roots、workspaces、writer、清理 owner 與共享 quota authority；installer/doctor 同源檢查。 驗收證據：multi-instance 並行/restart 不互寫；owner-aware stop/cleanup 不影響他人；共享 quota 不雙重預留；dirty artifacts 不混入下游 commit。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#818",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#818",
+            "hamanpaul/paulsha-cortex#800",
+            "hamanpaul/paulsha-cortex#476"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R13",
+      "revision": "2026-09-07:R13:v1",
+      "title": "launcher／parser 基礎可靠性",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R13-AC1",
+          "description": "驗 argv 引號/逗號解析、process/session lifecycle、timeout/cancel、terminal envelope/enum 與 adapter conformance。 驗收證據：argv round-trip；取消單 job 不連坐 manager；manager restart 有獨立證據；timeout 可設定解析；LF/CRLF/Unicode 保真，不放寬 carrier/schema。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#822",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#822",
+            "hamanpaul/paulsha-cortex#823",
+            "hamanpaul/paulsha-cortex#824",
+            "hamanpaul/paulsha-cortex#807",
+            "hamanpaul/paulsha-cortex#820",
+            "hamanpaul/paulsha-cortex#860"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    },
+    {
+      "id": "R14",
+      "revision": "2026-09-07:R14:v1",
+      "title": "進件／驗證／交付脫節",
+      "source_ref": {
+        "locator": "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md",
+        "sha256": "420972386c66c58980f1a04a1770d3948bd9a39173fdc6313d9989bc1f3f276f"
+      },
+      "acceptance_criteria": [
+        {
+          "id": "R14-AC1",
+          "description": "建立唯一需求來源、coverage matrix、逐項 evidence-backed checklist、可恢復分批審查與預算，分開 issue/PR/installed 狀態。 驗收證據：缺驗收、未 commit 或 policy placeholder 不得宣稱完成；合法等待不冒充 Job；Red 產出可追溯 child work；中斷只重跑缺項；逐票真實 closure。"
+        }
+      ],
+      "evidence_policy": {
+        "required_stages": [
+          "source",
+          "test",
+          "review",
+          "merge",
+          "installed",
+          "live"
+        ],
+        "waivable_stages": [],
+        "max_age_seconds": {
+          "installed": 604800,
+          "live": 604800
+        },
+        "policy_version": "refine-delivery-acceptance/v1",
+        "owner": {
+          "id": "hamanpaul/paulsha-cortex#830",
+          "work_ids": [
+            "hamanpaul/paulsha-cortex#830",
+            "hamanpaul/paulsha-cortex#831",
+            "hamanpaul/paulsha-cortex#833",
+            "hamanpaul/paulsha-cortex#845"
+          ],
+          "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
+        }
+      }
+    }
+  ],
+  "waiver_policy": {
+    "authorities": []
+  }
+}

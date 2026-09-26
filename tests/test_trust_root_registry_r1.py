@@ -106,6 +106,21 @@ def test_slice_review_log_is_registered_as_manager_only(tmp_path: Path) -> None:
     )
 
 
+def test_requirement_delivery_index_is_manager_owned_and_registered(tmp_path: Path) -> None:
+    """衍生總帳由 Manager 寫入、Monitor 唯讀，且路徑由 Trust Root 同源管理。"""
+    from paulsha_cortex.trust_root import permgen
+
+    asset = registry.asset_by_id("requirement-delivery-index")
+    assert asset.tree is TrustTree.MANAGER_OWNED
+    assert asset.writers == (Principal.MANAGER,)
+    assert asset.readers == (Principal.MANAGER, Principal.MONITOR)
+    assert asset.path_resolver == "paulsha_cortex.config.paths:requirement_delivery_index_root"
+    assert paths.requirement_delivery_index_root() == paths.coordinator_root() / "requirement-delivery"
+    assert permgen.DEFAULT_LAYOUT.asset_paths()["requirement-delivery-index"] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/requirement-delivery"
+    )
+
+
 def test_all_three_headless_personas_covered() -> None:
     """spec §R1：盤點必須涵蓋 builder／reviewer／planner 三者，不能只封 builder。"""
     assert registry.personas_covered() == HEADLESS_PERSONAS

@@ -3531,6 +3531,7 @@ class PathLayout:
             "runtime-agents-tree": a,
             "control-root-tree": ctl,
             "coordinator-root-tree": c,
+            "requirement-delivery-index": f"{c}/requirement-delivery",
             "dispatch-specs-tree": self.specs_root,
             "runtime-run-tree": self.run_root,
             "builder-job-codex-home-root": f"{a}/runtime/codex-home/builder",

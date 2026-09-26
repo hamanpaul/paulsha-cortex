@@ -44,6 +44,7 @@ coordinator commands:
   work             透過 Manager 單一 writer 執行 work lifecycle action
   outcome          讀取 canonical engineering outcome outbox（唯讀）
   reap-brokers     dry-run 或受限清理孤兒 Codex broker
+  delivery         檢查需求交付缺額；reconcile 只更新可重建索引
   dispatch         已停用的舊低階入口
 
 run 'cortex <command> --help' for command-specific help.

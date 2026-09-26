@@ -27,6 +27,7 @@ _FAMILY_MODULES: tuple[str, ...] = (
     "paulsha_cortex.porcelain.capacity_gate",
     "paulsha_cortex.porcelain.headless_hook",
     "paulsha_cortex.porcelain.model_profile",
+    "paulsha_cortex.porcelain.delivery",
 )
 _LOADED_MODULES: set[str] = set()
 
