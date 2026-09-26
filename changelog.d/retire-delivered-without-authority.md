@@ -1,0 +1,1 @@
+#1093：WorkAuthority 缺席時，`retire-delivered` 可依 exact registry run 與 GitHub PR terminal proof 退休已交付孤兒 run；保留 actor/reason、exact CAS、稽核與 replay，並維持 `abandon` 的原有嚴格門檻。Status/work list 只顯示正式入口當下可接受的 action，monitor 對不存在的 workspace 顯示診斷。

@@ -52,6 +52,28 @@ def test_monitor_config_rejects_non_positive_intervals(
         load_config(config_path=config_path)
 
 
+def test_monitor_once_reports_missing_workspace_path(tmp_path: Path, capsys) -> None:
+    from paulsha_cortex.monitor import __main__ as monitor_cli
+
+    workspace = tmp_path / "retired-workspace"
+    config_path = tmp_path / "project-cortex.yaml"
+    config_path.write_text(
+        f"workspaces:\n  - name: retired\n    path: {workspace}\n",
+        encoding="utf-8",
+    )
+
+    assert monitor_cli.main(["--config", str(config_path), "--once"]) == 0
+
+    import json
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["projects"] == []
+    assert any(
+        "workspace unavailable" in diagnostic and "retired-workspace" in diagnostic
+        for diagnostic in payload["diagnostics"]
+    )
+
+
 def test_refresh_preserves_last_good_state_when_scan_is_degraded(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     project = workspace / "demo"

@@ -1270,6 +1270,225 @@ def test_retire_delivered_supersedes_ongoing_run_when_all_prs_terminal(
         )
 
 
+@pytest.mark.parametrize(
+    "digest_source", ["workflow-run", "delivery-journal", "absent"]
+)
+def test_retire_delivered_uses_registry_run_when_work_authority_is_missing(
+    tmp_path: Path, digest_source: str
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry_path = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=registry_path)
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#110",))
+    run = registry.get_workflow_run(run_id)
+    if digest_source != "workflow-run":
+        authority = work_actions.load_work_authority(
+            repo="acme/demo", work_id="demo", snapshot_path=snapshot
+        )
+        journal = work_actions._load_runs(state)
+        journal["runs"][run_id] = work_actions._delivery_journal_row(run, authority)
+        work_actions._save_runs(state, journal)
+        run = registry._manager_update_workflow_run(
+            run_id, source_revision="unavailable-legacy-authority"
+        )
+        journal = work_actions._load_runs(state)
+        if digest_source == "absent":
+            journal["runs"].pop(run_id)
+            work_actions._save_runs(state, journal)
+            expected_digest = None
+            expected_digest_source = "absent"
+        else:
+            expected_digest = journal["runs"][run_id]["authority_digest"]
+            expected_digest_source = "delivery-journal.authority_digest"
+    else:
+        expected_digest = run.source_revision
+        expected_digest_source = "workflow-run.source_revision"
+
+    # Models the work item disappearing when its workspace is removed from
+    # project-cortex.yaml while its durable WorkflowRun remains in the registry.
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["work_items"] = []
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    args = {
+        "action": "retire-delivered",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "Workspace retired after external delivery.",
+    }
+    lifecycle_runner = _pr_lifecycle_runner(
+        {110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+    )
+    provider_calls = []
+
+    def terminal_runner(argv, **kwargs):
+        provider_calls.append(tuple(argv))
+        return lifecycle_runner(argv, **kwargs)
+
+    first = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        runner=terminal_runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+
+    assert first["result"]["action"] == "retired-delivered"
+    assert registry.get_workflow_run(run_id).status == "superseded"
+    evidence = Path(first["result"]["evidence"]["ref"])
+    evidence_payload = json.loads(evidence.read_text(encoding="utf-8"))
+    assert evidence_payload["authority_source"] == "registry-run-record"
+    assert evidence_payload["authority_digest"] == expected_digest
+    assert evidence_payload["authority_digest_source"] == expected_digest_source
+    assert evidence_payload["authority_digest_status"] == (
+        "recorded" if expected_digest is not None else "absent"
+    )
+    assert evidence_payload["pr_terminal_status"] == [
+        {"ref": "acme/demo#110", "state": "merged"}
+    ]
+    assert len(provider_calls) == 1
+
+    # Exact replay reads the durable terminal proof and emits only one outcome.
+    second = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        runner=_pr_lifecycle_runner({}),
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=JobRegistry(state_path=registry_path),
+    )
+    assert first == second
+    assert len(provider_calls) == 1
+    outcomes = list(
+        (tmp_path / "engineering-outcomes").glob("*.jsonl")
+    )
+    assert len(outcomes) == 1
+    assert len(outcomes[0].read_text(encoding="utf-8").splitlines()) == 1
+
+
+@pytest.mark.parametrize("failure", ["non-terminal-pr", "non-ongoing-run", "active-job"])
+def test_retire_delivered_without_authority_keeps_fail_closed_admission(
+    tmp_path: Path, failure: str
+) -> None:
+    snapshot = _snapshot(tmp_path / failure / "snapshot.json")
+    state = tmp_path / failure / "runs.json"
+    registry_path = tmp_path / failure / "jobs.json"
+    registry = JobRegistry(state_path=registry_path)
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#110",))
+    run = registry.get_workflow_run(run_id)
+    if failure == "non-ongoing-run":
+        from dataclasses import replace
+
+        index = registry._find_workflow_run_index(run_id)
+        registry._workflows[index] = replace(run, status="superseded")
+    elif failure == "active-job":
+        registry.create_job(
+            task="active-writer",
+            persona="builder",
+            branch="feature/demo",
+            pane="",
+            worktree=run.workspace_root,
+            workflow_run_id=run_id,
+            workflow_claim_key=run.claim_key,
+            workflow_repo=run.repo,
+            workflow_card="build-card",
+            workflow_phase="build",
+        )
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["work_items"] = []
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    runner = _pr_lifecycle_runner(
+        {
+            110: {
+                "state": "open" if failure == "non-terminal-pr" else "closed",
+                "merged_at": None
+                if failure == "non-terminal-pr"
+                else "2026-08-01T00:00:00Z",
+            }
+        }
+    )
+
+    expected_error = {
+        "non-terminal-pr": "non-terminal PR",
+        "non-ongoing-run": "different authority",
+        "active-job": "refuses active workflow job",
+    }[failure]
+    with pytest.raises((RuntimeError, ValueError), match=expected_error):
+        work_actions.execute_work_action(
+            args={
+                "action": "retire-delivered",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "operator",
+                "expected_run_id": run_id,
+                "reason": "Fail closed without authority.",
+            },
+            requested_by="operator",
+            runner=runner,
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    assert not (tmp_path / failure / "evidence" / "work-retire-delivered").exists()
+    assert not (tmp_path / failure / "engineering-outcomes").exists()
+
+
+def test_abandon_does_not_bypass_missing_work_authority(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["work_items"] = []
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="confirmed work authority missing or ambiguous"):
+        work_actions.execute_work_action(
+            args={
+                "action": "abandon",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "operator",
+                "expected_run_id": run_id,
+                "reason": "Must remain strict.",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+
 def test_retire_delivered_unlinks_missing_pinned_todo_path(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"

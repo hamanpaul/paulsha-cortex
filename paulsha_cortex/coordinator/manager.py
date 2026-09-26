@@ -1506,7 +1506,11 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
 
 
 def workflow_status_entry(
-    registry, run, *, candidate_base_probe: "candidate_base.MirrorDistanceProbe | None" = None
+    registry,
+    run,
+    *,
+    candidate_base_probe: "candidate_base.MirrorDistanceProbe | None" = None,
+    work_authority_state: str | None = None,
 ) -> dict[str, Any]:
     """#527：把 `needs_human` 的 workflow run 投影成 attention 條目。
 
@@ -1598,6 +1602,24 @@ def workflow_status_entry(
                 next_step_hint = main_sync_hint
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         pass
+    if work_authority_state in {"missing", "unavailable"}:
+        if work_authority_state == "missing":
+            try:
+                from .work_actions import recovery_actions_without_work_authority
+
+                next_actions = recovery_actions_without_work_authority(run, registry)
+            except Exception:  # noqa: BLE001 - projection failures expose no action
+                next_actions = ()
+        else:
+            next_actions = ()
+        if "retire-delivered" in next_actions:
+            next_step_hint = (
+                f"cortex work retire-delivered {run.work_id} --repo {run.repo} "
+                f"--expected-run-id {run.run_id} --actor <operator> "
+                "--reason '<single-line reason>'"
+            )
+        else:
+            next_step_hint = "目前沒有符合正式入口前置條件的 recovery action。"
     try:
         candidate_git_base = candidate_base.candidate_git_base_for_run(
             run, registry, probe=candidate_base_probe

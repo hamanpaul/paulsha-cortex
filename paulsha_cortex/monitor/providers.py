@@ -86,10 +86,13 @@ def _workflow_next_actions_projection(
     from ..coordinator.work_actions import (
         _phase_recovery_actions,
         _planning_failure_hint,
+        recovery_actions_without_work_authority,
+        work_authority_projection_state,
     )
     from ..coordinator.workflow import WorkflowRun
 
     runs = []
+    all_runs = []
     active_counts: dict[str, int] = {}
     for row in workflow_rows:
         if row.get("repo") != repo or row.get("status") != "ongoing":
@@ -99,6 +102,7 @@ def _workflow_next_actions_projection(
         except (TypeError, ValueError):
             continue
         active_counts[run.work_id] = active_counts.get(run.work_id, 0) + 1
+        all_runs.append(run)
         if "needs_human" in run.facets:
             runs.append(run)
 
@@ -119,7 +123,7 @@ def _workflow_next_actions_projection(
 
     registry_view = SimpleNamespace(
         list_jobs=lambda: [dict(row) for row in job_rows],
-        list_workflow_runs=lambda: runs,
+        list_workflow_runs=lambda: all_runs,
         list_slices_by_owner=list_slices_by_owner,
         get_job=get_job,
     )
@@ -134,15 +138,23 @@ def _workflow_next_actions_projection(
             classification = hint.get("classification") if isinstance(hint, dict) else None
         except Exception:  # noqa: BLE001 - read projection fails closed on evidence errors
             classification = None
-        try:
-            recovery_actions = _phase_recovery_actions(run, registry_view)
-        except Exception:  # noqa: BLE001 - read projection fails closed on registry errors
-            recovery_actions = ()
-        actions = needs_human_next_actions(
-            phase=run.current_phase,
-            planning_failure_classification=classification,
-            job_recovery_actions=recovery_actions,
+        authority_state = work_authority_projection_state(
+            repo=run.repo, work_id=run.work_id
         )
+        if authority_state == "missing":
+            actions = recovery_actions_without_work_authority(run, registry_view)
+        elif authority_state == "unavailable":
+            actions = ()
+        else:
+            try:
+                recovery_actions = _phase_recovery_actions(run, registry_view)
+            except Exception:  # noqa: BLE001 - read projection fails closed on registry errors
+                recovery_actions = ()
+            actions = needs_human_next_actions(
+                phase=run.current_phase,
+                planning_failure_classification=classification,
+                job_recovery_actions=recovery_actions,
+            )
         projected[run.work_id] = {
             "run_id": run.run_id,
             "actions": list(actions),

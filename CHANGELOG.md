@@ -13,6 +13,8 @@
 
 ### Fixed
 
+- **#1093 authority 缺席時退休已交付 run**：`retire-delivered` 可在 workspace 不存在或已從 `project-cortex.yaml` 移除時，以 `--repo`、work id 與 exact run ID 從 registry 定址；仍要求 run admission 與所有 PR 的 GitHub terminal proof。稽核 evidence 標明 registry run authority，僅沿用已存 digest，缺少時明記 absent；`abandon` 維持原有 WorkAuthority 與 pre-delivery 門檻。Status、work list 與 monitor 診斷同步更新。
+
 - **PatchMUD report v2 consumer**：封套 mapper 以 role、execution-profile key、benchmark、deck digest 與 evaluator revision 精確選取 cohort；v1 報表僅 opaque 保留並 fail-closed 不排名，未知版本拒收。`model-eval-roster.yaml` 新增 profile-bound schema v2，保留既有 roster v1 相容讀取。
 
 - **#833 Red child 自動進件**：拆分計畫通過 review 後，Manager 以 planning transaction 冪等發布 child work item 與 Todo；Monitor snapshot 確認 WorkAuthority 後由 periodic resume 自動標準 intake。

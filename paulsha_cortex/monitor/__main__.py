@@ -16,7 +16,7 @@ from ..runtime_attestation import (
     trust_root_receipt_summary,
 )
 from .config import load_config
-from .scanner import scan_workspaces
+from .scanner import ScanResult, scan_workspaces_detailed
 from .service import ProjectMonitorService
 
 
@@ -38,8 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _snapshot_payload(states) -> dict[str, object]:
-    return {"projects": [asdict(state) for state in states]}
+def _snapshot_payload(result: ScanResult) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "projects": [asdict(state) for state in result.states]
+    }
+    if result.diagnostics:
+        payload["diagnostics"] = list(result.diagnostics)
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,12 +59,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.once:
         try:
-            states = scan_workspaces(config)
+            result = scan_workspaces_detailed(config)
         except (FileNotFoundError, ValueError, OSError) as error:
             print(f"錯誤: {error}", file=sys.stderr)
             return 1
 
-        payload = _snapshot_payload(states)
+        payload = _snapshot_payload(result)
         print(json.dumps(payload, ensure_ascii=False, default=str))
         return 0
 

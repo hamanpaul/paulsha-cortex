@@ -105,6 +105,46 @@ def test_status_projects_recover_pre_candidate_when_owner_admission_allows_it(tm
     )
 
 
+def test_missing_authority_attention_only_offers_admitted_retirement(
+    tmp_path, monkeypatch
+):
+    registry, run, _authority = _seed_pre_candidate_recovery(tmp_path)
+    monkeypatch.setattr(
+        work_actions,
+        "_retire_delivered_pr_terminal_status",
+        lambda _run, *, repo, runner: [
+            {"ref": "acme/demo#8", "state": "merged"}
+        ],
+    )
+
+    without_delivery = manager.workflow_status_entry(
+        registry, run, work_authority_state="missing"
+    )
+    assert without_delivery["next_actions"] == []
+    assert "abandon" not in without_delivery["next_step_hint"]
+    assert "retry-card" not in without_delivery["next_actions"]
+
+    delivered = registry._manager_update_workflow_run(
+        run.run_id, pr_refs=("acme/demo#8",)
+    )
+    retirement = manager.workflow_status_entry(
+        registry, delivered, work_authority_state="missing"
+    )
+    assert retirement["next_actions"] == ["retire-delivered"]
+    assert "retire-delivered" in retirement["next_step_hint"]
+    assert "abandon" not in retirement["next_step_hint"]
+
+    def reject_non_terminal_pr(*_args, **_kwargs):
+        raise RuntimeError("retire-delivered refuses a non-terminal PR")
+
+    monkeypatch.setattr(
+        work_actions, "_retire_delivered_pr_terminal_status", reject_non_terminal_pr
+    )
+    assert manager.workflow_status_entry(
+        registry, delivered, work_authority_state="missing"
+    )["next_actions"] == []
+
+
 def test_recovery_projection_hides_unbound_pre_candidate_action(tmp_path):
     registry, run, _authority = _seed_pre_candidate_recovery(tmp_path)
     registry._slices[0]["builder_job_id"] = None
@@ -121,8 +161,13 @@ def test_recovery_projection_hides_unbound_pre_candidate_action(tmp_path):
     )
 
 
-def test_work_list_projects_admitted_workflow_recovery_actions(tmp_path):
+def test_work_list_projects_admitted_workflow_recovery_actions(tmp_path, monkeypatch):
     registry, run, _authority = _seed_pre_candidate_recovery(tmp_path)
+    monkeypatch.setattr(
+        work_actions,
+        "work_authority_projection_state",
+        lambda **_kwargs: "available",
+    )
     provider = WorkflowRegistryProvider(run.repo, state_path=registry._state_path)
 
     snapshot = provider.scan()
@@ -161,9 +206,51 @@ def test_work_list_projects_admitted_workflow_recovery_actions(tmp_path):
     }
 
 
-def test_job_derived_retry_build_is_projected_across_claim_list_and_status(tmp_path):
+def test_work_list_without_authority_only_projects_admitted_retirement(
+    tmp_path, monkeypatch
+):
+    registry, run, _authority = _seed_pre_candidate_recovery(tmp_path)
+    monkeypatch.setattr(
+        work_actions,
+        "_retire_delivered_pr_terminal_status",
+        lambda _run, *, repo, runner: [
+            {"ref": "acme/demo#8", "state": "merged"}
+        ],
+    )
+    monkeypatch.setattr(
+        work_actions,
+        "work_authority_projection_state",
+        lambda **_kwargs: "missing",
+    )
+    provider = WorkflowRegistryProvider(run.repo, state_path=registry._state_path)
+
+    without_delivery = provider.scan()
+    assert without_delivery.observations["workflow_next_actions"][run.work_id][
+        "actions"
+    ] == []
+
+    delivered = registry._manager_update_workflow_run(
+        run.run_id, pr_refs=("acme/demo#8",)
+    )
+    retirement = WorkflowRegistryProvider(
+        run.repo, state_path=registry._state_path
+    ).scan()
+    assert retirement.observations["workflow_next_actions"][run.work_id] == {
+        "run_id": delivered.run_id,
+        "actions": ["retire-delivered"],
+    }
+
+
+def test_job_derived_retry_build_is_projected_across_claim_list_and_status(
+    tmp_path, monkeypatch
+):
     _source_snapshot, authority, registry, run = _review_fixture(tmp_path)
     assert "retry-build" in work_actions._phase_recovery_actions(run, registry)
+    monkeypatch.setattr(
+        work_actions,
+        "work_authority_projection_state",
+        lambda **_kwargs: "available",
+    )
 
     claim = work_actions._claim_action(
         args={"action": "start", "repo": run.repo, "work_id": run.work_id},
