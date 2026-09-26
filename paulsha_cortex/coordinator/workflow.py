@@ -172,6 +172,249 @@ class PlanningArtifactAuthority:
 
 
 @dataclass(frozen=True)
+class PlanReviewReceipt:
+    """不可變地記錄一次 ready plan review 實際採信的規劃 bytes。"""
+
+    run_id: str
+    work_id: str
+    repo: str
+    claim_key: str
+    review_card: str
+    source_revision: str
+    artifacts: tuple[PlanningArtifactAuthority, ...]
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("run_id", self.run_id),
+            ("work_id", self.work_id),
+            ("repo", self.repo),
+            ("claim_key", self.claim_key),
+            ("review_card", self.review_card),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"plan review receipt {name} 必須為非空字串")
+        if (
+            not isinstance(self.source_revision, str)
+            or len(self.source_revision) != 64
+            or any(char not in "0123456789abcdef" for char in self.source_revision)
+        ):
+            raise ValueError("plan review receipt source_revision 格式錯誤")
+        if not isinstance(self.artifacts, tuple) or not self.artifacts or any(
+            not isinstance(item, PlanningArtifactAuthority) or item.work_id != self.work_id
+            for item in self.artifacts
+        ):
+            raise ValueError("plan review receipt artifacts 格式錯誤")
+        refs = [item.ref for item in self.artifacts]
+        if len(refs) != len(set(refs)):
+            raise ValueError("plan review receipt artifacts 重複")
+
+    @property
+    def ready(self) -> bool:
+        return True
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "work_id": self.work_id,
+            "repo": self.repo,
+            "claim_key": self.claim_key,
+            "review_card": self.review_card,
+            "result": "ready",
+            "source_revision": self.source_revision,
+            "artifacts": [
+                {
+                    "ref": item.ref,
+                    "kind": item.kind,
+                    "work_id": item.work_id,
+                    "sha256": item.baseline_sha256,
+                }
+                for item in self.artifacts
+            ],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._payload()
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "PlanReviewReceipt":
+        expected = {
+            "schema_version", "run_id", "work_id", "repo", "claim_key", "review_card",
+            "result", "source_revision", "artifacts",
+        }
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != expected
+            or payload.get("schema_version") != 1
+            or payload.get("result") != "ready"
+            or not isinstance(payload.get("artifacts"), list)
+        ):
+            raise ValueError("plan review receipt 格式錯誤")
+        receipt = cls(
+            run_id=payload["run_id"],
+            work_id=payload["work_id"],
+            repo=payload["repo"],
+            claim_key=payload["claim_key"],
+            review_card=payload["review_card"],
+            source_revision=payload["source_revision"],
+            artifacts=tuple(
+                PlanningArtifactAuthority(
+                    ref=row["ref"],
+                    kind=row["kind"],
+                    work_id=row["work_id"],
+                    baseline_sha256=row["sha256"],
+                )
+                if isinstance(row, dict) and set(row) == {"ref", "kind", "work_id", "sha256"}
+                else _invalid_plan_review_artifact()
+                for row in payload["artifacts"]
+            ),
+        )
+        return receipt
+
+
+def _invalid_plan_review_artifact():
+    raise ValueError("plan review receipt artifact 格式錯誤")
+
+
+@dataclass(frozen=True)
+class PlanningDriftArtifact:
+    ref: str
+    kind: str
+    expected_sha256: str
+    current_sha256: str
+
+    def __post_init__(self) -> None:
+        PlanningArtifactAuthority(
+            ref=self.ref,
+            kind=self.kind,
+            work_id="planning-drift",
+            baseline_sha256=self.expected_sha256,
+        )
+        if (
+            not isinstance(self.current_sha256, str)
+            or len(self.current_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.current_sha256)
+        ):
+            raise ValueError("planning drift current_sha256 格式錯誤")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "ref": self.ref,
+            "kind": self.kind,
+            "expected_sha256": self.expected_sha256,
+            "current_sha256": self.current_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "PlanningDriftArtifact":
+        if not isinstance(payload, dict) or set(payload) != {
+            "ref", "kind", "expected_sha256", "current_sha256"
+        }:
+            raise ValueError("planning drift artifact 格式錯誤")
+        return cls(**payload)
+
+
+@dataclass(frozen=True)
+class WorkflowPlanningDriftStop:
+    """綁定單一 run 與 exact candidate 的 verify 派工 drift stop。"""
+
+    run_id: str
+    work_id: str
+    repo: str
+    claim_key: str
+    card_id: str
+    candidate_head: str
+    source_revision: str
+    artifacts: tuple[PlanningDriftArtifact, ...]
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("run_id", self.run_id),
+            ("work_id", self.work_id),
+            ("repo", self.repo),
+            ("claim_key", self.claim_key),
+            ("card_id", self.card_id),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"workflow planning drift stop {name} 必須為非空字串")
+        if verification.SAFE_SHA_RE.fullmatch(self.candidate_head) is None:
+            raise ValueError("workflow planning drift stop candidate 格式錯誤")
+        if (
+            not isinstance(self.source_revision, str)
+            or len(self.source_revision) != 64
+            or any(char not in "0123456789abcdef" for char in self.source_revision)
+        ):
+            raise ValueError("workflow planning drift stop source_revision 格式錯誤")
+        if not isinstance(self.artifacts, tuple) or not self.artifacts or any(
+            not isinstance(item, PlanningDriftArtifact) for item in self.artifacts
+        ):
+            raise ValueError("workflow planning drift stop artifacts 格式錯誤")
+        refs = [item.ref for item in self.artifacts]
+        if len(refs) != len(set(refs)):
+            raise ValueError("workflow planning drift stop artifacts 重複")
+
+    @property
+    def stop_code(self) -> str:
+        return "workflow-planning-input-drift"
+
+    @property
+    def phase(self) -> str:
+        return "verify"
+
+    @property
+    def verify_job_absent(self) -> bool:
+        return True
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "stop_code": self.stop_code,
+            "run_id": self.run_id,
+            "work_id": self.work_id,
+            "repo": self.repo,
+            "claim_key": self.claim_key,
+            "phase": self.phase,
+            "card_id": self.card_id,
+            "candidate_head": self.candidate_head,
+            "source_revision": self.source_revision,
+            "verify_job_absent": True,
+            "artifacts": [item.to_dict() for item in self.artifacts],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._payload()
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "WorkflowPlanningDriftStop":
+        expected = {
+            "schema_version", "stop_code", "run_id", "work_id", "repo", "claim_key",
+            "phase", "card_id", "candidate_head", "source_revision", "verify_job_absent",
+            "artifacts",
+        }
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != expected
+            or payload.get("schema_version") != 1
+            or payload.get("stop_code") != "workflow-planning-input-drift"
+            or payload.get("phase") != "verify"
+            or payload.get("verify_job_absent") is not True
+            or not isinstance(payload.get("artifacts"), list)
+        ):
+            raise ValueError("workflow planning drift stop 格式錯誤")
+        stop = cls(
+            run_id=payload["run_id"],
+            work_id=payload["work_id"],
+            repo=payload["repo"],
+            claim_key=payload["claim_key"],
+            card_id=payload["card_id"],
+            candidate_head=payload["candidate_head"],
+            source_revision=payload["source_revision"],
+            artifacts=tuple(PlanningDriftArtifact.from_dict(row) for row in payload["artifacts"]),
+        )
+        return stop
+
+
+@dataclass(frozen=True)
 class WorkflowStep:
     """Deck card投影出的持久化workflow step契約。"""
 
@@ -438,6 +681,8 @@ class WorkflowRun:
     # 從不呼叫 gate，沿用 pre-#213 立即凍結行為（呼叫端一律視為已通過）。只負責
     # 持有最新一次的判定快照，不在本模組做判定本身。
     plan_review_passed: bool = False
+    plan_review_receipt: PlanReviewReceipt | None = None
+    planning_drift_stop: WorkflowPlanningDriftStop | None = None
     # #211（design #208 A.2）：pre-claim readiness 六道關卡通過後凍結的
     # base_sha／monitor_snapshot_revision 等集合（claim_readiness.FrozenReadinessSet
     # 的 dict 投影），供 builder worktree 建立時消費（#211 收斂）；不得由
@@ -592,6 +837,37 @@ class WorkflowRun:
             )
         if not isinstance(self.plan_review_passed, bool):
             raise ValueError("workflow run plan_review_passed 必須為bool")
+        if self.plan_review_receipt is not None:
+            receipt = self.plan_review_receipt
+            if not isinstance(receipt, PlanReviewReceipt):
+                raise ValueError("workflow run plan_review_receipt 格式錯誤")
+            if (
+                receipt.run_id != self.run_id
+                or receipt.work_id != self.work_id
+                or receipt.repo != self.repo
+                or receipt.claim_key != self.claim_key
+                or receipt.source_revision != self.planning_source_revision
+                or not self.plan_review_passed
+                or not any(
+                    step.phase == "plan" and step.card == receipt.review_card
+                    for step in self.steps
+                )
+            ):
+                raise ValueError("workflow run plan review receipt binding 不符")
+        if self.planning_drift_stop is not None:
+            stop = self.planning_drift_stop
+            if (
+                not isinstance(stop, WorkflowPlanningDriftStop)
+                or stop.run_id != self.run_id
+                or stop.work_id != self.work_id
+                or stop.repo != self.repo
+                or stop.claim_key != self.claim_key
+                or not any(
+                    step.phase == "verify" and step.card == stop.card_id
+                    for step in self.steps
+                )
+            ):
+                raise ValueError("workflow run planning drift stop binding 不符")
         if self.frozen_readiness is not None:
             base_sha = (
                 self.frozen_readiness.get("base_sha")
@@ -658,7 +934,7 @@ class WorkflowRun:
             object.__setattr__(self, "needs_human_reason", reason.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "run_id": self.run_id,
             "work_id": self.work_id,
             "repo": self.repo,
@@ -716,6 +992,12 @@ class WorkflowRun:
                 dict(self.needs_human_reason) if self.needs_human_reason is not None else None
             ),
         }
+        # 向前相容：新欄位只在有值時寫出，舊版 Monitor 的封閉白名單讀新版 jobs.json 不會拒收。
+        if self.plan_review_receipt is not None:
+            payload["plan_review_receipt"] = self.plan_review_receipt.to_dict()
+        if self.planning_drift_stop is not None:
+            payload["planning_drift_stop"] = self.planning_drift_stop.to_dict()
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> WorkflowRun:
@@ -792,6 +1074,16 @@ class WorkflowRun:
             sizing_band=payload.get("sizing_band"),
             decomposition_depth=payload.get("decomposition_depth", 0),
             plan_review_passed=payload.get("plan_review_passed", False),
+            plan_review_receipt=(
+                PlanReviewReceipt.from_dict(payload["plan_review_receipt"])
+                if payload.get("plan_review_receipt") is not None
+                else None
+            ),
+            planning_drift_stop=(
+                WorkflowPlanningDriftStop.from_dict(payload["planning_drift_stop"])
+                if payload.get("planning_drift_stop") is not None
+                else None
+            ),
             frozen_readiness=payload.get("frozen_readiness"),
             model_chain_override=payload.get("model_chain_override"),
             resolved_model_chain=payload.get("resolved_model_chain"),

@@ -26,6 +26,8 @@ from .usage_extractors import extract_usage
 from .workflow import (
     GateEvidenceRef,
     PlanningArtifactAuthority,
+    PlanReviewReceipt,
+    WorkflowPlanningDriftStop,
     WorkflowRun,
     WorkflowStep,
     validate_workflow_phase_transition,
@@ -4874,6 +4876,17 @@ class JobRegistry:
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
+        if current.plan_review_receipt is not None and (
+            (
+                planning_authority is not None
+                and tuple(planning_authority) != current.plan_review_receipt.artifacts
+            )
+            or (
+                planning_source_revision is not None
+                and planning_source_revision != current.plan_review_receipt.source_revision
+            )
+        ):
+            raise ValueError("accepted plan review baseline requires restricted transition")
         next_phase = current.current_phase if current_phase is None else current_phase
         validate_workflow_phase_transition(current.current_phase, next_phase)
         next_facets = current.facets if facets is None else tuple(facets)
@@ -4962,6 +4975,8 @@ class JobRegistry:
                 if plan_review_passed is None
                 else plan_review_passed
             ),
+            plan_review_receipt=current.plan_review_receipt,
+            planning_drift_stop=current.planning_drift_stop,
             model_chain_override=(
                 current.model_chain_override
                 if model_chain_override is None
@@ -4979,6 +4994,182 @@ class JobRegistry:
                 current.frozen_readiness if frozen_readiness is None else frozen_readiness
             ),
             needs_human_reason=resolved_needs_human_reason,
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_accept_plan_review(
+        self,
+        run_id: str,
+        *,
+        expected_updated_at: str,
+        expected_phase: str,
+        expected_status: str,
+        expected_candidate: str | None,
+        expected_source_revision: str,
+        current_phase: str,
+        steps: tuple[WorkflowStep, ...],
+        attempts: dict[str, int],
+        planning_authority: tuple[PlanningArtifactAuthority, ...],
+        receipt: PlanReviewReceipt,
+    ) -> WorkflowRun:
+        """以 CAS 原子提交 ready plan review、receipt 與下一階段。"""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if (
+            current.updated_at != expected_updated_at
+            or current.current_phase != expected_phase
+            or current.status != expected_status
+            or current.candidate_head != expected_candidate
+            or current.source_revision != expected_source_revision
+            or current.plan_review_passed
+            or current.plan_review_receipt is not None
+            or current.status != "ongoing"
+            or current.current_phase != "plan"
+            or receipt.run_id != current.run_id
+            or receipt.work_id != current.work_id
+            or receipt.repo != current.repo
+            or receipt.claim_key != current.claim_key
+            or receipt.source_revision
+            != (current.planning_source_revision or current.source_revision)
+            or tuple(planning_authority) != receipt.artifacts
+        ):
+            raise ValueError("plan review baseline compare-and-set failed")
+        validate_workflow_phase_transition(current.current_phase, current_phase)
+        updated = replace(
+            current,
+            current_phase=current_phase,
+            steps=tuple(steps),
+            attempts=dict(attempts),
+            planning_authority=tuple(planning_authority),
+            planning_source_revision=receipt.source_revision,
+            plan_review_passed=True,
+            plan_review_receipt=receipt,
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_record_planning_drift_stop(
+        self,
+        run_id: str,
+        *,
+        expected_updated_at: str,
+        expected_candidate: str,
+        stop: WorkflowPlanningDriftStop,
+        reason: DiagnosticReason,
+    ) -> WorkflowRun:
+        """在建立 reviewer job 前持久化 exact verify-drift stop。"""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if current.planning_drift_stop is not None:
+            if current.planning_drift_stop == stop:
+                return self._copy_workflow_run(current)
+            raise ValueError("workflow planning drift stop already recorded")
+        step = next(
+            (
+                item
+                for item in current.steps
+                if item.phase == "verify" and item.card == stop.card_id
+            ),
+            None,
+        )
+        if (
+            current.updated_at != expected_updated_at
+            or current.status != "ongoing"
+            or current.current_phase != "verify"
+            or current.candidate_head != expected_candidate
+            or current.source_revision != stop.source_revision
+            or stop.run_id != current.run_id
+            or stop.work_id != current.work_id
+            or stop.repo != current.repo
+            or stop.claim_key != current.claim_key
+            or stop.candidate_head != current.candidate_head
+            or step is None
+            or any(
+                job.get("workflow_run_id") == current.run_id
+                and job.get("workflow_claim_key") in (None, current.claim_key)
+                and job.get("workflow_phase") == "verify"
+                and job.get("subject_head") == current.candidate_head
+                for job in self._jobs
+            )
+        ):
+            raise ValueError("workflow planning drift stop compare-and-set failed")
+        if not isinstance(reason, DiagnosticReason):
+            raise ValueError("workflow planning drift stop requires structured reason")
+        updated = replace(
+            current,
+            planning_drift_stop=stop,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            needs_human_reason=reason.to_dict(),
+            gate_status="running",
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_rebind_planning_for_verify(
+        self,
+        run_id: str,
+        *,
+        expected_updated_at: str,
+        expected_candidate: str,
+        expected_authority: tuple[PlanningArtifactAuthority, ...],
+        expected_planning_source_revision: str | None,
+        receipt: PlanReviewReceipt,
+    ) -> WorkflowRun:
+        """以 CAS 將 exact stopped candidate 綁回不可變的 accepted review。"""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        stop = current.planning_drift_stop
+        matching_verify_jobs = [
+            job
+            for job in self._jobs
+            if job.get("workflow_run_id") == current.run_id
+            and job.get("workflow_claim_key") in (None, current.claim_key)
+            and job.get("workflow_phase") == "verify"
+            and job.get("subject_head") == expected_candidate
+        ]
+        if (
+            current.updated_at != expected_updated_at
+            or current.status != "ongoing"
+            or current.current_phase != "verify"
+            or current.candidate_head != expected_candidate
+            or current.planning_authority != expected_authority
+            or current.planning_source_revision != expected_planning_source_revision
+            or not isinstance(stop, WorkflowPlanningDriftStop)
+            or stop.run_id != current.run_id
+            or stop.work_id != current.work_id
+            or stop.repo != current.repo
+            or stop.claim_key != current.claim_key
+            or stop.phase != "verify"
+            or stop.candidate_head != expected_candidate
+            or stop.source_revision != current.source_revision
+            or not isinstance(receipt, PlanReviewReceipt)
+            or current.plan_review_receipt != receipt
+            or receipt.run_id != current.run_id
+            or receipt.work_id != current.work_id
+            or receipt.repo != current.repo
+            or receipt.claim_key != current.claim_key
+            or receipt.source_revision != current.planning_source_revision
+            or not receipt.ready
+            or bool(matching_verify_jobs)
+        ):
+            raise ValueError("workflow planning drift recovery compare-and-set failed")
+        updated = replace(
+            current,
+            planning_authority=receipt.artifacts,
+            planning_source_revision=receipt.source_revision,
+            facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            needs_human_reason=None,
+            gate_status="running",
+            updated_at=_now_iso(),
         )
         self._workflows[index] = updated
         self._persist()
