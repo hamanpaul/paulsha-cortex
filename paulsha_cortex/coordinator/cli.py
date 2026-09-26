@@ -27,13 +27,36 @@ _REQUEST_TIMEOUTS: dict[str, float] = {
 }
 
 
-def _resolve_launcher(executor, injected, *, allow_unsafe, model):
-    """注入優先；否則僅在 executor 指定時建 SubprocessLauncher（帶 allow_unsafe/model）。"""
+def _resolve_launcher(
+    executor,
+    injected,
+    *,
+    allow_unsafe,
+    model,
+    identity=None,
+    identity_registry=None,
+):
+    """注入優先；否則以已解析 identity 建立 SubprocessLauncher。"""
     if injected is not None:
         return injected
     if executor is None:
         return None
-    return SubprocessLauncher(executor=executor, allow_unsafe=allow_unsafe, model=model)
+    if identity is None and identity_registry is not None and model is not None:
+        identity = identity_registry.get(executor, model)
+    if identity is not None and (
+        getattr(identity, "executor", None) != executor
+        or (model is not None and getattr(identity, "model_id", None) != model)
+    ):
+        raise ValueError("launcher identity does not match executor/model")
+    executable = (
+        getattr(identity, "executable", None) if executor == "claude" else None
+    )
+    return SubprocessLauncher(
+        executor=executor,
+        allow_unsafe=allow_unsafe,
+        model=model,
+        executable=executable,
+    )
 
 
 def _refuse_unsafe_fanout(metas, predicate, *, allow_unsafe, max_ready=1):

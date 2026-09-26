@@ -702,7 +702,7 @@ Manager 選到 operator overlay 中的 Copilot identity 時，會在建立 Corte
 `PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`：
 
 ```yaml
-schema_version: 2
+schema_version: 4
 identities:
   - executor: agy
     model_id: gemini-3.1-pro-high
@@ -717,12 +717,13 @@ identities:
     model_id: "<reviewer-model-id>"
     independence_domain: "<different-reviewer-domain>"
     capabilities: [planning, review]
+    executable: /opt/cortex/bin/claude-compatible
 ```
 
-- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 提供 canonical agy 候選；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。`cortex doctor` 依解析政策確認至少有一個可用的 planning identity，不要求部署保留 canonical agy；agy discovery 與 smoke probe 只判定 agy 是否可用。
+- schema v1–v3 仍可讀取；schema v2 起可設 `capabilities` / `live_probe`，schema v3 起可設封套欄位，schema v4 可為 Claude identity 選填 `executable` 絕對路徑。Claude job 與 `cortex doctor` 的 review-sandbox probe 共用該路徑；路徑必須指向一般可執行檔，無效時拒絕啟動且不回退 PATH，job 記錄保存解析後路徑。packaged registry 提供 canonical agy 候選；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。`cortex doctor` 依解析政策確認至少有一個可用的 planning identity，不要求部署保留 canonical agy；agy discovery 與 smoke probe 只判定 agy 是否可用。
 - planner/builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析；agy 只有在 `doctor --probe-live` 的 model discovery 與 plan/sandbox smoke 都吻合時才可用。
 - fanout/tick 明確指定的 builder `(executor, model_id)`，以及 spec frontmatter 成對宣告的 `executor`／`model_id`，都會先查這份 registry；unknown identity 會在派工前 fail-closed 並列出可用 candidates。
-- workflow reviewer 只會選擇明示 `capabilities: [review]` 且與會產出 Candidate commit 的 build card 不同 independence domain 的 schema v2 identity；`commit_policy=forbidden` 的隔離確認卡不計為 Builder；legacy v1 identity 只取得 planning capability，不能被猜成 reviewer。
+- workflow reviewer 只會選擇明示 `capabilities: [review]` 且與會產出 Candidate commit 的 build card 不同 independence domain 的 schema v2 以上 identity；`commit_policy=forbidden` 的隔離確認卡不計為 Builder；legacy v1 identity 只取得 planning capability，不能被猜成 reviewer。
 - Verify/Review 以 executor 的 enforced read-only mode在exact Candidate的remote-free disposable clone檢查；Claude reviewer固定使用`dontAsk`與`safe-mode`，只暴露OS-sandboxed Bash並要求structured JSON object，不載入Candidate `CLAUDE.md`/skills/plugins/MCP/remote session，也不進Plan Mode。Filesystem預設拒讀整個home、`/run/user`與Docker sockets，只重開Candidate與Python user-site工具鏈，並對Candidate clone設deny-write；review subprocess只保留`PATH`、`HOME`、locale、`TMPDIR`、`VIRTUAL_ENV`等非密鑰基礎環境，且不啟動login shell。Linux/WSL host必須安裝`bubblewrap`、`socat`與官方sandbox runtime（Ubuntu可用`sudo apt-get install bubblewrap socat`，再用`npm install -g @anthropic-ai/sandbox-runtime`）；任一依賴缺失、Unix-socket seccomp失效或命令要求unsandboxed fallback都拒絕啟動。Manager在所有terminal/launch failure/operator retry路徑重驗原Candidate完整tree snapshot後清除clone。agent只回傳substantive result、findings與inline report body；report僅能發布至phase專屬的`reports/verify/*.md`或`reports/review/*.md`，並由durable publication journal把多檔CAS、canonical evidence與registry bind組成可rollback/roll-forward的transaction。Manager會從durable Job注入Candidate、builder/reviewer job ID與launch identity，agent不取得report或Candidate寫入權。
 - `cortex doctor`會在identity registry配置Claude `review` capability時把Claude Code 2.1.187+、必要CLI flags、`bubblewrap`、`socat`與`srt`執行能力列為required probe；`--probe-live`另跑native read-only與Unix-socket seccomp smoke。沒有Claude reviewer的部署只顯示非必要warn。Claude的protected bind targets位於deterministic disposable session root，exact Candidate則固定在其無污染的`candidate/` checkout。
 - 同 domain、未知 identity、缺 model 都會得到 `foreign-review-absent`（fail-closed）。

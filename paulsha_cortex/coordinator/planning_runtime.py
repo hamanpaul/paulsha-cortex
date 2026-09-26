@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from ..config import paths
 from . import job_runner, job_workspace, planning_probe_cache
-from .launcher import build_agy_argv
+from .launcher import build_agy_argv, resolve_claude_executable
 from .model_identities import (
     AGY_MODEL_ID,
     PLANNING_DIAGNOSTIC_LIMIT,
@@ -111,7 +111,8 @@ def _planning_argv(
         # operator 帳號下的 user MCP servers／plugins／hooks／使用者層
         # CLAUDE.md，避免這些注入項讓模型敘事跑題或繞過純 JSON 契約。
         return [
-            "claude", "-p", prompt, "--output-format", "json",
+            resolve_claude_executable(identity.executable) or "claude",
+            "-p", prompt, "--output-format", "json",
             "--tools", "", "--model", identity.model_id,
             "--add-dir", str(worktree),
         ]

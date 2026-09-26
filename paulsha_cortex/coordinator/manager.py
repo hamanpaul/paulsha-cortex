@@ -2137,6 +2137,7 @@ def _launch_foreign_review(
             reviewer_job["job_id"],
             executor=handle.executor,
             model_id=handle.model_id,
+            executable=handle.executable,
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,
@@ -10881,6 +10882,17 @@ def _runtime_preflight_gate(
                 ttl_seconds=runtime_preflight.DEFAULT_PROVIDER_TTL_SECONDS,
                 source="model-availability-probe",
                 reason=reason,
+                diagnostic_reason=(
+                    None
+                    if status == "available"
+                    else diagnostic_reason(
+                        f"model-availability-{status}",
+                        reason,
+                        source="coordinator.manager._workflow_dispatch_gate:model-availability",
+                        executor=identity.executor,
+                        model_id=identity.model_id,
+                    )
+                ),
             )
             availability_finding = runtime_preflight.CapabilityFinding(
                 capability=capability,
@@ -12841,6 +12853,7 @@ def _dispatch_workflow_card(
             str(job["job_id"]),
             executor=identity.executor,
             model_id=identity.model_id,
+            executable=handle.executable,
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,

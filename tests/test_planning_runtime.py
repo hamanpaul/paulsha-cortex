@@ -444,6 +444,29 @@ def test_planning_argv_claude_branch_omits_permission_mode(tmp_path: Path) -> No
     assert argv[argv.index("--tools") + 1] == ""
 
 
+def test_planning_argv_uses_identity_bound_claude_executable(tmp_path: Path) -> None:
+    executable = tmp_path / "claude-compatible"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    identity = ModelIdentity(
+        "claude",
+        "claude-plan",
+        "anthropic",
+        ("planning",),
+        executable=str(executable),
+    )
+
+    argv = planning_runtime._planning_argv(
+        identity,
+        "prompt",
+        str(tmp_path / "runtime-output"),
+        tmp_path,
+        last_message_path=tmp_path / "runtime-output" / "planning.last.json",
+    )
+
+    assert argv[0] == str(executable.resolve())
+
+
 def test_planning_json_parser_accepts_only_whole_fenced_object(tmp_path: Path) -> None:
     output = tmp_path / "missing.json"
     assert planning_runtime._extract_json(
