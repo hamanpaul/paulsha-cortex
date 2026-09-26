@@ -24,5 +24,5 @@ operator 只看得到一句 `workflow brainstorm artifact is not accepted`——
 
 - [ ] 例外訊息帶上 `ref`（指出是哪一個 artifact）與 `assessment.reasons`，`blocking-decision` 時附 marker 行號
 - [ ] 沿用 `#513` 建立的 `cortex-planning-artifact-rejection/v1` evidence 落檔（`<coordinator_root>/evidence/planning-artifacts/`），讓重驗失敗同樣留下可查的完整內容
-- [ ] 訊息欄位順序比照 `#513`（reasons → markers → evidence path），確保在上游 `planning.py:1165` 的 `str(exc)[:160]` 截斷後關鍵資訊仍存活
+- [ ] 訊息欄位順序比照 `#513`（reasons → markers → evidence path），確保關鍵資訊留在 `planning.summarize_planning_exception()` 保留的頭段內；摘要保留訊息頭尾並以 `…+Nc` 記帳超出 480 字預算的字元數
 - [ ] 測試涵蓋三種 reason 在重驗路徑上的訊息內容，並鎖住「訊息含 ref」
