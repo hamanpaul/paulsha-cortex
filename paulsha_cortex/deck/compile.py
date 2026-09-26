@@ -20,14 +20,14 @@ class DeckCompileError(ValueError):
     """compile 期錯誤（fail-closed：不產任何檔）。"""
 
 
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
-_SLICE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+_SLICE_ID_RE = re.compile(r"[^\W_](?:[^\W_]|-)*", re.UNICODE)
 _CHANGE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
 def slugify_task(task: str) -> str:
-    """將 task 正規化為 branch-safe slug。"""
-    slug = _SLUG_RE.sub("-", task.lower()).strip("-")[:60].strip("-")
+    """將 task 正規化為 branch-safe slug，保留 Unicode 字母與數字。"""
+    slug = "".join(char if char.isalnum() else "-" for char in task.lower())
+    slug = re.sub(r"-+", "-", slug).strip("-")[:60].strip("-")
     if not slug:
         raise DeckCompileError(f"task 無法正規化為 slug: {task!r}")
     return slug
@@ -58,6 +58,22 @@ def _warning_default_target_branch(task_slug: str, change: str | None) -> None:
         return
     print(
         f"deck compile: 目錄 context 缺 change，target_branch fallback 為 feature/{task_slug}",
+        file=sys.stderr,
+    )
+
+
+def _warn_task_slug_information(task_slug: str) -> None:
+    parts = task_slug.split("-")
+    if parts and parts[0] == "task":
+        parts = parts[1:]
+        if parts and parts[0].isdigit():
+            parts = parts[1:]
+    descriptive_parts = [part for part in parts if not part.isdigit()]
+    if len(descriptive_parts) >= 2:
+        return
+    print(
+        f"deck compile: [WARNING] task-slug 資訊量偏低（{task_slug}）；"
+        "請在 --task 補上至少兩段可辨識的任務描述，避免切片與分支名稱難以區分",
         file=sys.stderr,
     )
 
@@ -120,10 +136,15 @@ def _placeholder_argv(reason: str) -> list[str]:
 
 
 def _warn_policy_undetected(kind: str, *, purpose: str) -> None:
+    bootstrap_hint = (
+        "；若本計畫的任務之一是建立 .project-policy.yml，請先手動完成該任務，再編譯後續 slice"
+        if kind == "validation"
+        else ""
+    )
     print(
         f"deck compile: [WARNING] 未偵測到 .project-policy.yml 的 preflight.steps(kind: {kind})，"
         f"verification.{purpose} 已改填 fail-closed placeholder；翻 dispatch: auto 前必須手動改成"
-        "真正的驗證指令（見 issue #380）",
+        f"真正的驗證指令（見 issue #380）{bootstrap_hint}",
         file=sys.stderr,
     )
 
@@ -608,6 +629,7 @@ def compile_combo(
         Path(repo_root) if repo_root is not None else paths.repo_root(allow_cwd=True)
     )
     slug = slugify_task(task)
+    _warn_task_slug_information(slug)
     if change is not None:
         change = _validate_change_name(change)
     entries = _resolve_hand(combo, cards, with_cards, only)
@@ -688,7 +710,7 @@ def compile_combo(
         )
         if not _SLICE_ID_RE.fullmatch(slice_id):
             raise DeckCompileError(
-                f"slice_id 非檔名/branch 安全（僅允許 [a-z0-9-]，card id 與 slice_group 不得含路徑分隔）: {slice_id!r}"
+                f"slice_id 非檔名/branch 安全（僅允許字母、數字與連字號，card id 與 slice_group 不得含路徑分隔）: {slice_id!r}"
             )
         slices.append(SliceDoc(slice_id=slice_id, filename=f"{slice_id}.md", content=content))
 

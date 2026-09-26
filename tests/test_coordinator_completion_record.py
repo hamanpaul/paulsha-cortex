@@ -138,6 +138,21 @@ def _write_manifest(
     return path
 
 
+def test_cjk_task_slice_id_is_safe_for_persisted_evidence_paths(tmp_path):
+    slice_id = "task-5-閘2-匯出樹乾淨重建-build"
+    candidate = "a" * 40
+
+    assert verification.evidence_path(
+        slice_id=slice_id, candidate=candidate, coordinator_root=tmp_path
+    ).name == f"{slice_id}-{candidate}.json"
+    assert completion.completion_record_path(
+        slice_id=slice_id, candidate=candidate, coordinator_root=tmp_path
+    ).name == f"{slice_id}-{candidate}.json"
+    assert review.review_worktree_path(
+        repo_root=tmp_path, slice_id=slice_id, reviewer_job_id="reviewer-1"
+    ).name == f"{slice_id}-reviewer-1"
+
+
 class CompletionRecordValidationTests(unittest.TestCase):
     @staticmethod
     def _work_authority(*, review_kind: str = "copilot") -> dict:
