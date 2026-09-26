@@ -344,6 +344,84 @@ def test_ac5_reset_expiration_makes_snapshot_unknown_before_ttl():
     assert "stale-snapshot" in row["coverage_gaps"]
 
 
+def test_ac5_unknown_snapshot_epoch_does_not_combine_usage_after_window_switch():
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    service = shadow_module.QuotaShadowService.in_memory()
+    snapshot = _observation(
+        descriptor,
+        "short",
+        value="20",
+        observed_at_ms=_NOW,
+        ttl_ms=300_000,
+    )
+    assert service.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    # The terminal usage belongs to a new five-minute window one millisecond
+    # after the snapshot. The snapshot has no window instance or reset anchor.
+    terminal_usage = _observation(
+        descriptor,
+        "short",
+        value="2",
+        observed_at_ms=_NOW + 1,
+        reset_at_ms=_NOW + 300_001,
+        ttl_ms=300_000,
+        measurement_kind="usage_delta",
+        metric_id="input_tokens",
+        source_method="executor_usage",
+        event_id="terminal-usage-after-window-switch",
+    )
+    assert service.record_observation(
+        terminal_usage.to_dict(), descriptors=(descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 2
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "unknown"
+    assert "window-epoch-unknown" in row["coverage_gaps"]
+
+
+def test_ac5_known_snapshot_epoch_still_projects_matching_usage():
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    service = shadow_module.QuotaShadowService.in_memory()
+    snapshot = _observation(
+        descriptor,
+        "short",
+        value="20",
+        observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 300_000,
+        ttl_ms=300_000,
+    )
+    usage = _observation(
+        descriptor,
+        "short",
+        value="2",
+        observed_at_ms=_NOW + 1,
+        reset_at_ms=_NOW + 300_000,
+        ttl_ms=300_000,
+        measurement_kind="usage_delta",
+        metric_id="input_tokens",
+        source_method="executor_usage",
+        event_id="terminal-usage-same-window",
+    )
+    for observation in (snapshot, usage):
+        assert service.record_observation(
+            observation.to_dict(), descriptors=(descriptor,), unit_catalog=()
+        ).accepted == 1
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 2
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "observed"
+    assert row["remaining"]["amount"] == {"kind": "exact", "value": "18"}
+
+
 def test_ac1_multimodel_shared_pool_independent_pool_and_all_windows_are_separate():
     _, _, shadow_module = _feature_api()
     descriptor_shared = _pool_descriptor()
@@ -720,10 +798,12 @@ def test_ac4_manager_worker_reviewer_replays_deduplicate_and_external_gap_is_vis
         descriptors=(descriptor,), unit_catalog=(unit,), now_utc_ms=_NOW + 20
     )
     row = _pool_row(report, "pool-shared", "short")
-    assert row["remaining"]["amount"] == {"kind": "exact", "value": "14"}
+    assert row["remaining"]["state"] == "unknown"
+    assert "window-epoch-unknown" in row["coverage_gaps"]
     assert "external-session-unobserved" in row["coverage_gaps"]
     week = _pool_row(report, "pool-shared", "week")
-    assert week["remaining"]["amount"] == {"kind": "exact", "value": "44"}
+    assert week["remaining"]["state"] == "unknown"
+    assert "window-epoch-unknown" in week["coverage_gaps"]
     assert "external-session-unobserved" in week["coverage_gaps"]
     assert report["dispatch_effect"] == "none"
 
@@ -750,9 +830,9 @@ def test_ac4_manager_worker_reviewer_replays_deduplicate_and_external_gap_is_vis
     bounded_report = bounded_service.project(
         descriptors=(descriptor,), unit_catalog=(unit,), now_utc_ms=_NOW + 20
     )
-    assert _pool_row(bounded_report, "pool-shared", "short")["remaining"]["amount"] == {
-        "kind": "bounds", "lower": "7", "upper": "17"
-    }
+    bounded_row = _pool_row(bounded_report, "pool-shared", "short")
+    assert bounded_row["remaining"]["state"] == "unknown"
+    assert "window-epoch-unknown" in bounded_row["coverage_gaps"]
 
     external_service = shadow_module.QuotaShadowService.in_memory()
     external_payload = _observation(

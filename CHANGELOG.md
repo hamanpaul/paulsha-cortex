@@ -21,7 +21,9 @@
   `usedPercent` 的有效 remaining，reset 時間維持 unknown。provider 無 event ID 時，
   ledger 以來源、scope/window、measurement 與
   observation 時間推導 identity；相同 identity 的內容衝突寫入 receipt，shadow remaining
-  維持 unknown。增加 reset 早於 TTL 時的 freshness 回歸測試。
+  維持 unknown。增加 reset 早於 TTL 時的 freshness 回歸測試。window epoch 未知的
+  remaining snapshot 不再與其後同 unit usage 合成確定餘額，並以
+  `window-epoch-unknown` gap 保留原因；已知且相符的 epoch 路徑維持原有扣算。
 
 - **PatchMUD report v2 consumer**：封套 mapper 以 role、execution-profile key、benchmark、deck digest 與 evaluator revision 精確選取 cohort；v1 報表僅 opaque 保留並 fail-closed 不排名，未知版本拒收。`model-eval-roster.yaml` 新增 profile-bound schema v2，保留既有 roster v1 相容讀取。
 

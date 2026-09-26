@@ -455,6 +455,14 @@ class QuotaShadowService:
         baseline = _known_value(selected_observation.to_dict().get("observed_at_ms"))
         baseline_unit = _known_value(selected_observation.to_dict().get("unit_ref"))
         baseline_window = selected_observation.to_dict().get("window_instance")
+        baseline_epoch = (
+            baseline_window.get("epoch")
+            if isinstance(baseline_window, dict) and baseline_window.get("kind") == "interval"
+            else None
+        )
+        baseline_epoch_known = (
+            isinstance(baseline_epoch, dict) and baseline_epoch.get("state") == "known"
+        )
         base_amount = quantity.get("amount", {})
         if not isinstance(base_amount, dict):
             return
@@ -493,6 +501,9 @@ class QuotaShadowService:
                 invalidated = "usage-unit-not-comparable"
                 continue
             usage_window = wire.get("window_instance")
+            if not baseline_epoch_known:
+                invalidated = "window-epoch-unknown"
+                continue
             if isinstance(baseline_window, dict) and baseline_window.get("kind") == "interval":
                 if not isinstance(usage_window, dict) or usage_window.get("kind") != "interval" or usage_window != baseline_window:
                     invalidated = "usage-window-unresolved"

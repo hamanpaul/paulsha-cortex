@@ -19,3 +19,7 @@ ledger 改以穩定的來源、
 scope/window、measurement 與 observation 時間推導 identity；相同 identity 的內容
 衝突會寫 conflict receipt 並使 shadow remaining 保持 unknown。補上 reset 已過但 TTL
 未到的 freshness regression，確認此情況已由既有 freshness/min-expiry 邏輯 fail closed。
+
+修正 shadow projection：remaining snapshot 的 window epoch 未知時，後續同 unit usage
+不再與 snapshot 合成確定餘額；projection 回報 unknown 並附 `window-epoch-unknown` gap。
+已知且相符的 window epoch 仍可扣算 usage。
