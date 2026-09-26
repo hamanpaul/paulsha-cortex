@@ -628,6 +628,9 @@
 
 ### Fixed
 
+- **#486 foreign-review verdict 提示與診斷**：review prompt 會列出 validator 允許的
+  finding category／severity；無效 verdict 仍 fail closed，gate evaluation 會保留
+  validator 的具體錯誤。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
