@@ -176,7 +176,7 @@ def _pinned_git_runner(repo_root: Path) -> GitRunner:
             raise RuntimeError(
                 f"git -C {repo_root} {' '.join(args)} 失敗: {proc.stderr.strip()}"
             )
-        return proc.stdout.strip()
+        return proc.stdout
 
     return _runner
 
@@ -302,9 +302,8 @@ def _dirty_entries(runner: GitRunner, target: Path) -> tuple[list[str], str | No
     透過 ``git -C <worktree>`` 走同一個 seam：git 允許重複 ``-C``，後者為絕對
     路徑時直接生效，因此不必為了讀 worktree 狀態另開一條 runner 契約。
 
-    刻意**不用** ``git status --porcelain``：seam 契約回傳的是已 ``strip()`` 的
-    字串，porcelain 的兩字狀態碼首欄可能是空白（`` M README.md``），首筆記錄會
-    被 strip 掉一個字元、路徑跟著錯位。改用兩個只吐裸路徑的命令，對 strip 免疫。
+    延續使用兩個 NUL 分隔、只列出路徑的命令，保留既有 tracked／untracked 收集與
+    去重語意。git_runner 原樣回傳 stdout；此處依 NUL 分隔切出路徑，不做 strip。
     """
 
     entries: list[str] = []

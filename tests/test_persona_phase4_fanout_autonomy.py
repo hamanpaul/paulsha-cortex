@@ -902,6 +902,39 @@ class FanoutTests(unittest.TestCase):
             self.assertEqual(jobs[0]["pid"], 123)
             self.assertEqual(reg.get_job(jobs[0]["job_id"])["pid"], 123)
 
+    def test_dispatch_ready_strips_early_best_effort_rev_parse_output(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import DispatchReadyError, dispatch_ready
+        from paulsha_cortex.coordinator.dispatcher import Dispatcher
+        from paulsha_cortex.coordinator.registry import JobRegistry
+
+        class _FakeSender:
+            def send(self, *_args):
+                raise AssertionError("no dispatch should be launched")
+
+        class _FakeWt:
+            def create(self, branch, *, job_id=None):
+                return f"/fake/wt/{branch.replace('/', '-')}"
+
+        sha = "c" * 40
+        with tempfile.TemporaryDirectory() as d:
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            disp = Dispatcher(reg, _FakeSender(), _FakeWt())
+            with mock.patch(
+                "paulsha_cortex.coordinator.autonomy._resolve_dispatch_identity",
+                side_effect=ValueError("stop after early baseline"),
+            ):
+                with self.assertRaisesRegex(DispatchReadyError, "stop after early baseline"):
+                    dispatch_ready(
+                        [_meta("early-baseline", plan="docs/early.md")],
+                        is_satisfied=lambda _id: True,
+                        dispatcher=disp,
+                        persona="reviewer",
+                        launcher=object(),
+                        git_runner=lambda _args: sha + "\n",
+                    )
+
+            self.assertEqual(reg.get_slice("early-baseline")["dispatch_base"], sha)
+
     def test_dispatch_ready_no_slice_id_not_dispatched(self) -> None:
         from paulsha_cortex.coordinator.autonomy import dispatch_ready
 
@@ -977,7 +1010,7 @@ class FanoutTests(unittest.TestCase):
             def _fake_git(args):  # 注入 git runner，避免起真 git（target + baseline）
                 git_calls.append(list(args))
                 if args and args[0] == "rev-parse":
-                    return "f" * 40
+                    return "b" * 40 + "\n"
                 if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
                     return ""
                 if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
@@ -999,6 +1032,7 @@ class FanoutTests(unittest.TestCase):
                 _subprocess.run = orig_run
             self.assertEqual(len(jobs), 2)
             self.assertEqual({j["status"] for j in jobs}, {"dispatched"})
+            self.assertEqual({j["dispatch_head"] for j in jobs}, {"b" * 40})
             self.assertEqual(len(reg.list_jobs()), 2)
             self.assertEqual(launcher.calls, ["real-a", "real-b"])
             self.assertEqual(sender.sent, [])   # headless：不送 tmux pane
@@ -1025,7 +1059,7 @@ class FanoutTests(unittest.TestCase):
                 ),
                 2,
             )
-            self.assertEqual({j["dispatch_head"] for j in jobs}, {"f" * 40})
+            self.assertEqual({j["dispatch_head"] for j in jobs}, {"b" * 40})
 
 
 # --------------------------------------------------------------------------- #

@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#550 git_runner 輸出保真**：兩份預設 runner 保留原始 stdout，避免 porcelain 等 whitespace-sensitive 輸出的前導空白遭移除；dispatcher 與 autonomy 的 `rev-parse` 呼叫端自行清理 SHA 換行，並補上對應回歸測試。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

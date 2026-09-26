@@ -676,7 +676,7 @@ def dispatch_ready(
             # 再被更新（見下方 _mark_slice_needs_human），故先嘗試取現有 branch head
             # 存底；branch 尚未建立（首次派工常態）時取不到，None 為預期落點。
             try:
-                early_dispatch_head = runner(["rev-parse", _branch_for_slice(slice_id)])
+                early_dispatch_head = runner(["rev-parse", _branch_for_slice(slice_id)]).strip()
             except Exception:
                 early_dispatch_head = None
             executor = m.get("executor")
@@ -777,7 +777,7 @@ def dispatch_ready(
                 prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
             # baseline 須在 agent 動工前取（launch 前），否則含進 agent 的 commit → 空 diff。
             try:
-                dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])
+                dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)]).strip()
             except Exception:
                 dispatch_head = None
             log_dir = str(Path("runtime/dispatch") / slice_id)

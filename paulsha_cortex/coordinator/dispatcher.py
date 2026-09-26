@@ -43,7 +43,7 @@ def _default_git_runner(args: list[str]) -> str:
         raise RuntimeError(
             f"git -C {repo_root} {' '.join(args)} 失敗: {proc.stderr.strip()}"
         )
-    return proc.stdout.strip()
+    return proc.stdout
 
 
 def _branch_for_task(task: str) -> str:
@@ -179,7 +179,7 @@ class Dispatcher:
         #     D5：baseline 持久化於 job 上（非實例 dict），故 poll_done 可跨進程比對。
         runner = git_runner or self._git_runner or _default_git_runner
         try:
-            dispatch_head: str | None = runner(["rev-parse", branch])
+            dispatch_head: str | None = runner(["rev-parse", branch]).strip()
         except Exception:
             dispatch_head = None
         # (4) registry 記一筆 job（status=dispatched，含 dispatch_head baseline）
@@ -205,7 +205,7 @@ class Dispatcher:
             return job  # baseline 不明 → 不自動完成
         runner = git_runner or self._git_runner or _default_git_runner
         try:
-            current = runner(["rev-parse", job["branch"]])
+            current = runner(["rev-parse", job["branch"]]).strip()
         except Exception:
             return job  # 取不到 head → 無法判定，維持原狀
         if current != baseline:
