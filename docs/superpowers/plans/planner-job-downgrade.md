@@ -100,8 +100,7 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
   - `test_in_process_invoker_preserves_sandbox_contract`：sandbox 被弄髒仍拋
     `planning launcher modified disposable read-only sandbox`。
   - `test_in_process_invoker_preserves_operator_drift_containment`：operator 樹 drift
-    仍走 `_contain_operator_drift`，`PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX` 逐字不變
-    （那是下游分類契約）。
+    仍走 `_contain_operator_drift`，並攜帶固定 `failure_kind`；訊息前綴只供人工診斷。
   - `test_invoker_selection_follows_resolve_runner_mode`：`PSC_JOB_RUNNER` 的值是**唯一**
     輸入；非法值 fail-closed；不存在第二個開關。
 - [x] `paulsha_cortex/coordinator/planning_runtime.py`：抽出 `PlanningInvocation`／

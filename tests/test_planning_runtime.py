@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 from paulsha_cortex.coordinator import planning, planning_runtime
 import paulsha_cortex.coordinator.model_identities as model_identities
@@ -1198,6 +1199,102 @@ def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_pa
     link.unlink()
     link.symlink_to("empty", target_is_directory=True)
     assert planning_runtime._tree_snapshot(tmp_path) != baseline
+
+
+def test_tree_snapshot_ignores_owner_and_xattr_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("same content\n", encoding="utf-8")
+    baseline = planning_runtime._tree_snapshot(tmp_path)
+    original_lstat = Path.lstat
+
+    def changed_owner(path: Path):
+        metadata = original_lstat(path)
+        if path == tracked:
+            return SimpleNamespace(
+                st_mode=metadata.st_mode,
+                st_uid=metadata.st_uid + 1,
+                st_gid=metadata.st_gid + 1,
+                st_rdev=metadata.st_rdev,
+            )
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", changed_owner)
+    monkeypatch.setattr(planning_runtime.os, "listxattr", lambda *_a, **_k: ["user.test"])
+    monkeypatch.setattr(planning_runtime.os, "getxattr", lambda *_a, **_k: b"changed")
+
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline
+
+
+def test_planning_runtime_retries_unstable_baseline_copy_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    tracked = tmp_path / "tracked.md"
+    tracked.write_text("initial\n", encoding="utf-8")
+    real_copy = planning_runtime._copy_planning_sandbox
+    copy_count = 0
+
+    def change_during_first_copy(source: Path, destination: Path) -> None:
+        nonlocal copy_count
+        copy_count += 1
+        real_copy(source, destination)
+        if copy_count == 1:
+            tracked.write_text("edited during baseline copy\n", encoding="utf-8")
+
+    monkeypatch.setattr(planning_runtime, "_copy_planning_sandbox", change_during_first_copy)
+
+    result = planning_runtime._invoke_json(
+        identity,
+        "return JSON",
+        worktree=tmp_path,
+        runner=lambda *_a, **_k: _completed(json.dumps({"ok": True})),
+        timeout_seconds=30,
+    )
+
+    assert result == {"ok": True}
+    assert copy_count == 2
+    assert tracked.read_text(encoding="utf-8") == "edited during baseline copy\n"
+
+
+def test_planning_runtime_fails_closed_when_baseline_never_stabilizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    tracked = tmp_path / "tracked.md"
+    tracked.write_text("initial\n", encoding="utf-8")
+    real_copy = planning_runtime._copy_planning_sandbox
+    copy_count = 0
+    runner_called = False
+
+    def keep_changing_during_copy(source: Path, destination: Path) -> None:
+        nonlocal copy_count
+        copy_count += 1
+        real_copy(source, destination)
+        tracked.write_text(f"edit {copy_count}\n", encoding="utf-8")
+
+    def runner(*_args, **_kwargs):
+        nonlocal runner_called
+        runner_called = True
+        return _completed(json.dumps({"ok": True}))
+
+    monkeypatch.setattr(planning_runtime, "_copy_planning_sandbox", keep_changing_during_copy)
+
+    with pytest.raises(ValueError, match="operator worktree.*content preserved") as excinfo:
+        planning_runtime._invoke_json(
+            identity,
+            "return JSON",
+            worktree=tmp_path,
+            runner=runner,
+            timeout_seconds=30,
+            evidence_root=tmp_path / "coordinator",
+            run_id="workflow-551",
+        )
+
+    assert copy_count == 2
+    assert runner_called is False
+    assert getattr(excinfo.value, "failure_kind", None) == "operator_worktree_drift"
 
 
 def test_snapshot_permission_error_still_produces_drift_evidence(tmp_path: Path) -> None:

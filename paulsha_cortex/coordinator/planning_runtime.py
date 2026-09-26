@@ -37,6 +37,15 @@ from .planning import echoed_identifier_hint, question_pack_echo_hint, required_
 logger = logging.getLogger(__name__)
 
 
+PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT = "operator_worktree_drift"
+
+
+class OperatorWorktreeDriftError(ValueError):
+    """planning 執行期間 operator worktree 發生變動。"""
+
+    failure_kind = PLANNING_FAILURE_KIND_OPERATOR_WORKTREE_DRIFT
+
+
 @dataclass(frozen=True)
 class ProductionPlanningRuntime:
     identity_registry: IdentityRegistry
@@ -151,31 +160,19 @@ def _snapshot_skipped(relative: Path, name: str) -> bool:
 
 
 def _tree_snapshot(root: Path) -> str:
-    """Hash the complete tree shape, content, links, and stable metadata.
+    """雜湊工作樹路徑、類型、權限、內容與 symlink 目標。
 
-    The planner runs in a disposable copy, but the operator checkout is also
-    hashed before and after launch.  This catches direct writes through an
-    absolute path even when the planner exits non-zero.
+    planner 在拋棄式複本執行，但仍會在啟動前後雜湊 operator checkout，捕捉
+    launcher 經絕對路徑直接寫入的變更。共用工作樹的 owner 與 xattr 可能由 daemon、
+    operator 或編輯器改變，故不納入判準；檔案類型與 mode 仍保留。
     """
 
     digest = hashlib.sha256()
 
     def add_metadata(path: Path) -> os.stat_result:
         metadata = path.lstat()
-        digest.update(f"{metadata.st_mode}:{metadata.st_uid}:{metadata.st_gid}".encode())
+        digest.update(str(metadata.st_mode).encode())
         digest.update(b"\0")
-        try:
-            names = sorted(os.listxattr(path, follow_symlinks=False))
-        except (AttributeError, OSError):
-            names = []
-        for name in names:
-            digest.update(name.encode("utf-8", errors="surrogateescape"))
-            digest.update(b"=")
-            try:
-                digest.update(os.getxattr(path, name, follow_symlinks=False))
-            except OSError:
-                digest.update(b"<unreadable>")
-            digest.update(b"\0")
         return metadata
 
     def visit(path: Path, relative: Path) -> None:
@@ -278,7 +275,8 @@ def _make_tree_traversable(root: Path) -> None:
 # 根因是歸因錯誤：launcher 以 `cwd=sandbox`（拋棄式複本）執行，operator 樹比對
 # 只是「防越界」的安全網；把安全網的補救動作設成整棵樹抹除，在多方並行（operator
 # 手動編輯、其他 agent、編輯器自動儲存、背景建置）的真實環境下誤傷機率遠高於
-# 真正的越界。加上 baseline 由非原子 `copytree` 取樣，歸因本身就不可靠。
+# 真正的越界。加上 baseline 由非原子 `copytree` 取樣，歸因本身就不可靠；#551
+# 以來源前後快照與複本快照比對，第一次不一致時重取一次，仍不一致才 fail-closed。
 #
 # R0 修法（本檔）：
 #   1. 整棵還原的程式路徑**移除**，改為 `_contain_operator_drift()`。
@@ -301,11 +299,8 @@ PLANNING_WORKTREE_DRIFT_DIRNAME = "planning-worktree-drift"
 # `backed_up: false`，並且**一律逐出 rollback 範圍**——備份不成功就不准抹除，
 # 是本 issue 最低限度的保命索。
 PLANNING_DRIFT_BACKUP_MAX_BYTES = 64_000_000
-# #554：drift 失敗訊息的**穩定前綴**。這串字是下游分類（`manager.
-# _is_planning_worktree_drift_failure`）唯一可以依賴的部分——訊息尾段已經在
-# #543 改過一次（`changes rolled back` → `operator content preserved`），計數與
-# evidence 路徑更是每次都不同。改動本常數等同改動分類契約，必須同步改判準與
-# 其回歸測試。
+# #554：drift 失敗訊息的人工診斷前綴。下游分類依固定 failure_kind，不讀取
+# 這段 reason；本常數只提供可辨識的 log/evidence 文字。
 PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX = "planning launcher modified operator worktree"
 # #554：備份與報告雙雙寫不出去時，evidence 欄位的退化佔位符。
 #
@@ -399,22 +394,6 @@ def _tree_manifest(root: Path) -> dict[str, dict[str, object]]:
             manifest[key] = {"kind": "unreadable", "error": type(exc).__name__}
             return
         entry = _entry_digest(path, metadata)
-        # xattr 也納入描述：`_tree_snapshot` 把它算進雜湊，這裡不看的話會出現
-        # 「偵測到 dirty 卻報不出任何 diff」的失真報告。
-        try:
-            names = sorted(os.listxattr(path, follow_symlinks=False))
-        except (AttributeError, OSError):
-            names = []
-        if names:
-            attributes: dict[str, str] = {}
-            for name in names:
-                try:
-                    value = os.getxattr(path, name, follow_symlinks=False)
-                except OSError:
-                    attributes[name] = "<unreadable>"
-                    continue
-                attributes[name] = hashlib.sha256(value).hexdigest()
-            entry["xattrs"] = attributes
         manifest[key] = entry
         if entry.get("kind") != "dir":
             return
@@ -718,6 +697,49 @@ def _operator_drift_message(summary: Mapping[str, object]) -> str:
         f"(added={counts.get('added', 0)} modified={counts.get('modified', 0)} "
         f"removed={counts.get('removed', 0)}); evidence={location}"
     )
+
+
+def _operator_worktree_drift_failure(
+    worktree: Path,
+    baseline: Path,
+    *,
+    evidence_root: str | Path | None,
+    run_id: str,
+) -> OperatorWorktreeDriftError:
+    try:
+        summary = _contain_operator_drift(
+            worktree,
+            baseline,
+            evidence_root=Path(evidence_root) if evidence_root is not None else None,
+            run_id=run_id,
+            rollback_scope=frozenset(),
+        )
+    except BaseException as exc:  # noqa: BLE001 - 診斷面 fail-open
+        logger.error(
+            "planning-worktree-drift-containment-failed run_id=%s error=%s: %s",
+            run_id,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        summary = {"counts": {}, "report_path": None, "backup_root": None}
+    message = _operator_drift_message(summary)
+    logger.error("planning-worktree-drift run_id=%s %s", run_id, message)
+    return OperatorWorktreeDriftError(message)
+
+
+def _copy_stable_planning_baseline(worktree: Path, baseline: Path) -> str | None:
+    """建立與來源內容一致的 baseline；不穩時重取一次，仍不穩則回 None。"""
+
+    for attempt in range(2):
+        source_before = _tree_snapshot(worktree)
+        _copy_planning_sandbox(worktree, baseline)
+        copied = _tree_snapshot(baseline)
+        source_after = _tree_snapshot(worktree)
+        if source_before == copied == source_after:
+            return source_after
+        if attempt == 0:
+            shutil.rmtree(baseline)
+    return None
 
 
 _FENCED_JSON = re.compile(
@@ -1171,11 +1193,17 @@ class InProcessPlanningInvoker:
         worktree = invocation.worktree
         run_id = invocation.run_id
         evidence_root = invocation.evidence_root
-        operator_before = _tree_snapshot(worktree)
         with tempfile.TemporaryDirectory(prefix="cortex-planning-") as temp_dir:
             baseline = Path(temp_dir) / "baseline"
             sandbox = Path(temp_dir) / "checkout"
-            _copy_planning_sandbox(worktree, baseline)
+            operator_before = _copy_stable_planning_baseline(worktree, baseline)
+            if operator_before is None:
+                raise _operator_worktree_drift_failure(
+                    worktree,
+                    baseline,
+                    evidence_root=evidence_root,
+                    run_id=run_id,
+                )
             shutil.copytree(baseline, sandbox, symlinks=True)
             sandbox_before = _tree_snapshot(sandbox)
             # #727：落點只推導一次，argv 與讀回端共用同一個物件——修法前這裡與
@@ -1264,30 +1292,12 @@ class InProcessPlanningInvoker:
                     # `manager._publish_planning_artifacts`（有交易與 authority 把
                     # 關），不在此。任何差異都當成 operator／其他 agent 的並行工作
                     # 保留原地，只做備份與報告。
-                    try:
-                        summary = _contain_operator_drift(
-                            worktree,
-                            baseline,
-                            evidence_root=(
-                                Path(evidence_root) if evidence_root is not None else None
-                            ),
-                            run_id=run_id,
-                            rollback_scope=frozenset(),
-                        )
-                    except BaseException as exc:  # noqa: BLE001 - 診斷面 fail-open
-                        # drift 收斂只負責診斷；它自己壞掉時仍要拋出可辨識的
-                        # planning 失敗，不得換成一個與現場無關的例外（修法前那條
-                        # 「restore failed」出口就是這個反例）。
-                        logger.error(
-                            "planning-worktree-drift-containment-failed run_id=%s error=%s: %s",
-                            run_id,
-                            type(exc).__name__,
-                            str(exc)[:200],
-                        )
-                        summary = {"counts": {}, "report_path": None, "backup_root": None}
-                    message = _operator_drift_message(summary)
-                    logger.error("planning-worktree-drift run_id=%s %s", run_id, message)
-                    failure = ValueError(message)
+                    failure = _operator_worktree_drift_failure(
+                        worktree,
+                        baseline,
+                        evidence_root=evidence_root,
+                        run_id=run_id,
+                    )
             if failure is not None:
                 raise failure
             if outcome is None:  # pragma: no cover - failure 為 None ⇒ 必已賦值
