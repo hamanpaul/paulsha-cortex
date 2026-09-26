@@ -2444,7 +2444,8 @@ cortex install trust-root plan \
 #   [codex]）；不得用「找得到某個 HOME」來補這一格。
 
 # 3️⃣ apply 完成後，只接受 operator 明確選定的單一來源檔；來源檔名必須是
-#    oauth_creds.json，內容不得進 argv、receipt 或 log。
+#    antigravity-oauth-token（agy 1.2.11 的 ~/.gemini/antigravity-cli/ 葉檔），
+#    內容不得進 argv、receipt 或 log。
 sudo cortex install trust-root credentials import \
   --receipt /path/to/install-receipt.json \
   --principal builder \

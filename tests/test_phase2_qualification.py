@@ -12,6 +12,12 @@ from pathlib import Path
 
 import pytest
 
+from qualification.contract import PROVIDERS as PROVIDER_CONTRACTS
+
+
+PROVIDER_MODELS = {name: row["model_id"] for name, row in PROVIDER_CONTRACTS.items()}
+PROVIDER_EFFORTS = {name: row["effort"] for name, row in PROVIDER_CONTRACTS.items()}
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 QUALIFICATION = REPO_ROOT / "qualification"
@@ -48,6 +54,35 @@ def _required_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def test_install_config_writer_keeps_the_exact_input_inventory(tmp_path: Path) -> None:
+    """canary overlay 在容器內由 contract 產生，不得在 qualification-input 多出檔案。"""
+
+    bundle = tmp_path / "bundle.json"
+    bundle.write_text(
+        json.dumps({"candidate_sha": "a" * 40, "toolchain": []}),
+        encoding="utf-8",
+    )
+    output = tmp_path / "install-config.yaml"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(QUALIFICATION / "write_install_config.py"),
+            "--bundle",
+            str(bundle),
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "bundle.json",
+        "install-config.yaml",
+    ]
+
+
 def _valid_qualification() -> dict:
     return {
         "schema_version": 2,
@@ -71,30 +106,30 @@ def _valid_qualification() -> dict:
         "providers": [
             {
                 "provider": "agy",
-                "requested_model": "gemini-3.7-flash",
-                "runtime_model": "gemini-3.7-flash",
-                "requested_effort": "high",
-                "runtime_effort": "high",
+                "requested_model": PROVIDER_MODELS["agy"],
+                "runtime_model": PROVIDER_MODELS["agy"],
+                "requested_effort": PROVIDER_EFFORTS["agy"],
+                "runtime_effort": PROVIDER_EFFORTS["agy"],
                 "status": "passed",
                 "quota": "available",
                 "fallback": False,
             },
             {
                 "provider": "copilot",
-                "requested_model": "gpt-5.4",
-                "runtime_model": "gpt-5.4",
-                "requested_effort": "xhigh",
-                "runtime_effort": "xhigh",
+                "requested_model": PROVIDER_MODELS["copilot"],
+                "runtime_model": PROVIDER_MODELS["copilot"],
+                "requested_effort": PROVIDER_EFFORTS["copilot"],
+                "runtime_effort": PROVIDER_EFFORTS["copilot"],
                 "status": "passed",
                 "quota": "available",
                 "fallback": False,
             },
             {
                 "provider": "codex",
-                "requested_model": "gpt-5.3-codex-spark",
-                "runtime_model": "gpt-5.3-codex-spark",
-                "requested_effort": "xhigh",
-                "runtime_effort": "xhigh",
+                "requested_model": PROVIDER_MODELS["codex"],
+                "runtime_model": PROVIDER_MODELS["codex"],
+                "requested_effort": PROVIDER_EFFORTS["codex"],
+                "runtime_effort": PROVIDER_EFFORTS["codex"],
                 "status": "passed",
                 "quota": "available",
                 "fallback": False,
@@ -301,7 +336,7 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
         "agent_loop_probe": {
             "schema_version": 1,
             "executor": "codex",
-            "model_id": "gpt-5.3-codex-spark",
+            "model_id": PROVIDER_MODELS["codex"],
             "card_id": "worktree-isolation",
             "builder_job_ids": ["build-job"],
             "successful_command_count": 1,
@@ -310,8 +345,8 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
             "output_sha256": "6" * 64,
             "log_sha256": "7" * 64,
             "thread_sha256": "8" * 64,
-            "runtime_model": "gpt-5.3-codex-spark",
-            "runtime_effort": "xhigh",
+            "runtime_model": PROVIDER_MODELS["codex"],
+            "runtime_effort": PROVIDER_EFFORTS["codex"],
             "model_provider": "openai",
             "probe_candidate_sha": "9" * 40,
         },
@@ -1000,7 +1035,7 @@ def test_full_suite_validator_rejects_self_consistent_forged_artifacts(
         elif mutation == "agent-loop-unbounded-command-count":
             probe["successful_command_count"] = 10**100
         elif mutation == "agent-loop-wrong-model":
-            probe["model_id"] = "gpt-5.4"
+            probe["model_id"] = PROVIDER_MODELS["copilot"]
         elif mutation == "agent-loop-wrong-card":
             probe["card_id"] = "tdd-red"
         elif mutation == "agent-loop-multiple-jobs":
@@ -1008,7 +1043,7 @@ def test_full_suite_validator_rejects_self_consistent_forged_artifacts(
         elif mutation == "agent-loop-unbounded-job-id":
             probe["builder_job_ids"] = ["raw output with spaces" * 100]
         elif mutation == "agent-loop-runtime-model":
-            probe["runtime_model"] = "gpt-5.4"
+            probe["runtime_model"] = PROVIDER_MODELS["copilot"]
         elif mutation == "agent-loop-log-unbound":
             probe["log_sha256"] = "9" * 64
         elif mutation == "agent-loop-artifact-set":
@@ -1172,13 +1207,32 @@ def test_qualification_driver_and_runner_are_fail_closed_on_live_inputs() -> Non
         assert variable in runner
     assert "builder_agy_required" in runner
     assert "jq -e" in runner
+    # Credential source basenames come from the installer adapter, not literals.
+    assert "oauth_creds.json" not in runner
+    assert "hosts.json" not in runner
+    assert "/opt/cortex/venv/bin/python -c" not in runner.split("cortex install trust-root apply")[0]
+    for assignment in (
+        "agy_auth_leaf=$(credential_source_basename reviewer-planner agy)",
+        "builder_agy_auth_leaf=$(credential_source_basename builder agy)",
+        "copilot_auth_leaf=$(credential_source_basename reviewer-planner copilot)",
+        "manager_github_auth_leaf=$(credential_source_basename manager github)",
+    ):
+        assert assignment in runner
     assert (
-        "import_secret CORTEX_RC_BUILDER_AGY_AUTH builder agy /run/oauth_creds.json"
+        'import_secret CORTEX_RC_BUILDER_AGY_AUTH builder agy "/run/$builder_agy_auth_leaf"'
         in runner
     )
+    assert 'import_fixture builder agy "/run/$builder_agy_auth_leaf"' in runner
     assert (
-        "import_fixture builder agy /run/oauth_creds.json" in runner
+        'import_secret CORTEX_RC_COPILOT_AUTH reviewer-planner copilot "/run/$copilot_auth_leaf"'
+        in runner
     )
+    # The canary model overlay is rendered in-container from the shared contract
+    # and installed at the Manager's installed PSC_PROJECT_CONFIG_ROOT.
+    assert "/usr/local/libexec/qualification/contract.py" in runner
+    assert "--model-identity-overlay" in runner
+    assert "PSC_PROJECT_CONFIG_ROOT" in runner
+    assert "/artifacts/model-identities.yaml" not in runner
 
 
 def test_release_driver_never_calls_live_provider_or_repository_functions(
@@ -1219,6 +1273,7 @@ def test_release_driver_never_calls_live_provider_or_repository_functions(
 
     monkeypatch.setattr(driver, "_provider_smokes", unexpected_live_call)
     monkeypatch.setattr(driver, "_manager_github_probe", unexpected_live_call)
+    monkeypatch.setattr(driver, "_prepare_probe_dispatch", unexpected_live_call)
     monkeypatch.setattr(driver, "_full_dispatch", unexpected_live_call)
     monkeypatch.setattr(
         sys,
