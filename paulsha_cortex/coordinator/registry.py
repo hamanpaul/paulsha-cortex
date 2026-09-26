@@ -5434,6 +5434,9 @@ class JobRegistry:
         *,
         expected_candidate: str,
         retry_classification: str | None = None,
+        reviewer_recovery_checker: (
+            Callable[[Mapping[str, Any], WorkflowRun], bool] | None
+        ) = None,
     ) -> WorkflowRun:
         """Atomically rerun verification only, keeping the exact unchanged Candidate (#216).
 
@@ -5463,17 +5466,19 @@ class JobRegistry:
         build_steps = [step for step in current.steps if step.phase == "build"]
         if not build_steps or any(step.gate_result != "passed" for step in build_steps):
             raise ValueError("retry-verify reset requires completed build phase")
-        # #315：operator 已以 CAS 顯式授權重跑 verification；舊 exited verify job
-        # 的 reviewer sandbox 依設計已清除、terminal 證據不可重驗，維持 "exited"
-        # 會讓 dispatch 先 terminalize 舊 job 而永遠卡在 input-snapshot-missing。
-        # 標記 failed 讓 explicit resume 走 replacement dispatch；build phase job
-        # 與 active job（前面 admission 已擋）不受影響。
+        # #315：一般舊 exited verify job 標記 failed，讓 explicit resume 走 replacement
+        # dispatch。若 Manager 的完整判準確認 job 仍可供精準 reviewer terminal
+        # recovery 採用，則保留 exited，避免關閉免費復原路徑。
         for job in self._jobs:
             if (
                 job.get("workflow_run_id") == current.run_id
                 and job.get("workflow_phase") == "verify"
                 and job.get("status") == "exited"
             ):
+                if reviewer_recovery_checker is not None and reviewer_recovery_checker(
+                    job, current
+                ):
+                    continue
                 job["status"] = "failed"
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "verify" else step
@@ -5511,6 +5516,9 @@ class JobRegistry:
         *,
         expected_candidate: str,
         retry_classification: str | None = None,
+        reviewer_recovery_checker: (
+            Callable[[Mapping[str, Any], WorkflowRun], bool] | None
+        ) = None,
     ) -> WorkflowRun:
         """Atomically relaunch foreign review only, keeping the verified Candidate (#216).
 
@@ -5542,16 +5550,19 @@ class JobRegistry:
         verify_steps = [step for step in current.steps if step.phase == "verify"]
         if not verify_steps or any(step.gate_result != "passed" for step in verify_steps):
             raise ValueError("retry-review reset requires completed verify phase")
-        # #315（review 版）：operator 已以 CAS 顯式授權重跑 review；舊 exited
-        # review job 的 reviewer sandbox 已清、terminal 不可重驗，維持 "exited"
-        # 會讓 resume 先 terminalize 舊 job 而卡死。標記 failed 讓 explicit
-        # resume 走 replacement dispatch；verify／build job 不受影響。
+        # #315：一般舊 exited review job 標記 failed，讓 explicit resume 走 replacement
+        # dispatch。若 Manager 的完整判準確認 job 仍可供精準 reviewer terminal
+        # recovery 採用，則保留 exited，避免關閉免費復原路徑。
         for job in self._jobs:
             if (
                 job.get("workflow_run_id") == current.run_id
                 and job.get("workflow_phase") == "review"
                 and job.get("status") == "exited"
             ):
+                if reviewer_recovery_checker is not None and reviewer_recovery_checker(
+                    job, current
+                ):
+                    continue
                 job["status"] = "failed"
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "review" else step

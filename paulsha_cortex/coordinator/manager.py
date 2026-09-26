@@ -14366,6 +14366,24 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
     coordinator_root = (
         Path(state_path).resolve().parent if state_path is not None else paths.coordinator_root().resolve()
     )
+    recovery_identities: IdentityRegistry | None = None
+
+    def reviewer_recovery_checker(job, run) -> bool:
+        """在 reset 前用 Manager 的精準判準保留仍可復原的 reviewer job。"""
+
+        nonlocal recovery_identities
+        if recovery_identities is None:
+            recovery_identities = load_model_identities()
+        step = _current_workflow_step(run)
+        return step is not None and _is_exact_reviewer_terminal_recovery(
+            active_registry,
+            job,
+            run=run,
+            step=step,
+            identities=recovery_identities,
+            coordinator_root=coordinator_root,
+        )
+
     # #205 R1：operator 在 `cortex run work start/resume/...` 帶入的 run-scoped
     # 模型鏈覆寫語法層抽取；是否合法留給 dispatch 時 fail closed（D4）。
     work_action_model_chain_override = extract_model_chain_override(args)
@@ -14392,11 +14410,17 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
             combo_override=work_action_combo_override,
         )
 
+    recovery_kwargs = (
+        {"reviewer_recovery_checker": reviewer_recovery_checker}
+        if args.get("action") in {"retry-verify", "retry-review"}
+        else {}
+    )
     return execute_work_action(
         args=args,
         requested_by=requested_by,
         workflow_registry=active_registry,
         workflow_starter=starter,
+        **recovery_kwargs,
     )
 
 

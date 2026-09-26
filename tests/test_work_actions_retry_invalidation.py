@@ -312,6 +312,23 @@ def test_retry_verify_reruns_only_verification_without_rebuilding_candidate(
         candidate_head=HEAD,
         facets=("needs_human",),
     )
+    old_job = registry.create_job(
+        task="wf-demo-verification",
+        persona="reviewer",
+        branch="feature/demo",
+        pane="",
+        worktree=str(tmp_path / "verify-sandbox"),
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="reviewer-verify",
+        workflow_phase="verify",
+    )
+    registry.update_headless_result(old_job["job_id"], status="exited", exit_code=0)
+
+    def exact_recovery_checker(job, current_run) -> bool:
+        return job["job_id"] == old_job["job_id"] and current_run.run_id == run.run_id
+
     result = work_actions.execute_work_action(
         args={
             "action": "retry-verify",
@@ -325,6 +342,7 @@ def test_retry_verify_reruns_only_verification_without_rebuilding_candidate(
         snapshot_path=snapshot,
         state_path=tmp_path / "runs.json",
         workflow_registry=registry,
+        reviewer_recovery_checker=exact_recovery_checker,
     )
     updated = result["result"]["run"]
     assert updated["current_phase"] == "verify"
@@ -339,6 +357,7 @@ def test_retry_verify_reruns_only_verification_without_rebuilding_candidate(
     # 不得計入 model failure 指標，也不得吃 #218 的 repair budget。
     assert result["result"]["retry_classification"] == "orchestrator_retry"
     assert updated["retry_classification"] == "orchestrator_retry"
+    assert registry.get_job(old_job["job_id"])["status"] == "exited"
 
 
 def test_retry_verify_rejects_candidate_mismatch(tmp_path: Path) -> None:
@@ -435,6 +454,23 @@ def test_retry_review_reruns_only_review_without_rebuilding_or_reverifying(
         facets=("needs_human",),
         planning_authority=plan_authority,
     )
+    old_job = registry.create_job(
+        task="wf-demo-code-review",
+        persona="reviewer",
+        branch="feature/demo",
+        pane="",
+        worktree=str(tmp_path / "review-sandbox"),
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="reviewer-review",
+        workflow_phase="review",
+    )
+    registry.update_headless_result(old_job["job_id"], status="exited", exit_code=0)
+
+    def exact_recovery_checker(job, current_run) -> bool:
+        return job["job_id"] == old_job["job_id"] and current_run.run_id == run.run_id
+
     result = work_actions.execute_work_action(
         args={
             "action": "retry-review",
@@ -448,6 +484,7 @@ def test_retry_review_reruns_only_review_without_rebuilding_or_reverifying(
         snapshot_path=snapshot,
         state_path=tmp_path / "runs.json",
         workflow_registry=registry,
+        reviewer_recovery_checker=exact_recovery_checker,
     )
     updated = result["result"]["run"]
     assert updated["current_phase"] == "review"
@@ -461,6 +498,7 @@ def test_retry_review_reruns_only_review_without_rebuilding_or_reverifying(
     # 重跑 review 本身即是 review 交接修復：candidate 未變，非 model repair。
     assert result["result"]["retry_classification"] == "review_handoff_failure"
     assert updated["retry_classification"] == "review_handoff_failure"
+    assert registry.get_job(old_job["job_id"])["status"] == "exited"
 
 
 def test_retry_review_without_frozen_plan_fails_pre_dispatch(tmp_path: Path) -> None:

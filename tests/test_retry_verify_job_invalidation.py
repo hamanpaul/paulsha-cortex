@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from paulsha_cortex.coordinator import manager, work_actions
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
 
@@ -78,6 +79,55 @@ def _run_with_exited_verify_job(tmp_path: Path):
     return registry, run, job["job_id"]
 
 
+def _run_with_exited_review_job(tmp_path: Path):
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    build = WorkflowStep(
+        phase="build", persona="builder", card="subagent-build",
+        executor="copilot", model="gpt-5.4", domain="github",
+        inputs=(), outputs=(), gate_result="passed",
+    )
+    verify = WorkflowStep(
+        phase="verify", persona="reviewer", card="verification",
+        executor=None, model=None, domain=None,
+        inputs=(), outputs=(), gate_result="passed",
+    )
+    review = WorkflowStep(
+        phase="review", persona="reviewer", card="code-review",
+        executor=None, model=None, domain=None,
+        inputs=(), outputs=(), gate_result="needs_human",
+    )
+    run = registry._manager_create_workflow_run(
+        work_id="retry-review-work",
+        repo="example/repo",
+        claim_key="claim:v1:" + "f" * 64,
+        source_revision="rev-f",
+        workspace_root=str(tmp_path / "workspace"),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=(build, verify, review),
+        issue_refs=("example/repo#1",),
+        attempts={"claim": 1, "review": 1},
+        facets=("needs_human",),
+        candidate_head=CANDIDATE,
+        verified_head=CANDIDATE,
+        needs_human_reason=fixture_needs_human_reason(),
+    )
+    job = registry.create_job(
+        task="wf-demo-code-review",
+        persona="reviewer",
+        branch="feature/demo",
+        pane="",
+        worktree=str(tmp_path / "sandbox"),
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="code-review",
+        workflow_phase="review",
+    )
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    return registry, run, job["job_id"]
+
+
 def test_reset_marks_exited_verify_job_failed(tmp_path: Path) -> None:
     registry, run, job_id = _run_with_exited_verify_job(tmp_path)
     registry._manager_reset_workflow_for_retry_verify(
@@ -85,6 +135,74 @@ def test_reset_marks_exited_verify_job_failed(tmp_path: Path) -> None:
     )
     row = registry.get_job(job_id)
     assert row["status"] == "failed"
+
+
+def test_retry_verify_reset_preserves_job_accepted_by_exact_recovery(
+    tmp_path: Path,
+) -> None:
+    registry, run, job_id = _run_with_exited_verify_job(tmp_path)
+    checked: list[tuple[str, str]] = []
+
+    def exact_recovery_checker(job, current_run) -> bool:
+        checked.append((job["job_id"], current_run.run_id))
+        return job["job_id"] == job_id and current_run.run_id == run.run_id
+
+    registry._manager_reset_workflow_for_retry_verify(
+        run.run_id,
+        expected_candidate=CANDIDATE,
+        reviewer_recovery_checker=exact_recovery_checker,
+    )
+
+    assert checked == [(job_id, run.run_id)]
+    assert registry.get_job(job_id)["status"] == "exited"
+
+
+def test_apply_work_action_wires_exact_reviewer_recovery_checker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry, run, job_id = _run_with_exited_verify_job(tmp_path)
+    identities = object()
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(manager, "load_model_identities", lambda: identities)
+
+    def exact_recovery_checker(
+        actual_registry, job, *, run, step, identities, coordinator_root
+    ) -> bool:
+        observed.update(
+            registry=actual_registry,
+            job_id=job["job_id"],
+            run_id=run.run_id,
+            step_card=step.card,
+            identities=identities,
+            coordinator_root=coordinator_root,
+        )
+        return job["job_id"] == job_id
+
+    monkeypatch.setattr(
+        manager, "_is_exact_reviewer_terminal_recovery", exact_recovery_checker
+    )
+
+    def fake_execute_work_action(**kwargs):
+        checker = kwargs["reviewer_recovery_checker"]
+        assert checker(registry.get_job(job_id), run)
+        return {"action": "retry-verify"}
+
+    monkeypatch.setattr(work_actions, "execute_work_action", fake_execute_work_action)
+    manager.apply_work_action(
+        args={"action": "retry-verify", "repo": run.repo, "work_id": run.work_id},
+        requested_by="operator",
+        registry=registry,
+    )
+
+    assert observed == {
+        "registry": registry,
+        "job_id": job_id,
+        "run_id": run.run_id,
+        "step_card": "verification",
+        "identities": identities,
+        "coordinator_root": tmp_path.resolve(),
+    }
 
 
 def test_reset_leaves_build_phase_jobs_untouched(tmp_path: Path) -> None:
@@ -129,55 +247,31 @@ def test_reset_still_refuses_active_verify_job(tmp_path: Path) -> None:
 
 
 def test_retry_review_reset_marks_exited_review_job_failed(tmp_path: Path) -> None:
-    registry = JobRegistry(state_path=tmp_path / "jobs.json")
-    build = WorkflowStep(
-        phase="build", persona="builder", card="subagent-build",
-        executor="copilot", model="gpt-5.4", domain="github",
-        inputs=(), outputs=(), gate_result="passed",
-    )
-    verify = WorkflowStep(
-        phase="verify", persona="reviewer", card="verification",
-        executor=None, model=None, domain=None,
-        inputs=(), outputs=(), gate_result="passed",
-    )
-    review = WorkflowStep(
-        phase="review", persona="reviewer", card="code-review",
-        executor=None, model=None, domain=None,
-        inputs=(), outputs=(), gate_result="needs_human",
-    )
-    run = registry._manager_create_workflow_run(
-        work_id="retry-review-work",
-        repo="hamanpaul/paulsha-cortex",
-        claim_key="claim:v1:" + "f" * 64,
-        source_revision="rev-f",
-        workspace_root="/tmp/workspace",
-        combo="feature-oneshot",
-        current_phase="review",
-        steps=(build, verify, review),
-        issue_refs=("hamanpaul/paulsha-cortex#315",),
-        attempts={"claim": 1, "review": 1},
-        facets=("needs_human",),
-        candidate_head=CANDIDATE,
-        verified_head=CANDIDATE,
-        needs_human_reason=fixture_needs_human_reason(),
-    )
-    job = registry.create_job(
-        task="wf-demo-code-review",
-        persona="reviewer",
-        branch="feature/315-demo",
-        pane="",
-        worktree=str(tmp_path / "sandbox"),
-        workflow_run_id=run.run_id,
-        workflow_claim_key=run.claim_key,
-        workflow_repo=run.repo,
-        workflow_card="code-review",
-        workflow_phase="review",
-    )
-    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    registry, run, job_id = _run_with_exited_review_job(tmp_path)
     registry._manager_reset_workflow_for_retry_review(
         run.run_id, expected_candidate=CANDIDATE
     )
-    assert registry.get_job(job["job_id"])["status"] == "failed"
+    assert registry.get_job(job_id)["status"] == "failed"
+
+
+def test_retry_review_reset_preserves_job_accepted_by_exact_recovery(
+    tmp_path: Path,
+) -> None:
+    registry, run, job_id = _run_with_exited_review_job(tmp_path)
+    checked: list[tuple[str, str]] = []
+
+    def exact_recovery_checker(candidate_job, current_run) -> bool:
+        checked.append((candidate_job["job_id"], current_run.run_id))
+        return candidate_job["job_id"] == job_id and current_run.run_id == run.run_id
+
+    registry._manager_reset_workflow_for_retry_review(
+        run.run_id,
+        expected_candidate=CANDIDATE,
+        reviewer_recovery_checker=exact_recovery_checker,
+    )
+
+    assert checked == [(job_id, run.run_id)]
+    assert registry.get_job(job_id)["status"] == "exited"
 
 
 def test_review_tool_schema_allows_authority_hashes() -> None:
