@@ -2909,6 +2909,20 @@ builder job 會回到 #712 的原症狀：ACL 全對、`git bundle create` 仍�
 
 #### 4e-2g. executor 的**內層沙箱** × 外層加固面（#714）
 
+> **2026-09-26 現行裁決（取代以下 0819 的 Codex template 操作判準）**：codex-cli
+> 0.157 在 Trust Root template unit 中執行
+> `codex sandbox -c features.use_legacy_landlock=true -- /bin/pwd` 會 panic：
+> `filesystem-restricted execution requires bubblewrap to isolate app-server sockets`；
+> 不開 legacy 時則回 `bwrap: No permissions to create a new namespace`。依 owner 裁決
+> 採 #716 選項 B：**只有成功完成 `systemd-template` preflight 的 Codex job** 改用
+> `--sandbox danger-full-access` 並省略內層沙箱旗標。此時 systemd template unit、精確
+> `ReadWritePaths` 與既有 egress proxy 是唯一安全邊界；`RestrictNamespaces=yes`、
+> `ProcSubset=pid`、`SystemCallFilter=@system-service @sandbox` 及其他 unit 值逐字保留。
+> `direct` 與 `systemd-run` 不具備這份 template unit 邊界，仍依卡片契約使用原 Codex
+> sandbox argv。下方原始逐項量測仍是歷史證據；其 Codex 內層安裝探針不再是 template
+> job 的驗收方式。`inner-sandbox-probe` 命令名稱因相容性保留，現行輸出改驗外層 unit
+> 加固、工作區寫入限制與 egress，且不宣稱覆蓋真實 Codex agent loop。
+
 > **這一節與前面幾節的層級不同。** 4e-2d/e/f 驗的是「job 進得去、寫得出、git 認得」；
 > 本節驗的是 **executor 自己再開的那一層沙箱**還裝不裝得上。#714 就是它整層沒裝上的
 > 實機證據：builder job 跑了 **30 分鐘**，19 行 job log 裡 **5 個 `command_execution`

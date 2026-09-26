@@ -81,16 +81,12 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     # gate ledger 與 exit sentinel）。
                                                     # 同樣**不含任何 --setenv=**（D13）。
     python -m paulsha_cortex.trust_root inner-sandbox-probe [four-way|three-way|two-way] [codex]
-                                                    # #714：反向不變式的實機探針——
-                                                    # executor **自帶的內層沙箱**在
-                                                    # 真實加固面下裝不裝得上、以及它
-                                                    # 到底有沒有在擋。四個方向：不帶
-                                                    # 旗標必須仍失敗（外層沒被偷偷
-                                                    # 放寬）、旗標必須還存在（不得回
-                                                    # `Unknown feature flag`）、帶了
-                                                    # 就通、且寫工作區外／對外連線
-                                                    # 必須被擋。同樣**不含任何
-                                                    # --setenv=**（D13）。
+                                                    # #716：相容保留的命令名稱；
+                                                    # 現行 Codex 探針檢查 Trust Root
+                                                    # template 的外層加固／寫入／
+                                                    # egress 邊界。它不再執行 Codex
+                                                    # 內層沙箱命令，也不證明完整
+                                                    # agent loop。
     python -m paulsha_cortex.trust_root workspace-probe [four-way|three-way|two-way]
     python -m paulsha_cortex.trust_root git-trust-probe [four-way|three-way|two-way]
                                                     # #710：反向不變式的實機探針——

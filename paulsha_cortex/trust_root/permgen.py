@@ -541,57 +541,38 @@ class ExecutorShape(Enum):
 
 
 # ---------------------------------------------------------------------------
-# executor 自帶的**內層沙箱**（#714）——第三個與 `needs_node` 正交的加固維度
+# executor 的**內層沙箱**（#714／#716）——按實際 launcher 外層分流
 #
-# ## 為什麼要有這一格
+# ## 歷史與目前裁決
 #
-# job 已經被 systemd 關在四分降權 ＋ 完整加固面裡，而 executor 自己**還會**再開一層
-# 沙箱來關住模型跑的 shell 命令。那一層與外層加固面是會打架的：#714 實機在 builder
-# 的 job log 裡量到 **5 個 `command_execution` 全部 `status: failed`**，逐字都是
+# 0819 的 #714 選擇 Codex legacy Landlock，因為 Codex 預設 bubblewrap 在 Trust Root
+# unit 的 `ProcSubset=pid`／namespace／address-family／seccomp 面下起不來。2026-09-26
+# operator 在 codex-cli 0.157 確認舊路徑也已失效：
 #
-#     bwrap: Can't read /proc/sys/kernel/overflowuid: No such file or directory
+#     codex sandbox -c features.use_legacy_landlock=true -- /bin/pwd
+#       panic: filesystem-restricted execution requires bubblewrap to isolate app-server sockets
+#     codex sandbox -- /bin/pwd
+#       bwrap: No permissions to create a new namespace
 #
-# ——`ProcSubset=pid` 讓 `/proc/sys` 整個消失，codex 的 bubblewrap 起不來，於是它跑的
-# 每一個命令都 `exit 1`，模型最後合理地回 `needs_human`。Manager 端看到的
-# `card-terminal-schema-retry-exhausted` 是**症狀**，離病因四層遠。
+# owner 裁決採 #716 選項 B：只在已驗證的 Trust Root template unit 內，以
+# `--sandbox danger-full-access` 停用 Codex 內層沙箱。外層 systemd 加固、既有
+# `ReadWritePaths` 與 egress proxy 成為唯一邊界；不放寬 `RestrictNamespaces` 或其他鍵。
+#
+# `InnerSandboxSpec` 仍描述 direct／非 template 路徑的既有 Codex argv。此時 Codex 是
+# Manager 子行程，會繼承 Manager unit 的 `SystemCallFilter`，所以 `@sandbox` 仍須保留；
+# Trust Root template job 不在這份 spec 的 `systemd_surfaces` 內，也不附掛該 argv。
 #
 # ## 為什麼落在**這張表**上，而不是加固剖面上
 #
-# 這與 #673 把 `filtered_syscalls` 放在同一張表上是同一個判斷：**事實是「這支程式跑
-# 起來需要什麼」，屬於程式；處置才屬於加固面。** 而且與 `needs_node` 那條軸不同——
-# `needs_node` 導向「換一份放寬的具名剖面」，本欄位導向「**全域**多放行一組**方向
-# 相反**的 syscall」，因此不能共用那個欄位（#673 的教訓逐字：兩件事混在一個欄位上，
-# 適用面與處置方向都會錯）。
-#
-# ## 0819 實機量到四道牆（逐條，其餘 property 固定，每次只加一條）
-#
-# 走 `psc_run_under` 全量導出（D13），跑 codex 自帶的 `codex-resources/bwrap`：
-#
-#     1  jit 剖面原樣            bwrap: Can't read /proc/sys/kernel/overflowuid
-#     2  +ProcSubset=all         bwrap: No permissions to create a new namespace
-#     3  +RestrictNamespaces=no  bwrap: loopback: Failed to create NETLINK_ROUTE socket
-#     4  +AF_NETLINK             bwrap: Failed to make / slave: Operation not permitted
-#     5  +SystemCallFilter 加 @mount   rc=0
-#
-# 也就是說「保留 bwrap」要付的是**四條**放寬，其中第 2、4 條放寬的正是 user namespace
-# 與 mount——外層加固面存在的理由本身（`RestrictNamespaces` 那一列的註解逐字寫著
-# 「user namespace 是 unprivileged 提權的常見起點」），而第 4 條的鍵是
-# :data:`PROFILE_LOCKED_KEYS` 裡的 `SystemCallFilter`。0819 裁決因此由「A＝具名剖面
-# 放寬 `ProcSubset`」更正為**票上的 C＝換一個不需要 bwrap 的執行形態**：
-#
-#     psc_run_under（全量導出）＋ SystemCallFilter=@system-service @sandbox
-#       codex sandbox --enable use_legacy_landlock -- /bin/pwd   → rc=0
-#       …-- sh -c 'echo hi > <builder HOME>/.codex/PWN'          → Permission denied
-#       …-- sh -c 'getent hosts api.openai.com'                  → rc=2（網路被擋）
-#
-# 一條、全域、方向相反，其餘 26 項加固**逐字不動**（`ProcSubset=pid`／
-# `RestrictNamespaces=yes`／`RestrictAddressFamilies` 全部留著）。
+# 這個欄位記錄「executor 的 direct argv 需要什麼」以及 direct 子行程繼承的 unit；
+# template 外層模式則由 registry 的執行邊界 × 卡片契約矩陣決定，不靠 executor/persona
+# 猜測。這避免把兩種不同的呼叫路徑折疊成同一個 sandbox 宣告。
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class InnerSandboxSpec:
-    """一個 executor 自帶的內層沙箱形態 × 它在外層加固面上的**執行條件**（#714）。"""
+    """一個 executor 的 direct 內層沙箱形態與其繼承的 systemd surface（#714／#716）。"""
 
     #: 形態名（進產物註解與錯誤訊息）。
     kind: str
@@ -608,14 +589,19 @@ class InnerSandboxSpec:
     #: 都引用它。
     accepted_loss: tuple[str, ...]
     note: str
+    #: 哪些 systemd surface 會包住仍使用此 direct argv 的執行。Trust Root template job
+    #: 刻意不在這裡，因其 Codex sandbox mode 由 registry 的 outer-unit 分支導出。
+    systemd_surfaces: tuple[str, ...] = ()
 
 
-#: codex 的內層沙箱形態（#714 實機，codex-cli 0.147.0）。
+#: Codex direct／非 template runner 的舊內層沙箱 argv（#714 實測，codex-cli 0.147.0）。
 #:
 #: 預設形態是 **bubblewrap**：user／mount／pid／net namespace ＋ 自己一套 mount 表。
 #: 那個形態在本系統的加固面下要付四條放寬（見上方逐條量測），因此改走它的
-#: **landlock ＋ seccomp** 路徑——不建立任何 namespace，只用兩個「把自己關得更緊」的
-#: 核心介面。
+#: **landlock ＋ seccomp** 路徑。codex-cli 0.157 在 Trust Root template 加固下已不能
+#: 使用：legacy 模式要求 bwrap 隔離 app-server sockets；停用 legacy 則 bwrap 無法建立
+#: namespace。此 spec 僅供 direct／非 template argv；該路徑若在 Manager systemd unit
+#: 內執行，需由 `@sandbox` syscall group 支援。
 CODEX_LEGACY_LANDLOCK = InnerSandboxSpec(
     kind="landlock-seccomp",
     argv=("--enable", "use_legacy_landlock"),
@@ -630,28 +616,19 @@ CODEX_LEGACY_LANDLOCK = InnerSandboxSpec(
         "手法——但那需要 `mount(2)`，而 `SystemCallFilter=@system-service` 本來就沒有"
         "放行 `@mount`（#714 第 4 道牆量到的正是它）。外層擋住的東西不因內層換形態"
         "而鬆動。",
-        "**依賴 codex 的 `use_legacy_landlock` 旗標，而上游已宣告它是過渡狀態**。"
-        "0819 實機在真實派工的 `--json` 串流裡逐字收到："
-        "`[features].use_legacy_landlock is deprecated and will be removed soon. "
-        "(Remove this setting to stop opting into the legacy Linux sandbox behavior.)`"
-        "——**這是倒數，不是穩態**：上游拿掉它的那天，codex 回 "
-        "`Error: Unknown feature flag: …` 並以非零收場（同日實測），"
-        "屆時只剩 bubblewrap，而 bubblewrap 要付的四條放寬正是本票否決的那四條 ⇒ "
-        "A／B／C 會整個回到桌上。因此 `trust_root inner-sandbox-probe` 不只驗「還能不能"
-        "用」，也把那句 deprecation 印出來當**早期警報**。"
-        "※ 那句話以 `item.completed` ／ `item.type=error` 進 `--json` 串流，"
-        "**不影響 terminal 契約**：`manager._extract_terminal_json()` 由**尾端往回**找 "
-        "`agent_message`，開頭的 error 項會被跳過（0819 實機的 job log 逐字確認）。",
+        "**codex-cli 0.157 已讓 Trust Root template 不可使用此形態**：legacy Landlock "
+        "在外層 unit 內 panic，因其需要 bubblewrap 隔離 app-server sockets；停用 legacy "
+        "則 bubblewrap 因 namespace 權限不足而失敗。故 template Codex 改採選項 B，"
+        "其隔離完全依賴 systemd unit、ReadWritePaths 與 egress proxy。此 spec 僅保留給 "
+        "direct／非 template 相容路徑，並不宣稱該舊旗標可用於 0.157 Trust Root job。",
     ),
     note=(
-        "0819 實機（codex-cli 0.147.0）：`codex sandbox --enable use_legacy_landlock "
-        "-- /bin/pwd` 在 builder 的真實加固面下 rc=0；同一條命令改寫 "
-        "`$CODEX_HOME/PWN` 得 `Permission denied`（landlock 生效）、`getent hosts` "
-        "rc=2（seccomp 擋網路）。不加旗標則走 bubblewrap，逐字死在 "
-        "`bwrap: Can't read /proc/sys/kernel/overflowuid`。"
-        "※ `--disable use_linux_sandbox_bwrap` **不會**切走 bwrap（0819 實測仍是 "
-        "bwrap 的錯誤），因此不能拿它當同義的開關。"
+        "0819（codex-cli 0.147.0）曾量到 legacy Landlock 可執行並限制檔案／網路。"
+        "2026-09-26 的 0.157 實測只保留 direct argv 相容性：在 Trust Root unit 中，"
+        "`features.use_legacy_landlock=true` 會 panic，沒有該設定則 bwrap 因 namespace 被拒。"
+        "Trust Root template 不消費此 spec。"
     ),
+    systemd_surfaces=(MANAGER_SURFACE,),
 )
 
 
@@ -4986,14 +4963,12 @@ _HARDENING: tuple[tuple[str, str, str], ...] = (
      "※ **`@sandbox` 是 #714 加的，而它與「放寬」方向相反**："
      "`@sandbox`＝`landlock_create_ruleset`／`landlock_add_rule`／"
      "`landlock_restrict_self`／`seccomp` 四支，能力上限是**讓呼叫者把自己關得更緊**"
-     "——它們拿不到任何本來拿不到的資源。少了它，executor 自帶的內層沙箱裝不上"
-     "（#714 實機：codex 的 legacy landlock 路徑在 `SeccompInstall … EPERM` 上 panic），"
-     "於是 job 只剩 systemd 這一層。**加在全域而不是某份剖面**：這正是 "
-     ":data:`PROFILE_LOCKED_KEYS` 那條理由要的形態（白名單的變動必須是一次全域可稽核"
-     "的決定），因此 `SystemCallFilter` 至今仍是鎖定鍵、沒有任何剖面分岔它。"
-     "需求由 :data:`TOOLCHAIN_PROGRAMS` 的 `inner_sandbox` 機械導出，"
-     "import 時由 `_validate_inner_sandbox_support()` 強制——把 `@sandbox` 刪掉，"
-     "這個模組**載不起來**。"),
+     "——它們拿不到任何本來拿不到的資源。Trust Root template 的 Codex 自 0.157 起不再"
+     "呼叫 legacy Landlock；`@sandbox` 仍供 direct 模式由 Manager unit 繼承 seccomp 的"
+     "Codex 子行程使用。**加在全域而不是某份剖面**：這正是"
+     ":data:`PROFILE_LOCKED_KEYS` 要求的可稽核形態，`SystemCallFilter` 保持鎖定且各 unit"
+     "值相同。direct 需求由 `InnerSandboxSpec.systemd_surfaces` 宣告並由"
+     "`_validate_inner_sandbox_support()` 驗證；template Codex 不依賴這個內層。"),
     ("SystemCallErrorNumber", "EPERM",
      "被過濾的 syscall 回 EPERM 而非 SIGSYS——失敗可觀測，不是無聲當掉。"
      "※ **本行承重，刪掉會讓六份 job unit 上的 codex／copilot 同時靜默死**"
@@ -5412,7 +5387,9 @@ def inner_sandbox_surfaces() -> tuple[InnerSandboxSurface, ...]:
         if spec is None:
             continue
         surfaces = (
-            (tool.name,) if tool.name in executor_names else tuple(tool.consumed_by)
+            tuple(spec.systemd_surfaces)
+            if tool.name in executor_names
+            else tuple(tool.consumed_by)
         )
         if not surfaces:
             findings.append(
@@ -5442,17 +5419,18 @@ def inner_sandbox_surfaces() -> tuple[InnerSandboxSurface, ...]:
 
 
 def _validate_inner_sandbox_support() -> None:
-    """import 時強制 #714 的不變式。兩條，缺一即讓 import 炸掉。
+    """import 時驗證 direct Codex 形態的外層支援，並鎖住 seccomp filter key。
 
-    1. 每一個宣告了 `inner_sandbox` 的程式，在它**每一個**執行面上都必須放行該形態
-       宣告的 syscall 群組；
+    1. 每個 direct 內層沙箱在 `InnerSandboxSpec.systemd_surfaces` 宣告的 unit 上都必須
+       放行其 syscall 群組；Codex 目前只宣告 Manager unit，因 Trust Root template job
+       已切到外層獨占 argv；
     2. `INNER_SANDBOX_SYSCALL_KEY` 必須留在 :data:`PROFILE_LOCKED_KEYS` 上——處置是
        **全域**放行，剖面分岔它就退化成「某一份剖面偷偷多開一支 syscall」，而那正是
        #673 立那把鎖的理由。
 
-    為什麼在 import 當下而不是一條測試：#714 的破口不是「有人寫錯一行」，是「內層
-    沙箱的執行條件從來不是機器可讀的」——於是它只能在實機上以「模型跑的每一條命令都
-    `exit 1`」的形式出現，而那個症狀離原因四層遠。
+    為什麼在 import 當下而不是一條測試：#714 的破口是「內層沙箱的執行條件從來不是
+    機器可讀的」。現在 direct 與 Trust Root template 的適用面分別登記，避免把兩種
+    launcher 形態混成一個條件。
     """
 
     if INNER_SANDBOX_SYSCALL_KEY not in PROFILE_LOCKED_KEYS:
@@ -9355,319 +9333,72 @@ def build_inner_sandbox_probe(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     executor: str = "codex",
 ) -> list[str]:
-    """#714／#716 反向不變式的實機探針（**只回傳字串，不執行**）。
+    """Emit a Trust Root outer-boundary probe; it does not execute commands.
 
-    ## #716 修掉的假綠：探針驗的形態不是 production 的形態
-
-    #715 的版本跑的是 `codex sandbox -- <cmd>`，**不帶** `-c sandbox_mode=`——而
-    `codex sandbox` 不帶 mode 時導出的是**唯讀族** profile。也就是說它驗到的是
-    planner／reviewer 的形態，**從來沒碰過 builder 的 `workspace-write`**。同一份加固面
-    複本、同一次量測（0819）：
-
-        1) #715 探針形態（不帶 sandbox_mode）  → <worktree pool>   rc=0    ← 綠
-        2) production 形態（workspace-write）  → panic             rc=101  ← 真實回歸
-
-    ⇒ 要驗的不是「`codex sandbox` 跑不跑得起來」，而是「**`build_codex_argv` 會發出的
-    每一個 `--sandbox <mode>`** 在真實加固面下都裝得上內層沙箱」。mode 清單由
-    :func:`registry.emitted_sandbox_modes` **機械導出**——手抄就會再抄成只有 `read-only`
-    那一格，那正是本節開頭那個假綠的原症狀。
-
-    ⚠️ **第二種假綠的陷阱**：`codex sandbox` **忽略 `config.toml` 裡的 `sandbox_mode`**，
-    只吃 `-c` 覆寫。0819 實測——`config.toml` 寫 `workspace-write` 但不帶 `-c` → rc=0
-    （**什麼都沒驗到**）；`config.toml` 空、`-c sandbox_mode='"workspace-write"'` →
-    panic rc=101。**因此本探針凡走 `codex sandbox` 的命令都帶 `-c`。**
-
-    ## 要證的方向（依該 mode **附不附**內層沙箱分兩族，判準由
-    ## `registry.sandbox_mode_attaches_inner_sandbox()` 機械導出）
-
-    **附掛內層的族（read-only）**，每個 mode 四步缺一不可：
-
-    1. **缺陷還在**（不帶旗標的負向對照）——executor 的**預設**內層沙箱形態在真實
-       加固面下**必須仍然失敗**，且逐字是 `bwrap: Can't read
-       /proc/sys/kernel/overflowuid`。這一步同時守住兩件事：外層加固面沒有被人「順手
-       放寬 `ProcSubset`」（那會讓這一步變成 rc=0），以及本票選的形態切換**真的是**
-       讓它通的原因。
-    2. **旗標還在**——`inner_sandbox.argv` 不得換來 `Unknown feature flag`。**這是本
-       探針存在的主要理由**：那個旗標名帶 `legacy`，是對 codex 某一版的觀察，不是不
-       變式（PR #713 的教訓方向相反但同一族：那次把某版 git 的行為寫成不變式）。
-    3. **正向**——帶上旗標之後，同一條命令在**同一份**加固面下 rc=0。
-    4. **內層真的在擋**——沙箱不是「裝上了就算」：寫工作區外的檔必須 `Permission
-       denied`、對外查名必須失敗。少了這一半，「旗標吃下去了但沒有沙箱」與「沙箱生效」
-       在輸出上長得一模一樣，而那正是 `accepted_loss` 裡最不能靜默的那一格。
-
-    **不附掛內層的族（`danger-full-access`，#716 B 後半的寫入卡）**：這一列**沒有
-    內層沙箱**——**不要**拿 `codex sandbox` 去驗它（沒有東西可驗：rc=0 只證明「沒有
-    沙箱」，什麼都不擋）。改斷言兩件事：
-
-    (a) **命令執行得了**（rc=0）——這正是本列存在的理由（`workspace-write` ＋
-        landlock 是 100% panic 的必死卡）；
-    (b) **出口管制在**——`env -u HTTPS_PROXY … socket.create_connection(("1.1.1.1",
-        443))` 必須 `TimeoutError`（`IPAddressDeny=any` ＋ proxy 白名單，PR #725）。
-        **這是該列僅存的網路防線，探針缺了它就是假綠**：「不補出口就不要採 B」是
-        這一列成立的硬前置。
-
-    ## 落地後這條探針**預期全綠**；紅的那幾種各代表什麼，逐字寫在對應步驟裡
-
-    #716 B 後半把寫入卡改成 `danger-full-access` 之後，per-mode 矩陣不再有「誠實紅」
-    ——read-only 族的四步與 `danger-full-access` 的 (a)(b) 都該綠。**仍然沒驗到的**
-    是端到端（真實派工跑會寫檔的卡），見文末清單；**不得**把這裡的綠當成那一條。
-
-    ## 為什麼這一支走 `psc_run_under`，而不是真實派工
-
-    要驗的東西**住在加固面與 executor argv 上**，兩者都由加固面複本忠實帶到
-    （`unit_replica_properties()` 全量導出，含 `Environment=`）。#709／#687 那條
-    caveat 講的是「spec 的 env 只有派工路徑才會產生」——本票不驗 spec 的 env。
-
-    ⚠️ 但 **#714 的驗收本身仍須走真實派工**：「builder 執行得了命令且產得出非空
-    bundle」那一條要的是端到端結果，不是加固面複本。本探針是**回歸守衛**，不是驗收。
-
-    **本產生器一行 `--property=` 都不自組、一個 `--setenv=` 都不帶**（design D13）。
+    codex-cli 0.157 requires bubblewrap for filesystem-restricted app-server sockets.
+    The Trust Root template denies namespace creation, so Codex jobs use
+    ``danger-full-access`` and rely on the hardened unit plus egress proxy. This probe
+    checks those external controls; it does not claim to prove the real agent loop.
     """
 
+    if executor != "codex":
+        raise ValueError(
+            f"executor {executor!r} has no Trust Root Codex outer-only probe"
+        )
     layout = layout if layout is not None else DEFAULT_LAYOUT
-    spec = executor_inner_sandbox(executor)
-    if spec is None:
+    from . import registry
+
+    modes = registry.emitted_sandbox_modes(trust_root_outer_unit=True)
+    if modes != (registry.SANDBOX_MODE_DANGER_FULL_ACCESS,):
         raise ValueError(
-            f"executor {executor!r} 沒有登記 inner_sandbox——沒有內層沙箱就沒有這條"
-            "反向不變式可驗（#714）。"
+            "Trust Root Codex modes must be exactly danger-full-access; "
+            f"derived {modes!r}"
         )
-    # #716：mode 清單機械導出，且**產生器自己先斷言它不是唯讀族獨佔**。
-    # 全是 read-only ⇒ 導出規則被人改成只剩唯讀族，那正是 #715 假綠的形狀 ⇒ 當場停，
-    # 不產生一份「看起來有在驗、其實只驗了唯讀」的探針。寫入卡今天發的 mode 由表上
-    # `builder-workspace-write` 那一列導出（B 後半起是 `danger-full-access`），這裡
-    # 一個字都不手抄。
-    sandbox_modes = registry.emitted_sandbox_modes()
-    if all(mode == registry.SANDBOX_MODE_READ_ONLY for mode in sandbox_modes):
-        raise ValueError(
-            "registry.emitted_sandbox_modes() 只剩唯讀族"
-            f"（實得 {list(sandbox_modes)}）——builder 的寫入卡今天仍然存在，清單少了"
-            "它的 mode 代表導出規則被改成只剩唯讀族，本探針會退化成 #715 那個假綠"
-            "（只驗到 planner／reviewer 的形態）。先查清楚導出規則，不要產生一份"
-            "驗不到 production 形態的探針（#716）。"
-        )
-    write_mode = registry.sandbox_mode_for(
-        registry.JobWriteContract.BUILDER_WORKSPACE_WRITE
-    )
-    assert write_mode is not None  # 表上斷言過：只有 bypass 那格不發 --sandbox
     profile = executor_hardening_profile(executor)
     stem = job_unit_stem(layout, Principal.BUILDER, profile)
-    binary = f"{layout.toolchain_root}/bin/{executor}"
-    # 第 4 步要「外層允許、內層擋」的那一格：runbook 第 4e 步的共用探針前置已經要求
-    # 建出 `<worktree pool>/probe`（`--instance probe` 的 `ReadWritePaths=%i`）。
     probe_workspace = f"{layout.worktree_root}/probe"
-    flag = " ".join(spec.argv)
-    groups = " ".join(spec.syscall_groups)
-    # #716：`codex sandbox` **忽略 `config.toml` 的 `sandbox_mode`**，只吃 `-c` 覆寫
-    # ——因此每一條命令都必須帶這個 token（實測見本函式 docstring）。
-    mode_override = "-c sandbox_mode="
-    lines: list[str] = [
-        "# === #714／#716 反向不變式：production 會發的**每一個** sandbox mode，",
-        "#     內層沙箱都還裝得上、而且真的在擋嗎 ===",
-        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}，executor={executor}）"
-        "——勿手改；重跑：",
-        f"#   python3 -m paulsha_cortex.trust_root inner-sandbox-probe {scheme.scheme_id}",
-        "#",
-    ]
-    lines += _wrap_comment(
-        f"形態：{spec.kind}（argv `{flag}`，需要 `{groups}`）。"
-        f"{spec.note}"
+    write_command = (
+        f"cd {probe_workspace} && : > psc-716-outer-write && "
+        "echo PSC-716-OUTER-WRITE-OK && rm -f psc-716-outer-write"
     )
-    lines += _wrap_comment(
-        "**#716：mode 清單由 `registry.emitted_sandbox_modes()` 機械導出，一個字都沒有"
-        f"手抄**（本次導出：{'／'.join(sandbox_modes)}）。#715 的探針跑的是 "
-        f"`{executor} sandbox -- <cmd>` **不帶 mode**，而那時導出的是**唯讀族** profile "
-        "⇒ 它驗到的是 planner／reviewer 的形態，從來沒碰過 builder 的 "
-        f"`{registry.SANDBOX_MODE_WORKSPACE_WRITE}`——同一份複本同一次量測：不帶 mode "
-        "rc=0（綠）、`workspace-write` panic rc=101。手抄清單就會再抄成只有 "
-        f"`{registry.SANDBOX_MODE_READ_ONLY}` 那一格，也就是原症狀本身。"
+    egress_command = "python3 -c " + shlex.quote(
+        "import socket; socket.create_connection(('1.1.1.1', 443), timeout=5)"
     )
-    lines += _wrap_comment(
-        f"⚠️ **第二種假綠的陷阱**：`{executor} sandbox` **忽略 `config.toml` 裡的 "
-        f"`sandbox_mode`**，只吃 `{mode_override}` 覆寫。0819 實測——config 寫 "
-        "`workspace-write` 但不帶 `-c` → rc=0（**什麼都沒驗到**）；config 空、"
-        "`-c sandbox_mode='\"workspace-write\"'` → panic rc=101。"
-        "**因此下面每一條命令都帶 `-c`；把它拿掉就等於什麼都沒驗。**"
-    )
-    lines += _wrap_comment(
-        "**#716 B 後半起，本探針預期全綠。** 寫入卡已由 "
-        f"`{registry.SANDBOX_MODE_WORKSPACE_WRITE}`（legacy landlock 下 100% panic "
-        f"rc=101，`linux_run_main.rs:318`）改發 `{write_mode}`，且不附內層 argv——"
-        f"該列**沒有內層沙箱**，殘餘防線是外層＋出口管制，因此 `{write_mode}` 那一段"
-        "驗的不是沙箱、是「命令執行得了 ＋ 出口管制在」。read-only 族維持 legacy "
-        "landlock（今天是好的、真的在擋），四步矩陣照舊。"
-    )
-    lines += [
-        "#",
-        f"# 前置：先貼上 runbook 第 4e 步的**共用探針** `{PATH_PROBE_HELPER}`。",
-        f"declare -F {PATH_PROBE_HELPER} >/dev/null || {{",
-        f"  echo \"⛔ 未定義 {PATH_PROBE_HELPER}——先貼上 runbook 第 4e 步的共用探針\" >&2",
-        "  return 1 2>/dev/null || exit 1",
-        "}",
-        "",
-        "#   0) 加固面上真的有那組群組（D13：讀**落檔的** unit，不是讀產生器）。",
-        f"sudo systemctl cat {stem}@.service | grep '^SystemCallFilter='",
-        f"#      期望：值裡含 `{groups}`。沒有 ⇒ 落檔的是舊版產生器的產物，重跑第 5-2",
-        "#      步落檔再回來；**不要**在這裡手動加 property 把它蓋過去。",
-        "",
-        "#   0b) **探針自檢**：導出的 mode 清單必須含 production 寫入卡的形態",
-        f"#      （表上 builder-workspace-write 那一列導出＝`{write_mode}`）。",
-        "#      不含 ⇒ 導出規則被改成只剩唯讀族 ⇒ 本探針退化成 #715 那個假綠，",
-        "#      **當場停**，不要往下跑。",
-        f"PSC_716_MODES=({' '.join(sandbox_modes)})",
-        f"case \" ${{PSC_716_MODES[*]}} \" in",
-        f"  *\" {write_mode} \"*) ;;",
-        "  *)",
-        f"    echo \"⛔ 導出的 mode 清單 ${{PSC_716_MODES[*]}} 不含 {write_mode}\" >&2",
-        "    echo \"   理由：builder 的寫入卡今天仍然會發它；少了它代表這份探針只驗得到\" >&2",
-        "    echo \"   planner／reviewer 的形態，也就是 #715 假綠的原症狀。先查導出規則。\" >&2",
-        "    return 1 2>/dev/null || exit 1",
-        "    ;;",
-        "esac",
-        "",
-        "#   1／3) **per-mode 矩陣**：production 會發的每一個 `--sandbox <mode>`——",
-        "#      附掛內層的（read-only 族）各配一組「不帶旗標必須仍然失敗（負向對照）」",
-        "#      ＋「帶旗標必須 rc=0（正向）」；不附掛的（danger-full-access）**沒有**",
-        "#      內層可驗，改驗「命令執行得了 ＋ 出口管制在」。分族判準由",
-        "#      `registry.sandbox_mode_attaches_inner_sandbox()` 機械導出，不手抄。",
-    ]
-    for mode in sandbox_modes:
-        quoted = f"'\"{mode}\"'"
-        if registry.sandbox_mode_attaches_inner_sandbox(mode):
-            lines += [
-                "",
-                f"#   --- mode: {mode}（附掛內層沙箱） ---",
-                f"#   1[{mode}]) **負向對照**：不帶旗標＝executor 的預設內層沙箱形態，",
-                "#      必須**仍然失敗**。",
-                f"{PATH_PROBE_HELPER} {stem} {binary} sandbox -c sandbox_mode={quoted} -- /bin/pwd",
-                "#      期望：非零，且 stderr 逐字含 `Can't read /proc/sys/kernel/overflowuid`。",
-                "#      rc=0 ⇒ 外層被放寬了（有人動了 `ProcSubset`）或 executor 換了預設形態",
-                "#      ——那會讓本票的整個論證失效，**當場停下來查清楚**，不要因為「反正也是",
-                "#      綠的」就放過。",
-                f"#   3[{mode}]) 正向：同一份加固面下，帶 `{flag}` 就通。",
-                f"{PATH_PROBE_HELPER} {stem} {binary} sandbox -c sandbox_mode={quoted} {flag} \\",
-                "  -- /bin/pwd",
-                "#      期望：rc=0，stdout 是 job 的 cwd。",
-            ]
-        else:
-            lines += [
-                "",
-                f"#   --- mode: {mode}（**沒有內層沙箱**，#716 B 後半的寫入卡） ---",
-                f"#   ⚠️ **不要**拿 `{executor} sandbox -c sandbox_mode={quoted}` 來「驗」",
-                "#      這一列——沒有東西可驗：rc=0 只證明「沒有沙箱」，什麼都不擋，",
-                "#      而那個綠會被誤讀成「有防線」。這一列的殘餘防線是外層＋出口管制，",
-                "#      驗的就是它們兩個。",
-                f"#   a[{mode}]) **命令執行得了**（這正是本列存在的理由：workspace-write ＋",
-                "#      landlock 是 100% panic 的必死卡）。工作區那一格外層允許寫。",
-                f"{PATH_PROBE_HELPER} {stem} /bin/sh -c \\",
-                f"  'cd {probe_workspace} && : > psc-716-write && echo PSC-716-EXEC-OK && "
-                "rm -f psc-716-write'",
-                "#      期望：`PSC-716-EXEC-OK`、rc=0。非零 ⇒ 外層把這一列也弄死了，",
-                "#      寫入卡回到「必死」狀態——先查 unit 落檔，不要動導出表。",
-                f"#   b[{mode}]) **出口管制在**——這是該列**僅存**的網路防線",
-                "#      （`IPAddressDeny=any` ＋ proxy 白名單，PR #725），探針缺了它就是",
-                "#      假綠。`env -u` 是為了證明「繞開 proxy 宣告直連」也出不去：raw",
-                "#      socket 本來就不讀 HTTPS_PROXY，擋它的是 IPAddressDeny，不是 env。",
-                f"{PATH_PROBE_HELPER} {stem} /usr/bin/env -u HTTPS_PROXY -u https_proxy /bin/sh -c \\",
-                "  'python3 -c \"import socket; socket.create_connection((\\\"1.1.1.1\\\", 443),"
-                " timeout=5)\"'",
-                "#      期望：非零，逐字 `TimeoutError`。連得出去（rc=0）⇒ 出口管制被拆",
-                "#      或 unit 落檔漂移——**當場停**：「不補出口就不要採 B」是這一列成立",
-                "#      的硬前置，出口不在的那一刻本列的裁決前提就垮了。",
-            ]
-    lines += [
-        "",
-        f"#   2) 旗標還在：`{flag}` 不得換來 `Unknown feature flag`。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox "
-        f"-c sandbox_mode='\"{registry.SANDBOX_MODE_READ_ONLY}\"' {flag} -- /bin/true",
-        "#      期望：rc=0。stderr 出現 `Unknown feature flag` ⇒ **上游把旗標拿掉了**：",
-        "#      內層沙箱從此不存在，而 job 會照跑。處置是回到 permgen 的 "
-        "`EXECUTOR_TOOLS`",
-        "#      那一列重新量一次形態，**不是**把這條探針刪掉。",
-        f"#      刻意固定用 `{registry.SANDBOX_MODE_READ_ONLY}`：旗標只附在 read-only 族",
-        "#      的 argv 上（#716 B 後半），也只有唯讀族 profile 裝得上 landlock——歷史",
-        "#      上 `workspace-write` 在 profile 檢查就先 panic，分不出「旗標存不存在」。",
-        "",
-        "#   2b) **早期警報**：上游對這個旗標的 deprecation 宣告（0819 起就有）。",
-        "#",
-        f"#      ⚠️ **這一條看的是 job log，不是上面那條命令。** `{binary} sandbox` 這個",
-        "#      子命令**不印**那句話（0819 實測），只有走 `exec --json` 的真實派工會把它",
-        "#      當成一筆 `item.type=error` 放進串流。拿 `sandbox` 的輸出去 grep 只會得到",
-        "#      一個看起來很安心、其實什麼都沒驗到的「沒有 deprecation 訊息」。",
-        f"#      ⚠️ #716 B 後半起，**旗標只附在 read-only 族的 argv 上**——寫入卡",
-        f"#      （`{write_mode}`）的 job log **不該**再有這句。要看警報，挑一份",
-        "#      planner／reviewer／write-forbidden 卡的 log；在寫入卡的 log 看到它",
-        "#      反而是回歸（旗標漏回了寫入卡的 argv）。",
-        "grep -o 'use_legacy_landlock[^\"]*deprecated[^\"]*' \\",
-        "  <build-logs>/<最近一次 read-only 族真實派工>/job.jsonl || echo '（本次 log 沒有這句）'",
-        "#      0819 實機逐字：`[features].use_legacy_landlock is deprecated and will be",
-        "#      removed soon. (Remove this setting to stop opting into the legacy Linux",
-        "#      sandbox behavior.)`——**這是倒數，不是穩態**。",
-        "#      它還在印 ⇒ 旗標還在；它不見了 ⇒ 先看第 2 步分辨是「上游收回宣告」還是",
-        "#      「旗標已經被拿掉」（後者代表 read-only 族的內層沙箱沒了，job 卻會照跑）。",
-        "#      ⚠️ 這句話**不影響** terminal 契約（`_extract_terminal_json()` 由尾端往回",
-        "#      找 `agent_message`），但看到 job log 開頭有一筆 error 時不要誤判成失敗。",
-        "",
-        "#   4) 內層真的在擋（**這一段不可省略**——裝上了不等於有在擋）。",
-        "#",
-        "#      ⚠️ **每一條都要有成對的對照組。** 拿「寫 job HOME 被擋」當證據是**假的**",
-        "#      ——那一格本來就不在 `ReadWritePaths=` 內，`ProtectSystem=strict` 會先回",
-        "#      `Read-only file system`，內層有沒有裝上完全看不出來。要證明內層在擋，被",
-        "#      擋的那一格必須是**外層允許**的那一格。",
-        "#",
-        f"#      ⚠️ **這一段只適用附掛內層的 `{registry.SANDBOX_MODE_READ_ONLY}` 族**",
-        f"#      （#716）：`{write_mode}` 那一列沒有內層沙箱，「內層擋什麼」對它是",
-        f"#      空集合，它的防線由上面 a[{write_mode}]／b[{write_mode}] 兩條涵蓋。",
-        "#      因此以下每一條都逐字帶",
-        f"#      `-c sandbox_mode='\"{registry.SANDBOX_MODE_READ_ONLY}\"'`——不要把它拿掉",
-        "#      當成「量了兩種 mode」，那是第三種假綠。",
-        "",
-        f"#      4a) 對照：**沒有**內層沙箱時，外層允許寫 {probe_workspace}",
-        f"{PATH_PROBE_HELPER} {stem} /bin/sh -c \\",
-        f"  'cd {probe_workspace} && : > psc-714-outer && echo OUTER_ALLOWS && "
-        "rm -f psc-714-outer'",
-        "#          期望：`OUTER_ALLOWS`、rc=0。",
-        "#      4b) **同一格**，帶內層沙箱 ⇒ 必須被擋。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox "
-        f"-c sandbox_mode='\"{registry.SANDBOX_MODE_READ_ONLY}\"' {flag} -- /bin/sh -c \\",
-        f"  'cd {probe_workspace} && : > psc-714-inner && echo INNER_LEAK'",
-        "#          期望：非零，逐字 `Permission denied`（landlock 擋寫）。",
-        "#          印出 `INNER_LEAK` ⇒ 旗標吃下去了但沙箱沒生效。",
-        "#      4c) 網路：帶內層沙箱 ⇒ 查不到名。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox "
-        f"-c sandbox_mode='\"{registry.SANDBOX_MODE_READ_ONLY}\"' {flag} -- /bin/sh -c \\",
-        "  'getent hosts api.openai.com'",
-        "#          期望：非零（seccomp 擋網路）。",
-        "#      4d) 對照：**沒有**內層沙箱時查得到（外層的 RestrictAddressFamilies 放行",
-        "#          AF_INET，所以這一條 rc=0 才代表 4c 的失敗真的來自內層）。",
-        f"{PATH_PROBE_HELPER} {stem} /bin/sh -c 'getent hosts api.openai.com'",
-        "#          期望：rc=0，印出 A 記錄。",
-        "#      ⚠️ 4b／4c **任一**變成 rc=0（而對照組正常）⇒ 內層沒生效——那是最壞的",
-        "#      狀態（看起來一切正常，實際少一層），比整個起不來還難發現。",
+    lines = [
+        "# === #716 Trust Root Codex outer-boundary probe ===",
+        f"# generated (scheme={scheme.scheme_id}, executor={executor})",
+        "# Codex 0.157 does not run its inner sandbox under this unit; do not invoke",
+        "# `codex sandbox` here. The expected argv mode is danger-full-access.",
+        "# This probes the unit boundary, not the production-shaped Codex agent loop.",
         "",
     ]
-    lines += _wrap_comment(
-        "本探針是**回歸守衛**，不是 #714 的驗收。驗收是「builder job 執行得了 shell "
-        "命令**且產得出非空 bundle**」，那一條必須走真實派工（#709 的 caveat："
-        f"`{PATH_PROBE_HELPER}` 複製的是加固面、不是派工路徑），工作區由真實 "
-        "provisioning 產生（#645：手工前置物會把 bug 繞過去）。"
-    )
-    lines += _wrap_comment(
-        "**本探針量不到的（#716，逐條列出，不要當成已解）**："
-        f"(1) `{write_mode}` 那一列的端到端——本探針只證明「外層允許執行、出口關著」，"
-        "沒有跑真實 `codex exec` 的 agent loop（0819 已量過一次：headless "
-        f"`-s {write_mode}` 不卡核可閘、模型自主命令 rc=0，但**真實派工跑會寫檔的卡**"
-        "仍未驗）；"
-        f"(2) `{binary} sandbox` 與 `{binary} exec --sandbox <mode>` 的等價性"
-        "——兩個端點對得上（`workspace-write` 兩邊同字串同 file:line、`read-only` 兩邊"
-        "皆 rc=0），但**未逐行證明是同一個函式**；"
-        "(3) 真實派工的端到端結果（會燒 token）。"
-        f"另一條反向警報順手記在這裡：builder 寫入卡的 argv 已不帶 `{flag}`（#716 B "
-        "後半），**若 builder 的 job log 再出現那句 deprecation，代表旗標從某條路"
-        "漏回了寫入卡的 argv**——先查 `registry.SANDBOX_MODE_DERIVATION` 的消費端。"
-    )
-    lines += _wrap_comment(
-        "**明載的取捨**（`InnerSandboxSpec.accepted_loss`，本探針量不到）："
-        + "；".join(spec.accepted_loss)
+    for key, value in (
+        ("NoNewPrivileges", "yes"),
+        ("ProtectSystem", "strict"),
+        ("ProtectHome", "yes"),
+        ("ProcSubset", "pid"),
+        ("RestrictNamespaces", "yes"),
+        ("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6"),
+        ("SystemCallFilter", "@system-service @sandbox"),
+        ("SystemCallErrorNumber", "EPERM"),
+        ("IPAddressDeny", "any"),
+    ):
+        lines.append(f"sudo systemctl cat {stem}@.service | grep -F '{key}={value}'")
+    lines.extend(
+        [
+            "",
+            "# The existing ReadWritePaths surface allows the job-owned worktree slot.",
+            f"{PATH_PROBE_HELPER} {stem} /bin/sh -c {shlex.quote(write_command)}",
+            "# Expected: PSC-716-OUTER-WRITE-OK and rc=0.",
+            "",
+            "# Raw egress remains denied even when proxy variables are removed.",
+            f"{PATH_PROBE_HELPER} {stem} /usr/bin/env -u HTTPS_PROXY -u https_proxy "
+            f"/bin/sh -c {shlex.quote(egress_command)}",
+            "# Expected: nonzero with TimeoutError (IPAddressDeny=any).",
+            "",
+            "# For argv behavior, run the focused launcher tests. A live model-driven",
+            "# repo-command check requires the protected Trust Root deployment canary.",
+        ]
     )
     return lines
 

@@ -135,9 +135,42 @@ def _launch(
 ) -> None:
     """在完全受控的 env／systemd 探測 seam 下跑一次 launch。"""
 
+    def prepare_prompt_spool_without_host_acl(directory: str, *, account=None) -> str:
+        # Prompt-path tests in this module assert launch routing and argv. The
+        # dedicated prompt-spool tests own ACL semantics; this workspace does
+        # not support named ACLs.
+        target = Path(directory)
+        target.mkdir(parents=True, exist_ok=True)
+        target.chmod(0o710)
+        return str(target)
+
+    def write_prompt_without_host_acl(
+        prompt_path: str, prompt: str, *, account=None, max_bytes=None
+    ) -> str:
+        target = Path(prompt_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(prompt, encoding="utf-8")
+        target.chmod(0o600)
+        return str(target)
+
     original = launcher_module.subprocess.Popen
     launcher_module.subprocess.Popen = popen
-    patches = [mock.patch.object(job_runner, "_account_ids", side_effect=_fake_account_ids)]
+    patches = [
+        mock.patch.object(job_runner, "_account_ids", side_effect=_fake_account_ids),
+        mock.patch.object(job_runner, "_grant_prompt_traverse"),
+        mock.patch.object(
+            job_runner,
+            "prepare_private_prompt_spool",
+            side_effect=prepare_prompt_spool_without_host_acl,
+        ),
+        mock.patch.object(
+            job_runner, "write_job_prompt", side_effect=write_prompt_without_host_acl
+        ),
+        # Launch-shape tests do not exercise filesystem ACL semantics. The
+        # restricted worktree filesystem rejects named ACLs; dedicated spool
+        # tests cover those semantics on a suitable filesystem.
+        mock.patch.object(launcher_module.spool_slot, "_apply_slot_acl"),
+    ]
     if preflight_ok:
         patches += [
             mock.patch.object(job_runner.shutil, "which", return_value="/usr/bin/systemd-run"),
@@ -737,6 +770,36 @@ class DegradedLaunchTests(unittest.TestCase):
         return _unwrap_exit_recorder(
             self._launch_builder(env=env, executor=executor).call["argv"]
         )
+
+    def test_systemd_run_does_not_select_template_outer_sandbox_mode(self) -> None:
+        """Transient systemd-run only adds NNP; it is not the Trust Root template boundary."""
+
+        original_builder = launcher_module._ARGV_BUILDERS["codex"]
+        observed: dict[str, object] = {}
+        launched_argv: list[str] = []
+
+        def capture_builder(**kwargs):
+            observed.update(kwargs)
+            argv = original_builder(**kwargs)
+            launched_argv.extend(argv)
+            return argv
+
+        popen = _RecordingPopen()
+        with mock.patch.dict(
+            launcher_module._ARGV_BUILDERS, {"codex": capture_builder}
+        ), mock.patch.object(launcher_module.spool_slot, "_apply_slot_acl"):
+            _launch(
+                SubprocessLauncher("codex").as_read_only(),
+                env=_degraded_env(),
+                popen=popen,
+            )
+
+        self.assertIs(observed.get("trust_root_outer_unit"), False)
+        self.assertEqual(
+            launched_argv[launched_argv.index("--sandbox") + 1], "read-only"
+        )
+        self.assertIn("--enable", launched_argv)
+        self.assertIn("use_legacy_landlock", launched_argv)
 
     def test_exit_sentinel_is_written_by_the_manager_side_recorder(self) -> None:
         # #604：sentinel 的寫者必須在 Manager 這一側。外層 shell 由 Manager 的

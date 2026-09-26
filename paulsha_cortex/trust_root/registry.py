@@ -957,7 +957,7 @@ class JobWriteContract(Enum):
 
 @dataclass(frozen=True)
 class SandboxModeDerivation:
-    """一種寫入契約 → executor sandbox mode 的宣告（#716）。"""
+    """一種寫入契約 → direct／Trust Root template sandbox mode 的宣告（#716）。"""
 
     contract: JobWriteContract
     #: 要發的 `--sandbox <mode>`；`None` ＝ 這一格根本不發 `--sandbox`（bypass）。
@@ -976,24 +976,27 @@ class SandboxModeDerivation:
     #: （`--dangerously-bypass-approvals-and-sandbox` 已整個關掉）。
     #: 與 mode 的一致性由 import 期斷言釘死（attaches ⇔ mode 是 `read-only`）。
     attaches_inner_sandbox: bool
+    #: 成功建立 Trust Root per-job template unit 時使用的 mode。`None` 僅供 unsafe bypass。
+    trust_root_sandbox_mode: str | None
+    #: Trust Root `danger-full-access` 由外層 unit 限制可寫面。
+    trust_root_grants_filesystem_write: bool
+    #: Trust Root template job 固定不附掛 Codex 內層沙箱。
+    trust_root_attaches_inner_sandbox: bool
     note: str
 
 
-#: **#716 那條規則的表**：:class:`JobWriteContract` 五格一格都不能少。
-#:
-#: | 契約 | mode | 帶寫入授權 | 附內層 argv | 備註 |
-#: |---|---|---|---|---|
-#: | `unsafe-bypass` | （不發） | —（連沙箱都沒有） | 否 | bypass 旗標已整個關掉 |
-#: | `planner-read-only` | `read-only` | 否 | **是** | landlock 下 rc=0，今天就是好的 |
-#: | `reviewer-review-only` | `read-only` | 否 | **是** | 同上 |
-#: | `builder-write-forbidden` | `read-only` | 否 | **是** | #716 選項 F 修的那一格 |
-#: | `builder-workspace-write` | `danger-full-access` | **是（＝沒有內層）** | **否** | #716 選項 B 後半；殘餘防線＝外層＋出口管制 |
+#: **#716 的兩種執行邊界**：direct／systemd-run 保持卡片契約的既有 mode；
+#: Trust Root template 依 2026-09-26 選項 B，所有非 bypass 卡都用 `danger-full-access`
+#: 並只依賴外層 unit 與 egress proxy。每個契約都在同一列明載兩種 mode。
 SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
     SandboxModeDerivation(
         contract=JobWriteContract.UNSAFE_BYPASS,
         sandbox_mode=None,
         grants_filesystem_write=True,
         attaches_inner_sandbox=False,
+        trust_root_sandbox_mode=None,
+        trust_root_grants_filesystem_write=True,
+        trust_root_attaches_inner_sandbox=False,
         note=(
             "`--dangerously-bypass-approvals-and-sandbox` 同時關掉核可**與**沙箱，"
             "再選一個 mode 沒有意義（`build_codex_argv` 的既有註解逐字如此，本表沒有"
@@ -1007,13 +1010,14 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
         sandbox_mode=SANDBOX_MODE_READ_ONLY,
         grants_filesystem_write=False,
         attaches_inner_sandbox=True,
+        trust_root_sandbox_mode=SANDBOX_MODE_DANGER_FULL_ACCESS,
+        trust_root_grants_filesystem_write=True,
+        trust_root_attaches_inner_sandbox=False,
         note=(
-            "`as_read_only()`＝workflow lane 的 planner 卡。**本票一個位元都不動它**"
-            "——0819 實機在真實加固面複本下 `-s read-only` ＋ legacy landlock 是 rc=0，"
-            "而且是**模型自己決定命令**的真實 agent loop 量到的"
-            "（`git -c safe.directory=… rev-parse HEAD` → `exit_code: 0`／"
-            "`turn.completed`／`DONE rc=0`）。這一格在本表上的作用是**成為斷言的一部分**："
-            "任何人把 planner 的 mode 改掉，import 期的全覆蓋斷言與其配套測試會擋下來。"
+            "`as_read_only()`＝workflow lane 的 planner 卡。direct／非 template runner"
+            "仍依契約使用 `read-only`；Trust Root template 因 codex-cli 0.157 在外層"
+            "namespace 限制下要求 bwrap 而改用 `danger-full-access`，安全邊界由 template"
+            "unit 與 egress proxy 提供。"
         ),
     ),
     SandboxModeDerivation(
@@ -1021,12 +1025,13 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
         sandbox_mode=SANDBOX_MODE_READ_ONLY,
         grants_filesystem_write=False,
         attaches_inner_sandbox=True,
+        trust_root_sandbox_mode=SANDBOX_MODE_DANGER_FULL_ACCESS,
+        trust_root_grants_filesystem_write=True,
+        trust_root_attaches_inner_sandbox=False,
         note=(
-            "`as_review_only()`＝workflow lane 的 reviewer 卡，與 planner 同一個 mode、"
-            "同樣今天就是好的。兩格分開列而不是合併成一個 `read-only-lane`，是因為它們"
-            "在 launcher 上是**兩個不同的建構契約**（`--skip-git-repo-check` 之外還有"
-            "`--tools`／`--settings`／verdict spool 的差異），合併會讓「reviewer 的 mode "
-            "被改掉」與「planner 的 mode 被改掉」在表上長得一樣。"
+            "`as_review_only()`＝workflow lane 的 reviewer 卡，保留獨立列涵蓋它的"
+            "`--tools`／`--settings`／verdict spool 建構契約；Trust Root template 下由外層"
+            "unit 限制寫入與網路，Codex 內層沙箱不啟用。"
         ),
     ),
     SandboxModeDerivation(
@@ -1034,16 +1039,21 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
         sandbox_mode=SANDBOX_MODE_READ_ONLY,
         grants_filesystem_write=False,
         attaches_inner_sandbox=True,
+        trust_root_sandbox_mode=SANDBOX_MODE_DANGER_FULL_ACCESS,
+        trust_root_grants_filesystem_write=True,
+        trust_root_attaches_inner_sandbox=False,
         note=(
             "**#716 選項 F 的那一格。** 判準是**卡片契約**（`commit_policy=forbidden` "
             "**且** `declared_outputs` 為空，見 "
             ":func:`card_contract_forbids_workspace_write`），不是 persona——persona 一刀切"
             "正是被否決的形態：builder 這個 persona 底下同時有唯讀卡與寫入卡。\n"
-            "**這是最小權限修正，不是 landlock 的 workaround**：一張契約上宣告不 commit、"
+            "direct／非 template runner 下，這是最小權限修正，不是 landlock 的 workaround："
+            "一張契約上宣告不 commit、"
             "也不宣告任何產出的卡，本來就不該拿到工作區寫入授權。legacy landlock 只是讓"
             "這個既有缺陷從靜默變成 panic。\n"
             "**誠實邊界**：本格**只**解得了唯讀卡。同一個 build phase 的下一張會寫檔的卡"
-            "落在 `builder-workspace-write`，仍會撞同一面牆（#716 的 A／B／E 裁決仍要做）。\n"
+            "落在 `builder-workspace-write`。Trust Root template 另依 2026-09-26 選項 B"
+            "統一使用外層 unit 邊界。\n"
             "**隱性邊界（#721）**：`-s read-only` 之下**任何需要暫存檔的命令都會失敗**，"
             "`/tmp` 也不例外（`tempfile` 建不出檔，實測 `python3 -m pytest -q` 死於 "
             "`No usable temporary directory available`）——「不寫工作區」不等於「不寫任何"
@@ -1055,6 +1065,9 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
         sandbox_mode=SANDBOX_MODE_DANGER_FULL_ACCESS,
         grants_filesystem_write=True,
         attaches_inner_sandbox=False,
+        trust_root_sandbox_mode=SANDBOX_MODE_DANGER_FULL_ACCESS,
+        trust_root_grants_filesystem_write=True,
+        trust_root_attaches_inner_sandbox=False,
         note=(
             "**預設落點，也是保守方向的具體形狀**：`commit_policy=required`／`optional`、"
             "**以及契約缺欄或解不出來**的一律落這裡。"
@@ -1099,12 +1112,18 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
 )
 
 
-def sandbox_mode_for(contract: JobWriteContract) -> str | None:
-    """該寫入契約要發的 `--sandbox <mode>`；查無即 fail-closed（#716）。"""
+def sandbox_mode_for(
+    contract: JobWriteContract, *, trust_root_outer_unit: bool = False
+) -> str | None:
+    """該契約在 direct／Trust Root template 下發出的 `--sandbox <mode>`。"""
 
     for row in SANDBOX_MODE_DERIVATION:
         if row.contract is contract:
-            return row.sandbox_mode
+            return (
+                row.trust_root_sandbox_mode
+                if trust_root_outer_unit
+                else row.sandbox_mode
+            )
     raise KeyError(
         f"{contract} 沒有登記 sandbox mode——每一種 launcher 寫入契約都必須在 "
         "SANDBOX_MODE_DERIVATION 上有恰好一格，不得在 build_codex_argv 裡另寫一個 "
@@ -1112,8 +1131,10 @@ def sandbox_mode_for(contract: JobWriteContract) -> str | None:
     )
 
 
-def inner_sandbox_attached_for(contract: JobWriteContract) -> bool:
-    """該寫入契約的 argv 要不要附掛內層沙箱形態；查無即 fail-closed（#716 B 後半）。
+def inner_sandbox_attached_for(
+    contract: JobWriteContract, *, trust_root_outer_unit: bool = False
+) -> bool:
+    """該契約 argv 是否附掛內層沙箱；Trust Root template 一律不附掛。
 
     這是 `launcher._codex_inner_sandbox_argv()` 的判準來源——附掛條件**跟著契約走**，
     不在 `build_codex_argv` 裡另寫一個 if：read-only 族附（legacy landlock 今天是好
@@ -1122,14 +1143,20 @@ def inner_sandbox_attached_for(contract: JobWriteContract) -> bool:
 
     for row in SANDBOX_MODE_DERIVATION:
         if row.contract is contract:
-            return row.attaches_inner_sandbox
+            return (
+                row.trust_root_attaches_inner_sandbox
+                if trust_root_outer_unit
+                else row.attaches_inner_sandbox
+            )
     raise KeyError(
         f"{contract} 沒有登記內層沙箱附掛條件——每一種 launcher 寫入契約都必須在 "
         "SANDBOX_MODE_DERIVATION 上有恰好一格（#716）。"
     )
 
 
-def sandbox_mode_attaches_inner_sandbox(mode: str) -> bool:
+def sandbox_mode_attaches_inner_sandbox(
+    mode: str, *, trust_root_outer_unit: bool = False
+) -> bool:
     """某個會被發出的 `--sandbox <mode>` 是否附掛內層沙箱（#716 B 後半）。
 
     `permgen.build_inner_sandbox_probe()` 逐 mode 消費：附掛的 mode 走「負向對照＋
@@ -1138,13 +1165,25 @@ def sandbox_mode_attaches_inner_sandbox(mode: str) -> bool:
     mode 來問，代表清單不是從 :func:`emitted_sandbox_modes` 導出的。
     """
 
-    rows = [row for row in SANDBOX_MODE_DERIVATION if row.sandbox_mode == mode]
+    rows = [
+        row
+        for row in SANDBOX_MODE_DERIVATION
+        if (
+            row.trust_root_sandbox_mode if trust_root_outer_unit else row.sandbox_mode
+        )
+        == mode
+    ]
     if not rows:
         raise KeyError(
             f"sandbox mode {mode!r} 不在 SANDBOX_MODE_DERIVATION 上——mode 清單必須由 "
             "emitted_sandbox_modes() 機械導出，不得手抄（#716）。"
         )
-    answers = {row.attaches_inner_sandbox for row in rows}
+    answers = {
+        row.trust_root_attaches_inner_sandbox
+        if trust_root_outer_unit
+        else row.attaches_inner_sandbox
+        for row in rows
+    }
     if len(answers) != 1:
         raise ValueError(
             f"sandbox mode {mode!r} 在不同列上的附掛宣告互相矛盾——同一個 mode 的內層"
@@ -1231,8 +1270,8 @@ def derive_job_write_contract(
     return JobWriteContract.BUILDER_WORKSPACE_WRITE
 
 
-def emitted_sandbox_modes() -> tuple[str, ...]:
-    """`build_codex_argv` 會發出的**每一個** `--sandbox <mode>`（#716）。
+def emitted_sandbox_modes(*, trust_root_outer_unit: bool = False) -> tuple[str, ...]:
+    """`build_codex_argv` 在指定執行邊界會發出的每一個 `--sandbox <mode>`。
 
     這是 `permgen.build_inner_sandbox_probe()` 的輸入。**探針不得手抄這份清單**
     ——#715 的探針正是因為只驗到 `codex sandbox` 的預設（唯讀族）profile 而假綠，
@@ -1244,8 +1283,13 @@ def emitted_sandbox_modes() -> tuple[str, ...]:
 
     modes: list[str] = []
     for row in SANDBOX_MODE_DERIVATION:
-        if row.sandbox_mode is not None and row.sandbox_mode not in modes:
-            modes.append(row.sandbox_mode)
+        mode = (
+            row.trust_root_sandbox_mode
+            if trust_root_outer_unit
+            else row.sandbox_mode
+        )
+        if mode is not None and mode not in modes:
+            modes.append(mode)
     return tuple(modes)
 
 
@@ -1330,6 +1374,27 @@ def _assert_sandbox_mode_derivation_is_total() -> None:
                 "附掛條件跟著契約走（#716 B 後半）：read-only 族的 legacy landlock "
                 "今天是好的、真的在擋，必須附；`danger-full-access` 沒有內層可附，"
                 "帶著旗標只是在 job log 開頭多印 deprecation 噪音；bypass 已整個關掉。"
+            )
+        if (row.trust_root_sandbox_mode is None) != is_bypass:
+            raise ValueError(
+                f"{row.contract.value}：Trust Root template 只有 unsafe-bypass 不發 --sandbox"
+            )
+        if row.trust_root_sandbox_mode is not None and (
+            row.trust_root_sandbox_mode != SANDBOX_MODE_DANGER_FULL_ACCESS
+        ):
+            raise ValueError(
+                f"{row.contract.value}：Trust Root template 必須停用 Codex 內層沙箱"
+            )
+        if row.trust_root_attaches_inner_sandbox:
+            raise ValueError(
+                f"{row.contract.value}：Trust Root template 不得附掛 Codex 內層沙箱"
+            )
+        expected_outer_write = row.trust_root_sandbox_mode in (
+            None, SANDBOX_MODE_DANGER_FULL_ACCESS
+        )
+        if row.trust_root_grants_filesystem_write != expected_outer_write:
+            raise ValueError(
+                f"{row.contract.value}：Trust Root filesystem write 標記與 mode 矛盾"
             )
     for contract in (
         JobWriteContract.PLANNER_READ_ONLY, JobWriteContract.REVIEWER_REVIEW_ONLY
