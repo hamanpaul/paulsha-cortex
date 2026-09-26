@@ -9,6 +9,8 @@
 
 ### Added
 
+- **#842 execution qualification lifecycle**：以 report v2／#835 profile candidate、不可變 human-review／revoke receipt、revision CAS、expiry 與 legacy unknown migration 發布 exact profile／role／coverage qualification；Manager 僅在 sized-dispatch policy 明確 enforce 時查詢 approved roster，預設派工不變，測試 receipt 不進 live policy。CLI、Trust Root、README 與 live 驗收界線見 `docs/execution-qualification.md`。
+
 - **#843 recovery action conformance**：新增版本化 action registry 與 13 家族契約矩陣，並以 dispatcher、control contract、coordinator CLI、`cortex recover` work/slice alias 雙向核對正式名稱與 CAS 欄位；補上 retry candidate CLI CAS、recover/abandon crash/restart 參數化特性與 frozen same-domain reviewer pin 零派工負控制。既有 producer gap 和 live 驗收界線記錄於矩陣。
 
 ### Fixed

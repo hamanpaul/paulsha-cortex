@@ -11252,15 +11252,23 @@ def _bind_workflow_execution_profile(
         step.persona,
         requirements=requirements,
     )
+    qualification_required = (
+        getattr(run, "sizing_band", None) is not None
+        and qualification_policy == "enforce"
+    )
+    qualification = None
+    if qualification_required:
+        # 資格必須來自持久化 approved-roster query；舊 Identity 上的任意屬性
+        # 不是授權來源。disabled 預設不查詢，因此不改既有 dispatch 行為。
+        from .qualification_lifecycle import lookup_dispatch_qualification
+
+        qualification = lookup_dispatch_qualification(identity, binding)
     validate_dispatch_requirements(
         binding,
         identity=identity,
         builder_domains=builder_domains,
-        qualification_required=(
-            getattr(run, "sizing_band", None) is not None
-            and qualification_policy == "enforce"
-        ),
-        qualification=getattr(identity, "execution_qualification", None),
+        qualification_required=qualification_required,
+        qualification=qualification,
     )
     return binding, bind_launcher_profile(launcher, binding)
 

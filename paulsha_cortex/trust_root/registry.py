@@ -1683,6 +1683,30 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         note="jobs.json／evidence 樹／journal 的容器；實測 drwxrwxr-x（group-writable）。",
     ),
     TrustRootAsset(
+        "execution-qualification-candidates", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_candidates_root",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note="#842 immutable report-bound candidates；未知與 legacy 證據不可升格。",
+    ),
+    TrustRootAsset(
+        "execution-qualification-receipts", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_receipts_root",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note="#842 immutable human-review 與撤銷 receipts；授權只綁 exact candidate。",
+    ),
+    TrustRootAsset(
+        "execution-qualification-roster", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_roster_path",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note="#842 approved roster projection；舊 Manager 不讀此獨立檔案。",
+    ),
+    TrustRootAsset(
+        "execution-qualification-index", _T0, _MO,
+        "paulsha_cortex.config.paths:execution_qualification_index_path",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        note="#842 revision/CAS 唯一 lifecycle 真值；receipt 缺失時查詢 fail-closed。",
+    ),
+    TrustRootAsset(
         "dispatch-specs-tree", _T0, _MO, "paulsha_cortex.config.paths:specs_root",
         (Principal.MANAGER, Principal.PLANNER, Principal.ANY_SAME_UID),
         (Principal.MANAGER,),

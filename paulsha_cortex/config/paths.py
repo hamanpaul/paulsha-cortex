@@ -58,6 +58,29 @@ def coordinator_root() -> Path:
     return resolve_runtime_root("PSC_COORDINATOR_ROOT")
 
 
+_EXECUTION_QUALIFICATION_DIRNAME = "execution-qualification"
+
+
+def execution_qualification_candidates_root() -> Path:
+    """#842 immutable report-bound candidates；僅 Manager 可寫。"""
+    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME / "candidates"
+
+
+def execution_qualification_receipts_root() -> Path:
+    """#842 immutable human-review/revocation receipts；僅 Manager 可寫。"""
+    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME / "receipts"
+
+
+def execution_qualification_roster_path() -> Path:
+    """#842 可重建的 approved qualification roster 投影。"""
+    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME / "approved-roster.json"
+
+
+def execution_qualification_index_path() -> Path:
+    """#842 CAS revision、binding 與 lifecycle index 唯一真值。"""
+    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME / "index.json"
+
+
 def coverage_shadow_telemetry_root() -> Path:
     """v4 R1（方案 A）coverage validator shadow 的 disagreement telemetry 落點。
 
