@@ -482,7 +482,7 @@ def test_a_headless_claude_builder_carries_the_hook_on_argv() -> None:
     assert settings is not None
     assert list(settings) == ["hooks"]  # 只加 hook，不動 permissions／sandbox
     assert [group["matcher"] for group in settings["hooks"]["PostToolUse"]] == ["Bash"]
-    assert [group["matcher"] for group in settings["hooks"]["PreToolUse"]] == ["Edit"]
+    assert [group["matcher"] for group in settings["hooks"]["PreToolUse"]] == ["Edit|Write|MultiEdit"]
     assert _hook_commands(settings) == [
         "cortex headless-hook post-tool-use || true",
         "cortex headless-hook pre-tool-use || exit 2",

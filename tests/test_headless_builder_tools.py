@@ -91,7 +91,7 @@ class ExecutableModeToolTests(unittest.TestCase):
                 "tool_input": {
                     "file_path": str(target),
                     "old_string": "before",
-                    "new_string": "x" * 1200,
+                    "new_string": "x" * 40000,
                 },
             }
             output = StringIO()
@@ -102,13 +102,42 @@ class ExecutableModeToolTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(decision["hookSpecificOutput"]["hookEventName"], "PreToolUse")
             self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
-            self.assertIn("1000 bytes", decision["hookSpecificOutput"]["permissionDecisionReason"])
+            self.assertIn("32768 bytes", decision["hookSpecificOutput"]["permissionDecisionReason"])
             self.assertEqual(target.read_text(encoding="utf-8"), "before\n")
 
     def test_pre_tool_use_leaves_bounded_edit_to_normal_permissions(self) -> None:
         payload = {
             "tool_name": "Edit",
             "tool_input": {"file_path": "target.py", "old_string": "a", "new_string": "b"},
+        }
+        output = StringIO()
+        with mock.patch("sys.stdin", StringIO(json.dumps(payload))), redirect_stdout(output):
+            result = headless_hook.main(["pre-tool-use"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_pre_tool_use_denies_oversized_write(self) -> None:
+        payload = {
+            "tool_name": "Write",
+            "tool_input": {"file_path": "target.py", "content": "y" * 40000},
+        }
+        output = StringIO()
+        with mock.patch("sys.stdin", StringIO(json.dumps(payload))), redirect_stdout(output):
+            result = headless_hook.main(["pre-tool-use"])
+
+        decision = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(decision["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_pre_tool_use_allows_medium_edit_with_large_old_string(self) -> None:
+        payload = {
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "target.py",
+                "old_string": "o" * 5000,
+                "new_string": "n" * 900,
+            },
         }
         output = StringIO()
         with mock.patch("sys.stdin", StringIO(json.dumps(payload))), redirect_stdout(output):

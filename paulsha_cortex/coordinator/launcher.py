@@ -511,7 +511,7 @@ def _claude_spool_hook_settings() -> str:
         "hooks": {
             "PreToolUse": [
                 {
-                    "matcher": "Edit",
+                    "matcher": "Edit|Write|MultiEdit",
                     "hooks": [
                         {
                             "type": "command",

@@ -167,7 +167,7 @@ class ArgvTests(unittest.TestCase):
         )
         settings = json.loads(argv[argv.index("--settings") + 1])
         edit_hook = settings["hooks"]["PreToolUse"][0]
-        self.assertEqual(edit_hook["matcher"], "Edit")
+        self.assertEqual(edit_hook["matcher"], "Edit|Write|MultiEdit")
         self.assertIn("headless-hook pre-tool-use", edit_hook["hooks"][0]["command"])
 
     def test_write_forbidden_claude_does_not_project_builder_tools(self) -> None:

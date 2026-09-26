@@ -34,7 +34,7 @@ builder 工具授權。
 candidate 程式碼。既有 runtime isolation／獨立驗收仍不可省略，不能將 allowlist
 當作對惡意 candidate 的完整防線。
 
-Edit 的 PreToolUse hook 會在呼叫工具前拒絕超過 1000 bytes 的 `tool_input`，不執行
+Edit／Write／MultiEdit 的 PreToolUse hook 會在呼叫工具前拒絕新內容（`new_string`／`content`）超過 32 KiB 的寫入，不執行
 該次 Edit。`required_artifacts` 可選擇宣告 Git mode `100644` 或 `100755`；驗收會讀取
 Candidate tree 的 mode 並要求完全相符。這些命令授權不是 OS sandbox，也不替原生
 Edit 建立 `write_paths` 路徑限制。

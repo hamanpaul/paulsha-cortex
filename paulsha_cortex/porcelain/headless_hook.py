@@ -150,7 +150,10 @@ _ENV_ASSIGNMENT = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*=")
 _PUNCTUATION = set("();<>|&")
 
 _GIT_REMOTE_TIMEOUT_SECONDS = 5.0
-EDIT_PAYLOAD_MAX_BYTES = 1000
+# #495：限制的是「寫入檔案的新內容」而不是整個 tool_input；1000 bytes 只是某次
+# job 的 prompt 軟性要求，當硬上限會擋掉正常的中型修改。
+EDIT_PAYLOAD_MAX_BYTES = 32 * 1024
+_GUARDED_WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit"})
 
 _UNRESOLVED = object()
 
@@ -628,21 +631,31 @@ def _read_stdin_payload(stream: Any) -> dict[str, Any]:
 
 
 def _edit_payload_rejection(payload: Mapping[str, Any]) -> str | None:
-    if payload.get("tool_name", "Edit") != "Edit":
+    tool_name = payload.get("tool_name", "Edit")
+    if tool_name not in _GUARDED_WRITE_TOOLS:
         return None
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
-        return "Edit payload is malformed; tool_input must be an object"
+        return f"{tool_name} payload is malformed; tool_input must be an object"
+    if tool_name == "Write":
+        pieces = [tool_input.get("content")]
+    elif tool_name == "MultiEdit":
+        edits = tool_input.get("edits")
+        if not isinstance(edits, list) or not all(isinstance(item, dict) for item in edits):
+            return "MultiEdit payload is malformed; edits must be a list of objects"
+        pieces = [item.get("new_string") for item in edits]
+    else:
+        pieces = [tool_input.get("new_string")]
+    if not all(isinstance(piece, str) for piece in pieces):
+        return f"{tool_name} payload is malformed; new content must be a string"
     try:
-        payload_size = len(
-            json.dumps(tool_input, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
-    except (TypeError, ValueError, UnicodeError):
-        return "Edit payload is malformed; tool_input is not valid JSON"
+        payload_size = sum(len(piece.encode("utf-8")) for piece in pieces)
+    except UnicodeError:
+        return f"{tool_name} payload is malformed; new content is not valid UTF-8"
     if payload_size > EDIT_PAYLOAD_MAX_BYTES:
         return (
-            f"Edit payload exceeds {EDIT_PAYLOAD_MAX_BYTES} bytes "
-            f"(received {payload_size})"
+            f"{tool_name} new content exceeds {EDIT_PAYLOAD_MAX_BYTES} bytes "
+            f"(received {payload_size}); split the change into smaller edits"
         )
     return None
 
@@ -663,7 +676,7 @@ def main(argv: Sequence[str]) -> int:
     )
     sub.add_parser(
         "pre-tool-use",
-        help="在 Edit 執行前拒絕超過 1000 bytes 的工具輸入",
+        help="在 Edit／Write／MultiEdit 執行前拒絕新內容超過 32 KiB 的寫入",
     )
     restore_file = sub.add_parser(
         "restore-file",
