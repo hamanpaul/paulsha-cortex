@@ -5,3 +5,5 @@
 profile key 涵蓋 adapter/model/effort、loadout、toolset、sandbox、permissions、toolchain 與 requirements。dispatch／launch 在 spawn 前 fail-closed 驗證 role、pin、reviewer independence 與 Trust Root。Sized dispatch 的 exact-profile qualification 僅由 host `model-identities.yaml` overlay 明示 `qualification_policy.sized_dispatch: enforce` 啟用；預設不阻擋，並於 `resolved_model_chain` 記錄 `qualification: not-enforced`。quota 未有可信來源時明示 unknown。PatchMUD profile report consumer 驗證 schema、source revision、digest 與 exact profile key，不引入 runtime import。
 
 同步新增 #835 AC 自動化整合測試與 README／操作文件。PatchMUD #37 真實 immutable fixture、#842 qualification lifecycle／真人核可，以及 installed／live launcher 驗收需在外部完成。
+
+PatchMUD profile report consumer 改讀 report v2：以 producer 的 `report_fingerprint` 驗內容並要求呼叫端 `source_digest` 釘住同一 fingerprint，`source_revision` 只記 provenance；以 row 的 `profile_id` 精確比對 profile、以完整 cohort identity 對齊 envelope mapper；v1 報表拒收。
