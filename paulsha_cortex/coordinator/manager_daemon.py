@@ -36,7 +36,10 @@ from .registry import RETRY_CARD_PHASE_PERSONA, JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
 from .spawn_admission import DEFAULT_MIN_INTERVAL_SECONDS, SpawnAdmissionLimiter, build_default_limiter
 from .claim import load_work_authority, work_authority_digest
-from .work_actions import safe_exception_summary
+from .work_actions import (
+    safe_exception_summary,
+    work_authority_projection_state,
+)
 
 DEFAULT_TICK_INTERVAL = 300.0
 DEFAULT_POLL_INTERVAL = 3.0
@@ -656,7 +659,13 @@ def build_runtime_status_provider(
                     continue
                 attention.append(
                     manager.workflow_status_entry(
-                        registry, run, candidate_base_probe=candidate_base_probe
+                        registry,
+                        run,
+                        candidate_base_probe=candidate_base_probe,
+                        work_authority_state=work_authority_projection_state(
+                            repo=run.repo,
+                            work_id=run.work_id,
+                        ),
                     )
                 )
         in_flight = _in_flight_status(

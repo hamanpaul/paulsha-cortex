@@ -86,10 +86,14 @@ def _workflow_next_actions_projection(
     from ..coordinator.work_actions import (
         _phase_recovery_actions,
         _planning_failure_hint,
+        admitted_recovery_actions_under_authority_state,
+        recovery_actions_without_work_authority,
+        work_authority_projection_state,
     )
     from ..coordinator.workflow import WorkflowRun
 
     runs = []
+    all_runs = []
     active_counts: dict[str, int] = {}
     for row in workflow_rows:
         if row.get("repo") != repo or row.get("status") != "ongoing":
@@ -99,6 +103,7 @@ def _workflow_next_actions_projection(
         except (TypeError, ValueError):
             continue
         active_counts[run.work_id] = active_counts.get(run.work_id, 0) + 1
+        all_runs.append(run)
         if "needs_human" in run.facets:
             runs.append(run)
 
@@ -119,7 +124,7 @@ def _workflow_next_actions_projection(
 
     registry_view = SimpleNamespace(
         list_jobs=lambda: [dict(row) for row in job_rows],
-        list_workflow_runs=lambda: runs,
+        list_workflow_runs=lambda: all_runs,
         list_slices_by_owner=list_slices_by_owner,
         get_job=get_job,
     )
@@ -134,14 +139,33 @@ def _workflow_next_actions_projection(
             classification = hint.get("classification") if isinstance(hint, dict) else None
         except Exception:  # noqa: BLE001 - read projection fails closed on evidence errors
             classification = None
-        try:
-            recovery_actions = _phase_recovery_actions(run, registry_view)
-        except Exception:  # noqa: BLE001 - read projection fails closed on registry errors
-            recovery_actions = ()
-        actions = needs_human_next_actions(
-            phase=run.current_phase,
-            planning_failure_classification=classification,
-            job_recovery_actions=recovery_actions,
+        authority_state = work_authority_projection_state(
+            repo=run.repo, work_id=run.work_id
+        )
+        if authority_state == "missing":
+            actions = recovery_actions_without_work_authority(run, registry_view)
+        elif authority_state == "unavailable":
+            actions = ()
+        else:
+            try:
+                recovery_actions = _phase_recovery_actions(run, registry_view)
+            except Exception:  # noqa: BLE001 - read projection fails closed on registry errors
+                recovery_actions = ()
+            actions = needs_human_next_actions(
+                phase=run.current_phase,
+                planning_failure_classification=classification,
+                job_recovery_actions=recovery_actions,
+            )
+        # #1093 對抗審查第四輪 MAJOR1：`authority_state == "available_last_
+        # known_good"` 代表 authority 只靠 canonical GitHub provider 的
+        # rate-limited last-known-good 豁免才讀得到——execute_work_action
+        # 對非 `_LOCAL_UNBLOCK_ACTIONS` 動作一律用嚴格（非 LKG）authority
+        # 重新驗證，同一份限流 snapshot 會 fail-closed 拒絕。這裡收斂到正式
+        # 入口真的會接受的子集（單一真相，見
+        # `admitted_recovery_actions_under_authority_state`）；其他狀態
+        # （包含 missing／unavailable 已經算出的最小集合）原樣放行。
+        actions = admitted_recovery_actions_under_authority_state(
+            actions, work_authority_state=authority_state
         )
         projected[run.work_id] = {
             "run_id": run.run_id,

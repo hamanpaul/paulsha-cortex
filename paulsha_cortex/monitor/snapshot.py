@@ -57,6 +57,7 @@ class SnapshotStore:
         self._lock = threading.RLock()
         self._states: dict[str, ProjectState] = {}
         self._signatures: dict[str, tuple] = {}
+        self._diagnostics: tuple[str, ...] = ()
         self._sequence = 0
 
     def load(self) -> tuple[ChangeEvent, ...]:
@@ -65,7 +66,9 @@ class SnapshotStore:
         with self._lock:
             self._states.clear()
             self._signatures.clear()
-            for state in scan_workspaces_detailed(self._config).states:
+            result = scan_workspaces_detailed(self._config)
+            self._diagnostics = result.diagnostics
+            for state in result.states:
                 self._states[state.project_id] = state
                 self._signatures[state.project_id] = _project_signature(state)
         return ()
@@ -76,6 +79,7 @@ class SnapshotStore:
             previous_states = self._states
             previous_signatures = self._signatures
             result = scan_workspaces_detailed(self._config)
+            self._diagnostics = result.diagnostics
             previous_ids_by_path = {
                 str(stable_path(Path(state.path))): project_id
                 for project_id, state in previous_states.items()
@@ -328,6 +332,12 @@ class SnapshotStore:
     def sequence(self) -> int:
         with self._lock:
             return self._sequence
+
+    def current_diagnostics(self) -> tuple[str, ...]:
+        """Return scan-level diagnostics, including unavailable empty workspaces."""
+
+        with self._lock:
+            return self._diagnostics
 
 
 def _is_under_degraded_root(path: Path, roots: tuple[Path, ...]) -> bool:

@@ -414,12 +414,15 @@ class MonitorServer:
 
     def _handle_list_projects(self, conn: socket.socket) -> None:
         states = self._store.current_snapshot()
+        diagnostics = self._store.current_diagnostics()
         payload = {
             "ok": True,
             "data": {
                 "projects": [_state_to_dict(s) for s in states],
             },
         }
+        if diagnostics:
+            payload["data"]["diagnostics"] = list(diagnostics)
         _write_line(conn, payload)
 
     def _handle_get_project_state(self, conn: socket.socket, request: dict) -> None:
@@ -461,6 +464,9 @@ class MonitorServer:
                     if sub.matches(s.project_id)
                 ],
             }
+            diagnostics = self._store.current_diagnostics()
+            if diagnostics:
+                initial["diagnostics"] = list(diagnostics)
             _write_line(conn, initial)
 
             # Stream events until subscriber dies or peer disconnects.

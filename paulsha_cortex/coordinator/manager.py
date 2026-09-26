@@ -1506,7 +1506,11 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
 
 
 def workflow_status_entry(
-    registry, run, *, candidate_base_probe: "candidate_base.MirrorDistanceProbe | None" = None
+    registry,
+    run,
+    *,
+    candidate_base_probe: "candidate_base.MirrorDistanceProbe | None" = None,
+    work_authority_state: str | None = None,
 ) -> dict[str, Any]:
     """#527：把 `needs_human` 的 workflow run 投影成 attention 條目。
 
@@ -1598,6 +1602,52 @@ def workflow_status_entry(
                 next_step_hint = main_sync_hint
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         pass
+    if work_authority_state in {"missing", "unavailable"}:
+        if work_authority_state == "missing":
+            try:
+                from .work_actions import recovery_actions_without_work_authority
+
+                next_actions = recovery_actions_without_work_authority(run, registry)
+            except Exception:  # noqa: BLE001 - projection failures expose no action
+                next_actions = ()
+        else:
+            next_actions = ()
+        if "retire-delivered" in next_actions:
+            next_step_hint = (
+                f"cortex work retire-delivered {run.work_id} --repo {run.repo} "
+                f"--expected-run-id {run.run_id} --actor <operator> "
+                "--reason '<single-line reason>'"
+            )
+        else:
+            next_step_hint = "目前沒有符合正式入口前置條件的 recovery action。"
+    elif work_authority_state == "available_last_known_good":
+        # #1093 對抗審查第四輪 MAJOR1：authority 只在 canonical GitHub
+        # provider 限流、靠 last-known-good 豁免下才讀得到——
+        # execute_work_action 對非 `_LOCAL_UNBLOCK_ACTIONS` 動作一律用嚴格
+        # （非 LKG）authority 重新驗證，同一份限流 snapshot 會 fail-closed
+        # 拒絕。上面依 job 層事實算出的 next_actions（可能含
+        # recover-pre-candidate／retry-build 等）在這裡收斂到正式入口真的
+        # 會接受的子集，不能整套曝光——單一真相見
+        # `admitted_recovery_actions_under_authority_state`。
+        from .work_actions import admitted_recovery_actions_under_authority_state
+
+        filtered_next_actions = admitted_recovery_actions_under_authority_state(
+            next_actions, work_authority_state=work_authority_state
+        )
+        if filtered_next_actions != next_actions:
+            # 被收斂掉的動作若剛好是上面 retry-build／retry-review 專屬 hint
+            # 所指的那個動作，該 hint 文字已不再對應真正可執行的動作，退回
+            # 一般 phase hint，避免 operator 依殘留文字操作撞牆。
+            next_step_hint = persisted_next_step_hint or needs_human_next_step_hint(
+                phase=getattr(run, "current_phase", None),
+                planning_failure_classification=hint_classification,
+                work_id=getattr(run, "work_id", None),
+                repo=getattr(run, "repo", None),
+                run_id=getattr(run, "run_id", None),
+            )
+            if not filtered_next_actions:
+                next_step_hint = "目前沒有符合正式入口前置條件的 recovery action。"
+        next_actions = filtered_next_actions
     try:
         candidate_git_base = candidate_base.candidate_git_base_for_run(
             run, registry, probe=candidate_base_probe
