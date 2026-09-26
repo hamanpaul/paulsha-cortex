@@ -103,6 +103,7 @@ WORKFLOW_LANE_GATE_REASON = "workflow-lane-job"
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
 SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"})
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
+WORKFLOW_INPUT_ENVELOPE_MAX_BYTES = 131072
 _PLANNING_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
@@ -6424,6 +6425,8 @@ def _workflow_input_snapshot(
 
     rows: list[dict[str, str]] = []
     total_bytes = 0
+    counted_digests: set[str] = set()
+    ref_sizes: dict[str, int] = {}
     for pattern in patterns:
         matches = _safe_input_matches(root, pattern)
         if not matches:
@@ -6463,9 +6466,19 @@ def _workflow_input_snapshot(
                 content = data.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError("workflow input must be UTF-8") from exc
-            total_bytes += len(data)
-            if total_bytes > 131072:
-                raise ValueError("workflow input envelope exceeds bound")
+            ref_sizes[ref] = len(data)
+            if digest not in counted_digests:
+                counted_digests.add(digest)
+                total_bytes += len(data)
+            if total_bytes > WORKFLOW_INPUT_ENVELOPE_MAX_BYTES:
+                sizes = ", ".join(
+                    f"{input_ref}={size} bytes" for input_ref, size in ref_sizes.items()
+                )
+                raise ValueError(
+                    "workflow input envelope exceeds bound "
+                    f"(total={total_bytes} bytes; limit={WORKFLOW_INPUT_ENVELOPE_MAX_BYTES} bytes; "
+                    f"refs=[{sizes}])"
+                )
             content_ref = _write_workflow_input_content(
                 coordinator_root=Path(coordinator_root),
                 run=run,
