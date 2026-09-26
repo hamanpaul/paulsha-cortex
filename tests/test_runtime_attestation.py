@@ -516,6 +516,18 @@ def test_isolated_installed_cli_reports_installed_artifact_from_outside_checkout
     )
     assert venv.returncode == 0, venv.stderr
     venv_python = prefix / "bin" / "python"
+    # Python 3.12 起 venv（含 --system-site-packages 的基底）不再內建 setuptools；
+    # 新 venv 看得到 build backend 才離線 --no-build-isolation，否則交給 pip 的
+    # build isolation 取得 backend（CI 有網路）。兩條路都是真的從 checkout 外安裝。
+    backend_probe = subprocess.run(
+        [str(venv_python), "-c", "import setuptools.build_meta"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    isolation_args = ["--no-build-isolation"] if backend_probe.returncode == 0 else []
     install = subprocess.run(
         [
             str(venv_python),
@@ -523,7 +535,7 @@ def test_isolated_installed_cli_reports_installed_artifact_from_outside_checkout
             "pip",
             "install",
             "--no-deps",
-            "--no-build-isolation",
+            *isolation_args,
             str(project_root),
         ],
         cwd=tmp_path,
