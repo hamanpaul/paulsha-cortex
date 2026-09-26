@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#895 管線外交付結案**：新增 `cortex work close-delivered`，在無 `WorkflowRun` 時由 operator 提供 actor／reason；Manager 重新驗證遠端 issue、PR、OpenSpec 與 Todo closure 後寫入 immutable CompletionRecord，供 Monitor 沿用既有 strict closure 投影。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

@@ -10,7 +10,7 @@ import subprocess
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import yaml
@@ -287,15 +287,30 @@ class WorkflowRegistryProvider:
     def scan(self) -> ProviderSnapshot:
         attempted_at = _utcnow()
         if not self.state_path.exists():
+            sources, links, completions, record_bytes, diagnostics = (
+                self._scan_close_delivered_records()
+            )
+            revision = (
+                "registry:absent"
+                if not record_bytes
+                else f"registry:absent+close-delivered:{_digest(record_bytes)}"
+            )
             return ProviderSnapshot(
                 provider_id=self.provider_id,
                 status="ok",
                 last_attempt_at=attempted_at,
                 last_success_at=attempted_at,
-                revision="registry:absent",
-                diagnostics=(),
-                sources=(),
-                observations={},
+                revision=revision,
+                diagnostics=tuple(diagnostics),
+                sources=tuple(sources),
+                observations=(
+                    {
+                        "workflow_links": links,
+                        "validated_completions": completions,
+                    }
+                    if sources or diagnostics
+                    else {}
+                ),
             )
         try:
             raw = self.state_path.read_bytes()
@@ -305,15 +320,25 @@ class WorkflowRegistryProvider:
             version = payload.get("schema_version")
             if version == 1:
                 _validate_workflow_v1_root(payload)
+                sources, links, completions, record_bytes, diagnostics = (
+                    self._scan_close_delivered_records()
+                )
                 return ProviderSnapshot(
                     provider_id=self.provider_id,
                     status="ok",
                     last_attempt_at=attempted_at,
                     last_success_at=attempted_at,
-                    revision=f"registry-sha256:{_digest((raw,))}",
-                    diagnostics=(),
-                    sources=(),
-                    observations={},
+                    revision=f"registry-sha256:{_digest((raw, *record_bytes))}",
+                    diagnostics=tuple(diagnostics),
+                    sources=tuple(sources),
+                    observations=(
+                        {
+                            "workflow_links": links,
+                            "validated_completions": completions,
+                        }
+                        if sources or diagnostics
+                        else {}
+                    ),
                 )
             if "workflows" in payload:
                 rows = _validate_canonical_coordinator_v2_root(payload)
@@ -417,6 +442,15 @@ class WorkflowRegistryProvider:
                             _add_workflow_link(links, canonical_id, work_id)
                 if completion is not None:
                     validated_completions.setdefault(work_id, []).append(completion)
+            close_sources, close_links, close_completions, close_record_bytes, close_diagnostics = (
+                self._scan_close_delivered_records()
+            )
+            sources.extend(close_sources)
+            for source_id, work_id in close_links.items():
+                _add_workflow_link(links, source_id, work_id)
+            for work_id, rows in close_completions.items():
+                validated_completions.setdefault(work_id, []).extend(rows)
+            diagnostics.extend(close_diagnostics)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
             return ProviderSnapshot(
                 provider_id=self.provider_id,
@@ -433,7 +467,7 @@ class WorkflowRegistryProvider:
             status="ok",
             last_attempt_at=attempted_at,
             last_success_at=attempted_at,
-            revision=f"registry-sha256:{_digest((raw,))}",
+            revision=f"registry-sha256:{_digest((raw, *close_record_bytes))}",
             diagnostics=tuple(diagnostics),
             sources=tuple(sources),
             observations={
@@ -444,6 +478,62 @@ class WorkflowRegistryProvider:
                 "candidate_git_bases": candidate_git_bases,
             },
         )
+
+    def _scan_close_delivered_records(self):
+        sources: list[WorkSource] = []
+        links: dict[str, str] = {}
+        completions: dict[str, list[dict[str, object]]] = {}
+        record_bytes: list[bytes] = []
+        diagnostics: list[str] = []
+        root = self.state_path.resolve().parent / "evidence" / "work-close-delivered"
+        if not root.exists():
+            return sources, links, completions, record_bytes, diagnostics
+        if root.is_symlink() or not root.is_dir():
+            return sources, links, completions, record_bytes, [
+                "close-delivered completion directory is not a real directory"
+            ]
+        try:
+            paths_in_root = sorted(root.glob("*.json"))
+        except OSError as error:
+            return sources, links, completions, record_bytes, [
+                f"close-delivered completion scan unavailable: {error}"
+            ]
+        for path in paths_in_root:
+            try:
+                payload, digest, raw = _validated_close_delivered_completion(
+                    path,
+                    state_path=self.state_path,
+                    repo=self.repo,
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+                diagnostics.append(
+                    f"close-delivered completion skipped: {path.name}: {error}"
+                )
+                continue
+            record_bytes.append(raw)
+            work_id = str(payload["work_id"])
+            source_id = f"completion_record:{self.repo}:{work_id}:{digest}"
+            sources.append(
+                WorkSource(
+                    source_id=source_id,
+                    kind="completion_record",
+                    ref=f"evidence/work-close-delivered/{path.name}",
+                    revision=f"close-delivered:{digest}",
+                    status="validated",
+                    confidence="confirmed",
+                    provider=self.provider_id,
+                )
+            )
+            _add_workflow_link(links, source_id, work_id)
+            pull = payload["pull_request"]
+            completions.setdefault(work_id, []).append(
+                {
+                    "source_revisions": dict(payload["source_revisions"]),
+                    "pr_candidate": pull["candidate"],
+                    "merge_revision": pull["merge_commit"],
+                }
+            )
+        return sources, links, completions, record_bytes, diagnostics
 
 
 
@@ -762,6 +852,189 @@ def _validated_workflow_completion(
         "merge_revision": merge_revision.lower(),
         "source_revisions": normalized_sources,
     }
+
+
+def _validated_close_delivered_completion(
+    path: Path,
+    *,
+    state_path: Path,
+    repo: str,
+) -> tuple[dict[str, object], str, bytes]:
+    """讀取一筆沒有 WorkflowRun 的 immutable operator CompletionRecord。"""
+
+    if path.is_symlink():
+        raise ValueError("completion record path must not be a symlink")
+    root = state_path.resolve().parent / "evidence" / "work-close-delivered"
+    resolved_root = root.resolve(strict=True)
+    resolved = path.resolve(strict=True)
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as error:
+        raise ValueError("completion record escapes its evidence directory") from error
+    metadata = resolved.stat()
+    if not resolved.is_file() or metadata.st_mode & 0o222:
+        raise ValueError("completion record must be a read-only regular file")
+    raw = resolved.read_bytes()
+    if len(raw) > 16384:
+        raise ValueError("completion record exceeds size limit")
+    payload = json.loads(raw)
+    required = {
+        "schema", "repo", "work_id", "actor", "reason", "authority_digest",
+        "source_revisions", "issue_states", "pull_request", "openspec",
+        "todo_revisions",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError("completion record shape invalid")
+    from paulsha_cortex.coordinator.verification import canonical_json_hash
+
+    digest = canonical_json_hash(payload)
+    match = re.fullmatch(
+        r"(?P<work_id>[a-z0-9][a-z0-9-]*)-(?P<digest>[0-9a-f]{64})\.json",
+        path.name,
+    )
+    if match is None or match.group("digest") != digest:
+        raise ValueError("completion record content hash mismatch")
+    work_id = payload.get("work_id")
+    if (
+        payload.get("schema") != "cortex-work-close-delivered/v1"
+        or payload.get("repo") != repo
+        or not isinstance(work_id, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None
+        or match.group("work_id") != work_id
+    ):
+        raise ValueError("completion record identity invalid")
+    actor = payload.get("actor")
+    reason = payload.get("reason")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+        or not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+    ):
+        raise ValueError("completion record actor/reason invalid")
+    if not isinstance(payload.get("authority_digest"), str) or re.fullmatch(
+        r"[0-9a-fA-F]{64}", payload["authority_digest"]
+    ) is None:
+        raise ValueError("completion record authority digest invalid")
+    source_revisions = payload.get("source_revisions")
+    if (
+        not isinstance(source_revisions, Mapping)
+        or not source_revisions
+        or any(
+            not isinstance(source_id, str)
+            or not source_id
+            or not isinstance(revision, str)
+            or not revision
+            for source_id, revision in source_revisions.items()
+        )
+    ):
+        raise ValueError("completion record source revisions invalid")
+
+    issue_states = payload.get("issue_states")
+    if not isinstance(issue_states, list) or not issue_states:
+        raise ValueError("completion record issue states invalid")
+    issue_refs: set[str] = set()
+    for row in issue_states:
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != {"ref", "state"}
+            or not isinstance(row.get("ref"), str)
+            or re.fullmatch(rf"{re.escape(repo)}#[1-9][0-9]*", row["ref"]) is None
+            or row.get("state") != "closed"
+            or row["ref"] in issue_refs
+        ):
+            raise ValueError("completion record issue states invalid")
+        issue_refs.add(row["ref"])
+    if any(
+        f"github_issue:{ref}" not in source_revisions for ref in issue_refs
+    ):
+        raise ValueError("completion record issue sources do not match its authority")
+
+    pull = payload.get("pull_request")
+    pull_fields = {
+        "ref", "candidate", "merge_commit", "merge_parents", "default_head",
+        "merge_is_ancestor", "merge_is_merge_commit",
+    }
+    if not isinstance(pull, Mapping) or set(pull) != pull_fields:
+        raise ValueError("completion record pull request invalid")
+    pull_ref = pull.get("ref")
+    if not isinstance(pull_ref, str) or re.fullmatch(
+        rf"{re.escape(repo)}#[1-9][0-9]*", pull_ref
+    ) is None:
+        raise ValueError("completion record pull request ref invalid")
+    if f"github_pr:{pull_ref}" not in source_revisions:
+        raise ValueError("completion record PR source does not match its authority")
+    for field in ("candidate", "merge_commit", "default_head"):
+        if not isinstance(pull.get(field), str) or re.fullmatch(
+            r"[0-9a-fA-F]{40}", pull[field]
+        ) is None:
+            raise ValueError(f"completion record {field} invalid")
+    parents = pull.get("merge_parents")
+    if (
+        not isinstance(parents, list)
+        or len(parents) < 2
+        or any(
+            not isinstance(parent, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", parent) is None
+            for parent in parents
+        )
+        or pull["candidate"].lower() not in {parent.lower() for parent in parents}
+        or pull.get("merge_is_ancestor") is not True
+        or pull.get("merge_is_merge_commit") is not True
+    ):
+        raise ValueError("completion record pull request merge proof invalid")
+
+    openspec = payload.get("openspec")
+    if (
+        not isinstance(openspec, Mapping)
+        or set(openspec) != {"refs", "active_openspec_absent", "archive_present"}
+        or not isinstance(openspec.get("refs"), list)
+        or any(
+            not isinstance(ref, str)
+            or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", ref) is None
+            for ref in openspec["refs"]
+        )
+        or len(openspec["refs"]) != len(set(openspec["refs"]))
+        or openspec.get("active_openspec_absent") is not True
+        or openspec.get("archive_present") is not True
+    ):
+        raise ValueError("completion record OpenSpec archive proof invalid")
+    if any(
+        f"openspec:{repo}:{ref}" not in source_revisions
+        for ref in openspec["refs"]
+    ):
+        raise ValueError("completion record OpenSpec sources do not match its authority")
+
+    todo_revisions = payload.get("todo_revisions")
+    if not isinstance(todo_revisions, Mapping) or not todo_revisions:
+        raise ValueError("completion record Todo revisions invalid")
+    for todo_path, revision in todo_revisions.items():
+        pure = PurePosixPath(todo_path) if isinstance(todo_path, str) else None
+        if (
+            pure is None
+            or pure.is_absolute()
+            or ".." in pure.parts
+            or pure.as_posix() != todo_path
+            or pure.suffix.lower() != ".md"
+            or not isinstance(revision, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None
+        ):
+            raise ValueError("completion record Todo revisions invalid")
+        archive_task = re.fullmatch(
+            r"openspec/changes/archive/\d{4}-\d{2}-\d{2}-(?P<change>[a-z0-9]+(?:-[a-z0-9]+)*)/tasks\.md",
+            todo_path,
+        )
+        if archive_task is not None and archive_task.group("change") in openspec["refs"]:
+            continue
+        source_id = f"todo:{repo}:{todo_path}"
+        if source_id not in source_revisions:
+            raise ValueError("completion record Todo source does not match its authority")
+
+    return payload, digest, raw
 
 
 def _frontmatter_work_item(path: Path) -> str | None:

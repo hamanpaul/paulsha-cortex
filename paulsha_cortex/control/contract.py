@@ -18,6 +18,7 @@ WORK_ACTIONS = frozenset(
         "link", "unlink", "start", "resume", "retry-build", "retry-card",
         "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
+        "close-delivered",
         "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
         "intake",
@@ -207,6 +208,25 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or not reason.isprintable()
             ):
                 raise ValueError(f"work-action {action} requires bounded reason")
+        if action == "close-delivered":
+            if "expected_run_id" in args:
+                raise ValueError("work-action close-delivered must not include expected_run_id")
+            actor = args.get("actor")
+            reason = args.get("reason")
+            if (
+                not isinstance(actor, str)
+                or actor != actor.strip()
+                or not 1 <= len(actor) <= 128
+                or not actor.isprintable()
+            ):
+                raise ValueError("work-action close-delivered requires bounded actor")
+            if (
+                not isinstance(reason, str)
+                or reason != reason.strip()
+                or not 1 <= len(reason) <= 500
+                or not reason.isprintable()
+            ):
+                raise ValueError("work-action close-delivered requires bounded reason")
         if action == "refreeze-base":
             # issue #731 (A)：明示把候選 git base 重新凍結到目前的 `origin/main`。
             # 界限刻意與 abandon／retire-delivered／reset-reclaim-budget 同一族

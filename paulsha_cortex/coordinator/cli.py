@@ -205,6 +205,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "link", "unlink", "start", "resume", "retry-build", "retry-card",
             "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
             "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
+            "close-delivered",
             "recover-superseded",
             "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
             "intake",
@@ -234,7 +235,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "retry-build／retry-card／retry-review：operator 裁決，最多 4000 字；全文落成 "
             "operator-adjudication evidence，前 2000 字注入後續 dispatch prompt。 "
-            "abandon／retire-delivered／recover-superseded／reset-reclaim-budget／refreeze-base："
+            "abandon／retire-delivered／close-delivered／recover-superseded／reset-reclaim-budget／refreeze-base："
             "單行審計理由，最多 500 字。"
         ),
     )
@@ -417,6 +418,9 @@ def main(
         )
 
     if args.cmd == "work":
+        if args.action == "close-delivered" and (args.actor is None or args.reason is None):
+            print("錯誤: close-delivered 必須提供 --actor 與 --reason。", file=sys.stderr)
+            return 2
         if args.action == "retry-build" and args.expected_run_id is not None:
             print(
                 "錯誤: retry-build 不接受 --expected-run-id；請改用 --payload 的 expected_candidate CAS。",

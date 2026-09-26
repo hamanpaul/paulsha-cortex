@@ -11,6 +11,12 @@ Monitor 對每個 repo/work item 只公開 `topic`、`todo`、`on-going`、`done
 - `on-going`：Manager 已建立 `WorkflowRun`；queued 到 ship 都維持此狀態。
 - `done`：merge commit、所有 issue closed、Todo 完成與 CompletionRecord 全部驗證成功；若 work item 有 mapped OpenSpec，另要求 default branch active OpenSpec 消失且 archive 存在，沒有 mapped OpenSpec 時則不要求 archive。
 
+### 管線外交付的結案（#895）
+
+若交付發生在 Cortex 管線外，work item 沒有任何 `WorkflowRun`，operator 可執行 `cortex work close-delivered <work-id> --repo <owner/repo> --actor <actor> --reason <reason>`。Manager 會即時重驗所有 mapped issue 已關閉、唯一 mapped PR 已以 merge commit 進入 default branch、mapped OpenSpec 已封存且不再 active，以及 mapped Todo 與 archived OpenSpec tasks 全部完成；其中任一 remote fact 不符或無法驗證都不會寫入紀錄。V1 要求至少一個 issue、唯一一張 PR、至少一個 mapped Todo，並至多一個 mapped OpenSpec change。
+
+驗證成功後，Manager 會寫入含 actor、reason、authority 與遠端 closure facts 的 immutable `cortex-work-close-delivered/v1` CompletionRecord。Monitor 只把這類固定目錄中 hash 與唯讀檔案驗證通過的紀錄納入 CompletionRecord 投影；原有 `done` reducer 與所有 closure 條件維持不變，不會建立或偽造 `WorkflowRun`。若其他 strict closure evidence 尚未成立，work item 仍不會投影為 `done`。
+
 Provider 失敗時會保留 last-good snapshot 並標 `degraded`。GitHub provider 超過 900 秒沒有成功 snapshot 時，auto claim 與 merge 都會 fail-closed。
 
 ### Workflow admission 的 executor backoff
