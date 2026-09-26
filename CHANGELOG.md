@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#555 `retry-card` per-card 重派熔斷**：每張卡最多接受三次 operator 重派；超限後維持 `needs_human`、在 `blocking_reason` 指明卡片並提供 `abandon`／符合條件時 `retry-build` 的出口，status 不再宣告該卡可 `retry-card`。
 - Wave R 整合交付：operator 合併 8 個卡在 cortex pipeline 的實作 PR，並補 review 修正（非正規化 governed path、journal lock `O_CLOEXEC`、裁決 evidence 先於 run 重置、#862 測試對齊 #966 CAS）。
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、
   逐條宣稱更正，以及切換當下才撞得到的那一個阻斷**。四分部署的
