@@ -2968,6 +2968,10 @@
   `permgen.unit_replica_properties()` 從落檔的 unit 全量導出），**未新增任何手寫的
   `--property=` 清單、未自帶 `--setenv=PATH=`**（design D13）。
 
+### Fixed
+
+- **#716 唯讀卡 sandbox 文件校正**：README 改為說明 Codex sandbox mode 依卡片契約導出；只有 `commit_policy=forbidden` 且 `declared_outputs` 為空的 build card 使用 `read-only`。
+
 ## [0.1.8] - 2026-08-12
 
 ### Fixed
