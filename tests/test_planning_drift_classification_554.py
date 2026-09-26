@@ -339,8 +339,6 @@ def test_recover_planning_is_available_for_drift(tmp_path: Path, message: str) -
     [
         "primary-artifact-invalid: artifact-symlink-rejected "
         "ref=docs/superpowers/specs/demo-spec.md symlink rejected",
-        "primary-artifact-invalid: artifact-path-escapes-root "
-        "ref=../outside.md artifact ref escapes artifact root",
         "primary-artifact-invalid: artifact-unreadable "
         "ref=docs/superpowers/specs/demo-spec.md UnicodeDecodeError",
     ],
@@ -353,6 +351,18 @@ def test_recover_planning_is_available_for_artifact_environment_failures(
     decision = _resume_decision(_needs_human_candidate(tmp_path, reason=reason))
 
     assert decision.next_actions == ("recover-planning", "abandon")
+
+
+def test_model_supplied_path_escape_stays_content(tmp_path: Path) -> None:
+    """模型回傳 `../`／絕對路徑 ref 是輸出內容錯誤，不得開出 recover-planning。"""
+
+    reason = (
+        "primary-artifact-invalid: artifact-path-escapes-root "
+        "ref=../outside.md artifact ref escapes artifact root"
+    )
+    decision = _resume_decision(_needs_human_candidate(tmp_path, reason=reason))
+
+    assert decision.next_actions == ("abandon",)
 
 
 def test_artifact_assessment_rejection_stays_content(tmp_path: Path) -> None:
