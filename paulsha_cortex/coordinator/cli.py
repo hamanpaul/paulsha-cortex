@@ -224,6 +224,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "close-delivered",
             "recover-superseded",
             "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+            "review-disposition",
             "intake",
         ],
     )

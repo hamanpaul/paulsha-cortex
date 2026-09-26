@@ -144,6 +144,24 @@ def test_submit_work_action_accepts_review_attest_through_control_contract(monke
     assert payload["args"]["action"] == "review-attest"
 
 
+def test_submit_work_action_accepts_review_disposition_through_control_contract(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+
+    req_id = client.submit_work_action(
+        action="review-disposition",
+        repo="acme/demo",
+        work_id="demo",
+        args={"actor": "maintainer", "reason": "討論完成，finding 不阻擋合併。"},
+        requested_by="operator",
+    )
+
+    payload = contract.read_json(tmp_path / "requests" / f"{req_id}.json")
+    assert payload is not None
+    assert payload["args"]["action"] == "review-disposition"
+    assert payload["args"]["actor"] == "maintainer"
+    assert payload["args"]["reason"] == "討論完成，finding 不阻擋合併。"
+
+
 def test_read_status_degrades_on_missing_or_stale_file(monkeypatch, tmp_path):
     from paulsha_cortex.control import client
 

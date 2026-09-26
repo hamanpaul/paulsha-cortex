@@ -649,6 +649,7 @@
 - **#808 Manager-only OpenSpec 任務不再卡住 archive**：local-closeout 對明確由 Manager 執行 authoritative preflight 並採信 Candidate 的未勾項不再判為 tasks 未完成；其他未勾項仍阻擋 archive。
 - **#938 workflow input envelope 去重**：相同 SHA-256 內容只計入一次 128 KiB 上限，snapshot 仍保留各 ref；超限錯誤列出計量總 bytes、上限與各 ref 的 bytes。
 - **#877 manager／monitor 冪等啟動入口**：新增 `cortex service ensure-running`，已持有 `manager.lock` 時直接回報；systemd user units 可用時啟動既有 units 並等待 manager lock，否則以目前 Cortex interpreter 本地啟動 manager 與 monitor，固定輸出一行 JSON。
+- **#935 review disposition 續行**：新增 operator 明示裁決入口；Manager 重新驗證同 HEAD 的 PR、latest Copilot review 與 resolved threads，並保留 immutable finding/disposition 歷史，確認未漂移後才允許沿原 workflow 重跑 delivery gates。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

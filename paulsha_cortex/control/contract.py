@@ -21,6 +21,7 @@ WORK_ACTIONS = frozenset(
         "close-delivered",
         "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+        "review-disposition",
         "intake",
     }
 )
@@ -263,11 +264,10 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or not reason.isprintable()
             ):
                 raise ValueError(f"work-action {action} requires bounded reason")
-        if action == "reset-reclaim-budget":
-            # issue #519：明示重置 semantic-reclaim 世代熔斷。actor／reason 的
-            # 界限與 abandon／retire-delivered 完全一致（同樣是「一個人明示解
-            # 除一道安全機制」）；差別只在不要 expected_run_id——熔斷觸發的前
-            # 提就是沒有 active run 可供 CAS。
+        if action in {"reset-reclaim-budget", "review-disposition"}:
+            # #519 semantic-reclaim reset 與 #935 review disposition 都由操作員
+            # 明示 actor／reason；兩者不帶 expected_run_id，作用對象由 Manager
+            # 依當前 work item／exact run 解析。
             actor = args.get("actor")
             reason = args.get("reason")
             if (

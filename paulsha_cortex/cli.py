@@ -50,7 +50,7 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-card|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|close-delivered|recover-superseded|reset-reclaim-budget|refreeze-base|auto|review-attest|ship> ...
+usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-card|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|close-delivered|recover-superseded|reset-reclaim-budget|refreeze-base|auto|review-attest|review-disposition|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
@@ -76,6 +76,7 @@ work item commands:
   refreeze-base  以 exact WorkflowRun CAS 把還活著的 run 的候選 git base 重新凍結到目前的 origin/main（需 --actor／--reason，fast-forward only，落稽核 evidence；已有被採信 candidate／in-flight job／build branch 帶外來 commit 時一律拒絕）
   auto      管理 cortex:auto-on-going issue label
   review-attest  建立 exact-HEAD maintainer review evidence
+  review-disposition  裁決已 resolved 的 exact-HEAD ship finding
   ship      執行 fail-closed delivery state machine
 
 `cortex stat --combo-selections` 可彙總自動選牌／override／bypass 的來源與 task_type。

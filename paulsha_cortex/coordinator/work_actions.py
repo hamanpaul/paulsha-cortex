@@ -2229,6 +2229,402 @@ def _review_attest_action(
     return {"action": "review-attested", "head": run.candidate_head, **record}
 
 
+_REVIEW_DISPOSITION_SCHEMA = "cortex-review-disposition/v1"
+
+
+def _review_disposition_thread_snapshot(threads: object) -> list[dict[str, Any]]:
+    if not isinstance(threads, (list, tuple)):
+        raise RuntimeError("review-disposition PR review threads malformed")
+    snapshot: list[dict[str, Any]] = []
+    for thread in threads:
+        thread_id = getattr(thread, "thread_id", None)
+        resolved = getattr(thread, "resolved", None)
+        outdated = getattr(thread, "outdated", None)
+        if (
+            not isinstance(thread_id, str)
+            or not thread_id
+            or not isinstance(resolved, bool)
+            or not isinstance(outdated, bool)
+        ):
+            raise RuntimeError("review-disposition PR review threads malformed")
+        snapshot.append(
+            {"thread_id": thread_id, "resolved": resolved, "outdated": outdated}
+        )
+    snapshot.sort(key=lambda item: item["thread_id"])
+    if len({item["thread_id"] for item in snapshot}) != len(snapshot):
+        raise RuntimeError("review-disposition PR review threads malformed")
+    return snapshot
+
+
+def _review_disposition_latest_copilot_review(remote: object, *, head: str):
+    reviews = [
+        review
+        for review in getattr(remote, "copilot_reviews", ())
+        if review.commit_id == head and review.author == COPILOT_REVIEWER_LOGIN
+    ]
+    if not reviews:
+        return None
+    return max(reviews, key=lambda item: (item.submitted_at_epoch, item.review_id))
+
+
+def _review_disposition_finding_hash(ship: dict[str, Any]) -> tuple[int, int, str]:
+    review_id = ship.get("review_id")
+    finding_count = ship.get("finding_count")
+    findings = ship.get("findings")
+    if (
+        not isinstance(review_id, int)
+        or isinstance(review_id, bool)
+        or review_id <= 0
+        or not isinstance(finding_count, int)
+        or isinstance(finding_count, bool)
+        or finding_count <= 0
+        or not isinstance(findings, list)
+        or not findings
+    ):
+        raise RuntimeError("review-disposition requires persisted Copilot findings")
+    digest = verification.canonical_json_hash(
+        {"review_id": review_id, "finding_count": finding_count, "findings": findings}
+    )
+    return review_id, finding_count, digest
+
+
+def _review_disposition_record(
+    body: dict[str, Any], *, state_path: Path
+) -> dict[str, str]:
+    digest = verification.canonical_json_hash(body)
+    root = state_path.resolve().parent / "evidence" / "review-disposition"
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{body['run_id']}-{body['head']}-{digest}.json"
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if target.exists() or target.is_symlink():
+        if (
+            target.is_symlink()
+            or not target.is_file()
+            or target.read_bytes() != content
+            or target.stat().st_mode & 0o222
+        ):
+            raise RuntimeError("review-disposition evidence conflict")
+    else:
+        temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, target)
+            os.chmod(target, 0o444)
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except FileExistsError:
+            if (
+                target.is_symlink()
+                or not target.is_file()
+                or target.read_bytes() != content
+                or target.stat().st_mode & 0o222
+            ):
+                raise RuntimeError("review-disposition evidence conflict")
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {"ref": str(target), "hash": digest}
+
+
+def _read_review_disposition(
+    reference: object, *, state_path: Path
+) -> tuple[dict[str, Any], dict[str, str]]:
+    if (
+        not isinstance(reference, dict)
+        or set(reference) != {"ref", "hash"}
+        or not isinstance(reference.get("ref"), str)
+        or not isinstance(reference.get("hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", reference["hash"]) is None
+    ):
+        raise RuntimeError("review-disposition reference malformed")
+    raw_path = Path(reference["ref"])
+    root = state_path.resolve().parent / "evidence" / "review-disposition"
+    if raw_path.is_symlink() or not raw_path.is_absolute():
+        raise RuntimeError("review-disposition evidence path invalid")
+    try:
+        evidence_path = raw_path.resolve(strict=True)
+        if (
+            root.is_symlink()
+            or evidence_path.parent != root.resolve(strict=True)
+            or not evidence_path.is_file()
+            or evidence_path.stat().st_mode & 0o222
+        ):
+            raise RuntimeError("review-disposition evidence is not immutable")
+        body = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("review-disposition evidence unreadable") from exc
+    required = {
+        "schema",
+        "repo",
+        "work_id",
+        "run_id",
+        "authority_digest",
+        "pr_number",
+        "head",
+        "review_id",
+        "finding_count",
+        "finding_hash",
+        "actor",
+        "requested_by",
+        "outcome",
+        "reason",
+        "thread_snapshot",
+        "thread_snapshot_hash",
+        "created_at_epoch",
+    }
+    snapshot = body.get("thread_snapshot") if isinstance(body, dict) else None
+    if (
+        not isinstance(body, dict)
+        or set(body) != required
+        or body.get("schema") != _REVIEW_DISPOSITION_SCHEMA
+        or not isinstance(snapshot, list)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"thread_id", "resolved", "outdated"}
+            or not isinstance(item.get("thread_id"), str)
+            or not item["thread_id"]
+            or item.get("resolved") is not True
+            or not isinstance(item.get("outdated"), bool)
+            for item in snapshot
+        )
+        or len({item["thread_id"] for item in snapshot}) != len(snapshot)
+        or verification.canonical_json_hash(snapshot) != body.get("thread_snapshot_hash")
+        or verification.canonical_json_hash(body) != reference["hash"]
+        or body.get("outcome") != "continue"
+        or not isinstance(body.get("finding_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["finding_hash"]) is None
+        or not isinstance(body.get("actor"), str)
+        or not isinstance(body.get("requested_by"), str)
+        or not body["requested_by"]
+        or not isinstance(body.get("reason"), str)
+        or not isinstance(body.get("created_at_epoch"), (int, float))
+        or isinstance(body.get("created_at_epoch"), bool)
+        or not math.isfinite(float(body["created_at_epoch"]))
+    ):
+        raise RuntimeError("review-disposition evidence does not authorize exact findings")
+    return body, {"ref": str(evidence_path), "hash": reference["hash"]}
+
+
+def _review_disposition_for_ship(
+    *,
+    active: dict[str, Any],
+    ship: dict[str, Any],
+    authority,
+    canonical_run,
+    binding: dict[str, Any],
+    head: str,
+    remote: object,
+    state_path: Path,
+) -> dict[str, str] | None:
+    snapshot = _review_disposition_thread_snapshot(
+        getattr(remote, "review_threads", ())
+    )
+    if any(item["resolved"] is not True for item in snapshot):
+        return None
+    latest = _review_disposition_latest_copilot_review(remote, head=head)
+    review_id, finding_count, finding_hash = _review_disposition_finding_hash(ship)
+    if (
+        latest is None
+        or latest.review_id != review_id
+        or latest.is_error
+        or latest.state.upper() not in {"COMMENTED", "APPROVED"}
+    ):
+        return None
+    references = active.get("review_dispositions", [])
+    if not isinstance(references, list):
+        raise RuntimeError("review-disposition history malformed")
+    snapshot_hash = verification.canonical_json_hash(snapshot)
+    for reference in reversed(references):
+        body, record = _read_review_disposition(reference, state_path=state_path)
+        if (
+            body.get("repo") == authority.repo
+            and body.get("work_id") == authority.work_id
+            and body.get("run_id") == canonical_run.run_id
+            and body.get("authority_digest") == work_authority_digest(authority)
+            and body.get("pr_number") == binding["pr_number"]
+            and body.get("head") == head
+            and body.get("review_id") == review_id
+            and body.get("finding_count") == finding_count
+            and body.get("finding_hash") == finding_hash
+            and body.get("thread_snapshot_hash") == snapshot_hash
+            and body.get("thread_snapshot") == snapshot
+        ):
+            return record
+    return None
+
+
+def _archive_review_finding_history(
+    *, active: dict[str, Any], ship: dict[str, Any], disposition: dict[str, str]
+) -> None:
+    history = active.get("review_finding_history", [])
+    if not isinstance(history, list):
+        raise RuntimeError("review finding history malformed")
+    if any(
+        isinstance(item, dict) and item.get("disposition_ref") == disposition["ref"]
+        for item in history
+    ):
+        return
+    review_id, finding_count, finding_hash = _review_disposition_finding_hash(ship)
+    findings = ship["findings"]
+    history.append(
+        {
+            "head": ship["head"],
+            "review_id": review_id,
+            "finding_count": finding_count,
+            "finding_hash": finding_hash,
+            "findings": copy.deepcopy(findings),
+            "disposition_ref": disposition["ref"],
+            "disposition_hash": disposition["hash"],
+        }
+    )
+    active["review_finding_history"] = history
+
+
+def _review_disposition_action(
+    *,
+    args: dict[str, Any],
+    requested_by: str,
+    authority,
+    runner: Runner,
+    now_epoch: float,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    allowed = {"action", "repo", "work_id", "actor", "reason"}
+    extras = set(args) - allowed
+    if extras:
+        raise ValueError(
+            f"review-disposition rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+        or not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+        or not isinstance(requested_by, str)
+        or not requested_by
+        or not isinstance(now_epoch, (int, float))
+        or isinstance(now_epoch, bool)
+        or not math.isfinite(float(now_epoch))
+    ):
+        raise ValueError("review-disposition payload invalid")
+    state, active, run = _load_work_run(
+        state_path=state_path,
+        workflow_registry=workflow_registry,
+        authority=authority,
+    )
+    _validate_current_run_authority(active, authority, run)
+    if any(
+        step.phase == "review" and step.gate_result == "needs_human"
+        for step in run.steps
+    ):
+        raise RuntimeError(
+            "review-disposition only applies to ship Copilot findings; "
+            "use retry-review --reason or retry-build --reason for review-gate findings"
+        )
+    ship = active.get("ship")
+    candidate = _exact_verified_candidate_head(run)
+    binding_value = active.get("delivery_binding")
+    if (
+        run.current_phase != "review"
+        or run.status not in {"ongoing", "needs_human"}
+        or not isinstance(ship, dict)
+        or ship.get("phase") != "needs-fix"
+        or candidate is None
+        or ship.get("head") != candidate
+        or not isinstance(binding_value, dict)
+    ):
+        raise RuntimeError(
+            "review-disposition requires a current exact-HEAD ship needs-fix finding"
+        )
+    binding = _ship_binding(binding_value, authority)
+    if (
+        binding != binding_value
+        or ship.get("pr_number") != binding["pr_number"]
+        or ship.get("change") != binding["change"]
+        or ship.get("todo_paths") != binding["todo_paths"]
+    ):
+        raise RuntimeError("review-disposition delivery binding mismatch")
+    review_id, finding_count, finding_hash = _review_disposition_finding_hash(ship)
+    remote = GitHubDeliveryClient(runner=runner).fetch_delivery_facts(
+        repo=authority.repo,
+        pr_number=binding["pr_number"],
+        change=binding["change"],
+    )
+    if remote.head != candidate:
+        raise RuntimeError("review-disposition PR HEAD mismatch")
+    latest = _review_disposition_latest_copilot_review(remote, head=candidate)
+    if (
+        latest is None
+        or latest.review_id != review_id
+        or latest.is_error
+        or latest.state.upper() not in {"COMMENTED", "APPROVED"}
+    ):
+        raise RuntimeError(
+            "review-disposition requires the persisted latest exact-HEAD Copilot review"
+        )
+    thread_snapshot = _review_disposition_thread_snapshot(remote.review_threads)
+    unresolved = sum(1 for item in thread_snapshot if not item["resolved"])
+    if unresolved:
+        raise RuntimeError(
+            "review-disposition requires all PR review threads resolved "
+            f"(unresolved={unresolved})"
+        )
+    body = {
+        "schema": _REVIEW_DISPOSITION_SCHEMA,
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "run_id": run.run_id,
+        "authority_digest": work_authority_digest(authority),
+        "pr_number": binding["pr_number"],
+        "head": candidate,
+        "review_id": review_id,
+        "finding_count": finding_count,
+        "finding_hash": finding_hash,
+        "actor": actor,
+        "requested_by": requested_by,
+        "outcome": "continue",
+        "reason": reason,
+        "thread_snapshot": thread_snapshot,
+        "thread_snapshot_hash": verification.canonical_json_hash(thread_snapshot),
+        "created_at_epoch": float(now_epoch),
+    }
+    record = _review_disposition_record(body, state_path=state_path)
+    references = active.get("review_dispositions", [])
+    if not isinstance(references, list):
+        raise RuntimeError("review-disposition history malformed")
+    active["review_dispositions"] = [*references, record]
+    _save_runs(state_path, state)
+    workflow_registry._manager_update_workflow_run(
+        run.run_id,
+        facets=tuple(facet for facet in run.facets if facet != "needs_human"),
+        gate_status="running",
+    )
+    return {
+        "action": "review-disposition-recorded",
+        "head": candidate,
+        **record,
+        "next_actions": ["resume"],
+        "next_step_hint": (
+            f"cortex work resume {run.work_id} --repo {authority.repo}"
+        ),
+    }
+
+
 def _ship_with_maintainer_review(
     *,
     args: dict[str, Any],
@@ -3209,6 +3605,12 @@ def _claim_action(
                 response["next_step_hint"] = (
                     f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
                 )
+            elif "review-disposition" in extra and authority is not None:
+                response["next_step_hint"] = (
+                    "確認 PR review threads 全部 resolved 後，由 operator 提交 exact-HEAD 裁決："
+                    f"cortex work review-disposition {canonical_run.work_id} --repo {authority.repo} "
+                    "--actor <operator> --reason '<理由>'"
+                )
     if decision.blocking_reason is not None:
         response["blocking_reason"] = decision.blocking_reason
     return response
@@ -3931,6 +4333,8 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
 
     if reason_code.startswith("copilot-") and "review-attest" not in actions:
         actions.append("review-attest")
+    if reason_code in {"review-disposition-required", "review-threads-unresolved"}:
+        actions.append("review-disposition")
     return tuple(actions)
 
 
@@ -7845,7 +8249,48 @@ def _ship_action(
         _save_runs(state_path, state)
         ship = active["ship"]
     if ship and ship.get("phase") == "needs-fix" and previous_head == preflight.head:
-        return {"action": "fix-required", "head": preflight.head, "fix_rounds": fix_rounds}
+        thread_snapshot = _review_disposition_thread_snapshot(remote.review_threads)
+        unresolved = sum(1 for item in thread_snapshot if not item["resolved"])
+        disposition = (
+            None
+            if unresolved
+            else _review_disposition_for_ship(
+                active=active,
+                ship=ship,
+                authority=authority,
+                canonical_run=canonical_run,
+                binding=binding,
+                head=preflight.head,
+                remote=remote,
+                state_path=state_path,
+            )
+        )
+        if disposition is None:
+            reason = (
+                "review-threads-unresolved"
+                if unresolved
+                else "review-disposition-required"
+            )
+            return {
+                "action": "fix-required",
+                "reason": reason,
+                "head": preflight.head,
+                "fix_rounds": fix_rounds,
+                "open_review_threads": unresolved,
+                "next_actions": ["review-disposition"],
+                "next_step_hint": (
+                    "先確認 PR review threads 全部 resolved，再由 operator 提交裁決："
+                    f"cortex work review-disposition {canonical_run.work_id} "
+                    f"--repo {authority.repo} --actor <operator> --reason '<理由>'；"
+                    "完成後以 cortex work resume 續行。"
+                ),
+            }
+        _archive_review_finding_history(
+            active=active,
+            ship=ship,
+            disposition=disposition,
+        )
+        _save_runs(state_path, state)
     if previous_head is not None and previous_head != preflight.head:
         fix_rounds += 1
         active["repair_rounds"] = fix_rounds
@@ -8270,6 +8715,7 @@ def execute_work_action(
         "close-delivered",
         "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+        "review-disposition",
         "intake",
     }:
         raise ValueError("unsupported work action")
@@ -8442,6 +8888,16 @@ def execute_work_action(
         )
     elif action == "review-attest":
         result = _review_attest_action(
+            args=args,
+            requested_by=requested_by,
+            authority=authority,
+            runner=runner,
+            now_epoch=now_epoch,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "review-disposition":
+        result = _review_disposition_action(
             args=args,
             requested_by=requested_by,
             authority=authority,
