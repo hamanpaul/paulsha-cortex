@@ -8,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence, runtime_checkable
@@ -1107,6 +1108,16 @@ def build_claude_argv(
     return argv
 
 
+def _codex_default_effort(model: str) -> str | None:
+    """Return the existing model-specific native Codex effort override."""
+
+    return {
+        "gpt-5.6-luna": "max",
+        "gpt-6-luna": "max",
+        "gpt-5.3-codex-spark": "xhigh",
+    }.get(model)
+
+
 def build_codex_argv(
     *,
     prompt: str,
@@ -1205,11 +1216,7 @@ def build_codex_argv(
         argv += ["--add-dir", spool_dir]
     if model is not None:
         argv += ["--model", model]
-        reasoning_effort = {
-            "gpt-5.6-luna": "max",
-            "gpt-6-luna": "max",
-            "gpt-5.3-codex-spark": "xhigh",
-        }.get(model)
+        reasoning_effort = _codex_default_effort(model)
         if reasoning_effort is not None:
             # Codex reads this as a CLI config override, so an ambient
             # ~/.codex/config.toml cannot silently choose a different effort.
@@ -1674,6 +1681,7 @@ class SubprocessLauncher:
         effort: str | None = None,
         verdict_spool_dir: str | None = None,
         effective_tools: Sequence[str] | None = None,
+        execution_profile: object | None = None,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
@@ -1752,6 +1760,23 @@ class SubprocessLauncher:
             if effective_tools is not None and not write_forbidden
             else None
         )
+        self._execution_profile_binding = None
+        if execution_profile is not None:
+            from .execution_adapters import load_profile_binding, validate_profile_for_launch
+
+            binding = (
+                execution_profile
+                if hasattr(execution_profile, "resolved_key")
+                else load_profile_binding(execution_profile)
+            )
+            validate_profile_for_launch(
+                binding,
+                executor=self._executor,
+                model=self._model,
+                effort=self._effort,
+                sandbox_mode=self._execution_profile_sandbox_mode(),
+            )
+            self._execution_profile_binding = binding
 
     @property
     def executor(self) -> str:
@@ -1773,6 +1798,39 @@ class SubprocessLauncher:
         """設定的 Claude executable 絕對路徑；None 表示沿用 PATH 解析。"""
         return self._executable
 
+    @property
+    def execution_profile_binding(self) -> dict[str, object] | None:
+        binding = self._execution_profile_binding
+        return binding.to_dict() if binding is not None else None
+
+    def _execution_profile_sandbox_mode(self) -> str:
+        if self._review_only:
+            return "review-only"
+        if self._read_only:
+            return "read-only"
+        if self._write_forbidden:
+            return "write-forbidden"
+        if self._allow_unsafe:
+            return "unsafe-opt-in"
+        return "workspace-write"
+
+    def with_execution_profile(self, binding: object) -> "SubprocessLauncher":
+        """Return this launcher bound to one exact resolved profile."""
+
+        from .execution_adapters import load_profile_binding, validate_profile_for_launch
+
+        parsed = binding if hasattr(binding, "resolved_key") else load_profile_binding(binding)
+        validate_profile_for_launch(
+            parsed,
+            executor=self._executor,
+            model=self._model,
+            effort=self._effort,
+            sandbox_mode=self._execution_profile_sandbox_mode(),
+        )
+        clone = copy(self)
+        clone._execution_profile_binding = parsed
+        return clone
+
     def as_read_only(self) -> "SubprocessLauncher":
         """Return an equivalent launcher with the executor's strict planning contract."""
 
@@ -1787,6 +1845,7 @@ class SubprocessLauncher:
             review_only=False,
             commit_required=False,
             effort=self._effort,
+            execution_profile=self._execution_profile_binding,
         )
 
     def as_review_only(self, *, terminal_kind: str) -> "SubprocessLauncher":
@@ -1804,6 +1863,7 @@ class SubprocessLauncher:
             commit_required=False,
             review_terminal_kind=terminal_kind,
             effort=self._effort,
+            execution_profile=self._execution_profile_binding,
         )
 
     def as_verdict_spool_writer(self, spool_dir: str) -> "SubprocessLauncher":
@@ -1838,6 +1898,7 @@ class SubprocessLauncher:
             write_forbidden=self._write_forbidden,
             effort=self._effort,
             verdict_spool_dir=spool_dir,
+            execution_profile=self._execution_profile_binding,
         )
 
     def as_commit_required(self) -> "SubprocessLauncher":
@@ -1863,6 +1924,7 @@ class SubprocessLauncher:
             commit_required=True,
             effort=self._effort,
             effective_tools=self._effective_tools,
+            execution_profile=self._execution_profile_binding,
         )
 
     def as_write_forbidden(self) -> "SubprocessLauncher":
@@ -1906,6 +1968,7 @@ class SubprocessLauncher:
             effort=self._effort,
             verdict_spool_dir=self._verdict_spool_dir,
             effective_tools=self._effective_tools,
+            execution_profile=self._execution_profile_binding,
         )
 
     def _should_run_gates(self, env: Mapping[str, str]) -> bool:
@@ -2106,6 +2169,16 @@ class SubprocessLauncher:
         )
 
     def launch(self, *, slice_id: str, prompt: str, worktree: str, log_dir: str) -> LaunchHandle:
+        if self._execution_profile_binding is not None:
+            from .execution_adapters import validate_profile_for_launch
+
+            validate_profile_for_launch(
+                self._execution_profile_binding,
+                executor=self._executor,
+                model=self._model,
+                effort=self._effort,
+                sandbox_mode=self._execution_profile_sandbox_mode(),
+            )
         # 在建立 job 檔案前重新驗證；設定路徑失效時立即失敗，不回退至 PATH。
         resolved_executable = resolve_claude_executable(self._executable)
         # Phase 2a 降權啟動器（#584 未決 1 裁決＝systemd-run transient unit）。
@@ -2268,9 +2341,9 @@ class SubprocessLauncher:
             builder_kwargs["last_message_path"] = last_message_path
         if self._executor == "agy":
             builder_kwargs["print_timeout"] = resolve_agy_print_timeout(os.environ)
-        inner_argv = _ARGV_BUILDERS[self._executor](
-            **builder_kwargs,
-        )
+        from .execution_adapters import adapter_for
+
+        inner_argv = adapter_for(self._executor).build_argv(builder_kwargs)
         # PSC_REPO_ROOT 讓已安裝 hook 的 `${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh`
         # 在 cwd=worktree（≠repo）時仍可解（worktree 雖是 repo checkout，但 hook 為全域安裝、
         # 不可依賴相對 cwd；互動 session 亦不應因相對路徑找不到 script 而報錯）。

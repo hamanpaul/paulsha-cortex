@@ -80,6 +80,7 @@ def _planning_argv(
     worktree: Path,
     *,
     last_message_path: str | Path,
+    execution_profile: object | None = None,
 ) -> list[str]:
     """一次 planning 呼叫的 executor argv。
 
@@ -91,6 +92,20 @@ def _planning_argv(
     :func:`planning_last_message_path` 交出答案。
     """
 
+    from .execution_adapters import resolve_profile, validate_profile_for_launch
+
+    profile_binding = execution_profile or resolve_profile(
+        identity,
+        "planner",
+        launch_contract={"sandbox": "read-only", "tools": ()},
+    )
+    validate_profile_for_launch(
+        profile_binding,
+        executor=identity.executor,
+        model=identity.model_id,
+        effort=None,
+        sandbox_mode="read-only",
+    )
     if identity.executor == "agy":
         return build_agy_argv(
             prompt=prompt,
@@ -1113,6 +1128,7 @@ class PlanningInvocation:
     worktree: Path
     evidence_root: str | Path | None = None
     run_id: str = "ephemeral"
+    execution_profile: object | None = None
 
 
 @dataclass(frozen=True)
@@ -1223,6 +1239,7 @@ class InProcessPlanningInvoker:
                 temp_dir,
                 sandbox,
                 last_message_path=output_path,
+                execution_profile=invocation.execution_profile,
             )
             run_kwargs: dict[str, object] = {}
             if identity.executor == "claude":
@@ -1353,6 +1370,7 @@ def _invoke_json(
     timeout_seconds: int,
     evidence_root: str | Path | None = None,
     run_id: str = "ephemeral",
+    execution_profile: object | None = None,
 ) -> object:
     """呼叫端這一半：組 invocation → 交 invoker → 判 rc → 抽 JSON。
 
@@ -1365,6 +1383,13 @@ def _invoke_json(
         invoker = InProcessPlanningInvoker(runner)
     elif runner is not None:
         raise ValueError("planning invoker and runner are mutually exclusive")
+    from .execution_adapters import resolve_profile
+
+    profile_binding = execution_profile or resolve_profile(
+        identity,
+        "planner",
+        launch_contract={"sandbox": "read-only", "tools": ()},
+    )
     outcome = invoker.run(
         PlanningInvocation(
             identity=identity,
@@ -1374,6 +1399,7 @@ def _invoke_json(
             worktree=Path(worktree),
             evidence_root=evidence_root,
             run_id=run_id,
+            execution_profile=profile_binding,
         )
     )
     detail = _outcome_diagnostic(outcome)

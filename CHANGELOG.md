@@ -12,6 +12,8 @@
 - **#833 Red child 自動進件**：拆分計畫通過 review 後，Manager 以 planning transaction 冪等發布 child work item 與 Todo；Monitor snapshot 確認 WorkAuthority 後由 periodic resume 自動標準 intake。
 
 - **#567 delivery closure 本機 Git 讀取**：fetch default branch 後，以 canonical checkout 的本機 Git 驗證 merge ancestry、parents、OpenSpec tree 與 Todo blob／內容；checkout 缺失或 shallow 時 fail-closed 並提供診斷，不自動 unshallow。
+- **#835 execution profile production 接線**：沿用 schema-core 建立可信 executor adapter，將 requested／resolved／observed profile 接在正式 workflow identity 選擇後，並納入 launcher、manager、generic dispatch 與 planning runtime；以獨立 versioned sibling 持久化，保留 legacy model chain。profile key 綁定 effort、loadout、toolset、sandbox、permissions 與 toolchain；角色、pin、reviewer independence 與 Trust Root 維持 spawn 前 fail-closed。Sized dispatch 的 exact-profile qualification 僅由 host `model-identities.yaml` overlay 的 `qualification_policy.sized_dispatch: enforce` 啟用，預設不阻擋並記錄 `qualification: not-enforced`。quota 未綁可信來源時維持 unknown，PatchMUD 報告 consumer 驗證 revision／digest／profile key。
+
 - **#502 verify／review 通過後的阻斷修復入口**：exact-candidate `retry-build` 現可接受尚未進入 `needs_human` 的後續阻斷裁決；必須提供 `--reason`，以既有 immutable operator-adjudication evidence 記錄後重跑 verify／review，已完成 run 仍拒絕重開。
 
 - **#862 recovery registry receipt contract**：`JobRegistry` 現在依 OpenSpec 實作

@@ -10918,7 +10918,15 @@ def _runtime_preflight_gate(
     def _launcher_for(identity):
         key = id(identity)
         if key not in specialized:
-            specialized[key] = _specialize_workflow_launcher(launcher_factory(identity), step)
+            launcher = _specialize_workflow_launcher(launcher_factory(identity), step)
+            _, launcher = _bind_workflow_execution_profile(
+                run,
+                step,
+                identity,
+                launcher,
+                qualification_policy=getattr(identities, "qualification_policy", "disabled"),
+            )
+            specialized[key] = launcher
             if compatibility_for is not None:
                 model_resolution.validate_identity_compatibility(
                     step.persona, identity, launcher=specialized[key]
@@ -11133,7 +11141,13 @@ def _runtime_preflight_gate(
 
 
 def _record_resolved_model_chain(
-    registry, run, step, identity, identities: IdentityRegistry | None = None
+    registry,
+    run,
+    step,
+    identity,
+    identities: IdentityRegistry | None = None,
+    *,
+    execution_profile_binding=None,
 ) -> None:
     """#205 R4/D5：把本次 dispatch 實際解析到的 executor/model/domain 與來源
     寫入 run，供事後稽核。純 provenance 寫入，逐段覆蓋合併既有紀錄，不影響
@@ -11171,7 +11185,106 @@ def _record_resolved_model_chain(
         "source": source,
         "envelope_source": envelope_source,
     }
-    registry._manager_update_workflow_run(run.run_id, resolved_model_chain=resolved)
+    update = {"resolved_model_chain": resolved}
+    if getattr(run, "sizing_band", None) is not None:
+        qualification_policy = getattr(identities, "qualification_policy", "disabled")
+        qualification = dict(getattr(run, "model_qualification", None) or {})
+        qualification[step.persona] = (
+            "enforced" if qualification_policy == "enforce" else "not-enforced"
+        )
+        update["model_qualification"] = qualification
+    if execution_profile_binding is not None:
+        profile_bindings = dict(getattr(run, "execution_profile_bindings", None) or {})
+        profile_bindings[step.persona] = (
+            execution_profile_binding.to_dict()
+            if callable(getattr(execution_profile_binding, "to_dict", None))
+            else dict(execution_profile_binding)
+        )
+        update["execution_profile_bindings"] = profile_bindings
+    registry._manager_update_workflow_run(run.run_id, **update)
+
+
+def _bind_workflow_execution_profile(
+    run, step, identity, launcher, *, qualification_policy: str = "disabled"
+):
+    """Join selected identity and specialized launch policy before dispatch."""
+
+    if step.persona == "manager":
+        # Deterministic manager-owned ship cards may use model identities only
+        # as executor-environment probes; they do not launch a model profile.
+        # Other unknown roles remain rejected by resolve_profile.
+        return None, launcher
+
+    from .execution_adapters import (
+        bind_launcher_profile,
+        make_launcher_profile,
+        validate_dispatch_requirements,
+    )
+
+    builder_domains = tuple(
+        sorted(
+            {
+                item.domain
+                for item in run.steps
+                if item.phase == "build"
+                and item.gate_result == "passed"
+                and getattr(item, "commit_policy", None) != "forbidden"
+                and item.domain is not None
+            }
+        )
+    )
+    overrides = getattr(run, "model_chain_override", None)
+    explicit = overrides.get(step.persona) if isinstance(overrides, dict) else None
+    requirements: dict[str, object] = {
+        "independence": {
+            "selected_domain": getattr(identity, "independence_domain", "unknown"),
+            "builder_domains": list(builder_domains),
+        }
+    }
+    if explicit is not None:
+        requirements["pin"] = dict(explicit)
+    if getattr(run, "sizing_band", None) is not None:
+        requirements["minimum_quality"] = {"sizing_band": run.sizing_band}
+    binding = make_launcher_profile(
+        launcher,
+        identity,
+        step.persona,
+        requirements=requirements,
+    )
+    validate_dispatch_requirements(
+        binding,
+        identity=identity,
+        builder_domains=builder_domains,
+        qualification_required=(
+            getattr(run, "sizing_band", None) is not None
+            and qualification_policy == "enforce"
+        ),
+        qualification=getattr(identity, "execution_qualification", None),
+    )
+    return binding, bind_launcher_profile(launcher, binding)
+
+
+def _workflow_execution_profile_stop(registry, run, step, exc: BaseException):
+    """Persist a fail-closed profile gate before any workflow launch side effect."""
+
+    updated = registry._manager_update_workflow_run(
+        run.run_id,
+        facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+        needs_human_reason=diagnostic_reason(
+            "execution-profile-blocked",
+            f"execution profile 在 spawn 前拒絕派工：{exc}",
+            source="manager._dispatch_workflow_card:execution-profile",
+            run_id=run.run_id,
+            work_id=run.work_id,
+            card=step.card,
+        ),
+    )
+    return {
+        "run_id": updated.run_id,
+        "current_phase": updated.current_phase,
+        "reason": "execution-profile-blocked",
+        "detail": str(exc),
+    }
 
 
 _LEGACY_CARD_EXECUTION = {
@@ -12912,14 +13025,22 @@ def _dispatch_workflow_card(
     elif forced_identity is not None:
         gate = None
     else:
-        gate = _runtime_preflight_gate(
-            run,
-            step,
-            identities=identities,
-            launcher_factory=launcher_factory,
-            candidates=eligible_candidates,
-            projected_backoff_candidates=projected_backoff_candidates,
-        )
+        try:
+            gate = _runtime_preflight_gate(
+                run,
+                step,
+                identities=identities,
+                launcher_factory=launcher_factory,
+                candidates=eligible_candidates,
+                projected_backoff_candidates=projected_backoff_candidates,
+            )
+        except Exception as exc:
+            from .execution_adapters import ExecutionAdapterError
+            from .execution_profile import ExecutionProfileError
+
+            if isinstance(exc, (ExecutionAdapterError, ExecutionProfileError)):
+                return _workflow_execution_profile_stop(registry, run, step, exc)
+            raise
     if gate is not None and gate.action == "needs_human":
         updated = registry._manager_update_workflow_run(
             run.run_id,
@@ -12974,9 +13095,33 @@ def _dispatch_workflow_card(
             model_resolution.validate_identity_compatibility(
                 step.persona, identity, launcher=launcher
             )
+    profile_binding = getattr(launcher, "_execution_profile_binding", None)
+    if profile_binding is None:
+        try:
+            profile_binding, launcher = _bind_workflow_execution_profile(
+                run,
+                step,
+                identity,
+                launcher,
+                qualification_policy=getattr(identities, "qualification_policy", "disabled"),
+            )
+        except Exception as exc:
+            from .execution_adapters import ExecutionAdapterError
+            from .execution_profile import ExecutionProfileError
+
+            if isinstance(exc, (ExecutionAdapterError, ExecutionProfileError)):
+                return _workflow_execution_profile_stop(registry, run, step, exc)
+            raise
     # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
     # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
-    _record_resolved_model_chain(registry, run, step, identity, identities)
+    _record_resolved_model_chain(
+        registry,
+        run,
+        step,
+        identity,
+        identities,
+        execution_profile_binding=profile_binding,
+    )
     builder_jobs = [
         job
         for job in registry.list_jobs()

@@ -286,6 +286,7 @@ class JobPlanningInvoker:
             "/tmp",
             scratch_hint.cwd,
             last_message_path=last_message_path,
+            execution_profile=invocation.execution_profile,
         )
         completed = self._dispatch(
             argv=argv,
