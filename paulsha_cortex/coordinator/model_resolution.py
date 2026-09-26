@@ -22,6 +22,7 @@ duck-typed 讀取，缺欄位時退回最寬鬆的預設，讓既有測試替身
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -76,10 +77,25 @@ ROLE_BY_PERSONA = {
 EVAL_ROSTER_ROLES = ("planning", "build", "review")
 
 EVAL_ROSTER_FILENAME = "model-eval-roster.yaml"
-EVAL_ROSTER_SCHEMA_VERSION = 1
-SUPPORTED_EVAL_ROSTER_SCHEMAS = frozenset({1})
+EVAL_ROSTER_SCHEMA_VERSION = 2
+SUPPORTED_EVAL_ROSTER_SCHEMAS = frozenset({1, 2})
 EVAL_VERDICTS = ("pass", "fail", "pending")
 REVIEW_STATUSES = ("approved", "rejected", "pending")
+_PATCHMUD_REPORT_ROLES = frozenset(("planner", "builder", "reviewer"))
+_PATCHMUD_ROLE_BY_EVAL_ROLE = {
+    "planning": "planner",
+    "build": "builder",
+    "review": "reviewer",
+}
+_EVAL_COHORT_FIELDS = (
+    "role",
+    "benchmark_type",
+    "profile_id",
+    "deck_digest",
+    "evaluator_revision",
+)
+_PROFILE_KEY_RE = re.compile(r"epk:v1:(?:request|resolved|observed):[0-9a-f]{64}\Z")
+_SHA256_REF_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 _EVAL_REQUIRED_KEYS = (
     "executor",
@@ -91,12 +107,34 @@ _EVAL_REQUIRED_KEYS = (
     "review_status",
 )
 _EVAL_OPTIONAL_KEYS = ("eval_ref", "reviewer", "reviewed_at", "notes")
+_EVAL_V2_REQUIRED_KEYS = (
+    "executor",
+    "model_id",
+    "role",
+    "execution_profile_key",
+    "benchmark_type",
+    "deck_digest",
+    "evaluator_revision",
+    "verdict",
+    "evaluated_at",
+    "eval_source",
+    "review_status",
+)
 
 
 def role_for_persona(persona: str) -> str:
     """persona → 評估角色；未知 persona 比照 manager 的 catch-all 視為 build。"""
 
     return ROLE_BY_PERSONA.get(persona, "build")
+
+
+def _cohort_key(value: Mapping[str, object] | None) -> tuple[str, ...] | None:
+    if not isinstance(value, Mapping):
+        return None
+    fields = tuple(value.get(name) for name in _EVAL_COHORT_FIELDS)
+    if any(not isinstance(item, str) or not item.strip() for item in fields):
+        return None
+    return tuple(item.strip() for item in fields)
 
 
 # Cross-layer compatibility is deliberately expressed in terms of the
@@ -492,6 +530,11 @@ class EvalRosterEntry:
     reviewer: str | None = None
     reviewed_at: str | None = None
     notes: str | None = None
+    report_role: str | None = None
+    execution_profile_key: str | None = None
+    benchmark_type: str | None = None
+    deck_digest: str | None = None
+    evaluator_revision: str | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -500,8 +543,37 @@ class EvalRosterEntry:
     def qualified(self) -> bool:
         return self.verdict == "pass" and self.review_status == "approved"
 
-    def approves(self, role: str) -> bool:
-        return self.qualified() and role in self.roles
+    @property
+    def cohort_key(self) -> tuple[str, ...] | None:
+        if self.execution_profile_key is None:
+            return None
+        assert self.report_role is not None
+        assert self.benchmark_type is not None
+        assert self.deck_digest is not None
+        assert self.evaluator_revision is not None
+        return (
+            self.report_role,
+            self.benchmark_type,
+            self.execution_profile_key,
+            self.deck_digest,
+            self.evaluator_revision,
+        )
+
+    def approves(
+        self,
+        role: str,
+        *,
+        execution_profile_key: str | None = None,
+        cohort_identity: Mapping[str, object] | None = None,
+    ) -> bool:
+        if not self.qualified() or role not in self.roles:
+            return False
+        if self.execution_profile_key is None:
+            return True
+        return (
+            execution_profile_key == self.execution_profile_key
+            and _cohort_key(cohort_identity) == self.cohort_key
+        )
 
     def disqualified_reason(self) -> str | None:
         if self.verdict != "pass":
@@ -514,12 +586,23 @@ class EvalRosterEntry:
         payload: dict[str, object] = {
             "executor": self.executor,
             "model_id": self.model_id,
-            "roles": list(self.roles),
             "verdict": self.verdict,
             "evaluated_at": self.evaluated_at,
             "eval_source": self.eval_source,
             "review_status": self.review_status,
         }
+        if self.execution_profile_key is None:
+            payload["roles"] = list(self.roles)
+        else:
+            payload.update(
+                {
+                    "role": self.report_role,
+                    "execution_profile_key": self.execution_profile_key,
+                    "benchmark_type": self.benchmark_type,
+                    "deck_digest": self.deck_digest,
+                    "evaluator_revision": self.evaluator_revision,
+                }
+            )
         for name in _EVAL_OPTIONAL_KEYS:
             value = getattr(self, name)
             if value is not None:
@@ -541,15 +624,65 @@ class EvalRoster:
     path: str | None = None
     load_error: str | None = None
 
-    def entry_for(self, executor: str, model_id: str) -> EvalRosterEntry | None:
-        for entry in self.entries:
-            if entry.key == (executor, model_id):
-                return entry
-        return None
+    def entry_for(
+        self,
+        executor: str,
+        model_id: str,
+        *,
+        role: str | None = None,
+        execution_profile_key: str | None = None,
+        cohort_identity: Mapping[str, object] | None = None,
+    ) -> EvalRosterEntry | None:
+        if self.schema_version == 1:
+            return next(
+                (entry for entry in self.entries if entry.key == (executor, model_id)),
+                None,
+            )
+        if self.schema_version != 2 or role is None or execution_profile_key is None:
+            return None
+        report_role = _PATCHMUD_ROLE_BY_EVAL_ROLE.get(role)
+        cohort_key = _cohort_key(cohort_identity)
+        if report_role is None or cohort_key is None:
+            return None
+        if (
+            cohort_key[0] != report_role
+            or cohort_key[2] != execution_profile_key
+        ):
+            return None
+        matches = [
+            entry
+            for entry in self.entries
+            if entry.key == (executor, model_id)
+            and entry.report_role == report_role
+            and entry.execution_profile_key == execution_profile_key
+            and entry.cohort_key == cohort_key
+        ]
+        return matches[0] if len(matches) == 1 else None
 
-    def approves(self, executor: str, model_id: str, role: str) -> bool:
-        entry = self.entry_for(executor, model_id)
-        return entry is not None and entry.approves(role)
+    def approves(
+        self,
+        executor: str,
+        model_id: str,
+        role: str,
+        *,
+        execution_profile_key: str | None = None,
+        cohort_identity: Mapping[str, object] | None = None,
+    ) -> bool:
+        entry = self.entry_for(
+            executor,
+            model_id,
+            role=role,
+            execution_profile_key=execution_profile_key,
+            cohort_identity=cohort_identity,
+        )
+        return (
+            entry is not None
+            and entry.approves(
+                role,
+                execution_profile_key=execution_profile_key,
+                cohort_identity=cohort_identity,
+            )
+        )
 
     def qualified_entries(self) -> tuple[EvalRosterEntry, ...]:
         return tuple(entry for entry in self.entries if entry.qualified())
@@ -583,9 +716,12 @@ def parse_eval_roster(payload: object, *, path: str | None = None) -> EvalRoster
     rows = payload.get("entries", [])
     if not isinstance(rows, list):
         raise ValueError("model-eval-roster entries must be a list")
-    allowed = set(_EVAL_REQUIRED_KEYS) | set(_EVAL_OPTIONAL_KEYS)
+    required = (
+        _EVAL_REQUIRED_KEYS if schema_version == 1 else _EVAL_V2_REQUIRED_KEYS
+    )
+    allowed = set(required) | set(_EVAL_OPTIONAL_KEYS)
     entries: list[EvalRosterEntry] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
     for index, row in enumerate(rows):
         prefix = f"model-eval-roster[{index}]"
         if not isinstance(row, Mapping):
@@ -593,20 +729,51 @@ def parse_eval_roster(payload: object, *, path: str | None = None) -> EvalRoster
         unexpected = set(row) - allowed
         if unexpected:
             raise ValueError(f"{prefix}.{sorted(unexpected)[0]} unexpected")
-        missing = [name for name in _EVAL_REQUIRED_KEYS if name not in row]
+        missing = [name for name in required if name not in row]
         if missing:
             raise ValueError(f"{prefix}.{missing[0]} is required")
         executor = _nonempty(row.get("executor"), f"{prefix}.executor")
         model_id = _nonempty(row.get("model_id"), f"{prefix}.model_id")
-        roles_raw = row.get("roles")
-        if not isinstance(roles_raw, list) or not roles_raw:
-            raise ValueError(f"{prefix}.roles must be a non-empty string list")
-        roles = tuple(_nonempty(item, f"{prefix}.roles[]") for item in roles_raw)
-        if len(set(roles)) != len(roles):
-            raise ValueError(f"{prefix}.roles contains duplicates")
-        invalid = [role for role in roles if role not in EVAL_ROSTER_ROLES]
-        if invalid:
-            raise ValueError(f"{prefix}.roles invalid: {invalid[0]!r}")
+        report_role: str | None = None
+        execution_profile_key: str | None = None
+        benchmark_type: str | None = None
+        deck_digest: str | None = None
+        evaluator_revision: str | None = None
+        if schema_version == 1:
+            roles_raw = row.get("roles")
+            if not isinstance(roles_raw, list) or not roles_raw:
+                raise ValueError(f"{prefix}.roles must be a non-empty string list")
+            roles = tuple(_nonempty(item, f"{prefix}.roles[]") for item in roles_raw)
+            if len(set(roles)) != len(roles):
+                raise ValueError(f"{prefix}.roles contains duplicates")
+            invalid = [role for role in roles if role not in EVAL_ROSTER_ROLES]
+            if invalid:
+                raise ValueError(f"{prefix}.roles invalid: {invalid[0]!r}")
+        else:
+            report_role = _nonempty(row.get("role"), f"{prefix}.role")
+            if report_role not in _PATCHMUD_REPORT_ROLES:
+                raise ValueError(f"{prefix}.role invalid: {report_role!r}")
+            roles = tuple(
+                eval_role
+                for eval_role, patchmud_role in _PATCHMUD_ROLE_BY_EVAL_ROLE.items()
+                if patchmud_role == report_role
+            )
+            execution_profile_key = _nonempty(
+                row.get("execution_profile_key"), f"{prefix}.execution_profile_key"
+            )
+            if not _PROFILE_KEY_RE.fullmatch(execution_profile_key):
+                raise ValueError(f"{prefix}.execution_profile_key invalid")
+            benchmark_type = _nonempty(
+                row.get("benchmark_type"), f"{prefix}.benchmark_type"
+            )
+            deck_digest = _nonempty(row.get("deck_digest"), f"{prefix}.deck_digest")
+            evaluator_revision = _nonempty(
+                row.get("evaluator_revision"), f"{prefix}.evaluator_revision"
+            )
+            if not _SHA256_REF_RE.fullmatch(deck_digest):
+                raise ValueError(f"{prefix}.deck_digest invalid")
+            if not _SHA256_REF_RE.fullmatch(evaluator_revision):
+                raise ValueError(f"{prefix}.evaluator_revision invalid")
         verdict = _nonempty(row.get("verdict"), f"{prefix}.verdict")
         if verdict not in EVAL_VERDICTS:
             raise ValueError(f"{prefix}.verdict invalid: {verdict!r}")
@@ -626,9 +793,30 @@ def parse_eval_roster(payload: object, *, path: str | None = None) -> EvalRoster
             raise ValueError(
                 f"{prefix}.review_status=approved requires reviewer and reviewed_at"
             )
-        key = (executor, model_id)
+        key = (
+            (executor, model_id)
+            if schema_version == 1
+            else (
+                executor,
+                model_id,
+                *(entry_value for entry_value in (
+                    report_role or "",
+                    benchmark_type or "",
+                    execution_profile_key or "",
+                    deck_digest or "",
+                    evaluator_revision or "",
+                )),
+            )
+        )
         if key in seen:
-            raise ValueError(f"model-eval-roster duplicate entry: {executor}/{model_id}")
+            message = (
+                f"model-eval-roster duplicate entry: {executor}/{model_id}"
+                if schema_version == 1
+                else "model-eval-roster duplicate cohort qualification: "
+                f"{executor}/{model_id}/{report_role}/{execution_profile_key}/"
+                f"{benchmark_type}/{deck_digest}/{evaluator_revision}"
+            )
+            raise ValueError(message)
         seen.add(key)
         entries.append(
             EvalRosterEntry(
@@ -640,6 +828,11 @@ def parse_eval_roster(payload: object, *, path: str | None = None) -> EvalRoster
                 eval_source=eval_source,
                 review_status=review_status,
                 **optional,
+                report_role=report_role,
+                execution_profile_key=execution_profile_key,
+                benchmark_type=benchmark_type,
+                deck_digest=deck_digest,
+                evaluator_revision=evaluator_revision,
             )
         )
     return EvalRoster(
@@ -842,7 +1035,12 @@ def identity_origin(identity: object) -> str:
 
 
 def identity_layer(
-    identity: object, *, role: str, eval_roster: EvalRoster | None = None
+    identity: object,
+    *,
+    role: str,
+    eval_roster: EvalRoster | None = None,
+    execution_profile_key: str | None = None,
+    cohort_identity: Mapping[str, object] | None = None,
 ) -> str | None:
     """(identity, role) → 解析層；``None`` 代表被 operator park（不可解析）。"""
 
@@ -851,8 +1049,30 @@ def identity_layer(
     if identity_origin(identity) == IDENTITY_ORIGIN_OVERLAY:
         return RESOLUTION_LAYER_OVERLAY
     roster = eval_roster or EvalRoster()
+    profile_key = execution_profile_key
+    if profile_key is None:
+        profile_key = getattr(identity, "execution_profile_key", None)
+    provenance = getattr(identity, "profile_provenance", None)
+    observation = (
+        provenance.get("observation") if isinstance(provenance, Mapping) else None
+    )
+    if isinstance(observation, Mapping):
+        if profile_key is None:
+            candidate_key = observation.get("profile_id")
+            if isinstance(candidate_key, str):
+                profile_key = candidate_key
+        if cohort_identity is None:
+            cohort_identity = observation
+    if profile_key is None and isinstance(cohort_identity, Mapping):
+        candidate_key = cohort_identity.get("profile_id")
+        if isinstance(candidate_key, str):
+            profile_key = candidate_key
     if roster.approves(
-        getattr(identity, "executor", ""), getattr(identity, "model_id", ""), role
+        getattr(identity, "executor", ""),
+        getattr(identity, "model_id", ""),
+        role,
+        execution_profile_key=profile_key,
+        cohort_identity=cohort_identity,
     ):
         return RESOLUTION_LAYER_EVALUATED
     return RESOLUTION_LAYER_PACKAGED
@@ -885,6 +1105,8 @@ def rank_candidates(
     role: str,
     context: ResolutionContext | None = None,
     compatibility_for: Callable[[object], Mapping[str, object] | None] | None = None,
+    execution_profile_key: str | None = None,
+    cohort_identity: Mapping[str, object] | None = None,
 ) -> RankedCandidates:
     """把既有候選清單重排成三層解析鏈的順序，並套用 packaged fallback 政策。
 
@@ -901,7 +1123,13 @@ def rank_candidates(
     warnings: list[str] = []
     ranked: list[tuple[int, int, int, object]] = []
     for index, identity in enumerate(candidates):
-        layer = identity_layer(identity, role=role, eval_roster=roster)
+        layer = identity_layer(
+            identity,
+            role=role,
+            eval_roster=roster,
+            execution_profile_key=execution_profile_key,
+            cohort_identity=cohort_identity,
+        )
         if layer is None:
             excluded.append((identity, "operator overlay parked this packaged identity"))
             continue

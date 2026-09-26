@@ -1,0 +1,8 @@
+encounter_dir: tests/fixtures/mini_encounter
+frozen_sha: frozen-fixture-revision
+harness_prompt_version: legacy-v1
+model: scripted:legacy-fixture
+pricing_hash: NA
+run_id: golden-legacy-v1
+schedule_ref: NA
+schema_version: 1

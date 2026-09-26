@@ -318,6 +318,12 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    patchmud 目前僅有 anthropic adapter，roster 內只有 `claude/sonnet` 可被驅動；
    其餘身分會逐一回報 `adapter-unavailable` 並誠實維持預設封套。
 
+   PatchMUD report consumer 僅將 schema v2 完整 cohort identity
+   (`role`、`benchmark_type`、Cortex `execution_profile` key、`deck_digest`、
+   `evaluator_revision`) 對應到榜列；`model`／`loadout` 不再作為查詢鍵。Report
+   v1 按上游遷移契約只可 opaque 保留、不可排名；未知版本拒絕。詳見
+   [PatchMUD report v2 consumer](docs/patchmud-report-v2-consumer.md)。
+
    `cortex inspect models` 另顯示每列的 `layer=`，即該身分在三層解析鏈中的位置
    （`operator-overlay`／`evaluated-roster`／`packaged-fallback`／`parked`）。
 
@@ -777,24 +783,31 @@ planner／builder／reviewer 的身分解析依序走三層，**層級是排序�
 即空清單；可手工維護）：
 
 ```yaml
-schema_version: 1
+schema_version: 2
 entries:
   - executor: claude
     model_id: sonnet
-    roles: [build, review]        # planning / build / review
-    verdict: pass                 # pass / fail / pending（patchmud 評估結果）
-    evaluated_at: "2026-08-14"
-    eval_source: patchmud
-    eval_ref: patchmud-deck-v1/report-2026-08-14   # 選配：評估證據指標
-    review_status: approved       # approved / rejected / pending（人工複核）
-    reviewer: operator            # approved 時必填
-    reviewed_at: "2026-08-14"     # approved 時必填
+    role: builder
+    execution_profile_key: epk:v1:resolved:<64 lowercase hex digits>
+    benchmark_type: issue-resolution
+    deck_digest: sha256:<64 lowercase hex digits>
+    evaluator_revision: sha256:<64 lowercase hex digits>
+    verdict: pass
+    evaluated_at: "2026-09-26"
+    eval_source: patchmud-report-v2
+    eval_ref: <report fingerprint 或 evidence 參照>
+    review_status: approved
+    reviewer: operator
+    reviewed_at: "2026-09-26"
 ```
 
-只有 `verdict: pass` **且** `review_status: approved` **且**角色列於 `roles` 的
-身分才進第 2 層——「評估過」不等於「人工核可」。清單解析失敗時第 2 層視為空
-（保守方向，絕不因錯誤多授予資格），並由 `cortex doctor` 的 `model-resolution`
-probe 回報，不會中止 periodic tick。
+schema v2 每列只綁一個 report role、execution profile 與完整 cohort evidence；
+resolver 必須取得並比對五個 cohort 欄位才會將身分放入第 2 層。不同 deck 或
+evaluator revision 可各有獨立核可列，重複完整 identity 會拒收。Schema v1 的 `roles`
+清單仍可讀，沿用舊的 identity-level approval。所有版本都要求
+`verdict: pass`、`review_status: approved` 及可稽核 reviewer/date；「評估過」不等於
+「人工核可」。清單解析失敗時第 2 層視為空（保守方向，絕不因錯誤多授予資格），
+並由 `cortex doctor` 的 `model-resolution` probe 回報，不會中止 periodic tick。
 
 **overlay 的解析指令**（皆為選配，既有 overlay 檔案不改也照舊合法）：
 

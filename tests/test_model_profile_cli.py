@@ -88,18 +88,56 @@ def _report_dict(
     model: str = "anthropic:claude-sonnet-5",
     loadout: str = "P0T0R0",
 ) -> dict:
-    # 聚合鍵 model 預設用 normalize 後的完整 spec（patchmud PR #15 起 run.yaml
-    # 即如此記錄）——與 CLI 別名 `sonnet` 不同，鎖住 #466 A-1「鍵值從 report
-    # 本身取」的修法。
+    # v2 group key carries the resolved execution profile and producer revisions.
+    profile_id = "epk:v1:resolved:" + hashlib.sha256(
+        f"{model}\0{loadout}".encode("utf-8")
+    ).hexdigest()
+    cohort = {
+        "role": "builder",
+        "benchmark_type": "issue-resolution",
+        "profile_id": profile_id,
+        "deck_id": "pilot-v1",
+        "deck_digest": "sha256:" + _pin("pilot-v1-deck"),
+        "evaluator_revision": "sha256:" + _pin("evaluator-v1"),
+    }
+    runs_rows = [
+        {
+            **cohort,
+            "run_id": f"report-run-{index}",
+            "model": model,
+            "loadout": loadout,
+            "clear": 1 if index < clears else 0,
+            "end_reason": "clear" if index < clears else "defeat",
+        }
+        for index in range(runs)
+    ]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "producer": {"name": "paulsha-patchmud", "version": "0.0.1"},
+        "generated_at": "2026-09-26T00:00:00Z",
+        "report_fingerprint": "sha256:" + _pin("report"),
         "runs_included": runs,
         "runs_skipped": [],
+        "runs": runs_rows,
         "leaderboards": {
             "clear_rate": {
                 "status": "ok",
                 "rows": [
-                    {"model": model, "loadout": loadout, "runs": runs, "clears": clears}
+                    {
+                        **cohort,
+                        "cohort_id": "cohort:" + _pin(profile_id),
+                        "cohort_identity_complete": True,
+                        "coverage_expected_encounters": list(ENCOUNTERS[:8]),
+                        "coverage_observed_encounters": list(ENCOUNTERS[:runs]),
+                        "coverage_complete": runs >= 8,
+                        "ranked": True,
+                        "reason": "" if runs >= 8 else "incomplete coverage",
+                        "model": model,
+                        "loadout": loadout,
+                        "runs": runs,
+                        "clears": clears,
+                        "value": clears / runs,
+                    }
                 ],
             }
         },
@@ -112,22 +150,46 @@ def _report_json(**kwargs) -> str:
 
 
 def _report_yaml(**kwargs) -> str:
-    """YAML fallback 模板：舊版 patchmud 只落 report.yaml 的相容路徑。
-    刻意用 PyYAML 的 indentless sequence 形狀，一併鎖住 subset parser 修正。"""
+    """YAML fallback 模板；以 indentless sequence 鎖住 subset parser 支援。"""
     payload = _report_dict(**kwargs)
     row = payload["leaderboards"]["clear_rate"]["rows"][0]
+    run = payload["runs"][0]
+    run_lines = "".join(
+        f"  - {key}: {value}\n" if index == 0 else f"    {key}: {value}\n"
+        for index, (key, value) in enumerate(
+            (field, run[field])
+            for field in (
+                "role",
+                "benchmark_type",
+                "profile_id",
+                "deck_digest",
+                "evaluator_revision",
+                "deck_id",
+                "model",
+                "loadout",
+            )
+        )
+    )
     return (
+        "schema_version: 2\n"
+        "runs:\n"
+        f"{run_lines}"
         "leaderboards:\n"
         "  clear_rate:\n"
-        "    rows:\n"
-        f"    - clears: {row['clears']}\n"
-        f"      loadout: {row['loadout']}\n"
-        f"      model: {row['model']}\n"
-        f"      runs: {row['runs']}\n"
         "    status: ok\n"
-        f"runs_included: {payload['runs_included']}\n"
-        "runs_skipped: []\n"
-        "schema_version: 1\n"
+        "    rows:\n"
+        f"    - role: {row['role']}\n"
+        f"      benchmark_type: {row['benchmark_type']}\n"
+        f"      profile_id: {row['profile_id']}\n"
+        f"      deck_digest: {row['deck_digest']}\n"
+        f"      evaluator_revision: {row['evaluator_revision']}\n"
+        "      cohort_identity_complete: true\n"
+        f"      coverage_complete: {'true' if row['coverage_complete'] else 'false'}\n"
+        "      ranked: true\n"
+        f"      model: {row['model']}\n"
+        f"      loadout: {row['loadout']}\n"
+        f"      runs: {row['runs']}\n"
+        f"      clears: {row['clears']}\n"
     )
 
 
@@ -337,14 +399,31 @@ def test_incomplete_deck_sample_falls_back_to_default(fake_patchmud: SimpleNames
 def test_report_group_key_taken_from_report_not_alias(
     fake_patchmud: SimpleNamespace,
 ) -> None:
-    """#466 A-1：run.yaml 記 normalize 後的完整 spec，鍵值必須從 report 取。
-
-    fixture 模板的聚合鍵是 `anthropic:claude-sonnet-5`（≠ CLI 別名 `sonnet`）；
-    別名查表的舊實作在此必落 identity-not-in-report。"""
+    """v2 query 取 profile identity；報表 model 只留作觀測，不作榜列查詢鍵。"""
     result = mp.run_model_profile(_options(fake_patchmud), sleep=lambda _s: None)
     cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
     assert cell["status"] == "proposed"
     assert cell["observation"]["model"] == "anthropic:claude-sonnet-5"
+    assert cell["observation"]["profile_id"].startswith("epk:v1:resolved:")
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "reason"),
+    ((1, "report-schema-unsupported"), (3, "report-schema-unsupported")),
+)
+def test_legacy_and_unknown_report_versions_fail_closed(
+    fake_patchmud: SimpleNamespace, schema_version: int, reason: str
+) -> None:
+    payload = _report_dict(clears=6)
+    payload["schema_version"] = schema_version
+    (fake_patchmud.tools / "report-template.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    result = mp.run_model_profile(_options(fake_patchmud), sleep=lambda _s: None)
+    cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
+    assert cell["status"] == "failed"
+    assert cell["reason"] == reason
+    assert "opaque" in cell["detail"] if schema_version == 1 else "不支援" in cell["detail"]
 
 
 def test_yaml_only_report_falls_back_to_subset_parser(
@@ -365,12 +444,13 @@ def test_yaml_only_report_falls_back_to_subset_parser(
 def test_report_with_multiple_groups_is_explicit_failure(
     fake_patchmud: SimpleNamespace,
 ) -> None:
-    """profile 的 runs_root 為單一身分專用：report 多於一組聚合鍵＝污染，
-    fail-closed 明確報錯，不得猜一組來映射。"""
+    """profile runs_root 混入第二個完整 cohort 時拒絕猜選。"""
     payload = _report_dict(clears=6)
-    payload["leaderboards"]["clear_rate"]["rows"].append(
-        {"model": "agy:gemini-3.1-pro", "loadout": "P0T0R0", "runs": 8, "clears": 8}
+    other = _report_dict(clears=8, model="agy:gemini-3.1-pro")
+    payload["leaderboards"]["clear_rate"]["rows"].extend(
+        other["leaderboards"]["clear_rate"]["rows"]
     )
+    payload["runs"].extend(other["runs"])
     (fake_patchmud.tools / "report-template.json").write_text(
         json.dumps(payload), encoding="utf-8"
     )
@@ -393,8 +473,8 @@ def test_report_row_without_model_is_explicit_failure(
     result = mp.run_model_profile(_options(fake_patchmud, apply=True), sleep=lambda _s: None)
     cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
     assert cell["status"] == "failed"
-    assert cell["reason"] == "report-group-ambiguous"
-    assert "缺非空 model" in cell["detail"]
+    assert cell["reason"] == "mapping-rejected"
+    assert "clear_rate row model" in cell["detail"]
     assert fake_patchmud.registry.read_text(encoding="utf-8") == REGISTRY_V3
 
 
