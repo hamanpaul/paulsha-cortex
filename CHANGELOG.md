@@ -636,6 +636,7 @@
 - **#887／#962／#975 已合併 run 防重驗護欄**：authority 前進且 merge authorization 與 delivery journal 完整綁定時，保留原 run phase；舊 `authority_restart` verify-reset merged run 則 fail-closed 停止並提示 `retire-delivered`。
 
 - **#547／#968–#971 owner-bound recover-pre-candidate**：work action 只依 WorkAuthority 的 repo／Work Item 唯一解析持久 owner identity，移除 slice 名稱、spec suffix 與全表 fallback；legacy unbound、缺失、歧義或 attempt／workspace marker 不一致時，回收與 registry mutation 前即拒絕。Manager slice action 與 work action 共用 recovery core，成功後清除 builder binding、寫入 pending action、supersede handoff manifest 並驗證 read-back。
+- **#1051／#1054 Builder Todo admission**：Manager 在第一次 Builder 派工前驗證目前 WorkAuthority 只有一個 Todo 且 run claim revision 相符；Todo=0、多個 Todo 或 authority drift 都會在建立 job／worktree 前停止，ship 的 Todo=0 診斷改為發布、link、等待 Monitor 更新後 resume，不再建議 unlink。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、路徑逃逸、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用，內容驗收拒收維持
   content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

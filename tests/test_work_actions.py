@@ -2940,6 +2940,11 @@ def test_ship_resume_rearms_prebinding_target_cardinality_stop(tmp_path: Path) -
         now=lambda: 200,
     )
     assert stopped["result"]["reason"] == "multiple-delivery-targets-unsupported"
+    stopped_run = JobRegistry(state_path=state.parent / "jobs.json").list_workflow_runs()[0]
+    assert stopped_run.needs_human_reason["reason"] == "multiple-delivery-targets-unsupported"
+    assert "unlink" not in stopped_run.needs_human_reason["detail"]
+    assert "發布 canonical Todo" in stopped_run.needs_human_reason["detail"]
+    assert "等 Monitor 更新" in stopped_run.needs_human_reason["detail"]
 
     _snapshot(
         snapshot,

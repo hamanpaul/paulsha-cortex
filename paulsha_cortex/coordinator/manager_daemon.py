@@ -29,6 +29,7 @@ from .model_identities import load_model_identities
 from .registry import RETRY_CARD_PHASE_PERSONA, JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
 from .spawn_admission import DEFAULT_MIN_INTERVAL_SECONDS, SpawnAdmissionLimiter, build_default_limiter
+from .claim import load_work_authority, work_authority_digest
 from .work_actions import safe_exception_summary
 
 DEFAULT_TICK_INTERVAL = 300.0
@@ -251,6 +252,25 @@ def _repo_from_manifest(payload: dict[str, Any]) -> str | None:
         payload.get("workflow_repo"),
         authority_repo,
     )
+
+
+def _builder_todo_admission_for_run(run) -> manager.BuilderTodoAdmission | None:
+    """在 Builder 派工前由 daemon 載入目前受監控 authority。"""
+    if (
+        getattr(run, "current_phase", None) != "build"
+        or not str(getattr(run, "claim_key", "")).startswith("claim:v1:")
+    ):
+        return None
+    try:
+        authority = load_work_authority(repo=run.repo, work_id=run.work_id)
+        if authority.repo != run.repo or authority.work_id != run.work_id:
+            raise ValueError("WorkAuthority identity mismatch")
+        return manager.BuilderTodoAdmission(
+            authority_revision=work_authority_digest(authority),
+            mapped_todo_paths=authority.mapped_todo_paths,
+        )
+    except (OSError, ValueError):
+        return manager.BuilderTodoAdmission(error="current-work-authority-unavailable")
 
 
 # #370: the exponential curve itself now lives in `backoff.py` (pure, no
@@ -709,6 +729,7 @@ def build_request_executor(
                     coordinator_root=coordinator_root,
                     ship_validator=active_ship_validator,
                     operator_resume=True,
+                    builder_todo_admission_loader=_builder_todo_admission_for_run,
                 )
             result = manager.apply_workflow_action(
                 registry,
@@ -747,6 +768,7 @@ def build_request_executor(
                         identities=identities,
                         launcher_factory=launcher_factory,
                         coordinator_root=coordinator_root,
+                        builder_todo_admission=_builder_todo_admission_for_run(run),
                     )
                     # #830：producer 對 Red sizing／preflight refusal 等情況合法回傳
                     # 非 Job 決策（`{run_id, current_phase, reason}`），舊實作只驗
@@ -837,6 +859,7 @@ def build_request_executor(
                             coordinator_root=coordinator_root,
                             ship_validator=active_ship_validator,
                             operator_resume=True,
+                            builder_todo_admission_loader=_builder_todo_admission_for_run,
                         )
                         result["result"].update(resumed)
                         result["result"]["run"] = registry.get_workflow_run(
@@ -851,6 +874,7 @@ def build_request_executor(
                                 launcher_factory=launcher_factory,
                                 coordinator_root=coordinator_root,
                                 force_new_card=forced_card_retry,
+                                builder_todo_admission=_builder_todo_admission_for_run(run),
                             )
                             # #830：同 start 路徑的分類契約（見上方 workflow-action
                             # start）。forced retry 的成功後置條件是「新 replacement

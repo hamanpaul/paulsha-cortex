@@ -15,7 +15,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -11020,6 +11020,88 @@ def _evaluate_yellow_plan_review(
         return None
 
 
+@dataclass(frozen=True)
+class BuilderTodoAdmission:
+    """目前受監控 WorkAuthority 的 Builder Todo admission 輸入。"""
+
+    authority_revision: str | None = None
+    mapped_todo_paths: tuple[str, ...] | None = None
+    error: str | None = None
+
+
+def _builder_todo_admission_stop(
+    *,
+    registry,
+    run,
+    step,
+    admission: BuilderTodoAdmission | None,
+) -> dict[str, object] | None:
+    """在 Builder 派工入口、建立 job/worktree 前驗證目前 Todo authority。"""
+    if admission is None or step.phase != "build" or step.persona != "builder":
+        return None
+
+    authority_revision = getattr(admission, "authority_revision", None)
+    todo_paths = getattr(admission, "mapped_todo_paths", None)
+    admission_error = getattr(admission, "error", None)
+    if (
+        admission_error is not None
+        or not isinstance(authority_revision, str)
+        or not isinstance(todo_paths, tuple)
+        or any(not isinstance(path, str) or not path for path in todo_paths)
+    ):
+        reason = "builder-todo-authority-unavailable"
+        detail = (
+            "Manager 目前無法讀取唯一的 WorkAuthority，暫停 Builder 派工；"
+            "請先修復或等待 Monitor snapshot 更新，再依正式流程 resume。"
+        )
+        next_step_hint = "確認 Monitor snapshot 可讀且 WorkAuthority 唯一，再依正式流程 resume。"
+    elif authority_revision != run.source_revision:
+        reason = "builder-todo-authority-changed"
+        detail = (
+            "目前 WorkAuthority 已更新，但 WorkflowRun claim 與目前 authority 不一致；"
+            "拒絕以舊 claim 派出 Builder，請依既有正式重啟流程重新綁定目前 authority。"
+        )
+        next_step_hint = "依既有正式重啟流程重新綁定目前 WorkAuthority 後，再派出 Builder。"
+    elif not todo_paths:
+        reason = "builder-todo-missing"
+        detail = (
+            "目前 WorkAuthority 沒有 canonical workstream Todo（Todo=0），尚未建立 Builder job。"
+            "請先發布 canonical Todo、link path，等 Monitor 更新後再 resume。"
+        )
+        next_step_hint = "發布 canonical Todo → link path → 等 Monitor 更新 → resume。"
+    elif len(todo_paths) > 1:
+        reason = "builder-todo-ambiguous"
+        detail = (
+            "目前 WorkAuthority 映射了多個 canonical workstream Todo（Todo="
+            f"{len(todo_paths)}：{', '.join(todo_paths)}）。請用 `cortex work unlink`"
+            "移除多餘 mapping，等待 Monitor 更新後再 resume。"
+        )
+        next_step_hint = "保留唯一 canonical Todo；unlink 其他 mapping，等 Monitor 更新後 resume。"
+    else:
+        return None
+
+    current = registry.get_workflow_run(run.run_id)
+    updated = registry._manager_update_workflow_run(
+        run.run_id,
+        facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+        gate_status="running",
+        needs_human_reason=diagnostic_reason(
+            reason,
+            detail,
+            source="manager._dispatch_workflow_card:builder-todo-admission",
+            next_step_hint=next_step_hint,
+            run_id=run.run_id,
+            work_id=run.work_id,
+            card=step.card,
+        ),
+    )
+    return {
+        "run_id": updated.run_id,
+        "current_phase": updated.current_phase,
+        "reason": reason,
+    }
+
+
 def _dispatch_workflow_card(
     dispatcher,
     *,
@@ -11032,6 +11114,7 @@ def _dispatch_workflow_card(
     force_new_card: bool = False,
     forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    builder_todo_admission: BuilderTodoAdmission | None = None,
 ) -> dict[str, object] | None:
     """#381：workflow lane 的實際 spawn 點。spawn_admission 未注入時解析為
     零間隔 no-op（見 spawn_admission.resolve_limiter）——只有 resume_workflow_run
@@ -11052,6 +11135,14 @@ def _dispatch_workflow_card(
         return None
     if force_new_card and RETRY_CARD_PHASE_PERSONA.get(step.phase) != step.persona:
         raise ValueError("forced workflow retry requires builder or reviewer card")
+    admission_stop = _builder_todo_admission_stop(
+        registry=registry,
+        run=run,
+        step=step,
+        admission=builder_todo_admission,
+    )
+    if admission_stop is not None:
+        return admission_stop
     matching = [
         job
         for job in registry.list_jobs()
@@ -11817,6 +11908,7 @@ def dispatch_workflow_card(
     force_new_card: bool = False,
     forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    builder_todo_admission: BuilderTodoAdmission | None = None,
 ) -> dict[str, object] | None:
     """Dispatch a normal workflow card; legacy recovery is operator-resume internal only."""
 
@@ -11830,6 +11922,7 @@ def dispatch_workflow_card(
         force_new_card=force_new_card,
         forced_identity=forced_identity,
         spawn_admission=spawn_admission,
+        builder_todo_admission=builder_todo_admission,
     )
 
 
@@ -12186,6 +12279,9 @@ def resume_workflow_run(
     ship_validator: Callable[..., object] | None = None,
     operator_resume: bool = False,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    builder_todo_admission_loader: (
+        Callable[[object], BuilderTodoAdmission | None] | None
+    ) = None,
 ) -> dict[str, object]:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -12381,6 +12477,11 @@ def resume_workflow_run(
                 planning_source_revision=planning_source_revision,
             )
 
+    def builder_todo_admission_for(bound_run):
+        if builder_todo_admission_loader is None:
+            return None
+        return builder_todo_admission_loader(bound_run)
+
     def dispatch_or_stop(
         bound_run,
         *,
@@ -12388,6 +12489,7 @@ def resume_workflow_run(
         retry_recovery_job_id: str | None = None,
     ):
         try:
+            builder_todo_admission = builder_todo_admission_for(bound_run)
             if retry_recovery_job_id is not None:
                 return _dispatch_workflow_card(
                     dispatcher,
@@ -12398,6 +12500,7 @@ def resume_workflow_run(
                     retry_failed=retry,
                     operator_recovery_job_id=retry_recovery_job_id,
                     spawn_admission=spawn_admission,
+                    builder_todo_admission=builder_todo_admission,
                 )
             return dispatch_workflow_card(
                 dispatcher,
@@ -12407,6 +12510,7 @@ def resume_workflow_run(
                 coordinator_root=coordinator_root,
                 retry_failed=retry,
                 spawn_admission=spawn_admission,
+                builder_todo_admission=builder_todo_admission,
             )
         except Exception as exc:
             current = registry.get_workflow_run(bound_run.run_id)
@@ -12631,6 +12735,7 @@ def resume_workflow_run(
                         coordinator_root=coordinator_root,
                         retry_failed=True,
                         forced_identity=rerouted_target,
+                        builder_todo_admission=builder_todo_admission_for(run),
                     )
                     if replacement is None:
                         return {
@@ -12873,6 +12978,7 @@ def resume_workflow_run(
             launcher_factory=launcher_factory,
             coordinator_root=coordinator_root,
             retry_failed=True,
+            builder_todo_admission=builder_todo_admission_for(run),
         )
         if replacement is None:
             return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}

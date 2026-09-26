@@ -88,6 +88,10 @@ work_items:
 
 `unlink` 會留下 exclusion，避免 inferred grouping 下次重新合併。單一 source 若被兩個 confirmed work item claim，整個 provider 會 degraded，Manager 不得派工。
 
+### Builder 派工前 Todo admission
+
+Manager 第一次派出 Builder 前會重新載入目前 WorkAuthority，要求 WorkAuthority-backed run 的 `mapped_todo_paths` 恰有一個 canonical workstream Todo，且 authority revision 必須與 `WorkflowRun.source_revision` 相同。Todo=0 時以 `builder-todo-missing` 停在 `needs_human`，提示發布 canonical Todo、link path、等待 Monitor 更新後再 resume；多個 Todo 才提示 unlink 多餘 mapping。若目前 authority 已變更，舊 run 不會繼續派工，需依既有正式重啟流程重新綁定。此 gate 在建立 Builder job、worktree 或 launcher 前執行，只攔 Builder；plan、verify、review 不受影響。Ship 的 Todo cardinality 檢查仍保留作 backstop，Todo=0 時也改提示補建與 link，避免錯誤建議 unlink。
+
 ## CLI
 
 ```bash

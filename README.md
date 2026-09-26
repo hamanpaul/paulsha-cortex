@@ -520,6 +520,8 @@ Manager periodic tick 會從 durable Monitor snapshot 執行 auto-claim scan；�
 
 `ship` 的 `pr_number`、`change`、`todo_paths` 必須與 current WorkAuthority 的 confirmed refs 完全相同，第一次 ship 後即成為 immutable delivery binding。V1 每個 run 只支援唯一一張 PR、零或一個 OpenSpec change，以及唯一一個 Todo path；PR/Todo 不是各一個，或 OpenSpec confirmed target 多於一個時，都會轉為 `needs_human: multiple-delivery-targets-unsupported`，不會以其中一個 target 寫 CompletionRecord 或投影 done。Manager 會用 authenticated `gh api` 更新既有 mapped PR 的 zh-TW conventional title、body 與 labels，再逐欄 reread；body 必須用 closing keyword涵蓋全部 mapped issues。Checks、statuses與reviews的REST pagination使用`--paginate --jq '.'`輸出一頁一行的compact JSON stream，不依賴`gh api --slurp`；任一頁無法解碼仍fail-closed。`repo_root` 必須恰好等於 canonical `git rev-parse --show-toplevel` realpath，且 `origin` 對應同一 `owner/name`。
 
+第一次派出 Builder 前，Manager 會重新載入 WorkAuthority-backed run 的目前 authority，要求恰有一個 canonical workstream Todo，且 authority revision 與 `WorkflowRun.source_revision` 相符。Todo=0 時會停在 `needs_human`，提示發布 canonical Todo、link path、等 Monitor 更新後再 resume；只有多個 Todo mapping 才建議 unlink。authority 已變更時，舊 run 不會繼續派 Builder，須依既有正式重啟流程重新綁定。此 admission 發生在 Builder job、worktree 與 launcher 建立前，且不攔 plan、verify 或 review；ship cardinality gate 繼續作為 backstop。
+
 Merge authorization 只雜湊 stable preflight 結果（argv、return code、HEAD、tree 與 gate outcome）及 immutable evidence hashes，不納入 stdout、stderr 或 duration。若 Manager 在 `merge-authorized` 後 crash，restart 會先以唯讀 authorization record 與 authenticated merge status reconcile；已合併時不重寫 PR metadata，也不重跑可能漂移的 preflight output。
 
 ### 5. 由 Manager 完成交付
