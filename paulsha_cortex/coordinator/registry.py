@@ -26,6 +26,8 @@ from .usage_extractors import extract_usage
 from .workflow import (
     GateEvidenceRef,
     PlanningArtifactAuthority,
+    PlanReviewReceipt,
+    WorkflowPlanningDriftStop,
     WorkflowRun,
     WorkflowStep,
     validate_workflow_phase_transition,
@@ -105,6 +107,7 @@ VALID_SLICE_STATES = frozenset(
         "completed",
         "needs_human",
         "failed",
+        "superseded",
     }
 )
 VALID_GATE_STATES = frozenset({"pending", "passed", "failed", "needs_human"})
@@ -124,7 +127,7 @@ SLICE_STATE_TRANSITIONS = {
     "reviewing": frozenset({"reviewing", "needs_human", "verified", "failed"}),
     "verified": frozenset({"verified", "completed", "needs_human"}),
     "completed": frozenset({"completed"}),
-    "needs_human": frozenset({"needs_human", "pending", "building", "reviewing", "verified", "failed", "completed"}),
+    "needs_human": frozenset({"needs_human", "pending", "building", "reviewing", "verified", "failed", "completed", "superseded"}),
     # "building" 併入 failed 的合法離開路徑（#382）：repin_slice() 刻意保留
     # slice state（同 needs_human 的既有行為，見
     # test_repin_slice_preserves_needs_human_until_explicit_retry_transition），
@@ -133,7 +136,8 @@ SLICE_STATE_TRANSITIONS = {
     # repin 前的原值直接轉成 "building"。needs_human 早就允許這條直接跳轉，
     # failed 原本沒有，導致 repin 成功後下一步 _mark_slice_building 仍會
     # raise，retry-build 整條路徑還是走不完。
-    "failed": frozenset({"failed", "pending", "needs_human", "building"}),
+    "failed": frozenset({"failed", "pending", "needs_human", "building", "superseded"}),
+    "superseded": frozenset({"superseded"}),
 }
 GATE_STATE_TRANSITIONS = {
     "pending": frozenset({"pending", "passed", "failed", "needs_human"}),
@@ -437,6 +441,29 @@ def _require_non_empty_string(
     except UnicodeEncodeError as exc:
         raise _contract_error("malformed-recovery-context", state_path=state_path, detail=label) from exc
     return value
+
+
+def _normalize_owner_identity(
+    value: Mapping[str, str] | None,
+    *,
+    state_path: Path,
+) -> dict[str, str] | None:
+    """驗證持久 repo／Work Item／slice 身分，不推測或回填 legacy row。"""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"repo", "work_id", "slice_id"}:
+        raise _contract_error("malformed-owner-identity", state_path=state_path)
+    repo = _require_non_empty_string(value.get("repo"), label="owner_identity.repo", state_path=state_path)
+    work_id = _require_non_empty_string(value.get("work_id"), label="owner_identity.work_id", state_path=state_path)
+    slice_id = _require_non_empty_string(value.get("slice_id"), label="owner_identity.slice_id", state_path=state_path)
+    repo_parts = repo.split("/")
+    if len(repo_parts) != 2 or any(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", part) is None for part in repo_parts
+    ):
+        raise _contract_error("malformed-owner-identity", state_path=state_path, detail="repo")
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
+        raise _contract_error("malformed-owner-identity", state_path=state_path, detail="work_id")
+    return {"repo": repo, "work_id": work_id, "slice_id": slice_id}
 
 
 def _require_exact_dict_keys(
@@ -3460,6 +3487,8 @@ class JobRegistry:
         workflow_run_id: str | None = None,
         workflow_claim_key: str | None = None,
         workflow_repo: str | None = None,
+        owner_identity: Mapping[str, str] | None = None,
+        attempt_id: str | None = None,
         workflow_card: str | None = None,
         workflow_phase: str | None = None,
         workflow_repo_root: str | None = None,
@@ -3490,6 +3519,11 @@ class JobRegistry:
             raise ValueError(f"slice 已有 active builder，不可重複派工: {task}")
         if kind not in {"build", "review"}:
             raise ValueError(f"非法 kind: {kind!r}")
+        normalized_owner = _normalize_owner_identity(owner_identity, state_path=self._state_path)
+        if normalized_owner is not None and normalized_owner["slice_id"] != task:
+            raise ValueError("owner_identity.slice_id 必須符合 job task")
+        if attempt_id is not None and (not isinstance(attempt_id, str) or not attempt_id.strip()):
+            raise ValueError("attempt_id 必須為非空字串")
         self._validate_existing_job_ref("workflow_builder_job_id", workflow_builder_job_id)
         if job_id is None:
             allocated = self._allocate_job_id(task)
@@ -3535,6 +3569,8 @@ class JobRegistry:
             "workflow_run_id": workflow_run_id,
             "workflow_claim_key": workflow_claim_key,
             "workflow_repo": workflow_repo,
+            "owner_identity": normalized_owner,
+            "attempt_id": attempt_id,
             "workflow_card": workflow_card,
             "workflow_phase": workflow_phase,
             "workflow_repo_root": workflow_repo_root,
@@ -3849,14 +3885,23 @@ class JobRegistry:
         builder_job_id: str | None = None,
         reviewer_job_id: str | None = None,
         candidate: str | None = None,
+        owner_identity: Mapping[str, str] | None = None,
+        attempt_id: str | None = None,
     ) -> dict[str, Any]:
         if any(row["slice_id"] == slice_id for row in self._slices):
             raise ValueError(f"slice 已存在: {slice_id}")
         self._validate_existing_job_ref("builder_job_id", builder_job_id)
         self._validate_existing_job_ref("reviewer_job_id", reviewer_job_id)
+        normalized_owner = _normalize_owner_identity(owner_identity, state_path=self._state_path)
+        if normalized_owner is not None and normalized_owner["slice_id"] != slice_id:
+            raise ValueError("owner_identity.slice_id 必須符合 slice_id")
+        if attempt_id is not None and (not isinstance(attempt_id, str) or not attempt_id.strip()):
+            raise ValueError("attempt_id 必須為非空字串")
         now = _now_iso()
         slice_row = {
             "slice_id": slice_id,
+            "owner_identity": normalized_owner,
+            "attempt_id": attempt_id,
             "spec": {"path": spec_path, "hash": spec_hash},
             "plan": {"path": plan_path, "hash": plan_hash},
             "target_branch": target_branch,
@@ -3900,8 +3945,24 @@ class JobRegistry:
         verification_hash: str,
         verification: dict[str, Any] | None,
         dispatch_base: str | None,
+        owner_identity: Mapping[str, str] | None = None,
+        attempt_id: str | None = None,
+        replace_owner_identity: bool = False,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+        normalized_owner = _normalize_owner_identity(owner_identity, state_path=self._state_path)
+        if replace_owner_identity and normalized_owner is not None and normalized_owner["slice_id"] != slice_id:
+            raise ValueError("owner_identity.slice_id 必須符合 slice_id")
+        if replace_owner_identity:
+            previous_owner = _normalize_owner_identity(
+                slice_row.get("owner_identity"), state_path=self._state_path
+            )
+            if previous_owner != normalized_owner:
+                if previous_owner is None:
+                    raise ValueError("cannot migrate legacy owner identity")
+                raise ValueError("cannot replace an established owner identity")
+        if attempt_id is not None and (not isinstance(attempt_id, str) or not attempt_id.strip()):
+            raise ValueError("attempt_id 必須為非空字串")
         previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
         staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
         if previous_binding is not None:
@@ -3932,6 +3993,10 @@ class JobRegistry:
             "contract": dict(verification) if isinstance(verification, dict) else None,
         }
         slice_row["dispatch_base"] = dispatch_base
+        if replace_owner_identity:
+            slice_row["owner_identity"] = normalized_owner
+        if attempt_id is not None:
+            slice_row["attempt_id"] = attempt_id
         slice_row["builder_job_id"] = None
         slice_row["reviewer_job_id"] = None
         slice_row["candidate"] = None
@@ -3947,6 +4012,17 @@ class JobRegistry:
     def list_slices(self) -> list[dict[str, Any]]:
         self._reload_if_changed()
         return [self._copy_slice(slice_row) for slice_row in self._slices]
+
+    def list_slices_by_owner(self, *, repo: str, work_id: str) -> list[dict[str, Any]]:
+        """依明示、持久的 repo／Work Item 身分列出 slice；不推測或回填舊 row。"""
+        self._reload_if_changed()
+        return [
+            self._copy_slice(row)
+            for row in self._slices
+            if isinstance(row.get("owner_identity"), dict)
+            and row["owner_identity"].get("repo") == repo
+            and row["owner_identity"].get("work_id") == work_id
+        ]
 
     def get_slice(self, slice_id: str) -> dict[str, Any]:
         self._reload_if_changed()
@@ -4365,11 +4441,41 @@ class JobRegistry:
         evidence_refs: list[str] | None = None,
         evaluation_refs: list[str] | None = None,
         candidate: str | None = None,
+        clear_builder_binding: bool = False,
+        clear_candidate: bool = False,
         requested_at: str | None = None,
         consumed_at: str | None = None,
         result: str | None = None,
+        reason: str | None = None,
+        expected_binding_revision: int | None = None,
+        diagnostic_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
+        if not isinstance(clear_builder_binding, bool) or not isinstance(clear_candidate, bool):
+            raise ValueError("clear binding flags 必須為布林值")
+        normalized_diagnostic_reason = coerce_diagnostic_reason(diagnostic_reason)
+        if diagnostic_reason is not None and normalized_diagnostic_reason is None:
+            raise ValueError("diagnostic_reason 必須符合 DiagnosticReason 契約")
+        normalized_expected_binding_revision = None
+        if expected_binding_revision is not None:
+            normalized_expected_binding_revision = _require_safe_integer(
+                expected_binding_revision,
+                label="record_action.expected_binding_revision",
+                state_path=self._state_path,
+            )
+            if slice_row.get("binding_revision") != normalized_expected_binding_revision:
+                raise ValueError(
+                    "record_action expected_binding_revision mismatch: "
+                    f"expected={normalized_expected_binding_revision}, "
+                    f"actual={slice_row.get('binding_revision')}"
+                )
+        if reason is not None and (
+            not isinstance(reason, str)
+            or reason != reason.strip()
+            or not 1 <= len(reason) <= 500
+            or not reason.isprintable()
+        ):
+            raise ValueError("record_action reason 必須為 1–500 字可列印單行文字")
         previous_binding = _slice_binding_from_row(slice_row) if self._slice_is_versioned(slice_row) else None
         staged_binding_backfills: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
@@ -4411,6 +4517,8 @@ class JobRegistry:
                 (state is not None and state != slice_row["state"])
                 or (gate_state is not None and gate_state != slice_row["gate_state"])
                 or (candidate is not None and candidate != slice_row["candidate"])
+                or (clear_builder_binding and slice_row["builder_job_id"] is not None)
+                or (clear_candidate and slice_row["candidate"] is not None)
             )
             if will_bump_binding:
                 self._next_binding_revision(int(slice_row["binding_revision"]))
@@ -4439,6 +4547,10 @@ class JobRegistry:
             )
         if candidate is not None:
             slice_row["candidate"] = candidate
+        if clear_builder_binding:
+            slice_row["builder_job_id"] = None
+        if clear_candidate:
+            slice_row["candidate"] = None
         self._maybe_bump_binding_revision(slice_row, previous_binding=previous_binding)
         action_entry: dict[str, Any] = {
             "action": action,
@@ -4453,6 +4565,12 @@ class JobRegistry:
             action_entry["consumed_at"] = consumed_at
         if result is not None:
             action_entry["result"] = result
+        if reason is not None:
+            action_entry["reason"] = reason
+        if normalized_expected_binding_revision is not None:
+            action_entry["expected_binding_revision"] = normalized_expected_binding_revision
+        if normalized_diagnostic_reason is not None:
+            action_entry["diagnostic_reason"] = normalized_diagnostic_reason.to_dict()
         slice_row["actions"].append(action_entry)
         slice_row["updated_at"] = _now_iso()
         self._persist()
@@ -4758,6 +4876,17 @@ class JobRegistry:
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
+        if current.plan_review_receipt is not None and (
+            (
+                planning_authority is not None
+                and tuple(planning_authority) != current.plan_review_receipt.artifacts
+            )
+            or (
+                planning_source_revision is not None
+                and planning_source_revision != current.plan_review_receipt.source_revision
+            )
+        ):
+            raise ValueError("accepted plan review baseline requires restricted transition")
         next_phase = current.current_phase if current_phase is None else current_phase
         validate_workflow_phase_transition(current.current_phase, next_phase)
         next_facets = current.facets if facets is None else tuple(facets)
@@ -4846,6 +4975,8 @@ class JobRegistry:
                 if plan_review_passed is None
                 else plan_review_passed
             ),
+            plan_review_receipt=current.plan_review_receipt,
+            planning_drift_stop=current.planning_drift_stop,
             model_chain_override=(
                 current.model_chain_override
                 if model_chain_override is None
@@ -4863,6 +4994,182 @@ class JobRegistry:
                 current.frozen_readiness if frozen_readiness is None else frozen_readiness
             ),
             needs_human_reason=resolved_needs_human_reason,
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_accept_plan_review(
+        self,
+        run_id: str,
+        *,
+        expected_updated_at: str,
+        expected_phase: str,
+        expected_status: str,
+        expected_candidate: str | None,
+        expected_source_revision: str,
+        current_phase: str,
+        steps: tuple[WorkflowStep, ...],
+        attempts: dict[str, int],
+        planning_authority: tuple[PlanningArtifactAuthority, ...],
+        receipt: PlanReviewReceipt,
+    ) -> WorkflowRun:
+        """以 CAS 原子提交 ready plan review、receipt 與下一階段。"""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if (
+            current.updated_at != expected_updated_at
+            or current.current_phase != expected_phase
+            or current.status != expected_status
+            or current.candidate_head != expected_candidate
+            or current.source_revision != expected_source_revision
+            or current.plan_review_passed
+            or current.plan_review_receipt is not None
+            or current.status != "ongoing"
+            or current.current_phase != "plan"
+            or receipt.run_id != current.run_id
+            or receipt.work_id != current.work_id
+            or receipt.repo != current.repo
+            or receipt.claim_key != current.claim_key
+            or receipt.source_revision
+            != (current.planning_source_revision or current.source_revision)
+            or tuple(planning_authority) != receipt.artifacts
+        ):
+            raise ValueError("plan review baseline compare-and-set failed")
+        validate_workflow_phase_transition(current.current_phase, current_phase)
+        updated = replace(
+            current,
+            current_phase=current_phase,
+            steps=tuple(steps),
+            attempts=dict(attempts),
+            planning_authority=tuple(planning_authority),
+            planning_source_revision=receipt.source_revision,
+            plan_review_passed=True,
+            plan_review_receipt=receipt,
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_record_planning_drift_stop(
+        self,
+        run_id: str,
+        *,
+        expected_updated_at: str,
+        expected_candidate: str,
+        stop: WorkflowPlanningDriftStop,
+        reason: DiagnosticReason,
+    ) -> WorkflowRun:
+        """在建立 reviewer job 前持久化 exact verify-drift stop。"""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if current.planning_drift_stop is not None:
+            if current.planning_drift_stop == stop:
+                return self._copy_workflow_run(current)
+            raise ValueError("workflow planning drift stop already recorded")
+        step = next(
+            (
+                item
+                for item in current.steps
+                if item.phase == "verify" and item.card == stop.card_id
+            ),
+            None,
+        )
+        if (
+            current.updated_at != expected_updated_at
+            or current.status != "ongoing"
+            or current.current_phase != "verify"
+            or current.candidate_head != expected_candidate
+            or current.source_revision != stop.source_revision
+            or stop.run_id != current.run_id
+            or stop.work_id != current.work_id
+            or stop.repo != current.repo
+            or stop.claim_key != current.claim_key
+            or stop.candidate_head != current.candidate_head
+            or step is None
+            or any(
+                job.get("workflow_run_id") == current.run_id
+                and job.get("workflow_claim_key") in (None, current.claim_key)
+                and job.get("workflow_phase") == "verify"
+                and job.get("subject_head") == current.candidate_head
+                for job in self._jobs
+            )
+        ):
+            raise ValueError("workflow planning drift stop compare-and-set failed")
+        if not isinstance(reason, DiagnosticReason):
+            raise ValueError("workflow planning drift stop requires structured reason")
+        updated = replace(
+            current,
+            planning_drift_stop=stop,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            needs_human_reason=reason.to_dict(),
+            gate_status="running",
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_rebind_planning_for_verify(
+        self,
+        run_id: str,
+        *,
+        expected_updated_at: str,
+        expected_candidate: str,
+        expected_authority: tuple[PlanningArtifactAuthority, ...],
+        expected_planning_source_revision: str | None,
+        receipt: PlanReviewReceipt,
+    ) -> WorkflowRun:
+        """以 CAS 將 exact stopped candidate 綁回不可變的 accepted review。"""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        stop = current.planning_drift_stop
+        matching_verify_jobs = [
+            job
+            for job in self._jobs
+            if job.get("workflow_run_id") == current.run_id
+            and job.get("workflow_claim_key") in (None, current.claim_key)
+            and job.get("workflow_phase") == "verify"
+            and job.get("subject_head") == expected_candidate
+        ]
+        if (
+            current.updated_at != expected_updated_at
+            or current.status != "ongoing"
+            or current.current_phase != "verify"
+            or current.candidate_head != expected_candidate
+            or current.planning_authority != expected_authority
+            or current.planning_source_revision != expected_planning_source_revision
+            or not isinstance(stop, WorkflowPlanningDriftStop)
+            or stop.run_id != current.run_id
+            or stop.work_id != current.work_id
+            or stop.repo != current.repo
+            or stop.claim_key != current.claim_key
+            or stop.phase != "verify"
+            or stop.candidate_head != expected_candidate
+            or stop.source_revision != current.source_revision
+            or not isinstance(receipt, PlanReviewReceipt)
+            or current.plan_review_receipt != receipt
+            or receipt.run_id != current.run_id
+            or receipt.work_id != current.work_id
+            or receipt.repo != current.repo
+            or receipt.claim_key != current.claim_key
+            or receipt.source_revision != current.planning_source_revision
+            or not receipt.ready
+            or bool(matching_verify_jobs)
+        ):
+            raise ValueError("workflow planning drift recovery compare-and-set failed")
+        updated = replace(
+            current,
+            planning_authority=receipt.artifacts,
+            planning_source_revision=receipt.source_revision,
+            facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            needs_human_reason=None,
+            gate_status="running",
+            updated_at=_now_iso(),
         )
         self._workflows[index] = updated
         self._persist()
@@ -5352,6 +5659,9 @@ class JobRegistry:
         *,
         expected_candidate: str,
         retry_classification: str | None = None,
+        reviewer_recovery_checker: (
+            Callable[[Mapping[str, Any], WorkflowRun], bool] | None
+        ) = None,
     ) -> WorkflowRun:
         """Atomically rerun verification only, keeping the exact unchanged Candidate (#216).
 
@@ -5381,17 +5691,19 @@ class JobRegistry:
         build_steps = [step for step in current.steps if step.phase == "build"]
         if not build_steps or any(step.gate_result != "passed" for step in build_steps):
             raise ValueError("retry-verify reset requires completed build phase")
-        # #315：operator 已以 CAS 顯式授權重跑 verification；舊 exited verify job
-        # 的 reviewer sandbox 依設計已清除、terminal 證據不可重驗，維持 "exited"
-        # 會讓 dispatch 先 terminalize 舊 job 而永遠卡在 input-snapshot-missing。
-        # 標記 failed 讓 explicit resume 走 replacement dispatch；build phase job
-        # 與 active job（前面 admission 已擋）不受影響。
+        # #315：一般舊 exited verify job 標記 failed，讓 explicit resume 走 replacement
+        # dispatch。若 Manager 的完整判準確認 job 仍可供精準 reviewer terminal
+        # recovery 採用，則保留 exited，避免關閉免費復原路徑。
         for job in self._jobs:
             if (
                 job.get("workflow_run_id") == current.run_id
                 and job.get("workflow_phase") == "verify"
                 and job.get("status") == "exited"
             ):
+                if reviewer_recovery_checker is not None and reviewer_recovery_checker(
+                    job, current
+                ):
+                    continue
                 job["status"] = "failed"
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "verify" else step
@@ -5429,6 +5741,9 @@ class JobRegistry:
         *,
         expected_candidate: str,
         retry_classification: str | None = None,
+        reviewer_recovery_checker: (
+            Callable[[Mapping[str, Any], WorkflowRun], bool] | None
+        ) = None,
     ) -> WorkflowRun:
         """Atomically relaunch foreign review only, keeping the verified Candidate (#216).
 
@@ -5460,16 +5775,19 @@ class JobRegistry:
         verify_steps = [step for step in current.steps if step.phase == "verify"]
         if not verify_steps or any(step.gate_result != "passed" for step in verify_steps):
             raise ValueError("retry-review reset requires completed verify phase")
-        # #315（review 版）：operator 已以 CAS 顯式授權重跑 review；舊 exited
-        # review job 的 reviewer sandbox 已清、terminal 不可重驗，維持 "exited"
-        # 會讓 resume 先 terminalize 舊 job 而卡死。標記 failed 讓 explicit
-        # resume 走 replacement dispatch；verify／build job 不受影響。
+        # #315：一般舊 exited review job 標記 failed，讓 explicit resume 走 replacement
+        # dispatch。若 Manager 的完整判準確認 job 仍可供精準 reviewer terminal
+        # recovery 採用，則保留 exited，避免關閉免費復原路徑。
         for job in self._jobs:
             if (
                 job.get("workflow_run_id") == current.run_id
                 and job.get("workflow_phase") == "review"
                 and job.get("status") == "exited"
             ):
+                if reviewer_recovery_checker is not None and reviewer_recovery_checker(
+                    job, current
+                ):
+                    continue
                 job["status"] = "failed"
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "review" else step

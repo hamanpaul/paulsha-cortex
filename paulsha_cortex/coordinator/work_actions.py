@@ -13,6 +13,7 @@ import re
 import stat as statmod
 import subprocess
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -29,7 +30,7 @@ from .diagnostics import diagnostic_reason
 from .claim import (
     AUTO_LABEL,
     ClaimCandidate,
-    authority_digest_without_planning_outputs,
+    authority_matches_claim_era,
     build_claim_key,
     build_label_argv,
     claim_identity_digest,
@@ -40,6 +41,8 @@ from .claim import (
     load_work_authorities,
     load_work_authorities_with_snapshot_items,
     load_work_authority,
+    manager_pr_refs_compatible,
+    self_only_authority_drift_matches,
     work_authority_digest,
 )
 from .delivery import (
@@ -64,6 +67,7 @@ from .github_delivery import (
     DeliveryPolicy,
     GitHubDeliveryClient,
     evaluate_delivery_gate,
+    evaluate_remote_closure,
 )
 from . import candidate_base
 from . import engineering_outcome
@@ -212,6 +216,15 @@ def _ensure_openspec_change_scaffold(*, repo_root: Path, change: str) -> None:
         )
 
 
+def _is_manager_only_authoritative_preflight_task(description: str) -> bool:
+    """只辨識 #808 的 Manager authoritative preflight 任務，避免放寬其他未勾項。"""
+    return (
+        re.match(r"(?i)^Manager\b", description.strip()) is not None
+        and re.search(r"(?i)\bauthoritative\s+preflight\b", description) is not None
+        and re.search(r"(?i)\bCandidate\b", description) is not None
+    )
+
+
 def _validate_local_archive_inputs(
     *,
     repo_root: Path,
@@ -223,7 +236,11 @@ def _validate_local_archive_inputs(
         tasks_text = tasks_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise RuntimeError("OpenSpec tasks unavailable") from exc
-    task_states = re.findall(r"(?m)^\s*[-*]\s+\[([ xX])\]\s+", tasks_text)
+    task_items = []
+    for line in tasks_text.splitlines():
+        match = re.match(r"^\s*[-*]\s+\[([ xX])\]\s+(.*)$", line)
+        if match is not None:
+            task_items.append(match.groups())
     canonical = runner(
         build_openspec_validate_change_argv(change),
         cwd=str(repo_root),
@@ -272,7 +289,12 @@ def _validate_local_archive_inputs(
             fragment_present = True
             break
     facts = ArchiveGateFacts(
-        tasks_complete=bool(task_states) and all(state.lower() == "x" for state in task_states),
+        tasks_complete=bool(task_items)
+        and all(
+            state.lower() == "x"
+            or _is_manager_only_authoritative_preflight_task(description)
+            for state, description in task_items
+        ),
         canonical_specs_valid=getattr(canonical, "returncode", None) == 0,
         doc_references_valid=getattr(policy, "returncode", None) == 0,
         changelog_present=(
@@ -1168,13 +1190,12 @@ def _append_delivery_publication_event(
 
 
 def _canonical_workflow_run(*, workflow_registry, authority):
-    digest = work_authority_digest(authority)
     matches = [
         run
         for run in workflow_registry.list_workflow_runs()
         if run.repo == authority.repo
         and run.work_id == authority.work_id
-        and run.source_revision == digest
+        and authority_matches_claim_era(authority, run)
         and run.issue_refs
         == tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
         # A workflow's planning cards may create the active OpenSpec change
@@ -1184,8 +1205,7 @@ def _canonical_workflow_run(*, workflow_registry, authority):
         # bind that run instead of treating its own planning output as a new
         # identity.
         and _openspec_refs_compatible(run, authority)
-        and run.pr_refs
-        == tuple(f"{authority.repo}#{number}" for number in authority.mapped_prs)
+        and manager_pr_refs_compatible(authority, run)
     ]
     # A re-claimed work item legitimately leaves superseded historical runs
     # with the same authority refs.  Delivery must bind to the one live run;
@@ -1276,7 +1296,10 @@ def _validate_current_run_authority(active: dict[str, Any], authority, canonical
         "mapped_openspec": list(authority.mapped_openspec),
         "mapped_todo_paths": list(authority.mapped_todo_paths),
     }
-    if any(active.get(field) != value for field, value in expected.items()):
+    if (
+        not authority_matches_claim_era(authority, canonical_run)
+        or any(active.get(field) != value for field, value in expected.items())
+    ):
         raise RuntimeError("persisted workflow does not match current WorkAuthority")
     step_ids = active.get("workflow_step_ids")
     if (
@@ -2206,6 +2229,404 @@ def _review_attest_action(
     return {"action": "review-attested", "head": run.candidate_head, **record}
 
 
+_REVIEW_DISPOSITION_SCHEMA = "cortex-review-disposition/v1"
+
+
+def _review_disposition_thread_snapshot(threads: object) -> list[dict[str, Any]]:
+    if not isinstance(threads, (list, tuple)):
+        raise RuntimeError("review-disposition PR review threads malformed")
+    snapshot: list[dict[str, Any]] = []
+    for thread in threads:
+        thread_id = getattr(thread, "thread_id", None)
+        resolved = getattr(thread, "resolved", None)
+        outdated = getattr(thread, "outdated", None)
+        if (
+            not isinstance(thread_id, str)
+            or not thread_id
+            or not isinstance(resolved, bool)
+            or not isinstance(outdated, bool)
+        ):
+            raise RuntimeError("review-disposition PR review threads malformed")
+        snapshot.append(
+            {"thread_id": thread_id, "resolved": resolved, "outdated": outdated}
+        )
+    snapshot.sort(key=lambda item: item["thread_id"])
+    if len({item["thread_id"] for item in snapshot}) != len(snapshot):
+        raise RuntimeError("review-disposition PR review threads malformed")
+    return snapshot
+
+
+def _review_disposition_latest_copilot_review(remote: object, *, head: str):
+    reviews = [
+        review
+        for review in getattr(remote, "copilot_reviews", ())
+        if review.commit_id == head and review.author == COPILOT_REVIEWER_LOGIN
+    ]
+    if not reviews:
+        return None
+    return max(reviews, key=lambda item: (item.submitted_at_epoch, item.review_id))
+
+
+def _review_disposition_finding_hash(ship: dict[str, Any]) -> tuple[int, int, str]:
+    review_id = ship.get("review_id")
+    finding_count = ship.get("finding_count")
+    findings = ship.get("findings")
+    if (
+        not isinstance(review_id, int)
+        or isinstance(review_id, bool)
+        or review_id <= 0
+        or not isinstance(finding_count, int)
+        or isinstance(finding_count, bool)
+        or finding_count <= 0
+        or not isinstance(findings, list)
+        or not findings
+    ):
+        raise RuntimeError("review-disposition requires persisted Copilot findings")
+    digest = verification.canonical_json_hash(
+        {"review_id": review_id, "finding_count": finding_count, "findings": findings}
+    )
+    return review_id, finding_count, digest
+
+
+def _review_disposition_record(
+    body: dict[str, Any], *, state_path: Path
+) -> dict[str, str]:
+    digest = verification.canonical_json_hash(body)
+    root = state_path.resolve().parent / "evidence" / "review-disposition"
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{body['run_id']}-{body['head']}-{digest}.json"
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if target.exists() or target.is_symlink():
+        if (
+            target.is_symlink()
+            or not target.is_file()
+            or target.read_bytes() != content
+            or target.stat().st_mode & 0o222
+        ):
+            raise RuntimeError("review-disposition evidence conflict")
+    else:
+        temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, target)
+            os.chmod(target, 0o444)
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except FileExistsError:
+            if (
+                target.is_symlink()
+                or not target.is_file()
+                or target.read_bytes() != content
+                or target.stat().st_mode & 0o222
+            ):
+                raise RuntimeError("review-disposition evidence conflict")
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {"ref": str(target), "hash": digest}
+
+
+def _read_review_disposition(
+    reference: object, *, state_path: Path
+) -> tuple[dict[str, Any], dict[str, str]]:
+    if (
+        not isinstance(reference, dict)
+        or set(reference) != {"ref", "hash"}
+        or not isinstance(reference.get("ref"), str)
+        or not isinstance(reference.get("hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", reference["hash"]) is None
+    ):
+        raise RuntimeError("review-disposition reference malformed")
+    raw_path = Path(reference["ref"])
+    root = state_path.resolve().parent / "evidence" / "review-disposition"
+    if raw_path.is_symlink() or not raw_path.is_absolute():
+        raise RuntimeError("review-disposition evidence path invalid")
+    try:
+        evidence_path = raw_path.resolve(strict=True)
+        if (
+            root.is_symlink()
+            or evidence_path.parent != root.resolve(strict=True)
+            or not evidence_path.is_file()
+            or evidence_path.stat().st_mode & 0o222
+        ):
+            raise RuntimeError("review-disposition evidence is not immutable")
+        body = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("review-disposition evidence unreadable") from exc
+    required = {
+        "schema",
+        "repo",
+        "work_id",
+        "run_id",
+        "authority_digest",
+        "pr_number",
+        "head",
+        "review_id",
+        "finding_count",
+        "finding_hash",
+        "actor",
+        "requested_by",
+        "outcome",
+        "reason",
+        "thread_snapshot",
+        "thread_snapshot_hash",
+        "created_at_epoch",
+    }
+    snapshot = body.get("thread_snapshot") if isinstance(body, dict) else None
+    if (
+        not isinstance(body, dict)
+        or set(body) != required
+        or body.get("schema") != _REVIEW_DISPOSITION_SCHEMA
+        or not isinstance(snapshot, list)
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"thread_id", "resolved", "outdated"}
+            or not isinstance(item.get("thread_id"), str)
+            or not item["thread_id"]
+            or item.get("resolved") is not True
+            or not isinstance(item.get("outdated"), bool)
+            for item in snapshot
+        )
+        or len({item["thread_id"] for item in snapshot}) != len(snapshot)
+        or verification.canonical_json_hash(snapshot) != body.get("thread_snapshot_hash")
+        or verification.canonical_json_hash(body) != reference["hash"]
+        or body.get("outcome") != "continue"
+        or not isinstance(body.get("finding_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["finding_hash"]) is None
+        or not isinstance(body.get("actor"), str)
+        or not isinstance(body.get("requested_by"), str)
+        or not body["requested_by"]
+        or not isinstance(body.get("reason"), str)
+        or not isinstance(body.get("created_at_epoch"), (int, float))
+        or isinstance(body.get("created_at_epoch"), bool)
+        or not math.isfinite(float(body["created_at_epoch"]))
+    ):
+        raise RuntimeError("review-disposition evidence does not authorize exact findings")
+    return body, {"ref": str(evidence_path), "hash": reference["hash"]}
+
+
+def _review_disposition_for_ship(
+    *,
+    active: dict[str, Any],
+    ship: dict[str, Any],
+    authority,
+    canonical_run,
+    binding: dict[str, Any],
+    head: str,
+    remote: object,
+    state_path: Path,
+) -> dict[str, str] | None:
+    snapshot = _review_disposition_thread_snapshot(
+        getattr(remote, "review_threads", ())
+    )
+    if any(item["resolved"] is not True for item in snapshot):
+        return None
+    latest = _review_disposition_latest_copilot_review(remote, head=head)
+    review_id, finding_count, finding_hash = _review_disposition_finding_hash(ship)
+    if (
+        latest is None
+        or latest.review_id != review_id
+        or latest.is_error
+        or latest.state.upper() not in {"COMMENTED", "APPROVED"}
+    ):
+        return None
+    references = active.get("review_dispositions", [])
+    if not isinstance(references, list):
+        raise RuntimeError("review-disposition history malformed")
+    snapshot_hash = verification.canonical_json_hash(snapshot)
+    for reference in reversed(references):
+        body, record = _read_review_disposition(reference, state_path=state_path)
+        if (
+            body.get("repo") == authority.repo
+            and body.get("work_id") == authority.work_id
+            and body.get("run_id") == canonical_run.run_id
+            and body.get("authority_digest") == work_authority_digest(authority)
+            and body.get("pr_number") == binding["pr_number"]
+            and body.get("head") == head
+            and body.get("review_id") == review_id
+            and body.get("finding_count") == finding_count
+            and body.get("finding_hash") == finding_hash
+            and body.get("thread_snapshot_hash") == snapshot_hash
+            and body.get("thread_snapshot") == snapshot
+        ):
+            return record
+    return None
+
+
+def _archive_review_finding_history(
+    *, active: dict[str, Any], ship: dict[str, Any], disposition: dict[str, str]
+) -> None:
+    history = active.get("review_finding_history", [])
+    if not isinstance(history, list):
+        raise RuntimeError("review finding history malformed")
+    if any(
+        isinstance(item, dict) and item.get("disposition_ref") == disposition["ref"]
+        for item in history
+    ):
+        return
+    review_id, finding_count, finding_hash = _review_disposition_finding_hash(ship)
+    findings = ship["findings"]
+    history.append(
+        {
+            "head": ship["head"],
+            "review_id": review_id,
+            "finding_count": finding_count,
+            "finding_hash": finding_hash,
+            "findings": copy.deepcopy(findings),
+            "disposition_ref": disposition["ref"],
+            "disposition_hash": disposition["hash"],
+        }
+    )
+    active["review_finding_history"] = history
+
+
+def _review_disposition_action(
+    *,
+    args: dict[str, Any],
+    requested_by: str,
+    authority,
+    runner: Runner,
+    now_epoch: float,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    allowed = {"action", "repo", "work_id", "actor", "reason"}
+    extras = set(args) - allowed
+    if extras:
+        raise ValueError(
+            f"review-disposition rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+        or not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+        or not isinstance(requested_by, str)
+        or not requested_by
+        or not isinstance(now_epoch, (int, float))
+        or isinstance(now_epoch, bool)
+        or not math.isfinite(float(now_epoch))
+    ):
+        raise ValueError("review-disposition payload invalid")
+    state, active, run = _load_work_run(
+        state_path=state_path,
+        workflow_registry=workflow_registry,
+        authority=authority,
+    )
+    _validate_current_run_authority(active, authority, run)
+    # 只有 Cortex 自己的 review gate 全部通過、剩下 ship 段 Copilot finding 時，operator 才能裁決續行；
+    # review gate 未過一律走 retry-review／retry-build，不得以 disposition 繞過。
+    if any(
+        step.phase == "review" and step.gate_result != "passed"
+        for step in run.steps
+    ):
+        raise RuntimeError(
+            "review-disposition only applies to ship Copilot findings; "
+            "use retry-review --reason or retry-build --reason for review-gate findings"
+        )
+    ship = active.get("ship")
+    candidate = _exact_verified_candidate_head(run)
+    binding_value = active.get("delivery_binding")
+    if (
+        run.current_phase != "review"
+        or run.status not in {"ongoing", "needs_human"}
+        or not isinstance(ship, dict)
+        or ship.get("phase") != "needs-fix"
+        or candidate is None
+        or ship.get("head") != candidate
+        or not isinstance(binding_value, dict)
+    ):
+        raise RuntimeError(
+            "review-disposition requires a current exact-HEAD ship needs-fix finding"
+        )
+    binding = _ship_binding(binding_value, authority)
+    if (
+        binding != binding_value
+        or ship.get("pr_number") != binding["pr_number"]
+        or ship.get("change") != binding["change"]
+        or ship.get("todo_paths") != binding["todo_paths"]
+    ):
+        raise RuntimeError("review-disposition delivery binding mismatch")
+    review_id, finding_count, finding_hash = _review_disposition_finding_hash(ship)
+    remote = GitHubDeliveryClient(runner=runner).fetch_delivery_facts(
+        repo=authority.repo,
+        pr_number=binding["pr_number"],
+        change=binding["change"],
+    )
+    if remote.head != candidate:
+        raise RuntimeError("review-disposition PR HEAD mismatch")
+    latest = _review_disposition_latest_copilot_review(remote, head=candidate)
+    if (
+        latest is None
+        or latest.review_id != review_id
+        or latest.is_error
+        or latest.state.upper() not in {"COMMENTED", "APPROVED"}
+    ):
+        raise RuntimeError(
+            "review-disposition requires the persisted latest exact-HEAD Copilot review"
+        )
+    thread_snapshot = _review_disposition_thread_snapshot(remote.review_threads)
+    unresolved = sum(1 for item in thread_snapshot if not item["resolved"])
+    if unresolved:
+        raise RuntimeError(
+            "review-disposition requires all PR review threads resolved "
+            f"(unresolved={unresolved})"
+        )
+    body = {
+        "schema": _REVIEW_DISPOSITION_SCHEMA,
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "run_id": run.run_id,
+        "authority_digest": work_authority_digest(authority),
+        "pr_number": binding["pr_number"],
+        "head": candidate,
+        "review_id": review_id,
+        "finding_count": finding_count,
+        "finding_hash": finding_hash,
+        "actor": actor,
+        "requested_by": requested_by,
+        "outcome": "continue",
+        "reason": reason,
+        "thread_snapshot": thread_snapshot,
+        "thread_snapshot_hash": verification.canonical_json_hash(thread_snapshot),
+        "created_at_epoch": float(now_epoch),
+    }
+    record = _review_disposition_record(body, state_path=state_path)
+    references = active.get("review_dispositions", [])
+    if not isinstance(references, list):
+        raise RuntimeError("review-disposition history malformed")
+    active["review_dispositions"] = [*references, record]
+    _save_runs(state_path, state)
+    workflow_registry._manager_update_workflow_run(
+        run.run_id,
+        facets=tuple(facet for facet in run.facets if facet != "needs_human"),
+        gate_status="running",
+    )
+    return {
+        "action": "review-disposition-recorded",
+        "head": candidate,
+        **record,
+        "next_actions": ["resume"],
+        "next_step_hint": (
+            f"cortex work resume {run.work_id} --repo {authority.repo}"
+        ),
+    }
+
+
 def _ship_with_maintainer_review(
     *,
     args: dict[str, Any],
@@ -2765,18 +3186,17 @@ def _claim_action(
             #     `run.status` 又會把 needs_human／needs_decomposition／blocked
             #     的 run 誤納入保護。
             #
-            # (2)「漂移完全來自 run 自己的產出」：把 planning phase 自產的
-            #     `superpowers_spec:`／`superpowers_plan:` source 剝掉之後重算的
-            #     authority digest，必須與 run 持久化的 `source_revision`（claim
-            #     當下的 `work_authority_digest`）逐字相符。相符即代表「除了這個
-            #     run 自己寫出來的 spec/design/plan 以外，authority 一個字都沒
-            #     變」，此時換代純屬自我作廢。
+            # (2)「漂移完全來自 run 自己的產出」：共用判定會逐項核對 run 已接受
+            #     的 planning artifact ref/kind/hash 與目前 bytes、run 宣告的
+            #     OpenSpec proposal，以及 Manager PR refs 綁定的 exact verified
+            #     Candidate。只有把這些精確對應的新增項目還原後，authority digest
+            #     才能逐字等於原 `source_revision`。source prefix、檔名或 caller
+            #     自述都不足以豁免；任何其他欄位變更仍走既有 restart。
             #
             # 判準 (2) 同時守住既有的 operator 逃生口：issue 開關、openspec
             # revision、todo 成員變動等**真正的** authority 變更不會被剝除，
             # digest 依然不同，`start` 照舊開新世代（見
             # tests/test_work_actions.py::test_source_change_starts_new_canonical_run）。
-            inflight_digest = authority_digest_without_planning_outputs(authority)
             inflight = [
                 run
                 for run in all_runs
@@ -2784,7 +3204,7 @@ def _claim_action(
                 and run.work_id == authority.work_id
                 and run.status == "ongoing"
                 and workflow_status(run) == "ongoing"
-                and run.source_revision == inflight_digest
+                and authority_matches_claim_era(authority, run)
             ]
             if len(inflight) > 1:
                 raise RuntimeError("active workflow identity is ambiguous")
@@ -2881,9 +3301,40 @@ def _claim_action(
         # 沒有 in-flight job 時才符合精準 invalidation 的前置條件；不符合時
         # （build/claim/define/plan phase、或有 active job）維持既有『原樣
         # resume』行為，不強行 invalidate。
+        if self_only_authority_drift_matches(authority, canonical_run):
+            return {
+                "action": "resume",
+                "reason": "active-workflow",
+                "run": canonical_run.to_dict(),
+            }
         new_digest = work_authority_digest(authority)
         authority_restart_classification = None
         if canonical_run.current_phase in {"verify", "review"}:
+            from .manager import _merged_delivery_journal_bound
+
+            if _merged_delivery_journal_bound(
+                canonical_run, journal_path=Path(state_path)
+            ):
+                logger.info(
+                    "preserving merged delivery run during authority advance: run_id=%s candidate_head=%s",
+                    canonical_run.run_id,
+                    canonical_run.candidate_head,
+                )
+                active = canonical_run.to_dict()
+                active.update(
+                    {
+                        "snapshot_hash": authority.snapshot_hash,
+                        "source_revisions": list(authority.source_revisions),
+                        "provider_revision": authority.github_provider_revision,
+                        "authority_digest": new_digest,
+                        "status": workflow_status(canonical_run),
+                    }
+                )
+                return {
+                    "action": "resume",
+                    "reason": "merged-delivery-closure",
+                    "run": active,
+                }
             try:
                 canonical_run = workflow_registry._manager_reset_workflow_for_authority_restart(
                     canonical_run.run_id,
@@ -3155,6 +3606,12 @@ def _claim_action(
             elif "review-attest" in extra and authority is not None:
                 response["next_step_hint"] = (
                     f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+                )
+            elif "review-disposition" in extra and authority is not None:
+                response["next_step_hint"] = (
+                    "確認 PR review threads 全部 resolved 後，由 operator 提交 exact-HEAD 裁決："
+                    f"cortex work review-disposition {canonical_run.work_id} --repo {authority.repo} "
+                    "--actor <operator> --reason '<理由>'"
                 )
     if decision.blocking_reason is not None:
         response["blocking_reason"] = decision.blocking_reason
@@ -3449,6 +3906,12 @@ def _candidate_tree_matching_archive_entries(
     return tuple(sorted(entries))
 
 
+_MAIN_SYNC_RETRYABLE_REASONS = frozenset(
+    {"candidate-behind-main", "candidate-conflicts-with-main"}
+)
+_MAIN_SYNC_STOP_REASONS = _MAIN_SYNC_RETRYABLE_REASONS | {"main-sync-unavailable"}
+
+
 def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None) -> dict[str, Any]:
     """Reopen the final builder card with exact-Candidate CAS after a human stop."""
 
@@ -3492,6 +3955,24 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         raise RuntimeError("retry-build requires build/verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
+    reason_payload = run.needs_human_reason
+    reason_context = reason_payload.get("context") if isinstance(reason_payload, dict) else None
+    delivery_reason = reason_context.get("delivery_reason") if isinstance(reason_context, dict) else None
+    main_sync_stop = (
+        isinstance(reason_payload, dict)
+        and reason_payload.get("reason") == "delivery-needs-human"
+        and (
+            delivery_reason in _MAIN_SYNC_STOP_REASONS
+            or (
+                isinstance(reason_context, dict)
+                and ("main_sync" in reason_context or "main_sync_evidence_hash" in reason_context)
+            )
+            or any(value in str(reason_payload.get("detail", "")) for value in _MAIN_SYNC_STOP_REASONS)
+        )
+    )
+    main_sync_context = _main_sync_retry_context(run)
+    if main_sync_stop and (run.current_phase != "review" or main_sync_context is None):
+        raise RuntimeError("retry-build requires valid matching main-sync stop evidence")
     from . import manager
 
     archive_applied = manager._manager_archive_applied(
@@ -3518,7 +3999,9 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
                 }
             )
     retry_classification = _classify_retry(run, workflow_registry)
-    if run.current_phase == "build":
+    if main_sync_context is not None:
+        repair_action = _main_sync_retry_build_action(main_sync_context)
+    elif run.current_phase == "build":
         repair_action = (
             "Recover the exact Candidate after a builder terminalization failure. Preserve all "
             "declared input snapshots and inspect any existing unbound worktree commits before "
@@ -3624,6 +4107,72 @@ def _blocking_findings_recovery_actions(run) -> tuple[str, ...]:
     ):
         actions.append("retry-build")
     return tuple(actions)
+
+
+def _main_sync_retry_context(run) -> dict[str, str] | None:
+    reason = getattr(run, "needs_human_reason", None)
+    context = reason.get("context") if isinstance(reason, dict) else None
+    if (
+        not isinstance(reason, dict)
+        or reason.get("reason") != "delivery-needs-human"
+        or not isinstance(context, dict)
+        or context.get("delivery_reason") not in _MAIN_SYNC_RETRYABLE_REASONS
+    ):
+        return None
+    try:
+        raw = context["main_sync"]
+        main_sync = json.loads(raw) if isinstance(raw, str) else raw
+        candidate, main_head = main_sync["candidate"], main_sync["main_head"]
+        evidence_ref = next(
+            item for item in reason["evidence_refs"]
+            if isinstance(item, str) and item.strip()
+        )
+    except (KeyError, StopIteration, TypeError, ValueError):
+        return None
+    current_candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(main_sync, dict)
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or not isinstance(current_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(current_candidate) is None
+        or candidate.lower() != current_candidate.lower()
+        or not isinstance(main_head, str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", main_head) is None
+        or not isinstance(context.get("main_sync_evidence_hash"), str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", context["main_sync_evidence_hash"]) is None
+    ):
+        return None
+    return {
+        "candidate": current_candidate.lower(),
+        "main_head": main_head.lower(),
+        "evidence_ref": evidence_ref,
+    }
+
+
+def _main_sync_retry_build_action(context: dict[str, str]) -> str:
+    return (
+        f"Repair the exact Candidate {context['candidate']} using the saved main-sync "
+        f"probe evidence at {context['evidence_ref']}. That stop recorded origin/main "
+        f"as {context['main_head']}; include this exact main commit in a tested "
+        "descendant Candidate instead of substituting a newly fetched main. Do not "
+        "claim merge, issue closure, or done. The existing verification and review "
+        "gates must rerun, and the ship probe must confirm main sync before delivery "
+        "continues."
+    )
+
+
+def main_sync_retry_build_next_step_hint(run) -> str | None:
+    context = _main_sync_retry_context(run)
+    if context is None:
+        return None
+    return (
+        f"main-sync evidence `{context['evidence_ref']}` 記錄停機時的 Candidate C 與 "
+        f"main M `{context['main_head']}`。請依該證據人工修復候選並納入這個 M，讓既有 "
+        f"verify／review 與 ship probe 重跑；執行 `cortex run work retry-build "
+        f"{run.work_id} --repo {run.repo} --expected-candidate {context['candidate']} "
+        "--actor <operator> --reason '<人工裁決>'`。"
+    )
 
 
 def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
@@ -3744,6 +4293,40 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
                     actions.append("retry-card")
 
             if jobs_readable:
+                main_sync_context = _main_sync_retry_context(run)
+                build_steps = [step for step in run.steps if step.phase == "build"]
+                ship_steps = [
+                    step for step in run.steps
+                    if step.phase == "ship" and step.gate_result == "passed"
+                ]
+                reset_steps_valid = (
+                    bool(build_steps)
+                    and all(step.gate_result == "passed" for step in build_steps)
+                    and len(ship_steps) <= 1
+                    and all(
+                        step.card == "openspec-archive"
+                        and step.executor == "cortex-manager"
+                        and step.model == "deterministic"
+                        and step.domain == "cortex"
+                        for step in ship_steps
+                    )
+                )
+                if (
+                    main_sync_context is not None
+                    and run.status == "ongoing"
+                    and run.current_phase == "review"
+                    and reset_steps_valid
+                ):
+                    try:
+                        active_runs = [
+                            item for item in workflow_registry.list_workflow_runs()
+                            if item.repo == run.repo and item.work_id == run.work_id
+                            and item.status == "ongoing"
+                        ]
+                    except Exception:
+                        active_runs = []
+                    if len(active_runs) == 1 and active_runs[0].run_id == run.run_id:
+                        actions.append("retry-build")
                 actions.extend(
                     action
                     for action in _blocking_findings_recovery_actions(run)
@@ -3752,6 +4335,8 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
 
     if reason_code.startswith("copilot-") and "review-attest" not in actions:
         actions.append("review-attest")
+    if reason_code in {"review-disposition-required", "review-threads-unresolved"}:
+        actions.append("review-disposition")
     return tuple(actions)
 
 
@@ -3983,7 +4568,15 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     }
 
 
-def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+def _retry_verify_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    workflow_registry,
+    reviewer_recovery_checker: (
+        Callable[[dict[str, Any], Any], bool] | None
+    ) = None,
+) -> dict[str, Any]:
     """Rerun verification only for the exact unchanged Candidate after a human stop（#216 AC2）。
 
     build phase 完全不動：不重派 builder、不重建 candidate，只把 verify step
@@ -4033,6 +4626,7 @@ def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) 
         run.run_id,
         expected_candidate=expected_candidate.lower(),
         retry_classification=retry_classification.value,
+        reviewer_recovery_checker=reviewer_recovery_checker,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
@@ -4051,6 +4645,9 @@ def _retry_review_action(
     workflow_registry,
     state_path: Path | None = None,
     now_epoch: float | None = None,
+    reviewer_recovery_checker: (
+        Callable[[dict[str, Any], Any], bool] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Relaunch foreign review only for the exact verified Candidate（#216 AC3）。
 
@@ -4130,6 +4727,7 @@ def _retry_review_action(
         run.run_id,
         expected_candidate=expected_candidate.lower(),
         retry_classification=retry_classification.value,
+        reviewer_recovery_checker=reviewer_recovery_checker,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
@@ -5373,6 +5971,170 @@ def _retire_delivered_action(
     }
 
 
+def _close_delivered_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    runner: Runner,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """為已交付但缺少記錄的 work item 建立 operator CompletionRecord。
+
+    僅接受沒有 WorkflowRun 的 work item。既有 remote closure gates 必須全數
+    通過，才會保存 actor／reason 與遠端事實。
+    """
+
+    extras = set(args) - {"action", "repo", "work_id", "actor", "reason"}
+    if extras:
+        raise ValueError(
+            f"close-delivered rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+    ):
+        raise ValueError("close-delivered requires bounded actor")
+    if (
+        not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+    ):
+        raise ValueError("close-delivered requires bounded reason")
+
+    related = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo and run.work_id == authority.work_id
+    ]
+    if related:
+        raise RuntimeError("close-delivered requires a work item with no WorkflowRun")
+    if not authority.mapped_issues:
+        raise RuntimeError("close-delivered requires mapped GitHub issues")
+    if len(authority.mapped_prs) != 1:
+        raise RuntimeError("close-delivered requires exactly one mapped PR")
+    if len(authority.mapped_openspec) > 1:
+        raise RuntimeError("close-delivered supports at most one mapped OpenSpec change")
+    if not authority.mapped_todo_paths:
+        raise RuntimeError("close-delivered requires mapped Todo paths")
+
+    github = GitHubDeliveryClient(runner=runner)
+    change = authority.mapped_openspec[0] if authority.mapped_openspec else None
+    todo_paths = tuple(authority.mapped_todo_paths)
+    facts = github.fetch_remote_closure(
+        repo=authority.repo,
+        pr_number=authority.mapped_prs[0],
+        change=change,
+        required_issues=authority.mapped_issues,
+        todo_paths=todo_paths,
+    )
+    if change is not None:
+        archive_task_paths = tuple(
+            sorted(
+                path
+                for path in github._commit_tree_paths(
+                    repo=authority.repo, commit=facts.default_head
+                )
+                if re.fullmatch(
+                    rf"openspec/changes/archive/\d{{4}}-\d{{2}}-\d{{2}}-"
+                    rf"{re.escape(change)}/tasks\.md",
+                    path,
+                )
+            )
+        )
+        if not archive_task_paths:
+            raise RuntimeError("close-delivered remote closure blocked: openspec-tasks-missing")
+        first_facts = facts
+        facts = github.fetch_remote_closure(
+            repo=authority.repo,
+            pr_number=authority.mapped_prs[0],
+            change=change,
+            required_issues=authority.mapped_issues,
+            todo_paths=tuple(sorted(set(todo_paths) | set(archive_task_paths))),
+        )
+        if (
+            facts.default_head != first_facts.default_head
+            or facts.merge_commit != first_facts.merge_commit
+            or facts.pr_head != first_facts.pr_head
+            or dict(facts.issue_states) != dict(first_facts.issue_states)
+            or facts.active_openspec_absent != first_facts.active_openspec_absent
+            or facts.archive_present != first_facts.archive_present
+            or any(
+                facts.todo_revisions.get(path) != revision
+                for path, revision in first_facts.todo_revisions.items()
+            )
+        ):
+            raise RuntimeError("close-delivered remote facts changed during verification")
+    gate = evaluate_remote_closure(
+        facts=replace(facts, completion_record_valid=True),
+        required_issues=authority.mapped_issues,
+        expected_head=facts.pr_head,
+    )
+    if not gate.allowed:
+        raise RuntimeError(f"close-delivered remote closure blocked: {', '.join(gate.reasons)}")
+
+    source_revisions: dict[str, str] = {}
+    for value in authority.source_revisions:
+        source_id, separator, revision = value.partition("@")
+        if not separator or not source_id or not revision:
+            raise RuntimeError("close-delivered WorkAuthority source revisions malformed")
+        if source_id in source_revisions:
+            raise RuntimeError("close-delivered WorkAuthority source revisions duplicated")
+        source_revisions[source_id] = revision
+    if not source_revisions:
+        raise RuntimeError("close-delivered requires confirmed source revisions")
+
+    body = {
+        "schema": "cortex-work-close-delivered/v1",
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "actor": actor,
+        "reason": reason,
+        "authority_digest": work_authority_digest(authority),
+        "source_revisions": dict(sorted(source_revisions.items())),
+        "issue_states": [
+            {"ref": f"{authority.repo}#{issue}", "state": facts.issue_states[issue]}
+            for issue in sorted(authority.mapped_issues)
+        ],
+        "pull_request": {
+            "ref": f"{authority.repo}#{authority.mapped_prs[0]}",
+            "candidate": facts.pr_head.lower(),
+            "merge_commit": facts.merge_commit.lower(),
+            "merge_parents": [parent.lower() for parent in facts.merge_parents],
+            "default_head": facts.default_head.lower(),
+            "merge_is_ancestor": facts.merge_is_ancestor,
+            "merge_is_merge_commit": facts.merge_is_merge_commit,
+        },
+        "openspec": {
+            "refs": list(authority.mapped_openspec),
+            "active_openspec_absent": facts.active_openspec_absent,
+            "archive_present": facts.archive_present,
+        },
+        "todo_revisions": dict(sorted(facts.todo_revisions.items())),
+    }
+    record = _write_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="work-close-delivered",
+        stem=authority.work_id,
+        label="close-delivered",
+        max_size=16384,
+    )
+    return {
+        "action": "closed-delivered",
+        "actor": actor,
+        "reason": reason,
+        "issue_states": body["issue_states"],
+        "pull_request": body["pull_request"],
+        "completion_record": record,
+    }
+
+
 def _validate_reclaim_reset_operator_inputs(args: dict[str, Any]) -> tuple[str, str]:
     """#519：`reset-reclaim-budget` 的 actor／reason 入場驗證。
 
@@ -5981,12 +6743,18 @@ def _regenerate_gates_action(
     from .manager import GATE_LEDGER_REQUIRED_PHASES
 
     extras = set(args) - {
-        "action", "repo", "work_id", "issue", "actor", "expected_run_id",
+        "action", "repo", "work_id", "issue", "actor", "expected_run_id", "card",
     }
     if extras:
         raise ValueError(
             f"regenerate-gates rejects caller evidence/input: {sorted(extras)[0]}"
         )
+    card = args.get("card")
+    if card is not None and (
+        not isinstance(card, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None
+    ):
+        raise ValueError("regenerate-gates requires exact card id")
     expected_run_id = args.get("expected_run_id")
     if (
         not isinstance(expected_run_id, str)
@@ -6026,8 +6794,19 @@ def _regenerate_gates_action(
         and job.get("log_path")
         and Path(job["log_path"]).is_file()
     ]
+    if card is not None:
+        candidates = [job for job in candidates if job.get("workflow_card") == card]
+    elif candidates:
+        first_card = candidates[0].get("workflow_card")
+        if any(job.get("workflow_card") != first_card for job in candidates[1:]):
+            raise RuntimeError(
+                "regenerate-gates requires --card when multiple build cards are eligible"
+            )
     if not candidates:
-        raise RuntimeError("regenerate-gates requires a terminal builder job log")
+        detail = " for the requested card" if card is not None else ""
+        raise RuntimeError(
+            f"regenerate-gates requires a terminal builder job log{detail}"
+        )
     job = candidates[-1]
     worktree = job.get("worktree")
     if not isinstance(worktree, str) or not Path(worktree).is_dir():
@@ -6284,101 +7063,21 @@ def _recover_pre_candidate_action(
     issue = args.get("issue")
     if issue is not None and issue not in authority.mapped_issues:
         raise RuntimeError("recover-pre-candidate issue is not authorized by WorkAuthority")
+    from . import manager
 
-    matching_slices = [
-        s for s in workflow_registry.list_slices()
-        if s.get("slice_id") == authority.work_id or s.get("spec", {}).get("path", "").endswith(f"{authority.work_id}.md")
-    ]
-    if not matching_slices:
-        matching_slices = workflow_registry.list_slices()
-
-    target_slice = None
-    for s in matching_slices:
-        cand = s.get("candidate")
-        if not (isinstance(cand, str) and verification.SAFE_SHA_RE.fullmatch(cand) is not None):
-            target_slice = s
-            break
-
-    if target_slice is None:
-        raise RuntimeError("recover-pre-candidate requires a slice with null candidate")
-
-    slice_id = target_slice["slice_id"]
-    if target_slice.get("state") not in {"needs_human", "failed", "pending"}:
-        raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")
-
-    if target_slice.get("state") == "pending" and target_slice.get("builder_job_id") is None:
-        return {
-            "action": "recover-pre-candidate",
-            "reason": "already-recovered",
-            "slice_id": slice_id,
-            "slice_state": "pending",
-        }
-
-    builder_job_id = target_slice.get("builder_job_id")
-    wt_path = None
-    if isinstance(builder_job_id, str):
-        try:
-            b_job = workflow_registry.get_job(builder_job_id)
-            wt_path = b_job.get("worktree")
-        except Exception:
-            pass
-    if not wt_path:
-        wt_path = target_slice.get("worktree")
-
-    # #478：舊碼用裸 `subprocess.run(["git", "worktree", ...])`（無 `-C <repo>`，
-    # 實際跑在 manager 進程的 cwd 上）、`check=False` 吞錯，且只在目錄還在時
-    # 觸發——registry 殘留與「目錄已消失但 registry 還在」都清不掉。統一改走
-    # `worktree_reclaim`，後置條件不成立即 fail closed。
-    # #645：記錄沒有 worktree 時的反推走共用 helper（與 `manager.apply_slice_action`
-    # 同一份），新舊兩種目錄形狀都試；pool root 只在真的要反推時才解析（#612）。
-    recorded = wt_path if isinstance(wt_path, (str, Path)) and wt_path else None
-    pool_root = None
-    if recorded is None:
-        try:
-            pool_root = paths.worktree_root()
-        except Exception:
-            pool_root = None
-    branch_hint = target_slice.get("branch")
-    reclaim = worktree_reclaim.reclaim_recorded_or_derived(
-        recorded_path=recorded,
-        pool_root=pool_root,
-        job_id=slice_id,
-        branch=branch_hint if isinstance(branch_hint, str) else None,
-        preserve_root=state_path.resolve().parent / "evidence",
+    target_slice = manager._resolve_work_owner_slice(
+        workflow_registry,
+        repo=authority.repo,
+        work_id=authority.work_id,
     )
-    if reclaim is not None and not reclaim.ok:
-        raise RuntimeError(
-            "recover-pre-candidate worktree reclaim failed: "
-            f"{reclaim.detail or reclaim.status} ({reclaim.path})"
-        )
-
     actor = args.get("actor") or requested_by
-    workflow_registry.record_action(
-        slice_id,
-        action="operator-recover-pre-candidate",
+    return manager._recover_pre_candidate_core(
+        workflow_registry,
+        slice_id=target_slice["slice_id"],
         actor=actor,
-        state="pending",
-        gate_state="pending",
-        result="ok",
+        handoff_dir=manager.autonomy.DEFAULT_HANDOFF_DIR,
+        expected_owner={"repo": authority.repo, "work_id": authority.work_id},
     )
-    workflow_registry.update_slice(
-        slice_id,
-        state="pending",
-        gate_state="pending",
-        builder_job_id=None,
-        candidate=None,
-    )
-    updated = workflow_registry.get_slice(slice_id)
-    payload: dict[str, Any] = {
-        "action": "recover-pre-candidate",
-        "reason": "pre-candidate-slice-reset",
-        "slice_id": slice_id,
-        "slice_state": updated.get("state"),
-        "gate_state": updated.get("gate_state"),
-    }
-    if reclaim is not None:
-        payload["worktree_reclaim"] = reclaim.to_dict()
-    return payload
 
 
 def _find_repair_adoption_record(
@@ -6980,6 +7679,20 @@ def _ship_action(
         or len(authority.mapped_openspec) > 1
         or len(authority.mapped_todo_paths) != 1
     ):
+        if not authority.mapped_todo_paths:
+            detail = (
+                "目前 WorkAuthority 沒有 canonical workstream Todo mapping（Todo=0）；"
+                "請先發布 canonical Todo、link path，等 Monitor 更新後再 resume。"
+            )
+            next_step_hint = "發布 canonical Todo → link path → 等 Monitor 更新 → resume。"
+        else:
+            detail = (
+                "work item 的交付 correlation 尚未收斂到 ship lane 支援的唯一組合"
+                f"（需要 pr=1、todo=1、openspec=0 或 1；觀察到 prs={len(authority.mapped_prs)} "
+                f"openspec={len(authority.mapped_openspec)} todo={len(authority.mapped_todo_paths)}）。"
+                "請先用 `cortex work unlink` 修正多餘的 delivery correlation，待 snapshot 更新後再 `resume`。"
+            )
+            next_step_hint = "用 cortex work unlink 移除多餘 mapping，等 Monitor 更新後 resume。"
         active["ship"] = {
             "phase": "needs_human",
             "reason": "multiple-delivery-targets-unsupported",
@@ -6991,11 +7704,9 @@ def _ship_action(
             gate_status="running",
             needs_human_reason=diagnostic_reason(
                 "multiple-delivery-targets-unsupported",
-                "work item 的交付 correlation 尚未收斂到 ship lane 支援的唯一組合"
-                f"（需要 pr=1、todo=1、openspec=0 或 1；觀察到 prs={len(authority.mapped_prs)} "
-                f"openspec={len(authority.mapped_openspec)} todo={len(authority.mapped_todo_paths)}）。"
-                "請先用 `cortex work unlink` 修正多餘的 delivery correlation，待 snapshot 更新後再 `resume`。",
+                detail,
                 source="work_actions._ship_action:delivery-targets",
+                next_step_hint=next_step_hint,
                 run_id=canonical_run.run_id,
                 work_id=canonical_run.work_id,
                 repo=authority.repo,
@@ -7540,7 +8251,48 @@ def _ship_action(
         _save_runs(state_path, state)
         ship = active["ship"]
     if ship and ship.get("phase") == "needs-fix" and previous_head == preflight.head:
-        return {"action": "fix-required", "head": preflight.head, "fix_rounds": fix_rounds}
+        thread_snapshot = _review_disposition_thread_snapshot(remote.review_threads)
+        unresolved = sum(1 for item in thread_snapshot if not item["resolved"])
+        disposition = (
+            None
+            if unresolved
+            else _review_disposition_for_ship(
+                active=active,
+                ship=ship,
+                authority=authority,
+                canonical_run=canonical_run,
+                binding=binding,
+                head=preflight.head,
+                remote=remote,
+                state_path=state_path,
+            )
+        )
+        if disposition is None:
+            reason = (
+                "review-threads-unresolved"
+                if unresolved
+                else "review-disposition-required"
+            )
+            return {
+                "action": "fix-required",
+                "reason": reason,
+                "head": preflight.head,
+                "fix_rounds": fix_rounds,
+                "open_review_threads": unresolved,
+                "next_actions": ["review-disposition"],
+                "next_step_hint": (
+                    "先確認 PR review threads 全部 resolved，再由 operator 提交裁決："
+                    f"cortex work review-disposition {canonical_run.work_id} "
+                    f"--repo {authority.repo} --actor <operator> --reason '<理由>'；"
+                    "完成後以 cortex work resume 續行。"
+                ),
+            }
+        _archive_review_finding_history(
+            active=active,
+            ship=ship,
+            disposition=disposition,
+        )
+        _save_runs(state_path, state)
     if previous_head is not None and previous_head != preflight.head:
         fix_rounds += 1
         active["repair_rounds"] = fix_rounds
@@ -7951,6 +8703,9 @@ def execute_work_action(
     workflow_registry=None,
     workflow_starter=None,
     readiness_checker=None,
+    reviewer_recovery_checker: (
+        Callable[[dict[str, Any], Any], bool] | None
+    ) = None,
 ) -> dict[str, Any]:
     action = args.get("action")
     repo = args.get("repo")
@@ -7959,8 +8714,10 @@ def execute_work_action(
         "link", "unlink", "start", "resume", "retry-build", "retry-card",
         "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
+        "close-delivered",
         "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+        "review-disposition",
         "intake",
     }:
         raise ValueError("unsupported work action")
@@ -8044,6 +8801,7 @@ def execute_work_action(
             args=args,
             authority=authority,
             workflow_registry=workflow_registry,
+            reviewer_recovery_checker=reviewer_recovery_checker,
         )
     elif action == "retry-review":
         result = _retry_review_action(
@@ -8052,6 +8810,7 @@ def execute_work_action(
             workflow_registry=workflow_registry,
             state_path=resolved_state_path,
             now_epoch=now_epoch,
+            reviewer_recovery_checker=reviewer_recovery_checker,
         )
     elif action == "recover-planning":
         result = _recover_planning_action(
@@ -8105,6 +8864,14 @@ def execute_work_action(
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,
         )
+    elif action == "close-delivered":
+        result = _close_delivered_action(
+            args=args,
+            authority=authority,
+            runner=runner,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
     elif action == "reset-reclaim-budget":
         result = _reset_reclaim_budget_action(
             args=args,
@@ -8123,6 +8890,16 @@ def execute_work_action(
         )
     elif action == "review-attest":
         result = _review_attest_action(
+            args=args,
+            requested_by=requested_by,
+            authority=authority,
+            runner=runner,
+            now_epoch=now_epoch,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "review-disposition":
+        result = _review_disposition_action(
             args=args,
             requested_by=requested_by,
             authority=authority,

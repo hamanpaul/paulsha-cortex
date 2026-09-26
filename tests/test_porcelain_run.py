@@ -329,7 +329,7 @@ def test_run_work_payload_help_describes_json_file_path(
     captured = capsys.readouterr()
     assert "JSON 檔案路徑" in captured.out
     assert "--card" in captured.out
-    assert "retry-card 專用" in captured.out
+    assert "regenerate-gates 專用" in captured.out
     assert captured.err == ""
 
 
@@ -363,6 +363,34 @@ def test_run_work_retry_card_forwards_card_and_run_scoped_builder_override(
         "card": "worktree-isolation",
         "builder_executor": "copilot",
         "builder_model": "gpt-5.4",
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_run_work_regenerate_gates_forwards_card(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        _run_cli(
+            [
+                "run", "work", "regenerate-gates", RETRY_CARD_WORK_ID,
+                "--repo", "hamanpaul/paulsha-cortex",
+                "--expected-run-id", RETRY_CARD_RUN_ID,
+                "--card", "tdd-red",
+            ]
+        )
+        == 3
+    )
+
+    request = _submitted_request()
+    assert request["type"] == "work-action"
+    assert request["args"] == {
+        "action": "regenerate-gates",
+        "work_id": RETRY_CARD_WORK_ID,
+        "repo": "hamanpaul/paulsha-cortex",
+        "expected_run_id": RETRY_CARD_RUN_ID,
+        "card": "tdd-red",
     }
     assert capsys.readouterr().err == ""
 

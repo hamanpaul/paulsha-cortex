@@ -130,6 +130,36 @@ def _pr_metadata(path: Path, *, title="fix(work): 修正工作流程", body="Clo
     return path
 
 
+def _seed_verified_run_with_gate(
+    registry: JobRegistry,
+    run_id: str,
+    *,
+    phase: str = "verify",
+    pr_refs: tuple[str, ...] = (),
+    facets: tuple[str, ...] = ("needs_human",),
+    verify_attempts: int = 2,
+) -> object:
+    for current in ("plan", "build", "verify", "review"):
+        if current == "review" and phase != "review":
+            break
+        registry._manager_update_workflow_run(run_id, current_phase=current)
+    attempts = {"claim": 1, "plan": 1, "build": 1, "verify": verify_attempts}
+    if phase == "review":
+        attempts["review"] = 1
+    return registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        pr_refs=pr_refs,
+        attempts=attempts,
+        evidence_refs=("reports/verify/accepted.md",),
+        gate_refs=(GateEvidenceRef("foreign-review", "reports/review/accepted.md", "e" * 64),),
+        gate_status="passed",
+        facets=facets,
+        needs_human_reason=fixture_needs_human_reason(),
+    )
+
+
 def _snapshot(
     path: Path,
     *,
@@ -1458,7 +1488,10 @@ def test_abandon_evidence_rejects_oversized_target_without_reading(
 def test_review_attest_writes_immutable_exact_head_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
     state = tmp_path / "runs.json"
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     started = work_actions.execute_work_action(
@@ -1470,17 +1503,38 @@ def test_review_attest_writes_immutable_exact_head_evidence(
         workflow_registry=registry,
     )
     run_id = started["result"]["run"]["run_id"]
-    for phase in ("plan", "build", "verify", "review"):
-        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    _seed_verified_run_with_gate(
+        registry,
+        run_id,
+        phase="review",
+        pr_refs=("acme/demo#8",),
+        facets=("needs_human", "degraded"),
+    )
+    plan_ref = "docs/superpowers/plans/demo.md"
+    plan_bytes = b"# Accepted plan\n"
+    plan_path = Path(registry.get_workflow_run(run_id).workspace_root) / plan_ref
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_bytes(plan_bytes)
     registry._manager_update_workflow_run(
         run_id,
-        candidate_head=HEAD,
-        verified_head=HEAD,
-        pr_refs=("acme/demo#8",),
-        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/foreign.json", "f" * 64),),
-        gate_status="passed",
-        facets=("needs_human", "degraded"),
-        needs_human_reason=fixture_needs_human_reason(),
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=plan_ref,
+                kind="plan",
+                work_id="demo",
+                baseline_sha256=hashlib.sha256(plan_bytes).hexdigest(),
+            ),
+        ),
+    )
+    original_claim = registry.get_workflow_run(run_id)
+    _snapshot(
+        snapshot,
+        source_revisions=(
+            "issue:12@open",
+            "openspec:demo@1",
+            f"superpowers_plan:acme/demo:{plan_ref}@identity:{plan_ref}",
+        ),
+        provider_revision="gh-2",
     )
 
     class GitHub:
@@ -1518,6 +1572,8 @@ def test_review_attest_writes_immutable_exact_head_evidence(
     review = next(ref for ref in persisted.gate_refs if ref.kind == "maintainer-review")
     assert review.ref == str(evidence)
     assert review.sha256 == first["result"]["hash"]
+    assert persisted.claim_key == original_claim.claim_key
+    assert persisted.source_revision == original_claim.source_revision
     assert persisted.facets == ("degraded",)
 
 
@@ -1807,7 +1863,11 @@ def test_source_change_starts_new_canonical_run(tmp_path: Path) -> None:
 def test_auto_scan_does_not_supersede_active_run_when_planning_adds_sources(
     tmp_path: Path,
 ) -> None:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        prs=(),
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
     state = tmp_path / "runs.json"
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     first = work_actions.execute_work_action(
@@ -1818,12 +1878,35 @@ def test_auto_scan_does_not_supersede_active_run_when_planning_adds_sources(
         now=lambda: 200,
         workflow_registry=registry,
     )
+    run_id = first["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    plan_ref = "docs/superpowers/plans/demo.md"
+    plan_bytes = b"# Accepted plan\n"
+    plan_path = Path(run.workspace_root) / plan_ref
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_bytes(plan_bytes)
+    registry._manager_update_workflow_run(
+        run_id,
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=plan_ref,
+                kind="plan",
+                work_id="demo",
+                baseline_sha256=hashlib.sha256(plan_bytes).hexdigest(),
+            ),
+        ),
+    )
+    before = _seed_verified_run_with_gate(
+        registry, run_id, verify_attempts=3
+    )
+    initial_job_count = len(registry.list_jobs())
     _snapshot(
         snapshot,
+        prs=(),
         source_revisions=(
             "issue:12@open",
             "openspec:demo@1",
-            "superpowers_plan:docs/demo.md@active",
+            f"superpowers_plan:acme/demo:{plan_ref}@identity:{plan_ref}",
         ),
         provider_revision="gh-2",
     )
@@ -1841,9 +1924,291 @@ def test_auto_scan_does_not_supersede_active_run_when_planning_adds_sources(
     )
 
     assert result[0]["action"] == "resume"
-    assert result[0]["run"]["run_id"] == first["result"]["run"]["run_id"]
+    assert result[0]["run"]["run_id"] == run_id
     assert len(registry.list_workflow_runs()) == 1
-    assert registry.list_workflow_runs()[0].status == "ongoing"
+    after = registry.get_workflow_run(run_id)
+    assert after.status == "ongoing"
+    assert after.claim_key == before.claim_key
+    assert after.source_revision == before.source_revision
+    assert after.current_phase == before.current_phase
+    assert after.candidate_head == before.candidate_head
+    assert after.verified_head == before.verified_head
+    assert after.steps == before.steps
+    assert after.attempts == before.attempts
+    assert after.evidence_refs == before.evidence_refs
+    assert after.gate_refs == before.gate_refs
+    assert after.gate_status == before.gate_status
+    assert after.needs_human_reason == before.needs_human_reason
+    assert len(registry.list_jobs()) == initial_job_count
+
+
+def test_resume_does_not_reset_gates_when_manager_pr_becomes_authority_source(
+    tmp_path: Path,
+) -> None:
+    original_sources = ("issue:12@open", "openspec:demo@1")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json", prs=(), source_revisions=original_sources
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    before = _seed_verified_run_with_gate(
+        registry, run_id, phase="review", pr_refs=("acme/demo#17",)
+    )
+    initial_job_count = len(registry.list_jobs())
+    pr_source = "github_pr:acme/demo#17@identity:acme/demo#17;state:open"
+    _snapshot(
+        snapshot,
+        prs=(17,),
+        source_revisions=(*original_sources, pr_source),
+        provider_revision="gh-2",
+    )
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["action"] == "resume"
+    assert result["result"]["run"]["run_id"] == run_id
+    after = registry.get_workflow_run(run_id)
+    assert after.claim_key == before.claim_key
+    assert after.source_revision == before.source_revision
+    assert after.current_phase == before.current_phase
+    assert after.candidate_head == before.candidate_head
+    assert after.verified_head == before.verified_head
+    assert after.steps == before.steps
+    assert after.attempts == before.attempts
+    assert after.gate_refs == before.gate_refs
+    assert after.evidence_refs == before.evidence_refs
+    assert after.needs_human_reason == before.needs_human_reason
+    assert len(registry.list_jobs()) == initial_job_count
+
+
+def test_resume_restarts_exactly_once_for_a_real_authority_change(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        prs=(),
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    before = _seed_verified_run_with_gate(registry, run_id)
+    _snapshot(
+        snapshot,
+        prs=(),
+        source_revisions=("issue:12@closed", "openspec:demo@1"),
+        provider_revision="gh-2",
+    )
+
+    first = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+    reset = registry.get_workflow_run(run_id)
+    second = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 220,
+        workflow_registry=registry,
+    )
+    settled = registry.get_workflow_run(run_id)
+
+    assert first["result"]["run"]["run_id"] == run_id
+    assert second["result"]["run"]["run_id"] == run_id
+    assert reset.claim_key == work_actions._expected_claim_key(
+        work_actions.load_work_authority(
+            repo="acme/demo", work_id="demo", snapshot_path=snapshot
+        )
+    )
+    assert reset.source_revision != before.source_revision
+    assert reset.attempts["verify"] == before.attempts["verify"] + 1
+    assert reset.gate_refs == ()
+    assert settled.attempts == reset.attempts
+    assert settled.gate_refs == reset.gate_refs
+
+
+def test_resume_does_not_exempt_foreign_planning_source_by_prefix(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        prs=(),
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    before = _seed_verified_run_with_gate(registry, run_id)
+    foreign_ref = "docs/superpowers/plans/foreign.md"
+    _snapshot(
+        snapshot,
+        prs=(),
+        source_revisions=(
+            "issue:12@open",
+            "openspec:demo@1",
+            f"superpowers_plan:acme/demo:{foreign_ref}@identity:{foreign_ref}",
+        ),
+        provider_revision="gh-2",
+    )
+
+    work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    after = registry.get_workflow_run(run_id)
+    assert after.source_revision != before.source_revision
+    assert after.attempts["verify"] == before.attempts["verify"] + 1
+    assert after.gate_refs == ()
+
+
+def test_resume_restarts_when_accepted_planning_bytes_drift(tmp_path: Path) -> None:
+    base_sources = ("issue:12@open", "openspec:demo@1")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json", prs=(), source_revisions=base_sources
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    ref = "docs/superpowers/plans/demo.md"
+    accepted_bytes = b"# Accepted plan\n"
+    path = Path(run.workspace_root) / ref
+    path.parent.mkdir(parents=True)
+    path.write_bytes(accepted_bytes)
+    registry._manager_update_workflow_run(
+        run_id,
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind="plan",
+                work_id="demo",
+                baseline_sha256=hashlib.sha256(accepted_bytes).hexdigest(),
+            ),
+        ),
+    )
+    before = _seed_verified_run_with_gate(registry, run_id)
+    path.write_bytes(b"# Drifted plan\n")
+    source = f"superpowers_plan:acme/demo:{ref}@identity:{ref}"
+    _snapshot(
+        snapshot,
+        prs=(),
+        source_revisions=(*base_sources, source),
+        provider_revision="gh-2",
+    )
+
+    work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    after = registry.get_workflow_run(run_id)
+    assert after.source_revision != before.source_revision
+    assert after.attempts["verify"] == before.attempts["verify"] + 1
+    assert after.gate_refs == ()
+
+
+@pytest.mark.parametrize("mismatch", ["pr-ref", "pr-candidate"])
+def test_resume_restarts_when_manager_pr_does_not_match_run_candidate(
+    tmp_path: Path, mismatch: str
+) -> None:
+    base_sources = ("issue:12@open", "openspec:demo@1")
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json", prs=(), source_revisions=base_sources
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run_pr_refs = ("acme/demo#18",) if mismatch == "pr-ref" else ("acme/demo#17",)
+    before = _seed_verified_run_with_gate(
+        registry, run_id, phase="review", pr_refs=run_pr_refs
+    )
+    if mismatch == "pr-candidate":
+        registry._manager_update_workflow_run(run_id, verified_head="f" * 40)
+        before = registry.get_workflow_run(run_id)
+    source = "github_pr:acme/demo#17@identity:acme/demo#17;state:open"
+    _snapshot(
+        snapshot,
+        prs=(17,),
+        source_revisions=(*base_sources, source),
+        provider_revision="gh-2",
+    )
+
+    work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    after = registry.get_workflow_run(run_id)
+    assert after.source_revision != before.source_revision
+    assert after.attempts["verify"] == before.attempts["verify"] + 1
+    assert after.gate_refs == ()
 
 
 def test_canonical_claim_excludes_derived_sources_and_volatile_github_revisions(
@@ -2575,6 +2940,11 @@ def test_ship_resume_rearms_prebinding_target_cardinality_stop(tmp_path: Path) -
         now=lambda: 200,
     )
     assert stopped["result"]["reason"] == "multiple-delivery-targets-unsupported"
+    stopped_run = JobRegistry(state_path=state.parent / "jobs.json").list_workflow_runs()[0]
+    assert stopped_run.needs_human_reason["reason"] == "multiple-delivery-targets-unsupported"
+    assert "unlink" not in stopped_run.needs_human_reason["detail"]
+    assert "發布 canonical Todo" in stopped_run.needs_human_reason["detail"]
+    assert "等 Monitor 更新" in stopped_run.needs_human_reason["detail"]
 
     _snapshot(
         snapshot,
@@ -3212,6 +3582,257 @@ def test_ship_fix_required_persists_capped_reviewer_findings(
     assert persisted["ship"]["findings"] == [
         {"path": f"src/file_{index}.py", "line": 100 + index, "body": f"finding {index}"}
         for index in range(10)
+    ]
+
+
+def _review_steps_passed(steps):
+    """走到 ship needs-fix 時，Cortex 自己的 review gate 必然已通過。"""
+    import dataclasses
+
+    return tuple(
+        dataclasses.replace(step, gate_result="passed") if step.phase == "review" else step
+        for step in steps
+    )
+
+
+def test_review_disposition_requires_resolved_same_head_and_resumes_ship(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    foreign_path = tmp_path / "foreign-review.json"
+    foreign_payload = {"state": "passed", "candidate": HEAD}
+    foreign_path.write_text(json.dumps(foreign_payload), encoding="utf-8")
+    foreign_hash = work_actions.verification.canonical_json_hash(foreign_payload)
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        pr_refs=("acme/demo#8",),
+        gate_refs=(GateEvidenceRef("foreign-review", str(foreign_path), foreign_hash),),
+        gate_status="passed",
+        facets=("needs_human",),
+        needs_human_reason=fixture_needs_human_reason(),
+        steps=_review_steps_passed(registry.get_workflow_run(run_id).steps),
+    )
+    current = {
+        "head": HEAD,
+        "threads": (ReviewThread("thread-1", False, False, "src/demo.py", 7, "finding"),),
+        "merged": False,
+    }
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def ensure_pr_metadata(self, **kwargs):
+            pass
+
+        def fetch_delivery_facts(self, **kwargs):
+            return DeliveryFacts(
+                head=current["head"],
+                mergeable=True,
+                mergeable_state="clean",
+                checks=(GitHubCheck("ci", "completed", "success"),),
+                copilot_reviews=(
+                    CopilotReview(
+                        review_id=9,
+                        commit_id=HEAD,
+                        state="COMMENTED",
+                        body="finding",
+                        author=COPILOT_REVIEWER_LOGIN,
+                        submitted_at_epoch=205,
+                    ),
+                ),
+                review_threads=current["threads"],
+                closing_issues=(12,),
+                active_openspec_absent=True,
+                archive_present=True,
+            )
+
+        def fetch_merge_status(self, **kwargs):
+            return MergeStatus(current["merged"], current["head"], "c" * 40 if current["merged"] else None)
+
+        def request_copilot(self, **kwargs):
+            raise AssertionError("existing exact-HEAD Copilot review must be reused")
+
+    class Orchestrator:
+        def __init__(self, *, github, now):
+            self.github = github
+
+        def merge_if_ready(self, **kwargs):
+            current["merged"] = True
+            return SimpleNamespace(
+                expected_head=kwargs["expected_head"],
+                expected_tree_hash=kwargs["expected_tree_hash"],
+            )
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    monkeypatch.setattr(work_actions, "ShipOrchestrator", Orchestrator)
+    monkeypatch.setattr(work_actions, "load_preflight_command", lambda: ("preflight",))
+    monkeypatch.setattr(
+        work_actions,
+        "run_preflight",
+        lambda **kwargs: PreflightResult(
+            True,
+            None,
+            CommandResult(("policy",), 0, "", ""),
+            CommandResult(("preflight",), 0, "", ""),
+            HEAD,
+            TREE,
+        ),
+    )
+    monkeypatch.setattr(
+        work_actions,
+        "_validate_foreign_review",
+        lambda *_args, **_kwargs: foreign_payload,
+    )
+    base = {
+        "repo_root": str(tmp_path),
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+        "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+        "foreign_review_path": str(foreign_path),
+        "foreign_review_hash": foreign_hash,
+    }
+
+    def ship(now_epoch: float) -> dict:
+        return work_actions.execute_work_action(
+            args={"action": "ship", "repo": "acme/demo", "work_id": "demo", **base},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: now_epoch,
+            workflow_registry=registry,
+        )["result"]
+
+    finding = ship(207)
+    assert finding["action"] == "fix-required"
+    assert _only_journal_row(state)["ship"]["phase"] == "needs-fix"
+
+    still_open = ship(208)
+    assert still_open["action"] == "fix-required"
+    assert still_open["reason"] == "review-threads-unresolved"
+    assert still_open["next_actions"] == ["review-disposition"]
+    disposition_args = {
+        "action": "review-disposition",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "actor": "maintainer",
+        "reason": "討論已完成，此 finding 不阻擋合併。",
+    }
+    with pytest.raises(RuntimeError, match="all PR review threads resolved"):
+        work_actions.execute_work_action(
+            args=disposition_args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 209,
+            workflow_registry=registry,
+        )
+    assert not (tmp_path / "evidence" / "review-disposition").exists()
+
+    current["threads"] = (ReviewThread("thread-1", True, False, "src/demo.py", 7, "finding"),)
+    still_needs_operator = ship(210)
+    assert still_needs_operator["action"] == "fix-required"
+    assert still_needs_operator["reason"] == "review-disposition-required"
+    assert still_needs_operator["next_actions"] == ["review-disposition"]
+    registry._manager_update_workflow_run(
+        run_id,
+        facets=("needs_human",),
+        gate_status="running",
+        needs_human_reason=work_actions.diagnostic_reason(
+            "review-disposition-required",
+            "PR review threads 已 resolved，仍需要 operator disposition。",
+            source="test_review_disposition_935",
+            run_id=run_id,
+            work_id="demo",
+            head=HEAD,
+        ),
+    )
+    resumed_attention = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 211,
+        workflow_registry=registry,
+        workflow_starter=lambda *_args: registry.get_workflow_run(run_id),
+    )["result"]
+    assert "review-disposition" in resumed_attention["next_actions"]
+    assert "cortex work review-disposition" in resumed_attention["next_step_hint"]
+
+    current["head"] = "c" * 40
+    with pytest.raises(RuntimeError, match="PR HEAD mismatch"):
+        work_actions.execute_work_action(
+            args=disposition_args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 212,
+            workflow_registry=registry,
+        )
+
+    current["head"] = HEAD
+    recorded = work_actions.execute_work_action(
+        args=disposition_args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 212,
+        workflow_registry=registry,
+    )["result"]
+    assert recorded["action"] == "review-disposition-recorded"
+    record_path = Path(recorded["ref"])
+    assert record_path.is_file()
+    assert record_path.stat().st_mode & 0o222 == 0
+    row = _only_journal_row(state)
+    assert row["ship"]["phase"] == "needs-fix"
+    assert row["ship"]["findings"] == [
+        {"path": "src/demo.py", "line": 7, "body": "finding"}
+    ]
+    assert row["review_dispositions"] == [
+        {"ref": str(record_path), "hash": recorded["hash"]}
+    ]
+    assert "needs_human" not in registry.get_workflow_run(run_id).facets
+
+    current["threads"] = (
+        ReviewThread("thread-1", True, False, "src/demo.py", 7, "finding"),
+        ReviewThread("thread-2", True, False, "src/other.py", 8, "new thread"),
+    )
+    stale_thread_set = ship(213)
+    assert stale_thread_set["action"] == "fix-required"
+    assert stale_thread_set["reason"] == "review-disposition-required"
+    current["threads"] = (
+        ReviewThread("thread-1", True, False, "src/demo.py", 7, "finding"),
+    )
+
+    current["head"] = "c" * 40
+    with pytest.raises(RuntimeError, match="ship HEAD differs from authenticated GitHub PR"):
+        ship(214)
+    current["head"] = HEAD
+
+    resumed = ship(216)
+    assert resumed == {"action": "merged-awaiting-closure", "head": HEAD}
+    row = _only_journal_row(state)
+    assert row["review_finding_history"][0]["finding_count"] == 1
+    assert row["review_finding_history"][0]["review_id"] == 9
+    assert row["review_finding_history"][0]["disposition_ref"] == str(record_path)
+    assert row["review_dispositions"] == [
+        {"ref": str(record_path), "hash": recorded["hash"]}
     ]
 
 
@@ -3998,3 +4619,40 @@ def test_intake_without_any_authority_or_link_args_fails_closed_without_creating
         )
 
     assert registry.list_workflow_runs() == []
+
+
+def test_review_disposition_refuses_when_cortex_review_gate_not_passed(tmp_path: Path) -> None:
+    """disposition 只裁決 ship 段 Copilot finding；Cortex review gate 未通過不得繞過。"""
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id, candidate_head=HEAD, verified_head=HEAD, facets=("needs_human",),
+        needs_human_reason=fixture_needs_human_reason(),
+    )
+    with pytest.raises(RuntimeError, match="only applies to ship Copilot findings"):
+        work_actions.execute_work_action(
+            args={
+                "action": "review-disposition",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "maintainer",
+                "reason": "review gate 尚未通過時不得裁決續行。",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 209,
+            workflow_registry=registry,
+        )

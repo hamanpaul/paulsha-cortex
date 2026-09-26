@@ -30,7 +30,7 @@ import pytest
 
 from paulsha_cortex import doctor
 from paulsha_cortex.control import contract as control_contract
-from paulsha_cortex.coordinator import gate_ledger, manager, work_actions
+from paulsha_cortex.coordinator import gate_ledger, gate_runner, manager, work_actions
 from paulsha_cortex.coordinator import terminal_contract as tc
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
@@ -413,6 +413,29 @@ def _stuck_run(tmp_path: Path):
     return snapshot, registry, run, ledger
 
 
+def _additional_terminal_build_job(
+    tmp_path: Path, registry: JobRegistry, run, *, card: str
+) -> dict:
+    worktree = tmp_path / f"worktree-{card}"
+    worktree.mkdir()
+    log = tmp_path / "logs" / "workflow" / f"{card}.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("{}\n", encoding="utf-8")
+    job = registry.create_job(
+        task=f"demo-{card}",
+        persona="builder",
+        branch=f"feature/{card}",
+        pane="",
+        worktree=str(worktree),
+        workflow_run_id=run.run_id,
+        workflow_card=card,
+        workflow_phase="build",
+    )
+    registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    return next(item for item in registry.list_jobs() if item["job_id"] == job["job_id"])
+
+
 def _regenerate(tmp_path: Path, snapshot: Path, registry: JobRegistry, **overrides):
     args = {
         "action": "regenerate-gates",
@@ -515,6 +538,49 @@ def test_regenerate_gates_rejects_caller_supplied_evidence(tmp_path: Path) -> No
         )
 
 
+def test_regenerate_gates_selects_the_requested_card_from_multiple_build_cards(
+    tmp_path: Path, monkeypatch
+) -> None:
+    snapshot, registry, run, _ledger = _stuck_run(tmp_path)
+    first = next(
+        item for item in registry.list_jobs() if item.get("workflow_card") == "tdd-red"
+    )
+    _additional_terminal_build_job(tmp_path, registry, run, card="worktree-isolation")
+    calls: list[dict] = []
+
+    def run_gates(**kwargs):
+        calls.append(kwargs)
+        return {"gates": []}
+
+    monkeypatch.setattr(gate_runner, "run_declared_gates", run_gates)
+
+    result = _regenerate(
+        tmp_path, snapshot, registry, expected_run_id=run.run_id, card="tdd-red"
+    )["result"]
+
+    assert result["card_id"] == "tdd-red"
+    assert calls[0]["job_id"] == first["job_id"]
+    assert calls[0]["ledger_path"] == tc.gate_ledger_path(first["log_path"])
+
+
+def test_regenerate_gates_requires_card_when_multiple_build_cards_are_eligible(
+    tmp_path: Path, monkeypatch
+) -> None:
+    snapshot, registry, run, _ledger = _stuck_run(tmp_path)
+    _additional_terminal_build_job(tmp_path, registry, run, card="worktree-isolation")
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        gate_runner,
+        "run_declared_gates",
+        lambda **kwargs: calls.append(kwargs) or {"gates": []},
+    )
+
+    with pytest.raises(RuntimeError, match="requires --card"):
+        _regenerate(tmp_path, snapshot, registry, expected_run_id=run.run_id)
+
+    assert calls == []
+
+
 def test_control_contract_accepts_regenerate_gates_with_exact_run_cas() -> None:
     """控制佇列是所有入口的收斂點：新動作必須在此被承認且 fail-closed 驗參。"""
 
@@ -537,6 +603,13 @@ def test_control_contract_accepts_regenerate_gates_with_exact_run_cas() -> None:
         },
     )
     control_contract.validate_request(ok)
+
+    card_pinned = dict(ok, args={**ok["args"], "card": "tdd-red"})
+    control_contract.validate_request(card_pinned)
+
+    invalid_card = dict(ok, args={**ok["args"], "card": "Bad card"})
+    with pytest.raises(ValueError, match="requires exact card id"):
+        control_contract.validate_request(invalid_card)
 
     missing = dict(
         base,

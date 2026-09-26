@@ -1,0 +1,1 @@
+修正 #817 的 stale `building` 狀態：complete/status 會在 slice 沒有目前綁定的 in-flight builder job 時，將它收斂為附 `DiagnosticReason` 的 `needs_human`；新增需 actor、reason 與 exact `binding_revision` CAS 的單筆 `supersede` action，保留舊 slice 與 audit，並使其離開 attention；相同 CAS 重送冪等，不新增 bulk closure 或 diagnosis intent。

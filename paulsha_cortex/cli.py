@@ -50,7 +50,7 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-card|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|recover-superseded|reset-reclaim-budget|refreeze-base|auto|review-attest|ship> ...
+usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-card|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|close-delivered|recover-superseded|reset-reclaim-budget|refreeze-base|auto|review-attest|review-disposition|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
@@ -66,15 +66,17 @@ work item commands:
   retry-review  以 exact Candidate CAS 只重跑 foreign review，不重跑 builder
   abandon   以 exact WorkflowRun CAS 將 pre-delivery run 標成 superseded
   retire-delivered  以 exact WorkflowRun CAS 退休交付已在管線外完成、pr_refs 全 terminal（merged/closed）的孤兒 run
+  close-delivered  對沒有 WorkflowRun 的已交付 work item 驗證遠端 closure，需提供 --actor 與 --reason 並寫入 CompletionRecord
   recover-superseded  以 exact WorkflowRun CAS 撿回被識別失誤 supersede 的已驗證 run（需 candidate＋PR、verify/review phase、同 work 無 ongoing run；動作＝復歸 ongoing＋official authority-restart）
   recover-planning  對 define/needs_human 的 planning 失敗作可恢復重跑
   recover-pre-candidate  對 candidate 產生前的 builder 失敗作可恢復重跑並回收 worktree
   recover-repair-commit  對 repair commit 已存在但缺 terminal evidence 的 build 失敗做具 CAS 的採納恢復
-  regenerate-gates  以 exact WorkflowRun CAS，對既有 builder job log 依當前 PSC_GATE_CMD_* 宣告重跑 gate 並重寫 ledger（不改判、不重派 builder）
+  regenerate-gates  以 exact WorkflowRun CAS 重跑指定 build 卡的 gate 並重寫 ledger；多張 build 卡時須加 --card（不改判、不重派 builder）
   reset-reclaim-budget  明示重置 semantic-reclaim 世代熔斷計數（需 --actor／--reason，落稽核 evidence）
   refreeze-base  以 exact WorkflowRun CAS 把還活著的 run 的候選 git base 重新凍結到目前的 origin/main（需 --actor／--reason，fast-forward only，落稽核 evidence；已有被採信 candidate／in-flight job／build branch 帶外來 commit 時一律拒絕）
   auto      管理 cortex:auto-on-going issue label
   review-attest  建立 exact-HEAD maintainer review evidence
+  review-disposition  裁決已 resolved 的 exact-HEAD ship finding
   ship      執行 fail-closed delivery state machine
 
 `cortex stat --combo-selections` 可彙總自動選牌／override／bypass 的來源與 task_type。

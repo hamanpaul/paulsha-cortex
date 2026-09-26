@@ -1,0 +1,1 @@
+#547 與 #968–#971：recover-pre-candidate 改採完整 repo／Work Item／slice／attempt 身分，移除名稱、spec suffix 與全表 fallback；legacy unbound 或不唯一的目標在回收和狀態寫入前即拒絕，Manager 與 work action 共用 recovery core，並一致清除 builder binding、更新 action/history 及 supersede handoff manifest。

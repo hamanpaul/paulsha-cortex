@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import pwd
 import re
@@ -14,7 +15,7 @@ import stat
 import subprocess
 import tempfile
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,7 +55,12 @@ from .claim import (
     needs_human_next_step_hint,
 )
 from . import model_resolution
-from .diagnostics import DiagnosticReason, diagnostic_reason, summarize_exception
+from .diagnostics import (
+    DiagnosticReason,
+    coerce_diagnostic_reason,
+    diagnostic_reason,
+    summarize_exception,
+)
 from .model_identities import (
     AGY_DOMAIN,
     AGY_LIVE_PROBE,
@@ -81,7 +87,10 @@ from .workflow import (
     BRAINSTORM_AUTHORITY_MISSING,
     WORKFLOW_PHASES,
     GateEvidenceRef,
+    PlanningDriftArtifact,
     PlanningArtifactAuthority,
+    PlanReviewReceipt,
+    WorkflowPlanningDriftStop,
     WorkflowManifest,
     brainstorm_authority_bound,
     validate_workflow_phase_transition,
@@ -101,8 +110,9 @@ TERMINAL_STATUSES = frozenset({"exited", "failed"})
 WORKFLOW_LANE_GATE_STATUS = "workflow-tracked"
 WORKFLOW_LANE_GATE_REASON = "workflow-lane-job"
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
-SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"})
+SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"})
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
+WORKFLOW_INPUT_ENVELOPE_MAX_BYTES = 131072
 _PLANNING_SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
@@ -210,7 +220,7 @@ def _supersede_handoff_manifest(
     actor: str,
     clock: Callable[[], str] = _utcnow,
 ) -> None:
-    """操作者復原動作（recover-pre-candidate／abandon）後，替殘留 handoff manifest
+    """操作者 slice action 後，替殘留 handoff manifest
     補上 superseded 稽核標記（issue #383）。
 
     `run_tick()`/`dispatch_gate_scan()` 的 fanout 放行判定改成與 registry 現況
@@ -252,6 +262,181 @@ def _reclaim_preserve_root(registry) -> Path:
     if isinstance(state_path, (str, Path)):
         return Path(state_path).resolve().parent / "evidence"
     return paths.coordinator_root() / "evidence"
+
+
+def _owner_identity_matches(row: dict, *, expected: dict | None = None) -> dict[str, str]:
+    identity = row.get("owner_identity")
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"repo", "work_id", "slice_id"}
+        or any(not isinstance(identity.get(key), str) or not identity[key] for key in identity)
+        or identity.get("slice_id") != row.get("slice_id")
+    ):
+        raise RuntimeError("recover-pre-candidate requires complete owner identity")
+    if not isinstance(row.get("attempt_id"), str) or not row["attempt_id"]:
+        raise RuntimeError("recover-pre-candidate requires complete owner identity attempt")
+    if expected is not None and (
+        identity["repo"] != expected.get("repo")
+        or identity["work_id"] != expected.get("work_id")
+    ):
+        raise RuntimeError("recover-pre-candidate owner identity differs from WorkAuthority")
+    return identity
+
+
+def _resolve_work_owner_slice(registry, *, repo: str, work_id: str) -> dict:
+    """以完整 WorkAuthority repo/work_id 唯一解析 slice，拒絕啟發式 fallback。"""
+    lookup = getattr(registry, "list_slices_by_owner", None)
+    if not callable(lookup):
+        raise RuntimeError("recover-pre-candidate owner lookup API unavailable")
+    rows = lookup(repo=repo, work_id=work_id)
+    matches = []
+    malformed = False
+    for row in rows:
+        identity = row.get("owner_identity") if isinstance(row, dict) else None
+        if not isinstance(identity, dict):
+            continue
+        if identity.get("repo") != repo or identity.get("work_id") != work_id:
+            continue
+        try:
+            _owner_identity_matches(row, expected={"repo": repo, "work_id": work_id})
+        except RuntimeError:
+            malformed = True
+            continue
+        matches.append(row)
+    if malformed:
+        raise RuntimeError("recover-pre-candidate owner identity is incomplete or malformed")
+    if len(matches) > 1:
+        raise RuntimeError("recover-pre-candidate owner identity is ambiguous")
+    if not matches:
+        raise RuntimeError("recover-pre-candidate requires exactly one owner identity match")
+    return matches[0]
+
+
+def _recover_pre_candidate_core(
+    registry,
+    *,
+    slice_id: str,
+    actor: str,
+    handoff_dir: str,
+    clock: Callable[[], str] = _utcnow,
+    git_runner=None,
+    expected_owner: dict | None = None,
+) -> dict:
+    """兩個入口共用的 owner-bound admission、reclaim、transition 與 handoff 更新。"""
+    try:
+        row = registry.get_slice(slice_id)
+    except KeyError as exc:
+        raise RuntimeError("recover-pre-candidate target slice is unavailable") from exc
+    owner_identity = _owner_identity_matches(row, expected=expected_owner)
+    candidate = row.get("candidate")
+    # 與 needs_human 動作清單（valid_candidate）同一判準：非合法 SHA 的殘值視同尚無
+    # candidate，仍可 recover；只有合法 SHA candidate 才拒絕。
+    if isinstance(candidate, str) and verification.SAFE_SHA_RE.fullmatch(candidate) is not None:
+        raise ValueError("recover-pre-candidate requires null candidate")
+    if row.get("state") not in {"needs_human", "failed", "pending"}:
+        raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")
+    builder_job_id = row.get("builder_job_id")
+    if row.get("state") == "pending" and builder_job_id is None:
+        return {
+            "action": "recover-pre-candidate",
+            "reason": "already-recovered",
+            "slice_id": slice_id,
+            "slice_state": "pending",
+            "gate_state": "pending",
+            "result": "ok",
+        }
+    if not isinstance(builder_job_id, str) or not builder_job_id:
+        raise RuntimeError("recover-pre-candidate requires an owner-bound builder job")
+    try:
+        builder_job = registry.get_job(builder_job_id)
+    except Exception as exc:
+        raise RuntimeError("recover-pre-candidate owner-bound builder job is unavailable") from exc
+    if (
+        builder_job.get("owner_identity") != owner_identity
+        or builder_job.get("attempt_id") != row.get("attempt_id")
+    ):
+        raise RuntimeError("recover-pre-candidate builder job identity mismatch")
+
+    worktree = builder_job.get("worktree")
+    if isinstance(worktree, str) and worktree and Path(worktree).exists():
+        marker = job_workspace.read_marker(worktree)
+        if (
+            not isinstance(marker, dict)
+            or marker.get("owner_identity") != owner_identity
+            or marker.get("attempt_id") != row.get("attempt_id")
+        ):
+            raise RuntimeError("recover-pre-candidate workspace marker identity mismatch")
+    branch_hint = row.get("branch")
+    reclaim = worktree_reclaim.reclaim_recorded_or_derived(
+        recorded_path=worktree if isinstance(worktree, (str, Path)) and worktree else None,
+        pool_root=None,
+        job_id=slice_id,
+        branch=branch_hint if isinstance(branch_hint, str) else None,
+        git_runner=git_runner,
+        preserve_root=_reclaim_preserve_root(registry),
+    )
+    if reclaim is not None and not reclaim.ok:
+        raise RuntimeError(
+            "recover-pre-candidate worktree reclaim failed: "
+            f"{reclaim.detail or reclaim.status} ({reclaim.path})"
+        )
+
+    requested_at = clock()
+    consumed_at = clock()
+    registry.record_action(
+        slice_id,
+        action="operator-recover-pre-candidate",
+        actor=actor,
+        state="pending",
+        gate_state="pending",
+        clear_builder_binding=True,
+        clear_candidate=True,
+        requested_at=requested_at,
+        consumed_at=consumed_at,
+        result="ok",
+    )
+    updated = registry.get_slice(slice_id)
+    if (
+        updated.get("state") != "pending"
+        or updated.get("gate_state") != "pending"
+        or updated.get("builder_job_id") is not None
+        or updated.get("candidate") is not None
+        or updated.get("owner_identity") != owner_identity
+    ):
+        raise RuntimeError("recover-pre-candidate registry read-back mismatch")
+
+    manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+    manifest_was_present = manifest_path.is_file() and not manifest_path.is_symlink()
+    action = "operator-recover-pre-candidate"
+    _supersede_handoff_manifest(
+        handoff_dir=handoff_dir,
+        slice_id=slice_id,
+        action=action,
+        actor=actor,
+        clock=clock,
+    )
+    if manifest_was_present:
+        manifest = _read_manifest_payload(manifest_path)
+        if (
+            manifest is None
+            or not isinstance(manifest.get("superseded_at"), str)
+            or manifest.get("superseded_by") != actor
+            or manifest.get("superseded_reason") != action
+        ):
+            raise RuntimeError("recover-pre-candidate handoff manifest read-back mismatch")
+    payload = {
+        "slice_id": slice_id,
+        "action": "recover-pre-candidate",
+        "reason": "pre-candidate-slice-reset",
+        "slice_state": updated.get("state"),
+        "gate_state": updated.get("gate_state"),
+        "result": "ok",
+        "requested_at": requested_at,
+        "consumed_at": consumed_at,
+    }
+    if reclaim is not None:
+        payload["worktree_reclaim"] = reclaim.to_dict()
+    return payload
 
 
 def _is_workflow_lane_job(job: dict) -> bool:
@@ -678,12 +863,19 @@ def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
         actions = ["recover-pre-candidate", "abandon"] if not valid_candidate else ["abandon"]
         if slice_repin_eligible(slice_row):
             actions = ["retry-build"] + actions
+        if not _slice_has_in_flight_job(registry, slice_row):
+            actions.append("supersede")
         return actions
     if state != "needs_human":
         return []
     if not valid_candidate:
-        return ["recover-pre-candidate", "abandon"]
+        actions = ["recover-pre-candidate", "abandon"]
+        if not _slice_has_in_flight_job(registry, slice_row):
+            actions.append("supersede")
+        return actions
     actions = ["retry-build", "abandon"]
+    if not _slice_has_in_flight_job(registry, slice_row):
+        actions.append("supersede")
     builder_job_id = slice_row.get("builder_job_id")
     if not isinstance(builder_job_id, str):
         return actions
@@ -705,6 +897,127 @@ def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
     ):
         actions.append("retry-review")
     return actions
+
+
+def _slice_has_in_flight_job(registry, slice_row: dict) -> bool:
+    slice_id = slice_row.get("slice_id")
+    if not isinstance(slice_id, str):
+        return True
+    list_jobs = getattr(registry, "list_jobs", None)
+    if callable(list_jobs):
+        try:
+            return any(
+                job.get("task") == slice_id and job.get("status") in IN_FLIGHT_STATUSES
+                for job in list_jobs()
+                if isinstance(job, dict)
+            )
+        except Exception:  # noqa: BLE001 - 無法證明沒有 active job 時 fail-closed
+            return True
+    get_job = getattr(registry, "get_job", None)
+    if not callable(get_job):
+        return True
+    for key in ("builder_job_id", "reviewer_job_id"):
+        job_id = slice_row.get(key)
+        if not isinstance(job_id, str):
+            continue
+        try:
+            if get_job(job_id).get("status") in IN_FLIGHT_STATUSES:
+                return True
+        except Exception:  # noqa: BLE001 - 無法證明沒有 active job 時 fail-closed
+            return True
+    return False
+
+
+def reconcile_building_slices(
+    registry,
+    *,
+    clock: Callable[[], str] = _utcnow,
+    errors: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """把沒有 current in-flight builder 的 building slice 收斂為 needs_human。"""
+    list_jobs = getattr(registry, "list_jobs", None)
+    list_slices = getattr(registry, "list_slices", None)
+    if not callable(list_jobs) or not callable(list_slices):
+        return []
+    try:
+        jobs = list_jobs()
+        slices = list_slices()
+    except Exception as exc:  # noqa: BLE001 - reconcile 失敗不得遮住 status/tick 結果
+        detail = {"stage": "reconcile-building-slices", "error": str(exc)}
+        if errors is not None:
+            errors.append(detail)
+        else:
+            logger.warning("building slice reconciliation failed: %s", exc)
+        return []
+    jobs_by_id = {
+        job.get("job_id"): job
+        for job in jobs
+        if isinstance(job, dict) and isinstance(job.get("job_id"), str)
+    }
+    reconciled: list[str] = []
+    for slice_row in slices:
+        if not isinstance(slice_row, dict) or slice_row.get("state") != "building":
+            continue
+        slice_id = slice_row.get("slice_id")
+        if not isinstance(slice_id, str) or not slice_id:
+            continue
+        builder_job_id = slice_row.get("builder_job_id")
+        builder_job = jobs_by_id.get(builder_job_id) if isinstance(builder_job_id, str) else None
+        if (
+            isinstance(builder_job, dict)
+            and builder_job.get("task") == slice_id
+            and builder_job.get("status") in IN_FLIGHT_STATUSES
+            and builder_job.get("kind") != "review"
+        ):
+            continue
+        observed_at = clock()
+        reason = diagnostic_reason(
+            "building-without-inflight-job",
+            "slice 標示為 building，但目前沒有綁定的 in-flight builder job。",
+            source="paulsha_cortex.coordinator.manager.reconcile_building_slices",
+            next_step_hint=(
+                "請檢視 slice 與 job 狀態；可用 retry-build 重派，或依明確理由執行 supersede。"
+            ),
+            recorded_at=observed_at,
+            slice_id=slice_id,
+            builder_job_id=builder_job_id,
+        )
+        gate_state = slice_row.get("gate_state")
+        action_kwargs: dict[str, Any] = {}
+        if gate_state in {"pending", "failed", "needs_human"}:
+            action_kwargs["gate_state"] = "needs_human"
+        expected_binding_revision = slice_row.get("binding_revision")
+        try:
+            registry.record_action(
+                slice_id,
+                action="manager-reconcile-building-without-inflight-job",
+                actor="manager",
+                state="needs_human",
+                requested_at=observed_at,
+                consumed_at=observed_at,
+                result="reconciled",
+                diagnostic_reason=reason,
+                **(
+                    {"expected_binding_revision": expected_binding_revision}
+                    if isinstance(expected_binding_revision, int)
+                    and not isinstance(expected_binding_revision, bool)
+                    else {}
+                ),
+                **action_kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - report the failed CAS/write and continue
+            detail = {
+                "slice_id": slice_id,
+                "stage": "reconcile-building-slices",
+                "error": str(exc),
+            }
+            if errors is not None:
+                errors.append(detail)
+            else:
+                logger.warning("building slice reconciliation failed for %s: %s", slice_id, exc)
+            continue
+        reconciled.append(slice_id)
+    return reconciled
 
 
 def _resolve_ancestry_status(slice_row: dict, *, git_runner) -> dict[str, Any]:
@@ -978,6 +1291,115 @@ def _workflow_execution_identity(registry, run) -> dict[str, Any]:
     return _unknown_execution_identity(card=step.card)
 
 
+_PROVIDER_ATTEMPT_ERROR_RE = re.compile(
+    r"API error\s+\(attempt\s+\d+\):[^\r\n]*", re.IGNORECASE
+)
+_PROVIDER_ATTEMPT_ERROR_NOTE_LIMIT = 400
+
+
+def _provider_attempt_errors(job: Mapping[str, object]) -> list[str]:
+    """從 job log 擷取有明確 attempt 標記的 provider ERROR 訊息供呈現。"""
+    log_path = job.get("log_path")
+    if not isinstance(log_path, str) or not log_path:
+        return []
+    output = provider_outcome.read_log_tail(log_path)
+    if not output:
+        return []
+    messages: list[str] = []
+    for line in output.splitlines():
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, Mapping):
+            continue
+        status = record.get("status")
+        if not isinstance(status, str) or status.upper() != "ERROR":
+            continue
+        for key in ("error", "message", "detail", "reason"):
+            value = record.get(key)
+            if not isinstance(value, str):
+                continue
+            match = _PROVIDER_ATTEMPT_ERROR_RE.search(value)
+            if match is None:
+                continue
+            message = match.group(0).strip()
+            if len(message) > _PROVIDER_ATTEMPT_ERROR_NOTE_LIMIT:
+                message = message[:_PROVIDER_ATTEMPT_ERROR_NOTE_LIMIT].rstrip() + "…"
+            if message not in messages:
+                messages.append(message)
+            break
+    return messages
+
+
+def workflow_job_result_presentation(
+    job: Mapping[str, object], run
+) -> dict[str, Any]:
+    """只為 Manager 已採信的 verify verdict 附上恢復的 provider attempt error。"""
+    locator = job.get("workflow_evidence")
+    evidence_path = locator.get("path") if isinstance(locator, Mapping) else None
+    evidence_hash = locator.get("hash") if isinstance(locator, Mapping) else None
+    candidate = job.get("subject_head")
+    if (
+        job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or job.get("workflow_phase") != "verify"
+        or not isinstance(locator, Mapping)
+        or set(locator) != {"kind", "path", "hash"}
+        or locator.get("kind") != "verify"
+        or job.get("workflow_run_id") != getattr(run, "run_id", None)
+        or job.get("workflow_claim_key") != getattr(run, "claim_key", None)
+        or job.get("workflow_repo") != getattr(run, "repo", None)
+        or not isinstance(candidate, str)
+        or candidate != getattr(run, "candidate_head", None)
+        or candidate != getattr(run, "verified_head", None)
+    ):
+        return {}
+    if (
+        not isinstance(evidence_path, str)
+        or Path(evidence_path).is_absolute()
+        or ".." in Path(evidence_path).parts
+        or Path(evidence_path).parts[:2] != ("evidence", "workflow")
+        or not isinstance(evidence_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", evidence_hash) is None
+    ):
+        return {}
+    card = job.get("workflow_card")
+    if not isinstance(card, str) or not any(
+        step.phase == "verify" and step.card == card and step.gate_result == "passed"
+        for step in getattr(run, "steps", ())
+    ):
+        return {}
+    errors = _provider_attempt_errors(job)
+    if not errors:
+        return {}
+    return {
+        "workflow_result": {
+            "status": "verified",
+            "recovered_provider_errors": errors,
+        }
+    }
+
+
+def workflow_accepted_results_for_run(registry, run) -> list[dict[str, Any]]:
+    """投影同一 run 中帶 recovered provider error 註記的已採信驗證結果。"""
+    try:
+        jobs = registry.list_jobs()
+    except Exception:  # noqa: BLE001 - 呈現補充欄位不得讓 status 失效
+        return []
+    results: list[dict[str, Any]] = []
+    for job in jobs:
+        if not isinstance(job, Mapping):
+            continue
+        presentation = workflow_job_result_presentation(job, run)
+        result = presentation.get("workflow_result")
+        if not isinstance(result, dict):
+            continue
+        results.append({"card": job.get("workflow_card"), **result})
+    return results
+
+
 def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runner=None) -> dict[str, Any]:
     slice_id = str(slice_row.get("slice_id") or "")
     builder_job_id = slice_row.get("builder_job_id")
@@ -1007,6 +1429,7 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
         gate_reason = manifest.get("gate_reason")
         if isinstance(gate_reason, str) and gate_reason:
             reason = gate_reason
+    diagnostic_payload = None
     if reason is None:
         actions = slice_row.get("actions")
         if isinstance(actions, list) and actions:
@@ -1015,6 +1438,12 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
                 latest_action = latest.get("action")
                 if isinstance(latest_action, str) and latest_action:
                     reason = latest_action
+    actions = slice_row.get("actions")
+    if isinstance(actions, list) and actions and isinstance(actions[-1], dict):
+        latest_diagnostic = coerce_diagnostic_reason(actions[-1].get("diagnostic_reason"))
+        if latest_diagnostic is not None:
+            diagnostic_payload = latest_diagnostic.to_dict()
+            reason = latest_diagnostic.rendered()
     # #384：manifest 上的 typed provider failure 分類（None 除非本輪終局是
     # build-phase failure 且分類得到結果，見上面 write_manifest 的呼叫端）。
     # 投影出來讓 `cortex inspect status` 不必自己解析 `reason` 字串。
@@ -1035,12 +1464,14 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
         "slice_id": slice_id,
         "slice_state": slice_row.get("state"),
         "gate_state": slice_row.get("gate_state"),
+        "binding_revision": slice_row.get("binding_revision"),
         "job_state": reviewer_job_state or builder_job_state,
         "builder_job_id": builder_job_id,
         "builder_job_state": builder_job_state,
         "reviewer_job_id": reviewer_job_id,
         "reviewer_job_state": reviewer_job_state,
         "reason": reason,
+        "diagnostic_reason": diagnostic_payload,
         "provider_outcome": manifest_provider_outcome,
         "repo": repo,
         "candidate": slice_row.get("candidate"),
@@ -1128,6 +1559,7 @@ def workflow_status_entry(
         from .work_actions import (
             _phase_recovery_actions,
             blocking_findings_next_step_hint,
+            main_sync_retry_build_next_step_hint,
         )
 
         next_actions = (
@@ -1148,6 +1580,10 @@ def workflow_status_entry(
                 repo=getattr(run, "repo", None),
                 candidate=getattr(run, "candidate_head", None),
             )
+        if persisted_next_step_hint is None and "retry-build" in next_actions:
+            main_sync_hint = main_sync_retry_build_next_step_hint(run)
+            if main_sync_hint is not None:
+                next_step_hint = main_sync_hint
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         pass
     try:
@@ -1157,7 +1593,7 @@ def workflow_status_entry(
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         candidate_git_base = None
     execution_identity = _workflow_execution_identity(registry, run)
-    return {
+    entry = {
         "kind": "workflow_run",
         "run_id": run.run_id,
         "work_id": run.work_id,
@@ -1180,6 +1616,10 @@ def workflow_status_entry(
         "updated_at": run.updated_at,
         **execution_identity,
     }
+    accepted_workflow_results = workflow_accepted_results_for_run(registry, run)
+    if accepted_workflow_results:
+        entry["accepted_workflow_results"] = accepted_workflow_results
+    return entry
 
 
 def _completion_candidate_ref(
@@ -1401,6 +1841,7 @@ def _write_gate_evaluation(
     reviewer_identity: dict | None,
     findings: list[dict] | None,
     coordinator_root: Path | None,
+    diagnostics: list[str] | None = None,
 ) -> dict:
     payload = foreign_review.build_gate_evaluation(
         slice_id=slice_id,
@@ -1411,6 +1852,7 @@ def _write_gate_evaluation(
         candidate=candidate,
         launch_identity={"builder": builder_identity, "reviewer": reviewer_identity},
         findings=findings,
+        diagnostics=diagnostics,
     )
     return foreign_review.write_gate_evaluation(payload, coordinator_root=coordinator_root)
 
@@ -1682,7 +2124,14 @@ def _launch_foreign_review(
             slice_id=reviewer_job["job_id"],
             prompt=prompt,
             worktree=str(review_worktree),
-            log_dir=str(Path("runtime/review") / slice_id),
+            log_dir=str(
+                (
+                    paths.slice_review_log_root(
+                        coordinator_root_override=coordinator_root
+                    )
+                    / reviewer_job["job_id"]
+                ).resolve()
+            ),
         )
         registry.attach_launch_handle(
             reviewer_job["job_id"],
@@ -1985,7 +2434,7 @@ def _finalize_review_job(
                 candidate=candidate,
                 launch_identity=reviewer_identity,
             )
-    except Exception:
+    except Exception as exc:
         evaluation = _write_gate_evaluation(
             slice_id=slice_id,
             state="absent",
@@ -1997,6 +2446,7 @@ def _finalize_review_job(
             reviewer_identity=reviewer_identity,
             findings=[],
             coordinator_root=coordinator_root,
+            diagnostics=[str(exc)],
         )
         _apply_review_evaluation(registry, slice_id, evaluation)
         return evaluation, "needs_human", "foreign-review-absent"
@@ -2028,6 +2478,8 @@ def apply_slice_action(
     action: str,
     actor: str,
     specs_dir: str,
+    reason: str | None = None,
+    expected_binding_revision: int | None = None,
     handoff_dir: str = autonomy.DEFAULT_HANDOFF_DIR,
     launcher=None,
     review_launcher=None,
@@ -2050,11 +2502,57 @@ def apply_slice_action(
         raise ValueError(f"unsupported-slice-action:{action}")
     if not isinstance(actor, str) or not actor.strip():
         raise ValueError("slice-action actor must be a non-empty string")
+    if action == "supersede":
+        if actor != actor.strip() or len(actor) > 128 or not actor.isprintable():
+            raise ValueError("supersede requires bounded actor")
+        if (
+            not isinstance(reason, str)
+            or reason != reason.strip()
+            or not 1 <= len(reason) <= 500
+            or not reason.isprintable()
+        ):
+            raise ValueError("supersede requires bounded reason")
+        if (
+            not isinstance(expected_binding_revision, int)
+            or isinstance(expected_binding_revision, bool)
+            or expected_binding_revision < 1
+        ):
+            raise ValueError("supersede requires exact expected_binding_revision")
     try:
         slice_row = registry.get_slice(slice_id)
     except KeyError as exc:
         raise ValueError("unknown-slice") from exc
-    if action not in allowed_slice_actions(registry, slice_row):
+    already_recovered = (
+        action == "recover-pre-candidate"
+        and slice_row.get("state") == "pending"
+        and slice_row.get("builder_job_id") is None
+    )
+    if action == "supersede" and slice_row.get("state") == "superseded":
+        actions = slice_row.get("actions")
+        latest_action = actions[-1] if isinstance(actions, list) and actions else None
+        if (
+            isinstance(latest_action, dict)
+            and latest_action.get("action") == "operator-supersede"
+            and latest_action.get("actor") == actor
+            and latest_action.get("reason") == reason
+            and latest_action.get("expected_binding_revision") == expected_binding_revision
+            and latest_action.get("result") == "ok"
+        ):
+            return {
+                "slice_id": slice_id,
+                "action": action,
+                "slice_state": slice_row.get("state"),
+                "gate_state": slice_row.get("gate_state"),
+                "result": "already-superseded",
+                "requested_at": latest_action.get("requested_at"),
+                "consumed_at": latest_action.get("consumed_at"),
+            }
+    if action == "supersede" and slice_row.get("binding_revision") != expected_binding_revision:
+        raise ValueError(
+            "supersede expected_binding_revision mismatch: "
+            f"expected={expected_binding_revision}, actual={slice_row.get('binding_revision')}"
+        )
+    if action not in allowed_slice_actions(registry, slice_row) and not already_recovered:
         raise ValueError(f"action-not-allowed:{action}")
 
     requested_at = clock()
@@ -2091,94 +2589,28 @@ def apply_slice_action(
             "consumed_at": consumed_at,
         }
 
-    if action == "recover-pre-candidate":
-        cand = slice_row.get("candidate")
-        if isinstance(cand, str) and verification.SAFE_SHA_RE.fullmatch(cand) is not None:
-            raise ValueError("action-not-allowed:recover-pre-candidate")
-
-        if slice_row.get("state") == "pending" and slice_row.get("builder_job_id") is None:
-            consumed_at = clock()
-            return {
-                "slice_id": slice_id,
-                "action": action,
-                "slice_state": "pending",
-                "gate_state": "pending",
-                "result": "ok",
-                "reason": "already-recovered",
-                "requested_at": requested_at,
-                "consumed_at": consumed_at,
-            }
-
-        builder_job_id = slice_row.get("builder_job_id")
-        wt_path = None
-        if isinstance(builder_job_id, str):
-            try:
-                b_job = registry.get_job(builder_job_id)
-                wt_path = b_job.get("worktree")
-            except Exception:
-                pass
-        if not wt_path:
-            wt_path = slice_row.get("worktree")
-
-        # #478：舊碼在 `runner is None`（生產 dispatcher 的合法狀態）時整段跳過
-        # git 清理只 rmtree 目錄，registry 記錄留下來讓下一 tick 的
-        # `git worktree add` 必失敗；且清理只在「目錄還在」時觸發，既存的
-        # 「目錄已消失、registry 殘留」壞狀態永遠自癒不了。改走單一回收函式：
-        # 預設 runner 由 `worktree_reclaim` 自行 fallback，後置條件（目錄不存在
-        # ＋ registry 無該筆）驗證不過就 fail closed，不再回報 ok。
-        # #645：記錄沒有 worktree 時的反推改走共用 helper，新舊兩種目錄形狀都試。
-        # pool root **只在真的要反推時才解析**——`paths.worktree_root()` 在
-        # `PSC_REPO_ROOT` 未宣告時是 fail-closed 的（#612），記錄已有路徑卻因此炸掉
-        # 會讓回收比 #645 之前更脆弱。
-        recorded = wt_path if isinstance(wt_path, (str, Path)) and wt_path else None
-        pool_root = None
-        if recorded is None:
-            try:
-                pool_root = paths.worktree_root()
-            except Exception:
-                pool_root = None
-        branch_hint = slice_row.get("branch")
-        reclaim = worktree_reclaim.reclaim_recorded_or_derived(
-            recorded_path=recorded,
-            pool_root=pool_root,
-            job_id=slice_id,
-            branch=branch_hint if isinstance(branch_hint, str) else None,
-            git_runner=runner,
-            preserve_root=_reclaim_preserve_root(registry),
-        )
-        if reclaim is not None and not reclaim.ok:
-            raise RuntimeError(
-                "recover-pre-candidate worktree reclaim failed: "
-                f"{reclaim.detail or reclaim.status} ({reclaim.path})"
-            )
-
+    if action == "supersede":
         consumed_at = clock()
         registry.record_action(
             slice_id,
-            action="operator-recover-pre-candidate",
+            action="operator-supersede",
             actor=actor,
-            state="pending",
-            gate_state="pending",
+            state="superseded",
             requested_at=requested_at,
             consumed_at=consumed_at,
             result="ok",
-        )
-        registry.update_slice(
-            slice_id,
-            state="pending",
-            gate_state="pending",
-            builder_job_id=None,
-            candidate=None,
+            reason=reason,
+            expected_binding_revision=expected_binding_revision,
         )
         _supersede_handoff_manifest(
             handoff_dir=handoff_dir,
             slice_id=slice_id,
-            action="operator-recover-pre-candidate",
+            action="operator-supersede",
             actor=actor,
             clock=clock,
         )
         latest = registry.get_slice(slice_id)
-        payload = {
+        return {
             "slice_id": slice_id,
             "action": action,
             "slice_state": latest.get("state"),
@@ -2187,9 +2619,16 @@ def apply_slice_action(
             "requested_at": requested_at,
             "consumed_at": consumed_at,
         }
-        if reclaim is not None:
-            payload["worktree_reclaim"] = reclaim.to_dict()
-        return payload
+
+    if action == "recover-pre-candidate":
+        return _recover_pre_candidate_core(
+            registry,
+            slice_id=slice_id,
+            actor=actor,
+            handoff_dir=handoff_dir,
+            clock=clock,
+            git_runner=runner,
+        )
 
     if action == "retry-build":
         metas = scan_specs_fn(specs_dir)
@@ -2838,6 +3277,7 @@ def complete_tick(
         except Exception as exc:
             errors.append({"job_id": job_id, "error": str(exc)})
 
+    reconcile_building_slices(registry, clock=clock, errors=errors)
     summary: dict = {
         "polled": polled,
         "completed": completed,
@@ -3183,6 +3623,78 @@ def _load_run_planning_artifacts(run) -> tuple[PlanningArtifact, ...] | None:
             return None
         artifacts.append(PlanningArtifact(kind=authority.kind, ref=authority.ref, text=text))
     return tuple(artifacts)
+
+
+def _plan_review_receipt(
+    *,
+    run,
+    review_card: str,
+    artifacts: tuple[PlanningArtifact, ...],
+    candidate_authority: tuple[PlanningArtifactAuthority, ...],
+) -> tuple[tuple[PlanningArtifactAuthority, ...], PlanReviewReceipt]:
+    """凍結 ready plan review 實際讀取的安全 workspace bytes。"""
+
+    source_revision = run.planning_source_revision or run.source_revision
+    current_by_ref = {item.ref: item for item in candidate_authority}
+    if len(current_by_ref) != len(candidate_authority):
+        raise ValueError("plan review planning authority contains duplicate refs")
+    artifact_by_ref = {item.ref: item for item in artifacts}
+    if (
+        len(artifact_by_ref) != len(artifacts)
+        or set(artifact_by_ref) != set(current_by_ref)
+        or any(
+            artifact_by_ref[ref].kind != authority.kind
+            for ref, authority in current_by_ref.items()
+        )
+    ):
+        raise ValueError("plan review artifacts differ from canonical planning authority")
+
+    root = Path(run.workspace_root).resolve()
+    frozen: list[PlanningArtifactAuthority] = []
+    for ref, authority in current_by_ref.items():
+        content, text = _read_planning_artifact_content(root, ref)
+        if text != artifact_by_ref[ref].text:
+            raise ValueError(f"plan review bytes changed before baseline freeze: {ref}")
+        frozen.append(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind=authority.kind,
+                work_id=run.work_id,
+                baseline_sha256=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    frozen_authority = tuple(frozen)
+    receipt = PlanReviewReceipt(
+        run_id=run.run_id,
+        work_id=run.work_id,
+        repo=run.repo,
+        claim_key=run.claim_key,
+        review_card=review_card,
+        source_revision=source_revision,
+        artifacts=frozen_authority,
+    )
+    return frozen_authority, receipt
+
+
+def _validate_plan_review_receipt_source(run) -> None:
+    """確認 receipt 綁定的受審規劃 bytes 仍未變更。"""
+
+    receipt = getattr(run, "plan_review_receipt", None)
+    if not isinstance(receipt, PlanReviewReceipt):
+        raise ValueError("workflow plan review receipt missing")
+    if (
+        receipt.run_id != run.run_id
+        or receipt.work_id != run.work_id
+        or receipt.repo != run.repo
+        or receipt.claim_key != run.claim_key
+        or receipt.source_revision != run.planning_source_revision
+    ):
+        raise ValueError("workflow plan review receipt binding drift")
+    root = Path(run.workspace_root).resolve()
+    for authority in receipt.artifacts:
+        content, _text = _read_planning_artifact_content(root, authority.ref)
+        if hashlib.sha256(content).hexdigest() != authority.baseline_sha256:
+            raise ValueError(f"workflow plan review receipt source drift: {authority.ref}")
 
 
 # --- #414：deterministic pass plan 卡前的 declared-outputs 驗證 -------------
@@ -6355,17 +6867,27 @@ def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict
     return mapping
 
 
+class WorkflowPlanningInputDrift(ValueError):
+    """保存與 frozen hash 不符的 planning input 逐檔差異。"""
+
+    def __init__(self, rows: tuple[dict[str, str], ...]) -> None:
+        self.drift_rows = tuple(dict(row) for row in rows)
+        super().__init__("workflow planning input drift")
+
+
 def _workflow_input_snapshot(
     *,
     run,
     repo_root: Path,
     patterns: tuple[str, ...],
     coordinator_root: str | Path,
+    persist_content: bool = True,
 ) -> tuple[dict[str, str], ...]:
     root = repo_root.resolve()
     operator_root = Path(run.workspace_root).resolve()
     authority = {item.ref: item for item in run.planning_authority}
     seeds: dict[str, bytes] = {}
+    drift_rows: list[dict[str, str]] = []
 
     for pattern in patterns:
         if _safe_input_matches(root, pattern):
@@ -6389,8 +6911,19 @@ def _workflow_input_snapshot(
             source = source_matches[0]
             data = source.read_bytes()
             if hashlib.sha256(data).hexdigest() != authority[ref].baseline_sha256:
-                raise ValueError("workflow planning input drift")
+                drift_rows.append(
+                    {
+                        "ref": ref,
+                        "kind": authority[ref].kind,
+                        "expected_sha256": authority[ref].baseline_sha256,
+                        "current_sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                )
+                continue
             seeds[ref] = data
+
+    if drift_rows:
+        raise WorkflowPlanningInputDrift(tuple(drift_rows))
 
     for ref, data in seeds.items():
         destination = root / ref
@@ -6424,6 +6957,8 @@ def _workflow_input_snapshot(
 
     rows: list[dict[str, str]] = []
     total_bytes = 0
+    counted_digests: set[str] = set()
+    ref_sizes: dict[str, int] = {}
     for pattern in patterns:
         matches = _safe_input_matches(root, pattern)
         if not matches:
@@ -6453,7 +6988,14 @@ def _workflow_input_snapshot(
                         ):
                             tolerated = True
                 if not tolerated:
-                    raise ValueError("workflow planning input drift")
+                    drift_rows.append(
+                        {
+                            "ref": ref,
+                            "kind": bound.kind,
+                            "expected_sha256": bound.baseline_sha256,
+                            "current_sha256": digest,
+                        }
+                    )
             pattern_has_authority = any(
                 fnmatch.fnmatch(candidate_ref, pattern) for candidate_ref in authority
             )
@@ -6463,15 +7005,29 @@ def _workflow_input_snapshot(
                 content = data.decode("utf-8")
             except UnicodeDecodeError as exc:
                 raise ValueError("workflow input must be UTF-8") from exc
-            total_bytes += len(data)
-            if total_bytes > 131072:
-                raise ValueError("workflow input envelope exceeds bound")
-            content_ref = _write_workflow_input_content(
-                coordinator_root=Path(coordinator_root),
-                run=run,
-                ref=ref,
-                digest=digest,
-                content=content,
+            ref_sizes[ref] = len(data)
+            if digest not in counted_digests:
+                counted_digests.add(digest)
+                total_bytes += len(data)
+            if total_bytes > WORKFLOW_INPUT_ENVELOPE_MAX_BYTES:
+                sizes = ", ".join(
+                    f"{input_ref}={size} bytes" for input_ref, size in ref_sizes.items()
+                )
+                raise ValueError(
+                    "workflow input envelope exceeds bound "
+                    f"(total={total_bytes} bytes; limit={WORKFLOW_INPUT_ENVELOPE_MAX_BYTES} bytes; "
+                    f"refs=[{sizes}])"
+                )
+            content_ref = (
+                _write_workflow_input_content(
+                    coordinator_root=Path(coordinator_root),
+                    run=run,
+                    ref=ref,
+                    digest=digest,
+                    content=content,
+                )
+                if persist_content
+                else ""
             )
             rows.append(
                 {
@@ -6482,6 +7038,8 @@ def _workflow_input_snapshot(
                     "content_ref": content_ref,
                 }
             )
+    if drift_rows:
+        raise WorkflowPlanningInputDrift(tuple(drift_rows))
     return tuple(rows)
 
 
@@ -7242,6 +7800,28 @@ def _reviewer_candidate_workspace(
     created = Path(creator.create(branch, job_id=workspace_id, base_sha=candidate))
     _require_reviewer_candidate_workspace(created, branch=branch, candidate=candidate)
     return created
+
+
+def _existing_reviewer_candidate_workspace(
+    *, run, branch: str, candidate: str
+) -> Path:
+    """唯讀驗證既有 candidate tree，不建立或重建 workspace。"""
+
+    source = Path(run.workspace_root)
+    target = job_workspace.workspace_path(
+        worktree_root_for(source), _reviewer_candidate_workspace_id(run, candidate)
+    )
+    if target.is_symlink() or not target.is_dir() or not job_workspace.is_job_clone(target):
+        raise ValueError("workflow reviewer candidate workspace unavailable")
+    marker = job_workspace.read_marker(target)
+    if (
+        not isinstance(marker, dict)
+        or marker.get("branch") != branch
+        or str(marker.get("base", "")).lower() != candidate.lower()
+    ):
+        raise ValueError("workflow reviewer candidate workspace binding mismatch")
+    _require_reviewer_candidate_workspace(target, branch=branch, candidate=candidate)
+    return target.resolve()
 
 
 def _reviewer_sandbox_parent(
@@ -9482,6 +10062,9 @@ _MODEL_CHAIN_CAPABILITY_BY_PERSONA = {
     "planner": "planning",
     "reviewer": "review",
     "builder": "build",
+    # ship 階段的 manager 卡（policy-commit 等）若需模型執行，沿用 build capability；
+    # 這是原本「未知 persona 當 build」唯一的正當用途，改為明示對應。
+    "manager": "build",
 }
 
 
@@ -9493,9 +10076,9 @@ def _identity_candidates_for_persona(persona: str, identities: IdentityRegistry,
     優先」的排序偏好，不是合法性限制；拿它驗證覆寫會把偏好升級成硬約束，讓
     operator 明確指定的 identity 被誤判為違規。
     """
-    # 非 planner／reviewer 一律視為 builder（比照 #205 之前既有的 else 分支
-    # catch-all 行為，deck 目前只會派出 planner/build/reviewer 三種 persona）。
-    capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona, "build")
+    capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona)
+    if capability is None:
+        raise ValueError(f"unknown workflow persona: {persona}")
     candidates = [item for item in identities.identities if capability in item.capabilities]
     if persona == "builder":
         # cg 是 zero-tool executor，不能承接需要 workspace-write 的 builder 卡。
@@ -10486,6 +11069,87 @@ def _workflow_retry_context(
     return context
 
 
+def _verification_gate_ledger_context(
+    run, job: Mapping[str, object]
+) -> dict[str, object] | None:
+    """#803：只把精確綁定目前 Candidate 的 Manager build pytest ledger 給 verifier。
+
+    ledger 的 ``worktree_state.head`` 是 Manager gate 執行前在受控 checkout
+    收集的 HEAD；必須同時吻合 run Candidate 與成功 build job 的
+    ``subject_head``。缺檔、身分／hash 不符或沒有 pytest gate 時不附證據，沿用原
+    verification 判準。Ledger 內容仍經 terminal contract 的 Manager 作者檢查與
+    canonical digest 計算。
+    """
+
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or job.get("workflow_run_id") != getattr(run, "run_id", None)
+        or job.get("workflow_phase") != "build"
+        or job.get("persona") != "builder"
+        or job.get("status") != "exited"
+        or job.get("exit_code") != 0
+        or job.get("subject_head") != candidate
+        or job.get("workflow_test_policy") == "red-required"
+    ):
+        return None
+    log_path = job.get("log_path")
+    if not isinstance(log_path, str) or not log_path:
+        return None
+    ledger_path = terminal_contract.gate_ledger_path(
+        _job_control_log_path(job, log_path)
+    )
+    try:
+        found = terminal_contract.read_gate_ledger(ledger_path)
+    except terminal_contract.TerminalContractError:
+        return None
+    if found is None:
+        return None
+    payload, digest = found
+    worktree_state = payload.get(gate_ledger.WORKTREE_STATE_KEY)
+    if (
+        not isinstance(worktree_state, Mapping)
+        or worktree_state.get("probe") != "ok"
+        or worktree_state.get("head") != candidate.lower()
+    ):
+        return None
+    try:
+        outcomes = terminal_contract._ledger_outcomes(payload)
+    except terminal_contract.TerminalContractError:
+        return None
+    pytest_outcome = outcomes.get(terminal_contract.RED_REQUIRED_TEST_GATE_NAME)
+    if (
+        not isinstance(pytest_outcome, Mapping)
+        or type(pytest_outcome.get("exit_code")) is not int
+    ):
+        return None
+    pytest_rows = [
+        row
+        for row in payload["gates"]
+        if isinstance(row, Mapping)
+        and row.get("name") == terminal_contract.RED_REQUIRED_TEST_GATE_NAME
+    ]
+    if len(pytest_rows) != 1 or not isinstance(pytest_rows[0].get("command"), str):
+        return None
+    pytest_gate = {
+        "name": terminal_contract.RED_REQUIRED_TEST_GATE_NAME,
+        "command": pytest_rows[0]["command"],
+        "exit_code": pytest_outcome["exit_code"],
+        "status": pytest_outcome["status"],
+    }
+    result_summary = (
+        f"pytest {pytest_gate['status']} (exit {pytest_gate['exit_code']})"
+    )
+    return {
+        "candidate": candidate.lower(),
+        "path": str(ledger_path),
+        "sha256": digest,
+        "gates": [pytest_gate],
+        "result_summary": result_summary,
+    }
+
+
 def _workflow_job_prompt(
     run,
     step,
@@ -10494,6 +11158,7 @@ def _workflow_job_prompt(
     coordinator_root: str | Path,
     input_snapshot: tuple[dict[str, str], ...] = (),
     candidate_checkout: str | None = None,
+    manager_gate_ledger: Mapping[str, object] | None = None,
     env: Mapping[str, str] | None = None,
     retry_context: Mapping[str, object] | None = None,
     operator_adjudications: Sequence[Mapping[str, object]] | None = None,
@@ -10735,6 +11400,8 @@ def _workflow_job_prompt(
         contract["builder_job_id"] = builder_job_id
     if candidate_checkout is not None:
         contract["candidate_checkout"] = candidate_checkout
+    if step.phase == "verify" and manager_gate_ledger is not None:
+        contract["manager_gate_ledger"] = dict(manager_gate_ledger)
     if retry_context is not None:
         # #606：首派沒有這個鍵，prompt 因此逐字不變（見 `_workflow_retry_context`）。
         contract["retry_context"] = dict(retry_context)
@@ -10766,6 +11433,42 @@ def _workflow_job_prompt(
         if step.persona == "reviewer"
         else ""
     )
+    verification_gate_ledger_contract = ""
+    if step.phase == "verify" and manager_gate_ledger is not None:
+        summary = manager_gate_ledger.get("result_summary")
+        digest = manager_gate_ledger.get("sha256")
+        pytest_rows = manager_gate_ledger.get("gates")
+        pytest_gate = (
+            pytest_rows[0]
+            if isinstance(pytest_rows, (list, tuple))
+            and pytest_rows
+            and isinstance(pytest_rows[0], Mapping)
+            and pytest_rows[0].get("name") == terminal_contract.RED_REQUIRED_TEST_GATE_NAME
+            else None
+        )
+        pytest_status = pytest_gate.get("status") if pytest_gate is not None else None
+        if pytest_status == "passed":
+            verification_gate_ledger_contract = (
+                " A candidate-bound Manager gate ledger is included in the contract below. "
+                f"The full-suite result is `{summary}` (ledger sha256 `{digest}`). "
+                "Treat this Manager result as the evidence for the full-suite gate: explicitly "
+                f"report `Full-suite result: Manager ledger {digest} passed`. In this enforced "
+                "read-only sandbox, ACL/xattr restrictions, a read-only filesystem, or a long "
+                "TMPDIR that exceeds AF_UNIX sun_path limits can prevent rerunning the full "
+                "suite. Such sandbox-only failures must not override the matching Manager "
+                "ledger's green full-suite result; classify them as environment limitations, "
+                "and run focused and diff-related tests plus the review. The ledger proves only "
+                "the full-suite gate, not a verified verdict: assess the Candidate and report "
+                "any real findings independently."
+            )
+        elif pytest_status == "failed":
+            verification_gate_ledger_contract = (
+                " A candidate-bound Manager gate ledger is included in the contract below. "
+                f"The full-suite result is `{summary}` (ledger sha256 `{digest}`). "
+                "This recorded failure is authoritative for the full-suite gate: focused green "
+                "tests and sandbox conditions must not override it, and this Candidate must "
+                "not be reported verified. Continue the diff review and report the failed gate."
+            )
     commit_required_contract = (
         f" Before the final commit, update {tasks_path} checkboxes for work completed by this card, "
         "and never modify pinned input files such as the plan document."
@@ -10817,6 +11520,7 @@ def _workflow_job_prompt(
         "null."
         + planner_contract
         + reviewer_contract
+        + verification_gate_ledger_contract
         + commit_required_contract
         + repair_findings_contract
         + retry_context_contract
@@ -10924,6 +11628,88 @@ def _evaluate_yellow_plan_review(
         return None
 
 
+@dataclass(frozen=True)
+class BuilderTodoAdmission:
+    """目前受監控 WorkAuthority 的 Builder Todo admission 輸入。"""
+
+    authority_revision: str | None = None
+    mapped_todo_paths: tuple[str, ...] | None = None
+    error: str | None = None
+
+
+def _builder_todo_admission_stop(
+    *,
+    registry,
+    run,
+    step,
+    admission: BuilderTodoAdmission | None,
+) -> dict[str, object] | None:
+    """在 Builder 派工入口、建立 job/worktree 前驗證目前 Todo authority。"""
+    if admission is None or step.phase != "build" or step.persona != "builder":
+        return None
+
+    authority_revision = getattr(admission, "authority_revision", None)
+    todo_paths = getattr(admission, "mapped_todo_paths", None)
+    admission_error = getattr(admission, "error", None)
+    if (
+        admission_error is not None
+        or not isinstance(authority_revision, str)
+        or not isinstance(todo_paths, tuple)
+        or any(not isinstance(path, str) or not path for path in todo_paths)
+    ):
+        reason = "builder-todo-authority-unavailable"
+        detail = (
+            "Manager 目前無法讀取唯一的 WorkAuthority，暫停 Builder 派工；"
+            "請先修復或等待 Monitor snapshot 更新，再依正式流程 resume。"
+        )
+        next_step_hint = "確認 Monitor snapshot 可讀且 WorkAuthority 唯一，再依正式流程 resume。"
+    elif authority_revision != run.source_revision:
+        reason = "builder-todo-authority-changed"
+        detail = (
+            "目前 WorkAuthority 已更新，但 WorkflowRun claim 與目前 authority 不一致；"
+            "拒絕以舊 claim 派出 Builder，請依既有正式重啟流程重新綁定目前 authority。"
+        )
+        next_step_hint = "依既有正式重啟流程重新綁定目前 WorkAuthority 後，再派出 Builder。"
+    elif not todo_paths:
+        reason = "builder-todo-missing"
+        detail = (
+            "目前 WorkAuthority 沒有 canonical workstream Todo（Todo=0），尚未建立 Builder job。"
+            "請先發布 canonical Todo、link path，等 Monitor 更新後再 resume。"
+        )
+        next_step_hint = "發布 canonical Todo → link path → 等 Monitor 更新 → resume。"
+    elif len(todo_paths) > 1:
+        reason = "builder-todo-ambiguous"
+        detail = (
+            "目前 WorkAuthority 映射了多個 canonical workstream Todo（Todo="
+            f"{len(todo_paths)}：{', '.join(todo_paths)}）。請用 `cortex work unlink`"
+            "移除多餘 mapping，等待 Monitor 更新後再 resume。"
+        )
+        next_step_hint = "保留唯一 canonical Todo；unlink 其他 mapping，等 Monitor 更新後 resume。"
+    else:
+        return None
+
+    current = registry.get_workflow_run(run.run_id)
+    updated = registry._manager_update_workflow_run(
+        run.run_id,
+        facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+        gate_status="running",
+        needs_human_reason=diagnostic_reason(
+            reason,
+            detail,
+            source="manager._dispatch_workflow_card:builder-todo-admission",
+            next_step_hint=next_step_hint,
+            run_id=run.run_id,
+            work_id=run.work_id,
+            card=step.card,
+        ),
+    )
+    return {
+        "run_id": updated.run_id,
+        "current_phase": updated.current_phase,
+        "reason": reason,
+    }
+
+
 def _dispatch_workflow_card(
     dispatcher,
     *,
@@ -10936,6 +11722,7 @@ def _dispatch_workflow_card(
     force_new_card: bool = False,
     forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    builder_todo_admission: BuilderTodoAdmission | None = None,
 ) -> dict[str, object] | None:
     """#381：workflow lane 的實際 spawn 點。spawn_admission 未注入時解析為
     零間隔 no-op（見 spawn_admission.resolve_limiter）——只有 resume_workflow_run
@@ -10956,6 +11743,14 @@ def _dispatch_workflow_card(
         return None
     if force_new_card and RETRY_CARD_PHASE_PERSONA.get(step.phase) != step.persona:
         raise ValueError("forced workflow retry requires builder or reviewer card")
+    admission_stop = _builder_todo_admission_stop(
+        registry=registry,
+        run=run,
+        step=step,
+        admission=builder_todo_admission,
+    )
+    if admission_stop is not None:
+        return admission_stop
     matching = [
         job
         for job in registry.list_jobs()
@@ -11160,6 +11955,17 @@ def _dispatch_workflow_card(
                         "reason": "plan-outputs-missing",
                     }
                 artifacts, new_authority, publication = materialize_result
+            next_authority = run.planning_authority + (
+                (new_authority,) if new_authority is not None else ()
+            )
+            review_receipt = None
+            if plan_review_passed_now:
+                next_authority, review_receipt = _plan_review_receipt(
+                    run=run,
+                    review_card=step.card,
+                    artifacts=artifacts,
+                    candidate_authority=next_authority,
+                )
             next_phase = run.current_phase
             attempts = run.attempts
             if is_last_pending:
@@ -11171,26 +11977,37 @@ def _dispatch_workflow_card(
             try:
                 if publication is not None:
                     publication.prepare_commit()
-                registry._manager_update_workflow_run(
-                    run.run_id,
-                    current_phase=next_phase,
-                    steps=_audit_phase_steps(
-                        run.steps,
-                        phase=run.current_phase,
-                        executor="cortex-manager",
-                        model="deterministic",
-                        domain="cortex",
-                        outputs=tuple(artifact.ref for artifact in artifacts),
-                        card_id=step.card,
-                    ),
-                    attempts=attempts,
-                    **({"plan_review_passed": True} if plan_review_passed_now else {}),
-                    **(
-                        {"planning_authority": run.planning_authority + (new_authority,)}
-                        if new_authority is not None
-                        else {}
-                    ),
+                audited_steps = _audit_phase_steps(
+                    run.steps,
+                    phase=run.current_phase,
+                    executor="cortex-manager",
+                    model="deterministic",
+                    domain="cortex",
+                    outputs=tuple(artifact.ref for artifact in artifacts),
+                    card_id=step.card,
                 )
+                if review_receipt is not None:
+                    registry._manager_accept_plan_review(
+                        run.run_id,
+                        expected_updated_at=run.updated_at,
+                        expected_phase=run.current_phase,
+                        expected_status=run.status,
+                        expected_candidate=run.candidate_head,
+                        expected_source_revision=run.source_revision,
+                        current_phase=next_phase,
+                        steps=audited_steps,
+                        attempts=attempts,
+                        planning_authority=next_authority,
+                        receipt=review_receipt,
+                    )
+                else:
+                    registry._manager_update_workflow_run(
+                        run.run_id,
+                        current_phase=next_phase,
+                        steps=audited_steps,
+                        attempts=attempts,
+                        **({"planning_authority": next_authority} if new_authority is not None else {}),
+                    )
             except BaseException:
                 if publication is not None:
                     publication.rollback()
@@ -11342,6 +12159,17 @@ def _dispatch_workflow_card(
         )
     ]
     builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
+    verification_gate_ledger = None
+    if step.phase == "verify":
+        candidate_build_jobs = [
+            job
+            for job in builder_jobs
+            if job.get("persona") == "builder" and job.get("workflow_phase") == "build"
+        ]
+        if candidate_build_jobs:
+            verification_gate_ledger = _verification_gate_ledger_context(
+                run, candidate_build_jobs[-1]
+            )
     if step.persona == "reviewer" and builder_job_id is None:
         raise ValueError("workflow reviewer builder job unavailable")
     task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
@@ -11639,6 +12467,7 @@ def _dispatch_workflow_card(
                     if step.persona == "reviewer"
                     else None
                 ),
+                manager_gate_ledger=verification_gate_ledger,
                 # #606：`matching` 就是這張卡先前燒掉的 job（首派為空 →
                 # retry_context 為 None → prompt 逐字不變）。retry-card 的重派與
                 # daemon 的 forced retry 都走這唯一一條組裝路徑，因此兩者同時
@@ -11721,6 +12550,7 @@ def dispatch_workflow_card(
     force_new_card: bool = False,
     forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    builder_todo_admission: BuilderTodoAdmission | None = None,
 ) -> dict[str, object] | None:
     """Dispatch a normal workflow card; legacy recovery is operator-resume internal only."""
 
@@ -11734,6 +12564,7 @@ def dispatch_workflow_card(
         force_new_card=force_new_card,
         forced_identity=forced_identity,
         spawn_admission=spawn_admission,
+        builder_todo_admission=builder_todo_admission,
     )
 
 
@@ -11815,6 +12646,193 @@ def classify_dispatch_result(
     return {"kind": "decision", "run_id": run_id, "current_phase": current_phase, "reason": reason}
 
 
+def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
+    """Recognize a complete Manager merge authorization bound to this run.
+
+    This is an admission guard only.  It neither proves remote closure nor
+    grants completion; resume uses it to avoid invalidating a run whose merge
+    was already authorized and durably recorded.
+    """
+    path = Path(journal_path)
+    try:
+        if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+            return False
+        journal = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(journal, dict) or journal.get("schema") != "cortex-delivery-journal/v1":
+        return False
+    runs = journal.get("runs")
+    row = runs.get(run.run_id) if isinstance(runs, dict) else None
+    if not isinstance(row, dict) or any(
+        row.get(field) != getattr(run, field, None)
+        for field in ("run_id", "repo", "work_id")
+    ):
+        return False
+
+    expected_step_ids = [
+        f"{run.run_id}:{step.phase}:{step.card}"
+        for step in getattr(run, "steps", ())
+    ]
+    if not expected_step_ids or row.get("workflow_step_ids") != expected_step_ids:
+        return False
+    binding = row.get("delivery_binding")
+    if not isinstance(binding, dict) or set(binding) != {
+        "pr_number", "change", "todo_paths"
+    }:
+        return False
+
+    ship = row.get("ship")
+    if not isinstance(ship, dict):
+        return False
+    if any(ship.get(field) != binding[field] for field in binding):
+        return False
+    candidate = getattr(run, "candidate_head", None)
+    merge_commit = ship.get("merge_commit")
+    if (
+        ship.get("phase") not in {"merged", "done"}
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or ship.get("head") != candidate
+        or not isinstance(merge_commit, str)
+        or verification.SAFE_SHA_RE.fullmatch(merge_commit) is None
+    ):
+        return False
+
+    authorization = ship.get("merge_authorization")
+    if not isinstance(authorization, dict) or set(authorization) != {
+        "path", "hash", "payload"
+    }:
+        return False
+    evidence_path_value = authorization.get("path")
+    digest = authorization.get("hash")
+    body = authorization.get("payload")
+    if (
+        not isinstance(evidence_path_value, str)
+        or not Path(evidence_path_value).is_absolute()
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or not isinstance(body, dict)
+    ):
+        return False
+
+    common_fields = {
+        "schema", "run_id", "workflow_step_ids", "repo", "work_id",
+        "authority_digest", "pr_number", "change", "todo_paths", "head",
+        "tree_hash", "foreign_review_path", "foreign_review_hash",
+        "preflight_hash", "checks_hash",
+    }
+    body_keys = set(body)
+    if body.get("schema") == "cortex-merge-authorization/v1":
+        expected_fields = common_fields | {
+            "copilot_requested_at_epoch", "copilot_review_id", "copilot_hash"
+        }
+        complete_variant = body_keys == expected_fields
+    elif body.get("schema") == "cortex-merge-authorization/v2":
+        expected_fields = common_fields | {"review_kind", "review_ref", "review_hash"}
+        superseded_fields = {
+            "superseded_authorization_ref", "superseded_authorization_hash"
+        }
+        complete_variant = frozenset(body_keys) in {
+            frozenset(expected_fields),
+            frozenset(expected_fields | superseded_fields),
+        }
+    else:
+        return False
+
+    body_binding = {
+        "pr_number": body.get("pr_number"),
+        "change": body.get("change"),
+        "todo_paths": body.get("todo_paths"),
+    }
+    pr_number = body.get("pr_number")
+    change = body.get("change")
+    todo_paths = body.get("todo_paths")
+    if (
+        not complete_variant
+        or body.get("run_id") != run.run_id
+        or body.get("workflow_step_ids") != expected_step_ids
+        or body.get("repo") != run.repo
+        or body.get("work_id") != run.work_id
+        or body.get("head") != candidate
+        or not isinstance(body.get("authority_digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["authority_digest"]) is None
+        or not isinstance(body.get("tree_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["tree_hash"]) is None
+        or not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
+        or pr_number <= 0
+        or body_binding != binding
+        or not isinstance(todo_paths, list)
+        or any(not isinstance(value, str) or not value for value in todo_paths)
+        or len(set(todo_paths)) != len(todo_paths)
+        or (change is not None and (not isinstance(change, str) or not change))
+        or (
+            change is not None
+            and change not in getattr(run, "openspec_refs", ())
+        )
+        or f"{run.repo}#{pr_number}" not in getattr(run, "pr_refs", ())
+    ):
+        return False
+    for field in ("foreign_review_hash", "preflight_hash", "checks_hash"):
+        if not isinstance(body.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", body[field]) is None:
+            return False
+    if not isinstance(body.get("foreign_review_path"), str) or not Path(
+        body["foreign_review_path"]
+    ).is_absolute():
+        return False
+    if body.get("schema") == "cortex-merge-authorization/v1":
+        requested_at = body.get("copilot_requested_at_epoch")
+        review_id = body.get("copilot_review_id")
+        try:
+            requested_at_finite = math.isfinite(float(requested_at))
+        except (OverflowError, TypeError, ValueError):
+            return False
+        if (
+            not isinstance(requested_at, (int, float))
+            or isinstance(requested_at, bool)
+            or not requested_at_finite
+            or not isinstance(review_id, int)
+            or isinstance(review_id, bool)
+            or review_id <= 0
+            or not isinstance(body.get("copilot_hash"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", body["copilot_hash"]) is None
+        ):
+            return False
+    elif (
+        body.get("review_kind") != "maintainer-review"
+        or not isinstance(body.get("review_ref"), str)
+        or not Path(body["review_ref"]).is_absolute()
+        or not isinstance(body.get("review_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["review_hash"]) is None
+    ):
+        return False
+    if "superseded_authorization_ref" in body and (
+        not isinstance(body.get("superseded_authorization_ref"), str)
+        or not Path(body["superseded_authorization_ref"]).is_absolute()
+        or not isinstance(body.get("superseded_authorization_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["superseded_authorization_hash"]) is None
+    ):
+        return False
+
+    try:
+        evidence_path = Path(evidence_path_value)
+        if evidence_path.is_symlink() or not stat.S_ISREG(evidence_path.lstat().st_mode):
+            return False
+        if evidence_path.stat().st_mode & 0o222:
+            return False
+        wrapper = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(wrapper, dict)
+        and set(wrapper) == {"payload", "hash"}
+        and wrapper.get("payload") == body
+        and wrapper.get("hash") == digest
+        and verification.canonical_json_hash(body) == digest
+    )
+
+
 def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path) -> bool:
     """Detect the narrow terminal closure path without granting ship authority."""
     terminal_refresh = (
@@ -11893,6 +12911,161 @@ def _provider_rate_limit_result(
     }
 
 
+def _rebind_reviewed_planning_for_verify(
+    dispatcher, *, registry, run, coordinator_root: str | Path
+) -> tuple[object | None, str | None]:
+    """先唯讀檢查資格，再執行一次 exact Registry CAS 並讀回確認。"""
+
+    receipt = run.plan_review_receipt
+    stop = run.planning_drift_stop
+    step = _current_workflow_step(run)
+    if (
+        not isinstance(receipt, PlanReviewReceipt)
+        or not isinstance(stop, WorkflowPlanningDriftStop)
+        or not run.plan_review_passed
+        or run.status != "ongoing"
+        or run.current_phase != "verify"
+        or step is None
+        or step.phase != "verify"
+        or stop.card_id != step.card
+        or stop.run_id != run.run_id
+        or stop.work_id != run.work_id
+        or stop.repo != run.repo
+        or stop.claim_key != run.claim_key
+        or stop.candidate_head != run.candidate_head
+        or stop.source_revision != run.source_revision
+        or receipt.run_id != run.run_id
+        or receipt.work_id != run.work_id
+        or receipt.repo != run.repo
+        or receipt.claim_key != run.claim_key
+        or receipt.source_revision != run.planning_source_revision
+        or not receipt.ready
+        or not isinstance(run.candidate_head, str)
+        or verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is None
+    ):
+        return None, "workflow-planning-drift-recovery-ineligible"
+
+    authority = {item.ref: item for item in run.planning_authority}
+    reviewed = {item.ref: item for item in receipt.artifacts}
+    if len(authority) != len(run.planning_authority) or len(reviewed) != len(receipt.artifacts):
+        return None, "workflow-planning-drift-recovery-ineligible"
+    baseline_already_rebound = (
+        run.planning_authority == receipt.artifacts
+        and run.planning_source_revision == receipt.source_revision
+    )
+    for drift in stop.artifacts:
+        old = authority.get(drift.ref)
+        accepted = reviewed.get(drift.ref)
+        if (
+            old is None
+            or accepted is None
+            or (
+                not baseline_already_rebound
+                and (
+                    old.kind != drift.kind
+                    or old.baseline_sha256 != drift.expected_sha256
+                )
+            )
+            or accepted.kind != drift.kind
+        ):
+            return None, "workflow-planning-drift-recovery-ineligible"
+
+    matching_verify_jobs = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_claim_key") in (None, run.claim_key)
+        and job.get("workflow_phase") == "verify"
+        and job.get("workflow_card") == stop.card_id
+        and job.get("subject_head") == run.candidate_head
+    ]
+    if matching_verify_jobs:
+        return None, "workflow-planning-drift-recovery-ineligible"
+    builder_jobs = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_claim_key") in (None, run.claim_key)
+        and job.get("workflow_phase") == "build"
+        and job.get("persona") == "builder"
+        and job.get("status") == "exited"
+        and job.get("exit_code") == 0
+        and job.get("subject_head") == run.candidate_head
+    ]
+    if not builder_jobs or not isinstance(builder_jobs[-1].get("branch"), str):
+        return None, "workflow-planning-drift-recovery-ineligible"
+
+    try:
+        _validate_plan_review_receipt_source(run)
+        candidate_root = _existing_reviewer_candidate_workspace(
+            run=run,
+            branch=builder_jobs[-1]["branch"],
+            candidate=run.candidate_head,
+        )
+        stop_rows = {item.ref: item for item in stop.artifacts}
+        for accepted in receipt.artifacts:
+            source_bytes, _ = _read_planning_artifact_content(
+                Path(run.workspace_root).resolve(), accepted.ref
+            )
+            if hashlib.sha256(source_bytes).hexdigest() != accepted.baseline_sha256:
+                return None, "workflow-planning-drift-recovery-ineligible"
+            candidate_bytes, _ = _read_planning_artifact_content(candidate_root, accepted.ref)
+            candidate_hash = hashlib.sha256(candidate_bytes).hexdigest()
+            stopped_row = stop_rows.get(accepted.ref)
+            if stopped_row is not None and candidate_hash != stopped_row.current_sha256:
+                return None, "workflow-planning-drift-recovery-ineligible"
+            if candidate_hash != accepted.baseline_sha256 and not (
+                accepted.kind == "plan"
+                and Path(accepted.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
+                and _checkbox_insensitive_equal(source_bytes, candidate_bytes)
+            ):
+                return None, "workflow-planning-drift-recovery-ineligible"
+
+        reviewed_run = replace(
+            run,
+            planning_authority=receipt.artifacts,
+            planning_source_revision=receipt.source_revision,
+        )
+        reviewed_step = _current_workflow_step(reviewed_run)
+        if reviewed_step is None:
+            return None, "workflow-planning-drift-recovery-ineligible"
+        patterns = _reviewer_input_patterns(
+            reviewed_run,
+            _effective_workflow_inputs(reviewed_run, reviewed_step),
+        )
+        _workflow_input_snapshot(
+            run=reviewed_run,
+            repo_root=candidate_root,
+            patterns=patterns,
+            coordinator_root=coordinator_root,
+            persist_content=False,
+        )
+        rebound = registry._manager_rebind_planning_for_verify(
+            run.run_id,
+            expected_updated_at=run.updated_at,
+            expected_candidate=run.candidate_head,
+            expected_authority=run.planning_authority,
+            expected_planning_source_revision=run.planning_source_revision,
+            receipt=receipt,
+        )
+        confirmed = registry.get_workflow_run(run.run_id)
+        if (
+            rebound != confirmed
+            or confirmed.current_phase != "verify"
+            or confirmed.status != "ongoing"
+            or confirmed.candidate_head != run.candidate_head
+            or confirmed.planning_authority != receipt.artifacts
+            or confirmed.planning_source_revision != receipt.source_revision
+            or confirmed.plan_review_receipt != receipt
+            or confirmed.planning_drift_stop != stop
+            or "needs_human" in confirmed.facets
+        ):
+            return None, "workflow-planning-drift-recovery-readback-failed"
+        return confirmed, None
+    except Exception:
+        return None, "workflow-planning-drift-recovery-ineligible"
+
+
 def resume_workflow_run(
     dispatcher,
     *,
@@ -11903,11 +13076,34 @@ def resume_workflow_run(
     ship_validator: Callable[..., object] | None = None,
     operator_resume: bool = False,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    builder_todo_admission_loader: (
+        Callable[[object], BuilderTodoAdmission | None] | None
+    ) = None,
 ) -> dict[str, object]:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
+    if (
+        run.status == "ongoing"
+        and run.current_phase == "verify"
+        and run.retry_classification == "authority_restart"
+        and _merged_delivery_journal_bound(
+            run,
+            journal_path=Path(coordinator_root) / "delivery-journal.json",
+        )
+    ):
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "merged-run-reset-to-verify",
+            "next_actions": ["retire-delivered"],
+            "next_step_hint": (
+                f"cortex work {run.work_id} retire-delivered --repo {run.repo} "
+                f"--expected-run-id {run.run_id} --actor <operator> "
+                "--reason '<single-line reason>'"
+            ),
+        }
     if ship_validator is not None:
         # #370: a prior resume already recorded a durable rate-limit
         # backoff for this run's GitHub provider (see
@@ -11934,13 +13130,50 @@ def resume_workflow_run(
     pre_resume_gate_status = run.gate_status
     retry_failed = False
     recovery_job_id: str | None = None
+    if "needs_human" in run.facets and run.status == "ongoing" and not operator_resume:
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "operator-resume-required",
+        }
+    if run.planning_drift_stop is not None and run.status == "ongoing":
+        existing_verify_jobs = [
+            job
+            for job in registry.list_jobs()
+            if job.get("workflow_run_id") == run.run_id
+            and job.get("workflow_claim_key") in (None, run.claim_key)
+            and job.get("workflow_phase") == "verify"
+            and job.get("workflow_card") == run.planning_drift_stop.card_id
+            and job.get("subject_head") == run.planning_drift_stop.candidate_head
+        ]
+        already_rebound = (
+            run.plan_review_receipt is not None
+            and run.planning_authority == run.plan_review_receipt.artifacts
+            and run.planning_source_revision == run.plan_review_receipt.source_revision
+        )
+        if existing_verify_jobs:
+            if not already_rebound:
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "reason": "workflow-planning-drift-recovery-ineligible",
+                }
+        else:
+            rebound, reason = _rebind_reviewed_planning_for_verify(
+                dispatcher,
+                registry=registry,
+                run=run,
+                coordinator_root=coordinator_root,
+            )
+            if rebound is None:
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "reason": reason or "workflow-planning-drift-recovery-ineligible",
+                }
+            run = rebound
+            pre_resume_gate_status = run.gate_status
     if "needs_human" in run.facets and run.status == "ongoing":
-        if not operator_resume:
-            return {
-                "run_id": run.run_id,
-                "current_phase": run.current_phase,
-                "reason": "operator-resume-required",
-            }
         recovery_step = _current_workflow_step(run)
         if recovery_step is not None:
             recovery_jobs = [
@@ -12036,12 +13269,17 @@ def resume_workflow_run(
     )
     if not post_merge_closure:
         try:
-            planning_authority, planning_source_revision = (
-                _validated_brainstorm_planning_authority(
-                    run,
-                    coordinator_root=coordinator_root,
+            if run.plan_review_receipt is not None:
+                _validate_plan_review_receipt_source(run)
+                planning_authority = run.planning_authority
+                planning_source_revision = run.planning_source_revision
+            else:
+                planning_authority, planning_source_revision = (
+                    _validated_brainstorm_planning_authority(
+                        run,
+                        coordinator_root=coordinator_root,
+                    )
                 )
-            )
         except ValueError as exc:
             current = registry.get_workflow_run(run.run_id)
             updated = registry._manager_update_workflow_run(
@@ -12078,6 +13316,11 @@ def resume_workflow_run(
                 planning_source_revision=planning_source_revision,
             )
 
+    def builder_todo_admission_for(bound_run):
+        if builder_todo_admission_loader is None:
+            return None
+        return builder_todo_admission_loader(bound_run)
+
     def dispatch_or_stop(
         bound_run,
         *,
@@ -12085,6 +13328,7 @@ def resume_workflow_run(
         retry_recovery_job_id: str | None = None,
     ):
         try:
+            builder_todo_admission = builder_todo_admission_for(bound_run)
             if retry_recovery_job_id is not None:
                 return _dispatch_workflow_card(
                     dispatcher,
@@ -12095,6 +13339,7 @@ def resume_workflow_run(
                     retry_failed=retry,
                     operator_recovery_job_id=retry_recovery_job_id,
                     spawn_admission=spawn_admission,
+                    builder_todo_admission=builder_todo_admission,
                 )
             return dispatch_workflow_card(
                 dispatcher,
@@ -12104,9 +13349,61 @@ def resume_workflow_run(
                 coordinator_root=coordinator_root,
                 retry_failed=retry,
                 spawn_admission=spawn_admission,
+                builder_todo_admission=builder_todo_admission,
             )
         except Exception as exc:
             current = registry.get_workflow_run(bound_run.run_id)
+            current_step = _current_workflow_step(current)
+            if (
+                isinstance(exc, WorkflowPlanningInputDrift)
+                and current.current_phase == "verify"
+                and current.status == "ongoing"
+                and current_step is not None
+                and current_step.phase == "verify"
+                and isinstance(current.candidate_head, str)
+                and verification.SAFE_SHA_RE.fullmatch(current.candidate_head) is not None
+                and exc.drift_rows
+            ):
+                stop = WorkflowPlanningDriftStop(
+                    run_id=current.run_id,
+                    work_id=current.work_id,
+                    repo=current.repo,
+                    claim_key=current.claim_key,
+                    card_id=current_step.card,
+                    candidate_head=current.candidate_head,
+                    source_revision=current.source_revision,
+                    artifacts=tuple(
+                        PlanningDriftArtifact(
+                            ref=row["ref"],
+                            kind=row["kind"],
+                            expected_sha256=row["expected_sha256"],
+                            current_sha256=row["current_sha256"],
+                        )
+                        for row in exc.drift_rows
+                    ),
+                )
+                stopped = registry._manager_record_planning_drift_stop(
+                    current.run_id,
+                    expected_updated_at=current.updated_at,
+                    expected_candidate=current.candidate_head,
+                    stop=stop,
+                    reason=diagnostic_reason(
+                        "workflow-planning-input-drift",
+                        "verify 派工前的 planning input hash 與 frozen baseline 不符",
+                        source="manager.resume_workflow_run:verify-planning-drift",
+                        run_id=current.run_id,
+                        work_id=current.work_id,
+                        card=current_step.card,
+                        candidate=current.candidate_head,
+                        source_revision=current.source_revision,
+                        artifact_count=str(len(stop.artifacts)),
+                    ),
+                )
+                return {
+                    "run_id": stopped.run_id,
+                    "current_phase": stopped.current_phase,
+                    "reason": stop.stop_code,
+                }
             registry._manager_update_workflow_run(
                 bound_run.run_id,
                 facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
@@ -12221,7 +13518,11 @@ def resume_workflow_run(
         )
     ]
     job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
-    if job is not None and recovery_job_id == job.get("job_id"):
+    if (
+        recovery_job_id is not None
+        and job is not None
+        and recovery_job_id == job.get("job_id")
+    ):
         job = dispatch_or_stop(run, retry_recovery_job_id=recovery_job_id)
     elif retry_failed and job is not None and (
         _is_stale_terminalized_failed_job(job)
@@ -12328,6 +13629,7 @@ def resume_workflow_run(
                         coordinator_root=coordinator_root,
                         retry_failed=True,
                         forced_identity=rerouted_target,
+                        builder_todo_admission=builder_todo_admission_for(run),
                     )
                     if replacement is None:
                         return {
@@ -12570,6 +13872,7 @@ def resume_workflow_run(
             launcher_factory=launcher_factory,
             coordinator_root=coordinator_root,
             retry_failed=True,
+            builder_todo_admission=builder_todo_admission_for(run),
         )
         if replacement is None:
             return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
@@ -12940,11 +14243,16 @@ def apply_workflow_action(
                 context["main_sync_evidence_hash"] = evidence_hash
                 result["evidence_hash"] = evidence_hash
             result["main_sync"] = dict(main_sync)
+        diagnostic_code = (
+            delivery_reason
+            if delivery_reason in {"review-disposition-required", "review-threads-unresolved"}
+            else "delivery-needs-human"
+        )
         return (
             delivery_reason,
             updated_evidence_refs,
             diagnostic_reason(
-                "delivery-needs-human",
+                diagnostic_code,
                 "ship validator 判定交付需要人工介入："
                 f"{delivery_reason}",
                 source=source,
@@ -13957,6 +15265,24 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
     coordinator_root = (
         Path(state_path).resolve().parent if state_path is not None else paths.coordinator_root().resolve()
     )
+    recovery_identities: IdentityRegistry | None = None
+
+    def reviewer_recovery_checker(job, run) -> bool:
+        """在 reset 前用 Manager 的精準判準保留仍可復原的 reviewer job。"""
+
+        nonlocal recovery_identities
+        if recovery_identities is None:
+            recovery_identities = load_model_identities()
+        step = _current_workflow_step(run)
+        return step is not None and _is_exact_reviewer_terminal_recovery(
+            active_registry,
+            job,
+            run=run,
+            step=step,
+            identities=recovery_identities,
+            coordinator_root=coordinator_root,
+        )
+
     # #205 R1：operator 在 `cortex run work start/resume/...` 帶入的 run-scoped
     # 模型鏈覆寫語法層抽取；是否合法留給 dispatch 時 fail closed（D4）。
     work_action_model_chain_override = extract_model_chain_override(args)
@@ -13983,11 +15309,17 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
             combo_override=work_action_combo_override,
         )
 
+    recovery_kwargs = (
+        {"reviewer_recovery_checker": reviewer_recovery_checker}
+        if args.get("action") in {"retry-verify", "retry-review"}
+        else {}
+    )
     return execute_work_action(
         args=args,
         requested_by=requested_by,
         workflow_registry=active_registry,
         workflow_starter=starter,
+        **recovery_kwargs,
     )
 
 

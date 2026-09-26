@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -763,3 +764,273 @@ def test_service_rejects_invalid_instance_names(
 
     captured = capsys.readouterr()
     assert "instance 名稱不合法" in captured.err
+
+
+def test_ensure_running_is_discoverable_in_service_help(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _run_cli(["service", "ensure-running", "--help"]) == 0
+    assert "ensure-running" in capsys.readouterr().out
+
+
+def test_ensure_running_returns_already_running_without_spawning(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.deploy import installer
+    from paulsha_cortex.porcelain import service
+
+    monkeypatch.setattr(
+        service,
+        "probe_service_runtime",
+        lambda instance: {"instance": instance, "mode": "unmanaged", "version": "1.2.3", "units": {}},
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    (service_runtime["control_root"] / "manager.lock").write_text(
+        json.dumps({"pid": os.getpid()}), encoding="utf-8"
+    )
+
+    def unexpected_spawn(*args, **kwargs):
+        raise AssertionError("already-running must not spawn a process")
+
+    monkeypatch.setattr(service.subprocess, "Popen", unexpected_spawn)
+
+    assert service.main(["ensure-running", "--instance", "beta"]) == 0
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert len(output.splitlines()) == 1
+    assert payload["schema"] == SERVICE_SCHEMA
+    assert payload["command"] == "ensure-running"
+    assert payload["instance"] == "beta"
+    assert payload["mode"] == "already-running"
+    assert payload["pids"]["manager"] == os.getpid()
+    assert payload["result"]["exit_code"] == 0
+
+
+def test_ensure_running_starts_systemd_units_and_waits_for_manager_lock(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.deploy import installer
+    from paulsha_cortex.porcelain import service
+
+    units = {
+        name: {
+            "present": True,
+            "status": "inactive/dead",
+            "pid": 7654 if name.endswith("monitor.service") else None,
+        }
+        for name in service._unit_names("beta")
+    }
+    monkeypatch.setattr(
+        service,
+        "probe_service_runtime",
+        lambda instance: {"instance": instance, "mode": "systemd", "version": "1.2.3", "units": units},
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: True)
+    lock_payloads = iter(({}, {}, {"pid": 4321}))
+    monkeypatch.setattr(service, "_read_lock_payload", lambda instance=None: next(lock_payloads))
+    monkeypatch.setattr(service, "_pid_is_live", lambda pid: isinstance(pid, int) and pid > 0)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_systemctl(verb: str, *unit_names: str):
+        calls.append((verb, *unit_names))
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(service, "_run_systemctl", fake_systemctl)
+
+    assert service.main(["ensure-running", "--instance", "beta"]) == 0
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert len(output.splitlines()) == 1
+    assert calls == [
+        ("start", "beta-manager.service", "beta-manager.timer"),
+        ("start", "beta-monitor.service"),
+    ]
+    assert payload["mode"] == "systemd"
+    assert payload["pids"] == {"manager": 4321, "monitor": 7654}
+    assert payload["units"] == [
+        "beta-manager.service",
+        "beta-manager.timer",
+        "beta-monitor.service",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("systemd_available", "units_present"),
+    [(False, False), (False, True), (True, False)],
+)
+def test_ensure_running_falls_back_to_local_manager_and_monitor(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    systemd_available: bool,
+    units_present: bool,
+) -> None:
+    from paulsha_cortex.deploy import installer
+    from paulsha_cortex.porcelain import service
+
+    monkeypatch.setattr(
+        service,
+        "_status_payload",
+        lambda instance: {
+            "instance": instance,
+            "mode": "systemd" if units_present else "none",
+            "units": {
+                name: {"present": units_present, "pid": None}
+                for name in service._unit_names(instance)
+            },
+        },
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: systemd_available)
+    lock_payloads = iter(({}, {"pid": 4321}))
+    monkeypatch.setattr(service, "_read_lock_payload", lambda instance=None: next(lock_payloads))
+    monkeypatch.setattr(service, "_pid_is_live", lambda pid: isinstance(pid, int) and pid > 0)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    launches: list[tuple[list[str], dict[str, object]]] = []
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+    def fake_popen(argv: list[str], **kwargs):
+        launches.append((argv, kwargs))
+        return FakeProcess(9002 + len(launches))
+
+    monkeypatch.setattr(service.subprocess, "Popen", fake_popen)
+
+    assert service.main(["ensure-running", "--instance", "beta"]) == 0
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert len(output.splitlines()) == 1
+    assert [argv for argv, _kwargs in launches] == [
+        [
+            sys.executable,
+            "-m",
+            "paulsha_cortex.coordinator.manager_daemon",
+            "--specs-dir",
+            str(service_runtime["tmp_path"] / "specs"),
+        ],
+        [sys.executable, "-m", "paulsha_cortex.monitor"],
+    ]
+    assert all(kwargs["env"]["PSC_INSTANCE"] == "beta" for _argv, kwargs in launches)
+    assert payload["mode"] == "fallback"
+    assert payload["pids"] == {"manager": 4321, "monitor": 9004}
+    assert payload["units"] == []
+
+
+def test_ensure_running_reports_systemd_startup_timeout(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.deploy import installer
+    from paulsha_cortex.porcelain import service
+
+    units = {
+        name: {"present": True, "status": "inactive/dead", "pid": None}
+        for name in service._unit_names("beta")
+    }
+    monkeypatch.setattr(
+        service,
+        "probe_service_runtime",
+        lambda instance: {"instance": instance, "mode": "systemd", "version": "1.2.3", "units": units},
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: True)
+    monkeypatch.setattr(service, "_read_lock_payload", lambda instance=None: {})
+    monkeypatch.setattr(service, "_pid_is_live", lambda pid: False)
+    monkeypatch.setattr(service, "_ENSURE_START_TIMEOUT_SECONDS", 0, raising=False)
+    monkeypatch.setattr(
+        service,
+        "_run_systemctl",
+        lambda verb, *unit_names: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    assert service.main(["ensure-running", "--instance", "beta"]) == 1
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert len(output.splitlines()) == 1
+    assert payload["command"] == "ensure-running"
+    assert payload["mode"] == "systemd"
+    assert payload["result"]["exit_code"] == 1
+    assert "manager.lock" in payload["error"]
+
+
+def test_ensure_running_systemctl_timeout_keeps_json_envelope(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.deploy import installer
+    from paulsha_cortex.porcelain import service
+
+    units = {
+        name: {"present": True, "status": "inactive/dead", "pid": None}
+        for name in service._unit_names("beta")
+    }
+    monkeypatch.setattr(
+        service,
+        "probe_service_runtime",
+        lambda instance: {"instance": instance, "mode": "systemd", "version": "1.2.3", "units": units},
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: True)
+    monkeypatch.setattr(service, "_read_lock_payload", lambda instance=None: {})
+
+    def timeout(verb: str, *unit_names: str):
+        raise subprocess.TimeoutExpired(["systemctl", "--user", verb, *unit_names], 10)
+
+    monkeypatch.setattr(service, "_run_systemctl", timeout)
+
+    assert service.main(["ensure-running", "--instance", "beta"]) == 1
+
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert len(output.splitlines()) == 1
+    assert payload["command"] == "ensure-running"
+    assert payload["mode"] == "systemd"
+    assert payload["result"]["exit_code"] == 1
+    assert "timed out" in payload["error"]
+
+
+def test_ensure_running_uses_requested_instance_runtime_env_for_lock_probe(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.deploy import installer
+    from paulsha_cortex.porcelain import service
+
+    beta_control_root = service_runtime["tmp_path"] / "beta-control"
+    beta_control_root.mkdir()
+    (service_runtime["runtime_root"] / "beta-manager.env").write_text(
+        f"PSC_CONTROL_ROOT={beta_control_root}\n", encoding="utf-8"
+    )
+    (beta_control_root / "manager.lock").write_text(
+        json.dumps({"pid": os.getpid()}), encoding="utf-8"
+    )
+    monkeypatch.setenv("PSC_INSTANCE", "cortex")
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(service_runtime["tmp_path"] / "wrong-control"))
+    monkeypatch.setattr(
+        service,
+        "probe_service_runtime",
+        lambda instance: {"instance": instance, "mode": "unmanaged", "version": "1.2.3", "units": {}},
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+
+    def unexpected_spawn(*args, **kwargs):
+        raise AssertionError("the requested beta manager is already running")
+
+    monkeypatch.setattr(service.subprocess, "Popen", unexpected_spawn)
+
+    assert service.main(["ensure-running", "--instance", "beta"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "already-running"
+    assert payload["pids"]["manager"] == os.getpid()

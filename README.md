@@ -114,6 +114,18 @@ pipx install git+https://github.com/hamanpaul/paulsha-cortex.git
 - [Runbook](docs/onboarding/runbook.md)：把常見事故整理成可執行 SOP。
 - [driving-cortex skill](skills/driving-cortex/SKILL.md)：agent 編排 coordinator 視角，對應 issue #177 的 dogfood 派工實務。
 
+### 安裝 driving-cortex skill
+
+`skills/driving-cortex` 是此 skill 的唯一來源；Python 套件與 `cortex install service` 不會安裝它。支援 `$HOME/.agents/skills` 的 agent 可在此 repo checkout 建立 symlink，讓通用 skills root 發現該 skill：
+
+```bash
+repo_root="$(git rev-parse --show-toplevel)"
+mkdir -p "$HOME/.agents/skills"
+ln -s "$repo_root/skills/driving-cortex" "$HOME/.agents/skills/driving-cortex"
+```
+
+之後更新此 checkout 時，symlink 會讀到最新的 `SKILL.md`；若 repo 搬移，需重新建立入口。
+
 ## Usage
 
 ### 10 分鐘上手：`cortex bootstrap`
@@ -206,6 +218,10 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    restart survival 保證。Manager daemon restart、timeout/parser/CLI 值域（#824）與 AGY
    probe containment（#851）仍是獨立工作項；本 session 修正不新增 cancel/timeout/probe
    語意，也不宣稱這些 issue 已完成或關閉。
+
+   **#498 Claude headless builder 的 steering 邊界**：Claude builder 以 `-p` 執行時不附加
+   `--remote-control`；執行中的 headless job 不支援即時 steering。spool 保留的
+   `steering` 事件不代表指令已送達或被採納。
 
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 
@@ -317,10 +333,13 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    ```bash
    cortex service install --instance cortex --repo-root "$(git rev-parse --show-toplevel)"
    cortex service start --instance cortex --json
+   cortex service ensure-running --instance cortex
    cortex service status --instance cortex --json
    cortex service logs --instance cortex -n 50
    cortex service uninstall --instance cortex --purge --json
    ```
+
+   自動化呼叫可用 `cortex service ensure-running`：若 `manager.lock` 已由 live manager 持有，就不重啟並回報 `mode=already-running`；systemd user units 齊備且可用時會啟動 manager service/timer 與 monitor service，並等待 manager lock 最多 10 秒；否則以目前執行中的 Cortex Python 啟動本地 manager 與 monitor。此命令固定輸出一行 `cortex-porcelain/service/v1` JSON，fallback log 寫入 `manager.log`，不會安裝或修改 units。
 
    `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
    `cortex service install` 寫入 unit 後，若 `daemon-reload` 或 `enable` 任一階段非零，會直接回報 `mode=systemd`、非零 exit code，訊息僅包含 systemd stderr、unit 落檔位置、重試 command（`systemctl --user ...`），並明確指出「unit 已寫入但僅 reload/enable 尚未完成」，不會輸出 traceback 或 stdout 內容，並不再繼續後續步驟。
@@ -343,7 +362,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    若 spec frontmatter 成對宣告 optional `executor`／`model_id`，fanout/tick 會逐 slice 覆寫這裡的 builder 預設值；命令列明確指定與 spec frontmatter 宣告的 `(executor, model_id)` 都會先查 `model-identities.yaml`，unknown identity 直接 fail-closed 並列出可用 candidates。
    `run fanout`／`run tick` 的 JSON 結果固定帶 `dispatch_skipped_by_backoff`；若 `dispatch` request 或 `slice-action retry-build` 因 durable executor backoff 沒有派出 job，也會回同名欄位而不是造假 `job_id`。元素若是已知 cooldown，形狀正好是 `{"slice_id","executor","model_id","retry_after_epoch"}`；若 store 狀態未知，則改為 `retry_after_epoch: null` 並帶 `reason`（目前為 `executor-backoff-store-unknown`）。**unknown 只代表 durable backoff state 無法可信判定，不代表 quota/額度已可用。**
    `cortex run work start/resume/...` 額外支援 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model`：run-scoped 覆寫該 work item 這次 claim 的 planner/builder/reviewer 模型鏈，三段各自獨立、未指定的段落回退共享 `model-identities.yaml`。覆寫只影響這個 run，不改共享設定檔、不影響其他 active run 尚未派出的 card；於 claim（或首次 dispatch）時凍結，之後 resume／retry 沿用凍結值。指定的 identity 仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 CLI 直接回報錯誤原因並列出可用 identity，不會靜默退回共享預設。
-   `run work retry-card` 的 `--card` 只接受 retry-card action，需搭配 exact 活動 WorkflowRun ID 與該 run 的待派 card；run-scoped builder override 仍受既有 identity 與 Manager 檢查。`--payload` 可用來傳遞各 action 原本支援的其他欄位，不是選擇 retry card 的必要輸入；retry-card 仍拒絕既有 allowlist 以外的 caller fields。
+   `run work` 的 `--card` 用於 `retry-card` 與 `regenerate-gates`：前者需搭配 exact 活動 WorkflowRun ID 與該 run 的待派 card；後者選擇要重跑 gate 的 build 卡，若 run 有多張符合條件的 build 卡就必須指定，單卡時省略仍相容並取該卡最新 job。run-scoped builder override 仍受既有 identity 與 Manager 檢查。`--payload` 可用來傳遞各 action 原本支援的其他欄位，不是選擇 retry card 的必要輸入；retry-card 仍拒絕既有 allowlist 以外的 caller fields。
    每張卡最多接受三次 `retry-card` 重派；超限會維持 `needs_human` 並在阻塞理由標示卡片，提示 `abandon` 或符合條件時使用 `retry-build`。
 
 11. 用 `recover` 家族執行受限復原；slice/work mutation 的 `--actor` 為必要審計欄位：
@@ -481,14 +500,20 @@ systemctl --user status cortex-manager.service cortex-monitor.service
   下游可直接使用去識別化 producer snapshot fixture
   `tests/fixtures/workflow-execution-identity-828-status.json`；欄位與 selection
   語意見 `docs/superpowers/specs/workflow-execution-identity-producer-contract.md`。
+- verify job 的 log 若含 `status: ERROR` 的 provider attempt 訊息，且 Manager 已綁定
+  成功 evidence、run 的 Candidate 與 `verified_head` 相同並將該卡標為 passed，`in_flight`／
+  `attention` 會附 `accepted_workflow_results`，`cortex jobs` 會附 `workflow_result`，顯示
+  `verified` 與 `recovered_provider_errors`。這是呈現註記，不覆寫 Job 的 process status、原始 log 或 usage；沒有 Manager 採信結果時不會投影成成功。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。builder／reviewer 失敗若已有
   durable `provider_outcome`，`gate_reason` 會帶具名後綴（例如 `builder-failed-rate_limited`、
   `builder-failed-effort_not_supported`、`foreign-review-provider-launch_failed`），而不是把所有
-  provider 層與 launch 層失敗壓平成同一句。
+  provider 層與 launch 層失敗壓平成同一句；每筆也帶目前的 `binding_revision`，供單筆
+  `supersede` action 做 exact CAS。
 - `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及
   `candidate_git_base`。workflow job 的 provider 類失敗會另外投影 `provider_outcome` 與
   `provider_outcome_authority`；`runtime-contract-failed` 仍與 provider 分類分層，不會被
-  `exit 127` 或關鍵字比對覆蓋。
+  `exit 127` 或關鍵字比對覆蓋。`building` slice 若沒有目前綁定的 in-flight builder job，
+  complete/status reconcile 會將它轉成帶 `DiagnosticReason` 的 `needs_human`。
 - `candidate_git_base`（#731）：這條 run／這張卡的**候選 git base**——真正那個 40-hex commit SHA，以及它落後 mirror 上 `origin/main` 幾個 commit。欄位含 `sha`、`sha_source`（`frozen-readiness-base-sha` 或 `first-build-job-dispatch-head`）、`behind_origin_main`、`mirror_origin_main`、`threshold_commits`、`reason`、`measured_against`、`fetched`。
   - **與 `source_revision` 是兩件事**：`source_revision` 是 work item 來源材料的 sha256（authority digest，64-hex），與 git 無關、也不隨 `origin/main` 前進而改變。過去候選基底只存在於候選 worktree 的 `.git` 裡，operator 只能 `git -C <候選 worktree> rev-parse HEAD` 才問得到，於是把診斷掛在 `source_revision` 上而誤判。
   - 落後達 `threshold_commits`（預設 10，可用 `PSC_CANDIDATE_BASE_STALE_THRESHOLD_COMMITS` 覆寫）時，`reason` 為具名診斷 `candidate-git-base-stale`——代表「這條 run 的基底過舊、已 merge 的 test-only 修復進不去」。
@@ -508,11 +533,20 @@ cortex slice-action "$SLICE_ID" retry-build  --actor operator
 cortex slice-action "$SLICE_ID" retry-verify --actor operator
 cortex slice-action "$SLICE_ID" retry-review --actor operator
 cortex slice-action "$SLICE_ID" abandon      --actor operator
+cortex slice-action "$SLICE_ID" supersede    --actor operator \
+  --reason "後續 retry 已接手此分析" --expected-binding-revision "$BINDING_REVISION"
 ```
+
+`supersede` 是單筆終結動作，只接受沒有 in-flight job 的 `needs_human`／`failed` slice；必須帶
+`--actor`、單行 `--reason` 與 status 所列的 `--expected-binding-revision`。它會保留舊 slice 與
+action audit，將 state 標為 `superseded`，不建立 CompletionRecord，也不釋放 dependency；相同
+actor/reason/CAS 重送會回報已完成且不新增 audit。
 
 `fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。共享 coordinator root 內的 `jobs.json` 另以 exact durable-byte SHA-256 revision ＋ canonical `jobs.json.transaction.lock` sidecar 做 compare-and-persist：stale request 不會被靜默重播，daemon 會先把 `RegistryRevisionConflict`（含 expected/actual revision 與 canonical path）持久化成 `done` error，再移除 request file。
 
-Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|auto|review-attest|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，CLI 會拒絕 `expected_run_id`；`cortex run work retry-build` 使用 `--expected-candidate`，不接受共用旗標 `--expected-run-id`。`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord；終態化後也會逐 run reconcile planning transaction、回收 build worktree，並退役 build branch。有超出 base 的 branch commit 會先保留在 `archive/<work_id>-<shortsha>` tag。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|retire-delivered|close-delivered|auto|review-attest|review-disposition|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，CLI 會拒絕 `expected_run_id`；`cortex run work retry-build` 使用 `--expected-candidate`，不接受共用旗標 `--expected-run-id`。`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord；終態化後也會逐 run reconcile planning transaction、回收 build worktree，並退役 build branch。有超出 base 的 branch commit 會先保留在 `archive/<work_id>-<shortsha>` tag。`review-attest` 的 review 摘要、空 findings 與選填 `evidence_refs`，以及 `ship` 的 exact evidence refs，都由 `--payload <json>` 傳入；當 work item 沒有 mapped OpenSpec 時，即使尚未建立 PR，只要 verified HEAD 仍等於 candidate 也可先建立 maintainer attestation。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+
+沒有 `WorkflowRun` 的管線外交付可用 `cortex work close-delivered <work-id> --repo <owner/repo> --actor <actor> --reason <reason>` 補建 immutable CompletionRecord。Manager 會重驗 issue、PR merge commit、OpenSpec archive、mapped Todo 與 archived OpenSpec tasks；所有既有 remote closure 條件通過才寫入 actor/reason 證據，命令不會建立 WorkflowRun。
 
 Sizing 的五個維度仍各為 0–2 分，Green／Yellow／Red 仍是 0–3／4–6／7–10。`spec_stability` 使用可識別的 `stability-risk-v2` 風險映射：完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind 或任何 blocker／未 accepted artifact 為 2；空白或不一致資料保守為 2。這不會取代 accepted/readiness gate。新 claim／reclaim／明示 retry 重算才採用新映射；舊 run、frozen planning、CompletionRecord 與 immutable evidence 不會因讀取或重啟被回填，缺算法來源的歷史分數標為 legacy／unversioned，需正式重新評估才取得新分數。
 
@@ -520,19 +554,26 @@ Manager periodic tick 會從 durable Monitor snapshot 執行 auto-claim scan；�
 
 `ship` 的 `pr_number`、`change`、`todo_paths` 必須與 current WorkAuthority 的 confirmed refs 完全相同，第一次 ship 後即成為 immutable delivery binding。V1 每個 run 只支援唯一一張 PR、零或一個 OpenSpec change，以及唯一一個 Todo path；PR/Todo 不是各一個，或 OpenSpec confirmed target 多於一個時，都會轉為 `needs_human: multiple-delivery-targets-unsupported`，不會以其中一個 target 寫 CompletionRecord 或投影 done。Manager 會用 authenticated `gh api` 更新既有 mapped PR 的 zh-TW conventional title、body 與 labels，再逐欄 reread；body 必須用 closing keyword涵蓋全部 mapped issues。Checks、statuses與reviews的REST pagination使用`--paginate --jq '.'`輸出一頁一行的compact JSON stream，不依賴`gh api --slurp`；任一頁無法解碼仍fail-closed。`repo_root` 必須恰好等於 canonical `git rev-parse --show-toplevel` realpath，且 `origin` 對應同一 `owner/name`。
 
+第一次派出 Builder 前，Manager 會重新載入 WorkAuthority-backed run 的目前 authority，要求恰有一個 canonical workstream Todo，且 authority revision 與 `WorkflowRun.source_revision` 相符。Todo=0 時會停在 `needs_human`，提示發布 canonical Todo、link path、等 Monitor 更新後再 resume；只有多個 Todo mapping 才建議 unlink。authority 已變更時，舊 run 不會繼續派 Builder，須依既有正式重啟流程重新綁定。此 admission 發生在 Builder job、worktree 與 launcher 建立前，且不攔 plan、verify 或 review；ship cardinality gate 繼續作為 backstop。
+
 Merge authorization 只雜湊 stable preflight 結果（argv、return code、HEAD、tree 與 gate outcome）及 immutable evidence hashes，不納入 stdout、stderr 或 duration。若 Manager 在 `merge-authorized` 後 crash，restart 會先以唯讀 authorization record 與 authenticated merge status reconcile；已合併時不重寫 PR metadata，也不重跑可能漂移的 preflight output。
 
 ### 5. 由 Manager 完成交付
 
-Work Item workflow 通過 build、deterministic verification 與 foreign review 後，由 Manager 依序 archive OpenSpec（若 `mapped_openspec == ()` 則跳過）、在自己的 ship clone 內用 bounded direct git subprocess probe `origin/main`、跑 policy/pinned preflight、建立或更新 PR，再要求恰好一種current-HEAD delivery review：authenticated Copilot review，或透過`review-attest`建立的immutable maintainer evidence。main probe 會依序 resolve/validate Candidate、fetch、resolve/validate `FETCH_HEAD`、算 merge-base，必要時再跑 `merge-tree --write-tree --name-only --no-messages -z` 與 NUL-safe path parser；只有 Candidate 已含最新 `origin/main` 時才可進 preflight，clean-behind／conflict／probe failure 都會在 preflight／push／PR 前 fail-closed。fetch／merge-base／merge-tree／path-parser failure 會把 `candidate`／`stage`／`returncode`（timeout 為 null）／`error_kind`／`main_head` 寫成 content-addressed `main-sync-probe` evidence；若真的要 push，preflight 後與 `git push` 前還會再 probe 一次。已進 merged/done closure 與 terminal refresh 則跳過 main probe，直接走既有 closure reconciliation。Manager接著重讀checks、threads、closing refs與mergeability；只有全部gate對同一HEAD成立時才執行merge commit。Maintainer evidence保留`maintainer-review` kind，絕不偽裝成Copilot。
+Work Item workflow 通過 build、deterministic verification 與 foreign review 後，由 Manager 依序 archive OpenSpec（若 `mapped_openspec == ()` 則跳過）、在自己的 ship clone 內用 bounded direct git subprocess probe `origin/main`、跑 policy/pinned preflight、建立或更新 PR，再要求恰好一種current-HEAD delivery review：authenticated Copilot review，或透過`review-attest`建立的immutable maintainer evidence。main probe 會依序 resolve/validate Candidate、fetch、resolve/validate `FETCH_HEAD`、算 merge-base，必要時再跑 `merge-tree --write-tree --name-only --no-messages -z` 與 NUL-safe path parser；只有 Candidate 已含最新 `origin/main` 時才可進 preflight，clean-behind／conflict／probe failure 都會在 preflight／push／PR 前 fail-closed。clean-behind／conflict 停止後，若 exact Candidate、passed build、無 active job 與 ship/archive 前置條件都允許 registry reset，`cortex status` 會顯示帶 exact Candidate 的 `retry-build` 指令；Builder 指示會引用 stop evidence 與該次 probe 的 main SHA，reset 後仍須重跑 verify、review 與 ship probe。fetch／merge-base／merge-tree／path-parser failure 會把 `candidate`／`stage`／`returncode`（timeout 為 null）／`error_kind`／`main_head` 寫成 content-addressed `main-sync-probe` evidence；若真的要 push，preflight 後與 `git push` 前還會再 probe 一次。已進 merged/done closure 與 terminal refresh 則跳過 main probe，直接走既有 closure reconciliation。Manager接著重讀checks、threads、closing refs與mergeability；只有全部gate對同一HEAD成立時才執行merge commit。Maintainer evidence保留`maintainer-review` kind，絕不偽裝成Copilot。
 
-Headless build card會在dispatch前解析declared inputs。異質brainstorm發布的新artifact會先由canonical brainstorm evidence的ref/kind/hash與不可變發證source revision原子併入WorkflowRun planning authority；legacy active run也只透過相同evidence reconcile，不從mutable檔案猜測。後續PR refresh即使更新run目前source revision，也不會改寫planning發證revision；brainstorm-required run缺evidence一律停止。Accepted planning artifact只接受該authority的ref/hash；獨立builder worktree缺檔時由Manager原子seed。plan card 缺少宣告的 output 時，Manager 會以 planning authority 綁定的 durable journal 發佈；registry 未提交時回滾，已提交時由 reconcile 保留產物。Codex固定使用`workspace-write`；workflow中`commit_policy=required`的builder，以及legacy fanout／dispatch／retry-build的builder persona，取得明確commit capability，linked worktree才額外開放Git驗證出的current worktree gitdir、shared objects、current branch ref與reflog parent directories。Launcher會清除inherited Git repository selectors；planner、verify與review不取得這些Git write directories，symlink、detached HEAD或invalid metadata一律拒絕required-commit launch。Job、versioned bounded prompt與canonical evidence保存同一份input snapshot，terminalize再驗hash。Build card可把Candidate單調推進到目前Candidate的exact descendant worktree HEAD；verify/review仍須完全等於凍結Candidate。Dead job，或plan/build workflow card以schema/binding正確的terminal明示`failed|needs_human`，轉`needs_human`後periodic runner都不會自動重派；explicit resume保留舊job/log並重試同一run/card。verify／review reviewer card若以形狀合法的 `failed`／`needs_human` terminal 誠實要求停止，Manager 會落 `verification-terminal-explicit-stop`／`review-terminal-explicit-stop`、保留模型原文與 job log evidence ref，periodic runner 同樣不自動重派；這條路的 explicit resume 只會重落同一個停止，不會重派新 reviewer job，實際重派出口仍是 `retry-card`／`retry-build`。若已完成的Candidate在delivery preflight才發現真實缺陷，operator可用`retry-build`加上exact `expected_candidate`；Manager通常只在ongoing `needs_human` verify/review run、無active job且舊build全部passed時，以窄化registry recovery原子重開最後一張builder card。若final builder已成功退出（`exited/0`）但因immutable input／evidence驗證失敗而未綁定，則只允許同一Candidate CAS在build phase重派，且前置build card必須全passed、最後card仍pending、最新同card job必須成功退出且無workflow evidence；真正的failed job不走此入口。所有retry-build recovery prompt都要求先檢查worktree是否已有repair commit，並允許builder提交或採用已測試的descendant Candidate；Manager仍會獨立驗證exact舊Candidate CAS與單調ancestry。terminalization recovery另要求保留declared input snapshot並先檢查未綁定commit。兩條路徑都清除失效的下游authority，並要求新HEAD為舊Candidate的descendant。Dispatch失敗會恢復stop facet，必須修正authority後再由operator重試。
+Headless build card會在dispatch前解析declared inputs。異質brainstorm發布的新artifact會先由canonical brainstorm evidence的ref/kind/hash與不可變發證source revision原子併入WorkflowRun planning authority；legacy active run也只透過相同evidence reconcile，不從mutable檔案猜測。Monitor 後續納入同 run 已接受且 bytes 符合 baseline 的 planning artifact，或加入綁定同一 exact verified Candidate 的 Manager PR 時，claim/reconciliation 保留原 claim-era、gate、evidence 與 attempts；來源、hash、PR refs 或 Candidate 無法逐項對應，或其他 authority 欄位改變時，仍走既有 restart。建立 PR 只更新 run 的 `pr_refs` 與 delivery journal，不改寫 `source_revision`／claim key；brainstorm-required run 缺 evidence 一律停止。Yellow plan review 只有在結果明確 ready 後，才會以單一 registry transition 將被接受的逐檔 bytes/hash 與 immutable planning source revision 寫入 receipt 並同步 run baseline。若 verify dispatch 前發生 planning drift，Manager 會保存 exact candidate/card/hash stop；operator resume 只有在尚無 verify job、receipt 綁定仍有效且既有 candidate workspace 逐檔符合 review receipt 時，才會以 CAS 更新 baseline 後續跑同一 candidate，原有 checkbox-only 容忍維持不變。Accepted planning artifact只接受該authority的ref/hash；獨立builder worktree缺檔時由Manager原子seed。plan card 缺少宣告的 output 時，Manager 會以 planning authority 綁定的 durable journal 發佈；registry 未提交時回滾，已提交時由 reconcile 保留產物。Codex 的 sandbox mode 依卡片契約導出：只有 `commit_policy=forbidden` 且 `declared_outputs` 為空的 build card 使用 `read-only`；其他 builder card 不套用這個唯讀例外。workflow中`commit_policy=required`的builder，以及legacy fanout／dispatch／retry-build的builder persona，取得明確commit capability，linked worktree才額外開放Git驗證出的current worktree gitdir、shared objects、current branch ref與reflog parent directories。Launcher會清除inherited Git repository selectors；planner、verify與review不取得這些Git write directories，symlink、detached HEAD或invalid metadata一律拒絕required-commit launch。Job、versioned bounded prompt與canonical evidence保存同一份input snapshot，terminalize再驗hash。Build card可把Candidate單調推進到目前Candidate的exact descendant worktree HEAD；verify/review仍須完全等於凍結Candidate。Dead job，或plan/build workflow card以schema/binding正確的terminal明示`failed|needs_human`，轉`needs_human`後periodic runner都不會自動重派；explicit resume保留舊job/log並重試同一run/card。verify／review reviewer card若以形狀合法的 `failed`／`needs_human` terminal 誠實要求停止，Manager 會落 `verification-terminal-explicit-stop`／`review-terminal-explicit-stop`、保留模型原文與 job log evidence ref，periodic runner 同樣不自動重派；這條路的 explicit resume 只會重落同一個停止，不會重派新 reviewer job，實際重派出口仍是 `retry-card`／`retry-build`。若已完成的Candidate在delivery preflight才發現真實缺陷，operator可用`retry-build`加上exact `expected_candidate`；Manager通常只在ongoing `needs_human` verify/review run、無active job且舊build全部passed時，以窄化registry recovery原子重開最後一張builder card。若final builder已成功退出（`exited/0`）但因immutable input／evidence驗證失敗而未綁定，則只允許同一Candidate CAS在build phase重派，且前置build card必須全passed、最後card仍pending、最新同card job必須成功退出且無workflow evidence；真正的failed job不走此入口。所有retry-build recovery prompt都要求先檢查worktree是否已有repair commit，並允許builder提交或採用已測試的descendant Candidate；Manager仍會獨立驗證exact舊Candidate CAS與單調ancestry。terminalization recovery另要求保留declared input snapshot並先檢查未綁定commit。兩條路徑都清除失效的下游authority，並要求新HEAD為舊Candidate的descendant。Dispatch失敗會恢復stop facet，必須修正authority後再由operator重試。
 
 Legacy headless builder 的 dispatch prompt 會帶入 Manager 解析後的 worktree 根目錄，限制 repository 讀寫與命令只在該樹內執行，並禁止存取 operator/base checkout；路徑遭拒時須從目前 cwd 重新解析成 worktree 內的相對路徑。
 
 **provider／launch 失敗詞彙維持分層，且只對有證據的 executable 問題 reroute（#826）。** 結構化 terminal 與 controller interruption 仍優先於文字關鍵字；其後才接受可證實的 `exit 127` 空輸出，最後才走 provider text 的 `rate limit → quota → auth → effort_not_supported → executable_not_found → content → transient` 次序。`not found` 只有在已知 launcher／executor 的 shell `command not found` 上下文、同一行帶 `exec`／`execvpe`／`execve`／`spawn`／`Popen` 與 `No such file or directory` 的 launcher ENOENT（若同一行也附帶 `: <target>`，該 target 必須是已知 launcher executable，且不能只是缺失的 cwd/path；若沒有明示 target，則 bare launch-call ENOENT 仍可成立；未知 explicit target 一律維持 non-reroutable）、可信的空 `127`（不是缺 log／讀不到 log），或 launch 例外可證明缺的是 provider executable（如 `copilot`／`codex`／`claude`／`agy`／`cg` 或精確 executor 名）時，才會進 `executable_not_found`；HTTP 404、model not found、一般工作檔案 `No such file or directory`，以及 `bash`／`sh`／`git`／`systemctl`／`systemd-run` 這類 shared launch infrastructure 缺失，都不會借題發揮成 reroute。新的環境類詞彙是 `effort_not_supported`／`executable_not_found`／`launch_failed`：前兩者在 authority 不是 `hint` 時可有界 reroute，`launch_failed` 只保留原始 exception／缺 handle 診斷，三條 launch-failure producer path 都會同步保存 matching `launch-failed` runtime diagnostic，不自動 retry 或 reroute；真正的 `runtime-contract-failed` 與 reviewer candidate drift 仍比 provider routing 更強，持續 fail-closed。
 
+**#582 sandbox 工具中止分類**：終局 `subtype=error_during_execution` 且 `terminal_reason=aborted_tools` 表示工具鏈被外部生命週期中斷，分類為 `environment`／`tool_aborted`，可進入 bounded retry；這不同於維持 `unknown` 的一般 controller interruption。
+
 Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、Todo 與 CompletionRecord；若 work item 有 mapped OpenSpec，另要求 active OpenSpec 消失且 archive 成立。`mapped_openspec == ()` 時 remote closure 以 PR merged＋issue 全 closed＋Todo 全勾＋CompletionRecord 有效為準。部分完成不會提早標 `done`。
+
+若舊版 `authority-restart` 已把 run reset 到 `verify`，但同一 run 的完整 merge authorization 與 delivery journal 仍確認 Candidate 已 merge，`resume` 會停止且不重派 verify，並提示 `cortex work <work-id> retire-delivered`。此出口保留退休／abandoned 語意，不代表 shipped completion。
+`close-delivered` 使用相同的 strict closure 條件，僅補足缺失的 operator CompletionRecord；遠端 issue、PR、OpenSpec 或 Todo 證據未全通過時不會結案。
 
 ### 目前邊界
 
@@ -591,6 +632,7 @@ verification:
 - verification command 只接受 typed argv（`shell=False`）；採 sanitized env，但這不是 sandbox，不保證隔離 untrusted code。
 - verification frontmatter 的 inline `argv` list 由 zero-dependency YAML subset parser 解析；含逗號或 `]` 的元素需使用單／雙引號，單／雙引號內的反斜線跳脫可保留引號等字面值，尾逗號可容忍，前導／中間空元素與未閉合引號會拒絕。
 - `repo` 為 optional 顯式歸屬宣告（`owner/repo`，#469）：宣告後派工會寫進 builder/reviewer job 的 `workflow_repo`，`recent_done`／`slices` 的 repo 歸屬即投影此值；未宣告維持 `null`，不從本機路徑或 git remote 推斷。非法 shape（不是恰一個 `/` 或任一段為空）會 fail-closed 落 `hold`。
+- `cortex deck compile` 可用 `--repo owner/name` 將明確 repo 寫入輸出的 spec；省略時仍為 `repo: null`，不從本機路徑或 git remote 推斷（#473）。
 
 ### Runtime preflight（dispatch 前的 capability 與 provider 新鮮度，#262）
 
@@ -666,7 +708,7 @@ identities:
     capabilities: [planning, review]
 ```
 
-- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 已登錄 canonical agy identity；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。
+- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 提供 canonical agy 候選；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。`cortex doctor` 依解析政策確認至少有一個可用的 planning identity，不要求部署保留 canonical agy；agy discovery 與 smoke probe 只判定 agy 是否可用。
 - planner/builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析；agy 只有在 `doctor --probe-live` 的 model discovery 與 plan/sandbox smoke 都吻合時才可用。
 - fanout/tick 明確指定的 builder `(executor, model_id)`，以及 spec frontmatter 成對宣告的 `executor`／`model_id`，都會先查這份 registry；unknown identity 會在派工前 fail-closed 並列出可用 candidates。
 - workflow reviewer 只會選擇明示 `capabilities: [review]` 且與會產出 Candidate commit 的 build card 不同 independence domain 的 schema v2 identity；`commit_policy=forbidden` 的隔離確認卡不計為 Builder；legacy v1 identity 只取得 planning capability，不能被猜成 reviewer。
@@ -762,6 +804,8 @@ cortex slice-action "$SLICE_ID" retry-build  --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" retry-verify --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" retry-review --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
+cortex slice-action "$SLICE_ID" supersede    --actor "$ACTOR" \
+  --reason "$REASON" --expected-binding-revision "$BINDING_REVISION"
 
 # 明確淘汰沒有delivery side effect的舊WorkflowRun：
 cortex work abandon "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
@@ -773,6 +817,14 @@ cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
 ```
 
 `review-attest.json`接受`{"verdict":"approved","summary":"...","findings":[]}`，並可選填 `evidence_refs`（只接受 `{"kind":"operator-reproduction","ref":"<absolute path>","sha256":"<64 hex>"}` 陣列）。path/hash 仍由 Manager 生成，caller 不得注入。若 work item 尚無 mapped PR，Manager 會在 `verified_head == candidate_head` 時先建立 `pr_number: null` 的 immutable maintainer evidence；後續 ship 建 PR 時再把它綁進 delivery gate。若已有 PR，Manager 仍會重讀 authenticated PR HEAD 並將 evidence 綁定 repo/work/run/authority/PR/candidate/actor。
+
+同 HEAD 的 Copilot finding 已完成討論時，operator 可用 `cortex work review-disposition <work-id> --repo <owner/repo> --actor <operator> --reason <理由>` 提交續行裁決。Manager 只在 run／PR／latest Copilot review 仍綁同一 exact HEAD、fresh GitHub snapshot 的所有 review threads 均 resolved，且 thread snapshot 與裁決時一致時寫入 immutable evidence 並清除 needs-human facet；ship 保留原 finding/disposition 歷史。之後明示 `cortex work resume` 會再次執行既有 delivery gates。HEAD、review 或 thread snapshot 改變、仍有未 resolved thread，或沒有 operator disposition 時都會繼續阻擋；單獨 resolve thread 不授權 merge。
+
+```bash
+cortex work review-disposition "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
+  --reason "$REASON"
+cortex work resume "$WORK_ID" --repo "$REPO"
+```
 
 - `slice-action` 一律透過 control request queue，由 daemon/manager 單一 writer 消費。
 - `slice-action retry-build` 若在 agent 真正 launch 前失敗，現在會保留既有

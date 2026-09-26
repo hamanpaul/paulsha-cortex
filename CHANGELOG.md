@@ -628,9 +628,41 @@
 
 ### Fixed
 
+- **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
+- **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
+- **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加
+  `--remote-control`；README 與 monitor 文件說明 headless job 不支援即時 steering，
+  spool 保留的 `steering` 事件也不代表指令已送達或採納。
+- **#803 verifier 採用 Candidate 綁定的 Manager full-suite ledger**：verification prompt 附上精確符合 Candidate 的 build ledger 路徑、sha256 與 pytest 結果摘要；唯讀 sandbox 的環境失敗不再覆蓋 ledger 綠燈，ledger 失敗仍維持 fail-closed。
+- **#817 building invariant 與單筆 supersede**：complete/status 會將沒有目前綁定 in-flight builder job 的 `building` slice reconcile 為帶 `DiagnosticReason` 的 `needs_human`；新增需 actor、reason 與 exact `binding_revision` CAS 的單筆 `supersede`，保留 slice/audit 並使其離開 attention，相同 CAS 重送冪等，不支援 bulk closure 或 diagnosis intent。
+- **#864 driving-cortex skill 入口**：修正 start 範例為現行 `cortex run work start` 命令，並在 README 記錄從 repo 內 canonical `skills/driving-cortex` 建立 `$HOME/.agents/skills/driving-cortex` symlink 的安裝步驟。
+- **#933 AGY provider attempt 錯誤呈現**：`status` 與 `jobs` 投影在 Manager 已採信 verification 結果時，改顯示 `verified` 並附上 recovered provider error 註記；缺少採信結果時維持原狀。
+- **#473 Deck spec repo 宣告**：`cortex deck compile --repo owner/name` 會將明示的 repo 寫入輸出 spec；未指定時維持 `repo: null`，不從本機路徑或 git remote 推斷。
+- **#895 管線外交付結案**：新增 `cortex work close-delivered`，在無 `WorkflowRun` 時由 operator 提供 actor／reason；Manager 重新驗證遠端 issue、PR、OpenSpec 與 Todo closure 後寫入 immutable CompletionRecord，供 Monitor 沿用既有 strict closure 投影。
+- **#486 foreign-review verdict 提示與診斷**：review prompt 會列出 validator 允許的
+  finding category／severity；無效 verdict 仍 fail closed，gate evaluation 會保留
+  validator 的具體錯誤。
+- **#550 git_runner 輸出保真**：兩份預設 runner 保留原始 stdout，避免 porcelain 等 whitespace-sensitive 輸出的前導空白遭移除；dispatcher 與 autonomy 的 `rev-parse` 呼叫端自行清理 SHA 換行，並補上對應回歸測試。
+- **#557 regenerate-gates 卡片定錨**：新增 `--card` 以選擇要重跑 gate 的 build 卡；同一 run 有多張符合條件的卡時，未指定便拒絕執行，並同步更新 CLI、porcelain help 與生命週期文件。
+- **#581 persona fail-loud 殘項**：doctor 依解析政策確認至少一個可用的 planning identity，不再要求 canonical agy；未知 workflow persona 明確拒絕；Claude review overlay 判定改用公開 loader。核對後確認各派工入口共用 `_dispatch_workflow_card`，沿用既有 `resolved_model_chain` provenance 寫入點。
+- **#602 slice-lane reviewer log 路徑**：將 `log_dir` 從 repo 工作樹相對路徑改為 `<coordinator_root>/slice-review-logs/<reviewer_job_id>/`，並列入 Manager-only trust-root 資產，避免 builder 透過可寫工作樹改寫 review 終局 log。
+- **#808 Manager-only OpenSpec 任務不再卡住 archive**：local-closeout 對明確由 Manager 執行 authoritative preflight 並採信 Candidate 的未勾項不再判為 tasks 未完成；其他未勾項仍阻擋 archive。
+- **#938 workflow input envelope 去重**：相同 SHA-256 內容只計入一次 128 KiB 上限，snapshot 仍保留各 ref；超限錯誤列出計量總 bytes、上限與各 ref 的 bytes。
+- **#877 manager／monitor 冪等啟動入口**：新增 `cortex service ensure-running`，已持有 `manager.lock` 時直接回報；systemd user units 可用時啟動既有 units 並等待 manager lock，否則以目前 Cortex interpreter 本地啟動 manager 與 monitor，固定輸出一行 JSON。
+- **#935 review disposition 續行**：新增 operator 明示裁決入口；Manager 重新驗證同 HEAD 的 PR、latest Copilot review 與 resolved threads，並保留 immutable finding/disposition 歷史，確認未漂移後才允許沿原 workflow 重跑 delivery gates。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
+- **#943／#972／#989／#990 main-sync 人工恢復出口**：Candidate clean-behind 或與 main 衝突而停在 `needs_human` 時，只有 reset 前置條件、C/M 摘要與 stop evidence 都相符才會在 status 顯示 `retry-build`；重試指示引用原 evidence 與 main SHA，重開 Builder 後仍須重跑既有 verify、review 與 ship probe。
+- **#847／#964／#965／#979／#980 self-publication drift**：同 run 已接受且 bytes 符合 baseline 的 planning publication，以及綁定 exact verified Candidate 的 Manager PR 納入 WorkAuthority 時保留 claim-era 與既有 gate；其他 authority 變更仍觸發 restart。
+- **#887／#962／#975 已合併 run 防重驗護欄**：authority 前進且 merge authorization 與 delivery journal 完整綁定時，保留原 run phase；舊 `authority_restart` verify-reset merged run 則 fail-closed 停止並提示 `retire-delivered`。
+
+- **#547／#968–#971 owner-bound recover-pre-candidate**：work action 只依 WorkAuthority 的 repo／Work Item 唯一解析持久 owner identity，移除 slice 名稱、spec suffix 與全表 fallback；legacy unbound、缺失、歧義或 attempt／workspace marker 不一致時，回收與 registry mutation 前即拒絕。Manager slice action 與 work action 共用 recovery core，成功後清除 builder binding、寫入 pending action、supersede handoff manifest 並驗證 read-back。
+- **#1051／#1054 Builder Todo admission**：Manager 在第一次 Builder 派工前驗證目前 WorkAuthority 只有一個 Todo 且 run claim revision 相符；Todo=0、多個 Todo 或 authority drift 都會在建立 job／worktree 前停止，ship 的 Todo=0 診斷改為發布、link、等待 Monitor 更新後 resume，不再建議 unlink。
+- **#1042／#1045／#1046／#1058–#1060 plan review baseline 與 verify 恢復**：ready Yellow plan review 會原子保存受審逐檔 hash 並同步 run baseline；verify planning drift 會保存結構化 stop，operator resume 僅在原 Candidate、來源、receipt 與既有 workspace 均通過唯讀核對且尚無 verify job 時重綁並續跑。
+- **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、路徑逃逸、非一般檔案
+  及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用，內容驗收拒收維持
+  content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
   經分類標記遮罩且限 2 KiB。
 - **#876／#936／#558／#613**：archive gate 接受下游 issue-prefix changelog fragment，缺 change-specific entry 時回報明確原因；CLI 會在送件前拒絕 retry-build 的 `expected_run_id`；abandon 會立即 reconcile 該 run 的 planning journal，並回收 build worktree 與 branch，有額外 commit 時先以 archive tag 保留。
 - **#813／#945 AGY builder 權限與前景執行契約**：為 commit-required argv 補上不得含 `--dangerously-skip-permissions` 的負向回歸斷言；AGY builder prompt 現要求測試與長命令在前景同步執行並等待完成，不得交給背景任務。README 也註明 `--allow-unsafe` 對 AGY 會啟用全工具核可，其權限剖面尚未依 #716 逐 executor 量測。
@@ -2951,6 +2983,10 @@
   並指向新步驟。**加固面一律走既有共用探針 `psc_run_under`**（property 由
   `permgen.unit_replica_properties()` 從落檔的 unit 全量導出），**未新增任何手寫的
   `--property=` 清單、未自帶 `--setenv=PATH=`**（design D13）。
+
+### Fixed
+
+- **#716 唯讀卡 sandbox 文件校正**：README 改為說明 Codex sandbox mode 依卡片契約導出；只有 `commit_policy=forbidden` 且 `declared_outputs` 為空的 build card 使用 `read-only`。
 
 ## [0.1.8] - 2026-08-12
 

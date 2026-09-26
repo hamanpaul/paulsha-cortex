@@ -18,11 +18,11 @@ issue: 1030
 
 `cortex run work retry-card <work_id> --repo <owner/repo> --expected-run-id <workflow-id> --card <card-id>` MUST 在提交的既有 `work-action` request 中帶入同一個 `card`、`action`、`work_id`、`repo` 與 `expected_run_id`。現有 `--builder-executor`／`--builder-model` 等 run-scoped options MUST 原樣保留在同一 request；後續 dispatch 與 identity/capability 檢查沿用現有 Manager 行為。
 
-`card` syntax MUST 繼續遵守現有 `control.contract` exact-card 格式與 `retry-card` exact `expected_run_id` CAS；不得放寬 `retry-card` action／phase／下一張待派卡／terminal job／accepted-evidence 驗證。
+`card` syntax MUST 繼續遵守現有 `control.contract` exact-card 格式與 `retry-card` exact `expected_run_id` CAS；不得放寬 `retry-card` action／phase／下一張待派卡／terminal job／accepted-evidence 驗證。#557 的 `regenerate-gates` 選擇器使用相同 card 格式，僅在有多張符合條件的 build 卡時要求提供。
 
 ### R1030.2 — action scope fail closed
 
-`--card` MUST 只對 `action=retry-card` 有效。因 `run work` 共用一個 argparse parser，其他 action 若帶 `--card` MUST 在送 request 前明確報錯，不能默默忽略或轉送。`retry-card` 缺少 `--card` 或提供不合法 card 時，沿用正式 `work-action` contract 的拒絕，且不得寫入 request。
+`--card` 對 `action=retry-card` 與 `action=regenerate-gates` 有效；其他 action 若帶 `--card` MUST 在送 request 前明確報錯，不能默默忽略或轉送。`retry-card` 缺少 `--card` 或提供不合法 card 時，沿用正式 `work-action` contract 的拒絕，且不得寫入 request。`regenerate-gates` 的 `--card` 選擇該 run 內符合條件的 build job；多張卡時必須指定，只有一張時省略仍沿用取最新 job 的相容行為（#557）。
 
 ### R1030.3 — 保留 payload 兼容
 
@@ -32,7 +32,7 @@ issue: 1030
 
 ### R1030.4 — help 與操作範例
 
-`cortex run work --help` MUST 顯示 `--card` 及「retry-card 專用」說明。README recovery 範例 MUST 展示 `--expected-run-id`、`--card`，並可同時帶已有 run-scoped builder override；說明 `--payload` 不是此命令選 card 的必要輸入，payload 欄位仍受各 action 既有 Manager contract／allowlist 限制。
+`cortex run work --help` MUST 顯示 `--card` 及 `retry-card`／`regenerate-gates` 的用途。README recovery 範例 MUST 展示 `--expected-run-id`、`--card`，並可同時帶已有 run-scoped builder override；說明 `--payload` 不是此命令選 card 的必要輸入，payload 欄位仍受各 action 既有 Manager contract／allowlist 限制。
 
 ### Non-goals
 

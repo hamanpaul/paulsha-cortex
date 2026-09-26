@@ -182,6 +182,65 @@ def _base_steps(*, verify_result: str, review_result: str) -> tuple[WorkflowStep
     )
 
 
+def _write_merged_delivery_journal(path: Path, run) -> None:
+    """Create the immutable authorization and journal binding used by merge guards."""
+    step_ids = [f"{run.run_id}:{step.phase}:{step.card}" for step in run.steps]
+    binding = {"pr_number": 8, "change": "demo", "todo_paths": ["docs/todo.md"]}
+    body = {
+        "schema": "cortex-merge-authorization/v1",
+        "run_id": run.run_id,
+        "workflow_step_ids": step_ids,
+        "repo": run.repo,
+        "work_id": run.work_id,
+        "authority_digest": "1" * 64,
+        **binding,
+        "head": run.candidate_head,
+        "tree_hash": "2" * 64,
+        "foreign_review_path": str(path.parent / "foreign-review.json"),
+        "foreign_review_hash": "3" * 64,
+        "preflight_hash": "4" * 64,
+        "checks_hash": "5" * 64,
+        "copilot_requested_at_epoch": 100.0,
+        "copilot_review_id": 17,
+        "copilot_hash": "6" * 64,
+    }
+    auth_hash = work_actions.verification.canonical_json_hash(body)
+    auth_path = path.parent / "evidence" / "merge-authorization.json"
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text(
+        json.dumps({"payload": body, "hash": auth_hash}), encoding="utf-8"
+    )
+    auth_path.chmod(0o444)
+    path.write_text(
+        json.dumps(
+            {
+                "schema": "cortex-delivery-journal/v1",
+                "runs": {
+                    run.run_id: {
+                        "run_id": run.run_id,
+                        "repo": run.repo,
+                        "work_id": run.work_id,
+                        "workflow_step_ids": step_ids,
+                        "delivery_binding": binding,
+                        "ship": {
+                            "phase": "merged",
+                            **binding,
+                            "head": run.candidate_head,
+                            "merge_commit": "7" * 40,
+                            "merge_authorization": {
+                                "path": str(auth_path),
+                                "hash": auth_hash,
+                                "payload": body,
+                            },
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
 # AC1（regression）：retry-build 只重跑 builder，invalidate verify/review
 # ---------------------------------------------------------------------------
@@ -253,6 +312,23 @@ def test_retry_verify_reruns_only_verification_without_rebuilding_candidate(
         candidate_head=HEAD,
         facets=("needs_human",),
     )
+    old_job = registry.create_job(
+        task="wf-demo-verification",
+        persona="reviewer",
+        branch="feature/demo",
+        pane="",
+        worktree=str(tmp_path / "verify-sandbox"),
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="reviewer-verify",
+        workflow_phase="verify",
+    )
+    registry.update_headless_result(old_job["job_id"], status="exited", exit_code=0)
+
+    def exact_recovery_checker(job, current_run) -> bool:
+        return job["job_id"] == old_job["job_id"] and current_run.run_id == run.run_id
+
     result = work_actions.execute_work_action(
         args={
             "action": "retry-verify",
@@ -266,6 +342,7 @@ def test_retry_verify_reruns_only_verification_without_rebuilding_candidate(
         snapshot_path=snapshot,
         state_path=tmp_path / "runs.json",
         workflow_registry=registry,
+        reviewer_recovery_checker=exact_recovery_checker,
     )
     updated = result["result"]["run"]
     assert updated["current_phase"] == "verify"
@@ -280,6 +357,7 @@ def test_retry_verify_reruns_only_verification_without_rebuilding_candidate(
     # 不得計入 model failure 指標，也不得吃 #218 的 repair budget。
     assert result["result"]["retry_classification"] == "orchestrator_retry"
     assert updated["retry_classification"] == "orchestrator_retry"
+    assert registry.get_job(old_job["job_id"])["status"] == "exited"
 
 
 def test_retry_verify_rejects_candidate_mismatch(tmp_path: Path) -> None:
@@ -376,6 +454,23 @@ def test_retry_review_reruns_only_review_without_rebuilding_or_reverifying(
         facets=("needs_human",),
         planning_authority=plan_authority,
     )
+    old_job = registry.create_job(
+        task="wf-demo-code-review",
+        persona="reviewer",
+        branch="feature/demo",
+        pane="",
+        worktree=str(tmp_path / "review-sandbox"),
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="reviewer-review",
+        workflow_phase="review",
+    )
+    registry.update_headless_result(old_job["job_id"], status="exited", exit_code=0)
+
+    def exact_recovery_checker(job, current_run) -> bool:
+        return job["job_id"] == old_job["job_id"] and current_run.run_id == run.run_id
+
     result = work_actions.execute_work_action(
         args={
             "action": "retry-review",
@@ -389,6 +484,7 @@ def test_retry_review_reruns_only_review_without_rebuilding_or_reverifying(
         snapshot_path=snapshot,
         state_path=tmp_path / "runs.json",
         workflow_registry=registry,
+        reviewer_recovery_checker=exact_recovery_checker,
     )
     updated = result["result"]["run"]
     assert updated["current_phase"] == "review"
@@ -402,6 +498,7 @@ def test_retry_review_reruns_only_review_without_rebuilding_or_reverifying(
     # 重跑 review 本身即是 review 交接修復：candidate 未變，非 model repair。
     assert result["result"]["retry_classification"] == "review_handoff_failure"
     assert updated["retry_classification"] == "review_handoff_failure"
+    assert registry.get_job(old_job["job_id"])["status"] == "exited"
 
 
 def test_retry_review_without_frozen_plan_fails_pre_dispatch(tmp_path: Path) -> None:
@@ -720,6 +817,57 @@ def test_repeated_automatic_scan_on_unchanged_authority_does_not_retrigger_resta
         assert "needs_human" in current.facets
         assert current.attempts.get("verify", 0) == attempts_after_tick1
         assert current.claim_key == work_actions._expected_claim_key(new_authority)
+
+
+def test_merged_delivery_authority_advance_does_not_reset_review_run(
+    tmp_path: Path,
+) -> None:
+    old_authority, _ = _authority(
+        tmp_path, source_revisions=["issue:12@open", "openspec:demo@1"]
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    steps = _base_steps(verify_result="passed", review_result="passed")
+    run = _make_run(
+        registry,
+        authority=old_authority,
+        claim_key=work_actions._expected_claim_key(old_authority),
+        current_phase="review",
+        steps=steps,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+    )
+    run = registry._manager_update_workflow_run(
+        run.run_id, pr_refs=("acme/demo#8",)
+    )
+    state_path = tmp_path / "delivery-journal.json"
+    _write_merged_delivery_journal(state_path, run)
+    journal_before = state_path.read_bytes()
+    new_snapshot = _snapshot(
+        tmp_path / "new-snapshot.json",
+        source_revisions=["issue:12@merged", "openspec:demo@2"],
+    )
+    new_authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=new_snapshot
+    )
+
+    result = work_actions._claim_action(
+        args={"action": "auto-scan"},
+        authority=new_authority,
+        now_epoch=200,
+        state_path=state_path,
+        automatic=True,
+        workflow_registry=registry,
+    )
+
+    current = registry.get_workflow_run(run.run_id)
+    assert result["action"] == "resume"
+    assert result["reason"] == "merged-delivery-closure"
+    assert current.current_phase == "review"
+    assert current.claim_key == run.claim_key
+    assert current.steps == run.steps
+    assert current.attempts == run.attempts
+    assert current.to_dict() == run.to_dict()
+    assert state_path.read_bytes() == journal_before
 
 
 # ---------------------------------------------------------------------------

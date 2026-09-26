@@ -323,6 +323,32 @@ class WorkActionFlagTests(unittest.TestCase):
             self.assertEqual(request["args"]["verdict"], "approved")
             self.assertEqual(request["args"]["findings"], [])
 
+    def test_review_disposition_parser_writes_operator_decision_request(self) -> None:
+        submitted = []
+
+        def submit(req_type, args, requested_by):
+            submitted.append((req_type, args, requested_by))
+            return "request-1"
+
+        rc = cli.main(
+            [
+                "work", "review-disposition", "demo", "--repo", "acme/demo",
+                "--actor", "maintainer", "--reason", "討論完成，finding 不阻擋合併。",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=submit,
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"action": "review-disposition-recorded"},
+            },
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][0], "work-action")
+        self.assertEqual(submitted[0][1]["action"], "review-disposition")
+        self.assertEqual(submitted[0][1]["actor"], "maintainer")
+        self.assertEqual(submitted[0][1]["reason"], "討論完成，finding 不阻擋合併。")
+
     def test_work_abandon_parser_writes_exact_run_cas_and_reason(self) -> None:
         submitted = []
 

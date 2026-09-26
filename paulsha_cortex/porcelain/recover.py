@@ -36,13 +36,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cortex recover")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    slice_cmd = sub.add_parser("slice", help="復原 needs_human slice")
+    slice_cmd = sub.add_parser("slice", help="處理需要操作的 slice")
     slice_cmd.add_argument("slice_id")
     slice_cmd.add_argument(
         "action",
-        choices=("retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"),
+        choices=("retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"),
     )
     slice_cmd.add_argument("--actor", required=True)
+    slice_cmd.add_argument("--reason", default=None, help="supersede 的單行稽核理由")
+    slice_cmd.add_argument(
+        "--expected-binding-revision",
+        type=int,
+        default=None,
+        help="supersede 的 slice binding revision CAS",
+    )
     # #396 item 4：`cortex recover slice` 與 `cortex slice-action`
     # （coordinator/cli.py）同樣送出 slice-action request，需要一致的 foreign
     # reviewer identity override，否則 retry-review 落 needs_human
@@ -69,7 +76,10 @@ def _build_parser() -> argparse.ArgumentParser:
     work.add_argument("--actor", required=True)
     work.add_argument("--expected-candidate")
     work.add_argument("--expected-run-id")
-    work.add_argument("--card", help="retry-card 要重派的 builder／reviewer card id")
+    work.add_argument(
+        "--card",
+        help="retry-card／regenerate-gates 專用：指定 card id",
+    )
     work.add_argument("--reason")
     _add_tracking_options(work)
 
@@ -94,6 +104,10 @@ def _slice_args(args: argparse.Namespace) -> dict[str, Any]:
         "actor": args.actor,
     }
     for name in ("review_executor", "review_model"):
+        value = getattr(args, name)
+        if value is not None:
+            payload[name] = value
+    for name in ("reason", "expected_binding_revision"):
         value = getattr(args, name)
         if value is not None:
             payload[name] = value

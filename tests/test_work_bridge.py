@@ -23,7 +23,11 @@ from paulsha_cortex.coordinator import (
     work_actions,
     work_bridge,
 )
-from paulsha_cortex.coordinator.claim import load_work_authority, work_authority_digest
+from paulsha_cortex.coordinator.claim import (
+    claim_key_for_authority_digest,
+    load_work_authority,
+    work_authority_digest,
+)
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
 from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
@@ -246,7 +250,11 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     run = registry._manager_create_workflow_run(
         work_id="work",
         repo="acme/demo",
-        claim_key="claim:v1:" + "1" * 64,
+        claim_key=claim_key_for_authority_digest(
+            repo=authority.repo,
+            work_id=authority.work_id,
+            authority_digest=work_authority_digest(authority),
+        ),
         source_revision=work_authority_digest(authority),
         workspace_root=str(repo),
         combo="feature-oneshot",
@@ -470,7 +478,7 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         snapshot,
         source_revisions=(
             "github_issue:acme/demo#14@issue-open",
-            "openspec:acme/demo:work@spec-2",
+            "openspec:acme/demo:work@spec-1",
         ),
     )
 
@@ -483,7 +491,7 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     updated = registry.get_workflow_run(run.run_id)
     assert updated.run_id == run.run_id
     assert updated.pr_refs == ("acme/demo#17",)
-    assert updated.source_revision != run.source_revision
+    assert updated.source_revision == run.source_revision
     assert updated.planning_source_revision == initial_source_revision
     # #653：ship 段在自己的 Manager-owned clone 裡動手，builder 記錄的樹（本
     # fixture 就是來源樹）一個位元組沒動——canonical report 原地留著。舊模型是在
@@ -507,7 +515,7 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         (tmp_path / "state" / "delivery-journal.json").read_text(encoding="utf-8")
     )
     assert journal["runs"][run.run_id]["pushes"][candidate]["head"] == candidate
-    assert "openspec:acme/demo:work@spec-2" in journal["runs"][run.run_id][
+    assert "openspec:acme/demo:work@spec-1" in journal["runs"][run.run_id][
         "source_revisions"
     ]
 

@@ -77,6 +77,18 @@ def _step(persona: str):
     return SimpleNamespace(persona=persona, phase="build", card="card")
 
 
+def test_unknown_workflow_persona_fails_loud_instead_of_using_builder_candidates(
+    tmp_path: Path,
+) -> None:
+    _write(tmp_path, "model-identities.yaml", _OPERATOR_OVERLAY)
+    registry = load_model_identities(tmp_path)
+
+    with pytest.raises(ValueError, match="unknown workflow persona: future-persona"):
+        manager._workflow_identity_candidates_for_persona(
+            _run(), "future-persona", registry
+        )
+
+
 # ---------------------------------------------------------------------------
 # 第 1 層：overlay 絕對優先（#534 主訴）
 # ---------------------------------------------------------------------------

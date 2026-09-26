@@ -29,6 +29,7 @@ from .model_identities import load_model_identities
 from .registry import RETRY_CARD_PHASE_PERSONA, JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
 from .spawn_admission import DEFAULT_MIN_INTERVAL_SECONDS, SpawnAdmissionLimiter, build_default_limiter
+from .claim import load_work_authority, work_authority_digest
 from .work_actions import safe_exception_summary
 
 DEFAULT_TICK_INTERVAL = 300.0
@@ -253,6 +254,25 @@ def _repo_from_manifest(payload: dict[str, Any]) -> str | None:
     )
 
 
+def _builder_todo_admission_for_run(run) -> manager.BuilderTodoAdmission | None:
+    """在 Builder 派工前由 daemon 載入目前受監控 authority。"""
+    if (
+        getattr(run, "current_phase", None) != "build"
+        or not str(getattr(run, "claim_key", "")).startswith("claim:v1:")
+    ):
+        return None
+    try:
+        authority = load_work_authority(repo=run.repo, work_id=run.work_id)
+        if authority.repo != run.repo or authority.work_id != run.work_id:
+            raise ValueError("WorkAuthority identity mismatch")
+        return manager.BuilderTodoAdmission(
+            authority_revision=work_authority_digest(authority),
+            mapped_todo_paths=authority.mapped_todo_paths,
+        )
+    except (OSError, ValueError):
+        return manager.BuilderTodoAdmission(error="current-work-authority-unavailable")
+
+
 # #370: the exponential curve itself now lives in `backoff.py` (pure, no
 # internal deps) so `provider_backoff.py`'s durable GitHub rate-limit
 # backoff can reuse it without a circular import back into this module.
@@ -303,6 +323,7 @@ def _in_flight_status(
         )
     )
     in_flight = []
+    accepted_results_by_run: dict[str, list[dict[str, Any]]] = {}
     for job in registry.list_jobs():
         status = job.get("status")
         if status not in manager.IN_FLIGHT_STATUSES:
@@ -318,15 +339,29 @@ def _in_flight_status(
         execution_identity = manager._job_execution_identity(
             job, identity_source="in-flight"
         )
+        workflow_run_id = job.get("workflow_run_id")
+        accepted_results: list[dict[str, Any]] = []
+        if isinstance(workflow_run_id, str) and workflow_run_id:
+            if workflow_run_id not in accepted_results_by_run:
+                try:
+                    run = registry.get_workflow_run(workflow_run_id)
+                except Exception:  # noqa: BLE001 - status enrichment is fail-soft
+                    accepted_results_by_run[workflow_run_id] = []
+                else:
+                    accepted_results_by_run[workflow_run_id] = (
+                        manager.workflow_accepted_results_for_run(registry, run)
+                    )
+            accepted_results = accepted_results_by_run[workflow_run_id]
         # ``job_id`` 只來自 execution_identity 的投影（單一來源）。
-        in_flight.append(
-            {
-                "slice_id": job.get("task"),
-                "state": status,
-                "candidate_git_base": git_base,
-                **execution_identity,
-            }
-        )
+        row = {
+            "slice_id": job.get("task"),
+            "state": status,
+            "candidate_git_base": git_base,
+            **execution_identity,
+        }
+        if accepted_results:
+            row["accepted_workflow_results"] = accepted_results
+        in_flight.append(row)
     return in_flight
 
 
@@ -506,6 +541,7 @@ def build_runtime_status_provider(
             mirror_root=candidate_base.default_mirror_root(),
             git_runner=git_runner,
         )
+        manager.reconcile_building_slices(registry)
         metas = scan_specs_fn(specs_dir)
         predicate = lambda slice_id: autonomy.default_is_satisfied(
             slice_id,
@@ -709,6 +745,7 @@ def build_request_executor(
                     coordinator_root=coordinator_root,
                     ship_validator=active_ship_validator,
                     operator_resume=True,
+                    builder_todo_admission_loader=_builder_todo_admission_for_run,
                 )
             result = manager.apply_workflow_action(
                 registry,
@@ -747,6 +784,7 @@ def build_request_executor(
                         identities=identities,
                         launcher_factory=launcher_factory,
                         coordinator_root=coordinator_root,
+                        builder_todo_admission=_builder_todo_admission_for_run(run),
                     )
                     # #830：producer 對 Red sizing／preflight refusal 等情況合法回傳
                     # 非 Job 決策（`{run_id, current_phase, reason}`），舊實作只驗
@@ -837,6 +875,7 @@ def build_request_executor(
                             coordinator_root=coordinator_root,
                             ship_validator=active_ship_validator,
                             operator_resume=True,
+                            builder_todo_admission_loader=_builder_todo_admission_for_run,
                         )
                         result["result"].update(resumed)
                         result["result"]["run"] = registry.get_workflow_run(
@@ -851,6 +890,7 @@ def build_request_executor(
                                 launcher_factory=launcher_factory,
                                 coordinator_root=coordinator_root,
                                 force_new_card=forced_card_retry,
+                                builder_todo_admission=_builder_todo_admission_for_run(run),
                             )
                             # #830：同 start 路徑的分類契約（見上方 workflow-action
                             # start）。forced retry 的成功後置條件是「新 replacement
@@ -938,6 +978,8 @@ def build_request_executor(
                 slice_id=slice_id,
                 action=action,
                 actor=actor,
+                reason=args.get("reason"),
+                expected_binding_revision=args.get("expected_binding_revision"),
                 specs_dir=request_specs_dir,
                 handoff_dir=request_handoff_dir,
                 launcher=_resolve_launcher(

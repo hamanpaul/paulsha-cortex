@@ -429,6 +429,42 @@ def test_invalid_spool_verdict_is_absent_not_passed(tmp_path: Path) -> None:
     assert gate_status == "needs_human"
 
 
+@pytest.mark.parametrize(
+    ("finding_override", "expected_diagnostic"),
+    [
+        ({"severity": "major"}, "findings[0].severity invalid"),
+        ({"verified": True}, "findings[0].verified unexpected"),
+    ],
+)
+def test_invalid_finding_is_absent_and_evaluation_keeps_validation_error(
+    tmp_path: Path,
+    finding_override: dict[str, object],
+    expected_diagnostic: str,
+) -> None:
+    fixture = _Fixture(tmp_path, reviewer_channel=foreign_review.REVIEW_VERDICT_CHANNEL_SPOOL)
+    finding = {
+        "category": "security",
+        "severity": "important",
+        "summary": "blocking security defect",
+        "evidence": [{"path": "a.py", "line": 3, "detail": "unsafe input reaches command"}],
+        "recommendation": "validate the input",
+    }
+    finding.update(finding_override)
+    spool = foreign_review.prepare_review_verdict_spool(
+        reviewer_job_id=fixture.reviewer_job["job_id"],
+        coordinator_root=fixture.coordinator_root,
+    )
+    spool.write_text(_spool_body(findings=[finding]), encoding="utf-8")
+
+    evaluation, gate_status, gate_reason = fixture.finalize()
+
+    assert evaluation["payload"]["state"] == "absent"
+    assert evaluation["payload"]["reason"] == "invalid-verdict"
+    assert evaluation["payload"]["diagnostics"] == [expected_diagnostic]
+    assert gate_status == "needs_human"
+    assert gate_reason == "foreign-review-absent"
+
+
 # ---------------------------------------------------------------------------
 # 5. 身分由 registry 推導；payload 自述被忽略
 # ---------------------------------------------------------------------------
@@ -628,6 +664,59 @@ def test_review_prompt_points_at_the_spool_and_drops_self_attestation(tmp_path: 
     body = prompt.split("Verdict schema（只能輸出此 JSON 結構）:\n", 1)[1]
     template = json.loads(body)
     assert set(template) == {"schema_version", "findings"}
+
+
+def test_review_prompt_enumerates_validator_enums_and_accepts_blocking_security_finding(
+    tmp_path: Path,
+) -> None:
+    prompt = foreign_review.build_review_prompt(
+        slice_id="slice-x",
+        plan_path="plans/slice-x.md",
+        verdict_path=str(tmp_path / "verdict.json"),
+        builder_job_id="slice-x-1",
+        reviewer_job_id="slice-x-7",
+        candidate=CANDIDATE,
+        launch_identity=dict(REVIEWER_IDENTITY),
+    )
+    lines = prompt.splitlines()
+    categories = next(
+        line for line in lines if line.startswith("合法 finding category（category）值：")
+    )
+    severities = next(
+        line for line in lines if line.startswith("合法 finding severity（severity）值：")
+    )
+    assert categories.partition("：")[2].split(", ") == sorted(
+        foreign_review.VALID_FINDING_CATEGORIES
+    )
+    assert severities.partition("：")[2].split(", ") == sorted(
+        foreign_review.VALID_SEVERITIES
+    )
+
+    verdict = foreign_review.validate_review_verdict(
+        {
+            "schema_version": foreign_review.REVIEW_SCHEMA_VERSION,
+            "builder_job_id": "slice-x-1",
+            "reviewer_job_id": "slice-x-7",
+            "candidate": CANDIDATE,
+            "launch_identity": dict(REVIEWER_IDENTITY),
+            "findings": [
+                {
+                    "category": "security",
+                    "severity": "important",
+                    "summary": "blocking security defect",
+                    "evidence": [
+                        {"path": "a.py", "line": 3, "detail": "unsafe input reaches command"}
+                    ],
+                    "recommendation": "validate the input",
+                }
+            ],
+        },
+        builder_job_id="slice-x-1",
+        reviewer_job_id="slice-x-7",
+        candidate=CANDIDATE,
+        launch_identity=dict(REVIEWER_IDENTITY),
+    )
+    assert verdict["state"] == "rejected"
 
 
 # ---------------------------------------------------------------------------

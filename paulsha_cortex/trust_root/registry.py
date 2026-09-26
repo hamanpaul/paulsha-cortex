@@ -2419,6 +2419,18 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         ),
     ),
     TrustRootAsset(
+        "slice-review-log", _T0, _MO,
+        "paulsha_cortex.config.paths:slice_review_log_root",
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        derived_in=("coordinator/manager.py:_launch_foreign_review",),
+        note=(
+            "#602：slice-lane reviewer 的 Manager-side log 落在 "
+            "`<coordinator_root>/slice-review-logs/<reviewer_job_id>/`。"
+            "review 終局 JSON 會從 log 收割，因此此根只由 Manager 存取，與 gate ledger "
+            "同樣留在模型拿不到的路徑。"
+        ),
+    ),
+    TrustRootAsset(
         "delivery-journal", _T0, _MO, None,
         (Principal.MANAGER, Principal.ANY_SAME_UID), (Principal.MANAGER,),
         IngressKind.DIRECT_FILE_WRITE,

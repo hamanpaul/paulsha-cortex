@@ -150,7 +150,7 @@ def test_cortex_work_help_lists_read_and_manager_actions(capsys):
     output = capsys.readouterr().out
     for command in (
         "show", "gc", "link", "unlink", "start", "resume", "retry-build", "auto",
-        "abandon", "review-attest", "ship",
+        "abandon", "review-attest", "review-disposition", "ship",
     ):
         assert command in output
 

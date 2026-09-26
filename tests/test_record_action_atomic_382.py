@@ -338,12 +338,20 @@ class TestRecoverPreCandidateOnFreshFailure:
 
         state_path = tmp_path / "jobs.json"
         reg = JobRegistry(state_path=state_path)
+        owner_identity = {
+            "repo": "hamanpaul/example",
+            "work_id": "slice-a",
+            "slice_id": "slice-a",
+        }
+        attempt_id = "attempt-slice-a"
         builder_job = reg.create_job(
             task="slice-a",
             persona="builder",
             branch="feature/slice-a",
             pane="",
             worktree=str(tmp_path / "wt" / "feature-slice-a"),
+            owner_identity=owner_identity,
+            attempt_id=attempt_id,
         )
         reg.create_slice(
             slice_id="slice-a",
@@ -355,6 +363,8 @@ class TestRecoverPreCandidateOnFreshFailure:
             builder_job_id=builder_job["job_id"],
             reviewer_job_id=None,
             candidate=None,
+            owner_identity=owner_identity,
+            attempt_id=attempt_id,
         )
         reg.update_slice("slice-a", state="failed", gate_state="failed")
 

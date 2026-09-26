@@ -36,8 +36,8 @@ spool；monitor 每輪把 spool 掃一遍，對**被點名的物件**做一次 t
 ## #498 擴充點
 
 ``event_type`` 是封閉列舉的**擴充位**：本次只消費 ``github_object``。
-``steering``／``job``（#498 的 remote-control 佇列與 job 心跳）已在
-:data:`RESERVED_EVENT_TYPES` 佔位，本模組掃到時**原地保留、只記 log 與計數**，
+``steering``／``job``（#498）已在 :data:`RESERVED_EVENT_TYPES` 佔位，本模組掃到時
+**原地保留、只記 log 與計數**；``steering`` 目前不是 headless job 的即時控制通道，
 絕不刪除——那些事件屬於未來的另一個 consumer，這裡刪掉就是替它們決定生命週期。
 同理，未知的 ``event_type`` 與未知的 ``schema_version``（較新的 producer 對上較舊
 的 consumer）一律保留不動，只有**結構壞掉**的檔案才會被隔離。
@@ -68,7 +68,7 @@ EVENT_SCHEMA = "monitor-event-spool/v1"
 #: 本次唯一會被消費的事件型別。
 EVENT_TYPE_GITHUB_OBJECT = "github_object"
 
-#: #498 預留：headless steering 佇列與 job 心跳。本模組只記 log、原地保留。
+#: #498 預留事件型別；目前只記 log、原地保留，不提供 headless 即時 steering。
 EVENT_TYPE_STEERING = "steering"
 EVENT_TYPE_JOB = "job"
 RESERVED_EVENT_TYPES = frozenset({EVENT_TYPE_STEERING, EVENT_TYPE_JOB})

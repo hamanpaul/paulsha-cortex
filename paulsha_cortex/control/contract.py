@@ -18,8 +18,10 @@ WORK_ACTIONS = frozenset(
         "link", "unlink", "start", "resume", "retry-build", "retry-card",
         "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
+        "close-delivered",
         "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+        "review-disposition",
         "intake",
     }
 )
@@ -184,6 +186,13 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None
             ):
                 raise ValueError("work-action retry-card requires exact card id")
+        if action == "regenerate-gates" and args.get("card") is not None:
+            card = args.get("card")
+            if (
+                not isinstance(card, str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None
+            ):
+                raise ValueError("work-action regenerate-gates requires exact card id")
         if action in {"abandon", "retire-delivered", "recover-superseded"}:
             expected_run_id = args.get("expected_run_id")
             actor = args.get("actor")
@@ -207,6 +216,25 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or not reason.isprintable()
             ):
                 raise ValueError(f"work-action {action} requires bounded reason")
+        if action == "close-delivered":
+            if "expected_run_id" in args:
+                raise ValueError("work-action close-delivered must not include expected_run_id")
+            actor = args.get("actor")
+            reason = args.get("reason")
+            if (
+                not isinstance(actor, str)
+                or actor != actor.strip()
+                or not 1 <= len(actor) <= 128
+                or not actor.isprintable()
+            ):
+                raise ValueError("work-action close-delivered requires bounded actor")
+            if (
+                not isinstance(reason, str)
+                or reason != reason.strip()
+                or not 1 <= len(reason) <= 500
+                or not reason.isprintable()
+            ):
+                raise ValueError("work-action close-delivered requires bounded reason")
         if action == "refreeze-base":
             # issue #731 (A)：明示把候選 git base 重新凍結到目前的 `origin/main`。
             # 界限刻意與 abandon／retire-delivered／reset-reclaim-budget 同一族
@@ -236,11 +264,10 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or not reason.isprintable()
             ):
                 raise ValueError(f"work-action {action} requires bounded reason")
-        if action == "reset-reclaim-budget":
-            # issue #519：明示重置 semantic-reclaim 世代熔斷。actor／reason 的
-            # 界限與 abandon／retire-delivered 完全一致（同樣是「一個人明示解
-            # 除一道安全機制」）；差別只在不要 expected_run_id——熔斷觸發的前
-            # 提就是沒有 active run 可供 CAS。
+        if action in {"reset-reclaim-budget", "review-disposition"}:
+            # #519 semantic-reclaim reset 與 #935 review disposition 都由操作員
+            # 明示 actor／reason；兩者不帶 expected_run_id，作用對象由 Manager
+            # 依當前 work item／exact run 解析。
             actor = args.get("actor")
             reason = args.get("reason")
             if (
@@ -257,6 +284,32 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or not reason.isprintable()
             ):
                 raise ValueError(f"work-action {action} requires bounded reason")
+    elif req_type == "slice-action" and args.get("action") == "supersede":
+        actor = args.get("actor")
+        reason = args.get("reason")
+        expected_binding_revision = args.get("expected_binding_revision")
+        if (
+            not isinstance(actor, str)
+            or actor != actor.strip()
+            or not 1 <= len(actor) <= 128
+            or not actor.isprintable()
+        ):
+            raise ValueError("slice-action supersede requires bounded actor")
+        if (
+            not isinstance(reason, str)
+            or reason != reason.strip()
+            or not 1 <= len(reason) <= 500
+            or not reason.isprintable()
+        ):
+            raise ValueError("slice-action supersede requires bounded reason")
+        if (
+            not isinstance(expected_binding_revision, int)
+            or isinstance(expected_binding_revision, bool)
+            or expected_binding_revision < 1
+        ):
+            raise ValueError(
+                "slice-action supersede requires exact expected_binding_revision"
+            )
     requested_by = payload.get("requested_by")
     if not isinstance(requested_by, str) or not requested_by:
         raise ValueError("request requested_by must be a non-empty string")

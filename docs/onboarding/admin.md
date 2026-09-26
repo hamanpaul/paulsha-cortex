@@ -26,7 +26,7 @@ cortex list --repo owner/name --state on-going --explain
 
 重點：
 
-- `cortex service ...`：看 service/runtime/logs 與 start/stop/restart
+- `cortex service ...`：看 service/runtime/logs 與 start/stop/restart/ensure-running
 - `cortex inspect ...`：唯讀查詢 status/job/ready/work/doctor/service
 - `cortex status`：看 manager 目前 gate 與 slice 狀態
 - `cortex list`：看跨來源投影出的 work read model
@@ -36,11 +36,14 @@ cortex list --repo owner/name --state on-going --explain
 ### service
 
 ```bash
+cortex service ensure-running --instance cortex
 cortex service start --instance cortex
 cortex service restart --instance cortex
 cortex service logs --instance cortex -n 50
 cortex service uninstall --instance cortex --json
 ```
+
+`ensure-running` 是供自動化呼叫的冪等入口，固定輸出一行 JSON。manager lock 已由 live manager 持有時直接回報；systemd user units 齊備且 systemd 可用時啟動 units 並等待 lock，否則使用目前 Cortex interpreter 在本機啟動 manager 與 monitor。
 
 ### inspect
 

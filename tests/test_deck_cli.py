@@ -224,6 +224,32 @@ def test_compile_emit_writes_hold_specs(tmp_path, monkeypatch):
     assert all("dispatch: hold" in path.read_text(encoding="utf-8") for path in files)
 
 
+def test_compile_emit_writes_explicit_repo(tmp_path, monkeypatch):
+    _seed_fixture(tmp_path / "deck", monkeypatch)
+    specs_root = tmp_path / "specs"
+    monkeypatch.setenv("PSC_MANAGER_SPECS_DIR", str(specs_root))
+
+    rc = deck_cli.main(
+        [
+            "compile",
+            "feature-oneshot",
+            "--task",
+            "demo task",
+            "--change",
+            "demo",
+            "--allow-external",
+            "--repo",
+            "acme/demo",
+            "--emit",
+        ]
+    )
+
+    assert rc == 0
+    files = sorted(specs_root.glob("*.md"))
+    assert files
+    assert all('repo: "acme/demo"' in path.read_text(encoding="utf-8") for path in files)
+
+
 def test_compile_out_file_path_reports_error(tmp_path, capsys, monkeypatch):
     _seed_fixture(tmp_path / "deck", monkeypatch)
     out_file = tmp_path / "not-a-dir"

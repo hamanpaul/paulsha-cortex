@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import itertools
 import json
 import logging
 import math
@@ -978,38 +980,17 @@ def work_authority_digest(authority: WorkAuthority) -> str:
     )
 
 
-# #524：monitor 的 repo provider 以 glob 掃 `docs/superpowers/specs/**/*.md` 與
-# `docs/superpowers/plans/**/*.md` 產生的 source id 前綴（見 monitor/providers.py）。
-#
-# 這兩類 source 依構造永遠是 **planning phase 自己的產出**，不可能是 operator 在
-# `.cortex/work-items.yaml` 宣告的授權來源——canonical row 解析
-# （`_authority_from_canonical_row`）只認 `github_issue`／`github_pr`／`openspec`／
-# `todo` 四種 kind，`superpowers_*` 完全不在其中，只會被 monitor 掃出來。因此它們
-# 在 authority 裡「出現」這件事，只代表該 work item 的 run 正在成功推進，不代表
-# authority 被任何外部事實改動過。
+# #524：Monitor 會為這些 repo source 使用穩定前綴。前綴可供 digest 診斷，不能單獨
+# 證明 source 是哪個 run 發布；正式 drift 分類另核對 run 的 accepted artifact 與 bytes。
 PLANNING_OUTPUT_SOURCE_PREFIXES = ("superpowers_spec:", "superpowers_plan:")
 
 
 def authority_digest_without_planning_outputs(authority: WorkAuthority) -> str:
-    """把 planning phase 自產的 source 剝掉之後重算的 authority digest。
+    """回傳排除 planning source 前綴後的診斷 digest；不可作為 drift 豁免證據。
 
-    #524：`claim_key`／`run.source_revision` 都由 `work_authority_digest` 導出，
-    而該 digest 折入 `source_revisions`。run 的 brainstorming／writing-plans 卡一旦
-    把 spec/design/plan 寫進 governed roots，monitor 下一輪就把它們當成新的
-    confirmed source 併進同一個 work item——digest 因此改變，run 的持久化識別與
-    「目前 authority 算出來的識別」再也對不上，claim 路徑於是把仍在 flight 的 run
-    當成陳舊世代作廢。
-
-    本函式提供的是「若不算 run 自己的產出，authority 是否仍是 claim 當下那一份」
-    這個判準：與 `run.source_revision` 相等即代表**整段漂移都是自己造成的**，此時
-    不得換代。反之（issue 開關、openspec revision、todo 成員變動……）維持既有的
-    新世代語意，operator 明確 `start` 換代的逃生口不受影響。
-
-    生產現場驗證：以 2026-08-14 的 snapshot 剝除兩個 `superpowers_spec` 與一個
-    `superpowers_plan` source 後重算，digest 為
-    `039e89aab0a56384bce29bc89dc638c4e176f96873e9a4d89627b223d79a31bf`，與被誤
-    supersede 的 `workflow-009fe9ab303df196209d` 持久化的 `source_revision` 逐字
-    相符。
+    前綴可能包含 foreign 或內容已漂移的來源。生產 consumer 必須改用
+    `self_only_authority_drift_matches()`，逐項核對 run 的 accepted artifact、PR 與
+    candidate，再與持久化 claim-era 比對。
     """
 
     if not isinstance(authority, WorkAuthority):
@@ -1384,6 +1365,205 @@ def claim_key_for_authority_digest(*, repo: str, work_id: str, authority_digest:
     payload = {"repo": repo, "work_id": work_id, "authority_digest": authority_digest}
     digest = verification.canonical_json_hash(payload)
     return f"claim:v1:{digest}"
+
+
+def _accepted_planning_artifact(run, *, ref: str, kind: str):
+    rows = [
+        item
+        for item in getattr(run, "planning_authority", ()) or ()
+        if getattr(item, "ref", None) == ref
+        and getattr(item, "kind", None) == kind
+        and getattr(item, "work_id", None) == getattr(run, "work_id", None)
+    ]
+    if len(rows) != 1:
+        return None
+    item = rows[0]
+    try:
+        root = Path(run.workspace_root)
+        if root.is_symlink():
+            return None
+        root = root.resolve(strict=True)
+        path = root
+        for part in PurePosixPath(ref).parts:
+            path = path / part
+            if path.is_symlink():
+                return None
+        if not _safe_todo_path(ref) or not path.is_file():
+            return None
+        path.resolve(strict=True).relative_to(root)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != item.baseline_sha256:
+            return None
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+    return item
+
+
+def _manager_pr_candidate_is_exact(run) -> bool:
+    candidate = getattr(run, "candidate_head", None)
+    return (
+        getattr(run, "current_phase", None) in {"review", "ship"}
+        and isinstance(candidate, str)
+        and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+        and getattr(run, "verified_head", None) == candidate
+        and getattr(run, "pr_candidate", None) in {None, candidate}
+    )
+
+
+def manager_pr_refs_compatible(authority: WorkAuthority, run) -> bool:
+    """接受完全相同的 PR refs，或 Monitor 尚未看見的 Manager 已建 PR。"""
+
+    authority_refs = tuple(
+        f"{authority.repo}#{number}" for number in authority.mapped_prs
+    )
+    run_refs = tuple(getattr(run, "pr_refs", ()) or ())
+    if run_refs == authority_refs:
+        return True
+    if (
+        authority.mapped_prs
+        or len(run_refs) != 1
+        or not _manager_pr_candidate_is_exact(run)
+    ):
+        return False
+    return (
+        re.fullmatch(rf"{re.escape(authority.repo)}#[1-9][0-9]*", run_refs[0])
+        is not None
+    )
+
+
+def self_only_authority_drift_matches(authority: WorkAuthority, run) -> bool:
+    """只在漂移能逐項對應此 run 的已接受產物時，比對原 claim-era。
+
+    比對以完整 current authority 為起點，只可移除已接受的 planning 檔案、run
+    宣告建立的 OpenSpec proposal，或綁定已驗證 Candidate 的單一 open PR。其他
+    authority 欄位都保留在 digest 比對中。
+    """
+
+    if (
+        not isinstance(authority, WorkAuthority)
+        or getattr(run, "repo", None) != authority.repo
+        or getattr(run, "work_id", None) != authority.work_id
+        or not isinstance(getattr(run, "source_revision", None), str)
+        or re.fullmatch(r"[0-9a-f]{64}", run.source_revision) is None
+        or getattr(run, "claim_key", None)
+        != claim_key_for_authority_digest(
+            repo=authority.repo,
+            work_id=authority.work_id,
+            authority_digest=run.source_revision,
+        )
+        or tuple(getattr(run, "issue_refs", ()) or ())
+        != tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
+        or not openspec_refs_compatible(run, authority)
+    ):
+        return False
+
+    revisions = authority.source_revisions
+    if len(set(revisions)) != len(revisions):
+        return False
+    planning_revisions: list[str] = []
+    for revision in revisions:
+        source_id, _, semantic = revision.rpartition("@")
+        if source_id.startswith(f"superpowers_spec:{authority.repo}:"):
+            ref = source_id[len(f"superpowers_spec:{authority.repo}:") :]
+            kind = "design" if ref.endswith("-design.md") else "spec"
+            if (
+                semantic != f"identity:{ref}"
+                or not ref.startswith("docs/superpowers/specs/")
+                or _accepted_planning_artifact(run, ref=ref, kind=kind) is None
+            ):
+                return False
+            planning_revisions.append(revision)
+        elif source_id.startswith(f"superpowers_plan:{authority.repo}:"):
+            ref = source_id[len(f"superpowers_plan:{authority.repo}:") :]
+            if (
+                semantic != f"identity:{ref}"
+                or not ref.startswith("docs/superpowers/plans/")
+                or _accepted_planning_artifact(run, ref=ref, kind="plan") is None
+            ):
+                return False
+            planning_revisions.append(revision)
+        elif source_id.startswith(("superpowers_spec:", "superpowers_plan:")):
+            return False
+    run_openspec = tuple(getattr(run, "openspec_refs", ()) or ())
+    extra_openspec = set(authority.mapped_openspec) - set(run_openspec)
+    openspec_revisions: list[str] = []
+    for ref in extra_openspec:
+        revision = f"openspec:{authority.repo}:{ref}@identity:{ref};state:active"
+        if revision not in revisions or _accepted_planning_artifact(
+            run, ref=f"openspec/changes/{ref}/proposal.md", kind="spec"
+        ) is None:
+            return False
+        openspec_revisions.append(revision)
+
+    pr_revisions: tuple[str, ...] = ()
+    pr_removal_allowed = False
+    if authority.mapped_prs:
+        refs = tuple(f"{authority.repo}#{number}" for number in authority.mapped_prs)
+        if (
+            len(refs) == 1
+            and tuple(getattr(run, "pr_refs", ()) or ()) == refs
+            and _manager_pr_candidate_is_exact(run)
+        ):
+            number = authority.mapped_prs[0]
+            expected = (
+                f"github_pr:{authority.repo}#{number}@identity:"
+                f"{authority.repo}#{number};state:open"
+            )
+            if expected in revisions:
+                pr_revisions = (expected,)
+                pr_removal_allowed = True
+
+    # 用 claim-era digest 精確辨認哪些已接受的 planning rows 與合格 PR 是後來加入。
+    matches = 0
+    for count in range(len(planning_revisions) + 1):
+        for planning_removed in itertools.combinations(planning_revisions, count):
+            for remove_pr in ((False, True) if pr_removal_allowed else (False,)):
+                removed = set(planning_removed) | set(openspec_revisions)
+                if remove_pr:
+                    removed.update(pr_revisions)
+                mapped_openspec = tuple(
+                    ref for ref in authority.mapped_openspec if ref not in extra_openspec
+                )
+                mapped_prs = () if remove_pr else authority.mapped_prs
+                if not removed and mapped_openspec == authority.mapped_openspec:
+                    continue
+                baseline = WorkAuthority._verified(
+                    repo=authority.repo,
+                    work_id=authority.work_id,
+                    mapped_issues=authority.mapped_issues,
+                    mapped_prs=mapped_prs,
+                    mapped_openspec=mapped_openspec,
+                    mapped_todo_paths=authority.mapped_todo_paths,
+                    confirmed_todo=authority.confirmed_todo,
+                    auto_label=authority.auto_label,
+                    source_revisions=tuple(
+                        revision for revision in revisions if revision not in removed
+                    ),
+                    provider_revision=authority.github_provider_revision,
+                    provider_id=authority.github_provider_id,
+                    last_success_epoch=authority.github_last_success_epoch,
+                    snapshot_hash=authority.snapshot_hash,
+                    requires_github_authority=authority.requires_github_authority,
+                )
+                if work_authority_digest(baseline) == run.source_revision:
+                    matches += 1
+                    if matches > 1:
+                        return False
+    return matches == 1
+
+
+def authority_matches_claim_era(authority: WorkAuthority, run) -> bool:
+    """判定 authority 與 claim-era 完全相同，或只差此 run 自身發布的內容。"""
+
+    if (
+        not isinstance(authority, WorkAuthority)
+        or getattr(run, "repo", None) != authority.repo
+        or getattr(run, "work_id", None) != authority.work_id
+    ):
+        return False
+    digest = work_authority_digest(authority)
+    return getattr(run, "source_revision", None) == digest or (
+        self_only_authority_drift_matches(authority, run)
+    )
 
 
 def build_claim_key(candidate: ClaimCandidate) -> str:

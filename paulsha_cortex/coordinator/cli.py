@@ -75,6 +75,10 @@ def _attribute_job(job: dict[str, Any], reg: JobRegistry) -> dict[str, Any]:
         except KeyError:
             run = None
     job.update(_workflow_run_attribution(run))
+    if run is not None:
+        from . import manager
+
+        job.update(manager.workflow_job_result_presentation(job, run))
     return job
 
 
@@ -83,7 +87,12 @@ def _attribute_jobs(jobs: list[dict[str, Any]], reg: JobRegistry) -> list[dict[s
     避免對每個 job 各自線性掃描 registry 的 workflow run 列表。"""
     runs_by_id = {run.run_id: run for run in reg.list_workflow_runs()}
     for job in jobs:
-        job.update(_workflow_run_attribution(runs_by_id.get(job.get("workflow_run_id"))))
+        run = runs_by_id.get(job.get("workflow_run_id"))
+        job.update(_workflow_run_attribution(run))
+        if run is not None:
+            from . import manager
+
+            job.update(manager.workflow_job_result_presentation(job, run))
     return jobs
 
 
@@ -183,10 +192,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_complete.add_argument("--review-model", default=None, help="foreign reviewer model ID")
 
-    p_slice_action = sub.add_parser("slice-action", help="對 needs_human slice 送出本機 recovery action")
+    p_slice_action = sub.add_parser("slice-action", help="對需要處置的 slice 送出本機 action")
     p_slice_action.add_argument("slice_id")
-    p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon"])
+    p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"])
     p_slice_action.add_argument("--actor", required=True)
+    p_slice_action.add_argument("--reason", default=None, help="supersede 的單行稽核理由")
+    p_slice_action.add_argument(
+        "--expected-binding-revision",
+        type=int,
+        default=None,
+        help="supersede 的 slice binding revision CAS",
+    )
     # #396 item 4：retry-review／retry-verify 落 needs_human(reviewer-identity-missing)
     # 時，先前只能靠 tick/complete 的 request 級參數補 foreign reviewer identity——
     # slice-action 本身沒有對應旗標可帶。比照 complete/tick 既有的 identity
@@ -205,8 +221,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "link", "unlink", "start", "resume", "retry-build", "retry-card",
             "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
             "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
+            "close-delivered",
             "recover-superseded",
             "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+            "review-disposition",
             "intake",
         ],
     )
@@ -227,14 +245,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_work.add_argument(
         "--card",
-        help="retry-card 專用：要重派的 builder／reviewer card id（必須是下一張待派的卡）",
+        help="retry-card／regenerate-gates 專用：card id；retry-card 須是下一張待派的卡",
     )
     p_work.add_argument(
         "--reason",
         help=(
             "retry-build／retry-card／retry-review：operator 裁決，最多 4000 字；全文落成 "
             "operator-adjudication evidence，前 2000 字注入後續 dispatch prompt。 "
-            "abandon／retire-delivered／recover-superseded／reset-reclaim-budget／refreeze-base："
+            "abandon／retire-delivered／close-delivered／recover-superseded／reset-reclaim-budget／refreeze-base："
             "單行審計理由，最多 500 字。"
         ),
     )
@@ -404,6 +422,10 @@ def main(
 
     if args.cmd == "slice-action":
         slice_action_args = {"slice_id": args.slice_id, "action": args.action, "actor": args.actor}
+        if args.reason is not None:
+            slice_action_args["reason"] = args.reason
+        if args.expected_binding_revision is not None:
+            slice_action_args["expected_binding_revision"] = args.expected_binding_revision
         if args.review_executor is not None:
             slice_action_args["review_executor"] = args.review_executor
         if args.review_model is not None:
@@ -417,6 +439,9 @@ def main(
         )
 
     if args.cmd == "work":
+        if args.action == "close-delivered" and (args.actor is None or args.reason is None):
+            print("錯誤: close-delivered 必須提供 --actor 與 --reason。", file=sys.stderr)
+            return 2
         if args.action == "retry-build" and args.expected_run_id is not None:
             print(
                 "錯誤: retry-build 不接受 --expected-run-id；請改用 --payload 的 expected_candidate CAS。",

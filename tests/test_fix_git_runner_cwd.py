@@ -19,7 +19,7 @@ def test_default_git_runner_prefixes_arguments_with_repo_root(monkeypatch, tmp_p
     monkeypatch.setattr(dispatcher.subprocess, "run", fake_run)
 
     out = dispatcher._default_git_runner(["rev-parse", "--show-toplevel"])
-    assert out == "abc"
+    assert out == "abc\n"
     assert calls == [(["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"], True, True)]
 
 
