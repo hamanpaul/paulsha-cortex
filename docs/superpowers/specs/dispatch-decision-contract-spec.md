@@ -28,7 +28,7 @@ accepted 表示需求與測試邊界已定案，不表示已實作、可繞過 s
 
 ### 後續實作補充（#833）
 
-本 spec 記錄 #830 定案時的範圍；#833 後，Red plan 完成且未達深度上限時，Manager 會派出唯一拆分 planner Job。計畫通過既有 plan review gate 後，child work ID 經標準 work-action intake 受理；本次不改 sizing，也不建立 fan-out、全樹預算或通用 lineage 引擎。
+本 spec 記錄 #830 定案時的範圍；#833 後，Red plan 完成且未達深度上限時，Manager 會派出唯一拆分 planner Job。計畫通過既有 plan review gate 後，Manager 透過 planning publication transaction 發布該 child 的 `.cortex/work-items.yaml` 項目與 `docs/superpowers/workstreams/<child>/todo.md`；periodic resume 會冪等重送，直到 Monitor snapshot 確認 child WorkAuthority 後才呼叫標準 work-action intake。本次不改 sizing，也不建立 fan-out、全樹預算或通用 lineage 引擎。
 
 ## Evidence
 

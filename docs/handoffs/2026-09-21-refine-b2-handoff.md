@@ -45,7 +45,7 @@
 
 ## 5. cortex 派工實測要訣（本輪新增，補 09-17 版 §5）
 
-1. **進件前先查既有 work item 與 sizing**：`grep -n "#<N>'" .cortex/work-items.yaml`；同 issue 綁兩個 work item = `CorrelationError`。sizing 離線實算：`work_bridge.current_sizing_snapshot(workspace_root=".", combo_name=..., artifact_rows=[spec,design,plan])`；Red 不要 intake（停 `needs_decomposition` 沒人接）。todo-only（無 spec/design）會因 `spec_stability=2` 算 Red，但 planner 補完後重算——要保證 Yellow 就自己寫三件套。
+1. **進件前先查既有 work item 與 sizing**：`grep -n "#<N>'" .cortex/work-items.yaml`；同 issue 綁兩個 work item = `CorrelationError`。sizing 離線實算：`work_bridge.current_sizing_snapshot(workspace_root=".", combo_name=..., artifact_rows=[spec,design,plan])`；Red 母件不直接進 build，#833 會派拆分 planner，通過 plan review 後發布 child work item/Todo，待 Monitor snapshot 確認 WorkAuthority 再由 periodic resume intake。todo-only（無 spec/design）會因 `spec_stability=2` 算 Red，但 planner 補完後重算——要保證 Yellow 就自己寫三件套。
 2. **combo 選擇**：issue 標題 scope 必須在 `deck/data/task-types.yaml` 的 7 個受控 scope 內，否則 `ComboSelectionError` → `--combo` 明示。`fix(coordinator):`／`feat(coordinator):` 會自動選。
 3. **plan review 機械檢查**只掃 Tasks 下 list item **首行**找 `changelog`／`cli`／`test`／`doc` 關鍵字（`planning._collect_task_items` 丟續行）；缺 → `plan-review-retry-contract_compatibility`。
 4. **裁決指令要明寫 pinned 邊界**：spec／design／todo 文字是 pinned authority，只准翻 checkbox；澄清寫進 terminal reason。否則長回合自審會「修文件對齊實作」→ `workflow planning input drift`。drift 判定：`manager._workflow_input_snapshot` 先比 operator checkout 再比候選樹，plan 類只容忍 `[ ]`→`[x]`。

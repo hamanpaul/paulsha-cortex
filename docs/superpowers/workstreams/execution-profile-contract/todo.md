@@ -25,7 +25,7 @@ production 跨 profile/identity/resolution、launcher/adapter、planning runtime
 ## Boundary
 
 產品碼與測試只由 Cortex 開發，本 intake 不實作；下列未勾工作是母範圍交付清單，
-不是將 Red 母件直接作單一 build 派工的指令。#833 的拆分 planner 僅提出一個 child；child 仍須由標準 intake 依既有 authority/registration/freeze 受理。拆分須保留 parent AC owner、依賴與真實 sizing，不能刪驗收／降分；沒有可受理的 child authority 時由 intake 停止並交由 operator 處理。
+不是將 Red 母件直接作單一 build 派工的指令。#833 的拆分 planner 僅提出一個 child；Manager 依通過 review 的 Tasks 發布 child work item 與 Todo，等 Monitor snapshot 確認 WorkAuthority 後由 periodic resume 自動標準 intake。重送不得改動其他既有 work item。拆分須保留 parent AC owner、依賴與真實 sizing，不能刪驗收／降分。
 #842 是 qualification lifecycle owner；#581 保留五項解析／producer 原 scope，
 PatchMUD #37 只提供 CLI/file schema／immutable fixture，不引入 runtime import。
 

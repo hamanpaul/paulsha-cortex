@@ -1369,6 +1369,16 @@ def build_periodic_tick_runner(
                         coordinator_root=coordinator_root,
                         ship_validator=active_ship_validator,
                         spawn_admission=spawn_admission,
+                        decomposition_intake=lambda child_work_id: manager.apply_work_action(
+                            args={
+                                "action": "intake",
+                                "repo": workflow.repo,
+                                "work_id": child_work_id,
+                            },
+                            requested_by="manager-daemon",
+                            registry=registry,
+                            runtime_factory=planning_runtime.build_production_planning_runtime,
+                        ),
                     )
                 except Exception as exc:
                     _log_error(
