@@ -95,6 +95,50 @@ def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
             raise ValueError(f"workflow run {field_name}[{persona!r}].source 非法: {row.get('source')!r}")
 
 
+def _validate_execution_profile_bindings(
+    value: object,
+    resolved_model_chain: dict[str, dict[str, str]] | None = None,
+) -> None:
+    """Validate the additive #835 sibling without reinterpreting legacy chains."""
+
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("workflow run execution_profile_bindings 必須為null或dict")
+    if set(value) - MODEL_CHAIN_PERSONAS:
+        raise ValueError("workflow run execution_profile_bindings persona 非法")
+    from .execution_adapters import load_profile_binding
+
+    for persona, binding in value.items():
+        try:
+            parsed = load_profile_binding(binding)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"workflow run execution_profile_bindings[{persona!r}] 格式錯誤"
+            ) from exc
+        if parsed.resolved.requirements["role"].get("value") != _PERSONA_ROLE_FOR_PROFILE[persona]:
+            raise ValueError(
+                f"workflow run execution_profile_bindings[{persona!r}] role 不符"
+            )
+        chain_row = (resolved_model_chain or {}).get(persona)
+        if isinstance(chain_row, dict) and (
+            chain_row.get("executor"), chain_row.get("model_id")
+        ) != (
+            parsed.resolved.conditions["adapter"]["value"]["id"].removesuffix("-cli"),
+            parsed.resolved.conditions["model"]["value"]["id"],
+        ):
+            raise ValueError(
+                f"workflow run execution_profile_bindings[{persona!r}] identity 不符"
+            )
+
+
+_PERSONA_ROLE_FOR_PROFILE = {
+    "planner": "planning",
+    "builder": "build",
+    "reviewer": "review",
+}
+
+
 def _validate_combo_selection(value: object) -> None:
     if value is None:
         return
@@ -699,6 +743,9 @@ class WorkflowRun:
     # 用了什麼模型、為什麼」。每次 dispatch 選定 identity 時逐段覆寫更新，純
     # provenance，不影響既有 workflow 語意。
     resolved_model_chain: dict[str, dict[str, str]] | None = None
+    # #835：與 legacy chain 並存的版本化 profile binding。只在實際解析後
+    # 增寫，不回填舊 run；缺欄位的舊 registry 仍是 legacy/unknown。
+    execution_profile_bindings: dict[str, dict[str, Any]] | None = None
     combo_selection: dict[str, Any] | None = None
     # 診斷 invariant 家族（#527／#514／#515／#511／#482）：把 run 轉入
     # `needs_human` 的那一刻必須同時落一份結構化理由（`diagnostics.
@@ -918,6 +965,9 @@ class WorkflowRun:
                 raise ValueError(f"workflow run {field} 必須為ISO8601") from exc
         _validate_model_chain_override(self.model_chain_override, field_name="model_chain_override")
         _validate_model_chain_resolution(self.resolved_model_chain, field_name="resolved_model_chain")
+        _validate_execution_profile_bindings(
+            self.execution_profile_bindings, self.resolved_model_chain
+        )
         _validate_combo_selection(self.combo_selection)
         if self.needs_human_reason is not None:
             # 形狀驗證：DiagnosticReason.from_dict 自己 fail-closed（reason 必須
@@ -997,6 +1047,11 @@ class WorkflowRun:
             payload["plan_review_receipt"] = self.plan_review_receipt.to_dict()
         if self.planning_drift_stop is not None:
             payload["planning_drift_stop"] = self.planning_drift_stop.to_dict()
+        if self.execution_profile_bindings is not None:
+            payload["execution_profile_bindings"] = {
+                persona: dict(binding)
+                for persona, binding in self.execution_profile_bindings.items()
+            }
         return payload
 
     @classmethod
@@ -1087,6 +1142,7 @@ class WorkflowRun:
             frozen_readiness=payload.get("frozen_readiness"),
             model_chain_override=payload.get("model_chain_override"),
             resolved_model_chain=payload.get("resolved_model_chain"),
+            execution_profile_bindings=payload.get("execution_profile_bindings"),
             combo_selection=payload.get("combo_selection"),
             # 既有部署的狀態檔沒有這個欄位；缺席時維持 None（facet 有、理由沒有
             # 的 legacy run 照常載入，見上方 __post_init__ 的說明）。facet 已清

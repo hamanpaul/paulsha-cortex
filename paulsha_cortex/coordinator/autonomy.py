@@ -753,6 +753,12 @@ def dispatch_ready(
                     commit_required_factory = getattr(active_launcher, "as_commit_required", None)
                     if callable(commit_required_factory):
                         active_launcher = commit_required_factory()
+                active_launcher = _bind_dispatch_execution_profile(
+                    active_launcher,
+                    identity,
+                    persona,
+                    explicit_pin={"executor": executor, "model_id": model_id},
+                )
             resolved_executor, resolved_model_id, identity_diagnostic = _resolve_dispatch_identity(
                 meta=m,
                 launcher=active_launcher,
@@ -964,6 +970,32 @@ def _resolve_dispatch_identity(
         missing = "model_id" if launcher_executor is not None else "executor"
         return None, None, f"launcher-missing-{missing}"
     return None, None, "identity-unavailable"
+
+
+def _bind_dispatch_execution_profile(
+    launcher: object,
+    identity: object,
+    persona: str,
+    *,
+    explicit_pin: dict[str, str] | None = None,
+) -> object:
+    """Bind the generic slice lane's selected identity before workspace creation."""
+
+    from .execution_adapters import (
+        bind_launcher_profile,
+        make_launcher_profile,
+        validate_dispatch_requirements,
+    )
+
+    requirements = {"pin": explicit_pin} if explicit_pin is not None else {}
+    binding = make_launcher_profile(
+        launcher,
+        identity,
+        persona,
+        requirements=requirements,
+    )
+    validate_dispatch_requirements(binding, identity=identity)
+    return bind_launcher_profile(launcher, binding)
 
 
 def _dispatcher_coordinator_root(dispatcher) -> Path | None:

@@ -5061,6 +5061,7 @@ class JobRegistry:
         frozen_readiness: dict[str, Any] | None = None,
         model_chain_override: dict[str, dict[str, str]] | None = None,
         resolved_model_chain: dict[str, dict[str, str]] | None = None,
+        execution_profile_bindings: dict[str, dict[str, Any]] | None = None,
         combo_selection: dict[str, Any] | None = None,
         needs_human_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> WorkflowRun:
@@ -5176,6 +5177,11 @@ class JobRegistry:
                 current.resolved_model_chain
                 if resolved_model_chain is None
                 else resolved_model_chain
+            ),
+            execution_profile_bindings=(
+                current.execution_profile_bindings
+                if execution_profile_bindings is None
+                else execution_profile_bindings
             ),
             combo_selection=(
                 current.combo_selection if combo_selection is None else combo_selection

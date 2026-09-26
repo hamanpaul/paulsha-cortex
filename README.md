@@ -818,6 +818,30 @@ fail-closed 並列出補救路徑（列入 overlay，或評估合格後加入 ev
 回報每個 persona 的生效解析與所在層、使用的 config root；overlay 宣告了某角色
 卻不是生效解析（不變式被破壞）、或有 persona 無候選時 FAIL。
 
+### Execution profile（#835）
+
+每次實際派工會在既有身分解析結果之外，建立 versioned execution profile：
+`requested` 記錄明示偏好／pin，`resolved` 記錄 Cortex 選定的 adapter、model、native
+effort、persona loadout、工具與 sandbox，`observed` 只接受可信來源對 exact resolved
+key 的完整觀測。無可信觀測時維持 `unknown`；不會把 descriptor、要求值或 launcher
+設定冒充成 runtime 實測。
+
+Profile 以 `WorkflowRun.execution_profile_bindings` 作為獨立 sibling 欄位持久化，
+不改寫凍結的 `resolved_model_chain`、attempt 或歷史 evidence。舊 run 缺少該欄位時
+仍按 legacy 載入；新版讀舊資料不補造 profile。格式版本未知、descriptor 不完整、
+key 不一致或 launch 條件與 resolved profile 不符時拒絕派工。
+
+Adapter descriptor 是資料，不會載入 descriptor 提供的程式碼；adapter 實作由 Cortex
+可信註冊表提供，並沿用現有 launcher 的 argv、terminal、usage、cancel/timeout、工具與
+sandbox 邊界。quota 能力預設為 unknown，usage 不代表剩餘額度。正式 dispatch 會重新
+驗證 role、pin、reviewer independence 與既有 Trust Root；有最低品質要求的 run 必須
+取得 #842 exact-profile qualification，未知／不足時在 spawn 前進入 `needs_human`。
+
+PatchMUD #37 的報告由 Cortex consumer 驗證 schema、source revision、digest 與 exact
+profile key；Cortex 不 runtime import PatchMUD。此 worktree 使用固定 fixture 驗證
+consumer，真實 immutable producer fixture／revision 與安裝後 launcher 仍需外部驗收。
+欄位與擴充契約見 [Execution profile 操作與相容性](docs/execution-profile.md)。
+
 ### Merge 限制與 completion/restart
 
 - v1 只支援 preserving-commit 路徑：Candidate 必須是 `refs/remotes/<remote>/<target_branch>` 的 ancestor；squash/cherry-pick 視為不支援（保持 blocked 或 needs_human）。
