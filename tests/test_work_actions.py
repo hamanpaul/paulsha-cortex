@@ -3728,6 +3728,7 @@ def test_default_ship_runtime_is_resumable_and_connects_all_delivery_gates(
         def verify_remote_closure(self, **kwargs):
             calls.append("remote-closure")
             assert kwargs["expected_head"] == HEAD
+            assert kwargs["canonical_checkout"] == tmp_path.resolve()
             return SimpleNamespace(
                 facts=SimpleNamespace(merge_commit="c" * 40),
                 completion_record={"path": "/evidence/completion.json", "hash": "d" * 64},
@@ -4794,6 +4795,7 @@ def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(
     assert result["result"]["action"] == "done"
     assert len(closure_calls) == 1
     assert closure_calls[0]["authority"].snapshot_hash == run["snapshot_hash"]
+    assert closure_calls[0]["canonical_checkout"] == tmp_path.resolve()
     assert closure_calls[0]["completion_payload"] == (
         {"record": "replacement"} if use_replacement else {"record": True}
     )

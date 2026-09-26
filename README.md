@@ -586,7 +586,7 @@ quota 不會在同一個 identity 上重試；Builder roster 有其他合格 ide
 
 **#582 sandbox 工具中止分類**：終局 `subtype=error_during_execution` 且 `terminal_reason=aborted_tools` 表示工具鏈被外部生命週期中斷，分類為 `environment`／`tool_aborted`，可進入 bounded retry；這不同於維持 `unknown` 的一般 controller interruption。
 
-Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、mapped Todo 存在且內容可讀、CompletionRecord；workstream Todo 未勾 checkbox 只作觀測，不阻擋 remote closure。若 work item 有 mapped OpenSpec，仍要求 active OpenSpec 消失且 archive 成立，archived tasks 仍須通過既有 archive gate；`mapped_openspec == ()` 時不要求 archive。其餘 closure 證據不成立時不會提早標 `done`。
+Merge 後 Manager 會從 canonical checkout fetch default branch，以本機 Git 驗證雙親 merge commit ancestry、OpenSpec tree 與 mapped Todo blob SHA／內容；issue closed 仍由 GitHub API 讀取，並照常驗證 CompletionRecord。shallow checkout 會 fail-closed 並提供診斷，不自動 unshallow。workstream Todo 未勾 checkbox 只作觀測，不阻擋 remote closure。若 work item 有 mapped OpenSpec，仍要求 active OpenSpec 消失且 archive 成立，archived tasks 仍須通過既有 archive gate；`mapped_openspec == ()` 時不要求 archive。其餘 closure 證據不成立時不會提早標 `done`。
 
 若舊版 `authority-restart` 已把 run reset 到 `verify`，但同一 run 的完整 merge authorization 與 delivery journal 仍確認 Candidate 已 merge，`resume` 會停止且不重派 verify，並提示 `cortex work <work-id> retire-delivered`。此出口保留退休／abandoned 語意，不代表 shipped completion。
 `close-delivered` 使用相同的 strict closure 條件，僅補足缺失的 operator CompletionRecord；遠端 issue、PR、OpenSpec 或 Todo 證據未全通過時不會結案。

@@ -121,7 +121,7 @@ def _validate_combo_selection(value: object) -> None:
 
 @dataclass(frozen=True)
 class PlanningArtifactAuthority:
-    """Scan-time ownership and CAS baseline for one canonical planning artifact."""
+    """Ownership and CAS baseline for one canonical planning/publication artifact."""
 
     ref: str
     kind: str
@@ -138,7 +138,13 @@ class PlanningArtifactAuthority:
             or path.as_posix() != self.ref
         ):
             raise ValueError("planning authority ref 必須為canonical repo-relative path")
-        if self.kind not in {"spec", "design", "plan"}:
+        if self.kind not in {
+            "spec",
+            "design",
+            "plan",
+            "work-item",
+            "workstream-todo",
+        }:
             raise ValueError("planning authority kind 非法")
         if not isinstance(self.work_id, str) or not self.work_id:
             raise ValueError("planning authority work_id 必須為非空字串")

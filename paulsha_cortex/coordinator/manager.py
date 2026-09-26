@@ -10197,6 +10197,65 @@ def planning_kind_bound(
     return any(_base_allowed(candidate) for candidate in candidates)
 
 
+def _red_child_work_items_document(content: str) -> dict[str, object]:
+    try:
+        payload = safe_load(content)
+    except YAMLError as exc:
+        raise ValueError("red child work-items manifest is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"version", "work_items"}
+        or payload.get("version") != 1
+        or isinstance(payload.get("version"), bool)
+        or not isinstance(payload.get("work_items"), dict)
+    ):
+        raise ValueError("red child work-items manifest is invalid")
+    return payload["work_items"]
+
+
+def _validate_red_child_work_item(content: str, *, child_work_id: str) -> None:
+    todo_ref = f"docs/superpowers/workstreams/{child_work_id}/todo.md"
+    work_items = _red_child_work_items_document(content)
+    expected = {
+        "title": child_work_id,
+        "links": [{"kind": "path", "ref": todo_ref}],
+        "excludes": [],
+    }
+    if work_items.get(child_work_id) != expected:
+        raise ValueError("red child work-item definition is invalid")
+
+
+def _validate_red_child_manifest_append(
+    before: str, after: str, *, child_work_id: str
+) -> None:
+    before_items = _red_child_work_items_document(before)
+    after_items = _red_child_work_items_document(after)
+    expected_ids = set(before_items) | {child_work_id}
+    if set(after_items) != expected_ids:
+        raise ValueError("red child publication may only add its work item")
+    if any(after_items.get(work_id) != row for work_id, row in before_items.items()):
+        raise ValueError("red child publication changed an existing work item")
+    _validate_red_child_work_item(after, child_work_id=child_work_id)
+    if child_work_id in before_items and before_items[child_work_id] != after_items[child_work_id]:
+        raise ValueError("red child publication changed an existing work item")
+
+
+def _validate_red_child_todo(content: str) -> None:
+    in_sprint = False
+    has_open_task = False
+    for line in content.splitlines():
+        heading = re.match(r"^\s*(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            in_sprint = (
+                len(heading.group(1)) == 2
+                and heading.group(2).casefold() == "current sprint"
+            )
+        elif in_sprint and re.match(r"^\s*-\s*\[\s\]\s+\S", line):
+            has_open_task = True
+    if not has_open_task:
+        raise ValueError("red child todo must contain an open Current Sprint task")
+
+
 def _publish_planning_artifacts(
     root_value: str,
     rows: object,
@@ -10228,11 +10287,29 @@ def _publish_planning_artifacts(
         if not isinstance(path_value, str) or not isinstance(content, str):
             raise ValueError("planning artifact path/content invalid")
         relative = Path(path_value)
+        red_child_id = (
+            work_id
+            if isinstance(work_id, str)
+            and _PLANNING_SLUG_RE.fullmatch(work_id) is not None
+            else None
+        )
+        red_child_manifest = (
+            row.get("kind") == "work-item"
+            and path_value == ".cortex/work-items.yaml"
+            and red_child_id is not None
+        )
+        red_child_todo = (
+            row.get("kind") == "workstream-todo"
+            and red_child_id is not None
+            and path_value
+            == f"docs/superpowers/workstreams/{red_child_id}/todo.md"
+        )
         docs_bound = (
             relative.parts[:3] in {
                 ("docs", "superpowers", "specs"),
                 ("docs", "superpowers", "plans"),
             }
+            or red_child_todo
         )
         openspec_bound = (
             len(relative.parts) >= 4
@@ -10252,10 +10329,10 @@ def _publish_planning_artifacts(
             or ".." in relative.parts
             # 等價但非正規化的字串（`./`、`//`、尾端 `/`）不得成為另一個 authority ref。
             or relative.as_posix() != path_value
-            or not (docs_bound or openspec_bound)
-            or (docs_bound and not kind_bound)
+            or not (docs_bound or openspec_bound or red_child_manifest)
+            or (docs_bound and not (kind_bound or red_child_todo))
             or (openspec_bound and not manifest_bound)
-            or relative.suffix != ".md"
+            or (not red_child_manifest and relative.suffix != ".md")
         ):
             raise ValueError("planning artifact path outside governed roots")
         unresolved = root / relative
@@ -10266,28 +10343,37 @@ def _publish_planning_artifacts(
                 raise ValueError("planning artifact symlink rejected")
         path = unresolved.resolve()
         path.relative_to(root)
-        artifact = PlanningArtifact(kind=str(row["kind"]), ref=path_value, text=content)
-        assessment = assess_planning_artifact(artifact)
-        if not assessment.accepted:
-            # #511：先落 evidence 再組訊息，好讓訊息帶得上 evidence 路徑。
-            evidence_ref = _record_planning_artifact_rejection_evidence(
-                coordinator_root=coordinator_root,
-                run_id=publication_run_id,
-                work_id=work_id,
-                assessment=assessment,
-            )
-            message = _planning_artifact_rejection_message(assessment, evidence_ref=evidence_ref)
-            # 上游 `run_heterogeneous_brainstorm` 會把本例外壓成
-            # `primary-artifact-write-rejected: ValueError: {str(exc)[:160]}`，
-            # evidence 路徑可能被截掉；完整訊息在此另落一筆 log（比照 #391 對
-            # needs_human reason 的處理），確保診斷至少有一條完整軌跡。
-            logger.error(
-                "planning-artifact-rejected run_id=%s work_id=%s %s",
-                publication_run_id,
-                work_id,
-                message,
-            )
-            raise ValueError(message)
+        if red_child_manifest:
+            _validate_red_child_work_item(content, child_work_id=str(red_child_id))
+            if not path.exists() and set(
+                _red_child_work_items_document(content)
+            ) != {red_child_id}:
+                raise ValueError("red child publication may only add its work item")
+        elif red_child_todo:
+            _validate_red_child_todo(content)
+        else:
+            artifact = PlanningArtifact(kind=str(row["kind"]), ref=path_value, text=content)
+            assessment = assess_planning_artifact(artifact)
+            if not assessment.accepted:
+                # #511：先落 evidence 再組訊息，好讓訊息帶得上 evidence 路徑。
+                evidence_ref = _record_planning_artifact_rejection_evidence(
+                    coordinator_root=coordinator_root,
+                    run_id=publication_run_id,
+                    work_id=work_id,
+                    assessment=assessment,
+                )
+                message = _planning_artifact_rejection_message(assessment, evidence_ref=evidence_ref)
+                # 上游 `run_heterogeneous_brainstorm` 會把本例外壓成
+                # `primary-artifact-write-rejected: ValueError: {str(exc)[:160]}`，
+                # evidence 路徑可能被截掉；完整訊息在此另落一筆 log（比照 #391 對
+                # needs_human reason 的處理），確保診斷至少有一條完整軌跡。
+                logger.error(
+                    "planning-artifact-rejected run_id=%s work_id=%s %s",
+                    publication_run_id,
+                    work_id,
+                    message,
+                )
+                raise ValueError(message)
         owner = authority_by_ref.get(path_value)
         baseline_hash: str | None = None
         if path.exists():
@@ -10301,6 +10387,12 @@ def _publish_planning_artifacts(
             baseline_hash = owner.baseline_sha256
             if not path.is_file() or _sha256_path(path) != baseline_hash:
                 raise ValueError(f"planning artifact current authority drift: {path_value}")
+            if red_child_manifest:
+                _validate_red_child_manifest_append(
+                    path.read_text(encoding="utf-8"),
+                    content,
+                    child_work_id=str(red_child_id),
+                )
         elif owner is not None:
             raise ValueError(f"planning artifact current authority drift: {path_value}")
         prepared.append((path, content.encode("utf-8"), baseline_hash))
@@ -11856,9 +11948,10 @@ def _workflow_job_prompt(
         planner_contract = (
             " 此卡只能產生一個 child 計畫，不可建立多個 children。保持唯讀，不修改檔案；"
             "在 terminal diagnostics.decomposition_plan 內直接回傳完整 Markdown。"
-            "frontmatter 必須宣告非負整數 invariant_count、非空 artifact_classes，並以合法 child_work_id 指定一個既有工作項目；"
+            "frontmatter 必須宣告非負整數 invariant_count、非空 artifact_classes，並以合法 child_work_id 指定一個新的 child work item；"
             "Tasks 必須涵蓋所有宣告的 artifact_classes，並保留 changelog、cli、test/測試等既有 plan review 要求；"
-            "計畫通過 Manager plan review 後才會呼叫標準 intake。"
+            "Manager 會將 Tasks 項目發布為 child Todo 的 Current Sprint，並登錄對應 work item；"
+            "計畫通過 Manager plan review 後才會發布，Monitor 確認 WorkAuthority 後才會呼叫標準 intake。"
         )
     elif step.persona == "planner":
         planner_contract = (
@@ -12096,7 +12189,7 @@ def _schedule_red_decomposition(registry, *, run, step, artifacts):
         skill_ref="superpowers:writing-plans",
         action=(
             "將此 Red 工作拆成恰好一個 child work item；輸出含 artifact_classes 與 child_work_id "
-            "欄位的拆分計畫，child_work_id 必須是可由正常 intake 載入的既有工作。"
+            "欄位的拆分計畫，child_work_id 必須是新的合法工作項目識別。"
         ),
     )
     steps = list(audited)
@@ -12137,6 +12230,161 @@ def _red_decomposition_child_work_id(plan_text: str) -> str | None:
     ):
         return None
     return child_work_id
+
+
+def _red_decomposition_child_todo(plan_text: str, *, child_work_id: str) -> str | None:
+    lines = plan_text.splitlines()
+    closing = next(
+        (index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
+        None,
+    ) if lines and lines[0].strip() == "---" else None
+    if closing is None:
+        return None
+    tasks: list[str] = []
+    in_tasks = False
+    for line in lines[closing + 1 :]:
+        heading = re.match(r"^\s*(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            title = re.sub(r"^\d+(?:\.\d+)*[.)]?\s+", "", heading.group(2)).casefold()
+            if len(heading.group(1)) == 2 and title in {"task", "tasks"}:
+                in_tasks = True
+                continue
+            if in_tasks and len(heading.group(1)) <= 2:
+                break
+        if in_tasks:
+            item = re.match(r"^\s*-\s+(?:\[[ xX]\]\s+)?(.+?)\s*$", line)
+            if item:
+                tasks.append(item.group(1))
+    if not tasks:
+        return None
+    task_rows = "".join(f"- [ ] {task}\n" for task in tasks)
+    return f"# {child_work_id}\n\n## Current Sprint\n\n{task_rows}"
+
+
+def _red_decomposition_publication(
+    run, *, child_work_id: str, plan_text: str
+) -> tuple[list[dict[str, str]], tuple[PlanningArtifactAuthority, ...]]:
+    if child_work_id == run.work_id:
+        raise ValueError("decomposition child work id must differ from parent")
+    todo_content = _red_decomposition_child_todo(
+        plan_text, child_work_id=child_work_id
+    )
+    if todo_content is None:
+        raise ValueError("decomposition plan has no child Current Sprint tasks")
+
+    root = Path(run.workspace_root).resolve()
+    manifest_ref = ".cortex/work-items.yaml"
+    todo_ref = f"docs/superpowers/workstreams/{child_work_id}/todo.md"
+    manifest_path = root / manifest_ref
+    todo_path = root / todo_ref
+    for relative in (Path(manifest_ref), Path(todo_ref)):
+        cursor = root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("decomposition child publication symlink rejected")
+
+    manifest_before: str | None = None
+    manifest_bytes: bytes | None = None
+    work_items: dict[str, object] = {}
+    if manifest_path.exists():
+        if not manifest_path.is_file():
+            raise ValueError("red child work-items manifest is not a file")
+        manifest_bytes = manifest_path.read_bytes()
+        try:
+            manifest_before = manifest_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("red child work-items manifest is unreadable") from exc
+        work_items = _red_child_work_items_document(manifest_before)
+
+    expected_row = {
+        "title": child_work_id,
+        "links": [{"kind": "path", "ref": todo_ref}],
+        "excludes": [],
+    }
+    def _overlapping_identity(existing: str) -> bool:
+        # #812：不同 work item 之間不得有 `<id>-…` 的前綴／後綴占用（任一方向）。
+        return existing != child_work_id and (
+            existing.startswith(f"{child_work_id}-") or child_work_id.startswith(f"{existing}-")
+        )
+
+    workstreams_root = root / "docs" / "superpowers" / "workstreams"
+    existing_workstreams = (
+        [entry.name for entry in workstreams_root.iterdir() if entry.is_dir()]
+        if workstreams_root.is_dir()
+        else []
+    )
+    if any(_overlapping_identity(existing) for existing in (*work_items, *existing_workstreams)):
+        raise ValueError(
+            "decomposition child work item overlaps an existing work item identity (#812)"
+        )
+    for existing_id, row in work_items.items():
+        if not isinstance(row, dict):
+            raise ValueError("red child work-items manifest is invalid")
+        links = row.get("links", [])
+        if not isinstance(links, list):
+            raise ValueError("red child work-items manifest is invalid")
+        if existing_id == child_work_id:
+            if row != expected_row:
+                raise ValueError("decomposition child work item already exists with different authority")
+        elif any(
+            isinstance(link, dict)
+            and link.get("kind") == "path"
+            and link.get("ref") == todo_ref
+            for link in links
+        ):
+            raise ValueError("decomposition child todo is already linked to another work item")
+
+    manifest_has_child = child_work_id in work_items
+    if todo_path.exists():
+        if not manifest_has_child:
+            raise ValueError("decomposition child todo exists without its work item")
+        if not todo_path.is_file() or todo_path.read_text(encoding="utf-8") != todo_content:
+            raise ValueError("decomposition child todo already exists with different content")
+
+    rows: list[dict[str, str]] = []
+    authorities: list[PlanningArtifactAuthority] = []
+    if not manifest_has_child:
+        if manifest_before is None:
+            manifest_after = "version: 1\nwork_items:\n"
+        else:
+            manifest_after = manifest_before
+            if re.search(r"(?m)^work_items:[ \t]*\{\}[ \t]*$", manifest_after):
+                manifest_after = re.sub(
+                    r"(?m)^work_items:[ \t]*\{\}[ \t]*$",
+                    "work_items:",
+                    manifest_after,
+                    count=1,
+                )
+            elif re.search(r"(?m)^work_items:[ \t]*$", manifest_after) is None:
+                raise ValueError("red child work-items manifest must use a block mapping")
+        if manifest_after and not manifest_after.endswith("\n"):
+            manifest_after += "\n"
+        manifest_after += (
+            f"  {child_work_id}:\n"
+            f"    title: '{child_work_id}'\n"
+            "    links:\n"
+            "      - kind: path\n"
+            f"        ref: '{todo_ref}'\n"
+            "    excludes: []\n"
+        )
+        rows.append(
+            {"kind": "work-item", "path": manifest_ref, "content": manifest_after}
+        )
+        if manifest_bytes is not None:
+            authorities.append(
+                PlanningArtifactAuthority(
+                    ref=manifest_ref,
+                    kind="work-item",
+                    work_id=child_work_id,
+                    baseline_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+                )
+            )
+    if not todo_path.exists():
+        rows.append(
+            {"kind": "workstream-todo", "path": todo_ref, "content": todo_content}
+        )
+    return rows, tuple(authorities)
 
 
 def _red_decomposition_plan_from_job(job: Mapping[str, object]) -> str | None:
@@ -14592,6 +14840,35 @@ def resume_workflow_run(
                 reason="decomposition-child-work-id-invalid",
                 detail="通過 review 的拆分計畫必須包含唯一合法 child_work_id。",
             )
+        try:
+            publication_rows, publication_authorities = _red_decomposition_publication(
+                run,
+                child_work_id=child_work_id,
+                plan_text=plan_text,
+            )
+            if publication_rows:
+                publication = _PlanningPublicationTransaction(
+                    root=Path(run.workspace_root),
+                    run_id=run.run_id,
+                    journal_root=Path(coordinator_root),
+                )
+                _publish_planning_artifacts(
+                    run.workspace_root,
+                    publication_rows,
+                    work_id=child_work_id,
+                    allowed_refs=(),
+                    authorities=publication_authorities,
+                    transaction=publication,
+                    coordinator_root=coordinator_root,
+                )
+                publication.commit()
+        except Exception as exc:
+            return _stop_red_decomposition(
+                registry,
+                run=run,
+                reason="decomposition-child-publication-failed",
+                detail=f"child work item 發布失敗：{summarize_exception(exc)}",
+            )
         if decomposition_intake is None:
             return _stop_red_decomposition(
                 registry,
@@ -14602,6 +14879,16 @@ def resume_workflow_run(
         try:
             child_result = decomposition_intake(child_work_id)
         except Exception as exc:
+            if (
+                isinstance(exc, ValueError)
+                and str(exc).startswith("confirmed work authority missing or ambiguous")
+            ):
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "reason": "decomposition-child-awaiting-monitor",
+                    "child_work_id": child_work_id,
+                }
             return _stop_red_decomposition(
                 registry,
                 run=run,

@@ -9,6 +9,9 @@
 
 ### Fixed
 
+- **#833 Red child 自動進件**：拆分計畫通過 review 後，Manager 以 planning transaction 冪等發布 child work item 與 Todo；Monitor snapshot 確認 WorkAuthority 後由 periodic resume 自動標準 intake。
+
+- **#567 delivery closure 本機 Git 讀取**：fetch default branch 後，以 canonical checkout 的本機 Git 驗證 merge ancestry、parents、OpenSpec tree 與 Todo blob／內容；checkout 缺失或 shallow 時 fail-closed 並提供診斷，不自動 unshallow。
 - **#502 verify／review 通過後的阻斷修復入口**：exact-candidate `retry-build` 現可接受尚未進入 `needs_human` 的後續阻斷裁決；必須提供 `--reason`，以既有 immutable operator-adjudication evidence 記錄後重跑 verify／review，已完成 run 仍拒絕重開。
 
 - **#862 recovery registry receipt contract**：`JobRegistry` 現在依 OpenSpec 實作
