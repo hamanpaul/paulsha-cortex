@@ -198,6 +198,10 @@ def build_review_prompt(
         "任何檔案都**不會**被採信。stdout/stderr 也不算 verdict。\n"
         "身分／job id／candidate 由 Manager 自行綁定，不必也不能在 verdict 裡宣告。\n"
         "若無 findings，請輸出 findings: []。\n"
+        "合法 finding category（category）值："
+        f"{', '.join(sorted(VALID_FINDING_CATEGORIES))}\n"
+        "合法 finding severity（severity）值："
+        f"{', '.join(sorted(VALID_SEVERITIES))}\n"
         "Verdict schema（只能輸出此 JSON 結構）:\n"
         f"{json.dumps(verdict_template, ensure_ascii=False, indent=2, sort_keys=True)}\n"
     )
@@ -913,6 +917,7 @@ def build_gate_evaluation(
     candidate: str,
     launch_identity: dict[str, Any],
     findings: list[dict[str, Any]] | None = None,
+    diagnostics: list[str] | None = None,
 ) -> dict[str, Any]:
     if state not in VALID_EVALUATION_STATES:
         raise ValueError(f"invalid gate evaluation state: {state!r}")
@@ -930,7 +935,7 @@ def build_gate_evaluation(
         if isinstance(launch_identity, dict) and launch_identity.get("reviewer") is not None
         else None,
     }
-    return {
+    payload = {
         "schema_version": REVIEW_SCHEMA_VERSION,
         "slice_id": slice_id,
         "state": state,
@@ -941,6 +946,9 @@ def build_gate_evaluation(
         "launch_identity": normalized_launch_identity,
         "findings": copy.deepcopy(findings or []),
     }
+    if diagnostics is not None:
+        payload["diagnostics"] = list(diagnostics)
+    return payload
 
 
 def validate_gate_evaluation(payload: object) -> dict[str, Any]:
@@ -961,11 +969,17 @@ def validate_gate_evaluation(payload: object) -> dict[str, Any]:
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"gate evaluation missing keys: {', '.join(missing)}")
-    extras = sorted(set(payload) - required)
+    extras = sorted(set(payload) - required - {"diagnostics"})
     if extras:
         raise ValueError(f"gate evaluation unexpected key: {extras[0]}")
     if payload.get("schema_version") != REVIEW_SCHEMA_VERSION:
         raise ValueError(f"gate evaluation schema_version must be {REVIEW_SCHEMA_VERSION}")
+    diagnostics_value = payload.get("diagnostics")
+    if "diagnostics" in payload and (
+        not isinstance(diagnostics_value, list)
+        or any(not isinstance(item, str) or not item.strip() for item in diagnostics_value)
+    ):
+        raise ValueError("gate evaluation diagnostics must be a list of non-empty strings")
 
     slice_id = payload.get("slice_id")
     if not isinstance(slice_id, str) or verification.SAFE_SLICE_ID_RE.fullmatch(slice_id) is None:
@@ -1037,7 +1051,7 @@ def validate_gate_evaluation(payload: object) -> dict[str, Any]:
     if state == "absent" and findings:
         raise ValueError("absent gate evaluation must not contain findings")
 
-    return {
+    normalized_payload = {
         "schema_version": REVIEW_SCHEMA_VERSION,
         "slice_id": slice_id,
         "state": state,
@@ -1048,6 +1062,9 @@ def validate_gate_evaluation(payload: object) -> dict[str, Any]:
         "launch_identity": normalized_identity,
         "findings": findings,
     }
+    if "diagnostics" in payload:
+        normalized_payload["diagnostics"] = list(diagnostics_value)
+    return normalized_payload
 
 
 def write_gate_evaluation(

@@ -1837,6 +1837,7 @@ def _write_gate_evaluation(
     reviewer_identity: dict | None,
     findings: list[dict] | None,
     coordinator_root: Path | None,
+    diagnostics: list[str] | None = None,
 ) -> dict:
     payload = foreign_review.build_gate_evaluation(
         slice_id=slice_id,
@@ -1847,6 +1848,7 @@ def _write_gate_evaluation(
         candidate=candidate,
         launch_identity={"builder": builder_identity, "reviewer": reviewer_identity},
         findings=findings,
+        diagnostics=diagnostics,
     )
     return foreign_review.write_gate_evaluation(payload, coordinator_root=coordinator_root)
 
@@ -2421,7 +2423,7 @@ def _finalize_review_job(
                 candidate=candidate,
                 launch_identity=reviewer_identity,
             )
-    except Exception:
+    except Exception as exc:
         evaluation = _write_gate_evaluation(
             slice_id=slice_id,
             state="absent",
@@ -2433,6 +2435,7 @@ def _finalize_review_job(
             reviewer_identity=reviewer_identity,
             findings=[],
             coordinator_root=coordinator_root,
+            diagnostics=[str(exc)],
         )
         _apply_review_evaluation(registry, slice_id, evaluation)
         return evaluation, "needs_human", "foreign-review-absent"

@@ -67,7 +67,9 @@ benchmark 結果是日後決定是否擴充優先序的依據。
 補充註記（非排除，實作票需知）：reviewer persona 的結構化終局契約目前只有 claude 有
 `--json-schema` 綁定（`launcher.py:993-994` 只對 claude 傳 `review_terminal_kind`，
 `_claude_review_json_schema`）；codex／agy／cg reviewer 依賴 prompt 側終局契約＋harvest
-驗證。benchmark reviewer 維度時此差異屬觀測條件，須記入 run 條件。
+驗證。slice foreign-review prompt 會列出 validator 允許的 finding category／severity；verdict
+驗證失敗時，gate evaluation 的 `diagnostics` 會保留具體錯誤，狀態仍 fail closed。
+benchmark reviewer 維度時此差異屬觀測條件，須記入 run 條件。
 
 ### R3 定案登錄 roster：每 executor 的 model_id 清單（僅收 repo 內有據可查的字串）
 
