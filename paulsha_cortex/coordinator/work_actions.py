@@ -3983,7 +3983,15 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     }
 
 
-def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+def _retry_verify_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    workflow_registry,
+    reviewer_recovery_checker: (
+        Callable[[dict[str, Any], Any], bool] | None
+    ) = None,
+) -> dict[str, Any]:
     """Rerun verification only for the exact unchanged Candidate after a human stop（#216 AC2）。
 
     build phase 完全不動：不重派 builder、不重建 candidate，只把 verify step
@@ -4033,6 +4041,7 @@ def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) 
         run.run_id,
         expected_candidate=expected_candidate.lower(),
         retry_classification=retry_classification.value,
+        reviewer_recovery_checker=reviewer_recovery_checker,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
@@ -4051,6 +4060,9 @@ def _retry_review_action(
     workflow_registry,
     state_path: Path | None = None,
     now_epoch: float | None = None,
+    reviewer_recovery_checker: (
+        Callable[[dict[str, Any], Any], bool] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Relaunch foreign review only for the exact verified Candidate（#216 AC3）。
 
@@ -4130,6 +4142,7 @@ def _retry_review_action(
         run.run_id,
         expected_candidate=expected_candidate.lower(),
         retry_classification=retry_classification.value,
+        reviewer_recovery_checker=reviewer_recovery_checker,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
     return {
@@ -7951,6 +7964,9 @@ def execute_work_action(
     workflow_registry=None,
     workflow_starter=None,
     readiness_checker=None,
+    reviewer_recovery_checker: (
+        Callable[[dict[str, Any], Any], bool] | None
+    ) = None,
 ) -> dict[str, Any]:
     action = args.get("action")
     repo = args.get("repo")
@@ -8044,6 +8060,7 @@ def execute_work_action(
             args=args,
             authority=authority,
             workflow_registry=workflow_registry,
+            reviewer_recovery_checker=reviewer_recovery_checker,
         )
     elif action == "retry-review":
         result = _retry_review_action(
@@ -8052,6 +8069,7 @@ def execute_work_action(
             workflow_registry=workflow_registry,
             state_path=resolved_state_path,
             now_epoch=now_epoch,
+            reviewer_recovery_checker=reviewer_recovery_checker,
         )
     elif action == "recover-planning":
         result = _recover_planning_action(
