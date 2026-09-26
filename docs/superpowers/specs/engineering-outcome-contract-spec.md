@@ -48,9 +48,10 @@ SHALL 定義單一版本化的 outcome envelope（`schema` / `schema_version`）
 
 ### R2 outcome 詞彙縮限與可擴張性
 
-v1 SHALL 只在真正存在既有終局轉換點的兩處 emit：`_ship_action` 的
-`status="done"` 對應 `outcome="shipped"`；`_abandon_action` 的
-`status="superseded"` 對應 `outcome="abandoned"`。`rejected`／`failed`（run 級）／
+v1 SHALL 只使用既有交付／終局路徑 emit：`_ship_action` 對應
+`outcome="shipped"`，涵蓋直接 ship，以及一般 review→ship validator 在 Manager 將
+WorkflowRun 標成 `done` 前的寫入；`_abandon_action` 在 `status="superseded"` 前對應
+`outcome="abandoned"`。`rejected`／`failed`（run 級）／
 `rolled_back` MUST 留在 schema 的合法值集合內（供未來擴張既有終局轉換點時沿用同一
 schema），但 v1 MUST NOT 為了湊滿六種狀態去發明新的 run-level 終局狀態或改動
 `WorkflowRun.status` 的既有三值域。
@@ -63,6 +64,10 @@ SHALL 提供決定性的 `outcome_id` 推導——由 `workflow_run_id`／`outco
 `outcome_id`；outbox 的寫入層 MUST 依 `outcome_id` 去重，daemon restart 或 request
 retry 造成的重複呼叫 MUST NOT 產生第二筆 record。
 
+`shipped` caller MUST 保證同一 repo/work/run 只有一筆 shipped row：完全相同的
+Candidate、merge 與 CompletionRecord 重入 MUST 重用既有 immutable row；不同 attempt
+或交付綁定 MUST fail closed，不得為同一 run 新增第二筆 shipped outcome。
+
 ### R4 execution provenance 的誠實邊界
 
 `execution_provenance.session_refs` MUST NOT 宣稱與 executor 自身 session 的
@@ -74,10 +79,11 @@ exact match——Cortex job record 目前沒有存 executor session UUID（只�
 
 ### R5 終局轉換順序
 
-`_ship_action`／`_abandon_action` MUST 在呼叫 `_manager_update_workflow_run`／
-`_manager_abandon_workflow_run` 之前完成 outcome 的 durable 寫入（`OutcomeStore.
-append` 成功回傳）。若 outcome 寫入失敗，terminal transition MUST NOT 執行
-（維持現有的例外傳播行為即可，不需額外補償邏輯）。
+直接 ship 與 abandon MUST 在各自 registry terminal transition 前 durable 寫入 outcome。
+一般 review→ship MUST 在 ship validator 回傳 trusted completion 前 durable 寫入並讀回
+shipped outcome，之後 Manager 才能將 WorkflowRun 標成 `done`。任何 shipped 寫入、讀回
+或交付綁定驗證失敗時，terminal transition MUST NOT 執行；若 outcome 已成功而 Manager
+終態寫入中斷，重入 MUST 重驗 closure 並沿用相同 row。
 
 ### R6 唯讀消費 surface
 

@@ -7908,6 +7908,30 @@ def _ship_action(
         raise RuntimeError("ship delivery binding differs from persisted PR/OpenSpec/Todo refs")
     github = GitHubDeliveryClient(runner=runner)
     orchestrator = ShipOrchestrator(github=github, now=now)
+
+    def persist_shipped_outcome(
+        *, expected_head: str, pr_number: int, change: str | None,
+        todo_paths: list[str], authorization: dict[str, Any], closure,
+    ) -> None:
+        outcome_store = engineering_outcome.OutcomeStore(
+            engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
+        )
+        engineering_outcome.emit_shipped_outcome(
+            outcome_store,
+            run=canonical_run,
+            authority=authority,
+            jobs=workflow_registry.list_jobs(),
+            attempt_digest=str(closure.completion_record["hash"]),
+            candidate={
+                "pr_number": pr_number,
+                "openspec_change": change,
+                "sha": expected_head,
+                "merge_commit": closure.facts.merge_commit,
+            },
+            verification={"todo_paths": list(todo_paths)},
+            review={"merge_authorization_hash": authorization.get("hash")},
+        )
+
     rearm_permit = None
     if (
         isinstance(ship, dict)
@@ -8000,36 +8024,21 @@ def _ship_action(
             for source in authority.source_revisions
             if "@" in source
         }
+        if canonical_run.current_phase in {"review", "ship"}:
+            # #1086：一般 review→ship advance 仍處於 review；先 durable 寫入
+            # shipped outcome，production ship validator 才能回傳 passed，讓
+            # Manager 後續將 Registry 標成 done。重入會重驗 closure，並以
+            # CompletionRecord hash 重用同一筆 outcome。
+            persist_shipped_outcome(
+                expected_head=expected_head,
+                pr_number=pr_number,
+                change=change,
+                todo_paths=todo_paths_value,
+                authorization=authorization,
+                closure=closure,
+            )
+
         if canonical_run.current_phase == "ship":
-            # #275：canonical engineering outcome 必須在 terminal transition
-            # （status="done"）之前 durable 寫入，讓外部 learning systems 有一個
-            # 不受 WorkflowRun in-place 覆寫影響的 append-only 記錄可讀。
-            # attempt_digest 用 completion record hash——同一次 merge 重跑
-            # ship（daemon restart／request retry）會算出同一個 hash，因此
-            # OutcomeStore.append 據此去重，不產生第二筆 outcome。
-            outcome_store = engineering_outcome.OutcomeStore(
-                engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
-            )
-            engineering_outcome.emit_outcome(
-                outcome_store,
-                run=canonical_run,
-                authority=authority,
-                jobs=workflow_registry.list_jobs(),
-                outcome="shipped",
-                attempt_digest=str(closure.completion_record["hash"]),
-                candidate={
-                    "pr_number": pr_number,
-                    "openspec_change": change,
-                    "sha": expected_head,
-                    "merge_commit": closure.facts.merge_commit,
-                },
-                verification={"todo_paths": list(todo_paths_value)},
-                review={
-                    "merge_authorization_hash": (
-                        authorization.get("hash") if isinstance(authorization, dict) else None
-                    ),
-                },
-            )
             workflow_registry._manager_update_workflow_run(
                 canonical_run.run_id,
                 status="done",
@@ -8103,6 +8112,17 @@ def _ship_action(
             "completion_record": dict(closure.completion_record),
         }
         _save_runs(state_path, state)
+        if canonical_run.current_phase == "review":
+            # Manager 若在 outcome 後轉態前中斷，重入時 journal 已是 done。
+            # 重驗 remote closure 後，以同一 CompletionRecord 綁定補齊或重用 outcome。
+            persist_shipped_outcome(
+                expected_head=expected_head,
+                pr_number=pr_number,
+                change=change,
+                todo_paths=todo_paths,
+                authorization=authorization,
+                closure=closure,
+            )
         return {
             "action": "done",
             "head": expected_head,

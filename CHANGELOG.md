@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#1086 review→ship outcome 順序**：一般 review→ship closure 先 durable 寫入唯一、綁定 CompletionRecord／Candidate／merge 的 shipped outcome，確認讀回後才由 Manager 將 WorkflowRun 標成 done；相同交付重入沿用原 row，append／讀回失敗或綁定衝突時不完成終態轉換。
 - **#492 foreign review tier 前置檢查**：required review 的 builder slice 會在建立工作區與啟動 builder 前驗證 project policy tier；缺少或非法值會指出選定 manifest 路徑及允許值，無 manifest 時維持 `shareable` 預設。
 - **#571、#579 reviewer 路徑綁定**：review gate evaluation 檔名納入 candidate 短 SHA；reviewer sandbox 目錄名納入 job id，並於新 reviewer 派工前回收前代 claim era 已終止的孤兒 sandbox，回收失敗時記錄 warning 並繼續派工。
 - **#810 merge 後 Todo 勾選狀態僅供診斷**：已合併 WorkflowRun 的遠端結案與 Monitor 不再因 workstream Todo 未勾而阻擋有效交付；Todo 證據仍須存在且可讀，archived OpenSpec tasks 的完成要求維持不變。

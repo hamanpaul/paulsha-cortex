@@ -19,7 +19,7 @@ checkbox 則兩面失真，也違反 #261 R2「自述不構成授權」：
 
 `fetch_remote_closure` 不動：Todo 必須存在於 default head、payload 形狀 fail-closed，`todo_complete`／`todo_revisions` 照算，作為觀測事實。
 
-WorkflowRun 的 terminal transition 不在本票改動範圍。daemon 路徑由 `manager.apply_workflow_action` 的 review→ship `advance` 在拿到 ship validator 的 trusted completion 後寫 `status="done"`（`manager.py:12477`、`:12538-12580`）；只有 `canonical_run.current_phase == "ship"` 時才由 `_ship_action` 自己寫（`work_actions.py:5683`）。兩條路徑都只差在 `verify_remote_closure` 不再擲例外。
+WorkflowRun 的 terminal transition 不在本票改動範圍。daemon 路徑由 `manager.apply_workflow_action` 的 review→ship `advance` 在拿到 ship validator 的 trusted completion 後寫 `status="done"`（`manager.py:12477`、`:12538-12580`）；只有 `canonical_run.current_phase == "ship"` 時才由 `_ship_action` 自己寫（`work_actions.py:5683`）。#1086 已補上共同的 outcome-first 順序；本票兩條路徑只改 Todo closure 不再擲例外。
 
 ### D2 advisory 的可觀測面：只記 warning
 
@@ -34,7 +34,7 @@ logger.warning(
 
 用 `getattr` 的原因：既有測試的 fake orchestrator 回 `SimpleNamespace(merge_commit=...)`，沒有 `todo_complete` 屬性（`tests/test_engineering_outcome.py` 的 `Orchestrator.verify_remote_closure`、`tests/test_work_actions.py` 兩處同型），直接取屬性會打破既有斷言。
 
-不寫進 engineering outcome：`shipped` outcome 只在 `canonical_run.current_phase == "ship"` 時 emit（`work_actions.py:5683`）。daemon 的 review→ship `advance` 呼叫 ship validator 時 run 仍在 `review`（`manager.py:12477`），所以 outcome 欄位在主要 production 路徑根本不會出現。加上去還會改 durable outcome 的形狀，讓 `state_consistency` 從 0 變 1。
+不寫進 engineering outcome：不新增 `todo_complete` 欄位，避免改 durable outcome 形狀；#1086 已讓 review→ship 在終態轉換前寫入既有 shipped outcome，但不把 Todo advisory 狀態加入 payload。
 
 不寫進 CompletionRecord：`completion.validate_completion_record` 是 strict schema，加欄位要 bump schema，超出範圍。cached `done` 重播路徑不加 warning，避免每次 refresh 重複記同一件事。
 
@@ -105,7 +105,7 @@ combined[wid]["todo_tasks_complete"] = (
 - **merge 前 checkbox blocking gate（pr-preflight）**：會把 merge 後的死結換成 merge 前的 needs_human。只為了翻勾就得跑一次完整 `retry-build`（build＋verify＋review）；已建好、未翻勾的在飛候選會全部停住；而判準仍是自述。
 - **Manager 在 local-closeout 自動翻勾**：無 OpenSpec 的 run 目前沒有 local-closeout commit（`work_bridge.py:1920`）。新增 commit 會產生新 candidate，要比照 `_commit_archive_and_require_reverification` 做 harvest、registry reset 與 reverification，屬 cross-object durable（`state_consistency=2`），超出 Yellow。列為後續，可與 #808 合併處理。
 - **Monitor 改成看 WorkflowRun `done` 直接投影 `done`**：會繞過 remote truth（merge ancestry、issue closure、OpenSpec archive），違反 `README.md:386` 以遠端 default branch 事實判 `done` 的契約，也和 #895 的設計空間重疊。
-- **engineering outcome 加 `verification.todo_complete`**：見 D2，主要 production 路徑不會 emit，且改 durable 形狀。
+- **engineering outcome 加 `verification.todo_complete`**：會改 durable 形狀；Todo checkbox advisory 仍只記 warning，不加入 payload。
 
 ### D7 風險／測試矩陣
 

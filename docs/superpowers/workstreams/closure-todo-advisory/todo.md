@@ -26,7 +26,7 @@ artifact_classes:
   - Manager 在 local-closeout 自動翻勾（新 commit → reverification，另票，可併 #808）。
   - merge 前的 checkbox blocking gate。
   - archive gate 的 OpenSpec tasks 全勾（#808）；Monitor 對 archived OpenSpec tasks 的全勾要求同樣保留。
-  - engineering outcome 加 `todo_complete`（daemon 的 review→ship 路徑不 emit `shipped` outcome，且會改 durable 形狀）。
+  - engineering outcome 加 `todo_complete`（會改 durable 形狀；Todo advisory 狀態仍不加入 outcome payload）。
   - Monitor 的 superpowers source 恆 `active`，以及無 CompletionRecord 的已交付 work item 投影（#895）。
   - #810 原文第 4 點（issue 關閉後 `retry-build` 的 row-malformed）。
   - 新增 CLI。
