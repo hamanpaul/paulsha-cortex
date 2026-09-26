@@ -9482,6 +9482,9 @@ _MODEL_CHAIN_CAPABILITY_BY_PERSONA = {
     "planner": "planning",
     "reviewer": "review",
     "builder": "build",
+    # ship 階段的 manager 卡（policy-commit 等）若需模型執行，沿用 build capability；
+    # 這是原本「未知 persona 當 build」唯一的正當用途，改為明示對應。
+    "manager": "build",
 }
 
 
