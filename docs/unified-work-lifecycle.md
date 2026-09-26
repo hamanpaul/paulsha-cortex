@@ -319,10 +319,10 @@ JSON string data 中的原始 Unicode NEL（`U+0085`）、line separator（`U+20
 **gate ledger 由 manager 產生，不是模型自述。** 重驗只有在「被驗的東西不是模型講的話」時才有意義。`launcher.build_wrapper_script` 產生的 headless wrapper 是 manager 擁有的，形狀為：
 
 ```text
-<模型 argv>; printf %s "$?" > <sentinel>; python3 -m paulsha_cortex.coordinator.gate_ledger --out <ledger> --worktree <wt> >/dev/null 2>&1
+<模型 argv>; __psc_rc=$?; <gate ledger writer>; printf %s "$__psc_rc" > <sentinel>; exit "$__psc_rc"
 ```
 
-三段以 `;` 串接，因此模型失敗時 sentinel 與 ledger 仍會產生；sentinel 早於 gate 階段寫入，模型的 exit code 不會被 gate 耗時污染；gate 階段輸出導向 `/dev/null`，不污染 JSONL 的 terminal evidence。gate 清單由 operator 以 `PSC_GATE_CMD_<NAME>` 環境變數宣告（沿用 `PSC_PREFLIGHT_CMD` 的 typed-argv 規範，拒絕 shell wrapper），exit code 由真實 subprocess 產生。模型既不能選擇跑哪些 gate、不能決定 exit code，也拿不到 ledger 路徑（`<log_dir>/<slice_id>.gates.json` 由 job 的 `log_path` 推導，模型的 cwd 是 worktree）。跑不起來或逾時的 gate 一律記為 `failed`，避免 operator 設定壞掉靜默變成 fail-open。
+各段以 `;` 串接，因此模型失敗時 gate 仍會執行並產生 ledger。wrapper 先保存模型 exit code，gate writer 結束後才寫 sentinel；sentinel 因此代表 gate 階段已完成，模型 exit code 也不會被 gate 耗時或結果污染。gate 階段輸出導向 `/dev/null`，不污染 JSONL 的 terminal evidence。gate 清單由 operator 以 `PSC_GATE_CMD_<NAME>` 環境變數宣告（沿用 `PSC_PREFLIGHT_CMD` 的 typed-argv 規範，拒絕 shell wrapper），exit code 由真實 subprocess 產生。模型既不能選擇跑哪些 gate、不能決定 exit code，也拿不到 ledger 路徑（`<log_dir>/<slice_id>.gates.json` 由 job 的 `log_path` 推導，模型的 cwd 是 worktree）。跑不起來或逾時的 gate 一律記為 `failed`，避免 operator 設定壞掉靜默變成 fail-open。
 
 **成功必須被證明。** `manager.terminalize_workflow_job` 在任何狀態採信之前，先以 `_assert_terminal_gate_consistency` 做確定性 cross-check：只要 ledger 中有任何 gate 的實際結果不是 passed，terminal 自稱的 `passed` 一律 fail closed，錯誤訊息保留哪一個 gate、期望值與實際值。「沒提到」不能當作「沒失敗」——terminal 完全不引用某個失敗的 gate 也一樣被否決。ledger 自身矛盾（記了非 0 exit code 卻標 passed）視同失敗。envelope 內的 `gate_evidence` 是模型「自述跑了哪些 gate」的宣告，manager 以 ledger 對照：宣稱跑了 ledger 中不存在的 gate，或宣稱的結果與 ledger 不符，皆 fail closed。會實際跑並要求本卡 gate ledger 的 phase（`build`，見 `GATE_LEDGER_REQUIRED_PHASES`）若連 ledger 都不存在，代表 wrapper 的 gate 階段沒跑完，同樣 fail closed。模型輸出的自然語言、exit code 為 0、以及「沒有明確錯誤」三者皆不構成成功授權。
 

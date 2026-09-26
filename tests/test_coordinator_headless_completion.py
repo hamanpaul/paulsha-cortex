@@ -45,8 +45,8 @@ class CrossProcessCompletionTests(unittest.TestCase):
             self.assertEqual(updated["exit_code"], 0)
             self.assertEqual(JobRegistry(state_path=state).get_job("slice-a-1")["status"], "exited")
 
-    def test_sentinel_waits_for_gate_ledger_while_wrapper_is_still_alive(self) -> None:
-        """The model sentinel precedes the slower Manager-authored ledger."""
+    def test_live_wrapper_stays_dispatched_even_if_sentinel_exists(self) -> None:
+        """sentinel 已存在時，仍以存活中的 wrapper 為準並維持 dispatched。"""
         import os
 
         with tempfile.TemporaryDirectory() as d:

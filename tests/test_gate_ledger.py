@@ -114,7 +114,7 @@ def test_ledger_is_written_even_with_no_declared_gates(tmp_path: Path) -> None:
     assert ledger_path.is_file()
 
 
-def test_wrapper_runs_gate_writer_after_sentinel_and_survives_model_failure(
+def test_wrapper_runs_gate_writer_before_sentinel_and_survives_model_failure(
     tmp_path: Path,
 ) -> None:
     """wrapper 必須在模型失敗時也寫出 sentinel 與 ledger（以 `;` 串接而非 `&&`）。"""
@@ -130,18 +130,21 @@ def test_wrapper_runs_gate_writer_after_sentinel_and_survives_model_failure(
         repo_root=str(Path(__file__).resolve().parents[1]),
         run_gates=True,
     )
-    # sentinel 必須早於 gate 階段寫入，否則模型的 exit code 會被 gate 耗時污染。
-    assert script.index('printf %s "$?"') < script.index("gate_ledger")
+    # 模型 exit code 先保存；gate 完成後才寫 sentinel，最後還原模型 exit code。
+    assert script.index("__psc_rc=$?") < script.index("gate_ledger")
+    assert script.index("gate_ledger") < script.index('printf %s "$__psc_rc"')
+    assert script.endswith('exit "$__psc_rc"')
 
     import subprocess
 
-    subprocess.run(
+    proc = subprocess.run(
         ["bash", "-c", script],
         cwd=str(tmp_path),
         env={**os.environ, "PSC_GATE_CMD_GREEN": "python3 -c pass"},
         check=False,
         capture_output=True,
     )
+    assert proc.returncode == 9
     assert sentinel.read_text(encoding="utf-8") == "9"
     ledger_payload = json.loads(ledger.read_text(encoding="utf-8"))
     assert ledger_payload["gates"][0]["name"] == "green"
@@ -159,4 +162,6 @@ def test_wrapper_gate_output_never_pollutes_terminal_log(tmp_path: Path) -> None
         repo_root="/repo",
         run_gates=True,
     )
-    assert script.rstrip().endswith(">/dev/null 2>&1")
+    gate_command = script[script.index("PYTHONPATH=") :].split("; ", 1)[0]
+    assert gate_command.endswith(">/dev/null 2>&1")
+    assert script.index(gate_command) < script.index('printf %s "$__psc_rc"')

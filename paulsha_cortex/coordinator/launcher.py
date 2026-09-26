@@ -160,21 +160,21 @@ def build_wrapper_script(
 ) -> str:
     """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
 
-    三段皆以 ``;`` 串接，因此模型失敗時 sentinel 與 ledger 仍會產生：
+    一般 wrapper 依序執行模型、保存模型 exit code、產生 gate ledger、寫入
+    completion sentinel，最後以保存的 exit code 結束。各段以 ``;`` 串接，所以
+    模型失敗時仍會執行 gate 並寫出 sentinel；sentinel 代表 gate 階段已結束。
 
-    1. 模型 argv；
-    2. 把 ``$?`` 寫入 exit sentinel（跨進程 durable 完成判定，早於 gate 階段，
-       確保 gate 執行時間不會被算進模型的 exit code）；
-    3. 由 manager 掌控的 gate ledger writer。
+    wrapper 會在 gate 前保存模型的 ``$?``，因此 gate 的耗時或 exit code 不會改變
+    模型 exit code；gate 階段 stdout/stderr 另導向 ``/dev/null``。
 
     ``commit_bundle``（#623）：成果 bundle 的落點。非 None 時 script 改成**先把
-    模型的 ``$?`` 存進 shell 變數**，接著產 bundle，最後才寫 sentinel／跑 gate，
-    並以存下來的值收場。兩個理由：
+    模型的 ``$?`` 存進 shell 變數**，接著產 bundle，再跑 gate，最後才寫 sentinel，
+    並以保存的值結束。verdict 與 last-message publication 也排在 gate 和 sentinel 之前：
 
     - **順序**——sentinel 一出現，Manager 隨時可能在下一個 tick 判定完成並開始
-      回收。bundle 必須在 sentinel **之前**落地，否則回收會撞上一個還沒寫完的 spool。
-      降權模式沒有 job 側 sentinel，但 Manager 側的記帳 shell 等的是整個 unit
-      （``systemctl start --wait``），bundle 同樣先完成。
+      回收。因此 publication 與 gate ledger 都必須在 sentinel **之前**完成；降權模式
+      沒有 job 側 sentinel，但 Manager 側記帳 shell 等的是整個 unit
+      （``systemctl start --wait``），bundle 與 gate 同樣先完成。
     - **exit code 不得被污染**——降權模式下 unit 的 exit code 就是這支 script 的
       exit code，而 Manager 的記帳 shell 記的正是它（#604）。多接一段 bundle 之後
       若不還原 ``$?``，模型明明失敗卻會被記成成功（或反過來）。
@@ -186,8 +186,8 @@ def build_wrapper_script(
     verdict 通道就不成立。與 bundle 段的 ``chmod`` 是**同一個修法的兩個實例**
     （共用 :data:`spool_slot.PUBLISHED_FILE_MODE`），差別只在 bundle 的 producer
     是 Manager 組出來的 ``git`` 命令、verdict 的 producer 是模型本身——模型不會
-    自己 chmod，所以那一步必須由 wrapper 在它結束後補上。段序同樣排在 sentinel
-    **之前**，理由與 bundle 一致。
+    自己 chmod，所以那一步必須由 wrapper 在它結束後補上。段序同樣排在 gate 與
+    sentinel **之前**。
 
     ``last_message_path``（#714 repair）：Codex 的 ``-o`` 可能以 temp+rename
     發表，最後的檔案因此由 job UID 擁有、`UMask=0077` 下 Manager 讀不到。wrapper
@@ -195,8 +195,8 @@ def build_wrapper_script(
     放在 publication 之後；它不是 gate/evidence，Manager 不以其 owner 或內容作為
     completion authority。檔案不存在時 publication 是靜默 no-op。
 
-    三個 publication 參數皆為 None 時（planner，以及所有既有測試路徑）script
-    **逐字**與改動前相同。
+    三個 publication 參數皆為 None 時，wrapper 仍依序保存 exit code、執行 gate、寫入
+    sentinel，最後還原模型 exit code。
 
     ``write_sentinel=False`` / ``run_gates=False``（#604，降權模式）：這支 script
     在降權模式下是以 **job 帳號**（`cortex-builder`）執行的，而 sentinel 與 ledger
@@ -264,29 +264,22 @@ def build_wrapper_script(
             verdict_file=verdict_file,
             last_message_path=last_message_path,
         )
+    if run_gates and repo_root:
+        segments = [
+            command,
+            f"{_RC_VAR}=$?",
+            _gate_segment(ledger=ledger, worktree=worktree, repo_root=repo_root),
+        ]
+        if write_sentinel:
+            segments.append(f'printf %s "${_RC_VAR}" > {shlex.quote(sentinel)}')
+        segments.append(f'exit "${_RC_VAR}"')
+        return "; ".join(segments)
     if write_sentinel:
-        script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
-    else:
-        script = command
-    if not run_gates or not repo_root:
-        return script
-    gate_argv = [
-        "python3",
-        "-m",
-        "paulsha_cortex.coordinator.gate_ledger",
-        "--out",
-        ledger,
-        "--worktree",
-        worktree,
-    ]
-    # PYTHONPATH 指向 repo root，讓 wrapper 在 worktree cwd 下仍能 import 套件。
-    return (
-        f"{script}; PYTHONPATH={shlex.quote(repo_root)} "
-        f"{shlex.join(gate_argv)} >/dev/null 2>&1"
-    )
+        return f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
+    return command
 
 
-#: 存放模型 exit code 的 shell 變數名（#623 的 bundle 段用）。刻意帶 `__psc_` 前綴，
+#: wrapper 保存模型 exit code 的 shell 變數名。刻意帶 `__psc_` 前綴，
 #: 不與模型或 gate 階段可能設定的任何變數撞名。
 _RC_VAR = "__psc_rc"
 
@@ -322,10 +315,10 @@ def _publishing_wrapper_script(
     """帶「成果發表」段的 wrapper。
 
     段序＝模型 → 存 `$?` → bundle（#623）→ verdict 放寬（#638）→ last-message
-    publication（#714）→ sentinel → gate → 還原 `$?`。
+    publication（#714）→ gate → sentinel → 還原 `$?`。
 
-    兩個發表段都排在 sentinel **之前**：sentinel 一出現，Manager 隨時可能在下一個
-    tick 判定完成並開始收割，成果必須先落地且已經是 consumer 讀得到的形狀。
+    發表段與 gate 都排在 sentinel **之前**：sentinel 一出現，Manager 隨時可能在下一個
+    tick 判定完成並開始收割；此時成果與 gate ledger 都已完成。
 
     為什麼 bundle 段用 `git` 而不是像 gate 那樣呼叫一個 python module：降權模式下
     builder 看到的是白名單 env、且它未必讀得到 Manager 的 repo root
@@ -343,10 +336,10 @@ def _publishing_wrapper_script(
         segments.append(spool_slot.publish_file_command(verdict_file))
     if last_message_path is not None:
         segments.append(spool_slot.publish_file_command(last_message_path))
-    if write_sentinel:
-        segments.append(f'printf %s "${_RC_VAR}" > {shlex.quote(sentinel)}')
     if run_gates and repo_root:
         segments.append(_gate_segment(ledger=ledger, worktree=worktree, repo_root=repo_root))
+    if write_sentinel:
+        segments.append(f'printf %s "${_RC_VAR}" > {shlex.quote(sentinel)}')
     segments.append(f'exit "${_RC_VAR}"')
     return "; ".join(segments)
 

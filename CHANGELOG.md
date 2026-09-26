@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#564 gate ledger 與 completion sentinel 競態**：plain 與 publishing wrapper 都先保存模型 exit code，gate ledger writer 返回後才寫 sentinel，避免 harvest 在 gate 執行期間因 ledger 尚未落地而誤判終局；結束時仍還原模型 exit code，缺少 ledger 時維持 fail-closed。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加

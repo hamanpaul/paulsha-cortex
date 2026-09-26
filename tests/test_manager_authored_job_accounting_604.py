@@ -551,7 +551,10 @@ class DirectModeZeroRegressionTests(unittest.TestCase):
             repo_root="/repo",
             run_gates=True,
         )
-        self.assertIn('printf %s "$?" > /tmp/s.exit', script)
+        sentinel_write = 'printf %s "$__psc_rc" > /tmp/s.exit'
+        self.assertIn(sentinel_write, script)
+        self.assertLess(script.index("gate_ledger"), script.index(sentinel_write))
+        self.assertTrue(script.endswith('exit "$__psc_rc"'))
         self.assertIn("paulsha_cortex.coordinator.gate_ledger", script)
 
     def test_write_sentinel_false_removes_only_that_segment(self) -> None:
