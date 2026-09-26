@@ -2204,6 +2204,11 @@ class JobRegistry:
         finally:
             os.close(fd)
 
+    def _temp_file_prefix(self) -> str:
+        """本 registry 專屬的暫存檔前綴，讓啟動 sweep 不會誤刪同目錄其他 registry 的檔案。"""
+
+        return f".{self._state_path.name}."
+
     def _sweep_stale_temp_files(
         self,
         *,
@@ -2225,8 +2230,10 @@ class JobRegistry:
                 except OSError:
                     return []
                 for path in entries:
+                    # 只清本 registry 前綴的暫存檔；同目錄其他 registry 的暫存檔
+                    # 不受本 registry 的 transaction lock 保護，一律不碰。
                     if not (
-                        path.name.startswith("tmp")
+                        path.name.startswith(self._temp_file_prefix())
                         and path.name.endswith((".tmp", ".backup.tmp", ".rollback.bak"))
                     ):
                         continue
@@ -2465,7 +2472,9 @@ class JobRegistry:
         digest = hashlib.sha256(original).hexdigest()
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup = directory / f"{self._state_path.name}.v1.{timestamp}.{digest}.bak"
-        fd, tmp_name = tempfile.mkstemp(dir=str(directory), suffix=".backup.tmp")
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(directory), prefix=self._temp_file_prefix(), suffix=".backup.tmp"
+        )
         tmp = Path(tmp_name)
         try:
             with os.fdopen(fd, "wb") as handle:
@@ -2494,7 +2503,9 @@ class JobRegistry:
         previous_raw_bytes = self._pending_previous_raw_bytes
         directory = self._state_path.parent
         directory.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=str(directory), suffix=".tmp")
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(directory), prefix=self._temp_file_prefix(), suffix=".tmp"
+        )
         tmp = Path(tmp_name)
         backup: Path | None = None
         had_original = previous_raw_bytes is not None
@@ -2506,7 +2517,9 @@ class JobRegistry:
                 os.fsync(handle.fileno())
             if had_original:
                 backup_fd, backup_name = tempfile.mkstemp(
-                    dir=str(directory), suffix=".rollback.bak"
+                    dir=str(directory),
+                    prefix=self._temp_file_prefix(),
+                    suffix=".rollback.bak",
                 )
                 backup = Path(backup_name)
                 os.close(backup_fd)
@@ -4330,7 +4343,9 @@ class JobRegistry:
         slice_row["candidate"] = None
         slice_row["binding_revision"] = next_binding_revision
         applied_binding = _slice_binding_from_row(slice_row)
-        slice_row["actions"].append(
+        self._append_bounded_history(
+            slice_row,
+            "actions",
             {
                 "action": "recover-pre-candidate",
                 "actor": normalized_request["payload"]["actor"],
@@ -4339,7 +4354,7 @@ class JobRegistry:
                 "requested_at": normalized_request["payload"]["created_at"],
                 "at": completed_at,
                 "result": "recovery-complete",
-            }
+            },
         )
         slice_row["updated_at"] = completed_at
         completed_receipt = self._build_recovery_receipt(

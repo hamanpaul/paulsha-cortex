@@ -66,8 +66,8 @@ def test_persist_skips_identical_bytes_without_creating_temp_files(
     after = state_path.stat()
     assert mkstemp_calls == 0
     assert (after.st_mtime_ns, after.st_ino) == (before.st_mtime_ns, before.st_ino)
-    assert list(tmp_path.glob("tmp*.tmp")) == []
-    assert list(tmp_path.glob("tmp*.rollback.bak")) == []
+    assert list(tmp_path.glob(".jobs.json.*.tmp")) == []
+    assert list(tmp_path.glob(".jobs.json.*.rollback.bak")) == []
 
 
 def test_rollback_snapshot_uses_hardlink_and_restores_after_replace_fault(
@@ -105,8 +105,8 @@ def test_rollback_snapshot_uses_hardlink_and_restores_after_replace_fault(
     assert link_calls[0][0] == state_path
     assert state_path.read_bytes() == before
     assert registry._seq == 0
-    assert list(tmp_path.glob("tmp*.tmp")) == []
-    assert list(tmp_path.glob("tmp*.rollback.bak")) == []
+    assert list(tmp_path.glob(".jobs.json.*.tmp")) == []
+    assert list(tmp_path.glob(".jobs.json.*.rollback.bak")) == []
 
 
 @pytest.mark.parametrize("link_error", [errno.EPERM, errno.EXDEV])
@@ -131,8 +131,8 @@ def test_hardlink_error_falls_back_to_copy_and_persists(
 
     assert link_calls == 1
     assert json.loads(state_path.read_bytes())["seq"] == 1
-    assert list(tmp_path.glob("tmp*.tmp")) == []
-    assert list(tmp_path.glob("tmp*.rollback.bak")) == []
+    assert list(tmp_path.glob(".jobs.json.*.tmp")) == []
+    assert list(tmp_path.glob(".jobs.json.*.rollback.bak")) == []
 
 
 def test_hardlink_fallback_copy_can_restore_after_replace_fault(
@@ -165,8 +165,8 @@ def test_hardlink_fallback_copy_can_restore_after_replace_fault(
 
     assert state_path.read_bytes() == before
     assert registry._seq == 0
-    assert list(tmp_path.glob("tmp*.tmp")) == []
-    assert list(tmp_path.glob("tmp*.rollback.bak")) == []
+    assert list(tmp_path.glob(".jobs.json.*.tmp")) == []
+    assert list(tmp_path.glob(".jobs.json.*.rollback.bak")) == []
 
 
 def test_record_action_bounds_evidence_evaluation_and_action_history(
@@ -339,21 +339,23 @@ def test_startup_sweeps_only_old_registry_temp_files(tmp_path: Path) -> None:
     original_state = state_path.read_bytes()
     old_time = time.time() - 120
 
-    stale_tmp = tmp_path / "tmpAAAA.tmp"
-    stale_rollback = tmp_path / "tmpBBBB.rollback.bak"
-    stale_backup_tmp = tmp_path / "tmpCCCC.backup.tmp"
-    recent_tmp = tmp_path / "tmpRecent.tmp"
+    stale_tmp = tmp_path / ".jobs.json.AAAA.tmp"
+    stale_rollback = tmp_path / ".jobs.json.BBBB.rollback.bak"
+    stale_backup_tmp = tmp_path / ".jobs.json.CCCC.backup.tmp"
+    recent_tmp = tmp_path / ".jobs.json.Recent.tmp"
+    foreign_tmp = tmp_path / ".other-registry.json.DDDD.tmp"
+    legacy_generic_tmp = tmp_path / "tmpEEEE.tmp"
     manual_backup = tmp_path / "jobs.json.bak-manual"
     v1_backup = tmp_path / "jobs.json.v1.20260101T000000000000Z.deadbeef.bak"
-    temp_directory = tmp_path / "tmpDirectory.tmp"
-    for path in (stale_tmp, stale_rollback, stale_backup_tmp, recent_tmp, manual_backup, v1_backup):
+    temp_directory = tmp_path / ".jobs.json.Directory.tmp"
+    for path in (stale_tmp, stale_rollback, stale_backup_tmp, recent_tmp, manual_backup, v1_backup, foreign_tmp, legacy_generic_tmp):
         path.write_text("temporary", encoding="utf-8")
-    for path in (stale_tmp, stale_rollback, stale_backup_tmp, manual_backup, v1_backup):
+    for path in (stale_tmp, stale_rollback, stale_backup_tmp, manual_backup, v1_backup, foreign_tmp, legacy_generic_tmp):
         os.utime(path, (old_time, old_time))
     recent_time = time.time()
     os.utime(recent_tmp, (recent_time, recent_time))
     temp_directory.mkdir()
-    symlink = tmp_path / "tmpSymlink.tmp"
+    symlink = tmp_path / ".jobs.json.Symlink.tmp"
     symlink.symlink_to(state_path)
 
     JobRegistry(state_path=state_path)
@@ -364,6 +366,9 @@ def test_startup_sweeps_only_old_registry_temp_files(tmp_path: Path) -> None:
     assert recent_tmp.exists()
     assert manual_backup.exists()
     assert v1_backup.exists()
+    # 同目錄其他 registry 或無前綴的暫存檔不受本 registry lock 保護，不得刪除。
+    assert foreign_tmp.exists()
+    assert legacy_generic_tmp.exists()
     assert temp_directory.is_dir()
     assert symlink.is_symlink()
     assert state_path.read_bytes() == original_state
@@ -377,7 +382,7 @@ def test_startup_sweep_rejects_short_grace_and_preserves_younger_files(
         JobRegistry(state_path=state_path, sweep_grace_seconds=10)
 
     tmp_path.mkdir(exist_ok=True)
-    recent_for_long_grace = tmp_path / "tmpGrace.tmp"
+    recent_for_long_grace = tmp_path / ".jobs.json.Grace.tmp"
     recent_for_long_grace.write_text("temporary", encoding="utf-8")
     os.utime(recent_for_long_grace, (time.time() - 120, time.time() - 120))
     JobRegistry(state_path=state_path, sweep_grace_seconds=600)
