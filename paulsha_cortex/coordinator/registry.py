@@ -6091,6 +6091,7 @@ class JobRegistry:
         self,
         run_id: str,
         *,
+        expected_run: WorkflowRun,
         authority_digest: str,
     ) -> WorkflowRun:
         """Atomically invalidate stale verify/review gates after a bound WorkAuthority
@@ -6115,9 +6116,15 @@ class JobRegistry:
 
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
-        if current.status != "ongoing" or current.current_phase not in {"verify", "review"}:
+        if current != expected_run:
+            raise ValueError("authority-restart snapshot mismatch")
+        if current.status != "ongoing" or current.current_phase not in {
+            "verify",
+            "review",
+            "ship",
+        }:
             raise ValueError(
-                "authority-restart reset requires ongoing verify/review workflow"
+                "authority-restart reset requires ongoing verify/review/ship workflow"
             )
         if (
             not isinstance(authority_digest, str)

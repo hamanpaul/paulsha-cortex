@@ -2227,6 +2227,334 @@ def test_resume_restarts_exactly_once_for_a_real_authority_change(
     assert settled.gate_refs == reset.gate_refs
 
 
+def test_auto_scan_does_not_restart_existing_candidate_pr_after_authority_change(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        prs=(8,),
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    before = _seed_verified_run_with_gate(
+        registry,
+        run_id,
+        phase="review",
+        pr_refs=("acme/demo#8",),
+    )
+    _snapshot(
+        snapshot,
+        prs=(8,),
+        source_revisions=("issue:12@closed", "openspec:demo@1"),
+        provider_revision="gh-2",
+    )
+    jobs_before = registry.list_jobs()
+
+    results = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        runner=lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"labels": [{"name": "cortex:auto-on-going"}]}),
+            stderr="",
+        ),
+        workflow_registry=registry,
+    )
+
+    after = registry.get_workflow_run(run_id)
+    assert results[0]["action"] == "blocked"
+    assert results[0]["reason"] == "candidate-recovery-requires-explicit-resume"
+    assert after == before
+    assert registry.list_workflow_runs() == [before]
+    assert registry.list_jobs() == jobs_before
+
+
+_EXISTING_CANDIDATE_REPO = "acme/demo"
+_EXISTING_CANDIDATE_RUN_ID = "workflow-52d048b72adbd5cae06f"
+_EXISTING_CANDIDATE_HEAD = "7ba7e877c94ff4eee72ba796ea9f8962953ed5cc"
+_EXISTING_CANDIDATE_PR = 1049
+
+
+def _prepare_existing_candidate_recovery(tmp_path: Path):
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        prs=(_EXISTING_CANDIDATE_PR,),
+        source_revisions=("issue:12@open", "openspec:demo@1"),
+    )
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["work_items"][0]["repo"] = _EXISTING_CANDIDATE_REPO
+    payload["work_items"][0]["work_id"] = "demo"
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    state = tmp_path / "delivery-journal.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={
+            "action": "start",
+            "repo": _EXISTING_CANDIDATE_REPO,
+            "work_id": "demo",
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    generated_id = started["result"]["run"]["run_id"]
+    generated = registry.get_workflow_run(generated_id)
+    fixture_run = replace(generated, run_id=_EXISTING_CANDIDATE_RUN_ID)
+    registry._workflows[registry._find_workflow_run_index(generated_id)] = fixture_run
+    registry._persist()
+    reviewed = _seed_verified_run_with_gate(
+        registry,
+        _EXISTING_CANDIDATE_RUN_ID,
+        phase="review",
+        pr_refs=(f"{_EXISTING_CANDIDATE_REPO}#{_EXISTING_CANDIDATE_PR}",),
+    )
+    passed_steps = tuple(
+        replace(
+            step,
+            gate_result="passed",
+            domain=(
+                "recovery-builder"
+                if step.phase == "build"
+                else "recovery-reviewer"
+                if step.phase in {"verify", "review"}
+                else step.domain
+            ),
+        )
+        if step.phase in {"build", "verify", "review", "ship"}
+        else step
+        for step in reviewed.steps
+    )
+    before = registry._manager_update_workflow_run(
+        reviewed.run_id,
+        current_phase="ship",
+        steps=passed_steps,
+        gate_refs=(
+            *reviewed.gate_refs,
+            GateEvidenceRef("copilot", "/evidence/copilot.json", "d" * 64),
+        ),
+        candidate_head=_EXISTING_CANDIDATE_HEAD,
+        verified_head=_EXISTING_CANDIDATE_HEAD,
+    )
+    old_authority = work_actions.load_work_authority(
+        repo=_EXISTING_CANDIDATE_REPO,
+        work_id="demo",
+        snapshot_path=snapshot,
+    )
+    journal = work_actions._load_runs(state)
+    row = work_actions._delivery_journal_row(before, old_authority)
+    row["ship"] = {
+        "phase": "needs_human",
+        "reason": "multiple-delivery-targets-unsupported",
+        "head": _EXISTING_CANDIDATE_HEAD,
+        "pr_number": _EXISTING_CANDIDATE_PR,
+    }
+    journal["runs"][before.run_id] = row
+    work_actions._save_runs(state, journal)
+
+    _snapshot(
+        snapshot,
+        prs=(_EXISTING_CANDIDATE_PR,),
+        source_revisions=("issue:12@closed", "openspec:demo@1", "todo:docs/todo.md@1"),
+        provider_revision="gh-2",
+    )
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["work_items"][0]["repo"] = _EXISTING_CANDIDATE_REPO
+    payload["work_items"][0]["work_id"] = "demo"
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    return snapshot, state, registry, before
+
+
+def _candidate_pr_read_runner(*, head: str, state: str = "open"):
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        assert argv[:2] == ["gh", "api"]
+        assert argv[2] == (
+            f"repos/{_EXISTING_CANDIDATE_REPO}/pulls/{_EXISTING_CANDIDATE_PR}"
+        )
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {"state": state, "head": {"sha": head}, "merged_at": None}
+            ),
+            stderr="",
+        )
+
+    return runner, calls
+
+
+def test_explicit_resume_restarts_same_candidate_and_pr_after_fresh_authority(
+    tmp_path: Path,
+) -> None:
+    snapshot, state, registry, before = _prepare_existing_candidate_recovery(tmp_path)
+    journal_before = work_actions._load_runs(state)
+    runner, reads = _candidate_pr_read_runner(head=_EXISTING_CANDIDATE_HEAD)
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": _EXISTING_CANDIDATE_REPO, "work_id": "demo"},
+        requested_by="operator",
+        runner=runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+        workflow_starter=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("recovery must only re-enter verify/review")
+        ),
+    )
+
+    after = registry.get_workflow_run(before.run_id)
+    assert result["result"]["action"] == "resume"
+    assert after.current_phase == "verify"
+    assert after.status == "ongoing"
+    assert after.candidate_head == before.candidate_head
+    assert after.pr_refs == before.pr_refs
+    assert after.verified_head is None
+    assert after.steps[0].gate_result == "passed"
+    assert all(
+        step.gate_result == "pending"
+        for step in after.steps
+        if step.phase in {"verify", "review"}
+    )
+    assert after.attempts["build"] == before.attempts["build"]
+    assert after.attempts["verify"] == before.attempts["verify"] + 1
+    journal_after = work_actions._load_runs(state)
+    assert journal_after["revision"] == journal_before["revision"]
+    assert journal_after["runs"][before.run_id] == journal_before["runs"][before.run_id]
+    assert len(reads) == 4
+
+
+def test_explicit_resume_fails_closed_when_existing_pr_head_differs(
+    tmp_path: Path,
+) -> None:
+    snapshot, state, registry, before = _prepare_existing_candidate_recovery(tmp_path)
+    journal_before = work_actions._load_runs(state)
+    runner, reads = _candidate_pr_read_runner(head="f" * 40)
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": _EXISTING_CANDIDATE_REPO, "work_id": "demo"},
+        requested_by="operator",
+        runner=runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["action"] == "blocked"
+    assert result["result"]["reason"] == "existing-pr-head-mismatch"
+    assert registry.get_workflow_run(before.run_id) == before
+    journal_after = work_actions._load_runs(state)
+    assert journal_after["revision"] == journal_before["revision"]
+    assert journal_after["runs"][before.run_id] == journal_before["runs"][before.run_id]
+    assert len(reads) == 2
+
+
+def test_explicit_resume_does_not_reset_existing_candidate_with_active_job(
+    tmp_path: Path,
+) -> None:
+    snapshot, state, registry, before = _prepare_existing_candidate_recovery(tmp_path)
+    job = registry.create_job(
+        task="recovery-active-job",
+        persona="reviewer",
+        kind="review",
+        branch="feature/recovery",
+        pane="",
+        worktree=before.workspace_root,
+        workflow_run_id=before.run_id,
+        workflow_claim_key=before.claim_key,
+        workflow_repo=before.repo,
+        workflow_card="review",
+        workflow_phase="review",
+        workflow_repo_root=before.workspace_root,
+        source_revision=before.source_revision,
+    )
+    runner, reads = _candidate_pr_read_runner(head=_EXISTING_CANDIDATE_HEAD)
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": _EXISTING_CANDIDATE_REPO, "work_id": "demo"},
+        requested_by="operator",
+        runner=runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["action"] == "blocked"
+    assert result["result"]["reason"] == "existing-candidate-active-job"
+    assert registry.get_workflow_run(before.run_id) == before
+    assert registry.get_job(job["job_id"])["status"] == "dispatched"
+    assert reads == []
+
+
+def test_existing_candidate_recovery_rebases_same_delivery_journal_row_once(
+    tmp_path: Path,
+) -> None:
+    from paulsha_cortex.coordinator import work_bridge
+
+    snapshot, state, registry, before = _prepare_existing_candidate_recovery(tmp_path)
+    journal_before = work_actions._load_runs(state)
+    runner, _reads = _candidate_pr_read_runner(head=_EXISTING_CANDIDATE_HEAD)
+    work_actions.execute_work_action(
+        args={"action": "resume", "repo": _EXISTING_CANDIDATE_REPO, "work_id": "demo"},
+        requested_by="operator",
+        runner=runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+    recovered = registry.get_workflow_run(before.run_id)
+    authority = work_actions.load_work_authority(
+        repo=_EXISTING_CANDIDATE_REPO,
+        work_id="demo",
+        snapshot_path=snapshot,
+    )
+
+    work_bridge._rebase_delivery_journal_authority(
+        state_root=state.parent,
+        run=recovered,
+        authority=authority,
+    )
+    first_readback = work_actions._load_runs(state)
+    work_bridge._rebase_delivery_journal_authority(
+        state_root=state.parent,
+        run=recovered,
+        authority=authority,
+    )
+    second_readback = work_actions._load_runs(state)
+
+    assert recovered.run_id == _EXISTING_CANDIDATE_RUN_ID
+    assert len(first_readback["runs"]) == 1
+    row = first_readback["runs"][recovered.run_id]
+    assert row["claim_key"] == recovered.claim_key
+    assert row["authority_digest"] == work_actions.work_authority_digest(authority)
+    assert row["source_revisions"] == list(authority.source_revisions)
+    assert row["mapped_prs"] == [_EXISTING_CANDIDATE_PR]
+    assert row["ship"]["head"] == _EXISTING_CANDIDATE_HEAD
+    assert row["ship"]["pr_number"] == _EXISTING_CANDIDATE_PR
+    assert row.get("publication_events", {}) == journal_before["runs"][recovered.run_id].get(
+        "publication_events", {}
+    )
+    assert second_readback["revision"] == first_readback["revision"]
+    assert second_readback["runs"] == first_readback["runs"]
+
+
 def test_resume_does_not_exempt_foreign_planning_source_by_prefix(
     tmp_path: Path,
 ) -> None:
@@ -4826,3 +5154,37 @@ def test_review_disposition_refuses_when_cortex_review_gate_not_passed(tmp_path:
             now=lambda: 209,
             workflow_registry=registry,
         )
+
+
+@pytest.mark.parametrize(
+    "ship_state",
+    [
+        {"phase": "merge-authorized", "merge_authorization": {"ref": "auth.json", "hash": "a" * 64}},
+        {"phase": "review-requested", "merge_authorization": {"ref": "auth.json", "hash": "a" * 64}},
+        {"phase": "merged"},
+    ],
+)
+def test_explicit_resume_does_not_reset_existing_candidate_after_merge_authorization(
+    tmp_path: Path, ship_state: dict
+) -> None:
+    """merge 已授權或已進入 merge 的交付，中止後 resume 不得把 run 退回 verify。"""
+    snapshot, state, registry, before = _prepare_existing_candidate_recovery(tmp_path)
+    journal = work_actions._load_runs(state)
+    row = journal["runs"][before.run_id]
+    row["ship"] = {**(row.get("ship") or {}), **ship_state}
+    work_actions._save_runs(state, journal)
+    runner, reads = _candidate_pr_read_runner(head=_EXISTING_CANDIDATE_HEAD)
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": _EXISTING_CANDIDATE_REPO, "work_id": "demo"},
+        requested_by="operator",
+        runner=runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["action"] == "blocked"
+    assert result["result"]["reason"] == "existing-candidate-merge-authorized"
+    assert registry.get_workflow_run(before.run_id) == before
