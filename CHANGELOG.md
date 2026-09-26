@@ -637,6 +637,7 @@
 - **#817 building invariant 與單筆 supersede**：complete/status 會將沒有目前綁定 in-flight builder job 的 `building` slice reconcile 為帶 `DiagnosticReason` 的 `needs_human`；新增需 actor、reason 與 exact `binding_revision` CAS 的單筆 `supersede`，保留 slice/audit 並使其離開 attention，相同 CAS 重送冪等，不支援 bulk closure 或 diagnosis intent。
 - **#864 driving-cortex skill 入口**：修正 start 範例為現行 `cortex run work start` 命令，並在 README 記錄從 repo 內 canonical `skills/driving-cortex` 建立 `$HOME/.agents/skills/driving-cortex` symlink 的安裝步驟。
 - **#933 AGY provider attempt 錯誤呈現**：`status` 與 `jobs` 投影在 Manager 已採信 verification 結果時，改顯示 `verified` 並附上 recovered provider error 註記；缺少採信結果時維持原狀。
+- **#473 Deck spec repo 宣告**：`cortex deck compile --repo owner/name` 會將明示的 repo 寫入輸出 spec；未指定時維持 `repo: null`，不從本機路徑或 git remote 推斷。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
