@@ -10237,7 +10237,7 @@ def _publish_planning_artifacts(
         openspec_bound = (
             len(relative.parts) >= 4
             and relative.parts[:2] == ("openspec", "changes")
-            and relative.parts[2] == work_id
+            and relative.parts[2] in {work_id, *anchor_slugs}
             and relative.parts[2] != "archive"
         )
         manifest_bound = any(fnmatch.fnmatch(path_value, pattern) for pattern in allowed_refs)
@@ -11163,7 +11163,9 @@ _OPERATOR_ADJUDICATION_PREAMBLE = (
     " The operator_adjudications block of the contract below reproduces rulings the human "
     "operator issued through the Manager's bounded CLI (source operator-adjudication); "
     "builder, verification and review cards all read the same evidence. Those rulings are "
-    "authoritative and outrank model-generated findings; do not re-litigate them."
+    "authoritative within the actor, card and preconditions they state; check applicability "
+    "against the current candidate and Manager-recorded actions before applying them. "
+    "Within that scope they outrank model-generated findings; do not re-litigate them."
 )
 # builder 卡：裁決是要實作的指令。
 OPERATOR_ADJUDICATION_DIRECTIVE = _OPERATOR_ADJUDICATION_PREAMBLE + (
@@ -11189,6 +11191,14 @@ OPERATOR_ADJUDICATION_REVIEWER_DIRECTIVE = _OPERATOR_ADJUDICATION_PREAMBLE + (
         )
     )
     + ") and cite the ruling in its recommendation."
+) + (
+    " First check each ruling's applicability and preconditions against the current candidate, "
+    "its commit history and Manager-recorded actions. A ruling about Builder actions does not "
+    "make Manager-owned actions (including openspec-archive) a Builder violation; if scope or "
+    "attribution is no longer supported, request operator re-adjudication instead of reporting "
+    "a blocking candidate finding. For every test or policy gate result, cite current "
+    "Manager-supplied gate evidence; when the contract has no matching result, say `not measured` "
+    "and do not claim that gate passed or failed."
 )
 RETRY_CONTEXT_MESSAGE_LIMIT = 600
 
