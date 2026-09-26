@@ -10,13 +10,14 @@
 2. 產出與回收——builder 在自己的 clone 產 bundle，Manager 從那個**檔案** fetch
 3. **不變式**——回收全程不存取 builder 的 clone（本次變更的全部價值）
 4. fail-closed——bundle 缺席／不完整／帶錯 branch／非 fast-forward，訊息可操作
-5. wrapper 與 `direct` 模式零回歸——段序、exit code、無 bundle 時逐字不變
+5. wrapper 與 `direct` 模式零回歸——段序與 exit code
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -511,15 +512,15 @@ def _wrapper(**overrides: object) -> str:
     return launcher.build_wrapper_script(**kwargs)  # type: ignore[arg-type]
 
 
-def test_wrapper_without_a_bundle_is_byte_identical_to_the_previous_shape() -> None:
-    """`commit_bundle=None`（reviewer／planner）＝改動前逐字相同。"""
+def test_wrapper_without_a_bundle_runs_gate_before_sentinel() -> None:
+    """沒有發表段時，gate 完成後才寫 sentinel，並還原模型 exit code。"""
 
     assert _wrapper() == (
-        "true; "
-        'printf %s "$?" > /tmp/psc-nonexistent/s.exit; '
+        "true; __psc_rc=$?; "
         "PYTHONPATH=/tmp/psc-nonexistent/repo python3 -m paulsha_cortex.coordinator.gate_ledger "
         "--out /tmp/psc-nonexistent/s.gates.json --worktree /tmp/psc-nonexistent/wt "
-        ">/dev/null 2>&1"
+        '>/dev/null 2>&1; printf %s "$__psc_rc" > /tmp/psc-nonexistent/s.exit; '
+        'exit "$__psc_rc"'
     )
 
 
@@ -529,8 +530,88 @@ def test_wrapper_puts_the_bundle_before_the_sentinel() -> None:
     script = _wrapper(commit_bundle="/spool/k/commits.bundle")
 
     assert script.index("bundle create") < script.index("s.exit")
-    # gate 排在 sentinel 之後（#261 的既有順序不變）
-    assert script.index("s.exit") < script.index("gate_ledger")
+    assert script.index("bundle create") < script.index("gate_ledger")
+    assert script.index("gate_ledger") < script.index("s.exit")
+
+
+@pytest.mark.parametrize("publishing", [False, True], ids=["plain", "publishing"])
+def test_wrapper_sentinel_is_absent_while_gates_are_running(
+    tmp_path: Path, publishing: bool
+) -> None:
+    """gate 執行中的 harvest 不會看到 completion sentinel。"""
+
+    gate_dir = tmp_path / "gate-probe"
+    bin_dir = gate_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    sentinel = gate_dir / "job.exit"
+    gate_started = gate_dir / "gate-started"
+    gate_release = gate_dir / "gate-release"
+    fake_python = bin_dir / "python3"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" != "-m" ] || [ "$2" != "paulsha_cortex.coordinator.gate_ledger" ]; then\n'
+        "  exit 92\n"
+        "fi\n"
+        'if [ -e "$PSC_TEST_SENTINEL" ]; then printf present > "$PSC_TEST_GATE_STARTED"; '
+        'else printf absent > "$PSC_TEST_GATE_STARTED"; fi\n'
+        'while [ ! -e "$PSC_TEST_GATE_RELEASE" ]; do sleep 0.01; done\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    if publishing:
+        repo = _source_repo(tmp_path)
+        workspace = _workspace(repo, tmp_path / "pool")
+        bundle = _dispatch(tmp_path)
+        (workspace / "model.txt").write_text("from the model\n", encoding="utf-8")
+        model = "git add -A && git commit -qm 'builder: model output' && exit 7"
+        repo_root: str | None = str(repo)
+    else:
+        workspace = tmp_path
+        bundle = None
+        model = "exit 7"
+        repo_root = str(tmp_path)
+
+    wrapper_options: dict[str, object] = {
+        "inner_argv": ["bash", "-c", model],
+        "sentinel": str(sentinel),
+        "ledger": str(gate_dir / "job.gates.json"),
+        "worktree": str(workspace),
+        "repo_root": repo_root,
+        "run_gates": True,
+    }
+    if bundle is not None:
+        wrapper_options["commit_bundle"] = str(bundle)
+    script = launcher.build_wrapper_script(**wrapper_options)  # type: ignore[arg-type]
+    environment = {
+        **os.environ,
+        "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+        "PSC_TEST_SENTINEL": str(sentinel),
+        "PSC_TEST_GATE_STARTED": str(gate_started),
+        "PSC_TEST_GATE_RELEASE": str(gate_release),
+    }
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        cwd=str(workspace),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not gate_started.exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert gate_started.is_file(), "gate 未在期限內開始"
+        assert gate_started.read_text(encoding="utf-8") == "absent"
+        assert not sentinel.exists()
+    finally:
+        gate_release.touch()
+        stdout, stderr = proc.communicate(timeout=5)
+
+    assert proc.returncode == 7, stderr or stdout
+    assert sentinel.read_text(encoding="utf-8") == "7"
 
 
 def test_wrapper_preserves_the_model_exit_code_across_the_bundle_step(
