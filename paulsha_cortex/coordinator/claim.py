@@ -1188,6 +1188,9 @@ class ClaimCandidate:
     active_phase: str | None = None
     active_planning_failure_classification: str | None = None
     active_planning_failure_reason: str | None = None
+    # 讀取端從 canonical job／owner slice 摘要導出的可受理復原動作；claim 與
+    # status/list 共用同一份投影，不在純決策層重新猜測 job 狀態。
+    active_recovery_actions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1259,6 +1262,16 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
         and candidate.active_planning_failure_reason is not None
     ):
         raise ValueError("planning failure reason requires its classification")
+    if (
+        not isinstance(candidate.active_recovery_actions, tuple)
+        or any(
+            not isinstance(action, str) or not action
+            for action in candidate.active_recovery_actions
+        )
+    ):
+        raise ValueError("active recovery actions must be a tuple of non-empty strings")
+    if candidate.active_run_id is None and candidate.active_recovery_actions:
+        raise ValueError("active recovery actions require an active workflow")
     if candidate.active_run_id is not None:
         if not isinstance(candidate.active_run_id, str) or not candidate.active_run_id.strip():
             raise ValueError("active_run_id must be a non-empty string")
@@ -1608,6 +1621,7 @@ def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
             active_source_revisions=None,
             active_provider_revision=None,
             active_authority_digest=None,
+            active_recovery_actions=(),
         )
     )
     if candidate.active_claim_key != expected_key:
@@ -1619,17 +1633,16 @@ def needs_human_next_actions(
     *,
     phase: str | None,
     planning_failure_classification: str | None,
+    job_recovery_actions: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """`needs_human` run 的基礎合法動作集合——**單一導出點，回傳值永不為空**。
 
-    #256 R2 的判準原本只長在 `_resume_decision` 裡；`cortex status` 的 attention
-    投影（`manager.workflow_status_entry`）另走 `work_actions.
-    _phase_recovery_actions` 一條，而後者只涵蓋 build／verify／review 三個 phase
-    （`registry.RETRY_CARD_PHASE_PERSONA`）。兩份導出漂移的後果就是 #728 的現場：
-    `plan` phase 的 needs_human run（`planning-authority-reconciliation-failed`）
-    拿到 `next_actions: []`——fail-closed 可以，**無出路不行**。
+    #256 R2 的基礎判準原本只長在 `_resume_decision` 裡；`cortex status` 的 attention
+    與 Monitor work list 另有投影，曾造成 #728 的 `plan` phase `needs_human` run
+    拿到空的 `next_actions`。現在 `ClaimCandidate` 帶入從 canonical job／owner
+    slice admission 導出的動作，claim、status、list 共用本函式合併基礎與 job 動作。
 
-    判準本身不變，只是被抬成兩側共用的函式：
+    基礎判準維持不變：
 
     - `abandon` **永遠**合法（#256 R3：釋放後可重 claim），因此本函式不可能回空
       集合；這就是「至少給得出一個合法動作」的機械保證。
@@ -1639,9 +1652,12 @@ def needs_human_next_actions(
       拒收）同一組條件——宣告一個保證失敗的動作比不宣告更糟（#382）。
     """
 
-    if planning_failure_classification == "environment" and phase == "define":
-        return ("recover-planning", "abandon")
-    return ("abandon",)
+    base = (
+        ("recover-planning", "abandon")
+        if planning_failure_classification == "environment" and phase == "define"
+        else ("abandon",)
+    )
+    return (*base, *(action for action in job_recovery_actions if action not in base))
 
 
 def needs_human_next_step_hint(
@@ -1711,6 +1727,7 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
         next_actions = needs_human_next_actions(
             phase=candidate.active_phase,
             planning_failure_classification=classification,
+            job_recovery_actions=candidate.active_recovery_actions,
         )
         blocking_reason = (
             f"planning-failure:{classification}:{candidate.active_planning_failure_reason}"

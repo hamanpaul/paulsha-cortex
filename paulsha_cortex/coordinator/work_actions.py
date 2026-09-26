@@ -3584,6 +3584,14 @@ def _claim_action(
     planning_failure_hint = (
         _planning_failure_hint(canonical_run) if canonical_run is not None else None
     )
+    active_recovery_actions: tuple[str, ...] = ()
+    if canonical_run is not None:
+        try:
+            active_recovery_actions = _phase_recovery_actions(
+                canonical_run, workflow_registry
+            )
+        except Exception:  # noqa: BLE001 - claim read projection remains fail-soft
+            active_recovery_actions = ()
     candidate = ClaimCandidate(
         authority=authority,
         repo=authority.repo,
@@ -3628,6 +3636,7 @@ def _claim_action(
         active_planning_failure_reason=(
             planning_failure_hint["reason"] if planning_failure_hint else None
         ),
+        active_recovery_actions=active_recovery_actions,
     )
     if (
         canonical_run is not None
@@ -3941,42 +3950,32 @@ def _claim_action(
         response["next_actions"] = list(decision.next_actions)
     if decision.next_step_hint is not None:
         response["next_step_hint"] = decision.next_step_hint
-    # #546（部分）：卡片卡在 needs_human 時，`_resume_decision` 看不到 job 層
-    # 事實，宣告的唯一出口是 `abandon`（＝燒掉一個世代與合格的 commit）。
-    # 這裡把同樣以 run/job 事實判定為「真的會被受理」的復原動作補進去，順序維持
-    # 「既有決策優先、補充在後」，不重排既有值。#569：verify／review 的 reviewer
-    # 卡一併涵蓋——那個現場的 operator 正是因為 `next_actions` 只寫著 `abandon`
-    # 才轉而使用只重置不重派的 `retry-verify`。
+    # #546：ClaimCandidate 已帶入與 action admission 同源的 job／owner-slice 判準。
+    # 保留既有的動作專屬提示，動作本身不在回應層重算。
     if decision.action == "needs_human" and canonical_run is not None:
-        extra = [
-            item
-            for item in _phase_recovery_actions(canonical_run, workflow_registry)
-            if item not in response.get("next_actions", [])
-        ]
-        if extra:
-            response["next_actions"] = [*response.get("next_actions", []), *extra]
-            reason_payload = canonical_run.needs_human_reason
-            reason_code = (
-                reason_payload.get("reason")
-                if isinstance(reason_payload, dict)
-                else None
+        projected_actions = response.get("next_actions", [])
+        reason_payload = canonical_run.needs_human_reason
+        reason_code = (
+            reason_payload.get("reason")
+            if isinstance(reason_payload, dict)
+            else None
+        )
+        if "retry-review" in projected_actions and reason_code == "blocking-findings":
+            response["next_step_hint"] = blocking_findings_next_step_hint(
+                work_id=canonical_run.work_id,
+                repo=canonical_run.repo,
+                candidate=canonical_run.candidate_head,
             )
-            if "retry-review" in extra and reason_code == "blocking-findings":
-                response["next_step_hint"] = blocking_findings_next_step_hint(
-                    work_id=canonical_run.work_id,
-                    repo=canonical_run.repo,
-                    candidate=canonical_run.candidate_head,
-                )
-            elif "review-attest" in extra and authority is not None:
-                response["next_step_hint"] = (
-                    f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
-                )
-            elif "review-disposition" in extra and authority is not None:
-                response["next_step_hint"] = (
-                    "確認 PR review threads 全部 resolved 後，由 operator 提交 exact-HEAD 裁決："
-                    f"cortex work review-disposition {canonical_run.work_id} --repo {authority.repo} "
-                    "--actor <operator> --reason '<理由>'"
-                )
+        elif "review-attest" in projected_actions and authority is not None:
+            response["next_step_hint"] = (
+                f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+            )
+        elif "review-disposition" in projected_actions and authority is not None:
+            response["next_step_hint"] = (
+                "確認 PR review threads 全部 resolved 後，由 operator 提交 exact-HEAD 裁決："
+                f"cortex work review-disposition {canonical_run.work_id} --repo {authority.repo} "
+                "--actor <operator> --reason '<理由>'"
+            )
     if decision.blocking_reason is not None:
         response["blocking_reason"] = decision.blocking_reason
     return response
@@ -4585,19 +4584,12 @@ def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
 
 
 def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
-    """#546（部分）：run 停在 needs_human 時真的可用的 recovery 動作。
+    """計算 needs_human run 中與 job／owner-slice admission 一致的 recovery 動作。
 
-    `claim._resume_decision` 只看得到 run 的 phase 與 planning failure 記錄，因此
-    卡片卡住時它宣告的唯一出口是 `abandon`——實測（run
-    ``workflow-084f75e2178cf7547476``）operator 因此以為只能燒掉一個世代，而
-    `regenerate-gates`／`retry-card` 其實都可用。這個 helper 在 work action 層
-    （拿得到 JobRegistry）補上那段曝光面。
-
-    #569 一般化到 verify／review：同一個現場的 verification 卡（reviewer job 輸出
-    損壞、evidence 綁不上）過去在 `next_actions` 裡同樣只看得到 `abandon`，
-    operator 因此改用 `retry-verify`——那條路只重置不重派，四小時後 needs_human
-    原地回鍋。函式名從 `_build_phase_recovery_actions` 一併改名，因為它已不再只
-    覆蓋 build phase。
+    #546 將此結果帶入 `ClaimCandidate`，並供 claim、status、Monitor work list 共用；
+    helper 只在能以 canonical registry 證據確認動作可受理時回傳該動作。既有
+    `regenerate-gates`／`retry-card`、#569 的 verify／review recovery，以及 owner-bound
+    `recover-pre-candidate` 都沿用各自 action 的 admission 判準。
 
     刻意**只宣告會被受理的動作**：每一項都用與該動作自身完全相同的前置驗
     （同一份 job/step 判準）判定，拿不準就不宣告。宣告一個保證失敗的動作比不
@@ -4715,6 +4707,21 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
         actions.append("review-attest")
     if reason_code in {"review-disposition-required", "review-threads-unresolved"}:
         actions.append("review-disposition")
+    try:
+        from . import manager as workflow_manager
+
+        owner_slice = workflow_manager._resolve_work_owner_slice(
+            workflow_registry, repo=run.repo, work_id=run.work_id
+        )
+        workflow_manager._pre_candidate_recovery_admission(
+            workflow_registry,
+            owner_slice,
+            expected_owner={"repo": run.repo, "work_id": run.work_id},
+        )
+        if "recover-pre-candidate" not in actions:
+            actions.append("recover-pre-candidate")
+    except Exception:  # noqa: BLE001 - incomplete owner/job evidence fails closed
+        pass
     return tuple(actions)
 
 

@@ -102,12 +102,14 @@ def project_work_items(
     updated_at: str,
     previous_items: Sequence[WorkItem] = (),
     closure_by_work: Mapping[str, ClosureEvidence] | None = None,
+    workflow_next_actions_by_work: Mapping[str, Mapping[str, object]] | None = None,
 ) -> LifecycleProjection:
     """Apply the reducer to correlated groups and attach its trace to explain."""
     previous = {
         item.work_id: item for item in previous_items if item.repo == repo
     }
     closure_by_work = closure_by_work or {}
+    workflow_next_actions_by_work = workflow_next_actions_by_work or {}
     explanations = {
         work_id: dict(explanation)
         for work_id, explanation in correlation.explanations.items()
@@ -142,6 +144,24 @@ def project_work_items(
         )
         decision = reduce_lifecycle(facts)
         workflow = workflows[0] if workflows else None
+        next_actions = (
+            ("start",)
+            if decision.state == "todo" and group.confidence == "confirmed"
+            else ()
+        )
+        recovery_projection = workflow_next_actions_by_work.get(group.work_id)
+        if (
+            decision.state == "ongoing"
+            and len(workflows) == 1
+            and workflow is not None
+            and isinstance(recovery_projection, Mapping)
+            and recovery_projection.get("run_id") == workflow.ref
+        ):
+            actions = recovery_projection.get("actions")
+            if isinstance(actions, (tuple, list)) and all(
+                isinstance(action, str) and action for action in actions
+            ):
+                next_actions = tuple(actions)
         projected.append(
             WorkItem(
                 work_id=group.work_id,
@@ -151,9 +171,7 @@ def project_work_items(
                 phase=prior.phase if prior is not None and workflows else None,
                 facets=decision.facets,
                 sources=group.sources,
-                next_actions=("start",)
-                if decision.state == "todo" and group.confidence == "confirmed"
-                else (),
+                next_actions=next_actions,
                 workflow_run_id=workflow.ref if workflow is not None else None,
                 updated_at=updated_at,
             )

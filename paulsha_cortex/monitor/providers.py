@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import yaml
@@ -71,6 +72,82 @@ def _digest(parts: Sequence[bytes]) -> str:
         value.update(len(part).to_bytes(8, "big"))
         value.update(part)
     return value.hexdigest()
+
+
+def _workflow_next_actions_projection(
+    workflow_rows: Sequence[Mapping[str, object]],
+    *,
+    repo: str,
+    job_rows: Sequence[Mapping[str, object]],
+    slice_rows: Sequence[Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    """以同一 recovery 判準產生 Monitor work-list 的 needs_human 動作。"""
+    from ..coordinator.claim import needs_human_next_actions
+    from ..coordinator.work_actions import (
+        _phase_recovery_actions,
+        _planning_failure_hint,
+    )
+    from ..coordinator.workflow import WorkflowRun
+
+    runs = []
+    active_counts: dict[str, int] = {}
+    for row in workflow_rows:
+        if row.get("repo") != repo or row.get("status") != "ongoing":
+            continue
+        try:
+            run = WorkflowRun.from_dict(row)
+        except (TypeError, ValueError):
+            continue
+        active_counts[run.work_id] = active_counts.get(run.work_id, 0) + 1
+        if "needs_human" in run.facets:
+            runs.append(run)
+
+    def list_slices_by_owner(*, repo: str, work_id: str) -> list[dict[str, object]]:
+        return [
+            row
+            for row in slice_rows
+            if isinstance(row.get("owner_identity"), Mapping)
+            and row["owner_identity"].get("repo") == repo
+            and row["owner_identity"].get("work_id") == work_id
+        ]
+
+    def get_job(job_id: str) -> dict[str, object]:
+        for row in job_rows:
+            if row.get("job_id") == job_id:
+                return dict(row)
+        raise KeyError(job_id)
+
+    registry_view = SimpleNamespace(
+        list_jobs=lambda: [dict(row) for row in job_rows],
+        list_workflow_runs=lambda: runs,
+        list_slices_by_owner=list_slices_by_owner,
+        get_job=get_job,
+    )
+    projected: dict[str, dict[str, object]] = {}
+    for run in runs:
+        # WorkItem 每個 work 只有一筆 workflow_run_ref；多筆 active run 時無法
+        # 把 run-scoped 動作安全地掛到單一 item，故不曝光。
+        if active_counts.get(run.work_id) != 1:
+            continue
+        try:
+            hint = _planning_failure_hint(run)
+            classification = hint.get("classification") if isinstance(hint, dict) else None
+        except Exception:  # noqa: BLE001 - read projection fails closed on evidence errors
+            classification = None
+        try:
+            recovery_actions = _phase_recovery_actions(run, registry_view)
+        except Exception:  # noqa: BLE001 - read projection fails closed on registry errors
+            recovery_actions = ()
+        actions = needs_human_next_actions(
+            phase=run.current_phase,
+            planning_failure_classification=classification,
+            job_recovery_actions=recovery_actions,
+        )
+        projected[run.work_id] = {
+            "run_id": run.run_id,
+            "actions": list(actions),
+        }
+    return projected
 
 
 def _read_revision(path: Path) -> str:
@@ -362,6 +439,9 @@ class WorkflowRegistryProvider:
             job_rows = payload.get("jobs")
             if not isinstance(job_rows, list):
                 job_rows = []
+            slice_rows = payload.get("slices")
+            if not isinstance(slice_rows, list):
+                slice_rows = []
             candidate_base_probe = (
                 self._candidate_base_probe
                 if self._candidate_base_probe is not None
@@ -459,9 +539,15 @@ class WorkflowRegistryProvider:
             sources.extend(close_sources)
             for source_id, work_id in close_links.items():
                 _add_workflow_link(links, source_id, work_id)
-            for work_id, rows in close_completions.items():
-                validated_completions.setdefault(work_id, []).extend(rows)
+            for work_id, completion_rows in close_completions.items():
+                validated_completions.setdefault(work_id, []).extend(completion_rows)
             diagnostics.extend(close_diagnostics)
+            workflow_next_actions = _workflow_next_actions_projection(
+                rows,
+                repo=self.repo,
+                job_rows=[row for row in job_rows if isinstance(row, Mapping)],
+                slice_rows=[row for row in slice_rows if isinstance(row, Mapping)],
+            )
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
             return ProviderSnapshot(
                 provider_id=self.provider_id,
@@ -478,6 +564,15 @@ class WorkflowRegistryProvider:
                     source="monitor.WorkflowRegistryProvider.scan",
                 ),
             )
+        observations = {
+            "workflow_links": links,
+            "validated_completions": validated_completions,
+            "schema_retry": schema_retry,
+            "needs_human_reasons": needs_human_reasons,
+            "candidate_git_bases": candidate_git_bases,
+        }
+        if workflow_next_actions:
+            observations["workflow_next_actions"] = workflow_next_actions
         return ProviderSnapshot(
             provider_id=self.provider_id,
             status="ok",
@@ -486,13 +581,7 @@ class WorkflowRegistryProvider:
             revision=f"registry-sha256:{_digest((raw, *close_record_bytes))}",
             diagnostics=tuple(diagnostics),
             sources=tuple(sources),
-            observations={
-                "workflow_links": links,
-                "validated_completions": validated_completions,
-                "schema_retry": schema_retry,
-                "needs_human_reasons": needs_human_reasons,
-                "candidate_git_bases": candidate_git_bases,
-            },
+            observations=observations,
         )
 
     def _scan_close_delivered_records(self):

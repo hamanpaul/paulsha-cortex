@@ -527,6 +527,7 @@ Job `exited` 只代表 Agent process 以 exit code 0 結束，**不代表任務�
 ### 4. 處理 `needs_human`
 
 先從 `cortex status` 的 `attention[].next_actions` 選擇當下允許的動作，不要手動改 `jobs.json`：
+`cortex list` 與 `cortex work show` 的 needs_human work item 也會投影同一份目前可受理的 recovery actions，包含符合 owner-bound 前置條件時的 `recover-pre-candidate`。
 
 ```bash
 cortex slice-action "$SLICE_ID" retry-build  --actor operator
