@@ -3449,6 +3449,12 @@ def _candidate_tree_matching_archive_entries(
     return tuple(sorted(entries))
 
 
+_MAIN_SYNC_RETRYABLE_REASONS = frozenset(
+    {"candidate-behind-main", "candidate-conflicts-with-main"}
+)
+_MAIN_SYNC_STOP_REASONS = _MAIN_SYNC_RETRYABLE_REASONS | {"main-sync-unavailable"}
+
+
 def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None) -> dict[str, Any]:
     """Reopen the final builder card with exact-Candidate CAS after a human stop."""
 
@@ -3492,6 +3498,24 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         raise RuntimeError("retry-build requires build/verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
+    reason_payload = run.needs_human_reason
+    reason_context = reason_payload.get("context") if isinstance(reason_payload, dict) else None
+    delivery_reason = reason_context.get("delivery_reason") if isinstance(reason_context, dict) else None
+    main_sync_stop = (
+        isinstance(reason_payload, dict)
+        and reason_payload.get("reason") == "delivery-needs-human"
+        and (
+            delivery_reason in _MAIN_SYNC_STOP_REASONS
+            or (
+                isinstance(reason_context, dict)
+                and ("main_sync" in reason_context or "main_sync_evidence_hash" in reason_context)
+            )
+            or any(value in str(reason_payload.get("detail", "")) for value in _MAIN_SYNC_STOP_REASONS)
+        )
+    )
+    main_sync_context = _main_sync_retry_context(run)
+    if main_sync_stop and (run.current_phase != "review" or main_sync_context is None):
+        raise RuntimeError("retry-build requires valid matching main-sync stop evidence")
     from . import manager
 
     archive_applied = manager._manager_archive_applied(
@@ -3518,7 +3542,9 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
                 }
             )
     retry_classification = _classify_retry(run, workflow_registry)
-    if run.current_phase == "build":
+    if main_sync_context is not None:
+        repair_action = _main_sync_retry_build_action(main_sync_context)
+    elif run.current_phase == "build":
         repair_action = (
             "Recover the exact Candidate after a builder terminalization failure. Preserve all "
             "declared input snapshots and inspect any existing unbound worktree commits before "
@@ -3624,6 +3650,72 @@ def _blocking_findings_recovery_actions(run) -> tuple[str, ...]:
     ):
         actions.append("retry-build")
     return tuple(actions)
+
+
+def _main_sync_retry_context(run) -> dict[str, str] | None:
+    reason = getattr(run, "needs_human_reason", None)
+    context = reason.get("context") if isinstance(reason, dict) else None
+    if (
+        not isinstance(reason, dict)
+        or reason.get("reason") != "delivery-needs-human"
+        or not isinstance(context, dict)
+        or context.get("delivery_reason") not in _MAIN_SYNC_RETRYABLE_REASONS
+    ):
+        return None
+    try:
+        raw = context["main_sync"]
+        main_sync = json.loads(raw) if isinstance(raw, str) else raw
+        candidate, main_head = main_sync["candidate"], main_sync["main_head"]
+        evidence_ref = next(
+            item for item in reason["evidence_refs"]
+            if isinstance(item, str) and item.strip()
+        )
+    except (KeyError, StopIteration, TypeError, ValueError):
+        return None
+    current_candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(main_sync, dict)
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or not isinstance(current_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(current_candidate) is None
+        or candidate.lower() != current_candidate.lower()
+        or not isinstance(main_head, str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", main_head) is None
+        or not isinstance(context.get("main_sync_evidence_hash"), str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", context["main_sync_evidence_hash"]) is None
+    ):
+        return None
+    return {
+        "candidate": current_candidate.lower(),
+        "main_head": main_head.lower(),
+        "evidence_ref": evidence_ref,
+    }
+
+
+def _main_sync_retry_build_action(context: dict[str, str]) -> str:
+    return (
+        f"Repair the exact Candidate {context['candidate']} using the saved main-sync "
+        f"probe evidence at {context['evidence_ref']}. That stop recorded origin/main "
+        f"as {context['main_head']}; include this exact main commit in a tested "
+        "descendant Candidate instead of substituting a newly fetched main. Do not "
+        "claim merge, issue closure, or done. The existing verification and review "
+        "gates must rerun, and the ship probe must confirm main sync before delivery "
+        "continues."
+    )
+
+
+def main_sync_retry_build_next_step_hint(run) -> str | None:
+    context = _main_sync_retry_context(run)
+    if context is None:
+        return None
+    return (
+        f"main-sync evidence `{context['evidence_ref']}` 記錄停機時的 Candidate C 與 "
+        f"main M `{context['main_head']}`。請依該證據人工修復候選並納入這個 M，讓既有 "
+        f"verify／review 與 ship probe 重跑；執行 `cortex run work retry-build "
+        f"{run.work_id} --repo {run.repo} --expected-candidate {context['candidate']} "
+        "--actor <operator> --reason '<人工裁決>'`。"
+    )
 
 
 def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
@@ -3744,6 +3836,40 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
                     actions.append("retry-card")
 
             if jobs_readable:
+                main_sync_context = _main_sync_retry_context(run)
+                build_steps = [step for step in run.steps if step.phase == "build"]
+                ship_steps = [
+                    step for step in run.steps
+                    if step.phase == "ship" and step.gate_result == "passed"
+                ]
+                reset_steps_valid = (
+                    bool(build_steps)
+                    and all(step.gate_result == "passed" for step in build_steps)
+                    and len(ship_steps) <= 1
+                    and all(
+                        step.card == "openspec-archive"
+                        and step.executor == "cortex-manager"
+                        and step.model == "deterministic"
+                        and step.domain == "cortex"
+                        for step in ship_steps
+                    )
+                )
+                if (
+                    main_sync_context is not None
+                    and run.status == "ongoing"
+                    and run.current_phase == "review"
+                    and reset_steps_valid
+                ):
+                    try:
+                        active_runs = [
+                            item for item in workflow_registry.list_workflow_runs()
+                            if item.repo == run.repo and item.work_id == run.work_id
+                            and item.status == "ongoing"
+                        ]
+                    except Exception:
+                        active_runs = []
+                    if len(active_runs) == 1 and active_runs[0].run_id == run.run_id:
+                        actions.append("retry-build")
                 actions.extend(
                     action
                     for action in _blocking_findings_recovery_actions(run)

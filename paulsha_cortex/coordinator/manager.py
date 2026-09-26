@@ -1128,6 +1128,7 @@ def workflow_status_entry(
         from .work_actions import (
             _phase_recovery_actions,
             blocking_findings_next_step_hint,
+            main_sync_retry_build_next_step_hint,
         )
 
         next_actions = (
@@ -1148,6 +1149,10 @@ def workflow_status_entry(
                 repo=getattr(run, "repo", None),
                 candidate=getattr(run, "candidate_head", None),
             )
+        if persisted_next_step_hint is None and "retry-build" in next_actions:
+            main_sync_hint = main_sync_retry_build_next_step_hint(run)
+            if main_sync_hint is not None:
+                next_step_hint = main_sync_hint
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         pass
     try:

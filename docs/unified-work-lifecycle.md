@@ -261,6 +261,8 @@ Verify/Review dispatch只接受schema v2明示`review` capability、且independe
 
 Manager 是唯一 writer。每次 push 都會使上一個 delivery review epoch 失效，並重新要求 current-HEAD review。第一次 ship preflight 前，Manager 會在自己的 ship clone 內以 bounded direct git subprocess probe `origin/main`：依序 resolve/validate Candidate、fetch、resolve/validate `FETCH_HEAD`、計算 merge-base，必要時再跑 `merge-tree --write-tree --name-only --no-messages -z` 與 NUL-safe path parser。只有 C 已含最新 M 時才可進 preflight；clean-behind 與 conflict 一律在 preflight／push／建 PR 前停下。fetch／merge-base／merge-tree／path-parser failure 會把 `candidate`／`stage`／`returncode`（timeout 為 null）／`error_kind`／`main_head` 寫成 content-addressed `main-sync-probe` evidence；若真的要 push，preflight 後、`git push` 前還會再 probe 一次。已進 merged/done closure 的 reconciliation 與 terminal refresh 則直接走既有 closure path，不重跑 main probe。Merge 前必須同時具備：
 
+**main-sync stop 的人工 Builder 出口（#943／#972／#989／#990）。** clean-behind 或 conflict 轉成 `delivery-needs-human` 後，status 只有在 exact Candidate 與保存的 C 相符、main SHA 合法且 evidence ref 已保存、build steps 全部 passed、沒有 active job，且 passed ship step 僅可能是 Manager 的 `openspec-archive` 時才列出 `retry-build` 與 exact-Candidate 指令。此 action 沿用 registry reset 和 operator adjudication；Builder 會收到原 stop evidence 與 probe 記錄的 main SHA，產生修復候選後由既有 verify／review gates 重跑，ship probe 再確認同步才繼續。probe unavailable、context 缺漏或 C 不符時不列出這個 retry。
+
 - exact tree 的 policy + pinned preflight；
 - deterministic verification 與不同 independence domain 的 ForeignReview；
 - 恰好一種 current-HEAD typed delivery review：非 error 且 threads resolved/outdated 的 Copilot review，或 immutable exact-HEAD maintainer attestation；

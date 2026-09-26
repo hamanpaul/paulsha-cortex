@@ -631,6 +631,10 @@
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
+- **#943／#972／#989／#990 main-sync 人工恢復出口**：Candidate clean-behind 或與 main 衝突而停在 `needs_human` 時，只有 reset 前置條件、C/M 摘要與 stop evidence 都相符才會在 status 顯示 `retry-build`；重試指示引用原 evidence 與 main SHA，重開 Builder 後仍須重跑既有 verify、review 與 ship probe。
+- **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、路徑逃逸、非一般檔案
+  及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用，內容驗收拒收維持
+  content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
   經分類標記遮罩且限 2 KiB。
 - **#876／#936／#558／#613**：archive gate 接受下游 issue-prefix changelog fragment，缺 change-specific entry 時回報明確原因；CLI 會在送件前拒絕 retry-build 的 `expected_run_id`；abandon 會立即 reconcile 該 run 的 planning journal，並回收 build worktree 與 branch，有額外 commit 時先以 archive tag 保留。
 - **#813／#945 AGY builder 權限與前景執行契約**：為 commit-required argv 補上不得含 `--dangerously-skip-permissions` 的負向回歸斷言；AGY builder prompt 現要求測試與長命令在前景同步執行並等待完成，不得交給背景任務。README 也註明 `--allow-unsafe` 對 AGY 會啟用全工具核可，其權限剖面尚未依 #716 逐 executor 量測。
