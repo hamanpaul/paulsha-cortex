@@ -7,14 +7,13 @@
   ``superseded`` 三個合法值（見 ``registry.py``），run 級沒有 ``failed``／
   ``rejected``／``rolled_back`` 的既有終局轉換點。:data:`OUTCOME_STATUSES`
   因此列出六種 schema 合法值供未來擴張，但 v1 只有 ``shipped``（對應
-  ``_ship_action`` 的 ``status="done"`` 轉換）與 ``abandoned``（對應
+  ``_ship_action`` 的交付成功）與 ``abandoned``（對應
   ``_abandon_action`` 的 ``status="superseded"`` 轉換）兩種實際 emitter；其餘
   三種是預留值，尚無呼叫端會產生。
 - idempotency：:func:`outcome_id` 由 ``run_id``／``outcome``／``attempt_digest``
-  決定性推導；呼叫端傳入同一次終局轉換的內容位址 digest（例如 ship 的
-  completion record hash、abandon 的 evidence digest），daemon 重跑或 request
-  retry 只要落在同一次轉換上就會產生相同 id，:meth:`OutcomeStore.append`
-  據此去重，不會產生第二筆 record。
+  決定性推導。:func:`emit_shipped_outcome` 以 CompletionRecord hash 定址，重入會
+  驗證唯一 shipped row 的 Candidate／merge／completion 綁定並讀回確認；完全相同
+  的交付重用原 row，不同綁定 fail closed。abandon 仍以 evidence digest 去重。
 - ``execution_provenance.session_refs``：Cortex job record 目前沒有存 executor
   自身的 session UUID（只有 ``session_name``、``log_path``、``pane``），因此
   這裡只能提供 worktree-path＋時間窗的弱 correlation hint，不宣稱 exact
@@ -22,9 +21,9 @@
   變更，超出本模組範圍。
 
 本模組刻意維持純函式／純資料，不 import manager、registry 或 work_actions；
-呼叫端負責在既有終局轉換點呼叫 :func:`emit_outcome`。本模組也不 import 任何
-hippo 套件——這是外部 learning systems（含 Hippo）消費的唯讀 outbox，Hippo
-未安裝時本模組的一切行為必須維持不變。
+呼叫端負責在既有終局轉換點呼叫 :func:`emit_shipped_outcome` 或
+:func:`emit_outcome`。本模組也不 import 任何 hippo 套件——這是外部 learning
+systems（含 Hippo）消費的唯讀 outbox，Hippo 未安裝時本模組的一切行為必須維持不變。
 """
 
 from __future__ import annotations
@@ -541,12 +540,9 @@ def emit_outcome(
 ) -> dict[str, Any]:
     """組出一筆 outcome record，驗證後 durable 寫入 ``store``。
 
-    呼叫端（``work_actions._ship_action``／``_abandon_action``）MUST 在改動
-    ``WorkflowRun.status`` 的終局轉換呼叫（``_manager_update_workflow_run``／
-    ``_manager_abandon_workflow_run``）之前呼叫本函式，確保 outcome 先於
-    terminal transition durable 落地。``jobs`` 只需傳入該 run 底下的全部 job
-    record（例如 ``workflow_registry.list_jobs()`` 的結果），本函式會依
-    ``workflow_run_id`` 過濾。
+    通用 emitter 供 abandon 等呼叫端使用。shipped 終局請使用
+    :func:`emit_shipped_outcome`，以額外檢查同一 run 的唯一交付綁定與 durable readback。
+    ``jobs`` 只需傳入 registry job 清單，本函式會依 ``workflow_run_id`` 過濾。
     """
 
     run_jobs = tuple(job for job in jobs if job.get("workflow_run_id") == run.run_id)
@@ -564,6 +560,125 @@ def emit_outcome(
         supersedes_outcome_id=supersedes_outcome_id,
     )
     return store.append(record)
+
+
+def _shipped_binding_matches(
+    existing: Mapping[str, Any], expected: Mapping[str, Any]
+) -> bool:
+    """比對 shipped outcome 的不可變交付綁定；重入診斷時間與 jobs 沿用原 row。"""
+
+    binding_fields = (
+        "schema",
+        "schema_version",
+        "outcome_id",
+        "repo",
+        "work_id",
+        "workflow_run_id",
+        "slice_id",
+        "candidate",
+        "outcome",
+        "reason_code",
+        "verification",
+        "review",
+        "supersedes_outcome_id",
+    )
+    if any(existing.get(field) != expected.get(field) for field in binding_fields):
+        return False
+    existing_provenance = existing.get("execution_provenance")
+    expected_provenance = expected.get("execution_provenance")
+    if not isinstance(existing_provenance, Mapping) or not isinstance(
+        expected_provenance, Mapping
+    ):
+        return False
+    existing_window = existing_provenance.get("time_window")
+    expected_window = expected_provenance.get("time_window")
+    return (
+        existing_provenance.get("worktree_root")
+        == expected_provenance.get("worktree_root")
+        and isinstance(existing_window, Mapping)
+        and isinstance(expected_window, Mapping)
+        and existing_window.get("started_at") == expected_window.get("started_at")
+    )
+
+
+def emit_shipped_outcome(
+    store: OutcomeStore,
+    *,
+    run: Any,
+    authority: Any,
+    jobs: Sequence[Mapping[str, Any]],
+    attempt_digest: str,
+    candidate: Mapping[str, Any],
+    verification: Mapping[str, Any] | None = None,
+    review: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """寫入或重用同一 WorkflowRun 的唯一 shipped outcome，並確認 durable readback。
+
+    重入以 completion digest 定址。相同交付綁定會直接回傳既有 immutable row；
+    不同 Candidate／merge／completion 或其他 shipped attempt 會 fail closed。
+    """
+
+    run_jobs = tuple(job for job in jobs if job.get("workflow_run_id") == run.run_id)
+    expected = build_outcome_record(
+        run=run,
+        authority=authority,
+        jobs=run_jobs,
+        outcome="shipped",
+        attempt_digest=attempt_digest,
+        candidate=candidate,
+        verification=verification,
+        review=review,
+    )
+    existing_rows = [
+        row
+        for row in store.list_outcomes(repo=authority.repo, work_id=authority.work_id)
+        if row.get("workflow_run_id") == run.run_id and row.get("outcome") == "shipped"
+    ]
+    if existing_rows:
+        if len(existing_rows) != 1:
+            raise EngineeringOutcomeError(
+                "同一 WorkflowRun 已有不同 shipped outcome 綁定",
+                reason="shipped-outcome-conflict",
+                validation_path="$.workflow_run_id",
+            )
+        existing = existing_rows[0]
+        try:
+            normalized_existing = validate_outcome_record(existing)
+        except EngineeringOutcomeError as exc:
+            raise EngineeringOutcomeError(
+                "同一 WorkflowRun 的 shipped outcome 格式無效",
+                reason="shipped-outcome-conflict",
+                validation_path="$.workflow_run_id",
+            ) from exc
+        if normalized_existing != existing or not _shipped_binding_matches(existing, expected):
+            raise EngineeringOutcomeError(
+                "同一 WorkflowRun 已有不同 shipped outcome 綁定",
+                reason="shipped-outcome-conflict",
+                validation_path="$.workflow_run_id",
+            )
+        return existing
+
+    appended = store.append(expected)
+    if not _shipped_binding_matches(appended, expected):
+        raise EngineeringOutcomeError(
+            "shipped outcome append 與本次交付綁定衝突",
+            reason="shipped-outcome-conflict",
+            validation_path="$.workflow_run_id",
+        )
+    readback = store.show_outcome(expected["outcome_id"])
+    if readback is None:
+        raise EngineeringOutcomeError(
+            "shipped outcome append 後讀回缺失",
+            reason="shipped-outcome-readback-missing",
+            validation_path="$.outcome_id",
+        )
+    if readback != appended or not _shipped_binding_matches(readback, expected):
+        raise EngineeringOutcomeError(
+            "shipped outcome append 後讀回內容衝突",
+            reason="shipped-outcome-readback-conflict",
+            validation_path="$.outcome_id",
+        )
+    return readback
 
 
 def iter_outcome_stores(root: str | Path) -> Iterator[OutcomeStore]:
