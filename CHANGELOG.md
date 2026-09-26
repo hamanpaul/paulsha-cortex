@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#912 recent_done 與 not_claimable 狀態收斂**：recent_done 增列 registry job 的實際 `exited_at` 與所屬 workflow 的 `run_id`、`work_id`、`run_status`；auto-claim scan 收尾會移除不再存在於 work snapshot 的 not-claimable 記錄。
 - Wave R 整合交付：operator 合併 8 個卡在 cortex pipeline 的實作 PR，並補 review 修正（非正規化 governed path、journal lock `O_CLOEXEC`、裁決 evidence 先於 run 重置、#862 測試對齊 #966 CAS）。
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、
   逐條宣稱更正，以及切換當下才撞得到的那一個阻斷**。四分部署的

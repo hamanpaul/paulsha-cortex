@@ -46,6 +46,7 @@ __all__ = [
     "list_entries",
     "record",
     "clear",
+    "sweep_missing",
 ]
 
 
@@ -218,3 +219,28 @@ def clear(path: str | Path, *, repo: str, work_id: str) -> bool:
     del payload["items"][key]
     _save(target, payload)
     return True
+
+
+def sweep_missing(
+    path: str | Path,
+    *,
+    present_items: Iterable[tuple[str, str]],
+) -> int:
+    """移除 work snapshot 已不再包含的項目，回傳本次清除筆數。"""
+
+    target = Path(path)
+    if not target.exists():
+        return 0
+    payload = load_ledger(target)
+    present_keys = {
+        _entry_key(repo=repo, work_id=work_id)
+        for repo, work_id in present_items
+        if isinstance(repo, str) and repo and isinstance(work_id, str) and work_id
+    }
+    stale_keys = [key for key in payload["items"] if key not in present_keys]
+    if not stale_keys:
+        return 0
+    for key in stale_keys:
+        del payload["items"][key]
+    _save(target, payload)
+    return len(stale_keys)

@@ -38,6 +38,7 @@ from .claim import (
     decide_auto_claim,
     decide_manual_start,
     load_work_authorities,
+    load_work_authorities_with_snapshot_items,
     load_work_authority,
     work_authority_digest,
 )
@@ -6512,7 +6513,9 @@ def run_auto_claim_scan(
     """Project the durable Monitor snapshot into Manager-owned auto claims."""
 
     try:
-        authorities = load_work_authorities(snapshot_path=snapshot_path)
+        authorities, snapshot_items = load_work_authorities_with_snapshot_items(
+            snapshot_path=snapshot_path
+        )
     except ValueError as exc:
         if "snapshot unavailable" in str(exc):
             return []
@@ -6656,6 +6659,10 @@ def run_auto_claim_scan(
                     **result,
                 }
             )
+    not_claimable.sweep_missing(
+        not_claimable.ledger_path(resolved_state.parent),
+        present_items=snapshot_items,
+    )
     return results
 
 
