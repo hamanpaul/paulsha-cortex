@@ -9,6 +9,8 @@
 
 ### Fixed
 
+- **#841 loaded-runtime 身分證據**：Manager／Monitor startup 寫入不可覆寫的 loaded artifact/config receipt；`service status` 與 doctor 分開投影 operator CLI、磁碟 service declaration 與長駐程序身分。package/config drift、缺漏或無法核對的 receipt/PID/source override 維持明確 drift/unknown；transition status 不授予更新或回滾安全性。補齊隔離安裝 CLI、restart/reload、secret allowlist、instance-root、Trust Root receipt chain 與 in-flight fail-closed 測試，並新增操作與 live 驗收文件。
+
 - **#502 verify／review 通過後的阻斷修復入口**：exact-candidate `retry-build` 現可接受尚未進入 `needs_human` 的後續阻斷裁決；必須提供 `--reason`，以既有 immutable operator-adjudication evidence 記錄後重跑 verify／review，已完成 run 仍拒絕重開。
 
 - **#862 recovery registry receipt contract**：`JobRegistry` 現在依 OpenSpec 實作

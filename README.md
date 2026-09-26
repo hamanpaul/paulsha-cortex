@@ -342,6 +342,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    自動化呼叫可用 `cortex service ensure-running`：若 `manager.lock` 已由 live manager 持有，就不重啟並回報 `mode=already-running`；systemd user units 齊備且可用時會啟動 manager service/timer 與 monitor service，並等待 manager lock 最多 10 秒；否則以目前執行中的 Cortex Python 啟動本地 manager 與 monitor。此命令固定輸出一行 `cortex-porcelain/service/v1` JSON，fallback log 寫入 `manager.log`，不會安裝或修改 units。
 
    `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
+   `cortex service status --json` 另含 `loaded_runtime`：分開列出執行 status 命令的 `operator_cli`、磁碟上的 `service_declaration`，以及 Manager／Monitor 啟動時實際載入的 artifact/config receipt。只有 process PID、artifact 與可比對配置都能核對時才回報 match；磁碟更新會顯示 drift，缺 receipt、source override 或無法證實的欄位維持 unknown。`cortex doctor --json` 使用同一份安全投影。欄位與 live 驗收界線見[已載入 runtime 身分證據](docs/loaded-runtime-attestation.md)。
    `cortex service install` 寫入 unit 後，若 `daemon-reload` 或 `enable` 任一階段非零，會直接回報 `mode=systemd`、非零 exit code，訊息僅包含 systemd stderr、unit 落檔位置、重試 command（`systemctl --user ...`），並明確指出「unit 已寫入但僅 reload/enable 尚未完成」，不會輸出 traceback 或 stdout 內容，並不再繼續後續步驟。
 
 10. 用 `run` 家族提交高階 mutation；不加 `--wait` 時會回傳 request ID 並以 exit 3 表示 accepted-pending：

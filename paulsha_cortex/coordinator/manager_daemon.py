@@ -20,6 +20,12 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 from ..control import constants, contract
+from ..runtime_attestation import (
+    artifact_identity,
+    manager_configuration_snapshot,
+    record_runtime_startup,
+    trust_root_receipt_summary,
+)
 from ..trust_root import selfcheck as trust_root_selfcheck
 from . import autonomy, backoff, candidate_base, manager, not_claimable, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
@@ -1530,6 +1536,7 @@ def run_loop(
     recent_done_window_seconds: float | None = RECENT_DONE_WINDOW_SECONDS,
     spawn_admission: SpawnAdmissionLimiter | None = None,
     default_max_load: float | None = None,
+    on_started: Callable[[], None] | None = None,
 ) -> bool:
     if default_max_load is not None:
         if (
@@ -1544,6 +1551,15 @@ def run_loop(
     held_lock = acquire_lock(pid=runtime_pid, pid_alive=pid_alive, now_fn=now_fn)
     if held_lock is None:
         return False
+
+    if on_started is not None:
+        try:
+            on_started()
+        except Exception:  # noqa: BLE001 — 證據寫入失敗時仍須明確維持 unknown。
+            print(
+                "manager loaded-runtime receipt unavailable; runtime status remains unknown",
+                file=sys.stderr,
+            )
 
     resolved_specs_dir = specs_dir or default_specs_dir()
     resolved_default_executor = default_executor or DEFAULT_EXECUTOR
@@ -2018,6 +2034,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _install_signal_handlers()
 
+    def record_loaded_runtime() -> None:
+        config, components = manager_configuration_snapshot(vars(args), os.environ)
+        record_runtime_startup(
+            service="manager",
+            instance=os.environ.get("PSC_INSTANCE", "cortex"),
+            state_root=paths.coordinator_root(),
+            configuration=config,
+            config_components=components,
+            artifact=artifact_identity(),
+            trust_root=trust_root_receipt_summary(
+                os.environ.get("PSC_TRUST_ROOT_INSTALL_RECEIPT")
+            ),
+        )
+
     # #381：fanout（dispatch/fanout/tick 請求 ＋ periodic tick 的 run_tick）
     # 與 workflow lane（periodic tick 的 resume 迴圈）在這裡拿到同一個
     # SpawnAdmissionLimiter instance，往下分別注入 build_request_executor 與
@@ -2041,6 +2071,7 @@ def main(argv: list[str] | None = None) -> int:
         recent_done_window_seconds=args.recent_done_window_seconds,
         spawn_admission=spawn_admission_limiter,
         default_max_load=args.max_load if args.max_load is not None else default_max_load(),
+        on_started=record_loaded_runtime,
     )
     return 0 if started else 1
 
