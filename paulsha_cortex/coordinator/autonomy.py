@@ -755,25 +755,26 @@ def dispatch_ready(
             # 記到 job row 供完成側對照（`manager._builder_input_attestation_mismatches`）。
             # 失敗走既有 per-slice except：slice 落 needs_human、不派 job。只有 builder
             # persona 交付 spec authority；其他 persona 維持既有三行 prompt 形狀。
-            if persona == "builder":
-                spec_body = _read_pinned_spec_body(pinned_inputs)
-                prompt = build_dispatch_prompt(
-                    persona,
-                    task=slice_id,
-                    plan_path=m["plan"],
-                    spec_path=str(pinned_inputs["spec_path"]),
-                    spec_hash=str(pinned_inputs["spec_hash"]),
-                    spec_body=spec_body,
-                )
-            else:
-                prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
+            spec_body = _read_pinned_spec_body(pinned_inputs) if persona == "builder" else None
             base_sha = _resolve_target_base_sha(
                 meta=m,
                 pinned_inputs=pinned_inputs,
                 handoff_dir=handoff_dir,
                 git_runner=runner,
             )
-            worktree = _launcher_worktree(dispatcher, slice_id, base_sha=base_sha)
+            worktree = str(Path(_launcher_worktree(dispatcher, slice_id, base_sha=base_sha)).resolve())
+            if persona == "builder":
+                prompt = build_dispatch_prompt(
+                    persona,
+                    task=slice_id,
+                    plan_path=m["plan"],
+                    worktree_root=worktree,
+                    spec_path=str(pinned_inputs["spec_path"]),
+                    spec_hash=str(pinned_inputs["spec_hash"]),
+                    spec_body=spec_body,
+                )
+            else:
+                prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
             # baseline 須在 agent 動工前取（launch 前），否則含進 agent 的 commit → 空 diff。
             try:
                 dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])

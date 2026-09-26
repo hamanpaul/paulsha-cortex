@@ -622,6 +622,40 @@ class FanoutTests(unittest.TestCase):
         self.assertIn("docs/superpowers/plans/a.md", command)
         self.assertNotIn("copilot", command)               # executor wrapping moved to launcher
 
+    def test_dispatch_prompt_is_anchored_to_resolved_worktree(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import dispatch_ready
+
+        class _WorktreeCreator:
+            def __init__(self, path: str) -> None:
+                self.path = path
+
+            def create(self, branch, *, job_id=None, base_sha=None):
+                return self.path
+
+        with tempfile.TemporaryDirectory(prefix="dispatch anchor ") as path:
+            root = Path(path)
+            resolved_worktree = root / "worktree with spaces ;$(literal)"
+            resolved_worktree.mkdir()
+            worktree_alias = root / "alias with spaces ;$(literal)"
+            worktree_alias.symlink_to(resolved_worktree, target_is_directory=True)
+            expected_root = str(worktree_alias.resolve())
+            dispatcher = _FakeDispatcher()
+            dispatcher._worktree_creator = _WorktreeCreator(str(worktree_alias))
+            launcher = _RecordingLauncher()
+            dispatch_ready(
+                [_meta("anchored-slice", plan="docs/p.md")],
+                is_satisfied=lambda _id: True,
+                dispatcher=dispatcher,
+                persona="builder",
+                launcher=launcher,
+                git_runner=_fake_target_git_runner,
+            )
+            self.assertEqual(launcher.calls[0]["worktree"], expected_root)
+            prompt = launcher.calls[0]["prompt"]
+            self.assertIn(expected_root, prompt)
+            self.assertIn("不得讀取、寫入或執行主 checkout", prompt)
+            self.assertIn("遭拒", prompt)
+
     def test_dispatch_ready_bad_role_isolated_from_other_slices(self) -> None:
         # reviewer #112-2：未知 role 的 prompt 構建失敗只該影響該單位，
         # 其餘就緒單位照常派工，失敗被收進 DispatchReadyError（per-slice 隔離）。

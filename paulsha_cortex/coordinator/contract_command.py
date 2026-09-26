@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Mapping
 
 from paulsha_cortex.persona import render
@@ -32,6 +33,7 @@ def build_dispatch_prompt(
     *,
     task: str,
     plan_path: str,
+    worktree_root: str | None = None,
     catalog: Mapping[str, PersonaContract] | None = None,
     spec_path: str | None = None,
     spec_hash: str | None = None,
@@ -39,7 +41,7 @@ def build_dispatch_prompt(
 ) -> str:
     """強制點 ①：把 persona 契約 render 成 executor-agnostic 純文字 prompt 前言。
 
-    純字串函式、零 I/O：只嵌 plan_path 參照（agent 於 worktree 內自行讀計畫）。
+    純字串函式、零 I/O：嵌 plan_path 參照；呼叫端提供已解析 worktree_root 時，附上目錄邊界。
     未知 role → ValueError（由 render_contract_prompt 冒泡）。
     不含任何 shell/executor 包裝；executor argv 由 AgentLauncher 各自組裝（launcher.py）。
 
@@ -61,6 +63,17 @@ def build_dispatch_prompt(
         f"[TASK] {task}",
         f"[PLAN: {plan_path}]",
     ]
+    if worktree_root is not None:
+        lines.extend(
+            [
+                "",
+                "[AUTHORITATIVE WORKTREE ROOT — JSON string]",
+                json.dumps(worktree_root, ensure_ascii=False),
+                "所有 repository 檔案的讀取、寫入與命令都必須留在此根目錄內；命令 cwd 設為此目錄，repo 內目標使用相對路徑。",
+                "不得讀取、寫入或執行主 checkout（operator/base checkout）中的任何內容。",
+                "若路徑遭拒，請依目前 cwd 重新解析成此 worktree 內的相對路徑，不要重試遭拒的絕對路徑。",
+            ]
+        )
     if spec_path is None:
         lines.append("請於本 worktree 內讀取上述 plan 並依 persona 契約邊界執行。")
         return "\n".join(lines)
