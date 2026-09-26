@@ -267,7 +267,7 @@ def _identity_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
     return ProbeResult(
         "model-identities",
         "pass",
-        f"runtime-validated schema v{schema_version} with canonical agy identity",
+        f"runtime-validated schema v{schema_version} with resolvable planning identity",
         True,
     )
 
@@ -419,36 +419,34 @@ def _identity_failure_detail(exc: BaseException) -> str:
             "fix identity schema and "
             "capability settings."
         )
-    if "canonical agy planning identity missing" in message:
+    if "no resolvable planning identity" in message:
         return (
-            "canonical agy planning identity missing (category: registry-invalid); "
-            "define planning identity "
-            "with `executor: agy` and planning capability."
+            "no resolvable planning identity (category: registry-invalid); "
+            "declare a planning identity that remains eligible under the configured "
+            "resolution policy."
         )
     return (
         "model-identities validation failed. Ensure a valid identities file exists, "
-        "passes schema/contracts, and contains the canonical planning identity."
+        "passes schema/contracts, and contains at least one resolvable planning identity."
     )
 
 
 def _load_runtime_model_identities(config_root: Path) -> int:
     """Validate the exact registry consumed by planner/reviewer selection."""
-    from .coordinator.model_identities import (
-        AGY_DOMAIN,
-        AGY_LIVE_PROBE,
-        AGY_MODEL_ID,
-        load_model_identities,
-    )
+    from .coordinator import model_resolution
+    from .coordinator.model_identities import load_model_identities
 
     registry = load_model_identities(config_root)
-    identity = registry.get("agy", AGY_MODEL_ID)
-    if (
-        identity is None
-        or identity.independence_domain != AGY_DOMAIN
-        or "planning" not in identity.capabilities
-        or identity.live_probe != AGY_LIVE_PROBE
-    ):
-        raise ValueError("canonical agy planning identity missing")
+    planning_candidates = [
+        identity for identity in registry.identities if "planning" in identity.capabilities
+    ]
+    ranked = model_resolution.rank_candidates(
+        planning_candidates,
+        role="planning",
+        context=registry.resolution_context,
+    )
+    if not ranked.ordered:
+        raise ValueError("no resolvable planning identity")
     return int(registry.schema_version)
 
 
@@ -638,9 +636,9 @@ def _custom_overlay_declares_claude_review(config_root: Path) -> bool:
     if not custom.is_file():
         return False
     try:
-        from .coordinator.model_identities import _load_model_identity_file
+        from .coordinator.model_identities import load_model_identities
 
-        overlay = _load_model_identity_file(custom)
+        overlay = load_model_identities(config_root, use_packaged_default=False)
     except (ImportError, ValueError):
         return False
     return any(

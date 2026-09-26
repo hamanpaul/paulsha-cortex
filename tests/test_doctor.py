@@ -264,6 +264,72 @@ def test_identity_probe_uses_runtime_schema_validator(monkeypatch, tmp_path: Pat
     assert "validation" in lowered
 
 
+def test_identity_probe_reports_resolvable_planning_identity(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda _config_root: 3,
+    )
+
+    result = _identity_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(tmp_path / "config")}, tmp_path
+    )
+
+    assert result.status == "pass"
+    assert "resolvable planning identity" in result.detail
+
+
+def test_runtime_model_identity_validation_accepts_alternate_planner(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """doctor 以可解析的 planner 為準，不要求保留 canonical agy 身分。"""
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+    from paulsha_cortex.doctor import _load_runtime_model_identities
+
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "claude",
+                "model_id": "claude-opus-5",
+                "independence_domain": "anthropic",
+                "capabilities": ["planning"],
+            }
+        ],
+        schema_version=3,
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.model_identities.load_model_identities",
+        lambda _config_root: registry,
+    )
+
+    assert _load_runtime_model_identities(tmp_path) == 3
+
+
+def test_runtime_model_identity_validation_requires_resolvable_planner(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+    from paulsha_cortex.doctor import _load_runtime_model_identities
+
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "gpt-5.6-luna",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            }
+        ],
+        schema_version=3,
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.model_identities.load_model_identities",
+        lambda _config_root: registry,
+    )
+
+    with pytest.raises(ValueError, match="no resolvable planning identity"):
+        _load_runtime_model_identities(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("exc", "needles"),
     [
@@ -276,7 +342,10 @@ def test_identity_probe_uses_runtime_schema_validator(monkeypatch, tmp_path: Pat
             "model-identities schema_version must be one of [1, 2], got 99",
             ("schema", "contract", "registry-invalid", "model-identities"),
         ),
-        ("canonical agy planning identity missing", ("canonical", "agy", "planning", "registry-invalid")),
+        (
+            "no resolvable planning identity",
+            ("resolvable", "planning", "registry-invalid"),
+        ),
     ],
 )
 def test_identity_probe_returns_actionable_categories_for_known_errors(
@@ -312,6 +381,45 @@ def test_identity_probe_unknown_error_uses_safe_boundary_message(monkeypatch, tm
     assert "top secret marker" not in lower
     assert "TOP_SECRET_MARKER" not in detail
     assert "/private/operator" not in detail
+
+
+def test_custom_overlay_claude_review_check_uses_public_loader(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+    from paulsha_cortex.doctor import _custom_overlay_declares_claude_review
+
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "model-identities.yaml").write_text("overlay", encoding="utf-8")
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "claude",
+                "model_id": "sonnet-reviewer",
+                "independence_domain": "anthropic",
+                "capabilities": ["review"],
+            }
+        ],
+        schema_version=2,
+    )
+    calls = []
+
+    def public_loader(root, *, use_packaged_default=True):
+        calls.append((root, use_packaged_default))
+        return registry
+
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.model_identities.load_model_identities",
+        public_loader,
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.model_identities._load_model_identity_file",
+        lambda *_args, **_kwargs: pytest.fail("doctor called the private parser"),
+    )
+
+    assert _custom_overlay_declares_claude_review(config)
+    assert calls == [(config, False)]
 
 
 def test_review_sandbox_probe_requires_dependencies_only_for_claude_reviewer(

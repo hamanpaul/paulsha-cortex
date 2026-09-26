@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#581 persona fail-loud 殘項**：doctor 依解析政策確認至少一個可用的 planning identity，不再要求 canonical agy；未知 workflow persona 明確拒絕；Claude review overlay 判定改用公開 loader。核對後確認各派工入口共用 `_dispatch_workflow_card`，沿用既有 `resolved_model_chain` provenance 寫入點。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

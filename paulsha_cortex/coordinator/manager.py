@@ -9493,9 +9493,9 @@ def _identity_candidates_for_persona(persona: str, identities: IdentityRegistry,
     優先」的排序偏好，不是合法性限制；拿它驗證覆寫會把偏好升級成硬約束，讓
     operator 明確指定的 identity 被誤判為違規。
     """
-    # 非 planner／reviewer 一律視為 builder（比照 #205 之前既有的 else 分支
-    # catch-all 行為，deck 目前只會派出 planner/build/reviewer 三種 persona）。
-    capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona, "build")
+    capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona)
+    if capability is None:
+        raise ValueError(f"unknown workflow persona: {persona}")
     candidates = [item for item in identities.identities if capability in item.capabilities]
     if persona == "builder":
         # cg 是 zero-tool executor，不能承接需要 workspace-write 的 builder 卡。
