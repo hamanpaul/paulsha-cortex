@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#546 recovery action 投影對齊 admission**：claim、Monitor work list/show 與 status attention 共用實際可受理的 recovery actions；owner-bound slice 條件成立時會列出 `recover-pre-candidate`。
 - **#492 foreign review tier 前置檢查**：required review 的 builder slice 會在建立工作區與啟動 builder 前驗證 project policy tier；缺少或非法值會指出選定 manifest 路徑及允許值，無 manifest 時維持 `shareable` 預設。
 - **#571、#579 reviewer 路徑綁定**：review gate evaluation 檔名納入 candidate 短 SHA；reviewer sandbox 目錄名納入 job id，並於新 reviewer 派工前回收前代 claim era 已終止的孤兒 sandbox，回收失敗時記錄 warning 並繼續派工。
 - **#810 merge 後 Todo 勾選狀態僅供診斷**：已合併 WorkflowRun 的遠端結案與 Monitor 不再因 workstream Todo 未勾而阻擋有效交付；Todo 證據仍須存在且可讀，archived OpenSpec tasks 的完成要求維持不變。

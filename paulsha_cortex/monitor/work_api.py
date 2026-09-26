@@ -705,6 +705,9 @@ class WorkModelRefresher:
                     closure_by_work=_parse_closure_evidence(
                         observations, correlation=correlation, repo=repo
                     ),
+                    workflow_next_actions_by_work=observations.get(
+                        "workflow_next_actions", {}
+                    ),
                 )
                 projected_items.extend(projection.items)
                 explanations.update(
@@ -798,6 +801,7 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
         "closure_by_work": {},
         "validated_completions": {},
         "schema_retry": {},
+        "workflow_next_actions": {},
         "inferred_signals": [],
         "remote_openspec": {"active": [], "archived": []},
         "remote_openspec_observed": False,
@@ -815,6 +819,13 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
             value = observations.get("workflow_links", {})
             if isinstance(value, Mapping):
                 merged["workflow_links"].update(value)
+            next_actions = observations.get("workflow_next_actions", {})
+            if isinstance(next_actions, Mapping):
+                merged["workflow_next_actions"].update(
+                    (work_id, row)
+                    for work_id, row in next_actions.items()
+                    if isinstance(work_id, str) and isinstance(row, Mapping)
+                )
             retries = observations.get("schema_retry", {})
             if isinstance(retries, Mapping):
                 for work_id, rows in retries.items():

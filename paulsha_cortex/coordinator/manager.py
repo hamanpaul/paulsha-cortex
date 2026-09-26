@@ -312,6 +312,42 @@ def _resolve_work_owner_slice(registry, *, repo: str, work_id: str) -> dict:
     return matches[0]
 
 
+def _pre_candidate_recovery_admission(
+    registry, row: dict, *, expected_owner: dict | None = None
+) -> tuple[dict[str, str], dict | None]:
+    """讀取 recover-pre-candidate 的實際 owner/job 前置條件，不執行回收。"""
+    owner_identity = _owner_identity_matches(row, expected=expected_owner)
+    candidate = row.get("candidate")
+    if isinstance(candidate, str) and verification.SAFE_SHA_RE.fullmatch(candidate) is not None:
+        raise ValueError("recover-pre-candidate requires null candidate")
+    if row.get("state") not in {"needs_human", "failed", "pending"}:
+        raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")
+    builder_job_id = row.get("builder_job_id")
+    if row.get("state") == "pending" and builder_job_id is None:
+        return owner_identity, None
+    if not isinstance(builder_job_id, str) or not builder_job_id:
+        raise RuntimeError("recover-pre-candidate requires an owner-bound builder job")
+    try:
+        builder_job = registry.get_job(builder_job_id)
+    except Exception as exc:
+        raise RuntimeError("recover-pre-candidate owner-bound builder job is unavailable") from exc
+    if (
+        builder_job.get("owner_identity") != owner_identity
+        or builder_job.get("attempt_id") != row.get("attempt_id")
+    ):
+        raise RuntimeError("recover-pre-candidate builder job identity mismatch")
+    worktree = builder_job.get("worktree")
+    if isinstance(worktree, str) and worktree and Path(worktree).exists():
+        marker = job_workspace.read_marker(worktree)
+        if (
+            not isinstance(marker, dict)
+            or marker.get("owner_identity") != owner_identity
+            or marker.get("attempt_id") != row.get("attempt_id")
+        ):
+            raise RuntimeError("recover-pre-candidate workspace marker identity mismatch")
+    return owner_identity, builder_job
+
+
 def _recover_pre_candidate_core(
     registry,
     *,
@@ -327,14 +363,9 @@ def _recover_pre_candidate_core(
         row = registry.get_slice(slice_id)
     except KeyError as exc:
         raise RuntimeError("recover-pre-candidate target slice is unavailable") from exc
-    owner_identity = _owner_identity_matches(row, expected=expected_owner)
-    candidate = row.get("candidate")
-    # 與 needs_human 動作清單（valid_candidate）同一判準：非合法 SHA 的殘值視同尚無
-    # candidate，仍可 recover；只有合法 SHA candidate 才拒絕。
-    if isinstance(candidate, str) and verification.SAFE_SHA_RE.fullmatch(candidate) is not None:
-        raise ValueError("recover-pre-candidate requires null candidate")
-    if row.get("state") not in {"needs_human", "failed", "pending"}:
-        raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")
+    owner_identity, builder_job = _pre_candidate_recovery_admission(
+        registry, row, expected_owner=expected_owner
+    )
     builder_job_id = row.get("builder_job_id")
     if row.get("state") == "pending" and builder_job_id is None:
         return {
@@ -345,27 +376,8 @@ def _recover_pre_candidate_core(
             "gate_state": "pending",
             "result": "ok",
         }
-    if not isinstance(builder_job_id, str) or not builder_job_id:
-        raise RuntimeError("recover-pre-candidate requires an owner-bound builder job")
-    try:
-        builder_job = registry.get_job(builder_job_id)
-    except Exception as exc:
-        raise RuntimeError("recover-pre-candidate owner-bound builder job is unavailable") from exc
-    if (
-        builder_job.get("owner_identity") != owner_identity
-        or builder_job.get("attempt_id") != row.get("attempt_id")
-    ):
-        raise RuntimeError("recover-pre-candidate builder job identity mismatch")
-
+    assert builder_job is not None
     worktree = builder_job.get("worktree")
-    if isinstance(worktree, str) and worktree and Path(worktree).exists():
-        marker = job_workspace.read_marker(worktree)
-        if (
-            not isinstance(marker, dict)
-            or marker.get("owner_identity") != owner_identity
-            or marker.get("attempt_id") != row.get("attempt_id")
-        ):
-            raise RuntimeError("recover-pre-candidate workspace marker identity mismatch")
     branch_hint = row.get("branch")
     reclaim = worktree_reclaim.reclaim_recorded_or_derived(
         recorded_path=worktree if isinstance(worktree, (str, Path)) and worktree else None,
@@ -1562,13 +1574,10 @@ def workflow_status_entry(
             main_sync_retry_build_next_step_hint,
         )
 
-        next_actions = (
-            *next_actions,
-            *(
-                item
-                for item in _phase_recovery_actions(run, registry)
-                if item not in next_actions
-            ),
+        next_actions = needs_human_next_actions(
+            phase=getattr(run, "current_phase", None),
+            planning_failure_classification=hint_classification,
+            job_recovery_actions=_phase_recovery_actions(run, registry),
         )
         if (
             persisted_next_step_hint is None
@@ -6070,9 +6079,10 @@ def _assert_terminal_gate_consistency(
     只要有任何確定性 gate 的實際結果不是 passed，terminal 自稱的 ``passed`` 一律
     fail closed，並把「哪一個 gate、期望值、實際值」保留在錯誤訊息裡。
 
-    會跑 gate 的 phase（build／verify）若連 ledger 都不存在，代表 wrapper 的 gate
-    階段沒跑完，同樣 fail closed：模型文字、exit code 為 0、無明確錯誤三者皆不構成
-    成功授權。
+    會跑且要求本卡 gate ledger 的 phase（build）若連 ledger 都不存在，代表 wrapper
+    的 gate 階段沒跑完，同樣 fail closed：模型文字、exit code 為 0、無明確錯誤三者皆
+    不構成成功授權。verify phase 不要求 gate ledger，另由 deterministic verification
+    report 提供獨立證據。
 
     #307：``registry`` 為選填——提供時會用來解析目前 card 的 ``test_policy``，讓
     ``test_policy=red-required``（tdd-red）卡對測試 gate 的語意反轉在
