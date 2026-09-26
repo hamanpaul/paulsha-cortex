@@ -318,7 +318,10 @@ def _recover_pre_candidate_core(
     except KeyError as exc:
         raise RuntimeError("recover-pre-candidate target slice is unavailable") from exc
     owner_identity = _owner_identity_matches(row, expected=expected_owner)
-    if row.get("candidate") is not None:
+    candidate = row.get("candidate")
+    # 與 needs_human 動作清單（valid_candidate）同一判準：非合法 SHA 的殘值視同尚無
+    # candidate，仍可 recover；只有合法 SHA candidate 才拒絕。
+    if isinstance(candidate, str) and verification.SAFE_SHA_RE.fullmatch(candidate) is not None:
         raise ValueError("recover-pre-candidate requires null candidate")
     if row.get("state") not in {"needs_human", "failed", "pending"}:
         raise RuntimeError("recover-pre-candidate requires needs_human or failed slice")

@@ -606,3 +606,38 @@ def test_manager_recovery_does_not_report_success_when_manifest_readback_fails(
             specs_dir=str(tmp_path / "specs"),
             handoff_dir=str(handoff_dir),
         )
+
+
+@pytest.mark.parametrize(("candidate", "recoverable"), [("not-a-sha", True), ("a" * 40, False)])
+def test_recovery_core_matches_action_list_candidate_validity(
+    tmp_path: Path, monkeypatch, candidate: str, recoverable: bool
+) -> None:
+    """動作清單把非合法 SHA 殘值視同尚無 candidate；共用 core 必須用同一判準。"""
+    owner = _owner("hamanpaul/project-a", "work-42", "work-42")
+    row = {**_slice("work-42", spec_path="specs/work-42.md", owner=owner), "candidate": candidate}
+    jobs = {"job-work-42": _job(row, tmp_path / "workspace")}
+    monkeypatch.setattr(
+        manager.worktree_reclaim, "reclaim_recorded_or_derived", lambda **kwargs: None
+    )
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    registry = RecoveryRegistry([row], jobs)
+    registry._state_path = tmp_path / "jobs.json"
+
+    def run():
+        return manager.apply_slice_action(
+            SimpleNamespace(_registry=registry, _git_runner=None),
+            slice_id="work-42",
+            action="recover-pre-candidate",
+            actor="operator",
+            specs_dir=str(tmp_path / "specs"),
+            handoff_dir=str(handoff_dir),
+        )
+
+    if recoverable:
+        assert registry.get_slice("work-42")["state"] != "pending"
+        run()
+        assert registry.get_slice("work-42")["state"] == "pending"
+    else:
+        with pytest.raises(Exception, match="null candidate|action-not-allowed"):
+            run()
