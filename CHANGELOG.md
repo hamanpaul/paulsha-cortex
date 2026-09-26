@@ -642,6 +642,7 @@
 - **#585、#567 Monitor spool 與 tree 讀取**：每輪只掃一次共享 spool，producer 拒絕 repo 形狀錯誤的事件，quarantine 自隔離起保留 30 天；Monitor 改由 canonical checkout 的本機 `git ls-tree -r -t -z` 讀 default-branch tree，shallow ancestry 無法判定時明確診斷且不自動 unshallow。
 - **#1086 review→ship outcome 順序**：一般 review→ship closure 先 durable 寫入唯一、綁定 CompletionRecord／Candidate／merge 的 shipped outcome，確認讀回後才由 Manager 將 WorkflowRun 標成 done；相同交付重入沿用原 row，append／讀回失敗或綁定衝突時不完成終態轉換。
 - **#1068、#1069、#1070、#1055 既有 Candidate／PR authority 恢復**：registry 以 exact WorkflowRun snapshot 重設 verify/review；已有 Candidate 與 open PR 僅能由明確 `resume` 恢復，並以同 run delivery journal read-back 驗證重入不重複寫入。
+- **#480、#494、#495 builder 工具契約**：Claude job 依 persona 投影窄工具授權並於派工前拒絕無法表達的工具；提供限單檔的 executable mode 與復原操作、Candidate Git mode 驗收，以及 Edit 超限前置拒絕。
 - **#492 foreign review tier 前置檢查**：required review 的 builder slice 會在建立工作區與啟動 builder 前驗證 project policy tier；缺少或非法值會指出選定 manifest 路徑及允許值，無 manifest 時維持 `shareable` 預設。
 - **#571、#579 reviewer 路徑綁定**：review gate evaluation 檔名納入 candidate 短 SHA；reviewer sandbox 目錄名納入 job id，並於新 reviewer 派工前回收前代 claim era 已終止的孤兒 sandbox，回收失敗時記錄 warning 並繼續派工。
 - **#810 merge 後 Todo 勾選狀態僅供診斷**：已合併 WorkflowRun 的遠端結案與 Monitor 不再因 workstream Todo 未勾而阻擋有效交付；Todo 證據仍須存在且可讀，archived OpenSpec tasks 的完成要求維持不變。

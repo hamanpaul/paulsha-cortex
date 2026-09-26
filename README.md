@@ -614,6 +614,8 @@ verification:
   required_artifacts:
     - path: reports/policy.json
       must_change: true
+    - path: script/deliver.py
+      mode: "100755"
   checks:
     - kind: persona-scope
     - kind: command
@@ -632,6 +634,7 @@ verification:
 
 - v1 只支援 `tier: shareable`；非 shareable 會 fail-closed 到 `needs_human`。
 - verification command 只接受 typed argv（`shell=False`）；採 sanitized env，但這不是 sandbox，不保證隔離 untrusted code。
+- `required_artifacts` 可選擇以 `mode: "100644"` 或 `mode: "100755"` 宣告 Candidate Git tree 的預期檔案 mode；未宣告時不檢查 mode。
 - verification frontmatter 的 inline `argv` list 由 zero-dependency YAML subset parser 解析；含逗號或 `]` 的元素需使用單／雙引號，單／雙引號內的反斜線跳脫可保留引號等字面值，尾逗號可容忍，前導／中間空元素與未閉合引號會拒絕。
 - `repo` 為 optional 顯式歸屬宣告（`owner/repo`，#469）：宣告後派工會寫進 builder/reviewer job 的 `workflow_repo`，`recent_done`／`slices` 的 repo 歸屬即投影此值；未宣告維持 `null`，不從本機路徑或 git remote 推斷。非法 shape（不是恰一個 `/` 或任一段為空）會 fail-closed 落 `hold`。
 - `cortex deck compile` 可用 `--repo owner/name` 將明確 repo 寫入輸出的 spec；省略時仍為 `repo: null`，不從本機路徑或 git remote 推斷（#473）。
