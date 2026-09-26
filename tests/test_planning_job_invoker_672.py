@@ -636,6 +636,40 @@ def test_scratch_and_log_slots_are_removed_after_the_call(tmp_path, monkeypatch)
     assert list(harness.spool.iterdir()) == []
 
 
+def test_codex_planner_in_template_unit_uses_outer_sandbox_only(tmp_path, monkeypatch) -> None:
+    """#716 B：job 模式只會跑在 Trust Root 模板 unit（`RestrictNamespaces=yes`）。
+
+    codex 0.157 的 `--sandbox read-only` 會啟 bwrap，在該 unit 內必然失敗；唯讀
+    邊界改由 unit 的 `ProtectSystem=strict`＋唯讀 scratch 承擔。模式值取自
+    `registry.SANDBOX_MODE_DERIVATION` 的 outer-unit 欄，不在 planning 另寫一份。
+    """
+
+    from paulsha_cortex.trust_root import registry as trust_registry
+
+    harness = _Harness(tmp_path, monkeypatch, log_payload='{"ok":true}')
+    invoker = harness.invoker(monkeypatch)
+    invoker.run(_invocation(IDENTITY_CODEX))
+
+    command = harness.specs[-1]["command"]
+    expected = trust_registry.sandbox_mode_for(
+        trust_registry.JobWriteContract.PLANNER_READ_ONLY, trust_root_outer_unit=True
+    )
+    assert expected == "danger-full-access"
+    assert command[command.index("--sandbox") + 1] == expected
+    assert not any("use_legacy_landlock" in token for token in command)
+
+
+def test_codex_planner_direct_argv_keeps_read_only_sandbox(tmp_path) -> None:
+    argv = planning_runtime._planning_argv(
+        IDENTITY_CODEX,
+        "prompt",
+        str(tmp_path),
+        tmp_path,
+        last_message_path=tmp_path / "last.json",
+    )
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+
+
 def test_direct_mode_is_unchanged(tmp_path) -> None:
     """direct 模式逐字不變——本票只新增第二個實作，不動第一個。"""
 

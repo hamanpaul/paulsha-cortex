@@ -80,8 +80,14 @@ def _planning_argv(
     worktree: Path,
     *,
     last_message_path: str | Path,
+    trust_root_outer_unit: bool = False,
 ) -> list[str]:
     """一次 planning 呼叫的 executor argv。
+
+    `trust_root_outer_unit` 只由 :class:`planning_job.JobPlanningInvoker` 傳 True——
+    它的每一次呼叫都落在 Trust Root 模板 unit（`RestrictNamespaces=yes`）內，codex
+    0.157 的內層沙箱（bwrap）在那裡起不來，唯讀邊界改由 unit 承擔（#716 B）。
+    direct 模式維持預設 False，codex 仍帶 `--sandbox read-only`。
 
     `last_message_path` 是**必填的關鍵字參數**，而且本函式不對它做任何推導——#714
     缺陷 2 的形狀逐字是「codex 的 `-o` 指著一個 job 寫不進去的路徑」，而它之所以
@@ -102,8 +108,15 @@ def _planning_argv(
             read_only=True,
         )
     if identity.executor == "codex":
+        from ..trust_root import registry as trust_registry
+
+        # 模式值只有一份真相：`SANDBOX_MODE_DERIVATION` 的 planner 唯讀列（#716）。
+        sandbox_mode = trust_registry.sandbox_mode_for(
+            trust_registry.JobWriteContract.PLANNER_READ_ONLY,
+            trust_root_outer_unit=trust_root_outer_unit,
+        )
         return [
-            "codex", "exec", prompt, "--json", "--sandbox", "read-only",
+            "codex", "exec", prompt, "--json", "--sandbox", str(sandbox_mode),
             "--model", identity.model_id, "-o", str(last_message_path),
             "-C", str(worktree), "--skip-git-repo-check",
         ]
