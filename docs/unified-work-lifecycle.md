@@ -291,6 +291,15 @@ PR #54 僅識別目前仍為 open 的 delivery target；此編號本身不是 me
 
 ## Terminal/result contract（#261）
 
+**#803 verification full-suite 證據**：Manager 只在同一 run 的成功 build job ledger
+之 `worktree_state.head`、build job `subject_head` 均符合目前 Candidate，且 ledger
+含 `pytest` 結果時，才把路徑、canonical sha256、命令、exit code 與摘要附入
+verification prompt。verifier 仍須檢視 diff 並跑 focused／diff 相關測試；唯讀 sandbox
+中的 ACL／xattr、唯讀檔案系統或過長 `TMPDIR`／AF_UNIX `sun_path` 環境失敗，不得覆蓋
+相符 ledger 已證明的 full-suite 綠燈。ledger 記錄失敗時，focused 綠燈也不能覆蓋；ledger
+缺席或 Candidate 不符時維持原判準。此 ledger 只證明 full-suite gate，不會自動授權
+verification 通過。
+
 `paulsha_cortex/coordinator/terminal_contract.py` 是 terminal/result 契約的單一真相源，供 build、verify、review 三類 card 共用。
 
 **Canonical envelope。** envelope 帶 `schema_version`，並完整支援 `passed`、`failed`、`needs_human` 三種終局狀態與結構化 `diagnostics`；三類 card 都不存在「只有成功形狀才合法」的路徑。不帶 canonical 版本的舊 payload 走相容讀取路徑並記 legacy 標記，既有 run 不因版本差異被拒收。
@@ -307,7 +316,7 @@ JSON string data 中的原始 Unicode NEL（`U+0085`）、line separator（`U+20
 
 三段以 `;` 串接，因此模型失敗時 sentinel 與 ledger 仍會產生；sentinel 早於 gate 階段寫入，模型的 exit code 不會被 gate 耗時污染；gate 階段輸出導向 `/dev/null`，不污染 JSONL 的 terminal evidence。gate 清單由 operator 以 `PSC_GATE_CMD_<NAME>` 環境變數宣告（沿用 `PSC_PREFLIGHT_CMD` 的 typed-argv 規範，拒絕 shell wrapper），exit code 由真實 subprocess 產生。模型既不能選擇跑哪些 gate、不能決定 exit code，也拿不到 ledger 路徑（`<log_dir>/<slice_id>.gates.json` 由 job 的 `log_path` 推導，模型的 cwd 是 worktree）。跑不起來或逾時的 gate 一律記為 `failed`，避免 operator 設定壞掉靜默變成 fail-open。
 
-**成功必須被證明。** `manager.terminalize_workflow_job` 在任何狀態採信之前，先以 `_assert_terminal_gate_consistency` 做確定性 cross-check：只要 ledger 中有任何 gate 的實際結果不是 passed，terminal 自稱的 `passed` 一律 fail closed，錯誤訊息保留哪一個 gate、期望值與實際值。「沒提到」不能當作「沒失敗」——terminal 完全不引用某個失敗的 gate 也一樣被否決。ledger 自身矛盾（記了非 0 exit code 卻標 passed）視同失敗。envelope 內的 `gate_evidence` 是模型「自述跑了哪些 gate」的宣告，manager 以 ledger 對照：宣稱跑了 ledger 中不存在的 gate，或宣稱的結果與 ledger 不符，皆 fail closed。會實際跑 gate 的 phase（`build`／`verify`，見 `GATE_LEDGER_REQUIRED_PHASES`）若連 ledger 都不存在，代表 wrapper 的 gate 階段沒跑完，同樣 fail closed。模型輸出的自然語言、exit code 為 0、以及「沒有明確錯誤」三者皆不構成成功授權。
+**成功必須被證明。** `manager.terminalize_workflow_job` 在任何狀態採信之前，先以 `_assert_terminal_gate_consistency` 做確定性 cross-check：只要 ledger 中有任何 gate 的實際結果不是 passed，terminal 自稱的 `passed` 一律 fail closed，錯誤訊息保留哪一個 gate、期望值與實際值。「沒提到」不能當作「沒失敗」——terminal 完全不引用某個失敗的 gate 也一樣被否決。ledger 自身矛盾（記了非 0 exit code 卻標 passed）視同失敗。envelope 內的 `gate_evidence` 是模型「自述跑了哪些 gate」的宣告，manager 以 ledger 對照：宣稱跑了 ledger 中不存在的 gate，或宣稱的結果與 ledger 不符，皆 fail closed。會實際跑並要求本卡 gate ledger 的 phase（`build`，見 `GATE_LEDGER_REQUIRED_PHASES`）若連 ledger 都不存在，代表 wrapper 的 gate 階段沒跑完，同樣 fail closed。模型輸出的自然語言、exit code 為 0、以及「沒有明確錯誤」三者皆不構成成功授權。
 
 **operator 未宣告任何 gate 時的語意。** 沒有 `PSC_GATE_CMD_*` 時 wrapper 仍會寫出 `gates: []` 的 ledger：ledger 的**存在**證明 wrapper 跑完了，內容為空則代表 operator 明確選擇不設 gate。此時 `passed` 會被放行——這是 operator 的顯式設定，不是靜默旁路，但也表示此設定下沒有 R2 保護。要讓保護生效，至少宣告一個確定性 gate。
 
