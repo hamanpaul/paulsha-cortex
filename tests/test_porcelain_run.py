@@ -61,6 +61,44 @@ def _retry_card_command(*options: str) -> list[str]:
     ]
 
 
+@pytest.mark.parametrize("source", ["flag", "payload"])
+def test_run_work_retry_build_rejects_expected_run_id_before_submission(
+    source: str,
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    command = [
+        "run",
+        "work",
+        "retry-build",
+        RETRY_CARD_WORK_ID,
+        "--repo",
+        "hamanpaul/paulsha-cortex",
+    ]
+    if source == "flag":
+        command.extend(
+            ["--expected-run-id", RETRY_CARD_RUN_ID, "--expected-candidate", "a" * 40]
+        )
+    else:
+        payload = tmp_path / "retry-build.json"
+        payload.write_text(
+            json.dumps(
+                {
+                    "expected_candidate": "a" * 40,
+                    "expected_run_id": RETRY_CARD_RUN_ID,
+                }
+            ),
+            encoding="utf-8",
+        )
+        command.extend(["--payload", str(payload)])
+
+    assert _run_cli(command) == 2
+
+    assert "retry-build" in capsys.readouterr().err
+    assert not (control_runtime / "requests" / f"{REQUEST_ID}.json").exists()
+
+
 def _write_done(
     *,
     status: str = "ok",

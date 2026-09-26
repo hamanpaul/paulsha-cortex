@@ -620,7 +620,7 @@ def test_abandon_reclaim_is_a_no_op_after_immediate_reclaim(tmp_path: Path) -> N
     「registry 沒這筆、目錄也不在」判定為 `absent`（成功），因此 abandon 不會因為
     「東西已經被收掉了」而落一堆 failed 診斷——那正是 #658 要避免的新死路。
 
-    **branch 仍留在來源樹上**：那是 #613 的範圍，即時回收一個 branch 名都沒碰。
+    有 candidate commit 時 #613 會先用 archive tag 保留，再刪除 build branch。
     """
 
     workspace = _source_repo(tmp_path / "source")
@@ -665,8 +665,16 @@ def test_abandon_reclaim_is_a_no_op_after_immediate_reclaim(tmp_path: Path) -> N
     work_actions._reclaim_abandoned_build_worktrees(
         run, registry, state_path=state_path
     )
-    # #613：branch 與它承載的 commit 原封不動——回收 branch 不在本票範圍。
-    assert job_workspace.source_branch_head(workspace, branch) == candidate
+    # #613：保留 branch 上的 candidate commit 為 archive tag，再退役 branch ref。
+    assert subprocess.run(
+        ["git", "-C", str(workspace), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        capture_output=True,
+    ).returncode == 1
+    archived = [
+        tag for tag in _git(workspace, "tag", "--list", "archive/*").splitlines()
+        if _git(workspace, "rev-parse", f"refs/tags/{tag}").strip() == candidate
+    ]
+    assert archived, "有超出 base 的 candidate commit 時必須先保留 archive tag"
 
 
 def test_gc_still_protects_the_delivery_branch_when_no_workspace_is_left(

@@ -87,6 +87,19 @@ def test_archive_gate_requires_tasks_specs_docs_and_changelog() -> None:
         assert not result.allowed
 
 
+def test_archive_gate_names_missing_change_specific_changelog_entry() -> None:
+    facts = ArchiveGateFacts(
+        tasks_complete=True,
+        canonical_specs_valid=True,
+        doc_references_valid=True,
+        changelog_present=False,
+    )
+
+    assert validate_archive_gate(facts).reasons == (
+        "change-specific-changelog-entry-missing",
+    )
+
+
 def test_official_openspec_archive_argv_is_non_interactive_and_typed() -> None:
     assert build_openspec_archive_argv("unified-work-lifecycle") == [
         "openspec",

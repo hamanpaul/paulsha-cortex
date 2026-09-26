@@ -102,7 +102,7 @@ def validate_archive_gate(facts: ArchiveGateFacts) -> GateResult:
     if not facts.doc_references_valid:
         reasons.append("doc-reference-invalid")
     if not facts.changelog_present:
-        reasons.append("changelog-missing")
+        reasons.append("change-specific-changelog-entry-missing")
     return GateResult(allowed=not reasons, reasons=tuple(reasons))
 
 

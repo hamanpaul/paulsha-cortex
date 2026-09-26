@@ -1,0 +1,1 @@
+修正 #876、#936、#558、#613：archive gate 接受 issue-prefix changelog fragment 並提供明確的缺項診斷；retry-build CLI 送件前拒絕不支援的 `expected_run_id`；abandon 即時 reconcile 該 run 的 planning transaction，並在回收 build worktree 後退役 branch，有超出 base 的 commit 時先建立 archive tag 保留。
