@@ -660,6 +660,27 @@ def build_request_executor(
     stage_evidence_validator: Callable[[dict[str, str]], bool] | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    def decomposition_intake_for(repo: str, registry):
+        def intake(child_work_id: str):
+            args = {
+                "action": "intake",
+                "repo": repo,
+                "work_id": child_work_id,
+            }
+            if work_action_fn is not None:
+                return work_action_fn(args=args, requested_by="manager-daemon")
+            return manager.apply_work_action(
+                args=args,
+                requested_by="manager-daemon",
+                registry=registry,
+                runtime_factory=(
+                    workflow_runtime_factory
+                    or planning_runtime.build_production_planning_runtime
+                ),
+            )
+
+        return intake
+
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
         request_specs_dir = args.get("specs_dir") or specs_dir
@@ -762,6 +783,9 @@ def build_request_executor(
                     ship_validator=active_ship_validator,
                     operator_resume=True,
                     builder_todo_admission_loader=_builder_todo_admission_for_run,
+                    decomposition_intake=decomposition_intake_for(
+                        resume_run.repo, registry
+                    ),
                 )
             result = manager.apply_workflow_action(
                 registry,
@@ -893,6 +917,9 @@ def build_request_executor(
                             ship_validator=active_ship_validator,
                             operator_resume=True,
                             builder_todo_admission_loader=_builder_todo_admission_for_run,
+                            decomposition_intake=decomposition_intake_for(
+                                run.repo, registry
+                            ),
                         )
                         result["result"].update(resumed)
                         result["result"]["run"] = registry.get_workflow_run(
