@@ -732,7 +732,7 @@ def test_authority_restart_reset_syncs_claim_key_to_new_authority(tmp_path: Path
     assert expected_new_claim_key != old_claim_key
 
     updated = registry._manager_reset_workflow_for_authority_restart(
-        run.run_id, authority_digest=new_digest
+        run.run_id, expected_run=run, authority_digest=new_digest
     )
 
     assert updated.source_revision == new_digest

@@ -1286,6 +1286,161 @@ def _expected_claim_key(authority) -> str:
     )
 
 
+def _candidate_recovery_block(run, reason: str) -> dict[str, Any]:
+    return {"action": "blocked", "reason": reason, "run": run.to_dict()}
+
+
+def _candidate_recovery_journal_snapshot(*, state_path: Path, run, authority):
+    journal = _load_runs(state_path)
+    row = journal["runs"].get(run.run_id)
+    if not isinstance(row, dict):
+        raise ValueError("existing-candidate-journal-missing")
+    expected = {
+        "run_id": run.run_id,
+        "claim_key": run.claim_key,
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "mapped_prs": list(authority.mapped_prs),
+        "workflow_step_ids": [
+            f"{run.run_id}:{step.phase}:{step.card}" for step in run.steps
+        ],
+    }
+    if any(row.get(field) != value for field, value in expected.items()):
+        raise ValueError("existing-candidate-journal-identity-mismatch")
+    return {"revision": journal["revision"], "row": copy.deepcopy(row)}
+
+
+def _existing_candidate_pr_facts(*, runner: Runner, repo: str, pr_number: int):
+    github = GitHubDeliveryClient(runner=runner)
+    lifecycle = github.fetch_pr_lifecycle_status(repo=repo, pr_number=pr_number)
+    if lifecycle.number != pr_number or lifecycle.state != "open" or lifecycle.terminal:
+        return lifecycle.state, None
+    merge_status = github.fetch_merge_status(repo=repo, pr_number=pr_number)
+    return lifecycle.state, merge_status.pr_head
+
+
+def _resume_existing_candidate_after_authority_change(
+    *,
+    run,
+    authority,
+    snapshot_path: str | Path | None,
+    state_path: Path,
+    workflow_registry,
+    runner: Runner,
+) -> dict[str, Any]:
+    from .registry import ACTIVE_JOB_STATUSES
+
+    if (
+        run.status != "ongoing"
+        or run.current_phase not in {"verify", "review", "ship"}
+        or not isinstance(run.candidate_head, str)
+        or verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is None
+        or run.verified_head != run.candidate_head
+        or len(authority.mapped_prs) != 1
+        or run.pr_refs != (f"{authority.repo}#{authority.mapped_prs[0]}",)
+        or run.issue_refs
+        != tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
+        or not _openspec_refs_compatible(run, authority)
+    ):
+        return _candidate_recovery_block(run, "existing-candidate-identity-mismatch")
+    if workflow_registry.get_workflow_run(run.run_id) != run:
+        return _candidate_recovery_block(run, "existing-candidate-registry-conflict")
+    if any(
+        job.get("workflow_run_id") == run.run_id
+        and job.get("status") in ACTIVE_JOB_STATUSES
+        for job in workflow_registry.list_jobs()
+    ):
+        return _candidate_recovery_block(run, "existing-candidate-active-job")
+    try:
+        journal_before = _candidate_recovery_journal_snapshot(
+            state_path=state_path, run=run, authority=authority
+        )
+    except (ValueError, OSError):
+        return _candidate_recovery_block(run, "existing-candidate-journal-mismatch")
+    pr_number = authority.mapped_prs[0]
+    try:
+        remote_before = _existing_candidate_pr_facts(
+            runner=runner, repo=authority.repo, pr_number=pr_number
+        )
+    except (RuntimeError, ValueError, OSError):
+        return _candidate_recovery_block(run, "existing-pr-facts-unavailable")
+    if remote_before != ("open", run.candidate_head):
+        return _candidate_recovery_block(run, "existing-pr-head-mismatch")
+
+    new_digest = work_authority_digest(authority)
+    try:
+        updated = workflow_registry._manager_reset_workflow_for_authority_restart(
+            run.run_id,
+            expected_run=run,
+            authority_digest=new_digest,
+        )
+    except (RuntimeError, ValueError):
+        return _candidate_recovery_block(
+            workflow_registry.get_workflow_run(run.run_id),
+            "existing-candidate-registry-conflict",
+        )
+
+    try:
+        fresh_authority = load_work_authority(
+            repo=authority.repo,
+            work_id=authority.work_id,
+            snapshot_path=snapshot_path,
+        )
+        journal_after = _candidate_recovery_journal_snapshot(
+            state_path=state_path, run=run, authority=authority
+        )
+        remote_after = _existing_candidate_pr_facts(
+            runner=runner, repo=authority.repo, pr_number=pr_number
+        )
+        confirmed = workflow_registry.get_workflow_run(run.run_id)
+    except (RuntimeError, ValueError, OSError):
+        return _candidate_recovery_block(
+            workflow_registry.get_workflow_run(run.run_id),
+            "existing-candidate-readback-failed",
+        )
+    if (
+        work_authority_digest(fresh_authority) != new_digest
+        or fresh_authority.mapped_prs != authority.mapped_prs
+        or journal_after != journal_before
+        or remote_after != remote_before
+        or confirmed != updated
+        or confirmed.status != "ongoing"
+        or confirmed.current_phase != "verify"
+        or confirmed.claim_key != _expected_claim_key(fresh_authority)
+        or confirmed.source_revision != new_digest
+        or confirmed.candidate_head != run.candidate_head
+        or confirmed.pr_refs != run.pr_refs
+        or confirmed.verified_head is not None
+        or any(
+            step.gate_result != "pending"
+            for step in confirmed.steps
+            if step.phase in {"verify", "review"}
+        )
+        or any(
+            job.get("workflow_run_id") == run.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in workflow_registry.list_jobs()
+        )
+    ):
+        return _candidate_recovery_block(
+            confirmed, "existing-candidate-readback-conflict"
+        )
+    active = confirmed.to_dict()
+    active.update(
+        {
+            "snapshot_hash": fresh_authority.snapshot_hash,
+            "source_revisions": list(fresh_authority.source_revisions),
+            "provider_revision": fresh_authority.github_provider_revision,
+            "authority_digest": new_digest,
+            "status": workflow_status(confirmed),
+            "retry_classification": _classify_retry(
+                confirmed, workflow_registry, trigger="authority-restart"
+            ),
+        }
+    )
+    return {"action": "resume", "reason": "active-workflow", "run": active}
+
+
 def _validate_current_run_authority(active: dict[str, Any], authority, canonical_run) -> None:
     expected = {
         "claim_key": canonical_run.claim_key,
@@ -3238,6 +3393,8 @@ def _claim_action(
     workflow_registry=None,
     workflow_starter=None,
     readiness_checker=None,
+    runner: Runner = subprocess.run,
+    snapshot_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Claim decision for one authority.
 
@@ -3274,6 +3431,49 @@ def _claim_action(
         if len(matching) > 1:
             raise RuntimeError("canonical workflow claim is ambiguous")
         canonical_run = matching[0] if matching else None
+        mapped_pr_refs = tuple(
+            f"{authority.repo}#{number}" for number in authority.mapped_prs
+        )
+        existing_candidate_runs = [
+            run
+            for run in all_runs
+            if run.repo == authority.repo
+            and run.work_id == authority.work_id
+            and run.status == "ongoing"
+            and run.current_phase in {"verify", "review", "ship"}
+            and getattr(run, "candidate_head", None)
+            and getattr(run, "verified_head", None) == run.candidate_head
+            and mapped_pr_refs
+            and getattr(run, "pr_refs", ()) == mapped_pr_refs
+            and run.claim_key != expected_key
+        ]
+        if existing_candidate_runs:
+            from .manager import _merged_delivery_journal_bound
+
+            existing_candidate_runs = [
+                run
+                for run in existing_candidate_runs
+                if run.current_phase not in {"verify", "review"}
+                or not _merged_delivery_journal_bound(
+                    run, journal_path=Path(state_path)
+                )
+            ]
+        if len(existing_candidate_runs) > 1:
+            return _candidate_recovery_block(
+                existing_candidate_runs[0], "existing-candidate-identity-ambiguous"
+            )
+        if existing_candidate_runs:
+            existing_candidate = existing_candidate_runs[0]
+            if args.get("action") != "resume" or automatic:
+                return _candidate_recovery_block(
+                    existing_candidate,
+                    "candidate-recovery-requires-explicit-resume",
+                )
+            if canonical_run is not None and canonical_run.run_id != existing_candidate.run_id:
+                return _candidate_recovery_block(
+                    existing_candidate, "existing-candidate-identity-ambiguous"
+                )
+            canonical_run = existing_candidate
         if canonical_run is None and (automatic or args.get("action") == "resume"):
             active = [
                 run
@@ -3444,8 +3644,6 @@ def _claim_action(
                 "reason": "active-workflow",
                 "run": canonical_run.to_dict(),
             }
-        new_digest = work_authority_digest(authority)
-        authority_restart_classification = None
         if canonical_run.current_phase in {"verify", "review"}:
             from .manager import _merged_delivery_journal_bound
 
@@ -3463,7 +3661,7 @@ def _claim_action(
                         "snapshot_hash": authority.snapshot_hash,
                         "source_revisions": list(authority.source_revisions),
                         "provider_revision": authority.github_provider_revision,
-                        "authority_digest": new_digest,
+                        "authority_digest": work_authority_digest(authority),
                         "status": workflow_status(canonical_run),
                     }
                 )
@@ -3472,9 +3670,30 @@ def _claim_action(
                     "reason": "merged-delivery-closure",
                     "run": active,
                 }
+        if (
+            canonical_run.status == "ongoing"
+            and canonical_run.current_phase in {"verify", "review", "ship"}
+            and getattr(canonical_run, "candidate_head", None)
+            and getattr(canonical_run, "verified_head", None)
+            == canonical_run.candidate_head
+            and mapped_pr_refs
+            and getattr(canonical_run, "pr_refs", ()) == mapped_pr_refs
+        ):
+            return _resume_existing_candidate_after_authority_change(
+                run=canonical_run,
+                authority=authority,
+                snapshot_path=snapshot_path,
+                state_path=Path(state_path),
+                workflow_registry=workflow_registry,
+                runner=runner,
+            )
+        new_digest = work_authority_digest(authority)
+        authority_restart_classification = None
+        if canonical_run.current_phase in {"verify", "review"}:
             try:
                 canonical_run = workflow_registry._manager_reset_workflow_for_authority_restart(
                     canonical_run.run_id,
+                    expected_run=canonical_run,
                     authority_digest=new_digest,
                 )
                 authority_restart_classification = _classify_retry(
@@ -5644,13 +5863,14 @@ def _recover_superseded_action(
     # 兩步走：先復歸 ongoing 並剝掉 supersede 迴圈附加的 blocked facet（保留
     # needs_human facet＋理由，維持 `_resolve_needs_human_reason` 的 facet⟷理由
     # invariant），再交給 official restart 一步清 needs_human 並打回 verify。
-    workflow_registry._manager_update_workflow_run(
+    restored_run = workflow_registry._manager_update_workflow_run(
         run.run_id,
         status="ongoing",
         facets=tuple(facet for facet in run.facets if facet != "blocked"),
     )
     updated = workflow_registry._manager_reset_workflow_for_authority_restart(
         run.run_id,
+        expected_run=restored_run,
         authority_digest=work_authority_digest(authority),
     )
     return {
@@ -8911,6 +9131,8 @@ def execute_work_action(
             workflow_registry=workflow_registry,
             workflow_starter=workflow_starter,
             readiness_checker=readiness_checker,
+            runner=runner,
+            snapshot_path=snapshot_path,
         )
     elif action == "intake":
         result = _intake_action(
