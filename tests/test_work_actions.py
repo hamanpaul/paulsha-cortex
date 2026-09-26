@@ -1598,6 +1598,8 @@ def test_retire_delivered_without_authority_keeps_fail_closed_admission(
         "provider-list",
         "provider-string",
         "provider-timestamp-unparseable",
+        "repo-provider-degraded",
+        "other-repo-scoped-provider-degraded",
     ],
 )
 def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
@@ -1616,6 +1618,15 @@ def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
     （``"not-a-timestamp"``）——這種畸形先前會被舊的 ``healthy`` 判斷
     （只檢查非空字串）誤判為健康，讓 canonical provider 誤判成「根本不
     存在」而放行 ``WorkAuthorityConfirmedAbsent``（registry-only 退休）。
+
+    #1093 對抗審查第四輪 MAJOR3：``repo-provider-degraded`` 模擬
+    ``github:<repo>`` 健康、但本機工作區掃描 provider ``repo:<repo>``
+    degraded——這正是 todo-only work item 消失的真正成因（見 issue 現場：
+    fresh／清空的 monitor snapshot 上 `repo:` 掃描失敗）。舊實作只檢查
+    ``github:<repo>``，會誤判成確定缺席。``other-repo-scoped-provider-
+    degraded`` 模擬既有 snapshot 已經對這個 repo 建了另一種 provider
+    （``workflow:<repo>``）但 degraded，驗證檢查不是寫死只認 ``github:``／
+    ``repo:`` 兩種前綴。
     """
     snapshot = _snapshot(tmp_path / failure / "snapshot.json")
     state = tmp_path / failure / "runs.json"
@@ -1658,6 +1669,42 @@ def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
                     "revision": "gh-1",
                     "last_success_at": "not-a-timestamp",
                 }
+            },
+            "work_items": [],
+        }
+    elif failure == "repo-provider-degraded":
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {
+                "github:acme/demo": {
+                    "status": "ok",
+                    "revision": "gh-1",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                },
+                "repo:acme/demo": {
+                    "status": "degraded",
+                    "revision": "repo-rev-lkg",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                    "diagnostics": ["repo scan unavailable: OSError"],
+                },
+            },
+            "work_items": [],
+        }
+    elif failure == "other-repo-scoped-provider-degraded":
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {
+                "github:acme/demo": {
+                    "status": "ok",
+                    "revision": "gh-1",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                },
+                "workflow:acme/demo": {
+                    "status": "degraded",
+                    "revision": "workflow-rev-lkg",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                    "diagnostics": ["workflow registry scan unavailable"],
+                },
             },
             "work_items": [],
         }
@@ -1912,6 +1959,28 @@ def test_retire_delivered_proceeds_under_rate_limited_authority(tmp_path: Path) 
     )
     assert result["result"]["action"] == "retired-delivered"
     assert registry.get_workflow_run(run_id).status == "superseded"
+
+
+def test_work_authority_projection_state_distinguishes_rate_limited_last_known_good(
+    tmp_path: Path,
+) -> None:
+    """#1093 對抗審查第四輪 MAJOR1：``work_authority_projection_state`` 過去
+    一律以 ``allow_rate_limited_last_known_good=True`` 呼叫
+    ``load_work_authority``，對「真正健康」與「只靠限流 last-known-good
+    才讀得到」的 snapshot 回傳同一個 ``"available"``。但
+    ``execute_work_action`` 對非 ``_LOCAL_UNBLOCK_ACTIONS`` 動作一律用嚴格
+    （非 LKG）authority 重新驗證，同一份限流 snapshot 會 fail-closed 拒絕
+    ——projection 必須能分辨出這個狀態，讓呼叫端（status／work list）只曝光
+    正式入口真的會接受的動作（#843 R09 契約）。
+    """
+    snapshot = _canonical_rate_limited_snapshot(tmp_path / "snapshot.json")
+
+    assert (
+        work_actions.work_authority_projection_state(
+            repo="acme/demo", work_id="demo", snapshot_path=snapshot
+        )
+        == "available_last_known_good"
+    )
 
 
 def test_abandon_orphan_rescue_allows_refs_drift_when_authority_lost_all_mappings(

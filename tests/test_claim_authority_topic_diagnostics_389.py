@@ -247,3 +247,26 @@ def test_ambiguous_duplicate_owner_keeps_generic_message(tmp_path: Path) -> None
         load_work_authority(repo="acme/demo", work_id="owner-new", snapshot_path=snapshot)
     with pytest.raises(ValueError, match="missing or ambiguous"):
         load_work_authorities(snapshot_path=snapshot)
+
+
+def test_malformed_repo_field_with_matching_work_id_blocks_confirmed_absent(
+    tmp_path: Path,
+) -> None:
+    """#1093 對抗審查第四輪 MAJOR2：``load_work_authority`` 比對 skipped row
+    時只信任 ``exc.repo``（已過 ``_diagnostic_label`` 篩選）——row 的 ``repo``
+    欄位缺失／畸形時 ``exc.repo`` 是 ``None``，與目標 repo 字串比對恆為
+    False。即使 ``exc.work_id`` 與目標完全相符，這一列仍會被當成「與目標
+    無關」跳過，若 canonical GitHub provider 又剛好不存在（或健康），
+    ``load_work_authority`` 會落到 ``WorkAuthorityConfirmedAbsent``——誤判
+    確定缺席、放行 registry-only 退休，即使目標 row 其實還在，只是
+    ``repo`` 欄位本身損毀。任何 work_id 相符（或無法判定是否相符）的畸形
+    row 都必須維持一般 fail-closed，不得被誤判成確定缺席。
+    """
+    snapshot = _write_snapshot(
+        tmp_path / "snapshot.json",
+        providers={},
+        work_items=[{"work_id": "demo", "repo": None, "sources": []}],
+    )
+    with pytest.raises(AuthorityValidationError) as excinfo:
+        load_work_authority(repo="acme/demo", work_id="demo", snapshot_path=snapshot)
+    assert excinfo.value.reason_code == "row-malformed"

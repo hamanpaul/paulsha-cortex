@@ -145,6 +145,48 @@ def test_missing_authority_attention_only_offers_admitted_retirement(
     )["next_actions"] == []
 
 
+def test_available_last_known_good_authority_only_offers_admitted_recovery_actions(
+    tmp_path,
+):
+    """#1093 對抗審查第四輪 MAJOR1：``available_last_known_good`` 代表 authority
+    只在 canonical GitHub provider 限流、靠 last-known-good 豁免下才讀得到。
+    ``execute_work_action`` 對非 ``_LOCAL_UNBLOCK_ACTIONS`` 動作一律用嚴格
+    （非 LKG）authority 重新驗證，同一份限流 snapshot 會 fail-closed 拒絕
+    ``recover-pre-candidate``——attention 投影不得曝光這個 operator 一操作
+    就會撞牆的動作，只能留下 execute_work_action 真的會接受的（``abandon``
+    在 ``_LOCAL_UNBLOCK_ACTIONS`` 裡）。
+    """
+    registry, run, _authority = _seed_pre_candidate_recovery(tmp_path)
+
+    entry = manager.workflow_status_entry(
+        registry, run, work_authority_state="available_last_known_good"
+    )
+
+    assert set(entry["next_actions"]) == {"abandon"}
+    assert "recover-pre-candidate" not in entry["next_step_hint"]
+
+
+def test_work_list_restricts_actions_when_authority_is_rate_limited_last_known_good(
+    tmp_path, monkeypatch
+):
+    """同一收斂規則套用到 Monitor work list 投影（狀態版見上一測試）。"""
+    registry, run, _authority = _seed_pre_candidate_recovery(tmp_path)
+    monkeypatch.setattr(
+        work_actions,
+        "work_authority_projection_state",
+        lambda **_kwargs: "available_last_known_good",
+    )
+    provider = WorkflowRegistryProvider(run.repo, state_path=registry._state_path)
+
+    snapshot = provider.scan()
+
+    assert snapshot.status == "ok"
+    observations = _merge_observations((snapshot,))
+    row = observations["workflow_next_actions"][run.work_id]
+    assert row["run_id"] == run.run_id
+    assert set(row["actions"]) == {"abandon"}
+
+
 def test_recovery_projection_hides_unbound_pre_candidate_action(tmp_path):
     registry, run, _authority = _seed_pre_candidate_recovery(tmp_path)
     registry._slices[0]["builder_job_id"] = None

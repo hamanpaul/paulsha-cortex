@@ -86,6 +86,7 @@ def _workflow_next_actions_projection(
     from ..coordinator.work_actions import (
         _phase_recovery_actions,
         _planning_failure_hint,
+        admitted_recovery_actions_under_authority_state,
         recovery_actions_without_work_authority,
         work_authority_projection_state,
     )
@@ -155,6 +156,17 @@ def _workflow_next_actions_projection(
                 planning_failure_classification=classification,
                 job_recovery_actions=recovery_actions,
             )
+        # #1093 對抗審查第四輪 MAJOR1：`authority_state == "available_last_
+        # known_good"` 代表 authority 只靠 canonical GitHub provider 的
+        # rate-limited last-known-good 豁免才讀得到——execute_work_action
+        # 對非 `_LOCAL_UNBLOCK_ACTIONS` 動作一律用嚴格（非 LKG）authority
+        # 重新驗證，同一份限流 snapshot 會 fail-closed 拒絕。這裡收斂到正式
+        # 入口真的會接受的子集（單一真相，見
+        # `admitted_recovery_actions_under_authority_state`）；其他狀態
+        # （包含 missing／unavailable 已經算出的最小集合）原樣放行。
+        actions = admitted_recovery_actions_under_authority_state(
+            actions, work_authority_state=authority_state
+        )
         projected[run.work_id] = {
             "run_id": run.run_id,
             "actions": list(actions),

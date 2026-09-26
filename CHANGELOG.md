@@ -13,7 +13,7 @@
 
 ### Fixed
 
-- **#1093 authority 缺席時退休已交付 run**：`retire-delivered` 可在 workspace 不存在或已從 `project-cortex.yaml` 移除時，以 `--repo`、work id 與 exact run ID 從 registry 定址；仍要求 run admission 與所有 PR 的 GitHub terminal proof。稽核 evidence 標明 registry run authority，僅沿用已存 digest，缺少時明記 absent；`abandon` 維持原有 WorkAuthority 與 pre-delivery 門檻。Status、work list 與 monitor 診斷同步更新。
+- **#1093 authority 缺席時退休已交付 run**：`retire-delivered` 可在 workspace 不存在或已從 `project-cortex.yaml` 移除時，以 `--repo`、work id 與 exact run ID 從 registry 定址；仍要求 run admission 與所有 PR 的 GitHub terminal proof。稽核 evidence 標明 registry run authority，僅沿用已存 digest，缺少時明記 absent；`abandon` 維持原有 WorkAuthority 與 pre-delivery 門檻。Status、work list 與 monitor 診斷同步更新。第四輪對抗審查另修正：`work_authority_projection_state()` 新增 `available_last_known_good` 狀態，避免 rate-limited last-known-good authority 被 status／work list 誤當一般 `available` 曝光正式入口會 fail-closed 拒絕的動作；`load_work_authority` 對畸形 `repo` 欄位的 skipped row 比對與「目標完全沒有列在 work_items」的 provider 健康檢查（新增涵蓋 `repo:<repo>` 與其他既有 provider 種類）皆修正為 fail-closed，不再誤判成確定缺席。
 
 - **PatchMUD report v2 consumer**：封套 mapper 以 role、execution-profile key、benchmark、deck digest 與 evaluator revision 精確選取 cohort；v1 報表僅 opaque 保留並 fail-closed 不排名，未知版本拒收。`model-eval-roster.yaml` 新增 profile-bound schema v2，保留既有 roster v1 相容讀取。
 

@@ -33,7 +33,9 @@ from paulsha_cortex.recovery_action_contracts import (
 from .diagnostics import diagnostic_reason
 from .claim import (
     AUTO_LABEL,
+    AuthorityValidationError,
     ClaimCandidate,
+    REASON_PROVIDER_RATE_LIMITED_CANONICAL,
     authority_matches_claim_era,
     build_claim_key,
     build_label_argv,
@@ -6305,6 +6307,24 @@ def work_authority_projection_state(
     handle from a registry run. Other read failures are ``unavailable`` and
     must not be presented as an actionable recovery path.
 
+    ``available_last_known_good``（#1093 對抗審查第四輪 MAJOR1）：authority
+    只有在 canonical GitHub provider 被限流、靠 last-known-good 豁免才讀得
+    到——這與一般 ``available``（provider 本身健康）不是同一件事。
+    ``execute_work_action`` 對 ``_LOCAL_UNBLOCK_ACTIONS`` 以外的動作一律用
+    嚴格（非 LKG）authority 重新驗證：同一份限流 snapshot 會 fail-closed
+    拒絕。舊實作不分辨這兩種「讀得到」，一律回傳 ``available``，導致
+    status／work list 對 builder／reviewer run 曝光 `recover-pre-candidate`
+    ／`retry-build` 這類正式入口其實會拒絕的動作。呼叫端必須把這個狀態的
+    next_actions 收斂到 `admitted_recovery_actions_under_authority_state()`
+    （單一真相：與 `execute_work_action` 用的是同一份
+    `_LOCAL_UNBLOCK_ACTIONS`），不能直接當成一般 ``available`` 曝光完整
+    動作集合（#843 R09 契約：只提供正式入口會接受的動作）。
+
+    判斷方式：先用嚴格（非 LKG）authority 讀一次；只有在因為 canonical
+    provider *限流*（`REASON_PROVIDER_RATE_LIMITED_CANONICAL`）而失敗時，
+    才再用 LKG 讀一次確認能否成功——其他不健康（畸形／非限流 degraded／
+    逾期）維持 ``unavailable``，不得被 LKG 掩蓋。
+
     ``snapshot_path`` 預設 ``None``（沿用 ``canonical_work_snapshot_path()``
     的正式 durable snapshot），僅供測試以明確路徑驅動——#1093 對抗審查第三
     輪 BLOCKER：先前完全沒有這個參數，測試建的畸形 snapshot fixture 永遠寫
@@ -6317,15 +6337,50 @@ def work_authority_projection_state(
             repo=repo,
             work_id=work_id,
             snapshot_path=snapshot_path,
-            allow_rate_limited_last_known_good=True,
+            allow_rate_limited_last_known_good=False,
         )
     except ValueError as error:
         if _is_work_authority_absence(error):
             return "missing"
+        if (
+            isinstance(error, AuthorityValidationError)
+            and error.reason_code == REASON_PROVIDER_RATE_LIMITED_CANONICAL
+        ):
+            try:
+                load_work_authority(
+                    repo=repo,
+                    work_id=work_id,
+                    snapshot_path=snapshot_path,
+                    allow_rate_limited_last_known_good=True,
+                )
+            except Exception:  # noqa: BLE001 - LKG re-check must also fail closed
+                return "unavailable"
+            return "available_last_known_good"
         return "unavailable"
     except Exception:  # noqa: BLE001 - read projection must fail closed
         return "unavailable"
     return "available"
+
+
+def admitted_recovery_actions_under_authority_state(
+    actions: tuple[str, ...], *, work_authority_state: str | None
+) -> tuple[str, ...]:
+    """依 ``work_authority_projection_state()`` 的分類收斂 next_actions／
+    actions 到 ``execute_work_action`` 真正會接受的集合（#1093 對抗審查第
+    四輪 MAJOR1）。
+
+    只有 ``"available_last_known_good"`` 需要在這裡收斂：``execute_work_action``
+    對 ``_LOCAL_UNBLOCK_ACTIONS`` 以外的動作一律用嚴格（非 LKG）authority
+    重新驗證，snapshot 若真的在限流會 fail-closed 拒絕——曝光這些動作等於
+    帶 operator 去撞牆。``missing``／``unavailable`` 由呼叫端另行分流（分別
+    對應 ``recovery_actions_without_work_authority`` 與空集合）；其他狀態
+    （``available``／``None``）原樣放行，不受影響。與 ``execute_work_action``
+    共用同一份 ``_LOCAL_UNBLOCK_ACTIONS`` 判準（單一真相），不得另猜一套。
+    """
+
+    if work_authority_state != "available_last_known_good":
+        return tuple(actions)
+    return tuple(action for action in actions if action in _LOCAL_UNBLOCK_ACTIONS)
 
 
 def _is_work_authority_absence(error: ValueError) -> bool:
