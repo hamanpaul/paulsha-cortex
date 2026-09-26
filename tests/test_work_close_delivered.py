@@ -478,3 +478,42 @@ def test_work_help_documents_close_delivered_operator_requirements(capsys) -> No
     assert "close-delivered" in output
     assert "--actor" in output
     assert "--reason" in output
+
+
+def test_closure_openspec_gates_are_vacuous_without_mapped_openspec() -> None:
+    """沒有 mapped OpenSpec 時 archive 條件不適用（#1037 同一規則），否則永遠投影不到 done。"""
+    sources = (
+        WorkSource(
+            source_id="github_issue:acme/demo#12",
+            kind="github_issue",
+            ref="acme/demo#12",
+            revision="issue-revision",
+            status="closed",
+            confidence="confirmed",
+            provider="github-terminal:acme/demo",
+        ),
+        WorkSource(
+            source_id="github_pr:acme/demo#8",
+            kind="github_pr",
+            ref="acme/demo#8",
+            revision="pr-revision",
+            status="closed",
+            confidence="confirmed",
+            provider="github-terminal:acme/demo",
+        ),
+    )
+    group = CorrelatedWork(work_id=WORK_ID, title="Demo", sources=sources, confidence="confirmed")
+    closure = _parse_closure_evidence(
+        {
+            "remote_prs": [],
+            "remote_todos": [],
+            "remote_openspec_observed": True,
+            "remote_openspec": {"active": [], "archived": []},
+            "validated_completions": {WORK_ID: [{}]},
+        },
+        correlation=SimpleNamespace(groups=(group,)),
+        repo=REPO,
+    )[WORK_ID]
+
+    assert closure.remote_active_openspec_absent is True
+    assert closure.remote_archive_present is True
