@@ -61,11 +61,14 @@ def _retry_card_attempt_key(card_id: str) -> str:
 def _retry_card_redispatch_count(
     attempts: Mapping[str, int], *, matching_job_count: int, card_id: str
 ) -> int:
-    """以持久計數為主，並以舊 run 的卡片 job 歷史補算重派次數。"""
+    """只計 operator 明示 retry-card 的持久計數。
 
-    persisted = attempts.get(_retry_card_attempt_key(card_id), 0)
-    observed = max(0, matching_job_count - 1)
-    return max(persisted, observed)
+    不以卡片 job 數回推：同卡的 schema 自動重派也會產生 job，回推會把自動重派
+    誤算成 operator 重派而提早耗盡額度。舊 run 沒有這個鍵時從 0 起算。
+    """
+
+    del matching_job_count
+    return attempts.get(_retry_card_attempt_key(card_id), 0)
 
 
 def _retry_card_budget_message(card_id: str, count: int) -> str:
@@ -5172,7 +5175,7 @@ class JobRegistry:
             for step in current.steps
         )
         # #555：operator 的顯式重派次數跨世代累計，不得被下方 schema retry reset 清掉。
-        # 舊 run 若尚無這個 attempts key，retry_card_count 已由 matching jobs 補算。
+        # 舊 run 若尚無這個 attempts key，從 0 起算（不以 job 數回推，見 _retry_card_redispatch_count）。
         # #717：operator 的顯式重派＝**重新給一輪 schema retry 額度**。
         #
         # 過去只 bump `attempts[phase]`，同一個 dict 上的 `schema-mismatch:<card>`

@@ -400,6 +400,32 @@ def test_retry_card_registry_reset_enforces_the_card_budget(tmp_path: Path) -> N
     assert blocked.needs_human_reason["reason"] == "retry-card-budget-exhausted"
 
 
+def test_retry_card_budget_ignores_schema_auto_redispatch_jobs(tmp_path: Path) -> None:
+    """#555：schema 自動重派產生的同卡 job 不得被算成 operator 的 retry-card。"""
+
+    _snapshot, registry, run, _job_id = _stuck_run(tmp_path)
+    for index in range(2):
+        auto = registry.create_job(
+            task=f"wf-tdd-red-schema-retry-{index}",
+            persona="builder",
+            branch="feature/12-demo",
+            pane="",
+            worktree=str(tmp_path),
+            workflow_run_id=run.run_id,
+            workflow_card="tdd-red",
+            workflow_phase="build",
+        )
+        registry.update_headless_result(auto["job_id"], status="failed", exit_code=1)
+
+    reset = registry._manager_reset_workflow_for_retry_card(
+        run.run_id,
+        expected_run_id=run.run_id,
+        card="tdd-red",
+    )
+
+    assert reset.attempts["retry-card:tdd-red"] == 1
+
+
 def test_retry_card_reopens_after_a_newer_failed_builder_attempt(
     tmp_path: Path,
 ) -> None:
