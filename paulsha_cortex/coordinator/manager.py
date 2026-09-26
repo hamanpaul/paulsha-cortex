@@ -10486,6 +10486,87 @@ def _workflow_retry_context(
     return context
 
 
+def _verification_gate_ledger_context(
+    run, job: Mapping[str, object]
+) -> dict[str, object] | None:
+    """#803：只把精確綁定目前 Candidate 的 Manager build pytest ledger 給 verifier。
+
+    ledger 的 ``worktree_state.head`` 是 Manager gate 執行前在受控 checkout
+    收集的 HEAD；必須同時吻合 run Candidate 與成功 build job 的
+    ``subject_head``。缺檔、身分／hash 不符或沒有 pytest gate 時不附證據，沿用原
+    verification 判準。Ledger 內容仍經 terminal contract 的 Manager 作者檢查與
+    canonical digest 計算。
+    """
+
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or job.get("workflow_run_id") != getattr(run, "run_id", None)
+        or job.get("workflow_phase") != "build"
+        or job.get("persona") != "builder"
+        or job.get("status") != "exited"
+        or job.get("exit_code") != 0
+        or job.get("subject_head") != candidate
+        or job.get("workflow_test_policy") == "red-required"
+    ):
+        return None
+    log_path = job.get("log_path")
+    if not isinstance(log_path, str) or not log_path:
+        return None
+    ledger_path = terminal_contract.gate_ledger_path(
+        _job_control_log_path(job, log_path)
+    )
+    try:
+        found = terminal_contract.read_gate_ledger(ledger_path)
+    except terminal_contract.TerminalContractError:
+        return None
+    if found is None:
+        return None
+    payload, digest = found
+    worktree_state = payload.get(gate_ledger.WORKTREE_STATE_KEY)
+    if (
+        not isinstance(worktree_state, Mapping)
+        or worktree_state.get("probe") != "ok"
+        or worktree_state.get("head") != candidate.lower()
+    ):
+        return None
+    try:
+        outcomes = terminal_contract._ledger_outcomes(payload)
+    except terminal_contract.TerminalContractError:
+        return None
+    pytest_outcome = outcomes.get(terminal_contract.RED_REQUIRED_TEST_GATE_NAME)
+    if (
+        not isinstance(pytest_outcome, Mapping)
+        or type(pytest_outcome.get("exit_code")) is not int
+    ):
+        return None
+    pytest_rows = [
+        row
+        for row in payload["gates"]
+        if isinstance(row, Mapping)
+        and row.get("name") == terminal_contract.RED_REQUIRED_TEST_GATE_NAME
+    ]
+    if len(pytest_rows) != 1 or not isinstance(pytest_rows[0].get("command"), str):
+        return None
+    pytest_gate = {
+        "name": terminal_contract.RED_REQUIRED_TEST_GATE_NAME,
+        "command": pytest_rows[0]["command"],
+        "exit_code": pytest_outcome["exit_code"],
+        "status": pytest_outcome["status"],
+    }
+    result_summary = (
+        f"pytest {pytest_gate['status']} (exit {pytest_gate['exit_code']})"
+    )
+    return {
+        "candidate": candidate.lower(),
+        "path": str(ledger_path),
+        "sha256": digest,
+        "gates": [pytest_gate],
+        "result_summary": result_summary,
+    }
+
+
 def _workflow_job_prompt(
     run,
     step,
@@ -10494,6 +10575,7 @@ def _workflow_job_prompt(
     coordinator_root: str | Path,
     input_snapshot: tuple[dict[str, str], ...] = (),
     candidate_checkout: str | None = None,
+    manager_gate_ledger: Mapping[str, object] | None = None,
     env: Mapping[str, str] | None = None,
     retry_context: Mapping[str, object] | None = None,
     operator_adjudications: Sequence[Mapping[str, object]] | None = None,
@@ -10735,6 +10817,8 @@ def _workflow_job_prompt(
         contract["builder_job_id"] = builder_job_id
     if candidate_checkout is not None:
         contract["candidate_checkout"] = candidate_checkout
+    if step.phase == "verify" and manager_gate_ledger is not None:
+        contract["manager_gate_ledger"] = dict(manager_gate_ledger)
     if retry_context is not None:
         # #606：首派沒有這個鍵，prompt 因此逐字不變（見 `_workflow_retry_context`）。
         contract["retry_context"] = dict(retry_context)
@@ -10766,6 +10850,42 @@ def _workflow_job_prompt(
         if step.persona == "reviewer"
         else ""
     )
+    verification_gate_ledger_contract = ""
+    if step.phase == "verify" and manager_gate_ledger is not None:
+        summary = manager_gate_ledger.get("result_summary")
+        digest = manager_gate_ledger.get("sha256")
+        pytest_rows = manager_gate_ledger.get("gates")
+        pytest_gate = (
+            pytest_rows[0]
+            if isinstance(pytest_rows, (list, tuple))
+            and pytest_rows
+            and isinstance(pytest_rows[0], Mapping)
+            and pytest_rows[0].get("name") == terminal_contract.RED_REQUIRED_TEST_GATE_NAME
+            else None
+        )
+        pytest_status = pytest_gate.get("status") if pytest_gate is not None else None
+        if pytest_status == "passed":
+            verification_gate_ledger_contract = (
+                " A candidate-bound Manager gate ledger is included in the contract below. "
+                f"The full-suite result is `{summary}` (ledger sha256 `{digest}`). "
+                "Treat this Manager result as the evidence for the full-suite gate: explicitly "
+                f"report `Full-suite result: Manager ledger {digest} passed`. In this enforced "
+                "read-only sandbox, ACL/xattr restrictions, a read-only filesystem, or a long "
+                "TMPDIR that exceeds AF_UNIX sun_path limits can prevent rerunning the full "
+                "suite. Such sandbox-only failures must not override the matching Manager "
+                "ledger's green full-suite result; classify them as environment limitations, "
+                "and run focused and diff-related tests plus the review. The ledger proves only "
+                "the full-suite gate, not a verified verdict: assess the Candidate and report "
+                "any real findings independently."
+            )
+        elif pytest_status == "failed":
+            verification_gate_ledger_contract = (
+                " A candidate-bound Manager gate ledger is included in the contract below. "
+                f"The full-suite result is `{summary}` (ledger sha256 `{digest}`). "
+                "This recorded failure is authoritative for the full-suite gate: focused green "
+                "tests and sandbox conditions must not override it, and this Candidate must "
+                "not be reported verified. Continue the diff review and report the failed gate."
+            )
     commit_required_contract = (
         f" Before the final commit, update {tasks_path} checkboxes for work completed by this card, "
         "and never modify pinned input files such as the plan document."
@@ -10817,6 +10937,7 @@ def _workflow_job_prompt(
         "null."
         + planner_contract
         + reviewer_contract
+        + verification_gate_ledger_contract
         + commit_required_contract
         + repair_findings_contract
         + retry_context_contract
@@ -11342,6 +11463,17 @@ def _dispatch_workflow_card(
         )
     ]
     builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
+    verification_gate_ledger = None
+    if step.phase == "verify":
+        candidate_build_jobs = [
+            job
+            for job in builder_jobs
+            if job.get("persona") == "builder" and job.get("workflow_phase") == "build"
+        ]
+        if candidate_build_jobs:
+            verification_gate_ledger = _verification_gate_ledger_context(
+                run, candidate_build_jobs[-1]
+            )
     if step.persona == "reviewer" and builder_job_id is None:
         raise ValueError("workflow reviewer builder job unavailable")
     task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
@@ -11639,6 +11771,7 @@ def _dispatch_workflow_card(
                     if step.persona == "reviewer"
                     else None
                 ),
+                manager_gate_ledger=verification_gate_ledger,
                 # #606：`matching` 就是這張卡先前燒掉的 job（首派為空 →
                 # retry_context 為 None → prompt 逐字不變）。retry-card 的重派與
                 # daemon 的 forced retry 都走這唯一一條組裝路徑，因此兩者同時
