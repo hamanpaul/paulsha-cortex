@@ -10,7 +10,10 @@ import re
 from typing import Any
 
 from . import quota_observation as schema
-from .quota_ledger import LedgerAppendResult, LedgerCorrupt, QuotaEventLedger, _is_terminal_usage_observation
+from .quota_ledger import (
+    LedgerAppendResult, LedgerCorrupt, QuotaEventLedger,
+    _cross_identity_conflict_digest, _is_terminal_usage_observation,
+)
 from .quota_sources import (
     CoverageGap, ProviderCapture, ProviderQuotaTarget, capture_provider_quota, _parse_iso_epoch_ms,
 )
@@ -65,6 +68,18 @@ class _MemoryLedger:
             self.events.append({
                 "schema_version": 1, "kind": "conflict", "idempotency_key": key,
                 "existing_sha256": prior["payload_sha256"], "incoming_sha256": digest,
+                "scope": _scope_summary(wire), "observed_at_ms": _known_value(wire.get("observed_at_ms")),
+                "window_id": _scope_summary(wire).get("window_id"), "associations": normalized,
+            })
+            return LedgerAppendResult("conflict", conflicts=1, idempotency_key=key)
+        # 與持久化 ledger 對齊：即使這筆的 idempotency key 與既有事件都不同，
+        # 仍以語意範圍（pool／window／observed_at／metric）尋找衝突（見 #836
+        # 對抗審查第七輪 MAJOR quota_ledger.py:274）。
+        cross_digest = _cross_identity_conflict_digest(self.events, wire, digest)
+        if cross_digest is not None:
+            self.events.append({
+                "schema_version": 1, "kind": "conflict", "idempotency_key": key,
+                "existing_sha256": cross_digest, "incoming_sha256": digest,
                 "scope": _scope_summary(wire), "observed_at_ms": _known_value(wire.get("observed_at_ms")),
                 "window_id": _scope_summary(wire).get("window_id"), "associations": normalized,
             })
@@ -298,13 +313,25 @@ class QuotaShadowService:
                 # 撞成 conflict（見 #836 對抗審查第四輪 MAJOR）。每個 constraint
                 # 本身的 pool_ref/window_id 已足夠穩定區分，可比對與不可換算
                 # 兩種情形共用同一套 key 規則。
+                #
+                # key 不得納入 profile_key：終局 usage 的去重 identity 只認
+                # (job_id, pool identity, metric, window 範圍)。同一個
+                # terminal job 若因 group binding／profile alias replay，
+                # 先後以兩個不同的 profile_key 記到同一個 shared pool/window
+                # （constraint 的 pool_ref/window_id 本身就已相同），只要
+                # profile_key 還留在 key 裡，兩筆 key 就永遠不同，導致兩筆
+                # usage 都被接受、對同一 pool 雙重扣減。改成不含 profile_key
+                # 後，同一 job/pool/metric/window 的重播一律撞上同一個 key，
+                # 交給既有的 duplicate／conflict 判定（配合下方 digest 已排除
+                # profile_ref／observation_id 的差異）（見 #836 對抗審查第七輪
+                # MAJOR quota_shadow.py:307）。
                 pool_component = hashlib.sha256(
                     json.dumps(
                         constraint["scope"]["pool_ref"], sort_keys=True, separators=(",", ":"),
                     ).encode()
                 ).hexdigest()[:16]
                 key = (
-                    f"terminal-usage:v1:{job_id}:{profile_key}:{metric}:{pool_component}:"
+                    f"terminal-usage:v1:{job_id}:{metric}:{pool_component}:"
                     + constraint["window_id"]
                 )
                 result = self.ledger.append_observation(
@@ -360,6 +387,13 @@ class QuotaShadowService:
         # （見 #836 對抗審查第四輪 MAJOR：舊 revision 事件不得讓整份 shadow
         # projection 都變成 ledger-corrupt）。
         parsed_records: list[tuple[dict[str, Any], schema.QuotaObservation]] = []
+        # usage_delta 事件描述的是實際發生過的耗用；即使目前的
+        # unit／pool／revision 描述集認不出某一筆 usage 事件（例如透過
+        # association 指向 credit pool 的不可換算 usage，之後又以缺少該
+        # usage unit 的舊版／rollback descriptor 投影），也不得整筆丟棄——
+        # 這裡先收集受影響的 pool／window key，稍後強制轉為 unknown（見 #836
+        # 對抗審查第七輪 MAJOR quota_shadow.py:791）。
+        unresolved_usage_keys: set[tuple[tuple[str, str, str, str], str]] = set()
         for record in records:
             if record.get("kind") != "observation":
                 continue
@@ -368,7 +402,7 @@ class QuotaShadowService:
                     record.get("observation"), descriptors=descriptors, unit_catalog=unit_catalog,
                 )
             except (TypeError, ValueError, schema.QuotaContractError):
-                _mark_unresolved_record(record, rows)
+                _mark_unresolved_record(record, rows, unresolved_usage_keys)
                 continue
             parsed_records.append((record, observation))
 
@@ -500,6 +534,18 @@ class QuotaShadowService:
             row["assessment"] = _assess(row["remaining"], demand)
             if row["assessment"] == "unknown" and demand is not None:
                 row["coverage_gaps"].append("demand-or-remaining-unknown")
+                row["coverage_gaps"] = sorted(set(row["coverage_gaps"]))
+        # 有任何一筆 usage 事件因目前描述集無法解讀而被 _mark_unresolved_record
+        # 標記為受影響的 pool，一律強制轉為 unknown：這筆看不懂的耗用可能已經
+        # 發生但無法確認金額，不能讓上面依其他有效 snapshot 算出的「確定」餘額
+        # 蓋過這個缺口（見 #836 對抗審查第七輪 MAJOR quota_shadow.py:791）。
+        for row in rows:
+            row_key = (_pool_key(row["pool_ref"]), row["window_id"])
+            if row_key in unresolved_usage_keys:
+                row["remaining"] = _unknown("usage-unresolvable")
+                row["assessment"] = "unknown"
+                if "usage-unresolvable" not in row["coverage_gaps"]:
+                    row["coverage_gaps"].append("usage-unresolvable")
                 row["coverage_gaps"] = sorted(set(row["coverage_gaps"]))
         overall_gaps = sorted({gap for row in rows for gap in row["coverage_gaps"]})
         return {
@@ -781,24 +827,64 @@ def _scope_summary(wire):
     return {"state": "known", "pool_ref": value["pool_ref"], "window_id": value.get("window_id")}
 
 
-def _mark_unresolved_record(record, rows):
-    """單筆事件因目前描述集解析失敗時，只標記對應 pool（忽略 revision 比對
-    pool_id），不影響其他 pool 的投影結果。找不到對應 pool 時安全地忽略。"""
+def _mark_unresolved_record(record, rows, unresolved_usage_keys):
+    """單筆事件因目前描述集解析失敗時，依 measurement kind 決定處理方式。
+
+    非 usage 事件（例如舊 revision 的 remaining snapshot）維持既有的軟性
+    標記：只在對應 pool 附註 stale-pool-revision，不強制整個 pool 轉
+    unknown（見 #836 對抗審查第四輪 MAJOR：不得毒化其他 pool）。
+
+    usage_delta 事件描述的是實際已發生的耗用，即使目前的 unit／pool／
+    revision 描述集認不出它，也不得整筆丟棄：受影響的 pool（scope 已知時
+    依 scope；scope 因「不可換算」而記為 unknown 時依 association）一律
+    記入 unresolved_usage_keys，讓呼叫端強制轉為 unknown 並附上明確 gap。
+    scope 未知又完全沒有 association 線索時，保守地視為所有已知 pool 都
+    可能受影響（見 #836 對抗審查第七輪 MAJOR quota_shadow.py:791）。"""
     raw = record.get("observation") if isinstance(record, dict) else None
     if not isinstance(raw, dict):
         return
+    measurement = raw.get("measurement")
+    is_usage = isinstance(measurement, dict) and measurement.get("kind") == "usage_delta"
     scope = _scope_summary(raw)
-    if scope.get("state") != "known":
+    targets: list[tuple[tuple[str, ...], str]] = []
+    if scope.get("state") == "known":
+        pool_ref = scope.get("pool_ref")
+        window_id = scope.get("window_id")
+        if isinstance(pool_ref, dict):
+            targets.append((
+                tuple(pool_ref.get(name) for name in ("authority_id", "account_id", "pool_id")),
+                window_id,
+            ))
+    elif is_usage:
+        associations = record.get("associations") if isinstance(record, dict) else None
+        for association in associations or []:
+            if not isinstance(association, dict):
+                continue
+            pool_ref = association.get("pool_ref")
+            window_id = association.get("window_id")
+            if isinstance(pool_ref, dict):
+                targets.append((
+                    tuple(pool_ref.get(name) for name in ("authority_id", "account_id", "pool_id")),
+                    window_id,
+                ))
+    if is_usage and scope.get("state") != "known" and not targets:
+        # 既無已知 scope，也沒有任何 association 線索：完全無法判定這筆
+        # usage 屬於哪個 pool，保守地視為所有目前已知的 pool 都可能受影響，
+        # 不得放行一筆看不懂的耗用事件靜默消失。
+        for row in rows:
+            unresolved_usage_keys.add((_pool_key(row["pool_ref"]), row["window_id"]))
+            row["coverage_gaps"].append("usage-unresolvable")
         return
-    pool_ref = scope.get("pool_ref")
-    window_id = scope.get("window_id")
-    if not isinstance(pool_ref, dict):
-        return
-    ref_key = tuple(pool_ref.get(name) for name in ("authority_id", "account_id", "pool_id"))
-    for row in rows:
-        row_key = tuple(row["pool_ref"].get(name) for name in ("authority_id", "account_id", "pool_id"))
-        if row_key == ref_key and row["window_id"] == window_id:
-            row["coverage_gaps"].append("stale-pool-revision")
+    for ref_key, window_id in targets:
+        for row in rows:
+            row_key = tuple(row["pool_ref"].get(name) for name in ("authority_id", "account_id", "pool_id"))
+            if row_key != ref_key or row["window_id"] != window_id:
+                continue
+            if is_usage:
+                unresolved_usage_keys.add((_pool_key(row["pool_ref"]), row["window_id"]))
+                row["coverage_gaps"].append("usage-unresolvable")
+            else:
+                row["coverage_gaps"].append("stale-pool-revision")
 
 
 def _public_event(record, observation):

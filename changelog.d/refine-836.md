@@ -100,3 +100,27 @@ schema）因為 source 欄位不同永遠不會撞成同一個 key，`project()`
 一筆、看不到衝突。衝突偵測現在以 pool／window／observed_at（語意範圍）為
 準跨 source 比較：不同 source 在同一時點給出不同 remaining 時產生 conflict
 receipt 並使該 pool 保持 unknown，相同值仍視為一致、不衝突。
+
+修正三條對抗審查第七輪 MAJOR：(1) 同一 pool／window／observed_at 的兩筆衝突
+snapshot，若呼叫端分別帶不同的 caller idempotency key、或分別帶不同的外部
+event_identity，兩者的 idempotency key 永遠不會撞在一起，ledger 不產生
+conflict receipt，`project()` 依 observation_id 任選一筆 remaining。ledger
+新增跨 idempotency key 的語意範圍比對（僅限 remaining_snapshot／
+gauge_snapshot 這類「同一時間點只有一個真值」的量測，不含 usage_delta）：
+量測值不同即產生 conflict receipt、該 pool 轉 unknown；量測值相同視為一致
+（例如不同 profile 各自獨立讀到同一個真值），不算衝突。(2) 同一 terminal
+job 若因 group binding／profile alias replay 先後以兩個 profile_key 記到
+同一個 shared pool／window，replay key 含 profile_key，兩筆 usage 都被接受
+而雙重扣減。終局 usage 的去重 identity 改為 (job_id, pool identity, metric,
+window 範圍)，不再含 profile_key；payload digest 也不再綁 profile_ref／
+observation_id。同 job 同 pool 的第二筆用量數值相同時判定為 duplicate，
+數值不同時判定為 conflict（該 pool unknown）。(3) 先記一筆透過 associations
+指向 credit pool 的不可換算 token usage，之後以缺少該 usage 自身引用的
+unit（例如舊版／rollback descriptor）做 `project()` 時，scope=unknown 的
+usage 事件被 `_mark_unresolved_record` 直接丟掉，credit pool 的 row 仍顯示
+舊 snapshot 餘額。現在 usage_delta 事件解析失敗一律不丟棄：依 scope（已知
+時）或 association（scope 為 unknown 時）定位受影響的 pool，強制轉為
+unknown 並附上 `usage-unresolvable` gap；完全無法定位目標 pool 時保守地
+視為所有已知 pool 都可能受影響。非 usage 事件（例如舊 revision 的
+remaining snapshot）維持既有的 `stale-pool-revision` 軟性標記，不強制整個
+pool 轉 unknown。

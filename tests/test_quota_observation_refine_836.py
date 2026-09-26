@@ -1480,3 +1480,255 @@ def test_review6_major3_cross_source_snapshot_conflict_at_same_scope_and_time_is
     row = _pool_row(report, "pool-shared", "short")
     assert row["remaining"]["state"] == "unknown"
     assert "source-conflict" in row["coverage_gaps"]
+
+
+# #836 對抗審查第七輪：以下測試對應審查稿指出的三條 MAJOR。
+
+
+def _group_binding(descriptors, keys, *, binding_id="group-binding"):
+    constraints = [
+        {
+            "state": "known",
+            "value": {
+                "pool_ref": {
+                    "authority_id": descriptor.authority_id,
+                    "account_id": descriptor.account_id,
+                    "pool_id": descriptor.pool_id,
+                    "revision": descriptor.revision,
+                },
+                "window_id": window_id,
+            },
+        }
+        for descriptor, window_id in constraints_from(descriptors)
+    ]
+    return schema.parse_binding(
+        {
+            "schema_version": 1,
+            "binding_id": binding_id,
+            "revision": "1",
+            "subject": {
+                "kind": "group",
+                "group_ref": "fixture:group/v1",
+                "revision": "1",
+                "members": {
+                    "state": "known",
+                    "value": [{"schema_version": 1, "key": key} for key in keys],
+                },
+            },
+            "constraints": constraints,
+            "coverage": {"state": "complete", "gaps": []},
+        },
+        descriptors=tuple(descriptors),
+    )
+
+
+def test_review7_major1_conflicting_snapshots_with_different_caller_idempotency_keys_are_detected():
+    """MAJOR quota_ledger.py:274 — 同一 pool/window/observed_at 的兩筆衝突
+    snapshot，若呼叫端分別帶不同的 caller idempotency key，兩者的
+    idempotency key 永遠不會撞在一起，ledger 不會產生 conflict receipt，
+    project() 依 observation_id 任選一筆 remaining 當確定值。衝突偵測必須
+    以語意範圍（pool／window／observed_at／metric）為準，不論 idempotency
+    key 是否不同。"""
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    first = _observation(descriptor, "short", value="18", observed_at_ms=_NOW)
+    result_a = service.record_observation(
+        first.to_dict(), descriptors=(descriptor,), unit_catalog=(),
+        idempotency_key="caller-key-a",
+    )
+    assert result_a.accepted == 1
+
+    second_payload = deepcopy(first.to_dict())
+    second_payload["observation_id"] = "fixture-remaining-conflicting-caller-key"
+    second_payload["measurement"]["quantity"]["amount"]["value"] = "9"
+    result_b = service.record_observation(
+        second_payload, descriptors=(descriptor,), unit_catalog=(),
+        idempotency_key="caller-key-b",
+    )
+    assert result_b.status == "conflict"
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 1
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "unknown"
+    assert "source-conflict" in row["coverage_gaps"]
+
+
+def test_review7_major1_conflicting_snapshots_with_different_event_identity_are_detected():
+    """MAJOR quota_ledger.py:274 — 同一 pool/window/observed_at 的兩筆衝突
+    snapshot，若分別帶不同的外部 event_identity（不同 provider event id），
+    「source:」key 因 event id 不同而永遠不會撞在一起，同樣看不到衝突。"""
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    first = _observation(
+        descriptor, "short", value="18", observed_at_ms=_NOW, event_id="evt-a",
+    )
+    assert service.record_observation(
+        first.to_dict(), descriptors=(descriptor,), unit_catalog=(),
+    ).accepted == 1
+
+    second_payload = deepcopy(first.to_dict())
+    second_payload["observation_id"] = "fixture-remaining-conflicting-event-id"
+    second_payload["measurement"]["quantity"]["amount"]["value"] = "9"
+    second_payload["source"]["event_identity"]["event_id"] = "evt-b"
+    result = service.record_observation(
+        second_payload, descriptors=(descriptor,), unit_catalog=(),
+    )
+    assert result.status == "conflict"
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 1
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "unknown"
+    assert "source-conflict" in row["coverage_gaps"]
+
+
+def test_review7_major2_group_binding_replay_with_different_profile_keys_does_not_double_deduct():
+    """MAJOR quota_shadow.py:307 — 同一 terminal job 若因 group binding／
+    profile alias replay 先後以兩個 profile_key 記到同一 shared pool／
+    window，replay key 含 profile_key，兩筆 usage 都被接受而雙重扣減。
+    終局 usage 的去重 identity 必須是 (job_id, pool identity, metric,
+    window 範圍)，不含 profile_key；數值相同時第二筆須判定為 duplicate。"""
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    binding = _group_binding((descriptor,), (_PROFILE_A, _PROFILE_B))
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    snapshot = _observation(
+        descriptor, "short", value="20", observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 300_000,
+    )
+    assert service.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=(),
+    ).accepted == 1
+
+    job = {
+        "id": "job-group-replay", "executor": "codex",
+        "started_at": _iso_utc_ms(_NOW + 1), "finished_at": _iso_utc_ms(_NOW + 2),
+        "usage": {"input_tokens": 4},
+    }
+    first = service.record_terminal_usage(
+        job, profile_key=_PROFILE_A, binding=binding, descriptors=(descriptor,),
+        unit_catalog=(), unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 5,
+    )
+    assert first.accepted == 1
+
+    # 同一 job 因 profile alias replay，改以另一個 group member 的
+    # profile_key 記到同一個 shared pool/window，用量數值不變。
+    replay = service.record_terminal_usage(
+        deepcopy(job), profile_key=_PROFILE_B, binding=binding, descriptors=(descriptor,),
+        unit_catalog=(), unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 6,
+    )
+    assert replay.accepted == 0
+    assert replay.duplicates == 1
+    assert replay.conflicts == 0
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 10
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "observed"
+    assert row["remaining"]["amount"] == {"kind": "exact", "value": "16"}
+
+
+def test_review7_major2_group_binding_replay_with_different_usage_value_is_conflict():
+    """同上情境，但 replay 的用量數值不同時必須是 conflict、該 pool
+    unknown，不能被靜默接受成第二筆獨立扣減。"""
+    _, _, shadow_module = _feature_api()
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    binding = _group_binding((descriptor,), (_PROFILE_A, _PROFILE_B))
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    snapshot = _observation(
+        descriptor, "short", value="20", observed_at_ms=_NOW,
+        reset_at_ms=_NOW + 300_000,
+    )
+    assert service.record_observation(
+        snapshot.to_dict(), descriptors=(descriptor,), unit_catalog=(),
+    ).accepted == 1
+
+    job = {
+        "id": "job-group-replay-conflict", "executor": "codex",
+        "started_at": _iso_utc_ms(_NOW + 1), "finished_at": _iso_utc_ms(_NOW + 2),
+        "usage": {"input_tokens": 4},
+    }
+    first = service.record_terminal_usage(
+        job, profile_key=_PROFILE_A, binding=binding, descriptors=(descriptor,),
+        unit_catalog=(), unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 5,
+    )
+    assert first.accepted == 1
+
+    changed_job = deepcopy(job)
+    changed_job["usage"]["input_tokens"] = 9
+    changed = service.record_terminal_usage(
+        changed_job, profile_key=_PROFILE_B, binding=binding, descriptors=(descriptor,),
+        unit_catalog=(), unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 6,
+    )
+    assert changed.accepted == 0
+    assert changed.conflicts == 1
+
+    report = service.project(
+        descriptors=(descriptor,), unit_catalog=(), now_utc_ms=_NOW + 10
+    )
+    row = _pool_row(report, "pool-shared", "short")
+    assert row["remaining"]["state"] == "unknown"
+
+
+def test_review7_major3_unresolvable_usage_event_forces_associated_pool_unknown_instead_of_being_dropped():
+    """MAJOR quota_shadow.py:791 — 先記一筆透過 associations 指向 credit
+    pool 的不可換算 token usage，project() 若因為缺少該 usage 自身引用的
+    unit（例如舊版／rollback descriptor）而無法解析，scope=unknown 的事件
+    會被 _mark_unresolved_record 直接丟掉：credit pool 的 row 仍顯示舊
+    snapshot 餘額，等同放行一筆看不懂的耗用事件。無法解讀的 usage 事件不得
+    丟棄；受影響 pool 必須轉 unknown 並附上明確 gap（例如
+    usage-unresolvable）。"""
+    _, _, shadow_module = _feature_api()
+    token_descriptor = _pool_descriptor(
+        account="acct-tokens", pool="pool-tokens", unit_id="token",
+        windows=(("month", 2_678_400_000),),
+    )
+    credit_descriptor = _pool_descriptor(
+        account="acct-credit", pool="pool-credit", unit_id="premium-credit",
+        semantics_ref="provider:github-copilot-sdk/premium-interactions/v1",
+        windows=(("month", 2_678_400_000),),
+    )
+    binding = _binding((token_descriptor, credit_descriptor), _PROFILE_A)
+    service = shadow_module.QuotaShadowService.in_memory()
+
+    credit_snapshot = _observation(
+        credit_descriptor, "month", value="10", observed_at_ms=_NOW, unit_id="premium-credit",
+    )
+    assert service.record_observation(
+        credit_snapshot.to_dict(), descriptors=(credit_descriptor,), unit_catalog=()
+    ).accepted == 1
+
+    result = service.record_terminal_usage(
+        {"id": "job-unresolvable-usage", "executor": "codex", "usage": {"input_tokens": 3}},
+        profile_key=_PROFILE_A,
+        binding=binding,
+        descriptors=(token_descriptor, credit_descriptor),
+        unit_catalog=(),
+        unit_ref_by_metric={"input_tokens": ("token", "1")},
+        observed_at_ms=_NOW + 10,
+    )
+    assert result.accepted == 2
+
+    # project() 只帶 credit_descriptor：credit pool 那筆不可換算 usage 自身
+    # 引用的 token unit 因而缺失——模擬缺少該 usage unit 的舊版／rollback
+    # descriptor。
+    report = service.project(
+        descriptors=(credit_descriptor,), unit_catalog=(), now_utc_ms=_NOW + 20
+    )
+    credit_row = _pool_row(report, "pool-credit", "month")
+    assert credit_row["remaining"]["state"] == "unknown"
+    assert "usage-unresolvable" in credit_row["coverage_gaps"]

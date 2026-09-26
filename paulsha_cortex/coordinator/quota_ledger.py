@@ -130,6 +130,27 @@ class QuotaEventLedger:
                     conflict["associations"] = normalized_associations
                 self._append_fd(fd, conflict, info.st_size)
                 return LedgerAppendResult("conflict", conflicts=1, idempotency_key=key)
+            # 就算這筆的 idempotency key（caller 指定或外部 event_identity）
+            # 與既有事件都不同，仍必須以語意範圍（pool／window／observed_at／
+            # metric）比對是否撞上同一次觀測：key 本身可能因呼叫端／事件來源
+            # 不同而永遠不會撞在一起，但那不代表語意上不是同一筆衝突觀測
+            # （見 #836 對抗審查第七輪 MAJOR quota_ledger.py:274）。
+            cross_digest = _cross_identity_conflict_digest(records, wire, digest)
+            if cross_digest is not None:
+                conflict = {
+                    "schema_version": 1,
+                    "kind": "conflict",
+                    "idempotency_key": key,
+                    "existing_sha256": cross_digest,
+                    "incoming_sha256": digest,
+                    "scope": _scope_summary(wire),
+                    "observed_at_ms": _known_value(wire.get("observed_at_ms")),
+                    "window_id": _scope_summary(wire).get("window_id"),
+                }
+                if normalized_associations:
+                    conflict["associations"] = normalized_associations
+                self._append_fd(fd, conflict, info.st_size)
+                return LedgerAppendResult("conflict", conflicts=1, idempotency_key=key)
             self._append_fd(fd, entry, info.st_size)
             return LedgerAppendResult("accepted", accepted=1, idempotency_key=key)
         finally:
@@ -285,27 +306,19 @@ def _idempotency_key(observation, wire, caller_key):
             "metric_id": measurement.get("metric_id"),
             "kind": measurement.get("kind"),
         })).hexdigest()
-    measurement = wire.get("measurement", {})
-    scope = _scope_summary(wire)
-    observed_at_ms = _known_value(wire.get("observed_at_ms"))
-    if scope.get("state") == "known" and type(observed_at_ms) is int:
-        # Without a provider event ID, use stable observation coordinates rather
-        # than content: a changed quantity at the same scope/time must collide
-        # and create a conflict receipt. The key intentionally excludes
-        # source_id/source_schema/method: conflict detection must compare
-        # across sources on semantic scope (pool/window/observed_at), not only
-        # within one source. Keying on source fields let a manager provider
-        # read and an imported external read (or the same source before/after
-        # an adapter-schema rollback) report different remaining values for
-        # the same pool/window/observed_at without ever colliding, so
-        # project() silently picked one arbitrarily instead of raising a
-        # conflict receipt (see #836 對抗審查第六輪 MAJOR quota_ledger.py:296).
-        derived_identity = {
-            "scope": scope,
-            "metric_id": measurement.get("metric_id"),
-            "kind": measurement.get("kind"),
-            "observed_at_ms": observed_at_ms,
-        }
+    # Without a provider event ID, use stable observation coordinates rather
+    # than content: a changed quantity at the same scope/time must collide
+    # and create a conflict receipt. The key intentionally excludes
+    # source_id/source_schema/method: conflict detection must compare
+    # across sources on semantic scope (pool/window/observed_at), not only
+    # within one source. Keying on source fields let a manager provider
+    # read and an imported external read (or the same source before/after
+    # an adapter-schema rollback) report different remaining values for
+    # the same pool/window/observed_at without ever colliding, so
+    # project() silently picked one arbitrarily instead of raising a
+    # conflict receipt (see #836 對抗審查第六輪 MAJOR quota_ledger.py:296).
+    derived_identity = _semantic_scope_identity(wire)
+    if derived_identity is not None:
         return "derived:" + hashlib.sha256(_canonical_bytes(derived_identity)).hexdigest()
     # Unknown coordinates cannot safely be coalesced across receipts. Keep
     # replay detection stable by using the caller observation ID, not payload.
@@ -313,6 +326,74 @@ def _idempotency_key(observation, wire, caller_key):
         "source_id": observation.source_id,
         "observation_id": observation.observation_id,
     })).hexdigest()
+
+
+def _semantic_scope_identity(wire):
+    """觀測的語意範圍身分：pool／window／observed_at／metric／measurement
+    kind。與 idempotency key 使用哪一種機制（caller-supplied、外部
+    event_identity 或本模組推導的 derived key）完全無關，只用來判斷「這是
+    不是同一次觀測」，不論 idempotency key 是否相同（見 #836 對抗審查第七輪
+    MAJOR quota_ledger.py:274）。scope 或 observed_at_ms 未知時回傳 None，
+    代表這筆事件的座標不足以安全比對。"""
+    scope = _scope_summary(wire)
+    if scope.get("state") != "known":
+        return None
+    observed_at_ms = _known_value(wire.get("observed_at_ms"))
+    if type(observed_at_ms) is not int:
+        return None
+    measurement = wire.get("measurement")
+    if not isinstance(measurement, dict):
+        return None
+    return {
+        "scope": scope,
+        "metric_id": measurement.get("metric_id"),
+        "kind": measurement.get("kind"),
+        "observed_at_ms": observed_at_ms,
+    }
+
+
+_SNAPSHOT_LIKE_MEASUREMENT_KINDS = frozenset(("remaining_snapshot", "gauge_snapshot"))
+
+
+def _cross_identity_conflict_digest(records, wire, digest):
+    """在既有事件中尋找與這筆觀測語意範圍相同、但觀測到的量測值不同的既有
+    observation 記錄——不論兩者當初各自使用哪一種 idempotency key。找到即
+    回傳既有的 payload digest（用於寫入 conflict receipt）；範圍不足以比
+    對、或範圍相同但量測值一致都回傳 None（視為一致，不算衝突：不同
+    profile／來源各自獨立讀到同一個真值時，profile_ref／source 等欄位本來
+    就可能不同，不能因此誤判成衝突）。
+
+    只比對「同一時間點應該只有一個真值」的 snapshot 類量測
+    （remaining_snapshot／gauge_snapshot）。usage_delta 等累加型事件本質上
+    允許多筆事件共享同一個 observed_at_ms（例如多個不同 job 在同一毫秒各自
+    完成、各自扣減同一個 window），不屬於這裡要抓的語意衝突；那一類事件的
+    去重／衝突判定另有專屬 identity（見 record_terminal_usage 的 replay
+    key），不能被這裡的通用比對誤傷。"""
+    measurement = wire.get("measurement")
+    if not isinstance(measurement, dict) or measurement.get("kind") not in _SNAPSHOT_LIKE_MEASUREMENT_KINDS:
+        return None
+    semantic_id = _semantic_scope_identity(wire)
+    if semantic_id is None:
+        return None
+    target = _canonical_bytes(semantic_id)
+    value = _canonical_bytes(measurement.get("quantity"))
+    for row in records:
+        if row.get("kind") != "observation":
+            continue
+        other_wire = row.get("observation")
+        if not isinstance(other_wire, dict):
+            continue
+        other_measurement = other_wire.get("measurement")
+        if (not isinstance(other_measurement, dict)
+                or other_measurement.get("kind") not in _SNAPSHOT_LIKE_MEASUREMENT_KINDS):
+            continue
+        other_id = _semantic_scope_identity(other_wire)
+        if other_id is None or _canonical_bytes(other_id) != target:
+            continue
+        if _canonical_bytes(other_measurement.get("quantity")) == value:
+            continue
+        return row.get("payload_sha256")
+    return None
 
 
 def _is_terminal_usage_observation(wire):
@@ -343,6 +424,7 @@ def _terminal_usage_metadata(wire, started_at_ms, finished_at_ms=None):
 
 
 _TERMINAL_USAGE_REPLAY_TIME_EXCLUDED = "terminal-usage-replay-time-excluded-from-identity"
+_TERMINAL_USAGE_REPLAY_PROFILE_EXCLUDED = "terminal-usage-replay-profile-excluded-from-identity"
 
 
 def _observation_digest_payload(wire, associations, terminal_metadata):
@@ -355,6 +437,15 @@ def _observation_digest_payload(wire, associations, terminal_metadata):
         wire = dict(wire)
         wire["observed_at_ms"] = _TERMINAL_USAGE_REPLAY_TIME_EXCLUDED
         wire["received_at_ms"] = _TERMINAL_USAGE_REPLAY_TIME_EXCLUDED
+        # 同樣不綁記錄當下使用的 profile_key／observation_id：同一 terminal
+        # job 若因 group binding／profile alias replay 先後以不同
+        # profile_key 記到同一個 shared pool/window，identity 只認
+        # (job_id, pool identity, metric, window 範圍)，profile_key 不應
+        # 參與比對——否則數值相同的重播仍會因 profile_ref/observation_id
+        # 不同而被誤判成 conflict，而不是 duplicate（見 #836 對抗審查第七輪
+        # MAJOR quota_shadow.py:307）。
+        wire["profile_ref"] = _TERMINAL_USAGE_REPLAY_PROFILE_EXCLUDED
+        wire["observation_id"] = _TERMINAL_USAGE_REPLAY_PROFILE_EXCLUDED
     if associations:
         payload = {"observation": wire, "associations": associations}
     else:
