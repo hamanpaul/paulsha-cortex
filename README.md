@@ -481,6 +481,10 @@ systemctl --user status cortex-manager.service cortex-monitor.service
   下游可直接使用去識別化 producer snapshot fixture
   `tests/fixtures/workflow-execution-identity-828-status.json`；欄位與 selection
   語意見 `docs/superpowers/specs/workflow-execution-identity-producer-contract.md`。
+- verify job 的 log 若含 `status: ERROR` 的 provider attempt 訊息，且 Manager 已綁定
+  成功 evidence、run 的 Candidate 與 `verified_head` 相同並將該卡標為 passed，`in_flight`／
+  `attention` 會附 `accepted_workflow_results`，`cortex jobs` 會附 `workflow_result`，顯示
+  `verified` 與 `recovered_provider_errors`。這是呈現註記，不覆寫 Job 的 process status、原始 log 或 usage；沒有 Manager 採信結果時不會投影成成功。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。builder／reviewer 失敗若已有
   durable `provider_outcome`，`gate_reason` 會帶具名後綴（例如 `builder-failed-rate_limited`、
   `builder-failed-effort_not_supported`、`foreign-review-provider-launch_failed`），而不是把所有

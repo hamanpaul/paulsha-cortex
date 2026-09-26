@@ -978,6 +978,115 @@ def _workflow_execution_identity(registry, run) -> dict[str, Any]:
     return _unknown_execution_identity(card=step.card)
 
 
+_PROVIDER_ATTEMPT_ERROR_RE = re.compile(
+    r"API error\s+\(attempt\s+\d+\):[^\r\n]*", re.IGNORECASE
+)
+_PROVIDER_ATTEMPT_ERROR_NOTE_LIMIT = 400
+
+
+def _provider_attempt_errors(job: Mapping[str, object]) -> list[str]:
+    """從 job log 擷取有明確 attempt 標記的 provider ERROR 訊息供呈現。"""
+    log_path = job.get("log_path")
+    if not isinstance(log_path, str) or not log_path:
+        return []
+    output = provider_outcome.read_log_tail(log_path)
+    if not output:
+        return []
+    messages: list[str] = []
+    for line in output.splitlines():
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, Mapping):
+            continue
+        status = record.get("status")
+        if not isinstance(status, str) or status.upper() != "ERROR":
+            continue
+        for key in ("error", "message", "detail", "reason"):
+            value = record.get(key)
+            if not isinstance(value, str):
+                continue
+            match = _PROVIDER_ATTEMPT_ERROR_RE.search(value)
+            if match is None:
+                continue
+            message = match.group(0).strip()
+            if len(message) > _PROVIDER_ATTEMPT_ERROR_NOTE_LIMIT:
+                message = message[:_PROVIDER_ATTEMPT_ERROR_NOTE_LIMIT].rstrip() + "…"
+            if message not in messages:
+                messages.append(message)
+            break
+    return messages
+
+
+def workflow_job_result_presentation(
+    job: Mapping[str, object], run
+) -> dict[str, Any]:
+    """只為 Manager 已採信的 verify verdict 附上恢復的 provider attempt error。"""
+    locator = job.get("workflow_evidence")
+    evidence_path = locator.get("path") if isinstance(locator, Mapping) else None
+    evidence_hash = locator.get("hash") if isinstance(locator, Mapping) else None
+    candidate = job.get("subject_head")
+    if (
+        job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or job.get("workflow_phase") != "verify"
+        or not isinstance(locator, Mapping)
+        or set(locator) != {"kind", "path", "hash"}
+        or locator.get("kind") != "verify"
+        or job.get("workflow_run_id") != getattr(run, "run_id", None)
+        or job.get("workflow_claim_key") != getattr(run, "claim_key", None)
+        or job.get("workflow_repo") != getattr(run, "repo", None)
+        or not isinstance(candidate, str)
+        or candidate != getattr(run, "candidate_head", None)
+        or candidate != getattr(run, "verified_head", None)
+    ):
+        return {}
+    if (
+        not isinstance(evidence_path, str)
+        or Path(evidence_path).is_absolute()
+        or ".." in Path(evidence_path).parts
+        or Path(evidence_path).parts[:2] != ("evidence", "workflow")
+        or not isinstance(evidence_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", evidence_hash) is None
+    ):
+        return {}
+    card = job.get("workflow_card")
+    if not isinstance(card, str) or not any(
+        step.phase == "verify" and step.card == card and step.gate_result == "passed"
+        for step in getattr(run, "steps", ())
+    ):
+        return {}
+    errors = _provider_attempt_errors(job)
+    if not errors:
+        return {}
+    return {
+        "workflow_result": {
+            "status": "verified",
+            "recovered_provider_errors": errors,
+        }
+    }
+
+
+def workflow_accepted_results_for_run(registry, run) -> list[dict[str, Any]]:
+    """投影同一 run 中帶 recovered provider error 註記的已採信驗證結果。"""
+    try:
+        jobs = registry.list_jobs()
+    except Exception:  # noqa: BLE001 - 呈現補充欄位不得讓 status 失效
+        return []
+    results: list[dict[str, Any]] = []
+    for job in jobs:
+        if not isinstance(job, Mapping):
+            continue
+        presentation = workflow_job_result_presentation(job, run)
+        result = presentation.get("workflow_result")
+        if not isinstance(result, dict):
+            continue
+        results.append({"card": job.get("workflow_card"), **result})
+    return results
+
+
 def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runner=None) -> dict[str, Any]:
     slice_id = str(slice_row.get("slice_id") or "")
     builder_job_id = slice_row.get("builder_job_id")
@@ -1157,7 +1266,7 @@ def workflow_status_entry(
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         candidate_git_base = None
     execution_identity = _workflow_execution_identity(registry, run)
-    return {
+    entry = {
         "kind": "workflow_run",
         "run_id": run.run_id,
         "work_id": run.work_id,
@@ -1180,6 +1289,10 @@ def workflow_status_entry(
         "updated_at": run.updated_at,
         **execution_identity,
     }
+    accepted_workflow_results = workflow_accepted_results_for_run(registry, run)
+    if accepted_workflow_results:
+        entry["accepted_workflow_results"] = accepted_workflow_results
+    return entry
 
 
 def _completion_candidate_ref(

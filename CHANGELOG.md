@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#933 AGY provider attempt 錯誤呈現**：`status` 與 `jobs` 投影在 Manager 已採信 verification 結果時，改顯示 `verified` 並附上 recovered provider error 註記；缺少採信結果時維持原狀。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
