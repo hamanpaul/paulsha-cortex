@@ -628,6 +628,7 @@
 
 ### Fixed
 
+- **#882 verify operator attestation**：新增 exact Candidate 綁定的 `verify-attest` work action，要求 operator 附 full-suite 指令與 passed/failed 摘要（failed 必須為 0），將 immutable evidence 寫入 registry 後推進 review；`review-attest` 維持 review-only。
 - **#577 retry-verify／retry-review 保留精準 reviewer recovery**：重置前先用 Manager 的精準 terminal recovery 判準檢查舊 exited job；仍可復原者保留 `exited`，避免永久關閉免費復原路徑。
 - **#582 Manager 重啟中斷 Claude 工具鏈**：部署前確認沒有執行中的 Claude job；將 `aborted_tools` 終局分類為可重試的環境中斷。
 - **#498 Claude headless builder 停用即時 steering**：launcher 不再為 `-p` builder 附加

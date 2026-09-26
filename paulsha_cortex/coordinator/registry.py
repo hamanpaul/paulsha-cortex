@@ -4999,6 +4999,65 @@ class JobRegistry:
         self._persist()
         return self._copy_workflow_run(updated)
 
+    def _manager_advance_verify_attest(
+        self,
+        run_id: str,
+        *,
+        expected_candidate: str,
+        evidence_ref: str,
+    ) -> WorkflowRun:
+        """原子採信指定 Candidate 的 operator verify attestation 並推進至 review。"""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if (
+            current.status != "ongoing"
+            or current.current_phase != "verify"
+            or "needs_human" not in current.facets
+        ):
+            raise ValueError("verify-attest requires active needs_human verify workflow")
+        if (
+            not isinstance(expected_candidate, str)
+            or verification.SAFE_SHA_RE.fullmatch(expected_candidate) is None
+            or not isinstance(current.candidate_head, str)
+            or verification.SAFE_SHA_RE.fullmatch(current.candidate_head) is None
+            or current.candidate_head.lower() != expected_candidate.lower()
+        ):
+            raise ValueError("verify-attest Candidate CAS mismatch")
+        if not isinstance(evidence_ref, str) or not evidence_ref.strip():
+            raise ValueError("verify-attest evidence ref is required")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("verify-attest refuses active workflow job")
+        build_steps = [step for step in current.steps if step.phase == "build"]
+        verify_steps = [step for step in current.steps if step.phase == "verify"]
+        if not build_steps or any(step.gate_result != "passed" for step in build_steps):
+            raise ValueError("verify-attest requires completed build phase")
+        if not verify_steps:
+            raise ValueError("verify-attest requires verify-phase steps")
+
+        validate_workflow_phase_transition(current.current_phase, "review")
+        updated = replace(
+            current,
+            current_phase="review",
+            steps=tuple(
+                replace(step, gate_result="passed") if step.phase == "verify" else step
+                for step in current.steps
+            ),
+            verified_head=current.candidate_head.lower(),
+            facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            gate_status="running",
+            evidence_refs=tuple(dict.fromkeys((*current.evidence_refs, evidence_ref))),
+            needs_human_reason=None,
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
     def _manager_accept_plan_review(
         self,
         run_id: str,

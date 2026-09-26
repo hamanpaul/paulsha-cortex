@@ -224,6 +224,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "close-delivered",
             "recover-superseded",
             "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+            "verify-attest",
             "review-disposition",
             "intake",
         ],
@@ -242,6 +243,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "abandon／retire-delivered／recover-superseded／regenerate-gates／"
             "retry-card／refreeze-base 使用的 exact WorkflowRun CAS；retry-build 改用 expected_candidate"
         ),
+    )
+    p_work.add_argument(
+        "--expected-candidate",
+        help="verify-attest 專用：exact Candidate SHA CAS",
     )
     p_work.add_argument(
         "--card",
@@ -263,7 +268,10 @@ def _build_parser() -> argparse.ArgumentParser:
     toggle = p_work.add_mutually_exclusive_group()
     toggle.add_argument("--enable", action="store_true")
     toggle.add_argument("--disable", action="store_true")
-    p_work.add_argument("--payload", help="額外 manager-side evidence refs JSON object")
+    p_work.add_argument(
+        "--payload",
+        help="verify-attest 的 full_suite_command/result_summary JSON（failed 必須為 0），或其他 action 的 payload",
+    )
 
     sub.add_parser(
         "status",
@@ -439,6 +447,17 @@ def main(
         )
 
     if args.cmd == "work":
+        if args.action == "verify-attest" and (
+            args.actor is None or args.expected_candidate is None or args.payload is None
+        ):
+            print(
+                "錯誤: verify-attest 必須提供 --actor、--expected-candidate 與 --payload。",
+                file=sys.stderr,
+            )
+            return 2
+        if args.action != "verify-attest" and args.expected_candidate is not None:
+            print("錯誤: --expected-candidate 僅供 verify-attest 使用。", file=sys.stderr)
+            return 2
         if args.action == "close-delivered" and (args.actor is None or args.reason is None):
             print("錯誤: close-delivered 必須提供 --actor 與 --reason。", file=sys.stderr)
             return 2
@@ -467,6 +486,8 @@ def main(
             request_args["failure_reason"] = args.failure_reason
         if args.expected_run_id is not None:
             request_args["expected_run_id"] = args.expected_run_id
+        if args.action == "verify-attest":
+            request_args["expected_candidate"] = args.expected_candidate
         if args.card is not None:
             request_args["card"] = args.card
         if args.reason is not None:
@@ -485,6 +506,8 @@ def main(
                 print("錯誤: work payload must be a JSON object", file=sys.stderr)
                 return 2
             protected = {"action", "repo", "work_id"}
+            if args.action == "verify-attest":
+                protected.update({"actor", "expected_candidate"})
             if protected & set(extra):
                 print("錯誤: work payload cannot override action/repo/work_id", file=sys.stderr)
                 return 2

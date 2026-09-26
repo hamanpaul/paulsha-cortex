@@ -2229,6 +2229,131 @@ def _review_attest_action(
     return {"action": "review-attested", "head": run.candidate_head, **record}
 
 
+def _verify_attest_action(
+    *,
+    args: dict[str, Any],
+    requested_by: str,
+    authority,
+    now_epoch: float,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """以 operator evidence 覆核被阻塞的 verify 階段，並綁定 exact Candidate。"""
+
+    allowed = {
+        "action",
+        "repo",
+        "work_id",
+        "actor",
+        "expected_candidate",
+        "full_suite_command",
+        "result_summary",
+    }
+    extras = set(args) - allowed
+    if extras:
+        raise ValueError(f"verify-attest rejects caller evidence/input: {sorted(extras)[0]}")
+    actor = args.get("actor")
+    expected_candidate = args.get("expected_candidate")
+    full_suite_command = args.get("full_suite_command")
+    result_summary = args.get("result_summary")
+    if (
+        not isinstance(actor, str)
+        or not actor.strip()
+        or len(actor) > 128
+        or "\n" in actor
+        or not isinstance(expected_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(expected_candidate) is None
+        or not isinstance(full_suite_command, str)
+        or not full_suite_command.strip()
+        or len(full_suite_command) > 4000
+        or "\x00" in full_suite_command
+        or not isinstance(result_summary, dict)
+        or set(result_summary) != {"passed", "failed"}
+        or type(result_summary.get("passed")) is not int
+        or result_summary["passed"] < 0
+        or type(result_summary.get("failed")) is not int
+        or result_summary["failed"] != 0
+        or not isinstance(now_epoch, (int, float))
+        or isinstance(now_epoch, bool)
+        or not math.isfinite(float(now_epoch))
+    ):
+        raise ValueError("verify-attest payload invalid")
+
+    _state, active, run = _load_work_run(
+        state_path=state_path,
+        workflow_registry=workflow_registry,
+        authority=authority,
+    )
+    _validate_current_run_authority(active, authority, run)
+    if (
+        run.status != "ongoing"
+        or run.current_phase != "verify"
+        or "needs_human" not in run.facets
+    ):
+        raise RuntimeError("verify-attest requires needs_human verify-phase workflow")
+    if (
+        not isinstance(run.candidate_head, str)
+        or verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is None
+        or run.candidate_head.lower() != expected_candidate.lower()
+    ):
+        raise RuntimeError("verify-attest expected Candidate CAS mismatch")
+    if not any(step.phase == "verify" for step in run.steps):
+        raise RuntimeError("verify-attest requires verify-phase steps")
+    if any(
+        step.phase == "build" and step.gate_result != "passed"
+        for step in run.steps
+    ) or not any(step.phase == "build" for step in run.steps):
+        raise RuntimeError("verify-attest requires completed build phase")
+    from .registry import ACTIVE_JOB_STATUSES
+
+    jobs = workflow_registry.list_jobs()
+    if any(
+        not isinstance(job, dict)
+        or (
+            job.get("workflow_run_id") == run.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+        )
+        for job in jobs
+    ):
+        raise RuntimeError("verify-attest refuses active workflow job or malformed job row")
+
+    candidate = run.candidate_head.lower()
+    body = {
+        "schema": "cortex-verify-attestation/v1",
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "run_id": run.run_id,
+        "authority_digest": work_authority_digest(authority),
+        "candidate": candidate,
+        "actor": actor.strip(),
+        "requested_by": requested_by,
+        "full_suite_command": full_suite_command.strip(),
+        "result_summary": {
+            "passed": result_summary["passed"],
+            "failed": result_summary["failed"],
+        },
+        "attested_at_epoch": float(now_epoch),
+    }
+    record = _write_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="verify-attest",
+        label="verify-attest",
+        max_size=16_384,
+    )
+    updated = workflow_registry._manager_advance_verify_attest(
+        run.run_id,
+        expected_candidate=candidate,
+        evidence_ref=record["ref"],
+    )
+    return {
+        "action": "verify-attested",
+        "head": candidate,
+        "current_phase": updated.current_phase,
+        **record,
+    }
+
+
 _REVIEW_DISPOSITION_SCHEMA = "cortex-review-disposition/v1"
 
 
@@ -8717,6 +8842,7 @@ def execute_work_action(
         "close-delivered",
         "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+        "verify-attest",
         "review-disposition",
         "intake",
     }:
@@ -8894,6 +9020,15 @@ def execute_work_action(
             requested_by=requested_by,
             authority=authority,
             runner=runner,
+            now_epoch=now_epoch,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "verify-attest":
+        result = _verify_attest_action(
+            args=args,
+            requested_by=requested_by,
+            authority=authority,
             now_epoch=now_epoch,
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,
