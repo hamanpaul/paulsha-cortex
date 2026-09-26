@@ -2892,6 +2892,31 @@ def _claim_action(
         new_digest = work_authority_digest(authority)
         authority_restart_classification = None
         if canonical_run.current_phase in {"verify", "review"}:
+            from .manager import _merged_delivery_journal_bound
+
+            if _merged_delivery_journal_bound(
+                canonical_run, journal_path=Path(state_path)
+            ):
+                logger.info(
+                    "preserving merged delivery run during authority advance: run_id=%s candidate_head=%s",
+                    canonical_run.run_id,
+                    canonical_run.candidate_head,
+                )
+                active = canonical_run.to_dict()
+                active.update(
+                    {
+                        "snapshot_hash": authority.snapshot_hash,
+                        "source_revisions": list(authority.source_revisions),
+                        "provider_revision": authority.github_provider_revision,
+                        "authority_digest": new_digest,
+                        "status": workflow_status(canonical_run),
+                    }
+                )
+                return {
+                    "action": "resume",
+                    "reason": "merged-delivery-closure",
+                    "run": active,
+                }
             try:
                 canonical_run = workflow_registry._manager_reset_workflow_for_authority_restart(
                     canonical_run.run_id,

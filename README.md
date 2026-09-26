@@ -534,6 +534,8 @@ Legacy headless builder 的 dispatch prompt 會帶入 Manager 解析後的 workt
 
 Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、Todo 與 CompletionRecord；若 work item 有 mapped OpenSpec，另要求 active OpenSpec 消失且 archive 成立。`mapped_openspec == ()` 時 remote closure 以 PR merged＋issue 全 closed＋Todo 全勾＋CompletionRecord 有效為準。部分完成不會提早標 `done`。
 
+若舊版 `authority-restart` 已把 run reset 到 `verify`，但同一 run 的完整 merge authorization 與 delivery journal 仍確認 Candidate 已 merge，`resume` 會停止且不重派 verify，並提示 `cortex work <work-id> retire-delivered`。此出口保留退休／abandoned 語意，不代表 shipped completion。
+
 ### 目前邊界
 
 - 沒有 Web UI；任務意圖仍以 Markdown spec 維護。

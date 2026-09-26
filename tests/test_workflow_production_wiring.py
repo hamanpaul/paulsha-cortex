@@ -1363,6 +1363,125 @@ def test_post_merge_closure_routing_rejects_incomplete_authorization(tmp_path: P
     assert not manager._merged_delivery_reconciliation_pending(
         run, coordinator_root=tmp_path
     )
+    assert not manager._merged_delivery_journal_bound(
+        run, journal_path=tmp_path / "delivery-journal.json"
+    )
+
+
+def test_resume_stops_merged_authority_reset_verify_run_with_retirement_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    candidate = "a" * 40
+    steps = tuple(
+        replace(
+            step,
+            gate_result=("passed" if step.phase in {"claim", "define", "plan", "build"} else "pending"),
+        )
+        for step in _manifest().steps
+    )
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="verify",
+        steps=steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=("hamanpaul/paulsha-cortex#17",),
+        attempts={"verify": 1},
+        candidate_head=candidate,
+    )
+    run = registry._manager_update_workflow_run(
+        run.run_id, retry_classification="authority_restart"
+    )
+    step_ids = [f"{run.run_id}:{step.phase}:{step.card}" for step in run.steps]
+    binding = {"pr_number": 17, "change": "production-wiring", "todo_paths": []}
+    body = {
+        "schema": "cortex-merge-authorization/v1",
+        "run_id": run.run_id,
+        "workflow_step_ids": step_ids,
+        "repo": run.repo,
+        "work_id": run.work_id,
+        "authority_digest": "3" * 64,
+        **binding,
+        "head": candidate,
+        "tree_hash": "4" * 64,
+        "foreign_review_path": str(tmp_path / "foreign-review.json"),
+        "foreign_review_hash": "5" * 64,
+        "preflight_hash": "6" * 64,
+        "checks_hash": "7" * 64,
+        "copilot_requested_at_epoch": 100.0,
+        "copilot_review_id": 19,
+        "copilot_hash": "8" * 64,
+    }
+    auth_hash = manager.verification.canonical_json_hash(body)
+    auth_path = tmp_path / "evidence" / "merge-authorization.json"
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_path.write_text(
+        json.dumps({"payload": body, "hash": auth_hash}), encoding="utf-8"
+    )
+    auth_path.chmod(0o444)
+    (tmp_path / "delivery-journal.json").write_text(
+        json.dumps(
+            {
+                "schema": "cortex-delivery-journal/v1",
+                "runs": {
+                    run.run_id: {
+                        "run_id": run.run_id,
+                        "repo": run.repo,
+                        "work_id": run.work_id,
+                        "workflow_step_ids": step_ids,
+                        "delivery_binding": binding,
+                        "ship": {
+                            "phase": "merged",
+                            **binding,
+                            "head": candidate,
+                            "merge_commit": "9" * 40,
+                            "merge_authorization": {
+                                "path": str(auth_path),
+                                "hash": auth_hash,
+                                "payload": body,
+                            },
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    dispatches: list[str] = []
+    monkeypatch.setattr(
+        manager,
+        "dispatch_workflow_card",
+        lambda *_args, **_kwargs: dispatches.append("verify")
+        or {"run_id": run.run_id, "current_phase": "verify", "reason": "dispatch-probe"},
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: None,
+        coordinator_root=tmp_path,
+        operator_resume=True,
+    )
+
+    assert result["reason"] == "merged-run-reset-to-verify"
+    assert "cortex work production-wiring retire-delivered" in result["next_step_hint"]
+    assert "--expected-run-id " + run.run_id in result["next_step_hint"]
+    assert dispatches == []
+    current = registry.get_workflow_run(run.run_id)
+    assert current.current_phase == "verify"
+    assert current.retry_classification == "authority_restart"
+    assert current.steps == run.steps
+    assert current.to_dict() == run.to_dict()
+    assert registry.list_jobs() == []
 
 
 def test_done_ship_resume_refreshes_completion_without_dispatch(tmp_path: Path) -> None:
