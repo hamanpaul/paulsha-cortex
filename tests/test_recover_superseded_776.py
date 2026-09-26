@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+
 from paulsha_cortex.coordinator import work_actions
 from paulsha_cortex.coordinator.claim import claim_key_for_authority_digest
 from paulsha_cortex.coordinator.registry import JobRegistry, WorkflowStep
@@ -163,7 +164,17 @@ class RecoverSupersededActionTests(unittest.TestCase):
             registry._manager_update_workflow_run(
                 run.run_id, status="superseded", facets=("blocked",)
             )
+            persist_calls = 0
+            original_persist = registry._persist
+
+            def count_persist():
+                nonlocal persist_calls
+                persist_calls += 1
+                return original_persist()
+
+            registry._persist = count_persist
             result = self._recover(registry, root / "jobs.json", run.run_id)
+            self.assertEqual(persist_calls, 1)
             self.assertEqual(result["action"], "recovered-superseded")
             updated = registry.get_workflow_run(run.run_id)
             self.assertEqual(updated.status, "ongoing")
@@ -188,6 +199,157 @@ class RecoverSupersededActionTests(unittest.TestCase):
             )
             self.assertEqual(evidence["schema"], "cortex-work-recover-superseded/v1")
             self.assertEqual(evidence["run_id"], run.run_id)
+            self.assertIn(result["evidence"]["ref"], updated.evidence_refs)
+
+    def test_recover_superseded_crash_restart_boundaries_are_atomic_and_replayable(self) -> None:
+        """重啟後只允許原 superseded 狀態或完整恢復狀態，且 exact replay 成功。"""
+
+        for crash_point in (
+            "before-audit-write",
+            "after-audit-write",
+            "after-registry-commit",
+        ):
+            with self.subTest(crash_point=crash_point):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    registry = _make_registry(root)
+                    run = _create_run(registry)
+                    registry._manager_update_workflow_run(
+                        run.run_id, status="superseded", facets=("blocked",)
+                    )
+
+                    original_transition = (
+                        registry._manager_recover_superseded_workflow_run
+                    )
+
+                    def crash_before_audit(*args, **kwargs):
+                        raise RuntimeError("injected crash before audit write")
+
+                    def crash_before_transition(*args, **kwargs):
+                        raise RuntimeError("injected crash after audit write")
+
+                    def crash_after_transition(*args, **kwargs):
+                        original_transition(*args, **kwargs)
+                        raise RuntimeError("injected crash after registry commit")
+
+                    writer_patch = (
+                        mock.patch.object(
+                            work_actions,
+                            "_write_supersede_evidence",
+                            crash_before_audit,
+                        )
+                        if crash_point == "before-audit-write"
+                        else mock.patch.object(
+                            work_actions,
+                            "_write_supersede_evidence",
+                            wraps=work_actions._write_supersede_evidence,
+                        )
+                    )
+                    transition_patch = (
+                        mock.patch.object(
+                            registry,
+                            "_manager_recover_superseded_workflow_run",
+                            crash_before_transition,
+                        )
+                        if crash_point == "after-audit-write"
+                        else mock.patch.object(
+                            registry,
+                            "_manager_recover_superseded_workflow_run",
+                            crash_after_transition,
+                        )
+                        if crash_point == "after-registry-commit"
+                        else mock.patch.object(
+                            registry,
+                            "_manager_recover_superseded_workflow_run",
+                            wraps=original_transition,
+                        )
+                    )
+                    with writer_patch, transition_patch:
+                        with self.assertRaisesRegex(RuntimeError, "injected crash"):
+                            self._recover(registry, root / "jobs.json", run.run_id)
+
+                    restarted = _make_registry(root)
+                    persisted = restarted.get_workflow_run(run.run_id)
+                    if persisted.status == "superseded":
+                        self.assertEqual(persisted.source_revision, "2" * 64)
+                        self.assertEqual(
+                            {step.phase: step.gate_result for step in persisted.steps}["verify"],
+                            "passed",
+                        )
+                        replay = self._recover(restarted, root / "jobs.json", run.run_id)
+                        self.assertEqual(replay["action"], "recovered-superseded")
+                    else:
+                        self.assertEqual(persisted.status, "ongoing")
+                        self.assertEqual(persisted.current_phase, "verify")
+                        self.assertNotIn("blocked", persisted.facets)
+                        self.assertEqual(persisted.source_revision, _DIGEST)
+                        self.assertIsNone(persisted.verified_head)
+                        by_phase = {
+                            step.phase: step.gate_result for step in persisted.steps
+                        }
+                        self.assertEqual(by_phase["verify"], "pending")
+                        self.assertEqual(by_phase["review"], "pending")
+                        with mock.patch.object(
+                            work_actions,
+                            "_write_supersede_evidence",
+                            side_effect=AssertionError("exact replay rewrote audit"),
+                        ), mock.patch.object(
+                            restarted,
+                            "_manager_recover_superseded_workflow_run",
+                            side_effect=AssertionError("exact replay rewrote registry"),
+                        ):
+                            replay = self._recover(
+                                restarted, root / "jobs.json", run.run_id
+                            )
+                        self.assertEqual(replay["action"], "recovered-superseded")
+                    final = restarted.get_workflow_run(run.run_id)
+                    self.assertEqual(final.status, "ongoing")
+                    self.assertEqual(final.source_revision, _DIGEST)
+                    final_gates = {
+                        step.phase: step.gate_result for step in final.steps
+                    }
+                    self.assertEqual(final_gates["verify"], "pending")
+                    self.assertEqual(final_gates["review"], "pending")
+
+    def test_exact_replay_uses_audit_hash_without_rewriting_registry_or_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "jobs.json"
+            registry = _make_registry(root)
+            run = _create_run(registry)
+            registry._manager_update_workflow_run(
+                run.run_id, status="superseded", facets=("blocked",)
+            )
+            original = self._recover(registry, state, run.run_id)
+            before_state = state.read_bytes()
+            evidence = Path(original["evidence"]["ref"])
+            before_evidence = evidence.read_bytes()
+
+            restarted = _make_registry(root)
+            with mock.patch.object(
+                work_actions,
+                "_write_supersede_evidence",
+                side_effect=AssertionError("exact replay rewrote audit"),
+            ), mock.patch.object(
+                restarted,
+                "_manager_recover_superseded_workflow_run",
+                side_effect=AssertionError("exact replay rewrote registry"),
+            ):
+                replay = self._recover(restarted, state, run.run_id)
+
+            self.assertEqual(replay, original)
+            self.assertEqual(state.read_bytes(), before_state)
+            self.assertEqual(evidence.read_bytes(), before_evidence)
+            for changed_audit in (
+                {"actor": "different operator"},
+                {"reason": "different recovery reason"},
+            ):
+                with self.subTest(changed_audit=changed_audit):
+                    with self.assertRaisesRegex(RuntimeError, "superseded"):
+                        self._recover(
+                            restarted, state, run.run_id, **changed_audit
+                        )
+            self.assertEqual(state.read_bytes(), before_state)
 
     def test_rejects_non_superseded_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

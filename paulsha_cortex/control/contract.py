@@ -8,23 +8,15 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from paulsha_cortex.recovery_action_contracts import (
+    SLICE_ACTIONS,
+    WORK_ACTIONS,
+)
+
 from . import constants
 
 REQUEST_TYPES = frozenset(
     {"tick", "fanout", "dispatch", "complete", "slice-action", "workflow-action", "work-action"}
-)
-WORK_ACTIONS = frozenset(
-    {
-        "link", "unlink", "start", "resume", "retry-build", "retry-card",
-        "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
-        "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
-        "close-delivered",
-        "recover-superseded",
-        "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
-        "verify-attest",
-        "review-disposition",
-        "intake",
-    }
 )
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
 
@@ -285,32 +277,36 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or not reason.isprintable()
             ):
                 raise ValueError(f"work-action {action} requires bounded reason")
-    elif req_type == "slice-action" and args.get("action") == "supersede":
-        actor = args.get("actor")
-        reason = args.get("reason")
-        expected_binding_revision = args.get("expected_binding_revision")
-        if (
-            not isinstance(actor, str)
-            or actor != actor.strip()
-            or not 1 <= len(actor) <= 128
-            or not actor.isprintable()
-        ):
-            raise ValueError("slice-action supersede requires bounded actor")
-        if (
-            not isinstance(reason, str)
-            or reason != reason.strip()
-            or not 1 <= len(reason) <= 500
-            or not reason.isprintable()
-        ):
-            raise ValueError("slice-action supersede requires bounded reason")
-        if (
-            not isinstance(expected_binding_revision, int)
-            or isinstance(expected_binding_revision, bool)
-            or expected_binding_revision < 1
-        ):
-            raise ValueError(
-                "slice-action supersede requires exact expected_binding_revision"
-            )
+    elif req_type == "slice-action":
+        action = args.get("action")
+        if action not in SLICE_ACTIONS:
+            raise ValueError("slice-action action invalid")
+        if action == "supersede":
+            actor = args.get("actor")
+            reason = args.get("reason")
+            expected_binding_revision = args.get("expected_binding_revision")
+            if (
+                not isinstance(actor, str)
+                or actor != actor.strip()
+                or not 1 <= len(actor) <= 128
+                or not actor.isprintable()
+            ):
+                raise ValueError("slice-action supersede requires bounded actor")
+            if (
+                not isinstance(reason, str)
+                or reason != reason.strip()
+                or not 1 <= len(reason) <= 500
+                or not reason.isprintable()
+            ):
+                raise ValueError("slice-action supersede requires bounded reason")
+            if (
+                not isinstance(expected_binding_revision, int)
+                or isinstance(expected_binding_revision, bool)
+                or expected_binding_revision < 1
+            ):
+                raise ValueError(
+                    "slice-action supersede requires exact expected_binding_revision"
+                )
     requested_by = payload.get("requested_by")
     if not isinstance(requested_by, str) or not requested_by:
         raise ValueError("request requested_by must be a non-empty string")

@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **#843 recovery action conformance**：新增版本化 action registry 與 13 家族契約矩陣，並以 dispatcher、control contract、coordinator CLI、`cortex recover` work/slice alias 雙向核對正式名稱與 CAS 欄位；補上 retry candidate CLI CAS、recover/abandon crash/restart 參數化特性與 frozen same-domain reviewer pin 零派工負控制。既有 producer gap 和 live 驗收界線記錄於矩陣。
+
 ### Fixed
 
 - **#833 Red child 自動進件**：拆分計畫通過 review 後，Manager 以 planning transaction 冪等發布 child work item 與 Todo；Monitor snapshot 確認 WorkAuthority 後由 periodic resume 自動標準 intake。
@@ -14,6 +18,7 @@
 - **#567 delivery closure 本機 Git 讀取**：fetch default branch 後，以 canonical checkout 的本機 Git 驗證 merge ancestry、parents、OpenSpec tree 與 Todo blob／內容；checkout 缺失或 shallow 時 fail-closed 並提供診斷，不自動 unshallow。
 - **#835 execution profile production 接線**：沿用 schema-core 建立可信 executor adapter，將 requested／resolved／observed profile 接在正式 workflow identity 選擇後，並納入 launcher、manager、generic dispatch 與 planning runtime；以獨立 versioned sibling 持久化，保留 legacy model chain。profile key 綁定 effort、loadout、toolset、sandbox、permissions 與 toolchain；角色、pin、reviewer independence 與 Trust Root 維持 spawn 前 fail-closed。Sized dispatch 的 exact-profile qualification 僅由 host `model-identities.yaml` overlay 的 `qualification_policy.sized_dispatch: enforce` 啟用，預設不阻擋並記錄 `qualification: not-enforced`。quota 未綁可信來源時維持 unknown，PatchMUD 報告 consumer 驗證 revision／digest／profile key。
 - **#841 loaded-runtime 身分證據**：Manager／Monitor startup 寫入不可覆寫的 loaded artifact/config receipt；`service status` 與 doctor 分開投影 operator CLI、磁碟 service declaration 與長駐程序身分。package/config drift、缺漏或無法核對的 receipt/PID/source override 維持明確 drift/unknown；transition status 不授予更新或回滾安全性。補齊隔離安裝 CLI、restart/reload、secret allowlist、instance-root、Trust Root receipt chain 與 in-flight fail-closed 測試，並新增操作與 live 驗收文件。
+- **#843 R07 `recover-superseded` crash/replay**：run status、`blocked`/`needs_human` 清理、authority restart 的 verify/review gate reset、`claim_key`/`source_revision` 更新與 audit reference 改由單一 registry revision CAS 寫入；同 run/actor/reason 的 content-addressed audit exact replay 回傳已完成結果，不重寫 audit 或 registry。三個 crash/reload 邊界均驗證無 ongoing wedge。#497/#547/#577 已關閉，不列作本次外部阻塞。
 
 - **#502 verify／review 通過後的阻斷修復入口**：exact-candidate `retry-build` 現可接受尚未進入 `needs_human` 的後續阻斷裁決；必須提供 `--reason`，以既有 immutable operator-adjudication evidence 記錄後重跑 verify／review，已完成 run 仍拒絕重開。
 

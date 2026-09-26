@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.recovery_action_contracts import SLICE_ACTIONS as _REGISTERED_SLICE_ACTIONS
 
 from .._yaml import YAMLError, safe_load
 from ..lib import idle
@@ -111,7 +112,7 @@ TERMINAL_STATUSES = frozenset({"exited", "failed"})
 WORKFLOW_LANE_GATE_STATUS = "workflow-tracked"
 WORKFLOW_LANE_GATE_REASON = "workflow-lane-job"
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
-SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "recover-pre-candidate", "abandon", "supersede"})
+SLICE_ACTIONS = _REGISTERED_SLICE_ACTIONS
 WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
 WORKFLOW_INPUT_ENVELOPE_MAX_BYTES = 131072
 RED_DECOMPOSITION_CARD = "red-decomposition"
