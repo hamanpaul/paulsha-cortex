@@ -647,6 +647,7 @@
 - **#581 persona fail-loud 殘項**：doctor 依解析政策確認至少一個可用的 planning identity，不再要求 canonical agy；未知 workflow persona 明確拒絕；Claude review overlay 判定改用公開 loader。核對後確認各派工入口共用 `_dispatch_workflow_card`，沿用既有 `resolved_model_chain` provenance 寫入點。
 - **#602 slice-lane reviewer log 路徑**：將 `log_dir` 從 repo 工作樹相對路徑改為 `<coordinator_root>/slice-review-logs/<reviewer_job_id>/`，並列入 Manager-only trust-root 資產，避免 builder 透過可寫工作樹改寫 review 終局 log。
 - **#808 Manager-only OpenSpec 任務不再卡住 archive**：local-closeout 對明確由 Manager 執行 authoritative preflight 並採信 Candidate 的未勾項不再判為 tasks 未完成；其他未勾項仍阻擋 archive。
+- **#938 workflow input envelope 去重**：相同 SHA-256 內容只計入一次 128 KiB 上限，snapshot 仍保留各 ref；超限錯誤列出計量總 bytes、上限與各 ref 的 bytes。
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用；模型回傳 `..`／絕對
   路徑 ref 與內容驗收拒收維持 content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，
