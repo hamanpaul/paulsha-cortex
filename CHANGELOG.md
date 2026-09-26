@@ -628,6 +628,8 @@
 
 ### Fixed
 
+- **#887／#962／#975 已合併 run 防重驗護欄**：authority 前進且 merge authorization 與 delivery journal 完整綁定時，保留原 run phase；舊 `authority_restart` verify-reset merged run 則 fail-closed 停止並提示 `retire-delivered`。
+
 - **#572／#707 planning failure 診斷**：整合後 artifact 的 symlink、路徑逃逸、非一般檔案
   及讀取／解碼拒收分類為 environment，使 `recover-planning` 可用，內容驗收拒收維持
   content；planning failure evidence 另保存 questioner／secondary／integrator 輸入摘錄，

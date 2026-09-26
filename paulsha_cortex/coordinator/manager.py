@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import pwd
 import re
@@ -11815,6 +11816,193 @@ def classify_dispatch_result(
     return {"kind": "decision", "run_id": run_id, "current_phase": current_phase, "reason": reason}
 
 
+def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
+    """Recognize a complete Manager merge authorization bound to this run.
+
+    This is an admission guard only.  It neither proves remote closure nor
+    grants completion; resume uses it to avoid invalidating a run whose merge
+    was already authorized and durably recorded.
+    """
+    path = Path(journal_path)
+    try:
+        if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+            return False
+        journal = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(journal, dict) or journal.get("schema") != "cortex-delivery-journal/v1":
+        return False
+    runs = journal.get("runs")
+    row = runs.get(run.run_id) if isinstance(runs, dict) else None
+    if not isinstance(row, dict) or any(
+        row.get(field) != getattr(run, field, None)
+        for field in ("run_id", "repo", "work_id")
+    ):
+        return False
+
+    expected_step_ids = [
+        f"{run.run_id}:{step.phase}:{step.card}"
+        for step in getattr(run, "steps", ())
+    ]
+    if not expected_step_ids or row.get("workflow_step_ids") != expected_step_ids:
+        return False
+    binding = row.get("delivery_binding")
+    if not isinstance(binding, dict) or set(binding) != {
+        "pr_number", "change", "todo_paths"
+    }:
+        return False
+
+    ship = row.get("ship")
+    if not isinstance(ship, dict):
+        return False
+    if any(ship.get(field) != binding[field] for field in binding):
+        return False
+    candidate = getattr(run, "candidate_head", None)
+    merge_commit = ship.get("merge_commit")
+    if (
+        ship.get("phase") not in {"merged", "done"}
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or ship.get("head") != candidate
+        or not isinstance(merge_commit, str)
+        or verification.SAFE_SHA_RE.fullmatch(merge_commit) is None
+    ):
+        return False
+
+    authorization = ship.get("merge_authorization")
+    if not isinstance(authorization, dict) or set(authorization) != {
+        "path", "hash", "payload"
+    }:
+        return False
+    evidence_path_value = authorization.get("path")
+    digest = authorization.get("hash")
+    body = authorization.get("payload")
+    if (
+        not isinstance(evidence_path_value, str)
+        or not Path(evidence_path_value).is_absolute()
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or not isinstance(body, dict)
+    ):
+        return False
+
+    common_fields = {
+        "schema", "run_id", "workflow_step_ids", "repo", "work_id",
+        "authority_digest", "pr_number", "change", "todo_paths", "head",
+        "tree_hash", "foreign_review_path", "foreign_review_hash",
+        "preflight_hash", "checks_hash",
+    }
+    body_keys = set(body)
+    if body.get("schema") == "cortex-merge-authorization/v1":
+        expected_fields = common_fields | {
+            "copilot_requested_at_epoch", "copilot_review_id", "copilot_hash"
+        }
+        complete_variant = body_keys == expected_fields
+    elif body.get("schema") == "cortex-merge-authorization/v2":
+        expected_fields = common_fields | {"review_kind", "review_ref", "review_hash"}
+        superseded_fields = {
+            "superseded_authorization_ref", "superseded_authorization_hash"
+        }
+        complete_variant = frozenset(body_keys) in {
+            frozenset(expected_fields),
+            frozenset(expected_fields | superseded_fields),
+        }
+    else:
+        return False
+
+    body_binding = {
+        "pr_number": body.get("pr_number"),
+        "change": body.get("change"),
+        "todo_paths": body.get("todo_paths"),
+    }
+    pr_number = body.get("pr_number")
+    change = body.get("change")
+    todo_paths = body.get("todo_paths")
+    if (
+        not complete_variant
+        or body.get("run_id") != run.run_id
+        or body.get("workflow_step_ids") != expected_step_ids
+        or body.get("repo") != run.repo
+        or body.get("work_id") != run.work_id
+        or body.get("head") != candidate
+        or not isinstance(body.get("authority_digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["authority_digest"]) is None
+        or not isinstance(body.get("tree_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["tree_hash"]) is None
+        or not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
+        or pr_number <= 0
+        or body_binding != binding
+        or not isinstance(todo_paths, list)
+        or any(not isinstance(value, str) or not value for value in todo_paths)
+        or len(set(todo_paths)) != len(todo_paths)
+        or (change is not None and (not isinstance(change, str) or not change))
+        or (
+            change is not None
+            and change not in getattr(run, "openspec_refs", ())
+        )
+        or f"{run.repo}#{pr_number}" not in getattr(run, "pr_refs", ())
+    ):
+        return False
+    for field in ("foreign_review_hash", "preflight_hash", "checks_hash"):
+        if not isinstance(body.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", body[field]) is None:
+            return False
+    if not isinstance(body.get("foreign_review_path"), str) or not Path(
+        body["foreign_review_path"]
+    ).is_absolute():
+        return False
+    if body.get("schema") == "cortex-merge-authorization/v1":
+        requested_at = body.get("copilot_requested_at_epoch")
+        review_id = body.get("copilot_review_id")
+        try:
+            requested_at_finite = math.isfinite(float(requested_at))
+        except (OverflowError, TypeError, ValueError):
+            return False
+        if (
+            not isinstance(requested_at, (int, float))
+            or isinstance(requested_at, bool)
+            or not requested_at_finite
+            or not isinstance(review_id, int)
+            or isinstance(review_id, bool)
+            or review_id <= 0
+            or not isinstance(body.get("copilot_hash"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", body["copilot_hash"]) is None
+        ):
+            return False
+    elif (
+        body.get("review_kind") != "maintainer-review"
+        or not isinstance(body.get("review_ref"), str)
+        or not Path(body["review_ref"]).is_absolute()
+        or not isinstance(body.get("review_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["review_hash"]) is None
+    ):
+        return False
+    if "superseded_authorization_ref" in body and (
+        not isinstance(body.get("superseded_authorization_ref"), str)
+        or not Path(body["superseded_authorization_ref"]).is_absolute()
+        or not isinstance(body.get("superseded_authorization_hash"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", body["superseded_authorization_hash"]) is None
+    ):
+        return False
+
+    try:
+        evidence_path = Path(evidence_path_value)
+        if evidence_path.is_symlink() or not stat.S_ISREG(evidence_path.lstat().st_mode):
+            return False
+        if evidence_path.stat().st_mode & 0o222:
+            return False
+        wrapper = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(wrapper, dict)
+        and set(wrapper) == {"payload", "hash"}
+        and wrapper.get("payload") == body
+        and wrapper.get("hash") == digest
+        and verification.canonical_json_hash(body) == digest
+    )
+
+
 def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path) -> bool:
     """Detect the narrow terminal closure path without granting ship authority."""
     terminal_refresh = (
@@ -11908,6 +12096,26 @@ def resume_workflow_run(
     if registry is None:
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
+    if (
+        run.status == "ongoing"
+        and run.current_phase == "verify"
+        and run.retry_classification == "authority_restart"
+        and _merged_delivery_journal_bound(
+            run,
+            journal_path=Path(coordinator_root) / "delivery-journal.json",
+        )
+    ):
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "merged-run-reset-to-verify",
+            "next_actions": ["retire-delivered"],
+            "next_step_hint": (
+                f"cortex work {run.work_id} retire-delivered --repo {run.repo} "
+                f"--expected-run-id {run.run_id} --actor <operator> "
+                "--reason '<single-line reason>'"
+            ),
+        }
     if ship_validator is not None:
         # #370: a prior resume already recorded a durable rate-limit
         # backoff for this run's GitHub provider (see

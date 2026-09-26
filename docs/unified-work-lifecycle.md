@@ -271,6 +271,8 @@ Manager 是唯一 writer。每次 push 都會使上一個 delivery review epoch 
 
 V1 terminal delivery 僅支援 GitHub。其他 forge 仍可顯示 read model，但 ship 會停在 `needs_human`。
 
+Authority 前進時，claim 會先讀取收到的 delivery journal；若 review run 的完整 merge authorization、workflow step、PR binding 與 Candidate 都相符，便保留原 phase，不執行 authority-restart reset。舊版已標記 `retry_classification=authority_restart` 且 reset 到 `verify` 的 merged run，`resume` 會 fail-closed 回報 `merged-run-reset-to-verify`、不派 verify，並提供 `cortex work <work-id> retire-delivered --repo <owner/repo> --expected-run-id <run-id> --actor <operator> --reason '<single-line reason>'`。`retire-delivered` 只退休孤兒 run，維持 abandoned/superseded 語意；它不補寫 CompletionRecord 或 shipped outcome，也不把 run 標成 done。
+
 ## Terminal lifecycle canary
 
 `terminal-lifecycle-canary` confirmed mapping 對應 issue #31。這條 docs-only canary 保持 persona-domain separation：primary `planner` 必須整合 `agy/google` evidence 完成 heterogeneous brainstorm，`planner`、`builder` 與 `reviewer` 則分別在不同 independence domain 產出規劃、最小文件 diff 與獨立審查 evidence。
