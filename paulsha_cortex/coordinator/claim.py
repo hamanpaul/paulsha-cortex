@@ -1189,32 +1189,52 @@ def load_work_authority(
     providers = payload.get("providers") if isinstance(payload, dict) else None
     if isinstance(providers, dict):
         canonical_provider_id = f"{GITHUB_PROVIDER_ID}:{repo}"
-        canonical = providers.get(canonical_provider_id)
-        if isinstance(canonical, dict):
-            revision = canonical.get("revision")
-            last_success_at = canonical.get("last_success_at")
-            healthy = (
-                canonical.get("status") == "ok"
-                and isinstance(revision, str)
-                and bool(revision)
-                and isinstance(last_success_at, str)
-                and bool(last_success_at)
-            )
-            if not healthy:
-                diagnostics = canonical.get("diagnostics")
-                rate_limited = isinstance(diagnostics, list) and any(
-                    isinstance(entry, str) and is_rate_limit_signal(entry)
-                    for entry in diagnostics
+        # #1093 對抗審查 MAJOR1：用 `in` 判斷「這個 provider 條目存在」而非
+        # `.get(...) is not None`——兩者對「條目根本不存在」與「條目存在但
+        # 值是 null」的區分不同，但這裡真正要分的是「存在」vs「不存在」，
+        # 「值是 null」屬於下面 else 分支要 fail-closed 的畸形之一。
+        if canonical_provider_id in providers:
+            canonical = providers[canonical_provider_id]
+            if isinstance(canonical, dict):
+                revision = canonical.get("revision")
+                last_success_at = canonical.get("last_success_at")
+                healthy = (
+                    canonical.get("status") == "ok"
+                    and isinstance(revision, str)
+                    and bool(revision)
+                    and isinstance(last_success_at, str)
+                    and bool(last_success_at)
                 )
-                raise AuthorityValidationError(
-                    "durable GitHub provider authority rate-limited"
-                    if rate_limited
-                    else "durable GitHub provider authority invalid",
-                    reason_code=(
-                        REASON_PROVIDER_RATE_LIMITED_CANONICAL
+                if not healthy:
+                    diagnostics = canonical.get("diagnostics")
+                    rate_limited = isinstance(diagnostics, list) and any(
+                        isinstance(entry, str) and is_rate_limit_signal(entry)
+                        for entry in diagnostics
+                    )
+                    raise AuthorityValidationError(
+                        "durable GitHub provider authority rate-limited"
                         if rate_limited
-                        else REASON_PROVIDER_INVALID_CANONICAL
-                    ),
+                        else "durable GitHub provider authority invalid",
+                        reason_code=(
+                            REASON_PROVIDER_RATE_LIMITED_CANONICAL
+                            if rate_limited
+                            else REASON_PROVIDER_INVALID_CANONICAL
+                        ),
+                        repo=_diagnostic_label(repo),
+                        work_id=_diagnostic_label(work_id),
+                        provider_id=canonical_provider_id,
+                        field="status",
+                    )
+            else:
+                # provider 條目存在，但格式不正確（`null`／list／字串等非
+                # mapping）——健康度無法判斷，不可當作「provider 不存在」
+                # 而放行確定缺席，必須 fail-closed。這正是 #1093 對抗審查
+                # MAJOR1 指出的漏洞：畸形條目原本會被 `isinstance(..., dict)`
+                # 悄悄跳過，落到下面的 WorkAuthorityConfirmedAbsent，讓
+                # registry-only 退休被錯誤放行。
+                raise AuthorityValidationError(
+                    "durable GitHub provider authority malformed",
+                    reason_code=REASON_PROVIDER_INVALID_CANONICAL,
                     repo=_diagnostic_label(repo),
                     work_id=_diagnostic_label(work_id),
                     provider_id=canonical_provider_id,

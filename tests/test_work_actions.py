@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import re
+import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 import subprocess
@@ -1379,6 +1381,136 @@ def test_retire_delivered_uses_registry_run_when_work_authority_is_missing(
     assert len(outcomes[0].read_text(encoding="utf-8").splitlines()) == 1
 
 
+def test_retire_delivered_v2_evidence_fails_closed_under_pre_1093_reader(
+    tmp_path: Path,
+) -> None:
+    """#1093 對抗審查 MAJOR2 相容性驗證。
+
+    authority 缺席（registry-only）路徑改寫 ``cortex-work-retire-delivered
+    /v2`` evidence；若這個修復日後被回退到 ``origin/main``（本票之前），舊
+    版 ``_superseded_retire_delivered_body`` 只認得 v1 schema——必須證明它
+    遇到 v2 evidence 時是「安全 fail-closed」（乾淨的
+    ``WorkflowRun was superseded by different authority`` RuntimeError，不
+    是未攔截例外或資料損毀），而且本 PR 未改動的 v1 evidence（authority 存
+    在路徑）仍能被舊 reader 正常讀回——兩面都要驗證才算完整的回退相容性。
+
+    做法：把 ``origin/main`` 版本的 ``work_actions.py`` 原始碼載入成獨立
+    module，直接呼叫它的 ``_superseded_retire_delivered_body``，不猜測、不
+    重寫舊邏輯。
+    """
+
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        old_source = subprocess.run(
+            ["git", "show", "origin/main:paulsha_cortex/coordinator/work_actions.py"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        pytest.skip(f"origin/main 不可讀，略過舊 reader 回退相容性驗證：{error}")
+
+    module_name = "paulsha_cortex.coordinator._pre_1093_work_actions_compat_shim"
+    old_module = types.ModuleType(module_name)
+    old_module.__package__ = "paulsha_cortex.coordinator"
+    old_module.__file__ = "origin/main:paulsha_cortex/coordinator/work_actions.py"
+    sys.modules[module_name] = old_module
+    try:
+        exec(compile(old_source, old_module.__file__, "exec"), old_module.__dict__)
+    finally:
+        sys.modules.pop(module_name, None)
+    assert hasattr(old_module, "_superseded_retire_delivered_body"), (
+        "origin/main 的 work_actions.py 應仍有 _superseded_retire_delivered_body；"
+        "若函式已改名/搬移，這份相容性測試需要跟著更新，不能靜默略過"
+    )
+
+    actor = "operator"
+    reason = "Workspace retired after external delivery."
+
+    # --- v1：authority 存在路徑，本 PR 未改動 evidence 形狀 ---
+    # 舊 reader 對這條路徑必須仍能正常讀回，證明本 PR 沒有連帶破壞既有相容性。
+    snapshot_v1 = _snapshot(tmp_path / "v1" / "snapshot.json")
+    state_v1 = tmp_path / "v1" / "runs.json"
+    registry_v1 = JobRegistry(state_path=tmp_path / "v1" / "jobs.json")
+    started_v1 = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot_v1,
+        state_path=state_v1,
+        now=lambda: 200,
+        workflow_registry=registry_v1,
+    )
+    run_id_v1 = started_v1["result"]["run"]["run_id"]
+    registry_v1._manager_update_workflow_run(run_id_v1, pr_refs=("acme/demo#110",))
+    args_v1 = {
+        "action": "retire-delivered",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "actor": actor,
+        "expected_run_id": run_id_v1,
+        "reason": reason,
+    }
+    work_actions.execute_work_action(
+        args=args_v1,
+        requested_by="operator",
+        runner=_pr_lifecycle_runner(
+            {110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+        ),
+        snapshot_path=snapshot_v1,
+        state_path=state_v1,
+        workflow_registry=registry_v1,
+    )
+    run_v1 = registry_v1.get_workflow_run(run_id_v1)
+    old_body_v1 = old_module._superseded_retire_delivered_body(
+        run_v1, state_path=state_v1, actor=actor, reason=reason
+    )
+    assert old_body_v1["schema"] == "cortex-work-retire-delivered/v1"
+
+    # --- v2：authority 缺席路徑，本 PR 新增 ---
+    # 舊 reader 遇到多出的 authority_source／authority_digest_source／
+    # authority_digest_status 欄位時必須安全 fail-closed，而不是崩潰或誤讀。
+    snapshot_v2 = _snapshot(tmp_path / "v2" / "snapshot.json")
+    state_v2 = tmp_path / "v2" / "runs.json"
+    registry_v2 = JobRegistry(state_path=tmp_path / "v2" / "jobs.json")
+    started_v2 = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot_v2,
+        state_path=state_v2,
+        now=lambda: 200,
+        workflow_registry=registry_v2,
+    )
+    run_id_v2 = started_v2["result"]["run"]["run_id"]
+    registry_v2._manager_update_workflow_run(run_id_v2, pr_refs=("acme/demo#110",))
+    payload_v2 = json.loads(snapshot_v2.read_text(encoding="utf-8"))
+    payload_v2["work_items"] = []
+    snapshot_v2.write_text(json.dumps(payload_v2), encoding="utf-8")
+    args_v2 = {**args_v1, "expected_run_id": run_id_v2}
+    work_actions.execute_work_action(
+        args=args_v2,
+        requested_by="operator",
+        runner=_pr_lifecycle_runner(
+            {110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+        ),
+        snapshot_path=snapshot_v2,
+        state_path=state_v2,
+        workflow_registry=registry_v2,
+    )
+    run_v2 = registry_v2.get_workflow_run(run_id_v2)
+    evidence_files_v2 = list(
+        (state_v2.parent / "evidence" / "work-retire-delivered").glob("*.json")
+    )
+    assert len(evidence_files_v2) == 1
+    v2_payload = json.loads(evidence_files_v2[0].read_text(encoding="utf-8"))
+    assert v2_payload["schema"] == "cortex-work-retire-delivered/v2"
+
+    with pytest.raises(RuntimeError, match="superseded by different authority"):
+        old_module._superseded_retire_delivered_body(
+            run_v2, state_path=state_v2, actor=actor, reason=reason
+        )
+
+
 @pytest.mark.parametrize("failure", ["non-terminal-pr", "non-ongoing-run", "active-job"])
 def test_retire_delivered_without_authority_keeps_fail_closed_admission(
     tmp_path: Path, failure: str
@@ -1462,12 +1594,21 @@ def test_retire_delivered_without_authority_keeps_fail_closed_admission(
         "issue-owner-conflict",
         "provider-degraded",
         "provider-rate-limited",
+        "provider-null",
+        "provider-list",
+        "provider-string",
     ],
 )
 def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
     tmp_path: Path, failure: str
 ) -> None:
-    """Registry-only retirement requires healthy, unambiguous snapshot absence."""
+    """Registry-only retirement requires healthy, unambiguous snapshot absence.
+
+    #1093 對抗審查 MAJOR1：``provider-null``／``provider-list``／
+    ``provider-string`` 模擬 ``providers["github:<repo>"]`` 條目存在但格式
+    不正確（非 mapping）——這種畸形不可被誤判成「provider 根本不存在」而
+    放行確定缺席，必須與 degraded／rate-limited 一樣 fail-closed。
+    """
     snapshot = _snapshot(tmp_path / failure / "snapshot.json")
     state = tmp_path / failure / "runs.json"
     registry = JobRegistry(state_path=tmp_path / failure / "jobs.json")
@@ -1489,6 +1630,17 @@ def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
         other_owner = json.loads(json.dumps(payload["work_items"][0]))
         other_owner["work_id"] = "other-work"
         payload["work_items"].append(other_owner)
+    elif failure in {"provider-null", "provider-list", "provider-string"}:
+        malformed_provider = {
+            "provider-null": None,
+            "provider-list": [],
+            "provider-string": "degraded",
+        }[failure]
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {"github:acme/demo": malformed_provider},
+            "work_items": [],
+        }
     else:
         payload = {
             "schema": "work-items-snapshot/v1",
