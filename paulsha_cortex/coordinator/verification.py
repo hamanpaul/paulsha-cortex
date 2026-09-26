@@ -138,8 +138,8 @@ def normalize_required_artifacts(value: object, *, repo_root: Path) -> list[dict
         field = f"verification.required_artifacts[{index}]"
         if not isinstance(entry, dict):
             raise ContractValidationError(field, "artifact entry must be an object")
-        if set(entry) - {"path", "must_change"}:
-            extra = sorted(set(entry) - {"path", "must_change"})[0]
+        if set(entry) - {"path", "must_change", "mode"}:
+            extra = sorted(set(entry) - {"path", "must_change", "mode"})[0]
             raise ContractValidationError(f"{field}.{extra}", f"unknown artifact key: {extra}")
         must_change = entry.get("must_change", False)
         if not isinstance(must_change, bool):
@@ -147,16 +147,23 @@ def normalize_required_artifacts(value: object, *, repo_root: Path) -> list[dict
                 f"{field}.must_change",
                 "must_change must be a boolean",
             )
-        artifacts.append(
-            {
-                "path": normalize_repo_relative_path(
-                    entry.get("path"),
-                    repo_root=repo_root,
-                    field=f"{field}.path",
-                ),
-                "must_change": must_change,
-            }
-        )
+        artifact = {
+            "path": normalize_repo_relative_path(
+                entry.get("path"),
+                repo_root=repo_root,
+                field=f"{field}.path",
+            ),
+            "must_change": must_change,
+        }
+        if "mode" in entry:
+            mode = entry["mode"]
+            if not isinstance(mode, str) or mode not in {"100644", "100755"}:
+                raise ContractValidationError(
+                    f"{field}.mode",
+                    "mode must be 100644 or 100755",
+                )
+            artifact["mode"] = mode
+        artifacts.append(artifact)
     return artifacts
 
 
@@ -865,11 +872,45 @@ def run_result_verification(
             "exists": artifact_path.exists(),
             "changed": None,
         }
+        if "mode" in artifact:
+            artifact_result["expected_mode"] = artifact["mode"]
         details["required_artifacts"].append(artifact_result)
         artifact_rows.append(artifact_result)
         if not artifact_result["exists"]:
             artifact_result["status"] = "missing"
             return _finish("needs_human", "required-artifact-missing")
+        if "mode" in artifact:
+            mode_result = _run_git(
+                [
+                    "--literal-pathspecs",
+                    "-C",
+                    str(resolved_repo_root),
+                    "ls-tree",
+                    "-z",
+                    candidate,
+                    "--",
+                    artifact["path"],
+                ],
+                git_runner,
+            )
+            artifact_result["git_mode_check"] = mode_result
+            if mode_result["status"] != "ok":
+                artifact_result["status"] = "mode-unreadable"
+                return _finish("needs_human", "required-artifact-mode-error")
+            matching_modes = []
+            for entry in mode_result["stdout"].split("\0"):
+                if "\t" not in entry:
+                    continue
+                metadata, entry_path = entry.split("\t", 1)
+                if entry_path == artifact["path"]:
+                    matching_modes.append(metadata.split(" ", 1)[0])
+            if len(matching_modes) != 1:
+                artifact_result["status"] = "mode-missing"
+                return _finish("needs_human", "required-artifact-mode-missing")
+            artifact_result["git_mode"] = matching_modes[0]
+            if matching_modes[0] != artifact["mode"]:
+                artifact_result["status"] = "mode-mismatch"
+                return _finish("needs_human", "required-artifact-mode-mismatch")
 
     artifact_diff = _run_git(
         [

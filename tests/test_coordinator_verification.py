@@ -13,6 +13,30 @@ def _write_spec(dirpath: Path, name: str, frontmatter: str, body: str = "body") 
 
 
 class VerificationContractFrontmatterTests(unittest.TestCase):
+    def test_required_artifact_declares_expected_git_mode(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = verification.normalize_required_artifacts(
+                [{"path": "script/deliver.py", "must_change": True, "mode": "100755"}],
+                repo_root=Path(directory),
+            )
+
+        self.assertEqual(
+            artifacts,
+            [{"path": "script/deliver.py", "must_change": True, "mode": "100755"}],
+        )
+
+    def test_required_artifact_git_mode_rejects_unsupported_modes(self) -> None:
+        from paulsha_cortex.coordinator import verification
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "mode must be 100644 or 100755"):
+                verification.normalize_required_artifacts(
+                    [{"path": "script/deliver.py", "mode": "120000"}],
+                    repo_root=Path(directory),
+                )
+
     def test_parser_rejects_non_string_target_branch_even_for_hold_specs(self) -> None:
         from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
 

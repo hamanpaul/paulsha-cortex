@@ -98,6 +98,90 @@ class ArgvTests(unittest.TestCase):
         for forbidden in ("Bash(*)", "Bash(git:*)", "Bash(python:*)", "bypassPermissions"):
             self.assertNotIn(forbidden, json.dumps(argv))
 
+    def test_claude_commit_permissions_project_persona_effective_tools(self) -> None:
+        effective_tools = (
+            "edit", "git add", "git commit", "python -m unittest", "rg",
+        )
+        argv = build_claude_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            commit_required=True,
+            effective_tools=effective_tools,
+        )
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(
+            settings["permissions"]["allow"],
+            [
+                "Bash(git add:*)",
+                "Bash(git commit:*)",
+                "Bash(python -m unittest:*)",
+                "Bash(python3 -m unittest:*)",
+                "Bash(rg:*)",
+                "Edit",
+            ],
+        )
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
+        for forbidden in ("Bash(*)", "Bash(git:*)", "Bash(python:*)", "bypassPermissions"):
+            self.assertNotIn(forbidden, json.dumps(argv))
+
+    def test_claude_commit_permissions_reject_unrepresentable_effective_tool(self) -> None:
+        with self.assertRaisesRegex(ValueError, "effective tool.*cannot be represented"):
+            build_claude_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir="/lg",
+                commit_required=True,
+                effective_tools=("edit", "unknown-required-tool"),
+            )
+
+    def test_claude_builder_projects_executable_mode_capability(self) -> None:
+        argv = build_claude_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            effective_tools=("edit", "file executable bit"),
+        )
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(
+            settings["permissions"]["allow"],
+            ["Bash(cortex headless-hook set-executable:*)", "Edit"],
+        )
+
+    def test_claude_builder_projects_single_file_restore_capability(self) -> None:
+        argv = build_claude_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            effective_tools=("git restore",),
+        )
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(
+            settings["permissions"]["allow"],
+            ["Bash(cortex headless-hook restore-file:*)"],
+        )
+
+    def test_claude_builder_settings_install_pre_tool_edit_payload_guard(self) -> None:
+        argv = build_claude_argv(
+            prompt="P", slice_id="s", log_dir="/lg", effective_tools=("edit",),
+        )
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        edit_hook = settings["hooks"]["PreToolUse"][0]
+        self.assertEqual(edit_hook["matcher"], "Edit")
+        self.assertIn("headless-hook pre-tool-use", edit_hook["hooks"][0]["command"])
+
+    def test_write_forbidden_claude_does_not_project_builder_tools(self) -> None:
+        launcher = SubprocessLauncher("claude").as_write_forbidden()
+        argv = build_claude_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            effective_tools=launcher._effective_tools,
+        )
+        settings = json.loads(argv[argv.index("--settings") + 1])
+
+        self.assertNotIn("permissions", settings)
+
     def test_claude_commit_permissions_reject_rule_injection(self) -> None:
         for gate in (
             "python3 -m pytest tests/*", "python3 -m pytest 'x);*'",
@@ -1450,6 +1534,27 @@ class ArgvTests(unittest.TestCase):
                 f"--add-dir {shlex.quote(git_write_dirs[0])}",
                 script,
             )
+            inner_argv = shlex.split(script.split(";", 1)[0])
+            settings = json.loads(inner_argv[inner_argv.index("--settings") + 1])
+            self.assertEqual(
+                settings["permissions"]["allow"],
+                sorted([
+                    "Bash(cortex headless-hook set-executable:*)",
+                    "Bash(cortex headless-hook restore-file:*)",
+                    "Bash(git add:*)",
+                    "Bash(git commit:*)",
+                    "Bash(python -m unittest:*)",
+                    "Bash(python3 -m unittest:*)",
+                    "Bash(rg:*)",
+                    "Edit",
+                ]),
+            )
+
+    def test_claude_builder_rejects_unrepresentable_tool_before_launch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "effective tool.*cannot be represented"):
+            SubprocessLauncher(
+                "claude", effective_tools=("edit", "unknown-required-tool"),
+            ).as_commit_required()
 
     def test_prompt_is_single_element(self) -> None:
         # prompt 含換行也是單一 argv 元素（headless 的核心保證）

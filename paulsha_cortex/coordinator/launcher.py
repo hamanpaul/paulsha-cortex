@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
 from . import gate_ledger, job_runner, job_workspace, spool_slot, terminal_contract
+from ..persona.context import build_persona_context
 
 
 _GIT_REPOSITORY_ENV_KEYS = job_runner.GIT_REPOSITORY_ENV_KEYS | frozenset(
@@ -481,6 +482,7 @@ def _claude_review_settings(worktree: str) -> str:
 # 下 hook 都不得讓 job 看到非零 exit（PostToolUse 的非零 exit 會被回報成 hook 失敗，
 # 甚至把 stderr 回饋給模型）。
 _CLAUDE_SPOOL_HOOK_COMMAND = "cortex headless-hook post-tool-use || true"
+_CLAUDE_EDIT_GUARD_HOOK_COMMAND = "cortex headless-hook pre-tool-use || exit 2"
 
 # 逾時上限：hook 只寫一個本機檔案（外加最多一次本機 `git config` 讀取），秒級都嫌多；
 # 設上限是為了「hook 永不阻塞 job」這條硬約束，不是為了正常路徑。
@@ -488,7 +490,7 @@ _CLAUDE_SPOOL_HOOK_TIMEOUT_SECONDS = 10
 
 
 def _claude_spool_hook_settings() -> str:
-    """Build the per-job PostToolUse hook settings for a headless Claude builder.
+    """Build the per-job hook settings for a headless Claude builder.
 
     #506 / D5，使用者硬約束「**hook 不得影響正常的互動式 agent 使用**」的第一道
     結構保證：這份宣告是每次 `launch()` 現場組出來、經 argv 的 `--settings` 交給
@@ -507,6 +509,17 @@ def _claude_spool_hook_settings() -> str:
 
     settings = {
         "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Edit",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": _CLAUDE_EDIT_GUARD_HOOK_COMMAND,
+                        }
+                    ],
+                }
+            ],
             "PostToolUse": [
                 {
                     # 只掛 Bash：GitHub 物件的 mutation 一律經 `gh`（CLI 或 `gh api`）
@@ -527,7 +540,38 @@ def _claude_spool_hook_settings() -> str:
     return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
-def _claude_builder_settings() -> str:
+_CLAUDE_EFFECTIVE_TOOL_RULES: dict[str, tuple[str, ...]] = {
+    "edit": ("Edit",),
+    "file executable bit": ("Bash(cortex headless-hook set-executable:*)",),
+    "git add": ("Bash(git add:*)",),
+    "git commit": ("Bash(git commit:*)",),
+    "git restore": ("Bash(cortex headless-hook restore-file:*)",),
+    "python -m unittest": (
+        "Bash(python -m unittest:*)",
+        "Bash(python3 -m unittest:*)",
+    ),
+    "rg": ("Bash(rg:*)",),
+}
+
+
+def _claude_effective_tool_permissions(effective_tools: Sequence[str]) -> list[str]:
+    """將 persona 明確宣告的工具映射成 Claude 可表達的窄 permission 規則。"""
+
+    allowed: set[str] = set()
+    for tool in effective_tools:
+        if not isinstance(tool, str) or tool not in _CLAUDE_EFFECTIVE_TOOL_RULES:
+            raise ValueError(
+                f"Claude effective tool cannot be represented: {tool!r}"
+            )
+        allowed.update(_CLAUDE_EFFECTIVE_TOOL_RULES[tool])
+    return sorted(allowed)
+
+
+def _claude_builder_settings(
+    effective_tools: Sequence[str] | None = None,
+    *,
+    commit_required: bool = True,
+) -> str:
     """Grant commit-required jobs Git writes and exact declared Python tests.
 
     This is a per-process usability grant, not an OS sandbox. Never derive
@@ -535,7 +579,18 @@ def _claude_builder_settings() -> str:
     remain subject to the existing approval policy.
     """
     settings = json.loads(_claude_spool_hook_settings())
-    allowed = ["Bash(git add:*)", "Bash(git commit:*)"]
+    if effective_tools is None:
+        allowed = ["Bash(git add:*)", "Bash(git commit:*)"]
+    else:
+        allowed = _claude_effective_tool_permissions(effective_tools)
+        if not commit_required:
+            allowed = [
+                rule
+                for tool, rules in _CLAUDE_EFFECTIVE_TOOL_RULES.items()
+                if tool not in {"git add", "git commit"}
+                for rule in rules
+                if rule in allowed
+            ]
     safe_chars = frozenset(
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/.:=,@+"
     )
@@ -955,6 +1010,7 @@ def build_claude_argv(
     commit_required: bool = False,
     verdict_spool_dir: str | None = None,
     prompt_via_stdin: bool = False,
+    effective_tools: Sequence[str] | None = None,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Claude launcher cannot bypass permissions")
@@ -1021,7 +1077,14 @@ def build_claude_argv(
         # 這一行是 hook 的**唯一**注入點：per-job、走 argv、不落地任何檔案。
         argv += [
             "--settings",
-            _claude_builder_settings() if commit_required else _claude_spool_hook_settings(),
+            (
+                _claude_builder_settings(
+                    effective_tools,
+                    commit_required=commit_required,
+                )
+                if effective_tools is not None or commit_required
+                else _claude_spool_hook_settings()
+            ),
         ]
     if model is not None:
         argv += ["--model", model]
@@ -1610,6 +1673,7 @@ class SubprocessLauncher:
         review_terminal_kind: str | None = None,
         effort: str | None = None,
         verdict_spool_dir: str | None = None,
+        effective_tools: Sequence[str] | None = None,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
@@ -1648,6 +1712,14 @@ class SubprocessLauncher:
         # `_verdict_spool_add_dirs`），不靜默降級成「開了洞卻寫不進去」。
         if verdict_spool_dir is not None and (read_only or review_only):
             raise ValueError("read-only launcher cannot be granted a verdict spool write path")
+        if effective_tools is not None and executor != "claude":
+            raise ValueError("persona effective_tools are only supported by the Claude launcher")
+        if executor == "claude" and not (
+            read_only or review_only or write_forbidden or verdict_spool_dir
+        ):
+            if effective_tools is None:
+                effective_tools = build_persona_context(role="builder")["effective_tools"]
+            _claude_effective_tool_permissions(effective_tools)
         self._executor = executor
         self._relay_target = relay_target
         self._codex_remote = codex_remote
@@ -1675,6 +1747,11 @@ class SubprocessLauncher:
         # trust-root Phase 2a：本 job 專屬的 verdict spool 目錄（唯一額外放行的
         # 寫入路徑）。None ＝ 不放行任何 worktree 之外的寫入（既有行為）。
         self._verdict_spool_dir = verdict_spool_dir
+        self._effective_tools = (
+            tuple(effective_tools)
+            if effective_tools is not None and not write_forbidden
+            else None
+        )
 
     @property
     def executor(self) -> str:
@@ -1785,6 +1862,7 @@ class SubprocessLauncher:
             review_only=False,
             commit_required=True,
             effort=self._effort,
+            effective_tools=self._effective_tools,
         )
 
     def as_write_forbidden(self) -> "SubprocessLauncher":
@@ -1827,6 +1905,7 @@ class SubprocessLauncher:
             write_forbidden=True,
             effort=self._effort,
             verdict_spool_dir=self._verdict_spool_dir,
+            effective_tools=self._effective_tools,
         )
 
     def _should_run_gates(self, env: Mapping[str, str]) -> bool:
@@ -2180,6 +2259,8 @@ class SubprocessLauncher:
             builder_kwargs["prompt_via_stdin"] = True
         if self._executor in {"copilot", "cg"}:
             builder_kwargs["effort"] = self._effort
+        if self._executor == "claude" and self._effective_tools is not None:
+            builder_kwargs["effective_tools"] = self._effective_tools
         # #714 缺陷 2：只有 codex 有 `--output-last-message`。其餘 executor 沒有這個
         # 落點，傳過去只會是一個沒人接的 kwarg（形狀與既有的 `verdict_spool_dir`／
         # `effort` 逐條一致：能力有差異就顯式分岔，不塞 None 給接不住的那幾支）。
