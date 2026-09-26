@@ -430,6 +430,52 @@ def test_service_declaration_projection_hashes_paths_and_unit_contents_without_e
     assert projected["monitor"]["disk_unit_sha256"] is None
 
 
+def test_service_declaration_projection_never_echoes_environment_values(
+    tmp_path: Path,
+) -> None:
+    """#841 對抗審查第四輪 MAJOR：``service_declaration_projection`` 只能對外輸出
+    摘要，不得把 ``PSC_*``／``PAULSHACLAW_*`` 的有效值放進
+    ``loaded_runtime.service_declaration.*.environment``——那會讓
+    ``cortex service status``／``doctor --json`` 直接印出 state／config root
+    等環境值。對外一律換成 ``environment_digest``；內部要重建有效環境時改用
+    ``service_environment_overlay``（不得序列化）。"""
+    from paulsha_cortex.runtime_attestation import service_environment_overlay
+
+    unit_path = tmp_path / "manager.service"
+    unit_path.write_text("[Service]\nExecStart=/usr/bin/true\n", encoding="utf-8")
+    pinned_root = str(tmp_path / "pinned-monitor-state")
+    units = {
+        "test-manager.service": {
+            "path": str(unit_path),
+            "status": "active/running",
+            "pid": 321,
+            "exec_path": "/usr/bin/env",
+            "stale": False,
+            "systemd": {
+                "ExecStart": "{ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }",
+                "Environment": f"PSC_MONITOR_STATE_ROOT={pinned_root}",
+                "EnvironmentFiles": "",
+                "DropInPaths": "",
+                "FragmentPath": str(unit_path),
+                "WorkingDirectory": "/",
+            },
+        }
+    }
+
+    projected = service_declaration_projection(units, instance="test")
+
+    assert projected["manager"]["environment_source"] == "systemd-effective"
+    assert "environment" not in projected["manager"]
+    assert pinned_root not in json.dumps(projected)
+    expected_digest = configuration_revision({"PSC_MONITOR_STATE_ROOT": pinned_root})
+    assert projected["manager"]["environment_digest"] == expected_digest
+
+    # 內部重建（不落進 JSON 輸出）仍能拿到真實值，且與上面摘要判定共用同一套規則。
+    overlays = service_environment_overlay(units, instance="test")
+    assert overlays["manager"]["environment_source"] == "systemd-effective"
+    assert overlays["manager"]["environment"] == {"PSC_MONITOR_STATE_ROOT": pinned_root}
+
+
 def test_service_dropins_project_pinned_manager_and_monitor_artifacts_against_receipts(
     tmp_path: Path,
 ) -> None:

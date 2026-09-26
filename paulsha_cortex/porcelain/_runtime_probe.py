@@ -150,9 +150,15 @@ def _unit_pid(unit_name: str, live_rows: Mapping[str, Mapping[str, Any]]) -> int
     return pid if pid > 0 else None
 
 
-def probe_service_runtime(
+def _probe_units_raw(
     instance: str, *, home: Path | None = None
-) -> dict[str, Any]:
+) -> dict[str, dict[str, Any]]:
+    """探測每個 unit 目前狀態，含 systemd 有效屬性原始內容（未做安全過濾）。
+
+    只在 ``probe_service_runtime`` 內部呼叫一次；其計算出的
+    ``_environment_overlay`` 含真實環境值，任何要把結果交給 JSON 輸出或 CLI
+    顯示的呼叫端，都必須在使用前明確 ``pop`` 掉這個鍵（見
+    ``probe_service_runtime`` 的說明）。"""
     home = (home or Path(os.environ.get("HOME", str(Path.home())))).expanduser()
     unit_root = home / ".config" / "systemd" / "user"
     unit_names = (
@@ -214,9 +220,27 @@ def probe_service_runtime(
         else:
             row["_systemd_unavailable"] = True
         units[unit_name] = row
-    from ..runtime_attestation import service_declaration_projection
+    return units
+
+
+def probe_service_runtime(
+    instance: str, *, home: Path | None = None
+) -> dict[str, Any]:
+    """探測 manager／monitor 目前狀態，回傳可安全交給 JSON 輸出或 CLI 顯示的
+    投影。
+
+    回傳值額外帶一個 ``_environment_overlay`` 鍵，內容是探測當下（濾除機敏
+    屬性前）算出的每個 service 有效環境（含真實值，供 doctor／``cortex
+    service status`` 內部重建 root／config 用）。這個鍵刻意保留前導底線標示
+    「內部用、不得序列化」——任何要把這個函式的回傳值整包（或用
+    ``dict(probe)``）轉成 JSON／CLI 輸出的呼叫端，都必須先明確
+    ``pop("_environment_overlay", None)`` 再輸出；只需要安全欄位的呼叫端可以
+    直接忽略它。"""
+    units = _probe_units_raw(instance, home=home)
+    from ..runtime_attestation import service_declaration_projection, service_environment_overlay
 
     service_declaration = service_declaration_projection(units, instance=instance)
+    environment_overlay = service_environment_overlay(units, instance=instance)
     for row in units.values():
         row.pop("systemd", None)
         row.pop("_systemd_unavailable", None)
@@ -227,4 +251,5 @@ def probe_service_runtime(
         "version": _installed_version(),
         "units": units,
         "service_declaration": service_declaration,
+        "_environment_overlay": environment_overlay,
     }

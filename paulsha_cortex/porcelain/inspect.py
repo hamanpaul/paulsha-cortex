@@ -357,6 +357,10 @@ def _run_doctor(
 
 def _run_service(*, instance: str, json_output: bool) -> int:
     service = probe_service_runtime(instance)
+    # #841 對抗審查第四輪：`_environment_overlay` 只供內部重建有效環境用，含
+    # 真實值，這裡不需要它——顯示／輸出前一律先丟掉，避免整包 `service` 被
+    # JSON dump 時帶出去。
+    service.pop("_environment_overlay", None)
     if json_output:
         _json_dump(_inspect_envelope("service", service=service))
         return 0

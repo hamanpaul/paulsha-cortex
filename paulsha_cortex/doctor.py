@@ -986,30 +986,34 @@ def _systemd_declared_environment(
     *, home: Path, instance: str, manager_unit: Path, monitor_unit: Path
 ) -> tuple[Mapping[str, object], Mapping[str, object]]:
     """#841：與 ``cortex service status`` 共用同一份有效環境判定（single source
-    of truth）——systemd 可用時必須套用 drop-in 已覆寫的 ``Environment=``／
-    ``EnvironmentFiles=``，不能只讀主 unit 檔宣告；systemd 本身不可用時，回傳
-    空宣告讓呼叫端退回既有逐檔讀取的 direct-mode fallback。
+    of truth，判定邏輯本身在 ``runtime_attestation._environment_source_and_overlay``，
+    manager／monitor 兩邊都經由這一個函式，結論保證一致）——systemd 可用時必須
+    套用 drop-in 已覆寫的 ``Environment=``／``EnvironmentFiles=``，不能只讀主
+    unit 檔宣告；systemd 本身不可用時，回傳空宣告讓呼叫端退回既有逐檔讀取的
+    direct-mode fallback。
 
     probe 回報的 unit 路徑若與這次要驗證的 ``home`` 不一致（例如測試環境下
     巧合存在同名的真實 unit），視為與這個 home 無關、不採信，確保這個判定是
-    hermetic 的，不會讀到本機真實 unit。"""
+    hermetic 的，不會讀到本機真實 unit。
+
+    回傳值的 ``environment`` 含真實環境值（取自 ``probe_service_runtime`` 探測
+    當下、濾除機敏屬性前算出的 ``_environment_overlay``），只能在程序內部使用，
+    不得序列化進 JSON 輸出。"""
     from .porcelain._runtime_probe import probe_service_runtime
-    from .runtime_attestation import service_declaration_projection
 
     service_runtime = probe_service_runtime(instance, home=home)
     probed_units = service_runtime.get("units")
     probed_units = probed_units if isinstance(probed_units, Mapping) else {}
-    declarations = service_runtime.get("service_declaration")
-    if not isinstance(declarations, Mapping):
-        declarations = service_declaration_projection(probed_units, instance=instance)
+    overlays = service_runtime.get("_environment_overlay")
+    overlays = overlays if isinstance(overlays, Mapping) else {}
 
     def trusted(unit_name: str, expected_unit: Path, key: str) -> Mapping[str, object]:
         row = probed_units.get(unit_name)
         declared_path = row.get("path") if isinstance(row, Mapping) else None
         if declared_path != str(expected_unit):
             return {}
-        declaration = declarations.get(key)
-        return declaration if isinstance(declaration, Mapping) else {}
+        overlay = overlays.get(key)
+        return overlay if isinstance(overlay, Mapping) else {}
 
     return (
         trusted(f"{instance}-manager.service", manager_unit, "manager"),
@@ -1037,15 +1041,33 @@ def _load_bootstrap_environment(
     manager_source = manager_declaration.get("environment_source")
     monitor_source = monitor_declaration.get("environment_source")
 
+    def trusted_environment(overlay: object) -> dict[str, str]:
+        # #841 對抗審查第四輪 MAJOR：systemd-effective 這條路徑只能用 unit
+        # 宣告本身＋systemd 對 user service 的已知預設（``_finalize_effective_
+        # environment``／``_runtime_defaults`` 補的 HOME／PSC_*_ROOT 預設），
+        # 不得以 ``base_env``（呼叫者殼層，例如操作者跑
+        # ``PSC_MONITOR_CONFIG=... cortex doctor --json`` 時帶進來的值）為底，
+        # 否則呼叫者殼層裡未被 unit 宣告的 PSC_* 會污染這個 service 的判定。
+        effective: dict[str, str] = {}
+        if isinstance(overlay, Mapping):
+            effective.update(overlay)
+        return _finalize_effective_environment(effective, home=home, instance=instance)
+
     if manager_source == "systemd-effective" and monitor_source == "systemd-effective":
         manager_overlay = manager_declaration.get("environment")
         monitor_overlay = monitor_declaration.get("environment")
         if manager_overlay != monitor_overlay:
             raise ValueError("manager/monitor effective environment differs")
-        effective = dict(base_env)
-        if isinstance(manager_overlay, Mapping):
-            effective.update(manager_overlay)
-        return _finalize_effective_environment(effective, home=home, instance=instance)
+        return trusted_environment(manager_overlay)
+    if manager_source == "systemd-effective":
+        # #841 對抗審查第四輪 MAJOR：只有一邊被 drop-in 改過／systemd 對它有效
+        # 時，另一邊（monitor）不可信任或 systemd 不可用，不代表這一邊
+        # （manager）的有效宣告也要被丟棄——那會讓 doctor 與 `cortex service
+        # status` 對同一個 manager 的結論不一致。無法判定的那一邊維持
+        # unknown／unavailable，不強制兩邊都退回主 unit 檔的粗略判定。
+        return trusted_environment(manager_declaration.get("environment"))
+    if monitor_source == "systemd-effective":
+        return trusted_environment(monitor_declaration.get("environment"))
     if "unknown" in (manager_source, monitor_source):
         raise ValueError("managed bootstrap environment is invalid")
 

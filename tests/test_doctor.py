@@ -886,6 +886,100 @@ def test_bootstrap_environment_uses_systemd_effective_dropin_override(
     assert effective["PSC_MONITOR_STATE_ROOT"] == str(pinned_root)
 
 
+def test_bootstrap_environment_trusts_the_resolvable_side_when_only_one_unit_is_systemd_effective(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#841 對抗審查第四輪 MAJOR：只有 manager unit 這次探測得到 systemd 有效
+    屬性（``systemd-effective``），monitor 探測不到（退回 ``unavailable``）時，
+    doctor 仍必須採用 manager 已知的 drop-in 覆寫值，不能因為 monitor 那邊
+    無法判定，就連 manager 都一起退回主 unit 檔宣告的舊值——那會與
+    ``cortex service status`` 對 manager 的結論不一致（single source of
+    truth 被打破），也正是這一輪對抗審查抓到的回歸。只 mock 出 manager 的
+    ``systemctl show`` 區塊，monitor 保持沒有對應區塊（探測不到）。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home, env = _layout(tmp_path)
+    unit_root = home / ".config" / "systemd" / "user"
+    manager_unit = unit_root / "cortex-manager.service"
+    pinned_root = tmp_path / "pinned-monitor-state"
+
+    show_output = (
+        f"Id={manager_unit.name}\n"
+        "LoadState=loaded\n"
+        "ActiveState=active\n"
+        "SubState=running\n"
+        "MainPID=0\n"
+        "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }\n"
+        f"Environment=PSC_MONITOR_STATE_ROOT={pinned_root}\n"
+        "EnvironmentFiles=\n"
+        "DropInPaths=\n"
+        f"FragmentPath={manager_unit}\n"
+        "WorkingDirectory=/\n"
+    )
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=show_output)
+
+    monkeypatch.setattr(_runtime_probe.subprocess, "run", fake_run)
+
+    effective = _load_bootstrap_environment(home=home, instance="cortex", base_env=env)
+
+    assert effective["PSC_MONITOR_STATE_ROOT"] == str(pinned_root)
+
+
+def test_bootstrap_environment_never_mixes_caller_shell_into_systemd_effective_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#841 對抗審查第四輪 MAJOR：systemd-effective 這條路徑只能用 unit 宣告
+    本身＋systemd 對 user service 的已知預設，不得混入呼叫者殼層——例如操作者
+    跑 ``PSC_MONITOR_CONFIG=/from/caller/shell cortex doctor --json`` 時，這個
+    未被 unit 宣告的 ``PSC_*`` 不能污染判定結果（那是描述 operator CLI 本身的
+    環境，不是這個 service 的有效環境）。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home, env = _layout(tmp_path)
+    env = dict(env)
+    env["PSC_MONITOR_CONFIG"] = "/from/caller/shell"
+    unit_root = home / ".config" / "systemd" / "user"
+    manager_unit = unit_root / "cortex-manager.service"
+    monitor_unit = unit_root / "cortex-monitor.service"
+    pinned_root = tmp_path / "pinned-monitor-state"
+
+    def show_block(unit_path: Path) -> str:
+        lines = [
+            f"Id={unit_path.name}",
+            "LoadState=loaded",
+            "ActiveState=active",
+            "SubState=running",
+            "MainPID=0",
+            "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }",
+            f"Environment=PSC_MONITOR_STATE_ROOT={pinned_root}",
+            "EnvironmentFiles=",
+            "DropInPaths=",
+            f"FragmentPath={unit_path}",
+            "WorkingDirectory=/",
+        ]
+        return "\n".join(lines) + "\n"
+
+    show_output = show_block(manager_unit) + "\n" + show_block(monitor_unit)
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=show_output)
+
+    monkeypatch.setattr(_runtime_probe.subprocess, "run", fake_run)
+
+    effective = _load_bootstrap_environment(home=home, instance="cortex", base_env=env)
+
+    assert effective["PSC_MONITOR_STATE_ROOT"] == str(pinned_root)
+    assert "PSC_MONITOR_CONFIG" not in effective
+
+
 def test_github_permission_probe_fails_without_token_scope_proof(tmp_path: Path, monkeypatch) -> None:
     home, env = _layout(tmp_path)
     monkeypatch.setattr(

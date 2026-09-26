@@ -631,15 +631,82 @@ def _declared_service_artifact(
     return _safe_artifact({})
 
 
+def _environment_source_and_overlay(
+    row: object,
+) -> tuple[str, dict[str, str]]:
+    """單個 service 目前的 ``environment_source`` 與其有效環境（已套用
+    ``safe_environment_projection`` 的安全鍵值白名單投影，值仍是原始字串）。
+
+    判定只依賴這個 row 的 ``systemd``／``_systemd_unavailable`` 欄位，與
+    artifact 判定（``unit_files``／``effective_argv``）完全獨立，因此可以安全地
+    在 ``service_declaration_projection``（對外只留 digest）與
+    ``service_environment_overlay``（內部重建用，含真實值）兩處共用同一份
+    結果——這是 doctor 與 ``cortex service status`` 對同一 service 的結論保證
+    一致的關鍵：兩邊都只能透過這個函式判定，不得各自另外解析。"""
+
+    if not isinstance(row, Mapping):
+        return "unavailable", {}
+    properties = row.get("systemd")
+    if isinstance(properties, Mapping):
+        required_properties = {
+            "ExecStart",
+            "Environment",
+            "EnvironmentFiles",
+            "DropInPaths",
+            "FragmentPath",
+            "WorkingDirectory",
+        }
+        if not required_properties.issubset(properties):
+            return "unknown", {}
+        environment_sources = _systemd_environment_sources(properties)
+        if environment_sources is None:
+            return "unknown", {}
+        environment, from_files = environment_sources
+        effective_argv = _systemd_exec_start(properties.get("ExecStart"))
+        env_assignments: dict[str, str] = {}
+        if effective_argv:
+            env_assignments, _index = _env_command_assignments(effective_argv)
+        merged_environment = {**from_files, **environment, **env_assignments}
+        return "systemd-effective", safe_environment_projection(merged_environment)
+    if row.get("_systemd_unavailable") is True:
+        # 探測不到 systemd 有效屬性集合，不能確認是否有 drop-in 覆寫；呼叫端應
+        # 改用既有 direct-mode fallback，這裡維持 "unavailable" 不臆測。
+        return "unavailable", {}
+    return "unavailable", {}
+
+
+def service_environment_overlay(
+    units: object, *, instance: str
+) -> dict[str, dict[str, object]]:
+    """回傳每個 service 目前的有效環境來源與內容，供 doctor／``cortex service
+    status`` 內部重建 root／config 用；判定規則與 ``service_declaration_projection``
+    共用同一個 ``_environment_source_and_overlay``，確保兩者結論一致。
+
+    回傳值的 ``environment`` 含真實環境值（僅 ``PSC_*``／``PAULSHACLAW_*``），
+    只能在程序內部使用，絕對不能序列化進 JSON 輸出或 CLI 顯示——對外一律使用
+    ``service_declaration_projection`` 回傳的 ``environment_digest``。"""
+
+    rows = units if isinstance(units, Mapping) else {}
+    result: dict[str, dict[str, object]] = {}
+    for service in ("manager", "monitor"):
+        unit_name = f"{instance}-{service}.service"
+        source, overlay = _environment_source_and_overlay(rows.get(unit_name))
+        result[service] = {"environment_source": source, "environment": overlay}
+    return result
+
+
 def service_declaration_projection(
     units: object, *, instance: str
 ) -> dict[str, dict[str, object]]:
     """投影 service 宣告欄位，不回傳環境值或檔案內容。
 
-    附帶回傳每個 service 目前的有效環境（僅 ``PSC_*``／``PAULSHACLAW_*``、已剔除機敏
-    欄位的安全投影）與其來源標示（``environment_source``），讓 service status／
-    doctor 可以共用同一份「systemctl show 有效值優先於 fallback 讀檔」判定，
-    不必各自重新解析 unit 檔或 EnvironmentFile。"""
+    附帶回傳每個 service 目前有效環境的摘要（``environment_digest``：對
+    ``safe_environment_projection`` 後的內容取 canonical SHA-256）與其來源標示
+    （``environment_source``），讓 service status／doctor 可以共用同一份
+    「systemctl show 有效值優先於 fallback 讀檔」判定，不必各自重新解析 unit 檔
+    或 EnvironmentFile。這個函式只回傳摘要，不回傳環境原值——真正的值只能透過
+    ``service_environment_overlay`` 在程序內部取得，且該函式的回傳值不得序列化
+    進 JSON 輸出。"""
 
     rows = units if isinstance(units, Mapping) else {}
     result: dict[str, dict[str, object]] = {}
@@ -656,7 +723,7 @@ def service_declaration_projection(
                 "artifact": _safe_artifact({}),
                 "stale": None,
                 "environment_source": "unavailable",
-                "environment": {},
+                "environment_digest": configuration_revision({}),
             }
             continue
         exec_path = row.get("exec_path")
@@ -668,10 +735,10 @@ def service_declaration_projection(
         # 環境來源判定與 artifact 判定分開計算：exec artifact 需要能雜湊 unit/
         # drop-in 檔案內容才算「known」，但有效環境只要 Environment=／
         # EnvironmentFiles= 能安全解析即可信任，不需要連帶依賴 unit 檔雜湊成功。
-        environment_source = "unavailable"
-        effective_environment: dict[str, str] = {}
+        # 環境來源／有效環境本身改由 ``_environment_source_and_overlay`` 統一判定
+        # （與 ``service_environment_overlay`` 共用），這裡只留 artifact 判定要用
+        # 的 unit_files／effective_argv／environment／from_files。
         if isinstance(properties, Mapping):
-            environment_source = "unknown"
             required_properties = {
                 "ExecStart",
                 "Environment",
@@ -695,30 +762,11 @@ def service_declaration_projection(
                     declaration_known = False
                 else:
                     environment, from_files = environment_sources
-                    # 優先序：ExecStart 的 `/usr/bin/env KEY=VALUE` 前綴 ＞
-                    # Environment= ＞ EnvironmentFiles=；drop-in 覆寫的值已經
-                    # 反映在 systemctl show 的有效屬性裡，不需要另外重讀 unit 檔。
-                    env_assignments: dict[str, str] = {}
-                    if effective_argv:
-                        env_assignments, _index = _env_command_assignments(
-                            effective_argv
-                        )
-                    merged_environment = {
-                        **from_files,
-                        **environment,
-                        **env_assignments,
-                    }
-                    environment_source = "systemd-effective"
-                    effective_environment = safe_environment_projection(
-                        merged_environment
-                    )
                 declaration_known = declaration_known and unit_files is not None
                 declaration_known = declaration_known and effective_argv is not None
         elif row.get("_systemd_unavailable") is True:
             # Without systemd's effective property set, the probe cannot prove that its
             # file-only view covers every configured unit/drop-in search directory.
-            # 環境同理：無法確認是否有 drop-in 覆寫，呼叫端應改用既有 direct-mode
-            # fallback（environment_source 維持預設的 "unavailable"）。
             declaration_known = False
             unit_files = None
             effective_argv = None
@@ -731,6 +779,7 @@ def service_declaration_projection(
             declaration_known = unit_files is not None and effective_argv is not None
         unit_digest = _unit_files_digest(unit_files)
         effective_exec_path = effective_argv[0] if effective_argv else None
+        environment_source, effective_environment = _environment_source_and_overlay(row)
         result[service] = {
             "unit": unit_name,
             "status": row.get("status") if isinstance(row.get("status"), str) else "unknown",
@@ -759,7 +808,7 @@ def service_declaration_projection(
             ),
             "stale": row.get("stale") if type(row.get("stale")) is bool else None,
             "environment_source": environment_source,
-            "environment": effective_environment,
+            "environment_digest": configuration_revision(effective_environment),
         }
     return result
 

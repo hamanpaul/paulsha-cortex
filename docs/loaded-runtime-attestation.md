@@ -18,7 +18,7 @@ cortex doctor --instance cortex --json
 `loaded_runtime` 把三種觀測分開：
 
 - `operator_cli`：目前這次 CLI 的 package/source digest、instance、安全環境 revision、PID 與觀測時間。從 checkout 執行時會標 `source-override`，不會偽裝成已安裝 wheel。
-- `service_declaration`：磁碟 unit 的狀態、PID、有效 ExecStart path digest、unit file digest，可由 unit 宣告定位到的 Manager／Monitor 套件 artifact，以及該 service 目前有效環境的安全投影（僅 `PSC_*`／`PAULSHACLAW_*`，已剔除機敏欄位）與其來源標示 `environment_source`；不輸出 unit 內容或其他環境值。
+- `service_declaration`：磁碟 unit 的狀態、PID、有效 ExecStart path digest、unit file digest，可由 unit 宣告定位到的 Manager／Monitor 套件 artifact，以及該 service 目前有效環境的來源標示 `environment_source` 與其摘要 `environment_digest`（對已剔除機敏欄位、僅 `PSC_*`／`PAULSHACLAW_*` 的安全投影取 canonical SHA-256）；不輸出 unit 內容或環境原值——真正的值只在程序內部（`service_environment_overlay`）用於重建 root／config，絕不序列化進這份輸出。
 
 probe 以 `systemctl --user show` 取得 systemd 已合併的 `ExecStart`、`Environment`、`EnvironmentFiles`、`DropInPaths`、`FragmentPath` 與 `WorkingDirectory`；不自行重建 systemd 的 drop-in 搜尋與合併規則。`disk_unit_sha256` 讀取 systemd 回報的 fragment 與完整 drop-in 清單，以檔名和內容摘要計算。任何列出的檔案不可安全讀取、是 symlink、超過大小上限，或屬性集合不完整時，artifact 維持 `unknown`，不退回主 unit。systemctl 不可用且無法證明檔案退路涵蓋完整 unit 搜尋路徑時也維持 `unknown`。
 
@@ -27,6 +27,8 @@ probe 以 `systemctl --user show` 取得 systemd 已合併的 `ExecStart`、`Env
 Manager 的 `service-manager.sh` 與直接宣告 `<python> -m paulsha_cortex.monitor` 維持可辨識。service status 與 doctor 共用同一份安全投影（`service_declaration_projection`），避免再次從主 unit 推算。輸出僅包含摘要與 artifact 欄位，不包含環境值或 EnvironmentFile 內容。
 
 `PSC_COORDINATOR_ROOT`／`PSC_MONITOR_STATE_ROOT` 與 config revision 的判定同樣以這份有效宣告為準，不再固定讀 `~/.agents/core/runtime/*.env`：`environment_source` 為 `systemd-effective` 時，採用 probe 取得的有效環境（優先序 env 前綴 ＞ `Environment=` ＞ `EnvironmentFiles=`；任一來源無法安全解析時該 service 標 `unknown`，不靜默退回舊值）；只有 `environment_source` 為 `unavailable`（systemd 本身不可用的 direct 模式）才退回既有的 fallback 讀檔，並在輸出以 `unavailable`／`direct-fallback` 標示來源。drop-in 改了 root 或 config 時，`cortex service status` 與 `cortex doctor` 都會照新值判定，不會因為讀到舊 fallback 檔而對錯 state root 或誤報 config drift／match。
+
+manager／monitor 各自獨立判定 `environment_source`，不互相牽連：只要其中一邊確認是 `systemd-effective`，`cortex doctor` 就會採用那一邊已知的有效值，不會因為另一邊當下無法判定（`unavailable`／`unknown`）就連可信的一邊也一起退回粗略的主 unit 檔 fallback；只有兩邊都 `systemd-effective` 時才要求兩者完全相同，不同即視為設定不一致而失敗。`cortex doctor` 與 `cortex service status` 對同一個 service 呼叫的是同一個判定函式（`runtime_attestation._environment_source_and_overlay`），因此對同一個 live service 的結論保證一致。這條路徑的有效環境只由 unit 宣告本身＋systemd 對 user service 的既知預設（例如 `HOME`）組成，不會以呼叫者（操作 CLI）當時的殼層環境為底──操作者殼層自己的環境只用於描述 `operator_cli` 這次呼叫本身，不會混進任何 service 的判定。
 - `manager`／`monitor`：各 service 啟動 receipt、由 service declaration 定位的安裝 artifact、effective config 比對、目前 unit PID 比對，以及前次 process start 與 Trust Root receipt 摘要。
 
 `match` 要求 receipt 存在、目前 unit PID 與 receipt 相同，且 service 宣告 artifact/config 可比較。套件或 Monitor 有效配置與 receipt 不同時為 `drift`。Manager invocation 參數不能由目前 service declaration 確認時，該配置維持 unknown。checkout source override、缺漏／損壞 receipt、未知 schema、instance-root mismatch、缺少目前 PID 或未知 revision 都不會升成 match。status 命令本身只是唯讀 consumer，不會用磁碟 `VERSION` 重寫 loaded identity。

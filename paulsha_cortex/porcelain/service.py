@@ -21,6 +21,7 @@ from paulsha_cortex.runtime_attestation import (
     monitor_configuration_revision_from_environment,
     runtime_status_report,
     service_declaration_projection,
+    service_environment_overlay,
 )
 
 from . import COMMANDS, PorcelainCommand, register
@@ -353,7 +354,15 @@ def _service_declared_environment(
     ``EnvironmentFiles=`` 的覆寫，不必重讀 ``~/.agents/core/runtime/*.env``）；
     只有 systemd 本身不可用的 direct 模式，才退回既有的 fallback 讀檔。宣告
     存在但無法安全解析時回傳空環境並標示 unknown，不得靜默沿用舊 fallback去
-    對錯 root／config（那正是 #841 對抗審查抓到的回歸）。"""
+    對錯 root／config（那正是 #841 對抗審查抓到的回歸）。
+
+    #841 對抗審查第四輪 MAJOR：systemd-effective 分支只能用 unit 宣告本身，
+    不得以呼叫者（操作 CLI）的殼層環境為底再覆蓋——否則殼層裡未被 unit 宣告
+    的 ``PSC_*``（例如操作者自己執行 ``PSC_MONITOR_CONFIG=... cortex service
+    status`` 時帶進來的值）會污染這個 service 的判定。呼叫者自己的環境只用於
+    描述 operator CLI 本身（見 ``cli_runtime_observation``），不進這裡。缺的
+    root 由 ``resolve_runtime_root`` 自行退回已安裝 instance／home 預設，不需
+    要在這裡預先補值。"""
     source = (
         declaration.get("environment_source")
         if isinstance(declaration, dict)
@@ -361,9 +370,7 @@ def _service_declared_environment(
     )
     overlay = declaration.get("environment") if isinstance(declaration, dict) else None
     if source == "systemd-effective" and isinstance(overlay, dict):
-        environment = dict(os.environ)
-        environment.update(overlay)
-        return environment, "systemd-effective"
+        return dict(overlay), "systemd-effective"
     if source == "unavailable":
         return _fallback_environment(instance), "direct-fallback"
     return {}, "unknown"
@@ -376,6 +383,7 @@ def _loaded_runtime_payload(
     monitor_pid: int | None,
     units: Any = None,
     service_declaration: Any = None,
+    environment_overlay: Any = None,
 ) -> dict[str, object]:
     current_artifact = artifact_identity()
     operator_cli = cli_runtime_observation(
@@ -391,11 +399,21 @@ def _loaded_runtime_payload(
     )
     manager_artifact = declarations["manager"].get("artifact")
     monitor_artifact = declarations["monitor"].get("artifact")
+    # #841 對抗審查第四輪：environment_overlay（含真實值）與 declarations（只有
+    # digest，safe for JSON）分開傳入——後者可能是探測後已濾除 systemd 原始屬性
+    # 的快取結果，前者才是判定 manager／monitor 實際環境用的來源。呼叫端沒有
+    # 明確傳入時（例如測試直接餵未濾除過的 ``units``），退回從 ``unit_rows``
+    # 重新判定，行為與濾除前一致。
+    overlays = (
+        environment_overlay
+        if isinstance(environment_overlay, dict)
+        else service_environment_overlay(unit_rows, instance=instance)
+    )
     manager_environment, manager_environment_source = _service_declared_environment(
-        instance, declarations.get("manager")
+        instance, overlays.get("manager")
     )
     monitor_environment, monitor_environment_source = _service_declared_environment(
-        instance, declarations.get("monitor")
+        instance, overlays.get("monitor")
     )
 
     if manager_environment_source == "unknown":
@@ -468,6 +486,10 @@ def _loaded_runtime_payload(
 
 def _status_payload(instance: str) -> dict[str, Any]:
     probe = probe_service_runtime(instance)
+    # #841 對抗審查第四輪：真實環境值只透過這個 pop 取出，之後任何分支對
+    # ``probe`` 做 ``dict(probe)``／整包回傳都不會再帶著它，避免誤落進 JSON
+    # 輸出；再以獨立參數傳給 ``_loaded_runtime_payload`` 供內部重建 root 用。
+    environment_overlay = probe.pop("_environment_overlay", None)
     if probe["mode"] == "systemd":
         units = probe.get("units", {})
         manager_service = f"{instance}-manager.service"
@@ -481,6 +503,7 @@ def _status_payload(instance: str) -> dict[str, Any]:
             monitor_pid=_unit_pid(units, monitor_service),
             units=units,
             service_declaration=probe.get("service_declaration"),
+            environment_overlay=environment_overlay,
         )
         return payload
     fallback = _fallback_runtime(instance, str(probe.get("version", "0.0.0+unknown")), probe.get("units", {}))
@@ -492,6 +515,7 @@ def _status_payload(instance: str) -> dict[str, Any]:
             monitor_pid=_unit_pid(units, f"{instance}-monitor.service"),
             units=units,
             service_declaration=probe.get("service_declaration"),
+            environment_overlay=environment_overlay,
         )
         return fallback
     return {
@@ -505,6 +529,7 @@ def _status_payload(instance: str) -> dict[str, Any]:
             monitor_pid=-1,
             units=probe.get("units", {}),
             service_declaration=probe.get("service_declaration"),
+            environment_overlay=environment_overlay,
         ),
         "suggested_commands": [f"cortex service install --instance {instance}"],
     }
