@@ -4984,3 +4984,37 @@ def test_review_disposition_refuses_when_cortex_review_gate_not_passed(tmp_path:
             now=lambda: 209,
             workflow_registry=registry,
         )
+
+
+@pytest.mark.parametrize(
+    "ship_state",
+    [
+        {"phase": "merge-authorized", "merge_authorization": {"ref": "auth.json", "hash": "a" * 64}},
+        {"phase": "review-requested", "merge_authorization": {"ref": "auth.json", "hash": "a" * 64}},
+        {"phase": "merged"},
+    ],
+)
+def test_explicit_resume_does_not_reset_existing_candidate_after_merge_authorization(
+    tmp_path: Path, ship_state: dict
+) -> None:
+    """merge 已授權或已進入 merge 的交付，中止後 resume 不得把 run 退回 verify。"""
+    snapshot, state, registry, before = _prepare_existing_candidate_recovery(tmp_path)
+    journal = work_actions._load_runs(state)
+    row = journal["runs"][before.run_id]
+    row["ship"] = {**(row.get("ship") or {}), **ship_state}
+    work_actions._save_runs(state, journal)
+    runner, reads = _candidate_pr_read_runner(head=_EXISTING_CANDIDATE_HEAD)
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": _EXISTING_CANDIDATE_REPO, "work_id": "demo"},
+        requested_by="operator",
+        runner=runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["action"] == "blocked"
+    assert result["result"]["reason"] == "existing-candidate-merge-authorized"
+    assert registry.get_workflow_run(before.run_id) == before

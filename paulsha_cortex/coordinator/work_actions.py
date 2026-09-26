@@ -1357,6 +1357,13 @@ def _resume_existing_candidate_after_authority_change(
         )
     except (ValueError, OSError):
         return _candidate_recovery_block(run, "existing-candidate-journal-mismatch")
+    journal_ship = journal_before["row"].get("ship")
+    if isinstance(journal_ship, dict) and (
+        journal_ship.get("merge_authorization") is not None
+        or journal_ship.get("phase") in {"merge-authorized", "merged", "done"}
+    ):
+        # 已授權或已進入 merge 的交付不得退回 verify；中止後應沿 ship 重入完成 merge。
+        return _candidate_recovery_block(run, "existing-candidate-merge-authorized")
     pr_number = authority.mapped_prs[0]
     try:
         remote_before = _existing_candidate_pr_facts(
