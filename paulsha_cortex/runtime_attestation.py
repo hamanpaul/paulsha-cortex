@@ -937,6 +937,16 @@ def service_declaration_projection(
             "environment_source": environment_source,
             "environment_digest": configuration_revision(effective_environment),
         }
+        if service == "manager":
+            # live 驗收發現：`probe_service_runtime` 對外回傳的 units 已移除
+            # `systemd` 原始屬性，`cortex service status` 事後拿不到 ExecStart，
+            # 宣告端 invocation 永遠是 None。必須在這裡（原始 row 仍在手上）先算
+            # 出宣告值；投影只放 sha256 摘要，不含 argv 原文。
+            result[service]["invocation_revision"] = (
+                manager_declared_invocation_revision(row, effective_environment)
+                if environment_source == "systemd-effective"
+                else None
+            )
     return result
 
 

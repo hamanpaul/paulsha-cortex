@@ -1344,3 +1344,78 @@ def test_ensure_running_uses_requested_instance_runtime_env_for_lock_probe(
     payload = json.loads(capsys.readouterr().out)
     assert payload["mode"] == "already-running"
     assert payload["pids"]["manager"] == os.getpid()
+
+
+def test_status_payload_production_path_reports_manager_invocation_match(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """live 驗收回歸：正式路徑 `_status_payload` 傳給 `_loaded_runtime_payload`
+    的 units 已由 `probe_service_runtime` 移除 `systemd` 原始屬性，宣告端
+    invocation 必須在 probe 投影階段先算好；否則 live 上 manager 永遠
+    `invocation-declaration-unknown`（先前的測試直接餵未過濾 units，測不到）。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex.porcelain import _runtime_probe, service
+    from paulsha_cortex.runtime_attestation import (
+        manager_configuration_snapshot,
+        record_runtime_startup,
+    )
+
+    home = tmp_path / "home"
+    units_dir = home / ".config" / "systemd" / "user"
+    units_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    coordinator_root = tmp_path / "coordinator"
+    specs_dir = str(tmp_path / "specs")
+    argv = ["--specs-dir", specs_dir, "--no-require-idle"]
+    manager_environment = {"PSC_COORDINATOR_ROOT": str(coordinator_root)}
+    config, components = manager_configuration_snapshot({}, manager_environment, argv=argv)
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=coordinator_root,
+        configuration=config,
+        config_components=components,
+        artifact={
+            "kind": "unknown", "package": "paulsha-cortex", "package_version": "unknown",
+            "source_revision": "unknown", "sha256": None,
+        },
+        started_at="2026-09-27T00:00:00Z",
+        pid=4321,
+    )
+
+    def block(unit: str, exec_start: str, environment: str) -> str:
+        fragment = units_dir / unit
+        fragment.write_text("[Service]\nExecStart=/usr/bin/true\n", encoding="utf-8")
+        # 依真實 systemctl 輸出順序：Id 在區塊中間。
+        return (
+            f"ExecStart={exec_start}\nEnvironment={environment}\nWorkingDirectory=/\n"
+            f"MainPID=4321\nId={unit}\nLoadState=loaded\nActiveState=active\n"
+            f"SubState=running\nFragmentPath={fragment}\nDropInPaths=\n"
+            "EnvironmentFiles=\n"
+        )
+
+    manager_exec = (
+        "{ path=/usr/bin/env ; argv[]=/usr/bin/env /usr/bin/python3 -m "
+        f"paulsha_cortex.coordinator.manager_daemon {' '.join(argv)} ; ignore_errors=no ; "
+        "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+    )
+    show_output = "\n".join((
+        block("test-manager.service", manager_exec, f"PSC_COORDINATOR_ROOT={coordinator_root}"),
+        block("test-manager.timer", "", ""),
+        block("test-monitor.service", manager_exec.replace("coordinator.manager_daemon", "monitor"), ""),
+    ))
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+    monkeypatch.setattr(
+        _runtime_probe.subprocess, "run",
+        lambda argv_, **_kwargs: SimpleNamespace(returncode=0, stdout=show_output),
+    )
+
+    payload = service._status_payload("test")
+
+    manager = payload["loaded_runtime"]["manager"]
+    assert payload["loaded_runtime"]["service_declaration"]["manager"]["environment_source"] == "systemd-effective"
+    assert manager["comparison"]["config_components"]["invocation_revision"] == "match"
+    assert manager["comparison"]["config_components"]["environment_revision"] == "match"
+    assert "invocation_revision" in payload["loaded_runtime"]["service_declaration"]["manager"]
+    assert specs_dir not in __import__("json").dumps(payload)

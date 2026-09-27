@@ -405,8 +405,14 @@ def _loaded_runtime_payload(
             # 集合可用，維持 None（仍為 unknown，不臆測）。manager_unit_row 用
             # unit_rows 裡對應這個 instance 的 manager service 原始探測結果
             # （含 "systemd" 區塊），與 overlays 共用同一份判定來源。
+            # 優先採用 probe 在原始 row 仍可用時算好的投影摘要（production 路徑
+            # 傳進來的 units 已移除 `systemd` 原始屬性）；只有呼叫端直接給未過濾
+            # 的 units 時才退回現場計算。
+            projected_invocation = declarations["manager"].get("invocation_revision")
             declared_invocation_revision = (
-                manager_declared_invocation_revision(
+                projected_invocation
+                if isinstance(projected_invocation, str)
+                else manager_declared_invocation_revision(
                     unit_rows.get(_unit_names(instance)[0]), manager_environment
                 )
                 if manager_environment_source == "systemd-effective"
