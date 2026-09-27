@@ -724,21 +724,35 @@ def test_reserved_unbound_lease_expired_beyond_grace_is_released(tmp_path: Path)
 
 def test_reserved_unbound_in_flight_dispatch_renews_even_after_lease_expired(tmp_path: Path) -> None:
     """本 process 標記為 in-flight 的 reservation——即使 lease（含 grace）
-    早已過期，也不得釋放；改續租並回 `reconciled`／`in-flight`，維持
-    `reserved`、容量不變。"""
+    早已過期，也不得釋放。
+
+    對抗審查第五輪 MAJOR：這個檢查排在 job 反查之前，且一律直接 `skipped`
+    ——不對這筆 reservation 呼叫 `reconcile()`／`renew()`（不寫入任何事件、
+    不推進 sequence）。原因：dispatch 側（manager.py）持有的
+    `quota_reservation_handle["sequence"]` 是它自己續租後記住的值；sweep
+    若在這個窗口內對同一筆 reservation 寫入任何事件（即使只是續租
+    lease），都會讓 dispatch 手上的 sequence 過期，稍後的 `bind()` 就會
+    因 `expected_sequence` 不符而失敗（見 #839 第五輪 MAJOR
+    manager.py:14511 的重試修法）。sweep 什麼都不做，正確性交給 dispatch
+    自己的續租呼叫；lease 是否過期因此保持原樣，`reserved` 狀態與容量都
+    不變。"""
     from paulsha_cortex.coordinator.quota_admission import InFlightDispatchTracker
 
     descriptor = _pool_descriptor(windows=(("short", 300_000),))
     authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
+    original_status = authority.status(decision.reservation_id, now_ms=_NOW)
 
     tracker = InFlightDispatchTracker()
     tracker.mark_started(decision.reservation_id)
 
+    def _job_lookup_must_not_be_called(run_id, card_id, decision_id):
+        raise AssertionError("in-flight reservation 必須在 job 反查之前就被跳過")
+
     outcomes = admission.reconcile_reserved_reservations(
         authority=authority,
-        job_lookup_by_decision=lambda run_id, card_id, decision_id: None,
+        job_lookup_by_decision=_job_lookup_must_not_be_called,
         job_outcome=lambda job: None,
         now_ms=_NOW + 10_000_000,  # 遠遠超過 lease + grace
         grace_ms=0,
@@ -746,11 +760,13 @@ def test_reserved_unbound_in_flight_dispatch_renews_even_after_lease_expired(tmp
         renew_lease_ms=300_000,
     )
     assert len(outcomes) == 1
-    assert outcomes[0].action == "reconciled"
+    assert outcomes[0].action == "skipped"
     assert "in-flight" in outcomes[0].detail
     status = authority.status(decision.reservation_id, now_ms=_NOW + 10_000_000)
     assert status.state == "reserved"
-    assert status.lease_expires_at_ms == _NOW + 10_000_000 + 300_000
+    # sweep 完全沒有寫入任何事件——sequence／lease 都維持 reserve() 當下的原值。
+    assert status.sequence == original_status.sequence
+    assert status.lease_expires_at_ms == original_status.lease_expires_at_ms
     committed = authority.committed(now_ms=_NOW + 10_000_000)
     key = (tuple(_pool_ref(descriptor)[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "short")
     assert committed.get(key, "0") == "1"
