@@ -45,6 +45,71 @@ producer/consumer 使用，不接 workflow chain、排序、reservation、admiss
 事件；未覆蓋的外部來源仍標 gap。這些 API 不代表 provider live read 或安裝 runtime
 已驗收。
 
+### Quota observation collector（`cortex quota`）
+
+`paulsha_cortex.coordinator.quota_collectors`（#836）是唯一真的會啟動 provider CLI
+的地方，讓 operator 能產生真實觀測供上面的 shadow ledger 使用：
+
+- **codex**：啟動 `codex app-server`，走 stdio JSON-RPC 讀
+  `account/rateLimits/read`（先 `initialize`／`initialized`，再送 request）；
+  整體逾時（預設 20 秒）或協定失敗（逾時、子程序提前結束、壞 JSON、協定
+  錯誤、缺 id=2 回應）皆終止子程序（terminate→kill）並回精確 gap。
+- **agy**：執行 `agy -p /usage --output-format json` 一次性讀取；逾時、非零
+  exit、壞 JSON 各自回精確 gap。
+- **copilot**：Copilot SDK 的 `account.getQuota` 是正式介面，但 `copilot` CLI
+  目前沒有對應的非互動唯讀路徑（已用 `copilot --help` 逐條核對其子命令），
+  回報 `copilot-quota-read-path-unavailable`，不猜測、不爬網頁。
+- **claude／cg**：沿用 `provider_read_contract()` 既有的 unsupported／unknown
+  狀態與理由，不重複定義。
+
+不讀任何 credential 檔，也不把 provider 原始 payload 或帳號識別（如
+`accountId`）外洩到 ledger、stdout 或錯誤訊息——只有 `capture_provider_quota()`
+產出的、已去識別的 observation 才會往下游走。
+
+`quota_collectors.load_collector_config(path)` 讀取版本化的
+`cortex/quota-pools/v1` 設定檔（`config_revision`／`descriptors`／
+`unit_catalog`／`bindings`，選填 `lease_ms`），descriptor／binding 驗證完全
+交給既有的 `quota_observation.parse_*`；額外解析選填的 `collector_targets`
+區塊（每個 executor 的 `resource_key`／`window_id`／`profile_key`／`pool_ref`），
+依 profile_key 分組後對應到 `ProviderQuotaTarget`。設定檔路徑一律由呼叫端
+明確給定，本模組不讀任何預設路徑。
+
+CLI 提供兩個子命令：
+
+- `cortex quota observe --config <path> [--executor codex|agy|copilot|claude|cg]
+  [--dry-run] [--json] [--output <file>] [--timeout-s <秒數>]`：對設定檔內每個
+  executor 執行唯讀讀取，預設以 Manager 帳號寫入
+  `QuotaShadowService(QuotaEventLedger())`。ledger 路徑不可寫時（例如多 UID
+  部署下執行者不是 Manager 帳號）不崩潰，回報 `ledger-unwritable` 並建議改用
+  `--output`。`--dry-run` 不寫任何檔，只印分類結果；`--json` 輸出機讀摘要
+  （每 executor 的 `state`／`observations`／`gaps`）。
+- `cortex quota import --config <path> --file <file>`：由 Manager 帳號匯入
+  `--output` 落地的 observation 檔。匯入前先以
+  `quota_collectors.validate_import_payload()` 核對這份檔案真的是
+  `observe --output` 產生的 export envelope（固定 `schema`／
+  `collector_version`／`config_revision`），且每筆 observation 的
+  `source.method`／`source_schema`／`authority_ref`／unit 的 `semantics_ref`
+  逐字等於 `provider_read_contract(executor)` 的正式值、`config_revision`
+  等於目前 `--config`、`(pool_ref, window_id, profile_key)` 屬於設定檔該
+  executor 的 `collector_targets`、`observed_at_ms` 不在未來也未超過自身
+  `ttl_ms` 過期；任一筆不符即整份拒絕（不部分匯入），錯誤訊息只帶機器可讀
+  reason code，不含原始內容。通過驗證後才走
+  `record_external_observation()`（仍要求 `method` 為
+  `provider_status`／`structured_event`）逐筆寫入 ledger。
+
+多 UID 部署的建議流程：以任意帳號執行 `cortex quota observe --config <path>
+--output observation.json`（唯讀，只落已去識別的 observation），再由 Manager
+帳號執行 `cortex quota import --config <path> --file observation.json` 寫入
+ledger。
+
+**信任邊界**：`cortex quota import` 假設執行者是 Manager 帳號、`--file` 是
+collector（`cortex quota observe --output`）產生的檔案。上述檢查能擋掉「檔案
+被搬到別的 config／別的 executor 環境」或「隨手竄改單一欄位」這類意外或粗糙
+偽造，但**無法防止持有 operator 執行權限者刻意偽造整份檔案**——只要偽造者能
+在本機跑一次 `cortex quota observe --config <path> --output x.json`，就能取得
+所有欄位的合法值再自行拼裝別的內容（例如竄改 amount 但保留其餘欄位全部合法）。
+要防這一層，需要 collector 對輸出簽章、import 端驗簽——目前尚未實作，另議。
+
 ## Quota reservation authority
 
 `paulsha_cortex.coordinator.quota_reservation`（#838）提供跨 instance 共享的
