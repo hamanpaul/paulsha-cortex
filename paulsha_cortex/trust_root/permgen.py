@@ -3567,6 +3567,7 @@ class PathLayout:
             "coverage-shadow-telemetry": f"{c}/coverage-shadow",
             "quota-observation-events": f"{c}/quota-observations",
             "quota-reservation-authority": f"{c}/quota-reservations",
+            "quota-admission-decisions": f"{c}/quota-admission-decisions",
             "monitor-state-tree": mon,
             "monitor-work-items-snapshot": f"{mon}/work-items.snapshot.json",
             "monitor-github-sync-cursor": f"{mon}/github-issue-sync.json",

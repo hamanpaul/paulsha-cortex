@@ -5063,6 +5063,7 @@ class JobRegistry:
         resolved_model_chain: dict[str, dict[str, str]] | None = None,
         execution_profile_bindings: dict[str, dict[str, Any]] | None = None,
         model_qualification: dict[str, str] | None = None,
+        quota_admission: dict[str, dict[str, str]] | None = None,
         combo_selection: dict[str, Any] | None = None,
         needs_human_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> WorkflowRun:
@@ -5188,6 +5189,11 @@ class JobRegistry:
                 current.model_qualification
                 if model_qualification is None
                 else model_qualification
+            ),
+            quota_admission=(
+                current.quota_admission
+                if quota_admission is None
+                else quota_admission
             ),
             combo_selection=(
                 current.combo_selection if combo_selection is None else combo_selection

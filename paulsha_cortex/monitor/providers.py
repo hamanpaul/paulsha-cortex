@@ -762,6 +762,9 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         # #835：版本化 execution profile binding 與 sized dispatch 的
         # qualification 診斷；兩者只在實際解析後寫出，舊 row 缺席照常通過。
         "execution_profile_bindings", "model_qualification",
+        # #839：quota-aware admission 的診斷投影，provenance-only，比照
+        # execution_profile_bindings／model_qualification 的可選欄位模式。
+        "quota_admission",
         # 診斷 invariant（#527／#514／#515／#511／#482）：run 被轉入 needs_human
         # 時同時落地的結構化理由（機器可讀 reason ＋ 人可讀 detail ＋ 來源位置）。
         # **必須列在這裡**：這個 whitelist 是封閉的，漏掉會讓每一個 run row 都被

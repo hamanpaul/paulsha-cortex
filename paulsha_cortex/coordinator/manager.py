@@ -11346,6 +11346,100 @@ def _workflow_execution_profile_stop(registry, run, step, exc: BaseException):
     }
 
 
+# ---------------------------------------------------------------------------
+# #839：quota-aware admission——沿用既有候選排序／runtime preflight／
+# execution-profile 硬濾，只在它們已核可的候選上疊一層「額度夠不夠」。
+# `quota_admission_context` 缺席時以下全部函式完全不呼叫，既有派工行為
+# 逐字不變（見 `quota_admission.DispatchContext` 文件字串）。
+# ---------------------------------------------------------------------------
+
+
+def _quota_admission_qualification_version(run, identities: "IdentityRegistry") -> str:
+    """與 `_record_resolved_model_chain` 寫入 `model_qualification` 的判準逐字
+    相同——`sizing_band` 未設時 qualification 根本不在這個 run 的判斷範圍內，
+    receipt 上不該假裝它有 enforced／not-enforced 兩態之一。"""
+    if getattr(run, "sizing_band", None) is None:
+        return "not-applicable"
+    policy = getattr(identities, "qualification_policy", "disabled")
+    return "enforced" if policy == "enforce" else "not-enforced"
+
+
+def _quota_admission_attempt_id(registry, run, step) -> str:
+    """穩定、可重算的 attempt 識別——不是新的持久欄位，是既有 job 記錄的投影。
+
+    同一張卡在還沒有任何 job 被 `create_job()` 真正建立之前重送（restart／
+    resume 補送），這裡算出的計數不變 ⇒ decision_id 不變 ⇒ #838 reserve()
+    冪等重放，不會二次扣款。真正的新 attempt（前一個 job 已經終局）之後
+    這裡的計數會多一，算出全新的 decision_id。"""
+
+    prior = sum(
+        1
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id and job.get("workflow_card") == step.card
+    )
+    return f"{run.run_id}:{step.card}:n{prior}"
+
+
+def _evaluate_quota_admission_candidate(
+    quota_ctx,
+    *,
+    identity,
+    profile_binding,
+    now_ms: int,
+):
+    """單一候選的額度可行性評估（唯讀，不預留）。
+
+    `quota_ctx` 或 `profile_binding`（manager persona 不派模型）缺席時回
+    `None`——呼叫端據此完全略過額度檢查，維持既有派工行為。"""
+
+    if quota_ctx is None or profile_binding is None:
+        return None
+    from . import quota_admission
+
+    assessment, demand_version = quota_admission.assess_candidate_quota(
+        executor=identity.executor,
+        model_id=identity.model_id,
+        independence_domain=getattr(identity, "independence_domain", "unknown"),
+        profile_key=profile_binding.resolved_key,
+        bindings=quota_ctx.bindings,
+        descriptors=quota_ctx.descriptors,
+        unit_catalog=quota_ctx.unit_catalog,
+        shadow=quota_ctx.shadow,
+        now_ms=now_ms,
+    )
+    return assessment, demand_version
+
+
+def _quota_admission_stop(registry, run, step, *, attempts: Sequence[Mapping[str, object]]):
+    """所有候選皆額度不可行（opt-in enforce）：zero job，回精確 wait 理由。
+
+    比照 `_workflow_execution_profile_stop`——在建立任何 job／worktree 之前
+    fail-closed，不造假 job_id，`classify_dispatch_result` 會把這個回傳值
+    投影成 `decision` 而非 `job`（#830 契約）。"""
+
+    detail_reasons = sorted({str(item.get("exclusion_reason")) for item in attempts})
+    updated = registry._manager_update_workflow_run(
+        run.run_id,
+        facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+        needs_human_reason=diagnostic_reason(
+            "quota-admission-insufficient",
+            "quota-aware admission 判定所有候選目前額度不足或未知，暫停派工："
+            f"{', '.join(detail_reasons) or 'no-candidate'}",
+            source="manager._dispatch_workflow_card:quota-admission",
+            run_id=run.run_id,
+            work_id=run.work_id,
+            card=step.card,
+            attempted_candidates=str(len(attempts)),
+        ),
+    )
+    return {
+        "run_id": updated.run_id,
+        "current_phase": updated.current_phase,
+        "reason": "quota-admission-insufficient",
+        "attempts": list(attempts),
+    }
+
+
 _LEGACY_CARD_EXECUTION = {
     "worktree-isolation": (
         "superpowers:using-git-worktrees",
@@ -12990,6 +13084,9 @@ def _dispatch_workflow_card(
     forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
     builder_todo_admission: BuilderTodoAdmission | None = None,
+    # #839：quota-aware admission 的一次性打包（見 quota_admission.DispatchContext）；
+    # 缺席（預設）代表尚未接上真實觀測/reservation，完全 no-op，逐字維持既有派工行為。
+    quota_admission_context: object | None = None,
 ) -> dict[str, object] | None:
     """#381：workflow lane 的實際 spawn 點。spawn_admission 未注入時解析為
     零間隔 no-op（見 spawn_admission.resolve_limiter）——只有 resume_workflow_run
@@ -13161,6 +13258,7 @@ def _dispatch_workflow_card(
                         forced_identity=forced_identity,
                         spawn_admission=spawn_admission,
                         builder_todo_admission=builder_todo_admission,
+                        quota_admission_context=quota_admission_context,
                     )
                 else:
                     updated = registry._manager_update_workflow_run(
@@ -13368,98 +13466,153 @@ def _dispatch_workflow_card(
         if isinstance(forced_identity, DispatchGateDecision):
             forced_gate = forced_identity
             forced_reroute_identity = forced_gate.identity
-    if forced_gate is not None:
-        gate = forced_gate
-    elif forced_identity is not None:
-        gate = None
-    else:
-        try:
-            gate = _runtime_preflight_gate(
+    quota_admission_attempts: list[dict[str, object]] = []
+    excluded_quota_identities: set[tuple[str, str]] = set()
+    quota_admission_enforced = False
+    if quota_admission_context is not None:
+        from . import quota_admission
+
+        quota_admission_enforced = quota_admission.quota_admission_enabled(
+            quota_admission_context.environment
+        )
+    quota_selected_assessment = None
+    quota_selected_demand_version = None
+    quota_now_ms = int(time.time() * 1000)
+    while True:
+        # #839：opt-in enforce 下，額度不可行的候選會被排除、再重選——`gate`
+        # 每輪都用目前尚未排除的候選重新算一次（`_runtime_preflight_gate` 本來
+        # 就支援帶入已過濾的候選清單，provider-failure reroute 已是既有用法）；
+        # forced reroute 路徑維持既有單一候選語意，不參與這裡的排除重選。
+        if forced_gate is not None:
+            gate = forced_gate
+        elif forced_identity is not None:
+            gate = None
+        else:
+            quota_loop_candidates = tuple(
+                candidate
+                for candidate in eligible_candidates
+                if (candidate.executor, candidate.model_id) not in excluded_quota_identities
+            )
+            if not quota_loop_candidates:
+                return _quota_admission_stop(registry, run, step, attempts=quota_admission_attempts)
+            try:
+                gate = _runtime_preflight_gate(
+                    run,
+                    step,
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    candidates=quota_loop_candidates,
+                    projected_backoff_candidates=projected_backoff_candidates,
+                )
+            except Exception as exc:
+                from .execution_adapters import ExecutionAdapterError
+                from .execution_profile import ExecutionProfileError
+
+                if isinstance(exc, (ExecutionAdapterError, ExecutionProfileError)):
+                    return _workflow_execution_profile_stop(registry, run, step, exc)
+                raise
+            if gate is not None and gate.action == "needs_human":
+                updated = registry._manager_update_workflow_run(
+                    run.run_id,
+                    facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+                    needs_human_reason=diagnostic_reason(
+                        f"runtime-preflight-{gate.result.outcome.value}",
+                        "runtime preflight 在建立 worktree／job 之前判定不可派工："
+                        f"{gate.reason or gate.result.blocking_reason() or gate.result.outcome.value}",
+                        source="manager._dispatch_workflow_card:runtime-preflight",
+                        run_id=run.run_id,
+                        work_id=run.work_id,
+                        card=step.card,
+                        outcome=gate.result.outcome.value,
+                    ),
+                )
+                return {
+                    "run_id": updated.run_id,
+                    "current_phase": updated.current_phase,
+                    "reason": f"runtime-preflight-{gate.result.outcome.value}",
+                    "runtime_preflight": gate.to_dict(),
+                }
+        if gate is not None:
+            # gate.launcher 已由 _runtime_preflight_gate 套過執行契約，不再 specialize。
+            identity = gate.identity
+            launcher = gate.launcher
+            if launcher is None:
+                raise ValueError("workflow launcher unavailable")
+        elif forced_reroute_identity is not None:
+            identity = forced_reroute_identity
+            launcher = launcher_factory(identity)
+            if launcher is None:
+                raise ValueError("workflow launcher unavailable")
+            launcher = _specialize_workflow_launcher(launcher, step)
+        else:
+            identity = _select_workflow_identity(
                 run,
                 step,
-                identities=identities,
-                launcher_factory=launcher_factory,
-                candidates=eligible_candidates,
-                projected_backoff_candidates=projected_backoff_candidates,
+                identities,
+                candidates=quota_loop_candidates,
             )
-        except Exception as exc:
-            from .execution_adapters import ExecutionAdapterError
-            from .execution_profile import ExecutionProfileError
+            launcher = launcher_factory(identity)
+            if launcher is None:
+                raise ValueError("workflow launcher unavailable")
+            launcher = _specialize_workflow_launcher(launcher, step)
+        if identity is not None:
+            # Hardened candidate ranking checks the static registry contract.  A
+            # final check against the specialized launcher closes the remaining
+            # dependency seam before any job/worktree launch side effect; direct
+            # mode intentionally keeps the legacy operator-overlay path.
+            compatibility_for = model_resolution.compatibility_checker_for(step.persona)
+            if compatibility_for is not None:
+                model_resolution.validate_identity_compatibility(
+                    step.persona, identity, launcher=launcher
+                )
+        profile_binding = getattr(launcher, "_execution_profile_binding", None)
+        if profile_binding is None:
+            try:
+                profile_binding, launcher = _bind_workflow_execution_profile(
+                    run,
+                    step,
+                    identity,
+                    launcher,
+                    qualification_policy=getattr(identities, "qualification_policy", "disabled"),
+                )
+            except Exception as exc:
+                from .execution_adapters import ExecutionAdapterError
+                from .execution_profile import ExecutionProfileError
 
-            if isinstance(exc, (ExecutionAdapterError, ExecutionProfileError)):
-                return _workflow_execution_profile_stop(registry, run, step, exc)
-            raise
-    if gate is not None and gate.action == "needs_human":
-        updated = registry._manager_update_workflow_run(
-            run.run_id,
-            facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
-            needs_human_reason=diagnostic_reason(
-                f"runtime-preflight-{gate.result.outcome.value}",
-                "runtime preflight 在建立 worktree／job 之前判定不可派工："
-                f"{gate.reason or gate.result.blocking_reason() or gate.result.outcome.value}",
-                source="manager._dispatch_workflow_card:runtime-preflight",
-                run_id=run.run_id,
-                work_id=run.work_id,
-                card=step.card,
-                outcome=gate.result.outcome.value,
-            ),
+                if isinstance(exc, (ExecutionAdapterError, ExecutionProfileError)):
+                    return _workflow_execution_profile_stop(registry, run, step, exc)
+                raise
+        if quota_admission_context is None:
+            break
+        quota_now_ms = int(time.time() * 1000)
+        quota_evaluation = _evaluate_quota_admission_candidate(
+            quota_admission_context,
+            identity=identity,
+            profile_binding=profile_binding,
+            now_ms=quota_now_ms,
         )
-        return {
-            "run_id": updated.run_id,
-            "current_phase": updated.current_phase,
-            "reason": f"runtime-preflight-{gate.result.outcome.value}",
-            "runtime_preflight": gate.to_dict(),
-        }
-    if gate is not None:
-        # gate.launcher 已由 _runtime_preflight_gate 套過執行契約，不再 specialize。
-        identity = gate.identity
-        launcher = gate.launcher
-        if launcher is None:
-            raise ValueError("workflow launcher unavailable")
-    elif forced_reroute_identity is not None:
-        identity = forced_reroute_identity
-        launcher = launcher_factory(identity)
-        if launcher is None:
-            raise ValueError("workflow launcher unavailable")
-        launcher = _specialize_workflow_launcher(launcher, step)
-    else:
-        identity = _select_workflow_identity(
-            run,
-            step,
-            identities,
-            candidates=eligible_candidates,
+        if quota_evaluation is None:
+            # manager persona（無 profile）或 quota context 沒給——完全略過。
+            break
+        quota_assessment, quota_demand_version = quota_evaluation
+        quota_admission_attempts.append(
+            {
+                "executor": identity.executor,
+                "model_id": identity.model_id,
+                "exclusion_reason": quota_assessment.exclusion_reason,
+            }
         )
-        launcher = launcher_factory(identity)
-        if launcher is None:
-            raise ValueError("workflow launcher unavailable")
-        launcher = _specialize_workflow_launcher(launcher, step)
-    if identity is not None:
-        # Hardened candidate ranking checks the static registry contract.  A
-        # final check against the specialized launcher closes the remaining
-        # dependency seam before any job/worktree launch side effect; direct
-        # mode intentionally keeps the legacy operator-overlay path.
-        compatibility_for = model_resolution.compatibility_checker_for(step.persona)
-        if compatibility_for is not None:
-            model_resolution.validate_identity_compatibility(
-                step.persona, identity, launcher=launcher
-            )
-    profile_binding = getattr(launcher, "_execution_profile_binding", None)
-    if profile_binding is None:
-        try:
-            profile_binding, launcher = _bind_workflow_execution_profile(
-                run,
-                step,
-                identity,
-                launcher,
-                qualification_policy=getattr(identities, "qualification_policy", "disabled"),
-            )
-        except Exception as exc:
-            from .execution_adapters import ExecutionAdapterError
-            from .execution_profile import ExecutionProfileError
-
-            if isinstance(exc, (ExecutionAdapterError, ExecutionProfileError)):
-                return _workflow_execution_profile_stop(registry, run, step, exc)
-            raise
+        if quota_assessment.feasible or not quota_admission_enforced:
+            # shadow 模式：無論可不可行都繼續（只記錄，不改既有派工結果）。
+            # enforce 模式：可行才繼續。
+            quota_selected_assessment = quota_assessment
+            quota_selected_demand_version = quota_demand_version
+            break
+        if forced_gate is not None or forced_identity is not None:
+            # provider-failure reroute 的既有單一候選語意：那條路徑已經是別的
+            # 機制核可的替代候選，不在這裡繼續往下換第三個候選。
+            return _quota_admission_stop(registry, run, step, attempts=quota_admission_attempts)
+        excluded_quota_identities.add((identity.executor, identity.model_id))
     # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
     # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
     _record_resolved_model_chain(
@@ -13470,6 +13623,77 @@ def _dispatch_workflow_card(
         identities,
         execution_profile_binding=profile_binding,
     )
+    quota_reservation_handle: dict[str, object] | None = None
+    if quota_admission_context is not None and quota_selected_assessment is not None:
+        from . import quota_admission
+
+        quota_attempt_id = _quota_admission_attempt_id(registry, run, step)
+        quota_decision_id = quota_admission.decision_id_for(
+            run_id=run.run_id, card_id=step.card, attempt_id=quota_attempt_id,
+            profile_key=profile_binding.resolved_key,
+        )
+        quota_mode = "enforced" if quota_admission_enforced else "shadow"
+        quota_observation_version = quota_admission.observation_fingerprint(quota_selected_assessment)
+        reservation_id = None
+        if (
+            quota_admission_enforced
+            and quota_selected_assessment.feasible
+            and quota_selected_assessment.pools
+        ):
+            reservation_result = quota_admission.reserve_for_candidate(
+                quota_admission_context.authority,
+                run_id=run.run_id, card_id=step.card, decision_id=quota_decision_id,
+                attempt_id=quota_attempt_id, assessment=quota_selected_assessment,
+                observation_version=quota_observation_version,
+                demand_version=quota_selected_demand_version,
+                lease_ms=quota_admission_context.lease_ms, now_ms=quota_now_ms,
+            )
+            if reservation_result.status not in ("granted", "duplicate"):
+                # race 落敗（denied）或呼叫本身不合法（invalid）：這個候選剛
+                # 剛還可行，現在搶不到——回精確 wait，不造假 job、不留半額度。
+                quota_admission_attempts.append(
+                    {
+                        "executor": identity.executor, "model_id": identity.model_id,
+                        "exclusion_reason": f"reservation-{reservation_result.status}",
+                    }
+                )
+                return _quota_admission_stop(registry, run, step, attempts=quota_admission_attempts)
+            reservation_id = reservation_result.reservation_id
+            quota_reservation_handle = {
+                "reservation_id": reservation_result.reservation_id,
+                "owner_token": reservation_result.owner_token,
+                "sequence": reservation_result.sequence,
+                "attempt_id": quota_attempt_id,
+            }
+        quota_decision = quota_admission.AdmissionDecision(
+            decision_id=quota_decision_id, run_id=run.run_id, card_id=step.card,
+            attempt_id=quota_attempt_id, profile_key=profile_binding.resolved_key,
+            mode=quota_mode, outcome="admit",
+            policy_version=quota_admission.ADMISSION_POLICY_VERSION,
+            observation_version=quota_observation_version,
+            demand_version=quota_selected_demand_version,
+            qualification_version=_quota_admission_qualification_version(run, identities),
+            generated_at_ms=quota_now_ms,
+            selected={
+                "executor": identity.executor,
+                "model_id": identity.model_id,
+                "independence_domain": getattr(identity, "independence_domain", "unknown"),
+            },
+            reservation_id=reservation_id,
+            # 排除掉的候選（額度 fallback 換過的那些）——最後一筆是本次選中的
+            # 候選自己，不算「被排除」。
+            excluded=tuple(quota_admission_attempts[:-1]),
+        )
+        quota_admission_context.store.record(quota_decision)
+        registry._manager_update_workflow_run(
+            run.run_id,
+            quota_admission={
+                **(run.quota_admission or {}),
+                step.persona: {
+                    "decision_id": quota_decision_id, "mode": quota_mode, "outcome": "admit",
+                },
+            },
+        )
     builder_jobs = [
         job
         for job in registry.list_jobs()
@@ -13739,6 +13963,7 @@ def _dispatch_workflow_card(
             ):
                 raise ValueError("workflow build phase base is unavailable")
             dispatch_base = base_value
+    quota_job_created = False
     try:
         branch = (
             # #648：build 卡的 branch 已在 provisioning 當下定案（`build_branch`
@@ -13788,7 +14013,41 @@ def _dispatch_workflow_card(
             workflow_test_policy=step.test_policy,
             dispatch_reroute=dispatch_reroute,
         )
+        quota_job_created = True
+        if quota_reservation_handle is not None:
+            # #839：job 記錄一旦建立就取得真正的 job_id——依 #838 現行契約，
+            # bind() 必須在這裡（spawn 之前）發生，不是 spawn 之後。bind 之後
+            # 這筆 reservation 進入 bound，只能經 settle／reconcile 結束。
+            bind_result = quota_admission_context.authority.bind(
+                reservation_id=quota_reservation_handle["reservation_id"],
+                owner_token=quota_reservation_handle["owner_token"],
+                attempt_id=quota_reservation_handle["attempt_id"],
+                job_id=str(job["job_id"]),
+                expected_sequence=quota_reservation_handle["sequence"],
+                now_ms=int(time.time() * 1000),
+            )
+            if bind_result.status not in ("ok", "duplicate"):
+                # 結構性異常（非預期的 owner/attempt/sequence 衝突）——job 記錄
+                # 已經建立，不能用 release()（#838 只允許 release 發生在 bind
+                # 之前）；fail-closed 直接讓派工失敗，reservation 留在 reserved
+                # 由後續 reconcile 掃描或下一次同 attempt 重送處理。
+                raise ValueError(
+                    f"quota admission reservation bind rejected: "
+                    f"{bind_result.status}/{bind_result.reason}"
+                )
+            quota_reservation_handle["sequence"] = bind_result.sequence
     except BaseException:
+        if not quota_job_created and quota_reservation_handle is not None:
+            from . import quota_admission
+
+            quota_admission.release_reservation_before_spawn(
+                quota_admission_context.authority,
+                reservation_id=quota_reservation_handle["reservation_id"],
+                owner_token=quota_reservation_handle["owner_token"],
+                attempt_id=quota_reservation_handle["attempt_id"],
+                expected_sequence=quota_reservation_handle["sequence"],
+                now_ms=int(time.time() * 1000),
+            )
         if planner_sandbox is not None:
             shutil.rmtree(planner_sandbox, ignore_errors=True)
         if reviewer_sandbox is not None:
@@ -13884,6 +14143,21 @@ def _dispatch_workflow_card(
                 "job_id": str(job["job_id"]),
             },
         )
+        if quota_reservation_handle is not None:
+            # #839：spawn 已經 bind 到這個 job_id 之後才失敗（含派工時 429／
+            # infra 錯誤）——只能經 settle 收尾（release 只允許 bind 之前），
+            # 記消耗但不對品質下判斷（那是既有 provider_outcome 分類的責任）。
+            from . import quota_admission
+
+            quota_admission.settle_reservation_after_spawn_failure(
+                quota_admission_context.authority,
+                reservation_id=quota_reservation_handle["reservation_id"],
+                owner_token=quota_reservation_handle["owner_token"],
+                attempt_id=quota_reservation_handle["attempt_id"],
+                expected_sequence=quota_reservation_handle["sequence"],
+                now_ms=int(time.time() * 1000),
+                note=summarize_exception(launch_exc)[:200],
+            )
         if planner_sandbox is not None:
             shutil.rmtree(planner_sandbox, ignore_errors=True)
         if reviewer_sandbox is not None:
@@ -13910,6 +14184,7 @@ def dispatch_workflow_card(
     forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
     builder_todo_admission: BuilderTodoAdmission | None = None,
+    quota_admission_context: object | None = None,
 ) -> dict[str, object] | None:
     """Dispatch a normal workflow card; legacy recovery is operator-resume internal only."""
 
@@ -13924,6 +14199,7 @@ def dispatch_workflow_card(
         forced_identity=forced_identity,
         spawn_admission=spawn_admission,
         builder_todo_admission=builder_todo_admission,
+        quota_admission_context=quota_admission_context,
     )
 
 
@@ -14439,6 +14715,7 @@ def resume_workflow_run(
         Callable[[object], BuilderTodoAdmission | None] | None
     ) = None,
     decomposition_intake: Callable[[str], object] | None = None,
+    quota_admission_context: object | None = None,
 ) -> dict[str, object]:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -14700,6 +14977,7 @@ def resume_workflow_run(
                     operator_recovery_job_id=retry_recovery_job_id,
                     spawn_admission=spawn_admission,
                     builder_todo_admission=builder_todo_admission,
+                    quota_admission_context=quota_admission_context,
                 )
             return dispatch_workflow_card(
                 dispatcher,
@@ -14710,6 +14988,7 @@ def resume_workflow_run(
                 retry_failed=retry,
                 spawn_admission=spawn_admission,
                 builder_todo_admission=builder_todo_admission,
+                quota_admission_context=quota_admission_context,
             )
         except Exception as exc:
             current = registry.get_workflow_run(bound_run.run_id)
@@ -15001,6 +15280,7 @@ def resume_workflow_run(
                         retry_failed=True,
                         forced_identity=rerouted_target,
                         builder_todo_admission=builder_todo_admission_for(run),
+                        quota_admission_context=quota_admission_context,
                     )
                     if replacement is None:
                         return {
@@ -15247,6 +15527,7 @@ def resume_workflow_run(
             coordinator_root=coordinator_root,
             retry_failed=True,
             builder_todo_admission=builder_todo_admission_for(run),
+            quota_admission_context=quota_admission_context,
         )
         if replacement is None:
             return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}

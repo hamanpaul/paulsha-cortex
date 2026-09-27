@@ -68,6 +68,46 @@ decision 用相同組成重複呼叫 `reserve()`／terminal 事件重送皆冪�
 library primitive。`reservation_authority_enabled()` 是保留給未來整合者的
 opt-in 開關，預設關閉即等於 shadow／rollback，不需要改動任何程式碼。
 
+## Quota-aware admission
+
+`paulsha_cortex.coordinator.quota_admission`（#839）在既有候選分層排序／
+runtime preflight／execution-profile 硬濾（pin、權限、角色、reviewer
+independence、#842 qualification）**之後**，疊上一層「這個已核可的候選現在
+有沒有額度」：以上面 #836 的 `QuotaShadowService.project()` 唯讀投影算出每個
+pool/window 是 `sufficient`／`insufficient`／`unknown`（同池換 model 不算恢復；
+短窗夠、週窗不足一樣視為不可行），只替**目前選中**的那一個候選原子預留
+（`quota_reservation.reserve_for_candidate`），成功才繼續 provisioning／
+spawn；race 落敗或額度不可行時，`manager._dispatch_workflow_card` 會換下一個
+既有排序候選重試（沿用 `_runtime_preflight_gate`／`_select_workflow_identity`
+既有機制，不重建候選池），全部候選皆不可行才回精確 wait 理由，不建立任何
+job、不留半額度。
+
+Reservation 的 `reserve → create_job → bind(job_id) → spawn` 順序嚴格對應
+#838 現行協定：job 記錄一旦建立即 `bind()`，之後只能經 `settle()`（含派工時
+429／infra 失敗）或 `reconcile()` 結束；job 記錄建立前失敗才用
+`release(reason="fail-before-spawn")`。`reconcile_bound_reservations()`
+另外提供 restart／crash 後的收斂掃描——job registry 查不到時一律
+`inconclusive`（不因為查不到就假設已終止並釋放額度），只有確認終局才釋放。
+
+每個 decision 都有耐久、append-only 的 receipt（`AdmissionDecisionStore`，
+已登記於 Trust Root），綁定 `run_id`／`card_id`／`attempt_id`／`profile_key`
+與 qualification／observation／demand／policy 版本，以及被排除候選與理由；
+同一個 attempt 重送冪等回放，不會二次扣款或搬活 job。#837 operational usage
+forecast 尚未落地前，demand 只用明確標示版本的 fixture
+（`DEMAND_FIXTURE_VERSION`），receipt 上的 `demand_version` 因此可精確分辨
+「這是 fixture」還是「這是真預測」。
+
+`quota_admission_enabled()` 是本模組自己的 opt-in 開關
+（`PSC_QUOTA_ADMISSION_ENFORCE`），與 #838 的開關各自獨立：預設皆為
+shadow——manager 只在有呼叫端明確傳入 `quota_admission.DispatchContext`
+時才會呼叫任何一行本模組（`dispatch_workflow_card`／`resume_workflow_run`
+新增的 `quota_admission_context` 參數，缺省 `None`），shadow 模式下只用
+唯讀投影記一份 decision receipt 供觀察，不呼叫 `reserve()`、不改變既有派工
+結果；rollback 只需把環境變數改回非 `on`（或整條不接線 context），不需要
+刪除已經寫下的 decision receipt／reservation／consumption 證據。部署層
+（真正的 #836 descriptors／bindings／provider 觀測來源、`manager_daemon.py`
+的 context 建構）是獨立的安裝／canary gate，本票只交付 Cortex 消費端。
+
 ## Execution profile schema／key core
 
 `paulsha_cortex.coordinator.execution_profile` 是 #849 的純 stdlib

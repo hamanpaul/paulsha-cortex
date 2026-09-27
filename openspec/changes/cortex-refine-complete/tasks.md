@@ -80,10 +80,10 @@
 
 ## 5. B4 動態派工與恢復
 
-- [ ] 5.1 由 #839 完成 qualified feasible candidate selection，維持 explicit pin、permissions、role、independence 硬條件。
+- [x] 5.1 由 #839 完成 qualified feasible candidate selection（`coordinator/quota_admission.py` + `manager._dispatch_workflow_card` 接線）：只在既有候選分層排序／runtime preflight／execution-profile 硬濾（pin、permissions、role、reviewer independence、#842 qualification）已核可的候選上疊額度可行性；同池換 model 一樣視為同池、不可繞過（`tests/test_quota_admission_839.py`／`tests/test_quota_admission_dispatch_wiring_839.py`）。shadow 預設不擋派，opt-in enforce 才會排除不可行候選並換下一個既有排序候選重試。
 - [x] 5.2 由 #838 完成多池/多時間窗原子 reservation 與同主機多 instance contention 測試（`coordinator/quota_reservation.py`；`multiprocessing`＋`Barrier` 真實競爭、failpoint crash matrix、bounded worker 壓力/耐久 audit）；本模組刻意不接線任何 spawn path、不做候選排序/fallback/forecast，`reservation_authority_enabled()` 預設關閉即 shadow，留給 #839 整合。
-- [ ] 5.3 完成 consumption reconciliation、crash/restart uncertain liveness 與 lease 不誤釋放。
-- [ ] 5.4 完成 card/attempt 安全邊界的 fallback、supersession 與 artifact preservation；同耗盡 pool 不可繞過。
+- [ ] 5.3 部分由 #839 完成：`quota_admission.reconcile_bound_reservations()` 提供 restart 後的 bound reservation 收斂掃描（job registry 查不到一律 `inconclusive`、不假設終止；確認終局才 `reconcile(confirmed-terminated)` 釋放），並在 `manager._dispatch_workflow_card` 接上 `reserve → create_job → bind(job_id) → spawn` 的完整生命週期（bind 前失敗 release，bind 後失敗 settle）。尚未接上 periodic tick／manager 啟動時自動呼叫 reconcile 掃描，仍待後續整合。
+- [ ] 5.4 部分由 #839 完成：card/attempt 安全邊界的候選 fallback 已落地（同耗盡 pool 不可繞過，opt-in enforce 下換下一個既有排序候選並原子重新預留）。supersession 與 artifact preservation（forecast 誤判外部消耗導致的既有 in-flight attempt 安全下線）仍未實作，留待後續票。
 - [ ] 5.5 由 #843 補 R07 recovery matrix 與 exact-run/card CAS、late evidence、重送冪等、abandon owner-aware 資源處置；#497/#547/#577等原producer缺陷仍須修正。
 - [ ] 5.6 通過計畫 12 個 quota/profile 場景，再有限 opt-in canary；保留 legacy policy 回復路徑與 receipts。
 - [ ] 5.7 由 #844 完成 production stage reuse 的同run/claim-era安全cohort與可信採信；跨run新採信未支援需列管，不能以相同key改寫舊evidence。

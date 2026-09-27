@@ -156,6 +156,35 @@ def _validate_model_qualification(value: object) -> None:
             )
 
 
+QUOTA_ADMISSION_MODES = frozenset({"shadow", "enforced"})
+QUOTA_ADMISSION_OUTCOMES = frozenset({"admit", "wait"})
+
+
+def _validate_quota_admission(value: object) -> None:
+    """#839：quota-aware admission 的診斷投影——{persona: {decision_id, mode,
+    outcome}}。純 provenance-only，比照 #835 ``model_qualification`` 的加法
+    模式；完整耐久 decision receipt 住在獨立的
+    ``quota_admission.AdmissionDecisionStore``（見該模組），這裡只留一份可
+    被 ``cortex work show`` 直接讀到的摘要，不是 receipt 本身的權威副本。"""
+
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("workflow run quota_admission 必須為null或dict")
+    required_keys = {"decision_id", "mode", "outcome"}
+    for persona, row in value.items():
+        if persona not in MODEL_CHAIN_PERSONAS:
+            raise ValueError(f"workflow run quota_admission persona 非法: {persona!r}")
+        if not isinstance(row, dict) or set(row) != required_keys:
+            raise ValueError(f"workflow run quota_admission[{persona!r}] 格式錯誤")
+        if not isinstance(row.get("decision_id"), str) or not row["decision_id"]:
+            raise ValueError(f"workflow run quota_admission[{persona!r}].decision_id 必須為非空字串")
+        if row.get("mode") not in QUOTA_ADMISSION_MODES:
+            raise ValueError(f"workflow run quota_admission[{persona!r}].mode 非法: {row.get('mode')!r}")
+        if row.get("outcome") not in QUOTA_ADMISSION_OUTCOMES:
+            raise ValueError(f"workflow run quota_admission[{persona!r}].outcome 非法: {row.get('outcome')!r}")
+
+
 _PERSONA_ROLE_FOR_PROFILE = {
     "planner": "planning",
     "builder": "build",
@@ -780,6 +809,10 @@ class WorkflowRun:
     # "not-enforced"）。頂層新欄位而非塞進 resolved_model_chain row：舊版
     # from_dict 忽略未知頂層鍵，row 內新鍵則會被舊版封閉驗證拒收。
     model_qualification: dict[str, str] | None = None
+    # #839：quota-aware admission 的診斷投影（decision_id／mode／outcome）。
+    # 頂層新欄位，理由與 model_qualification 逐字相同——舊版 from_dict 忽略
+    # 未知頂層鍵，row 內新鍵則會被舊版封閉驗證拒收。
+    quota_admission: dict[str, dict[str, str]] | None = None
     combo_selection: dict[str, Any] | None = None
     # 診斷 invariant 家族（#527／#514／#515／#511／#482）：把 run 轉入
     # `needs_human` 的那一刻必須同時落一份結構化理由（`diagnostics.
@@ -1003,6 +1036,7 @@ class WorkflowRun:
             self.execution_profile_bindings, self.resolved_model_chain
         )
         _validate_model_qualification(self.model_qualification)
+        _validate_quota_admission(self.quota_admission)
         _validate_combo_selection(self.combo_selection)
         if self.needs_human_reason is not None:
             # 形狀驗證：DiagnosticReason.from_dict 自己 fail-closed（reason 必須
@@ -1089,6 +1123,10 @@ class WorkflowRun:
             }
         if self.model_qualification is not None:
             payload["model_qualification"] = dict(self.model_qualification)
+        if self.quota_admission is not None:
+            payload["quota_admission"] = {
+                persona: dict(row) for persona, row in self.quota_admission.items()
+            }
         return payload
 
     @classmethod
@@ -1181,6 +1219,7 @@ class WorkflowRun:
             resolved_model_chain=payload.get("resolved_model_chain"),
             execution_profile_bindings=payload.get("execution_profile_bindings"),
             model_qualification=payload.get("model_qualification"),
+            quota_admission=payload.get("quota_admission"),
             combo_selection=payload.get("combo_selection"),
             # 既有部署的狀態檔沒有這個欄位；缺席時維持 None（facet 有、理由沒有
             # 的 legacy run 照常載入，見上方 __post_init__ 的說明）。facet 已清

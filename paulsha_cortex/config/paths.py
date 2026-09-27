@@ -135,6 +135,20 @@ def quota_reservation_root() -> Path:
     return coordinator_root() / QUOTA_RESERVATION_DIRNAME
 
 
+QUOTA_ADMISSION_DIRNAME = "quota-admission-decisions"
+
+
+def quota_admission_decisions_root() -> Path:
+    """#839 Manager-owned quota-aware admission decision receipt 根。
+
+    與 `quota_reservation_root()` 同層但獨立目錄：decision receipt 只記錄
+    「這次准入決策長什麼樣子」（append-only、無狀態機），與 #838 reservation
+    的原子生命週期是兩個不同的寫入面，分開落地不必互相牽動對方已審查過的
+    schema。
+    """
+    return coordinator_root() / QUOTA_ADMISSION_DIRNAME
+
+
 #: `review_verdict_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數
 #: 是為了讓 `coordinator/review.py` 的 per-job 定址與本 resolver 共用同一個字面量
 #: （R1 登記表的「重複路徑推導」Scenario 要求單一真相）。

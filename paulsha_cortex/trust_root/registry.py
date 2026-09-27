@@ -1827,6 +1827,16 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             "序列化寫入同一份檔案；headless persona 無寫入權，Monitor 唯讀投影。"
         ),
     ),
+    TrustRootAsset(
+        "quota-admission-decisions", _T1, _MO,
+        "paulsha_cortex.config.paths:quota_admission_decisions_root",
+        (Principal.MANAGER,), (Principal.MANAGER, Principal.MONITOR),
+        IngressKind.MANAGER_INTERNAL,
+        note=(
+            "#839 quota-aware admission decision receipt（append-only，無狀態機）。"
+            "Manager 寫入、Monitor 唯讀投影；headless persona 無寫入權。"
+        ),
+    ),
     # ---- monitor state 族 --------------------------------------------------
     TrustRootAsset(
         "monitor-state-tree", _T1, _MO, "paulsha_cortex.config.paths:monitor_state_root",
