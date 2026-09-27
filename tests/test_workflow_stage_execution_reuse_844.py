@@ -12,6 +12,8 @@ monkeypatch admission 為永真——全程走真正的 `resume_workflow_run`／
 
 from __future__ import annotations
 
+import ast
+import json
 import os
 import subprocess
 import sys
@@ -512,6 +514,172 @@ class TestStageExecutionReuseIntegration:
         assert "verification" not in (persisted.stage_reuse_receipts or {})
 
 
+class TestStageReuseCoversPromptVariantInputs:
+    """對抗審查第二輪 MAJOR-1：`_workflow_job_prompt()` 組出 verify／review
+    卡 contract 時實際吃進、且**可能在同一 candidate 下改變**的三項輸入——
+    ``builder_job_id``（contract 裡 `[REVIEW JOB: ... / BUILDER JOB: ...]`
+    的綁定來源）、``manager_gate_ledger``（verify 專用，Manager 自己重跑、
+    綁定 candidate 的 build gate ledger）、``operator_adjudications``
+    （#752／#814 的 run 級人裁紀錄）——必須納入 stage_execution_key／
+    receipt 的逐欄比對。`retry-build` 合法重跑允許 candidate SHA 不變
+    （`_verify_build_candidate_transition()`），若這三項不入 key，
+    `resume_workflow_run()` 會誤判成「相容，可以沿用」，把重跑前的
+    verify／review evidence 錯誤地當成仍然有效。
+    """
+
+    def test_retry_build_same_candidate_new_builder_job_invalidates_verify_reuse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """retry-build 重跑出同一顆 candidate（HEAD 不變）但換了一顆新的
+        builder job：即使 candidate／executor／model／execution profile
+        全部不變，verify 卡也必須視為 stale，不能沿用綁定舊 builder job
+        的 evidence。"""
+
+        _seed_auth_cache(monkeypatch)
+        registry, run, candidate = _build_verify_run(tmp_path)
+        dispatcher = _Dispatcher(registry)
+        coordinator_root = tmp_path / "coordinator"
+        identities = _identities()
+        launch_calls: list[str] = []
+
+        first = manager.resume_workflow_run(
+            dispatcher,
+            run_id=run.run_id,
+            identities=identities,
+            launcher_factory=_launcher_factory(launch_calls),
+            coordinator_root=coordinator_root,
+        )
+        job_id = first["job_id"]
+        stale_job = registry.get_job(job_id)
+        assert isinstance(stale_job.get("workflow_builder_job_id"), str)
+        registry.update_headless_result(job_id, status="exited", exit_code=0)
+        _bind_valid_verification_evidence(
+            registry, job_id=job_id, coordinator_root=coordinator_root
+        )
+        assert len(launch_calls) == 1
+
+        # 模擬 operator 對同一顆 candidate 執行合法的 retry-build 重跑：
+        # 多一顆 exited/exit_code==0 的 builder job，subject_head 仍是同一
+        # 個 candidate（HEAD 不變），但 job_id／worktree 都是新的——
+        # `builder_jobs[-1]` 因此換人，即使 executor/model 都沒變。
+        retried_builder = registry.create_job(
+            task="wf-subagent-build-retry",
+            persona="builder",
+            branch=f"feature/{WORK_ID}",
+            pane="",
+            worktree=str(tmp_path / "workspace-retry-build"),
+            dispatch_head="b" * 40,
+            subject_head=candidate,
+            executor="codex",
+            model_id="gpt-primary",
+            independence_domain=BUILDER_DOMAIN,
+            workflow_run_id=run.run_id,
+            workflow_claim_key=run.claim_key,
+            workflow_repo=run.repo,
+            workflow_card="subagent-build",
+            workflow_phase="build",
+            source_revision=run.source_revision,
+        )
+        registry.update_headless_result(
+            retried_builder["job_id"], status="exited", exit_code=0
+        )
+
+        second = manager.resume_workflow_run(
+            dispatcher,
+            run_id=run.run_id,
+            identities=identities,
+            launcher_factory=_launcher_factory(launch_calls),
+            coordinator_root=coordinator_root,
+        )
+
+        assert len(launch_calls) == 2, (
+            "retry-build 換了 builder job 之後，verify 卡必須視為 stale、"
+            "強制新 attempt，不能沿用重跑前綁定舊 builder job 的 evidence"
+        )
+        jobs = [
+            job for job in registry.list_jobs() if job.get("workflow_card") == "verification"
+        ]
+        assert len(jobs) == 2
+        assert jobs[-1]["job_id"] != stale_job["job_id"]
+        assert jobs[-1]["workflow_builder_job_id"] == str(retried_builder["job_id"])
+
+        persisted = registry.get_workflow_run(run.run_id)
+        receipts = persisted.stage_reuse_receipts or {}
+        assert receipts["verification"]["decision"] == "fresh"
+        assert second["reason"] == "in-flight"
+
+    def test_new_operator_adjudication_between_attempts_invalidates_verify_reuse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#752／#814：run 級人裁紀錄在兩次 resume 之間新增一筆時，即使
+        candidate／builder job／executor／model 全部不變，verify 卡也必須
+        視為 stale——它會改變下一次派工 prompt 的 adjudication_contract
+        區塊，不能沿用裁決落地前沒看過這筆裁決的 evidence。"""
+
+        _seed_auth_cache(monkeypatch)
+        registry, run, candidate = _build_verify_run(tmp_path)
+        dispatcher = _Dispatcher(registry)
+        coordinator_root = tmp_path / "coordinator"
+        identities = _identities()
+        launch_calls: list[str] = []
+
+        first = manager.resume_workflow_run(
+            dispatcher,
+            run_id=run.run_id,
+            identities=identities,
+            launcher_factory=_launcher_factory(launch_calls),
+            coordinator_root=coordinator_root,
+        )
+        job_id = first["job_id"]
+        stale_job = registry.get_job(job_id)
+        registry.update_headless_result(job_id, status="exited", exit_code=0)
+        _bind_valid_verification_evidence(
+            registry, job_id=job_id, coordinator_root=coordinator_root
+        )
+        assert len(launch_calls) == 1
+
+        # Operator 經 `retry-card --reason` 落一筆裁決（#752）；這裡直接
+        # 寫落地後的檔案，格式與 `manager._operator_adjudications()` 讀取
+        # 的一致（不重新實作那條寫入路徑）。
+        adjudication_dir = coordinator_root / "evidence" / "operator-adjudication"
+        adjudication_dir.mkdir(parents=True, exist_ok=True)
+        (adjudication_dir / f"{run.run_id}-adjudication-1.json").write_text(
+            json.dumps(
+                {
+                    "run_id": run.run_id,
+                    "actor": "operator",
+                    "card": "verification",
+                    "created_at": "2026-09-27T00:00:00+00:00",
+                    "reason": "design 與 todo 矛盾，以 design 為準。",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        second = manager.resume_workflow_run(
+            dispatcher,
+            run_id=run.run_id,
+            identities=identities,
+            launcher_factory=_launcher_factory(launch_calls),
+            coordinator_root=coordinator_root,
+        )
+
+        assert len(launch_calls) == 2, (
+            "新增 operator 裁決之後，verify 卡必須視為 stale、強制新"
+            "attempt，不能沿用裁決落地前的 evidence"
+        )
+        jobs = [
+            job for job in registry.list_jobs() if job.get("workflow_card") == "verification"
+        ]
+        assert len(jobs) == 2
+        assert jobs[-1]["job_id"] != stale_job["job_id"]
+
+        persisted = registry.get_workflow_run(run.run_id)
+        receipts = persisted.stage_reuse_receipts or {}
+        assert receipts["verification"]["decision"] == "fresh"
+        assert second["reason"] == "in-flight"
+
+
 class TestRetryCardBypassesStageReuse:
     """S09：明確 retry-card／force_new_card 要求新 attempt 時，不能被相同的
     stage_execution_key 意外吃掉。`force_new_card` 走 `_dispatch_workflow_card`
@@ -968,6 +1136,31 @@ class TestStageReuseReceiptsRollbackCompat:
     能失真的舊版驗證邏輯，證明：本分支寫出的 registry payload 給那份舊
     `WorkflowRun.from_dict()` 讀仍不會炸，且它自己的 `to_dict()` 輸出裡
     沒有新欄位。
+
+    對抗審查第二輪 BLOCKER（測試強度）：只驗過舊版 `WorkflowRun.from_dict()`
+    不夠——舊版 Monitor 的 canonical 讀取路徑
+    （`monitor/providers.py` 的 `_validate_canonical_coordinator_v2_root()`）
+    實際上是先把每個 row 餵給 `WorkflowRun.from_dict(row).to_dict()`（丟棄
+    未知頂層鍵），再拿那個結果去比對 row whitelist
+    （`_validate_workflow_v2_row()` 的 `_WORKFLOW_V2_REQUIRED_ROW_KEYS`／
+    `_WORKFLOW_V2_OPTIONAL_ROW_KEYS`）。只證明 `from_dict()` 不炸，沒證明
+    round-trip 之後的鍵集合真的落在那份 row whitelist 內——如果哪天
+    `WorkflowRun.to_dict()` 開始多吐一個舊 whitelist 沒列的欄位，
+    `from_dict()` 本身仍然不會炸，但舊版 Monitor 的 row whitelist 檢查會
+    fail closed，整份 workflow projection degraded，而上面那個既有測試完
+    全看不到。
+
+    修法：把 `monitor/providers.py` 那份舊原始碼**只用 `ast` 靜態解析**
+    （不 import／不 exec——它的 import 鏈遠比 `workflow.py` 重，靜態解析
+    足夠回答這裡要問的兩個問題，沒有理由承擔 exec 整份舊 providers 模組
+    的風險或副作用），取出：
+    (1) `_WORKFLOW_V2_REQUIRED_ROW_KEYS`／`_WORKFLOW_V2_OPTIONAL_ROW_KEYS`
+        的字面值集合；
+    (2) 確認 `_validate_canonical_coordinator_v2_root()` 真的呼叫
+        `WorkflowRun.from_dict(...).to_dict()`（不是憑印象假設舊版走這條
+        路徑）。
+    再拿 (1) 對下面 `old_payload`（已經是 `WorkflowRun.from_dict().to_dict()`
+    的 round-trip 輸出）逐欄比對，斷言鍵集合完全落在舊白名單內。
     """
 
     @staticmethod
@@ -1001,6 +1194,82 @@ class TestStageReuseReceiptsRollbackCompat:
             sys.modules.pop(module_name, None)
             raise
         return module
+
+    @staticmethod
+    def _refine_wave_2_source_text(relative_path: str) -> str:
+        """取回 `feature/refine-wave-2` 某檔案的原始碼純文字，只供 `ast`
+        靜態解析——刻意不 exec／不 import（見類別 docstring 的修法說明）。
+        """
+
+        repo_root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            ["git", "show", f"feature/refine-wave-2:{relative_path}"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout
+
+    @staticmethod
+    def _frozenset_string_literal(tree: ast.Module, name: str) -> frozenset[str]:
+        """從模組層級 ``<name> = frozenset({...純字串字面值...})`` 指派中
+        取出字串集合。指派形狀不符、或任何元素不是字串字面值，都直接視為
+        抓不到白名單、讓測試失敗（fail-closed，不臆測一個可能失真的值）。
+        """
+
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == name
+            ):
+                continue
+            call = node.value
+            assert (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "frozenset"
+                and len(call.args) == 1
+                and isinstance(call.args[0], ast.Set)
+            ), f"{name} 不是預期的 frozenset({{...}}) 字面值指派"
+            values: set[str] = set()
+            for element in call.args[0].elts:
+                assert isinstance(element, ast.Constant) and isinstance(
+                    element.value, str
+                ), f"{name} 含非字串字面值元素"
+                values.add(element.value)
+            return frozenset(values)
+        raise AssertionError(f"舊版 providers.py 找不到 {name} 的頂層指派")
+
+    @staticmethod
+    def _function_chains_workflow_run_from_dict_to_dict(
+        tree: ast.Module, func_name: str
+    ) -> bool:
+        """靜態檢查 ``func_name`` 函式主體內是否有
+        ``WorkflowRun.from_dict(...).to_dict()`` 這條呼叫鏈——不執行程式
+        碼，只在 AST 裡找 `Attribute(attr="to_dict")` 掛在
+        `Attribute(attr="from_dict", value=Name(id="WorkflowRun"))` 呼叫
+        結果上的那個 `Call` 節點。
+        """
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == func_name:
+                for inner in ast.walk(node):
+                    if (
+                        isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == "to_dict"
+                        and isinstance(inner.func.value, ast.Call)
+                        and isinstance(inner.func.value.func, ast.Attribute)
+                        and inner.func.value.func.attr == "from_dict"
+                        and isinstance(inner.func.value.func.value, ast.Name)
+                        and inner.func.value.func.value.id == "WorkflowRun"
+                    ):
+                        return True
+                return False
+        raise AssertionError(f"舊版 providers.py 找不到函式 {func_name}")
 
     def test_old_workflow_run_from_dict_tolerates_new_field_and_omits_it(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1054,6 +1323,42 @@ class TestStageReuseReceiptsRollbackCompat:
         # 缺席時維持 None（S10 的另一面）。
         new_run_from_old_payload = WorkflowRun.from_dict(old_payload)
         assert new_run_from_old_payload.stage_reuse_receipts is None
+
+        # BLOCKER 修法：上面只證明了 old_module.WorkflowRun.from_dict()
+        # 不會炸；這裡把 `old_payload`（那個 from_dict().to_dict() 的
+        # round-trip 輸出）拿去對舊版 Monitor **真正的** row whitelist 比
+        # 對，並確認舊版 canonical 路徑真的是先 from_dict()→to_dict() 再
+        # 比對——兩者合起來，才是完整證明「新頂層鍵不會讓舊版 Monitor 的
+        # row whitelist 檢查 fail closed」。
+        providers_source = self._refine_wave_2_source_text(
+            "paulsha_cortex/monitor/providers.py"
+        )
+        providers_tree = ast.parse(providers_source)
+        assert self._function_chains_workflow_run_from_dict_to_dict(
+            providers_tree, "_validate_canonical_coordinator_v2_root"
+        ), (
+            "舊版 canonical 路徑必須真的走 WorkflowRun.from_dict(...)."
+            "to_dict()，否則上面的 round-trip 沒有代表性"
+        )
+        required_row_keys = self._frozenset_string_literal(
+            providers_tree, "_WORKFLOW_V2_REQUIRED_ROW_KEYS"
+        )
+        optional_row_keys = self._frozenset_string_literal(
+            providers_tree, "_WORKFLOW_V2_OPTIONAL_ROW_KEYS"
+        )
+        # 白名單本身不可能是空集合——真的抓到字面值才有意義，抓錯（例如
+        # AST 節點找錯函式、正規表示式/字面值格式改了）不該被空集合悄悄
+        # 掩蓋成一個恆真的 subset 斷言。
+        assert required_row_keys
+        assert optional_row_keys
+        unsupported_keys = set(old_payload) - required_row_keys - optional_row_keys
+        assert unsupported_keys == set(), (
+            "舊版 Monitor 的 row whitelist（_validate_workflow_v2_row）會"
+            f"拒絕這些鍵：{sorted(unsupported_keys)}"
+        )
+        assert required_row_keys.issubset(old_payload), (
+            "舊版 Monitor row whitelist 要求的必要欄位缺席"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

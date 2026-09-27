@@ -194,7 +194,36 @@ def slice_repin_eligible(slice_row: dict[str, Any]) -> bool:
 #   profile_key 涵蓋範圍內，見 execution_profile.py 的 conditions／metadata
 #   欄位切分），補上舊 key schema 缺的「完整原生 effort/adapter/config
 #   compatibility 描述」。
-STAGE_EXECUTION_KEY_SCHEMA_VERSION = 2
+#
+# #844 對抗審查第二輪 MAJOR-1：schema v2 涵蓋的欄位仍漏了 verify／review
+# 卡 prompt（`manager._workflow_job_prompt()`）實際吃進、且**可能在同一
+# candidate 下改變**的三項輸入——`retry-build` 合法重跑（HEAD 不變，見
+# `_verify_build_candidate_transition()`）就會讓它們變而 candidate_sha 不
+# 變，若不納入雜湊，`resume_workflow_run()` 會誤判成「相容，可以沿用」：
+# - builder_job_id：verify／review 卡綁定的那個 builder job。同一顆
+#   candidate 可能對應到不同的 builder job（`retry-build` 重跑後
+#   `builder_jobs[-1]` 換人），prompt 裡的
+#   `[REVIEW JOB: ... / BUILDER JOB: <this>]` 綁定隨之改變。
+# - manager_gate_ledger_digest：verify 卡專用，Manager 自己重跑、綁定目前
+#   candidate 的 build gate ledger 內容摘要（`terminal_contract.
+#   gate_ledger_digest()`）。`retry-build` 重跑通常會產生內容不同的新
+#   ledger，即使結論（passed/failed）不變。
+# - operator_adjudications_digest：run 級人裁紀錄（#752／#814）的內容摘
+#   要，任何時候新增一筆都會改變之後每一次派工的 prompt（不限這張卡）。
+# 三者由 `manager._workflow_stage_execution_context()` 正規化成非空字串
+# （缺席時另有固定字面值，見該函式），本模組只負責把它們當一般字串欄位
+# 納入雜湊／逐欄比對——因此給預設值 ``"n/a"``，維持 #214 既有的 build-phase
+# 泛用呼叫（`compute_stage_execution_key()` 本身不是 verify/review 專屬
+# API）在不知道這三項輸入時仍可用同一個預設字面值算出確定性的 key，不因
+# 這次擴充而被迫改寫呼叫點。
+STAGE_EXECUTION_KEY_SCHEMA_VERSION = 3
+
+#: #844 對抗審查第二輪 MAJOR-1：呼叫端未提供 builder_job_id／
+#: manager_gate_ledger_digest／operator_adjudications_digest 時的固定字面值
+#: （#214 既有的泛用 build-phase 呼叫點沿用此值，行為在它們眼中不變；
+#: verify/review 的受信 producer 一律會傳入真正計算出的值，不會落到這個
+#: 分支）。
+STAGE_EXECUTION_KEY_UNSPECIFIED_INPUT = "n/a"
 
 STAGE_EXECUTION_KEY_STRING_FIELDS = (
     "repo",
@@ -210,6 +239,9 @@ STAGE_EXECUTION_KEY_STRING_FIELDS = (
     "action",
     "test_policy",
     "execution_profile_key",
+    "builder_job_id",
+    "manager_gate_ledger_digest",
+    "operator_adjudications_digest",
 )
 
 #: `stage_execution_receipt()` 逐欄快照與 `describe_stage_execution_mismatch()`
@@ -237,15 +269,25 @@ def compute_stage_execution_key(
     action: str,
     test_policy: str,
     execution_profile_key: str,
+    builder_job_id: str = STAGE_EXECUTION_KEY_UNSPECIFIED_INPUT,
+    manager_gate_ledger_digest: str = STAGE_EXECUTION_KEY_UNSPECIFIED_INPUT,
+    operator_adjudications_digest: str = STAGE_EXECUTION_KEY_UNSPECIFIED_INPUT,
 ) -> str:
     """把 stage 執行的內容定址欄位收斂成單一雜湊 key（建立在既有 phase 級
     checkpoint／claim key 之上，只是把顆粒度從 phase 降到 stage）。
 
     涵蓋 repo/work_id/run_id/claim_key/card/phase/executor/model/base_sha/
     candidate_sha/frozen_input_hashes/action/test_policy/
-    execution_profile_key；任一欄位變更都會產生不同的 64-hex key，讓
-    authority／candidate／model／execution profile 任一變更即精準
-    invalidate 既有 reuse 判定，不需要額外的比對邏輯。
+    execution_profile_key/builder_job_id/manager_gate_ledger_digest/
+    operator_adjudications_digest；任一欄位變更都會產生不同的 64-hex key，
+    讓 authority／candidate／model／execution profile／verify-review 卡
+    prompt 實際依賴的 builder job／gate ledger／operator 裁決任一變更即
+    精準 invalidate 既有 reuse 判定，不需要額外的比對邏輯。
+
+    後三個欄位（#844 對抗審查第二輪 MAJOR-1）皆有預設值：只有 verify／
+    review 卡的受信 producer（`manager._workflow_stage_execution_context()`）
+    才會傳入真正算出的值；#214 既有的其他呼叫點（例如泛用 build-phase
+    reuse）不知道這三項輸入，沿用固定字面值即可，行為不受影響。
     """
     values = {
         "repo": repo,
@@ -261,6 +303,9 @@ def compute_stage_execution_key(
         "action": action,
         "test_policy": test_policy,
         "execution_profile_key": execution_profile_key,
+        "builder_job_id": builder_job_id,
+        "manager_gate_ledger_digest": manager_gate_ledger_digest,
+        "operator_adjudications_digest": operator_adjudications_digest,
     }
     for field_name in STAGE_EXECUTION_KEY_STRING_FIELDS:
         value = values[field_name]
@@ -292,6 +337,9 @@ def stage_execution_receipt(
     action: str,
     test_policy: str,
     execution_profile_key: str,
+    builder_job_id: str = STAGE_EXECUTION_KEY_UNSPECIFIED_INPUT,
+    manager_gate_ledger_digest: str = STAGE_EXECUTION_KEY_UNSPECIFIED_INPUT,
+    operator_adjudications_digest: str = STAGE_EXECUTION_KEY_UNSPECIFIED_INPUT,
 ) -> dict[str, Any]:
     """#844：與 `compute_stage_execution_key()` 完全對齊的逐欄快照＋key。
 
@@ -300,6 +348,10 @@ def stage_execution_receipt(
     逐欄比對，把拒絕原因具體到欄位名稱，而不是只回一個雜湊不同（S03／S04）。
     正常 producer（`manager._dispatch_workflow_card`）建立 job 時呼叫本函式
     產生受信 receipt，不接受任意 caller 自行拼裝。
+
+    ``builder_job_id``／``manager_gate_ledger_digest``／
+    ``operator_adjudications_digest``：#844 對抗審查第二輪 MAJOR-1 新增，
+    語意與預設值見 `compute_stage_execution_key()`。
     """
     key = compute_stage_execution_key(
         repo=repo,
@@ -316,6 +368,9 @@ def stage_execution_receipt(
         action=action,
         test_policy=test_policy,
         execution_profile_key=execution_profile_key,
+        builder_job_id=builder_job_id,
+        manager_gate_ledger_digest=manager_gate_ledger_digest,
+        operator_adjudications_digest=operator_adjudications_digest,
     )
     return {
         "schema_version": STAGE_EXECUTION_KEY_SCHEMA_VERSION,
@@ -333,6 +388,9 @@ def stage_execution_receipt(
         "action": action,
         "test_policy": test_policy,
         "execution_profile_key": execution_profile_key,
+        "builder_job_id": builder_job_id,
+        "manager_gate_ledger_digest": manager_gate_ledger_digest,
+        "operator_adjudications_digest": operator_adjudications_digest,
         "key": key,
     }
 

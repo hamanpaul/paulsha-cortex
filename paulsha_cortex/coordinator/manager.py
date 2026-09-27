@@ -12998,12 +12998,67 @@ STAGE_EXECUTION_REUSE_SUPPORTED_PHASES = frozenset({"verify", "review"})
 _WORKFLOW_STAGE_EXECUTION_ACTION = "workflow-dispatch"
 
 
+def _workflow_stage_execution_builder_context(
+    run, step, registry
+) -> tuple[list[dict[str, object]], str | None, dict[str, object] | None]:
+    """#844 對抗審查第二輪 MAJOR-1：`builder_job_id`／`manager_gate_ledger`
+    的單一推導點，`_dispatch_workflow_card`（正式派工）與
+    `_workflow_stage_reuse_probe`（相容性複核）共用同一條邏輯——兩處各自
+    重寫一份等價篩選條件，遲早會語意漂移（其中一處改了篩選條件，另一處
+    忘了跟著改），讓 stage_execution_key 的計算與實際會組出的 prompt 不
+    同步，等於重現本票要修的那個 bug。
+
+    回傳 ``(builder_jobs, builder_job_id, manager_gate_ledger)``：
+    ``builder_jobs`` 是本 run 目前綁定 candidate 的完整 builder job 列表
+    （`_dispatch_workflow_card` 後續還要拿它推 branch／base 等，不是只有
+    這裡用），``builder_job_id`` 是其中最新一筆的 job_id（沒有則 None），
+    ``manager_gate_ledger`` 只在 ``step.phase == "verify"`` 且找得到對應
+    build 卡的 gate ledger 時才非 None。
+    """
+
+    builder_jobs = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and (
+            job.get("persona") == "builder"
+            or (
+                job.get("persona") == "manager"
+                and job.get("workflow_phase") == "ship"
+                and job.get("workflow_card") == "openspec-archive"
+            )
+        )
+        and job.get("status") == "exited"
+        and job.get("exit_code") == 0
+        and (
+            run.candidate_head is None
+            or job.get("subject_head") == run.candidate_head
+        )
+    ]
+    builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
+    manager_gate_ledger = None
+    if step.phase == "verify":
+        candidate_build_jobs = [
+            job
+            for job in builder_jobs
+            if job.get("persona") == "builder" and job.get("workflow_phase") == "build"
+        ]
+        if candidate_build_jobs:
+            manager_gate_ledger = _verification_gate_ledger_context(
+                run, candidate_build_jobs[-1]
+            )
+    return builder_jobs, builder_job_id, manager_gate_ledger
+
+
 def _workflow_stage_execution_context(
     *,
     run,
     step,
     identity,
     profile_binding,
+    builder_job_id: str | None,
+    manager_gate_ledger: Mapping[str, object] | None,
+    operator_adjudications: Sequence[Mapping[str, object]] | None,
 ) -> dict[str, object] | None:
     """#844：verify／review 卡的受信 stage-execution 逐欄快照（S02）。
 
@@ -13013,6 +13068,30 @@ def _workflow_stage_execution_context(
     不接受任何 caller 自行拼裝的 key。build 卡或未解析出 profile binding
     （persona=="manager" 的 deterministic 卡）不在安全 cohort，回 None——
     呼叫端據此維持 #844 之前的行為，不強行補一個假 key。
+
+    ``builder_job_id``／``manager_gate_ledger``／``operator_adjudications``
+    （對抗審查第二輪 MAJOR-1）：這三項**不是**「順手多納入幾個欄位」，而是
+    `_workflow_job_prompt()` 實際組進 verify／review 卡 contract 的可變輸
+    入——`retry-build` 合法重跑（HEAD 不變，見
+    `_verify_build_candidate_transition()`）就會讓它們變而 candidate_sha
+    不變：
+    - ``builder_job_id``：contract 裡的 ``builder_job_id`` 欄位（prompt
+      banner ``[REVIEW JOB: ... / BUILDER JOB: <this>]`` 的綁定來源）。
+      `retry-build` 重跑會換一顆新的 builder job，即使產出的 candidate SHA
+      不變，`builder_jobs[-1]` 也已經換人。
+    - ``manager_gate_ledger``：僅 verify 卡吃，contract 裡的
+      ``manager_gate_ledger`` 欄位（Manager 自己重跑、綁定 candidate 的
+      build gate ledger）。`retry-build` 重跑通常會產生內容不同的新
+      ledger，即使結論（passed/failed）不變（`terminal_contract.
+      gate_ledger_digest()` 幾乎必然不同——ledger 內含 worktree 探測時的
+      實際狀態，不是純函式）。
+    - ``operator_adjudications``：contract 裡的 ``operator_adjudications``
+      欄位（#752／#814 的 run 級人裁紀錄）。任何時候新增一筆都會改變之後
+      每一次派工的 prompt（不限這張卡），與 candidate／builder job 是否
+      變動無關。
+    呼叫端必須傳入與**同一次**會組出的 prompt 完全相同的值（不得各自重新
+    計算一份可能不同步的複本）——見 `_dispatch_workflow_card()` 對這三個
+    參數的計算時機。
     """
 
     if step.phase not in STAGE_EXECUTION_REUSE_SUPPORTED_PHASES or profile_binding is None:
@@ -13030,6 +13109,21 @@ def _workflow_stage_execution_context(
     frozen_input_hashes = tuple(
         sorted(f"{item.ref}:{item.baseline_sha256}" for item in run.planning_authority)
     )
+    # 正規化成非空字串：`compute_stage_execution_key()` 要求
+    # `STAGE_EXECUTION_KEY_STRING_FIELDS` 一律非空字串，缺席（None／空
+    # dict／空 list）在這裡就要有個固定、可重現的表示，而不是讓呼叫端各自
+    # 決定怎麼補。字典／清單一律連同其內容一起雜湊，而不是只取某個子欄位
+    # （例如 ledger 的 sha256）——這樣任何一個子欄位改變（即使不影響那個
+    # sha256）都會被抓到，比只信任單一子欄位更嚴格、也更不會漏。
+    normalized_builder_job_id = (
+        builder_job_id if isinstance(builder_job_id, str) and builder_job_id else "absent"
+    )
+    manager_gate_ledger_digest = verification.canonical_json_hash(
+        dict(manager_gate_ledger) if isinstance(manager_gate_ledger, Mapping) else None
+    )
+    operator_adjudications_digest = verification.canonical_json_hash(
+        [dict(row) for row in operator_adjudications] if operator_adjudications else None
+    )
     return stage_execution_receipt(
         repo=run.repo,
         work_id=run.work_id,
@@ -13045,6 +13139,9 @@ def _workflow_stage_execution_context(
         action=_WORKFLOW_STAGE_EXECUTION_ACTION,
         test_policy=step.test_policy or "none",
         execution_profile_key=profile_binding.resolved_key,
+        builder_job_id=normalized_builder_job_id,
+        manager_gate_ledger_digest=manager_gate_ledger_digest,
+        operator_adjudications_digest=operator_adjudications_digest,
     )
 
 
@@ -13137,11 +13234,25 @@ def _workflow_stage_reuse_probe(
             launcher,
             qualification_policy=getattr(identities, "qualification_policy", "disabled"),
         )
+        # 對抗審查第二輪 MAJOR-1：重算「現在」的 builder_job_id／
+        # manager_gate_ledger／operator_adjudications——與
+        # `_dispatch_workflow_card` 若真的要派新卡會組出的 prompt 完全同源
+        # （共用 `_workflow_stage_execution_builder_context`／
+        # `_operator_adjudications`），才能讓下面的 key 比對真正反映
+        # retry-build 換 builder job、gate ledger 內容變、新增 operator
+        # 裁決這些「candidate 不變但 prompt 變了」的狀況。
+        _builder_jobs, builder_job_id, manager_gate_ledger = (
+            _workflow_stage_execution_builder_context(run, step, registry)
+        )
+        operator_adjudications = _operator_adjudications(run, coordinator_root)
         context = _workflow_stage_execution_context(
             run=run,
             step=step,
             identity=identity,
             profile_binding=profile_binding,
+            builder_job_id=builder_job_id,
+            manager_gate_ledger=manager_gate_ledger,
+            operator_adjudications=operator_adjudications,
         )
     except Exception:  # noqa: BLE001 - probe 本身的例外不當作新拒絕面，但
         # 帶 key 的 job 不可因此回 "legacy"（S10 只保留給真正無 key 的
@@ -13663,49 +13774,35 @@ def _dispatch_workflow_card(
         identities,
         execution_profile_binding=profile_binding,
     )
+    builder_jobs, builder_job_id, verification_gate_ledger = (
+        _workflow_stage_execution_builder_context(run, step, registry)
+    )
+    if step.persona == "reviewer" and builder_job_id is None:
+        raise ValueError("workflow reviewer builder job unavailable")
+    # #752／#814／#844：run 級 operator 裁決紀錄。下面 `_workflow_job_prompt`
+    # 呼叫會再獨立呼叫一次 `_operator_adjudications()`（歷史既有寫法，
+    # `test_adjudication_scope_757.py` 逐字釘住那個呼叫樣式）——這裡先算一
+    # 次只為了餵給 stage_execution_key／receipt；append-only 的裁決檔案與
+    # 兩次呼叫之間沒有讓步點，實務上兩次讀到的必為同一份列表。
+    operator_adjudications = _operator_adjudications(run, coordinator_root)
     # #844 S02：正常 producer 在此計算受信 stage_execution_key／receipt（沿
-    # 用剛解析出的 identity／#835 profile binding，不接受任何 caller 自行
-    # 拼裝的 key）。verify／review 以外的卡（build／planner／manager）回
-    # None，`registry.create_job()` 原樣寫 None，行為與 #844 之前完全相同。
+    # 用剛解析出的 identity／#835 profile binding，以及緊接在上面算出的
+    # builder_job_id／manager_gate_ledger／operator_adjudications，三者皆是
+    # `_workflow_job_prompt()` 實際會組進 verify／review 卡 contract 的可
+    # 變輸入——對抗審查第二輪 MAJOR-1：這裡的計算時機必須排在它們之後，
+    # 否則納入的仍是這張卡「還沒解出 builder_job_id 之前」的舊快照，等於
+    # 沒修。不接受任何 caller 自行拼裝的 key。verify／review 以外的卡
+    # （build／planner／manager）回 None，`registry.create_job()` 原樣寫
+    # None，行為與 #844 之前完全相同。
     stage_execution_context = _workflow_stage_execution_context(
         run=run,
         step=step,
         identity=identity,
         profile_binding=profile_binding,
+        builder_job_id=builder_job_id,
+        manager_gate_ledger=verification_gate_ledger,
+        operator_adjudications=operator_adjudications,
     )
-    builder_jobs = [
-        job
-        for job in registry.list_jobs()
-        if job.get("workflow_run_id") == run.run_id
-        and (
-            job.get("persona") == "builder"
-            or (
-                job.get("persona") == "manager"
-                and job.get("workflow_phase") == "ship"
-                and job.get("workflow_card") == "openspec-archive"
-            )
-        )
-        and job.get("status") == "exited"
-        and job.get("exit_code") == 0
-        and (
-            run.candidate_head is None
-            or job.get("subject_head") == run.candidate_head
-        )
-    ]
-    builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
-    verification_gate_ledger = None
-    if step.phase == "verify":
-        candidate_build_jobs = [
-            job
-            for job in builder_jobs
-            if job.get("persona") == "builder" and job.get("workflow_phase") == "build"
-        ]
-        if candidate_build_jobs:
-            verification_gate_ledger = _verification_gate_ledger_context(
-                run, candidate_build_jobs[-1]
-            )
-    if step.persona == "reviewer" and builder_job_id is None:
-        raise ValueError("workflow reviewer builder job unavailable")
     task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
     # #648：job_id 必須在 **provision 之前**就定案——per-job 工作區的目錄名就是
     # `job_workspace.job_segment(job_id)`，而 `launcher.launch(slice_id=job_id)`
@@ -14062,6 +14159,11 @@ def _dispatch_workflow_card(
                     else None
                 ),
             ),
+            # #757／#844：與上面算 stage_execution_key 用的那次呼叫各自獨立
+            # 重新讀一次（歷史既有寫法，`test_adjudication_scope_757.py`／
+            # `test_adjudication_builder_prompt_814.py` 逐字釘住這個呼叫
+            # 樣式）；operator adjudication 檔案是 append-only、且兩次呼叫
+            # 之間沒有任何 I/O 或讓步點，實務上必為同一份列表。
             operator_adjudications=_operator_adjudications(run, coordinator_root),
         )
         if task_memory_dispatch is not None:
