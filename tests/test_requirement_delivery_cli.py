@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -285,7 +286,9 @@ def _cli_qualification_payload(*, candidate_sha: str, wheel_sha256: str) -> dict
     }
 
 
-def _cli_write_live_receipt(root: Path, *, target: dict, kind: str, evidence: dict) -> dict:
+def _cli_write_live_receipt(
+    root: Path, *, target: dict, kind: str, evidence: dict, canary_target: dict | None = None
+) -> dict:
     payload = {
         "schema": "cortex/live-canary-receipt/v1",
         "result": "passed",
@@ -299,9 +302,221 @@ def _cli_write_live_receipt(root: Path, *, target: dict, kind: str, evidence: di
         "kind": kind,
         "evidence": evidence,
     }
+    if canary_target is not None:
+        # #845 對抗審查 BLOCKER：deployment-canary receipt 額外帶入外部 canary
+        # 身分與 evidence 目錄 locator，見 `live_receipt_validators.
+        # make_governed_live_receipt_validator`。
+        payload["canary_target"] = canary_target
     path = root / "live-cli-R01.json"
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     return {"locator": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _cli_copy_qualification_module(source_root: Path) -> None:
+    """把真正的 `qualification/validate.py` 複製進 CLI `--source-root`（模擬
+    Manager 實際 checkout），證明 production validator 改走動態載入後，`cortex
+    delivery gaps` 這條 CLI 入口仍能吃到真檔。"""
+    real_module = Path(__file__).resolve().parents[1] / "qualification" / "validate.py"
+    target_dir = source_root / "qualification"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(real_module, target_dir / "validate.py")
+
+
+def _cli_full_canary_qualification(
+    evidence_base: Path, *, candidate_sha: str, wheel_sha256: str, repository: str
+) -> dict:
+    """CLI E2E 版本的完整 deployment-canary evidence tree 建構；邏輯與
+    `test_requirement_delivery.py` 的 `_full_canary_qualification` 相同（各自
+    獨立維護，兩個測試檔本來就各自複製 qualification payload fixture），確保
+    `cortex delivery gaps` 這條 production CLI 入口也真的走過 `evidence_root`
+    逐檔核對，不是只驗證 unit-level 呼叫。"""
+    providers = [
+        {
+            "provider": name,
+            "requested_model": model,
+            "runtime_model": model,
+            "requested_effort": effort,
+            "runtime_effort": effort,
+            "status": "passed",
+            "quota": "available",
+            "fallback": False,
+        }
+        for name, (model, effort) in REQUIRED_PROVIDERS.items()
+    ]
+    work_id = "canary-dispatch-1"
+    issue = 845
+    payload = {
+        "schema_version": 2,
+        "profile": "deployment-canary",
+        "status": "passed",
+        "candidate_sha": candidate_sha,
+        "wheel": {"filename": "paulsha_cortex-1.0.0-py3-none-any.whl", "sha256": wheel_sha256},
+        "bundle": {"sha256": "c" * 64},
+        "image": {"digest": "sha256:" + "d" * 64},
+        "services": [
+            {"name": "cortex-egress-proxy.service", "uid": 950, "gid": 950, "active": True},
+            {"name": "cortex-manager.service", "uid": 991, "gid": 991, "active": True},
+            {"name": "cortex-monitor.service", "uid": 991, "gid": 991, "active": True},
+        ],
+        "providers": providers,
+        "tests": [
+            {"name": name, "status": "passed"}
+            for name in (
+                "fresh-install", "idempotent-apply", "drift-detection", "rollback",
+                "reinstall", "selfcheck", "registry-equation",
+                "generated-installed-attestation", "service-identity-hardening",
+                "capability-attack-matrix", "durable-state-attack-matrix",
+                "enforcement-plane-attack-matrix", "process-attack-matrix",
+                "gate-attack-matrix", "negative-controls",
+                "provider-capability-smoke", "full-dispatch-closeout",
+                "manager-github-dry-run-push",
+            )
+        ],
+        "artifacts": [],
+    }
+    attestation = {"ok": True, "failures": [], "warnings": []}
+    installed = {
+        "schema_version": 1,
+        "result": "pass",
+        "candidate": {"wheel_sha256": wheel_sha256, "bundle_sha256": "c" * 64},
+        "attestation": attestation,
+        "artifact_hashes": {"units/cortex-manager.service": "1" * 64},
+        "service_identities": {"cortex-manager.service": {"user": "cortex-manager"}},
+    }
+    generated = {
+        "schema_version": 1,
+        "ok": True,
+        "attestation": attestation,
+        "artifact_hashes": installed["artifact_hashes"],
+        "service_identities": installed["service_identities"],
+    }
+    cases = []
+    required_cases = {
+        "capability": ("T1.1", "T1.2", "T1.3", "T1.4"),
+        "enforcement-plane": tuple(f"T3.{index}" for index in range(1, 11)),
+        "process": ("T4.1", "T4.2", "T4.3", "T4.4"),
+        "gate": tuple(f"T5.{index}" for index in range(1, 11)),
+    }
+    for family, case_ids in required_cases.items():
+        for case_id in case_ids:
+            cases.append({"family": family, "case": f"{case_id}-probe", "principal": "probe", "status": "passed", "returncode": 1})
+    for operation in ("modify", "truncate", "delete", "replace", "symlink-swap", "rollback"):
+        for principal in ("cortex-builder", "cortex-reviewer-planner"):
+            cases.append({
+                "family": "durable-state",
+                "case": f"jobs-registry:{operation}",
+                "principal": principal,
+                "status": "passed",
+                "returncode": 13,
+            })
+    attack = {
+        "schema_version": 1,
+        "status": "passed",
+        "families": ["capability", "durable-state", "enforcement-plane", "process", "gate"],
+        "cases": cases,
+        "negative_controls": [
+            {"family": family, "case": f"{family}-control", "principal": "trusted", "status": "passed", "returncode": 0}
+            for family in ("capability", "durable-state", "enforcement-plane", "process", "gate")
+        ],
+        "authorized_mutations": [],
+        "deny_only_assets": [],
+        "covered_assets": 1,
+        "registry_asset_ids": ["jobs-registry"],
+    }
+    provider_evidence = {
+        "schema_version": 1,
+        "providers": {
+            row["provider"]: {
+                "preflight": {
+                    "returncode": 0,
+                    "status": "ready",
+                    "authenticated": True,
+                    "quota": row["quota"],
+                    "fallback": row["fallback"],
+                    "skipped": False,
+                },
+                "returncode": 0,
+                "models": [row["runtime_model"]],
+                "efforts": [row["runtime_effort"]],
+                "native_metadata": True,
+                "response_token": True,
+            }
+            for row in providers
+        },
+    }
+    dispatch = {
+        "schema_version": 1,
+        "status": "passed",
+        "repository": repository,
+        "work_id": work_id,
+        "issue": issue,
+        "release_candidate_sha": candidate_sha,
+        "workflow_candidate_sha": "f" * 40,
+        "terminal": {"state": "done", "work_id": work_id, "run_id": "workflow-qualification"},
+        "required_markers": sorted({
+            "agent-loop-command", "candidate", "bundle", "verdict", "ledger", "evidence", "completion",
+        }),
+        "agent_loop_probe": {
+            "schema_version": 1,
+            "executor": "codex",
+            "model_id": "gpt-5.3-codex-spark",
+            "card_id": "worktree-isolation",
+            "builder_job_ids": ["build-job"],
+            "successful_command_count": 1,
+            "all_outputs_nonempty": True,
+            "command_sha256": "5" * 64,
+            "output_sha256": "6" * 64,
+            "log_sha256": "7" * 64,
+            "thread_sha256": "8" * 64,
+            "runtime_model": "gpt-5.3-codex-spark",
+            "runtime_effort": "xhigh",
+            "model_provider": "openai",
+            "probe_candidate_sha": "9" * 40,
+        },
+        "artifacts": [
+            {"path": "coordinator/jobs.json", "sha256": "2" * 64},
+            {"path": "coordinator/commit-spool/build-logs/build-job/job.jsonl", "sha256": "7" * 64},
+        ],
+    }
+    dispatch["agent_loop_probe"]["artifact_set_sha256"] = hashlib.sha256(
+        (json.dumps(dispatch["artifacts"], sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    github = {
+        "schema_version": 1,
+        "status": "passed",
+        "repository": repository,
+        "authenticated": True,
+        "dry_run": True,
+        "remote_refs_unchanged": True,
+        "before_sha256": "3" * 64,
+        "after_sha256": "3" * 64,
+    }
+    evidence_dir = evidence_base / "evidence"
+    documents = {
+        "install-verification.json": installed,
+        "generated-installed-attestation.json": generated,
+        "attack-matrix.json": attack,
+        "provider-capabilities.json": provider_evidence,
+        "dispatch-closeout.json": dispatch,
+        "manager-github-auth.json": github,
+    }
+    for name, value in documents.items():
+        path = evidence_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    inventory_rows = [
+        {"path": f"evidence/{name}", "sha256": hashlib.sha256((evidence_dir / name).read_bytes()).hexdigest()}
+        for name in sorted(documents)
+    ]
+    inventory_path = evidence_dir / "artifact-inventory.json"
+    inventory_path.write_text(
+        json.dumps({"schema_version": 1, "status": "passed", "artifacts": inventory_rows}, sort_keys=True),
+        encoding="utf-8",
+    )
+    payload["artifacts"] = inventory_rows + [
+        {"path": "evidence/artifact-inventory.json", "sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest()}
+    ]
+    return payload
 
 
 def _cli_snapshot(root: Path, *, target: dict, completion_ref: dict, live_ref: dict) -> dict:
@@ -362,15 +577,25 @@ class _CliGitHub:
         )
 
 
-def _prepare_cli_delivery_gate(monkeypatch, tmp_path: Path, *, kind: str, evidence: dict) -> dict:
+def _prepare_cli_delivery_gate(
+    monkeypatch, tmp_path: Path, *, kind: str, evidence: dict, canary_target: dict | None = None
+) -> dict:
     """把 `cortex delivery gaps` 唯一觸網／觸 loaded-runtime 的邊界換成固定 fixture，
     其餘一律走 production code path（manifest/snapshot 解析、CompletionRecord、
-    封閉登記表 live receipt validator）。回傳供 `delivery.main` 使用的 argv 片段。"""
+    封閉登記表 live receipt validator）。回傳供 `delivery.main` 使用的 argv 片段。
+
+    `--source-root` 與這裡的 tmp_path 相同，因此一律先放一份真正的
+    `qualification/validate.py` 進去（#845 對抗審查 MAJOR：production validator
+    改為動態從 `--source-root` 載入，不再依賴一般 import）；kind 不是
+    deployment-canary-qualification 時這份檔案就是多餘但無害。"""
+    _cli_copy_qualification_module(tmp_path)
     config_revision = _cli_config_revision()
     target = _cli_target(config_revision)
     authority = _cli_authority()
     completion_ref = _cli_write_completion(tmp_path, authority=authority)
-    live_ref = _cli_write_live_receipt(tmp_path, target=target, kind=kind, evidence=evidence)
+    live_ref = _cli_write_live_receipt(
+        tmp_path, target=target, kind=kind, evidence=evidence, canary_target=canary_target
+    )
     manifest = _cli_manifest(tmp_path)
     snapshot = _cli_snapshot(tmp_path, target=target, completion_ref=completion_ref, live_ref=live_ref)
     manifest_path = tmp_path / "manifest.json"
@@ -413,10 +638,28 @@ def _prepare_cli_delivery_gate(monkeypatch, tmp_path: Path, *, kind: str, eviden
 
 
 def test_delivery_gaps_cli_with_governed_qualification_receipt_reaches_ready(monkeypatch, tmp_path: Path, capsys) -> None:
+    """#845 對抗審查 BLOCKER／MAJOR GREEN：`cortex delivery gaps` 這條 production
+    CLI 入口，帶真正的 evidence 目錄、外部 canary 身分，且 `qualification/
+    validate.py` 由 `--source-root` 動態載入，才能到達 ready。"""
     target = _cli_target(_cli_config_revision())
-    evidence = _cli_qualification_payload(candidate_sha=target["candidate_sha"], wheel_sha256=target["artifact_sha256"])
+    evidence = _cli_full_canary_qualification(
+        tmp_path / "canary-evidence",
+        candidate_sha=target["candidate_sha"],
+        wheel_sha256=target["artifact_sha256"],
+        repository=target["repo"],
+    )
+    canary_target = {
+        "repository": target["repo"],
+        "work_id": "canary-dispatch-1",
+        "issue": 845,
+        "evidence_directory": "canary-evidence",
+    }
     paths_ = _prepare_cli_delivery_gate(
-        monkeypatch, tmp_path, kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION, evidence=evidence
+        monkeypatch,
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence=evidence,
+        canary_target=canary_target,
     )
     exit_code = delivery.main([
         "gaps",
@@ -429,6 +672,48 @@ def test_delivery_gaps_cli_with_governed_qualification_receipt_reaches_ready(mon
     assert exit_code == 0
     assert report["closure_readiness"] == "ready"
     assert report["mappings"][0]["evidence"]["live"]["status"] == "verified"
+
+
+def test_delivery_gaps_cli_with_governed_qualification_receipt_missing_source_root_module_is_rejected(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """#845 對抗審查 MAJOR：`--source-root` 沒有 `qualification/` 時（模擬已安裝
+    wheel 在 checkout 外執行），即使 evidence 完全合法，CLI 入口也必須 fail
+    closed，不能因為缺套件就放行。"""
+    target = _cli_target(_cli_config_revision())
+    evidence = _cli_full_canary_qualification(
+        tmp_path / "canary-evidence",
+        candidate_sha=target["candidate_sha"],
+        wheel_sha256=target["artifact_sha256"],
+        repository=target["repo"],
+    )
+    canary_target = {
+        "repository": target["repo"],
+        "work_id": "canary-dispatch-1",
+        "issue": 845,
+        "evidence_directory": "canary-evidence",
+    }
+    paths_ = _prepare_cli_delivery_gate(
+        monkeypatch,
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence=evidence,
+        canary_target=canary_target,
+    )
+    # `_prepare_cli_delivery_gate` 已放好 `qualification/validate.py`；這裡故意
+    # 移除，模擬已安裝 wheel 在 checkout 外執行的情境。
+    shutil.rmtree(tmp_path / "qualification")
+    exit_code = delivery.main([
+        "gaps",
+        "--manifest", str(paths_["manifest_path"]),
+        "--snapshot", str(paths_["snapshot_path"]),
+        "--source-root", str(tmp_path),
+        "--checkout", f"{_CLI_REPO}={tmp_path}",
+    ])
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
 
 
 def test_delivery_gaps_cli_with_unknown_live_receipt_kind_reports_gap(monkeypatch, tmp_path: Path, capsys) -> None:

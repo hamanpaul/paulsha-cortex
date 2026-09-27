@@ -152,8 +152,9 @@ def main(argv: Sequence[str]) -> int:
                 work_id=work_id,
             )
 
+        source_root = Path(args.source_root).expanduser().absolute()
         common = {
-            "source_root": Path(args.source_root).expanduser().absolute(),
+            "source_root": source_root,
             "evidence_root": coordinator_root,
             "coordinator_root": coordinator_root,
             "authority_loader": load_authority,
@@ -163,7 +164,12 @@ def main(argv: Sequence[str]) -> int:
             "now_epoch": time.time(),
             "runtime_state_resolver": _runtime_state_root,
             "runtime_status_resolver": _runtime_status_report,
-            "live_receipt_validator": live_receipt_validators.governed_live_receipt_validator,
+            # #845 對抗審查 MAJOR：改由工廠帶入 --source-root 動態載入
+            # `qualification/validate.py`，不再依賴一般 import 撞運氣命中
+            # repo 根目錄；已安裝的 wheel 在 checkout 外執行也能正確 fail closed。
+            "live_receipt_validator": live_receipt_validators.make_governed_live_receipt_validator(
+                source_root=source_root, evidence_root=coordinator_root
+            ),
         }
         if args.command == "gaps":
             _emit(requirement_delivery.inspect_delivery(manifest, snapshot, **common))

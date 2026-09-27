@@ -2,8 +2,8 @@
 
 `requirement_delivery._verify_live` 只把已通過 schema／hash／target／freshness／
 authority／independence 檢查的 receipt 物件（`Mapping[str, Any]`）交給
-`live_receipt_validator(receipt) -> bool`；這個函式不拿到 `evidence_root`，也不能
-有任何副作用（不得觸發模型、merge、部署、關票）。本模組提供該 callable 的正式
+`live_receipt_validator(receipt) -> bool`；這個函式每次呼叫只吃 receipt 本身，
+不能有任何副作用（不得觸發模型、merge、部署、關票）。本模組提供該 callable 的正式
 production 實作：
 
 - 以 ``receipt["kind"]`` 為 key 的封閉登記表，只認得本模組明確實作的 receipt kind；
@@ -16,17 +16,51 @@ production 實作：
 - 目前支援兩種 kind：
   1. ``cortex/deployment-canary-qualification/v1``：`qualification/validate.py`
      既有 fail-closed 邏輯的 deployment-canary 產物，`candidate_sha`／wheel
-     sha256 必須等於這條需求 claim 的 target。
+     sha256 必須等於這條需求 claim 的 target，且以 `require_canary_profile=True`
+     驗證——外部 canary 身分（repository／work_id／issue，見
+     ``receipt["canary_target"]``）與 receipt 綁定的 evidence 目錄（真正落地的
+     檔案集合與逐檔 sha256）皆須存在並通過。
   2. ``cortex/task-memory-live-canary/v1``：#857 task-memory canary evidence，
      content retrieval／各 delivery path 成功率須達門檻，且負例與跨 project
      檢查全部通過。
 
 任何解析失敗、格式錯誤或內容不符都視為未驗證通過，回傳 ``False``（對應
 `requirement_delivery` 的 ``failed`` gap），絕不因為 kind 不認得或內容壞掉而放行。
+
+## #845 對抗審查（第八輪）：evidence_root 與 checkout 外執行
+
+`governed_live_receipt_validator`（單一全域 callable）已被 `make_governed_live_
+receipt_validator` 工廠取代：
+
+- BLOCKER：先前 deployment-canary 驗證固定傳 `require_release_profile=False`、
+  `require_canary_profile=False`、`evidence_root=None`，只做 payload 結構檢查，
+  完全沒有比對真正的 evidence 檔案集合與內容，只含 `fresh-install`／
+  `full-dispatch-closeout` 加一個假 artifact 的 receipt 就會被採信。現在
+  `_validate_deployment_canary_qualification` 一律以 `require_canary_profile=True`
+  呼叫 `qualification/validate.py` 的 `validate()`，並要求 receipt 額外帶
+  ``canary_target``（`repository`／`work_id`／`issue`／`evidence_directory`）：
+  `repository` 必須等於已驗證的 `target["repo"]`；`evidence_directory` 是相對
+  delivery `evidence_root`（呼叫端於工廠建立時傳入、非 receipt 內容可操控）的
+  安全 locator，解析到的目錄交給 `validate()` 的 `evidence_root` 參數，實際核對
+  每個宣告 artifact 的檔案存在、內容 sha256 與 artifact-inventory 逐檔一致、
+  evidence tree 沒有多餘或缺漏檔案。任一項缺失、路徑不安全（絕對路徑、`..`、
+  symlink）或內容不符，一律 fail closed。
+- MAJOR：`from qualification import validate` 是一般 import，依賴 repo 根目錄的
+  `qualification/` 剛好在 `sys.path` 上；wheel 只打包 `paulsha_cortex*`，已安裝
+  的 `cortex delivery gaps` 在 checkout 外執行時，這個 import 一律 `ImportError`，
+  導致合法 receipt 永遠被拒。現在改由工廠接收 CLI 已要求的 `--source-root`
+  （checkout 根目錄），以 `importlib.util.spec_from_file_location` 從
+  `<source_root>/qualification/validate.py` 動態載入；路徑須嚴格在 source_root
+  之下且不得是 symlink，缺檔或載入失敗一律回傳 `None`，deployment-canary
+  validator 遇到 `None` 立即 fail closed，不影響 task-memory kind。
+  `porcelain/delivery.py` 以此工廠建立 `common["live_receipt_validator"]`。
 """
 from __future__ import annotations
 
+import importlib.util
 import re
+from pathlib import Path, PurePosixPath
+from types import ModuleType
 from typing import Any, Callable, Mapping
 
 KIND_DEPLOYMENT_CANARY_QUALIFICATION = "cortex/deployment-canary-qualification/v1"
@@ -59,12 +93,90 @@ def _rate_matches(*, attempts: object, successes: object, reported_rate: object)
     return computed >= _MIN_SUCCESS_RATE
 
 
-def _validate_deployment_canary_qualification(receipt: Mapping[str, Any]) -> bool:
+def _load_qualification_module(source_root: Path) -> ModuleType | None:
+    """從 CLI `--source-root`（checkout 根目錄）動態載入 `qualification/validate.py`。
+
+    wheel 不會打包 repo 根目錄的 `qualification/`；已安裝的 `cortex delivery` 在
+    checkout 外執行時，一般 `import qualification` 只會撞運氣命中不相干或不存在
+    的模組。這裡改成明確從呼叫端提供、已知是 checkout 根目錄的 `source_root`
+    載入，路徑必須真的落在 `source_root` 之下且不得經過 symlink；缺檔、路徑逃逸
+    或載入時任何例外都回傳 ``None``（fail-closed），由呼叫端在驗證該 kind 時
+    直接拒絕，不拖累其他 kind。"""
+    try:
+        root = Path(source_root).resolve(strict=True)
+        if not root.is_dir():
+            return None
+        package_dir = root / "qualification"
+        module_path = package_dir / "validate.py"
+        if package_dir.is_symlink() or module_path.is_symlink() or not module_path.is_file():
+            return None
+        resolved_module = module_path.resolve(strict=True)
+        if root not in resolved_module.parents:
+            return None
+        spec = importlib.util.spec_from_file_location(
+            "paulsha_cortex._governed_qualification_validate", resolved_module
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not hasattr(module, "validate") or not hasattr(module, "ValidationError"):
+            return None
+        return module
+    except (OSError, ValueError, ImportError, AttributeError, SyntaxError, TypeError):
+        return None
+
+
+def _resolve_evidence_directory(evidence_root: Path, locator: object) -> Path | None:
+    """把 receipt 宣告的 evidence 目錄 locator 安全解析到 delivery `evidence_root`
+    之下；`evidence_root` 是呼叫端（工廠建立時）提供的信任路徑，不受 receipt 內容
+    影響。絕對路徑、`..`、反斜線或任何路徑元件是 symlink，都視為不安全並拒絕。"""
+    if not isinstance(locator, str) or not locator:
+        return None
+    try:
+        pure = PurePosixPath(locator)
+    except TypeError:
+        return None
+    if (
+        pure.is_absolute()
+        or ".." in pure.parts
+        or not pure.parts
+        or "\\" in locator
+        or "\x00" in locator
+        or any(part in {"", "."} for part in pure.parts)
+    ):
+        return None
+    root = Path(evidence_root)
+    if root.is_symlink() or not root.is_dir():
+        return None
+    candidate = root
+    for part in pure.parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            return None
+    if not candidate.is_dir():
+        return None
+    return candidate
+
+
+def _validate_deployment_canary_qualification(
+    receipt: Mapping[str, Any],
+    *,
+    qualification_module: ModuleType | None,
+    evidence_root: Path,
+) -> bool:
     """deployment-canary `qualification.json` receipt：沿用 `qualification/validate.py`
-    既有驗證邏輯，不另寫一套；只額外綁定 candidate_sha／wheel sha256 等於 target。"""
+    既有驗證邏輯，不另寫一套；以 `require_canary_profile=True` 驗證，額外綁定
+    candidate_sha／wheel sha256 等於 target，以及外部 canary 身分
+    （repository／work_id／issue）與真正落地的 evidence 目錄。任一項缺失即拒絕。"""
+    if qualification_module is None:
+        # `qualification/validate.py` 未能從 --source-root 載入；fail closed，
+        # 不得因為缺套件或路徑不安全就放行（#845 對抗審查 MAJOR）。
+        return False
     target = receipt.get("target")
     evidence = receipt.get("evidence")
-    if not isinstance(target, Mapping) or not isinstance(evidence, Mapping):
+    canary_target = receipt.get("canary_target")
+    if not isinstance(target, Mapping) or not isinstance(evidence, Mapping) or not isinstance(canary_target, Mapping):
         return False
     candidate_sha = target.get("candidate_sha")
     wheel_sha256 = target.get("artifact_sha256")
@@ -72,30 +184,56 @@ def _validate_deployment_canary_qualification(receipt: Mapping[str, Any]) -> boo
         return False
     if evidence.get("profile") != "deployment-canary":
         return False
-    try:
-        # repo 根目錄的 `qualification/` 不隨 paulsha_cortex wheel 一起發佈；
-        # 未安裝時 lazy import 失敗一律 fail-closed，不得因缺套件而放行。
-        from qualification import validate as qualification_validate
-    except ImportError:
+
+    # 外部 canary 身分：不得只信 evidence 自己在 dispatch-closeout 裡宣稱的
+    # repository／work_id／issue，必須另外由 receipt 帶入且 repository 綁定
+    # 已驗證的 target["repo"]，交給 `validate()` 逐一核對 evidence 內容是否一致。
+    canary_repository = canary_target.get("repository")
+    canary_work_id = canary_target.get("work_id")
+    canary_issue = canary_target.get("issue")
+    evidence_directory = canary_target.get("evidence_directory")
+    if (
+        not isinstance(canary_repository, str)
+        or not canary_repository
+        or canary_repository != target.get("repo")
+        or not isinstance(canary_work_id, str)
+        or not canary_work_id
+        or isinstance(canary_issue, bool)
+        or not isinstance(canary_issue, int)
+        or canary_issue <= 0
+    ):
         return False
+
+    resolved_evidence_root = _resolve_evidence_directory(evidence_root, evidence_directory)
+    if resolved_evidence_root is None:
+        return False
+
     try:
-        qualification_validate.validate(
+        qualification_module.validate(
             evidence,
             candidate_sha=candidate_sha,
             wheel_sha256=wheel_sha256,
             bundle_sha256=None,
-            evidence_root=None,
+            evidence_root=resolved_evidence_root,
             require_release_profile=False,
-            require_canary_profile=False,
+            require_canary_profile=True,
+            canary_repository=canary_repository,
+            canary_work_id=canary_work_id,
+            canary_issue=canary_issue,
         )
-    except qualification_validate.ValidationError:
+    except qualification_module.ValidationError:
         return False
-    except (TypeError, ValueError, KeyError):
+    except (TypeError, ValueError, KeyError, OSError):
         return False
     return True
 
 
-def _validate_task_memory_live_canary(receipt: Mapping[str, Any]) -> bool:
+def _validate_task_memory_live_canary(
+    receipt: Mapping[str, Any],
+    *,
+    qualification_module: ModuleType | None = None,
+    evidence_root: Path | None = None,
+) -> bool:
     """#857 task-memory canary evidence：content retrieval／各 path 成功率達門檻，
     負例與跨 project 檢查通過，且綁定同一個 target（即同時期 #841 loaded runtime
     receipt 的 artifact digest／revision）；無法綁定即拒絕。"""
@@ -164,29 +302,54 @@ def _validate_task_memory_live_canary(receipt: Mapping[str, Any]) -> bool:
     return True
 
 
-_VALIDATORS: dict[str, Callable[[Mapping[str, Any]], bool]] = {
+_VALIDATORS: dict[str, Callable[..., bool]] = {
     KIND_DEPLOYMENT_CANARY_QUALIFICATION: _validate_deployment_canary_qualification,
     KIND_TASK_MEMORY_LIVE_CANARY: _validate_task_memory_live_canary,
 }
 
 
-def governed_live_receipt_validator(receipt: Mapping[str, Any]) -> bool:
-    """`requirement_delivery` 唯一的 production `live_receipt_validator`。
+def make_governed_live_receipt_validator(
+    *, source_root: str | Path, evidence_root: str | Path
+) -> Callable[[Mapping[str, Any]], bool]:
+    """建立 `requirement_delivery` 唯一的 production `live_receipt_validator`。
 
-    封閉登記表：只接受本模組明確登記且可機械驗證的 receipt kind；未知 kind、
-    型別不符或任何解析例外都回傳 ``False``（fail-closed），不得因為看不懂或
-    內部壞掉而放行。此函式讀取傳入的 ``receipt`` 內容，不觸發模型、merge、
-    部署或關票，亦不讀取檔案系統或網路。
+    以 closure 帶入呼叫端（`porcelain/delivery.py`）已經驗證過的兩個路徑：
+
+    - ``source_root``：CLI `--source-root`，checkout 根目錄，用來動態載入
+      `qualification/validate.py`（#845 對抗審查 MAJOR：不再依賴一般 import
+      撞運氣命中 repo 根目錄）。
+    - ``evidence_root``：delivery evidence root（目前是 Manager coordinator
+      root），deployment-canary receipt 綁定的 evidence 目錄只能解析到這個
+      根目錄之下（#845 對抗審查 BLOCKER：不再略過 evidence tree 的逐檔案核對）。
+
+    回傳的 callable 仍然只吃 receipt 本身，符合 `_verify_live` 既有呼叫慣例——
+    這兩個路徑是呼叫端事先决定、不受 receipt 內容操控的信任邊界，不是從 receipt
+    推導出來的。封閉登記表：只接受本模組明確登記且可機械驗證的 receipt kind；
+    未知 kind、型別不符或任何解析例外都回傳 ``False``（fail-closed），不得因為
+    看不懂或內部壞掉而放行。此函式讀取傳入的 ``receipt`` 內容，不觸發模型、
+    merge、部署或關票，亦不讀取檔案系統或網路（deployment-canary kind 底下
+    對 evidence_root 的檔案讀取，全部委由已載入的 `qualification/validate.py`
+    在其自身 fail-closed 契約內完成）。
     """
-    if not isinstance(receipt, Mapping):
-        return False
-    kind = receipt.get("kind")
-    if not isinstance(kind, str):
-        return False
-    validator = _VALIDATORS.get(kind)
-    if validator is None:
-        return False
-    try:
-        return validator(receipt) is True
-    except Exception:
-        return False
+    resolved_evidence_root = Path(evidence_root)
+    qualification_module = _load_qualification_module(Path(source_root))
+
+    def validator(receipt: Mapping[str, Any]) -> bool:
+        if not isinstance(receipt, Mapping):
+            return False
+        kind = receipt.get("kind")
+        if not isinstance(kind, str):
+            return False
+        handler = _VALIDATORS.get(kind)
+        if handler is None:
+            return False
+        try:
+            return handler(
+                receipt,
+                qualification_module=qualification_module,
+                evidence_root=resolved_evidence_root,
+            ) is True
+        except Exception:
+            return False
+
+    return validator

@@ -1259,6 +1259,220 @@ def _qualification_payload(*, candidate_sha: str, wheel_sha256: str, status: str
     }
 
 
+def _copy_qualification_module(source_root: Path) -> None:
+    """把真正的 `qualification/validate.py` 複製進測試用 `--source-root`（模擬
+    Manager 實際 checkout 內含的 `qualification/`）；#845 對抗審查 MAJOR 修正後，
+    production validator 改以 `importlib.util.spec_from_file_location` 從
+    `--source-root` 動態載入，不再依賴一般 import 撞運氣命中 repo 根目錄。"""
+    real_module = Path(__file__).resolve().parents[1] / "qualification" / "validate.py"
+    target_dir = source_root / "qualification"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(real_module, target_dir / "validate.py")
+
+
+def _full_canary_qualification(
+    evidence_base: Path,
+    *,
+    candidate_sha: str,
+    wheel_sha256: str,
+    repository: str,
+    work_id: str = "canary-dispatch-1",
+    issue: int = 845,
+    dispatch_repository: str | None = None,
+    status: str = "passed",
+) -> dict:
+    """在 `evidence_base` 下建出一整份**真正能通過** `qualification/validate.py`
+    `require_canary_profile=True` 的 evidence tree（`evidence_base/evidence/*.json`），
+    回傳對應的 qualification.json payload（含逐檔 sha256 的 artifacts 清單）。#845
+    對抗審查 BLOCKER：production validator 現在真的會用 `evidence_root` 核對這裡
+    每個檔案的實際內容與 digest，不能只靠一個假 artifact 矇混。"""
+    providers = [
+        {
+            "provider": name,
+            "requested_model": model,
+            "runtime_model": model,
+            "requested_effort": effort,
+            "runtime_effort": effort,
+            "status": "passed",
+            "quota": "available",
+            "fallback": False,
+        }
+        for name, (model, effort) in REQUIRED_PROVIDERS.items()
+    ]
+    payload = {
+        "schema_version": 2,
+        "profile": "deployment-canary",
+        "status": status,
+        "candidate_sha": candidate_sha,
+        "wheel": {"filename": "paulsha_cortex-1.0.0-py3-none-any.whl", "sha256": wheel_sha256},
+        "bundle": {"sha256": "c" * 64},
+        "image": {"digest": "sha256:" + "d" * 64},
+        "services": [
+            {"name": "cortex-egress-proxy.service", "uid": 950, "gid": 950, "active": True},
+            {"name": "cortex-manager.service", "uid": 991, "gid": 991, "active": True},
+            {"name": "cortex-monitor.service", "uid": 991, "gid": 991, "active": True},
+        ],
+        "providers": providers,
+        "tests": [
+            {"name": name, "status": "passed"}
+            for name in (
+                "fresh-install", "idempotent-apply", "drift-detection", "rollback",
+                "reinstall", "selfcheck", "registry-equation",
+                "generated-installed-attestation", "service-identity-hardening",
+                "capability-attack-matrix", "durable-state-attack-matrix",
+                "enforcement-plane-attack-matrix", "process-attack-matrix",
+                "gate-attack-matrix", "negative-controls",
+                "provider-capability-smoke", "full-dispatch-closeout",
+                "manager-github-dry-run-push",
+            )
+        ],
+        "artifacts": [],
+    }
+    attestation = {"ok": True, "failures": [], "warnings": []}
+    installed = {
+        "schema_version": 1,
+        "result": "pass",
+        "candidate": {"wheel_sha256": wheel_sha256, "bundle_sha256": "c" * 64},
+        "attestation": attestation,
+        "artifact_hashes": {"units/cortex-manager.service": "1" * 64},
+        "service_identities": {"cortex-manager.service": {"user": "cortex-manager"}},
+    }
+    generated = {
+        "schema_version": 1,
+        "ok": True,
+        "attestation": attestation,
+        "artifact_hashes": installed["artifact_hashes"],
+        "service_identities": installed["service_identities"],
+    }
+    cases = []
+    required_cases = {
+        "capability": ("T1.1", "T1.2", "T1.3", "T1.4"),
+        "enforcement-plane": tuple(f"T3.{index}" for index in range(1, 11)),
+        "process": ("T4.1", "T4.2", "T4.3", "T4.4"),
+        "gate": tuple(f"T5.{index}" for index in range(1, 11)),
+    }
+    for family, case_ids in required_cases.items():
+        for case_id in case_ids:
+            cases.append({"family": family, "case": f"{case_id}-probe", "principal": "probe", "status": "passed", "returncode": 1})
+    for operation in ("modify", "truncate", "delete", "replace", "symlink-swap", "rollback"):
+        for principal in ("cortex-builder", "cortex-reviewer-planner"):
+            cases.append({
+                "family": "durable-state",
+                "case": f"jobs-registry:{operation}",
+                "principal": principal,
+                "status": "passed",
+                "returncode": 13,
+            })
+    attack = {
+        "schema_version": 1,
+        "status": "passed",
+        "families": ["capability", "durable-state", "enforcement-plane", "process", "gate"],
+        "cases": cases,
+        "negative_controls": [
+            {"family": family, "case": f"{family}-control", "principal": "trusted", "status": "passed", "returncode": 0}
+            for family in ("capability", "durable-state", "enforcement-plane", "process", "gate")
+        ],
+        "authorized_mutations": [],
+        "deny_only_assets": [],
+        "covered_assets": 1,
+        "registry_asset_ids": ["jobs-registry"],
+    }
+    provider_evidence = {
+        "schema_version": 1,
+        "providers": {
+            row["provider"]: {
+                "preflight": {
+                    "returncode": 0,
+                    "status": "ready",
+                    "authenticated": True,
+                    "quota": row["quota"],
+                    "fallback": row["fallback"],
+                    "skipped": False,
+                },
+                "returncode": 0,
+                "models": [row["runtime_model"]],
+                "efforts": [row["runtime_effort"]],
+                "native_metadata": True,
+                "response_token": True,
+            }
+            for row in providers
+        },
+    }
+    dispatch = {
+        "schema_version": 1,
+        "status": "passed",
+        "repository": dispatch_repository or repository,
+        "work_id": work_id,
+        "issue": issue,
+        "release_candidate_sha": candidate_sha,
+        "workflow_candidate_sha": "f" * 40,
+        "terminal": {"state": "done", "work_id": work_id, "run_id": "workflow-qualification"},
+        "required_markers": sorted({
+            "agent-loop-command", "candidate", "bundle", "verdict", "ledger", "evidence", "completion",
+        }),
+        "agent_loop_probe": {
+            "schema_version": 1,
+            "executor": "codex",
+            "model_id": "gpt-5.3-codex-spark",
+            "card_id": "worktree-isolation",
+            "builder_job_ids": ["build-job"],
+            "successful_command_count": 1,
+            "all_outputs_nonempty": True,
+            "command_sha256": "5" * 64,
+            "output_sha256": "6" * 64,
+            "log_sha256": "7" * 64,
+            "thread_sha256": "8" * 64,
+            "runtime_model": "gpt-5.3-codex-spark",
+            "runtime_effort": "xhigh",
+            "model_provider": "openai",
+            "probe_candidate_sha": "9" * 40,
+        },
+        "artifacts": [
+            {"path": "coordinator/jobs.json", "sha256": "2" * 64},
+            {"path": "coordinator/commit-spool/build-logs/build-job/job.jsonl", "sha256": "7" * 64},
+        ],
+    }
+    dispatch["agent_loop_probe"]["artifact_set_sha256"] = hashlib.sha256(
+        (json.dumps(dispatch["artifacts"], sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ).hexdigest()
+    github = {
+        "schema_version": 1,
+        "status": "passed",
+        "repository": dispatch_repository or repository,
+        "authenticated": True,
+        "dry_run": True,
+        "remote_refs_unchanged": True,
+        "before_sha256": "3" * 64,
+        "after_sha256": "3" * 64,
+    }
+    evidence_dir = evidence_base / "evidence"
+    documents = {
+        "install-verification.json": installed,
+        "generated-installed-attestation.json": generated,
+        "attack-matrix.json": attack,
+        "provider-capabilities.json": provider_evidence,
+        "dispatch-closeout.json": dispatch,
+        "manager-github-auth.json": github,
+    }
+    for name, value in documents.items():
+        path = evidence_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    inventory_rows = [
+        {"path": f"evidence/{name}", "sha256": hashlib.sha256((evidence_dir / name).read_bytes()).hexdigest()}
+        for name in sorted(documents)
+    ]
+    inventory_path = evidence_dir / "artifact-inventory.json"
+    inventory_path.write_text(
+        json.dumps({"schema_version": 1, "status": "passed", "artifacts": inventory_rows}, sort_keys=True),
+        encoding="utf-8",
+    )
+    payload["artifacts"] = inventory_rows + [
+        {"path": "evidence/artifact-inventory.json", "sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest()}
+    ]
+    return payload
+
+
 def _rate_row(attempts: int, successes: int) -> dict:
     return {"attempts": attempts, "successes": successes, "success_rate": successes / attempts}
 
@@ -1294,6 +1508,7 @@ def _write_governed_live(
     kind: str,
     evidence: dict,
     target: dict,
+    canary_target: dict | None = None,
 ) -> dict:
     payload = {
         "schema": "cortex/live-canary-receipt/v1",
@@ -1308,17 +1523,32 @@ def _write_governed_live(
         "kind": kind,
         "evidence": evidence,
     }
-    path = root / f"live-governed-{requirement_id}-{abs(hash((kind, requirement_id, revision)))}.json"
+    if canary_target is not None:
+        # #845 對抗審查 BLOCKER：deployment-canary receipt 額外帶入外部 canary
+        # 身分（repository／work_id／issue）與 evidence 目錄 locator，供
+        # `make_governed_live_receipt_validator` 以 `require_canary_profile=True`
+        # 交 `qualification/validate.py` 逐檔核對；不是 evidence 自身的一部分，
+        # 因為 evidence 就是原封不動的 qualification.json，其 ROOT_KEYS 是封閉集合。
+        payload["canary_target"] = canary_target
+    path = root / f"live-governed-{requirement_id}-{abs(hash((kind, requirement_id, revision, id(evidence))))}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     return {"locator": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def _governed_case(tmp_path: Path, *, kind: str, evidence_factory) -> tuple[dict, dict, dict]:
+def _governed_case(
+    tmp_path: Path,
+    *,
+    kind: str,
+    evidence_factory,
+    canary_target_factory=None,
+    install_qualification_module: bool = True,
+) -> tuple[dict, dict, dict]:
     specs = [("R01", "r1")]
     manifest = _manifest(tmp_path, specs)
     snapshot = _snapshot(tmp_path, manifest, specs, with_live=False)
     target = snapshot["mappings"][0]["target"]
+    canary_target = canary_target_factory(target) if canary_target_factory is not None else None
     live_ref = _write_governed_live(
         tmp_path,
         requirement_id="R01",
@@ -1327,23 +1557,216 @@ def _governed_case(tmp_path: Path, *, kind: str, evidence_factory) -> tuple[dict
         kind=kind,
         evidence=evidence_factory(target),
         target=target,
+        canary_target=canary_target,
     )
     snapshot["mappings"][0]["live_receipt"] = live_ref
-    context = _context(tmp_path, live_validator=live_receipt_validators.governed_live_receipt_validator)
+    if install_qualification_module:
+        _copy_qualification_module(tmp_path)
+    # #845 對抗審查 MAJOR：production validator 改由工廠帶入 --source-root／
+    # evidence_root 建立，不再是單一全域 callable；測試沿用同一顆工廠證明
+    # `inspect_delivery` 真正接到這個受治理的 production validator。
+    validator = live_receipt_validators.make_governed_live_receipt_validator(
+        source_root=tmp_path, evidence_root=tmp_path
+    )
+    context = _context(tmp_path, live_validator=validator)
     return manifest, snapshot, context
 
 
+def _canary_target(target: dict, *, evidence_directory: str = "canary-evidence") -> dict:
+    return {
+        "repository": target["repo"],
+        "work_id": "canary-dispatch-1",
+        "issue": 845,
+        "evidence_directory": evidence_directory,
+    }
+
+
 def test_a04_delivery_governed_qualification_live_receipt_reaches_ready(tmp_path: Path) -> None:
+    """#845 對抗審查 BLOCKER GREEN：deployment-canary receipt 現在必須帶真正的
+    evidence 目錄與外部 canary 身分，以 `require_canary_profile=True` 通過
+    `qualification/validate.py` 才算 ready；不是只憑 payload 結構就放行。"""
     manifest, snapshot, context = _governed_case(
         tmp_path,
         kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
-        evidence_factory=lambda target: _qualification_payload(
-            candidate_sha=target["candidate_sha"], wheel_sha256=target["artifact_sha256"]
+        evidence_factory=lambda target: _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
         ),
+        canary_target_factory=_canary_target,
     )
     report = inspect_delivery(manifest, snapshot, **context)
     assert report["closure_readiness"] == "ready"
     assert report["mappings"][0]["evidence"]["live"]["status"] == "verified"
+
+
+def test_a03_delivery_deployment_canary_without_canary_target_is_rejected(tmp_path: Path) -> None:
+    """#845 對抗審查 BLOCKER：即使 evidence 目錄真實存在且完整通過，receipt 缺
+    外部 canary 身分（`canary_target`）仍必須拒絕——不得只憑 evidence 自己聲稱
+    的 repository／work_id／issue 放行。"""
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=lambda target: _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
+        ),
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a03_delivery_deployment_canary_missing_evidence_file_is_rejected(tmp_path: Path) -> None:
+    """#845 對抗審查 BLOCKER：evidence 目錄少了一個宣告過的 canary-only 檔案，
+    `evidence_root` 逐檔核對必須抓到，不能因為 payload 結構本身合法就放行。"""
+
+    def evidence_factory(target: dict) -> dict:
+        payload = _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
+        )
+        (tmp_path / "canary-evidence" / "evidence" / "manager-github-auth.json").unlink()
+        return payload
+
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=evidence_factory,
+        canary_target_factory=_canary_target,
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a03_delivery_deployment_canary_unlisted_evidence_file_is_rejected(tmp_path: Path) -> None:
+    """#845 對抗審查 BLOCKER：evidence 目錄多出一個未列入 artifact-inventory 的
+    檔案，`_validate_evidence_file_set` 必須擋下，不能因為宣告的 artifacts 全部
+    存在就放行整棵樹。"""
+
+    def evidence_factory(target: dict) -> dict:
+        payload = _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
+        )
+        stray = tmp_path / "canary-evidence" / "evidence" / "stray.json"
+        stray.write_text("{}", encoding="utf-8")
+        return payload
+
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=evidence_factory,
+        canary_target_factory=_canary_target,
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a03_delivery_deployment_canary_evidence_digest_mismatch_is_rejected(tmp_path: Path) -> None:
+    """#845 對抗審查 BLOCKER：evidence 檔案內容被竄改後（sha256 不再與宣告值
+    相符），必須拒絕——證明 validator 真的比對了檔案內容，不是只信宣告的路徑
+    存在。"""
+
+    def evidence_factory(target: dict) -> dict:
+        payload = _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
+        )
+        tampered = tmp_path / "canary-evidence" / "evidence" / "install-verification.json"
+        tampered.write_text(tampered.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        return payload
+
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=evidence_factory,
+        canary_target_factory=_canary_target,
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a03_delivery_deployment_canary_dispatch_repository_mismatch_is_rejected(tmp_path: Path) -> None:
+    """#845 對抗審查 BLOCKER：evidence 自己在 `dispatch-closeout.json` 宣稱的
+    repository 與 receipt 帶入的外部 canary 身分不符時必須拒絕——這正是
+    `require_canary_profile=True` 外部身分交叉核對存在的理由，不能讓 candidate
+    自報的 dispatch 身分單方面說了算。"""
+
+    def evidence_factory(target: dict) -> dict:
+        return _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
+            dispatch_repository="hamanpaul/some-other-repo",
+        )
+
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=evidence_factory,
+        canary_target_factory=_canary_target,
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a03_delivery_deployment_canary_evidence_directory_traversal_is_rejected(tmp_path: Path) -> None:
+    """#845 對抗審查 BLOCKER：`canary_target.evidence_directory` 企圖用 `..`
+    逃出 delivery evidence_root 時必須拒絕，不得解析到 evidence_root 之外。"""
+
+    def evidence_factory(target: dict) -> dict:
+        return _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
+        )
+
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=evidence_factory,
+        canary_target_factory=lambda target: _canary_target(target, evidence_directory="../canary-evidence"),
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
+def test_a03_delivery_deployment_canary_validator_missing_source_root_module_is_rejected(tmp_path: Path) -> None:
+    """#845 對抗審查 MAJOR：`--source-root` 底下沒有 `qualification/validate.py`
+    （模擬已安裝 wheel 在 checkout 外執行）時，即使 evidence 完全合法也必須
+    fail closed，不能因為缺套件就放行。"""
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=lambda target: _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
+        ),
+        canary_target_factory=_canary_target,
+        install_qualification_module=False,
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
 
 
 def test_a04_delivery_governed_task_memory_live_receipt_reaches_ready(tmp_path: Path) -> None:
@@ -1373,12 +1796,18 @@ def test_a03_delivery_unknown_live_receipt_kind_is_rejected_fail_closed(tmp_path
 
 
 def test_a03_delivery_qualification_wheel_digest_not_bound_to_target_is_rejected(tmp_path: Path) -> None:
+    """即使 evidence 目錄與外部 canary 身分皆合法齊備，wheel sha256 與 target
+    不符仍必須拒絕——證明是這個具體綁定失敗，不是被別的缺項短路。"""
     manifest, snapshot, context = _governed_case(
         tmp_path,
         kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
-        evidence_factory=lambda target: _qualification_payload(
-            candidate_sha=target["candidate_sha"], wheel_sha256="f" * 64
+        evidence_factory=lambda target: _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256="f" * 64,
+            repository=target["repo"],
         ),
+        canary_target_factory=_canary_target,
     )
     report = inspect_delivery(manifest, snapshot, **context)
     assert report["closure_readiness"] != "ready"
@@ -1386,12 +1815,19 @@ def test_a03_delivery_qualification_wheel_digest_not_bound_to_target_is_rejected
 
 
 def test_a03_delivery_qualification_not_passed_is_rejected(tmp_path: Path) -> None:
+    """即使 evidence 目錄與外部 canary 身分皆合法齊備，qualification.json 頂層
+    `status` 不是 `passed` 仍必須拒絕。"""
     manifest, snapshot, context = _governed_case(
         tmp_path,
         kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
-        evidence_factory=lambda target: _qualification_payload(
-            candidate_sha=target["candidate_sha"], wheel_sha256=target["artifact_sha256"], status="failed"
+        evidence_factory=lambda target: _full_canary_qualification(
+            tmp_path / "canary-evidence",
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
+            status="failed",
         ),
+        canary_target_factory=_canary_target,
     )
     report = inspect_delivery(manifest, snapshot, **context)
     assert report["closure_readiness"] != "ready"

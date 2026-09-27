@@ -185,3 +185,70 @@ service 投影的邊界，其餘走 production code path，證明合法 fixture 
 `test_requirement_delivery_cli.py`／`test_github_delivery_client.py`／
 `test_delivery_orchestrator.py`／`test_phase2_qualification.py`
 （218 個）與 `-k "delivery or qualification"`（444 個）全數通過。
+
+對抗審查第八輪修正（deployment-canary receipt 只做結構檢查、checkout 外執行必壞，
+共兩條）：
+
+1. BLOCKER：`_validate_deployment_canary_qualification` 先前呼叫 `qualification/
+   validate.py` 的 `validate()` 時固定傳 `require_release_profile=False`、
+   `require_canary_profile=False`、`evidence_root=None`——只做 payload 結構檢查
+   （provider 需求、必備 base tests 等），完全沒有比對真正的 evidence 檔案集合
+   與內容；只含 `fresh-install`／`full-dispatch-closeout` 兩個測試名稱加一個假
+   artifact 路徑（`evidence/summary.json`，不對應任何真實檔案）的 receipt 就會被
+   採信為合法 deployment-canary qualification。現在一律以
+   `require_canary_profile=True` 呼叫 `validate()`，並要求 receipt 額外帶
+   `canary_target`（`repository`／`work_id`／`issue`／`evidence_directory`）：
+   `repository` 綁定已驗證的 `target["repo"]`；`evidence_directory` 是相對
+   delivery evidence root（工廠建立時由呼叫端提供，不是 receipt 內容能操控的
+   路徑，經安全 locator 解析——禁止絕對路徑、`..`、symlink）的目錄，交給
+   `validate()` 的 `evidence_root` 參數，讓它逐檔核對 artifact-inventory 宣告
+   的檔案是否存在、內容 sha256 是否相符、evidence tree 是否缺漏或多出檔案，並
+   比對 evidence 自報的 `dispatch-closeout.json` repository／work_id／issue 是否
+   與外部帶入的 `canary_target` 一致——防止 candidate 自己在自報的 dispatch
+   closeout 裡宣稱任意身分。因為 `evidence`（即 qualification.json payload）本身
+   的 `ROOT_KEYS` 是封閉集合，`canary_target` 是 receipt 的獨立頂層欄位，不塞進
+   `evidence` 裡。
+2. MAJOR：`_validate_deployment_canary_qualification` 先前用一般
+   `from qualification import validate` import，依賴 repo 根目錄的
+   `qualification/` 剛好在 `sys.path` 上（測試/開發環境跑 `python -m pytest` 時
+   cwd 會被加進 `sys.path`，恰好命中）；已安裝的 wheel 只打包 `paulsha_cortex*`，
+   `cortex delivery gaps` 在 checkout 外執行時這個 import 一律 `ImportError`，
+   導致就算 producer 交付完全合法的 receipt 也永遠被拒。新增
+   `make_governed_live_receipt_validator(*, source_root, evidence_root)` 工廠
+   取代原先單一全域 callable `governed_live_receipt_validator`：以
+   `importlib.util.spec_from_file_location` 從 CLI `--source-root` 底下的
+   `qualification/validate.py` 動態載入，路徑須嚴格在 `source_root` 之下且不得
+   經過 symlink；缺檔、路徑逃逸或載入時任何例外一律回傳 `None`，deployment-canary
+   kind 遇到 `None` 立即 fail closed，不影響 task-memory kind（它不需要
+   `qualification/validate.py`）。`porcelain/delivery.py` 改以這個工廠、帶入
+   `args.source_root` 與 `coordinator_root` 建立 `common["live_receipt_
+   validator"]`。工廠回傳的 callable 仍只吃 receipt 本身，符合 `_verify_live`
+   既有呼叫慣例——`source_root`／`evidence_root` 是呼叫端事先決定的信任邊界，
+   不是從 receipt 推導。
+
+兩條均先以 RED 測試（暫時把 `paulsha_cortex/coordinator/live_receipt_validators.
+py`／`paulsha_cortex/porcelain/delivery.py` 還原成 `git show HEAD:` 版本，不用
+`git stash`）確認可重現：13 個新／改測試因 `make_governed_live_receipt_validator`
+在舊版不存在而 `AttributeError`；其中
+`test_delivery_gaps_cli_with_governed_qualification_receipt_missing_source_
+root_module_is_rejected` 直接證明 MAJOR 那條——`--source-root` 底下完全沒有
+`qualification/` 時，舊版 CLI 仍回報 `closure_readiness == "ready"`。復原後
+GREEN。
+
+`tests/test_requirement_delivery.py` 新增 7 個測試（正例：完整合法 evidence
+目錄＋外部 canary 身分才 ready；負例各一：缺 `canary_target`、evidence 少一個
+canary-only 檔案、evidence 多一個未列入 inventory 的檔案、evidence 檔案內容被
+竄改導致 digest 不符、`dispatch-closeout.json` 自報 repository 與外部
+`canary_target` 不符、`evidence_directory` 用 `..` 試圖逃出 evidence_root、
+`--source-root` 底下沒有 `qualification/validate.py`），並把既有 wheel-digest-
+mismatch／qualification-not-passed 兩個舊測試改用完整合法 evidence 目錄＋
+canary 身分，確保是這兩個具體綁定失敗、不是被新增的 `canary_target` 缺項短路。
+`tests/test_requirement_delivery_cli.py` 新增 1 個端到端測試，證明 `cortex
+delivery gaps` 這條 production CLI 入口在 `--source-root` 缺 `qualification/`
+時同樣 fail closed，並把既有 ready 測試改用完整合法 evidence 目錄＋外部 canary
+身分。`docs/superpowers/specs/requirement-delivery-accounting.md` 更新為工廠
+呼叫方式與新的綁定規則表。
+
+`tests/test_requirement_delivery.py`／`test_requirement_delivery_cli.py`／
+`test_phase2_qualification.py`（139 個）與 `-k "delivery or qualification"`
+（452 個）全數通過。
