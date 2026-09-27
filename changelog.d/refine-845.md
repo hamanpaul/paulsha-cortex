@@ -313,3 +313,7 @@ evidence_directory` 保持指向原 evidence 實體目錄），證明修法前�
 `tests/test_requirement_delivery.py`／`test_requirement_delivery_cli.py`／
 `test_phase2_qualification.py`（141 個）與 `-k "delivery or qualification"`
 （454 個）全數通過。
+
+契約文件新增「信任邊界與已知限制」：live receipt 的信任錨點是 Trust Root 保護的
+delivery evidence root 加 snapshot sha256 綁定；`authority` 仍只是 provenance 標籤、
+task-memory canary 統計仍取自內嵌 JSON，兩項改綁受信紀錄追蹤於 #1100。

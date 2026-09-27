@@ -82,7 +82,25 @@ directory` 必須精確等於這個 digest（不再是 receipt 自由選擇的�
 `cortex/task-memory-live-canary/v1` 的 evidence 完全沒有檔案樹可供內容定
 址，目前仍只靠 `evidence["target"] == 外層 target` 的自我一致檢查（`_verify_
 live` 已先驗證外層 target 就是這條需求 mapping 的 acceptance target）；這是
-已知的較弱綁定，非本輪對抗審查具體指出的項目，於此明確記載，不佇裝已解決。
+已知的較弱綁定，非本輪對抗審查具體指出的項目，於此明確記載，不佯裝已解決。
+
+#### 信任邊界與已知限制（#845 對抗審查第十輪，追蹤於 #1100）
+
+live receipt 的最終信任錨點是「檔案位於 Manager 擁有、Trust Root 保護的
+delivery `evidence_root` 之下，且 delivery snapshot 以 sha256 綁定」。
+job sandbox 無法寫入這兩者；能同時改寫兩者的一方已持有 Manager／operator
+權限，不屬於本模組要防的權限提升。在這個邊界內仍有兩項較弱綁定，明列如下，
+不視為已解決：
+
+- `authority`（`id`／`version`／`receipt`）目前只驗非空字串，是 provenance
+  標籤而非已驗證的 approval record；尚未解析到任何受信 approval store。
+- `cortex/task-memory-live-canary/v1` 的 `executor.id` 與成功率、負例、
+  跨專案統計取自 receipt 內嵌 JSON，沒有原始逐案量測檔可重算，也沒有外部
+  witness。
+
+兩項改綁受信紀錄（approval record、內容定址原始量測檔、必要時 producer
+簽章）排入 #1100；在此之前 reconcile 輸出的 `verified` 只代表「通過上述
+結構、hash、target、期限與 independence 檢查，且位於受信 evidence root」。
 
 `owner.work_ids` 的 `owner/repo#issue` 必須與正式 WorkAuthority 的 repo 及 mapped issue 相符；只有相同標籤、PR closed 或別的 work 完成不會覆蓋該需求。每列 coverage 依自身列出的 required stages 計算；缺 stage、failed、stale 或 unknown 都不能 ready。同一次 snapshot 若對同一 requirement／criterion／repo／work／run 邏輯範圍同時含多個 source_generation 的 mapping row（例如較舊 covered 與較新 blocked 同時存在、producer 尚未清理掉舊紀錄），判定該 criterion covered 與否只信這個邏輯範圍內最高 generation 的 row，不是只要任一 row covered 就通過；未選中的較舊 generation row 不影響判定，也不會蓋掉較新事實的 gap 回報。此規則與下方索引跨 mapping generation 守門共用同一套「以最高 generation 為單一真相」邏輯。
 
