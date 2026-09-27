@@ -94,12 +94,20 @@ def configuration_revision(configuration: Mapping[str, object] | object) -> str:
 
 
 def safe_environment_projection(environment: Mapping[str, str]) -> dict[str, str]:
-    """挑選安全的 Cortex 環境宣告，不保留未列入允許清單的值。"""
+    """挑選安全的 Cortex 環境宣告，不保留未列入允許清單的值。
+
+    #1098：白名單額外收 ``PY`` 這一個單獨鍵——``scripts/service-manager.sh``
+    wrapper 用它決定實際執行哪個直譯器／venv，drop-in 覆寫它時，`cortex
+    service status` 的 executor 顯示欄位與（透過
+    ``_declared_service_artifact``）manager artifact 判定都需要能看到這個
+    有效值；沒有它就只看得到 wrapper 腳本自己所在的套件根，看不出實際載入的
+    是哪個 venv。``PY`` 不是機敏值（只是一個直譯器路徑），比對規則沿用既有
+    的 ``_SECRET_KEY_RE`` 檢查。"""
 
     return {
         key: value
         for key, value in sorted(environment.items())
-        if key.startswith(("PSC_", "PAULSHACLAW_"))
+        if (key.startswith(("PSC_", "PAULSHACLAW_")) or key == "PY")
         and not _SECRET_KEY_RE.search(key)
         and isinstance(value, str)
     }
@@ -551,15 +559,24 @@ def _env_command_assignments(argv: list[str]) -> tuple[dict[str, str], int]:
     return assignments, index
 
 
-def _effective_pythonpath(
+def _effective_env_value(
+    key: str,
     *,
     env_assignments: Mapping[str, str],
     environment: Mapping[str, str],
     from_files: Mapping[str, str],
 ) -> tuple[bool, str | None]:
-    env_value = environment.get("PYTHONPATH")
-    file_value = from_files.get("PYTHONPATH")
-    command_value = env_assignments.get("PYTHONPATH")
+    """單一環境變數（例如 ``PYTHONPATH``／``PY``）目前有效值的判定。
+
+    優先序：ExecStart 內 ``/usr/bin/env KEY=VAL`` 命令層前綴 > systemd
+    ``Environment=`` 指令層 > ``EnvironmentFile``。``EnvironmentFile`` 與另外
+    兩層的值互相衝突時視為無法安全判定──這種變數（PYTHONPATH／PY）任何一段
+    衝突都可能改變實際載入的套件／直譯器，衝突時不臆測任何一邊，回傳
+    ``(False, None)``。"""
+
+    env_value = environment.get(key)
+    file_value = from_files.get(key)
+    command_value = env_assignments.get(key)
     if file_value is not None and any(
         value is not None and value != file_value
         for value in (env_value, command_value)
@@ -570,6 +587,20 @@ def _effective_pythonpath(
     if file_value is not None:
         return True, file_value
     return True, env_value
+
+
+def _effective_pythonpath(
+    *,
+    env_assignments: Mapping[str, str],
+    environment: Mapping[str, str],
+    from_files: Mapping[str, str],
+) -> tuple[bool, str | None]:
+    return _effective_env_value(
+        "PYTHONPATH",
+        env_assignments=env_assignments,
+        environment=environment,
+        from_files=from_files,
+    )
 
 
 def _pythonpath_artifact(pythonpath: str) -> dict[str, object]:
@@ -691,6 +722,24 @@ def _declared_service_artifact(
             workdir_artifact = _working_directory_artifact(working_directory)
             if workdir_artifact is not None:
                 return workdir_artifact
+        # #1098：wrapper（``scripts/service-manager.sh``）實際執行哪個直譯器
+        # 由 ``PY`` 環境變數決定（腳本內 ``PY=${PY:-$(command -v python3)}``）；
+        # drop-in 以 ``Environment=PY=/other/venv/bin/python`` 覆寫時，之前這裡
+        # 完全沒看 ``PY``，永遠回報 wrapper 腳本自己所在的套件根，與實際載入
+        # 的 venv 不同步。有效 ``PY`` 可判定時，改用該直譯器的匯入結果；
+        # ``PY`` 未被任何一層宣告（多數既有部署的實際狀態）時，沿用「wrapper
+        # 與套件同根」既有假設；判定衝突（EnvironmentFile 與其他層不一致）時
+        # 一律 unknown，不臆測。
+        py_known, py_interpreter = _effective_env_value(
+            "PY",
+            env_assignments=env_assignments,
+            environment=environment or {},
+            from_files=from_files or {},
+        )
+        if not py_known:
+            return _safe_artifact({})
+        if py_interpreter is not None:
+            return artifact_identity_from_python(py_interpreter)
         return artifact_identity_from_package_root(package_root)
     return _safe_artifact({})
 
