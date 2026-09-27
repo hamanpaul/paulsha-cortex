@@ -558,9 +558,13 @@ def test_refresher_quota_decision_cache_survives_across_refresh_ticks_for_last_g
     spec.write_text("---\nwork_item: work\n---\n# work\n", encoding="utf-8")
 
     registry = JobRegistry()
+    # #840 對抗審查第三輪（MAJOR）：步卡 executor／model 必須對齊下面 admit
+    # 決策的 `selected`——`WorkflowRegistryProvider.scan()` 現在會比對兩者
+    # 是否相符（見 `decision_projection._attempt_mismatch_reason`），不一致
+    # 會被判成『目前 attempt 尚無決策』，不是這裡要驗證的 last-good 快取。
     step = WorkflowStep(
         phase="build", persona="builder", card="build-card",
-        executor="planned-executor", model="planned-model", domain="test-domain",
+        executor="codex", model="gpt-5.3-codex", domain="test-domain",
         inputs=(), outputs=(), gate_result="pending",
     )
     run = registry._manager_create_workflow_run(

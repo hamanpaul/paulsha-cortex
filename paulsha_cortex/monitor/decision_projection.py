@@ -20,11 +20,19 @@ allowlist：只輸出下面列舉的非機敏欄位；``selected``／``excluded`
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..coordinator import quota_admission as _quota_admission
+
+#: 對抗審查第三輪（MAJOR）：`current_identity_by_persona` 完全沒被呼叫端
+#: 傳入（舊呼叫方式，例如本檔既有全部單元測試）時，attempt-比對邏輯必須
+#: 逐字停用——不得把『呼叫端沒有能力算出』與『呼叫端算出來、但這個
+#: persona 目前沒有未通過的卡』混為一談（後者才是「推導不出就視為不
+#: 相符」）。用 sentinel 區分兩者，不能用 ``None`` 兼職兩個意思。
+_ATTEMPT_CHECK_DISABLED = object()
 
 PROJECTION_SCHEMA = "cortex-quota-decision-projection/v1"
 
@@ -103,6 +111,34 @@ def _file_identity(path: Path) -> tuple[int, int, int, int] | None:
     return (info.st_size, info.st_mtime_ns, info.st_ino, info.st_mode)
 
 
+def _parent_identity(path: Path) -> tuple[int, int, int] | None:
+    """回傳 ``path``（store 檔案）父目錄目前的 ``(mode, uid, inode)``。
+
+    對抗審查第三輪（MAJOR）：`_load_index` 過去只把 :func:`_file_identity`
+    （store **檔案本身**的身分）當快取鍵——`AdmissionDecisionStore._check_parent`
+    的安全檢查是驗**父目錄**的權限位（`0o077` 遮罩），純把父目錄
+    chmod 成不安全權限（例如 `0o777`）完全不動檔案本身的 size／mtime／
+    inode／mode，因此 `_file_identity` 判定『沒變』→ 沿用快取索引 → 從未
+    真的呼叫 `store.all_rows()`／`_check_parent()`，讓已經不安全的目錄繼續
+    回報『新鮮』決策。
+
+    修法：把父目錄身分也併入快取鍵——目錄權限一旦變動，這裡算出的 tuple
+    就會不同，強迫 :meth:`DecisionReadCache._load_index` 落回真正呼叫
+    ``store.all_rows()``，由該呼叫鏈既有的 ``_check_parent()`` 做同一套
+    fail-closed 判定（本函式不重新定義『安全』的語意，只負責讓比對不被
+    繞過）。不用 ``st_mtime``／``st_size``——目錄內容變動（decisions.jsonl
+    的 rename／unlink）已經由 `_file_identity` 覆蓋，這裡只多補權限維度。
+    目錄不存在回 ``None``（比照 `_check_parent(allow_missing=True)` 的
+    既有語意，交由後續 `store.all_rows()` 走它自己的判定，不在這裡搶先
+    定調）。
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    return (stat.S_IMODE(info.st_mode), info.st_uid, info.st_ino)
+
+
 @dataclass
 class _CachedDecision:
     decision: "_quota_admission.AdmissionDecision"
@@ -143,15 +179,27 @@ class DecisionReadCache:
         # value 是 ``(identity, status, payload)``：`status="ok"` 時
         # `payload` 是索引 dict；`status="error"` 時 `payload` 是失敗訊息
         # 字串（供在同一個身分下重放同一個例外，不必真的重新開檔）。
+        # `identity` 是 ``(檔案身分, 父目錄身分)`` 的組合鍵——見
+        # `_parent_identity` 文件字串：父目錄權限被放寬時檔案本身的
+        # size／mtime／inode／mode 都不會變，組合鍵才能偵測到（對抗審查
+        # 第三輪 MAJOR）。
         self._index_by_path: dict[
-            str, tuple[tuple[int, int, int, int] | None, str, Any]
+            str,
+            tuple[
+                tuple[tuple[int, int, int, int] | None, tuple[int, int, int] | None],
+                str,
+                Any,
+            ],
         ] = {}
 
     def _load_index(
         self, store: "_quota_admission.AdmissionDecisionStore"
     ) -> dict[str, dict[str, Any]]:
         path_key = str(store.path)
-        identity = _file_identity(store.path)
+        # 對抗審查第三輪（MAJOR）：組合鍵＝檔案身分＋父目錄身分。單獨比對
+        # 檔案身分繞得過『父目錄權限被放寬、檔案內容沒變』這種攻擊面——見
+        # `_parent_identity` 文件字串。
+        identity = (_file_identity(store.path), _parent_identity(store.path.parent))
         cached = self._index_by_path.get(path_key)
         if cached is not None and cached[0] == identity:
             _, status, payload = cached
@@ -219,11 +267,62 @@ class DecisionReadCache:
         return None, None
 
 
+def _attempt_mismatch_reason(
+    decision: "_quota_admission.AdmissionDecision",
+    current_identity: object,
+) -> str | None:
+    """判斷已找到的 ``decision`` 是否仍對應這個 persona『目前』在處理的卡。
+
+    對抗審查第三輪（MAJOR）：`quota_admission` 指標一旦寫入就留在
+    ``WorkflowRun`` 上，直到下一次同一個 persona 的 admission 決策覆寫它
+    為止——`retry-card`（或世代 replay）重置卡片後、新 attempt 尚未寫出
+    receipt 前，指標仍指著上一個（已經結束）attempt 的舊 receipt。這裡只
+    比對呼叫端從既有 ``WorkflowRun.steps``（``card``／``executor``／
+    ``model``）推導出的『這個 persona 目前最早未通過的卡』，不重算 #839
+    的候選排序、原子預留或 job-count-based ``attempt_id``——那些仍是
+    quota_admission 模組自己的權責。
+
+    ``current_identity`` 非 ``Mapping``（呼叫端算不出目前卡，例如 persona
+    已無未通過的卡）一律視為不相符，不臆測。回 ``None`` 代表相符；非
+    ``None`` 是機器可讀的不相符原因。
+    """
+    if not isinstance(current_identity, Mapping):
+        return "current-card-not-derivable"
+    if current_identity.get("card") != decision.card_id:
+        return "card-superseded"
+    if decision.outcome == "admit":
+        selected = decision.selected if isinstance(decision.selected, Mapping) else None
+        if selected is None:
+            return "admit-missing-selected"
+        # admit 決策的身分解析（`step.executor`／`step.model`）與 admission
+        # 決策同一次候選迴圈迭代內依序寫入（見 `manager._record_resolved_model_chain`
+        # 呼叫點）；`retry-card` 重置這張卡時把兩者都清成 ``None``（見
+        # `registry._manager_reset_workflow_for_retry_card`），因此『目前
+        # 這張卡的身分』與這筆決策的 ``selected`` 不再一致，正是本檢查要
+        # 抓的訊號。
+        if (
+            current_identity.get("executor") != selected.get("executor")
+            or current_identity.get("model") != selected.get("model_id")
+        ):
+            return "identity-reset-since-decision"
+        return None
+    if decision.outcome == "wait":
+        # wait 決策從未寫入 step 身分（見 `manager._quota_admission_stop`／
+        # `_quota_admission_config_invalid_stop` 文件字串：全數候選被拒時
+        # 不建立任何 job，`step.executor`／`step.model` 維持原值不變）——
+        # card 相符已是本檢查僅憑 WorkflowRun 既有欄位能拿到的最強訊號；
+        # 同一張卡的第二次 wait 這個更深的世代區分需要 job-count-based
+        # ``attempt_id``（#839 既有語意），不在本檢查範圍內臆測。
+        return None
+    return "unknown-outcome"
+
+
 def _project_persona_decision(
     persona: str,
     *,
     pointer: object,
     profile_binding: object,
+    current_identity: object,
     store: "_quota_admission.AdmissionDecisionStore",
     cache: DecisionReadCache,
     now_ms: int,
@@ -247,6 +346,20 @@ def _project_persona_decision(
             payload.update(stale_info)
             payload.pop("gap_reason", None)
         return payload
+    if current_identity is not _ATTEMPT_CHECK_DISABLED:
+        mismatch_reason = _attempt_mismatch_reason(decision, current_identity)
+        if mismatch_reason is not None:
+            # 不相符：呈現「目前 attempt 尚無決策」，不得沿用舊 attempt 的
+            # mode／outcome／selected（見票面：『不得沿用舊 attempt』）。
+            return {
+                "persona": persona,
+                "decision_id": decision.decision_id,
+                "source": "decision-store",
+                "available": False,
+                "stale": False,
+                "gap_reason": "quota-decision-attempt-superseded",
+                "mismatch_reason": mismatch_reason,
+            }
     requested_profile_key = None
     resolved_profile_key = decision.profile_key
     # #840 對抗審查修復第二輪（MAJOR，約本檔原 250 行）：`execution_profile_bindings`
@@ -324,6 +437,7 @@ def project_workflow_quota_admission(
     quota_admission: Mapping[str, Mapping[str, str]] | None,
     needs_human_reason: Mapping[str, Any] | None,
     execution_profile_bindings: Mapping[str, Mapping[str, Any]] | None = None,
+    current_identity_by_persona: Mapping[str, Mapping[str, Any]] | None = None,
     store: "_quota_admission.AdmissionDecisionStore",
     cache: DecisionReadCache | None = None,
     now_ms: int,
@@ -332,6 +446,15 @@ def project_workflow_quota_admission(
 
     純函式（不寫任何檔案）；``store``／``cache`` 由呼叫端注入，同一次
     snapshot 內請傳同一個 ``cache`` 實例，確保跨 section 一致（見票面 AC3）。
+
+    ``current_identity_by_persona``（對抗審查第三輪 MAJOR）：呼叫端從
+    ``WorkflowRun.steps`` 推導出的『每個 persona 目前最早未通過的卡』
+    （``{"card":..., "executor":..., "model":...}``），供 :func:`_attempt_mismatch_reason`
+    判斷 `quota_admission` 指標是否仍對應這個 persona 目前的 attempt——見
+    該函式文件字串。**省略此參數維持逐字既有行為**（不做任何 attempt
+    比對），只有呼叫端明確傳入時才生效；這是刻意的可選欄位加法（比照
+    #835／#839 既有模式），現有呼叫端（例如本模組所有既有單元測試）不必
+    跟著改。
     """
 
     resolved_cache = cache if cache is not None else DecisionReadCache()
@@ -343,10 +466,15 @@ def project_workflow_quota_admission(
             profile_binding = None
             if isinstance(execution_profile_bindings, Mapping):
                 profile_binding = execution_profile_bindings.get(persona)
+            if current_identity_by_persona is None:
+                current_identity = _ATTEMPT_CHECK_DISABLED
+            else:
+                current_identity = current_identity_by_persona.get(persona)
             projected = _project_persona_decision(
                 persona,
                 pointer=pointer,
                 profile_binding=profile_binding,
+                current_identity=current_identity,
                 store=store,
                 cache=resolved_cache,
                 now_ms=now_ms,

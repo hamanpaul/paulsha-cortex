@@ -182,3 +182,110 @@ remaining、缺 provenance 的 legacy receipt、needs_human 語意保留、plann
    正確，不需要 bump，也不需要改碼。上方「對抗審查修復（5 條 MAJOR，本輪
    追加）」第 1 點已記錄過同一個結論與理由，本節僅確認第二輪重提的疑慮
    仍是同一個判定：不成立。
+
+## 對抗審查修復（第三輪，1 條 BLOCKER＋2 條 MAJOR）
+
+1. **`test_projection_does_not_mutate_decision_store_or_registry_bytes` 形同
+   空測 fix**（BLOCKER，`tests/test_decision_status_projection_840.py`）：
+   AC5「讀取前後 bytes 不變」的 provider 分支呼叫
+   `WorkflowRegistryProvider(REPO, state_path=state).scan()` 時沒有注入
+   `quota_decision_store=store`——provider 在未注入時會自建一個指向**預設
+   路徑**（`quota_admission_decisions_root()/decisions.jsonl`，Trust Root
+   資產位置）的 store，跟這裡雜湊的 `tmp_path/decisions.jsonl` 是兩個完全
+   不同的檔案；`scan()` 從未真的讀寫過 `store.path`，讓 bytes-不變斷言不管
+   scan() 做了什麼都會通過。手動驗證（monkeypatch `scan()` 對它自己持有的
+   `self._quota_decision_store.path` 額外寫入 bytes）：未注入時 provider 的
+   store path 是預設路徑、corruption 寫進去測試的雜湊完全碰不到，斷言仍
+   `True`（vacuous 成立）；注入 `store` 後 provider 的 store path 與測試雜湊
+   的檔案是同一個，corruption 被抓到，斷言變成 `False`。修法：明確注入
+   `quota_decision_store=store`，並額外斷言 `scan()` 確實投影出這筆
+   decision（證明 provider 真的讀到了它，不是又落回『沒有任何 #839 證據』
+   的空路徑）。
+2. **`quota_admission` 指標沿用已結束 attempt 的舊 receipt fix**（MAJOR，
+   `paulsha_cortex/monitor/decision_projection.py`／`providers.py`）：
+   `_quota_decision_row()`／`project_workflow_quota_admission()` 過去接受
+   `WorkflowRun.quota_admission[persona]` 上的任何指標，不管它是不是這個
+   persona『目前』在處理的 attempt——這個指標一旦寫入就留在 run 上，直到
+   下一次同一個 persona 的 admission 決策覆寫它為止；`retry-card`（#545／
+   #569）重置卡片（`step.executor`／`step.model` 清成 `None`，見
+   `registry._manager_reset_workflow_for_retry_card`）後、新 attempt 尚未
+   寫出 receipt 前，指標仍指著上一個已經結束的 attempt 的舊 admit／wait
+   receipt，`cortex work show`／`cortex inspect status` 會誤呈現成『目前』
+   的決策。
+   修法：`project_workflow_quota_admission()` 新增可選參數
+   `current_identity_by_persona`（呼叫端從 `WorkflowRun.steps` 推導出的
+   『每個 persona 目前最早未通過的卡』：`{"card","executor","model"}`，比照
+   `registry._manager_reset_workflow_for_retry_card` 挑「當前 phase 內最早
+   一張尚未通過的卡」同一個判準）；`_attempt_mismatch_reason()` 比對已找到
+   的決策是否仍對應這張卡——`outcome=="admit"` 時要求 `selected` 與目前卡
+   的 `executor`／`model_id` 完全相符（兩者本來就在同一次候選迴圈迭代內
+   依序寫入，`retry-card` 只清掉 step 這一半，造成不一致）；`outcome==
+   "wait"` 時（wait 從未寫入 step 身分）以卡是否相符為僅能拿到的最強訊號；
+   卡不同、或呼叫端算不出目前卡（`current_identity_by_persona` 有傳但這個
+   persona 沒有任何未通過的卡）一律視為不相符，不臆測。不相符時回報
+   `available: false`、`gap_reason: "quota-decision-attempt-superseded"` ＋
+   機器可讀的 `mismatch_reason`，不帶出舊 attempt 的
+   `mode`／`outcome`／`selected`／`excluded`／`classification`，只保留
+   `decision_id` 供 operator 追查那筆已結束 attempt 的舊 receipt。
+   **省略此參數維持逐字既有行為**（比照 #835／#839 既有的可選欄位加法
+   模式）——本模組既有全部單元測試與 `manager.workflow_status_entry()`
+   （`cortex inspect status` 的 `_workflow_quota_decision_projection()`
+   呼叫點）都還沒有傳這個參數，因此**只有 `cortex work show`
+   （`WorkflowRegistryProvider._quota_decision_row()`，本輪已接上，見下）
+   這條路徑受益；`cortex inspect status` 要接上同一個檢查需要在
+   `manager.py` 內把 `run.steps` 換算成 `current_identity_by_persona` 並多
+   傳一個參數——manager.py 本輪明確排除在改動範圍外（另一票在審），因此
+   刻意不動，留下已知的路徑間 parity 缺口，待 manager.py 解除排他後再補
+   對稱的一行改動。
+   同一輪也修了 `WorkflowRegistryProvider.scan()` 聚合 `quota_decisions` 的
+   一個相關缺陷：同一個 `work_id` 對應多個 run（例如舊 attempt 已標
+   `done`／`superseded`、換了新 run_id 繼續派工）時，`scan()` 過去無條件
+   覆寫、等於『最後一個非空投影贏』——若已終局的舊 run 恰好在 `rows` 迭代
+   順序裡排在仍在跑的新 run 之後，就會顯示已經結束的那個 run 的決策。改成
+   沿用 `monitor.lifecycle.project_work_items` 既有的選 run 規則（排除
+   `done`／`completed`／`failed`／`superseded`，見該函式 `workflows` 變數）：
+   只有非終局狀態的 run 才能寫入這個 work_id 的欄位；同一輪掃描裡已有一個
+   非終局 run 佔住這個 work_id 時，後來的終局 run 不得覆寫掉它。
+   補測試（`tests/test_decision_status_projection_840.py`）：
+   shared-function 層級的 admit／wait 相符與不相符（身分 reset、卡片前進、
+   算不出目前卡）共 7 個案例、`WorkflowRegistryProvider.scan()` 端到端的
+   retry-card 重置情境（`test_provider_scan_after_retry_card_reset_reports_pending_not_stale_admit`）、
+   以及 work_id 對應多個 run 時選 run 規則
+   （`test_scan_quota_decision_for_work_id_picks_active_run_not_last_processed`）。
+   既有 fixture 副作用：本檔 `_step()` 輔助函式的預設 `executor`／`model`
+   （`"planned-executor"`／`"planned-model"`）與 `_decision()` 預設
+   `selected`（`"codex"`／`"gpt-5.3-codex"`）本來就不相符——新增的比對邏輯
+   會讓所有沿用預設值、原本期待完整 admit 投影的既有測試改判成 mismatch。
+   `_step()` 新增可選 `executor`／`model` 參數（預設不變），並在會經過
+   `WorkflowRegistryProvider.scan()` 的既有測試（`consistency-840`、
+   `bytes-840`、`e2e-work-show-840`；另含 `tests/test_monitor_work_api.py`
+   的 `test_refresher_quota_decision_cache_survives_across_refresh_ticks_for_last_good_stale`）
+   顯式傳入與各自 admit 決策 `selected` 相符的 `executor`／`model`，讓這些
+   測試繼續驗證完整投影，而不是意外落入新的 mismatch 分支。
+3. **`DecisionReadCache` 被『父目錄權限放寬、檔案本身沒變』繞過 fix**
+   （MAJOR，`paulsha_cortex/monitor/decision_projection.py`）：
+   `DecisionReadCache._load_index()` 過去只以 store **檔案本身**的
+   `(size, mtime_ns, inode, mode)`（`_file_identity()`）判斷快取是否命中，
+   完全沒有比對 `AdmissionDecisionStore._check_parent()` 驗的**父目錄**
+   權限位（`0o077` 遮罩）。第一次成功讀取後，若把
+   `quota-admission-decisions/` 目錄改成不安全權限（例如 `0o777`）——檔案
+   本身的 size／mtime／inode／mode 完全不變——`_load_index()` 判定『沒
+   變』就直接沿用快取索引，從未真的呼叫 `store.all_rows()`／
+   `_check_parent()`，讓已經不安全的目錄繼續回報 `stale=false` 的新鮮
+   決策。
+   修法：新增 `_parent_identity()`（回傳父目錄的 `(mode, uid, inode)`），
+   把它併入 `_load_index()` 的快取鍵（`(檔案身分, 父目錄身分)` 組合）——
+   父目錄權限一變，組合鍵就不同，強迫落回真正呼叫 `store.all_rows()`，由
+   該呼叫鏈既有的 `_check_parent()` 做同一套 fail-closed 判定（本函式不
+   重新定義『安全』的語意，只負責讓比對不被繞過）。補
+   `test_decision_read_cache_detects_parent_directory_permission_widened`：
+   第一次讀取成功後 chmod 父目錄成 `0o777`，驗證第二次讀取回報
+   `stale=true`／`stale_reason` 含 `parent-permissions-invalid`，且 last-good
+   內容（同一筆 decision）仍完整保留。
+
+**RED→GREEN 驗證方式**：條目 2／3 用 `git show HEAD:<path>` 暫時還原
+`decision_projection.py`／`providers.py`、重跑新測試確認全數失敗（RED），
+復原後全數通過（GREEN）。條目 1 因為是測試強度問題（production 程式碼本身
+沒有 bug），改用手動 monkeypatch 腳本驗證：讓 `scan()` 對它實際持有的 store
+路徑寫入 bytes，比較「未注入 store」與「已注入 store」兩種情境下 bytes-
+不變斷言的結果（見上方條目 1 說明的驗證數字）。

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat as stat_module
 from pathlib import Path
 
 import pytest
@@ -44,13 +45,20 @@ _NOW = 1_900_000_000_000
 # ---------------------------------------------------------------------------
 
 
-def _step(card: str, *, phase: str = "build", persona: str = "builder") -> WorkflowStep:
+def _step(
+    card: str,
+    *,
+    phase: str = "build",
+    persona: str = "builder",
+    executor: str | None = "planned-executor",
+    model: str | None = "planned-model",
+) -> WorkflowStep:
     return WorkflowStep(
         phase=phase,
         persona=persona,
         card=card,
-        executor="planned-executor",
-        model="planned-model",
+        executor=executor,
+        model=model,
         domain="test-domain",
         inputs=(),
         outputs=(),
@@ -408,9 +416,14 @@ def test_planned_identity_does_not_fabricate_actual_and_has_no_quota_evidence(tm
 def test_status_entry_and_work_show_row_agree_on_same_snapshot(tmp_path: Path) -> None:
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
+    # 對抗審查第三輪（MAJOR）：步卡的 executor／model 必須與下面 admit
+    # 決策的 `selected` 一致——`WorkflowRegistryProvider.scan()` 現在會比對
+    # 兩者是否相符（見 `_current_persona_identity_from_steps`），不一致會
+    # 被判成『目前 attempt 尚無決策』而不是這裡要驗證的完整投影。
     run = _run(
         registry, tmp_path, work_id="consistency-840",
-        steps=(_step("build-card"),), facets=("needs_human",),
+        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+        facets=("needs_human",),
     )
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(
@@ -730,7 +743,13 @@ def test_old_attempt_receipt_immutable_after_newer_attempt_recorded(tmp_path: Pa
 def test_projection_does_not_mutate_decision_store_or_registry_bytes(tmp_path: Path) -> None:
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
-    run = _run(registry, tmp_path, work_id="bytes-840", steps=(_step("build-card"),))
+    # 步卡 executor／model 對齊下面 admit 決策的 `selected`（見
+    # `_current_persona_identity_from_steps` 的比對），確保這裡驗證的是完整
+    # 投影而不是「目前 attempt 尚無決策」的 mismatch 分支。
+    run = _run(
+        registry, tmp_path, work_id="bytes-840",
+        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+    )
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(decision_id="adm:v1:" + "0" * 64, run_id=run.run_id, card_id="build-card")
     store.record(decision)
@@ -741,7 +760,19 @@ def test_projection_does_not_mutate_decision_store_or_registry_bytes(tmp_path: P
     registry_before = hashlib.sha256(state.read_bytes()).hexdigest()
 
     manager.workflow_status_entry(registry, run, quota_decision_store=store)
-    WorkflowRegistryProvider(REPO, state_path=state).scan()
+    # 對抗審查第三輪（BLOCKER）：舊版沒有把 provider 指到上面雜湊的
+    # `tmp_path/decisions.jsonl`——`WorkflowRegistryProvider` 在沒有注入
+    # `quota_decision_store` 時會自建一個指向**預設路徑**（Trust Root 資產
+    # 位置）的 store，跟這裡雜湊的檔案完全是兩個檔案，scan() 從未真的碰過
+    # `store.path`，讓下面的 bytes-不變斷言形同空測（不管 scan 有沒有寫壞
+    # store 都會通過）。這裡明確注入同一個 `store`，讓 scan() 真的讀這份
+    # store，斷言才有意義；同時斷言 scan() 真的投影出這筆 decision，證明
+    # provider 確實讀到了它（不是又落回『沒有任何 #839 證據』的空路徑）。
+    result = WorkflowRegistryProvider(REPO, state_path=state, quota_decision_store=store).scan()
+    assert (
+        result.observations["quota_decisions"]["bytes-840"]["personas"]["builder"]["decision_id"]
+        == decision.decision_id
+    )
 
     decisions_after = hashlib.sha256(store.path.read_bytes()).hexdigest()
     registry_after = hashlib.sha256(state.read_bytes()).hexdigest()
@@ -843,7 +874,12 @@ def test_producer_to_snapshot_to_work_show_end_to_end(tmp_path: Path) -> None:
 
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
-    run = _run(registry, tmp_path, work_id="e2e-work-show-840", steps=(_step("build-card"),))
+    # 步卡 executor／model 對齊下面 admit 決策的 `selected`，理由同上（見
+    # `_current_persona_identity_from_steps`）。
+    run = _run(
+        registry, tmp_path, work_id="e2e-work-show-840",
+        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+    )
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(
         decision_id="adm:v1:" + "5" * 63 + "6", run_id=run.run_id, card_id="build-card",
@@ -861,3 +897,365 @@ def test_producer_to_snapshot_to_work_show_end_to_end(tmp_path: Path) -> None:
     assert "quota_decision[builder]:" in joined
     assert f"decision_id: {decision.decision_id}" in joined
     assert "mode: shadow  outcome: admit" in joined
+
+
+# ---------------------------------------------------------------------------
+# 對抗審查第三輪
+#
+# 條目 1（BLOCKER，測試強度）：見上方
+# `test_projection_does_not_mutate_decision_store_or_registry_bytes` 的修法——
+# provider 分支已改成注入同一份 store，並斷言真的投影出這筆 decision。
+#
+# 條目 2（MAJOR，providers.py／decision_projection.py）：`quota_admission`
+# 指標不得沿用不再對應『目前 attempt』的舊 receipt；下面補上 shared-function
+# 層級（`dp.project_workflow_quota_admission` 的 `current_identity_by_persona`）
+# 與 provider 端到端（`WorkflowRegistryProvider.scan()`）兩層測試，並補
+# work_id 對應多個 run 時的選 run 規則。
+#
+# 條目 3（MAJOR，decision_projection.py）：`DecisionReadCache` 補父目錄安全
+# 檢查，不再被『檔案本身沒變、父目錄權限被放寬』繞過。
+# ---------------------------------------------------------------------------
+
+
+def test_attempt_check_disabled_by_default_preserves_existing_behavior(tmp_path: Path) -> None:
+    """`current_identity_by_persona` 完全省略（本檔既有全部呼叫方式）時，
+    attempt 比對必須逐字停用——新增這個可選參數不得改變任何既有呼叫端的
+    既有行為（比照 #835／#839 既有的可選欄位加法模式）。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "31", card_id="build-card",
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(decision)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={"builder": {"decision_id": decision.decision_id, "mode": "shadow", "outcome": "admit"}},
+        needs_human_reason=None,
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is True
+    assert persona["selected"] == {"executor": "codex", "model_id": "gpt-5.3-codex"}
+
+
+def test_admit_matches_current_step_identity_stays_available(tmp_path: Path) -> None:
+    """對照組：`current_identity_by_persona` 有傳、且與這筆 admit 決策的
+    ``selected``／``card_id`` 完全相符時，仍完整呈現（本次修法只收斂不相符
+    的情況，不影響正常、當前的 admit 呈現）。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "32", card_id="build-card",
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(decision)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={"builder": {"decision_id": decision.decision_id, "mode": "shadow", "outcome": "admit"}},
+        needs_human_reason=None,
+        current_identity_by_persona={
+            "builder": {"card": "build-card", "executor": "codex", "model": "gpt-5.3-codex"},
+        },
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is True
+    assert persona["outcome"] == "admit"
+    assert persona["selected"] == {"executor": "codex", "model_id": "gpt-5.3-codex"}
+
+
+def test_admit_after_retry_card_identity_reset_is_pending_not_stale(tmp_path: Path) -> None:
+    """`retry-card` 重置卡片（`step.executor`／`step.model` 清成 ``None``，見
+    `registry._manager_reset_workflow_for_retry_card`）後、新 attempt 尚未
+    寫出 receipt 前，``quota_admission["builder"]`` 仍指著上一個（已經結束）
+    attempt 的 admit receipt。傳入從 reset 後的 ``WorkflowRun.steps`` 推導的
+    `current_identity_by_persona` 時，必須偵測到身分已被清空、跟這筆決策的
+    ``selected`` 不再一致，呈現「目前 attempt 尚無決策」，不得沿用舊
+    attempt 的 mode／outcome／selected。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    stale_admit = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "33", card_id="build-card",
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(stale_admit)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={
+            "builder": {"decision_id": stale_admit.decision_id, "mode": "shadow", "outcome": "admit"},
+        },
+        needs_human_reason=None,
+        # 模擬 retry-card 重置後的快照：同一張卡，身分已被清空。
+        current_identity_by_persona={
+            "builder": {"card": "build-card", "executor": None, "model": None},
+        },
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is False
+    assert persona["gap_reason"] == "quota-decision-attempt-superseded"
+    assert persona["mismatch_reason"] == "identity-reset-since-decision"
+    # 不得沿用舊 attempt 的欄位——operator 讀到的必須是『目前沒有決策』，
+    # 不是上一輪的 mode／outcome／selected。
+    for leaked_field in ("mode", "outcome", "selected", "excluded", "classification"):
+        assert leaked_field not in persona
+    # 但保留 decision_id，方便追查那筆已結束 attempt 的舊 receipt。
+    assert persona["decision_id"] == stale_admit.decision_id
+
+
+def test_admit_pointer_for_superseded_card_is_pending(tmp_path: Path) -> None:
+    """卡片已經前進到下一張（``current_identity_by_persona`` 的 ``card``
+    與決策的 ``card_id`` 不同）時，同樣視為不相符——不得把上一張卡的 admit
+    誤呈現成『目前這張卡』的決策。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "34", card_id="build-card-1",
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(decision)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={"builder": {"decision_id": decision.decision_id, "mode": "shadow", "outcome": "admit"}},
+        needs_human_reason=None,
+        current_identity_by_persona={
+            "builder": {"card": "build-card-2", "executor": None, "model": None},
+        },
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is False
+    assert persona["mismatch_reason"] == "card-superseded"
+
+
+def test_current_identity_missing_for_persona_is_treated_as_not_derivable(tmp_path: Path) -> None:
+    """`current_identity_by_persona` 有傳，但這個 persona 底下沒有任何未通過
+    的卡（例如已經全部通過、或呼叫端根本算不出來）——票面：『推導不出就視為
+    不相符』，不得預設放行。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "35", card_id="build-card",
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(decision)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={"builder": {"decision_id": decision.decision_id, "mode": "shadow", "outcome": "admit"}},
+        needs_human_reason=None,
+        current_identity_by_persona={},
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is False
+    assert persona["mismatch_reason"] == "current-card-not-derivable"
+
+
+def test_wait_matches_current_card_stays_available(tmp_path: Path) -> None:
+    """wait 決策從未寫入 step 身分（見 `manager._quota_admission_stop`
+    文件字串），card 相符已是能拿到的最強訊號——相符時仍完整呈現這個 wait，
+    不因為新增 attempt 比對就把正常、當前的 wait 也隱藏掉。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    wait_decision = admission.AdmissionDecision(
+        decision_id="adm:v1:" + "7" * 62 + "36",
+        run_id="run-1", card_id="build-card", attempt_id="n0",
+        profile_key="quota-admission:no-admissible-candidate",
+        mode="enforced", outcome="wait",
+        policy_version=admission.ADMISSION_POLICY_VERSION,
+        observation_version="not-applicable", demand_version="not-applicable",
+        qualification_version="not-enforced",
+        generated_at_ms=_NOW, selected=None, reservation_id=None,
+        excluded=(), reason="quota-admission-insufficient",
+    )
+    store.record(wait_decision)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={
+            "builder": {"decision_id": wait_decision.decision_id, "mode": "enforced", "outcome": "wait"},
+        },
+        needs_human_reason=None,
+        current_identity_by_persona={
+            "builder": {"card": "build-card", "executor": None, "model": None},
+        },
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is True
+    assert persona["outcome"] == "wait"
+
+
+def test_wait_pointer_for_superseded_card_is_pending(tmp_path: Path) -> None:
+    """wait 決策的卡與目前卡不同時，同樣不相符（卡片已經前進）。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    wait_decision = admission.AdmissionDecision(
+        decision_id="adm:v1:" + "7" * 62 + "37",
+        run_id="run-1", card_id="build-card-1", attempt_id="n0",
+        profile_key="quota-admission:no-admissible-candidate",
+        mode="enforced", outcome="wait",
+        policy_version=admission.ADMISSION_POLICY_VERSION,
+        observation_version="not-applicable", demand_version="not-applicable",
+        qualification_version="not-enforced",
+        generated_at_ms=_NOW, selected=None, reservation_id=None,
+        excluded=(), reason="quota-admission-insufficient",
+    )
+    store.record(wait_decision)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={
+            "builder": {"decision_id": wait_decision.decision_id, "mode": "enforced", "outcome": "wait"},
+        },
+        needs_human_reason=None,
+        current_identity_by_persona={
+            "builder": {"card": "build-card-2", "executor": None, "model": None},
+        },
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is False
+    assert persona["mismatch_reason"] == "card-superseded"
+
+
+def test_provider_scan_after_retry_card_reset_reports_pending_not_stale_admit(tmp_path: Path) -> None:
+    """端到端（`WorkflowRegistryProvider.scan()`，`cortex work show` 路徑）：
+    先寫一筆正常 admit receipt（步卡身分與 selected 相符）→ 模擬 `retry-card`
+    重置這張卡（`step.executor`／`step.model` 清成 ``None``，`needs_human`
+    facet／理由清空，比照 `registry._manager_reset_workflow_for_retry_card`
+    的既有效果）→ 新 attempt 尚未寫出任何新 receipt 前，`cortex work show`
+    不得沿用重置前那筆 admit receipt 的 mode／selected。"""
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    run = _run(
+        registry, tmp_path, work_id="retry-card-840",
+        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+        facets=(),
+    )
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "38", run_id=run.run_id, card_id="build-card",
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(decision)
+    registry._manager_update_workflow_run(run.run_id, quota_admission=_quota_admission_pointer(decision))
+
+    # 修好之前的基準：重置前，`cortex work show` 正確顯示這筆 admit。
+    before_reset = WorkflowRegistryProvider(
+        REPO, state_path=state, quota_decision_store=store,
+    ).scan().observations["quota_decisions"]["retry-card-840"]
+    assert before_reset["personas"]["builder"]["available"] is True
+    assert before_reset["personas"]["builder"]["outcome"] == "admit"
+
+    # 模擬 `retry-card`：同一張卡，身分清空、facet／理由清空（`quota_admission`
+    # 指標維持不動——這正是票面描述的『新 attempt 尚未寫出 receipt 前』）。
+    registry._manager_update_workflow_run(
+        run.run_id,
+        steps=(_step("build-card", executor=None, model=None),),
+        facets=(), needs_human_reason=None,
+    )
+
+    after_reset = WorkflowRegistryProvider(
+        REPO, state_path=state, quota_decision_store=store,
+    ).scan().observations["quota_decisions"]["retry-card-840"]
+    persona = after_reset["personas"]["builder"]
+    assert persona["available"] is False
+    assert persona["gap_reason"] == "quota-decision-attempt-superseded"
+    # 不得沿用重置前那筆 admit 的 mode／selected。
+    assert "mode" not in persona
+    assert "selected" not in persona
+    assert persona["decision_id"] == decision.decision_id
+
+
+def test_scan_quota_decision_for_work_id_picks_active_run_not_last_processed(tmp_path: Path) -> None:
+    """對抗審查第三輪（MAJOR，providers.py 約 568）：同一個 ``work_id``
+    對應多個 run（例如舊 attempt 已標終局狀態、換了新 run_id 繼續派工）時，
+    `scan()` 過去無條件覆寫、等於『最後一個非空投影贏』——若終局的舊 run
+    恰好在迴圈裡排在仍在跑的新 run **之後**，`cortex work show` 就會顯示
+    已經結束的那個 run 的額度決策。修法沿用 `lifecycle.project_work_items`
+    既有的選 run 規則（排除 done／completed／failed／superseded），這裡先
+    建立『仍在跑的 run』、再建立『已終局的 run』（故意讓終局 run 在
+    ``rows`` 迭代順序裡排在後面，重現舊版會選錯的排序），驗證挑中的仍是
+    仍在跑的那個。"""
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    work_id = "multi-run-840"
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+
+    active_run = registry._manager_create_workflow_run(
+        work_id=work_id, repo=REPO, claim_key=f"{REPO}/{work_id}/active",
+        source_revision="a" * 64, workspace_root=str(tmp_path / "workspace" / "active"),
+        combo="feature-oneshot", current_phase="build",
+        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+        attempts={"build": 1}, facets=(), gate_status="running",
+    )
+    active_decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "39", run_id=active_run.run_id, card_id="build-card",
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(active_decision)
+    registry._manager_update_workflow_run(
+        active_run.run_id, quota_admission=_quota_admission_pointer(active_decision),
+    )
+
+    # 建立在 active_run 之後，`rows` 迭代順序會排在它後面——舊版「最後一個
+    # 非空投影贏」會誤選這個已終局的 run。
+    superseded_run = registry._manager_create_workflow_run(
+        work_id=work_id, repo=REPO, claim_key=f"{REPO}/{work_id}/superseded",
+        source_revision="b" * 64, workspace_root=str(tmp_path / "workspace" / "superseded"),
+        combo="feature-oneshot", current_phase="build",
+        steps=(_step("build-card", executor="claude", model="sonnet"),),
+        attempts={"build": 1}, facets=(), gate_status="running",
+    )
+    superseded_decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "40", run_id=superseded_run.run_id, card_id="build-card",
+        selected={"executor": "claude", "model_id": "sonnet"},
+    )
+    store.record(superseded_decision)
+    registry._manager_update_workflow_run(
+        superseded_run.run_id, quota_admission=_quota_admission_pointer(superseded_decision),
+    )
+    registry._manager_update_workflow_run(superseded_run.run_id, status="superseded")
+
+    result = WorkflowRegistryProvider(
+        REPO, state_path=state, quota_decision_store=store,
+    ).scan()
+    row_projection = result.observations["quota_decisions"][work_id]
+
+    assert row_projection["run_id"] == active_run.run_id
+    assert row_projection["personas"]["builder"]["decision_id"] == active_decision.decision_id
+
+
+def test_decision_read_cache_detects_parent_directory_permission_widened(tmp_path: Path) -> None:
+    """對抗審查第三輪（MAJOR，decision_projection.py 約 154）：
+    `DecisionReadCache` 過去只以 store 檔案本身的 (size, mtime_ns, inode,
+    mode) 判斷快取命中，繞過 `AdmissionDecisionStore._check_parent()` 的父
+    目錄安全檢查。第一次成功讀取後，若父目錄（`quota-admission-decisions/`）
+    被改成不安全權限（例如 `0o777`）——檔案本身完全沒變——舊版仍會沿用
+    快取索引、回報 `stale=False`。修法把父目錄身分併入快取鍵，權限一變就
+    強迫真正重讀，落回 `AdmissionDecisionStore._check_parent()` 既有的
+    fail-closed 判定。"""
+    decisions_path = tmp_path / "quota-admission-decisions" / "decisions.jsonl"
+    store = admission.AdmissionDecisionStore(decisions_path)
+    decision = _decision(decision_id="adm:v1:" + "7" * 62 + "41")
+    store.record(decision)
+    cache = dp.DecisionReadCache()
+
+    first, first_stale = cache.get(store, decision.decision_id, now_ms=_NOW)
+    assert first is not None
+    assert first_stale is None
+
+    parent = decisions_path.parent
+    original_mode = parent.stat().st_mode
+    parent.chmod(0o777)
+    try:
+        second, second_stale = cache.get(store, decision.decision_id, now_ms=_NOW + 1)
+    finally:
+        parent.chmod(stat_module.S_IMODE(original_mode))
+
+    # last-good 仍完整保留（檔案身分沒變，內容仍是同一筆 decision）。
+    assert second is not None
+    assert second.decision_id == decision.decision_id
+    assert second_stale is not None
+    assert second_stale["stale"] is True
+    assert "parent-permissions-invalid" in second_stale["stale_reason"]

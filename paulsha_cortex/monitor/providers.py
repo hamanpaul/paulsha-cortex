@@ -571,7 +571,23 @@ class WorkflowRegistryProvider:
                     cache=self._quota_decision_cache,
                 )
                 if quota_projection is not None:
-                    quota_decisions[work_id] = {"run_id": run_id, **quota_projection}
+                    # 對抗審查第三輪（MAJOR）：`rows` 內同一個 work_id 可能對應
+                    # 多個 run（例如同一個 claim_key 的舊 attempt 被標
+                    # superseded／done 之後，同一個 work_id 換了新 run_id 繼續
+                    # 派工）。舊實作無條件覆寫，等於「最後一個非空投影贏」——
+                    # 若舊（已終局）run 恰好排在新（仍在跑）run 後面，`cortex
+                    # work show` 就會顯示已經結束的那個 run 的額度決策。
+                    # 沿用 `lifecycle.project_work_items` 既有的「選 run」規則
+                    # （`workflow_run` source 排除 done／completed／failed／
+                    # superseded 才算『目前有效』，見該函式 `workflows` 變數）：
+                    # 只有非終局狀態的 run 才能寫入這個 work_id 的欄位；同一輪
+                    # 掃描裡若已經有一個非終局 run 佔住這個 work_id（正常情況下
+                    # 至多一個），後來的終局 run 不得覆寫掉它。
+                    row_status = row.get("status", "ongoing")
+                    if row_status not in _TERMINAL_WORKFLOW_RUN_STATUSES:
+                        quota_decisions[work_id] = {"run_id": run_id, **quota_projection}
+                    elif work_id not in quota_decisions:
+                        quota_decisions[work_id] = {"run_id": run_id, **quota_projection}
                 # #731 (C)：候選 git base（真的那個 40-hex commit SHA）與落後
                 # mirror 上 origin/main 的距離。同樣走 observations 通道，理由
                 # 與上面兩段一致（新增 row 欄位會讓整份 projection degraded）。
@@ -767,6 +783,45 @@ def _needs_human_reason_row(row: Mapping[str, Any]) -> dict[str, object] | None:
     }
 
 
+#: 對抗審查第三輪（MAJOR，約本檔 568）：`quota_decisions` 依 work_id 聚合時
+#: 判定「目前有效的 run」的終局狀態集合——逐字沿用
+#: `monitor.lifecycle.project_work_items` 既有的 `workflows` 過濾條件（該
+#: 函式把這幾個狀態的 `workflow_run` source 視為不再代表『目前』），不另外
+#:發明一套平行的終局狀態定義。
+_TERMINAL_WORKFLOW_RUN_STATUSES = frozenset({"done", "completed", "failed", "superseded"})
+
+
+def _current_persona_identity_from_steps(steps: object) -> dict[str, dict[str, object]]:
+    """從 ``row["steps"]`` 推導『每個 persona 目前最早未通過的卡』。
+
+    對抗審查第三輪（MAJOR）：只依賴 ``WorkflowStep`` 既有欄位
+    （``persona``／``card``／``gate_result``／``executor``／``model``），不
+    重算 #839 的候選排序或 dispatch 邏輯——單純沿用
+    `registry._manager_reset_workflow_for_retry_card` 挑「當前 phase 內最早
+    一張尚未通過的卡」時同一個判準（`gate_result != "passed"`，取第一個），
+    供 `decision_projection._attempt_mismatch_reason` 判斷 `quota_admission`
+    指標是否仍對應這張卡『目前』的身分。同一個 persona 若有多張未通過的
+    卡，只取最早（``steps`` 既有順序）一張——那也正是下一次會被派工的卡。
+    """
+    if not isinstance(steps, (list, tuple)):
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    for step in steps:
+        if not isinstance(step, Mapping):
+            continue
+        persona = step.get("persona")
+        if not isinstance(persona, str) or not persona or persona in result:
+            continue
+        if step.get("gate_result") == "passed":
+            continue
+        result[persona] = {
+            "card": step.get("card"),
+            "executor": step.get("executor"),
+            "model": step.get("model"),
+        }
+    return result
+
+
 def _quota_decision_row(
     row: Mapping[str, Any],
     *,
@@ -799,6 +854,12 @@ def _quota_decision_row(
             if isinstance(row.get("execution_profile_bindings"), Mapping)
             else None
         ),
+        # 對抗審查第三輪（MAJOR）：見 `_current_persona_identity_from_steps`
+        # 與 `decision_projection._attempt_mismatch_reason` 文件字串——只有
+        # `WorkflowRegistryProvider.scan()` 這條路徑（有完整 `row["steps"]`）
+        # 目前會傳這個參數；`manager.workflow_status_entry()`（`cortex
+        # inspect status`）尚未接上同一個檢查，見本檔／changelog 對應說明。
+        current_identity_by_persona=_current_persona_identity_from_steps(row.get("steps")),
         store=store,
         cache=cache,
         now_ms=int(time.time() * 1000),
