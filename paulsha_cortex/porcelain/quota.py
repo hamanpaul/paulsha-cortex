@@ -1,8 +1,12 @@
-"""`cortex quota observe`／`cortex quota import`：#836 額度觀測 collector CLI。
+"""`cortex quota observe`／`cortex quota import`／`cortex quota bindings`：
+#836 額度觀測 collector CLI，以及 #1116 唯讀 binding 診斷報表。
 
 `observe` 對設定檔內每個 executor 執行唯讀讀取並記錄觀測；`import` 由 Manager
 帳號匯入 operator 以 `--output` 落地、之後帶到 Manager 帳號的 observation 檔。
-兩者都不讀任何 credential 檔，也不把 provider 原始 payload 印到 stdout/stderr。
+`bindings --report` 唯讀彙總 admission decision store 裡『曾經派工用到、但用
+目前設定檔重算仍然沒有任何 binding 涵蓋』的 resolved profile key（見 #1116），
+不寫入任何狀態，也不啟動任何 provider CLI。三者都不讀任何 credential 檔，也
+不把 provider 原始 payload 印到 stdout/stderr。
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from paulsha_cortex.coordinator import quota_collectors, quota_ledger, quota_shadow
+from paulsha_cortex.coordinator import quota_admission, quota_collectors, quota_ledger, quota_shadow
 
 from . import COMMANDS, PorcelainCommand, register
 
@@ -63,6 +67,21 @@ def _build_parser() -> argparse.ArgumentParser:
     do_import.add_argument("--file", required=True, help="待匯入的 observation 檔路徑")
     do_import.add_argument("--json", action="store_true", help="輸出機讀摘要")
 
+    bindings_cmd = sub.add_parser(
+        "bindings",
+        help="唯讀彙總目前派工用到、但沒有任何 binding 涵蓋的 resolved profile key（見 #1116）",
+    )
+    bindings_cmd.add_argument(
+        "--report", action="store_true",
+        help="執行報表（目前唯一支援的動作；明確要求避免未來語意混淆）",
+    )
+    bindings_cmd.add_argument("--config", required=True, help="cortex/quota-pools/v1 設定檔路徑（讀取目前 bindings）")
+    bindings_cmd.add_argument(
+        "--store", default=None,
+        help="admission decision store 路徑；預設沿用既有 PSC_* 路徑（見 AdmissionDecisionStore）",
+    )
+    bindings_cmd.add_argument("--json", action="store_true", help="輸出機讀摘要")
+
     return parser
 
 
@@ -73,6 +92,8 @@ def main(argv: Sequence[str]) -> int:
         return _run_observe(args)
     if args.command == "import":
         return _run_import(args)
+    if args.command == "bindings":
+        return _run_bindings_report(args)
     parser.error(f"unsupported quota command: {args.command}")
     return 2
 
@@ -245,3 +266,59 @@ def _run_import(args: argparse.Namespace) -> int:
             f"conflicts={results['conflicts']} invalid={results['invalid']}"
         )
     return 0 if results["invalid"] == 0 else 1
+
+
+def _run_bindings_report(args: argparse.Namespace) -> int:
+    """#1116：唯讀彙總『目前派工用到、但用目前設定檔重算仍然沒有任何
+    binding 涵蓋』的 resolved profile key——只讀 admission decision store 與
+    quota-pools 設定檔，不寫任何狀態，也不呼叫任何 provider CLI／shadow／
+    reservation。"""
+    if not args.report:
+        print("錯誤: 目前 `cortex quota bindings` 只支援 --report", file=sys.stderr)
+        return 2
+
+    try:
+        config = quota_admission.load_quota_pools_config(args.config)
+    except quota_admission.QuotaPoolsConfigError as exc:
+        print(f"錯誤: 設定檔載入失敗：{exc}", file=sys.stderr)
+        return 1
+    if config is None:
+        print(f"錯誤: 設定檔不存在：{args.config}", file=sys.stderr)
+        return 1
+
+    try:
+        store = (
+            quota_admission.AdmissionDecisionStore(args.store)
+            if args.store
+            else quota_admission.AdmissionDecisionStore()
+        )
+        rows = store.all_rows()
+    except quota_admission.AdmissionDecisionCorrupt as exc:
+        print(f"錯誤: admission decision store 損毀：{exc}", file=sys.stderr)
+        return 1
+
+    usages = quota_admission.unbound_profile_keys_report(rows, bindings=config.bindings)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": "cortex-porcelain/quota-bindings-report/v1",
+                    "config_revision": config.config_revision,
+                    "unbound": [usage.to_dict() for usage in usages],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not usages:
+        print("目前沒有任何派工用到、且現有設定沒有 binding 涵蓋的 resolved profile key。")
+        return 0
+    for usage in usages:
+        print(
+            f"executor={usage.executor}\tmodel_id={usage.model_id}\t"
+            f"profile_key={usage.profile_key}\tdecision_count={usage.decision_count}\t"
+            f"last_seen_ms={usage.last_seen_ms}"
+        )
+    return 0

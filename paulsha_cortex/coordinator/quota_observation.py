@@ -1201,6 +1201,21 @@ def _parse_binding_subject(value: object, locator: tuple[str | int, ...]) -> boo
             _parse_profile_ref_list,
         )
         return members.state == "known"
+    if kind == "identity":
+        # #1116：resolved profile key 隨卡片的 launch contract／requirements
+        # 而變（見 `execution_profile.profile_key`——canonical bytes 含
+        # conditions／requirements 全部欄位），同一個 executor／model 在不同
+        # 卡片會解析出不同 key，「profile」／「group」兩種 kind 都得逐一列舉
+        # resolved key，卡片一改就無聲失效。`identity` 這個 kind 直接綁定
+        # executor＋model_id 這組操作者本來就知道、且跨卡片不變的穩定識別
+        # ——不綁定任何 conditions／requirements，因此不會因為卡片改變而跟著
+        # 變。executor／model_id 是操作者手動填寫的設定事實（不是觀測值），
+        # 比照 group kind 的 group_ref／revision，兩者都視為必然已知，不套
+        # known/unknown 包裝。
+        _ensure_exact_keys(payload, ("kind", "executor", "model_id"), locator)
+        _parse_identifier(payload.get("executor"), locator + ("executor",))
+        _parse_identifier(payload.get("model_id"), locator + ("model_id",))
+        return True
     raise QuotaContractError("invalid_identifier", locator + ("kind",))
 
 

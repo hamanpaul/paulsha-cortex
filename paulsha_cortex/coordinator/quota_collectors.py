@@ -727,6 +727,16 @@ def _find_binding(
     window_id: str,
     profile_key: str,
 ) -> schema.ProfilePoolBinding | None:
+    """#1116：`collector_targets` 刻意不新增 executor＋model_id 穩定 subject
+    的比對路徑（見 `quota_sources._binding_has_profile` 同一份理由）——這裡
+    的 ``profile_key`` 是設定檔逐筆手動填寫的 resolved key，`_binding_has_profile`
+    只是驗證『operator 填的這個 key 確實有對應的 binding』，不是像
+    `quota_admission.pools_for_profile` 那樣要替一個動態候選（resolved key
+    隨卡片變動）即時找出涵蓋它的 binding。要讓 collector_targets 也吃到
+    identity 綁定，需要另外替設定檔的 target item 加一個 model_id 欄位（新
+    schema 欄位＋新驗證規則），不是本函式現有比對邏輯的自然延伸；operator
+    仍可用既有 `group` kind 綁定，把同一個 executor 目前已知的多個 resolved
+    key 收進同一個 binding，降低（但不是消除）逐卡新增 binding 的成本。"""
     for binding in bindings:
         if schema.binding_status(binding).get("state") != "complete":
             continue

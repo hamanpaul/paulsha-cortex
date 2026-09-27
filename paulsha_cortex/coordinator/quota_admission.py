@@ -71,6 +71,9 @@ __all__ = [
     "AdmissionDecisionStore",
     "quota_admission_enabled",
     "pools_for_profile",
+    "binding_kind_for_profile",
+    "UnboundProfileUsage",
+    "unbound_profile_keys_report",
     "estimate_demand",
     "assess_candidate_quota",
     "observation_fingerprint",
@@ -256,9 +259,123 @@ def _fsync_directory(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _binding_pool_windows(
+    binding: schema.ProfilePoolBinding,
+) -> tuple[tuple[dict[str, str], str], ...]:
+    """展開單一 binding 的 constraints 為 ``(pool_ref, window_id)`` 序列。
+
+    純粹的 wire 展開，不做任何 subject 比對——留給呼叫端決定這個 binding
+    是否適用於目前的候選（見 :func:`_matches_exact`／:func:`_matches_identity`）。
+    """
+    wire = binding.to_dict()
+    result: list[tuple[dict[str, str], str]] = []
+    for constraint in wire.get("constraints", []):
+        if not isinstance(constraint, dict) or constraint.get("state") != "known":
+            continue
+        value = constraint.get("value")
+        if not isinstance(value, dict):
+            continue
+        pool_ref = value.get("pool_ref")
+        window_id = value.get("window_id")
+        if not isinstance(pool_ref, dict) or not isinstance(window_id, str):
+            continue
+        try:
+            _pool_key(pool_ref)
+        except KeyError:
+            continue
+        result.append((dict(pool_ref), window_id))
+    return tuple(result)
+
+
+def _matches_exact(subject: Mapping[str, object], profile_key: str) -> bool:
+    """#836 既有的『精確』比對：subject 直接列舉 resolved profile key
+    （``kind == "profile"``）或把它收進一份 group 成員清單
+    （``kind == "group"``）。"""
+    kind = subject.get("kind")
+    if kind == "profile":
+        profile_ref = subject.get("profile_ref")
+        if not isinstance(profile_ref, dict) or profile_ref.get("state") != "known":
+            return False
+        value = profile_ref.get("value")
+        return isinstance(value, dict) and value.get("key") == profile_key
+    if kind == "group":
+        members = subject.get("members")
+        if not isinstance(members, dict) or members.get("state") != "known":
+            return False
+        return any(
+            isinstance(item, dict) and item.get("key") == profile_key
+            for item in members.get("value", [])
+        )
+    return False
+
+
+def _matches_identity(subject: Mapping[str, object], executor: str, model_id: str) -> bool:
+    """#1116：『穩定』比對——subject 直接綁 executor＋model_id
+    （``kind == "identity"``），不看任何隨卡片而變的 resolved profile key。"""
+    if subject.get("kind") != "identity":
+        return False
+    return subject.get("executor") == executor and subject.get("model_id") == model_id
+
+
+def _resolve_binding_coverage(
+    profile_key: str,
+    *,
+    executor: str | None,
+    model_id: str | None,
+    bindings: Sequence[schema.ProfilePoolBinding],
+) -> tuple[tuple[tuple[dict[str, str], str], ...], str]:
+    """回傳 ``(pool_windows, binding_kind)``——單一來源同時供
+    :func:`pools_for_profile`／:func:`binding_kind_for_profile`／
+    :func:`assess_candidate_quota` 消費，避免三處各自重掃一次 ``bindings``。
+
+    優先序（#1116 票面）：resolved profile key 精確綁定（``binding_kind
+    == "exact"``）＞ executor＋model_id 穩定 subject 綁定（``"identity"``）；
+    找到精確綁定就**只**採用精確綁定的 pool/window 集合，不與穩定綁定的
+    結果合併——避免同一候選『同時命中兩者』時被重複計算成兩份 pool 需求，
+    也保留操作者刻意用精確綁定覆寫穩定綁定的能力（例如某張卡故意分流到
+    另一個 pool）。兩者都找不到時回 ``binding_kind == "none"``（見
+    :func:`assess_candidate_quota` 的 ``observation_state="unmanaged"``
+    分支）——這個候選目前完全不受任何 binding 涵蓋。
+    """
+    exact_matched: list[tuple[dict[str, str], str]] = []
+    seen: set[tuple[tuple[str, str, str, str], str]] = set()
+    for binding in bindings:
+        subject = binding.to_dict().get("subject")
+        if not isinstance(subject, dict) or not _matches_exact(subject, profile_key):
+            continue
+        for pool_ref, window_id in _binding_pool_windows(binding):
+            key = (_pool_key(pool_ref), window_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            exact_matched.append((pool_ref, window_id))
+    if exact_matched:
+        return tuple(exact_matched), "exact"
+
+    if isinstance(executor, str) and executor and isinstance(model_id, str) and model_id:
+        identity_matched: list[tuple[dict[str, str], str]] = []
+        seen = set()
+        for binding in bindings:
+            subject = binding.to_dict().get("subject")
+            if not isinstance(subject, dict) or not _matches_identity(subject, executor, model_id):
+                continue
+            for pool_ref, window_id in _binding_pool_windows(binding):
+                key = (_pool_key(pool_ref), window_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                identity_matched.append((pool_ref, window_id))
+        if identity_matched:
+            return tuple(identity_matched), "identity"
+
+    return (), "none"
+
+
 def pools_for_profile(
     profile_key: str,
     *,
+    executor: str | None = None,
+    model_id: str | None = None,
     bindings: Sequence[schema.ProfilePoolBinding],
 ) -> tuple[tuple[dict[str, str], str], ...]:
     """從 #836 的 ``ProfilePoolBinding`` 找出這個 profile 綁定的 pool/window。
@@ -267,54 +384,114 @@ def pools_for_profile(
     （例如尚未替這個 executor 設定觀測來源），本模組據此視為『不受額度限制』
     （見 :func:`assess_candidate_quota` 的 ``observation_state="unmanaged"``
     分支），維持既有派工行為，不因為尚未接上真實觀測就無故擋派。
+
+    ``executor``／``model_id`` 為 #1116 新增的選填參數——缺席（沿用既有呼叫
+    端不帶這兩個參數）時行為與 #1116 之前逐字相同，只比對 resolved profile
+    key 精確綁定；帶入時額外把 executor＋model_id 穩定 subject 綁定納入優先序
+    最低的備援來源（見 :func:`_resolve_binding_coverage`）。
     """
-    matched: list[tuple[dict[str, str], str]] = []
-    seen: set[tuple[tuple[str, str, str, str], str]] = set()
-    for binding in bindings:
-        wire = binding.to_dict()
-        subject = wire.get("subject")
-        if not isinstance(subject, dict):
+    pool_windows, _ = _resolve_binding_coverage(
+        profile_key, executor=executor, model_id=model_id, bindings=bindings,
+    )
+    return pool_windows
+
+
+def binding_kind_for_profile(
+    profile_key: str,
+    *,
+    executor: str | None = None,
+    model_id: str | None = None,
+    bindings: Sequence[schema.ProfilePoolBinding],
+) -> str:
+    """#1116：唯讀回報這個候選『目前是靠哪一種 binding 涵蓋』——
+    ``"exact"``（resolved profile key 精確綁定）／``"identity"``（executor＋
+    model_id 穩定 subject 綁定）／``"none"``（兩者都沒有，即
+    unmanaged）。供 decision receipt／狀態投影／`bindings --report` 共用同一套
+    判定，不各自重新實作一次比對規則。
+    """
+    _, binding_kind = _resolve_binding_coverage(
+        profile_key, executor=executor, model_id=model_id, bindings=bindings,
+    )
+    return binding_kind
+
+
+# ---------------------------------------------------------------------------
+# #1116：唯讀報表——目前派工用到、但現有 bindings 完全沒有涵蓋的 resolved
+# profile key（operator 診斷用；不寫任何狀態、不呼叫 shadow／reservation）。
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UnboundProfileUsage:
+    """一組『曾經被派工使用、但目前沒有任何 binding 涵蓋』的 resolved profile
+    key 彙總——`executor`／`model_id` 來自當時 decision receipt 的
+    ``selected``，`decision_count`／`last_seen_ms` 是純粹的出現次數／最近一次
+    時間戳，供 operator 判斷這個缺口是不是還在發生。"""
+
+    executor: str
+    model_id: str
+    profile_key: str
+    decision_count: int
+    last_seen_ms: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "executor": self.executor,
+            "model_id": self.model_id,
+            "profile_key": self.profile_key,
+            "decision_count": self.decision_count,
+            "last_seen_ms": self.last_seen_ms,
+        }
+
+
+def unbound_profile_keys_report(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    bindings: Sequence[schema.ProfilePoolBinding],
+) -> tuple[UnboundProfileUsage, ...]:
+    """唯讀彙總：``rows``（比照 ``AdmissionDecisionStore.all_rows()`` 的既有
+    raw row 形狀）裡曾經 ``outcome == "admit"`` 選中過的 resolved profile
+    key，逐一用**目前**傳入的 ``bindings`` 重新判定涵蓋狀態——不信任 row 裡
+    舊有的 ``selected_binding_kind``（那是寫入當時的快照，設定檔之後可能
+    已經改過），只回報『用目前設定重算仍然是 ``binding_kind ==
+    "none"``』的 resolved key，讓 operator 看見『目前』真正還缺 binding 的
+    缺口，而不是歷史上曾經缺過、現在已經補上的舊紀錄。
+
+    只讀 ``rows``／``bindings``，不開任何檔案、不呼叫 shadow／reservation、
+    不寫任何狀態——呼叫端自行決定 ``rows`` 從哪個 store 讀出來。
+    """
+    usage: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping) or row.get("outcome") != "admit":
             continue
-        kind = subject.get("kind")
-        if kind == "profile":
-            profile_ref = subject.get("profile_ref")
-            if not isinstance(profile_ref, dict) or profile_ref.get("state") != "known":
-                continue
-            value = profile_ref.get("value")
-            if not isinstance(value, dict) or value.get("key") != profile_key:
-                continue
-        elif kind == "group":
-            members = subject.get("members")
-            if not isinstance(members, dict) or members.get("state") != "known":
-                continue
-            member_keys = {
-                item.get("key")
-                for item in members.get("value", [])
-                if isinstance(item, dict)
-            }
-            if profile_key not in member_keys:
-                continue
-        else:
+        selected = row.get("selected")
+        profile_key = row.get("profile_key")
+        generated_at_ms = row.get("generated_at_ms")
+        if not isinstance(selected, Mapping) or not isinstance(profile_key, str):
             continue
-        for constraint in wire.get("constraints", []):
-            if not isinstance(constraint, dict) or constraint.get("state") != "known":
-                continue
-            value = constraint.get("value")
-            if not isinstance(value, dict):
-                continue
-            pool_ref = value.get("pool_ref")
-            window_id = value.get("window_id")
-            if not isinstance(pool_ref, dict) or not isinstance(window_id, str):
-                continue
-            try:
-                key = (_pool_key(pool_ref), window_id)
-            except KeyError:
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            matched.append((dict(pool_ref), window_id))
-    return tuple(matched)
+        executor = selected.get("executor")
+        model_id = selected.get("model_id")
+        if not isinstance(executor, str) or not executor:
+            continue
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        binding_kind = binding_kind_for_profile(
+            profile_key, executor=executor, model_id=model_id, bindings=bindings,
+        )
+        if binding_kind != "none":
+            continue
+        key = (executor, model_id, profile_key)
+        entry = usage.setdefault(key, {"count": 0, "last_seen_ms": 0})
+        entry["count"] += 1
+        if isinstance(generated_at_ms, int) and generated_at_ms > entry["last_seen_ms"]:
+            entry["last_seen_ms"] = generated_at_ms
+    return tuple(
+        UnboundProfileUsage(
+            executor=executor, model_id=model_id, profile_key=profile_key,
+            decision_count=info["count"], last_seen_ms=info["last_seen_ms"],
+        )
+        for (executor, model_id, profile_key), info in sorted(usage.items())
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +565,13 @@ class CandidateAssessment:
     pools: tuple[PoolAssessment, ...]
     observation_state: str  # unmanaged | known | unknown
     coverage_gaps: tuple[str, ...]
+    #: #1116：這個候選『目前是靠哪一種 binding 涵蓋』——``"exact"``（resolved
+    #: profile key 精確綁定）／``"identity"``（executor＋model_id 穩定 subject
+    #: 綁定）／``"none"``（兩者都沒有，即 unmanaged）。預設 ``None`` 是給
+    #: 不經 :func:`assess_candidate_quota` 直接建構本型別的既有呼叫端（例如
+    #: #839 測試 fixture）用的——沒有算過就不臆測，投影面一律視為 unknown，
+    #: 不是新增必填欄位逼所有呼叫端改寫。
+    binding_kind: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -400,6 +584,7 @@ class CandidateAssessment:
             "pools": [pool.to_dict() for pool in self.pools],
             "observation_state": self.observation_state,
             "coverage_gaps": list(self.coverage_gaps),
+            "binding_kind": self.binding_kind,
         }
 
 
@@ -423,8 +608,15 @@ def assess_candidate_quota(
     ``assessment == "sufficient"``——短窗夠、週窗不足一樣視為不可行（原票
     AC1：「短窗夠週窗不足也拒絕」）。找不到任何綁定的候選（``pools`` 為空）
     視為不受額度管理，直接可行。
+
+    #1116：pool/window 綁定改由 :func:`_resolve_binding_coverage` 一次算出
+    ``(pool_windows, binding_kind)``——resolved profile key 精確綁定優先，
+    executor＋model_id 穩定 subject 綁定次之，兩者都沒有才是
+    ``observation_state="unmanaged"``。
     """
-    pool_windows = pools_for_profile(profile_key, bindings=bindings)
+    pool_windows, binding_kind = _resolve_binding_coverage(
+        profile_key, executor=executor, model_id=model_id, bindings=bindings,
+    )
     if not pool_windows:
         return (
             CandidateAssessment(
@@ -437,6 +629,7 @@ def assess_candidate_quota(
                 pools=(),
                 observation_state="unmanaged",
                 coverage_gaps=(),
+                binding_kind=binding_kind,
             ),
             demand_version or "not-applicable",
         )
@@ -494,7 +687,7 @@ def assess_candidate_quota(
             executor=executor, model_id=model_id, independence_domain=independence_domain,
             profile_key=profile_key, feasible=feasible, exclusion_reason=exclusion_reason,
             pools=tuple(pool_assessments), observation_state=projection["state"],
-            coverage_gaps=tuple(sorted(all_gaps)),
+            coverage_gaps=tuple(sorted(all_gaps)), binding_kind=binding_kind,
         ),
         resolved_demand_version,
     )
@@ -807,6 +1000,12 @@ class AdmissionDecision:
     #: #840 對抗審查修復：見 `DispatchContext.config_revision` 的文件字串。
     #: 同樣不需要 schema bump，理由同上。
     policy_config_revision: str | None = None
+    #: #1116：對應 `CandidateAssessment.binding_kind`——選中候選當時是靠
+    #: ``"exact"``（resolved profile key 精確綁定）還是 ``"identity"``
+    #: （executor＋model_id 穩定 subject 綁定）涵蓋，或完全 ``"none"``
+    #: （unmanaged）。比照 #840 三個選填欄位的既有加法模式：缺席（#1116
+    #: 之前寫的舊 row）投影面視為 unknown，不臆測；不需要 schema bump。
+    selected_binding_kind: str | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("shadow", "enforced"):
@@ -825,6 +1024,10 @@ class AdmissionDecision:
             raise ValueError("invalid admission decision selected_observation_state")
         if self.selected_feasible is not None and not isinstance(self.selected_feasible, bool):
             raise ValueError("selected_feasible must be a bool or None")
+        if self.selected_binding_kind is not None and self.selected_binding_kind not in (
+            "exact", "identity", "none",
+        ):
+            raise ValueError("invalid admission decision selected_binding_kind")
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -856,6 +1059,7 @@ class AdmissionDecision:
             "selected_observation_state": self.selected_observation_state,
             "selected_feasible": self.selected_feasible,
             "policy_config_revision": self.policy_config_revision,
+            "selected_binding_kind": self.selected_binding_kind,
         }
 
     @classmethod
@@ -872,6 +1076,7 @@ class AdmissionDecision:
             selected_observation_state=row.get("selected_observation_state"),
             selected_feasible=row.get("selected_feasible"),
             policy_config_revision=row.get("policy_config_revision"),
+            selected_binding_kind=row.get("selected_binding_kind"),
         )
 
 
@@ -888,7 +1093,10 @@ _DECISION_REQUIRED_KEYS = frozenset(
 #: `_QUOTA_POOLS_CONFIG_OPTIONAL_KEYS` 的既有加法模式，讓 #840 之前寫的舊
 #: row（缺這三個 key）與之後寫的新 row（一律含，值可能是 ``None``）都合法。
 _DECISION_OPTIONAL_KEYS = frozenset(
-    {"selected_observation_state", "selected_feasible", "policy_config_revision"}
+    {
+        "selected_observation_state", "selected_feasible", "policy_config_revision",
+        "selected_binding_kind",
+    }
 )
 _DECISION_ALL_KEYS = _DECISION_REQUIRED_KEYS | _DECISION_OPTIONAL_KEYS
 

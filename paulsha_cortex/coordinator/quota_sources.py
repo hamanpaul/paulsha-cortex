@@ -219,6 +219,18 @@ def _validate_targets(targets, *, profile_key, descriptors, unit_catalog):
 
 
 def _binding_has_profile(binding: dict[str, Any], profile_key: str) -> bool:
+    """刻意**不**支援 #1116 新增的 ``identity`` subject kind。
+
+    這裡的 ``profile_key`` 一定是某個 collector target（見
+    `quota_collectors._find_binding`）在**設定載入當下**已經精確比對過一次
+    的 resolved key——`target.binding` 是那次比對留下的固定物件，本函式在
+    `_validate_targets()` 只是重放同一份判定（收到的 payload／targets 沒變、
+    profile_key 沒變），不是重新搜尋『這個候選現在有沒有 binding』。identity
+    比對需要 executor＋model_id，而 `ProviderQuotaTarget` 本身不帶 model_id
+    （collector_targets 設定檔目前也沒有這個欄位）；替 collector_targets
+    另開一個 model_id 欄位是獨立的設定檔 schema 擴充，不是這次重放判定的
+    自然延伸，因此本函式維持只認 resolved profile key 精確綁定
+    （``profile``／``group`` 兩種 kind）。"""
     subject = binding.get("subject")
     if not isinstance(subject, dict):
         return False
