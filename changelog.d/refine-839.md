@@ -288,3 +288,129 @@ canary gate，本票只交付 Cortex 消費端。
     `test_shadow_mode_store_record_failure_never_changes_dispatch_result`）。
     三個 MAJOR 皆先以 `git show HEAD:<path>` 暫還原對應 production 檔重跑
     新測試確認 RED，復原修法後轉 GREEN。
+
+- **#839 對抗審查修復（第四輪三個 MAJOR）**：
+  1. **MAJOR（manager.py:11491，admit receipt 寫入與 bound 收斂）**：同一個
+     attempt／profile 先以 shadow 模式寫過一筆 admit receipt，operator 隨後
+     才把 `PSC_QUOTA_ADMISSION_ENFORCE` 開成 `on` 重試同一張卡（job 尚未
+     真正建立，attempt ordinal 不變）——舊版 `decision_id_for()` 不納入
+     mode，兩次呼叫算出**同一個** decision_id；enforce 那次真正
+     reserve／bind 出的 reservation 想寫 admit receipt 時，
+     `_quota_admission_record_admit_decision`（第三輪修法：先讀舊值、有
+     就沿用）會直接沿用 shadow 那筆舊記錄，enforced receipt 從未落地，
+     `WorkflowRun.quota_admission` 永遠卡在 shadow；`reconcile_bound_reservations`
+     的舊實作又以 `store.enforced_admitted()`（過濾 `mode=="enforced"`）
+     反查候選，這筆真正 bound 的 reservation 因此對它完全隱形，job 終局
+     後容量卡死。修法二合一：(a) `decision_id_for()` 新增必填 `mode`
+     參數（`"shadow"`／`"enforced"`）納入雜湊輸入，讓兩種模式的決策身分
+     隔離、可並存各自冪等（`reserve_for_candidate_with_generation_fallback`
+     內部固定用 `mode="enforced"`，因為它只在 enforce 路徑被呼叫）；
+     (b) `reconcile_bound_reservations` 改以
+     `authority.list_by_state("bound", ...)` 為出發點（比照
+     `reconcile_reserved_reservations` 既有做法），`store` 只在
+     `on_settled` 需要診斷用 `profile_key` 時才被動查詢
+     （`store.get(status.decision_id)`），查不到（receipt 從未寫入或
+     mode 隔離之前的舊碰撞）不影響容量收斂本身，`on_settled` 收到 `None`
+     即安全略過 usage 記錄。`WorkflowRun.quota_admission[persona]` 的
+     `{decision_id, mode, outcome}` 三鍵閉包形狀（`workflow._validate_quota_admission`）
+     不變——`decision_id` 改變只是它指向的字串值變了，不是形狀變了；
+     `AdmissionDecision` 也未新增欄位。**#840 定位方式**：projection 本身
+     已經內嵌當前 `decision_id`（每次成功 dispatch 都覆寫），#840 讀
+     `run.quota_admission[persona]["decision_id"]` 拿到的永遠是最新一次
+     的身分，不需要另外枚舉 store 猜測哪筆是「現在的」。以直接 dispatch
+     兩次（第一次 shadow、monkeypatch `registry.create_job` 使其在第一次
+     呼叫失敗以保持 ordinal 不動，第二次開 enforce）重現：驗證兩個
+     decision_id 不同、shadow 那筆完全沒被動過、`WorkflowRun.quota_admission`
+     更新成 enforced，且這筆 bound reservation 能被
+     `reconcile_bound_reservations` 正確收斂。
+  2. **MAJOR（manager.py:11603，reserved sweep 反查 job）**：舊實作
+     `_quota_admission_job_lookup_by_attempt` 純依
+     `_quota_admission_attempt_id` 的 ordinal（`f"{run_id}:{card_id}:n{prior}"`）
+     反查 registry——只反映「這個 run/card 目前有幾個 job」，不指向任何
+     特定候選／decision。Manager A 對候選 A 的某個 attempt `reserve()` 後
+     crash（`create_job()` 從未發生）；Manager B（另一個 instance，或稍後
+     retry）改派候選 B（不同 pool／profile）在同一個 ordinal 建出它自己的
+     job 時，舊實作會把 B 的 job 誤當成 A 的存活證據，誤 renew／誤判 A 的
+     reservation 存活，即使兩者完全無關。修法：`registry.create_job()`
+     新增選填欄位 `quota_decision_id`（純加法，預設 `None`；`_validate_loaded_job`
+     的既有字串型別檢查清單同步新增這個欄位，registry 對 job dict 本來就
+     沒有封閉 key-set 檢查——核對 `d99df4d9` 與現版 `_validate_loaded_job`
+     逐字相同，確認舊版 Manager／Monitor 讀到多一個未知鍵不會 fail closed；
+     只有真的取得 reservation 的候選才寫入這個欄位，shadow／未受額度管理
+     的候選維持 `None`，與完全沒接線時的 job 記錄逐字相同，不引入 shadow
+     可觀察的新副作用）。`_quota_admission_job_lookup_by_attempt` 改名為
+     `_quota_admission_job_lookup_by_decision`，改依 job 建立時記錄的
+     `quota_decision_id` 精確比對；`quota_admission.reconcile_reserved_reservations`
+     的 callback 參數同步改名為 `job_lookup_by_decision`，改傳
+     `status.decision_id`（原本傳 `status.attempt_id`）。以直接建構兩個
+     不同 decision_id、只替其中一個建出 job（同一個 run/card，ordinal 0）
+     重現：舊版 `_quota_admission_job_lookup_by_attempt` 對另一個
+     decision_id 反查也會誤命中這個不相關的 job（獨立腳本重現，非測試
+     套件常駐項）；新版精確比對，A 查無、B 查有；另補「job 缺
+     `quota_decision_id`（舊版 job）→ 一律視為查無」的相容測試。
+  3. **MAJOR（quota_admission.py:1119，reserved lease 過期即回收 vs.
+     provisioning 尚未結束）**：`reconcile_reserved_reservations` 對「lease
+     過期且查無對應 job」直接視為可回收，但 reserve() 之後到
+     provisioning（worktree／sandbox 建立）完成、`create_job()`／`bind()`
+     之前還有一段耗時窗口；lease 設太短或 provisioning 恰好變慢時，會釋放
+     一筆原 dispatch 仍在使用中的 reservation，讓另一個 Manager 重拿同額度、
+     原 dispatch 稍後 `bind()` 時撞上衝突。修法四件套：(a) `QuotaReservationAuthority`
+     新增 `renew()`（#838 純加法新事件種類，只允許從 `reserved` 續租，
+     與 `reconcile(confirmed-alive)` 的續租分支服務不同情境——後者刻意不
+     驗證 owner_token，給 crash 後第三方復原用；`renew()` 給仍活著、知道
+     自己 owner_token 的原 dispatch 用，兩者不重疊）；`_dispatch_workflow_card`
+     拿到 grant 之後立刻續租一整個新的 `lease_ms` 窗口。(b) 新增
+     process-global `quota_admission.IN_FLIGHT_DISPATCHES`
+     （`InFlightDispatchTracker`，純記憶體、不耐久）：dispatch 拿到 grant
+     後 `mark_started`，`create_job()`／`bind()` 的 try/except 外包一層
+     `finally` 保證 `mark_finished`（成功／結構性失敗／任何例外皆會清除，
+     不會永久卡住）；`reconcile_reserved_reservations` 新增選填 `in_flight`
+     參數，命中時即使 lease 早已過期也續租而不釋放。(c) `reconcile_reserved_reservations`
+     新增選填 `grace_ms`（預設 `0`，逐字沿用舊行為；daemon 端傳入一整個
+     `lease_ms`）——次要防線，主要防線是 (a)(b)。(d) `bind()` 仍可能撞上
+     `conflict`／`reservation-already-terminal`（例如 renew 呼叫本身失敗、
+     clock skew）：job 記錄已建立，`_dispatch_workflow_card` 標記它失敗
+     （**不**記 `provider_outcome`，避免誤觸 #825/#826 executor backoff
+     分類——這不是 executor 的錯）、留一筆 `outcome=wait` 的 decision
+     receipt 並更新 `WorkflowRun.quota_admission[persona]`，再讓例外照
+     既有「job 已建立、spawn 前失敗」路徑傳播（fail closed，不 spawn、
+     不假稱成功）。另在 `parse_quota_pools_config` 加 `lease_ms` 下限
+     （1 分鐘）——低於下限拒絕載入，enforce 下回 `quota-config-invalid`；
+     太短的 lease 會讓上面的安全網疲於奔命。以直接呼叫
+     `reserve_for_candidate`（不 bind）模擬 crash 窗口＋設 `now_ms` 遠遠
+     超過 lease＋grace 重現 RED（舊版釋放）／GREEN（`in_flight` 命中時續
+     租，未命中時仍安全釋放）；`bind()` monkeypatch 回傳
+     `reservation-already-terminal` 重現 job 標記失敗＋wait receipt 的
+     fail-closed 路徑。
+  - 未動候選排序／runtime preflight／pin／independence／Trust Root／品質
+    規則。`decision_id_for()` 的雜湊輸入改變（新增必填 `mode`）改變了未來
+    產生的 decision_id 字串值，但這是 #839 尚未經過 installed／live
+    accepted 檢查點前的身分推導調整，不影響任何已耐久寫入事件的可讀性
+    （舊事件本身不重新驗證雜湊來源）。
+  - 新增測試：`tests/test_quota_reservation_838.py`
+    （`test_renew_extends_lease_and_keeps_reserved_state`／
+    `test_renew_rejects_bound_reservation`／
+    `test_renew_rejects_terminal_reservation`／
+    `test_renew_rejects_wrong_owner_attempt_or_sequence`／
+    `test_renew_rejects_invalid_lease_ms`／
+    `test_renew_is_durable_and_survives_reload`）；
+    `tests/test_quota_admission_839.py`
+    （`test_bound_reservation_without_any_decision_receipt_is_still_reconciled`／
+    `test_on_settled_receives_none_decision_when_receipt_missing_and_usage_recording_is_skipped`／
+    `test_bound_reservation_with_receipt_present_still_passes_decision_to_on_settled`／
+    `test_reserved_unbound_lease_expired_but_within_grace_is_left_untouched`／
+    `test_reserved_unbound_lease_expired_beyond_grace_is_released`／
+    `test_reserved_unbound_in_flight_dispatch_renews_even_after_lease_expired`／
+    `test_reserved_unbound_not_in_flight_of_this_process_is_released_normally`／
+    `test_in_flight_dispatch_tracker_mark_finished_removes_entry`／
+    `test_quota_pools_config_rejects_lease_ms_below_floor`／
+    `test_quota_pools_config_accepts_lease_ms_at_floor`）；
+    `tests/test_quota_admission_dispatch_wiring_839.py`
+    （`test_switching_shadow_to_enforce_mid_attempt_writes_distinct_enforced_receipt`／
+    `test_reserved_sweep_job_lookup_does_not_misattribute_unrelated_candidates_job`／
+    `test_reserved_sweep_ignores_legacy_job_missing_quota_decision_id_field`／
+    `test_successful_dispatch_renews_lease_and_clears_in_flight_marker`／
+    `test_bind_conflict_reservation_already_terminal_fails_closed_with_wait_receipt`）。
+    三個 MAJOR 皆先以 `git show HEAD:<path>` 暫還原對應 production 檔（或
+    直接呼叫舊函式名重現）重跑新測試確認 RED，復原修法後轉 GREEN；另在
+    CPU 滿載（`nproc * 2` 個忙迴圈）下重跑四個既有測試檔 6 輪全數通過。

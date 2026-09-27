@@ -76,6 +76,13 @@ opt-in 開關，預設關閉即等於 shadow／rollback，不需要改動任何�
 索引是否成功寫入；純查詢，不修改任何狀態、不新增事件種類，狀態機與寫入
 協定不變。
 
+`renew(reservation_id, owner_token, attempt_id, lease_ms, expected_sequence,
+now_ms)`（純加法，新事件種類 `renew`）讓合法持有者（知道自己 owner_token）
+在 provisioning 期間主動延長 lease，只允許從 `reserved` 續租；與
+`reconcile(resolution="confirmed-alive", renew_lease_ms=...)` 的差異是後者
+刻意不驗證 owner_token／attempt_id（給 crash 之後、原 owner 已不存在時的
+第三方復原用），兩者服務不同情境，互不重疊。
+
 ## Quota-aware admission
 
 `paulsha_cortex.coordinator.quota_admission`（#839）在既有候選分層排序／
@@ -240,6 +247,51 @@ provider 讀取與長期運作）仍是獨立的部署 gate，本節只交付到
   仍放行」。
 
 這是唯讀投影新增的欄位，不改變 #839 的准入邏輯或 reservation 生命週期。
+
+### 對抗審查第四輪修法：mode 隔離、精確反查、provisioning 續租
+
+`decision_id_for()` 新增必填 `mode` 參數（`"shadow"`／`"enforced"`），一併
+納入雜湊輸入——同一個 attempt／profile 先以 shadow 觀察、operator 隨後才
+把 `PSC_QUOTA_ADMISSION_ENFORCE` 開成 `on` 重試時，兩者現在算出不同的
+decision_id，各自冪等寫入、彼此不覆蓋；`WorkflowRun.quota_admission[persona]`
+因此能正確反映「這次是 enforced」而不會卡在舊的 shadow 快照。
+`reconcile_bound_reservations()` 也不再以 `AdmissionDecisionStore.enforced_admitted()`
+反查候選——改與 `reconcile_reserved_reservations()` 一致，直接以
+`QuotaReservationAuthority.list_by_state("bound", ...)` 為出發點；任何一筆
+`bound` reservation 即使對應的 admit receipt 從未成功寫入（IO／衝突／
+mode 隔離之前的舊碰撞），也不會對這支收斂掃描永久隱形。
+
+`reconcile_reserved_reservations()` 的反查依據從「依 `attempt_id` 的 ordinal
+猜測」改成「依 job 建立時記錄的 `quota_decision_id` 精確比對」——多個
+Manager instance 交錯派工時（instance A 對候選 A 的某個 attempt `reserve()`
+後 crash，instance B 改派候選 B 建出剛好同一個 ordinal 的 job），舊實作會
+把 B 的 job 誤當成 A 的存活證據。`registry.create_job()` 新增選填欄位
+`quota_decision_id`（純加法，缺席回 `None`，向後相容舊版 job／registry
+讀取端），只有真的取得 reservation 的候選才會寫入這個欄位（shadow／未受
+額度管理的候選維持 `None`，與完全沒接線時的 job 記錄逐字相同）。
+
+Lease 過期本身仍然永不證明可以釋放（既有設計不變），但 provisioning
+（worktree／sandbox 建立）耗時可能超過單次 lease：`QuotaReservationAuthority`
+新增 `renew()`（純加法事件種類，只允許從 `reserved` 續租，`bind()` 之後的
+續租仍是既有 `reconcile(confirmed-alive)` 分支的責任，不重疊）；
+`_dispatch_workflow_card` 拿到 grant 之後立刻續租一整個新的 `lease_ms`
+窗口，同時把 reservation 標進 process-global 的
+`quota_admission.IN_FLIGHT_DISPATCHES`（純記憶體、不耐久，process 重啟即
+清空）。`reconcile_reserved_reservations()` 新增選填 `grace_ms`（額外寬限，
+預設 `0` 逐字沿用舊行為；daemon 端傳入一整個 `lease_ms`）與 `in_flight`
+（給定時，即使 lease＋寬限都已過期，只要本 process 自己知道這筆
+reservation 還在 provisioning 就續租而不釋放）；兩者皆為次要防線，主要
+防線是上面的 provisioning 續租。quota-pools 設定檔的 `lease_ms` 新增下限
+（1 分鐘，低於視為設定錯誤，`quota-config-invalid` fail closed）——太短的
+lease 會讓上述安全網疲於奔命地追續租。
+
+即使有這些安全網，`bind()` 仍可能在極端情況（例如續租呼叫本身失敗、clock
+skew）撞上 `conflict`／`reservation-already-terminal`（reservation 已被
+結束）：job 記錄這時已經建立，`_dispatch_workflow_card` 會把它標記失敗
+（不記 `provider_outcome`，避免誤觸 #825/#826 的 executor backoff 分類——
+這不是 executor 的錯）、留一筆 `outcome=wait` 的 decision receipt 並更新
+`WorkflowRun.quota_admission[persona]`，再讓例外照既有「job 已建立、spawn
+前失敗」的 fail-closed 路徑傳播——絕不假稱成功、絕不 spawn。
 
 ## Execution profile schema／key core
 

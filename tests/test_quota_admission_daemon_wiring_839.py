@@ -445,6 +445,7 @@ def test_end_to_end_shadow_daemon_dispatch_records_receipt_without_blocking(
     assert "job_id" in result  # shadow 不擋派——即使這個 pool 完全沒有觀測資料（unknown）
     decision_id = quota_admission.decision_id_for(
         run_id=run.run_id, card_id=step.card, attempt_id=f"{run.run_id}:{step.card}:n0", profile_key=profile_key,
+        mode="shadow",
     )
     store = quota_admission.AdmissionDecisionStore()
     decision = store.get(decision_id)

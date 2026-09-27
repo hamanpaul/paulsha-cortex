@@ -404,6 +404,60 @@ class QuotaReservationAuthority:
             now_ms=now_ms, failpoint_stage="bind-before-append", apply=apply,
         )
 
+    def renew(
+        self,
+        *,
+        reservation_id: str,
+        owner_token: str,
+        attempt_id: str,
+        lease_ms: int,
+        expected_sequence: int,
+        now_ms: int,
+    ) -> TransitionResult:
+        """對抗審查第四輪 MAJOR（quota_admission.py:1119）：合法持有者（知道
+        自己的 ``owner_token``）在 provisioning 期間主動續租——與
+        :meth:`reconcile` 的 ``resolution="confirmed-alive"``／
+        ``renew_lease_ms`` 差異在於：``reconcile`` 刻意**不**驗證
+        ``owner_token``／``attempt_id``（給 crash 之後、原 owner 早已不存在
+        時，另一個知道可信 liveness 證據的呼叫端使用，見該方法文件字串）；
+        這支給『目前仍活著、知道自己 owner_token 的原 dispatch』用，只允許
+        從 ``reserved`` 續租——``bind()`` 之後的 lease 語意已經是
+        ``settle()``／``reconcile(confirmed-alive)`` 的責任（見
+        ``reconcile_bound_reservations`` 既有的續租分支），這裡不重複、也
+        不允許對 ``bound``／終局狀態呼叫（避免與那條既有路徑的語意重疊、
+        產生兩套『誰才是續租權威』的分歧）。
+
+        純加法：只新增一種事件種類（``renew``），不改變既有
+        ``reserve``／``bind``／``settle``／``release``／``reconcile`` 的轉移
+        規則或欄位形狀；`list_by_state`／`committed`／`_display_state` 完全
+        不需要跟著改（renew 只更新 ``lease_expires_at_ms``，`state` 邏輯值
+        原封不動維持 ``reserved``）。"""
+        if type(lease_ms) is not int or lease_ms < 0 or lease_ms > _MAX_LEASE_MS:
+            return TransitionResult(status="invalid", reason="invalid-lease-ms")
+
+        def apply(current: dict[str, Any]) -> tuple[dict[str, Any] | None, TransitionResult]:
+            if current["state"] in ("settled", "released"):
+                return None, TransitionResult(status="conflict", state=current["state"], reason="reservation-already-terminal")
+            if current["state"] != "reserved":
+                return None, TransitionResult(status="conflict", state=current["state"], reason="renew-requires-reserved")
+            if current["sequence"] != expected_sequence:
+                return None, TransitionResult(status="conflict", state=current["state"], sequence=current["sequence"], reason="sequence-mismatch")
+            new_lease = min(now_ms + lease_ms, _MAX_TIMESTAMP_MS)
+            entry = {
+                "schema_version": 1,
+                "kind": "renew",
+                "reservation_id": reservation_id,
+                "sequence": current["sequence"] + 1,
+                "lease_expires_at_ms": new_lease,
+                "event_at_ms": now_ms,
+            }
+            return entry, TransitionResult(status="ok", state="reserved", display_state="reserved", sequence=current["sequence"] + 1)
+
+        return self._transition(
+            reservation_id=reservation_id, owner_token=owner_token, attempt_id=attempt_id,
+            now_ms=now_ms, failpoint_stage="renew-before-append", apply=apply,
+        )
+
     def settle(
         self,
         *,
@@ -863,6 +917,9 @@ _RESERVE_REQUIRED = frozenset(
     }
 )
 _BIND_REQUIRED = frozenset({"schema_version", "kind", "reservation_id", "sequence", "job_id", "event_at_ms"})
+_RENEW_REQUIRED = frozenset(
+    {"schema_version", "kind", "reservation_id", "sequence", "lease_expires_at_ms", "event_at_ms"}
+)
 _SETTLE_REQUIRED = frozenset(
     {"schema_version", "kind", "reservation_id", "sequence", "outcome", "note", "event_at_ms"}
 )
@@ -934,6 +991,13 @@ def _validate_bind_row(row: dict[str, Any]) -> None:
         raise ReservationCorrupt("reservation-store-invalid-record")
 
 
+def _validate_renew_row(row: dict[str, Any]) -> None:
+    _require_keys(row, _RENEW_REQUIRED)
+    lease = row["lease_expires_at_ms"]
+    if type(lease) is not int or lease < 0 or lease > _MAX_TIMESTAMP_MS:
+        raise ReservationCorrupt("reservation-store-invalid-record")
+
+
 def _validate_settle_row(row: dict[str, Any]) -> None:
     _require_keys(row, _SETTLE_REQUIRED)
     if row["outcome"] not in _SETTLE_OUTCOMES:
@@ -983,6 +1047,7 @@ def _validate_transition_time(row: dict[str, Any]) -> None:
 # reservation 並重新占用容量。
 _ALLOWED_FROM_STATE: dict[str, frozenset[str]] = {
     "bind": frozenset({"reserved"}),
+    "renew": frozenset({"reserved"}),
     "settle": frozenset({"bound"}),
     "release": frozenset({"reserved"}),
     "reconcile": frozenset({"reserved", "bound"}),
@@ -992,6 +1057,7 @@ _ALLOWED_FROM_STATE: dict[str, frozenset[str]] = {
 _EVENT_VALIDATORS: dict[str, Callable[[dict[str, Any]], None]] = {
     "reserve": _validate_reserve_row,
     "bind": _validate_bind_row,
+    "renew": _validate_renew_row,
     "settle": _validate_settle_row,
     "release": _validate_release_row,
     "reconcile": _validate_reconcile_row,
@@ -1046,6 +1112,8 @@ def _fold(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if row["kind"] == "bind":
             current["state"] = "bound"
             current["job_id"] = row["job_id"]
+        elif row["kind"] == "renew":
+            current["lease_expires_at_ms"] = row["lease_expires_at_ms"]
         elif row["kind"] == "settle":
             current["state"] = "settled"
             current["settle_outcome"] = row["outcome"]

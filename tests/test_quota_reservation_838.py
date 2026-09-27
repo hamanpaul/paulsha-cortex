@@ -960,3 +960,160 @@ def test_list_by_state_rejects_unknown_state(tmp_path: Path) -> None:
     authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
     with pytest.raises(ValueError):
         authority.list_by_state("uncertain", now_ms=NOW)
+
+
+# ---------------------------------------------------------------------------
+# 對抗審查第四輪 MAJOR（quota_admission.py:1119）：合法持有者在 provisioning
+# 期間主動續租的 `renew()`——純加法，不改變既有狀態機。
+# ---------------------------------------------------------------------------
+
+
+def test_renew_extends_lease_and_keeps_reserved_state(tmp_path: Path) -> None:
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-renew", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert granted.status == "granted"
+
+    renewed = authority.renew(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", lease_ms=300_000, expected_sequence=granted.sequence,
+        now_ms=NOW + 50_000,
+    )
+    assert renewed.status == "ok"
+    assert renewed.state == "reserved"
+    assert renewed.sequence == granted.sequence + 1
+
+    status = authority.status(granted.reservation_id, now_ms=NOW + 50_000)
+    assert status.state == "reserved"
+    assert status.lease_expires_at_ms == NOW + 50_000 + 300_000
+    # 原始 lease（NOW + 60_000）早已被續租取代，容量仍然生效（不是 uncertain）。
+    assert status.display_state == "reserved"
+    committed = authority.committed(now_ms=NOW + 50_000)
+    key = (tuple(_pool("pool-x")[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "week")
+    assert committed.get(key, "0") == "1"
+
+
+def test_renew_rejects_bound_reservation(tmp_path: Path) -> None:
+    """已 bind() 過的 reservation 只能經 settle／reconcile 續租，renew() 不
+    重疊那條路徑（見 `reconcile_bound_reservations` 既有的 confirmed-alive
+    續租分支），避免出現兩套『誰才是續租權威』。"""
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-bound", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    bound = authority.bind(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", job_id="job-1", expected_sequence=granted.sequence, now_ms=NOW,
+    )
+    assert bound.status == "ok"
+
+    result = authority.renew(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", lease_ms=300_000, expected_sequence=bound.sequence,
+        now_ms=NOW + 1,
+    )
+    assert result.status == "conflict"
+    assert result.reason == "renew-requires-reserved"
+    status = authority.status(granted.reservation_id, now_ms=NOW + 1)
+    assert status.state == "bound"
+
+
+def test_renew_rejects_terminal_reservation(tmp_path: Path) -> None:
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-released", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    released = authority.release(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", reason="fail-before-spawn", expected_sequence=granted.sequence,
+        now_ms=NOW,
+    )
+    assert released.status == "ok"
+
+    result = authority.renew(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", lease_ms=300_000, expected_sequence=released.sequence,
+        now_ms=NOW + 1,
+    )
+    assert result.status == "conflict"
+    assert result.reason == "reservation-already-terminal"
+
+
+def test_renew_rejects_wrong_owner_attempt_or_sequence(tmp_path: Path) -> None:
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-auth", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+
+    wrong_owner = authority.renew(
+        reservation_id=granted.reservation_id, owner_token="not-the-real-owner-token-32chars",
+        attempt_id="attempt-1", lease_ms=300_000, expected_sequence=granted.sequence, now_ms=NOW + 1,
+    )
+    assert wrong_owner.status == "invalid"
+    assert wrong_owner.reason == "owner-mismatch"
+
+    wrong_attempt = authority.renew(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-not-mine", lease_ms=300_000, expected_sequence=granted.sequence, now_ms=NOW + 1,
+    )
+    assert wrong_attempt.status == "invalid"
+    assert wrong_attempt.reason == "attempt-mismatch"
+
+    wrong_sequence = authority.renew(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", lease_ms=300_000, expected_sequence=99, now_ms=NOW + 1,
+    )
+    assert wrong_sequence.status == "conflict"
+    assert wrong_sequence.reason == "sequence-mismatch"
+
+    # 三次都被拒絕的呼叫完全沒有動到狀態——原始 lease／sequence 原封不動。
+    status = authority.status(granted.reservation_id, now_ms=NOW + 1)
+    assert status.state == "reserved"
+    assert status.sequence == granted.sequence
+    assert status.lease_expires_at_ms == NOW + 60_000
+
+
+def test_renew_rejects_invalid_lease_ms(tmp_path: Path) -> None:
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-lease", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    result = authority.renew(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", lease_ms=-1, expected_sequence=granted.sequence, now_ms=NOW + 1,
+    )
+    assert result.status == "invalid"
+    assert result.reason == "invalid-lease-ms"
+
+
+def test_renew_is_durable_and_survives_reload(tmp_path: Path) -> None:
+    """`renew` 事件必須耐久寫入並在下次讀取（重新開 authority）時折疊出同一
+    個 lease_expires_at_ms——不是只活在記憶體裡的暫時狀態。"""
+    path = tmp_path / "reservations.jsonl"
+    authority = QuotaReservationAuthority(path)
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-durable", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    authority.renew(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", lease_ms=500_000, expected_sequence=granted.sequence, now_ms=NOW + 10_000,
+    )
+
+    reopened = QuotaReservationAuthority(path)
+    status = reopened.status(granted.reservation_id, now_ms=NOW + 10_000)
+    assert status.state == "reserved"
+    assert status.lease_expires_at_ms == NOW + 10_000 + 500_000
+    assert status.sequence == granted.sequence + 1

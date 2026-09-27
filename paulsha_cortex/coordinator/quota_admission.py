@@ -49,6 +49,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import threading
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import quota_observation as schema
@@ -84,6 +85,8 @@ __all__ = [
     "reconcile_bound_reservations",
     "reconcile_reserved_reservations",
     "ReconcileOutcome",
+    "InFlightDispatchTracker",
+    "IN_FLIGHT_DISPATCHES",
     "DispatchContext",
     "QuotaConfigInvalid",
     "QuotaPoolsConfigError",
@@ -122,6 +125,51 @@ def quota_admission_enabled(environment: Mapping[str, str] | None = None) -> boo
     """
     env = os.environ if environment is None else environment
     return env.get(_ENV_ENFORCE_FLAG, "").strip().lower() == "on"
+
+
+class InFlightDispatchTracker:
+    """對抗審查第四輪 MAJOR（quota_admission.py:1119）：本 process 內、目前
+    正在 ``reserve()``→``bind()`` 之間 provisioning 的 reservation 集合。
+
+    periodic tick 的 :func:`reconcile_reserved_reservations` 掃描與正在
+    進行中的 dispatch 可能同時跑在同一個 process 裡（單一 Manager
+    instance）——sweep 只靠 lease 是否過期無法分辨『provisioning 就是比這次
+    lease 長，owner（也就是這個 process 自己）其實還活著』和『owner 早已
+    不存在（crash／別的 instance）』。這個純記憶體、不耐久的集合就是那個
+    區分依據：dispatch 拿到 grant 之後立刻 :meth:`mark_started`，
+    bind()／失敗路徑結束後立刻 :meth:`mark_finished`（成對、finally 保
+    證）；sweep 命中 in-flight 的 reservation 一律續租而不釋放，即使 lease
+    早已過期。
+
+    process 重啟後這個集合自然清空——回退到既有『依 lease／registry 事實
+    判定』行為，不引入任何新的耐久狀態；不耐久正是設計：這個集合只回答
+    『這個 process 自己知不知道還有誰在用』，crash 之後這個問題天然沒有
+    答案，必須靠既有的 lease＋registry 證據鏈接手，不能假裝這個集合能夠
+    跨 process／跨 restart 存活。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._in_flight: set[str] = set()
+
+    def mark_started(self, reservation_id: str) -> None:
+        with self._lock:
+            self._in_flight.add(reservation_id)
+
+    def mark_finished(self, reservation_id: str) -> None:
+        with self._lock:
+            self._in_flight.discard(reservation_id)
+
+    def is_in_flight(self, reservation_id: str) -> bool:
+        with self._lock:
+            return reservation_id in self._in_flight
+
+
+#: process-global 單一實例——dispatch 路徑與 periodic tick 的收斂掃描必須
+#: 讀寫同一份記憶體集合，因此不能放在每次呼叫都重新建構的 `DispatchContext`
+#: 上（`manager_daemon._quota_admission_context_for()` 每次 dispatch／
+#: periodic tick 都會建一個新的 `DispatchContext`，若把追蹤集合放在它上面，
+#: 每次呼叫看到的都會是一個空集合，形同沒有追蹤）。
+IN_FLIGHT_DISPATCHES = InFlightDispatchTracker()
 
 
 @dataclass(frozen=True)
@@ -472,17 +520,30 @@ def observation_fingerprint(assessment: CandidateAssessment) -> str:
     return f"shadow-projection:{digest}"
 
 
-def decision_id_for(*, run_id: str, card_id: str, attempt_id: str, profile_key: str) -> str:
-    """給定 (run, card, attempt, profile) 的穩定 decision_id。
+def decision_id_for(
+    *, run_id: str, card_id: str, attempt_id: str, profile_key: str, mode: str
+) -> str:
+    """給定 (run, card, attempt, profile, mode) 的穩定 decision_id。
 
     同一個 attempt 重送（restart／resume／late terminal 補送）算出同一個
     decision_id，因此後續 :func:`reserve_for_candidate` 呼叫
     ``QuotaReservationAuthority.reserve()`` 天然冪等——不會因為重送而重新
     扣一次額度，也不會誤造第二個 job。真正的新 attempt（安全 attempt 邊界
     fallback 之後）必須帶新的 ``attempt_id``，才會算出不同的 decision_id。
-    """
+
+    對抗審查第四輪 MAJOR（manager.py:11491）：``mode``（必填）納入雜湊
+    輸入——shadow 與 enforced 是不同的決策，若同一個 attempt／profile 先以
+    shadow 寫過一筆 receipt，之後才切到 opt-in enforce 重試（例如 operator
+    在同一個 attempt 存活期間切換 ``PSC_QUOTA_ADMISSION_ENFORCE``），兩者
+    必須能夠在 :class:`AdmissionDecisionStore` 裡並存、各自冪等回放，不能
+    讓後者的寫入被前者的舊記錄以『同 decision_id、內容不同』擋下（見
+    ``AdmissionDecisionStore.record`` 的衝突語意）。呼叫端必須顯式帶入
+    ``"shadow"`` 或 ``"enforced"``——不給預設值，逼每個呼叫點誠實回答『這是
+    哪一種決策』，避免日後新呼叫點無意間沿用錯的隱含假設。"""
+    if mode not in ("shadow", "enforced"):
+        raise ValueError(f"invalid decision mode: {mode!r}")
     digest = hashlib.sha256(
-        f"{run_id}\0{card_id}\0{attempt_id}\0{profile_key}".encode()
+        f"{run_id}\0{card_id}\0{attempt_id}\0{profile_key}\0{mode}".encode()
     ).hexdigest()
     return f"adm:v1:{digest}"
 
@@ -613,11 +674,17 @@ def reserve_for_candidate_with_generation_fallback(
 
     回傳 ``(attempt_id, decision_id, result)``——實際用到的世代 attempt_id
     與其 decision_id，呼叫端據此更新 receipt／reservation handle 的簿記，
-    不必自己重算。"""
+    不必自己重算。
+
+    本函式只在 opt-in enforce（且候選已判定可行）時被呼叫（見
+    ``manager._dispatch_workflow_card`` 的守衛），因此內部固定用
+    ``mode="enforced"`` 算 decision_id——shadow 模式從不呼叫這支函式，不需
+    要（也不應該）讓呼叫端額外傳一個永遠是同一個值的參數。"""
     generation = 0
     attempt_id = generation_attempt_id(base_attempt_id, generation)
     decision_id = decision_id_for(
         run_id=run_id, card_id=card_id, attempt_id=attempt_id, profile_key=profile_key,
+        mode="enforced",
     )
     while True:
         result = reserve_for_candidate(
@@ -635,6 +702,7 @@ def reserve_for_candidate_with_generation_fallback(
         attempt_id = generation_attempt_id(base_attempt_id, generation)
         decision_id = decision_id_for(
             run_id=run_id, card_id=card_id, attempt_id=attempt_id, profile_key=profile_key,
+            mode="enforced",
         )
 
 
@@ -1054,17 +1122,33 @@ def reconcile_bound_reservations(
     job_outcome: Callable[[Mapping[str, Any]], str | None],
     now_ms: int,
     renew_lease_ms: int | None = None,
-    on_settled: Callable[[AdmissionDecision, Mapping[str, Any]], None] | None = None,
+    on_settled: Callable[["AdmissionDecision | None", Mapping[str, Any]], None] | None = None,
 ) -> tuple[ReconcileOutcome, ...]:
-    """掃描曾經 enforced-admit 的決策，把 ``bound`` reservation 導向終局。
+    """把所有 ``bound`` reservation 導向終局或續租。
+
+    對抗審查第四輪 MAJOR（manager.py:11491）：舊實作以
+    ``store.enforced_admitted()`` 反查候選——如果同一個 attempt／profile 先
+    以 shadow 模式寫過一筆 receipt，之後才切到 opt-in enforce（見
+    ``decision_id_for`` 對 ``mode`` 的處理），舊版 ``decision_id`` 不納入
+    mode，enforce 那次的 admit receipt 寫入會被 shadow 的舊記錄擋下、永遠
+    不會出現在 ``store.enforced_admitted()`` 的結果裡——即使已經修好
+    decision_id 的 mode 隔離，這支收斂掃描本身仍然是『先信任 receipt 是否
+    成功寫入』的間接查法，任何一次 receipt 寫入失敗（IO／損毀／衝突）都會
+    讓對應的 bound reservation 對它完全隱形，容量永久卡死。改以
+    ``authority.list_by_state("bound", now_ms=now_ms)`` 為出發點——本
+    authority 才是 reservation 的唯一真相來源，`store` 只在需要診斷用的
+    ``profile_key``（見 ``on_settled``）時才被動查詢，查不到（receipt 從未
+    寫入或已損毀）不影響容量本身的收斂決定，只讓 ``on_settled`` 收到
+    ``None`` 而略過那一筆的 usage 記錄。
 
     ``on_settled``（選填）在某筆 ``bound`` reservation 因為 job 終局被收斂成
-    ``settled``（見下方 ``action="settled"`` 分支）時，以 ``(decision, job)``
-    呼叫一次——供呼叫端（例如 ``manager_daemon``）在同一次觀察到終局時，
-    順手呼叫 ``QuotaShadowService.record_terminal_usage`` 記消耗，不必另外
-    重查一次 job／reservation。呼叫失敗（拋例外）不影響本函式已經完成的
-    reconcile 決定——額度容量的釋放與 usage 記錄是兩個獨立的失效面，usage
-    記錄失敗不該讓已經正確收斂的容量釋放結果跳回一半。
+    ``settled``（見下方 ``action="settled"`` 分支）時，以
+    ``(decision_or_none, job)`` 呼叫一次——供呼叫端（例如 ``manager_daemon``）
+    在同一次觀察到終局時，順手呼叫
+    ``QuotaShadowService.record_terminal_usage`` 記消耗，不必另外重查一次
+    job／reservation。呼叫失敗（拋例外）不影響本函式已經完成的 reconcile
+    決定——額度容量的釋放與 usage 記錄是兩個獨立的失效面，usage 記錄失敗
+    不該讓已經正確收斂的容量釋放結果跳回一半。
 
     - job 找到且 ``job_outcome`` 給出確定終局（``succeeded``／``failed``／
       ``cancelled``）→ ``settle()``。
@@ -1081,13 +1165,8 @@ def reconcile_bound_reservations(
     reservation 一律 no-op）。
     """
     outcomes: list[ReconcileOutcome] = []
-    for decision in store.enforced_admitted():
-        reservation_id = decision.reservation_id
-        if not reservation_id:
-            continue
-        status = authority.status(reservation_id, now_ms=now_ms)
-        if status is None or status.state != "bound":
-            continue
+    for status in authority.list_by_state("bound", now_ms=now_ms):
+        reservation_id = status.reservation_id
         job_id = status.job_id
         job = job_lookup(job_id) if job_id else None
         if job is None:
@@ -1099,7 +1178,7 @@ def reconcile_bound_reservations(
                 now_ms=now_ms,
             )
             outcomes.append(
-                ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                                   action="reconciled", detail=f"inconclusive:{result.status}")
             )
             continue
@@ -1114,13 +1193,13 @@ def reconcile_bound_reservations(
                 renew_lease_ms=renew_lease_ms,
             )
             outcomes.append(
-                ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                                   action="reconciled", detail=f"confirmed-alive:{result.status}")
             )
             continue
         if outcome not in ("succeeded", "failed", "cancelled"):
             outcomes.append(
-                ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                                   action="skipped", detail=f"unknown-job-outcome:{outcome!r}")
             )
             continue
@@ -1138,10 +1217,14 @@ def reconcile_bound_reservations(
             now_ms=now_ms,
         )
         outcomes.append(
-            ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+            ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                               action="settled", detail=f"confirmed-terminated:{result.status}")
         )
         if on_settled is not None:
+            try:
+                decision = store.get(status.decision_id)
+            except Exception:  # noqa: BLE001 - receipt 查詢失敗不影響已完成的容量收斂
+                decision = None
             try:
                 on_settled(decision, job)
             except Exception:  # noqa: BLE001 - usage 記錄失敗不得回滾已完成的容量釋放
@@ -1152,10 +1235,12 @@ def reconcile_bound_reservations(
 def reconcile_reserved_reservations(
     *,
     authority: QuotaReservationAuthority,
-    job_lookup_by_attempt: Callable[[str, str, str], Mapping[str, Any] | None],
+    job_lookup_by_decision: Callable[[str, str, str], Mapping[str, Any] | None],
     job_outcome: Callable[[Mapping[str, Any]], str | None],
     now_ms: int,
     renew_lease_ms: int | None = None,
+    grace_ms: int = 0,
+    in_flight: "InFlightDispatchTracker | None" = None,
 ) -> tuple[ReconcileOutcome, ...]:
     """把卡在 ``reserved``（``create_job()`` 耐久寫入後、``bind()`` 之前
     crash）的 reservation 導向安全的終局或維持。
@@ -1179,8 +1264,8 @@ def reconcile_reserved_reservations(
     ``reserved`` 狀態下這筆 reservation **恆不可能有活著的 job 在跑**——但
     仍必須以 registry 事實判定，不能只憑 lease 過期臆測（原票 AC）：
 
-    - ``job_lookup_by_attempt(run_id, card_id, attempt_id)`` 找到對應建立的
-      job（crash 發生在 ``create_job()`` 之後、``bind()`` 之前）：
+    - ``job_lookup_by_decision(run_id, card_id, decision_id)`` 找到對應建立
+      的 job（crash 發生在 ``create_job()`` 之後、``bind()`` 之前）：
       - job 已終局 → 以 ``reconcile(confirmed-terminated)`` 收斂（`bind()`／
         `settle()` 都需要原 owner 的 ``owner_token``，restart 後的 sweep
         拿不到，見 ``reconcile_bound_reservations`` 同一個理由）。
@@ -1188,25 +1273,39 @@ def reconcile_reserved_reservations(
         一筆 inert 的 registry 記錄）→ ``reconcile(confirmed-alive)`` 續
         lease，避免它只因為 lease 過期就被下一輪誤判成可回收。
     - 查無對應 job：
-      - lease 已過期 → ``reconcile(confirmed-terminated)`` 收斂釋放容量，
-        evidence 標記 ``recovered-unbound``（呼叫端等同「release」語意，但
-        走 ``reconcile()``——sweep 沒有原 owner 的 ``owner_token``，
-        ``release()`` 一樣需要它）。
-      - lease 未過期 → 不動（可能是 ``create_job()`` 還在進行中，尚未
-        寫入 registry）。
-    - ``job_lookup_by_attempt`` 查詢本身失敗（拋例外）→ 一律不動，不得因為
-      查詢失敗就當作『查無此 job』而釋放容量。
+      - 這個 process 自己知道這筆 reservation 目前正在 provisioning
+        （``in_flight`` 給定且 :meth:`InFlightDispatchTracker.is_in_flight`
+        為真——對抗審查第四輪 MAJOR quota_admission.py:1119）→
+        ``reconcile(confirmed-alive)`` 續 lease，即使 lease 早已過期：
+        provisioning（worktree／sandbox 建立）耗時本來就可能超過單次
+        lease，這不是 crash 殘留的證據，是本 process 自己正在使用的活躍
+        窗口。
+      - lease（含 ``grace_ms`` 寬限）已過期，且不是本 process 的 in-flight
+        窗口 → ``reconcile(confirmed-terminated)`` 收斂釋放容量，evidence
+        標記 ``recovered-unbound``（呼叫端等同「release」語意，但走
+        ``reconcile()``——sweep 沒有原 owner 的 ``owner_token``，
+        ``release()`` 一樣需要它）。``grace_ms``（預設 0，逐字沿用舊行為）
+        是額外的安全邊界——即使 dispatch 側的續租（見 manager.py 的
+        provisioning 續租呼叫）因故沒有發生或失敗，也不會在 lease 剛過期
+        的那一刻立刻被判定成可回收。
+      - lease（含寬限）未過期 → 不動（可能是 ``create_job()`` 還在進行
+        中，尚未寫入 registry）。
+    - ``job_lookup_by_decision`` 查詢本身失敗（拋例外）→ 一律不動，不得
+      因為查詢失敗就當作『查無此 job』而釋放容量。
 
     與 :func:`reconcile_bound_reservations` 分成兩支函式：``reserved`` 沒有
-    ``job_id`` 可用，查找方式（依 ``attempt_id`` 的 ordinal 反查 registry）
-    與 ``bound``（直接用 ``status.job_id``）完全不同，呼叫端提供的 callback
-    形狀因此也不同，合併成一支只會讓兩種語意互相混淆。
+    ``job_id`` 可用，查找方式（依 ``decision_id`` 精確比對 job 建立時記錄的
+    quota 決策身分——對抗審查第四輪 MAJOR manager.py:11603，取代舊版依
+    ``attempt_id`` ordinal 猜測、在多 Manager instance 交錯時會誤把不相關
+    候選的 job 當成證據的作法）與 ``bound``（直接用 ``status.job_id``）完全
+    不同，呼叫端提供的 callback 形狀因此也不同，合併成一支只會讓兩種語意
+    互相混淆。
     """
     outcomes: list[ReconcileOutcome] = []
     for status in authority.list_by_state("reserved", now_ms=now_ms):
         reservation_id = status.reservation_id
         try:
-            job = job_lookup_by_attempt(status.run_id, status.card_id, status.attempt_id)
+            job = job_lookup_by_decision(status.run_id, status.card_id, status.decision_id)
         except Exception:  # noqa: BLE001 - 查詢失敗一律不動，不得誤判成『查無』而釋放
             outcomes.append(
                 ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
@@ -1214,8 +1313,24 @@ def reconcile_reserved_reservations(
             )
             continue
         if job is None:
-            if status.lease_expires_at_ms > now_ms:
-                # lease 未過期——可能是 create_job() 仍在進行中，不動。
+            if in_flight is not None and in_flight.is_in_flight(reservation_id):
+                # 本 process 自己知道這筆 reservation 目前正在 provisioning
+                # 窗口內——不是 crash 殘留，即使 lease 早已過期也不能釋放。
+                result = authority.reconcile(
+                    reservation_id=reservation_id,
+                    evidence={"kind": "in-flight-dispatch-provisioning"},
+                    resolution="confirmed-alive",
+                    expected_sequence=status.sequence,
+                    now_ms=now_ms,
+                    renew_lease_ms=renew_lease_ms,
+                )
+                outcomes.append(
+                    ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
+                                      action="reconciled", detail=f"in-flight:{result.status}")
+                )
+                continue
+            if status.lease_expires_at_ms + grace_ms > now_ms:
+                # lease（含寬限）未過期——可能是 create_job() 仍在進行中，不動。
                 outcomes.append(
                     ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                                       action="skipped", detail="lease-not-expired")
@@ -1281,6 +1396,14 @@ _QUOTA_POOLS_CONFIG_REQUIRED_KEYS = frozenset(
 _QUOTA_POOLS_CONFIG_OPTIONAL_KEYS = frozenset({"lease_ms", "usage_unit_refs"})
 _QUOTA_POOLS_CONFIG_ALL_KEYS = _QUOTA_POOLS_CONFIG_REQUIRED_KEYS | _QUOTA_POOLS_CONFIG_OPTIONAL_KEYS
 _MAX_LEASE_MS_CONFIG = 31_622_400_000  # 一年——單純防呆上限，比照 #838 的常數
+#: 對抗審查第四輪 MAJOR（quota_admission.py:1119）：lease 太短時，正常的
+#: worktree／sandbox provisioning 耗時就足以撞上 lease 過期——即使已經補上
+#: dispatch 側的 provisioning 續租與 sweep 的 in-flight／grace 排除，太短
+#: 的 lease 仍會讓這些安全網疲於奔命地追續租，任何一次續租延遲都可能被
+#: sweep 誤判為 crash 殘留。1 分鐘是 worktree／sandbox 建立在正常負載下的
+#: 保守上界，設定值低於它視為設定錯誤，直接拒絕載入（呼叫端據此回
+#: ``quota-config-invalid``），不是業務語意，純粹是防呆下限。
+_MIN_LEASE_MS_CONFIG = 60_000
 
 
 class QuotaPoolsConfigError(ValueError):
@@ -1350,7 +1473,11 @@ def parse_quota_pools_config(payload: object) -> QuotaPoolsConfig:
         raise QuotaPoolsConfigError("quota-pools-config-invalid-binding") from exc
 
     lease_ms = payload.get("lease_ms", 900_000)
-    if type(lease_ms) is not int or lease_ms <= 0 or lease_ms > _MAX_LEASE_MS_CONFIG:
+    if (
+        type(lease_ms) is not int
+        or lease_ms < _MIN_LEASE_MS_CONFIG
+        or lease_ms > _MAX_LEASE_MS_CONFIG
+    ):
         raise QuotaPoolsConfigError("quota-pools-config-invalid-lease-ms")
 
     raw_usage_unit_refs = payload.get("usage_unit_refs", {})
