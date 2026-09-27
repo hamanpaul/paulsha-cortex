@@ -56,6 +56,8 @@ from ..config.paths import worktree_root_for
 from .claim import (
     AuthorityValidationError,
     REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+    WorkAuthority,
+    authority_matches_claim_era,
     decomposition_route,
     needs_human_next_actions,
     needs_human_next_step_hint,
@@ -13279,11 +13281,18 @@ def _stop_red_decomposition(
 
 @dataclass(frozen=True)
 class BuilderTodoAdmission:
-    """目前受監控 WorkAuthority 的 Builder Todo admission 輸入。"""
+    """目前受監控 WorkAuthority 的 Builder Todo admission 輸入。
+
+    ``authority``（#847 self-only planning drift 判準接線）：daemon 載入的完整
+    ``WorkAuthority``，供 digest 不相符時另核對「漂移是否只來自本 run 自產的
+    planning 產物」。缺席（例如既有測試只帶 ``authority_revision``）時退回原本
+    的裸 digest 比對，行為不變。
+    """
 
     authority_revision: str | None = None
     mapped_todo_paths: tuple[str, ...] | None = None
     error: str | None = None
+    authority: WorkAuthority | None = None
 
 
 def _builder_todo_admission_stop(
@@ -13300,6 +13309,7 @@ def _builder_todo_admission_stop(
     authority_revision = getattr(admission, "authority_revision", None)
     todo_paths = getattr(admission, "mapped_todo_paths", None)
     admission_error = getattr(admission, "error", None)
+    authority = getattr(admission, "authority", None)
     if (
         admission_error is not None
         or not isinstance(authority_revision, str)
@@ -13312,7 +13322,16 @@ def _builder_todo_admission_stop(
             "請先修復或等待 Monitor snapshot 更新，再依正式流程 resume。"
         )
         next_step_hint = "確認 Monitor snapshot 可讀且 WorkAuthority 唯一，再依正式流程 resume。"
-    elif authority_revision != run.source_revision:
+    elif not (
+        authority_revision == run.source_revision
+        or (
+            # #847：漂移若只來自本 run 自己已接受、內容 sha256 與 baseline 相符
+            # 的 planning 產物（或等價的 OpenSpec／Manager PR 綁定），視為未變動；
+            # 沿用既有 self-only drift 判準，不自行放寬或忽略 authority。
+            isinstance(authority, WorkAuthority)
+            and authority_matches_claim_era(authority, run)
+        )
+    ):
         reason = "builder-todo-authority-changed"
         detail = (
             "目前 WorkAuthority 已更新，但 WorkflowRun claim 與目前 authority 不一致；"
