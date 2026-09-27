@@ -77,6 +77,8 @@ __all__ = [
     "build_pool_demands",
     "build_capacity_by_pool",
     "reserve_for_candidate",
+    "generation_attempt_id",
+    "reserve_for_candidate_with_generation_fallback",
     "settle_reservation_after_spawn_failure",
     "release_reservation_before_spawn",
     "reconcile_bound_reservations",
@@ -545,6 +547,91 @@ def reserve_for_candidate(
     )
 
 
+def generation_attempt_id(base_attempt_id: str, generation: int) -> str:
+    """給定基底 attempt_id 與世代序號，算出這個世代要用的 attempt_id。
+
+    世代 0 就是 ``base_attempt_id`` 本身（不加任何後綴）——維持
+    :func:`decision_id_for` 對世代 0 的既有輸出逐字不變，向後相容尚未觸發
+    對抗審查第三輪 MAJOR（manager.py:13961）修法之前就已經存在的
+    reservation／decision receipt。世代 ``>=1`` 才附加 ``:g{generation}``。
+    """
+    if generation < 0:
+        raise ValueError("generation must be non-negative")
+    if generation == 0:
+        return base_attempt_id
+    return f"{base_attempt_id}:g{generation}"
+
+
+def reserve_for_candidate_with_generation_fallback(
+    authority: QuotaReservationAuthority,
+    *,
+    run_id: str,
+    card_id: str,
+    base_attempt_id: str,
+    profile_key: str,
+    assessment: CandidateAssessment,
+    observation_version: str,
+    demand_version: str,
+    lease_ms: int,
+    now_ms: int,
+    max_generations: int = _MAX_ATTEMPTS_PER_DECISION,
+) -> tuple[str, str, ReservationResult]:
+    """對抗審查第三輪 MAJOR（manager.py:13961）：`reserve_for_candidate` 的
+    冪等回放（``duplicate``）只看 pools 組成是否相同，不看那筆舊
+    reservation 現在是不是已經終局（``settled``／``released``）。dispatch 在
+    建出 job 之前（``create_job()`` 失敗，或已經被
+    :func:`release_reservation_before_spawn`／reconcile 收斂終結）就把上一
+    個世代的 reservation 結束掉時，`decision_id_for` 依 job 數推算出的
+    ``attempt_id`` 完全不會前進（job 從沒真正建立過，計數不會變）——下一次
+    retry 用同一個 ``attempt_id``／``decision_id`` 再 reserve，只會拿到同一
+    個已終結 reservation 的 ``duplicate`` 回放；若一律當成『別人持有』就會
+    讓這張卡永久卡在 held-elsewhere，即使容量其實完全空著。
+
+    這支函式把『世代』疊在 attempt_id 之上
+    （:func:`generation_attempt_id`），決定性地往前探測：世代 0 就是
+    ``base_attempt_id`` 本身；只要某個世代的 :func:`reserve_for_candidate`
+    回傳 ``duplicate`` **且**那筆舊 reservation 已經是終局
+    （``state in ("settled", "released")``），代表這個世代已經走完了它的
+    生命週期，換下一個世代重算 decision_id 再試一次。遇到其他任何結果
+    （``granted``／``denied``／``conflict``／``invalid``，或 ``duplicate``
+    但舊 reservation 仍是 ``reserved``／``bound``）就立刻停下並原樣回傳——
+    那些情況都不代表『這個世代已經結束』，換世代反而可能誤判仍在使用中的
+    reservation。
+
+    冪等性：同一份 authority 內容下，這個探測序列永遠停在同一個世代——同一
+    次呼叫只會在探測到的『第一個尚未終結』世代呼叫一次真正可能改變狀態的
+    reserve()（更早的世代只讀到 duplicate、不寫入任何新事件），不會一次
+    retry 產生兩個 grant；重複呼叫（同一次 retry 因故重送）一樣先重新探測
+    到同一個世代，再次冪等回放，或極少數情況下冪等地拿到同一個已授予的
+    grant。
+
+    回傳 ``(attempt_id, decision_id, result)``——實際用到的世代 attempt_id
+    與其 decision_id，呼叫端據此更新 receipt／reservation handle 的簿記，
+    不必自己重算。"""
+    generation = 0
+    attempt_id = generation_attempt_id(base_attempt_id, generation)
+    decision_id = decision_id_for(
+        run_id=run_id, card_id=card_id, attempt_id=attempt_id, profile_key=profile_key,
+    )
+    while True:
+        result = reserve_for_candidate(
+            authority,
+            run_id=run_id, card_id=card_id, decision_id=decision_id, attempt_id=attempt_id,
+            assessment=assessment, observation_version=observation_version,
+            demand_version=demand_version, lease_ms=lease_ms, now_ms=now_ms,
+        )
+        is_terminated_duplicate = (
+            result.status == "duplicate" and result.state in ("settled", "released")
+        )
+        if not is_terminated_duplicate or generation + 1 >= max_generations:
+            return attempt_id, decision_id, result
+        generation += 1
+        attempt_id = generation_attempt_id(base_attempt_id, generation)
+        decision_id = decision_id_for(
+            run_id=run_id, card_id=card_id, attempt_id=attempt_id, profile_key=profile_key,
+        )
+
+
 def release_reservation_before_spawn(
     authority: QuotaReservationAuthority,
     *,
@@ -968,15 +1055,29 @@ def reconcile_bound_reservations(
 def reconcile_reserved_reservations(
     *,
     authority: QuotaReservationAuthority,
-    store: AdmissionDecisionStore,
     job_lookup_by_attempt: Callable[[str, str, str], Mapping[str, Any] | None],
     job_outcome: Callable[[Mapping[str, Any]], str | None],
     now_ms: int,
     renew_lease_ms: int | None = None,
 ) -> tuple[ReconcileOutcome, ...]:
-    """掃描曾經 enforced-admit 的決策，把卡在 ``reserved``（``create_job()``
-    耐久寫入後、``bind()`` 之前 crash）的 reservation 導向安全的終局或維持。
+    """把卡在 ``reserved``（``create_job()`` 耐久寫入後、``bind()`` 之前
+    crash）的 reservation 導向安全的終局或維持。
 
+    對抗審查第三輪 MAJOR（quota_admission.py:1008）：舊實作以
+    ``AdmissionDecisionStore.enforced_admitted()`` 反查候選、再用
+    ``authority.status()`` 確認狀態——如果合法持有者在 :func:`reserve_for_candidate`
+    成功之後、寫入那筆 admit receipt 之前 crash（或 receipt 寫入本身失敗；
+    見 ``AdmissionDecisionStore.record()`` 的內容衝突 fail-closed 語意），
+    這筆 reservation 就從未出現在 store 的列舉裡，對這支掃描完全隱形——
+    ``_committed_totals()`` 不會因為 lease 過期就自動放掉它佔的容量（見
+    ``_display_state`` 文件字串：過期本身永不證明可以釋放），之後同一個
+    attempt 重送會一直撞到這筆『看不見也放不掉』的 reservation，永遠卡在
+    ``held-elsewhere``（見 :func:`reserve_for_candidate_with_generation_fallback`）。
+
+    改以 ``authority.list_by_state("reserved", ...)`` 為出發點——本 authority
+    才是 reservation 的唯一真相來源，不必經過任何下游 receipt 是否成功寫入
+    （``run_id``／``card_id``／``attempt_id``／``decision_id`` 本來就已經是
+    reservation 記錄自己的欄位，見 :class:`~.quota_reservation.ReservationStatus`）。
     #838 協定是 reserve → 建 job 記錄 → bind(job_id) → 才 spawn；因此
     ``reserved`` 狀態下這筆 reservation **恆不可能有活著的 job 在跑**——但
     仍必須以 registry 事實判定，不能只憑 lease 過期臆測（原票 AC）：
@@ -1005,18 +1106,13 @@ def reconcile_reserved_reservations(
     形狀因此也不同，合併成一支只會讓兩種語意互相混淆。
     """
     outcomes: list[ReconcileOutcome] = []
-    for decision in store.enforced_admitted():
-        reservation_id = decision.reservation_id
-        if not reservation_id:
-            continue
-        status = authority.status(reservation_id, now_ms=now_ms)
-        if status is None or status.state != "reserved":
-            continue
+    for status in authority.list_by_state("reserved", now_ms=now_ms):
+        reservation_id = status.reservation_id
         try:
-            job = job_lookup_by_attempt(decision.run_id, decision.card_id, decision.attempt_id)
+            job = job_lookup_by_attempt(status.run_id, status.card_id, status.attempt_id)
         except Exception:  # noqa: BLE001 - 查詢失敗一律不動，不得誤判成『查無』而釋放
             outcomes.append(
-                ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                                   action="skipped", detail="job-lookup-failed")
             )
             continue
@@ -1024,7 +1120,7 @@ def reconcile_reserved_reservations(
             if status.lease_expires_at_ms > now_ms:
                 # lease 未過期——可能是 create_job() 仍在進行中，不動。
                 outcomes.append(
-                    ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                    ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                                       action="skipped", detail="lease-not-expired")
                 )
                 continue
@@ -1036,7 +1132,7 @@ def reconcile_reserved_reservations(
                 now_ms=now_ms,
             )
             outcomes.append(
-                ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                                   action="settled", detail=f"recovered-unbound:{result.status}")
             )
             continue
@@ -1052,7 +1148,7 @@ def reconcile_reserved_reservations(
                 now_ms=now_ms,
             )
             outcomes.append(
-                ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                                   action="settled", detail=f"confirmed-terminated:{result.status}")
             )
             continue
@@ -1067,7 +1163,7 @@ def reconcile_reserved_reservations(
             renew_lease_ms=renew_lease_ms,
         )
         outcomes.append(
-            ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+            ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
                               action="reconciled", detail=f"confirmed-alive:{result.status}")
         )
     return outcomes

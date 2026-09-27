@@ -11463,6 +11463,40 @@ def _quota_admission_record_wait_decision(
         return None
 
 
+def _quota_admission_record_admit_decision(
+    store, decision: "quota_admission.AdmissionDecision",
+) -> dict[str, str] | None:
+    """#839 對抗審查修復第三輪（MAJOR manager.py:14056）：admit receipt 比照
+    `_quota_admission_record_wait_decision` 先讀、有舊紀錄就直接沿用不重寫
+    ——舊實作每次都無條件呼叫 `store.record()`。`reserve()` 對同一個
+    decision_id 的重送本來就冪等回放（見 `decision_id_for` 文件字串），但
+    `AdmissionDecision.generated_at_ms` 是每次呼叫當下的時間戳，retry 時
+    必然與上一次不同；`AdmissionDecisionStore.record()` 對同 decision_id、
+    內容不同（哪怕只差這個時間戳）一律視為衝突並拋
+    `AdmissionDecisionCorrupt("admission-decision-id-conflict")`。舊實作沒有
+    任何 try/except 包住這次寫入，會讓這個純診斷用途的 receipt 寫入失敗
+    直接炸掉整條 `_dispatch_workflow_card`——即使是 shadow 模式（票面契約：
+    shadow 只記錄、絕不改變既有派工結果）也會被拖累，讓 shadow rollout 本身
+    改變既有重試行為。
+
+    store 讀寫任何錯誤（含內容衝突、IO、罕見損毀）一律靜默降級為
+    `None`——只影響這筆診斷投影／`WorkflowRun.quota_admission` 投影。
+    enforced 模式下這個時間點是否要建立 job／spawn 的決定已經在候選迴圈裡
+    確定（reservation 的存續完全交給
+    `reconcile_reserved_reservations`／`reconcile_bound_reservations` 依
+    authority／registry 事實判定，不依賴這筆 receipt 是否寫成功——見對抗
+    審查第三輪 MAJOR quota_admission.py:1008 的修法），receipt 只是事後補記
+    的診斷投影，因此這裡放寬到 enforced 模式也一律 fail soft 是安全的。"""
+    try:
+        existing = store.get(decision.decision_id)
+        if existing is None:
+            store.record(decision)
+            return {"decision_id": decision.decision_id, "mode": decision.mode, "outcome": decision.outcome}
+        return {"decision_id": existing.decision_id, "mode": existing.mode, "outcome": existing.outcome}
+    except Exception:
+        return None
+
+
 def _quota_admission_stop(
     registry, run, step, *, attempts: Sequence[Mapping[str, object]],
     quota_admission_context, identities: "IdentityRegistry",
@@ -11580,14 +11614,26 @@ def _quota_admission_job_lookup_by_attempt(
 
     格式不符、索引超出範圍（該 attempt 從未真正建出 job，或已被更晚的
     attempt 覆蓋計數）一律回 ``None``——由呼叫端依 lease 是否過期決定是否
-    安全釋放，本函式不猜測。"""
+    安全釋放，本函式不猜測。
+
+    對抗審查第三輪 MAJOR（manager.py:13961）：
+    `quota_admission.reserve_for_candidate_with_generation_fallback` 會在
+    attempt_id 尾端加上世代後綴（``:g{generation}``，見
+    `quota_admission.generation_attempt_id`）——世代只用來讓 reservation／
+    decision_id 在舊世代已終局時仍能算出一個全新的身分，job 是否已經建立
+    的判定完全看『這個 run/card 已經有幾個 job』這個與世代無關的計數，因此
+    這裡先剝掉世代後綴才解析 ordinal，避免世代 >=1 的 attempt_id 因為多了
+    這段尾綴、``isdigit()`` 檢查失敗而永遠查不到其實已經建立的 job。"""
     prefix = f"{run_id}:{card_id}:n"
     if not attempt_id.startswith(prefix):
         return None
     suffix = attempt_id[len(prefix):]
-    if not suffix.isdigit():
+    ordinal_part, _, generation_part = suffix.partition(":g")
+    if generation_part and not generation_part.isdigit():
         return None
-    ordinal = int(suffix)
+    if not ordinal_part.isdigit():
+        return None
+    ordinal = int(ordinal_part)
     matching = [
         job
         for job in registry.list_jobs()
@@ -11673,7 +11719,11 @@ def reconcile_quota_admission_reservations(
 
     1. `quota_admission.reconcile_reserved_reservations`——收斂
        `create_job()` 之後、`bind()` 之前 crash 留下的無 job_id reservation
-       （對抗審查 MAJOR manager.py:13981）。
+       （對抗審查 MAJOR manager.py:13981）；對抗審查第三輪
+       （quota_admission.py:1008）之後改以 reservation authority 本身列舉
+       `reserved` 狀態，即使 admit receipt 從未寫入（合法持有者在
+       `reserve()` 成功後、寫入 receipt 前 crash）也照樣能被掃到，不再依賴
+       `AdmissionDecisionStore` 是否成功記錄這筆決策。
     2. `quota_admission.reconcile_bound_reservations`——收斂已經 `bind()`
        過的 reservation；job 進終局時同時透過 `on_settled` 呼叫
        `_quota_admission_record_terminal_usage` 記消耗（票面 c：「成功／
@@ -11692,7 +11742,6 @@ def reconcile_quota_admission_reservations(
     resolved_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     reserved_outcomes = quota_admission.reconcile_reserved_reservations(
         authority=quota_admission_context.authority,
-        store=quota_admission_context.store,
         job_lookup_by_attempt=lambda run_id, card_id, attempt_id: _quota_admission_job_lookup_by_attempt(
             registry, run_id, card_id, attempt_id
         ),
@@ -13940,13 +13989,24 @@ def _dispatch_workflow_card(
         # 耗盡並在下一輪迴圈頂端回 `_quota_admission_stop`）、每次只替『目前
         # 選中』的候選預留，不留半張 grant（reserve() 失敗不會留下任何容量）。
         quota_now_ms = int(time.time() * 1000)
-        reservation_result = quota_admission.reserve_for_candidate(
-            quota_admission_context.authority,
-            run_id=run.run_id, card_id=step.card, decision_id=quota_decision_id,
-            attempt_id=quota_attempt_id, assessment=quota_assessment,
-            observation_version=quota_admission.observation_fingerprint(quota_assessment),
-            demand_version=quota_demand_version,
-            lease_ms=quota_admission_context.lease_ms, now_ms=quota_now_ms,
+        # #839 對抗審查修復第三輪（MAJOR manager.py:13961）：改用
+        # `reserve_for_candidate_with_generation_fallback`——如果這個
+        # attempt_id 底下的舊 reservation 已經是終局（released／settled，
+        # 例如上一次 retry 在 create_job() 失敗後已經
+        # release_reservation_before_spawn，或已被 reconcile 收斂），它會
+        # 自動換算下一個世代的 attempt_id／decision_id 再試一次，不會把
+        # 『舊 attempt 早已結束』誤判成『別人持有』而永久卡住這張卡；仍是
+        # `reserved`／`bound` 的 duplicate 則原樣回傳，交給下面既有的
+        # held-elsewhere 判斷。
+        quota_attempt_id, quota_decision_id, reservation_result = (
+            quota_admission.reserve_for_candidate_with_generation_fallback(
+                quota_admission_context.authority,
+                run_id=run.run_id, card_id=step.card, base_attempt_id=quota_attempt_id,
+                profile_key=profile_binding.resolved_key, assessment=quota_assessment,
+                observation_version=quota_admission.observation_fingerprint(quota_assessment),
+                demand_version=quota_demand_version,
+                lease_ms=quota_admission_context.lease_ms, now_ms=quota_now_ms,
+            )
         )
         if reservation_result.status == "granted":
             # 只有這次呼叫**新建立**的 grant，這個 Manager instance 才是唯一
@@ -13969,6 +14029,13 @@ def _dispatch_workflow_card(
             # 若這個 instance 隨後在 create_job()／provisioning 失敗，就會
             # 用這個借來的 owner_token 呼叫 release()，誤釋放另一個仍在使用
             # 中的 instance 的 grant。
+            #
+            # 對抗審查第三輪（MAJOR manager.py:13961）：能走到這裡的
+            # `duplicate` 已經是 `reserve_for_candidate_with_generation_fallback`
+            # 探測過『這個世代是不是終局』之後仍原樣回傳的——換句話說，這筆
+            # 舊 reservation 目前確實還是 `reserved`／`bound`（或世代探測已
+            # 到上限），不會是單純『舊 attempt 早已結束、只是計數沒前進』的
+            # 情況（那種情況上面那支函式已經自動換了世代重新 reserve）。
             #
             # 一律把 `duplicate` 當成『別人持有』：不建立
             # quota_reservation_handle（因此後面永遠不會對它呼叫
@@ -14053,16 +14120,22 @@ def _dispatch_workflow_card(
             # ——最後一筆是本次選中的候選自己，不算「被排除」。
             excluded=tuple(quota_admission_attempts[:-1]),
         )
-        quota_admission_context.store.record(quota_decision)
-        registry._manager_update_workflow_run(
-            run.run_id,
-            quota_admission={
-                **(run.quota_admission or {}),
-                step.persona: {
-                    "decision_id": quota_decision_id, "mode": quota_mode, "outcome": "admit",
-                },
-            },
+        # #839 對抗審查修復第三輪（MAJOR manager.py:14056）：admit receipt
+        # 比照 wait receipt 先讀、有舊紀錄就沿用不重寫——見
+        # `_quota_admission_record_admit_decision` 文件字串；shadow（以及
+        # 未受額度管理、`quota_reservation_handle` 為 None）的候選尤其不能
+        # 讓這筆純診斷寫入的失敗回頭影響已經確定的派工結果。
+        quota_admission_projection = _quota_admission_record_admit_decision(
+            quota_admission_context.store, quota_decision,
         )
+        if quota_admission_projection is not None:
+            registry._manager_update_workflow_run(
+                run.run_id,
+                quota_admission={
+                    **(run.quota_admission or {}),
+                    step.persona: quota_admission_projection,
+                },
+            )
     builder_jobs = [
         job
         for job in registry.list_jobs()
