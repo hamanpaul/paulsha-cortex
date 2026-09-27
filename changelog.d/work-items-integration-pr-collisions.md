@@ -1,0 +1,1 @@
+- `.cortex/work-items.yaml`：整合 PR #1087、#1090 一次關閉多張各自已有 work item 的票，Monitor 的 `github_closing` 關聯把這些票拉進整合 PR 所屬群組，造成 13 筆 confirmed source collision，paulsha-cortex repo 自 2026-09-25 起被標 degraded（auto-claim／merge hard gate 關閉、新 work item 停在 topic 無法 intake）。以 `retry-build-preserve-proof` 的 excludes 與新增 `wave4-large-bug-integration`（連結 PR #1090 並排除已有 owner 的票）解除衝突。
