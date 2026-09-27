@@ -942,6 +942,7 @@ def _verify_live(
     now: datetime,
     validator: Callable[[Mapping[str, Any]], bool] | None,
     review_document: Mapping[str, Any] | None,
+    domain_deriver: Callable[[Mapping[str, Any]], str | None] | None,
 ) -> dict[str, Any]:
     ref = row.get("live_receipt")
     if ref is None:
@@ -977,9 +978,28 @@ def _verify_live(
             return _stage("unknown", "live-canary-independence-unknown", locator=locator, digest=expected_digest)
         reviewer = review_document.get("launch_identity", {}).get("reviewer") if isinstance(review_document, Mapping) else None
         reviewer_domain = reviewer.get("independence_domain") if isinstance(reviewer, Mapping) else None
-        canary_domain = independence.get("canary_domain")
         review_domain = independence.get("review_domain")
-        if not isinstance(canary_domain, str) or not isinstance(review_domain, str) or canary_domain == review_domain or (reviewer_domain is not None and review_domain != reviewer_domain):
+        if not isinstance(review_domain, str) or (reviewer_domain is not None and review_domain != reviewer_domain):
+            return _stage("failed", "live-canary-independence-mismatch", locator=locator, digest=expected_digest)
+        # 對抗審查第九輪 BLOCKER：canary_domain 不得只信 receipt 自報字串——
+        # 由 `domain_deriver`（production 為 `live_receipt_validators.
+        # derive_canary_domain`）依 receipt kind 與已驗證的 evidence 導出；
+        # independence 檢查只用導出值。receipt 若仍自報 canary_domain，該值
+        # 必須與導出值完全相同，否則拒絕；無法導出（kind 未登記、evidence
+        # 缺對應欄位）一律 fail closed，不得代入預設值放行。
+        if domain_deriver is None:
+            return _stage("unknown", "governed-live-receipt-domain-deriver-unavailable", locator=locator, digest=expected_digest)
+        try:
+            canary_domain = domain_deriver(receipt)
+        except Exception:
+            canary_domain = None
+        reported_canary_domain = independence.get("canary_domain")
+        if (
+            not isinstance(canary_domain, str)
+            or not canary_domain
+            or canary_domain == review_domain
+            or (reported_canary_domain is not None and reported_canary_domain != canary_domain)
+        ):
             return _stage("failed", "live-canary-independence-mismatch", locator=locator, digest=expected_digest)
         if validator is None:
             return _stage("unknown", "governed-live-receipt-validator-unavailable", locator=locator, digest=expected_digest)
@@ -1103,6 +1123,7 @@ def inspect_delivery(
     runtime_state_resolver: Callable[[str, str, object], str | Path] | None = None,
     runtime_status_resolver: Callable[[str, str], Mapping[str, Any]] | None = None,
     live_receipt_validator: Callable[[Mapping[str, Any]], bool] | None = None,
+    live_receipt_domain_deriver: Callable[[Mapping[str, Any]], str | None] | None = None,
     waiver_validator: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> dict[str, Any]:
     """唯讀重驗 requirement/evidence；永不派工、merge、部署或改 issue。"""
@@ -1192,6 +1213,7 @@ def inspect_delivery(
                 now=now,
                 validator=live_receipt_validator,
                 review_document=review_doc,
+                domain_deriver=live_receipt_domain_deriver,
             )
             # test_result 為 "verified" 只表示 run 層級驗證通過；仍須逐條 acceptance
             # criterion 找到明確綁定且通過的測試才算 covered，不可用 run 狀態推定。
@@ -1418,6 +1440,7 @@ def reconcile_delivery(
     runtime_state_resolver: Callable[[str, str, object], str | Path] | None = None,
     runtime_status_resolver: Callable[[str, str], Mapping[str, Any]] | None = None,
     live_receipt_validator: Callable[[Mapping[str, Any]], bool] | None = None,
+    live_receipt_domain_deriver: Callable[[Mapping[str, Any]], str | None] | None = None,
     waiver_validator: Callable[[Mapping[str, Any]], bool] | None = None,
 ) -> dict[str, Any]:
     """重新驗證可信來源後以單檔 CAS 更新衍生索引。"""
@@ -1447,6 +1470,7 @@ def reconcile_delivery(
         "runtime_state_resolver": runtime_state_resolver,
         "runtime_status_resolver": runtime_status_resolver,
         "live_receipt_validator": live_receipt_validator,
+        "live_receipt_domain_deriver": live_receipt_domain_deriver,
         "waiver_validator": waiver_validator,
     }
     report = inspect_delivery(manifest, source_snapshot, **context)

@@ -54,10 +54,60 @@ receipt_validator` 工廠取代：
   之下且不得是 symlink，缺檔或載入失敗一律回傳 `None`，deployment-canary
   validator 遇到 `None` 立即 fail closed，不影響 task-memory kind。
   `porcelain/delivery.py` 以此工廠建立 `common["live_receipt_validator"]`。
+
+## #845 對抗審查（第九輪）：canary_domain 自報與 target 欄位部分綁定
+
+- BLOCKER（`requirement_delivery.py` 的 `_verify_live`）：`independence.
+  canary_domain` 先前完全是 receipt 自報字串，同一個 reviewer 產生的 receipt
+  只要把它改成任意不同於 reviewer domain 的值就能通過 independence 檢查。
+  現在改由本模組的 `derive_canary_domain(receipt)` 依 `receipt["kind"]` 從
+  **已通過 schema 檢查的 evidence** 導出，`_verify_live` 只用導出值；receipt
+  若仍自報 `independence.canary_domain`，該值必須與導出值完全相同，否則拒絕
+  （不是「有填就信」，是「填了就必須對得上」）。兩種已登記 kind 的導出來源：
+  - `cortex/deployment-canary-qualification/v1`：導出來源是 evidence 的
+    `image.digest`（`sha256:` + 64 hex）。`qualification/driver.py` 的
+    docstring 明示這是「複製進候選掛載之前的參考映像」——與候選 checkout、
+    builder／reviewer 執行環境無關，是這個 kind 的 schema 已經強制存在且
+    格式受限的欄位，不是額外自由填的字串。
+  - `cortex/task-memory-live-canary/v1`：導出來源是 evidence 的
+    `executor.id`（非空字串）。這是本模組新增的必要欄位（原 schema 沒有任何
+    執行環境／執行者身分可用於 independence 導出），代表產生這份 canary
+    量測的執行者身分，與 review 執行環境無關。
+  兩種來源都無法取得時（kind 未登記、evidence 型別不符、欄位缺失或格式錯誤）
+  一律回傳 `None`，`_verify_live` 視為 independence 檢查失敗（fail closed），
+  不得代入任何預設值放行。
+- MAJOR（`_validate_deployment_canary_qualification`）：先前只把
+  `candidate_sha`／`artifact_sha256`（進而透過 `canary_target.repository`
+  綁 `repo`）與 acceptance target 比對；target 其餘五個欄位——
+  `source_revision`／`service`／`instance`／`profile_key`／`config_revision`
+  ——qualification evidence 的 schema完全沒有對應內容可比對（canary 測的是
+  「這顆 wheel／candidate」本身能否通過 attack matrix 與基本 dispatch，不是
+  某個特定 profile／instance 的部署事實），所以先前的程式碼就沒有檢查它們；
+  同一份真實 canary evidence 因而可以在只換掉外層 `receipt["target"]` 這五個
+  欄位後被重複拿去核銷不同 profile/config/instance 的需求，違反 A04 exact
+  target。修法：**每種 kind 先明列 evidence 可證明的 target 欄位**——
+  deployment-canary-qualification 只能證明 `repo`／`candidate_sha`／
+  `artifact_sha256`（已直接比對 evidence 內容）；其餘五個欄位改用內容定址
+  綁定——`deployment_canary_evidence_scope(target)` 對這五個欄位算出
+  canonical SHA-256，`canary_target.evidence_directory` 必須**精確等於**這個
+  digest 才會被接受（不再是 receipt 自由選的字串），因此實際 evidence 檔案
+  必須真的存在於 `evidence_root/<digest>/...` 這個路徑之下——`evidence_root`
+  是呼叫端信任邊界，receipt 內容無法寫入。同一份 wheel canary evidence 若被
+  重貼到不同 profile_key／config_revision／instance／service／
+  source_revision 的需求，其唯一合法路徑會跟著改變；除非攻擊者真的取得
+  `evidence_root` 寫入權限並把檔案複製到新路徑，否則無法讓舊 evidence 通過
+  新 target 的檢查——這已經超出單純竄改 receipt JSON 的威脅模型，是本模組
+  唯一不受 receipt 內容操控的信任邊界。`cortex/task-memory-live-canary/v1`
+  這個 kind 的 evidence 完全沒有檔案樹可供內容定址，目前仍只靠
+  `evidence["target"] == 外層 target` 的自我一致檢查（見 `_verify_live` 已
+  先驗證外層 target 就是這條需求 mapping 的 acceptance target）；這是已知
+  的較弱綁定，非本輪對抗審查具體指出的項目，於此明確記載，不佇裝已解決。
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import re
 from pathlib import Path, PurePosixPath
 from types import ModuleType
@@ -65,6 +115,14 @@ from typing import Any, Callable, Mapping
 
 KIND_DEPLOYMENT_CANARY_QUALIFICATION = "cortex/deployment-canary-qualification/v1"
 KIND_TASK_MEMORY_LIVE_CANARY = "cortex/task-memory-live-canary/v1"
+
+# #845 對抗審查第九輪 MAJOR：deployment-canary qualification evidence 的 schema
+# 完全沒有對應內容可以證明這五個 acceptance target 欄位；改用內容定址的
+# evidence 目錄 locator 間接綁定（見 `deployment_canary_evidence_scope`）。
+_DEPLOYMENT_CANARY_DIRECTORY_SCOPE_FIELDS = (
+    "source_revision", "service", "instance", "profile_key", "config_revision",
+)
+_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 # #857 task-memory canary 的門檻：與規格 R7（canary acceptance）一致——至少 5 次
 # 嘗試、eligible authorized content retrieval 成功率至少 95%。
@@ -159,6 +217,59 @@ def _resolve_evidence_directory(evidence_root: Path, locator: object) -> Path | 
     return candidate
 
 
+def deployment_canary_evidence_scope(target: Mapping[str, Any]) -> str:
+    """deployment-canary evidence 目錄的規範內容定址 locator（#845 對抗審查
+    第九輪 MAJOR）。
+
+    只吃 `target` 裡 qualification evidence 無法直接證明的五個欄位
+    （`_DEPLOYMENT_CANARY_DIRECTORY_SCOPE_FIELDS`），算出 canonical JSON 的
+    SHA-256；`_validate_deployment_canary_qualification` 要求
+    `canary_target.evidence_directory` 精確等於這個值，而不是 receipt 自由
+    選擇的字串。這是純函式，不讀檔案系統；實際 evidence 是否真的存在於這個
+    digest 命名的目錄下，由 `_resolve_evidence_directory` 對呼叫端信任邊界
+    `evidence_root` 解析後核對。"""
+    payload = {field: target.get(field) for field in _DEPLOYMENT_CANARY_DIRECTORY_SCOPE_FIELDS}
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def derive_canary_domain(receipt: Mapping[str, Any]) -> str | None:
+    """依 `receipt["kind"]` 從已通過 schema 檢查的 evidence 導出 canary 執行
+    環境身分，取代 receipt 自報的 `independence.canary_domain`（#845 對抗
+    審查第九輪 BLOCKER）。
+
+    - `cortex/deployment-canary-qualification/v1`：導出來源是 evidence 的
+      `image.digest`（`sha256:` + 64 hex；`qualification/driver.py` docstring
+      明示這是複製進候選掛載之前的參考映像，與候選 checkout／reviewer 執行
+      環境無關）。
+    - `cortex/task-memory-live-canary/v1`：導出來源是 evidence 的
+      `executor.id`（非空字串；本模組新增的必要欄位，代表產生這份 canary
+      量測的執行者身分）。
+
+    kind 未登記、evidence 型別不符或對應欄位缺失／格式錯誤，一律回傳
+    ``None``（fail-closed）；呼叫端（`requirement_delivery._verify_live`）
+    不得因為看不懂就代入預設值放行。"""
+    if not isinstance(receipt, Mapping):
+        return None
+    kind = receipt.get("kind")
+    evidence = receipt.get("evidence")
+    if not isinstance(kind, str) or not isinstance(evidence, Mapping):
+        return None
+    if kind == KIND_DEPLOYMENT_CANARY_QUALIFICATION:
+        image = evidence.get("image")
+        digest = image.get("digest") if isinstance(image, Mapping) else None
+        if not isinstance(digest, str) or _IMAGE_DIGEST_RE.fullmatch(digest) is None:
+            return None
+        return f"deployment-canary-image:{digest}"
+    if kind == KIND_TASK_MEMORY_LIVE_CANARY:
+        executor = evidence.get("executor")
+        executor_id = executor.get("id") if isinstance(executor, Mapping) else None
+        if not isinstance(executor_id, str) or not executor_id:
+            return None
+        return f"task-memory-live-canary-executor:{executor_id}"
+    return None
+
+
 def _validate_deployment_canary_qualification(
     receipt: Mapping[str, Any],
     *,
@@ -204,6 +315,15 @@ def _validate_deployment_canary_qualification(
     ):
         return False
 
+    # #845 對抗審查第九輪 MAJOR：qualification evidence 完全無法證明
+    # source_revision／service／instance／profile_key／config_revision 這五個
+    # target 欄位；改用內容定址間接綁定——evidence_directory 必須精確等於這
+    # 五個欄位的規範 digest，不再是 receipt 自由選擇的字串。同一份 wheel
+    # canary evidence 換掉這五個欄位後，其唯一合法路徑會跟著改變，無法只靠
+    # 竄改 receipt JSON 就讓舊 evidence 通過新 target。
+    if evidence_directory != deployment_canary_evidence_scope(target):
+        return False
+
     resolved_evidence_root = _resolve_evidence_directory(evidence_root, evidence_directory)
     if resolved_evidence_root is None:
         return False
@@ -242,6 +362,13 @@ def _validate_task_memory_live_canary(
     if not isinstance(target, Mapping) or not isinstance(evidence, Mapping):
         return False
     if evidence.get("schema") != KIND_TASK_MEMORY_LIVE_CANARY or evidence.get("passed") is not True:
+        return False
+    # #845 對抗審查第九輪 BLOCKER：`derive_canary_domain` 需要一個獨立於
+    # review 執行環境的執行者身分才能導出 canary_domain；這個 kind 原本沒有
+    # 任何身分欄位可用，因此新增為必要欄位（非空字串），不是選填。
+    executor = evidence.get("executor")
+    executor_id = executor.get("id") if isinstance(executor, Mapping) else None
+    if not isinstance(executor_id, str) or not executor_id:
         return False
     # evidence 必須明確宣告與 receipt 同一個 target；型別不符或不相等都拒絕。
     if not isinstance(evidence.get("target"), Mapping) or dict(evidence["target"]) != dict(target):

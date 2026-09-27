@@ -298,7 +298,10 @@ def _cli_write_live_receipt(
         "observed_at": "2026-09-25T00:00:00+00:00",
         "target": target,
         "authority": {"id": "release-operator", "version": "1", "receipt": "approval:123"},
-        "independence": {"canary_domain": "loaded-runtime", "review_domain": "reviewer-domain"},
+        # #845 對抗審查第九輪 BLOCKER GREEN：canary_domain 不再自報，改由
+        # production `live_receipt_validators.derive_canary_domain` 依 kind／
+        # evidence 導出（`porcelain/delivery.py` 已固定接線）。
+        "independence": {"review_domain": "reviewer-domain"},
         "kind": kind,
         "evidence": evidence,
     }
@@ -642,8 +645,11 @@ def test_delivery_gaps_cli_with_governed_qualification_receipt_reaches_ready(mon
     CLI 入口，帶真正的 evidence 目錄、外部 canary 身分，且 `qualification/
     validate.py` 由 `--source-root` 動態載入，才能到達 ready。"""
     target = _cli_target(_cli_config_revision())
+    # #845 對抗審查第九輪 MAJOR：evidence 目錄 locator 必須精確等於這五個
+    # target 欄位的規範 digest，不再是自由選擇的 `"canary-evidence"` 字面路徑。
+    evidence_scope = live_receipt_validators.deployment_canary_evidence_scope(target)
     evidence = _cli_full_canary_qualification(
-        tmp_path / "canary-evidence",
+        tmp_path / evidence_scope,
         candidate_sha=target["candidate_sha"],
         wheel_sha256=target["artifact_sha256"],
         repository=target["repo"],
@@ -652,7 +658,7 @@ def test_delivery_gaps_cli_with_governed_qualification_receipt_reaches_ready(mon
         "repository": target["repo"],
         "work_id": "canary-dispatch-1",
         "issue": 845,
-        "evidence_directory": "canary-evidence",
+        "evidence_directory": evidence_scope,
     }
     paths_ = _prepare_cli_delivery_gate(
         monkeypatch,
@@ -681,8 +687,9 @@ def test_delivery_gaps_cli_with_governed_qualification_receipt_missing_source_ro
     wheel 在 checkout 外執行），即使 evidence 完全合法，CLI 入口也必須 fail
     closed，不能因為缺套件就放行。"""
     target = _cli_target(_cli_config_revision())
+    evidence_scope = live_receipt_validators.deployment_canary_evidence_scope(target)
     evidence = _cli_full_canary_qualification(
-        tmp_path / "canary-evidence",
+        tmp_path / evidence_scope,
         candidate_sha=target["candidate_sha"],
         wheel_sha256=target["artifact_sha256"],
         repository=target["repo"],
@@ -691,7 +698,7 @@ def test_delivery_gaps_cli_with_governed_qualification_receipt_missing_source_ro
         "repository": target["repo"],
         "work_id": "canary-dispatch-1",
         "issue": 845,
-        "evidence_directory": "canary-evidence",
+        "evidence_directory": evidence_scope,
     }
     paths_ = _prepare_cli_delivery_gate(
         monkeypatch,
@@ -734,6 +741,10 @@ def test_delivery_gaps_cli_with_unknown_live_receipt_kind_reports_gap(monkeypatc
     assert report["closure_readiness"] != "ready"
     live = report["mappings"][0]["evidence"]["live"]
     assert live["status"] == "failed"
-    assert live["reason"] == "governed-live-receipt-validator-rejected"
+    # #845 對抗審查第九輪 BLOCKER：kind 未登記時，`derive_canary_domain` 就
+    # 已經無法導出 canary_domain，因此在到達封閉登記表 validator 之前就已在
+    # independence 檢查 fail closed；不再是先前的
+    # `governed-live-receipt-validator-rejected`。
+    assert live["reason"] == "live-canary-independence-mismatch"
     gap_stages = {gap.get("stage") for gap in report.get("gaps", [])}
     assert "live" in gap_stages

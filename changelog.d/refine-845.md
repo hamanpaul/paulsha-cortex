@@ -252,3 +252,64 @@ delivery gaps` 這條 production CLI 入口在 `--source-root` 缺 `qualificatio
 `tests/test_requirement_delivery.py`／`test_requirement_delivery_cli.py`／
 `test_phase2_qualification.py`（139 個）與 `-k "delivery or qualification"`
 （452 個）全數通過。
+
+對抗審查第九輪修正（canary_domain 自報放行、target 欄位只部分綁定，共兩條）：
+
+1. BLOCKER：`requirement_delivery._verify_live` 先前把 `independence.
+   canary_domain` 當成 receipt 自報字串直接採信，只要求它跟 `review_domain`
+   不同——同一個 reviewer 產生的 receipt，只要把 `canary_domain` 改成任意
+   不同於 reviewer domain 的值就能通過 independence 檢查，這條檢查形同虛設。
+   新增 `live_receipt_validators.derive_canary_domain(receipt)`：依
+   `receipt["kind"]` 從已通過 schema 檢查的 evidence 導出 canary 執行環境
+   身分——`cortex/deployment-canary-qualification/v1` 用 evidence 的
+   `image.digest`（`qualification/driver.py` docstring 明示這是複製進候選
+   掛載之前的參考映像，與候選 checkout／reviewer 執行環境無關）；
+   `cortex/task-memory-live-canary/v1` 用 evidence 的 `executor.id`（本輪
+   新增的必要欄位，原 schema 沒有任何可用的執行者身分）。`_verify_live`
+   改吃新的 `domain_deriver` 參數（`inspect_delivery`／`reconcile_delivery`
+   新增對應 `live_receipt_domain_deriver` 參數並轉交；`porcelain/delivery.py`
+   接上 `derive_canary_domain`），independence 檢查只用導出值；receipt 若
+   仍自報 `independence.canary_domain`，該值必須與導出值完全相同，否則拒絕。
+   無法導出（kind 未登記、evidence 缺對應欄位）一律回傳 `None`，視為
+   independence 檢查失敗，不代入預設值放行。
+2. MAJOR：`_validate_deployment_canary_qualification` 先前只把
+   `candidate_sha`／`artifact_sha256`（進而透過 `canary_target.repository`
+   綁 `repo`）與 acceptance target 比對；target 其餘五個欄位——
+   `source_revision`／`service`／`instance`／`profile_key`／
+   `config_revision`——qualification evidence 的 schema 完全沒有對應內容
+   可比對，因此完全沒被檢查。同一份真正、完整通過的 canary evidence 只要
+   換掉外層 `receipt["target"]` 這五個欄位（例如 instance 或
+   config_revision），就能重複核銷不同 profile/instance 的需求，違反 A04
+   exact target。新增 `live_receipt_validators.deployment_canary_evidence_
+   scope(target)`：只取這五個欄位算出 canonical SHA-256；
+   `canary_target.evidence_directory` 現在必須精確等於這個 digest（不再是
+   receipt 自由選擇的字串），因此真正的 evidence 檔案必須存在於
+   `evidence_root/<digest>/...` 這個路徑之下——`evidence_root` 是呼叫端信任
+   邊界，receipt 內容無法寫入。同一份 wheel canary evidence 換掉這五個欄位
+   後，其唯一合法路徑會跟著改變，除非攻擊者真的取得 `evidence_root` 寫入
+   權限並複製檔案到新路徑，否則無法通過新 target 的檢查。
+   `cortex/task-memory-live-canary/v1` 的 evidence 完全沒有檔案樹可供內容
+   定址，目前仍只靠 `evidence["target"] == 外層 target` 的自我一致檢查；這
+   是已知的較弱綁定，非本輪對抗審查具體指出的項目，於文件明確記載，不佇裝
+   已解決。
+
+兩條均先以 RED 測試（`git show HEAD:` 還原 `live_receipt_validators.py`／
+`requirement_delivery.py` 到本輪修法前版本，不用 `git stash`）確認可重現：
+新測試因 `deployment_canary_evidence_scope`／`derive_canary_domain` 在舊版
+不存在，`tests/test_requirement_delivery.py` 於收集階段就 `AttributeError`。
+復原後 GREEN。新增 2 個 regression 測試：BLOCKER 用真正合法的 deployment-
+canary evidence，僅把 receipt 自報的 `canary_domain` 改成一個「看起來合法、
+確實跟 reviewer domain 不同」但跟導出值不符的字串，證明修法前會被放行、
+修法後必須拒絕；MAJOR 用同一份針對 `instance="default"` 產生的真實
+evidence，只把外層 `target.instance` 換成 `"other"`（`canary_target.
+evidence_directory` 保持指向原 evidence 實體目錄），證明修法前會被放行、
+修法後必須 fail closed。既有測試中沿用固定字面路徑 `"canary-evidence"` 與
+自報 `canary_domain: "loaded-runtime"` 的 fixture 全部改為依 target 動態算出
+的規範 digest，並移除不再需要的自報 canary_domain；`_task_memory_payload`
+新增必要的 `executor.id` 欄位。未知 kind 的既有 regression 測試因獨立性
+檢查提前 fail closed，改為斷言新的 `live-canary-independence-mismatch`
+原因（原先是 `governed-live-receipt-validator-rejected`）。
+
+`tests/test_requirement_delivery.py`／`test_requirement_delivery_cli.py`／
+`test_phase2_qualification.py`（141 個）與 `-k "delivery or qualification"`
+（454 個）全數通過。

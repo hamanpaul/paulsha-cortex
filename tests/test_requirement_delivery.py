@@ -228,6 +228,12 @@ def _target(*, profile_key: str = PROFILE_KEY, config_revision: str = CONFIG_REV
     }
 
 
+# #845 對抗審查第九輪 MAJOR：這個 suite 的所有 governed deployment-canary
+# fixture 都沿用同一個 `_target()`，因此規範 evidence 目錄 digest 是常數；
+# 集中定義一次，取代先前寫死的 `"canary-evidence"` 字面路徑。
+_CANARY_EVIDENCE_SCOPE = live_receipt_validators.deployment_canary_evidence_scope(_target())
+
+
 def _write_runtime(root: Path, *, target=None, pid: int = 555, state_name: str = "runtime-0") -> None:
     target = target or _target()
     runtime_attestation.record_runtime_startup(
@@ -390,7 +396,7 @@ def _snapshot(root: Path, manifest: dict, specs: list[tuple[str, str]], *, profi
     }
 
 
-def _context(root: Path, *, authorities=None, github=None, current_artifact=None, live_validator=None, waiver_validator=None):
+def _context(root: Path, *, authorities=None, github=None, current_artifact=None, live_validator=None, domain_deriver=None, waiver_validator=None):
     return {
         "source_root": root,
         "evidence_root": root,
@@ -408,6 +414,11 @@ def _context(root: Path, *, authorities=None, github=None, current_artifact=None
         "now_epoch": NOW,
         "runtime_state_resolver": lambda service, instance, hint: root / str(hint),
         "live_receipt_validator": live_validator or (lambda receipt: True),
+        # 未特別指定 kind-aware 導出（大多數測試不觸及 #845 對抗審查第九輪
+        # BLOCKER 的封閉登記表路徑）時，這個 test double 直接沿用 receipt 自報
+        # 的 `independence.canary_domain`，等同修法前的行為；`_governed_case`
+        # 會改用真正的 `live_receipt_validators.derive_canary_domain`。
+        "live_receipt_domain_deriver": domain_deriver or (lambda receipt: (receipt.get("independence") or {}).get("canary_domain")),
         "waiver_validator": waiver_validator or (lambda waiver: True),
     }
 
@@ -1481,6 +1492,9 @@ def _task_memory_payload(*, target: dict) -> dict:
     return {
         "schema": live_receipt_validators.KIND_TASK_MEMORY_LIVE_CANARY,
         "passed": True,
+        # #845 對抗審查第九輪 BLOCKER：`derive_canary_domain` 需要一個獨立於
+        # review 執行環境的執行者身分；這個欄位現在是必要欄位。
+        "executor": {"id": "hippo-task-memory-canary-runner-1"},
         "target": target,
         "content_retrieval": _rate_row(40, 38),
         "paths": {
@@ -1519,7 +1533,10 @@ def _write_governed_live(
         "observed_at": "2026-09-25T00:00:00+00:00",
         "target": target,
         "authority": {"id": "release-operator", "version": "1", "receipt": "approval:123"},
-        "independence": {"canary_domain": "loaded-runtime", "review_domain": "reviewer-domain"},
+        # #845 對抗審查第九輪 BLOCKER GREEN：canary_domain 不再自報，改由
+        # `derive_canary_domain` 依 kind／evidence 導出（見 `_governed_case`
+        # 用真正的 production 導出函式）；receipt 只留 review_domain。
+        "independence": {"review_domain": "reviewer-domain"},
         "kind": kind,
         "evidence": evidence,
     }
@@ -1568,16 +1585,22 @@ def _governed_case(
     validator = live_receipt_validators.make_governed_live_receipt_validator(
         source_root=tmp_path, evidence_root=tmp_path
     )
-    context = _context(tmp_path, live_validator=validator)
+    # #845 對抗審查第九輪 BLOCKER：這裡改用真正的 production 導出函式，證明
+    # `inspect_delivery` 真的走 kind-aware 導出，不是只信 receipt 自報字串。
+    context = _context(tmp_path, live_validator=validator, domain_deriver=live_receipt_validators.derive_canary_domain)
     return manifest, snapshot, context
 
 
-def _canary_target(target: dict, *, evidence_directory: str = "canary-evidence") -> dict:
+def _canary_target(target: dict, *, evidence_directory: str | None = None) -> dict:
     return {
         "repository": target["repo"],
         "work_id": "canary-dispatch-1",
         "issue": 845,
-        "evidence_directory": evidence_directory,
+        # #845 對抗審查第九輪 MAJOR：預設值改為這五個 target 欄位的規範
+        # digest（見 `deployment_canary_evidence_scope`），不再是 receipt 自由
+        # 選擇的字串；呼叫端仍可傳 `evidence_directory` 覆寫以測試路徑安全性
+        # 之類的負例。
+        "evidence_directory": evidence_directory if evidence_directory is not None else live_receipt_validators.deployment_canary_evidence_scope(target),
     }
 
 
@@ -1589,7 +1612,7 @@ def test_a04_delivery_governed_qualification_live_receipt_reaches_ready(tmp_path
         tmp_path,
         kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
         evidence_factory=lambda target: _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256=target["artifact_sha256"],
             repository=target["repo"],
@@ -1601,6 +1624,104 @@ def test_a04_delivery_governed_qualification_live_receipt_reaches_ready(tmp_path
     assert report["mappings"][0]["evidence"]["live"]["status"] == "verified"
 
 
+# --- #845 對抗審查第九輪：canary_domain 自報與 target 欄位部分綁定 ----------------
+
+
+def test_a05_delivery_live_canary_self_reported_domain_must_match_derived_evidence_identity(tmp_path: Path) -> None:
+    """#845 對抗審查第九輪 BLOCKER RED→GREEN：修法前 `independence.canary_domain`
+    完全是 receipt 自報字串，只要跟 reviewer domain 不同就能通過 independence
+    檢查——同一個 reviewer 就能自己捏造一個「看起來獨立」的字串放行。修法後
+    canary_domain 改由 `derive_canary_domain` 依 evidence 的 `image.digest`
+    導出；receipt 自報一個任意但確實不同於 reviewer domain 的字串（不等於導出
+    值）仍必須被拒絕。"""
+    manifest, snapshot, context = _governed_case(
+        tmp_path,
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence_factory=lambda target: _full_canary_qualification(
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
+            candidate_sha=target["candidate_sha"],
+            wheel_sha256=target["artifact_sha256"],
+            repository=target["repo"],
+        ),
+        canary_target_factory=_canary_target,
+    )
+    locator = snapshot["mappings"][0]["live_receipt"]["locator"]
+    live_path = tmp_path / locator
+    doc = json.loads(live_path.read_text(encoding="utf-8"))
+    assert doc["independence"].get("canary_domain") is None
+    # 攻擊者自報一個「看起來合法」、與 reviewer domain 不同的 canary_domain，
+    # 但它跟證據實際內容（qualification evidence 的 image.digest）無關。
+    doc["independence"]["canary_domain"] = "attacker-chosen-domain"
+    live_path.write_text(json.dumps(doc, sort_keys=True), encoding="utf-8")
+    snapshot["mappings"][0]["live_receipt"]["sha256"] = hashlib.sha256(live_path.read_bytes()).hexdigest()
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    assert report["closure_readiness"] != "ready"
+    live = report["mappings"][0]["evidence"]["live"]
+    assert live["status"] == "failed"
+    assert live["reason"] == "live-canary-independence-mismatch"
+
+
+def test_a04_delivery_deployment_canary_evidence_cannot_be_replayed_across_target_scope(tmp_path: Path) -> None:
+    """#845 對抗審查第九輪 MAJOR RED→GREEN：修法前 validator 只把
+    candidate_sha／artifact_sha256 綁到 target；qualification evidence 完全
+    沒有欄位能證明 source_revision／service／instance／profile_key／
+    config_revision，因此同一份真正、完整通過的 canary evidence（針對
+    instance="default" 產生）只要改外層 target.instance 就能核銷不同
+    instance 的需求。修法後 evidence 目錄必須精確等於這五個欄位的規範
+    digest；換了 instance 後，同一份實體 evidence 不再位於新 target 唯一
+    合法的路徑下，必須 fail closed。"""
+    specs = [("R01", "r1")]
+    manifest = _manifest(tmp_path, specs)
+    snapshot = _snapshot(tmp_path, manifest, specs, with_live=False)
+    row = snapshot["mappings"][0]
+    original_target = row["target"]
+    replayed_target = {**original_target, "instance": "other"}
+    row["target"] = replayed_target
+    row["installed_runtime"] = {**row["installed_runtime"], "target": replayed_target}
+
+    # 真正的 evidence 只針對 original_target（instance="default"）產生，物理
+    # 落在它的規範 digest 目錄之下。
+    original_scope = live_receipt_validators.deployment_canary_evidence_scope(original_target)
+    evidence = _full_canary_qualification(
+        tmp_path / original_scope,
+        candidate_sha=original_target["candidate_sha"],
+        wheel_sha256=original_target["artifact_sha256"],
+        repository=original_target["repo"],
+    )
+    # receipt 對外聲稱的 target 已經是被替換過的 replayed_target（跟 row 一致，
+    # 通過 `_verify_live` 最外層的 exact-target 相等檢查），但
+    # `canary_target.evidence_directory` 仍指向原本那份 evidence 的實體目錄。
+    canary_target = {
+        "repository": replayed_target["repo"],
+        "work_id": "canary-dispatch-1",
+        "issue": 845,
+        "evidence_directory": original_scope,
+    }
+    live_ref = _write_governed_live(
+        tmp_path,
+        requirement_id="R01",
+        revision="r1",
+        criterion_id="R01-AC1",
+        kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
+        evidence=evidence,
+        target=replayed_target,
+        canary_target=canary_target,
+    )
+    row["live_receipt"] = live_ref
+    _copy_qualification_module(tmp_path)
+    validator = live_receipt_validators.make_governed_live_receipt_validator(
+        source_root=tmp_path, evidence_root=tmp_path
+    )
+    context = _context(tmp_path, live_validator=validator, domain_deriver=live_receipt_validators.derive_canary_domain)
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    assert report["closure_readiness"] != "ready"
+    assert report["mappings"][0]["evidence"]["live"]["status"] == "failed"
+
+
 def test_a03_delivery_deployment_canary_without_canary_target_is_rejected(tmp_path: Path) -> None:
     """#845 對抗審查 BLOCKER：即使 evidence 目錄真實存在且完整通過，receipt 缺
     外部 canary 身分（`canary_target`）仍必須拒絕——不得只憑 evidence 自己聲稱
@@ -1609,7 +1730,7 @@ def test_a03_delivery_deployment_canary_without_canary_target_is_rejected(tmp_pa
         tmp_path,
         kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
         evidence_factory=lambda target: _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256=target["artifact_sha256"],
             repository=target["repo"],
@@ -1626,12 +1747,12 @@ def test_a03_delivery_deployment_canary_missing_evidence_file_is_rejected(tmp_pa
 
     def evidence_factory(target: dict) -> dict:
         payload = _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256=target["artifact_sha256"],
             repository=target["repo"],
         )
-        (tmp_path / "canary-evidence" / "evidence" / "manager-github-auth.json").unlink()
+        (tmp_path / _CANARY_EVIDENCE_SCOPE / "evidence" / "manager-github-auth.json").unlink()
         return payload
 
     manifest, snapshot, context = _governed_case(
@@ -1652,12 +1773,12 @@ def test_a03_delivery_deployment_canary_unlisted_evidence_file_is_rejected(tmp_p
 
     def evidence_factory(target: dict) -> dict:
         payload = _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256=target["artifact_sha256"],
             repository=target["repo"],
         )
-        stray = tmp_path / "canary-evidence" / "evidence" / "stray.json"
+        stray = tmp_path / _CANARY_EVIDENCE_SCOPE / "evidence" / "stray.json"
         stray.write_text("{}", encoding="utf-8")
         return payload
 
@@ -1679,12 +1800,12 @@ def test_a03_delivery_deployment_canary_evidence_digest_mismatch_is_rejected(tmp
 
     def evidence_factory(target: dict) -> dict:
         payload = _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256=target["artifact_sha256"],
             repository=target["repo"],
         )
-        tampered = tmp_path / "canary-evidence" / "evidence" / "install-verification.json"
+        tampered = tmp_path / _CANARY_EVIDENCE_SCOPE / "evidence" / "install-verification.json"
         tampered.write_text(tampered.read_text(encoding="utf-8") + " ", encoding="utf-8")
         return payload
 
@@ -1707,7 +1828,7 @@ def test_a03_delivery_deployment_canary_dispatch_repository_mismatch_is_rejected
 
     def evidence_factory(target: dict) -> dict:
         return _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256=target["artifact_sha256"],
             repository=target["repo"],
@@ -1731,7 +1852,7 @@ def test_a03_delivery_deployment_canary_evidence_directory_traversal_is_rejected
 
     def evidence_factory(target: dict) -> dict:
         return _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256=target["artifact_sha256"],
             repository=target["repo"],
@@ -1756,7 +1877,7 @@ def test_a03_delivery_deployment_canary_validator_missing_source_root_module_is_
         tmp_path,
         kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
         evidence_factory=lambda target: _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256=target["artifact_sha256"],
             repository=target["repo"],
@@ -1792,7 +1913,11 @@ def test_a03_delivery_unknown_live_receipt_kind_is_rejected_fail_closed(tmp_path
     assert report["closure_readiness"] != "ready"
     live = report["mappings"][0]["evidence"]["live"]
     assert live["status"] == "failed"
-    assert live["reason"] == "governed-live-receipt-validator-rejected"
+    # #845 對抗審查第九輪 BLOCKER：kind 未登記時，`derive_canary_domain` 就
+    # 已經無法導出 canary_domain，因此在到達封閉登記表 validator 之前就已在
+    # independence 檢查 fail closed；不再是先前的
+    # `governed-live-receipt-validator-rejected`。
+    assert live["reason"] == "live-canary-independence-mismatch"
 
 
 def test_a03_delivery_qualification_wheel_digest_not_bound_to_target_is_rejected(tmp_path: Path) -> None:
@@ -1802,7 +1927,7 @@ def test_a03_delivery_qualification_wheel_digest_not_bound_to_target_is_rejected
         tmp_path,
         kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
         evidence_factory=lambda target: _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256="f" * 64,
             repository=target["repo"],
@@ -1821,7 +1946,7 @@ def test_a03_delivery_qualification_not_passed_is_rejected(tmp_path: Path) -> No
         tmp_path,
         kind=live_receipt_validators.KIND_DEPLOYMENT_CANARY_QUALIFICATION,
         evidence_factory=lambda target: _full_canary_qualification(
-            tmp_path / "canary-evidence",
+            tmp_path / _CANARY_EVIDENCE_SCOPE,
             candidate_sha=target["candidate_sha"],
             wheel_sha256=target["artifact_sha256"],
             repository=target["repo"],

@@ -170,6 +170,10 @@ def main(argv: Sequence[str]) -> int:
             "live_receipt_validator": live_receipt_validators.make_governed_live_receipt_validator(
                 source_root=source_root, evidence_root=coordinator_root
             ),
+            # #845 對抗審查第九輪 BLOCKER：canary_domain 不得只信 receipt 自報
+            # 字串，改由這個 production 導出函式依 receipt kind 與已驗證的
+            # evidence 取得。
+            "live_receipt_domain_deriver": live_receipt_validators.derive_canary_domain,
         }
         if args.command == "gaps":
             _emit(requirement_delivery.inspect_delivery(manifest, snapshot, **common))
