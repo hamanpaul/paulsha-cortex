@@ -1,0 +1,2 @@
+- 發布 v0.1.11：refine 完整交付（#716、#835–#845、#857，含 execution profile、多額度池觀測與 collector、跨 instance reservation、額度感知准入與 status 決策投影、loaded runtime attestation、qualification 生命週期、recovery 契約、stage evidence 重用、需求交付證據索引、task memory hippo provider），以及 live 驗收修正（systemctl show 區塊解析、manager invocation 比對、EnvironmentFile 巢狀引號、quota 共用設定、attempt 判定改以 job 事實、harvest 對未進版控 planning 的合法缺席、builder 准入沿用 claim-era 規則）與 work-items 衝突解除。
+- `trust-root-transactional-install.md` 的 release ingress 路徑與資產名改為 0.1.11。
