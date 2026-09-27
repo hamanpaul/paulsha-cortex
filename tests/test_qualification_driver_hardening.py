@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -1133,7 +1134,11 @@ def _dispatch_fixture(tmp_path: Path, driver):
                     "schema_version": 1,
                     "kind": "workflow-gate-ledger",
                     "slice_id": job_id,
-                    "gates": [],
+                    # #1096：closeout 現在逐項驗證部署層宣告的 gate（pytest）存在且
+                    # 為 terminal passed，正向 fixture 因此不能再用空 `gates: []`。
+                    "gates": [
+                        {"name": "pytest", "status": "passed", "exit_code": 0}
+                    ],
                 },
             )
             artifacts.append(ledger)
@@ -1280,6 +1285,38 @@ def _dispatch_fixture(tmp_path: Path, driver):
         "artifacts": artifacts,
         "codex_home": probe_codex_home,
     }
+
+
+def _dispatch_fixture_fake_run(driver, fixture):
+    """#1096：多個 closeout 綁定測試共用同一套 `_run` 假身分，只認得
+    `_dispatch_fixture` 會真的呼叫到的四種 git 子命令。"""
+
+    def fake_run(argv, **_kwargs):
+        if "cat-file" in argv or ("bundle" in argv and "verify" in argv):
+            return _result(driver, argv)
+        if "worktree" in argv:
+            return _result(driver, argv, stdout=f"worktree {fixture['repo']}\n")
+        if "bundle" in argv and "list-heads" in argv:
+            return _result(
+                driver, argv, stdout=f"{fixture['probe_candidate']} refs/heads/work\n"
+            )
+        raise AssertionError(argv)
+
+    return fake_run
+
+
+def _validate_fixture_closeout(driver, fixture):
+    return driver._validate_dispatch_closeout(
+        repository=fixture["repository"],
+        work_id=fixture["work_id"],
+        issue=fixture["issue"],
+        terminal={
+            "status": "done",
+            "run_id": fixture["run_id"],
+            "work_id": fixture["work_id"],
+        },
+        coordinator_root=fixture["coordinator"],
+    )
 
 
 def test_dispatch_closeout_rejects_forged_marker_text(
@@ -2023,6 +2060,173 @@ def test_dispatch_closeout_resolves_every_delivery_gate_ref(
             },
             coordinator_root=fixture["coordinator"],
         )
+
+
+# ---------------------------------------------------------------------------
+# #1096：canary closeout 綁定 gate ledger 與 delivery gate 到本次派工
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_closeout_rejects_a_missing_expected_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """部署層宣告的 gate（pytest）完全沒出現在 ledger 時必須擋下——過去只驗
+    ledger 外層形狀，連空的 `gates: []` 都會被放行，讓「gate 被跳過」的回歸
+    通過 canary。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    ledger_path = fixture["coordinator"] / "control" / "build-job.gates.json"
+    ledger = json.loads(ledger_path.read_text())
+    ledger["gates"] = []
+    _write_json(ledger_path, ledger)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    with pytest.raises(
+        driver.QualificationFailure, match="missing an expected passed gate"
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+def test_dispatch_closeout_rejects_a_non_passed_expected_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """部署層宣告的 gate 若存在但沒有 passed（例如 pytest 真的跑了但 failed），
+    closeout 必須擋下，不能只因為 ledger 外層形狀合法就放行。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    ledger_path = fixture["coordinator"] / "control" / "verify-job.gates.json"
+    ledger = json.loads(ledger_path.read_text())
+    ledger["gates"] = [{"name": "pytest", "status": "failed", "exit_code": 1}]
+    _write_json(ledger_path, ledger)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    with pytest.raises(
+        driver.QualificationFailure, match="missing an expected passed gate"
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+def test_dispatch_closeout_rejects_a_malformed_gate_ledger_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ledger 的 `gates` 項目必須是帶 `name`／`status` 的物件；過去任何列表內容都
+    會通過形狀檢查，缺 `status` 的殘缺列不該被靜默接受成「沒有這個 gate」。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    ledger_path = fixture["coordinator"] / "control" / "plan-job.gates.json"
+    ledger = json.loads(ledger_path.read_text())
+    ledger["gates"] = [{"name": "pytest"}]
+    _write_json(ledger_path, ledger)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    with pytest.raises(
+        driver.QualificationFailure, match="gate ledger entry is malformed"
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+def test_dispatch_closeout_rejects_a_gate_ledger_slice_id_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ledger 的 `slice_id` 過去只驗型別是字串，換成別的 job 的 slice_id 也會通過；
+    這裡要求逐字等於它自己 job 的 `job_id`，把 ledger 綁回本次派工的那一個 job。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    ledger_path = fixture["coordinator"] / "control" / "verify-job.gates.json"
+    ledger = json.loads(ledger_path.read_text())
+    ledger["slice_id"] = "build-job"
+    _write_json(ledger_path, ledger)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    with pytest.raises(
+        driver.QualificationFailure, match="gate ledger schema is invalid"
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("run_id", "another-run"),
+        ("work_id", "another-work"),
+        ("candidate", "c" * 40),
+    ],
+)
+def test_dispatch_closeout_rejects_delivery_gate_evidence_from_another_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: str
+) -> None:
+    """copilot delivery gate evidence 若自報的 run_id／work_id／candidate 與本次
+    派工不符，closeout 必須拒絕——過去只以 kind／path／hash 採信，他 run 或舊
+    candidate 遺留、hash 對得上的合法檔案一樣能滿足 closeout。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    payload = json.loads(fixture["registry"].read_text())
+    refs = payload["workflows"][0]["gate_refs"]
+    copilot_ref = next(row for row in refs if row["kind"] == "copilot")
+    tampered = json.loads(Path(copilot_ref["ref"]).read_text())
+    tampered[field] = value
+    copilot_ref["sha256"] = _write_json(Path(copilot_ref["ref"]), tampered)
+    _write_json(fixture["registry"], payload)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    with pytest.raises(
+        driver.QualificationFailure, match="not bound to this dispatch"
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+def test_dispatch_closeout_rejects_a_foreign_review_evidence_substitute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`foreign-review` gate_ref 必須逐字指向本 run 已獨立驗過（run_id／repo／
+    candidate／reviewer_job_id 皆核對過）的 review job workflow evidence。把它
+    換成另一份形狀合法、hash 也對得上自己內容的檔案——模擬他 run／舊 candidate
+    遺留的 foreign-review 證據——必須被拒，不能只因為湊得出合法的 path＋hash
+    就滿足 closeout。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    payload = json.loads(fixture["registry"].read_text())
+    refs = payload["workflows"][0]["gate_refs"]
+    foreign_ref = next(row for row in refs if row["kind"] == "foreign-review")
+    original = json.loads(Path(foreign_ref["ref"]).read_text())
+    substitute = copy.deepcopy(original)
+    substitute["job"]["run_id"] = "another-run"
+    substitute_path = (
+        fixture["coordinator"] / "evidence" / "workflow" / "foreign-substitute.json"
+    )
+    substitute_hash = _write_json(substitute_path, substitute)
+    foreign_ref["ref"] = str(substitute_path)
+    foreign_ref["sha256"] = substitute_hash
+    _write_json(fixture["registry"], payload)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    with pytest.raises(
+        driver.QualificationFailure, match="foreign-review evidence is not bound"
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+def test_dispatch_closeout_accepts_the_positive_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1096 的所有新綁定檢查疊加後，既有正向 canary fixture（未經任何 mutation）
+    仍必須通過——新檢查不得讓合法的 closeout 誤判為失敗。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    markers, artifact_rows, workflow, agent_loop_probe = _validate_fixture_closeout(
+        driver, fixture
+    )
+    assert workflow["run_id"] == fixture["run_id"]
+    assert artifact_rows
 
 
 # ---------------------------------------------------------------------------

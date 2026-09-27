@@ -692,6 +692,16 @@
 
 ### Fixed
 
+- **#1096 deployment canary closeout 綁定 gate ledger 與 delivery gate 到本次派工**：
+  `qualification/driver.py::_validate_dispatch_closeout` 的 gate ledger 驗證過去只驗外層
+  形狀，`gates` 列表內容從未被看，回歸把宣告的 gate（`pytest`）跳過也會被放行；現在逐項驗證
+  每個 gate 條目形狀合法、部署層宣告的每個 gate 名稱皆存在且為 terminal `passed`，並把
+  `slice_id` 從「型別是字串」升級為「逐字等於它自己 job 的 `job_id`」。delivery gate（`gate_refs`）
+  過去只以 kind／path／hash 採信 evidence，內容從未被讀，他 run 或舊 candidate 遺留的合法檔案
+  一樣能滿足 closeout；現在把內容當 JSON 讀出來比對自報的 `run_id`／`work_id`／`candidate`，
+  且 `foreign-review` 這個必要 kind 強制要求逐字等於本 run 已獨立驗過的 review job workflow
+  evidence。新增 8 個回歸測試，既有正向 fixture 與 #845 消費的 receipt 契約皆維持通過。細節見
+  `changelog.d/1096-canary-closeout-binding.md`。
 - **#617 slice-review category 語意**：prompt 明列阻擋交付與可交付 follow-up 的 category，要求 review 結論與 blocking findings 一致，並說明 severity 只表示影響程度。
 - **#1006 post-archive Builder 綁定 exact Candidate**：resume 與 dispatch 僅重用以目前 Candidate 派出的 build job；新 job 的 `dispatch_head` 記錄實際採用的 clone base，並同步 lifecycle 文件。
 - **#489 slice write_paths 範圍驗證**：verification contract 可固定有限的 repo 相對檔案清單；候選變更須同時符合 builder persona 與 slice 限制，未宣告 slice 路徑的舊 contract 則明示為 `persona-only`。
