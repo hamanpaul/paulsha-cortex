@@ -844,6 +844,10 @@ def _round_trip_worker(store_path: str, worker_id: int, rounds: int, barriers, r
             lease_ms=60_000, now_ms=NOW,
         )
         outcomes.append(result.status)
+        # 所有 worker 都完成本輪 reserve 之後才釋放；否則快的 worker 先釋放，
+        # 慢的 worker 在同一輪稍後 reserve 就會拿到第三張（容量從未同時超額，
+        # 但「每輪恰好 2 張」的計數會被打亂）。
+        barriers[round_index + rounds].wait(timeout=20)
         if result.status == "granted":
             authority.release(
                 reservation_id=result.reservation_id, owner_token=result.owner_token,
@@ -859,7 +863,8 @@ def test_ac6_fixed_rounds_release_and_reacquire_stays_consistent_across_workers(
     worker_count = 4
     rounds = 3
     context = multiprocessing.get_context("spawn")
-    barriers = [context.Barrier(worker_count) for _ in range(rounds)]
+    # 前 rounds 道 barrier 同步每輪開始，後 rounds 道同步「本輪 reserve 皆完成」。
+    barriers = [context.Barrier(worker_count) for _ in range(rounds * 2)]
     result_queue = context.Queue()
     processes = [
         context.Process(target=_round_trip_worker, args=(store_path, i, rounds, barriers, result_queue))
