@@ -1381,47 +1381,54 @@ def test_retire_delivered_uses_registry_run_when_work_authority_is_missing(
     assert len(outcomes[0].read_text(encoding="utf-8").splitlines()) == 1
 
 
+_PRE_1093_BASE_REF = "d99df4d9574f8333e43d6e1799470ea5340abadd"
+
+
 def test_retire_delivered_v2_evidence_fails_closed_under_pre_1093_reader(
     tmp_path: Path,
 ) -> None:
     """#1093 對抗審查 MAJOR2 相容性驗證。
 
     authority 缺席（registry-only）路徑改寫 ``cortex-work-retire-delivered
-    /v2`` evidence；若這個修復日後被回退到 ``origin/main``（本票之前），舊
+    /v2`` evidence；若這個修復日後被回退到 #1093 之前的版本，舊
     版 ``_superseded_retire_delivered_body`` 只認得 v1 schema——必須證明它
     遇到 v2 evidence 時是「安全 fail-closed」（乾淨的
     ``WorkflowRun was superseded by different authority`` RuntimeError，不
     是未攔截例外或資料損毀），而且本 PR 未改動的 v1 evidence（authority 存
     在路徑）仍能被舊 reader 正常讀回——兩面都要驗證才算完整的回退相容性。
 
-    做法：把 ``origin/main`` 版本的 ``work_actions.py`` 原始碼載入成獨立
+    做法：把 ``_PRE_1093_BASE_REF`` 版本的 ``work_actions.py`` 原始碼載入成獨立
     module，直接呼叫它的 ``_superseded_retire_delivered_body``，不猜測、不
     重寫舊邏輯。
     """
 
+    # 舊版基準固定為 #1093 合入前、目前部署的 runtime pin（wave-1 合入 main 的
+    # merge commit）。不可用 origin/main：#1093 合入後 origin/main 已含本修正，
+    # 舊 reader 會變成新 reader、測試失去意義（CI 的 tests job 以 fetch-depth: 0
+    # checkout，完整 SHA 必定可解析）。
     repo_root = Path(__file__).resolve().parent.parent
     try:
         old_source = subprocess.run(
-            ["git", "show", "origin/main:paulsha_cortex/coordinator/work_actions.py"],
+            ["git", "show", f"{_PRE_1093_BASE_REF}:paulsha_cortex/coordinator/work_actions.py"],
             cwd=repo_root,
             check=True,
             capture_output=True,
             text=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError) as error:
-        pytest.skip(f"origin/main 不可讀，略過舊 reader 回退相容性驗證：{error}")
+        pytest.skip(f"{_PRE_1093_BASE_REF} 不可讀，略過舊 reader 回退相容性驗證：{error}")
 
     module_name = "paulsha_cortex.coordinator._pre_1093_work_actions_compat_shim"
     old_module = types.ModuleType(module_name)
     old_module.__package__ = "paulsha_cortex.coordinator"
-    old_module.__file__ = "origin/main:paulsha_cortex/coordinator/work_actions.py"
+    old_module.__file__ = f"{_PRE_1093_BASE_REF}:paulsha_cortex/coordinator/work_actions.py"
     sys.modules[module_name] = old_module
     try:
         exec(compile(old_source, old_module.__file__, "exec"), old_module.__dict__)
     finally:
         sys.modules.pop(module_name, None)
     assert hasattr(old_module, "_superseded_retire_delivered_body"), (
-        "origin/main 的 work_actions.py 應仍有 _superseded_retire_delivered_body；"
+        "#1093 之前的 work_actions.py 應仍有 _superseded_retire_delivered_body；"
         "若函式已改名/搬移，這份相容性測試需要跟著更新，不能靜默略過"
     )
 
