@@ -1,0 +1,1 @@
+Builder todo 准入（`manager._builder_todo_admission_stop()`）改用既有 `claim.authority_matches_claim_era()`（#847）判定 self-only planning drift：run 自產、內容 sha256 與 baseline 相符的 planning 產物（plan／spec／design）被 Monitor 掃成新 source 時放行派工；其他任何 authority 差異仍維持 `builder-todo-authority-changed` gate。

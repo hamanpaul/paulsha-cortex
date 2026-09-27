@@ -280,6 +280,9 @@ def _builder_todo_admission_for_run(run) -> manager.BuilderTodoAdmission | None:
         return manager.BuilderTodoAdmission(
             authority_revision=work_authority_digest(authority),
             mapped_todo_paths=authority.mapped_todo_paths,
+            # #847：把完整 WorkAuthority 一併帶給 `_builder_todo_admission_stop`，
+            # 讓它能在裸 digest 不符時另核對 self-only planning drift。
+            authority=authority,
         )
     except (OSError, ValueError):
         return manager.BuilderTodoAdmission(error="current-work-authority-unavailable")
