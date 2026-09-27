@@ -604,6 +604,26 @@ def test_ac4_tampered_reserve_row_values_fail_closed(tmp_path: Path) -> None:
             QuotaReservationAuthority(path).committed(now_ms=NOW + 1)
 
 
+def test_existing_store_still_fsyncs_directories_before_granting(tmp_path: Path, monkeypatch) -> None:
+    """前一個建立者可能在 O_CREAT 後、目錄 fsync 前崩潰；後續 reserve 看到檔案
+    已存在時仍必須 fsync 目錄，不得依 exists() 跳過。"""
+    import paulsha_cortex.coordinator.quota_reservation as module
+
+    path = tmp_path / "quota-reservations" / "reservations.jsonl"
+    path.parent.mkdir(mode=0o700)
+    path.touch(mode=0o600)
+    synced: list[str] = []
+    real = module._fsync_directory
+    monkeypatch.setattr(module, "_fsync_directory", lambda p: (synced.append(str(p)), real(p)))
+    granted = QuotaReservationAuthority(path).reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-existing", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert granted.status == "granted"
+    assert str(path.parent) in synced
+
+
 def test_ac4_negative_or_non_finite_amount_rejected() -> None:
     for bad in ("-1", "nan", "inf", "-inf", "abc", ""):
         with pytest.raises(ValueError):

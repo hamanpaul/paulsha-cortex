@@ -687,24 +687,23 @@ class QuotaReservationAuthority:
         父目錄，確保主機崩潰後第一筆 grant 的 dirent 仍在，重啟不會看到空
         ledger 而把同一容量再 grant 一次。"""
         parent = self.path.parent
-        parent_existed = parent.exists()
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if not parent_existed:
-            _fsync_directory(parent.parent)
         self._check_parent()
-        file_existed = self.path.exists()
         flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
             fd = os.open(self.path, flags, 0o600)
         except OSError as exc:
             raise ReservationCorrupt("reservation-store-open-failed") from exc
-        if not file_existed:
-            try:
-                _fsync_directory(parent)
-            except BaseException:
-                os.close(fd)
-                raise
+        # 不以 exists() 判斷「是不是我建立的」：前一個建立者可能在 O_CREAT 後、
+        # 目錄 fsync 前崩潰，後續呼叫者看到檔案已存在就不會補 fsync。每次寫入前
+        # 都 fsync 父目錄與其上層，確保 dirent 耐久後才可能回 granted。
+        try:
+            _fsync_directory(parent.parent)
+            _fsync_directory(parent)
+        except BaseException:
+            os.close(fd)
+            raise
         return fd
 
     # -- 內部：檔案安全（比照 #836 quota_ledger 的硬化模式） ------------------
