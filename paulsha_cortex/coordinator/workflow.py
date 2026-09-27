@@ -137,7 +137,7 @@ def _validate_execution_profile_bindings(
             )
 
 
-_STAGE_REUSE_DECISIONS = frozenset({"reused", "fresh"})
+_STAGE_REUSE_DECISIONS = frozenset({"reused", "fresh", "ineligible"})
 
 
 def _is_stage_execution_key(value: object) -> bool:
@@ -153,6 +153,14 @@ def _validate_stage_reuse_receipts(
 ) -> None:
     """#844：`stage_reuse_receipts` 只是 provenance 快照，不做 admission 判定；
     這裡只驗形狀，不重新裁決是否真的可以 reuse——那是 manager 層的責任。
+
+    對抗審查 MAJOR-1 修法新增 ``"ineligible"``：既有 job 帶 key 但
+    manager 探測階段無法判定相容性（launcher／execution-profile 綁不
+    出、沒有 eligible candidate）時的過渡標記——此時還沒有派出新 job，
+    也就沒有新 `stage_execution_key` 可記，因此 ``"ineligible"`` 不要求
+    `stage_execution_key`（那是 `"reused"`／`"fresh"` 才有的欄位），改要
+    求非空 `reason`；`superseded_key` 若出現仍須是合法 key 格式（引用被
+    判定 ineligible 的那顆舊 job key）。
     """
 
     if value is None:
@@ -165,15 +173,28 @@ def _validate_stage_reuse_receipts(
             raise ValueError(f"workflow run stage_reuse_receipts card 非法: {card!r}")
         if not isinstance(receipt, dict):
             raise ValueError(f"workflow run stage_reuse_receipts[{card!r}] 必須為dict")
-        if receipt.get("decision") not in _STAGE_REUSE_DECISIONS:
+        decision = receipt.get("decision")
+        if decision not in _STAGE_REUSE_DECISIONS:
             raise ValueError(
                 f"workflow run stage_reuse_receipts[{card!r}].decision 非法"
             )
-        key = receipt.get("stage_execution_key")
-        if not _is_stage_execution_key(key):
-            raise ValueError(
-                f"workflow run stage_reuse_receipts[{card!r}].stage_execution_key 格式錯誤"
-            )
+        if decision == "ineligible":
+            reason = receipt.get("reason")
+            if not isinstance(reason, str) or not reason:
+                raise ValueError(
+                    f"workflow run stage_reuse_receipts[{card!r}].reason 必須為非空字串"
+                )
+            superseded_key = receipt.get("superseded_key")
+            if superseded_key is not None and not _is_stage_execution_key(superseded_key):
+                raise ValueError(
+                    f"workflow run stage_reuse_receipts[{card!r}].superseded_key 格式錯誤"
+                )
+        else:
+            key = receipt.get("stage_execution_key")
+            if not _is_stage_execution_key(key):
+                raise ValueError(
+                    f"workflow run stage_reuse_receipts[{card!r}].stage_execution_key 格式錯誤"
+                )
         mismatched = receipt.get("mismatched_fields")
         if mismatched is not None and (
             not isinstance(mismatched, list)

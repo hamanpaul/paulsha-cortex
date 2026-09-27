@@ -20,6 +20,8 @@
 
 ### Fixed
 
+- **#844 對抗審查 MAJOR-1／MAJOR-2 修法**：`_workflow_stage_reuse_probe()` 先前只要因 launcher／execution-profile 解析失敗，或沒有 eligible candidate 而算不出可比對的新 context，就一律回 `"legacy"`，被呼叫端誤判為可以沿用既有 `jobs[-1]`——等於在 reviewer model／execution profile 已經改變、但當下綁不出新 launcher 的瞬間，錯誤放行了過期的 verify／review evidence。現在對帶有 `workflow_stage_execution_key` 的 job，這類無法判定相容性的分支改回新的 `"ineligible"` 分類，`resume_workflow_run()` 對 `"ineligible"` 與 `"stale"` 一視同仁：一律強制新 attempt，派工本身若也綁不出 launcher 則沿用既有 fail-closed；只有真正沒有 key 的 legacy job 才維持原行為。另修正 `dispatch_workflow_card(force_new_card=True)`（retry-build／retry-card／retry-verify／retry-review 的新 attempt 共用路徑）先前不會覆寫 `WorkflowRun.stage_reuse_receipts`，導致 status 可能停留在前一輪的 `"reused"` 或缺少 `"fresh"` 標記；`_dispatch_workflow_card()` 現在只要為 verify／review 卡真正建立新 job 就無條件覆寫成 `"fresh"`。細節與測試涵蓋見 `changelog.d/refine-844.md`。
+
 - **#842 execution qualification operator/Manager 帳號分離**：operator CLI 核發 approve／revoke receipt 不再嘗試寫入 Manager-only 的 `operator-receipt-index.json`（發布的 Trust Root ACL 下 writers/readers 都只有 Manager，operator 帳號寫不進、讀不到），改成只寫 operator 自己有權限的 immutable receipt 檔；讀取端據以改為「讀得到、對上了就多一層佐證，讀不到／查無此筆就退回單靠 receipt 檔本身 content-addressed 自證」，operator 帳號與 Manager 帳號分離時 approve／revoke 仍能完整核發、Manager 端查詢與 roster 依然正確採信。
 
 - **#842 execution qualification 撤銷後重播防護**：operator receipt 現在綁定核發當下的 lifecycle binding generation；approve／revoke 皆會推進 generation，重跑完全相同參數的 `qualification approve` 不再拿回撤銷前的舊人類 receipt，重播任何綁在舊世代的 receipt（含撤銷前的核可 receipt）也無法把已撤銷／到期的資格翻回 approved。`review_candidate`／`revoke_qualification` 改在取得 lifecycle lock 後、寫入前重新量測時間，避免他 process 持鎖到 receipt 過期後才放行卻仍以取鎖前的舊時間戳通過。

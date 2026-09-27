@@ -13061,20 +13061,38 @@ def _workflow_stage_reuse_probe(
     """#844 S04／S07：既有 terminal job 的相容性複核。
 
     只在 verify／review 且該 job 帶有 producer 產生的
-    `workflow_stage_execution_key` 時才啟動；任何解析失敗、缺前置條件都回
-    ``("legacy", None)``，讓呼叫端維持 #844 之前的行為（S10：舊資料不補值、
-    不新增拒絕面；probe 本身失敗不得變成新的失敗模式）。
+    `workflow_stage_execution_key` 時才啟動；job 本身沒有 key（真正的
+    #844 之前的 legacy job，或不在安全 cohort）一律回 ``("legacy", None)``，
+    讓呼叫端維持 #844 之前的行為（S10：舊資料不補值、不新增拒絕面）。
+
+    **對抗審查 MAJOR-1 修法**：一旦確認 job 帶 producer 產生的 key，
+    「probe 無法判定相容性」就不再等同「維持既有行為」——launcher／
+    execution-profile 解析失敗、或沒有 eligible candidate，代表現在根本
+    綁不出可比對的新 context，不能因此把舊 evidence 當「反正沒變」直接
+    放行（舊版在這裡回 "legacy"，被呼叫端的 `jobs[-1]` 短路誤判為可以沿
+    用，等同放行過期 verify／review evidence）。這種情況改回
+    ``("ineligible", context)``：`context["reason"]` 帶不可判定的具體原
+    因，`context["superseded_key"]` 帶舊 key 供診斷；呼叫端必須視為不可
+    重用、走新 attempt 的正式派工路徑——若派工本身也綁不出 launcher，
+    自然落入既有 fail-closed（needs_human／明確原因），不是本 probe 該
+    吞掉的錯誤。
 
     回傳 ``(kind, context)``：
 
-    - ``("legacy", None)``：不在安全 cohort，或無法完成複核；呼叫端沿用既
-      有 `jobs[-1]` 短路（S10）。
+    - ``("legacy", None)``：job 沒有 `workflow_stage_execution_key`
+      （#844 之前建立），或不在安全 cohort；呼叫端沿用既有 `jobs[-1]`
+      短路（S10）。
     - ``("reused", context)``：現在會派出的 executor/model/native
       effort/adapter/tool 版本與既有 job 完全相容，`jobs[-1]` 可安全沿用，
       不需要新的 model invocation（S01）。
     - ``("stale", context)``：偵測到不相容變動（S04），`context` 帶
       `mismatched_fields` 逐欄診斷；呼叫端必須以 `force_new_card=True`
       派出新 attempt，不得沿用舊 evidence。
+    - ``("ineligible", context)``：job 帶 key，但當下無法判定相容性
+      （`context["reason"]` ∈ ``no-eligible-candidate``／
+      ``launcher-unavailable``／``probe-exception``／
+      ``profile-unresolvable``）；視同不可重用，呼叫端必須以
+      `force_new_card=True` 派出新 attempt（與 "stale" 走同一條路徑）。
     """
 
     if not jobs:
@@ -13087,6 +13105,9 @@ def _workflow_stage_reuse_probe(
     stored_key = latest.get("workflow_stage_execution_key")
     if not isinstance(stored_key, str) or not stored_key:
         return "legacy", None
+    # 以下確認 job 帶 producer 產生的 key——不再是「沒有 key 的 legacy
+    # job」，之後任何無法判定相容性的分支都必須回 "ineligible"，不得回
+    # "legacy"（那會被呼叫端誤判為維持既有 `jobs[-1]` 短路，等同放行）。
     try:
         candidate_pool = _workflow_identity_candidates(run, step, identities)
         backoff_report = _executor_backoff_admission_report(
@@ -13097,11 +13118,17 @@ def _workflow_stage_reuse_probe(
         )
         eligible = tuple(backoff_report["eligible"])
         if not eligible:
-            return "legacy", None
+            return "ineligible", {
+                "superseded_key": stored_key,
+                "reason": "no-eligible-candidate",
+            }
         identity = _select_workflow_identity(run, step, identities, candidates=eligible)
         launcher = launcher_factory(identity)
         if launcher is None:
-            return "legacy", None
+            return "ineligible", {
+                "superseded_key": stored_key,
+                "reason": "launcher-unavailable",
+            }
         launcher = _specialize_workflow_launcher(launcher, step)
         profile_binding, _launcher = _bind_workflow_execution_profile(
             run,
@@ -13116,10 +13143,18 @@ def _workflow_stage_reuse_probe(
             identity=identity,
             profile_binding=profile_binding,
         )
-    except Exception:  # noqa: BLE001 - probe 失敗必須 fail-soft 回既有行為，不當作新拒絕面
-        return "legacy", None
+    except Exception:  # noqa: BLE001 - probe 本身的例外不當作新拒絕面，但
+        # 帶 key 的 job 不可因此回 "legacy"（S10 只保留給真正無 key 的
+        # legacy job）。
+        return "ineligible", {
+            "superseded_key": stored_key,
+            "reason": "probe-exception",
+        }
     if context is None:
-        return "legacy", None
+        return "ineligible", {
+            "superseded_key": stored_key,
+            "reason": "profile-unresolvable",
+        }
     if context["key"] == stored_key:
         return "reused", context
     stored_receipt = latest.get("workflow_stage_execution_receipt")
@@ -13971,6 +14006,26 @@ def _dispatch_workflow_card(
         if reviewer_sandbox is not None:
             shutil.rmtree(reviewer_sandbox, ignore_errors=True)
         raise
+    if stage_execution_context is not None:
+        # 對抗審查 MAJOR-2 修法：`_dispatch_workflow_card` 是所有派工路徑
+        # （resume 的 "stale"／"ineligible" 強制新 attempt、retry-build／
+        # retry-card／retry-verify／retry-review 的 `force_new_card`）唯一
+        # 的真正 spawn 點。這張卡只要在這裡真的建立了新 job，就代表舊
+        # receipt（可能還是上一輪的 "reused"）已經過期——必須無條件覆寫成
+        # "fresh"，不能只讓個別呼叫端各自記，否則任何繞過
+        # `resume_workflow_run` 探測層的強制重派（retry-card／retry-verify／
+        # retry-review）都會讓 status 停留在過期的 "reused" 字樣。
+        # `resume_workflow_run` 自己的探測路徑會在 `dispatch_or_stop` 回來
+        # 後，用這張新 job 的 key 再補上 `mismatched_fields`（"stale" 才
+        # 有）等診斷欄位，不影響這裡先寫入的基本 "fresh" 事實。
+        stage_reuse_receipts = dict(getattr(run, "stage_reuse_receipts", None) or {})
+        stage_reuse_receipts[step.card] = {
+            "decision": "fresh",
+            "stage_execution_key": stage_execution_context["key"],
+        }
+        registry._manager_update_workflow_run(
+            run.run_id, stage_reuse_receipts=stage_reuse_receipts
+        )
     try:
         # #381：真正 spawn 前才 admit，不佔住這張卡接下來的整個執行期。
         resolve_limiter(spawn_admission).admit(resolve_provider(identity=identity, launcher=launcher))
@@ -15086,26 +15141,64 @@ def resume_workflow_run(
         coordinator_root=coordinator_root,
         registry=registry,
     )
-    if stage_reuse_kind == "stale":
-        # 不相容變動：不得沿用 `jobs[-1]` 的舊 evidence，強制新 attempt（不算
-        # operator retry-card，`retry_failed` 語意不變）。
+    if stage_reuse_kind in ("stale", "ineligible"):
+        # 對抗審查 MAJOR-1 修法：不相容變動（"stale"）或無法判定相容性
+        # （"ineligible"）兩者都不得沿用 `jobs[-1]` 的舊 evidence，一律強
+        # 制新 attempt（不算 operator retry-card，`retry_failed` 語意不
+        # 變）。若這裡因 launcher 綁不出而失敗，`dispatch_or_stop` 會先落
+        # needs_human 再重新拋出——沿用既有 fail-closed 流程，不吞例外。
         job = dispatch_or_stop(run, force_new_card=True)
     else:
         job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
-    if stage_reuse_context is not None:
-        # #844 S11：純 provenance 快照，供 status／`cortex status` 辨識這張卡
-        # 是 reuse 還是重新執行；不是 admission authority，不影響上面已經做
-        # 完的裁決。
+    if stage_reuse_kind == "reused" and stage_reuse_context is not None:
+        # #844 S11：純 provenance 快照，供 status／`cortex status` 辨識這張
+        # 卡是 reuse；沒有新 job，receipt 由這裡寫。
         stage_reuse_receipts = dict(getattr(run, "stage_reuse_receipts", None) or {})
         stage_reuse_receipts[step.card] = {
-            "decision": "reused" if stage_reuse_kind == "reused" else "fresh",
+            "decision": "reused",
             "stage_execution_key": stage_reuse_context["key"],
-            **(
-                {"mismatched_fields": list(stage_reuse_context.get("mismatched_fields", ()))}
-                if stage_reuse_kind == "stale"
-                else {}
-            ),
         }
+        registry._manager_update_workflow_run(
+            run.run_id, stage_reuse_receipts=stage_reuse_receipts
+        )
+    elif stage_reuse_kind in ("stale", "ineligible") and stage_reuse_context is not None:
+        # 對抗審查 MAJOR-2 修法：這張卡確定不再沿用舊 evidence，receipt 必
+        # 須覆寫，不能留著前一次可能還是 "reused" 的字樣。真的建立了新
+        # job 時（`job` 帶 `job_id`），用**那顆新 job 自己的**
+        # `workflow_stage_execution_key`——由 `_dispatch_workflow_card`
+        # 實際派工當下算出，不是這裡探測階段可能已經 drift 的猜測值
+        # （S07：探測與實際派工之間可能已經 drift，新 job 自己的欄位才是
+        # 真正落盤的那份）——記成 "fresh"；forced dispatch 本身落成其他
+        # 決策（例如 runtime-preflight needs_human，沒有新 job）時記
+        # "ineligible" 與原因，不冒充還沒發生的 fresh evidence。
+        new_key = (
+            job.get("workflow_stage_execution_key")
+            if isinstance(job, dict) and "job_id" in job
+            else None
+        )
+        stage_reuse_receipts = dict(getattr(run, "stage_reuse_receipts", None) or {})
+        if isinstance(new_key, str) and new_key:
+            entry: dict[str, object] = {
+                "decision": "fresh",
+                "stage_execution_key": new_key,
+            }
+            if stage_reuse_kind == "stale":
+                entry["mismatched_fields"] = list(
+                    stage_reuse_context.get("mismatched_fields", ())
+                )
+        else:
+            entry = {
+                "decision": "ineligible",
+                "reason": (
+                    stage_reuse_context.get("reason")
+                    if stage_reuse_kind == "ineligible"
+                    else "stale-dispatch-produced-no-job"
+                ),
+            }
+            superseded_key = stage_reuse_context.get("superseded_key")
+            if isinstance(superseded_key, str) and superseded_key:
+                entry["superseded_key"] = superseded_key
+        stage_reuse_receipts[step.card] = entry
         registry._manager_update_workflow_run(
             run.run_id, stage_reuse_receipts=stage_reuse_receipts
         )
