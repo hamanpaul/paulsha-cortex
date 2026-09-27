@@ -37,6 +37,8 @@
 
 ### Fixed
 
+- **#1099 quota window snapshot refinement**：同值、同時間的 snapshot 補上先前缺失的 window epoch 時，file ledger 與 memory ledger 會追加 refinement observation；shadow 投影在同時間快照間優先採用 epoch 已知者。值不同仍是 conflict，較不完整或完全相同的重送仍是 duplicate；不新增 ledger event kind 或 schema version。
+
 - **#844 對抗審查 MAJOR-1／MAJOR-2 修法**：`_workflow_stage_reuse_probe()` 先前只要因 launcher／execution-profile 解析失敗，或沒有 eligible candidate 而算不出可比對的新 context，就一律回 `"legacy"`，被呼叫端誤判為可以沿用既有 `jobs[-1]`——等於在 reviewer model／execution profile 已經改變、但當下綁不出新 launcher 的瞬間，錯誤放行了過期的 verify／review evidence。現在對帶有 `workflow_stage_execution_key` 的 job，這類無法判定相容性的分支改回新的 `"ineligible"` 分類，`resume_workflow_run()` 對 `"ineligible"` 與 `"stale"` 一視同仁：一律強制新 attempt，派工本身若也綁不出 launcher 則沿用既有 fail-closed；只有真正沒有 key 的 legacy job 才維持原行為。另修正 `dispatch_workflow_card(force_new_card=True)`（retry-build／retry-card／retry-verify／retry-review 的新 attempt 共用路徑）先前不會覆寫 `WorkflowRun.stage_reuse_receipts`，導致 status 可能停留在前一輪的 `"reused"` 或缺少 `"fresh"` 標記；`_dispatch_workflow_card()` 現在只要為 verify／review 卡真正建立新 job 就無條件覆寫成 `"fresh"`。細節與測試涵蓋見 `changelog.d/refine-844.md`。
 
 - **#844 對抗審查第二輪 MAJOR-1 修法**：verify／review 卡的 `stage_execution_key`／receipt 先前只雜湊 `planning_authority` 與 `candidate`，沒涵蓋卡片 prompt 實際依賴、且可能在同一 candidate 下改變的 `builder_job_id`／gate ledger 內容／operator 裁決——`retry-build` 合法重跑出同一顆 candidate 後，`resume_workflow_run()` 仍會誤判成相容並沿用重跑前的 evidence。schema 升版新增這三項摘要欄位，任一變動即 stale、強制新 attempt；`_dispatch_workflow_card()` 與 probe 改用共用推導點避免兩處篩選條件漂移。另強化 rollback 相容性測試，補上舊版 Monitor row whitelist 全鏈驗證（見 `changelog.d/refine-844.md`）。

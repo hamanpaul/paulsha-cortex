@@ -113,11 +113,21 @@ class QuotaEventLedger:
             if conflicts:
                 return LedgerAppendResult("conflict", conflicts=1, idempotency_key=key)
             if previous:
-                prior_digest = previous[0].get("payload_sha256")
-                if prior_digest == digest or _same_snapshot_value(
-                    previous[0].get("observation"), wire
-                ):
+                if any(row.get("payload_sha256") == digest for row in previous):
                     return LedgerAppendResult("duplicate", duplicates=1, idempotency_key=key)
+                same_value = [
+                    row for row in previous
+                    if _same_snapshot_value(row.get("observation"), wire)
+                ]
+                if same_value:
+                    if (_snapshot_has_known_window_epoch(wire)
+                            and not any(_snapshot_has_known_window_epoch(
+                                row.get("observation")
+                            ) for row in same_value)):
+                        self._append_fd(fd, entry, info.st_size)
+                        return LedgerAppendResult("accepted", accepted=1, idempotency_key=key)
+                    return LedgerAppendResult("duplicate", duplicates=1, idempotency_key=key)
+                prior_digest = previous[0].get("payload_sha256")
                 conflict = {
                     "schema_version": 1,
                     "kind": "conflict",
@@ -381,6 +391,14 @@ def _same_snapshot_value(prior_wire, wire):
     return _canonical_bytes(prior_measurement.get("quantity")) == _canonical_bytes(
         measurement.get("quantity")
     )
+
+
+def _snapshot_has_known_window_epoch(wire):
+    window_instance = wire.get("window_instance") if isinstance(wire, dict) else None
+    if not isinstance(window_instance, dict) or window_instance.get("kind") != "interval":
+        return False
+    epoch = window_instance.get("epoch")
+    return isinstance(epoch, dict) and epoch.get("state") == "known"
 
 
 def _cross_identity_conflict_digest(records, wire, digest):
