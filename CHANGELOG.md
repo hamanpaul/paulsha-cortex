@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#841 宣告端 invocation 摘要**：`service_declaration_projection` 先算出 manager invocation revision，`cortex service status` 正式路徑的 manager config 可達 match。
 - **#841 systemctl show 區塊解析**：依真實輸出順序（`Id=` 在區塊中間）解析、`EnvironmentFiles` 多值串接，修正真實 service 的 loaded runtime attestation 永遠為 unknown。後續修法：manager 的 `invocation_revision` 改以 daemon 實際收到的原始 argv token 計算（而非 `parse_args` 後、混入環境變數推導預設值的 namespace），`cortex service status` 端新增 `manager_declared_invocation_revision`，在 `environment_source=systemd-effective` 時從 systemd 有效 `ExecStart` 反推同一份 argv（支援直接呼叫 `python -m manager_daemon` 與 installer 實際產生的 `service-manager.sh` wrapper 兩種形狀），修正任何部署的 manager 都必然卡在 `invocation-declaration-unknown` 的缺口；`compare_runtime_state` 新增對應的 `invocation-drift` 判定。
 - **#1099 進件**：登記 work item `quota-snapshot-window-refinement` 與 accepted todo，供正式 lifecycle 實作。
 - **refine 第二波整合**：#716 canary 刷新、#836（含 provider 唯讀 collector）、#838、#839、#840、#841、#842、#844、#845、#857、#1093 合流；整合修正受治理 live receipt loader 一併載入 `qualification/contract.py`、#844 rollback 相容測試改以部署中 pin 為舊版基準、#844 stage key 與 #839 provisioning `try` 結構合流；service runtime probe 對 `LoadState=not-found` 的 unit 改走 unit 檔 fallback。

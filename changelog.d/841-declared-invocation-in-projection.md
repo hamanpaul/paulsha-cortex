@@ -1,0 +1,1 @@
+- #841 live 驗收修正：`cortex service status` 的正式路徑拿到的 units 已由 `probe_service_runtime` 移除 `systemd` 原始屬性，manager 的宣告端 invocation revision 因此永遠為 None、config 永遠 `invocation-declaration-unknown`。改在 `service_declaration_projection`（原始 row 仍在手上）先算出 manager 的 `invocation_revision` 摘要放進投影，`service status` 優先採用；投影只含 sha256 摘要，不含 argv 原文。新增走 `_status_payload` 正式路徑的回歸測試（先前的測試直接餵未過濾 units，測不到）。
