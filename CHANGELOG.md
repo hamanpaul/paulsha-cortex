@@ -10,6 +10,12 @@
 ### Added
 
 - **review malformed 預檢**：接受不帶選填 `authority_hashes` 的合法 review envelope（#1118）。
+- **#1097 qualification clock watermark 補上其他 durable 系統時間證據**：`_clock_evidence_floor()` 讀取
+  `jobs-registry`（`jobs.json`）與 `quota-admission-decisions` 兩個 Trust Root 登記、Manager-only 的
+  durable 落盤來源最新 mtime，取其上界墊高 `now`（只會墊高、不會壓低），讓「第一次 qualification 查詢就
+  發生在時鐘回撥之後」的場景改為 `clock-evidence-expired` fail-closed；完全沒有可用證據時行為不變，並在
+  查詢結果多帶可機讀的 `clock_evidence` 診斷（`clock-evidence-checked` / `clock-evidence-unavailable`）。
+  見 `changelog.d/1097-qualification-clock-watermark.md`。
 - **v0.1.11 發版**：`VERSION` 升為 0.1.11，收錄 refine 完整交付與 live 驗收修正（見 `changelog.d/release-0-1-11.md`）。
 - **work-items 衝突解除（續）**：`wave4-large-bug-integration` 明確歸屬 #475，消除 PR #1090 的 fallback 群組殘留衝突。
 - **#839／#836 共用設定檔**：admission 接受 collector 的選填 `collector_targets`，同一份 `quota-pools.json` 可同時供兩者使用。
