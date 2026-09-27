@@ -389,6 +389,7 @@ class WorkflowRegistryProvider:
         state_path: str | Path | None = None,
         candidate_base_probe: "candidate_base.MirrorDistanceProbe | None" = None,
         quota_decision_store: "quota_admission_module.AdmissionDecisionStore | None" = None,
+        quota_decision_cache: "DecisionReadCache | None" = None,
     ) -> None:
         self.repo = repo
         self.provider_id = f"workflow:{repo}"
@@ -405,14 +406,29 @@ class WorkflowRegistryProvider:
         # #840：quota-aware admission decision store handle。比照上面的
         # `candidate_base_probe`——production 用預設路徑（與 manager_daemon
         # 共用同一個 Trust Root 資產），測試／多 instance 部署可注入自己的
-        # store。同一個 provider 實例的多次 `scan()` 共用它，讓
-        # `DecisionReadCache` 的 last-good 語意跨輪次持續有效。
+        # store。
         self._quota_decision_store = (
             quota_decision_store
             if quota_decision_store is not None
             else quota_admission_module.AdmissionDecisionStore()
         )
-        self._quota_decision_cache = DecisionReadCache()
+        # #840 對抗審查修復第二輪（MAJOR，work_api.py 約 594）：`DecisionReadCache`
+        # 一旦只建在這個 provider 實例內部，就只在『同一個 provider 實例被重複
+        # `scan()`』時才跨輪存活——但 `WorkModelRefresher.refresh()` 每一輪都經
+        # `workflow_provider_factory(repo)` 重建一個全新的 provider 實例（比照
+        # `_candidate_base_probe` 的『production 每次 scan 重建一個』設計），
+        # 上一輪成功讀到的 last-good 在下一輪 store 暫時損毀／權限錯誤時就會
+        # 隨舊 provider 一起被丟棄，退化成單純的『這次讀不到』，跟
+        # `manager_daemon.build_runtime_status_provider()` 那條路徑（daemon
+        # 生命週期內只建一個 `DecisionReadCache`，見該檔文件字串）不一致。
+        # 這裡改成可選注入：呼叫端（`WorkModelRefresher`）可以在自己的生命週期
+        # 內只建一個 cache，逐輪把同一個實例傳進每一輪新建的 provider，讓
+        # last-good 語意真正跨快照存活；不注入時維持舊行為（provider 自己建一個
+        # 新的，不影響其餘呼叫端，例如 `manager_daemon.py` 走的是直接呼叫
+        # `project_workflow_quota_admission` 的另一條路徑，不受影響）。
+        self._quota_decision_cache = (
+            quota_decision_cache if quota_decision_cache is not None else DecisionReadCache()
+        )
 
     def scan(self) -> ProviderSnapshot:
         attempted_at = _utcnow()

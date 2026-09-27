@@ -249,13 +249,30 @@ def _project_persona_decision(
         return payload
     requested_profile_key = None
     resolved_profile_key = decision.profile_key
-    if isinstance(profile_binding, Mapping):
-        request_key = profile_binding.get("request_key")
-        if isinstance(request_key, str) and request_key:
-            requested_profile_key = request_key
-        resolved_key = profile_binding.get("resolved_key")
-        if isinstance(resolved_key, str) and resolved_key:
-            resolved_profile_key = resolved_key
+    # #840 對抗審查修復第二輪（MAJOR，約本檔原 250 行）：`execution_profile_bindings`
+    # 是 #835 既有的 per-persona『最近一次真正派工成功』快照——只有真的走到
+    # `manager._record_resolved_model_chain()` 才會被覆寫（見該函式呼叫點），
+    # retry-card 之後這次 attempt 若全數候選被拒（`outcome == "wait"`，
+    # `decision.selected is None`），這次 attempt 從未走到那個寫入點，
+    # 這個 persona 底下的 binding 因此**必然**是上一個仍 admit 的 attempt
+    # 留下的舊值。舊實作不論 outcome 一律套用，等於把上一輪的 requested／resolved
+    # profile 借給這次根本沒有選中任何候選的 wait receipt——只有
+    # `outcome == "admit"`（等價於 `decision.selected is not None`）時，
+    # `execution_profile_bindings[persona]` 才保證與這個 decision 屬於同一個
+    # attempt（兩者在 `manager._dispatch_workflow_card` 同一次候選迴圈迭代裡
+    # 依序寫入，見該函式文件字串），才可以疊加；wait receipt 一律呈現
+    # requested=none／resolved=unknown，不臆測，`excluded` 仍照舊帶出被排除
+    # 候選清單（不受本次修法影響）。
+    if decision.outcome == "admit" and decision.selected is not None:
+        if isinstance(profile_binding, Mapping):
+            request_key = profile_binding.get("request_key")
+            if isinstance(request_key, str) and request_key:
+                requested_profile_key = request_key
+            resolved_key = profile_binding.get("resolved_key")
+            if isinstance(resolved_key, str) and resolved_key:
+                resolved_profile_key = resolved_key
+    else:
+        resolved_profile_key = "unknown"
     payload = {
         "persona": persona,
         "decision_id": decision.decision_id,

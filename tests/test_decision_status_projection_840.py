@@ -445,6 +445,109 @@ def test_status_entry_and_work_show_row_agree_on_same_snapshot(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
+# 對抗審查第二輪 MAJOR（decision_projection.py 約 250）：wait receipt 不得
+# 借用上一個 attempt 的 execution_profile_bindings。
+# ---------------------------------------------------------------------------
+
+
+def test_wait_receipt_after_retry_does_not_borrow_previous_attempt_profile(tmp_path: Path) -> None:
+    """先成功派工（attempt n0，admit，profile A）→ retry-card → 這次 attempt
+    （n1）全數候選被拒（quota-config-invalid／wait，沒有選中候選）。
+
+    `execution_profile_bindings["builder"]` 只有 `manager._record_resolved_model_chain()`
+    真的走到派工才會被覆寫（見 #835）；這次 wait 從未走到那個寫入點，run 上
+    仍是 attempt n0 留下的舊值。投影不得把這份舊 binding 當成這次 wait 的
+    結果——requested 必須是 ``None``、resolved 必須是 ``"unknown"``，不得
+    呈現成 attempt n0 的 profile。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    admit_decision = _decision(
+        decision_id="adm:v1:" + "1" * 62 + "a1", attempt_id="n0", outcome="admit",
+        profile_key="epk:v1:resolved:" + "a" * 64,
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    # 比照 `manager._quota_admission_record_wait_decision()` 產出的真實 wait
+    # receipt 形狀：`selected=None`、`observation_version`／`demand_version`
+    # 皆為 `"not-applicable"`、`reason` 必填（`AdmissionDecision.__post_init__`
+    # 對 outcome=="wait" 的既有驗證）。不能沿用 `_decision()` 輔助函式——它對
+    # 未指定 `selected` 一律回退成一組假候選，無法表達『真的沒有選中任何
+    # 候選』的 wait 語意。
+    wait_decision = admission.AdmissionDecision(
+        decision_id="adm:v1:" + "1" * 62 + "a2",
+        run_id="run-1", card_id="card-1", attempt_id="n1",
+        profile_key="quota-admission:no-admissible-candidate",
+        mode="enforced", outcome="wait",
+        policy_version=admission.ADMISSION_POLICY_VERSION,
+        observation_version="not-applicable", demand_version="not-applicable",
+        qualification_version="not-enforced",
+        generated_at_ms=_NOW,
+        selected=None, reservation_id=None,
+        excluded=(
+            {"executor": "codex", "model_id": "gpt-5.3-codex", "exclusion_reason": "insufficient-quota"},
+        ),
+        reason="quota-admission-insufficient",
+    )
+    store.record(admit_decision)
+    store.record(wait_decision)
+
+    # 模擬『run 上還留著上一個 attempt 的 binding』這個既有事實（#835 只按
+    # persona 存最近一次真正派工成功的 profile），不重造 #835 的寫入邏輯。
+    stale_profile_binding = {
+        "request_key": "epk:v1:requested:" + "b" * 64,
+        "resolved_key": "epk:v1:resolved:" + "a" * 64,
+    }
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={
+            "builder": {
+                "decision_id": wait_decision.decision_id, "mode": "enforced", "outcome": "wait",
+            },
+        },
+        needs_human_reason=None,
+        execution_profile_bindings={"builder": stale_profile_binding},
+        store=store, now_ms=_NOW,
+    )
+
+    persona = projection["personas"]["builder"]
+    assert persona["outcome"] == "wait"
+    assert persona["requested_profile_key"] is None
+    assert persona["resolved_profile_key"] == "unknown"
+    # 不得洩漏 attempt n0 的舊 profile key。
+    assert persona["resolved_profile_key"] != stale_profile_binding["resolved_key"]
+    assert persona["requested_profile_key"] != stale_profile_binding["request_key"]
+    # 被排除候選清單仍照舊帶出，不受本次修法影響。
+    assert persona["excluded"] == [
+        {"executor": "codex", "model_id": "gpt-5.3-codex", "exclusion_reason": "insufficient-quota"},
+    ]
+
+
+def test_admit_receipt_still_uses_execution_profile_binding_for_same_attempt(tmp_path: Path) -> None:
+    """對照組：outcome=="admit"（真的選中候選）時，同一個 attempt 的
+    `execution_profile_bindings` 仍必須疊加——本次修法只收斂 wait，不影響
+    既有 admit 語意。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "2" * 64, outcome="admit",
+        profile_key="epk:v1:resolved:" + "c" * 64,
+    )
+    store.record(decision)
+    profile_binding = {
+        "request_key": "epk:v1:requested:" + "d" * 64,
+        "resolved_key": "epk:v1:resolved:" + "e" * 64,
+    }
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1", quota_admission=_quota_admission_pointer(decision),
+        needs_human_reason=None, execution_profile_bindings={"builder": profile_binding},
+        store=store, now_ms=_NOW,
+    )
+
+    persona = projection["personas"]["builder"]
+    assert persona["requested_profile_key"] == profile_binding["request_key"]
+    assert persona["resolved_profile_key"] == profile_binding["resolved_key"]
+
+
+# ---------------------------------------------------------------------------
 # 對抗審查 MAJOR（manager.py 熱路徑）：同一份 snapshot 內，`DecisionReadCache`
 # 對同一個 store 檔案身分最多真的讀一次，不管有多少個 run／persona 各自查詢。
 # ---------------------------------------------------------------------------

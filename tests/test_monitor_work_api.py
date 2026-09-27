@@ -9,7 +9,12 @@ import pytest
 
 from sandbox_support import requires_af_unix_bind
 
+from paulsha_cortex.coordinator import manager
+from paulsha_cortex.coordinator import quota_admission as admission
+from paulsha_cortex.coordinator.registry import JobRegistry
+from paulsha_cortex.coordinator.workflow import WorkflowStep
 from paulsha_cortex.monitor.config import MonitorConfig
+from paulsha_cortex.monitor.decision_projection import DecisionReadCache
 from paulsha_cortex.monitor.server import MonitorServer
 from paulsha_cortex.monitor.server import _Subscriber
 from paulsha_cortex.monitor.models import ProjectState
@@ -529,3 +534,111 @@ def test_refresher_prunes_provider_state_after_authoritative_project_removal(tmp
     assert any(event.removed and event.work_item.work_id == "work" for event in events)
     assert durable.load().providers == {}
     assert read_store.list_work_items(include_done=True)["items"] == []
+
+
+def test_refresher_quota_decision_cache_survives_across_refresh_ticks_for_last_good_stale(
+    tmp_path,
+):
+    """#840 對抗審查修復第二輪（MAJOR，work_api.py 約 594）：
+    `WorkModelRefresher.refresh()` 每輪經 `workflow_provider_factory(repo)`
+    重建全新的 `WorkflowRegistryProvider`——provider 內部的 `DecisionReadCache`
+    過去無法跨輪存活：第一輪成功讀到 decision，第二輪 `decisions.jsonl`
+    權限錯誤／損毀時，`cortex work show` 只剩 `available=false`／
+    `stale_reason`，遺失第一輪的 last-good ``mode``／``selected``。這裡驗證
+    refresher 兩輪 ``refresh()``：可讀→不可讀，`get_work_item()` 仍顯示
+    last-good 的 ``mode``／``selected`` 並帶精確 stale 原因；同時斷言
+    `inspect status`（`manager.workflow_status_entry`）在同一份 registry／
+    store 狀態下算出與 work show 一致的 ``decision_id``／``mode``／
+    ``selected``（各自持有獨立的 `DecisionReadCache`，模擬兩個真實呈現面各自
+    的快取生命週期，而非共用同一個實例）。"""
+
+    repo = tmp_path / "repo"
+    spec = repo / "docs/superpowers/specs/work.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("---\nwork_item: work\n---\n# work\n", encoding="utf-8")
+
+    registry = JobRegistry()
+    step = WorkflowStep(
+        phase="build", persona="builder", card="build-card",
+        executor="planned-executor", model="planned-model", domain="test-domain",
+        inputs=(), outputs=(), gate_result="pending",
+    )
+    run = registry._manager_create_workflow_run(
+        work_id="work", repo="example/acme", claim_key="example/acme/work/0",
+        source_revision="a" * 64, workspace_root=str(repo),
+        combo="feature-oneshot", current_phase="build",
+        steps=(step,), attempts={"build": 1}, facets=(), gate_status="running",
+    )
+    store = admission.AdmissionDecisionStore()
+    decision = admission.AdmissionDecision(
+        decision_id="adm:v1:" + "9" * 64, run_id=run.run_id, card_id="build-card",
+        attempt_id="attempt-0", profile_key="epk:v1:resolved:" + "a" * 64,
+        mode="shadow", outcome="admit", policy_version=admission.ADMISSION_POLICY_VERSION,
+        observation_version="shadow-projection:" + "b" * 16,
+        demand_version=admission.DEMAND_FIXTURE_VERSION, qualification_version="not-enforced",
+        generated_at_ms=1_900_000_000_000,
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(decision)
+    registry._manager_update_workflow_run(
+        run.run_id,
+        quota_admission={
+            "builder": {"decision_id": decision.decision_id, "mode": "shadow", "outcome": "admit"},
+        },
+    )
+    run = registry.get_workflow_run(run.run_id)
+
+    durable = WorkSnapshotStore(tmp_path / "state/work-items.snapshot.json")
+    read_store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(durable_store=durable, read_store=read_store)
+    project = ProjectState(project_id="example/acme", workspace="ws", path=str(repo))
+    inspect_cache = DecisionReadCache()
+
+    refresher.refresh((project,), include_github=False)
+    first_work_show = read_store.get_work_item("work", repo="example/acme")
+    first_persona = first_work_show["quota_decision"]["personas"]["builder"]
+    assert first_persona["stale"] is False
+    assert first_persona["decision_id"] == decision.decision_id
+    assert first_persona["mode"] == "shadow"
+
+    first_status = manager.workflow_status_entry(
+        registry, run, quota_decision_store=store, quota_decision_cache=inspect_cache,
+    )
+    first_status_persona = first_status["quota_decision"]["personas"]["builder"]
+    assert first_status_persona["stale"] is False
+    assert first_status_persona["decision_id"] == decision.decision_id
+
+    # 損毀 store（破壞群組權限位——`AdmissionDecisionStore._check_file` 會 fail
+    # closed），模擬第二輪讀取失敗。
+    store.path.chmod(0o660)
+    try:
+        refresher.refresh((project,), include_github=False)
+        second_status = manager.workflow_status_entry(
+            registry, run, quota_decision_store=store, quota_decision_cache=inspect_cache,
+        )
+    finally:
+        store.path.chmod(0o600)
+
+    second_work_show = read_store.get_work_item("work", repo="example/acme")
+    second_persona = second_work_show["quota_decision"]["personas"]["builder"]
+
+    # 修好之前：provider 隨每輪 refresh() 重建、cache 隨之整個消失，這裡
+    # `stale` 會是 `False`／`available` 會是 `False`，`mode`／`selected` 直接
+    # 不見——不是 last-good。
+    assert second_persona["stale"] is True
+    assert second_persona["stale_reason"].startswith("decision-store-read-failed:")
+    assert second_persona["decision_id"] == decision.decision_id
+    assert second_persona["mode"] == "shadow"
+    assert second_persona["selected"] == {"executor": "codex", "model_id": "gpt-5.3-codex"}
+
+    second_status_persona = second_status["quota_decision"]["personas"]["builder"]
+    assert second_status_persona["stale"] is True
+    assert second_status_persona["stale_reason"].startswith("decision-store-read-failed:")
+
+    # `cortex inspect status` 與 `cortex work show` 在同一次損毀狀態下必須算出
+    # 一致的 decision／mode／selected——即使各自持有獨立的 `DecisionReadCache`
+    # 實例（兩個呈現面本來就是各自的呼叫端，不共用同一個 cache 物件）。
+    assert second_status_persona["decision_id"] == second_persona["decision_id"]
+    assert second_status_persona["mode"] == second_persona["mode"]
+    assert second_status_persona["selected"] == second_persona["selected"]
+    assert second_status_persona["outcome"] == second_persona["outcome"]

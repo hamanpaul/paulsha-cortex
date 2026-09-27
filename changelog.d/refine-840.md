@@ -113,3 +113,72 @@ remaining、缺 provenance 的 legacy receipt、needs_human 語意保留、plann
    WSL2）metadata-only 變更不保證更新 ctime 解析度）。補
    `test_shared_cache_reads_store_at_most_once_per_snapshot_across_many_runs_and_personas`：
    3 個 run×2 個 persona＝6 次查詢，監看 `all_rows()` 只被呼叫一次。
+
+## 對抗審查修復（第二輪，2 條 MAJOR＋1 條判定不成立）
+
+1. **`WorkModelRefresher.refresh()` 每輪重建 provider 導致 `DecisionReadCache`
+   跨快照失效 fix**（`work_api.py`／`providers.py`）：上一輪（第一輪對抗審查）
+   已經把 `manager_daemon.build_runtime_status_provider()`（`cortex inspect
+   status` 路徑）的 `quota_decision_cache` 搬到 daemon 生命週期層級共用，但
+   `cortex work show` 走的是另一條路徑——`WorkModelRefresher.refresh()` 每輪
+   都經 `workflow_provider_factory(repo)` 重建一個全新的
+   `WorkflowRegistryProvider` 實例，provider 內部的 `DecisionReadCache`
+   （舊行為：建在 `__init__` 內部、呼叫端無法注入）因此每輪都是空的——第一輪
+   成功讀到 decision，第二輪 `decisions.jsonl` 權限錯誤／損毀時，
+   `cortex work show` 只剩 `available=false`／`stale_reason`，遺失第一輪的
+   last-good `mode`／`selected`。
+   修法：`WorkflowRegistryProvider.__init__` 新增可選的 `quota_decision_cache`
+   注入參數（不注入時維持舊行為，自建一個，不影響其他呼叫端）；
+   `WorkModelRefresher` 比照既有 `issue_sync_store`／`event_spool`（『必須
+   活得比 per-repo provider 久』）的既有模式，在自己的 `__init__` 建立
+   `_quota_decision_store`／`_quota_decision_cache`（daemon／refresher 生命
+   週期內只建一次），`refresh()` 內使用**預設** provider factory 時逐輪把
+   同一個 cache／store 實例注入新建的 provider；自訂
+   `workflow_provider_factory`（測試／上層組裝）呼叫維持原樣（僅 `repo`
+   單一參數），不受影響。補
+   `test_refresher_quota_decision_cache_survives_across_refresh_ticks_for_last_good_stale`
+   （`tests/test_monitor_work_api.py`）：refresher 兩輪 `refresh()`——可讀→
+   （chmod 破壞群組權限位模擬）不可讀，驗證 `get_work_item()` 仍顯示
+   last-good 的 `mode`／`selected` 並帶精確 `stale_reason`；同時在同一次
+   損毀狀態下另建一個獨立的 `DecisionReadCache` 呼叫
+   `manager.workflow_status_entry()`，斷言 `cortex inspect status` 與
+   `cortex work show` 算出一致的 `decision_id`／`mode`／`selected`／
+   `outcome`（兩個呈現面各自持有獨立 cache 實例，不共用同一個物件，模擬
+   真實部署形狀）。
+2. **wait receipt 無條件借用上一個 attempt 的 `execution_profile_bindings`
+   fix**（`decision_projection.py`）：`_project_persona_decision()` 過去不論
+   `decision.outcome` 一律用 `execution_profile_bindings[persona]` 覆寫
+   `requested_profile_key`／`resolved_profile_key`。但 `execution_profile_bindings`
+   是 #835 既有的 per-persona『最近一次真正派工成功』快照，只有真的走到
+   `manager._record_resolved_model_chain()`（與 admit 決策同一次候選迴圈
+   迭代內依序寫入）才會被覆寫——retry-card 之後，若這次 attempt 全數候選
+   被拒（`quota-config-invalid`／全拒 wait，`outcome=="wait"`，
+   `selected=None`），這次 attempt 從未走到那個寫入點，run 上的 binding
+   **必然**是上一個仍 admit 的 attempt 留下的舊值。舊實作把這份舊 binding
+   當成這次 wait 的結果疊上去，讓 status／work show 把上一輪的
+   requested／resolved profile 誤呈現成當前 wait 的結果。
+   修法：只有 `decision.outcome == "admit"` 且 `decision.selected is not
+   None`（等價於這個 decision 確實選中了候選）時才疊加
+   `execution_profile_bindings` 的 `request_key`／`resolved_key`；否則（wait
+   receipt，沒有選中候選）`requested_profile_key` 維持 `None`、
+   `resolved_profile_key` 明確改成字串 `"unknown"`（不再沿用
+   `AdmissionDecision.profile_key` 內部 sentinel `quota-admission:
+   no-admissible-candidate` 逐字外露，避免呼叫端誤把它當成一個真的 profile
+   key 格式）；`excluded` 被排除候選清單不受本次修法影響，照舊帶出。補兩個
+   測試（`tests/test_decision_status_projection_840.py`）：
+   `test_wait_receipt_after_retry_does_not_borrow_previous_attempt_profile`
+   （先 admit attempt n0、再 retry-card 出一筆 wait attempt n1，斷言
+   requested／resolved 不再洩漏 n0 的 profile key，改為 `None`／`"unknown"`）
+   與 `test_admit_receipt_still_uses_execution_profile_binding_for_same_attempt`
+   （對照組：outcome=="admit" 時 binding 仍照舊疊加，確認本次修法只收斂
+   wait，不影響既有 admit 語意）。
+3. **`AdmissionDecision` 三個 #840 選填欄位 schema bump 疑慮（判定不成立，
+   不改碼）**：對抗審查第二輪另提出「schema_version=1 下寫入
+   `selected_observation_state`／`selected_feasible`／`policy_config_revision`
+   三個選填鍵，回退到 `#839`-only 基準（commit `0cda9ec2`）讀不懂」的疑慮。
+   查證：`#839` 與 `#840` 同一個 release 一起發布，`0cda9ec2`（`#839` 落地
+   commit）從未獨立發布過、不存在任何『只有 #839、沒有 #840』的已發布版本
+   需要相容；因此不存在真實的回退相容性缺口，`schema_version` 維持 `1`
+   正確，不需要 bump，也不需要改碼。上方「對抗審查修復（5 條 MAJOR，本輪
+   追加）」第 1 點已記錄過同一個結論與理由，本節僅確認第二輪重提的疑慮
+   仍是同一個判定：不成立。
