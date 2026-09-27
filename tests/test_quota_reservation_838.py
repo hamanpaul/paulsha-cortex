@@ -411,14 +411,19 @@ def test_ac4_illegal_transition_history_fails_closed(tmp_path: Path) -> None:
         pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
         demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
     )
+    bound = authority.bind(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", job_id="job-1", expected_sequence=0, now_ms=NOW + 1,
+    )
+    assert bound.status == "ok"
     settled = authority.settle(
         reservation_id=granted.reservation_id, owner_token=granted.owner_token,
-        attempt_id="attempt-1", outcome="succeeded", expected_sequence=0, now_ms=NOW + 1,
+        attempt_id="attempt-1", outcome="succeeded", expected_sequence=1, now_ms=NOW + 1,
     )
     assert settled.status == "ok"
     _append_raw_row(path, {
         "schema_version": 1, "kind": "bind", "reservation_id": granted.reservation_id,
-        "sequence": 2, "job_id": "job-revived", "event_at_ms": NOW + 2,
+        "sequence": 3, "job_id": "job-revived", "event_at_ms": NOW + 2,
     })
     with pytest.raises(ReservationCorrupt):
         QuotaReservationAuthority(path).committed(now_ms=NOW + 3)
@@ -436,7 +441,8 @@ def test_ac4_malformed_reconcile_numbers_fail_closed_not_type_error(tmp_path: Pa
     )
     _append_raw_row(path, {
         "schema_version": 1, "kind": "reconcile", "reservation_id": granted.reservation_id,
-        "sequence": 1, "resolution": "confirmed-alive", "evidence": {},
+        # evidence 必須合法（有 kind），才能確實驗到數值欄位的 fail-closed。
+        "sequence": 1, "resolution": "confirmed-alive", "evidence": {"kind": "job-registry"},
         "renew_lease_ms": "1000", "event_at_ms": NOW + 1,
     })
     with pytest.raises(ReservationCorrupt):
@@ -502,6 +508,120 @@ def test_ac4_reconcile_and_reserve_rows_are_revalidated_on_reload(tmp_path: Path
     )
     with pytest.raises(ReservationCorrupt):
         QuotaReservationAuthority(second).committed(now_ms=NOW + 2)
+
+
+def test_ac4_reserved_cannot_settle_and_pool_capacity_mismatch_fails_closed(tmp_path: Path) -> None:
+    """協定：reserve → bind(job_id) → spawn。reserved 恆為「尚未 spawn」，
+    settle 只接受 bound；reserve row 的 pools 與 capacity_by_pool 必須逐一對應。"""
+    import json as _json
+
+    path = tmp_path / "reservations.jsonl"
+    authority = QuotaReservationAuthority(path)
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-settle", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    settled = authority.settle(
+        reservation_id=granted.reservation_id, owner_token=granted.owner_token,
+        attempt_id="attempt-1", outcome="failed", expected_sequence=0, now_ms=NOW + 1,
+    )
+    assert settled.status == "conflict"
+
+    rows = [_json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["capacity_by_pool"].append(dict(rows[0]["capacity_by_pool"][0], window_id="other-window"))
+    path.write_text(
+        "".join(_json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReservationCorrupt):
+        QuotaReservationAuthority(path).committed(now_ms=NOW + 2)
+
+
+def test_first_grant_fsyncs_new_store_directory(tmp_path: Path, monkeypatch) -> None:
+    import paulsha_cortex.coordinator.quota_reservation as module
+
+    synced: list[str] = []
+    real = module._fsync_directory
+    monkeypatch.setattr(module, "_fsync_directory", lambda path: (synced.append(str(path)), real(path)))
+    path = tmp_path / "quota-reservations" / "reservations.jsonl"
+    QuotaReservationAuthority(path).reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-fsync", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert str(tmp_path) in synced and str(tmp_path / "quota-reservations") in synced
+
+
+def test_ac1_distinct_windows_of_same_pool_are_accounted_independently(tmp_path: Path) -> None:
+    """多時間窗：同一 pool 的 short／week 兩個 window 各自計帳；short 滿不影響
+    week，反之亦然，且同一 reservation 同時要求兩窗時 all-or-none。"""
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    capacity = {**_cap("1", window_id="short"), **_cap("1", window_id="week")}
+    first = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-short", attempt_id="attempt-1",
+        pools=(_demand("1", window_id="short"),), capacity_by_pool=capacity,
+        observation_version="obs-v1", demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert first.status == "granted"
+    week_only = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-week", attempt_id="attempt-1",
+        pools=(_demand("1", window_id="week"),), capacity_by_pool=capacity,
+        observation_version="obs-v1", demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert week_only.status == "granted"
+    both = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-both", attempt_id="attempt-1",
+        pools=(_demand("1", window_id="short"), _demand("1", window_id="week")),
+        capacity_by_pool=capacity,
+        observation_version="obs-v1", demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert both.status == "denied"
+    assert {row["window_id"] for row in both.denied_pools} == {"short", "week"}
+
+
+def test_ac4_tampered_reserve_row_values_fail_closed(tmp_path: Path) -> None:
+    import json as _json
+
+    for mutate in (
+        lambda row: row["pools"][0].__setitem__("amount", "nan"),
+        lambda row: row.__setitem__("event_at_ms", "bad"),
+        lambda row: row.__setitem__("lease_expires_at_ms", -1),
+    ):
+        path = tmp_path / f"reservations-{id(mutate)}.jsonl"
+        QuotaReservationAuthority(path).reserve(
+            run_id="run-1", card_id="card-1", decision_id="decision-tamper", attempt_id="attempt-1",
+            pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+            demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+        )
+        rows = [_json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        mutate(rows[0])
+        path.write_text(
+            "".join(_json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        with pytest.raises(ReservationCorrupt):
+            QuotaReservationAuthority(path).committed(now_ms=NOW + 1)
+
+
+def test_existing_store_still_fsyncs_directories_before_granting(tmp_path: Path, monkeypatch) -> None:
+    """前一個建立者可能在 O_CREAT 後、目錄 fsync 前崩潰；後續 reserve 看到檔案
+    已存在時仍必須 fsync 目錄，不得依 exists() 跳過。"""
+    import paulsha_cortex.coordinator.quota_reservation as module
+
+    path = tmp_path / "quota-reservations" / "reservations.jsonl"
+    path.parent.mkdir(mode=0o700)
+    path.touch(mode=0o600)
+    synced: list[str] = []
+    real = module._fsync_directory
+    monkeypatch.setattr(module, "_fsync_directory", lambda p: (synced.append(str(p)), real(p)))
+    granted = QuotaReservationAuthority(path).reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-existing", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert granted.status == "granted"
+    assert str(path.parent) in synced
 
 
 def test_ac4_negative_or_non_finite_amount_rejected() -> None:
@@ -724,6 +844,10 @@ def _round_trip_worker(store_path: str, worker_id: int, rounds: int, barriers, r
             lease_ms=60_000, now_ms=NOW,
         )
         outcomes.append(result.status)
+        # 所有 worker 都完成本輪 reserve 之後才釋放；否則快的 worker 先釋放，
+        # 慢的 worker 在同一輪稍後 reserve 就會拿到第三張（容量從未同時超額，
+        # 但「每輪恰好 2 張」的計數會被打亂）。
+        barriers[round_index + rounds].wait(timeout=20)
         if result.status == "granted":
             authority.release(
                 reservation_id=result.reservation_id, owner_token=result.owner_token,
@@ -739,7 +863,8 @@ def test_ac6_fixed_rounds_release_and_reacquire_stays_consistent_across_workers(
     worker_count = 4
     rounds = 3
     context = multiprocessing.get_context("spawn")
-    barriers = [context.Barrier(worker_count) for _ in range(rounds)]
+    # 前 rounds 道 barrier 同步每輪開始，後 rounds 道同步「本輪 reserve 皆完成」。
+    barriers = [context.Barrier(worker_count) for _ in range(rounds * 2)]
     result_queue = context.Queue()
     processes = [
         context.Process(target=_round_trip_worker, args=(store_path, i, rounds, barriers, result_queue))
