@@ -294,3 +294,7 @@ remaining、缺 provenance 的 legacy receipt、needs_human 語意保留、plann
 `decision_projection.current_identity_by_persona_from_steps` 判定當前 attempt：retry-card
 後、新 attempt 尚未寫出 receipt 前，兩條路徑都回 `quota-decision-attempt-superseded`，
 不沿用舊決策（補上前一輪只接到 Monitor provider 的缺口）。
+
+最後一輪審查修正：wait receipt 沒有 step 身分可比對，改以 run 目前的
+`needs_human_reason` 判定是否仍為當前決策——`retry-card` 清除或換成其他理由後，
+舊 wait 一律呈現為 `quota-decision-attempt-superseded`，不再當成目前的等待原因。

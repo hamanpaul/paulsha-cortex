@@ -1074,7 +1074,12 @@ def test_wait_matches_current_card_stays_available(tmp_path: Path) -> None:
         quota_admission={
             "builder": {"decision_id": wait_decision.decision_id, "mode": "enforced", "outcome": "wait"},
         },
-        needs_human_reason=None,
+        # production 的 wait 路徑（`_quota_admission_stop`）一定同時寫入相同理由。
+        needs_human_reason=diagnostic_reason(
+            "quota-admission-insufficient", "所有候選額度不足",
+            source="manager._dispatch_workflow_card:quota-admission",
+            run_id="run-1", card="build-card", attempted_candidates="1",
+        ).to_dict(),
         current_identity_by_persona={
             "builder": {"card": "build-card", "executor": None, "model": None},
         },
@@ -1083,6 +1088,42 @@ def test_wait_matches_current_card_stays_available(tmp_path: Path) -> None:
     persona = projection["personas"]["builder"]
     assert persona["available"] is True
     assert persona["outcome"] == "wait"
+
+
+def test_wait_after_retry_card_clears_reason_is_superseded(tmp_path: Path) -> None:
+    """最後一輪審查 MAJOR：`retry-card` 清掉 needs_human_reason 後、新 attempt
+    尚未寫出 receipt 前，舊 wait 不得仍被呈現為目前決策。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    wait_decision = admission.AdmissionDecision(
+        decision_id="adm:v1:" + "7" * 62 + "3a",
+        run_id="run-1", card_id="build-card", attempt_id="n0",
+        profile_key="quota-admission:no-admissible-candidate",
+        mode="enforced", outcome="wait",
+        policy_version=admission.ADMISSION_POLICY_VERSION,
+        observation_version="not-applicable", demand_version="not-applicable",
+        qualification_version="not-enforced",
+        generated_at_ms=_NOW, selected=None, reservation_id=None,
+        excluded=(), reason="quota-admission-insufficient",
+    )
+    store.record(wait_decision)
+    pointer = {"builder": {"decision_id": wait_decision.decision_id, "mode": "enforced", "outcome": "wait"}}
+    identity = {"builder": {"card": "build-card", "executor": None, "model": None}}
+
+    for cleared_reason in (
+        None,
+        diagnostic_reason(
+            "some-other-reason", "非 quota 的其他等待",
+            source="test", run_id="run-1", card="build-card",
+        ).to_dict(),
+    ):
+        projection = dp.project_workflow_quota_admission(
+            run_id="run-1", quota_admission=pointer, needs_human_reason=cleared_reason,
+            current_identity_by_persona=identity, store=store, now_ms=_NOW,
+        )
+        persona = projection["personas"]["builder"]
+        assert persona["available"] is False
+        assert persona["gap_reason"] == "quota-decision-attempt-superseded"
+        assert "outcome" not in persona
 
 
 def test_wait_pointer_for_superseded_card_is_pending(tmp_path: Path) -> None:

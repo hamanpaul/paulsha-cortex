@@ -270,6 +270,8 @@ class DecisionReadCache:
 def _attempt_mismatch_reason(
     decision: "_quota_admission.AdmissionDecision",
     current_identity: object,
+    *,
+    needs_human_reason: object = None,
 ) -> str | None:
     """判斷已找到的 ``decision`` 是否仍對應這個 persona『目前』在處理的卡。
 
@@ -308,11 +310,17 @@ def _attempt_mismatch_reason(
         return None
     if decision.outcome == "wait":
         # wait 決策從未寫入 step 身分（見 `manager._quota_admission_stop`／
-        # `_quota_admission_config_invalid_stop` 文件字串：全數候選被拒時
-        # 不建立任何 job，`step.executor`／`step.model` 維持原值不變）——
-        # card 相符已是本檢查僅憑 WorkflowRun 既有欄位能拿到的最強訊號；
-        # 同一張卡的第二次 wait 這個更深的世代區分需要 job-count-based
-        # ``attempt_id``（#839 既有語意），不在本檢查範圍內臆測。
+        # `_quota_admission_config_invalid_stop`：全數候選被拒時不建立任何
+        # job），只看身分分不出新舊 attempt。這兩條路徑都同時把 run 標成
+        # needs_human 並寫入同一個 quota 等待理由；`retry-card` 重置時會清掉
+        # needs_human_reason。因此 wait receipt 只有在 run 目前的
+        # needs_human_reason 仍是這筆決策的理由時才算當前——理由已清除或
+        # 換成別的，代表 operator 已重試、新 attempt 尚未寫出 receipt。
+        current_reason = (
+            needs_human_reason.get("reason") if isinstance(needs_human_reason, Mapping) else None
+        )
+        if current_reason != getattr(decision, "reason", None):
+            return "wait-cleared-since-decision"
         return None
     return "unknown-outcome"
 
@@ -326,6 +334,7 @@ def _project_persona_decision(
     store: "_quota_admission.AdmissionDecisionStore",
     cache: DecisionReadCache,
     now_ms: int,
+    needs_human_reason: object = None,
 ) -> dict[str, Any] | None:
     if not isinstance(pointer, Mapping):
         return None
@@ -347,7 +356,9 @@ def _project_persona_decision(
             payload.pop("gap_reason", None)
         return payload
     if current_identity is not _ATTEMPT_CHECK_DISABLED:
-        mismatch_reason = _attempt_mismatch_reason(decision, current_identity)
+        mismatch_reason = _attempt_mismatch_reason(
+            decision, current_identity, needs_human_reason=needs_human_reason
+        )
         if mismatch_reason is not None:
             # 不相符：呈現「目前 attempt 尚無決策」，不得沿用舊 attempt 的
             # mode／outcome／selected（見票面：『不得沿用舊 attempt』）。
@@ -514,6 +525,7 @@ def project_workflow_quota_admission(
                 store=store,
                 cache=resolved_cache,
                 now_ms=now_ms,
+                needs_human_reason=needs_human_reason,
             )
             if projected is not None:
                 personas[persona] = projected
