@@ -103,3 +103,88 @@ canary gate，本票只交付 Cortex 消費端。
   候選）、`tests/test_quota_admission_daemon_wiring_839.py`（新檔：五個
   daemon 呼叫點接線、設定檔載入三態、periodic tick 收斂掃描接線、兩個端到
   端案例）。
+
+- **#839 對抗審查修復（production 接線輪之後，第二輪三個 finding）**：
+  1. **MAJOR（manager.py:13848）**：`reserve_for_candidate()` 的冪等回放
+     （`status == "duplicate"`，代表這個 decision_id 的 reservation 在這次
+     呼叫**之前**就已經存在——可能是另一個 Manager instance 剛贏得的
+     grant）舊實作跟 `granted` 同等對待，若這個 instance 隨後在
+     `create_job()`／provisioning 失敗，會用這個借來的 owner_token 呼叫
+     `release()`，誤釋放另一個仍在使用中的 instance 的 grant。#838
+     `reserve()` 本身無法分辨『這是我方稍早留下的紀錄』還是『別人剛贏的
+     grant』（兩者回傳形狀逐字相同），因此改在 #839 側只認 `status`：只有
+     這次呼叫自己拿到 `granted` 才建立 `quota_reservation_handle`（可信
+     擁有者，後面才安全 release／bind）；`duplicate` 一律視為『別人持有』
+     ——不建 job、不呼叫 release()／bind()，排除該候選換下一個既有排序
+     候選重試，精確等待理由 `quota-admission-attempt-held-elsewhere`
+     （#830 非 Job 決策契約）；這個 attempt 底下卡住的舊 reservation 是否
+     已死，交給既有 `reconcile_reserved_reservations()`／
+     `reconcile_bound_reservations()` 依 lease／job registry 事實判定。
+     以直接呼叫 authority 模擬第二個 Manager instance（比照既有
+     AC3／race-fallback 兩個測試的既有寫法：同一份 reservation authority
+     檔案、先替 dispatch 即將算出的同一個 decision_id reserve）＋
+     monkeypatch `registry.create_job` 一定失敗重現：RED 下該既有
+     reservation 被誤 release 成 `released`；GREEN 下維持 `reserved`、
+     sequence 不動、`registry.create_job` 從未被呼叫。
+  2. **BLOCKER（manager.py:14379）**：spawn 時 429／infra 失敗的即時
+     settle 路徑只呼叫 `settle(outcome="failed")`，沒有像 reconcile 路徑
+     （`on_settled`）一樣呼叫 `QuotaShadowService.record_terminal_usage`
+     記終局 usage——只有 restart 後的 periodic reconcile 掃描才補記，即時
+     路徑漏記。修法：`_quota_admission_record_terminal_usage` 改吃
+     `profile_key` 而非整個 `decision`（兩個呼叫端形狀不同——即時路徑只有
+     `profile_binding.resolved_key`，沒有完整 `AdmissionDecision`），
+     `reconcile_bound_reservations(on_settled=...)` 與 spawn 失敗的即時
+     settle 路徑改共用同一支 helper；settle 成功（`ok`／`duplicate`）才記
+     usage，settle 結構性被拒不記（交給既有 reconcile 依事實判定）。以
+     spy 包一層 `QuotaShadowService.record_terminal_usage` 驗證：RED 下
+     spawn 429 後從未被呼叫；GREEN 下恰好呼叫一次、`profile_key`／
+     `job["id"]` 對得上。另核對三件既有事：reservation ledger 確實
+     `settled(failed)` 並釋回容量（既有測試已覆蓋）、job 仍如實記
+     `status=failed` 且 `provider_outcome.outcome != "quota"`（#826 分類不
+     受影響，既有行為）；`record_executor_backoff_from_job` 只認
+     `RATE_LIMITED`／`QUOTA` outcome，這條 launch-time 例外路徑
+     （`classify_launch_failure`）恆分類為 `LAUNCH_FAILED`／
+     `EXECUTABLE_NOT_FOUND`，本來就不會寫入 #825 backoff——這是 #826
+     既有分類語意（launch() 直接丟例外時還沒有任何 provider 輸出可判斷
+     429／quota），不在本票／#826 範圍內變更；因此「下一次 dispatch 在
+     backoff 期間不選同一候選」對這條路徑不適用（backoff 從未寫入），未
+     另補測試。
+  3. **MAJOR（manager.py:11413）**：enforce 下全部候選被拒時
+     `_quota_admission_stop()` 只標 `needs_human`，沒寫
+     `AdmissionDecisionStore` receipt、也沒更新
+     `WorkflowRun.quota_admission`；`_quota_admission_config_invalid_stop()`
+     （設定無效路徑）同樣沒寫。新增共用 helper
+     `_quota_admission_record_wait_decision()`：兩條路徑都留一筆
+     `outcome="wait"` 的 receipt（沿用 `workflow.QUOTA_ADMISSION_OUTCOMES`
+     既有封閉列舉 `{"admit", "wait"}`，不新增第三種 outcome 值——`wait`
+     語意上已經精確覆蓋『目前沒有可派工的候選』，避免對 #840 receipt 形狀
+     引入未宣告的新狀態），含被排除候選與各自理由（`excluded`）；
+     decision_id 用固定 sentinel profile_key（`quota-admission:no-admissible-candidate`）
+     搭配 `attempt_id` 算出，receipt 冪等（`store.get()` 先查已有紀錄就
+     沿用，不因重送時觀測數字變了就試圖覆寫出矛盾內容）；store 讀寫任何
+     失敗（含罕見併發衝突）一律靜默降級為 `None`，只影響這筆診斷投影，
+     絕不讓已經確定的 fail-closed 派工結果變成派工。
+     `_quota_admission_config_invalid_stop()` 這條路徑用預設路徑新建
+     `AdmissionDecisionStore()`（該路徑收到的是 `QuotaConfigInvalid` 訊號
+     物件，不是 `DispatchContext`，沒有 `.store`；decision receipt 落點
+     `quota_admission_decisions_root()` 本身獨立於壞掉的 quota-pools
+     設定檔，可安全建構）。兩條路徑都在同一次
+     `registry._manager_update_workflow_run()` 呼叫內一併更新
+     `facets`／`needs_human_reason`／`quota_admission[persona]`。以
+     git-show 還原 production 檔重跑新測試確認 RED（receipt 不存在／
+     `updated_run.quota_admission` 為 `None`），修復後 GREEN。
+  - 未動候選排序／runtime preflight／pin／independence／Trust Root／品質
+    規則；`WorkflowRun.quota_admission[persona]` 既有欄位形狀
+    （`decision_id`／`mode`／`outcome`）與 `monitor/providers.py` 白名單
+    皆未變動，`workflow._validate_quota_admission()` 既有封閉鍵集合
+    （`{"decision_id", "mode", "outcome"}`）與既有 `QUOTA_ADMISSION_OUTCOMES`
+    列舉沿用不擴充——receipt 形狀對 #840（status 投影）只做加法，不改
+    既有欄位名稱或意義。
+  - 新增 3 個測試（`tests/test_quota_admission_dispatch_wiring_839.py`）：
+    `test_duplicate_reservation_from_concurrent_manager_is_never_released_on_failure`
+    （MAJOR 1）；`test_spawn_time_429_after_bind_settles_failed_and_frees_capacity`
+    擴充終局 usage spy 斷言（BLOCKER 2）；
+    `test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason`
+    擴充 receipt／quota_admission 投影斷言（MAJOR 3）。三者皆先以
+    `git show HEAD:paulsha_cortex/coordinator/manager.py` 暫還原
+    production 檔確認 RED，復原修法後轉 GREEN。

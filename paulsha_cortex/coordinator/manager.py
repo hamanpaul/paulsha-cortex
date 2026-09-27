@@ -11410,18 +11410,83 @@ def _evaluate_quota_admission_candidate(
     return assessment, demand_version
 
 
-def _quota_admission_stop(registry, run, step, *, attempts: Sequence[Mapping[str, object]]):
+#: `_quota_admission_stop`／`_quota_admission_config_invalid_stop` 共用：
+#: 聚合『這個 attempt 目前沒有任何候選可派工』的 decision，不對應單一候選
+#: 的 profile_key，因此固定用一個不會與任何真實 execution profile
+#: resolved_key 撞名的 sentinel 字串（見 `_quota_admission_record_wait_decision`）。
+_QUOTA_ADMISSION_NO_CANDIDATE_PROFILE_KEY = "quota-admission:no-admissible-candidate"
+
+
+def _quota_admission_record_wait_decision(
+    store, *, registry, run, step, identities: "IdentityRegistry", reason: str,
+    excluded: Sequence[Mapping[str, object]] = (),
+) -> dict[str, str] | None:
+    """#839 對抗審查修復第二輪（MAJOR manager.py:11413）：全部候選被拒
+    （`_quota_admission_stop`）或設定本身無效（`_quota_admission_config_invalid_stop`）
+    時，也留一筆耐久 decision receipt——比照既有 admit 分支的形狀，只是
+    `outcome` 換成 `workflow.QUOTA_ADMISSION_OUTCOMES` 已有的 `wait`（沿用
+    既有封閉列舉，不新增第三種 outcome，維持 #840 只做加法的 receipt 形狀
+    契約）。
+
+    receipt 冪等：同一個 attempt_id 只留『第一次』觀察到的拒絕快照——
+    `store.get()` 先查已有紀錄就直接沿用，不因為之後重送時（例如 periodic
+    tick 對同一個仍卡在等待的 attempt 反覆重試）觀測數字變了就試圖覆寫出
+    矛盾內容（`AdmissionDecisionStore.record()` 對同 decision_id、不同內容
+    視為衝突，見該類別文件字串）。store 讀寫任何失敗（含罕見的併發衝突）
+    一律靜默降級為 `None`——這筆 receipt 只是診斷投影／稽核紀錄，store 失敗
+    絕不能回頭把已經確定的 fail-closed 派工結果改成派工（票面：「store 寫入
+    失敗仍 fail closed 不派工」）。"""
+    from . import quota_admission
+
+    try:
+        attempt_id = _quota_admission_attempt_id(registry, run, step)
+        decision_id = quota_admission.decision_id_for(
+            run_id=run.run_id, card_id=step.card, attempt_id=attempt_id,
+            profile_key=_QUOTA_ADMISSION_NO_CANDIDATE_PROFILE_KEY,
+        )
+        existing = store.get(decision_id)
+        if existing is None:
+            decision = quota_admission.AdmissionDecision(
+                decision_id=decision_id, run_id=run.run_id, card_id=step.card,
+                attempt_id=attempt_id, profile_key=_QUOTA_ADMISSION_NO_CANDIDATE_PROFILE_KEY,
+                mode="enforced", outcome="wait",
+                policy_version=quota_admission.ADMISSION_POLICY_VERSION,
+                observation_version="not-applicable", demand_version="not-applicable",
+                qualification_version=_quota_admission_qualification_version(run, identities),
+                generated_at_ms=int(time.time() * 1000),
+                selected=None, reservation_id=None,
+                excluded=tuple(excluded), reason=reason,
+            )
+            store.record(decision)
+        return {"decision_id": decision_id, "mode": "enforced", "outcome": "wait"}
+    except Exception:
+        return None
+
+
+def _quota_admission_stop(
+    registry, run, step, *, attempts: Sequence[Mapping[str, object]],
+    quota_admission_context, identities: "IdentityRegistry",
+):
     """所有候選皆額度不可行（opt-in enforce）：zero job，回精確 wait 理由。
 
     比照 `_workflow_execution_profile_stop`——在建立任何 job／worktree 之前
     fail-closed，不造假 job_id，`classify_dispatch_result` 會把這個回傳值
-    投影成 `decision` 而非 `job`（#830 契約）。"""
+    投影成 `decision` 而非 `job`（#830 契約）。
+
+    對抗審查修復（MAJOR manager.py:11413）：拒絕也要留一筆
+    `AdmissionDecisionStore` receipt（含被排除候選與各自理由）並更新
+    `WorkflowRun.quota_admission[persona]`——舊實作只標 `needs_human`，
+    完全沒有留下任何額度層自己的證據，`cortex work show` 讀不到『這次是
+    因為額度被拒』，只能看見人類可讀的 needs_human_reason 文字。"""
 
     detail_reasons = sorted({str(item.get("exclusion_reason")) for item in attempts})
-    updated = registry._manager_update_workflow_run(
-        run.run_id,
-        facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
-        needs_human_reason=diagnostic_reason(
+    quota_admission_projection = _quota_admission_record_wait_decision(
+        quota_admission_context.store, registry=registry, run=run, step=step,
+        identities=identities, reason="quota-admission-insufficient", excluded=attempts,
+    )
+    update_kwargs: dict[str, object] = {
+        "facets": tuple(dict.fromkeys((*run.facets, "needs_human"))),
+        "needs_human_reason": diagnostic_reason(
             "quota-admission-insufficient",
             "quota-aware admission 判定所有候選目前額度不足或未知，暫停派工："
             f"{', '.join(detail_reasons) or 'no-candidate'}",
@@ -11431,7 +11496,12 @@ def _quota_admission_stop(registry, run, step, *, attempts: Sequence[Mapping[str
             card=step.card,
             attempted_candidates=str(len(attempts)),
         ),
-    )
+    }
+    if quota_admission_projection is not None:
+        update_kwargs["quota_admission"] = {
+            **(run.quota_admission or {}), step.persona: quota_admission_projection,
+        }
+    updated = registry._manager_update_workflow_run(run.run_id, **update_kwargs)
     return {
         "run_id": updated.run_id,
         "current_phase": updated.current_phase,
@@ -11440,15 +11510,31 @@ def _quota_admission_stop(registry, run, step, *, attempts: Sequence[Mapping[str
     }
 
 
-def _quota_admission_config_invalid_stop(registry, run, step, *, detail: str):
+def _quota_admission_config_invalid_stop(
+    registry, run, step, *, detail: str, identities: "IdentityRegistry",
+):
     """production 接線 a：operator quota-pools 設定檔存在但無效，且 opt-in
     enforce 已開——zero job，回精確 `quota-config-invalid` 等待理由（#830
     非 Job 決策契約，比照 `_quota_admission_stop`／`_workflow_execution_profile_stop`
-    的 fail-closed 形狀，但用獨立的理由字串，不與『額度不足』混用）。"""
-    updated = registry._manager_update_workflow_run(
-        run.run_id,
-        facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
-        needs_human_reason=diagnostic_reason(
+    的 fail-closed 形狀，但用獨立的理由字串，不與『額度不足』混用）。
+
+    對抗審查修復（MAJOR manager.py:11413）：這條路徑同樣留一筆 receipt——
+    用預設路徑新建一個 `AdmissionDecisionStore()`（`quota_admission_context`
+    在這裡是 `quota_admission.QuotaConfigInvalid` 訊號物件，不是
+    `DispatchContext`，沒有 `.store` 可用；decision receipt 的落點
+    （`quota_admission_decisions_root()`）本身獨立於這份壞掉的 quota-pools
+    設定檔，可以安全建構）。能寫就寫，store 寫入失敗仍維持 fail closed，不
+    派工。"""
+    from . import quota_admission
+
+    quota_admission_projection = _quota_admission_record_wait_decision(
+        quota_admission.AdmissionDecisionStore(), registry=registry, run=run, step=step,
+        identities=identities, reason="quota-config-invalid",
+        excluded=({"exclusion_reason": "quota-config-invalid", "detail": detail},),
+    )
+    update_kwargs: dict[str, object] = {
+        "facets": tuple(dict.fromkeys((*run.facets, "needs_human"))),
+        "needs_human_reason": diagnostic_reason(
             "quota-config-invalid",
             f"operator quota-pools 設定檔存在但無效，opt-in enforce 已開，"
             f"fail closed 暫停派工：{detail}",
@@ -11457,7 +11543,12 @@ def _quota_admission_config_invalid_stop(registry, run, step, *, detail: str):
             work_id=run.work_id,
             card=step.card,
         ),
-    )
+    }
+    if quota_admission_projection is not None:
+        update_kwargs["quota_admission"] = {
+            **(run.quota_admission or {}), step.persona: quota_admission_projection,
+        }
+    updated = registry._manager_update_workflow_run(run.run_id, **update_kwargs)
     return {
         "run_id": updated.run_id,
         "current_phase": updated.current_phase,
@@ -11535,13 +11626,19 @@ def _quota_admission_job_view_for_terminal_usage(job: Mapping[str, object]) -> d
 
 
 def _quota_admission_record_terminal_usage(
-    quota_ctx, *, decision, job: Mapping[str, object], now_ms: int
+    quota_ctx, *, profile_key: str, job: Mapping[str, object], now_ms: int
 ) -> None:
-    """`quota_admission.reconcile_bound_reservations(on_settled=...)` 的
-    callback：job 終局時，若這個 decision 的 profile_key 在某個已知 binding
-    上『可解析』（``binding_status`` 為 ``complete`` 且該 binding 確實涵蓋
-    這個 profile），就記一筆終局 usage；不可解析（unmanaged／不完整
-    binding）時安靜略過，不擋容量釋放（釋放已經由呼叫端完成）。
+    """job 終局時（不論成功／失敗）記一筆終局 usage 的共用 helper——
+    `quota_admission.reconcile_bound_reservations(on_settled=...)`（restart
+    後 periodic tick 的收斂掃描）與 spawn 時 429／infra 失敗的即時 settle
+    路徑（`_dispatch_workflow_card` 的 launch 例外處理）共用同一支函式，不
+    能只有前者記得住終局 usage、後者卻漏記（對抗審查第二輪 BLOCKER
+    manager.py:14379）。
+
+    若 ``profile_key`` 在某個已知 binding 上『可解析』（``binding_status``
+    為 ``complete`` 且該 binding 確實涵蓋這個 profile），就記一筆終局
+    usage；不可解析（unmanaged／不完整 binding）時安靜略過，不擋容量釋放
+    （釋放本身已經由呼叫端各自的 settle／reconcile 完成）。
 
     逐一嘗試 ``quota_ctx.bindings`` 而不先自行判斷『這個 binding 是否匹配
     這個 profile』——``record_terminal_usage`` 本身已經對不匹配／不完整的
@@ -11549,7 +11646,6 @@ def _quota_admission_record_terminal_usage(
     binding subject 比對規則（#839 契約邊界：不重驗、只消費）。"""
     from . import quota_admission
 
-    profile_key = decision.profile_key
     pool_windows = quota_admission.pools_for_profile(profile_key, bindings=quota_ctx.bindings)
     if not pool_windows:
         return  # 這個 profile 不受額度管理，沒有任何 binding 可解析。
@@ -11612,7 +11708,8 @@ def reconcile_quota_admission_reservations(
         now_ms=resolved_now_ms,
         renew_lease_ms=quota_admission_context.lease_ms,
         on_settled=lambda decision, job: _quota_admission_record_terminal_usage(
-            quota_admission_context, decision=decision, job=job, now_ms=resolved_now_ms,
+            quota_admission_context, profile_key=decision.profile_key, job=job,
+            now_ms=resolved_now_ms,
         ),
     )
     return {
@@ -13304,7 +13401,7 @@ def _dispatch_workflow_card(
             # 不重用 `_quota_admission_stop`（那支的訊息語意是「額度不足」，
             # 這裡是「設定本身不可信」，兩者不該共用同一個等待理由字串）。
             return _quota_admission_config_invalid_stop(
-                registry, run, step, detail=quota_admission_context.reason
+                registry, run, step, detail=quota_admission_context.reason, identities=identities,
             )
     admission_stop = _builder_todo_admission_stop(
         registry=registry,
@@ -13696,7 +13793,10 @@ def _dispatch_workflow_card(
                 if (candidate.executor, candidate.model_id) not in excluded_quota_identities
             )
             if not quota_loop_candidates:
-                return _quota_admission_stop(registry, run, step, attempts=quota_admission_attempts)
+                return _quota_admission_stop(
+                    registry, run, step, attempts=quota_admission_attempts,
+                    quota_admission_context=quota_admission_context, identities=identities,
+                )
             try:
                 gate = _runtime_preflight_gate(
                     run,
@@ -13810,7 +13910,10 @@ def _dispatch_workflow_card(
             if forced_gate is not None or forced_identity is not None:
                 # provider-failure reroute 的既有單一候選語意：那條路徑已經是別的
                 # 機制核可的替代候選，不在這裡繼續往下換第三個候選。
-                return _quota_admission_stop(registry, run, step, attempts=quota_admission_attempts)
+                return _quota_admission_stop(
+                    registry, run, step, attempts=quota_admission_attempts,
+                    quota_admission_context=quota_admission_context, identities=identities,
+                )
             excluded_quota_identities.add((identity.executor, identity.model_id))
             continue
         # shadow 模式：無論可不可行都繼續（只記錄，不改既有派工結果）。
@@ -13845,7 +13948,9 @@ def _dispatch_workflow_card(
             demand_version=quota_demand_version,
             lease_ms=quota_admission_context.lease_ms, now_ms=quota_now_ms,
         )
-        if reservation_result.status in ("granted", "duplicate"):
+        if reservation_result.status == "granted":
+            # 只有這次呼叫**新建立**的 grant，這個 Manager instance 才是唯一
+            # 可信的擁有者——後面對它呼叫 release()／bind() 才安全。
             quota_reservation_handle = {
                 "reservation_id": reservation_result.reservation_id,
                 "owner_token": reservation_result.owner_token,
@@ -13853,9 +13958,43 @@ def _dispatch_workflow_card(
                 "attempt_id": quota_attempt_id,
             }
             break
-        # race 落敗（denied）或呼叫本身不合法（invalid）：這個候選剛剛還可行，
-        # 現在搶不到——排除、換下一個既有排序候選重試；沒有其他候選時最終在
-        # 迴圈頂端回精確 wait，不造假 job、不留半額度。
+        if reservation_result.status == "duplicate":
+            # #839 對抗審查修復第二輪（MAJOR manager.py:13848）：`duplicate`
+            # 代表這個 decision_id 的 reservation 在**這次呼叫之前**就已經
+            # 存在——#838 reserve() 的冪等回放無法分辨「這是我方稍早留下的
+            # 紀錄」還是「另一個 Manager instance 剛剛才贏得的 grant」，兩者
+            # 回傳形狀（owner_token／sequence／state）逐字相同。這次 for-loop
+            # 迭代從未替這個 decision_id 呼叫過 reserve()，因此永遠不是這個
+            # grant 的建立者——舊實作把 `duplicate` 跟 `granted` 同等對待，
+            # 若這個 instance 隨後在 create_job()／provisioning 失敗，就會
+            # 用這個借來的 owner_token 呼叫 release()，誤釋放另一個仍在使用
+            # 中的 instance 的 grant。
+            #
+            # 一律把 `duplicate` 當成『別人持有』：不建立
+            # quota_reservation_handle（因此後面永遠不會對它呼叫
+            # release()／bind()），不建 job，換下一個既有排序候選；這個
+            # attempt 底下卡住的舊 reservation 是否已經是死掉的殘留，交給
+            # periodic tick 的 `reconcile_reserved_reservations()`／
+            # `reconcile_bound_reservations()` 依 lease／job registry 事實
+            # 判定，不由這裡的即時派工路徑猜測身分（見 #830 非 Job 決策契約）。
+            quota_admission_attempts[-1] = {
+                **quota_admission_attempts[-1],
+                "exclusion_reason": "quota-admission-attempt-held-elsewhere",
+            }
+            quota_selected_assessment = None
+            quota_selected_demand_version = None
+            quota_attempt_id = None
+            quota_decision_id = None
+            if forced_gate is not None or forced_identity is not None:
+                return _quota_admission_stop(
+                    registry, run, step, attempts=quota_admission_attempts,
+                    quota_admission_context=quota_admission_context, identities=identities,
+                )
+            excluded_quota_identities.add((identity.executor, identity.model_id))
+            continue
+        # race 落敗（denied）或呼叫本身不合法（invalid／conflict）：這個候選
+        # 剛剛還可行，現在搶不到——排除、換下一個既有排序候選重試；沒有其他
+        # 候選時最終在迴圈頂端回精確 wait，不造假 job、不留半額度。
         quota_admission_attempts[-1] = {
             **quota_admission_attempts[-1],
             "exclusion_reason": f"reservation-{reservation_result.status}",
@@ -13867,7 +14006,10 @@ def _dispatch_workflow_card(
         if forced_gate is not None or forced_identity is not None:
             # provider-failure reroute 的既有單一候選語意：那條路徑已經是別的
             # 機制核可的替代候選，不在這裡繼續往下換第三個候選。
-            return _quota_admission_stop(registry, run, step, attempts=quota_admission_attempts)
+            return _quota_admission_stop(
+                registry, run, step, attempts=quota_admission_attempts,
+                quota_admission_context=quota_admission_context, identities=identities,
+            )
         excluded_quota_identities.add((identity.executor, identity.model_id))
     # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
     # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
@@ -14352,7 +14494,7 @@ def _dispatch_workflow_card(
                 )
         return attached_job
     except BaseException as launch_exc:
-        registry.update_headless_result(
+        updated_job = registry.update_headless_result(
             str(job["job_id"]),
             status="failed",
             exit_code=1,
@@ -14376,7 +14518,7 @@ def _dispatch_workflow_card(
             # 記消耗但不對品質下判斷（那是既有 provider_outcome 分類的責任）。
             from . import quota_admission
 
-            quota_admission.settle_reservation_after_spawn_failure(
+            settle_result = quota_admission.settle_reservation_after_spawn_failure(
                 quota_admission_context.authority,
                 reservation_id=quota_reservation_handle["reservation_id"],
                 owner_token=quota_reservation_handle["owner_token"],
@@ -14385,6 +14527,21 @@ def _dispatch_workflow_card(
                 now_ms=int(time.time() * 1000),
                 note=summarize_exception(launch_exc)[:200],
             )
+            if settle_result.status in ("ok", "duplicate"):
+                # #839 對抗審查修復第二輪（BLOCKER manager.py:14379）：settle
+                # 成功之後這個 attempt 的額度消耗已經確定發生過——和 reconcile
+                # 路徑的 `on_settled` 共用同一個
+                # `_quota_admission_record_terminal_usage` helper 記終局
+                # usage，不能只有 restart 後的 periodic reconcile 掃描才記得
+                # 住，即時 settle 這裡卻漏記。settle 本身結構性被拒
+                # （conflict／invalid，例如 bind 前就已經被別的路徑
+                # release／reconcile 過）時不記 usage——那種情況下這次消耗
+                # 是否真的發生過已經不是這裡能確定的事，交給既有 reconcile
+                # 掃描依 job registry 事實判定。
+                _quota_admission_record_terminal_usage(
+                    quota_admission_context, profile_key=profile_binding.resolved_key,
+                    job=updated_job, now_ms=int(time.time() * 1000),
+                )
         if planner_sandbox is not None:
             shutil.rmtree(planner_sandbox, ignore_errors=True)
         if reviewer_sandbox is not None:

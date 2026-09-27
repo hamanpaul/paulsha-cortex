@@ -79,23 +79,39 @@ independence、#842 qualification）**之後**，疊上一層「這個已核可�
 pool/window 是 `sufficient`／`insufficient`／`unknown`（同池換 model 不算恢復；
 短窗夠、週窗不足一樣視為不可行），只替**目前選中**的那一個候選原子預留
 （`quota_reservation.reserve_for_candidate`），成功才繼續 provisioning／
-spawn；race 落敗或額度不可行時，`manager._dispatch_workflow_card` 會換下一個
-既有排序候選重試（沿用 `_runtime_preflight_gate`／`_select_workflow_identity`
-既有機制，不重建候選池），全部候選皆不可行才回精確 wait 理由，不建立任何
-job、不留半額度。
+spawn；race 落敗、額度不可行，或 `reserve()` 回報這個 decision_id 的 grant
+在這次呼叫**之前**就已經存在（`duplicate`——可能是另一個 Manager instance
+剛贏得的 grant，這次呼叫從未替它 reserve 過，因此永遠不是它的擁有者）時，
+`manager._dispatch_workflow_card` 都會排除該候選、換下一個既有排序候選重試
+（沿用 `_runtime_preflight_gate`／`_select_workflow_identity` 既有機制，不
+重建候選池）；`duplicate` 一律精確等待（`quota-admission-attempt-held-elsewhere`），
+不建 job、也不對它呼叫 `release()`／`bind()`——只有這次呼叫自己拿到
+`granted` 的候選才是可信擁有者，避免誤釋放別的 instance 仍在用的 grant。
+全部候選皆不可行才回精確 wait 理由，不建立任何 job、不留半額度。
 
 Reservation 的 `reserve → create_job → bind(job_id) → spawn` 順序嚴格對應
 #838 現行協定：job 記錄一旦建立即 `bind()`，之後只能經 `settle()`（含派工時
 429／infra 失敗）或 `reconcile()` 結束；job 記錄建立前失敗才用
-`release(reason="fail-before-spawn")`。`reconcile_bound_reservations()`
-另外提供 restart／crash 後的收斂掃描——job registry 查不到時一律
-`inconclusive`（不因為查不到就假設已終止並釋放額度），只有確認終局才釋放。
+`release(reason="fail-before-spawn")`。settle 之後（不論成功或失敗）與
+periodic reconcile 收斂 `bound` reservation 一樣，共用同一個
+`_quota_admission_record_terminal_usage` helper 呼叫
+`QuotaShadowService.record_terminal_usage()` 記終局 usage——spawn 時 429／
+infra 失敗不必等到 restart 後的 reconcile 掃描才補記消耗；settle 本身結構性
+被拒（例如 bind 前就已經被別的路徑處理過）時不記，交給既有 reconcile 依
+job registry 事實判定。`reconcile_bound_reservations()` 另外提供
+restart／crash 後的收斂掃描——job registry 查不到時一律 `inconclusive`
+（不因為查不到就假設已終止並釋放額度），只有確認終局才釋放。
 
 每個 decision 都有耐久、append-only 的 receipt（`AdmissionDecisionStore`，
 已登記於 Trust Root），綁定 `run_id`／`card_id`／`attempt_id`／`profile_key`
 與 qualification／observation／demand／policy 版本，以及被排除候選與理由；
-同一個 attempt 重送冪等回放，不會二次扣款或搬活 job。#837 operational usage
-forecast 尚未落地前，demand 只用明確標示版本的 fixture
+同一個 attempt 重送冪等回放，不會二次扣款或搬活 job。全部候選皆不可行
+（enforce 下的 `quota-admission-insufficient`）或 quota-pools 設定檔本身
+無效（`quota-config-invalid`）時，同樣留一筆 outcome `wait` 的 receipt 並更新
+`WorkflowRun.quota_admission[persona]` 投影——不再只標 `needs_human`；receipt
+冪等（同一個 attempt 只留第一次觀察到的拒絕快照），store 讀寫失敗一律靜默
+降級，絕不會讓已經確定的 fail-closed 派工結果變成派工。#837 operational
+usage forecast 尚未落地前，demand 只用明確標示版本的 fixture
 （`DEMAND_FIXTURE_VERSION`），receipt 上的 `demand_version` 因此可精確分辨
 「這是 fixture」還是「這是真預測」。
 

@@ -482,3 +482,16 @@ def test_end_to_end_enforce_invalid_config_fails_closed_via_daemon_path(
     assert registry.list_jobs() == []
     updated_run = registry.get_workflow_run(run.run_id)
     assert "needs_human" in updated_run.facets
+
+    # 對抗審查第二輪 MAJOR（manager.py:11413）：quota-config-invalid 路徑
+    # 同樣要留一筆 decision receipt 並更新 WorkflowRun.quota_admission
+    # 投影——不再只標 needs_human。
+    assert updated_run.quota_admission is not None
+    projection = updated_run.quota_admission["builder"]
+    assert projection["mode"] == "enforced"
+    assert projection["outcome"] == "wait"
+    store = quota_admission.AdmissionDecisionStore()
+    decision = store.get(projection["decision_id"])
+    assert decision is not None
+    assert decision.outcome == "wait"
+    assert decision.reason == "quota-config-invalid"
