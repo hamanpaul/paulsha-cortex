@@ -613,6 +613,72 @@ def test_systemctl_effective_dropin_paths_override_user_unit_fragment(
     assert "hidden-systemd-value" not in json.dumps(probe)
 
 
+def test_systemctl_show_parses_real_property_order_and_multi_environment_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """live 驗收回歸：真實 `systemctl --user show` 依 systemd 內部順序輸出，
+    `Id=` 在區塊中間（不是第一行），且每個 EnvironmentFile 各佔一行
+    `EnvironmentFiles=`。parser 不得因 Id 位置丟掉前面的 ExecStart／
+    Environment／EnvironmentFiles／WorkingDirectory，也不得把多值
+    EnvironmentFiles 視為重複鍵；其他鍵重複仍標 malformed。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex import runtime_attestation
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home = tmp_path / "home"
+    units_dir = home / ".config" / "systemd" / "user"
+    units_dir.mkdir(parents=True)
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "cortex.env").write_text("PSC_SHARED=one\n", encoding="utf-8")
+    (env_dir / "cortex-manager.env").write_text("PSC_MANAGER_ONLY=two\n", encoding="utf-8")
+    pin = tmp_path / "pin"
+
+    def block(unit: str) -> str:
+        fragment = units_dir / unit
+        fragment.write_text("[Service]\nExecStart=/usr/bin/true\n", encoding="utf-8")
+        return (
+            "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env PYTHONPATH="
+            f"{pin} /usr/bin/python3 -m paulsha_cortex.monitor ; ignore_errors=no ; "
+            "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n"
+            "Environment=PSC_INLINE=three\n"
+            f"EnvironmentFiles={env_dir / 'cortex.env'} (ignore_errors=yes)\n"
+            f"EnvironmentFiles={env_dir / 'cortex-manager.env'} (ignore_errors=yes)\n"
+            "WorkingDirectory=/\nMainPID=4242\n"
+            f"Id={unit}\nLoadState=loaded\nActiveState=active\nSubState=running\n"
+            f"FragmentPath={fragment}\nDropInPaths=\n"
+        )
+
+    show_output = "\n".join(
+        block(name) for name in ("test-manager.service", "test-manager.timer", "test-monitor.service")
+    )
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+    monkeypatch.setattr(
+        _runtime_probe.subprocess, "run",
+        lambda argv, **_kwargs: SimpleNamespace(returncode=0, stdout=show_output),
+    )
+    rows = _runtime_probe._probe_units_raw("test", home=home)
+    manager = rows["test-manager.service"]["systemd"]
+    for key in ("ExecStart", "Environment", "EnvironmentFiles", "WorkingDirectory", "MainPID"):
+        assert key in manager, key
+    assert "_malformed" not in manager
+    overlay = runtime_attestation.service_environment_overlay(rows, instance="test")
+    assert overlay["manager"]["environment_source"] == "systemd-effective"
+    environment = overlay["manager"]["environment"]
+    assert environment.get("PSC_SHARED") == "one"
+    assert environment.get("PSC_MANAGER_ONLY") == "two"
+    assert environment.get("PSC_INLINE") == "three"
+
+    duplicated = show_output.replace("WorkingDirectory=/\n", "WorkingDirectory=/\nWorkingDirectory=/tmp\n", 1)
+    monkeypatch.setattr(
+        _runtime_probe.subprocess, "run",
+        lambda argv, **_kwargs: SimpleNamespace(returncode=0, stdout=duplicated),
+    )
+    rows = _runtime_probe._probe_units_raw("test", home=home)
+    assert rows["test-manager.service"]["systemd"].get("_malformed") is True
+
+
 def test_systemd_not_found_units_fall_back_to_unit_files_not_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

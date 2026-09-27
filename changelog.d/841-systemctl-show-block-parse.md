@@ -1,0 +1,1 @@
+- #841 loaded runtime attestation live 驗收修正：`systemctl --user show` 的輸出依 systemd 內部順序排列，`Id=` 位於區塊中間；parser 改為先以空行切區塊再找 Id，不再丟掉排在 Id 前面的 ExecStart／Environment／EnvironmentFiles／WorkingDirectory（真實 service 先前因此永遠被判成 `environment_source=unknown`、讀不到 loaded receipt）；多值的 `EnvironmentFiles`（每個檔案一行）改為串接，其他鍵重複仍標 malformed。
