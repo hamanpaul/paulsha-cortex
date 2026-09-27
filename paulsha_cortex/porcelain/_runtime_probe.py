@@ -24,6 +24,9 @@ _SHOW_PROPERTIES = (
     "WorkingDirectory",
 )
 
+#: `systemctl show` 對這些屬性的每個值各輸出一行 `Key=value`（不是重複宣告）。
+_MULTI_VALUED_SHOW_PROPERTIES = frozenset({"EnvironmentFiles"})
+
 
 def _installed_version() -> str:
     try:
@@ -51,32 +54,39 @@ def _systemctl_unit_rows(unit_names: tuple[str, ...]) -> dict[str, dict[str, Any
         return {}
     if raw.returncode != 0:
         return {}
+    # `systemctl show` 以空行分隔各 unit 的區塊，區塊內屬性依 systemd 內部順序
+    # 輸出——`Id=` 通常在中間，不是第一行（live 驗收發現：舊 parser 以 `Id=`
+    # 當區塊起點，丟掉排在它前面的 ExecStart／Environment／EnvironmentFiles／
+    # WorkingDirectory，真實 service 因此永遠被判成 unknown）。因此先切區塊、
+    # 再在區塊內找 Id。多值屬性（每個值各佔一行，例如每個 EnvironmentFile 一行
+    # `EnvironmentFiles=`）以空白串接成單一字串，交給既有逐項解析；其他鍵重複
+    # 仍視為輸出格式異常。
     rows: dict[str, dict[str, Any]] = {}
-    current: dict[str, Any] = {}
-    current_id: str | None = None
+    block: dict[str, Any] = {}
 
-    def save_current() -> None:
-        nonlocal current, current_id
-        if current_id is not None:
-            rows[current_id] = dict(current)
-        current = {}
-        current_id = None
+    def save_block() -> None:
+        nonlocal block
+        unit_id = block.get("Id")
+        if isinstance(unit_id, str) and unit_id:
+            rows[unit_id] = dict(block)
+        block = {}
 
     for line in raw.stdout.splitlines():
         if not line.strip():
-            save_current()
+            save_block()
             continue
         key, separator, value = line.partition("=")
         if not separator:
             continue
         key = key.strip()
-        if key == "Id":
-            save_current()
-            current_id = value
-        if key in current:
-            current["_malformed_show_output"] = True
-        current[key] = value
-    save_current()
+        if key in block:
+            if key in _MULTI_VALUED_SHOW_PROPERTIES:
+                previous = block[key]
+                block[key] = f"{previous} {value}".strip() if previous else value
+                continue
+            block["_malformed_show_output"] = True
+        block[key] = value
+    save_block()
     return rows
 
 

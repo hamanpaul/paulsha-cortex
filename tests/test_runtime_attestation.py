@@ -17,6 +17,7 @@ from paulsha_cortex.runtime_attestation import (
     compare_runtime_state,
     configuration_revision,
     manager_configuration_snapshot,
+    manager_declared_invocation_revision,
     inspect_runtime_state,
     record_config_reload,
     record_runtime_startup,
@@ -613,6 +614,72 @@ def test_systemctl_effective_dropin_paths_override_user_unit_fragment(
     assert "hidden-systemd-value" not in json.dumps(probe)
 
 
+def test_systemctl_show_parses_real_property_order_and_multi_environment_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """live 驗收回歸：真實 `systemctl --user show` 依 systemd 內部順序輸出，
+    `Id=` 在區塊中間（不是第一行），且每個 EnvironmentFile 各佔一行
+    `EnvironmentFiles=`。parser 不得因 Id 位置丟掉前面的 ExecStart／
+    Environment／EnvironmentFiles／WorkingDirectory，也不得把多值
+    EnvironmentFiles 視為重複鍵；其他鍵重複仍標 malformed。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex import runtime_attestation
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home = tmp_path / "home"
+    units_dir = home / ".config" / "systemd" / "user"
+    units_dir.mkdir(parents=True)
+    env_dir = tmp_path / "env"
+    env_dir.mkdir()
+    (env_dir / "cortex.env").write_text("PSC_SHARED=one\n", encoding="utf-8")
+    (env_dir / "cortex-manager.env").write_text("PSC_MANAGER_ONLY=two\n", encoding="utf-8")
+    pin = tmp_path / "pin"
+
+    def block(unit: str) -> str:
+        fragment = units_dir / unit
+        fragment.write_text("[Service]\nExecStart=/usr/bin/true\n", encoding="utf-8")
+        return (
+            "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env PYTHONPATH="
+            f"{pin} /usr/bin/python3 -m paulsha_cortex.monitor ; ignore_errors=no ; "
+            "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n"
+            "Environment=PSC_INLINE=three\n"
+            f"EnvironmentFiles={env_dir / 'cortex.env'} (ignore_errors=yes)\n"
+            f"EnvironmentFiles={env_dir / 'cortex-manager.env'} (ignore_errors=yes)\n"
+            "WorkingDirectory=/\nMainPID=4242\n"
+            f"Id={unit}\nLoadState=loaded\nActiveState=active\nSubState=running\n"
+            f"FragmentPath={fragment}\nDropInPaths=\n"
+        )
+
+    show_output = "\n".join(
+        block(name) for name in ("test-manager.service", "test-manager.timer", "test-monitor.service")
+    )
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+    monkeypatch.setattr(
+        _runtime_probe.subprocess, "run",
+        lambda argv, **_kwargs: SimpleNamespace(returncode=0, stdout=show_output),
+    )
+    rows = _runtime_probe._probe_units_raw("test", home=home)
+    manager = rows["test-manager.service"]["systemd"]
+    for key in ("ExecStart", "Environment", "EnvironmentFiles", "WorkingDirectory", "MainPID"):
+        assert key in manager, key
+    assert "_malformed" not in manager
+    overlay = runtime_attestation.service_environment_overlay(rows, instance="test")
+    assert overlay["manager"]["environment_source"] == "systemd-effective"
+    environment = overlay["manager"]["environment"]
+    assert environment.get("PSC_SHARED") == "one"
+    assert environment.get("PSC_MANAGER_ONLY") == "two"
+    assert environment.get("PSC_INLINE") == "three"
+
+    duplicated = show_output.replace("WorkingDirectory=/\n", "WorkingDirectory=/\nWorkingDirectory=/tmp\n", 1)
+    monkeypatch.setattr(
+        _runtime_probe.subprocess, "run",
+        lambda argv, **_kwargs: SimpleNamespace(returncode=0, stdout=duplicated),
+    )
+    rows = _runtime_probe._probe_units_raw("test", home=home)
+    assert rows["test-manager.service"]["systemd"].get("_malformed") is True
+
+
 def test_systemd_not_found_units_fall_back_to_unit_files_not_unknown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1042,6 +1109,259 @@ def test_service_status_requires_loaded_receipt_pid_to_match_unit_pid(
     assert report["comparison"]["process_status"] == "match"
     assert report["status"] == "unknown"
     assert report["reason"] == "invocation-declaration-unknown"
+
+
+# #841 loaded runtime attestation 後續修法：invocation_revision 改以 daemon 實際
+# 收到的原始 argv 計算，宣告端改成能從 systemd 有效 ExecStart 反推同一份 argv。
+# 以下測試涵蓋 manager_configuration_snapshot 的 argv 基準／機敏過濾，以及
+# manager_declared_invocation_revision 目前支援的兩種 ExecStart 形狀
+# （直接呼叫 python -m manager_daemon；installer 實際產生的 service-manager.sh
+# wrapper）與各自的 unknown 邊界，最後用 compare_runtime_state 驗證
+# match／drift／unknown 三種整體結果。
+
+
+def test_manager_configuration_snapshot_invocation_revision_uses_argv_not_namespace() -> None:
+    """namespace 裡「未指定旗標的 argparse 預設值」不應該影響
+    invocation_revision——那些預設值已經被 environment_revision 涵蓋一次，
+    真正該比對的是 daemon 實際收到的 argv token。"""
+
+    argv = ["--poll-interval", "7"]
+    _config_a, components_a = manager_configuration_snapshot(
+        {"poll_interval": 7.0, "tick_interval": 111.0}, {}, argv=argv
+    )
+    _config_b, components_b = manager_configuration_snapshot(
+        {"poll_interval": 7.0, "tick_interval": 222.0}, {}, argv=argv
+    )
+    assert components_a["invocation_revision"] == components_b["invocation_revision"]
+
+    _config_c, components_c = manager_configuration_snapshot(
+        {"poll_interval": 7.0, "tick_interval": 111.0},
+        {},
+        argv=["--poll-interval", "9"],
+    )
+    assert components_c["invocation_revision"] != components_a["invocation_revision"]
+
+
+def test_manager_configuration_snapshot_invocation_revision_filters_secret_flag_values() -> None:
+    """argv 若夾帶看起來像機敏值的旗標（名稱命中 _SECRET_KEY_RE），
+    invocation_revision 不能把值本身雜湊進去——沿用 _safe_config 對 Mapping key
+    已有的機敏鍵過濾規則。"""
+
+    _config_a, components_a = manager_configuration_snapshot(
+        {}, {}, argv=["--specs-dir", "/x", "--api-key", "shhh"]
+    )
+    _config_b, components_b = manager_configuration_snapshot(
+        {}, {}, argv=["--specs-dir", "/x", "--api-key", "totally-different"]
+    )
+    assert components_a["invocation_revision"] == components_b["invocation_revision"]
+
+    _config_c, components_c = manager_configuration_snapshot(
+        {}, {}, argv=["--specs-dir", "/y", "--api-key", "shhh"]
+    )
+    assert components_c["invocation_revision"] != components_a["invocation_revision"]
+
+
+def test_manager_declared_invocation_revision_matches_direct_module_execstart() -> None:
+    """形狀一：ExecStart 直接呼叫
+    ``python -m paulsha_cortex.coordinator.manager_daemon <args...>``。"""
+
+    argv = ["--poll-interval", "7"]
+    _config, components = manager_configuration_snapshot({}, {}, argv=argv)
+    row = {
+        "systemd": {
+            "ExecStart": (
+                "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -m "
+                "paulsha_cortex.coordinator.manager_daemon --poll-interval 7 ; "
+                "ignore_errors=no }"
+            ),
+        },
+    }
+    declared = manager_declared_invocation_revision(row, {})
+    assert declared == components["invocation_revision"]
+
+
+def test_manager_declared_invocation_revision_matches_service_manager_wrapper_with_specs_dir_env() -> None:
+    """形狀二：installer（``paulsha_cortex/deploy/installer.py`` 的
+    ``render_units``）目前實際產生的 ExecStart——``/usr/bin/env bash
+    <pkg>/scripts/service-manager.sh``。腳本內只會傳一個旗標
+    ``--specs-dir``，值來自 ``PSC_MANAGER_SPECS_DIR``（未宣告時退回
+    ``$HOME/.agents/specs``）。這裡驗證有宣告時可以精確重建。"""
+
+    specs_dir = "/srv/specs-override"
+    argv = ["--specs-dir", specs_dir]
+    _config, components = manager_configuration_snapshot({}, {}, argv=argv)
+    row = {
+        "systemd": {
+            "ExecStart": (
+                "{ path=/usr/bin/env ; argv[]=/usr/bin/env bash "
+                "/opt/paulsha_cortex/scripts/service-manager.sh ; "
+                "ignore_errors=no }"
+            ),
+        },
+    }
+    declared = manager_declared_invocation_revision(
+        row, {"PSC_MANAGER_SPECS_DIR": specs_dir}
+    )
+    assert declared == components["invocation_revision"]
+
+
+def test_manager_declared_invocation_revision_unknown_without_specs_dir_env() -> None:
+    """形狀二成立，但有效環境沒有宣告 ``PSC_MANAGER_SPECS_DIR``：預設值取決於
+    執行 systemd --user 服務的 ``$HOME``，不在 safe_environment_projection 的
+    允許清單內，沒有安全管道驗證，必須回傳 None，不能猜家目錄。"""
+
+    row = {
+        "systemd": {
+            "ExecStart": (
+                "{ path=/usr/bin/env ; argv[]=/usr/bin/env bash "
+                "/opt/paulsha_cortex/scripts/service-manager.sh ; "
+                "ignore_errors=no }"
+            ),
+        },
+    }
+    assert manager_declared_invocation_revision(row, {}) is None
+
+
+def test_manager_declared_invocation_revision_unknown_when_shape_or_declaration_missing() -> None:
+    """ExecStart 能解析成 argv，但不是目前已知的任何形狀；或 systemd 有效屬性
+    集合根本不存在——兩者都必須回傳 None，不臆測。"""
+
+    unrecognized_shape = {
+        "systemd": {
+            "ExecStart": "{ path=/usr/bin/true ; argv[]=/usr/bin/true ; ignore_errors=no }",
+        },
+    }
+    assert manager_declared_invocation_revision(unrecognized_shape, {}) is None
+    assert manager_declared_invocation_revision({"_systemd_unavailable": True}, {}) is None
+    assert manager_declared_invocation_revision({}, {}) is None
+    assert manager_declared_invocation_revision("not-a-mapping", {}) is None
+
+
+def test_compare_runtime_state_manager_invocation_match_via_direct_module_execstart(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "runtime"
+    environment = {"PSC_COORDINATOR_ROOT": "/srv/coordinator"}
+    config, components = manager_configuration_snapshot(
+        {}, environment, argv=["--poll-interval", "7"]
+    )
+    artifact = _artifact("4" * 64)
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=state_root,
+        configuration=config,
+        config_components=components,
+        artifact=artifact,
+        started_at="2026-09-26T00:00:00Z",
+        pid=321,
+    )
+    row = {
+        "systemd": {
+            "ExecStart": (
+                "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -m "
+                "paulsha_cortex.coordinator.manager_daemon --poll-interval 7 ; "
+                "ignore_errors=no }"
+            ),
+        },
+    }
+    declared_invocation_revision = manager_declared_invocation_revision(row, {})
+    state = inspect_runtime_state(state_root, service="manager", instance="test")
+    comparison = compare_runtime_state(
+        state,
+        current_artifact=artifact,
+        declared_config_revision=components["environment_revision"],
+        declared_config_component="environment_revision",
+        declared_invocation_revision=declared_invocation_revision,
+        expected_pid=321,
+        require_process_match=True,
+    )
+    assert comparison["status"] == "match"
+    assert comparison["config_components"]["invocation_revision"] == "match"
+
+
+def test_compare_runtime_state_manager_invocation_drift_when_argv_changes(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "runtime"
+    environment = {"PSC_COORDINATOR_ROOT": "/srv/coordinator"}
+    config, components = manager_configuration_snapshot(
+        {}, environment, argv=["--poll-interval", "7"]
+    )
+    artifact = _artifact("5" * 64)
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=state_root,
+        configuration=config,
+        config_components=components,
+        artifact=artifact,
+        started_at="2026-09-26T00:00:00Z",
+        pid=321,
+    )
+    # 目前 ExecStart 有效值宣告的 argv（--poll-interval 9）跟 receipt 記錄的
+    # （--poll-interval 7）不一樣——模擬「daemon 還沒用新設定重啟，unit 已經
+    # 被改了」的情境。
+    row = {
+        "systemd": {
+            "ExecStart": (
+                "{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -m "
+                "paulsha_cortex.coordinator.manager_daemon --poll-interval 9 ; "
+                "ignore_errors=no }"
+            ),
+        },
+    }
+    declared_invocation_revision = manager_declared_invocation_revision(row, {})
+    state = inspect_runtime_state(state_root, service="manager", instance="test")
+    comparison = compare_runtime_state(
+        state,
+        current_artifact=artifact,
+        declared_config_revision=components["environment_revision"],
+        declared_config_component="environment_revision",
+        declared_invocation_revision=declared_invocation_revision,
+        expected_pid=321,
+        require_process_match=True,
+    )
+    assert comparison["status"] == "drift"
+    assert comparison["reason"] == "invocation-drift"
+    assert comparison["config_components"]["invocation_revision"] == "drift"
+
+
+def test_compare_runtime_state_manager_invocation_unknown_when_execstart_unparseable(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "runtime"
+    environment = {"PSC_COORDINATOR_ROOT": "/srv/coordinator"}
+    config, components = manager_configuration_snapshot(
+        {}, environment, argv=["--poll-interval", "7"]
+    )
+    artifact = _artifact("6" * 64)
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=state_root,
+        configuration=config,
+        config_components=components,
+        artifact=artifact,
+        started_at="2026-09-26T00:00:00Z",
+        pid=321,
+    )
+    row = {"systemd": {"ExecStart": "not a structured exec line"}}
+    declared_invocation_revision = manager_declared_invocation_revision(row, {})
+    assert declared_invocation_revision is None
+    state = inspect_runtime_state(state_root, service="manager", instance="test")
+    comparison = compare_runtime_state(
+        state,
+        current_artifact=artifact,
+        declared_config_revision=components["environment_revision"],
+        declared_config_component="environment_revision",
+        declared_invocation_revision=declared_invocation_revision,
+        expected_pid=321,
+        require_process_match=True,
+    )
+    assert comparison["status"] == "unknown"
+    assert comparison["reason"] == "invocation-declaration-unknown"
+    assert comparison["config_components"]["invocation_revision"] == "unknown"
 
 
 def test_runtime_state_compares_declared_revision_and_never_calls_inflight_safe(

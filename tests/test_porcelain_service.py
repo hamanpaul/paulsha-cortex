@@ -661,6 +661,170 @@ def test_loaded_runtime_never_mixes_caller_shell_into_systemd_effective_environm
     assert "PSC_MONITOR_CONFIG" not in manager_calls[0]
 
 
+def test_loaded_runtime_manager_invocation_match_via_service_manager_wrapper(
+    tmp_path: Path,
+) -> None:
+    """#841 loaded runtime attestation 後續修法：manager unit 走 installer 實際
+    產生的 ``service-manager.sh`` wrapper 形狀（見
+    ``paulsha_cortex/deploy/installer.py`` 的 ``render_units`` 與
+    ``manager.service.tmpl``）時，只要有效環境宣告了 ``PSC_MANAGER_SPECS_DIR``，
+    ``cortex service status`` 現在應該能重建出跟 daemon 端一致的
+    ``invocation_revision``，manager 的整體 config 判定不再永遠卡在
+    ``invocation-declaration-unknown``（live 實測回歸：修法前任何部署都會卡
+    這裡）。"""
+    from paulsha_cortex.porcelain import service
+    from paulsha_cortex.runtime_attestation import (
+        manager_configuration_snapshot,
+        record_runtime_startup,
+    )
+
+    coordinator_root = tmp_path / "coordinator"
+    specs_dir = str(tmp_path / "specs-override")
+    manager_environment = {
+        "PSC_COORDINATOR_ROOT": str(coordinator_root),
+        "PSC_MANAGER_SPECS_DIR": specs_dir,
+    }
+    config, components = manager_configuration_snapshot(
+        {}, manager_environment, argv=["--specs-dir", specs_dir]
+    )
+    artifact = {
+        "kind": "installed-wheel",
+        "package": "paulsha-cortex",
+        "package_version": "0.1.10",
+        "source_revision": "unknown",
+        "sha256": "3" * 64,
+    }
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=coordinator_root,
+        configuration=config,
+        config_components=components,
+        artifact=artifact,
+        started_at="2026-09-26T00:00:00Z",
+        pid=321,
+    )
+    units = {
+        "test-manager.service": {
+            "systemd": {
+                "ExecStart": (
+                    "{ path=/usr/bin/env ; argv[]=/usr/bin/env bash "
+                    "/opt/paulsha_cortex/scripts/service-manager.sh ; "
+                    "ignore_errors=no }"
+                ),
+            },
+        },
+        "test-monitor.service": {},
+    }
+    service_declaration = {
+        "manager": {"artifact": artifact},
+        "monitor": {"artifact": {"kind": "unknown", "sha256": None}},
+    }
+    environment_overlay = {
+        "manager": {
+            "environment_source": "systemd-effective",
+            "environment": manager_environment,
+        },
+        "monitor": {"environment_source": "unavailable", "environment": {}},
+    }
+
+    payload = service._loaded_runtime_payload(
+        "test",
+        manager_pid=321,
+        monitor_pid=None,
+        units=units,
+        service_declaration=service_declaration,
+        environment_overlay=environment_overlay,
+    )
+
+    manager_report = payload["manager"]
+    assert (
+        manager_report["comparison"]["config_components"]["invocation_revision"]
+        == "match"
+    )
+    assert manager_report["status"] == "match"
+
+
+def test_loaded_runtime_manager_invocation_stays_unknown_without_specs_dir_env(
+    tmp_path: Path,
+) -> None:
+    """同一種 wrapper 形狀，但有效環境沒有宣告 ``PSC_MANAGER_SPECS_DIR``（目前
+    多數既有部署的實際狀態，即 live 實測撞到的情境）：預設值取決於執行
+    systemd ``--user`` 服務的 ``$HOME``，不在安全允許清單內，這裡必須仍然是
+    ``unknown``／``invocation-declaration-unknown``，不能因為看不到值就猜一個
+    出來、也不能整個判定爆掉。"""
+    from paulsha_cortex.porcelain import service
+    from paulsha_cortex.runtime_attestation import (
+        manager_configuration_snapshot,
+        record_runtime_startup,
+    )
+
+    coordinator_root = tmp_path / "coordinator"
+    manager_environment = {"PSC_COORDINATOR_ROOT": str(coordinator_root)}
+    config, components = manager_configuration_snapshot(
+        {},
+        manager_environment,
+        argv=["--specs-dir", str(tmp_path / "home" / ".agents" / "specs")],
+    )
+    artifact = {
+        "kind": "installed-wheel",
+        "package": "paulsha-cortex",
+        "package_version": "0.1.10",
+        "source_revision": "unknown",
+        "sha256": "7" * 64,
+    }
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=coordinator_root,
+        configuration=config,
+        config_components=components,
+        artifact=artifact,
+        started_at="2026-09-26T00:00:00Z",
+        pid=321,
+    )
+    units = {
+        "test-manager.service": {
+            "systemd": {
+                "ExecStart": (
+                    "{ path=/usr/bin/env ; argv[]=/usr/bin/env bash "
+                    "/opt/paulsha_cortex/scripts/service-manager.sh ; "
+                    "ignore_errors=no }"
+                ),
+            },
+        },
+        "test-monitor.service": {},
+    }
+    service_declaration = {
+        "manager": {"artifact": artifact},
+        "monitor": {"artifact": {"kind": "unknown", "sha256": None}},
+    }
+    environment_overlay = {
+        "manager": {
+            "environment_source": "systemd-effective",
+            "environment": manager_environment,
+        },
+        "monitor": {"environment_source": "unavailable", "environment": {}},
+    }
+
+    payload = service._loaded_runtime_payload(
+        "test",
+        manager_pid=321,
+        monitor_pid=None,
+        units=units,
+        service_declaration=service_declaration,
+        environment_overlay=environment_overlay,
+    )
+
+    manager_report = payload["manager"]
+    assert manager_report["status"] == "unknown"
+    assert manager_report["reason"] == "invocation-declaration-unknown"
+    assert (
+        manager_report["comparison"]["config_components"]["invocation_revision"]
+        == "unknown"
+    )
+
+
 def test_service_logs_uses_journalctl_when_systemd_units_exist(
     service_runtime: dict[str, Path],
     capsys: pytest.CaptureFixture[str],

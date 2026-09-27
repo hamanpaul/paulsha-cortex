@@ -18,6 +18,7 @@ from paulsha_cortex.runtime_attestation import (
     artifact_identity,
     cli_runtime_observation,
     declared_service_environment,
+    manager_declared_invocation_revision,
     manager_environment_revision,
     monitor_configuration_revision_from_environment,
     runtime_status_report,
@@ -398,6 +399,19 @@ def _loaded_runtime_payload(
             manager_root = resolve_runtime_root(
                 "PSC_COORDINATOR_ROOT", environment=manager_environment
             )
+            # #841 loaded runtime attestation 後續修法：只有 systemd-effective
+            # 這條路徑才有可信的 unit 宣告（ExecStart／有效環境）可以反推 daemon
+            # 實際收到的 argv；direct-fallback／unknown 沒有對應的 systemd 屬性
+            # 集合可用，維持 None（仍為 unknown，不臆測）。manager_unit_row 用
+            # unit_rows 裡對應這個 instance 的 manager service 原始探測結果
+            # （含 "systemd" 區塊），與 overlays 共用同一份判定來源。
+            declared_invocation_revision = (
+                manager_declared_invocation_revision(
+                    unit_rows.get(_unit_names(instance)[0]), manager_environment
+                )
+                if manager_environment_source == "systemd-effective"
+                else None
+            )
             manager_report = runtime_status_report(
                 manager_root,
                 service="manager",
@@ -406,7 +420,7 @@ def _loaded_runtime_payload(
                     manager_environment
                 ),
                 declared_config_component="environment_revision",
-                declared_invocation_revision=None,
+                declared_invocation_revision=declared_invocation_revision,
                 expected_pid=manager_pid,
                 require_process_match=True,
                 current_artifact=(
