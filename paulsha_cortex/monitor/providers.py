@@ -25,6 +25,7 @@ from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signa
 from .decision_projection import (
     QUOTA_WAIT_REASONS,
     DecisionReadCache,
+    current_identity_by_persona_from_steps,
     project_workflow_quota_admission,
 )
 from .git_mirror import (
@@ -791,35 +792,9 @@ def _needs_human_reason_row(row: Mapping[str, Any]) -> dict[str, object] | None:
 _TERMINAL_WORKFLOW_RUN_STATUSES = frozenset({"done", "completed", "failed", "superseded"})
 
 
-def _current_persona_identity_from_steps(steps: object) -> dict[str, dict[str, object]]:
-    """從 ``row["steps"]`` 推導『每個 persona 目前最早未通過的卡』。
-
-    對抗審查第三輪（MAJOR）：只依賴 ``WorkflowStep`` 既有欄位
-    （``persona``／``card``／``gate_result``／``executor``／``model``），不
-    重算 #839 的候選排序或 dispatch 邏輯——單純沿用
-    `registry._manager_reset_workflow_for_retry_card` 挑「當前 phase 內最早
-    一張尚未通過的卡」時同一個判準（`gate_result != "passed"`，取第一個），
-    供 `decision_projection._attempt_mismatch_reason` 判斷 `quota_admission`
-    指標是否仍對應這張卡『目前』的身分。同一個 persona 若有多張未通過的
-    卡，只取最早（``steps`` 既有順序）一張——那也正是下一次會被派工的卡。
-    """
-    if not isinstance(steps, (list, tuple)):
-        return {}
-    result: dict[str, dict[str, object]] = {}
-    for step in steps:
-        if not isinstance(step, Mapping):
-            continue
-        persona = step.get("persona")
-        if not isinstance(persona, str) or not persona or persona in result:
-            continue
-        if step.get("gate_result") == "passed":
-            continue
-        result[persona] = {
-            "card": step.get("card"),
-            "executor": step.get("executor"),
-            "model": step.get("model"),
-        }
-    return result
+# 共用判準移到 `decision_projection.current_identity_by_persona_from_steps`，
+# 讓 `cortex inspect status`（Manager 端）與本 provider 用同一份實作。
+_current_persona_identity_from_steps = current_identity_by_persona_from_steps
 
 
 def _quota_decision_row(

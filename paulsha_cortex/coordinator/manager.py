@@ -1734,6 +1734,11 @@ def _workflow_quota_decision_projection(
             store=resolved_store,
             cache=cache,
             now_ms=int(time.time() * 1000),
+            # 與 `cortex work show`（Monitor provider）共用同一個 attempt 判準：
+            # retry-card 後、新 attempt 尚未寫出 receipt 前，不得沿用舊決策。
+            current_identity_by_persona=_decision_projection.current_identity_by_persona_from_steps(
+                getattr(run, "steps", None)
+            ),
         )
     except Exception:  # noqa: BLE001 - 呈現面不得因投影失敗而讓 status 死掉
         return None

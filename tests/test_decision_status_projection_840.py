@@ -681,7 +681,8 @@ def test_daemon_wired_cache_persists_across_snapshot_ticks_for_last_good_stale(
     from paulsha_cortex.coordinator import manager_daemon
 
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
-    run = _run(registry, tmp_path, work_id="daemon-840", steps=(_step("build-card"),))
+    # step 身分與 decision.selected 一致（status 路徑也套用當前 attempt 比對）。
+    run = _run(registry, tmp_path, work_id="daemon-840", steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),))
     # 用預設路徑的 store——per-test 隔離環境（見 conftest.py 的
     # `_clear_runtime_env`）保證這與 `build_runtime_status_provider()` 內部
     # 建立的 `AdmissionDecisionStore()` 指向同一個檔案。
@@ -833,7 +834,8 @@ def test_producer_to_snapshot_to_status_cli_end_to_end(tmp_path: Path, capsys) -
 
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
-    run = _run(registry, tmp_path, work_id="e2e-840", steps=(_step("build-card"),))
+    # step 身分與 decision.selected 一致（status 路徑也套用當前 attempt 比對）。
+    run = _run(registry, tmp_path, work_id="e2e-840", steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),))
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(
         decision_id="adm:v1:" + "3" * 63 + "4", run_id=run.run_id, card_id="build-card",
@@ -1259,3 +1261,67 @@ def test_decision_read_cache_detects_parent_directory_permission_widened(tmp_pat
     assert second_stale is not None
     assert second_stale["stale"] is True
     assert "parent-permissions-invalid" in second_stale["stale_reason"]
+
+
+def test_status_entry_after_retry_card_reset_matches_work_show(tmp_path: Path) -> None:
+    """`cortex inspect status`（`manager.workflow_status_entry`）與 `cortex work
+    show`（`WorkflowRegistryProvider.scan`）對 retry-card 後、新 attempt 尚未寫出
+    receipt 的同一狀態必須一致：都回 `quota-decision-attempt-superseded`，不沿用
+    重置前的 admit。兩條路徑共用
+    `decision_projection.current_identity_by_persona_from_steps`。"""
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    run = _run(
+        registry, tmp_path, work_id="retry-card-status-840",
+        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+        facets=(),
+    )
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "8" * 62 + "39", run_id=run.run_id, card_id="build-card",
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(decision)
+    registry._manager_update_workflow_run(run.run_id, quota_admission=_quota_admission_pointer(decision))
+
+    before = manager.workflow_status_entry(
+        registry, registry.get_workflow_run(run.run_id), quota_decision_store=store
+    )["quota_decision"]["personas"]["builder"]
+    assert before["available"] is True
+    assert before["outcome"] == "admit"
+
+    registry._manager_update_workflow_run(
+        run.run_id,
+        steps=(_step("build-card", executor=None, model=None),),
+        facets=(), needs_human_reason=None,
+    )
+    status_persona = manager.workflow_status_entry(
+        registry, registry.get_workflow_run(run.run_id), quota_decision_store=store
+    )["quota_decision"]["personas"]["builder"]
+    work_show_persona = WorkflowRegistryProvider(
+        REPO, state_path=state, quota_decision_store=store,
+    ).scan().observations["quota_decisions"]["retry-card-status-840"]["personas"]["builder"]
+
+    for persona in (status_persona, work_show_persona):
+        assert persona["available"] is False
+        assert persona["gap_reason"] == "quota-decision-attempt-superseded"
+        assert "mode" not in persona
+        assert "selected" not in persona
+    assert status_persona["gap_reason"] == work_show_persona["gap_reason"]
+    assert status_persona["decision_id"] == work_show_persona["decision_id"] == decision.decision_id
+
+
+def test_current_identity_from_steps_accepts_workflow_step_objects_and_dicts() -> None:
+    """共用判準對 `WorkflowStep` 物件與 registry row 的 dict 給出相同結果。"""
+    from paulsha_cortex.monitor.decision_projection import current_identity_by_persona_from_steps
+
+    steps = (
+        _step("plan-card", executor="codex", model="m1"),
+        _step("build-card", executor="claude", model="m2"),
+    )
+    as_dicts = [
+        {"persona": s.persona, "card": s.card, "gate_result": s.gate_result, "executor": s.executor, "model": s.model}
+        for s in steps
+    ]
+    assert current_identity_by_persona_from_steps(steps) == current_identity_by_persona_from_steps(as_dicts)
+    assert current_identity_by_persona_from_steps(None) == {}

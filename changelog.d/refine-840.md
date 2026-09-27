@@ -289,3 +289,8 @@ remaining、缺 provenance 的 legacy receipt、needs_human 語意保留、plann
 沒有 bug），改用手動 monkeypatch 腳本驗證：讓 `scan()` 對它實際持有的 store
 路徑寫入 bytes，比較「未注入 store」與「已注入 store」兩種情境下 bytes-
 不變斷言的結果（見上方條目 1 說明的驗證數字）。
+
+`cortex inspect status`（`manager.workflow_status_entry`）與 `cortex work show` 現在共用
+`decision_projection.current_identity_by_persona_from_steps` 判定當前 attempt：retry-card
+後、新 attempt 尚未寫出 receipt 前，兩條路徑都回 `quota-decision-attempt-superseded`，
+不沿用舊決策（補上前一輪只接到 Monitor provider 的缺口）。

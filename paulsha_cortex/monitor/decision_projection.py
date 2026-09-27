@@ -431,6 +431,42 @@ def _project_wait(needs_human_reason: object) -> dict[str, Any] | None:
     return payload
 
 
+def current_identity_by_persona_from_steps(steps: object) -> dict[str, dict[str, object]]:
+    """從 workflow steps 推導『每個 persona 目前最早未通過的卡』的身分。
+
+    `cortex work show`（Monitor 讀 registry row，steps 為 dict）與
+    `cortex inspect status`（Manager 讀 `WorkflowRun`，steps 為 `WorkflowStep`
+    物件）共用同一個判準，兩條路徑對同一狀態的 attempt 比對結果才會一致。
+    只依賴既有欄位（``persona``／``card``／``gate_result``／``executor``／
+    ``model``），沿用 `registry._manager_reset_workflow_for_retry_card` 挑
+    「最早一張尚未通過的卡」的判準（`gate_result != "passed"`，取第一個）；
+    同一 persona 有多張未通過的卡時只取最早一張——那正是下一次會被派工的卡。
+    """
+    if not isinstance(steps, (list, tuple)):
+        return {}
+
+    def _field(step: object, name: str) -> object:
+        if isinstance(step, Mapping):
+            return step.get(name)
+        return getattr(step, name, None)
+
+    result: dict[str, dict[str, object]] = {}
+    for step in steps:
+        if step is None:
+            continue
+        persona = _field(step, "persona")
+        if not isinstance(persona, str) or not persona or persona in result:
+            continue
+        if _field(step, "gate_result") == "passed":
+            continue
+        result[persona] = {
+            "card": _field(step, "card"),
+            "executor": _field(step, "executor"),
+            "model": _field(step, "model"),
+        }
+    return result
+
+
 def project_workflow_quota_admission(
     *,
     run_id: str,
