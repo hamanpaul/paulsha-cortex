@@ -1299,7 +1299,23 @@ work_items:
         ref: 'docs/superpowers/specs/retry-build-preserve-proof-spec.md'
       - kind: path
         ref: 'docs/superpowers/specs/retry-build-preserve-proof-design.md'
-    excludes: []
+    # 整合 PR #1087 同時關閉下列各自已有 work item 的票；github_closing 會把它們拉進
+    # 本群組造成 confirmed source collision（repo degraded），故明確排除。
+    excludes:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#812'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#862'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#871'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#874'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#956'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#961'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#983'
   terminal-replay-manifest-fence:
     title: 'terminal-replay-manifest-fence'
     links:
@@ -1512,3 +1528,23 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/quota-snapshot-window-refinement/todo.md'
     excludes: []
+  wave4-large-bug-integration:
+    title: 'wave-4 第一輪 large bug 最小修法整合（PR #1090）'
+    links:
+      - kind: github_pr
+        ref: 'hamanpaul/paulsha-cortex#1090'
+    # PR #1090 關閉的票中，下列各自已有 work item；排除以免 github_closing 造成
+    # confirmed source collision。其餘無 work item 的票（#475 等）歸入本群組。
+    excludes:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#481'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#492'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#497'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#579'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#810'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#821'
