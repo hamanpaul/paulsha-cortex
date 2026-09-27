@@ -263,7 +263,9 @@ Manager 讀取 `paulsha_cortex.config.paths.quota_pools_config_path()`
 `parse_binding` 的既有驗證，本模組不自寫第二套 schema；`lease_ms`（選填，
 預設 900000ms）與 `usage_unit_refs`（選填，終局 usage metric → unit ref
 對照，供 periodic tick 呼叫 `record_terminal_usage` 用）皆有明確預設，缺席
-不視為錯誤。
+不視為錯誤。同一份檔案也可加上 #836 collector 用的選填 `collector_targets`（由
+`cortex quota observe` 解析與驗證），admission 只接受其存在、不解讀內容，因此
+admission 與 collector 可共用單一設定檔；其他未知鍵仍一律拒絕。
 
 三態行為：
 
