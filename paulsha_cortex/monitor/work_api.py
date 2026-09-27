@@ -13,6 +13,7 @@ from typing import Callable, Mapping, Sequence
 
 from .config import load_config
 from .correlation import InferredSignal, correlate_work_sources
+from .decision_projection import DecisionReadCache
 from .event_spool import EventSpool, SpoolScan
 from .git_mirror import GITHUB_HTTPS_REMOTE, GITHUB_SSH_REMOTE
 from .github_issue_sync import IssueSyncStore
@@ -26,6 +27,7 @@ from .providers import (
     WorkflowRegistryProvider,
 )
 from .socket_path import validate_socket_path
+from ..coordinator import quota_admission as quota_admission_module
 from ..coordinator.diagnostics import diagnostic_reason
 from ..coordinator.terminal_contract import MAX_SCHEMA_RETRIES as SCHEMA_RETRY_LIMIT
 from .work_models import ProviderSnapshot
@@ -273,6 +275,14 @@ class WorkReadModelStore:
             git_base = self._candidate_git_base(item.repo, item.work_id)
             if git_base:
                 envelope["candidate_git_base"] = git_base
+            # #840：quota-aware admission 決策與額度等待來源投影。資料源與上面
+            # 三段完全相同（workflow provider 的 observations），欄位名沿用
+            # `decision_projection.project_workflow_quota_admission` 的輸出
+            # 形狀，與 `cortex inspect status` 的 attention 條目共用同一份
+            # 投影函式，避免兩個呈現面各自算出不一致的結果。
+            quota_decision = self._quota_decision(item.repo, item.work_id)
+            if quota_decision:
+                envelope["quota_decision"] = quota_decision
             return envelope
 
     def _candidate_git_base(self, repo: str, work_id: str) -> dict:
@@ -283,6 +293,29 @@ class WorkReadModelStore:
             if not isinstance(observations, Mapping):
                 continue
             rows = observations.get("candidate_git_bases", {})
+            if not isinstance(rows, Mapping):
+                continue
+            found = rows.get(work_id)
+            if isinstance(found, Mapping) and found:
+                return dict(found)
+        return {}
+
+    def _quota_decision(self, repo: str, work_id: str) -> dict:
+        for provider_id, provider in self._snapshot.providers.items():
+            if not provider_id.startswith("workflow:"):
+                continue
+            # 對抗審查 MAJOR：原先只憑 `workflow:` 前綴挑 provider，完全沒用
+            # 到 `repo` 參數——兩個 repo 各自的 workflow provider 若剛好有
+            # 同一個 `work_id`（跨 repo work_id 不保證唯一），會把另一個 repo
+            # 的 quota_decision 錯配過來。沿用 `_provider_repo()`（見本檔
+            # 下方，`envelope`／provider 列表既有的 repo 比對方式）做
+            # exact (repo, work_id) 匹配，不再只靠 work_id 命中就回傳。
+            if _provider_repo(provider_id) != repo:
+                continue
+            observations = provider.observations
+            if not isinstance(observations, Mapping):
+                continue
+            rows = observations.get("quota_decisions", {})
             if not isinstance(rows, Mapping):
                 continue
             found = rows.get(work_id)
@@ -466,6 +499,7 @@ class WorkModelRefresher:
         github_pressure_gate: GitHubPressureGate | None = None,
         issue_sync_store: IssueSyncStore | None = None,
         event_spool: EventSpool | None = None,
+        quota_decision_store: "quota_admission_module.AdmissionDecisionStore | None" = None,
     ) -> None:
         self.durable_store = durable_store
         self.read_store = read_store
@@ -477,6 +511,7 @@ class WorkModelRefresher:
         self._uses_default_github_terminal_provider = (
             github_terminal_provider_factory is None
         )
+        self._uses_default_workflow_provider = workflow_provider_factory is None
         # #506：跨 repo 共用的節流／退避閘門。掃描是 per-repo 建 provider、
         # 但壓力是 per-token 的，所以閘門必須活得比 provider 久（由 refresher
         # 持有），否則節流只在單一 repo 內生效、退避每個 repo 各燒一次 403。
@@ -490,6 +525,26 @@ class WorkModelRefresher:
         # 目錄不存在（D5 hook 尚未部署）就是一次空掃描，不建目錄、不報錯。
         self.event_spool = event_spool or EventSpool()
         self.workflow_provider_factory = workflow_provider_factory or WorkflowRegistryProvider
+        # #840 對抗審查修復第二輪（MAJOR，約本檔 594）：`WorkflowRegistryProvider`
+        # 每輪 `refresh()` 都經 `workflow_provider_factory(repo)` 重建一個全新
+        # 實例——若 provider 自己內部建 `DecisionReadCache`（舊行為），上一輪
+        # 成功讀到的 decision 在下一輪 store 暫時損毀／權限錯誤時就會隨舊
+        # provider 一起被丟棄，`cortex work show` 退化成單純的『這次讀不到』
+        # （只剩 `available=false`／`stale_reason`，不是 last-good）。
+        # `quota_decision_store`／`quota_decision_cache` 因此比照上面
+        # `issue_sync_store`／`event_spool` 的既有模式，改由 refresher（活得比
+        # per-repo provider 久）持有，`refresh()` 內用預設 provider factory 時
+        # 逐輪注入同一個實例——與 `manager_daemon.build_runtime_status_provider()`
+        # 那條路徑（daemon 生命週期內只建一個 cache）共用同一個機制，讓
+        # `cortex inspect status` 與 `cortex work show` 在同一個 last-good／
+        # stale 狀態下結果一致。自訂 `workflow_provider_factory`（測試／上層
+        # 組裝）行為完全不變，不受影響。
+        self._quota_decision_store = (
+            quota_decision_store
+            if quota_decision_store is not None
+            else quota_admission_module.AdmissionDecisionStore()
+        )
+        self._quota_decision_cache = DecisionReadCache()
         self.stale_after_seconds = stale_after_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
@@ -560,7 +615,21 @@ class WorkModelRefresher:
                 local = _retain_last_good(previous_local, local_result)
                 providers[local.provider_id] = local
                 relevant = [local]
-                workflow_result = self.workflow_provider_factory(repo).scan()
+                # #840 對抗審查修復第二輪：預設 provider factory 才注入
+                # refresher 自己持有、跨輪次存活的 `quota_decision_store`／
+                # `quota_decision_cache`（見 `__init__` 註解）；自訂 factory
+                # （測試／上層組裝）呼叫維持原樣（僅 `repo` 單一參數），行為
+                # 不變。
+                workflow_provider = (
+                    self.workflow_provider_factory(
+                        repo,
+                        quota_decision_store=self._quota_decision_store,
+                        quota_decision_cache=self._quota_decision_cache,
+                    )
+                    if self._uses_default_workflow_provider
+                    else self.workflow_provider_factory(repo)
+                )
+                workflow_result = workflow_provider.scan()
                 workflow = _retain_last_good(
                     providers.get(workflow_result.provider_id), workflow_result
                 )

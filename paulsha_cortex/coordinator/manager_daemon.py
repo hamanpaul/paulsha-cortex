@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import inspect
 import json
 import math
@@ -477,6 +478,97 @@ def _resolve_launcher_compat(*args, **kwargs):
     return _call_with_supported_kwargs(_resolve_launcher, *args, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# #839 production 接線 a／b：讀 operator quota-pools 設定檔，建構
+# `quota_admission.DispatchContext`。缺席（部署尚未接上）時完全 no-op；存在
+# 但無效時依 opt-in enforce 是否已開分流（shadow 降級記錄 vs. enforce fail
+# closed）。以設定檔內容 sha256 digest 快取解析結果——同一份未變動的 JSON
+# 不需要每次 dispatch／periodic tick 都重跑 parse_pool_descriptor 等驗證。
+# ---------------------------------------------------------------------------
+
+#: path 字串 -> (content_sha256, 已解析的 QuotaPoolsConfig 或 None, 解析錯誤或 None)
+_QUOTA_POOLS_CONFIG_CACHE: dict[str, tuple[str, Any, Exception | None]] = {}
+
+
+def _load_quota_pools_config_cached(path: Path):
+    """回傳 ``(config, error)``；兩者皆 ``None`` 代表檔案不存在（整條線沒
+    接上）。快取鍵是檔案內容的 sha256 digest，不是 mtime——operator 用工具
+    重寫檔案但內容不變時不必重新解析，內容真的變了（即使忘了 bump
+    ``config_revision``）也一定會被偵測到。"""
+    from . import quota_admission
+
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        _QUOTA_POOLS_CONFIG_CACHE.pop(str(path), None)
+        return None, None
+    except OSError:
+        return None, quota_admission.QuotaPoolsConfigError("quota-pools-config-read-failed")
+    digest = hashlib.sha256(raw).hexdigest()
+    cached = _QUOTA_POOLS_CONFIG_CACHE.get(str(path))
+    if cached is not None and cached[0] == digest:
+        return cached[1], cached[2]
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        config: Any = quota_admission.parse_quota_pools_config(payload)
+        error: Exception | None = None
+    except quota_admission.QuotaPoolsConfigError as exc:
+        config, error = None, exc
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        config, error = None, quota_admission.QuotaPoolsConfigError("quota-pools-config-invalid-json")
+    _QUOTA_POOLS_CONFIG_CACHE[str(path)] = (digest, config, error)
+    return config, error
+
+
+def _quota_admission_context_for(environment: dict[str, str] | None = None):
+    """建構本次 dispatch／periodic tick 要傳給
+    ``manager._dispatch_workflow_card``／``manager.resume_workflow_run`` 的
+    ``quota_admission_context``。
+
+    - 設定檔不存在 → ``None``（行為與 #839 落地前逐字相同）。
+    - 設定檔存在但無效：
+      - ``PSC_QUOTA_ADMISSION_ENFORCE=on`` → 回
+        ``quota_admission.QuotaConfigInvalid``，manager 端在建立任何 job 前
+        fail closed，回 ``quota-config-invalid``。
+      - 否則（shadow）→ 記一筆錯誤 log、回 ``None``——不擋派工，也不假裝
+        有一份可用的設定。
+    - 設定檔存在且有效 → 建構真正的 ``DispatchContext``：file-backed
+      ``QuotaEventLedger``／``QuotaReservationAuthority``／
+      ``AdmissionDecisionStore``，皆用各自模組的預設路徑（見
+      `paulsha_cortex.config.paths` 的 `quota_observation_root`／
+      `quota_reservation_root`／`quota_admission_decisions_root`）。
+    """
+    from . import quota_admission
+    from .quota_ledger import QuotaEventLedger
+    from .quota_reservation import QuotaReservationAuthority
+    from .quota_shadow import QuotaShadowService
+
+    config_path = paths.quota_pools_config_path()
+    config, error = _load_quota_pools_config_cached(config_path)
+    if config is None and error is None:
+        return None
+    if error is not None:
+        if quota_admission.quota_admission_enabled(environment):
+            return quota_admission.QuotaConfigInvalid(reason=safe_exception_summary(error))
+        _log_error(error, context={"action": "quota-admission-config"})
+        return None
+    return quota_admission.DispatchContext(
+        authority=QuotaReservationAuthority(),
+        store=quota_admission.AdmissionDecisionStore(),
+        shadow=QuotaShadowService(QuotaEventLedger()),
+        descriptors=config.descriptors,
+        unit_catalog=config.unit_catalog,
+        bindings=config.bindings,
+        lease_ms=config.lease_ms,
+        environment=environment,
+        usage_unit_refs=config.usage_unit_refs,
+        # #840：見 `quota_admission.DispatchContext.config_revision` 文件字串
+        # ——落地決策 receipt 才有得投影「這筆決策當時用的是哪一版 operator
+        # 設定」，不只有一個只做快取鍵的內部 digest。
+        config_revision=config.config_revision,
+    )
+
+
 def _held_reasons(
     meta: dict[str, Any],
     is_satisfied: Callable[[str], bool],
@@ -536,6 +628,19 @@ def build_runtime_status_provider(
     now_fn: Callable[[], str] = contract.utcnow,
     git_runner=None,
 ) -> Callable[[], dict[str, Any]]:
+    # #840 對抗審查修復（MAJOR）：`quota_decision_cache` 必須跨快照存活，
+    # 建在 `build_runtime_status_provider()` 這層（daemon 生命週期內只建一次
+    # 的閉包捕獲變數），不能放進下面 `provider()` 內部——否則每輪 tick 都會
+    # 重建一個空 cache，上一輪成功讀到的 decision 在下一輪 store 暫時損毀／
+    # 權限錯誤時完全遺失，退化成「讀不到就是讀不到」而不是 last-good（違反
+    # `DecisionReadCache` 的設計目的）。`quota_decision_store` 本身是唯讀
+    # append-only handle，跨快照共用同一個沒有正確性風險，一併搬到這裡。
+    from paulsha_cortex.coordinator import quota_admission as _quota_admission_module
+    from paulsha_cortex.monitor.decision_projection import DecisionReadCache
+
+    quota_decision_store = _quota_admission_module.AdmissionDecisionStore()
+    quota_decision_cache = DecisionReadCache()
+
     def recent_done_provider() -> list[dict[str, Any]]:
         manifests: list[tuple[str, dict[str, Any]]] = []
         handoff_path = Path(handoff_dir)
@@ -593,6 +698,12 @@ def build_runtime_status_provider(
             mirror_root=candidate_base.default_mirror_root(),
             git_runner=git_runner,
         )
+        # #840：整份快照共用同一個 decision store handle／last-good cache，
+        # 確保這一輪 `attention` 清單裡每個 run 的 quota-decision 投影都是
+        # 對同一次 store 讀取結果，不會因為逐一重開檔案而互相漂移；
+        # `quota_decision_store`／`quota_decision_cache` 本身在
+        # `build_runtime_status_provider()` 這層建立（見上方註解），跨快照
+        # 存活，這裡直接沿用閉包捕獲的變數，不重建。
         manager.reconcile_building_slices(registry)
         metas = scan_specs_fn(specs_dir)
         predicate = lambda slice_id: autonomy.default_is_satisfied(
@@ -666,6 +777,8 @@ def build_runtime_status_provider(
                             repo=run.repo,
                             work_id=run.work_id,
                         ),
+                        quota_decision_store=quota_decision_store,
+                        quota_decision_cache=quota_decision_cache,
                     )
                 )
         in_flight = _in_flight_status(
@@ -842,6 +955,7 @@ def build_request_executor(
                     decomposition_intake=decomposition_intake_for(
                         resume_run.repo, registry
                     ),
+                    quota_admission_context=_quota_admission_context_for(),
                 )
             result = manager.apply_workflow_action(
                 registry,
@@ -881,6 +995,7 @@ def build_request_executor(
                         launcher_factory=launcher_factory,
                         coordinator_root=coordinator_root,
                         builder_todo_admission=_builder_todo_admission_for_run(run),
+                        quota_admission_context=_quota_admission_context_for(),
                     )
                     # #830：producer 對 Red sizing／preflight refusal 等情況合法回傳
                     # 非 Job 決策（`{run_id, current_phase, reason}`），舊實作只驗
@@ -976,6 +1091,7 @@ def build_request_executor(
                             decomposition_intake=decomposition_intake_for(
                                 run.repo, registry
                             ),
+                            quota_admission_context=_quota_admission_context_for(),
                         )
                         result["result"].update(resumed)
                         result["result"]["run"] = registry.get_workflow_run(
@@ -991,6 +1107,7 @@ def build_request_executor(
                                 coordinator_root=coordinator_root,
                                 force_new_card=forced_card_retry,
                                 builder_todo_admission=_builder_todo_admission_for_run(run),
+                                quota_admission_context=_quota_admission_context_for(),
                             )
                             # #830：同 start 路徑的分類契約（見上方 workflow-action
                             # start）。forced retry 的成功後置條件是「新 replacement
@@ -1314,6 +1431,8 @@ def build_periodic_tick_runner(
             auto_claim_error = safe_exception_summary(exc)
         planning_transactions: list[dict[str, Any]] = []
         planning_transaction_error: str | None = None
+        quota_admission_error: str | None = None
+        quota_admission_reconcile: dict[str, Any] | None = None
         if registry is not None and hasattr(registry, "list_workflow_runs"):
             state_path = getattr(registry, "_state_path", None)
             coordinator_root = (
@@ -1337,6 +1456,10 @@ def build_periodic_tick_runner(
             except Exception as exc:  # noqa: BLE001 - tick isolation
                 _log_error(exc, context={"action": "planning-transaction-sweep"})
                 planning_transaction_error = safe_exception_summary(exc)
+            # #839 production 接線 b：本輪 tick 內所有 resume 呼叫與稍後的
+            # reserved／bound 收斂掃描（c）共用同一個 context——同一次讀檔／
+            # 解析結果，不必每個 workflow 各自重建。
+            quota_admission_ctx = _quota_admission_context_for()
             for workflow in registry.list_workflow_runs():
                 if (
                     workflow.status != "ongoing"
@@ -1394,6 +1517,7 @@ def build_periodic_tick_runner(
                             registry=registry,
                             runtime_factory=planning_runtime.build_production_planning_runtime,
                         ),
+                        quota_admission_context=quota_admission_ctx,
                     )
                 except Exception as exc:
                     _log_error(
@@ -1431,6 +1555,17 @@ def build_periodic_tick_runner(
                             **review_terminal_context,
                         ),
                     )
+            # #839 production 接線 c：periodic tick 收斂 reserved／bound
+            # reservation（create_job() 之後、bind() 之前 crash 留下的無
+            # job_id reservation；job 進終局時 settle＋record_terminal_usage）。
+            # 比照 #246 tick isolation：這個子系統整批失效不得癱瘓本輪 tick。
+            try:
+                quota_admission_reconcile = manager.reconcile_quota_admission_reservations(
+                    registry=registry, quota_admission_context=quota_admission_ctx,
+                )
+            except Exception as exc:  # noqa: BLE001 - tick isolation
+                _log_error(exc, context={"action": "quota-admission-reconcile"})
+                quota_admission_error = safe_exception_summary(exc)
         metas = scan_specs_fn(specs_dir)
         _refuse_unsafe_fanout(metas, predicate, allow_unsafe=default_allow_unsafe)
         if (
@@ -1504,6 +1639,11 @@ def build_periodic_tick_runner(
             # 而不是靜默吞掉——不含絕對路徑／token，只有型別＋訊息摘要。
             summary["auto_claim_failed"] = True
             summary["auto_claim_error"] = auto_claim_error
+        if quota_admission_reconcile is not None and quota_admission_reconcile.get("wired"):
+            summary["quota_admission_reconcile"] = quota_admission_reconcile
+        if quota_admission_error is not None:
+            summary["quota_admission_reconcile_failed"] = True
+            summary["quota_admission_reconcile_error"] = quota_admission_error
         return summary
 
     return execute

@@ -135,6 +135,229 @@ decision 用相同組成重複呼叫 `reserve()`／terminal 事件重送皆冪�
 library primitive。`reservation_authority_enabled()` 是保留給未來整合者的
 opt-in 開關，預設關閉即等於 shadow／rollback，不需要改動任何程式碼。
 
+`list_by_state(state, *, now_ms)`（唯讀）列出目前邏輯狀態恰為 `state`
+（`reserved`／`bound`／`settled`／`released`）的所有 reservation，讓呼叫端
+可以直接以本 authority 為真相來源做收斂掃描，不必經過任何下游 receipt／
+索引是否成功寫入；純查詢，不修改任何狀態、不新增事件種類，狀態機與寫入
+協定不變。
+
+`renew(reservation_id, owner_token, attempt_id, lease_ms, expected_sequence,
+now_ms)`（純加法，新事件種類 `renew`）讓合法持有者（知道自己 owner_token）
+在 provisioning 期間主動延長 lease，只允許從 `reserved` 續租；與
+`reconcile(resolution="confirmed-alive", renew_lease_ms=...)` 的差異是後者
+刻意不驗證 owner_token／attempt_id（給 crash 之後、原 owner 已不存在時的
+第三方復原用），兩者服務不同情境，互不重疊。
+
+## Quota-aware admission
+
+`paulsha_cortex.coordinator.quota_admission`（#839）在既有候選分層排序／
+runtime preflight／execution-profile 硬濾（pin、權限、角色、reviewer
+independence、#842 qualification）**之後**，疊上一層「這個已核可的候選現在
+有沒有額度」：以上面 #836 的 `QuotaShadowService.project()` 唯讀投影算出每個
+pool/window 是 `sufficient`／`insufficient`／`unknown`（同池換 model 不算恢復；
+短窗夠、週窗不足一樣視為不可行），只替**目前選中**的那一個候選原子預留
+（`quota_reservation.reserve_for_candidate`），成功才繼續 provisioning／
+spawn；race 落敗、額度不可行，或 `reserve()` 回報這個 decision_id 的 grant
+在這次呼叫**之前**就已經存在（`duplicate`——可能是另一個 Manager instance
+剛贏得的 grant，這次呼叫從未替它 reserve 過，因此永遠不是它的擁有者）時，
+`manager._dispatch_workflow_card` 都會排除該候選、換下一個既有排序候選重試
+（沿用 `_runtime_preflight_gate`／`_select_workflow_identity` 既有機制，不
+重建候選池）；`duplicate` 且那筆舊 reservation 目前仍是 `reserved`／`bound`
+時精確等待（`quota-admission-attempt-held-elsewhere`），不建 job、也不對它
+呼叫 `release()`／`bind()`——只有這次呼叫自己拿到 `granted` 的候選才是可信
+擁有者，避免誤釋放別的 instance 仍在用的 grant。全部候選皆不可行才回精確
+wait 理由，不建立任何 job、不留半額度。
+
+`duplicate` 但那筆舊 reservation 已經是終局（`settled`／`released`，例如
+上一次 retry 在 `create_job()` 之前失敗、已呼叫
+`release_reservation_before_spawn`，或已被下方的 reconcile 掃描收斂）——
+job 從未真正建立過，`attempt_id` 依 job 數推算出的計數因此不會前進，下一次
+retry 只會用同一個 `attempt_id`／`decision_id` 撞到同一筆已終結的 duplicate。
+`reserve_for_candidate_with_generation_fallback` 把『世代』疊在 attempt_id
+之上（世代 0 就是原始 attempt_id，世代 ≥1 附加 `:g{generation}`），偵測到
+duplicate-且終局時決定性地換算下一個世代重新 reserve，直到拿到
+`granted`／`denied`／`conflict`，或撞到仍是 `reserved`／`bound` 的 duplicate
+（held-elsewhere，交由既有判斷）——同一次呼叫只會在探測到的第一個尚未
+終結的世代真正改變狀態，不會一次 retry 產生兩個 grant。
+
+Reservation 的 `reserve → create_job → bind(job_id) → spawn` 順序嚴格對應
+#838 現行協定：job 記錄一旦建立即 `bind()`，之後只能經 `settle()`（含派工時
+429／infra 失敗）或 `reconcile()` 結束；job 記錄建立前失敗才用
+`release(reason="fail-before-spawn")`。settle 之後（不論成功或失敗）與
+periodic reconcile 收斂 `bound` reservation 一樣，共用同一個
+`_quota_admission_record_terminal_usage` helper 呼叫
+`QuotaShadowService.record_terminal_usage()` 記終局 usage——spawn 時 429／
+infra 失敗不必等到 restart 後的 reconcile 掃描才補記消耗；settle 本身結構性
+被拒（例如 bind 前就已經被別的路徑處理過）時不記，交給既有 reconcile 依
+job registry 事實判定。`reconcile_bound_reservations()` 另外提供
+restart／crash 後的收斂掃描——job registry 查不到時一律 `inconclusive`
+（不因為查不到就假設已終止並釋放額度），只有確認終局才釋放。
+
+`reconcile_reserved_reservations()` 收斂 `create_job()` 之後、`bind()` 之前
+crash 留下的無 job_id reservation；掃描目標直接來自
+`QuotaReservationAuthority.list_by_state("reserved", ...)`（唯讀新增 API，
+不改 #838 狀態機／寫入協定），不依賴任何下游 `AdmissionDecisionStore` 是否
+成功記錄這筆決策——合法持有者在 `reserve()` 成功後、寫入 admit receipt 之前
+crash（或 receipt 寫入本身失敗）時，這筆 reservation 仍會被掃到並依 job
+registry 事實安全收斂或維持，不會因為 receipt 從未落地就對收斂掃描永久
+隱形、卡死容量。
+
+每個 decision 都有耐久、append-only 的 receipt（`AdmissionDecisionStore`，
+已登記於 Trust Root），綁定 `run_id`／`card_id`／`attempt_id`／`profile_key`
+與 qualification／observation／demand／policy 版本，以及被排除候選與理由；
+同一個 attempt 重送冪等回放，不會二次扣款或搬活 job。admit receipt（含
+shadow 與未受額度管理的候選）與 wait receipt 一樣先讀舊值、有紀錄就直接
+沿用不重寫——`generated_at_ms` 是每次呼叫當下的時間戳，retry 必然與上一次
+不同，若無條件 `record()` 會被判定成內容衝突而丟例外；store 讀寫任何錯誤
+（含衝突、IO、損毀）一律靜默降級為 `None`，只影響這筆診斷投影，絕不讓
+shadow（本該完全旁觀）也被這個純診斷寫入拖累而改變既有派工結果。全部候選
+皆不可行（enforce 下的 `quota-admission-insufficient`）或 quota-pools 設定
+檔本身無效（`quota-config-invalid`）時，同樣留一筆 outcome `wait` 的 receipt
+並更新 `WorkflowRun.quota_admission[persona]` 投影——不再只標
+`needs_human`；receipt 冪等（同一個 attempt 只留第一次觀察到的拒絕快照），
+store 讀寫失敗一律靜默降級，絕不會讓已經確定的 fail-closed 派工結果變成
+派工。#837 operational
+usage forecast 尚未落地前，demand 只用明確標示版本的 fixture
+（`DEMAND_FIXTURE_VERSION`），receipt 上的 `demand_version` 因此可精確分辨
+「這是 fixture」還是「這是真預測」。
+
+`quota_admission_enabled()` 是本模組自己的 opt-in 開關
+（`PSC_QUOTA_ADMISSION_ENFORCE`），與 #838 的開關各自獨立：預設皆為
+shadow——manager 只在有呼叫端明確傳入 `quota_admission.DispatchContext`
+時才會呼叫任何一行本模組（`dispatch_workflow_card`／`resume_workflow_run`
+新增的 `quota_admission_context` 參數，缺省 `None`），shadow 模式下只用
+唯讀投影記一份 decision receipt 供觀察，不呼叫 `reserve()`、不改變既有派工
+結果；rollback 只需把環境變數改回非 `on`（或整條不接線 context），不需要
+刪除已經寫下的 decision receipt／reservation／consumption 證據。
+
+### Production 接線：`manager_daemon.py` 與 quota-pools 設定檔
+
+`manager_daemon.py` 在 workflow start、operator resume（`workflow-action`／
+`work-action` 兩條 resume／retry 路徑）與 periodic resume 全部五個
+dispatch／resume 呼叫點，都會以下述設定檔建構同一份 `DispatchContext` 並
+傳入；periodic tick 另外呼叫 `manager.reconcile_quota_admission_reservations()`
+收斂 `reserved`（`create_job()` 之後、`bind()` 之前 crash 留下的無 job_id
+reservation）與 `bound` 兩種狀態，job 進終局時若 binding 可解析，同時透過
+`QuotaShadowService.record_terminal_usage()` 記消耗（成功／失敗都記，
+infra／429 失敗不改寫品質分類）。
+
+Manager 讀取 `paulsha_cortex.config.paths.quota_pools_config_path()`
+（預設 `~/.config/paulshaclaw/quota-pools.json`，可用 `PSC_QUOTA_POOLS_CONFIG`
+覆寫整個檔案路徑；比照既有 `paulshaclaw.yaml`，這是 operator-owned app 設定，
+不是 Trust Root 治理的 durable-state 資產），schema 為 `cortex/quota-pools/v1`：
+
+```json
+{
+  "schema": "cortex/quota-pools/v1",
+  "config_revision": "<operator 自訂版本字串，供稽核>",
+  "descriptors": [ /* #836 PoolDescriptor 原始 payload，見 parse_pool_descriptor */ ],
+  "unit_catalog": [ /* #836 UnitDefinition 原始 payload，可為空陣列 */ ],
+  "bindings": [ /* #836 ProfilePoolBinding 原始 payload，見 parse_binding */ ],
+  "lease_ms": 900000,
+  "usage_unit_refs": { "input_tokens": ["token", "1"] }
+}
+```
+
+`descriptors`／`unit_catalog`／`bindings` 逐字複用 #836
+`quota_observation.parse_pool_descriptor`／`parse_unit_definition`／
+`parse_binding` 的既有驗證，本模組不自寫第二套 schema；`lease_ms`（選填，
+預設 900000ms）與 `usage_unit_refs`（選填，終局 usage metric → unit ref
+對照，供 periodic tick 呼叫 `record_terminal_usage` 用）皆有明確預設，缺席
+不視為錯誤。
+
+三態行為：
+
+- **檔案不存在** → 整條線沒接上，與 #839 落地前逐字相同，任何模式皆不
+  受影響。
+- **檔案存在但無效**（結構錯誤、pool／unit／binding 驗證失敗等）：
+  - shadow（`PSC_QUOTA_ADMISSION_ENFORCE` 未開）→ 記一筆錯誤 log，降級為
+    「沒接上」，不擋派工。
+  - enforce（`PSC_QUOTA_ADMISSION_ENFORCE=on`）→ fail closed：在建立任何
+    job／worktree 之前回精確等待理由 `quota-config-invalid`，零 job、零假
+    job_id（走 #830 非 Job 決策契約）。
+- **檔案存在且有效** → 建構真正的 file-backed `DispatchContext`
+  （`QuotaEventLedger`／`QuotaReservationAuthority`／`AdmissionDecisionStore`
+  皆用各自模組預設路徑）。以檔案內容 sha256 digest 快取解析結果；operator
+  編輯過的檔案下一次讀到的 digest 改變即自動重新解析，不需要重啟 daemon。
+
+**Opt-in／rollback**：預設（無設定檔）與 shadow（有設定檔但
+`PSC_QUOTA_ADMISSION_ENFORCE` 未開）皆不改變既有派工結果，只多寫 decision
+receipt 供觀察。要讓額度不足真的擋派工，必須同時滿足「設定檔存在且有效」
+與「`PSC_QUOTA_ADMISSION_ENFORCE=on`」。Rollback 只需移除設定檔或把環境
+變數改回非 `on`，不需要刪除已經寫下的 decision receipt／reservation／
+consumption 證據——那些是耐久稽核紀錄，rollback 只改變新決策的政策，不洗
+掉歷史。
+
+真正的 #836 provider 觀測來源（另一位同事在做的 collector）尚未接上時，
+`descriptors` 對應的 pool 一律回報 `unknown`；shadow 模式下這只影響
+decision receipt 的 `assessment` 欄位，enforce 模式下 `unknown` 視為不可行
+（AC2）。installed／live canary（在生產環境實際重啟 daemon、驗證真實
+provider 讀取與長期運作）仍是獨立的部署 gate，本節只交付到「daemon 進程內
+的接線與設定檔消費」。
+
+### 決策 receipt 的投影欄位（#840）
+
+`AdmissionDecisionStore` 的 decision receipt 新增三個選填欄位，供
+`paulsha_cortex.monitor.decision_projection`（見上面 `cortex status` 的
+`quota_decision` 欄位說明）投影使用，缺席（#840 之前寫的舊 receipt）時投影
+一律視為 `unknown`，不臆測成 confirmed：
+
+- `policy_config_revision`：這筆決策當時使用的 operator quota-pools 設定檔
+  `config_revision`（來自 `DispatchContext.config_revision`，由
+  `manager_daemon.py` 從設定檔載入結果帶入）。
+- `selected_observation_state`／`selected_feasible`：選中候選當時的額度
+  observation 狀態（`unmanaged`／`known`／`unknown`）與是否所有綁定 pool
+  都 sufficient——shadow 模式下候選即使 `unknown`／不可行一樣會被 admit，
+  這兩個欄位讓投影面能忠實區分「confirmed 可派」與「shadow 下明知不可行
+  仍放行」。
+
+這是唯讀投影新增的欄位，不改變 #839 的准入邏輯或 reservation 生命週期。
+
+### 對抗審查第四輪修法：mode 隔離、精確反查、provisioning 續租
+
+`decision_id_for()` 新增必填 `mode` 參數（`"shadow"`／`"enforced"`），一併
+納入雜湊輸入——同一個 attempt／profile 先以 shadow 觀察、operator 隨後才
+把 `PSC_QUOTA_ADMISSION_ENFORCE` 開成 `on` 重試時，兩者現在算出不同的
+decision_id，各自冪等寫入、彼此不覆蓋；`WorkflowRun.quota_admission[persona]`
+因此能正確反映「這次是 enforced」而不會卡在舊的 shadow 快照。
+`reconcile_bound_reservations()` 也不再以 `AdmissionDecisionStore.enforced_admitted()`
+反查候選——改與 `reconcile_reserved_reservations()` 一致，直接以
+`QuotaReservationAuthority.list_by_state("bound", ...)` 為出發點；任何一筆
+`bound` reservation 即使對應的 admit receipt 從未成功寫入（IO／衝突／
+mode 隔離之前的舊碰撞），也不會對這支收斂掃描永久隱形。
+
+`reconcile_reserved_reservations()` 的反查依據從「依 `attempt_id` 的 ordinal
+猜測」改成「依 job 建立時記錄的 `quota_decision_id` 精確比對」——多個
+Manager instance 交錯派工時（instance A 對候選 A 的某個 attempt `reserve()`
+後 crash，instance B 改派候選 B 建出剛好同一個 ordinal 的 job），舊實作會
+把 B 的 job 誤當成 A 的存活證據。`registry.create_job()` 新增選填欄位
+`quota_decision_id`（純加法，缺席回 `None`，向後相容舊版 job／registry
+讀取端），只有真的取得 reservation 的候選才會寫入這個欄位（shadow／未受
+額度管理的候選維持 `None`，與完全沒接線時的 job 記錄逐字相同）。
+
+Lease 過期本身仍然永不證明可以釋放（既有設計不變），但 provisioning
+（worktree／sandbox 建立）耗時可能超過單次 lease：`QuotaReservationAuthority`
+新增 `renew()`（純加法事件種類，只允許從 `reserved` 續租，`bind()` 之後的
+續租仍是既有 `reconcile(confirmed-alive)` 分支的責任，不重疊）；
+`_dispatch_workflow_card` 拿到 grant 之後立刻續租一整個新的 `lease_ms`
+窗口，同時把 reservation 標進 process-global 的
+`quota_admission.IN_FLIGHT_DISPATCHES`（純記憶體、不耐久，process 重啟即
+清空）。`reconcile_reserved_reservations()` 新增選填 `grace_ms`（額外寬限，
+預設 `0` 逐字沿用舊行為；daemon 端傳入一整個 `lease_ms`）與 `in_flight`
+（給定時，即使 lease＋寬限都已過期，只要本 process 自己知道這筆
+reservation 還在 provisioning 就續租而不釋放）；兩者皆為次要防線，主要
+防線是上面的 provisioning 續租。quota-pools 設定檔的 `lease_ms` 新增下限
+（1 分鐘，低於視為設定錯誤，`quota-config-invalid` fail closed）——太短的
+lease 會讓上述安全網疲於奔命地追續租。
+
+即使有這些安全網，`bind()` 仍可能在極端情況（例如續租呼叫本身失敗、clock
+skew）撞上 `conflict`／`reservation-already-terminal`（reservation 已被
+結束）：job 記錄這時已經建立，`_dispatch_workflow_card` 會把它標記失敗
+（不記 `provider_outcome`，避免誤觸 #825/#826 的 executor backoff 分類——
+這不是 executor 的錯）、留一筆 `outcome=wait` 的 decision receipt 並更新
+`WorkflowRun.quota_admission[persona]`，再讓例外照既有「job 已建立、spawn
+前失敗」的 fail-closed 路徑傳播——絕不假稱成功、絕不 spawn。
+
 ## Execution profile schema／key core
 
 `paulsha_cortex.coordinator.execution_profile` 是 #849 的純 stdlib
@@ -689,6 +912,7 @@ systemctl --user status cortex-manager.service cortex-monitor.service
   - 落後達 `threshold_commits`（預設 10，可用 `PSC_CANDIDATE_BASE_STALE_THRESHOLD_COMMITS` 覆寫）時，`reason` 為具名診斷 `candidate-git-base-stale`——代表「這條 run 的基底過舊、已 merge 的 test-only 修復進不去」。
   - 距離是相對 **mirror 上次 fetch 到的 `refs/remotes/origin/main`** 算的，不是相對 GitHub 此刻的 main：status 是唯讀路徑，`fetched` 恆為 `false`（fetch 是 claim 的職責）。讀不到 mirror／算不出距離時，`behind_origin_main` 落 `<unresolved:MirrorRootUnset>`／`<unresolved:MirrorMainUnreadable>`／`<unresolved:BaseNotInMirror>`，`reason` 為 `candidate-git-base-distance-unresolved`；run 還沒有基底（define／plan 階段）時 `reason` 為 `candidate-git-base-absent`。
   - 同一份資料也出現在 `cortex work show <work_id>`（文字模式與 `--json` 皆有）。
+- `quota_decision`（#840）：quota-aware admission（#839）決策與額度等待來源的唯讀投影，只在這條 run 真的有 #839 證據時才出現。欄位含 `wait`（額度等待——非 Job 決策，例如 `quota-admission-insufficient`／`quota-config-invalid`，直接沿用 #527 `blocking_reason` 的 `reason`／`detail`／`next_step_hint`／`context`，不自行編造）與 `personas`（依 persona 分列：`decision_id`、`mode`（`shadow`／`enforced`）、`outcome`、`policy_version`、`policy_config_revision`（operator quota-pools 設定檔的 `config_revision`）、`observation_version`、`demand_version`、`qualification_version`、`requested_profile_key`／`resolved_profile_key`、`selected`／`excluded`（僅 `executor`／`model_id`／`independence_domain`／`exclusion_reason`——不含 credential、env、raw prompt）、`reservation_id`，以及 `classification`（`demand`：`confirmed`／`estimated`（#837 forecast 落地前的 fixture）／`not-applicable`；`observation`：`confirmed`／`unknown`／`not-applicable`，缺 provenance 或候選本身 unknown remaining 一律 `unknown`，不呈現成『現在可派』）。decision store 暫時讀不到時保留上一次成功讀到的內容，並附 `stale: true`、`stale_reason`、`stale_since_ms`。與 `cortex work show <work_id>` 共用同一份投影，兩者對同一份 snapshot 保證一致。
 - `not_claimable`（#669）：claim 判定**現在不可 claim、且刻意不建立 run** 的 work item。最典型的是 `docs/superpowers/workstreams/*`——那類 work item 設計上就不對應單一 issue，`missing_issue` 是**預期狀態而非異常**，過去卻被物化成停在 `current_phase: claim`、永遠不會推進的 `needs_human` run（實測一次產出 24 個，把 `attention` 信噪比壓成 1:24）。現在改記在耐久的 `<coordinator_root>/not-claimable.json`（schema `cortex-not-claimable/v1`），欄位含 `reason`、`detail`、`first_observed_at`／`last_observed_at`／`observations`（卡多久了）與 `next_step_hint`（照抄即可執行的下一步）。work item 一旦變成可 claim，該筆紀錄於下一次判定時自動消失；work item 從 snapshot 移除時，claim scan 收尾也會一併清除其紀錄。`attention` 因此只留可行動的項目，被跳過的項目也不會變成盲區。
 - `recent_done`：最近退出的 job 或進入 terminal gate 的 slice 摘要，含 `slice_id`、`gate_status`、`at`、`exited_at`、`gate_reason`、`job_id`、`branch`、明確的 `repo` project 歸屬（manifest 缺該欄時為 `null`）。`at` 是 handoff manifest 完成時間；`exited_at` 來自 registry 中綁定 job 的實際退出時間。workflow job 另帶綁定 run 的 `run_id`、`work_id`、`run_status`（`ongoing`／`superseded`／`done`），缺少 registry 證據時欄位為 `null`。`attention`／`slices` 也只接受明確的 slice 或 workflow job repo；不從 branch、worktree 或 path 猜測 project。只回溯 `--recent-done-window-seconds`（預設 86400 秒／24 小時，可用 `PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS` 覆寫）內完成的 handoff manifest；window 內沒有資料時回空陣列，不會回退撈更舊的紀錄，過期 manifest 檔案本身的清理屬於 #178 program teardown GC 的範圍，不在 `recent_done` provider 職責內。
 

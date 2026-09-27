@@ -140,6 +140,20 @@ def quota_reservation_root() -> Path:
     return coordinator_root() / QUOTA_RESERVATION_DIRNAME
 
 
+QUOTA_ADMISSION_DIRNAME = "quota-admission-decisions"
+
+
+def quota_admission_decisions_root() -> Path:
+    """#839 Manager-owned quota-aware admission decision receipt 根。
+
+    與 `quota_reservation_root()` 同層但獨立目錄：decision receipt 只記錄
+    「這次准入決策長什麼樣子」（append-only、無狀態機），與 #838 reservation
+    的原子生命週期是兩個不同的寫入面，分開落地不必互相牽動對方已審查過的
+    schema。
+    """
+    return coordinator_root() / QUOTA_ADMISSION_DIRNAME
+
+
 #: `review_verdict_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數
 #: 是為了讓 `coordinator/review.py` 的 per-job 定址與本 resolver 共用同一個字面量
 #: （R1 登記表的「重複路徑推導」Scenario 要求單一真相）。
@@ -532,6 +546,21 @@ def config_root() -> Path:
 
 def config_path(*parts: str) -> Path:
     return config_root().joinpath(*parts)
+
+
+def quota_pools_config_path() -> Path:
+    """#839 operator-owned quota-pools 設定檔（schema ``cortex/quota-pools/v1``）。
+
+    與既有 ``paulshaclaw.yaml``（見 ``monitor/config.py``）同一族：住在
+    ``config_root()``（``~/.config/paulshaclaw``），不是治理平面的
+    durable-state 資產（比照 `ACKNOWLEDGED_NON_ASSET_PATHS` 對 `config_root`
+    的既有豁免——Manager 對它唯讀消費，operator 直接編輯，不走 Trust Root
+    的 managed-directory 生命週期）。支援 ``PSC_QUOTA_POOLS_CONFIG`` 覆寫
+    整個檔案路徑，沿用 `_env_path` 既有慣例；檔案不存在時呼叫端
+    （``quota_admission.load_quota_pools_config``）視為『尚未接線』，行為
+    與 #839 落地前逐字相同。
+    """
+    return _env_path("PSC_QUOTA_POOLS_CONFIG") or config_path("quota-pools.json")
 
 
 def project_config_root() -> Path:

@@ -2824,6 +2824,7 @@ class JobRegistry:
             "runtime_principal", "runtime_mode", "runtime_surface",
             "prompt_path",
             "template_instance",
+            "quota_decision_id",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
@@ -3900,6 +3901,7 @@ class JobRegistry:
         credential_publish: bool = False,
         prompt_path: str | None = None,
         dispatch_reroute: Mapping[str, Any] | None = None,
+        quota_decision_id: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -3996,6 +3998,16 @@ class JobRegistry:
             "credential_publish": credential_publish,
             "prompt_path": prompt_path,
             "dispatch_reroute": None if dispatch_reroute is None else dict(dispatch_reroute),
+            # #839 對抗審查第四輪 MAJOR（manager.py:11603）：job 建立時就記錄
+            # 它對應的 quota admission decision_id（若有），讓 restart 後的
+            # reserved-sweep 能精確反查『這個 job 到底是不是這筆 reservation
+            # 的證據』，取代舊版依 run/card + job 數 ordinal 猜測、多 Manager
+            # instance 交錯時會誤配到不相關候選的作法。新增欄位、預設
+            # `None`——舊版 job（本欄位新增之前建立）讀回時天然缺這個鍵，
+            # `.get("quota_decision_id")` 回 `None`，不等於任何真實
+            # decision_id，因此永遠不會被誤配到（見
+            # `manager._quota_admission_job_lookup_by_decision` 文件字串）。
+            "quota_decision_id": quota_decision_id,
             "runtime_diagnostic": None,
             "workflow_evidence": None,
             # #384：executor 失敗的 typed 分類（見 provider_outcome.py），只在
@@ -5278,6 +5290,7 @@ class JobRegistry:
         resolved_model_chain: dict[str, dict[str, str]] | None = None,
         execution_profile_bindings: dict[str, dict[str, Any]] | None = None,
         model_qualification: dict[str, str] | None = None,
+        quota_admission: dict[str, dict[str, str]] | None = None,
         combo_selection: dict[str, Any] | None = None,
         stage_reuse_receipts: dict[str, dict[str, Any]] | None = None,
         needs_human_reason: DiagnosticReason | Mapping[str, Any] | None = None,
@@ -5404,6 +5417,11 @@ class JobRegistry:
                 current.model_qualification
                 if model_qualification is None
                 else model_qualification
+            ),
+            quota_admission=(
+                current.quota_admission
+                if quota_admission is None
+                else quota_admission
             ),
             combo_selection=(
                 current.combo_selection if combo_selection is None else combo_selection
