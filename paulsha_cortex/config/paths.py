@@ -103,6 +103,11 @@ def execution_qualification_index_path() -> Path:
     return execution_qualification_root() / "index.json"
 
 
+def requirement_delivery_index_root() -> Path:
+    """Manager-owned, read-only-rebuildable requirement delivery index root."""
+    return coordinator_root() / "requirement-delivery"
+
+
 def coverage_shadow_telemetry_root() -> Path:
     """v4 R1（方案 A）coverage validator shadow 的 disagreement telemetry 落點。
 

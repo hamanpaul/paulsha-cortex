@@ -3555,6 +3555,7 @@ class PathLayout:
             "execution-qualification-operator-receipt-index": f"{c}/execution-qualification/operator-receipt-index.json",
             "execution-qualification-roster": f"{c}/execution-qualification/approved-roster.json",
             "execution-qualification-index": f"{c}/execution-qualification/index.json",
+            "requirement-delivery-index": f"{c}/requirement-delivery",
             "dispatch-specs-tree": self.specs_root,
             "runtime-run-tree": self.run_root,
             "builder-job-codex-home-root": f"{a}/runtime/codex-home/builder",

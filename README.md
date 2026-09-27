@@ -172,6 +172,30 @@ ln -s "$repo_root/skills/driving-cortex" "$HOME/.agents/skills/driving-cortex"
 
 ## Usage
 
+### 需求交付總帳（#845）
+
+refine R01–R14 的版本化需求、acceptance criteria、evidence policy 與 owner 對照在
+[`refine-requirements-v1.json`](docs/superpowers/specs/refine-requirements-v1.json)；
+驗證來源、CompletionRecord、remote closure、#841 loaded-runtime receipt、live receipt
+及 crash/CAS 索引語意見[需求交付總帳契約](docs/superpowers/specs/requirement-delivery-accounting.md)。
+
+```bash
+cortex delivery status
+cortex delivery gaps --manifest docs/superpowers/specs/refine-requirements-v1.json \
+  --snapshot "$PSC_COORDINATOR_ROOT/evidence/requirement-delivery/source-snapshot.json" \
+  --source-root "$(git rev-parse --show-toplevel)" \
+  --checkout "hamanpaul/paulsha-cortex=$(git rev-parse --show-toplevel)"
+```
+
+`status` 是最近一次 reconcile 的唯讀投影；`gaps` 即時重驗但不寫入；`reconcile` 才以 CAS
+更新 Trust Root 登記的可重建索引。命令不派工、不呼叫模型、不 merge、不部署、不改 issue
+或關票。installed 證據沿用 #841 receipt；live 證據已固定接上
+`paulsha_cortex/coordinator/live_receipt_validators.py` 的封閉登記表 validator，只認得
+deployment-canary `qualification.json`（沿用 `qualification/validate.py`）與 #857
+`cortex/task-memory-live-canary/v1` 兩種 receipt kind，兩者都綁定該需求 claim 的
+artifact/target；receipt 缺失、kind 不在登記表內或內容不符綁定規則時保留具體 gap，
+規則詳見[需求交付總帳契約](docs/superpowers/specs/requirement-delivery-accounting.md)。
+
 ### 10 分鐘上手：`cortex bootstrap`
 
 乾淨機器或新 workspace 建議先跑一次 bootstrap，把 preflight、service install/start 與基本健檢串成單一入口：

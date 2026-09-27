@@ -1739,6 +1739,14 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         note="#842 revision/CAS 唯一 lifecycle 真值；receipt 缺失時查詢 fail-closed。",
     ),
     TrustRootAsset(
+        "requirement-delivery-index", _T1, _MO,
+        "paulsha_cortex.config.paths:requirement_delivery_index_root",
+        (Principal.MANAGER,),
+        (Principal.MANAGER, Principal.MONITOR),
+        IngressKind.DIRECT_FILE_WRITE,
+        note="由 Manager CAS 更新、可從可信 evidence 重建的需求交付衍生索引。",
+    ),
+    TrustRootAsset(
         "dispatch-specs-tree", _T0, _MO, "paulsha_cortex.config.paths:specs_root",
         (Principal.MANAGER, Principal.PLANNER, Principal.ANY_SAME_UID),
         (Principal.MANAGER,),
