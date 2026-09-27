@@ -1263,25 +1263,35 @@ def _manifest_execution_identity(
     return {**identity, **lifecycle_fields}
 
 
-def _workflow_execution_identity(registry, run) -> dict[str, Any]:
+def _workflow_execution_identity(
+    registry, run, *, jobs: list[Mapping[str, Any]] | None = None
+) -> dict[str, Any]:
     """Project the current workflow card's planned/actual/last identity.
 
     Selection is intentionally ordered as current-card in-flight, current-card
     terminal execution, planned step, then unknown.  A job from another card,
     run, phase, or explicit repository is not evidence for this projection.
+
+    ``jobs``（#840 對抗審查第四輪）：呼叫端（`workflow_status_entry`）可以
+    傳入這一輪快照已經讀過的完整 job 清單，讓 `_workflow_quota_decision_projection`
+    共用同一份 `registry.list_jobs()` 結果，不必各自重讀（見票面：『不額外
+    全檔讀取』）。省略時維持逐字既有行為——自己呼叫 `registry.list_jobs()`。
     """
     if not getattr(run, "steps", None):
         return _unknown_execution_identity()
     step = _current_workflow_step(run)
     if step is None:
         return _unknown_execution_identity()
-    jobs: list[Mapping[str, Any]] = []
-    lister = getattr(registry, "list_jobs", None)
-    if callable(lister):
-        try:
-            jobs = [job for job in lister() if isinstance(job, Mapping)]
-        except Exception:  # noqa: BLE001 - status projection is fail-soft
-            jobs = []
+    if jobs is None:
+        jobs = []
+        lister = getattr(registry, "list_jobs", None)
+        if callable(lister):
+            try:
+                jobs = [job for job in lister() if isinstance(job, Mapping)]
+            except Exception:  # noqa: BLE001 - status projection is fail-soft
+                jobs = []
+    else:
+        jobs = [job for job in jobs if isinstance(job, Mapping)]
     matching = [
         job
         for job in jobs
@@ -1661,7 +1671,25 @@ def workflow_status_entry(
         ).to_dict()
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         candidate_git_base = None
-    execution_identity = _workflow_execution_identity(registry, run)
+    # #840 對抗審查第四輪：這一輪快照只讀一次 `registry.list_jobs()`，
+    # `_workflow_execution_identity`（#828 既有）與
+    # `_workflow_quota_decision_projection`（本票新增的 job 事實 attempt
+    # 判定）共用同一份結果，不各自重讀（票面：『不額外全檔讀取』）。
+    # `registry` 可能是 `None`／沒有 `list_jobs` 的假物件（既有測試如
+    # `test_planning_artifact_manifest_binding_802.py`），或 `list_jobs()`
+    # 本身會拋例外（`test_candidate_base_visibility_731.py` 的
+    # `_Broken`）——都保守回 `None`，交給兩個投影函式各自既有的 fail-soft
+    # 處理（`_workflow_execution_identity` 省略時會自己再嘗試一次；
+    # `_workflow_quota_decision_projection` 收到 `None` 時視為『沒有能力
+    # 提供 job 事實』，不臆測）。
+    registry_jobs: list[Mapping[str, Any]] | None = None
+    lister = getattr(registry, "list_jobs", None)
+    if callable(lister):
+        try:
+            registry_jobs = [job for job in lister() if isinstance(job, Mapping)]
+        except Exception:  # noqa: BLE001 - 呈現面不得因這次讀取失敗而讓 status 死掉
+            registry_jobs = None
+    execution_identity = _workflow_execution_identity(registry, run, jobs=registry_jobs)
     entry = {
         "kind": "workflow_run",
         "run_id": run.run_id,
@@ -1696,7 +1724,7 @@ def workflow_status_entry(
     # `needs_human_reason` 皆為 None／與額度無關）時整段略過，維持既有
     # attention 條目形狀不變。
     quota_decision = _workflow_quota_decision_projection(
-        run, store=quota_decision_store, cache=quota_decision_cache,
+        run, store=quota_decision_store, cache=quota_decision_cache, jobs=registry_jobs,
     )
     if quota_decision is not None:
         entry["quota_decision"] = quota_decision
@@ -1705,6 +1733,7 @@ def workflow_status_entry(
 
 def _workflow_quota_decision_projection(
     run, *, store: object | None, cache: object | None,
+    jobs: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """`workflow_status_entry` 的 quota-decision 投影掛載點。
 
@@ -1713,6 +1742,14 @@ def _workflow_quota_decision_projection(
     ``None``——沒有任何證據時完全不出現在 entry 上，維持既有 attention
     形狀不變。呈現面失效不得讓整份 status 死掉（比照上面
     `candidate_git_base` 的既有 fail-soft 慣例）。
+
+    ``jobs``（#840 對抗審查第四輪）：`workflow_status_entry` 這一輪快照已經
+    讀過的完整 `registry.list_jobs()` 結果（可能是 ``None``——registry 沒有
+    `list_jobs` 或讀取失敗，見呼叫端），這裡篩成這個 run 的 job rows（見
+    `decision_projection.jobs_for_run_from_rows`）交給
+    `project_workflow_quota_admission` 的 admit 分支 attempt 判定，取代已
+    證實不可靠的 step executor／model 比對——與 `cortex work show`
+    （Monitor provider）共用同一套判準，見該函式文件字串。
     """
 
     from paulsha_cortex.monitor import decision_projection as _decision_projection
@@ -1744,6 +1781,7 @@ def _workflow_quota_decision_projection(
             current_identity_by_persona=_decision_projection.current_identity_by_persona_from_steps(
                 getattr(run, "steps", None)
             ),
+            jobs=_decision_projection.jobs_for_run_from_rows(jobs, run.run_id),
         )
     except Exception:  # noqa: BLE001 - 呈現面不得因投影失敗而讓 status 死掉
         return None

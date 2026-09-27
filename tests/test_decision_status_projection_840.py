@@ -137,6 +137,47 @@ def _quota_admission_pointer(decision: admission.AdmissionDecision) -> dict[str,
     return {"builder": {"decision_id": decision.decision_id, "mode": decision.mode, "outcome": decision.outcome}}
 
 
+def _attempt_id(run_id: str, card: str, ordinal: int) -> str:
+    """`manager._quota_admission_attempt_id` 的既有格式，供 fixture 建構
+    真正對得上『第 ordinal 個 job』的 decision.attempt_id——不寫第二套解析，
+    只是照格式拼字串。"""
+    return f"{run_id}:{card}:n{ordinal}"
+
+
+def _job(
+    registry: JobRegistry,
+    run,
+    tmp_path: Path,
+    *,
+    card: str,
+    status: str = "dispatched",
+    executor: str | None = "codex",
+    model_id: str | None = "gpt-5.3-codex",
+):
+    """對抗審查第四輪（本票 live 缺陷）：建立一筆真正的 registry job，讓
+    `decision.attempt_id` 的 ordinal 能反查到它——比照
+    `tests/test_workflow_execution_identity_828.py` 既有的同名 helper。
+    預設 ``status="dispatched"``（in-flight），對應票面重現的 live 場景：
+    job 已派出並在執行，`WorkflowStep.executor`／`model` 仍為 ``None``。"""
+    job = registry.create_job(
+        task=f"{run.run_id}-{card}",
+        persona="builder",
+        branch="feature/decision-status-840",
+        pane="",
+        worktree=str(tmp_path / f"worktree-{card}-{len(registry.list_jobs())}"),
+        executor=executor,
+        model_id=model_id,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card=card,
+        workflow_phase=run.current_phase,
+    )
+    if status != "dispatched":
+        registry.update_status(job["job_id"], status)
+    return job
+
+
 # ---------------------------------------------------------------------------
 # AC1：多卡／retry／跨 run-card exact-key fixture
 # ---------------------------------------------------------------------------
@@ -416,20 +457,24 @@ def test_planned_identity_does_not_fabricate_actual_and_has_no_quota_evidence(tm
 def test_status_entry_and_work_show_row_agree_on_same_snapshot(tmp_path: Path) -> None:
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
-    # 對抗審查第三輪（MAJOR）：步卡的 executor／model 必須與下面 admit
-    # 決策的 `selected` 一致——`WorkflowRegistryProvider.scan()` 現在會比對
-    # 兩者是否相符（見 `_current_persona_identity_from_steps`），不一致會
-    # 被判成『目前 attempt 尚無決策』而不是這裡要驗證的完整投影。
+    # 對抗審查第四輪（本票 live 缺陷）：目前 attempt 的判定改成看 job 事實
+    # （見 `decision_projection._attempt_mismatch_reason` 文件字串），不再
+    # 比對 step 的 executor／model——這裡改成 live 形狀：step 身分維持
+    # ``None``（尚未寫入，真實環境正是如此），改用一筆真正 in-flight 的
+    # registry job 佐證『目前 attempt』，attempt_id 依既有 ordinal 格式對上
+    # 這個 job（第 0 個）。
     run = _run(
         registry, tmp_path, work_id="consistency-840",
-        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+        steps=(_step("build-card", executor=None, model=None),),
         facets=("needs_human",),
     )
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(
         decision_id="adm:v1:" + "b" * 64, run_id=run.run_id, card_id="build-card",
+        attempt_id=_attempt_id(run.run_id, "build-card", 0),
     )
     store.record(decision)
+    _job(registry, run, tmp_path, card="build-card")
     registry._manager_update_workflow_run(
         run.run_id, quota_admission=_quota_admission_pointer(decision),
     )
@@ -681,14 +726,20 @@ def test_daemon_wired_cache_persists_across_snapshot_ticks_for_last_good_stale(
     from paulsha_cortex.coordinator import manager_daemon
 
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
-    # step 身分與 decision.selected 一致（status 路徑也套用當前 attempt 比對）。
-    run = _run(registry, tmp_path, work_id="daemon-840", steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),))
+    # 對抗審查第四輪（本票 live 缺陷）：目前 attempt 改以 job 事實判定，
+    # step 身分維持 ``None``（尚未寫入）；一筆真正 in-flight 的 registry
+    # job 佐證『目前 attempt』（status 路徑也套用同一個判準）。
+    run = _run(registry, tmp_path, work_id="daemon-840", steps=(_step("build-card", executor=None, model=None),))
     # 用預設路徑的 store——per-test 隔離環境（見 conftest.py 的
     # `_clear_runtime_env`）保證這與 `build_runtime_status_provider()` 內部
     # 建立的 `AdmissionDecisionStore()` 指向同一個檔案。
     store = admission.AdmissionDecisionStore()
-    decision = _decision(decision_id="adm:v1:" + "9" * 64, run_id=run.run_id, card_id="build-card")
+    decision = _decision(
+        decision_id="adm:v1:" + "9" * 64, run_id=run.run_id, card_id="build-card",
+        attempt_id=_attempt_id(run.run_id, "build-card", 0),
+    )
     store.record(decision)
+    _job(registry, run, tmp_path, card="build-card")
     registry._manager_update_workflow_run(run.run_id, quota_admission=_quota_admission_pointer(decision))
 
     provider = manager_daemon.build_runtime_status_provider(
@@ -744,16 +795,21 @@ def test_old_attempt_receipt_immutable_after_newer_attempt_recorded(tmp_path: Pa
 def test_projection_does_not_mutate_decision_store_or_registry_bytes(tmp_path: Path) -> None:
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
-    # 步卡 executor／model 對齊下面 admit 決策的 `selected`（見
-    # `_current_persona_identity_from_steps` 的比對），確保這裡驗證的是完整
-    # 投影而不是「目前 attempt 尚無決策」的 mismatch 分支。
+    # 對抗審查第四輪（本票 live 缺陷）：一筆真正 in-flight 的 registry job
+    # （而非步卡 executor／model）佐證『目前 attempt』，確保這裡驗證的是完整
+    # 投影而不是「目前 attempt 尚無決策」的 mismatch 分支——見
+    # `decision_projection._attempt_mismatch_reason` 文件字串。
     run = _run(
         registry, tmp_path, work_id="bytes-840",
-        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+        steps=(_step("build-card", executor=None, model=None),),
     )
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
-    decision = _decision(decision_id="adm:v1:" + "0" * 64, run_id=run.run_id, card_id="build-card")
+    decision = _decision(
+        decision_id="adm:v1:" + "0" * 64, run_id=run.run_id, card_id="build-card",
+        attempt_id=_attempt_id(run.run_id, "build-card", 0),
+    )
     store.record(decision)
+    _job(registry, run, tmp_path, card="build-card")
     registry._manager_update_workflow_run(run.run_id, quota_admission=_quota_admission_pointer(decision))
     run = registry.get_workflow_run(run.run_id)
 
@@ -831,14 +887,18 @@ def test_producer_to_snapshot_to_status_cli_end_to_end(tmp_path: Path, capsys) -
 
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
-    # step 身分與 decision.selected 一致（status 路徑也套用當前 attempt 比對）。
-    run = _run(registry, tmp_path, work_id="e2e-840", steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),))
+    # 對抗審查第四輪（本票 live 缺陷）：一筆真正 in-flight 的 registry job
+    # （而非步卡 executor／model）佐證『目前 attempt』（status 路徑也套用
+    # 同一個判準）。
+    run = _run(registry, tmp_path, work_id="e2e-840", steps=(_step("build-card", executor=None, model=None),))
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(
         decision_id="adm:v1:" + "3" * 63 + "4", run_id=run.run_id, card_id="build-card",
+        attempt_id=_attempt_id(run.run_id, "build-card", 0),
         selected_observation_state="known", selected_feasible=True,
     )
     store.record(decision)
+    _job(registry, run, tmp_path, card="build-card")
     registry._manager_update_workflow_run(run.run_id, quota_admission=_quota_admission_pointer(decision))
     run = registry.get_workflow_run(run.run_id)
 
@@ -873,17 +933,19 @@ def test_producer_to_snapshot_to_work_show_end_to_end(tmp_path: Path) -> None:
 
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
-    # 步卡 executor／model 對齊下面 admit 決策的 `selected`，理由同上（見
-    # `_current_persona_identity_from_steps`）。
+    # 一筆真正 in-flight 的 registry job 佐證『目前 attempt』，理由同上
+    # （見 `decision_projection._attempt_mismatch_reason` 文件字串）。
     run = _run(
         registry, tmp_path, work_id="e2e-work-show-840",
-        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+        steps=(_step("build-card", executor=None, model=None),),
     )
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(
         decision_id="adm:v1:" + "5" * 63 + "6", run_id=run.run_id, card_id="build-card",
+        attempt_id=_attempt_id(run.run_id, "build-card", 0),
     )
     store.record(decision)
+    _job(registry, run, tmp_path, card="build-card")
     registry._manager_update_workflow_run(run.run_id, quota_admission=_quota_admission_pointer(decision))
 
     result = WorkflowRegistryProvider(
@@ -939,12 +1001,17 @@ def test_attempt_check_disabled_by_default_preserves_existing_behavior(tmp_path:
 
 
 def test_admit_matches_current_step_identity_stays_available(tmp_path: Path) -> None:
-    """對照組：`current_identity_by_persona` 有傳、且與這筆 admit 決策的
-    ``selected``／``card_id`` 完全相符時，仍完整呈現（本次修法只收斂不相符
-    的情況，不影響正常、當前的 admit 呈現）。"""
+    """對照組（本票 live 缺陷重現的形狀）：job 在飛（``status=dispatched``）、
+    card 相符時，即使 step 身分尚未寫入（``executor``／``model`` 仍為
+    ``None``），admit 仍完整呈現——正式派工路徑先寫 admission receipt、
+    job 建立並 dispatch，`_record_resolved_model_chain()` 寫入 step 身分在
+    那之後才發生，中間這段窗口不得被誤判成『已結束』（見
+    `decision_projection._attempt_mismatch_reason` 文件字串）。本次修法只
+    收斂 job 已終局／查無此 job 的情況，不影響正常、當前的 admit 呈現。"""
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(
-        decision_id="adm:v1:" + "7" * 62 + "32", card_id="build-card",
+        decision_id="adm:v1:" + "7" * 62 + "32", run_id="run-1", card_id="build-card",
+        attempt_id=_attempt_id("run-1", "build-card", 0),
         selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
     )
     store.record(decision)
@@ -954,8 +1021,9 @@ def test_admit_matches_current_step_identity_stays_available(tmp_path: Path) -> 
         quota_admission={"builder": {"decision_id": decision.decision_id, "mode": "shadow", "outcome": "admit"}},
         needs_human_reason=None,
         current_identity_by_persona={
-            "builder": {"card": "build-card", "executor": "codex", "model": "gpt-5.3-codex"},
+            "builder": {"card": "build-card", "executor": None, "model": None},
         },
+        jobs=[{"workflow_run_id": "run-1", "workflow_card": "build-card", "status": "dispatched"}],
         store=store, now_ms=_NOW,
     )
     persona = projection["personas"]["builder"]
@@ -965,16 +1033,17 @@ def test_admit_matches_current_step_identity_stays_available(tmp_path: Path) -> 
 
 
 def test_admit_after_retry_card_identity_reset_is_pending_not_stale(tmp_path: Path) -> None:
-    """`retry-card` 重置卡片（`step.executor`／`step.model` 清成 ``None``，見
-    `registry._manager_reset_workflow_for_retry_card`）後、新 attempt 尚未
-    寫出 receipt 前，``quota_admission["builder"]`` 仍指著上一個（已經結束）
-    attempt 的 admit receipt。傳入從 reset 後的 ``WorkflowRun.steps`` 推導的
-    `current_identity_by_persona` 時，必須偵測到身分已被清空、跟這筆決策的
-    ``selected`` 不再一致，呈現「目前 attempt 尚無決策」，不得沿用舊
-    attempt 的 mode／outcome／selected。"""
+    """對抗審查第四輪（本票 live 缺陷）：attempt n0 的 job 已終局（builder
+    失敗，觸發 retry-card），新 attempt（n1）尚未建立任何 job 前，
+    ``quota_admission["builder"]`` 仍指著 n0 那筆（已經結束）admit receipt。
+    改以 job 事實（不是 step 身分——已證實不可靠，見
+    `decision_projection._attempt_mismatch_reason` 文件字串）判定這個
+    attempt 已結束，呈現「目前 attempt 尚無決策」，不得沿用舊 attempt 的
+    mode／outcome／selected。"""
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     stale_admit = _decision(
-        decision_id="adm:v1:" + "7" * 62 + "33", card_id="build-card",
+        decision_id="adm:v1:" + "7" * 62 + "33", run_id="run-1", card_id="build-card",
+        attempt_id=_attempt_id("run-1", "build-card", 0),
         selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
     )
     store.record(stale_admit)
@@ -985,22 +1054,126 @@ def test_admit_after_retry_card_identity_reset_is_pending_not_stale(tmp_path: Pa
             "builder": {"decision_id": stale_admit.decision_id, "mode": "shadow", "outcome": "admit"},
         },
         needs_human_reason=None,
-        # 模擬 retry-card 重置後的快照：同一張卡，身分已被清空。
         current_identity_by_persona={
             "builder": {"card": "build-card", "executor": None, "model": None},
         },
+        # attempt n0 的 job 已終局（失敗，觸發 retry-card）；n1 尚未建立任何
+        # job——ordinal 1 超出目前已知的 job 數，`_job_for_attempt` 回 None。
+        jobs=[{"workflow_run_id": "run-1", "workflow_card": "build-card", "status": "failed"}],
         store=store, now_ms=_NOW,
     )
     persona = projection["personas"]["builder"]
     assert persona["available"] is False
     assert persona["gap_reason"] == "quota-decision-attempt-superseded"
-    assert persona["mismatch_reason"] == "identity-reset-since-decision"
+    assert persona["mismatch_reason"] == "decision-attempt-ended"
     # 不得沿用舊 attempt 的欄位——operator 讀到的必須是『目前沒有決策』，
     # 不是上一輪的 mode／outcome／selected。
     for leaked_field in ("mode", "outcome", "selected", "excluded", "classification"):
         assert leaked_field not in persona
     # 但保留 decision_id，方便追查那筆已結束 attempt 的舊 receipt。
     assert persona["decision_id"] == stale_admit.decision_id
+
+
+def test_admit_pointer_with_no_job_evidence_at_all_is_pending(tmp_path: Path) -> None:
+    """decision 指向的 attempt ordinal 從未真正建出任何 job（例如 crash 在
+    寫完 receipt、還沒 `create_job()` 之前，或這個 run/card 至今零 job）——
+    `_job_for_attempt` 回 ``None``（查無此 job，不是『job 存在但終局』，是
+    另一條程式碼路徑），同樣視為『這個 attempt 已結束、下一個 attempt 尚無
+    決策』，不臆測、不沿用。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "3b", run_id="run-1", card_id="build-card",
+        attempt_id=_attempt_id("run-1", "build-card", 0),
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(decision)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={"builder": {"decision_id": decision.decision_id, "mode": "shadow", "outcome": "admit"}},
+        needs_human_reason=None,
+        current_identity_by_persona={
+            "builder": {"card": "build-card", "executor": None, "model": None},
+        },
+        jobs=[],  # 這個 run/card 目前完全沒有任何 job。
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is False
+    assert persona["gap_reason"] == "quota-decision-attempt-superseded"
+    assert persona["mismatch_reason"] == "decision-attempt-ended"
+
+
+def test_admit_for_new_attempt_after_retry_is_available_when_its_job_is_in_flight(
+    tmp_path: Path,
+) -> None:
+    """retry-card 後新 attempt（n1）真的選中候選、job 也真的建立且在飛——
+    pointer 換成指向 n1 的新 decision 時，ordinal 1 對應第二個 job
+    （0-based，依既有建立順序），正確判定成當前、完整呈現，不受 n0 那筆
+    已終局的舊 job 影響。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    old_decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "3c", run_id="run-1", card_id="build-card",
+        attempt_id=_attempt_id("run-1", "build-card", 0),
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    new_decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "3d", run_id="run-1", card_id="build-card",
+        attempt_id=_attempt_id("run-1", "build-card", 1),
+        selected={"executor": "claude", "model_id": "sonnet"},
+    )
+    store.record(old_decision)
+    store.record(new_decision)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={
+            "builder": {"decision_id": new_decision.decision_id, "mode": "shadow", "outcome": "admit"},
+        },
+        needs_human_reason=None,
+        current_identity_by_persona={
+            "builder": {"card": "build-card", "executor": None, "model": None},
+        },
+        jobs=[
+            {"workflow_run_id": "run-1", "workflow_card": "build-card", "status": "failed"},
+            {"workflow_run_id": "run-1", "workflow_card": "build-card", "status": "dispatched"},
+        ],
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is True
+    assert persona["outcome"] == "admit"
+    assert persona["selected"] == {"executor": "claude", "model_id": "sonnet"}
+
+
+def test_admit_generation_suffix_attempt_id_resolves_ordinal(tmp_path: Path) -> None:
+    """``decision.attempt_id`` 帶世代後綴（``:g{generation}``，見
+    `quota_admission.generation_attempt_id`——`reserve_for_candidate_with_generation_fallback`
+    在舊世代 reservation 已終局時換算下一個世代重試）時，ordinal 解析仍只看
+    ``:n{k}`` 那段，世代後綴不影響對應到哪個 job——沿用
+    `decision_projection._job_ordinal_from_attempt_id` 文件字串記載的既有
+    規則，不另寫第二套。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "7" * 62 + "3e", run_id="run-1", card_id="build-card",
+        attempt_id=_attempt_id("run-1", "build-card", 0) + ":g2",
+        selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
+    )
+    store.record(decision)
+
+    projection = dp.project_workflow_quota_admission(
+        run_id="run-1",
+        quota_admission={"builder": {"decision_id": decision.decision_id, "mode": "shadow", "outcome": "admit"}},
+        needs_human_reason=None,
+        current_identity_by_persona={
+            "builder": {"card": "build-card", "executor": None, "model": None},
+        },
+        jobs=[{"workflow_run_id": "run-1", "workflow_card": "build-card", "status": "dispatched"}],
+        store=store, now_ms=_NOW,
+    )
+    persona = projection["personas"]["builder"]
+    assert persona["available"] is True
+    assert persona["outcome"] == "admit"
 
 
 def test_admit_pointer_for_superseded_card_is_pending(tmp_path: Path) -> None:
@@ -1160,35 +1333,40 @@ def test_wait_pointer_for_superseded_card_is_pending(tmp_path: Path) -> None:
 
 def test_provider_scan_after_retry_card_reset_reports_pending_not_stale_admit(tmp_path: Path) -> None:
     """端到端（`WorkflowRegistryProvider.scan()`，`cortex work show` 路徑）：
-    先寫一筆正常 admit receipt（步卡身分與 selected 相符）→ 模擬 `retry-card`
-    重置這張卡（`step.executor`／`step.model` 清成 ``None``，`needs_human`
-    facet／理由清空，比照 `registry._manager_reset_workflow_for_retry_card`
-    的既有效果）→ 新 attempt 尚未寫出任何新 receipt 前，`cortex work show`
-    不得沿用重置前那筆 admit receipt 的 mode／selected。"""
+    對抗審查第四輪（本票 live 缺陷）：先派出一個真正 in-flight 的 job
+    （``status=dispatched``，step 身分仍為 ``None``——這正是票面重現的 live
+    形狀本身）→ `cortex work show` 正確顯示這筆 admit → job 轉終局
+    （builder 失敗，觸發 retry-card；同時 step 身分被清空——驗證『清空 step
+    身分』本身不再是判斷依據，job 事實才是）、新 attempt 尚未建立任何 job
+    前，不得沿用重置前那筆 admit receipt 的 mode／selected。"""
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
     run = _run(
         registry, tmp_path, work_id="retry-card-840",
-        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+        steps=(_step("build-card", executor=None, model=None),),
         facets=(),
     )
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(
         decision_id="adm:v1:" + "7" * 62 + "38", run_id=run.run_id, card_id="build-card",
+        attempt_id=_attempt_id(run.run_id, "build-card", 0),
         selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
     )
     store.record(decision)
+    job = _job(registry, run, tmp_path, card="build-card")
     registry._manager_update_workflow_run(run.run_id, quota_admission=_quota_admission_pointer(decision))
 
-    # 修好之前的基準：重置前，`cortex work show` 正確顯示這筆 admit。
+    # 修好之前的基準：job 在飛時，`cortex work show` 正確顯示這筆 admit。
     before_reset = WorkflowRegistryProvider(
         REPO, state_path=state, quota_decision_store=store,
     ).scan().observations["quota_decisions"]["retry-card-840"]
     assert before_reset["personas"]["builder"]["available"] is True
     assert before_reset["personas"]["builder"]["outcome"] == "admit"
 
-    # 模擬 `retry-card`：同一張卡，身分清空、facet／理由清空（`quota_admission`
-    # 指標維持不動——這正是票面描述的『新 attempt 尚未寫出 receipt 前』）。
+    # 模擬 `retry-card`：job 轉終局＋ step 身分清空、facet／理由清空
+    # （`quota_admission` 指標維持不動——這正是票面描述的『新 attempt 尚未
+    # 寫出 receipt 前』）。
+    registry.update_status(job["job_id"], "failed")
     registry._manager_update_workflow_run(
         run.run_id,
         steps=(_step("build-card", executor=None, model=None),),
@@ -1201,6 +1379,7 @@ def test_provider_scan_after_retry_card_reset_reports_pending_not_stale_admit(tm
     persona = after_reset["personas"]["builder"]
     assert persona["available"] is False
     assert persona["gap_reason"] == "quota-decision-attempt-superseded"
+    assert persona["mismatch_reason"] == "decision-attempt-ended"
     # 不得沿用重置前那筆 admit 的 mode／selected。
     assert "mode" not in persona
     assert "selected" not in persona
@@ -1306,20 +1485,24 @@ def test_status_entry_after_retry_card_reset_matches_work_show(tmp_path: Path) -
     show`（`WorkflowRegistryProvider.scan`）對 retry-card 後、新 attempt 尚未寫出
     receipt 的同一狀態必須一致：都回 `quota-decision-attempt-superseded`，不沿用
     重置前的 admit。兩條路徑共用
-    `decision_projection.current_identity_by_persona_from_steps`。"""
+    `decision_projection.current_identity_by_persona_from_steps` 與
+    `decision_projection.jobs_for_run_from_rows`（對抗審查第四輪，本票 live
+    缺陷：改用 job 事實判定，不是 step 身分）。"""
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
     run = _run(
         registry, tmp_path, work_id="retry-card-status-840",
-        steps=(_step("build-card", executor="codex", model="gpt-5.3-codex"),),
+        steps=(_step("build-card", executor=None, model=None),),
         facets=(),
     )
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
     decision = _decision(
         decision_id="adm:v1:" + "8" * 62 + "39", run_id=run.run_id, card_id="build-card",
+        attempt_id=_attempt_id(run.run_id, "build-card", 0),
         selected={"executor": "codex", "model_id": "gpt-5.3-codex"},
     )
     store.record(decision)
+    job = _job(registry, run, tmp_path, card="build-card")
     registry._manager_update_workflow_run(run.run_id, quota_admission=_quota_admission_pointer(decision))
 
     before = manager.workflow_status_entry(
@@ -1328,6 +1511,8 @@ def test_status_entry_after_retry_card_reset_matches_work_show(tmp_path: Path) -
     assert before["available"] is True
     assert before["outcome"] == "admit"
 
+    # 模擬 `retry-card`：job 轉終局＋ step 身分清空、facet／理由清空。
+    registry.update_status(job["job_id"], "failed")
     registry._manager_update_workflow_run(
         run.run_id,
         steps=(_step("build-card", executor=None, model=None),),
@@ -1343,6 +1528,7 @@ def test_status_entry_after_retry_card_reset_matches_work_show(tmp_path: Path) -
     for persona in (status_persona, work_show_persona):
         assert persona["available"] is False
         assert persona["gap_reason"] == "quota-decision-attempt-superseded"
+        assert persona["mismatch_reason"] == "decision-attempt-ended"
         assert "mode" not in persona
         assert "selected" not in persona
     assert status_persona["gap_reason"] == work_show_persona["gap_reason"]
