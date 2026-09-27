@@ -1504,3 +1504,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/specs/main-probe-design.md'
     excludes: []
+  quota-snapshot-window-refinement:
+    title: 'quota-snapshot-window-refinement'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1099'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/quota-snapshot-window-refinement/todo.md'
+    excludes: []
