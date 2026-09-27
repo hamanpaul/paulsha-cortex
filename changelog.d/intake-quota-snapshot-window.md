@@ -1,0 +1,1 @@
+- 進件 #1099：登記 work item `quota-snapshot-window-refinement` 與 accepted workstream todo（quota ledger 同值 snapshot 應採用 window 資訊較完整的觀測），供 `cortex work intake` 走正式 lifecycle 實作。
