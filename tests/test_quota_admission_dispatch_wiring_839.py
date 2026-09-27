@@ -256,6 +256,92 @@ def test_shadow_mode_records_decision_but_never_blocks_dispatch(tmp_path: Path) 
     assert updated_run.quota_admission["builder"]["mode"] == "shadow"
 
 
+def test_shadow_mode_store_record_failure_never_changes_dispatch_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """對抗審查第三輪 MAJOR（manager.py:14056）：shadow 模式下 decision store
+    任何錯誤（含內容衝突／IO／損毀）都不得改變派工結果——舊實作 admit
+    receipt 寫入前沒有先讀舊值，直接無條件 `store.record()`；同一個
+    decision_id 的重送（retry）因為 `generated_at_ms` 每次都不同，會被
+    `AdmissionDecisionStore` 判定成內容衝突而整段往外丟例外，讓 shadow
+    （本該是完全旁觀、絕不改變既有派工結果的模式）也會被這個純診斷寫入
+    炸掉整條 dispatch。這裡直接讓 `store.record()` 恆定丟例外（模擬任何
+    store 寫入失敗），驗證：派工結果（是否派工、選中的 executor、run 的
+    phase）與完全沒有 `quota_admission_context` 時逐字相同，
+    `WorkflowRun.quota_admission` 也一樣維持 `None`（不是半吊子的診斷
+    投影）。
+    """
+    identities = _two_builder_identities()
+
+    registry_baseline = JobRegistry(state_path=tmp_path / "jobs-baseline.json")
+    worktree_baseline = tmp_path / "wt-baseline"
+    _init_worktree(worktree_baseline)
+    run_baseline = _make_run(registry_baseline, workspace_root=tmp_path / "workspace-baseline")
+    baseline_result = _dispatch(
+        registry_baseline, run_baseline, identities, worktree_baseline, tmp_path / "coordinator-baseline",
+    )
+    assert baseline_result is not None
+    assert "job_id" in baseline_result
+    baseline_job = registry_baseline.get_job(baseline_result["job_id"])
+    baseline_run_after = registry_baseline.get_workflow_run(run_baseline.run_id)
+
+    registry_shadow = JobRegistry(state_path=tmp_path / "jobs-shadow.json")
+    worktree_shadow = tmp_path / "wt-shadow"
+    _init_worktree(worktree_shadow)
+    run_shadow = _make_run(registry_shadow, workspace_root=tmp_path / "workspace-shadow")
+    step = manager._current_workflow_step(run_shadow)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run_shadow, step, identities) if c.executor == "codex")
+    profile_key = _resolved_profile_key(run_shadow, step, codex_identity, "codex", "gpt-primary")
+    descriptor = _pool_descriptor(account="acct-codex-store-fail", pool="pool-codex-store-fail")
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=profile_key, now_ms=int(time.time() * 1000))
+    ctx = quota_admission.DispatchContext(
+        authority=QuotaReservationAuthority(tmp_path / "reservations-store-fail.jsonl"),
+        store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions-store-fail.jsonl"),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, profile_key),), environment={},  # PSC_QUOTA_ADMISSION_ENFORCE 未設 -> shadow
+    )
+
+    def _boom(self, decision):
+        raise RuntimeError("simulated decision store write failure")
+
+    monkeypatch.setattr(quota_admission.AdmissionDecisionStore, "record", _boom)
+
+    shadow_result = _dispatch(
+        registry_shadow, run_shadow, identities, worktree_shadow, tmp_path / "coordinator-shadow",
+        quota_admission_context=ctx,
+    )
+    assert shadow_result is not None
+    assert "job_id" in shadow_result  # store 全程失敗仍照常派工——shadow 絕不擋派
+    shadow_job = registry_shadow.get_job(shadow_result["job_id"])
+    shadow_run_after = registry_shadow.get_workflow_run(run_shadow.run_id)
+
+    # 派工結果逐字相同——只允許每個獨立 registry／run 自身內在就會不同的
+    # 識別碼／路徑／時間戳差異，其餘欄位（executor／status／facets 等）必須
+    # 完全一致。
+    allowed_volatile = {
+        "job_id", "pid", "log_path", "session_name", "worktree", "prompt_path",
+        "workflow_run_id", "workflow_repo_root", "workflow_input_root",
+        "control_log_path", "created_at", "started_at",
+    }
+    volatile_job_keys = {
+        key for key in set(baseline_job) | set(shadow_job)
+        if baseline_job.get(key) != shadow_job.get(key)
+    }
+    assert volatile_job_keys.issubset(allowed_volatile), volatile_job_keys
+    assert baseline_job["executor"] == shadow_job["executor"] == "codex"
+    assert baseline_job["model_id"] == shadow_job["model_id"]
+    assert baseline_job["status"] == shadow_job["status"]
+
+    assert set(baseline_result.keys()) == set(shadow_result.keys())
+
+    # store 寫入從頭到尾都失敗——shadow 的診斷投影完全沒有落地，
+    # `WorkflowRun.quota_admission` 和 baseline（完全沒有 context）一樣維持
+    # `None`，不是半吊子的『寫了一半』狀態。
+    assert baseline_run_after.quota_admission is None
+    assert shadow_run_after.quota_admission is None
+
+
 def test_opt_in_independent_pool_alternative_is_selected_same_pool_alternative_rejected(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     worktree = tmp_path / "wt"
@@ -634,3 +720,89 @@ def test_duplicate_reservation_from_concurrent_manager_is_never_released_on_fail
     assert status.job_id is None
     committed = authority.committed(now_ms=now_ms + 1)
     assert committed.get(pool_key) == "1"
+
+
+def test_duplicate_reservation_already_terminated_advances_to_next_generation_and_dispatches(
+    tmp_path: Path,
+) -> None:
+    """對抗審查第三輪 MAJOR（manager.py:13961）：上一次 retry 在
+    `create_job()` 之前失敗，已經把這個 attempt 的 reservation
+    `release_reservation_before_spawn` 掉（或已被 reconcile 收斂終結）——
+    但因為從未真正建出 job，`_quota_admission_attempt_id` 依 job 數推算出的
+    attempt_id 完全不變，下一次 retry 用同一個 attempt_id／decision_id 重新
+    reserve 只會撞到這筆『已經終結』的舊 reservation。舊實作把所有
+    `duplicate` 一律當成『別人持有』，會讓這張卡永久卡在
+    held-elsewhere，即使容量其實完全空著；驗證新實作改用下一個世代的
+    attempt_id 重新 reserve，成功建出 job。
+    """
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+
+    descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    now_ms = int(time.time() * 1000)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "10", profile_key=codex_key, now_ms=now_ms)
+    authority_path = tmp_path / "reservations.jsonl"
+    authority = QuotaReservationAuthority(authority_path)
+    ctx = quota_admission.DispatchContext(
+        authority=authority,
+        store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, codex_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+
+    # 模擬「上一次 retry」：替這個 attempt（一定是 n0，registry 目前是空的）
+    # reserve 之後、在 create_job() 之前就已經失敗並 release 掉——這正是
+    # `release_reservation_before_spawn` 的既有用法
+    # （reason="fail-before-spawn"）。
+    from paulsha_cortex.coordinator.quota_reservation import PoolDemand
+
+    base_attempt_id = f"{run.run_id}:{step.card}:n0"
+    base_decision_id = quota_admission.decision_id_for(
+        run_id=run.run_id, card_id=step.card, attempt_id=base_attempt_id, profile_key=codex_key,
+    )
+    pool_key = (tuple(_pool_ref(descriptor)[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "short")
+    prior_result = authority.reserve(
+        run_id=run.run_id, card_id=step.card, decision_id=base_decision_id, attempt_id=base_attempt_id,
+        pools=(PoolDemand(pool_ref=_pool_ref(descriptor), window_id="short", amount="1"),),
+        capacity_by_pool={pool_key: "10"},
+        observation_version="obs-prior", demand_version="demand-prior", lease_ms=900_000, now_ms=now_ms,
+    )
+    assert prior_result.status == "granted"
+    released = authority.release(
+        reservation_id=prior_result.reservation_id, owner_token=prior_result.owner_token,
+        attempt_id=base_attempt_id, reason="fail-before-spawn",
+        expected_sequence=prior_result.sequence, now_ms=now_ms,
+    )
+    assert released.status == "ok"
+
+    result = _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+    assert result is not None
+    assert "job_id" in result  # 舊 reservation 已終結，改用下一個世代成功派工
+    job = registry.get_job(result["job_id"])
+    assert job["executor"] == "codex"
+
+    generation_attempt_id = f"{base_attempt_id}:g1"
+    decision_id = quota_admission.decision_id_for(
+        run_id=run.run_id, card_id=step.card, attempt_id=generation_attempt_id, profile_key=codex_key,
+    )
+    decision = ctx.store.get(decision_id)
+    assert decision is not None
+    assert decision.attempt_id == generation_attempt_id
+    assert decision.reservation_id is not None
+    status = ctx.authority.status(decision.reservation_id, now_ms=now_ms + 1)
+    assert status.state == "bound"
+    assert status.job_id == result["job_id"]
+
+    # 上一個世代的 reservation 維持它原本的終局狀態，沒有被誤動。
+    prior_status = ctx.authority.status(prior_result.reservation_id, now_ms=now_ms + 1)
+    assert prior_status.state == "released"

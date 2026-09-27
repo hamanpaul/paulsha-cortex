@@ -883,3 +883,80 @@ def test_ac6_fixed_rounds_release_and_reacquire_stays_consistent_across_workers(
 
     authority = QuotaReservationAuthority(store_path)
     assert authority.committed(now_ms=NOW) == {}  # 全部釋放完畢
+
+
+# ---------------------------------------------------------------------------
+# 對抗審查第三輪 MAJOR（quota_admission.py:1008）：新增唯讀 list_by_state——
+# 讓 #839 的 reserved 收斂掃描可以直接以本 authority 為真相來源，不必經過
+# 任何下游 decision receipt store 是否成功寫入。純唯讀，不改狀態機。
+# ---------------------------------------------------------------------------
+
+
+def test_list_by_state_finds_reserved_reservation_even_without_any_downstream_receipt(tmp_path: Path) -> None:
+    """核心情境：呼叫端在 reserve() 成功後從未寫過任何下游 receipt（模擬合法
+    持有者 crash 在 receipt 寫入之前）——這筆 reservation 仍必須能被
+    ``list_by_state("reserved", ...)`` 直接列舉出來，不依賴任何 store。"""
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    granted = authority.reserve(
+        run_id="run-1", card_id="card-1", decision_id="decision-invisible", attempt_id="attempt-1",
+        pools=(_demand("1"),), capacity_by_pool=_cap("1"), observation_version="obs-v1",
+        demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    assert granted.status == "granted"
+
+    reserved = authority.list_by_state("reserved", now_ms=NOW + 1)
+    assert [item.reservation_id for item in reserved] == [granted.reservation_id]
+    assert reserved[0].run_id == "run-1"
+    assert reserved[0].card_id == "card-1"
+    assert reserved[0].decision_id == "decision-invisible"
+    assert reserved[0].attempt_id == "attempt-1"
+    assert reserved[0].job_id is None
+
+    assert authority.list_by_state("bound", now_ms=NOW + 1) == ()
+    assert authority.list_by_state("settled", now_ms=NOW + 1) == ()
+    assert authority.list_by_state("released", now_ms=NOW + 1) == ()
+
+
+def test_list_by_state_partitions_reservations_by_current_logical_state(tmp_path: Path) -> None:
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    reserved_only = authority.reserve(
+        run_id="run-1", card_id="card-a", decision_id="decision-a", attempt_id="attempt-a",
+        pools=(_demand("1", pool_id="pool-a"),), capacity_by_pool=_cap("5", pool_id="pool-a"),
+        observation_version="obs-v1", demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    bound_one = authority.reserve(
+        run_id="run-1", card_id="card-b", decision_id="decision-b", attempt_id="attempt-b",
+        pools=(_demand("1", pool_id="pool-b"),), capacity_by_pool=_cap("5", pool_id="pool-b"),
+        observation_version="obs-v1", demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    authority.bind(
+        reservation_id=bound_one.reservation_id, owner_token=bound_one.owner_token,
+        attempt_id="attempt-b", job_id="job-b", expected_sequence=bound_one.sequence, now_ms=NOW,
+    )
+    released_one = authority.reserve(
+        run_id="run-1", card_id="card-c", decision_id="decision-c", attempt_id="attempt-c",
+        pools=(_demand("1", pool_id="pool-c"),), capacity_by_pool=_cap("5", pool_id="pool-c"),
+        observation_version="obs-v1", demand_version="demand-v1", lease_ms=60_000, now_ms=NOW,
+    )
+    authority.release(
+        reservation_id=released_one.reservation_id, owner_token=released_one.owner_token,
+        attempt_id="attempt-c", reason="fail-before-spawn", expected_sequence=released_one.sequence,
+        now_ms=NOW,
+    )
+
+    assert {item.reservation_id for item in authority.list_by_state("reserved", now_ms=NOW + 1)} == {
+        reserved_only.reservation_id
+    }
+    assert {item.reservation_id for item in authority.list_by_state("bound", now_ms=NOW + 1)} == {
+        bound_one.reservation_id
+    }
+    assert {item.reservation_id for item in authority.list_by_state("released", now_ms=NOW + 1)} == {
+        released_one.reservation_id
+    }
+    assert authority.list_by_state("settled", now_ms=NOW + 1) == ()
+
+
+def test_list_by_state_rejects_unknown_state(tmp_path: Path) -> None:
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    with pytest.raises(ValueError):
+        authority.list_by_state("uncertain", now_ms=NOW)

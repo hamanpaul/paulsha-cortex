@@ -188,3 +188,103 @@ canary gate，本票只交付 Cortex 消費端。
     擴充 receipt／quota_admission 投影斷言（MAJOR 3）。三者皆先以
     `git show HEAD:paulsha_cortex/coordinator/manager.py` 暫還原
     production 檔確認 RED，復原修法後轉 GREEN。
+
+- **#839 對抗審查修復（第三輪三個 MAJOR）**：
+  1. **MAJOR（quota_admission.py:1008，`reconcile_reserved_reservations`）**：
+     合法持有者在 `reserve()` 成功後、寫入 admit receipt 前 crash（或
+     `AdmissionDecisionStore.record()` 本身失敗）會留下一筆從未被任何
+     receipt 記錄過的 `reserved` reservation——舊實作以
+     `AdmissionDecisionStore.enforced_admitted()` 反查候選再查
+     `authority.status()`，這筆 reservation 對它完全隱形；
+     `_committed_totals()` 本身不因 lease 過期自動放掉容量（過期永不證明
+     可釋放，是既有設計，非本次修復對象），之後同一個 attempt 重送只會
+     一直撞到這筆『看不見也放不掉』的 reservation。修法：新增
+     `QuotaReservationAuthority.list_by_state(state, *, now_ms)`（#838
+     唯讀新增，不改狀態機／寫入協定），收斂掃描改以此 API 為出發點——
+     `run_id`／`card_id`／`attempt_id`／`decision_id` 本來就是 reservation
+     記錄自己的欄位，不必經過任何下游 receipt 是否成功寫入；找到對應 job
+     則依終局／存活收斂或續 lease，查無對應 job 且 lease 已過期則
+     `reconcile(confirmed-terminated)` 釋放（evidence 標
+     `recovered-unbound`），查詢失敗或 lease 未過期一律不動。以直接呼叫
+     `reserve_for_candidate()`（**不**呼叫 `store.record()`）模擬這個 crash
+     窗口重現：RED 下（`git show HEAD` 還原 `quota_admission.py`／
+     `quota_reservation.py`）用空 store 呼叫舊版
+     `reconcile_reserved_reservations()` 回傳空 tuple、reservation 永遠停
+     在 `reserved`；GREEN 下用新版（不再需要 `store` 參數）直接掃到並在
+     lease 過期後正確釋放。`reconcile_reserved_reservations()` 因此拿掉了
+     `store` 參數（僅供列舉用，內部已不需要）；`manager.reconcile_quota_admission_reservations()`
+     同步移除呼叫時傳入的 `store=`。
+  2. **MAJOR（manager.py:13961，dispatch 候選迴圈 `duplicate` 分支）**：
+     dispatch 在建出 job 前 reservation 已被 release（`create_job()` 失敗
+     觸發 `release_reservation_before_spawn`）或經 reconcile 終結後，job
+     從未真正建立過，`_quota_admission_attempt_id()` 依 job 數推算的
+     `attempt_id` 完全不會前進——下一次 retry 用同一個
+     `attempt_id`／`decision_id` 重新 `reserve()`，只會拿到同一筆已終結
+     reservation 的 `duplicate` 回放；第二輪修法把所有 `duplicate` 一律當
+     `held-elsewhere`，讓這種情況下的卡永久卡住、即使容量其實完全空著。
+     修法：新增 `quota_admission.generation_attempt_id()` 與
+     `reserve_for_candidate_with_generation_fallback()`——把『世代』疊在
+     attempt_id 之上（世代 0 就是原始 attempt_id，向後相容；世代 ≥1 附加
+     `:g{generation}`），`duplicate` 時檢查那筆舊 reservation 目前狀態：
+     仍 `reserved`／`bound`（非本地持有）→ 原樣回傳，交給既有
+     held-elsewhere 判斷；已 `released`／`settled`（終局）→ 決定性地換算
+     下一個世代重新 `reserve()`，直到拿到非「duplicate-且終局」的結果或
+     世代探測上限（重用既有 `_MAX_ATTEMPTS_PER_DECISION=64`）。同一次呼叫
+     只在探測到的第一個尚未終結的世代真正呼叫會改變狀態的 `reserve()`
+     （更早世代只讀到 duplicate、不寫入任何事件），確保重啟／重送同一次
+     retry 仍冪等，不會一次 retry 產生兩個 grant。連帶修正
+     `_quota_admission_job_lookup_by_attempt()`：世代後綴只影響
+     reservation／decision 身分，job 是否已建立的判定仍看與世代無關的
+     job-count ordinal，因此先剝掉 `:g{generation}` 尾綴才解析，否則世代
+     ≥1 的 attempt_id 會因為 `isdigit()` 檢查失敗而永遠查不到其實已經
+     建立的 job。以直接呼叫 authority 模擬「上一次 retry 已
+     `release_reservation_before_spawn`」重現：RED 下（`git show HEAD`
+     還原 `manager.py`）唯一候選撞到 `duplicate` 一律排除，回
+     `quota-admission-insufficient`、零 job；GREEN 下改用下一個世代成功
+     `granted`／建立 job／`bind()`，且上一個世代的 reservation 維持它原本
+     的 `released` 狀態，沒有被誤動。
+  3. **MAJOR（manager.py:14056，admit receipt 寫入）**：shadow（以及未受
+     額度管理、`quota_reservation_handle` 為 `None`）的候選走到 admit
+     receipt 這一步時，舊實作沒有先讀舊值就直接無條件
+     `quota_admission_context.store.record(quota_decision)`——`reserve()`
+     對同一個 decision_id 的重送本來就冪等，但
+     `AdmissionDecision.generated_at_ms` 是每次呼叫當下的時間戳，retry
+     時必然與上一次不同；`AdmissionDecisionStore.record()` 對同
+     decision_id、內容不同（哪怕只差這個時間戳）一律視為衝突並拋
+     `AdmissionDecisionCorrupt`，沒有任何 try/except 包住，讓這筆純診斷
+     用途的寫入直接炸掉整條 `_dispatch_workflow_card`——即使是 shadow
+     模式（票面契約：只記錄、絕不改變既有派工結果）也會被拖累，讓 shadow
+     rollout 本身改變既有重試行為。修法：新增
+     `_quota_admission_record_admit_decision()`，比照既有
+     `_quota_admission_record_wait_decision()` 先 `store.get()`、有紀錄
+     就直接沿用（回既有紀錄的 `mode`／`outcome`，不重寫），沒有才
+     `store.record()`；store 讀寫任何錯誤（含衝突、IO、罕見損毀）一律
+     靜默降級為 `None`，只影響這筆診斷投影／`WorkflowRun.quota_admission`
+     投影——reservation（如果有）的存續完全交給
+     `reconcile_reserved_reservations()`／`reconcile_bound_reservations()`
+     依 authority／registry 事實判定，不依賴這筆 receipt 是否寫成功（見
+     上面第 1 點的修法），因此對 enforced 模式也一律 fail soft 是安全的。
+     以 monkeypatch 讓 `AdmissionDecisionStore.record` 恆定丟例外重現：
+     RED 下（`git show HEAD` 還原 `manager.py`）shadow dispatch 直接讓
+     `RuntimeError` 往外傳、整條 dispatch 中斷；GREEN 下派工結果（是否
+     派工、選中的 executor、job 欄位、`WorkflowRun.quota_admission`）與
+     完全沒有 `quota_admission_context` 的 baseline dispatch 逐字相同
+     （`WorkflowRun.quota_admission` 兩者皆維持 `None`，不是半吊子的
+     診斷投影）。
+  - 未動候選排序／preflight／pin／independence／Trust Root／品質規則；
+    receipt 欄位（`AdmissionDecision`／`WorkflowRun.quota_admission`）沿用
+    既有形狀，只加了兩個純唯讀函式（`quota_admission.generation_attempt_id`／
+    `reserve_for_candidate_with_generation_fallback`）與 #838 authority 的
+    一個唯讀方法（`list_by_state`），沒有新增或修改任何 receipt／事件欄位。
+  - 新增測試：`tests/test_quota_reservation_838.py`
+    （`test_list_by_state_finds_reserved_reservation_even_without_any_downstream_receipt`／
+    `test_list_by_state_partitions_reservations_by_current_logical_state`／
+    `test_list_by_state_rejects_unknown_state`）；
+    `tests/test_quota_admission_839.py`
+    （`test_reserved_reservation_without_any_decision_receipt_is_still_reconciled`，
+    並移除既有 5 個 `reconcile_reserved_reservations` 呼叫的 `store=`
+    參數以配合新簽章）；`tests/test_quota_admission_dispatch_wiring_839.py`
+    （`test_duplicate_reservation_already_terminated_advances_to_next_generation_and_dispatches`／
+    `test_shadow_mode_store_record_failure_never_changes_dispatch_result`）。
+    三個 MAJOR 皆先以 `git show HEAD:<path>` 暫還原對應 production 檔重跑
+    新測試確認 RED，復原修法後轉 GREEN。

@@ -70,6 +70,12 @@ decision 用相同組成重複呼叫 `reserve()`／terminal 事件重送皆冪�
 library primitive。`reservation_authority_enabled()` 是保留給未來整合者的
 opt-in 開關，預設關閉即等於 shadow／rollback，不需要改動任何程式碼。
 
+`list_by_state(state, *, now_ms)`（唯讀）列出目前邏輯狀態恰為 `state`
+（`reserved`／`bound`／`settled`／`released`）的所有 reservation，讓呼叫端
+可以直接以本 authority 為真相來源做收斂掃描，不必經過任何下游 receipt／
+索引是否成功寫入；純查詢，不修改任何狀態、不新增事件種類，狀態機與寫入
+協定不變。
+
 ## Quota-aware admission
 
 `paulsha_cortex.coordinator.quota_admission`（#839）在既有候選分層排序／
@@ -84,10 +90,23 @@ spawn；race 落敗、額度不可行，或 `reserve()` 回報這個 decision_id
 剛贏得的 grant，這次呼叫從未替它 reserve 過，因此永遠不是它的擁有者）時，
 `manager._dispatch_workflow_card` 都會排除該候選、換下一個既有排序候選重試
 （沿用 `_runtime_preflight_gate`／`_select_workflow_identity` 既有機制，不
-重建候選池）；`duplicate` 一律精確等待（`quota-admission-attempt-held-elsewhere`），
-不建 job、也不對它呼叫 `release()`／`bind()`——只有這次呼叫自己拿到
-`granted` 的候選才是可信擁有者，避免誤釋放別的 instance 仍在用的 grant。
-全部候選皆不可行才回精確 wait 理由，不建立任何 job、不留半額度。
+重建候選池）；`duplicate` 且那筆舊 reservation 目前仍是 `reserved`／`bound`
+時精確等待（`quota-admission-attempt-held-elsewhere`），不建 job、也不對它
+呼叫 `release()`／`bind()`——只有這次呼叫自己拿到 `granted` 的候選才是可信
+擁有者，避免誤釋放別的 instance 仍在用的 grant。全部候選皆不可行才回精確
+wait 理由，不建立任何 job、不留半額度。
+
+`duplicate` 但那筆舊 reservation 已經是終局（`settled`／`released`，例如
+上一次 retry 在 `create_job()` 之前失敗、已呼叫
+`release_reservation_before_spawn`，或已被下方的 reconcile 掃描收斂）——
+job 從未真正建立過，`attempt_id` 依 job 數推算出的計數因此不會前進，下一次
+retry 只會用同一個 `attempt_id`／`decision_id` 撞到同一筆已終結的 duplicate。
+`reserve_for_candidate_with_generation_fallback` 把『世代』疊在 attempt_id
+之上（世代 0 就是原始 attempt_id，世代 ≥1 附加 `:g{generation}`），偵測到
+duplicate-且終局時決定性地換算下一個世代重新 reserve，直到拿到
+`granted`／`denied`／`conflict`，或撞到仍是 `reserved`／`bound` 的 duplicate
+（held-elsewhere，交由既有判斷）——同一次呼叫只會在探測到的第一個尚未
+終結的世代真正改變狀態，不會一次 retry 產生兩個 grant。
 
 Reservation 的 `reserve → create_job → bind(job_id) → spawn` 順序嚴格對應
 #838 現行協定：job 記錄一旦建立即 `bind()`，之後只能經 `settle()`（含派工時
@@ -102,15 +121,30 @@ job registry 事實判定。`reconcile_bound_reservations()` 另外提供
 restart／crash 後的收斂掃描——job registry 查不到時一律 `inconclusive`
 （不因為查不到就假設已終止並釋放額度），只有確認終局才釋放。
 
+`reconcile_reserved_reservations()` 收斂 `create_job()` 之後、`bind()` 之前
+crash 留下的無 job_id reservation；掃描目標直接來自
+`QuotaReservationAuthority.list_by_state("reserved", ...)`（唯讀新增 API，
+不改 #838 狀態機／寫入協定），不依賴任何下游 `AdmissionDecisionStore` 是否
+成功記錄這筆決策——合法持有者在 `reserve()` 成功後、寫入 admit receipt 之前
+crash（或 receipt 寫入本身失敗）時，這筆 reservation 仍會被掃到並依 job
+registry 事實安全收斂或維持，不會因為 receipt 從未落地就對收斂掃描永久
+隱形、卡死容量。
+
 每個 decision 都有耐久、append-only 的 receipt（`AdmissionDecisionStore`，
 已登記於 Trust Root），綁定 `run_id`／`card_id`／`attempt_id`／`profile_key`
 與 qualification／observation／demand／policy 版本，以及被排除候選與理由；
-同一個 attempt 重送冪等回放，不會二次扣款或搬活 job。全部候選皆不可行
-（enforce 下的 `quota-admission-insufficient`）或 quota-pools 設定檔本身
-無效（`quota-config-invalid`）時，同樣留一筆 outcome `wait` 的 receipt 並更新
-`WorkflowRun.quota_admission[persona]` 投影——不再只標 `needs_human`；receipt
-冪等（同一個 attempt 只留第一次觀察到的拒絕快照），store 讀寫失敗一律靜默
-降級，絕不會讓已經確定的 fail-closed 派工結果變成派工。#837 operational
+同一個 attempt 重送冪等回放，不會二次扣款或搬活 job。admit receipt（含
+shadow 與未受額度管理的候選）與 wait receipt 一樣先讀舊值、有紀錄就直接
+沿用不重寫——`generated_at_ms` 是每次呼叫當下的時間戳，retry 必然與上一次
+不同，若無條件 `record()` 會被判定成內容衝突而丟例外；store 讀寫任何錯誤
+（含衝突、IO、損毀）一律靜默降級為 `None`，只影響這筆診斷投影，絕不讓
+shadow（本該完全旁觀）也被這個純診斷寫入拖累而改變既有派工結果。全部候選
+皆不可行（enforce 下的 `quota-admission-insufficient`）或 quota-pools 設定
+檔本身無效（`quota-config-invalid`）時，同樣留一筆 outcome `wait` 的 receipt
+並更新 `WorkflowRun.quota_admission[persona]` 投影——不再只標
+`needs_human`；receipt 冪等（同一個 attempt 只留第一次觀察到的拒絕快照），
+store 讀寫失敗一律靜默降級，絕不會讓已經確定的 fail-closed 派工結果變成
+派工。#837 operational
 usage forecast 尚未落地前，demand 只用明確標示版本的 fixture
 （`DEMAND_FIXTURE_VERSION`），receipt 上的 `demand_version` 因此可精確分辨
 「這是 fixture」還是「這是真預測」。

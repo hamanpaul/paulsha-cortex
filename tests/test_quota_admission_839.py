@@ -514,7 +514,7 @@ def test_reserved_unbound_lease_not_expired_is_left_untouched(tmp_path: Path) ->
     decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
 
     outcomes = admission.reconcile_reserved_reservations(
-        authority=authority, store=store,
+        authority=authority,
         job_lookup_by_attempt=lambda run_id, card_id, attempt_id: None,
         job_outcome=lambda job: None,
         now_ms=_NOW + 1,
@@ -534,7 +534,7 @@ def test_reserved_unbound_lease_expired_and_no_job_found_is_released(tmp_path: P
     decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
 
     outcomes = admission.reconcile_reserved_reservations(
-        authority=authority, store=store,
+        authority=authority,
         job_lookup_by_attempt=lambda run_id, card_id, attempt_id: None,
         job_outcome=lambda job: None,
         now_ms=_NOW + 120_000,  # lease_ms=60_000 早已過期
@@ -559,7 +559,7 @@ def test_reserved_unbound_job_found_alive_renews_lease_and_keeps_capacity(tmp_pa
     decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
 
     outcomes = admission.reconcile_reserved_reservations(
-        authority=authority, store=store,
+        authority=authority,
         job_lookup_by_attempt=lambda run_id, card_id, attempt_id: {"job_id": "j-1", "status": "dispatched"},
         job_outcome=lambda job: None,
         now_ms=_NOW + 120_000, renew_lease_ms=60_000,
@@ -584,7 +584,7 @@ def test_reserved_unbound_lookup_failure_is_left_untouched_not_released(tmp_path
         raise RuntimeError("registry temporarily unavailable")
 
     outcomes = admission.reconcile_reserved_reservations(
-        authority=authority, store=store,
+        authority=authority,
         job_lookup_by_attempt=_boom,
         job_outcome=lambda job: None,
         now_ms=_NOW + 120_000,
@@ -605,7 +605,7 @@ def test_reserved_unbound_job_found_terminal_is_released_defensively(tmp_path: P
     decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
 
     outcomes = admission.reconcile_reserved_reservations(
-        authority=authority, store=store,
+        authority=authority,
         job_lookup_by_attempt=lambda run_id, card_id, attempt_id: {"job_id": "j-1", "status": "exited", "exit_code": 0},
         job_outcome=lambda job: "succeeded",
         now_ms=_NOW + 1,
@@ -614,6 +614,53 @@ def test_reserved_unbound_job_found_terminal_is_released_defensively(tmp_path: P
     assert outcomes[0].action == "settled"
     status = authority.status(decision.reservation_id, now_ms=_NOW + 1)
     assert status.state == "released"
+
+
+def _reserve_only_never_write_receipt(authority, *, attempt_id: str, descriptor) -> str:
+    """模擬對抗審查第三輪 MAJOR（quota_admission.py:1008）的觸發情境：合法
+    持有者 `reserve_for_candidate()` 成功之後、寫入 admit receipt 之前
+    crash（或 receipt 寫入本身失敗）——**完全不呼叫** `store.record()`，這筆
+    reservation 因此對任何『依賴 decision store 反查』的收斂路徑徹底隱形。
+    回傳這筆 reservation 的 id。"""
+    assessment = _feasible_assessment(descriptor)
+    decision_id = admission.decision_id_for(
+        run_id="run-1", card_id="card-1", attempt_id=attempt_id, profile_key=_PROFILE_A,
+    )
+    reserved = admission.reserve_for_candidate(
+        authority, run_id="run-1", card_id="card-1", decision_id=decision_id, attempt_id=attempt_id,
+        assessment=assessment, observation_version="obs-v1", demand_version="demand-v1",
+        lease_ms=60_000, now_ms=_NOW,
+    )
+    assert reserved.status == "granted"
+    return reserved.reservation_id
+
+
+def test_reserved_reservation_without_any_decision_receipt_is_still_reconciled(tmp_path: Path) -> None:
+    """核心情境（對抗審查第三輪 MAJOR quota_admission.py:1008）：這筆
+    reservation 從未被任何 `AdmissionDecisionStore` 記錄過——舊實作的收斂
+    掃描以 `store.enforced_admitted()` 反查候選，對這筆完全看不到，容量永久
+    卡住、之後同 attempt 重送永遠撞 `held-elsewhere`。新實作改以
+    `authority.list_by_state("reserved", ...)` 為出發點，不依賴任何下游
+    receipt，一樣能在 lease 過期後正確收斂釋放容量。"""
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    reservation_id = _reserve_only_never_write_receipt(authority, attempt_id="job-1", descriptor=descriptor)
+
+    outcomes = admission.reconcile_reserved_reservations(
+        authority=authority,
+        job_lookup_by_attempt=lambda run_id, card_id, attempt_id: None,
+        job_outcome=lambda job: None,
+        now_ms=_NOW + 120_000,  # lease_ms=60_000 早已過期
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].reservation_id == reservation_id
+    assert outcomes[0].action == "settled"
+    assert "recovered-unbound" in outcomes[0].detail
+    status = authority.status(reservation_id, now_ms=_NOW + 120_000)
+    assert status.state == "released"
+    committed = authority.committed(now_ms=_NOW + 120_000)
+    key = (tuple(_pool_ref(descriptor)[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "short")
+    assert committed.get(key, "0") == "0"
 
 
 # ---------------------------------------------------------------------------

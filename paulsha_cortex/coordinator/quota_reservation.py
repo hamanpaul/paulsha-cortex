@@ -53,7 +53,12 @@ __all__ = [
     "ReservationStatus",
     "QuotaReservationAuthority",
     "reservation_authority_enabled",
+    "RESERVATION_LOGICAL_STATES",
 ]
+
+#: :meth:`QuotaReservationAuthority.list_by_state` 接受的邏輯狀態——與折疊後
+#: ``current["state"]`` 的可能值逐字相同（見 ``_fold``）。
+RESERVATION_LOGICAL_STATES = frozenset({"reserved", "bound", "settled", "released"})
 
 _MAX_STORE_BYTES = 32 * 1024 * 1024
 _MAX_EVENTS = 200_000
@@ -562,23 +567,53 @@ class QuotaReservationAuthority:
         current = folded.get(reservation_id)
         if current is None:
             return None
-        display_state = _display_state(current, now_ms)
+        return self._status_from_entry(current, now_ms)
+
+    def list_by_state(self, state: str, *, now_ms: int) -> tuple[ReservationStatus, ...]:
+        """唯讀：列出目前邏輯狀態恰為 ``state`` 的所有 reservation（依讀取時
+        的檔案快照；含 lease 已過期者——本方法不代為篩選是否過期，呼叫端依
+        回傳的 ``lease_expires_at_ms``／``display_state`` 自行判斷）。
+
+        對抗審查第三輪 MAJOR（quota_admission.py:1008）新增：#839 原本的
+        ``reserved`` 收斂掃描（``quota_admission.reconcile_reserved_reservations``）
+        只能透過 ``AdmissionDecisionStore.enforced_admitted()`` 反查『曾經
+        寫過 admit receipt 的決策』，再用 :meth:`status` 查它的 reservation
+        狀態——如果合法持有者在 :meth:`reserve` 成功後、寫入那筆 receipt
+        之前 crash（或 receipt 寫入本身失敗），這筆 reservation 就永遠不會
+        出現在 store 的列舉裡，等於對收斂掃描完全隱形，容量永久卡住。這支
+        方法讓收斂掃描改以本 authority（reservation 的唯一真相來源）為出發
+        點，不必經過任何下游 receipt 是否成功寫入。
+
+        純唯讀查詢：不修改任何狀態、不新增事件種類，#838 既有狀態機與
+        reserve／bind／settle／release／reconcile 的寫入協定完全不變。"""
+        if state not in RESERVATION_LOGICAL_STATES:
+            raise ValueError(f"invalid reservation state: {state!r}")
+        records = self._read()
+        folded = _fold(records)
+        return tuple(
+            self._status_from_entry(entry, now_ms)
+            for entry in folded.values()
+            if entry["state"] == state
+        )
+
+    @staticmethod
+    def _status_from_entry(entry: Mapping[str, Any], now_ms: int) -> ReservationStatus:
         return ReservationStatus(
-            reservation_id=reservation_id,
-            state=current["state"],
-            display_state=display_state,
-            sequence=current["sequence"],
-            run_id=current["run_id"],
-            card_id=current["card_id"],
-            decision_id=current["decision_id"],
-            attempt_id=current["attempt_id"],
-            job_id=current["job_id"],
-            pools=tuple(current["pools"]),
-            observation_version=current["observation_version"],
-            demand_version=current["demand_version"],
-            lease_expires_at_ms=current["lease_expires_at_ms"],
-            created_at_ms=current["created_at_ms"],
-            last_event_at_ms=current["last_event_at_ms"],
+            reservation_id=entry["reservation_id"],
+            state=entry["state"],
+            display_state=_display_state(entry, now_ms),
+            sequence=entry["sequence"],
+            run_id=entry["run_id"],
+            card_id=entry["card_id"],
+            decision_id=entry["decision_id"],
+            attempt_id=entry["attempt_id"],
+            job_id=entry["job_id"],
+            pools=tuple(entry["pools"]),
+            observation_version=entry["observation_version"],
+            demand_version=entry["demand_version"],
+            lease_expires_at_ms=entry["lease_expires_at_ms"],
+            created_at_ms=entry["created_at_ms"],
+            last_event_at_ms=entry["last_event_at_ms"],
         )
 
     def committed(self, *, now_ms: int) -> dict[tuple[tuple[str, str, str, str], str], str]:
