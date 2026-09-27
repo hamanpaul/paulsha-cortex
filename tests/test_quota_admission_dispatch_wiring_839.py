@@ -338,8 +338,24 @@ def test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason(t
     updated_run = registry.get_workflow_run(run.run_id)
     assert "needs_human" in updated_run.facets
 
+    # 對抗審查第二輪 MAJOR（manager.py:11413）：全部候選被拒也要留一筆
+    # decision receipt，並更新 WorkflowRun.quota_admission[persona] 診斷投影
+    # ——不能只標 needs_human，讓額度層自己完全沒有留下任何證據。
+    assert updated_run.quota_admission is not None
+    projection = updated_run.quota_admission["builder"]
+    assert projection["mode"] == "enforced"
+    assert projection["outcome"] == "wait"
+    decision = ctx.store.get(projection["decision_id"])
+    assert decision is not None
+    assert decision.mode == "enforced"
+    assert decision.outcome == "wait"
+    assert decision.reason == "quota-admission-insufficient"
+    assert {item["executor"] for item in decision.excluded} == {"codex", "claude"}
 
-def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(tmp_path: Path) -> None:
+
+def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     worktree = tmp_path / "wt"
     _init_worktree(worktree)
@@ -360,6 +376,19 @@ def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(tmp_path: P
         bindings=(_binding(descriptor, codex_key),), environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
     )
 
+    # 對抗審查第二輪 BLOCKER（manager.py:14379）：spawn 時 429／infra 失敗的
+    # 即時 settle 路徑必須和 reconcile 的 on_settled 共用同一個
+    # record_terminal_usage helper——用 spy 包一層原始實作，既驗證『真的被
+    # 呼叫』又不改變原有副作用。
+    terminal_usage_calls: list[dict[str, object]] = []
+    original_record_terminal_usage = QuotaShadowService.record_terminal_usage
+
+    def _spy_record_terminal_usage(self, job, **kwargs):
+        terminal_usage_calls.append({"job": dict(job), **kwargs})
+        return original_record_terminal_usage(self, job, **kwargs)
+
+    monkeypatch.setattr(QuotaShadowService, "record_terminal_usage", _spy_record_terminal_usage)
+
     _FAILING_EXECUTORS.add("codex")
     with pytest.raises(RuntimeError, match="fake-executor-429"):
         _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
@@ -375,9 +404,16 @@ def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(tmp_path: P
     committed = ctx.authority.committed(now_ms=now_ms + 1)
     key = (tuple(_pool_ref(descriptor)[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "short")
     assert committed.get(key, "0") == "0"
-    # job 本身仍如實記為 failed——quota admission 不覆寫既有失敗分類。
+    # job 本身仍如實記為 failed——quota admission 不覆寫既有失敗分類（#826）。
     job = registry.list_jobs()[0]
     assert job["status"] == "failed"
+    assert job["provider_outcome"]["outcome"] != "quota"  # 不把 infra 失敗記成品質失敗
+
+    # settle 之後這個 attempt 的終局 usage 已經記過——不必等 restart 後的
+    # periodic reconcile 才補記。
+    assert len(terminal_usage_calls) == 1
+    assert terminal_usage_calls[0]["profile_key"] == codex_key
+    assert terminal_usage_calls[0]["job"]["id"] == job["job_id"]
 
 
 def test_ac3_two_instances_race_for_last_unit_only_one_gets_bound_job(tmp_path: Path) -> None:
@@ -503,3 +539,98 @@ def test_race_loss_on_top_ranked_candidate_falls_back_to_independent_pool_candid
     status = ctx.authority.status(decision.reservation_id, now_ms=now_ms + 1)
     assert status.state == "bound"
     assert status.job_id == result["job_id"]
+
+
+def test_duplicate_reservation_from_concurrent_manager_is_never_released_on_failure(
+    tmp_path: Path,
+) -> None:
+    """對抗審查第二輪 MAJOR（manager.py:13848）：`reserve_for_candidate()` 的
+    冪等回放（`status == "duplicate"`）代表這個 decision_id 的 reservation
+    在這次呼叫**之前**就已經存在——可能是另一個 Manager instance 剛剛才
+    贏得的 grant，不是這次呼叫自己剛建立的。舊實作把 `duplicate` 和
+    `granted` 同等對待，若這個 instance 隨後在 `create_job()`／provisioning
+    失敗，會用這個借來的 owner_token 呼叫 `release()`，誤釋放另一個仍在
+    使用中的 instance 的 grant。
+
+    這裡直接模擬「另一個 Manager instance」（比照既有 AC3／race-fallback 兩個
+    測試『直接呼叫 authority 模擬第二個 instance』的既有寫法）：在 dispatch
+    呼叫前，用同一份 reservation authority 檔案，替 dispatch 即將算出的那個
+    decision_id 先 reserve 一次（`granted`，取得它自己的 owner_token）——這
+    就是它「已經 reserve、還沒 bind」的窗口。dispatch（模擬第二個 instance）
+    唯一候選撞上這個既有 reservation 只會拿到 `duplicate`；把
+    `registry.create_job` 換成一定失敗的版本，驗證即使走到『原本會觸發
+    release』的失敗路徑，這個既有 reservation 仍完全沒被動過。
+    """
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+
+    descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    now_ms = int(time.time() * 1000)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "10", profile_key=codex_key, now_ms=now_ms)
+    authority_path = tmp_path / "reservations.jsonl"
+    authority = QuotaReservationAuthority(authority_path)
+    ctx = quota_admission.DispatchContext(
+        authority=authority,
+        store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, codex_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+
+    # 「另一個 Manager instance」：先替 dispatch 即將算出的同一個 decision_id
+    # reserve（registry 目前是空的，因此 attempt_id 一定是 n0）。
+    from paulsha_cortex.coordinator.quota_reservation import PoolDemand
+
+    attempt_id = f"{run.run_id}:{step.card}:n0"
+    other_decision_id = quota_admission.decision_id_for(
+        run_id=run.run_id, card_id=step.card, attempt_id=attempt_id, profile_key=codex_key,
+    )
+    pool_key = (tuple(_pool_ref(descriptor)[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "short")
+    other_result = authority.reserve(
+        run_id=run.run_id, card_id=step.card, decision_id=other_decision_id, attempt_id=attempt_id,
+        pools=(PoolDemand(pool_ref=_pool_ref(descriptor), window_id="short", amount="1"),),
+        capacity_by_pool={pool_key: "10"},
+        observation_version="obs-other", demand_version="demand-other", lease_ms=900_000, now_ms=now_ms,
+    )
+    assert other_result.status == "granted"
+
+    # 這次 dispatch（模擬第二個 instance）在 create_job() 這一步失敗——模擬
+    # provisioning 在拿到 job_id 之後、真正 spawn 之前發生的錯誤。若這個候選
+    # 被誤當成『這次新建立的 grant』，就會走到 release_reservation_before_spawn，
+    # 用借來的 owner_token 誤釋放另一個 instance 仍在用的 reservation。
+    original_create_job = registry.create_job
+
+    def _failing_create_job(*args, **kwargs):
+        raise RuntimeError("simulated provisioning failure before spawn")
+
+    registry.create_job = _failing_create_job
+    try:
+        result = _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+    finally:
+        registry.create_job = original_create_job
+
+    assert result is not None
+    assert "job_id" not in result
+    assert result["reason"] == "quota-admission-insufficient"
+    assert registry.list_jobs() == []
+    excluded_reasons = {item["exclusion_reason"] for item in result.get("attempts", [])}
+    assert excluded_reasons == {"quota-admission-attempt-held-elsewhere"}
+
+    # 核心斷言：另一個 instance 的 reservation 完全沒被動過（仍是 reserved，
+    # 不是被誤 release 成 released；sequence 停在 0，代表連 bind 都沒發生）。
+    status = authority.status(other_result.reservation_id, now_ms=now_ms + 1)
+    assert status is not None
+    assert status.state == "reserved"
+    assert status.sequence == 0
+    assert status.job_id is None
+    committed = authority.committed(now_ms=now_ms + 1)
+    assert committed.get(pool_key) == "1"
