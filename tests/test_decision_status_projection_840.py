@@ -825,12 +825,9 @@ def test_allowlist_strips_sensitive_fields_from_selected_and_excluded(tmp_path: 
 def test_producer_to_snapshot_to_status_cli_end_to_end(tmp_path: Path, capsys) -> None:
     """真實 `AdmissionDecisionStore` 寫入 receipt → `workflow_status_entry`
     投影 → 塞進 status payload → `cortex inspect status` 的文字模式印出。"""
-    import importlib
-    import sys
-
-    for module_name in ("paulsha_cortex.cli", "paulsha_cortex.porcelain", "paulsha_cortex.porcelain.inspect"):
-        sys.modules.pop(module_name, None)
-    cli = importlib.import_module("paulsha_cortex.cli")
+    # 不可從 sys.modules 移除 porcelain 套件再重新 import：那會產生新的空註冊表，
+    # 已載入的其他 porcelain 子模組不會重新註冊，汙染之後的 CLI 測試。
+    from paulsha_cortex import cli
 
     state = tmp_path / "jobs.json"
     registry = JobRegistry(state_path=state)
