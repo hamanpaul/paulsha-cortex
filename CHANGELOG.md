@@ -10,6 +10,7 @@
 ### Added
 
 - **work-items 衝突解除（續）**：`wave4-large-bug-integration` 明確歸屬 #475，消除 PR #1090 的 fallback 群組殘留衝突。
+- **#839／#836 共用設定檔**：admission 接受 collector 的選填 `collector_targets`，同一份 `quota-pools.json` 可同時供兩者使用。
 - **#841／#857 env 檔引號**：attestation 的 EnvironmentFile parser 接受引號值內的另一種引號（JSON argv），不再讓照文件設定的 task memory 命令使 loaded runtime 比對失效。
 - **#841 宣告端 invocation 摘要**：`service_declaration_projection` 先算出 manager invocation revision，`cortex service status` 正式路徑的 manager config 可達 match。
 - **work-items 衝突解除**：排除整合 PR #1087／#1090 關閉票造成的 13 筆 confirmed source collision，恢復 paulsha-cortex repo 的 intake 與 hard gate。
