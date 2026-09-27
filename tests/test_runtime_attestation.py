@@ -1658,3 +1658,49 @@ def test_doctor_exposes_the_same_safe_runtime_identity_projection(
     assert probe.context["operator_cli"]["artifact"]["sha256"]
     assert probe.context["service_declaration"]["manager"]["pid"] is None
     assert "doctor-secret-must-not-appear" not in serialized
+
+
+def test_environment_file_accepts_other_quote_inside_quoted_value(tmp_path: Path) -> None:
+    """#857 文件允許 `PSC_TASK_MEMORY_HIPPO_CMD` 用 JSON argv（`'["/abs", "..."]'`）
+    寫進 per-instance env 檔；systemd 的單引號值內雙引號是字面值。attestation 的
+    env 檔 parser 不得因此把整份檔判為無法解析（live：manager／monitor 的
+    environment_source 因而變 unknown）。同種引號未閉合、引號外夾帶引號、反斜線
+    仍 fail closed。"""
+    from paulsha_cortex import runtime_attestation
+
+    parse = runtime_attestation._parse_environment_file
+    ok = parse(
+        b"PSC_TASK_MEMORY_HIPPO_CMD='[\"/usr/bin/env\",\"PYTHONPATH=/opt/h\",\"/usr/bin/python3\"]'\n"
+        b"PSC_NOTE=\"it's fine\"\n"
+        b"PSC_PLAIN=value\n"
+    )
+    assert ok == {
+        "PSC_TASK_MEMORY_HIPPO_CMD": '["/usr/bin/env","PYTHONPATH=/opt/h","/usr/bin/python3"]',
+        "PSC_NOTE": "it's fine",
+        "PSC_PLAIN": "value",
+    }
+    for bad in (
+        b"PSC_X='a'b'\n",          # 同種引號提前閉合後仍有內容
+        b"PSC_X=a\"b\n",           # 未加引號卻夾帶引號
+        b"PSC_X='unterminated\n",  # 未閉合
+        b"PSC_X='a\\\"b'\n",       # 反斜線一律拒絕
+        b"PSC_X='a' 'b'\n",        # 多段串接不支援
+    ):
+        assert parse(bad) is None, bad
+
+    env_file = tmp_path / "manager.env"
+    env_file.write_text(
+        "PSC_TASK_MEMORY_HIPPO_CMD='[\"/usr/bin/env\",\"/usr/bin/python3\"]'\n", encoding="utf-8"
+    )
+    row = {
+        "systemd": {
+            "ExecStart": "{ path=/usr/bin/true ; argv[]=/usr/bin/true ; ignore_errors=no }",
+            "Environment": "",
+            "EnvironmentFiles": f"{env_file} (ignore_errors=no)",
+            "DropInPaths": "",
+            "FragmentPath": str(tmp_path / "unit.service"),
+            "WorkingDirectory": "/",
+        }
+    }
+    source, _overlay = runtime_attestation._environment_source_and_overlay(row)
+    assert source == "systemd-effective"
