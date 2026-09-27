@@ -4791,14 +4791,60 @@ def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
     )
 
 
-def _validate_candidate_planning_authority(run, *, source_repo: Path, candidate: str) -> None:
-    """在候選分支更新前核對 candidate tree 內的 pinned planning bytes。"""
+def _candidate_planning_authority_base(run, job: Mapping[str, object]) -> str | None:
+    """這張 build 卡實際 clone 出來的來源 commit——planning authority 缺席判定的
+    事實來源。**不得信任 builder 自報**，只讀 Manager 自己已有的兩個欄位：
+
+    1. ``run.candidate_head``——上一張已被採信的 build 卡的 candidate。#623 之後
+       每一張 build 卡的實際 clone base 都是它（見 `_workflow_build_handoff_base`
+       與 `_post_archive_candidate`：post-archive、中段續建、以及一般 handoff 三個
+       分支最終都收斂成這個值）。呼叫這個函式時 `run` 尚未因這次 harvest 而更新，
+       因此這裡讀到的正是「這張卡動工前」的那個值。
+    2. ``job.get("dispatch_head")``——僅在 **run 第一張 build 卡**（
+       ``run.candidate_head`` 尚未錨定）時才可信：那張卡自己的 `dispatch_head`
+       就是 provision 當下實際用的 base（`candidate_base.py` 模組 docstring
+       逐字：「第一張 build 卡的 `dispatch_head`……那正是 Manager 當時實際
+       provision 工作區用的 base」）。中段起的 build 卡在 job 記錄上的
+       `dispatch_head` 是**繼承自第一張卡**的 provenance 值（見
+       `manager._dispatch_workflow_card` 的 `builder_jobs[0].get("dispatch_head")`），
+       不是這張卡自己的實際 clone base，所以只在候選尚未錨定時才退回它。
+
+    兩者都推不出合法 SHA 時回 ``None``——呼叫端須 fail-closed，不得把「取不到
+    base」誤判成「合法缺席」。
+    """
+
+    candidate_head = getattr(run, "candidate_head", None)
+    if isinstance(candidate_head, str) and verification.SAFE_SHA_RE.fullmatch(candidate_head):
+        return candidate_head.lower()
+    dispatch_head = job.get("dispatch_head")
+    if isinstance(dispatch_head, str) and verification.SAFE_SHA_RE.fullmatch(dispatch_head):
+        return dispatch_head.lower()
+    return None
+
+
+def _validate_candidate_planning_authority(
+    run, *, job: Mapping[str, object], source_repo: Path, candidate: str
+) -> None:
+    """在候選分支更新前核對 candidate tree 內的 pinned planning bytes。
+
+    #897／#937 部分（f0a37f72）原判準：candidate 缺席 pinned ref 一律視為
+    drift。這在 planner 自產、**從未進版控**的 spec／design／plan（只寫在
+    operator workspace，未 `git add`）上會誤殺——builder 不可能刪除一個從來不
+    存在於版控歷史的東西。修正後的判準：candidate 缺席時，先問這張卡的
+    base（見 `_candidate_planning_authority_base`）**是不是也缺席**：
+
+    - base 也缺席 ⇒ 合法初始狀態（從未進版控），不是 drift，放行。
+    - base 有、candidate 沒有 ⇒ 真的被刪除，維持既有 fail-closed。
+    - 推不出 base ⇒ fail-closed（維持拒收，訊息明講 base 不可得，不得因此
+      放寬成「合法缺席」）。
+    """
 
     authorities = tuple(getattr(run, "planning_authority", ()) or ())
     if not authorities:
         return
 
     operator_root = Path(run.workspace_root).resolve()
+    base = _candidate_planning_authority_base(run, job)
     drift_rows: list[dict[str, str]] = []
     for authority in authorities:
         content = subprocess.run(
@@ -4807,6 +4853,23 @@ def _validate_candidate_planning_authority(run, *, source_repo: Path, candidate:
             check=False,
         )
         if content.returncode != 0:
+            if base is None:
+                raise ValueError(
+                    "workflow planning input drift at candidate harvest: "
+                    f"{authority.ref} is missing from the candidate, and this "
+                    "build card's base commit is unavailable — cannot tell "
+                    "whether the absence predates the build"
+                )
+            base_content = subprocess.run(
+                ["git", "-C", str(source_repo), "show", f"{base}:{authority.ref}"],
+                capture_output=True,
+                check=False,
+            )
+            if base_content.returncode != 0:
+                # base 也沒有這個 ref：這份 planning authority 從未進版控
+                # （operator workspace 未 commit 的產物），builder 不可能刪除
+                # 它，缺席是合法的初始狀態，不是 drift。
+                continue
             raise ValueError(
                 "workflow planning input drift at candidate harvest: "
                 f"{authority.ref} is missing from the candidate"
@@ -4910,7 +4973,7 @@ def _harvest_build_candidate(
                 f"job workspace planning input candidate unavailable: {detail}"
             )
         _validate_candidate_planning_authority(
-            run, source_repo=Path(source_repo), candidate=candidate.lower()
+            run, job=job, source_repo=Path(source_repo), candidate=candidate.lower()
         )
     harvested = job_workspace.harvest_branch(
         source_repo=source_repo, bundle=bundle, branch=branch
