@@ -17,10 +17,13 @@ from paulsha_cortex.deploy import installer
 from paulsha_cortex.runtime_attestation import (
     artifact_identity,
     cli_runtime_observation,
+    declared_service_environment,
     manager_environment_revision,
     monitor_configuration_revision_from_environment,
     runtime_status_report,
     service_declaration_projection,
+    service_environment_overlay,
+    unknown_runtime_report,
 )
 
 from . import COMMANDS, PorcelainCommand, register
@@ -315,32 +318,35 @@ def _unit_pid(units: Any, service_name: str) -> int | None:
 
 
 def _unknown_runtime_report(reason: str, current_artifact: dict[str, object]) -> dict[str, object]:
-    is_installed = current_artifact.get("kind") == "installed-wheel"
-    return {
-        "status": "unknown",
-        "reason": reason,
-        "loaded": None,
-        "installed_artifact": current_artifact if is_installed else {
-            "kind": "unknown",
-            "package": current_artifact.get("package"),
-            "package_version": "unknown",
-            "source_revision": "unknown",
-            "sha256": None,
-        },
-        "current_artifact": current_artifact,
-        "comparison": {
-            "status": "unknown",
-            "reason": reason,
-            "artifact_status": "unknown",
-            "config_status": "unknown",
-            "transition_disposition": "unknown-in-flight-state",
-            "transition_safe": False,
-        },
-        "initial_config_revision": None,
-        "effective_config_revision": None,
-        "previous_process_start": None,
-        "trust_root": {"status": "unknown"},
-    }
+    # #841 對抗審查第五輪：shape 改由 runtime_attestation.unknown_runtime_report
+    # 唯一定義，doctor 的 loaded-runtime 判定共用同一份，避免兩邊結構各自漂移。
+    return unknown_runtime_report(reason, current_artifact)
+
+
+def _service_declared_environment(
+    instance: str, declaration: Any
+) -> tuple[dict[str, str], str]:
+    """依 service 宣告目前的 ``environment_source`` 決定該 service 實際會拿到
+    的環境變數。
+
+    分支判定（systemd-effective／unavailable／unknown）改由
+    ``runtime_attestation.declared_service_environment`` 唯一決定，doctor 的
+    loaded-runtime 判定共用同一條規則（#841 對抗審查第五輪修掉「doctor 用
+    manager 的環境去比對 monitor」那組回歸）；這裡只負責提供 ``cortex
+    service status`` 自己的 direct-fallback 讀法（讀真實 ``os.environ`` 下既有
+    的 ``~/.agents/core/runtime/*.env``），doctor 端則注入可 hermetic 測試的
+    讀法，兩邊分支邏輯不會各自漂移。
+
+    #841 對抗審查第四輪 MAJOR：systemd-effective 分支只能用 unit 宣告本身，
+    不得以呼叫者（操作 CLI）的殼層環境為底再覆蓋——否則殼層裡未被 unit 宣告
+    的 ``PSC_*``（例如操作者自己執行 ``PSC_MONITOR_CONFIG=... cortex service
+    status`` 時帶進來的值）會污染這個 service 的判定。呼叫者自己的環境只用於
+    描述 operator CLI 本身（見 ``cli_runtime_observation``），不進這裡。缺的
+    root 由 ``resolve_runtime_root`` 自行退回已安裝 instance／home 預設，不需
+    要在這裡預先補值。"""
+    return declared_service_environment(
+        declaration, direct_fallback=lambda: _fallback_environment(instance)
+    )
 
 
 def _loaded_runtime_payload(
@@ -349,8 +355,9 @@ def _loaded_runtime_payload(
     manager_pid: int | None,
     monitor_pid: int | None,
     units: Any = None,
+    service_declaration: Any = None,
+    environment_overlay: Any = None,
 ) -> dict[str, object]:
-    environment = _fallback_environment(instance)
     current_artifact = artifact_identity()
     operator_cli = cli_runtime_observation(
         instance=instance,
@@ -358,62 +365,104 @@ def _loaded_runtime_payload(
         artifact=current_artifact,
     )
     unit_rows = units if isinstance(units, dict) else {}
-    service_declaration = service_declaration_projection(
-        unit_rows, instance=instance
+    declarations = (
+        service_declaration
+        if isinstance(service_declaration, dict)
+        else service_declaration_projection(unit_rows, instance=instance)
     )
-    manager_artifact = service_declaration["manager"].get("artifact")
-    monitor_artifact = service_declaration["monitor"].get("artifact")
-    try:
-        manager_root = resolve_runtime_root(
-            "PSC_COORDINATOR_ROOT", environment=environment
+    manager_artifact = declarations["manager"].get("artifact")
+    monitor_artifact = declarations["monitor"].get("artifact")
+    # #841 對抗審查第四輪：environment_overlay（含真實值）與 declarations（只有
+    # digest，safe for JSON）分開傳入——後者可能是探測後已濾除 systemd 原始屬性
+    # 的快取結果，前者才是判定 manager／monitor 實際環境用的來源。呼叫端沒有
+    # 明確傳入時（例如測試直接餵未濾除過的 ``units``），退回從 ``unit_rows``
+    # 重新判定，行為與濾除前一致。
+    overlays = (
+        environment_overlay
+        if isinstance(environment_overlay, dict)
+        else service_environment_overlay(unit_rows, instance=instance)
+    )
+    manager_environment, manager_environment_source = _service_declared_environment(
+        instance, overlays.get("manager")
+    )
+    monitor_environment, monitor_environment_source = _service_declared_environment(
+        instance, overlays.get("monitor")
+    )
+
+    if manager_environment_source == "unknown":
+        manager_report = _unknown_runtime_report(
+            "service-environment-unknown", current_artifact
         )
-        monitor_root = resolve_runtime_root(
-            "PSC_MONITOR_STATE_ROOT", environment=environment
+    else:
+        try:
+            manager_root = resolve_runtime_root(
+                "PSC_COORDINATOR_ROOT", environment=manager_environment
+            )
+            manager_report = runtime_status_report(
+                manager_root,
+                service="manager",
+                instance=instance,
+                declared_config_revision=manager_environment_revision(
+                    manager_environment
+                ),
+                declared_config_component="environment_revision",
+                declared_invocation_revision=None,
+                expected_pid=manager_pid,
+                require_process_match=True,
+                current_artifact=(
+                    manager_artifact if isinstance(manager_artifact, dict) else None
+                ),
+            )
+        except Exception:  # noqa: BLE001 — 無效宣告時維持 unknown。
+            manager_report = _unknown_runtime_report(
+                "runtime-declaration-unavailable", current_artifact
+            )
+
+    if monitor_environment_source == "unknown":
+        monitor_report = _unknown_runtime_report(
+            "service-environment-unknown", current_artifact
         )
-        manager_report = runtime_status_report(
-            manager_root,
-            service="manager",
-            instance=instance,
-            declared_config_revision=manager_environment_revision(environment),
-            declared_config_component="environment_revision",
-            declared_invocation_revision=None,
-            expected_pid=manager_pid,
-            require_process_match=True,
-            current_artifact=(
-                manager_artifact if isinstance(manager_artifact, dict) else None
-            ),
-        )
-        monitor_report = runtime_status_report(
-            monitor_root,
-            service="monitor",
-            instance=instance,
-            declared_config_revision=monitor_configuration_revision_from_environment(
-                environment
-            ),
-            expected_pid=monitor_pid,
-            require_process_match=True,
-            current_artifact=(
-                monitor_artifact if isinstance(monitor_artifact, dict) else None
-            ),
-        )
-    except Exception:  # noqa: BLE001 — 無效宣告時維持 unknown。
-        unknown = _unknown_runtime_report("runtime-declaration-unavailable", current_artifact)
-        return {
-            "operator_cli": operator_cli,
-            "service_declaration": service_declaration,
-            "manager": unknown,
-            "monitor": unknown,
-        }
+    else:
+        try:
+            monitor_root = resolve_runtime_root(
+                "PSC_MONITOR_STATE_ROOT", environment=monitor_environment
+            )
+            monitor_report = runtime_status_report(
+                monitor_root,
+                service="monitor",
+                instance=instance,
+                declared_config_revision=monitor_configuration_revision_from_environment(
+                    monitor_environment
+                ),
+                expected_pid=monitor_pid,
+                require_process_match=True,
+                current_artifact=(
+                    monitor_artifact if isinstance(monitor_artifact, dict) else None
+                ),
+            )
+        except Exception:  # noqa: BLE001 — 無效宣告時維持 unknown。
+            monitor_report = _unknown_runtime_report(
+                "runtime-declaration-unavailable", current_artifact
+            )
+
     return {
         "operator_cli": operator_cli,
-        "service_declaration": service_declaration,
+        "service_declaration": declarations,
         "manager": manager_report,
         "monitor": monitor_report,
+        "environment_source": {
+            "manager": manager_environment_source,
+            "monitor": monitor_environment_source,
+        },
     }
 
 
 def _status_payload(instance: str) -> dict[str, Any]:
     probe = probe_service_runtime(instance)
+    # #841 對抗審查第四輪：真實環境值只透過這個 pop 取出，之後任何分支對
+    # ``probe`` 做 ``dict(probe)``／整包回傳都不會再帶著它，避免誤落進 JSON
+    # 輸出；再以獨立參數傳給 ``_loaded_runtime_payload`` 供內部重建 root 用。
+    environment_overlay = probe.pop("_environment_overlay", None)
     if probe["mode"] == "systemd":
         units = probe.get("units", {})
         manager_service = f"{instance}-manager.service"
@@ -426,6 +475,8 @@ def _status_payload(instance: str) -> dict[str, Any]:
             manager_pid=_unit_pid(units, manager_service),
             monitor_pid=_unit_pid(units, monitor_service),
             units=units,
+            service_declaration=probe.get("service_declaration"),
+            environment_overlay=environment_overlay,
         )
         return payload
     fallback = _fallback_runtime(instance, str(probe.get("version", "0.0.0+unknown")), probe.get("units", {}))
@@ -436,6 +487,8 @@ def _status_payload(instance: str) -> dict[str, Any]:
             manager_pid=fallback.get("pid") if type(fallback.get("pid")) is int else None,
             monitor_pid=_unit_pid(units, f"{instance}-monitor.service"),
             units=units,
+            service_declaration=probe.get("service_declaration"),
+            environment_overlay=environment_overlay,
         )
         return fallback
     return {
@@ -448,6 +501,8 @@ def _status_payload(instance: str) -> dict[str, Any]:
             manager_pid=-1,
             monitor_pid=-1,
             units=probe.get("units", {}),
+            service_declaration=probe.get("service_declaration"),
+            environment_overlay=environment_overlay,
         ),
         "suggested_commands": [f"cortex service install --instance {instance}"],
     }

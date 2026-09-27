@@ -111,6 +111,22 @@ class AuthorityValidationError(ValueError):
         super().__init__(f"{message} ({', '.join(details)})")
 
 
+class WorkAuthorityConfirmedAbsent(ValueError):
+    """(repo, work_id) 在健康、非限流、非 ambiguous 的 snapshot 中查無任何
+    authority 來源時才拋出。
+
+    這是 ``retire-delivered`` registry-only 退休路徑唯一可信任「視為明確
+    缺席」的例外**型別**（#1093 對抗審查 MAJOR）：判斷方式必須是結構化的
+    型別檢查，不能靠比對錯誤訊息字串——重複 ``(repo, work_id)``、跨 work
+    的 issue owner 衝突（見 ``_load_work_authorities_with_diagnostics``）、
+    以及 snapshot 對應 provider degraded／限流（見
+    ``load_work_authority`` 尾端的 provider 健康檢查）都會讓查詢「找不到
+    唯一解」，但那些是歧義或不健康，不是確定缺席；它們一律維持一般
+    ``ValueError``／``AuthorityValidationError``（非本類別），讓呼叫端
+    （``work_actions._is_work_authority_absence``）繼續 fail-closed。
+    """
+
+
 def semantic_source_revision(
     *,
     repo: str,
@@ -589,6 +605,38 @@ def _auto_label_from_observations(github: dict, issues: list[int]) -> bool:
     return any(number in labeled for number in issues)
 
 
+def _validate_canonical_provider_timestamp(
+    last_success_at: str,
+    *,
+    repo_label: str | None,
+    work_id_label: str | None,
+    provider_id: str,
+) -> float:
+    """驗證 canonical GitHub provider 的 ``last_success_at`` 可解析成時間。
+
+    這是 canonical provider 健康度判斷唯一的時間解析規則，被
+    ``_authority_from_canonical_row``（逐列解析時）與
+    ``load_work_authority``（#1093：目標 (repo, work_id) 完全沒有列在
+    work_items 時，對 canonical provider 本身的最後一道健康檢查）共用
+    ——不可各寫一套。#1093 對抗審查第三輪 MAJOR：後者原本只檢查
+    ``last_success_at`` 是非空字串就視為健康，像 ``"not-a-timestamp"``
+    這種無法解析的畸形值會被誤判為健康，讓 provider 誤判為「根本不存在」
+    而放行 ``WorkAuthorityConfirmedAbsent``（registry-only 退休）。
+    """
+
+    try:
+        return datetime.fromisoformat(last_success_at.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise AuthorityValidationError(
+            "durable GitHub provider timestamp invalid",
+            reason_code=REASON_PROVIDER_INVALID_CANONICAL,
+            repo=repo_label,
+            work_id=work_id_label,
+            provider_id=provider_id,
+            field="last_success_at",
+        ) from exc
+
+
 def _authority_from_canonical_row(
     *,
     row: dict,
@@ -789,17 +837,12 @@ def _authority_from_canonical_row(
             )
         # else：rate-limited 但被退休語境豁免——沿用 last-known-good 的
         # revision/last_success_at 繼續建構 authority。
-    try:
-        last_success = datetime.fromisoformat(last_success_at.replace("Z", "+00:00")).timestamp()
-    except ValueError as exc:
-        raise AuthorityValidationError(
-            "durable GitHub provider timestamp invalid",
-            reason_code=REASON_PROVIDER_INVALID_CANONICAL,
-            repo=repo_label,
-            work_id=work_id_label,
-            provider_id=provider_id,
-            field="last_success_at",
-        ) from exc
+    last_success = _validate_canonical_provider_timestamp(
+        last_success_at,
+        repo_label=repo_label,
+        work_id_label=work_id_label,
+        provider_id=provider_id,
+    )
     issues: list[int] = []
     prs: list[int] = []
     changes: list[str] = []
@@ -1153,15 +1196,141 @@ def load_work_authority(
         return matches[0]
     # #206 AC1/C：目標本身就是被跳過的壞 row → 拋出帶該 row reason code 的錯誤，
     # 而不是泛化的 missing/ambiguous，讓呼叫端能診斷「因為它的 authority 無效」。
+    #
+    # #1093 對抗審查第四輪 MAJOR2：原本用 `exc.repo == repo` 精確比對——但
+    # `exc.repo` 是已過 `_diagnostic_label` 篩選的診斷欄位，row 的 `repo`
+    # 欄位本身缺失／畸形（非字串、以 "/"/"~" 開頭、含 "\\"）時 `exc.repo`
+    # 會是 `None`，與任何真實 repo 字串比對恆為 False。此時即使 `exc.work_id`
+    # 與目標完全相符，這一列仍會被判定「與目標無關」而不觸發這裡的 raise，
+    # 讓查詢落到下面「目標完全沒有任何一列」的分支，若 canonical provider
+    # 又剛好健康或不存在，就會誤判成 `WorkAuthorityConfirmedAbsent`（確定
+    # 缺席），放行 registry-only 退休——即使目標 row 其實還在，只是 `repo`
+    # 欄位本身損毀。`repo`／`work_id` 任一邊「相符」或「因為欄位本身畸形而
+    # 無法判定是否相符」（`None`）都必須視為「不能排除是目標」，一律
+    # fail-closed 拋出這一列原本的錯誤，不得放行確定缺席。
     for exc in skipped:
-        if exc.repo == repo and exc.work_id in (None, work_id):
+        repo_may_match = exc.repo is None or exc.repo == repo
+        work_id_may_match = exc.work_id is None or exc.work_id == work_id
+        if repo_may_match and work_id_may_match:
             raise exc
     payload, _ = _load_snapshot(snapshot_path)
     if isinstance(payload, dict) and payload.get("last_refresh_error"):
         raise ValueError(
             f"confirmed work authority missing or ambiguous (monitor refresh failed: {payload['last_refresh_error']})"
         )
-    raise ValueError("confirmed work authority missing or ambiguous")
+    # #1093 對抗審查：目標 (repo, work_id) 在 work_items 裡完全沒有任何一列
+    # ——但這不代表可以放行 registry-only 退休。canonical schema 下，一個
+    # repo 完全沒有列在 work_items，provider 健康度不會被上面逐列解析碰到
+    # （_authority_from_canonical_row 只在有列引用該 provider 時才檢查），
+    # 所以這裡補上對「目標 repo 這一側」所有相關 provider 的最後一道健康
+    # 檢查：任一 provider 存在但 degraded／限流／畸形時，缺席「找不到」可能
+    # 只是被中斷的掃描掩蓋，必須 fail-closed（AuthorityValidationError，
+    # 非本函式的確定缺席型別）；provider 全部根本不存在（workspace 已從
+    # 設定移除，或這個 work item 從不需要對應來源）才算確定缺席。
+    #
+    # #1093 對抗審查第四輪 MAJOR3：舊實作只檢查 `github:<repo>`。但
+    # todo-only work item（不依賴 GitHub）完全靠 `repo:<repo>`（本機工作區
+    # 掃描 provider）供應；`repo:<repo>` degraded 會讓它從 work_items 消失，
+    # 舊檢查看不到這個 provider，只要 `github:<repo>` 健康（或根本不存在）
+    # 就會誤判成確定缺席。改為對「這個 repo 的每一個已存在 provider 條目」
+    # （至少 `repo:`、`github:`，加上 snapshot 裡任何其他以 `<kind>:<repo>`
+    # 形式對應這個 repo 的既有 provider 種類）逐一健康檢查；條目完全不存在
+    # 才不擋（維持既有「provider 根本不存在＝確定缺席」語意）。
+    payload_providers = payload.get("providers") if isinstance(payload, dict) else None
+    if isinstance(payload_providers, dict):
+        repo_label = _diagnostic_label(repo)
+        work_id_label = _diagnostic_label(work_id)
+        provider_ids_for_repo = {f"{GITHUB_PROVIDER_ID}:{repo}", f"repo:{repo}"}
+        for provider_id in payload_providers:
+            if not isinstance(provider_id, str):
+                continue
+            kind, _, provider_repo = provider_id.partition(":")
+            if provider_repo == repo and kind:
+                provider_ids_for_repo.add(provider_id)
+        for provider_id in sorted(provider_ids_for_repo):
+            _require_repo_scoped_provider_healthy_if_present(
+                provider_id,
+                payload_providers,
+                repo_label=repo_label,
+                work_id_label=work_id_label,
+            )
+    raise WorkAuthorityConfirmedAbsent("confirmed work authority missing or ambiguous")
+
+
+def _require_repo_scoped_provider_healthy_if_present(
+    provider_id: str,
+    providers: dict,
+    *,
+    repo_label: str | None,
+    work_id_label: str | None,
+) -> None:
+    """若 ``providers[provider_id]`` 存在，驗證其健康／新鮮；entry 完全不
+    存在則放行（呼叫端仍要另外判斷「所有相關 provider 皆不存在」是否代表
+    確定缺席）。沿用 canonical GitHub provider 既有的健康規則（狀態／
+    revision／可解析的 last_success_at），不為其他 provider 種類另寫一套
+    較寬鬆的判準（#1093 對抗審查第四輪 MAJOR3）。
+    """
+
+    # #1093 對抗審查 MAJOR1（沿用同一判準）：用 `in` 判斷「這個 provider
+    # 條目存在」而非 `.get(...) is not None`——兩者對「條目根本不存在」與
+    # 「條目存在但值是 null」的區分不同，但這裡真正要分的是「存在」vs
+    # 「不存在」，「值是 null」屬於下面 else 分支要 fail-closed 的畸形之一。
+    if provider_id not in providers:
+        return
+    entry = providers[provider_id]
+    if not isinstance(entry, dict):
+        # provider 條目存在，但格式不正確（`null`／list／字串等非
+        # mapping）——健康度無法判斷，不可當作「provider 不存在」而放行
+        # 確定缺席，必須 fail-closed。
+        raise AuthorityValidationError(
+            "durable provider authority malformed",
+            reason_code=REASON_PROVIDER_INVALID_CANONICAL,
+            repo=repo_label,
+            work_id=work_id_label,
+            provider_id=provider_id,
+            field="status",
+        )
+    revision = entry.get("revision")
+    last_success_at = entry.get("last_success_at")
+    healthy = (
+        entry.get("status") == "ok"
+        and isinstance(revision, str)
+        and bool(revision)
+        and isinstance(last_success_at, str)
+        and bool(last_success_at)
+    )
+    if not healthy:
+        diagnostics = entry.get("diagnostics")
+        rate_limited = isinstance(diagnostics, list) and any(
+            isinstance(diag, str) and is_rate_limit_signal(diag) for diag in diagnostics
+        )
+        raise AuthorityValidationError(
+            "durable provider authority rate-limited"
+            if rate_limited
+            else "durable provider authority invalid",
+            reason_code=(
+                REASON_PROVIDER_RATE_LIMITED_CANONICAL
+                if rate_limited
+                else REASON_PROVIDER_INVALID_CANONICAL
+            ),
+            repo=repo_label,
+            work_id=work_id_label,
+            provider_id=provider_id,
+            field="status",
+        )
+    # 上面的 `healthy` 只檢查 `last_success_at` 是非空字串，沒有驗證它真的
+    # 能解析成時間——`"not-a-timestamp"` 這類畸形值會被誤判為健康，讓
+    # `WorkAuthorityConfirmedAbsent` 誤判「確定缺席」、放行 registry-only
+    # 退休。沿用 `_authority_from_canonical_row` 對 canonical GitHub
+    # provider 已經在用的同一套 ISO8601 解析規則
+    # （`_validate_canonical_provider_timestamp`），而不是另寫一套較寬鬆的
+    # 健康判斷。
+    _validate_canonical_provider_timestamp(
+        last_success_at,
+        repo_label=repo_label,
+        work_id_label=work_id_label,
+        provider_id=provider_id,
+    )
 
 
 @dataclass(frozen=True)

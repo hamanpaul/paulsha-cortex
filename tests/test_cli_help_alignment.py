@@ -21,6 +21,8 @@ def test_umbrella_help_lists_public_command_families(capsys) -> None:
     assert "deck" in captured.out
     assert "monitor" in captured.out
     assert "tick" in captured.out
+    assert "delivery" in captured.out
+    assert "需求交付缺額" in captured.out
     assert "work             透過 Manager 單一 writer" in captured.out
     assert "dispatch         已停用" in captured.out
 
@@ -50,6 +52,15 @@ def test_fanout_help_uses_daemon_default_not_legacy_tmux(capsys) -> None:
 def test_subcommand_help_uses_installed_cortex_invocations() -> None:
     assert build_deck_parser().prog == "cortex deck"
     assert build_monitor_parser().prog == "cortex monitor"
+
+
+def test_task_memory_canary_help_does_not_repeat_subcommand(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        umbrella_cli.main(["task-memory", "canary", "--help"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "usage: cortex task-memory canary " in output
+    assert "usage: cortex task-memory canary canary" not in output
 
 
 def test_work_help_lists_gc_subcommand() -> None:

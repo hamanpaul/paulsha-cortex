@@ -106,6 +106,128 @@ def test_slice_review_log_is_registered_as_manager_only(tmp_path: Path) -> None:
     )
 
 
+def test_execution_qualification_state_is_registered_manager_only() -> None:
+    """#842 durable authority data must stay inside the manager-only Trust Root."""
+    from paulsha_cortex.trust_root import permgen
+
+    expected = {
+        "execution-qualification-candidates": (
+            "execution_qualification_candidates_root", "execution-qualification/candidates"
+        ),
+        "execution-qualification-receipts": (
+            "execution_qualification_receipts_root", "execution-qualification/receipts"
+        ),
+        "execution-qualification-roster": (
+            "execution_qualification_roster_path", "execution-qualification/approved-roster.json"
+        ),
+        "execution-qualification-index": (
+            "execution_qualification_index_path", "execution-qualification/index.json"
+        ),
+    }
+    layout = permgen.DEFAULT_LAYOUT
+    registered_paths = layout.asset_paths()
+    for asset_id, (resolver, suffix) in expected.items():
+        asset = registry.asset_by_id(asset_id)
+        assert asset.tier is AssetTier.TIER_0
+        assert asset.tree is TrustTree.MANAGER_OWNED
+        assert asset.writers == (Principal.MANAGER,)
+        assert asset.readers == (Principal.MANAGER,)
+        assert asset.path_resolver == f"paulsha_cortex.config.paths:{resolver}"
+        assert registered_paths[asset_id] == f"{layout.coordinator_root}/{suffix}"
+    assert check_registry_equation().ok
+
+
+def test_execution_qualification_operator_receipts_are_governed_and_job_unwritable() -> None:
+    """Live approval receipts are operator/Manager writable and unavailable to job writers."""
+    from paulsha_cortex.trust_root import permgen
+
+    asset = registry.asset_by_id("execution-qualification-operator-receipts")
+    assert asset.tier is AssetTier.TIER_0
+    assert asset.tree is TrustTree.MANAGER_OWNED
+    assert asset.writers == (Principal.MANAGER, Principal.OPERATOR)
+    assert asset.readers == (Principal.MANAGER, Principal.OPERATOR)
+    assert asset.path_resolver == (
+        "paulsha_cortex.config.paths:execution_qualification_operator_receipts_root"
+    )
+    assert permgen.DEFAULT_LAYOUT.asset_paths()[asset.asset_id] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/execution-qualification/operator-receipts"
+    )
+    index = registry.asset_by_id("execution-qualification-operator-receipt-index")
+    assert index.writers == (Principal.MANAGER,)
+    assert index.readers == (Principal.MANAGER,)
+    assert index.path_resolver == (
+        "paulsha_cortex.config.paths:execution_qualification_operator_receipt_registry_path"
+    )
+    assert permgen.DEFAULT_LAYOUT.asset_paths()[index.asset_id] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/execution-qualification/operator-receipt-index.json"
+    )
+    assert check_registry_equation().ok
+
+
+def test_quota_observation_ledger_is_manager_written_monitor_readable(tmp_path: Path, monkeypatch) -> None:
+    """#836 durable shadow state has one resolver and no headless write access."""
+    from paulsha_cortex.trust_root import permgen
+
+    asset = registry.asset_by_id("quota-observation-events")
+    assert asset.tier is AssetTier.TIER_1
+    assert asset.tree is TrustTree.MANAGER_OWNED
+    assert asset.writers == (Principal.MANAGER,)
+    assert asset.readers == (Principal.MANAGER, Principal.MONITOR)
+    assert asset.path_resolver == "paulsha_cortex.config.paths:quota_observation_root"
+    assert asset.headless_writable() is False
+    coordinator = tmp_path / "coordinator"
+    monkeypatch.setenv("PSC_COORDINATOR_ROOT", str(coordinator))
+    assert paths.quota_observation_root() == coordinator / "quota-observations"
+    assert permgen.DEFAULT_LAYOUT.asset_paths()["quota-observation-events"] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/quota-observations"
+    )
+    for scheme in (permgen.TWO_WAY_SCHEME, permgen.THREE_WAY_SCHEME):
+        assert scheme.resolve(Principal.MANAGER) == scheme.resolve(Principal.MONITOR)
+        entry = permgen.generate_plan(scheme).by_id("quota-observation-events")
+        assert entry.writer_accounts == frozenset({scheme.resolve(Principal.MANAGER)})
+        assert entry.reader_accounts == frozenset({scheme.resolve(Principal.MANAGER)})
+
+
+def test_quota_reservation_authority_is_manager_written_monitor_readable(tmp_path: Path, monkeypatch) -> None:
+    """#838 跨 instance 共享的 reservation authority：唯一 resolver，headless 無寫入權。"""
+    from paulsha_cortex.trust_root import permgen
+
+    asset = registry.asset_by_id("quota-reservation-authority")
+    assert asset.tier is AssetTier.TIER_1
+    assert asset.tree is TrustTree.MANAGER_OWNED
+    assert asset.writers == (Principal.MANAGER,)
+    assert asset.readers == (Principal.MANAGER, Principal.MONITOR)
+    assert asset.path_resolver == "paulsha_cortex.config.paths:quota_reservation_root"
+    assert asset.headless_writable() is False
+    coordinator = tmp_path / "coordinator"
+    monkeypatch.setenv("PSC_COORDINATOR_ROOT", str(coordinator))
+    assert paths.quota_reservation_root() == coordinator / "quota-reservations"
+    assert permgen.DEFAULT_LAYOUT.asset_paths()["quota-reservation-authority"] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/quota-reservations"
+    )
+    for scheme in (permgen.TWO_WAY_SCHEME, permgen.THREE_WAY_SCHEME):
+        assert scheme.resolve(Principal.MANAGER) == scheme.resolve(Principal.MONITOR)
+        entry = permgen.generate_plan(scheme).by_id("quota-reservation-authority")
+        assert entry.writer_accounts == frozenset({scheme.resolve(Principal.MANAGER)})
+        assert entry.reader_accounts == frozenset({scheme.resolve(Principal.MANAGER)})
+    assert check_registry_equation().ok
+
+
+def test_requirement_delivery_index_is_manager_owned_and_registered(tmp_path: Path) -> None:
+    """衍生總帳由 Manager 寫入、Monitor 唯讀，且路徑由 Trust Root 同源管理。"""
+    from paulsha_cortex.trust_root import permgen
+
+    asset = registry.asset_by_id("requirement-delivery-index")
+    assert asset.tree is TrustTree.MANAGER_OWNED
+    assert asset.writers == (Principal.MANAGER,)
+    assert asset.readers == (Principal.MANAGER, Principal.MONITOR)
+    assert asset.path_resolver == "paulsha_cortex.config.paths:requirement_delivery_index_root"
+    assert paths.requirement_delivery_index_root() == paths.coordinator_root() / "requirement-delivery"
+    assert permgen.DEFAULT_LAYOUT.asset_paths()["requirement-delivery-index"] == (
+        f"{permgen.DEFAULT_LAYOUT.coordinator_root}/requirement-delivery"
+    )
+
+
 def test_all_three_headless_personas_covered() -> None:
     """spec §R1：盤點必須涵蓋 builder／reviewer／planner 三者，不能只封 builder。"""
     assert registry.personas_covered() == HEADLESS_PERSONAS

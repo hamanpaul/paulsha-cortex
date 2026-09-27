@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import re
+import sys
+import types
 from dataclasses import replace
 from pathlib import Path
 import subprocess
@@ -1270,6 +1272,527 @@ def test_retire_delivered_supersedes_ongoing_run_when_all_prs_terminal(
         )
 
 
+@pytest.mark.parametrize(
+    "digest_source", ["workflow-run", "delivery-journal", "absent"]
+)
+def test_retire_delivered_uses_registry_run_when_work_authority_is_missing(
+    tmp_path: Path, digest_source: str
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry_path = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=registry_path)
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#110",))
+    run = registry.get_workflow_run(run_id)
+    if digest_source != "workflow-run":
+        authority = work_actions.load_work_authority(
+            repo="acme/demo", work_id="demo", snapshot_path=snapshot
+        )
+        journal = work_actions._load_runs(state)
+        journal["runs"][run_id] = work_actions._delivery_journal_row(run, authority)
+        work_actions._save_runs(state, journal)
+        run = registry._manager_update_workflow_run(
+            run_id, source_revision="unavailable-legacy-authority"
+        )
+        journal = work_actions._load_runs(state)
+        if digest_source == "absent":
+            journal["runs"].pop(run_id)
+            work_actions._save_runs(state, journal)
+            expected_digest = None
+            expected_digest_source = "absent"
+        else:
+            expected_digest = journal["runs"][run_id]["authority_digest"]
+            expected_digest_source = "delivery-journal.authority_digest"
+    else:
+        expected_digest = run.source_revision
+        expected_digest_source = "workflow-run.source_revision"
+
+    # Models the work item disappearing when its workspace is removed from
+    # project-cortex.yaml while its durable WorkflowRun remains in the registry.
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["work_items"] = []
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    args = {
+        "action": "retire-delivered",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "Workspace retired after external delivery.",
+    }
+    lifecycle_runner = _pr_lifecycle_runner(
+        {110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+    )
+    provider_calls = []
+
+    def terminal_runner(argv, **kwargs):
+        provider_calls.append(tuple(argv))
+        return lifecycle_runner(argv, **kwargs)
+
+    first = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        runner=terminal_runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+
+    assert first["result"]["action"] == "retired-delivered"
+    assert registry.get_workflow_run(run_id).status == "superseded"
+    evidence = Path(first["result"]["evidence"]["ref"])
+    evidence_payload = json.loads(evidence.read_text(encoding="utf-8"))
+    assert evidence_payload["authority_source"] == "registry-run-record"
+    assert evidence_payload["authority_digest"] == expected_digest
+    assert evidence_payload["authority_digest_source"] == expected_digest_source
+    assert evidence_payload["authority_digest_status"] == (
+        "recorded" if expected_digest is not None else "absent"
+    )
+    assert evidence_payload["pr_terminal_status"] == [
+        {"ref": "acme/demo#110", "state": "merged"}
+    ]
+    assert len(provider_calls) == 1
+
+    # Exact replay reads the durable terminal proof and emits only one outcome.
+    second = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        runner=_pr_lifecycle_runner({}),
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=JobRegistry(state_path=registry_path),
+    )
+    assert first == second
+    assert len(provider_calls) == 1
+    outcomes = list(
+        (tmp_path / "engineering-outcomes").glob("*.jsonl")
+    )
+    assert len(outcomes) == 1
+    assert len(outcomes[0].read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_retire_delivered_v2_evidence_fails_closed_under_pre_1093_reader(
+    tmp_path: Path,
+) -> None:
+    """#1093 對抗審查 MAJOR2 相容性驗證。
+
+    authority 缺席（registry-only）路徑改寫 ``cortex-work-retire-delivered
+    /v2`` evidence；若這個修復日後被回退到 ``origin/main``（本票之前），舊
+    版 ``_superseded_retire_delivered_body`` 只認得 v1 schema——必須證明它
+    遇到 v2 evidence 時是「安全 fail-closed」（乾淨的
+    ``WorkflowRun was superseded by different authority`` RuntimeError，不
+    是未攔截例外或資料損毀），而且本 PR 未改動的 v1 evidence（authority 存
+    在路徑）仍能被舊 reader 正常讀回——兩面都要驗證才算完整的回退相容性。
+
+    做法：把 ``origin/main`` 版本的 ``work_actions.py`` 原始碼載入成獨立
+    module，直接呼叫它的 ``_superseded_retire_delivered_body``，不猜測、不
+    重寫舊邏輯。
+    """
+
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        old_source = subprocess.run(
+            ["git", "show", "origin/main:paulsha_cortex/coordinator/work_actions.py"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        pytest.skip(f"origin/main 不可讀，略過舊 reader 回退相容性驗證：{error}")
+
+    module_name = "paulsha_cortex.coordinator._pre_1093_work_actions_compat_shim"
+    old_module = types.ModuleType(module_name)
+    old_module.__package__ = "paulsha_cortex.coordinator"
+    old_module.__file__ = "origin/main:paulsha_cortex/coordinator/work_actions.py"
+    sys.modules[module_name] = old_module
+    try:
+        exec(compile(old_source, old_module.__file__, "exec"), old_module.__dict__)
+    finally:
+        sys.modules.pop(module_name, None)
+    assert hasattr(old_module, "_superseded_retire_delivered_body"), (
+        "origin/main 的 work_actions.py 應仍有 _superseded_retire_delivered_body；"
+        "若函式已改名/搬移，這份相容性測試需要跟著更新，不能靜默略過"
+    )
+
+    actor = "operator"
+    reason = "Workspace retired after external delivery."
+
+    # --- v1：authority 存在路徑，本 PR 未改動 evidence 形狀 ---
+    # 舊 reader 對這條路徑必須仍能正常讀回，證明本 PR 沒有連帶破壞既有相容性。
+    snapshot_v1 = _snapshot(tmp_path / "v1" / "snapshot.json")
+    state_v1 = tmp_path / "v1" / "runs.json"
+    registry_v1 = JobRegistry(state_path=tmp_path / "v1" / "jobs.json")
+    started_v1 = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot_v1,
+        state_path=state_v1,
+        now=lambda: 200,
+        workflow_registry=registry_v1,
+    )
+    run_id_v1 = started_v1["result"]["run"]["run_id"]
+    registry_v1._manager_update_workflow_run(run_id_v1, pr_refs=("acme/demo#110",))
+    args_v1 = {
+        "action": "retire-delivered",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "actor": actor,
+        "expected_run_id": run_id_v1,
+        "reason": reason,
+    }
+    work_actions.execute_work_action(
+        args=args_v1,
+        requested_by="operator",
+        runner=_pr_lifecycle_runner(
+            {110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+        ),
+        snapshot_path=snapshot_v1,
+        state_path=state_v1,
+        workflow_registry=registry_v1,
+    )
+    run_v1 = registry_v1.get_workflow_run(run_id_v1)
+    old_body_v1 = old_module._superseded_retire_delivered_body(
+        run_v1, state_path=state_v1, actor=actor, reason=reason
+    )
+    assert old_body_v1["schema"] == "cortex-work-retire-delivered/v1"
+
+    # --- v2：authority 缺席路徑，本 PR 新增 ---
+    # 舊 reader 遇到多出的 authority_source／authority_digest_source／
+    # authority_digest_status 欄位時必須安全 fail-closed，而不是崩潰或誤讀。
+    snapshot_v2 = _snapshot(tmp_path / "v2" / "snapshot.json")
+    state_v2 = tmp_path / "v2" / "runs.json"
+    registry_v2 = JobRegistry(state_path=tmp_path / "v2" / "jobs.json")
+    started_v2 = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot_v2,
+        state_path=state_v2,
+        now=lambda: 200,
+        workflow_registry=registry_v2,
+    )
+    run_id_v2 = started_v2["result"]["run"]["run_id"]
+    registry_v2._manager_update_workflow_run(run_id_v2, pr_refs=("acme/demo#110",))
+    payload_v2 = json.loads(snapshot_v2.read_text(encoding="utf-8"))
+    payload_v2["work_items"] = []
+    snapshot_v2.write_text(json.dumps(payload_v2), encoding="utf-8")
+    args_v2 = {**args_v1, "expected_run_id": run_id_v2}
+    work_actions.execute_work_action(
+        args=args_v2,
+        requested_by="operator",
+        runner=_pr_lifecycle_runner(
+            {110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+        ),
+        snapshot_path=snapshot_v2,
+        state_path=state_v2,
+        workflow_registry=registry_v2,
+    )
+    run_v2 = registry_v2.get_workflow_run(run_id_v2)
+    evidence_files_v2 = list(
+        (state_v2.parent / "evidence" / "work-retire-delivered").glob("*.json")
+    )
+    assert len(evidence_files_v2) == 1
+    v2_payload = json.loads(evidence_files_v2[0].read_text(encoding="utf-8"))
+    assert v2_payload["schema"] == "cortex-work-retire-delivered/v2"
+
+    with pytest.raises(RuntimeError, match="superseded by different authority"):
+        old_module._superseded_retire_delivered_body(
+            run_v2, state_path=state_v2, actor=actor, reason=reason
+        )
+
+
+@pytest.mark.parametrize("failure", ["non-terminal-pr", "non-ongoing-run", "active-job"])
+def test_retire_delivered_without_authority_keeps_fail_closed_admission(
+    tmp_path: Path, failure: str
+) -> None:
+    snapshot = _snapshot(tmp_path / failure / "snapshot.json")
+    state = tmp_path / failure / "runs.json"
+    registry_path = tmp_path / failure / "jobs.json"
+    registry = JobRegistry(state_path=registry_path)
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#110",))
+    run = registry.get_workflow_run(run_id)
+    if failure == "non-ongoing-run":
+        from dataclasses import replace
+
+        index = registry._find_workflow_run_index(run_id)
+        registry._workflows[index] = replace(run, status="superseded")
+    elif failure == "active-job":
+        registry.create_job(
+            task="active-writer",
+            persona="builder",
+            branch="feature/demo",
+            pane="",
+            worktree=run.workspace_root,
+            workflow_run_id=run_id,
+            workflow_claim_key=run.claim_key,
+            workflow_repo=run.repo,
+            workflow_card="build-card",
+            workflow_phase="build",
+        )
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["work_items"] = []
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    runner = _pr_lifecycle_runner(
+        {
+            110: {
+                "state": "open" if failure == "non-terminal-pr" else "closed",
+                "merged_at": None
+                if failure == "non-terminal-pr"
+                else "2026-08-01T00:00:00Z",
+            }
+        }
+    )
+
+    expected_error = {
+        "non-terminal-pr": "non-terminal PR",
+        "non-ongoing-run": "different authority",
+        "active-job": "refuses active workflow job",
+    }[failure]
+    with pytest.raises((RuntimeError, ValueError), match=expected_error):
+        work_actions.execute_work_action(
+            args={
+                "action": "retire-delivered",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "operator",
+                "expected_run_id": run_id,
+                "reason": "Fail closed without authority.",
+            },
+            requested_by="operator",
+            runner=runner,
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    assert not (tmp_path / failure / "evidence" / "work-retire-delivered").exists()
+    assert not (tmp_path / failure / "engineering-outcomes").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "duplicate-identity",
+        "issue-owner-conflict",
+        "provider-degraded",
+        "provider-rate-limited",
+        "provider-null",
+        "provider-list",
+        "provider-string",
+        "provider-timestamp-unparseable",
+        "repo-provider-degraded",
+        "other-repo-scoped-provider-degraded",
+    ],
+)
+def test_retire_delivered_rejects_ambiguous_or_unhealthy_authority_absence(
+    tmp_path: Path, failure: str
+) -> None:
+    """Registry-only retirement requires healthy, unambiguous snapshot absence.
+
+    #1093 對抗審查 MAJOR1：``provider-null``／``provider-list``／
+    ``provider-string`` 模擬 ``providers["github:<repo>"]`` 條目存在但格式
+    不正確（非 mapping）——這種畸形不可被誤判成「provider 根本不存在」而
+    放行確定缺席，必須與 degraded／rate-limited 一樣 fail-closed。
+
+    #1093 對抗審查第三輪 MAJOR：``provider-timestamp-unparseable`` 模擬
+    ``providers["github:<repo>"]`` 條目 schema 表面完整（``status: ok``、
+    ``revision`` 非空）但 ``last_success_at`` 是無法解析的字串
+    （``"not-a-timestamp"``）——這種畸形先前會被舊的 ``healthy`` 判斷
+    （只檢查非空字串）誤判為健康，讓 canonical provider 誤判成「根本不
+    存在」而放行 ``WorkAuthorityConfirmedAbsent``（registry-only 退休）。
+
+    #1093 對抗審查第四輪 MAJOR3：``repo-provider-degraded`` 模擬
+    ``github:<repo>`` 健康、但本機工作區掃描 provider ``repo:<repo>``
+    degraded——這正是 todo-only work item 消失的真正成因（見 issue 現場：
+    fresh／清空的 monitor snapshot 上 `repo:` 掃描失敗）。舊實作只檢查
+    ``github:<repo>``，會誤判成確定缺席。``other-repo-scoped-provider-
+    degraded`` 模擬既有 snapshot 已經對這個 repo 建了另一種 provider
+    （``workflow:<repo>``）但 degraded，驗證檢查不是寫死只認 ``github:``／
+    ``repo:`` 兩種前綴。
+    """
+    snapshot = _snapshot(tmp_path / failure / "snapshot.json")
+    state = tmp_path / failure / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / failure / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#110",))
+
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    if failure == "duplicate-identity":
+        payload["work_items"].append(json.loads(json.dumps(payload["work_items"][0])))
+    elif failure == "issue-owner-conflict":
+        other_owner = json.loads(json.dumps(payload["work_items"][0]))
+        other_owner["work_id"] = "other-work"
+        payload["work_items"].append(other_owner)
+    elif failure in {"provider-null", "provider-list", "provider-string"}:
+        malformed_provider = {
+            "provider-null": None,
+            "provider-list": [],
+            "provider-string": "degraded",
+        }[failure]
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {"github:acme/demo": malformed_provider},
+            "work_items": [],
+        }
+    elif failure == "provider-timestamp-unparseable":
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {
+                "github:acme/demo": {
+                    "status": "ok",
+                    "revision": "gh-1",
+                    "last_success_at": "not-a-timestamp",
+                }
+            },
+            "work_items": [],
+        }
+    elif failure == "repo-provider-degraded":
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {
+                "github:acme/demo": {
+                    "status": "ok",
+                    "revision": "gh-1",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                },
+                "repo:acme/demo": {
+                    "status": "degraded",
+                    "revision": "repo-rev-lkg",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                    "diagnostics": ["repo scan unavailable: OSError"],
+                },
+            },
+            "work_items": [],
+        }
+    elif failure == "other-repo-scoped-provider-degraded":
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {
+                "github:acme/demo": {
+                    "status": "ok",
+                    "revision": "gh-1",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                },
+                "workflow:acme/demo": {
+                    "status": "degraded",
+                    "revision": "workflow-rev-lkg",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                    "diagnostics": ["workflow registry scan unavailable"],
+                },
+            },
+            "work_items": [],
+        }
+    else:
+        payload = {
+            "schema": "work-items-snapshot/v1",
+            "providers": {
+                "github:acme/demo": {
+                    "status": "degraded",
+                    "revision": "gh-rev-lkg",
+                    "last_success_at": "2026-08-07T11:19:26Z",
+                    "diagnostics": [
+                        "github rate limit exceeded"
+                        if failure == "provider-rate-limited"
+                        else "github API unavailable"
+                    ],
+                }
+            },
+            "work_items": [],
+        }
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises((RuntimeError, ValueError)):
+        work_actions.execute_work_action(
+            args={
+                "action": "retire-delivered",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "operator",
+                "expected_run_id": run_id,
+                "reason": "Snapshot ambiguity or health failure must block registry-only retirement.",
+            },
+            requested_by="operator",
+            runner=_pr_lifecycle_runner(
+                {110: {"state": "closed", "merged_at": "2026-08-01T00:00:00Z"}}
+            ),
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+    assert work_actions.work_authority_projection_state(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    ) == "unavailable"
+    status = manager.workflow_status_entry(
+        registry,
+        registry.get_workflow_run(run_id),
+        work_authority_state="unavailable",
+    )
+    assert "retire-delivered" not in status["next_actions"]
+    assert registry.get_workflow_run(run_id).status == "ongoing"
+    assert not (tmp_path / failure / "evidence" / "work-retire-delivered").exists()
+
+
+def test_abandon_does_not_bypass_missing_work_authority(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["work_items"] = []
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="confirmed work authority missing or ambiguous"):
+        work_actions.execute_work_action(
+            args={
+                "action": "abandon",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "actor": "operator",
+                "expected_run_id": run_id,
+                "reason": "Must remain strict.",
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+
 def test_retire_delivered_unlinks_missing_pinned_todo_path(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
@@ -1436,6 +1959,28 @@ def test_retire_delivered_proceeds_under_rate_limited_authority(tmp_path: Path) 
     )
     assert result["result"]["action"] == "retired-delivered"
     assert registry.get_workflow_run(run_id).status == "superseded"
+
+
+def test_work_authority_projection_state_distinguishes_rate_limited_last_known_good(
+    tmp_path: Path,
+) -> None:
+    """#1093 對抗審查第四輪 MAJOR1：``work_authority_projection_state`` 過去
+    一律以 ``allow_rate_limited_last_known_good=True`` 呼叫
+    ``load_work_authority``，對「真正健康」與「只靠限流 last-known-good
+    才讀得到」的 snapshot 回傳同一個 ``"available"``。但
+    ``execute_work_action`` 對非 ``_LOCAL_UNBLOCK_ACTIONS`` 動作一律用嚴格
+    （非 LKG）authority 重新驗證，同一份限流 snapshot 會 fail-closed 拒絕
+    ——projection 必須能分辨出這個狀態，讓呼叫端（status／work list）只曝光
+    正式入口真的會接受的動作（#843 R09 契約）。
+    """
+    snapshot = _canonical_rate_limited_snapshot(tmp_path / "snapshot.json")
+
+    assert (
+        work_actions.work_authority_projection_state(
+            repo="acme/demo", work_id="demo", snapshot_path=snapshot
+        )
+        == "available_last_known_good"
+    )
 
 
 def test_abandon_orphan_rescue_allows_refs_drift_when_authority_lost_all_mappings(

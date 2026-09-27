@@ -25,12 +25,17 @@ from uuid import uuid4
 from paulsha_cortex.config import paths
 from paulsha_cortex._yaml import safe_load
 from paulsha_cortex.github_rate_limit import is_rate_limit_signal
-from paulsha_cortex.recovery_action_contracts import WORK_ACTIONS
+from paulsha_cortex.recovery_action_contracts import (
+    RECOVERY_ACTION_FAMILIES,
+    WORK_ACTIONS,
+)
 
 from .diagnostics import diagnostic_reason
 from .claim import (
     AUTO_LABEL,
+    AuthorityValidationError,
     ClaimCandidate,
+    REASON_PROVIDER_RATE_LIMITED_CANONICAL,
     authority_matches_claim_era,
     build_claim_key,
     build_label_argv,
@@ -39,6 +44,7 @@ from .claim import (
     planning_declared_openspec_changes as claim_planning_declared_openspec_changes,
     decide_auto_claim,
     decide_manual_start,
+    WorkAuthorityConfirmedAbsent,
     load_work_authorities,
     load_work_authorities_with_snapshot_items,
     load_work_authority,
@@ -84,6 +90,7 @@ from .work_bridge import (
     workflow_status,
 )
 from .workflow import GateEvidenceRef, brainstorm_authority_bound
+from .registry import ACTIVE_JOB_STATUSES
 
 
 logger = logging.getLogger(__name__)
@@ -6268,7 +6275,7 @@ def _validate_retirement_operator_inputs(args: dict[str, Any]) -> tuple[str, str
 
 
 def _retire_delivered_pr_terminal_status(
-    run, *, authority, runner: Runner
+    run, *, repo: str, runner: Runner
 ) -> list[dict[str, str]]:
     """Prove every ``pr_ref`` of ``run`` is terminal (merged/closed) via the
     existing GitHub provider seam. Refuses (``RuntimeError``) on the first PR
@@ -6278,17 +6285,152 @@ def _retire_delivered_pr_terminal_status(
     github = GitHubDeliveryClient(runner=runner)
     statuses: list[dict[str, str]] = []
     for ref in run.pr_refs:
-        match = re.fullmatch(rf"{re.escape(authority.repo)}#([1-9][0-9]*)", str(ref))
+        match = re.fullmatch(rf"{re.escape(repo)}#([1-9][0-9]*)", str(ref))
         if match is None:
             raise RuntimeError("retire-delivered PR ref malformed or cross-repo")
         lifecycle = github.fetch_pr_lifecycle_status(
-            repo=authority.repo, pr_number=int(match.group(1))
+            repo=repo, pr_number=int(match.group(1))
         )
         if not lifecycle.terminal:
             raise RuntimeError("retire-delivered refuses a non-terminal PR")
         statuses.append({"ref": ref, "state": lifecycle.state})
     statuses.sort(key=lambda entry: entry["ref"])
     return statuses
+
+
+def work_authority_projection_state(
+    *, repo: str, work_id: str, snapshot_path: str | Path | None = None
+) -> str:
+    """Classify the authority available to status/read-model projections.
+
+    ``missing`` is the narrow, expected state that ``retire-delivered`` can
+    handle from a registry run. Other read failures are ``unavailable`` and
+    must not be presented as an actionable recovery path.
+
+    ``available_last_known_good``（#1093 對抗審查第四輪 MAJOR1）：authority
+    只有在 canonical GitHub provider 被限流、靠 last-known-good 豁免才讀得
+    到——這與一般 ``available``（provider 本身健康）不是同一件事。
+    ``execute_work_action`` 對 ``_LOCAL_UNBLOCK_ACTIONS`` 以外的動作一律用
+    嚴格（非 LKG）authority 重新驗證：同一份限流 snapshot 會 fail-closed
+    拒絕。舊實作不分辨這兩種「讀得到」，一律回傳 ``available``，導致
+    status／work list 對 builder／reviewer run 曝光 `recover-pre-candidate`
+    ／`retry-build` 這類正式入口其實會拒絕的動作。呼叫端必須把這個狀態的
+    next_actions 收斂到 `admitted_recovery_actions_under_authority_state()`
+    （單一真相：與 `execute_work_action` 用的是同一份
+    `_LOCAL_UNBLOCK_ACTIONS`），不能直接當成一般 ``available`` 曝光完整
+    動作集合（#843 R09 契約：只提供正式入口會接受的動作）。
+
+    判斷方式：先用嚴格（非 LKG）authority 讀一次；只有在因為 canonical
+    provider *限流*（`REASON_PROVIDER_RATE_LIMITED_CANONICAL`）而失敗時，
+    才再用 LKG 讀一次確認能否成功——其他不健康（畸形／非限流 degraded／
+    逾期）維持 ``unavailable``，不得被 LKG 掩蓋。
+
+    ``snapshot_path`` 預設 ``None``（沿用 ``canonical_work_snapshot_path()``
+    的正式 durable snapshot），僅供測試以明確路徑驅動——#1093 對抗審查第三
+    輪 BLOCKER：先前完全沒有這個參數，測試建的畸形 snapshot fixture 永遠寫
+    在別的路徑，實際驅動的是（可能不存在，或是這台機器上真正的）canonical
+    snapshot，斷言恆真、驗不到回歸。
+    """
+
+    try:
+        load_work_authority(
+            repo=repo,
+            work_id=work_id,
+            snapshot_path=snapshot_path,
+            allow_rate_limited_last_known_good=False,
+        )
+    except ValueError as error:
+        if _is_work_authority_absence(error):
+            return "missing"
+        if (
+            isinstance(error, AuthorityValidationError)
+            and error.reason_code == REASON_PROVIDER_RATE_LIMITED_CANONICAL
+        ):
+            try:
+                load_work_authority(
+                    repo=repo,
+                    work_id=work_id,
+                    snapshot_path=snapshot_path,
+                    allow_rate_limited_last_known_good=True,
+                )
+            except Exception:  # noqa: BLE001 - LKG re-check must also fail closed
+                return "unavailable"
+            return "available_last_known_good"
+        return "unavailable"
+    except Exception:  # noqa: BLE001 - read projection must fail closed
+        return "unavailable"
+    return "available"
+
+
+def admitted_recovery_actions_under_authority_state(
+    actions: tuple[str, ...], *, work_authority_state: str | None
+) -> tuple[str, ...]:
+    """依 ``work_authority_projection_state()`` 的分類收斂 next_actions／
+    actions 到 ``execute_work_action`` 真正會接受的集合（#1093 對抗審查第
+    四輪 MAJOR1）。
+
+    只有 ``"available_last_known_good"`` 需要在這裡收斂：``execute_work_action``
+    對 ``_LOCAL_UNBLOCK_ACTIONS`` 以外的動作一律用嚴格（非 LKG）authority
+    重新驗證，snapshot 若真的在限流會 fail-closed 拒絕——曝光這些動作等於
+    帶 operator 去撞牆。``missing``／``unavailable`` 由呼叫端另行分流（分別
+    對應 ``recovery_actions_without_work_authority`` 與空集合）；其他狀態
+    （``available``／``None``）原樣放行，不受影響。與 ``execute_work_action``
+    共用同一份 ``_LOCAL_UNBLOCK_ACTIONS`` 判準（單一真相），不得另猜一套。
+    """
+
+    if work_authority_state != "available_last_known_good":
+        return tuple(actions)
+    return tuple(action for action in actions if action in _LOCAL_UNBLOCK_ACTIONS)
+
+
+def _is_work_authority_absence(error: ValueError) -> bool:
+    # #1093 對抗審查 MAJOR：舊實作比對錯誤訊息字串，重複 (repo, work_id)、
+    # 跨 work 的 issue owner 衝突、snapshot degraded／限流都會讓
+    # ``load_work_authority`` 拋出**同一段文字**的 ``ValueError``，導致
+    # authority 歧義／不健康被誤判成明確缺席、放寬 registry-only 退休。改用
+    # ``claim.WorkAuthorityConfirmedAbsent`` 的結構化型別檢查：只有 claim.py
+    # 確認 snapshot 健康、非限流、且真的沒有任何一列 (repo, work_id) 時才會
+    # 拋出這個型別；其餘情境（含上述三種）維持一般 ``ValueError`` 或
+    # ``AuthorityValidationError``，一律落回 fail-closed。
+    return isinstance(error, WorkAuthorityConfirmedAbsent)
+
+
+def recovery_actions_without_work_authority(
+    run,
+    workflow_registry,
+    *,
+    runner: Runner = subprocess.run,
+) -> tuple[str, ...]:
+    """Return only registered actions admitted by the local registry state.
+
+    This projection checks the same local admission and GitHub terminal proof
+    as the official retire action, so it never suggests an action that the
+    entry point would reject when WorkAuthority is absent.
+    """
+
+    if run.status != "ongoing" or not run.pr_refs:
+        return ()
+    try:
+        related = [
+            item
+            for item in workflow_registry.list_workflow_runs()
+            if item.repo == run.repo and item.work_id == run.work_id
+        ]
+        if any(
+            item.run_id != run.run_id and item.status == "ongoing"
+            for item in related
+        ):
+            return ()
+        if any(
+            job.get("workflow_run_id") == run.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in workflow_registry.list_jobs()
+        ):
+            return ()
+        _retire_delivered_pr_terminal_status(run, repo=run.repo, runner=runner)
+    except Exception:  # noqa: BLE001 - uncertain registry state yields no action
+        return ()
+    return RECOVERY_ACTION_FAMILIES["retire-delivered"].coordinator_work
 
 
 def _superseded_retire_delivered_body(
@@ -6333,7 +6475,7 @@ def _superseded_retire_delivered_body(
         raise RuntimeError(
             "WorkflowRun was superseded by different authority"
         ) from error
-    required = {
+    required_v1 = {
         "schema",
         "repo",
         "work_id",
@@ -6343,15 +6485,47 @@ def _superseded_retire_delivered_body(
         "reason",
         "pr_terminal_status",
     }
+    required_v2 = required_v1 | {
+        "authority_source",
+        "authority_digest_source",
+        "authority_digest_status",
+    }
     pr_terminal_status = body.get("pr_terminal_status") if isinstance(body, dict) else None
+    schema = body.get("schema") if isinstance(body, dict) else None
+    digest = body.get("authority_digest") if isinstance(body, dict) else None
+    if schema == "cortex-work-retire-delivered/v1":
+        evidence_shape_valid = (
+            set(body) == required_v1
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+        )
+    elif schema == "cortex-work-retire-delivered/v2":
+        digest_source = body.get("authority_digest_source")
+        digest_status = body.get("authority_digest_status")
+        evidence_shape_valid = (
+            set(body) == required_v2
+            and body.get("authority_source") == "registry-run-record"
+            and (
+                digest_status == "recorded"
+                and digest_source in {
+                    "workflow-run.source_revision",
+                    "delivery-journal.authority_digest",
+                }
+                and isinstance(digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+                or digest_status == "absent"
+                and digest_source == "absent"
+                and digest is None
+            )
+        )
+    else:
+        evidence_shape_valid = False
     if (
         not isinstance(body, dict)
-        or set(body) != required
-        or body.get("schema") != "cortex-work-retire-delivered/v1"
+        or not evidence_shape_valid
         or body.get("repo") != run.repo
         or body.get("work_id") != run.work_id
         or body.get("run_id") != run.run_id
-        or re.fullmatch(r"[0-9a-f]{64}", str(body.get("authority_digest"))) is None
         or body.get("actor") != actor
         or body.get("reason") != reason
         or not isinstance(pr_terminal_status, list)
@@ -6401,10 +6575,12 @@ def _retire_delivered_action(
             f"retire-delivered rejects caller evidence/input: {sorted(extras)[0]}"
         )
     expected_run_id, actor, reason = _validate_retirement_operator_inputs(args)
+    repo = authority.repo if authority is not None else args["repo"]
+    work_id = authority.work_id if authority is not None else args["work_id"]
     related = [
         run
         for run in workflow_registry.list_workflow_runs()
-        if run.repo == authority.repo and run.work_id == authority.work_id
+        if run.repo == repo and run.work_id == work_id
     ]
     exact = [run for run in related if run.run_id == expected_run_id]
     if len(exact) != 1:
@@ -6423,7 +6599,7 @@ def _retire_delivered_action(
             evidence_ref=record["ref"],
         )
         outcome_store = engineering_outcome.OutcomeStore(
-            engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
+            engineering_outcome.outcome_store_path(state_path, repo=repo)
         )
         engineering_outcome.emit_outcome(
             outcome_store,
@@ -6439,9 +6615,6 @@ def _retire_delivered_action(
             evidence_ref=record["ref"],
         )
         _gc_abandoned_planning_artifacts(updated)
-        cleanup_warnings = _retire_missing_pinned_path_links(
-            updated, authority=authority
-        )
         result = {
             "action": "retired-delivered",
             "reason": reason,
@@ -6451,26 +6624,77 @@ def _retire_delivered_action(
             "evidence": record,
             "run": updated.to_dict(),
         }
+        cleanup_warnings = (
+            _retire_missing_pinned_path_links(updated, authority=authority)
+            if authority is not None
+            else ()
+        )
         if cleanup_warnings:
             result["warnings"] = list(cleanup_warnings)
         return result
     if any(item.status == "ongoing" and item.run_id != run.run_id for item in related):
         raise RuntimeError("retire-delivered refuses a different active WorkflowRun")
-    if not run.pr_refs:
+    if authority is None and run.status != "ongoing":
+        raise RuntimeError("retire-delivered requires ongoing run")
+    if authority is not None and not run.pr_refs:
         raise RuntimeError("retire-delivered requires a delivered run with pr refs")
+    if authority is None:
+        # Read-only admission happens before the GitHub query so an active job,
+        # non-ongoing run, or missing PR refs cannot trigger remote work.
+        workflow_registry._manager_validate_workflow_retire_delivered(
+            run.run_id,
+            evidence_ref="registry-run-record-admission",
+        )
     pr_terminal_status = _retire_delivered_pr_terminal_status(
-        run, authority=authority, runner=runner
+        run, repo=repo, runner=runner
     )
-    body = {
-        "schema": "cortex-work-retire-delivered/v1",
-        "repo": authority.repo,
-        "work_id": authority.work_id,
-        "run_id": run.run_id,
-        "authority_digest": work_authority_digest(authority),
-        "actor": actor,
-        "reason": reason,
-        "pr_terminal_status": pr_terminal_status,
-    }
+    if authority is not None:
+        body = {
+            "schema": "cortex-work-retire-delivered/v1",
+            "repo": repo,
+            "work_id": work_id,
+            "run_id": run.run_id,
+            "authority_digest": work_authority_digest(authority),
+            "actor": actor,
+            "reason": reason,
+            "pr_terminal_status": pr_terminal_status,
+        }
+    else:
+        stored_digest = getattr(run, "source_revision", None)
+        digest_source = "workflow-run.source_revision"
+        if not isinstance(stored_digest, str) or re.fullmatch(
+            r"[0-9a-f]{64}", stored_digest
+        ) is None:
+            stored_digest = None
+            digest_source = "absent"
+            try:
+                journal = _delivery_journal_snapshot(state_path).payload
+                row = journal.get("runs", {}).get(run.run_id)
+                if (
+                    isinstance(row, dict)
+                    and row.get("repo") == repo
+                    and row.get("work_id") == work_id
+                    and isinstance(row.get("authority_digest"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", row["authority_digest"])
+                    is not None
+                ):
+                    stored_digest = row["authority_digest"]
+                    digest_source = "delivery-journal.authority_digest"
+            except (OSError, ValueError, TypeError):
+                pass
+        body = {
+            "schema": "cortex-work-retire-delivered/v2",
+            "repo": repo,
+            "work_id": work_id,
+            "run_id": run.run_id,
+            "authority_source": "registry-run-record",
+            "authority_digest": stored_digest,
+            "authority_digest_source": digest_source,
+            "authority_digest_status": "recorded" if stored_digest else "absent",
+            "actor": actor,
+            "reason": reason,
+            "pr_terminal_status": pr_terminal_status,
+        }
     digest = verification.canonical_json_hash(body)
     target = (
         state_path.resolve().parent
@@ -6484,7 +6708,7 @@ def _retire_delivered_action(
     )
     record = _retire_delivered_record(body, state_path=state_path)
     outcome_store = engineering_outcome.OutcomeStore(
-        engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
+        engineering_outcome.outcome_store_path(state_path, repo=repo)
     )
     engineering_outcome.emit_outcome(
         outcome_store,
@@ -6500,9 +6724,6 @@ def _retire_delivered_action(
         evidence_ref=record["ref"],
     )
     _gc_abandoned_planning_artifacts(updated)
-    cleanup_warnings = _retire_missing_pinned_path_links(
-        updated, authority=authority
-    )
     result = {
         "action": "retired-delivered",
         "reason": reason,
@@ -6512,6 +6733,11 @@ def _retire_delivered_action(
         "evidence": record,
         "run": updated.to_dict(),
     }
+    cleanup_warnings = (
+        _retire_missing_pinned_path_links(updated, authority=authority)
+        if authority is not None
+        else ()
+    )
     if cleanup_warnings:
         result["warnings"] = list(cleanup_warnings)
     return result
@@ -9307,20 +9533,31 @@ def execute_work_action(
             "requested_by": requested_by,
             "result": _mutate_override(args=args, repo=repo, work_id=work_id),
         }
-    authority = load_work_authority(
-        repo=repo,
-        work_id=work_id,
-        snapshot_path=snapshot_path,
-        # #370 follow-up: the retirement family (abandon / retire-delivered)
-        # tears down a *local* stuck run and never depends on an issue's live
-        # open/closed state, so a canonical GitHub provider that is merely
-        # rate-limited (degraded with a rate-limit diagnostic, but still
-        # carrying a prior last-known-good revision/last_success_at) must not
-        # block cleanup — the very moment the system is throttled is when
-        # stuck runs most need clearing. Claim/start and every other action
-        # keep the strict fail-closed default: they need fresh authority.
-        allow_rate_limited_last_known_good=action in _LOCAL_UNBLOCK_ACTIONS,
-    )
+    try:
+        authority = load_work_authority(
+            repo=repo,
+            work_id=work_id,
+            snapshot_path=snapshot_path,
+            # #370 follow-up: the retirement family (abandon / retire-delivered)
+            # tears down a *local* stuck run and never depends on an issue's live
+            # open/closed state, so a canonical GitHub provider that is merely
+            # rate-limited (degraded with a rate-limit diagnostic, but still
+            # carrying a prior last-known-good revision/last_success_at) must not
+            # block cleanup — the very moment the system is throttled is when
+            # stuck runs most need clearing. Claim/start and every other action
+            # keep the strict fail-closed default: they need fresh authority.
+            allow_rate_limited_last_known_good=action in _LOCAL_UNBLOCK_ACTIONS,
+        )
+    except ValueError as error:
+        if (
+            action != "retire-delivered"
+            or not _is_work_authority_absence(error)
+        ):
+            raise
+        # This narrow fallback handles only an absent work row (for example,
+        # its workspace was removed from project-cortex.yaml). Malformed or
+        # unreadable authority remains fail-closed, and abandon never uses it.
+        authority = None
     now_epoch = now()
     resolved_state_path = Path(state_path) if state_path is not None else _run_state_path()
     if workflow_registry is None:
@@ -9536,9 +9773,11 @@ def execute_work_action(
             )
         )
     return {
-        "work_id": authority.work_id,
-        "repo": authority.repo,
+        "work_id": authority.work_id if authority is not None else work_id,
+        "repo": authority.repo if authority is not None else repo,
         "requested_by": requested_by,
-        "provider_revision": authority.github_provider_revision,
+        "provider_revision": (
+            authority.github_provider_revision if authority is not None else None
+        ),
         "result": result,
     }

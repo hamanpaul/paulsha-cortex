@@ -5328,32 +5328,173 @@ class CredentialMetadata:
         }
 
 
-_CREDENTIAL_ADAPTERS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
-    ("builder", "codex"): ("auth.json", (".codex", "auth.json")),
-    # AGY builder import is an explicit principal/provider pair.  Its source
-    # filename and destination are intentionally duplicated from the adapter
-    # contract only; no HOME discovery or reviewer-planner fallback is allowed.
-    ("builder", "agy"): (
-        "oauth_creds.json",
-        ("cache", "gemini", "oauth_creds.json"),
+@dataclass(frozen=True)
+class _CredentialAdapter:
+    """一個 (principal, provider) 的 credential 匯入契約。"""
+
+    #: operator 必須指定的來源檔 basename（allowlist）。
+    source_name: str
+    #: 目的地相對於該帳號 HOME 的路徑分段。
+    destination_parts: tuple[str, ...]
+    #: 葉檔上方有幾層目錄由匯入者建立並交給該帳號擁有（0700）。0＝父目錄必須是
+    #: 安裝器既有的落點；>0 的目錄是 CLI 自己的狀態樹，CLI 以該帳號身分讀寫，
+    #: 若由 root 以 0700 建出來，CLI 連自己的登入檔都讀不到。
+    account_owned_dirs: int = 0
+
+
+#: Copilot CLI 自己的設定檔名；與 `coordinator.spool_slot._COPILOT_CONFIG_FILENAME`
+#: 為同一個檔（Manager 派工時把 `PSC_COPILOT_OAUTH_CONFIG` 複製成
+#: `$COPILOT_HOME/config.json`），由測試釘住兩者相同。
+COPILOT_CONFIG_FILENAME = "config.json"
+
+_CREDENTIAL_ADAPTERS: dict[tuple[str, str], _CredentialAdapter] = {
+    ("builder", "codex"): _CredentialAdapter("auth.json", (".codex", "auth.json")),
+    ("reviewer-planner", "codex"): _CredentialAdapter(
+        "auth.json", (".codex", "auth.json")
     ),
-    ("reviewer-planner", "codex"): (
-        "auth.json",
-        (".codex", "auth.json"),
+    # Copilot 1.0.88 以 `$COPILOT_HOME`（預設 `~/.copilot`）的 `config.json`
+    # （copilotTokens／loggedInUsers／lastLoggedInUser）為登入態；舊的
+    # `~/.config/github-copilot/hosts.json` 不再被讀取。刻意不用 gh 的
+    # `~/.config/gh/hosts.yml`：job 帳號依 #666 不得有 gh 設定目錄（GitHub 寫入一律
+    # 由 Manager 代理），而 gh token 會讓 job 內的 `gh` 直接取得 GitHub 寫入通道。
+    ("reviewer-planner", "copilot"): _CredentialAdapter(
+        COPILOT_CONFIG_FILENAME,
+        (".copilot", COPILOT_CONFIG_FILENAME),
+        account_owned_dirs=1,
     ),
-    ("reviewer-planner", "agy"): (
-        "oauth_creds.json",
-        ("cache", "gemini", "oauth_creds.json"),
-    ),
-    ("reviewer-planner", "copilot"): (
-        "hosts.json",
-        (".config", "github-copilot", "hosts.json"),
-    ),
-    ("manager", "github"): (
-        "hosts.yml",
-        (".config", "gh", "hosts.yml"),
+    ("manager", "github"): _CredentialAdapter(
+        "hosts.yml", (".config", "gh", "hosts.yml")
     ),
 }
+
+
+def _agy_credential_adapter(principal: str) -> _CredentialAdapter:
+    """AGY 的匯入契約由 permgen 的 `ExecutorCredential("agy", ...)` 導出（單一真相）。
+
+    來源 basename 是 `token_leaf` 的葉檔名；目的地是該帳號 `~/.gemini` symlink 的
+    實體目標（`cache/<cache_target>`）再接 `token_leaf`，不跟隨 HOME 內的 symlink。
+    `token_leaf` 上方的目錄（`antigravity-cli/`）是 AGY 自己的狀態樹，交給該帳號擁有。
+    """
+
+    layout = permgen.DEFAULT_LAYOUT
+    try:
+        credential = permgen.credential_for(principal, "agy")
+        account = layout.credential_accounts()[principal]
+    except (KeyError, permgen.UnregisteredExecutorCredentialError) as exc:
+        raise CredentialImportError("AGY credential registration is incomplete") from exc
+    token_parts = PurePosixPath(credential.token_leaf).parts
+    if (
+        credential.shape is not permgen.CredentialShape.HOME_REDIRECT_TREE
+        or not token_parts
+    ):
+        raise CredentialImportError("AGY credential registration is incomplete")
+    target = PurePosixPath(layout.credential_target_of(account, credential))
+    target_parts = target.relative_to(PurePosixPath(layout.home_of(account))).parts
+    return _CredentialAdapter(
+        token_parts[-1],
+        (*target_parts, *token_parts),
+        account_owned_dirs=len(token_parts) - 1,
+    )
+
+
+def _credential_adapter_for(principal: str, provider: str) -> _CredentialAdapter | None:
+    if provider == "agy" and principal in {"builder", "reviewer-planner"}:
+        return _agy_credential_adapter(principal)
+    return _CREDENTIAL_ADAPTERS.get((principal, provider))
+
+
+def credential_source_basename(principal: str, provider: str) -> str:
+    """回傳 allowlist 內的來源 basename；不讀任何 credential 內容。"""
+
+    adapter = _credential_adapter_for(principal, provider)
+    if adapter is None:
+        raise CredentialImportError(
+            f"provider/principal pair is not allowed: {principal}/{provider}"
+        )
+    return adapter.source_name
+
+
+def _validate_credential_source_shape(
+    principal: str, provider: str, content: bytes
+) -> None:
+    """只檢查結構；錯誤訊息是固定字串，不帶任何來源內容。"""
+
+    if (principal, provider) != ("reviewer-planner", "copilot"):
+        return
+    try:
+        document = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise CredentialImportError(
+            "Copilot credential source must be a JSON config.json object"
+        ) from exc
+    tokens = document.get("copilotTokens") if isinstance(document, Mapping) else None
+    if (
+        not isinstance(tokens, Mapping)
+        or not tokens
+        or not all(
+            isinstance(key, str) and key and isinstance(value, str) and value.strip()
+            for key, value in tokens.items()
+        )
+    ):
+        raise CredentialImportError(
+            "Copilot credential source must contain non-empty copilotTokens"
+        )
+
+
+def _open_credential_parent(
+    destination: Path,
+    *,
+    account_owned_dirs: int,
+    uid: int | None,
+    gid: int | None,
+) -> tuple[int, str]:
+    """開啟 credential 葉檔的父目錄。
+
+    葉檔上方 `account_owned_dirs` 層是 CLI 自己的狀態樹（例如 AGY 的
+    `antigravity-cli/`、Copilot 的 `.copilot/`）：缺少時以 0700 建立並交給該帳號，
+    既有時必須已由該帳號擁有。其餘祖先目錄維持既有行為（安裝器的落點）。
+    每一層都以 `O_NOFOLLOW|O_DIRECTORY` 開啟，不跟隨 symlink。
+    """
+
+    if account_owned_dirs <= 0:
+        return _open_parent_directory(destination, create=True, create_mode=0o700)
+    parent_parts = destination.parent.parts
+    if not destination.name or len(parent_parts) <= account_owned_dirs:
+        raise UnsafeInstallPathError(f"unsafe authority leaf path: {destination}")
+    descriptor = _open_directory_chain(
+        Path(*parent_parts[:-account_owned_dirs]), create=True, create_mode=0o700
+    )
+    try:
+        for component in parent_parts[-account_owned_dirs:]:
+            created = False
+            try:
+                next_descriptor = os.open(
+                    component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+                next_descriptor = os.open(
+                    component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor
+                )
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if created:
+                if uid is not None and gid is not None:
+                    os.fchown(descriptor, uid, gid)
+                os.fchmod(descriptor, 0o700)
+            if uid is not None and os.fstat(descriptor).st_uid != uid:
+                raise UnsafeInstallPathError(
+                    f"credential state directory is not owned by its account: {destination}"
+                )
+        return descriptor, destination.name
+    except BaseException:
+        os.close(descriptor)
+        raise
+
 
 _PRINCIPAL_ACCOUNTS = {
     "builder": "cortex-builder",
@@ -5365,7 +5506,7 @@ _PRINCIPAL_ACCOUNTS = {
 def credential_destination(
     receipt: InstallReceipt, *, principal: str, provider: str
 ) -> tuple[Path, int, int]:
-    adapter = _CREDENTIAL_ADAPTERS.get((principal, provider))
+    adapter = _credential_adapter_for(principal, provider)
     if adapter is None:
         raise CredentialImportError(
             f"provider/principal pair is not allowed: {principal}/{provider}"
@@ -5386,9 +5527,8 @@ def credential_destination(
         for key, expected in (("home", str), ("uid", int), ("gid", int))
     ):
         raise CredentialImportError(f"receipt lacks account identity for {principal}")
-    _name, destination_parts = adapter
     return (
-        Path(str(account["home"])).joinpath(*destination_parts),
+        Path(str(account["home"])).joinpath(*adapter.destination_parts),
         int(account["uid"]),
         int(account["gid"]),
     )
@@ -5570,12 +5710,13 @@ def import_credential(
 ) -> CredentialMetadata:
     if receipt._document.get("state") != "applied":
         raise CredentialImportError("credentials may only be imported into an applied receipt")
-    adapter = _CREDENTIAL_ADAPTERS.get((principal, provider))
+    adapter = _credential_adapter_for(principal, provider)
     if adapter is None:
         raise CredentialImportError(
             f"provider/principal pair is not allowed: {principal}/{provider}"
         )
-    allowed_name, destination_parts = adapter
+    allowed_name = adapter.source_name
+    destination_parts = adapter.destination_parts
     if source.name != allowed_name:
         raise CredentialImportError(
             f"{provider} source filename is outside the allowlist; expected {allowed_name}"
@@ -5646,6 +5787,7 @@ def import_credential(
             or _credential_source_metadata(final_authority) != source_metadata
         ):
             raise CredentialImportError("credential source changed during validation")
+        _validate_credential_source_shape(principal, provider, content)
         try:
             _assert_fd_path_binding(
                 source,
@@ -5749,8 +5891,11 @@ def import_credential(
             raise
 
     try:
-        parent_fd, destination_name = _open_parent_directory(
-            destination, create=True, create_mode=0o700
+        parent_fd, destination_name = _open_credential_parent(
+            destination,
+            account_owned_dirs=adapter.account_owned_dirs,
+            uid=destination_uid,
+            gid=destination_gid,
         )
     except (OSError, UnsafeInstallPathError) as exc:
         raise CredentialImportError("credential destination preparation failed") from exc

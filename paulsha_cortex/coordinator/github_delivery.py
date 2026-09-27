@@ -246,6 +246,11 @@ class RemoteClosureFacts:
     todo_revisions: Mapping[str, str]
     completion_record_valid: bool
     openspec_required: bool = True
+    # 這條 PR 實際 closingIssuesReferences 到的 issue 編號（僅同 repo）。issue 目前
+    # 是 closed 不代表由本 PR 關閉——可能是人工關閉或被別的 PR 關閉；`evaluate_remote_closure`
+    # 既有呼叫者只檢查 issue_states，語意不變。新增欄位只給 consumer（例如
+    # requirement_delivery）自行加嚴用，預設空 tuple 對舊呼叫者是 no-op。
+    closing_issues: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -641,6 +646,37 @@ class GitHubDeliveryClient:
                     raise RuntimeError("GitHub GraphQL thread cursor malformed")
                 thread_cursor = next_thread_cursor
 
+    @staticmethod
+    def _parse_closing_issue_numbers(graph: Mapping[str, object], *, repo: str) -> tuple[int, ...]:
+        """從 `_work_graph` 的 closingIssuesReferences 節點解析同 repo 的 issue 編號。
+
+        供 pre-merge 的 `fetch_delivery_facts` 與 merge 後 `fetch_remote_closure`
+        共用同一套嚴格解析／fail-closed 規則，避免兩處各寫一份漸行漸遠。"""
+
+        try:
+            nodes = graph["closingIssuesReferences"]["nodes"]  # type: ignore[index]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("GitHub GraphQL closing issue references malformed") from exc
+        if not isinstance(nodes, list):
+            raise RuntimeError("GitHub GraphQL closing issue references malformed")
+        issue_numbers: list[int] = []
+        for node in nodes:
+            if (
+                not isinstance(node, dict)
+                or not isinstance(node.get("number"), int)
+                or isinstance(node.get("number"), bool)
+                or not isinstance(node.get("repository"), dict)
+                or not isinstance(node["repository"].get("nameWithOwner"), str)
+            ):
+                raise RuntimeError("GitHub GraphQL closing issue reference node malformed")
+            if node["repository"]["nameWithOwner"] == repo:
+                issue_numbers.append(node["number"])
+        return tuple(sorted(issue_numbers))
+
+    def _closing_issue_numbers(self, *, repo: str, pr_number: int) -> tuple[int, ...]:
+        graph = self._work_graph(repo=repo, pr_number=pr_number)
+        return self._parse_closing_issue_numbers(graph, repo=repo)
+
     def _tree_paths(self, *, repo: str, ref: str) -> tuple[str, ...]:
         payload = self._api(f"repos/{repo}/git/trees/{ref}?recursive=1")
         if not isinstance(payload, dict) or payload.get("truncated") is not False:
@@ -909,6 +945,8 @@ class GitHubDeliveryClient:
         required_issues: tuple[int, ...],
         todo_paths: tuple[str, ...],
         canonical_checkout: str | Path | None = None,
+        include_closing_issues: bool = False,
+        todo_at_merge_commit: bool = False,
     ) -> RemoteClosureFacts:
         self._repo_parts(repo)
         checkout = self._canonical_checkout(canonical_checkout)
@@ -960,6 +998,17 @@ class GitHubDeliveryClient:
             if not isinstance(payload, dict) or not isinstance(payload.get("state"), str):
                 raise RuntimeError("GitHub issue state malformed")
             issue_states[issue] = payload["state"]
+        # issue 目前 closed 不能證明是被「這個」PR 關閉的——可能人工關閉或被別的
+        # PR 關閉。額外帶上這條 PR 真正 closingIssuesReferences 到的 issue 編號，
+        # 讓 consumer（例如 requirement_delivery）能自行加嚴驗證綁定關係；
+        # `evaluate_remote_closure` 本身語意不變，仍只看 issue_states。
+        # opt-in：ship／retire-delivered／work bridge 等既有呼叫者不多打一次
+        # GraphQL，也不因這次額外查詢失敗而讓原本會成功的路徑失敗。
+        closing_issues = (
+            self._closing_issue_numbers(repo=repo, pr_number=pr_number)
+            if include_closing_issues
+            else ()
+        )
         paths = self._commit_tree_paths(
             repo=repo,
             commit=default_head,
@@ -971,6 +1020,14 @@ class GitHubDeliveryClient:
         todo_revisions: dict[str, str] = {}
         todo_complete = True
         task_pattern = re.compile(r"(?m)^\s*[-*]\s+\[([ xX])\]\s+")
+        # 對抗審查第六輪 BLOCKER：`todo_complete` 預設仍讀「目前」default head
+        # 的內容——ship／retire-delivered／work bridge 等既有呼叫者要的正是
+        # 「現在是否勾完」，語意不變。但 requirement-delivery 的 merge 階段判定
+        # 的是「這筆 PR／merge 交付當下」是否勾完；若沿用 default head，PR 合併
+        # 時 todo 尚未全勾、之後別的無關 commit 才補勾，會讓同一筆已 blocked 的
+        # 交付在重跑時被誤判成 covered。opt-in 旗標讓這類 consumer 改讀 merge
+        # commit 當下的 tree 內容，不影響其他呼叫者。
+        todo_ref = merge_commit if todo_at_merge_commit else default_head
         for todo_path in todo_paths:
             pure = PurePosixPath(todo_path)
             if (
@@ -984,7 +1041,7 @@ class GitHubDeliveryClient:
                 checkout,
                 "rev-parse",
                 "--verify",
-                f"{default_head}:{todo_path}",
+                f"{todo_ref}:{todo_path}",
                 failure_message="GitHub remote Todo payload malformed",
             ).strip().lower()
             if re.fullmatch(r"[0-9a-f]{40}", todo_revision) is None:
@@ -1001,7 +1058,7 @@ class GitHubDeliveryClient:
             content_bytes_status, content_bytes = self._run_local_git(
                 checkout,
                 "show",
-                f"{default_head}:{todo_path}",
+                f"{todo_ref}:{todo_path}",
             )
             if content_bytes_status != 0:
                 raise RuntimeError("GitHub remote Todo payload malformed")
@@ -1026,6 +1083,7 @@ class GitHubDeliveryClient:
             todo_complete=todo_complete,
             todo_revisions=todo_revisions,
             completion_record_valid=False,
+            closing_issues=closing_issues,
             openspec_required=change is not None,
         )
 

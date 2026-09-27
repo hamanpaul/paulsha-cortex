@@ -514,6 +514,27 @@ class Stage9ServerTests(unittest.TestCase):
         ids = {p["project_id"] for p in payload["data"]["projects"]}
         self.assertEqual(ids, {"projA", "projB"})
 
+    def test_server_exposes_missing_workspace_diagnostic(self) -> None:
+        self.store._config = MonitorConfig(
+            workspaces=(
+                WorkspaceConfig(path=self.tmp / "retired-workspace", name="retired"),
+            ),
+        )
+        self.store.refresh()
+
+        sock = self._connect()
+        _socket_send_request(sock, {"kind": "list_projects"})
+        payload = json.loads(_socket_recv_line(sock))
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(
+            any(
+                "workspace unavailable" in diagnostic
+                and "retired-workspace" in diagnostic
+                for diagnostic in payload["data"]["diagnostics"]
+            )
+        )
+
     def test_server_responds_to_get_project_state_request(self) -> None:
         sock = self._connect()
         _socket_send_request(

@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 RUNTIME_ATTESTATION_SCHEMA = "cortex/loaded-runtime-attestation/v1"
 _SERVICES = frozenset({"manager", "monitor"})
@@ -31,6 +31,7 @@ _SECRET_KEY_RE = re.compile(
 )
 _MAX_RECEIPT_BYTES = 256 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
+_ENV_ASSIGNMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)\Z")
 
 
 class RuntimeAttestationError(ValueError):
@@ -141,15 +142,8 @@ def cli_runtime_observation(
     }
 
 
-def _read_small_unit_file(unit_path: str) -> bytes | None:
-    descriptor = -1
+def _read_small_unit_descriptor(descriptor: int) -> bytes | None:
     try:
-        descriptor = os.open(
-            unit_path,
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_RECEIPT_BYTES:
             return None
@@ -171,58 +165,548 @@ def _read_small_unit_file(unit_path: str) -> bytes | None:
         return bytes(content)
     except OSError:
         return None
+
+
+def _read_small_unit_file(unit_path: str) -> bytes | None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            unit_path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        return _read_small_unit_descriptor(descriptor)
+    except (OSError, UnicodeError, ValueError):
+        return None
     finally:
         if descriptor >= 0:
             os.close(descriptor)
 
 
-def _unit_exec_start(unit_bytes: bytes | None) -> list[str] | None:
-    if unit_bytes is None:
+def _read_unit_files(unit_path: str | None) -> list[tuple[str, bytes]] | None:
+    if not isinstance(unit_path, str) or not unit_path:
+        return None
+    main_path = Path(unit_path)
+    if not main_path.is_absolute():
         return None
     try:
-        lines = unit_bytes.decode("utf-8").splitlines()
+        main_path.name.encode("utf-8")
     except UnicodeError:
         return None
-    for raw in lines:
-        line = raw.strip()
-        if not line.startswith("ExecStart="):
-            continue
-        value = line.partition("=")[2].lstrip("-@:+!")
-        try:
-            arguments = shlex.split(value)
-        except ValueError:
+    main_bytes = _read_small_unit_file(unit_path)
+    if main_bytes is None:
+        return None
+
+    files = [(main_path.name, main_bytes)]
+    dropin_dir = main_path.with_name(f"{main_path.name}.d")
+    try:
+        dropin_info = os.lstat(dropin_dir)
+    except FileNotFoundError:
+        return files
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if stat.S_ISLNK(dropin_info.st_mode) or not stat.S_ISDIR(dropin_info.st_mode):
+        return None
+    directory_fd = -1
+    try:
+        directory_fd = os.open(
+            dropin_dir,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+    try:
+        before = os.fstat(directory_fd)
+        if not stat.S_ISDIR(before.st_mode):
             return None
-        return arguments or None
-    return None
+        try:
+            names = sorted(name for name in os.listdir(directory_fd) if name.endswith(".conf"))
+            for name in names:
+                name.encode("utf-8")
+        except (OSError, UnicodeError):
+            return None
+        for name in names:
+            descriptor = -1
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_fd,
+                )
+                content = _read_small_unit_descriptor(descriptor)
+            except (OSError, UnicodeError, ValueError):
+                return None
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            if content is None:
+                return None
+            files.append((f"{dropin_dir.name}/{name}", content))
+        after = os.fstat(directory_fd)
+        if (before.st_dev, before.st_ino, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mtime_ns,
+        ):
+            return None
+        return files
+    except (OSError, UnicodeError, ValueError):
+        return None
+    finally:
+        os.close(directory_fd)
+
+
+def _unit_files_digest(files: list[tuple[str, bytes]] | None) -> str | None:
+    if files is None:
+        return None
+    entries = [
+        (name, hashlib.sha256(content).hexdigest()) for name, content in files
+    ]
+    return hashlib.sha256(_canonical_bytes(entries)).hexdigest()
+
+
+def _systemd_unit_files(
+    fragment_path: object, drop_in_paths: object
+) -> list[tuple[str, bytes]] | None:
+    """安全讀取 systemd 回報的完整 fragment/drop-in 集合。"""
+
+    if not isinstance(fragment_path, str) or not fragment_path:
+        return None
+    if not Path(fragment_path).is_absolute() or not isinstance(drop_in_paths, str):
+        return None
+    try:
+        dropins = shlex.split(drop_in_paths)
+    except ValueError:
+        return None
+    if any(not Path(path).is_absolute() or "\\" in path for path in dropins):
+        return None
+    paths = [fragment_path, *dropins]
+    files: list[tuple[str, bytes]] = []
+    for path in paths:
+        content = _read_small_unit_file(path)
+        if content is None:
+            return None
+        files.append((path, content))
+    return files
+
+
+def _unit_exec_start(files: list[tuple[str, bytes]] | None) -> list[str] | None:
+    if files is None:
+        return None
+    commands: list[list[str]] = []
+    for _name, unit_bytes in files:
+        try:
+            lines = unit_bytes.decode("utf-8").splitlines()
+        except UnicodeError:
+            return None
+        section = ""
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if line.startswith("["):
+                if not line.endswith("]") or "]" in line[1:-1]:
+                    return None
+                section = line[1:-1].strip()
+                continue
+            if section != "Service":
+                continue
+            match = re.match(r"^\s*ExecStart\s*=(.*)$", raw)
+            if match is None:
+                if re.match(r"^ExecStart(?:\s|:|$)", line):
+                    return None
+                continue
+            value = match.group(1)
+            if not value.strip():
+                commands.clear()
+                continue
+            try:
+                arguments = shlex.split(value)
+            except ValueError:
+                return None
+            if not arguments:
+                return None
+            arguments[0] = arguments[0].lstrip("-@:+!")
+            if not arguments[0]:
+                return None
+            commands.append(arguments)
+    return commands[0] if len(commands) == 1 else None
+
+
+def _systemd_exec_start(value: object) -> list[str] | None:
+    """解析 systemctl show 的 ExecStart 結構化輸出，不重讀 unit 語法。"""
+
+    if not isinstance(value, str) or not value:
+        return None
+    matches = list(re.finditer(r"\bargv\[\]=", value))
+    if len(matches) != 1:
+        return None
+    start = matches[0].end()
+    end_match = re.search(r"\s*;\s*ignore_errors=|\s*}", value[start:])
+    if end_match is None:
+        return None
+    raw_argv = value[start : start + end_match.start()]
+    try:
+        argv = shlex.split(raw_argv)
+    except ValueError:
+        return None
+    return argv or None
+
+
+def _systemd_environment(value: object) -> dict[str, str] | None:
+    if not isinstance(value, str):
+        return None
+    if not value.strip():
+        return {}
+    try:
+        entries = shlex.split(value)
+    except ValueError:
+        return None
+    environment: dict[str, str] = {}
+    for entry in entries:
+        match = _ENV_ASSIGNMENT_RE.fullmatch(entry)
+        if match is None:
+            return None
+        environment[match.group(1)] = match.group(2)
+    return environment
+
+
+def _environment_file_paths(value: object) -> list[tuple[str, bool]] | None:
+    if not isinstance(value, str):
+        return None
+    if not value.strip():
+        return []
+    pattern = re.compile(r"([^\s()]+) \(ignore_errors=(yes|no)\)")
+    paths: list[tuple[str, bool]] = []
+    offset = 0
+    for match in pattern.finditer(value):
+        if value[offset : match.start()].strip():
+            return None
+        path = match.group(1)
+        if not Path(path).is_absolute() or "\\" in path:
+            return None
+        paths.append((path, match.group(2) == "yes"))
+        offset = match.end()
+    if value[offset:].strip():
+        return None
+    return paths
+
+
+def _parse_environment_file(content: bytes) -> dict[str, str] | None:
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeError:
+        return None
+    environment: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.lstrip()
+        if not line or line.startswith("#"):
+            continue
+        if "\\" in line or "\x00" in line:
+            return None
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+        if match is None:
+            return None
+        value = match.group(2)
+        if value.startswith(("'", '"')):
+            quote = value[0]
+            quoted = re.fullmatch(re.escape(quote) + r"([^'\"]*)" + re.escape(quote) + r"\s*", value)
+            if quoted is None:
+                return None
+            value = quoted.group(1)
+        elif any(character.isspace() or character in "'\"" for character in value):
+            return None
+        environment[match.group(1)] = value
+    return environment
+
+
+def _systemd_environment_sources(
+    properties: Mapping[str, object],
+) -> tuple[dict[str, str], dict[str, str]] | None:
+    environment = _systemd_environment(properties.get("Environment"))
+    paths = _environment_file_paths(properties.get("EnvironmentFiles"))
+    if environment is None or paths is None:
+        return None
+    from_files: dict[str, str] = {}
+    for path, ignore_errors in paths:
+        content = _read_small_unit_file(path)
+        if content is None:
+            if ignore_errors and not os.path.lexists(path):
+                continue
+            return None
+        parsed = _parse_environment_file(content)
+        if parsed is None:
+            return None
+        from_files.update(parsed)
+    if (
+        "PYTHONPATH" in environment
+        and "PYTHONPATH" in from_files
+        and environment["PYTHONPATH"] != from_files["PYTHONPATH"]
+    ):
+        return None
+    return environment, from_files
+
+
+def _working_directory_artifact(path: object) -> dict[str, object] | None:
+    """若工作目錄會遮蔽安裝套件，回傳該來源；無法證明時回傳 unknown。"""
+
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        return _safe_artifact({})
+    candidate = Path(path) / "paulsha_cortex"
+    try:
+        info = os.lstat(candidate)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _safe_artifact({})
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return _safe_artifact({})
+    return artifact_identity_from_package_root(candidate)
+
+
+def _env_command_assignments(argv: list[str]) -> tuple[dict[str, str], int]:
+    if not argv or argv[0] != "/usr/bin/env":
+        return {}, 0
+    index = 1
+    assignments: dict[str, str] = {}
+    while index < len(argv):
+        assignment = _ENV_ASSIGNMENT_RE.fullmatch(argv[index])
+        if assignment is None:
+            break
+        assignments[assignment.group(1)] = assignment.group(2)
+        index += 1
+    return assignments, index
+
+
+def _effective_pythonpath(
+    *,
+    env_assignments: Mapping[str, str],
+    environment: Mapping[str, str],
+    from_files: Mapping[str, str],
+) -> tuple[bool, str | None]:
+    env_value = environment.get("PYTHONPATH")
+    file_value = from_files.get("PYTHONPATH")
+    command_value = env_assignments.get("PYTHONPATH")
+    if file_value is not None and any(
+        value is not None and value != file_value
+        for value in (env_value, command_value)
+    ):
+        return False, None
+    if command_value is not None:
+        return True, command_value
+    if file_value is not None:
+        return True, file_value
+    return True, env_value
+
+
+def _pythonpath_artifact(pythonpath: str) -> dict[str, object]:
+    """依 Python 實際匯入順序（依序走訪 PYTHONPATH 各路徑段）找出第一個提供
+    ``paulsha_cortex`` 套件的位置；只看第一段會在套件其實裝在後面段落時誤判
+    unknown。第一個命中的段落若是 symlink 或非目錄，視為不安全，直接回傳
+    unknown，不再往後找（避免攻擊者用假的第一段掩蓋真正被載入的位置）。"""
+    for segment in pythonpath.split(os.pathsep):
+        if not segment or not Path(segment).is_absolute():
+            continue
+        candidate = Path(segment) / "paulsha_cortex"
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return _safe_artifact({})
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return _safe_artifact({})
+        return artifact_identity_from_package_root(candidate)
+    return _safe_artifact({})
+
+
+def _is_python_executable(value: str) -> bool:
+    return re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", Path(value).name) is not None
+
+
+def _env_python_module_artifact(
+    argv: list[str], *, module: str
+) -> dict[str, object] | None:
+    return _python_module_artifact(argv, module=module, environment={}, from_files={})
+
+
+def _python_module_artifact(
+    argv: list[str],
+    *,
+    module: str,
+    environment: Mapping[str, str],
+    from_files: Mapping[str, str],
+    working_directory: str | None = None,
+) -> dict[str, object] | None:
+    if not argv:
+        return None
+    env_assignments, command_index = _env_command_assignments(argv)
+    if (
+        command_index + 2 >= len(argv)
+        or not _is_python_executable(argv[command_index])
+        or argv[command_index + 1 : command_index + 3] != ["-m", module]
+    ):
+        return None
+    path_known, pythonpath = _effective_pythonpath(
+        env_assignments=env_assignments,
+        environment=environment,
+        from_files=from_files,
+    )
+    if not path_known:
+        return _safe_artifact({})
+    if pythonpath is None:
+        workdir_artifact = (
+            _working_directory_artifact(working_directory)
+            if working_directory is not None
+            else None
+        )
+        if workdir_artifact is not None:
+            return workdir_artifact
+        return artifact_identity_from_python(argv[command_index])
+    return _pythonpath_artifact(pythonpath)
 
 
 def _declared_service_artifact(
-    service: str, *, exec_path: str | None, unit_bytes: bytes | None
+    service: str,
+    *,
+    exec_path: str | None,
+    argv: list[str] | None,
+    environment: Mapping[str, str] | None = None,
+    from_files: Mapping[str, str] | None = None,
+    working_directory: str | None = None,
 ) -> dict[str, object]:
-    argv = _unit_exec_start(unit_bytes)
     if not argv:
         return _safe_artifact({})
+    module = {
+        "manager": "paulsha_cortex.coordinator.manager_daemon",
+        "monitor": "paulsha_cortex.monitor",
+    }.get(service)
+    if module is not None:
+        module_artifact = _python_module_artifact(
+            argv,
+            module=module,
+            environment=environment or {},
+            from_files=from_files or {},
+            working_directory=working_directory,
+        )
+        if module_artifact is not None:
+            return module_artifact
     if service == "monitor":
         if len(argv) < 3 or argv[0] != exec_path or argv[1:3] != ["-m", "paulsha_cortex.monitor"]:
             return _safe_artifact({})
         return artifact_identity_from_python(exec_path)
     if service == "manager":
-        if len(argv) < 3 or argv[0] != "/usr/bin/env" or argv[1] != "bash":
+        env_assignments, command_index = _env_command_assignments(argv)
+        if len(argv) <= command_index + 1 or argv[command_index] != "bash":
             return _safe_artifact({})
-        script = Path(argv[2])
+        script = Path(argv[command_index + 1])
         if script.name != "service-manager.sh" or script.parent.name != "scripts":
             return _safe_artifact({})
         package_root = script.parent.parent
         if package_root.name != "paulsha_cortex":
             return _safe_artifact({})
+        path_known, pythonpath = _effective_pythonpath(
+            env_assignments=env_assignments,
+            environment=environment or {},
+            from_files=from_files or {},
+        )
+        if not path_known:
+            return _safe_artifact({})
+        if pythonpath is not None:
+            return _pythonpath_artifact(pythonpath)
+        if working_directory is not None:
+            workdir_artifact = _working_directory_artifact(working_directory)
+            if workdir_artifact is not None:
+                return workdir_artifact
         return artifact_identity_from_package_root(package_root)
     return _safe_artifact({})
+
+
+def _environment_source_and_overlay(
+    row: object,
+) -> tuple[str, dict[str, str]]:
+    """單個 service 目前的 ``environment_source`` 與其有效環境（已套用
+    ``safe_environment_projection`` 的安全鍵值白名單投影，值仍是原始字串）。
+
+    判定只依賴這個 row 的 ``systemd``／``_systemd_unavailable`` 欄位，與
+    artifact 判定（``unit_files``／``effective_argv``）完全獨立，因此可以安全地
+    在 ``service_declaration_projection``（對外只留 digest）與
+    ``service_environment_overlay``（內部重建用，含真實值）兩處共用同一份
+    結果——這是 doctor 與 ``cortex service status`` 對同一 service 的結論保證
+    一致的關鍵：兩邊都只能透過這個函式判定，不得各自另外解析。"""
+
+    if not isinstance(row, Mapping):
+        return "unavailable", {}
+    properties = row.get("systemd")
+    if isinstance(properties, Mapping):
+        required_properties = {
+            "ExecStart",
+            "Environment",
+            "EnvironmentFiles",
+            "DropInPaths",
+            "FragmentPath",
+            "WorkingDirectory",
+        }
+        if not required_properties.issubset(properties):
+            return "unknown", {}
+        environment_sources = _systemd_environment_sources(properties)
+        if environment_sources is None:
+            return "unknown", {}
+        environment, from_files = environment_sources
+        effective_argv = _systemd_exec_start(properties.get("ExecStart"))
+        env_assignments: dict[str, str] = {}
+        if effective_argv:
+            env_assignments, _index = _env_command_assignments(effective_argv)
+        merged_environment = {**from_files, **environment, **env_assignments}
+        return "systemd-effective", safe_environment_projection(merged_environment)
+    if row.get("_systemd_unavailable") is True:
+        # 探測不到 systemd 有效屬性集合，不能確認是否有 drop-in 覆寫；呼叫端應
+        # 改用既有 direct-mode fallback，這裡維持 "unavailable" 不臆測。
+        return "unavailable", {}
+    return "unavailable", {}
+
+
+def service_environment_overlay(
+    units: object, *, instance: str
+) -> dict[str, dict[str, object]]:
+    """回傳每個 service 目前的有效環境來源與內容，供 doctor／``cortex service
+    status`` 內部重建 root／config 用；判定規則與 ``service_declaration_projection``
+    共用同一個 ``_environment_source_and_overlay``，確保兩者結論一致。
+
+    回傳值的 ``environment`` 含真實環境值（僅 ``PSC_*``／``PAULSHACLAW_*``），
+    只能在程序內部使用，絕對不能序列化進 JSON 輸出或 CLI 顯示——對外一律使用
+    ``service_declaration_projection`` 回傳的 ``environment_digest``。"""
+
+    rows = units if isinstance(units, Mapping) else {}
+    result: dict[str, dict[str, object]] = {}
+    for service in ("manager", "monitor"):
+        unit_name = f"{instance}-{service}.service"
+        source, overlay = _environment_source_and_overlay(rows.get(unit_name))
+        result[service] = {"environment_source": source, "environment": overlay}
+    return result
 
 
 def service_declaration_projection(
     units: object, *, instance: str
 ) -> dict[str, dict[str, object]]:
-    """投影 service 宣告欄位，不回傳環境值或檔案內容。"""
+    """投影 service 宣告欄位，不回傳環境值或檔案內容。
+
+    附帶回傳每個 service 目前有效環境的摘要（``environment_digest``：對
+    ``safe_environment_projection`` 後的內容取 canonical SHA-256）與其來源標示
+    （``environment_source``），讓 service status／doctor 可以共用同一份
+    「systemctl show 有效值優先於 fallback 讀檔」判定，不必各自重新解析 unit 檔
+    或 EnvironmentFile。這個函式只回傳摘要，不回傳環境原值——真正的值只能透過
+    ``service_environment_overlay`` 在程序內部取得，且該函式的回傳值不得序列化
+    進 JSON 輸出。"""
 
     rows = units if isinstance(units, Mapping) else {}
     result: dict[str, dict[str, object]] = {}
@@ -238,31 +722,171 @@ def service_declaration_projection(
                 "disk_unit_sha256": None,
                 "artifact": _safe_artifact({}),
                 "stale": None,
+                "environment_source": "unavailable",
+                "environment_digest": configuration_revision({}),
             }
             continue
         exec_path = row.get("exec_path")
         path_value = exec_path if isinstance(exec_path, str) else None
-        unit_path = row.get("path")
-        unit_bytes = _read_small_unit_file(unit_path) if isinstance(unit_path, str) else None
-        unit_digest = hashlib.sha256(unit_bytes).hexdigest() if unit_bytes is not None else None
+        properties = row.get("systemd")
+        environment: dict[str, str] | None = None
+        from_files: dict[str, str] | None = None
+        declaration_known = True
+        # 環境來源判定與 artifact 判定分開計算：exec artifact 需要能雜湊 unit/
+        # drop-in 檔案內容才算「known」，但有效環境只要 Environment=／
+        # EnvironmentFiles= 能安全解析即可信任，不需要連帶依賴 unit 檔雜湊成功。
+        # 環境來源／有效環境本身改由 ``_environment_source_and_overlay`` 統一判定
+        # （與 ``service_environment_overlay`` 共用），這裡只留 artifact 判定要用
+        # 的 unit_files／effective_argv／environment／from_files。
+        if isinstance(properties, Mapping):
+            required_properties = {
+                "ExecStart",
+                "Environment",
+                "EnvironmentFiles",
+                "DropInPaths",
+                "FragmentPath",
+                "WorkingDirectory",
+            }
+            if not required_properties.issubset(properties):
+                declaration_known = False
+                unit_files = None
+                effective_argv = None
+            else:
+                unit_files = _systemd_unit_files(
+                    properties.get("FragmentPath"),
+                    properties.get("DropInPaths"),
+                )
+                effective_argv = _systemd_exec_start(properties.get("ExecStart"))
+                environment_sources = _systemd_environment_sources(properties)
+                if environment_sources is None:
+                    declaration_known = False
+                else:
+                    environment, from_files = environment_sources
+                declaration_known = declaration_known and unit_files is not None
+                declaration_known = declaration_known and effective_argv is not None
+        elif row.get("_systemd_unavailable") is True:
+            # Without systemd's effective property set, the probe cannot prove that its
+            # file-only view covers every configured unit/drop-in search directory.
+            declaration_known = False
+            unit_files = None
+            effective_argv = None
+        else:
+            unit_path = row.get("path")
+            unit_files = _read_unit_files(
+                unit_path if isinstance(unit_path, str) else None
+            )
+            effective_argv = _unit_exec_start(unit_files)
+            declaration_known = unit_files is not None and effective_argv is not None
+        unit_digest = _unit_files_digest(unit_files)
+        effective_exec_path = effective_argv[0] if effective_argv else None
+        environment_source, effective_environment = _environment_source_and_overlay(row)
         result[service] = {
             "unit": unit_name,
             "status": row.get("status") if isinstance(row.get("status"), str) else "unknown",
             "pid": row.get("pid") if type(row.get("pid")) is int else None,
             "exec_path_sha256": (
-                hashlib.sha256(os.fsencode(path_value)).hexdigest()
-                if path_value is not None
+                hashlib.sha256(os.fsencode(effective_exec_path)).hexdigest()
+                if effective_exec_path is not None
                 else None
             ),
             "disk_unit_sha256": unit_digest,
-            "artifact": _declared_service_artifact(
-                service,
-                exec_path=path_value,
-                unit_bytes=unit_bytes,
+            "artifact": (
+                _declared_service_artifact(
+                    service,
+                    exec_path=path_value,
+                    argv=effective_argv,
+                    environment=environment,
+                    from_files=from_files,
+                    working_directory=(
+                        properties.get("WorkingDirectory")
+                        if isinstance(properties, Mapping)
+                        else None
+                    ),
+                )
+                if declaration_known
+                else _safe_artifact({})
             ),
             "stale": row.get("stale") if type(row.get("stale")) is bool else None,
+            "environment_source": environment_source,
+            "environment_digest": configuration_revision(effective_environment),
         }
     return result
+
+
+def unknown_runtime_report(
+    reason: str, current_artifact: Mapping[str, object]
+) -> dict[str, object]:
+    """單一 service 目前狀態判定不出來時的標準投影。
+
+    ``cortex service status`` 與 doctor 的 loaded-runtime 判定共用同一個
+    shape，確保兩邊在同一種「宣告存在但無法安全信任」情境下（例如
+    ``environment_source`` 判定為 ``unknown``，或有效環境算出來卻連不上
+    receipt）回報的結構完全一致——這是 #841 對抗審查第五輪修掉「doctor 另起
+    一份精簡版 unknown 結構，與 service status 對不起來」那組回歸的關鍵。"""
+
+    is_installed = current_artifact.get("kind") == "installed-wheel"
+    return {
+        "status": "unknown",
+        "reason": reason,
+        "loaded": None,
+        "installed_artifact": current_artifact if is_installed else {
+            "kind": "unknown",
+            "package": current_artifact.get("package"),
+            "package_version": "unknown",
+            "source_revision": "unknown",
+            "sha256": None,
+        },
+        "current_artifact": current_artifact,
+        "comparison": {
+            "status": "unknown",
+            "reason": reason,
+            "artifact_status": "unknown",
+            "config_status": "unknown",
+            "transition_disposition": "unknown-in-flight-state",
+            "transition_safe": False,
+        },
+        "initial_config_revision": None,
+        "effective_config_revision": None,
+        "previous_process_start": None,
+        "trust_root": {"status": "unknown"},
+    }
+
+
+def declared_service_environment(
+    declaration: object,
+    *,
+    direct_fallback: Callable[[], Mapping[str, str]],
+) -> tuple[dict[str, str], str]:
+    """單一 service 依目前 ``environment_source`` 判定會拿到的有效環境。
+
+    判定規則只有這裡一份：``systemd-effective`` 直接信任已套用 drop-in 的
+    有效值；``unavailable``（探測不到 systemd 有效屬性，需要退回既有讀法）
+    交給呼叫端提供的 ``direct_fallback``；``unknown``（屬性存在但無法安全
+    解析，例如 ``Environment=``／``EnvironmentFiles=`` 的 ``PYTHONPATH`` 互相
+    衝突）一律視為無法信任，回傳空環境，不得沿用另一個 service 的值或呼叫端
+    自己的殼層環境頂替。
+
+    ``cortex service status``（讀真實 ``os.environ`` 下的既有 EnvironmentFile）
+    與 doctor（可注入 ``home``／``base_env`` 的 hermetic 讀法）行為差異只在
+    各自的 ``direct_fallback`` 實作，兩邊都必須經過這個函式判斷分支，不得各自
+    重新判斷 source——這是 #841 對抗審查第五輪 MAJOR 指出「doctor 用 manager
+    的環境去比對 monitor，與 service status 不一致」那組回歸的修法核心。"""
+
+    source = (
+        declaration.get("environment_source")
+        if isinstance(declaration, Mapping)
+        else None
+    )
+    overlay = declaration.get("environment") if isinstance(declaration, Mapping) else None
+    if source == "systemd-effective" and isinstance(overlay, Mapping):
+        return dict(overlay), "systemd-effective"
+    if source == "unavailable":
+        try:
+            fallback = direct_fallback()
+        except Exception:
+            return {}, "unknown"
+        return dict(fallback), "direct-fallback"
+    return {}, "unknown"
 
 
 def monitor_configuration_revision_from_environment(

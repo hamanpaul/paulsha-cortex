@@ -58,6 +58,56 @@ def coordinator_root() -> Path:
     return resolve_runtime_root("PSC_COORDINATOR_ROOT")
 
 
+_EXECUTION_QUALIFICATION_DIRNAME = "execution-qualification"
+
+
+def execution_qualification_root() -> Path:
+    """#842 qualification lifecycle 共用容器；本身即獨立登記的 Trust Root 資產。
+
+    獨立登記（而非留白讓子資產隱含建立）是必要的：Trust Root 的 install-plan
+    驗證要求每個 managed directory step 的直接 parent 也必須是 managed step，
+    而 operator 對 ``operator-receipts/`` 的跨帳號 traverse ACL grant 也只能
+    附掛在既有 managed step 上；未登記的共用子目錄兩者都無法承接（見
+    tests/test_trust_root_install_plan.py 的完整 plan 驗證）。
+    """
+    return coordinator_root() / _EXECUTION_QUALIFICATION_DIRNAME
+
+
+def execution_qualification_candidates_root() -> Path:
+    """#842 immutable report-bound candidates；僅 Manager 可寫。"""
+    return execution_qualification_root() / "candidates"
+
+
+def execution_qualification_receipts_root() -> Path:
+    """#842 immutable human-review/revocation receipts；僅 Manager 可寫。"""
+    return execution_qualification_root() / "receipts"
+
+
+def execution_qualification_operator_receipts_root() -> Path:
+    """#842 經 operator CLI 核發、由 Manager 消費的不可變核可 receipts。"""
+    return execution_qualification_root() / "operator-receipts"
+
+
+def execution_qualification_operator_receipt_registry_path() -> Path:
+    """#842 Manager-only 輔助清單；operator 帳號不讀不寫，缺席不擋 operator receipt 核發。"""
+    return execution_qualification_root() / "operator-receipt-index.json"
+
+
+def execution_qualification_roster_path() -> Path:
+    """#842 可重建的 approved qualification roster 投影。"""
+    return execution_qualification_root() / "approved-roster.json"
+
+
+def execution_qualification_index_path() -> Path:
+    """#842 CAS revision、binding 與 lifecycle index 唯一真值。"""
+    return execution_qualification_root() / "index.json"
+
+
+def requirement_delivery_index_root() -> Path:
+    """Manager-owned, read-only-rebuildable requirement delivery index root."""
+    return coordinator_root() / "requirement-delivery"
+
+
 def coverage_shadow_telemetry_root() -> Path:
     """v4 R1（方案 A）coverage validator shadow 的 disagreement telemetry 落點。
 
@@ -66,6 +116,42 @@ def coverage_shadow_telemetry_root() -> Path:
     這是 coordinator 產出的 telemetry，與 monitor 的傳輸層狀態分族。
     """
     return coordinator_root() / "coverage-shadow"
+
+
+QUOTA_OBSERVATION_DIRNAME = "quota-observations"
+
+
+def quota_observation_root() -> Path:
+    """#836 Manager-owned quota observation/event ledger 根。"""
+    return coordinator_root() / QUOTA_OBSERVATION_DIRNAME
+
+
+QUOTA_RESERVATION_DIRNAME = "quota-reservations"
+
+
+def quota_reservation_root() -> Path:
+    """#838 Manager-owned 跨 instance 共享 quota reservation authority 根。
+
+    與 `quota_observation_root()` 同層但獨立目錄：reservation 的原子生命週期
+    （reserve／bind／settle／release）與 #836 的觀測事件 ledger 是兩個不同的
+    寫入面，分開落地才能各自套用最適合自己的 file-lock／corruption 邊界，
+    不必互相牽動對方已審查過的 schema。
+    """
+    return coordinator_root() / QUOTA_RESERVATION_DIRNAME
+
+
+QUOTA_ADMISSION_DIRNAME = "quota-admission-decisions"
+
+
+def quota_admission_decisions_root() -> Path:
+    """#839 Manager-owned quota-aware admission decision receipt 根。
+
+    與 `quota_reservation_root()` 同層但獨立目錄：decision receipt 只記錄
+    「這次准入決策長什麼樣子」（append-only、無狀態機），與 #838 reservation
+    的原子生命週期是兩個不同的寫入面，分開落地不必互相牽動對方已審查過的
+    schema。
+    """
+    return coordinator_root() / QUOTA_ADMISSION_DIRNAME
 
 
 #: `review_verdict_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數
@@ -460,6 +546,21 @@ def config_root() -> Path:
 
 def config_path(*parts: str) -> Path:
     return config_root().joinpath(*parts)
+
+
+def quota_pools_config_path() -> Path:
+    """#839 operator-owned quota-pools 設定檔（schema ``cortex/quota-pools/v1``）。
+
+    與既有 ``paulshaclaw.yaml``（見 ``monitor/config.py``）同一族：住在
+    ``config_root()``（``~/.config/paulshaclaw``），不是治理平面的
+    durable-state 資產（比照 `ACKNOWLEDGED_NON_ASSET_PATHS` 對 `config_root`
+    的既有豁免——Manager 對它唯讀消費，operator 直接編輯，不走 Trust Root
+    的 managed-directory 生命週期）。支援 ``PSC_QUOTA_POOLS_CONFIG`` 覆寫
+    整個檔案路徑，沿用 `_env_path` 既有慣例；檔案不存在時呼叫端
+    （``quota_admission.load_quota_pools_config``）視為『尚未接線』，行為
+    與 #839 落地前逐字相同。
+    """
+    return _env_path("PSC_QUOTA_POOLS_CONFIG") or config_path("quota-pools.json")
 
 
 def project_config_root() -> Path:

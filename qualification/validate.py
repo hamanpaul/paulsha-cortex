@@ -15,6 +15,19 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 
+try:
+    from qualification.contract import (
+        CANARY_BUILDER,
+        PROVIDERS as PROVIDER_CONTRACTS,
+        canary_identity,
+    )
+except ModuleNotFoundError:  # host 端以 qualification/validate.py 執行
+    from contract import (  # type: ignore[no-redef]
+        CANARY_BUILDER,
+        PROVIDERS as PROVIDER_CONTRACTS,
+        canary_identity,
+    )
+
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -38,10 +51,11 @@ ROOT_KEYS = {
     "artifacts",
 }
 REQUIRED_PROVIDERS = {
-    "agy": ("gemini-3.7-flash", "high"),
-    "copilot": ("gpt-5.4", "xhigh"),
-    "codex": ("gpt-5.3-codex-spark", "xhigh"),
+    name: (row["model_id"], row["effort"])
+    for name, row in PROVIDER_CONTRACTS.items()
 }
+CANARY_BUILDER_EXECUTOR, CANARY_BUILDER_MODEL = canary_identity(CANARY_BUILDER)
+CANARY_BUILDER_EFFORT = PROVIDER_CONTRACTS[str(CANARY_BUILDER["provider"])]["effort"]
 REPOSITORY = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?/"
     r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?$"
@@ -651,8 +665,8 @@ def _validate_profile_artifacts(
     command_count = probe["successful_command_count"]
     if (
         probe["schema_version"] != 1
-        or probe["executor"] != "codex"
-        or probe["model_id"] != "gpt-5.3-codex-spark"
+        or probe["executor"] != CANARY_BUILDER_EXECUTOR
+        or probe["model_id"] != CANARY_BUILDER_MODEL
         or probe["card_id"] != "worktree-isolation"
         or len(builder_job_ids) != 1
         or len(builder_job_ids) != len(set(builder_job_ids))
@@ -660,8 +674,8 @@ def _validate_profile_artifacts(
             re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id) is None
             for job_id in builder_job_ids
         )
-        or probe["runtime_model"] != "gpt-5.3-codex-spark"
-        or probe["runtime_effort"] != "xhigh"
+        or probe["runtime_model"] != CANARY_BUILDER_MODEL
+        or probe["runtime_effort"] != CANARY_BUILDER_EFFORT
         or probe["model_provider"] != "openai"
         or not isinstance(probe["probe_candidate_sha"], str)
         or SHA40.fullmatch(probe["probe_candidate_sha"]) is None

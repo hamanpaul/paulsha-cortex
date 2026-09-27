@@ -220,7 +220,7 @@ def _build_execution_provenance(*, run: Any, jobs: Iterable[Mapping[str, Any]]) 
 def build_outcome_record(
     *,
     run: Any,
-    authority: Any,
+    authority: Any | None,
     jobs: Sequence[Mapping[str, Any]],
     outcome: str,
     attempt_digest: str,
@@ -233,18 +233,22 @@ def build_outcome_record(
 ) -> dict[str, Any]:
     """組出一筆 canonical engineering outcome record 並驗證後回傳。
 
-    ``run`` 須為 :class:`paulsha_cortex.coordinator.workflow.WorkflowRun`，
-    ``authority`` 須為 :class:`paulsha_cortex.coordinator.claim.WorkAuthority`；
-    本函式只讀取兩者既有欄位，不做任何額外查詢。
+    ``run`` 須為 :class:`paulsha_cortex.coordinator.workflow.WorkflowRun`；
+    ``authority`` 通常是 :class:`paulsha_cortex.coordinator.claim.WorkAuthority`。
+    registry-only retire replay 可省略 authority，repo/work_id 直接取自 run
+    記錄；本函式不重建或推測 WorkAuthority。
     """
+
+    repo = authority.repo if authority is not None else run.repo
+    work_id = authority.work_id if authority is not None else run.work_id
 
     record = {
         "schema": ENGINEERING_OUTCOME_KIND,
         "schema_version": ENGINEERING_OUTCOME_SCHEMA_VERSION,
         "outcome_id": outcome_id(run_id=run.run_id, outcome=outcome, attempt_digest=attempt_digest),
         "emitted_at": emitted_at or _now_iso(),
-        "repo": authority.repo,
-        "work_id": authority.work_id,
+        "repo": repo,
+        "work_id": work_id,
         "workflow_run_id": run.run_id,
         "slice_id": _derive_slice_id(jobs),
         "jobs": _project_jobs(jobs),
@@ -527,7 +531,7 @@ def emit_outcome(
     store: OutcomeStore,
     *,
     run: Any,
-    authority: Any,
+    authority: Any | None,
     jobs: Sequence[Mapping[str, Any]],
     outcome: str,
     attempt_digest: str,

@@ -839,6 +839,310 @@ def test_default_monitor_socket_is_scoped_to_installed_instance(tmp_path: Path) 
     )
 
 
+def test_bootstrap_environment_uses_systemd_effective_dropin_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#841 對抗審查：manager／monitor unit 被 drop-in 換了
+    ``PSC_MONITOR_STATE_ROOT`` 時，doctor 的有效環境判定必須套用
+    ``systemctl show`` 已經套用 drop-in 的有效值，不能只讀主 unit 檔宣告的
+    ``EnvironmentFile=``（那會漏掉 drop-in，對錯 monitor state root）。
+    mock 掉 ``shutil.which``／``subprocess.run``，不讀到本機真實 unit。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home, env = _layout(tmp_path)
+    unit_root = home / ".config" / "systemd" / "user"
+    manager_unit = unit_root / "cortex-manager.service"
+    monitor_unit = unit_root / "cortex-monitor.service"
+    pinned_root = tmp_path / "pinned-monitor-state"
+
+    def show_block(unit_path: Path) -> str:
+        lines = [
+            f"Id={unit_path.name}",
+            "LoadState=loaded",
+            "ActiveState=active",
+            "SubState=running",
+            "MainPID=0",
+            "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }",
+            f"Environment=PSC_MONITOR_STATE_ROOT={pinned_root}",
+            "EnvironmentFiles=",
+            "DropInPaths=",
+            f"FragmentPath={unit_path}",
+            "WorkingDirectory=/",
+        ]
+        return "\n".join(lines) + "\n"
+
+    show_output = show_block(manager_unit) + "\n" + show_block(monitor_unit)
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=show_output)
+
+    monkeypatch.setattr(_runtime_probe.subprocess, "run", fake_run)
+
+    effective = _load_bootstrap_environment(home=home, instance="cortex", base_env=env)
+
+    assert effective["PSC_MONITOR_STATE_ROOT"] == str(pinned_root)
+
+
+def test_bootstrap_environment_trusts_the_resolvable_side_when_only_one_unit_is_systemd_effective(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#841 對抗審查第四輪 MAJOR：只有 manager unit 這次探測得到 systemd 有效
+    屬性（``systemd-effective``），monitor 探測不到（退回 ``unavailable``）時，
+    doctor 仍必須採用 manager 已知的 drop-in 覆寫值，不能因為 monitor 那邊
+    無法判定，就連 manager 都一起退回主 unit 檔宣告的舊值——那會與
+    ``cortex service status`` 對 manager 的結論不一致（single source of
+    truth 被打破），也正是這一輪對抗審查抓到的回歸。只 mock 出 manager 的
+    ``systemctl show`` 區塊，monitor 保持沒有對應區塊（探測不到）。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home, env = _layout(tmp_path)
+    unit_root = home / ".config" / "systemd" / "user"
+    manager_unit = unit_root / "cortex-manager.service"
+    pinned_root = tmp_path / "pinned-monitor-state"
+
+    show_output = (
+        f"Id={manager_unit.name}\n"
+        "LoadState=loaded\n"
+        "ActiveState=active\n"
+        "SubState=running\n"
+        "MainPID=0\n"
+        "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }\n"
+        f"Environment=PSC_MONITOR_STATE_ROOT={pinned_root}\n"
+        "EnvironmentFiles=\n"
+        "DropInPaths=\n"
+        f"FragmentPath={manager_unit}\n"
+        "WorkingDirectory=/\n"
+    )
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=show_output)
+
+    monkeypatch.setattr(_runtime_probe.subprocess, "run", fake_run)
+
+    effective = _load_bootstrap_environment(home=home, instance="cortex", base_env=env)
+
+    assert effective["PSC_MONITOR_STATE_ROOT"] == str(pinned_root)
+
+
+def test_bootstrap_environment_never_mixes_caller_shell_into_systemd_effective_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#841 對抗審查第四輪 MAJOR：systemd-effective 這條路徑只能用 unit 宣告
+    本身＋systemd 對 user service 的已知預設，不得混入呼叫者殼層——例如操作者
+    跑 ``PSC_MONITOR_CONFIG=/from/caller/shell cortex doctor --json`` 時，這個
+    未被 unit 宣告的 ``PSC_*`` 不能污染判定結果（那是描述 operator CLI 本身的
+    環境，不是這個 service 的有效環境）。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home, env = _layout(tmp_path)
+    env = dict(env)
+    env["PSC_MONITOR_CONFIG"] = "/from/caller/shell"
+    unit_root = home / ".config" / "systemd" / "user"
+    manager_unit = unit_root / "cortex-manager.service"
+    monitor_unit = unit_root / "cortex-monitor.service"
+    pinned_root = tmp_path / "pinned-monitor-state"
+
+    def show_block(unit_path: Path) -> str:
+        lines = [
+            f"Id={unit_path.name}",
+            "LoadState=loaded",
+            "ActiveState=active",
+            "SubState=running",
+            "MainPID=0",
+            "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }",
+            f"Environment=PSC_MONITOR_STATE_ROOT={pinned_root}",
+            "EnvironmentFiles=",
+            "DropInPaths=",
+            f"FragmentPath={unit_path}",
+            "WorkingDirectory=/",
+        ]
+        return "\n".join(lines) + "\n"
+
+    show_output = show_block(manager_unit) + "\n" + show_block(monitor_unit)
+    monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=show_output)
+
+    monkeypatch.setattr(_runtime_probe.subprocess, "run", fake_run)
+
+    effective = _load_bootstrap_environment(home=home, instance="cortex", base_env=env)
+
+    assert effective["PSC_MONITOR_STATE_ROOT"] == str(pinned_root)
+    assert "PSC_MONITOR_CONFIG" not in effective
+
+
+def test_loaded_runtime_probe_resolves_monitor_root_independently_of_manager_dropin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#841 對抗審查第五輪 MAJOR：manager unit 被 drop-in 覆寫、monitor unit這次
+    探測不到 systemd 有效屬性（退回讀自己的 EnvironmentFile）時，doctor 的
+    loaded-runtime 判定必須逐 service 使用各自的有效環境去解析 root，不能沿用
+    manager 的 drop-in 覆寫值去比對 monitor——即使 manager 的 drop-in 意外也
+    宣告了 ``PSC_MONITOR_STATE_ROOT``（例如複製貼上錯誤），monitor 這邊仍應
+    解析出它自己 EnvironmentFile 宣告的值，不是 manager 那個錯誤值。跑
+    ``run_doctor()`` 全流程（不是只呼叫 ``_load_bootstrap_environment()``），
+    並與 ``cortex service status`` 對同一組探測結果的 ``environment_source``
+    結論核對一致。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex import doctor as doctor_module
+    from paulsha_cortex.porcelain import _runtime_probe
+    from paulsha_cortex.porcelain import service as service_porcelain
+
+    home, env = _layout(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    unit_root = home / ".config" / "systemd" / "user"
+    manager_unit = unit_root / "cortex-manager.service"
+    pinned_coordinator_root = tmp_path / "pinned-coordinator-root"
+    wrong_monitor_root = tmp_path / "wrong-monitor-state-from-manager-dropin"
+    # _layout() 已經在 cortex-manager.env 宣告 PSC_MONITOR_STATE_ROOT 指到這裡；
+    # monitor unit 探測不到 systemd 有效屬性時，direct-fallback 應該讀出這個值。
+    right_monitor_root = home / ".agents" / "monitor"
+
+    show_output = (
+        f"Id={manager_unit.name}\n"
+        "LoadState=loaded\n"
+        "ActiveState=active\n"
+        "SubState=running\n"
+        "MainPID=0\n"
+        "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }\n"
+        f"Environment=PSC_COORDINATOR_ROOT={pinned_coordinator_root} PSC_MONITOR_STATE_ROOT={wrong_monitor_root}\n"
+        "EnvironmentFiles=\n"
+        "DropInPaths=\n"
+        f"FragmentPath={manager_unit}\n"
+        "WorkingDirectory=/\n"
+    )
+    # 這裡跑的是 run_doctor() 全流程，不能像既有測試那樣直接改寫共用的
+    # ``shutil.which`` 屬性（那會連 doctor.py 自己 `import shutil` 用到的
+    # review-sandbox probe 也一起被改到）；改成只換掉 ``_runtime_probe`` 這個
+    # module 自己的 ``shutil`` 名稱綁定。
+    monkeypatch.setattr(
+        _runtime_probe, "shutil", SimpleNamespace(which=lambda _name: "/usr/bin/systemctl")
+    )
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=show_output)
+
+    monkeypatch.setattr(_runtime_probe.subprocess, "run", fake_run)
+
+    calls: list[tuple[str, dict[str, str]]] = []
+    original_resolve = doctor_module.resolve_runtime_root
+
+    def spy_resolve(name, *, environment=None, **kwargs):
+        calls.append((name, dict(environment or {})))
+        return original_resolve(name, environment=environment, **kwargs)
+
+    monkeypatch.setattr(doctor_module, "resolve_runtime_root", spy_resolve)
+
+    report = run_doctor(probe_live=False, instance="cortex", env=env, home=home)
+    probe = next(row for row in report.probes if row.name == "loaded-runtime")
+    assert probe.context is not None  # 呼叫端斷言用得到 context，先確認存在。
+
+    monitor_calls = [environment for name, environment in calls if name == "PSC_MONITOR_STATE_ROOT"]
+    assert monitor_calls, "resolve_runtime_root 未被呼叫來決定 monitor 的 root"
+    assert monitor_calls[-1].get("PSC_MONITOR_STATE_ROOT") == str(right_monitor_root)
+    assert not any(
+        environment.get("PSC_MONITOR_STATE_ROOT") == str(wrong_monitor_root)
+        for environment in monitor_calls
+    )
+
+    # 與 `cortex service status` 對同一組探測結果的結論一致：兩者都認定
+    # monitor 走 direct-fallback（讀自己的 EnvironmentFile），不是 manager 的
+    # drop-in 覆寫值。
+    service_payload = service_porcelain._status_payload("cortex")
+    service_loaded_runtime = service_payload["loaded_runtime"]
+    assert service_loaded_runtime["environment_source"]["manager"] == "systemd-effective"
+    assert service_loaded_runtime["environment_source"]["monitor"] == "direct-fallback"
+
+
+def test_loaded_runtime_probe_treats_monitor_pythonpath_conflict_as_unresolvable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#841 對抗審查第五輪 BLOCKER／MAJOR：monitor unit 的 ``Environment=`` 與
+    ``EnvironmentFiles=`` 宣告互相衝突的 ``PYTHONPATH`` 時，這是真正的資料
+    完整性問題（``environment_source`` 判定為 ``unknown``），即使 manager 那邊
+    仍是 systemd-effective，doctor 也不能蓋章 pass：``service-paths`` 必須
+    fail、loaded-runtime 的 monitor 欄位必須是 unknown，且與 `cortex service
+    status` 對同一組探測結果的結論逐欄一致。跑 ``run_doctor()`` 全流程驗證，
+    不是只呼叫 ``_load_bootstrap_environment()``。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex.porcelain import _runtime_probe
+    from paulsha_cortex.porcelain import service as service_porcelain
+
+    home, env = _layout(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    unit_root = home / ".config" / "systemd" / "user"
+    manager_unit = unit_root / "cortex-manager.service"
+    monitor_unit = unit_root / "cortex-monitor.service"
+    monitor_env_file = tmp_path / "monitor-dropin.env"
+    monitor_env_file.write_text("PYTHONPATH=/from-file\n", encoding="utf-8")
+
+    manager_block = (
+        f"Id={manager_unit.name}\n"
+        "LoadState=loaded\n"
+        "ActiveState=active\n"
+        "SubState=running\n"
+        "MainPID=0\n"
+        "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }\n"
+        "Environment=\n"
+        "EnvironmentFiles=\n"
+        "DropInPaths=\n"
+        f"FragmentPath={manager_unit}\n"
+        "WorkingDirectory=/\n"
+    )
+    monitor_block = (
+        f"Id={monitor_unit.name}\n"
+        "LoadState=loaded\n"
+        "ActiveState=active\n"
+        "SubState=running\n"
+        "MainPID=0\n"
+        "ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/true ; ignore_errors=no }\n"
+        "Environment=PYTHONPATH=/from-drop-in\n"
+        f"EnvironmentFiles={monitor_env_file} (ignore_errors=no)\n"
+        "DropInPaths=\n"
+        f"FragmentPath={monitor_unit}\n"
+        "WorkingDirectory=/\n"
+    )
+    show_output = manager_block + "\n" + monitor_block
+    # 理由同上一個測試：run_doctor() 全流程下不能改寫共用的 ``shutil.which``
+    # 屬性，只換 ``_runtime_probe`` 自己的 ``shutil`` 名稱綁定。
+    monkeypatch.setattr(
+        _runtime_probe, "shutil", SimpleNamespace(which=lambda _name: "/usr/bin/systemctl")
+    )
+
+    def fake_run(argv, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=show_output)
+
+    monkeypatch.setattr(_runtime_probe.subprocess, "run", fake_run)
+
+    report = run_doctor(probe_live=False, instance="cortex", env=env, home=home)
+
+    service_paths = next(row for row in report.probes if row.name == "service-paths")
+    assert service_paths.status == "fail"
+
+    loaded_runtime = next(row for row in report.probes if row.name == "loaded-runtime")
+    assert loaded_runtime.context["monitor"]["status"] == "unknown"
+    assert loaded_runtime.context["monitor"]["reason"] == "service-environment-unknown"
+    assert loaded_runtime.context["manager"]["reason"] != "service-environment-unknown"
+
+    # 與 `cortex service status` 對同一組探測結果的結論逐欄一致。
+    service_payload = service_porcelain._status_payload("cortex")
+    service_loaded_runtime = service_payload["loaded_runtime"]
+    assert service_loaded_runtime["environment_source"]["monitor"] == "unknown"
+    assert service_loaded_runtime["monitor"]["status"] == "unknown"
+    assert service_loaded_runtime["monitor"]["reason"] == "service-environment-unknown"
+
+
 def test_github_permission_probe_fails_without_token_scope_proof(tmp_path: Path, monkeypatch) -> None:
     home, env = _layout(tmp_path)
     monkeypatch.setattr(

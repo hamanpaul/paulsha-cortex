@@ -5,36 +5,47 @@ work_item: task-memory-delivery-adapter
 
 # Task memory delivery Cortex adapter Plan
 
+本計畫依賴 Hippo #155 的可選 `hippo task-memory provide/fetch` public CLI 與 `hippo/task-memory/v1` envelope；Cortex 不 import Hippo package、不新增 package dependency。adapter-specific candidate identity/hash/version/manifest 是可選 public extension，未提供時 fail closed。Manager dispatch 只有在 per-instance manager overlay 設 `PSC_TASK_MEMORY_ENABLED=1` 時才呼叫 provider，目前以 bounded inline excerpt 傳送；預設路徑維持原 prompt。read-model CLI 與 Manager-owned sidecar 使用 Cortex state，Hippo strict KPI 不變。
+
 ## 1. Authority and dependency
 
-- [ ] 將 Cortex #857 與 Hippo #146 綁為跨 repo dependency；Hippo 是 generic contract owner，Cortex 是首個 host adapter。
-- [ ] 將本 plan、spec、design、workstream Todo 與 `.cortex/work-items.yaml` registration 保持同一 work item，讓 isolated worker 不依賴暫存檔。
-- [ ] 確認本次只走現行 `cortex work intake`/Manager single-writer；不使用 deprecated low-level dispatch、不直接寫 durable registry/ledger。
+- [x] 將 Cortex #857 與 Hippo #146 綁為跨 repo dependency；Hippo 是 generic contract owner，Cortex 是首個 host adapter。
+- [x] 將本 plan、spec、design、workstream Todo 與 `.cortex/work-items.yaml` registration 綁為同一 work item，讓 isolated worker 不依賴暫存檔。
+- [x] receipt ingress 僅由 Manager-owned writer 驗證 persisted run/job routing 後寫 sidecar；未使用 deprecated low-level dispatch、未直接改 durable registry 或 Hippo ledger。
 
 ## 2. Contract and RED coverage
 
-- [ ] 凍結 `hippo/task-memory/v1` envelope、0–3 candidate、manifest、delivery modes、receipt/event names 與 strict KPI separation；由 Hippo #146 的 public contract 驗證，不在 Cortex 複製第二份權威 schema。
-- [ ] 新增 Cortex adapter contract tests：Work Item/WorkflowRun/card → task envelope，缺 task id、跨 project、manifest/hash mismatch、unsupported major、ineligible source 均 fail closed。
-- [ ] 新增 receipt tests：inline/context-delivered、readonly snapshot/materialized ready/offer、僅由 tool/provider 成功返回內容產生的 content-returned、manifest-bound note-fetch、permission denied/read-failed、applied-with-evidence 分流與 retry idempotency。
-- [ ] 先取得真正 RED（測試確實能抓到 adapter 未接線或錯誤分類），保存 bounded test evidence；不得以文件 checkbox 代替 RED。
+- [x] 消費已發布的 `hippo/task-memory/v1` envelope、0–3 個 candidate、delivery mode 與未知 optional fields；內容取得需要 adapter extension 的 manifest/hash/version，缺少時 fail closed，strict KPI 維持分離。
+- [x] Cortex contract tests 涵蓋 Work Item/WorkflowRun/card → task envelope、identity 缺失或不符、跨 project、manifest/hash/capability mismatch、unsupported major 與 provider ineligible。
+- [x] Receipt tests 涵蓋 inline/context-delivered、唯讀 snapshot-ready/read、manifest-bound note-fetch、permission-denied/read-failed、帶 evidence 的 applied 與冪等 replay。
+- [x] 已保存初始 RED（測試模組因 adapter 尚不存在而無法 import）及後續 GREEN 證據，見 `docs/evidence/task-memory-delivery-adapter-857.md`。
 
 ## 3. Adapter implementation
 
-- [ ] 在 Cortex thin adapter 接上既有 Work Item/WorkflowRun/card task identity 與 executor capability；不改 central routing、trust-root、shared quota 或 Hippo lifecycle owner。
-- [ ] 依 capability matrix 實作 primary delivery mode 選擇與 explicit fallback/ineligible reason；拒絕 arbitrary host path、global memory-root access、allow-all。
-- [ ] 以 Manager-owned sidecar/receipt boundary 接回 attempt/run，不由 worker 直接寫 Hippo ledger；receipt/hash 不符時保留 fail-closed attention。
-- [ ] 沿現有合法 routing；不以 model override 修改全域 default，不將任何 executor/model 名稱寫成 special case。
+- [x] Cortex thin adapter 精確映射 Work Item/WorkflowRun/card/Job identity 與宣告的 capability；不修改 central routing、trust-root、shared quota 或 Hippo lifecycle。
+- [x] Capability matrix 每次只選一個 delivery mode；不接受任意 host path、不讀 global memory root、不用 allow-all；provider/mode/schema/scope failure 保留 bounded reason 且不 fallback 重試。
+- [x] Manager-owned sidecar writer 將 receipt 綁定 persisted run/job/routing；事件順序驗證拒絕沒有內容交付前置證據的 applied receipt，並以 no-follow 唯讀方式從該 Job worktree 核對 artifact SHA。
+- [x] 沿用目前 resolved executor/model identity；沒有 executor/model 特例或 model override。
+- [x] 以 bounded subprocess 接上 Hippo CLI：argv 只解析為 argv array/shlex、不經 shell；stdin/stdout/timeout 有界；exit 10/11/14 特殊映射，其餘保留 bounded diagnostic code；stderr 僅採第一行符合格式的 allowlisted code。
+- [x] 以 per-task callback 捕捉 request 與 Cortex validator 已接受的 manifest，拒絕 task id／manifest 外 note，呼叫 fetch CLI 後仍由 Cortex 驗 content hash。
+- [x] 以 `PSC_TASK_MEMORY_ENABLED=1` 接到正式 Manager workflow dispatch；目前 capability 僅 inline，提供者缺席／permission denied 不注入 prompt、不改 lifecycle，receipt 仍限 Cortex sidecar。
 
 ## 4. Canary and utility readiness
 
-- [ ] 每個支援 delivery path 以獨立 memory root、受限 headless executor 及固定 fixture 執行至少 5 次成功與負例。
-- [ ] Cortex 固定 denied path 重現後，驗同一 generic payload 可取得允許內容；另以不同 repository/task kind 通過，證明沒有 Cortex project branch。
-- [ ] 機械計算 eligible authorized content retrieval success rate，目標 ≥95%；列出 unknown/ineligible/denied，不以 126 intent 或 299 denied view 推算 adoption。
+- [x] 每種支援 delivery path 的 deterministic isolated fixture 各跑 5 次成功與 5 次 path-specific negative control；另測 permission denial 不洩漏 exception 與未知 permission layer。
+- [x] Generic payload fixture 在兩個 repository、build/verify task kind 間通過；cross-scope mismatch 與 relay/legacy-schema blocker 有明確拒絕測試。
+- [x] Canary summarizer 機械計算 authorized success、failure、permission denial、unknown/ineligible；離線正向 fixture 為每條路徑 5/5，strict KPI 不變。
+- [x] 新增 `cortex task-memory canary`：至少兩個 repo，每 repo/path 跑 `--runs N`（預設 5）真 provide（note-fetch 另 fetch、snapshot 開啟、inline 確認 delivery），並跑 evidence-source 拒絕及跨 project mismatch；JSON 分列 provide 與 candidate-level 成功數及成功率，未指定 evidence path 時不落檔且永不輸出 note 正文。
+- [ ] Installed/live provider canary 必須每 repo/path 至少五次 eligible authorized provide 和五次完整 delivery，provide 與 candidate 成功率 ≥95%；預設 `--runs 5` 要各 repo/path 5/5。驗收命令：`cortex task-memory canary --repo <hippo-registered-repo-a> --repo <hippo-registered-repo-b> --runs 5 --evidence-path "$HOME/.agents/core/runtime/task-memory-canary-857.json"`。
 - [ ] 只在 canary gate 通過後設計 task-level control/treatment utility trial；retries 合併、至少明列實際 evidence、成本與誤引用，未完成不宣稱 utility improvement。
 
 ## 5. Verification and delivery gates
 
-- [ ] Cortex focused tests、Hippo contract fixture/subprocess boundary、完整 tests、policy check（PR context）、`git diff --check` 全部記錄實際輸出。
-- [ ] 檢查既有 strict `offer → read → applied` 分母與輸出 schema 未改；inline/context delivery 不混入 legacy Read。
-- [ ] 以正式 Cortex read model 回查 work item/run/job state、plan/spec revision、model identity、receipt/sidecar、test/review evidence；issue open、accepted plan、queued、blocked、started、complete 必須分開報告。
-- [ ] 遇 provider stale、project registration、authority、permission、quota 或 sandbox blocker，停在精確 `needs_human`/blocked，不修改全域設定、不手造 evidence、不回收 unrelated work。
+- [ ] 完整 repo tests、PR-context policy/CI、review 與 merge 仍是後續交付 gate；focused/related 測試輸出已記錄於 `docs/evidence/task-memory-delivery-adapter-857.md`。
+- [x] Regression tests 確認未帶 opt-in flag 時 legacy `cortex-work/v1` 不變，inline/context delivery 不增加 strict Read。
+- [x] Read model 以正式 WorkItem/WorkflowRun/Job fixture 串接 routing identity、plan/spec revisions、receipts 與 test/review evidence；live Monitor/Manager state 保留為 runtime 驗收。
+- [x] Provider unavailable、project/scope mismatch 與 unsupported schema 都保留明確 `read-failed`/`ineligible`/`parked`；Trust Root 下 provider exit 10 記為 provider permission-denied，不變更全域權限、不偽造 evidence。
+
+## Local implementation status (2026-09-26)
+
+本次離線實作驗證及其界線見 [`docs/evidence/task-memory-delivery-adapter-857.md`](../../evidence/task-memory-delivery-adapter-857.md)。Hippo #155 CLI 尚在另一 repo 的未 merge worktree，Cortex client 依其只讀契約實作且沒有 runtime import；未安裝／PATH 無法解析時 fail-closed 為 `provider-unavailable`。Manager opt-in、fake CLI contract 與 canary 指令已落地；Hippo CLI 在 installed service 帳號下的 permission、scope 與 ≥95% live threshold 尚待執行。

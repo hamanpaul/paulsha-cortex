@@ -24,6 +24,7 @@ from paulsha_cortex.trust_root.install import (
 from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
+from paulsha_cortex.trust_root.install.core import credential_source_basename
 
 
 @pytest.fixture(autouse=True)
@@ -203,10 +204,10 @@ def test_agy_import_writes_physical_cache_target_without_following_home_symlink(
     tmp_path: Path,
 ) -> None:
     _plan_doc, receipt, _backend = _applied_receipt()
-    source = tmp_path / "oauth_creds.json"
+    source = tmp_path / credential_source_basename("reviewer-planner", "agy")
     source.write_text('{"token":"test-secret"}', encoding="utf-8")
     home = tmp_path / "cortex-reviewer-planner"
-    target = home / "cache/gemini"
+    target = home / "cache/gemini/antigravity-cli"
     target.mkdir(parents=True)
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -220,23 +221,23 @@ def test_agy_import_writes_physical_cache_target_without_following_home_symlink(
         destination_root=home,
     )
 
-    assert (target / "oauth_creds.json").read_bytes() == source.read_bytes()
-    assert not (outside / "oauth_creds.json").exists()
+    assert (target / "antigravity-oauth-token").read_bytes() == source.read_bytes()
+    assert not (outside / "antigravity-cli").exists()
 
 
 def test_builder_agy_import_is_scoped_to_the_builder_cache(tmp_path: Path) -> None:
     """The explicit builder/AGY adapter must not discover reviewer state."""
 
     _plan_doc, receipt, _backend = _applied_receipt()
-    source = tmp_path / "oauth_creds.json"
+    source = tmp_path / credential_source_basename("builder", "agy")
     source.write_text('{"token":"test-secret"}', encoding="utf-8")
     builder_home = tmp_path / "cortex-builder"
-    builder_cache = builder_home / "cache/gemini"
+    builder_cache = builder_home / "cache/gemini/antigravity-cli"
     builder_cache.mkdir(parents=True)
     reviewer_home = tmp_path / "cortex-reviewer-planner"
-    reviewer_target = reviewer_home / "cache/gemini"
+    reviewer_target = reviewer_home / "cache/gemini/antigravity-cli"
     reviewer_target.mkdir(parents=True)
-    (reviewer_target / "oauth_creds.json").write_text(
+    (reviewer_target / "antigravity-oauth-token").write_text(
         '{"token":"reviewer-state"}', encoding="utf-8"
     )
 
@@ -248,11 +249,167 @@ def test_builder_agy_import_is_scoped_to_the_builder_cache(tmp_path: Path) -> No
         destination_root=builder_home,
     )
 
-    assert (builder_cache / "oauth_creds.json").read_bytes() == source.read_bytes()
-    assert (reviewer_target / "oauth_creds.json").read_text(encoding="utf-8") == (
+    assert (builder_cache / "antigravity-oauth-token").read_bytes() == source.read_bytes()
+    assert (reviewer_target / "antigravity-oauth-token").read_text(encoding="utf-8") == (
         '{"token":"reviewer-state"}'
     )
-    assert not (builder_home / ".gemini" / "oauth_creds.json").exists()
+    assert not (builder_home / ".gemini" / "antigravity-oauth-token").exists()
+
+
+def test_agy_adapter_is_derived_from_the_permgen_credential_row() -> None:
+    """AGY 的來源 basename 與落點只有 permgen 一份真相（#716 canary refresh）。"""
+
+    from pathlib import PurePosixPath
+
+    from paulsha_cortex.trust_root import permgen
+
+    layout = permgen.DEFAULT_LAYOUT
+    for principal in ("builder", "reviewer-planner"):
+        credential = permgen.credential_for(principal, "agy")
+        account = layout.credential_accounts()[principal]
+        adapter = install_core._credential_adapter_for(principal, "agy")
+        assert adapter is not None
+        assert credential_source_basename(principal, "agy") == (
+            PurePosixPath(credential.token_leaf).name
+        )
+        expected = PurePosixPath(layout.credential_target_of(account, credential)).joinpath(
+            credential.token_leaf
+        )
+        assert PurePosixPath(layout.home_of(account)).joinpath(
+            *adapter.destination_parts
+        ) == expected
+        assert adapter.account_owned_dirs == len(
+            PurePosixPath(credential.token_leaf).parts
+        ) - 1
+    assert credential_source_basename("reviewer-planner", "agy") != "oauth_creds.json"
+
+
+def test_copilot_adapter_uses_the_config_file_the_manager_projects() -> None:
+    from paulsha_cortex.coordinator import spool_slot
+
+    assert install_core.COPILOT_CONFIG_FILENAME == spool_slot._COPILOT_CONFIG_FILENAME
+    adapter = install_core._credential_adapter_for("reviewer-planner", "copilot")
+    assert adapter is not None
+    assert adapter.source_name == install_core.COPILOT_CONFIG_FILENAME
+    assert adapter.destination_parts == (".copilot", install_core.COPILOT_CONFIG_FILENAME)
+    # #666：job 帳號不得有 gh 設定目錄，Copilot 憑證不可落到 gh 的 hosts.yml。
+    assert ".config" not in adapter.destination_parts
+
+
+def test_copilot_import_uses_config_json_shape_and_actual_cli_path(
+    tmp_path: Path,
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / credential_source_basename("reviewer-planner", "copilot")
+    secret = "copilot-source-secret-sentinel"
+    source.write_text(
+        json.dumps(
+            {
+                "loggedInUsers": [{"host": "https://github.com", "login": "fixture"}],
+                "lastLoggedInUser": {"host": "https://github.com", "login": "fixture"},
+                "copilotTokens": {"https://github.com:fixture": secret},
+            }
+        ),
+        encoding="utf-8",
+    )
+    home = tmp_path / "cortex-reviewer-planner"
+    home.mkdir()
+
+    metadata = import_credential(
+        receipt,
+        principal="reviewer-planner",
+        provider="copilot",
+        source=source,
+        destination_root=home,
+        destination_uid=os.getuid(),
+        destination_gid=os.getgid(),
+    )
+
+    installed = home / ".copilot/config.json"
+    assert installed.read_bytes() == source.read_bytes()
+    assert oct(installed.stat().st_mode & 0o777) == "0o600"
+    state_dir = (home / ".copilot").stat()
+    assert state_dir.st_uid == os.getuid()
+    assert oct(state_dir.st_mode & 0o777) == "0o700"
+    assert not (home / ".config").exists()
+    assert secret not in str(metadata.to_dict())
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "github.com:\n  user: do-not-render-source-content\n  oauth_token: x\n",
+        '{"copilotTokens": {}, "note": "do-not-render-source-content"}',
+        '{"copilotTokens": {"host": ""}, "note": "do-not-render-source-content"}',
+        '["do-not-render-source-content"]',
+    ],
+)
+def test_copilot_import_rejects_wrong_config_shape_without_echoing_content(
+    tmp_path: Path, content: str
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / credential_source_basename("reviewer-planner", "copilot")
+    source.write_text(content, encoding="utf-8")
+
+    with pytest.raises(CredentialImportError, match="Copilot credential source") as error:
+        import_credential(
+            receipt,
+            principal="reviewer-planner",
+            provider="copilot",
+            source=source,
+            destination_root=tmp_path / "installed",
+        )
+
+    assert "do-not-render-source-content" not in str(error.value)
+    assert not (tmp_path / "installed").exists()
+
+
+def test_agy_import_creates_its_state_directory_for_the_account(tmp_path: Path) -> None:
+    """`antigravity-cli/` 由匯入者建立時必須屬於該帳號，AGY 才讀得到自己的登入檔。"""
+
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / credential_source_basename("reviewer-planner", "agy")
+    source.write_text('{"token":"test-secret"}', encoding="utf-8")
+    home = tmp_path / "cortex-reviewer-planner"
+    (home / "cache/gemini").mkdir(parents=True)
+
+    import_credential(
+        receipt,
+        principal="reviewer-planner",
+        provider="agy",
+        source=source,
+        destination_root=home,
+        destination_uid=os.getuid(),
+        destination_gid=os.getgid(),
+    )
+
+    state_dir = home / "cache/gemini/antigravity-cli"
+    assert state_dir.stat().st_uid == os.getuid()
+    assert oct(state_dir.stat().st_mode & 0o777) == "0o700"
+    assert (state_dir / "antigravity-oauth-token").read_bytes() == source.read_bytes()
+
+
+def test_credential_import_rejects_state_directory_owned_by_another_account(
+    tmp_path: Path,
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / credential_source_basename("reviewer-planner", "agy")
+    source.write_text('{"token":"test-secret"}', encoding="utf-8")
+    home = tmp_path / "cortex-reviewer-planner"
+    (home / "cache/gemini/antigravity-cli").mkdir(parents=True)
+
+    with pytest.raises(CredentialImportError, match="destination preparation failed"):
+        import_credential(
+            receipt,
+            principal="reviewer-planner",
+            provider="agy",
+            source=source,
+            destination_root=home,
+            destination_uid=os.getuid() + 1,
+            destination_gid=os.getgid(),
+        )
+
+    assert not (home / "cache/gemini/antigravity-cli/antigravity-oauth-token").exists()
 
 
 def test_credential_adapter_rejects_a_symlink_before_reading_content(

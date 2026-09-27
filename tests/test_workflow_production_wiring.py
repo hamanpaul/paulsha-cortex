@@ -4240,8 +4240,14 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     ))
     assert result["reason"] == "ship-validator-unavailable"
     assert len(adversarial_launches) == 2
+    # #844：operator-resume 的 needs_human 復原把 adversarial-review 卡的
+    # facet 清掉之後，會繼續走到 `_workflow_stage_reuse_probe`——它在決定要
+    # 不要沿用這張卡已終止的 evidence 之前，會重新解析一次 identity／launcher
+    # 做相容性複核（不會真正派工／呼叫模型），因而多一次
+    # `as_review_only()`。這是 #844 新增的逐次複核，不是重複派工。
     assert review_capability_requests == [
         "workflow-verification-result",
+        "workflow-review-result",
         "workflow-review-result",
         "workflow-review-result",
         "workflow-review-result",

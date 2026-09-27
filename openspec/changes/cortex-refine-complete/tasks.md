@@ -80,10 +80,10 @@
 
 ## 5. B4 動態派工與恢復
 
-- [ ] 5.1 由 #839 完成 qualified feasible candidate selection，維持 explicit pin、permissions、role、independence 硬條件。
-- [ ] 5.2 由 #838 完成多池/多時間窗原子 reservation 與同主機多 instance contention 測試。
-- [ ] 5.3 完成 consumption reconciliation、crash/restart uncertain liveness 與 lease 不誤釋放。
-- [ ] 5.4 完成 card/attempt 安全邊界的 fallback、supersession 與 artifact preservation；同耗盡 pool 不可繞過。
+- [x] 5.1 由 #839 完成 qualified feasible candidate selection（`coordinator/quota_admission.py` + `manager._dispatch_workflow_card` 接線）：只在既有候選分層排序／runtime preflight／execution-profile 硬濾（pin、permissions、role、reviewer independence、#842 qualification）已核可的候選上疊額度可行性；同池換 model 一樣視為同池、不可繞過（`tests/test_quota_admission_839.py`／`tests/test_quota_admission_dispatch_wiring_839.py`）。shadow 預設不擋派，opt-in enforce 才會排除不可行候選並換下一個既有排序候選重試。
+- [x] 5.2 由 #838 完成多池/多時間窗原子 reservation 與同主機多 instance contention 測試（`coordinator/quota_reservation.py`；`multiprocessing`＋`Barrier` 真實競爭、failpoint crash matrix、bounded worker 壓力/耐久 audit）；本模組刻意不接線任何 spawn path、不做候選排序/fallback/forecast，`reservation_authority_enabled()` 預設關閉即 shadow，留給 #839 整合。
+- [x] 5.3 由 #839 完成（含 production 接線輪）：`quota_admission.reconcile_bound_reservations()` 提供 restart 後的 bound reservation 收斂掃描（job registry 查不到一律 `inconclusive`、不假設終止；確認終局才 `reconcile(confirmed-terminated)` 釋放，同時透過 `on_settled` 呼叫 `record_terminal_usage`），並在 `manager._dispatch_workflow_card` 接上 `reserve → create_job → bind(job_id) → spawn` 的完整生命週期（bind 前失敗 release，bind 後失敗 settle）。新增 `reconcile_reserved_reservations()` 收斂 `create_job()` 後、`bind()` 前 crash 留下的無 job_id reservation（依 attempt ordinal 反查 registry，查無或查詢失敗一律不動）。`manager_daemon.py` 的 periodic tick 現已呼叫 `manager.reconcile_quota_admission_reservations()` 執行上述兩個掃描（`tests/test_quota_admission_daemon_wiring_839.py`）；此前 `manager_daemon.py` 從未建構或傳入 `quota_admission_context`，本輪同時補上五個 dispatch／resume 呼叫點的接線與 operator quota-pools 設定檔載入，production 現已可達（installed／live canary 仍是獨立部署 gate，未在本輪執行）。
+- [ ] 5.4 部分由 #839 完成：card/attempt 安全邊界的候選 fallback 已落地（同耗盡 pool 不可繞過，opt-in enforce 下換下一個既有排序候選並原子重新預留）。supersession 與 artifact preservation（forecast 誤判外部消耗導致的既有 in-flight attempt 安全下線）仍未實作，留待後續票。
 - [ ] 5.5 由 #843 補 R07 recovery matrix 與 exact-run/card CAS、late evidence、重送冪等、abandon owner-aware 資源處置；#497/#547/#577等原producer缺陷仍須修正。
 - [ ] 5.6 通過計畫 12 個 quota/profile 場景，再有限 opt-in canary；保留 legacy policy 回復路徑與 receipts。
 - [ ] 5.7 由 #844 完成 production stage reuse 的同run/claim-era安全cohort與可信採信；跨run新採信未支援需列管，不能以相同key改寫舊evidence。
@@ -94,6 +94,7 @@
   - [x] 6.1.a [RED] #828 在 Cortex producer 邊界新增 execution-identity regression tests；以 registry job binding 驗證多卡、retry、缺值、未派工、跨 run/repo、needs_human、in-flight 與 completed status projection，保留 RED 供後續最小修正。
   - [x] 6.1.b [GREEN] #828 producer 以 registry job 的 run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；planned、actual、last execution 與 unknown 不互相代填。
   - [x] 6.1.c [CONTRACT] #828 新增去識別化 status snapshot fixture 與 producer/consumer 欄位契約；僅完成 pre-archive handoff，consumer、pin、installed/runtime integration 與下游 issue closure 仍未完成。
+  - [x] 6.1.d [IMPLEMENTED/TESTED] #840 新增 `monitor/decision_projection.py` 唯讀投影 quota-aware admission（#839）decision receipt 與額度等待來源（`wait`／`personas`／`classification`），`cortex inspect status` 的 `attention` 與 `cortex work show` 的 observations 通道共用同一份投影與同一次 snapshot 的 store handle；只消費既有 #828 identity producer／#830 非 Job 契約／#527 reason，不重做其邏輯。#839 receipt 最小加法：`selected_observation_state`／`selected_feasible`／`policy_config_revision`（見 `changelog.d/refine-840.md`）。19 個測試（`tests/test_decision_status_projection_840.py`）涵蓋多 persona/retry/跨 run-card、negative、restart/last-good、bytes 不變、allowlist 負例與端到端案例，皆已跑過。installed／live canary（在生產環境實際重啟 daemon、驗證 production 讀到真實 decision receipt）未執行，仍是獨立部署 gate。
 - [ ] 6.2 由 #841 建立 CLI/site-packages/service loaded artifact/config identity 的同源驗證與 checkout 外 smoke。
 - [ ] 6.3 完成 installer/doctor instance roots、writer ownership 與 owner-aware stop/cleanup 的契約驗收。
 - [ ] 6.4 取得 upgrade/restart/rollback 對 active jobs 的實際 receipts；未重載程序不得標已部署。

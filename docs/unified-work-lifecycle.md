@@ -32,7 +32,7 @@ admission 前也會拿 registry 內既有 terminal job 當 caller inventory 與 
 unreadable/corrupt，或 inventory 與 store 還在 pending/conflict，Manager 會回
 `reason: executor-backoff-unknown`，明確保留 unknown 而不是把它折成 allow/deny，也不捏造
 `retry_after_epoch`；pending 終局由 admission 重播補 ack，unknown 診斷含 pending／replayed 計數與
-replay diagnostics。修好 store 後重新 `resume` 即可；slice lane 的 admission 與 request／tick consumer 現在也會共用這份 durable state，透過 `dispatch_skipped_by_backoff` 明確區分 known cooldown 與 unknown（unknown 不代表 quota 已可用），但 #825 的 quota pool／forecast／reservation（R9）仍未完成。本票 merge 後才可再升級含 #928 的 pin。
+replay diagnostics。修好 store 後重新 `resume` 即可；slice lane 的 admission 與 request／tick consumer 現在也會共用這份 durable state，透過 `dispatch_skipped_by_backoff` 明確區分 known cooldown 與 unknown（unknown 不代表 quota 已可用）。#836 在 schema-core 上提供 quota source、durable event ledger 與 shadow projection；#837 forecast、#838 reservation、#839 quota admission 仍待各自產品實作。本票 merge 後才可再升級含 #928 的 pin。
 
 ### Planning capability probe boundary
 
@@ -54,12 +54,39 @@ OpenSpec publication 的 `<change>` 可使用目前 Work Item 明確映射的 an
 模組：它只提供 standalone `UnitDefinition`、`PoolDescriptor`、
 `ProfilePoolBinding`、`QuotaObservation` 的 bounded parser，以及
 `binding_status()`、`freshness()`、`event_identity()` 三個 read-only helper。
-這層目前**沒有**接到 workflow read model、delivery truth、或既有 usage pipeline；
-production 路徑仍是 `registry.update_headless_result()` 先寫 terminal outcome，再交
-`usage_extractors.extract_usage()` 擷取 usage，structured rate-limit／reset 訊號則
-沿既有 `outcome_taxonomy.StreamEvidence` seam 保留。若未來要把 quota observation
-餵進 source adapters、durable ledger、shadow read projection 或 admission，仍屬
-#836 的後續 B/C/D child，不在這個 pure-schema owner 內偷接 consumer。
+#836 在這個 schema-core 上新增 `coordinator/quota_sources.py`、
+`coordinator/quota_ledger.py` 與 `coordinator/quota_shadow.py`。Provider adapter
+只解析呼叫端明確提供的正式 JSON payload：Codex App Server
+`account/rateLimits/read`、GitHub Copilot SDK `account.getQuota`、以及 Antigravity
+CLI `/usage`；Anthropic Claude Code 與 `cg` 沒有此票已核實的 machine-readable
+remaining 介面時維持 unknown＋coverage gap。Adapter 不啟動 provider 命令、不讀
+credentials，也不依 executor/model 名稱推斷帳號 pool。
+
+Shadow service 以 profile binding 對照明示 pool/window，接受 fake/provider
+observation 與既有 registry terminal `usage`；此為明示 consumer API，不自動掛入
+workflow job completion path。Terminal token 欄位沿 #325 的
+`usage_extractors.extract_usage()` 結果，不重讀 log、不另造 parser。只有 unit ref
+完全相同的 usage delta 才能從新鮮 remaining snapshot 扣除；無 mapping、窗口 epoch
+不明、外部 session 不可觀測、資料 stale/corrupt 或事件衝突，都保留 unknown 與
+coverage gap。`observed`、`estimated`、`unknown` 與 source schema/version 會分開保留。
+請求、premium request、token、credit 與 concurrency gauge 不互相換算；bounded
+remaining 只在上下界足以證明時顯示 shadow assessment。
+
+外部 session／host 可由呼叫端唯讀取得 observation 後交給
+`record_external_observation()` 匯入；shadow API 不自行建立外連，也不讀取 auth。
+沒有被外部 observation 覆蓋的來源仍顯示 `external-session-unobserved`。
+
+Durable events 存在 `config.paths.quota_observation_root()` 的獨立 JSONL，使用
+append-only、來源事件／caller idempotency、衝突收據與 fail-closed replay；此 path
+已登記為 Trust Root `quota-observation-events`，Manager 可寫、Monitor 可讀，且兩者
+在既有 UID schemes 共用服務帳號。新 ledger 不增加 `WorkflowRun` 或 registry row
+巢狀欄位，因此不改舊版 Manager/Monitor 的封閉 row schema。
+
+此功能只提供 shadow producer/consumer API：**不接到 workflow chain、排序、forecast、
+reservation、admission、dispatch 或 delivery truth**。既有 terminal outcome 與
+`outcome_taxonomy.StreamEvidence` 路徑不變；provider payload 的 live 讀取、部署目錄
+權限落地、重啟與外部 canary 仍需 live 驗收，local fixture/test 不代表已安裝或
+provider live quota 已驗證。
 
 GitHub terminal closure scan 會以 authenticated default revision 的 Contents API 讀取 remote Todo，並重驗 path、blob SHA 與 base64 encoding；production 只對 canonical WorkflowRegistry 已連結的 PR 做 merge ancestry compare。只有 HTTP 502/503/504 會有限次 backoff retry，auth、rate-limit、其他 HTTP error、malformed JSON 或 identity mismatch 都立即保留 last-good 並標 degraded。
 
@@ -302,7 +329,7 @@ V1 terminal delivery 僅支援 GitHub。其他 forge 仍可顯示 read model，�
 
 一般 review→ship advance 在 ship validator 完成 remote closure 後，會先以 CompletionRecord hash 寫入並讀回唯一 shipped outcome，再由 Manager 將 WorkflowRun 寫成 ship/done。若兩步之間中斷，resume 會重驗 closure 並重用相同 outcome row；append、讀回或交付綁定衝突都會阻止 done。
 
-Authority 前進時，claim 會先讀取收到的 delivery journal；若 review run 的完整 merge authorization、workflow step、PR binding 與 Candidate 都相符，便保留原 phase，不執行 authority-restart reset。舊版已標記 `retry_classification=authority_restart` 且 reset 到 `verify` 的 merged run，`resume` 會 fail-closed 回報 `merged-run-reset-to-verify`、不派 verify，並提供 `cortex work <work-id> retire-delivered --repo <owner/repo> --expected-run-id <run-id> --actor <operator> --reason '<single-line reason>'`。`retire-delivered` 只退休孤兒 run，維持 abandoned/superseded 語意；它不補寫 CompletionRecord 或 shipped outcome，也不把 run 標成 done。退休後只會解除同時屬於該 run pinned planning authority 與目前 mapped Todo 的缺失 path link；仍存在、為 symlink、或未被這兩者確認的連結會保留。
+Authority 前進時，claim 會先讀取收到的 delivery journal；若 review run 的完整 merge authorization、workflow step、PR binding 與 Candidate 都相符，便保留原 phase，不執行 authority-restart reset。舊版已標記 `retry_classification=authority_restart` 且 reset 到 `verify` 的 merged run，`resume` 會 fail-closed 回報 `merged-run-reset-to-verify`、不派 verify，並提供 `cortex work <work-id> retire-delivered --repo <owner/repo> --expected-run-id <run-id> --actor <operator> --reason '<single-line reason>'`。即使工作區已不存在或已從 `project-cortex.yaml` 移除，只要 WorkAuthority 是單純缺席，操作者仍可用 repo/work id 與 exact run ID 由 registry 定址；Admission 依該 run 的 repo、work id、ongoing 狀態、PR refs、無 active job，加上 GitHub 對每個 PR 的 terminal proof。run 若非 ongoing、有 active job、PR 尚未 terminal 或 provider 不確定，仍拒絕。此時 immutable evidence 會標 `authority_source=registry-run-record`；digest 僅使用 run `source_revision` 或 delivery journal 既存值，兩者皆無則記為 absent，不重建 authority digest。`status` 與 work list 只在同一條件可由正式入口接受時列出 `retire-delivered`。`retire-delivered` 只退休孤兒 run，維持 abandoned/superseded 語意；它不補寫 CompletionRecord 或 shipped outcome，也不把 run 標成 done。`abandon` 仍要求可載入的 WorkAuthority，並保留原有無 PR 的 pre-delivery gate。authority 可載入時兩個 action 維持原行為。退休後只會解除同時屬於該 run pinned planning authority 與目前 mapped Todo 的缺失 path link；仍存在、為 symlink、或未被這兩者確認的連結會保留。
 
 若 authority 前進時 run 已有 Candidate 與已對應且仍開啟的 PR，自動掃描不會重設該 Candidate。操作者明確執行 `cortex work resume <work-id> --repo <owner/repo>` 後，Manager 只在 PR head 與已驗證 Candidate 相同、沒有執行中的工作，且 delivery journal 的 run／PR 綁定相符時，才把同一 run 退回 verify/review；通過後沿用原 ship 路徑。PR head 不符或其他識別綁定不符時，以 fail-closed 停止，不建立或修改 PR。
 
