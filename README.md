@@ -84,13 +84,31 @@ CLI 提供兩個子命令：
   `--output`。`--dry-run` 不寫任何檔，只印分類結果；`--json` 輸出機讀摘要
   （每 executor 的 `state`／`observations`／`gaps`）。
 - `cortex quota import --config <path> --file <file>`：由 Manager 帳號匯入
-  `--output` 落地的 observation 檔，走 `record_external_observation()`（要求
-  `method` 為 `provider_status`／`structured_event`，拒絕其他來源）。
+  `--output` 落地的 observation 檔。匯入前先以
+  `quota_collectors.validate_import_payload()` 核對這份檔案真的是
+  `observe --output` 產生的 export envelope（固定 `schema`／
+  `collector_version`／`config_revision`），且每筆 observation 的
+  `source.method`／`source_schema`／`authority_ref`／unit 的 `semantics_ref`
+  逐字等於 `provider_read_contract(executor)` 的正式值、`config_revision`
+  等於目前 `--config`、`(pool_ref, window_id, profile_key)` 屬於設定檔該
+  executor 的 `collector_targets`、`observed_at_ms` 不在未來也未超過自身
+  `ttl_ms` 過期；任一筆不符即整份拒絕（不部分匯入），錯誤訊息只帶機器可讀
+  reason code，不含原始內容。通過驗證後才走
+  `record_external_observation()`（仍要求 `method` 為
+  `provider_status`／`structured_event`）逐筆寫入 ledger。
 
 多 UID 部署的建議流程：以任意帳號執行 `cortex quota observe --config <path>
 --output observation.json`（唯讀，只落已去識別的 observation），再由 Manager
 帳號執行 `cortex quota import --config <path> --file observation.json` 寫入
 ledger。
+
+**信任邊界**：`cortex quota import` 假設執行者是 Manager 帳號、`--file` 是
+collector（`cortex quota observe --output`）產生的檔案。上述檢查能擋掉「檔案
+被搬到別的 config／別的 executor 環境」或「隨手竄改單一欄位」這類意外或粗糙
+偽造，但**無法防止持有 operator 執行權限者刻意偽造整份檔案**——只要偽造者能
+在本機跑一次 `cortex quota observe --config <path> --output x.json`，就能取得
+所有欄位的合法值再自行拼裝別的內容（例如竄改 amount 但保留其餘欄位全部合法）。
+要防這一層，需要 collector 對輸出簽章、import 端驗簽——目前尚未實作，另議。
 
 ## Quota reservation authority
 

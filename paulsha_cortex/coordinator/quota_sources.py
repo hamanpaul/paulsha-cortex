@@ -248,47 +248,161 @@ def _parse_provider_payload(executor: str, payload: object, targets):
     return {}
 
 
+def _codex_merged_field(
+    by_id_snapshot: dict[str, Any] | None, top_snapshot: dict[str, Any] | None, field_name: str,
+) -> tuple[object, bool]:
+    """合併同一 limitId 在 ``rateLimitsByLimitId``／頂層 ``rateLimits`` 兩處對
+    單一欄位（window 子物件或 gating 欄位）的回報。
+
+    只有兩邊都給出非 null 的值、且值不同才算矛盾；任一邊缺席（key 不存在或
+    值為 null，例如另一票只提供 ``{"limitId": "codex"}`` 這種殘缺 stub）不算
+    矛盾，直接採用有值的那一邊——不能因為某處只是回報不完整就誤判整個
+    observation 矛盾。
+    """
+
+    a = by_id_snapshot.get(field_name) if isinstance(by_id_snapshot, dict) else None
+    b = top_snapshot.get(field_name) if isinstance(top_snapshot, dict) else None
+    if a is not None and b is not None and a != b:
+        return None, True
+    return (a if a is not None else b), False
+
+
+def _codex_window_value(
+    *,
+    ordinary_allowed: object,
+    reached_type: object,
+    spend_control: object,
+    window: object,
+    target: "ProviderQuotaTarget",
+) -> tuple[str | None, int | None, str | None]:
+    """解析單一 limitId 下、單一 window 的剩餘額度。
+
+    ``ordinaryUsageAllowed`` 是整個回應（帳號）層級的 gating 欄位（回應頂層，
+    不巢在任一 limitId snapshot 底下）；``rateLimitReachedType``／
+    ``spendControlReached`` 是該 limitId 層級的 gating 欄位（不是某個 window
+    專屬）。provider 已明示拒絕一般用量時，不得讓任何 window 的 observation
+    呈現為「有剩餘」；改記為 remaining 0（`provider-reports-limit-reached`，
+    保留 resetsAt）而不是猜測的百分比。
+    """
+
+    if (
+        (ordinary_allowed is not None and type(ordinary_allowed) is not bool)
+        or (reached_type is not None and not isinstance(reached_type, str))
+        or (spend_control is not None and type(spend_control) is not bool)
+    ):
+        return (None, None, "invalid-provider-value")
+    blocked = ordinary_allowed is False or reached_type is not None or spend_control is True
+
+    if window is None:
+        # provider 明確回報「沒有這個 window」（缺 key 或值為 null），是精確的
+        # coverage gap，不是格式錯誤——不要歸成 invalid-provider-value。
+        return (None, None, "provider-window-absent")
+    if not isinstance(window, dict):
+        return (None, None, "invalid-provider-value")
+
+    used = window.get("usedPercent", window.get("used_percent"))
+    duration = window.get("windowDurationMins", window.get("window_duration_mins"))
+    reset_seconds = window.get("resetsAt", window.get("resets_at"))
+    expected = next((item.get("duration_ms") for item in target.descriptor.to_dict()["windows"]
+                     if item.get("window_id") == target.window_id), None)
+    if (type(used) is not int or used < 0 or used > 100
+            or (duration is not None and (
+                type(duration) is not int or duration <= 0
+                or expected is None or expected != duration * 60_000
+            ))
+            or (reset_seconds is not None and (
+                type(reset_seconds) is not int or reset_seconds < 0
+                or reset_seconds * 1000 > _TIME_MAX_MS
+            ))
+            or expected is None):
+        return (None, None, "invalid-provider-value")
+    if _target_semantics(target) != _CODEX_UNIT:
+        return (None, None, "provider-unit-mapping-mismatch")
+
+    reset_at_ms = None if reset_seconds is None else reset_seconds * 1000
+    if blocked:
+        return ("0", reset_at_ms, "provider-reports-limit-reached")
+    return (str(100 - used), reset_at_ms, None)
+
+
 def _parse_codex(payload: dict[str, Any], targets):
+    """解析 codex 回應；``target.resource_key`` 形狀固定為
+    ``codex:<limitId>:<providerWindowName>``——``<providerWindowName>``（如
+    ``primary``／``secondary``）是 provider 回應裡的欄位名，跟本地
+    ``target.window_id``（descriptor 那端的 window 識別，可以是任意 operator
+    命名，例如 ``short``）是兩個獨立的識別，不能假設兩者字面相同。
+
+    同一 limitId 可能同時出現在頂層 ``rateLimits`` 與
+    ``rateLimitsByLimitId[limitId]``（見 #836 對抗審查第九輪 MAJOR-1、
+    qualification/driver.py 的既有容忍寫法）：兩處都缺席才算沒有這個 limitId；
+    只要任一處有值就採用；兩處都給出非 null 值但不同才算矛盾，回精確的
+    ``provider-limit-snapshot-conflict`` gap，不猜哪一份才對。
+    """
+
     body = payload.get("result", payload)
     if not isinstance(body, dict):
         return {}
-    limits = body.get("rateLimits", body.get("rate_limits", body))
-    if not isinstance(limits, dict):
-        return {}
-    limit_id = limits.get("limitId", limits.get("limit_id"))
-    if not isinstance(limit_id, str) or not limit_id:
-        return {}
-    result = {}
+    by_limit_id_raw = body.get("rateLimitsByLimitId")
+    by_limit_id = by_limit_id_raw if isinstance(by_limit_id_raw, dict) else {}
+    # 第三層 fallback（直接把整個 body 當 snapshot）延續既有行為：某些呼叫端
+    # 直接把 limits 物件本身當 payload 傳入，沒有 rateLimits／rate_limits 包一層。
+    top_level_raw = body.get("rateLimits", body.get("rate_limits", body))
+    top_level = top_level_raw if isinstance(top_level_raw, dict) else None
+    top_limit_id = None
+    if top_level is not None:
+        candidate = top_level.get("limitId", top_level.get("limit_id"))
+        if isinstance(candidate, str) and candidate:
+            top_limit_id = candidate
+    # ordinaryUsageAllowed 是整個回應層級的欄位（回應頂層，跟 rateLimits／
+    # rateLimitsByLimitId 平行），不巢在任一 limitId snapshot 底下。
+    ordinary_allowed = body.get("ordinaryUsageAllowed")
+
+    # 候選 limitId：rateLimitsByLimitId 的 key 加上頂層 limitId；resource_key
+    # 對到哪個候選字首取「最長者」，避免恰好互為前綴時誤配到較短的那個。
+    candidate_limit_ids = [key for key in by_limit_id if isinstance(key, str) and key]
+    if top_limit_id is not None and top_limit_id not in candidate_limit_ids:
+        candidate_limit_ids.append(top_limit_id)
+
+    result: dict[str, tuple[str | None, int | None, str | None]] = {}
     for target in targets:
-        prefix = f"codex:{limit_id}:"
-        if not target.resource_key.startswith(prefix):
+        key = target.resource_key
+        if not key.startswith("codex:"):
             continue
-        window_name = target.resource_key[len(prefix):]
-        window = limits.get(window_name)
-        if not isinstance(window, dict):
+        remainder = key[len("codex:"):]
+        matched_limit_id: str | None = None
+        for limit_id in candidate_limit_ids:
+            if remainder.startswith(f"{limit_id}:") and (
+                matched_limit_id is None or len(limit_id) > len(matched_limit_id)
+            ):
+                matched_limit_id = limit_id
+        if matched_limit_id is None:
             continue
-        used = window.get("usedPercent", window.get("used_percent"))
-        duration = window.get("windowDurationMins", window.get("window_duration_mins"))
-        reset_seconds = window.get("resetsAt", window.get("resets_at"))
-        expected = next((item.get("duration_ms") for item in target.descriptor.to_dict()["windows"]
-                         if item.get("window_id") == target.window_id), None)
-        if (type(used) is not int or used < 0 or used > 100
-                or (duration is not None and (
-                    type(duration) is not int or duration <= 0
-                    or expected is None or expected != duration * 60_000
-                ))
-                or (reset_seconds is not None and (
-                    type(reset_seconds) is not int or reset_seconds < 0
-                    or reset_seconds * 1000 > _TIME_MAX_MS
-                ))
-                or expected is None):
-            result[target.resource_key] = (None, None, "invalid-provider-value")
+        window_name = remainder[len(matched_limit_id) + 1:]
+        if not window_name:
             continue
-        if _target_semantics(target) != _CODEX_UNIT:
-            result[target.resource_key] = (None, None, "provider-unit-mapping-mismatch")
+
+        by_id_snapshot = by_limit_id.get(matched_limit_id)
+        by_id_snapshot = by_id_snapshot if isinstance(by_id_snapshot, dict) else None
+        top_snapshot = top_level if matched_limit_id == top_limit_id else None
+
+        if by_id_snapshot is None and top_snapshot is None:
+            continue  # 交回上層依既有規則判定 invalid-provider-value／provider-value-missing
+
+        window, window_conflict = _codex_merged_field(by_id_snapshot, top_snapshot, window_name)
+        reached_type, reached_conflict = _codex_merged_field(
+            by_id_snapshot, top_snapshot, "rateLimitReachedType"
+        )
+        spend_control, spend_conflict = _codex_merged_field(
+            by_id_snapshot, top_snapshot, "spendControlReached"
+        )
+        if window_conflict or reached_conflict or spend_conflict:
+            result[key] = (None, None, "provider-limit-snapshot-conflict")
             continue
-        reset_at_ms = None if reset_seconds is None else reset_seconds * 1000
-        result[target.resource_key] = (str(100 - used), reset_at_ms, None)
+
+        result[key] = _codex_window_value(
+            ordinary_allowed=ordinary_allowed, reached_type=reached_type,
+            spend_control=spend_control, window=window, target=target,
+        )
     return result
 
 

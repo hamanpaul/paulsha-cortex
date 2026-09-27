@@ -203,12 +203,17 @@ def _run_import(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as exc:
         print(f"錯誤: 匯入檔不是合法 JSON：{exc}", file=sys.stderr)
         return 1
-    if not isinstance(payload, dict) or payload.get("schema") != quota_collectors.OUTPUT_SCHEMA:
-        print(f"錯誤: 匯入檔 schema 不符（需 {quota_collectors.OUTPUT_SCHEMA}）", file=sys.stderr)
-        return 1
-    observations = payload.get("observations")
-    if not isinstance(observations, list):
-        print("錯誤: 匯入檔缺少 observations 陣列", file=sys.stderr)
+
+    # 信任邊界：只接受 `observe --output` 產生的 export envelope，並逐筆核對
+    # source contract／config_revision／collector_targets／observed_at 新鮮度；
+    # 任一筆不符即整份拒絕（不部分匯入）。錯誤訊息只帶 reason code，不含原始
+    # 內容（見 #836 對抗審查第九輪 MAJOR-3；README 已記錄此處的信任邊界）。
+    try:
+        observations = quota_collectors.validate_import_payload(
+            payload, config=config, now_ms=int(time.time() * 1000),
+        )
+    except quota_collectors.ImportValidationError as exc:
+        print(f"錯誤: 匯入檔未通過信任邊界檢查（{exc}）", file=sys.stderr)
         return 1
 
     service = quota_shadow.QuotaShadowService(quota_ledger.QuotaEventLedger())

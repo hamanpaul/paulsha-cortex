@@ -7,6 +7,7 @@ provider CLI；子程序生命週期（terminate/kill）以假 Popen-like 物件
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -245,10 +246,11 @@ def test_codex_real_response_shape_produces_observation_and_terminates_process()
     by_key = {obs.to_dict()["scope"]["value"]["window_id"]: obs.to_dict() for obs in capture.observations}
     assert by_key["primary"]["measurement"]["quantity"]["amount"] == {"kind": "exact", "value": "99"}
     assert by_key["primary"]["reset_at_ms"] == {"state": "known", "value": 1_791_072_182_000}
-    # secondary 為 null：precise gap，不是靜默丟棄。
+    # secondary 為 null：provider 明確回報「沒有這個 window」，是精確 gap，
+    # 不是格式錯誤，也不是靜默丟棄（#836 對抗審查第九輪 MAJOR-1）。
     assert by_key["secondary"]["measurement"]["quantity"]["state"] == "unknown"
     gap_reasons = {gap.resource_key: gap.reason for gap in capture.gaps}
-    assert gap_reasons == {"codex:codex:secondary": "invalid-provider-value"}
+    assert gap_reasons == {"codex:codex:secondary": "provider-window-absent"}
 
     # accountId／原始 payload 一律不出現在 observation wire 裡。
     dumped = json.dumps([obs.to_dict() for obs in capture.observations])
@@ -262,6 +264,196 @@ def test_codex_real_response_shape_produces_observation_and_terminates_process()
     assert sent[0]["params"]["clientInfo"]["version"] == "9.9.9"
     assert sent[1]["method"] == "initialized"
     assert sent[2]["method"] == "account/rateLimits/read"
+
+
+# ---------------------------------------------------------------------------
+# #836 對抗審查第九輪 MAJOR-1：rateLimitsByLimitId／頂層 rateLimits 對帳
+# ---------------------------------------------------------------------------
+
+
+def _rate_limits_by_limit_id_only_line(request_id: int = 2) -> str:
+    """回應只有 rateLimitsByLimitId、沒有頂層 rateLimits（真實形狀之一；
+    ``qualification/driver.py`` 的 preflight 早就接受這種形狀）。"""
+
+    return json.dumps({
+        "jsonrpc": "2.0", "id": request_id,
+        "result": {
+            "ordinaryUsageAllowed": True,
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "ordinaryUsageAllowed": True,
+                    "rateLimitReachedType": None,
+                    "spendControlReached": False,
+                    "primary": {"usedPercent": 1, "windowDurationMins": 10_080, "resetsAt": 1_791_072_182},
+                    "secondary": None,
+                },
+            },
+            "accountId": "22222222-2222-2222-2222-222222222222",
+        },
+    }) + "\n"
+
+
+def test_codex_rate_limits_by_limit_id_only_still_produces_observation():
+    proc = _FakeProcess((_init_ok_line(), _rate_limits_by_limit_id_only_line()))
+    descriptor = _codex_descriptor(windows=(("primary", 10_080 * 60_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    targets = _codex_targets(descriptor, binding, window_ids=("primary",))
+
+    capture = collectors.collect_provider_quota(
+        "codex", profile_key=_PROFILE_A, targets=targets, descriptors=(descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW, ttl_ms=60_000, timeout_s=2.0, spawn_codex=lambda: proc,
+    )
+
+    assert not capture.gaps
+    by_key = {obs.to_dict()["scope"]["value"]["window_id"]: obs.to_dict() for obs in capture.observations}
+    assert by_key["primary"]["measurement"]["quantity"]["amount"] == {"kind": "exact", "value": "99"}
+
+
+def _codex_two_snapshot_line(*, top: dict, by_id: dict, request_id: int = 2) -> str:
+    return json.dumps({
+        "jsonrpc": "2.0", "id": request_id,
+        "result": {"rateLimits": top, "rateLimitsByLimitId": {"codex": by_id}},
+    }) + "\n"
+
+
+def test_codex_matching_top_level_and_by_limit_id_snapshots_are_not_a_conflict():
+    snapshot = {"limitId": "codex", "primary": {"usedPercent": 1, "windowDurationMins": 10_080, "resetsAt": 1_791_072_182}}
+    proc = _FakeProcess((_init_ok_line(), _codex_two_snapshot_line(top=snapshot, by_id=dict(snapshot))))
+    descriptor = _codex_descriptor(windows=(("primary", 10_080 * 60_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    targets = _codex_targets(descriptor, binding, window_ids=("primary",))
+
+    capture = collectors.collect_provider_quota(
+        "codex", profile_key=_PROFILE_A, targets=targets, descriptors=(descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW, ttl_ms=60_000, timeout_s=2.0, spawn_codex=lambda: proc,
+    )
+
+    assert not capture.gaps
+    by_key = {obs.to_dict()["scope"]["value"]["window_id"]: obs.to_dict() for obs in capture.observations}
+    assert by_key["primary"]["measurement"]["quantity"]["amount"] == {"kind": "exact", "value": "99"}
+
+
+def test_codex_conflicting_top_level_and_by_limit_id_snapshots_is_precise_gap_not_a_guess():
+    top = {"limitId": "codex", "primary": {"usedPercent": 1, "windowDurationMins": 10_080, "resetsAt": 1_791_072_182}}
+    by_id = {"limitId": "codex", "primary": {"usedPercent": 50, "windowDurationMins": 10_080, "resetsAt": 1_791_072_182}}
+    proc = _FakeProcess((_init_ok_line(), _codex_two_snapshot_line(top=top, by_id=by_id)))
+    descriptor = _codex_descriptor(windows=(("primary", 10_080 * 60_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    targets = _codex_targets(descriptor, binding, window_ids=("primary",))
+
+    capture = collectors.collect_provider_quota(
+        "codex", profile_key=_PROFILE_A, targets=targets, descriptors=(descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW, ttl_ms=60_000, timeout_s=2.0, spawn_codex=lambda: proc,
+    )
+
+    gap_reasons = {gap.resource_key: gap.reason for gap in capture.gaps}
+    assert gap_reasons == {"codex:codex:primary": "provider-limit-snapshot-conflict"}
+    assert capture.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# #836 對抗審查第九輪 MAJOR-2：provider 明示拒絕一般用量時不得呈現有剩餘
+# ---------------------------------------------------------------------------
+
+
+def _codex_gating_line(
+    *, ordinary_usage_allowed=True, rate_limit_reached_type=None, spend_control_reached=False,
+    request_id: int = 2,
+) -> str:
+    # ordinaryUsageAllowed 是回應頂層欄位（跟 rateLimits 平行、不巢在裡面）；
+    # rateLimitReachedType／spendControlReached／credits 才是巢在 limitId
+    # snapshot 底下的欄位——真實形狀就是這樣分層（見任務給的去識別回應）。
+    return json.dumps({
+        "jsonrpc": "2.0", "id": request_id,
+        "result": {
+            "ordinaryUsageAllowed": ordinary_usage_allowed,
+            "rateLimits": {
+                "limitId": "codex",
+                "rateLimitReachedType": rate_limit_reached_type,
+                "spendControlReached": spend_control_reached,
+                "primary": {"usedPercent": 1, "windowDurationMins": 10_080, "resetsAt": 1_791_072_182},
+                "credits": {"hasCredits": False, "unlimited": False, "balance": "0"},
+            },
+        },
+    }) + "\n"
+
+
+def _run_codex_gating_case(line: str):
+    proc = _FakeProcess((_init_ok_line(), line))
+    descriptor = _codex_descriptor(windows=(("primary", 10_080 * 60_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    targets = _codex_targets(descriptor, binding, window_ids=("primary",))
+    return collectors.collect_provider_quota(
+        "codex", profile_key=_PROFILE_A, targets=targets, descriptors=(descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW, ttl_ms=60_000, timeout_s=2.0, spawn_codex=lambda: proc,
+    )
+
+
+def test_codex_ordinary_usage_not_allowed_forces_remaining_zero_not_optimistic():
+    # usedPercent=1（表面上還有 99% 可用），但 ordinaryUsageAllowed=False：
+    # provider 已明示拒絕一般用量，不得仍寫出「有剩餘」的觀測。
+    capture = _run_codex_gating_case(_codex_gating_line(ordinary_usage_allowed=False))
+
+    obs = capture.observations[0].to_dict()
+    assert obs["measurement"]["quantity"]["amount"] == {"kind": "exact", "value": "0"}
+    assert obs["reset_at_ms"] == {"state": "known", "value": 1_791_072_182_000}
+    gap_reasons = {gap.resource_key: gap.reason for gap in capture.gaps}
+    assert gap_reasons == {"codex:codex:primary": "provider-reports-limit-reached"}
+    dumped = json.dumps(obs)
+    assert "hasCredits" not in dumped and "balance" not in dumped
+
+
+def test_codex_rate_limit_reached_type_set_forces_remaining_zero():
+    capture = _run_codex_gating_case(_codex_gating_line(rate_limit_reached_type="secondary"))
+
+    obs = capture.observations[0].to_dict()
+    assert obs["measurement"]["quantity"]["amount"] == {"kind": "exact", "value": "0"}
+    gap_reasons = {gap.resource_key: gap.reason for gap in capture.gaps}
+    assert gap_reasons == {"codex:codex:primary": "provider-reports-limit-reached"}
+
+
+def test_codex_spend_control_reached_forces_remaining_zero():
+    capture = _run_codex_gating_case(_codex_gating_line(spend_control_reached=True))
+
+    obs = capture.observations[0].to_dict()
+    assert obs["measurement"]["quantity"]["amount"] == {"kind": "exact", "value": "0"}
+    gap_reasons = {gap.resource_key: gap.reason for gap in capture.gaps}
+    assert gap_reasons == {"codex:codex:primary": "provider-reports-limit-reached"}
+
+
+def test_codex_ordinary_usage_allowed_wrong_type_is_precise_invalid_gap():
+    line = json.dumps({
+        "jsonrpc": "2.0", "id": 2,
+        "result": {
+            "ordinaryUsageAllowed": "yes",
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 1, "windowDurationMins": 10_080, "resetsAt": 1_791_072_182},
+            },
+        },
+    }) + "\n"
+    capture = _run_codex_gating_case(line)
+
+    gap_reasons = {gap.resource_key: gap.reason for gap in capture.gaps}
+    assert gap_reasons == {"codex:codex:primary": "invalid-provider-value"}
+    assert capture.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
+
+
+def test_codex_rate_limit_reached_type_wrong_type_is_precise_invalid_gap():
+    line = json.dumps({
+        "jsonrpc": "2.0", "id": 2,
+        "result": {
+            "rateLimits": {
+                "limitId": "codex", "rateLimitReachedType": 1,
+                "primary": {"usedPercent": 1, "windowDurationMins": 10_080, "resetsAt": 1_791_072_182},
+            },
+        },
+    }) + "\n"
+    capture = _run_codex_gating_case(line)
+
+    gap_reasons = {gap.resource_key: gap.reason for gap in capture.gaps}
+    assert gap_reasons == {"codex:codex:primary": "invalid-provider-value"}
 
 
 def test_codex_timeout_reports_gap_and_terminates_process():
@@ -712,6 +904,139 @@ def test_import_rejects_non_read_only_method(tmp_path):
     result = service.record_external_observation(payload, descriptors=(descriptor,), unit_catalog=())
     assert result.status == "invalid"
     assert {gap.reason for gap in result.gaps} == {"external-source-not-read-only"}
+
+
+# ---------------------------------------------------------------------------
+# import 信任邊界：#836 對抗審查第九輪 MAJOR-3
+# ---------------------------------------------------------------------------
+
+
+def _import_fixture(tmp_path):
+    """一組通過驗證的 baseline：真的走 collect_provider_quota() 產生
+    observation，config 內有對應的 collector_targets。回傳
+    ``(config, export_payload)``。"""
+
+    descriptor = _codex_descriptor(windows=(("primary", 10_080 * 60_000),))
+    binding = _binding((descriptor,), _PROFILE_A)
+    proc = _FakeProcess((_init_ok_line(), _rate_limits_line()))
+    targets = _codex_targets(descriptor, binding, window_ids=("primary",))
+    capture = collectors.collect_provider_quota(
+        "codex", profile_key=_PROFILE_A, targets=targets, descriptors=(descriptor,),
+        unit_catalog=(), observed_at_ms=_NOW, ttl_ms=300_000, timeout_s=2.0, spawn_codex=lambda: proc,
+    )
+    export_payload = collectors.observation_export_payload(
+        capture.observations, config_revision="rev-1", generated_at_ms=_NOW,
+    )
+    config_path = _write_config(
+        tmp_path, descriptor, binding,
+        collector_targets={
+            "codex": [
+                {
+                    "resource_key": "codex:codex:primary", "window_id": "primary",
+                    "profile_key": _PROFILE_A, "pool_ref": _pool_ref_dict(descriptor),
+                },
+            ],
+        },
+    )
+    config = collectors.load_collector_config(config_path)
+    return config, export_payload
+
+
+def test_validate_import_payload_accepts_a_genuine_observe_output_export(tmp_path):
+    config, export_payload = _import_fixture(tmp_path)
+    validated = collectors.validate_import_payload(export_payload, config=config, now_ms=_NOW + 1_000)
+    assert len(validated) == len(export_payload["observations"])
+
+
+def test_validate_import_payload_rejects_hand_crafted_file_with_fake_source_contract(tmp_path):
+    """手工構造的 provider_status 檔：schema id／observation 結構都合法，
+    但 source_schema／authority_ref 是隨便填的，不是真的
+    provider_read_contract() 正式值——必須被整份拒絕，不能只驗 top-level schema。"""
+
+    config, export_payload = _import_fixture(tmp_path)
+    forged = json.loads(json.dumps(export_payload))
+    forged["observations"][0]["source"]["source_schema"] = "totally-made-up-schema-v1"
+    forged["observations"][0]["source"]["authority_ref"] = "https://example.invalid/made-up"
+    with pytest.raises(collectors.ImportValidationError, match="import-source-contract-mismatch"):
+        collectors.validate_import_payload(forged, config=config, now_ms=_NOW + 1_000)
+
+
+def test_validate_import_payload_rejects_config_revision_mismatch(tmp_path):
+    config, export_payload = _import_fixture(tmp_path)
+    forged = json.loads(json.dumps(export_payload))
+    forged["config_revision"] = "rev-does-not-match"
+    with pytest.raises(collectors.ImportValidationError, match="import-config-revision-mismatch"):
+        collectors.validate_import_payload(forged, config=config, now_ms=_NOW + 1_000)
+
+
+def test_validate_import_payload_rejects_resource_key_not_in_collector_targets(tmp_path):
+    config, export_payload = _import_fixture(tmp_path)
+    forged = json.loads(json.dumps(export_payload))
+    # profile_key 換成設定檔完全沒有對應 collector_targets 的另一個 profile。
+    forged["observations"][0]["profile_ref"]["value"]["key"] = _PROFILE_B
+    with pytest.raises(collectors.ImportValidationError, match="import-resource-not-configured"):
+        collectors.validate_import_payload(forged, config=config, now_ms=_NOW + 1_000)
+
+
+def test_validate_import_payload_rejects_observed_at_in_the_future(tmp_path):
+    config, export_payload = _import_fixture(tmp_path)
+    with pytest.raises(collectors.ImportValidationError, match="import-observed-at-in-future"):
+        collectors.validate_import_payload(export_payload, config=config, now_ms=_NOW - 1)
+
+
+def test_validate_import_payload_rejects_expired_observation(tmp_path):
+    config, export_payload = _import_fixture(tmp_path)
+    with pytest.raises(collectors.ImportValidationError, match="import-observation-expired"):
+        collectors.validate_import_payload(
+            export_payload, config=config, now_ms=_NOW + 300_000 + 1,
+        )
+
+
+def test_validate_import_payload_rejects_missing_collector_version(tmp_path):
+    config, export_payload = _import_fixture(tmp_path)
+    forged = json.loads(json.dumps(export_payload))
+    del forged["collector_version"]
+    with pytest.raises(collectors.ImportValidationError, match="import-collector-version-missing"):
+        collectors.validate_import_payload(forged, config=config, now_ms=_NOW + 1_000)
+
+
+def test_validate_import_payload_error_message_never_contains_raw_content(tmp_path):
+    config, export_payload = _import_fixture(tmp_path)
+    forged = json.loads(json.dumps(export_payload))
+    forged["observations"][0]["profile_ref"]["value"]["key"] = _PROFILE_B
+    try:
+        collectors.validate_import_payload(forged, config=config, now_ms=_NOW + 1_000)
+        raise AssertionError("expected ImportValidationError")
+    except collectors.ImportValidationError as exc:
+        assert re.fullmatch(r"[a-z][a-z0-9-]*", str(exc))
+        assert _PROFILE_B not in str(exc)
+
+
+def test_cli_quota_import_rejects_hand_crafted_provider_status_file(tmp_path, capsys):
+    config, export_payload = _import_fixture(tmp_path)
+    forged = json.loads(json.dumps(export_payload))
+    forged["observations"][0]["source"]["authority_ref"] = "https://example.invalid/forged"
+    forged_path = tmp_path / "forged.json"
+    forged_path.write_text(json.dumps(forged), encoding="utf-8")
+
+    config_path = _write_config(
+        tmp_path, _codex_descriptor(windows=(("primary", 10_080 * 60_000),)),
+        _binding((_codex_descriptor(windows=(("primary", 10_080 * 60_000),)),), _PROFILE_A),
+        collector_targets={
+            "codex": [
+                {
+                    "resource_key": "codex:codex:primary", "window_id": "primary",
+                    "profile_key": _PROFILE_A,
+                    "pool_ref": _pool_ref_dict(_codex_descriptor(windows=(("primary", 10_080 * 60_000),))),
+                },
+            ],
+        },
+    )
+    exit_code = quota_cli.main(["import", "--config", str(config_path), "--file", str(forged_path)])
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "信任邊界" in err
+    assert "example.invalid" not in err
 
 
 # ---------------------------------------------------------------------------

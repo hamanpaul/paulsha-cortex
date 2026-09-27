@@ -46,6 +46,7 @@ __all__ = [
     "CollectorTargetGroup",
     "RawRead",
     "OUTPUT_SCHEMA",
+    "ImportValidationError",
     "load_collector_config",
     "collect_provider_quota",
     "read_codex_quota",
@@ -53,6 +54,7 @@ __all__ = [
     "read_copilot_quota",
     "append_captures_to_ledger",
     "observation_export_payload",
+    "validate_import_payload",
 ]
 
 _DEFAULT_TIMEOUT_S = 20.0
@@ -389,14 +391,173 @@ def observation_export_payload(
     observations: Sequence[schema.QuotaObservation], *, config_revision: str, generated_at_ms: int
 ) -> dict[str, Any]:
     """``--output`` 落地格式：只含 parser 產出的 observation wire dict，
-    不含任何原始 provider payload 或帳號識別。"""
+    不含任何原始 provider payload 或帳號識別。``collector_version`` 記錄產出
+    這份檔案的 cortex 版本，是 `validate_import_payload()` 判斷「這是不是真的
+    由 `observe --output` 產生」的固定信封欄位之一。"""
 
     return {
         "schema": OUTPUT_SCHEMA,
+        "collector_version": _cortex_version(),
         "config_revision": config_revision,
         "generated_at_ms": generated_at_ms,
         "observations": [observation.to_dict() for observation in observations],
     }
+
+
+# ---------------------------------------------------------------------------
+# import 信任邊界：#836 對抗審查第九輪 MAJOR-3
+# ---------------------------------------------------------------------------
+
+
+class ImportValidationError(ValueError):
+    """匯入檔未通過信任邊界檢查；整份拒絕（不部分匯入）。
+
+    訊息只帶 ``[a-z][a-z0-9-]*`` 形狀的機器可讀 reason code，絕不含匯入檔的
+    原始內容（觀測值、pool_ref、profile_key 等一律不外洩到錯誤訊息）。
+    """
+
+
+# QuotaObservation.source_id 只認得 quota_sources._observation() 實際會寫入
+# 的三個值；claude／cg 因為沒有真的讀取路徑，_unknown_capture() 一律回
+# source_id="cortex-unknown-provider"，本來就不該出現在可匯入的 observation 裡。
+_SOURCE_ID_TO_EXECUTOR = {
+    "openai-codex-app-server": "codex",
+    "github-copilot-sdk": "copilot",
+    "google-antigravity-cli": "agy",
+}
+
+
+def _import_allowed_resource_keys(config: "CollectorConfig") -> set[tuple[tuple[object, ...], str, str]]:
+    """設定檔內每個 executor 的 collector_targets 對應到的
+    ``(pool_ref, window_id, profile_key)`` 白名單。"""
+
+    keys: set[tuple[tuple[object, ...], str, str]] = set()
+    for group in config.target_groups:
+        for target in group.targets:
+            keys.add((target.descriptor.pool_ref, target.window_id, group.profile_key))
+    return keys
+
+
+def _import_unit_semantics_ref(config: "CollectorConfig", unit_ref: tuple[str, str]) -> str | None:
+    for descriptor in config.descriptors:
+        for unit in descriptor.units:
+            if unit.ref == unit_ref:
+                return unit.semantics_ref
+    for unit in config.unit_catalog:
+        if unit.ref == unit_ref:
+            return unit.semantics_ref
+    return None
+
+
+def validate_import_payload(
+    payload: object, *, config: "CollectorConfig", now_ms: int,
+) -> tuple[dict[str, Any], ...]:
+    """驗證匯入檔是否真的是 ``observe --output`` 產生的 export envelope。
+
+    任一筆 observation 不符即整份拒絕（不部分匯入）：
+    - envelope 的 ``schema``／``collector_version``／``config_revision`` 必須
+      是固定形狀（``config_revision`` 必須等於目前 ``--config`` 的
+      ``config_revision``）；
+    - 每筆 observation 先經既有的 ``quota_observation.parse_observation()``
+      驗證（descriptor／unit_catalog context 來自目前設定檔）；
+    - ``source.method`` 必須是唯讀分類（``provider_status``／
+      ``structured_event``）；
+    - ``source.source_schema``／``source.authority_ref`` 與該筆
+      ``source_id`` 反查回 executor 後、``provider_read_contract(executor)``
+      的正式值逐字相等；unit_ref 反查到的 ``semantics_ref`` 同理；
+    - ``(pool_ref, window_id, profile_key)`` 必須屬於設定檔該 executor 的
+      collector_targets；
+    - ``observed_at_ms`` 不得在未來，也不得已超過自身 ``ttl_ms`` 而過期。
+
+    成功回傳每筆已驗證的原始 observation dict（供呼叫端沿用既有
+    ``record_external_observation()`` 逐筆寫入 ledger）；失敗一律拋
+    ``ImportValidationError``，訊息只帶 reason code，不含原始內容。
+    """
+
+    if not isinstance(payload, dict) or payload.get("schema") != OUTPUT_SCHEMA:
+        raise ImportValidationError("import-schema-mismatch")
+    collector_version = payload.get("collector_version")
+    if not isinstance(collector_version, str) or not collector_version:
+        raise ImportValidationError("import-collector-version-missing")
+    if payload.get("config_revision") != config.config_revision:
+        raise ImportValidationError("import-config-revision-mismatch")
+    generated_at_ms = payload.get("generated_at_ms")
+    if type(generated_at_ms) is not int or generated_at_ms < 0:
+        raise ImportValidationError("import-generated-at-invalid")
+    raw_observations = payload.get("observations")
+    if not isinstance(raw_observations, list) or not raw_observations:
+        raise ImportValidationError("import-observations-missing")
+
+    allowed_keys = _import_allowed_resource_keys(config)
+    validated: list[dict[str, Any]] = []
+    for item in raw_observations:
+        try:
+            observation = schema.parse_observation(
+                item, descriptors=config.descriptors, unit_catalog=config.unit_catalog,
+            )
+        except (schema.QuotaContractError, TypeError, ValueError):
+            raise ImportValidationError("import-observation-invalid") from None
+        wire = observation.to_dict()
+        source = wire.get("source")
+        if not isinstance(source, dict) or source.get("method") not in {"provider_status", "structured_event"}:
+            raise ImportValidationError("import-source-not-read-only")
+
+        executor = _SOURCE_ID_TO_EXECUTOR.get(source.get("source_id"))
+        if executor is None:
+            raise ImportValidationError("import-source-id-unrecognized")
+        contract = provider_read_contract(executor)
+        if (
+            source.get("source_schema") != contract.get("source_schema")
+            or source.get("authority_ref") != contract.get("authority_ref")
+        ):
+            raise ImportValidationError("import-source-contract-mismatch")
+
+        unit_ref_value = wire.get("unit_ref", {}).get("value") if isinstance(wire.get("unit_ref"), dict) else None
+        unit_ref = (
+            (unit_ref_value.get("unit_id"), unit_ref_value.get("version"))
+            if isinstance(unit_ref_value, dict) else None
+        )
+        semantics_ref = _import_unit_semantics_ref(config, unit_ref) if unit_ref else None
+        if unit_ref is None or semantics_ref != contract.get("unit_semantics_ref"):
+            raise ImportValidationError("import-unit-semantics-mismatch")
+
+        scope_value = wire.get("scope", {}).get("value") if isinstance(wire.get("scope"), dict) else None
+        pool_ref_raw = scope_value.get("pool_ref") if isinstance(scope_value, dict) else None
+        window_id = scope_value.get("window_id") if isinstance(scope_value, dict) else None
+        profile_value = (
+            wire.get("profile_ref", {}).get("value") if isinstance(wire.get("profile_ref"), dict) else None
+        )
+        profile_key = profile_value.get("key") if isinstance(profile_value, dict) else None
+        pool_ref = (
+            tuple(pool_ref_raw.get(field) for field in ("authority_id", "account_id", "pool_id", "revision"))
+            if isinstance(pool_ref_raw, dict) else None
+        )
+        if pool_ref is None or window_id is None or profile_key is None:
+            raise ImportValidationError("import-resource-not-configured")
+        if (pool_ref, window_id, profile_key) not in allowed_keys:
+            raise ImportValidationError("import-resource-not-configured")
+
+        observed_at_container = wire.get("observed_at_ms")
+        ttl_container = wire.get("ttl_ms")
+        observed_at_ms = (
+            observed_at_container.get("value")
+            if isinstance(observed_at_container, dict) and observed_at_container.get("state") == "known"
+            else None
+        )
+        ttl_ms = (
+            ttl_container.get("value")
+            if isinstance(ttl_container, dict) and ttl_container.get("state") == "known"
+            else None
+        )
+        if type(observed_at_ms) is not int or type(ttl_ms) is not int:
+            raise ImportValidationError("import-observed-at-unknown")
+        if observed_at_ms > now_ms:
+            raise ImportValidationError("import-observed-at-in-future")
+        if observed_at_ms + ttl_ms < now_ms:
+            raise ImportValidationError("import-observation-expired")
+
+        validated.append(item)
+    return tuple(validated)
 
 
 # ---------------------------------------------------------------------------
