@@ -1,0 +1,1 @@
+- `.cortex/work-items.yaml`：`wave4-large-bug-integration` 補上 #475 的明確歸屬。Monitor 的 closing 關聯以 PR #1090 關閉的第一張票（#475）決定 PR 群組，#475 無 owner 時會產生 fallback 群組 `issue:…#475`，把 PR 與其他關閉票拉進去，殘留 7 筆 confirmed source collision。
