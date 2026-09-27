@@ -106,9 +106,72 @@ shadow——manager 只在有呼叫端明確傳入 `quota_admission.DispatchCont
 新增的 `quota_admission_context` 參數，缺省 `None`），shadow 模式下只用
 唯讀投影記一份 decision receipt 供觀察，不呼叫 `reserve()`、不改變既有派工
 結果；rollback 只需把環境變數改回非 `on`（或整條不接線 context），不需要
-刪除已經寫下的 decision receipt／reservation／consumption 證據。部署層
-（真正的 #836 descriptors／bindings／provider 觀測來源、`manager_daemon.py`
-的 context 建構）是獨立的安裝／canary gate，本票只交付 Cortex 消費端。
+刪除已經寫下的 decision receipt／reservation／consumption 證據。
+
+### Production 接線：`manager_daemon.py` 與 quota-pools 設定檔
+
+`manager_daemon.py` 在 workflow start、operator resume（`workflow-action`／
+`work-action` 兩條 resume／retry 路徑）與 periodic resume 全部五個
+dispatch／resume 呼叫點，都會以下述設定檔建構同一份 `DispatchContext` 並
+傳入；periodic tick 另外呼叫 `manager.reconcile_quota_admission_reservations()`
+收斂 `reserved`（`create_job()` 之後、`bind()` 之前 crash 留下的無 job_id
+reservation）與 `bound` 兩種狀態，job 進終局時若 binding 可解析，同時透過
+`QuotaShadowService.record_terminal_usage()` 記消耗（成功／失敗都記，
+infra／429 失敗不改寫品質分類）。
+
+Manager 讀取 `paulsha_cortex.config.paths.quota_pools_config_path()`
+（預設 `~/.config/paulshaclaw/quota-pools.json`，可用 `PSC_QUOTA_POOLS_CONFIG`
+覆寫整個檔案路徑；比照既有 `paulshaclaw.yaml`，這是 operator-owned app 設定，
+不是 Trust Root 治理的 durable-state 資產），schema 為 `cortex/quota-pools/v1`：
+
+```json
+{
+  "schema": "cortex/quota-pools/v1",
+  "config_revision": "<operator 自訂版本字串，供稽核>",
+  "descriptors": [ /* #836 PoolDescriptor 原始 payload，見 parse_pool_descriptor */ ],
+  "unit_catalog": [ /* #836 UnitDefinition 原始 payload，可為空陣列 */ ],
+  "bindings": [ /* #836 ProfilePoolBinding 原始 payload，見 parse_binding */ ],
+  "lease_ms": 900000,
+  "usage_unit_refs": { "input_tokens": ["token", "1"] }
+}
+```
+
+`descriptors`／`unit_catalog`／`bindings` 逐字複用 #836
+`quota_observation.parse_pool_descriptor`／`parse_unit_definition`／
+`parse_binding` 的既有驗證，本模組不自寫第二套 schema；`lease_ms`（選填，
+預設 900000ms）與 `usage_unit_refs`（選填，終局 usage metric → unit ref
+對照，供 periodic tick 呼叫 `record_terminal_usage` 用）皆有明確預設，缺席
+不視為錯誤。
+
+三態行為：
+
+- **檔案不存在** → 整條線沒接上，與 #839 落地前逐字相同，任何模式皆不
+  受影響。
+- **檔案存在但無效**（結構錯誤、pool／unit／binding 驗證失敗等）：
+  - shadow（`PSC_QUOTA_ADMISSION_ENFORCE` 未開）→ 記一筆錯誤 log，降級為
+    「沒接上」，不擋派工。
+  - enforce（`PSC_QUOTA_ADMISSION_ENFORCE=on`）→ fail closed：在建立任何
+    job／worktree 之前回精確等待理由 `quota-config-invalid`，零 job、零假
+    job_id（走 #830 非 Job 決策契約）。
+- **檔案存在且有效** → 建構真正的 file-backed `DispatchContext`
+  （`QuotaEventLedger`／`QuotaReservationAuthority`／`AdmissionDecisionStore`
+  皆用各自模組預設路徑）。以檔案內容 sha256 digest 快取解析結果；operator
+  編輯過的檔案下一次讀到的 digest 改變即自動重新解析，不需要重啟 daemon。
+
+**Opt-in／rollback**：預設（無設定檔）與 shadow（有設定檔但
+`PSC_QUOTA_ADMISSION_ENFORCE` 未開）皆不改變既有派工結果，只多寫 decision
+receipt 供觀察。要讓額度不足真的擋派工，必須同時滿足「設定檔存在且有效」
+與「`PSC_QUOTA_ADMISSION_ENFORCE=on`」。Rollback 只需移除設定檔或把環境
+變數改回非 `on`，不需要刪除已經寫下的 decision receipt／reservation／
+consumption 證據——那些是耐久稽核紀錄，rollback 只改變新決策的政策，不洗
+掉歷史。
+
+真正的 #836 provider 觀測來源（另一位同事在做的 collector）尚未接上時，
+`descriptors` 對應的 pool 一律回報 `unknown`；shadow 模式下這只影響
+decision receipt 的 `assessment` 欄位，enforce 模式下 `unknown` 視為不可行
+（AC2）。installed／live canary（在生產環境實際重啟 daemon、驗證真實
+provider 讀取與長期運作）仍是獨立的部署 gate，本節只交付到「daemon 進程內
+的接線與設定檔消費」。
 
 ## Execution profile schema／key core
 

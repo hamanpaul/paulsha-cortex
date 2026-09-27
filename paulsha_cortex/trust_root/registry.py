@@ -2841,6 +2841,11 @@ ACKNOWLEDGED_NON_ASSET_PATHS: dict[str, str] = {
     "paulsha_cortex.config.paths:config_path": "helper（接受 *parts），非單一資產。",
     "paulsha_cortex.config.paths:worktree_root_for": "helper（接受 repo 參數），由 worktree_root 登記。",
     "paulsha_cortex.config.paths:config_root": "~/.config/paulshaclaw app 設定根，非治理 durable-state 資產。",
+    "paulsha_cortex.config.paths:quota_pools_config_path": (
+        "#839 operator-owned quota-pools 設定檔，住在 config_root() 底下，"
+        "比照同族的 paulshaclaw.yaml／config_path 豁免；Manager 唯讀消費，"
+        "不是 Manager-owned durable-state 資產。"
+    ),
     "paulsha_cortex.control.constants:control_root": "委派給 config.paths.control_root；由 control-root-tree 登記。",
 }
 

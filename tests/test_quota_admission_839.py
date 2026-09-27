@@ -475,6 +475,147 @@ def test_ac6_reconcile_keeps_alive_job_bound_and_renews_lease(tmp_path: Path) ->
 
 
 # ---------------------------------------------------------------------------
+# 對抗審查 MAJOR（manager.py:13981）：reconcile_reserved_reservations —— 收斂
+# create_job() 耐久寫入後、bind() 前 crash 留下的無 job_id reserved reservation。
+# ---------------------------------------------------------------------------
+
+
+def _admit_reserve_only(authority, store, *, attempt_id: str, descriptor) -> admission.AdmissionDecision:
+    """比照 `_admit_and_bind`，但刻意不呼叫 `bind()`——模擬 `create_job()`
+    耐久寫入後、`bind()` 之前 crash 留下的『reserved 但無 job_id』狀態。"""
+    assessment = _feasible_assessment(descriptor)
+    decision_id = admission.decision_id_for(
+        run_id="run-1", card_id="card-1", attempt_id=attempt_id, profile_key=_PROFILE_A,
+    )
+    reserved = admission.reserve_for_candidate(
+        authority, run_id="run-1", card_id="card-1", decision_id=decision_id, attempt_id=attempt_id,
+        assessment=assessment, observation_version="obs-v1", demand_version="demand-v1",
+        lease_ms=60_000, now_ms=_NOW,
+    )
+    assert reserved.status == "granted"
+    decision = admission.AdmissionDecision(
+        decision_id=decision_id, run_id="run-1", card_id="card-1", attempt_id=attempt_id,
+        profile_key=_PROFILE_A, mode="enforced", outcome="admit",
+        policy_version=admission.ADMISSION_POLICY_VERSION, observation_version="obs-v1",
+        demand_version="demand-v1", qualification_version="not-enforced", generated_at_ms=_NOW,
+        selected={"executor": "claude", "model_id": "sonnet"}, reservation_id=reserved.reservation_id,
+    )
+    store.record(decision)
+    return decision
+
+
+def test_reserved_unbound_lease_not_expired_is_left_untouched(tmp_path: Path) -> None:
+    """create_job() 之後、bind() 之前 crash——lease 未到期時可能只是
+    create_job() 仍在進行中，不得因此釋放容量。"""
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
+
+    outcomes = admission.reconcile_reserved_reservations(
+        authority=authority, store=store,
+        job_lookup_by_attempt=lambda run_id, card_id, attempt_id: None,
+        job_outcome=lambda job: None,
+        now_ms=_NOW + 1,
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].action == "skipped"
+    status = authority.status(decision.reservation_id, now_ms=_NOW + 1)
+    assert status.state == "reserved"
+
+
+def test_reserved_unbound_lease_expired_and_no_job_found_is_released(tmp_path: Path) -> None:
+    """lease 已過期且 registry 查無對應 job（真的沒建成）——安全釋放容量，
+    evidence 標記 recovered-unbound。"""
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
+
+    outcomes = admission.reconcile_reserved_reservations(
+        authority=authority, store=store,
+        job_lookup_by_attempt=lambda run_id, card_id, attempt_id: None,
+        job_outcome=lambda job: None,
+        now_ms=_NOW + 120_000,  # lease_ms=60_000 早已過期
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].action == "settled"
+    assert "recovered-unbound" in outcomes[0].detail
+    status = authority.status(decision.reservation_id, now_ms=_NOW + 120_000)
+    assert status.state == "released"
+    committed = authority.committed(now_ms=_NOW + 120_000)
+    key = (tuple(_pool_ref(descriptor)[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "short")
+    assert committed.get(key, "0") == "0"
+
+
+def test_reserved_unbound_job_found_alive_renews_lease_and_keeps_capacity(tmp_path: Path) -> None:
+    """create_job() 成功建立、crash 發生在 bind() 之前——registry 找得到那筆
+    job（依 attempt 反查），job 本身從未真正 spawn（非終局）：續 lease、
+    維持 reserved，不釋放容量。"""
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
+
+    outcomes = admission.reconcile_reserved_reservations(
+        authority=authority, store=store,
+        job_lookup_by_attempt=lambda run_id, card_id, attempt_id: {"job_id": "j-1", "status": "dispatched"},
+        job_outcome=lambda job: None,
+        now_ms=_NOW + 120_000, renew_lease_ms=60_000,
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].action == "reconciled"
+    assert "confirmed-alive" in outcomes[0].detail
+    status = authority.status(decision.reservation_id, now_ms=_NOW + 120_000)
+    assert status.state == "reserved"
+    assert status.lease_expires_at_ms == _NOW + 120_000 + 60_000
+
+
+def test_reserved_unbound_lookup_failure_is_left_untouched_not_released(tmp_path: Path) -> None:
+    """job_lookup_by_attempt 本身查詢失敗（拋例外）——一律不動，不得誤判成
+    『查無此 job』而釋放容量（即使 lease 已過期）。"""
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
+
+    def _boom(run_id, card_id, attempt_id):
+        raise RuntimeError("registry temporarily unavailable")
+
+    outcomes = admission.reconcile_reserved_reservations(
+        authority=authority, store=store,
+        job_lookup_by_attempt=_boom,
+        job_outcome=lambda job: None,
+        now_ms=_NOW + 120_000,
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].action == "skipped"
+    assert outcomes[0].detail == "job-lookup-failed"
+    status = authority.status(decision.reservation_id, now_ms=_NOW + 120_000)
+    assert status.state == "reserved"
+
+
+def test_reserved_unbound_job_found_terminal_is_released_defensively(tmp_path: Path) -> None:
+    """防禦性分支：協定上 reserved 不該有終局 job（spawn 一定在 bind 之後），
+    但若 registry 事實真的顯示終局，仍安全收斂釋放容量而不假設。"""
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _admit_reserve_only(authority, store, attempt_id="job-1", descriptor=descriptor)
+
+    outcomes = admission.reconcile_reserved_reservations(
+        authority=authority, store=store,
+        job_lookup_by_attempt=lambda run_id, card_id, attempt_id: {"job_id": "j-1", "status": "exited", "exit_code": 0},
+        job_outcome=lambda job: "succeeded",
+        now_ms=_NOW + 1,
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].action == "settled"
+    status = authority.status(decision.reservation_id, now_ms=_NOW + 1)
+    assert status.state == "released"
+
+
+# ---------------------------------------------------------------------------
 # AdmissionDecisionStore：append-only、冪等重放、內容衝突 fail closed
 # ---------------------------------------------------------------------------
 
@@ -519,3 +660,45 @@ def test_decision_requires_selected_on_admit_and_reason_on_wait() -> None:
             demand_version="demand-v1", qualification_version="not-enforced", generated_at_ms=_NOW,
             reason=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# 對抗審查 MAJOR（quota_admission.py:658）：AdmissionDecisionStore.record()
+# 每次 append 都要 fsync 父目錄與其上層——比照 #838 quota_reservation 的
+# _open_for_append，避免第一筆 grant 的 dirent 在崩潰後消失、重啟看到空
+# store 而重放出第二份不同內容的 decision。
+# ---------------------------------------------------------------------------
+
+
+def test_record_fsyncs_new_store_directory_and_parent(tmp_path: Path, monkeypatch) -> None:
+    import paulsha_cortex.coordinator.quota_admission as module
+
+    synced: list[str] = []
+    real = module._fsync_directory
+    monkeypatch.setattr(module, "_fsync_directory", lambda path: (synced.append(str(path)), real(path))[1])
+    path = tmp_path / "quota-admission-decisions" / "decisions.jsonl"
+    store = admission.AdmissionDecisionStore(path)
+    decision_id = admission.decision_id_for(run_id="run-1", card_id="card-1", attempt_id="job-1", profile_key=_PROFILE_A)
+    store.record(_shadow_decision(decision_id))
+    assert str(tmp_path) in synced
+    assert str(tmp_path / "quota-admission-decisions") in synced
+
+
+def test_record_fsyncs_directories_on_every_append_not_only_first(tmp_path: Path, monkeypatch) -> None:
+    """前一個呼叫者可能在 O_CREAT 後、目錄 fsync 前崩潰；後續 record() 看到
+    檔案已存在時仍必須 fsync 目錄，不得只在檔案不存在時才補（對抗審查要求
+    「每次 append 都 fsync」，不是「首次建立才 fsync」）。"""
+    import paulsha_cortex.coordinator.quota_admission as module
+
+    path = tmp_path / "decisions.jsonl"
+    store = admission.AdmissionDecisionStore(path)
+    first_id = admission.decision_id_for(run_id="run-1", card_id="card-1", attempt_id="job-1", profile_key=_PROFILE_A)
+    store.record(_shadow_decision(first_id))
+    assert path.exists()
+
+    synced: list[str] = []
+    real = module._fsync_directory
+    monkeypatch.setattr(module, "_fsync_directory", lambda p: (synced.append(str(p)), real(p))[1])
+    second_id = admission.decision_id_for(run_id="run-1", card_id="card-1", attempt_id="job-2", profile_key=_PROFILE_A)
+    store.record(_shadow_decision(second_id))
+    assert str(tmp_path) in synced

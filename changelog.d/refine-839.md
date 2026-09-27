@@ -59,3 +59,47 @@ fake executor 派前可用／spawn 時 429 記消耗釋回容量、兩 instance 
 Job 消費端）不在本票接線範圍，維持既有行為。真正的 #836 provider 觀測來源
 與 `manager_daemon.py` 的 `DispatchContext` 建構屬部署／安裝層，是獨立的
 canary gate，本票只交付 Cortex 消費端。
+
+- **#839 對抗審查修復（production 接線輪）**：`manager_daemon.py` 從未建構
+  或傳入 `quota_admission_context`，production 完全不可達——`quota_admission`
+  模組與 `manager._dispatch_workflow_card` 的接線只有測試在餵，daemon 五個
+  dispatch／resume 呼叫點（workflow start、operator resume、periodic resume）
+  逐字未動。新增 `paths.quota_pools_config_path()`（`config_root()` 底下，
+  比照既有 `paulshaclaw.yaml` 豁免，支援 `PSC_QUOTA_POOLS_CONFIG` 覆寫）與
+  `quota_admission.load_quota_pools_config()`／`parse_quota_pools_config()`
+  （schema `cortex/quota-pools/v1`，逐字複用 #836
+  `parse_pool_descriptor`／`parse_unit_definition`／`parse_binding`，不自寫
+  第二套驗證）；`manager_daemon.py` 以此建構 `DispatchContext`（file-backed
+  `QuotaEventLedger`／`QuotaReservationAuthority`／`AdmissionDecisionStore`，
+  皆用預設路徑，以設定檔內容 sha256 digest 快取解析結果），並在五個呼叫點
+  全部傳入；periodic tick 另呼叫新增的
+  `manager.reconcile_quota_admission_reservations()`，同時收斂 `reserved`
+  （見下方 MAJOR）與 `bound` 兩種狀態，job 進終局時若 binding 可解析同時
+  呼叫 `QuotaShadowService.record_terminal_usage()` 記消耗。設定檔存在但
+  無效時，shadow 降級記錄錯誤並回 `None`（維持不擋派工）；opt-in enforce
+  下改回新增的 `quota_admission.QuotaConfigInvalid` 訊號物件，
+  `_dispatch_workflow_card` 在建立任何 job 之前 fail closed，回精確等待
+  理由 `quota-config-invalid`。
+- 同輪另修三個 MAJOR：(1) `reserve_for_candidate()` 對排名第一的可行候選
+  race 落敗（denied）時，原實作直接回 `quota-admission-insufficient`，完全
+  跳過既有排序中其餘候選——原子預留改成在候選迴圈內、選中候選的當下立刻
+  嘗試，race 落敗時排除該候選、依既有排序對下一個候選重試（有界，每次只
+  替所選候選預留，不留半張 grant）。(2) `create_job()` 耐久寫入後、
+  `bind()` 之前 crash 會留下無 job_id 的 `reserved` reservation，舊
+  `reconcile_bound_reservations()` 只收斂 `bound`——新增
+  `reconcile_reserved_reservations()`，依 `attempt_id` 的 ordinal 反查
+  registry 找出對應建立的 job（找到且已終局 → `reconcile(confirmed-terminated)`；
+  找到但非終局 → `reconcile(confirmed-alive)` 續 lease；查無此 job 且 lease
+  已過期 → `reconcile(confirmed-terminated)`，evidence 標 `recovered-unbound`；
+  查無此 job 但 lease 未過期，或查詢本身失敗 → 一律不動，不得誤放）。
+  (3) `AdmissionDecisionStore.record()` 只 fsync 檔案本身，未 fsync 目錄——
+  比照 #838 `_open_for_append` 每次 append 都 fsync 父目錄與其上層。
+- Trust Root：`quota_pools_config_path()` 比照 `config_root()` 既有豁免，
+  登記在 `ACKNOWLEDGED_NON_ASSET_PATHS`，不是 Manager-owned durable-state
+  資產（operator-owned、Manager 唯讀消費，慣例與 `paulshaclaw.yaml` 相同）。
+- 新增 21 個測試：`tests/test_quota_admission_839.py`（fsync 目錄、
+  `reconcile_reserved_reservations` 五個分支）、
+  `tests/test_quota_admission_dispatch_wiring_839.py`（race 落敗換獨立池
+  候選）、`tests/test_quota_admission_daemon_wiring_839.py`（新檔：五個
+  daemon 呼叫點接線、設定檔載入三態、periodic tick 收斂掃描接線、兩個端到
+  端案例）。

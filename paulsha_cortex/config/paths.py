@@ -543,6 +543,21 @@ def config_path(*parts: str) -> Path:
     return config_root().joinpath(*parts)
 
 
+def quota_pools_config_path() -> Path:
+    """#839 operator-owned quota-pools 設定檔（schema ``cortex/quota-pools/v1``）。
+
+    與既有 ``paulshaclaw.yaml``（見 ``monitor/config.py``）同一族：住在
+    ``config_root()``（``~/.config/paulshaclaw``），不是治理平面的
+    durable-state 資產（比照 `ACKNOWLEDGED_NON_ASSET_PATHS` 對 `config_root`
+    的既有豁免——Manager 對它唯讀消費，operator 直接編輯，不走 Trust Root
+    的 managed-directory 生命週期）。支援 ``PSC_QUOTA_POOLS_CONFIG`` 覆寫
+    整個檔案路徑，沿用 `_env_path` 既有慣例；檔案不存在時呼叫端
+    （``quota_admission.load_quota_pools_config``）視為『尚未接線』，行為
+    與 #839 落地前逐字相同。
+    """
+    return _env_path("PSC_QUOTA_POOLS_CONFIG") or config_path("quota-pools.json")
+
+
 def project_config_root() -> Path:
     return resolve_project_config_root()
 

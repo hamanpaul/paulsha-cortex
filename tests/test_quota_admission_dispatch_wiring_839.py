@@ -432,3 +432,74 @@ def test_ac3_two_instances_race_for_last_unit_only_one_gets_bound_job(tmp_path: 
     assert "job_id" not in result  # 兩個候選都撞到同一個已被搶走的 pool，race 落敗不建 job
     assert result["reason"] == "quota-admission-insufficient"
     assert registry.list_jobs() == []
+
+
+def test_race_loss_on_top_ranked_candidate_falls_back_to_independent_pool_candidate(tmp_path: Path) -> None:
+    """對抗審查 MAJOR（manager.py:13643）：排名第一的可行候選在原子預留階段
+    race 落敗時（另一個 instance 搶先吃光它自己那個池），不得直接回
+    quota-admission-insufficient——必須排除該候選、依既有排序對下一個候選
+    （這裡是獨立池的 claude）重試；claude 的池完全沒被動過，重試應該成功
+    並 bind 出一個真正的 job。與 AC3（`test_ac3_two_instances_race_for_last_unit_only_one_gets_bound_job`）
+    的差別：AC3 兩個候選共用同一個已耗盡的池，全部落敗；這裡只有排名第一的
+    候選撞到 race，第二名的池是獨立、未受影響的。
+    """
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = _two_builder_identities()
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    claude_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "claude")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+    claude_key = _resolved_profile_key(run, step, claude_identity, "claude", "claude-primary")
+
+    codex_pool = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    claude_pool = _pool_descriptor(account="acct-claude", pool="pool-claude")
+    now_ms = int(time.time() * 1000)
+    shadow = QuotaShadowService.in_memory()
+    # 兩個候選各自的池在 shadow 投影裡都還很充裕——assess 階段兩者都可行；
+    # race 只發生在原子預留這一層，shadow 的唯讀投影看不到它。
+    _observe(shadow, codex_pool, "short", "10", profile_key=codex_key, now_ms=now_ms)
+    _observe(shadow, claude_pool, "short", "10", profile_key=claude_key, now_ms=now_ms)
+    authority_path = tmp_path / "reservations.jsonl"
+    ctx = quota_admission.DispatchContext(
+        authority=QuotaReservationAuthority(authority_path),
+        store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(codex_pool, claude_pool), unit_catalog=(),
+        bindings=(_binding(codex_pool, codex_key), _binding(claude_pool, claude_key)),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+
+    # 另一個 instance 先把 codex 自己的池吃光——claude 的池完全沒被動過。
+    from paulsha_cortex.coordinator.quota_reservation import PoolDemand
+
+    other_authority = QuotaReservationAuthority(authority_path)
+    other_result = other_authority.reserve(
+        run_id="other-run", card_id="other-card", decision_id="adm:v1:" + "e" * 64,
+        attempt_id="other-attempt",
+        pools=(PoolDemand(pool_ref=_pool_ref(codex_pool), window_id="short", amount="10"),),
+        capacity_by_pool={(tuple(_pool_ref(codex_pool)[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "short"): "10"},
+        observation_version="obs-other", demand_version="demand-other", lease_ms=60_000, now_ms=now_ms,
+    )
+    assert other_result.status == "granted"
+
+    result = _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+    assert result is not None
+    assert "job_id" in result  # race 落敗換掉 codex，claude 的獨立池成功 bind
+    job = registry.get_job(result["job_id"])
+    assert job["executor"] == "claude"
+
+    decision_id = quota_admission.decision_id_for(
+        run_id=run.run_id, card_id=step.card, attempt_id=f"{run.run_id}:{step.card}:n0", profile_key=claude_key,
+    )
+    decision = ctx.store.get(decision_id)
+    assert decision is not None
+    assert decision.mode == "enforced"
+    assert decision.reservation_id is not None
+    assert len(decision.excluded) == 1
+    assert decision.excluded[0]["executor"] == "codex"
+    assert decision.excluded[0]["exclusion_reason"] == "reservation-denied"
+    status = ctx.authority.status(decision.reservation_id, now_ms=now_ms + 1)
+    assert status.state == "bound"
+    assert status.job_id == result["job_id"]

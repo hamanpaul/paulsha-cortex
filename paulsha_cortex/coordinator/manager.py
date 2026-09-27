@@ -11440,6 +11440,194 @@ def _quota_admission_stop(registry, run, step, *, attempts: Sequence[Mapping[str
     }
 
 
+def _quota_admission_config_invalid_stop(registry, run, step, *, detail: str):
+    """production 接線 a：operator quota-pools 設定檔存在但無效，且 opt-in
+    enforce 已開——zero job，回精確 `quota-config-invalid` 等待理由（#830
+    非 Job 決策契約，比照 `_quota_admission_stop`／`_workflow_execution_profile_stop`
+    的 fail-closed 形狀，但用獨立的理由字串，不與『額度不足』混用）。"""
+    updated = registry._manager_update_workflow_run(
+        run.run_id,
+        facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+        needs_human_reason=diagnostic_reason(
+            "quota-config-invalid",
+            f"operator quota-pools 設定檔存在但無效，opt-in enforce 已開，"
+            f"fail closed 暫停派工：{detail}",
+            source="manager._dispatch_workflow_card:quota-admission-config",
+            run_id=run.run_id,
+            work_id=run.work_id,
+            card=step.card,
+        ),
+    )
+    return {
+        "run_id": updated.run_id,
+        "current_phase": updated.current_phase,
+        "reason": "quota-config-invalid",
+    }
+
+
+def _quota_admission_job_lookup(registry, job_id: str) -> Mapping[str, object] | None:
+    """`quota_admission.reconcile_bound_reservations` 的 ``job_lookup``——
+    包一層把 registry 查無時的例外轉成 ``None``（該函式的既有契約：查不到
+    就是 ``None``，一律不假設已終止）。"""
+    try:
+        return registry.get_job(job_id)
+    except KeyError:
+        return None
+
+
+def _quota_admission_job_lookup_by_attempt(
+    registry, run_id: str, card_id: str, attempt_id: str
+) -> Mapping[str, object] | None:
+    """`quota_admission.reconcile_reserved_reservations` 的
+    ``job_lookup_by_attempt``——``reserved``（尚未 ``bind()``）狀態下拿不到
+    ``job_id``，只能反過來依 :func:`_quota_admission_attempt_id` 的計數規則
+    找出對應建立的 job：``attempt_id`` 格式為 ``f"{run_id}:{card_id}:n{prior}"``，
+    ``prior`` 既是判定該 attempt 當下、registry 裡已存在的同 run/card job 數，
+    也同時是這個 attempt 建立出來的 job 在『該 run/card 全部 job，依建立順序』
+    中的 0-based 索引（``registry.list_jobs()`` 依 append 順序回傳，見
+    ``JobRegistry.create_job``／``list_jobs``）。
+
+    格式不符、索引超出範圍（該 attempt 從未真正建出 job，或已被更晚的
+    attempt 覆蓋計數）一律回 ``None``——由呼叫端依 lease 是否過期決定是否
+    安全釋放，本函式不猜測。"""
+    prefix = f"{run_id}:{card_id}:n"
+    if not attempt_id.startswith(prefix):
+        return None
+    suffix = attempt_id[len(prefix):]
+    if not suffix.isdigit():
+        return None
+    ordinal = int(suffix)
+    matching = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run_id and job.get("workflow_card") == card_id
+    ]
+    if ordinal >= len(matching):
+        return None
+    return matching[ordinal]
+
+
+def _quota_admission_job_terminal_outcome(job: Mapping[str, object]) -> str | None:
+    """`quota_admission` 兩支 reconcile 掃描共用的 ``job_outcome``——把既有
+    registry job 的 ``status``／``exit_code`` 投影成
+    ``succeeded``／``failed``／``None``（仍在跑）。registry 本身沒有
+    ``cancelled`` 狀態（見 ``registry.VALID_JOB_STATUSES``），因此這裡永遠
+    不回它；quota_admission 端仍接受這個值是給其他未來 producer 用的。"""
+    status = job.get("status")
+    if status not in ("exited", "failed"):
+        return None
+    if status == "failed":
+        return "failed"
+    return "succeeded" if job.get("exit_code") == 0 else "failed"
+
+
+def _quota_admission_job_view_for_terminal_usage(job: Mapping[str, object]) -> dict[str, object]:
+    """把 registry job 記錄轉成 `quota_shadow.QuotaShadowService.record_terminal_usage`
+    期待的形狀（該函式沿用 #836 既有 fixture 慣例，欄位名與 registry 不同：
+    ``id`` 不是 ``job_id``、``finished_at`` 不是 ``exited_at``）。"""
+    return {
+        "id": job.get("job_id"),
+        "executor": job.get("executor"),
+        "usage": job.get("usage"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("exited_at"),
+    }
+
+
+def _quota_admission_record_terminal_usage(
+    quota_ctx, *, decision, job: Mapping[str, object], now_ms: int
+) -> None:
+    """`quota_admission.reconcile_bound_reservations(on_settled=...)` 的
+    callback：job 終局時，若這個 decision 的 profile_key 在某個已知 binding
+    上『可解析』（``binding_status`` 為 ``complete`` 且該 binding 確實涵蓋
+    這個 profile），就記一筆終局 usage；不可解析（unmanaged／不完整
+    binding）時安靜略過，不擋容量釋放（釋放已經由呼叫端完成）。
+
+    逐一嘗試 ``quota_ctx.bindings`` 而不先自行判斷『這個 binding 是否匹配
+    這個 profile』——``record_terminal_usage`` 本身已經對不匹配／不完整的
+    binding 回報 ``invalid``（無副作用），不必在這裡重新實作一次 #836 的
+    binding subject 比對規則（#839 契約邊界：不重驗、只消費）。"""
+    from . import quota_admission
+
+    profile_key = decision.profile_key
+    pool_windows = quota_admission.pools_for_profile(profile_key, bindings=quota_ctx.bindings)
+    if not pool_windows:
+        return  # 這個 profile 不受額度管理，沒有任何 binding 可解析。
+    job_view = _quota_admission_job_view_for_terminal_usage(job)
+    for binding in quota_ctx.bindings:
+        quota_ctx.shadow.record_terminal_usage(
+            job_view,
+            profile_key=profile_key,
+            binding=binding,
+            descriptors=quota_ctx.descriptors,
+            unit_catalog=quota_ctx.unit_catalog,
+            unit_ref_by_metric=dict(quota_ctx.usage_unit_refs or {}),
+            observed_at_ms=now_ms,
+        )
+
+
+def reconcile_quota_admission_reservations(
+    *, registry, quota_admission_context, now_ms: int | None = None,
+) -> dict[str, object]:
+    """#839 production 接線 c：periodic tick 呼叫的 reserved／bound 收斂掃描。
+
+    `quota_admission_context` 缺席（部署尚未接上 #839）時完全 no-op，回傳
+    ``{"wired": False}``——與整條線『沒接上』時的既有保守預設一致（見
+    `quota_admission.DispatchContext` 文件字串）。有接上時依序：
+
+    1. `quota_admission.reconcile_reserved_reservations`——收斂
+       `create_job()` 之後、`bind()` 之前 crash 留下的無 job_id reservation
+       （對抗審查 MAJOR manager.py:13981）。
+    2. `quota_admission.reconcile_bound_reservations`——收斂已經 `bind()`
+       過的 reservation；job 進終局時同時透過 `on_settled` 呼叫
+       `_quota_admission_record_terminal_usage` 記消耗（票面 c：「成功／
+       失敗都記消耗；infra／429 失敗不得寫成品質失敗」——這裡只記錄額度
+       usage，不對 job 的品質分類做任何判斷，那是既有
+       `provider_outcome.classify_launch_failure` 的責任）。
+
+    這支函式本身不是新的 dispatch producer，不塞進 #830 的 Job／decision
+    契約——它只操作既有 reservation／decision receipt 的收斂狀態，回傳值
+    純粹是給 daemon summary／log 用的診斷投影。
+    """
+    if quota_admission_context is None:
+        return {"wired": False}
+    from . import quota_admission
+
+    resolved_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    reserved_outcomes = quota_admission.reconcile_reserved_reservations(
+        authority=quota_admission_context.authority,
+        store=quota_admission_context.store,
+        job_lookup_by_attempt=lambda run_id, card_id, attempt_id: _quota_admission_job_lookup_by_attempt(
+            registry, run_id, card_id, attempt_id
+        ),
+        job_outcome=_quota_admission_job_terminal_outcome,
+        now_ms=resolved_now_ms,
+        renew_lease_ms=quota_admission_context.lease_ms,
+    )
+    bound_outcomes = quota_admission.reconcile_bound_reservations(
+        authority=quota_admission_context.authority,
+        store=quota_admission_context.store,
+        job_lookup=lambda job_id: _quota_admission_job_lookup(registry, job_id),
+        job_outcome=_quota_admission_job_terminal_outcome,
+        now_ms=resolved_now_ms,
+        renew_lease_ms=quota_admission_context.lease_ms,
+        on_settled=lambda decision, job: _quota_admission_record_terminal_usage(
+            quota_admission_context, decision=decision, job=job, now_ms=resolved_now_ms,
+        ),
+    )
+    return {
+        "wired": True,
+        "reserved": [
+            {"decision_id": o.decision_id, "reservation_id": o.reservation_id, "action": o.action, "detail": o.detail}
+            for o in reserved_outcomes
+        ],
+        "bound": [
+            {"decision_id": o.decision_id, "reservation_id": o.reservation_id, "action": o.action, "detail": o.detail}
+            for o in bound_outcomes
+        ],
+    }
+
+
 _LEGACY_CARD_EXECUTION = {
     "worktree-isolation": (
         "superpowers:using-git-worktrees",
@@ -13107,6 +13295,17 @@ def _dispatch_workflow_card(
         return None
     if force_new_card and RETRY_CARD_PHASE_PERSONA.get(step.phase) != step.persona:
         raise ValueError("forced workflow retry requires builder or reviewer card")
+    if quota_admission_context is not None:
+        from . import quota_admission
+
+        if isinstance(quota_admission_context, quota_admission.QuotaConfigInvalid):
+            # production 接線 a：operator quota-pools 設定檔存在但無效，且
+            # opt-in enforce 已開——在建立任何 job／worktree 之前 fail closed，
+            # 不重用 `_quota_admission_stop`（那支的訊息語意是「額度不足」，
+            # 這裡是「設定本身不可信」，兩者不該共用同一個等待理由字串）。
+            return _quota_admission_config_invalid_stop(
+                registry, run, step, detail=quota_admission_context.reason
+            )
     admission_stop = _builder_todo_admission_stop(
         registry=registry,
         run=run,
@@ -13477,6 +13676,9 @@ def _dispatch_workflow_card(
         )
     quota_selected_assessment = None
     quota_selected_demand_version = None
+    quota_reservation_handle: dict[str, object] | None = None
+    quota_attempt_id: str | None = None
+    quota_decision_id: str | None = None
     quota_now_ms = int(time.time() * 1000)
     while True:
         # #839：opt-in enforce 下，額度不可行的候選會被排除、再重選——`gate`
@@ -13602,12 +13804,66 @@ def _dispatch_workflow_card(
                 "exclusion_reason": quota_assessment.exclusion_reason,
             }
         )
-        if quota_assessment.feasible or not quota_admission_enforced:
-            # shadow 模式：無論可不可行都繼續（只記錄，不改既有派工結果）。
-            # enforce 模式：可行才繼續。
-            quota_selected_assessment = quota_assessment
-            quota_selected_demand_version = quota_demand_version
+        if not (quota_assessment.feasible or not quota_admission_enforced):
+            # enforce 模式下這個候選額度評估不可行——排除、依既有排序對下一個
+            # 候選重試。
+            if forced_gate is not None or forced_identity is not None:
+                # provider-failure reroute 的既有單一候選語意：那條路徑已經是別的
+                # 機制核可的替代候選，不在這裡繼續往下換第三個候選。
+                return _quota_admission_stop(registry, run, step, attempts=quota_admission_attempts)
+            excluded_quota_identities.add((identity.executor, identity.model_id))
+            continue
+        # shadow 模式：無論可不可行都繼續（只記錄，不改既有派工結果）。
+        # enforce 模式：到這裡代表額度評估已判定可行。
+        quota_selected_assessment = quota_assessment
+        quota_selected_demand_version = quota_demand_version
+        # attempt_id／decision_id 一旦選中這個候選就固定下來——不論後面是否
+        # 真的需要原子預留（shadow／不受額度管理的候選也要用它們寫 receipt）。
+        quota_attempt_id = _quota_admission_attempt_id(registry, run, step)
+        quota_decision_id = quota_admission.decision_id_for(
+            run_id=run.run_id, card_id=step.card, attempt_id=quota_attempt_id,
+            profile_key=profile_binding.resolved_key,
+        )
+        if not (quota_admission_enforced and quota_assessment.feasible and quota_assessment.pools):
+            # shadow 模式，或候選不受額度管理（無綁定 pool）——不需要原子預留。
             break
+        # #839 對抗審查修復（MAJOR manager.py:13643）：原子預留必須在**選中
+        # 這個候選的當下**立刻嘗試，不能等回到迴圈外才發現搶不到——舊實作在
+        # 迴圈外才呼叫 reserve_for_candidate()，race 落敗時直接回
+        # quota-admission-insufficient，完全跳過既有排序中其餘尚未排除的
+        # 候選。這裡把「排名第一的可行候選原子預留 race 落敗」視為跟「額度
+        # 評估不可行」同一類事件：排除該候選、依既有排序重選下一個——有界
+        # （`excluded_quota_identities` 單調變大，`quota_loop_candidates` 終將
+        # 耗盡並在下一輪迴圈頂端回 `_quota_admission_stop`）、每次只替『目前
+        # 選中』的候選預留，不留半張 grant（reserve() 失敗不會留下任何容量）。
+        quota_now_ms = int(time.time() * 1000)
+        reservation_result = quota_admission.reserve_for_candidate(
+            quota_admission_context.authority,
+            run_id=run.run_id, card_id=step.card, decision_id=quota_decision_id,
+            attempt_id=quota_attempt_id, assessment=quota_assessment,
+            observation_version=quota_admission.observation_fingerprint(quota_assessment),
+            demand_version=quota_demand_version,
+            lease_ms=quota_admission_context.lease_ms, now_ms=quota_now_ms,
+        )
+        if reservation_result.status in ("granted", "duplicate"):
+            quota_reservation_handle = {
+                "reservation_id": reservation_result.reservation_id,
+                "owner_token": reservation_result.owner_token,
+                "sequence": reservation_result.sequence,
+                "attempt_id": quota_attempt_id,
+            }
+            break
+        # race 落敗（denied）或呼叫本身不合法（invalid）：這個候選剛剛還可行，
+        # 現在搶不到——排除、換下一個既有排序候選重試；沒有其他候選時最終在
+        # 迴圈頂端回精確 wait，不造假 job、不留半額度。
+        quota_admission_attempts[-1] = {
+            **quota_admission_attempts[-1],
+            "exclusion_reason": f"reservation-{reservation_result.status}",
+        }
+        quota_selected_assessment = None
+        quota_selected_demand_version = None
+        quota_attempt_id = None
+        quota_decision_id = None
         if forced_gate is not None or forced_identity is not None:
             # provider-failure reroute 的既有單一候選語意：那條路徑已經是別的
             # 機制核可的替代候選，不在這裡繼續往下換第三個候選。
@@ -13623,48 +13879,15 @@ def _dispatch_workflow_card(
         identities,
         execution_profile_binding=profile_binding,
     )
-    quota_reservation_handle: dict[str, object] | None = None
     if quota_admission_context is not None and quota_selected_assessment is not None:
         from . import quota_admission
 
-        quota_attempt_id = _quota_admission_attempt_id(registry, run, step)
-        quota_decision_id = quota_admission.decision_id_for(
-            run_id=run.run_id, card_id=step.card, attempt_id=quota_attempt_id,
-            profile_key=profile_binding.resolved_key,
-        )
+        # #839 對抗審查修復：原子預留已經在上面的候選迴圈裡、選中這個候選的
+        # 當下就嘗試過（見迴圈內註解）——`quota_attempt_id`／`quota_decision_id`／
+        # `quota_reservation_handle` 都是那個成功迭代留下的值，這裡不重算、不
+        # 重新呼叫 reserve_for_candidate()，只負責把已經確定的結果寫成 receipt。
         quota_mode = "enforced" if quota_admission_enforced else "shadow"
         quota_observation_version = quota_admission.observation_fingerprint(quota_selected_assessment)
-        reservation_id = None
-        if (
-            quota_admission_enforced
-            and quota_selected_assessment.feasible
-            and quota_selected_assessment.pools
-        ):
-            reservation_result = quota_admission.reserve_for_candidate(
-                quota_admission_context.authority,
-                run_id=run.run_id, card_id=step.card, decision_id=quota_decision_id,
-                attempt_id=quota_attempt_id, assessment=quota_selected_assessment,
-                observation_version=quota_observation_version,
-                demand_version=quota_selected_demand_version,
-                lease_ms=quota_admission_context.lease_ms, now_ms=quota_now_ms,
-            )
-            if reservation_result.status not in ("granted", "duplicate"):
-                # race 落敗（denied）或呼叫本身不合法（invalid）：這個候選剛
-                # 剛還可行，現在搶不到——回精確 wait，不造假 job、不留半額度。
-                quota_admission_attempts.append(
-                    {
-                        "executor": identity.executor, "model_id": identity.model_id,
-                        "exclusion_reason": f"reservation-{reservation_result.status}",
-                    }
-                )
-                return _quota_admission_stop(registry, run, step, attempts=quota_admission_attempts)
-            reservation_id = reservation_result.reservation_id
-            quota_reservation_handle = {
-                "reservation_id": reservation_result.reservation_id,
-                "owner_token": reservation_result.owner_token,
-                "sequence": reservation_result.sequence,
-                "attempt_id": quota_attempt_id,
-            }
         quota_decision = quota_admission.AdmissionDecision(
             decision_id=quota_decision_id, run_id=run.run_id, card_id=step.card,
             attempt_id=quota_attempt_id, profile_key=profile_binding.resolved_key,
@@ -13679,9 +13902,13 @@ def _dispatch_workflow_card(
                 "model_id": identity.model_id,
                 "independence_domain": getattr(identity, "independence_domain", "unknown"),
             },
-            reservation_id=reservation_id,
-            # 排除掉的候選（額度 fallback 換過的那些）——最後一筆是本次選中的
-            # 候選自己，不算「被排除」。
+            reservation_id=(
+                quota_reservation_handle["reservation_id"]
+                if quota_reservation_handle is not None
+                else None
+            ),
+            # 排除掉的候選（額度評估不可行、或原子預留 race 落敗被換掉的那些）
+            # ——最後一筆是本次選中的候選自己，不算「被排除」。
             excluded=tuple(quota_admission_attempts[:-1]),
         )
         quota_admission_context.store.record(quota_decision)

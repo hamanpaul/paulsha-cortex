@@ -80,8 +80,15 @@ __all__ = [
     "settle_reservation_after_spawn_failure",
     "release_reservation_before_spawn",
     "reconcile_bound_reservations",
+    "reconcile_reserved_reservations",
     "ReconcileOutcome",
     "DispatchContext",
+    "QuotaConfigInvalid",
+    "QuotaPoolsConfigError",
+    "QuotaPoolsConfig",
+    "parse_quota_pools_config",
+    "load_quota_pools_config",
+    "QUOTA_POOLS_CONFIG_SCHEMA",
 ]
 
 #: decision receipt 上釘住的准入政策版本；改變准入邏輯本身（不是 demand／
@@ -116,6 +123,22 @@ def quota_admission_enabled(environment: Mapping[str, str] | None = None) -> boo
 
 
 @dataclass(frozen=True)
+class QuotaConfigInvalid:
+    """production 接線 a：operator quota-pools 設定檔存在但無效，且 opt-in
+    enforce（``PSC_QUOTA_ADMISSION_ENFORCE=on``）已開時，``manager_daemon``
+    傳給 ``quota_admission_context`` 的訊號物件——**不是** :class:`DispatchContext`。
+
+    ``manager._dispatch_workflow_card`` 認得這個型別，在建立任何 job／
+    worktree 之前就直接 fail closed，回精確的 ``quota-config-invalid`` 等待
+    理由（零 job、零假 job_id）。shadow 模式（enforce 未開）下設定檔無效時
+    **不會**用到這個類別——那種情況呼叫端應記錄錯誤後改傳 ``None``，維持
+    『整條線沒接上』的既有保守行為，不是傳這個訊號物件。
+    """
+
+    reason: str
+
+
+@dataclass(frozen=True)
 class DispatchContext:
     """manager.py 派工路徑接線用的一次性打包——沒有它時完全 no-op。
 
@@ -137,6 +160,12 @@ class DispatchContext:
     bindings: tuple[schema.ProfilePoolBinding, ...]
     lease_ms: int = 900_000
     environment: Mapping[str, str] | None = None
+    #: #837 forecast 落地前，operator 設定檔選填的『終局 usage metric → unit
+    #: ref』對照（見 :func:`parse_quota_pools_config`），給periodic tick 收斂
+    #: 終局 job 時呼叫 ``QuotaShadowService.record_terminal_usage`` 用；缺席
+    #: 時一律回空字典，行為與完全不呼叫 record_terminal_usage 相同（fail
+    #: soft，不擋容量釋放）。
+    usage_unit_refs: Mapping[str, tuple[str, str]] = field(default_factory=dict)
 
 
 def _pool_key(pool_ref: Mapping[str, str]) -> tuple[str, str, str, str]:
@@ -147,6 +176,23 @@ def _canonical_bytes(value: object) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
+
+
+def _fsync_directory(path: Path) -> None:
+    """比照 #838 ``quota_reservation._fsync_directory`` 逐字複製——兩個模組
+    刻意各自獨立成檔（見模組 docstring），因此各自持有一份小寫的目錄
+    fsync helper，不互相 import 對方的內部函式。"""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        dir_fd = os.open(path, flags)
+    except OSError as exc:
+        raise AdmissionDecisionCorrupt("admission-decision-store-dir-fsync-failed") from exc
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        raise AdmissionDecisionCorrupt("admission-decision-store-dir-fsync-failed") from exc
+    finally:
+        os.close(dir_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -657,14 +703,7 @@ class AdmissionDecisionStore:
 
     def record(self, decision: AdmissionDecision) -> AdmissionDecision:
         row = decision.to_row()
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._check_parent()
-        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            fd = os.open(self.path, flags, 0o600)
-        except OSError as exc:
-            raise AdmissionDecisionCorrupt("admission-decision-store-open-failed") from exc
+        fd = self._open_for_append()
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             info = os.fstat(fd)
@@ -691,6 +730,34 @@ class AdmissionDecisionStore:
             return decision
         finally:
             os.close(fd)
+
+    def _open_for_append(self) -> int:
+        """開啟（必要時建立）store 供寫入。
+
+        比照 #838 ``quota_reservation._open_for_append`` 的硬化模式：不以
+        ``exists()`` 判斷「是不是我建立的」——前一個呼叫者可能在 ``O_CREAT``
+        後、目錄 fsync 前崩潰，後續呼叫者看到檔案已存在就會誤以為不需要補
+        fsync。每次寫入前都 fsync 父目錄與其上層，確保這筆 decision receipt
+        的 dirent 在崩潰後仍然存在，重啟不會因為看到空 store 而重放出第二份
+        不同內容的 decision（對抗審查第四輪 MAJOR：舊實作只 fsync 檔案本身，
+        沒有 fsync 目錄）。
+        """
+        parent = self.path.parent
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._check_parent()
+        flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except OSError as exc:
+            raise AdmissionDecisionCorrupt("admission-decision-store-open-failed") from exc
+        try:
+            _fsync_directory(parent.parent)
+            _fsync_directory(parent)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
 
     def get(self, decision_id: str) -> AdmissionDecision | None:
         for row in self._read():
@@ -803,8 +870,17 @@ def reconcile_bound_reservations(
     job_outcome: Callable[[Mapping[str, Any]], str | None],
     now_ms: int,
     renew_lease_ms: int | None = None,
+    on_settled: Callable[[AdmissionDecision, Mapping[str, Any]], None] | None = None,
 ) -> tuple[ReconcileOutcome, ...]:
     """掃描曾經 enforced-admit 的決策，把 ``bound`` reservation 導向終局。
+
+    ``on_settled``（選填）在某筆 ``bound`` reservation 因為 job 終局被收斂成
+    ``settled``（見下方 ``action="settled"`` 分支）時，以 ``(decision, job)``
+    呼叫一次——供呼叫端（例如 ``manager_daemon``）在同一次觀察到終局時，
+    順手呼叫 ``QuotaShadowService.record_terminal_usage`` 記消耗，不必另外
+    重查一次 job／reservation。呼叫失敗（拋例外）不影響本函式已經完成的
+    reconcile 決定——額度容量的釋放與 usage 記錄是兩個獨立的失效面，usage
+    記錄失敗不該讓已經正確收斂的容量釋放結果跳回一半。
 
     - job 找到且 ``job_outcome`` 給出確定終局（``succeeded``／``failed``／
       ``cancelled``）→ ``settle()``。
@@ -881,4 +957,256 @@ def reconcile_bound_reservations(
             ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
                               action="settled", detail=f"confirmed-terminated:{result.status}")
         )
+        if on_settled is not None:
+            try:
+                on_settled(decision, job)
+            except Exception:  # noqa: BLE001 - usage 記錄失敗不得回滾已完成的容量釋放
+                pass
     return outcomes
+
+
+def reconcile_reserved_reservations(
+    *,
+    authority: QuotaReservationAuthority,
+    store: AdmissionDecisionStore,
+    job_lookup_by_attempt: Callable[[str, str, str], Mapping[str, Any] | None],
+    job_outcome: Callable[[Mapping[str, Any]], str | None],
+    now_ms: int,
+    renew_lease_ms: int | None = None,
+) -> tuple[ReconcileOutcome, ...]:
+    """掃描曾經 enforced-admit 的決策，把卡在 ``reserved``（``create_job()``
+    耐久寫入後、``bind()`` 之前 crash）的 reservation 導向安全的終局或維持。
+
+    #838 協定是 reserve → 建 job 記錄 → bind(job_id) → 才 spawn；因此
+    ``reserved`` 狀態下這筆 reservation **恆不可能有活著的 job 在跑**——但
+    仍必須以 registry 事實判定，不能只憑 lease 過期臆測（原票 AC）：
+
+    - ``job_lookup_by_attempt(run_id, card_id, attempt_id)`` 找到對應建立的
+      job（crash 發生在 ``create_job()`` 之後、``bind()`` 之前）：
+      - job 已終局 → 以 ``reconcile(confirmed-terminated)`` 收斂（`bind()`／
+        `settle()` 都需要原 owner 的 ``owner_token``，restart 後的 sweep
+        拿不到，見 ``reconcile_bound_reservations`` 同一個理由）。
+      - job 仍非終局（正常情況——crash 窗口內的 job 從未真正 spawn，只是
+        一筆 inert 的 registry 記錄）→ ``reconcile(confirmed-alive)`` 續
+        lease，避免它只因為 lease 過期就被下一輪誤判成可回收。
+    - 查無對應 job：
+      - lease 已過期 → ``reconcile(confirmed-terminated)`` 收斂釋放容量，
+        evidence 標記 ``recovered-unbound``（呼叫端等同「release」語意，但
+        走 ``reconcile()``——sweep 沒有原 owner 的 ``owner_token``，
+        ``release()`` 一樣需要它）。
+      - lease 未過期 → 不動（可能是 ``create_job()`` 還在進行中，尚未
+        寫入 registry）。
+    - ``job_lookup_by_attempt`` 查詢本身失敗（拋例外）→ 一律不動，不得因為
+      查詢失敗就當作『查無此 job』而釋放容量。
+
+    與 :func:`reconcile_bound_reservations` 分成兩支函式：``reserved`` 沒有
+    ``job_id`` 可用，查找方式（依 ``attempt_id`` 的 ordinal 反查 registry）
+    與 ``bound``（直接用 ``status.job_id``）完全不同，呼叫端提供的 callback
+    形狀因此也不同，合併成一支只會讓兩種語意互相混淆。
+    """
+    outcomes: list[ReconcileOutcome] = []
+    for decision in store.enforced_admitted():
+        reservation_id = decision.reservation_id
+        if not reservation_id:
+            continue
+        status = authority.status(reservation_id, now_ms=now_ms)
+        if status is None or status.state != "reserved":
+            continue
+        try:
+            job = job_lookup_by_attempt(decision.run_id, decision.card_id, decision.attempt_id)
+        except Exception:  # noqa: BLE001 - 查詢失敗一律不動，不得誤判成『查無』而釋放
+            outcomes.append(
+                ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                                  action="skipped", detail="job-lookup-failed")
+            )
+            continue
+        if job is None:
+            if status.lease_expires_at_ms > now_ms:
+                # lease 未過期——可能是 create_job() 仍在進行中，不動。
+                outcomes.append(
+                    ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                                      action="skipped", detail="lease-not-expired")
+                )
+                continue
+            result = authority.reconcile(
+                reservation_id=reservation_id,
+                evidence={"kind": "reserved-unbound-lease-expired", "reason": "recovered-unbound"},
+                resolution="confirmed-terminated",
+                expected_sequence=status.sequence,
+                now_ms=now_ms,
+            )
+            outcomes.append(
+                ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                                  action="settled", detail=f"recovered-unbound:{result.status}")
+            )
+            continue
+        outcome = job_outcome(job)
+        if outcome in ("succeeded", "failed", "cancelled"):
+            # 防禦性分支：協定上 reserved 不該有終局 job（spawn 一定在 bind
+            # 之後），但仍依 registry 事實而非協定假設判定。
+            result = authority.reconcile(
+                reservation_id=reservation_id,
+                evidence={"kind": "job-registry-terminal-unbound", "job_outcome": outcome},
+                resolution="confirmed-terminated",
+                expected_sequence=status.sequence,
+                now_ms=now_ms,
+            )
+            outcomes.append(
+                ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                                  action="settled", detail=f"confirmed-terminated:{result.status}")
+            )
+            continue
+        # job 找到但非終局（正常情況——crash 窗口內從未真正 spawn 過）：
+        # 續 lease，維持 reserved，不釋放容量。
+        result = authority.reconcile(
+            reservation_id=reservation_id,
+            evidence={"kind": "job-registry-lookup-alive-unbound"},
+            resolution="confirmed-alive",
+            expected_sequence=status.sequence,
+            now_ms=now_ms,
+            renew_lease_ms=renew_lease_ms,
+        )
+        outcomes.append(
+            ReconcileOutcome(decision_id=decision.decision_id, reservation_id=reservation_id,
+                              action="reconciled", detail=f"confirmed-alive:{result.status}")
+        )
+    return outcomes
+
+
+# ---------------------------------------------------------------------------
+# operator-owned quota-pools 設定檔（schema ``cortex/quota-pools/v1``）——
+# production 接線：manager_daemon 讀這份檔案建構 DispatchContext，本模組只
+# 消費 #836 既有的 parse_pool_descriptor／parse_unit_definition／parse_binding
+# 驗證，不自寫第二套 schema 驗證。
+# ---------------------------------------------------------------------------
+
+QUOTA_POOLS_CONFIG_SCHEMA = "cortex/quota-pools/v1"
+
+_QUOTA_POOLS_CONFIG_REQUIRED_KEYS = frozenset(
+    {"schema", "config_revision", "descriptors", "unit_catalog", "bindings"}
+)
+_QUOTA_POOLS_CONFIG_OPTIONAL_KEYS = frozenset({"lease_ms", "usage_unit_refs"})
+_QUOTA_POOLS_CONFIG_ALL_KEYS = _QUOTA_POOLS_CONFIG_REQUIRED_KEYS | _QUOTA_POOLS_CONFIG_OPTIONAL_KEYS
+_MAX_LEASE_MS_CONFIG = 31_622_400_000  # 一年——單純防呆上限，比照 #838 的常數
+
+
+class QuotaPoolsConfigError(ValueError):
+    """quota-pools 設定檔結構或內容不合法——呼叫端 fail closed（見票面 a）。"""
+
+
+@dataclass(frozen=True)
+class QuotaPoolsConfig:
+    """:func:`load_quota_pools_config` 的回傳型——已驗證、可直接餵進
+    :class:`DispatchContext` 的內容。"""
+
+    config_revision: str
+    descriptors: tuple[schema.PoolDescriptor, ...]
+    unit_catalog: tuple[schema.UnitDefinition, ...]
+    bindings: tuple[schema.ProfilePoolBinding, ...]
+    lease_ms: int
+    usage_unit_refs: Mapping[str, tuple[str, str]]
+
+
+def parse_quota_pools_config(payload: object) -> QuotaPoolsConfig:
+    """驗證並解析一份 ``cortex/quota-pools/v1`` 設定檔的已解碼 JSON 內容。
+
+    完全重用 #836 ``quota_observation`` 的 ``parse_pool_descriptor``／
+    ``parse_unit_definition``／``parse_binding``——本函式只負責這份設定檔
+    自己的外層 envelope（``schema``／``config_revision``／選填欄位），不重
+    寫任何 pool／unit／binding 的形狀驗證。任何一步失敗都 fail closed，拋
+    :class:`QuotaPoolsConfigError`（呼叫端據此決定 shadow 降級記錄或
+    enforce 下的 ``quota-config-invalid``）。
+    """
+    if not isinstance(payload, Mapping):
+        raise QuotaPoolsConfigError("quota-pools-config-not-a-mapping")
+    keys = set(payload)
+    if not _QUOTA_POOLS_CONFIG_REQUIRED_KEYS.issubset(keys):
+        raise QuotaPoolsConfigError("quota-pools-config-missing-required-key")
+    if not keys.issubset(_QUOTA_POOLS_CONFIG_ALL_KEYS):
+        raise QuotaPoolsConfigError("quota-pools-config-unknown-key")
+    if payload.get("schema") != QUOTA_POOLS_CONFIG_SCHEMA:
+        raise QuotaPoolsConfigError("quota-pools-config-unknown-schema")
+    config_revision = payload.get("config_revision")
+    if not isinstance(config_revision, str) or not config_revision:
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-config-revision")
+
+    raw_unit_catalog = payload.get("unit_catalog")
+    if not isinstance(raw_unit_catalog, list):
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-unit-catalog")
+    try:
+        unit_catalog = tuple(schema.parse_unit_definition(item) for item in raw_unit_catalog)
+    except (schema.QuotaContractError, TypeError, ValueError) as exc:
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-unit-definition") from exc
+
+    raw_descriptors = payload.get("descriptors")
+    if not isinstance(raw_descriptors, list) or not raw_descriptors:
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-descriptors")
+    try:
+        descriptors = tuple(schema.parse_pool_descriptor(item) for item in raw_descriptors)
+    except (schema.QuotaContractError, TypeError, ValueError) as exc:
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-pool-descriptor") from exc
+
+    raw_bindings = payload.get("bindings")
+    if not isinstance(raw_bindings, list) or not raw_bindings:
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-bindings")
+    try:
+        bindings = tuple(
+            schema.parse_binding(item, descriptors=descriptors) for item in raw_bindings
+        )
+    except (schema.QuotaContractError, TypeError, ValueError) as exc:
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-binding") from exc
+
+    lease_ms = payload.get("lease_ms", 900_000)
+    if type(lease_ms) is not int or lease_ms <= 0 or lease_ms > _MAX_LEASE_MS_CONFIG:
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-lease-ms")
+
+    raw_usage_unit_refs = payload.get("usage_unit_refs", {})
+    if not isinstance(raw_usage_unit_refs, dict):
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-usage-unit-refs")
+    usage_unit_refs: dict[str, tuple[str, str]] = {}
+    for metric, ref in raw_usage_unit_refs.items():
+        if (
+            not isinstance(metric, str) or not metric
+            or not isinstance(ref, list) or len(ref) != 2
+            or not all(isinstance(part, str) and part for part in ref)
+        ):
+            raise QuotaPoolsConfigError("quota-pools-config-invalid-usage-unit-ref-entry")
+        usage_unit_refs[metric] = (ref[0], ref[1])
+
+    return QuotaPoolsConfig(
+        config_revision=config_revision,
+        descriptors=descriptors,
+        unit_catalog=unit_catalog,
+        bindings=bindings,
+        lease_ms=lease_ms,
+        usage_unit_refs=usage_unit_refs,
+    )
+
+
+def load_quota_pools_config(path: str | Path | None = None) -> QuotaPoolsConfig | None:
+    """讀取並解析 operator-owned quota-pools 設定檔。
+
+    ``path`` 缺省時讀 :func:`paulsha_cortex.config.paths.quota_pools_config_path`
+    （支援 ``PSC_QUOTA_POOLS_CONFIG`` 覆寫）。**檔案不存在時回 ``None``**——
+    這是唯一「完全不接線」的分支，行為與 #839 落地前逐字相同（見票面 a：
+    「檔案不存在 → context 為 None」）。存在但內容不合法時一律拋
+    :class:`QuotaPoolsConfigError`，不吞例外、不靜默退回 None——shadow／
+    enforce 兩種模式如何降級是呼叫端（``manager_daemon``）的責任，本函式
+    只保證『合法才回傳可用物件，不合法一定讓呼叫端知道』。
+    """
+    if path is None:
+        from paulsha_cortex.config.paths import quota_pools_config_path
+
+        path = quota_pools_config_path()
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise QuotaPoolsConfigError("quota-pools-config-read-failed") from exc
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise QuotaPoolsConfigError("quota-pools-config-invalid-json") from exc
+    return parse_quota_pools_config(payload)
