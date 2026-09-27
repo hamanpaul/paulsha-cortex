@@ -37,8 +37,8 @@ refs:
 
 ## 1. 封存唯一 candidate CLI
 
-先由 release artifact ingress 將 `v0.1.10` 的 install-input archive 與 qualification
-manifest 放到 `/var/lib/cortex-installer/0.1.10/release`。這個 ingress 是前置 authority：
+先由 release artifact ingress 將 `v0.1.11` 的 install-input archive 與 qualification
+manifest 放到 `/var/lib/cortex-installer/0.1.11/release`。這個 ingress 是前置 authority：
 目錄及每一層 ancestor 必須是 root-owned、不可由 group/other 寫入、不可有 symlink。
 不要直接從使用者 checkout、`$HOME` 或 `/tmp` 以 root 執行 candidate code。
 
@@ -58,15 +58,15 @@ PATH=/usr/bin:/bin
 export PATH
 
 cortex_installer_root=/var/lib/cortex-installer
-cortex_bootstrap_root="$cortex_installer_root/0.1.10"
+cortex_bootstrap_root="$cortex_installer_root/0.1.11"
 cortex_release_root="$cortex_bootstrap_root/release"
 cortex_input_root="$cortex_bootstrap_root/input"
-cortex_install_input_archive="$cortex_release_root/paulsha-cortex-0.1.10-install-input.tar.gz"
-cortex_qualification_manifest="$cortex_release_root/paulsha-cortex-0.1.10-qualification.json"
+cortex_install_input_archive="$cortex_release_root/paulsha-cortex-0.1.11-install-input.tar.gz"
+cortex_qualification_manifest="$cortex_release_root/paulsha-cortex-0.1.11-qualification.json"
 cortex_bundle="$cortex_input_root/bundle.json"
 cortex_install_config="$cortex_input_root/install-config.yaml"
 cortex_release_candidate_sha=<40-hex-annotated-tag-target>
-cortex_release_wheel_asset_name=paulsha_cortex-0.1.10-py3-none-any.whl
+cortex_release_wheel_asset_name=paulsha_cortex-0.1.11-py3-none-any.whl
 cortex_release_wheel_asset_sha256=<64-hex-release-wheel-asset-digest>
 cortex_install_input_asset_sha256=<64-hex-release-install-input-asset-digest>
 cortex_qualification_asset_sha256=<64-hex-release-qualification-asset-digest>
@@ -856,7 +856,7 @@ PATH=/usr/bin:/bin
 export PATH
 
 cortex_installer_root=/var/lib/cortex-installer
-cortex_bootstrap_root="$cortex_installer_root/0.1.10"
+cortex_bootstrap_root="$cortex_installer_root/0.1.11"
 cortex_cli="$cortex_bootstrap_root/venv/bin/cortex"
 read -r -p "Re-enter the previously reviewed plan SHA-256: " cortex_confirmed_plan_sha
 test "${#cortex_confirmed_plan_sha}" -eq 64
