@@ -178,6 +178,18 @@ def _probe_units_raw(
         )
         if live is not None and live.get("_malformed_show_output") is True:
             systemd_properties = {**(systemd_properties or {}), "_malformed": True}
+        if (
+            isinstance(systemd_properties, Mapping)
+            and systemd_properties.get("LoadState") == "not-found"
+        ):
+            # systemd 根本沒載入這個 unit（例如 unit 檔已寫入但尚未 daemon-reload，
+            # 或 user manager 裡沒有這個 instance）：`show` 仍回 0，但只給殘缺的
+            # 屬性集合（無 ExecStart／EnvironmentFiles、FragmentPath 為空），
+            # 無法替這個 home 底下的宣告背書。視為 systemd 對這個 unit 不可用、
+            # 走檔案 fallback；不能把殘缺屬性當成「宣告存在但無法解析」的
+            # unknown。bad-setting／error 等宣告本身有問題的狀態不在此列，
+            # 維持 fail closed。
+            systemd_properties = None
         fragment_path = (
             systemd_properties.get("FragmentPath")
             if isinstance(systemd_properties, Mapping)

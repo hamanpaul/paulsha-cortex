@@ -613,6 +613,58 @@ def test_systemctl_effective_dropin_paths_override_user_unit_fragment(
     assert "hidden-systemd-value" not in json.dumps(probe)
 
 
+def test_systemd_not_found_units_fall_back_to_unit_files_not_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CI 回歸：user manager 存在但這個 instance 的 unit 未載入時，
+    `systemctl --user show` 仍回 0，只給殘缺屬性（LoadState=not-found、無
+    ExecStart／EnvironmentFiles、FragmentPath 為空）。這不是「宣告存在但無法
+    解析」的 unknown，必須視為 systemd 不可用、走 unit 檔 fallback；
+    LoadState=bad-setting 這類宣告本身有問題的狀態仍 fail closed。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex import runtime_attestation
+    from paulsha_cortex.porcelain import _runtime_probe
+
+    home = tmp_path / "home"
+    (home / ".config" / "systemd" / "user").mkdir(parents=True)
+
+    def not_found_block(unit: str, load_state: str = "not-found") -> str:
+        return (
+            f"MainPID=0\nEnvironment=\nWorkingDirectory=\nId={unit}\n"
+            f"LoadState={load_state}\nActiveState=inactive\nSubState=dead\n"
+            "FragmentPath=\nDropInPaths=\n"
+        )
+
+    def run_with(show_output: str) -> dict:
+        monkeypatch.setattr(_runtime_probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+        monkeypatch.setattr(
+            _runtime_probe.subprocess, "run",
+            lambda argv, **_kwargs: SimpleNamespace(returncode=0, stdout=show_output),
+        )
+        # 用未經安全投影的原始 rows（含 `systemd` 屬性）判定，否則測試形同空測。
+        return _runtime_probe._probe_units_raw("test", home=home)
+
+    units = run_with(
+        "\n".join(
+            not_found_block(name)
+            for name in ("test-manager.service", "test-manager.timer", "test-monitor.service")
+        )
+    )
+    overlay = runtime_attestation.service_environment_overlay(units, instance="test")
+    assert overlay["manager"]["environment_source"] == "unavailable"
+    assert overlay["monitor"]["environment_source"] == "unavailable"
+
+    units = run_with(
+        "\n".join(
+            not_found_block(name, load_state="bad-setting")
+            for name in ("test-manager.service", "test-manager.timer", "test-monitor.service")
+        )
+    )
+    overlay = runtime_attestation.service_environment_overlay(units, instance="test")
+    assert overlay["manager"]["environment_source"] == "unknown"
+
+
 def test_systemd_environment_pythonpath_locates_the_declared_artifact(
     tmp_path: Path,
 ) -> None:
