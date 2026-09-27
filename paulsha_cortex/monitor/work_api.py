@@ -273,6 +273,14 @@ class WorkReadModelStore:
             git_base = self._candidate_git_base(item.repo, item.work_id)
             if git_base:
                 envelope["candidate_git_base"] = git_base
+            # #840：quota-aware admission 決策與額度等待來源投影。資料源與上面
+            # 三段完全相同（workflow provider 的 observations），欄位名沿用
+            # `decision_projection.project_workflow_quota_admission` 的輸出
+            # 形狀，與 `cortex inspect status` 的 attention 條目共用同一份
+            # 投影函式，避免兩個呈現面各自算出不一致的結果。
+            quota_decision = self._quota_decision(item.repo, item.work_id)
+            if quota_decision:
+                envelope["quota_decision"] = quota_decision
             return envelope
 
     def _candidate_git_base(self, repo: str, work_id: str) -> dict:
@@ -283,6 +291,21 @@ class WorkReadModelStore:
             if not isinstance(observations, Mapping):
                 continue
             rows = observations.get("candidate_git_bases", {})
+            if not isinstance(rows, Mapping):
+                continue
+            found = rows.get(work_id)
+            if isinstance(found, Mapping) and found:
+                return dict(found)
+        return {}
+
+    def _quota_decision(self, repo: str, work_id: str) -> dict:
+        for provider_id, provider in self._snapshot.providers.items():
+            if not provider_id.startswith("workflow:"):
+                continue
+            observations = provider.observations
+            if not isinstance(observations, Mapping):
+                continue
+            rows = observations.get("quota_decisions", {})
             if not isinstance(rows, Mapping):
                 continue
             found = rows.get(work_id)

@@ -278,6 +278,55 @@ def _format_candidate_git_base(payload: object) -> list[str]:
     return lines
 
 
+def _format_quota_decision(payload: object) -> list[str]:
+    """`cortex work show` 的 quota-aware admission 決策區塊（#840）。
+
+    純函式（不 print、不做 I/O），與 `_format_candidate_git_base` 同樣的理由
+    ——好讓測試直接對輸出逐字斷言。缺欄位／legacy Monitor 回傳沒有這一欄時
+    回空清單，維持舊行為。
+    """
+
+    if not isinstance(payload, dict) or not payload:
+        return []
+    lines: list[str] = []
+    wait = payload.get("wait")
+    if isinstance(wait, dict) and wait.get("reason"):
+        lines.append(f"quota_wait: {wait.get('reason')}: {wait.get('detail')}")
+    personas = payload.get("personas")
+    if isinstance(personas, dict):
+        for persona in sorted(personas):
+            decision = personas[persona]
+            if not isinstance(decision, dict):
+                continue
+            lines.append(f"quota_decision[{persona}]:")
+            if decision.get("available") is False:
+                lines.append(
+                    f"  unavailable (stale={decision.get('stale')}, "
+                    f"reason={decision.get('stale_reason') or decision.get('gap_reason')})"
+                )
+                continue
+            lines.append(f"  decision_id: {decision.get('decision_id')}")
+            lines.append(f"  mode: {decision.get('mode')}  outcome: {decision.get('outcome')}")
+            lines.append(
+                f"  resolved_profile_key: {decision.get('resolved_profile_key')}"
+                f"  requested_profile_key: {decision.get('requested_profile_key')}"
+            )
+            classification = decision.get("classification") or {}
+            lines.append(
+                f"  classification: observation={classification.get('observation')} "
+                f"demand={classification.get('demand')}"
+            )
+            lines.append(f"  stale: {decision.get('stale')}")
+            excluded = decision.get("excluded") or []
+            for item in excluded:
+                if isinstance(item, dict):
+                    lines.append(
+                        f"  excluded: {item.get('executor')}/{item.get('model_id')} "
+                        f"({item.get('exclusion_reason')})"
+                    )
+    return lines
+
+
 def _work_read_main(
     args: list[str],
     *,
@@ -405,6 +454,11 @@ def _work_read_main(
         # 來源材料的 sha256（authority digest，64-hex），**與 git base 無關**，
         # 於是 0819 現場它把診斷帶偏了兩次。這裡逐行寫明兩者的分工。
         for line in _format_candidate_git_base(data.get("candidate_git_base")):
+            print(line)
+        # #840：quota-aware admission 決策與額度等待來源。與 `cortex inspect
+        # status` 共用同一份投影，逐行印出與其 `--json` 相同的內容，維持文字
+        # 模式與 JSON 模式一致。
+        for line in _format_quota_decision(data.get("quota_decision")):
             print(line)
         if parsed.explain:
             print(json.dumps(data.get("explanation", {}), ensure_ascii=False, indent=2))

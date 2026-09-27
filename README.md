@@ -173,6 +173,24 @@ decision receipt 的 `assessment` 欄位，enforce 模式下 `unknown` 視為不
 provider 讀取與長期運作）仍是獨立的部署 gate，本節只交付到「daemon 進程內
 的接線與設定檔消費」。
 
+### 決策 receipt 的投影欄位（#840）
+
+`AdmissionDecisionStore` 的 decision receipt 新增三個選填欄位，供
+`paulsha_cortex.monitor.decision_projection`（見上面 `cortex status` 的
+`quota_decision` 欄位說明）投影使用，缺席（#840 之前寫的舊 receipt）時投影
+一律視為 `unknown`，不臆測成 confirmed：
+
+- `policy_config_revision`：這筆決策當時使用的 operator quota-pools 設定檔
+  `config_revision`（來自 `DispatchContext.config_revision`，由
+  `manager_daemon.py` 從設定檔載入結果帶入）。
+- `selected_observation_state`／`selected_feasible`：選中候選當時的額度
+  observation 狀態（`unmanaged`／`known`／`unknown`）與是否所有綁定 pool
+  都 sufficient——shadow 模式下候選即使 `unknown`／不可行一樣會被 admit，
+  這兩個欄位讓投影面能忠實區分「confirmed 可派」與「shadow 下明知不可行
+  仍放行」。
+
+這是唯讀投影新增的欄位，不改變 #839 的准入邏輯或 reservation 生命週期。
+
 ## Execution profile schema／key core
 
 `paulsha_cortex.coordinator.execution_profile` 是 #849 的純 stdlib
@@ -703,6 +721,7 @@ systemctl --user status cortex-manager.service cortex-monitor.service
   - 落後達 `threshold_commits`（預設 10，可用 `PSC_CANDIDATE_BASE_STALE_THRESHOLD_COMMITS` 覆寫）時，`reason` 為具名診斷 `candidate-git-base-stale`——代表「這條 run 的基底過舊、已 merge 的 test-only 修復進不去」。
   - 距離是相對 **mirror 上次 fetch 到的 `refs/remotes/origin/main`** 算的，不是相對 GitHub 此刻的 main：status 是唯讀路徑，`fetched` 恆為 `false`（fetch 是 claim 的職責）。讀不到 mirror／算不出距離時，`behind_origin_main` 落 `<unresolved:MirrorRootUnset>`／`<unresolved:MirrorMainUnreadable>`／`<unresolved:BaseNotInMirror>`，`reason` 為 `candidate-git-base-distance-unresolved`；run 還沒有基底（define／plan 階段）時 `reason` 為 `candidate-git-base-absent`。
   - 同一份資料也出現在 `cortex work show <work_id>`（文字模式與 `--json` 皆有）。
+- `quota_decision`（#840）：quota-aware admission（#839）決策與額度等待來源的唯讀投影，只在這條 run 真的有 #839 證據時才出現。欄位含 `wait`（額度等待——非 Job 決策，例如 `quota-admission-insufficient`／`quota-config-invalid`，直接沿用 #527 `blocking_reason` 的 `reason`／`detail`／`next_step_hint`／`context`，不自行編造）與 `personas`（依 persona 分列：`decision_id`、`mode`（`shadow`／`enforced`）、`outcome`、`policy_version`、`policy_config_revision`（operator quota-pools 設定檔的 `config_revision`）、`observation_version`、`demand_version`、`qualification_version`、`requested_profile_key`／`resolved_profile_key`、`selected`／`excluded`（僅 `executor`／`model_id`／`independence_domain`／`exclusion_reason`——不含 credential、env、raw prompt）、`reservation_id`，以及 `classification`（`demand`：`confirmed`／`estimated`（#837 forecast 落地前的 fixture）／`not-applicable`；`observation`：`confirmed`／`unknown`／`not-applicable`，缺 provenance 或候選本身 unknown remaining 一律 `unknown`，不呈現成『現在可派』）。decision store 暫時讀不到時保留上一次成功讀到的內容，並附 `stale: true`、`stale_reason`、`stale_since_ms`。與 `cortex work show <work_id>` 共用同一份投影，兩者對同一份 snapshot 保證一致。
 - `not_claimable`（#669）：claim 判定**現在不可 claim、且刻意不建立 run** 的 work item。最典型的是 `docs/superpowers/workstreams/*`——那類 work item 設計上就不對應單一 issue，`missing_issue` 是**預期狀態而非異常**，過去卻被物化成停在 `current_phase: claim`、永遠不會推進的 `needs_human` run（實測一次產出 24 個，把 `attention` 信噪比壓成 1:24）。現在改記在耐久的 `<coordinator_root>/not-claimable.json`（schema `cortex-not-claimable/v1`），欄位含 `reason`、`detail`、`first_observed_at`／`last_observed_at`／`observations`（卡多久了）與 `next_step_hint`（照抄即可執行的下一步）。work item 一旦變成可 claim，該筆紀錄於下一次判定時自動消失；work item 從 snapshot 移除時，claim scan 收尾也會一併清除其紀錄。`attention` 因此只留可行動的項目，被跳過的項目也不會變成盲區。
 - `recent_done`：最近退出的 job 或進入 terminal gate 的 slice 摘要，含 `slice_id`、`gate_status`、`at`、`exited_at`、`gate_reason`、`job_id`、`branch`、明確的 `repo` project 歸屬（manifest 缺該欄時為 `null`）。`at` 是 handoff manifest 完成時間；`exited_at` 來自 registry 中綁定 job 的實際退出時間。workflow job 另帶綁定 run 的 `run_id`、`work_id`、`run_status`（`ongoing`／`superseded`／`done`），缺少 registry 證據時欄位為 `null`。`attention`／`slices` 也只接受明確的 slice 或 workflow job repo；不從 branch、worktree 或 path 猜測 project。只回溯 `--recent-done-window-seconds`（預設 86400 秒／24 小時，可用 `PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS` 覆寫）內完成的 handoff manifest；window 內沒有資料時回空陣列，不會回退撈更舊的紀錄，過期 manifest 檔案本身的清理屬於 #178 program teardown GC 的範圍，不在 `recent_done` provider 職責內。
 

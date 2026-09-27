@@ -166,6 +166,12 @@ class DispatchContext:
     #: 時一律回空字典，行為與完全不呼叫 record_terminal_usage 相同（fail
     #: soft，不擋容量釋放）。
     usage_unit_refs: Mapping[str, tuple[str, str]] = field(default_factory=dict)
+    #: #840 對抗審查修復：operator quota-pools 設定檔的 ``config_revision``
+    #: （見 :class:`QuotaPoolsConfig`）在 #839 落地時只用來做快取鍵，從未往下
+    #: 傳給 decision receipt——投影面因此完全看不出「這筆決策是用哪一版
+    #: operator 設定算出來的」。這裡加一個純 provenance 欄位補上；缺席（沿用
+    #: 既有呼叫端未帶這個參數）時維持明確的 ``"unknown"``，不臆測。
+    config_revision: str = "unknown"
 
 
 def _pool_key(pool_ref: Mapping[str, str]) -> tuple[str, str, str, str]:
@@ -621,6 +627,22 @@ class AdmissionDecision:
     excluded: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
     reason: str | None = None
     job_id: str | None = None
+    #: #840 對抗審查修復：receipt 過去只留一個不可逆的 ``observation_version``
+    #: 指紋，事後完全看不出「當時選中的候選本身」是 sufficient／insufficient／
+    #: unknown——shadow 模式下候選可行性不可行一樣會被 admit（見
+    #: `manager._dispatch_workflow_card` 的候選迴圈），投影面因此無法區分
+    #: 「confirmed 可派」與「shadow 下明知不可行／unknown 仍放行」。
+    #: 兩個欄位都是選填（缺席＝#840 之前寫的舊 row，投影面視為 ``unknown``，
+    #: 不臆測）：
+    #: - ``selected_observation_state``：對應
+    #:   ``CandidateAssessment.observation_state``（``unmanaged``／``known``／
+    #:   ``unknown``）。
+    #: - ``selected_feasible``：對應 ``CandidateAssessment.feasible``——是否
+    #:   『所有』綁定 pool 當時都 sufficient。
+    selected_observation_state: str | None = None
+    selected_feasible: bool | None = None
+    #: #840 對抗審查修復：見 `DispatchContext.config_revision` 的文件字串。
+    policy_config_revision: str | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("shadow", "enforced"):
@@ -633,6 +655,12 @@ class AdmissionDecision:
             raise ValueError("wait outcome requires an explicit reason")
         if len(self.excluded) > _MAX_ATTEMPTS_PER_DECISION:
             raise ValueError("too many excluded candidates on one decision")
+        if self.selected_observation_state is not None and self.selected_observation_state not in (
+            "unmanaged", "known", "unknown",
+        ):
+            raise ValueError("invalid admission decision selected_observation_state")
+        if self.selected_feasible is not None and not isinstance(self.selected_feasible, bool):
+            raise ValueError("selected_feasible must be a bool or None")
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -656,6 +684,14 @@ class AdmissionDecision:
             "excluded": [json.loads(json.dumps(item)) for item in self.excluded],
             "reason": self.reason,
             "job_id": self.job_id,
+            # #840：選填欄位一律寫出（值可能是 None），讓 `to_row()` 逐字回放
+            # 時一定含這三個 key——同一支程式碼寫兩次同一個 decision_id 才會
+            # 是同一份 dict，`record()` 的冪等比對才不會因為欄位集不同而誤判
+            # 成 conflict。舊 row（#840 之前寫的）讀回後同樣會補上這三個
+            # None，見 `from_row()`。
+            "selected_observation_state": self.selected_observation_state,
+            "selected_feasible": self.selected_feasible,
+            "policy_config_revision": self.policy_config_revision,
         }
 
     @classmethod
@@ -669,6 +705,9 @@ class AdmissionDecision:
             generated_at_ms=row["generated_at_ms"], selected=row.get("selected"),
             reservation_id=row.get("reservation_id"), excluded=tuple(row.get("excluded", ())),
             reason=row.get("reason"), job_id=row.get("job_id"),
+            selected_observation_state=row.get("selected_observation_state"),
+            selected_feasible=row.get("selected_feasible"),
+            policy_config_revision=row.get("policy_config_revision"),
         )
 
 
@@ -680,6 +719,14 @@ _DECISION_REQUIRED_KEYS = frozenset(
         "reason", "job_id",
     }
 )
+#: #840：見 `AdmissionDecision.selected_observation_state`／`selected_feasible`／
+#: `policy_config_revision` 的文件字串——比照 #839
+#: `_QUOTA_POOLS_CONFIG_OPTIONAL_KEYS` 的既有加法模式，讓 #840 之前寫的舊
+#: row（缺這三個 key）與之後寫的新 row（一律含，值可能是 ``None``）都合法。
+_DECISION_OPTIONAL_KEYS = frozenset(
+    {"selected_observation_state", "selected_feasible", "policy_config_revision"}
+)
+_DECISION_ALL_KEYS = _DECISION_REQUIRED_KEYS | _DECISION_OPTIONAL_KEYS
 
 
 class AdmissionDecisionStore:
@@ -834,12 +881,29 @@ class AdmissionDecisionStore:
                 row = json.loads(line)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 raise AdmissionDecisionCorrupt("admission-decision-store-invalid-json") from exc
+            row_keys = set(row) if isinstance(row, dict) else set()
             if (
                 not isinstance(row, dict)
-                or set(row) != _DECISION_REQUIRED_KEYS
+                or not _DECISION_REQUIRED_KEYS.issubset(row_keys)
+                or not row_keys.issubset(_DECISION_ALL_KEYS)
                 or row.get("schema_version") != 1
                 or not isinstance(row.get("decision_id"), str)
                 or not row["decision_id"]
+                or (
+                    "selected_observation_state" in row
+                    and row["selected_observation_state"] is not None
+                    and row["selected_observation_state"] not in ("unmanaged", "known", "unknown")
+                )
+                or (
+                    "selected_feasible" in row
+                    and row["selected_feasible"] is not None
+                    and not isinstance(row["selected_feasible"], bool)
+                )
+                or (
+                    "policy_config_revision" in row
+                    and row["policy_config_revision"] is not None
+                    and not isinstance(row["policy_config_revision"], str)
+                )
             ):
                 raise AdmissionDecisionCorrupt("admission-decision-store-invalid-record")
             if row["decision_id"] in seen_ids:

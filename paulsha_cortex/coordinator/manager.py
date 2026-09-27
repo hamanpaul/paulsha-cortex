@@ -1511,6 +1511,8 @@ def workflow_status_entry(
     *,
     candidate_base_probe: "candidate_base.MirrorDistanceProbe | None" = None,
     work_authority_state: str | None = None,
+    quota_decision_store: object | None = None,
+    quota_decision_cache: object | None = None,
 ) -> dict[str, Any]:
     """#527：把 `needs_human` 的 workflow run 投影成 attention 條目。
 
@@ -1681,7 +1683,60 @@ def workflow_status_entry(
     accepted_workflow_results = workflow_accepted_results_for_run(registry, run)
     if accepted_workflow_results:
         entry["accepted_workflow_results"] = accepted_workflow_results
+    # #840：quota-aware admission 決策與額度等待來源投影——與
+    # `monitor.providers.WorkflowRegistryProvider` 共用同一份
+    # `decision_projection.project_workflow_quota_admission`，避免 `cortex
+    # inspect status` 與 `cortex work show` 對同一個 run 算出兩份不一致的
+    # decision／stale 呈現。run 從未接上 #839（`quota_admission` 與
+    # `needs_human_reason` 皆為 None／與額度無關）時整段略過，維持既有
+    # attention 條目形狀不變。
+    quota_decision = _workflow_quota_decision_projection(
+        run, store=quota_decision_store, cache=quota_decision_cache,
+    )
+    if quota_decision is not None:
+        entry["quota_decision"] = quota_decision
     return entry
+
+
+def _workflow_quota_decision_projection(
+    run, *, store: object | None, cache: object | None,
+) -> dict[str, Any] | None:
+    """`workflow_status_entry` 的 quota-decision 投影掛載點。
+
+    只在這個 run 真的有 quota-admission 相關證據（`quota_admission` 指標，
+    或 needs_human 理由屬於 #840 定義的 quota-wait 分類碼）時才回傳非
+    ``None``——沒有任何證據時完全不出現在 entry 上，維持既有 attention
+    形狀不變。呈現面失效不得讓整份 status 死掉（比照上面
+    `candidate_git_base` 的既有 fail-soft 慣例）。
+    """
+
+    from paulsha_cortex.monitor import decision_projection as _decision_projection
+
+    quota_admission_pointers = getattr(run, "quota_admission", None)
+    needs_human_reason = getattr(run, "needs_human_reason", None)
+    has_wait = (
+        isinstance(needs_human_reason, Mapping)
+        and needs_human_reason.get("reason") in _decision_projection.QUOTA_WAIT_REASONS
+    )
+    if not quota_admission_pointers and not has_wait:
+        return None
+    try:
+        resolved_store = store
+        if resolved_store is None:
+            from . import quota_admission as quota_admission_module
+
+            resolved_store = quota_admission_module.AdmissionDecisionStore()
+        return _decision_projection.project_workflow_quota_admission(
+            run_id=run.run_id,
+            quota_admission=quota_admission_pointers,
+            needs_human_reason=needs_human_reason,
+            execution_profile_bindings=getattr(run, "execution_profile_bindings", None),
+            store=resolved_store,
+            cache=cache,
+            now_ms=int(time.time() * 1000),
+        )
+    except Exception:  # noqa: BLE001 - 呈現面不得因投影失敗而讓 status 死掉
+        return None
 
 
 def _completion_candidate_ref(
@@ -13910,6 +13965,12 @@ def _dispatch_workflow_card(
             # 排除掉的候選（額度評估不可行、或原子預留 race 落敗被換掉的那些）
             # ——最後一筆是本次選中的候選自己，不算「被排除」。
             excluded=tuple(quota_admission_attempts[:-1]),
+            # #840 對抗審查修復：見 `AdmissionDecision.selected_observation_state`
+            # 文件字串——舊 receipt 只留一個不可逆指紋，投影面看不出選中候選
+            # 本身是否 sufficient／unknown（shadow 模式下不可行一樣會被 admit）。
+            selected_observation_state=quota_selected_assessment.observation_state,
+            selected_feasible=quota_selected_assessment.feasible,
+            policy_config_revision=getattr(quota_admission_context, "config_revision", None),
         )
         quota_admission_context.store.record(quota_decision)
         registry._manager_update_workflow_run(

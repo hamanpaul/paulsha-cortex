@@ -562,6 +562,10 @@ def _quota_admission_context_for(environment: dict[str, str] | None = None):
         lease_ms=config.lease_ms,
         environment=environment,
         usage_unit_refs=config.usage_unit_refs,
+        # #840：見 `quota_admission.DispatchContext.config_revision` 文件字串
+        # ——落地決策 receipt 才有得投影「這筆決策當時用的是哪一版 operator
+        # 設定」，不只有一個只做快取鍵的內部 digest。
+        config_revision=config.config_revision,
     )
 
 
@@ -681,6 +685,14 @@ def build_runtime_status_provider(
             mirror_root=candidate_base.default_mirror_root(),
             git_runner=git_runner,
         )
+        # #840：整份快照共用同一個 decision store handle／last-good cache，
+        # 確保這一輪 `attention` 清單裡每個 run 的 quota-decision 投影都是
+        # 對同一次 store 讀取結果，不會因為逐一重開檔案而互相漂移。
+        from paulsha_cortex.coordinator import quota_admission as _quota_admission_module
+        from paulsha_cortex.monitor.decision_projection import DecisionReadCache
+
+        quota_decision_store = _quota_admission_module.AdmissionDecisionStore()
+        quota_decision_cache = DecisionReadCache()
         manager.reconcile_building_slices(registry)
         metas = scan_specs_fn(specs_dir)
         predicate = lambda slice_id: autonomy.default_is_satisfied(
@@ -754,6 +766,8 @@ def build_runtime_status_provider(
                             repo=run.repo,
                             work_id=run.work_id,
                         ),
+                        quota_decision_store=quota_decision_store,
+                        quota_decision_cache=quota_decision_cache,
                     )
                 )
         in_flight = _in_flight_status(

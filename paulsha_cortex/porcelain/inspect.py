@@ -148,6 +148,36 @@ def _print_status(status: dict[str, Any]) -> None:
         )
         for ref in blocking.get("evidence_refs") or []:
             sys.stdout.write(f"    evidence: {ref}\n")
+    # #840：quota-aware admission 決策與額度等待來源。文字模式比照上面
+    # needs_human 摘要行的既有慣例——理由存在於某處但沒有介面印它，正是
+    # #527 反覆命中的同一條根因，這裡不重演。
+    for entry in status.get("attention", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        quota_decision = entry.get("quota_decision")
+        if not isinstance(quota_decision, dict):
+            continue
+        subject = entry.get("run_id") or entry.get("slice_id") or "-"
+        wait = quota_decision.get("wait")
+        if isinstance(wait, dict) and wait.get("reason"):
+            sys.stdout.write(
+                f"  quota_wait[{subject}]: {wait.get('reason')}: {wait.get('detail')}\n"
+            )
+        for persona, decision in (quota_decision.get("personas") or {}).items():
+            if not isinstance(decision, dict):
+                continue
+            if decision.get("available") is False:
+                sys.stdout.write(
+                    f"  quota_decision[{subject}/{persona}]: unavailable "
+                    f"(stale={decision.get('stale')}, reason={decision.get('stale_reason') or decision.get('gap_reason')})\n"
+                )
+                continue
+            classification = decision.get("classification") or {}
+            sys.stdout.write(
+                f"  quota_decision[{subject}/{persona}]: mode={decision.get('mode')} "
+                f"outcome={decision.get('outcome')} observation={classification.get('observation')} "
+                f"demand={classification.get('demand')} stale={decision.get('stale')}\n"
+            )
     # #731 (C)：候選 git base 與它落後 mirror 上 origin/main 幾個 commit。過去
     # 這個事實只在候選 worktree 的 `.git` 裡，而 attention 上唯一像版本的欄位
     # `source_revision` 是 64-hex 的 authority digest、答非所問——operator 因此

@@ -18,9 +18,15 @@ import yaml
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator import candidate_base
+from paulsha_cortex.coordinator import quota_admission as quota_admission_module
 from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
 from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
 
+from .decision_projection import (
+    QUOTA_WAIT_REASONS,
+    DecisionReadCache,
+    project_workflow_quota_admission,
+)
 from .git_mirror import (
     GitMirrorError,
     GitRunner,
@@ -382,6 +388,7 @@ class WorkflowRegistryProvider:
         *,
         state_path: str | Path | None = None,
         candidate_base_probe: "candidate_base.MirrorDistanceProbe | None" = None,
+        quota_decision_store: "quota_admission_module.AdmissionDecisionStore | None" = None,
     ) -> None:
         self.repo = repo
         self.provider_id = f"workflow:{repo}"
@@ -395,6 +402,17 @@ class WorkflowRegistryProvider:
         # 「看一眼 work item」變成會改變 mirror 的動作。注入點留給測試；
         # production 每次 scan 重建一個，才不會把上一輪的 main 位置快取成永久值。
         self._candidate_base_probe = candidate_base_probe
+        # #840：quota-aware admission decision store handle。比照上面的
+        # `candidate_base_probe`——production 用預設路徑（與 manager_daemon
+        # 共用同一個 Trust Root 資產），測試／多 instance 部署可注入自己的
+        # store。同一個 provider 實例的多次 `scan()` 共用它，讓
+        # `DecisionReadCache` 的 last-good 語意跨輪次持續有效。
+        self._quota_decision_store = (
+            quota_decision_store
+            if quota_decision_store is not None
+            else quota_admission_module.AdmissionDecisionStore()
+        )
+        self._quota_decision_cache = DecisionReadCache()
 
     def scan(self) -> ProviderSnapshot:
         attempted_at = _utcnow()
@@ -478,6 +496,7 @@ class WorkflowRegistryProvider:
             schema_retry: dict[str, dict[str, int]] = {}
             needs_human_reasons: dict[str, dict[str, object]] = {}
             candidate_git_bases: dict[str, dict[str, object]] = {}
+            quota_decisions: dict[str, dict[str, object]] = {}
             diagnostics: list[str] = []
             validated_completions: dict[str, list[dict[str, object]]] = {}
             for row in rows:
@@ -524,6 +543,19 @@ class WorkflowRegistryProvider:
                 blocking = _needs_human_reason_row(row)
                 if blocking is not None:
                     needs_human_reasons[work_id] = {"run_id": run_id, **blocking}
+                # #840：quota-aware admission 決策與額度等待來源投影——與
+                # `manager.workflow_status_entry` 共用同一份
+                # `decision_projection.project_workflow_quota_admission`，
+                # 確保 `cortex work show` 與 `cortex inspect status` 對同一個
+                # run 算出一致的 decision／stale 呈現。row 上完全沒有 #839
+                # 證據（`quota_admission` 與 quota-wait 理由皆缺席）時完全略過。
+                quota_projection = _quota_decision_row(
+                    row,
+                    store=self._quota_decision_store,
+                    cache=self._quota_decision_cache,
+                )
+                if quota_projection is not None:
+                    quota_decisions[work_id] = {"run_id": run_id, **quota_projection}
                 # #731 (C)：候選 git base（真的那個 40-hex commit SHA）與落後
                 # mirror 上 origin/main 的距離。同樣走 observations 通道，理由
                 # 與上面兩段一致（新增 row 欄位會讓整份 projection degraded）。
@@ -594,6 +626,7 @@ class WorkflowRegistryProvider:
             "schema_retry": schema_retry,
             "needs_human_reasons": needs_human_reasons,
             "candidate_git_bases": candidate_git_bases,
+            "quota_decisions": quota_decisions,
         }
         if workflow_next_actions:
             observations["workflow_next_actions"] = workflow_next_actions
@@ -716,6 +749,44 @@ def _needs_human_reason_row(row: Mapping[str, Any]) -> dict[str, object] | None:
             item for item in (evidence_refs or []) if isinstance(item, str) and item
         ],
     }
+
+
+def _quota_decision_row(
+    row: Mapping[str, Any],
+    *,
+    store: "quota_admission_module.AdmissionDecisionStore",
+    cache: DecisionReadCache,
+) -> dict[str, object] | None:
+    """#840：從 run row 取出 quota-aware admission 決策投影。
+
+    比照 :func:`_needs_human_reason_row`——只在這個 row 真的有 #839 證據
+    （`quota_admission` 指標，或 needs_human 理由屬於 quota-wait 分類碼）時
+    才回傳非 ``None``；呈現面計算失敗（store 損毀等）由
+    ``decision_projection`` 內部處理成 stale 標記，這裡不吞例外——投影模組
+    本身是唯讀且不拋出非預期例外（見其文件字串）。
+    """
+
+    quota_admission_pointers = row.get("quota_admission")
+    needs_human_reason = row.get("needs_human_reason")
+    has_wait = (
+        isinstance(needs_human_reason, Mapping)
+        and needs_human_reason.get("reason") in QUOTA_WAIT_REASONS
+    )
+    if not quota_admission_pointers and not has_wait:
+        return None
+    return project_workflow_quota_admission(
+        run_id=str(row.get("run_id") or ""),
+        quota_admission=quota_admission_pointers if isinstance(quota_admission_pointers, Mapping) else None,
+        needs_human_reason=needs_human_reason if isinstance(needs_human_reason, Mapping) else None,
+        execution_profile_bindings=(
+            row.get("execution_profile_bindings")
+            if isinstance(row.get("execution_profile_bindings"), Mapping)
+            else None
+        ),
+        store=store,
+        cache=cache,
+        now_ms=int(time.time() * 1000),
+    )
 
 
 def _nonempty(value: object, field: str) -> str:

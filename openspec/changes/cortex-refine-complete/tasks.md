@@ -94,6 +94,7 @@
   - [x] 6.1.a [RED] #828 在 Cortex producer 邊界新增 execution-identity regression tests；以 registry job binding 驗證多卡、retry、缺值、未派工、跨 run/repo、needs_human、in-flight 與 completed status projection，保留 RED 供後續最小修正。
   - [x] 6.1.b [GREEN] #828 producer 以 registry job 的 run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；planned、actual、last execution 與 unknown 不互相代填。
   - [x] 6.1.c [CONTRACT] #828 新增去識別化 status snapshot fixture 與 producer/consumer 欄位契約；僅完成 pre-archive handoff，consumer、pin、installed/runtime integration 與下游 issue closure 仍未完成。
+  - [x] 6.1.d [IMPLEMENTED/TESTED] #840 新增 `monitor/decision_projection.py` 唯讀投影 quota-aware admission（#839）decision receipt 與額度等待來源（`wait`／`personas`／`classification`），`cortex inspect status` 的 `attention` 與 `cortex work show` 的 observations 通道共用同一份投影與同一次 snapshot 的 store handle；只消費既有 #828 identity producer／#830 非 Job 契約／#527 reason，不重做其邏輯。#839 receipt 最小加法：`selected_observation_state`／`selected_feasible`／`policy_config_revision`（見 `changelog.d/refine-840.md`）。19 個測試（`tests/test_decision_status_projection_840.py`）涵蓋多 persona/retry/跨 run-card、negative、restart/last-good、bytes 不變、allowlist 負例與端到端案例，皆已跑過。installed／live canary（在生產環境實際重啟 daemon、驗證 production 讀到真實 decision receipt）未執行，仍是獨立部署 gate。
 - [ ] 6.2 由 #841 建立 CLI/site-packages/service loaded artifact/config identity 的同源驗證與 checkout 外 smoke。
 - [ ] 6.3 完成 installer/doctor instance roots、writer ownership 與 owner-aware stop/cleanup 的契約驗收。
 - [ ] 6.4 取得 upgrade/restart/rollback 對 active jobs 的實際 receipts；未重載程序不得標已部署。
