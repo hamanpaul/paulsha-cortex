@@ -150,6 +150,66 @@ def test_hard_gates_are_repo_scoped_while_fleet_health_remains_visible():
     ]
 
 
+def test_quota_decision_is_scoped_to_exact_repo_not_leaked_across_repos():
+    """#840 對抗審查修復（MAJOR，work_api.py 約 301）：`_quota_decision()`
+    過去只憑 provider_id 前綴是不是 ``workflow:`` 就挑第一個命中的
+    ``quota_decisions[work_id]``，完全沒比對 `repo` 參數。兩個 repo 若剛好
+    有同一個 `work_id`（跨 repo 不保證唯一），會把另一個 repo 的
+    quota_decision 錯配過來。這裡驗證 exact (repo, work_id) 比對——同一個
+    `work_id` 在兩個 repo 各自的 workflow provider 上有『不同』的
+    quota_decisions 內容時，`get_work_item(work_id, repo=...)` 只回傳
+    對應 repo 的那一份，不互相污染。"""
+    shared_work_id = "shared-work-id"
+    acme_provider = ProviderSnapshot(
+        provider_id="workflow:example/acme",
+        status="ok",
+        last_attempt_at=NOW,
+        last_success_at=NOW,
+        revision="workflow-acme-1",
+        diagnostics=(),
+        sources=(),
+        observations={
+            "quota_decisions": {
+                shared_work_id: {"personas": {"builder": {"decision_id": "adm:v1:acme"}}},
+            }
+        },
+    )
+    other_provider = ProviderSnapshot(
+        provider_id="workflow:example/other",
+        status="ok",
+        last_attempt_at=NOW,
+        last_success_at=NOW,
+        revision="workflow-other-1",
+        diagnostics=(),
+        sources=(),
+        observations={
+            "quota_decisions": {
+                shared_work_id: {"personas": {"builder": {"decision_id": "adm:v1:other"}}},
+            }
+        },
+    )
+    store = WorkReadModelStore(
+        _snapshot(
+            _item(shared_work_id, "ongoing", repo="example/acme"),
+            _item(shared_work_id, "ongoing", repo="example/other"),
+            providers={
+                acme_provider.provider_id: acme_provider,
+                other_provider.provider_id: other_provider,
+            },
+        )
+    )
+
+    acme_envelope = store.get_work_item(shared_work_id, repo="example/acme")
+    other_envelope = store.get_work_item(shared_work_id, repo="example/other")
+
+    assert (
+        acme_envelope["quota_decision"]["personas"]["builder"]["decision_id"] == "adm:v1:acme"
+    )
+    assert (
+        other_envelope["quota_decision"]["personas"]["builder"]["decision_id"] == "adm:v1:other"
+    )
+
+
 def test_read_model_show_and_explain_contract():
     explanation = {
         "work_id": "active",

@@ -445,6 +445,53 @@ def test_status_entry_and_work_show_row_agree_on_same_snapshot(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
+# 對抗審查 MAJOR（manager.py 熱路徑）：同一份 snapshot 內，`DecisionReadCache`
+# 對同一個 store 檔案身分最多真的讀一次，不管有多少個 run／persona 各自查詢。
+# ---------------------------------------------------------------------------
+
+
+def test_shared_cache_reads_store_at_most_once_per_snapshot_across_many_runs_and_personas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """修好之前，`DecisionReadCache.get()` 對每個 persona 都直接呼叫
+    `AdmissionDecisionStore.get()`（全檔線性掃描一次）——即使呼叫端已經把
+    `store`／`cache` 兩個實例在同一輪 snapshot 內共用（manager_daemon.py 既有
+    的既有寫法），append-only 檔仍會在同一輪被重複讀 N 次（N = run 數 ×
+    persona 數）。這裡用 3 個 run × 2 個 persona＝6 次查詢，驗證檔案身分
+    （size／mtime／inode／mode）沒變時，底層 `AdmissionDecisionStore.all_rows()`
+    只被呼叫一次。"""
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decisions = []
+    for i in range(3):
+        decision = _decision(decision_id="adm:v1:" + str(i) * 64, run_id=f"run-{i}", card_id="build-card")
+        store.record(decision)
+        decisions.append(decision)
+
+    read_calls: list[int] = []
+    real_all_rows = admission.AdmissionDecisionStore.all_rows
+
+    def _counting_all_rows(self):
+        read_calls.append(1)
+        return real_all_rows(self)
+
+    monkeypatch.setattr(admission.AdmissionDecisionStore, "all_rows", _counting_all_rows)
+
+    cache = dp.DecisionReadCache()
+    for i, decision in enumerate(decisions):
+        for persona in ("builder", "reviewer"):
+            projection = dp.project_workflow_quota_admission(
+                run_id=f"run-{i}",
+                quota_admission={
+                    persona: {"decision_id": decision.decision_id, "mode": "shadow", "outcome": "admit"}
+                },
+                needs_human_reason=None, store=store, cache=cache, now_ms=_NOW,
+            )
+            assert projection["personas"][persona]["decision_id"] == decision.decision_id
+
+    assert len(read_calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # AC4：restart／replay
 # ---------------------------------------------------------------------------
 
@@ -501,6 +548,62 @@ def test_corrupt_store_falls_back_to_last_good_with_stale_reason(tmp_path: Path)
     # last-good 內容仍完整保留，不得因為這次讀取失敗而消失或呈現成『現在可派』。
     assert persona["decision_id"] == decision.decision_id
     assert persona["mode"] == decision.mode
+
+
+def test_daemon_wired_cache_persists_across_snapshot_ticks_for_last_good_stale(
+    tmp_path: Path,
+) -> None:
+    """#840 對抗審查修復（MAJOR，manager_daemon.py 約 694）：
+    `quota_decision_cache` 必須跨快照存活——建在
+    `build_runtime_status_provider()` 這層（呼叫一次、daemon 生命週期內共用
+    的閉包變數），不能放進 `provider()` 內部逐輪重建。修好之前，每輪 tick
+    都建一個空 cache，上一輪成功讀到的 decision 在下一輪 store 暫時損毀／
+    權限錯誤時完全遺失，退化成單純的『這次讀不到』（`mode`／`selected` 等
+    欄位整個消失），不是 last-good。這裡用同一個 `provider` closure 呼叫
+    兩次模擬兩輪 tick，驗證第二輪損毀時仍完整保留第一輪的 last-good
+    內容＋精確 stale 原因。"""
+    from paulsha_cortex.coordinator import manager_daemon
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _run(registry, tmp_path, work_id="daemon-840", steps=(_step("build-card"),))
+    # 用預設路徑的 store——per-test 隔離環境（見 conftest.py 的
+    # `_clear_runtime_env`）保證這與 `build_runtime_status_provider()` 內部
+    # 建立的 `AdmissionDecisionStore()` 指向同一個檔案。
+    store = admission.AdmissionDecisionStore()
+    decision = _decision(decision_id="adm:v1:" + "9" * 64, run_id=run.run_id, card_id="build-card")
+    store.record(decision)
+    registry._manager_update_workflow_run(run.run_id, quota_admission=_quota_admission_pointer(decision))
+
+    provider = manager_daemon.build_runtime_status_provider(
+        registry=registry,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        scan_specs_fn=lambda _: [],
+        ready_units_fn=lambda metas, predicate: [],
+    )
+
+    def _builder_persona(payload):
+        entries = [row for row in payload["attention"] if row.get("kind") == "workflow_run"]
+        assert len(entries) == 1
+        return entries[0]["quota_decision"]["personas"]["builder"]
+
+    first_tick = _builder_persona(provider())
+    assert first_tick["stale"] is False
+    assert first_tick["decision_id"] == decision.decision_id
+    assert first_tick["mode"] == decision.mode
+
+    store.path.chmod(0o660)
+    try:
+        second_tick = _builder_persona(provider())
+    finally:
+        store.path.chmod(0o600)
+
+    assert second_tick["stale"] is True
+    assert second_tick["stale_reason"].startswith("decision-store-read-failed:")
+    # 跨 tick 存活的 last-good：不因下一輪讀不到就把已經確認過的 mode／
+    # decision_id 整個丟掉。
+    assert second_tick["decision_id"] == decision.decision_id
+    assert second_tick["mode"] == decision.mode
 
 
 def test_old_attempt_receipt_immutable_after_newer_attempt_recorded(tmp_path: Path) -> None:

@@ -639,9 +639,18 @@ class AdmissionDecision:
     #:   ``unknown``）。
     #: - ``selected_feasible``：對應 ``CandidateAssessment.feasible``——是否
     #:   『所有』綁定 pool 當時都 sufficient。
+    #:
+    #: **不需要 schema bump**：這三個欄位與 #839 本身同一個 release 一起發布
+    #: （#839 從未獨立上線過），因此不存在「#839-only（無 #840）的已發布版本
+    #: 讀不懂這三個新 key」的相容性問題——`schema_version` 維持 ``1``。三個
+    #: 欄位定位是 v1 內的選填鍵加法（比照 #839
+    #: ``_QUOTA_POOLS_CONFIG_OPTIONAL_KEYS`` 的既有模式），不是破壞性 schema
+    #: 變更；``_DECISION_REQUIRED_KEYS``／``_DECISION_OPTIONAL_KEYS``（見下方）
+    #: 與 ``_read_fd`` 的驗證邏輯保證缺這三個 key 的 row 一樣合法可讀。
     selected_observation_state: str | None = None
     selected_feasible: bool | None = None
     #: #840 對抗審查修復：見 `DispatchContext.config_revision` 的文件字串。
+    #: 同樣不需要 schema bump，理由同上。
     policy_config_revision: str | None = None
 
     def __post_init__(self) -> None:
@@ -759,7 +768,19 @@ class AdmissionDecisionStore:
             for existing in records:
                 if existing["decision_id"] != decision.decision_id:
                     continue
-                if existing == row:
+                # #840 對抗審查修復（MAJOR）：不能直接拿磁碟上的 raw row 跟
+                # 新算出的 `row`（一定含 #840 三個選填欄位，值可能是 None）
+                # 做 dict 相等比較——#840 之前寫的舊 row 根本沒有這三個 key，
+                # 即使兩邊語意完全一樣（都是同一個 decision、選填欄位都是
+                # unknown/None），單純 dict 相等會因為 key 集合不同而判成
+                # 「內容不同」，把合法的冪等重放誤判成
+                # `admission-decision-id-conflict`。兩邊都先經
+                # `from_row()`→`to_row()` 正規化（缺席鍵補齊為 None，即
+                # `AdmissionDecision.__init__` 的預設值），才是同一把尺；
+                # 正規化後仍不同才是真的矛盾（同一個 decision_id 代表兩份
+                # 不同決策）。
+                normalized_existing = AdmissionDecision.from_row(existing).to_row()
+                if normalized_existing == row:
                     return AdmissionDecision.from_row(existing)
                 raise AdmissionDecisionCorrupt("admission-decision-id-conflict")
             if len(records) >= _MAX_RECORDS:
@@ -811,6 +832,18 @@ class AdmissionDecisionStore:
             if row["decision_id"] == decision_id:
                 return AdmissionDecision.from_row(row)
         return None
+
+    def all_rows(self) -> list[dict[str, Any]]:
+        """回傳目前 store 內所有已驗證過形狀的 raw row。
+
+        #840 對抗審查修復（MAJOR，manager.py 熱路徑）：`decision_projection.
+        DecisionReadCache` 需要在一次 status 快照內建一份 ``decision_id`` →
+        row 的索引供多個 persona／run 共用查詢，而不是逐個 persona 各自呼叫
+        :meth:`get` 造成同一份 append-only 檔在同一輪被重讀多次。此方法只是
+        ``_read()`` 的公開包裝——不新增驗證規則，也不改變既有 :meth:`get`／
+        :meth:`enforced_admitted` 的讀取語意。
+        """
+        return self._read()
 
     def enforced_admitted(self) -> tuple[AdmissionDecision, ...]:
         """回傳所有 ``mode=enforced`` 且 ``outcome=admit`` 的決策。

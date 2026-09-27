@@ -628,6 +628,19 @@ def build_runtime_status_provider(
     now_fn: Callable[[], str] = contract.utcnow,
     git_runner=None,
 ) -> Callable[[], dict[str, Any]]:
+    # #840 對抗審查修復（MAJOR）：`quota_decision_cache` 必須跨快照存活，
+    # 建在 `build_runtime_status_provider()` 這層（daemon 生命週期內只建一次
+    # 的閉包捕獲變數），不能放進下面 `provider()` 內部——否則每輪 tick 都會
+    # 重建一個空 cache，上一輪成功讀到的 decision 在下一輪 store 暫時損毀／
+    # 權限錯誤時完全遺失，退化成「讀不到就是讀不到」而不是 last-good（違反
+    # `DecisionReadCache` 的設計目的）。`quota_decision_store` 本身是唯讀
+    # append-only handle，跨快照共用同一個沒有正確性風險，一併搬到這裡。
+    from paulsha_cortex.coordinator import quota_admission as _quota_admission_module
+    from paulsha_cortex.monitor.decision_projection import DecisionReadCache
+
+    quota_decision_store = _quota_admission_module.AdmissionDecisionStore()
+    quota_decision_cache = DecisionReadCache()
+
     def recent_done_provider() -> list[dict[str, Any]]:
         manifests: list[tuple[str, dict[str, Any]]] = []
         handoff_path = Path(handoff_dir)
@@ -687,12 +700,10 @@ def build_runtime_status_provider(
         )
         # #840：整份快照共用同一個 decision store handle／last-good cache，
         # 確保這一輪 `attention` 清單裡每個 run 的 quota-decision 投影都是
-        # 對同一次 store 讀取結果，不會因為逐一重開檔案而互相漂移。
-        from paulsha_cortex.coordinator import quota_admission as _quota_admission_module
-        from paulsha_cortex.monitor.decision_projection import DecisionReadCache
-
-        quota_decision_store = _quota_admission_module.AdmissionDecisionStore()
-        quota_decision_cache = DecisionReadCache()
+        # 對同一次 store 讀取結果，不會因為逐一重開檔案而互相漂移；
+        # `quota_decision_store`／`quota_decision_cache` 本身在
+        # `build_runtime_status_provider()` 這層建立（見上方註解），跨快照
+        # 存活，這裡直接沿用閉包捕獲的變數，不重建。
         manager.reconcile_building_slices(registry)
         metas = scan_specs_fn(specs_dir)
         predicate = lambda slice_id: autonomy.default_is_satisfied(

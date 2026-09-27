@@ -19,7 +19,9 @@ allowlist：只輸出下面列舉的非機敏欄位；``selected``／``excluded`
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..coordinator import quota_admission as _quota_admission
@@ -81,6 +83,26 @@ def _classify_observation(state: object) -> str:
     return "unknown"
 
 
+def _file_identity(path: Path) -> tuple[int, int, int, int] | None:
+    """回傳 ``path`` 目前的檔案身分：``(size, mtime_ns, inode, mode)``。
+
+    只用來判斷『這個 store 檔案自從上次讀取後有沒有變』——append-only
+    寫入至少會改變 size／mtime；純權限變更（例如 #840 對抗審查驗收情境
+    裡用 chmod 模擬的損毀）不改變 size／mtime／inode，但會改變
+    ``st_mode``——``AdmissionDecisionStore._check_file`` 的 fail-closed
+    判定正是靠檔案權限位，因此權限位必須是身分的一部分，否則『純改權限、
+    內容沒變』會被誤判成『沒變』而漏讀，讓已經不再合法的檔案繼續沿用上一
+    次讀到的索引。刻意不用 ``st_ctime``：純 metadata 變更在部分檔案系統
+    （包含本專案 CI／開發機常見的 WSL2 環境）上不保證更新 ctime 解析度，
+    不是可靠訊號。檔案不存在（尚未寫過任何 decision）回傳 ``None``。
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_size, info.st_mtime_ns, info.st_ino, info.st_mode)
+
+
 @dataclass
 class _CachedDecision:
     decision: "_quota_admission.AdmissionDecision"
@@ -100,13 +122,54 @@ class DecisionReadCache:
     那是這次重新讀到的新鮮值（見票面 AC：『不得把過期選模或 unknown
     remaining 呈現成現在可派』）。
 
-    同一份 cache 實例應該在**同一次 status snapshot** 內共用（例如
-    ``manager_daemon.py`` 的 ``provider()`` closure 每輪重建一個），確保這一
-    輪快照裡所有 section 讀到的是同一次 store 存取結果。
+    同一份 cache 實例必須在**同一次 status snapshot** 內共用，確保這一輪
+    快照裡所有 section 讀到的是同一次 store 存取結果；同時**必須跨快照
+    存活**（daemon 生命週期內只建一個實例，不逐輪重建）——否則上一輪成功
+    讀到的 decision 會在下一輪重建時被丟棄，store 一旦暫時讀不到（損毀／
+    權限錯誤）就沒有 last-good 可回退，退化成單純的『這次讀不到』（對抗
+    審查第一輪 MAJOR）。``manager_daemon.py`` 的
+    ``build_runtime_status_provider()`` 在外層（呼叫一次、跨輪共用）建立
+    ``quota_decision_cache``，內層 ``provider()`` closure 每輪呼叫時沿用同
+    一個實例，不重建。
     """
 
     def __init__(self) -> None:
         self._cache: dict[str, _CachedDecision] = {}
+        # #840 對抗審查修復（MAJOR，manager.py 熱路徑）：`decision_id` →
+        # raw row 的全檔索引，一個 store 路徑最多存一份，只在檔案身分
+        # （見 `_file_identity`）真的變了才重讀。修好之前，`get()` 對每個
+        # persona／run 都直接呼叫 `store.get()`，等於整份 append-only 檔案
+        # 在同一輪 status 快照裡被重複線性掃描 N 次（N＝persona×run 數）。
+        # value 是 ``(identity, status, payload)``：`status="ok"` 時
+        # `payload` 是索引 dict；`status="error"` 時 `payload` 是失敗訊息
+        # 字串（供在同一個身分下重放同一個例外，不必真的重新開檔）。
+        self._index_by_path: dict[
+            str, tuple[tuple[int, int, int, int] | None, str, Any]
+        ] = {}
+
+    def _load_index(
+        self, store: "_quota_admission.AdmissionDecisionStore"
+    ) -> dict[str, dict[str, Any]]:
+        path_key = str(store.path)
+        identity = _file_identity(store.path)
+        cached = self._index_by_path.get(path_key)
+        if cached is not None and cached[0] == identity:
+            _, status, payload = cached
+            if status == "ok":
+                return payload
+            raise _quota_admission.AdmissionDecisionCorrupt(payload)
+        try:
+            rows = store.all_rows()
+        except _quota_admission.AdmissionDecisionCorrupt as exc:
+            self._index_by_path[path_key] = (identity, "error", str(exc))
+            raise
+        index = {
+            row["decision_id"]: row
+            for row in rows
+            if isinstance(row, Mapping) and isinstance(row.get("decision_id"), str)
+        }
+        self._index_by_path[path_key] = (identity, "ok", index)
+        return index
 
     def get(
         self,
@@ -121,10 +184,14 @@ class DecisionReadCache:
         該 decision_id 從 append-only store 裡『消失』（不該發生，但仍保守
         回報而非靜默吞掉）；此時 ``decision`` 是快取的 last-good（可能仍是
         ``None``，若從未成功讀過）。
+
+        內部經 :meth:`_load_index` 走同一份『整檔索引』——同一個 store 檔案
+        身分不變時，無論呼叫幾次 :meth:`get`（幾個 persona、幾個 run）都只
+        真的讀一次檔案，索引在記憶體內查表。
         """
 
         try:
-            decision = store.get(decision_id)
+            index = self._load_index(store)
         except _quota_admission.AdmissionDecisionCorrupt as exc:
             cached = self._cache.get(decision_id)
             return (
@@ -136,6 +203,8 @@ class DecisionReadCache:
                     "observed_at_ms": now_ms,
                 },
             )
+        row = index.get(decision_id)
+        decision = _quota_admission.AdmissionDecision.from_row(row) if row is not None else None
         if decision is not None:
             self._cache[decision_id] = _CachedDecision(decision=decision, read_at_ms=now_ms)
             return decision, None

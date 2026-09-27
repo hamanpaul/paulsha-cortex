@@ -49,7 +49,7 @@ sufficient／unknown（shadow 模式下候選不可行一樣會被 admit）、�
 `manager_daemon.py` 從 quota-pools 設定檔的 `config_revision` 帶入）。未改變
 准入判定、reservation 生命週期或既有欄位語意。
 
-新增 19 個測試：`tests/test_decision_status_projection_840.py`，覆蓋多
+新增 21 個測試：`tests/test_decision_status_projection_840.py`，覆蓋多
 persona／retry／跨 run-card exact-key、negative（wait 無 Job、unknown
 remaining、缺 provenance 的 legacy receipt、needs_human 語意保留、planned
 不造 actual）、`workflow_status_entry` 與 `WorkflowRegistryProvider.scan()`
@@ -60,3 +60,56 @@ remaining、缺 provenance 的 legacy receipt、needs_human 語意保留、plann
 本票刻意不改派工行為、不改 #839 決策邏輯；status 熱路徑只讀既有 Trust Root
 資產與 registry row，不評測、不探測 provider。installed／live canary 仍是
 獨立部署 gate，未在本票執行。
+
+## 對抗審查修復（5 條 MAJOR，本輪追加）
+
+1. **`AdmissionDecision` 三個 #840 選填欄位不需要 schema bump**：
+   `selected_observation_state`／`selected_feasible`／`policy_config_revision`
+   與 #839 本身同一個 release 一起發布——#839 從未獨立上線過，不存在
+   「#839-only（無 #840）的已發布版本讀不懂這三個新 key」的相容性缺口，
+   `schema_version` 維持 `1`。三欄位是 v1 內的選填鍵加法（比照 #839
+   `_QuotaPoolsConfig` 既有模式），讀取端（`_read_fd`）本來就已容忍缺這三
+   個 key 的舊 row；補了 `tests/test_quota_admission_839.py` 的
+   `test_store_get_tolerates_legacy_row_missing_840_optional_keys` 直接在
+   store 層級鎖住這個容忍度（先前只間接由 `decision_projection` 的 legacy
+   receipt 測試覆蓋）。
+2. **`AdmissionDecisionStore.record()` 冪等重放誤判 fix**（`quota_admission.py`）：
+   原本用磁碟上的 raw row 直接跟新算出的 `to_row()` dict 做相等比較——缺
+   三個 #840 選填欄位的既有紀錄（#839-only 時期寫的）重送同一個
+   `decision_id` 時，兩邊 key 集合不同，即使語意完全等價（都是
+   unknown／None）也會被誤判成 `admission-decision-id-conflict`。改成
+   `existing` 先經 `AdmissionDecision.from_row().to_row()` 正規化（缺席鍵
+   補齊為 `None`）再比較，真正矛盾（正規化後仍不同）才 fail closed。補
+   `test_record_replay_of_legacy_row_missing_840_optional_keys_is_idempotent_not_conflict`。
+3. **`work_api.WorkReadModelStore._quota_decision()` 跨 repo 洩漏 fix**：
+   原本只憑 provider_id 前綴是不是 `workflow:` 就挑第一個命中的
+   `quota_decisions[work_id]`，完全沒比對 `repo` 參數；兩個 repo 若剛好有
+   同一個 `work_id`（跨 repo 不保證唯一）會把另一個 repo 的
+   quota_decision 錯配過來。改用 `_provider_repo()`（沿用 work_api 既有的
+   provider↔repo 比對慣例）做 exact `(repo, work_id)` 匹配。補
+   `test_quota_decision_is_scoped_to_exact_repo_not_leaked_across_repos`
+   （`tests/test_monitor_work_api.py`）。
+4. **`quota_decision_cache` 跨快照存活 fix**（`manager_daemon.py`）：
+   `DecisionReadCache` 過去建在 `build_runtime_status_provider()` 的
+   `provider()` closure 內部，每輪 status 快照都重建一個空 cache——上一輪
+   成功讀到的 decision 在下一輪 store 暫時損毀／權限錯誤時完全遺失，退化成
+   單純的『這次讀不到』而非 last-good。改成建在
+   `build_runtime_status_provider()` 這層（呼叫一次、daemon 生命週期內共用
+   的閉包變數），`provider()` 每輪呼叫沿用同一個實例。補
+   `test_daemon_wired_cache_persists_across_snapshot_ticks_for_last_good_stale`：
+   同一個 `provider` closure 呼叫兩次模擬兩輪 tick，第二輪損毀時驗證仍
+   完整保留第一輪 last-good 內容（`mode`／`decision_id`）＋精確 stale
+   原因。
+5. **status 熱路徑每個 persona 都全檔重讀 fix**（`decision_projection.py`／
+   `quota_admission.py`）：`DecisionReadCache.get()` 過去對每個 persona 都
+   直接呼叫 `AdmissionDecisionStore.get()`（全檔線性掃描），即使 store／
+   cache 已經在同一輪快照內共用，append-only 檔仍會被重複讀 N 次（N＝run
+   數×persona 數）。新增 `AdmissionDecisionStore.all_rows()`（`get()`／
+   `enforced_admitted()` 既有 `_read()` 的公開包裝，不新增驗證規則）與
+   `DecisionReadCache` 內部的 `decision_id → row` 全檔索引，只在檔案身分
+   `(size, mtime_ns, inode, mode)` 改變時才重讀（權限位刻意納入身分——純
+   chmod 不動 size／mtime／inode，但 `_check_file` 的 fail-closed 判定正
+   是靠權限位；不用 `ctime` 是因為部分檔案系統（含本機開發環境常見的
+   WSL2）metadata-only 變更不保證更新 ctime 解析度）。補
+   `test_shared_cache_reads_store_at_most_once_per_snapshot_across_many_runs_and_personas`：
+   3 個 run×2 個 persona＝6 次查詢，監看 `all_rows()` 只被呼叫一次。

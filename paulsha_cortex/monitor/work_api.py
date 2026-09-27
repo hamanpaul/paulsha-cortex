@@ -302,6 +302,14 @@ class WorkReadModelStore:
         for provider_id, provider in self._snapshot.providers.items():
             if not provider_id.startswith("workflow:"):
                 continue
+            # 對抗審查 MAJOR：原先只憑 `workflow:` 前綴挑 provider，完全沒用
+            # 到 `repo` 參數——兩個 repo 各自的 workflow provider 若剛好有
+            # 同一個 `work_id`（跨 repo work_id 不保證唯一），會把另一個 repo
+            # 的 quota_decision 錯配過來。沿用 `_provider_repo()`（見本檔
+            # 下方，`envelope`／provider 列表既有的 repo 比對方式）做
+            # exact (repo, work_id) 匹配，不再只靠 work_id 命中就回傳。
+            if _provider_repo(provider_id) != repo:
+                continue
             observations = provider.observations
             if not isinstance(observations, Mapping):
                 continue

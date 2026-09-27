@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 from pathlib import Path
 
@@ -702,3 +703,83 @@ def test_record_fsyncs_directories_on_every_append_not_only_first(tmp_path: Path
     second_id = admission.decision_id_for(run_id="run-1", card_id="card-1", attempt_id="job-2", profile_key=_PROFILE_A)
     store.record(_shadow_decision(second_id))
     assert str(tmp_path) in synced
+
+
+# ---------------------------------------------------------------------------
+# #840 對抗審查修復 item 1／2（quota_admission.py 約 667／762）：
+# `AdmissionDecision.selected_observation_state`／`selected_feasible`／
+# `policy_config_revision` 是 #839 receipt 上新增的三個選填欄位，與 #840 同一
+# 個 release 一起發布（#839-only、從未發布的中間版本讀不懂三個新 key 不構成
+# schema bump 理由）。讀取端必須容忍舊 row 缺這三個 key；`record()` 的
+# 冪等重放比對也必須是「正規化後比較」，不能因為 raw dict 的 key 集合不同
+# 就把語意等價的重放誤判成衝突。
+# ---------------------------------------------------------------------------
+
+
+def test_store_get_tolerates_legacy_row_missing_840_optional_keys(tmp_path: Path) -> None:
+    """讀取端（#840 之前寫的 #839-only row）必須容忍缺
+    `selected_observation_state`／`selected_feasible`／`policy_config_revision`
+    三個 #840 新增選填欄位，不得判成 `admission-decision-store-invalid-record`。"""
+    path = tmp_path / "decisions.jsonl"
+    decision_id = admission.decision_id_for(run_id="run-1", card_id="card-1", attempt_id="job-1", profile_key=_PROFILE_A)
+    legacy_row = {
+        "schema_version": 1, "decision_id": decision_id, "run_id": "run-1", "card_id": "card-1",
+        "attempt_id": "job-1", "profile_key": _PROFILE_A, "mode": "shadow", "outcome": "wait",
+        "policy_version": admission.ADMISSION_POLICY_VERSION, "observation_version": "obs-v1",
+        "demand_version": "demand-v1", "qualification_version": "not-enforced",
+        "generated_at_ms": _NOW, "selected": None, "reservation_id": None, "excluded": [],
+        "reason": "quota-admission-insufficient", "job_id": None,
+        # 刻意不含三個 #840 選填欄位——模擬 #839-only（#840 之前）寫入的舊 row。
+    }
+    path.write_text(json.dumps(legacy_row, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    store = admission.AdmissionDecisionStore(path)
+
+    decision = store.get(decision_id)
+    assert decision is not None
+    assert decision.selected_observation_state is None
+    assert decision.selected_feasible is None
+    assert decision.policy_config_revision is None
+
+
+def test_record_replay_of_legacy_row_missing_840_optional_keys_is_idempotent_not_conflict(
+    tmp_path: Path,
+) -> None:
+    """既有紀錄缺 #840 三個選填欄位時，重送同一個 decision_id（三欄位在新
+    decision 上同樣是 None，語意等價於『缺席』）必須被視為冪等重放，不是
+    `admission-decision-id-conflict`；真的矛盾內容仍必須 fail closed。"""
+    path = tmp_path / "decisions.jsonl"
+    decision_id = admission.decision_id_for(run_id="run-1", card_id="card-1", attempt_id="job-1", profile_key=_PROFILE_A)
+    legacy_row = {
+        "schema_version": 1, "decision_id": decision_id, "run_id": "run-1", "card_id": "card-1",
+        "attempt_id": "job-1", "profile_key": _PROFILE_A, "mode": "shadow", "outcome": "wait",
+        "policy_version": admission.ADMISSION_POLICY_VERSION, "observation_version": "obs-v1",
+        "demand_version": "demand-v1", "qualification_version": "not-enforced",
+        "generated_at_ms": _NOW, "selected": None, "reservation_id": None, "excluded": [],
+        "reason": "quota-admission-insufficient", "job_id": None,
+    }
+    path.write_text(json.dumps(legacy_row, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    store = admission.AdmissionDecisionStore(path)
+
+    replay_decision = admission.AdmissionDecision(
+        decision_id=decision_id, run_id="run-1", card_id="card-1", attempt_id="job-1",
+        profile_key=_PROFILE_A, mode="shadow", outcome="wait",
+        policy_version=admission.ADMISSION_POLICY_VERSION, observation_version="obs-v1",
+        demand_version="demand-v1", qualification_version="not-enforced", generated_at_ms=_NOW,
+        reason="quota-admission-insufficient",
+        selected_observation_state=None, selected_feasible=None, policy_config_revision=None,
+    )
+    replayed = store.record(replay_decision)
+    assert replayed.decision_id == decision_id
+    assert replayed.reason == "quota-admission-insufficient"
+
+    conflicting = admission.AdmissionDecision(
+        decision_id=decision_id, run_id="run-1", card_id="card-1", attempt_id="job-1",
+        profile_key=_PROFILE_A, mode="shadow", outcome="wait",
+        policy_version=admission.ADMISSION_POLICY_VERSION, observation_version="obs-v1",
+        demand_version="demand-v1", qualification_version="not-enforced", generated_at_ms=_NOW,
+        reason="quota-config-invalid",
+    )
+    with pytest.raises(admission.AdmissionDecisionCorrupt):
+        store.record(conflicting)
