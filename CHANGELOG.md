@@ -9,6 +9,7 @@
 
 ### Added
 
+- **review malformed 預檢**：接受不帶選填 `authority_hashes` 的合法 review envelope（#1118）。
 - **v0.1.11 發版**：`VERSION` 升為 0.1.11，收錄 refine 完整交付與 live 驗收修正（見 `changelog.d/release-0-1-11.md`）。
 - **work-items 衝突解除（續）**：`wave4-large-bug-integration` 明確歸屬 #475，消除 PR #1090 的 fallback 群組殘留衝突。
 - **#839／#836 共用設定檔**：admission 接受 collector 的選填 `collector_targets`，同一份 `quota-pools.json` 可同時供兩者使用。

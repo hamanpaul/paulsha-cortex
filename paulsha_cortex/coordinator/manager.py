@@ -6749,8 +6749,12 @@ def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
         allowed = required | (
             {"authority_hashes"} if has_planning_authority else set()
         )
+        # #922 已讓 `authority_hashes` 成為選填（terminalize 接受缺席並由 Manager
+        # 依 job snapshot 補齊）；預檢必須與 terminalize 的鍵集合規則一致，否則
+        # 合法 envelope 會在 terminalize 之前被判 malformed、耗盡 schema retry 額度
+        # （live dogfood 回歸）。
         return not (
-            set(review_raw) == allowed
+            set(review_raw) in (required, allowed)
             and type(review_raw.get("schema_version")) is int
             and review_raw.get("schema_version") == 1
             and review_raw.get("kind") == "workflow-review-result"
