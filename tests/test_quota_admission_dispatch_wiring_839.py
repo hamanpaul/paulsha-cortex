@@ -177,6 +177,24 @@ def _observe(shadow: QuotaShadowService, descriptor, window_id: str, value: str,
     assert result.accepted == 1
 
 
+def _freeze_wall_clock(monkeypatch: pytest.MonkeyPatch, *, now_ms: int) -> None:
+    """凍結 `time.time()` 在 `now_ms`（毫秒）這一刻，讓整個測試裡的每一次取樣
+    ——測試自己傳給 `_observe()` 的 `now_ms`，以及 `manager._dispatch_workflow_card`
+    內部各處各自重新呼叫的 `int(time.time() * 1000)`（assess／reserve／bind／
+    settle／release 都各自取樣一次，不是共用同一個值）——都讀到同一個時間點。
+
+    沒有這個凍結時，CPU 滿載會拖長 `_init_worktree()` 的 subprocess／worktree
+    建立與 dispatch 本身的耗時，讓 `_observe()` 記錄觀測的那一刻與 dispatch
+    內部真正讀取 remaining 的那一刻之間的牆鐘落差變大；一旦落差超過 fixture
+    觀測的 60 秒 TTL（見 `_observe` 的 `ttl_ms`），原本 sufficient 的額度就會
+    被 `quota_shadow.project()` 判定成 stale／unknown（exclusion_reason
+    `unknown-remaining-quota`），造成間歇性失敗（見 #839 dogfood：CPU 滿載下
+    約一半回合失敗，無負載時逐次都通過）。凍結後這條路徑完全不受牆鐘影響，
+    不論環境多慢都逐字可重現。
+    """
+    monkeypatch.setattr(time, "time", lambda: now_ms / 1000)
+
+
 def _dispatch(registry, run, identities, worktree, coordinator_root, *, quota_admission_context=None):
     dispatcher = type(
         "D", (), {"_registry": registry, "_git_runner": None, "_worktree_creator": _FakeWorktreeCreator(worktree)}
@@ -196,7 +214,16 @@ def _init_worktree(path: Path) -> None:
     subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"], check=True)
     (path / "a.txt").write_text("base\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(path), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "base"], check=True)
+    # 固定 author/committer 時間戳──commit SHA 內含秒級時間，沒有固定時間時
+    # 兩個獨立 worktree 只要初始化跨過牆鐘秒界就會產生不同的 `dispatch_head`
+    # （CPU 滿載下 subprocess 變慢，更容易跨秒），讓比較兩個 worktree 派工
+    # 結果的測試間歇性失敗；固定時間讓初始 commit 逐字可重現，不受牆鐘影響。
+    commit_env = dict(os.environ)
+    commit_env["GIT_AUTHOR_DATE"] = "2000-01-01T00:00:00Z"
+    commit_env["GIT_COMMITTER_DATE"] = "2000-01-01T00:00:00Z"
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-q", "-m", "base"], check=True, env=commit_env,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -219,7 +246,9 @@ def test_baseline_without_quota_context_is_fully_unaffected(tmp_path: Path) -> N
     assert job["executor"] == "codex"
 
 
-def test_shadow_mode_records_decision_but_never_blocks_dispatch(tmp_path: Path) -> None:
+def test_shadow_mode_records_decision_but_never_blocks_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     worktree = tmp_path / "wt"
     _init_worktree(worktree)
@@ -229,9 +258,11 @@ def test_shadow_mode_records_decision_but_never_blocks_dispatch(tmp_path: Path) 
     codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
     profile_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
 
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
     descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
     shadow = QuotaShadowService.in_memory()
-    _observe(shadow, descriptor, "short", "0", profile_key=profile_key, now_ms=int(time.time() * 1000))
+    _observe(shadow, descriptor, "short", "0", profile_key=profile_key, now_ms=now_ms)
     ctx = quota_admission.DispatchContext(
         authority=QuotaReservationAuthority(tmp_path / "reservations.jsonl"),
         store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
@@ -342,7 +373,9 @@ def test_shadow_mode_store_record_failure_never_changes_dispatch_result(
     assert shadow_run_after.quota_admission is None
 
 
-def test_opt_in_independent_pool_alternative_is_selected_same_pool_alternative_rejected(tmp_path: Path) -> None:
+def test_opt_in_independent_pool_alternative_is_selected_same_pool_alternative_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     worktree = tmp_path / "wt"
     _init_worktree(worktree)
@@ -358,6 +391,7 @@ def test_opt_in_independent_pool_alternative_is_selected_same_pool_alternative_r
     exhausted = _pool_descriptor(account="acct-codex", pool="pool-codex")
     independent = _pool_descriptor(account="acct-claude", pool="pool-claude")
     now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
     shadow = QuotaShadowService.in_memory()
     _observe(shadow, exhausted, "short", "0", profile_key=codex_key, now_ms=now_ms)
     _observe(shadow, independent, "short", "50", profile_key=claude_key, now_ms=now_ms)
@@ -389,7 +423,9 @@ def test_opt_in_independent_pool_alternative_is_selected_same_pool_alternative_r
     assert status.job_id == result["job_id"]
 
 
-def test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason(tmp_path: Path) -> None:
+def test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     worktree = tmp_path / "wt"
     _init_worktree(worktree)
@@ -405,6 +441,7 @@ def test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason(t
     descriptor_a = _pool_descriptor(account="acct-codex", pool="pool-codex")
     descriptor_b = _pool_descriptor(account="acct-claude", pool="pool-claude")
     now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
     shadow = QuotaShadowService.in_memory()
     _observe(shadow, descriptor_a, "short", "0", profile_key=codex_key, now_ms=now_ms)
     _observe(shadow, descriptor_b, "short", "0", profile_key=claude_key, now_ms=now_ms)
@@ -453,6 +490,7 @@ def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(
 
     descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
     now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
     shadow = QuotaShadowService.in_memory()
     _observe(shadow, descriptor, "short", "5", profile_key=codex_key, now_ms=now_ms)
     ctx = quota_admission.DispatchContext(
@@ -502,7 +540,9 @@ def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(
     assert terminal_usage_calls[0]["job"]["id"] == job["job_id"]
 
 
-def test_ac3_two_instances_race_for_last_unit_only_one_gets_bound_job(tmp_path: Path) -> None:
+def test_ac3_two_instances_race_for_last_unit_only_one_gets_bound_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """兩個 Manager instance 共用同一份 reservation authority 檔案；模擬第二個
     instance 在第一個 instance 完成 reserve() 之後，搶先把剩餘容量吃光——第一
     個 instance 隨後嘗試 bind 前，其實已經在 reserve() 當下就該被擋下（見
@@ -522,6 +562,7 @@ def test_ac3_two_instances_race_for_last_unit_only_one_gets_bound_job(tmp_path: 
 
     descriptor = _pool_descriptor(account="acct-shared", pool="pool-shared")
     now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
     shadow = QuotaShadowService.in_memory()
     # 同一個共享 pool 只有一個 remaining 值——兩個候選各自的 binding 都指向
     # 這同一個 pool/window，不需要（也不該）為每個 profile 各記一筆觀測。
@@ -556,7 +597,9 @@ def test_ac3_two_instances_race_for_last_unit_only_one_gets_bound_job(tmp_path: 
     assert registry.list_jobs() == []
 
 
-def test_race_loss_on_top_ranked_candidate_falls_back_to_independent_pool_candidate(tmp_path: Path) -> None:
+def test_race_loss_on_top_ranked_candidate_falls_back_to_independent_pool_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """對抗審查 MAJOR（manager.py:13643）：排名第一的可行候選在原子預留階段
     race 落敗時（另一個 instance 搶先吃光它自己那個池），不得直接回
     quota-admission-insufficient——必須排除該候選、依既有排序對下一個候選
@@ -579,6 +622,7 @@ def test_race_loss_on_top_ranked_candidate_falls_back_to_independent_pool_candid
     codex_pool = _pool_descriptor(account="acct-codex", pool="pool-codex")
     claude_pool = _pool_descriptor(account="acct-claude", pool="pool-claude")
     now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
     shadow = QuotaShadowService.in_memory()
     # 兩個候選各自的池在 shadow 投影裡都還很充裕——assess 階段兩者都可行；
     # race 只發生在原子預留這一層，shadow 的唯讀投影看不到它。
@@ -628,7 +672,7 @@ def test_race_loss_on_top_ranked_candidate_falls_back_to_independent_pool_candid
 
 
 def test_duplicate_reservation_from_concurrent_manager_is_never_released_on_failure(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """對抗審查第二輪 MAJOR（manager.py:13848）：`reserve_for_candidate()` 的
     冪等回放（`status == "duplicate"`）代表這個 decision_id 的 reservation
@@ -660,6 +704,7 @@ def test_duplicate_reservation_from_concurrent_manager_is_never_released_on_fail
 
     descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
     now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
     shadow = QuotaShadowService.in_memory()
     _observe(shadow, descriptor, "short", "10", profile_key=codex_key, now_ms=now_ms)
     authority_path = tmp_path / "reservations.jsonl"
@@ -723,7 +768,7 @@ def test_duplicate_reservation_from_concurrent_manager_is_never_released_on_fail
 
 
 def test_duplicate_reservation_already_terminated_advances_to_next_generation_and_dispatches(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """對抗審查第三輪 MAJOR（manager.py:13961）：上一次 retry 在
     `create_job()` 之前失敗，已經把這個 attempt 的 reservation
@@ -748,6 +793,7 @@ def test_duplicate_reservation_already_terminated_advances_to_next_generation_an
 
     descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
     now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
     shadow = QuotaShadowService.in_memory()
     _observe(shadow, descriptor, "short", "10", profile_key=codex_key, now_ms=now_ms)
     authority_path = tmp_path / "reservations.jsonl"
