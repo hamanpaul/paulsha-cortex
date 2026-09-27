@@ -73,6 +73,8 @@ def test_start_reuses_stage_evidence_and_does_not_dispatch_a_new_job(
     stage_execution_key = compute_stage_execution_key(
         repo="hamanpaul/paulsha-cortex",
         work_id="214-stage-execution-key",
+        run_id="prior-run",
+        claim_key="claim:v1:" + "1" * 64,
         card="build",
         phase="build",
         executor="codex",
@@ -82,6 +84,7 @@ def test_start_reuses_stage_evidence_and_does_not_dispatch_a_new_job(
         frozen_input_hashes=("1" * 64,),
         action="propose-diff",
         test_policy="focused",
+        execution_profile_key="epk:v1:resolved:" + "7" * 64,
     )
     prior_job = registry.create_job(
         task="prior-build",
@@ -166,6 +169,8 @@ def test_start_dispatches_normally_when_no_reusable_stage_evidence(
     unmatched_key = compute_stage_execution_key(
         repo="hamanpaul/paulsha-cortex",
         work_id="214-stage-execution-key",
+        run_id="prior-run",
+        claim_key="claim:v1:" + "1" * 64,
         card="build",
         phase="build",
         executor="codex",
@@ -175,6 +180,7 @@ def test_start_dispatches_normally_when_no_reusable_stage_evidence(
         frozen_input_hashes=("1" * 64,),
         action="propose-diff",
         test_policy="focused",
+        execution_profile_key="epk:v1:resolved:" + "7" * 64,
     )
     result = executor(
         build_request(

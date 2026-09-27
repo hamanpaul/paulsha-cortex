@@ -137,6 +137,74 @@ def _validate_execution_profile_bindings(
             )
 
 
+_STAGE_REUSE_DECISIONS = frozenset({"reused", "fresh", "ineligible"})
+
+
+def _is_stage_execution_key(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _validate_stage_reuse_receipts(
+    value: object, steps: tuple[WorkflowStep, ...]
+) -> None:
+    """#844：`stage_reuse_receipts` 只是 provenance 快照，不做 admission 判定；
+    這裡只驗形狀，不重新裁決是否真的可以 reuse——那是 manager 層的責任。
+
+    對抗審查 MAJOR-1 修法新增 ``"ineligible"``：既有 job 帶 key 但
+    manager 探測階段無法判定相容性（launcher／execution-profile 綁不
+    出、沒有 eligible candidate）時的過渡標記——此時還沒有派出新 job，
+    也就沒有新 `stage_execution_key` 可記，因此 ``"ineligible"`` 不要求
+    `stage_execution_key`（那是 `"reused"`／`"fresh"` 才有的欄位），改要
+    求非空 `reason`；`superseded_key` 若出現仍須是合法 key 格式（引用被
+    判定 ineligible 的那顆舊 job key）。
+    """
+
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError("workflow run stage_reuse_receipts 必須為null或dict")
+    known_cards = {step.card for step in steps}
+    for card, receipt in value.items():
+        if not isinstance(card, str) or not card or card not in known_cards:
+            raise ValueError(f"workflow run stage_reuse_receipts card 非法: {card!r}")
+        if not isinstance(receipt, dict):
+            raise ValueError(f"workflow run stage_reuse_receipts[{card!r}] 必須為dict")
+        decision = receipt.get("decision")
+        if decision not in _STAGE_REUSE_DECISIONS:
+            raise ValueError(
+                f"workflow run stage_reuse_receipts[{card!r}].decision 非法"
+            )
+        if decision == "ineligible":
+            reason = receipt.get("reason")
+            if not isinstance(reason, str) or not reason:
+                raise ValueError(
+                    f"workflow run stage_reuse_receipts[{card!r}].reason 必須為非空字串"
+                )
+            superseded_key = receipt.get("superseded_key")
+            if superseded_key is not None and not _is_stage_execution_key(superseded_key):
+                raise ValueError(
+                    f"workflow run stage_reuse_receipts[{card!r}].superseded_key 格式錯誤"
+                )
+        else:
+            key = receipt.get("stage_execution_key")
+            if not _is_stage_execution_key(key):
+                raise ValueError(
+                    f"workflow run stage_reuse_receipts[{card!r}].stage_execution_key 格式錯誤"
+                )
+        mismatched = receipt.get("mismatched_fields")
+        if mismatched is not None and (
+            not isinstance(mismatched, list)
+            or any(not isinstance(item, str) or not item for item in mismatched)
+        ):
+            raise ValueError(
+                f"workflow run stage_reuse_receipts[{card!r}].mismatched_fields 格式錯誤"
+            )
+
+
 MODEL_QUALIFICATION_STATES = frozenset({"not-enforced", "enforced"})
 
 
@@ -781,6 +849,14 @@ class WorkflowRun:
     # from_dict 忽略未知頂層鍵，row 內新鍵則會被舊版封閉驗證拒收。
     model_qualification: dict[str, str] | None = None
     combo_selection: dict[str, Any] | None = None
+    # #844：verify／review 卡的 stage-evidence reuse 決策快照（card ->
+    # {"decision": "reused"/"fresh", "stage_execution_key": ..., ...}）。純
+    # provenance／診斷用途，不是 admission authority——真正的 reuse 判定在
+    # `manager._workflow_stage_reuse_probe()`／`registry.find_reusable_stage_evidence()`；
+    # 這裡只負責讓 status／`cortex status` 能看見「這張卡是 reuse 還是重新執
+    # 行」，比照 execution_profile_bindings／model_qualification 的加法模式。
+    # 缺席（None）＝尚未有任何 reuse 決策，legacy run 天然缺席。
+    stage_reuse_receipts: dict[str, dict[str, Any]] | None = None
     # 診斷 invariant 家族（#527／#514／#515／#511／#482）：把 run 轉入
     # `needs_human` 的那一刻必須同時落一份結構化理由（`diagnostics.
     # DiagnosticReason` 的 dict 投影：機器可讀 reason ＋ 人可讀 detail ＋ 來源
@@ -1004,6 +1080,7 @@ class WorkflowRun:
         )
         _validate_model_qualification(self.model_qualification)
         _validate_combo_selection(self.combo_selection)
+        _validate_stage_reuse_receipts(self.stage_reuse_receipts, self.steps)
         if self.needs_human_reason is not None:
             # 形狀驗證：DiagnosticReason.from_dict 自己 fail-closed（reason 必須
             # 是 kebab-case 機器碼、detail 非空、source 為 <module>.<function>）。
@@ -1089,6 +1166,10 @@ class WorkflowRun:
             }
         if self.model_qualification is not None:
             payload["model_qualification"] = dict(self.model_qualification)
+        if self.stage_reuse_receipts is not None:
+            payload["stage_reuse_receipts"] = {
+                card: dict(receipt) for card, receipt in self.stage_reuse_receipts.items()
+            }
         return payload
 
     @classmethod
@@ -1182,6 +1263,7 @@ class WorkflowRun:
             execution_profile_bindings=payload.get("execution_profile_bindings"),
             model_qualification=payload.get("model_qualification"),
             combo_selection=payload.get("combo_selection"),
+            stage_reuse_receipts=payload.get("stage_reuse_receipts"),
             # 既有部署的狀態檔沒有這個欄位；缺席時維持 None（facet 有、理由沒有
             # 的 legacy run 照常載入，見上方 __post_init__ 的說明）。facet 已清
             # 掉卻殘留理由的狀態檔（手改／舊版寫壞）在此直接丟掉，避免載入即炸。

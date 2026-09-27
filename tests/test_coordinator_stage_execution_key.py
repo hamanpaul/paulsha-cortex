@@ -15,13 +15,21 @@ from pathlib import Path
 
 import pytest
 
-from paulsha_cortex.coordinator.registry import JobRegistry, compute_stage_execution_key
+from paulsha_cortex.coordinator.registry import (
+    STAGE_EXECUTION_KEY_SCHEMA_VERSION,
+    JobRegistry,
+    compute_stage_execution_key,
+    describe_stage_execution_mismatch,
+    stage_execution_receipt,
+)
 
 
 def _key_kwargs(**overrides: object) -> dict:
     base = {
         "repo": "hamanpaul/paulsha-cortex",
         "work_id": "214-stage-execution-key",
+        "run_id": "workflow-214-run",
+        "claim_key": "claim:v1:" + "9" * 64,
         "card": "build",
         "phase": "build",
         "executor": "codex",
@@ -31,6 +39,7 @@ def _key_kwargs(**overrides: object) -> dict:
         "frozen_input_hashes": ("1" * 64, "2" * 64),
         "action": "propose-diff",
         "test_policy": "focused",
+        "execution_profile_key": "epk:v1:resolved:" + "7" * 64,
     }
     base.update(overrides)
     return base
@@ -58,6 +67,8 @@ class TestComputeStageExecutionKey:
         [
             ("repo", "other/repo"),
             ("work_id", "different-work"),
+            ("run_id", "workflow-other-run"),
+            ("claim_key", "claim:v1:" + "8" * 64),
             ("card", "review"),
             ("phase", "verify"),
             ("executor", "claude"),
@@ -66,6 +77,7 @@ class TestComputeStageExecutionKey:
             ("candidate_sha", "d" * 40),
             ("action", "commit-diff"),
             ("test_policy", "full"),
+            ("execution_profile_key", "epk:v1:resolved:" + "6" * 64),
         ],
     )
     def test_any_covered_field_change_invalidates_key(self, field: str, changed: str) -> None:
@@ -83,8 +95,9 @@ class TestComputeStageExecutionKey:
     @pytest.mark.parametrize(
         "field",
         [
-            "repo", "work_id", "card", "phase", "executor", "model",
-            "base_sha", "candidate_sha", "action", "test_policy",
+            "repo", "work_id", "run_id", "claim_key", "card", "phase",
+            "executor", "model", "base_sha", "candidate_sha", "action",
+            "test_policy", "execution_profile_key",
         ],
     )
     def test_rejects_empty_string_field(self, field: str) -> None:
@@ -94,6 +107,73 @@ class TestComputeStageExecutionKey:
     def test_rejects_empty_frozen_input_hash_entry(self) -> None:
         with pytest.raises(ValueError):
             compute_stage_execution_key(**_key_kwargs(frozen_input_hashes=("1" * 64, "")))
+
+
+class TestStageExecutionReceipt:
+    """#844 S02／S03／S04：逐欄快照＋itemized 不相容診斷。"""
+
+    def test_receipt_key_matches_compute_stage_execution_key(self) -> None:
+        receipt = stage_execution_receipt(**_key_kwargs())
+        assert receipt["key"] == compute_stage_execution_key(**_key_kwargs())
+        assert receipt["schema_version"] == STAGE_EXECUTION_KEY_SCHEMA_VERSION
+        assert receipt["frozen_input_hashes"] == sorted(_key_kwargs()["frozen_input_hashes"])
+
+    def test_describe_mismatch_empty_for_identical_receipts(self) -> None:
+        current = stage_execution_receipt(**_key_kwargs())
+        stored = stage_execution_receipt(**_key_kwargs())
+        assert describe_stage_execution_mismatch(current, stored) == ()
+
+    @pytest.mark.parametrize(
+        "field,changed",
+        [
+            ("run_id", "workflow-other-run"),
+            ("claim_key", "claim:v1:" + "8" * 64),
+            ("model", "a-different-model"),
+            ("execution_profile_key", "epk:v1:resolved:" + "6" * 64),
+        ],
+    )
+    def test_describe_mismatch_names_the_changed_field(self, field: str, changed: str) -> None:
+        current = stage_execution_receipt(**_key_kwargs())
+        stored = stage_execution_receipt(**_key_kwargs(**{field: changed}))
+        assert field in describe_stage_execution_mismatch(current, stored)
+
+    def test_describe_mismatch_ignores_frozen_input_hash_order(self) -> None:
+        current = stage_execution_receipt(
+            **_key_kwargs(frozen_input_hashes=("1" * 64, "2" * 64))
+        )
+        stored = stage_execution_receipt(
+            **_key_kwargs(frozen_input_hashes=("2" * 64, "1" * 64))
+        )
+        assert describe_stage_execution_mismatch(current, stored) == ()
+
+    def test_describe_mismatch_detects_frozen_input_hash_change(self) -> None:
+        current = stage_execution_receipt(**_key_kwargs())
+        stored = stage_execution_receipt(
+            **_key_kwargs(frozen_input_hashes=("1" * 64, "3" * 64))
+        )
+        assert "frozen_input_hashes" in describe_stage_execution_mismatch(current, stored)
+
+    def test_missing_receipt_field_counts_as_mismatch(self) -> None:
+        current = stage_execution_receipt(**_key_kwargs())
+        stored = dict(current)
+        del stored["execution_profile_key"]
+        assert "execution_profile_key" in describe_stage_execution_mismatch(current, stored)
+
+
+class TestStageExecutionKeyRunAndEraBinding:
+    """#844：run_id／claim_key 烤進雜湊，跨 run／跨 claim-era 在雜湊層即不可能相同。"""
+
+    def test_different_run_id_never_collides(self) -> None:
+        same_run = compute_stage_execution_key(**_key_kwargs())
+        other_run = compute_stage_execution_key(**_key_kwargs(run_id="workflow-different-run"))
+        assert same_run != other_run
+
+    def test_different_claim_key_never_collides(self) -> None:
+        same_era = compute_stage_execution_key(**_key_kwargs())
+        other_era = compute_stage_execution_key(
+            **_key_kwargs(claim_key="claim:v1:" + "5" * 64)
+        )
+        assert same_era != other_era
 
 
 def _make_registry(tmp_path: Path) -> JobRegistry:
