@@ -2192,9 +2192,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     _install_signal_handlers()
+    # #841 loaded runtime attestation 後續修法：invocation_revision 改以「daemon
+    # 實際收到的原始 argv token」計算（而非 parse_args 後的 namespace），argv 為
+    # None 時（例如由 systemd／service-manager.sh 呼叫 main() 不帶參數，argparse
+    # 內部會退回 sys.argv[1:]）同樣取 sys.argv[1:]，確保這裡記錄的 token 清單與
+    # parser 實際解析到的輸入完全一致。詳細理由見
+    # runtime_attestation.manager_configuration_snapshot 的說明。
+    _invocation_argv = list(argv) if argv is not None else list(sys.argv[1:])
 
     def record_loaded_runtime() -> None:
-        config, components = manager_configuration_snapshot(vars(args), os.environ)
+        config, components = manager_configuration_snapshot(
+            vars(args), os.environ, argv=_invocation_argv
+        )
         record_runtime_startup(
             service="manager",
             instance=os.environ.get("PSC_INSTANCE", "cortex"),

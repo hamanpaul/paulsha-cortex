@@ -11,7 +11,7 @@ import re
 import shlex
 import stat
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -32,6 +32,7 @@ _SECRET_KEY_RE = re.compile(
 _MAX_RECEIPT_BYTES = 256 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
 _ENV_ASSIGNMENT_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)\Z")
+_FLAG_TOKEN_RE = re.compile(r"--([A-Za-z][A-Za-z0-9-]*)(=(.*))?\Z")
 
 
 class RuntimeAttestationError(ValueError):
@@ -104,15 +105,72 @@ def safe_environment_projection(environment: Mapping[str, str]) -> dict[str, str
     }
 
 
+def _safe_invocation_argv(argv: Sequence[object]) -> list[str]:
+    """機敏過濾後的原始 argv token 清單。
+
+    ``invocation_revision`` 改成直接對 daemon 實際收到的 argv token 取雜湊
+    （而不是先經 argparse 解析成 dict 再雜湊），仍必須擋掉可能夾帶機敏值的
+    旗標——沿用 ``_safe_config`` 對 Mapping key 已有的 ``_SECRET_KEY_RE``
+    判斷規則：把 ``--flag`` token 當作 key 比對，命中時整個丟棄；
+    ``--flag=value`` 一個 token 內就把整個 token 丟掉，``--flag value`` 兩個
+    token 則額外丟掉緊接在後面、看起來不是旗標的下一個 token（也就是它的
+    值）。目前 manager daemon 的旗標（見 ``coordinator/manager_daemon.py`` 的
+    ``argparse`` 定義：poll-interval／executor／model 等）都不是機敏值，這裡
+    純粹是防禦未來新增旗標，不依賴、也不假設目前的旗標清單。"""
+
+    safe: list[str] = []
+    drop_next_value = False
+    for token in argv:
+        if not isinstance(token, str):
+            raise RuntimeAttestationError("invocation argv token 型別不合法")
+        if drop_next_value:
+            drop_next_value = False
+            if not token.startswith("-"):
+                continue
+        match = _FLAG_TOKEN_RE.fullmatch(token)
+        if match and _SECRET_KEY_RE.search(match.group(1)):
+            if match.group(2) is None:
+                drop_next_value = True
+            continue
+        safe.append(token)
+    return safe
+
+
 def manager_configuration_snapshot(
-    arguments: Mapping[str, object], environment: Mapping[str, str]
+    arguments: Mapping[str, object],
+    environment: Mapping[str, str],
+    *,
+    argv: Sequence[str] | None = None,
 ) -> tuple[dict[str, object], dict[str, str]]:
-    """建立 Manager 有效配置摘要，以及可獨立比對的元件摘要。"""
+    """建立 Manager 有效配置摘要，以及可獨立比對的元件摘要。
+
+    ``invocation_revision`` 改成以 daemon 實際收到的原始 argv token
+    （``argv``）計算，不再用 argparse 解析後的 namespace（``arguments``）：
+    namespace 對每個未指定的旗標一律套用預設值，其中一部分預設值本身是讀
+    環境變數算出來的（例如 ``--tick-interval``／``--max-load`` 未指定時，
+    預設值來自 ``PSC_TICK_INTERVAL_SECONDS``／``PSC_MANAGER_MAX_LOAD`` 等環境
+    變數）。這些「被環境影響出來的預設值」已經由 ``environment_revision``
+    涵蓋一次；再用解析後 namespace 算 ``invocation_revision`` 等於把同一份
+    環境資訊摻進第二個 component，而宣告端（``cortex service status``）只能
+    從 systemd 有效 ``ExecStart`` 反推 argv token，重放不出 argparse 的
+    default 邏輯，導致任何部署都無法達成 config match（#841 loaded runtime
+    attestation 的既知缺口）。改成只雜湊 argv token 後，宣告端只要能從
+    ExecStart 反推出同一份 token 清單（見 ``manager_declared_invocation_revision``）
+    就能重建、不必知道任何 argparse 預設值或環境變數。
+
+    ``arguments``（即回傳的 ``config["arguments"]``）維持吃解析後的
+    namespace 不變——那是給人看的診斷欄位，不是比對用的 revision 來源。
+
+    ``argv`` 省略時（既有呼叫端／測試）退回舊行為，以 ``arguments`` 算
+    ``invocation_revision``，維持相容。"""
 
     safe_args = _safe_config(arguments)
     safe_env = safe_environment_projection(environment)
     env_revision = configuration_revision(safe_env)
-    invocation_revision = configuration_revision(safe_args)
+    invocation_source: object = (
+        _safe_invocation_argv(argv) if argv is not None else safe_args
+    )
+    invocation_revision = configuration_revision(invocation_source)
     config = {"arguments": safe_args, "environment": safe_env}
     return config, {
         "environment_revision": env_revision,
@@ -673,6 +731,75 @@ def _environment_source_and_overlay(
         # 改用既有 direct-mode fallback，這裡維持 "unavailable" 不臆測。
         return "unavailable", {}
     return "unavailable", {}
+
+
+def manager_declared_invocation_revision(
+    row: object, environment: Mapping[str, str]
+) -> str | None:
+    """從 manager unit 目前的 systemd 有效 ``ExecStart`` 反推 daemon 實際收到
+    的 argv，換算成跟 ``manager_configuration_snapshot`` 同一份
+    ``invocation_revision``，供 ``cortex service status`` 的
+    ``declared_invocation_revision`` 用。只在能證明形狀、且拿得到必要值時
+    回傳字串，其餘情況回傳 ``None``（讓 ``compare_runtime_state`` 維持
+    unknown，不臆測）。
+
+    目前已知會出現的兩種 ExecStart 形狀：
+
+    1. 直接呼叫 ``[env KEY=VAL ...] python3 -m
+       paulsha_cortex.coordinator.manager_daemon <args...>``——``<args...>``
+       就是 daemon 收到的 argv，直接取用（沿用 ``_env_command_assignments``
+       跳過 ``/usr/bin/env`` 前綴、``_is_python_executable`` 判斷 python
+       執行檔，判斷邏輯與 ``_python_module_artifact`` 對齊，避免兩邊各自
+       另開一套 shape 判定）。
+
+    2. installer（``paulsha_cortex/deploy/installer.py`` 的
+       ``render_units``／``manager.service.tmpl``）目前實際產生的形狀：
+       ``ExecStart=/usr/bin/env bash <pkg>/scripts/service-manager.sh``。
+       daemon 的 module 呼叫發生在這個腳本內部的背景子行程（見
+       ``service-manager.sh`` 的 ``start_manager_loop``），ExecStart 本身看
+       不到；但腳本原始碼是套件內固定內容，永遠只傳一個旗標：
+       ``--specs-dir "${PSC_MANAGER_SPECS_DIR:-$HOME/.agents/specs}"``。
+       若 ``PSC_MANAGER_SPECS_DIR`` 有在有效環境（``environment``，即
+       ``_environment_source_and_overlay`` 算出的 ``PSC_*``／
+       ``PAULSHACLAW_*`` 投影）中宣告，可以精確重建這個 argv；若沒有，
+       預設值取決於執行 systemd ``--user`` 服務的 ``$HOME``，這個值不在
+       ``safe_environment_projection`` 的允許清單內，沒有安全管道可以驗證，
+       因此回傳 ``None`` 而不是猜測家目錄。"""
+
+    if not isinstance(row, Mapping):
+        return None
+    properties = row.get("systemd")
+    if not isinstance(properties, Mapping):
+        return None
+    effective_argv = _systemd_exec_start(properties.get("ExecStart"))
+    if not effective_argv:
+        return None
+    _env_assignments, command_index = _env_command_assignments(effective_argv)
+    remaining = effective_argv[command_index:]
+    if (
+        len(remaining) >= 3
+        and _is_python_executable(remaining[0])
+        and remaining[1:3] == ["-m", "paulsha_cortex.coordinator.manager_daemon"]
+    ):
+        declared_argv = remaining[3:]
+    elif len(remaining) >= 2 and remaining[0] == "bash":
+        script = Path(remaining[1])
+        if not (
+            script.name == "service-manager.sh"
+            and script.parent.name == "scripts"
+            and script.parent.parent.name == "paulsha_cortex"
+        ):
+            return None
+        specs_dir = environment.get("PSC_MANAGER_SPECS_DIR")
+        if specs_dir is None:
+            return None
+        declared_argv = ["--specs-dir", specs_dir]
+    else:
+        return None
+    try:
+        return configuration_revision(_safe_invocation_argv(declared_argv))
+    except RuntimeAttestationError:
+        return None
 
 
 def service_environment_overlay(
@@ -1657,6 +1784,35 @@ def inspect_runtime_state(
         os.close(directory_fd)
 
 
+def _invocation_revision_component_status(
+    latest: object, declared_invocation_revision: str | None
+) -> str:
+    """回報 ``config_components["invocation_revision"]`` 的獨立狀態。
+
+    與整體 ``config_status`` 分開計算（那個會被 environment_revision 那個
+    component 的比對結果影響），這裡只單純反映「宣告值 vs receipt 裡的
+    invocation_revision」這一組比較，四種結果：
+    - ``match``：兩邊都有值且相等。
+    - ``drift``：兩邊都有值但不相等。
+    - ``unknown``：receipt 有這個 component，但宣告端算不出來
+      （``declared_invocation_revision is None``）。
+    - ``not-applicable``：receipt 根本沒有這個 component（例如舊版 receipt
+      或本來就不記錄 invocation_revision 的 service）。"""
+
+    observed = (
+        latest["config"]["components"].get("invocation_revision")
+        if isinstance(latest, Mapping)
+        and isinstance(latest.get("config"), Mapping)
+        and isinstance(latest["config"].get("components"), Mapping)
+        else None
+    )
+    if not isinstance(observed, str):
+        return "not-applicable"
+    if declared_invocation_revision is None:
+        return "unknown"
+    return "match" if declared_invocation_revision == observed else "drift"
+
+
 def compare_runtime_state(
     state: Mapping[str, object],
     *,
@@ -1723,11 +1879,24 @@ def compare_runtime_state(
             declared_config_component == "environment_revision"
             and isinstance(components, Mapping)
             and isinstance(components.get("invocation_revision"), str)
-            and declared_invocation_revision is None
-            and config_status == "match"
         ):
-            config_status = "unknown"
-            reason = "invocation-declaration-unknown"
+            observed_invocation_revision = components.get("invocation_revision")
+            if declared_invocation_revision is None:
+                # 宣告端（cortex service status）算不出 declared_invocation_revision
+                # （例如 ExecStart 形狀無法解析、或形狀已知但缺必要環境變數，見
+                # manager_declared_invocation_revision）——receipt 有這個
+                # component 卻沒有東西可比對，即使 environment_revision 剛好
+                # match 也不能宣稱 config match，維持 unknown、不臆測。
+                if config_status == "match":
+                    config_status = "unknown"
+                    reason = "invocation-declaration-unknown"
+            elif declared_invocation_revision != observed_invocation_revision:
+                # 宣告端與 receipt 都有值但不相等：daemon 實際收到的 argv 與
+                # 目前 ExecStart／環境變數反推出的宣告值不一致，這本身就是一種
+                # config drift，即使 environment_revision 那個 component 剛好
+                # match 也要整體回報 drift，不能被 environment 這一半蓋過去。
+                config_status = "drift"
+                reason = "invocation-drift"
     if artifact_status == "drift" or config_status == "drift":
         status = "drift"
     elif (
@@ -1758,22 +1927,8 @@ def compare_runtime_state(
         "process_status": process_status,
         "config_components": {
             declared_config_component: config_status,
-            "invocation_revision": (
-                "match"
-                if declared_invocation_revision is not None
-                and isinstance(latest, Mapping)
-                and isinstance(latest.get("config"), Mapping)
-                and isinstance(latest["config"].get("components"), Mapping)
-                and latest["config"]["components"].get("invocation_revision")
-                == declared_invocation_revision
-                else (
-                    "unknown"
-                    if isinstance(latest, Mapping)
-                    and isinstance(latest.get("config"), Mapping)
-                    and isinstance(latest["config"].get("components"), Mapping)
-                    and "invocation_revision" in latest["config"]["components"]
-                    else "not-applicable"
-                )
+            "invocation_revision": _invocation_revision_component_status(
+                latest, declared_invocation_revision
             ),
         },
         "loaded_artifact_sha256": (
