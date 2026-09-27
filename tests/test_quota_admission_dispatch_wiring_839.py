@@ -278,6 +278,7 @@ def test_shadow_mode_records_decision_but_never_blocks_dispatch(
 
     decision_id = quota_admission.decision_id_for(
         run_id=run.run_id, card_id=step.card, attempt_id=f"{run.run_id}:{step.card}:n0", profile_key=profile_key,
+        mode="shadow",
     )
     decision = ctx.store.get(decision_id)
     assert decision is not None
@@ -411,6 +412,7 @@ def test_opt_in_independent_pool_alternative_is_selected_same_pool_alternative_r
 
     decision_id = quota_admission.decision_id_for(
         run_id=run.run_id, card_id=step.card, attempt_id=f"{run.run_id}:{step.card}:n0", profile_key=claude_key,
+        mode="enforced",
     )
     decision = ctx.store.get(decision_id)
     assert decision is not None
@@ -519,6 +521,7 @@ def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(
 
     decision_id = quota_admission.decision_id_for(
         run_id=run.run_id, card_id=step.card, attempt_id=f"{run.run_id}:{step.card}:n0", profile_key=codex_key,
+        mode="enforced",
     )
     decision = ctx.store.get(decision_id)
     assert decision is not None
@@ -658,6 +661,7 @@ def test_race_loss_on_top_ranked_candidate_falls_back_to_independent_pool_candid
 
     decision_id = quota_admission.decision_id_for(
         run_id=run.run_id, card_id=step.card, attempt_id=f"{run.run_id}:{step.card}:n0", profile_key=claude_key,
+        mode="enforced",
     )
     decision = ctx.store.get(decision_id)
     assert decision is not None
@@ -724,6 +728,7 @@ def test_duplicate_reservation_from_concurrent_manager_is_never_released_on_fail
     attempt_id = f"{run.run_id}:{step.card}:n0"
     other_decision_id = quota_admission.decision_id_for(
         run_id=run.run_id, card_id=step.card, attempt_id=attempt_id, profile_key=codex_key,
+        mode="enforced",
     )
     pool_key = (tuple(_pool_ref(descriptor)[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "short")
     other_result = authority.reserve(
@@ -815,6 +820,7 @@ def test_duplicate_reservation_already_terminated_advances_to_next_generation_an
     base_attempt_id = f"{run.run_id}:{step.card}:n0"
     base_decision_id = quota_admission.decision_id_for(
         run_id=run.run_id, card_id=step.card, attempt_id=base_attempt_id, profile_key=codex_key,
+        mode="enforced",
     )
     pool_key = (tuple(_pool_ref(descriptor)[k] for k in ("authority_id", "account_id", "pool_id", "revision")), "short")
     prior_result = authority.reserve(
@@ -840,6 +846,7 @@ def test_duplicate_reservation_already_terminated_advances_to_next_generation_an
     generation_attempt_id = f"{base_attempt_id}:g1"
     decision_id = quota_admission.decision_id_for(
         run_id=run.run_id, card_id=step.card, attempt_id=generation_attempt_id, profile_key=codex_key,
+        mode="enforced",
     )
     decision = ctx.store.get(decision_id)
     assert decision is not None
@@ -852,3 +859,312 @@ def test_duplicate_reservation_already_terminated_advances_to_next_generation_an
     # 上一個世代的 reservation 維持它原本的終局狀態，沒有被誤動。
     prior_status = ctx.authority.status(prior_result.reservation_id, now_ms=now_ms + 1)
     assert prior_status.state == "released"
+
+
+def test_switching_shadow_to_enforce_mid_attempt_writes_distinct_enforced_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """對抗審查第四輪 MAJOR（manager.py:11491）：同一個 attempt（job 從未真正
+    建立，ordinal 不動）先在 shadow 模式下寫過一筆 admit receipt——舊實作
+    `decision_id_for` 不納入 mode，之後 operator 把
+    `PSC_QUOTA_ADMISSION_ENFORCE` 開成 on 重試同一張卡時，算出**同一個**
+    decision_id；enforce 那次真正 reserve／bind 出的 reservation 想寫入
+    admit receipt 時會被 shadow 的舊記錄擋下（`_quota_admission_record_admit_decision`
+    的『先讀舊值、有就沿用』語意會直接沿用 shadow 那筆），
+    `WorkflowRun.quota_admission` 永遠卡在 shadow，真正的 bound reservation
+    對『依 receipt 反查』的收斂掃描也永遠不可見。
+
+    重現「shadow 觀察過但從未真正建出 job」的現場：把 `registry.create_job`
+    換成只在第一次呼叫失敗的版本——admit receipt 的寫入在
+    `_dispatch_workflow_card` 裡發生在 `create_job()` 之前，因此 shadow
+    receipt 會確實落地，但 job 從未建立、ordinal 不前進；第二次呼叫（開了
+    enforce）算出同一個 attempt_id，驗證 enforce 那次的 receipt 用
+    **不同** decision_id 落地、與 shadow 那筆並存，且
+    `WorkflowRun.quota_admission` 更新成 enforced。
+    """
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+
+    descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=codex_key, now_ms=now_ms)
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    store = quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    bindings = (_binding(descriptor, codex_key),)
+
+    shadow_ctx = quota_admission.DispatchContext(
+        authority=authority, store=store, shadow=shadow, descriptors=(descriptor,),
+        unit_catalog=(), bindings=bindings, environment={},  # PSC_QUOTA_ADMISSION_ENFORCE 未設 -> shadow
+    )
+
+    original_create_job = registry.create_job
+    call_count = {"n": 0}
+
+    def _fail_once_create_job(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated provisioning failure before spawn")
+        return original_create_job(*args, **kwargs)
+
+    registry.create_job = _fail_once_create_job
+    try:
+        with pytest.raises(RuntimeError, match="simulated provisioning failure"):
+            _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=shadow_ctx)
+    finally:
+        registry.create_job = original_create_job
+
+    assert registry.list_jobs() == []  # shadow 那次從未真正建出 job，ordinal 不動
+
+    attempt_id = f"{run.run_id}:{step.card}:n0"
+    shadow_decision_id = quota_admission.decision_id_for(
+        run_id=run.run_id, card_id=step.card, attempt_id=attempt_id, profile_key=codex_key, mode="shadow",
+    )
+    shadow_decision = store.get(shadow_decision_id)
+    assert shadow_decision is not None
+    assert shadow_decision.mode == "shadow"
+    assert shadow_decision.reservation_id is None
+
+    # operator 開 enforce 重試同一張卡（同一個 attempt_id，因為從未真正建出
+    # job）。
+    enforce_ctx = quota_admission.DispatchContext(
+        authority=authority, store=store, shadow=shadow, descriptors=(descriptor,),
+        unit_catalog=(), bindings=bindings, environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+    result = _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=enforce_ctx)
+    assert result is not None
+    assert "job_id" in result
+    job = registry.get_job(result["job_id"])
+    assert job["executor"] == "codex"
+
+    enforced_decision_id = quota_admission.decision_id_for(
+        run_id=run.run_id, card_id=step.card, attempt_id=attempt_id, profile_key=codex_key, mode="enforced",
+    )
+    assert enforced_decision_id != shadow_decision_id  # mode 隔離：兩者不撞
+    enforced_decision = store.get(enforced_decision_id)
+    assert enforced_decision is not None
+    assert enforced_decision.mode == "enforced"
+    assert enforced_decision.reservation_id is not None
+
+    # shadow 那筆舊記錄完全沒被動過（仍是它自己、獨立的一筆）。
+    shadow_decision_after = store.get(shadow_decision_id)
+    assert shadow_decision_after == shadow_decision
+
+    # WorkflowRun.quota_admission 投影更新成 enforced——不再卡在 shadow。
+    updated_run = registry.get_workflow_run(run.run_id)
+    assert updated_run.quota_admission["builder"]["mode"] == "enforced"
+    assert updated_run.quota_admission["builder"]["decision_id"] == enforced_decision_id
+
+    # 這筆真正的 bound reservation 對 authority-based 的收斂掃描可見（對抗
+    # 審查第四輪 MAJOR manager.py:11491（a）：bound 收斂改以 authority 為
+    # 真相，不再依賴 store.enforced_admitted() 反查）。
+    bound_outcomes = quota_admission.reconcile_bound_reservations(
+        authority=authority, store=store,
+        job_lookup=lambda job_id: registry.get_job(job_id),
+        job_outcome=lambda job: "succeeded" if job.get("status") == "exited" else None,
+        now_ms=now_ms + 1,
+    )
+    assert len(bound_outcomes) == 1
+    assert bound_outcomes[0].reservation_id == enforced_decision.reservation_id
+
+
+def test_reserved_sweep_job_lookup_does_not_misattribute_unrelated_candidates_job(tmp_path: Path) -> None:
+    """對抗審查第四輪 MAJOR（manager.py:11603）：Manager A 對候選 A 的
+    attempt n0 `reserve()` 後 crash（`create_job()` 從未發生）；Manager B
+    （另一個 instance，或稍後的 retry）改派候選 B（不同 pool／profile）也在
+    attempt n0 建出它自己的 job——這個 job 剛好是該 run/card 第一個
+    （ordinal 0）。舊實作 `_quota_admission_job_lookup_by_attempt` 純依
+    run/card + ordinal 反查，會把 B 的 job 誤當成 A 的證據，用它的 liveness
+    決定要不要 renew／release A 的 reservation，即使兩者完全無關。新實作依
+    job 建立時記錄的 `quota_decision_id` 精確比對，B 的 job 永遠不會被誤配
+    到 A。"""
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run_id = "run-x"
+    card_id = "card-x"
+
+    decision_id_a = quota_admission.decision_id_for(
+        run_id=run_id, card_id=card_id, attempt_id=f"{run_id}:{card_id}:n0",
+        profile_key="epk:v1:resolved:" + "a" * 64, mode="enforced",
+    )
+    decision_id_b = quota_admission.decision_id_for(
+        run_id=run_id, card_id=card_id, attempt_id=f"{run_id}:{card_id}:n0",
+        profile_key="epk:v1:resolved:" + "b" * 64, mode="enforced",
+    )
+    assert decision_id_a != decision_id_b
+
+    # Manager B 派候選 B 建出它自己的 job（該 run/card 目前唯一、ordinal 0）。
+    registry.create_job(
+        task="wf-x", persona="builder", branch="feature/x", pane="",
+        worktree=str(tmp_path / "wt"),
+        workflow_run_id=run_id, workflow_card=card_id, workflow_phase="build",
+        quota_decision_id=decision_id_b,
+    )
+
+    # 舊實作（ordinal 反查）會把這個 job 當成 A 的證據；新實作精確比對
+    # decision_id，A 查不到任何對應的 job。
+    found_for_a = manager._quota_admission_job_lookup_by_decision(registry, run_id, card_id, decision_id_a)
+    assert found_for_a is None
+
+    found_for_b = manager._quota_admission_job_lookup_by_decision(registry, run_id, card_id, decision_id_b)
+    assert found_for_b is not None
+    assert found_for_b["quota_decision_id"] == decision_id_b
+
+
+def test_reserved_sweep_ignores_legacy_job_missing_quota_decision_id_field(tmp_path: Path) -> None:
+    """job 缺少可比對欄位（本欄位新增之前建立的舊版 job，或非額度管理路徑
+    建立的 job：`quota_decision_id` 為 `None`）——一律視為『查無此 job』，
+    交給呼叫端依 lease／in-flight 判定，不 bind、不 release（見
+    `reconcile_reserved_reservations` 對 `job is None` 的既有保守分支），不
+    得因為欄位缺失就誤配到任何 decision_id。"""
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run_id = "run-y"
+    card_id = "card-y"
+    decision_id = quota_admission.decision_id_for(
+        run_id=run_id, card_id=card_id, attempt_id=f"{run_id}:{card_id}:n0",
+        profile_key="epk:v1:resolved:" + "c" * 64, mode="enforced",
+    )
+    registry.create_job(
+        task="wf-y", persona="builder", branch="feature/y", pane="",
+        worktree=str(tmp_path / "wt"),
+        workflow_run_id=run_id, workflow_card=card_id, workflow_phase="build",
+        # quota_decision_id 未傳——預設 None，模擬舊版 job。
+    )
+    found = manager._quota_admission_job_lookup_by_decision(registry, run_id, card_id, decision_id)
+    assert found is None
+
+
+# ---------------------------------------------------------------------------
+# 對抗審查第四輪 MAJOR（quota_admission.py:1119）：dispatch 側 provisioning
+# 續租、in-flight 標記與清除、bind() 撞上已終結 reservation 時 fail closed。
+# ---------------------------------------------------------------------------
+
+
+def test_successful_dispatch_renews_lease_and_clears_in_flight_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功派工時：(1) reservation 的 lease 在 bind 之前就已經被續租過一次
+    （對抗審查第四輪 MAJOR quota_admission.py:1119 的續租呼叫，見
+    `_dispatch_workflow_card` 拿到 grant 之後、開始 provisioning 之前）；
+    (2) `IN_FLIGHT_DISPATCHES` 在派工結束後不再標記這筆 reservation——不是
+    永久卡在 in-flight 集合裡（見 finally 保證）。"""
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+
+    descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=codex_key, now_ms=now_ms)
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    # 刻意用一個很短（但合法，>= 60s 下限）的 lease_ms——若沒有 provisioning
+    # 續租，_freeze_wall_clock 讓牆鐘完全不動，所以這裡不是要重現真的過期，
+    # 而是要驗證 renew() 事件確實發生過（sequence 前進、lease 被展延）。
+    ctx = quota_admission.DispatchContext(
+        authority=authority, store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, codex_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"}, lease_ms=60_000,
+    )
+
+    result = _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+    assert result is not None
+    assert "job_id" in result
+
+    status_after = authority.status(
+        [item for item in authority.list_by_state("bound", now_ms=now_ms + 1)][0].reservation_id,
+        now_ms=now_ms + 1,
+    )
+    # reserve() 給的原始 lease 是 now_ms + 60_000；renew()（sequence 0→1）
+    # 加上 bind()（sequence 1→2）之後 sequence 至少前進了兩次。
+    assert status_after.sequence >= 2
+
+    # in-flight 集合已經清空——不是永久卡住。
+    assert quota_admission.IN_FLIGHT_DISPATCHES.is_in_flight(status_after.reservation_id) is False
+
+
+def test_bind_conflict_reservation_already_terminal_fails_closed_with_wait_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """對抗審查第四輪 MAJOR（quota_admission.py:1119）：bind() 時發現這筆
+    reservation 已經被結束掉（`conflict`／`reservation-already-terminal`，
+    即使已經有 renew／grace／in-flight 排除，極端情況仍可能發生）——job 記錄
+    已經建立，不能假稱成功；必須標記失敗（不記 provider_outcome，避免誤觸
+    #825/#826 executor backoff）、留一筆 wait decision receipt，並讓例外
+    以既有『job 已建立、spawn 前失敗』的 fail-closed 路徑傳播（不 spawn）。"""
+    from paulsha_cortex.coordinator.quota_reservation import TransitionResult
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+
+    descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=codex_key, now_ms=now_ms)
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    store = quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    ctx = quota_admission.DispatchContext(
+        authority=authority, store=store, shadow=shadow, descriptors=(descriptor,),
+        unit_catalog=(), bindings=(_binding(descriptor, codex_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+
+    monkeypatch.setattr(
+        QuotaReservationAuthority, "bind",
+        lambda self, **kwargs: TransitionResult(
+            status="conflict", state="released", reason="reservation-already-terminal",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="reservation-already-terminal"):
+        _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+
+    # job 記錄已建立（create_job() 早於 bind()），但標記為失敗——不假稱成功。
+    jobs = registry.list_jobs()
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["status"] == "failed"
+    assert job["provider_outcome"] is None  # 不誤觸 #825/#826 executor backoff
+    assert job["runtime_diagnostic"]["reason"] == "quota-admission-reservation-lost"
+
+    # wait decision receipt 已留下，供 #840 觀測。
+    updated_run = registry.get_workflow_run(run.run_id)
+    assert updated_run.quota_admission is not None
+    projection = updated_run.quota_admission["builder"]
+    assert projection["mode"] == "enforced"
+    assert projection["outcome"] == "wait"
+    decision = store.get(projection["decision_id"])
+    assert decision is not None
+    assert decision.reason == "quota-admission-reservation-lost"
+
+    # in-flight 集合已經清除——不因為這條失敗路徑而永久卡住。
+    # bind() 被 monkeypatch 直接回傳假結果、從未真正寫入任何轉移事件，這筆
+    # reservation 在 authority 裡仍是 reserved；用它反查 reservation_id。
+    still_reserved = authority.list_by_state("reserved", now_ms=now_ms + 1)
+    assert len(still_reserved) == 1
+    assert quota_admission.IN_FLIGHT_DISPATCHES.is_in_flight(still_reserved[0].reservation_id) is False

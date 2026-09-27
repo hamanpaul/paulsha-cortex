@@ -11442,7 +11442,7 @@ def _quota_admission_record_wait_decision(
         attempt_id = _quota_admission_attempt_id(registry, run, step)
         decision_id = quota_admission.decision_id_for(
             run_id=run.run_id, card_id=step.card, attempt_id=attempt_id,
-            profile_key=_QUOTA_ADMISSION_NO_CANDIDATE_PROFILE_KEY,
+            profile_key=_QUOTA_ADMISSION_NO_CANDIDATE_PROFILE_KEY, mode="enforced",
         )
         existing = store.get(decision_id)
         if existing is None:
@@ -11600,48 +11600,40 @@ def _quota_admission_job_lookup(registry, job_id: str) -> Mapping[str, object] |
         return None
 
 
-def _quota_admission_job_lookup_by_attempt(
-    registry, run_id: str, card_id: str, attempt_id: str
+def _quota_admission_job_lookup_by_decision(
+    registry, run_id: str, card_id: str, decision_id: str
 ) -> Mapping[str, object] | None:
     """`quota_admission.reconcile_reserved_reservations` 的
-    ``job_lookup_by_attempt``——``reserved``（尚未 ``bind()``）狀態下拿不到
-    ``job_id``，只能反過來依 :func:`_quota_admission_attempt_id` 的計數規則
-    找出對應建立的 job：``attempt_id`` 格式為 ``f"{run_id}:{card_id}:n{prior}"``，
-    ``prior`` 既是判定該 attempt 當下、registry 裡已存在的同 run/card job 數，
-    也同時是這個 attempt 建立出來的 job 在『該 run/card 全部 job，依建立順序』
-    中的 0-based 索引（``registry.list_jobs()`` 依 append 順序回傳，見
-    ``JobRegistry.create_job``／``list_jobs``）。
+    ``job_lookup_by_decision``——``reserved``（尚未 ``bind()``）狀態下拿不到
+    ``job_id``，改依 job 建立時記錄的 ``quota_decision_id`` 精確比對（見
+    `_dispatch_workflow_card` 的 `registry.create_job(..., quota_decision_id=...)`
+    呼叫），不是猜測。
 
-    格式不符、索引超出範圍（該 attempt 從未真正建出 job，或已被更晚的
-    attempt 覆蓋計數）一律回 ``None``——由呼叫端依 lease 是否過期決定是否
-    安全釋放，本函式不猜測。
+    對抗審查第四輪 MAJOR（manager.py:11603）：舊實作依
+    `_quota_admission_attempt_id` 算出的 ordinal 反查——`attempt_id` 格式
+    ``f"{run_id}:{card_id}:n{prior}"`` 只反映『這個 run/card 目前有幾個
+    job』，不指向任何特定候選／decision。兩個 Manager instance 交錯時：
+    instance A 對候選 A 的 attempt n0 `reserve()` 後 crash（`create_job()`
+    從未發生）；instance B 改派候選 B（可能是不同 pool、不同 profile）也在
+    attempt n0 建出它自己的 job——這個 job 剛好是該 run/card 的第一個
+    （ordinal 0），舊實作的反查會把它當成 A 的證據，誤 renew／誤判 A 的
+    reservation 存活，即使兩者完全無關。
 
-    對抗審查第三輪 MAJOR（manager.py:13961）：
-    `quota_admission.reserve_for_candidate_with_generation_fallback` 會在
-    attempt_id 尾端加上世代後綴（``:g{generation}``，見
-    `quota_admission.generation_attempt_id`）——世代只用來讓 reservation／
-    decision_id 在舊世代已終局時仍能算出一個全新的身分，job 是否已經建立
-    的判定完全看『這個 run/card 已經有幾個 job』這個與世代無關的計數，因此
-    這裡先剝掉世代後綴才解析 ordinal，避免世代 >=1 的 attempt_id 因為多了
-    這段尾綴、``isdigit()`` 檢查失敗而永遠查不到其實已經建立的 job。"""
-    prefix = f"{run_id}:{card_id}:n"
-    if not attempt_id.startswith(prefix):
-        return None
-    suffix = attempt_id[len(prefix):]
-    ordinal_part, _, generation_part = suffix.partition(":g")
-    if generation_part and not generation_part.isdigit():
-        return None
-    if not ordinal_part.isdigit():
-        return None
-    ordinal = int(ordinal_part)
-    matching = [
-        job
-        for job in registry.list_jobs()
-        if job.get("workflow_run_id") == run_id and job.get("workflow_card") == card_id
-    ]
-    if ordinal >= len(matching):
-        return None
-    return matching[ordinal]
+    精確比對 `quota_decision_id` 消除這個誤配：只有『當初 reserve() 這筆
+    reservation 時算出的那個 decision_id』對應的 job 才會被找到，不同候選
+    即使 ordinal 剛好相同也不會互相誤認。job 沒有這個欄位（本票之前建立的
+    舊版 job，或非額度管理路徑建立的 job）時 `job.get(...)` 回 `None`，天然
+    不等於任何真實 decision_id，因此永遠不會被誤配到——查無此欄位的 job
+    效果等同『查無此 job』，交給既有的 lease／in-flight 判定（見呼叫端），
+    不 bind、不 release（inconclusive），不需要另外特判。"""
+    for job in registry.list_jobs():
+        if (
+            job.get("workflow_run_id") == run_id
+            and job.get("workflow_card") == card_id
+            and job.get("quota_decision_id") == decision_id
+        ):
+            return job
+    return None
 
 
 def _quota_admission_job_terminal_outcome(job: Mapping[str, object]) -> str | None:
@@ -11723,7 +11715,11 @@ def reconcile_quota_admission_reservations(
        （quota_admission.py:1008）之後改以 reservation authority 本身列舉
        `reserved` 狀態，即使 admit receipt 從未寫入（合法持有者在
        `reserve()` 成功後、寫入 receipt 前 crash）也照樣能被掃到，不再依賴
-       `AdmissionDecisionStore` 是否成功記錄這筆決策。
+       `AdmissionDecisionStore` 是否成功記錄這筆決策；反查 job 改依
+       `quota_decision_id` 精確比對（對抗審查第四輪 MAJOR
+       manager.py:11603），並傳入 `grace_ms`／`IN_FLIGHT_DISPATCHES`（對抗
+       審查第四輪 MAJOR quota_admission.py:1119），避免 provisioning 比
+       lease 長時被誤判成 crash 殘留而釋放仍在使用中的 reservation。
     2. `quota_admission.reconcile_bound_reservations`——收斂已經 `bind()`
        過的 reservation；job 進終局時同時透過 `on_settled` 呼叫
        `_quota_admission_record_terminal_usage` 記消耗（票面 c：「成功／
@@ -11742,12 +11738,18 @@ def reconcile_quota_admission_reservations(
     resolved_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     reserved_outcomes = quota_admission.reconcile_reserved_reservations(
         authority=quota_admission_context.authority,
-        job_lookup_by_attempt=lambda run_id, card_id, attempt_id: _quota_admission_job_lookup_by_attempt(
-            registry, run_id, card_id, attempt_id
+        job_lookup_by_decision=lambda run_id, card_id, decision_id: _quota_admission_job_lookup_by_decision(
+            registry, run_id, card_id, decision_id
         ),
         job_outcome=_quota_admission_job_terminal_outcome,
         now_ms=resolved_now_ms,
         renew_lease_ms=quota_admission_context.lease_ms,
+        # 對抗審查第四輪 MAJOR（quota_admission.py:1119）：額外寬限一整個
+        # lease_ms，加上 in-flight 排除——寬限本身只是次要防線，主要防線是
+        # dispatch 側的 provisioning 續租（見 `_dispatch_workflow_card`）與
+        # 這裡的 in-flight 排除。
+        grace_ms=quota_admission_context.lease_ms,
+        in_flight=quota_admission.IN_FLIGHT_DISPATCHES,
     )
     bound_outcomes = quota_admission.reconcile_bound_reservations(
         authority=quota_admission_context.authority,
@@ -11756,9 +11758,13 @@ def reconcile_quota_admission_reservations(
         job_outcome=_quota_admission_job_terminal_outcome,
         now_ms=resolved_now_ms,
         renew_lease_ms=quota_admission_context.lease_ms,
-        on_settled=lambda decision, job: _quota_admission_record_terminal_usage(
-            quota_admission_context, profile_key=decision.profile_key, job=job,
-            now_ms=resolved_now_ms,
+        on_settled=lambda decision, job: (
+            _quota_admission_record_terminal_usage(
+                quota_admission_context, profile_key=decision.profile_key, job=job,
+                now_ms=resolved_now_ms,
+            )
+            if decision is not None
+            else None
         ),
     )
     return {
@@ -13975,6 +13981,7 @@ def _dispatch_workflow_card(
         quota_decision_id = quota_admission.decision_id_for(
             run_id=run.run_id, card_id=step.card, attempt_id=quota_attempt_id,
             profile_key=profile_binding.resolved_key,
+            mode="enforced" if quota_admission_enforced else "shadow",
         )
         if not (quota_admission_enforced and quota_assessment.feasible and quota_assessment.pools):
             # shadow 模式，或候選不受額度管理（無綁定 pool）——不需要原子預留。
@@ -14078,6 +14085,30 @@ def _dispatch_workflow_card(
                 quota_admission_context=quota_admission_context, identities=identities,
             )
         excluded_quota_identities.add((identity.executor, identity.model_id))
+    if quota_reservation_handle is not None:
+        # 對抗審查第四輪 MAJOR（quota_admission.py:1119）：reserve() 給的
+        # lease 只保證涵蓋到這一刻——接下來 worktree／sandbox provisioning
+        # 到 create_job()／bind() 可能耗時超過原始 lease。立刻續租一整個全
+        # 新的 lease_ms 窗口，讓 periodic sweep 不會單純因為『provisioning
+        # 比 lease 長』就誤判成 crash 殘留並釋放這筆仍在使用中的容量；同時
+        # 標記進 process-global in-flight 集合，即使續租本身因故失敗／延遲，
+        # 同一個 process 內的 sweep 仍能靠 in-flight 排除，不必只靠 lease。
+        # renew() 只允許 `reserved` 狀態，只有真的拿到新 grant（這個 handle）
+        # 時才呼叫；`duplicate`／race 落敗的分支從未建立 handle，不受影響。
+        quota_admission.IN_FLIGHT_DISPATCHES.mark_started(quota_reservation_handle["reservation_id"])
+        renew_result = quota_admission_context.authority.renew(
+            reservation_id=quota_reservation_handle["reservation_id"],
+            owner_token=quota_reservation_handle["owner_token"],
+            attempt_id=quota_reservation_handle["attempt_id"],
+            lease_ms=quota_admission_context.lease_ms,
+            expected_sequence=quota_reservation_handle["sequence"],
+            now_ms=int(time.time() * 1000),
+        )
+        if renew_result.status == "ok":
+            quota_reservation_handle["sequence"] = renew_result.sequence
+        # renew 失敗（極端 race／結構異常）不擋派工——它只是延長 lease 的
+        # 優化，不是正確性前提；正確性來自上面的 in-flight 標記，以及下面
+        # bind() 若真的撞上「reservation 已被釋放」時的 fail-closed 處理。
     # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
     # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
     _record_resolved_model_chain(
@@ -14454,6 +14485,15 @@ def _dispatch_workflow_card(
             # manager._workflow_acceptance_definition_drifted）。
             workflow_test_policy=step.test_policy,
             dispatch_reroute=dispatch_reroute,
+            # #839 對抗審查第四輪 MAJOR（manager.py:11603）：只有這個候選真的
+            # 拿到 reservation（enforce＋可行＋受額度管理）才記——shadow 模式
+            # 從不 reserve()，對它的 job 記這個欄位沒有任何收斂用途，反而會
+            # 讓 shadow（票面契約：純旁觀，絕不改變既有派工結果／job 記錄
+            # 形狀）在 job 上多一個 baseline 沒有的欄位，違反既有『shadow 與
+            # 完全沒接線逐字相同』的測試契約。
+            quota_decision_id=(
+                quota_decision_id if quota_reservation_handle is not None else None
+            ),
         )
         quota_job_created = True
         if quota_reservation_handle is not None:
@@ -14469,6 +14509,50 @@ def _dispatch_workflow_card(
                 now_ms=int(time.time() * 1000),
             )
             if bind_result.status not in ("ok", "duplicate"):
+                if (
+                    bind_result.status == "conflict"
+                    and bind_result.reason == "reservation-already-terminal"
+                ):
+                    # 對抗審查第四輪 MAJOR（quota_admission.py:1119）：這筆
+                    # reservation 在 provisioning 期間已經被結束掉（sweep 的
+                    # reconcile，或另一個 instance）——即使已經有 renew／
+                    # grace／in-flight 排除，極端情況（例如 renew 呼叫本身
+                    # 失敗、或 clock skew）仍可能發生。job 記錄已經建立，不能
+                    # 假稱成功；標記為失敗（**不**記 provider_outcome，避免
+                    # 誤觸 #825/#826 的 executor backoff 分類——這不是
+                    # executor 的錯），留一筆 wait decision receipt 供 #840
+                    # 觀測，再讓下面的 fail-closed 例外照既有「job 已建立、
+                    # spawn 前失敗」路徑傳播（不 spawn、不假稱成功）。
+                    registry.update_headless_result(
+                        str(job["job_id"]), status="failed", exit_code=1,
+                        runtime_diagnostic={
+                            "reason": "quota-admission-reservation-lost",
+                            "detail": f"bind rejected: {bind_result.status}/{bind_result.reason}",
+                            "source": "manager._dispatch_workflow_card:quota-admission-bind",
+                            "job_id": str(job["job_id"]),
+                        },
+                    )
+                    quota_admission_projection = _quota_admission_record_wait_decision(
+                        quota_admission_context.store, registry=registry, run=run, step=step,
+                        identities=identities, reason="quota-admission-reservation-lost",
+                    )
+                    if quota_admission_projection is not None:
+                        registry._manager_update_workflow_run(
+                            run.run_id,
+                            facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+                            needs_human_reason=diagnostic_reason(
+                                "quota-admission-reservation-lost",
+                                "額度 reservation 在 provisioning 期間被收斂釋放，"
+                                f"bind 失敗，fail closed 不假稱成功："
+                                f"{bind_result.status}/{bind_result.reason}",
+                                source="manager._dispatch_workflow_card:quota-admission-bind",
+                                run_id=run.run_id, work_id=run.work_id, card=step.card,
+                                job_id=str(job["job_id"]),
+                            ),
+                            quota_admission={
+                                **(run.quota_admission or {}), step.persona: quota_admission_projection,
+                            },
+                        )
                 # 結構性異常（非預期的 owner/attempt/sequence 衝突）——job 記錄
                 # 已經建立，不能用 release()（#838 只允許 release 發生在 bind
                 # 之前）；fail-closed 直接讓派工失敗，reservation 留在 reserved
@@ -14495,6 +14579,16 @@ def _dispatch_workflow_card(
         if reviewer_sandbox is not None:
             shutil.rmtree(reviewer_sandbox, ignore_errors=True)
         raise
+    finally:
+        # 對抗審查第四輪 MAJOR（quota_admission.py:1119）：不論這個 try 是
+        # 成功、結構性 bind 失敗、或任何其他例外退出，只要之前標記過
+        # in-flight 就必須解除——否則這個 reservation_id 會永遠卡在
+        # in-flight 集合裡，讓 periodic sweep 誤以為它一直在 provisioning
+        # 而永遠不釋放（即使它已經走到 settle／release／甚至下一個世代）。
+        if quota_reservation_handle is not None:
+            quota_admission.IN_FLIGHT_DISPATCHES.mark_finished(
+                quota_reservation_handle["reservation_id"]
+            )
     try:
         # #381：真正 spawn 前才 admit，不佔住這張卡接下來的整個執行期。
         resolve_limiter(spawn_admission).admit(resolve_provider(identity=identity, launcher=launcher))
