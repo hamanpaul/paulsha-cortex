@@ -1168,3 +1168,261 @@ def test_bind_conflict_reservation_already_terminal_fails_closed_with_wait_recei
     still_reserved = authority.list_by_state("reserved", now_ms=now_ms + 1)
     assert len(still_reserved) == 1
     assert quota_admission.IN_FLIGHT_DISPATCHES.is_in_flight(still_reserved[0].reservation_id) is False
+
+
+# ---------------------------------------------------------------------------
+# 對抗審查第五輪 MAJOR：mark_started／try-finally 必須緊鄰，provisioning
+# 失敗（含 creator.create()）也要清 in-flight 並 release(fail-before-spawn)；
+# periodic sweep 對本 process in-flight 的 reservation 必須在 job 反查之前
+# 就跳過；bind() 撞上並行續租造成的 sequence-mismatch 要重試一次。
+# ---------------------------------------------------------------------------
+
+
+class _FailingOnceWorktreeCreator:
+    """第一次呼叫（模擬 creator.create() 的 provisioning 失敗）拋例外，第二次
+    起成功——用來驗證失敗後的 retry 能乾淨重新 reserve，不撞 held-elsewhere。"""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self.calls = 0
+
+    def create(self, branch: str, base_sha: str | None = None, *, job_id: str | None = None) -> Path:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("fake-worktree-provisioning-failure")
+        return self._path
+
+
+def _dispatch_with_creator(registry, run, identities, creator, coordinator_root, *, quota_admission_context=None):
+    dispatcher = type(
+        "D", (), {"_registry": registry, "_git_runner": None, "_worktree_creator": creator}
+    )()
+    return manager.dispatch_workflow_card(
+        dispatcher, run=run, identities=identities, launcher_factory=_launcher_factory,
+        coordinator_root=coordinator_root, quota_admission_context=quota_admission_context,
+    )
+
+
+def test_provisioning_failure_before_create_job_clears_in_flight_and_releases_for_clean_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#839 對抗審查修復第五輪 MAJOR（manager.py:14098）：mark_started 之後、
+    真正進入涵蓋 provisioning 全程的 try 之前不能夾雜任何可能拋例外的程式碼
+    ——`creator.create()`（worktree provisioning）在 `create_job()` 之前失敗
+    時，這筆 reservation 必須被 `release(reason="fail-before-spawn")`，
+    `IN_FLIGHT_DISPATCHES` 也必須清掉；下一次 retry 要能正常重新 reserve
+    （撞到已終結的舊 reservation 時自動換下一個世代），不會卡在
+    held-elsewhere。"""
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+
+    descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=codex_key, now_ms=now_ms)
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    ctx = quota_admission.DispatchContext(
+        authority=authority, store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, codex_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+
+    creator = _FailingOnceWorktreeCreator(worktree)
+
+    with pytest.raises(RuntimeError, match="fake-worktree-provisioning-failure"):
+        _dispatch_with_creator(
+            registry, run, identities, creator, tmp_path / "coordinator", quota_admission_context=ctx,
+        )
+
+    # 第一次失敗：從未建立任何 job；reservation 已經被 release
+    # (fail-before-spawn)；in-flight 集合也已經清空——不是永久卡住。
+    assert registry.list_jobs() == []
+    released = authority.list_by_state("released", now_ms=now_ms + 1)
+    assert len(released) == 1
+    assert released[0].reservation_id != ""
+    assert quota_admission.IN_FLIGHT_DISPATCHES.is_in_flight(released[0].reservation_id) is False
+    assert authority.list_by_state("reserved", now_ms=now_ms + 1) == ()
+
+    # 下一次 retry（同一個 run/card，job 數未變 ⇒ 同一個 attempt_id ordinal）
+    # ——撞到上面這筆已終結的 reservation 時自動換算下一個世代，正常拿到新
+    # grant 並成功派工，不撞 held-elsewhere。
+    result = _dispatch_with_creator(
+        registry, run, identities, creator, tmp_path / "coordinator", quota_admission_context=ctx,
+    )
+    assert result is not None
+    assert "job_id" in result
+    jobs = registry.list_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["status"] != "failed"
+    bound = authority.list_by_state("bound", now_ms=now_ms + 1)
+    assert len(bound) == 1
+    assert bound[0].reservation_id != released[0].reservation_id
+    assert quota_admission.IN_FLIGHT_DISPATCHES.is_in_flight(bound[0].reservation_id) is False
+
+
+def test_reserved_sweep_skips_this_process_in_flight_reservation_before_job_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#839 對抗審查修復第五輪 MAJOR（quota_admission.py 週期性 sweep）：在
+    `create_job()` 與 `bind()` 之間插入一次本 process 自己的
+    `reconcile_reserved_reservations` 掃描——這個 reservation 已經被
+    `mark_started` 標記為 in-flight，掃描必須在反查 job 之前就跳過（不續租、
+    不寫入任何事件），不能因為這時候 job 已經存在但未終局就對它 renew，
+    否則會讓 dispatch 手上快取的 `expected_sequence` 過期。"""
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+
+    descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=codex_key, now_ms=now_ms)
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    ctx = quota_admission.DispatchContext(
+        authority=authority, store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, codex_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+
+    captured_outcomes: list = []
+    sequence_before_sweep_holder: list[int] = []
+    original_create_job = JobRegistry.create_job
+
+    def _create_job_then_sweep(self, **kwargs):
+        job = original_create_job(self, **kwargs)
+
+        # job 已建立、bind() 尚未呼叫——此刻這筆 reservation 恰好處於
+        # create_job() 與 bind() 之間，且已被 mark_started 標記為 in-flight。
+        reserved_now = authority.list_by_state("reserved", now_ms=int(time.time() * 1000))
+        assert len(reserved_now) == 1
+        sequence_before_sweep_holder.append(reserved_now[0].sequence)
+
+        def _job_lookup_by_decision(run_id, card_id, decision_id):
+            return next(
+                (
+                    j for j in self.list_jobs()
+                    if j.get("workflow_run_id") == run_id
+                    and j.get("workflow_card") == card_id
+                    and j.get("quota_decision_id") == decision_id
+                ),
+                None,
+            )
+
+        outcomes = quota_admission.reconcile_reserved_reservations(
+            authority=authority,
+            job_lookup_by_decision=_job_lookup_by_decision,
+            job_outcome=lambda j: None,
+            now_ms=int(time.time() * 1000),
+            in_flight=quota_admission.IN_FLIGHT_DISPATCHES,
+        )
+        captured_outcomes.extend(outcomes)
+        return job
+
+    monkeypatch.setattr(JobRegistry, "create_job", _create_job_then_sweep)
+
+    result = _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+    assert result is not None
+    assert "job_id" in result
+
+    # 本 process 自己的 sweep 對這筆 in-flight reservation 一律 skipped——
+    # 沒有續租、沒有寫入任何事件。
+    assert len(captured_outcomes) == 1
+    assert captured_outcomes[0].action == "skipped"
+    assert "in-flight" in captured_outcomes[0].detail
+
+    bound = authority.list_by_state("bound", now_ms=now_ms + 1)
+    assert len(bound) == 1
+    # sweep 完全沒有介入：sequence 只由 dispatch 自己的 renew()→bind() 前進，
+    # 沒有夾雜任何額外的 sweep 寫入事件。
+    assert bound[0].sequence == sequence_before_sweep_holder[0] + 1
+
+
+def test_concurrent_instance_sweep_renew_between_create_job_and_bind_retries_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#839 對抗審查修復第五輪 MAJOR（manager.py:14511 bind 重試）：模擬
+    *另一個* Manager instance 的 periodic sweep——它沒有本 process 的
+    `IN_FLIGHT_DISPATCHES` 記憶（不同 process 的記憶體集合），在
+    `create_job()` 之後、原 dispatch `bind()` 之前，對這筆同一個 owner 的
+    reservation 做了一次合法的 `reconcile(confirmed-alive)` 續租（`reserved`
+    →`reserved`，sequence 前進）。原 dispatch 手上快取的 `expected_sequence`
+    因此過期；`bind()` 第一次呼叫必然撞上 `conflict`／`sequence-mismatch`，
+    但 owner_token／attempt_id 都對得上、且 reservation 仍是 `reserved`——
+    重新讀取目前 sequence 後重試一次應該成功，派工乾淨完成，不會永久卡住。"""
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+
+    descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=codex_key, now_ms=now_ms)
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    ctx = quota_admission.DispatchContext(
+        authority=authority, store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, codex_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+
+    original_create_job = JobRegistry.create_job
+
+    def _create_job_then_foreign_sweep_renew(self, **kwargs):
+        job = original_create_job(self, **kwargs)
+        # 模擬另一個 instance 的 sweep：直接對 authority 操作，完全不知道
+        # 本 process 的 IN_FLIGHT_DISPATCHES（它是不同 process 的記憶體）。
+        reserved = authority.list_by_state("reserved", now_ms=int(time.time() * 1000))
+        assert len(reserved) == 1
+        status = reserved[0]
+        renew_result = authority.reconcile(
+            reservation_id=status.reservation_id,
+            evidence={"kind": "job-registry-lookup-alive-unbound"},
+            resolution="confirmed-alive",
+            expected_sequence=status.sequence,
+            now_ms=int(time.time() * 1000),
+            renew_lease_ms=300_000,
+        )
+        assert renew_result.status == "ok"
+        return job
+
+    monkeypatch.setattr(JobRegistry, "create_job", _create_job_then_foreign_sweep_renew)
+
+    result = _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+    assert result is not None
+    assert "job_id" in result
+    job = registry.get_job(result["job_id"])
+    assert job["status"] != "failed"
+
+    bound = authority.list_by_state("bound", now_ms=now_ms + 1)
+    assert len(bound) == 1
+    # sequence 前進次序：reserve()=0 → dispatch 自己的 renew()=1 →
+    # 「另一個 instance」的 foreign sweep renew=2 → bind() 重試成功=3。
+    assert bound[0].sequence == 3
+    assert quota_admission.IN_FLIGHT_DISPATCHES.is_in_flight(bound[0].reservation_id) is False

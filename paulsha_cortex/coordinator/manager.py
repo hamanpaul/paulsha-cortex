@@ -14146,364 +14146,372 @@ def _dispatch_workflow_card(
             )
         excluded_quota_identities.add((identity.executor, identity.model_id))
     if quota_reservation_handle is not None:
-        # 對抗審查第四輪 MAJOR（quota_admission.py:1119）：reserve() 給的
-        # lease 只保證涵蓋到這一刻——接下來 worktree／sandbox provisioning
-        # 到 create_job()／bind() 可能耗時超過原始 lease。立刻續租一整個全
-        # 新的 lease_ms 窗口，讓 periodic sweep 不會單純因為『provisioning
-        # 比 lease 長』就誤判成 crash 殘留並釋放這筆仍在使用中的容量；同時
-        # 標記進 process-global in-flight 集合，即使續租本身因故失敗／延遲，
-        # 同一個 process 內的 sweep 仍能靠 in-flight 排除，不必只靠 lease。
-        # renew() 只允許 `reserved` 狀態，只有真的拿到新 grant（這個 handle）
-        # 時才呼叫；`duplicate`／race 落敗的分支從未建立 handle，不受影響。
+        # #839 對抗審查修復（第五輪 MAJOR manager.py:14098）：mark_started
+        # 必須與涵蓋 provisioning 全程的 try/finally 緊鄰——標記後立刻進入
+        # try，中間不能夾雜任何可能拋例外的程式碼；否則 creator.create()
+        # （worktree／sandbox provisioning）或下面任何其他失敗都會讓這個
+        # reservation_id 永遠卡在 in-flight 集合裡，periodic sweep 因此無限
+        # 續租，後續重試只會一直撞 duplicate（見下面 try/except/finally）。
         quota_admission.IN_FLIGHT_DISPATCHES.mark_started(quota_reservation_handle["reservation_id"])
-        renew_result = quota_admission_context.authority.renew(
-            reservation_id=quota_reservation_handle["reservation_id"],
-            owner_token=quota_reservation_handle["owner_token"],
-            attempt_id=quota_reservation_handle["attempt_id"],
-            lease_ms=quota_admission_context.lease_ms,
-            expected_sequence=quota_reservation_handle["sequence"],
-            now_ms=int(time.time() * 1000),
-        )
-        if renew_result.status == "ok":
-            quota_reservation_handle["sequence"] = renew_result.sequence
-        # renew 失敗（極端 race／結構異常）不擋派工——它只是延長 lease 的
-        # 優化，不是正確性前提；正確性來自上面的 in-flight 標記，以及下面
-        # bind() 若真的撞上「reservation 已被釋放」時的 fail-closed 處理。
-    # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
-    # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
-    _record_resolved_model_chain(
-        registry,
-        run,
-        step,
-        identity,
-        identities,
-        execution_profile_binding=profile_binding,
-    )
-    if quota_admission_context is not None and quota_selected_assessment is not None:
-        from . import quota_admission
-
-        # #839 對抗審查修復：原子預留已經在上面的候選迴圈裡、選中這個候選的
-        # 當下就嘗試過（見迴圈內註解）——`quota_attempt_id`／`quota_decision_id`／
-        # `quota_reservation_handle` 都是那個成功迭代留下的值，這裡不重算、不
-        # 重新呼叫 reserve_for_candidate()，只負責把已經確定的結果寫成 receipt。
-        quota_mode = "enforced" if quota_admission_enforced else "shadow"
-        quota_observation_version = quota_admission.observation_fingerprint(quota_selected_assessment)
-        quota_decision = quota_admission.AdmissionDecision(
-            decision_id=quota_decision_id, run_id=run.run_id, card_id=step.card,
-            attempt_id=quota_attempt_id, profile_key=profile_binding.resolved_key,
-            mode=quota_mode, outcome="admit",
-            policy_version=quota_admission.ADMISSION_POLICY_VERSION,
-            observation_version=quota_observation_version,
-            demand_version=quota_selected_demand_version,
-            qualification_version=_quota_admission_qualification_version(run, identities),
-            generated_at_ms=quota_now_ms,
-            selected={
-                "executor": identity.executor,
-                "model_id": identity.model_id,
-                "independence_domain": getattr(identity, "independence_domain", "unknown"),
-            },
-            reservation_id=(
-                quota_reservation_handle["reservation_id"]
-                if quota_reservation_handle is not None
-                else None
-            ),
-            # 排除掉的候選（額度評估不可行、或原子預留 race 落敗被換掉的那些）
-            # ——最後一筆是本次選中的候選自己，不算「被排除」。
-            excluded=tuple(quota_admission_attempts[:-1]),
-            # #840 對抗審查修復：見 `AdmissionDecision.selected_observation_state`
-            # 文件字串——舊 receipt 只留一個不可逆指紋，投影面看不出選中候選
-            # 本身是否 sufficient／unknown（shadow 模式下不可行一樣會被 admit）。
-            selected_observation_state=quota_selected_assessment.observation_state,
-            selected_feasible=quota_selected_assessment.feasible,
-            policy_config_revision=getattr(quota_admission_context, "config_revision", None),
-        )
-        # #839 對抗審查修復第三輪（MAJOR manager.py:14056）：admit receipt
-        # 比照 wait receipt 先讀、有舊紀錄就沿用不重寫——見
-        # `_quota_admission_record_admit_decision` 文件字串；shadow（以及
-        # 未受額度管理、`quota_reservation_handle` 為 None）的候選尤其不能
-        # 讓這筆純診斷寫入的失敗回頭影響已經確定的派工結果。
-        quota_admission_projection = _quota_admission_record_admit_decision(
-            quota_admission_context.store, quota_decision,
-        )
-        if quota_admission_projection is not None:
-            registry._manager_update_workflow_run(
-                run.run_id,
-                quota_admission={
-                    **(run.quota_admission or {}),
-                    step.persona: quota_admission_projection,
-                },
-            )
-    builder_jobs = [
-        job
-        for job in registry.list_jobs()
-        if job.get("workflow_run_id") == run.run_id
-        and (
-            job.get("persona") == "builder"
-            or (
-                job.get("persona") == "manager"
-                and job.get("workflow_phase") == "ship"
-                and job.get("workflow_card") == "openspec-archive"
-            )
-        )
-        and job.get("status") == "exited"
-        and job.get("exit_code") == 0
-        and (
-            run.candidate_head is None
-            or job.get("subject_head") == run.candidate_head
-        )
-    ]
-    builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
-    verification_gate_ledger = None
-    if step.phase == "verify":
-        candidate_build_jobs = [
-            job
-            for job in builder_jobs
-            if job.get("persona") == "builder" and job.get("workflow_phase") == "build"
-        ]
-        if candidate_build_jobs:
-            verification_gate_ledger = _verification_gate_ledger_context(
-                run, candidate_build_jobs[-1]
-            )
-    if step.persona == "reviewer" and builder_job_id is None:
-        raise ValueError("workflow reviewer builder job unavailable")
-    task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
-    # #648：job_id 必須在 **provision 之前**就定案——per-job 工作區的目錄名就是
-    # `job_workspace.job_segment(job_id)`，而 `launcher.launch(slice_id=job_id)`
-    # 之後交給 `job_runner.prepare_systemd_template(job_id=…)` 算 instance 名的也是
-    # 同一個字串。順序不能反過來：`create_job()` 的 `workflow_input_snapshot` /
-    # `workflow_output_baseline` 都是從工作區的檔案算出來的。
-    # 配發即消耗（見 `registry.reserve_job_id`），因此 provision 失敗只是燒掉一個
-    # 序號，不會有兩個 job 共用同一個 id、進而共用同一個目錄。
-    reserved_job_id = registry.reserve_job_id(task)
-    planner_sandbox: Path | None = None
-    reviewer_sandbox: Path | None = None
-    sandbox_hash: str | None = None
-    repo_root = run.workspace_root
-    if step.persona == "planner":
-        sandbox_parent = Path(coordinator_root).resolve() / "planning-sandboxes"
-        try:
-            sandbox_parent.relative_to(Path(run.workspace_root).resolve())
-        except ValueError:
-            pass
-        else:
-            sandbox_parent = (
-                Path(coordinator_root).resolve().parent
-                / f".{Path(coordinator_root).resolve().name}-planning-sandboxes"
-            )
-        sandbox_parent.mkdir(parents=True, exist_ok=True)
-        sandbox_name = hashlib.sha256(f"{run.run_id}:{step.card}".encode()).hexdigest()[:32]
-        planner_sandbox = sandbox_parent / sandbox_name
-        if planner_sandbox.exists() or planner_sandbox.is_symlink():
-            raise ValueError("stale planner sandbox requires reconciliation")
-        planning_runtime._copy_planning_sandbox(Path(run.workspace_root), planner_sandbox)
-        sandbox_hash = planning_runtime._tree_snapshot(planner_sandbox)
-        worktree = str(planner_sandbox)
-    elif step.phase == "build":
-        creator = getattr(dispatcher, "_worktree_creator", None)
-        workspace_root = Path(run.workspace_root)
-        if creator is None:
-            try:
-                creator = seams.ScriptWorktreeCreator(
-                    repo=workspace_root,
-                    wt_root=worktree_root_for(workspace_root),
-                    base="main",
-                )
-            except BaseException as exc:
-                raise ValueError("workflow builder worktree creator unavailable") from exc
-        #: #633：改問 `anchored_at()` 而不是自己比較 `creator.repo_root`——lazy 化
-        #: 之後「repo 尚未解析且環境沒宣告」是 dispatcher 上一個合法的 creator 狀態，
-        #: 直接讀 `repo_root` 會讓 `RepoRootUnresolvedError` 從一句比較裡漏出去。
-        #: 語意不變：錨定的不是本 run 的 workspace_root 就換一個錨定正確的。
-        elif isinstance(creator, seams.ScriptWorktreeCreator) and not creator.anchored_at(
-            workspace_root
-        ):
-            try:
-                creator = seams.ScriptWorktreeCreator(
-                    repo=workspace_root,
-                    wt_root=worktree_root_for(workspace_root),
-                    base="main",
-                )
-            except BaseException as exc:
-                raise ValueError("workflow builder worktree creator unavailable") from exc
-        # #731：branch 名的推導抬成 `workflow_build_branch()`（模組級單一導出點），
-        # 讓 `work refreeze-base` 的 #613 前置檢查問到的是**同一條** branch。
-        builder_branch = workflow_build_branch(run)
-        # #648：canonical lane 的工作區改為 **per-job**——每一張 build 卡自己 clone
-        # 一份，目錄名 ＝ 這張卡的 job_id 經 `job_workspace.job_segment()` 導出的
-        # 片段，也就是 `job_runner.template_instance_id()` 算出來的 instance 名。
-        # #645／#646 之後 canonical lane 傳的是 run 層級的 build 身分，一個工作區
-        # 對多個 job_id，`ReadWritePaths=<pool>/%i` 對第二張卡起必然指向不存在的
-        # 路徑（`226/NAMESPACE`）；改 per-job 之後那個一對多消失，不變式成立。
-        # 這裡刻意與 slice lane（`autonomy._launcher_worktree`）用**同一個推導點**。
-        build_branch = (
-            str(builder_jobs[-1]["branch"])
-            if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
-            else builder_branch
-        )
-        accepted_candidate = (
-            run.candidate_head
-            if isinstance(run.candidate_head, str)
-            and verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is not None
-            else None
-        )
-        if post_archive_candidate is not None:
-            # post-archive Builder 的工作區必須從 archive 已採信的 exact
-            # Candidate 出發；歷史 Builder 的 dispatch_head 是 run 起始基底，不能
-            # 拿來當這張新卡的 clone base。
-            build_base_sha = post_archive_candidate
-        elif builder_jobs and accepted_candidate is not None:
-            # 中段／後續 build 卡：base 是**來源樹上這條 branch 現在的位置**，也就是
-            # 前一張卡 harvest 回來（#637 bundle ＋ append-only spool）之後被採信的
-            # candidate。交接因此完全走 Manager 自己的 object store，不依賴前一張卡的
-            # 工作區還留在磁碟上——那個目錄可以已經被回收掉。
-            # `run.candidate_head` 是 Manager 採信的權威值；推不出時 fail-closed，
-            # **絕不**讓 base 落回 creator 的預設（那會是 `main`，等於把整個 run 的
-            # 成果 reset 掉）。base 對不上來源樹的實況時，creator 既有的兩道守衛會擋：
-            # `rev-parse --verify <base>` 找不到 commit ⇒ harvest 沒完成；
-            # `merge-base --is-ancestor <branch> <base>` ⇒ branch 上有 base 以外的
-            # commit（#613 的形狀），一律拒絕 provision。
-            build_base_sha = _workflow_build_handoff_base(
-                run, builder_jobs=builder_jobs, card=step.card
-            )
-        else:
-            # 尚未錨定 Candidate 的 build 卡：#208 收口 wiring 5（#211 閉環）——
-            # 凍結集存在時必須以 frozen_readiness["base_sha"] 為基底，不得讓 dispatch
-            # 自行重新推導一個可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2
-            # 的 stale-base 缺陷）。
-            build_base_sha = None
-            if isinstance(run.frozen_readiness, dict):
-                candidate_base_sha = run.frozen_readiness.get("base_sha")
-                if isinstance(candidate_base_sha, str) and candidate_base_sha:
-                    build_base_sha = candidate_base_sha
-        # 無凍結集且為首張卡時完全不傳 base_sha 引數，維持現行為（呼叫端保有舊
-        # WorktreeCreator 實作 without base_sha 亦不受影響）。
-        if build_base_sha is not None:
-            worktree = str(
-                creator.create(
-                    build_branch, job_id=reserved_job_id, base_sha=build_base_sha
-                )
-            )
-        else:
-            worktree = str(creator.create(build_branch, job_id=reserved_job_id))
-    elif step.persona == "reviewer":
-        # #650：verify／review 卡的 candidate 樹改為 **Manager 自己在來源樹上 clone
-        # 出來的一棵**，不再是 `builder_jobs[-1]["worktree"]`。
-        #
-        # 為什麼在這裡（而不是等到 reviewer 分支）provision：`_workflow_input_snapshot()`
-        # 是 `_create_reviewer_sandbox()` 的**輸入**，算它時 sandbox 還不存在——票上點名
-        # 的順序問題。解法沿用 #653 對 `archive-applied-needs-commit` 的處置：**同一次
-        # 派工內結構性共用同一個 provisioning**。candidate 樹在這裡建好一次，
-        # authority map／input snapshot／output baseline／sandbox clone 源／tree
-        # snapshot 五個用途全部拿到同一棵樹，順序問題因此不是被「解決」而是**不存在**。
-        #
-        # branch 與底下 job 記錄用的那一個是同一條推導（前一張 build 卡的 branch；
-        # post-archive 時是 `_record_manager_ship_job()` 記在 archive 卡上的那一條）。
-        reviewer_branch = (
-            str(builder_jobs[-1]["branch"])
-            if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
-            else f"feature/{run.work_id}"
-        )
-        reviewer_candidate = run.candidate_head
-        if (
-            not isinstance(reviewer_candidate, str)
-            or verification.SAFE_SHA_RE.fullmatch(reviewer_candidate) is None
-        ):
-            # 與 `_create_reviewer_sandbox()` 逐字相同的訊息：candidate 推不出來時
-            # 這條 lane 本來就走不下去，只是現在擋在建樹之前。
-            raise ValueError("workflow reviewer candidate invalid")
-        worktree = str(
-            _reviewer_candidate_workspace(
-                run=run,
-                branch=reviewer_branch,
-                candidate=reviewer_candidate.lower(),
-            )
-        )
-    elif builder_jobs:
-        worktree = str(builder_jobs[-1]["worktree"])
-    else:
-        worktree = run.workspace_root
-    effective_repo_root = Path(worktree).resolve()
-    effective_inputs = _effective_workflow_inputs(run, step)
-    if step.persona == "reviewer":
-        reviewer_target = effective_repo_root
-        # #310 補遺：checkbox 容忍成立的 tasks/todo 以候選實際 hash 為 pinned 期望值。
-        authority_map = _authority_map_with_checkbox_tolerance(
-            run, candidate_root=reviewer_target
-        )
-        effective_inputs = _reviewer_input_patterns(run, effective_inputs)
-        input_snapshot = _workflow_input_snapshot(
-            run=run,
-            repo_root=reviewer_target,
-            patterns=effective_inputs,
-            coordinator_root=coordinator_root,
-        )
-        foreign_review.verify_authority_in_input_snapshot(
-            authority=authority_map,
-            input_snapshot=input_snapshot,
-        )
-        output_baseline = _workflow_output_baseline(reviewer_target, step.outputs)
-        try:
-            reviewer_sandbox, reviewer_checkout = _create_reviewer_sandbox(
-                run=run,
-                step=step,
-                executor=identity.executor,
-                candidate_root=reviewer_target,
-                coordinator_root=coordinator_root,
-                input_snapshot=input_snapshot,
-                job_id=reserved_job_id,
-            )
-            sandbox_hash = planning_runtime._tree_snapshot(reviewer_target)
-            repo_root = str(reviewer_target)
-            worktree = str(reviewer_sandbox)
-            effective_repo_root = reviewer_checkout
-            _validate_workflow_input_snapshot(
-                effective_repo_root,
-                list(input_snapshot),
-                coordinator_root=coordinator_root,
-            )
-        except BaseException:
-            if reviewer_sandbox is not None:
-                shutil.rmtree(reviewer_sandbox, ignore_errors=True)
-            raise
-    else:
-        input_snapshot = _workflow_input_snapshot(
-            run=run,
-            repo_root=effective_repo_root,
-            patterns=effective_inputs,
-            coordinator_root=coordinator_root,
-        )
-        output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
-    dispatch_base: str | None = None
-    if step.phase == "build":
-        if post_archive_candidate is not None:
-            if (
-                not isinstance(build_base_sha, str)
-                or verification.SAFE_SHA_RE.fullmatch(build_base_sha) is None
-            ):
-                raise ValueError("workflow build phase base is unavailable")
-            dispatch_base = build_base_sha.lower()
-        elif builder_jobs:
-            persisted_base = builder_jobs[0].get("dispatch_head")
-            if (
-                not isinstance(persisted_base, str)
-                or verification.SAFE_SHA_RE.fullmatch(persisted_base) is None
-            ):
-                raise ValueError("workflow build phase base is unavailable")
-            dispatch_base = persisted_base
-        else:
-            base_result = verification._run_git(
-                ["-C", str(effective_repo_root), "rev-parse", "HEAD"],
-                getattr(dispatcher, "_git_runner", None),
-            )
-            base_value = str(base_result.get("stdout", "")).strip().lower()
-            if (
-                base_result.get("status") != "ok"
-                or verification.SAFE_SHA_RE.fullmatch(base_value) is None
-            ):
-                raise ValueError("workflow build phase base is unavailable")
-            dispatch_base = base_value
     quota_job_created = False
     try:
+        if quota_reservation_handle is not None:
+            # 對抗審查第四輪 MAJOR（quota_admission.py:1119）：reserve() 給的
+            # lease 只保證涵蓋到這一刻——接下來 worktree／sandbox provisioning
+            # 到 create_job()／bind() 可能耗時超過原始 lease。立刻續租一整個全
+            # 新的 lease_ms 窗口，讓 periodic sweep 不會單純因為『provisioning
+            # 比 lease 長』就誤判成 crash 殘留並釋放這筆仍在使用中的容量；同時
+            # 已標記進 process-global in-flight 集合（見上面），即使續租本身因
+            # 故失敗／延遲，同一個 process 內的 sweep 仍能靠 in-flight 排除，
+            # 不必只靠 lease。renew() 只允許 `reserved` 狀態，只有真的拿到新
+            # grant（這個 handle）時才呼叫；`duplicate`／race 落敗的分支從未
+            # 建立 handle，不受影響。
+            renew_result = quota_admission_context.authority.renew(
+                reservation_id=quota_reservation_handle["reservation_id"],
+                owner_token=quota_reservation_handle["owner_token"],
+                attempt_id=quota_reservation_handle["attempt_id"],
+                lease_ms=quota_admission_context.lease_ms,
+                expected_sequence=quota_reservation_handle["sequence"],
+                now_ms=int(time.time() * 1000),
+            )
+            if renew_result.status == "ok":
+                quota_reservation_handle["sequence"] = renew_result.sequence
+            # renew 失敗（極端 race／結構異常）不擋派工——它只是延長 lease 的
+            # 優化，不是正確性前提；正確性來自上面的 in-flight 標記，以及下面
+            # bind() 若真的撞上「reservation 已被釋放」時的 fail-closed 處理。
+        # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
+        # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
+        _record_resolved_model_chain(
+            registry,
+            run,
+            step,
+            identity,
+            identities,
+            execution_profile_binding=profile_binding,
+        )
+        if quota_admission_context is not None and quota_selected_assessment is not None:
+            from . import quota_admission
+
+            # #839 對抗審查修復：原子預留已經在上面的候選迴圈裡、選中這個候選的
+            # 當下就嘗試過（見迴圈內註解）——`quota_attempt_id`／`quota_decision_id`／
+            # `quota_reservation_handle` 都是那個成功迭代留下的值，這裡不重算、不
+            # 重新呼叫 reserve_for_candidate()，只負責把已經確定的結果寫成 receipt。
+            quota_mode = "enforced" if quota_admission_enforced else "shadow"
+            quota_observation_version = quota_admission.observation_fingerprint(quota_selected_assessment)
+            quota_decision = quota_admission.AdmissionDecision(
+                decision_id=quota_decision_id, run_id=run.run_id, card_id=step.card,
+                attempt_id=quota_attempt_id, profile_key=profile_binding.resolved_key,
+                mode=quota_mode, outcome="admit",
+                policy_version=quota_admission.ADMISSION_POLICY_VERSION,
+                observation_version=quota_observation_version,
+                demand_version=quota_selected_demand_version,
+                qualification_version=_quota_admission_qualification_version(run, identities),
+                generated_at_ms=quota_now_ms,
+                selected={
+                    "executor": identity.executor,
+                    "model_id": identity.model_id,
+                    "independence_domain": getattr(identity, "independence_domain", "unknown"),
+                },
+                reservation_id=(
+                    quota_reservation_handle["reservation_id"]
+                    if quota_reservation_handle is not None
+                    else None
+                ),
+                # 排除掉的候選（額度評估不可行、或原子預留 race 落敗被換掉的那些）
+                # ——最後一筆是本次選中的候選自己，不算「被排除」。
+                excluded=tuple(quota_admission_attempts[:-1]),
+                # #840 對抗審查修復：見 `AdmissionDecision.selected_observation_state`
+                # 文件字串——舊 receipt 只留一個不可逆指紋，投影面看不出選中候選
+                # 本身是否 sufficient／unknown（shadow 模式下不可行一樣會被 admit）。
+                selected_observation_state=quota_selected_assessment.observation_state,
+                selected_feasible=quota_selected_assessment.feasible,
+                policy_config_revision=getattr(quota_admission_context, "config_revision", None),
+            )
+            # #839 對抗審查修復第三輪（MAJOR manager.py:14056）：admit receipt
+            # 比照 wait receipt 先讀、有舊紀錄就沿用不重寫——見
+            # `_quota_admission_record_admit_decision` 文件字串；shadow（以及
+            # 未受額度管理、`quota_reservation_handle` 為 None）的候選尤其不能
+            # 讓這筆純診斷寫入的失敗回頭影響已經確定的派工結果。
+            quota_admission_projection = _quota_admission_record_admit_decision(
+                quota_admission_context.store, quota_decision,
+            )
+            if quota_admission_projection is not None:
+                registry._manager_update_workflow_run(
+                    run.run_id,
+                    quota_admission={
+                        **(run.quota_admission or {}),
+                        step.persona: quota_admission_projection,
+                    },
+                )
+        builder_jobs = [
+            job
+            for job in registry.list_jobs()
+            if job.get("workflow_run_id") == run.run_id
+            and (
+                job.get("persona") == "builder"
+                or (
+                    job.get("persona") == "manager"
+                    and job.get("workflow_phase") == "ship"
+                    and job.get("workflow_card") == "openspec-archive"
+                )
+            )
+            and job.get("status") == "exited"
+            and job.get("exit_code") == 0
+            and (
+                run.candidate_head is None
+                or job.get("subject_head") == run.candidate_head
+            )
+        ]
+        builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
+        verification_gate_ledger = None
+        if step.phase == "verify":
+            candidate_build_jobs = [
+                job
+                for job in builder_jobs
+                if job.get("persona") == "builder" and job.get("workflow_phase") == "build"
+            ]
+            if candidate_build_jobs:
+                verification_gate_ledger = _verification_gate_ledger_context(
+                    run, candidate_build_jobs[-1]
+                )
+        if step.persona == "reviewer" and builder_job_id is None:
+            raise ValueError("workflow reviewer builder job unavailable")
+        task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
+        # #648：job_id 必須在 **provision 之前**就定案——per-job 工作區的目錄名就是
+        # `job_workspace.job_segment(job_id)`，而 `launcher.launch(slice_id=job_id)`
+        # 之後交給 `job_runner.prepare_systemd_template(job_id=…)` 算 instance 名的也是
+        # 同一個字串。順序不能反過來：`create_job()` 的 `workflow_input_snapshot` /
+        # `workflow_output_baseline` 都是從工作區的檔案算出來的。
+        # 配發即消耗（見 `registry.reserve_job_id`），因此 provision 失敗只是燒掉一個
+        # 序號，不會有兩個 job 共用同一個 id、進而共用同一個目錄。
+        reserved_job_id = registry.reserve_job_id(task)
+        planner_sandbox: Path | None = None
+        reviewer_sandbox: Path | None = None
+        sandbox_hash: str | None = None
+        repo_root = run.workspace_root
+        if step.persona == "planner":
+            sandbox_parent = Path(coordinator_root).resolve() / "planning-sandboxes"
+            try:
+                sandbox_parent.relative_to(Path(run.workspace_root).resolve())
+            except ValueError:
+                pass
+            else:
+                sandbox_parent = (
+                    Path(coordinator_root).resolve().parent
+                    / f".{Path(coordinator_root).resolve().name}-planning-sandboxes"
+                )
+            sandbox_parent.mkdir(parents=True, exist_ok=True)
+            sandbox_name = hashlib.sha256(f"{run.run_id}:{step.card}".encode()).hexdigest()[:32]
+            planner_sandbox = sandbox_parent / sandbox_name
+            if planner_sandbox.exists() or planner_sandbox.is_symlink():
+                raise ValueError("stale planner sandbox requires reconciliation")
+            planning_runtime._copy_planning_sandbox(Path(run.workspace_root), planner_sandbox)
+            sandbox_hash = planning_runtime._tree_snapshot(planner_sandbox)
+            worktree = str(planner_sandbox)
+        elif step.phase == "build":
+            creator = getattr(dispatcher, "_worktree_creator", None)
+            workspace_root = Path(run.workspace_root)
+            if creator is None:
+                try:
+                    creator = seams.ScriptWorktreeCreator(
+                        repo=workspace_root,
+                        wt_root=worktree_root_for(workspace_root),
+                        base="main",
+                    )
+                except BaseException as exc:
+                    raise ValueError("workflow builder worktree creator unavailable") from exc
+            #: #633：改問 `anchored_at()` 而不是自己比較 `creator.repo_root`——lazy 化
+            #: 之後「repo 尚未解析且環境沒宣告」是 dispatcher 上一個合法的 creator 狀態，
+            #: 直接讀 `repo_root` 會讓 `RepoRootUnresolvedError` 從一句比較裡漏出去。
+            #: 語意不變：錨定的不是本 run 的 workspace_root 就換一個錨定正確的。
+            elif isinstance(creator, seams.ScriptWorktreeCreator) and not creator.anchored_at(
+                workspace_root
+            ):
+                try:
+                    creator = seams.ScriptWorktreeCreator(
+                        repo=workspace_root,
+                        wt_root=worktree_root_for(workspace_root),
+                        base="main",
+                    )
+                except BaseException as exc:
+                    raise ValueError("workflow builder worktree creator unavailable") from exc
+            # #731：branch 名的推導抬成 `workflow_build_branch()`（模組級單一導出點），
+            # 讓 `work refreeze-base` 的 #613 前置檢查問到的是**同一條** branch。
+            builder_branch = workflow_build_branch(run)
+            # #648：canonical lane 的工作區改為 **per-job**——每一張 build 卡自己 clone
+            # 一份，目錄名 ＝ 這張卡的 job_id 經 `job_workspace.job_segment()` 導出的
+            # 片段，也就是 `job_runner.template_instance_id()` 算出來的 instance 名。
+            # #645／#646 之後 canonical lane 傳的是 run 層級的 build 身分，一個工作區
+            # 對多個 job_id，`ReadWritePaths=<pool>/%i` 對第二張卡起必然指向不存在的
+            # 路徑（`226/NAMESPACE`）；改 per-job 之後那個一對多消失，不變式成立。
+            # 這裡刻意與 slice lane（`autonomy._launcher_worktree`）用**同一個推導點**。
+            build_branch = (
+                str(builder_jobs[-1]["branch"])
+                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+                else builder_branch
+            )
+            accepted_candidate = (
+                run.candidate_head
+                if isinstance(run.candidate_head, str)
+                and verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is not None
+                else None
+            )
+            if post_archive_candidate is not None:
+                # post-archive Builder 的工作區必須從 archive 已採信的 exact
+                # Candidate 出發；歷史 Builder 的 dispatch_head 是 run 起始基底，不能
+                # 拿來當這張新卡的 clone base。
+                build_base_sha = post_archive_candidate
+            elif builder_jobs and accepted_candidate is not None:
+                # 中段／後續 build 卡：base 是**來源樹上這條 branch 現在的位置**，也就是
+                # 前一張卡 harvest 回來（#637 bundle ＋ append-only spool）之後被採信的
+                # candidate。交接因此完全走 Manager 自己的 object store，不依賴前一張卡的
+                # 工作區還留在磁碟上——那個目錄可以已經被回收掉。
+                # `run.candidate_head` 是 Manager 採信的權威值；推不出時 fail-closed，
+                # **絕不**讓 base 落回 creator 的預設（那會是 `main`，等於把整個 run 的
+                # 成果 reset 掉）。base 對不上來源樹的實況時，creator 既有的兩道守衛會擋：
+                # `rev-parse --verify <base>` 找不到 commit ⇒ harvest 沒完成；
+                # `merge-base --is-ancestor <branch> <base>` ⇒ branch 上有 base 以外的
+                # commit（#613 的形狀），一律拒絕 provision。
+                build_base_sha = _workflow_build_handoff_base(
+                    run, builder_jobs=builder_jobs, card=step.card
+                )
+            else:
+                # 尚未錨定 Candidate 的 build 卡：#208 收口 wiring 5（#211 閉環）——
+                # 凍結集存在時必須以 frozen_readiness["base_sha"] 為基底，不得讓 dispatch
+                # 自行重新推導一個可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2
+                # 的 stale-base 缺陷）。
+                build_base_sha = None
+                if isinstance(run.frozen_readiness, dict):
+                    candidate_base_sha = run.frozen_readiness.get("base_sha")
+                    if isinstance(candidate_base_sha, str) and candidate_base_sha:
+                        build_base_sha = candidate_base_sha
+            # 無凍結集且為首張卡時完全不傳 base_sha 引數，維持現行為（呼叫端保有舊
+            # WorktreeCreator 實作 without base_sha 亦不受影響）。
+            if build_base_sha is not None:
+                worktree = str(
+                    creator.create(
+                        build_branch, job_id=reserved_job_id, base_sha=build_base_sha
+                    )
+                )
+            else:
+                worktree = str(creator.create(build_branch, job_id=reserved_job_id))
+        elif step.persona == "reviewer":
+            # #650：verify／review 卡的 candidate 樹改為 **Manager 自己在來源樹上 clone
+            # 出來的一棵**，不再是 `builder_jobs[-1]["worktree"]`。
+            #
+            # 為什麼在這裡（而不是等到 reviewer 分支）provision：`_workflow_input_snapshot()`
+            # 是 `_create_reviewer_sandbox()` 的**輸入**，算它時 sandbox 還不存在——票上點名
+            # 的順序問題。解法沿用 #653 對 `archive-applied-needs-commit` 的處置：**同一次
+            # 派工內結構性共用同一個 provisioning**。candidate 樹在這裡建好一次，
+            # authority map／input snapshot／output baseline／sandbox clone 源／tree
+            # snapshot 五個用途全部拿到同一棵樹，順序問題因此不是被「解決」而是**不存在**。
+            #
+            # branch 與底下 job 記錄用的那一個是同一條推導（前一張 build 卡的 branch；
+            # post-archive 時是 `_record_manager_ship_job()` 記在 archive 卡上的那一條）。
+            reviewer_branch = (
+                str(builder_jobs[-1]["branch"])
+                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+                else f"feature/{run.work_id}"
+            )
+            reviewer_candidate = run.candidate_head
+            if (
+                not isinstance(reviewer_candidate, str)
+                or verification.SAFE_SHA_RE.fullmatch(reviewer_candidate) is None
+            ):
+                # 與 `_create_reviewer_sandbox()` 逐字相同的訊息：candidate 推不出來時
+                # 這條 lane 本來就走不下去，只是現在擋在建樹之前。
+                raise ValueError("workflow reviewer candidate invalid")
+            worktree = str(
+                _reviewer_candidate_workspace(
+                    run=run,
+                    branch=reviewer_branch,
+                    candidate=reviewer_candidate.lower(),
+                )
+            )
+        elif builder_jobs:
+            worktree = str(builder_jobs[-1]["worktree"])
+        else:
+            worktree = run.workspace_root
+        effective_repo_root = Path(worktree).resolve()
+        effective_inputs = _effective_workflow_inputs(run, step)
+        if step.persona == "reviewer":
+            reviewer_target = effective_repo_root
+            # #310 補遺：checkbox 容忍成立的 tasks/todo 以候選實際 hash 為 pinned 期望值。
+            authority_map = _authority_map_with_checkbox_tolerance(
+                run, candidate_root=reviewer_target
+            )
+            effective_inputs = _reviewer_input_patterns(run, effective_inputs)
+            input_snapshot = _workflow_input_snapshot(
+                run=run,
+                repo_root=reviewer_target,
+                patterns=effective_inputs,
+                coordinator_root=coordinator_root,
+            )
+            foreign_review.verify_authority_in_input_snapshot(
+                authority=authority_map,
+                input_snapshot=input_snapshot,
+            )
+            output_baseline = _workflow_output_baseline(reviewer_target, step.outputs)
+            try:
+                reviewer_sandbox, reviewer_checkout = _create_reviewer_sandbox(
+                    run=run,
+                    step=step,
+                    executor=identity.executor,
+                    candidate_root=reviewer_target,
+                    coordinator_root=coordinator_root,
+                    input_snapshot=input_snapshot,
+                    job_id=reserved_job_id,
+                )
+                sandbox_hash = planning_runtime._tree_snapshot(reviewer_target)
+                repo_root = str(reviewer_target)
+                worktree = str(reviewer_sandbox)
+                effective_repo_root = reviewer_checkout
+                _validate_workflow_input_snapshot(
+                    effective_repo_root,
+                    list(input_snapshot),
+                    coordinator_root=coordinator_root,
+                )
+            except BaseException:
+                if reviewer_sandbox is not None:
+                    shutil.rmtree(reviewer_sandbox, ignore_errors=True)
+                raise
+        else:
+            input_snapshot = _workflow_input_snapshot(
+                run=run,
+                repo_root=effective_repo_root,
+                patterns=effective_inputs,
+                coordinator_root=coordinator_root,
+            )
+            output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
+        dispatch_base: str | None = None
+        if step.phase == "build":
+            if post_archive_candidate is not None:
+                if (
+                    not isinstance(build_base_sha, str)
+                    or verification.SAFE_SHA_RE.fullmatch(build_base_sha) is None
+                ):
+                    raise ValueError("workflow build phase base is unavailable")
+                dispatch_base = build_base_sha.lower()
+            elif builder_jobs:
+                persisted_base = builder_jobs[0].get("dispatch_head")
+                if (
+                    not isinstance(persisted_base, str)
+                    or verification.SAFE_SHA_RE.fullmatch(persisted_base) is None
+                ):
+                    raise ValueError("workflow build phase base is unavailable")
+                dispatch_base = persisted_base
+            else:
+                base_result = verification._run_git(
+                    ["-C", str(effective_repo_root), "rev-parse", "HEAD"],
+                    getattr(dispatcher, "_git_runner", None),
+                )
+                base_value = str(base_result.get("stdout", "")).strip().lower()
+                if (
+                    base_result.get("status") != "ok"
+                    or verification.SAFE_SHA_RE.fullmatch(base_value) is None
+                ):
+                    raise ValueError("workflow build phase base is unavailable")
+                dispatch_base = base_value
         branch = (
             # #648：build 卡的 branch 已在 provisioning 當下定案（`build_branch`
             # 就是傳給 `creator.create()` 的那一個）。在這裡重算一次等於再開一個
@@ -14574,55 +14582,75 @@ def _dispatch_workflow_card(
                 expected_sequence=quota_reservation_handle["sequence"],
                 now_ms=int(time.time() * 1000),
             )
+            if (
+                bind_result.status == "conflict"
+                and bind_result.reason == "sequence-mismatch"
+                and bind_result.state == "reserved"
+            ):
+                # #839 對抗審查修復第五輪 MAJOR（quota_admission.py 週期性
+                # sweep）：另一個 Manager instance 的 periodic sweep 可能在
+                # 這次 create_job() 之後、這次 bind() 之前掃到同一筆
+                # reservation（job 已存在但未終局），把它當存活續租——那筆
+                # reconcile 對本 process 完全合法（它不知道我方正在
+                # provisioning），只是把 sequence 往前推了一格，讓這裡原本
+                # 记住的 expected_sequence 過期。owner_token／attempt_id 都對
+                # 得上（否則 bind() 會回 invalid 而不是 conflict），且
+                # bind_result.state 仍是 `reserved`（沒有被終結）——單純重新
+                # 讀取目前 sequence 再試一次即可，不必因為別人幫忙續租過就
+                # 整條 fail closed。只重試一次：這裡不是搶鎖迴圈，重試後仍
+                # 衝突就落到下面既有的 fail-closed 路徑，交給下一次 dispatch
+                # 或收斂掃描處理。
+                bind_result = quota_admission_context.authority.bind(
+                    reservation_id=quota_reservation_handle["reservation_id"],
+                    owner_token=quota_reservation_handle["owner_token"],
+                    attempt_id=quota_reservation_handle["attempt_id"],
+                    job_id=str(job["job_id"]),
+                    expected_sequence=bind_result.sequence,
+                    now_ms=int(time.time() * 1000),
+                )
             if bind_result.status not in ("ok", "duplicate"):
-                if (
-                    bind_result.status == "conflict"
-                    and bind_result.reason == "reservation-already-terminal"
-                ):
-                    # 對抗審查第四輪 MAJOR（quota_admission.py:1119）：這筆
-                    # reservation 在 provisioning 期間已經被結束掉（sweep 的
-                    # reconcile，或另一個 instance）——即使已經有 renew／
-                    # grace／in-flight 排除，極端情況（例如 renew 呼叫本身
-                    # 失敗、或 clock skew）仍可能發生。job 記錄已經建立，不能
-                    # 假稱成功；標記為失敗（**不**記 provider_outcome，避免
-                    # 誤觸 #825/#826 的 executor backoff 分類——這不是
-                    # executor 的錯），留一筆 wait decision receipt 供 #840
-                    # 觀測，再讓下面的 fail-closed 例外照既有「job 已建立、
-                    # spawn 前失敗」路徑傳播（不 spawn、不假稱成功）。
-                    registry.update_headless_result(
-                        str(job["job_id"]), status="failed", exit_code=1,
-                        runtime_diagnostic={
-                            "reason": "quota-admission-reservation-lost",
-                            "detail": f"bind rejected: {bind_result.status}/{bind_result.reason}",
-                            "source": "manager._dispatch_workflow_card:quota-admission-bind",
-                            "job_id": str(job["job_id"]),
+                # #839 對抗審查修復第五輪 MAJOR：bind() 最終失敗（含上面重試
+                # 一次之後仍失敗）——job 記錄已經建立，不能假稱成功。不論衝突
+                # 原因是什麼（reservation 已被收斂終結、重試後仍 sequence 不
+                # 符、或其他結構性衝突），一律走同一條既有 fail-closed
+                # 路徑：標記為失敗（**不**記 provider_outcome，避免誤觸
+                # #825/#826 的 executor backoff 分類——這不是 executor 的
+                # 錯），留一筆 wait decision receipt 供 #840 觀測，再讓下面的
+                # 例外照既有「job 已建立、spawn 前失敗」路徑傳播（不 spawn、
+                # 不假稱成功）；reservation 本身是否已死交給既有
+                # reconcile_reserved_reservations／reconcile_bound_reservations
+                # 依事實判定，這裡不猜測、不呼叫 release()（#838 只允許
+                # release 發生在 bind 之前）。
+                registry.update_headless_result(
+                    str(job["job_id"]), status="failed", exit_code=1,
+                    runtime_diagnostic={
+                        "reason": "quota-admission-reservation-lost",
+                        "detail": f"bind rejected: {bind_result.status}/{bind_result.reason}",
+                        "source": "manager._dispatch_workflow_card:quota-admission-bind",
+                        "job_id": str(job["job_id"]),
+                    },
+                )
+                quota_admission_projection = _quota_admission_record_wait_decision(
+                    quota_admission_context.store, registry=registry, run=run, step=step,
+                    identities=identities, reason="quota-admission-reservation-lost",
+                )
+                if quota_admission_projection is not None:
+                    registry._manager_update_workflow_run(
+                        run.run_id,
+                        facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+                        needs_human_reason=diagnostic_reason(
+                            "quota-admission-reservation-lost",
+                            "額度 reservation 在 provisioning 期間被收斂釋放，"
+                            f"bind 失敗，fail closed 不假稱成功："
+                            f"{bind_result.status}/{bind_result.reason}",
+                            source="manager._dispatch_workflow_card:quota-admission-bind",
+                            run_id=run.run_id, work_id=run.work_id, card=step.card,
+                            job_id=str(job["job_id"]),
+                        ),
+                        quota_admission={
+                            **(run.quota_admission or {}), step.persona: quota_admission_projection,
                         },
                     )
-                    quota_admission_projection = _quota_admission_record_wait_decision(
-                        quota_admission_context.store, registry=registry, run=run, step=step,
-                        identities=identities, reason="quota-admission-reservation-lost",
-                    )
-                    if quota_admission_projection is not None:
-                        registry._manager_update_workflow_run(
-                            run.run_id,
-                            facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
-                            needs_human_reason=diagnostic_reason(
-                                "quota-admission-reservation-lost",
-                                "額度 reservation 在 provisioning 期間被收斂釋放，"
-                                f"bind 失敗，fail closed 不假稱成功："
-                                f"{bind_result.status}/{bind_result.reason}",
-                                source="manager._dispatch_workflow_card:quota-admission-bind",
-                                run_id=run.run_id, work_id=run.work_id, card=step.card,
-                                job_id=str(job["job_id"]),
-                            ),
-                            quota_admission={
-                                **(run.quota_admission or {}), step.persona: quota_admission_projection,
-                            },
-                        )
-                # 結構性異常（非預期的 owner/attempt/sequence 衝突）——job 記錄
-                # 已經建立，不能用 release()（#838 只允許 release 發生在 bind
-                # 之前）；fail-closed 直接讓派工失敗，reservation 留在 reserved
-                # 由後續 reconcile 掃描或下一次同 attempt 重送處理。
                 raise ValueError(
                     f"quota admission reservation bind rejected: "
                     f"{bind_result.status}/{bind_result.reason}"

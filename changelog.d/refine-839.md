@@ -414,3 +414,103 @@ canary gate，本票只交付 Cortex 消費端。
     三個 MAJOR 皆先以 `git show HEAD:<path>` 暫還原對應 production 檔（或
     直接呼叫舊函式名重現）重跑新測試確認 RED，復原修法後轉 GREEN；另在
     CPU 滿載（`nproc * 2` 個忙迴圈）下重跑四個既有測試檔 6 輪全數通過。
+
+- **#839 對抗審查修復（第五輪兩個 bug）**：
+  1. **MAJOR（manager.py:14098，mark_started 與 try/finally 不緊鄰）**：
+     reserve 成功後，`quota_admission.IN_FLIGHT_DISPATCHES.mark_started()`
+     立刻執行，但負責清除它的 `finally`（`mark_finished`）在原本的程式碼
+     裡要到大約 340 行之後——`create_job()` 之前的整段
+     worktree／sandbox provisioning（尤其 `creator.create()`，含 planner
+     sandbox 複製與 reviewer sandbox 建立）與其他任何例外（例如
+     `reviewer builder job unavailable`）都夾在中間、完全沒有 try 保護。
+     這段期間任何一次失敗都會讓這個 reservation_id 永遠卡在 in-flight
+     集合裡（periodic sweep 因此對它無限續租），同時這筆 reservation 本身
+     也從未被 `release()`——下一次同 attempt 重送只會一直撞到這筆『看不見
+     也放不掉』的 duplicate（held-elsewhere）。修法：把涵蓋 provisioning
+     全程的 try/finally 往前挪，緊接在 `mark_started()` 之後就進入 try
+     （連同 renew() 呼叫本身也納入保護），一路涵蓋 `_record_resolved_model_chain`、
+     admit receipt 寫入、`reserved_job_id` 配發、worktree／sandbox
+     provisioning、`create_job()`、`bind()`；`quota_job_created` 旗標的
+     初始化同步往前移到同一個位置。既有的
+     `except BaseException: if not quota_job_created and quota_reservation_handle
+     is not None: release_reservation_before_spawn(...)` 與
+     `finally: mark_finished(...)` 邏輯本身不用改——擴大 try 的涵蓋範圍後
+     它們自然接住 provisioning 階段（含 `creator.create()`）的任何失敗，
+     不需要另外補寫第二套清理路徑。以 monkeypatch worktree creator 使
+     `create()` 在第一次呼叫時拋例外重現：RED 下（`git show HEAD` 還原
+     `manager.py`）失敗後這筆 reservation 仍是 `reserved`（從未
+     release）；GREEN 下確認 release 成功（`released`，
+     `reason="fail-before-spawn"`）且 in-flight 集合已清空，接著同一組
+     `run`／`card` 立刻重送第二次，`reserve_for_candidate_with_generation_fallback`
+     自動換算下一個世代乾淨拿到新 grant 並成功派工，不撞
+     `quota-admission-attempt-held-elsewhere`。
+  2. **MAJOR（quota_admission.py:1270，`reconcile_reserved_reservations`
+     的 in-flight 排除排在 job 反查之後）**：舊實作只在『查無對應 job』的
+     分支才檢查 `in_flight`；但 `create_job()` 之後、`bind()` 之前這段
+     窗口內 job 記錄已經存在（且必然未終局，見 #838 協定），job 反查一定
+     命中，直接落到『job 找到但非終局』分支去
+     `reconcile(confirmed-alive, renew_lease_ms=...)`——即使這筆
+     reservation 明明是本 process 自己標記的 in-flight，也會被無條件續租、
+     把 sequence 往前推一格。原 dispatch 手上 `quota_reservation_handle`
+     快取的 `expected_sequence` 因此變成過期值，接下來呼叫的 `bind()`
+     必然撞上 `conflict`／`sequence-mismatch`，job 記錄已建立但沒有走
+     `reservation-already-terminal` 的既有 fail-closed 分支（那個分支只認
+     那一個 reason），直接 raise ValueError 讓整條 dispatch 中斷、job 沒被
+     標失敗，sweep 之後還會持續對它續租，容量因此永久卡住（本 process 自己
+     的 sweep 跟自己的 dispatch 打架）。修法三件套：(a) 把 `in_flight` 檢查
+     移到 job 反查**之前**、迴圈最頂端——命中就直接
+     `skipped`（`detail="in-flight-dispatch-provisioning"`），不呼叫
+     `job_lookup_by_decision`、不 `reconcile`、不 `renew`、不 `bind`、不
+     `release`，把是否續租完全交還給正在進行中的 dispatch 自己（見下面
+     manager.py 的 renew() 呼叫）。這修的是『同一個 process 自己的 sweep
+     跟自己的 dispatch 互撞』；`in_flight`（process-local 記憶體）天生看
+     不到**另一個** Manager instance 的 sweep，所以還需要 (b)：
+     `manager._dispatch_workflow_card` 的 `bind()` 呼叫改成，若第一次回
+     `conflict`／`sequence-mismatch` 且 `state` 仍是 `reserved`（代表
+     owner_token／attempt_id 都對得上、reservation 沒被終結，只是 sequence
+     被其他人合法推進過），就用回傳的最新 `sequence` 重新 `bind()` 一次
+     （只重試一次，不是搶鎖迴圈）。(c) `bind()` 最終仍失敗時（含重試後仍
+     衝突）：原本只有 `reservation-already-terminal` 那個特例會走
+     job-標失敗＋wait-receipt 的 fail-closed 路徑，其餘衝突理由直接 raise
+     裸例外、job 從未被標記——現在不分理由，`bind_result.status not in
+     ("ok", "duplicate")` 一律走同一條既有 fail-closed 路徑（標記
+     `status=failed`、不記 `provider_outcome`、留 `outcome=wait` 的
+     decision receipt、更新 `WorkflowRun.quota_admission[persona]`），再讓
+     `ValueError` 照既有『job 已建立、spawn 前失敗』路徑傳播。以直接呼叫
+     `reconcile_reserved_reservations()`（模擬本 process 自己的 sweep 插在
+     `create_job()` 與 `bind()` 之間）與直接呼叫 `authority.reconcile()`
+     （模擬**另一個** instance 的 sweep，不經過 `in_flight`）兩種方式重現：
+     RED 下（`git show HEAD` 還原 `quota_admission.py`／`manager.py`）
+     前者觸發 `job-lookup-failed`／`reconciled` 而非 `skipped`，兩者最終都
+     讓 dispatch 的 `bind()` 撞上未重試的 `sequence-mismatch` 直接
+     ValueError 中斷；GREEN 下前者確認 outcome 為 `skipped` 且 sequence
+     完全未被 sweep 寫入事件改變，後者確認 `bind()` 重試一次後乾淨成功、
+     reservation 進入 `bound`。
+  - 未動候選排序／runtime preflight／pin／independence／Trust Root／品質
+    規則；receipt／job 欄位形狀不變，只調整既有 fail-closed 分支的觸發
+    條件（原本只認一種 reason，現在對所有非 ok/duplicate 的 bind 結果一律
+    適用同一條既有路徑），未新增任何欄位。
+  - 新增／調整測試：`tests/test_quota_admission_839.py`
+    （`test_reserved_unbound_in_flight_dispatch_renews_even_after_lease_expired`
+    改寫——第四輪版本斷言 in-flight 時 sweep 會 `reconciled`／續租 lease，
+    這其實正是本輪要修的同一種『sweep 跟自己打架』風險，改斷言
+    `skipped`、job 反查從未被呼叫、sequence／lease 完全未被 sweep 改動）；
+    `tests/test_quota_admission_dispatch_wiring_839.py`
+    （`test_provisioning_failure_before_create_job_clears_in_flight_and_releases_for_clean_retry`／
+    `test_reserved_sweep_skips_this_process_in_flight_reservation_before_job_lookup`／
+    `test_concurrent_instance_sweep_renew_between_create_job_and_bind_retries_and_succeeds`）。
+    兩個 MAJOR 皆先以 `git show HEAD:<path>` 暫還原對應 production 檔重跑
+    新測試確認 RED，復原修法後轉 GREEN；另在 CPU 滿載
+    （`nproc * 2` 個忙迴圈）下重跑
+    `tests/test_quota_admission_839.py`／`test_quota_admission_dispatch_wiring_839.py`／
+    `test_quota_admission_daemon_wiring_839.py`／`test_quota_reservation_838.py`
+    共 6 輪全數通過。
+  - **第三輪『renew 事件讓 038e0901 讀不懂』判定不成立的補充說明**：對抗
+    審查第三輪曾提出一個 finding，主張新增 `renew` 事件種類會讓
+    `038e0901` 這個版本的 reader 讀不懂既有 reservation 檔案；查證後這個
+    判定不成立——`038e0901` 從未發布過，上一個真正發布的版本是
+    `d99df4d9`，而 `d99df4d9` 完全沒有 reservation store（#838 是之後才
+    落地的功能），沒有『舊版讀不懂新事件種類』這個相容性問題存在的前提；
+    `#836`／`#838`／`#839`／`#840` 全部同在 `0.1.11` 這一次發布內落地，
+    對外沒有任何中間版本曾經讀過缺少 `renew` 支援的 reservation 檔案格式。
+    這裡不再另補程式碼修法，僅記錄判定結果。

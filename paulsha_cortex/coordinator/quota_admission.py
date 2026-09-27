@@ -1264,6 +1264,16 @@ def reconcile_reserved_reservations(
     ``reserved`` 狀態下這筆 reservation **恆不可能有活著的 job 在跑**——但
     仍必須以 registry 事實判定，不能只憑 lease 過期臆測（原票 AC）：
 
+    - 這個 process 自己知道這筆 reservation 目前正在 provisioning
+      （``in_flight`` 給定且 :meth:`InFlightDispatchTracker.is_in_flight`
+      為真——對抗審查第四輪 MAJOR quota_admission.py:1119）→ 一律跳過
+      （不反查 job、不續租、不 bind、不 release）。**這個檢查排在 job 反查
+      之前**（對抗審查第五輪 MAJOR）：``create_job()`` 之後、``bind()``
+      之前這段窗口內 job 記錄已經存在但未終局，若照下面『job 找到但非
+      終局』分支續租，會把 sequence 往前推一格，讓原 dispatch 隨後的
+      ``bind()`` 因 ``expected_sequence`` 過期而 sequence-mismatch 失敗
+      ——本 process 自己就是唯一活躍的 owner，不需要靠反查 job 是否存在
+      來確認存活，也不該對它寫入任何事件。
     - ``job_lookup_by_decision(run_id, card_id, decision_id)`` 找到對應建立
       的 job（crash 發生在 ``create_job()`` 之後、``bind()`` 之前）：
       - job 已終局 → 以 ``reconcile(confirmed-terminated)`` 收斂（`bind()`／
@@ -1273,21 +1283,13 @@ def reconcile_reserved_reservations(
         一筆 inert 的 registry 記錄）→ ``reconcile(confirmed-alive)`` 續
         lease，避免它只因為 lease 過期就被下一輪誤判成可回收。
     - 查無對應 job：
-      - 這個 process 自己知道這筆 reservation 目前正在 provisioning
-        （``in_flight`` 給定且 :meth:`InFlightDispatchTracker.is_in_flight`
-        為真——對抗審查第四輪 MAJOR quota_admission.py:1119）→
-        ``reconcile(confirmed-alive)`` 續 lease，即使 lease 早已過期：
-        provisioning（worktree／sandbox 建立）耗時本來就可能超過單次
-        lease，這不是 crash 殘留的證據，是本 process 自己正在使用的活躍
-        窗口。
-      - lease（含 ``grace_ms`` 寬限）已過期，且不是本 process 的 in-flight
-        窗口 → ``reconcile(confirmed-terminated)`` 收斂釋放容量，evidence
-        標記 ``recovered-unbound``（呼叫端等同「release」語意，但走
-        ``reconcile()``——sweep 沒有原 owner 的 ``owner_token``，
-        ``release()`` 一樣需要它）。``grace_ms``（預設 0，逐字沿用舊行為）
-        是額外的安全邊界——即使 dispatch 側的續租（見 manager.py 的
-        provisioning 續租呼叫）因故沒有發生或失敗，也不會在 lease 剛過期
-        的那一刻立刻被判定成可回收。
+      - lease（含 ``grace_ms`` 寬限）已過期 → ``reconcile(confirmed-terminated)``
+        收斂釋放容量，evidence 標記 ``recovered-unbound``（呼叫端等同
+        「release」語意，但走 ``reconcile()``——sweep 沒有原 owner 的
+        ``owner_token``，``release()`` 一樣需要它）。``grace_ms``（預設
+        0，逐字沿用舊行為）是額外的安全邊界——即使 dispatch 側的續租
+        （見 manager.py 的 provisioning 續租呼叫）因故沒有發生或失敗，
+        也不會在 lease 剛過期的那一刻立刻被判定成可回收。
       - lease（含寬限）未過期 → 不動（可能是 ``create_job()`` 還在進行
         中，尚未寫入 registry）。
     - ``job_lookup_by_decision`` 查詢本身失敗（拋例外）→ 一律不動，不得
@@ -1304,6 +1306,25 @@ def reconcile_reserved_reservations(
     outcomes: list[ReconcileOutcome] = []
     for status in authority.list_by_state("reserved", now_ms=now_ms):
         reservation_id = status.reservation_id
+        if in_flight is not None and in_flight.is_in_flight(reservation_id):
+            # #839 對抗審查修復第五輪 MAJOR（quota_admission.py 週期性
+            # sweep）：這個檢查必須排在 job 反查之前——舊實作只在『查無對應
+            # job』的分支才問 in_flight，但『job 已經被本 process 的
+            # create_job() 建出來、bind() 還沒呼叫』這個時間點，job 反查會
+            # 命中一筆非終局的 job，落到下面『job 找到但非終局』分支去
+            # renew()，把 sequence 往前推一格；原 dispatch 隨後呼叫的
+            # bind() 就會因為 expected_sequence 過期而 sequence-mismatch
+            # 失敗。本 process 自己就是這筆 reservation 目前唯一活躍的
+            # owner，不需要（也不該）靠反查 job 存不存在／終不終局來確認
+            # 存活；一律跳過——不續租（不呼叫 reconcile／renew）、不
+            # bind、不 release，讓正在進行中的 dispatch 自己（見 manager.py
+            # 的 provisioning 續租呼叫）決定要不要續租，sweep 這一輪什麼都
+            # 不做，下一輪再看。
+            outcomes.append(
+                ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
+                                  action="skipped", detail="in-flight-dispatch-provisioning")
+            )
+            continue
         try:
             job = job_lookup_by_decision(status.run_id, status.card_id, status.decision_id)
         except Exception:  # noqa: BLE001 - 查詢失敗一律不動，不得誤判成『查無』而釋放
@@ -1313,22 +1334,6 @@ def reconcile_reserved_reservations(
             )
             continue
         if job is None:
-            if in_flight is not None and in_flight.is_in_flight(reservation_id):
-                # 本 process 自己知道這筆 reservation 目前正在 provisioning
-                # 窗口內——不是 crash 殘留，即使 lease 早已過期也不能釋放。
-                result = authority.reconcile(
-                    reservation_id=reservation_id,
-                    evidence={"kind": "in-flight-dispatch-provisioning"},
-                    resolution="confirmed-alive",
-                    expected_sequence=status.sequence,
-                    now_ms=now_ms,
-                    renew_lease_ms=renew_lease_ms,
-                )
-                outcomes.append(
-                    ReconcileOutcome(decision_id=status.decision_id, reservation_id=reservation_id,
-                                      action="reconciled", detail=f"in-flight:{result.status}")
-                )
-                continue
             if status.lease_expires_at_ms + grace_ms > now_ms:
                 # lease（含寬限）未過期——可能是 create_job() 仍在進行中，不動。
                 outcomes.append(
