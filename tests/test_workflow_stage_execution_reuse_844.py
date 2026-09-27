@@ -1123,6 +1123,13 @@ class TestRetryReviewOverwritesStaleReceipt:
         assert receipt["stage_execution_key"] != stale_key
 
 
+# rollback 相容測試的「舊版」基準：固定為目前部署中的 runtime pin（wave-1 合入
+# main 的 merge commit），也就是 0.1.11 回退時實際會跑的版本。不可用分支名：
+# 分支會前進（整合後已包含本票自身），CI 也沒有這個本地分支。CI 的 tests job
+# 以 `fetch-depth: 0` checkout，完整 SHA 必定可解析。
+_ROLLBACK_BASE_REF = "d99df4d9574f8333e43d6e1799470ea5340abadd"
+
+
 class TestStageReuseReceiptsRollbackCompat:
     """對抗審查 MAJOR-3（記錄但不修）：新頂層欄位 `stage_reuse_receipts`
     是否會讓舊版 Monitor 的 canonical 讀取路徑炸掉？答案是不會——舊版
@@ -1131,8 +1138,8 @@ class TestStageReuseReceiptsRollbackCompat:
     reject-unknown-keys 的 strict schema），與既有 `model_qualification`
     等既有欄位新增時完全同一種相容模式。
 
-    這裡直接載入 `feature/refine-wave-2`（#844 之前、`stage_reuse_receipts`
-    尚未存在的基底）那份 workflow.py 原始碼本身，而不是憑印象重寫一份可
+    這裡直接載入 `_ROLLBACK_BASE_REF`（目前部署中的 runtime pin，`stage_reuse_receipts`
+    尚未存在）那份 workflow.py 原始碼本身，而不是憑印象重寫一份可
     能失真的舊版驗證邏輯，證明：本分支寫出的 registry payload 給那份舊
     `WorkflowRun.from_dict()` 讀仍不會炸，且它自己的 `to_dict()` 輸出裡
     沒有新欄位。
@@ -1167,7 +1174,7 @@ class TestStageReuseReceiptsRollbackCompat:
     def _load_refine_wave_2_workflow_module() -> types.ModuleType:
         repo_root = Path(__file__).resolve().parents[1]
         result = subprocess.run(
-            ["git", "show", "feature/refine-wave-2:paulsha_cortex/coordinator/workflow.py"],
+            ["git", "show", f"{_ROLLBACK_BASE_REF}:paulsha_cortex/coordinator/workflow.py"],
             cwd=repo_root,
             check=True,
             capture_output=True,
@@ -1181,7 +1188,7 @@ class TestStageReuseReceiptsRollbackCompat:
         # 己重建一整套 import 環境。
         module.__dict__["__package__"] = "paulsha_cortex.coordinator"
         module.__dict__["__name__"] = module_name
-        module.__dict__["__file__"] = "feature/refine-wave-2:paulsha_cortex/coordinator/workflow.py"
+        module.__dict__["__file__"] = f"{_ROLLBACK_BASE_REF}:paulsha_cortex/coordinator/workflow.py"
         # `from __future__ import annotations` 讓這份舊原始碼的 dataclass 欄位
         # annotation 都是字串；`dataclasses` 在處理 class body 時會用
         # `sys.modules[cls.__module__]` 反查型別（例如判斷是不是 ClassVar／
@@ -1197,13 +1204,13 @@ class TestStageReuseReceiptsRollbackCompat:
 
     @staticmethod
     def _refine_wave_2_source_text(relative_path: str) -> str:
-        """取回 `feature/refine-wave-2` 某檔案的原始碼純文字，只供 `ast`
+        """取回 `_ROLLBACK_BASE_REF` 某檔案的原始碼純文字，只供 `ast`
         靜態解析——刻意不 exec／不 import（見類別 docstring 的修法說明）。
         """
 
         repo_root = Path(__file__).resolve().parents[1]
         result = subprocess.run(
-            ["git", "show", f"feature/refine-wave-2:{relative_path}"],
+            ["git", "show", f"{_ROLLBACK_BASE_REF}:{relative_path}"],
             cwd=repo_root,
             check=True,
             capture_output=True,
