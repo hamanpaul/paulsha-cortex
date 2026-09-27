@@ -1,0 +1,1 @@
+- #841／#857 交互修正：runtime attestation 的 EnvironmentFile parser 原本拒絕「引號值內含另一種引號」，而 #857 文件允許 `PSC_TASK_MEMORY_HIPPO_CMD` 以 JSON argv（`'["/abs", "..."]'`）寫進 per-instance env 檔；live 上照文件設定後 manager／monitor 的 `environment_source` 變 unknown、loaded runtime 比對失效。改為依 systemd 語意允許引號值內出現另一種引號，同種引號未閉合、引號外夾帶引號、反斜線與多段串接仍 fail closed（doctor 的 fallback parser 本已接受）。

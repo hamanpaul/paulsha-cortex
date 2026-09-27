@@ -477,7 +477,13 @@ def _parse_environment_file(content: bytes) -> dict[str, str] | None:
         value = match.group(2)
         if value.startswith(("'", '"')):
             quote = value[0]
-            quoted = re.fullmatch(re.escape(quote) + r"([^'\"]*)" + re.escape(quote) + r"\s*", value)
+            # systemd 的引號值內，另一種引號是字面值（例如 #857 文件允許的
+            # JSON argv：`'["/abs", "..."]'`）；只禁止同種引號本身出現在值內。
+            # 反斜線已在上方整行拒絕，因此不必處理跳脫；多段串接仍不支援。
+            quoted = re.fullmatch(
+                re.escape(quote) + r"([^" + re.escape(quote) + r"]*)" + re.escape(quote) + r"\s*",
+                value,
+            )
             if quoted is None:
                 return None
             value = quoted.group(1)

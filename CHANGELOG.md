@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#841／#857 env 檔引號**：attestation 的 EnvironmentFile parser 接受引號值內的另一種引號（JSON argv），不再讓照文件設定的 task memory 命令使 loaded runtime 比對失效。
 - **#841 宣告端 invocation 摘要**：`service_declaration_projection` 先算出 manager invocation revision，`cortex service status` 正式路徑的 manager config 可達 match。
 - **work-items 衝突解除**：排除整合 PR #1087／#1090 關閉票造成的 13 筆 confirmed source collision，恢復 paulsha-cortex repo 的 intake 與 hard gate。
 - **#841 systemctl show 區塊解析**：依真實輸出順序（`Id=` 在區塊中間）解析、`EnvironmentFiles` 多值串接，修正真實 service 的 loaded runtime attestation 永遠為 unknown。後續修法：manager 的 `invocation_revision` 改以 daemon 實際收到的原始 argv token 計算（而非 `parse_args` 後、混入環境變數推導預設值的 namespace），`cortex service status` 端新增 `manager_declared_invocation_revision`，在 `environment_source=systemd-effective` 時從 systemd 有效 `ExecStart` 反推同一份 argv（支援直接呼叫 `python -m manager_daemon` 與 installer 實際產生的 `service-manager.sh` wrapper 兩種形狀），修正任何部署的 manager 都必然卡在 `invocation-declaration-unknown` 的缺口；`compare_runtime_state` 新增對應的 `invocation-drift` 判定。
