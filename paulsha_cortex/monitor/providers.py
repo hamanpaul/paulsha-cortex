@@ -88,8 +88,13 @@ def _workflow_next_actions_projection(
     repo: str,
     job_rows: Sequence[Mapping[str, object]],
     slice_rows: Sequence[Mapping[str, object]],
+    state_path: Path | None = None,
 ) -> dict[str, dict[str, object]]:
-    """以同一 recovery 判準產生 Monitor work-list 的 needs_human 動作。"""
+    """以同一 recovery 判準產生 Monitor work-list 的 needs_human 動作。
+
+    ``state_path``（registry 檔）供 recovery 判準定位同一 coordinator root 的
+    delivery journal（#1141：已交付 run 的 `retire-delivered`）；缺席時該判準不宣告。
+    """
     from ..coordinator.claim import needs_human_next_actions
     from ..coordinator.work_actions import (
         _phase_recovery_actions,
@@ -135,6 +140,7 @@ def _workflow_next_actions_projection(
         list_workflow_runs=lambda: all_runs,
         list_slices_by_owner=list_slices_by_owner,
         get_job=get_job,
+        _state_path=state_path,
     )
     projected: dict[str, dict[str, object]] = {}
     for run in runs:
@@ -638,6 +644,7 @@ class WorkflowRegistryProvider:
                 repo=self.repo,
                 job_rows=[row for row in job_rows if isinstance(row, Mapping)],
                 slice_rows=[row for row in slice_rows if isinstance(row, Mapping)],
+                state_path=self.state_path,
             )
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
             return ProviderSnapshot(
