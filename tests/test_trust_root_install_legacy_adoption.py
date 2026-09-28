@@ -176,8 +176,9 @@ class MemoryInstallBackend:
         self.identities[f"tree:{step['path']}"] = identity
         return dict(identity)
 
-    def discard_created_tree(self, path: str, identity) -> None:
+    def discard_created_tree(self, path: str, identity, *, quarantine_root: str, key: str) -> None:
         self.log.append(["discard", path])
+        assert quarantine_root == self.plan["legacy_adoption"]["quarantine_root"]
         venv = next((s for s in self.plan["apply_order"] if s["kind"] == "venv"), None)
         if venv is not None and path == venv["path"]:
             expected = {"device": 1, "inode": self.VENV_INODE, "tree_sha256": TREE_SHA256}
@@ -2124,17 +2125,18 @@ class FilesystemLegacyBackend(MemoryInstallBackend):
         super().rollback_step(entry)
         step = entry["step"]
         if self._created_directory(step) and not entry["prior"].get("exists"):
-            path = Path(step["path"])
-            # Like the real backend: only an empty directory is removed.
-            if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
-                path.rmdir()
+            # The real backend's rollback of a directory this receipt created.
+            self.log.append(["real-rollback", entry["step_id"]])
+            install_backend.LocalInstallBackend(require_root=False).rollback_step(entry)
 
     def created_tree_identity(self, step) -> dict[str, object]:
         return install_backend._created_tree_identity(Path(step["path"]))
 
-    def discard_created_tree(self, path: str, identity) -> None:
+    def discard_created_tree(self, path: str, identity, *, quarantine_root: str, key: str) -> None:
         self.log.append(["discard", path])
-        install_backend._discard_created_tree(Path(path), identity)
+        install_backend._discard_created_tree(
+            Path(path), identity, quarantine_root=Path(quarantine_root), key=key
+        )
 
     def rollback_credentials(self, receipt):
         return install_backend.LocalInstallBackend(require_root=False).rollback_credentials(
@@ -2348,39 +2350,235 @@ def test_plain_receipt_credential_import_records_no_created_directories(
     assert (home / ".copilot" / "config.json").is_file()
 
 
-def test_created_tree_discard_removes_only_the_recorded_tree(tmp_path: Path) -> None:
+def _checkout(tmp_path: Path) -> Path:
     tree = tmp_path / "repos" / "checkout"
-    (tree / ".git").mkdir(parents=True)
+    (tree / ".git" / "objects").mkdir(parents=True)
+    (tree / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     (tree / "README.md").write_text("created\n")
+    (tree / "docs").mkdir()
+    (tree / "docs" / "link").symlink_to("../README.md")
+    return tree
+
+
+def _discard(tmp_path: Path, tree: Path, identity) -> None:
+    install_backend._discard_created_tree(
+        tree, identity, quarantine_root=tmp_path / "quarantine", key=f"tree:{tree}"
+    )
+
+
+def _staged(tmp_path: Path) -> list[str]:
+    """Everything left under the private discard staging, relative to it."""
+
+    root = tmp_path / "quarantine" / ".discard"
+    if not root.exists():
+        return []
+    return sorted(
+        str(Path(directory, name).relative_to(root))
+        for directory, directories, files in os.walk(root)
+        for name in (*directories, *files)
+    )
+
+
+def test_tree_digest_on_descriptors_equals_the_path_digest(tmp_path: Path) -> None:
+    tree = _checkout(tmp_path)
+    (tree / ".hidden").write_text("dot\n")
+    parent = os.open(tree.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        digest, manifest = install_backend._tree_digest_at(parent, tree.name)
+    finally:
+        os.close(parent)
+
+    assert digest == install_backend._tree_sha256(tree)
+    assert manifest[""][:2] == (tree.lstat().st_dev, tree.lstat().st_ino)
+    assert manifest["docs/link"][2] == "symlink"
+
+
+def test_created_tree_discard_removes_the_verified_tree_in_private_staging(
+    tmp_path: Path,
+) -> None:
+    tree = _checkout(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("not part of the tree\n")
+    (tree / "docs" / "escape").symlink_to(outside)
+    identity = install_backend._created_tree_identity(tree)
+
+    _discard(tmp_path, tree, identity)
+
+    assert not os.path.lexists(tree)
+    assert os.listdir(tree.parent) == []
+    # The removal never followed a symlink out of the staging directory.
+    assert (outside / "keep.txt").read_text() == "not part of the tree\n"
+    assert all(Path(item).name != "tree" for item in _staged(tmp_path))
+
+
+def test_created_tree_discard_moves_a_changed_tree_back(tmp_path: Path) -> None:
+    tree = _checkout(tmp_path)
     identity = install_backend._created_tree_identity(tree)
     (tree / "extra.txt").write_text("added later\n")
 
     with pytest.raises(InstallDriftError, match="changed"):
-        install_backend._discard_created_tree(tree, identity)
+        _discard(tmp_path, tree, identity)
 
     assert (tree / "extra.txt").is_file()
     assert tree.lstat().st_ino == identity["inode"]
-    assert os.listdir(tree.parent) == ["checkout"]
-
-    (tree / "extra.txt").unlink()
-    install_backend._discard_created_tree(tree, identity)
-    assert not os.path.lexists(tree)
-    assert os.listdir(tree.parent) == []
+    assert all(Path(item).name != "tree" for item in _staged(tmp_path))
 
 
 def test_created_tree_discard_refuses_a_replaced_tree(tmp_path: Path) -> None:
-    tree = tmp_path / "repos" / "checkout"
-    tree.mkdir(parents=True)
-    (tree / "README.md").write_text("created\n")
+    tree = _checkout(tmp_path)
     identity = install_backend._created_tree_identity(tree)
     tree.rename(tmp_path / "repos" / "aside")
     tree.mkdir()
     (tree / "README.md").write_text("created\n")
 
     with pytest.raises(InstallDriftError, match="not the tree"):
-        install_backend._discard_created_tree(tree, identity)
+        _discard(tmp_path, tree, identity)
 
     assert (tree / "README.md").is_file()
+    assert _staged(tmp_path) == []
+
+
+def test_created_tree_discard_never_deletes_a_file_added_after_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _checkout(tmp_path)
+    identity = install_backend._created_tree_identity(tree)
+    original = install_backend._tree_digest_at
+
+    def verified_then_written(parent_fd: int, name: str):
+        result = original(parent_fd, name)
+        # A writer that still holds a descriptor into the tree adds a file
+        # after the digest matched, before the removal walks the tree.
+        staged = next(
+            Path(directory)
+            for directory, _dirs, _files in os.walk(tmp_path / "quarantine")
+            if Path(directory).name == "tree"
+        )
+        (staged / "docs" / "late.txt").write_text("written after the check\n")
+        return result
+
+    monkeypatch.setattr(install_backend, "_tree_digest_at", verified_then_written)
+
+    with pytest.raises(InstallDriftError, match="late.txt"):
+        _discard(tmp_path, tree, identity)
+
+    # Only objects of the verified manifest were removed; the late file stays.
+    late = [item for item in _staged(tmp_path) if item.endswith("docs/late.txt")]
+    assert len(late) == 1
+    assert not os.path.lexists(tree)
+
+    # The pending discard is explicit: a later attempt names it, removes nothing.
+    tree.mkdir()
+    with pytest.raises(InstallDriftError, match="pending"):
+        _discard(tmp_path, tree, {**identity, "inode": tree.lstat().st_ino})
+    assert len([item for item in _staged(tmp_path) if item.endswith("docs/late.txt")]) == 1
+
+
+def test_created_tree_discard_refuses_another_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _checkout(tmp_path)
+    identity = install_backend._created_tree_identity(tree)
+    monkeypatch.setattr(
+        install_backend, "_filesystem_device", lambda _fd: identity["device"] + 1
+    )
+
+    with pytest.raises(InstallDriftError, match="filesystem"):
+        _discard(tmp_path, tree, identity)
+
+    assert tree.lstat().st_ino == identity["inode"]
+    assert (tree / "README.md").read_text() == "created\n"
+
+
+def test_created_tree_discard_reports_a_tree_it_could_not_move_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = _checkout(tmp_path)
+    identity = install_backend._created_tree_identity(tree)
+    (tree / "extra.txt").write_text("added later\n")
+    original = install_backend._renameat2_noreplace
+    calls: list[str] = []
+
+    def reoccupied_before_the_move_back(source_fd, source, destination_fd, destination):
+        calls.append(source)
+        if len(calls) == 2:
+            tree.mkdir()  # the original path is taken again
+        original(source_fd, source, destination_fd, destination)
+
+    monkeypatch.setattr(install_backend, "_renameat2_noreplace", reoccupied_before_the_move_back)
+
+    with pytest.raises(InstallDriftError, match="could not be moved back") as caught:
+        _discard(tmp_path, tree, identity)
+
+    assert ".discard" in str(caught.value)
+    assert any(item.endswith("tree/extra.txt") for item in _staged(tmp_path))
+    assert os.listdir(tree) == []
+
+
+def test_credential_directory_is_removed_only_after_staging_proves_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    directory = home / ".copilot"
+    directory.mkdir(parents=True)
+    observed = directory.lstat()
+    rows = [{"path": str(directory), "dev": observed.st_dev, "ino": observed.st_ino}]
+    destination = directory / "config.json"
+    remove = install_backend._remove_created_credential_directories
+    root = tmp_path / "quarantine"
+
+    # A file appeared: the directory goes to staging, is found non-empty,
+    # and comes straight back.
+    (directory / "session.json").write_text("{}\n")
+    problem = remove(rows, destination, quarantine_root=root, key="reviewer-planner/copilot")
+    assert problem is not None and "not empty" in problem
+    assert (directory / "session.json").is_file()
+    (directory / "session.json").unlink()
+
+    # Replaced between the check and the rename: the substitute is moved back.
+    original = install_backend._renameat2_noreplace
+    swapped: list[int] = []
+
+    def swap_first(source_fd, source, destination_fd, destination):
+        if not swapped:
+            directory.rename(home / ".copilot.original")
+            directory.mkdir()
+            swapped.append(directory.lstat().st_ino)
+        original(source_fd, source, destination_fd, destination)
+
+    monkeypatch.setattr(install_backend, "_renameat2_noreplace", swap_first)
+    problem = remove(rows, destination, quarantine_root=root, key="reviewer-planner/copilot")
+    assert problem is not None and "replaced" in problem
+    assert directory.lstat().st_ino == swapped[0]
+    assert (home / ".copilot.original").lstat().st_ino == observed.st_ino
+    monkeypatch.setattr(install_backend, "_renameat2_noreplace", original)
+
+    # The proven, empty directory is removed inside staging.
+    directory.rmdir()
+    (home / ".copilot.original").rename(directory)
+    assert remove(rows, destination, quarantine_root=root, key="reviewer-planner/copilot") is None
+    assert not os.path.lexists(directory)
+    assert all(not item.endswith("/dir") for item in _staged(tmp_path))
+
+
+def test_legacy_rollback_removes_the_venvs_directory_it_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = AdoptedHost(tmp_path, monkeypatch)
+    case = host.case
+    scaffold = f"scaffold:{host.venvs}"
+    entry = _entry(host.receipt.to_dict(), scaffold)
+    assert entry["prior"] == {"exists": False}
+    assert host.venvs.is_dir()
+
+    report = host.rollback()
+
+    assert ["real-rollback", scaffold] in case.backend.log
+    assert not os.path.lexists(host.venvs)
+    assert report.legacy_restored is True
+    assert case.recaptured_sha256() == case.block["inventory_sha256"]
+    assert install_cli._receipt_restore_safe(host.receipt.to_dict()) is True
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -2416,5 +2614,5 @@ def test_repository_tree_identity_is_stable_across_git_inspection(tmp_path: Path
         )
 
     assert install_backend._created_tree_identity(clone) == identity
-    install_backend._discard_created_tree(clone, identity)
+    _discard(tmp_path, clone, identity)
     assert not os.path.lexists(clone)

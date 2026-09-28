@@ -5746,17 +5746,36 @@ def _record_legacy_creation(
 
 
 def _discard_legacy_creation(
-    backend: InstallBackend, *, path: object, identity: object
+    backend: InstallBackend,
+    *,
+    path: object,
+    identity: object,
+    legacy_record: Mapping[str, object],
+    key: str,
 ) -> str | None:
-    """Remove a tree a legacy receipt created; return why it is kept, if it is."""
+    """Remove a tree a legacy receipt created; return why it is kept, if it is.
+
+    The backend stages it in a private directory below the receipt's
+    quarantine root before proving and removing it.
+    """
 
     discard = getattr(backend, "discard_created_tree", None)
+    quarantine_root = legacy_record.get("quarantine_root")
     if not callable(discard):
         return "backend cannot discard a tree this receipt created; it is kept"
-    if not isinstance(path, str) or not _valid_legacy_creation(identity):
+    if (
+        not isinstance(path, str)
+        or not isinstance(quarantine_root, str)
+        or not _valid_legacy_creation(identity)
+    ):
         return "no creation identity binds the tree this receipt created; it is kept"
     try:
-        discard(path, dict(identity))  # type: ignore[arg-type]
+        discard(
+            path,
+            dict(identity),  # type: ignore[arg-type]
+            quarantine_root=quarantine_root,
+            key=f"tree:{key}",
+        )
     except Exception as exc:
         return str(exc)
     return None
@@ -5768,6 +5787,7 @@ def _discard_legacy_venv_slot(
     entry: Mapping[str, object],
     step: Mapping[str, object],
     installed: Mapping[str, object],
+    legacy_record: Mapping[str, object],
 ) -> str | None:
     """Remove the venv slot a legacy receipt created (it did not exist before)."""
 
@@ -5795,6 +5815,8 @@ def _discard_legacy_venv_slot(
             "inode": authority.get("inode"),
             "tree_sha256": authority.get("tree_sha256"),
         },
+        legacy_record=legacy_record,
+        key=str(step.get("step_id")),
     )
 
 
@@ -6645,6 +6667,9 @@ def rollback_receipt(
     if not isinstance(journal, list):
         raise InstallError("receipt journal is invalid")
     legacy_record = receipt._document.get("legacy_adoption")
+    legacy_mapping: Mapping[str, object] = (
+        legacy_record if isinstance(legacy_record, Mapping) else {}
+    )
     retained_drift: list[dict[str, object]] = []
     service_stop_failures: list[str] = []
     activation_journal = _activation_entries(receipt)
@@ -6837,7 +6862,11 @@ def rollback_receipt(
                     # A legacy host had no slot here: the reviewed inventory
                     # covers it, so the slot this receipt created must go.
                     problem = _discard_legacy_venv_slot(
-                        backend, entry=entry, step=step, installed=installed
+                        backend,
+                        entry=entry,
+                        step=step,
+                        installed=installed,
+                        legacy_record=legacy_mapping,
                     )
                     if problem is not None:
                         retained_drift.append(
@@ -6874,7 +6903,11 @@ def rollback_receipt(
                 continue
             if legacy_record is not None:
                 problem = _discard_legacy_venv_slot(
-                    backend, entry=entry, step=step, installed=installed
+                    backend,
+                    entry=entry,
+                    step=step,
+                    installed=installed,
+                    legacy_record=legacy_mapping,
                 )
                 if problem is not None:
                     retained_drift.append(
@@ -6975,7 +7008,11 @@ def rollback_receipt(
             # Fresh checkouts are normally retained; under a legacy adoption
             # this clone stands where the legacy checkout must move back.
             problem = _discard_legacy_creation(
-                backend, path=step.get("path"), identity=entry.get("legacy_creation")
+                backend,
+                path=step.get("path"),
+                identity=entry.get("legacy_creation"),
+                legacy_record=legacy_mapping,
+                key=str(entry.get("step_id")),
             )
             if problem is not None:
                 retained_drift.append(

@@ -1693,11 +1693,15 @@ def _acl_argument(row: Mapping[str, object]) -> str:
     short = {"user": "u", "group": "g", "mask": "m", "other": "o"}[
         str(entry_type)
     ]
+    # ``_read_acl`` records ``---`` as an empty string (receipts hold that
+    # form); ``setfacl -m m::`` is rejected as incomplete, so an empty
+    # permission set is written as ``-``.
+    rendered = perms.replace("X", "x") or "-"
     if entry_type in {"mask", "other"}:
         if account:
             raise InstallPlanError("mask/other ACL entries must not name an account")
-        return f"{prefix}{short}::{perms.replace('X', 'x')}"
-    return f"{prefix}{short}:{account}:{perms.replace('X', 'x')}"
+        return f"{prefix}{short}::{rendered}"
+    return f"{prefix}{short}:{account}:{rendered}"
 
 
 def _apply_fd_asset_state(
@@ -1724,10 +1728,15 @@ def _apply_fd_asset_state(
         _run(("setfacl", "-k", target), check=True, pass_fds=inherited_fds)
     os.fchown(descriptor, _resolve_uid(owner), _resolve_gid(group))
     os.fchmod(descriptor, _mode(mode))
-    for row in acls:
-        assert isinstance(row, Mapping)
+    # One ``-m`` for the whole set: setfacl recalculates the mask after each
+    # modification unless the same command names a mask entry, so applying a
+    # recorded ``mask::---`` before a named entry would silently widen it.
+    arguments = [_acl_argument(row) for row in acls]  # type: ignore[arg-type]
+    if any("," in argument for argument in arguments):
+        raise InstallPlanError("ACL entries must not contain a comma")
+    if arguments:
         _run(
-            ("setfacl", "-m", _acl_argument(row), target),
+            ("setfacl", "-m", ",".join(arguments), target),
             check=True,
             pass_fds=inherited_fds,
         )
@@ -2441,6 +2450,82 @@ def _legacy_quarantine_restore(entry: Mapping[str, object]) -> None:
         os.close(destination_fd)
 
 
+def _sha256_at(parent_fd: int, name: str, observed: os.stat_result) -> str:
+    descriptor = os.open(name, _QUARANTINE_READ_FLAGS, dir_fd=parent_fd)
+    try:
+        held = os.fstat(descriptor)
+        if not stat.S_ISREG(held.st_mode) or (held.st_dev, held.st_ino) != (
+            observed.st_dev,
+            observed.st_ino,
+        ):
+            raise InstallDriftError(f"tree member changed while it was hashed: {name}")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+#: A tree member recorded for removal: (dev, ino, type).
+_TreeManifest = dict[str, tuple[int, int, str]]
+
+
+def _tree_digest_at(parent_fd: int, name: str) -> tuple[str, _TreeManifest]:
+    """``_tree_sha256`` of ``name`` under ``parent_fd``, walked by descriptors.
+
+    Every directory is opened ``O_NOFOLLOW`` relative to its verified parent,
+    so the walk never leaves the tree through a symlink.  Besides the digest
+    it returns the manifest of every member (relative path -> dev, ino,
+    type): a later removal deletes nothing that is not in it.
+    """
+
+    root_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+    manifest: _TreeManifest = {}
+    records: list[tuple[str, bytes]] = []
+    try:
+        top = os.fstat(root_fd)
+        manifest[""] = (top.st_dev, top.st_ino, "directory")
+
+        def walk(directory_fd: int, prefix: str) -> None:
+            for entry in sorted(os.listdir(directory_fd)):
+                relative = f"{prefix}/{entry}" if prefix else entry
+                observed = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+                kind = _file_type_name(observed.st_mode)
+                manifest[relative] = (observed.st_dev, observed.st_ino, kind)
+                if relative == ".cortex-tree.sha256":
+                    continue  # the marker that records this very digest
+                record = relative.encode("utf-8") + b"\0"
+                record += format(stat.S_IMODE(observed.st_mode), "04o").encode("ascii") + b"\0"
+                if kind == "symlink":
+                    target = os.readlink(entry, dir_fd=directory_fd)
+                    record += b"L\0" + target.encode("utf-8") + b"\0"
+                elif kind == "file":
+                    record += b"F\0" + _sha256_at(directory_fd, entry, observed).encode("ascii") + b"\0"
+                elif kind == "directory":
+                    record += b"D\0"
+                else:
+                    raise InstallDriftError(f"tree contains an unsupported object: {relative}")
+                records.append((relative, record))
+                if kind == "directory":
+                    child_fd = os.open(entry, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+                    try:
+                        held = os.fstat(child_fd)
+                        if (held.st_dev, held.st_ino) != (observed.st_dev, observed.st_ino):
+                            raise InstallDriftError(f"tree changed while it was hashed: {relative}")
+                        walk(child_fd, relative)
+                    finally:
+                        os.close(child_fd)
+
+        walk(root_fd, "")
+    finally:
+        os.close(root_fd)
+    digest = hashlib.sha256()
+    for _relative, record in sorted(records, key=lambda row: row[0]):
+        digest.update(record)
+    return digest.hexdigest(), manifest
+
+
 def _created_tree_identity(path: Path) -> dict[str, object]:
     """Inode and full tree digest of a directory tree a receipt just created.
 
@@ -2454,25 +2539,132 @@ def _created_tree_identity(path: Path) -> dict[str, object]:
         observed = _stat_at(parent_fd, path.name)
         if observed is None or not stat.S_ISDIR(observed.st_mode):
             raise InstallDriftError(f"created tree is not a directory: {path}")
-        tree_sha256 = _tree_sha256(path)
-        current = _stat_at(parent_fd, path.name)
-        if current is None or (current.st_dev, current.st_ino) != (
-            observed.st_dev,
-            observed.st_ino,
-        ):
+        tree_sha256, manifest = _tree_digest_at(parent_fd, path.name)
+        if manifest[""][:2] != (observed.st_dev, observed.st_ino):
             raise InstallDriftError(f"created tree changed while it was recorded: {path}")
         return {"device": observed.st_dev, "inode": observed.st_ino, "tree_sha256": tree_sha256}
     finally:
         os.close(parent_fd)
 
 
-def _discard_created_tree(path: Path, identity: Mapping[str, object]) -> None:
+def _discard_staging_path(quarantine_root: Path, key: str) -> Path:
+    """The installer-owned private staging for one discard: ``<root>/.discard/<hash>``."""
+
+    return Path(quarantine_root) / ".discard" / hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+def _remove_verified_tree(parent_fd: int, name: str, manifest: _TreeManifest) -> None:
+    """Delete ``name`` under ``parent_fd`` member by member, only as the manifest proves.
+
+    The walk runs on ``O_NOFOLLOW`` directory descriptors and never follows a
+    symlink (a symlink member is unlinked, not entered).  The first member that
+    is not the verified one stops the removal: what remains stays where it is.
+    """
+
+    def expect(relative: str, observed: os.stat_result) -> None:
+        if manifest.get(relative) != (
+            observed.st_dev,
+            observed.st_ino,
+            _file_type_name(observed.st_mode),
+        ):
+            raise InstallDriftError(
+                f"{relative or name} was not part of the verified tree; nothing more "
+                "is removed and the rest stays in the private discard staging"
+            )
+
+    def clear(directory_fd: int, prefix: str) -> None:
+        for entry in sorted(os.listdir(directory_fd)):
+            relative = f"{prefix}/{entry}" if prefix else entry
+            observed = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+            expect(relative, observed)
+            if stat.S_ISDIR(observed.st_mode):
+                child_fd = os.open(entry, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+                try:
+                    expect(relative, os.fstat(child_fd))
+                    clear(child_fd, relative)
+                finally:
+                    os.close(child_fd)
+                os.rmdir(entry, dir_fd=directory_fd)
+            else:
+                os.unlink(entry, dir_fd=directory_fd)
+
+    expect("", os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+    root_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+    try:
+        expect("", os.fstat(root_fd))
+        clear(root_fd, "")
+    finally:
+        os.close(root_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _stage_for_discard(
+    *,
+    parent_fd: int,
+    path: Path,
+    staging: Path,
+    staging_fd: int,
+    leaf: str,
+    device: int,
+) -> None:
+    """Move ``path`` into the private staging (same filesystem, never replacing)."""
+
+    if _stat_at(staging_fd, leaf) is not None:
+        raise InstallDriftError(
+            f"a previous discard of {path} is pending in {staging / leaf}; it is kept "
+            "for the operator"
+        )
+    if _filesystem_device(staging_fd) != device:
+        raise InstallDriftError(
+            f"{path} is on another filesystem than the private discard staging "
+            f"{staging}; it is kept (nothing is copied or deleted in place)"
+        )
+    try:
+        _renameat2_noreplace(parent_fd, path.name, staging_fd, leaf)
+    except OSError as exc:
+        raise _rename_failure(exc, path, staging / leaf) from exc
+    _fsync_directory_at(parent_fd)
+    os.fsync(staging_fd)
+
+
+def _restore_from_discard(
+    *,
+    parent_fd: int,
+    path: Path,
+    staging: Path,
+    staging_fd: int,
+    leaf: str,
+    problem: str,
+) -> InstallDriftError:
+    """Move an unproven object back to its path; say where it is either way."""
+
+    try:
+        _renameat2_noreplace(staging_fd, leaf, parent_fd, path.name)
+    except OSError as exc:
+        return InstallDriftError(
+            f"{problem}; it could not be moved back ({exc.strerror or exc}) and is left "
+            f"in the private discard staging {staging / leaf}"
+        )
+    _fsync_directory_at(parent_fd)
+    os.fsync(staging_fd)
+    return InstallDriftError(f"{problem}; it was moved back and is kept")
+
+
+def _discard_created_tree(
+    path: Path,
+    identity: Mapping[str, object],
+    *,
+    quarantine_root: Path,
+    key: str,
+) -> None:
     """Remove a tree this receipt created, only while it is exactly that tree.
 
-    The tree is first renamed aside (``RENAME_NOREPLACE``, same directory) so
-    the original path frees atomically and the digest is taken of the very
-    inode that will be removed.  A different inode, a changed tree or an
-    unsupported object keeps it: it is renamed back and the call fails.
+    The tree is first renamed (``RENAME_NOREPLACE``) into an installer-owned,
+    root-only 0700 staging directory below the quarantine root, on the same
+    filesystem, so no other account can reach it by path any more.  Only
+    there are its inode and full tree digest verified; an unproven tree is
+    renamed straight back.  The removal then walks descriptors without
+    following symlinks and deletes only members of the verified manifest.
     """
 
     if (
@@ -2481,8 +2673,19 @@ def _discard_created_tree(path: Path, identity: Mapping[str, object]) -> None:
         or not isinstance(identity.get("tree_sha256"), str)
     ):
         raise InstallDriftError(f"no creation identity binds the tree at {path}")
+    staging = _discard_staging_path(quarantine_root, key)
     parent_fd = _open_path_chain(path.parent)
     try:
+        pending_fd = _open_quarantine_chain(staging, Path(quarantine_root), create=False)
+        if pending_fd is not None:
+            try:
+                if _stat_at(pending_fd, "tree") is not None:
+                    raise InstallDriftError(
+                        f"a previous discard of {path} is pending in {staging / 'tree'}; "
+                        "it is kept for the operator"
+                    )
+            finally:
+                os.close(pending_fd)
         observed = _stat_at(parent_fd, path.name)
         if observed is None:
             return
@@ -2490,42 +2693,61 @@ def _discard_created_tree(path: Path, identity: Mapping[str, object]) -> None:
             identity["device"],
             identity["inode"],
         ):
-            raise InstallDriftError(
-                f"{path} is not the tree this receipt created; it is kept"
-            )
-        aside = f".{path.name}.cortex-discard"
-        if _stat_at(parent_fd, aside) is not None:
-            raise InstallDriftError(f"a previous discard of {path} is still pending: {aside}")
-        _renameat2_noreplace(parent_fd, path.name, parent_fd, aside)
-        moved = _stat_at(parent_fd, aside)
+            raise InstallDriftError(f"{path} is not the tree this receipt created; it is kept")
+        staging_fd = _open_quarantine_chain(staging, Path(quarantine_root), create=True)
+        assert staging_fd is not None
         try:
-            unchanged = (
-                moved is not None
-                and (moved.st_dev, moved.st_ino) == (identity["device"], identity["inode"])
-                and _tree_sha256(path.parent / aside) == identity["tree_sha256"]
+            _stage_for_discard(
+                parent_fd=parent_fd,
+                path=path,
+                staging=staging,
+                staging_fd=staging_fd,
+                leaf="tree",
+                device=observed.st_dev,
             )
-        except (InstallError, OSError):
-            unchanged = False
-        if not unchanged:
-            _renameat2_noreplace(parent_fd, aside, parent_fd, path.name)
-            _fsync_directory_at(parent_fd)
-            raise InstallDriftError(
-                f"{path} changed since this receipt created it; it is kept"
-            )
-        shutil.rmtree(path.parent / aside)
-        _fsync_directory_at(parent_fd)
+            try:
+                digest, manifest = _tree_digest_at(staging_fd, "tree")
+                proven = manifest[""][:2] == (
+                    identity["device"],
+                    identity["inode"],
+                ) and digest == identity["tree_sha256"]
+            except (InstallError, OSError):
+                proven, manifest = False, {}
+            if not proven:
+                raise _restore_from_discard(
+                    parent_fd=parent_fd,
+                    path=path,
+                    staging=staging,
+                    staging_fd=staging_fd,
+                    leaf="tree",
+                    problem=f"{path} changed since this receipt created it",
+                )
+            _remove_verified_tree(staging_fd, "tree", manifest)
+            os.fsync(staging_fd)
+        finally:
+            os.close(staging_fd)
     finally:
         os.close(parent_fd)
 
 
 def _remove_created_credential_directories(
-    rows: Sequence[object], destination: Path
+    rows: Sequence[object],
+    destination: Path,
+    *,
+    quarantine_root: Path | None,
+    key: str,
 ) -> str | None:
     """Remove the (empty) directories a legacy-receipt import created, innermost first.
 
-    Returns why a directory is kept, or ``None`` when all are gone.
+    Each directory is renamed into the private discard staging first and only
+    there proven to be the recorded inode and empty; ``rmdir`` then removes
+    it (and would refuse a directory that gained an entry meanwhile).  An
+    unproven directory goes straight back.  Returns why a directory is kept,
+    or ``None`` when all are gone.
     """
 
+    if quarantine_root is None:
+        return "credential directories are removed only through a legacy quarantine root"
     for item in reversed(list(rows)):
         if (
             not isinstance(item, Mapping)
@@ -2550,17 +2772,51 @@ def _remove_created_credential_directories(
                 item["ino"],
             ):
                 return f"credential directory created by import was replaced: {path}"
-            descriptor = os.open(path.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+            staging = _discard_staging_path(Path(quarantine_root), f"{key}\0{path}")
+            staging_fd = _open_quarantine_chain(staging, Path(quarantine_root), create=True)
+            assert staging_fd is not None
             try:
-                held = os.fstat(descriptor)
-                if (held.st_dev, held.st_ino) != (observed.st_dev, observed.st_ino):
-                    return f"credential directory created by import was replaced: {path}"
-                if os.listdir(descriptor):
-                    return f"credential directory created by import is not empty: {path}"
+                try:
+                    _stage_for_discard(
+                        parent_fd=parent_fd,
+                        path=path,
+                        staging=staging,
+                        staging_fd=staging_fd,
+                        leaf="dir",
+                        device=observed.st_dev,
+                    )
+                except InstallError as exc:
+                    return str(exc)
+                problem: str | None = None
+                try:
+                    held_fd = os.open("dir", _DIRECTORY_OPEN_FLAGS, dir_fd=staging_fd)
+                    try:
+                        held = os.fstat(held_fd)
+                        if (held.st_dev, held.st_ino) != (item["dev"], item["ino"]):
+                            problem = f"credential directory created by import was replaced: {path}"
+                        elif os.listdir(held_fd):
+                            problem = f"credential directory created by import is not empty: {path}"
+                    finally:
+                        os.close(held_fd)
+                    if problem is None:
+                        # rmdir refuses a directory that gained an entry meanwhile.
+                        os.rmdir("dir", dir_fd=staging_fd)
+                        os.fsync(staging_fd)
+                        continue
+                except OSError as exc:
+                    problem = f"credential directory created by import could not be removed: {path} ({exc})"
+                return str(
+                    _restore_from_discard(
+                        parent_fd=parent_fd,
+                        path=path,
+                        staging=staging,
+                        staging_fd=staging_fd,
+                        leaf="dir",
+                        problem=problem,
+                    )
+                )
             finally:
-                os.close(descriptor)
-            os.rmdir(path.name, dir_fd=parent_fd)
-            _fsync_directory_at(parent_fd)
+                os.close(staging_fd)
         finally:
             os.close(parent_fd)
     return None
@@ -2866,10 +3122,19 @@ class LocalInstallBackend:
 
         return _created_tree_identity(Path(str(step.get("path", ""))))
 
-    def discard_created_tree(self, path: str, identity: Mapping[str, object]) -> None:
+    def discard_created_tree(
+        self,
+        path: str,
+        identity: Mapping[str, object],
+        *,
+        quarantine_root: str,
+        key: str,
+    ) -> None:
         """Legacy rollback: remove a tree this receipt created, only if unchanged."""
 
-        _discard_created_tree(Path(path), identity)
+        _discard_created_tree(
+            Path(path), identity, quarantine_root=Path(quarantine_root), key=key
+        )
 
     def apply_step_checkpointed(
         self,
@@ -4424,6 +4689,9 @@ class LocalInstallBackend:
         # where quarantined legacy directories must move back, so they go too
         # -- but only while empty and still the recorded inode.
         retained_keys = {str(row.get("credential")) for row in retained}
+        plan = document.get("plan")
+        block = plan.get("legacy_adoption") if isinstance(plan, Mapping) else None
+        quarantine_root = block.get("quarantine_root") if isinstance(block, Mapping) else None
         for row in rows:
             if not isinstance(row, Mapping) or not row.get("created_directories"):
                 continue
@@ -4437,7 +4705,12 @@ class LocalInstallBackend:
                     receipt, principal=principal, provider=provider
                 )
                 problem = _remove_created_credential_directories(
-                    list(row["created_directories"]), destination  # type: ignore[arg-type]
+                    list(row["created_directories"]),  # type: ignore[arg-type]
+                    destination,
+                    quarantine_root=(
+                        Path(quarantine_root) if isinstance(quarantine_root, str) else None
+                    ),
+                    key=f"credential:{key}",
                 )
             except (InstallError, OSError) as exc:
                 problem = f"credential directory rollback failed: {exc}"
