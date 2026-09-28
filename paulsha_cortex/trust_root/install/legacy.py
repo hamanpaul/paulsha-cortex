@@ -4,11 +4,13 @@ A Phase 2b host was deployed by hand and never produced an installer receipt,
 so the transactional installer can neither fresh-install over it nor upgrade it
 with ``--prior-receipt``.  Legacy adoption adds a third kind of provenance: a
 root-captured, operator-reviewed inventory whose digest a later plan binds.
-The capture side (PR-2) never mutates the host.  The planning side (PR-3, at
-the end of this module) gives ``legacy_policy`` its meaning, records the host
-overlay digest, binds an inventory to a plan and derives one disposition per
-inventoried object, emitting ``legacy-quarantine`` steps.  Apply refuses those
-plans until apply-time re-capture, the quarantine backend and rollback land.
+The capture side (PR-2) never mutates the host.  The planning side (PR-3)
+gives ``legacy_policy`` its meaning, records the host overlay digest, binds an
+inventory to a plan and derives one disposition per inventoried object,
+emitting ``legacy-quarantine`` steps.  The apply side (PR-4, at the end of this
+module) re-captures the inventory before the first mutation, proves adopted
+objects by their live inventory rows, and proves a rollback by re-capturing
+the reviewed stable-field digest.
 
 Inventory schema v1 (canonical JSON, ASCII, sorted keys, one trailing newline):
 
@@ -70,6 +72,7 @@ from .backend import (
 )
 from .core import (
     ASSET_PRIOR_SNAPSHOT_MAX_BYTES,
+    InstallDriftError,
     InstallError,
     InstallPlanError,
     UnsafeInstallPathError,
@@ -846,6 +849,7 @@ class LegacyHostBackend(Protocol):
     def writable_paths(
         self, identity: CensusIdentity, tree: CensusTree
     ) -> CensusResult: ...
+    def running_cortex_units(self) -> Sequence[tuple[str, str]]: ...
 
 
 _READ_FLAGS = (
@@ -1057,6 +1061,37 @@ class LocalLegacyHostBackend:
             "active_state": values.get("ActiveState", ""),
             "sub_state": values.get("SubState", ""),
         }
+
+    def running_cortex_units(self) -> Sequence[tuple[str, str]]:
+        """Every loaded ``cortex*`` unit and its active state.
+
+        Services, template instances (``cortex-job@<id>.service``), timers and
+        scopes alike: apply refuses to adopt while any of them is not stopped.
+        """
+
+        argv = (
+            "systemctl",
+            "list-units",
+            "--all",
+            "--plain",
+            "--no-legend",
+            "--no-pager",
+            "--full",
+            "cortex*",
+        )
+        try:
+            result = _run(argv)
+        except OSError as exc:
+            raise InstallError(f"cannot list cortex units: {exc}") from exc
+        if result.returncode != 0:
+            raise InstallError("cannot list cortex units; refusing to assume none run")
+        rows: list[tuple[str, str]] = []
+        for line in result.stdout.splitlines():
+            fields = line.replace("●", " ").split()
+            if len(fields) < 4:
+                continue
+            rows.append((fields[0], fields[2]))
+        return sorted(rows)
 
     def in_flight(
         self, job_uids: Mapping[str, int], plan: Mapping[str, object]
@@ -1522,6 +1557,30 @@ def _account_rows(
     return rows, by_name, passwd, groups
 
 
+def _managed_row(
+    step: Mapping[str, object],
+    backend: LegacyHostBackend,
+    credential_paths: frozenset[str],
+) -> tuple[dict[str, object], os.stat_result | None]:
+    """One ``managed_paths`` row, exactly as the collector records it."""
+
+    path = str(step["path"])
+    credential = _is_credential_path(path, credential_paths)
+    observed, content = _observe(backend, path, credential=credential)
+    row: dict[str, object] = {
+        **step,
+        "class": "credential" if credential else "managed",
+        "lstat": None,
+        "acl": None,
+        "content": content,
+    }
+    if observed is not None:
+        row["lstat"] = _lstat_record(observed, credential=credential)
+        if not credential and _file_type(observed.st_mode) in {"file", "directory"}:
+            row["acl"] = [dict(entry) for entry in backend.read_acl(path)]
+    return row, observed
+
+
 def _managed_rows(
     plan: Mapping[str, object],
     backend: LegacyHostBackend,
@@ -1530,26 +1589,14 @@ def _managed_rows(
     rows: list[dict[str, object]] = []
     directories: dict[str, os.stat_result] = {}
     for step in _managed_steps(plan):
-        path = str(step["path"])
-        credential = _is_credential_path(path, credential_paths)
-        observed, content = _observe(backend, path, credential=credential)
-        row: dict[str, object] = {
-            **step,
-            "class": "credential" if credential else "managed",
-            "lstat": None,
-            "acl": None,
-            "content": content,
-        }
-        if observed is not None:
-            row["lstat"] = _lstat_record(observed, credential=credential)
-            if not credential and _file_type(observed.st_mode) in {"file", "directory"}:
-                row["acl"] = [dict(entry) for entry in backend.read_acl(path)]
-            if (
-                step["kind"] == "asset"
-                and step["asset_type"] == "directory"
-                and stat.S_ISDIR(observed.st_mode)
-            ):
-                directories[path] = observed
+        row, observed = _managed_row(step, backend, credential_paths)
+        if (
+            observed is not None
+            and step["kind"] == "asset"
+            and step["asset_type"] == "directory"
+            and stat.S_ISDIR(observed.st_mode)
+        ):
+            directories[str(step["path"])] = observed
         rows.append(row)
     return rows, directories
 
@@ -1884,15 +1931,26 @@ def _collector_version() -> str:
         return "unknown"
 
 
+_UNSET: object = object()
+
+
 def collect_legacy_inventory(
     *,
     plan: Mapping[str, object],
     backend: LegacyHostBackend,
     host_overlay: Mapping[str, object] | None = None,
     captured_at: datetime | None = None,
+    overlay_record: object = _UNSET,
 ) -> dict[str, object]:
-    """Capture a legacy host read-only and return a validated inventory document."""
+    """Capture a legacy host read-only and return a validated inventory document.
 
+    ``overlay_record`` replaces the record derived from ``host_overlay``: an
+    apply-time or rollback-time re-capture has only the plan-bound overlay
+    digest, so it reuses the reviewed inventory's own record.
+    """
+
+    if overlay_record is _UNSET:
+        overlay_record = host_overlay_record(host_overlay)
     scope = legacy_scope(plan)
     credential_paths = frozenset(
         str(row["path"]) for row in scope["credential_destinations"]  # type: ignore[union-attr]
@@ -1929,7 +1987,7 @@ def collect_legacy_inventory(
         "host": {"binding_sha256": host_binding_sha256(backend.machine_id())},
         "scope": scope,
         "scope_sha256": scope_sha256(scope),
-        "host_overlay": host_overlay_record(host_overlay),
+        "host_overlay": overlay_record,
         "accounts": accounts,
         "managed_paths": managed_rows,
         "discovered": discovered,
@@ -2671,7 +2729,7 @@ def render_inventory_summary(inventory: LegacyInventory) -> str:
 # reviewed inventory: the plan re-derives its scope, checks the self digest,
 # the host binding and the overlay the capture used, and derives one
 # disposition for every inventoried object.  Anything no rule classifies fails
-# planning.  Apply refuses these plans until the apply side lands (PR-4).
+# planning.  Apply takes the same inventory again (see the apply side below).
 
 LEGACY_PLAN_SCHEMA_VERSION = 1
 QUARANTINE_STEP_KIND = "legacy-quarantine"
@@ -3209,6 +3267,17 @@ def _account_failures(
     ]
 
 
+def _receipt_directory(scope: Mapping[str, object]) -> str | None:
+    """The canonical receipt directory (``canonical_receipt_path``'s parent)."""
+
+    roots = scope.get("roots")
+    state = roots.get("state") if isinstance(roots, Mapping) else None
+    if not isinstance(state, str) or not state.startswith("/"):
+        return None
+    state = posixpath.normpath(state)
+    return posixpath.join(posixpath.dirname(state), f"{posixpath.basename(state)}-install-receipts")
+
+
 def _quarantine_root_problems(root: str, scope: Mapping[str, object]) -> list[str]:
     problems: list[str] = []
     for protected in _scope_protected_paths(scope):
@@ -3220,6 +3289,13 @@ def _quarantine_root_problems(root: str, scope: Mapping[str, object]) -> list[st
             problems.append(
                 f"quarantine_root {root} contains {protected}, which the inventory records"
             )
+    receipts = _receipt_directory(scope)
+    if receipts is not None and (_within(root, receipts) or _within(receipts, root)):
+        # Receipts and their side files are installer authority; quarantined
+        # legacy objects must never mix with them.
+        problems.append(
+            f"quarantine_root {root} overlaps the canonical receipt directory {receipts}"
+        )
     return problems
 
 
@@ -3738,3 +3814,390 @@ def validate_legacy_adoption_plan(
         or not all(type(value) is int and value >= 0 for value in summary.values())
     ):
         raise InstallPlanError("plan legacy_adoption.summary is invalid")
+
+
+# ---------------------------------------------------------------------------
+# apply side (PR-4): re-capture gate, adoption provenance, rollback proof
+# ---------------------------------------------------------------------------
+#
+# Apply receives the reviewed inventory again (``--legacy-inventory``).  Before
+# the receipt leaves ``planned`` -- under the transaction lock, with the
+# services stopped by the maintenance lease -- it re-captures the host with the
+# plan's scope and refuses on any stable-field drift, census finding, in-flight
+# job or running cortex unit.  Adopted objects are then proven step by step by
+# re-deriving their live inventory row, and the receipt records that
+# provenance as ``adoption: {source: "legacy-inventory", row_sha256}``.
+# Rollback re-captures once more and reports ``legacy_restored`` only when the
+# host is back at the reviewed stable-field digest.
+
+LEGACY_ADOPTION_SOURCE = "legacy-inventory"
+_STOPPED_STATES = frozenset({"inactive", "failed"})
+_CHANGED_ROWS_SHOWN = 20
+
+
+class LegacyApplyGateError(InstallDriftError):
+    """The apply-time re-capture refused; nothing was mutated."""
+
+    def __init__(self, failures: Sequence[str]) -> None:
+        self.failures = tuple(failures)
+        super().__init__(
+            "legacy adoption apply gate failed before any mutation (the receipt "
+            "stays planned):\n" + "\n".join(f"  - {failure}" for failure in self.failures)
+        )
+
+
+def _row_key(section: str, row: Mapping[str, object]) -> str:
+    return str(row.get("name") if section == "accounts" else row.get("path"))
+
+
+def _changed_rows(
+    original: Mapping[str, object], recaptured: Mapping[str, object]
+) -> list[str]:
+    """Name what differs between two inventories, for the operator."""
+
+    changed: list[str] = []
+    for field in ("host", "scope_sha256", "host_overlay"):
+        if original.get(field) != recaptured.get(field):
+            changed.append(field)
+    for section in ("accounts", "managed_paths", "discovered", "credentials"):
+        before = {
+            _row_key(section, row): row
+            for row in original.get(section, []) or []  # type: ignore[union-attr]
+            if isinstance(row, Mapping)
+        }
+        after = {
+            _row_key(section, row): row
+            for row in recaptured.get(section, []) or []  # type: ignore[union-attr]
+            if isinstance(row, Mapping)
+        }
+        for key in sorted(set(before) | set(after)):
+            if before.get(key) != after.get(key):
+                changed.append(f"{section}:{key}")
+    for section in ("services", "census"):
+        before_map = original.get(section)
+        after_map = recaptured.get(section)
+        before_map = before_map if isinstance(before_map, Mapping) else {}
+        after_map = after_map if isinstance(after_map, Mapping) else {}
+        for key in sorted(set(before_map) | set(after_map)):
+            if before_map.get(key) != after_map.get(key):
+                changed.append(f"{section}:{key}")
+    return changed
+
+
+def _describe_changes(changed: Sequence[str]) -> str:
+    if not changed:
+        return ""
+    shown = ", ".join(changed[:_CHANGED_ROWS_SHOWN])
+    more = len(changed) - _CHANGED_ROWS_SHOWN
+    return f"; changed: {shown}" + (f" (+{more} more)" if more > 0 else "")
+
+
+class LegacyApplyContext:
+    """What apply needs to adopt a legacy host: the reviewed inventory and a live view.
+
+    Construction binds the inventory file to the plan: its self digest, scope,
+    host binding and overlay record must be the plan's, every adopted digest
+    must name one of its rows, and every quarantine step must carry exactly
+    the expected state its row describes.
+    """
+
+    def __init__(
+        self,
+        plan: Mapping[str, object],
+        inventory: LegacyInventory,
+        host: LegacyHostBackend,
+        *,
+        inventory_path: str,
+    ) -> None:
+        block = plan.get("legacy_adoption") if isinstance(plan, Mapping) else None
+        if not isinstance(block, Mapping):
+            raise InstallPlanError(
+                "--legacy-inventory is accepted only for a plan that carries a "
+                "legacy_adoption block"
+            )
+        if not _normalized_absolute(inventory_path):
+            raise InstallPlanError(
+                f"legacy inventory path must be a normalized absolute path: {inventory_path}"
+            )
+        self.plan = plan
+        self.block = block
+        self.inventory = inventory
+        self.host = host
+        self.inventory_path = inventory_path
+        scope = legacy_scope(plan)
+        self._credential_paths = frozenset(
+            str(row["path"]) for row in scope["credential_destinations"]  # type: ignore[union-attr]
+        )
+        self._managed_steps = {str(row["step_id"]): row for row in _managed_steps(plan)}
+        self._adopted_rows: dict[str, tuple[str, Mapping[str, object]]] = {}
+        self._bind()
+
+    # -- binding ---------------------------------------------------------
+
+    def _bind(self) -> None:
+        inventory = self.inventory
+        block = self.block
+        path = self.inventory_path
+        for label, observed, bound in (
+            ("inventory_sha256", inventory.inventory_sha256, block["inventory_sha256"]),
+            ("scope_sha256", inventory.scope_sha256, block["scope_sha256"]),
+            ("host binding", inventory.host_binding_sha256, block["host_binding_sha256"]),
+        ):
+            if observed != bound:
+                raise InstallPlanError(
+                    f"legacy inventory {path} has {label} {observed} but the plan binds {bound}"
+                )
+        overlay = inventory.document["host_overlay"]
+        overlay_sha256 = overlay.get("sha256") if isinstance(overlay, Mapping) else None
+        if overlay_sha256 != block["host_overlay_sha256"]:
+            raise InstallPlanError(
+                f"legacy inventory {path} was captured with host overlay {overlay_sha256} "
+                f"but the plan binds {block['host_overlay_sha256']}"
+            )
+        adopted = block["adopted"]
+        assert isinstance(adopted, Mapping)
+        for step_id, digest in adopted.items():
+            located = next(
+                (
+                    (section, row)
+                    for section, row in self._candidate_rows(str(step_id))
+                    if inventory_row_sha256(section, row) == digest
+                ),
+                None,
+            )
+            if located is None:
+                raise InstallPlanError(
+                    f"plan legacy_adoption.adopted {step_id} does not name a row of the "
+                    f"bound inventory {path}"
+                )
+            self._adopted_rows[str(step_id)] = located
+        rows_by_path: dict[str, list[tuple[str, Mapping[str, object]]]] = {}
+        for section in ("managed_paths", "discovered", "credentials"):
+            for row in inventory.document[section]:  # type: ignore[union-attr]
+                rows_by_path.setdefault(str(row["path"]), []).append((section, row))
+        for step in self.plan.get("apply_order", []) or []:  # type: ignore[union-attr]
+            if not isinstance(step, Mapping) or step.get("kind") != QUARANTINE_STEP_KIND:
+                continue
+            if not any(
+                inventory_row_sha256(section, row) == step.get("row_sha256")
+                and isinstance(row.get("lstat"), Mapping)
+                and _quarantine_expected(row["lstat"], row.get("content")) == step.get("expected")
+                for section, row in rows_by_path.get(str(step.get("path")), [])
+            ):
+                raise InstallPlanError(
+                    f"legacy-quarantine step {step.get('path')} does not match the bound "
+                    f"inventory {path}"
+                )
+
+    def _candidate_rows(self, step_id: str) -> list[tuple[str, Mapping[str, object]]]:
+        document = self.inventory.document
+        if step_id.startswith("account:"):
+            name = step_id.removeprefix("account:")
+            return [
+                ("accounts", row)
+                for row in document["accounts"]  # type: ignore[union-attr]
+                if row["name"] == name
+            ]
+        managed = [
+            ("managed_paths", row)
+            for row in document["managed_paths"]  # type: ignore[union-attr]
+            if row["step_id"] == step_id
+        ]
+        if managed:
+            return managed
+        links = _enablement_links(self.plan, _plan_roots(self.plan))
+        return [
+            ("discovered", row)
+            for row in document["discovered"]  # type: ignore[union-attr]
+            if links.get(str(row["path"]), ("",))[0] == step_id
+        ]
+
+    # -- what apply asks -------------------------------------------------
+
+    def adopted_account_rows(self) -> dict[str, dict[str, object]]:
+        """Inventory rows of the adopted accounts, by account name."""
+
+        return {
+            str(row["name"]): deepcopy(dict(row))
+            for section, row in self._adopted_rows.values()
+            if section == "accounts"
+        }
+
+    def _live_row(
+        self, step_id: str, section: str, row: Mapping[str, object]
+    ) -> Mapping[str, object] | None:
+        if section == "accounts":
+            rows, _by_name, _passwd, _groups = _account_rows(self.plan, self.host)
+            return next((live for live in rows if live["name"] == row["name"]), None)
+        if section == "managed_paths":
+            step = self._managed_steps.get(step_id)
+            if step is None:
+                return None
+            live, _observed = _managed_row(step, self.host, self._credential_paths)
+            return live
+        path = str(row["path"])
+        credential = row.get("class") == "credential"
+        observed, content = _observe(self.host, path, credential=credential)
+        if observed is None:
+            return None
+        return {
+            **row,
+            "lstat": _lstat_record(observed, credential=credential),
+            "content": content,
+        }
+
+    def adoption_record(self, step: Mapping[str, object]) -> dict[str, str] | None:
+        """``{source, row_sha256}`` while the step's legacy object is still its row.
+
+        The row is re-derived from the live host exactly as the collector
+        derives it, so an adopted object that changed since the review (or
+        since an interrupted apply) has no legacy provenance.
+        """
+
+        step_id = str(step.get("step_id"))
+        digest = self.block["adopted"].get(step_id)  # type: ignore[union-attr]
+        located = self._adopted_rows.get(step_id)
+        if digest is None or located is None:
+            return None
+        section, row = located
+        try:
+            live = self._live_row(step_id, section, row)
+        except (InstallError, OSError):
+            return None
+        if live is None or inventory_row_sha256(section, live) != digest:
+            return None
+        return {"source": LEGACY_ADOPTION_SOURCE, "row_sha256": str(digest)}
+
+    def recapture(self) -> dict[str, object]:
+        return collect_legacy_inventory(
+            plan=self.plan,
+            backend=self.host,
+            overlay_record=deepcopy(self.inventory.document["host_overlay"]),
+        )
+
+    def apply_gate(self) -> dict[str, object]:
+        """Re-capture the host and refuse on any drift; return the receipt record."""
+
+        document = self.recapture()
+        block = self.block
+        failures: list[str] = []
+        exceptions = block["census_exceptions"]
+        assert isinstance(exceptions, list)
+        census = document["census"]
+        assert isinstance(census, Mapping)
+        for principal, row in sorted(census.items()):
+            if row["status"] == "unstable":
+                failures.append(
+                    f"census: {principal} entries changed while they were checked "
+                    f"(unstable): {', '.join(row['unstable'])}"
+                )
+            for item in row["writable_outside_declared"]:
+                path = str(item["path"])
+                if not any(
+                    exception["principal"] == principal and _within(path, exception["path"])
+                    for exception in exceptions
+                ):
+                    failures.append(
+                        f"census: {principal} can write {path}, which is neither a "
+                        "plan-declared writable asset nor a "
+                        "legacy_adoption.census_exceptions entry"
+                    )
+        volatile = document["volatile"]
+        assert isinstance(volatile, Mapping)
+        in_flight = volatile["in_flight"]
+        assert isinstance(in_flight, Mapping)
+        processes = in_flight.get("job_processes")
+        durable = in_flight.get("durable_jobs")
+        if processes != 0 or durable != 0:
+            failures.append(
+                f"in-flight: job processes={processes}, durable in-flight jobs={durable}; "
+                "every job must provably be finished before adoption"
+            )
+        services = volatile["services"]
+        assert isinstance(services, Mapping)
+        for unit, row in sorted(services.items()):
+            state = row.get("active_state") if isinstance(row, Mapping) else None
+            if state not in _STOPPED_STATES:
+                failures.append(
+                    f"service: {unit} is {state or 'unknown'}; the maintenance lease must "
+                    "stop it before apply"
+                )
+        for unit, state in self.host.running_cortex_units():
+            if state not in _STOPPED_STATES:
+                failures.append(
+                    f"unit: {unit} is {state}; stop every cortex service and job "
+                    "template instance before apply"
+                )
+        host = document["host"]
+        assert isinstance(host, Mapping)
+        if host["binding_sha256"] != block["host_binding_sha256"]:
+            failures.append(
+                f"host binding: this host is {host['binding_sha256']} but the plan binds "
+                f"{block['host_binding_sha256']}"
+            )
+        if document["scope_sha256"] != block["scope_sha256"]:
+            failures.append(
+                f"scope: the re-capture covers scope {document['scope_sha256']} but the "
+                f"plan binds {block['scope_sha256']}"
+            )
+        digest = inventory_stable_sha256(document)
+        if digest != block["inventory_sha256"]:
+            failures.append(
+                f"inventory: the re-captured stable-field digest {digest} differs from "
+                f"the plan-bound {block['inventory_sha256']}"
+                + _describe_changes(_changed_rows(self.inventory.document, document))
+            )
+        if failures:
+            raise LegacyApplyGateError(failures)
+        return self.receipt_record(digest)
+
+    def receipt_record(self, apply_inventory_sha256: str) -> dict[str, object]:
+        return {
+            "inventory_sha256": self.block["inventory_sha256"],
+            "inventory_path": self.inventory_path,
+            "host_binding_sha256": self.block["host_binding_sha256"],
+            "quarantine_root": self.block["quarantine_root"],
+            "apply_inventory_sha256": apply_inventory_sha256,
+        }
+
+
+def prove_legacy_restored(
+    plan: Mapping[str, object],
+    record: Mapping[str, object],
+    host: LegacyHostBackend | None,
+) -> tuple[bool, dict[str, object]]:
+    """Re-capture after rollback: is the host back at the reviewed digest?
+
+    The reviewed inventory is reloaded from the path the receipt recorded (its
+    overlay record is part of the stable digest).  Any failure to load,
+    re-capture or match is ``False`` -- restoration is never assumed.
+    """
+
+    expected = record.get("inventory_sha256")
+    if host is None:
+        return False, {"error": "no legacy host backend to re-capture the inventory"}
+    try:
+        inventory = LegacyInventory.load(Path(str(record.get("inventory_path"))))
+    except Exception as exc:  # noqa: BLE001 - any failure is "not proven"
+        return False, {"error": f"cannot load the reviewed legacy inventory: {exc}"}
+    if inventory.inventory_sha256 != expected:
+        return False, {
+            "error": "the recorded legacy inventory file no longer has the bound digest",
+            "expected_inventory_sha256": expected,
+        }
+    try:
+        document = collect_legacy_inventory(
+            plan=plan,
+            backend=host,
+            overlay_record=deepcopy(inventory.document["host_overlay"]),
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure is "not proven"
+        return False, {"error": f"cannot re-capture the legacy inventory: {exc}"}
+    digest = inventory_stable_sha256(document)
+    if digest != expected:
+        return False, {
+            "expected_inventory_sha256": expected,
+            "recaptured_inventory_sha256": digest,
+            "changed": _changed_rows(inventory.document, document)[:_CHANGED_ROWS_SHOWN],
+        }
+    return True, {"recaptured_inventory_sha256": digest}

@@ -4,7 +4,8 @@ Planning binds a reviewed legacy inventory: it re-derives the inventory scope
 from the same config, overlay and bundle, checks the host binding and the
 self digest, and derives one disposition per inventoried object (adopt,
 adopt-in-place, quarantine-then-create, quarantine, or planning failure).
-Apply refuses every legacy plan until the apply side lands (PR-4).
+Apply accepts such a plan only together with the inventory it binds; the apply
+side (PR-4) is covered by ``test_trust_root_install_legacy_adoption.py``.
 """
 from __future__ import annotations
 
@@ -1258,23 +1259,25 @@ def test_quarantine_root_must_stay_outside_the_inventoried_scope(tmp_path: Path)
 
 
 # ---------------------------------------------------------------------------
-# apply refuses legacy plans until PR-4
+# apply accepts a legacy plan only with the inventory it binds (PR-4)
 # ---------------------------------------------------------------------------
 
 
-def test_apply_refuses_a_legacy_plan(
+def test_apply_validates_a_legacy_plan_and_requires_its_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # Adopted rows are keyed by step id; a scaffold id carries its path, and
     # here that path contains "auth".  The secret-field screen must still let
-    # the plan reach the explicit refusal.
+    # the plan through validation.
     tmp_path = tmp_path / "auth-bearing"
     plan, _seeded, _base = _adopt(tmp_path)
     digest = install_core.plan_sha256(plan)
     assert any("auth" in step_id for step_id in plan["legacy_adoption"]["adopted"])
 
-    with pytest.raises(InstallPlanError, match="legacy adoption apply is not implemented"):
-        install_core.validate_apply_plan(plan, confirm_sha256=digest)
+    steps = install_core.validate_apply_plan(plan, confirm_sha256=digest)
+    assert sum(step["kind"] == "legacy-quarantine" for step in steps) == len(
+        plan["legacy_adoption"]["quarantine"]
+    )
     smuggled = deepcopy(plan)
     smuggled["legacy_adoption"]["summary"]["github_token"] = 0
     smuggled["receipt_path"] = str(install_core.canonical_receipt_path(smuggled))
@@ -1287,12 +1290,10 @@ def test_apply_refuses_a_legacy_plan(
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
     monkeypatch.setattr(install_cli, "_require_root", lambda: None)
     receipt = tmp_path / "receipts" / "receipt.json"
-    for argv in (
-        ["apply", "--plan", str(plan_path), "--confirm-sha256", digest, "--receipt", str(receipt)],
-        ["lease", "--plan", str(plan_path), "--confirm-sha256", digest, "--receipt", str(receipt)],
-    ):
-        assert install_cli.main(argv) == 1
-        assert "legacy adoption apply is not implemented" in capsys.readouterr().err
+    assert install_cli.main(
+        ["apply", "--plan", str(plan_path), "--confirm-sha256", digest, "--receipt", str(receipt)]
+    ) == 1
+    assert "requires --legacy-inventory" in capsys.readouterr().err
     assert not receipt.parent.exists()
     assert not Path(plan["receipt_path"]).exists()
 

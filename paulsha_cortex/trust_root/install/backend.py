@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import base64
 import configparser
+import ctypes
 import errno
+import functools
 import grp
 import hashlib
 import json
 import os
+import platform
+import posixpath
 import pwd
 import re
 import shutil
@@ -26,6 +30,7 @@ from .core import (
     InstallPlanError,
     InstallReceipt,
     UnsafeInstallPathError,
+    _DIRECTORY_OPEN_FLAGS,
     _account_digest,
     _assert_fd_path_binding,
     _desired_digest,
@@ -1757,6 +1762,515 @@ def _replacement_staging_matches(
     return _state_matches_step(step, state)
 
 
+# ---------------------------------------------------------------------------
+# legacy quarantine (#1122): move a legacy object aside, never delete or
+# overwrite it, and move it back on rollback
+# ---------------------------------------------------------------------------
+
+_RENAME_NOREPLACE = 1
+#: ``renameat2`` (Linux 3.15+) by architecture; an unknown one fails closed.
+_RENAMEAT2_SYSCALL = {
+    "x86_64": 316,
+    "i386": 353,
+    "i686": 353,
+    "aarch64": 276,
+    "arm64": 276,
+    "riscv64": 276,
+    "loongarch64": 276,
+    "armv7l": 382,
+    "armv8l": 382,
+    "s390x": 347,
+    "ppc64": 357,
+    "ppc64le": 357,
+}
+_RENAME_UNSUPPORTED_ERRNOS = frozenset(
+    {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
+)
+#: The inventory hashes regular files up to this bound; the quarantine binds
+#: exactly the digests the inventory recorded.
+_QUARANTINE_HASH_MAX_BYTES = ASSET_PRIOR_SNAPSHOT_MAX_BYTES
+_QUARANTINE_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _renameat2_syscall():  # type: ignore[no-untyped-def]
+    function = ctypes.CDLL(None, use_errno=True).syscall
+    function.restype = ctypes.c_long
+    return function
+
+
+def _renameat2_noreplace(
+    source_dir_fd: int, source: str, destination_dir_fd: int, destination: str
+) -> None:
+    """``renameat2(..., RENAME_NOREPLACE)`` straight to the kernel.
+
+    Deliberately not a libc wrapper or a check-then-rename: a kernel or
+    filesystem that cannot refuse to replace an existing destination answers
+    ENOSYS/EINVAL, and the quarantine then refuses to move at all instead of
+    falling back to a racy rename or to a copy.
+    """
+
+    number = _RENAMEAT2_SYSCALL.get(platform.machine())
+    if number is None:
+        raise OSError(
+            errno.ENOSYS, "renameat2 is not known for this architecture", source
+        )
+    result = _renameat2_syscall()(
+        ctypes.c_long(number),
+        ctypes.c_long(source_dir_fd),
+        ctypes.c_char_p(os.fsencode(source)),
+        ctypes.c_long(destination_dir_fd),
+        ctypes.c_char_p(os.fsencode(destination)),
+        ctypes.c_long(_RENAME_NOREPLACE),
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        raise OSError(error, os.strerror(error), destination)
+
+
+def _validate_quarantine_ancestor(observed: os.stat_result, path: Path) -> None:
+    """An ancestor of the quarantine root: root-owned, writable by root only."""
+
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != 0
+        or stat.S_IMODE(observed.st_mode) & 0o022
+    ):
+        raise UnsafeInstallPathError(
+            "quarantine ancestor must be a root-owned directory no other account "
+            f"can write: {path}"
+        )
+
+
+def _validate_quarantine_directory(observed: os.stat_result, path: Path) -> None:
+    """The quarantine root and every directory below it: root-owned 0700."""
+
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != 0
+        or stat.S_IMODE(observed.st_mode) != 0o700
+    ):
+        raise UnsafeInstallPathError(
+            f"quarantine directory must be root-owned mode 0700: {path}"
+        )
+
+
+def _filesystem_device(descriptor: int) -> int:
+    return os.fstat(descriptor).st_dev
+
+
+def _normalized_absolute_path(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("/")
+        and not value.startswith("//")
+        and value != "/"
+        and "\x00" not in value
+        and posixpath.normpath(value) == value
+    )
+
+
+def _quarantine_layout(step: Mapping[str, object]) -> tuple[Path, Path, Path]:
+    """Return (source, destination, quarantine root) of a bound quarantine step.
+
+    ``destination`` must be ``<quarantine_root>/<16 hex>/root<source>``: the
+    root is derived from the step itself, never from a caller.
+    """
+
+    source = step.get("path")
+    destination = step.get("destination")
+    expected = step.get("expected")
+    if (
+        step.get("kind") != "legacy-quarantine"
+        or not _normalized_absolute_path(source)
+        or not _normalized_absolute_path(destination)
+        or not isinstance(expected, Mapping)
+    ):
+        raise InstallPlanError(f"invalid legacy quarantine step: {step.get('step_id')}")
+    assert isinstance(source, str) and isinstance(destination, str)
+    suffix = f"/root{source}"
+    prefix = destination[: -len(suffix)] if destination.endswith(suffix) else ""
+    root, _separator, bucket = prefix.rpartition("/")
+    if not re.fullmatch(r"[0-9a-f]{16}", bucket) or not _normalized_absolute_path(root):
+        raise InstallPlanError(
+            f"legacy quarantine destination is not bound to a quarantine root: {destination}"
+        )
+    for key in ("dev", "ino"):
+        if type(expected.get(key)) is not int:
+            raise InstallPlanError(
+                f"legacy quarantine step lacks its inode identity: {step.get('step_id')}"
+            )
+    return Path(source), Path(destination), Path(root)
+
+
+def _file_type_name(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    return "other"
+
+
+def _quarantine_record(observed: os.stat_result) -> dict[str, object]:
+    return {
+        "type": _file_type_name(observed.st_mode),
+        "uid": observed.st_uid,
+        "gid": observed.st_gid,
+        "mode": format(stat.S_IMODE(observed.st_mode), "04o"),
+        "dev": observed.st_dev,
+        "ino": observed.st_ino,
+    }
+
+
+def _stat_at(parent_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _bounded_sha256_at(
+    parent_fd: int, name: str, observed: os.stat_result
+) -> str | None:
+    """Hash a bound-sized regular file that is still ``observed``; else ``None``."""
+
+    if not stat.S_ISREG(observed.st_mode) or observed.st_size > _QUARANTINE_HASH_MAX_BYTES:
+        return None
+    try:
+        descriptor = os.open(name, _QUARANTINE_READ_FLAGS, dir_fd=parent_fd)
+    except OSError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (observed.st_dev, observed.st_ino):
+            return None
+        digest = hashlib.sha256()
+        total = 0
+        while chunk := os.read(descriptor, 1024 * 1024):
+            total += len(chunk)
+            if total > _QUARANTINE_HASH_MAX_BYTES:
+                return None
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (total, after.st_size, after.st_mtime_ns) != (
+            before.st_size,
+            before.st_size,
+            before.st_mtime_ns,
+        ):
+            return None
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _quarantine_source_record(
+    parent_fd: int, name: str, expected: Mapping[str, object]
+) -> dict[str, object] | None:
+    """The source's identity plus exactly the content binding the step carries.
+
+    Only a file whose inventory row recorded a digest is read; credential
+    class objects carry none and are never opened.
+    """
+
+    observed = _stat_at(parent_fd, name)
+    if observed is None:
+        return None
+    record = _quarantine_record(observed)
+    if "sha256" in expected:
+        record["sha256"] = _bounded_sha256_at(parent_fd, name, observed)
+    if "link_target" in expected:
+        record["link_target"] = (
+            os.readlink(name, dir_fd=parent_fd) if stat.S_ISLNK(observed.st_mode) else None
+        )
+    return record
+
+
+def _open_existing_directory(path: Path) -> int | None:
+    try:
+        return _open_directory_chain(path)
+    except FileNotFoundError:
+        return None
+
+
+def _open_quarantine_chain(directory: Path, root: Path, *, create: bool) -> int | None:
+    """Open ``directory`` at or below ``root`` without following any symlink.
+
+    Each component is opened relative to its verified parent.  An ancestor of
+    the quarantine root must be a root-owned directory no other account can
+    write; the root and every directory below it must be root-owned 0700.
+    Missing components are created root-only 0700 when ``create`` is true;
+    otherwise ``None`` is returned at the first missing component.
+    """
+
+    if directory != root and root not in directory.parents:
+        raise UnsafeInstallPathError(
+            f"quarantine destination {directory} is not below its root {root}"
+        )
+    descriptor = os.open("/", _DIRECTORY_OPEN_FLAGS)
+    current = Path("/")
+    try:
+        _validate_quarantine_ancestor(os.fstat(descriptor), current)
+        for component in directory.parts[1:]:
+            current = current / component
+            created = False
+            try:
+                next_descriptor = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    os.close(descriptor)
+                    descriptor = -1
+                    return None
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+                try:
+                    next_descriptor = os.open(
+                        component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor
+                    )
+                except OSError as exc:
+                    raise UnsafeInstallPathError(
+                        f"quarantine path contains an unsafe component: {current}"
+                    ) from exc
+            except OSError as exc:
+                raise UnsafeInstallPathError(
+                    f"quarantine path contains an unsafe component: {current}"
+                ) from exc
+            try:
+                if created:
+                    os.fchmod(next_descriptor, 0o700)
+                    os.fsync(descriptor)
+                validator = (
+                    _validate_quarantine_directory
+                    if current == root or root in current.parents
+                    else _validate_quarantine_ancestor
+                )
+                validator(os.fstat(next_descriptor), current)
+            except BaseException:
+                os.close(next_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _quarantine_chain_problem(directory: Path, root: Path) -> str | None:
+    """Read-only check of the existing part of a quarantine destination chain."""
+
+    try:
+        descriptor = _open_quarantine_chain(directory, root, create=False)
+    except UnsafeInstallPathError as exc:
+        return str(exc)
+    if descriptor is not None:
+        os.close(descriptor)
+    return None
+
+
+def _nearest_existing_device(directory: Path) -> int:
+    """``st_dev`` of the deepest existing directory on the way to ``directory``."""
+
+    descriptor = os.open("/", _DIRECTORY_OPEN_FLAGS)
+    try:
+        for component in directory.parts[1:]:
+            try:
+                next_descriptor = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
+            except OSError:
+                break
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return _filesystem_device(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _legacy_quarantine_state(step: Mapping[str, object]) -> dict[str, object]:
+    """Where a quarantined object is: its source, its destination, and the chain."""
+
+    source, destination, root = _quarantine_layout(step)
+    expected = step["expected"]
+    assert isinstance(expected, Mapping)
+    source_record: dict[str, object] | None = None
+    parent_fd = _open_existing_directory(source.parent)
+    if parent_fd is not None:
+        try:
+            source_record = _quarantine_source_record(parent_fd, source.name, expected)
+        finally:
+            os.close(parent_fd)
+    destination_record: dict[str, object] | None = None
+    destination_fd = _open_existing_directory(destination.parent)
+    if destination_fd is not None:
+        try:
+            observed = _stat_at(destination_fd, destination.name)
+            if observed is not None:
+                destination_record = _quarantine_record(observed)
+        finally:
+            os.close(destination_fd)
+    return {
+        "exists": source_record is not None,
+        "source": source_record,
+        "destination": destination_record,
+        "destination_device": _nearest_existing_device(destination.parent),
+        "destination_chain": _quarantine_chain_problem(destination.parent, root),
+    }
+
+
+def _rename_failure(exc: OSError, source: Path, destination: Path) -> InstallError:
+    if exc.errno == errno.EXDEV:
+        return InstallDriftError(
+            f"{source} and {destination} are on another filesystem for rename(2); "
+            "the installer never copies a legacy object, so it stays in place"
+        )
+    if exc.errno in _RENAME_UNSUPPORTED_ERRNOS:
+        return InstallError(
+            f"renameat2 with RENAME_NOREPLACE is unavailable for {source} "
+            f"({exc.strerror or exc}); the quarantine refuses to move without it"
+        )
+    return InstallDriftError(f"legacy quarantine could not move {source} to {destination}: {exc}")
+
+
+def _legacy_quarantine_move(step: Mapping[str, object]) -> dict[str, object]:
+    """Move one inventoried legacy object into its private quarantine slot.
+
+    The source must still be the inventoried object (type, owner, mode, inode
+    and, where the inventory recorded one, content digest or link target); the
+    destination chain is root-only; the destination must be on the source's
+    filesystem and must not exist.  The move itself is a single
+    ``renameat2(RENAME_NOREPLACE)`` followed by an fsync of both parents.
+    """
+
+    source, destination, root = _quarantine_layout(step)
+    expected = step["expected"]
+    assert isinstance(expected, Mapping)
+    try:
+        source_fd = _open_directory_chain(source.parent)
+    except FileNotFoundError as exc:
+        raise InstallDriftError(f"legacy quarantine source is missing: {source}") from exc
+    try:
+        current = _quarantine_source_record(source_fd, source.name, expected)
+        if current is None:
+            raise InstallDriftError(f"legacy quarantine source is missing: {source}")
+        changed = sorted(key for key in expected if current.get(key) != expected[key])
+        if changed:
+            raise InstallDriftError(
+                f"legacy quarantine source changed since the inventory: {source} "
+                f"({', '.join(changed)}); nothing was moved"
+            )
+        destination_fd = _open_quarantine_chain(destination.parent, root, create=True)
+        assert destination_fd is not None
+        try:
+            if _filesystem_device(destination_fd) != expected["dev"]:
+                raise InstallDriftError(
+                    f"legacy quarantine destination {destination} is on another "
+                    f"filesystem than {source}; a rename cannot move it there and the "
+                    "installer never copies a legacy object"
+                )
+            if _stat_at(destination_fd, destination.name) is not None:
+                raise InstallDriftError(
+                    f"legacy quarantine destination already exists: {destination}; "
+                    f"{source} was left in place"
+                )
+            try:
+                _renameat2_noreplace(
+                    source_fd, source.name, destination_fd, destination.name
+                )
+            except FileExistsError as exc:
+                raise InstallDriftError(
+                    f"legacy quarantine destination already exists: {destination}; "
+                    f"{source} was left in place"
+                ) from exc
+            except OSError as exc:
+                raise _rename_failure(exc, source, destination) from exc
+            os.fsync(destination_fd)
+            os.fsync(source_fd)
+            moved = _stat_at(destination_fd, destination.name)
+            if moved is None or (moved.st_dev, moved.st_ino) != (
+                expected["dev"],
+                expected["ino"],
+            ):
+                raise InstallDriftError(
+                    f"legacy quarantine moved an object that is not the inventoried "
+                    f"inode: {destination}"
+                )
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+    return _legacy_quarantine_state(step)
+
+
+def _legacy_quarantine_restore(entry: Mapping[str, object]) -> None:
+    """Move a quarantined object back to its original path, never over anything."""
+
+    step = entry.get("step")
+    prior = entry.get("prior")
+    if not isinstance(step, Mapping) or not isinstance(prior, Mapping):
+        raise InstallError("invalid legacy quarantine rollback entry")
+    source, destination, root = _quarantine_layout(step)
+    destination_fd = _open_quarantine_chain(destination.parent, root, create=False)
+    if destination_fd is None:
+        raise InstallDriftError(f"quarantined object is missing: {destination}")
+    try:
+        moved = _stat_at(destination_fd, destination.name)
+        if (
+            moved is None
+            or _file_type_name(moved.st_mode) != prior.get("type")
+            or (moved.st_dev, moved.st_ino) != (prior.get("dev"), prior.get("ino"))
+        ):
+            raise InstallDriftError(
+                f"quarantined object does not match its prior inode: {destination}"
+            )
+        try:
+            source_fd = _open_directory_chain(source.parent)
+        except FileNotFoundError as exc:
+            raise InstallDriftError(
+                f"the original parent of {source} is gone; the legacy object stays "
+                f"in quarantine at {destination}"
+            ) from exc
+        try:
+            occupied = (
+                f"original path is occupied: {source}; the legacy object stays in "
+                f"quarantine at {destination}"
+            )
+            if _stat_at(source_fd, source.name) is not None:
+                raise InstallDriftError(occupied)
+            try:
+                _renameat2_noreplace(
+                    destination_fd, destination.name, source_fd, source.name
+                )
+            except FileExistsError as exc:
+                raise InstallDriftError(occupied) from exc
+            except OSError as exc:
+                raise _rename_failure(exc, destination, source) from exc
+            os.fsync(source_fd)
+            os.fsync(destination_fd)
+            restored = _stat_at(source_fd, source.name)
+            if restored is None or (restored.st_dev, restored.st_ino) != (
+                prior.get("dev"),
+                prior.get("ino"),
+            ):
+                raise InstallDriftError(
+                    f"restored object is not the quarantined inode: {source}"
+                )
+        finally:
+            os.close(source_fd)
+    finally:
+        os.close(destination_fd)
+
+
 class LocalInstallBackend:
     """Real Linux implementation; construction itself enforces the root boundary."""
 
@@ -1956,6 +2470,8 @@ class LocalInstallBackend:
         return _venv_activation_state(step)
 
     def inspect_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        if step.get("kind") == "legacy-quarantine":
+            return _legacy_quarantine_state(step)
         if step.get("kind") == "account":
             return _account_state(step)
         if step.get("kind") == "venv":
@@ -2030,6 +2546,8 @@ class LocalInstallBackend:
         )
 
     def apply_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        if step.get("kind") == "legacy-quarantine":
+            return _legacy_quarantine_move(step)
         return self._apply_step(
             step,
             expected_prior=None,
@@ -2042,6 +2560,8 @@ class LocalInstallBackend:
         expected_prior: Mapping[str, object],
         creation_checkpoint: Callable[[Mapping[str, object]], None],
     ) -> Mapping[str, object]:
+        if step.get("kind") == "legacy-quarantine":
+            return _legacy_quarantine_move(step)
         return self._apply_step(
             step,
             expected_prior=expected_prior,
@@ -2973,6 +3493,9 @@ class LocalInstallBackend:
         prior = entry.get("prior", {})
         if not isinstance(step, Mapping) or not isinstance(prior, Mapping):
             raise InstallError("invalid rollback journal entry")
+        if step.get("kind") == "legacy-quarantine":
+            _legacy_quarantine_restore(entry)
+            return
         if step.get("kind") == "account":
             # Service accounts are intentionally retained. Deleting an account
             # safely requires a host-wide owned-file/process proof that the
@@ -3219,6 +3742,35 @@ class LocalInstallBackend:
                 and isinstance(step.get("path"), str)
             ):
                 managed_paths.add(Path(str(step["path"])))
+        # A legacy object rollback moved back out of quarantine is managed
+        # state of its own entry: a directory step that was created in its
+        # place (or below it) must not report the restored legacy content as
+        # unknown -- but only while that path is the quarantined inode.
+        quarantine_sources: dict[Path, tuple[object, object]] = {}
+        for entry in journal_rows:
+            step = entry.get("step") if isinstance(entry, Mapping) else None
+            expected = step.get("expected") if isinstance(step, Mapping) else None
+            if (
+                isinstance(step, Mapping)
+                and step.get("kind") == "legacy-quarantine"
+                and isinstance(step.get("path"), str)
+                and isinstance(expected, Mapping)
+            ):
+                quarantine_sources[Path(str(step["path"]))] = (
+                    expected.get("dev"),
+                    expected.get("ino"),
+                )
+
+        def is_restored_quarantine_source(path: Path) -> bool:
+            for source, identity in quarantine_sources.items():
+                if path != source and source not in path.parents:
+                    continue
+                try:
+                    observed = source.lstat()
+                except OSError:
+                    return False
+                return (observed.st_dev, observed.st_ino) == identity
+            return False
 
         def is_managed_inventory_path(candidate: Path, container: Path) -> bool:
             return any(
@@ -3245,6 +3797,8 @@ class LocalInstallBackend:
                 path = Path(str(step.get("path", "")))
                 try:
                     if not prior.get("exists"):
+                        if is_restored_quarantine_source(path):
+                            continue
                         if path.is_symlink() or (path.exists() and not path.is_dir()):
                             retained.append(str(path))
                         elif path.is_dir():

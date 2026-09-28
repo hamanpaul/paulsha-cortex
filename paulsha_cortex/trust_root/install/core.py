@@ -18,10 +18,21 @@ import uuid
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Mapping,
+    MutableMapping,
+    Protocol,
+    Sequence,
+)
 from urllib.parse import parse_qsl, urlsplit
 
 from .. import permgen, registry
+
+if TYPE_CHECKING:  # the legacy module builds on this one
+    from .legacy import LegacyApplyContext, LegacyHostBackend
 
 
 class InstallError(RuntimeError):
@@ -1818,6 +1829,64 @@ class PreflightReport:
         return {"ok": self.ok, "failures": [dict(row) for row in self.failures]}
 
 
+_LEGACY_ADOPTION_SOURCE = "legacy-inventory"
+_QUARANTINE_STEP_KIND = "legacy-quarantine"
+
+
+def _legacy_adoption_matches(
+    entry: Mapping[str, object], plan: Mapping[str, object]
+) -> bool:
+    """The entry adopted an existing object the plan's reviewed inventory binds.
+
+    ``adoption`` must name exactly the inventory row digest the plan's
+    ``legacy_adoption.adopted`` records for this step.  It can never be
+    combined with -- or pose as -- ``adopted_from_receipt``.
+    """
+
+    adoption = entry.get("adoption")
+    if adoption is None:
+        return False
+    block = plan.get("legacy_adoption") if isinstance(plan, Mapping) else None
+    adopted = block.get("adopted") if isinstance(block, Mapping) else None
+    prior = entry.get("prior")
+    return bool(
+        isinstance(adoption, Mapping)
+        and set(adoption) == {"source", "row_sha256"}
+        and adoption.get("source") == _LEGACY_ADOPTION_SOURCE
+        and _valid_sha256(adoption.get("row_sha256"))
+        and isinstance(adopted, Mapping)
+        and adopted.get(entry.get("step_id")) == adoption.get("row_sha256")
+        and entry.get("adopted_from_receipt") is not True
+        and isinstance(prior, Mapping)
+        and prior.get("exists") is True
+    )
+
+
+def _entry_adopted(entry: Mapping[str, object], plan: Mapping[str, object]) -> bool:
+    """The entry took over an existing object: by receipt or by legacy row."""
+
+    return entry.get("adopted_from_receipt") is True or _legacy_adoption_matches(
+        entry, plan
+    )
+
+
+def _entry_has_adoption_provenance(
+    entry: Mapping[str, object], plan: Mapping[str, object]
+) -> bool:
+    """The one provenance predicate for the object behind a journal entry.
+
+    The object was created by the transaction (prior absent), carried forward
+    from a receipt (``adopted_from_receipt``), or adopted from the plan-bound
+    legacy inventory row (``adoption``).  The two adoption sources stay
+    distinguishable in the receipt.
+    """
+
+    prior = entry.get("prior")
+    if not isinstance(prior, Mapping):
+        return False
+    return prior.get("exists") is False or _entry_adopted(entry, plan)
+
+
 def _account_has_receipt_provenance(
     *,
     plan: Mapping[str, object],
@@ -1858,16 +1927,11 @@ def _account_has_receipt_provenance(
         for entry in entries:
             if not isinstance(entry, Mapping):
                 continue
-            prior = entry.get("prior")
             if (
                 entry.get("step_id") == planned_step.get("step_id")
                 and entry.get("step") == planned_step
                 and entry.get("status") in {"prepared", "completed"}
-                and isinstance(prior, Mapping)
-                and (
-                    prior.get("exists") is False
-                    or entry.get("adopted_from_receipt") is True
-                )
+                and _entry_has_adoption_provenance(entry, plan)
             ):
                 return True
     return False
@@ -1914,7 +1978,7 @@ def _account_group_has_receipt_provenance(
                     prior.get("exists") is False
                     and prior.get("group_exists") is False
                 )
-                or entry.get("adopted_from_receipt") is True
+                or _entry_adopted(entry, plan)
             )
         ):
             return True
@@ -1947,6 +2011,25 @@ def validate_prior_receipt_handoff(
         raise InstallPlanError(
             "prior receipt must identify a different plan; replay the current receipt instead"
         )
+    if "legacy_adoption" in plan:
+        raise InstallPlanError(
+            "--legacy-inventory and --prior-receipt are mutually exclusive: a legacy "
+            "adoption plan never hands off from a prior receipt"
+        )
+    prior_block = prior_plan.get("legacy_adoption")
+    if prior_block is not None:
+        # An adoption receipt proves its adopted objects by legacy rows; those
+        # rows count only while the receipt carries the apply gate's record.
+        record = document.get("legacy_adoption")
+        if (
+            not isinstance(prior_block, Mapping)
+            or not isinstance(record, Mapping)
+            or record.get("inventory_sha256") != prior_block.get("inventory_sha256")
+            or record.get("apply_inventory_sha256") != prior_block.get("inventory_sha256")
+        ):
+            raise InstallPlanError(
+                "prior adoption receipt lacks its legacy adoption provenance record"
+            )
     for field in ("scheme", "instance", "roots"):
         if prior_plan.get(field) != plan.get(field):
             label = "install root" if field == "roots" else field
@@ -2087,7 +2170,8 @@ def _step_has_receipt_provenance(
     therefore not adopt an unrelated asset or repository merely because it
     happens to match.  A prior prepared/completed entry whose original state
     was absent proves creation by this receipt.  Later reinstall cycles carry
-    that proof forward with ``adopted_from_receipt``.
+    that proof forward with ``adopted_from_receipt``; a legacy adoption carries
+    it as the plan-bound inventory row (``adoption``).
     """
 
     document = receipt.to_dict()
@@ -2105,13 +2189,11 @@ def _step_has_receipt_provenance(
                 entry.get("step_id") == step.get("step_id")
                 and entry.get("step") == step
                 and entry.get("status") in {"prepared", "completed"}
+                and _entry_has_adoption_provenance(entry, plan)
                 and isinstance(prior, Mapping)
                 and (
                     prior.get("exists") is False
-                    or (
-                        entry.get("adopted_from_receipt") is True
-                        and entry.get("adopted_mount_root") is None
-                    )
+                    or entry.get("adopted_mount_root") is None
                 )
             ):
                 return True
@@ -2152,13 +2234,84 @@ def _mount_adoption_authority_from_receipt(
     return None
 
 
+def _legacy_account_row_problems(
+    row: Mapping[str, object],
+    *,
+    desired: Mapping[str, object],
+    observed: Mapping[str, object],
+    groups: Mapping[object, object],
+    uid_owners: Mapping[object, object],
+    group_names_by_gid: Mapping[object, object],
+    primary_gid_users: Mapping[object, object],
+) -> list[str]:
+    """Which fields of a reviewed legacy account row the host no longer matches."""
+
+    name = str(desired.get("name"))
+    uid = desired.get("uid")
+    gid = desired.get("gid")
+    problems: list[str] = []
+    passwd = {
+        "uid": uid,
+        "gid": gid,
+        "home": desired.get("home"),
+        "shell": desired.get("shell"),
+    }
+    if row.get("name") != name or row.get("passwd") != passwd or any(
+        observed.get(key) != value for key, value in passwd.items()
+    ):
+        problems.append("passwd")
+    group = groups.get(name)
+    live_group = (
+        {
+            "name": name,
+            "gid": group.get("gid"),
+            "members": sorted(set(group.get("members") or [])),  # type: ignore[arg-type]
+        }
+        if isinstance(group, Mapping)
+        else None
+    )
+    if row.get("group") != live_group:
+        problems.append("group")
+    if row.get("supplementary_groups") != observed.get("supplementary_groups"):
+        problems.append("supplementary groups")
+    if row.get("password_locked") is not True or observed.get("password_locked") is not True:
+        problems.append("password lock")
+    if row.get("uid_holders") != {str(uid): [name]} or uid_owners.get(uid) != name:
+        problems.append("uid holders")
+    if (
+        row.get("gid_holders") != {str(gid): {"groups": [name], "primary_users": [name]}}
+        or group_names_by_gid.get(gid) != [name]
+        or primary_gid_users.get(gid) != [name]
+    ):
+        problems.append("gid holders")
+    return problems
+
+
+def _covered_by(path: object, covered: Sequence[str]) -> bool:
+    return isinstance(path, str) and any(
+        path == root or path.startswith(root.rstrip("/") + "/") for root in covered
+    )
+
+
 def validate_preflight(
     plan: Mapping[str, object],
     facts: Mapping[str, object],
     *,
     receipt: "InstallReceipt | None" = None,
     prior_receipt: "InstallReceipt | None" = None,
+    legacy_accounts: Mapping[str, Mapping[str, object]] | None = None,
+    covered_paths: Sequence[str] = (),
 ) -> PreflightReport:
+    """Refuse an unsafe host before any mutation.
+
+    ``legacy_accounts`` (reviewed inventory rows of adopted legacy accounts)
+    only adds provenance for an existing account whose row still matches the
+    host field by field; every collision check still applies first.
+    ``covered_paths`` are legacy objects a pending ``legacy-quarantine`` step
+    moves away before any step writes at or below them, so their current
+    (legacy) shape is not the managed path's.
+    """
+
     if prior_receipt is not None:
         validate_prior_receipt_handoff(plan, prior_receipt)
     failures: list[dict[str, str]] = []
@@ -2294,6 +2447,23 @@ def validate_preflight(
             desired=desired,
             prior_receipt=prior_receipt,
         )
+        legacy_row = (legacy_accounts or {}).get(name)
+        if not account_provenance and isinstance(legacy_row, Mapping):
+            problems = _legacy_account_row_problems(
+                legacy_row,
+                desired=desired,
+                observed=observed,
+                groups=observed_groups,
+                uid_owners=observed_uids,
+                group_names_by_gid=observed_group_names_by_gid,
+                primary_gid_users=observed_primary_gid_users,
+            )
+            if problems:
+                raise AccountCollisionError(
+                    f"existing account {name} does not match its legacy inventory "
+                    f"row: {', '.join(problems)}"
+                )
+            account_provenance = True
         if not account_provenance:
             raise AccountCollisionError(
                 f"existing account {name} lacks trusted prior receipt provenance"
@@ -2332,10 +2502,15 @@ def validate_preflight(
     if not isinstance(observed_paths, Mapping):
         observed_paths = {}
     symlinked: list[str] = []
+    covered = tuple(str(path) for path in covered_paths)
     for step in plan.get("apply_order", []):
         if not isinstance(step, Mapping):
             raise InstallPlanError("apply_order entries must be typed objects")
         path = step.get("path")
+        if step.get("kind") == _QUARANTINE_STEP_KIND or _covered_by(path, covered):
+            # The quarantine step verifies its own source; a covered path is
+            # a legacy object that moves away before this step touches it.
+            continue
         observed = observed_paths.get(path, {})
         if not isinstance(observed, Mapping):
             continue
@@ -2748,6 +2923,7 @@ class InstallReceipt:
                     f"receipt rollback venv authority is invalid: {path}"
                 )
             rollback_seen.add(step_id)
+        _validate_receipt_legacy_provenance(payload, plan, planned_steps, path)
         credentials = payload.get("credentials")
         if not isinstance(credentials, list) or any(
             not isinstance(row, Mapping)
@@ -2874,6 +3050,102 @@ class InstallReceipt:
         )
         receipt._externalize_legacy_inventories()
         return receipt
+
+
+_RECEIPT_LEGACY_KEYS = frozenset(
+    {
+        "inventory_sha256",
+        "inventory_path",
+        "host_binding_sha256",
+        "quarantine_root",
+        "apply_inventory_sha256",
+    }
+)
+_QUARANTINE_PRIOR_KEYS = ("type", "uid", "gid", "mode", "dev", "ino")
+_QUARANTINE_ENTRY_KEYS = frozenset(
+    {"step_id", "step", "status", "prior", "quarantine_authority"}
+)
+
+
+def _quarantine_step_expected(step: Mapping[str, object]) -> Mapping[str, object]:
+    expected = step.get("expected")
+    if not isinstance(expected, Mapping):
+        raise InstallPlanError(
+            f"legacy quarantine step lacks its expected state: {step.get('step_id')}"
+        )
+    return expected
+
+
+def _quarantine_prior(step: Mapping[str, object]) -> dict[str, object]:
+    """The durable prior of a quarantine entry: the inventoried lstat and inode."""
+
+    expected = _quarantine_step_expected(step)
+    return {"exists": True, **{key: expected.get(key) for key in _QUARANTINE_PRIOR_KEYS}}
+
+
+def _quarantine_authority(step: Mapping[str, object]) -> dict[str, object]:
+    """What a quarantine entry may move: this inode, to this destination only."""
+
+    expected = _quarantine_step_expected(step)
+    return {
+        "source": {"dev": expected.get("dev"), "ino": expected.get("ino")},
+        "destination": step.get("destination"),
+    }
+
+
+def _validate_receipt_legacy_provenance(
+    payload: Mapping[str, object],
+    plan: Mapping[str, object],
+    planned_steps: Mapping[str, object],
+    path: Path,
+) -> None:
+    """Bind the receipt's legacy adoption record and entries to its embedded plan."""
+
+    block = plan.get("legacy_adoption")
+    record = payload.get("legacy_adoption")
+    entries = [
+        entry
+        for field in ("journal", "rollback_journal")
+        for entry in (payload.get(field) or [])  # type: ignore[union-attr]
+        if isinstance(entry, Mapping)
+    ]
+    if record is not None:
+        inventory_path = record.get("inventory_path") if isinstance(record, Mapping) else None
+        if (
+            not isinstance(block, Mapping)
+            or not isinstance(record, Mapping)
+            or set(record) != _RECEIPT_LEGACY_KEYS
+            or record.get("inventory_sha256") != block.get("inventory_sha256")
+            or record.get("apply_inventory_sha256") != block.get("inventory_sha256")
+            or record.get("host_binding_sha256") != block.get("host_binding_sha256")
+            or record.get("quarantine_root") != block.get("quarantine_root")
+            or not _is_safe_absolute_plan_path(inventory_path)
+            or "\x00" in str(inventory_path)
+        ):
+            raise InstallError(f"receipt legacy adoption record is invalid: {path}")
+    elif block is not None and entries:
+        raise InstallError(
+            "receipt of a legacy adoption plan carries journal authority without "
+            f"its legacy adoption record: {path}"
+        )
+    for entry in entries:
+        step = planned_steps.get(str(entry.get("step_id")))
+        if "adoption" in entry and (
+            record is None or not _legacy_adoption_matches(entry, plan)
+        ):
+            raise InstallError(
+                f"receipt journal legacy adoption provenance is invalid: {path}"
+            )
+        if isinstance(step, Mapping) and step.get("kind") == _QUARANTINE_STEP_KIND:
+            if (
+                record is None
+                or set(entry) != _QUARANTINE_ENTRY_KEYS
+                or entry.get("prior") != _quarantine_prior(step)
+                or entry.get("quarantine_authority") != _quarantine_authority(step)
+            ):
+                raise InstallError(f"receipt legacy quarantine authority is invalid: {path}")
+        elif "quarantine_authority" in entry:
+            raise InstallError(f"receipt legacy quarantine authority is invalid: {path}")
 
 
 def _validate_receipt_parent(observed: os.stat_result, path: Path) -> None:
@@ -3892,13 +4164,6 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
     return typed_steps
 
 
-_LEGACY_APPLY_NOT_IMPLEMENTED = (
-    "legacy adoption apply is not implemented yet (#1122): this installer can "
-    "plan a legacy_adoption block for review but refuses to lease, apply or "
-    "recover it until the apply, receipt and rollback support lands"
-)
-
-
 def validate_apply_plan(
     plan: Mapping[str, object], *, confirm_sha256: str
 ) -> tuple[Mapping[str, object], ...]:
@@ -3922,10 +4187,7 @@ def validate_apply_plan(
         allowed_field_paths=frozenset(allowed_field_paths),
         subject="plan",
     )
-    steps = tuple(_validate_apply_plan_schema(plan))
-    if "legacy_adoption" in plan:
-        raise InstallPlanError(_LEGACY_APPLY_NOT_IMPLEMENTED)
-    return steps
+    return tuple(_validate_apply_plan_schema(plan))
 
 
 def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
@@ -4122,13 +4384,14 @@ def _prepared_leaf_has_rollback_authority(
     step: Mapping[str, object],
     entry: Mapping[str, object],
     installed: Mapping[str, object],
+    plan: Mapping[str, object] | None = None,
 ) -> bool:
     prior = entry.get("prior")
     if not isinstance(prior, Mapping):
         return False
     if (
         prior.get("exists") is True
-        and entry.get("adopted_from_receipt") is True
+        and _entry_adopted(entry, plan or {})
         and step.get("kind") in {"asset", "repository"}
     ):
         # Atomic file/symlink replacement binds the old inode before mutation.
@@ -4669,10 +4932,20 @@ def _validate_venv_cutover_authority(
     candidate_binding: Mapping[str, object] | None = None,
     prior_receipt: InstallReceipt | None,
     backend: InstallBackend,
+    activation_covered: bool = False,
 ) -> tuple[bool, dict[str, object] | None]:
-    """Validate a venv link replacement before any earlier step can mutate."""
+    """Validate a venv link replacement before any earlier step can mutate.
 
-    activation = _inspect_venv_activation(backend=backend, step=step)
+    ``activation_covered`` means a pending legacy quarantine moves the object
+    at the active link away first: the link is then expected to be absent and
+    the legacy object there is never inspected.
+    """
+
+    activation = (
+        {"exists": False}
+        if activation_covered
+        else _inspect_venv_activation(backend=backend, step=step)
+    )
     prior_provenance, _prior_step = _prior_venv_provenance(
         plan=plan,
         step=step,
@@ -4786,6 +5059,8 @@ def _validate_managed_step_provenance_before_apply(
     receipt: InstallReceipt,
     prior_receipt: InstallReceipt | None,
     backend: InstallBackend,
+    legacy: "LegacyApplyContext | None" = None,
+    covered: Sequence[str] = (),
 ) -> None:
     """Reject late managed-filesystem drift before the transaction mutates.
 
@@ -4794,6 +5069,11 @@ def _validate_managed_step_provenance_before_apply(
     existing object is foreign.  Sweep assets, repositories, toolchains, and
     the venv cutover first; the apply loop still re-inspects each step
     immediately before use.
+
+    A step at or below a pending legacy quarantine (``covered``) is fresh:
+    the legacy object there moves away first and is never inspected as the
+    managed object.  An adopted legacy object (``legacy``) is proven by its
+    live inventory row.
     """
 
     prior_plan = (
@@ -4804,6 +5084,8 @@ def _validate_managed_step_provenance_before_apply(
     for step in steps:
         kind = step.get("kind")
         if kind not in {"account", "asset", "repository", "toolchain", "venv"}:
+            continue
+        if _covered_by(step.get("path"), covered):
             continue
         installed = dict(backend.inspect_step(step))
         if kind == "account":
@@ -4841,7 +5123,12 @@ def _validate_managed_step_provenance_before_apply(
                 prior_receipt=prior_receipt,
                 group_only=group_only,
             )
-            if not (current_provenance or prior_provenance):
+            legacy_provenance = bool(
+                not group_only
+                and legacy is not None
+                and legacy.adoption_record(step) is not None
+            )
+            if not (current_provenance or prior_provenance or legacy_provenance):
                 label = "group" if group_only else "account"
                 raise AccountCollisionError(
                     f"existing {label} lacks trusted prior receipt provenance: "
@@ -4861,6 +5148,7 @@ def _validate_managed_step_provenance_before_apply(
                 candidate_binding=binding,
                 prior_receipt=prior_receipt,
                 backend=backend,
+                activation_covered=_covered_by(step.get("active_link"), covered),
             )
             continue
         if installed.get("exists") is not True:
@@ -4888,9 +5176,26 @@ def _validate_managed_step_provenance_before_apply(
                     step=step,
                     entry=current_entry,
                     installed=installed,
+                    plan=plan,
                 )
             ):
                 continue
+        if (
+            legacy is not None
+            and kind == "asset"
+            and (current_entry is None or current_entry.get("status") == "prepared")
+            and legacy.adoption_record(step) is not None
+        ):
+            # The reviewed legacy object is still exactly its inventory row:
+            # adopted as it is, or its own metadata replaced in place.
+            if not _state_matches(step, installed) and not callable(
+                getattr(backend, "replace_step_checkpointed", None)
+            ):
+                raise InstallDriftError(
+                    "backend cannot replace an adopted legacy object before "
+                    f"transaction mutation: {step.get('step_id')}"
+                )
+            continue
         current_matches = _state_matches(step, installed)
         current_provenance = bool(
             current_matches
@@ -4996,6 +5301,237 @@ def _assert_inventory_store_outside_managed_directories(
         )
 
 
+def _pending_quarantine_paths(
+    steps: Sequence[Mapping[str, object]], receipt: InstallReceipt
+) -> tuple[str, ...]:
+    """Sources of legacy quarantine steps this receipt has not completed yet."""
+
+    journal = receipt._document.get("journal")
+    done = {
+        str(entry.get("step_id"))
+        for entry in (journal if isinstance(journal, list) else [])
+        if isinstance(entry, Mapping) and entry.get("status") == "completed"
+    }
+    return tuple(
+        str(step["path"])
+        for step in steps
+        if step.get("kind") == _QUARANTINE_STEP_KIND
+        and isinstance(step.get("path"), str)
+        and str(step.get("step_id")) not in done
+    )
+
+
+def _quarantine_moved(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
+    """The source is gone and the destination holds the inventoried inode."""
+
+    expected = _quarantine_step_expected(step)
+    destination = state.get("destination")
+    return bool(
+        state.get("exists") is False
+        and state.get("source") is None
+        and isinstance(destination, Mapping)
+        and destination.get("type") == expected.get("type")
+        and destination.get("dev") == expected.get("dev")
+        and destination.get("ino") == expected.get("ino")
+    )
+
+
+def _quarantine_in_place(prior: object, state: Mapping[str, object]) -> bool:
+    """The inventoried inode is (back) at its original path."""
+
+    source = state.get("source")
+    return bool(
+        isinstance(prior, Mapping)
+        and isinstance(source, Mapping)
+        and source.get("type") == prior.get("type")
+        and source.get("dev") == prior.get("dev")
+        and source.get("ino") == prior.get("ino")
+    )
+
+
+def _quarantine_source_problem(
+    step: Mapping[str, object], state: Mapping[str, object]
+) -> str | None:
+    """Why a quarantine step may not move its source now (``None``: it may)."""
+
+    expected = _quarantine_step_expected(step)
+    path = step.get("path")
+    destination = step.get("destination")
+    source = state.get("source")
+    if not isinstance(source, Mapping):
+        return f"legacy quarantine source is missing: {path}"
+    changed = sorted(key for key in expected if source.get(key) != expected[key])
+    if changed:
+        return (
+            f"legacy quarantine source changed since the inventory: {path} "
+            f"({', '.join(changed)})"
+        )
+    if state.get("destination") is not None:
+        return f"legacy quarantine destination already exists: {destination}"
+    chain = state.get("destination_chain")
+    if chain is not None:
+        return f"legacy quarantine destination chain is unsafe: {chain}"
+    if state.get("destination_device") != expected.get("dev"):
+        return (
+            f"legacy quarantine destination {destination} is on another filesystem "
+            f"than {path}; a rename cannot move it and the installer never copies "
+            "a legacy object"
+        )
+    return None
+
+
+def _validate_quarantine_steps_before_apply(
+    *,
+    steps: Sequence[Mapping[str, object]],
+    receipt: InstallReceipt,
+    backend: InstallBackend,
+) -> None:
+    """Prove every legacy quarantine can still move its exact source, or has."""
+
+    journal = receipt._document.get("journal")
+    entries = {
+        str(entry.get("step_id")): entry
+        for entry in (journal if isinstance(journal, list) else [])
+        if isinstance(entry, Mapping)
+    }
+    for step in steps:
+        if step.get("kind") != _QUARANTINE_STEP_KIND:
+            continue
+        entry = entries.get(str(step.get("step_id")))
+        state = dict(backend.inspect_step(step))
+        status = entry.get("status") if isinstance(entry, Mapping) else None
+        if status == "completed":
+            if not _quarantine_moved(step, state):
+                raise InstallDriftError(
+                    f"completed legacy quarantine drifted: {step.get('path')} is not "
+                    f"(only) the quarantined inode at {step.get('destination')}"
+                )
+            continue
+        if status == "prepared" and _quarantine_moved(step, state):
+            continue
+        problem = _quarantine_source_problem(step, state)
+        if problem is not None:
+            raise InstallDriftError(problem)
+
+
+def _apply_legacy_quarantine(
+    *,
+    step: Mapping[str, object],
+    receipt: InstallReceipt,
+    journal: list[object],
+    completed: dict[str, Mapping[str, object]],
+    backend: InstallBackend,
+) -> None:
+    """Prepared entry, then one ``renameat2(RENAME_NOREPLACE)``, then completed.
+
+    Replay: a prepared entry whose source is gone and whose destination is the
+    recorded inode completes without a second move; one whose source is still
+    the untouched inventoried object moves it; anything else is drift.
+    """
+
+    step_id = str(step.get("step_id"))
+    entry = completed.get(step_id)
+    state = dict(backend.inspect_step(step))
+    if isinstance(entry, dict):
+        if entry.get("status") == "completed":
+            if _quarantine_moved(step, state):
+                return
+            raise InstallDriftError(f"completed legacy quarantine drifted: {step_id}")
+        if _quarantine_moved(step, state):
+            entry["status"] = "completed"
+            receipt._persist()
+            return
+        problem = _quarantine_source_problem(step, state)
+        if problem is not None:
+            raise InstallDriftError(f"prepared legacy quarantine cannot be replayed: {problem}")
+    else:
+        problem = _quarantine_source_problem(step, state)
+        if problem is not None:
+            raise InstallDriftError(problem)
+        entry = {
+            "step_id": step_id,
+            "step": deepcopy(dict(step)),
+            "status": "prepared",
+            "prior": _quarantine_prior(step),
+            "quarantine_authority": _quarantine_authority(step),
+        }
+        journal.append(entry)
+        completed[step_id] = entry
+        receipt._persist()
+    # The prepared entry is durable before the move and stays if the move
+    # fails: rollback then proves by inode whether anything moved.
+    backend.apply_step(step)
+    if not _quarantine_moved(step, dict(backend.inspect_step(step))):
+        raise InstallDriftError(f"legacy quarantine did not reach its destination: {step_id}")
+    entry["status"] = "completed"
+    receipt._persist()
+
+
+def _legacy_apply_authority(
+    *,
+    plan: Mapping[str, object],
+    receipt: InstallReceipt,
+    prior_receipt: InstallReceipt | None,
+    legacy: "LegacyApplyContext | None",
+) -> dict[str, object] | None:
+    """Admit a legacy adoption apply; return the gate record to persist, if any.
+
+    ``--legacy-inventory`` and ``--prior-receipt`` are mutually exclusive, and
+    a plan with a ``legacy_adoption`` block requires the reviewed inventory.
+    Before the receipt leaves ``planned`` (or a proven ``rolled-back``) the
+    host is re-captured and must equal the plan-bound inventory; a replay of
+    an ``applying`` receipt relies on the record that gate left.
+    """
+
+    block = plan.get("legacy_adoption")
+    if block is None:
+        if legacy is not None:
+            raise InstallPlanError(
+                "--legacy-inventory is accepted only for a plan that carries a "
+                "legacy_adoption block"
+            )
+        return None
+    if prior_receipt is not None:
+        raise InstallPlanError(
+            "--legacy-inventory and --prior-receipt are mutually exclusive: a legacy "
+            "adoption plan never hands off from a prior receipt"
+        )
+    if legacy is None:
+        raise InstallPlanError(
+            "this plan carries a legacy_adoption block; apply requires "
+            "--legacy-inventory with the reviewed inventory it binds"
+        )
+    if canonical_plan_bytes(legacy.plan) != canonical_plan_bytes(plan):
+        raise InstallPlanError("the legacy inventory context is bound to another plan")
+    quarantine_root = block.get("quarantine_root") if isinstance(block, Mapping) else None
+    if receipt.path is not None and isinstance(quarantine_root, str):
+        receipt_parent = str(receipt.path.parent)
+        root = quarantine_root.rstrip("/")
+        if (
+            receipt_parent == root
+            or receipt_parent.startswith(root + "/")
+            or root.startswith(receipt_parent.rstrip("/") + "/")
+        ):
+            raise InstallPlanError(
+                f"receipt {receipt.path} overlaps the legacy quarantine root {quarantine_root}"
+            )
+    state = receipt._document.get("state")
+    if state in {"planned", "rolled-back"}:
+        return legacy.apply_gate()
+    record = receipt._document.get("legacy_adoption")
+    if state in {"applying", "applied"}:
+        if not isinstance(record, Mapping) or record.get(
+            "apply_inventory_sha256"
+        ) != block.get("inventory_sha256"):
+            raise InstallDriftError(
+                "legacy adoption replay lacks the apply gate record of its first run"
+            )
+        return None
+    raise InstallDriftError(
+        f"legacy adoption apply refuses a receipt in state {state}; finish its rollback first"
+    )
+
+
 def apply_plan(
     plan: Mapping[str, object],
     *,
@@ -5003,19 +5539,27 @@ def apply_plan(
     receipt: InstallReceipt,
     prior_receipt: InstallReceipt | None = None,
     backend: InstallBackend,
+    legacy: "LegacyApplyContext | None" = None,
 ) -> InstallReceipt:
     expected_hash = plan_sha256(plan)
     steps = validate_apply_plan(plan, confirm_sha256=confirm_sha256)
     if receipt._document.get("plan_sha256") != expected_hash:
         raise InstallPlanError("confirm-sha256 does not match the canonical plan sha256")
+    # Legacy adoption: every check below runs before the first mutation.
+    legacy_record = _legacy_apply_authority(
+        plan=plan, receipt=receipt, prior_receipt=prior_receipt, legacy=legacy
+    )
     if prior_receipt is not None:
         validate_prior_receipt_handoff(plan, prior_receipt)
+    covered = _pending_quarantine_paths(steps, receipt)
     facts = backend.preflight_facts(plan)
     report = validate_preflight(
         plan,
         facts,
         receipt=receipt,
         prior_receipt=prior_receipt,
+        legacy_accounts=legacy.adopted_account_rows() if legacy is not None else None,
+        covered_paths=covered,
     )
     if not report.ok:
         details = "; ".join(row["detail"] for row in report.failures)
@@ -5024,14 +5568,19 @@ def apply_plan(
         steps=steps, receipt=receipt, backend=backend
     )
 
+    _validate_quarantine_steps_before_apply(steps=steps, receipt=receipt, backend=backend)
     _validate_managed_step_provenance_before_apply(
         plan=plan,
         steps=steps,
         receipt=receipt,
         prior_receipt=prior_receipt,
         backend=backend,
+        legacy=legacy,
+        covered=covered,
     )
 
+    if legacy_record is not None:
+        receipt._document["legacy_adoption"] = legacy_record
     receipt._document["state"] = "applying"
     receipt._persist()
     journal = receipt._document.get("journal")
@@ -5040,6 +5589,15 @@ def apply_plan(
     completed = {str(row.get("step_id")): row for row in journal if isinstance(row, Mapping)}
     for step in steps:
         step_id = str(step.get("step_id"))
+        if step.get("kind") == _QUARANTINE_STEP_KIND:
+            _apply_legacy_quarantine(
+                step=step,
+                receipt=receipt,
+                journal=journal,
+                completed=completed,
+                backend=backend,
+            )
+            continue
         if step_id in completed:
             entry = completed[step_id]
             installed = backend.inspect_step(step)
@@ -5055,13 +5613,14 @@ def apply_plan(
                     if (
                         isinstance(prior, Mapping)
                         and prior.get("exists") is True
-                        and entry.get("adopted_from_receipt") is True
+                        and _entry_adopted(entry, plan)
                         and step.get("kind") in {"asset", "repository"}
                         and not _prepared_leaf_has_rollback_authority(
                             backend=backend,
                             step=step,
                             entry=entry,
                             installed=installed,
+                            plan=plan,
                         )
                     ):
                         raise InstallDriftError(
@@ -5103,6 +5662,7 @@ def apply_plan(
                         step=step,
                         entry=entry,
                         installed=installed,
+                        plan=plan,
                     ):
                         raise InstallDriftError(
                             "prepared install step lacks matching creation "
@@ -5121,6 +5681,15 @@ def apply_plan(
             adopted_mount_root: dict[str, int] | None = None
             replayed_mount_root = False
             prior_step: Mapping[str, object] | None = None
+            legacy_adoption: dict[str, str] | None = None
+            if (
+                legacy is not None
+                and prior.get("exists") is True
+                and step.get("kind") in {"account", "asset", "systemctl"}
+            ):
+                # An adopted legacy object whose live inventory row is still
+                # the reviewed one; recorded as such, never as a receipt.
+                legacy_adoption = legacy.adoption_record(step)
             if step.get("kind") == "venv":
                 receipt_entry, archived, binding = _receipt_venv_entry(
                     receipt=receipt, step=step
@@ -5142,7 +5711,11 @@ def apply_plan(
                         "active venv rollback authority is unavailable"
                     )
                 rollback_prior = activation_prior
-            if step.get("kind") == "account" and prior.get("exists") is True:
+            if (
+                step.get("kind") == "account"
+                and prior.get("exists") is True
+                and legacy_adoption is None
+            ):
                 desired = next(
                     (
                         row
@@ -5210,6 +5783,7 @@ def apply_plan(
             if (
                 step.get("kind") in {"asset", "repository", "toolchain"}
                 and prior.get("exists") is True
+                and legacy_adoption is None
             ):
                 current_receipt_provenance = (
                     _state_matches(step, prior)
@@ -5312,6 +5886,8 @@ def apply_plan(
                 entry["adopted_mount_root"] = adopted_mount_root
                 if replayed_mount_root:
                     entry["adopted_from_receipt"] = True
+            if legacy_adoption is not None:
+                entry["adoption"] = dict(legacy_adoption)
             inventory_binder = getattr(backend, "bind_rollback_inventory", None)
             if callable(inventory_binder):
                 # A directory prior carries only its descendant digest; the
@@ -5388,7 +5964,7 @@ def apply_plan(
             inspection_prior = entry.get("inspection_prior", entry.get("prior"))
             if (
                 step.get("kind") not in {"asset", "repository"}
-                or entry.get("adopted_from_receipt") is not True
+                or not _entry_adopted(entry, plan)
                 or not isinstance(inspection_prior, Mapping)
                 or inspection_prior.get("exists") is not True
                 or not _valid_creation_authority(authority, file_type=file_type)
@@ -5433,7 +6009,7 @@ def apply_plan(
                     f"install step changed after durable inspection: {step_id}"
                 )
             replacing = bool(
-                entry.get("adopted_from_receipt") is True
+                _entry_adopted(entry, plan)
                 and step.get("kind") in {"asset", "repository"}
                 and isinstance(inspection_prior, Mapping)
                 and inspection_prior.get("exists") is True
@@ -5539,13 +6115,19 @@ class RollbackReport:
     # ``not-required`` | ``completed`` | ``failed`` | ``pending``: whether the
     # rollback had to make systemd re-read restored or removed unit files.
     systemd_daemon_reload: str = "not-required"
+    # Legacy adoption only: whether a re-capture proved the host is back at
+    # the reviewed inventory's stable-field digest.  ``None`` otherwise.
+    legacy_restored: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "retained_unknown": list(self.retained_unknown),
             "retained_drift": [dict(row) for row in self.retained_drift],
             "systemd_daemon_reload": self.systemd_daemon_reload,
         }
+        if self.legacy_restored is not None:
+            payload["legacy_restored"] = self.legacy_restored
+        return payload
 
 
 # Durable receipt marker: a unit file or drop-in was (or may have been)
@@ -5555,9 +6137,13 @@ _SYSTEMD_RELOAD_STEP_ID = "systemd:daemon-reload"
 
 
 def _is_systemd_unit_step(plan: object, step: Mapping[str, object]) -> bool:
-    """Return whether rolling this step back changes systemd unit definitions."""
+    """Return whether rolling this step back changes systemd unit definitions.
 
-    if step.get("kind") != "asset":
+    A legacy quarantine below the systemd root counts too: moving a unit or
+    drop-in back changes what systemd must re-read.
+    """
+
+    if step.get("kind") not in {"asset", _QUARANTINE_STEP_KIND}:
         return False
     if str(step.get("step_id", "")).startswith("generated:units/"):
         return True
@@ -5613,12 +6199,69 @@ def _forget_activation_entry(
         raise
 
 
+def _rollback_legacy_quarantine(
+    *,
+    entry: Mapping[str, object],
+    step: Mapping[str, object],
+    backend: InstallBackend,
+    retained_drift: list[dict[str, object]],
+    forget: Callable[[Mapping[str, object]], None],
+    require_reload: Callable[[Mapping[str, object]], None],
+) -> None:
+    """Move one quarantined object back with ``RENAME_NOREPLACE``, or retain it.
+
+    A reoccupied original path, or a destination that no longer holds the
+    recorded inode, is retained drift: the object stays where it is.
+    """
+
+    step_id = entry.get("step_id")
+    prior = entry.get("prior")
+    try:
+        state = dict(backend.inspect_step(step))
+    except Exception as exc:
+        retained_drift.append({"step_id": step_id, "observed": {"error": str(exc)}})
+        return
+    if _quarantine_in_place(prior, state):
+        forget(entry)  # never moved, or already moved back
+        return
+    if not _quarantine_moved(step, state):
+        reason = (
+            "original path is occupied; the legacy object stays in quarantine"
+            if isinstance(state.get("source"), Mapping)
+            else "quarantine destination does not hold the recorded inode"
+        )
+        retained_drift.append({"step_id": step_id, "observed": {"error": reason, **state}})
+        return
+    require_reload(step)
+    try:
+        backend.rollback_step(entry)
+        restored = dict(backend.inspect_step(step))
+    except Exception as exc:
+        retained_drift.append({"step_id": step_id, "observed": {"error": str(exc)}})
+        return
+    if not _quarantine_in_place(prior, restored):
+        retained_drift.append({"step_id": step_id, "observed": restored})
+        return
+    forget(entry)
+
+
 def rollback_receipt(
-    receipt: InstallReceipt, *, backend: InstallBackend
+    receipt: InstallReceipt,
+    *,
+    backend: InstallBackend,
+    legacy_host: "LegacyHostBackend | None" = None,
 ) -> RollbackReport:
+    """Reverse the journal; for a legacy adoption, prove the legacy host is back.
+
+    ``legacy_host`` re-captures the reviewed inventory's scope after the
+    journal is reversed.  Without it (or on any mismatch) ``legacy_restored``
+    is false and the rollback is blocked: services stay stopped.
+    """
+
     journal = receipt._document.get("journal", [])
     if not isinstance(journal, list):
         raise InstallError("receipt journal is invalid")
+    legacy_record = receipt._document.get("legacy_adoption")
     retained_drift: list[dict[str, object]] = []
     service_stop_failures: list[str] = []
     activation_journal = _activation_entries(receipt)
@@ -5663,8 +6306,12 @@ def rollback_receipt(
             "retained_drift": retained_drift,
             "systemd_daemon_reload": reload_status,
         }
+        stopped_legacy: bool | None = None
+        if legacy_record is not None:
+            stopped_legacy = False
+            receipt._document["rollback"]["legacy_restored"] = False
         receipt._persist()
-        return RollbackReport((), tuple(retained_drift), reload_status)
+        return RollbackReport((), tuple(retained_drift), reload_status, stopped_legacy)
 
     if journal and receipt._document.get("state") != "rolling-back":
         # Archive the full authority before removing entries one by one.  A
@@ -5751,6 +6398,16 @@ def rollback_receipt(
         step = entry.get("step", entry)
         if not isinstance(step, Mapping):
             continue
+        if step.get("kind") == _QUARANTINE_STEP_KIND:
+            _rollback_legacy_quarantine(
+                entry=entry,
+                step=step,
+                backend=backend,
+                retained_drift=retained_drift,
+                forget=forget_install_entry,
+                require_reload=require_systemd_reload,
+            )
+            continue
         installed = backend.inspect_step(step)
         prior = entry.get("prior")
         if step.get("kind") == "venv" and isinstance(prior, Mapping):
@@ -5829,7 +6486,9 @@ def rollback_receipt(
             # post-install drift.
             if (
                 entry.get("status") == "prepared"
-                and entry.get("adopted_from_receipt") is True
+                and _entry_adopted(
+                    entry, plan_document if isinstance(plan_document, Mapping) else {}
+                )
                 and entry.get("replacement_authority") is not None
             ):
                 cleanup = getattr(backend, "cleanup_prepared_replacement", None)
@@ -5868,6 +6527,7 @@ def rollback_receipt(
                     step=step,
                     entry=entry,
                     installed=installed,
+                    plan=plan_document if isinstance(plan_document, Mapping) else None,
                 )
             ):
                 retained_drift.append(
@@ -5938,6 +6598,20 @@ def rollback_receipt(
                 reload_status = "completed"
                 receipt._document.pop(_SYSTEMD_RELOAD_PENDING, None)
     unknown = tuple(backend.list_unknown_state(receipt))
+    legacy_restored: bool | None = None
+    if legacy_record is not None:
+        # Rollback of a legacy adoption must prove the host is the reviewed
+        # legacy host again; anything short of that keeps services stopped.
+        if isinstance(legacy_record, Mapping) and isinstance(plan_document, Mapping):
+            from .legacy import prove_legacy_restored
+
+            legacy_restored, detail = prove_legacy_restored(
+                plan_document, legacy_record, legacy_host
+            )
+        else:
+            legacy_restored, detail = False, {"error": "legacy adoption record is invalid"}
+        if not legacy_restored:
+            retained_drift.append({"step_id": "legacy-inventory", "observed": detail})
     receipt._document["state"] = (
         "rollback-blocked" if unknown or retained_drift else "rolled-back"
     )
@@ -5956,8 +6630,10 @@ def rollback_receipt(
         "retained_drift": retained_drift,
         "systemd_daemon_reload": reload_status,
     }
+    if legacy_restored is not None:
+        receipt._document["rollback"]["legacy_restored"] = legacy_restored
     receipt._persist()
-    return RollbackReport(unknown, tuple(retained_drift), reload_status)
+    return RollbackReport(unknown, tuple(retained_drift), reload_status, legacy_restored)
 
 
 @dataclass(frozen=True)
