@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -246,20 +247,30 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def _env_summary(instance: str) -> dict[str, Any]:
-    values = _read_env_file(_runtime_env_path(instance))
+def _env_summary_from_environment(environment: Mapping[str, str]) -> dict[str, Any]:
+    """由一份環境變數（不論來源是檔案讀值還是 systemd 有效宣告）投影出
+    ``cortex service status`` 的顯示欄位。#1098：drop-in 覆寫
+    ``PY``／``PSC_MANAGER_INTERVAL_SECONDS``／``PSC_MANAGER_SPECS_DIR`` 時，
+    呼叫端應改傳有效宣告（見 ``_status_payload``），讓顯示值與有效宣告一致，
+    不再固定讀 ``~/.agents/core/runtime/<instance>-manager.env`` 這份可能已
+    過時的檔案。"""
+
     interval: int | None = None
-    raw_interval = values.get("PSC_MANAGER_INTERVAL_SECONDS")
+    raw_interval = environment.get("PSC_MANAGER_INTERVAL_SECONDS")
     if raw_interval is not None:
         try:
             interval = int(raw_interval)
         except ValueError:
             interval = None
     return {
-        "executor": values.get("PY"),
+        "executor": environment.get("PY"),
         "interval_seconds": interval,
-        "specs_dir": values.get("PSC_MANAGER_SPECS_DIR"),
+        "specs_dir": environment.get("PSC_MANAGER_SPECS_DIR"),
     }
+
+
+def _env_summary(instance: str) -> dict[str, Any]:
+    return _env_summary_from_environment(_read_env_file(_runtime_env_path(instance)))
 
 
 def _pid_is_live(pid: int | None) -> bool:
@@ -489,7 +500,28 @@ def _status_payload(instance: str) -> dict[str, Any]:
         monitor_service = f"{instance}-monitor.service"
         payload = dict(probe)
         payload["pid"] = units.get(manager_service, {}).get("pid")
-        payload["env"] = _env_summary(instance)
+        # #1098：只有 manager 的有效環境來源確認是 ``systemd-effective``（已
+        # 套用 drop-in）時才改用它投影顯示欄位；其餘來源（unavailable／
+        # unknown）沒有可信的有效值可用，維持既有讀 `<instance>-manager.env`
+        # 檔案的 fallback，不強行套用可能是空的有效環境覆蓋掉檔案內容。
+        manager_overlay = (
+            environment_overlay.get("manager")
+            if isinstance(environment_overlay, dict)
+            else None
+        )
+        manager_effective_environment = (
+            manager_overlay.get("environment")
+            if isinstance(manager_overlay, dict)
+            else None
+        )
+        if (
+            isinstance(manager_overlay, dict)
+            and manager_overlay.get("environment_source") == "systemd-effective"
+            and isinstance(manager_effective_environment, dict)
+        ):
+            payload["env"] = _env_summary_from_environment(manager_effective_environment)
+        else:
+            payload["env"] = _env_summary(instance)
         payload["loaded_runtime"] = _loaded_runtime_payload(
             instance,
             manager_pid=_unit_pid(units, manager_service),
