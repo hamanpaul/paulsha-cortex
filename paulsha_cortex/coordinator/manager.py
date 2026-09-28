@@ -11829,6 +11829,10 @@ def _quota_admission_job_view_for_terminal_usage(job: Mapping[str, object]) -> d
     return {
         "id": job.get("job_id"),
         "executor": job.get("executor"),
+        # #1116：`quota_shadow.record_terminal_usage()` 需要 model_id 才能
+        # 比對 executor＋model_id 穩定 identity subject binding（見該函式
+        # 文件字串）；舊版只投影 executor，identity binding 永遠比對不到。
+        "model_id": job.get("model_id"),
         "usage": job.get("usage"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("exited_at"),
@@ -11856,10 +11860,20 @@ def _quota_admission_record_terminal_usage(
     binding subject 比對規則（#839 契約邊界：不重驗、只消費）。"""
     from . import quota_admission
 
-    pool_windows = quota_admission.pools_for_profile(profile_key, bindings=quota_ctx.bindings)
+    job_view = _quota_admission_job_view_for_terminal_usage(job)
+    # #1116：pool_windows 短路檢查一併帶入 executor／model_id，讓 executor＋
+    # model_id 穩定 identity subject binding 也能通過這個「值不值得往下走」
+    # 的前置判斷；真正逐 binding 記消耗仍交給下面的迴圈與
+    # `QuotaShadowService.record_terminal_usage()` 自己的 `_binding_has_profile`
+    # 判定（本函式不重驗，只做短路優化，見函式文件字串）。
+    pool_windows = quota_admission.pools_for_profile(
+        profile_key,
+        executor=job_view.get("executor") if isinstance(job_view.get("executor"), str) else None,
+        model_id=job_view.get("model_id") if isinstance(job_view.get("model_id"), str) else None,
+        bindings=quota_ctx.bindings,
+    )
     if not pool_windows:
         return  # 這個 profile 不受額度管理，沒有任何 binding 可解析。
-    job_view = _quota_admission_job_view_for_terminal_usage(job)
     for binding in quota_ctx.bindings:
         quota_ctx.shadow.record_terminal_usage(
             job_view,
@@ -14654,6 +14668,10 @@ def _dispatch_workflow_card(
                 selected_observation_state=quota_selected_assessment.observation_state,
                 selected_feasible=quota_selected_assessment.feasible,
                 policy_config_revision=getattr(quota_admission_context, "config_revision", None),
+                # #1116：見 `AdmissionDecision.selected_binding_kind` 文件字串
+                # ——選中候選當時是靠精確 resolved key 還是穩定 identity subject
+                # 涵蓋，供投影面／`bindings --report` 事後判斷。
+                selected_binding_kind=quota_selected_assessment.binding_kind,
             )
             # #839 對抗審查修復第三輪（MAJOR manager.py:14056）：admit receipt
             # 比照 wait receipt 先讀、有舊紀錄就沿用不重寫——見

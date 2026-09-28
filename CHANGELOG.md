@@ -17,6 +17,7 @@
   查詢結果多帶可機讀的 `clock_evidence` 診斷（`clock-evidence-checked` / `clock-evidence-unavailable`）。
   見 `changelog.d/1097-qualification-clock-watermark.md`。
 - **v0.1.11 發版**：`VERSION` 升為 0.1.11，收錄 refine 完整交付與 live 驗收修正（見 `changelog.d/release-0-1-11.md`）。
+- **#1116 quota binding 支援 executor＋model_id 穩定 identity subject**：`quota_observation.parse_binding()` 新增第三種 `subject.kind == "identity"`（`{"kind": "identity", "executor": ..., "model_id": ...}`），解決同一個 builder 身分在不同卡片解析出不同 resolved profile key、逐卡綁定無聲失效的問題；`pools_for_profile()`／`assess_candidate_quota()` 優先序為 resolved key 精確綁定＞identity 穩定綁定，命中精確綁定時不與 identity 結果合併，避免重複計算 pool；既有以 resolved key 綁定的設定完全相容。新增 `CandidateAssessment.binding_kind`／`AdmissionDecision.selected_binding_kind`（比照 #840 選填欄位加法模式）與 `decision_projection` 的 `classification.binding`（`bound-exact`／`bound-identity`／`binding-missing`／`unknown`），以及唯讀 `cortex quota bindings --report` 彙總目前派工用到、但沒有任何 binding 涵蓋的 resolved profile key。`quota_shadow.record_terminal_usage()` 同步支援 identity binding；collector_targets 精確比對刻意不新增 identity 路徑（見 `quota_collectors._find_binding()` 文件字串）。詳見 `changelog.d/1116-quota-binding-identity-subject.md`。
 - **work-items 衝突解除（續）**：`wave4-large-bug-integration` 明確歸屬 #475，消除 PR #1090 的 fallback 群組殘留衝突。
 - **#839／#836 共用設定檔**：admission 接受 collector 的選填 `collector_targets`，同一份 `quota-pools.json` 可同時供兩者使用。
 - **#841／#857 env 檔引號**：attestation 的 EnvironmentFile parser 接受引號值內的另一種引號（JSON argv），不再讓照文件設定的 task memory 命令使 loaded runtime 比對失效。
