@@ -1,0 +1,1 @@
+- deployment canary 的 codex provider preflight 對 app-server 偶發不回應更穩健（#716，canary run 36394947903 以 `Codex app-server status probe timed out` 失敗）：逾時訊息寫出卡住的請求（initialize／account/read／account/rateLimits/read）；只有傳輸層逾時才以新 app-server process 重試一次，認證失敗、額度用盡、提前關閉等明確回答仍立即 fail closed；單次交換時限由 45 秒放寬為 90 秒。本機經 cortex egress proxy 重現：同一呼叫偶發 60–150 秒無回應，重開 process 即在 5 秒內回應。

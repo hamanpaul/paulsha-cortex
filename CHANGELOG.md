@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 deployment canary codex preflight 逾時**：逾時訊息標明卡住的請求，傳輸逾時以新 process 重試一次、單次時限 90 秒；明確否定回答不重試（#716）。
 - **#716 deployment canary provider preflight**：copilot status server 移除會跳過已存登入的 `--no-auto-login`、允許超額使用時不誤判 quota 用盡、codex 方案額度可用時不要求加購 credits（#716）。
 - **#716 deployment canary agy smoke**：agy 1.2.x 的 JSON 輸出不帶 model／effort，改以持久化對話的模型變體 id 證明實際模型與 effort，修正 canary 在 provider smoke 必然失敗（#716）。
 - **installer receipt 界限**：目錄快照改記子孫 digest＋count、完整清單存 root-only 旁檔；getfacl 加 `-E`；rollback 還原 unit 後執行 `systemctl daemon-reload`；preflight 事前拒絕過大既有檔與 symlink（#1123）。

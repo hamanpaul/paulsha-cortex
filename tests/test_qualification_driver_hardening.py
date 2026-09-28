@@ -815,6 +815,139 @@ def test_codex_app_server_without_live_account_or_rate_limits_fails_closed_once(
     assert calls == [("/opt/cortex/toolchain/bin/codex", "--version")]
 
 
+_FAKE_CODEX_APP_SERVER = r"""
+import json, sys, time
+answer_rate_limits = sys.argv[1] == "answer"
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({"id": message["id"], "result": {"userAgent": "fake"}}), flush=True)
+    elif method == "account/read":
+        print(json.dumps({"id": message["id"], "result": {"account": {"type": "chatgpt"}}}), flush=True)
+    elif method == "account/rateLimits/read" and answer_rate_limits:
+        print(json.dumps({"id": message["id"], "result": {"rateLimits": {}}}), flush=True)
+"""
+
+
+def test_codex_app_server_timeout_names_the_pending_request() -> None:
+    """#716：canary 只看到 `status probe timed out`，無從判斷卡在哪個請求。"""
+
+    driver = _load_driver()
+    with pytest.raises(
+        driver.QualificationFailure, match="timed out waiting for account/rateLimits/read"
+    ):
+        driver._codex_app_server_exchange(
+            (sys.executable, "-c", _FAKE_CODEX_APP_SERVER, "silent"),
+            user="",
+            env={},
+            timeout=2,
+        )
+    account, rate_limits = driver._codex_app_server_exchange(
+        (sys.executable, "-c", _FAKE_CODEX_APP_SERVER, "answer"),
+        user="",
+        env={},
+        timeout=10,
+    )
+    assert account["result"]["account"]["type"] == "chatgpt"
+    assert rate_limits["result"] == {"rateLimits": {}}
+
+
+def _codex_ready_responses():
+    return (
+        {"id": 2, "result": {"account": {"type": "chatgpt", "planType": "prolite"}}},
+        {
+            "id": 3,
+            "result": {
+                "ordinaryUsageAllowed": True,
+                "rateLimits": {
+                    "primary": {"usedPercent": 11, "windowDurationMins": 10080, "resetsAt": 1_900_000_000},
+                    "secondary": None,
+                    "rateLimitReachedType": None,
+                    "spendControlReached": False,
+                },
+            },
+        },
+    )
+
+
+def test_codex_preflight_retries_a_timed_out_status_probe_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n"
+        ),
+    )
+    attempts: list[int] = []
+
+    def flaky(_command, **kwargs):
+        attempts.append(kwargs["timeout"])
+        if len(attempts) == 1:
+            raise driver.QualificationFailure(
+                "Codex app-server status probe timed out waiting for account/rateLimits/read"
+            )
+        return _codex_ready_responses()
+
+    monkeypatch.setattr(driver, "_codex_app_server_exchange", flaky)
+    assert driver._provider_preflight("codex", "cortex-builder")["status"] == "ready"
+    assert attempts == [90, 90]
+
+
+def test_codex_preflight_fails_after_a_second_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n"
+        ),
+    )
+    attempts: list[int] = []
+
+    def always_timeout(_command, **kwargs):
+        attempts.append(kwargs["timeout"])
+        raise driver.QualificationFailure(
+            "Codex app-server status probe timed out waiting for account/read"
+        )
+
+    monkeypatch.setattr(driver, "_codex_app_server_exchange", always_timeout)
+    with pytest.raises(driver.QualificationFailure, match="timed out waiting for account/read"):
+        driver._provider_preflight("codex", "cortex-builder")
+    assert len(attempts) == 2
+
+
+def test_codex_preflight_does_not_retry_a_definitive_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n"
+        ),
+    )
+    attempts: list[int] = []
+
+    def closed(_command, **kwargs):
+        attempts.append(kwargs["timeout"])
+        raise driver.QualificationFailure("Codex app-server closed before status response")
+
+    monkeypatch.setattr(driver, "_codex_app_server_exchange", closed)
+    with pytest.raises(driver.QualificationFailure, match="closed before status response"):
+        driver._provider_preflight("codex", "cortex-builder")
+    assert len(attempts) == 1
+
+
 def test_codex_agent_loop_uses_provider_persisted_thread_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

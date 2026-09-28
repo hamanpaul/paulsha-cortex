@@ -91,6 +91,10 @@ SERVICES = (
 )
 
 
+#: codex app-server 單次 status 交換的時限（秒）；逾時會以新 process 重試一次（#716）。
+CODEX_STATUS_PROBE_TIMEOUT_SECONDS = 90
+
+
 @dataclass(frozen=True)
 class ProviderPreflightAdapter:
     version: str | None
@@ -1572,18 +1576,19 @@ def _codex_app_server_exchange(
         )
         process.stdin.flush()
 
-    def receive(request_id: int) -> Mapping[str, object]:
+    def receive(request_id: int, method: str) -> Mapping[str, object]:
         if process.stdout is None:
             raise QualificationFailure("Codex app-server stdout is unavailable")
+        timed_out = f"Codex app-server status probe timed out waiting for {method}"
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise QualificationFailure("Codex app-server status probe timed out")
+                raise QualificationFailure(timed_out)
             ready, _unused_write, _unused_error = select.select(
                 [process.stdout], [], [], remaining
             )
             if not ready:
-                raise QualificationFailure("Codex app-server status probe timed out")
+                raise QualificationFailure(timed_out)
             line = process.stdout.readline()
             if line == "":
                 raise QualificationFailure("Codex app-server closed before status response")
@@ -1616,7 +1621,7 @@ def _codex_app_server_exchange(
                 },
             }
         )
-        initialize = receive(1)
+        initialize = receive(1, "initialize")
         if "error" in initialize or not isinstance(initialize.get("result"), Mapping):
             raise QualificationFailure("Codex app-server initialize failed")
         send(
@@ -1634,7 +1639,7 @@ def _codex_app_server_exchange(
                 "params": {"refreshToken": False},
             }
         )
-        account = receive(2)
+        account = receive(2, "account/read")
         send(
             {
                 "jsonrpc": "2.0",
@@ -1643,7 +1648,7 @@ def _codex_app_server_exchange(
                 "params": None,
             }
         )
-        rate_limits = receive(3)
+        rate_limits = receive(3, "account/rateLimits/read")
         return account, rate_limits
     except (BrokenPipeError, OSError, subprocess.SubprocessError) as exc:
         raise QualificationFailure("Codex app-server status probe failed") from exc
@@ -2199,12 +2204,21 @@ def _provider_preflight(provider: str, account: str) -> dict[str, object]:
 
     account_env = _account_env(account)
     if adapter.status_kind == "codex-app-server":
-        account_response, rate_limits_response = _codex_app_server_exchange(
-            adapter.status_command,
-            user=account,
-            env=account_env,
-            timeout=45,
-        )
+        # #716：app-server 對上游的 account／rate-limit 查詢偶發卡住（本機經 egress
+        # proxy 重現過數次不回應，重開一個 process 即正常）。只有傳輸層逾時才以新
+        # process 重試一次；認證失敗、額度用盡等明確回答仍立即 fail closed。
+        for attempt in range(2):
+            try:
+                account_response, rate_limits_response = _codex_app_server_exchange(
+                    adapter.status_command,
+                    user=account,
+                    env=account_env,
+                    timeout=CODEX_STATUS_PROBE_TIMEOUT_SECONDS,
+                )
+                break
+            except QualificationFailure as exc:
+                if attempt == 1 or "status probe timed out" not in str(exc):
+                    raise
         return _codex_preflight_from_responses(account_response, rate_limits_response)
     if adapter.status_kind == "copilot-app-server":
         auth_response, quota_response = _copilot_app_server_exchange(
