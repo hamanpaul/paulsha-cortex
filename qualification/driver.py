@@ -2633,6 +2633,11 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
     return verdicts
 
 
+#: permgen 為 durable owner 產生的 GitHub HTTPS credential 範圍與 helper（#716）。
+GITHUB_HTTPS_CREDENTIAL_URL = "https://github.com"
+MANAGER_GH_CREDENTIAL_HELPER = "!/usr/bin/gh auth git-credential"
+
+
 def _require_installed_manager_gitconfig(path: Path) -> None:
     if path.is_symlink() or not path.is_file():
         raise QualificationFailure("installed Manager gitconfig is absent or a symlink")
@@ -2702,17 +2707,32 @@ def _manager_github_probe(
             "config",
             "--show-origin",
             "--show-scope",
-            "--get-all",
-            "credential.helper",
+            "--get-regexp",
+            r"^credential\..*helper$",
         ),
         user=account,
         env=env,
         timeout=30,
     )
-    _require_success(helper, "Manager installed credential helper inventory")
-    helper_rows = [line.split("\t", 2) for line in helper.stdout.splitlines()]
+    # `--get-regexp` 找不到任何鍵時回 1；那代表 installed helper 不存在，歸為同一種
+    # 「不是唯一 installed helper」的失敗，而不是 git 本身的錯誤。
+    if helper.returncode not in (0, 1):
+        _require_success(helper, "Manager installed credential helper inventory")
+    helper_rows: list[tuple[str, str, str, str]] = []
+    for line in helper.stdout.splitlines():
+        scope, origin, entry = (line.split("\t", 2) + ["", "", ""])[:3]
+        key, _separator, value = entry.partition(" ")
+        helper_rows.append((scope, origin, key, value))
+    # permgen.build_account_gitconfig() 只為 durable owner 寫 URL-scoped helper：先以
+    # 空值清掉任何繼承的 helper，再只對 https://github.com 委派給 gh（#716）。所有
+    # scope 的 credential helper 設定必須恰好是這兩列，repo 本地或其他 URL 再加掛
+    # 任何 helper 都會在 reset 之後生效，一律拒絕。
     expected_origin = f"file:{gitconfig}"
-    if helper_rows != [["global", expected_origin, "!/usr/bin/gh auth git-credential"]]:
+    expected_key = f"credential.{GITHUB_HTTPS_CREDENTIAL_URL}.helper"
+    if helper_rows != [
+        ("global", expected_origin, expected_key, ""),
+        ("global", expected_origin, expected_key, MANAGER_GH_CREDENTIAL_HELPER),
+    ]:
         raise QualificationFailure(
             "Manager effective credential helper is not the unique installed helper"
         )
