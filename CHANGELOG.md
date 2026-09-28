@@ -9,8 +9,12 @@
 
 ### Added
 
+- **#716 deployment canary codex preflight 逾時**：逾時訊息標明卡住的請求，傳輸逾時以新 process 重試一次、單次時限 90 秒；明確否定回答不重試（#716）。
+- **#716 deployment canary provider preflight**：copilot status server 移除會跳過已存登入的 `--no-auto-login`、允許超額使用時不誤判 quota 用盡、codex 方案額度可用時不要求加購 credits（#716）。
 - **#716 deployment canary agy smoke**：agy 1.2.x 的 JSON 輸出不帶 model／effort，改以持久化對話的模型變體 id 證明實際模型與 effort，修正 canary 在 provider smoke 必然失敗（#716）。
 - **installer receipt 界限**：目錄快照改記子孫 digest＋count、完整清單存 root-only 旁檔；getfacl 加 `-E`；rollback 還原 unit 後執行 `systemctl daemon-reload`；preflight 事前拒絕過大既有檔與 symlink（#1123）。
+- **legacy adoption 唯讀 inventory**：新增 `cortex install trust-root legacy inventory`（root、shared lock、唯讀、既有 receipt／snapshot／lease 時拒絕並指向 `--prior-receipt`、no-overwrite 輸出）與 `legacy show`（非 root 摘要）；inventory schema v1 以穩定欄位自證 digest、scope digest 與 machine-id 雜湊綁定主機，credential 類只記 metadata，job 帳號以 kernel `access(2)` 做可寫 census；`--host-overlay` 只接受 allowlist key（#1122）。
+- **legacy adoption 唯讀 inventory**：新增 `cortex install trust-root legacy inventory`（root、shared lock、唯讀、既有 receipt／snapshot／lease 時拒絕並指向 `--prior-receipt`、no-overwrite 輸出）與 `legacy show`（非 root 摘要）；inventory schema v1 以穩定欄位自證 digest、scope digest 與 machine-id 雜湊綁定主機，credential 類只記 metadata，job 帳號在已驗證 inode 的目錄 fd 上以 `faccessat2(AT_SYMLINK_NOFOLLOW)` 做可寫 census（項目途中變動記為 unstable、kernel 不支援即 fail-closed）；`--output` 不得落在 roots、受管路徑或帳號 HOME 之下，也不得經過 symlink；`--host-overlay` 只接受 allowlist key（#1122）。
 - **installer receipt 界限**：目錄快照改記子孫 digest＋count、完整清單存 root-only 旁檔（receipt `schema_version` 升為 2，舊版明確拒收；受管目錄內的舊 receipt 維持內嵌不建旁檔）；getfacl 加 `-E`；rollback 還原 unit 後執行 `systemctl daemon-reload`；preflight 事前拒絕過大既有檔與 symlink（#1123）。
 - **trust-root legacy adoption 規格**：新增 OpenSpec change `trust-root-legacy-adoption`，定義無 receipt 舊主機的 inventory、host overlay、disposition、quarantine 搬移、rollback 證明與 RC profile；僅規格（#1122）。
 - **review malformed 預檢**：接受不帶選填 `authority_hashes` 的合法 review envelope（#1118）。
@@ -51,7 +55,7 @@
 
 ### Fixed
 
-- **#1099 quota window snapshot refinement**：同值、同時間的 snapshot 補上先前缺失的 window epoch 時，file ledger 與 memory ledger 會追加 refinement observation；shadow 投影在同時間快照間優先採用 epoch 已知者。值不同仍是 conflict，較不完整或完全相同的重送仍是 duplicate；不新增 ledger event kind 或 schema version。
+- **#1099 quota window snapshot refinement**：同值、同時間的 snapshot 補上先前缺失的 window epoch 時，file ledger 與 memory ledger 會追加 refinement observation；shadow 投影在同時間快照間優先採用 epoch 已知者。值不同仍是 conflict，較不完整或完全相同的重送仍是 duplicate；refinement 後的 conflict receipt 以最近接受 observation 的 payload digest 作為 `existing_sha256`；不新增 ledger event kind 或 schema version。
 
 - **#1098 service status／doctor 改以有效宣告解析 wrapper 的 `PY` 覆寫與顯示欄位**：installer 產生的 manager unit 走 `ExecStart=/usr/bin/env bash <pkg>/scripts/service-manager.sh` wrapper 時，實際執行的直譯器由環境變數 `PY` 決定，但 `_declared_service_artifact` 先前完全沒看 `PY`，drop-in 以 `Environment=PY=/other/venv/bin/python` 覆寫時仍固定回報 wrapper 腳本自己所在的舊套件根，`cortex service status`／`doctor` 因此可能誤報仍與舊 receipt match。改為以有效環境（`Environment=`／`EnvironmentFiles=`／ExecStart 內 `env` 前綴，優先序與既有 `PYTHONPATH` 判定一致）解析出的 `PY` 直譯器匯入結果判定 artifact；`PY` 未被任何一層宣告時維持既有「wrapper 與套件同根」假設，判定衝突一律 unknown，不臆測。`cortex service status` 的 `env`（`executor`／`interval_seconds`／`specs_dir`）顯示欄位在 manager 的有效環境來源確認是 `systemd-effective` 時，改用同一份有效環境投影顯示值，不再固定讀 `~/.agents/core/runtime/<instance>-manager.env` 這份可能已被 drop-in 蓋過的舊檔案；`safe_environment_projection` 允許清單額外收 `PY` 這個單一鍵以支援上述兩處。細節見 `changelog.d/1098-service-status-effective-py.md`。
 - **`#1106` github_closing 不再牽連已有 owner 的票**：`correlate_work_sources()` 處理 `github_closing`（整合 PR 關閉多張票）時，先前無條件把「PR 關閉的第一張票（primary）目前的 owner」套用到 PR 本身與其餘每一張被關閉的票，其餘票若早就有自己的 override／frontmatter 歸屬就會同時落在兩個群組，變成 confirmed source collision、整個 repo 被標 degraded（`auto_claim`／`merge` hard gate 全關），例如整合 PR `#1087`／`#1090` 目前只能靠 `.cortex/work-items.yaml` 逐一 `excludes` 才不 degraded。現改為：來源若已有自己、與 primary 不同的權威歸屬則維持不動；PR 本身沒有自己歸屬時，才確定性地加入 primary 目前的 owner 群組（primary 也沒 owner 則與 primary 一起落入 `issue:<ref>` fallback 群組）。真正的衝突（同一票被兩個 override 明列）不受影響，仍回報 collision。細節見 `changelog.d/1106-closing-link-owner.md`。

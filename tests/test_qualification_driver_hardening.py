@@ -413,12 +413,14 @@ def test_provider_preflight_uses_only_supported_pinned_argv() -> None:
         "json",
     )
     assert adapters["copilot"].version is None
-    assert adapters["copilot"].status_command[-4:] == (
+    # #716：copilot 1.0.88 的 `--no-auto-login` 會讓 headless server 不載入已儲存的
+    # 登入狀態，`account.getCurrentAuth` 因此回空結果；不得再帶這個旗標。
+    assert adapters["copilot"].status_command[-3:] == (
         "--headless",
         "--no-auto-update",
         "--stdio",
-        "--no-auto-login",
     )
+    assert "--no-auto-login" not in adapters["copilot"].status_command
     assert adapters["copilot"].status_kind == "copilot-app-server"
     assert adapters["codex"].version == TOOL_VERSIONS["codex"]
     assert adapters["codex"].status_command[-2:] == ("app-server", "--stdio")
@@ -538,6 +540,89 @@ def test_copilot_app_server_accepts_authenticated_quota_snapshots(
     assert calls == [("/opt/cortex/toolchain/bin/copilot", "--version")]
 
 
+def _copilot_preflight_with_quota(driver, monkeypatch, snapshots):
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"Copilot CLI {TOOL_VERSIONS['copilot']}\n"
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_copilot_app_server_exchange",
+        lambda _command, **_kwargs: (
+            {"id": 2, "result": {"authInfo": {"type": "user", "login": "redacted-user"}}},
+            {"id": 3, "result": {"quotaSnapshots": snapshots}},
+        ),
+    )
+    return driver._provider_preflight("copilot", "cortex-reviewer-planner")
+
+
+def _copilot_live_snapshots(**premium_overrides):
+    """copilot 1.0.88 `account.getQuota` 的真實形狀（去識別化）。"""
+
+    unlimited = {
+        "isUnlimitedEntitlement": True,
+        "entitlementRequests": 0,
+        "usedRequests": 0,
+        "usageAllowedWithExhaustedQuota": False,
+        "overage": 0,
+        "overageAllowedWithExhaustedQuota": False,
+        "remainingPercentage": 100,
+        "hasQuota": True,
+        "tokenBasedBilling": False,
+        "overageEntitlement": 0,
+    }
+    premium = {
+        "isUnlimitedEntitlement": False,
+        "entitlementRequests": 1500,
+        "usedRequests": 1500,
+        "usageAllowedWithExhaustedQuota": True,
+        "overage": 1682,
+        "overageAllowedWithExhaustedQuota": True,
+        "remainingPercentage": 0,
+        "hasQuota": True,
+        "tokenBasedBilling": False,
+        "overageEntitlement": 0,
+    }
+    premium.update(premium_overrides)
+    return {"chat": dict(unlimited), "completions": dict(unlimited), "premium_interactions": premium}
+
+
+def test_copilot_preflight_accepts_exhausted_quota_when_usage_remains_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#716：額度用盡但帳號允許超額繼續使用時，provider 仍可服務。"""
+
+    driver = _load_driver()
+    assert _copilot_preflight_with_quota(driver, monkeypatch, _copilot_live_snapshots()) == {
+        "status": "ready",
+        "authenticated": True,
+        "quota": "available",
+        "fallback": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"usageAllowedWithExhaustedQuota": False, "overageAllowedWithExhaustedQuota": False},
+        {"usageAllowedWithExhaustedQuota": None, "overageAllowedWithExhaustedQuota": None},
+        {"hasQuota": False},
+    ],
+)
+def test_copilot_preflight_rejects_exhausted_quota_without_allowed_usage(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, object]
+) -> None:
+    driver = _load_driver()
+    with pytest.raises(driver.QualificationFailure, match="no remaining quota"):
+        _copilot_preflight_with_quota(
+            driver, monkeypatch, _copilot_live_snapshots(**overrides)
+        )
+
+
 def test_copilot_app_server_without_auth_or_quota_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -622,6 +707,83 @@ def test_codex_app_server_accepts_authenticated_rate_limits(
     assert calls == [("/opt/cortex/toolchain/bin/codex", "--version")]
 
 
+def _codex_preflight_with_rate_limits(driver, monkeypatch, result):
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n"
+        ),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_codex_app_server_exchange",
+        lambda _command, **_kwargs: (
+            {"id": 2, "result": {"account": {"type": "chatgpt", "planType": "prolite"}}},
+            {"id": 3, "result": result},
+        ),
+    )
+    return driver._provider_preflight("codex", "cortex-builder")
+
+
+def _codex_live_rate_limits(*, ordinary_usage_allowed, has_credits=False, used=11):
+    """codex 0.157 `account/rateLimits/read` 的真實形狀（去識別化）。"""
+
+    return {
+        "ordinaryUsageAllowed": ordinary_usage_allowed,
+        "rateLimits": {
+            "limitName": None,
+            "normalModelSlug": None,
+            "primary": {"usedPercent": used, "windowDurationMins": 10080, "resetsAt": 1_900_000_000},
+            "secondary": None,
+            "credits": {"hasCredits": has_credits, "unlimited": False, "balance": "0"},
+            "spendControlReached": False,
+            "planType": "prolite",
+            "rateLimitReachedType": None,
+        },
+        "rateLimitResetCredits": {"availableCount": 0, "credits": []},
+        "rateLimitUpsell": None,
+    }
+
+
+def test_codex_preflight_ignores_purchased_credits_when_plan_usage_is_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#716：`credits` 是加購點數；方案內額度可用（ordinaryUsageAllowed）時不看它。"""
+
+    driver = _load_driver()
+    assert _codex_preflight_with_rate_limits(
+        driver, monkeypatch, _codex_live_rate_limits(ordinary_usage_allowed=True)
+    ) == {"status": "ready", "authenticated": True, "quota": "available", "fallback": False}
+
+
+@pytest.mark.parametrize("ordinary", [False, None])
+def test_codex_preflight_requires_credits_when_plan_usage_is_not_allowed(
+    monkeypatch: pytest.MonkeyPatch, ordinary: object
+) -> None:
+    driver = _load_driver()
+    with pytest.raises(driver.QualificationFailure, match="no remaining credits"):
+        _codex_preflight_with_rate_limits(
+            driver, monkeypatch, _codex_live_rate_limits(ordinary_usage_allowed=ordinary)
+        )
+    assert _codex_preflight_with_rate_limits(
+        driver,
+        monkeypatch,
+        _codex_live_rate_limits(ordinary_usage_allowed=ordinary, has_credits=True),
+    )["quota"] == "available"
+
+
+def test_codex_preflight_still_rejects_an_exhausted_plan_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    with pytest.raises(driver.QualificationFailure, match="no remaining rate-limit capacity"):
+        _codex_preflight_with_rate_limits(
+            driver, monkeypatch, _codex_live_rate_limits(ordinary_usage_allowed=True, used=100)
+        )
+
+
 def test_codex_app_server_without_live_account_or_rate_limits_fails_closed_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -651,6 +813,139 @@ def test_codex_app_server_without_live_account_or_rate_limits_fails_closed_once(
     with pytest.raises(driver.QualificationFailure, match="authenticated account"):
         driver._provider_preflight("codex", "cortex-builder")
     assert calls == [("/opt/cortex/toolchain/bin/codex", "--version")]
+
+
+_FAKE_CODEX_APP_SERVER = r"""
+import json, sys, time
+answer_rate_limits = sys.argv[1] == "answer"
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({"id": message["id"], "result": {"userAgent": "fake"}}), flush=True)
+    elif method == "account/read":
+        print(json.dumps({"id": message["id"], "result": {"account": {"type": "chatgpt"}}}), flush=True)
+    elif method == "account/rateLimits/read" and answer_rate_limits:
+        print(json.dumps({"id": message["id"], "result": {"rateLimits": {}}}), flush=True)
+"""
+
+
+def test_codex_app_server_timeout_names_the_pending_request() -> None:
+    """#716：canary 只看到 `status probe timed out`，無從判斷卡在哪個請求。"""
+
+    driver = _load_driver()
+    with pytest.raises(
+        driver.QualificationFailure, match="timed out waiting for account/rateLimits/read"
+    ):
+        driver._codex_app_server_exchange(
+            (sys.executable, "-c", _FAKE_CODEX_APP_SERVER, "silent"),
+            user="",
+            env={},
+            timeout=2,
+        )
+    account, rate_limits = driver._codex_app_server_exchange(
+        (sys.executable, "-c", _FAKE_CODEX_APP_SERVER, "answer"),
+        user="",
+        env={},
+        timeout=10,
+    )
+    assert account["result"]["account"]["type"] == "chatgpt"
+    assert rate_limits["result"] == {"rateLimits": {}}
+
+
+def _codex_ready_responses():
+    return (
+        {"id": 2, "result": {"account": {"type": "chatgpt", "planType": "prolite"}}},
+        {
+            "id": 3,
+            "result": {
+                "ordinaryUsageAllowed": True,
+                "rateLimits": {
+                    "primary": {"usedPercent": 11, "windowDurationMins": 10080, "resetsAt": 1_900_000_000},
+                    "secondary": None,
+                    "rateLimitReachedType": None,
+                    "spendControlReached": False,
+                },
+            },
+        },
+    )
+
+
+def test_codex_preflight_retries_a_timed_out_status_probe_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n"
+        ),
+    )
+    attempts: list[int] = []
+
+    def flaky(_command, **kwargs):
+        attempts.append(kwargs["timeout"])
+        if len(attempts) == 1:
+            raise driver.QualificationFailure(
+                "Codex app-server status probe timed out waiting for account/rateLimits/read"
+            )
+        return _codex_ready_responses()
+
+    monkeypatch.setattr(driver, "_codex_app_server_exchange", flaky)
+    assert driver._provider_preflight("codex", "cortex-builder")["status"] == "ready"
+    assert attempts == [90, 90]
+
+
+def test_codex_preflight_fails_after_a_second_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n"
+        ),
+    )
+    attempts: list[int] = []
+
+    def always_timeout(_command, **kwargs):
+        attempts.append(kwargs["timeout"])
+        raise driver.QualificationFailure(
+            "Codex app-server status probe timed out waiting for account/read"
+        )
+
+    monkeypatch.setattr(driver, "_codex_app_server_exchange", always_timeout)
+    with pytest.raises(driver.QualificationFailure, match="timed out waiting for account/read"):
+        driver._provider_preflight("codex", "cortex-builder")
+    assert len(attempts) == 2
+
+
+def test_codex_preflight_does_not_retry_a_definitive_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n"
+        ),
+    )
+    attempts: list[int] = []
+
+    def closed(_command, **kwargs):
+        attempts.append(kwargs["timeout"])
+        raise driver.QualificationFailure("Codex app-server closed before status response")
+
+    monkeypatch.setattr(driver, "_codex_app_server_exchange", closed)
+    with pytest.raises(driver.QualificationFailure, match="closed before status response"):
+        driver._provider_preflight("codex", "cortex-builder")
+    assert len(attempts) == 1
 
 
 def test_codex_agent_loop_uses_provider_persisted_thread_identity(

@@ -58,14 +58,15 @@ class _MemoryLedger:
         )
         digest_payload = _observation_digest_payload(wire, normalized, terminal_metadata)
         digest = hashlib.sha256(_canonical_bytes(digest_payload)).hexdigest()
-        prior = next((row for row in self.events if row.get("idempotency_key") == key
-                      and row.get("kind") == "observation"), None)
+        previous = [row for row in self.events if row.get("idempotency_key") == key
+                    and row.get("kind") == "observation"]
+        prior = previous[-1] if previous else None
         conflict = next((row for row in self.events if row.get("idempotency_key") == key
                          and row.get("kind") == "conflict"), None)
         if conflict:
             return LedgerAppendResult("conflict", conflicts=1, idempotency_key=key)
         if prior:
-            if prior["payload_sha256"] == digest:
+            if any(row.get("payload_sha256") == digest for row in previous):
                 return LedgerAppendResult("duplicate", duplicates=1, idempotency_key=key)
             same_value = [row for row in self.events
                           if row.get("idempotency_key") == key

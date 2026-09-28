@@ -70,6 +70,12 @@ def _remaining(service, descriptor):
     return _pool_row(report, "pool-shared", "short")
 
 
+def _ledger_events(service):
+    if hasattr(service.ledger, "read"):
+        return service.ledger.read().events
+    return service.ledger.events
+
+
 def test_same_value_snapshot_refines_unknown_window_and_enables_terminal_usage(quota_service):
     descriptor = _pool_descriptor(windows=(("short", 300_000),))
     unknown_window = _snapshot(descriptor)
@@ -134,3 +140,27 @@ def test_identical_snapshot_and_terminal_usage_replays_do_not_double_deduct(quot
         "state": "observed",
         "amount": {"kind": "exact", "value": "18"},
     }
+
+
+def test_conflict_after_refinement_references_latest_accepted_observation(quota_service):
+    descriptor = _pool_descriptor(windows=(("short", 300_000),))
+    assert _record_snapshot(quota_service, descriptor, _snapshot(descriptor)).accepted == 1
+
+    refinement = _record_snapshot(
+        quota_service,
+        descriptor,
+        _snapshot(descriptor, reset_at_ms=_NOW + 300_000),
+    )
+    assert refinement.status == "accepted"
+    refined_digest = _ledger_events(quota_service)[-1]["payload_sha256"]
+
+    conflict = _record_snapshot(
+        quota_service,
+        descriptor,
+        _snapshot(descriptor, value="19", reset_at_ms=_NOW + 300_000),
+    )
+
+    assert conflict.status == "conflict"
+    conflict_event = _ledger_events(quota_service)[-1]
+    assert conflict_event["kind"] == "conflict"
+    assert conflict_event["existing_sha256"] == refined_digest

@@ -127,7 +127,7 @@ class QuotaEventLedger:
                         self._append_fd(fd, entry, info.st_size)
                         return LedgerAppendResult("accepted", accepted=1, idempotency_key=key)
                     return LedgerAppendResult("duplicate", duplicates=1, idempotency_key=key)
-                prior_digest = previous[0].get("payload_sha256")
+                prior_digest = previous[-1].get("payload_sha256")
                 conflict = {
                     "schema_version": 1,
                     "kind": "conflict",
