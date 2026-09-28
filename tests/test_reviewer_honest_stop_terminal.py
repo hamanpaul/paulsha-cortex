@@ -1006,3 +1006,32 @@ def test_verify_and_review_terminals_do_not_gain_plan_build_retry_authority(
     assert manager._retryable_nonpassing_workflow_terminal(
         registry2.get_job(review_job["job_id"])
     ) is False
+
+
+def test_review_terminal_without_authority_hashes_is_not_malformed(tmp_path: Path) -> None:
+    """live 回歸（dogfood #1099）：#922 已讓 review terminal 的 `authority_hashes`
+    成為選填（`terminalize_workflow_job` 接受缺席並由 Manager 依 job snapshot
+    補齊），但 #578 的 malformed 預檢在有 planning authority 時要求鍵集合完全
+    等於「含 authority_hashes」的集合，合法 envelope 因此在 terminalize 之前就被
+    判 malformed、耗盡 schema retry 額度。"""
+    registry, _run, job, _authority_hashes, _coordinator_root = _reviewer_terminal_fixture(
+        tmp_path,
+        current_phase="review",
+        executor="claude",
+        model_id="claude-opus-5",
+        independence_domain="anthropic",
+    )
+    payload = {
+        "schema_version": 1,
+        "kind": "workflow-review-result",
+        "reason": "accepted",
+        "findings": [],
+        "reports": [],
+    }
+    _attach_terminal_log(
+        registry,
+        job,
+        log_path=_write_claude_terminal_log(job, payload),
+    )
+
+    assert manager._malformed_workflow_card_terminal(registry.get_job(job["job_id"])) is False

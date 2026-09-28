@@ -1,0 +1,1 @@
+- review terminal 的 malformed 預檢（#578）改為與 terminalize 相同的鍵集合規則：不帶選填 `authority_hashes`（#922）的合法 envelope 不再被判 malformed、不再耗盡 schema retry 額度（live dogfood 發現，#1118）。
