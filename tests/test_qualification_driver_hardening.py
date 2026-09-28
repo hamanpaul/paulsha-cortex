@@ -1263,10 +1263,8 @@ def test_manager_github_probe_uses_only_installed_manager_helper(
     home = tmp_path / "manager-home"
     home.mkdir()
     gitconfig = home / ".gitconfig"
-    gitconfig.write_text(
-        "[credential]\n\thelper = !/usr/bin/gh auth git-credential\n",
-        encoding="utf-8",
-    )
+    # 與 permgen.build_account_gitconfig() 為 durable owner 產生的形狀相同（#716）。
+    gitconfig.write_text(_INSTALLED_MANAGER_CREDENTIAL_SECTION, encoding="utf-8")
     repo = tmp_path / "repo"
     repo.mkdir()
     evidence = tmp_path / "evidence"
@@ -1286,11 +1284,7 @@ def test_manager_github_probe_uses_only_installed_manager_helper(
         command = tuple(argv)
         calls.append((command, user, dict(env or {})))
         if "config" in command:
-            return _result(
-                driver,
-                command,
-                stdout=f"global\tfile:{gitconfig}\t!/usr/bin/gh auth git-credential\n",
-            )
+            return _result(driver, command, stdout=_installed_helper_rows(gitconfig))
         if command[:2] == ("/usr/bin/python3", "-c"):
             return _result(driver, command, stdout="credential-ok\n")
         if "ls-remote" in command:
@@ -1312,13 +1306,41 @@ def test_manager_github_probe_uses_only_installed_manager_helper(
     assert payload["before_sha256"] == payload["after_sha256"]
 
 
+_INSTALLED_MANAGER_CREDENTIAL_SECTION = (
+    '[credential "https://github.com"]\n'
+    "\thelper =\n"
+    "\thelper = !/usr/bin/gh auth git-credential\n"
+)
+_HELPER_KEY = "credential.https://github.com.helper"
+
+
+def _installed_helper_rows(gitconfig) -> str:
+    """`git config --show-origin --show-scope --get-regexp` 對 installed gitconfig 的真實輸出。"""
+
+    origin = f"file:{gitconfig}"
+    return (
+        f"global\t{origin}\t{_HELPER_KEY} \n"
+        f"global\t{origin}\t{_HELPER_KEY} !/usr/bin/gh auth git-credential\n"
+    )
+
+
 @pytest.mark.parametrize(
     "config_output",
     [
-        "global\tfile:/installed/.gitconfig\t!/usr/bin/gh auth git-credential\n"
-        "local\tfile:/repo/.git/config\tstore\n",
-        "global\tfile:/wrong/.gitconfig\t!/usr/bin/gh auth git-credential\n",
-        "global\tfile:/installed/.gitconfig\tstore\n",
+        # repo 本地再加掛一個 helper（排在 reset 之後，會真的生效）
+        _installed_helper_rows("/installed/.gitconfig")
+        + "local\tfile:/repo/.git/config\tcredential.helper store\n",
+        # 來源不是 installed gitconfig
+        _installed_helper_rows("/wrong/.gitconfig"),
+        # 舊的不限 URL 形狀（installer 從不產生）
+        "global\tfile:/installed/.gitconfig\tcredential.helper !/usr/bin/gh auth git-credential\n",
+        # 缺少清空繼承 helper 的 reset 列
+        f"global\tfile:/installed/.gitconfig\t{_HELPER_KEY} !/usr/bin/gh auth git-credential\n",
+        # helper 不是 gh
+        f"global\tfile:/installed/.gitconfig\t{_HELPER_KEY} \n"
+        f"global\tfile:/installed/.gitconfig\t{_HELPER_KEY} store\n",
+        # 找不到任何 helper
+        "",
     ],
 )
 def test_manager_github_probe_rejects_ambiguous_or_uninstalled_helpers(
@@ -1347,6 +1369,65 @@ def test_manager_github_probe_rejects_ambiguous_or_uninstalled_helpers(
         )
 
 
+def test_manager_helper_inventory_parses_real_git_output_for_the_installed_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：canary 以 `credential.helper` 查不到 installer 寫的 URL-scoped helper。"""
+
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git is unavailable")
+    driver = _load_driver()
+    home = tmp_path / "manager-home"
+    home.mkdir()
+    gitconfig = home / ".gitconfig"
+    gitconfig.write_text(_INSTALLED_MANAGER_CREDENTIAL_SECTION, encoding="utf-8")
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    monkeypatch.setattr(
+        driver.pwd,
+        "getpwnam",
+        lambda _account: SimpleNamespace(pw_dir=str(home), pw_uid=os.getuid()),
+    )
+    monkeypatch.setattr(
+        driver, "_require_installed_manager_gitconfig", lambda path: None
+    )
+    refs = "a" * 40 + "\trefs/heads/main\n"
+
+    def fake_run(argv, *, user=None, env=None, timeout=120):
+        command = tuple(argv)
+        if "config" in command:
+            completed = subprocess.run(
+                ["git", *command[1:]],
+                capture_output=True,
+                text=True,
+                env={"HOME": str(home), "PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1"},
+                check=False,
+            )
+            return driver.CommandResult(
+                command, completed.returncode, completed.stdout, completed.stderr
+            )
+        if command[:2] == ("/usr/bin/python3", "-c"):
+            return _result(driver, command, stdout="credential-ok\n")
+        if "ls-remote" in command:
+            return _result(driver, command, stdout=refs)
+        return _result(driver, command)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    driver._manager_github_probe("owner/repo", "b" * 40, evidence, source_repo=repo)
+    (repo / ".git" / "config").write_text(
+        (repo / ".git" / "config").read_text(encoding="utf-8")
+        + "[credential]\n\thelper = store\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(driver.QualificationFailure, match="credential helper"):
+        driver._manager_github_probe("owner/repo", "b" * 40, evidence, source_repo=repo)
+
+
 def test_manager_github_probe_does_not_emit_credential_material(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1364,12 +1445,7 @@ def test_manager_github_probe_does_not_emit_credential_material(
     def fake_run(argv, **_kwargs):
         if "config" in argv:
             return _result(
-                driver,
-                argv,
-                stdout=(
-                    "global\tfile:/installed/.gitconfig\t"
-                    "!/usr/bin/gh auth git-credential\n"
-                ),
+                driver, argv, stdout=_installed_helper_rows("/installed/.gitconfig")
             )
         if tuple(argv[:2]) == ("/usr/bin/python3", "-c"):
             return _result(driver, argv, stdout="username=manager\npassword=SECRET\n")
@@ -3089,3 +3165,13 @@ def test_full_dispatch_reports_the_structured_needs_human_reason(
             timeout=30,
             evidence_dir=tmp_path / "evidence",
         )
+
+
+def test_manager_helper_expectation_matches_the_permgen_generated_gitconfig() -> None:
+    """driver 對 installed helper 的預期必須與 permgen 產生的設定同源（#716）。"""
+
+    from paulsha_cortex.trust_root import permgen
+
+    driver = _load_driver()
+    assert driver.GITHUB_HTTPS_CREDENTIAL_URL == permgen.GITHUB_HTTPS_CREDENTIAL_URL
+    assert driver.MANAGER_GH_CREDENTIAL_HELPER == permgen.durable_owner_git_credential_helper()
