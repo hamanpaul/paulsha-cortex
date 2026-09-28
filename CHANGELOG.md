@@ -13,6 +13,7 @@
 - **#716 deployment canary provider preflight**：copilot status server 移除會跳過已存登入的 `--no-auto-login`、允許超額使用時不誤判 quota 用盡、codex 方案額度可用時不要求加購 credits（#716）。
 - **#716 deployment canary agy smoke**：agy 1.2.x 的 JSON 輸出不帶 model／effort，改以持久化對話的模型變體 id 證明實際模型與 effort，修正 canary 在 provider smoke 必然失敗（#716）。
 - **installer receipt 界限**：目錄快照改記子孫 digest＋count、完整清單存 root-only 旁檔；getfacl 加 `-E`；rollback 還原 unit 後執行 `systemctl daemon-reload`；preflight 事前拒絕過大既有檔與 symlink（#1123）。
+- **legacy adoption 唯讀 inventory**：新增 `cortex install trust-root legacy inventory`（root、shared lock、唯讀、既有 receipt／snapshot／lease 時拒絕並指向 `--prior-receipt`、no-overwrite 輸出）與 `legacy show`（非 root 摘要）；inventory schema v1 以穩定欄位自證 digest、scope digest 與 machine-id 雜湊綁定主機，credential 類只記 metadata，job 帳號以 kernel `access(2)` 做可寫 census；`--host-overlay` 只接受 allowlist key（#1122）。
 - **installer receipt 界限**：目錄快照改記子孫 digest＋count、完整清單存 root-only 旁檔（receipt `schema_version` 升為 2，舊版明確拒收；受管目錄內的舊 receipt 維持內嵌不建旁檔）；getfacl 加 `-E`；rollback 還原 unit 後執行 `systemctl daemon-reload`；preflight 事前拒絕過大既有檔與 symlink（#1123）。
 - **trust-root legacy adoption 規格**：新增 OpenSpec change `trust-root-legacy-adoption`，定義無 receipt 舊主機的 inventory、host overlay、disposition、quarantine 搬移、rollback 證明與 RC profile；僅規格（#1122）。
 - **review malformed 預檢**：接受不帶選填 `authority_hashes` 的合法 review envelope（#1118）。

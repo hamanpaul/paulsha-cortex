@@ -17,6 +17,15 @@ from typing import Iterator, Mapping, Sequence
 import yaml
 
 from .backend import LocalInstallBackend
+from .legacy import (
+    LegacyInventory,
+    LocalLegacyHostBackend,
+    apply_host_overlay,
+    collect_legacy_inventory,
+    publish_inventory,
+    render_inventory_summary,
+    validate_host_overlay,
+)
 from .core import (
     InstallError,
     InstallPlanError,
@@ -705,12 +714,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="skip receipts that are not in an incomplete rollback-safe state",
     )
     rollback.add_argument("--maintenance-token")
+
+    legacy = sub.add_parser(
+        "legacy", help="read-only inventory of a host deployed without a receipt"
+    )
+    legacy_sub = legacy.add_subparsers(dest="legacy_command", required=True)
+    legacy_inventory = legacy_sub.add_parser(
+        "inventory",
+        help="capture a root-only, read-only, self-digested legacy inventory",
+    )
+    legacy_inventory.add_argument("--config", required=True)
+    legacy_inventory.add_argument(
+        "--host-overlay",
+        help="allowlisted host delta (account ids, egress home, operator/reader, builder providers)",
+    )
+    legacy_inventory.add_argument("--bundle", required=True)
+    legacy_inventory.add_argument(
+        "--output", required=True, help="new file; an existing path is never overwritten"
+    )
+    legacy_show = legacy_sub.add_parser(
+        "show", help="print a review summary of a legacy inventory"
+    )
+    legacy_show.add_argument("--inventory", required=True)
     return parser
 
 
-def _plan_command(args: argparse.Namespace) -> int:
-    config = _load_mapping(Path(args.config), label="trust-root config")
-    manifest = validate_bundle_manifest(Path(args.bundle))
+def _bound_plan_from_config(
+    config: Mapping[str, object], bundle: Path
+) -> dict[str, object]:
+    """Plan ``config`` against a validated bundle exactly as ``plan`` does."""
+
+    manifest = validate_bundle_manifest(bundle)
     repo_identity = config.get("repo_identity")
     if not isinstance(repo_identity, Mapping) or repo_identity.get("commit") != manifest["candidate_sha"]:
         raise InstallPlanError(
@@ -765,6 +799,12 @@ def _plan_command(args: argparse.Namespace) -> int:
     ):
         raise InstallPlanError("bundle wheelhouse must include the exact candidate wheel")
     plan["receipt_path"] = str(canonical_receipt_path(plan))
+    return plan
+
+
+def _plan_command(args: argparse.Namespace) -> int:
+    config = _load_mapping(Path(args.config), label="trust-root config")
+    plan = _bound_plan_from_config(config, Path(args.bundle))
     output = Path(args.output).expanduser().absolute()
     atomic_write_json(output, plan, mode=0o600)
     _emit({"output": str(output), "plan_sha256": plan_sha256(plan)})
@@ -1064,6 +1104,98 @@ def _rollback_command(args: argparse.Namespace) -> int:
     return 0 if payload["restore_safe"] is True else 1
 
 
+_RECEIPT_MANAGED_HINT = (
+    "this host is managed by the transactional installer; upgrade it with "
+    "`apply --prior-receipt <applied and qualified receipt>` instead of legacy adoption"
+)
+
+
+@contextmanager
+def _legacy_inventory_admission(plan: Mapping[str, object]) -> Iterator[None]:
+    """Admit a read-only legacy capture on a quiescent host with no receipt history.
+
+    It holds the maintenance lock shared (no lease may start mid-capture) and
+    the host-global transaction lock shared (no mutating transaction runs, while
+    concurrent read-only captures may).  It creates nothing outside the
+    tmpfs lock directory: the maintenance snapshot is only probed, never opened
+    through the helpers that create its persistent parent.
+    """
+
+    with _host_lock_file(leaf="maintenance.lock") as maintenance_fd:
+        try:
+            fcntl.flock(maintenance_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise InstallError(
+                f"a trust-root maintenance lease is active; {_RECEIPT_MANAGED_HINT}"
+            ) from exc
+        try:
+            marker = _maintenance_lock_payload(maintenance_fd, allow_absent=True)
+        except InstallError:
+            marker = {"invalid": True}
+        if marker is not None:
+            raise InstallError(
+                f"a trust-root maintenance lease marker exists; {_RECEIPT_MANAGED_HINT}"
+            )
+        with _host_lock(
+            leaf="transaction.lock",
+            conflict="another trust-root transaction is running; legacy inventory needs it to finish",
+            shared=True,
+        ):
+            receipt_parent = canonical_receipt_path(plan).parent
+            if os.path.lexists(receipt_parent):
+                raise InstallError(
+                    f"canonical receipt parent exists: {receipt_parent}; {_RECEIPT_MANAGED_HINT}"
+                )
+            snapshot = _maintenance_snapshot_path()
+            if os.path.lexists(snapshot):
+                raise InstallError(
+                    f"maintenance snapshot exists: {snapshot}; {_RECEIPT_MANAGED_HINT}"
+                )
+            yield
+
+
+def _legacy_inventory_command(args: argparse.Namespace) -> int:
+    _require_root()
+    config = _load_mapping(Path(args.config), label="trust-root config")
+    overlay = (
+        validate_host_overlay(
+            _load_mapping(Path(args.host_overlay), label="host overlay")
+        )
+        if args.host_overlay is not None
+        else None
+    )
+    plan = _bound_plan_from_config(
+        apply_host_overlay(config, overlay), Path(args.bundle)
+    )
+    output = Path(args.output).expanduser().absolute()
+    if os.path.lexists(output):
+        raise InstallError(
+            f"legacy inventory output already exists; refusing to overwrite: {output}"
+        )
+    with _legacy_inventory_admission(plan):
+        document = collect_legacy_inventory(
+            plan=plan, backend=LocalLegacyHostBackend(), host_overlay=overlay
+        )
+        publish_inventory(output, document)
+    host = document["host"]
+    assert isinstance(host, Mapping)
+    _emit(
+        {
+            "output": str(output),
+            "inventory_sha256": document["inventory_sha256"],
+            "scope_sha256": document["scope_sha256"],
+            "host_binding_sha256": host["binding_sha256"],
+        }
+    )
+    return 0
+
+
+def _legacy_show_command(args: argparse.Namespace) -> int:
+    inventory = LegacyInventory.load(Path(args.inventory).expanduser().absolute())
+    sys.stdout.write(render_inventory_summary(inventory))
+    return 0
+
+
 def _receipt_restore_safe(document: Mapping[str, object]) -> bool:
     """Prove that restarting the pre-transaction services is safe."""
 
@@ -1112,6 +1244,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _verify_command(args)
         if args.trust_root_command == "rollback":
             return _rollback_command(args)
+        if args.trust_root_command == "legacy":
+            if args.legacy_command == "inventory":
+                return _legacy_inventory_command(args)
+            return _legacy_show_command(args)
     except (InstallError, PermissionError, OSError, ValueError) as exc:
         sys.stderr.write(f"trust-root install failed: {exc}\n")
         return 1
