@@ -13,6 +13,7 @@ from . import quota_observation as schema
 from .quota_ledger import (
     LedgerAppendResult, LedgerCorrupt, QuotaEventLedger,
     _cross_identity_conflict_digest, _is_terminal_usage_observation,
+    _snapshot_has_known_window_epoch,
 )
 from .quota_sources import (
     CoverageGap, ProviderCapture, ProviderQuotaTarget, capture_provider_quota, _parse_iso_epoch_ms,
@@ -43,7 +44,8 @@ class _MemoryLedger:
                             terminal_job_started_at_ms=None, terminal_job_finished_at_ms=None):
         from .quota_ledger import (
             _canonical_bytes, _idempotency_key as make_key,
-            _observation_digest_payload, _same_snapshot_value, _terminal_usage_metadata,
+            _observation_digest_payload, _same_snapshot_value,
+            _snapshot_has_known_window_epoch, _terminal_usage_metadata,
         )
 
         wire = observation.to_dict()
@@ -56,16 +58,32 @@ class _MemoryLedger:
         )
         digest_payload = _observation_digest_payload(wire, normalized, terminal_metadata)
         digest = hashlib.sha256(_canonical_bytes(digest_payload)).hexdigest()
-        prior = next((row for row in self.events if row.get("idempotency_key") == key
-                      and row.get("kind") == "observation"), None)
+        previous = [row for row in self.events if row.get("idempotency_key") == key
+                    and row.get("kind") == "observation"]
+        prior = previous[-1] if previous else None
         conflict = next((row for row in self.events if row.get("idempotency_key") == key
                          and row.get("kind") == "conflict"), None)
         if conflict:
             return LedgerAppendResult("conflict", conflicts=1, idempotency_key=key)
         if prior:
-            if prior["payload_sha256"] == digest or _same_snapshot_value(
-                prior.get("observation"), wire
-            ):
+            if any(row.get("payload_sha256") == digest for row in previous):
+                return LedgerAppendResult("duplicate", duplicates=1, idempotency_key=key)
+            same_value = [row for row in self.events
+                          if row.get("idempotency_key") == key
+                          and row.get("kind") == "observation"
+                          and _same_snapshot_value(row.get("observation"), wire)]
+            if same_value:
+                if (_snapshot_has_known_window_epoch(wire)
+                        and not any(_snapshot_has_known_window_epoch(
+                            row.get("observation")
+                        ) for row in same_value)):
+                    row = {"schema_version": 1, "kind": "observation", "idempotency_key": key,
+                           "payload_sha256": digest, "observation": wire}
+                    row.update(terminal_metadata)
+                    if normalized:
+                        row["associations"] = normalized
+                    self.events.append(row)
+                    return LedgerAppendResult("accepted", accepted=1, idempotency_key=key)
                 return LedgerAppendResult("duplicate", duplicates=1, idempotency_key=key)
             self.events.append({
                 "schema_version": 1, "kind": "conflict", "idempotency_key": key,
@@ -517,8 +535,14 @@ class QuotaShadowService:
                     continue
                 if freshness.get("state") != "fresh":
                     continue
-                snapshot_candidates.append((observed_at if type(observed_at) is int else -1, record, observation))
-            selected = max(snapshot_candidates, key=lambda item: (item[0], item[2].observation_id), default=None)
+                snapshot_candidates.append((
+                    observed_at if type(observed_at) is int else -1,
+                    _snapshot_has_known_window_epoch(wire),
+                    observation.observation_id,
+                    record,
+                    observation,
+                ))
+            selected = max(snapshot_candidates, key=lambda item: item[:3], default=None)
             conflict_at = conflicts.get(key)
             if clock_rollback:
                 row["remaining"] = _unknown("clock-rollback")
@@ -537,7 +561,7 @@ class QuotaShadowService:
                 row["remaining"] = _unknown("source-conflict")
                 row["coverage_gaps"].append("source-conflict")
             else:
-                _, selected_record, selected_observation = selected
+                _, _, _, selected_record, selected_observation = selected
                 selected_wire = selected_observation.to_dict()
                 quantity = selected_wire["measurement"]["quantity"]
                 row["remaining"] = _copy_quantity(quantity)
