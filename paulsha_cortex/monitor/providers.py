@@ -26,6 +26,7 @@ from .decision_projection import (
     QUOTA_WAIT_REASONS,
     DecisionReadCache,
     current_identity_by_persona_from_steps,
+    jobs_for_run_from_rows,
     project_workflow_quota_admission,
 )
 from .git_mirror import (
@@ -570,6 +571,7 @@ class WorkflowRegistryProvider:
                     row,
                     store=self._quota_decision_store,
                     cache=self._quota_decision_cache,
+                    job_rows=job_rows,
                 )
                 if quota_projection is not None:
                     # 對抗審查第三輪（MAJOR）：`rows` 內同一個 work_id 可能對應
@@ -802,6 +804,7 @@ def _quota_decision_row(
     *,
     store: "quota_admission_module.AdmissionDecisionStore",
     cache: DecisionReadCache,
+    job_rows: object = None,
 ) -> dict[str, object] | None:
     """#840：從 run row 取出 quota-aware admission 決策投影。
 
@@ -810,6 +813,12 @@ def _quota_decision_row(
     才回傳非 ``None``；呈現面計算失敗（store 損毀等）由
     ``decision_projection`` 內部處理成 stale 標記，這裡不吞例外——投影模組
     本身是唯讀且不拋出非預期例外（見其文件字串）。
+
+    ``job_rows``（對抗審查第四輪，本票 live 缺陷）：``scan()`` 同一次快照已
+    經讀到的完整 ``payload["jobs"]``——這裡只做記憶體內篩選（見
+    `decision_projection.jobs_for_run_from_rows`），不重新讀檔，供
+    `_attempt_mismatch_reason` 的 admit 分支以 job 事實（是否仍在執行）取代
+    已證實不可靠的 step executor／model 比對。
     """
 
     quota_admission_pointers = row.get("quota_admission")
@@ -820,8 +829,9 @@ def _quota_decision_row(
     )
     if not quota_admission_pointers and not has_wait:
         return None
+    run_id = str(row.get("run_id") or "")
     return project_workflow_quota_admission(
-        run_id=str(row.get("run_id") or ""),
+        run_id=run_id,
         quota_admission=quota_admission_pointers if isinstance(quota_admission_pointers, Mapping) else None,
         needs_human_reason=needs_human_reason if isinstance(needs_human_reason, Mapping) else None,
         execution_profile_bindings=(
@@ -830,11 +840,11 @@ def _quota_decision_row(
             else None
         ),
         # 對抗審查第三輪（MAJOR）：見 `_current_persona_identity_from_steps`
-        # 與 `decision_projection._attempt_mismatch_reason` 文件字串——只有
-        # `WorkflowRegistryProvider.scan()` 這條路徑（有完整 `row["steps"]`）
-        # 目前會傳這個參數；`manager.workflow_status_entry()`（`cortex
-        # inspect status`）尚未接上同一個檢查，見本檔／changelog 對應說明。
+        # 與 `decision_projection._attempt_mismatch_reason` 文件字串——兩條
+        # 路徑（本 provider 與 `manager.workflow_status_entry()`）現在都傳
+        # 這個參數，見本檔／changelog 對應說明。
         current_identity_by_persona=_current_persona_identity_from_steps(row.get("steps")),
+        jobs=jobs_for_run_from_rows(job_rows, run_id),
         store=store,
         cache=cache,
         now_ms=int(time.time() * 1000),

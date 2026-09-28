@@ -1398,7 +1398,11 @@ QUOTA_POOLS_CONFIG_SCHEMA = "cortex/quota-pools/v1"
 _QUOTA_POOLS_CONFIG_REQUIRED_KEYS = frozenset(
     {"schema", "config_revision", "descriptors", "unit_catalog", "bindings"}
 )
-_QUOTA_POOLS_CONFIG_OPTIONAL_KEYS = frozenset({"lease_ms", "usage_unit_refs"})
+#: `collector_targets` 屬於 #836 provider collector（`quota_collectors.load_collector_config`
+#: 解析並驗證）；同一份設定檔同時供 admission 與 collector 使用，admission 只接受
+#: 這個鍵存在、不解讀其內容（live 驗收發現：封閉鍵集合把它當未知鍵，shadow 整條
+#: 退回「沒接上」）。
+_QUOTA_POOLS_CONFIG_OPTIONAL_KEYS = frozenset({"lease_ms", "usage_unit_refs", "collector_targets"})
 _QUOTA_POOLS_CONFIG_ALL_KEYS = _QUOTA_POOLS_CONFIG_REQUIRED_KEYS | _QUOTA_POOLS_CONFIG_OPTIONAL_KEYS
 _MAX_LEASE_MS_CONFIG = 31_622_400_000  # 一年——單純防呆上限，比照 #838 的常數
 #: 對抗審查第四輪 MAJOR（quota_admission.py:1119）：lease 太短時，正常的

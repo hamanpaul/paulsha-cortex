@@ -15,6 +15,18 @@ reason／freshness 不會因為兩個呈現面各自重算而長得不一樣。
 allowlist：只輸出下面列舉的非機敏欄位；``selected``／``excluded`` 即使呼叫端
 （測試或未來 producer）塞進了非預期 key（例如 credential、env、raw prompt），
 本模組也只挑出白名單內的欄位，不逐字轉發。
+
+對抗審查第四輪（本票，live 缺陷實錄）：`_attempt_mismatch_reason` 的 admit
+分支過去比對 step 的 ``executor``／``model`` 是否與 decision 的 ``selected``
+一致——live canary 撞到：正式派工路徑把 admission receipt（候選選定當下）
+與 step 身分（`_record_resolved_model_chain()`，job 建立、dispatch 之後才
+落地）分兩個時間點寫入，job 已經在執行、step 身分還是 ``None`` 時就會誤判
+成『已被 retry-card 清空』，把仍在執行的 attempt 誤呈現成已結束。改以
+`decision.attempt_id` 的 job-count ordinal（沿用 #839 舊版
+``_quota_admission_job_lookup_by_attempt`` 記載的解析規則，見
+:func:`_job_ordinal_from_attempt_id`）反查對應的 job 是否仍在執行——不再
+依賴 step 身分是否已經寫入。呼叫端需額外傳入這個 run 的 job rows（見
+:func:`jobs_for_run_from_rows`）。
 """
 
 from __future__ import annotations
@@ -267,11 +279,118 @@ class DecisionReadCache:
         return None, None
 
 
+def _job_ordinal_from_attempt_id(
+    attempt_id: str, *, run_id: str, card_id: str
+) -> int | None:
+    """解析 `_quota_admission_attempt_id` 格式（``f"{run_id}:{card_id}:n{k}"``，
+    可能帶世代後綴 ``:g{generation}``）得到 0-based ordinal ``k``。
+
+    對抗審查第四輪（本票，manager.py:11432 live 缺陷）：沿用 #839 對抗審查
+    第四輪之前、``_quota_admission_job_lookup_by_attempt``（已被
+    ``_quota_admission_job_lookup_by_decision`` 取代，見該函式文件字串）
+    記載的同一套解析規則，不另寫第二套——先剝掉 ``f"{run_id}:{card_id}:n"``
+    前綴、再從尾端剝掉 ``:g{generation}`` 世代後綴，剩下的部分必須是純數字。
+
+    那支函式當年被取代的理由是『ordinal 猜測在多 Manager instance 交錯時會
+    誤配 reservation 歸屬』（見其文件字串）——本模組是唯讀 status 投影，不做
+    reservation 收斂、不呼叫 ``release()``／``bind()``，答錯了也只是呈現面
+    暫時多顯示或少顯示一筆決策，不會誤釋放或誤扣真正的額度容量，不受那個
+    理由影響，因此在這裡重新啟用同一套 ordinal 解析是安全的。
+
+    格式不符一律回 ``None``——由呼叫端視為『這個 attempt 沒有可佐證的 job
+    ordinal』，不臆測。
+    """
+    prefix = f"{run_id}:{card_id}:n"
+    if not attempt_id.startswith(prefix):
+        return None
+    suffix = attempt_id[len(prefix):]
+    ordinal_part, _, generation_part = suffix.partition(":g")
+    if generation_part and not generation_part.isdigit():
+        return None
+    if not ordinal_part.isdigit():
+        return None
+    return int(ordinal_part)
+
+
+def _job_for_attempt(
+    jobs: object, *, run_id: str, card_id: str, attempt_id: str
+) -> Mapping[str, object] | None:
+    """依 ``attempt_id`` 的 ordinal 語意，在 ``jobs``（這個 run 的 job rows，
+    見 :func:`jobs_for_run_from_rows`）中找出當初這個 attempt 建立出來的
+    job——``ordinal`` 既是 `_quota_admission_attempt_id` 判定當下、registry
+    裡已存在的同 run/card job 數，也同時是這個 attempt 建立出來的 job 在
+    『該 run/card 全部 job，依建立順序』中的 0-based 索引（見
+    :func:`_job_ordinal_from_attempt_id` 文件字串）；``jobs`` 必須維持呼叫端
+    給定的既有順序（``registry.list_jobs()``／registry row 的 ``jobs`` 陣列
+    皆依 append 順序），本函式不重排序。
+
+    ``jobs`` 不是 ``list``／``tuple``（呼叫端沒有能力提供 job 事實）、格式
+    無法解出 ordinal，或該 ordinal 超出這個 run/card 目前已知的 job 數
+    （這個 attempt 從未真正建出 job，或已被更晚的 attempt 覆蓋計數）一律
+    回 ``None``——由呼叫端（`_attempt_mismatch_reason`）決定如何處理，本
+    函式不臆測。
+    """
+    if not isinstance(jobs, (list, tuple)):
+        return None
+    ordinal = _job_ordinal_from_attempt_id(attempt_id, run_id=run_id, card_id=card_id)
+    if ordinal is None:
+        return None
+    matching = [
+        job
+        for job in jobs
+        if isinstance(job, Mapping)
+        and job.get("workflow_run_id") == run_id
+        and job.get("workflow_card") == card_id
+    ]
+    if ordinal >= len(matching):
+        return None
+    return matching[ordinal]
+
+
+def _job_is_in_flight(job: Mapping[str, object]) -> bool:
+    """job 目前是否仍在執行——沿用既有 in-flight 狀態集合定義
+    （`manager.IN_FLIGHT_STATUSES`，`_workflow_execution_identity` 既有判準），
+    不重新定義語意、不另寫第二套。模組層級刻意不匯入 ``coordinator.manager``
+    （唯讀 status 投影不需要在載入時就拉進整個派工引擎）；這裡改用函式內
+    lazy import，呼叫時兩個模組都已經完全載入，沒有循環匯入風險。"""
+    from ..coordinator.manager import IN_FLIGHT_STATUSES
+
+    return job.get("status") in IN_FLIGHT_STATUSES
+
+
+def jobs_for_run_from_rows(
+    job_rows: object, run_id: str
+) -> list[Mapping[str, object]] | None:
+    """從『同一份 snapshot 已經讀到的完整 job rows』篩出這個 run 的 job。
+
+    `cortex work show`（`WorkflowRegistryProvider.scan()`，job rows 來自
+    registry payload 的 ``jobs`` 陣列）與 `cortex inspect status`
+    （`manager.workflow_status_entry()`，job rows 來自
+    ``registry.list_jobs()``）都把各自已經在同一次快照內拿到的完整列表傳進
+    來，這裡統一篩選——兩條路徑用同一套篩選規則，對同一個 run 才會算出一致
+    的『目前 attempt』判定（見 :func:`_job_for_attempt`）。刻意不在這裡重新
+    讀檔或呼叫 ``registry.list_jobs()``：那是呼叫端的責任，本函式只做記憶體
+    內的篩選（票面：『同一快照已有的 jobs 清單重用，不額外全檔讀取』）。
+
+    ``job_rows`` 不是 ``list``／``tuple``（呼叫端沒有能力提供，例如尚未接線
+    的舊呼叫端）回 ``None``，與『提供了、但這個 run 目前真的沒有任何 job』
+    （回空 list）是兩件不同的事——`_attempt_mismatch_reason` 只在前者時跳過
+    attempt 判定，後者會正確判定成『這個 attempt 沒有對應的 job』。"""
+    if not isinstance(job_rows, (list, tuple)):
+        return None
+    return [
+        job
+        for job in job_rows
+        if isinstance(job, Mapping) and job.get("workflow_run_id") == run_id
+    ]
+
+
 def _attempt_mismatch_reason(
     decision: "_quota_admission.AdmissionDecision",
     current_identity: object,
     *,
     needs_human_reason: object = None,
+    jobs: object = None,
 ) -> str | None:
     """判斷已找到的 ``decision`` 是否仍對應這個 persona『目前』在處理的卡。
 
@@ -279,14 +398,33 @@ def _attempt_mismatch_reason(
     ``WorkflowRun`` 上，直到下一次同一個 persona 的 admission 決策覆寫它
     為止——`retry-card`（或世代 replay）重置卡片後、新 attempt 尚未寫出
     receipt 前，指標仍指著上一個（已經結束）attempt 的舊 receipt。這裡只
-    比對呼叫端從既有 ``WorkflowRun.steps``（``card``／``executor``／
-    ``model``）推導出的『這個 persona 目前最早未通過的卡』，不重算 #839
-    的候選排序、原子預留或 job-count-based ``attempt_id``——那些仍是
-    quota_admission 模組自己的權責。
+    比對呼叫端從既有 ``WorkflowRun.steps``（``card``）推導出的『這個
+    persona 目前最早未通過的卡』，不重算 #839 的候選排序、原子預留或
+    job-count-based ``attempt_id``——那些仍是 quota_admission 模組自己的
+    權責。
 
     ``current_identity`` 非 ``Mapping``（呼叫端算不出目前卡，例如 persona
     已無未通過的卡）一律視為不相符，不臆測。回 ``None`` 代表相符；非
     ``None`` 是機器可讀的不相符原因。
+
+    對抗審查第四輪（本票，live 缺陷實錄）：admit 分支過去比對
+    ``current_identity`` 的 ``executor``／``model``（來自 ``WorkflowStep``）
+    是否與 ``decision.selected`` 一致——但正式派工路徑（`_dispatch_workflow_card`）
+    寫入 step 身分（`_record_resolved_model_chain()`）與寫入這筆 admission
+    receipt **不是同一個時間點**：receipt 在候選選定當下就寫（見
+    `_quota_admission_record_admit_decision` 呼叫點），job 建立、
+    dispatch、乃至 step 身分落地都在那之後才發生，中間有一段窗口——正式
+    live 環境撞到：job 已經 `create_job()`、`status=dispatched`、正在執行，
+    但 step 身分還是 ``None``，這裡誤判成『身分已被 retry-card 清空』，
+    把仍在執行的 attempt 呈現成已結束。改以 job 事實判定：`decision.attempt_id`
+    的 ordinal（見 :func:`_job_ordinal_from_attempt_id`）反查該 run/card 對應
+    的 job（見 :func:`_job_for_attempt`）——job 存在且仍在執行（見
+    :func:`_job_is_in_flight`）即為當前，不論 step 身分是否已經寫入；job
+    已終局或查無此 job（且卡片尚未 passed，由上面的 ``card`` 比對保證）才是
+    『這個 attempt 已經結束、下一個 attempt 尚無決策』。``jobs`` 由呼叫端
+    傳入這個 run 的 job rows（見 :func:`jobs_for_run_from_rows`）；省略
+    （``None``）代表呼叫端沒有能力提供 job 事實，不臆測，維持逐字既有行為
+    （等同這個決策的 attempt 判定停用，同 ``_ATTEMPT_CHECK_DISABLED`` 語意）。
     """
     if not isinstance(current_identity, Mapping):
         return "current-card-not-derivable"
@@ -296,18 +434,20 @@ def _attempt_mismatch_reason(
         selected = decision.selected if isinstance(decision.selected, Mapping) else None
         if selected is None:
             return "admit-missing-selected"
-        # admit 決策的身分解析（`step.executor`／`step.model`）與 admission
-        # 決策同一次候選迴圈迭代內依序寫入（見 `manager._record_resolved_model_chain`
-        # 呼叫點）；`retry-card` 重置這張卡時把兩者都清成 ``None``（見
-        # `registry._manager_reset_workflow_for_retry_card`），因此『目前
-        # 這張卡的身分』與這筆決策的 ``selected`` 不再一致，正是本檢查要
-        # 抓的訊號。
-        if (
-            current_identity.get("executor") != selected.get("executor")
-            or current_identity.get("model") != selected.get("model_id")
-        ):
-            return "identity-reset-since-decision"
-        return None
+        if jobs is None:
+            return None
+        job = _job_for_attempt(
+            jobs, run_id=decision.run_id, card_id=decision.card_id,
+            attempt_id=decision.attempt_id,
+        )
+        if job is not None and _job_is_in_flight(job):
+            return None
+        # job 已終局，或查無此 job（從未真正建出來，或已被更晚的 attempt
+        # 覆蓋掉這個 ordinal）——這個 attempt 已經結束，下一個 attempt 尚無
+        # 決策；沿用既有 `quota-decision-attempt-superseded` gap_reason，
+        # mismatch_reason 用精確字串描述（不再是『身分被清空』——那從來就
+        # 不是可靠訊號，見本函式文件字串）。
+        return "decision-attempt-ended"
     if decision.outcome == "wait":
         # wait 決策從未寫入 step 身分（見 `manager._quota_admission_stop`／
         # `_quota_admission_config_invalid_stop`：全數候選被拒時不建立任何
@@ -335,6 +475,7 @@ def _project_persona_decision(
     cache: DecisionReadCache,
     now_ms: int,
     needs_human_reason: object = None,
+    jobs: object = None,
 ) -> dict[str, Any] | None:
     if not isinstance(pointer, Mapping):
         return None
@@ -357,7 +498,7 @@ def _project_persona_decision(
         return payload
     if current_identity is not _ATTEMPT_CHECK_DISABLED:
         mismatch_reason = _attempt_mismatch_reason(
-            decision, current_identity, needs_human_reason=needs_human_reason
+            decision, current_identity, needs_human_reason=needs_human_reason, jobs=jobs,
         )
         if mismatch_reason is not None:
             # 不相符：呈現「目前 attempt 尚無決策」，不得沿用舊 attempt 的
@@ -485,6 +626,7 @@ def project_workflow_quota_admission(
     needs_human_reason: Mapping[str, Any] | None,
     execution_profile_bindings: Mapping[str, Mapping[str, Any]] | None = None,
     current_identity_by_persona: Mapping[str, Mapping[str, Any]] | None = None,
+    jobs: object = None,
     store: "_quota_admission.AdmissionDecisionStore",
     cache: DecisionReadCache | None = None,
     now_ms: int,
@@ -502,7 +644,14 @@ def project_workflow_quota_admission(
     比對），只有呼叫端明確傳入時才生效；這是刻意的可選欄位加法（比照
     #835／#839 既有模式），現有呼叫端（例如本模組所有既有單元測試）不必
     跟著改。
-    """
+
+    ``jobs``（對抗審查第四輪，本票 live 缺陷）：呼叫端傳入這個 run 的
+    job rows（見 :func:`jobs_for_run_from_rows`），供 :func:`_attempt_mismatch_reason`
+    的 admit 分支以 job 事實（是否仍在執行）取代已證實不可靠的 step
+    executor／model 比對——見該函式文件字串。同樣是可選欄位加法：省略時
+    admit 分支的 attempt 判定完全停用（不臆測），只影響這個 outcome，不影響
+    ``current_identity_by_persona`` 既有的 card 比對或 wait 分支既有的
+    needs_human_reason 比對。"""
 
     resolved_cache = cache if cache is not None else DecisionReadCache()
     personas: dict[str, Any] = {}
@@ -526,6 +675,7 @@ def project_workflow_quota_admission(
                 cache=resolved_cache,
                 now_ms=now_ms,
                 needs_human_reason=needs_human_reason,
+                jobs=jobs,
             )
             if projected is not None:
                 personas[persona] = projected

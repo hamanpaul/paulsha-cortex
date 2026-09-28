@@ -558,13 +558,14 @@ def test_refresher_quota_decision_cache_survives_across_refresh_ticks_for_last_g
     spec.write_text("---\nwork_item: work\n---\n# work\n", encoding="utf-8")
 
     registry = JobRegistry()
-    # #840 對抗審查第三輪（MAJOR）：步卡 executor／model 必須對齊下面 admit
-    # 決策的 `selected`——`WorkflowRegistryProvider.scan()` 現在會比對兩者
-    # 是否相符（見 `decision_projection._attempt_mismatch_reason`），不一致
-    # 會被判成『目前 attempt 尚無決策』，不是這裡要驗證的 last-good 快取。
+    # #840 對抗審查第四輪（本票 live 缺陷）：目前 attempt 改以 job 事實判定
+    # （見 `decision_projection._attempt_mismatch_reason` 文件字串），不再
+    # 比對步卡 executor／model——step 身分維持 ``None``（尚未寫入），改用
+    # 一筆真正 in-flight 的 registry job 佐證『目前 attempt』，
+    # `decision.attempt_id` 依既有 ordinal 格式對上這個 job（第 0 個）。
     step = WorkflowStep(
         phase="build", persona="builder", card="build-card",
-        executor="codex", model="gpt-5.3-codex", domain="test-domain",
+        executor=None, model=None, domain="test-domain",
         inputs=(), outputs=(), gate_result="pending",
     )
     run = registry._manager_create_workflow_run(
@@ -573,10 +574,17 @@ def test_refresher_quota_decision_cache_survives_across_refresh_ticks_for_last_g
         combo="feature-oneshot", current_phase="build",
         steps=(step,), attempts={"build": 1}, facets=(), gate_status="running",
     )
+    registry.create_job(
+        task=f"{run.run_id}-build-card", persona="builder",
+        branch="feature/work-api-840", pane="", worktree=str(repo / "worktree"),
+        executor="codex", model_id="gpt-5.3-codex",
+        workflow_run_id=run.run_id, workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo, workflow_card="build-card", workflow_phase=run.current_phase,
+    )
     store = admission.AdmissionDecisionStore()
     decision = admission.AdmissionDecision(
         decision_id="adm:v1:" + "9" * 64, run_id=run.run_id, card_id="build-card",
-        attempt_id="attempt-0", profile_key="epk:v1:resolved:" + "a" * 64,
+        attempt_id=f"{run.run_id}:build-card:n0", profile_key="epk:v1:resolved:" + "a" * 64,
         mode="shadow", outcome="admit", policy_version=admission.ADMISSION_POLICY_VERSION,
         observation_version="shadow-projection:" + "b" * 16,
         demand_version=admission.DEMAND_FIXTURE_VERSION, qualification_version="not-enforced",

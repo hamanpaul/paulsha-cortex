@@ -1,0 +1,1 @@
+- #839／#836 交互修正：admission 的 `parse_quota_pools_config` 以封閉鍵集合拒絕 #836 collector 文件允許的選填 `collector_targets`（`quota-pools-config-unknown-key`），live 上照 collector 文件把 targets 放進 `quota-pools.json` 後，shadow 整條退回「沒接上」、派工不寫 decision receipt。改為接受 `collector_targets`（admission 不解讀其內容，仍由 collector 驗證），其他未知鍵照舊拒絕；新增兩個 loader 共讀同一檔的回歸測試。
