@@ -87,8 +87,22 @@ ASSET_PRIOR_SNAPSHOT_MAX_BYTES = 1024 * 1024
 # installer would find no ``children`` and misreport the whole directory as
 # unknown; it refuses any ``schema_version`` other than 1, so every write uses
 # v2.  Loading still accepts v1 (inline ``children``) receipts.
+#
+# v3 is v2 plus legacy adoption (#1122): ``legacy-quarantine`` entries, the
+# ``legacy_adoption`` record and ``adoption`` rows.  An installer that reads
+# only v1/v2 cannot inspect or roll back a quarantine step, so a receipt whose
+# plan carries a ``legacy_adoption`` block is always written as v3 and such an
+# installer refuses it at load; every other receipt stays v2 unchanged.
 _RECEIPT_SCHEMA_VERSION = 2
-_READABLE_RECEIPT_SCHEMA_VERSIONS = (1, 2)
+_LEGACY_RECEIPT_SCHEMA_VERSION = 3
+_READABLE_RECEIPT_SCHEMA_VERSIONS = (1, 2, 3)
+
+
+def _receipt_schema_version(document: Mapping[str, object]) -> int:
+    plan = document.get("plan")
+    if isinstance(plan, Mapping) and plan.get("legacy_adoption") is not None:
+        return _LEGACY_RECEIPT_SCHEMA_VERSION
+    return _RECEIPT_SCHEMA_VERSION
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -2746,7 +2760,7 @@ class InstallReceipt:
         if self.path is not None:
             if self._document.get("effective_receipt_path") != str(self.path):
                 raise InstallError("receipt effective path binding is invalid")
-            self._document["schema_version"] = _RECEIPT_SCHEMA_VERSION
+            self._document["schema_version"] = _receipt_schema_version(self._document)
             if self._inline_inventories:
                 document = self._document_with_inline_inventories()
             else:
@@ -2826,6 +2840,21 @@ class InstallReceipt:
         plan = payload.get("plan")
         if not isinstance(plan, Mapping) or payload.get("plan_sha256") != plan_sha256(plan):
             raise InstallError(f"receipt embedded plan hash is invalid: {path}")
+        # v3 is exactly the legacy adoption receipt: a legacy plan or record
+        # in a v1/v2 receipt, or a v3 receipt without one, is refused.
+        legacy_receipt = (
+            plan.get("legacy_adoption") is not None or "legacy_adoption" in payload
+        )
+        if (version == _LEGACY_RECEIPT_SCHEMA_VERSION) != legacy_receipt:
+            raise InstallError(
+                f"invalid receipt schema: v{version} "
+                + (
+                    "must not carry a legacy adoption"
+                    if legacy_receipt
+                    else "is reserved for a legacy adoption receipt"
+                )
+                + f": {path}"
+            )
         if payload.get("effective_receipt_path") != str(path):
             raise InstallError(f"receipt effective path binding is invalid: {path}")
         if expected_plan is not None and canonical_plan_bytes(plan) != canonical_plan_bytes(
@@ -3760,7 +3789,7 @@ def new_install_receipt(
     effective_path = path if path is not None else canonical_receipt_path(plan)
     receipt = InstallReceipt(
         {
-            "schema_version": _RECEIPT_SCHEMA_VERSION,
+            "schema_version": _receipt_schema_version({"plan": plan}),
             "receipt_id": str(uuid.uuid4()),
             "effective_receipt_path": str(effective_path),
             "plan_sha256": plan_sha256(plan),
@@ -6392,6 +6421,23 @@ def _rollback_legacy_quarantine(
         retained_drift.append({"step_id": step_id, "observed": {"error": str(exc)}})
         return
     if _quarantine_in_place(prior, state):
+        if state.get("destination") is not None:
+            # The legacy object never moved (or is back), yet something sits
+            # where this entry would have put it: outside the inventory's
+            # scope, so only the entry can keep it from being overlooked.
+            retained_drift.append(
+                {
+                    "step_id": step_id,
+                    "observed": {
+                        "error": (
+                            "quarantine destination occupied by an unexpected object; "
+                            "the entry stays for the operator"
+                        ),
+                        **state,
+                    },
+                }
+            )
+            return
         forget(entry)  # never moved, or already moved back
         return
     if not _quarantine_moved(step, state):
@@ -6420,7 +6466,7 @@ def _rollback_legacy_quarantine(
     except Exception as exc:
         retained_drift.append({"step_id": step_id, "observed": {"error": str(exc)}})
         return
-    if not _quarantine_in_place(prior, restored):
+    if not _quarantine_in_place(prior, restored) or restored.get("destination") is not None:
         retained_drift.append({"step_id": step_id, "observed": restored})
         return
     forget(entry)
@@ -6783,7 +6829,20 @@ def rollback_receipt(
     if legacy_record is not None:
         # Rollback of a legacy adoption must prove the host is the reviewed
         # legacy host again; anything short of that keeps services stopped.
-        if isinstance(legacy_record, Mapping) and isinstance(plan_document, Mapping):
+        # Entries still in the journal are mutations (or quarantine slots)
+        # this rollback could not reverse -- some lie outside the inventory's
+        # scope, so a matching re-capture alone would not prove restoration.
+        if journal:
+            legacy_restored, detail = False, {
+                "error": (
+                    f"{len(journal)} journal entr{'y was' if len(journal) == 1 else 'ies were'} "
+                    "not reversed; the legacy host cannot be proven restored"
+                ),
+                "retained_steps": [
+                    str(entry.get("step_id")) for entry in journal if isinstance(entry, Mapping)
+                ],
+            }
+        elif isinstance(legacy_record, Mapping) and isinstance(plan_document, Mapping):
             from .legacy import prove_legacy_restored
 
             legacy_restored, detail = prove_legacy_restored(

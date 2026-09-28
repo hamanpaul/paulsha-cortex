@@ -1097,6 +1097,41 @@ def test_stranded_substitute_is_recorded_and_never_restored_as_legacy(
     assert "quarantine_unexpected" in _rollback_entry(loaded.to_dict(), stray["step_id"])
 
 
+def test_rollback_keeps_a_prepared_quarantine_whose_destination_was_occupied(
+    tmp_path: Path,
+) -> None:
+    case = LegacyCase(tmp_path)
+    stray = case.step(f"legacy-quarantine:{case.seeded['stray']}")
+    receipt = new_install_receipt(case.plan)
+    original = case.backend.quarantine_step
+
+    def killed_before_the_rename(entry):
+        if entry["step_id"] == stray["step_id"]:
+            raise SystemExit("killed after the prepared checkpoint, before the rename")
+        return original(entry)
+
+    case.backend.quarantine_step = killed_before_the_rename  # type: ignore[method-assign]
+    with pytest.raises(SystemExit):
+        case.apply(receipt)
+    assert _entry(receipt.to_dict(), stray["step_id"])["status"] == "prepared"
+    # Something appears at the (never used) quarantine destination.
+    destination = Path(stray["destination"])
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination.write_text("planted\n")
+
+    report = rollback_receipt(receipt, backend=case.backend, legacy_host=case.host)
+
+    row = next(row for row in report.retained_drift if row["step_id"] == stray["step_id"])
+    assert "destination occupied by an unexpected object" in row["observed"]["error"]
+    assert _rollback_entry(receipt.to_dict(), stray["step_id"])["status"] == "prepared"
+    assert report.legacy_restored is False
+    assert receipt.to_dict()["rollback"]["legacy_restored"] is False
+    assert receipt.to_dict()["state"] == "rollback-blocked"
+    assert install_cli._receipt_restore_safe(receipt.to_dict()) is False
+    assert case.seeded["stray"].lstat().st_ino == stray["expected"]["ino"]
+    assert destination.read_text() == "planted\n"
+
+
 def _rollback_entry(document: dict, step_id: str) -> dict:
     return next(entry for entry in document["journal"] if entry["step_id"] == step_id)
 
@@ -1297,6 +1332,90 @@ def test_receipt_load_rejects_tampered_legacy_provenance(
 
     with pytest.raises(InstallError, match=named):
         InstallReceipt.load(path, expected_plan=case.plan)
+
+
+def _schema_version(path: Path) -> object:
+    return json.loads(path.read_text(encoding="utf-8"))["schema_version"]
+
+
+def test_legacy_receipts_are_schema_v3_and_plain_receipts_stay_v2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = LegacyCase(tmp_path)
+    receipt, path = _durable(monkeypatch, case)
+    assert _schema_version(path) == 3
+    case.apply(receipt)
+    assert _schema_version(path) == 3
+    assert InstallReceipt.load(path, expected_plan=case.plan).to_dict()["schema_version"] == 3
+
+    plain_path = tmp_path / "receipts" / "plain.json"
+    new_install_receipt(_plain_plan(tmp_path / "plain"), path=plain_path)
+    assert _schema_version(plain_path) == 2
+
+    # An installer that reads only v1/v2 (every one before legacy adoption)
+    # refuses the legacy receipt at load instead of failing mid-rollback on a
+    # step kind it does not know.
+    monkeypatch.setattr(install_core, "_READABLE_RECEIPT_SCHEMA_VERSIONS", (1, 2))
+    with pytest.raises(InstallError, match="invalid receipt schema"):
+        InstallReceipt.load(path)
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_receipt_v1_v2_must_not_carry_a_legacy_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: int
+) -> None:
+    case = LegacyCase(tmp_path)
+    receipt, path = _durable(monkeypatch, case)
+    case.apply(receipt)
+
+    _tampered(path, lambda document: document.update(schema_version=version))
+
+    with pytest.raises(InstallError, match="invalid receipt schema"):
+        InstallReceipt.load(path, expected_plan=case.plan)
+
+
+def test_receipt_v3_must_carry_a_legacy_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(install_core, "_validate_receipt_parent", lambda _observed, _path: None)
+    monkeypatch.setattr(install_core, "_validate_receipt_file", lambda _observed, _path: None)
+    path = tmp_path / "receipts" / "plain.json"
+    path.parent.mkdir(mode=0o700)
+    new_install_receipt(_plain_plan(tmp_path / "plain"), path=path)
+
+    _tampered(path, lambda document: document.update(schema_version=3))
+
+    with pytest.raises(InstallError, match="invalid receipt schema"):
+        InstallReceipt.load(path)
+
+
+def test_v3_adoption_receipt_hands_off_to_an_upgrade_as_prior_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = LegacyCase(tmp_path)
+    adoption, path = _durable(monkeypatch, case)
+    case.apply(adoption)
+    _tampered(path, lambda document: document.update(qualified=True))
+    prior = InstallReceipt.load(path)
+    assert prior.to_dict()["schema_version"] == 3
+    upgrade = install_cli._plan_document(case.config, case.bundle, overlay=case.overlay)
+    case.backend.plan = upgrade
+    case.backend.facts = _legacy_facts(upgrade, case.host)
+    upgrade_path = tmp_path / "receipts" / "upgrade.json"
+    receipt = new_install_receipt(upgrade, path=upgrade_path)
+
+    apply_plan(
+        upgrade,
+        confirm_sha256=plan_sha256(upgrade),
+        receipt=receipt,
+        prior_receipt=prior,
+        backend=case.backend,
+    )
+
+    loaded = InstallReceipt.load(upgrade_path, expected_plan=upgrade)
+    assert loaded.to_dict()["state"] == "applied"
+    assert loaded.to_dict()["schema_version"] == 2
+    assert _schema_version(upgrade_path) == 2
 
 
 # ---------------------------------------------------------------------------
