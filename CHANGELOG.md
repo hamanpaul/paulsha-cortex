@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 deployment canary agy smoke**：agy 1.2.x 的 JSON 輸出不帶 model／effort，改以持久化對話的模型變體 id 證明實際模型與 effort，修正 canary 在 provider smoke 必然失敗（#716）。
 - **review malformed 預檢**：接受不帶選填 `authority_hashes` 的合法 review envelope（#1118）。
 - **#1097 qualification clock watermark 補上其他 durable 系統時間證據**：`_clock_evidence_floor()` 讀取
   `jobs-registry`（`jobs.json`）與 `quota-admission-decisions` 兩個 Trust Root 登記、Manager-only 的

@@ -2289,6 +2289,15 @@ def _has_exact_final_assistant_response(records: Sequence[object]) -> bool:
             if isinstance(data, Mapping) and isinstance(data.get("content"), str):
                 final_contents.append(str(data["content"]))
             continue
+        if (
+            isinstance(record.get("conversation_id"), str)
+            and record.get("status") == "SUCCESS"
+            and isinstance(record.get("response"), str)
+        ):
+            # agy 1.2.x `--print --output-format json` 以單一 result 物件回覆，並一律在
+            # response 尾端附加一個換行；只剝掉這一個換行，其餘仍須逐字相等。
+            final_contents.append(str(record["response"]).removesuffix("\n"))
+            continue
         if record.get("type") != "item.completed":
             continue
         item = record.get("item")
@@ -2351,6 +2360,60 @@ def _codex_canary_builder_sandbox_argv() -> tuple[str, ...]:
     return _codex_registry_sandbox_argv(
         JobWriteContract.BUILDER_WRITE_FORBIDDEN, trust_root_outer_unit=True
     )
+
+
+AGY_CONVERSATION_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+# 以 account 身分讀自己 HOME 內 agy 持久化的對話，列出 executor 設定中的模型變體 id
+# （例如 `gemini-3.8-flash-high`）。root 不直接開啟帳號可寫樹內的檔案。
+AGY_PERSISTED_VARIANTS_SCRIPT = """
+import json, re, sqlite3, sys
+from pathlib import Path
+conversation_id = sys.argv[1]
+database = Path.home() / ".gemini" / "antigravity-cli" / "conversations" / f"{conversation_id}.db"
+if database.is_symlink() or not database.is_file():
+    raise SystemExit("agy conversation database is missing or not a regular file")
+connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+pattern = re.compile(rb"(?<![A-Za-z0-9._-])gemini-[0-9][A-Za-z0-9._-]*(?![A-Za-z0-9._-])")
+variants = set()
+for (data,) in connection.execute("select data from executor_metadata"):
+    blob = data if isinstance(data, (bytes, bytearray)) else str(data).encode()
+    variants.update(match.decode("ascii") for match in pattern.findall(blob))
+print(json.dumps(sorted(variants)))
+"""
+
+
+def _agy_persisted_model_variants(conversation_id: str, *, account: str) -> set[str]:
+    """Return the model variant ids agy persisted for one exact conversation.
+
+    agy 1.2.x 的 print 輸出不回報 model／effort；它把本次對話實際使用的變體
+    （``<model>-<effort>``）寫在對話資料庫的 executor metadata。這與 Codex smoke 讀
+    provider 持久化 thread 的 model／reasoningEffort 是同一類原生證據。
+    """
+
+    if AGY_CONVERSATION_ID_RE.fullmatch(conversation_id) is None:
+        raise QualificationFailure("provider agy conversation identity is malformed")
+    result = _run(
+        ("/usr/bin/python3", "-I", "-c", AGY_PERSISTED_VARIANTS_SCRIPT, conversation_id),
+        user=account,
+        env=_account_env(account),
+        timeout=60,
+    )
+    _require_success(result, "provider agy persisted conversation read")
+    try:
+        variants = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise QualificationFailure(
+            "provider agy persisted conversation read returned malformed output"
+        ) from exc
+    if not isinstance(variants, list) or not all(
+        isinstance(value, str) for value in variants
+    ):
+        raise QualificationFailure(
+            "provider agy persisted conversation read returned malformed output"
+        )
+    return set(variants)
 
 
 def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
@@ -2442,6 +2505,26 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
                 if isinstance(persisted.get("reasoningEffort"), str)
                 else ""
             }
+        elif provider == "agy":
+            conversation_ids = {
+                str(row["conversation_id"])
+                for row in records
+                if isinstance(row, Mapping)
+                and isinstance(row.get("conversation_id"), str)
+            }
+            if len(conversation_ids) != 1 or AGY_CONVERSATION_ID_RE.fullmatch(
+                next(iter(conversation_ids))
+            ) is None:
+                raise QualificationFailure(
+                    "provider agy returned no unique conversation identity"
+                )
+            persisted_variants = _agy_persisted_model_variants(
+                next(iter(conversation_ids)), account=account
+            )
+            if persisted_variants == {f"{model}-{effort}"}:
+                models, efforts = {model}, {effort}
+            else:
+                models, efforts = set(persisted_variants), set()
         else:
             models = (
                 set().union(
@@ -2503,6 +2586,10 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             "native_metadata": passed,
             "response_token": response_token,
         }
+        if provider == "agy":
+            raw_evidence["providers"][provider]["persisted_variants"] = sorted(
+                persisted_variants
+            )
         if not passed:
             raise QualificationFailure(
                 f"provider {provider} lacked unique exact native model/effort metadata "
