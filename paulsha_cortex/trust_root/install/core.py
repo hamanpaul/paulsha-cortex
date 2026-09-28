@@ -58,6 +58,14 @@ class ActivationError(InstallError):
 # instead of being copied into every receipt checkpoint.
 ASSET_PRIOR_SNAPSHOT_MAX_BYTES = 1024 * 1024
 
+# Receipt format.  v2 records a directory's descendants as ``children_count``
+# + ``children_sha256`` with the full list in a receipt-bound side file.  A v1
+# installer would find no ``children`` and misreport the whole directory as
+# unknown; it refuses any ``schema_version`` other than 1, so every write uses
+# v2.  Loading still accepts v1 (inline ``children``) receipts.
+_RECEIPT_SCHEMA_VERSION = 2
+_READABLE_RECEIPT_SCHEMA_VERSIONS = (1, 2)
+
 
 def _canonical_bytes(value: object) -> bytes:
     return (
@@ -2377,6 +2385,19 @@ class InstallReceipt:
         # receipt it only holds legacy inline inventories awaiting their
         # side file, flushed before the next checkpoint drops them.
         self._inventories: dict[str, tuple[str, ...]] = {}
+        # A receipt stored inside a directory it manages must never create
+        # side files there: they would become unknown state of that very
+        # directory.  Such a (legacy) receipt keeps inventories inline on
+        # disk and uses the digest form only in memory.
+        plan = self._document.get("plan")
+        self._inline_inventories = bool(
+            path is not None
+            and isinstance(plan, Mapping)
+            and _managed_directory_step_containing(
+                plan.get("apply_order"), _inventory_store_path(path)
+            )
+            is not None
+        )
 
     def to_dict(self) -> dict[str, object]:
         return deepcopy(self._document)
@@ -2392,7 +2413,7 @@ class InstallReceipt:
 
         normalized = _validated_inventory_rows(rows)
         digest = _directory_inventory_sha256(normalized)
-        if self.path is None:
+        if self.path is None or self._inline_inventories:
             self._inventories[digest] = normalized
         else:
             _write_inventory_blob(
@@ -2416,7 +2437,7 @@ class InstallReceipt:
             return ()
         rows = self._inventories.get(str(digest))
         if rows is None:
-            if self.path is None:
+            if self.path is None or self._inline_inventories:
                 raise InstallDriftError(
                     f"receipt-bound directory inventory is unavailable: {digest}"
                 )
@@ -2461,21 +2482,61 @@ class InstallReceipt:
                     state["children_count"] = len(rows)
                     state["children_sha256"] = digest
 
+    def _document_with_inline_inventories(self) -> dict[str, object]:
+        """Return the document with digest-form directory states re-inlined."""
+
+        document = deepcopy(self._document)
+        empty = _directory_inventory_sha256(())
+        for field in ("journal", "rollback_journal"):
+            entries = document.get(field)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for state in (entry, entry.get("prior"), entry.get("inspection_prior")):
+                    if not isinstance(state, dict):
+                        continue
+                    digest = state.get("children_sha256")
+                    count = state.get("children_count")
+                    rows = (
+                        ()
+                        if count == 0 and digest == empty
+                        else self._inventories.get(digest)
+                        if isinstance(digest, str)
+                        else None
+                    )
+                    if rows is None or type(count) is not int or count != len(rows):
+                        # No rows to inline: the digest stays, and the
+                        # unknown-state scan fails closed on it.
+                        continue
+                    del state["children_sha256"]
+                    del state["children_count"]
+                    state["children"] = list(rows)
+        return document
+
     def _persist(self) -> None:
         if self.path is not None:
             if self._document.get("effective_receipt_path") != str(self.path):
                 raise InstallError("receipt effective path binding is invalid")
-            for digest, rows in list(self._inventories.items()):
-                _write_inventory_blob(self.path, digest, _directory_inventory_bytes(rows))
-                del self._inventories[digest]
+            self._document["schema_version"] = _RECEIPT_SCHEMA_VERSION
+            if self._inline_inventories:
+                document = self._document_with_inline_inventories()
+            else:
+                for digest, rows in list(self._inventories.items()):
+                    _write_inventory_blob(
+                        self.path, digest, _directory_inventory_bytes(rows)
+                    )
+                    del self._inventories[digest]
+                document = self._document
             if self._checkpoint_sha256 is None:
                 self._checkpoint_sha256 = _create_receipt_json_exclusive(
-                    self.path, self._document
+                    self.path, document
                 )
             else:
                 self._checkpoint_sha256 = _atomic_write_receipt_json(
                     self.path,
-                    self._document,
+                    document,
                     expected_sha256=self._checkpoint_sha256,
                 )
 
@@ -2528,7 +2589,12 @@ class InstallReceipt:
                 os.close(receipt_fd)
             if parent_fd is not None:
                 os.close(parent_fd)
-        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        version = payload.get("schema_version") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or type(version) is not int
+            or version not in _READABLE_RECEIPT_SCHEMA_VERSIONS
+        ):
             raise InstallError(f"invalid receipt schema: {path}")
         plan = payload.get("plan")
         if not isinstance(plan, Mapping) or payload.get("plan_sha256") != plan_sha256(plan):
@@ -3116,6 +3182,26 @@ def _inventory_store_path(receipt_path: Path) -> Path:
     return receipt_path.with_name(f".{receipt_path.name}.inventory")
 
 
+def _managed_directory_step_containing(
+    steps: object, path: Path
+) -> Mapping[str, object] | None:
+    """Return the managed directory step whose snapshot would include ``path``."""
+
+    if not isinstance(steps, (list, tuple)):
+        return None
+    for step in steps:
+        managed = step.get("path") if isinstance(step, Mapping) else None
+        if (
+            isinstance(step, Mapping)
+            and step.get("kind") == "asset"
+            and step.get("asset_type") == "directory"
+            and isinstance(managed, str)
+            and Path(managed) in path.parents
+        ):
+            return step
+    return None
+
+
 def _validate_inventory_store(observed: os.stat_result, path: Path) -> None:
     _validate_receipt_parent(observed, path)
     if stat.S_IMODE(observed.st_mode) & 0o077:
@@ -3305,7 +3391,7 @@ def new_install_receipt(
     effective_path = path if path is not None else canonical_receipt_path(plan)
     receipt = InstallReceipt(
         {
-            "schema_version": 1,
+            "schema_version": _RECEIPT_SCHEMA_VERSION,
             "receipt_id": str(uuid.uuid4()),
             "effective_receipt_path": str(effective_path),
             "plan_sha256": plan_sha256(plan),
@@ -4827,22 +4913,17 @@ def _assert_inventory_store_outside_managed_directories(
         getattr(backend, "bind_rollback_inventory", None)
     ):
         return
-    store = _inventory_store_path(receipt.path)
-    for step in steps:
-        path = step.get("path")
-        if (
-            step.get("kind") == "asset"
-            and step.get("asset_type") == "directory"
-            and isinstance(path, str)
-            and Path(path) in store.parents
-        ):
-            raise InstallPlanError(
-                f"receipt {receipt.path} is inside managed directory {path} "
-                f"(step {step.get('step_id')}): its rollback inventory side "
-                "files would change that directory's snapshot mid-transaction; "
-                "use a receipt path outside managed directories (the default "
-                "canonical receipt path is)"
-            )
+    step = _managed_directory_step_containing(
+        steps, _inventory_store_path(receipt.path)
+    )
+    if step is not None:
+        raise InstallPlanError(
+            f"receipt {receipt.path} is inside managed directory {step.get('path')} "
+            f"(step {step.get('step_id')}): its rollback inventory side "
+            "files would change that directory's snapshot mid-transaction; "
+            "use a receipt path outside managed directories (the default "
+            "canonical receipt path is)"
+        )
 
 
 def apply_plan(

@@ -2661,6 +2661,75 @@ def test_apply_refuses_receipt_inside_a_managed_directory_before_mutation(
     assert receipt.to_dict()["journal"] == []
 
 
+def test_new_receipts_use_the_digest_inventory_schema(tmp_path: Path) -> None:
+    # v1 readers compare ``schema_version`` to 1 and refuse anything else, so
+    # the digest-form directory states must never be published as v1.
+    assert new_install_receipt(_plan(tmp_path)).to_dict()["schema_version"] == 2
+
+
+def _legacy_v1_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    plan: dict[str, object],
+    **fields: object,
+) -> Path:
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    path = (tmp_path / "receipts" / "legacy.json").absolute()
+    document = new_install_receipt(plan, path=path).to_dict()
+    document.update({"schema_version": 1, **fields})
+    path.write_bytes(install_core._canonical_bytes(document))
+    return path
+
+
+def test_legacy_v1_receipt_still_loads_and_is_rewritten_as_v2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _legacy_v1_receipt(tmp_path, monkeypatch, _plan(tmp_path))
+
+    loaded = InstallReceipt.load(path)
+    assert loaded.to_dict()["schema_version"] == 1
+    loaded._document["state"] = "applying"
+    loaded._persist()
+
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 2
+    assert InstallReceipt.load(path).to_dict()["state"] == "applying"
+
+
+def test_legacy_v1_prior_receipt_still_authorizes_upgrade_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prior_plan = _plan(tmp_path)
+    path = _legacy_v1_receipt(
+        tmp_path, monkeypatch, prior_plan, state="applied", qualified=True
+    )
+    next_plan = deepcopy(prior_plan)
+    next_plan["repo_identity"]["commit"] = "b" * 40
+
+    prior_receipt = InstallReceipt.load(path)
+
+    assert install_core.validate_prior_receipt_handoff(next_plan, prior_receipt) == (
+        prior_plan
+    )
+
+
+@pytest.mark.parametrize("version", [0, 3, True, "2"])
+def test_receipt_load_refuses_unknown_schema_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: object
+) -> None:
+    path = _legacy_v1_receipt(tmp_path, monkeypatch, _plan(tmp_path))
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["schema_version"] = version
+    path.write_bytes(install_core._canonical_bytes(document))
+
+    with pytest.raises(InstallError, match="invalid receipt schema"):
+        InstallReceipt.load(path)
+
+
 def test_directory_inventory_binding_rejects_mismatched_rows() -> None:
     receipt = InstallReceipt({"journal": []})
     digest = receipt.bind_directory_inventory(["a", "a/b"])

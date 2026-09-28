@@ -2071,6 +2071,64 @@ def test_unchanged_directory_needs_no_inventory_lookup(
     assert LocalInstallBackend(require_root=False).list_unknown_state(reloaded) == ()
 
 
+def test_legacy_receipt_inside_managed_directory_rolls_back_without_side_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    managed = tmp_path / "state"
+    _populate_tree(managed, directories=2, files=2)
+    step = _managed_directory_step(managed)
+    plan = {"apply_order": [dict(step)], "repo_identity": {}, "candidate": {}}
+    receipt_path = (managed / "receipts" / "install.json").absolute()
+    receipt = new_install_receipt(plan, path=receipt_path)
+    backend = LocalInstallBackend(require_root=False)
+    current = dict(backend.inspect_step(step))
+    legacy_rows = backend_module._directory_inventory(managed)
+    assert "receipts/install.json" in legacy_rows
+    legacy_prior = {
+        key: value
+        for key, value in current.items()
+        if key not in {"children_count", "children_sha256"}
+    }
+    legacy_prior["children"] = legacy_rows
+    document = receipt.to_dict()
+    document.update(
+        {
+            "schema_version": 1,
+            "state": "applied",
+            "journal": [
+                {
+                    "step_id": step["step_id"],
+                    "step": dict(step),
+                    "status": "completed",
+                    "prior": legacy_prior,
+                    **legacy_prior,
+                }
+            ],
+        }
+    )
+    # A receipt written by the pre-digest installer: inline children, v1.
+    receipt_path.write_bytes(install_core._canonical_bytes(document))
+
+    loaded = InstallReceipt.load(receipt_path)
+    report = rollback_receipt(loaded, backend=LocalInstallBackend(require_root=False))
+
+    # The installer never creates side files inside a managed directory, so
+    # the receipt's own directory cannot turn into unknown state.
+    assert report.retained_unknown == ()
+    assert report.retained_drift == ()
+    assert loaded.to_dict()["state"] == "rolled-back"
+    assert not (receipt_path.parent / ".install.json.inventory").exists()
+    on_disk = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert on_disk["rollback_journal"][0]["prior"]["children"] == legacy_rows
+
+
 def test_legacy_inline_children_receipt_is_migrated_on_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2116,6 +2174,9 @@ def test_legacy_inline_children_receipt_is_migrated_on_load(
     loaded._persist()
     on_disk = receipt.path.read_text(encoding="utf-8")
     assert "branch-0001/leaf-0001.txt" not in on_disk
+    # Side-file receipts are unreadable to a pre-digest installer: it must
+    # refuse the schema outright instead of misreading the directory states.
+    assert json.loads(on_disk)["schema_version"] == 2
     assert LocalInstallBackend(require_root=False).list_unknown_state(
         InstallReceipt.load(receipt.path)
     ) == (str(unknown),)
