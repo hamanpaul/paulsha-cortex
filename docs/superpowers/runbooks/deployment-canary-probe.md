@@ -196,6 +196,14 @@ canary 以該 ref 的 HEAD 作為 candidate SHA。完成後分別確認：
 - probe repo 出現已 merge 的 PR（分支 `feature/<issue>-deployment-canary-probe`，body 帶
   `Closes #N`），issue 已關閉，OpenSpec change 已 archive，todo 全勾。
 
+`qualification.json` 的 passed 不只是「dispatch 跑到終局」：`_validate_dispatch_closeout`
+（#1096）逐項驗證每個非-ship phase 的 Manager 權威 gate ledger（`<control>.gates.json`）都
+含有部署層宣告的每個 gate（目前只有 `pytest`，見 §5）且為 terminal `passed`，`slice_id` 逐字
+綁回該 job 的 `job_id`；delivery gate（`gate_refs`）的證據內容若自報 `run_id`／`work_id`／
+`candidate` 則必須與本次派工相符，`foreign-review` 這個必要 kind 另外強制逐字等於本 run 已
+獨立驗過的 review job workflow evidence。任一項不成立都會讓 closeout（進而 `qualification.json`）
+fail closed，不會只是「PR 沒開出來」這種粗粒度徵狀。
+
 ## 7. 每次 canary 後：重置
 
 PR 已 merge、issue 已關、change 已 archive、todo 已勾滿，同一個 target 不能重跑。下一次
@@ -213,6 +221,14 @@ PR 已 merge、issue 已關、change 已 archive、todo 已勾滿，同一個 ta
 - **provider 與 GitHub 的實際行為**：provider smoke、planning／build／review 的模型輸出、
   GitHub provider refresh 與 Copilot review 的送達時間，都要靠真實憑證跑過一次；本機只驗證
   了 image 建置、安裝流程、probe 範本在引擎與 openspec 下的結果，以及 driver 的單元測試。
+- **#1096 delivery gate evidence 綁定的完整覆蓋**：`brainstorm`／`copilot`／`maintainer-review`
+  三種 delivery gate evidence 由外部 adapter（brainstorm evidence writer、GitHub ship
+  validator 的 review 結果）產生，其 JSON 內容是否逐字帶 `run_id`／`work_id`／`candidate`
+  只在測試 fixture 中如此設計，尚未由 live run 證實 production 形狀一致；`foreign-review` 已
+  以「逐字等於本 run 已驗過的 review job evidence」做到與內容無關的強綁定，其餘三種 kind 目前
+  是「有帶就核對、沒帶就放行」的柔性檢查。若要對它們做出同等的強制綁定，需要 Manager 端在
+  寫出該證據（或 gate ledger 本身）時多帶 `run_id`／`work_id` 等欄位，driver／validator 端
+  不能單方面補上。
 
 deck compile 在 workflow 路徑讀的是 `PSC_REPO_ROOT`（`paulsha-cortex`）的
 `.project-policy.yml`，但**不是缺陷**：那份讀取只用來產生 slice 文件的 verification 骨架，
