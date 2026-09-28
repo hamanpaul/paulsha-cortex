@@ -219,7 +219,7 @@ def test_plan_applies_the_host_overlay_and_records_its_digest(
     assert emitted["plan_sha256"] == install_core.plan_sha256(plan)
     assert "legacy_adoption" not in plan
     assert _step(plan, "account:cortex-builder")["uid"] == LEGACY_IDS["cortex-builder"][0]
-    assert _step(plan, "account:cortex-egress")["home"] == str(tmp_path / "host/home/cortex-egress")
+    assert _step(plan, "account:cortex-egress")["home"] == str(tmp_path / "host/srv/cortex-egress")
     assert plan["operator_account"] == "legacy-operator"
     # The overlay changes the effective config and adds exactly one key.
     merged = install_cli._bound_plan_from_config(legacy.apply_host_overlay(config, overlay), bundle)
