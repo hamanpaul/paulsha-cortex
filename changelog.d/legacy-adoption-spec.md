@@ -1,0 +1,1 @@
+- 新增 OpenSpec change `trust-root-legacy-adoption`：讓 transactional installer 在 operator 明確審核下接手沒有 receipt 的 Phase 2b 舊主機（root 唯讀 inventory、host overlay、確定性 disposition、`legacy-quarantine` 搬移不刪除、apply 重新擷取比對、rollback 證明、RC `legacy-adoption` profile），並記錄 owner 裁決（保留舊 uid、state 只接手必要子集）；本 PR 僅規格，程式另行落地（#1122）。
