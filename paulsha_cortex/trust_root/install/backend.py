@@ -2450,7 +2450,39 @@ def _legacy_quarantine_restore(entry: Mapping[str, object]) -> None:
         os.close(destination_fd)
 
 
-def _sha256_at(parent_fd: int, name: str, observed: os.stat_result) -> str:
+def _mount_id(descriptor: int) -> int:
+    """The id of the mount that holds ``descriptor`` (``/proc/self/fdinfo``).
+
+    Unlike ``st_dev`` it also tells a bind mount of the same filesystem apart.
+    Without it nothing proves a walk stays on one mount, so it fails closed.
+    """
+
+    try:
+        with open(f"/proc/self/fdinfo/{descriptor}", encoding="ascii") as handle:
+            for line in handle:
+                field, _separator, value = line.partition(":")
+                if field == "mnt_id":
+                    return int(value.strip())
+    except (OSError, ValueError) as exc:
+        raise InstallDriftError(f"cannot prove which mount holds a tree member: {exc}") from exc
+    raise InstallDriftError("cannot prove which mount holds a tree member: no mnt_id")
+
+
+def _mount_point_problem(relative: str) -> str:
+    return (
+        f"tree member {relative or '.'} is a mount point (another filesystem or mount "
+        "than the tree); nothing in the tree is removed"
+    )
+
+
+def _sha256_at(
+    parent_fd: int,
+    name: str,
+    observed: os.stat_result,
+    *,
+    mount_id: int | None = None,
+    relative: str | None = None,
+) -> str:
     descriptor = os.open(name, _QUARANTINE_READ_FLAGS, dir_fd=parent_fd)
     try:
         held = os.fstat(descriptor)
@@ -2459,6 +2491,8 @@ def _sha256_at(parent_fd: int, name: str, observed: os.stat_result) -> str:
             observed.st_ino,
         ):
             raise InstallDriftError(f"tree member changed while it was hashed: {name}")
+        if mount_id is not None and _mount_id(descriptor) != mount_id:
+            raise InstallDriftError(_mount_point_problem(relative or name))
         digest = hashlib.sha256()
         while chunk := os.read(descriptor, 1024 * 1024):
             digest.update(chunk)
@@ -2478,6 +2512,11 @@ def _tree_digest_at(parent_fd: int, name: str) -> tuple[str, _TreeManifest]:
     so the walk never leaves the tree through a symlink.  Besides the digest
     it returns the manifest of every member (relative path -> dev, ino,
     type): a later removal deletes nothing that is not in it.
+
+    The tree must lie on one mount: a member (or the tree itself) whose
+    ``st_dev`` or mount id differs from the tree's -- a mount point, bind
+    mounts of the same filesystem included -- fails the whole walk before
+    anything could be removed.
     """
 
     root_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
@@ -2485,12 +2524,17 @@ def _tree_digest_at(parent_fd: int, name: str) -> tuple[str, _TreeManifest]:
     records: list[tuple[str, bytes]] = []
     try:
         top = os.fstat(root_fd)
+        root_mount = _mount_id(root_fd)
+        if top.st_dev != os.fstat(parent_fd).st_dev or root_mount != _mount_id(parent_fd):
+            raise InstallDriftError(_mount_point_problem(""))
         manifest[""] = (top.st_dev, top.st_ino, "directory")
 
         def walk(directory_fd: int, prefix: str) -> None:
             for entry in sorted(os.listdir(directory_fd)):
                 relative = f"{prefix}/{entry}" if prefix else entry
                 observed = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+                if observed.st_dev != top.st_dev:
+                    raise InstallDriftError(_mount_point_problem(relative))
                 kind = _file_type_name(observed.st_mode)
                 manifest[relative] = (observed.st_dev, observed.st_ino, kind)
                 if relative == ".cortex-tree.sha256":
@@ -2501,7 +2545,10 @@ def _tree_digest_at(parent_fd: int, name: str) -> tuple[str, _TreeManifest]:
                     target = os.readlink(entry, dir_fd=directory_fd)
                     record += b"L\0" + target.encode("utf-8") + b"\0"
                 elif kind == "file":
-                    record += b"F\0" + _sha256_at(directory_fd, entry, observed).encode("ascii") + b"\0"
+                    file_sha256 = _sha256_at(
+                        directory_fd, entry, observed, mount_id=root_mount, relative=relative
+                    )
+                    record += b"F\0" + file_sha256.encode("ascii") + b"\0"
                 elif kind == "directory":
                     record += b"D\0"
                 else:
@@ -2513,6 +2560,8 @@ def _tree_digest_at(parent_fd: int, name: str) -> tuple[str, _TreeManifest]:
                         held = os.fstat(child_fd)
                         if (held.st_dev, held.st_ino) != (observed.st_dev, observed.st_ino):
                             raise InstallDriftError(f"tree changed while it was hashed: {relative}")
+                        if _mount_id(child_fd) != root_mount:
+                            raise InstallDriftError(_mount_point_problem(relative))
                         walk(child_fd, relative)
                     finally:
                         os.close(child_fd)
@@ -2559,6 +2608,9 @@ def _remove_verified_tree(parent_fd: int, name: str, manifest: _TreeManifest) ->
     The walk runs on ``O_NOFOLLOW`` directory descriptors and never follows a
     symlink (a symlink member is unlinked, not entered).  The first member that
     is not the verified one stops the removal: what remains stays where it is.
+    A member on another filesystem or mount than the tree (a mount point that
+    appeared after the manifest was proven) stops it the same way, before
+    anything below it is touched.
     """
 
     def expect(relative: str, observed: os.stat_result) -> None:
@@ -2572,15 +2624,28 @@ def _remove_verified_tree(parent_fd: int, name: str, manifest: _TreeManifest) ->
                 "is removed and the rest stays in the private discard staging"
             )
 
+    def same_mount(relative: str, observed: os.stat_result, descriptor: int | None) -> None:
+        if observed.st_dev != top.st_dev or (
+            descriptor is not None and _mount_id(descriptor) != root_mount
+        ):
+            raise InstallDriftError(
+                f"{relative or name} is a mount point (another filesystem or mount than "
+                "the tree); nothing more is removed and the rest stays in the private "
+                "discard staging"
+            )
+
     def clear(directory_fd: int, prefix: str) -> None:
         for entry in sorted(os.listdir(directory_fd)):
             relative = f"{prefix}/{entry}" if prefix else entry
             observed = os.stat(entry, dir_fd=directory_fd, follow_symlinks=False)
+            same_mount(relative, observed, None)
             expect(relative, observed)
             if stat.S_ISDIR(observed.st_mode):
                 child_fd = os.open(entry, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
                 try:
-                    expect(relative, os.fstat(child_fd))
+                    held = os.fstat(child_fd)
+                    same_mount(relative, held, child_fd)
+                    expect(relative, held)
                     clear(child_fd, relative)
                 finally:
                     os.close(child_fd)
@@ -2591,7 +2656,14 @@ def _remove_verified_tree(parent_fd: int, name: str, manifest: _TreeManifest) ->
     expect("", os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
     root_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
     try:
-        expect("", os.fstat(root_fd))
+        top = os.fstat(root_fd)
+        root_mount = _mount_id(root_fd)
+        expect("", top)
+        if top.st_dev != os.fstat(parent_fd).st_dev or root_mount != _mount_id(parent_fd):
+            raise InstallDriftError(
+                f"{name} is a mount point; nothing is removed and it stays in the "
+                "private discard staging"
+            )
         clear(root_fd, "")
     finally:
         os.close(root_fd)
@@ -2705,22 +2777,27 @@ def _discard_created_tree(
                 leaf="tree",
                 device=observed.st_dev,
             )
+            problem: str | None = None
             try:
                 digest, manifest = _tree_digest_at(staging_fd, "tree")
-                proven = manifest[""][:2] == (
+                if manifest[""][:2] != (
                     identity["device"],
                     identity["inode"],
-                ) and digest == identity["tree_sha256"]
-            except (InstallError, OSError):
-                proven, manifest = False, {}
-            if not proven:
+                ) or digest != identity["tree_sha256"]:
+                    problem = f"{path} changed since this receipt created it"
+            except (InstallError, OSError) as exc:
+                # A mount point inside, a member that changed while it was
+                # hashed, an unsupported object: nothing is removed.
+                problem = f"{path} cannot be proven to be the tree this receipt created ({exc})"
+                manifest = {}
+            if problem is not None:
                 raise _restore_from_discard(
                     parent_fd=parent_fd,
                     path=path,
                     staging=staging,
                     staging_fd=staging_fd,
                     leaf="tree",
-                    problem=f"{path} changed since this receipt created it",
+                    problem=problem,
                 )
             _remove_verified_tree(staging_fd, "tree", manifest)
             os.fsync(staging_fd)

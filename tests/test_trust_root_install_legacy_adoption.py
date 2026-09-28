@@ -2379,6 +2379,73 @@ def _staged(tmp_path: Path) -> list[str]:
     )
 
 
+def _contents(tree: Path) -> dict[str, object]:
+    """Every member of ``tree``: file bytes, symlink target or ``"dir"``."""
+
+    rows: dict[str, object] = {}
+    for directory, directories, files in os.walk(tree):
+        for name in (*directories, *files):
+            path = Path(directory, name)
+            if path.is_symlink():
+                rows[str(path.relative_to(tree))] = os.readlink(path)
+            elif path.is_dir():
+                rows[str(path.relative_to(tree))] = "dir"
+            else:
+                rows[str(path.relative_to(tree))] = path.read_bytes()
+    return rows
+
+
+_STAT_EXTRA_FIELDS = (
+    "st_atime",
+    "st_mtime",
+    "st_ctime",
+    "st_atime_ns",
+    "st_mtime_ns",
+    "st_ctime_ns",
+    "st_blksize",
+    "st_blocks",
+    "st_rdev",
+)
+
+
+def _as_mounted_filesystem(monkeypatch: pytest.MonkeyPatch, top: Path) -> None:
+    """Make ``top`` and all below it report another ``st_dev``, as a mount would.
+
+    Mounting needs privileges the tests do not have; ``stat``/``fstat`` of the
+    exact inodes below ``top`` answer as another filesystem mounted there.
+    """
+
+    base = top.lstat().st_dev
+    inodes = {top.lstat().st_ino} | {
+        Path(directory, name).lstat().st_ino
+        for directory, directories, files in os.walk(top)
+        for name in (*directories, *files)
+    }
+    real_stat, real_fstat = os.stat, os.fstat
+
+    def mounted(result: os.stat_result) -> os.stat_result:
+        if result.st_dev != base or result.st_ino not in inodes:
+            return result
+        values = list(result[:10])
+        values[2] = base + 1  # st_dev
+        return os.stat_result(values, {name: getattr(result, name) for name in _STAT_EXTRA_FIELDS})
+
+    monkeypatch.setattr(os, "stat", lambda *args, **kwargs: mounted(real_stat(*args, **kwargs)))
+    monkeypatch.setattr(os, "fstat", lambda descriptor: mounted(real_fstat(descriptor)))
+
+
+def _as_bind_mount(monkeypatch: pytest.MonkeyPatch, top: Path) -> None:
+    """Make descriptors of ``top`` report another mount id (same ``st_dev``)."""
+
+    inode = top.lstat().st_ino
+    real = install_backend._mount_id
+    monkeypatch.setattr(
+        install_backend,
+        "_mount_id",
+        lambda descriptor: real(descriptor) + (1 if os.fstat(descriptor).st_ino == inode else 0),
+    )
+
+
 def test_tree_digest_on_descriptors_equals_the_path_digest(tmp_path: Path) -> None:
     tree = _checkout(tmp_path)
     (tree / ".hidden").write_text("dot\n")
@@ -2491,6 +2558,54 @@ def test_created_tree_discard_refuses_another_filesystem(
     assert (tree / "README.md").read_text() == "created\n"
 
 
+@pytest.mark.parametrize("boundary", ["filesystem", "bind-mount"])
+def test_created_tree_discard_moves_a_tree_with_a_mount_point_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    tree = _checkout(tmp_path)
+    identity = install_backend._created_tree_identity(tree)
+    before = _contents(tree)
+    # Something is mounted on docs/ after the tree was recorded; what the
+    # mount shows equals the recorded content, so the digest still matches.
+    if boundary == "filesystem":
+        _as_mounted_filesystem(monkeypatch, tree / "docs")
+    else:
+        _as_bind_mount(monkeypatch, tree / "docs")
+
+    with pytest.raises(InstallDriftError, match="mount point") as caught:
+        _discard(tmp_path, tree, identity)
+
+    assert "moved back" in str(caught.value)
+    # Nothing was deleted: the whole tree is back where it was.
+    assert tree.lstat().st_ino == identity["inode"]
+    assert _contents(tree) == before
+    assert all(Path(item).name != "tree" for item in _staged(tmp_path))
+
+
+@pytest.mark.parametrize("boundary", ["filesystem", "bind-mount"])
+def test_verified_tree_removal_stops_at_a_mount_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    tree = _checkout(tmp_path)
+    (tree / "zdata").mkdir()
+    (tree / "zdata" / "payload.bin").write_bytes(b"data on the mounted filesystem\n")
+    parent = os.open(tree.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _digest, manifest = install_backend._tree_digest_at(parent, tree.name)
+        # A mount appears on a member after the manifest was proven.
+        if boundary == "filesystem":
+            _as_mounted_filesystem(monkeypatch, tree / "zdata")
+        else:
+            _as_bind_mount(monkeypatch, tree / "zdata")
+
+        with pytest.raises(InstallDriftError, match="mount point"):
+            install_backend._remove_verified_tree(parent, tree.name, manifest)
+    finally:
+        os.close(parent)
+
+    assert (tree / "zdata" / "payload.bin").read_bytes() == b"data on the mounted filesystem\n"
+
+
 def test_created_tree_discard_reports_a_tree_it_could_not_move_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2579,6 +2694,31 @@ def test_legacy_rollback_removes_the_venvs_directory_it_created(
     assert report.legacy_restored is True
     assert case.recaptured_sha256() == case.block["inventory_sha256"]
     assert install_cli._receipt_restore_safe(host.receipt.to_dict()) is True
+
+
+def test_legacy_rollback_keeps_a_clone_with_a_mount_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = AdoptedHost(tmp_path, monkeypatch)
+    before = _contents(host.repository)
+    inode = host.repository.lstat().st_ino
+    # Another filesystem is mounted on .git/objects; it shows the same empty
+    # directory, so the clone's tree digest alone would still match.
+    _as_mounted_filesystem(monkeypatch, host.repository / ".git" / "objects")
+
+    report = host.rollback()
+
+    drift = {row["step_id"]: row["observed"] for row in report.retained_drift}
+    problem = drift["repository:paulsha-cortex"]["error"]
+    assert "mount point" in problem and "moved back" in problem
+    assert f"legacy-quarantine:{host.repository}" in drift
+    # No member was deleted; the clone is back at its path, the legacy
+    # repository stays in quarantine.
+    assert host.repository.lstat().st_ino == inode
+    assert _contents(host.repository) == before
+    assert report.legacy_restored is False
+    assert host.receipt.to_dict()["state"] == "rollback-blocked"
+    assert install_cli._receipt_restore_safe(host.receipt.to_dict()) is False
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
