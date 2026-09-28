@@ -45,6 +45,10 @@ from . import review as foreign_review
 from . import terminal_contract
 from . import verification
 from . import worktree_reclaim
+from .task_memory import (
+    MAX_APPLIED_TERMINAL_ENTRIES as MAX_TASK_MEMORY_APPLIED_ENTRIES,
+    TASK_MEMORY_APPLIED_TERMINAL_FIELD,
+)
 from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
 from .registry import (
     RETRY_CARD_PHASE_PERSONA,
@@ -6377,7 +6381,37 @@ def _assert_terminal_gate_consistency(
     )
 
 
+#: #1136：``_extract_terminal_payload`` 回報「terminal 沒帶 task_memory_applied」的哨兵。
+_TERMINAL_FIELD_ABSENT = object()
+
+
 def _extract_terminal_json(log_path: object) -> dict[str, object]:
+    """讀出 terminal payload，並拆掉選填的 ``task_memory_applied``（#1136）。
+
+    所有既有的形狀判定（exact key-set、malformed／明示停止分類、gate 矛盾偵測、
+    canonical evidence）都經過這裡，因此這個欄位不論合法、畸形或缺席，都不改變
+    任何卡片 lifecycle 判定；缺席時回傳的就是原本那個物件，行為逐位元組不變。
+    欄位本身只由 :func:`terminalize_workflow_job` 經 :func:`_extract_terminal_payload`
+    取回，在採信之後另行處理。
+    """
+
+    payload, _task_memory_applied = _extract_terminal_payload(log_path)
+    return payload
+
+
+def _extract_terminal_payload(log_path: object) -> tuple[dict[str, object], object]:
+    """回傳 ``(拆掉選填欄位的 payload, task_memory_applied 原值或哨兵)``（#1136）。"""
+
+    raw = _extract_raw_terminal_json(log_path)
+    if TASK_MEMORY_APPLIED_TERMINAL_FIELD not in raw:
+        return raw, _TERMINAL_FIELD_ABSENT
+    return (
+        {key: value for key, value in raw.items() if key != TASK_MEMORY_APPLIED_TERMINAL_FIELD},
+        raw[TASK_MEMORY_APPLIED_TERMINAL_FIELD],
+    )
+
+
+def _extract_raw_terminal_json(log_path: object) -> dict[str, object]:
     if not isinstance(log_path, str) or not log_path:
         raise ValueError("workflow terminal log missing")
     try:
@@ -8672,7 +8706,10 @@ def terminalize_workflow_job(
     phase = job.get("workflow_phase")
     if phase not in {"plan", "build", "verify", "review"}:
         raise ValueError("workflow job phase is not terminalizable")
-    raw = _extract_terminal_json(job.get("log_path"))
+    # #1136：選填的 task_memory_applied 在任何形狀驗證之前就拆出來，只在下面
+    # canonical evidence 綁定成功之後才處理；`raw` 與 `_extract_terminal_json()`
+    # 給其他判定點的是同一份拆掉欄位的 payload。
+    raw, task_memory_applied = _extract_terminal_payload(job.get("log_path"))
     # #629：降權模式下 job wrapper 不跑 gate（跑了就是模型自證，見
     # `launcher._should_run_gates`），ledger 因此在這一刻還不存在。這裡以**第四個
     # 帳號**（`cortex-gate`）重跑 operator 宣告的命令，產出經 spool 回到 Manager
@@ -8991,6 +9028,16 @@ def terminalize_workflow_job(
                 coordinator_root=Path(coordinator_root),
             )
         raise
+    if task_memory_applied is not _TERMINAL_FIELD_ABSENT:
+        # #1136：terminal 已被採信（canonical evidence 綁定成功、report 已提交）之後
+        # 才處理使用回報；reviewer 的審查對象此時已含 Manager 發佈的 report。
+        # 本呼叫保證不擲例外，也不回寫 job／run——optional memory 不改變 lifecycle。
+        _harvest_task_memory_applied(
+            registry,
+            job_id=job_id,
+            value=task_memory_applied,
+            coordinator_root=coordinator_root,
+        )
     if sandbox_path is not None:
         shutil.rmtree(sandbox_path, ignore_errors=True)
     return bound
@@ -12516,7 +12563,7 @@ def record_task_memory_receipt(
     if any(item["event_id"] == event["event_id"] for item in prior):
         return store.append(event)
     if event["event"] == "applied-with-evidence":
-        _verify_applied_artifact(job.get("worktree"), event["evidence"])
+        _verify_applied_artifact(_task_memory_evidence_root(job), event["evidence"])
     matching_prior = [
         item
         for item in prior
@@ -12539,6 +12586,140 @@ def record_task_memory_receipt(
             f"task memory {event['event']} receipt has no matching prior delivery evidence"
         )
     return store.append(event)
+
+
+def _task_memory_evidence_root(job: Mapping[str, object]) -> object:
+    """#1136：applied evidence 的驗證根目錄。
+
+    與 :func:`_verify_exact_candidate` 同一條分流：builder 的 ``worktree`` 就是本
+    attempt 的 candidate 工作區；reviewer 的 ``worktree`` 是用完即丟的 sandbox，
+    審查對象是 ``workflow_repo_root``（#650 的 Manager-owned candidate 樹，HEAD 恰為
+    candidate、追蹤檔無漂移，未追蹤檔只有 Manager 發佈的 report）。
+    """
+
+    if job.get("persona") == "reviewer":
+        return job.get("workflow_repo_root")
+    return job.get("worktree")
+
+
+def _verify_task_memory_candidate_artifact(
+    job: Mapping[str, object], evidence: Mapping[str, object]
+) -> None:
+    """#1136：builder 的 evidence 必須是本 attempt candidate commit 內的檔案。
+
+    工作區可能還有未追蹤或未 commit 的檔案；``_verify_applied_artifact`` 只證明
+    「工作區這個檔案此刻的 hash」，這裡另外以 ``git cat-file blob <candidate>:<ref>``
+    證明同一份內容確實在 terminal 宣告、已綁定為 ``subject_head`` 的 candidate 裡。
+    """
+
+    candidate = job.get("subject_head")
+    worktree = job.get("worktree")
+    reference = evidence.get("ref")
+    expected = evidence.get("sha256")
+    if (
+        not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        or not isinstance(worktree, str)
+        or not worktree
+        or not isinstance(reference, str)
+        or not isinstance(expected, str)
+    ):
+        raise ValueError("task memory applied evidence candidate unavailable")
+    blob = subprocess.run(
+        ["git", "-C", worktree, "cat-file", "blob", f"{candidate.lower()}:{reference}"],
+        capture_output=True,
+        check=False,
+    )
+    if blob.returncode != 0 or hashlib.sha256(blob.stdout).hexdigest() != expected:
+        raise ValueError("task memory applied evidence is not in the attempt candidate")
+
+
+#: #1136：有可驗證 evidence 根的 phase。plan 卡在唯讀 disposable sandbox 執行、
+#: 不產生 candidate，因此不收使用回報。
+TASK_MEMORY_APPLIED_PHASES = frozenset({"build", "verify", "review"})
+
+
+def _harvest_task_memory_applied(
+    registry,
+    *,
+    job_id: str,
+    value: object,
+    coordinator_root: str | Path,
+) -> None:
+    """#1136：terminal 採信之後，把 ``task_memory_applied`` 落成 applied receipt。
+
+    dispatch 時的 prepared context 不另存：以本 attempt 的正式 Work Item／Run／card／
+    Job 邊界重建 :class:`TaskMemoryContext`，再由 Manager receipt sidecar 重建本
+    attempt 已 offer／已交付的 note（:func:`task_memory.restore_prepared_task_memory`，
+    不含 note 內容）。每一筆經 ``record_applied()`` 產生 receipt，builder 另外證明
+    evidence 在 candidate commit 內，最後交給 :func:`record_task_memory_receipt`
+    （routing identity、``_verify_applied_artifact``、前置交付事件、冪等 append）。
+
+    任何失敗只留 class-only 診斷（同 :func:`_record_task_memory_events`），不擲例外、
+    不改 job／run／gate：optional memory 不得改變卡片 lifecycle。一筆失敗不影響
+    同一 terminal 的其他筆。
+    """
+
+    try:
+        from .task_memory import (
+            TaskMemoryAdapter,
+            TaskMemoryCapabilities,
+            TaskMemoryReceiptStore,
+            parse_task_memory_applied,
+            restore_prepared_task_memory,
+            task_memory_context_from_cortex,
+        )
+
+        entries = parse_task_memory_applied(value)
+        if not entries:
+            return
+        job = registry.get_job(job_id)
+        if job.get("workflow_phase") not in TASK_MEMORY_APPLIED_PHASES:
+            raise ValueError("task memory applied evidence phase unsupported")
+        run = registry.get_workflow_run(str(job.get("workflow_run_id")))
+        steps = [step for step in run.steps if step.card == job.get("workflow_card")]
+        if len(steps) != 1:
+            raise ValueError("workflow card identity mismatch")
+        step = steps[0]
+        context = task_memory_context_from_cortex(
+            work_item=SimpleNamespace(
+                repo=run.repo,
+                work_id=run.work_id,
+                workflow_run_id=run.run_id,
+            ),
+            run=run,
+            step=step,
+            job=job,
+            # capability 與 goal 不進 receipt；這裡只需要與 dispatch 相同的 task／
+            # attempt／routing identity，因此沿用 dispatch 的能力宣告與卡片描述，
+            # 不為 goal 再讀一次 Monitor snapshot。
+            capabilities=TaskMemoryCapabilities(inline=True),
+            goal=f"Complete {step.phase} work {step.card} for {run.repo}.",
+        )
+        prepared = restore_prepared_task_memory(
+            context,
+            TaskMemoryReceiptStore(coordinator_root).events_for_run(
+                run.repo, run.work_id, run.run_id
+            ),
+        )
+    except Exception as exc:
+        # class-only：note id、路徑、hash 與 provider 內容一律不進 log。
+        logger.warning("task-memory applied evidence rejected (%s)", type(exc).__name__)
+        return
+    adapter = TaskMemoryAdapter(provider=None)
+    for entry in entries:
+        try:
+            event = adapter.record_applied(
+                prepared,
+                entry["note_id"],
+                evidence_ref=entry["evidence_ref"],
+                evidence_sha256=entry["evidence_sha256"],
+            )
+            if job.get("persona") != "reviewer":
+                _verify_task_memory_candidate_artifact(job, event["evidence"])
+            record_task_memory_receipt(registry, event, coordinator_root=coordinator_root)
+        except Exception as exc:
+            logger.warning("task-memory applied evidence rejected (%s)", type(exc).__name__)
 
 
 def _workflow_job_prompt(
@@ -13625,7 +13806,25 @@ def _append_task_memory_inline(prompt: str, prepared) -> str:
     ]
     for item in prepared.inline_context:
         rows.append(f"[{item['note_id']}] {item['text']}")
+    if prepared.context.task_kind in TASK_MEMORY_APPLIED_PHASES:
+        # #1136：告知唯一的使用回報管道；只在真的交付了 note 的卡片出現，其餘
+        # prompt 逐字不變。
+        rows.append(_TASK_MEMORY_APPLIED_PROMPT)
     return prompt + "\n".join(rows)
+
+
+_TASK_MEMORY_APPLIED_PROMPT = (
+    "Only if a note above actually changed what you produced (a change you committed on a "
+    "build card, or a finding or verdict on a verification or review card), add the optional "
+    "top-level terminal field `task_memory_applied`: a JSON array of at most "
+    f"{MAX_TASK_MEMORY_APPLIED_ENTRIES} objects "
+    '{"note_id": "<id shown in brackets above>", "evidence_ref": "<repo-relative path of the '
+    'Candidate file that shows the effect>", "evidence_sha256": "<lowercase hex sha256 of that '
+    'file as committed in the Candidate>"}. Omit the field when no note changed your work; '
+    "merely reading a note is not use. The Manager verifies every entry against the notes "
+    "delivered to this attempt and the Candidate, ignores invalid entries, and never lets this "
+    "field change the card verdict."
+)
 
 
 #: #844：目前唯一明文可列舉、可由正常 producer 產生的 stage-evidence reuse

@@ -32,7 +32,14 @@ MAX_CANDIDATES = 3
 MAX_RECEIPT_BYTES = 32 * 1024
 MAX_SIDECAR_BYTES = 8 * 1024 * 1024
 MAX_APPLIED_ARTIFACT_BYTES = 64 * 1024 * 1024
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+#: #1136：卡片 terminal 的選填 task-memory 使用回報欄位。每筆必須指向本 attempt
+#: 已交付的 note，並以 candidate／審查對象內的 repo 相對檔案＋sha256 佐證。
+TASK_MEMORY_APPLIED_TERMINAL_FIELD = "task_memory_applied"
+#: 一個 attempt 最多交付 MAX_CANDIDATES 則 note，每則 note 至多一筆 applied receipt。
+MAX_APPLIED_TERMINAL_ENTRIES = MAX_CANDIDATES
+MAX_EVIDENCE_REF_CHARS = 1024
+_SHA256_PATTERN = "^[0-9a-f]{64}$"
+_SHA256_RE = re.compile(_SHA256_PATTERN)
 _NOTE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 # content_version 由 provider 提供並寫進每筆 receipt：只接受有界版本 token。
 # `sha256:` 前綴者必須是完整 64 hex，其餘為 ≤64 字元、無空白／控制字元的
@@ -395,6 +402,190 @@ class TaskMemoryFetch:
     content: str | None
     events: tuple[dict[str, Any], ...]
     reason: str | None = None
+
+
+def task_memory_applied_json_schema() -> dict[str, Any]:
+    """#1136：terminal ``task_memory_applied`` 的工具層 JSON schema（選填欄位）。
+
+    Claude／AGY reviewer 共用這一份；只用 Gemini structured output 相容子集
+    （單一 ``type``、字串 pattern、``maxItems``），完整語意仍由
+    :func:`parse_task_memory_applied` 在 harvest 端嚴格驗證。
+    """
+
+    return {
+        "type": "array",
+        "description": (
+            "Optional. Report a delivered task-memory note only when its content actually "
+            "changed your result; cite the Candidate file that shows the effect."
+        ),
+        "maxItems": MAX_APPLIED_TERMINAL_ENTRIES,
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["note_id", "evidence_ref", "evidence_sha256"],
+            "properties": {
+                "note_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "evidence_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_EVIDENCE_REF_CHARS,
+                },
+                "evidence_sha256": {"type": "string", "pattern": _SHA256_PATTERN},
+            },
+        },
+    }
+
+
+def parse_task_memory_applied(value: object) -> tuple[dict[str, str], ...]:
+    """#1136：嚴格驗證 terminal 的 ``task_memory_applied``，回傳正規化後的條目。
+
+    整個欄位是 JSON array，最多 :data:`MAX_APPLIED_TERMINAL_ENTRIES` 筆；每筆恰好
+    ``note_id``／``evidence_ref``／``evidence_sha256`` 三個字串鍵，note id 不重複、
+    ``evidence_ref`` 為正規化的 repo 相對路徑（不得跳出、不得是 ``.git`` 內部、
+    不得含控制字元）、``evidence_sha256`` 為小寫 64-hex。任何一處不符即整個欄位
+    拒收（``TaskMemoryError``）；空 array 代表明示「沒有 note 改變結果」。
+    """
+
+    if not isinstance(value, list) or len(value) > MAX_APPLIED_TERMINAL_ENTRIES:
+        raise TaskMemoryError("malformed-payload", "task_memory_applied shape invalid")
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "note_id",
+            "evidence_ref",
+            "evidence_sha256",
+        }:
+            raise TaskMemoryError("malformed-payload", "task_memory_applied entry invalid")
+        note_id = item["note_id"]
+        reference = item["evidence_ref"]
+        digest = item["evidence_sha256"]
+        if (
+            not isinstance(note_id, str)
+            or _NOTE_ID_RE.fullmatch(note_id) is None
+            or note_id in seen
+        ):
+            raise TaskMemoryError("malformed-payload", "task_memory_applied note id invalid")
+        if (
+            not isinstance(reference, str)
+            or len(reference) > MAX_EVIDENCE_REF_CHARS
+            or not _is_repo_relative(reference)
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in reference)
+            or not PurePosixPath(reference).parts
+            or ".git" in PurePosixPath(reference).parts
+        ):
+            raise TaskMemoryError("action-evidence-missing", "task_memory_applied evidence ref invalid")
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+            raise TaskMemoryError("action-evidence-missing", "task_memory_applied evidence hash invalid")
+        seen.add(note_id)
+        entries.append(
+            {"note_id": note_id, "evidence_ref": reference, "evidence_sha256": digest}
+        )
+    return tuple(entries)
+
+
+class _RestoredCandidate(dict):
+    """由 Manager receipt sidecar 重建的 candidate binding（#1136）。
+
+    只帶 note id／hash／version、來源時間與 offer receipt 上既有的 SHA-256 摘要，
+    從不含 note 內容或 provider 自由文字。以型別（而非 provider 可偽造的鍵）
+    標記，讓 :func:`_event` 沿用 offer 的摘要，而不是對不存在的原文重算成 null。
+    """
+
+
+_RESTORED_ATTEMPT_IDENTITY_FIELDS = (
+    "task_id",
+    "job_id",
+    "session_id",
+    "session_proxy",
+    "repo",
+    "work_id",
+    "workflow_run_id",
+    "card",
+    "executor",
+    "model_id",
+    "tool",
+    "project",
+    "task_kind",
+)
+
+
+def restore_prepared_task_memory(
+    context: TaskMemoryContext,
+    events: Sequence[Mapping[str, Any]],
+) -> PreparedTaskMemory:
+    """#1136：以 receipt sidecar 重建本 attempt dispatch 時的最小 prepared context。
+
+    dispatch 時的 :class:`PreparedTaskMemory` 只活在記憶體；harvest 時唯一可信的
+    持久化事實是 Manager 寫入的 receipt（已經過 routing identity 與前置事件檢查）。
+    這裡只採用 ``attempt_id`` 等於本 attempt 的列：candidate 取自同時具有
+    ``candidate-selected`` 與 ``offer-emitted`` 的 binding，已交付集合取自
+    ``content-returned``／``context-delivered``。不含 note 內容，也不重新呼叫
+    provider。身分欄位不一致、交付模式不一致或同一 note 綁到不同 hash 一律
+    fail closed。
+    """
+
+    rows = [
+        _validate_event(event)
+        for event in events
+        if isinstance(event, Mapping) and event.get("attempt_id") == context.attempt_id
+    ]
+    for row in rows:
+        if any(row.get(name) != getattr(context, name) for name in _RESTORED_ATTEMPT_IDENTITY_FIELDS):
+            raise TaskMemoryError("scope-mismatch", "task memory receipt identity mismatch")
+
+    def binding(row: Mapping[str, Any]) -> tuple[Any, Any, Any]:
+        return (row.get("note_id"), row.get("content_hash"), row.get("content_version"))
+
+    selected = {binding(row) for row in rows if row["event"] == "candidate-selected"}
+    offers = [row for row in rows if row["event"] == "offer-emitted" and binding(row) in selected]
+    if not offers:
+        raise TaskMemoryError("no-authorized-candidates", "attempt has no offered task memory")
+    modes = {row["mode"] for row in offers}
+    if len(modes) != 1 or not modes <= {"inline", "snapshot", "note_fetch"}:
+        raise TaskMemoryError("mode-mismatch", "attempt task memory mode inconsistent")
+    candidates: dict[str, dict[str, Any]] = {}
+    for row in offers:
+        note_id = row["note_id"]
+        restored = _RestoredCandidate(
+            note_id=note_id,
+            content_hash=row["content_hash"],
+            content_version=row["content_version"],
+            source_time=row.get("source_time"),
+            applicability_sha256=row.get("applicability_sha256"),
+            relevance_reason_sha256=row.get("relevance_reason_sha256"),
+        )
+        previous = candidates.get(note_id)
+        if previous is not None and binding(previous) != binding(restored):
+            raise TaskMemoryError("manifest-mismatch", "attempt note bound to multiple hashes")
+        candidates[note_id] = restored
+    bindings = {note_id: binding(candidate) for note_id, candidate in candidates.items()}
+
+    def delivered(event_name: str) -> set[str]:
+        return {
+            row["note_id"]
+            for row in rows
+            if row["event"] == event_name and bindings.get(row["note_id"]) == binding(row)
+        }
+
+    return PreparedTaskMemory(
+        context=context,
+        status="offered",
+        mode=next(iter(modes)),
+        manifest={
+            "entries": [
+                {
+                    "note_id": candidate["note_id"],
+                    "content_hash": candidate["content_hash"],
+                    "content_version": candidate["content_version"],
+                }
+                for candidate in candidates.values()
+            ]
+        },
+        candidates=candidates,
+        returned_note_ids=delivered("content-returned"),
+        context_delivered_note_ids=delivered("context-delivered"),
+    )
 
 
 class TaskMemoryAdapter:
@@ -1086,8 +1277,13 @@ def _event(
         # relevance_reason 是不受信任的自由文字，可能夾帶 note 正文或內部
         # 診斷訊息；receipt／sidecar 只保留其 SHA-256 摘要，原文不得持久化。
         # source_time 只在可解析為受界 ISO8601 時原樣保留，否則記為 unknown。
-        row["applicability_sha256"] = _digest_public_list(candidate.get("applicability"))
-        row["relevance_reason_sha256"] = _digest_public_text(candidate.get("relevance_reason"))
+        if isinstance(candidate, _RestoredCandidate):
+            # #1136：由 receipt 重建的 candidate 沒有原文，只沿用 offer 上已驗證的摘要。
+            row["applicability_sha256"] = candidate.get("applicability_sha256")
+            row["relevance_reason_sha256"] = candidate.get("relevance_reason_sha256")
+        else:
+            row["applicability_sha256"] = _digest_public_list(candidate.get("applicability"))
+            row["relevance_reason_sha256"] = _digest_public_text(candidate.get("relevance_reason"))
         row["source_time"] = _bounded_source_time(candidate.get("source_time"))
     if event_name == "content-returned":
         # Hippo's strict funnel treats inline and snapshot as not-read.
