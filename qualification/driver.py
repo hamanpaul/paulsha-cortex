@@ -5,6 +5,9 @@ The driver is copied into the reference image before the candidate is mounted.
 It never imports qualification verdicts from the candidate checkout. Shared
 installer and isolation probes always fail closed; provider-native identity and
 protected repository probes are additionally required by deployment-canary mode.
+The legacy-adoption mode (#1122) instead binds the in-container adoption
+harness evidence to the live receipt and host; it runs no attack matrix and no
+provider or repository probe.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ try:
         WHEELS,
         canary_identity,
     )
+    from qualification import legacy_fixture
 except ModuleNotFoundError:  # 直接以 qualification/driver.py 執行時 sys.path[0] 是 qualification/
     from contract import (  # type: ignore[no-redef]
         CANARY_BUILDER,
@@ -57,6 +61,7 @@ except ModuleNotFoundError:  # 直接以 qualification/driver.py 執行時 sys.p
         WHEELS,
         canary_identity,
     )
+    import legacy_fixture  # type: ignore[no-redef]
 
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -4568,6 +4573,80 @@ def _full_dispatch(
     )
 
 
+def _path_identity(path: str) -> tuple[int, int] | None:
+    try:
+        observed = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return observed.st_dev, observed.st_ino
+
+
+def _legacy_adoption_checks(
+    *,
+    receipt: Mapping[str, Any],
+    legacy_dir: Path,
+    evidence_dir: Path,
+    candidate: Mapping[str, str],
+) -> list[dict[str, str]]:
+    """Bind the legacy-adoption harness evidence to the live receipt and host.
+
+    The harness (`legacy_adoption.py`) drove the installer CLI; the driver
+    re-derives what it can from the final host instead of trusting the harness
+    verdict alone: the receipt must be the applied and qualified re-adoption of
+    exactly the captured inventory, and every legacy object must still sit in
+    its quarantine destination with its legacy inode.
+    """
+
+    documents = {
+        name: _load_json(legacy_dir / name, f"legacy evidence {name}")
+        for name in legacy_fixture.LEGACY_EVIDENCE_FILES
+    }
+    adoption = documents["legacy-adoption.json"]
+    if adoption.get("profile") != legacy_fixture.LEGACY_PROFILE or adoption.get("status") != "passed":
+        raise QualificationFailure("legacy-adoption harness evidence is not passed")
+    if [row.get("name") for row in adoption.get("steps", [])] != list(
+        legacy_fixture.LEGACY_STEPS
+    ) or any(row.get("status") != "passed" for row in adoption.get("steps", [])):
+        raise QualificationFailure("legacy-adoption harness did not pass every step in order")
+    if adoption.get("candidate") != dict(candidate):
+        raise QualificationFailure("legacy-adoption harness evidence is bound to another candidate")
+    if adoption.get("fixture", {}).get("sha256") != legacy_fixture.manifest_sha256():
+        raise QualificationFailure("legacy-adoption harness ran another fixture manifest")
+    inventory_sha = adoption.get("inventory", {}).get("inventory_sha256")
+    if not isinstance(inventory_sha, str) or SHA256.fullmatch(inventory_sha) is None:
+        raise QualificationFailure("legacy-adoption harness evidence lacks the inventory digest")
+    if documents["legacy-inventory.json"].get("inventory_sha256") != inventory_sha:
+        raise QualificationFailure("legacy inventory evidence is not the inventory the plan bound")
+    record = receipt.get("legacy_adoption")
+    if (
+        not isinstance(record, Mapping)
+        or record.get("inventory_sha256") != inventory_sha
+        or record.get("apply_inventory_sha256") != inventory_sha
+    ):
+        raise QualificationFailure(
+            "install receipt does not record the legacy apply gate for the captured inventory"
+        )
+    if receipt.get("state") != "applied" or receipt.get("qualified") is not True:
+        raise QualificationFailure("the re-adopted install receipt is not applied and qualified")
+    rollback = documents["legacy-rollback.json"]
+    if (
+        rollback.get("returncode") != 0
+        or rollback.get("legacy_restored") is not True
+        or rollback.get("restore_safe") is not True
+        or rollback.get("retained_unknown") != []
+        or rollback.get("retained_drift") != []
+    ):
+        raise QualificationFailure("legacy rollback evidence is not a restore-safe legacy restore")
+    for row in adoption.get("plan", {}).get("quarantine", []):
+        if _path_identity(str(row.get("destination"))) != (row.get("dev"), row.get("ino")):
+            raise QualificationFailure(
+                f"legacy object {row.get('path')} is no longer in its quarantine destination"
+            )
+    for name, document in documents.items():
+        _write_json(evidence_dir / name, document)
+    return [{"name": name, "status": "passed"} for name in legacy_fixture.LEGACY_TESTS]
+
+
 def _artifact_inventory(evidence_dir: Path) -> list[dict[str, str]]:
     paths = sorted(
         path
@@ -4598,7 +4677,14 @@ def main() -> int:
     parser.add_argument("--image-digest", required=True)
     parser.add_argument("--wheel-filename", required=True)
     parser.add_argument(
-        "--profile", required=True, choices=("release", "deployment-canary")
+        "--profile",
+        required=True,
+        choices=("release", "deployment-canary", legacy_fixture.LEGACY_PROFILE),
+    )
+    parser.add_argument(
+        "--legacy-evidence",
+        type=Path,
+        help="legacy-adoption only: directory the in-container harness wrote",
     )
     parser.add_argument("--probe-repository")
     parser.add_argument("--probe-work-id")
@@ -4613,8 +4699,15 @@ def main() -> int:
         if SHA256.fullmatch(value) is None:
             parser.error(f"{label} SHA-256 is invalid")
     probe_values = (args.probe_repository, args.probe_work_id, args.probe_issue)
-    if args.profile == "release" and any(value is not None for value in probe_values):
-        parser.error("release profile must not receive external probe inputs")
+    legacy_profile = args.profile == legacy_fixture.LEGACY_PROFILE
+    if args.profile in {"release", legacy_fixture.LEGACY_PROFILE} and any(
+        value is not None for value in probe_values
+    ):
+        parser.error(f"{args.profile} profile must not receive external probe inputs")
+    if legacy_profile and args.legacy_evidence is None:
+        parser.error("legacy-adoption profile requires --legacy-evidence")
+    if not legacy_profile and args.legacy_evidence is not None:
+        parser.error("--legacy-evidence belongs to the legacy-adoption profile only")
     if args.profile == "deployment-canary" and any(
         value is None for value in probe_values
     ):
@@ -4627,54 +4720,70 @@ def main() -> int:
             receipt=receipt,
             evidence_dir=args.evidence_dir,
         )
-        _permission_attack_matrix(receipt, args.evidence_dir)
-        tests += [
-            {"name": f"{family}-attack-matrix", "status": "passed"}
-            for family in (
-                "capability",
-                "durable-state",
-                "enforcement-plane",
-                "process",
-                "gate",
-            )
-        ]
-        tests.append({"name": "negative-controls", "status": "passed"})
         providers: list[dict[str, object]] = []
-        if args.profile == "deployment-canary":
-            providers = _provider_smokes(args.evidence_dir)
-            tests.append({"name": "provider-capability-smoke", "status": "passed"})
-            assert args.probe_repository is not None
-            assert args.probe_work_id is not None
-            assert args.probe_issue is not None
-            _manager_github_probe(
-                args.probe_repository, args.candidate_sha, args.evidence_dir
+        if legacy_profile:
+            assert args.legacy_evidence is not None
+            tests = (
+                _legacy_adoption_checks(
+                    receipt=receipt,
+                    legacy_dir=args.legacy_evidence,
+                    evidence_dir=args.evidence_dir,
+                    candidate={
+                        "candidate_sha": args.candidate_sha,
+                        "wheel_sha256": args.wheel_sha256,
+                        "bundle_sha256": args.bundle_sha256,
+                    },
+                )
+                + tests
             )
-            tests.append({"name": "manager-github-dry-run-push", "status": "passed"})
-            _prepare_probe_dispatch(
-                receipt=receipt,
-                repository=args.probe_repository,
-                work_id=args.probe_work_id,
-                issue=args.probe_issue,
-            )
-            _full_dispatch(
-                repository=args.probe_repository,
-                work_id=args.probe_work_id,
-                issue=args.probe_issue,
-                release_candidate_sha=args.candidate_sha,
-                timeout=args.dispatch_timeout,
-                evidence_dir=args.evidence_dir,
-            )
-            tests.append({"name": "full-dispatch-closeout", "status": "passed"})
-        tests = [
-            {"name": name, "status": "passed"}
-            for name in (
-                "fresh-install",
-                "idempotent-apply",
-                "drift-detection",
-                "rollback",
-                "reinstall",
-            )
-        ] + tests
+        else:
+            _permission_attack_matrix(receipt, args.evidence_dir)
+            tests += [
+                {"name": f"{family}-attack-matrix", "status": "passed"}
+                for family in (
+                    "capability",
+                    "durable-state",
+                    "enforcement-plane",
+                    "process",
+                    "gate",
+                )
+            ]
+            tests.append({"name": "negative-controls", "status": "passed"})
+            if args.profile == "deployment-canary":
+                providers = _provider_smokes(args.evidence_dir)
+                tests.append({"name": "provider-capability-smoke", "status": "passed"})
+                assert args.probe_repository is not None
+                assert args.probe_work_id is not None
+                assert args.probe_issue is not None
+                _manager_github_probe(
+                    args.probe_repository, args.candidate_sha, args.evidence_dir
+                )
+                tests.append({"name": "manager-github-dry-run-push", "status": "passed"})
+                _prepare_probe_dispatch(
+                    receipt=receipt,
+                    repository=args.probe_repository,
+                    work_id=args.probe_work_id,
+                    issue=args.probe_issue,
+                )
+                _full_dispatch(
+                    repository=args.probe_repository,
+                    work_id=args.probe_work_id,
+                    issue=args.probe_issue,
+                    release_candidate_sha=args.candidate_sha,
+                    timeout=args.dispatch_timeout,
+                    evidence_dir=args.evidence_dir,
+                )
+                tests.append({"name": "full-dispatch-closeout", "status": "passed"})
+            tests = [
+                {"name": name, "status": "passed"}
+                for name in (
+                    "fresh-install",
+                    "idempotent-apply",
+                    "drift-detection",
+                    "rollback",
+                    "reinstall",
+                )
+            ] + tests
         artifacts = _artifact_inventory(args.evidence_dir)
         qualification = {
             "schema_version": 2,

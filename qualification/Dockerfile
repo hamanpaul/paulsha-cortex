@@ -43,11 +43,16 @@ COPY __init__.py /usr/local/libexec/qualification/__init__.py
 COPY verify_bundle.py /usr/local/libexec/cortex-qualification-verify-bundle
 COPY driver.py /usr/local/libexec/cortex-release-qualification
 COPY qualification.schema.json /usr/local/share/cortex/qualification.schema.json
+# legacy-adoption profile (#1122): the Phase 2b-shaped fixture and its harness.
+COPY legacy_fixture.py /usr/local/libexec/qualification/legacy_fixture.py
+COPY legacy_fixture.json /usr/local/libexec/qualification/legacy_fixture.json
+COPY legacy_adoption.py /usr/local/libexec/cortex-legacy-adoption
 
 RUN chmod 0755 \
         /usr/local/libexec/cortex-qualification-validate \
         /usr/local/libexec/cortex-qualification-verify-bundle \
-        /usr/local/libexec/cortex-release-qualification
+        /usr/local/libexec/cortex-release-qualification \
+        /usr/local/libexec/cortex-legacy-adoption
 
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/sbin/init"]

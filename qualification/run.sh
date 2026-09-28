@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --profile {release|deployment-canary} --artifacts DIR --candidate-sha SHA --wheel-sha256 SHA --bundle-sha256 SHA --output DIR" >&2
+    echo "usage: $0 --profile {release|deployment-canary|legacy-adoption} --artifacts DIR --candidate-sha SHA --wheel-sha256 SHA --bundle-sha256 SHA --output DIR" >&2
     exit 2
 }
 
@@ -32,7 +32,7 @@ while (($#)); do
 done
 
 [[ -d "$artifact_dir" && -n "$output_dir" ]] || usage
-[[ "$profile" == release || "$profile" == deployment-canary ]] || usage
+[[ "$profile" == release || "$profile" == deployment-canary || "$profile" == legacy-adoption ]] || usage
 [[ "$candidate_sha" =~ ^[0-9a-f]{40}$ ]] || die "candidate SHA must be 40 lowercase hex characters"
 [[ "$expected_wheel_sha" =~ ^[0-9a-f]{64}$ ]] || die "wheel SHA-256 must be 64 lowercase hex characters"
 [[ "$expected_bundle_sha" =~ ^[0-9a-f]{64}$ ]] || die "bundle SHA-256 must be 64 lowercase hex characters"
@@ -79,10 +79,18 @@ image_digest=$(docker image inspect --format '{{.Id}}' "$image_tag")
 docker volume create "$volume_name" >/dev/null
 docker volume create "$output_volume_name" >/dev/null
 network_args=()
-if [[ "$profile" == release ]]; then
-    # The release profile must be incapable of contacting providers or remotes,
-    # even if an installed service unexpectedly attempts a network operation.
+if [[ "$profile" == release || "$profile" == legacy-adoption ]]; then
+    # The release and legacy-adoption profiles must be incapable of contacting
+    # providers or remotes, even if an installed service unexpectedly attempts
+    # a network operation.
     network_args=(--network none)
+fi
+state_mount_args=(--mount "type=volume,source=$volume_name,target=/var/lib/cortex")
+if [[ "$profile" == legacy-adoption ]]; then
+    # A Phase 2b host keeps /var/lib/cortex on the same filesystem as /etc and
+    # /opt; legacy-quarantine moves objects with rename(2) and never copies, so
+    # the legacy fixture lives on the container root filesystem.
+    state_mount_args=()
 fi
 docker run --detach \
     --name "$container_name" \
@@ -93,7 +101,7 @@ docker run --detach \
     --tmpfs /run/lock:rw,nosuid,nodev,noexec,mode=755 \
     --mount "type=bind,source=$artifact_dir,target=/artifacts,readonly" \
     --volume "/sys/fs/cgroup:/sys/fs/cgroup:rw" \
-    --mount "type=volume,source=$volume_name,target=/var/lib/cortex" \
+    "${state_mount_args[@]}" \
     --mount "type=volume,source=$output_volume_name,target=/qualification-output" \
     "${network_args[@]}" \
     "$image_tag" >/dev/null
@@ -126,6 +134,61 @@ qualification_path=$qualification_root/qualification.json
 
 docker exec "$container_name" install -d -o root -g root -m 0700 /run/cortex-install
 docker exec "$container_name" install -d -o root -g root -m 0700 "$qualification_root"
+
+# legacy-adoption (#1122): seed a Phase 2b-shaped host, then adopt, roll back,
+# and re-adopt it through the installer CLI. It never imports a provider
+# credential or runs a provider smoke; the release flow below is not used.
+run_legacy_adoption_profile() {
+    local legacy_output=$qualification_root/legacy
+    docker exec "$container_name" install -d -o root -g root -m 0700 "$legacy_output"
+    if ! docker exec "$container_name" /usr/local/libexec/cortex-legacy-adoption \
+        --config /artifacts/install-config.yaml \
+        --bundle /artifacts/bundle.json \
+        --output-dir "$legacy_output" \
+        --work-dir /run/cortex-install \
+        --candidate-sha "$candidate_sha" \
+        --wheel-sha256 "$expected_wheel_sha" \
+        --bundle-sha256 "$expected_bundle_sha"; then
+        # The step log names the failing step and the rollback report names any
+        # retained object; neither holds credential material.
+        docker exec "$container_name" cat "$legacy_output/legacy-adoption.json" >&2 || true
+        docker exec "$container_name" cat "$legacy_output/legacy-rollback.json" >&2 || true
+        die "legacy-adoption harness failed"
+    fi
+    docker exec "$container_name" /usr/local/libexec/cortex-release-qualification \
+        --receipt "$receipt_path" \
+        --install-evidence "$legacy_output/install-verification.json" \
+        --legacy-evidence "$legacy_output" \
+        --candidate-sha "$candidate_sha" \
+        --wheel-sha256 "$expected_wheel_sha" \
+        --bundle-sha256 "$expected_bundle_sha" \
+        --image-digest "$image_digest" \
+        --wheel-filename "$(basename "$wheel_path")" \
+        --profile legacy-adoption \
+        --output "$qualification_path" \
+        --evidence-dir "$qualification_root/evidence"
+    docker exec "$container_name" /usr/local/libexec/cortex-qualification-validate \
+        --qualification "$qualification_path" \
+        --candidate-sha "$candidate_sha" \
+        --wheel-sha256 "$expected_wheel_sha" \
+        --bundle-sha256 "$expected_bundle_sha" \
+        --evidence-root "$qualification_root" \
+        --require-legacy-profile
+    docker cp "$container_name:$qualification_path" "$output_dir/qualification.json"
+    docker cp "$container_name:$qualification_root/evidence" "$output_dir/evidence"
+    python3 "$script_dir/validate.py" \
+        --qualification "$output_dir/qualification.json" \
+        --candidate-sha "$candidate_sha" \
+        --wheel-sha256 "$expected_wheel_sha" \
+        --bundle-sha256 "$expected_bundle_sha" \
+        --evidence-root "$output_dir" \
+        --require-legacy-profile
+}
+
+if [[ "$profile" == legacy-adoption ]]; then
+    run_legacy_adoption_profile
+    exit 0
+fi
 docker exec "$container_name" cortex install trust-root plan \
     --config /artifacts/install-config.yaml \
     --bundle /artifacts/bundle.json \

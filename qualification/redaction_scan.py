@@ -9,7 +9,13 @@ import re
 import sys
 from pathlib import Path
 
+try:
+    from qualification import legacy_fixture
+except ModuleNotFoundError:  # host 端以 qualification/redaction_scan.py 執行
+    import legacy_fixture  # type: ignore[no-redef]
 
+
+PROFILES = ("release", "deployment-canary", legacy_fixture.LEGACY_PROFILE)
 REQUIRED_SECRET_ENV = (
     "CORTEX_RC_CODEX_AUTH",
     "CORTEX_RC_AGY_AUTH",
@@ -30,8 +36,13 @@ TOKEN_PATTERNS = (
 def _needles(profile: str) -> tuple[bytes, ...]:
     if profile == "release":
         return ()
+    if profile == legacy_fixture.LEGACY_PROFILE:
+        # The fixture's credential files hold fake but distinctive values; the
+        # inventory records them by metadata only and the harness drops even
+        # their digests, so none may reach an uploaded file.
+        return tuple(legacy_fixture.credential_secrets(legacy_fixture.load_manifest()))
     if profile != "deployment-canary":
-        raise ValueError("profile must be release or deployment-canary")
+        raise ValueError("profile must be release, deployment-canary or legacy-adoption")
     values: set[bytes] = set()
     for name in REQUIRED_SECRET_ENV:
         raw = os.environ.get(name)
@@ -79,9 +90,7 @@ def scan(root: Path, *, profile: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
-    parser.add_argument(
-        "--profile", required=True, choices=("release", "deployment-canary")
-    )
+    parser.add_argument("--profile", required=True, choices=PROFILES)
     args = parser.parse_args()
     try:
         scan(args.root, profile=args.profile)

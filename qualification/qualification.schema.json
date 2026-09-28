@@ -19,7 +19,7 @@
   ],
   "properties": {
     "schema_version": {"const": 2},
-    "profile": {"enum": ["release", "deployment-canary"]},
+    "profile": {"enum": ["release", "deployment-canary", "legacy-adoption"]},
     "status": {"enum": ["passed", "failed", "skipped"]},
     "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "wheel": {
@@ -134,6 +134,10 @@
     {
       "if": {"properties": {"profile": {"const": "deployment-canary"}}},
       "then": {"properties": {"providers": {"minItems": 3, "maxItems": 3}}}
+    },
+    {
+      "if": {"properties": {"profile": {"const": "legacy-adoption"}}},
+      "then": {"properties": {"providers": {"maxItems": 0}}}
     }
   ]
 }
