@@ -2441,6 +2441,131 @@ def _legacy_quarantine_restore(entry: Mapping[str, object]) -> None:
         os.close(destination_fd)
 
 
+def _created_tree_identity(path: Path) -> dict[str, object]:
+    """Inode and full tree digest of a directory tree a receipt just created.
+
+    Recorded when a legacy adoption creates a tree where a quarantined legacy
+    object stood, so rollback can remove exactly that tree -- and nothing a
+    later writer added or changed -- before the legacy object moves back.
+    """
+
+    parent_fd = _open_path_chain(path.parent)
+    try:
+        observed = _stat_at(parent_fd, path.name)
+        if observed is None or not stat.S_ISDIR(observed.st_mode):
+            raise InstallDriftError(f"created tree is not a directory: {path}")
+        tree_sha256 = _tree_sha256(path)
+        current = _stat_at(parent_fd, path.name)
+        if current is None or (current.st_dev, current.st_ino) != (
+            observed.st_dev,
+            observed.st_ino,
+        ):
+            raise InstallDriftError(f"created tree changed while it was recorded: {path}")
+        return {"device": observed.st_dev, "inode": observed.st_ino, "tree_sha256": tree_sha256}
+    finally:
+        os.close(parent_fd)
+
+
+def _discard_created_tree(path: Path, identity: Mapping[str, object]) -> None:
+    """Remove a tree this receipt created, only while it is exactly that tree.
+
+    The tree is first renamed aside (``RENAME_NOREPLACE``, same directory) so
+    the original path frees atomically and the digest is taken of the very
+    inode that will be removed.  A different inode, a changed tree or an
+    unsupported object keeps it: it is renamed back and the call fails.
+    """
+
+    if (
+        type(identity.get("device")) is not int
+        or type(identity.get("inode")) is not int
+        or not isinstance(identity.get("tree_sha256"), str)
+    ):
+        raise InstallDriftError(f"no creation identity binds the tree at {path}")
+    parent_fd = _open_path_chain(path.parent)
+    try:
+        observed = _stat_at(parent_fd, path.name)
+        if observed is None:
+            return
+        if not stat.S_ISDIR(observed.st_mode) or (observed.st_dev, observed.st_ino) != (
+            identity["device"],
+            identity["inode"],
+        ):
+            raise InstallDriftError(
+                f"{path} is not the tree this receipt created; it is kept"
+            )
+        aside = f".{path.name}.cortex-discard"
+        if _stat_at(parent_fd, aside) is not None:
+            raise InstallDriftError(f"a previous discard of {path} is still pending: {aside}")
+        _renameat2_noreplace(parent_fd, path.name, parent_fd, aside)
+        moved = _stat_at(parent_fd, aside)
+        try:
+            unchanged = (
+                moved is not None
+                and (moved.st_dev, moved.st_ino) == (identity["device"], identity["inode"])
+                and _tree_sha256(path.parent / aside) == identity["tree_sha256"]
+            )
+        except (InstallError, OSError):
+            unchanged = False
+        if not unchanged:
+            _renameat2_noreplace(parent_fd, aside, parent_fd, path.name)
+            _fsync_directory_at(parent_fd)
+            raise InstallDriftError(
+                f"{path} changed since this receipt created it; it is kept"
+            )
+        shutil.rmtree(path.parent / aside)
+        _fsync_directory_at(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _remove_created_credential_directories(
+    rows: Sequence[object], destination: Path
+) -> str | None:
+    """Remove the (empty) directories a legacy-receipt import created, innermost first.
+
+    Returns why a directory is kept, or ``None`` when all are gone.
+    """
+
+    for item in reversed(list(rows)):
+        if (
+            not isinstance(item, Mapping)
+            or not isinstance(item.get("path"), str)
+            or type(item.get("dev")) is not int
+            or type(item.get("ino")) is not int
+        ):
+            return "credential directory record is invalid"
+        path = Path(str(item["path"]))
+        if path not in destination.parents:
+            return "credential directory record is outside the destination"
+        try:
+            parent_fd = _open_path_chain(path.parent)
+        except FileNotFoundError:
+            continue
+        try:
+            observed = _stat_at(parent_fd, path.name)
+            if observed is None:
+                continue
+            if not stat.S_ISDIR(observed.st_mode) or (observed.st_dev, observed.st_ino) != (
+                item["dev"],
+                item["ino"],
+            ):
+                return f"credential directory created by import was replaced: {path}"
+            descriptor = os.open(path.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+            try:
+                held = os.fstat(descriptor)
+                if (held.st_dev, held.st_ino) != (observed.st_dev, observed.st_ino):
+                    return f"credential directory created by import was replaced: {path}"
+                if os.listdir(descriptor):
+                    return f"credential directory created by import is not empty: {path}"
+            finally:
+                os.close(descriptor)
+            os.rmdir(path.name, dir_fd=parent_fd)
+            _fsync_directory_at(parent_fd)
+        finally:
+            os.close(parent_fd)
+    return None
+
+
 def _refuse_unprepared_quarantine(step: Mapping[str, object]) -> None:
     if step.get("kind") == "legacy-quarantine":
         raise InstallPlanError(
@@ -2735,6 +2860,16 @@ class LocalInstallBackend:
         """Move a legacy object under the authority of its prepared entry."""
 
         return _legacy_quarantine_move(entry)
+
+    def created_tree_identity(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        """Bind a tree a legacy adoption created (repository clone) to its inode."""
+
+        return _created_tree_identity(Path(str(step.get("path", ""))))
+
+    def discard_created_tree(self, path: str, identity: Mapping[str, object]) -> None:
+        """Legacy rollback: remove a tree this receipt created, only if unchanged."""
+
+        _discard_created_tree(Path(path), identity)
 
     def apply_step_checkpointed(
         self,
@@ -4284,6 +4419,30 @@ class LocalInstallBackend:
                 if descriptor is not None:
                     os.close(descriptor)
                 os.close(parent_fd)
+        # A legacy adoption receipt also records the credential state
+        # directories an import created (``created_directories``): they stand
+        # where quarantined legacy directories must move back, so they go too
+        # -- but only while empty and still the recorded inode.
+        retained_keys = {str(row.get("credential")) for row in retained}
+        for row in rows:
+            if not isinstance(row, Mapping) or not row.get("created_directories"):
+                continue
+            principal = str(row.get("principal", ""))
+            provider = str(row.get("provider", ""))
+            key = f"{principal}/{provider}"
+            if key in retained_keys:
+                continue
+            try:
+                destination, _uid, _gid = credential_destination(
+                    receipt, principal=principal, provider=provider
+                )
+                problem = _remove_created_credential_directories(
+                    list(row["created_directories"]), destination  # type: ignore[arg-type]
+                )
+            except (InstallError, OSError) as exc:
+                problem = f"credential directory rollback failed: {exc}"
+            if problem is not None:
+                retained.append({"credential": key, "reason": problem})
         return tuple(retained)
 
     def start_service(self, name: str) -> None:

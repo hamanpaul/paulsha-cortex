@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 from copy import deepcopy
@@ -154,6 +155,38 @@ class MemoryInstallBackend:
     # -- inspection -----------------------------------------------------
     live_paths = False
     stable_replacement_identity = False
+    #: Publish the venv slot with a staged "ready" authority (inode bound), as
+    #: the real backend does; the base scenario keeps the legacy form.
+    ready_venv_authority = False
+    VENV_INODE = 4242
+
+    def _ready_venv_authority(self, step) -> dict[str, object]:
+        slot = Path(step["path"])
+        return {
+            "state": "ready",
+            "path": step["path"],
+            "staging_path": str(slot.with_name(f".{slot.name}.cortex-staging")),
+            "device": 1,
+            "inode": self.VENV_INODE,
+            "tree_sha256": TREE_SHA256,
+        }
+
+    def created_tree_identity(self, step) -> dict[str, object]:
+        identity = {"device": 1, "inode": 7000 + len(self.identities), "tree_sha256": "f" * 64}
+        self.identities[f"tree:{step['path']}"] = identity
+        return dict(identity)
+
+    def discard_created_tree(self, path: str, identity) -> None:
+        self.log.append(["discard", path])
+        venv = next((s for s in self.plan["apply_order"] if s["kind"] == "venv"), None)
+        if venv is not None and path == venv["path"]:
+            expected = {"device": 1, "inode": self.VENV_INODE, "tree_sha256": TREE_SHA256}
+            if dict(identity) != expected or not self.venv_slot:
+                raise InstallDriftError(f"venv slot is not the one this receipt created: {path}")
+            self.venv_slot = False
+            return
+        if dict(identity) != self.identities.get(f"tree:{path}"):
+            raise InstallDriftError(f"tree is not the one this receipt created: {path}")
 
     def preflight_facts(self, _plan) -> dict[str, object]:
         facts = deepcopy(self.facts)
@@ -221,7 +254,11 @@ class MemoryInstallBackend:
         assert kind != "legacy-quarantine", "a quarantine moves only through its entry"
         if kind == "venv":
             if creation_checkpoint is not None:
-                creation_checkpoint({"path": step["path"], "tree_sha256": TREE_SHA256})
+                creation_checkpoint(
+                    self._ready_venv_authority(step)
+                    if self.ready_venv_authority
+                    else {"path": step["path"], "tree_sha256": TREE_SHA256}
+                )
             self.venv_slot = True
             self.venv_link = {"exists": True, "is_symlink": True, "link_target": VENV_LINK}
             state = self._venv_state(step)
@@ -533,7 +570,15 @@ DRIFTED_DIRECTORY = "asset:coordinator-root-tree"
 class LegacyCase:
     """A Phase 2b-shaped host, its reviewed inventory and the bound plan."""
 
-    def __init__(self, tmp_path: Path, *, host=None, request: dict | None = None) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        host=None,
+        request: dict | None = None,
+        backend_class: type | None = None,
+    ) -> None:
+        self.backend_class = backend_class or MemoryInstallBackend
         config, bundle, overlay, fake, seeded, base = _setup(tmp_path)
         if host is not None:
             host(seeded, fake, base)
@@ -569,9 +614,10 @@ class LegacyCase:
         return [step["path"] for step in self.quarantine_steps()]
 
     def memory_backend(self) -> MemoryInstallBackend:
-        backend = MemoryInstallBackend(self.plan, facts=_legacy_facts(self.plan, self.host))
+        backend = self.backend_class(self.plan, facts=_legacy_facts(self.plan, self.host))
         backend.live_paths = True
         backend.stable_replacement_identity = True
+        backend.ready_venv_authority = True
         for step in self.plan["apply_order"]:
             if step["step_id"] not in self.block["adopted"]:
                 continue
@@ -1306,6 +1352,18 @@ def _quarantine_entry(document: dict) -> dict:
             ),
             "quarantine",
         ),
+        (
+            lambda d: _entry(d, "account:cortex-builder").update(
+                legacy_creation={"device": 1, "inode": 2, "tree_sha256": "3" * 64}
+            ),
+            "legacy creation",
+        ),
+        (
+            lambda d: _entry(d, "repository:paulsha-cortex")["legacy_creation"].pop(
+                "tree_sha256"
+            ),
+            "legacy creation",
+        ),
     ],
     ids=[
         "forged-row",
@@ -1318,6 +1376,8 @@ def _quarantine_entry(document: dict) -> dict:
         "quarantine-authority-missing",
         "quarantine-parent-missing",
         "unexpected-on-a-completed-entry",
+        "creation-on-an-adopted-account",
+        "creation-without-tree-digest",
     ],
 )
 def test_receipt_load_rejects_tampered_legacy_provenance(
@@ -1989,3 +2049,372 @@ def test_renameat2_noreplace_on_the_real_filesystem(tmp_path: Path) -> None:
     finally:
         os.close(left_fd)
         os.close(right_fd)
+
+
+# ---------------------------------------------------------------------------
+# rollback removes what the adoption created in the legacy objects' places
+# ---------------------------------------------------------------------------
+
+
+class FilesystemLegacyBackend(MemoryInstallBackend):
+    """The memory backend, except that what apply creates exists for real.
+
+    Directories the plan creates, the source repository clone and the venv
+    slot are made on the temporary tree, so a rollback that leaves any of them
+    behind shows up in the re-captured inventory -- and keeps a quarantined
+    legacy object from moving back -- exactly as on a host.
+    """
+
+    ready_venv_authority = True
+
+    @staticmethod
+    def _created_directory(step) -> bool:
+        return step["kind"] == "asset" and step.get("asset_type") == "directory"
+
+    def _venv_state(self, step) -> dict[str, object]:
+        slot = Path(step["path"])
+        if not slot.is_dir():
+            return {"exists": False}
+        state: dict[str, object] = {
+            "exists": True,
+            "installed_sha256": None,
+            "slot_sha256": step["desired_sha256"],
+            "path": step["path"],
+            "tree_sha256": install_backend._tree_sha256(slot),
+        }
+        if self.venv_link == {"exists": True, "is_symlink": True, "link_target": VENV_LINK}:
+            state.update({"installed_sha256": step["desired_sha256"], "link_target": VENV_LINK})
+        return state
+
+    def _apply(self, step, creation_checkpoint=None) -> dict[str, object]:
+        if step["kind"] == "venv":
+            prior = self.inspect_step(step)
+            self.log.append(["apply", step["step_id"]])
+            slot = Path(step["path"])
+            slot.mkdir()
+            (slot / "bin").mkdir()
+            (slot / "bin" / "python").write_text("#!/bin/sh\n")
+            (slot / ".cortex-wheel.sha256").write_text(step["wheel_sha256"] + "\n")
+            observed = slot.lstat()
+            authority = {
+                "state": "ready",
+                "path": step["path"],
+                "staging_path": str(slot.with_name(f".{slot.name}.cortex-staging")),
+                "device": observed.st_dev,
+                "inode": observed.st_ino,
+                "tree_sha256": install_backend._tree_sha256(slot),
+            }
+            if creation_checkpoint is not None:
+                creation_checkpoint(authority)
+            self.venv_link = {"exists": True, "is_symlink": True, "link_target": VENV_LINK}
+            return {"prior": prior, **self._venv_state(step)}
+        prior = self.inspect_step(step)
+        outcome = super()._apply(step, creation_checkpoint)
+        if not prior.get("exists"):
+            path = Path(str(step.get("path")))
+            if self._created_directory(step):
+                path.mkdir(mode=0o755)
+            elif step["kind"] == "repository":
+                (path / ".git" / "objects").mkdir(parents=True)
+                (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+                (path / "README.md").write_text("candidate checkout\n")
+        return outcome
+
+    def rollback_step(self, entry) -> None:
+        super().rollback_step(entry)
+        step = entry["step"]
+        if self._created_directory(step) and not entry["prior"].get("exists"):
+            path = Path(step["path"])
+            # Like the real backend: only an empty directory is removed.
+            if path.is_dir() and not path.is_symlink() and not any(path.iterdir()):
+                path.rmdir()
+
+    def created_tree_identity(self, step) -> dict[str, object]:
+        return install_backend._created_tree_identity(Path(step["path"]))
+
+    def discard_created_tree(self, path: str, identity) -> None:
+        self.log.append(["discard", path])
+        install_backend._discard_created_tree(Path(path), identity)
+
+    def rollback_credentials(self, receipt):
+        return install_backend.LocalInstallBackend(require_root=False).rollback_credentials(
+            receipt
+        )
+
+
+def _seed_repository_and_copilot(seeded, _fake, base) -> None:
+    repository = Path(base["roots"]["state"]) / "repos" / "paulsha-cortex"
+    (repository / ".git").mkdir(parents=True)
+    (repository / ".git" / "HEAD").write_text("ref: refs/heads/legacy\n")
+    (repository / "README.md").write_text("legacy checkout\n")
+    copilot = seeded["reviewer_auth"].parent.parent / ".copilot"
+    copilot.mkdir()
+    (copilot / "config.json").write_bytes(b"legacy copilot login\n")
+    (copilot / "config.json").chmod(0)
+
+
+def _credentials_as_test_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The receipt's accounts do not exist here; the test user owns the files."""
+
+    original = install_core.credential_destination
+
+    def as_test_user(receipt, *, principal, provider):
+        path, _uid, _gid = original(receipt, principal=principal, provider=provider)
+        return path, os.getuid(), os.getgid()
+
+    monkeypatch.setattr(install_backend, "credential_destination", as_test_user)
+
+
+def _home(case: LegacyCase, account: str) -> Path:
+    return Path(next(row["home"] for row in case.plan["accounts"] if row["name"] == account))
+
+
+def _import(case: LegacyCase, receipt: InstallReceipt, principal: str, provider: str) -> None:
+    name = install_core.credential_source_basename(principal, provider)
+    source = case.tmp_path / "import" / f"{principal}-{provider}" / name
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        json.dumps({"copilotTokens": {"host": "token"}}) if provider == "copilot" else "token\n"
+    )
+    account = install_core._PRINCIPAL_ACCOUNTS[principal]
+    install_core.import_credential(
+        receipt,
+        principal=principal,
+        provider=provider,
+        source=source,
+        destination_root=_home(case, account),
+    )
+
+
+class AdoptedHost:
+    """An applied adoption with real clone, venv slot and imported credentials."""
+
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _credentials_as_test_user(monkeypatch)
+        self.case = LegacyCase(
+            tmp_path, host=_seed_repository_and_copilot, backend_class=FilesystemLegacyBackend
+        )
+        case = self.case
+        self.legacy = case.legacy_identities()
+        self.repository = Path(case.base["roots"]["state"]) / "repos" / "paulsha-cortex"
+        self.slot = Path(case.step("candidate-venv")["path"])
+        self.venvs = self.slot.parent
+        self.reviewer = _home(case, "cortex-reviewer-planner")
+        self.copilot = self.reviewer / ".copilot"
+        self.agy = self.reviewer / "cache" / "gemini" / "antigravity-cli"
+        self.receipt = new_install_receipt(case.plan)
+        case.apply(self.receipt)
+        _import(case, self.receipt, "reviewer-planner", "copilot")
+        _import(case, self.receipt, "reviewer-planner", "agy")
+
+    def rollback(self):
+        return rollback_receipt(
+            self.receipt, backend=self.case.backend, legacy_host=self.case.host
+        )
+
+
+def test_legacy_rollback_returns_the_repository_venv_and_credential_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = AdoptedHost(tmp_path, monkeypatch)
+    case = host.case
+    # Apply created real objects where the legacy ones were quarantined.
+    assert (host.repository / "README.md").read_text() == "candidate checkout\n"
+    assert (host.slot / "bin" / "python").is_file()
+    assert (host.copilot / "config.json").is_file()
+    assert (host.agy / "antigravity-oauth-token").is_file()
+    rows = {row["provider"]: row for row in host.receipt.to_dict()["credentials"]}
+    assert [item["path"] for item in rows["copilot"]["created_directories"]] == [
+        str(host.copilot)
+    ]
+    assert [item["path"] for item in rows["agy"]["created_directories"]] == [str(host.agy)]
+    repository_entry = _entry(host.receipt.to_dict(), "repository:paulsha-cortex")
+    assert repository_entry["legacy_creation"]["inode"] == host.repository.lstat().st_ino
+
+    report = host.rollback()
+
+    assert report.retained_drift == ()
+    assert report.retained_unknown == ()
+    assert report.legacy_restored is True
+    assert case.snapshot() == host.legacy
+    assert (host.repository / "README.md").read_text() == "legacy checkout\n"
+    assert not os.path.lexists(host.venvs)
+    assert host.copilot.lstat().st_ino == host.legacy[str(host.copilot)][1]
+    assert host.agy.lstat().st_ino == host.legacy[str(host.agy)][1]
+    assert case.recaptured_sha256() == case.block["inventory_sha256"]
+    document = host.receipt.to_dict()
+    assert document["state"] == "rolled-back"
+    assert document["journal"] == []
+    assert install_cli._receipt_restore_safe(document) is True
+
+
+def test_legacy_rollback_keeps_a_clone_changed_after_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = AdoptedHost(tmp_path, monkeypatch)
+    (host.repository / "notes.txt").write_text("written by someone else\n")
+
+    report = host.rollback()
+
+    drift = {row["step_id"] for row in report.retained_drift}
+    assert "repository:paulsha-cortex" in drift
+    assert f"legacy-quarantine:{host.repository}" in drift
+    assert (host.repository / "notes.txt").read_text() == "written by someone else\n"
+    assert (host.repository / "README.md").read_text() == "candidate checkout\n"
+    assert not any(
+        name.endswith(".cortex-discard") for name in os.listdir(host.repository.parent)
+    )
+    assert report.legacy_restored is False
+    assert host.receipt.to_dict()["state"] == "rollback-blocked"
+    assert install_cli._receipt_restore_safe(host.receipt.to_dict()) is False
+
+
+def test_legacy_rollback_keeps_a_venv_slot_with_an_unknown_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = AdoptedHost(tmp_path, monkeypatch)
+    (host.slot / "unknown.pth").write_text("import os\n")
+
+    report = host.rollback()
+
+    assert "candidate-venv" in {row["step_id"] for row in report.retained_drift}
+    assert (host.slot / "unknown.pth").is_file()
+    assert report.legacy_restored is False
+    assert install_cli._receipt_restore_safe(host.receipt.to_dict()) is False
+
+
+def test_legacy_rollback_keeps_a_credential_directory_with_other_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = AdoptedHost(tmp_path, monkeypatch)
+    (host.copilot / "session-state.json").write_text("{}\n")
+
+    report = host.rollback()
+
+    reasons = [
+        row["observed"].get("reason")
+        for row in report.retained_drift
+        if str(row["step_id"]).startswith("credential:")
+    ]
+    assert any("not empty" in str(reason) for reason in reasons)
+    assert (host.copilot / "session-state.json").is_file()
+    assert not (host.copilot / "config.json").exists()
+    assert report.legacy_restored is False
+    assert install_cli._receipt_restore_safe(host.receipt.to_dict()) is False
+
+
+def test_receipt_load_binds_created_credential_directories_to_the_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = LegacyCase(tmp_path)
+    receipt, path = _durable(monkeypatch, case)
+    case.apply(receipt)
+    _import(case, receipt, "reviewer-planner", "copilot")
+    loaded = InstallReceipt.load(path, expected_plan=case.plan)
+    row = loaded.to_dict()["credentials"][0]
+    assert [item["path"] for item in row["created_directories"]] == [
+        str(_home(case, "cortex-reviewer-planner") / ".copilot")
+    ]
+
+    def elsewhere(document: dict) -> None:
+        document["credentials"][0]["created_directories"][0]["path"] = "/srv/elsewhere"
+
+    _tampered(path, elsewhere)
+    with pytest.raises(InstallError, match="created directories"):
+        InstallReceipt.load(path, expected_plan=case.plan)
+
+
+def test_plain_receipt_credential_import_records_no_created_directories(
+    tmp_path: Path,
+) -> None:
+    plan = _plain_plan(tmp_path / "plain")
+    receipt = new_install_receipt(plan)
+    receipt._document["state"] = "applied"
+    home = tmp_path / "home" / "reviewer"
+    home.mkdir(parents=True)
+    source = tmp_path / "import" / "config.json"
+    source.parent.mkdir(parents=True)
+    source.write_text(json.dumps({"copilotTokens": {"host": "token"}}))
+
+    install_core.import_credential(
+        receipt,
+        principal="reviewer-planner",
+        provider="copilot",
+        source=source,
+        destination_root=home,
+    )
+
+    assert set(receipt.to_dict()["credentials"][0]) == {"principal", "provider", "mode", "sha256"}
+    assert (home / ".copilot" / "config.json").is_file()
+
+
+def test_created_tree_discard_removes_only_the_recorded_tree(tmp_path: Path) -> None:
+    tree = tmp_path / "repos" / "checkout"
+    (tree / ".git").mkdir(parents=True)
+    (tree / "README.md").write_text("created\n")
+    identity = install_backend._created_tree_identity(tree)
+    (tree / "extra.txt").write_text("added later\n")
+
+    with pytest.raises(InstallDriftError, match="changed"):
+        install_backend._discard_created_tree(tree, identity)
+
+    assert (tree / "extra.txt").is_file()
+    assert tree.lstat().st_ino == identity["inode"]
+    assert os.listdir(tree.parent) == ["checkout"]
+
+    (tree / "extra.txt").unlink()
+    install_backend._discard_created_tree(tree, identity)
+    assert not os.path.lexists(tree)
+    assert os.listdir(tree.parent) == []
+
+
+def test_created_tree_discard_refuses_a_replaced_tree(tmp_path: Path) -> None:
+    tree = tmp_path / "repos" / "checkout"
+    tree.mkdir(parents=True)
+    (tree / "README.md").write_text("created\n")
+    identity = install_backend._created_tree_identity(tree)
+    tree.rename(tmp_path / "repos" / "aside")
+    tree.mkdir()
+    (tree / "README.md").write_text("created\n")
+
+    with pytest.raises(InstallDriftError, match="not the tree"):
+        install_backend._discard_created_tree(tree, identity)
+
+    assert (tree / "README.md").is_file()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_repository_tree_identity_is_stable_across_git_inspection(tmp_path: Path) -> None:
+    env = {
+        **install_backend._REPOSITORY_GIT_ENV,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+    source = tmp_path / "source"
+    subprocess.run(["git", "init", "-q", str(source)], check=True, env=env)
+    (source / "README.md").write_text("hello\n")
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True, env=env)
+    subprocess.run(["git", "-C", str(source), "commit", "-qm", "init"], check=True, env=env)
+    clone = tmp_path / "repos" / "clone"
+    clone.parent.mkdir()
+    prefix = install_backend._REPOSITORY_GIT_PREFIX
+    subprocess.run([*prefix, "clone", "-q", str(source), str(clone)], check=True, env=env)
+    identity = install_backend._created_tree_identity(clone)
+
+    for suffix in (
+        ("rev-parse", "HEAD"),
+        ("status", "--porcelain=v1", "--untracked-files=all"),
+        ("fsck", "--strict", "--no-dangling"),
+    ):
+        subprocess.run(
+            [*prefix, "-c", f"safe.directory={clone}", "-C", str(clone), *suffix],
+            check=True,
+            env=env,
+            capture_output=True,
+        )
+
+    assert install_backend._created_tree_identity(clone) == identity
+    install_backend._discard_created_tree(clone, identity)
+    assert not os.path.lexists(clone)

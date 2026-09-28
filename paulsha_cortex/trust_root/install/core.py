@@ -2969,7 +2969,7 @@ class InstallReceipt:
         credentials = payload.get("credentials")
         if not isinstance(credentials, list) or any(
             not isinstance(row, Mapping)
-            or set(row) != {"principal", "provider", "mode", "sha256"}
+            or set(row) - {"created_directories"} != {"principal", "provider", "mode", "sha256"}
             or row.get("mode") != "0600"
             or not isinstance(row.get("sha256"), str)
             or len(str(row.get("sha256"))) != 64
@@ -2979,7 +2979,7 @@ class InstallReceipt:
         credential_journal = payload.get("credential_journal", [])
         if not isinstance(credential_journal, list) or any(
             not isinstance(row, Mapping)
-            or set(row)
+            or set(row) - {"created_directories"}
             not in (
                 {"principal", "provider", "mode", "sha256", "status"},
                 {
@@ -3009,6 +3009,14 @@ class InstallReceipt:
             for row in credential_journal
         ):
             raise InstallError(f"receipt credential journal is invalid: {path}")
+        for row in (*credentials, *credential_journal):
+            if "created_directories" in row and (
+                version != _LEGACY_RECEIPT_SCHEMA_VERSION
+                or not _valid_created_credential_directories(row, plan)
+            ):
+                raise InstallError(
+                    f"receipt credential created directories are invalid: {path}"
+                )
         completed_identities = [
             (str(row["principal"]), str(row["provider"])) for row in credentials
         ]
@@ -3172,6 +3180,58 @@ def _valid_quarantine_unexpected(value: object) -> bool:
     )
 
 
+def _valid_created_credential_directories(
+    row: Mapping[str, object], plan: Mapping[str, object]
+) -> bool:
+    """Each recorded directory lies between the account HOME and the credential."""
+
+    items = row.get("created_directories")
+    adapter = _credential_adapter_for(str(row.get("principal")), str(row.get("provider")))
+    account_name = _PRINCIPAL_ACCOUNTS.get(str(row.get("principal")))
+    accounts = plan.get("accounts", [])
+    home = next(
+        (
+            account.get("home")
+            for account in (accounts if isinstance(accounts, list) else [])
+            if isinstance(account, Mapping) and account.get("name") == account_name
+        ),
+        None,
+    )
+    if (
+        adapter is None
+        or not isinstance(home, str)
+        or type(items) is not list
+        or not items
+    ):
+        return False
+    destination = Path(home).joinpath(*adapter.destination_parts)
+    for item in items:
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"path", "dev", "ino"}
+            or not isinstance(item.get("path"), str)
+            or type(item.get("dev")) is not int
+            or type(item.get("ino")) is not int
+        ):
+            return False
+        candidate = Path(str(item["path"]))
+        if candidate not in destination.parents or Path(home) not in candidate.parents:
+            return False
+    return True
+
+
+def _valid_legacy_creation(value: object) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value) == {"device", "inode", "tree_sha256"}
+        and type(value.get("device")) is int
+        and int(value["device"]) >= 0  # type: ignore[arg-type]
+        and type(value.get("inode")) is int
+        and int(value["inode"]) > 0  # type: ignore[arg-type]
+        and _valid_sha256(value.get("tree_sha256"))
+    )
+
+
 def _validate_receipt_legacy_provenance(
     payload: Mapping[str, object],
     plan: Mapping[str, object],
@@ -3209,6 +3269,16 @@ def _validate_receipt_legacy_provenance(
         )
     for entry in entries:
         step = planned_steps.get(str(entry.get("step_id")))
+        prior = entry.get("prior")
+        if "legacy_creation" in entry and (
+            record is None
+            or not isinstance(step, Mapping)
+            or step.get("kind") != "repository"
+            or not isinstance(prior, Mapping)
+            or prior.get("exists") is not False
+            or not _valid_legacy_creation(entry.get("legacy_creation"))
+        ):
+            raise InstallError(f"receipt journal legacy creation identity is invalid: {path}")
         if "adoption" in entry and (
             record is None or not _legacy_adoption_matches(entry, plan)
         ):
@@ -5646,6 +5716,88 @@ def _apply_legacy_quarantine(
     receipt._persist()
 
 
+def _record_legacy_creation(
+    *,
+    entry: dict[str, object],
+    step: Mapping[str, object],
+    backend: InstallBackend,
+    legacy: "LegacyApplyContext | None",
+) -> None:
+    """Bind a clone a legacy adoption created to its inode and tree digest.
+
+    The source repository's legacy checkout was quarantined from this very
+    path; rollback must remove exactly this clone before moving it back.
+    Without a backend that can describe the tree nothing is recorded, and
+    rollback then keeps the clone (fail closed).
+    """
+
+    prior = entry.get("prior")
+    if (
+        legacy is None
+        or step.get("kind") != "repository"
+        or not isinstance(prior, Mapping)
+        or prior.get("exists") is not False
+        or "legacy_creation" in entry
+    ):
+        return
+    describe = getattr(backend, "created_tree_identity", None)
+    if callable(describe):
+        entry["legacy_creation"] = dict(describe(step))
+
+
+def _discard_legacy_creation(
+    backend: InstallBackend, *, path: object, identity: object
+) -> str | None:
+    """Remove a tree a legacy receipt created; return why it is kept, if it is."""
+
+    discard = getattr(backend, "discard_created_tree", None)
+    if not callable(discard):
+        return "backend cannot discard a tree this receipt created; it is kept"
+    if not isinstance(path, str) or not _valid_legacy_creation(identity):
+        return "no creation identity binds the tree this receipt created; it is kept"
+    try:
+        discard(path, dict(identity))  # type: ignore[arg-type]
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+def _discard_legacy_venv_slot(
+    backend: InstallBackend,
+    *,
+    entry: Mapping[str, object],
+    step: Mapping[str, object],
+    installed: Mapping[str, object],
+) -> str | None:
+    """Remove the venv slot a legacy receipt created (it did not exist before)."""
+
+    inspection_prior = entry.get("inspection_prior")
+    if (
+        not isinstance(inspection_prior, Mapping)
+        or inspection_prior.get("exists") is not False
+        or installed.get("exists") is not True
+    ):
+        return None
+    authority = entry.get("venv_slot_authority")
+    if (
+        not isinstance(authority, Mapping)
+        or authority.get("state") != "ready"
+        or not _valid_venv_slot_authority(authority, step=step)
+    ):
+        return "venv slot has no inode-bound creation authority; it is kept"
+    if installed.get("tree_sha256") != authority.get("tree_sha256"):
+        return "venv slot changed since this receipt created it; it is kept"
+    return _discard_legacy_creation(
+        backend,
+        path=step.get("path"),
+        identity={
+            "device": authority.get("device"),
+            "inode": authority.get("inode"),
+            "tree_sha256": authority.get("tree_sha256"),
+        },
+    )
+
+
 def _legacy_apply_authority(
     *,
     plan: Mapping[str, object],
@@ -5811,6 +5963,9 @@ def apply_plan(
                         )
                     entry["status"] = "completed"
                     entry.update(installed)
+                    _record_legacy_creation(
+                        entry=entry, step=step, backend=backend, legacy=legacy
+                    )
                     receipt._persist()
                 continue
             if entry.get("status") != "prepared":
@@ -6275,6 +6430,7 @@ def apply_plan(
             raise
         entry.update({key: value for key, value in outcome.items() if key != "prior"})
         entry["status"] = "completed"
+        _record_legacy_creation(entry=entry, step=step, backend=backend, legacy=legacy)
         receipt._persist()
     _bind_candidate_venv(plan=plan, receipt=receipt, backend=backend)
     identity_reader = getattr(backend, "service_identities", None)
@@ -6677,6 +6833,17 @@ def rollback_receipt(
                             }
                         )
                         continue
+                if legacy_record is not None:
+                    # A legacy host had no slot here: the reviewed inventory
+                    # covers it, so the slot this receipt created must go.
+                    problem = _discard_legacy_venv_slot(
+                        backend, entry=entry, step=step, installed=installed
+                    )
+                    if problem is not None:
+                        retained_drift.append(
+                            {"step_id": entry.get("step_id"), "observed": {"error": problem}}
+                        )
+                        continue
                 forget_install_entry(entry)
                 continue
             if not _state_matches(step, installed):
@@ -6705,6 +6872,15 @@ def rollback_receipt(
                     }
                 )
                 continue
+            if legacy_record is not None:
+                problem = _discard_legacy_venv_slot(
+                    backend, entry=entry, step=step, installed=installed
+                )
+                if problem is not None:
+                    retained_drift.append(
+                        {"step_id": entry.get("step_id"), "observed": {"error": problem}}
+                    )
+                    continue
             forget_install_entry(entry)
             continue
         if isinstance(prior, Mapping) and dict(installed) == dict(prior):
@@ -6789,6 +6965,24 @@ def rollback_receipt(
             retained_drift.append(
                 {"step_id": entry.get("step_id"), "observed": dict(installed)}
             )
+            continue
+        if (
+            legacy_record is not None
+            and step.get("kind") == "repository"
+            and isinstance(prior, Mapping)
+            and prior.get("exists") is False
+        ):
+            # Fresh checkouts are normally retained; under a legacy adoption
+            # this clone stands where the legacy checkout must move back.
+            problem = _discard_legacy_creation(
+                backend, path=step.get("path"), identity=entry.get("legacy_creation")
+            )
+            if problem is not None:
+                retained_drift.append(
+                    {"step_id": entry.get("step_id"), "observed": {"error": problem}}
+                )
+                continue
+            forget_install_entry(entry)
             continue
         require_systemd_reload(step)
         backend.rollback_step(entry)
@@ -7011,6 +7205,7 @@ def _open_credential_parent(
     account_owned_dirs: int,
     uid: int | None,
     gid: int | None,
+    created: list[dict[str, object]] | None = None,
 ) -> tuple[int, str]:
     """開啟 credential 葉檔的父目錄。
 
@@ -7025,11 +7220,12 @@ def _open_credential_parent(
     parent_parts = destination.parent.parts
     if not destination.name or len(parent_parts) <= account_owned_dirs:
         raise UnsafeInstallPathError(f"unsafe authority leaf path: {destination}")
-    descriptor = _open_directory_chain(
-        Path(*parent_parts[:-account_owned_dirs]), create=True, create_mode=0o700
-    )
+    current = Path(*parent_parts[:-account_owned_dirs])
+    descriptor = _open_directory_chain(current, create=True, create_mode=0o700)
+    created_records = created
     try:
         for component in parent_parts[-account_owned_dirs:]:
+            current = current / component
             created = False
             try:
                 next_descriptor = os.open(
@@ -7050,6 +7246,11 @@ def _open_credential_parent(
                 if uid is not None and gid is not None:
                     os.fchown(descriptor, uid, gid)
                 os.fchmod(descriptor, 0o700)
+                if created_records is not None:
+                    observed = os.fstat(descriptor)
+                    created_records.append(
+                        {"path": str(current), "dev": observed.st_dev, "ino": observed.st_ino}
+                    )
             if uid is not None and os.fstat(descriptor).st_uid != uid:
                 raise UnsafeInstallPathError(
                     f"credential state directory is not owned by its account: {destination}"
@@ -7439,7 +7640,10 @@ def import_credential(
                 and row.get("provider") == provider
             )
         ]
-        credentials.append(metadata_row)
+        completed_row = dict(metadata_row)
+        if prepared.get("created_directories"):
+            completed_row["created_directories"] = deepcopy(prepared["created_directories"])
+        credentials.append(completed_row)
         credential_journal.remove(prepared)
         try:
             receipt._persist()
@@ -7454,12 +7658,21 @@ def import_credential(
             credential_journal[:] = prior_journal
             raise
 
+    # A legacy adoption receipt records the credential state directories this
+    # import creates: they may stand where a quarantined legacy directory has
+    # to move back on rollback.  Other receipts keep their v2 rows unchanged.
+    created_directories: list[dict[str, object]] | None = (
+        []
+        if _receipt_schema_version(receipt._document) == _LEGACY_RECEIPT_SCHEMA_VERSION
+        else None
+    )
     try:
         parent_fd, destination_name = _open_credential_parent(
             destination,
             account_owned_dirs=adapter.account_owned_dirs,
             uid=destination_uid,
             gid=destination_gid,
+            created=created_directories,
         )
     except (OSError, UnsafeInstallPathError) as exc:
         raise CredentialImportError("credential destination preparation failed") from exc
@@ -7522,6 +7735,11 @@ def import_credential(
         if pending is None:
             pending = {**metadata_row, "status": "prepared"}
             credential_journal.append(pending)
+        if created_directories:
+            assert isinstance(pending, MutableMapping)
+            recorded = list(pending.get("created_directories", []))  # type: ignore[arg-type]
+            recorded.extend(row for row in created_directories if row not in recorded)
+            pending["created_directories"] = recorded
         try:
             receipt._persist()
         except OSError as exc:
