@@ -29,6 +29,7 @@ from .core import (
     InstallError,
     InstallPlanError,
     InstallReceipt,
+    QuarantineSubstitutionError,
     UnsafeInstallPathError,
     _DIRECTORY_OPEN_FLAGS,
     _account_digest,
@@ -1972,13 +1973,14 @@ def _bounded_sha256_at(
         os.close(descriptor)
 
 
-def _quarantine_source_record(
+def _quarantine_object_record(
     parent_fd: int, name: str, expected: Mapping[str, object]
 ) -> dict[str, object] | None:
-    """The source's identity plus exactly the content binding the step carries.
+    """An object's identity plus exactly the content binding the step carries.
 
-    Only a file whose inventory row recorded a digest is read; credential
-    class objects carry none and are never opened.
+    Read with a no-follow ``fstatat`` (and ``openat``/``readlinkat``) on the
+    given directory descriptor.  Only a file whose inventory row recorded a
+    digest is read; credential class objects carry none and are never opened.
     """
 
     observed = _stat_at(parent_fd, name)
@@ -1994,11 +1996,106 @@ def _quarantine_source_record(
     return record
 
 
+def _mismatched(record: Mapping[str, object] | None, expected: Mapping[str, object]) -> list[str]:
+    if record is None:
+        return ["missing"]
+    return sorted(key for key in expected if record.get(key) != expected[key])
+
+
+_PATH_DIRECTORY_FLAGS = (
+    getattr(os, "O_PATH", os.O_RDONLY)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _open_path_chain(path: Path) -> int:
+    """Open an absolute directory as an ``O_PATH|O_NOFOLLOW`` descriptor.
+
+    Every component is resolved relative to its already open parent without
+    following a symlink, so every later ``fstatat``/``renameat2`` on the
+    returned descriptor names an entry of exactly this directory inode.
+    """
+
+    if not path.is_absolute() or ".." in path.parts:
+        raise UnsafeInstallPathError(f"unsafe directory path: {path}")
+    descriptor = os.open("/", _PATH_DIRECTORY_FLAGS)
+    try:
+        for component in path.parts[1:]:
+            try:
+                next_descriptor = os.open(component, _PATH_DIRECTORY_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                raise
+            except OSError as exc:
+                raise UnsafeInstallPathError(
+                    f"directory path contains an unsafe component: {path}"
+                ) from exc
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise UnsafeInstallPathError(f"directory path component is not a directory: {path}")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _open_existing_directory(path: Path) -> int | None:
     try:
-        return _open_directory_chain(path)
+        return _open_path_chain(path)
     except FileNotFoundError:
         return None
+
+
+def _fsync_directory_at(path_fd: int) -> None:
+    """fsync the directory an ``O_PATH`` descriptor names (O_PATH cannot fsync)."""
+
+    descriptor = os.open(
+        ".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=path_fd,
+    )
+    try:
+        held = os.fstat(path_fd)
+        opened = os.fstat(descriptor)
+        if (held.st_dev, held.st_ino) != (opened.st_dev, opened.st_ino):
+            raise InstallDriftError("directory changed while it was synced")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _authority_parent(
+    authority: object, step: Mapping[str, object]
+) -> tuple[int, int]:
+    """The source parent a prepared quarantine entry bound, after shape checks."""
+
+    expected = step.get("expected")
+    parent = authority.get("source_parent") if isinstance(authority, Mapping) else None
+    if (
+        not isinstance(authority, Mapping)
+        or set(authority) != {"source", "source_parent", "destination"}
+        or not isinstance(expected, Mapping)
+        or authority.get("source") != {"dev": expected.get("dev"), "ino": expected.get("ino")}
+        or authority.get("destination") != step.get("destination")
+        or not isinstance(parent, Mapping)
+        or set(parent) != {"dev", "ino"}
+        or type(parent.get("dev")) is not int
+        or type(parent.get("ino")) is not int
+    ):
+        raise InstallPlanError(
+            f"legacy quarantine entry lacks its prepared authority: {step.get('step_id')}"
+        )
+    return int(parent["dev"]), int(parent["ino"])  # type: ignore[arg-type]
+
+
+def _require_parent(descriptor: int, identity: tuple[int, int], path: Path) -> None:
+    observed = os.fstat(descriptor)
+    if (observed.st_dev, observed.st_ino) != identity:
+        raise InstallDriftError(
+            f"the parent directory of {path} is not the one the prepared quarantine "
+            "entry recorded; nothing was moved"
+        )
 
 
 def _open_quarantine_chain(directory: Path, root: Path, *, create: bool) -> int | None:
@@ -2104,24 +2201,28 @@ def _legacy_quarantine_state(step: Mapping[str, object]) -> dict[str, object]:
     expected = step["expected"]
     assert isinstance(expected, Mapping)
     source_record: dict[str, object] | None = None
+    source_parent: dict[str, int] | None = None
     parent_fd = _open_existing_directory(source.parent)
     if parent_fd is not None:
         try:
-            source_record = _quarantine_source_record(parent_fd, source.name, expected)
+            parent = os.fstat(parent_fd)
+            source_parent = {"dev": parent.st_dev, "ino": parent.st_ino}
+            source_record = _quarantine_object_record(parent_fd, source.name, expected)
         finally:
             os.close(parent_fd)
     destination_record: dict[str, object] | None = None
     destination_fd = _open_existing_directory(destination.parent)
     if destination_fd is not None:
         try:
-            observed = _stat_at(destination_fd, destination.name)
-            if observed is not None:
-                destination_record = _quarantine_record(observed)
+            destination_record = _quarantine_object_record(
+                destination_fd, destination.name, expected
+            )
         finally:
             os.close(destination_fd)
     return {
         "exists": source_record is not None,
         "source": source_record,
+        "source_parent": source_parent,
         "destination": destination_record,
         "destination_device": _nearest_existing_device(destination.parent),
         "destination_chain": _quarantine_chain_problem(destination.parent, root),
@@ -2142,28 +2243,82 @@ def _rename_failure(exc: OSError, source: Path, destination: Path) -> InstallErr
     return InstallDriftError(f"legacy quarantine could not move {source} to {destination}: {exc}")
 
 
-def _legacy_quarantine_move(step: Mapping[str, object]) -> dict[str, object]:
-    """Move one inventoried legacy object into its private quarantine slot.
+def _undo_substituted_move(
+    *,
+    source_fd: int,
+    source: Path,
+    destination_fd: int,
+    destination: Path,
+    moved: dict[str, object] | None,
+    changed: Sequence[str],
+) -> InstallError:
+    """Move a substitute that raced into quarantine straight back, and say so.
 
-    The source must still be the inventoried object (type, owner, mode, inode
-    and, where the inventory recorded one, content digest or link target); the
-    destination chain is root-only; the destination must be on the source's
-    filesystem and must not exist.  The move itself is a single
-    ``renameat2(RENAME_NOREPLACE)`` followed by an fsync of both parents.
+    Returns the error to raise: plain drift when the object is back at its
+    original name, :class:`QuarantineSubstitutionError` (naming what now sits
+    in quarantine) when even the move back is refused.
     """
 
+    fields = ", ".join(changed)
+    try:
+        _renameat2_noreplace(destination_fd, destination.name, source_fd, source.name)
+    except OSError as exc:
+        for sync in (lambda: os.fsync(destination_fd), lambda: _fsync_directory_at(source_fd)):
+            try:
+                sync()
+            except OSError:
+                pass
+        return QuarantineSubstitutionError(
+            f"legacy quarantine moved an object that is not the inventoried one "
+            f"({fields}) from {source} into {destination} and could not move it back "
+            f"({exc.strerror or exc}); it stays there as an unexpected object and is "
+            "never restored as legacy",
+            unexpected=moved,
+        )
+    os.fsync(destination_fd)
+    _fsync_directory_at(source_fd)
+    return InstallDriftError(
+        f"legacy quarantine found another object at {source} when it renamed it "
+        f"({fields}); the object was moved back and nothing was quarantined"
+    )
+
+
+def _legacy_quarantine_move(entry: Mapping[str, object]) -> dict[str, object]:
+    """Move one inventoried legacy object into its private quarantine slot.
+
+    Only a prepared journal entry authorizes a move: it binds the source inode
+    and the source's parent directory inode.  The parent is opened
+    ``O_PATH|O_NOFOLLOW`` component by component and must be that directory;
+    every check (type, owner, mode, inode and, where the inventory recorded
+    one, content digest or link target) and the ``renameat2(RENAME_NOREPLACE)``
+    run on that one descriptor.  The destination chain is root-only, on the
+    source's filesystem, and the destination must not exist.
+
+    A writer of the source's parent can still swap the name between the last
+    check and the rename.  The object that arrived is therefore verified at
+    once, by the same no-follow checks; anything else is renamed straight back
+    and the move fails as drift.  If the move back is refused too, the
+    substitute is reported (never completed) so the caller can record it.
+    """
+
+    step = entry.get("step")
+    if not isinstance(step, Mapping):
+        raise InstallPlanError("invalid legacy quarantine entry")
     source, destination, root = _quarantine_layout(step)
     expected = step["expected"]
     assert isinstance(expected, Mapping)
+    parent_identity = _authority_parent(entry.get("quarantine_authority"), step)
     try:
-        source_fd = _open_directory_chain(source.parent)
+        source_fd = _open_path_chain(source.parent)
     except FileNotFoundError as exc:
         raise InstallDriftError(f"legacy quarantine source is missing: {source}") from exc
     try:
-        current = _quarantine_source_record(source_fd, source.name, expected)
-        if current is None:
+        _require_parent(source_fd, parent_identity, source)
+        changed = _mismatched(
+            _quarantine_object_record(source_fd, source.name, expected), expected
+        )
+        if changed == ["missing"]:
             raise InstallDriftError(f"legacy quarantine source is missing: {source}")
-        changed = sorted(key for key in expected if current.get(key) != expected[key])
         if changed:
             raise InstallDriftError(
                 f"legacy quarantine source changed since the inventory: {source} "
@@ -2194,17 +2349,20 @@ def _legacy_quarantine_move(step: Mapping[str, object]) -> dict[str, object]:
                 ) from exc
             except OSError as exc:
                 raise _rename_failure(exc, source, destination) from exc
-            os.fsync(destination_fd)
-            os.fsync(source_fd)
-            moved = _stat_at(destination_fd, destination.name)
-            if moved is None or (moved.st_dev, moved.st_ino) != (
-                expected["dev"],
-                expected["ino"],
-            ):
-                raise InstallDriftError(
-                    f"legacy quarantine moved an object that is not the inventoried "
-                    f"inode: {destination}"
+            # Verify what actually arrived before anything else happens.
+            moved = _quarantine_object_record(destination_fd, destination.name, expected)
+            changed = _mismatched(moved, expected)
+            if changed:
+                raise _undo_substituted_move(
+                    source_fd=source_fd,
+                    source=source,
+                    destination_fd=destination_fd,
+                    destination=destination,
+                    moved=moved,
+                    changed=changed,
                 )
+            os.fsync(destination_fd)
+            _fsync_directory_at(source_fd)
         finally:
             os.close(destination_fd)
     finally:
@@ -2219,7 +2377,13 @@ def _legacy_quarantine_restore(entry: Mapping[str, object]) -> None:
     prior = entry.get("prior")
     if not isinstance(step, Mapping) or not isinstance(prior, Mapping):
         raise InstallError("invalid legacy quarantine rollback entry")
+    if entry.get("quarantine_unexpected") is not None:
+        raise InstallDriftError(
+            "legacy quarantine destination holds an unexpected object; it is never "
+            f"restored as legacy: {step.get('destination')}"
+        )
     source, destination, root = _quarantine_layout(step)
+    parent_identity = _authority_parent(entry.get("quarantine_authority"), step)
     destination_fd = _open_quarantine_chain(destination.parent, root, create=False)
     if destination_fd is None:
         raise InstallDriftError(f"quarantined object is missing: {destination}")
@@ -2234,13 +2398,19 @@ def _legacy_quarantine_restore(entry: Mapping[str, object]) -> None:
                 f"quarantined object does not match its prior inode: {destination}"
             )
         try:
-            source_fd = _open_directory_chain(source.parent)
+            source_fd = _open_path_chain(source.parent)
         except FileNotFoundError as exc:
             raise InstallDriftError(
                 f"the original parent of {source} is gone; the legacy object stays "
                 f"in quarantine at {destination}"
             ) from exc
         try:
+            observed_parent = os.fstat(source_fd)
+            if (observed_parent.st_dev, observed_parent.st_ino) != parent_identity:
+                raise InstallDriftError(
+                    f"the parent directory of {source} is not the one the quarantine "
+                    f"recorded; the legacy object stays in quarantine at {destination}"
+                )
             occupied = (
                 f"original path is occupied: {source}; the legacy object stays in "
                 f"quarantine at {destination}"
@@ -2255,7 +2425,7 @@ def _legacy_quarantine_restore(entry: Mapping[str, object]) -> None:
                 raise InstallDriftError(occupied) from exc
             except OSError as exc:
                 raise _rename_failure(exc, destination, source) from exc
-            os.fsync(source_fd)
+            _fsync_directory_at(source_fd)
             os.fsync(destination_fd)
             restored = _stat_at(source_fd, source.name)
             if restored is None or (restored.st_dev, restored.st_ino) != (
@@ -2269,6 +2439,14 @@ def _legacy_quarantine_restore(entry: Mapping[str, object]) -> None:
             os.close(source_fd)
     finally:
         os.close(destination_fd)
+
+
+def _refuse_unprepared_quarantine(step: Mapping[str, object]) -> None:
+    if step.get("kind") == "legacy-quarantine":
+        raise InstallPlanError(
+            "a legacy quarantine moves only through its prepared journal entry "
+            f"(quarantine_step): {step.get('step_id')}"
+        )
 
 
 class LocalInstallBackend:
@@ -2546,13 +2724,17 @@ class LocalInstallBackend:
         )
 
     def apply_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
-        if step.get("kind") == "legacy-quarantine":
-            return _legacy_quarantine_move(step)
+        _refuse_unprepared_quarantine(step)
         return self._apply_step(
             step,
             expected_prior=None,
             creation_checkpoint=None,
         )
+
+    def quarantine_step(self, entry: Mapping[str, object]) -> Mapping[str, object]:
+        """Move a legacy object under the authority of its prepared entry."""
+
+        return _legacy_quarantine_move(entry)
 
     def apply_step_checkpointed(
         self,
@@ -2560,8 +2742,7 @@ class LocalInstallBackend:
         expected_prior: Mapping[str, object],
         creation_checkpoint: Callable[[Mapping[str, object]], None],
     ) -> Mapping[str, object]:
-        if step.get("kind") == "legacy-quarantine":
-            return _legacy_quarantine_move(step)
+        _refuse_unprepared_quarantine(step)
         return self._apply_step(
             step,
             expected_prior=expected_prior,

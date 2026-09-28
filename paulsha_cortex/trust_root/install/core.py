@@ -55,6 +55,19 @@ class InstallDriftError(InstallError):
     pass
 
 
+class QuarantineSubstitutionError(InstallDriftError):
+    """A legacy quarantine moved another object and could not move it back.
+
+    ``unexpected`` describes what now sits at the quarantine destination; it
+    is recorded in the receipt so that no replay, rollback or recovery ever
+    treats it as the inventoried legacy object.
+    """
+
+    def __init__(self, message: str, *, unexpected: Mapping[str, object] | None) -> None:
+        super().__init__(message)
+        self.unexpected = dict(unexpected) if isinstance(unexpected, Mapping) else None
+
+
 class CredentialImportError(InstallError):
     pass
 
@@ -3065,6 +3078,9 @@ _QUARANTINE_PRIOR_KEYS = ("type", "uid", "gid", "mode", "dev", "ino")
 _QUARANTINE_ENTRY_KEYS = frozenset(
     {"step_id", "step", "status", "prior", "quarantine_authority"}
 )
+#: Set on a prepared quarantine entry whose move took another object into
+#: quarantine and could not move it back: that object is never legacy.
+_QUARANTINE_UNEXPECTED = "quarantine_unexpected"
 
 
 def _quarantine_step_expected(step: Mapping[str, object]) -> Mapping[str, object]:
@@ -3083,14 +3099,48 @@ def _quarantine_prior(step: Mapping[str, object]) -> dict[str, object]:
     return {"exists": True, **{key: expected.get(key) for key in _QUARANTINE_PRIOR_KEYS}}
 
 
-def _quarantine_authority(step: Mapping[str, object]) -> dict[str, object]:
-    """What a quarantine entry may move: this inode, to this destination only."""
+def _quarantine_authority(
+    step: Mapping[str, object], source_parent: Mapping[str, object]
+) -> dict[str, object]:
+    """What a quarantine entry may move: this inode, out of this directory
+    inode, to this destination only."""
 
     expected = _quarantine_step_expected(step)
     return {
         "source": {"dev": expected.get("dev"), "ino": expected.get("ino")},
+        "source_parent": {"dev": source_parent.get("dev"), "ino": source_parent.get("ino")},
         "destination": step.get("destination"),
     }
+
+
+def _valid_directory_identity(value: object) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value) == {"dev", "ino"}
+        and type(value.get("dev")) is int
+        and int(value["dev"]) >= 0  # type: ignore[arg-type]
+        and type(value.get("ino")) is int
+        and int(value["ino"]) > 0  # type: ignore[arg-type]
+    )
+
+
+def _quarantine_authority_matches(authority: object, step: Mapping[str, object]) -> bool:
+    return bool(
+        isinstance(authority, Mapping)
+        and _valid_directory_identity(authority.get("source_parent"))
+        and dict(authority)
+        == _quarantine_authority(step, authority["source_parent"])  # type: ignore[arg-type]
+    )
+
+
+def _valid_quarantine_unexpected(value: object) -> bool:
+    destination = value.get("destination") if isinstance(value, Mapping) else None
+    return bool(
+        isinstance(value, Mapping)
+        and set(value) == {"destination", "error"}
+        and isinstance(value.get("error"), str)
+        and (destination is None or isinstance(destination, Mapping))
+    )
 
 
 def _validate_receipt_legacy_provenance(
@@ -3137,14 +3187,22 @@ def _validate_receipt_legacy_provenance(
                 f"receipt journal legacy adoption provenance is invalid: {path}"
             )
         if isinstance(step, Mapping) and step.get("kind") == _QUARANTINE_STEP_KIND:
+            unexpected = entry.get(_QUARANTINE_UNEXPECTED)
             if (
                 record is None
-                or set(entry) != _QUARANTINE_ENTRY_KEYS
+                or set(entry) - {_QUARANTINE_UNEXPECTED} != _QUARANTINE_ENTRY_KEYS
                 or entry.get("prior") != _quarantine_prior(step)
-                or entry.get("quarantine_authority") != _quarantine_authority(step)
+                or not _quarantine_authority_matches(entry.get("quarantine_authority"), step)
+                or (
+                    _QUARANTINE_UNEXPECTED in entry
+                    and (
+                        entry.get("status") != "prepared"
+                        or not _valid_quarantine_unexpected(unexpected)
+                    )
+                )
             ):
                 raise InstallError(f"receipt legacy quarantine authority is invalid: {path}")
-        elif "quarantine_authority" in entry:
+        elif "quarantine_authority" in entry or _QUARANTINE_UNEXPECTED in entry:
             raise InstallError(f"receipt legacy quarantine authority is invalid: {path}")
 
 
@@ -5322,7 +5380,11 @@ def _pending_quarantine_paths(
 
 
 def _quarantine_moved(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
-    """The source is gone and the destination holds the inventoried inode."""
+    """The source is gone and the destination holds the inventoried inode.
+
+    Identity only: what rollback may move back.  Completing a move needs
+    :func:`_quarantine_moved_exact`.
+    """
 
     expected = _quarantine_step_expected(step)
     destination = state.get("destination")
@@ -5334,6 +5396,44 @@ def _quarantine_moved(step: Mapping[str, object], state: Mapping[str, object]) -
         and destination.get("dev") == expected.get("dev")
         and destination.get("ino") == expected.get("ino")
     )
+
+
+def _quarantine_moved_exact(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
+    """Moved, and the destination is exactly the inventoried object.
+
+    Type, owner, mode, inode and -- where the inventory recorded them -- the
+    content digest or link target all match.
+    """
+
+    expected = _quarantine_step_expected(step)
+    destination = state.get("destination")
+    return bool(
+        _quarantine_moved(step, state)
+        and isinstance(destination, Mapping)
+        and all(destination.get(key) == value for key, value in expected.items())
+    )
+
+
+def _quarantine_parent_problem(
+    step: Mapping[str, object],
+    state: Mapping[str, object],
+    *,
+    bound: Mapping[str, object] | None,
+) -> str | None:
+    """Whether the source's parent is the directory inode the move must use."""
+
+    parent = state.get("source_parent")
+    if not _valid_directory_identity(parent):
+        return f"legacy quarantine source parent is unavailable: {step.get('path')}"
+    if bound is not None and dict(parent) != {  # type: ignore[arg-type]
+        "dev": bound.get("dev"),
+        "ino": bound.get("ino"),
+    }:
+        return (
+            f"the parent directory of {step.get('path')} is not the recorded one "
+            f"(recorded {dict(bound)}, observed {parent}); nothing was moved"
+        )
+    return None
 
 
 def _quarantine_in_place(prior: object, state: Mapping[str, object]) -> bool:
@@ -5380,11 +5480,20 @@ def _quarantine_source_problem(
     return None
 
 
+def _unexpected_object_error(step: Mapping[str, object]) -> InstallDriftError:
+    return InstallDriftError(
+        f"legacy quarantine destination {step.get('destination')} holds an unexpected "
+        f"object that is not the inventoried one ({step.get('step_id')}); it is never "
+        "completed, replayed or restored as legacy -- resolve it by hand"
+    )
+
+
 def _validate_quarantine_steps_before_apply(
     *,
     steps: Sequence[Mapping[str, object]],
     receipt: InstallReceipt,
     backend: InstallBackend,
+    legacy: "LegacyApplyContext | None" = None,
 ) -> None:
     """Prove every legacy quarantine can still move its exact source, or has."""
 
@@ -5398,18 +5507,30 @@ def _validate_quarantine_steps_before_apply(
         if step.get("kind") != _QUARANTINE_STEP_KIND:
             continue
         entry = entries.get(str(step.get("step_id")))
+        if isinstance(entry, Mapping) and entry.get(_QUARANTINE_UNEXPECTED) is not None:
+            raise _unexpected_object_error(step)
         state = dict(backend.inspect_step(step))
         status = entry.get("status") if isinstance(entry, Mapping) else None
         if status == "completed":
-            if not _quarantine_moved(step, state):
+            if not _quarantine_moved_exact(step, state):
                 raise InstallDriftError(
                     f"completed legacy quarantine drifted: {step.get('path')} is not "
-                    f"(only) the quarantined inode at {step.get('destination')}"
+                    f"(only) the quarantined object at {step.get('destination')}"
                 )
             continue
-        if status == "prepared" and _quarantine_moved(step, state):
+        if status == "prepared" and _quarantine_moved_exact(step, state):
             continue
         problem = _quarantine_source_problem(step, state)
+        if problem is None:
+            authority = entry.get("quarantine_authority") if isinstance(entry, Mapping) else None
+            bound = (
+                authority.get("source_parent")
+                if isinstance(authority, Mapping)
+                else legacy.parent_identity(step) if legacy is not None else None
+            )
+            problem = _quarantine_parent_problem(
+                step, state, bound=bound if isinstance(bound, Mapping) else None
+            )
         if problem is not None:
             raise InstallDriftError(problem)
 
@@ -5421,47 +5542,76 @@ def _apply_legacy_quarantine(
     journal: list[object],
     completed: dict[str, Mapping[str, object]],
     backend: InstallBackend,
+    legacy: "LegacyApplyContext | None" = None,
 ) -> None:
     """Prepared entry, then one ``renameat2(RENAME_NOREPLACE)``, then completed.
 
-    Replay: a prepared entry whose source is gone and whose destination is the
-    recorded inode completes without a second move; one whose source is still
-    the untouched inventoried object moves it; anything else is drift.
+    The prepared entry binds the source inode and the inode of its parent
+    directory; the backend moves only under that authority and verifies what
+    arrived.  Replay: a prepared entry whose destination is exactly the
+    inventoried object completes without a second move; one whose source is
+    still the untouched inventoried object in the recorded parent moves it;
+    anything else is drift.  An entry that recorded an unexpected object in
+    quarantine is never completed or replayed.
     """
 
     step_id = str(step.get("step_id"))
     entry = completed.get(step_id)
+    if isinstance(entry, Mapping) and entry.get(_QUARANTINE_UNEXPECTED) is not None:
+        raise _unexpected_object_error(step)
     state = dict(backend.inspect_step(step))
     if isinstance(entry, dict):
         if entry.get("status") == "completed":
-            if _quarantine_moved(step, state):
+            if _quarantine_moved_exact(step, state):
                 return
             raise InstallDriftError(f"completed legacy quarantine drifted: {step_id}")
-        if _quarantine_moved(step, state):
+        if _quarantine_moved_exact(step, state):
             entry["status"] = "completed"
             receipt._persist()
             return
-        problem = _quarantine_source_problem(step, state)
+        authority = entry.get("quarantine_authority")
+        problem = _quarantine_source_problem(step, state) or _quarantine_parent_problem(
+            step,
+            state,
+            bound=authority.get("source_parent") if isinstance(authority, Mapping) else None,
+        )
         if problem is not None:
             raise InstallDriftError(f"prepared legacy quarantine cannot be replayed: {problem}")
     else:
-        problem = _quarantine_source_problem(step, state)
+        problem = _quarantine_source_problem(step, state) or _quarantine_parent_problem(
+            step, state, bound=legacy.parent_identity(step) if legacy is not None else None
+        )
         if problem is not None:
             raise InstallDriftError(problem)
+        parent = state["source_parent"]
+        assert isinstance(parent, Mapping)
         entry = {
             "step_id": step_id,
             "step": deepcopy(dict(step)),
             "status": "prepared",
             "prior": _quarantine_prior(step),
-            "quarantine_authority": _quarantine_authority(step),
+            "quarantine_authority": _quarantine_authority(step, parent),
         }
         journal.append(entry)
         completed[step_id] = entry
         receipt._persist()
+    mover = getattr(backend, "quarantine_step", None)
+    if not callable(mover):
+        raise InstallError("backend cannot move a legacy object under quarantine authority")
     # The prepared entry is durable before the move and stays if the move
     # fails: rollback then proves by inode whether anything moved.
-    backend.apply_step(step)
-    if not _quarantine_moved(step, dict(backend.inspect_step(step))):
+    try:
+        mover(deepcopy(entry))
+    except QuarantineSubstitutionError as exc:
+        # Another object is now in quarantine and could not be moved back:
+        # record it so no replay, rollback or recovery takes it for legacy.
+        entry[_QUARANTINE_UNEXPECTED] = {
+            "destination": deepcopy(exc.unexpected),
+            "error": str(exc),
+        }
+        receipt._persist()
+        raise
+    if not _quarantine_moved_exact(step, dict(backend.inspect_step(step))):
         raise InstallDriftError(f"legacy quarantine did not reach its destination: {step_id}")
     entry["status"] = "completed"
     receipt._persist()
@@ -5568,7 +5718,9 @@ def apply_plan(
         steps=steps, receipt=receipt, backend=backend
     )
 
-    _validate_quarantine_steps_before_apply(steps=steps, receipt=receipt, backend=backend)
+    _validate_quarantine_steps_before_apply(
+        steps=steps, receipt=receipt, backend=backend, legacy=legacy
+    )
     _validate_managed_step_provenance_before_apply(
         plan=plan,
         steps=steps,
@@ -5596,6 +5748,7 @@ def apply_plan(
                 journal=journal,
                 completed=completed,
                 backend=backend,
+                legacy=legacy,
             )
             continue
         if step_id in completed:
@@ -6211,11 +6364,28 @@ def _rollback_legacy_quarantine(
     """Move one quarantined object back with ``RENAME_NOREPLACE``, or retain it.
 
     A reoccupied original path, or a destination that no longer holds the
-    recorded inode, is retained drift: the object stays where it is.
+    recorded inode, is retained drift: the object stays where it is.  An entry
+    that recorded an unexpected object in quarantine is never moved back and
+    never forgotten: it keeps the rollback blocked for the operator.
     """
 
     step_id = entry.get("step_id")
     prior = entry.get("prior")
+    unexpected = entry.get(_QUARANTINE_UNEXPECTED)
+    if unexpected is not None:
+        retained_drift.append(
+            {
+                "step_id": step_id,
+                "observed": {
+                    "error": (
+                        "quarantine destination holds an unexpected object that is not "
+                        "the inventoried legacy object; it is never moved back as legacy"
+                    ),
+                    _QUARANTINE_UNEXPECTED: deepcopy(unexpected),
+                },
+            }
+        )
+        return
     try:
         state = dict(backend.inspect_step(step))
     except Exception as exc:
@@ -6225,11 +6395,22 @@ def _rollback_legacy_quarantine(
         forget(entry)  # never moved, or already moved back
         return
     if not _quarantine_moved(step, state):
-        reason = (
-            "original path is occupied; the legacy object stays in quarantine"
-            if isinstance(state.get("source"), Mapping)
-            else "quarantine destination does not hold the recorded inode"
+        destination = state.get("destination")
+        in_quarantine = bool(
+            isinstance(destination, Mapping)
+            and isinstance(prior, Mapping)
+            and (destination.get("dev"), destination.get("ino"))
+            == (prior.get("dev"), prior.get("ino"))
         )
+        if isinstance(state.get("source"), Mapping) and in_quarantine:
+            reason = "original path is occupied; the legacy object stays in quarantine"
+        elif isinstance(state.get("source"), Mapping):
+            reason = (
+                "the original path holds another object and the inventoried object "
+                "is not in quarantine"
+            )
+        else:
+            reason = "quarantine destination does not hold the recorded inode"
         retained_drift.append({"step_id": step_id, "observed": {"error": reason, **state}})
         return
     require_reload(step)

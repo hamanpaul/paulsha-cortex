@@ -218,12 +218,7 @@ class MemoryInstallBackend:
             raise RuntimeError(f"injected failure before mutating {step_id}")
         prior = self.inspect_step(step)
         self.log.append(["apply", step_id])
-        if kind == "legacy-quarantine":
-            outcome = dict(install_backend._legacy_quarantine_move(step))
-            if self.fail_after_mutation == step_id:
-                self.fail_after_mutation = None
-                raise RuntimeError(f"injected post-mutation interruption at {step_id}")
-            return outcome
+        assert kind != "legacy-quarantine", "a quarantine moves only through its entry"
         if kind == "venv":
             if creation_checkpoint is not None:
                 creation_checkpoint({"path": step["path"], "tree_sha256": TREE_SHA256})
@@ -263,6 +258,18 @@ class MemoryInstallBackend:
 
     def apply_step(self, step) -> dict[str, object]:
         return self._apply(step)
+
+    def quarantine_step(self, entry) -> dict[str, object]:
+        step_id = entry["step_id"]
+        if self.fail_before_mutation == step_id:
+            self.fail_before_mutation = None
+            raise RuntimeError(f"injected failure before mutating {step_id}")
+        self.log.append(["apply", step_id])
+        outcome = dict(install_backend._legacy_quarantine_move(entry))
+        if self.fail_after_mutation == step_id:
+            self.fail_after_mutation = None
+            raise RuntimeError(f"injected post-mutation interruption at {step_id}")
+        return outcome
 
     def apply_step_checkpointed(self, step, expected_prior, creation_checkpoint):
         assert self.inspect_step(step) == expected_prior
@@ -895,8 +902,10 @@ def test_adoption_quarantines_adopts_and_records_legacy_provenance(tmp_path: Pat
         entry = entries[step["step_id"]]
         expected = step["expected"]
         assert entry["status"] == "completed"
+        parent = os.lstat(os.path.dirname(step["path"]))
         assert entry["quarantine_authority"] == {
             "source": {"dev": expected["dev"], "ino": expected["ino"]},
+            "source_parent": {"dev": parent.st_dev, "ino": parent.st_ino},
             "destination": step["destination"],
         }
         assert not os.path.lexists(step["path"])
@@ -942,16 +951,16 @@ def test_prepared_quarantine_that_never_moved_is_redone(tmp_path: Path) -> None:
     case = LegacyCase(tmp_path)
     stray = case.step(f"legacy-quarantine:{case.seeded['stray']}")
     receipt = new_install_receipt(case.plan)
-    original = case.backend.apply_step
+    original = case.backend.quarantine_step
     calls = {"count": 0}
 
-    def crash_before_the_move(step):
-        if step["step_id"] == stray["step_id"] and calls["count"] == 0:
+    def crash_before_the_move(entry):
+        if entry["step_id"] == stray["step_id"] and calls["count"] == 0:
             calls["count"] += 1
             raise SystemExit("killed after the prepared checkpoint, before the rename")
-        return original(step)
+        return original(entry)
 
-    case.backend.apply_step = crash_before_the_move  # type: ignore[method-assign]
+    case.backend.quarantine_step = crash_before_the_move  # type: ignore[method-assign]
     with pytest.raises(SystemExit):
         case.apply(receipt)
     entry = next(e for e in receipt.to_dict()["journal"] if e["step_id"] == stray["step_id"])
@@ -985,6 +994,126 @@ def test_replaced_quarantine_source_fails_before_the_first_mutation(tmp_path: Pa
     assert receipt.to_dict()["journal"] == []
     assert _mutations(case.backend) == []
     assert not case.quarantine_root.exists()
+
+
+def test_quarantine_parent_must_be_the_inventoried_directory(tmp_path: Path) -> None:
+    case = LegacyCase(tmp_path)
+    stray = case.step(f"legacy-quarantine:{case.seeded['stray']}")
+    context = case.context()
+    reviewed = context.parent_identity(stray)
+    assert reviewed == {
+        "dev": case.seeded["stray"].parent.lstat().st_dev,
+        "ino": case.seeded["stray"].parent.lstat().st_ino,
+    }
+    original = context.parent_identity
+
+    def swapped(step):
+        bound = original(step)
+        if step["step_id"] == stray["step_id"]:
+            return {"dev": bound["dev"], "ino": bound["ino"] + 1}
+        return bound
+
+    context.parent_identity = swapped  # type: ignore[method-assign]
+    receipt = new_install_receipt(case.plan)
+
+    with pytest.raises(InstallDriftError, match="parent directory"):
+        case.apply(receipt, legacy=context)
+
+    assert receipt.to_dict()["journal"] == []
+    assert _mutations(case.backend) == []
+    assert not case.quarantine_root.exists()
+
+
+def _race_the_stray(case: LegacyCase, monkeypatch, *, reoccupy: bool = False):
+    """Swap ``stray.txt`` after the quarantine's checks, before its rename."""
+
+    swap = _SwapBeforeRename(case.seeded["stray"], reoccupy=reoccupy)
+
+    def racing(source_fd: int, source: str, destination_fd: int, destination: str) -> None:
+        if source == "stray.txt":
+            return swap(source_fd, source, destination_fd, destination)
+        return swap.original(source_fd, source, destination_fd, destination)
+
+    monkeypatch.setattr(install_backend, "_renameat2_noreplace", racing)
+    return swap
+
+
+def test_substituted_quarantine_source_is_moved_back_and_never_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = LegacyCase(tmp_path)
+    stray = case.step(f"legacy-quarantine:{case.seeded['stray']}")
+    swap = _race_the_stray(case, monkeypatch)
+    receipt = new_install_receipt(case.plan)
+
+    with pytest.raises(InstallDriftError, match="moved back"):
+        case.apply(receipt)
+
+    entry = _entry(receipt.to_dict(), stray["step_id"])
+    assert entry["status"] == "prepared"
+    assert "quarantine_unexpected" not in entry
+    assert case.seeded["stray"].lstat().st_ino == swap.substitute_inode
+    assert not os.path.lexists(stray["destination"])
+    # Replay refuses the substitute instead of quarantining it.
+    with pytest.raises(InstallDriftError, match="stray.txt"):
+        case.apply(receipt)
+    assert _entry(receipt.to_dict(), stray["step_id"])["status"] == "prepared"
+
+    report = rollback_receipt(receipt, backend=case.backend, legacy_host=case.host)
+
+    assert any(row["step_id"] == stray["step_id"] for row in report.retained_drift)
+    assert report.legacy_restored is False
+    assert case.seeded["stray"].read_text() == "substitute\n"
+    assert install_cli._receipt_restore_safe(receipt.to_dict()) is False
+
+
+def test_stranded_substitute_is_recorded_and_never_restored_as_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = LegacyCase(tmp_path)
+    stray = case.step(f"legacy-quarantine:{case.seeded['stray']}")
+    receipt, path = _durable(monkeypatch, case)
+    swap = _race_the_stray(case, monkeypatch, reoccupy=True)
+
+    with pytest.raises(install_core.QuarantineSubstitutionError):
+        case.apply(receipt)
+
+    loaded = InstallReceipt.load(path, expected_plan=case.plan)
+    entry = _entry(loaded.to_dict(), stray["step_id"])
+    assert entry["status"] == "prepared"
+    assert entry["quarantine_unexpected"]["destination"]["ino"] == swap.substitute_inode
+    with pytest.raises(InstallDriftError, match="unexpected"):
+        case.apply(loaded)
+
+    report = rollback_receipt(loaded, backend=case.backend, legacy_host=case.host)
+
+    row = next(row for row in report.retained_drift if row["step_id"] == stray["step_id"])
+    assert "unexpected" in row["observed"]["error"]
+    assert Path(stray["destination"]).read_text() == "substitute\n"
+    assert case.seeded["stray"].read_text() == "second occupant\n"
+    assert report.legacy_restored is False
+    assert loaded.to_dict()["state"] == "rollback-blocked"
+    assert install_cli._receipt_restore_safe(loaded.to_dict()) is False
+    assert "quarantine_unexpected" in _rollback_entry(loaded.to_dict(), stray["step_id"])
+
+
+def _rollback_entry(document: dict, step_id: str) -> dict:
+    return next(entry for entry in document["journal"] if entry["step_id"] == step_id)
+
+
+def test_replay_refuses_a_destination_that_is_not_the_recorded_inode(tmp_path: Path) -> None:
+    case = LegacyCase(tmp_path)
+    stray = case.step(f"legacy-quarantine:{case.seeded['stray']}")
+    case.backend.fail_after_mutation = stray["step_id"]
+    receipt = new_install_receipt(case.plan)
+    with pytest.raises(RuntimeError, match="post-mutation"):
+        case.apply(receipt)
+    _replace_with(Path(stray["destination"]), "stray\n")
+
+    with pytest.raises(InstallDriftError, match="stray.txt"):
+        case.apply(receipt)
+
+    assert _entry(receipt.to_dict(), stray["step_id"])["status"] == "prepared"
 
 
 def test_adopt_in_place_replacement_replays_after_a_partial_mutation(tmp_path: Path) -> None:
@@ -1132,6 +1261,16 @@ def _quarantine_entry(document: dict) -> dict:
             "quarantine",
         ),
         (lambda d: _quarantine_entry(d).pop("quarantine_authority"), "quarantine"),
+        (
+            lambda d: _quarantine_entry(d)["quarantine_authority"].pop("source_parent"),
+            "quarantine",
+        ),
+        (
+            lambda d: _quarantine_entry(d).update(
+                quarantine_unexpected={"destination": None, "error": "forged"}
+            ),
+            "quarantine",
+        ),
     ],
     ids=[
         "forged-row",
@@ -1142,6 +1281,8 @@ def _quarantine_entry(document: dict) -> dict:
         "quarantine-root",
         "quarantine-destination",
         "quarantine-authority-missing",
+        "quarantine-parent-missing",
+        "unexpected-on-a-completed-entry",
     ],
 )
 def test_receipt_load_rejects_tampered_legacy_provenance(
@@ -1408,21 +1549,58 @@ def _source(tmp_path: Path) -> Path:
     return source
 
 
-def _entry_for(step: dict) -> dict:
+def _entry_for(step: dict, *, parent: tuple[int, int] | None = None) -> dict:
+    """The prepared journal entry core writes before the move."""
+
     expected = step["expected"]
+    if parent is None:
+        observed = Path(step["path"]).parent.lstat()
+        parent = (observed.st_dev, observed.st_ino)
     return {
         "step_id": step["step_id"],
         "step": step,
-        "status": "completed",
+        "status": "prepared",
         "prior": {
             "exists": True,
             **{key: expected[key] for key in ("type", "uid", "gid", "mode", "dev", "ino")},
         },
         "quarantine_authority": {
             "source": {"dev": expected["dev"], "ino": expected["ino"]},
+            "source_parent": {"dev": parent[0], "ino": parent[1]},
             "destination": step["destination"],
         },
     }
+
+
+class _SwapBeforeRename:
+    """Stand-in for a writer of the source's parent racing the quarantine.
+
+    The first rename (the move into quarantine) finds a substitute where the
+    checked source was: the swap happens after every pre-rename check.  The
+    ``reoccupy`` option also refills the original name before the move back.
+    """
+
+    def __init__(self, source: Path, *, reoccupy: bool = False) -> None:
+        self.source = source
+        self.reoccupy = reoccupy
+        self.calls: list[tuple[str, str]] = []
+        self.substitute_inode: int | None = None
+        self.original = install_backend._renameat2_noreplace
+
+    def __call__(self, source_fd: int, source: str, destination_fd: int, destination: str) -> None:
+        self.calls.append((source, destination))
+        if len(self.calls) == 1:
+            _replace_with(self.source, "substitute\n")
+            self.substitute_inode = self.source.lstat().st_ino
+        elif len(self.calls) == 2 and self.reoccupy:
+            self.source.write_text("second occupant\n")
+        self.original(source_fd, source, destination_fd, destination)
+
+
+def _replace_with(path: Path, content: str) -> None:
+    replacement = path.with_name(f".{path.name}.swap")
+    replacement.write_text(content)
+    os.replace(replacement, path)
 
 
 def test_quarantine_moves_and_restores_the_same_inode(tmp_path: Path) -> None:
@@ -1432,7 +1610,7 @@ def test_quarantine_moves_and_restores_the_same_inode(tmp_path: Path) -> None:
 
     state = install_backend._legacy_quarantine_state(step)
     assert state["exists"] is True and state["destination"] is None
-    install_backend._legacy_quarantine_move(step)
+    install_backend._legacy_quarantine_move(_entry_for(step))
 
     assert not source.exists()
     destination = Path(step["destination"])
@@ -1455,12 +1633,12 @@ def test_quarantine_refuses_an_existing_destination(tmp_path: Path) -> None:
     source = _source(tmp_path)
     step = _file_step(tmp_path, source)
     destination = Path(step["destination"])
-    install_backend._legacy_quarantine_move(step)
+    install_backend._legacy_quarantine_move(_entry_for(step))
     install_backend._legacy_quarantine_restore(_entry_for(step))
     destination.write_text("someone else\n")
 
     with pytest.raises(InstallDriftError, match="already exists"):
-        install_backend._legacy_quarantine_move(step)
+        install_backend._legacy_quarantine_move(_entry_for(step))
 
     assert source.read_text() == "legacy\n"
     assert source.lstat().st_ino == step["expected"]["ino"]
@@ -1477,7 +1655,7 @@ def test_quarantine_refuses_another_filesystem_without_copy_fallback(
     monkeypatch.setattr(install_backend, "_filesystem_device", lambda _fd: device + 1)
 
     with pytest.raises(InstallDriftError, match="filesystem"):
-        install_backend._legacy_quarantine_move(step)
+        install_backend._legacy_quarantine_move(_entry_for(step))
     assert source.read_text() == "legacy\n"
     assert not Path(step["destination"]).exists()
 
@@ -1489,7 +1667,7 @@ def test_quarantine_refuses_another_filesystem_without_copy_fallback(
 
     monkeypatch.setattr(install_backend, "_renameat2_noreplace", cross_device)
     with pytest.raises(InstallDriftError, match="filesystem"):
-        install_backend._legacy_quarantine_move(step)
+        install_backend._legacy_quarantine_move(_entry_for(step))
     assert source.read_text() == "legacy\n"
     assert not Path(step["destination"]).exists()
 
@@ -1500,7 +1678,7 @@ def test_quarantine_refuses_a_replaced_source(tmp_path: Path) -> None:
     _replace_with_same_bytes(source)
 
     with pytest.raises(InstallDriftError, match="changed"):
-        install_backend._legacy_quarantine_move(step)
+        install_backend._legacy_quarantine_move(_entry_for(step))
     assert source.read_text() == "legacy\n"
     assert not Path(step["destination"]).exists()
 
@@ -1513,7 +1691,7 @@ def test_quarantine_fails_closed_without_renameat2(
     monkeypatch.setattr(install_backend, "_RENAMEAT2_SYSCALL", {})
 
     with pytest.raises(InstallError, match="RENAME_NOREPLACE"):
-        install_backend._legacy_quarantine_move(step)
+        install_backend._legacy_quarantine_move(_entry_for(step))
     assert source.read_text() == "legacy\n"
     assert not Path(step["destination"]).exists()
 
@@ -1525,7 +1703,7 @@ def test_quarantine_fails_closed_without_renameat2(
     _relax_quarantine_owner(monkeypatch)
     monkeypatch.setattr(install_backend, "_renameat2_noreplace", unsupported)
     with pytest.raises(InstallError, match="RENAME_NOREPLACE"):
-        install_backend._legacy_quarantine_move(step)
+        install_backend._legacy_quarantine_move(_entry_for(step))
     assert source.read_text() == "legacy\n"
 
 
@@ -1539,13 +1717,13 @@ def test_quarantine_chain_must_be_private_and_symlink_free(
     root.mkdir()
     root.chmod(0o755)
     with pytest.raises(install_core.UnsafeInstallPathError, match="quarantine"):
-        install_backend._legacy_quarantine_move(step)
+        install_backend._legacy_quarantine_move(_entry_for(step))
     root.rmdir()
 
     (tmp_path / "elsewhere").mkdir(mode=0o700)
     root.symlink_to(tmp_path / "elsewhere")
     with pytest.raises(install_core.UnsafeInstallPathError):
-        install_backend._legacy_quarantine_move(step)
+        install_backend._legacy_quarantine_move(_entry_for(step))
     root.unlink()
     assert source.read_text() == "legacy\n"
     assert not any((tmp_path / "elsewhere").iterdir())
@@ -1555,14 +1733,112 @@ def test_quarantine_chain_must_be_private_and_symlink_free(
         for name in _QUARANTINE_VALIDATORS:
             monkeypatch.setattr(install_backend, name, _ORIGINAL_VALIDATORS[name])
         with pytest.raises(install_core.UnsafeInstallPathError):
-            install_backend._legacy_quarantine_move(step)
+            install_backend._legacy_quarantine_move(_entry_for(step))
         assert source.read_text() == "legacy\n"
+
+
+def test_quarantine_moves_a_source_substituted_before_the_rename_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    step = _file_step(tmp_path, source)
+    swap = _SwapBeforeRename(source)
+    monkeypatch.setattr(install_backend, "_renameat2_noreplace", swap)
+
+    with pytest.raises(InstallDriftError, match="moved back") as caught:
+        install_backend._legacy_quarantine_move(_entry_for(step))
+
+    assert not isinstance(caught.value, install_core.QuarantineSubstitutionError)
+    assert [call[0] for call in swap.calls] == ["cortex-old.conf", "cortex-old.conf"]
+    assert source.read_text() == "substitute\n"
+    assert source.lstat().st_ino == swap.substitute_inode
+    assert not os.path.lexists(step["destination"])
+
+
+def test_quarantine_reports_a_stranded_substitute_when_the_move_back_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    step = _file_step(tmp_path, source)
+    swap = _SwapBeforeRename(source, reoccupy=True)
+    monkeypatch.setattr(install_backend, "_renameat2_noreplace", swap)
+
+    with pytest.raises(install_core.QuarantineSubstitutionError) as caught:
+        install_backend._legacy_quarantine_move(_entry_for(step))
+
+    assert isinstance(caught.value, InstallDriftError)
+    assert caught.value.unexpected["ino"] == swap.substitute_inode
+    assert caught.value.unexpected["ino"] != step["expected"]["ino"]
+    assert Path(step["destination"]).read_text() == "substitute\n"
+    assert source.read_text() == "second occupant\n"
+
+
+def test_quarantine_refuses_a_swapped_source_parent(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    step = _file_step(tmp_path, source)
+    observed = source.parent.lstat()
+
+    with pytest.raises(InstallDriftError, match="parent"):
+        install_backend._legacy_quarantine_move(
+            _entry_for(step, parent=(observed.st_dev, observed.st_ino + 1))
+        )
+
+    assert source.read_text() == "legacy\n"
+    assert not os.path.lexists(step["destination"])
+
+
+def test_quarantine_never_resolves_the_source_parent_through_a_symlink(
+    tmp_path: Path,
+) -> None:
+    source = _source(tmp_path)
+    step = _file_step(tmp_path, source)
+    entry = _entry_for(step)
+    # The parent is swapped for a symlink to the very same directory: the
+    # recorded inode would match if the chain followed it.
+    source.parent.rename(tmp_path / "legacy" / "etc.real")
+    source.parent.symlink_to(tmp_path / "legacy" / "etc.real")
+
+    with pytest.raises(install_core.UnsafeInstallPathError):
+        install_backend._legacy_quarantine_move(entry)
+
+    assert (tmp_path / "legacy" / "etc.real" / "cortex-old.conf").read_text() == "legacy\n"
+    assert not os.path.lexists(step["destination"])
+
+
+def test_restore_refuses_a_swapped_original_parent(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    step = _file_step(tmp_path, source)
+    entry = _entry_for(step)
+    install_backend._legacy_quarantine_move(entry)
+    source.parent.rename(tmp_path / "legacy" / "etc.moved")
+    source.parent.mkdir()
+
+    with pytest.raises(InstallDriftError, match="parent"):
+        install_backend._legacy_quarantine_restore(entry)
+
+    assert not source.exists()
+    assert Path(step["destination"]).lstat().st_ino == step["expected"]["ino"]
+
+
+def test_a_quarantine_moves_only_through_its_prepared_entry(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    step = _file_step(tmp_path, source)
+    backend = install_backend.LocalInstallBackend(require_root=False)
+
+    with pytest.raises(InstallPlanError, match="prepared"):
+        backend.apply_step(step)
+    with pytest.raises(InstallPlanError, match="prepared"):
+        backend.apply_step_checkpointed(step, {}, lambda _authority: None)
+    assert source.read_text() == "legacy\n"
+
+    backend.quarantine_step(_entry_for(step))
+    assert Path(step["destination"]).lstat().st_ino == step["expected"]["ino"]
 
 
 def test_restore_refuses_an_occupied_original_path(tmp_path: Path) -> None:
     source = _source(tmp_path)
     step = _file_step(tmp_path, source)
-    install_backend._legacy_quarantine_move(step)
+    install_backend._legacy_quarantine_move(_entry_for(step))
     source.write_text("new occupant\n")
 
     with pytest.raises(InstallDriftError, match="occupied"):

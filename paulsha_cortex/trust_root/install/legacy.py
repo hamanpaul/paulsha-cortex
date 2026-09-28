@@ -4014,6 +4014,28 @@ class LegacyApplyContext:
 
     # -- what apply asks -------------------------------------------------
 
+    def parent_identity(self, step: Mapping[str, object]) -> dict[str, int] | None:
+        """The reviewed inode of a quarantine source's parent directory, if recorded.
+
+        Parents that are managed directories (or other inventoried rows) carry
+        their ``dev``/``ino`` in the reviewed inventory; the quarantine must
+        move out of exactly that directory.  Unmanaged parents (the systemd or
+        polkit root) have no row: the prepared entry then binds the parent it
+        observed under the apply gate.
+        """
+
+        parent = posixpath.dirname(str(step.get("path")))
+        for section in ("managed_paths", "discovered"):
+            for row in self.inventory.document[section]:  # type: ignore[union-attr]
+                lstat_value = row.get("lstat")
+                if (
+                    row.get("path") == parent
+                    and isinstance(lstat_value, Mapping)
+                    and lstat_value.get("type") == "directory"
+                ):
+                    return {"dev": int(lstat_value["dev"]), "ino": int(lstat_value["ino"])}
+        return None
+
     def adopted_account_rows(self) -> dict[str, dict[str, object]]:
         """Inventory rows of the adopted accounts, by account name."""
 
