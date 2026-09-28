@@ -116,6 +116,8 @@ PROVIDER_PREFLIGHTS = {
     ),
     # Copilot's pinned headless SDK server exposes structured auth/quota RPCs;
     # do not infer either from the interactive /user or /usage commands.
+    # `--no-auto-login` is deliberately absent: on 1.0.88 it stops the server
+    # from loading the stored login, so `account.getCurrentAuth` is empty.
     "copilot": ProviderPreflightAdapter(
         version=None,
         version_command=("/opt/cortex/toolchain/bin/copilot", "--version"),
@@ -124,7 +126,6 @@ PROVIDER_PREFLIGHTS = {
             "--headless",
             "--no-auto-update",
             "--stdio",
-            "--no-auto-login",
         ),
         status_kind="copilot-app-server",
     ),
@@ -1900,6 +1901,8 @@ def _codex_preflight_from_responses(
             "provider codex app-server returned no rate-limit buckets"
         )
 
+    # `credits` 是加購點數；方案內額度可用時 provider 不需要它（#716）。
+    ordinary_usage_allowed = rate_result.get("ordinaryUsageAllowed") is True
     observed_window = False
     for snapshot in snapshots:
         if snapshot.get("rateLimitReachedType") is not None:
@@ -1911,7 +1914,7 @@ def _codex_preflight_from_responses(
                 "provider codex app-server reports spend control reached"
             )
         credits = snapshot.get("credits")
-        if isinstance(credits, Mapping):
+        if isinstance(credits, Mapping) and not ordinary_usage_allowed:
             if credits.get("hasCredits") is not True and credits.get("unlimited") is not True:
                 raise QualificationFailure(
                     "provider codex app-server reports no remaining credits"
@@ -2143,12 +2146,16 @@ def _copilot_preflight_from_responses(
                 "provider copilot app-server returned an invalid remaining percentage"
             )
         observed = True
-        if float(remaining) <= 0:
+        has_quota = snapshot.get("hasQuota")
+        if has_quota is False:
             raise QualificationFailure(
                 "provider copilot app-server reports no remaining quota"
             )
-        has_quota = snapshot.get("hasQuota")
-        if has_quota is False:
+        if float(remaining) <= 0 and not (
+            snapshot.get("usageAllowedWithExhaustedQuota") is True
+            or snapshot.get("overageAllowedWithExhaustedQuota") is True
+        ):
+            # 額度用盡但帳號允許超額繼續使用時，provider 仍可服務（#716）。
             raise QualificationFailure(
                 "provider copilot app-server reports no remaining quota"
             )
