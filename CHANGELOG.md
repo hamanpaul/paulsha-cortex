@@ -9,7 +9,19 @@
 
 ### Added
 
+- **#716 deployment canary agy smoke**：agy 1.2.x 的 JSON 輸出不帶 model／effort，改以持久化對話的模型變體 id 證明實際模型與 effort，修正 canary 在 provider smoke 必然失敗（#716）。
+- **installer receipt 界限**：目錄快照改記子孫 digest＋count、完整清單存 root-only 旁檔；getfacl 加 `-E`；rollback 還原 unit 後執行 `systemctl daemon-reload`；preflight 事前拒絕過大既有檔與 symlink（#1123）。
+- **installer receipt 界限**：目錄快照改記子孫 digest＋count、完整清單存 root-only 旁檔（receipt `schema_version` 升為 2，舊版明確拒收；受管目錄內的舊 receipt 維持內嵌不建旁檔）；getfacl 加 `-E`；rollback 還原 unit 後執行 `systemctl daemon-reload`；preflight 事前拒絕過大既有檔與 symlink（#1123）。
+- **trust-root legacy adoption 規格**：新增 OpenSpec change `trust-root-legacy-adoption`，定義無 receipt 舊主機的 inventory、host overlay、disposition、quarantine 搬移、rollback 證明與 RC profile；僅規格（#1122）。
+- **review malformed 預檢**：接受不帶選填 `authority_hashes` 的合法 review envelope（#1118）。
+- **#1097 qualification clock watermark 補上其他 durable 系統時間證據**：`_clock_evidence_floor()` 讀取
+  `jobs-registry`（`jobs.json`）與 `quota-admission-decisions` 兩個 Trust Root 登記、Manager-only 的
+  durable 落盤來源最新 mtime，取其上界墊高 `now`（只會墊高、不會壓低），讓「第一次 qualification 查詢就
+  發生在時鐘回撥之後」的場景改為 `clock-evidence-expired` fail-closed；完全沒有可用證據時行為不變，並在
+  查詢結果多帶可機讀的 `clock_evidence` 診斷（`clock-evidence-checked` / `clock-evidence-unavailable`）。
+  見 `changelog.d/1097-qualification-clock-watermark.md`。
 - **v0.1.11 發版**：`VERSION` 升為 0.1.11，收錄 refine 完整交付與 live 驗收修正（見 `changelog.d/release-0-1-11.md`）。
+- **#1116 quota binding 支援 executor＋model_id 穩定 identity subject**：`quota_observation.parse_binding()` 新增第三種 `subject.kind == "identity"`（`{"kind": "identity", "executor": ..., "model_id": ...}`），解決同一個 builder 身分在不同卡片解析出不同 resolved profile key、逐卡綁定無聲失效的問題；`pools_for_profile()`／`assess_candidate_quota()` 優先序為 resolved key 精確綁定＞identity 穩定綁定，命中精確綁定時不與 identity 結果合併，避免重複計算 pool；既有以 resolved key 綁定的設定完全相容。新增 `CandidateAssessment.binding_kind`／`AdmissionDecision.selected_binding_kind`（比照 #840 選填欄位加法模式）與 `decision_projection` 的 `classification.binding`（`bound-exact`／`bound-identity`／`binding-missing`／`unknown`），以及唯讀 `cortex quota bindings --report` 彙總目前派工用到、但沒有任何 binding 涵蓋的 resolved profile key。`quota_shadow.record_terminal_usage()` 同步支援 identity binding；collector_targets 精確比對刻意不新增 identity 路徑（見 `quota_collectors._find_binding()` 文件字串）。詳見 `changelog.d/1116-quota-binding-identity-subject.md`。
 - **work-items 衝突解除（續）**：`wave4-large-bug-integration` 明確歸屬 #475，消除 PR #1090 的 fallback 群組殘留衝突。
 - **#839／#836 共用設定檔**：admission 接受 collector 的選填 `collector_targets`，同一份 `quota-pools.json` 可同時供兩者使用。
 - **#841／#857 env 檔引號**：attestation 的 EnvironmentFile parser 接受引號值內的另一種引號（JSON argv），不再讓照文件設定的 task memory 命令使 loaded runtime 比對失效。
@@ -41,6 +53,8 @@
 
 - **#1099 quota window snapshot refinement**：同值、同時間的 snapshot 補上先前缺失的 window epoch 時，file ledger 與 memory ledger 會追加 refinement observation；shadow 投影在同時間快照間優先採用 epoch 已知者。值不同仍是 conflict，較不完整或完全相同的重送仍是 duplicate；不新增 ledger event kind 或 schema version。
 
+- **#1098 service status／doctor 改以有效宣告解析 wrapper 的 `PY` 覆寫與顯示欄位**：installer 產生的 manager unit 走 `ExecStart=/usr/bin/env bash <pkg>/scripts/service-manager.sh` wrapper 時，實際執行的直譯器由環境變數 `PY` 決定，但 `_declared_service_artifact` 先前完全沒看 `PY`，drop-in 以 `Environment=PY=/other/venv/bin/python` 覆寫時仍固定回報 wrapper 腳本自己所在的舊套件根，`cortex service status`／`doctor` 因此可能誤報仍與舊 receipt match。改為以有效環境（`Environment=`／`EnvironmentFiles=`／ExecStart 內 `env` 前綴，優先序與既有 `PYTHONPATH` 判定一致）解析出的 `PY` 直譯器匯入結果判定 artifact；`PY` 未被任何一層宣告時維持既有「wrapper 與套件同根」假設，判定衝突一律 unknown，不臆測。`cortex service status` 的 `env`（`executor`／`interval_seconds`／`specs_dir`）顯示欄位在 manager 的有效環境來源確認是 `systemd-effective` 時，改用同一份有效環境投影顯示值，不再固定讀 `~/.agents/core/runtime/<instance>-manager.env` 這份可能已被 drop-in 蓋過的舊檔案；`safe_environment_projection` 允許清單額外收 `PY` 這個單一鍵以支援上述兩處。細節見 `changelog.d/1098-service-status-effective-py.md`。
+- **`#1106` github_closing 不再牽連已有 owner 的票**：`correlate_work_sources()` 處理 `github_closing`（整合 PR 關閉多張票）時，先前無條件把「PR 關閉的第一張票（primary）目前的 owner」套用到 PR 本身與其餘每一張被關閉的票，其餘票若早就有自己的 override／frontmatter 歸屬就會同時落在兩個群組，變成 confirmed source collision、整個 repo 被標 degraded（`auto_claim`／`merge` hard gate 全關），例如整合 PR `#1087`／`#1090` 目前只能靠 `.cortex/work-items.yaml` 逐一 `excludes` 才不 degraded。現改為：來源若已有自己、與 primary 不同的權威歸屬則維持不動；PR 本身沒有自己歸屬時，才確定性地加入 primary 目前的 owner 群組（primary 也沒 owner 則與 primary 一起落入 `issue:<ref>` fallback 群組）。真正的衝突（同一票被兩個 override 明列）不受影響，仍回報 collision。細節見 `changelog.d/1106-closing-link-owner.md`。
 - **Builder todo 准入沿用 #847 self-only planning drift 判準**：`manager._builder_todo_admission_stop()` 先前以裸 `authority_revision != run.source_revision` 判定 `builder-todo-authority-changed`，run 自己在 `tdd-red` 之後自產、內容與釘住 baseline 相同的 planning 產物（`docs/superpowers/plans/<work>.md`、`-spec.md`、`-design.md`）一旦被 Monitor 掃成新的 confirmed source，就會把仍在推進的 run 誤擋成需要人工重啟，且無正式重新綁定路徑。現改為裸 digest 不符時另呼叫既有 `claim.authority_matches_claim_era()`（#847）：只有新增的差異恰好是本 run 已接受的自產 planning 產物、且目前檔案 bytes 與 `run.planning_authority` 釘住的 baseline sha256 相符才視為未變動、放行派工；planning 內容漂移、混入非本 run 的 source、todo 本身變動仍維持既有 gate。`manager_daemon._builder_todo_admission_for_run()` 同步把載入的完整 `WorkAuthority` 一併放進 `BuilderTodoAdmission`。細節見 `changelog.d/builder-admission-self-planning.md`。
 - **#840 attempt 判定改以 job 事實，不再依賴 step executor/model**：live 驗收發現正式派工路徑寫入 admission receipt 與寫入 step 身分（`_record_resolved_model_chain()`）不是同一個時間點，job 已派出並在執行（`status=dispatched`）但 step 身分仍為 `None` 時，`decision_projection._attempt_mismatch_reason` 會誤判成『已被 retry-card 清空』，導致所有進行中的 attempt 都被 `cortex work show`／`cortex inspect status` 誤呈現成已結束。改以 `decision.attempt_id` 的 job-count ordinal（沿用 #839 舊版 `_quota_admission_job_lookup_by_attempt` 記載的同一套解析規則）反查對應 job 是否仍在執行；job 已終局或查無此 job 才視為『這個 attempt 已結束』（`mismatch_reason: decision-attempt-ended`，取代不可靠的 `identity-reset-since-decision`）。新增 `decision_projection.jobs_for_run_from_rows()`，`cortex work show`／`cortex inspect status` 共用同一份 job 事實判定。細節見 `changelog.d/840-attempt-check-by-job.md`。
 - **#897／#937 部分：harvest 誤殺 planner 自產、從未進版控的 planning authority**：`_validate_candidate_planning_authority()`（f0a37f72）先前把 candidate 缺席任一 pinned `planning_authority` ref 一律視為 drift，但 planner 自產、只寫在 operator workspace 未 commit 的 spec／design／plan（`_workflow_input_snapshot()` 只把它 seed 進 builder 工作區的檔案系統，不是 `git add`）在只 commit 測試的卡（例如 tdd-red）之後，candidate 的 git tree 本來就不含這些檔案——builder 沒有刪除任何東西，卻被誤判成 drift，run 卡進 `needs_human: resume-workflow-failed`。現在缺席時先問這張 build 卡的 base（新增 `_candidate_planning_authority_base()`：優先 `run.candidate_head`，僅第一張 build 卡退回該 job 自己的 `dispatch_head`——與 `_workflow_build_handoff_base()`／`_post_archive_candidate()` 同一套推導，不信任 builder 自報）是否也缺席這個 ref：base 也缺席即合法初始狀態，放行；base 有、candidate 沒有仍判定為刪除、維持既有拒收；base 推不出時 fail-closed 並在錯誤訊息中明講。逐檔 hash／checkbox 容忍規則不變。核對過 verify／review 的 input snapshot seeding（`_workflow_input_snapshot()`／`_authority_map_with_checkbox_tolerance()`）本已用檔案系統 glob 比對、不受此問題影響，未需同步修正。
@@ -693,6 +707,16 @@
 
 ### Fixed
 
+- **#1096 deployment canary closeout 綁定 gate ledger 與 delivery gate 到本次派工**：
+  `qualification/driver.py::_validate_dispatch_closeout` 的 gate ledger 驗證過去只驗外層
+  形狀，`gates` 列表內容從未被看，回歸把宣告的 gate（`pytest`）跳過也會被放行；現在逐項驗證
+  每個 gate 條目形狀合法、部署層宣告的每個 gate 名稱皆存在且為 terminal `passed`，並把
+  `slice_id` 從「型別是字串」升級為「逐字等於它自己 job 的 `job_id`」。delivery gate（`gate_refs`）
+  過去只以 kind／path／hash 採信 evidence，內容從未被讀，他 run 或舊 candidate 遺留的合法檔案
+  一樣能滿足 closeout；現在把內容當 JSON 讀出來比對自報的 `run_id`／`work_id`／`candidate`，
+  且 `foreign-review` 這個必要 kind 強制要求逐字等於本 run 已獨立驗過的 review job workflow
+  evidence。新增 8 個回歸測試，既有正向 fixture 與 #845 消費的 receipt 契約皆維持通過。細節見
+  `changelog.d/1096-canary-closeout-binding.md`。
 - **#617 slice-review category 語意**：prompt 明列阻擋交付與可交付 follow-up 的 category，要求 review 結論與 blocking findings 一致，並說明 severity 只表示影響程度。
 - **#1006 post-archive Builder 綁定 exact Candidate**：resume 與 dispatch 僅重用以目前 Candidate 派出的 build job；新 job 的 `dispatch_head` 記錄實際採用的 clone base，並同步 lifecycle 文件。
 - **#489 slice write_paths 範圍驗證**：verification contract 可固定有限的 repo 相對檔案清單；候選變更須同時符合 builder persona 與 slice 限制，未宣告 slice 路徑的舊 contract 則明示為 `persona-only`。

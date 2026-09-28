@@ -70,6 +70,12 @@ DEPLOYMENT_CANARY_REVIEWER_EXECUTOR, DEPLOYMENT_CANARY_REVIEWER_MODEL = canary_i
 )
 DEPLOYMENT_CANARY_PROBE_CARD = "worktree-isolation"
 DEPLOYMENT_CANARY_BUILDER_PATH = "/opt/cortex/toolchain/bin:/usr/bin:/bin"
+#: #1096：部署層固定宣告的 `PSC_GATE_CMD_*`（見
+#: `docs/superpowers/runbooks/deployment-canary-probe.md` §5：canary 每張非-ship 卡
+#: 的 gate 身分只跑 `PSC_GATE_CMD_PYTEST`）。closeout 逐項驗證這個集合裡的每個
+#: gate 名稱都存在於 Manager 權威 gate ledger 且為 terminal passed，回歸把 gate
+#: 跳過、或跳過後仍宣告 `passed` 都會被擋下，而不是只驗 ledger 的外層形狀。
+DEPLOYMENT_CANARY_EXPECTED_GATE_NAMES = frozenset({"pytest"})
 MAX_AGENT_LOOP_LOG_BYTES = 128 * 1024 * 1024
 MAX_AGENT_LOOP_COMMANDS = 128
 MAX_DISPATCH_ARTIFACTS = 128
@@ -2283,6 +2289,15 @@ def _has_exact_final_assistant_response(records: Sequence[object]) -> bool:
             if isinstance(data, Mapping) and isinstance(data.get("content"), str):
                 final_contents.append(str(data["content"]))
             continue
+        if (
+            isinstance(record.get("conversation_id"), str)
+            and record.get("status") == "SUCCESS"
+            and isinstance(record.get("response"), str)
+        ):
+            # agy 1.2.x `--print --output-format json` 以單一 result 物件回覆，並一律在
+            # response 尾端附加一個換行；只剝掉這一個換行，其餘仍須逐字相等。
+            final_contents.append(str(record["response"]).removesuffix("\n"))
+            continue
         if record.get("type") != "item.completed":
             continue
         item = record.get("item")
@@ -2345,6 +2360,60 @@ def _codex_canary_builder_sandbox_argv() -> tuple[str, ...]:
     return _codex_registry_sandbox_argv(
         JobWriteContract.BUILDER_WRITE_FORBIDDEN, trust_root_outer_unit=True
     )
+
+
+AGY_CONVERSATION_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+# 以 account 身分讀自己 HOME 內 agy 持久化的對話，列出 executor 設定中的模型變體 id
+# （例如 `gemini-3.8-flash-high`）。root 不直接開啟帳號可寫樹內的檔案。
+AGY_PERSISTED_VARIANTS_SCRIPT = """
+import json, re, sqlite3, sys
+from pathlib import Path
+conversation_id = sys.argv[1]
+database = Path.home() / ".gemini" / "antigravity-cli" / "conversations" / f"{conversation_id}.db"
+if database.is_symlink() or not database.is_file():
+    raise SystemExit("agy conversation database is missing or not a regular file")
+connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+pattern = re.compile(rb"(?<![A-Za-z0-9._-])gemini-[0-9][A-Za-z0-9._-]*(?![A-Za-z0-9._-])")
+variants = set()
+for (data,) in connection.execute("select data from executor_metadata"):
+    blob = data if isinstance(data, (bytes, bytearray)) else str(data).encode()
+    variants.update(match.decode("ascii") for match in pattern.findall(blob))
+print(json.dumps(sorted(variants)))
+"""
+
+
+def _agy_persisted_model_variants(conversation_id: str, *, account: str) -> set[str]:
+    """Return the model variant ids agy persisted for one exact conversation.
+
+    agy 1.2.x 的 print 輸出不回報 model／effort；它把本次對話實際使用的變體
+    （``<model>-<effort>``）寫在對話資料庫的 executor metadata。這與 Codex smoke 讀
+    provider 持久化 thread 的 model／reasoningEffort 是同一類原生證據。
+    """
+
+    if AGY_CONVERSATION_ID_RE.fullmatch(conversation_id) is None:
+        raise QualificationFailure("provider agy conversation identity is malformed")
+    result = _run(
+        ("/usr/bin/python3", "-I", "-c", AGY_PERSISTED_VARIANTS_SCRIPT, conversation_id),
+        user=account,
+        env=_account_env(account),
+        timeout=60,
+    )
+    _require_success(result, "provider agy persisted conversation read")
+    try:
+        variants = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise QualificationFailure(
+            "provider agy persisted conversation read returned malformed output"
+        ) from exc
+    if not isinstance(variants, list) or not all(
+        isinstance(value, str) for value in variants
+    ):
+        raise QualificationFailure(
+            "provider agy persisted conversation read returned malformed output"
+        )
+    return set(variants)
 
 
 def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
@@ -2436,6 +2505,26 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
                 if isinstance(persisted.get("reasoningEffort"), str)
                 else ""
             }
+        elif provider == "agy":
+            conversation_ids = {
+                str(row["conversation_id"])
+                for row in records
+                if isinstance(row, Mapping)
+                and isinstance(row.get("conversation_id"), str)
+            }
+            if len(conversation_ids) != 1 or AGY_CONVERSATION_ID_RE.fullmatch(
+                next(iter(conversation_ids))
+            ) is None:
+                raise QualificationFailure(
+                    "provider agy returned no unique conversation identity"
+                )
+            persisted_variants = _agy_persisted_model_variants(
+                next(iter(conversation_ids)), account=account
+            )
+            if persisted_variants == {f"{model}-{effort}"}:
+                models, efforts = {model}, {effort}
+            else:
+                models, efforts = set(persisted_variants), set()
         else:
             models = (
                 set().union(
@@ -2497,6 +2586,10 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             "native_metadata": passed,
             "response_token": response_token,
         }
+        if provider == "agy":
+            raw_evidence["providers"][provider]["persisted_variants"] = sorted(
+                persisted_variants
+            )
         if not passed:
             raise QualificationFailure(
                 f"provider {provider} lacked unique exact native model/effort metadata "
@@ -3838,6 +3931,11 @@ def _validate_dispatch_closeout(
     remember_artifact(registry_path, hashlib.sha256(registry_content).hexdigest())
     verdict_seen = False
     ledgers_seen = 0
+    # #1096：foreign-review 這個 delivery gate 唯一可信的綁定來源，就是本迴圈稍後
+    # 對 review job 已獨立驗過 run_id／repo／candidate／reviewer_job_id 的那份
+    # workflow canonical evidence；記住它的 path＋hash，讓 gate_refs 段落能要求
+    # 「foreign-review 引用的必須逐字是這一份」，不接受他 run／舊 candidate 的證據。
+    review_evidence_locator: tuple[Path, str] | None = None
     for job in bound_jobs:
         phase = job.get("workflow_phase")
         if (
@@ -3886,6 +3984,7 @@ def _validate_dispatch_closeout(
             ):
                 raise QualificationFailure("workflow review verdict authority mismatch")
             verdict_seen = True
+            review_evidence_locator = (evidence_path, evidence_digest)
         rows = envelope.get("artifacts")
         if not isinstance(rows, list):
             raise QualificationFailure(
@@ -3931,13 +4030,43 @@ def _validate_dispatch_closeout(
                 ledger_content,
                 label="workflow gate ledger",
             )
+            ledger_gates = ledger.get("gates")
             if (
                 ledger.get("schema_version") != 1
                 or ledger.get("kind") != "workflow-gate-ledger"
-                or not isinstance(ledger.get("slice_id"), str)
-                or not isinstance(ledger.get("gates"), list)
+                # #1096：`slice_id` 綁定這份 ledger 是哪個 job 的，不再只驗型別——
+                # 他 job／舊 ledger 只要型別是字串就會被目前的檢查放行。
+                or ledger.get("slice_id") != job.get("job_id")
+                or not isinstance(ledger_gates, list)
             ):
                 raise QualificationFailure("workflow gate ledger schema is invalid")
+            # #1096：ledger 過去只驗外層形狀，`gates` 列表內容（有沒有預期的 gate、
+            # 是否 passed）完全沒人看——回歸把 pytest gate 跳過、或跳過後仍讓
+            # workflow 宣告 passed，都會被目前的檢查放行。這裡逐項驗證每個 gate
+            # 條目形狀合法，並要求部署層宣告的每個 gate 名稱
+            # （`DEPLOYMENT_CANARY_EXPECTED_GATE_NAMES`）都存在且為 terminal passed。
+            observed_gate_status: dict[str, str] = {}
+            for gate_row in ledger_gates:
+                if (
+                    not isinstance(gate_row, dict)
+                    or not isinstance(gate_row.get("name"), str)
+                    or not gate_row["name"]
+                    or not isinstance(gate_row.get("status"), str)
+                ):
+                    raise QualificationFailure(
+                        "workflow gate ledger entry is malformed"
+                    )
+                observed_gate_status[gate_row["name"]] = gate_row["status"]
+            missing_or_failed = sorted(
+                name
+                for name in DEPLOYMENT_CANARY_EXPECTED_GATE_NAMES
+                if observed_gate_status.get(name) != "passed"
+            )
+            if missing_or_failed:
+                raise QualificationFailure(
+                    "workflow gate ledger is missing an expected passed gate: "
+                    + ", ".join(missing_or_failed)
+                )
             ledgers_seen += 1
             remember_artifact(
                 ledger_path, hashlib.sha256(ledger_content).hexdigest()
@@ -4141,6 +4270,37 @@ def _validate_dispatch_closeout(
             or inode in gate_inodes
         ):
             raise QualificationFailure("workflow delivery gate hash/path is not unique")
+        # #1096：evidence 過去只以 kind／path／hash 採信，證據內容從未被讀——他 run
+        # 或舊 candidate 遺留的合法檔案，只要湊得出對應的 path＋hash 就能滿足
+        # closeout。這裡把內容當 JSON 讀出來，凡是自報 run_id／work_id／candidate
+        # 的欄位都必須與本次派工相符（欄位不存在則不強求，避免對未帶這些欄位的
+        # 既有 evidence adapter 產生新的形狀假設）；`foreign-review` 另外強制要求
+        # 逐字等於本 run 已獨立驗過的 review job workflow evidence（同一份
+        # path＋hash），不接受任何「看起來合法」但不是那一份的檔案。
+        evidence_payload = _json_object(content, label="workflow delivery gate")
+        observed_run_id = evidence_payload.get("run_id")
+        observed_work_id = evidence_payload.get("work_id")
+        observed_candidate = evidence_payload.get("candidate")
+        if (
+            (isinstance(observed_run_id, str) and observed_run_id != run_id)
+            or (isinstance(observed_work_id, str) and observed_work_id != work_id)
+            or (
+                isinstance(observed_candidate, str)
+                and observed_candidate != candidate
+            )
+        ):
+            raise QualificationFailure(
+                "workflow delivery gate evidence is not bound to this dispatch"
+            )
+        if row["kind"] == "foreign-review" and (
+            review_evidence_locator is None
+            or path != review_evidence_locator[0]
+            or expected_hash != review_evidence_locator[1]
+        ):
+            raise QualificationFailure(
+                "workflow delivery gate foreign-review evidence is not bound to "
+                "this run's review verdict"
+            )
         gate_paths.add(path)
         gate_inodes.add(inode)
         gate_kinds.add(row["kind"])

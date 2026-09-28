@@ -52,11 +52,53 @@ class ActivationError(InstallError):
     pass
 
 
+# The prior bytes of a managed regular file are rollback authority and live in
+# the receipt.  Managed files are small generated configuration; an existing
+# file above this bound is foreign state that must be moved aside explicitly
+# instead of being copied into every receipt checkpoint.
+ASSET_PRIOR_SNAPSHOT_MAX_BYTES = 1024 * 1024
+
+# Receipt format.  v2 records a directory's descendants as ``children_count``
+# + ``children_sha256`` with the full list in a receipt-bound side file.  A v1
+# installer would find no ``children`` and misreport the whole directory as
+# unknown; it refuses any ``schema_version`` other than 1, so every write uses
+# v2.  Loading still accepts v1 (inline ``children``) receipts.
+_RECEIPT_SCHEMA_VERSION = 2
+_READABLE_RECEIPT_SCHEMA_VERSIONS = (1, 2)
+
+
 def _canonical_bytes(value: object) -> bytes:
     return (
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode("utf-8")
+
+
+def _directory_inventory_bytes(rows: Sequence[str]) -> bytes:
+    """Canonical bytes of a sorted descendant inventory.
+
+    ``ensure_ascii`` keeps non-UTF-8 file names (surrogate escapes) encodable,
+    and the bytes double as the content-addressed side-file payload.
+    """
+
+    return (
+        json.dumps(list(rows), ensure_ascii=True, separators=(",", ":")) + "\n"
+    ).encode("ascii")
+
+
+def _directory_inventory_sha256(rows: Sequence[str]) -> str:
+    return hashlib.sha256(_directory_inventory_bytes(rows)).hexdigest()
+
+
+def _validated_inventory_rows(rows: object) -> tuple[str, ...]:
+    if not isinstance(rows, (list, tuple)) or not all(
+        isinstance(row, str) and row and "\x00" not in row for row in rows
+    ):
+        raise InstallDriftError("directory inventory rows are invalid")
+    normalized = tuple(rows)
+    if any(left >= right for left, right in zip(normalized, normalized[1:])):
+        raise InstallDriftError("directory inventory rows must be sorted and unique")
+    return normalized
 
 
 def _as_plan_dict(plan: Mapping[str, object]) -> dict[str, object]:
@@ -2250,17 +2292,47 @@ def validate_preflight(
     observed_paths = facts.get("paths", {})
     if not isinstance(observed_paths, Mapping):
         observed_paths = {}
+    symlinked: list[str] = []
     for step in plan.get("apply_order", []):
         if not isinstance(step, Mapping):
             raise InstallPlanError("apply_order entries must be typed objects")
         path = step.get("path")
         observed = observed_paths.get(path, {})
+        if not isinstance(observed, Mapping):
+            continue
+        if observed.get("is_symlink") and step.get("asset_type") != "symlink":
+            symlinked.append(f"{path} (step {step.get('step_id')})")
+            continue
+        size = observed.get("size")
         if (
-            isinstance(observed, Mapping)
-            and observed.get("is_symlink")
-            and step.get("asset_type") != "symlink"
+            step.get("kind") == "asset"
+            and step.get("asset_type", "file") == "file"
+            and isinstance(size, int)
+            and not isinstance(size, bool)
+            and size > ASSET_PRIOR_SNAPSHOT_MAX_BYTES
         ):
-            raise UnsafeInstallPathError(f"apply path became a symlink: {path}")
+            failures.append(
+                {
+                    "code": "asset_prior_too_large",
+                    "detail": (
+                        f"{path} (step {step.get('step_id')}) is an existing "
+                        f"{size}-byte regular file; rollback keeps the prior "
+                        "bytes of a managed file in the receipt and refuses "
+                        f"files above {ASSET_PRIOR_SNAPSHOT_MAX_BYTES} bytes. "
+                        "Inspect it, then move it aside (or remove it) before "
+                        "apply so the installer can create the managed file."
+                    ),
+                }
+            )
+    if symlinked:
+        # Refuse before any mutation, naming every offender at once: the
+        # installer never follows a symlink in place of a managed object, and
+        # a symlink cannot be snapshotted as rollback authority.
+        raise UnsafeInstallPathError(
+            "install paths must not be a symlink unless the plan declares a "
+            "symlink asset; replace each with the real object (or remove it) "
+            "before apply: " + "; ".join(symlinked)
+        )
     return PreflightReport(tuple(failures))
 
 
@@ -2308,22 +2380,163 @@ class InstallReceipt:
         self._document: dict[str, object] = deepcopy(dict(document))
         self.path = path
         self._checkpoint_sha256 = checkpoint_sha256
+        # Directory descendant inventories bound to this receipt by digest.
+        # For an in-memory receipt this is the store itself; for a durable
+        # receipt it only holds legacy inline inventories awaiting their
+        # side file, flushed before the next checkpoint drops them.
+        self._inventories: dict[str, tuple[str, ...]] = {}
+        # A receipt stored inside a directory it manages must never create
+        # side files there: they would become unknown state of that very
+        # directory.  Such a (legacy) receipt keeps inventories inline on
+        # disk and uses the digest form only in memory.
+        plan = self._document.get("plan")
+        self._inline_inventories = bool(
+            path is not None
+            and isinstance(plan, Mapping)
+            and _managed_directory_step_containing(
+                plan.get("apply_order"), _inventory_store_path(path)
+            )
+            is not None
+        )
 
     def to_dict(self) -> dict[str, object]:
         return deepcopy(self._document)
+
+    def bind_directory_inventory(self, rows: Sequence[str]) -> str:
+        """Bind a full descendant inventory to this receipt; return its digest.
+
+        The receipt itself records only ``children_count``/``children_sha256``.
+        A durable receipt keeps the rows in a content-addressed, root-only,
+        never-overwritten side file next to it, written before any receipt
+        checkpoint may reference the digest.
+        """
+
+        normalized = _validated_inventory_rows(rows)
+        digest = _directory_inventory_sha256(normalized)
+        if self.path is None or self._inline_inventories:
+            self._inventories[digest] = normalized
+        else:
+            _write_inventory_blob(
+                self.path, digest, _directory_inventory_bytes(normalized)
+            )
+        return digest
+
+    def directory_inventory(self, digest: object, count: object) -> tuple[str, ...]:
+        """Return the exact receipt-bound inventory, or raise (fail closed)."""
+
+        if (
+            not _valid_sha256(digest)
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+        ):
+            raise InstallDriftError("directory inventory binding is invalid")
+        if count == 0:
+            if digest != _directory_inventory_sha256(()):
+                raise InstallDriftError("empty directory inventory digest is invalid")
+            return ()
+        rows = self._inventories.get(str(digest))
+        if rows is None:
+            if self.path is None or self._inline_inventories:
+                raise InstallDriftError(
+                    f"receipt-bound directory inventory is unavailable: {digest}"
+                )
+            rows = _read_inventory_blob(self.path, str(digest))
+        if len(rows) != count or _directory_inventory_sha256(rows) != digest:
+            raise InstallDriftError(
+                f"directory inventory does not match its receipt binding: {digest}"
+            )
+        return rows
+
+    def _externalize_legacy_inventories(self) -> None:
+        """Move pre-digest inline ``children`` lists out of the document.
+
+        Older receipts embedded every descendant path in each directory state.
+        Converting them to the digest form keeps comparisons with fresh
+        backend inspections exact; the rows stay available in memory and are
+        written to the side store before the next checkpoint.
+        """
+
+        for field in ("journal", "rollback_journal"):
+            entries = self._document.get(field)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for state in (entry, entry.get("prior"), entry.get("inspection_prior")):
+                    if not isinstance(state, dict) or not isinstance(
+                        state.get("children"), list
+                    ):
+                        continue
+                    try:
+                        rows = _validated_inventory_rows(state["children"])
+                    except InstallError:
+                        # Leave malformed legacy authority untouched; the
+                        # unknown-state scan fails closed on it.
+                        continue
+                    digest = _directory_inventory_sha256(rows)
+                    if rows:
+                        self._inventories[digest] = rows
+                    del state["children"]
+                    state["children_count"] = len(rows)
+                    state["children_sha256"] = digest
+
+    def _document_with_inline_inventories(self) -> dict[str, object]:
+        """Return the document with digest-form directory states re-inlined."""
+
+        document = deepcopy(self._document)
+        empty = _directory_inventory_sha256(())
+        for field in ("journal", "rollback_journal"):
+            entries = document.get(field)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for state in (entry, entry.get("prior"), entry.get("inspection_prior")):
+                    if not isinstance(state, dict):
+                        continue
+                    digest = state.get("children_sha256")
+                    count = state.get("children_count")
+                    rows = (
+                        ()
+                        if count == 0 and digest == empty
+                        else self._inventories.get(digest)
+                        if isinstance(digest, str)
+                        else None
+                    )
+                    if rows is None or type(count) is not int or count != len(rows):
+                        # No rows to inline: the digest stays, and the
+                        # unknown-state scan fails closed on it.
+                        continue
+                    del state["children_sha256"]
+                    del state["children_count"]
+                    state["children"] = list(rows)
+        return document
 
     def _persist(self) -> None:
         if self.path is not None:
             if self._document.get("effective_receipt_path") != str(self.path):
                 raise InstallError("receipt effective path binding is invalid")
+            self._document["schema_version"] = _RECEIPT_SCHEMA_VERSION
+            if self._inline_inventories:
+                document = self._document_with_inline_inventories()
+            else:
+                for digest, rows in list(self._inventories.items()):
+                    _write_inventory_blob(
+                        self.path, digest, _directory_inventory_bytes(rows)
+                    )
+                    del self._inventories[digest]
+                document = self._document
             if self._checkpoint_sha256 is None:
                 self._checkpoint_sha256 = _create_receipt_json_exclusive(
-                    self.path, self._document
+                    self.path, document
                 )
             else:
                 self._checkpoint_sha256 = _atomic_write_receipt_json(
                     self.path,
-                    self._document,
+                    document,
                     expected_sha256=self._checkpoint_sha256,
                 )
 
@@ -2376,7 +2589,12 @@ class InstallReceipt:
                 os.close(receipt_fd)
             if parent_fd is not None:
                 os.close(parent_fd)
-        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        version = payload.get("schema_version") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or type(version) is not int
+            or version not in _READABLE_RECEIPT_SCHEMA_VERSIONS
+        ):
             raise InstallError(f"invalid receipt schema: {path}")
         plan = payload.get("plan")
         if not isinstance(plan, Mapping) or payload.get("plan_sha256") != plan_sha256(plan):
@@ -2610,11 +2828,13 @@ class InstallReceipt:
             and candidate_venv is None
         ):
             raise InstallError(f"receipt candidate venv binding is invalid: {path}")
-        return cls(
+        receipt = cls(
             payload,
             path=path,
             checkpoint_sha256=hashlib.sha256(receipt_bytes).hexdigest(),
         )
+        receipt._externalize_legacy_inventories()
+        return receipt
 
 
 def _validate_receipt_parent(observed: os.stat_result, path: Path) -> None:
@@ -2956,13 +3176,222 @@ def atomic_write_json(path: Path, value: object, *, mode: int = 0o600) -> None:
         raise
 
 
+def _inventory_store_path(receipt_path: Path) -> Path:
+    """Directory holding a receipt's content-addressed descendant inventories."""
+
+    return receipt_path.with_name(f".{receipt_path.name}.inventory")
+
+
+def _managed_directory_step_containing(
+    steps: object, path: Path
+) -> Mapping[str, object] | None:
+    """Return the managed directory step whose snapshot would include ``path``."""
+
+    if not isinstance(steps, (list, tuple)):
+        return None
+    for step in steps:
+        managed = step.get("path") if isinstance(step, Mapping) else None
+        if (
+            isinstance(step, Mapping)
+            and step.get("kind") == "asset"
+            and step.get("asset_type") == "directory"
+            and isinstance(managed, str)
+            and Path(managed) in path.parents
+        ):
+            return step
+    return None
+
+
+def _validate_inventory_store(observed: os.stat_result, path: Path) -> None:
+    _validate_receipt_parent(observed, path)
+    if stat.S_IMODE(observed.st_mode) & 0o077:
+        raise InstallError(
+            f"receipt inventory store must be root-only (mode 0700): {path}"
+        )
+
+
+def _open_inventory_store(
+    parent_fd: int, receipt_path: Path, *, create: bool
+) -> int:
+    store_path = _inventory_store_path(receipt_path)
+    name = store_path.name
+    if len(os.fsencode(name)) > 255:
+        raise UnsafeInstallPathError(
+            f"receipt inventory store name is too long: {store_path}"
+        )
+    created = False
+    try:
+        try:
+            descriptor = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        except FileNotFoundError:
+            if not create:
+                raise
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+                created = True
+            except FileExistsError:
+                pass
+            descriptor = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise UnsafeInstallPathError(
+            f"cannot safely open receipt inventory store: {store_path}"
+        ) from exc
+    try:
+        if created:
+            os.fsync(parent_fd)
+        _validate_inventory_store(os.fstat(descriptor), store_path)
+        _assert_fd_path_binding(store_path, descriptor, directory=True)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_verified_inventory_blob(
+    descriptor: int, path: Path, digest: str
+) -> bytes:
+    _validate_receipt_file(os.fstat(descriptor), path)
+    payload = _read_fd_bytes(descriptor)
+    _assert_fd_path_binding(path, descriptor, directory=False)
+    if hashlib.sha256(payload).hexdigest() != digest:
+        raise InstallDriftError(f"receipt inventory side file digest mismatch: {path}")
+    return payload
+
+
+def _write_inventory_blob(receipt_path: Path, digest: str, payload: bytes) -> None:
+    """Publish one content-addressed inventory next to its receipt.
+
+    Same durable discipline as the receipt: no-follow descriptors, a private
+    staging leaf, fsync, and an atomic no-replace rename.  An existing blob is
+    never overwritten; it is accepted only after its digest is re-verified.
+    """
+
+    if not _valid_sha256(digest) or hashlib.sha256(payload).hexdigest() != digest:
+        raise InstallError("inventory side file payload does not match its digest")
+    store_path = _inventory_store_path(receipt_path)
+    name = f"{digest}.json"
+    blob_path = store_path / name
+    parent_fd: int | None = None
+    store_fd: int | None = None
+    blob_fd: int | None = None
+    temporary_name: str | None = None
+    no_follow_read = (
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        parent_fd, _leaf = _open_receipt_parent_directory(receipt_path)
+        store_fd = _open_inventory_store(parent_fd, receipt_path, create=True)
+        try:
+            existing_fd = os.open(name, no_follow_read, dir_fd=store_fd)
+        except FileNotFoundError:
+            existing_fd = None
+        except OSError as exc:
+            raise UnsafeInstallPathError(
+                f"cannot safely open receipt inventory side file: {blob_path}"
+            ) from exc
+        if existing_fd is not None:
+            try:
+                _read_verified_inventory_blob(existing_fd, blob_path, digest)
+            finally:
+                os.close(existing_fd)
+            return
+        for _attempt in range(32):
+            temporary_name = f".{digest}.{uuid.uuid4().hex}.tmp"
+            try:
+                blob_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=store_fd,
+                )
+                break
+            except FileExistsError:
+                temporary_name = None
+        if blob_fd is None or temporary_name is None:
+            raise InstallError("cannot allocate a receipt inventory staging file")
+        os.fchmod(blob_fd, 0o600)
+        _validate_receipt_file(os.fstat(blob_fd), blob_path)
+        _write_all(blob_fd, payload)
+        os.fsync(blob_fd)
+        try:
+            _rename_noreplace_at(store_fd, temporary_name, name)
+        except FileExistsError:
+            # A concurrent writer published the same digest first.
+            os.unlink(temporary_name, dir_fd=store_fd)
+            temporary_name = None
+            winner_fd = os.open(name, no_follow_read, dir_fd=store_fd)
+            try:
+                _read_verified_inventory_blob(winner_fd, blob_path, digest)
+            finally:
+                os.close(winner_fd)
+            return
+        except OSError as exc:
+            raise UnsafeInstallPathError(
+                f"cannot atomically publish receipt inventory side file: {blob_path}"
+            ) from exc
+        temporary_name = None
+        os.fsync(store_fd)
+        _assert_fd_path_binding(blob_path, blob_fd, directory=False)
+    finally:
+        if temporary_name is not None and store_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=store_fd)
+            except FileNotFoundError:
+                pass
+        if blob_fd is not None:
+            os.close(blob_fd)
+        if store_fd is not None:
+            os.close(store_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _read_inventory_blob(receipt_path: Path, digest: str) -> tuple[str, ...]:
+    """Load a receipt-bound inventory; any doubt raises ``InstallDriftError``."""
+
+    blob_path = _inventory_store_path(receipt_path) / f"{digest}.json"
+    parent_fd: int | None = None
+    store_fd: int | None = None
+    blob_fd: int | None = None
+    try:
+        parent_fd, _leaf = _open_receipt_parent_directory(receipt_path)
+        store_fd = _open_inventory_store(parent_fd, receipt_path, create=False)
+        blob_fd = os.open(
+            blob_path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=store_fd,
+        )
+        payload = _read_verified_inventory_blob(blob_fd, blob_path, digest)
+        rows = json.loads(payload.decode("ascii"))
+    except InstallDriftError:
+        raise
+    except (InstallError, OSError, UnicodeError, ValueError) as exc:
+        raise InstallDriftError(
+            f"receipt-bound directory inventory is unavailable: {blob_path}: {exc}"
+        ) from exc
+    finally:
+        if blob_fd is not None:
+            os.close(blob_fd)
+        if store_fd is not None:
+            os.close(store_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+    return _validated_inventory_rows(rows)
+
+
 def new_install_receipt(
     plan: Mapping[str, object], *, path: Path | None = None
 ) -> InstallReceipt:
     effective_path = path if path is not None else canonical_receipt_path(plan)
     receipt = InstallReceipt(
         {
-            "schema_version": 1,
+            "schema_version": _RECEIPT_SCHEMA_VERSION,
             "receipt_id": str(uuid.uuid4()),
             "effective_receipt_path": str(effective_path),
             "plan_sha256": plan_sha256(plan),
@@ -3528,6 +3957,26 @@ def _receipt_bootstrap_children(
     return [relative.parts[0], relative.as_posix()]
 
 
+def _inventory_state_equals(
+    state: Mapping[str, object], rows: Sequence[str]
+) -> bool:
+    """Compare an inspected directory's descendants with an exact list.
+
+    Current backends report ``children_count``/``children_sha256``; inline
+    ``children`` lists remain accepted from legacy or in-memory states.
+    """
+
+    inline = state.get("children")
+    if isinstance(inline, list):
+        return inline == list(rows)
+    count = state.get("children_count")
+    return bool(
+        type(count) is int
+        and count == len(rows)
+        and state.get("children_sha256") == _directory_inventory_sha256(rows)
+    )
+
+
 def _explicit_empty_managed_mount_is_adoptable(
     *,
     plan: Mapping[str, object],
@@ -3545,10 +3994,10 @@ def _explicit_empty_managed_mount_is_adoptable(
     """
 
     roots = plan.get("roots")
-    children = installed.get("children")
     receipt_children = _receipt_bootstrap_children(plan=plan, receipt=receipt)
-    allowed_children = children == [] or (
-        receipt_children is not None and children == receipt_children
+    allowed_children = _inventory_state_equals(installed, []) or (
+        receipt_children is not None
+        and _inventory_state_equals(installed, receipt_children)
     )
     return bool(
         isinstance(roots, Mapping)
@@ -4446,6 +4895,37 @@ def _validate_managed_step_provenance_before_apply(
         )
 
 
+def _assert_inventory_store_outside_managed_directories(
+    *,
+    steps: Sequence[Mapping[str, object]],
+    receipt: InstallReceipt,
+    backend: InstallBackend,
+) -> None:
+    """Refuse, before any mutation, a receipt whose side files alter a snapshot.
+
+    Directory priors are bound by descendant digest.  Writing inventory side
+    files below a managed directory would change that directory's own
+    inventory between inspection and apply.  The canonical receipt path is a
+    sibling of the state root, so only an explicit override can hit this.
+    """
+
+    if receipt.path is None or not callable(
+        getattr(backend, "bind_rollback_inventory", None)
+    ):
+        return
+    step = _managed_directory_step_containing(
+        steps, _inventory_store_path(receipt.path)
+    )
+    if step is not None:
+        raise InstallPlanError(
+            f"receipt {receipt.path} is inside managed directory {step.get('path')} "
+            f"(step {step.get('step_id')}): its rollback inventory side "
+            "files would change that directory's snapshot mid-transaction; "
+            "use a receipt path outside managed directories (the default "
+            "canonical receipt path is)"
+        )
+
+
 def apply_plan(
     plan: Mapping[str, object],
     *,
@@ -4470,6 +4950,9 @@ def apply_plan(
     if not report.ok:
         details = "; ".join(row["detail"] for row in report.failures)
         raise InstallError(f"preflight failed: {details}")
+    _assert_inventory_store_outside_managed_directories(
+        steps=steps, receipt=receipt, backend=backend
+    )
 
     _validate_managed_step_provenance_before_apply(
         plan=plan,
@@ -4759,6 +5242,12 @@ def apply_plan(
                 entry["adopted_mount_root"] = adopted_mount_root
                 if replayed_mount_root:
                     entry["adopted_from_receipt"] = True
+            inventory_binder = getattr(backend, "bind_rollback_inventory", None)
+            if callable(inventory_binder):
+                # A directory prior carries only its descendant digest; the
+                # full inventory must be durable before this entry becomes
+                # the rollback authority that refers to it.
+                inventory_binder(receipt, step, rollback_prior)
             journal.append(entry)
             completed[step_id] = entry
             receipt._persist()
@@ -4977,12 +5466,42 @@ def apply_plan(
 class RollbackReport:
     retained_unknown: tuple[str, ...]
     retained_drift: tuple[dict[str, object], ...]
+    # ``not-required`` | ``completed`` | ``failed`` | ``pending``: whether the
+    # rollback had to make systemd re-read restored or removed unit files.
+    systemd_daemon_reload: str = "not-required"
 
     def to_dict(self) -> dict[str, object]:
         return {
             "retained_unknown": list(self.retained_unknown),
             "retained_drift": [dict(row) for row in self.retained_drift],
+            "systemd_daemon_reload": self.systemd_daemon_reload,
         }
+
+
+# Durable receipt marker: a unit file or drop-in was (or may have been)
+# restored/removed by rollback and systemd has not yet re-read its units.
+_SYSTEMD_RELOAD_PENDING = "systemd_reload_pending"
+_SYSTEMD_RELOAD_STEP_ID = "systemd:daemon-reload"
+
+
+def _is_systemd_unit_step(plan: object, step: Mapping[str, object]) -> bool:
+    """Return whether rolling this step back changes systemd unit definitions."""
+
+    if step.get("kind") != "asset":
+        return False
+    if str(step.get("step_id", "")).startswith("generated:units/"):
+        return True
+    path = step.get("path")
+    roots = plan.get("roots") if isinstance(plan, Mapping) else None
+    systemd_root = roots.get("systemd") if isinstance(roots, Mapping) else None
+    if (
+        not isinstance(path, str)
+        or not isinstance(systemd_root, str)
+        or not systemd_root
+    ):
+        return False
+    candidate = PurePosixPath(path)
+    return PurePosixPath(systemd_root) in candidate.parents
 
 
 def _activation_entries(receipt: InstallReceipt) -> list[dict[str, object]]:
@@ -5060,6 +5579,11 @@ def rollback_receipt(
         else:
             _forget_activation_entry(receipt, activation_entry)
     if service_stop_failures:
+        reload_status = (
+            "pending"
+            if receipt._document.get(_SYSTEMD_RELOAD_PENDING) is True
+            else "not-required"
+        )
         receipt._document["state"] = "rollback-blocked"
         receipt._document["activated"] = False
         receipt._document["qualified"] = False
@@ -5067,9 +5591,10 @@ def rollback_receipt(
         receipt._document["rollback"] = {
             "retained_unknown": [],
             "retained_drift": retained_drift,
+            "systemd_daemon_reload": reload_status,
         }
         receipt._persist()
-        return RollbackReport((), tuple(retained_drift))
+        return RollbackReport((), tuple(retained_drift), reload_status)
 
     if journal and receipt._document.get("state") != "rolling-back":
         # Archive the full authority before removing entries one by one.  A
@@ -5100,6 +5625,24 @@ def rollback_receipt(
             receipt._persist()
         except BaseException:
             journal.insert(index, removed)
+            raise
+
+    plan_document = receipt._document.get("plan")
+
+    def require_systemd_reload(step: Mapping[str, object]) -> None:
+        # Persist the reload obligation *before* touching a unit file.  A
+        # crash after the restore would otherwise forget the entry and leave
+        # systemd running the candidate's in-memory unit definitions.
+        if (
+            not _is_systemd_unit_step(plan_document, step)
+            or receipt._document.get(_SYSTEMD_RELOAD_PENDING) is True
+        ):
+            return
+        receipt._document[_SYSTEMD_RELOAD_PENDING] = True
+        try:
+            receipt._persist()
+        except BaseException:
+            receipt._document.pop(_SYSTEMD_RELOAD_PENDING, None)
             raise
 
     def restored_venv_slot_is_receipt_bound(
@@ -5261,6 +5804,8 @@ def rollback_receipt(
                     {"step_id": entry.get("step_id"), "observed": dict(installed)}
                 )
                 continue
+            if dict(installed) != dict(prior):
+                require_systemd_reload(step)
             try:
                 if dict(installed) != dict(prior):
                     backend.rollback_step(entry)
@@ -5288,8 +5833,40 @@ def rollback_receipt(
                 {"step_id": entry.get("step_id"), "observed": dict(installed)}
             )
             continue
+        require_systemd_reload(step)
         backend.rollback_step(entry)
         forget_install_entry(entry)
+    # The ``systemctl daemon-reload`` apply step cannot be undone in place:
+    # it runs before the unit files it covers are restored in reverse order.
+    # Reload once here, after every unit/drop-in mutation, so services started
+    # after rollback use the restored definitions rather than systemd's
+    # in-memory copy of the candidate units.
+    reload_status = "not-required"
+    if receipt._document.get(_SYSTEMD_RELOAD_PENDING) is True:
+        reload_status = "failed"
+        reloader = getattr(backend, "reload_systemd_units", None)
+        if not callable(reloader):
+            retained_drift.append(
+                {
+                    "step_id": _SYSTEMD_RELOAD_STEP_ID,
+                    "observed": {
+                        "error": "backend cannot reload systemd after unit rollback"
+                    },
+                }
+            )
+        else:
+            try:
+                reloader()
+            except Exception as exc:
+                retained_drift.append(
+                    {
+                        "step_id": _SYSTEMD_RELOAD_STEP_ID,
+                        "observed": {"error": str(exc)},
+                    }
+                )
+            else:
+                reload_status = "completed"
+                receipt._document.pop(_SYSTEMD_RELOAD_PENDING, None)
     unknown = tuple(backend.list_unknown_state(receipt))
     receipt._document["state"] = (
         "rollback-blocked" if unknown or retained_drift else "rolled-back"
@@ -5307,9 +5884,10 @@ def rollback_receipt(
     receipt._document["rollback"] = {
         "retained_unknown": list(unknown),
         "retained_drift": retained_drift,
+        "systemd_daemon_reload": reload_status,
     }
     receipt._persist()
-    return RollbackReport(unknown, tuple(retained_drift))
+    return RollbackReport(unknown, tuple(retained_drift), reload_status)
 
 
 @dataclass(frozen=True)

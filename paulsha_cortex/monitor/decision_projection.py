@@ -103,6 +103,23 @@ def _classify_observation(state: object) -> str:
     return "unknown"
 
 
+#: #1116：把 `AdmissionDecision.selected_binding_kind`（`"exact"`／`"identity"`／
+#: `"none"`／缺席）投影成可機讀原因——區分「這個候選完全沒有任何 binding
+#: （``binding-missing``，即票面『unmanaged』的具體原因）」與「有 binding
+#: 但目前餘量 unknown」（後者由 ``classification.observation`` 表達，兩者
+#: 是獨立的維度：一個候選可以『有 binding、但餘量目前 unknown』，也可以
+#: 『完全沒有 binding』——不能只看 observation 那一個欄位互相推論)。
+def _classify_binding_kind(value: object) -> str:
+    if value == "exact":
+        return "bound-exact"
+    if value == "identity":
+        return "bound-identity"
+    if value == "none":
+        return "binding-missing"
+    # 缺席（#1116 之前寫的舊 receipt）視為 unknown，不臆測。
+    return "unknown"
+
+
 def _file_identity(path: Path) -> tuple[int, int, int, int] | None:
     """回傳 ``path`` 目前的檔案身分：``(size, mtime_ns, inode, mode)``。
 
@@ -560,6 +577,7 @@ def _project_persona_decision(
         "classification": {
             "demand": _classify_demand(decision.demand_version),
             "observation": _classify_observation(decision.selected_observation_state),
+            "binding": _classify_binding_kind(decision.selected_binding_kind),
         },
         "selected_feasible": decision.selected_feasible,
     }

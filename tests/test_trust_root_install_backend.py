@@ -24,6 +24,7 @@ from paulsha_cortex.trust_root.install import (
     UnsafeInstallPathError,
 )
 from paulsha_cortex.trust_root.install import backend as backend_module
+from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
 from paulsha_cortex.trust_root.install.backend import _mode
 from paulsha_cortex.trust_root.install.core import (
@@ -31,6 +32,7 @@ from paulsha_cortex.trust_root.install.core import (
     InstallPlanError,
     _account_digest,
     _desired_digest,
+    new_install_receipt,
     rollback_receipt,
     validate_preflight,
 )
@@ -1087,6 +1089,87 @@ def test_file_replacement_binds_prior_inode_and_rolls_back_exact_bytes(
     assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 
+def test_rollback_restoring_a_unit_file_ends_with_systemd_daemon_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    systemd = tmp_path / "systemd"
+    systemd.mkdir()
+    path = systemd / "cortex-manager.service"
+    path.write_text("old unit\n", encoding="utf-8")
+    path.chmod(0o640)
+    step = {
+        "step_id": "generated:units/cortex-manager.service",
+        "kind": "asset",
+        "asset_type": "file",
+        "path": str(path),
+        "content": "new unit\n",
+        "owner": account,
+        "group": group,
+        "mode": "0600",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    commands: list[tuple[str, ...]] = []
+
+    def run(argv, **_kwargs):
+        commands.append(tuple(argv))
+        return _completed(argv)
+
+    monkeypatch.setattr(backend_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(backend_module, "_run", run)
+    backend = LocalInstallBackend(require_root=False)
+    prior = dict(backend.inspect_step(step))
+    outcome = backend.replace_step_checkpointed(step, prior, lambda _authority: None)
+    receipt = InstallReceipt(
+        {
+            "plan": {"roots": {"systemd": str(systemd)}},
+            "state": "applied",
+            "journal": [
+                {
+                    "step_id": step["step_id"],
+                    "step": step,
+                    "status": "completed",
+                    "prior": prior,
+                    **outcome,
+                }
+            ],
+            "services_started": False,
+            "credentials": [],
+        }
+    )
+    commands.clear()
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert path.read_text(encoding="utf-8") == "old unit\n"
+    systemctl_calls = [row for row in commands if row[0] == "systemctl"]
+    assert systemctl_calls == [("systemctl", "daemon-reload")]
+    assert commands[-1] == ("systemctl", "daemon-reload")
+    assert report.systemd_daemon_reload == "completed"
+    assert receipt.to_dict()["state"] == "rolled-back"
+
+
+def test_systemd_reload_failure_is_raised_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv, **_kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(
+            list(argv), 1, "", "Failed to reload daemon: Access denied"
+        )
+
+    monkeypatch.setattr(backend_module.subprocess, "run", run)
+
+    with pytest.raises(backend_module.InstallError, match="Access denied"):
+        LocalInstallBackend(require_root=False).reload_systemd_units()
+
+    assert calls == [["systemctl", "daemon-reload"]]
+
+
 @pytest.mark.parametrize("staging_exact", [True, False])
 def test_prepared_file_replacement_never_false_cleans_a_staging_leaf(
     tmp_path: Path,
@@ -1272,7 +1355,7 @@ def test_directory_acl_attestation_ignores_semantically_irrelevant_order(
     monkeypatch.setattr(
         backend_module,
         "_snapshot",
-        lambda _path: {
+        lambda _path, **_kwargs: {
             "exists": True,
             "is_directory": True,
             "owner": account,
@@ -1420,6 +1503,103 @@ def test_preflight_counts_active_jobs_from_plan_bound_durable_registry(
 
     assert facts["in_flight_jobs"] == 2
     assert any(row["code"] == "in_flight_jobs" for row in report.failures)
+
+
+def test_preflight_reports_oversized_prior_asset_file_before_any_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_in_flight_process_count", lambda _rows: 0)
+    monkeypatch.setattr(backend_module, "_run", lambda argv, **_kwargs: _completed(argv))
+    legacy = tmp_path / "bin/claude"
+    legacy.parent.mkdir()
+    with legacy.open("wb") as stream:
+        stream.truncate(backend_module.ASSET_PRIOR_SNAPSHOT_MAX_BYTES + 1)
+    plan = {
+        "roots": {"state": str(tmp_path / "state"), "deploy": str(tmp_path / "deploy")},
+        "accounts": [],
+        "service_accounts": [],
+        "apply_order": [
+            {
+                "step_id": "generated:toolchain_wrappers/claude",
+                "kind": "asset",
+                "asset_type": "file",
+                "path": str(legacy),
+            }
+        ],
+        "minimum_disk_free_bytes": 0,
+    }
+
+    facts = LocalInstallBackend(require_root=False).preflight_facts(plan)
+    report = validate_preflight(plan, facts)
+
+    assert facts["paths"][str(legacy)]["size"] == (
+        backend_module.ASSET_PRIOR_SNAPSHOT_MAX_BYTES + 1
+    )
+    oversized = [
+        row for row in report.failures if row["code"] == "asset_prior_too_large"
+    ]
+    assert len(oversized) == 1
+    detail = oversized[0]["detail"]
+    assert str(legacy) in detail
+    assert str(backend_module.ASSET_PRIOR_SNAPSHOT_MAX_BYTES) in detail
+    assert "move" in detail
+
+
+def test_asset_inspection_never_embeds_an_oversized_prior_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    path = tmp_path / "cortex.env"
+    with path.open("wb") as stream:
+        stream.truncate(backend_module.ASSET_PRIOR_SNAPSHOT_MAX_BYTES + 1)
+    step = {
+        "step_id": "generated:environment/cortex.env",
+        "kind": "asset",
+        "asset_type": "file",
+        "path": str(path),
+    }
+
+    with pytest.raises(InstallDriftError, match="too large") as caught:
+        LocalInstallBackend(require_root=False).inspect_step(step)
+
+    assert str(path) in str(caught.value)
+
+
+def test_asset_inspection_still_refuses_a_symlinked_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    target = tmp_path / "toolchain/claude"
+    target.parent.mkdir()
+    target.write_bytes(b"binary")
+    path = tmp_path / "claude"
+    path.symlink_to(target)
+    step = {
+        "step_id": "generated:toolchain_wrappers/claude",
+        "kind": "asset",
+        "asset_type": "file",
+        "path": str(path),
+    }
+
+    with pytest.raises(UnsafeInstallPathError, match="symlink"):
+        LocalInstallBackend(require_root=False).inspect_step(step)
+
+
+def test_installed_inventory_reads_large_generated_file_without_snapshot_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    path = tmp_path / "cortex.env"
+    with path.open("wb") as stream:
+        stream.truncate(backend_module.ASSET_PRIOR_SNAPSHOT_MAX_BYTES + 1)
+    plan = {
+        "generated": {"environment": {"cortex.env": {"path": str(path)}}},
+    }
+
+    installed = LocalInstallBackend(require_root=False).installed_inventory(plan)
+
+    row = installed["environment"]["cortex.env"]
+    assert len(row["content"]) == backend_module.ASSET_PRIOR_SNAPSHOT_MAX_BYTES + 1
 
 
 def test_preflight_facts_capture_private_group_members_primary_users_and_gid_aliases(
@@ -1670,11 +1850,15 @@ def test_rollback_reports_nested_unknown_child_from_recursive_no_follow_snapshot
             "credentials": [],
         }
     )
+    # apply_plan binds the prior's descendant inventory before persisting the
+    # entry; this direct backend test performs the same binding explicitly.
+    backend.bind_rollback_inventory(receipt, step, applied["prior"])
 
     report = rollback_receipt(receipt, backend=backend)
 
     assert unknown.read_text(encoding="utf-8") == "durable\n"
     assert str(unknown) in report.retained_unknown
+    assert str(managed) not in report.retained_unknown
 
 
 def test_recursive_directory_inventory_never_descends_through_symlinks(
@@ -1692,6 +1876,310 @@ def test_recursive_directory_inventory_never_descends_through_symlinks(
 
     assert inventory == ["escape", "real", "real/inside.txt"]
     assert "escape/outside.txt" not in inventory
+
+
+def _managed_directory_step(path: Path) -> dict[str, object]:
+    step = {
+        "step_id": "asset:state-root",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(path),
+        "owner": pwd.getpwuid(os.getuid()).pw_name,
+        "group": grp.getgrgid(os.getgid()).gr_name,
+        "mode": "0700",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    return step
+
+
+def _populate_tree(root: Path, *, directories: int, files: int) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    for index in range(directories):
+        branch = root / f"branch-{index:04d}"
+        branch.mkdir()
+        for leaf in range(files):
+            (branch / f"leaf-{leaf:04d}.txt").write_bytes(b"x")
+
+
+def _durable_receipt_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: Mapping[str, object]
+) -> InstallReceipt:
+    """Persist a real receipt in a temporary root; ownership checks are faked."""
+
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    plan = {"apply_order": [dict(step)], "repo_identity": {}, "candidate": {}}
+    path = (tmp_path / "receipts" / "install.json").absolute()
+    return new_install_receipt(plan, path=path)
+
+
+def _prepare_directory_entry(
+    backend: LocalInstallBackend,
+    receipt: InstallReceipt,
+    step: Mapping[str, object],
+) -> dict[str, object]:
+    """Mirror apply_plan: bind the prior inventory, then persist the entry."""
+
+    prior = dict(backend.inspect_step(step))
+    backend.bind_rollback_inventory(receipt, step, prior)
+    entry = {
+        "step_id": step["step_id"],
+        "step": dict(step),
+        "status": "completed",
+        "prior": prior,
+    }
+    receipt._document["journal"].append(entry)
+    receipt._document["state"] = "applied"
+    receipt._persist()
+    return prior
+
+
+def _inventory_store(receipt: InstallReceipt) -> Path:
+    assert receipt.path is not None
+    return receipt.path.with_name(f".{receipt.path.name}.inventory")
+
+
+def test_directory_snapshot_binds_descendants_by_digest_not_inline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    managed = tmp_path / "state"
+    _populate_tree(managed, directories=3, files=2)
+    rows = backend_module._directory_inventory(managed)
+
+    state = LocalInstallBackend(require_root=False).inspect_step(
+        _managed_directory_step(managed)
+    )
+
+    assert "children" not in state
+    assert state["children_count"] == len(rows) == 9
+    assert state["children_sha256"] == install_core._directory_inventory_sha256(rows)
+
+
+def test_receipt_size_is_independent_of_directory_descendant_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    sizes: dict[str, int] = {}
+    for label, directories, files in (("small", 2, 2), ("large", 60, 100)):
+        managed = tmp_path / label / "state"
+        _populate_tree(managed, directories=directories, files=files)
+        step = _managed_directory_step(managed)
+        receipt = _durable_receipt_for(tmp_path / label, monkeypatch, step)
+        backend = LocalInstallBackend(require_root=False)
+
+        prior = _prepare_directory_entry(backend, receipt, step)
+
+        assert receipt.path is not None
+        sizes[label] = receipt.path.stat().st_size
+        blob = _inventory_store(receipt) / f"{prior['children_sha256']}.json"
+        assert json.loads(blob.read_text(encoding="ascii")) == (
+            backend_module._directory_inventory(managed)
+        )
+        assert stat.S_IMODE(blob.stat().st_mode) == 0o600
+        assert stat.S_IMODE(_inventory_store(receipt).stat().st_mode) == 0o700
+        assert "branch-0001" not in receipt.path.read_text(encoding="utf-8")
+
+    assert prior["children_count"] == 60 * 101
+    # 6,060 descendants cost the receipt only the extra digits of the count.
+    assert sizes["large"] - sizes["small"] < 16
+
+
+def test_unknown_scanner_reads_bound_inventory_after_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    managed = tmp_path / "state"
+    _populate_tree(managed, directories=2, files=2)
+    step = _managed_directory_step(managed)
+    receipt = _durable_receipt_for(tmp_path, monkeypatch, step)
+    _prepare_directory_entry(LocalInstallBackend(require_root=False), receipt, step)
+    unknown = managed / "branch-0001" / "nested" / "created-after-install.txt"
+    unknown.parent.mkdir()
+    unknown.write_text("durable\n", encoding="utf-8")
+    assert receipt.path is not None
+
+    reloaded = InstallReceipt.load(receipt.path)
+    retained = LocalInstallBackend(require_root=False).list_unknown_state(reloaded)
+
+    assert retained == (str(unknown.parent), str(unknown))
+
+
+@pytest.mark.parametrize(
+    "corruption", ["missing", "tampered", "symlinked", "store-not-private"]
+)
+def test_unknown_scanner_fails_closed_without_trusted_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    managed = tmp_path / "state"
+    _populate_tree(managed, directories=2, files=2)
+    step = _managed_directory_step(managed)
+    receipt = _durable_receipt_for(tmp_path, monkeypatch, step)
+    backend = LocalInstallBackend(require_root=False)
+    prior = _prepare_directory_entry(backend, receipt, step)
+    store = _inventory_store(receipt)
+    blob = store / f"{prior['children_sha256']}.json"
+    if corruption == "missing":
+        blob.unlink()
+    elif corruption == "tampered":
+        blob.write_text(json.dumps(["branch-0000"]) + "\n", encoding="ascii")
+    elif corruption == "symlinked":
+        decoy = tmp_path / "decoy.json"
+        decoy.write_bytes(blob.read_bytes())
+        blob.unlink()
+        blob.symlink_to(decoy)
+    else:
+        store.chmod(0o755)
+    unknown = managed / "created-after-install.txt"
+    unknown.write_text("durable\n", encoding="utf-8")
+    baseline = backend_module._directory_inventory(managed)
+    assert receipt.path is not None
+
+    reloaded = InstallReceipt.load(receipt.path)
+    report = rollback_receipt(reloaded, backend=LocalInstallBackend(require_root=False))
+
+    # Nothing under the directory can be classified without a trusted
+    # baseline: the whole directory is retained and rollback is blocked.
+    assert report.retained_unknown == (str(managed),)
+    assert reloaded.to_dict()["state"] == "rollback-blocked"
+    assert backend_module._directory_inventory(managed) == baseline
+
+
+def test_unchanged_directory_needs_no_inventory_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    managed = tmp_path / "state"
+    _populate_tree(managed, directories=2, files=2)
+    step = _managed_directory_step(managed)
+    receipt = _durable_receipt_for(tmp_path, monkeypatch, step)
+    prior = _prepare_directory_entry(
+        LocalInstallBackend(require_root=False), receipt, step
+    )
+    (_inventory_store(receipt) / f"{prior['children_sha256']}.json").unlink()
+    assert receipt.path is not None
+
+    reloaded = InstallReceipt.load(receipt.path)
+
+    assert LocalInstallBackend(require_root=False).list_unknown_state(reloaded) == ()
+
+
+def test_legacy_receipt_inside_managed_directory_rolls_back_without_side_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    managed = tmp_path / "state"
+    _populate_tree(managed, directories=2, files=2)
+    step = _managed_directory_step(managed)
+    plan = {"apply_order": [dict(step)], "repo_identity": {}, "candidate": {}}
+    receipt_path = (managed / "receipts" / "install.json").absolute()
+    receipt = new_install_receipt(plan, path=receipt_path)
+    backend = LocalInstallBackend(require_root=False)
+    current = dict(backend.inspect_step(step))
+    legacy_rows = backend_module._directory_inventory(managed)
+    assert "receipts/install.json" in legacy_rows
+    legacy_prior = {
+        key: value
+        for key, value in current.items()
+        if key not in {"children_count", "children_sha256"}
+    }
+    legacy_prior["children"] = legacy_rows
+    document = receipt.to_dict()
+    document.update(
+        {
+            "schema_version": 1,
+            "state": "applied",
+            "journal": [
+                {
+                    "step_id": step["step_id"],
+                    "step": dict(step),
+                    "status": "completed",
+                    "prior": legacy_prior,
+                    **legacy_prior,
+                }
+            ],
+        }
+    )
+    # A receipt written by the pre-digest installer: inline children, v1.
+    receipt_path.write_bytes(install_core._canonical_bytes(document))
+
+    loaded = InstallReceipt.load(receipt_path)
+    report = rollback_receipt(loaded, backend=LocalInstallBackend(require_root=False))
+
+    # The installer never creates side files inside a managed directory, so
+    # the receipt's own directory cannot turn into unknown state.
+    assert report.retained_unknown == ()
+    assert report.retained_drift == ()
+    assert loaded.to_dict()["state"] == "rolled-back"
+    assert not (receipt_path.parent / ".install.json.inventory").exists()
+    on_disk = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert on_disk["rollback_journal"][0]["prior"]["children"] == legacy_rows
+
+
+def test_legacy_inline_children_receipt_is_migrated_on_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    managed = tmp_path / "state"
+    _populate_tree(managed, directories=2, files=2)
+    step = _managed_directory_step(managed)
+    receipt = _durable_receipt_for(tmp_path, monkeypatch, step)
+    backend = LocalInstallBackend(require_root=False)
+    current = dict(backend.inspect_step(step))
+    legacy_prior = {
+        key: value
+        for key, value in current.items()
+        if key not in {"children_count", "children_sha256"}
+    }
+    legacy_prior["children"] = backend_module._directory_inventory(managed)
+    receipt._document["journal"].append(
+        {
+            "step_id": step["step_id"],
+            "step": dict(step),
+            "status": "prepared",
+            "prior": legacy_prior,
+            **legacy_prior,
+        }
+    )
+    receipt._document["state"] = "applying"
+    receipt._persist()
+    assert receipt.path is not None
+    assert "branch-0001/leaf-0001.txt" in receipt.path.read_text(encoding="utf-8")
+    unknown = managed / "created-after-install.txt"
+    unknown.write_text("durable\n", encoding="utf-8")
+
+    loaded = InstallReceipt.load(receipt.path)
+    entry = loaded.to_dict()["journal"][0]
+
+    # The legacy baseline compares exactly like a fresh digest-form inspection.
+    assert entry["prior"] == current
+    assert "children" not in entry
+    assert LocalInstallBackend(require_root=False).list_unknown_state(loaded) == (
+        str(unknown),
+    )
+
+    loaded._persist()
+    on_disk = receipt.path.read_text(encoding="utf-8")
+    assert "branch-0001/leaf-0001.txt" not in on_disk
+    # Side-file receipts are unreadable to a pre-digest installer: it must
+    # refuse the schema outright instead of misreading the directory states.
+    assert json.loads(on_disk)["schema_version"] == 2
+    assert LocalInstallBackend(require_root=False).list_unknown_state(
+        InstallReceipt.load(receipt.path)
+    ) == (str(unknown),)
 
 
 def _write_toolchain_archive(path: Path, *, tool_mode: int = 0o755) -> None:
@@ -1890,6 +2378,71 @@ def test_getfacl_failure_is_not_reported_as_an_empty_acl(
 
     with pytest.raises(InstallDriftError, match="getfacl|ACL"):
         backend_module._read_acl(tmp_path)
+
+
+# Real ``getfacl -cp`` output (acl 2.3, no ``-E``) for a directory whose ACL
+# mask is stricter than its named/group entries.  Only the account name is
+# replaced with a neutral placeholder; the tab + ``#effective:`` comment shape
+# is exactly what the tool prints.
+_GETFACL_MASKED_OUTPUT = (
+    "user::rwx\n"
+    "user:operator:r-x\t#effective:---\n"
+    "group::r-x\t#effective:---\n"
+    "mask::---\n"
+    "other::---\n"
+    "default:user::rwx\n"
+    "default:user:operator:r-x\t#effective:---\n"
+    "default:group::r-x\t#effective:---\n"
+    "default:mask::---\n"
+    "default:other::---\n"
+    "\n"
+)
+
+
+def test_read_acl_ignores_effective_rights_comments_under_restrictive_mask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(backend_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def run(argv, **_kwargs):
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(list(argv), 0, _GETFACL_MASKED_OUTPUT, "")
+
+    monkeypatch.setattr(backend_module, "_run", run)
+
+    rows = backend_module._read_acl(tmp_path)
+
+    assert calls == [("getfacl", "-cpE", str(tmp_path))]
+    assert rows == [
+        {"account": "", "perms": "rx", "default": False, "entry_type": "group"},
+        {"account": "", "perms": "", "default": False, "entry_type": "mask"},
+        {"account": "operator", "perms": "rx", "default": False},
+        {"account": "", "perms": "rx", "default": True, "entry_type": "group"},
+        {"account": "", "perms": "", "default": True, "entry_type": "mask"},
+        {"account": "", "perms": "", "default": True, "entry_type": "other"},
+        {"account": "", "perms": "rwx", "default": True, "entry_type": "user"},
+        {"account": "operator", "perms": "rx", "default": True},
+    ]
+    # Every parsed row must round-trip into a valid ``setfacl -m`` spec.
+    assert [backend_module._acl_argument(row) for row in rows][2] == "u:operator:rx"
+
+
+def test_read_acl_reports_named_perms_when_live_mask_restricts_them(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
+        pytest.skip("requires acl tools")
+    account = pwd.getpwuid(os.getuid()).pw_name
+    target = tmp_path / "masked"
+    target.mkdir(mode=0o750)
+    subprocess.run(["setfacl", "-m", f"u:{account}:rx", str(target)], check=True)
+    subprocess.run(["setfacl", "-m", "m::---", str(target)], check=True)
+
+    rows = backend_module._read_acl(target)
+
+    assert {"account": account, "perms": "rx", "default": False} in rows
+    assert all(set(str(row["perms"])) <= set("rwx") for row in rows)
 
 
 def test_missing_getfacl_binary_is_not_reported_as_an_empty_acl(

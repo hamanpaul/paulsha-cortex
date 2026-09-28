@@ -225,9 +225,24 @@ class QuotaShadowService:
     ) -> ShadowRecordResult:
         gaps: list[CoverageGap] = []
         if (not isinstance(job, dict) or not isinstance(profile_key, str)
-                or not _PROFILE_KEY_RE.fullmatch(profile_key)
-                or schema.binding_status(binding).get("state") != "complete"
-                or not _binding_has_profile(binding.to_dict(), profile_key)):
+                or not _PROFILE_KEY_RE.fullmatch(profile_key)):
+            return ShadowRecordResult("invalid", gaps=(CoverageGap("terminal-usage", "profile-binding-unresolved"),))
+        # #1116：executor＋model_id 穩定 identity subject binding 也要能在
+        # 這裡涵蓋這個 job 的終局 usage，否則 admission 用 identity binding
+        # 判定可行、真正扣消耗時卻只認得 profile／group 兩種 kind，會讓
+        # identity 綁定的 pool 永遠扣不到終局 usage（見呼叫端
+        # `manager._quota_admission_record_terminal_usage` 文件字串）。job
+        # 缺 executor／model_id（非 str）時 identity 傳 `None`，效果等同
+        # #1116 之前——只比對 profile／group 兩種 kind。
+        job_executor = job.get("executor")
+        job_model_id = job.get("model_id")
+        identity = (
+            (job_executor, job_model_id)
+            if isinstance(job_executor, str) and isinstance(job_model_id, str)
+            else None
+        )
+        if (schema.binding_status(binding).get("state") != "complete"
+                or not _binding_has_profile(binding.to_dict(), profile_key, identity=identity)):
             return ShadowRecordResult("invalid", gaps=(CoverageGap("terminal-usage", "profile-binding-unresolved"),))
         job_id = job.get("id")
         executor = job.get("executor")
@@ -806,7 +821,15 @@ def _binding_constraints(binding_wire, descriptors):
     return result
 
 
-def _binding_has_profile(binding, profile_key):
+def _binding_has_profile(binding, profile_key, *, identity=None):
+    """``identity`` 為 #1116 新增的選填 ``(executor, model_id)``——缺席
+    （沿用既有呼叫端不帶這個參數）時行為與 #1116 之前逐字相同，只比對
+    resolved profile key 精確綁定（``profile``／``group`` 兩種 kind）；帶入
+    時額外接受 executor＋model_id 穩定 subject 綁定（``identity`` kind），
+    比照 `quota_admission._matches_exact`／`_matches_identity` 的同一套
+    優先序語意（此處只需要『有沒有涵蓋』的布林結果，不需要選出 pool/window
+    集合，因此不重用那兩個函式，各自獨立成檔的既有慣例——見模組文件字串）。
+    """
     subject = binding.get("subject")
     if not isinstance(subject, dict):
         return False
@@ -819,6 +842,9 @@ def _binding_has_profile(binding, profile_key):
             isinstance(item, dict) and item.get("key") == profile_key
             for item in members.get("value", [])
         )
+    if subject.get("kind") == "identity" and identity is not None:
+        executor, model_id = identity
+        return subject.get("executor") == executor and subject.get("model_id") == model_id
     return False
 
 

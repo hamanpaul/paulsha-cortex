@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import configparser
+import errno
 import grp
 import hashlib
 import json
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from .core import (
+    ASSET_PRIOR_SNAPSHOT_MAX_BYTES,
     InstallDriftError,
     InstallError,
     InstallPlanError,
@@ -27,6 +29,7 @@ from .core import (
     _account_digest,
     _assert_fd_path_binding,
     _desired_digest,
+    _directory_inventory_sha256,
     _open_directory_chain,
     _open_parent_directory,
     _read_fd_bytes,
@@ -422,14 +425,20 @@ def _cleanup_bound_venv_staging(
 def _read_acl(path: Path) -> list[dict[str, object]]:
     if shutil.which("getfacl") is None:
         raise InstallDriftError("getfacl is unavailable; ACL state is untrusted")
-    result = _run(("getfacl", "-cp", str(path)))
+    # ``-E`` suppresses the ``\t#effective:...`` annotation getfacl appends
+    # when the ACL mask narrows an entry.  The recorded perms must be the
+    # entry's own bits: those are what ``setfacl -m`` restores on rollback.
+    result = _run(("getfacl", "-cpE", str(path)))
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "command failed").strip()
         raise InstallDriftError(
             f"getfacl failed while inspecting ACL for {path} ({result.returncode}): {detail}"
         )
+    # Defensive: strip any trailing comment even if a getfacl build ignores
+    # ``-E``.  POSIX ACL entry text never contains ``#``.
+    lines = [raw.partition("#")[0].strip() for raw in result.stdout.splitlines()]
     rows: list[dict[str, object]] = []
-    for raw in result.stdout.splitlines():
+    for raw in lines:
         default = raw.startswith("default:")
         body = raw.removeprefix("default:")
         entry_type, separator, remainder = body.partition(":")
@@ -444,7 +453,7 @@ def _read_acl(path: Path) -> list[dict[str, object]]:
             default or any(
                 candidate.startswith(("user:", "group:"))
                 and candidate.split(":", 2)[1]
-                for candidate in result.stdout.splitlines()
+                for candidate in lines
             )
         ):
             continue
@@ -467,7 +476,57 @@ def _read_acl(path: Path) -> list[dict[str, object]]:
     )
 
 
-def _snapshot(path: Path) -> dict[str, object]:
+def _read_prior_file(path: Path, observed: os.stat_result) -> bytes:
+    """Read a managed file's prior bytes through a bounded no-follow descriptor."""
+
+    def too_large(size: int) -> InstallDriftError:
+        return InstallDriftError(
+            f"existing managed file is too large to snapshot for rollback: {path} "
+            f"is {size} bytes (limit {ASSET_PRIOR_SNAPSHOT_MAX_BYTES}); move it "
+            "aside before apply"
+        )
+
+    if observed.st_size > ASSET_PRIOR_SNAPSHOT_MAX_BYTES:
+        raise too_large(observed.st_size)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise UnsafeInstallPathError(
+                f"install asset must not be a symlink: {path}"
+            ) from exc
+        raise InstallDriftError(f"cannot snapshot managed file {path}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            observed.st_dev,
+            observed.st_ino,
+        ):
+            raise InstallDriftError(f"managed file changed during snapshot: {path}")
+        chunks: list[bytes] = []
+        remaining = ASSET_PRIOR_SNAPSHOT_MAX_BYTES + 1
+        while remaining > 0 and (chunk := os.read(descriptor, min(remaining, 1024 * 1024))):
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > ASSET_PRIOR_SNAPSHOT_MAX_BYTES:
+            raise too_large(len(content))
+        return content
+    finally:
+        os.close(descriptor)
+
+
+def _snapshot(
+    path: Path,
+    *,
+    capture_content: bool = True,
+    inventory_sink: Callable[[str, tuple[str, ...]], None] | None = None,
+) -> dict[str, object]:
     try:
         observed = path.lstat()
     except FileNotFoundError:
@@ -485,15 +544,23 @@ def _snapshot(path: Path) -> dict[str, object]:
     if stat.S_ISDIR(observed.st_mode):
         snapshot["device"] = observed.st_dev
         snapshot["inode"] = observed.st_ino
-        snapshot["children"] = _directory_inventory(path)
+        # Only the digest and count enter the state (and thus every receipt
+        # checkpoint); the full list is bound to the receipt as a side file
+        # when this state becomes rollback authority.
+        rows = tuple(_directory_inventory(path))
+        digest = _directory_inventory_sha256(rows)
+        snapshot["children_count"] = len(rows)
+        snapshot["children_sha256"] = digest
+        if inventory_sink is not None:
+            inventory_sink(digest, rows)
         try:
             snapshot["is_mountpoint"] = path.is_mount()
         except OSError as exc:
             raise InstallDriftError(
                 f"cannot determine managed directory mount status {path}: {exc}"
             ) from exc
-    if stat.S_ISREG(observed.st_mode):
-        content = path.read_bytes()
+    if stat.S_ISREG(observed.st_mode) and capture_content:
+        content = _read_prior_file(path, observed)
         snapshot["content_base64"] = base64.b64encode(content).decode("ascii")
         snapshot["installed_sha256"] = hashlib.sha256(content).hexdigest()
     return snapshot
@@ -1693,9 +1760,63 @@ def _replacement_staging_matches(
 class LocalInstallBackend:
     """Real Linux implementation; construction itself enforces the root boundary."""
 
+    # Recent directory inventories by digest, so binding a just-inspected
+    # prior does not walk a large tree again.  Deliberately tiny: a single
+    # large state tree can hold hundreds of thousands of rows.
+    _INVENTORY_CACHE_LIMIT = 2
+
     def __init__(self, *, require_root: bool = True) -> None:
         if require_root and os.geteuid() != 0:
             raise PermissionError("trust-root apply/activate/verify/rollback requires root")
+
+    def _remember_inventory(self, digest: str, rows: tuple[str, ...]) -> None:
+        cache = self.__dict__.setdefault("_inventory_cache", {})
+        cache.pop(digest, None)
+        cache[digest] = rows
+        while len(cache) > self._INVENTORY_CACHE_LIMIT:
+            cache.pop(next(iter(cache)))
+
+    def bind_rollback_inventory(
+        self,
+        receipt: InstallReceipt,
+        step: Mapping[str, object],
+        state: Mapping[str, object],
+    ) -> None:
+        """Bind the descendant list behind a directory prior's digest.
+
+        Called by the transaction before the prepared entry holding ``state``
+        is persisted.  The rows must hash to the recorded digest; a tree that
+        changed since inspection is drift, never a silently rebased baseline.
+        """
+
+        if "children_sha256" not in state and "children_count" not in state:
+            return
+        digest = state.get("children_sha256")
+        count = state.get("children_count")
+        if (
+            not isinstance(digest, str)
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+        ):
+            raise InstallDriftError(
+                f"directory prior has an invalid inventory binding: {step.get('step_id')}"
+            )
+        if count == 0:
+            # An empty baseline is fully determined by its digest.
+            return
+        rows = self.__dict__.get("_inventory_cache", {}).get(digest)
+        if rows is None:
+            rows = tuple(_directory_inventory(Path(str(step.get("path", "")))))
+        if len(rows) != count or _directory_inventory_sha256(rows) != digest:
+            raise InstallDriftError(
+                "managed directory changed before its rollback inventory was "
+                f"bound: {step.get('step_id')}"
+            )
+        if receipt.bind_directory_inventory(rows) != digest:
+            raise InstallDriftError(
+                f"rollback inventory binding digest mismatch: {step.get('step_id')}"
+            )
 
     def preflight_facts(self, plan: Mapping[str, object]) -> Mapping[str, object]:
         roots = plan.get("roots", {})
@@ -1791,14 +1912,18 @@ class LocalInstallBackend:
                 continue
             path = Path(str(step["path"]))
             try:
-                mode = path.lstat().st_mode
+                observed = path.lstat()
             except FileNotFoundError:
                 paths[str(path)] = {"exists": False, "is_symlink": False}
             else:
                 paths[str(path)] = {
                     "exists": True,
-                    "is_symlink": stat.S_ISLNK(mode),
+                    "is_symlink": stat.S_ISLNK(observed.st_mode),
                 }
+                if stat.S_ISREG(observed.st_mode):
+                    # Lets preflight refuse an oversized prior file up front
+                    # instead of the snapshot failing mid-transaction.
+                    paths[str(path)]["size"] = observed.st_size
         try:
             disk_free = shutil.disk_usage(deploy.parent).free
         except OSError:
@@ -1857,7 +1982,7 @@ class LocalInstallBackend:
         if step.get("asset_type") == "symlink":
             return _symlink_state(step)
         path = Path(str(step.get("path")))
-        observed = _snapshot(path)
+        observed = _snapshot(path, inventory_sink=self._remember_inventory)
         if not observed.get("exists"):
             return observed
         if step.get("asset_type") == "directory":
@@ -3130,14 +3255,40 @@ class LocalInstallBackend:
                                 retained.append(str(candidate))
                         continue
                     baseline = prior.get("children")
-                    if not isinstance(baseline, list) or not all(
+                    if isinstance(baseline, list) and all(
                         isinstance(row, str) for row in baseline
                     ):
+                        # Legacy receipt with the inventory embedded inline.
+                        baseline_rows = set(baseline)
+                        current = set(_directory_inventory(path))
+                    elif "children_sha256" in prior or "children_count" in prior:
+                        current_rows = tuple(_directory_inventory(path))
+                        if len(current_rows) == prior.get(
+                            "children_count"
+                        ) and _directory_inventory_sha256(current_rows) == prior.get(
+                            "children_sha256"
+                        ):
+                            # Byte-identical to the receipt-bound baseline.
+                            continue
+                        try:
+                            baseline_rows = set(
+                                receipt.directory_inventory(
+                                    prior.get("children_sha256"),
+                                    prior.get("children_count"),
+                                )
+                            )
+                        except InstallError:
+                            # Fail closed: without a trusted baseline nothing
+                            # below this directory can be classified, so the
+                            # whole directory is retained and rollback blocks.
+                            retained.append(str(path))
+                            continue
+                        current = set(current_rows)
+                    else:
                         if path.is_dir() and any(path.iterdir()):
                             retained.append(str(path))
                         continue
-                    current = set(_directory_inventory(path))
-                    for relative in sorted(current - set(baseline)):
+                    for relative in sorted(current - baseline_rows):
                         candidate = path / relative
                         if is_managed_inventory_path(candidate, path):
                             continue
@@ -3406,6 +3557,11 @@ class LocalInstallBackend:
     def stop_service(self, name: str) -> None:
         _run(("systemctl", "stop", name), check=True)
 
+    def reload_systemd_units(self) -> None:
+        """Make systemd re-read unit files that rollback restored or removed."""
+
+        _run(("systemctl", "daemon-reload"), check=True)
+
     def installed_inventory(self, plan: Mapping[str, object]) -> dict[str, dict[str, dict[str, str]]]:
         generated = plan.get("generated", {})
         installed: dict[str, dict[str, dict[str, str]]] = {}
@@ -3419,7 +3575,9 @@ class LocalInstallBackend:
                 if not isinstance(expected, Mapping):
                     continue
                 path = Path(str(expected.get("path", "")))
-                snapshot = _snapshot(path)
+                # Attestation reads the content itself below; the snapshot only
+                # supplies ownership metadata, so it must not embed the bytes.
+                snapshot = _snapshot(path, capture_content=False)
                 content = ""
                 if snapshot.get("exists") and path.is_file():
                     # Path.read_text() enables universal-newline translation and
