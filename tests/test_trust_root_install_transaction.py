@@ -1618,6 +1618,61 @@ def test_apply_time_symlink_drift_fails_before_any_mutation(tmp_path: Path) -> N
     assert backend.applied == []
 
 
+def test_preflight_names_every_symlinked_apply_path_with_the_reason(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    backend = RecordingBackend(plan)
+    paths = [step["path"] for step in plan["apply_order"]]
+    for path in paths:
+        backend.facts["paths"][path] = {"exists": True, "is_symlink": True}
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(UnsafeInstallPathError, match="symlink") as caught:
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    message = str(caught.value)
+    assert all(path in message for path in paths)
+    assert "must not be a symlink" in message
+    assert backend.applied == []
+    assert receipt.to_dict()["journal"] == []
+
+
+def test_oversized_prior_asset_file_fails_preflight_before_any_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    backend = RecordingBackend(plan)
+    unit_path = plan["apply_order"][1]["path"]
+    backend.facts["paths"][unit_path] = {
+        "exists": True,
+        "is_symlink": False,
+        "size": 300 * 1024 * 1024,
+    }
+    receipt = new_install_receipt(plan)
+
+    report = validate_preflight(plan, backend.preflight_facts(plan))
+    with pytest.raises(InstallError, match="preflight failed") as caught:
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert [row["code"] for row in report.failures] == ["asset_prior_too_large"]
+    assert unit_path in report.failures[0]["detail"]
+    assert str(300 * 1024 * 1024) in report.failures[0]["detail"]
+    assert unit_path in str(caught.value)
+    assert backend.applied == []
+    assert receipt.to_dict()["journal"] == []
+
+
 def test_apply_requires_the_exact_canonical_plan_hash(tmp_path: Path) -> None:
     plan = _plan(tmp_path)
     backend = RecordingBackend(plan)
@@ -2495,3 +2550,307 @@ def test_receipt_load_fails_closed_when_leaf_is_replaced_after_fd_read(
         InstallReceipt.load(path)
 
     assert swapped
+
+
+def test_empty_managed_mount_adoption_accepts_digest_bound_inventory(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    step = plan["apply_order"][0]
+    step.update(
+        {
+            "asset_type": "directory",
+            "adoption_policy": "empty-managed-root-mount",
+            "durable": True,
+        }
+    )
+    plan["roots"]["state"] = step["path"]
+    plan["apply_order"] = [step]
+    receipt_path = Path(str(step["path"])) / "install-receipts/install.json"
+    plan["receipt_path"] = str(receipt_path)
+    receipt = InstallReceipt(new_install_receipt(plan).to_dict(), path=receipt_path)
+    bootstrap = ["install-receipts", "install-receipts/install.json"]
+
+    def installed(rows: list[str]) -> dict[str, object]:
+        return {
+            "is_mountpoint": True,
+            "device": 8,
+            "inode": 42,
+            "children_count": len(rows),
+            "children_sha256": install_core._directory_inventory_sha256(rows),
+        }
+
+    for rows, expected in (
+        ([], True),
+        (bootstrap, True),
+        (["foreign-state"], False),
+        ([*bootstrap, "foreign-state"], False),
+    ):
+        assert (
+            install_core._explicit_empty_managed_mount_is_adoptable(
+                plan=plan,
+                step=step,
+                installed=installed(rows),
+                receipt=receipt,
+            )
+            is expected
+        )
+
+
+def test_apply_binds_directory_inventory_before_the_prepared_entry_is_durable(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    receipt = new_install_receipt(plan)
+
+    class InventoryBindingBackend(RecordingBackend):
+        def __init__(self, plan: dict[str, object]) -> None:
+            super().__init__(plan)
+            self.bound: list[tuple[str, dict[str, object], list[str]]] = []
+
+        def bind_rollback_inventory(self, bound_receipt, step, state) -> None:
+            assert bound_receipt is receipt
+            self.bound.append(
+                (
+                    step["step_id"],
+                    dict(state),
+                    [row["step_id"] for row in receipt.to_dict()["journal"]],
+                )
+            )
+
+    backend = InventoryBindingBackend(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    # Each prior is bound while its entry is not yet in the durable journal.
+    assert backend.bound == [
+        ("state-root", {"exists": False}, []),
+        ("manager-unit", {"exists": False}, ["state-root"]),
+    ]
+
+
+def test_apply_refuses_receipt_inside_a_managed_directory_before_mutation(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    state_root = plan["apply_order"][0]
+    state_root["asset_type"] = "directory"
+    receipt_path = Path(str(state_root["path"])) / "receipts/install.json"
+    receipt = InstallReceipt(new_install_receipt(plan).to_dict(), path=receipt_path)
+
+    class InventoryBindingBackend(RecordingBackend):
+        def bind_rollback_inventory(self, *_args) -> None:
+            raise AssertionError("the layout must be refused before any binding")
+
+    backend = InventoryBindingBackend(plan)
+
+    with pytest.raises(InstallPlanError, match="inside managed directory") as caught:
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert str(receipt_path) in str(caught.value)
+    assert backend.applied == []
+    assert receipt.to_dict()["journal"] == []
+
+
+def test_directory_inventory_binding_rejects_mismatched_rows() -> None:
+    receipt = InstallReceipt({"journal": []})
+    digest = receipt.bind_directory_inventory(["a", "a/b"])
+
+    assert receipt.directory_inventory(digest, 2) == ("a", "a/b")
+    assert receipt.directory_inventory(
+        install_core._directory_inventory_sha256([]), 0
+    ) == ()
+    with pytest.raises(InstallDriftError):
+        receipt.directory_inventory(digest, 3)
+    with pytest.raises(InstallDriftError):
+        receipt.directory_inventory("0" * 64, 2)
+    with pytest.raises(InstallDriftError):
+        receipt.bind_directory_inventory(["b", "a"])
+
+
+class SystemdReloadBackend(RecordingBackend):
+    """Record rollback mutations and the single post-rollback unit reload."""
+
+    def __init__(self, plan: dict[str, object]) -> None:
+        super().__init__(plan)
+        self.events: list[str] = []
+        self.reload_failures = 0
+        self.crash_on_rollback: str | None = None
+
+    def rollback_step(self, entry) -> None:
+        if self.crash_on_rollback == entry["step_id"]:
+            self.crash_on_rollback = None
+            raise SystemExit(f"simulated crash while rolling back {entry['step_id']}")
+        self.events.append(f"rollback:{entry['step_id']}")
+        super().rollback_step(entry)
+
+    def reload_systemd_units(self) -> None:
+        self.events.append("systemctl:daemon-reload")
+        if self.reload_failures:
+            self.reload_failures -= 1
+            raise RuntimeError("injected daemon-reload failure")
+
+
+def _unit_plan(tmp_path: Path) -> dict[str, object]:
+    plan = _plan(tmp_path)
+    systemd = Path(plan["roots"]["systemd"])
+    unit = plan["apply_order"][1]
+    unit["path"] = str(systemd / "cortex-manager.service")
+    drop_in_dir = _step(tmp_path, "manager-drop-in-dir", "3" * 64)
+    drop_in_dir.update(
+        {
+            "asset_type": "directory",
+            "path": str(systemd / "cortex-manager.service.d"),
+        }
+    )
+    drop_in = _step(tmp_path, "manager-drop-in", "4" * 64)
+    drop_in["path"] = str(systemd / "cortex-manager.service.d/override.conf")
+    plan["apply_order"].extend([drop_in_dir, drop_in])
+    return plan
+
+
+def test_rollback_reloads_systemd_once_after_restoring_unit_files(
+    tmp_path: Path,
+) -> None:
+    plan = _unit_plan(tmp_path)
+    backend = SystemdReloadBackend(plan)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert backend.events == [
+        "rollback:manager-drop-in",
+        "rollback:manager-drop-in-dir",
+        "rollback:manager-unit",
+        "rollback:state-root",
+        "systemctl:daemon-reload",
+    ]
+    assert report.retained_drift == ()
+    assert report.systemd_daemon_reload == "completed"
+    document = receipt.to_dict()
+    assert document["state"] == "rolled-back"
+    assert document["rollback"]["systemd_daemon_reload"] == "completed"
+    assert "systemd_reload_pending" not in document
+
+
+def test_rollback_without_unit_changes_does_not_reload_systemd(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    backend = SystemdReloadBackend(plan)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert "systemctl:daemon-reload" not in backend.events
+    assert report.systemd_daemon_reload == "not-required"
+    assert receipt.to_dict()["rollback"]["systemd_daemon_reload"] == "not-required"
+
+
+def test_failed_systemd_reload_blocks_rollback_and_is_retried(
+    tmp_path: Path,
+) -> None:
+    plan = _unit_plan(tmp_path)
+    backend = SystemdReloadBackend(plan)
+    backend.reload_failures = 1
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert report.systemd_daemon_reload == "failed"
+    assert report.retained_drift == (
+        {
+            "step_id": "systemd:daemon-reload",
+            "observed": {"error": "injected daemon-reload failure"},
+        },
+    )
+    document = receipt.to_dict()
+    assert document["state"] == "rollback-blocked"
+    assert document["systemd_reload_pending"] is True
+
+    retried = rollback_receipt(receipt, backend=backend)
+
+    assert backend.events.count("systemctl:daemon-reload") == 2
+    assert retried.retained_drift == ()
+    assert retried.systemd_daemon_reload == "completed"
+    assert receipt.to_dict()["state"] == "rolled-back"
+    assert "systemd_reload_pending" not in receipt.to_dict()
+
+
+def test_interrupted_rollback_still_reloads_units_restored_before_the_crash(
+    tmp_path: Path,
+) -> None:
+    plan = _unit_plan(tmp_path)
+    backend = SystemdReloadBackend(plan)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    backend.crash_on_rollback = "state-root"
+
+    with pytest.raises(SystemExit, match="state-root"):
+        rollback_receipt(receipt, backend=backend)
+
+    # Both unit entries were restored and forgotten before the crash; only the
+    # durable pending marker can still demand the reload on resume.
+    assert [row["step_id"] for row in receipt.to_dict()["journal"]] == ["state-root"]
+    assert receipt.to_dict()["systemd_reload_pending"] is True
+    assert "systemctl:daemon-reload" not in backend.events
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert backend.events[-2:] == ["rollback:state-root", "systemctl:daemon-reload"]
+    assert report.systemd_daemon_reload == "completed"
+    assert receipt.to_dict()["state"] == "rolled-back"
+
+
+def test_rollback_without_reload_capability_is_blocked_after_unit_restore(
+    tmp_path: Path,
+) -> None:
+    plan = _unit_plan(tmp_path)
+    backend = RecordingBackend(plan)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert report.systemd_daemon_reload == "failed"
+    assert [row["step_id"] for row in report.retained_drift] == [
+        "systemd:daemon-reload"
+    ]
+    assert receipt.to_dict()["state"] == "rollback-blocked"
