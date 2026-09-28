@@ -154,6 +154,58 @@ def _parse_now(now: object | None) -> datetime:
     return _timestamp(now, "now")
 
 
+# #1097：clock rollback watermark 只靠 qualification 自己稀疏的查詢／寫入落盤——
+# 如果第一次查詢就發生在時鐘回撥之後（回撥前完全沒有任何 qualification 觀測），
+# watermark 無從得知真實時間已越過 expires_at。這裡補上第二層、來自其他 Manager
+# 落盤狀態的時鐘證據，取其最新落盤時間作為 now 的下界（只會墊高、不會壓低）。
+#
+# 選源依據（呼應 issue #1097「可能方向」與 trust_root/registry.py 的資產登記，
+# 「選最少且足夠」）：
+#   1. jobs-registry（``<coordinator_root>/jobs.json``）：Job/Slice/workflow-run
+#      registry，幾乎每次派工或狀態轉移都會整份重寫，是全庫寫入頻率最高的
+#      Manager 落盤狀態，最可能在「真實過期後、真正回撥前」這段窗口留下佐證。
+#      Trust Root Tier-0 MANAGER_OWNED（見 registry.py 的 "jobs-registry" 資產）。
+#   2. quota-admission-decisions（``quota_admission_decisions_root()/decisions.jsonl``）：
+#      #839 append-only 准入決策 receipt，writer 僅 Principal.MANAGER（比 1. 更
+#      嚴格的單一寫入者），quota-aware admission 開啟時可互相佐證，取兩者最大值。
+# 兩者都只做單一 ``os.stat`` 取 mtime（不開檔、不解析內容），成本與檔案大小無
+# 關。刻意不選 commit-spool／review-verdict-spool／gate-ledger-spool 等
+# job-visible spool：writer 不限 Manager，且是逐 job 子目錄（子目錄數隨 job
+# 量增長），單一檔案 mtime 的訊號既乾淨又便宜，這兩個 job-visible spool 不會
+# 讓判定更可信，只會讓成本隨 job 數成長。
+_CLOCK_EVIDENCE_FILES: tuple[tuple[str, Callable[[], Path]], ...] = (
+    ("jobs-registry", lambda: config_paths.coordinator_root() / "jobs.json"),
+    (
+        "quota-admission-decisions",
+        lambda: config_paths.quota_admission_decisions_root() / "decisions.jsonl",
+    ),
+)
+
+
+def _clock_evidence_floor() -> tuple[datetime | None, bool]:
+    """回傳其他 durable 來源觀測到的最新落盤時間上界，與是否至少一個來源可讀。
+
+    只做 bounded ``os.stat``（見上方常數說明的選源依據），任何來源不存在、不可
+    讀、權限不符、或不是一般檔案都視為「這個來源沒有證據」而跳過；絕不因此讓
+    查詢丟例外（讀取失敗 → 視為無證據，不放寬也不壓低既有 watermark 判定）。
+    """
+    latest: datetime | None = None
+    any_readable = False
+    for _asset_id, path_fn in _CLOCK_EVIDENCE_FILES:
+        try:
+            path = path_fn()
+            info = os.stat(path, follow_symlinks=False)
+        except (OSError, TypeError, ValueError):
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        any_readable = True
+        observed = datetime.fromtimestamp(info.st_mtime, tz=timezone.utc)
+        if latest is None or observed > latest:
+            latest = observed
+    return latest, any_readable
+
+
 def _binding_key(executor: str, model_id: str, profile_key: str, role: str) -> str:
     return "qbind:v1:" + hashlib.sha256(
         _canonical_bytes([executor, model_id, profile_key, role])
@@ -2171,9 +2223,25 @@ class QualificationStore:
         expires = _timestamp(receipt.get("expires_at"), "receipt expires_at")
         if now < reviewed:
             return {"state": "unknown", "reason": "review-time-in-future"}
-        watermarks[binding_id] = _timestamp_text(now)
-        if now >= expires:
-            return {"state": "expired", "reason": "receipt-expired", "generation": binding.get("generation")}
+
+        # #1097：用其他 durable 來源的最新落盤時間墊高 now 的下界（絕不壓低），
+        # 這樣即使呼叫端傳入的 now 本身就是回撥後、尚未越過 expires_at 的時鐘，
+        # 只要其他 Manager 落盤狀態已經證明真實時間晚於 expires_at，這裡仍會
+        # fail-closed。完全沒有可用證據時 effective_now 就是原本的 now，行為
+        # 與 #1097 之前完全一致，只多帶一個可機讀的 clock_evidence 診斷欄位。
+        evidence_floor, evidence_available = _clock_evidence_floor()
+        effective_now = now if evidence_floor is None or evidence_floor <= now else evidence_floor
+        clock_evidence = "clock-evidence-checked" if evidence_available else "clock-evidence-unavailable"
+
+        watermarks[binding_id] = _timestamp_text(effective_now)
+        if effective_now >= expires:
+            reason = "receipt-expired" if now >= expires else "clock-evidence-expired"
+            return {
+                "state": "expired",
+                "reason": reason,
+                "generation": binding.get("generation"),
+                "clock_evidence": clock_evidence,
+            }
 
         entries = roster.get("entries")
         projected = next(
@@ -2222,6 +2290,7 @@ class QualificationStore:
             "generation": binding["generation"],
             "expires_at": receipt["expires_at"],
             "test_only": receipt["test_only"],
+            "clock_evidence": clock_evidence,
         }
 
     def qualification_status(
