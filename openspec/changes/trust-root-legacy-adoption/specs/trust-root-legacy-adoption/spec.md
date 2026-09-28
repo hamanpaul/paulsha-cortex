@@ -65,7 +65,7 @@ With `--legacy-inventory`, planning MUST verify the inventory schema, self diges
 
 ### Requirement: legacy-quarantine steps MUST move, never delete or overwrite
 
-A `legacy-quarantine` step MUST verify the source against the inventoried type, owner, mode, device, inode and content or tree digest, create the destination parent chain as root-only, require the destination to be on the same filesystem, and move the source with `renameat2(RENAME_NOREPLACE)`. A cross-filesystem move MUST fail closed without a copy fallback. An existing destination MUST fail closed. Replay after interruption MUST complete the step only when the source is gone and the destination inode equals the recorded prior inode.
+A `legacy-quarantine` step MUST verify the source against the inventoried type, owner, mode, device and inode, plus the content digest for a regular file and the link target for a symlink. Directory contents are not bound: quarantined content is never adopted or trusted, and rollback proves identity by device and inode. The step MUST then create the destination parent chain as root-only, require the destination to be on the same filesystem, and move the source with `renameat2(RENAME_NOREPLACE)`. A cross-filesystem move MUST fail closed without a copy fallback. An existing destination MUST fail closed. Replay after interruption MUST complete the step only when the source is gone and the destination inode equals the recorded prior inode.
 
 #### Scenario: destination already exists
 

@@ -68,7 +68,7 @@ root 擷取 inventory（唯讀，service 可繼續運轉）並以 no-overwrite �
 
 ### D4 `legacy-quarantine` step
 
-`{step_id: "legacy-quarantine:<path>", kind: "legacy-quarantine", path, destination, expected: {type, uid, gid, mode, dev, ino, sha256|tree_sha256|link_target}, row_sha256, operations: ["snapshot","rename-noreplace"], rollback_policy: "restore"}`。destination 為 `<quarantine_root>/<inventory_sha 前 16 碼>/root/<原絕對路徑>`。quarantine step 排在同路徑或其下任何 step 之前、在其父目錄受管 step 之後。拓撲驗證與 apply plan schema 驗證要認得此 kind；destination 父目錄鏈由 step 自行建立（root 0700），不列為受管路徑。
+`{step_id: "legacy-quarantine:<path>", kind: "legacy-quarantine", path, destination, expected: {type, uid, gid, mode, dev, ino, sha256|link_target}, row_sha256, operations: ["snapshot","rename-noreplace"], rollback_policy: "restore"}`。一般檔綁定 `sha256`、symlink 綁定 `link_target`；目錄只綁定身分（type／owner／mode／dev／ino），不綁定樹內容——被 quarantine 的內容從不被接手或採信，接手後一律重建，rollback 以 dev／ino 證明搬回的是同一個物件；對數十萬子孫的 worktree pool 計算樹 digest 既不可行也無法在服務運轉時穩定。destination 為 `<quarantine_root>/<inventory_sha 前 16 碼>/root/<原絕對路徑>`。quarantine step 排在同路徑或其下任何 step 之前、在其父目錄受管 step 之後。拓撲驗證與 apply plan schema 驗證要認得此 kind；destination 父目錄鏈由 step 自行建立（root 0700），不列為受管路徑。
 
 **替代方案**：copy 後刪除。否決：跨檔案系統複製 21 GB 不可行，且刪除違反「不刪除 legacy 物件」原則。rename 要求同檔案系統；參考主機的 `/`、`/opt`、`/etc`、`/var/lib` 同在一個 ext4。
 
