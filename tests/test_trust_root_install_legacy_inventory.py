@@ -247,7 +247,7 @@ def _legacy_overlay(tmp_path: Path) -> dict:
             "cortex-egress": {
                 "uid": 993,
                 "gid": 983,
-                "home": str(tmp_path / "host/home/cortex-egress"),
+                "home": str(tmp_path / "host/srv/cortex-egress"),
             }
         },
         "operator_account": "legacy-operator",
@@ -538,7 +538,7 @@ def test_host_overlay_merges_only_allowlisted_fields(tmp_path: Path) -> None:
     assert effective["service_accounts"]["cortex-egress"] == {
         "uid": 993,
         "gid": 983,
-        "home": str(tmp_path / "host/home/cortex-egress"),
+        "home": str(tmp_path / "host/srv/cortex-egress"),
         "shell": "/usr/sbin/nologin",
     }
     assert effective["operator_account"] == "legacy-operator"
@@ -1524,7 +1524,7 @@ def test_legacy_show_rejects_a_tampered_inventory(
         "host/etc/systemd/system/inventory.json",
         "host/etc/polkit-1/rules.d/inventory.json",
         "host/var/lib/cortex-builder/inventory.json",
-        "host/home/cortex-egress/inventory.json",
+        "host/srv/cortex-egress/inventory.json",
     ],
 )
 def test_legacy_inventory_cli_refuses_an_output_inside_the_inventoried_scope(
