@@ -37,13 +37,16 @@ inode identity only; their contents are never opened.  Regular files above
 """
 from __future__ import annotations
 
+import ctypes
 import errno
 import fnmatch
+import functools
 import grp
 import hashlib
 import importlib.metadata
 import json
 import os
+import platform
 import posixpath
 import pwd
 import re
@@ -54,7 +57,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Iterator, Mapping, Protocol, Sequence
+from typing import Callable, Iterator, Mapping, Protocol, Sequence
 
 from .backend import (
     _durable_in_flight_job_count,
@@ -186,6 +189,37 @@ _FILE_TYPES = (
 _KNOWN_FILE_TYPES = frozenset(name for _test, name in _FILE_TYPES) | {"unknown"}
 _CAPTURE_ATTEMPTS = 3
 _VANISHED_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+
+#: Where the design publishes inventories: installer-owned, outside every root
+#: and managed path the inventory records.
+INSTALLER_LEGACY_DIRECTORY = "/var/lib/cortex-installer/legacy/"
+
+_AT_SYMLINK_NOFOLLOW = 0x100
+#: ``faccessat2`` joined the unified syscall table in Linux 5.8.
+_FACCESSAT2_SYSCALL = {
+    "x86_64": 439,
+    "aarch64": 439,
+    "arm64": 439,
+    "armv7l": 439,
+    "armv8l": 439,
+    "i386": 439,
+    "i686": 439,
+    "riscv64": 439,
+    "s390x": 439,
+    "ppc64le": 439,
+    "loongarch64": 439,
+}
+_NOFOLLOW_ACCESS_UNSUPPORTED = frozenset(
+    {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
+)
+_CENSUS_EXIT_UNSUPPORTED = 5
+_CENSUS_EXIT_IDENTITY = 4
+_PATH_DIRECTORY_FLAGS = (
+    getattr(os, "O_PATH", os.O_RDONLY)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 
 
 class InventoryRaceError(InstallError):
@@ -734,6 +768,55 @@ class CensusIdentity:
         return {"uid": self.uid, "gid": self.gid, "groups": list(self.groups)}
 
 
+@dataclass(frozen=True)
+class CensusRoot:
+    """A census root and the identity of the directory it is reached from."""
+
+    path: str
+    dev: int
+    ino: int
+    is_dir: bool
+    parent: str
+    parent_dev: int
+    parent_ino: int
+
+
+@dataclass
+class CensusTree:
+    """Root-enumerated census input: every non-symlink object with its inode.
+
+    ``entries`` maps a directory to its non-symlink children
+    ``(name, dev, ino, is_dir)``.  The census re-walks this tree as the job
+    account, entry by entry relative to a verified directory descriptor.
+    """
+
+    roots: list[CensusRoot]
+    entries: dict[str, list[tuple[str, int, int, bool]]]
+    count: int = 0
+
+    def paths(self) -> Iterator[str]:
+        for root in self.roots:
+            yield root.path
+            if not root.is_dir:
+                continue
+            stack = [root.path]
+            while stack:
+                directory = stack.pop()
+                for name, _dev, _ino, is_dir in self.entries.get(directory, ()):
+                    child = _join(directory, name)
+                    yield child
+                    if is_dir:
+                        stack.append(child)
+
+
+@dataclass(frozen=True)
+class CensusResult:
+    """Paths the identity may write, and paths that changed under the census."""
+
+    writable: tuple[str, ...]
+    unstable: tuple[str, ...]
+
+
 class LegacyHostBackend(Protocol):
     """Read-only host observations; a fake replaces it in tests."""
 
@@ -753,8 +836,8 @@ class LegacyHostBackend(Protocol):
     def service_status(self, unit: str) -> Mapping[str, object]: ...
     def in_flight(self, job_uids: Mapping[str, int], plan: Mapping[str, object]) -> Mapping[str, object]: ...
     def writable_paths(
-        self, identity: CensusIdentity, paths: Sequence[str]
-    ) -> Sequence[str]: ...
+        self, identity: CensusIdentity, tree: CensusTree
+    ) -> CensusResult: ...
 
 
 _READ_FLAGS = (
@@ -981,18 +1064,21 @@ class LocalLegacyHostBackend:
             durable = None
         return {"job_processes": processes, "durable_jobs": durable}
 
-    def writable_paths(
-        self, identity: CensusIdentity, paths: Sequence[str]
-    ) -> Sequence[str]:
-        """Let the kernel decide, as ``identity``, which of ``paths`` it may write.
+    def writable_paths(self, identity: CensusIdentity, tree: CensusTree) -> CensusResult:
+        """Let the kernel decide, as ``identity``, which tree entries it may write.
 
         A forked child drops to the exact account identity (supplementary
-        groups, then gid, then uid) and calls ``access(W_OK)`` per path, so
-        ACLs, masks and traversal are evaluated by the kernel rather than by
-        re-implementing permission logic.  The child never execs: changing
-        credentials clears its dumpable flag, so the job account cannot ptrace
-        the census and forge its answer.  Without root only the caller's own
-        identity can be checked.
+        groups, then gid, then uid) and re-walks the root-enumerated tree: each
+        directory is reached with ``openat(O_PATH|O_NOFOLLOW)`` relative to its
+        already verified parent and must still be the enumerated inode, so the
+        kernel checks traversal as the job account and no symlink is ever
+        followed.  Each entry is judged with ``faccessat2(AT_SYMLINK_NOFOLLOW)``
+        on that directory descriptor, bracketed by two no-follow ``fstatat``
+        calls; an entry that became a symlink or changed inode at any point is
+        reported unstable instead of being skipped.  The child never execs:
+        changing credentials clears its dumpable flag, so the job account
+        cannot ptrace the census and forge its answer.  Without root only the
+        caller's own identity can be checked.
         """
 
         drop = os.geteuid() == 0
@@ -1014,21 +1100,11 @@ class LocalLegacyHostBackend:
                     if os.getresuid() != (identity.uid,) * 3 or os.getresgid() != (
                         identity.gid,
                     ) * 3:
-                        os._exit(4)
-                buffer = bytearray()
-                for path in paths:
-                    try:
-                        writable = os.access(path, os.W_OK)
-                    except (OSError, ValueError):
-                        continue
-                    if writable:
-                        buffer += os.fsencode(path) + b"\0"
-                        if len(buffer) >= 1 << 16:
-                            _write_all(write_fd, bytes(buffer))
-                            buffer.clear()
-                if buffer:
-                    _write_all(write_fd, bytes(buffer))
+                        os._exit(_CENSUS_EXIT_IDENTITY)
+                _census_as_current_identity(tree, write_fd)
                 status = 0
+            except _NoFollowAccessUnsupported:
+                status = _CENSUS_EXIT_UNSUPPORTED
             except BaseException:
                 status = 2
             finally:
@@ -1044,9 +1120,233 @@ class LocalLegacyHostBackend:
         finally:
             os.close(read_fd)
             _pid, wait_status = os.waitpid(pid, 0)
-        if os.waitstatus_to_exitcode(wait_status) != 0:
+        code = os.waitstatus_to_exitcode(wait_status)
+        if code == _CENSUS_EXIT_UNSUPPORTED:
+            raise InstallError(
+                "the writable census needs faccessat2 with AT_SYMLINK_NOFOLLOW "
+                "(Linux 5.8+); this kernel cannot judge an entry without following "
+                "a symlink or ignoring its ACL, so the census refuses to run"
+            )
+        if code != 0:
             raise InstallError(f"writable census as uid {identity.uid} did not complete")
-        return [os.fsdecode(item) for item in b"".join(chunks).split(b"\0") if item]
+        writable: list[str] = []
+        unstable: list[str] = []
+        for record in b"".join(chunks).split(b"\0"):
+            if not record:
+                continue
+            (writable if record[:1] == b"W" else unstable).append(os.fsdecode(record[1:]))
+        return CensusResult(writable=tuple(writable), unstable=tuple(unstable))
+
+
+class _NoFollowAccessUnsupported(Exception):
+    """faccessat2 cannot evaluate an entry without following a symlink."""
+
+
+@functools.lru_cache(maxsize=1)
+def _libc_syscall():  # type: ignore[no-untyped-def]
+    function = ctypes.CDLL(None, use_errno=True).syscall
+    function.restype = ctypes.c_long
+    return function
+
+
+def _faccessat2(dir_fd: int, name: str, mode: int) -> None:
+    """``faccessat2(dir_fd, name, mode, AT_SYMLINK_NOFOLLOW)`` straight to the kernel.
+
+    Deliberately not ``os.access(..., follow_symlinks=False)``: on a kernel
+    without faccessat2, glibc emulates the flag from mode bits and silently
+    ignores ACLs.  The raw syscall either answers with the kernel's full
+    permission check or fails (ENOSYS / EINVAL), which the census treats as
+    unsupported instead of falling back to a symlink-following check.
+    """
+
+    number = _FACCESSAT2_SYSCALL.get(platform.machine())
+    if number is None:
+        raise OSError(errno.ENOSYS, "faccessat2 is not known for this architecture", name)
+    result = _libc_syscall()(
+        ctypes.c_long(number),
+        ctypes.c_long(dir_fd),
+        ctypes.c_char_p(os.fsencode(name)),
+        ctypes.c_long(mode),
+        ctypes.c_long(_AT_SYMLINK_NOFOLLOW),
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+
+
+_WRITABLE, _READONLY, _UNSTABLE, _UNREACHABLE = "writable", "readonly", "unstable", "unreachable"
+
+
+def _census_check(directory_fd: int, name: str, device: int, inode: int) -> str:
+    """Judge one entry relative to a verified directory descriptor, no-follow."""
+
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except PermissionError:
+        return _UNREACHABLE  # no search permission on the directory itself
+    except OSError as exc:
+        if _is_vanished(exc):
+            return _UNSTABLE
+        raise
+    if stat.S_ISLNK(before.st_mode) or (before.st_dev, before.st_ino) != (device, inode):
+        return _UNSTABLE
+    try:
+        _faccessat2(directory_fd, name, os.W_OK)
+        writable = True
+    except OSError as exc:
+        if exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}:
+            writable = False
+        elif exc.errno == errno.ETXTBSY:
+            writable = True  # write permission exists; the file is merely running
+        elif _is_vanished(exc):
+            return _UNSTABLE
+        elif exc.errno in _NOFOLLOW_ACCESS_UNSUPPORTED:
+            raise _NoFollowAccessUnsupported(exc.errno) from exc
+        else:
+            raise
+    try:
+        after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        if _is_vanished(exc):
+            return _UNSTABLE
+        raise
+    if stat.S_ISLNK(after.st_mode) or (after.st_dev, after.st_ino) != (
+        before.st_dev,
+        before.st_ino,
+    ):
+        return _UNSTABLE
+    return _WRITABLE if writable else _READONLY
+
+
+def _open_path_chain(path: str) -> int:
+    """Open ``path`` as ``O_PATH`` one no-follow component at a time."""
+
+    descriptor = os.open("/", _PATH_DIRECTORY_FLAGS)
+    try:
+        for component in PurePosixPath(path).parts[1:]:
+            following = os.open(component, _PATH_DIRECTORY_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = following
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _census_as_current_identity(tree: CensusTree, out_fd: int) -> None:
+    """Census body run in the forked child after it assumed the job identity."""
+
+    buffer = bytearray()
+
+    def emit(tag: bytes, path: str) -> None:
+        buffer.extend(tag + os.fsencode(path) + b"\0")
+        if len(buffer) >= 1 << 16:
+            _write_all(out_fd, bytes(buffer))
+            buffer.clear()
+
+    for root in tree.roots:
+        try:
+            parent_fd = _open_path_chain(root.parent)
+        except PermissionError:
+            continue  # the account cannot even reach this root
+        except OSError as exc:
+            if _is_vanished(exc):
+                emit(b"U", root.path)
+                continue
+            raise
+        frames: list[list[object]] = []
+        try:
+            current = os.fstat(parent_fd)
+            if (current.st_dev, current.st_ino) != (root.parent_dev, root.parent_ino):
+                emit(b"U", root.path)
+                continue
+            first = (posixpath.basename(root.path), root.dev, root.ino, root.is_dir)
+            frames.append([parent_fd, root.parent, iter([first]), False])
+            while frames:
+                frame = frames[-1]
+                directory_fd, directory, pending, owned = frame
+                item = next(pending, None)  # type: ignore[call-overload]
+                if item is None:
+                    frames.pop()
+                    if owned:
+                        os.close(directory_fd)  # type: ignore[arg-type]
+                    continue
+                name, device, inode, is_dir = item
+                path = _join(str(directory), name)
+                verdict = _census_check(directory_fd, name, device, inode)  # type: ignore[arg-type]
+                if verdict == _UNREACHABLE:
+                    frame[2] = iter(())  # nothing below this directory is reachable
+                    continue
+                if verdict == _UNSTABLE:
+                    emit(b"U", path)
+                    continue
+                if verdict == _WRITABLE:
+                    emit(b"W", path)
+                if not is_dir:
+                    continue
+                try:
+                    child_fd = os.open(name, _PATH_DIRECTORY_FLAGS, dir_fd=directory_fd)  # type: ignore[arg-type]
+                except PermissionError:
+                    continue
+                except OSError as exc:
+                    if _is_vanished(exc):
+                        emit(b"U", path)
+                        continue
+                    raise
+                current = os.fstat(child_fd)
+                if (current.st_dev, current.st_ino) != (device, inode):
+                    os.close(child_fd)
+                    emit(b"U", path)
+                    continue
+                frames.append([child_fd, path, iter(tree.entries.get(path, ())), True])
+        finally:
+            for frame in frames:
+                if frame[3]:
+                    os.close(frame[0])  # type: ignore[arg-type]
+            os.close(parent_fd)
+    if buffer:
+        _write_all(out_fd, bytes(buffer))
+
+
+def build_census_tree(
+    backend: LegacyHostBackend,
+    roots: Sequence[str],
+    visit: Callable[[str, os.stat_result], None] | None = None,
+) -> CensusTree:
+    """Enumerate census roots as root; symlinks are visited but never entered."""
+
+    tree = CensusTree(roots=[], entries={})
+    for raw_root in roots:
+        root = posixpath.normpath(raw_root)
+        for path, observed in backend.walk(root):
+            if visit is not None:
+                visit(path, observed)
+            if stat.S_ISLNK(observed.st_mode):
+                continue
+            is_dir = stat.S_ISDIR(observed.st_mode)
+            if path == root:
+                parent = posixpath.dirname(root)
+                parent_stat = backend.lstat(parent)
+                if parent_stat is None or not stat.S_ISDIR(parent_stat.st_mode):
+                    raise InstallError(f"census root parent is not a directory: {parent}")
+                tree.roots.append(
+                    CensusRoot(
+                        path=root,
+                        dev=observed.st_dev,
+                        ino=observed.st_ino,
+                        is_dir=is_dir,
+                        parent=parent,
+                        parent_dev=parent_stat.st_dev,
+                        parent_ino=parent_stat.st_ino,
+                    )
+                )
+            else:
+                parent, name = posixpath.split(path)
+                tree.entries.setdefault(parent, []).append(
+                    (name, observed.st_dev, observed.st_ino, is_dir)
+                )
+            tree.count += 1
+    return tree
 
 
 # ---------------------------------------------------------------------------
@@ -1491,35 +1791,32 @@ def _census(
         ("entries", "nouser", "nogroup", "setid", "world_writable", "external_symlinks"), 0
     )
     owners: dict[str, int] = {}
-    paths: list[str] = []
-    for root in _census_roots(plan):
-        in_state = root == state_root or root.startswith(state_root + "/")
-        for path, observed in backend.walk(root):
-            is_link = stat.S_ISLNK(observed.st_mode)
-            if not is_link:
-                paths.append(path)
-            if not in_state and not (path == state_root or path.startswith(state_root + "/")):
-                continue
-            tally["entries"] += 1
-            owner = (
-                f"{user_names.get(observed.st_uid, observed.st_uid)}:"
-                f"{group_names.get(observed.st_gid, observed.st_gid)}"
-            )
-            owners[owner] = owners.get(owner, 0) + 1
-            tally["nouser"] += observed.st_uid not in user_names
-            tally["nogroup"] += observed.st_gid not in group_names
-            if is_link:
-                try:
-                    target = backend.readlink(path)
-                except OSError:
-                    continue  # removed while the tree was walked
-                tally["external_symlinks"] += _external_symlink(path, target, state_root)
-                continue
-            mode = observed.st_mode
-            tally["setid"] += bool(mode & (stat.S_ISUID | stat.S_ISGID))
-            tally["world_writable"] += bool(
-                mode & stat.S_IWOTH and not (stat.S_ISDIR(mode) and mode & stat.S_ISVTX)
-            )
+
+    def summarize(path: str, observed: os.stat_result) -> None:
+        if not (path == state_root or path.startswith(state_root + "/")):
+            return
+        tally["entries"] += 1
+        owner = (
+            f"{user_names.get(observed.st_uid, observed.st_uid)}:"
+            f"{group_names.get(observed.st_gid, observed.st_gid)}"
+        )
+        owners[owner] = owners.get(owner, 0) + 1
+        tally["nouser"] += observed.st_uid not in user_names
+        tally["nogroup"] += observed.st_gid not in group_names
+        mode = observed.st_mode
+        if stat.S_ISLNK(mode):
+            try:
+                target = backend.readlink(path)
+            except OSError:
+                return  # removed while the tree was walked
+            tally["external_symlinks"] += _external_symlink(path, target, state_root)
+            return
+        tally["setid"] += bool(mode & (stat.S_ISUID | stat.S_ISGID))
+        tally["world_writable"] += bool(
+            mode & stat.S_IWOTH and not (stat.S_ISDIR(mode) and mode & stat.S_ISVTX)
+        )
+
+    tree = build_census_tree(backend, _census_roots(plan), visit=summarize)
     summary: dict[str, object] = {**tally, "owner_census": dict(sorted(owners.items()))}
 
     stable: dict[str, dict[str, object]] = {}
@@ -1531,17 +1828,26 @@ def _census(
                 "status": "absent",
                 "identity": None,
                 "writable_outside_declared": [],
+                "unstable": [],
             }
-            counts[principal] = {"checked": 0, "writable": 0, "outside_declared": 0}
+            counts[principal] = {
+                "checked": 0,
+                "writable": 0,
+                "outside_declared": 0,
+                "unstable": 0,
+            }
             continue
         identity = CensusIdentity(
             uid=entry.uid,
             gid=entry.gid,
             groups=tuple(sorted(set(backend.group_list(principal, entry.gid)))),
         )
-        writable = list(backend.writable_paths(identity, paths))
+        result = backend.writable_paths(identity, tree)
         trie = _pattern_trie(declared_writable_patterns(plan, principal))
-        outside = [path for path in writable if not _declared(trie, path)]
+        outside = [path for path in result.writable if not _declared(trie, path)]
+        # A change inside the account's own declared area hides nothing it could
+        # not already write; anywhere else it is a fail-closed census finding.
+        unstable = sorted({path for path in result.unstable if not _declared(trie, path)})
         rows: list[dict[str, object]] = []
         for path in _collapse(outside):
             observed = backend.lstat(path)
@@ -1549,14 +1855,16 @@ def _census(
                 {"path": path, "type": None if observed is None else _file_type(observed.st_mode)}
             )
         stable[principal] = {
-            "status": "checked",
+            "status": "unstable" if unstable else "checked",
             "identity": identity.to_dict(),
             "writable_outside_declared": rows,
+            "unstable": unstable,
         }
         counts[principal] = {
-            "checked": len(paths),
-            "writable": len(writable),
+            "checked": tree.count,
+            "writable": len(result.writable),
             "outside_declared": len(outside),
+            "unstable": len(result.unstable),
         }
     return stable, counts, summary
 
@@ -1679,7 +1987,7 @@ _CREDENTIAL_ROW_KEYS = frozenset({"principal", "provider", "path", "configured",
 _SERVICE_ROW_KEYS = frozenset(
     {"load_state", "unit_file_state", "fragment_path", "drop_in_paths", "user", "exec_path", "exec"}
 )
-_CENSUS_ROW_KEYS = frozenset({"status", "identity", "writable_outside_declared"})
+_CENSUS_ROW_KEYS = frozenset({"status", "identity", "writable_outside_declared", "unstable"})
 _VOLATILE_KEYS = frozenset(
     {
         "captured_at",
@@ -1917,12 +2225,19 @@ def _validate_census(value: object) -> None:
     for principal, row in value.items():
         label = f"census.{principal}"
         row = _exact(row, _CENSUS_ROW_KEYS, label)
-        if row["status"] not in {"checked", "absent"}:
+        if row["status"] not in {"checked", "unstable", "absent"}:
             raise _fail(f"{label}.status is invalid")
-        if row["status"] == "checked":
+        unstable = row["unstable"]
+        if not isinstance(unstable, list) or not all(_is_abs(item) for item in unstable):
+            raise _fail(f"{label}.unstable is invalid")
+        _validate_sorted_unique(unstable, f"{label}.unstable")
+        if (row["status"] == "unstable") != bool(unstable):
+            raise _fail(f"{label}.status does not match its unstable entries")
+        if row["status"] == "absent":
+            if row["identity"] is not None or row["writable_outside_declared"] != []:
+                raise _fail(f"{label} absent principal carries census data")
+        else:
             _exact(row["identity"], frozenset({"uid", "gid", "groups"}), f"{label}.identity")
-        elif row["identity"] is not None or row["writable_outside_declared"] != []:
-            raise _fail(f"{label} absent principal carries census data")
         rows = row["writable_outside_declared"]
         if not isinstance(rows, list) or any(
             not isinstance(item, Mapping)
@@ -2041,14 +2356,87 @@ class LegacyInventory:
         return canonical_inventory_bytes(self.document)
 
 
+def _scope_protected_paths(scope: Mapping[str, object]) -> list[str]:
+    paths: set[str] = set()
+    roots = scope.get("roots")
+    if isinstance(roots, Mapping):
+        paths.update(value for value in roots.values() if isinstance(value, str))
+    for field, key in (("managed_paths", "path"), ("accounts", "home")):
+        rows = scope.get(field)
+        for row in rows if isinstance(rows, list) else ():
+            if isinstance(row, Mapping) and isinstance(row.get(key), str):
+                paths.add(str(row[key]))
+    return sorted(posixpath.normpath(path) for path in paths if path.startswith("/"))
+
+
+def check_inventory_output(path: Path, scope: Mapping[str, object]) -> Path:
+    """Refuse an output that would put the inventory inside what it records.
+
+    The capture must not mutate the host it describes: the output (and every
+    parent) must lie outside every deploy/state/systemd/polkit root, managed
+    path and account home in ``scope``, and no component may be a symlink.
+    Existing ancestors are also compared by inode, so a bind mount of a
+    managed directory is refused as well.
+    """
+
+    hint = f"write it to an installer-owned location such as {INSTALLER_LEGACY_DIRECTORY}"
+    target = Path(path)
+    if not target.is_absolute() or ".." in target.parts or not target.name:
+        raise UnsafeInstallPathError(
+            f"legacy inventory output must be an absolute path without '..': {path}; {hint}"
+        )
+    target = Path(posixpath.normpath(str(target)))
+    try:
+        _reject_symlink_ancestors(target, label="legacy inventory output")
+    except UnsafeInstallPathError as exc:
+        raise UnsafeInstallPathError(f"{exc}; {hint}") from exc
+    resolved = Path(os.path.realpath(target))
+    if resolved != target:
+        raise UnsafeInstallPathError(
+            f"legacy inventory output resolves through a symlink: {target} -> {resolved}; {hint}"
+        )
+    protected = _scope_protected_paths(scope)
+    for candidate in protected:
+        if str(target) == candidate or str(target).startswith(candidate.rstrip("/") + "/"):
+            raise InstallPlanError(
+                f"legacy inventory output {target} is inside {candidate}, which the "
+                f"inventory records; the capture must not write into the host it "
+                f"describes -- {hint}"
+            )
+    identities: dict[tuple[int, int], str] = {}
+    for candidate in protected:
+        try:
+            observed = os.lstat(candidate)
+        except OSError:
+            continue
+        if stat.S_ISDIR(observed.st_mode):
+            identities[(observed.st_dev, observed.st_ino)] = candidate
+    for ancestor in target.parents:
+        try:
+            observed = os.lstat(ancestor)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise UnsafeInstallPathError(
+                f"cannot inspect legacy inventory output parent {ancestor}: {exc}"
+            ) from exc
+        alias = identities.get((observed.st_dev, observed.st_ino))
+        if alias is not None:
+            raise InstallPlanError(
+                f"legacy inventory output {target} is inside {alias} (reached "
+                f"through {ancestor}), which the inventory records -- {hint}"
+            )
+    return target
+
+
 def publish_inventory(path: Path, document: Mapping[str, object]) -> str:
     """Write a validated inventory to ``path`` without replacing anything there."""
 
-    target = Path(path)
-    if not target.is_absolute() or ".." in target.parts or not target.name:
-        raise UnsafeInstallPathError(f"legacy inventory output must be an absolute path: {path}")
-    _reject_symlink_ancestors(target, label="legacy inventory output")
-    payload = LegacyInventory.from_document(document).to_bytes()
+    inventory = LegacyInventory.from_document(document)
+    scope = inventory.document["scope"]
+    assert isinstance(scope, Mapping)
+    target = check_inventory_output(Path(path), scope)
+    payload = inventory.to_bytes()
     try:
         parent_fd = _open_directory_chain(target.parent)
     except FileNotFoundError as exc:
@@ -2237,6 +2625,13 @@ def render_inventory_summary(inventory: LegacyInventory) -> str:
         lines.append(f"  {principal}: {len(outside) or 'none'}")
         for item in outside:
             lines.append(f"    {item['path']} ({item['type']})")
+        if row["status"] == "unstable":
+            lines.append(
+                f"    UNSTABLE: {len(row['unstable'])} entries changed while checked; "
+                "a plan must refuse this inventory"
+            )
+            for item in row["unstable"]:
+                lines.append(f"      {item}")
 
     lines.append("")
     lines.append("volatile gates (not digested):")

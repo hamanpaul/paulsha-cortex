@@ -7,6 +7,7 @@ root and is skipped otherwise.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -430,6 +431,7 @@ class FakeLegacyHost(legacy.LocalLegacyHostBackend):
         self.services = _default_services(plan, seeded)
         self.in_flight_value: dict[str, object] = {"job_processes": 0, "durable_jobs": 0}
         self.writable: dict[int, set[str]] = {}
+        self.unstable: dict[int, set[str]] = {}
         self.read_calls: list[str] = []
         self.census_calls: list[tuple[legacy.CensusIdentity, list[str]]] = []
         self.machine = MACHINE_ID
@@ -468,17 +470,21 @@ class FakeLegacyHost(legacy.LocalLegacyHostBackend):
     def in_flight(self, job_uids, plan):
         return dict(self.in_flight_value)
 
-    def writable_paths(self, identity: legacy.CensusIdentity, paths):
-        paths = list(paths)
+    def writable_paths(self, identity: legacy.CensusIdentity, tree: legacy.CensusTree):
+        paths = list(tree.paths())
         self.census_calls.append((identity, paths))
         for path in paths:
             assert not os.path.islink(path), f"census was handed a symlink: {path}"
         roots = self.writable.get(identity.uid, set())
-        return [
-            path
-            for path in paths
-            if any(path == root or path.startswith(root + "/") for root in roots)
-        ]
+        unstable = self.unstable.get(identity.uid, set())
+        return legacy.CensusResult(
+            writable=tuple(
+                path
+                for path in paths
+                if any(path == root or path.startswith(root + "/") for root in roots)
+            ),
+            unstable=tuple(path for path in paths if path in unstable),
+        )
 
 
 def _legacy_setup(tmp_path: Path, overlay: dict | None = None):
@@ -992,6 +998,7 @@ def test_census_reports_writable_paths_outside_declared_assets(tmp_path: Path) -
         "writable_outside_declared": [
             {"path": str(seeded["sandboxes"]), "type": "directory"}
         ],
+        "unstable": [],
     }
     assert census["cortex-gate"]["writable_outside_declared"] == []
     counts = document["volatile"]["census"]["cortex-reviewer-planner"]
@@ -1017,6 +1024,7 @@ def test_census_records_an_absent_principal(tmp_path: Path) -> None:
         "status": "absent",
         "identity": None,
         "writable_outside_declared": [],
+        "unstable": [],
     }
     assert {row["name"]: row for row in document["accounts"]}["cortex-gate"]["passwd"] is None
 
@@ -1037,30 +1045,164 @@ def test_declared_writable_patterns_come_from_plan_writers_and_desired_modes(
     assert str(state / "coordinator/review-sandboxes") not in reviewer
 
 
+def _self_identity() -> legacy.CensusIdentity:
+    return legacy.CensusIdentity(os.getuid(), os.getgid(), tuple(sorted(os.getgroups())))
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses DAC write checks")
 def test_writable_census_asks_the_kernel_as_the_calling_identity(tmp_path: Path) -> None:
     backend = legacy.LocalLegacyHostBackend(require_root=False)
-    writable_file = tmp_path / "writable.txt"
-    readonly_file = tmp_path / "readonly.txt"
-    readonly_dir = tmp_path / "readonly-dir"
-    writable_dir = tmp_path / "writable-dir"
+    root = tmp_path / "census"
+    root.mkdir()
+    writable_file = root / "writable.txt"
+    readonly_file = root / "readonly.txt"
+    readonly_dir = root / "readonly-dir"
+    writable_dir = root / "writable-dir"
+    closed = root / "closed"
     for path in (writable_file, readonly_file):
         path.write_text("x\n", encoding="utf-8")
-    readonly_dir.mkdir()
-    writable_dir.mkdir()
+    for path in (readonly_dir, writable_dir, closed):
+        path.mkdir()
+    (closed / "inner.txt").write_text("x\n", encoding="utf-8")
+    (root / "link").symlink_to(writable_file)
+    tree = legacy.build_census_tree(backend, [str(root)])
     readonly_file.chmod(0o444)
     readonly_dir.chmod(0o555)
-    identity = legacy.CensusIdentity(os.getuid(), os.getgid(), tuple(sorted(os.getgroups())))
+    closed.chmod(0o600)  # no search permission: nothing below is reachable
     try:
-        result = backend.writable_paths(
-            identity,
-            [str(writable_file), str(readonly_file), str(readonly_dir), str(writable_dir)],
-        )
+        result = backend.writable_paths(_self_identity(), tree)
     finally:
         readonly_dir.chmod(0o755)
-    assert result == [str(writable_file), str(writable_dir)]
+        closed.chmod(0o755)
+
+    assert sorted(result.writable) == sorted(
+        [str(root), str(writable_file), str(writable_dir), str(closed)]
+    )
+    assert result.unstable == ()
+    assert str(root / "link") not in list(tree.paths())
     with pytest.raises(PermissionError, match="needs root"):
-        backend.writable_paths(legacy.CensusIdentity(os.getuid() + 1, os.getgid(), ()), [])
+        backend.writable_paths(
+            legacy.CensusIdentity(os.getuid() + 1, os.getgid(), ()), tree
+        )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses DAC write checks")
+def test_census_marks_entries_swapped_for_symlinks_as_unstable(tmp_path: Path) -> None:
+    backend = legacy.LocalLegacyHostBackend(require_root=False)
+    root = tmp_path / "census"
+    (root / "sub").mkdir(parents=True)
+    victim = root / "victim.txt"
+    victim.write_text("x\n", encoding="utf-8")
+    (root / "sub/inner.txt").write_text("x\n", encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "inner.txt").write_text("x\n", encoding="utf-8")
+    readonly = tmp_path / "readonly.txt"
+    readonly.write_text("x\n", encoding="utf-8")
+    readonly.chmod(0o444)
+    tree = legacy.build_census_tree(backend, [str(root)])
+    # After enumeration and before the census, a job swaps both entries.
+    victim.unlink()
+    victim.symlink_to(readonly)
+    (root / "sub/inner.txt").unlink()
+    (root / "sub").rmdir()
+    (root / "sub").symlink_to(elsewhere)
+
+    result = backend.writable_paths(_self_identity(), tree)
+
+    assert sorted(result.unstable) == sorted([str(victim), str(root / "sub")])
+    assert str(victim) not in result.writable
+    assert str(root / "sub") not in result.writable
+    # The swapped directory is never entered through its new symlink.
+    assert str(root / "sub/inner.txt") not in (*result.writable, *result.unstable)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses DAC write checks")
+def test_census_catches_a_swap_between_its_stat_and_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = legacy.LocalLegacyHostBackend(require_root=False)
+    root = tmp_path / "census"
+    root.mkdir()
+    victim = root / "victim.txt"
+    victim.write_text("x\n", encoding="utf-8")
+    moved = root / "moved.txt"
+    tree = legacy.build_census_tree(backend, [str(root)])
+    access = legacy._faccessat2
+
+    def swapping_access(dir_fd: int, name: str, mode: int) -> None:
+        if name == victim.name and not moved.exists():
+            victim.rename(moved)
+            victim.symlink_to(moved)
+        access(dir_fd, name, mode)
+
+    monkeypatch.setattr(legacy, "_faccessat2", swapping_access)
+    result = backend.writable_paths(_self_identity(), tree)
+
+    assert str(victim) in result.unstable
+    assert str(victim) not in result.writable
+
+
+@pytest.mark.parametrize("error", [errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP])
+def test_census_fails_closed_without_nofollow_faccessat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: int
+) -> None:
+    backend = legacy.LocalLegacyHostBackend(require_root=False)
+    root = tmp_path / "census"
+    root.mkdir()
+    (root / "file.txt").write_text("x\n", encoding="utf-8")
+    tree = legacy.build_census_tree(backend, [str(root)])
+
+    def unsupported(dir_fd: int, name: str, mode: int) -> None:
+        raise OSError(error, os.strerror(error), name)
+
+    monkeypatch.setattr(legacy, "_faccessat2", unsupported)
+    with pytest.raises(InstallError, match="AT_SYMLINK_NOFOLLOW"):
+        backend.writable_paths(_self_identity(), tree)
+
+
+def test_census_records_unstable_entries_outside_declared_areas(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan, overlay, backend, seeded = _legacy_setup(tmp_path)
+    reviewer_uid = LEGACY_IDS["cortex-reviewer-planner"][0]
+    builder_uid = LEGACY_IDS["cortex-builder"][0]
+    backend.unstable = {
+        reviewer_uid: {str(seeded["stray"])},
+        # Inside the builder's own declared worktree slot: already writable.
+        builder_uid: {str(seeded["worktree_slot"])},
+    }
+
+    document = _collect(plan, overlay, backend)
+    census = document["census"]
+
+    assert census["cortex-reviewer-planner"]["status"] == "unstable"
+    assert census["cortex-reviewer-planner"]["unstable"] == [str(seeded["stray"])]
+    assert census["cortex-builder"]["status"] == "checked"
+    assert census["cortex-builder"]["unstable"] == []
+    backend.unstable = {}
+    assert _collect(plan, overlay, backend)["inventory_sha256"] != document["inventory_sha256"]
+
+    path = tmp_path / "inventory.json"
+    legacy.publish_inventory(path, document)
+    assert install_cli.main(["legacy", "show", "--inventory", str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "UNSTABLE" in out and str(seeded["stray"]) in out
+
+
+def test_legacy_inventory_cli_flags_an_unstable_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _plan, backend, seeded, argv, output, _constructed = _cli_setup(tmp_path, monkeypatch)
+    backend.unstable = {LEGACY_IDS["cortex-gate"][0]: {str(seeded["stray"])}}
+
+    assert install_cli.main(argv) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["census_stable"] is False
+    assert "census is unstable" in captured.err
+    census = legacy.LegacyInventory.load(output).document["census"]
+    assert census["cortex-gate"]["status"] == "unstable"
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="dropping to another account needs root")
@@ -1081,11 +1223,11 @@ def test_writable_census_drops_to_the_job_identity_as_root() -> None:
         open_dir.chmod(0o777)
         nobody = legacy.CensusIdentity(65534, 65534, (65534,))
 
-        result = legacy.LocalLegacyHostBackend().writable_paths(
-            nobody, [str(private), str(shared), str(closed), str(open_dir)]
-        )
+        backend = legacy.LocalLegacyHostBackend()
+        result = backend.writable_paths(nobody, legacy.build_census_tree(backend, [str(base)]))
 
-        assert result == [str(shared), str(open_dir)]
+        assert sorted(result.writable) == sorted([str(shared), str(open_dir)])
+        assert result.unstable == ()
         assert os.geteuid() == 0 and os.getegid() == 0
     finally:
         for path in sorted(base.rglob("*"), reverse=True):
@@ -1228,6 +1370,7 @@ def test_legacy_inventory_cli_writes_once_and_never_overwrites(
     assert install_cli.main(argv) == 0
     emitted = json.loads(capsys.readouterr().out)
     inventory = legacy.LegacyInventory.load(output)
+    assert emitted["census_stable"] is True
     assert emitted["output"] == str(output)
     assert emitted["inventory_sha256"] == inventory.inventory_sha256
     assert emitted["scope_sha256"] == inventory.scope_sha256
@@ -1364,3 +1507,69 @@ def test_legacy_show_rejects_a_tampered_inventory(
 
     assert install_cli.main(["legacy", "show", "--inventory", str(path)]) == 1
     assert "legacy inventory is invalid" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# the output never lands inside what the inventory records
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "host/var/lib/cortex/coordinator/inventory.json",
+        "host/var/lib/cortex/inventory.json",
+        "host/var/lib/cortex/coordinator/quota-observations/inventory.json",
+        "host/opt/cortex/etc/inventory.json",
+        "host/etc/systemd/system/inventory.json",
+        "host/etc/polkit-1/rules.d/inventory.json",
+        "host/var/lib/cortex-builder/inventory.json",
+        "host/home/cortex-egress/inventory.json",
+    ],
+)
+def test_legacy_inventory_cli_refuses_an_output_inside_the_inventoried_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    relative: str,
+) -> None:
+    _plan, backend, _seeded, argv, _output, _constructed = _cli_setup(tmp_path, monkeypatch)
+    target = tmp_path / relative
+    argv[-1] = str(target)
+
+    assert install_cli.main(argv) == 1
+
+    err = capsys.readouterr().err
+    assert "inside" in err and "/var/lib/cortex-installer/legacy/" in err
+    assert not target.exists()
+    assert backend.census_calls == [] and backend.read_calls == []
+
+
+@pytest.mark.parametrize("into_scope", [True, False])
+def test_legacy_inventory_cli_refuses_an_output_through_a_symlinked_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    into_scope: bool,
+) -> None:
+    _plan, backend, seeded, argv, output, _constructed = _cli_setup(tmp_path, monkeypatch)
+    real_parent = seeded["jobs"].parent if into_scope else output.parent
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent)
+    argv[-1] = str(alias / "inventory.json")
+
+    assert install_cli.main(argv) == 1
+
+    assert "symlink" in capsys.readouterr().err
+    assert not (real_parent / "inventory.json").exists()
+    assert backend.census_calls == []
+
+
+def test_publish_refuses_to_write_inside_the_inventoried_scope(tmp_path: Path) -> None:
+    plan, overlay, backend, seeded = _legacy_setup(tmp_path)
+    document = _collect(plan, overlay, backend)
+    target = seeded["jobs"].parent / "inventory.json"
+
+    with pytest.raises(InstallPlanError, match="cortex-installer/legacy"):
+        legacy.publish_inventory(target, document)
+    assert not target.exists()

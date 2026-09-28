@@ -21,7 +21,9 @@ from .legacy import (
     LegacyInventory,
     LocalLegacyHostBackend,
     apply_host_overlay,
+    check_inventory_output,
     collect_legacy_inventory,
+    legacy_scope,
     publish_inventory,
     render_inventory_summary,
     validate_host_overlay,
@@ -1167,7 +1169,10 @@ def _legacy_inventory_command(args: argparse.Namespace) -> int:
     plan = _bound_plan_from_config(
         apply_host_overlay(config, overlay), Path(args.bundle)
     )
-    output = Path(args.output).expanduser().absolute()
+    # Refuse an output inside anything the capture records before touching it.
+    output = check_inventory_output(
+        Path(args.output).expanduser().absolute(), legacy_scope(plan)
+    )
     if os.path.lexists(output):
         raise InstallError(
             f"legacy inventory output already exists; refusing to overwrite: {output}"
@@ -1178,13 +1183,25 @@ def _legacy_inventory_command(args: argparse.Namespace) -> int:
         )
         publish_inventory(output, document)
     host = document["host"]
-    assert isinstance(host, Mapping)
+    census = document["census"]
+    assert isinstance(host, Mapping) and isinstance(census, Mapping)
+    census_stable = all(
+        isinstance(row, Mapping) and row.get("status") != "unstable"
+        for row in census.values()
+    )
+    if not census_stable:
+        sys.stderr.write(
+            "trust-root legacy inventory: the writable census is unstable (entries "
+            "changed while they were checked); any adoption plan or apply gate must "
+            "refuse this inventory -- rerun the capture with the services stopped\n"
+        )
     _emit(
         {
             "output": str(output),
             "inventory_sha256": document["inventory_sha256"],
             "scope_sha256": document["scope_sha256"],
             "host_binding_sha256": host["binding_sha256"],
+            "census_stable": census_stable,
         }
     )
     return 0
