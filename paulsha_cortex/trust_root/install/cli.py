@@ -21,8 +21,12 @@ from .legacy import (
     LegacyInventory,
     LocalLegacyHostBackend,
     apply_host_overlay,
+    bind_host_overlay,
     check_inventory_output,
     collect_legacy_inventory,
+    derive_legacy_adoption,
+    host_binding_sha256,
+    legacy_adoption_request,
     legacy_scope,
     publish_inventory,
     render_inventory_summary,
@@ -648,7 +652,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     plan = sub.add_parser("plan", help="produce a rootless exact-artifact desired-state plan")
     plan.add_argument("--config", required=True)
+    plan.add_argument(
+        "--host-overlay",
+        help="allowlisted host delta (account ids, egress home, operator/reader, "
+        "builder providers, legacy_adoption); the plan records its digest",
+    )
     plan.add_argument("--bundle", required=True)
+    plan.add_argument(
+        "--legacy-inventory",
+        help="reviewed legacy inventory the host overlay's legacy_adoption block binds "
+        "(legacy_policy: quarantine only)",
+    )
     plan.add_argument("--output", required=True)
 
     apply = sub.add_parser("apply", help="apply an exact confirmed plan as root")
@@ -804,12 +818,80 @@ def _bound_plan_from_config(
     return plan
 
 
+def _host_machine_id() -> str:
+    """This host's machine identity; ``/etc/machine-id`` is world-readable."""
+
+    return LocalLegacyHostBackend(require_root=False).machine_id()
+
+
+def _plan_document(
+    config: Mapping[str, object],
+    bundle: Path,
+    *,
+    overlay: Mapping[str, object] | None = None,
+    legacy_inventory: Path | None = None,
+    machine_id: str | None = None,
+) -> dict[str, object]:
+    """Plan ``config`` with an optional host overlay and legacy inventory.
+
+    Without an overlay the plan is exactly the release config's plan.  An
+    overlay changes only its allowlisted fields and records its digest.  A
+    ``legacy_adoption`` block (``legacy_policy: quarantine`` only) binds the
+    reviewed inventory, which must have been captured on this host with the
+    same config, overlay and bundle.
+    """
+
+    validated = validate_host_overlay(overlay) if overlay is not None else None
+    request = legacy_adoption_request(
+        config, validated, inventory_given=legacy_inventory is not None
+    )
+    effective = apply_host_overlay(config, validated) if validated is not None else config
+    plan = bind_host_overlay(_bound_plan_from_config(effective, Path(bundle)), validated)
+    if request is None:
+        return plan
+    assert legacy_inventory is not None
+    inventory = LegacyInventory.load(Path(legacy_inventory).expanduser().absolute())
+    return derive_legacy_adoption(
+        plan,
+        request=request,
+        overlay=validated,
+        inventory=inventory,
+        host_binding_sha256=host_binding_sha256(
+            machine_id if machine_id is not None else _host_machine_id()
+        ),
+    )
+
+
 def _plan_command(args: argparse.Namespace) -> int:
     config = _load_mapping(Path(args.config), label="trust-root config")
-    plan = _bound_plan_from_config(config, Path(args.bundle))
+    overlay = (
+        _load_mapping(Path(args.host_overlay), label="host overlay")
+        if args.host_overlay is not None
+        else None
+    )
+    plan = _plan_document(
+        config,
+        Path(args.bundle),
+        overlay=overlay,
+        legacy_inventory=(
+            Path(args.legacy_inventory) if args.legacy_inventory is not None else None
+        ),
+    )
     output = Path(args.output).expanduser().absolute()
     atomic_write_json(output, plan, mode=0o600)
-    _emit({"output": str(output), "plan_sha256": plan_sha256(plan)})
+    payload: dict[str, object] = {"output": str(output), "plan_sha256": plan_sha256(plan)}
+    if "host_overlay_sha256" in plan:
+        payload["host_overlay_sha256"] = plan["host_overlay_sha256"]
+    legacy_block = plan.get("legacy_adoption")
+    if isinstance(legacy_block, Mapping):
+        quarantine = legacy_block["quarantine"]
+        assert isinstance(quarantine, list)
+        payload["legacy_adoption"] = {
+            "inventory_sha256": legacy_block["inventory_sha256"],
+            "quarantine": len(quarantine),
+            "summary": legacy_block["summary"],
+        }
+    _emit(payload)
     return 0
 
 

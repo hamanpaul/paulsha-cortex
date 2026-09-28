@@ -4,9 +4,11 @@ A Phase 2b host was deployed by hand and never produced an installer receipt,
 so the transactional installer can neither fresh-install over it nor upgrade it
 with ``--prior-receipt``.  Legacy adoption adds a third kind of provenance: a
 root-captured, operator-reviewed inventory whose digest a later plan binds.
-This module is the capture side only (PR-2).  It never mutates the host and it
-does not change planning; disposition, the quarantine step and apply-time
-re-capture build on the record defined here.
+The capture side (PR-2) never mutates the host.  The planning side (PR-3, at
+the end of this module) gives ``legacy_policy`` its meaning, records the host
+overlay digest, binds an inventory to a plan and derives one disposition per
+inventoried object, emitting ``legacy-quarantine`` steps.  Apply refuses those
+plans until apply-time re-capture, the quarantine backend and rollback land.
 
 Inventory schema v1 (canonical JSON, ASCII, sorted keys, one trailing newline):
 
@@ -74,12 +76,14 @@ from .core import (
     _DIRECTORY_OPEN_FLAGS,
     _PRINCIPAL_ACCOUNTS,
     _PROVIDER_ALLOWLIST,
+    _assert_managed_parent_topology,
     _credential_adapter_for,
     _open_directory_chain,
     _reject_sensitive_config,
     _reject_symlink_ancestors,
     _rename_noreplace_at,
     _write_all,
+    canonical_receipt_path,
 )
 
 
@@ -486,6 +490,10 @@ def _managed_steps(plan: Mapping[str, object]) -> list[dict[str, object]]:
     for step in steps:
         if not isinstance(step, Mapping):
             raise InstallPlanError("apply_order entries must be typed objects")
+        if step.get("kind") == QUARANTINE_STEP_KIND:
+            # A quarantine step moves a legacy object away; it declares no
+            # desired path, so the scope of a bound plan equals the plan's.
+            continue
         candidates: list[tuple[str, str, str]] = []
         path = step.get("path")
         if isinstance(path, str):
@@ -2650,3 +2658,1083 @@ def render_inventory_summary(inventory: LegacyInventory) -> str:
         )
     )
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# plan binding: legacy_policy, dispositions and the quarantine step (PR-3)
+# ---------------------------------------------------------------------------
+#
+# ``legacy_policy`` gains its meaning here.  ``reject`` keeps today's
+# behaviour and refuses any ``legacy_adoption`` block; ``quarantine`` without a
+# block plans exactly as before.  Only ``quarantine`` together with a block
+# (which only the host overlay may carry) and ``--legacy-inventory`` binds a
+# reviewed inventory: the plan re-derives its scope, checks the self digest,
+# the host binding and the overlay the capture used, and derives one
+# disposition for every inventoried object.  Anything no rule classifies fails
+# planning.  Apply refuses these plans until the apply side lands (PR-4).
+
+LEGACY_PLAN_SCHEMA_VERSION = 1
+QUARANTINE_STEP_KIND = "legacy-quarantine"
+QUARANTINE_OPERATIONS = ("snapshot", "rename-noreplace")
+QUARANTINE_ROLLBACK_POLICY = "restore"
+DISPOSITIONS = ("adopt", "adopt-in-place", "quarantine-then-create", "quarantine")
+SUMMARY_KEYS = (*DISPOSITIONS, "create", "covered")
+_QUARANTINE_DISPOSITIONS = frozenset({"quarantine", "quarantine-then-create"})
+QUARANTINE_REASONS = frozenset(
+    {
+        "authority",
+        "credential",
+        "deploy-backup",
+        "job-worktree-pool",
+        "managed-generated",
+        "managed-residue",
+        "managed-subdir",
+        "managed-symlink-mismatch",
+        "operator",
+        "source-repository",
+        "state-top",
+        "superseded-by-launcher",
+        "toolchain-bin",
+        "venv-active-directory",
+    }
+)
+#: Job worktree pools are rebuilt, never adopted (owner ruling, #1122).
+JOB_WORKTREE_POOL_STEPS = frozenset(
+    {"asset:dispatch-worktree-pool", "asset:gate-worktree-pool"}
+)
+#: Non-authoritative old copies at the top of the deploy root.
+DEPLOY_BACKUP_PATTERNS = ("venv.*", "venv-*", "operator-backups", *RESIDUE_PATTERNS)
+#: The #568 reviewer drop-in and its settings file; the reviewer launcher's
+#: ``--add-dir`` superseded both (#1125), so they move without a port.
+SUPERSEDED_BY_LAUNCHER = ("agy-reviewer-settings.json", "agy-review-settings.conf")
+_QUARANTINABLE_TYPES = frozenset({"file", "directory", "symlink"})
+_EXPECTED_BASE_KEYS = ("type", "uid", "gid", "mode", "dev", "ino")
+
+_LEGACY_REQUEST_KEYS = frozenset(
+    {"inventory_sha256", "quarantine_root", "census_exceptions", "quarantine_paths"}
+)
+_LEGACY_REQUEST_REQUIRED = frozenset({"inventory_sha256", "quarantine_root"})
+_LEGACY_BLOCK_KEYS = frozenset(
+    {
+        "schema_version",
+        "inventory_sha256",
+        "scope_sha256",
+        "host_binding_sha256",
+        "host_overlay_sha256",
+        "quarantine_root",
+        "adopted",
+        "quarantine",
+        "census_exceptions",
+        "summary",
+    }
+)
+_QUARANTINE_ROW_KEYS = frozenset({"path", "disposition", "reason", "row_sha256", "covers"})
+_QUARANTINE_STEP_KEYS = frozenset(
+    {
+        "step_id",
+        "kind",
+        "path",
+        "destination",
+        "expected",
+        "row_sha256",
+        "operations",
+        "rollback_policy",
+        "desired_sha256",
+    }
+)
+
+
+class LegacyAdoptionPlanError(InstallPlanError):
+    """Legacy adoption cannot be planned; ``failures`` names every reason."""
+
+    def __init__(self, failures: Sequence[str]) -> None:
+        self.failures = tuple(failures)
+        super().__init__(
+            "legacy adoption cannot be planned:\n"
+            + "\n".join(f"  - {failure}" for failure in self.failures)
+        )
+
+
+def _normalized_absolute(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("/")
+        and not value.startswith("//")
+        and value != "/"
+        and "\x00" not in value
+        and posixpath.normpath(value) == value
+    )
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def inventory_row_sha256(section: str, row: Mapping[str, object]) -> str:
+    """Digest of one inventory row, bound to the section it came from."""
+
+    return _digest({"section": section, "row": row})
+
+
+def quarantine_destination(quarantine_root: str, inventory_sha256: str, path: str) -> str:
+    """``<quarantine_root>/<inventory_sha[:16]>/root/<original absolute path>``."""
+
+    return f"{quarantine_root.rstrip('/')}/{inventory_sha256[:16]}/root{path}"
+
+
+def validate_legacy_adoption_request(block: object) -> dict[str, object]:
+    """Validate the host overlay's ``legacy_adoption`` block."""
+
+    if not isinstance(block, Mapping) or not all(isinstance(key, str) for key in block):
+        raise InstallPlanError("host overlay legacy_adoption must be an object with string keys")
+    unknown = sorted(set(block) - _LEGACY_REQUEST_KEYS)
+    missing = sorted(_LEGACY_REQUEST_REQUIRED - set(block))
+    if unknown or missing:
+        details = [
+            *(["unknown=" + ",".join(unknown)] if unknown else []),
+            *(["missing=" + ",".join(missing)] if missing else []),
+        ]
+        raise InstallPlanError(
+            "host overlay legacy_adoption keys must match the schema: " + "; ".join(details)
+        )
+    if not _is_sha256(block["inventory_sha256"]):
+        raise InstallPlanError("legacy_adoption.inventory_sha256 must be a 64-hex digest")
+    if not _normalized_absolute(block["quarantine_root"]):
+        raise InstallPlanError(
+            "legacy_adoption.quarantine_root must be a normalized absolute path other than /"
+        )
+    exceptions = block.get("census_exceptions", [])
+    if type(exceptions) is not list:
+        raise InstallPlanError("legacy_adoption.census_exceptions must be a list")
+    rows: list[dict[str, str]] = []
+    for item in exceptions:
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"path", "principal"}
+            or not _normalized_absolute(item["path"])
+            or not isinstance(item["principal"], str)
+            or not item["principal"]
+        ):
+            raise InstallPlanError(
+                "legacy_adoption.census_exceptions rows must be {path, principal} "
+                "with a normalized absolute path"
+            )
+        rows.append({"path": str(item["path"]), "principal": str(item["principal"])})
+    keys = [(row["path"], row["principal"]) for row in rows]
+    if len(set(keys)) != len(keys):
+        raise InstallPlanError("legacy_adoption.census_exceptions contains a duplicate")
+    paths = block.get("quarantine_paths", [])
+    if (
+        type(paths) is not list
+        or not all(_normalized_absolute(path) for path in paths)
+        or len(set(paths)) != len(paths)
+    ):
+        raise InstallPlanError(
+            "legacy_adoption.quarantine_paths must be unique normalized absolute paths"
+        )
+    return {
+        "inventory_sha256": block["inventory_sha256"],
+        "quarantine_root": block["quarantine_root"],
+        "census_exceptions": sorted(rows, key=lambda row: (row["path"], row["principal"])),
+        "quarantine_paths": sorted(str(path) for path in paths),
+    }
+
+
+def legacy_adoption_request(
+    config: Mapping[str, object],
+    overlay: Mapping[str, object] | None,
+    *,
+    inventory_given: bool,
+) -> dict[str, object] | None:
+    """Apply ``legacy_policy``: return the adoption request, or ``None``.
+
+    ``reject`` refuses any adoption.  ``quarantine`` without a block plans
+    exactly as before.  A block needs ``--legacy-inventory`` and the inventory
+    needs a block; the release config itself can never carry one because its
+    top-level keys are exact.
+    """
+
+    policy = config.get("legacy_policy") if isinstance(config, Mapping) else None
+    block = overlay.get("legacy_adoption") if isinstance(overlay, Mapping) else None
+    if block is None:
+        if inventory_given:
+            if policy == "reject":
+                raise InstallPlanError(
+                    "legacy_policy: reject refuses legacy adoption; --legacy-inventory is not accepted"
+                )
+            raise InstallPlanError(
+                "--legacy-inventory requires a legacy_adoption block in the host overlay"
+            )
+        return None
+    if policy == "reject":
+        raise InstallPlanError(
+            "legacy_policy: reject refuses a legacy_adoption block; only "
+            "legacy_policy: quarantine may adopt a host without a receipt"
+        )
+    if policy != "quarantine":
+        raise InstallPlanError("legacy_policy must be quarantine or reject")
+    request = validate_legacy_adoption_request(block)
+    if not inventory_given:
+        raise InstallPlanError("a legacy_adoption block requires --legacy-inventory")
+    return request
+
+
+def bind_host_overlay(
+    plan: Mapping[str, object], overlay: Mapping[str, object] | None
+) -> dict[str, object]:
+    """Record the overlay digest; a plan without an overlay is returned unchanged.
+
+    The digest covers the overlay minus ``legacy_adoption`` -- the same record
+    the inventory carries -- so it stays stable from adoption to every later
+    upgrade that reuses the persisted overlay.
+    """
+
+    record = host_overlay_record(overlay)
+    if record is None:
+        return plan  # type: ignore[return-value]
+    bound = deepcopy(dict(plan))
+    bound["host_overlay_sha256"] = record["sha256"]
+    bound["receipt_path"] = str(canonical_receipt_path(bound))
+    return bound
+
+
+@dataclass
+class _Outcome:
+    """The disposition of one inventoried object (or why it has none)."""
+
+    path: str
+    section: str
+    row: Mapping[str, object]
+    disposition: str | None = None  # a DISPOSITIONS value, or "create"
+    reason: str | None = None
+    step_id: str | None = None
+    failure: str | None = None
+    covered_by: str | None = None
+
+    @property
+    def exists(self) -> bool:
+        return isinstance(self.row.get("lstat"), Mapping)
+
+
+def _owner_ids(plan: Mapping[str, object]) -> tuple[dict[str, int], dict[str, int]]:
+    users = {"root": 0}
+    groups = {"root": 0}
+    for _kind, row in _plan_account_rows(plan):
+        if isinstance(row.get("uid"), int):
+            users[str(row["name"])] = int(row["uid"])  # type: ignore[arg-type]
+        if isinstance(row.get("gid"), int):
+            groups[str(row["name"])] = int(row["gid"])  # type: ignore[arg-type]
+    return users, groups
+
+
+def _wanted_by(content: str) -> list[str]:
+    section = None
+    targets: list[str] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+        elif section == "Install" and line.startswith("WantedBy="):
+            targets.extend(line.split("=", 1)[1].split())
+    return targets
+
+
+def _enablement_links(
+    plan: Mapping[str, object], roots: Mapping[str, str]
+) -> dict[str, tuple[str, str]]:
+    """``<systemd>/<target>.wants/<unit>`` -> (enable step id, unit path)."""
+
+    generated = plan.get("generated")
+    units = generated.get("units") if isinstance(generated, Mapping) else None
+    units = units if isinstance(units, Mapping) else {}
+    links: dict[str, tuple[str, str]] = {}
+    for step in plan.get("apply_order", []) or []:
+        if (
+            not isinstance(step, Mapping)
+            or step.get("kind") != "systemctl"
+            or step.get("action") != "enable"
+            or not isinstance(step.get("unit"), str)
+        ):
+            continue
+        unit = str(step["unit"])
+        artifact = units.get(unit)
+        if (
+            not isinstance(artifact, Mapping)
+            or not isinstance(artifact.get("content"), str)
+            or not isinstance(artifact.get("path"), str)
+        ):
+            continue
+        for target in _wanted_by(str(artifact["content"])):
+            link = _join(roots["systemd"], f"{target}.wants/{unit}")
+            links.setdefault(link, (str(step["step_id"]), str(artifact["path"])))
+    return links
+
+
+def _type_failure(path: str, observed: object, expected: str) -> str:
+    return (
+        f"type: {path} is a {observed}, but the plan manages a {expected} there; "
+        "remove or replace it before adoption"
+    )
+
+
+def _classify_managed(
+    row: Mapping[str, object],
+    step: Mapping[str, object],
+    *,
+    toolchain_bin: str,
+    owners: tuple[Mapping[str, int], Mapping[str, int]],
+    operator_paths: frozenset[str],
+) -> _Outcome:
+    path = str(row["path"])
+    outcome = _Outcome(path, "managed_paths", row)
+    lstat_value = row["lstat"]
+    if not isinstance(lstat_value, Mapping):
+        outcome.disposition = "create"
+        return outcome
+    kind = row["kind"]
+    observed = lstat_value["type"]
+    step_id = str(row["step_id"])
+    credential = row["class"] == "credential"
+
+    def quarantine(disposition: str, reason: str) -> _Outcome:
+        outcome.disposition = disposition
+        outcome.reason = reason
+        return outcome
+
+    def fail(message: str) -> _Outcome:
+        outcome.failure = message
+        return outcome
+
+    if kind == "asset":
+        expected = {"directory": "directory", "symlink": "symlink", "file": "file"}.get(
+            str(row["asset_type"])
+        )
+        if expected is None:
+            return fail(f"unclassified: {path} (managed asset of type {row['asset_type']})")
+        if observed != expected:
+            return fail(_type_failure(path, observed, expected))
+        if credential:
+            return quarantine("quarantine-then-create", "credential")
+        if expected == "directory":
+            if step_id in JOB_WORKTREE_POOL_STEPS:
+                return quarantine("quarantine-then-create", "job-worktree-pool")
+            if path == toolchain_bin:
+                return quarantine("quarantine-then-create", "toolchain-bin")
+            if path in operator_paths:
+                return quarantine("quarantine-then-create", "operator")
+            outcome.disposition = "adopt-in-place"
+            outcome.step_id = step_id
+            return outcome
+        if expected == "symlink":
+            users, groups = owners
+            if (
+                row["content"] == {"target": step.get("target")}
+                and lstat_value["uid"] == users.get(str(step.get("owner")))
+                and lstat_value["gid"] == groups.get(str(step.get("group")))
+            ):
+                if path in operator_paths:
+                    return quarantine("quarantine-then-create", "operator")
+                outcome.disposition = "adopt"
+                outcome.step_id = step_id
+                return outcome
+            return quarantine("quarantine-then-create", "managed-symlink-mismatch")
+        return quarantine("quarantine-then-create", "managed-generated")
+    if kind == "repository":
+        if observed != "directory":
+            return fail(_type_failure(path, observed, "directory"))
+        return quarantine("quarantine-then-create", "source-repository")
+    if kind == "toolchain":
+        return fail(
+            f"install path: {path} already exists without receipt provenance; the "
+            "versioned toolchain install path is never replaced in place"
+        )
+    if kind == "venv":
+        return fail(
+            f"install path: {path} already exists without receipt provenance; the "
+            "candidate venv slot must be created by this plan"
+        )
+    if kind == "venv-link":
+        if observed == "directory":
+            return quarantine("quarantine", "venv-active-directory")
+        if observed == "symlink":
+            return fail(
+                f"venv: the active venv link {path} is a symlink without receipt "
+                "provenance; nothing proves where it came from"
+            )
+        return fail(_type_failure(path, observed, "directory or symlink"))
+    return fail(f"unclassified: {path} (managed kind {kind})")
+
+
+def _classify_discovered(
+    row: Mapping[str, object],
+    *,
+    links: Mapping[str, tuple[str, str]],
+    operator_paths: frozenset[str],
+) -> _Outcome:
+    path = str(row["path"])
+    outcome = _Outcome(path, "discovered", row)
+    lstat_value = row["lstat"]
+    assert isinstance(lstat_value, Mapping)
+    observed = lstat_value["type"]
+    rules = [str(rule) for rule in row["rules"]]  # type: ignore[union-attr]
+    klass = row["class"]
+    name = posixpath.basename(path)
+
+    def quarantine(reason: str) -> _Outcome:
+        outcome.disposition = "quarantine"
+        outcome.reason = reason
+        return outcome
+
+    def unclassified() -> _Outcome:
+        if path in operator_paths:
+            return quarantine("operator")
+        outcome.failure = (
+            f"unclassified: {path} ({observed}, class={klass}, rules={','.join(rules)}); "
+            "no disposition rule covers it -- remove it or list it in "
+            "legacy_adoption.quarantine_paths after review"
+        )
+        return outcome
+
+    if observed not in _QUARANTINABLE_TYPES:
+        return unclassified()
+    if klass == "credential":
+        return quarantine("credential")
+    if klass == "authority":
+        link = links.get(path)
+        if (
+            link is not None
+            and "systemd-wants" in rules
+            and observed == "symlink"
+            and row["content"] == {"target": link[1]}
+            and path not in operator_paths
+        ):
+            # The enable step would create exactly this link.
+            outcome.disposition = "adopt"
+            outcome.step_id = link[0]
+            return outcome
+        if name in SUPERSEDED_BY_LAUNCHER:
+            return quarantine("superseded-by-launcher")
+        return quarantine("authority")
+    if name in SUPERSEDED_BY_LAUNCHER and "env-dir" in rules:
+        return quarantine("superseded-by-launcher")
+    if "state-top" in rules:
+        return quarantine("state-top")
+    if "deploy-top" in rules and any(
+        fnmatch.fnmatchcase(name, pattern) for pattern in DEPLOY_BACKUP_PATTERNS
+    ):
+        return quarantine("deploy-backup")
+    if "managed-subdir" in rules:
+        return quarantine("managed-subdir")
+    if "managed-residue" in rules:
+        return quarantine("managed-residue")
+    return unclassified()
+
+
+def _classify_credential(
+    row: Mapping[str, object], *, operator_paths: frozenset[str]
+) -> _Outcome:
+    path = str(row["path"])
+    outcome = _Outcome(path, "credentials", row)
+    lstat_value = row["lstat"]
+    assert isinstance(lstat_value, Mapping)
+    if lstat_value["type"] not in _QUARANTINABLE_TYPES and path not in operator_paths:
+        outcome.failure = (
+            f"unclassified: credential destination {path} is a {lstat_value['type']}"
+        )
+        return outcome
+    outcome.disposition = "quarantine"
+    outcome.reason = "credential" if path not in operator_paths else "operator"
+    return outcome
+
+
+def _account_failures(
+    desired: Mapping[str, object], row: Mapping[str, object]
+) -> list[str]:
+    """Why an account row does not match the overlay field by field."""
+
+    name = str(desired["name"])
+    uid = desired["uid"]
+    gid = desired["gid"]
+    problems: list[str] = []
+    uid_holders = row["uid_holders"]
+    gid_holders = row["gid_holders"]
+    assert isinstance(uid_holders, Mapping) and isinstance(gid_holders, Mapping)
+    foreign_uid = [holder for holder in uid_holders.get(str(uid), []) if holder != name]
+    held = gid_holders.get(str(gid), {})
+    held = held if isinstance(held, Mapping) else {}
+    foreign_groups = [holder for holder in held.get("groups", []) if holder != name]
+    foreign_primary = [holder for holder in held.get("primary_users", []) if holder != name]
+    if foreign_uid:
+        problems.append(f"uid {uid} is held by {', '.join(foreign_uid)}")
+    if foreign_groups:
+        problems.append(f"gid {gid} is held by group {', '.join(foreign_groups)}")
+    if foreign_primary:
+        problems.append(f"gid {gid} is the primary group of {', '.join(foreign_primary)}")
+    passwd = row["passwd"]
+    group = row["group"]
+    if not isinstance(passwd, Mapping):
+        if group is not None:
+            problems.append(f"group {name} exists without the account")
+    else:
+        for field, expected in (
+            ("uid", uid),
+            ("gid", gid),
+            ("home", desired["home"]),
+            ("shell", desired["shell"]),
+        ):
+            if passwd[field] != expected:
+                problems.append(
+                    f"{field} is {passwd[field]!r} but the overlay declares {expected!r}"
+                )
+        if not isinstance(group, Mapping):
+            problems.append(f"group {name} is missing")
+        else:
+            if group["gid"] != gid:
+                problems.append(
+                    f"group {name} has gid {group['gid']} but the overlay declares {gid}"
+                )
+            members = [member for member in group["members"] if member != name]  # type: ignore[union-attr]
+            if members:
+                problems.append(f"group {name} has member(s) {', '.join(members)}")
+        supplementary = row["supplementary_groups"]
+        if supplementary:
+            problems.append(
+                f"supplementary groups {', '.join(supplementary)} are not allowed"  # type: ignore[arg-type]
+            )
+        if row["password_locked"] is not True:
+            problems.append("password is not locked")
+    return [
+        f"account {name}: {problem}; the installer never remaps ids or alters other identities"
+        for problem in problems
+    ]
+
+
+def _quarantine_root_problems(root: str, scope: Mapping[str, object]) -> list[str]:
+    problems: list[str] = []
+    for protected in _scope_protected_paths(scope):
+        if _within(root, protected):
+            problems.append(
+                f"quarantine_root {root} lies inside {protected}, which the inventory records"
+            )
+        elif _within(protected, root):
+            problems.append(
+                f"quarantine_root {root} contains {protected}, which the inventory records"
+            )
+    return problems
+
+
+def _quarantine_expected(
+    lstat_value: Mapping[str, object], content: object
+) -> dict[str, object]:
+    expected: dict[str, object] = {key: lstat_value[key] for key in _EXPECTED_BASE_KEYS}
+    if isinstance(content, Mapping):
+        if lstat_value["type"] == "file" and _is_sha256(content.get("sha256")):
+            expected["sha256"] = content["sha256"]
+        elif lstat_value["type"] == "symlink" and isinstance(content.get("target"), str):
+            expected["link_target"] = content["target"]
+    return expected
+
+
+def _quarantine_step_digest(step: Mapping[str, object]) -> str:
+    return _digest(
+        {
+            "kind": QUARANTINE_STEP_KIND,
+            "path": step.get("path"),
+            "destination": step.get("destination"),
+            "expected": step.get("expected"),
+            "row_sha256": step.get("row_sha256"),
+        }
+    )
+
+
+def _quarantine_step(
+    outcome: _Outcome, *, quarantine_root: str, inventory_sha256: str
+) -> dict[str, object]:
+    lstat_value = outcome.row["lstat"]
+    assert isinstance(lstat_value, Mapping)
+    step: dict[str, object] = {
+        "step_id": f"{QUARANTINE_STEP_KIND}:{outcome.path}",
+        "kind": QUARANTINE_STEP_KIND,
+        "path": outcome.path,
+        "destination": quarantine_destination(quarantine_root, inventory_sha256, outcome.path),
+        "expected": _quarantine_expected(lstat_value, outcome.row.get("content")),
+        "row_sha256": inventory_row_sha256(outcome.section, outcome.row),
+        "operations": list(QUARANTINE_OPERATIONS),
+        "rollback_policy": QUARANTINE_ROLLBACK_POLICY,
+    }
+    step["desired_sha256"] = _quarantine_step_digest(step)
+    return step
+
+
+def _place_quarantine_steps(
+    order: Sequence[Mapping[str, object]], steps: Sequence[dict[str, object]]
+) -> list[Mapping[str, object]]:
+    """Put each quarantine step right after its parent's managed step.
+
+    A path whose parent is not a managed directory (the systemd or polkit
+    root, a HOME's parent) goes right after the account steps.  Parents
+    precede children in a valid plan, so a quarantine placed after its parent
+    precedes every step at or below its own path.
+    """
+
+    directories = {
+        str(step["path"]): index
+        for index, step in enumerate(order)
+        if step.get("kind") == "asset"
+        and step.get("asset_type") == "directory"
+        and isinstance(step.get("path"), str)
+    }
+    last_account = max(
+        (index for index, step in enumerate(order) if step.get("kind") == "account"),
+        default=-1,
+    )
+    anchored: dict[int, list[dict[str, object]]] = {}
+    for step in steps:
+        anchor = directories.get(posixpath.dirname(str(step["path"])), last_account)
+        anchored.setdefault(anchor, []).append(step)
+    placed: list[Mapping[str, object]] = list(
+        sorted(anchored.get(-1, []), key=lambda row: str(row["path"]))
+    )
+    for index, step in enumerate(order):
+        placed.append(step)
+        placed.extend(sorted(anchored.get(index, []), key=lambda row: str(row["path"])))
+    return placed
+
+
+def _covering_root(path: str, roots: frozenset[str]) -> str | None:
+    parent = posixpath.dirname(path)
+    while parent not in {"/", ""}:
+        if parent in roots:
+            return parent
+        parent = posixpath.dirname(parent)
+    return None
+
+
+def derive_legacy_adoption(
+    plan: Mapping[str, object],
+    *,
+    request: Mapping[str, object],
+    overlay: Mapping[str, object] | None,
+    inventory: LegacyInventory,
+    host_binding_sha256: str,
+) -> dict[str, object]:
+    """Bind ``inventory`` to ``plan`` and derive every object's disposition.
+
+    Binding failures (digest, scope, overlay, host) stop at once; every
+    disposition failure is collected so the operator sees them together.
+    """
+
+    if "legacy_adoption" in plan or any(
+        isinstance(step, Mapping) and step.get("kind") == QUARANTINE_STEP_KIND
+        for step in plan.get("apply_order", []) or []
+    ):
+        raise InstallPlanError("plan is already bound to a legacy inventory")
+    document = inventory.document
+    if request["inventory_sha256"] != inventory.inventory_sha256:
+        raise LegacyAdoptionPlanError(
+            [
+                f"inventory_sha256: the legacy_adoption block names "
+                f"{request['inventory_sha256']} but --legacy-inventory is "
+                f"{inventory.inventory_sha256}"
+            ]
+        )
+    scope = legacy_scope(plan)
+    derived_scope = scope_sha256(scope)
+    if derived_scope != inventory.scope_sha256:
+        raise LegacyAdoptionPlanError(
+            [
+                f"scope: the inventory covers scope {inventory.scope_sha256} but this "
+                f"config, overlay and bundle derive {derived_scope}; recapture it with "
+                "the same inputs"
+            ]
+        )
+    overlay_record = host_overlay_record(overlay)
+    if document["host_overlay"] != overlay_record:
+        raise LegacyAdoptionPlanError(
+            [
+                "host overlay: the inventory was captured with host overlay "
+                f"{(document['host_overlay'] or {}).get('sha256')} but this plan uses "  # type: ignore[union-attr]
+                f"{(overlay_record or {}).get('sha256')}"
+            ]
+        )
+    if inventory.host_binding_sha256 != host_binding_sha256:
+        raise LegacyAdoptionPlanError(
+            [
+                "host binding: the inventory was captured on another host "
+                f"({inventory.host_binding_sha256}); this host is {host_binding_sha256}"
+            ]
+        )
+
+    roots = _plan_roots(plan)
+    quarantine_root = str(request["quarantine_root"])
+    failures: list[str] = list(_quarantine_root_problems(quarantine_root, scope))
+    exceptions = list(request["census_exceptions"])  # type: ignore[arg-type]
+    principals = set(scope["census"]["principals"])  # type: ignore[index]
+    for exception in exceptions:
+        if exception["principal"] not in principals:
+            failures.append(
+                f"census_exceptions: {exception['principal']} is not a job account the "
+                f"census checks ({', '.join(sorted(principals))})"
+            )
+    operator_paths = frozenset(request["quarantine_paths"])  # type: ignore[arg-type]
+
+    # accounts: adopt when they match the overlay field by field
+    adopted: dict[str, str] = {}
+    summary = dict.fromkeys(SUMMARY_KEYS, 0)
+    rows_by_name = {str(row["name"]): row for row in document["accounts"]}  # type: ignore[union-attr]
+    for _kind, desired in _plan_account_rows(plan):
+        name = str(desired["name"])
+        row = rows_by_name.get(name)
+        if row is None:
+            failures.append(f"account {name}: the inventory has no row for it")
+            continue
+        problems = _account_failures(desired, row)
+        failures.extend(problems)
+        if problems:
+            continue
+        if row["passwd"] is None:
+            summary["create"] += 1
+        else:
+            adopted[f"account:{name}"] = inventory_row_sha256("accounts", row)
+            summary["adopt"] += 1
+
+    # every path-bearing object
+    steps_by_id = {
+        str(step["step_id"]): step
+        for step in plan.get("apply_order", []) or []
+        if isinstance(step, Mapping)
+    }
+    toolchain_bin = _toolchain_bin(plan, roots)
+    owners = _owner_ids(plan)
+    links = _enablement_links(plan, roots)
+    outcomes: list[_Outcome] = []
+    for row in document["managed_paths"]:  # type: ignore[union-attr]
+        step_id = str(row["step_id"])
+        step = steps_by_id.get(step_id.removesuffix(":active_link"), {})
+        outcomes.append(
+            _classify_managed(
+                row,
+                step,
+                toolchain_bin=toolchain_bin,
+                owners=owners,
+                operator_paths=operator_paths,
+            )
+        )
+    for row in document["discovered"]:  # type: ignore[union-attr]
+        outcomes.append(_classify_discovered(row, links=links, operator_paths=operator_paths))
+    for row in document["credentials"]:  # type: ignore[union-attr]
+        if isinstance(row["lstat"], Mapping):
+            outcomes.append(_classify_credential(row, operator_paths=operator_paths))
+    existing = {outcome.path for outcome in outcomes if outcome.exists}
+    for path in sorted(operator_paths - existing):
+        failures.append(
+            f"quarantine_paths: {path} is not an existing object in the inventory"
+        )
+
+    candidates: dict[str, _Outcome] = {}
+    for outcome in outcomes:
+        if outcome.failure is None and outcome.disposition in _QUARANTINE_DISPOSITIONS:
+            candidates.setdefault(outcome.path, outcome)
+    quarantine_roots = frozenset(_minimal_roots(list(candidates)))
+    for outcome in outcomes:
+        if outcome.exists:
+            outcome.covered_by = _covering_root(outcome.path, quarantine_roots)
+    for outcome in outcomes:
+        if outcome.covered_by is not None:
+            summary["covered"] += 1
+            continue
+        if outcome.failure is not None:
+            failures.append(outcome.failure)
+            continue
+        if outcome.disposition == "create":
+            summary["create"] += 1
+            continue
+        assert outcome.disposition is not None
+        summary[outcome.disposition] += 1
+        if outcome.disposition in {"adopt", "adopt-in-place"}:
+            assert outcome.step_id is not None
+            if outcome.step_id in adopted:
+                failures.append(
+                    f"adopt: {outcome.path} and another object both claim {outcome.step_id}"
+                )
+            adopted[outcome.step_id] = inventory_row_sha256(outcome.section, outcome.row)
+    for root in sorted(quarantine_roots):
+        content = candidates[root].row.get("content")
+        if isinstance(content, Mapping) and content.get("mountpoint") is True:
+            failures.append(
+                f"mountpoint: {root} is a mountpoint; a rename cannot move it into quarantine"
+            )
+
+    # services must not load cortex units or drop-ins from outside the plan
+    services = document["services"]
+    assert isinstance(services, Mapping)
+    for unit, row in sorted(services.items()):
+        managed_unit = _join(roots["systemd"], unit)
+        fragment = row["fragment_path"]
+        if fragment and fragment != managed_unit:
+            failures.append(
+                f"service: {unit} is loaded from {fragment}, not from {managed_unit}, "
+                "the unit the plan manages"
+            )
+        for dropin in row["drop_in_paths"]:
+            owner_directory = posixpath.basename(posixpath.dirname(str(dropin)))
+            if not owner_directory.startswith("cortex"):
+                continue  # a distribution-wide drop-in, not cortex state
+            if _covering_root(str(dropin), quarantine_roots) is None and dropin not in quarantine_roots:
+                failures.append(
+                    f"service: drop-in {dropin} for {unit} stays outside the quarantine; "
+                    "it would keep altering the unit the plan installs"
+                )
+
+    # writable census: stable, and only declared or excepted paths
+    census = document["census"]
+    assert isinstance(census, Mapping)
+    for principal, row in sorted(census.items()):
+        if row["status"] == "unstable":
+            failures.append(
+                f"census: {principal} entries changed while they were checked (unstable): "
+                f"{', '.join(row['unstable'])}; recapture with the services stopped"
+            )
+        for item in row["writable_outside_declared"]:
+            path = str(item["path"])
+            if not any(
+                exception["principal"] == principal and _within(path, exception["path"])
+                for exception in exceptions
+            ):
+                failures.append(
+                    f"census: {principal} can write {path}, which is neither a "
+                    "plan-declared writable asset nor a legacy_adoption.census_exceptions entry"
+                )
+
+    if failures:
+        raise LegacyAdoptionPlanError(failures)
+
+    quarantine_rows: list[dict[str, object]] = []
+    quarantine_steps: list[dict[str, object]] = []
+    for root in sorted(quarantine_roots):
+        outcome = candidates[root]
+        step = _quarantine_step(
+            outcome,
+            quarantine_root=quarantine_root,
+            inventory_sha256=inventory.inventory_sha256,
+        )
+        quarantine_steps.append(step)
+        quarantine_rows.append(
+            {
+                "path": root,
+                "disposition": outcome.disposition,
+                "reason": outcome.reason,
+                "row_sha256": step["row_sha256"],
+                "covers": sorted(
+                    {other.path for other in outcomes if other.covered_by == root}
+                ),
+            }
+        )
+
+    bound = deepcopy(dict(plan))
+    order = bound["apply_order"]
+    assert isinstance(order, list)
+    bound["apply_order"] = _place_quarantine_steps(order, quarantine_steps)
+    bound["legacy_adoption"] = {
+        "schema_version": LEGACY_PLAN_SCHEMA_VERSION,
+        "inventory_sha256": inventory.inventory_sha256,
+        "scope_sha256": inventory.scope_sha256,
+        "host_binding_sha256": inventory.host_binding_sha256,
+        "host_overlay_sha256": None if overlay_record is None else overlay_record["sha256"],
+        "quarantine_root": quarantine_root,
+        "adopted": dict(sorted(adopted.items())),
+        "quarantine": quarantine_rows,
+        "census_exceptions": exceptions,
+        "summary": summary,
+    }
+    bound["receipt_path"] = str(canonical_receipt_path(bound))
+    _assert_managed_parent_topology(bound)
+    validate_legacy_adoption_plan(bound, bound["apply_order"])  # type: ignore[arg-type]
+    return bound
+
+
+def _plan_sorted_unique(keys: Sequence[object], label: str) -> None:
+    if any(left >= right for left, right in zip(keys, keys[1:])):  # type: ignore[operator]
+        raise InstallPlanError(f"plan {label} must be sorted and unique")
+
+
+def _adoptable_step(step: Mapping[str, object]) -> bool:
+    kind = step.get("kind")
+    return (
+        kind == "account"
+        or (kind == "asset" and step.get("asset_type") in {"directory", "symlink"})
+        or (kind == "systemctl" and step.get("action") == "enable")
+    )
+
+
+def _validate_quarantine_expected(value: object, label: str) -> None:
+    if not isinstance(value, Mapping):
+        raise InstallPlanError(f"{label} expected must be an object")
+    keys = set(value)
+    extra = keys - set(_EXPECTED_BASE_KEYS)
+    if not set(_EXPECTED_BASE_KEYS) <= keys or len(extra) > 1 or not extra <= {
+        "sha256",
+        "link_target",
+    }:
+        raise InstallPlanError(f"{label} expected keys are invalid")
+    if value["type"] not in _QUARANTINABLE_TYPES:
+        raise InstallPlanError(f"{label} expected type is invalid")
+    if not all(type(value[key]) is int for key in ("uid", "gid", "dev", "ino")):
+        raise InstallPlanError(f"{label} expected numbers are invalid")
+    if not isinstance(value["mode"], str) or not re.fullmatch(r"[0-7]{4}", value["mode"]):
+        raise InstallPlanError(f"{label} expected mode is invalid")
+    if "sha256" in value and (value["type"] != "file" or not _is_sha256(value["sha256"])):
+        raise InstallPlanError(f"{label} expected sha256 is invalid")
+    if "link_target" in value and (
+        value["type"] != "symlink" or not isinstance(value["link_target"], str)
+    ):
+        raise InstallPlanError(f"{label} expected link_target is invalid")
+
+
+def validate_legacy_adoption_plan(
+    plan: Mapping[str, object], steps: Sequence[Mapping[str, object]]
+) -> None:
+    """Revalidate a plan's ``legacy_adoption`` block against its own steps.
+
+    Dispositions cannot be re-derived without the inventory; this proves the
+    block is internally consistent and bound to the plan: scope, overlay,
+    quarantine root and destinations, adopted step ids, and an exact
+    bijection between quarantine rows and ``legacy-quarantine`` steps.
+    """
+
+    block = plan.get("legacy_adoption")
+    quarantine_steps = [step for step in steps if step.get("kind") == QUARANTINE_STEP_KIND]
+    if block is None:
+        if quarantine_steps:
+            raise InstallPlanError("legacy-quarantine steps require a legacy_adoption block")
+        return
+    if plan.get("legacy_policy") != "quarantine":
+        raise InstallPlanError("a legacy_adoption block requires legacy_policy: quarantine")
+    if not isinstance(block, Mapping) or set(block) != _LEGACY_BLOCK_KEYS:
+        raise InstallPlanError("plan legacy_adoption keys do not match schema v1")
+    if block["schema_version"] != LEGACY_PLAN_SCHEMA_VERSION:
+        raise InstallPlanError("plan legacy_adoption schema_version must be 1")
+    for field in ("inventory_sha256", "scope_sha256", "host_binding_sha256"):
+        if not _is_sha256(block[field]):
+            raise InstallPlanError(f"plan legacy_adoption.{field} is invalid")
+    overlay = block["host_overlay_sha256"]
+    if overlay != plan.get("host_overlay_sha256") or (
+        overlay is not None and not _is_sha256(overlay)
+    ):
+        raise InstallPlanError(
+            "plan legacy_adoption.host_overlay_sha256 does not match the plan host overlay"
+        )
+    scope = legacy_scope(plan)
+    if scope_sha256(scope) != block["scope_sha256"]:
+        raise InstallPlanError("plan legacy_adoption.scope_sha256 does not match the plan scope")
+    quarantine_root = block["quarantine_root"]
+    if not _normalized_absolute(quarantine_root) or _quarantine_root_problems(
+        str(quarantine_root), scope
+    ):
+        raise InstallPlanError("plan legacy_adoption.quarantine_root is invalid")
+
+    exceptions = block["census_exceptions"]
+    principals = set(scope["census"]["principals"])  # type: ignore[index]
+    if type(exceptions) is not list or any(
+        not isinstance(row, Mapping)
+        or set(row) != {"path", "principal"}
+        or not _normalized_absolute(row["path"])
+        or row["principal"] not in principals
+        for row in exceptions
+    ):
+        raise InstallPlanError("plan legacy_adoption.census_exceptions are invalid")
+    _plan_sorted_unique(
+        [(row["path"], row["principal"]) for row in exceptions],
+        "legacy_adoption.census_exceptions",
+    )
+
+    by_id = {str(step.get("step_id")): step for step in steps}
+    adopted = block["adopted"]
+    if not isinstance(adopted, Mapping):
+        raise InstallPlanError("plan legacy_adoption.adopted must be an object")
+    for step_id, digest in adopted.items():
+        step = by_id.get(str(step_id))
+        if step is None or not _adoptable_step(step) or not _is_sha256(digest):
+            raise InstallPlanError(
+                f"plan legacy_adoption.adopted names a step the plan cannot adopt: {step_id}"
+            )
+
+    rows = block["quarantine"]
+    if type(rows) is not list:
+        raise InstallPlanError("plan legacy_adoption.quarantine must be a list")
+    for row in rows:
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != _QUARANTINE_ROW_KEYS
+            or not _normalized_absolute(row["path"])
+            or row["disposition"] not in _QUARANTINE_DISPOSITIONS
+            or row["reason"] not in QUARANTINE_REASONS
+            or not _is_sha256(row["row_sha256"])
+            or type(row["covers"]) is not list
+            or not all(
+                _normalized_absolute(item) and str(item).startswith(str(row["path"]) + "/")
+                for item in row["covers"]
+            )
+        ):
+            raise InstallPlanError("plan legacy_adoption.quarantine rows are invalid")
+        _plan_sorted_unique(row["covers"], f"legacy_adoption.quarantine {row['path']} covers")
+    paths = [str(row["path"]) for row in rows]
+    _plan_sorted_unique(paths, "legacy_adoption.quarantine")
+    if any(_within(other, path) for path in paths for other in paths if other != path):
+        raise InstallPlanError("plan legacy_adoption.quarantine paths must not nest")
+
+    steps_by_path: dict[str, Mapping[str, object]] = {}
+    for step in quarantine_steps:
+        path = step.get("path")
+        if not isinstance(path, str) or path in steps_by_path:
+            raise InstallPlanError("legacy-quarantine steps require unique paths")
+        steps_by_path[path] = step
+    if set(steps_by_path) != set(paths):
+        raise InstallPlanError(
+            "legacy quarantine rows and legacy-quarantine steps are not a bijection"
+        )
+    managed_paths = {
+        str(step["path"])
+        for step in steps
+        if step.get("kind") in {"asset", "repository"} and isinstance(step.get("path"), str)
+    }
+    for row in rows:
+        path = str(row["path"])
+        step = steps_by_path[path]
+        label = f"legacy-quarantine step {path}"
+        if set(step) != _QUARANTINE_STEP_KEYS or step["step_id"] != f"{QUARANTINE_STEP_KIND}:{path}":
+            raise InstallPlanError(f"{label} does not match schema v1")
+        if step["destination"] != quarantine_destination(
+            str(quarantine_root), str(block["inventory_sha256"]), path
+        ):
+            raise InstallPlanError(
+                f"{label} destination is not bound to the quarantine root and inventory"
+            )
+        _validate_quarantine_expected(step["expected"], label)
+        if step["row_sha256"] != row["row_sha256"]:
+            raise InstallPlanError(f"{label} row_sha256 does not match its quarantine row")
+        if (
+            step["operations"] != list(QUARANTINE_OPERATIONS)
+            or step["rollback_policy"] != QUARANTINE_ROLLBACK_POLICY
+        ):
+            raise InstallPlanError(f"{label} operations or rollback policy are invalid")
+        if step["desired_sha256"] != _quarantine_step_digest(step):
+            raise InstallPlanError(f"{label} desired_sha256 does not match the step")
+        if (row["disposition"] == "quarantine-then-create") != (path in managed_paths):
+            raise InstallPlanError(
+                f"{label} disposition {row['disposition']} does not match the plan's steps"
+            )
+    for step_id in adopted:
+        target = by_id[str(step_id)].get("path")
+        if isinstance(target, str) and any(_within(target, path) for path in paths):
+            raise InstallPlanError(
+                f"plan legacy_adoption.adopted step {step_id} lies inside a quarantined path"
+            )
+
+    summary = block["summary"]
+    if (
+        not isinstance(summary, Mapping)
+        or set(summary) != set(SUMMARY_KEYS)
+        or not all(type(value) is int and value >= 0 for value in summary.values())
+    ):
+        raise InstallPlanError("plan legacy_adoption.summary is invalid")

@@ -1258,6 +1258,39 @@ def _assert_managed_parent_topology(plan: Mapping[str, object]) -> None:
                 f"{step.get('step_id')} -> {parent}"
             )
 
+    # A legacy quarantine moves an existing object away.  Its parent already
+    # exists, but a managed parent's metadata step runs first; and the move
+    # must happen before any step writes at or below the same path.
+    path_positions = [
+        (index, str(value))
+        for index, step in enumerate(steps)
+        if isinstance(step, Mapping)
+        and step.get("kind") in {"asset", "repository", "toolchain", "venv"}
+        for value in (step.get("path"), step.get("active_link"))
+        if isinstance(value, str)
+    ]
+    for index, step in enumerate(steps):
+        if not isinstance(step, Mapping) or step.get("kind") != "legacy-quarantine":
+            continue
+        raw_path = step.get("path")
+        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+            raise InstallPlanError(
+                f"legacy quarantine has invalid absolute path: {step.get('step_id')}"
+            )
+        parent_position = directory_positions.get(Path(raw_path).parent)
+        if parent_position is not None and parent_position >= index:
+            raise InstallPlanError(
+                "managed parent must precede its legacy quarantine: "
+                f"{step.get('step_id')} -> {Path(raw_path).parent}"
+            )
+        prefix = raw_path.rstrip("/") + "/"
+        for position, value in path_positions:
+            if (value == raw_path or value.startswith(prefix)) and position <= index:
+                raise InstallPlanError(
+                    "legacy quarantine must precede every step at or below its path: "
+                    f"{step.get('step_id')} -> {steps[position].get('step_id')}"
+                )
+
 
 def canonical_receipt_path(plan: Mapping[str, object]) -> Path:
     """Derive the default receipt authority from immutable plan identity."""
@@ -3824,6 +3857,7 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
             "venv",
             "toolchain",
             "repository",
+            "legacy-quarantine",
         }:
             raise InstallPlanError(f"unknown or untyped apply step kind: {step!r}")
         step_id = step.get("step_id")
@@ -3841,10 +3875,28 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
     _validate_candidate_venv(plan, typed_steps)
     _validate_account_step_bijection(account_inventory, typed_steps)
     _validate_repository_step_bijection(plan, typed_steps, repo_identity)
+    if "host_overlay_sha256" in plan and not _valid_sha256(
+        plan.get("host_overlay_sha256")
+    ):
+        raise InstallPlanError("plan host_overlay_sha256 must be a sha256 digest")
+    if "legacy_adoption" in plan or any(
+        step.get("kind") == "legacy-quarantine" for step in typed_steps
+    ):
+        # Imported lazily: the legacy module builds on this one.
+        from .legacy import validate_legacy_adoption_plan
+
+        validate_legacy_adoption_plan(plan, typed_steps)
     _assert_managed_parent_topology(plan)
     _validate_finalized_apply_surfaces(plan, typed_steps)
     _validate_canonical_receipt_path(plan)
     return typed_steps
+
+
+_LEGACY_APPLY_NOT_IMPLEMENTED = (
+    "legacy adoption apply is not implemented yet (#1122): this installer can "
+    "plan a legacy_adoption block for review but refuses to lease, apply or "
+    "recover it until the apply, receipt and rollback support lands"
+)
 
 
 def validate_apply_plan(
@@ -3856,12 +3908,24 @@ def validate_apply_plan(
         raise InstallPlanError(
             "confirm-sha256 does not match the canonical plan sha256"
         )
+    allowed_field_paths = {("required_credentials",)}
+    legacy_block = plan.get("legacy_adoption")
+    adopted = legacy_block.get("adopted") if isinstance(legacy_block, Mapping) else None
+    if isinstance(adopted, Mapping):
+        # Adopted rows are keyed by step id, which may name a credential
+        # container; the schema below requires every key to be a plan step.
+        allowed_field_paths.update(
+            ("legacy_adoption", "adopted", str(key).casefold()) for key in adopted
+        )
     _reject_sensitive_config(
         plan,
-        allowed_field_paths=frozenset({("required_credentials",)}),
+        allowed_field_paths=frozenset(allowed_field_paths),
         subject="plan",
     )
-    return tuple(_validate_apply_plan_schema(plan))
+    steps = tuple(_validate_apply_plan_schema(plan))
+    if "legacy_adoption" in plan:
+        raise InstallPlanError(_LEGACY_APPLY_NOT_IMPLEMENTED)
+    return steps
 
 
 def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
