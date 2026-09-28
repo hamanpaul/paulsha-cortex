@@ -26,8 +26,8 @@ work_item: review-gate-adjudication-exit
 
    宣告順序：既有 extras 在前，後面依序是 `retry-review`、`retry-build`；已存在的不重複列。其他 reason（含 `copilot-*`）以及其他 phase 的宣告結果維持不變。
 6. **R6 `next_step_hint`**：新增純函式 `work_actions.blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str`，輸出 zh-tw，逐字列出兩條指令，並註明兩者都不適用時才 `abandon`：
-   - 接受：`cortex run work retry-review <work_id> --repo <repo> --expected-candidate <candidate> --actor <operator> --reason '<裁決>'`
-   - 駁回：`cortex run work retry-build <work_id> --repo <repo> --expected-candidate <candidate> --actor <operator> --reason '<裁決>'`
+   - 豁免 finding（接受偏離、候選不修改）：`cortex run work retry-review <work_id> --repo <repo> --expected-candidate <candidate> --actor <operator> --reason '<裁決>'`
+   - 要求修正（finding 成立）：`cortex run work retry-build <work_id> --repo <repo> --expected-candidate <candidate> --actor <operator> --reason '<裁決>'`
 
    參數不合格式時改用佔位字串：`work_id` 須符合 `[a-z0-9][a-z0-9-]*`，否則為 `<work-id>`；`repo` 須為 `owner/repo`，否則為 `<owner/repo>`；`candidate` 須為 40-hex，否則為 `<candidate-sha>`。使用點有兩處：
    - (a) `_claim_action`（resume）的回應：補上的 extras 含 `retry-review`，且 `canonical_run.needs_human_reason` 的 reason 為 `blocking-findings` 時，以本函式輸出覆寫 `next_step_hint`。

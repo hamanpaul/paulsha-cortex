@@ -564,3 +564,15 @@ def test_retry_review_evidence_write_failure_keeps_run_needs_human(
         next(step for step in unchanged.steps if step.phase == "review").gate_result
         == "needs_human"
     )
+
+
+def test_blocking_findings_hint_names_each_exit_by_its_effect() -> None:
+    """#1139：「接受／駁回 finding」易被讀成「同意／否認 finding 成立」，語意相反。"""
+
+    hint = work_actions.blocking_findings_next_step_hint(
+        work_id=WORK_ID, repo=REPO, candidate=HEAD
+    )
+    waive, fix = hint.splitlines()[0], hint.splitlines()[1]
+    assert "豁免" in waive and "retry-review" in waive and "不修改" in waive
+    assert "要求修正" in fix and "retry-build" in fix
+    assert "接受 finding" not in hint and "駁回 finding" not in hint

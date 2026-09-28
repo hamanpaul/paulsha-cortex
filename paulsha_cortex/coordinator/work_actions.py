@@ -4582,10 +4582,12 @@ def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
         else "<candidate-sha>"
     )
     prefix = f"cortex run work {{action}} {work_value} --repo {repo_value} --expected-candidate {candidate_value} --actor <operator> --reason '<裁決>'"
+    # #1139：以「效果」命名兩個出口。「接受／駁回 finding」易被讀成「同意／否認
+    # finding 成立」，與實際語意相反。
     return (
-        "接受 finding：`"
+        "豁免 finding（接受偏離、候選不修改；裁決注入重派的 reviewer）：`"
         + prefix.format(action="retry-review")
-        + "`\n駁回 finding：`"
+        + "`\n要求修正（finding 成立；裁決注入重派的 builder）：`"
         + prefix.format(action="retry-build")
         + "`\n兩者都不適用時才執行 `abandon`。"
     )
