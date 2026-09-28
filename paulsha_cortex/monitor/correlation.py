@@ -255,6 +255,17 @@ def correlate_work_sources(
                         source for source in sources if source.source_id == work_id
                     )
                     linked.add(_fallback_work_id(target))
+                # 1106：github_closing 只是「同一個整合 PR 把這些票綁在一起」的
+                # 推論式關聯，權威性低於 override／frontmatter（甚至
+                # workflow_metadata）。這個來源（可能是 PR 本身，也可能是同一個
+                # 整合 PR 關閉的其他票）如果已經有自己、與 primary 票不同的權威
+                # 歸屬，維持它自己的歸屬即可，不要再套用 primary 票目前的
+                # owner——否則整合 PR 一次關閉多張各自已有 owner 的票時，會把
+                # 它們全部拖成 confirmed source collision，讓整個 repo 被標
+                # degraded（issue #1106）。
+                own = candidates[source_id]
+                if own and own != linked:
+                    continue
                 for linked_work_id in linked:
                     source = next(
                         source for source in sources if source.source_id == source_id
