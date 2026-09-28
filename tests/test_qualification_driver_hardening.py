@@ -62,7 +62,34 @@ def _preflight(**overrides) -> dict[str, object]:
     return payload
 
 
+AGY_CONVERSATION_ID = "2a672272-32ca-4941-967e-27ca17031611"
+
+
+def _agy_print_json(*, response: str = "QUALIFICATION_OK\n", status: str = "SUCCESS") -> str:
+    """真實 agy 1.2.x `--print --output-format json` 的輸出形狀（不帶 model／effort）。"""
+
+    return json.dumps(
+        {
+            "conversation_id": AGY_CONVERSATION_ID,
+            "status": status,
+            "response": response,
+            "duration_seconds": 13.8,
+            "num_turns": 1,
+            "usage": {"input_tokens": 14001, "output_tokens": 40, "total_tokens": 14041},
+        }
+    ) + "\n"
+
+
+def _agy_variant() -> str:
+    return f"{PROVIDER_MODELS['agy']}-{PROVIDER_EFFORTS['agy']}"
+
+
 def _smoke(provider: str, *, extra_model: str | None = None) -> str:
+    if provider == "agy":
+        output = _agy_print_json()
+        if extra_model is not None:
+            output += json.dumps({"fallback": True, "fallbackModel": extra_model}) + "\n"
+        return output
     models = {
         "agy": PROVIDER_MODELS["agy"],
         "copilot": PROVIDER_MODELS["copilot"],
@@ -120,6 +147,11 @@ def test_provider_smokes_use_live_preflight_and_unique_runtime_metadata(
             "reasoningEffort": PROVIDER_EFFORTS["codex"],
             "modelProvider": "openai",
         },
+    )
+    monkeypatch.setattr(
+        driver,
+        "_agy_persisted_model_variants",
+        lambda _conversation_id, *, account: {_agy_variant()},
     )
     verdicts = driver._provider_smokes(tmp_path)
     assert [
@@ -201,9 +233,171 @@ def test_provider_smokes_reject_requested_plus_fallback_metadata(
             "modelProvider": "openai",
         },
     )
+    monkeypatch.setattr(
+        driver,
+        "_agy_persisted_model_variants",
+        lambda _conversation_id, *, account: {_agy_variant()},
+    )
     with pytest.raises(driver.QualificationFailure, match="unique exact"):
         driver._provider_smokes(tmp_path)
     assert not (tmp_path / "provider-capabilities.json").exists()
+
+
+def _smokes_with_agy(
+    driver,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    agy_stdout: str,
+    variants: set[str] | None = None,
+):
+    persisted_calls: list[tuple[str, str]] = []
+
+    def fake_run(argv, **_kwargs):
+        provider = _provider_name(argv)
+        if provider == "agy":
+            return _result(driver, argv, stdout=agy_stdout)
+        return _result(driver, argv, stdout=_smoke(provider))
+
+    def fake_variants(conversation_id, *, account):
+        persisted_calls.append((conversation_id, account))
+        return set(variants if variants is not None else {_agy_variant()})
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    monkeypatch.setattr(
+        driver, "_provider_preflight", lambda _provider, _account: _preflight()
+    )
+    monkeypatch.setattr(driver, "_agy_persisted_model_variants", fake_variants)
+    monkeypatch.setattr(
+        driver,
+        "_codex_provider_thread_result",
+        lambda _thread_id, **_kwargs: {
+            "thread": {"id": "thread-provider-smoke"},
+            "model": PROVIDER_MODELS["codex"],
+            "reasoningEffort": PROVIDER_EFFORTS["codex"],
+            "modelProvider": "openai",
+        },
+    )
+    return persisted_calls
+
+
+def test_agy_smoke_proves_model_and_effort_from_persisted_conversation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：agy 1.2.x 的 JSON 輸出不帶 model／effort，改由持久化的變體 id 證明。"""
+
+    driver = _load_driver()
+    calls = _smokes_with_agy(
+        driver, tmp_path, monkeypatch, agy_stdout=_agy_print_json()
+    )
+    verdicts = driver._provider_smokes(tmp_path)
+    agy = verdicts[0]
+    assert (agy["provider"], agy["runtime_model"], agy["runtime_effort"]) == (
+        "agy",
+        PROVIDER_MODELS["agy"],
+        PROVIDER_EFFORTS["agy"],
+    )
+    assert calls == [(AGY_CONVERSATION_ID, PROVIDER_CONTRACTS["agy"]["account"])]
+    evidence = json.loads((tmp_path / "provider-capabilities.json").read_text())
+    assert evidence["providers"]["agy"]["persisted_variants"] == [_agy_variant()]
+    assert evidence["providers"]["agy"]["models"] == [PROVIDER_MODELS["agy"]]
+    assert evidence["providers"]["agy"]["efforts"] == [PROVIDER_EFFORTS["agy"]]
+
+
+@pytest.mark.parametrize(
+    ("variants", "fragment"),
+    [
+        ({f"{PROVIDER_MODELS['agy']}-low"}, "-low"),
+        ({f"{PROVIDER_MODELS['agy']}-high", f"{PROVIDER_MODELS['agy']}-low"}, "-low"),
+        (set(), "models=[]"),
+    ],
+)
+def test_agy_smoke_rejects_persisted_variant_that_is_not_the_requested_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variants: set[str],
+    fragment: str,
+) -> None:
+    driver = _load_driver()
+    _smokes_with_agy(
+        driver,
+        tmp_path,
+        monkeypatch,
+        agy_stdout=_agy_print_json(),
+        variants=variants,
+    )
+    with pytest.raises(driver.QualificationFailure, match="provider agy") as caught:
+        driver._provider_smokes(tmp_path)
+    assert fragment in str(caught.value)
+    assert not (tmp_path / "provider-capabilities.json").exists()
+
+
+@pytest.mark.parametrize(
+    "agy_stdout",
+    [
+        _agy_print_json(response="QUALIFICATION_OK extra\n"),
+        _agy_print_json(response="QUALIFICATION_OK\n\n"),
+        _agy_print_json(status="ERROR"),
+        json.dumps({"status": "SUCCESS", "response": "QUALIFICATION_OK\n"}) + "\n",
+        json.dumps(
+            {"conversation_id": "not-a-uuid", "status": "SUCCESS", "response": "QUALIFICATION_OK\n"}
+        )
+        + "\n",
+    ],
+)
+def test_agy_smoke_requires_exact_response_and_unique_conversation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, agy_stdout: str
+) -> None:
+    driver = _load_driver()
+    _smokes_with_agy(driver, tmp_path, monkeypatch, agy_stdout=agy_stdout)
+    with pytest.raises(driver.QualificationFailure, match="provider agy"):
+        driver._provider_smokes(tmp_path)
+
+
+def test_agy_persisted_variants_are_read_as_the_account_from_its_own_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+    import subprocess
+
+    driver = _load_driver()
+    home = tmp_path / "home"
+    conversations = home / ".gemini" / "antigravity-cli" / "conversations"
+    conversations.mkdir(parents=True)
+    database = sqlite3.connect(conversations / f"{AGY_CONVERSATION_ID}.db")
+    database.execute("create table executor_metadata (idx integer, data blob)")
+    database.execute(
+        "insert into executor_metadata values (0, ?)",
+        (b"\x0a\x15" + _agy_variant().encode() + b"\x12\x05other",),
+    )
+    database.commit()
+    database.close()
+    seen: list[tuple[tuple[str, ...], str | None]] = []
+
+    def fake_run(argv, *, user=None, env=None, timeout=120):
+        seen.append((tuple(argv), user))
+        completed = subprocess.run(
+            list(argv),
+            capture_output=True,
+            text=True,
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+            check=False,
+        )
+        return driver.CommandResult(
+            tuple(argv), completed.returncode, completed.stdout, completed.stderr
+        )
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {"HOME": str(home)})
+    variants = driver._agy_persisted_model_variants(
+        AGY_CONVERSATION_ID, account="cortex-reviewer-planner"
+    )
+    assert variants == {_agy_variant()}
+    argv, user = seen[0]
+    assert user == "cortex-reviewer-planner"
+    assert argv[:2] == ("/usr/bin/python3", "-I")
+    with pytest.raises(driver.QualificationFailure):
+        driver._agy_persisted_model_variants("../escape", account="cortex-reviewer-planner")
 
 
 def test_provider_preflight_uses_only_supported_pinned_argv() -> None:
