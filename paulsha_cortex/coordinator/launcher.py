@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
-from . import gate_ledger, job_runner, job_workspace, spool_slot, terminal_contract
+from . import gate_ledger, job_runner, job_workspace, spool_slot, task_memory, terminal_contract
 from ..persona.context import build_persona_context
 
 
@@ -142,6 +142,10 @@ def _claude_review_json_schema(kind: str) -> str:
         }
     else:
         raise ValueError("Claude reviewer terminal contract kind invalid")
+    # #1136：選填的 task-memory 使用回報。工具 schema 只開放屬性（additionalProperties
+    # 為 false，不開就交不出來）；是否採用、note 是否已交付、evidence 是否在審查對象
+    # 內且 hash 相符，全由 manager harvest 端驗證，結果不影響 verdict。
+    schema["properties"]["task_memory_applied"] = task_memory.task_memory_applied_json_schema()
     return json.dumps(schema, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
