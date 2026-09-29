@@ -308,7 +308,9 @@ class WorkReadModelStore:
 
     def _candidate_git_base(self, repo: str, work_id: str) -> dict:
         for provider_id, provider in self._snapshot.providers.items():
-            if not provider_id.startswith("workflow:"):
+            # #1182：與 `_quota_decision()`／`_needs_human_reason()` 同一個 exact
+            # (repo, work_id) 判準，跨 repo 的相同 work_id 不得互相借用。
+            if not provider_id.startswith("workflow:") or _provider_repo(provider_id) != repo:
                 continue
             observations = provider.observations
             if not isinstance(observations, Mapping):
@@ -365,7 +367,8 @@ class WorkReadModelStore:
 
     def _schema_retry(self, repo: str, work_id: str) -> dict:
         for provider_id, provider in self._snapshot.providers.items():
-            if not provider_id.startswith("workflow:"):
+            # #1182：exact (repo, work_id)，見 `_candidate_git_base()`。
+            if not provider_id.startswith("workflow:") or _provider_repo(provider_id) != repo:
                 continue
             observations = provider.observations
             if not isinstance(observations, Mapping):

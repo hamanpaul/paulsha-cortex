@@ -654,3 +654,51 @@ def test_refresher_quota_decision_cache_survives_across_refresh_ticks_for_last_g
     assert second_status_persona["mode"] == second_persona["mode"]
     assert second_status_persona["selected"] == second_persona["selected"]
     assert second_status_persona["outcome"] == second_persona["outcome"]
+
+
+def test_schema_retry_and_candidate_git_base_are_scoped_to_exact_repo():
+    """#1182：`_schema_retry()`、`_candidate_git_base()` 與 quota_decision 同一個
+    exact (repo, work_id) 判準；只在另一個 repo 有的 observation 不得借到這個 repo。"""
+    shared_work_id = "shared-work-id"
+
+    other_only = ProviderSnapshot(
+        provider_id="workflow:example/other",
+        status="ok",
+        last_attempt_at=NOW,
+        last_success_at=NOW,
+        revision="workflow-other-1",
+        diagnostics=(),
+        sources=(),
+        observations={
+            "schema_retry": {shared_work_id: {"code-review": 2}},
+            "candidate_git_bases": {shared_work_id: {"sha": "b" * 40}},
+        },
+    )
+    acme_empty = ProviderSnapshot(
+        provider_id="workflow:example/acme",
+        status="ok",
+        last_attempt_at=NOW,
+        last_success_at=NOW,
+        revision="workflow-acme-1",
+        diagnostics=(),
+        sources=(),
+        observations={},
+    )
+    store = WorkReadModelStore(
+        _snapshot(
+            _item(shared_work_id, "ongoing", repo="example/acme"),
+            _item(shared_work_id, "ongoing", repo="example/other"),
+            providers={
+                other_only.provider_id: other_only,
+                acme_empty.provider_id: acme_empty,
+            },
+        )
+    )
+
+    acme_envelope = store.get_work_item(shared_work_id, repo="example/acme")
+    other_envelope = store.get_work_item(shared_work_id, repo="example/other")
+
+    assert "schema_retry" not in acme_envelope
+    assert "candidate_git_base" not in acme_envelope
+    assert other_envelope["schema_retry"]["by_card"] == {"code-review": 2}
+    assert other_envelope["candidate_git_base"] == {"sha": "b" * 40}
