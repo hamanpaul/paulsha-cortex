@@ -37,6 +37,7 @@ from .core import (
     _desired_digest,
     _directory_inventory_sha256,
     _open_directory_chain,
+    _observed_drift_detail,
     _open_parent_directory,
     _read_fd_bytes,
     _reject_symlink_ancestors,
@@ -842,10 +843,131 @@ _REPOSITORY_GIT_PREFIX = (
 )
 
 
-def _repository_config_is_canonical(
+#: Auto gc/maintenance may prune worktree registries, expire reflogs, or pack
+#: refs in the background.  Installer mutations of an existing source tree
+#: never start it, so the Manager's runtime state stays exactly as inspected.
+_REPOSITORY_MUTATION_CONFIG = (
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "maintenance.auto=false",
+)
+
+
+# ---------------------------------------------------------------------------
+# #1124: Manager runtime state the repository step reconciles
+# ---------------------------------------------------------------------------
+#
+# The repository step installs a detached clone of the candidate bundle at
+# ``<repo-source-tree>/<slug>``, and that same checkout is the Manager's
+# ``PSC_REPO_ROOT`` (``core._manager_environment``).  The Manager owns the tree
+# (0817 ruling, ``docs/superpowers/specs/trust-root-isolation-spec.md``) and
+# writes to it while jobs run; builder and gate jobs work in per-job clones
+# under ``PSC_WORKTREE_ROOT`` and never write here.  A ``--prior-receipt``
+# upgrade therefore reconciles exactly the runtime state declared below
+# instead of refusing it.  Every other difference stays fail-closed, and the
+# no-follow owner/group, world-writable, and symlink-escape walk still covers
+# every member of the tree, the runtime state included.
+#
+# Each declared shape names the production writer it was derived from
+# (package paths are relative to ``paulsha_cortex/``; ``qualification/`` is
+# the release-candidate harness at the repository root):
+#
+# * git config ``user.name`` / ``user.email`` (plain single-line values):
+#   ``coordinator/seams.py:351-355`` copies the source tree's *local* identity
+#   into every per-job clone -- the builder's root-owned gitconfig carries none
+#   -- and ``qualification/driver.py:3126-3142`` writes it, as the Manager, on
+#   the checkout it registers under ``repo-source-tree``.
+# * linked worktrees at ``.psc-review-worktrees/<slice>-<reviewer job>``:
+#   ``coordinator/review.py:26,222-227`` (path) and ``review.py:510``
+#   (``git worktree add --detach``); the reviewer only reads them.
+# * linked worktrees at ``.psc-verification-worktrees/<slice>-<sha12>``:
+#   ``coordinator/verification.py:29,748-749`` (path), ``:1131`` (add) and
+#   ``:1201`` (remove).  A crash between the two leaves one behind.  A registry
+#   entry whose directory is gone is inert and also accepted:
+#   ``review.py:505-508`` deletes the directory even when
+#   ``git worktree remove`` failed.
+# * refs, by namespace:
+#   ``refs/heads/feature/*`` -- ``coordinator/seams.py:249`` (``branch -f``)
+#   and ``coordinator/job_workspace.py:1131-1132`` (bundle harvest); every
+#   branch name is ``feature/<id>`` (``dispatcher.py:50``, ``autonomy.py:946``,
+#   ``manager.py:4758``);
+#   ``refs/remotes/origin/*`` -- ``fetch --no-tags origin <branch>`` under the
+#   installer's own fetch refspec (``manager.py:1854``,
+#   ``claim_readiness.py:354``, ``autonomy.py:1068``,
+#   ``github_delivery.py:443-449``);
+#   ``refs/tags/archive/<work>-<sha8>`` -- ``work_actions.py:6057,6075``;
+#   ``refs/cortex/reclaimed/<workspace>/<stamp>-<sha12>`` --
+#   ``job_workspace.py:118,1224-1225``;
+#   ``refs/cortex/main-sync{,-quarantine}/<run>`` --
+#   ``work_bridge.py:69-74,1403`` and ``manager.py:4991,5045``;
+#   ``refs/cortex/mirror/<hash16>/{default,pull/<n>}`` --
+#   ``monitor/git_mirror.py:133,211-215``.
+#
+# Deliberately *not* declared:
+#
+# * ``branch.<name>.*`` upstream config.  No trust-root writer exists:
+#   ``seams.py:249`` branches from an exact commit id, which never records an
+#   upstream, and the upstream that ``clone --branch`` records lives in the
+#   per-job clone and is removed there (``seams.py:343-347``).  Upstream
+#   config on a production checkout comes from the pre-#623 worktree/operator
+#   era; that legacy checkout is quarantined and re-cloned by #1122.
+# * linked worktrees anywhere else, including outside the source tree (the
+#   pre-#623 pool worktrees are the same legacy state).  Out-of-tree
+#   directories are never walked: their registry entry alone fails closed.
+# * every other config section or key -- notably executable or redirecting
+#   ones such as ``core.hooksPath``, ``core.fsmonitor``, ``include*``,
+#   ``filter.*``, ``alias.*``, ``credential.*``, ``url.*``, ``extensions.*``
+#   -- and every other ref namespace (``refs/replace/*`` would redirect the
+#   objects a checkout reads).
+_RUNTIME_WORKTREE_ROOTS: tuple[str, ...] = (
+    ".psc-review-worktrees",
+    ".psc-verification-worktrees",
+)
+#: ``<slice id>-<job id>`` / ``<slice id>-<sha12>`` in ASCII
+#: (``verification.py:24``, ``spool_slot.py:103``).
+_RUNTIME_WORKTREE_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+#: What ``git worktree add --detach`` writes into ``.git/worktrees/<id>``.
+_RUNTIME_WORKTREE_ADMIN_ENTRIES = frozenset(
+    {"HEAD", "ORIG_HEAD", "commondir", "gitdir", "index", "locked", "logs", "refs"}
+)
+_RUNTIME_IDENTITY_KEYS = frozenset({"name", "email"})
+_RUNTIME_IDENTITY_VALUE = re.compile(r"[^\x00-\x1f\x7f]{1,256}")
+_RUNTIME_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_RUNTIME_REF_SEGMENTS = r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*"
+_RUNTIME_REF_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        rf"refs/heads/feature/{_RUNTIME_REF_SEGMENTS}",
+        rf"refs/remotes/origin/{_RUNTIME_REF_SEGMENTS}",
+        r"refs/tags/archive/[A-Za-z0-9._-]+-[0-9a-f]{8}",
+        r"refs/cortex/reclaimed/[A-Za-z0-9][A-Za-z0-9_.-]*"
+        r"/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}",
+        r"refs/cortex/main-sync/[A-Za-z0-9][A-Za-z0-9_-]{0,127}",
+        r"refs/cortex/main-sync-quarantine/[A-Za-z0-9][A-Za-z0-9_-]{0,127}",
+        r"refs/cortex/mirror/[0-9a-f]{16}/(?:default|pull/[1-9][0-9]*)",
+    )
+)
+
+
+def _config_key_label(section: str, key: str) -> str:
+    """Spell a parsed key the way ``git config`` names it."""
+
+    match = re.fullmatch(r'(\S+)\s+"(.*)"', section)
+    if match is not None:
+        return f"{match.group(1).lower()}.{match.group(2)}.{key}"
+    return f"{section.lower()}.{key}"
+
+
+def _repository_config_state(
     path: Path, *, remote: object, uid: int, gid: int
-) -> bool:
-    """Accept only the detached clone config emitted by the installer."""
+) -> tuple[bool, str | None, tuple[str, ...]]:
+    """Accept the installer's clone config plus the declared runtime identity.
+
+    Returns ``(safe, drift, runtime_keys)``.  The installer's exact ``core``
+    and ``remote "origin"`` sections stay mandatory and immutable; the only
+    additional section is ``[user]`` carrying plain ``name``/``email`` values.
+    """
 
     git_dir = path / ".git"
     config_path = git_dir / "config"
@@ -853,20 +975,24 @@ def _repository_config_is_canonical(
         git_state = git_dir.lstat()
         config_state = config_path.lstat()
     except OSError:
-        return False
+        return False, "repository .git/config is missing", ()
     if (
         not stat.S_ISDIR(git_state.st_mode)
         or stat.S_ISLNK(git_state.st_mode)
         or git_state.st_uid != uid
         or git_state.st_gid != gid
-        or not stat.S_ISREG(config_state.st_mode)
+    ):
+        return False, "repository .git is not an owner-held directory", ()
+    if (
+        not stat.S_ISREG(config_state.st_mode)
         or stat.S_ISLNK(config_state.st_mode)
         or config_state.st_nlink != 1
         or config_state.st_uid != uid
         or config_state.st_gid != gid
-        or not isinstance(remote, str)
     ):
-        return False
+        return False, "repository .git/config is not an owner-held regular file", ()
+    if not isinstance(remote, str):
+        return False, "repository step remote is invalid", ()
     parser = configparser.RawConfigParser(
         strict=True,
         interpolation=None,
@@ -878,7 +1004,7 @@ def _repository_config_is_canonical(
         with config_path.open("r", encoding="utf-8") as stream:
             parser.read_file(stream)
     except (OSError, UnicodeError, configparser.Error):
-        return False
+        return False, "repository .git/config is not a plain git config", ()
     expected = {
         "core": {
             "repositoryformatversion": "0",
@@ -891,10 +1017,370 @@ def _repository_config_is_canonical(
             "fetch": "+refs/heads/*:refs/remotes/origin/*",
         },
     }
-    return parser.sections() == list(expected) and all(
-        dict(parser.items(section, raw=True)) == values
-        for section, values in expected.items()
+    runtime: list[str] = []
+    for section in parser.sections():
+        values = dict(parser.items(section, raw=True))
+        declared = expected.get(section)
+        if declared is not None:
+            for key, value in values.items():
+                label = _config_key_label(section, key)
+                if key not in declared:
+                    return False, f"undeclared git config key: {label}", ()
+                if value != declared[key]:
+                    return False, f"git config key differs from the clone: {label}", ()
+            continue
+        if section == "user":
+            for key, value in values.items():
+                if key not in _RUNTIME_IDENTITY_KEYS:
+                    return False, f"undeclared git config key: user.{key}", ()
+                if _RUNTIME_IDENTITY_VALUE.fullmatch(value) is None:
+                    return False, f"git config user.{key} is not a plain value", ()
+                runtime.append(f"user.{key}")
+            continue
+        if values:
+            label = _config_key_label(section, next(iter(values)))
+            return False, f"undeclared git config key: {label}", ()
+        return False, f"undeclared git config section: {section}", ()
+    for section, values in expected.items():
+        if not parser.has_section(section) or set(
+            dict(parser.items(section, raw=True))
+        ) != set(values):
+            return False, f"git config section differs from the clone: {section}", ()
+    return True, None, tuple(sorted(runtime))
+
+
+def _read_runtime_metadata(path: Path) -> str | None:
+    """Read one short single-line git metadata file without following links."""
+
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        return None
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_size > 4096:
+            return None
+        payload = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    text = text[:-1] if text.endswith("\n") else text
+    if not text or "\n" in text or "\0" in text:
+        return None
+    return text
+
+
+def _runtime_worktree_paths(path: Path) -> tuple[Path, ...]:
+    """Subtrees a main-checkout mutation must leave to the Manager."""
+
+    return (
+        *(path / root for root in _RUNTIME_WORKTREE_ROOTS),
+        path / ".git" / "worktrees",
     )
+
+
+class _RuntimeDrift(Exception):
+    """Internal: the first runtime-allowlist violation, as operator text."""
+
+
+def _runtime_directory_members(path: Path, label: str) -> set[str] | None:
+    """List a real (non-symlink) directory; ``None`` when it does not exist."""
+
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _RuntimeDrift(f"cannot inspect {label}") from exc
+    if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        raise _RuntimeDrift(f"{label} is not a directory")
+    try:
+        return set(os.listdir(path))
+    except OSError as exc:
+        raise _RuntimeDrift(f"cannot inspect {label}") from exc
+
+
+def _require_empty_worktree_refs(path: Path, label: str) -> None:
+    """Newer git creates an empty per-worktree ``refs/`` in the registry entry.
+
+    Only real directories are the git-written shape; any file or symlink is a
+    per-worktree ref (``refs/bisect/*``, ``refs/worktree/*``) the Manager never
+    writes, so it stays drift.
+    """
+
+    if _runtime_directory_members(path, label) is None:
+        return
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        relative = Path(root).relative_to(path)
+        for name in files:
+            raise _RuntimeDrift(
+                f"undeclared linked worktree metadata: {label}/{(relative / name).as_posix()}"
+            )
+        for name in directories:
+            if (Path(root) / name).is_symlink():
+                raise _RuntimeDrift(
+                    "undeclared linked worktree metadata: "
+                    f"{label}/{(relative / name).as_posix()}"
+                )
+
+
+def _runtime_worktree_row(path: Path, real_root: Path, entry: str) -> dict[str, object]:
+    """Prove one ``.git/worktrees/<id>`` entry is a declared runtime checkout."""
+
+    label = f".git/worktrees/{entry}"
+    admin = path / ".git" / "worktrees" / entry
+    members = _runtime_directory_members(admin, f"linked worktree metadata {label}")
+    undeclared = sorted((members or set()) - _RUNTIME_WORKTREE_ADMIN_ENTRIES)
+    if undeclared:
+        raise _RuntimeDrift(f"undeclared linked worktree metadata: {label}/{undeclared[0]}")
+    if members and "logs" in members:
+        logs = _runtime_directory_members(admin / "logs", f"{label}/logs")
+        if logs is None or logs - {"HEAD"}:
+            raise _RuntimeDrift(f"undeclared linked worktree metadata: {label}/logs")
+    if members and "refs" in members:
+        _require_empty_worktree_refs(admin / "refs", f"{label}/refs")
+    gitdir = _read_runtime_metadata(admin / "gitdir")
+    head = _read_runtime_metadata(admin / "HEAD")
+    if gitdir is None or _read_runtime_metadata(admin / "commondir") != "../..":
+        raise _RuntimeDrift(f"linked worktree metadata is not the git-written shape: {label}")
+    if head is None or _RUNTIME_OBJECT_ID.fullmatch(head) is None:
+        raise _RuntimeDrift(f"linked worktree is not a detached checkout: {label}")
+    target = Path(gitdir)
+    checkout = target.parent
+    # ``git worktree add`` names the registry after the checkout directory and
+    # appends a counter when that name is already taken.
+    suffix = entry[len(checkout.name):] if entry.startswith(checkout.name) else None
+    if not (
+        target.is_absolute()
+        and target.name == ".git"
+        and checkout.parent.parent == real_root
+        and checkout.parent.name in _RUNTIME_WORKTREE_ROOTS
+        and _RUNTIME_WORKTREE_NAME.fullmatch(checkout.name) is not None
+        and checkout.name not in {".", ".."}
+        and suffix is not None
+        and re.fullmatch(r"[0-9]*", suffix) is not None
+    ):
+        raise _RuntimeDrift(
+            f"linked worktree outside the runtime allowlist: {label} -> {gitdir}"
+        )
+    relative = f"{checkout.parent.name}/{checkout.name}"
+    try:
+        checkout_state = (path / relative).lstat()
+    except FileNotFoundError:
+        present = False
+    except OSError as exc:
+        raise _RuntimeDrift(f"cannot inspect runtime worktree: {relative}") from exc
+    else:
+        if (
+            not stat.S_ISDIR(checkout_state.st_mode)
+            or stat.S_ISLNK(checkout_state.st_mode)
+            or _read_runtime_metadata(path / relative / ".git")
+            != f"gitdir: {real_root / '.git' / 'worktrees' / entry}"
+        ):
+            raise _RuntimeDrift(
+                f"runtime worktree does not point back to its registry: {relative}"
+            )
+        present = True
+    return {"id": entry, "path": relative, "head": head, "present": present}
+
+
+def _repository_runtime_worktrees(
+    path: Path,
+) -> tuple[str | None, list[dict[str, object]], frozenset[str]]:
+    """Validate every linked worktree against the declared runtime roots.
+
+    Returns ``(drift, rows, status_entries)``.  ``drift`` is ``None`` only when
+    every ``.git/worktrees/<id>`` registry entry is the git-written shape of a
+    detached checkout at ``<root>/<name>`` for a declared runtime root, and
+    every member of a runtime root is such a registered checkout.
+    ``status_entries`` are the exact untracked lines ``git status`` prints in
+    the main worktree for those nested checkouts.
+    """
+
+    real_root = Path(os.path.realpath(path))
+    try:
+        roots = {
+            runtime_root: _runtime_directory_members(
+                path / runtime_root, f"runtime worktree root {runtime_root}"
+            )
+            for runtime_root in _RUNTIME_WORKTREE_ROOTS
+        }
+        entries = _runtime_directory_members(path / ".git" / "worktrees", ".git/worktrees")
+        rows: dict[str, dict[str, object]] = {}
+        for entry in sorted(entries or ()):
+            row = _runtime_worktree_row(path, real_root, entry)
+            if row["path"] in rows:
+                raise _RuntimeDrift(f"linked worktree registered twice: {row['path']}")
+            rows[str(row["path"])] = row
+        for runtime_root, children in roots.items():
+            for child in sorted(children or ()):
+                relative = f"{runtime_root}/{child}"
+                if relative not in rows or rows[relative]["present"] is not True:
+                    raise _RuntimeDrift(
+                        f"unregistered entry in runtime worktree root: {relative}"
+                    )
+    except _RuntimeDrift as drift:
+        return str(drift), [], frozenset()
+    status_entries = frozenset(
+        f"?? {relative}/" for relative, row in rows.items() if row["present"]
+    )
+    return None, list(rows.values()), status_entries
+
+
+def _repository_runtime_refs(
+    prefix: Sequence[str], *, uid: int, gid: int
+) -> tuple[str | None, int, str]:
+    """Accept only refs in the declared runtime namespaces.
+
+    Returns ``(drift, count, sha256)`` over the sorted ``<ref> <object>`` rows,
+    so a mutation of the tree can prove it left every Manager ref in place.
+    """
+
+    listing = _run(
+        (*prefix, "for-each-ref", "--format=%(refname) %(objectname) %(symref)"),
+        env=_REPOSITORY_GIT_ENV,
+        uid=uid,
+        gid=gid,
+    )
+    if listing.returncode != 0:
+        return "git for-each-ref failed", 0, ""
+    rows: list[str] = []
+    for line in listing.stdout.splitlines():
+        refname, _separator, remainder = line.partition(" ")
+        objectname, _separator, symref = remainder.partition(" ")
+        if symref:
+            return f"undeclared symbolic ref: {refname}", 0, ""
+        if not any(pattern.fullmatch(refname) for pattern in _RUNTIME_REF_PATTERNS):
+            return f"undeclared ref: {refname}", 0, ""
+        if _RUNTIME_OBJECT_ID.fullmatch(objectname) is None:
+            return f"ref does not name an object: {refname}", 0, ""
+        rows.append(f"{refname} {objectname}")
+    rows.sort()
+    digest = hashlib.sha256("".join(f"{row}\n" for row in rows).encode("utf-8"))
+    return None, len(rows), digest.hexdigest()
+
+
+def _repository_tree_drift(
+    path: Path, *, uid: int, gid: int, owner: object, group: object
+) -> str | None:
+    """Name the first member whose owner, write bit, or link target is unsafe."""
+
+    anchor = path.resolve(strict=True)
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        for name in (".", *directories, *files):
+            candidate = Path(root) if name == "." else Path(root) / name
+            relative = candidate.relative_to(path).as_posix()
+            try:
+                candidate_state = candidate.lstat()
+            except OSError:
+                return f"cannot inspect repository member: {relative}"
+            if candidate_state.st_uid != uid or candidate_state.st_gid != gid:
+                return (
+                    f"foreign owner: {relative} is "
+                    f"{_account_name(candidate_state.st_uid)}:"
+                    f"{_group_name(candidate_state.st_gid)}, expected {owner}:{group}"
+                )
+            if (
+                not stat.S_ISLNK(candidate_state.st_mode)
+                and stat.S_IMODE(candidate_state.st_mode) & 0o002
+            ):
+                return f"world-writable repository member: {relative}"
+            if stat.S_ISLNK(candidate_state.st_mode):
+                target = Path(os.readlink(candidate))
+                resolved = (candidate.parent / target).resolve(strict=False)
+                try:
+                    resolved.relative_to(anchor)
+                except ValueError:
+                    return f"symlink escapes the repository: {relative}"
+    return None
+
+
+def _refuse_runtime_root_checkout(
+    prefix: Sequence[str], commit: str, *, uid: int, gid: int
+) -> None:
+    """Refuse a checkout that would write into the Manager's worktree roots."""
+
+    listing = _run(
+        (*prefix, "ls-tree", "--name-only", commit, "--", *_RUNTIME_WORKTREE_ROOTS),
+        env=_REPOSITORY_GIT_ENV,
+        uid=uid,
+        gid=gid,
+    )
+    if listing.returncode != 0:
+        raise InstallDriftError(f"repository commit cannot be listed: {commit}")
+    tracked = listing.stdout.splitlines()
+    if tracked:
+        raise InstallDriftError(
+            "repository commit tracks a Manager runtime worktree root: "
+            f"{tracked[0]}"
+        )
+
+
+def _refuse_ignored_content_overwrite(
+    prefix: Sequence[str], commit: str, *, uid: int, gid: int
+) -> None:
+    """Refuse a checkout that would overwrite or delete ignored untracked content.
+
+    Ignored files never show in ``status``, so the clean check cannot see them.
+    ``checkout --force`` treats them as expendable: a commit that starts
+    tracking the same path (or a parent/child of it) overwrites or removes them,
+    and rollback has no copy to restore (#1124 review).
+    """
+
+    ignored = _run(
+        (
+            *prefix,
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ),
+        env=_REPOSITORY_GIT_ENV,
+        uid=uid,
+        gid=gid,
+    )
+    if ignored.returncode != 0:
+        raise InstallDriftError("repository ignored content cannot be listed")
+    entries = [entry for entry in ignored.stdout.split("\0") if entry]
+    if not entries:
+        return
+    ignored_dirs = {entry.rstrip("/") for entry in entries if entry.endswith("/")}
+    ignored_files = {entry for entry in entries if not entry.endswith("/")}
+    listing = _run(
+        (*prefix, "ls-tree", "-r", "-z", "--name-only", "--full-tree", commit),
+        env=_REPOSITORY_GIT_ENV,
+        uid=uid,
+        gid=gid,
+    )
+    if listing.returncode != 0:
+        raise InstallDriftError(f"repository commit cannot be listed: {commit}")
+    tracked = [entry for entry in listing.stdout.split("\0") if entry]
+    tracked_paths = set(tracked)
+    for path in tracked:
+        parts = path.split("/")
+        prefixes = {"/".join(parts[:index]) for index in range(1, len(parts) + 1)}
+        if path in ignored_files or prefixes & ignored_dirs:
+            raise InstallDriftError(
+                f"repository commit would overwrite ignored untracked content: {path}"
+            )
+    for entry in (*ignored_files, *ignored_dirs):
+        parts = entry.split("/")
+        parents = {"/".join(parts[:index]) for index in range(1, len(parts))}
+        if parents & tracked_paths:
+            raise InstallDriftError(
+                "repository commit would overwrite ignored untracked content: "
+                f"{entry}"
+            )
+
+
 def _tree_owned_and_nonwritable(path: Path, uid: int, gid: int) -> bool:
     """Attest owner/group and the write boundary for every no-follow tree member."""
 
@@ -1079,6 +1565,14 @@ def _rollback_prepared_toolchain(step: Mapping[str, object], path: Path) -> None
 
 
 def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
+    """Inspect an installed source tree, reconciling declared runtime state.
+
+    ``drift`` names every allowlist or safety violation (step-independent:
+    the same list results for the prior and the upgraded step), and
+    ``runtime`` records the reconciled Manager state so a mutation can prove
+    it left that state in place (#1124).
+    """
+
     path = Path(str(step.get("path", "")))
     try:
         observed = path.lstat()
@@ -1088,44 +1582,38 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
         return {"exists": True, "installed_sha256": None}
     expected_uid = _resolve_uid(step.get("owner"))
     expected_gid = _resolve_gid(step.get("group"))
-    tree_safe = True
-    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
-        for name in (".", *directories, *files):
-            candidate = Path(root) if name == "." else Path(root) / name
-            try:
-                candidate_state = candidate.lstat()
-            except OSError:
-                tree_safe = False
-                break
-            if (
-                candidate_state.st_uid != expected_uid
-                or candidate_state.st_gid != expected_gid
-                or (
-                    not stat.S_ISLNK(candidate_state.st_mode)
-                    and stat.S_IMODE(candidate_state.st_mode) & 0o002
-                )
-            ):
-                tree_safe = False
-                break
-            if stat.S_ISLNK(candidate_state.st_mode):
-                target = Path(os.readlink(candidate))
-                resolved = (candidate.parent / target).resolve(strict=False)
-                try:
-                    resolved.relative_to(path.resolve(strict=True))
-                except ValueError:
-                    tree_safe = False
-                    break
-        if not tree_safe:
-            break
-    config_safe = tree_safe and _repository_config_is_canonical(
+    drift: list[str] = []
+    tree_drift = _repository_tree_drift(
         path,
-        remote=step.get("remote"),
         uid=expected_uid,
         gid=expected_gid,
+        owner=step.get("owner"),
+        group=step.get("group"),
     )
-    # Inspect only a canonical tree, as its owning account, and without any
-    # host/user config.  Command-scope overrides are defense in depth against
-    # executable fsmonitor/hooks settings and optional index writes.
+    tree_safe = tree_drift is None
+    config_safe = False
+    runtime_config: tuple[str, ...] = ()
+    worktree_drift: str | None = None
+    worktrees: list[dict[str, object]] = []
+    status_entries: frozenset[str] = frozenset()
+    if tree_drift is not None:
+        drift.append(tree_drift)
+    else:
+        config_safe, config_drift, runtime_config = _repository_config_state(
+            path,
+            remote=step.get("remote"),
+            uid=expected_uid,
+            gid=expected_gid,
+        )
+        if config_drift is not None:
+            drift.append(config_drift)
+        worktree_drift, worktrees, status_entries = _repository_runtime_worktrees(path)
+        if worktree_drift is not None:
+            drift.append(worktree_drift)
+    # Run git only in a tree whose config and worktree metadata are declared
+    # state, as its owning account, and without any host/user config.
+    # Command-scope overrides are defense in depth against executable
+    # fsmonitor/hooks settings and optional index writes.
     prefix = (
         *_REPOSITORY_GIT_PREFIX,
         "-c",
@@ -1133,38 +1621,59 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
         "-C",
         str(path),
     )
-    commands: list[subprocess.CompletedProcess[str]] = []
-    if config_safe:
-        for suffix in (
-            ("rev-parse", "HEAD"),
-            ("remote", "get-url", "origin"),
-            ("status", "--porcelain=v1", "--untracked-files=all"),
-            ("fsck", "--strict", "--no-dangling"),
-        ):
-            commands.append(
-                _run(
-                    (*prefix, *suffix),
-                    env=_REPOSITORY_GIT_ENV,
-                    uid=expected_uid,
-                    gid=expected_gid,
-                )
+    git_safe = tree_safe and config_safe and worktree_drift is None
+    refs_drift: str | None = None
+    refs_count = 0
+    refs_sha256 = ""
+    dirty: list[str] = []
+    if git_safe:
+        head, remote, clean, integrity = (
+            _run(
+                (*prefix, *suffix),
+                env=_REPOSITORY_GIT_ENV,
+                uid=expected_uid,
+                gid=expected_gid,
             )
-    if commands:
-        head, remote, clean, integrity = commands
+            for suffix in (
+                ("rev-parse", "HEAD"),
+                ("remote", "get-url", "origin"),
+                ("status", "--porcelain=v1", "--untracked-files=all"),
+                ("fsck", "--strict", "--no-dangling"),
+            )
+        )
+        refs_drift, refs_count, refs_sha256 = _repository_runtime_refs(
+            prefix, uid=expected_uid, gid=expected_gid
+        )
+        if refs_drift is not None:
+            drift.append(refs_drift)
+        # A linked worktree nested in the main checkout is an untracked
+        # directory to ``git status``; only the registered runtime ones are
+        # expected, anything else is a dirty tree.
+        dirty = [
+            line for line in clean.stdout.splitlines() if line not in status_entries
+        ]
+        if clean.returncode != 0:
+            drift.append("git status failed")
+        elif dirty:
+            drift.append(f"working tree is not clean: {dirty[0]}")
+        if integrity.returncode != 0:
+            drift.append("git fsck --strict failed")
     else:
         head = remote = clean = integrity = subprocess.CompletedProcess(
-            list(prefix), 1, "", "repository config is not canonical"
+            list(prefix), 1, "", "repository is not in its declared runtime shape"
         )
+    is_clean = clean.returncode == 0 and not dirty
+    runtime_safe = git_safe and refs_drift is None
     matches = (
         head.returncode == 0
         and head.stdout.strip() == step.get("commit")
         and remote.returncode == 0
         and remote.stdout.strip() == step.get("remote")
-        and clean.returncode == 0
-        and not clean.stdout.strip()
+        and is_clean
         and integrity.returncode == 0
         and tree_safe
         and config_safe
+        and runtime_safe
         and _account_name(observed.st_uid) == step.get("owner")
         and _group_name(observed.st_gid) == step.get("group")
         and format(stat.S_IMODE(observed.st_mode), "04o") == step.get("mode")
@@ -1176,10 +1685,18 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
         "mode": format(stat.S_IMODE(observed.st_mode), "04o"),
         "commit": head.stdout.strip() if head.returncode == 0 else "",
         "remote": remote.stdout.strip() if remote.returncode == 0 else "",
-        "clean": clean.returncode == 0 and not clean.stdout.strip(),
+        "clean": is_clean,
         "integrity": integrity.returncode == 0,
         "tree_safe": tree_safe,
         "config_safe": config_safe,
+        "runtime_safe": runtime_safe,
+        "runtime": {
+            "config": list(runtime_config),
+            "worktrees": worktrees,
+            "refs_count": refs_count,
+            "refs_sha256": refs_sha256,
+        },
+        "drift": drift,
         "installed_sha256": step.get("desired_sha256") if matches else None,
     }
 
@@ -1191,10 +1708,18 @@ def _chown_tree(path: Path, uid: int, gid: int) -> None:
             os.chown(Path(root) / name, uid, gid, follow_symlinks=False)
 
 
-def _remove_group_other_write(path: Path) -> None:
-    """Make a freshly cloned tree non-writable outside its owning account."""
+def _remove_group_other_write(path: Path, *, skip: Sequence[Path] = ()) -> None:
+    """Make a checkout non-writable outside its owning account.
 
+    ``skip`` subtrees (the Manager's runtime worktrees) are neither entered
+    nor changed: a main-checkout mutation never touches them.
+    """
+
+    skipped = set(skip)
     for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        directories[:] = [
+            name for name in directories if Path(root) / name not in skipped
+        ]
         for candidate in (Path(root), *(Path(root) / name for name in (*directories, *files))):
             observed = candidate.lstat()
             if not stat.S_ISLNK(observed.st_mode):
@@ -3519,11 +4044,16 @@ class LocalInstallBackend:
             _assert_fd_path_binding(path, descriptor, directory=True)
             prefix = (
                 *_REPOSITORY_GIT_PREFIX,
+                *_REPOSITORY_MUTATION_CONFIG,
                 "-c",
                 f"safe.directory={path}",
                 "-C",
                 str(path),
             )
+            # The fetch names no destination ref and writes no FETCH_HEAD, and
+            # the detached checkout moves only the main worktree's HEAD: the
+            # Manager's branches, refs, and linked worktrees stay as inspected
+            # (#1124).
             _run(
                 (
                     *prefix,
@@ -3539,6 +4069,8 @@ class LocalInstallBackend:
                 gid=gid,
                 pass_fds=(source_descriptor,),
             )
+            _refuse_runtime_root_checkout(prefix, commit, uid=uid, gid=gid)
+            _refuse_ignored_content_overwrite(prefix, commit, uid=uid, gid=gid)
             _run(
                 (*prefix, "checkout", "--detach", "--force", commit),
                 check=True,
@@ -3546,7 +4078,7 @@ class LocalInstallBackend:
                 uid=uid,
                 gid=gid,
             )
-            _remove_group_other_write(path)
+            _remove_group_other_write(path, skip=_runtime_worktree_paths(path))
             os.chmod(path, _mode(step.get("mode")))
             _assert_fd_path_binding(path, descriptor, directory=True)
         finally:
@@ -3558,6 +4090,12 @@ class LocalInstallBackend:
         if installed.get("installed_sha256") != step.get("desired_sha256"):
             raise InstallDriftError(
                 f"repository replacement drifted: {step.get('slug')}"
+                + _observed_drift_detail(installed)
+            )
+        if installed.get("runtime") != expected_prior.get("runtime"):
+            raise InstallDriftError(
+                "repository replacement changed Manager runtime state: "
+                f"{step.get('slug')}"
             )
         return {
             "prior": dict(expected_prior),
@@ -3926,7 +4464,10 @@ class LocalInstallBackend:
             prior = inspected_prior
             if prior.get("exists"):
                 if prior.get("installed_sha256") != step.get("desired_sha256"):
-                    raise InstallDriftError(f"existing repository drifted: {step.get('slug')}")
+                    raise InstallDriftError(
+                        f"existing repository drifted: {step.get('slug')}"
+                        + _observed_drift_detail(prior)
+                    )
                 return {"prior": prior, **prior}
             source = Path(str(step.get("source", "")))
             path = Path(str(step.get("path", "")))
@@ -4190,11 +4731,18 @@ class LocalInstallBackend:
                 gid = _resolve_gid(prior.get("group"))
                 prefix = (
                     *_REPOSITORY_GIT_PREFIX,
+                    *_REPOSITORY_MUTATION_CONFIG,
                     "-c",
                     f"safe.directory={path}",
                     "-C",
                     str(path),
                 )
+                # Same boundary as the replacement: only the main worktree's
+                # checkout and the installer's own remote URL are restored;
+                # the Manager's branches, refs, and linked worktrees are not
+                # touched (#1124).
+                _refuse_runtime_root_checkout(prefix, commit, uid=uid, gid=gid)
+                _refuse_ignored_content_overwrite(prefix, commit, uid=uid, gid=gid)
                 _run(
                     (*prefix, "checkout", "--detach", "--force", commit),
                     check=True,
@@ -4209,8 +4757,25 @@ class LocalInstallBackend:
                     uid=uid,
                     gid=gid,
                 )
-                _remove_group_other_write(path)
+                _remove_group_other_write(path, skip=_runtime_worktree_paths(path))
                 os.chmod(path, _mode(prior.get("mode")))
+                prior_runtime = prior.get("runtime")
+                if isinstance(prior_runtime, Mapping):
+                    restored = _repository_state(
+                        {
+                            **step,
+                            "owner": prior.get("owner"),
+                            "group": prior.get("group"),
+                            "mode": prior.get("mode"),
+                            "commit": commit,
+                            "remote": remote,
+                        }
+                    )
+                    if restored.get("runtime") != prior_runtime:
+                        raise InstallDriftError(
+                            "repository rollback changed Manager runtime state: "
+                            f"{step.get('slug')}"
+                        )
             return
         if step.get("kind") == "venv":
             _cleanup_bound_venv_staging(

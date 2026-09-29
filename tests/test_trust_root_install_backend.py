@@ -18,6 +18,7 @@ from typing import Mapping
 
 import pytest
 
+import repository_runtime_fixtures
 from paulsha_cortex.trust_root.install import (
     AccountCollisionError,
     InstallDriftError,
@@ -276,7 +277,10 @@ def test_repository_install_isolates_every_root_git_call_from_host_config(
     result = LocalInstallBackend(require_root=False).apply_step(step)
 
     assert result["installed_sha256"] == step["desired_sha256"]
-    assert len(git_calls) == 7
+    # clone/checkout/set-url, then inspection: rev-parse, remote, status, fsck,
+    # and the runtime ref allowlist listing (#1124).
+    assert len(git_calls) == 8
+    assert git_calls[-1][0][-2] == "for-each-ref"
     for argv, kwargs in git_calls:
         assert argv[:6] == (
             "git",
@@ -1331,6 +1335,304 @@ def test_repository_replacement_upgrades_and_restores_exact_prior_commit(
     assert restored["installed_sha256"] == old_step["desired_sha256"]
     assert restored["commit"] == old_commit
     assert (destination / "README.md").read_text(encoding="utf-8") == "old\n"
+
+
+# ---------------------------------------------------------------------------
+# #1124：Manager 執行期寫進來源樹的 branch／ref／linked worktree allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_repository_state_reconciles_manager_runtime_state(tmp_path: Path) -> None:
+    upgrade = repository_runtime_fixtures.repository_upgrade(tmp_path)
+    repository_runtime_fixtures.simulate_manager_runtime(upgrade)
+
+    state = LocalInstallBackend(require_root=False).inspect_step(upgrade.old_step)
+
+    assert state["drift"] == []
+    assert state["clean"] is True
+    assert state["installed_sha256"] == upgrade.old_step["desired_sha256"]
+    runtime = state["runtime"]
+    assert runtime["config"] == ["user.email", "user.name"]
+    assert {(row["path"], row["present"]) for row in runtime["worktrees"]} == {
+        (repository_runtime_fixtures.REVIEW_WORKTREE, True),
+        (f".psc-verification-worktrees/s1124-{upgrade.old_commit[:12]}", False),
+    }
+    assert runtime["refs_count"] == len(
+        repository_runtime_fixtures.refs(upgrade.repository)
+    )
+
+
+def test_repository_state_accepts_empty_per_worktree_refs_directory(tmp_path: Path) -> None:
+    """較新的 git（CI 的 2.55）在 `.git/worktrees/<id>/` 建立空的 `refs/`；
+    只有目錄、沒有任何 ref 檔時屬 git 寫出的形狀（#1124）。"""
+
+    upgrade = repository_runtime_fixtures.repository_upgrade(tmp_path)
+    repository_runtime_fixtures.simulate_manager_runtime(upgrade)
+    admin = upgrade.repository / ".git" / "worktrees" / "s1124-review-1124"
+    (admin / "refs" / "worktree").mkdir(parents=True, exist_ok=True)
+
+    state = LocalInstallBackend(require_root=False).inspect_step(upgrade.old_step)
+
+    assert state["drift"] == []
+    assert state["installed_sha256"] == upgrade.old_step["desired_sha256"]
+
+
+def test_repository_replacement_keeps_manager_runtime_state_through_rollback(
+    tmp_path: Path,
+) -> None:
+    upgrade = repository_runtime_fixtures.repository_upgrade(tmp_path)
+    repository_runtime_fixtures.simulate_manager_runtime(upgrade)
+    review = upgrade.repository / repository_runtime_fixtures.REVIEW_WORKTREE
+    refs_before = repository_runtime_fixtures.refs(upgrade.repository)
+    backend = LocalInstallBackend(require_root=False)
+    prior = dict(backend.inspect_step(upgrade.new_step))
+    checkpoints: list[dict[str, object]] = []
+
+    outcome = backend.replace_step_checkpointed(
+        upgrade.new_step,
+        prior,
+        lambda authority: checkpoints.append(dict(authority)),
+    )
+
+    assert outcome["installed_sha256"] == upgrade.new_step["desired_sha256"]
+    assert outcome["commit"] == upgrade.new_commit
+    assert outcome["runtime"] == prior["runtime"]
+    assert (upgrade.repository / "README.md").read_text(encoding="utf-8") == "new\n"
+    # The Manager's review checkout, branches, and refs are untouched.
+    assert (review / "README.md").read_text(encoding="utf-8") == "old\n"
+    assert repository_runtime_fixtures.git(
+        "-C", str(review), "rev-parse", "HEAD"
+    ) == upgrade.old_commit
+    assert repository_runtime_fixtures.refs(upgrade.repository) == refs_before
+
+    backend.rollback_step(
+        {
+            "step_id": upgrade.new_step["step_id"],
+            "step": upgrade.new_step,
+            "status": "completed",
+            "prior": prior,
+            "replacement_authority": checkpoints[0],
+            **outcome,
+        }
+    )
+
+    restored = backend.inspect_step(upgrade.old_step)
+    assert restored["installed_sha256"] == upgrade.old_step["desired_sha256"]
+    assert restored["runtime"] == prior["runtime"]
+    assert (upgrade.repository / "README.md").read_text(encoding="utf-8") == "old\n"
+    assert (review / "README.md").read_text(encoding="utf-8") == "old\n"
+    assert repository_runtime_fixtures.refs(upgrade.repository) == refs_before
+
+
+def test_repository_replacement_refuses_candidate_tracking_runtime_worktree_root(
+    tmp_path: Path,
+) -> None:
+    upgrade = repository_runtime_fixtures.repository_upgrade(
+        tmp_path,
+        candidate_files={".psc-review-worktrees/s1124-review-1124/README.md": "x\n"},
+    )
+    repository_runtime_fixtures.simulate_manager_runtime(upgrade)
+    review = upgrade.repository / repository_runtime_fixtures.REVIEW_WORKTREE
+    backend = LocalInstallBackend(require_root=False)
+    prior = dict(backend.inspect_step(upgrade.new_step))
+
+    with pytest.raises(InstallDriftError, match="runtime worktree root"):
+        backend.replace_step_checkpointed(upgrade.new_step, prior, lambda _row: None)
+
+    assert repository_runtime_fixtures.git(
+        "-C", str(upgrade.repository), "rev-parse", "HEAD"
+    ) == upgrade.old_commit
+    assert (review / "README.md").read_text(encoding="utf-8") == "old\n"
+
+
+@pytest.mark.parametrize(
+    ("exclude", "ignored", "candidate"),
+    [
+        ("local.env", "local.env", "local.env"),
+        ("cache/", "cache/state.db", "cache/state.db"),
+        ("notes/", "notes/todo.txt", "notes"),
+    ],
+)
+def test_repository_replacement_refuses_to_overwrite_ignored_untracked_content(
+    tmp_path: Path, exclude: str, ignored: str, candidate: str
+) -> None:
+    """被 ignore 的未追蹤檔不在 status 裡；候選開始追蹤同一路徑時 checkout --force
+    會覆寫或刪除它，rollback 也無從還原，因此在 checkout 前拒絕（#1124 審查）。"""
+
+    upgrade = repository_runtime_fixtures.repository_upgrade(
+        tmp_path, candidate_files={candidate: "tracked by candidate\n"}
+    )
+    repository_runtime_fixtures.simulate_manager_runtime(upgrade)
+    exclude_file = upgrade.repository / ".git" / "info" / "exclude"
+    exclude_file.parent.mkdir(exist_ok=True)
+    exclude_file.write_text(exclude + "\n", encoding="utf-8")
+    local = upgrade.repository / ignored
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text("operator local content\n", encoding="utf-8")
+    backend = LocalInstallBackend(require_root=False)
+    prior = dict(backend.inspect_step(upgrade.new_step))
+
+    with pytest.raises(InstallDriftError, match="ignored untracked"):
+        backend.replace_step_checkpointed(upgrade.new_step, prior, lambda _row: None)
+
+    assert repository_runtime_fixtures.git(
+        "-C", str(upgrade.repository), "rev-parse", "HEAD"
+    ) == upgrade.old_commit
+    assert local.read_text(encoding="utf-8") == "operator local content\n"
+
+
+def _drift_undeclared_config(key: str, value: str):
+    def mutate(upgrade, _monkeypatch) -> None:
+        repository_runtime_fixtures.git(
+            "-C", str(upgrade.repository), "config", "--local", key, value
+        )
+
+    return mutate
+
+
+def _drift_outside_worktree(upgrade, _monkeypatch) -> None:
+    repository_runtime_fixtures.git(
+        "-C",
+        str(upgrade.repository),
+        "worktree",
+        "add",
+        "--detach",
+        str(upgrade.repository.parent / "elsewhere"),
+        upgrade.old_commit,
+    )
+
+
+def _drift_in_tree_undeclared_worktree(upgrade, _monkeypatch) -> None:
+    repository_runtime_fixtures.git(
+        "-C",
+        str(upgrade.repository),
+        "worktree",
+        "add",
+        "--detach",
+        str(upgrade.repository / "scratch"),
+        upgrade.old_commit,
+    )
+
+
+def _drift_stray_runtime_root_entry(upgrade, _monkeypatch) -> None:
+    (upgrade.repository / ".psc-review-worktrees" / "notes.txt").write_text(
+        "operator note\n", encoding="utf-8"
+    )
+
+
+def _drift_worktree_metadata(upgrade, _monkeypatch) -> None:
+    admin = upgrade.repository / ".git" / "worktrees" / "s1124-review-1124"
+    (admin / "config.worktree").write_text(
+        "[core]\n\thooksPath = /dev/null\n", encoding="utf-8"
+    )
+
+
+def _drift_per_worktree_ref(upgrade, _monkeypatch) -> None:
+    admin = upgrade.repository / ".git" / "worktrees" / "s1124-review-1124"
+    (admin / "refs" / "bisect").mkdir(parents=True, exist_ok=True)
+    (admin / "refs" / "bisect" / "bad").write_text(
+        upgrade.new_commit + "\n", encoding="utf-8"
+    )
+
+
+def _drift_undeclared_ref(refname: str):
+    def mutate(upgrade, _monkeypatch) -> None:
+        repository_runtime_fixtures.git(
+            "-C", str(upgrade.repository), "update-ref", refname, upgrade.new_commit
+        )
+
+    return mutate
+
+
+def _drift_world_writable_runtime_file(upgrade, _monkeypatch) -> None:
+    target = (
+        upgrade.repository / repository_runtime_fixtures.REVIEW_WORKTREE / "README.md"
+    )
+    target.chmod(0o646)
+
+
+def _drift_foreign_owner(upgrade, monkeypatch) -> None:
+    # An operator-owned file: the test account cannot chown, so the no-follow
+    # stat the inspector performs reports a different uid for this one leaf.
+    target = upgrade.repository / "README.md"
+    real_lstat = Path.lstat
+
+    def lstat(self: Path):
+        observed = real_lstat(self)
+        if self == target:
+            values = list(observed)
+            values[stat.ST_UID] = observed.st_uid + 4242
+            return os.stat_result(values)
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (_drift_undeclared_config("core.hooksPath", "/dev/null"), "core.hookspath"),
+        (_drift_undeclared_config("core.fsmonitor", "true"), "core.fsmonitor"),
+        (_drift_undeclared_config("include.path", "/dev/null"), "include.path"),
+        (_drift_undeclared_config("alias.co", "!true"), "alias.co"),
+        (_drift_undeclared_config("filter.lfs.smudge", "cat"), "filter.lfs.smudge"),
+        (_drift_undeclared_config("credential.helper", "store"), "credential.helper"),
+        (
+            _drift_undeclared_config("url.https://example.invalid/.insteadOf", "x"),
+            "url.https://example.invalid/.insteadof",
+        ),
+        (
+            _drift_undeclared_config(
+                f"branch.{repository_runtime_fixtures.BUILD_BRANCH}.remote", "origin"
+            ),
+            f"branch.{repository_runtime_fixtures.BUILD_BRANCH}.remote",
+        ),
+        (_drift_undeclared_config("user.signingKey", "x"), "user.signingkey"),
+        (_drift_outside_worktree, ".git/worktrees/elsewhere"),
+        (_drift_in_tree_undeclared_worktree, ".git/worktrees/scratch"),
+        (_drift_stray_runtime_root_entry, ".psc-review-worktrees/notes.txt"),
+        (_drift_worktree_metadata, "config.worktree"),
+        (_drift_per_worktree_ref, "refs/bisect/bad"),
+        (_drift_undeclared_ref("refs/heads/operator-topic"), "refs/heads/operator-topic"),
+        (_drift_undeclared_ref("refs/notes/commits"), "refs/notes/commits"),
+        (_drift_world_writable_runtime_file, "world-writable"),
+        (_drift_foreign_owner, "README.md"),
+    ],
+    ids=[
+        "core-hookspath",
+        "core-fsmonitor",
+        "include",
+        "alias",
+        "filter",
+        "credential",
+        "url-insteadof",
+        "branch-upstream",
+        "user-signingkey",
+        "worktree-outside-repository",
+        "worktree-outside-runtime-roots",
+        "stray-runtime-root-entry",
+        "worktree-metadata",
+        "per-worktree-ref",
+        "undeclared-branch",
+        "undeclared-ref-namespace",
+        "world-writable-runtime-file",
+        "foreign-owner",
+    ],
+)
+def test_repository_state_keeps_drift_outside_runtime_allowlist_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate,
+    expected: str,
+) -> None:
+    upgrade = repository_runtime_fixtures.repository_upgrade(tmp_path)
+    repository_runtime_fixtures.simulate_manager_runtime(upgrade)
+    mutate(upgrade, monkeypatch)
+
+    state = LocalInstallBackend(require_root=False).inspect_step(upgrade.old_step)
+
+    assert state["installed_sha256"] is None
+    assert any(expected in reason for reason in state["drift"]), state["drift"]
 
 
 def test_directory_acl_attestation_ignores_semantically_irrelevant_order(

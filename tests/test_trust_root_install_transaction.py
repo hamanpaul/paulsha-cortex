@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import repository_runtime_fixtures
 from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install import backend as install_backend
 from paulsha_cortex.trust_root.install import (
@@ -752,6 +753,190 @@ def test_prior_receipt_handoff_rejects_late_foreign_asset_before_mutation(
     assert backend.applied == []
     assert next_receipt.to_dict()["state"] == "planned"
     assert next_receipt.to_dict()["journal"] == []
+
+
+class RepositoryRuntimeBackend(RecordingBackend):
+    """Recording backend whose repository step is the real local backend (#1124)."""
+
+    def __init__(self, plan: dict[str, object]) -> None:
+        super().__init__(plan)
+        self.local = install_backend.LocalInstallBackend(require_root=False)
+
+    def inspect_step(self, step) -> dict[str, object]:
+        if step.get("kind") == "repository":
+            return dict(self.local.inspect_step(step))
+        return super().inspect_step(step)
+
+    def apply_step_checkpointed(self, step, expected_prior, creation_checkpoint):
+        if step.get("kind") == "repository":
+            self.applied.append(step["step_id"])
+            return self.local.apply_step_checkpointed(
+                step, expected_prior, creation_checkpoint
+            )
+        return super().apply_step_checkpointed(
+            step, expected_prior, creation_checkpoint
+        )
+
+    def replace_step_checkpointed(self, step, expected_prior, replacement_checkpoint):
+        if step.get("kind") == "repository":
+            self.applied.append(step["step_id"])
+            return self.local.replace_step_checkpointed(
+                step, expected_prior, replacement_checkpoint
+            )
+        return super().replace_step_checkpointed(
+            step, expected_prior, replacement_checkpoint
+        )
+
+    def creation_authority_matches(self, step, authority) -> bool:
+        if step.get("kind") == "repository":
+            return self.local.creation_authority_matches(step, authority)
+        return super().creation_authority_matches(step, authority)
+
+    def rollback_step(self, entry) -> None:
+        if entry["step"].get("kind") == "repository":
+            self.rolled_back.append(entry["step_id"])
+            self.local.rollback_step(entry)
+            return
+        super().rollback_step(entry)
+
+
+def _repository_runtime_upgrade_case(tmp_path: Path):
+    """A qualified prior receipt whose repository has since run Manager jobs."""
+
+    upgrade = repository_runtime_fixtures.repository_upgrade(tmp_path)
+    repository_runtime_fixtures.simulate_manager_runtime(upgrade)
+    prior_plan = _plan(tmp_path)
+    prior_plan["repo_identity"] = {
+        "commit": upgrade.old_commit,
+        "remote": repository_runtime_fixtures.REMOTE,
+    }
+    # The container of the source tree stands in for a state-root sibling so
+    # the isolated repository step keeps a permitted immediate parent.
+    prior_plan["roots"]["state"] = str(upgrade.repository.parent / "state")
+    prior_plan["apply_order"] = [upgrade.old_step]
+    prior_receipt = new_install_receipt(prior_plan)
+    prior_receipt._document["state"] = "applied"
+    prior_receipt._document["qualified"] = True
+    prior_receipt._document["journal"] = [
+        {
+            "step_id": upgrade.old_step["step_id"],
+            "step": deepcopy(upgrade.old_step),
+            "status": "completed",
+            "prior": {"exists": False},
+            "exists": True,
+            "installed_sha256": upgrade.old_step["desired_sha256"],
+        }
+    ]
+    next_plan = deepcopy(prior_plan)
+    next_plan["repo_identity"]["commit"] = upgrade.new_commit
+    next_plan["candidate"]["wheel_sha256"] = "d" * 64
+    next_plan["apply_order"] = [upgrade.new_step]
+    return upgrade, prior_receipt, next_plan
+
+
+def test_prior_receipt_upgrade_replaces_repository_that_ran_manager_jobs(
+    tmp_path: Path,
+) -> None:
+    upgrade, prior_receipt, next_plan = _repository_runtime_upgrade_case(tmp_path)
+    review = upgrade.repository / repository_runtime_fixtures.REVIEW_WORKTREE
+    refs_before = repository_runtime_fixtures.refs(upgrade.repository)
+    next_receipt = new_install_receipt(next_plan)
+    backend = RepositoryRuntimeBackend(next_plan)
+
+    apply_plan(
+        next_plan,
+        confirm_sha256=plan_sha256(next_plan),
+        receipt=next_receipt,
+        prior_receipt=prior_receipt,
+        backend=backend,
+    )
+
+    entry = next_receipt.to_dict()["journal"][0]
+    assert entry["adopted_from_receipt"] is True
+    assert entry["prior"]["commit"] == upgrade.old_commit
+    assert entry["installed_sha256"] == upgrade.new_step["desired_sha256"]
+    assert (upgrade.repository / "README.md").read_text(encoding="utf-8") == "new\n"
+    assert (review / "README.md").read_text(encoding="utf-8") == "old\n"
+    assert repository_runtime_fixtures.refs(upgrade.repository) == refs_before
+
+    rollback_receipt(next_receipt, backend=backend)
+
+    assert backend.rolled_back == [upgrade.new_step["step_id"]]
+    restored = backend.inspect_step(upgrade.old_step)
+    assert restored["installed_sha256"] == upgrade.old_step["desired_sha256"]
+    assert (upgrade.repository / "README.md").read_text(encoding="utf-8") == "old\n"
+    assert (review / "README.md").read_text(encoding="utf-8") == "old\n"
+    assert repository_runtime_fixtures.refs(upgrade.repository) == refs_before
+
+
+def _foreign_owned_readme(upgrade, monkeypatch) -> None:
+    target = upgrade.repository / "README.md"
+    real_lstat = Path.lstat
+
+    def lstat(self: Path):
+        observed = real_lstat(self)
+        if self == target:
+            values = list(observed)
+            values[stat.ST_UID] = observed.st_uid + 4242
+            return os.stat_result(values)
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+
+
+def _hooks_path_config(upgrade, _monkeypatch) -> None:
+    repository_runtime_fixtures.git(
+        "-C", str(upgrade.repository), "config", "--local", "core.hooksPath", "/dev/null"
+    )
+
+
+def _worktree_outside_repository(upgrade, _monkeypatch) -> None:
+    repository_runtime_fixtures.git(
+        "-C",
+        str(upgrade.repository),
+        "worktree",
+        "add",
+        "--detach",
+        str(upgrade.repository.parent / "operator-worktree"),
+        upgrade.old_commit,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (_foreign_owned_readme, "foreign owner: README.md"),
+        (_hooks_path_config, "undeclared git config key: core.hookspath"),
+        (_worktree_outside_repository, ".git/worktrees/operator-worktree"),
+    ],
+    ids=["foreign-owner", "undeclared-config-key", "worktree-outside-allowlist"],
+)
+def test_prior_receipt_upgrade_names_repository_drift_outside_runtime_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate,
+    expected: str,
+) -> None:
+    upgrade, prior_receipt, next_plan = _repository_runtime_upgrade_case(tmp_path)
+    mutate(upgrade, monkeypatch)
+    next_receipt = new_install_receipt(next_plan)
+    backend = RepositoryRuntimeBackend(next_plan)
+
+    with pytest.raises(InstallDriftError, match="prior receipt provenance") as raised:
+        apply_plan(
+            next_plan,
+            confirm_sha256=plan_sha256(next_plan),
+            receipt=next_receipt,
+            prior_receipt=prior_receipt,
+            backend=backend,
+        )
+
+    assert expected in str(raised.value)
+    assert backend.applied == []
+    assert next_receipt.to_dict()["journal"] == []
+    assert repository_runtime_fixtures.git(
+        "-C", str(upgrade.repository), "rev-parse", "HEAD"
+    ) == upgrade.old_commit
 
 
 def test_late_toolchain_drift_is_rejected_before_an_earlier_step_mutates(
