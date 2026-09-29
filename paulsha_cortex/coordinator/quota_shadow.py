@@ -524,6 +524,7 @@ class QuotaShadowService:
                     if latest_gauge is not None else _unknown("missing-gauge-snapshot")
                 )
                 row["remaining"] = _unknown("non-remaining-unit")
+                row["reset_at_ms"] = None
                 row["coverage_gaps"].append("non-remaining-unit")
                 row["coverage_gaps"].append("external-session-unobserved")
                 row["assessment"] = "unknown"
@@ -574,17 +575,27 @@ class QuotaShadowService:
                         row["coverage_gaps"].append("usage-unit-not-comparable")
             elif conflict_at is not None and conflict_at >= selected[0]:
                 row["remaining"] = _unknown("source-conflict")
+                row["reset_at_ms"] = None
                 row["coverage_gaps"].append("source-conflict")
             else:
                 _, _, _, selected_record, selected_observation = selected
                 selected_wire = selected_observation.to_dict()
                 quantity = selected_wire["measurement"]["quantity"]
                 row["remaining"] = _copy_quantity(quantity)
+                reset_at_ms = selected_wire.get("reset_at_ms", {})
+                row["reset_at_ms"] = (
+                    reset_at_ms.get("value")
+                    if isinstance(reset_at_ms, dict)
+                    and reset_at_ms.get("state") == "known"
+                    and type(reset_at_ms.get("value")) is int
+                    else None
+                )
                 if quantity.get("state") == "unknown":
                     row["coverage_gaps"].append(str(quantity.get("reason", "remaining-unknown")))
                 self._apply_usage(row, key, selected_record, selected_observation,
                                   usage_by_scope.get(key, []), now_utc_ms)
             row["coverage_gaps"].append("external-session-unobserved")
+            row.setdefault("reset_at_ms", None)
             row["coverage_gaps"] = sorted(set(row["coverage_gaps"]))
             demand = None if demand_by_window is None else demand_by_window.get(key)
             row["assessment"] = _assess(row["remaining"], demand)

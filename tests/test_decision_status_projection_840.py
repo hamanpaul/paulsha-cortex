@@ -109,7 +109,11 @@ def _decision(
     policy_config_revision: str | None = "pools-config:v1",
     generated_at_ms: int = _NOW,
     reservation_id: str | None = None,
-    demand_version: str = admission.DEMAND_FIXTURE_VERSION,
+    demand_version: str = admission.DISPATCH_UNIT_DEMAND_VERSION,
+    qualification_version: str = "not-enforced",
+    retry_eligible: bool | None = None,
+    reset_at_ms: int | None = None,
+    reason: str | None = None,
 ) -> admission.AdmissionDecision:
     return admission.AdmissionDecision(
         decision_id=decision_id,
@@ -122,14 +126,19 @@ def _decision(
         policy_version=admission.ADMISSION_POLICY_VERSION,
         observation_version="shadow-projection:" + "b" * 16,
         demand_version=demand_version,
-        qualification_version="not-enforced",
+        qualification_version=qualification_version,
         generated_at_ms=generated_at_ms,
-        selected=selected if selected is not None else {"executor": "codex", "model_id": "gpt-5.3-codex"},
+        selected=(selected if selected is not None else (
+            None if outcome == "wait" else {"executor": "codex", "model_id": "gpt-5.3-codex"}
+        )),
         reservation_id=reservation_id,
         excluded=excluded,
         selected_observation_state=selected_observation_state,
         selected_feasible=selected_feasible,
         policy_config_revision=policy_config_revision,
+        retry_eligible=retry_eligible,
+        reset_at_ms=reset_at_ms,
+        reason=reason,
     )
 
 
@@ -249,6 +258,36 @@ def test_retry_current_attempt_not_overridden_by_earlier_attempt(tmp_path: Path)
     assert store.get(old_decision.decision_id).selected == {"executor": "codex", "model_id": "gpt-5.3-codex"}
 
 
+def test_same_run_same_phase_other_card_decision_does_not_override_current_card(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run = _run(
+        registry, tmp_path, work_id="same-phase-card-isolation",
+        steps=(_step("current-card"), _step("older-card")), facets=(),
+    )
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    other_card_decision = _decision(
+        decision_id="adm:v1:" + "d" * 64, run_id=run.run_id,
+        card_id="older-card", attempt_id=_attempt_id(run.run_id, "older-card", 0),
+    )
+    store.record(other_card_decision)
+    _job(registry, run, tmp_path, card="older-card")
+    _job(registry, run, tmp_path, card="current-card")
+    registry._manager_update_workflow_run(
+        run.run_id, quota_admission=_quota_admission_pointer(other_card_decision),
+    )
+    current = registry.get_workflow_run(run.run_id)
+
+    entry = manager.workflow_status_entry(registry, current, quota_decision_store=store)
+    projected = entry["quota_decision"]
+
+    assert projected["personas"]["builder"]["decision_id"] == other_card_decision.decision_id
+    assert projected["personas"]["builder"]["available"] is False
+    assert projected["personas"]["builder"]["mismatch_reason"] == "card-superseded"
+    assert "selected" not in projected["personas"]["builder"]
+
+
 def test_cross_run_card_isolation_exact_key(tmp_path: Path) -> None:
     """同一個 store 裡兩個不同 run 的決策不得互相洩漏——exact-key 查找。"""
     store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
@@ -308,6 +347,35 @@ def test_wait_without_job_is_not_presented_as_admitted(tmp_path: Path) -> None:
     assert '"job_id"' not in rendered
 
 
+def test_wait_projection_includes_retry_eligibility_and_reset(tmp_path: Path) -> None:
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "1" * 64,
+        outcome="wait",
+        selected=None,
+        retry_eligible=True,
+        reset_at_ms=_NOW + 60_000,
+        reason="quota-admission-insufficient",
+    )
+    store.record(decision)
+    reason = diagnostic_reason(
+        "quota-admission-insufficient", "quota wait",
+        source="manager._dispatch_workflow_card:quota-admission",
+        run_id=decision.run_id, card=decision.card_id,
+    ).to_dict()
+    projection = dp.project_workflow_quota_admission(
+        run_id=decision.run_id,
+        quota_admission=_quota_admission_pointer(decision),
+        needs_human_reason=reason,
+        current_identity_by_persona={"builder": {"card": decision.card_id}},
+        jobs=[], store=store, now_ms=_NOW,
+    )
+
+    wait = projection["wait"]
+    assert wait["retry_eligible"] is True
+    assert wait["reset_at_ms"] == _NOW + 60_000
+
+
 def test_unknown_remaining_selected_candidate_is_not_confirmed(tmp_path: Path) -> None:
     """shadow 模式下即使候選 unknown remaining 一樣會被 admit——投影必須忠實
     標成 unknown，不得呈現成『現在可派』的 confirmed。"""
@@ -327,6 +395,23 @@ def test_unknown_remaining_selected_candidate_is_not_confirmed(tmp_path: Path) -
     persona = projection["personas"]["builder"]
     assert persona["classification"]["observation"] == "unknown"
     assert persona["selected_feasible"] is False
+
+
+def test_missing_qualification_provenance_projects_as_unknown(tmp_path: Path) -> None:
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "9" * 64,
+        qualification_version=None,
+    )
+    store.record(decision)
+    projection = dp.project_workflow_quota_admission(
+        run_id=decision.run_id,
+        quota_admission=_quota_admission_pointer(decision),
+        needs_human_reason=None,
+        store=store, now_ms=_NOW,
+    )
+
+    assert projection["personas"]["builder"]["classification"]["qualification"] == "unknown"
 
 
 def test_expired_observation_gap_marks_observation_unknown(tmp_path: Path) -> None:
@@ -958,6 +1043,121 @@ def test_producer_to_snapshot_to_work_show_end_to_end(tmp_path: Path) -> None:
     assert "quota_decision[builder]:" in joined
     assert f"decision_id: {decision.decision_id}" in joined
     assert "mode: shadow  outcome: admit" in joined
+
+
+def test_daemon_status_inspect_and_work_show_preserve_wait_projection_and_source_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
+) -> None:
+    """Compare the daemon snapshot, status CLI, and work-show read model on one wait."""
+    import hashlib
+    import time
+
+    from paulsha_cortex import cli
+    from paulsha_cortex.control import constants, contract
+    from paulsha_cortex.coordinator import manager_daemon
+    from paulsha_cortex.coordinator.model_identities import IdentityRegistry
+    from paulsha_cortex.monitor.work_api import WorkReadModelStore
+    from paulsha_cortex.monitor.work_models import WorkItem
+    from paulsha_cortex.monitor.work_snapshot import WorkSnapshot
+
+    coordinator = tmp_path / "coordinator"
+    control = tmp_path / "control"
+    monkeypatch.setattr(time, "time", lambda: _NOW / 1000)
+    monkeypatch.setenv("PSC_COORDINATOR_ROOT", str(coordinator))
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(control))
+    state = coordinator / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    run = _run(
+        registry, tmp_path, work_id="projection-wait-840",
+        steps=(_step("build-card", executor=None, model=None),),
+        facets=(),
+    )
+    store = admission.AdmissionDecisionStore()
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    result = manager.dispatch_workflow_card(
+        dispatcher, run=run, identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _identity: None, coordinator_root=coordinator,
+        quota_admission_context=admission.QuotaConfigInvalid(reason="fixture-invalid-config"),
+    )
+    assert result["reason"] == "quota-config-invalid"
+    run = registry.get_workflow_run(run.run_id)
+    reason = run.needs_human_reason
+    decision_id = run.quota_admission["builder"]["decision_id"]
+    decision = store.get(decision_id)
+    assert decision is not None and decision.outcome == "wait"
+    assert reason["reason"] == "quota-config-invalid"
+    decisions_path = store.path
+    source_before = {
+        "registry": hashlib.sha256(state.read_bytes()).hexdigest(),
+        "decisions": hashlib.sha256(decisions_path.read_bytes()).hexdigest(),
+    }
+
+    status_provider = manager_daemon.build_runtime_status_provider(
+        registry=registry, specs_dir=str(tmp_path / "specs"), handoff_dir=str(tmp_path / "handoff"),
+        scan_specs_fn=lambda _: [], ready_units_fn=lambda _metas, _predicate: [],
+        now_fn=lambda: "2026-09-29T00:00:00Z",
+    )
+    daemon_projection = status_provider()
+    status_entry = next(row for row in daemon_projection["attention"] if row.get("run_id") == run.run_id)
+    wait_projection = status_entry["quota_decision"]["wait"]
+    assert wait_projection["retry_eligible"] is False
+    assert wait_projection["reset_at_ms"] == decision.reset_at_ms
+    assert status_entry["blocking_reason"] == reason
+    assert not any(row.get("workflow_run_id") == run.run_id for row in daemon_projection["in_flight"])
+    assert not any(row.get("workflow_run_id") == run.run_id for row in daemon_projection["recent_done"])
+
+    status_payload = contract.build_status(
+        ready=daemon_projection["ready"], in_flight=daemon_projection["in_flight"],
+        recent_done=daemon_projection["recent_done"],
+        daemon={"pid": None, "last_tick_at": "2026-09-29T00:00:00Z", "idle": True},
+        updated_at="2026-09-29T00:00:00Z",
+    )
+    status_payload.update({key: value for key, value in daemon_projection.items() if key not in {"ready", "in_flight", "recent_done"}})
+    contract.atomic_write_json(constants.status_path(), status_payload)
+    status_bytes_before_cli = hashlib.sha256(constants.status_path().read_bytes()).hexdigest()
+    assert cli.main(["inspect", "status", "--json"]) == 0
+    inspect_payload = json.loads(capsys.readouterr().out)["status"]
+    inspect_entry = next(row for row in inspect_payload["attention"] if row.get("run_id") == run.run_id)
+    assert hashlib.sha256(constants.status_path().read_bytes()).hexdigest() == status_bytes_before_cli
+
+    workflow_snapshot = WorkflowRegistryProvider(
+        REPO, state_path=state, quota_decision_store=store,
+    ).scan()
+    item = WorkItem(
+        work_id=run.work_id, repo=run.repo, title=run.work_id, state="ongoing",
+        phase=run.current_phase, facets=run.facets, sources=(), next_actions=(),
+        workflow_run_id=run.run_id, updated_at="2026-09-29T00:00:00Z",
+    )
+    work_store = WorkReadModelStore(WorkSnapshot(
+        sequence=1, written_at="2026-09-29T00:00:00Z",
+        providers={workflow_snapshot.provider_id: workflow_snapshot}, work_items=(item,),
+        source_owners={}, exclusions=(),
+    ))
+
+    class _WorkClient:
+        def request(self, request):
+            data = work_store.get_work_item(request["work_id"], repo=request.get("repo"))
+            return {"ok": True, "data": data}
+
+    assert cli._work_read_main(
+        ["work", "show", run.work_id, "--repo", run.repo, "--json"], work_client=_WorkClient(),
+    ) == 0
+    work_payload = json.loads(capsys.readouterr().out)
+    work_decision = work_payload["quota_decision"]
+
+    assert inspect_entry["quota_decision"] == status_entry["quota_decision"]
+    assert work_decision == status_entry["quota_decision"]
+    work_reason = work_payload["blocking_reason"]
+    assert work_reason["reason"] == reason["reason"]
+    assert work_reason["detail"] == reason["detail"]
+    assert work_reason["source"] == reason["source"]
+    assert work_reason["run_id"] == run.run_id
+    assert work_decision["wait"] == wait_projection
+    assert hashlib.sha256(constants.status_path().read_bytes()).hexdigest() == status_bytes_before_cli
+    assert source_before == {
+        "registry": hashlib.sha256(state.read_bytes()).hexdigest(),
+        "decisions": hashlib.sha256(decisions_path.read_bytes()).hexdigest(),
+    }
 
 
 # ---------------------------------------------------------------------------

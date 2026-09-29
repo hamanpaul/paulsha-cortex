@@ -1,0 +1,4 @@
+- quota wait receipt 記錄 retry eligibility 與最早已知 reset；periodic tick 在 fresh quota observation 證明候選可行後自動續派，同時保留 frozen card/pin 與安全 attempt 邊界。
+- launch HTTP 429 的結構化訊號會持久分類為 rate-limited 並寫入 executor backoff，不改 model qualification／品質分；rollback 保留既有 receipt、reservation 與 usage evidence。
+- #840 wait projection 呈現 retry/reset 欄位，補 Manager 真實派工 producer 至 status CLI 與 work-show 投影測試。准入門檻使用一個原生計量單位，實際終局耗用依 #836 ledger 從 remaining 扣除；不做 #837 forecast。
+- 補上 manager_daemon periodic tick 經真實 resume／dispatch 的 quota wait 續派整合測試，涵蓋額度不足、reset 後觀測未恢復、fresh observation 恢復及連續 tick 冪等；補 #840 同 run 同 phase 跨卡隔離，以及 daemon status、inspect status、work show wait 投影逐欄一致與讀取前後 source bytes 不變驗證。

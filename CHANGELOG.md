@@ -77,6 +77,8 @@
 
 - **#842 qualification 驗收補齊**：補上 Manager enforce 真 store 核可／撤銷、profile／role 鄰列拒借、import／核可／撤銷 crash recovery、歷史 durable 檔案 digest，以及已核可資料仍受 pin／reviewer independence 硬閘限制的測試；文件列出 owner 真人核可 CLI、輸入與 receipt 查核步驟。
 - **#857／#845 B5 task-memory canary 對齊 live receipt 契約與 G857-3 補齊**：`cortex task-memory canary` 輸出改為 #845 `cortex/task-memory-live-canary/v1` 形狀（`paths.{context-delivered,snapshot-ready,note-fetch}`、`negative_controls[]`、`cross_project[]`、`executor.id`、`--target-file` 的 `target`），真 canary 產物可走 `_verify_live` 到 `verified`；relay overwrite（provider 覆寫 task id／mode、executor prompt 未逐字保留）與既有輸出 schema 破壞改由實際觀測判定為 blocker；task kind 輪替 build／verify／review；`legacy_strict_kpi_mutated` 改由 receipt 的 `counts_as_read` 計算（#857）。
+- **#839／#840 額度恢復與 wait 投影**：quota wait receipt 新增最早已知 reset 與 retry eligibility；periodic tick 只在新 observation 證明候選可行後自動續派，保留 frozen card/pin 並沿安全 attempt 邊界重試。結構化 launch HTTP 429 會分類為 rate-limited 並寫 durable executor backoff，不降品質分；新 receipt 以固定 dispatch unit threshold 表示 demand，已量測 Cortex 終局 usage 由 #836 ledger 扣自 remaining，不做 #837 forecast。補 Manager dispatch producer 到 status CLI／work-show projection、wait projection、並行 reservation、unknown remaining 零 spawn、restart reuse 與 rollback evidence 測試（見 `changelog.d/quota-admission-gaps.md`）。
+- **#839／#840 periodic retry 與投影一致性補測**：以真 `manager_daemon` periodic runner → `resume_workflow_run` → workflow dispatch 驗證 quota wait 僅在 fresh sufficient observation 後續派，reset 時間本身不放行，同一 attempt 跨 tick 冪等；補同 run 同 phase 跨卡決策隔離，以及 daemon `status.json`、`inspect status`、`work show` 的 wait 投影欄位一致和 registry／decision store bytes 保持不變（見 `changelog.d/quota-admission-gaps.md`）。
 
 ### Fixed
 

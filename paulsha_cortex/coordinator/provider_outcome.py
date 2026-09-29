@@ -301,6 +301,26 @@ def classify_launch_failure(
         if exc is None:
             raise ValueError("launch failure classification requires detail or exc")
         detail = f"launch failed before attach_launch_handle: {_exception_summary(exc)}"
+    # Launchers may surface a structured provider response before a stream/job
+    # exists. Preserve an explicit HTTP 429 as authoritative rate-limit evidence;
+    # prose such as "too many requests" remains insufficient here.
+    if exc is not None:
+        status = next(
+            (getattr(exc, name, None) for name in ("api_error_status", "status_code", "http_status")
+             if type(getattr(exc, name, None)) is int),
+            None,
+        )
+        if status == 429:
+            reset_at = next(
+                (getattr(exc, name, None) for name in ("reset_at", "retry_at")
+                 if type(getattr(exc, name, None)) is int),
+                None,
+            )
+            return _structured_classification(
+                outcome_taxonomy.StructuredKind.RATE_LIMITED,
+                "structured launch response api status 429",
+                reset_at=reset_at,
+            )
     kind = outcome_taxonomy.StructuredKind.LAUNCH_FAILED
     if exc is not None and _is_missing_executable_exception(
         exc, executor=executor, worktree=worktree

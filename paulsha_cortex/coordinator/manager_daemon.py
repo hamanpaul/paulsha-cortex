@@ -1473,7 +1473,12 @@ def build_periodic_tick_runner(
                     # 的 run 送進去白跑一趟——尤其是同一 tick 內剛被
                     # authority-restart reset 剝除過 needs_human 又再度標記
                     # needs_human 的 run，不必每個 tick 都重新嘗試一次。
-                    or "needs_human" in workflow.facets
+                    or (
+                        "needs_human" in workflow.facets
+                        and not manager.quota_wait_retry_is_eligible(
+                            run=workflow, quota_admission_context=quota_admission_ctx,
+                        )
+                    )
                 ):
                     continue
                 # #536：define 必須在集合內。實測 run `workflow-7a430d31eff66ef13630`

@@ -88,6 +88,8 @@ def _classify_demand(demand_version: object) -> str:
         return "unknown"
     if demand_version == "not-applicable":
         return "not-applicable"
+    if demand_version == _quota_admission.DISPATCH_UNIT_DEMAND_VERSION:
+        return "not-applicable"
     if demand_version == _quota_admission.DEMAND_FIXTURE_VERSION:
         return "estimated"
     return "confirmed"
@@ -117,6 +119,16 @@ def _classify_binding_kind(value: object) -> str:
     if value == "none":
         return "binding-missing"
     # 缺席（#1116 之前寫的舊 receipt）視為 unknown，不臆測。
+    return "unknown"
+
+
+def _classify_qualification(value: object) -> str:
+    if value == "not-applicable":
+        return "not-applicable"
+    if value == "enforced":
+        return "confirmed"
+    # Qualification was disabled, missing or written by an older producer;
+    # policy presence alone cannot prove a candidate's qualification.
     return "unknown"
 
 
@@ -578,9 +590,13 @@ def _project_persona_decision(
             "demand": _classify_demand(decision.demand_version),
             "observation": _classify_observation(decision.selected_observation_state),
             "binding": _classify_binding_kind(decision.selected_binding_kind),
+            "qualification": _classify_qualification(decision.qualification_version),
         },
         "selected_feasible": decision.selected_feasible,
     }
+    if decision.outcome == "wait":
+        payload["retry_eligible"] = decision.retry_eligible
+        payload["reset_at_ms"] = decision.reset_at_ms
     if stale_info is not None:
         payload.update(stale_info)
     return payload
@@ -697,10 +713,20 @@ def project_workflow_quota_admission(
             )
             if projected is not None:
                 personas[persona] = projected
+    wait = _project_wait(needs_human_reason)
+    if wait is not None:
+        current_wait = next(
+            (persona for persona in personas.values()
+             if persona.get("available") is True and persona.get("outcome") == "wait"),
+            None,
+        )
+        if current_wait is not None:
+            wait["retry_eligible"] = current_wait.get("retry_eligible")
+            wait["reset_at_ms"] = current_wait.get("reset_at_ms")
     return {
         "schema": PROJECTION_SCHEMA,
         "run_id": run_id,
         "as_of_ms": now_ms,
         "personas": personas,
-        "wait": _project_wait(needs_human_reason),
+        "wait": wait,
     }

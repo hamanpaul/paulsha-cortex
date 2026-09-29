@@ -11836,6 +11836,12 @@ def _quota_admission_record_wait_decision(
                 generated_at_ms=int(time.time() * 1000),
                 selected=None, reservation_id=None,
                 excluded=tuple(excluded), reason=reason,
+                retry_eligible=(reason == "quota-admission-insufficient"),
+                reset_at_ms=min(
+                    (int(item["reset_at_ms"]) for item in excluded
+                     if type(item.get("reset_at_ms")) is int and item["reset_at_ms"] >= 0),
+                    default=None,
+                ),
             )
             store.record(decision)
         return {"decision_id": decision_id, "mode": "enforced", "outcome": "wait"}
@@ -12396,6 +12402,87 @@ def reconcile_quota_admission_reservations(
             for o in bound_outcomes
         ],
     }
+
+
+def quota_wait_retry_is_eligible(*, run, quota_admission_context) -> bool:
+    """Return whether this run has the current durable quota wait receipt.
+
+    This is the periodic-tick selector only. It does not grant permission to
+    dispatch; ``resume_workflow_run`` separately requires a fresh feasible
+    observation while enforcement is enabled.
+    """
+    if quota_admission_context is None:
+        return False
+    from . import quota_admission
+
+    if isinstance(quota_admission_context, quota_admission.QuotaConfigInvalid):
+        return False
+    reason = getattr(run, "needs_human_reason", None)
+    step = _current_workflow_step(run)
+    if not isinstance(reason, Mapping) or step is None:
+        return False
+    if reason.get("reason") != "quota-admission-insufficient":
+        return False
+    pointer = (getattr(run, "quota_admission", None) or {}).get(step.persona)
+    decision_id = pointer.get("decision_id") if isinstance(pointer, Mapping) else None
+    if not isinstance(decision_id, str) or not decision_id:
+        return False
+    try:
+        decision = quota_admission_context.store.get(decision_id)
+    except Exception:
+        return False
+    return bool(
+        decision is not None
+        and decision.run_id == run.run_id
+        and decision.card_id == step.card
+        and decision.mode == "enforced"
+        and decision.outcome == "wait"
+        and decision.reason == reason.get("reason")
+        and decision.retry_eligible is True
+    )
+
+
+def _quota_wait_has_recovered_candidate(
+    *, run, identities, launcher_factory, quota_admission_context,
+) -> bool:
+    """Require a fresh quota observation to admit at least one current candidate."""
+    if not quota_wait_retry_is_eligible(run=run, quota_admission_context=quota_admission_context):
+        return False
+    from . import quota_admission
+
+    if not quota_admission.quota_admission_enabled(quota_admission_context.environment):
+        # Explicit rollback: the next decision is shadow and follows the
+        # pre-enforcement dispatch policy; the old wait evidence stays durable.
+        return True
+    step = _current_workflow_step(run)
+    if step is None:
+        return False
+    try:
+        candidates = _workflow_identity_candidates(run, step, identities)
+    except Exception:
+        return False
+    now_ms = int(time.time() * 1000)
+    for identity in candidates:
+        try:
+            launcher = launcher_factory(identity)
+            if launcher is None:
+                continue
+            launcher = _specialize_workflow_launcher(launcher, step)
+            binding, _ = _bind_workflow_execution_profile(
+                run, step, identity, launcher,
+                qualification_policy=getattr(identities, "qualification_policy", "disabled"),
+            )
+            assessment = _evaluate_quota_admission_candidate(
+                quota_admission_context, identity=identity,
+                profile_binding=binding, now_ms=now_ms,
+            )
+            if assessment is None or assessment[0].feasible:
+                return True
+        except Exception:
+            # This probe is read-only and conservative. The ordinary resume path
+            # will report the exact qualification/preflight failure if retried.
+            continue
+    return False
 
 
 _LEGACY_CARD_EXECUTION = {
@@ -15215,6 +15302,11 @@ def _dispatch_workflow_card(
                 "executor": identity.executor,
                 "model_id": identity.model_id,
                 "exclusion_reason": quota_assessment.exclusion_reason,
+                "reset_at_ms": min(
+                    (pool.reset_at_ms for pool in quota_assessment.pools
+                     if type(pool.reset_at_ms) is int and pool.reset_at_ms >= 0),
+                    default=None,
+                ),
             }
         )
         if not (quota_assessment.feasible or not quota_admission_enforced):
@@ -15990,23 +16082,30 @@ def _dispatch_workflow_card(
                 )
         return attached_job
     except BaseException as launch_exc:
+        launch_classification = provider_outcome.classify_launch_failure(
+            exc=launch_exc,
+            executor=identity.executor,
+            worktree=worktree,
+        )
         updated_job = registry.update_headless_result(
             str(job["job_id"]),
             status="failed",
             exit_code=1,
             executor=identity.executor,
             model_id=identity.model_id,
-            provider_outcome=provider_outcome.classify_launch_failure(
-                exc=launch_exc,
-                executor=identity.executor,
-                worktree=worktree,
-            ).to_dict(),
+            provider_outcome=launch_classification.to_dict(),
             runtime_diagnostic={
                 "reason": "launch-failed",
                 "detail": summarize_exception(launch_exc),
                 "source": "manager._dispatch_workflow_card:launch",
                 "job_id": str(job["job_id"]),
             },
+        )
+        # Launch-time structured 429 responses have no worker terminal callback
+        # to record the provider cooldown. Persist the same rate-limit contract
+        # used by ordinary terminal jobs before settling the quota reservation.
+        record_executor_backoff_from_job(
+            coordinator_root, updated_job, launch_classification,
         )
         if quota_reservation_handle is not None:
             # #839：spawn 已經 bind 到這個 job_id 之後才失敗（含派工時 429／
@@ -16678,7 +16777,20 @@ def resume_workflow_run(
     pre_resume_gate_status = run.gate_status
     retry_failed = False
     recovery_job_id: str | None = None
-    if "needs_human" in run.facets and run.status == "ongoing" and not operator_resume:
+    quota_auto_retry = bool(
+        "needs_human" in run.facets
+        and run.status == "ongoing"
+        and not operator_resume
+        and _quota_wait_has_recovered_candidate(
+            run=run, identities=identities,
+            launcher_factory=launcher_factory,
+            quota_admission_context=quota_admission_context,
+        )
+    )
+    if (
+        "needs_human" in run.facets and run.status == "ongoing"
+        and not operator_resume and not quota_auto_retry
+    ):
         return {
             "run_id": run.run_id,
             "current_phase": run.current_phase,
@@ -16721,7 +16833,18 @@ def resume_workflow_run(
                 }
             run = rebound
             pre_resume_gate_status = run.gate_status
-    if "needs_human" in run.facets and run.status == "ongoing":
+    if quota_auto_retry:
+        # A recovered quota wait is safe to retry only at the card boundary:
+        # keep the run's frozen chain/pins and ask the normal dispatcher to
+        # create the next attempt. It must not reattach a previous terminal job.
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(facet for facet in run.facets if facet != "needs_human"),
+            needs_human_reason=None,
+            gate_status="running",
+        )
+        retry_failed = True
+    elif "needs_human" in run.facets and run.status == "ongoing":
         recovery_step = _current_workflow_step(run)
         if recovery_step is not None:
             recovery_jobs = [

@@ -18,19 +18,27 @@ from __future__ import annotations
 import os
 import sys
 import time
+from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 
 import pytest
 
 from paulsha_cortex.coordinator import manager, quota_admission
+from paulsha_cortex.coordinator import executor_backoff
 from paulsha_cortex.coordinator import quota_observation as schema
 from paulsha_cortex.coordinator.launcher import LaunchHandle
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.quota_reservation import QuotaReservationAuthority
 from paulsha_cortex.coordinator.quota_shadow import QuotaShadowService
-from paulsha_cortex.coordinator.registry import JobRegistry
+from paulsha_cortex.coordinator.registry import JobRegistry, RegistryRevisionConflict
 from paulsha_cortex.coordinator.runtime_preflight import ExecutorEnvironment
 from paulsha_cortex.coordinator.workflow import WorkflowStep
+
+
+class _Structured429(RuntimeError):
+    status_code = 429
 
 
 def _step(phase: str, card: str, *, gate_result: str = "pending") -> WorkflowStep:
@@ -41,13 +49,15 @@ def _step(phase: str, card: str, *, gate_result: str = "pending") -> WorkflowSte
     )
 
 
-def _make_run(registry: JobRegistry, *, workspace_root: Path):
+def _make_run(registry: JobRegistry, *, workspace_root: Path, sized: bool = False):
     return registry._manager_create_workflow_run(
         work_id="quota-admission-839", repo="hamanpaul/paulsha-cortex",
         claim_key="claim:v1:" + "3" * 64, source_revision="4" * 64,
         workspace_root=str(workspace_root), combo="feature-oneshot", current_phase="build",
         steps=(_step("build", "subagent-build", gate_result="pending"),),
         issue_refs=(), openspec_refs=(), facets=(), gate_status="running",
+        sizing_score=5 if sized else None,
+        sizing_band="yellow" if sized else None,
     )
 
 
@@ -83,7 +93,7 @@ class _Launcher:
 
     def launch(self, *, slice_id, prompt, worktree, log_dir):
         if self._fail_on_launch:
-            raise RuntimeError("fake-executor-429: rate limited at spawn time")
+            raise _Structured429("fake-executor-429: rate limited at spawn time")
         return LaunchHandle(
             executor=self._executor, model_id=self._model_id, session_name=slice_id,
             pid=4242, log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
@@ -148,7 +158,10 @@ def _binding(descriptor: schema.PoolDescriptor, profile_key: str) -> schema.Prof
     )
 
 
-def _observe(shadow: QuotaShadowService, descriptor, window_id: str, value: str, *, profile_key: str, now_ms: int) -> None:
+def _observe(
+    shadow: QuotaShadowService, descriptor, window_id: str, value: str, *,
+    profile_key: str, now_ms: int, reset_at_ms: int | None = None,
+) -> None:
     payload = {
         "schema_version": 1,
         "observation_id": f"fixture-{descriptor.pool_id}-{window_id}-{profile_key[-8:]}-{now_ms}",
@@ -163,7 +176,11 @@ def _observe(shadow: QuotaShadowService, descriptor, window_id: str, value: str,
         "observed_at_ms": {"state": "known", "value": now_ms},
         "received_at_ms": now_ms,
         "ttl_ms": {"state": "known", "value": 60_000},
-        "reset_at_ms": {"state": "unknown", "reason": "missing-reset"},
+        "reset_at_ms": (
+            {"state": "known", "value": reset_at_ms}
+            if reset_at_ms is not None
+            else {"state": "unknown", "reason": "missing-reset"}
+        ),
         "source": {
             "source_id": "fixture-provider", "source_schema": "fixture-quota-v1",
             "adapter_version": "fixture-adapter-v1", "authority_ref": "fixture:provider-contract/v1",
@@ -195,13 +212,17 @@ def _freeze_wall_clock(monkeypatch: pytest.MonkeyPatch, *, now_ms: int) -> None:
     monkeypatch.setattr(time, "time", lambda: now_ms / 1000)
 
 
-def _dispatch(registry, run, identities, worktree, coordinator_root, *, quota_admission_context=None):
+def _dispatch(
+    registry, run, identities, worktree, coordinator_root, *,
+    quota_admission_context=None, force_new_card=False,
+):
     dispatcher = type(
         "D", (), {"_registry": registry, "_git_runner": None, "_worktree_creator": _FakeWorktreeCreator(worktree)}
     )()
     return manager.dispatch_workflow_card(
         dispatcher, run=run, identities=identities, launcher_factory=_launcher_factory,
         coordinator_root=coordinator_root, quota_admission_context=quota_admission_context,
+        force_new_card=force_new_card,
     )
 
 
@@ -425,8 +446,11 @@ def test_opt_in_independent_pool_alternative_is_selected_same_pool_alternative_r
     assert status.job_id == result["job_id"]
 
 
+@pytest.mark.parametrize("observed_remaining", ["0", None], ids=["insufficient", "unknown"])
 def test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed_remaining: str | None,
 ) -> None:
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     worktree = tmp_path / "wt"
@@ -443,10 +467,13 @@ def test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason(
     descriptor_a = _pool_descriptor(account="acct-codex", pool="pool-codex")
     descriptor_b = _pool_descriptor(account="acct-claude", pool="pool-claude")
     now_ms = int(time.time() * 1000)
-    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    clock_ms = [now_ms]
+    monkeypatch.setattr(time, "time", lambda: clock_ms[0] / 1000)
     shadow = QuotaShadowService.in_memory()
-    _observe(shadow, descriptor_a, "short", "0", profile_key=codex_key, now_ms=now_ms)
-    _observe(shadow, descriptor_b, "short", "0", profile_key=claude_key, now_ms=now_ms)
+    reset_at_ms = now_ms + 90_000
+    if observed_remaining is not None:
+        _observe(shadow, descriptor_a, "short", observed_remaining, profile_key=codex_key, now_ms=now_ms, reset_at_ms=reset_at_ms)
+        _observe(shadow, descriptor_b, "short", observed_remaining, profile_key=claude_key, now_ms=now_ms, reset_at_ms=reset_at_ms)
     ctx = quota_admission.DispatchContext(
         authority=QuotaReservationAuthority(tmp_path / "reservations.jsonl"),
         store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
@@ -475,7 +502,276 @@ def test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason(
     assert decision.mode == "enforced"
     assert decision.outcome == "wait"
     assert decision.reason == "quota-admission-insufficient"
+    assert decision.retry_eligible is True
+    assert decision.reset_at_ms == (reset_at_ms if observed_remaining is not None else None)
     assert {item["executor"] for item in decision.excluded} == {"codex", "claude"}
+    assert manager.quota_wait_retry_is_eligible(run=updated_run, quota_admission_context=ctx)
+    assert not manager._quota_wait_has_recovered_candidate(
+        run=updated_run, identities=identities, launcher_factory=_launcher_factory,
+        quota_admission_context=ctx,
+    )
+
+    # A reset timestamp alone never releases the wait. A fresh sufficient
+    # observation is required, after which the periodic resume path may retry.
+    clock_ms[0] += 1_000
+    _observe(shadow, descriptor_a, "short", "5", profile_key=codex_key,
+             now_ms=clock_ms[0], reset_at_ms=clock_ms[0] + 90_000)
+    _observe(shadow, descriptor_b, "short", "5", profile_key=claude_key,
+             now_ms=clock_ms[0], reset_at_ms=clock_ms[0] + 90_000)
+    assert manager._quota_wait_has_recovered_candidate(
+        run=updated_run, identities=identities, launcher_factory=_launcher_factory,
+        quota_admission_context=ctx,
+    )
+
+
+def test_periodic_tick_retries_quota_wait_only_after_fresh_recovery_and_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the real daemon tick -> resume -> dispatch path for a durable quota wait."""
+    from paulsha_cortex.coordinator import manager_daemon
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = _two_builder_identities()
+    step = manager._current_workflow_step(run)
+    candidates = manager._workflow_identity_candidates(run, step, identities)
+    codex = next(row for row in candidates if row.executor == "codex")
+    claude = next(row for row in candidates if row.executor == "claude")
+    codex_key = _resolved_profile_key(run, step, codex, "codex", "gpt-primary")
+    claude_key = _resolved_profile_key(run, step, claude, "claude", "claude-primary")
+    codex_pool = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    claude_pool = _pool_descriptor(account="acct-claude", pool="pool-claude")
+    clock_ms = [int(time.time() * 1000)]
+    monkeypatch.setattr(time, "time", lambda: clock_ms[0] / 1000)
+    shadow = QuotaShadowService.in_memory()
+    reset_at_ms = clock_ms[0] + 1_000
+    _observe(shadow, codex_pool, "short", "0", profile_key=codex_key,
+             now_ms=clock_ms[0], reset_at_ms=reset_at_ms)
+    _observe(shadow, claude_pool, "short", "0", profile_key=claude_key,
+             now_ms=clock_ms[0], reset_at_ms=reset_at_ms)
+    context = quota_admission.DispatchContext(
+        authority=QuotaReservationAuthority(tmp_path / "reservations.jsonl"),
+        store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(codex_pool, claude_pool), unit_catalog=(),
+        bindings=(_binding(codex_pool, codex_key), _binding(claude_pool, claude_key)),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+    dispatcher = type(
+        "D", (), {"_registry": registry, "_git_runner": None,
+                  "_worktree_creator": _FakeWorktreeCreator(worktree)}
+    )()
+    monkeypatch.setattr(manager, "_runtime_preflight_gate", lambda *args, **kwargs: None)
+    initial = manager.dispatch_workflow_card(
+        dispatcher, run=run, identities=identities, launcher_factory=_launcher_factory,
+        coordinator_root=tmp_path / "coordinator", quota_admission_context=context,
+    )
+    assert initial["reason"] == "quota-admission-insufficient"
+    waiting = registry.get_workflow_run(run.run_id)
+    assert waiting.needs_human_reason["reason"] == "quota-admission-insufficient"
+    assert waiting.quota_admission["builder"]["outcome"] == "wait"
+    assert manager.quota_wait_retry_is_eligible(run=waiting, quota_admission_context=context)
+    assert registry.list_jobs() == []
+
+    monkeypatch.setattr(manager_daemon, "_quota_admission_context_for", lambda: context)
+    monkeypatch.setattr(
+        manager_daemon, "_resolve_launcher_compat",
+        lambda executor, *a, identity=None, model=None, **kw: _Launcher(
+            identity.executor if identity is not None else executor,
+            identity.model_id if identity is not None else (model or "gpt-primary"),
+        ),
+    )
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher, specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"), workflow_identity_registry=identities,
+        scan_specs_fn=lambda _dir: [], auto_claim_fn=lambda: [],
+        run_tick_fn=lambda *args, **kwargs: {"dispatched": []},
+    )
+
+    runner()  # still empty: an eligible receipt alone does not admit a candidate
+    assert registry.list_jobs() == []
+    clock_ms[0] = reset_at_ms + 61_000
+    runner()  # reset has passed, but the old observation is stale; do not dispatch
+    assert registry.list_jobs() == []
+
+    _observe(shadow, codex_pool, "short", "5", profile_key=codex_key,
+             now_ms=clock_ms[0], reset_at_ms=clock_ms[0] + 90_000)
+    _observe(shadow, claude_pool, "short", "5", profile_key=claude_key,
+             now_ms=clock_ms[0], reset_at_ms=clock_ms[0] + 90_000)
+    runner()
+    launched = registry.list_jobs()
+    assert len(launched) == 1
+    assert launched[0]["workflow_run_id"] == run.run_id
+    assert launched[0]["workflow_card"] == step.card
+    runner()  # the same attempt is idempotent across consecutive daemon ticks
+    assert len(registry.list_jobs()) == 1
+
+
+def test_quota_context_cannot_override_missing_exact_qualification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Keep the unrelated runtime capability/provider snapshot out of this case;
+    # the real dispatch path and execution-profile qualification gate still run.
+    monkeypatch.setattr(manager, "_runtime_preflight_gate", lambda *args, **kwargs: None)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path, sized=True)
+    identities = _two_builder_identities()
+    step = manager._current_workflow_step(run)
+    identity = manager._workflow_identity_candidates(run, step, identities)[0]
+    profile_key = _resolved_profile_key(run, step, identity, "codex", "gpt-primary")
+    descriptor = _pool_descriptor(account="acct-qualification", pool="pool-qualification")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=profile_key, now_ms=now_ms)
+    context = quota_admission.DispatchContext(
+        authority=QuotaReservationAuthority(tmp_path / "reservations.jsonl"),
+        store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, profile_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+
+    result = _dispatch(
+        registry, run, replace(identities, qualification_policy="enforce"),
+        worktree, tmp_path / "coordinator", quota_admission_context=context,
+    )
+
+    assert result["reason"] == "execution-profile-blocked"
+    assert "exact-profile qualification is unknown" in result["detail"]
+    assert registry.list_jobs() == []
+    assert context.store.all_rows() == []
+    assert context.authority.list_by_state("reserved", now_ms=now_ms) == ()
+    assert context.authority.list_by_state("bound", now_ms=now_ms) == ()
+    assert registry.get_workflow_run(run.run_id).needs_human_reason["reason"] == "execution-profile-blocked"
+
+
+def test_two_manager_dispatches_racing_for_one_unit_launch_exactly_one_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state_path)
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    identity = manager._workflow_identity_candidates(run, step, identities)[0]
+    profile_key = _resolved_profile_key(run, step, identity, "codex", "gpt-primary")
+    descriptor = _pool_descriptor(account="acct-race", pool="pool-race")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=profile_key, now_ms=now_ms)
+    authority_path = tmp_path / "reservations.jsonl"
+    decisions_path = tmp_path / "decisions.jsonl"
+    bindings = (_binding(descriptor, profile_key),)
+    contexts = [
+        quota_admission.DispatchContext(
+            authority=QuotaReservationAuthority(authority_path),
+            store=quota_admission.AdmissionDecisionStore(decisions_path),
+            shadow=shadow, descriptors=(descriptor,), unit_catalog=(), bindings=bindings,
+            environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+        )
+        for _ in range(2)
+    ]
+    barrier = Barrier(2)
+    launched: list[str] = []
+
+    def dispatch(context):
+        local_registry = JobRegistry(state_path=state_path)
+        local_run = local_registry.get_workflow_run(run.run_id)
+        dispatcher = type(
+            "D", (), {"_registry": local_registry, "_git_runner": None,
+                      "_worktree_creator": _FakeWorktreeCreator(worktree)}
+        )()
+        barrier.wait(timeout=5)
+        def launcher_factory(candidate):
+            launcher = _launcher_factory(candidate)
+            original_launch = launcher.launch
+
+            def tracked_launch(**kwargs):
+                launched.append(candidate.executor)
+                return original_launch(**kwargs)
+
+            launcher.launch = tracked_launch
+            return launcher
+
+        try:
+            return manager.dispatch_workflow_card(
+                dispatcher, run=local_run, identities=identities,
+                launcher_factory=launcher_factory, coordinator_root=tmp_path / "coordinator",
+                quota_admission_context=context,
+            )
+        except RegistryRevisionConflict as exc:
+            # Two Managers may race to publish their run projection; losing
+            # registry CAS must still leave the quota winner as the only launcher.
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(dispatch, contexts))
+
+    final_registry = JobRegistry(state_path=state_path)
+    assert len(final_registry.list_jobs()) == 1
+    assert sum(isinstance(result, dict) and "job_id" in result for result in results) == 1
+    assert sum(isinstance(result, RegistryRevisionConflict) for result in results) <= 1
+    assert launched == ["codex"]
+    bound = contexts[0].authority.list_by_state("bound", now_ms=now_ms)
+    assert len(bound) == 1
+    assert bound[0].job_id == final_registry.list_jobs()[0]["job_id"]
+
+
+def test_manager_restart_reuses_live_bound_job_without_new_reservation_or_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state_path)
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    step = manager._current_workflow_step(run)
+    identity = manager._workflow_identity_candidates(run, step, identities)[0]
+    profile_key = _resolved_profile_key(run, step, identity, "codex", "gpt-primary")
+    descriptor = _pool_descriptor(account="acct-restart", pool="pool-restart")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=profile_key, now_ms=now_ms)
+    authority_path = tmp_path / "reservations.jsonl"
+    decisions_path = tmp_path / "decisions.jsonl"
+    context = quota_admission.DispatchContext(
+        authority=QuotaReservationAuthority(authority_path),
+        store=quota_admission.AdmissionDecisionStore(decisions_path),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, profile_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+    first_job = _dispatch(
+        registry, run, identities, worktree, tmp_path / "coordinator",
+        quota_admission_context=context,
+    )
+    first_decisions = context.store.all_rows()
+    reservation_states = context.authority.list_by_state("bound", now_ms=now_ms)
+
+    restarted_registry = JobRegistry(state_path=state_path)
+    restarted_run = restarted_registry.get_workflow_run(run.run_id)
+    restarted_job = _dispatch(
+        restarted_registry, restarted_run, identities, worktree, tmp_path / "coordinator",
+        quota_admission_context=context,
+    )
+
+    assert restarted_job["job_id"] == first_job["job_id"]
+    assert len(restarted_registry.list_jobs()) == 1
+    assert context.store.all_rows() == first_decisions
+    assert context.authority.list_by_state("bound", now_ms=now_ms) == reservation_states
 
 
 def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(
@@ -515,9 +811,13 @@ def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(
 
     monkeypatch.setattr(QuotaShadowService, "record_terminal_usage", _spy_record_terminal_usage)
 
+    qualification_before = registry.get_workflow_run(run.run_id).model_qualification
     _FAILING_EXECUTORS.add("codex")
-    with pytest.raises(RuntimeError, match="fake-executor-429"):
-        _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+    try:
+        with pytest.raises(RuntimeError, match="fake-executor-429"):
+            _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+    finally:
+        _FAILING_EXECUTORS.discard("codex")
 
     decision_id = quota_admission.decision_id_for(
         run_id=run.run_id, card_id=step.card, attempt_id=f"{run.run_id}:{step.card}:n0", profile_key=codex_key,
@@ -534,7 +834,34 @@ def test_spawn_time_429_after_bind_settles_failed_and_frees_capacity(
     # job 本身仍如實記為 failed——quota admission 不覆寫既有失敗分類（#826）。
     job = registry.list_jobs()[0]
     assert job["status"] == "failed"
-    assert job["provider_outcome"]["outcome"] != "quota"  # 不把 infra 失敗記成品質失敗
+    assert job["provider_outcome"]["outcome"] == "rate_limited"
+    assert job["provider_outcome"]["authority"] == "structured"
+    assert registry.get_workflow_run(run.run_id).model_qualification == qualification_before
+    persisted_backoff = executor_backoff.active_backoff(
+        tmp_path / "coordinator", "codex", "gpt-primary", now=now_ms / 1000 + 1,
+    )
+    assert persisted_backoff.backoff is not None
+    assert persisted_backoff.backoff.executor == "codex"
+
+    retry = _dispatch(
+        registry, run, identities, worktree, tmp_path / "coordinator",
+        quota_admission_context=ctx, force_new_card=True,
+    )
+    assert retry["executor"] == "claude"
+    claude_identity = next(
+        candidate for candidate in manager._workflow_identity_candidates(run, step, identities)
+        if candidate.executor == "claude"
+    )
+    claude_key = _resolved_profile_key(run, step, claude_identity, "claude", "claude-primary")
+    retry_decision_id = quota_admission.decision_id_for(
+        run_id=run.run_id, card_id=step.card,
+        attempt_id=f"{run.run_id}:{step.card}:n1", profile_key=claude_key,
+        mode="enforced",
+    )
+    assert retry_decision_id != decision_id
+    retry_decision = ctx.store.get(retry_decision_id)
+    assert retry_decision is not None
+    assert retry_decision.selected["executor"] == "claude"
 
     # settle 之後這個 attempt 的終局 usage 已經記過——不必等 restart 後的
     # periodic reconcile 才補記。
@@ -964,9 +1291,7 @@ def test_switching_shadow_to_enforce_mid_attempt_writes_distinct_enforced_receip
     assert updated_run.quota_admission["builder"]["mode"] == "enforced"
     assert updated_run.quota_admission["builder"]["decision_id"] == enforced_decision_id
 
-    # 這筆真正的 bound reservation 對 authority-based 的收斂掃描可見（對抗
-    # 審查第四輪 MAJOR manager.py:11491（a）：bound 收斂改以 authority 為
-    # 真相，不再依賴 store.enforced_admitted() 反查）。
+    # 這筆真正的 bound reservation 對 authority-based 的收斂掃描可見。
     bound_outcomes = quota_admission.reconcile_bound_reservations(
         authority=authority, store=store,
         job_lookup=lambda job_id: registry.get_job(job_id),
@@ -975,6 +1300,80 @@ def test_switching_shadow_to_enforce_mid_attempt_writes_distinct_enforced_receip
     )
     assert len(bound_outcomes) == 1
     assert bound_outcomes[0].reservation_id == enforced_decision.reservation_id
+
+
+def test_rollback_to_shadow_preserves_enforce_evidence_and_frozen_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    step = manager._current_workflow_step(run)
+    pinned_step = WorkflowStep(
+        phase=step.phase, persona=step.persona, card=step.card,
+        executor="codex", model="gpt-primary", domain="openai",
+        inputs=step.inputs, outputs=step.outputs, gate_result=step.gate_result,
+    )
+    run = registry._manager_update_workflow_run(run.run_id, steps=(pinned_step,))
+    identities = IdentityRegistry.from_rows(
+        [{"executor": "codex", "model_id": "gpt-primary", "independence_domain": "openai", "capabilities": ["build"]}]
+    )
+    identity = manager._workflow_identity_candidates(run, pinned_step, identities)[0]
+    profile_key = _resolved_profile_key(run, pinned_step, identity, "codex", "gpt-primary")
+    descriptor = _pool_descriptor(account="acct-rollback", pool="pool-rollback")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=profile_key, now_ms=now_ms)
+    authority = QuotaReservationAuthority(tmp_path / "reservations.jsonl")
+    store = quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    context = quota_admission.DispatchContext(
+        authority=authority, store=store, shadow=shadow, descriptors=(descriptor,),
+        unit_catalog=(), bindings=(_binding(descriptor, profile_key),),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+    original_create_job = registry.create_job
+
+    def fail_before_create(*args, **kwargs):
+        raise RuntimeError("provisioning failed before job creation")
+
+    registry.create_job = fail_before_create
+    try:
+        with pytest.raises(RuntimeError, match="before job creation"):
+            _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=context)
+    finally:
+        registry.create_job = original_create_job
+
+    enforce_id = quota_admission.decision_id_for(
+        run_id=run.run_id, card_id=pinned_step.card,
+        attempt_id=f"{run.run_id}:{pinned_step.card}:n0", profile_key=profile_key,
+        mode="enforced",
+    )
+    enforced = store.get(enforce_id)
+    assert enforced is not None and enforced.reservation_id is not None
+    assert authority.status(enforced.reservation_id, now_ms=now_ms + 1).state == "released"
+
+    shadow_context = quota_admission.DispatchContext(
+        authority=authority, store=store, shadow=shadow, descriptors=(descriptor,),
+        unit_catalog=(), bindings=(_binding(descriptor, profile_key),), environment={},
+    )
+    retry = _dispatch(
+        registry, run, identities, worktree, tmp_path / "coordinator",
+        quota_admission_context=shadow_context,
+    )
+    assert retry["executor"] == "codex"
+    shadow_id = quota_admission.decision_id_for(
+        run_id=run.run_id, card_id=pinned_step.card,
+        attempt_id=f"{run.run_id}:{pinned_step.card}:n0", profile_key=profile_key,
+        mode="shadow",
+    )
+    shadow_decision = store.get(shadow_id)
+    assert shadow_decision is not None and shadow_decision.mode == "shadow"
+    assert store.get(enforce_id) == enforced
+    assert authority.status(enforced.reservation_id, now_ms=now_ms + 1).state == "released"
+    assert registry.get_workflow_run(run.run_id).steps[0].executor == "codex"
+    assert registry.get_workflow_run(run.run_id).steps[0].model == "gpt-primary"
 
 
 def test_reserved_sweep_job_lookup_does_not_misattribute_unrelated_candidates_job(tmp_path: Path) -> None:

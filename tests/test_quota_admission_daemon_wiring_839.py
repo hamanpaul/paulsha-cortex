@@ -19,6 +19,7 @@ import pytest
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import manager, manager_daemon
 from paulsha_cortex.coordinator import quota_admission
+from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
 from paulsha_cortex.coordinator import quota_observation as schema
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -285,6 +286,63 @@ def test_periodic_tick_passes_quota_admission_context_and_calls_reconcile_sweep(
     assert "quota_admission_reconcile" not in summary  # wired=False 時不進 summary
 
 
+def test_periodic_tick_routes_eligible_quota_wait_to_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = _make_run(registry, tmp_path)
+    reason = diagnostic_reason(
+        "quota-admission-insufficient",
+        "all candidate quota pools are currently insufficient",
+        source="manager._dispatch_workflow_card:quota-admission",
+        run_id=run.run_id,
+    ).to_dict()
+    decision = quota_admission.AdmissionDecision(
+        decision_id="adm:v1:" + "a" * 64,
+        run_id=run.run_id, card_id="build", attempt_id=f"{run.run_id}:build:n0",
+        profile_key="quota-admission:no-admissible-candidate",
+        mode="enforced", outcome="wait",
+        policy_version=quota_admission.ADMISSION_POLICY_VERSION,
+        observation_version="not-applicable", demand_version="not-applicable",
+        qualification_version="not-applicable", generated_at_ms=1,
+        selected=None, reason="quota-admission-insufficient", retry_eligible=True,
+    )
+    store = quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    store.record(decision)
+    registry._manager_update_workflow_run(
+        run.run_id, facets=("needs_human",), needs_human_reason=reason,
+        quota_admission={"builder": {"decision_id": decision.decision_id, "mode": "enforced", "outcome": "wait"}},
+    )
+    run = registry.get_workflow_run(run.run_id)
+    context = quota_admission.DispatchContext(
+        authority=quota_admission.QuotaReservationAuthority(tmp_path / "reservations.jsonl"),
+        store=store, shadow=quota_admission.QuotaShadowService.in_memory(),
+        descriptors=(), unit_catalog=(), bindings=(),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+    monkeypatch.setattr(manager_daemon, "_quota_admission_context_for", lambda: context)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    resume_calls: list[dict] = []
+
+    def _fake_resume(*args, **kwargs):
+        resume_calls.append(kwargs)
+        return {"run_id": run.run_id, "current_phase": run.current_phase}
+
+    monkeypatch.setattr(manager, "resume_workflow_run", _fake_resume)
+    monkeypatch.setattr(manager, "reconcile_quota_admission_reservations", lambda **kwargs: {"wired": True})
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher, specs_dir=str(tmp_path / "specs"), handoff_dir=str(tmp_path / "handoff"),
+        workflow_identity_registry=IdentityRegistry.from_rows([]),
+        scan_specs_fn=lambda _dir: [], auto_claim_fn=lambda: [],
+        run_tick_fn=lambda *a, **k: {"dispatched": []},
+    )
+
+    runner()
+
+    assert len(resume_calls) == 1
+    assert resume_calls[0]["quota_admission_context"] is context
+
+
 # ---------------------------------------------------------------------------
 # 設定檔載入（a）：不存在／有效／無效 三態，以及 enforce／shadow 分流。
 # ---------------------------------------------------------------------------
@@ -383,7 +441,7 @@ def _init_worktree(path: Path) -> None:
 
 
 def test_end_to_end_shadow_daemon_dispatch_records_receipt_without_blocking(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
 ) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     run = _make_run(registry, tmp_path)
@@ -452,6 +510,38 @@ def test_end_to_end_shadow_daemon_dispatch_records_receipt_without_blocking(
     assert decision is not None
     assert decision.mode == "shadow"
     assert decision.outcome == "admit"
+
+    # #840 producer-to-reader chain: the real Manager dispatch receipt is read
+    # from the same registry snapshot by status and work-show projection paths.
+    from paulsha_cortex.control import constants, contract
+    # 直接呼叫 inspect porcelain 的入口：全套中其他 porcelain 測試會重建 umbrella
+    # 註冊表，經 umbrella dispatch 會依執行順序找不到 inspect 子命令。
+    from paulsha_cortex.porcelain import inspect as porcelain_inspect
+    from paulsha_cortex.monitor.providers import WorkflowRegistryProvider
+
+    run_after_dispatch = registry.get_workflow_run(run.run_id)
+    status_entry = manager.workflow_status_entry(
+        registry, run_after_dispatch, quota_decision_store=store,
+    )
+    assert status_entry["quota_decision"]["personas"]["builder"]["available"] is True
+    provider_result = WorkflowRegistryProvider(
+        run.repo, state_path=registry._state_path, quota_decision_store=store,
+    ).scan()
+    show_projection = provider_result.observations["quota_decisions"][run.work_id]
+    assert show_projection["personas"]["builder"]["decision_id"] == decision_id
+
+    status_file = tmp_path / "status.json"
+    monkeypatch.setattr(constants, "status_path", lambda: status_file)
+    payload = contract.build_status(
+        ready=[], in_flight=[], recent_done=[],
+        daemon={"pid": 1, "last_tick_at": "2026-09-29T00:00:00Z", "idle": False},
+        updated_at="2026-09-29T00:00:00Z",
+    )
+    payload["attention"] = [status_entry]
+    contract.atomic_write_json(status_file, payload)
+    assert porcelain_inspect.main(["status", "--json"]) == 0
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["status"]["attention"][0]["quota_decision"]["personas"]["builder"]["decision_id"] == decision_id
 
 
 def test_end_to_end_enforce_invalid_config_fails_closed_via_daemon_path(
