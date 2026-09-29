@@ -497,6 +497,24 @@ def test_gc_apply_reclaims_a_merged_job_clone_by_directory_removal(
     assert not workspace.exists()
 
 
+def test_direct_clone_removal_refuses_dirty_workspace_and_keeps_marker(
+    tmp_path: Path,
+) -> None:
+    repo = _source_repo(tmp_path)
+    pool = tmp_path / "pool"
+    workspace = Path(_creator(repo, pool).create(_BRANCH, job_id=_JOB_ID))
+    marker = job_workspace.marker_path(workspace)
+    precious = workspace / "unsaved.txt"
+    precious.write_text("keep for replay\n", encoding="utf-8")
+
+    with pytest.raises(job_workspace.WorkspaceError, match="workspace is dirty"):
+        job_workspace.remove_clone(workspace)
+
+    assert workspace.is_dir()
+    assert marker.is_file()
+    assert precious.read_text(encoding="utf-8") == "keep for replay\n"
+
+
 def test_gc_protects_the_branch_of_a_live_job_clone(tmp_path: Path) -> None:
     """未 merge 的工作區仍在用時，它的 branch 不得被歸類為可回收。
 

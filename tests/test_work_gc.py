@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from paulsha_cortex.coordinator import gc
+from paulsha_cortex.coordinator import gc, worktree_reclaim
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -161,6 +161,37 @@ def test_dirty_worktree_kept(tmp_path: Path) -> None:
     assert branch_artifact.action == gc.ACTION_KEEP
     assert branch_artifact.reason == gc.REASON_PROTECTED
     assert _branch_exists(repo, "feature/dirty")
+
+
+def test_gc_keeps_worktree_when_final_dirty_scan_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    pool = tmp_path / "repo-worktrees"
+    pool.mkdir()
+    worktree_path = pool / "feature-merged"
+    _git(repo, "worktree", "add", "-q", "-b", "feature/merged", str(worktree_path))
+    (worktree_path / "merged.txt").write_text("merged\n", encoding="utf-8")
+    _git(worktree_path, "add", "merged.txt")
+    _git(worktree_path, "commit", "-qm", "merged change")
+    _git(repo, "merge", "-q", "--ff-only", "feature/merged")
+
+    monkeypatch.setattr(
+        worktree_reclaim,
+        "_dirty_entries",
+        lambda _runner, _target: ([], "PermissionError: index permission denied"),
+    )
+    report = gc.run_gc(repo, apply=True, worktree_root=pool)
+
+    artifact = _artifact(report.artifacts, "worktree", str(worktree_path.resolve()))
+    assert artifact.action == gc.ACTION_KEEP
+    assert artifact.reason == gc.REASON_APPLY_ERROR
+    assert "worktree-dirty-scan-unavailable" in (artifact.detail or "")
+    assert worktree_path.is_dir()
+    assert (worktree_path / ".git").is_file()
+    assert (worktree_path / "merged.txt").is_file()
+    assert str(worktree_path) in _git(repo, "worktree", "list", "--porcelain").stdout
 
 
 def test_closed_unmerged_pr_branch_kept_with_annotation(tmp_path: Path) -> None:

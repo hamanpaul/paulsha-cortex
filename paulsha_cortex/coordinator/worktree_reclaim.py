@@ -114,6 +114,9 @@ RECLAIM_FAILED = "failed"
 PRESERVE_FILE_MAX_BYTES = 4 * 1024 * 1024
 # 封存檔數上限，理由同上。
 PRESERVE_FILE_MAX_COUNT = 512
+# Dirty scans and registry operations must terminate so a stuck git process cannot
+# keep a recovery action pending indefinitely.
+GIT_COMMAND_TIMEOUT_SECONDS = 30
 
 # 「不銷毀證據」的兩種模型（完整論證見模組 docstring）。**預設一律是
 # `EVIDENCE_PRESERVE`**：新呼叫端忘了表態時得到的是保守的那一個。
@@ -171,6 +174,7 @@ def _pinned_git_runner(repo_root: Path) -> GitRunner:
             ["git", "-C", str(repo_root), *args],
             capture_output=True,
             text=True,
+            timeout=GIT_COMMAND_TIMEOUT_SECONDS,
         )
         if proc.returncode != 0:
             raise RuntimeError(
@@ -383,6 +387,8 @@ def reclaim_worktree(
 
     任一條無法證實（含 registry 清單本身讀不到）一律回 ``failed``；呼叫端
     MUST NOT 在 ``failed`` 上回報 recovery 成功——這正是 #478 的核心缺陷。
+    對任何現存目錄也必須先成功列出 dirty 狀態；權限錯誤、git 失敗或逾時一律
+    在移除 registry 或目錄前回 ``failed``，讓工作區 marker 可供診斷與 replay。
 
     ``evidence_model``（#658）決定「不銷毀證據」怎麼落實，兩個合法值的語意與
     適用條件見模組 docstring。**不接受未知值**：那代表呼叫端沒有真的表態，而
@@ -391,7 +397,13 @@ def reclaim_worktree(
 
     if evidence_model not in _EVIDENCE_MODELS:
         raise ValueError(f"unknown worktree reclaim evidence model: {evidence_model!r}")
-    runner = resolve_git_runner(git_runner, repo_root=repo_root)
+    runner = (
+        git_runner
+        if git_runner is not None
+        else _pinned_git_runner(
+            Path(repo_root) if repo_root is not None else paths.repo_root()
+        )
+    )
     target = Path(path)
     text = str(target)
 
@@ -457,22 +469,23 @@ def reclaim_worktree(
 
     preserved_ref: str | None = None
     preserved_files = 0
-    if (
-        evidence_model == EVIDENCE_PRESERVE
-        and exists
-        and not target.is_symlink()
-        and target.is_dir()
-    ):
+    if exists and not target.is_symlink() and target.is_dir():
         entries, dirty_error = _dirty_entries(runner, target)
         if dirty_error is not None:
-            # gitdir 已壞（正是 #478 的殘留態）時 status 讀不到；此時目錄要嘛
-            # 不存在、要嘛只剩無主檔案，記錄後照常回收，不阻斷自癒。
             logger.warning(
                 "worktree-reclaim-dirty-scan-unavailable path=%s error=%s",
                 text,
                 dirty_error,
             )
-        elif entries:
+            return WorktreeReclaim(
+                RECLAIM_FAILED,
+                text,
+                registry_entry_found=registered,
+                archived_ref=archived_ref,
+                evidence_model=evidence_model,
+                detail=f"worktree-dirty-scan-unavailable: {dirty_error}",
+            )
+        if evidence_model == EVIDENCE_PRESERVE and entries:
             root = Path(preserve_root) if preserve_root is not None else (
                 paths.coordinator_root() / "evidence"
             )

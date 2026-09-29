@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 import subprocess
+import os
+import pwd
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -307,6 +310,174 @@ def test_reclaim_fails_closed_when_registry_is_unreadable(tmp_path: Path) -> Non
     result = worktree_reclaim.reclaim_worktree(tmp_path / "pool" / "x", git_runner=broken)
     assert result.status == worktree_reclaim.RECLAIM_FAILED
     assert "worktree-registry-unreadable" in (result.detail or "")
+
+
+@pytest.mark.parametrize("failed_command", ["diff", "ls-files"])
+def test_reclaim_fails_closed_when_dirty_scan_is_denied(
+    tmp_path: Path, failed_command: str
+) -> None:
+    """Manager 無權讀 builder index 時，marker 與整棵工作區都要留下。"""
+
+    repo = _init_repo(tmp_path)
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    workspace = pool / "job-workspace"
+    subprocess.run(["git", "clone", "-q", str(repo), str(workspace)], check=True)
+    marker = job_workspace.write_marker(
+        workspace,
+        branch="main",
+        base=_git(repo, "rev-parse", "main").strip(),
+        source_repo=repo,
+    )
+    precious = workspace / "uncommitted.txt"
+    precious.write_text("unsaved builder data\n", encoding="utf-8")
+    real = _runner_for(repo)
+    calls: list[list[str]] = []
+
+    def permission_denied(args: list[str]) -> str:
+        calls.append(list(args))
+        if len(args) > 2 and args[0] == "-C" and args[2] == failed_command:
+            raise PermissionError("index permission denied")
+        return real(args)
+
+    result = worktree_reclaim.reclaim_worktree(
+        workspace,
+        git_runner=permission_denied,
+        repo_root=repo,
+        preserve_root=tmp_path / "evidence",
+    )
+
+    assert result.status == worktree_reclaim.RECLAIM_FAILED
+    assert "worktree-dirty-scan-unavailable" in (result.detail or "")
+    assert workspace.is_dir()
+    assert marker.is_file()
+    assert precious.read_text(encoding="utf-8") == "unsaved builder data\n"
+    assert not any(args[:2] == ["worktree", "remove"] for args in calls)
+
+
+def test_reclaim_harvested_model_still_requires_a_successful_dirty_scan(
+    tmp_path: Path,
+) -> None:
+    """evidence_model 不得讓不可讀的 dirty 狀態繞過刪除前安全閘。"""
+
+    repo = _init_repo(tmp_path)
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    workspace = pool / "job-workspace"
+    subprocess.run(["git", "clone", "-q", str(repo), str(workspace)], check=True)
+    marker = job_workspace.write_marker(
+        workspace,
+        branch="main",
+        base=_git(repo, "rev-parse", "main").strip(),
+        source_repo=repo,
+    )
+
+    def permission_denied(args: list[str]) -> str:
+        if args[:2] == ["-C", str(workspace)] and args[2] == "diff":
+            raise PermissionError("index permission denied")
+        return _runner_for(repo)(args)
+
+    result = worktree_reclaim.reclaim_worktree(
+        workspace,
+        git_runner=permission_denied,
+        repo_root=repo,
+        evidence_model=worktree_reclaim.EVIDENCE_HARVESTED,
+    )
+
+    assert result.status == worktree_reclaim.RECLAIM_FAILED
+    assert "worktree-dirty-scan-unavailable" in (result.detail or "")
+    assert marker.is_file()
+    assert workspace.is_dir()
+
+
+def test_reclaim_fails_closed_when_dirty_scan_times_out(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    workspace = pool / "job-workspace"
+    subprocess.run(["git", "clone", "-q", str(repo), str(workspace)], check=True)
+    marker = job_workspace.write_marker(
+        workspace,
+        branch="main",
+        base=_git(repo, "rev-parse", "main").strip(),
+        source_repo=repo,
+    )
+
+    def timed_out(args: list[str]) -> str:
+        if args[:2] == ["-C", str(workspace)] and args[2] == "diff":
+            raise subprocess.TimeoutExpired(cmd="git diff", timeout=0.01)
+        return _runner_for(repo)(args)
+
+    result = worktree_reclaim.reclaim_worktree(
+        workspace, git_runner=timed_out, repo_root=repo
+    )
+
+    assert result.status == worktree_reclaim.RECLAIM_FAILED
+    assert "worktree-dirty-scan-unavailable" in (result.detail or "")
+    assert marker.is_file()
+    assert workspace.is_dir()
+
+
+def test_reclaim_fails_closed_when_index_is_unreadable_to_scanning_uid(
+    tmp_path: Path,
+) -> None:
+    """掃描 chmod 000 的 clone index，驗證跨 UID／DAC 權限拒絕。"""
+
+    other_user = None
+    if os.geteuid() == 0:
+        try:
+            other_user = pwd.getpwnam("nobody")
+        except KeyError:
+            pytest.skip("root-run permission test requires an unprivileged account")
+
+    repo = _init_repo(tmp_path)
+    with tempfile.TemporaryDirectory(prefix="cortex-reclaim-", dir="/tmp") as raw_pool:
+        # TemporaryDirectory 是 0700；降權後的掃描身分必須能進入工作區，失敗才
+        # 會來自 index 權限而不是目錄存取（審查指出的假陽性）。
+        os.chmod(raw_pool, 0o755)
+        workspace = Path(raw_pool) / "job-workspace"
+        subprocess.run(["git", "clone", "-q", str(repo), str(workspace)], check=True)
+        marker = job_workspace.write_marker(
+            workspace,
+            branch="main",
+            base=_git(repo, "rev-parse", "main").strip(),
+            source_repo=repo,
+        )
+        precious = workspace / "uncommitted.txt"
+        precious.write_text("unsaved builder data\n", encoding="utf-8")
+        index = workspace / ".git" / "index"
+        real = _runner_for(repo)
+
+        def manager_with_builder_uid(args: list[str]):
+            if args[:2] == ["-C", str(workspace)]:
+                command = ["git", "-c", f"safe.directory={workspace}", *args]
+                options = {}
+                if other_user is not None:
+                    def drop_privileges() -> None:
+                        os.setgroups([])
+                        os.setgid(other_user.pw_gid)
+                        os.setuid(other_user.pw_uid)
+
+                    options["preexec_fn"] = drop_privileges
+                return subprocess.run(command, capture_output=True, text=True, **options)
+            return real(args)
+
+        # 對照：index 可讀時同一個掃描身分能列出工作區，證明下方的失敗只來自
+        # index 權限。
+        control = manager_with_builder_uid(["-C", str(workspace), "ls-files"])
+        assert control.returncode == 0, control.stderr
+        index.chmod(0)
+
+        result = worktree_reclaim.reclaim_worktree(
+            workspace,
+            git_runner=manager_with_builder_uid,
+            repo_root=repo,
+        )
+
+        assert result.status == worktree_reclaim.RECLAIM_FAILED
+        assert "worktree-dirty-scan-unavailable" in (result.detail or "")
+        assert marker.is_file()
+        assert precious.read_text(encoding="utf-8") == "unsaved builder data\n"
 
 
 def test_resolve_git_runner_falls_back_to_production_default(tmp_path: Path) -> None:
