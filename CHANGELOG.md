@@ -3127,6 +3127,7 @@
 ### Fixed
 
 - **#716 唯讀卡 sandbox 文件校正**：README 改為說明 Codex sandbox mode 依卡片契約導出；只有 `commit_policy=forbidden` 且 `declared_outputs` 為空的 build card 使用 `read-only`。
+- **#844 stage-evidence reuse 缺口補齊**：reused receipt 不再於驗證前預寫，改由 `apply_workflow_action(action="advance")` 在受 revision CAS 保護的 run 快照上重驗（provenance、candidate、claim-era、planning authority、test policy、builder job、gate ledger、operator 裁決）後，與 gate 同一次寫入並連結 `source_run_id`／`source_job_id`／`source_evidence_hash`、key／schema／相容性規則與 `adoption`；決策與採信之間的 drift 記 `ineligible`／`adoption-drift` 重新裁決，不落 needs_human。probe 另驗來源 job 的 receipt schema、逐欄快照與實際 identity，只抄 key 的 job 不再被重用；registry 讀到其他 key schema 的 job receipt 不再整份 fail closed；交錯的重複 resume 回 `duplicate-continuation`；authority restart 在 resume 結果列出 `stage_invalidation` 並把受影響卡的 receipt 標成 `authority-restart`。resume 結果與 `cortex work show` 新增 `stage_reuse` 呈現。新增 `docs/stage-evidence-reuse.md`（card 層 cohort、migration、未支援範圍與 S12 canary 步驟）與 `tests/test_workflow_stage_reuse_adoption_844.py`（S01–S11 缺口）。
 
 ## [0.1.8] - 2026-08-12
 
