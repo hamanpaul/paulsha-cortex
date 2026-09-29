@@ -1755,7 +1755,12 @@ def record_config_reload(
 
 
 def _inspect_runtime_state_fd(
-    directory_fd: int, *, service: str, instance: str, state_root: Path
+    directory_fd: int,
+    *,
+    service: str,
+    instance: str,
+    state_root: Path,
+    expected_pid: int | None = None,
 ) -> dict[str, object]:
     try:
         names = sorted(
@@ -1786,7 +1791,18 @@ def _inspect_runtime_state_fd(
     starts = [row for row in matches if row.get("event_type") == "startup" and row.get("event_seq") == 0]
     if not starts:
         return _unknown("receipt-chain-invalid")
-    process_start = max(starts, key=lambda row: str(row.get("process_started_at")))
+    # #841 AC4：牆鐘可能在兩次啟動之間往回跳（NTP step、VM 時間同步），單憑
+    # ``process_started_at`` 會把已結束程序的舊 receipt 當成最新。呼叫端已知 unit
+    # 目前的 MainPID 時，先在屬於該 PID 的 startup receipt 中挑最新者；沒有任何
+    # receipt 屬於它才退回牆鐘最新，交給 compare_runtime_state 標 process 不符。
+    live_starts = (
+        [row for row in starts if row.get("pid") == expected_pid]
+        if type(expected_pid) is int
+        else []
+    )
+    process_start = max(
+        live_starts or starts, key=lambda row: str(row.get("process_started_at"))
+    )
     previous_starts = [
         row for row in starts if row.get("process_id") != process_start.get("process_id")
     ]
@@ -1828,7 +1844,11 @@ def _inspect_runtime_state_fd(
 
 
 def inspect_runtime_state(
-    state_root: Path, *, service: str, instance: str
+    state_root: Path,
+    *,
+    service: str,
+    instance: str,
+    expected_pid: int | None = None,
 ) -> dict[str, object]:
     if service not in _SERVICES or _INSTANCE_RE.fullmatch(instance) is None:
         return _unknown("identity-invalid")
@@ -1846,6 +1866,7 @@ def inspect_runtime_state(
             service=service,
             instance=instance,
             state_root=state_root,
+            expected_pid=expected_pid,
         )
     finally:
         os.close(directory_fd)
@@ -2030,7 +2051,9 @@ def runtime_status_report(
     in_flight_jobs: int | None = None,
     current_artifact: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    state = inspect_runtime_state(state_root, service=service, instance=instance)
+    state = inspect_runtime_state(
+        state_root, service=service, instance=instance, expected_pid=expected_pid
+    )
     current = _safe_artifact(current_artifact or artifact_identity())
     comparison = compare_runtime_state(
         state,

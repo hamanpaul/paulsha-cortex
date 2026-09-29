@@ -180,6 +180,69 @@ def test_subsecond_restart_selects_the_new_process_without_rewriting_prior_recei
     assert prior.read_bytes() == prior_bytes
 
 
+def test_restart_across_backward_wall_clock_step_binds_receipt_to_live_unit_pid(
+    tmp_path: Path,
+) -> None:
+    """#841 AC4：牆鐘在兩次啟動之間往回跳（NTP step、WSL2 時間同步；已安裝程序測試
+    在本機實測到約 1.9 秒回跳），新程序的 ``process_started_at`` 會早於舊程序。status
+    已知 unit 目前的 MainPID 時，loaded 必須是那個程序的 receipt，不能只憑牆鐘挑到
+    已結束程序的舊 receipt、再把它的 artifact 報成 drift。"""
+
+    from paulsha_cortex.runtime_attestation import runtime_status_report
+
+    state_root = tmp_path / "runtime"
+    prior = record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=state_root,
+        configuration={"poll_interval": 30},
+        artifact=_artifact("1" * 64),
+        started_at="2026-09-26T00:00:05Z",
+        pid=201,
+    )
+    prior_bytes = prior.read_bytes()
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=state_root,
+        configuration={"poll_interval": 30},
+        artifact=_artifact("2" * 64),
+        started_at="2026-09-26T00:00:04Z",
+        pid=202,
+    )
+
+    report = runtime_status_report(
+        state_root,
+        service="manager",
+        instance="test",
+        declared_config_revision=configuration_revision({"poll_interval": 30}),
+        expected_pid=202,
+        require_process_match=True,
+        current_artifact=_artifact("2" * 64),
+    )
+
+    assert report["loaded"]["pid"] == 202
+    assert report["loaded"]["artifact"]["sha256"] == "2" * 64
+    assert report["status"] == "match"
+    assert report["comparison"]["process_status"] == "match"
+    assert report["previous_process_start"]["pid"] == 201
+    assert prior.read_bytes() == prior_bytes
+
+    # 沒有任何 receipt 屬於目前 MainPID：維持以牆鐘最新者比對，並標 process 不符。
+    unmatched = runtime_status_report(
+        state_root,
+        service="manager",
+        instance="test",
+        declared_config_revision=configuration_revision({"poll_interval": 30}),
+        expected_pid=203,
+        require_process_match=True,
+        current_artifact=_artifact("2" * 64),
+    )
+    assert unmatched["loaded"]["pid"] == 201
+    assert unmatched["status"] == "drift"
+    assert unmatched["comparison"]["process_status"] == "unknown"
+
+
 @pytest.mark.parametrize("bad_receipt", ["truncated", "unknown-schema"])
 def test_missing_corrupt_and_unknown_receipts_remain_unknown(
     tmp_path: Path, bad_receipt: str
