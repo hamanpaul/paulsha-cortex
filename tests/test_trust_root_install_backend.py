@@ -1430,6 +1430,42 @@ def test_repository_replacement_refuses_candidate_tracking_runtime_worktree_root
     assert (review / "README.md").read_text(encoding="utf-8") == "old\n"
 
 
+@pytest.mark.parametrize(
+    ("exclude", "ignored", "candidate"),
+    [
+        ("local.env", "local.env", "local.env"),
+        ("cache/", "cache/state.db", "cache/state.db"),
+        ("notes/", "notes/todo.txt", "notes"),
+    ],
+)
+def test_repository_replacement_refuses_to_overwrite_ignored_untracked_content(
+    tmp_path: Path, exclude: str, ignored: str, candidate: str
+) -> None:
+    """被 ignore 的未追蹤檔不在 status 裡；候選開始追蹤同一路徑時 checkout --force
+    會覆寫或刪除它，rollback 也無從還原，因此在 checkout 前拒絕（#1124 審查）。"""
+
+    upgrade = repository_runtime_fixtures.repository_upgrade(
+        tmp_path, candidate_files={candidate: "tracked by candidate\n"}
+    )
+    repository_runtime_fixtures.simulate_manager_runtime(upgrade)
+    exclude_file = upgrade.repository / ".git" / "info" / "exclude"
+    exclude_file.parent.mkdir(exist_ok=True)
+    exclude_file.write_text(exclude + "\n", encoding="utf-8")
+    local = upgrade.repository / ignored
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_text("operator local content\n", encoding="utf-8")
+    backend = LocalInstallBackend(require_root=False)
+    prior = dict(backend.inspect_step(upgrade.new_step))
+
+    with pytest.raises(InstallDriftError, match="ignored untracked"):
+        backend.replace_step_checkpointed(upgrade.new_step, prior, lambda _row: None)
+
+    assert repository_runtime_fixtures.git(
+        "-C", str(upgrade.repository), "rev-parse", "HEAD"
+    ) == upgrade.old_commit
+    assert local.read_text(encoding="utf-8") == "operator local content\n"
+
+
 def _drift_undeclared_config(key: str, value: str):
     def mutate(upgrade, _monkeypatch) -> None:
         repository_runtime_fixtures.git(

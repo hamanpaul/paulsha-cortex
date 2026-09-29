@@ -1296,6 +1296,65 @@ def _refuse_runtime_root_checkout(
         )
 
 
+def _refuse_ignored_content_overwrite(
+    prefix: Sequence[str], commit: str, *, uid: int, gid: int
+) -> None:
+    """Refuse a checkout that would overwrite or delete ignored untracked content.
+
+    Ignored files never show in ``status``, so the clean check cannot see them.
+    ``checkout --force`` treats them as expendable: a commit that starts
+    tracking the same path (or a parent/child of it) overwrites or removes them,
+    and rollback has no copy to restore (#1124 review).
+    """
+
+    ignored = _run(
+        (
+            *prefix,
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ),
+        env=_REPOSITORY_GIT_ENV,
+        uid=uid,
+        gid=gid,
+    )
+    if ignored.returncode != 0:
+        raise InstallDriftError("repository ignored content cannot be listed")
+    entries = [entry for entry in ignored.stdout.split("\0") if entry]
+    if not entries:
+        return
+    ignored_dirs = {entry.rstrip("/") for entry in entries if entry.endswith("/")}
+    ignored_files = {entry for entry in entries if not entry.endswith("/")}
+    listing = _run(
+        (*prefix, "ls-tree", "-r", "-z", "--name-only", "--full-tree", commit),
+        env=_REPOSITORY_GIT_ENV,
+        uid=uid,
+        gid=gid,
+    )
+    if listing.returncode != 0:
+        raise InstallDriftError(f"repository commit cannot be listed: {commit}")
+    tracked = [entry for entry in listing.stdout.split("\0") if entry]
+    tracked_paths = set(tracked)
+    for path in tracked:
+        parts = path.split("/")
+        prefixes = {"/".join(parts[:index]) for index in range(1, len(parts) + 1)}
+        if path in ignored_files or prefixes & ignored_dirs:
+            raise InstallDriftError(
+                f"repository commit would overwrite ignored untracked content: {path}"
+            )
+    for entry in (*ignored_files, *ignored_dirs):
+        parts = entry.split("/")
+        parents = {"/".join(parts[:index]) for index in range(1, len(parts))}
+        if parents & tracked_paths:
+            raise InstallDriftError(
+                "repository commit would overwrite ignored untracked content: "
+                f"{entry}"
+            )
+
+
 def _tree_owned_and_nonwritable(path: Path, uid: int, gid: int) -> bool:
     """Attest owner/group and the write boundary for every no-follow tree member."""
 
@@ -3985,6 +4044,7 @@ class LocalInstallBackend:
                 pass_fds=(source_descriptor,),
             )
             _refuse_runtime_root_checkout(prefix, commit, uid=uid, gid=gid)
+            _refuse_ignored_content_overwrite(prefix, commit, uid=uid, gid=gid)
             _run(
                 (*prefix, "checkout", "--detach", "--force", commit),
                 check=True,
@@ -4656,6 +4716,7 @@ class LocalInstallBackend:
                 # the Manager's branches, refs, and linked worktrees are not
                 # touched (#1124).
                 _refuse_runtime_root_checkout(prefix, commit, uid=uid, gid=gid)
+                _refuse_ignored_content_overwrite(prefix, commit, uid=uid, gid=gid)
                 _run(
                     (*prefix, "checkout", "--detach", "--force", commit),
                     check=True,
