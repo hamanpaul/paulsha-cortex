@@ -4000,7 +4000,7 @@ def _expected_worktree_isolation_prompt(
     )
 
 
-_DIAGNOSTIC_TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_DIAGNOSTIC_TOKEN = re.compile(r"[A-Za-z0-9_.:+-]{1,64}")
 
 
 def _diagnostic_token(value: object) -> str:
@@ -4838,6 +4838,23 @@ def _dispatch_timeout_diagnostic(
                 f"last_tick_at={_diagnostic_token(daemon.get('last_tick_at'))}",
                 "in_flight="
                 + (str(len(in_flight)) if isinstance(in_flight, list) else "unknown"),
+            )
+        )
+        # daemon 最近一輪 periodic tick 中，resume 沒派 job 也沒轉 needs_human 的原因。
+        waits = payload.get("workflow_waits")
+        matched = [
+            row
+            for row in (waits if isinstance(waits, list) else [])
+            if isinstance(row, Mapping) and row.get("work_id") == work_id
+        ]
+        parts.append(
+            "workflow_wait="
+            + (
+                ",".join(
+                    f"{_diagnostic_token(row.get('phase'))}:{_diagnostic_token(row.get('reason'))}"
+                    for row in matched
+                )
+                or ("none" if isinstance(waits, list) else "unreported")
             )
         )
     except (QualificationFailure, OSError, TypeError, ValueError, subprocess.SubprocessError):

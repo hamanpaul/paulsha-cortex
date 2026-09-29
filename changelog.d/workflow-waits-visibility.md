@@ -1,0 +1,1 @@
+- periodic tick 中 `resume_workflow_run` 沒派出 job、也沒轉 needs_human 的決策（例如 `provider-rate-limited`、`not-dispatchable`、executor backoff）過去被丟棄，run 會無聲地一直等；改為收進 tick summary 與 status.json 的 `workflow_waits`（run、phase、原因、retry_after），`cortex inspect status` 文字與 JSON 模式都列出。deployment canary 逾時診斷帶出本 run 的等待原因，診斷 token 接受時區的 `+`（#716）。
