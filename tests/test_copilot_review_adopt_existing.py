@@ -845,6 +845,43 @@ def test_persisted_copilot_stop_on_exact_head_review_run_suggests_admitted_revie
     assert attested["result"]["head"] == HEAD
 
 
+def test_recovery_projection_offers_review_attest_only_when_authority_admits_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1184：claim／resume 投影有 authority 時，review-attest 以完整前置判定。"""
+    from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
+
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        gate_refs=(GateEvidenceRef("foreign-review", str(tmp_path / "foreign.json"), "f" * 64),),
+        facets=("needs_human",),
+        needs_human_reason=diagnostic_reason(
+            "copilot-review-timeout", "fixture", source="test", run_id=run_id
+        ),
+    )
+    run = registry.get_workflow_run(run_id)
+
+    assert "review-attest" in work_actions._phase_recovery_actions(run, registry, authority)
+    # 兩個 OpenSpec mapping：review-attest 的正式入口必拒，投影不得再宣告。
+    # WorkAuthority 只能由 snapshot 載入；predicate 只讀 mapped_prs／mapped_openspec。
+    ambiguous = SimpleNamespace(
+        repo=authority.repo,
+        mapped_prs=authority.mapped_prs,
+        mapped_openspec=("change-a", "change-b"),
+    )
+    assert "review-attest" not in work_actions._phase_recovery_actions(
+        run, registry, ambiguous
+    )
+
+
 def test_copilot_request_outcome_unknown_actions_pass_formal_admission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

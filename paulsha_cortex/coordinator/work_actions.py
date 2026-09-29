@@ -3786,7 +3786,7 @@ def _claim_action(
     if canonical_run is not None:
         try:
             active_recovery_actions = _phase_recovery_actions(
-                canonical_run, workflow_registry
+                canonical_run, workflow_registry, authority
             )
         except Exception:  # noqa: BLE001 - claim read projection remains fail-soft
             active_recovery_actions = ()
@@ -4902,7 +4902,7 @@ def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
     )
 
 
-def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
+def _phase_recovery_actions(run, workflow_registry, authority=None) -> tuple[str, ...]:
     """計算 needs_human run 中與 job／owner-slice admission 一致的 recovery 動作。
 
     #546 將此結果帶入 `ClaimCandidate`，並供 claim、status、Monitor work list 共用；
@@ -4913,6 +4913,10 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
     刻意**只宣告會被受理的動作**：每一項都用與該動作自身完全相同的前置驗
     （同一份 job/step 判準）判定，拿不準就不宣告。宣告一個保證失敗的動作比不
     宣告更糟——這是 #382 已經付過學費的教訓。
+
+    ``authority``（#1184）：呼叫端手上有 WorkAuthority 時傳入，`review-attest`
+    便以與該動作完全相同的 run＋authority 前置判定；Monitor／Manager 的讀取投影
+    沒有 authority，只能用 run 層那一半。
     """
 
     reason_code = (
@@ -5025,7 +5029,11 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
     if (
         reason_code.startswith("copilot-")
         and "review-attest" not in actions
-        and _review_attest_run_admissible(run)
+        and (
+            _review_attest_admission_allowed(run, authority)
+            if authority is not None
+            else _review_attest_run_admissible(run)
+        )
     ):
         actions.append("review-attest")
     if reason_code in {"review-disposition-required", "review-threads-unresolved"}:
@@ -7847,7 +7855,7 @@ def _refreeze_base_action(
         "evidence": record,
         "run": updated.to_dict(),
     }
-    next_actions = _phase_recovery_actions(updated, workflow_registry)
+    next_actions = _phase_recovery_actions(updated, workflow_registry, authority)
     if next_actions:
         payload["next_actions"] = list(next_actions)
     return payload
