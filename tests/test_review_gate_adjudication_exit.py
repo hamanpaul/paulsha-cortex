@@ -451,7 +451,11 @@ def test_blocking_findings_hint_reaches_status_and_resume(tmp_path: Path) -> Non
     expected_hint = hint_func(work_id=WORK_ID, repo=REPO, candidate=HEAD)
 
     entry = manager.workflow_status_entry(registry, run)
-    assert {"abandon", "retry-review", "retry-build"} <= set(entry["next_actions"])
+    # #1170：本 fixture 的 run 帶 mapped PR 的 pr_refs（PR 已開、未 merge），已越過
+    # abandon 的 pre-delivery 閘門；投影只給可受理的 retry lane，不再給 abandon。
+    assert run.pr_refs
+    assert {"retry-review", "retry-build"} <= set(entry["next_actions"])
+    assert "abandon" not in entry["next_actions"]
     assert entry["next_step_hint"] == expected_hint
 
     result = work_actions.execute_work_action(
@@ -465,7 +469,8 @@ def test_blocking_findings_hint_reaches_status_and_resume(tmp_path: Path) -> Non
         ),
     )["result"]
     assert result["action"] == "needs_human"
-    assert {"abandon", "retry-review", "retry-build"} <= set(result["next_actions"])
+    assert {"retry-review", "retry-build"} <= set(result["next_actions"])
+    assert "abandon" not in result["next_actions"]
     assert result["next_step_hint"] == expected_hint
 
 

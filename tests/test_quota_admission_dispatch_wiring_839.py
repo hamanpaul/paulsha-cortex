@@ -725,13 +725,24 @@ def test_two_manager_dispatches_racing_for_one_unit_launch_exactly_one_job(
         results = list(pool.map(dispatch, contexts))
 
     final_registry = JobRegistry(state_path=state_path)
-    assert len(final_registry.list_jobs()) == 1
-    assert sum(isinstance(result, dict) and "job_id" in result for result in results) == 1
+    jobs = final_registry.list_jobs()
+    # 安全不變量：最多一個 launch，且每個 launch 都有 job 紀錄。
+    assert len(jobs) <= 1
+    assert len(launched) == len(jobs)
     assert sum(isinstance(result, RegistryRevisionConflict) for result in results) <= 1
-    assert launched == ["codex"]
-    bound = contexts[0].authority.list_by_state("bound", now_ms=now_ms)
-    assert len(bound) == 1
-    assert bound[0].job_id == final_registry.list_jobs()[0]["job_id"]
+    if jobs:
+        assert sum(isinstance(result, dict) and "job_id" in result for result in results) == 1
+        assert launched == ["codex"]
+        bound = contexts[0].authority.list_by_state("bound", now_ms=now_ms)
+        assert len(bound) == 1
+        assert bound[0].job_id == jobs[0]["job_id"]
+    else:
+        # 真實競態下 grant 方可能在 launch 前輸掉 registry CAS，而另一方當下因
+        # 額度被佔拿到 quota wait：當輪零派工（由下一輪自動續派接手），但不得
+        # 殘留 reservation，也不得有任何 launch（CI 偶發，#1187）。
+        assert any(isinstance(result, RegistryRevisionConflict) for result in results)
+        assert contexts[0].authority.list_by_state("reserved", now_ms=now_ms + 1) == ()
+        assert contexts[0].authority.list_by_state("bound", now_ms=now_ms + 1) == ()
 
 
 def test_manager_restart_reuses_live_bound_job_without_new_reservation_or_spawn(

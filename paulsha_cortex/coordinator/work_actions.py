@@ -90,7 +90,7 @@ from .work_bridge import (
     workflow_status,
 )
 from .workflow import GateEvidenceRef, brainstorm_authority_bound
-from .registry import ACTIVE_JOB_STATUSES
+from .registry import ACTIVE_JOB_STATUSES, workflow_run_pre_delivery
 
 
 logger = logging.getLogger(__name__)
@@ -3738,6 +3738,12 @@ def _claim_action(
             planning_failure_hint["reason"] if planning_failure_hint else None
         ),
         active_recovery_actions=active_recovery_actions,
+        # #1170：abandon 的 pre-delivery 閘門與投影共用同一判準。
+        active_pre_delivery=(
+            workflow_run_pre_delivery(canonical_run)
+            if canonical_run is not None
+            else True
+        ),
     )
     if (
         canonical_run is not None
@@ -6463,11 +6469,16 @@ def _abandon_action(
         evidence_ref=str(target),
     )
     record = _abandon_record(body, state_path=state_path)
-    # #275：先 durable 寫 canonical outcome，再改 run status（見
-    # docs/superpowers/specs/engineering-outcome-contract-design.md）。
     outcome_store = engineering_outcome.OutcomeStore(
         engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
     )
+    updated = workflow_registry._manager_abandon_workflow_run(
+        run.run_id,
+        evidence_ref=record["ref"],
+    )
+    # Registry CAS 是終局裁決；只有 commit 成功後才發布 engineering outcome。
+    # 若程序在兩者之間 crash，superseded 重入分支會以相同 evidence digest
+    # 冪等補發這筆 outcome。
     engineering_outcome.emit_outcome(
         outcome_store,
         run=run,
@@ -6476,10 +6487,6 @@ def _abandon_action(
         outcome="abandoned",
         attempt_digest=record["hash"],
         reason_code=reason,
-    )
-    updated = workflow_registry._manager_abandon_workflow_run(
-        run.run_id,
-        evidence_ref=record["ref"],
     )
     # #416：run 終態化為 superseded 之後，盡力回收已發佈未提交的 planning
     # artifacts——放在狀態轉換之後，確保只有 abandon 真的成立時才動檔案；
@@ -6966,6 +6973,12 @@ def _retire_delivered_action(
     outcome_store = engineering_outcome.OutcomeStore(
         engineering_outcome.outcome_store_path(state_path, repo=repo)
     )
+    updated = workflow_registry._manager_retire_delivered_workflow_run(
+        run.run_id,
+        evidence_ref=record["ref"],
+    )
+    # 與 abandon 同序：registry CAS 成功後發布；若中間 crash，superseded
+    # replay 從 immutable evidence 重建相同 digest 並冪等補發。
     engineering_outcome.emit_outcome(
         outcome_store,
         run=run,
@@ -6974,10 +6987,6 @@ def _retire_delivered_action(
         outcome="abandoned",
         attempt_digest=record["hash"],
         reason_code=reason,
-    )
-    updated = workflow_registry._manager_retire_delivered_workflow_run(
-        run.run_id,
-        evidence_ref=record["ref"],
     )
     _gc_abandoned_planning_artifacts(updated)
     result = {

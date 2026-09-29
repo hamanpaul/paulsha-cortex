@@ -41,6 +41,11 @@ class RecoveryRegistry:
     def get_job(self, job_id: str) -> dict:
         return copy.deepcopy(self.jobs[job_id])
 
+    def list_jobs(self) -> list[dict]:
+        # #1168：admission 會列舉同 owner／attempt 的 job 檢查是否仍在執行，
+        # 替身須提供與 JobRegistry 相同的列舉 API。
+        return [{"job_id": job_id, **copy.deepcopy(job)} for job_id, job in self.jobs.items()]
+
     def record_action(self, slice_id: str, **kwargs) -> None:
         self.actions.append((slice_id, copy.deepcopy(kwargs)))
         for row in self.slices:
@@ -204,6 +209,26 @@ def test_work_recovery_requires_explicit_owner_lookup_api(tmp_path: Path, monkey
     )
 
     with pytest.raises(RuntimeError, match="owner lookup API unavailable"):
+        _recover_work(registry, state_path=tmp_path / "jobs.json")
+
+    assert registry.actions == []
+    assert reclaimed == []
+
+
+def test_work_recovery_requires_job_lookup_api(tmp_path: Path, monkeypatch) -> None:
+    """#1168：無法列舉同 owner／attempt 的 job 時不得假設沒有 active writer。"""
+    owner = _owner("hamanpaul/project-a", "work-42", "slice-a")
+    row = _slice("slice-a", spec_path="specs/a.md", owner=owner)
+    registry = RecoveryRegistry([row], {"job-slice-a": _job(row, tmp_path / "workspace")})
+    registry.list_jobs = None
+    reclaimed: list[dict] = []
+    monkeypatch.setattr(
+        work_actions.worktree_reclaim,
+        "reclaim_recorded_or_derived",
+        lambda **kwargs: reclaimed.append(kwargs) or None,
+    )
+
+    with pytest.raises(RuntimeError, match="job lookup API unavailable"):
         _recover_work(registry, state_path=tmp_path / "jobs.json")
 
     assert registry.actions == []

@@ -100,6 +100,8 @@ def _ok_status(
         # 與 `attention` 並列但分開——`attention` 只留可行動的項目，這份是「已知
         # 不可行動、但不得變成盲區」的紀錄。
         "not_claimable": list(payload.get("not_claimable", [])),
+        # #716：resume 沒派 job 也沒轉 needs_human 的 workflow（無聲等待的原因）。
+        "workflow_waits": list(payload.get("workflow_waits", [])),
         "in_flight": list(payload.get("in_flight", [])),
         "recent_done": list(payload.get("recent_done", [])),
         "degraded": False,

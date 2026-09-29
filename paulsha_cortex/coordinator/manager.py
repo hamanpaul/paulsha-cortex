@@ -333,6 +333,7 @@ def _pre_candidate_recovery_admission(
     registry, row: dict, *, expected_owner: dict | None = None
 ) -> tuple[dict[str, str], dict | None]:
     """讀取 recover-pre-candidate 的實際 owner/job 前置條件，不執行回收。"""
+    from .registry import ACTIVE_JOB_STATUSES
     owner_identity = _owner_identity_matches(row, expected=expected_owner)
     candidate = row.get("candidate")
     if isinstance(candidate, str) and verification.SAFE_SHA_RE.fullmatch(candidate) is not None:
@@ -353,6 +354,20 @@ def _pre_candidate_recovery_admission(
         or builder_job.get("attempt_id") != row.get("attempt_id")
     ):
         raise RuntimeError("recover-pre-candidate builder job identity mismatch")
+    list_jobs = getattr(registry, "list_jobs", None)
+    if not callable(list_jobs):
+        raise RuntimeError("recover-pre-candidate job lookup API unavailable")
+    try:
+        attempt_jobs = list(list_jobs())
+    except Exception as exc:
+        raise RuntimeError("recover-pre-candidate job lookup failed") from exc
+    if any(
+        job.get("owner_identity") == owner_identity
+        and job.get("attempt_id") == row.get("attempt_id")
+        and job.get("status") in ACTIVE_JOB_STATUSES
+        for job in attempt_jobs
+    ):
+        raise RuntimeError("recover-pre-candidate refuses active builder attempt")
     worktree = builder_job.get("worktree")
     if isinstance(worktree, str) and worktree and Path(worktree).exists():
         marker = job_workspace.read_marker(worktree)
@@ -684,18 +699,38 @@ def _validate_result_evidence(
         candidate=normalized["candidate"],
         coordinator_root=coordinator_root,
     )
-    if evidence.get("path") != str(expected_path):
+    evidence_path = (
+        Path(evidence.get("path"))
+        if isinstance(evidence.get("path"), str)
+        else None
+    )
+    content_addressed_prefix = f"{expected_path.stem}-"
+    valid_content_addressed_path = (
+        evidence_path is not None
+        and evidence_path.parent == expected_path.parent
+        and evidence_path.name.startswith(content_addressed_prefix)
+        and re.fullmatch(
+            r"[0-9a-f]{64}\.json",
+            evidence_path.name[len(content_addressed_prefix):],
+        ) is not None
+    )
+    if evidence.get("path") != str(expected_path) and not valid_content_addressed_path:
         raise ValueError("verification evidence path mismatch")
+    stored_path = evidence_path if valid_content_addressed_path else expected_path
     expected_hash = verification.canonical_json_hash(normalized)
     if evidence.get("hash") != expected_hash:
         raise ValueError("verification evidence hash mismatch")
-    stored_payload = _read_manifest_payload(expected_path)
+    if valid_content_addressed_path and evidence_path.name != (
+        f"{expected_path.stem}-{expected_hash}.json"
+    ):
+        raise ValueError("verification evidence content-addressed path mismatch")
+    stored_payload = _read_manifest_payload(stored_path)
     if stored_payload is None:
         raise ValueError("verification evidence file unreadable")
     stored_normalized = verification.validate_verification_evidence(stored_payload)
     if stored_normalized != normalized:
         raise ValueError("verification evidence payload mismatch")
-    return {"path": str(expected_path), "hash": expected_hash, "payload": normalized}
+    return {"path": str(stored_path), "hash": expected_hash, "payload": normalized}
 
 
 def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
@@ -882,6 +917,13 @@ def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
         and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
     )
     state = slice_row.get("state")
+    recover_pre_candidate_admitted = False
+    if state in {"needs_human", "failed", "pending"}:
+        try:
+            _pre_candidate_recovery_admission(registry, slice_row)
+            recover_pre_candidate_admitted = True
+        except Exception:
+            pass
     if state == "failed":
         # retry-build 底層即 registry.repin_slice()。只有在 repin_slice()
         # 真的會接受目前 (state, gate_state) 組合時才宣告 retry-build——
@@ -889,7 +931,8 @@ def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
         # （registry.REPINNABLE_SLICE_STATES / GATE_STATE_TRANSITIONS），
         # 讓「宣告的動作」與「mutation 端實際接受的動作」保持一致，不再宣告
         # 一個保證失敗的 retry-build（#382）。
-        actions = ["recover-pre-candidate", "abandon"] if not valid_candidate else ["abandon"]
+        actions = (["recover-pre-candidate"] if recover_pre_candidate_admitted else [])
+        actions.append("abandon")
         if slice_repin_eligible(slice_row):
             actions = ["retry-build"] + actions
         if not _slice_has_in_flight_job(registry, slice_row):
@@ -898,7 +941,8 @@ def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
     if state != "needs_human":
         return []
     if not valid_candidate:
-        actions = ["recover-pre-candidate", "abandon"]
+        actions = (["recover-pre-candidate"] if recover_pre_candidate_admitted else [])
+        actions.append("abandon")
         if not _slice_has_in_flight_job(registry, slice_row):
             actions.append("supersede")
         return actions
@@ -1571,9 +1615,11 @@ def workflow_status_entry(
     # phase 的 needs_human run（現場：`planning-authority-reconciliation-failed`）
     # 因此永遠拿到 `[]`，CLI 面無路可走。基礎集合改由
     # `claim.needs_human_next_actions` 導出——與 `claim._resume_decision` 是**同一
-    # 個函式**，且它永遠至少含 `abandon`，這就是「不得再出現 next_actions: []」
-    # 的機械保證。`_phase_recovery_actions` 退回它原本的職責：**補**那些要看 job
-    # 層事實才判定得出來的動作（regenerate-gates／retry-card）。
+    # 個函式**，pre-delivery run 永遠至少含 `abandon`，越過 pre-delivery 閘門的
+    # run 至少含 `retire-delivered`／retry lane／`resume`（#1170），這就是「不得
+    # 再出現 next_actions: []」的機械保證。`_phase_recovery_actions` 退回它原本的
+    # 職責：**補**那些要看 job 層事實才判定得出來的動作（regenerate-gates／
+    # retry-card）。
     hint_classification: str | None = None
     try:
         from .work_actions import _planning_failure_hint
@@ -1583,10 +1629,17 @@ def workflow_status_entry(
             hint_classification = hint.get("classification")
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         hint_classification = None
-    # 保底集合不依賴任何 registry／檔案讀取，因此上面的 except 分支也不會讓它變空。
+    # #1170：abandon 的 pre-delivery 閘門（`registry.workflow_run_pre_delivery`，
+    # 與 `_manager_validate_workflow_abandon` 同一判準）。越過閘門的 run 不論
+    # job 層投影成敗都不得再拿到必被拒的 abandon。
+    from .registry import workflow_run_pre_delivery
+
+    pre_delivery = workflow_run_pre_delivery(run)
+    # 保底集合不依賴任何 registry／檔案讀取，因此下面的 except 分支也不會讓它變空。
     next_actions: tuple[str, ...] = needs_human_next_actions(
         phase=getattr(run, "current_phase", None),
         planning_failure_classification=hint_classification,
+        pre_delivery=pre_delivery,
     )
     persisted_next_step_hint = None
     if isinstance(reason_payload, dict):
@@ -1599,6 +1652,7 @@ def workflow_status_entry(
         work_id=getattr(run, "work_id", None),
         repo=getattr(run, "repo", None),
         run_id=getattr(run, "run_id", None),
+        pre_delivery=pre_delivery,
     )
     try:
         from .work_actions import (
@@ -1612,10 +1666,13 @@ def workflow_status_entry(
             phase=getattr(run, "current_phase", None),
             planning_failure_classification=hint_classification,
             job_recovery_actions=recovery_actions,
+            pre_delivery=pre_delivery,
         )
-        if persisted_next_step_hint is None and "retire-delivered" in next_actions:
-            # #1141：已交付的 run（journal 證明交付 PR 已 merge）不得再指向必被拒的
-            # abandon；hint 與 next_actions 同源導出。
+        if persisted_next_step_hint is None and (
+            "retire-delivered" in next_actions or not pre_delivery
+        ):
+            # #1141／#1170：已交付或已越過 pre-delivery 閘門的 run 不得再指向
+            # 必被拒的 abandon；hint 與 next_actions 同源導出。
             next_step_hint = needs_human_next_step_hint(
                 phase=getattr(run, "current_phase", None),
                 planning_failure_classification=hint_classification,
@@ -1623,6 +1680,7 @@ def workflow_status_entry(
                 repo=getattr(run, "repo", None),
                 run_id=getattr(run, "run_id", None),
                 job_recovery_actions=recovery_actions,
+                pre_delivery=pre_delivery,
             )
         if (
             persisted_next_step_hint is None
@@ -1683,6 +1741,7 @@ def workflow_status_entry(
                 repo=getattr(run, "repo", None),
                 run_id=getattr(run, "run_id", None),
                 job_recovery_actions=filtered_next_actions,
+                pre_delivery=pre_delivery,
             )
             if not filtered_next_actions:
                 next_step_hint = "目前沒有符合正式入口前置條件的 recovery action。"

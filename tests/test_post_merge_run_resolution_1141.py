@@ -586,9 +586,12 @@ def test_delivered_run_resume_failure_points_to_retire_delivered(
     assert lane.run_id in entry["next_step_hint"]
 
 
-def test_undelivered_run_resume_failure_keeps_abandon(
+def test_undelivered_run_resume_failure_offers_resume_instead_of_abandon(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """#1170：PR 已開、未證實 merge 的 run 不是 retire-delivered 的對象，但也越過了
+    abandon 的 pre-delivery 閘門；投影改給註冊的 `resume`，不再給必被拒的 abandon。"""
+
     lane = _ship_lane(tmp_path, monkeypatch, copilot_reviewed=False)
     _open_pr_snapshot(lane.snapshot)
     assert lane.ship(now=2000.0)["action"] == "awaiting-copilot"
@@ -596,9 +599,14 @@ def test_undelivered_run_resume_failure_keeps_abandon(
     run = lane.registry.get_workflow_run(lane.run_id)
 
     assert "retire-delivered" not in work_actions._phase_recovery_actions(run, lane.registry)
+    with pytest.raises(ValueError, match="pre-delivery"):
+        lane.registry._manager_validate_workflow_abandon(
+            run.run_id, evidence_ref=str(tmp_path / "abandon-probe.json")
+        )
     entry = manager.workflow_status_entry(lane.registry, run)
-    assert "retire-delivered" not in entry["next_actions"]
-    assert "abandon" in entry["next_actions"]
+    assert entry["next_actions"] == ["resume"]
+    assert "cortex work abandon" not in entry["next_step_hint"]
+    assert f"cortex work resume {WORK_ID} --repo {REPO}" in entry["next_step_hint"]
 
 
 def test_needs_human_base_actions_switch_to_retire_delivered_for_delivered_runs() -> None:

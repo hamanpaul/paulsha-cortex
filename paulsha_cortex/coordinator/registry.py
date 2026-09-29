@@ -178,6 +178,25 @@ def slice_repin_eligible(slice_row: dict[str, Any]) -> bool:
     return "pending" in GATE_STATE_TRANSITIONS.get(gate_state, frozenset())
 
 
+def workflow_run_pre_delivery(run: Any) -> bool:
+    """`abandon` 的 pre-delivery 閘門：run 尚未進 ship、沒有 PR refs、沒有 ship
+    step 通過、也沒有 completion record。
+
+    `_manager_validate_workflow_abandon` 與 needs_human 的 `next_actions` 投影
+    共用這個判準（#1170）：越過這道閘門的 run，abandon 必被拒，投影不得再提供。
+    """
+
+    return not (
+        getattr(run, "current_phase", None) == "ship"
+        or tuple(getattr(run, "pr_refs", ()) or ())
+        or any(
+            step.phase == "ship" and step.gate_result == "passed"
+            for step in tuple(getattr(run, "steps", ()) or ())
+        )
+        or getattr(run, "completion_record_path", None) is not None
+    )
+
+
 # StageExecutionKey 涵蓋的內容定址欄位（#214／#844）：repo/work_id/run_id/
 # claim_key/card/phase/executor/model/base_sha/candidate_sha/
 # frozen_input_hashes/action/test_policy/execution_profile_key 任一改變都必須
@@ -6679,15 +6698,7 @@ class JobRegistry:
             for job in self._jobs
         ):
             raise ValueError("workflow abandon refuses active workflow job")
-        if (
-            current.current_phase == "ship"
-            or current.pr_refs
-            or any(
-                step.phase == "ship" and step.gate_result == "passed"
-                for step in current.steps
-            )
-            or current.completion_record_path is not None
-        ):
+        if not workflow_run_pre_delivery(current):
             raise ValueError("workflow abandon only permits pre-delivery run")
         return self._copy_workflow_run(current)
 

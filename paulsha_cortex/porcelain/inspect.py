@@ -222,6 +222,17 @@ def _print_status(status: dict[str, Any]) -> None:
         hint = entry.get("next_step_hint")
         if hint:
             sys.stdout.write(f"    next: {hint}\n")
+    # #716：resume 沒派 job、也沒轉 needs_human 的 workflow 會無聲等待；列出原因。
+    for entry in status.get("workflow_waits", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        retry_after = entry.get("retry_after_epoch")
+        sys.stdout.write(
+            f"  workflow_wait[{entry.get('repo', '-')}/{entry.get('work_id', '-')}]: "
+            f"{entry.get('phase')}: {entry.get('reason')}"
+            + (f" (retry_after_epoch={retry_after})" if retry_after is not None else "")
+            + "\n"
+        )
     sys.stdout.write(
         "in_flight: " + json.dumps(status.get("in_flight", []), ensure_ascii=False, sort_keys=True) + "\n"
     )
