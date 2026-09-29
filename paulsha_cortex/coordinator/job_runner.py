@@ -3124,6 +3124,7 @@ def prepare_systemd_template(
     role: str = JOB_ROLE_BUILDER,
     workspace_read_only: bool = False,
     unit_active: Callable[[str, str], bool] | None = None,
+    instance: str | None = None,
 ) -> SystemdTemplatePlan:
     """模板派工的前置：解析 config、決定加固剖面、靜態 preflight、算 instance／unit／
     spec 路徑，並確認**同名 instance 沒有正在跑**。
@@ -3151,9 +3152,21 @@ def prepare_systemd_template(
     也一樣 fail-closed（那正是 #643 要擋的「忘了說是哪個 executor」）。
 
     **在任何副作用之前呼叫**：這裡每一個 raise 都代表本次派工不該發生。
+
+    **`instance`（#1167）**：對一個**已存在**的 pool 工作區再起一個 unit（owner-bound
+    reclaim）時，工作區目錄名本身就是當初那顆 job 的 `%i`。此時由呼叫端逐字給定
+    instance，不再由 `job_id` 推導——對一個已經是 segment 的名字再 `job_segment()` 一次
+    會多一段 hash，`ReadWritePaths=<pool>/%i` 就指到一個不存在的目錄（#645 的同型事故）。
     """
 
     role_config = resolve_job_role(role)
+    if instance is not None and not instance_name_valid(instance):
+        raise _fail(
+            "job-runner-instance-name-invalid",
+            f"模板實例名不合法（只允許 [A-Za-z0-9_.-]，首字元須為英數）: {instance!r}",
+            source="prepare_systemd_template",
+            requested=instance,
+        )
     account = resolve_job_account(env, role=role)
     group = resolve_job_group(env, role=role)
     base_template = resolve_template_unit(env, role=role)
@@ -3172,7 +3185,8 @@ def prepare_systemd_template(
         shim=shim,
         spool_dir=spool_dir,
     )
-    instance = template_instance_id(job_id)
+    if instance is None:
+        instance = template_instance_id(job_id)
     unit = template_unit_name(instance, template=template)
     is_active = unit_active or _unit_is_active
     if is_active(binary, unit):

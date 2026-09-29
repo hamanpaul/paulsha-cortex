@@ -91,6 +91,7 @@ REQUIRED_RELEASE_TESTS = {
     "registry-equation",
     "generated-installed-attestation",
     "service-identity-hardening",
+    "owner-bound-reclaim",
     "capability-attack-matrix",
     "durable-state-attack-matrix",
     "enforcement-plane-attack-matrix",
@@ -104,7 +105,7 @@ CANARY_ONLY_TESTS = {
     "manager-github-dry-run-push",
 }
 REQUIRED_CANARY_ARTIFACTS = REQUIRED_RELEASE_ARTIFACTS | CANARY_ONLY_ARTIFACTS
-REQUIRED_CANARY_TESTS = REQUIRED_RELEASE_TESTS | CANARY_ONLY_TESTS
+REQUIRED_CANARY_TESTS = (REQUIRED_RELEASE_TESTS - {"owner-bound-reclaim"}) | CANARY_ONLY_TESTS
 #: legacy-adoption（#1122）：Phase 2b 形狀的舊主機接手、rollback 證明與再接手。
 INSTALLED_CHECK_TESTS = {
     "selfcheck",

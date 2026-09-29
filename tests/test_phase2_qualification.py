@@ -176,6 +176,46 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
 
 
+def test_release_installed_checks_require_owner_bound_reclaim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver_module()
+    install = tmp_path / "install.json"
+    install.write_text(
+        json.dumps({"result": "pass", "attestation": {"ok": True}, "artifact_hashes": {}, "service_identities": {}}),
+        encoding="utf-8",
+    )
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    seen: list[Path] = []
+    monkeypatch.setattr(
+        driver,
+        "_installed_owner_bound_reclaim",
+        lambda receipt, path: seen.append((receipt["receipt_id"], path)),
+    )
+
+    def fake_run(argv, **_kwargs):
+        name = "selfcheck" if "selfcheck" in argv else "equation"
+        payload = {"ok": True, "job_writable_count": 0} if name == "selfcheck" else {"ok": True}
+        return driver.CommandResult(tuple(argv), 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    checks = driver._installed_checks(
+        install_evidence=install,
+        receipt={"receipt_id": "rc-test"},
+        evidence_dir=evidence,
+        profile="release",
+        # system-scope status 另由 test_qualification_driver_service_status 覆蓋。
+        require_system_status=False,
+    )
+    assert {row["name"] for row in checks} >= {
+        "owner-bound-reclaim",
+        "registry-equation",
+        "generated-installed-attestation",
+    }
+    assert seen == [("rc-test", evidence)]
+
+
 def _valid_full_qualification(tmp_path: Path) -> dict:
     payload = _valid_qualification()
     payload["services"] = [
@@ -416,6 +456,7 @@ def _valid_release_qualification(tmp_path: Path) -> dict:
     payload["tests"] = [
         row for row in payload["tests"] if row["name"] not in canary_tests
     ]
+    payload["tests"].append({"name": "owner-bound-reclaim", "status": "passed"})
 
     evidence = tmp_path / "evidence"
     for name in (
@@ -1253,6 +1294,7 @@ def test_release_driver_never_calls_live_provider_or_repository_functions(
             {"name": "registry-equation", "status": "passed"},
             {"name": "generated-installed-attestation", "status": "passed"},
             {"name": "service-identity-hardening", "status": "passed"},
+            {"name": "owner-bound-reclaim", "status": "passed"},
         ],
     )
     monkeypatch.setattr(driver, "_permission_attack_matrix", lambda *_args: None)

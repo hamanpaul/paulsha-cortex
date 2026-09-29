@@ -120,16 +120,35 @@
     {
       "id": "G843-R08-live-reclaim",
       "owner": "issue-1167",
-      "status": "blocked",
+      "status": "closed",
       "source": "docs/recovery-action-contract-matrix.md#R08 RC boundary",
-      "retest": "Blocked on a producer fix: under the three-UID deployment the Manager has no ACL entry on builder-created inodes (trust_root registry JOB_WORKSPACE_REACH builder note), so owner-bound reclaim of a used builder workspace can only fail closed or leave it behind, and reclaim_worktree continues to rmtree when the dirty scan is unavailable. After a root-owned or job-identity reclaim helper lands and dirty-scan failure fails closed, add a release-profile owner-bound-reclaim installed check in a driver-created isolated coordinator root: owned and foreign pool slots with plan ACLs, builder commit plus untracked subdirectory, recover-pre-candidate and abandon via execute_work_action as cortex-manager; verify the foreign slot is unchanged (bytes, owner, ACL), the owned slot is removed with a preserve archive, the result is unique after a fresh registry reload, and exact replay deletes nothing."
+      "retest": "The Manager starts the root-owned builder template with the pool slot name as instance; the job spec it writes is the helper's single-use approval (Manager-owned, builder read-only, bound to workspace, pool, preserve area, marker digest and a nonce) and is deleted when the unit finishes. The helper refuses without that approval, accepts only a digest-matching direct child of the configured pool, performs a fail-closed dirty scan, preserves dirty entries and a bundle of commits beyond marker.base, then clears the workspace; the Manager moves the archive into its evidence tree and removes the empty slot. The RC release owner-bound-reclaim installed check runs every Manager step as the installed Manager and asserts a refused builder direct invocation, a consumed approval, foreign-slot preservation, owned-slot removal, Manager-only preserved content and idempotent replay.",
+      "verified_by": [
+        "tests/test_owner_reclaim_1167.py::test_owner_reclaim_scans_preserves_then_clears_only_marker_bound_workspace",
+        "tests/test_owner_reclaim_1167.py::test_owner_reclaim_refuses_foreign_marker_without_mutating_workspace",
+        "tests/test_owner_reclaim_1167.py::test_owner_reclaim_dirty_scan_failure_preserves_workspace",
+        "tests/test_owner_reclaim_1167.py::test_reclaim_routes_owner_bound_workspace_through_builder_helper",
+        "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_a_builder_invocation_without_any_approval",
+        "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_a_forged_approval",
+        "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_to_clear_another_pool_workspace",
+        "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_a_replayed_approval",
+        "tests/test_owner_reclaim_1167.py::test_manager_half_runs_the_existing_slot_instance_with_a_single_use_approval",
+        "tests/test_owner_reclaim_1167.py::test_forged_completion_cannot_skip_the_evidence_handover_or_delete_the_slot",
+        "tests/test_owner_reclaim_1167.py::test_forged_completion_cannot_remove_a_workspace_the_helper_never_cleared",
+        "tests/test_qualification_owner_reclaim_1167.py::test_manager_steps_run_as_the_installed_manager_runtime_not_the_driver",
+        "tests/test_phase2_qualification.py::test_release_installed_checks_require_owner_bound_reclaim"
+      ]
     },
     {
       "id": "G843-R08-reclaim-dirty-scan-fail-open",
       "owner": "issue-1166",
-      "status": "open",
+      "status": "closed",
       "source": "paulsha_cortex/coordinator/worktree_reclaim.py::reclaim_worktree",
-      "retest": "When the dirty scan cannot read the workspace (for example no Manager ACL on the builder index), reclaim_worktree must fail closed before any deletion instead of logging and continuing to rmtree; verify under a multi-UID RC profile that nothing is deleted and the marker survives for replay."
+      "retest": "When the dirty scan cannot read the workspace, reclaim_worktree returns failed before registry or directory deletion and leaves the marker available for replay.",
+      "verified_by": [
+        "tests/test_worktree_registry_reclaim_478.py::test_reclaim_fails_closed_when_dirty_scan_is_denied",
+        "tests/test_worktree_registry_reclaim_478.py::test_reclaim_fails_closed_when_dirty_scan_times_out"
+      ]
     },
     {
       "id": "G843-installed-live-recovery",

@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from paulsha_cortex.coordinator import job_runner, spool_slot
+from paulsha_cortex.coordinator import job_runner, job_workspace, owner_reclaim, spool_slot
 from paulsha_cortex.trust_root.registry import (
     JobWriteContract,
     inner_sandbox_attached_for,
@@ -351,6 +351,7 @@ def _installed_checks(
     evidence_dir: Path,
     require_system_status: bool = True,
     receipt_path: Path | None = None,
+    profile: str = "release",
 ) -> list[dict[str, str]]:
     install = _load_json(install_evidence, "install verification evidence")
     if (
@@ -385,6 +386,10 @@ def _installed_checks(
     equation_payload = json.loads(equation.stdout)
     if equation_payload.get("ok") is not True:
         raise QualificationFailure("registry equation is not balanced")
+    owner_reclaim_check: list[dict[str, str]] = []
+    if profile == "release":
+        _installed_owner_bound_reclaim(receipt, evidence_dir)
+        owner_reclaim_check.append({"name": "owner-bound-reclaim", "status": "passed"})
     _write_json(
         evidence_dir / "install-semantic-checks.json",
         {
@@ -496,6 +501,7 @@ def _installed_checks(
             if require_system_status
             else []
         ),
+        *owner_reclaim_check,
     ]
 
 
@@ -531,6 +537,388 @@ def _system_status_mismatch(report: object) -> str:
         + _diagnostic_token(installed.get("kind") if isinstance(installed, Mapping) else None)
     )
     return " ".join(parts)
+
+
+#: #1167 owner-bound-reclaim installed check.  Every Manager step runs as the
+#: installed Manager (its UID, its root-owned runtime environment, its unit's
+#: UMask, the installed wheel) — never in this driver process: the driver has no
+#: PSC_REPO_ROOT, runs as root and would read builder inodes the Manager cannot.
+OWNER_RECLAIM_MANAGER = "cortex-manager"
+OWNER_RECLAIM_TIMEOUT_SECONDS = 900
+
+_OWNER_RECLAIM_SETUP_CODE = r"""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# cortex-manager.service runs with UMask=0077; the clone must be born the same
+# way or builder-created inodes would inherit group/other bits the Manager
+# could read through.
+os.umask(0o077)
+
+from paulsha_cortex.config import paths
+from paulsha_cortex.coordinator import job_runner, job_workspace, owner_reclaim, seams, spool_slot
+
+source = Path(sys.argv[1])
+jobs = json.loads(sys.argv[2])
+identity = ["-c", "user.name=cortex qualification", "-c", "user.email=qualification@example.invalid"]
+
+
+def git(*args):
+    subprocess.run(["git", *args], check=True, capture_output=True, text=True, timeout=120)
+
+
+source.mkdir()
+git("init", "-q", "-b", "main", str(source))
+(source / "seed.txt").write_text("seed\n", encoding="utf-8")
+git("-C", str(source), "add", "seed.txt")
+git("-C", str(source), *identity, "commit", "-qm", "seed")
+pool = paths.worktree_root().resolve(strict=True)
+creator = seams.ScriptWorktreeCreator(repo=source, wt_root=pool, base="main")
+spool = job_runner.resolve_job_spec_spool(os.environ, role=job_runner.JOB_ROLE_BUILDER)
+workspaces = {}
+for job_id in jobs:
+    created = creator.create(
+        f"feature/{job_id}",
+        job_id=job_id,
+        owner_identity={"repo": "qualification/owner-reclaim", "work_id": job_id, "slice_id": job_id},
+        attempt_id=job_id,
+    )
+    job_runner.ensure_workspace_reachable(
+        os.environ, role=job_runner.JOB_ROLE_BUILDER, workspace=created
+    )
+    workspace = Path(created).resolve(strict=True)
+    workspaces[job_id] = {
+        "path": str(workspace),
+        "marker_sha256": owner_reclaim.marker_digest(job_workspace.read_marker(workspace)),
+        "approval": job_runner.job_spec_path(spool, workspace.name),
+        "surfaces": sorted(
+            str(spool_slot.exact_job_slot(row.surface_id, workspace.name))
+            for row in spool_slot.PER_JOB_WRITABLE_SURFACES
+            if "builder" in row.principals
+        ),
+    }
+print(json.dumps({
+    "pool": str(pool),
+    "evidence_root": str(owner_reclaim.reclaim_evidence_root()),
+    "workspaces": workspaces,
+}, sort_keys=True))
+""".strip()
+
+_OWNER_RECLAIM_BUILDER_CODE = r"""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+os.umask(0o077)  # the builder template's UMask=
+workspace = Path(sys.argv[1])
+identity = ["-c", "user.name=cortex qualification", "-c", "user.email=qualification@example.invalid"]
+(workspace / "builder-commit.txt").write_text("commit\n", encoding="utf-8")
+subprocess.run(["git", "-C", str(workspace), "add", "builder-commit.txt"], check=True, timeout=120)
+subprocess.run(["git", "-C", str(workspace), *identity, "commit", "-qm", "builder commit"], check=True, timeout=120)
+nested = workspace / "untracked" / "nested"
+nested.mkdir(parents=True)
+(nested / "payload.txt").write_text("preserve\n", encoding="utf-8")
+head = subprocess.run(
+    ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+    check=True, capture_output=True, text=True, timeout=120,
+)
+print(head.stdout.strip())
+""".strip()
+
+_OWNER_RECLAIM_RECLAIM_CODE = r"""
+import json
+import os
+import sys
+from pathlib import Path
+
+os.umask(0o077)
+
+from paulsha_cortex.coordinator import worktree_reclaim
+
+outcome = worktree_reclaim.reclaim_worktree(Path(sys.argv[1]), repo_root=Path(sys.argv[2]))
+print(json.dumps(outcome.to_dict(), sort_keys=True))
+""".strip()
+
+
+def _owner_reclaim_manager_json(code: str, *args: str, label: str) -> dict[str, Any]:
+    """Run one check step as the installed Manager and return its JSON result."""
+
+    result = _run(
+        ("/opt/cortex/venv/bin/python", "-c", code, *args),
+        user=OWNER_RECLAIM_MANAGER,
+        env=_account_runtime_env(OWNER_RECLAIM_MANAGER),
+        timeout=OWNER_RECLAIM_TIMEOUT_SECONDS,
+    )
+    _require_success(result, label)
+    records = _json_records(result.stdout)
+    if not records or not isinstance(records[-1], Mapping):
+        raise QualificationFailure(f"{label} returned no JSON result")
+    return dict(records[-1])
+
+
+def _owner_reclaim_builder_env(builder: str, workspace: Path) -> dict[str, str]:
+    """A builder process environment with the same per-job git trust the unit gets."""
+
+    return {
+        **_account_env(builder),
+        **job_runner.git_workspace_trust_env(
+            role=job_runner.JOB_ROLE_BUILDER, workspace=workspace
+        ),
+    }
+
+
+def _owner_reclaim_tree(path: Path) -> list[tuple[str, int, int, str]]:
+    rows: list[tuple[str, int, int, str]] = []
+    for directory, child_dirs, child_files in os.walk(path, followlinks=False):
+        child_dirs.sort()
+        for name in sorted([*child_dirs, *child_files]):
+            item = Path(directory) / name
+            info = item.lstat()
+            digest = _sha256(item) if stat.S_ISREG(info.st_mode) else ""
+            rows.append((str(item.relative_to(path)), info.st_uid, info.st_mode, digest))
+    return rows
+
+
+def _installed_owner_bound_reclaim(receipt: Mapping[str, Any], evidence_dir: Path) -> None:
+    """Exercise marker-bound cleanup of a used builder clone through the installed template.
+
+    Fixture shape equals production: the Manager provisions both pool slots with
+    the dispatch helpers (`ScriptWorktreeCreator` + per-job builder ACL), the
+    builder UID commits and leaves untracked content, and the Manager — with no
+    ACL on those inodes — reclaims through its own `reclaim_worktree`, which
+    starts `cortex-job*@<slot>.service` via polkit.  The builder may call the
+    helper itself; without the Manager's single-use approval it must refuse.
+    """
+
+    if os.geteuid() != 0:
+        raise QualificationFailure("owner-bound-reclaim installed check requires root")
+    runtime_env = _installed_runtime_env()
+    declared_pool = Path(runtime_env.get("PSC_WORKTREE_ROOT", ""))
+    if not declared_pool.is_absolute() or declared_pool.is_symlink() or not declared_pool.is_dir():
+        raise QualificationFailure("installed runtime does not declare a usable worktree pool")
+    try:
+        builder = job_runner.resolve_job_account(runtime_env, role=job_runner.JOB_ROLE_BUILDER)
+        manager = pwd.getpwnam(OWNER_RECLAIM_MANAGER)
+        builder_uid = pwd.getpwnam(builder).pw_uid
+    except (KeyError, ValueError) as exc:
+        raise QualificationFailure(
+            f"owner-bound-reclaim cannot resolve the installed accounts: {exc}"
+        ) from exc
+    layout = _plan_probe_layout(receipt)
+    token = f"{os.getpid()}-{os.urandom(4).hex()}"
+    source = layout.source_root / f"rc-owner-reclaim-{token}"
+    if source.name in layout.installed_slugs or os.path.lexists(source):
+        raise QualificationFailure("owner-bound-reclaim fixture source already exists")
+    owned_job = f"rc-owner-reclaim-{token}"
+    foreign_job = f"rc-owner-reclaim-{token}-foreign"
+    cleanup: list[Path] = [
+        declared_pool / job_workspace.job_segment(owned_job),
+        declared_pool / job_workspace.job_segment(foreign_job),
+        source,
+    ]
+    approvals: list[Path] = []
+    evidence_root: Path | None = None
+    evidence_root_preexisting = True
+    try:
+        fixture = _owner_reclaim_manager_json(
+            _OWNER_RECLAIM_SETUP_CODE,
+            str(source),
+            json.dumps([owned_job, foreign_job]),
+            label="owner-bound-reclaim Manager fixture provisioning",
+        )
+        if fixture.get("pool") != str(declared_pool.resolve()):
+            raise QualificationFailure(
+                "Manager runtime resolved a different worktree pool than the installed declaration"
+            )
+        workspaces = fixture.get("workspaces")
+        if not isinstance(workspaces, Mapping) or set(workspaces) != {owned_job, foreign_job}:
+            raise QualificationFailure("Manager fixture provisioning reported unexpected slots")
+        evidence_root = Path(str(fixture.get("evidence_root")))
+        evidence_root_preexisting = os.path.lexists(evidence_root)
+        slots: dict[str, Path] = {}
+        for job_id, row in workspaces.items():
+            if not isinstance(row, Mapping):
+                raise QualificationFailure("Manager fixture provisioning reported a malformed slot")
+            path = Path(str(row.get("path")))
+            if path != declared_pool.resolve() / job_workspace.job_segment(job_id):
+                raise QualificationFailure("Manager provisioned a pool slot outside the job-id contract")
+            slots[job_id] = path
+            approvals.append(Path(str(row.get("approval"))))
+            for surface in row.get("surfaces") or ():
+                surface_path = Path(str(surface))
+                if not surface_path.is_absolute() or surface_path.name != path.name:
+                    raise QualificationFailure("Manager reported an unexpected per-instance surface")
+                cleanup.append(surface_path)
+        owned, foreign = slots[owned_job], slots[foreign_job]
+        pool = declared_pool.resolve()
+
+        builder_setup = _run(
+            ("/usr/bin/python3", "-c", _OWNER_RECLAIM_BUILDER_CODE, str(owned)),
+            user=builder,
+            env=_owner_reclaim_builder_env(builder, owned),
+            timeout=120,
+        )
+        _require_success(builder_setup, "owner-bound-reclaim builder commit and untracked setup")
+        builder_head = builder_setup.stdout.strip().splitlines()[-1] if builder_setup.stdout.strip() else ""
+        if SHA40.fullmatch(builder_head) is None:
+            raise QualificationFailure("owner-bound-reclaim builder did not report its commit")
+
+        marker_path = job_workspace.marker_path(owned)
+        marker_read = _run(
+            ("/usr/bin/python3", "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).read_bytes()", str(marker_path)),
+            user=builder, env=_account_env(builder), timeout=30,
+        )
+        _require_success(marker_read, "owner-bound-reclaim builder marker access")
+        marker_acl = _run(("getfacl", "-cp", str(marker_path)))
+        _require_success(marker_acl, "owner-bound-reclaim marker ACL")
+        if marker_path.stat().st_uid != manager.pw_uid or f"user:{builder}:" not in marker_acl.stdout:
+            raise QualificationFailure("owner-bound-reclaim marker owner/ACL is incorrect")
+        payload_path = owned / "untracked" / "nested" / "payload.txt"
+        if payload_path.stat().st_uid != builder_uid:
+            raise QualificationFailure("builder artifact was not created by the builder UID")
+        manager_read = _run(
+            ("/usr/bin/python3", "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).read_bytes()", str(payload_path)),
+            user=OWNER_RECLAIM_MANAGER, env=_account_env(OWNER_RECLAIM_MANAGER), timeout=30,
+        )
+        if manager_read.returncode == 0:
+            raise QualificationFailure("Manager unexpectedly read a builder-created artifact")
+        artifact_acl = _run(("getfacl", "-cp", str(payload_path)))
+        _require_success(artifact_acl, "owner-bound-reclaim builder artifact ACL")
+        if f"user:{manager.pw_name}:" in artifact_acl.stdout:
+            raise QualificationFailure("builder artifact unexpectedly has a Manager ACL entry")
+
+        foreign_tree = _owner_reclaim_tree(foreign)
+        foreign_acl = _run(("getfacl", "-cpR", str(foreign)))
+        _require_success(foreign_acl, "owner-bound-reclaim foreign ACL snapshot")
+        # The builder UID calling the helper directly — here even outside any unit,
+        # where DAC alone would let it delete the foreign slot — must be refused
+        # for lack of a Manager approval, before touching anything.
+        direct = _run(
+            (
+                "/opt/cortex/venv/bin/python",
+                "-m",
+                owner_reclaim.MODULE,
+                *owner_reclaim.reclaim_arguments(
+                    workspace=foreign,
+                    pool_root=pool,
+                    preserve_root=foreign.parent,
+                    marker_sha256=str(workspaces[foreign_job].get("marker_sha256")),
+                    nonce=os.urandom(16).hex(),
+                ),
+            ),
+            user=builder,
+            env=_owner_reclaim_builder_env(builder, foreign),
+            timeout=120,
+        )
+        if direct.returncode == 0 or "no Manager approval" not in direct.stderr:
+            raise QualificationFailure(
+                "builder invoked the reclaim helper without a Manager approval and it did not refuse"
+            )
+
+        outcome = _owner_reclaim_manager_json(
+            _OWNER_RECLAIM_RECLAIM_CODE,
+            str(owned),
+            str(source),
+            label="owner-bound-reclaim Manager reclaim",
+        )
+        preserved_ref = outcome.get("preserved_ref")
+        if (
+            outcome.get("status") != "reclaimed"
+            or outcome.get("directory_removed") is not True
+            or not isinstance(preserved_ref, str)
+        ):
+            raise QualificationFailure(
+                "owner-bound-reclaim did not reclaim the owned slot: "
+                + _diagnostic_token(outcome.get("status"))
+                + " "
+                + str(outcome.get("detail") or "")[:300]
+            )
+        archive = Path(preserved_ref)
+        cleanup.append(archive)
+        if archive.parent != evidence_root or not archive.name.startswith(f"{owned.name}-"):
+            raise QualificationFailure("owner-bound-reclaim archive is outside the Manager evidence root")
+        if os.path.lexists(owned):
+            raise QualificationFailure("owner-bound-reclaim left the owned slot in the pool")
+        if any(os.path.lexists(path) for path in approvals):
+            raise QualificationFailure("owner-bound-reclaim left its Manager approval behind")
+        if (archive / "untracked" / "nested" / "payload.txt").read_text(encoding="utf-8") != "preserve\n":
+            raise QualificationFailure("owner-bound-reclaim archive omitted builder content")
+        bundle_heads = _run(("git", "bundle", "list-heads", str(archive / "workspace-head.bundle")))
+        _require_success(bundle_heads, "owner-bound-reclaim preserved commit bundle")
+        if builder_head not in bundle_heads.stdout:
+            raise QualificationFailure("owner-bound-reclaim did not preserve the builder commit")
+        archived_payload = archive / "untracked" / "nested" / "payload.txt"
+        if _run(
+            ("/usr/bin/python3", "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).read_bytes()", str(archived_payload)),
+            user=OWNER_RECLAIM_MANAGER, env=_account_env(OWNER_RECLAIM_MANAGER), timeout=30,
+        ).returncode != 0:
+            raise QualificationFailure("Manager cannot read the preserved builder content")
+        if _run(
+            ("/usr/bin/python3", "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).read_bytes()", str(archived_payload)),
+            user=builder, env=_account_env(builder), timeout=30,
+        ).returncode == 0:
+            raise QualificationFailure("builder can still reach the preserved reclaim evidence")
+        if (
+            _owner_reclaim_tree(foreign) != foreign_tree
+            or _run(("getfacl", "-cpR", str(foreign))).stdout != foreign_acl.stdout
+        ):
+            raise QualificationFailure("owner-bound-reclaim modified the foreign pool slot")
+        replay = _owner_reclaim_manager_json(
+            _OWNER_RECLAIM_RECLAIM_CODE,
+            str(owned),
+            str(source),
+            label="owner-bound-reclaim Manager replay",
+        )
+        if replay.get("status") != "absent":
+            raise QualificationFailure("owner-bound-reclaim replay was not an absent no-op")
+        _write_json(
+            evidence_dir / "owner-bound-reclaim.json",
+            {
+                "schema_version": 2,
+                "status": "passed",
+                "builder_account": builder,
+                "manager_account": manager.pw_name,
+                "pool": str(pool),
+                "owner_slot_removed": True,
+                "preserved_files": outcome.get("preserved_files"),
+                "preserved_commit_bundle": True,
+                "evidence_moved_out_of_builder_reach": True,
+                "foreign_slot_unchanged": True,
+                "marker_manager_owned_builder_readable": True,
+                "manager_artifact_read_denied": True,
+                "builder_direct_invocation_refused": True,
+                "manager_approval_single_use": True,
+                "replay_status": replay.get("status"),
+            },
+        )
+    except (KeyError, OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, QualificationFailure):
+            raise
+        raise QualificationFailure(
+            f"owner-bound-reclaim failed: {type(exc).__name__}: {str(exc)[:500]}"
+        ) from exc
+    finally:
+        for path in approvals:
+            path.unlink(missing_ok=True)
+        for path in cleanup:
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+        try:
+            if (
+                evidence_root is not None
+                and not evidence_root_preexisting
+                and evidence_root.is_dir()
+                and not any(evidence_root.iterdir())
+            ):
+                evidence_root.rmdir()
+        except OSError:
+            pass
 
 
 def _denied(
@@ -5140,6 +5528,7 @@ def main() -> int:
             evidence_dir=args.evidence_dir,
             require_system_status=not legacy_profile,
             receipt_path=args.receipt,
+            profile=args.profile,
         )
         providers: list[dict[str, object]] = []
         if legacy_profile:
