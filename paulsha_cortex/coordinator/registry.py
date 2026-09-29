@@ -6042,6 +6042,10 @@ class JobRegistry:
         card: str,
         retry_classification: str | None = None,
         model_chain_override: dict[str, dict[str, str]] | None = None,
+        expected_candidate: str | None = None,
+        expected_era: str | None = None,
+        expected_job_id: str | None = None,
+        evidence_ref: str | None = None,
     ) -> WorkflowRun:
         """#545／#569：原子重開「當前 phase 內最早一張尚未採信的卡」。
 
@@ -6075,6 +6079,10 @@ class JobRegistry:
         current = self._workflows[index]
         if current.run_id != expected_run_id:
             raise ValueError("retry-card reset expected WorkflowRun CAS mismatch")
+        if expected_candidate is not None and current.candidate_head != expected_candidate:
+            raise ValueError("retry-card reset expected Candidate CAS mismatch")
+        if expected_era is not None and current.claim_key != expected_era:
+            raise ValueError("retry-card reset expected claim-era CAS mismatch")
         phase = current.current_phase
         if (
             current.status != "ongoing"
@@ -6117,6 +6125,13 @@ class JobRegistry:
             and job.get("workflow_claim_key") in (None, current.claim_key)
         ]
         latest_card_job = matching_card_jobs[-1] if matching_card_jobs else None
+        if expected_job_id is not None and (
+            latest_card_job is None
+            or latest_card_job.get("job_id") != expected_job_id
+            or latest_card_job.get("status") not in TERMINAL_JOB_STATUSES
+            or latest_card_job.get("workflow_claim_key") not in (None, current.claim_key)
+        ):
+            raise ValueError("retry-card reset expected job CAS mismatch")
         accepted_evidence = any(
             job.get("workflow_evidence") is not None for job in matching_card_jobs
         )
@@ -6203,6 +6218,11 @@ class JobRegistry:
                 else retry_classification
             ),
             model_chain_override=effective_model_chain_override,
+            evidence_refs=(
+                current.evidence_refs
+                if evidence_ref is None or evidence_ref in current.evidence_refs
+                else (*current.evidence_refs, evidence_ref)
+            ),
             updated_at=_now_iso(),
         )
         self._workflows[index] = updated

@@ -259,18 +259,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument(
         "--expected-run-id",
         help=(
-            "abandon／retire-delivered／recover-superseded／regenerate-gates／rechain／"
+            "abandon／retire-delivered／recover-superseded／regenerate-gates／rechain／supersede-attempt／"
             "retry-card／refreeze-base 使用的 exact WorkflowRun CAS；retry-build 改用 expected_candidate"
         ),
     )
     p_work.add_argument(
         "--expected-candidate",
         help=(
-            "retry-build／retry-verify／retry-review／recover-repair-commit／rechain（無 candidate 填 none）／"
+            "retry-build／retry-verify／retry-review／recover-repair-commit／rechain／supersede-attempt（無 candidate 填 none）／"
             "verify-attest 專用：exact Candidate SHA CAS"
         ),
     )
     p_work.add_argument("--expected-era", help="rechain 專用：exact claim:v1 era CAS")
+    p_work.add_argument("--expected-job-id", help="supersede-attempt 專用：被取代 attempt 的 exact job CAS")
     for persona in ("planner", "builder", "reviewer"):
         p_work.add_argument(f"--{persona}-executor", help=f"rechain 專用：{persona} identity executor")
         p_work.add_argument(f"--{persona}-model", help=f"rechain 專用：{persona} identity model ID")
@@ -513,9 +514,11 @@ def main(
             request_args["failure_reason"] = args.failure_reason
         if args.expected_run_id is not None:
             request_args["expected_run_id"] = args.expected_run_id
-        if args.action == "rechain":
+        if args.action in {"rechain", "supersede-attempt"}:
             if args.expected_era is not None:
                 request_args["expected_era"] = args.expected_era
+            if args.expected_job_id is not None:
+                request_args["expected_job_id"] = args.expected_job_id
             for persona in ("planner", "builder", "reviewer"):
                 for suffix in ("executor", "model"):
                     value = getattr(args, f"{persona}_{suffix}")

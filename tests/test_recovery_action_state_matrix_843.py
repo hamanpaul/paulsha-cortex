@@ -54,6 +54,7 @@ import test_recover_superseded_776 as superseded_fixture
 import test_pre_candidate_recovery as pre_candidate_repo_fixture
 import test_recovery_action_exposure_546 as pre_candidate_fixture
 import test_recovery_action_rechain_1173 as rechain_fixture
+import test_recovery_action_supersession_1174 as supersession_fixture
 import test_repair_commit_recovery as repair_fixture
 import test_review_gate_adjudication_exit as review_fixture
 import test_work_actions as work_fixture
@@ -753,6 +754,22 @@ def _rechain_scenario(root: Path) -> Scenario:
     )
 
 
+def _supersede_attempt_scenario(root: Path) -> Scenario:
+    registry, run = rechain_fixture._registry(root)
+    accepted_job = supersession_fixture._seed_job(registry, run)
+    job = supersession_fixture._seed_job(registry, run, status="failed", with_evidence=False)
+    authority = rechain_fixture._authority()
+    authority.github_provider_revision = None
+    return Scenario(
+        action="supersede-attempt", root=root, registry=registry,
+        state_path=root / "state.json",
+        args=supersession_fixture._args(run, job), repo=rechain_fixture.REPO,
+        work_id=rechain_fixture.WORK_ID, run_id=run.run_id,
+        authority=authority,
+        extra={"old_job_id": job["job_id"], "accepted_job_id": accepted_job["job_id"]},
+    )
+
+
 SCENARIOS: dict[str, Callable[[Path], Scenario]] = {
     "resume": _resume_scenario,
     "retry-build": _retry_build_scenario,
@@ -769,6 +786,7 @@ SCENARIOS: dict[str, Callable[[Path], Scenario]] = {
     "reset-reclaim-budget": _reset_reclaim_budget_scenario,
     "refreeze-base": _refreeze_base_scenario,
     "rechain": _rechain_scenario,
+    "supersede-attempt": _supersede_attempt_scenario,
 }
 
 
@@ -950,6 +968,21 @@ def _expect_rechain(sc, result, fresh, attention) -> None:
     assert sc.run_id not in attention
 
 
+def _expect_supersede_attempt(sc, result, fresh, attention) -> None:
+    run = fresh.get_workflow_run(sc.run_id)
+    old_job = fresh.get_job(sc.extra["old_job_id"])
+    assert result["result"]["action"] == "supersede-attempt"
+    assert result["result"]["reason"] == "attempt-superseded"
+    assert old_job["status"] == "failed"
+    assert old_job["workflow_stage_execution_receipt"]["key"]
+    accepted_job = fresh.get_job(sc.extra["accepted_job_id"])
+    assert accepted_job["workflow_evidence"] is not None
+    assert result["result"]["evidence"]["ref"] in run.evidence_refs
+    assert "needs_human" not in run.facets
+    assert fresh.list_jobs() == [accepted_job, old_job]
+    assert sc.run_id not in attention
+
+
 POSITIVE_EXPECTATIONS: dict[str, Callable[..., None]] = {
     "resume": _expect_resume,
     "retry-build": _expect_retry_build,
@@ -966,6 +999,7 @@ POSITIVE_EXPECTATIONS: dict[str, Callable[..., None]] = {
     "reset-reclaim-budget": _expect_reset_reclaim_budget,
     "refreeze-base": _expect_refreeze_base,
     "rechain": _expect_rechain,
+    "supersede-attempt": _expect_supersede_attempt,
 }
 
 
@@ -1229,6 +1263,14 @@ NEGATIVE_MATRIX: dict[str, dict[str, Any]] = {
         "stale-exact-run": _stale_run_probe,
         "wrong-state": _facets_probe(),
     },
+    "supersede-attempt": {
+        "wrong-phase": _phase_probe("define"),
+        "wrong-card": _args_probe(card="other-card"),
+        "active-job": _active_job_probe(),
+        "missing-actor-reason": _drop_probe("actor", "reason"),
+        "stale-exact-run": _stale_run_probe,
+        "wrong-state": _facets_probe(),
+    },
 }
 
 
@@ -1427,6 +1469,7 @@ DRIFT_MATRIX: dict[str, Callable[[Scenario, JobRegistry], None]] = {
     "reset-reclaim-budget": _drift_new_superseded_generation,
     "refreeze-base": _drift_new_generation,
     "rechain": _drift_candidate,
+    "supersede-attempt": _drift_candidate,
 }
 
 #: action 在第一次 registry 持久化之前就依 #275 順序先落地的 content-addressed
@@ -1445,6 +1488,7 @@ PREPARE_RECORD_DIRS: dict[str, tuple[str, ...]] = {
     "reset-reclaim-budget": ("evidence/work-reclaim-reset",),
     "refreeze-base": ("evidence/work-candidate-base-refreeze",),
     "rechain": ("evidence/work-model-chain-readjudication",),
+    "supersede-attempt": ("evidence/work-attempt-supersession",),
 }
 
 

@@ -7781,6 +7781,143 @@ def _rechain_prior_request_record(
     return None
 
 
+def _supersede_attempt_action(
+    *, args: dict[str, Any], authority, state_path: Path, workflow_registry,
+) -> dict[str, Any]:
+    """Authorize one exact terminal workflow attempt for replacement (#1174).
+
+    Active jobs are refused: a registry status cannot prove that the executor
+    process has stopped. The old job row, receipt, and artifacts are never
+    rewritten; the immutable audit is attached while the card is reset.
+    """
+    from .manager import _current_workflow_step
+    from .registry import (
+        MAX_RETRY_CARD_REDISPATCHES,
+        TERMINAL_JOB_STATUSES,
+        _retry_card_redispatch_count,
+    )
+
+    allowed = {
+        "action", "repo", "work_id", "issue", "actor", "reason",
+        "expected_run_id", "expected_candidate", "expected_era",
+        "expected_job_id", "card",
+    }
+    extras = set(args) - allowed
+    if extras:
+        raise ValueError(f"supersede-attempt rejects caller evidence/input: {sorted(extras)[0]}")
+    expected_run_id = args.get("expected_run_id")
+    expected_candidate_raw = args.get("expected_candidate")
+    expected_era = args.get("expected_era")
+    expected_job_id = args.get("expected_job_id")
+    card = args.get("card")
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if not isinstance(expected_run_id, str) or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None:
+        raise ValueError("supersede-attempt requires exact expected_run_id")
+    if not isinstance(expected_candidate_raw, str) or (
+        expected_candidate_raw != "none"
+        and re.fullmatch(r"[0-9a-fA-F]{40}", expected_candidate_raw) is None
+    ):
+        raise ValueError("supersede-attempt requires exact expected_candidate or none")
+    expected_candidate = None if expected_candidate_raw == "none" else expected_candidate_raw.lower()
+    if not isinstance(expected_era, str) or re.fullmatch(r"claim:v1:[0-9a-f]{64}", expected_era) is None:
+        raise ValueError("supersede-attempt requires exact expected_era")
+    if not isinstance(expected_job_id, str) or not expected_job_id.strip() or expected_job_id != expected_job_id.strip():
+        raise ValueError("supersede-attempt requires exact expected_job_id")
+    if not isinstance(card, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None:
+        raise ValueError("supersede-attempt requires exact card")
+    if not isinstance(actor, str) or actor != actor.strip() or not 1 <= len(actor) <= 128 or not actor.isprintable():
+        raise ValueError("supersede-attempt requires bounded actor")
+    if not isinstance(reason, str) or reason != reason.strip() or not 1 <= len(reason) <= 500 or not reason.isprintable():
+        raise ValueError("supersede-attempt requires bounded reason")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("supersede-attempt issue is not authorized by WorkAuthority")
+
+    runs = [
+        row for row in workflow_registry.list_workflow_runs()
+        if row.run_id == expected_run_id and row.repo == authority.repo and row.work_id == authority.work_id
+    ]
+    if len(runs) != 1:
+        raise RuntimeError("supersede-attempt expected WorkflowRun CAS mismatch")
+    run = runs[0]
+    expected_issues = tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
+    canonical_runs = [
+        row for row in workflow_registry.list_workflow_runs()
+        if row.repo == authority.repo and row.work_id == authority.work_id
+        and row.issue_refs == expected_issues
+        and _openspec_refs_compatible(row, authority)
+        and row.status == "ongoing"
+    ]
+    if len(canonical_runs) != 1 or canonical_runs[0].run_id != expected_run_id:
+        raise RuntimeError("supersede-attempt requires one active canonical WorkflowRun")
+    body = {
+        "schema": "cortex-work-attempt-supersession/v1",
+        "action": "supersede-attempt", "repo": run.repo, "work_id": run.work_id,
+        "run_id": run.run_id, "expected_candidate": expected_candidate_raw,
+        "expected_era": expected_era, "expected_job_id": expected_job_id,
+        "card": card, "actor": actor, "reason": reason,
+    }
+    record = _existing_supersede_evidence(
+        body, state_path=state_path, subdir="work-attempt-supersession",
+        label="attempt-supersession", max_size=8192,
+    )
+    if record is not None and record["ref"] in run.evidence_refs:
+        return {
+            "action": "supersede-attempt", "reason": "attempt-already-superseded",
+            "already_applied": True, "evidence": record, "run": run.to_dict(),
+            "superseded_job_id": expected_job_id,
+        }
+    if run.candidate_head != expected_candidate:
+        raise RuntimeError("supersede-attempt expected Candidate CAS mismatch")
+    if run.claim_key != expected_era:
+        raise RuntimeError("supersede-attempt expected claim-era CAS mismatch")
+    if run.status != "ongoing" or "needs_human" not in run.facets:
+        raise RuntimeError("supersede-attempt requires an ongoing needs_human workflow")
+    target = _current_workflow_step(run)
+    if target is None or target.card != card:
+        raise RuntimeError("supersede-attempt expected card CAS mismatch")
+    jobs = [job for job in workflow_registry.list_jobs() if job.get("workflow_run_id") == run.run_id]
+    if any(job.get("status") in ACTIVE_JOB_STATUSES for job in jobs):
+        raise RuntimeError("supersede-attempt refuses active workflow job")
+    matches = [
+        job for job in jobs
+        if job.get("job_id") == expected_job_id
+        and job.get("workflow_claim_key") in (None, run.claim_key)
+        and job.get("workflow_phase") == run.current_phase
+        and job.get("workflow_card") == card
+        and (run.current_phase == "build" or job.get("subject_head") == run.candidate_head)
+    ]
+    if len(matches) != 1 or matches[0].get("status") not in TERMINAL_JOB_STATUSES:
+        raise RuntimeError("supersede-attempt expected job CAS mismatch")
+    card_job_count = sum(
+        job.get("workflow_phase") == run.current_phase
+        and job.get("workflow_card") == card
+        and job.get("workflow_claim_key") in (None, run.claim_key)
+        and (run.current_phase == "build" or job.get("subject_head") == run.candidate_head)
+        for job in jobs
+    )
+    if _retry_card_redispatch_count(run.attempts, matching_job_count=card_job_count, card_id=card) >= MAX_RETRY_CARD_REDISPATCHES:
+        raise RuntimeError("supersede-attempt retry budget exhausted")
+    record = record or _write_supersede_evidence(
+        body, state_path=state_path, subdir="work-attempt-supersession",
+        label="attempt-supersession", max_size=8192,
+    )
+    try:
+        updated = workflow_registry._manager_reset_workflow_for_retry_card(
+            run.run_id, expected_run_id=expected_run_id, card=card,
+            expected_candidate=expected_candidate, expected_era=expected_era,
+            expected_job_id=expected_job_id, evidence_ref=record["ref"],
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"supersede-attempt CAS/admission failed: {exc}") from exc
+    return {
+        "action": "supersede-attempt", "reason": "attempt-superseded",
+        "already_applied": False, "evidence": record, "run": updated.to_dict(),
+        "superseded_job_id": expected_job_id,
+    }
+
+
 def _rechain_action(
     *,
     args: dict[str, Any],
@@ -10204,6 +10341,13 @@ def execute_work_action(
             args=args,
             authority=authority,
             now_epoch=now_epoch,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "supersede-attempt":
+        result = _supersede_attempt_action(
+            args=args,
+            authority=authority,
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,
         )
