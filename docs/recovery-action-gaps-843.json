@@ -128,6 +128,8 @@
         "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_to_clear_another_pool_workspace",
         "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_a_replayed_approval",
         "tests/test_owner_reclaim_1167.py::test_manager_half_runs_the_existing_slot_instance_with_a_single_use_approval",
+        "tests/test_owner_reclaim_1167.py::test_forged_completion_cannot_skip_the_evidence_handover_or_delete_the_slot",
+        "tests/test_owner_reclaim_1167.py::test_forged_completion_cannot_remove_a_workspace_the_helper_never_cleared",
         "tests/test_qualification_owner_reclaim_1167.py::test_manager_steps_run_as_the_installed_manager_runtime_not_the_driver",
         "tests/test_phase2_qualification.py::test_release_installed_checks_require_owner_bound_reclaim"
       ]

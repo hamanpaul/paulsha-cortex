@@ -12,7 +12,7 @@
    - unit instance 就是工作區目錄名。那個名字本來就是當初那顆 job 的 `%i`（`job_workspace.job_segment(job_id)`），所以模板的 `ReadWritePaths=<pool>/%i` 恰好只涵蓋這一格。`job_runner.prepare_systemd_template(instance=...)` 逐字使用它，不再對已是 segment 的名字多算一次 hash。
    - 以 `spool_slot.provision_runtime_surfaces(instance=..., seed_credential=False)` 建齊模板所有 `ReadWritePaths`，否則 systemd 在 helper 起跑前就以 `226/NAMESPACE` 失敗。回收不跑模型，所以不複製 model credential。
    - 重設該 instance 的 commit-spool 格，在裡面開 `reclaim-preserved/`（Manager 與 builder 具名 ACL）與 reclaim log。build-log 格不重設，被回收工作區那顆 job 的 log 留著供診斷。接著寫 job spec，`systemctl start --wait` 起 unit；unit 結束後無論成敗都刪掉 spec。
-   - 驗證 helper 的完成紀錄（nonce、工作區名、保存數量），把保存下來的封存移到 Manager-only 的 `<coordinator>/evidence/worktree-reclaim/`，封住 commit-spool 格，最後刪掉已清空的 pool 目錄。
+   - unit 結束後先封住 commit-spool 格，把 preserve 區裡的封存全部移到 Manager-only 的 `<coordinator>/evidence/worktree-reclaim/`；以 systemd 回報的結果與工作區是否確實清空判定成敗，最後才交叉核對 helper 的完成紀錄，由呼叫端刪掉已清空的 pool 目錄（見下文「完成紀錄不是決策依據」）。
 2. **builder 半**（`python -m paulsha_cortex.coordinator.owner_reclaim`，在 root-owned 模板 unit 內以 builder UID 執行）：驗證 Manager 核准，比對 marker digest，dirty scan、保存未提交內容與 `marker.base` 之後的本機 commit bundle，再清空工作區內容。掃描、保存或 bundle 任一步失敗就不刪任何東西。
 
 ## 威脅模型
@@ -51,11 +51,29 @@
 
 builder 的模型 job 本身就跑在同一個模板（`cortex-job@<instance>`）裡。「在模板 unit 內」這件事分辨不出這次呼叫是 Manager 要求的回收，還是 builder 自己在 job 裡發起的。能表達 Manager 意圖的只有 Manager 寫、builder 唯讀的 job spec，而它本來就是既有、已安裝的資產，不需要新的權限計畫資產或安裝步驟。
 
+### 完成紀錄不是決策依據
+
+helper 把完成紀錄（含 nonce、保存數量、封存路徑）寫進 reclaim log，但這份紀錄出自 builder 可寫的位置：
+
+- **DAC**：commit-spool 格對 builder 有 `wx`，log 檔是 Manager 預建的 `0620`，帶 builder 的寫入 ACL。任何 builder UID 行程只要走得到這條路徑，就能追加或截斷它。
+- **mount namespace**：模板只把 `commit-spool/%i` 掛成可寫，所以其他 instance 的 builder job 看到的是唯讀，寫不進去。實際能寫的只有 instance 相同的 builder unit：reclaim unit 本身（裡面只跑 helper），以及另一個 stem（另一種加固剖面，或唯讀模板）仍在執行的舊 job。`prepare_systemd_template` 只檢查自己選的那個 stem。
+- **nonce**：寫在 builder 可讀的 spec 裡，擋不住上述的共用者。
+
+因此 Manager 的每個決定都改以自己觀察到的事實為準：
+
+1. 起 unit 前，確認同一個 instance 的所有 builder 模板 stem（strict／jit × 一般／唯讀）都不在 active，否則不起 unit。
+2. unit 結束後先封住 commit-spool 格。ACL mask 歸零，任何 builder 行程都走不進 preserve 區與 log。
+3. 不論完成紀錄怎麼說，把 preserve 區裡每一個 helper 會建立的封存（`<instance>-<32 位 hex>` 目錄）都移進 Manager-only evidence。其他形狀的項目（symlink、檔案、名稱不符）留在原地，並讓回收失敗。
+4. 以 systemd 回報的結果（`systemctl start --wait` 的回傳碼）判定 helper 成敗。成功時，Manager 再自己確認工作區目錄已經是空的，才讓呼叫端刪除它。
+5. 最後才核對完成紀錄：帶本次 nonce 的紀錄必須恰好一筆，工作區名稱、保存數量、有無 commit bundle 都要與 Manager 自己讀到的封存一致（bundle 還要有 git bundle 檔頭）。任何不符都 fail closed，此時證據已經移走。
+
+偽造的紀錄因此只能讓回收失敗，不能讓 Manager 跳過證據移交，也不能讓它刪掉沒有清空的工作區。
+
 ### 保存下來的證據
 
 - helper 建的封存目錄以 `0770`（ACL mask 含 `w`）建立，Manager 的具名條目因此可以移動與清理它。
-- Manager 驗證完成紀錄後，把封存從 builder 可寫的 commit-spool 格移到 `<coordinator>/evidence/worktree-reclaim/`（Manager `0700`，builder 無 traverse）。好處有兩個：之後同一 slice 重派時 `prepare_commit_spool(reset=True)` 不會把證據一起清掉，也不會卡在刪不掉 builder 目錄；builder 也碰不到已保存的內容。
-- 若 `reclaim-preserved/` 裡還留著前一次未完成回收的封存，Manager 會拒絕重設該格，保留證據給 operator 檢查。
+- unit 結束後（不論成敗），Manager 把封存從 builder 可寫的 commit-spool 格移到 `<coordinator>/evidence/worktree-reclaim/`（Manager `0700`，builder 無 traverse）。好處有兩個：之後同一 slice 重派時 `prepare_commit_spool(reset=True)` 不會把證據一起清掉，也不會卡在刪不掉 builder 目錄；builder 也碰不到已保存的內容。
+- 若 `reclaim-preserved/` 裡還留著 Manager 沒有移走的項目（例如上一輪被判為非預期形狀而留在原地的東西），Manager 會拒絕重設該格，保留給 operator 檢查。
 
 ### 殘餘風險
 
@@ -64,7 +82,11 @@ builder 的模型 job 本身就跑在同一個模板（`cortex-job@<instance>`�
 
 ## 驗證
 
-- 單元測試：`tests/test_owner_reclaim_1167.py`，涵蓋核准的正向路徑、無核准、偽造核准（非 Manager 擁有、群組可寫、spool 可寫、symlink）、他人工作區、重放舊核准，以及 Manager 半（instance 名、單次核准、nonce、封存移出、拒絕重設未檢查的封存）。
+- 單元測試：`tests/test_owner_reclaim_1167.py`，涵蓋：
+  - 核准的正向路徑；
+  - 無核准、偽造核准（非 Manager 擁有、群組可寫、spool 可寫、symlink）、他人工作區、重放舊核准；
+  - Manager 半：instance 名、單次核准、封存移出、拒絕重設未檢查的封存；
+  - 偽造完成紀錄（追加、覆寫、helper 未執行）、preserve 區被塞入其他項目、同 instance 另有 builder unit 在執行。
 - RC `release` profile 的 `owner-bound-reclaim` installed check（`qualification/driver.py::_installed_owner_bound_reclaim`）：
   - 以已安裝 Manager 的身分、runtime 環境與 `UMask` 建出兩格 production 形狀的工作區；
   - 以 builder UID commit 並留下未追蹤內容；

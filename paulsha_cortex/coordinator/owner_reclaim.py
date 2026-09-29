@@ -23,6 +23,13 @@ Threat model (full text: ``docs/three-uid-workspace-reclaim.md``):
   a per-invocation nonce.  The Manager deletes the spec as soon as the unit has
   finished, so an approval is single use; a leftover copy cannot clear a later
   attempt because that attempt has a different marker digest.
+* The helper's completion record is never the basis of a Manager decision.  The
+  log it lands in is writable by any builder process that shares the instance's
+  mounts, and the nonce is in the builder-readable spec.  The Manager refuses to
+  start while another builder unit holds the instance, and after the unit it
+  seals the slot, adopts every archive it observes in the preserve area into
+  Manager-only evidence, judges success by the systemd result and by the
+  workspace being observably empty, and only then cross-checks the record.
 """
 from __future__ import annotations
 
@@ -446,60 +453,148 @@ def _refuse_unreviewed_archive(archive_root: Path) -> None:
         )
 
 
-def _count_archive(archive: Path) -> int:
-    observed = 0
-    for directory, child_dirs, child_files in os.walk(archive, followlinks=False):
-        observed += sum(1 for name in child_dirs if (Path(directory) / name).is_symlink())
-        observed += len(child_files)
-    return observed
+def _builder_units_for_instance(env: Mapping[str, str], instance: str) -> list[str]:
+    """Every builder template unit that can run with this ``%i``.
+
+    Each of them mounts ``<pool>/%i`` and the instance's spools writable, so while
+    any one is active a process other than the reclaim helper could write the
+    workspace, the preserve area or the reclaim log.
+    """
+
+    base = job_runner.resolve_template_unit(env, role=job_runner.JOB_ROLE_BUILDER)
+    units: list[str] = []
+    for read_only in (False, True):
+        contract = job_runner.template_unit_for_workspace_contract(
+            base, workspace_read_only=read_only
+        )
+        for profile in sorted(job_runner.TEMPLATE_UNIT_SUFFIX_BY_PROFILE):
+            units.append(
+                job_runner.template_unit_name(
+                    instance, template=job_runner.template_unit_for_profile(contract, profile)
+                )
+            )
+    return units
 
 
 def _completion(log: Path, *, instance: str, nonce: str) -> dict[str, object]:
-    for line in reversed(log.read_text(encoding="utf-8", errors="replace").splitlines()):
+    """The helper's completion record: auxiliary, never the basis of a decision.
+
+    The log is builder-writable and the nonce is readable by the builder in the
+    spec, so exactly one nonce-matching record is required; a second one means
+    something other than the helper wrote the log.
+    """
+
+    matches: list[dict[str, object]] = []
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
-            result = json.loads(line)
+            record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if (
-            isinstance(result, dict)
-            and result.get("status") == "cleared"
-            and result.get("nonce") == nonce
-        ):
-            if result.get("workspace_name") != instance:
-                raise RuntimeError("builder reclaim completion names a different workspace")
-            return result
-    raise RuntimeError("builder reclaim unit returned no completion record for this invocation")
+        if isinstance(record, dict) and record.get("nonce") == nonce:
+            matches.append(record)
+    if not matches:
+        raise RuntimeError("builder reclaim unit returned no completion record for this invocation")
+    if len(matches) > 1:
+        raise RuntimeError(
+            "builder reclaim log holds more than one completion record for this invocation"
+        )
+    [record] = matches
+    if record.get("status") != "cleared" or record.get("workspace_name") != instance:
+        raise RuntimeError("builder reclaim completion does not describe this workspace")
+    return record
 
 
-def _adopt_archive(result: dict[str, object], *, archive_root: Path) -> dict[str, object]:
-    """Verify the helper's archive claim and move it into Manager-only evidence."""
+def _adopt_preserved(archive_root: Path, *, instance: str) -> list[Path]:
+    """Move every archive the unit left behind into Manager-only evidence.
 
-    preserved = result.get("preserved_files")
-    if not isinstance(preserved, int) or isinstance(preserved, bool) or preserved < 0:
-        raise RuntimeError("builder reclaim completion has an invalid preserve count")
-    preserved_commit = result.get("preserved_commit") is True
-    preserve_path = result.get("preserve_path")
-    if preserved == 0 and not preserved_commit:
-        if preserve_path is not None:
-            raise RuntimeError("builder reclaim returned an empty preserve archive")
-        return result
-    archive = Path(str(preserve_path))
-    if archive.parent != archive_root or archive.is_symlink() or not archive.is_dir():
-        raise RuntimeError("builder reclaim archive is outside its Manager spool slot")
+    What is adopted is decided from what the Manager observes in the sealed
+    preserve area, not from the builder-writable completion record, so a forged
+    record cannot make the Manager leave an archive behind.  Entries the helper
+    never creates are left in place and fail the reclaim.
+    """
+
+    name = re.compile(rf"^{re.escape(instance)}-[0-9a-f]{{32}}$")
     evidence_root = reclaim_evidence_root()
     evidence_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    destination = evidence_root / archive.name
-    # After the move the builder cannot reach the archive any more; verify the
-    # claimed content there, not in the builder-writable slot.
-    os.rename(archive, destination)
-    expected_count = preserved + (1 if preserved_commit else 0)
-    if _count_archive(destination) != expected_count:
-        raise RuntimeError("builder reclaim archive count does not match its completion")
-    if preserved_commit:
-        bundle = destination / "workspace-head.bundle"
+    adopted: list[Path] = []
+    unexpected: list[str] = []
+    for entry in sorted(archive_root.iterdir()):
+        info = entry.lstat()
+        destination = evidence_root / entry.name
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or name.fullmatch(entry.name) is None
+            or os.path.lexists(destination)
+        ):
+            unexpected.append(entry.name)
+            continue
+        os.rename(entry, destination)
+        adopted.append(destination)
+    if unexpected:
+        raise RuntimeError(
+            "the reclaim preserve area holds entries the helper does not create: "
+            + ", ".join(sorted(unexpected))[:300]
+        )
+    return adopted
+
+
+_BUNDLE_SIGNATURES = (b"# v2 git bundle\n", b"# v3 git bundle\n")
+
+
+def _inspect_archive(archive: Path) -> tuple[int, bool]:
+    """Manager's own reading of an adopted archive: (preserved entries, has bundle).
+
+    Preserved entries are what ``_preserve`` creates for dirty paths: regular
+    files, symlinks and (for an untracked nested repository) empty directories.
+    """
+
+    entries = 0
+    for directory, child_dirs, child_files in os.walk(archive, followlinks=False):
+        for child in (*child_dirs, *child_files):
+            item = Path(directory) / child
+            info = item.lstat()
+            if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                entries += 1
+            elif stat.S_ISDIR(info.st_mode):
+                if not any(item.iterdir()):
+                    entries += 1
+            else:
+                raise RuntimeError("reclaim archive holds an unsupported entry")
+    bundle = archive / "workspace-head.bundle"
+    has_bundle = os.path.lexists(bundle)
+    if has_bundle:
         if bundle.is_symlink() or not bundle.is_file():
-            raise RuntimeError("builder reclaim omitted the local commit bundle")
-    return {**result, "preserve_path": str(destination)}
+            raise RuntimeError("reclaim archive commit bundle is not a regular file")
+        with bundle.open("rb") as stream:
+            if stream.read(16) not in _BUNDLE_SIGNATURES:
+                raise RuntimeError("reclaim archive commit bundle is not a git bundle")
+        entries -= 1
+    return entries, has_bundle
+
+
+def _reconcile(record: Mapping[str, object], adopted: Sequence[Path]) -> dict[str, object]:
+    """Cross-check the completion record against the archives the Manager adopted."""
+
+    preserved = record.get("preserved_files")
+    if not isinstance(preserved, int) or isinstance(preserved, bool) or preserved < 0:
+        raise RuntimeError("builder reclaim completion has an invalid preserve count")
+    preserved_commit = record.get("preserved_commit") is True
+    claimed = record.get("preserve_path")
+    if len(adopted) > 1:
+        raise RuntimeError("the reclaim preserve area held more than one archive")
+    if not adopted:
+        if preserved or preserved_commit or claimed is not None:
+            raise RuntimeError(
+                "builder reclaim completion claims preserved content the Manager did not find"
+            )
+        return {**record, "preserve_path": None}
+    [archive] = adopted
+    if not isinstance(claimed, str) or Path(claimed).name != archive.name:
+        raise RuntimeError("builder reclaim completion does not name the archive the Manager adopted")
+    entries, has_bundle = _inspect_archive(archive)
+    if entries != preserved or has_bundle != preserved_commit:
+        raise RuntimeError("adopted reclaim archive does not match the completion record")
+    return {**record, "preserve_path": str(archive)}
 
 
 def reclaim_through_builder_unit(
@@ -543,6 +638,30 @@ def reclaim_through_builder_unit(
     manager_account = DEFAULT_SCHEME.durable_state_owner
     if not manager_account:
         raise RuntimeError("the installed UID scheme has no Manager durable-state owner")
+    # prepare_systemd_template() only checked the stem it selected.  A builder job
+    # for this slot under another stem (other hardening profile, read-only
+    # template) would share every writable surface with the helper.
+    busy = [
+        unit
+        for unit in _builder_units_for_instance(env, instance)
+        if job_runner._unit_is_active(plan.binary, unit)
+    ]
+    if busy:
+        raise RuntimeError(
+            "another builder unit for this workspace is still active: " + ", ".join(busy)
+        )
+    # The job environment is validated (PATH/HOME contract, git trust) before any
+    # side effect, like every other pre-launch check.
+    job_env = job_runner.build_job_env(
+        manager_env=env,
+        job_id=instance,
+        slice_id=instance,
+        repo_root=source_repo,
+        workspace=workspace_path,
+        role=job_runner.JOB_ROLE_BUILDER,
+    )
+    job_env["CODEX_HOME"] = str(spool_slot.exact_job_slot("builder-codex-home", instance))
+    job_env["XDG_CACHE_HOME"] = str(spool_slot.exact_job_slot("builder-runtime-cache", instance))
     # Every ReadWritePaths= of the template must exist or systemd fails the
     # namespace setup (226/NAMESPACE) before the helper runs.  The reclaim runs
     # no model, so no credential is copied into its runtime home.
@@ -567,16 +686,6 @@ def reclaim_through_builder_unit(
     # the instance's build-log slot: resetting that one would erase the log of
     # the builder job whose workspace is being reclaimed.
     log = spool_slot.preseed_job_writable_file(commit_slot / RECLAIM_LOG_FILENAME)
-    job_env = job_runner.build_job_env(
-        manager_env=env,
-        job_id=instance,
-        slice_id=instance,
-        repo_root=source_repo,
-        workspace=workspace_path,
-        role=job_runner.JOB_ROLE_BUILDER,
-    )
-    job_env["CODEX_HOME"] = str(spool_slot.exact_job_slot("builder-codex-home", instance))
-    job_env["XDG_CACHE_HOME"] = str(spool_slot.exact_job_slot("builder-runtime-cache", instance))
     nonce = secrets.token_hex(16)
     command = [
         RECLAIM_PYTHON,
@@ -607,6 +716,14 @@ def reclaim_through_builder_unit(
     finally:
         # The spec is the helper's approval: single use, whatever happened.
         Path(plan.spec_path).unlink(missing_ok=True)
+    # From here on nothing a builder process wrote decides anything.  Seal the
+    # slot first: its ACL mask drops to ---, so no builder process can reach the
+    # preserve area or the log any more.
+    if not spool_slot.seal_slot(commit_slot):
+        raise RuntimeError("the reclaim spool slot could not be sealed")
+    # Evidence first, whatever the unit reported: every archive the unit left is
+    # moved out of the builder's reach before any outcome is decided.
+    adopted = _adopt_preserved(archive_root, instance=instance)
     if completed.returncode:
         # The helper's own refusal is on its stderr, which the shim sent to the log.
         try:
@@ -622,10 +739,11 @@ def reclaim_through_builder_unit(
         raise RuntimeError(
             f"builder reclaim unit failed rc={completed.returncode}: {str(detail)[-500:]}"
         )
-    result = _adopt_archive(_completion(log, instance=instance, nonce=nonce), archive_root=archive_root)
-    job_workspace.seal_commit_spool(commit_slot / job_workspace.COMMIT_BUNDLE_FILENAME)
-    return result
-
+    # systemd reported success; the workspace must be observably empty before the
+    # caller may remove it.  The Manager owns the slot directory, so it can list it.
+    if any(workspace_path.iterdir()):
+        raise RuntimeError("workspace is not empty after the builder reclaim unit")
+    return _reconcile(_completion(log, instance=instance, nonce=nonce), adopted)
 
 if __name__ == "__main__":  # pragma: no cover - installed helper entry point
     raise SystemExit(main())
