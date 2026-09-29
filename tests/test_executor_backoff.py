@@ -2975,3 +2975,46 @@ def test_last_slot_race_accepts_only_one_new_event(tmp_path: Path, monkeypatch) 
     assert sum(1 for result in results if result["changed"] is True) == 1
     assert sum(1 for result in results if "capacity-exceeded" in result["diagnostics"]) == 1
     assert len(_state_payload(tmp_path)["events"]) == 2
+
+
+def test_lock_lives_in_the_coordinator_root_when_ancestors_are_not_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716 canary：三 UID 安裝中 coordinator root 由 Manager 擁有，但它的祖先
+    （/var/lib/cortex 以上）都是 root-owned。舊邏輯找不到可寫祖先就退回 `/`，
+    Manager 開不了 lock → store 讀取 UNKNOWN → build 卡片永遠 executor-backoff-unknown。
+    coordinator root 存在時 lock 必須放在 root 內，且與呼叫端權限無關。"""
+    from paulsha_cortex.coordinator import executor_backoff
+
+
+    root = tmp_path / "state" / "coordinator"
+    root.mkdir(parents=True)
+    real_access = os.access
+
+    def only_root_writable(path, mode, *args, **kwargs):
+        if Path(path) != root and mode & os.W_OK:
+            return False
+        return real_access(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(executor_backoff.os, "access", only_root_writable)
+
+    lock = executor_backoff._lock_path(root)
+    assert lock.parent == root
+
+    status = executor_backoff.reconcile_backoff(
+        root, "codex", "gpt-5.5", now=1_790_000_000.0, inventory=None
+    )
+    assert status.observation is not executor_backoff.StoreObservation.UNKNOWN, status.diagnostics
+
+
+def test_lock_location_does_not_depend_on_the_callers_ancestor_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from paulsha_cortex.coordinator import executor_backoff
+
+    root = tmp_path / "coordinator"
+    root.mkdir()
+    as_manager = executor_backoff._lock_path(root)
+    monkeypatch.setattr(executor_backoff.os, "access", lambda *_args, **_kwargs: True)
+    as_root = executor_backoff._lock_path(root)
+    assert as_manager == as_root
