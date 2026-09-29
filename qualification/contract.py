@@ -21,7 +21,11 @@ TOOLCHAIN: Mapping[str, Mapping[str, str]] = {
         "version": "0.157.1",
         "npm_package": "@openai/codex@0.157.1-linux-x64",
         "integrity": "sha512-Eac8XlC0nCXSeUjDU9l8yLJ6P9evv1mO+AnvILoNwlegBC7B3AVXqJ05QcMhQX7RcJ3Lk2618ykCb2X2ui8VAQ==",
-        "archive_path": "package/vendor/x86_64-unknown-linux-musl/bin/codex",
+        # 整個 bin 目錄以 tree 安裝（#716）：0.157 起 `features.code_mode_host`
+        # （stable、預設開）要求 `codex-code-mode-host` 與 codex 同目錄，只裝單檔
+        # codex 時 job 內每個 tool call 都因 host 不存在而失敗。
+        "archive_dir": "package/vendor/x86_64-unknown-linux-musl/bin",
+        "entrypoint": "codex",
     },
     "claude": {
         "version": "2.1.239",

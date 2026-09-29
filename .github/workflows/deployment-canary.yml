@@ -112,14 +112,15 @@ jobs:
             "$TOOL_OPENSPEC_INTEGRITY" \
             qualification-staging/openspec.path
 
+          mkdir -p qualification-staging/codex
           tar -xzf "$(<qualification-staging/codex.path)" \
-            -O "$TOOL_CODEX_ARCHIVE_PATH" \
-            > qualification-input/toolchain/codex
+            -C qualification-staging/codex "$TOOL_CODEX_ARCHIVE_DIR"
+          test -f "qualification-staging/codex/$TOOL_CODEX_ARCHIVE_DIR/codex-code-mode-host"
           tar -xzf "$(<qualification-staging/claude.path)" \
             -O "$TOOL_CLAUDE_ARCHIVE_PATH" > qualification-input/toolchain/claude
           tar -xzf "$(<qualification-staging/copilot.path)" \
             -O "$TOOL_COPILOT_ARCHIVE_PATH" > qualification-input/toolchain/copilot
-          chmod 0755 qualification-input/toolchain/codex \
+          chmod 0755 \
             qualification-input/toolchain/claude qualification-input/toolchain/copilot
 
           curl --fail --location --silent --show-error \
@@ -148,7 +149,7 @@ jobs:
             --root qualification-input \
             --candidate-sha "$CANDIDATE_SHA" \
             --wheel "${candidate_wheels[0]}" \
-            --tool-file "codex,$TOOL_CODEX_VERSION,qualification-input/toolchain/codex" \
+            --tool-tree "codex,$TOOL_CODEX_VERSION,qualification-staging/codex/$TOOL_CODEX_ARCHIVE_DIR,$TOOL_CODEX_ENTRYPOINT" \
             --tool-file "claude,$TOOL_CLAUDE_VERSION,qualification-input/toolchain/claude" \
             --tool-file "copilot,$TOOL_COPILOT_VERSION,qualification-input/toolchain/copilot" \
             --tool-file "agy,$TOOL_AGY_VERSION,qualification-input/toolchain/agy" \

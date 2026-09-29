@@ -338,6 +338,24 @@ def test_qualification_toolchain_and_provider_models_have_one_workflow_source() 
     )
 
 
+def test_codex_ships_its_code_mode_host_as_one_tree() -> None:
+    """#716：codex 以整個 bin 目錄安裝，`codex-code-mode-host` 與本體同目錄。"""
+    codex = TOOLCHAIN["codex"]
+    assert codex["archive_dir"].endswith("/bin")
+    assert codex["entrypoint"] == "codex"
+    assert "archive_path" not in codex
+    for name in ("deployment-canary.yml", "rc-qualification.yml"):
+        raw = (WORKFLOWS / name).read_text(encoding="utf-8")
+        assert '--tool-file "codex,' not in raw, name
+        assert (
+            '--tool-tree "codex,$TOOL_CODEX_VERSION,'
+            'qualification-staging/codex/$TOOL_CODEX_ARCHIVE_DIR,$TOOL_CODEX_ENTRYPOINT"'
+        ) in raw, name
+        assert (
+            'test -f "qualification-staging/codex/$TOOL_CODEX_ARCHIVE_DIR/codex-code-mode-host"'
+        ) in raw, name
+
+
 def test_canary_codex_effort_matches_the_production_launcher() -> None:
     """contract 不能 import paulsha_cortex；codex effort 與 launcher 的對照由此釘住。"""
 
