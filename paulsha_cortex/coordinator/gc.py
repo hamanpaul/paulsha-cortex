@@ -25,7 +25,7 @@ from typing import Any, Callable, Sequence
 from paulsha_cortex.config.paths import repo_root as default_repo_root
 from paulsha_cortex.config.paths import worktree_root_for
 
-from . import job_workspace, verification
+from . import job_workspace, verification, worktree_reclaim
 
 GC_SCHEMA = "cortex-work-gc/v1"
 
@@ -384,21 +384,24 @@ def _apply_worktree(
     merged, reason = _classify_merge(repo_root, default_branch, ref, git_runner)
     if not merged:
         return _keep_apply_error(artifact, "worktree no longer verified merged")
-    # #623：per-job clone 沒有 `git worktree` registry，回收退化成單純的目錄刪除；
-    # 升級前既存的 linked worktree 仍走 `git worktree remove`（它同時要清 registry，
-    # 少了那一步就是 #478 的殘留態）。判準是工作區自己的形狀，不是部署模式旗標
-    # ——旗標會與磁碟上的實況漂移，形狀不會。
-    if job_workspace.is_job_clone(path):
-        try:
-            job_workspace.remove_clone(path)
-        except Exception as exc:  # noqa: BLE001 - 刪除失敗一律降為 keep，不誤報回收
-            return _keep_apply_error(
-                artifact, f"job workspace remove failed: {type(exc).__name__}: {str(exc)[:200]}"
-            )
-    else:
-        removal = _git(repo_root, ["worktree", "remove", str(path)], git_runner)
-        if removal["status"] != "ok":
-            return _keep_apply_error(artifact, f"git worktree remove failed: {removal['stderr']}")
+    # 再次透過共同回收閘檢查 dirty 狀態。`gc` 的前置 status 是 proposal-first
+    # 重驗，這裡仍不能直接 rmtree：多 UID 下第二次 git scan 可能因 index ACL 失敗。
+    try:
+        reclaim_options: dict[str, Any] = {"repo_root": repo_root}
+        if git_runner is not None:
+            def reclaim_runner(args: list[str]) -> object:
+                return git_runner(["-C", str(repo_root), *args])
+
+            reclaim_options["git_runner"] = reclaim_runner
+        removal = worktree_reclaim.reclaim_worktree(path, **reclaim_options)
+    except Exception as exc:  # noqa: BLE001 - 疑義一律保留
+        return _keep_apply_error(
+            artifact, f"worktree reclaim failed: {type(exc).__name__}: {str(exc)[:200]}"
+        )
+    if not removal.ok:
+        return _keep_apply_error(
+            artifact, f"worktree reclaim failed: {removal.detail or removal.status}"
+        )
     return Artifact(
         artifact.kind, artifact.identifier, ACTION_RECLAIM, reason,
         branch=artifact.branch, detail="removed",

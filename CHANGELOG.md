@@ -857,6 +857,7 @@
   job**」。票 E 的 3/3 全綠與 `job-specs/reviewer/` 是空目錄這兩件事同時為真。
   runbook 新增第 **5-6c** 步（planner／define 端到端）補上第二維，其 5 條檢查刻意
   走 daemon 自己的派工路徑而不是手工 spec。
+- **#1166 worktree dirty scan fail-closed**：`reclaim_worktree()` 對 `diff`／`ls-files` 任一步驟的權限錯誤、git 失敗或逾時都回 `failed`，並在任何目錄／registry 刪除前保留工作區 marker 供 replay；`gc --apply` 與 `remove_clone()` 也先驗 dirty 狀態，回收失敗具體回報並保留項目。
 
 ### Changed
 - **`permgen.deferred_run_dependencies()` 移除 `manager-claude-credential`**——這是

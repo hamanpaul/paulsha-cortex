@@ -157,6 +157,7 @@ JOB_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 #: `trust_root.permgen.SYSTEM_PROGRAMS`／`RUN_EXTERNAL_DEPENDENCIES` 是**成對契約**
 #: ——本模組刻意不 import `trust_root`，兩邊由測試釘住登記表真的有這一項。
 SETFACL_PROGRAM = "setfacl"
+WORKSPACE_DIRTY_SCAN_TIMEOUT_SECONDS = 30
 
 
 class WorkspaceError(ValueError):
@@ -422,7 +423,9 @@ def reclaim_candidate_paths(
 # git 執行（本模組刻意直接用 subprocess）
 # ---------------------------------------------------------------------------
 
-def _git(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _git(
+    args: list[str], *, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
     """執行 `git <args>`；不 check，由呼叫端判讀。
 
     不引入 runner seam：本模組的行為**就是** git 的行為，注入假 runner 的測試只會
@@ -431,7 +434,13 @@ def _git(args: list[str]) -> subprocess.CompletedProcess[str]:
     """
 
     try:
-        return subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+        return subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
     except FileNotFoundError as exc:  # pragma: no cover - 環境無 git
         raise WorkspaceError("git not found") from exc
 
@@ -1236,7 +1245,9 @@ def remove_clone(workspace: str | Path) -> None:
     """刪除 per-job clone 目錄，並驗證後置條件。
 
     clone 沒有 `git worktree` registry，回收因此退化成單純的目錄刪除——但後置條件
-    仍必須被**驗證**（#478 的教訓：清理失敗被吞掉，下一個 tick 才炸）。
+    仍必須被**驗證**（#478 的教訓：清理失敗被吞掉，下一個 tick 才炸）。刪除前
+    重新讀取 tracked 與 untracked 狀態；dirty 或 git status 無法完成時拒絕刪除，
+    讓 marker 與工作區保留給呼叫端診斷／replay。
     """
 
     target = Path(workspace)
@@ -1245,6 +1256,18 @@ def remove_clone(workspace: str | Path) -> None:
         return
     if not target.exists():
         return
+    try:
+        status = _git(
+            ["-C", str(target), "status", "--porcelain", "--untracked-files=all"],
+            timeout=WORKSPACE_DIRTY_SCAN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WorkspaceError("job workspace dirty scan timed out") from exc
+    if status.returncode != 0:
+        detail = (status.stderr or status.stdout or "git status failed").strip()
+        raise WorkspaceError(f"job workspace dirty scan unavailable: {detail[:300]}")
+    if status.stdout.strip():
+        raise WorkspaceError("job workspace is dirty; refusing to remove it")
     shutil.rmtree(target, ignore_errors=False)
     if target.exists() or target.is_symlink():  # pragma: no cover - rmtree 失敗會先拋
         raise WorkspaceError(f"job workspace removal incomplete: {target}")

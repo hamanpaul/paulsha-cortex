@@ -1,0 +1,1 @@
+- **#1166 worktree dirty scan fail-closed**：dirty scan 任一步驟無法讀取時，回收在刪除前回報 `failed` 並保留工作區與 marker；`gc --apply` 使用相同安全閘，`remove_clone()` 也拒絕 dirty 或掃描失敗的工作區，讓失敗項目可供診斷與 replay。
