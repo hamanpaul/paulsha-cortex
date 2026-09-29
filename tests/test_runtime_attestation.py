@@ -384,6 +384,30 @@ def test_trust_root_receipt_summary_binds_install_activation_verify_and_rollback
     assert str(receipt_path) not in json.dumps(summary)
 
 
+def test_config_reload_writer_has_no_production_caller_and_services_have_no_reload_entry() -> None:
+    """#841 AC4 的 reload 條目 owner 裁決 N/A（見 docs/loaded-runtime-attestation.md
+    「config reload」段）：文件宣稱 Manager／Monitor 沒有 hot reload 入口、
+    ``record_config_reload()`` 沒有 production 呼叫端。這裡把兩個宣稱釘在程式碼上，
+    有人接上 reload 時會在此失敗，提醒同步更新文件與 AC4 分帳。"""
+
+    package = Path(__file__).resolve().parents[1] / "paulsha_cortex"
+    callers = sorted(
+        path.relative_to(package).as_posix()
+        for path in package.rglob("*.py")
+        if path.name != "runtime_attestation.py"
+        and "record_config_reload" in path.read_text(encoding="utf-8")
+    )
+    assert callers == []
+    definition = (package / "runtime_attestation.py").read_text(encoding="utf-8")
+    assert definition.count("record_config_reload(") == 1
+    for service_module in (
+        package / "coordinator" / "manager_daemon.py",
+        package / "monitor" / "__main__.py",
+        package / "monitor" / "service.py",
+    ):
+        assert "SIGHUP" not in service_module.read_text(encoding="utf-8"), service_module
+
+
 def test_config_reload_cannot_branch_from_superseded_process_receipt(tmp_path: Path) -> None:
     from paulsha_cortex.runtime_attestation import RuntimeAttestationError
 

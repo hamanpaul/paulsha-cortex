@@ -1696,6 +1696,16 @@ def record_config_reload(
     recorded_at: str | None = None,
     config_components: Mapping[str, str] | None = None,
 ) -> Path:
+    """在同一程序的 receipt chain 追加 ``config-reload`` 事件。
+
+    **production 沒有呼叫端（#841 AC4 的 reload 條目 owner 裁決 N/A）**：Manager／
+    Monitor 都沒有 hot config reload 入口，程序設定在啟動時固定，變更只能靠重啟
+    生效（重啟寫新的 startup receipt）。此函式只保留 v1 receipt chain 的
+    ``config-reload`` 事件格式，讓 reader 的 chain 驗證（stale parent 拒絕、initial／
+    effective revision 分開）維持可測；沒有真正切換 in-memory config 的 reload owner
+    之前不得從 production 呼叫，接線時須同步更新
+    ``docs/loaded-runtime-attestation.md`` 與對應的 guard 測試。"""
+
     root_dir, directory_fd = _open_attestation_directory(state_root, create=False)
     try:
         if Path(os.path.abspath(previous_receipt.parent)) != root_dir:
