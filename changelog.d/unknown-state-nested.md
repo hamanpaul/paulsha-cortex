@@ -1,0 +1,1 @@
+- 修正 transactional installer 在巢狀受管目錄漏報事後新增 durable state；rollback 報告會列出 `retained_unknown` 並標記 `rollback-blocked`。

@@ -74,6 +74,7 @@
 
 ### Fixed
 
+- **#1161 巢狀受管目錄的 rollback unknown state**：`list_unknown_state` 只把目前 inventory 範圍內的更深層 managed directory 當作委派邊界；巢狀目錄中的事後新增 durable state 會列入 `retained_unknown`，使 rollback 正確回報 `rollback-blocked`。非巢狀 inventory 的判定維持不變。
 - **#1099 quota window snapshot refinement**：同值、同時間的 snapshot 補上先前缺失的 window epoch 時，file ledger 與 memory ledger 會追加 refinement observation；shadow 投影在同時間快照間優先採用 epoch 已知者。值不同仍是 conflict，較不完整或完全相同的重送仍是 duplicate；refinement 後的 conflict receipt 以最近接受 observation 的 payload digest 作為 `existing_sha256`；不新增 ledger event kind 或 schema version。
 
 - **installer 無法還原含無權限條目的 ACL**：`mask::---`、`user:<acct>:---` 等條目先前被組成 `setfacl -m m::` 而遭拒（`Option -m incomplete`），且逐條套用會讓 setfacl 重算並放寬明確記錄的 mask；現空權限寫成 `-`、整組 ACL 以單一 `setfacl -m` 套用，rollback 與 metadata replacement 可原樣還原（#1122，見 `changelog.d/legacy-apply.md`）。
