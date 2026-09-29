@@ -1,0 +1,1 @@
+- deployment canary 的派工結案驗證失敗時，錯誤訊息列出不成立的條件（`current_phase`、`status`、`gate_status`、facets、needs_human 原因代碼、缺少的 phase、未通過的步驟、候選／verified_head／issue 綁定）（#716，canary run 36515622925 只回報 `workflow terminal phase chain or candidate binding is invalid`、失敗時 evidence 不上傳，無從定位派工停在哪）。只輸出短的列舉型字串，needs_human 的 detail 等自由文字一律不輸出。

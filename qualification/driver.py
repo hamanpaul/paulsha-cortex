@@ -3859,6 +3859,67 @@ def _expected_worktree_isolation_prompt(
     )
 
 
+_DIAGNOSTIC_TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+
+def _diagnostic_token(value: object) -> str:
+    """只輸出短的列舉型字串；其他型別或內容一律遮成型別名（不洩漏 detail 文字）。"""
+
+    if value is None:
+        return "none"
+    if isinstance(value, str) and _DIAGNOSTIC_TOKEN.fullmatch(value):
+        return value
+    return f"<{type(value).__name__}>"
+
+
+def _closeout_diagnostic(
+    workflow: Mapping[str, object],
+    *,
+    steps: object,
+    phase_chain: list[object],
+    required_phases: tuple[str, ...],
+    candidate: object,
+    repository: str,
+    issue: int,
+) -> str:
+    """#716：closeout 失敗時列出不成立的條件，讓 canary log 可以直接定位停在哪。"""
+
+    parts = [
+        f"current_phase={_diagnostic_token(workflow.get('current_phase'))}",
+        f"status={_diagnostic_token(workflow.get('status'))}",
+        f"gate_status={_diagnostic_token(workflow.get('gate_status'))}",
+    ]
+    facets = workflow.get("facets")
+    if facets not in ([], ()):
+        tokens = [_diagnostic_token(item) for item in facets] if isinstance(facets, (list, tuple)) else [_diagnostic_token(facets)]
+        parts.append("facets=" + ",".join(tokens))
+    reason = workflow.get("needs_human_reason")
+    if isinstance(reason, Mapping):
+        parts.append(f"needs_human={_diagnostic_token(reason.get('reason'))}")
+    elif reason is not None:
+        parts.append(f"needs_human={_diagnostic_token(reason)}")
+    missing = [phase for phase in required_phases if phase not in phase_chain]
+    if missing:
+        parts.append("missing_phases=" + ",".join(missing))
+    if isinstance(steps, list):
+        failed = [
+            f"{_diagnostic_token(row.get('phase'))}:{_diagnostic_token(row.get('card'))}"
+            f"={_diagnostic_token(row.get('gate_result'))}"
+            for row in steps
+            if isinstance(row, Mapping) and row.get("gate_result") != "passed"
+        ]
+        if failed:
+            parts.append("failed_steps=" + ";".join(failed))
+    if not isinstance(candidate, str) or SHA40.fullmatch(candidate) is None:
+        parts.append("candidate=invalid")
+    elif workflow.get("verified_head") != candidate:
+        parts.append("verified_head=mismatch")
+    issue_refs = workflow.get("issue_refs")
+    if not isinstance(issue_refs, list) or f"{repository}#{issue}" not in issue_refs:
+        parts.append("issue_refs=unbound")
+    return " ".join(parts)
+
+
 def _validate_dispatch_closeout(
     *,
     repository: str,
@@ -3924,7 +3985,16 @@ def _validate_dispatch_closeout(
         or f"{repository}#{issue}" not in workflow["issue_refs"]
     ):
         raise QualificationFailure(
-            "workflow terminal phase chain or candidate binding is invalid"
+            "workflow terminal phase chain or candidate binding is invalid: "
+            + _closeout_diagnostic(
+                workflow,
+                steps=steps,
+                phase_chain=phase_chain,
+                required_phases=required_phases,
+                candidate=candidate,
+                repository=repository,
+                issue=issue,
+            )
         )
     if _terminal_named_values(terminal, "run_id") not in (
         {run_id},
