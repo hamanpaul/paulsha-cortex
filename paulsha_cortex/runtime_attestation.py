@@ -681,6 +681,26 @@ def _declared_service_artifact(
 ) -> dict[str, object]:
     if not argv:
         return _safe_artifact({})
+    # Trust Root Phase 2b units use the installed console script rather than
+    # `python -m`. Accept only the two generator-defined argv shapes and derive
+    # the interpreter from the same venv bin directory.
+    expected_console_argv = {
+        "manager": ["service", "run"],
+        "monitor": ["monitor"],
+    }.get(service)
+    if (
+        expected_console_argv is not None
+        and argv[0] == exec_path
+        and Path(argv[0]).name == "cortex"
+        and argv[1:] == expected_console_argv
+        and Path(argv[0]).is_absolute()
+    ):
+        interpreter = Path(argv[0]).with_name("python")
+        # venv 的 bin/python 本來就是指向系統 interpreter 的 symlink；這裡只用它
+        # 的路徑前綴找 site-packages（不執行它），venv 樹由 installer 以 root
+        # 擁有，因此不以 symlink 拒絕（#1160 RC run 36555744467）。
+        if interpreter.is_file():
+            return artifact_identity_from_python(interpreter)
     module = {
         "manager": "paulsha_cortex.coordinator.manager_daemon",
         "monitor": "paulsha_cortex.monitor",
@@ -837,6 +857,16 @@ def manager_declared_invocation_revision(
         and remaining[1:3] == ["-m", "paulsha_cortex.coordinator.manager_daemon"]
     ):
         declared_argv = remaining[3:]
+    elif (
+        len(remaining) == 3
+        and Path(remaining[0]).is_absolute()
+        and Path(remaining[0]).name == "cortex"
+        and remaining[1:] == ["service", "run"]
+    ):
+        # permgen Phase 2b invokes the public console script. service run
+        # forwards no daemon arguments; manager_daemon.main receives an empty
+        # argv list and records that exact invocation.
+        declared_argv = []
     elif len(remaining) >= 2 and remaining[0] == "bash":
         script = Path(remaining[1])
         if not (
@@ -1162,6 +1192,7 @@ def artifact_identity_from_package_root(
         if distribution is not None and same_root and not editable
         else "source-override"
     )
+    wheel_sha256 = _installer_wheel_marker(site)
     return _safe_artifact(
         {
             "kind": kind,
@@ -1169,8 +1200,24 @@ def artifact_identity_from_package_root(
             "package_version": version,
             "source_revision": source_revision,
             "sha256": digest,
+            "wheel_sha256": wheel_sha256,
         }
     )
+
+
+def _installer_wheel_marker(site_packages: Path) -> str | None:
+    """installer venv slot（``venvs/<wheel sha256>``）上的 wheel digest marker。"""
+
+    try:
+        slot = site_packages.resolve(strict=True).parents[2]
+        marker = slot / ".cortex-wheel.sha256"
+        if marker.is_file() and not marker.is_symlink():
+            candidate = marker.read_text(encoding="ascii").strip()
+            if _SHA256_RE.fullmatch(candidate) and slot.name == candidate:
+                return candidate
+    except (IndexError, OSError, UnicodeError):
+        pass
+    return None
 
 
 def artifact_identity_from_python(executable: str | Path | None) -> dict[str, object]:
@@ -1273,13 +1320,21 @@ def artifact_identity(
         selected_root = installed_root
 
     digest = _tree_digest(selected_root) if selected_root is not None else None
-    return {
+    identity: dict[str, object] = {
         "kind": kind if digest is not None else "unknown",
         "package": "paulsha-cortex",
         "package_version": package_version,
         "source_revision": source_revision,
         "sha256": digest,
     }
+    # 服務啟動時寫進 loaded receipt 的就是這份身分；installer venv 的 wheel
+    # marker 也要帶上，operator 端才能把 loaded wheel 綁到 install receipt 的
+    # candidate wheel（#1160 RC run：loaded_wheel=missing）。
+    if kind == "installed-wheel" and installed_root is not None:
+        wheel_sha256 = _installer_wheel_marker(installed_root.parent)
+        if wheel_sha256 is not None:
+            identity["wheel_sha256"] = wheel_sha256
+    return identity
 
 
 def _utc(value: str | None = None) -> str:
@@ -1310,7 +1365,7 @@ def _safe_artifact(identity: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
         digest = None
         kind = "unknown"
-    return {
+    result: dict[str, object] = {
         "kind": kind,
         "package": "paulsha-cortex" if package == "paulsha-cortex" else "unknown",
         "package_version": (
@@ -1326,6 +1381,13 @@ def _safe_artifact(identity: Mapping[str, object]) -> dict[str, object]:
         ),
         "sha256": digest,
     }
+    wheel_digest = identity.get("wheel_sha256")
+    candidate_commit = identity.get("candidate_commit")
+    if isinstance(wheel_digest, str) and _SHA256_RE.fullmatch(wheel_digest):
+        result["wheel_sha256"] = wheel_digest
+    if isinstance(candidate_commit, str) and re.fullmatch(r"[0-9a-f]{40}", candidate_commit):
+        result["candidate_commit"] = candidate_commit
+    return result
 
 
 def _safe_trust_root(value: Mapping[str, object] | None) -> dict[str, object]:
@@ -2012,8 +2074,16 @@ def compare_runtime_state(
             and isinstance(loaded_artifact.get("sha256"), str)
             and isinstance(installed.get("sha256"), str)
         ):
+            loaded_wheel = loaded_artifact.get("wheel_sha256")
+            installed_wheel = installed.get("wheel_sha256")
+            same_package_tree = loaded_artifact["sha256"] == installed["sha256"]
+            same_installed_wheel = (
+                loaded_wheel == installed_wheel
+                if isinstance(loaded_wheel, str) and isinstance(installed_wheel, str)
+                else True
+            )
             artifact_status = (
-                "match" if loaded_artifact["sha256"] == installed["sha256"] else "drift"
+                "match" if same_package_tree and same_installed_wheel else "drift"
             )
             if artifact_status == "drift":
                 reason = "artifact-drift"
@@ -2102,6 +2172,16 @@ def compare_runtime_state(
         ),
         "installed_artifact_sha256": (
             _safe_artifact(current_artifact or {}).get("sha256")
+            if current_artifact is not None
+            else None
+        ),
+        "loaded_wheel_sha256": (
+            latest.get("artifact", {}).get("wheel_sha256")
+            if isinstance(latest, Mapping) and isinstance(latest.get("artifact"), Mapping)
+            else None
+        ),
+        "installed_wheel_sha256": (
+            _safe_artifact(current_artifact or {}).get("wheel_sha256")
             if current_artifact is not None
             else None
         ),

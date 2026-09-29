@@ -301,8 +301,37 @@ def test_disk_artifact_or_config_drift_is_visible_without_rewriting_loaded_recei
 
     assert artifact_drift["status"] == "drift"
     assert artifact_drift["artifact_status"] == "drift"
+    wheel_bound_receipt = record_runtime_startup(
+        service="manager",
+        instance="wheel-test",
+        state_root=tmp_path / "wheel-runtime",
+        configuration={"interval": 10},
+        artifact={**_artifact("3" * 64), "wheel_sha256": "4" * 64},
+        started_at="2026-09-26T00:00:00Z",
+        pid=112,
+    )
+    wheel_state = inspect_runtime_state(
+        tmp_path / "wheel-runtime", service="manager", instance="wheel-test"
+    )
+    wheel_drift = compare_runtime_state(
+        wheel_state,
+        current_artifact={**_artifact("3" * 64), "wheel_sha256": "5" * 64},
+        declared_config_revision=configuration_revision({"interval": 10}),
+    )
+    package_tree_drift = compare_runtime_state(
+        wheel_state,
+        current_artifact={**_artifact("6" * 64), "wheel_sha256": "4" * 64},
+        declared_config_revision=configuration_revision({"interval": 10}),
+    )
+
     assert config_drift["status"] == "drift"
     assert config_drift["config_status"] == "drift"
+    assert wheel_drift["status"] == "drift"
+    assert wheel_drift["artifact_status"] == "drift"
+    assert wheel_drift["loaded_wheel_sha256"] == "4" * 64
+    assert wheel_drift["installed_wheel_sha256"] == "5" * 64
+    assert package_tree_drift["artifact_status"] == "drift"
+    assert wheel_bound_receipt.exists()
     assert original.read_bytes() == original_bytes
 
 
@@ -565,6 +594,55 @@ def test_service_declaration_projection_never_echoes_environment_values(
     overlays = service_environment_overlay(units, instance="test")
     assert overlays["manager"]["environment_source"] == "systemd-effective"
     assert overlays["manager"]["environment"] == {"PSC_MONITOR_STATE_ROOT": pinned_root}
+
+
+def test_service_declaration_recognizes_installer_console_script_execstarts(
+    tmp_path: Path,
+) -> None:
+    from paulsha_cortex.runtime_attestation import service_declaration_projection
+
+    wheel_digest = "d" * 64
+    # installer 的真實形狀：`venv` 是指向 `venvs/<wheel digest>` 的 active link，
+    # unit 的 ExecStart 走 `venv/bin/cortex`，`bin/python` 是指向系統 interpreter
+    # 的 symlink（#1160 RC run 36555744467 在這個形狀上判成 unknown）。
+    slot = tmp_path / "opt" / "cortex" / "venvs" / wheel_digest
+    package_root = _write_fake_install(slot / "lib" / "python3.12" / "site-packages", "system")
+    (slot / "bin").mkdir(parents=True, exist_ok=True)
+    (slot / "bin" / "cortex").touch()
+    (slot / "bin" / "python").symlink_to(sys.executable)
+    (slot / ".cortex-wheel.sha256").write_text(wheel_digest + "\n", encoding="ascii")
+    venv = tmp_path / "opt" / "cortex" / "venv"
+    venv.symlink_to(slot)
+    executable = venv / "bin" / "cortex"
+    manager_unit = tmp_path / "cortex-manager.service"
+    monitor_unit = tmp_path / "cortex-monitor.service"
+    manager_unit.write_text("[Service]\nExecStart=/old/cortex service run\n", encoding="utf-8")
+    monitor_unit.write_text("[Service]\nExecStart=/old/cortex monitor\n", encoding="utf-8")
+    properties = lambda path, command: {
+        "ExecStart": f"{{ path={command.split()[0]} ; argv[]={command} ; ignore_errors=no }}",
+        "Environment": "",
+        "EnvironmentFiles": "",
+        "DropInPaths": "",
+        "FragmentPath": str(path),
+        "WorkingDirectory": str(tmp_path),
+    }
+    units = {
+        "cortex-manager.service": {
+            "path": str(manager_unit), "status": "active/running", "pid": 123,
+            "exec_path": str(executable), "systemd": properties(manager_unit, f"{executable} service run"),
+        },
+        "cortex-monitor.service": {
+            "path": str(monitor_unit), "status": "active/running", "pid": 124,
+            "exec_path": str(executable), "systemd": properties(monitor_unit, f"{executable} monitor"),
+        },
+    }
+
+    projected = service_declaration_projection(units, instance="cortex")
+
+    assert projected["manager"]["artifact"]["kind"] == "installed-wheel"
+    assert projected["manager"]["artifact"]["sha256"] == artifact_identity_from_package_root(package_root)["sha256"]
+    assert projected["manager"]["artifact"]["wheel_sha256"] == wheel_digest
+    assert projected["monitor"]["artifact"]["kind"] == "installed-wheel"
 
 
 def test_service_dropins_project_pinned_manager_and_monitor_artifacts_against_receipts(
@@ -1270,6 +1348,19 @@ def test_manager_declared_invocation_revision_matches_direct_module_execstart() 
     assert declared == components["invocation_revision"]
 
 
+def test_manager_declared_invocation_revision_matches_trust_root_console_script() -> None:
+    row = {
+        "systemd": {
+            "ExecStart": (
+                "{ path=/opt/cortex/venv/bin/cortex ; "
+                "argv[]=/opt/cortex/venv/bin/cortex service run ; ignore_errors=no }"
+            ),
+        },
+    }
+
+    assert manager_declared_invocation_revision(row, {}) == configuration_revision([])
+
+
 def test_manager_declared_invocation_revision_matches_service_manager_wrapper_with_specs_dir_env() -> None:
     """形狀二：installer（``paulsha_cortex/deploy/installer.py`` 的
     ``render_units``）目前實際產生的 ExecStart——``/usr/bin/env bash
@@ -1867,3 +1958,52 @@ def test_live_process_started_epoch_reads_proc_stat(tmp_path: Path) -> None:
     assert live_process_started_epoch(4243, proc_root=proc) is None
     assert live_process_started_epoch(None, proc_root=proc) is None
     assert live_process_started_epoch(os.getpid()) is not None
+
+
+def test_in_process_identity_carries_the_installer_wheel_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """服務啟動時寫進 loaded receipt 的 in-process 身分，也要帶 installer venv slot
+    的 wheel digest（#1160 RC：loaded_wheel=missing）。"""
+
+    import importlib
+    import importlib.metadata
+    import types
+
+    from paulsha_cortex import runtime_attestation
+
+    wheel_digest = "e" * 64
+    slot = tmp_path / "venvs" / wheel_digest
+    site = slot / "lib" / "python3.12" / "site-packages"
+    package = site / "paulsha_cortex"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (slot / ".cortex-wheel.sha256").write_text(wheel_digest + "\n", encoding="ascii")
+    venv = tmp_path / "venv"
+    venv.symlink_to(slot)
+    module = types.SimpleNamespace(__file__=str(venv / "lib" / "python3.12" / "site-packages" / "paulsha_cortex" / "__init__.py"))
+
+    class Distribution:
+        version = "0.1.12"
+
+        def locate_file(self, name):
+            return site / name
+
+        def read_text(self, _name):
+            return None
+
+    real_import = importlib.import_module
+    monkeypatch.setattr(
+        runtime_attestation.importlib,
+        "import_module",
+        lambda name: module if name == "paulsha_cortex" else real_import(name),
+    )
+    monkeypatch.setattr(
+        runtime_attestation.importlib.metadata, "distribution", lambda _name: Distribution()
+    )
+
+    identity = runtime_attestation.artifact_identity()
+
+    assert identity["kind"] == "installed-wheel"
+    assert identity["wheel_sha256"] == wheel_digest
+    assert runtime_attestation._safe_artifact(identity)["wheel_sha256"] == wheel_digest

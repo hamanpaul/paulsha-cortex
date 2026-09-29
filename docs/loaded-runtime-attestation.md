@@ -20,12 +20,17 @@ Trust Root 部分只讀既有 `PSC_TRUST_ROOT_INSTALL_RECEIPT`，摘要其 recei
 
 rollback 只撤 receipt 自己建立或改動的東西：durable job registry 與 loaded receipt 不會被清除；本 receipt 建立的目錄裡若已有這類資料，目錄保留並列入 `retained_unknown`，receipt 停在 `rollback-blocked`。
 
+System scope 的 unit 不把 root-only install receipt 暴露給 Manager／Monitor。`cortex service status --system` 讀取 system manager 的有效 unit 屬性與兩個 state root 下的 loaded receipt；要得到 Trust Root 判定，操作者必須以可讀取 `/var/lib/cortex-install-receipts/` 的身分執行（一般部署使用 `sudo`）。CLI 只載入可由 `InstallReceipt.load()` 驗證、且 plan 的 state root 與目前 Manager root 相符的 receipt；verified 結果還必須以 receipt 的 wheel hash 對上目前 system unit 選取的 installed wheel。服務帳號仍不需要 receipt 權限，也不要求在 activation/verify 前啟動的服務重啟。
+
 ## 查詢與判讀
 
 ```bash
 cortex service status --instance cortex --json
+cortex service status --system --instance cortex --json
 cortex doctor --instance cortex --json
 ```
+
+預設 `service status` 與 doctor 維持 user scope。`--system` 改查 `systemctl show` 的 system units，取得有效 `FragmentPath`、`DropInPaths`、`EnvironmentFiles`、`ExecStart` 與 `MainPID`；辨識 permgen 產生的 `<venv>/bin/cortex service run` 與 `<venv>/bin/cortex monitor`，並依對應 venv 的 `.cortex-wheel.sha256` 記錄 installed wheel 身分。unit 宣告不完整、receipt 不可讀或無法驗證時，狀態維持 unknown。
 
 `loaded_runtime` 把三種觀測分開：
 
@@ -44,6 +49,10 @@ manager／monitor 各自獨立判定 `environment_source`，不互相牽連：�
 - `manager`／`monitor`：各 service 啟動 receipt、由 service declaration 定位的安裝 artifact、effective config 比對、目前 unit PID 比對，以及前次 process start 與 Trust Root receipt 摘要。
 
 已知 unit 目前的 MainPID 時，`loaded` 取「屬於該 PID 的最新 startup receipt」；沒有任何 receipt 屬於它才退回牆鐘最新者（此時 process 比對必然不符）。這讓 NTP step 或 VM 時間同步造成的牆鐘回跳不會把已結束程序的舊 receipt 當成目前載入的身分。`match` 要求 receipt 存在、目前 unit PID 與 receipt 相同，且 service 宣告 artifact/config 可比較。套件或 Monitor 有效配置與 receipt 不同時為 `drift`。Manager invocation 參數不能由目前 service declaration 確認時，該配置維持 unknown。checkout source override、缺漏／損壞 receipt、未知 schema、instance-root mismatch、缺少目前 PID 或未知 revision 都不會升成 match。status 命令本身只是唯讀 consumer，不會用磁碟 `VERSION` 重寫 loaded identity。
+
+Installed wheel 的 package tree digest 保留在 `sha256`；有 installer wheel marker 時另輸出 `wheel_sha256`，並以已驗證 install receipt 的 `repo_identity.commit` 輸出 `candidate_commit`。wheel 安裝的 Python distribution 通常沒有 VCS `direct_url.json`，所以 `source_revision` 仍為 `unknown`；candidate commit 是 installer/bundle 聲明的來源 revision，與 wheel hash 一起綁定，不會偽稱成 distribution 自己提供的 `source_revision`。receipt 為 rolled back 時 status 保留 `rolled-back` 及 rollback revision，不把被回滾候選 commit 冒充目前載入來源。
+
+`match` 要求 receipt 存在、目前 unit PID 與 receipt 相同，且 service 宣告 artifact/config 可比較。套件或 Monitor 有效配置與 receipt 不同時為 `drift`。Manager invocation 參數不能由目前 service declaration 確認時，該配置維持 unknown。checkout source override、缺漏／損壞 receipt、未知 schema、instance-root mismatch、缺少目前 PID 或未知 revision 都不會升成 match。status 命令本身只是唯讀 consumer，不會用磁碟 `VERSION` 重寫 loaded identity。
 
 `transition_safe` 固定為 `false`。只有已知 in-flight 數量會呈現具體 disposition：非零為 `blocked-in-flight`，零為 `clear-not-authorized`；未知數量為 `unknown-in-flight-state`。這些診斷不放寬 installer 的 process／durable job preflight，也不清理 job。
 
@@ -65,6 +74,12 @@ owner 於 2026-09-29 裁決：AC4「reload 明確區分初始／有效 config」
 - `tests/test_loaded_runtime_rollback_receipt_841.py`：走正式 `apply`→`activate`→`verify`→`rollback` 產生的真 install receipt，loaded receipt 串接 prior（`verified`）與 rollback 後（`rolled-back`／`install-rollback-blocked`）兩次啟動；durable `jobs.json` 與 installer 讀到的 in-flight 事實在 rollback 前後不變，比對只標 `blocked-in-flight`。
 
 **限制：`cortex service status`／`cortex doctor` 目前只探測 user 級 unit**（`systemctl --user`、`$HOME/.config/systemd/user`）。Trust Root 的 system 部署（`/etc/systemd/system/cortex-*.service`、`ExecStart=<venv>/bin/cortex service run`／`cortex monitor`、state 在 root／服務帳號擁有的樹）不在探測範圍，也不認得 console script 形式的 ExecStart，loaded↔installed 比對在該部署維持 unknown；system 部署的 installed／live 證據需要另外補上 system scope 探測後才能由這兩個命令產生。operator 需在有權控管的 live target 上依序：
+
+```bash
+sudo /opt/cortex/venv/bin/cortex service status --system --instance cortex --json
+```
+
+在 9900X transactional system install 完成 activation 與 verify 後，成功判準是 JSON 的 `service.loaded_runtime.manager` 與 `.monitor` 均有 `comparison.artifact_status`、`config_status`、`process_status` = `match`，`trust_root.status` = `verified`，並且各自 loaded PID 等於 systemd MainPID。輸出的 wheel hash 須等於 install receipt 的 candidate wheel hash；`candidate_commit` 須等於 receipt/bundle 的 repo commit。配置或 wheel 已變更但程序未 restart 時，對應 config/artifact 應回報 `drift`；rollback 後應回報 `trust_root.status=rolled-back`、rollback revision，且 loaded wheel 只與實際回復的 candidate 對齊。每次狀態擷取保存原始 JSON 作比較證據。
 
 1. 比對 Manager／Monitor 的實際 MainPID 與 `loaded_runtime.*.loaded.pid`、process start time、artifact digest、config revision，以及 `service_declaration`。
 2. 先用既有 Trust Root process 與 durable-job in-flight facts 確認可否進入維護；非零不得更新或回滾，unknown 也不得當作零。

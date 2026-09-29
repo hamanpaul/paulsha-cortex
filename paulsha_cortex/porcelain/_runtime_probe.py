@@ -35,10 +35,14 @@ def _installed_version() -> str:
         return "0.0.0+unknown"
 
 
-def _systemctl_unit_rows(unit_names: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+def _systemctl_unit_rows(
+    unit_names: tuple[str, ...], *, scope: str = "user"
+) -> dict[str, dict[str, Any]]:
     if shutil.which("systemctl") is None:
         return {}
-    arguments = ["systemctl", "--user", "show"]
+    if scope not in {"user", "system"}:
+        raise ValueError("systemd scope must be user or system")
+    arguments = ["systemctl", *(["--user"] if scope == "user" else []), "show"]
     for property_name in _SHOW_PROPERTIES:
         arguments.extend(("-p", property_name))
     arguments.extend(unit_names)
@@ -161,7 +165,7 @@ def _unit_pid(unit_name: str, live_rows: Mapping[str, Mapping[str, Any]]) -> int
 
 
 def _probe_units_raw(
-    instance: str, *, home: Path | None = None
+    instance: str, *, home: Path | None = None, scope: str = "user"
 ) -> dict[str, dict[str, Any]]:
     """探測每個 unit 目前狀態，含 systemd 有效屬性原始內容（未做安全過濾）。
 
@@ -170,13 +174,19 @@ def _probe_units_raw(
     顯示的呼叫端，都必須在使用前明確 ``pop`` 掉這個鍵（見
     ``probe_service_runtime`` 的說明）。"""
     home = (home or Path(os.environ.get("HOME", str(Path.home())))).expanduser()
-    unit_root = home / ".config" / "systemd" / "user"
+    if scope not in {"user", "system"}:
+        raise ValueError("systemd scope must be user or system")
+    unit_root = (
+        home / ".config" / "systemd" / "user"
+        if scope == "user"
+        else Path("/etc/systemd/system")
+    )
     unit_names = (
         f"{instance}-manager.service",
-        f"{instance}-manager.timer",
+        *((f"{instance}-manager.timer",) if scope == "user" else ()),
         f"{instance}-monitor.service",
     )
-    live_rows = _systemctl_unit_rows(unit_names)
+    live_rows = _systemctl_unit_rows(unit_names, scope=scope)
     units: dict[str, dict[str, Any]] = {}
     for unit_name in unit_names:
         unit_path = unit_root / unit_name
@@ -206,7 +216,7 @@ def _probe_units_raw(
             else None
         )
         if isinstance(fragment_path, str) and fragment_path.startswith("/"):
-            if Path(fragment_path) != unit_path:
+            if scope == "user" and Path(fragment_path) != unit_path:
                 # systemd 回報的有效宣告其實指向另一個檔案位置——例如這個
                 # instance 名稱剛好撞到使用者 systemd session 底下另一個真正
                 # 在跑的 unit（不是這次要探查的 home 底下管理的那個）。這種宣告
@@ -246,7 +256,7 @@ def _probe_units_raw(
 
 
 def probe_service_runtime(
-    instance: str, *, home: Path | None = None
+    instance: str, *, home: Path | None = None, scope: str = "user"
 ) -> dict[str, Any]:
     """探測 manager／monitor 目前狀態，回傳可安全交給 JSON 輸出或 CLI 顯示的
     投影。
@@ -258,7 +268,7 @@ def probe_service_runtime(
     ``dict(probe)``）轉成 JSON／CLI 輸出的呼叫端，都必須先明確
     ``pop("_environment_overlay", None)`` 再輸出；只需要安全欄位的呼叫端可以
     直接忽略它。"""
-    units = _probe_units_raw(instance, home=home)
+    units = _probe_units_raw(instance, home=home, scope=scope)
     from ..runtime_attestation import service_declaration_projection, service_environment_overlay
 
     service_declaration = service_declaration_projection(units, instance=instance)
@@ -266,7 +276,8 @@ def probe_service_runtime(
     for row in units.values():
         row.pop("systemd", None)
         row.pop("_systemd_unavailable", None)
-    mode = "systemd" if any(unit["present"] for unit in units.values()) else "unmanaged"
+    has_units = any(unit["present"] for unit in units.values())
+    mode = ("systemd" if scope == "user" else "systemd-system") if has_units else "unmanaged"
     return {
         "instance": instance,
         "mode": mode,

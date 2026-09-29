@@ -345,7 +345,12 @@ def _service_rows() -> list[dict[str, object]]:
 
 
 def _installed_checks(
-    *, install_evidence: Path, receipt: Mapping[str, Any], evidence_dir: Path
+    *,
+    install_evidence: Path,
+    receipt: Mapping[str, Any],
+    evidence_dir: Path,
+    require_system_status: bool = True,
+    receipt_path: Path | None = None,
 ) -> list[dict[str, str]]:
     install = _load_json(install_evidence, "install verification evidence")
     if (
@@ -389,12 +394,143 @@ def _installed_checks(
             "receipt_id": receipt.get("receipt_id"),
         },
     )
+    if require_system_status:
+        # 服務在 activate 時才啟動，loaded receipt 可能晚幾秒才寫入：輪詢到三項
+        # 全部 match 或逾時，逾時時列出各項狀態（只輸出列舉 token）。
+        deadline = time.monotonic() + SYSTEM_STATUS_SETTLE_SECONDS
+        while True:
+            system_status = _run(
+                (
+                    "/opt/cortex/venv/bin/cortex",
+                    "service",
+                    "status",
+                    "--system",
+                    "--json",
+                    *(
+                        ("--install-receipt", str(receipt_path))
+                        if receipt_path is not None
+                        else ()
+                    ),
+                ),
+                env=_installed_runtime_env(),
+            )
+            _require_success(system_status, "system-scope loaded runtime status")
+            try:
+                status_payload = json.loads(system_status.stdout)
+            except json.JSONDecodeError as exc:
+                raise QualificationFailure("system-scope status returned invalid JSON") from exc
+            service = status_payload.get("service") if isinstance(status_payload, Mapping) else None
+            loaded_runtime = service.get("loaded_runtime") if isinstance(service, Mapping) else None
+            if not isinstance(loaded_runtime, Mapping):
+                raise QualificationFailure("system-scope status omitted loaded runtime evidence")
+            mismatched = [
+                name
+                for name in ("manager", "monitor")
+                if _system_status_mismatch(loaded_runtime.get(name))
+            ]
+            if not mismatched or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+        for name in ("manager", "monitor"):
+            report = loaded_runtime.get(name)
+            comparison = report.get("comparison") if isinstance(report, Mapping) else None
+            detail = _system_status_mismatch(report)
+            if detail:
+                raise QualificationFailure(
+                    f"system-scope {name} loaded artifact/config/process did not match: "
+                    + detail
+                )
+            trust_root = report.get("trust_root")
+            if not isinstance(trust_root, Mapping) or trust_root.get("status") != "verified":
+                raise QualificationFailure(
+                    f"system-scope {name} Trust Root receipt is not verified: "
+                    + (
+                        f"status={_diagnostic_token(trust_root.get('status'))} "
+                        f"reason={_diagnostic_token(trust_root.get('reason'))}"
+                        if isinstance(trust_root, Mapping)
+                        else "trust_root=missing"
+                    )
+                )
+            installed_artifact = report.get("installed_artifact")
+            wheel_sha256 = trust_root.get("wheel_sha256")
+            candidate_commit = trust_root.get("candidate_commit")
+            if (
+                not isinstance(installed_artifact, Mapping)
+                or not isinstance(wheel_sha256, str)
+                or installed_artifact.get("wheel_sha256") != wheel_sha256
+                or comparison.get("loaded_wheel_sha256") != wheel_sha256
+                or not isinstance(candidate_commit, str)
+                or SHA40.fullmatch(candidate_commit) is None
+            ):
+                def _wheel_state(value: object) -> str:
+                    if not isinstance(value, str):
+                        return "missing"
+                    return "match" if value == wheel_sha256 else "mismatch"
+
+                raise QualificationFailure(
+                    f"system-scope {name} wheel/commit receipt binding is incomplete: "
+                    f"receipt_wheel={'present' if isinstance(wheel_sha256, str) else 'missing'} "
+                    "installed_wheel="
+                    + _wheel_state(
+                        installed_artifact.get("wheel_sha256")
+                        if isinstance(installed_artifact, Mapping)
+                        else None
+                    )
+                    + f" loaded_wheel={_wheel_state(comparison.get('loaded_wheel_sha256'))}"
+                    + " candidate_commit="
+                    + (
+                        "valid"
+                        if isinstance(candidate_commit, str)
+                        and SHA40.fullmatch(candidate_commit) is not None
+                        else "invalid"
+                    )
+                )
+        _write_json(evidence_dir / "system-loaded-runtime-status.json", status_payload)
     return [
         {"name": "selfcheck", "status": "passed"},
         {"name": "registry-equation", "status": "passed"},
         {"name": "generated-installed-attestation", "status": "passed"},
         {"name": "service-identity-hardening", "status": "passed"},
+        *(
+            [{"name": "system-loaded-runtime-attestation", "status": "passed"}]
+            if require_system_status
+            else []
+        ),
     ]
+
+
+#: activate 後等待 system-scope loaded receipt 寫入並與宣告一致的上限。
+SYSTEM_STATUS_SETTLE_SECONDS = 60
+
+
+def _system_status_mismatch(report: object) -> str:
+    """空字串表示三項皆 match；否則回傳各項狀態與 reason（列舉 token）。"""
+
+    comparison = report.get("comparison") if isinstance(report, Mapping) else None
+    if not isinstance(comparison, Mapping):
+        return "comparison=missing"
+    statuses = {
+        key: comparison.get(key)
+        for key in ("artifact_status", "config_status", "process_status")
+    }
+    if all(value == "match" for value in statuses.values()):
+        return ""
+    parts = [f"{key}={_diagnostic_token(value)}" for key, value in statuses.items()]
+    parts.append(f"status={_diagnostic_token(report.get('status'))}")
+    parts.append(f"reason={_diagnostic_token(report.get('reason'))}")
+    loaded = report.get("loaded")
+    if isinstance(loaded, Mapping):
+        artifact = loaded.get("artifact")
+        parts.append(
+            "loaded_artifact_kind="
+            + _diagnostic_token(artifact.get("kind") if isinstance(artifact, Mapping) else None)
+        )
+    installed = report.get("installed_artifact")
+    parts.append(
+        "installed_artifact_kind="
+        + _diagnostic_token(installed.get("kind") if isinstance(installed, Mapping) else None)
+    )
+    return " ".join(parts)
 
 
 def _denied(
@@ -4985,6 +5121,8 @@ def main() -> int:
             install_evidence=args.install_evidence,
             receipt=receipt,
             evidence_dir=args.evidence_dir,
+            require_system_status=not legacy_profile,
+            receipt_path=args.receipt,
         )
         providers: list[dict[str, object]] = []
         if legacy_profile:

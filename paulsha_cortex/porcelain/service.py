@@ -26,6 +26,7 @@ from paulsha_cortex.runtime_attestation import (
     runtime_status_report,
     service_declaration_projection,
     service_environment_overlay,
+    trust_root_receipt_summary,
     unknown_runtime_report,
 )
 
@@ -69,6 +70,16 @@ def _build_parser() -> argparse.ArgumentParser:
         cmd = sub.add_parser(command_name, help=help_text)
         cmd.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
         cmd.add_argument("--json", action="store_true", help="輸出 cortex-porcelain/service/v1 JSON")
+        if command_name == "status":
+            cmd.add_argument(
+                "--system", action="store_true",
+                help="讀取 system scope units 與 Trust Root install receipt",
+            )
+            cmd.add_argument(
+                "--install-receipt",
+                help="（搭配 --system）明確指定 effective install receipt；"
+                "未指定時搜尋 canonical receipt 目錄",
+            )
 
     ensure = sub.add_parser("ensure-running", help="確保 manager／monitor 正在執行（輸出 JSON）")
     ensure.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
@@ -491,13 +502,141 @@ def _loaded_runtime_payload(
     }
 
 
-def _status_payload(instance: str) -> dict[str, Any]:
-    probe = probe_service_runtime(instance)
+def _apply_operator_install_evidence(
+    loaded_runtime: dict[str, Any],
+    *,
+    environment_overlay: Any,
+    instance: str,
+    receipt_path: Path | None = None,
+) -> None:
+    """Resolve the root-owned Trust Root receipt from the operator side.
+
+    System service accounts cannot read install receipts. `service status --system`
+    is therefore intended to run as an operator with receipt access (normally via
+    sudo), and binds a validated receipt to the active loaded wheel digest.
+    """
+    try:
+        manager_environment, source = _service_declared_environment(
+            instance,
+            environment_overlay.get("manager")
+            if isinstance(environment_overlay, Mapping)
+            else None,
+        )
+        if source == "unknown":
+            raise ValueError("system manager environment is unknown")
+        manager_root = resolve_runtime_root(
+            "PSC_COORDINATOR_ROOT", environment=manager_environment
+        )
+        state_root = manager_root.parent
+        receipt_dir = state_root.parent / f"{state_root.name}-install-receipts"
+        installed = loaded_runtime.get("manager", {}).get("installed_artifact", {})
+        # The install receipt attests the wheel currently selected by the
+        # on-disk service declaration. The loaded process may intentionally
+        # still be on the previous wheel, so its digest is never a stand-in:
+        # without the installed wheel the receipt cannot be bound (#1160 review).
+        expected_wheel = (
+            installed.get("wheel_sha256") if isinstance(installed, Mapping) else None
+        )
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        receipt_paths: list[Path] = []
+        if receipt_path is not None:
+            # installer 允許 effective receipt 放在 canonical 目錄以外（例如 RC
+            # 的 /run/cortex-install）；operator 明確指定時只看這一份。
+            if not receipt_path.is_absolute():
+                raise ValueError("install receipt path must be absolute")
+            receipt_paths = [receipt_path]
+        elif receipt_dir.is_dir() and not receipt_dir.is_symlink():
+            receipt_paths = sorted(receipt_dir.glob("*.json"))
+            if len(receipt_paths) > 256:
+                raise ValueError("install receipt directory exceeds scan limit")
+        if receipt_paths:
+            from paulsha_cortex.trust_root.install.core import InstallReceipt
+
+            for path in receipt_paths:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                try:
+                    receipt = InstallReceipt.load(path)
+                    document = receipt.to_dict()
+                    plan = document.get("plan")
+                    roots = plan.get("roots") if isinstance(plan, Mapping) else None
+                    candidate = plan.get("candidate") if isinstance(plan, Mapping) else None
+                    if not isinstance(roots, Mapping) or roots.get("state") != str(state_root):
+                        continue
+                    if not isinstance(candidate, Mapping):
+                        continue
+                    wheel_sha256 = candidate.get("wheel_sha256")
+                    identity = plan.get("repo_identity")
+                    commit = identity.get("commit") if isinstance(identity, Mapping) else None
+                    summary = trust_root_receipt_summary(path)
+                    summary["wheel_sha256"] = wheel_sha256
+                    if isinstance(commit, str):
+                        summary["candidate_commit"] = commit.lower()
+                    candidates.append((path.stat().st_mtime_ns, summary))
+                except Exception:  # noqa: BLE001 — skip invalid unrelated receipt
+                    continue
+        evidence = (
+            max(candidates, key=lambda row: row[0])[1]
+            if candidates
+            else {"status": "unknown", "reason": "install-receipt-unavailable"}
+        )
+        if evidence.get("status") == "verified" and not isinstance(expected_wheel, str):
+            evidence = {
+                "status": "unknown",
+                "reason": "installed-wheel-unresolved",
+            }
+        elif (
+            evidence.get("status") == "verified"
+            and evidence.get("wheel_sha256") != expected_wheel
+        ):
+            evidence = {
+                **evidence,
+                "status": "drift",
+                "reason": "installed-wheel-receipt-mismatch",
+            }
+    except Exception:  # noqa: BLE001 — operator receipt lookup is fail closed
+        evidence = {"status": "unknown", "reason": "install-receipt-unavailable"}
+
+    loaded_runtime["trust_root"] = evidence
+    for service in ("manager", "monitor"):
+        report = loaded_runtime.get(service)
+        if not isinstance(report, dict):
+            continue
+        report["trust_root"] = evidence
+        artifact = report.get("installed_artifact")
+        if isinstance(artifact, dict) and evidence.get("status") == "verified":
+            if isinstance(evidence.get("wheel_sha256"), str):
+                artifact["wheel_sha256"] = evidence["wheel_sha256"]
+            if isinstance(evidence.get("candidate_commit"), str):
+                artifact["candidate_commit"] = evidence["candidate_commit"]
+            artifact["source_revision"] = "unknown"
+
+
+def _status_payload(
+    instance: str,
+    *,
+    system_scope: bool = False,
+    install_receipt: str | None = None,
+) -> dict[str, Any]:
+    probe = (
+        probe_service_runtime(instance, scope="system")
+        if system_scope
+        else probe_service_runtime(instance)
+    )
     # #841 對抗審查第四輪：真實環境值只透過這個 pop 取出，之後任何分支對
     # ``probe`` 做 ``dict(probe)``／整包回傳都不會再帶著它，避免誤落進 JSON
     # 輸出；再以獨立參數傳給 ``_loaded_runtime_payload`` 供內部重建 root 用。
     environment_overlay = probe.pop("_environment_overlay", None)
-    if probe["mode"] == "systemd":
+    if system_scope and isinstance(environment_overlay, dict):
+        # System mode has no trustworthy direct/file fallback. Missing effective
+        # properties must remain unknown rather than consulting the operator env.
+        for row in environment_overlay.values():
+            if (
+                isinstance(row, dict)
+                and row.get("environment_source") != "systemd-effective"
+            ):
+                row["environment_source"] = "unknown"
+    if str(probe["mode"]).startswith("systemd"):
         units = probe.get("units", {})
         manager_service = f"{instance}-manager.service"
         monitor_service = f"{instance}-monitor.service"
@@ -533,7 +672,34 @@ def _status_payload(instance: str) -> dict[str, Any]:
             service_declaration=probe.get("service_declaration"),
             environment_overlay=environment_overlay,
         )
+        if system_scope:
+            payload["scope"] = "system"
+            _apply_operator_install_evidence(
+                payload["loaded_runtime"],
+                environment_overlay=environment_overlay,
+                instance=instance,
+                receipt_path=Path(install_receipt) if install_receipt else None,
+            )
         return payload
+    if system_scope:
+        current = artifact_identity()
+        return {
+            "instance": instance,
+            "mode": "none",
+            "scope": "system",
+            "version": probe.get("version", "0.0.0+unknown"),
+            "units": probe.get("units", {}),
+            "loaded_runtime": {
+                "operator_cli": cli_runtime_observation(
+                    instance=instance, environment=os.environ, artifact=current
+                ),
+                "service_declaration": probe.get("service_declaration"),
+                "manager": unknown_runtime_report("system-units-unavailable", current),
+                "monitor": unknown_runtime_report("system-units-unavailable", current),
+                "trust_root": {"status": "unknown", "reason": "system-units-unavailable"},
+            },
+            "suggested_commands": [],
+        }
     fallback = _fallback_runtime(instance, str(probe.get("version", "0.0.0+unknown")), probe.get("units", {}))
     if fallback is not None:
         units = fallback.get("units", {})
@@ -957,8 +1123,16 @@ def _run_lifecycle(command: str, *, instance: str, json_output: bool) -> int:
     return 0
 
 
-def _run_status(*, instance: str, json_output: bool) -> int:
-    service = _status_payload(instance)
+def _run_status(
+    *,
+    instance: str,
+    json_output: bool,
+    system_scope: bool = False,
+    install_receipt: str | None = None,
+) -> int:
+    service = _status_payload(
+        instance, system_scope=system_scope, install_receipt=install_receipt
+    )
     if json_output:
         _json_dump(_service_envelope("status", instance, mode=str(service.get("mode")), service=service))
         return 0
@@ -1171,7 +1345,12 @@ def main(argv: Sequence[str]) -> int:
         if args.command in {"start", "stop", "restart"}:
             return _run_lifecycle(args.command, instance=instance, json_output=args.json)
         if args.command == "status":
-            return _run_status(instance=instance, json_output=args.json)
+            return _run_status(
+                instance=instance,
+                json_output=args.json,
+                system_scope=args.system,
+                install_receipt=getattr(args, "install_receipt", None),
+            )
         if args.command == "logs":
             return _run_logs(
                 instance=instance,

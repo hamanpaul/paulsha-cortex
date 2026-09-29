@@ -590,6 +590,258 @@ def test_loaded_runtime_uses_systemd_effective_environment_over_stale_fallback_f
     assert manager_calls[0]["PSC_COORDINATOR_ROOT"] == str(pinned_root)
 
 
+def test_system_scope_probe_uses_systemctl_without_user_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = importlib.import_module("paulsha_cortex.porcelain._runtime_probe")
+    calls: list[list[str]] = []
+
+    def run(argv, **_kwargs):
+        calls.append(list(argv))
+        stdout = "\n\n".join(
+            f"Id={name}\nLoadState=loaded\nActiveState=active\nSubState=running\n"
+            f"MainPID=44\nExecStart={{ path=/opt/cortex/venv/bin/cortex ; argv[]=/opt/cortex/venv/bin/cortex {verb} ; ignore_errors=no }}\n"
+            "Environment=\nEnvironmentFiles=/opt/cortex/etc/cortex-manager.env (ignore_errors=no)\n"
+            f"DropInPaths=\nFragmentPath=/etc/systemd/system/{name}\nWorkingDirectory=/var/lib/cortex"
+            for name, verb in (
+                ("cortex-manager.service", "service run"),
+                ("cortex-monitor.service", "monitor"),
+            )
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    monkeypatch.setattr(probe.shutil, "which", lambda _name: "/usr/bin/systemctl")
+    monkeypatch.setattr(probe.subprocess, "run", run)
+
+    rows = probe._systemctl_unit_rows(
+        ("cortex-manager.service", "cortex-monitor.service"), scope="system"
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0:2] == ["systemctl", "show"]
+    assert "--user" not in calls[0]
+    assert rows["cortex-manager.service"]["MainPID"] == "44"
+
+
+def test_system_status_binds_operator_install_receipt_to_selected_wheel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from paulsha_cortex.porcelain import service
+    from paulsha_cortex.trust_root.install import core
+
+    state_root = tmp_path / "cortex"
+    receipt_dir = tmp_path / "cortex-install-receipts"
+    receipt_dir.mkdir()
+    receipt_path = receipt_dir / f"{'a' * 64}.json"
+    receipt_path.write_text("root controlled receipt", encoding="utf-8")
+    wheel_sha = "b" * 64
+    candidate_commit = "c" * 40
+
+    class Receipt:
+        def to_dict(self):
+            return {
+                "plan": {
+                    "roots": {"state": str(state_root)},
+                    "candidate": {"wheel_sha256": wheel_sha},
+                    "repo_identity": {"commit": candidate_commit},
+                }
+            }
+
+    monkeypatch.setattr(core.InstallReceipt, "load", lambda _path: Receipt())
+    monkeypatch.setattr(service, "resolve_runtime_root", lambda *_args, **_kwargs: state_root / "coordinator")
+    monkeypatch.setattr(service, "_service_declared_environment", lambda *_args: ({}, "systemd-effective"))
+    monkeypatch.setattr(
+        service,
+        "trust_root_receipt_summary",
+        lambda _path: {"status": "verified", "receipt_id": "receipt"},
+    )
+    loaded_runtime = {
+        "manager": {
+            "loaded": {"artifact": {"wheel_sha256": wheel_sha}},
+            "installed_artifact": {"wheel_sha256": wheel_sha, "source_revision": "unknown"},
+        },
+        "monitor": {"installed_artifact": {}},
+    }
+
+    service._apply_operator_install_evidence(
+        loaded_runtime,
+        environment_overlay={"manager": {}},
+        instance="cortex",
+    )
+
+    assert loaded_runtime["trust_root"]["status"] == "verified"
+    assert loaded_runtime["trust_root"]["wheel_sha256"] == wheel_sha
+    assert loaded_runtime["trust_root"]["candidate_commit"] == candidate_commit
+    assert loaded_runtime["manager"]["installed_artifact"]["candidate_commit"] == candidate_commit
+    assert loaded_runtime["manager"]["installed_artifact"]["source_revision"] == "unknown"
+
+
+def test_system_status_never_verifies_trust_root_without_the_installed_wheel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1160 審查：ExecStart 解析不出 installed wheel 時，不得改用 loaded 程序的
+    wheel 去比對 receipt——磁碟上實際選用的 wheel 可能已不同，只能回 unknown。"""
+    from paulsha_cortex.porcelain import service
+    from paulsha_cortex.trust_root.install import core
+
+    state_root = tmp_path / "cortex"
+    receipt_dir = tmp_path / "cortex-install-receipts"
+    receipt_dir.mkdir()
+    (receipt_dir / f"{'a' * 64}.json").write_text("root controlled receipt", encoding="utf-8")
+    wheel_sha = "b" * 64
+
+    class Receipt:
+        def to_dict(self):
+            return {
+                "plan": {
+                    "roots": {"state": str(state_root)},
+                    "candidate": {"wheel_sha256": wheel_sha},
+                    "repo_identity": {"commit": "c" * 40},
+                }
+            }
+
+    monkeypatch.setattr(core.InstallReceipt, "load", lambda _path: Receipt())
+    monkeypatch.setattr(service, "resolve_runtime_root", lambda *_args, **_kwargs: state_root / "coordinator")
+    monkeypatch.setattr(service, "_service_declared_environment", lambda *_args: ({}, "systemd-effective"))
+    monkeypatch.setattr(
+        service,
+        "trust_root_receipt_summary",
+        lambda _path: {"status": "verified", "receipt_id": "receipt"},
+    )
+    loaded_runtime = {
+        "manager": {
+            "loaded": {"artifact": {"wheel_sha256": wheel_sha}},
+            "installed_artifact": {"kind": "unknown"},
+        },
+        "monitor": {"installed_artifact": {}},
+    }
+
+    service._apply_operator_install_evidence(
+        loaded_runtime,
+        environment_overlay={"manager": {}},
+        instance="cortex",
+    )
+
+    assert loaded_runtime["trust_root"]["status"] == "unknown"
+    assert loaded_runtime["trust_root"]["reason"] == "installed-wheel-unresolved"
+    assert "candidate_commit" not in loaded_runtime["manager"]["installed_artifact"]
+
+
+def test_system_status_uses_an_explicit_effective_receipt_outside_the_canonical_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """installer 允許 effective receipt 放在 canonical 目錄以外（RC 放在
+    /run/cortex-install）；`--install-receipt` 明確指定時只採用這一份。"""
+    from paulsha_cortex.porcelain import service
+    from paulsha_cortex.trust_root.install import core
+
+    state_root = tmp_path / "cortex"
+    elsewhere = tmp_path / "run" / "install-receipt.json"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text("root controlled receipt", encoding="utf-8")
+    wheel_sha = "b" * 64
+    loaded_paths: list[Path] = []
+
+    class Receipt:
+        def to_dict(self):
+            return {
+                "plan": {
+                    "roots": {"state": str(state_root)},
+                    "candidate": {"wheel_sha256": wheel_sha},
+                    "repo_identity": {"commit": "c" * 40},
+                }
+            }
+
+    def load(path):
+        loaded_paths.append(path)
+        return Receipt()
+
+    monkeypatch.setattr(core.InstallReceipt, "load", load)
+    monkeypatch.setattr(service, "resolve_runtime_root", lambda *_args, **_kwargs: state_root / "coordinator")
+    monkeypatch.setattr(service, "_service_declared_environment", lambda *_args: ({}, "systemd-effective"))
+    monkeypatch.setattr(service, "trust_root_receipt_summary", lambda _path: {"status": "verified"})
+    loaded_runtime = {
+        "manager": {"installed_artifact": {"wheel_sha256": wheel_sha}},
+        "monitor": {"installed_artifact": {"wheel_sha256": wheel_sha}},
+    }
+
+    service._apply_operator_install_evidence(
+        loaded_runtime,
+        environment_overlay={"manager": {}},
+        instance="cortex",
+        receipt_path=elsewhere,
+    )
+
+    assert loaded_paths == [elsewhere]
+    assert loaded_runtime["trust_root"]["status"] == "verified"
+
+
+def test_system_status_reports_latest_rollback_receipt_over_prior_verified_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from paulsha_cortex.porcelain import service
+    from paulsha_cortex.trust_root.install import core
+
+    state_root = tmp_path / "cortex"
+    receipt_dir = tmp_path / "cortex-install-receipts"
+    receipt_dir.mkdir()
+    prior_path = receipt_dir / "prior.json"
+    rollback_path = receipt_dir / "rollback.json"
+    prior_path.write_text("prior", encoding="utf-8")
+    rollback_path.write_text("rollback", encoding="utf-8")
+    os.utime(prior_path, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(rollback_path, ns=(2_000_000_000, 2_000_000_000))
+    wheel_sha = "b" * 64
+
+    class Receipt:
+        def __init__(self, path: Path):
+            self.path = path
+
+        def to_dict(self):
+            return {
+                "plan": {
+                    "roots": {"state": str(state_root)},
+                    "candidate": {
+                        "wheel_sha256": wheel_sha if self.path == prior_path else "d" * 64
+                    },
+                    "repo_identity": {"commit": "c" * 40 if self.path == prior_path else "e" * 40},
+                }
+            }
+
+    monkeypatch.setattr(core.InstallReceipt, "load", lambda path: Receipt(path))
+    monkeypatch.setattr(service, "resolve_runtime_root", lambda *_args, **_kwargs: state_root / "coordinator")
+    monkeypatch.setattr(service, "_service_declared_environment", lambda *_args: ({}, "systemd-effective"))
+    monkeypatch.setattr(
+        service,
+        "trust_root_receipt_summary",
+        lambda path: {
+            "status": "verified" if path == prior_path else "rolled-back",
+            "rollback_revision": "f" * 64 if path == rollback_path else None,
+        },
+    )
+    loaded_runtime = {
+        "manager": {
+            "loaded": {"artifact": {"wheel_sha256": wheel_sha}},
+            "installed_artifact": {"wheel_sha256": wheel_sha, "source_revision": "unknown"},
+        },
+        "monitor": {"installed_artifact": {"wheel_sha256": wheel_sha}},
+    }
+
+    service._apply_operator_install_evidence(
+        loaded_runtime,
+        environment_overlay={"manager": {}},
+        instance="cortex",
+    )
+
+    assert loaded_runtime["trust_root"]["status"] == "rolled-back"
+    assert loaded_runtime["trust_root"]["rollback_revision"] == "f" * 64
+    assert "candidate_commit" not in loaded_runtime["manager"]["installed_artifact"]
+
+
 def test_loaded_runtime_never_mixes_caller_shell_into_systemd_effective_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
