@@ -259,17 +259,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument(
         "--expected-run-id",
         help=(
-            "abandon／retire-delivered／recover-superseded／regenerate-gates／"
+            "abandon／retire-delivered／recover-superseded／regenerate-gates／rechain／"
             "retry-card／refreeze-base 使用的 exact WorkflowRun CAS；retry-build 改用 expected_candidate"
         ),
     )
     p_work.add_argument(
         "--expected-candidate",
         help=(
-            "retry-build／retry-verify／retry-review／recover-repair-commit／"
+            "retry-build／retry-verify／retry-review／recover-repair-commit／rechain（無 candidate 填 none）／"
             "verify-attest 專用：exact Candidate SHA CAS"
         ),
     )
+    p_work.add_argument("--expected-era", help="rechain 專用：exact claim:v1 era CAS")
+    for persona in ("planner", "builder", "reviewer"):
+        p_work.add_argument(f"--{persona}-executor", help=f"rechain 專用：{persona} identity executor")
+        p_work.add_argument(f"--{persona}-model", help=f"rechain 專用：{persona} identity model ID")
     p_work.add_argument(
         "--card",
         help="retry-card／regenerate-gates 專用：card id；retry-card 須是下一張待派的卡",
@@ -279,7 +283,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "retry-build／retry-card／retry-review：operator 裁決，最多 4000 字；verify／review 已通過後提交新阻斷時 retry-build 必填；全文落成 "
             "operator-adjudication evidence，前 2000 字注入後續 dispatch prompt。 "
-            "abandon／retire-delivered／close-delivered／recover-superseded／reset-reclaim-budget／refreeze-base："
+            "abandon／retire-delivered／close-delivered／recover-superseded／reset-reclaim-budget／refreeze-base／rechain："
             "單行審計理由，最多 500 字。"
         ),
     )
@@ -509,6 +513,14 @@ def main(
             request_args["failure_reason"] = args.failure_reason
         if args.expected_run_id is not None:
             request_args["expected_run_id"] = args.expected_run_id
+        if args.action == "rechain":
+            if args.expected_era is not None:
+                request_args["expected_era"] = args.expected_era
+            for persona in ("planner", "builder", "reviewer"):
+                for suffix in ("executor", "model"):
+                    value = getattr(args, f"{persona}_{suffix}")
+                    if value is not None:
+                        request_args[f"{persona}_{suffix}"] = value
         if args.action == "verify-attest":
             request_args["expected_candidate"] = args.expected_candidate
         elif args.action in RECOVERY_EXPECTED_CANDIDATE_ACTIONS:

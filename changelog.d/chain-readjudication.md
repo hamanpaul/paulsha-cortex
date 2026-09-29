@@ -1,0 +1,1 @@
+- 新增明示 `rechain` work action：operator 必須以 actor/reason 授權並提供 exact run/candidate/claim-era CAS 與完整 per-persona identity chain；安全 attempt 邊界重新驗資格、pin 與 reviewer independence，append-only audit 和原子 registry CAS 綁定新 pin 並解除阻斷，供後續安全 tick 接續；不改寫舊 evidence、不由 fallback 暗中替換、不在 action 內派工。
