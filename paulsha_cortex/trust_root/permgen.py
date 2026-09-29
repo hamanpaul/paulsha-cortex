@@ -77,7 +77,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from paulsha_cortex.config import paths
 
@@ -7626,6 +7626,8 @@ def build_job_unit(
             for leaf in ("plugins", "skills", "config.toml", "hooks.json")
         )
     body += _rwp_lines(owners, read_only, workspace_read_only_paths)
+    if principal is Principal.GATE:
+        body += gate_worktree_state_directory_lines(layout)
     body += [
         "",
         "# job 為一次性，不自動重啟（`CollectMode` 在上方 [Unit] 段）。",
@@ -7648,6 +7650,49 @@ def build_job_unit(
         content="\n".join(body) + "\n",
         hardening_profile=profile.profile_id,
     )
+
+
+#: systemd 的 `StateDirectory=` 一律相對於這個根（system unit）。
+SYSTEMD_STATE_DIRECTORY_ROOT = "/var/lib"
+
+
+def gate_worktree_state_directory(layout: "PathLayout") -> str:
+    """gate 拋棄式工作區那一格的 `StateDirectory=` 值（相對 `/var/lib`，含 `%i`）。
+
+    gate 的 pool（登記表 `gate-worktree-pool`）由 gate 帳號擁有、0700、零 ACL，
+    Manager 進不去，因此 per-job 那一格不能像其他 spool 由 Manager 事先建好；
+    但模板 unit 的 `ReadWritePaths=<gate-worktree>/%i` 要求路徑在 namespace 設定
+    當下就存在，否則 unit 以 `226/NAMESPACE` 起不來（#716 canary run 36639639414：
+    `Failed to set up mount namespacing: <gate-worktree>/<instance>`）。
+    `StateDirectory=` 讓 systemd 在 namespace 設定之前以 `User=` 身分建立那一格，
+    擁有者仍是 gate，Manager 不需要任何額外權限。pool 不在 `/var/lib` 底下時
+    `StateDirectory=` 無法表達，直接拒絕產生（不退回會起不來的 unit）。
+    """
+
+    root = PurePosixPath(layout.gate_worktree_root)
+    marker = SYSTEMD_STATE_DIRECTORY_ROOT + "/"
+    text = root.as_posix()
+    # 以**最後一個** `/var/lib/` 為基準：安裝器測試以 `<target>/var/lib/...` 組出整棵
+    # 部署樹（target 前綴只存在於測試產物），實機部署的 target 就是 `/`。
+    index = text.rfind(marker)
+    relative = text[index + len(marker):] if root.is_absolute() and index >= 0 else ""
+    if not relative or ".." in PurePosixPath(relative).parts:
+        raise ValueError(
+            f"gate worktree pool must live under {SYSTEMD_STATE_DIRECTORY_ROOT} "
+            f"to be provisioned by StateDirectory=: {root}"
+        )
+    return f"{relative}/%i"
+
+
+def gate_worktree_state_directory_lines(layout: "PathLayout") -> list[str]:
+    return [
+        "# --- gate 拋棄式工作區那一格由 systemd 預建（#716）---",
+        "# 上方 ReadWritePaths 的 gate-worktree/%i 必須在 namespace 設定前存在；pool 屬於",
+        "# gate、Manager 進不去，因此由 StateDirectory= 以 User= 身分建立（0700）。gate",
+        "# 在這一格裡就地清空再複製快照，不移除這一格本身（它是 bind mount 點）。",
+        f"StateDirectory={gate_worktree_state_directory(layout)}",
+        "StateDirectoryMode=0700",
+    ]
 
 
 # ---------------------------------------------------------------------------

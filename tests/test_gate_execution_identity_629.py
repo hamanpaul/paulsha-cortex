@@ -286,6 +286,25 @@ class GateWriteFaceTests(unittest.TestCase):
             },
         )
 
+    def test_systemd_precreates_the_worktree_slot_owned_by_the_gate(self) -> None:
+        """#716：`ReadWritePaths=<gate-worktree>/%i` 要在 namespace 設定前存在。
+
+        pool 屬於 gate、Manager 進不去，因此由 `StateDirectory=` 以 `User=` 建立；
+        少了它，gate unit 以 226/NAMESPACE 起不來（canary run 36639639414）。
+        """
+        content = permgen.build_job_unit(SCHEME, principal=Principal.GATE).content
+        relative = JOB_LAYOUT.gate_worktree_root.removeprefix("/var/lib/")
+        self.assertIn(f"StateDirectory={relative}/%i", content.splitlines())
+        self.assertIn("StateDirectoryMode=0700", content.splitlines())
+        for principal in (Principal.BUILDER, Principal.REVIEWER):
+            other = permgen.build_job_unit(SCHEME, principal=principal).content
+            self.assertNotIn("StateDirectory=", other)
+
+    def test_a_gate_pool_outside_var_lib_cannot_be_generated(self) -> None:
+        layout = permgen.PathLayout(agents_root="/srv/cortex")
+        with self.assertRaises(ValueError):
+            permgen.build_job_unit(SCHEME, layout, principal=Principal.GATE)
+
     def test_gate_cannot_write_manager_durable_state(self) -> None:
         """含 gate ledger／exit sentinel 的落點——這一條若破，#628 當場失效。"""
         for target in (
@@ -1001,6 +1020,27 @@ class SnapshotTests(unittest.TestCase):
             gate_ledger.snapshot_worktree(src, dst)
             self.assertFalse((dst / "leftover.txt").exists())
             self.assertTrue((dst / "new.txt").is_file())
+
+    def test_a_precreated_slot_is_emptied_in_place_not_replaced(self) -> None:
+        """#716：`StateDirectory=` 預建、bind mount 成可寫的那一格不能被移除。"""
+        with tempfile.TemporaryDirectory() as root:
+            src = Path(root) / "src"
+            (src / "pkg").mkdir(parents=True)
+            (src / "pkg" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+            dst = Path(root) / "snap"
+            (dst / "old-dir").mkdir(parents=True)
+            (dst / "old-dir" / "stale.txt").write_text("old", encoding="utf-8")
+            (dst / "old-link").symlink_to(src / "pkg")
+            before = dst.stat()
+
+            gate_ledger.snapshot_worktree(src, dst)
+
+            after = dst.stat()
+            self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+            self.assertEqual(sorted(p.name for p in dst.iterdir()), ["pkg"])
+            self.assertEqual((dst / "pkg" / "mod.py").read_text(encoding="utf-8"), "x = 1\n")
+            # 清空時不跟隨 symlink：來源樹原封不動。
+            self.assertTrue((src / "pkg" / "mod.py").is_file())
 
     def test_overlapping_destinations_are_refused(self) -> None:
         with tempfile.TemporaryDirectory() as root:
