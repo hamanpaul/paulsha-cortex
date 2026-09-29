@@ -2568,7 +2568,10 @@ def test_full_dispatch_times_out_while_the_bound_run_is_still_running(
     clock = iter(float(tick) for tick in range(0, 1000, 5))
     monkeypatch.setattr(driver.time, "monotonic", lambda: next(clock))
 
-    with pytest.raises(driver.QualificationFailure, match="before timeout"):
+    with pytest.raises(
+        driver.QualificationFailure,
+        match="before timeout: state=on-going runs=run-qualification:running facets=none",
+    ):
         driver._full_dispatch(
             repository="owner/repo",
             work_id="qualification-work",
@@ -2589,7 +2592,7 @@ def test_full_dispatch_ignores_a_record_for_another_work_item(
     clock = iter(float(tick) for tick in range(0, 1000, 5))
     monkeypatch.setattr(driver.time, "monotonic", lambda: next(clock))
 
-    with pytest.raises(driver.QualificationFailure, match="before timeout"):
+    with pytest.raises(driver.QualificationFailure, match="before timeout: item=unobserved"):
         driver._full_dispatch(
             repository="owner/repo",
             work_id="qualification-work",

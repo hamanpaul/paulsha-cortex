@@ -4581,6 +4581,32 @@ def _dispatch_item_verdict(envelope: object, item: Mapping[str, object]) -> str:
     return "pending"
 
 
+def _dispatch_item_diagnostic(item: Mapping[str, object] | None) -> str:
+    """逾時時最後一次看到的 work item 狀態；只輸出列舉型 token。"""
+
+    if item is None:
+        return "item=unobserved"
+    sources = item.get("sources")
+    runs = [
+        f"{_diagnostic_token(source.get('ref'))}:{_diagnostic_token(source.get('status'))}"
+        for source in (sources if isinstance(sources, list) else [])
+        if isinstance(source, Mapping) and source.get("kind") == "workflow_run"
+    ]
+    facets = item.get("facets")
+    return " ".join(
+        (
+            f"state={_diagnostic_token(item.get('state'))}",
+            "runs=" + (",".join(runs) or "none"),
+            "facets="
+            + (
+                ",".join(_diagnostic_token(facet) for facet in facets) or "none"
+                if isinstance(facets, list)
+                else _diagnostic_token(facets)
+            ),
+        )
+    )
+
+
 def _full_dispatch(
     *,
     repository: str,
@@ -4626,6 +4652,7 @@ def _full_dispatch(
     _require_success(intake, "full-dispatch intake")
     deadline = time.monotonic() + timeout
     item: Mapping[str, object] | None = None
+    observed: Mapping[str, object] | None = None
     while time.monotonic() < deadline:
         status = _run(
             (
@@ -4645,6 +4672,7 @@ def _full_dispatch(
             envelope = records[-1] if records else None
             candidate = _dispatch_work_item(envelope, work_id)
             if candidate is not None:
+                observed = candidate
                 verdict = _dispatch_item_verdict(envelope, candidate)
                 if verdict == "done":
                     item = candidate
@@ -4657,7 +4685,8 @@ def _full_dispatch(
         time.sleep(10)
     else:
         raise QualificationFailure(
-            "full dispatch did not reach terminal closeout before timeout"
+            "full dispatch did not reach terminal closeout before timeout: "
+            + _dispatch_item_diagnostic(observed)
         )
     markers, artifact_rows, workflow, agent_loop_probe = _validate_dispatch_closeout(
         repository=repository,
