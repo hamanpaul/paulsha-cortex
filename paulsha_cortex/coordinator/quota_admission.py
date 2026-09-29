@@ -695,7 +695,11 @@ def assess_candidate_quota(
         CandidateAssessment(
             executor=executor, model_id=model_id, independence_domain=independence_domain,
             profile_key=profile_key, feasible=feasible, exclusion_reason=exclusion_reason,
-            pools=tuple(pool_assessments), observation_state=projection["state"],
+            pools=tuple(pool_assessments),
+            observation_state=(
+                "known" if all(pool.remaining.get("state") != "unknown" for pool in pool_assessments)
+                else "unknown"
+            ),
             coverage_gaps=tuple(sorted(all_gaps)), binding_kind=binding_kind,
         ),
         resolved_demand_version,
