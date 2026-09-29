@@ -10871,6 +10871,33 @@ def _identity_candidates_for_persona(persona: str, identities: IdentityRegistry,
     return candidates
 
 
+def _reviewer_independence_exclusion_detail(
+    persona: str, identities: IdentityRegistry, builder_domains: set
+) -> str:
+    """#839 AC2：唯一 reviewer 與 builder 同 independence domain 時的精確拒因。
+
+    `_identity_candidates_for_persona` 對 reviewer 以 independence domain 硬濾；
+    若具 review capability 的身分**全部**因此被排除，舊訊息只剩「沒有設定
+    identity」，operator 分不出是沒設定還是被 independence 規則擋下。這裡只
+    補述既有過濾的結果（同一份判準，不放寬也不新增規則）；其他 persona 或非
+    independence 造成的空集合維持原訊息。"""
+
+    if persona != "reviewer" or not builder_domains:
+        return ""
+    capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona)
+    same_domain = [
+        f"{item.executor}/{item.model_id}"
+        for item in identities.identities
+        if capability in item.capabilities and item.independence_domain in builder_domains
+    ]
+    if not same_domain:
+        return ""
+    return (
+        "（reviewer independence_domain 與 builder 相同："
+        f"{', '.join(sorted(builder_domains))}；被排除 candidates: {', '.join(same_domain)}）"
+    )
+
+
 def _measured_profile_partition(
     persona: str, sizing_band, candidates: list
 ) -> tuple[list, list[tuple[object, str]]]:
@@ -10976,7 +11003,10 @@ def _workflow_identity_candidates_for_persona(
             ]
             candidates = preferred + rest
     if not candidates:
-        raise ValueError(f"no configured identity for workflow persona: {persona}")
+        raise ValueError(
+            f"no configured identity for workflow persona: {persona}"
+            + _reviewer_independence_exclusion_detail(persona, identities, builder_domains)
+        )
     # #452 C：measured 側寫優先＋band 過濾（三段 persona 之外的 catch-all
     # persona 沒有封套語意，維持原清單）。
     from .model_identities import DEFAULT_ENVELOPE

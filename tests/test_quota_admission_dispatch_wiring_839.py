@@ -558,9 +558,14 @@ def test_periodic_tick_retries_quota_wait_only_after_fresh_recovery_and_once(
         bindings=(_binding(codex_pool, codex_key), _binding(claude_pool, claude_key)),
         environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
     )
+    # `poll_headless_done` 回 registry 原樣 row（fake pid 的 job 視為仍在執行）：
+    # 缺這個方法時第二個 tick 的 resume 會以 AttributeError 失敗、把 run 標成
+    # `resume-workflow-failed`，下面「連續 tick 冪等」的斷言就會因為錯誤的理由
+    # 通過。
     dispatcher = type(
         "D", (), {"_registry": registry, "_git_runner": None,
-                  "_worktree_creator": _FakeWorktreeCreator(worktree)}
+                  "_worktree_creator": _FakeWorktreeCreator(worktree),
+                  "poll_headless_done": lambda self, job_id, **_kwargs: registry.get_job(job_id)}
     )()
     monkeypatch.setattr(manager, "_runtime_preflight_gate", lambda *args, **kwargs: None)
     initial = manager.dispatch_workflow_card(
@@ -606,6 +611,9 @@ def test_periodic_tick_retries_quota_wait_only_after_fresh_recovery_and_once(
     assert launched[0]["workflow_card"] == step.card
     runner()  # the same attempt is idempotent across consecutive daemon ticks
     assert len(registry.list_jobs()) == 1
+    resumed = registry.get_workflow_run(run.run_id)
+    assert "needs_human" not in resumed.facets
+    assert resumed.needs_human_reason is None
 
 
 def test_quota_context_cannot_override_missing_exact_qualification(
