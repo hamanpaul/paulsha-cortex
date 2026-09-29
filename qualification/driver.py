@@ -5258,9 +5258,12 @@ _DIAGNOSTIC_SECRET_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[A-Za-z0-9._~+/-]{16,}"),
 )
-_JOB_DIAGNOSTIC_UNITS = 6
-_JOB_DIAGNOSTIC_LINES = 40
-_JOB_DIAGNOSTIC_CHARS = 16000
+#: 各類 job 模板 unit（builder／reviewer-planner／gate；兩種加固剖面）的 journal glob。
+_JOB_DIAGNOSTIC_UNIT_GLOBS = ("cortex-gate-job@*", "cortex-job*@*", "cortex-reviewer-job*@*")
+_JOB_DIAGNOSTIC_LINES = 60
+#: 每一段（一個 journal glob 或一份 gate.log）各自截尾，總長另有上限。
+_JOB_DIAGNOSTIC_SECTION_CHARS = 4000
+_JOB_DIAGNOSTIC_CHARS = 24000
 
 
 def _scrub_diagnostic(text: str) -> str:
@@ -5272,38 +5275,20 @@ def _scrub_diagnostic(text: str) -> str:
 
 
 def _job_unit_diagnostics(runtime_env: Mapping[str, str]) -> str:
-    """派工失敗時的 job 層診斷：最近幾個 job unit 的 journal 尾端與 gate.log 尾端。
+    """派工失敗時的 job 層診斷：job unit 的 journal 尾端與 gate.log 尾端。
 
     #716 canary run 36628749017 以 `gate-spool-empty` 終局，錯誤訊息只指向
     `journalctl -u <gate unit>` 與 gate.log，而容器在 workflow 結束後就銷毀。
     這裡在拋出失敗前把兩者的有界尾端印到 stderr（遮蔽 credential 形狀）；
     任何讀取失敗只記 unavailable，不影響原本的失敗。
+
+    journal 以 unit glob 查詢，不先列 unit：模板 instance 結束後就從 unit 清單
+    卸載（run 36634548058 的 `list-units` 因此是空的），journal 仍保留紀錄。
     """
 
     lines: list[str] = []
-    try:
-        listed = _run(
-            (
-                "/usr/bin/systemctl",
-                "list-units",
-                "--all",
-                "--no-legend",
-                "--plain",
-                "--no-pager",
-                "cortex-*job@*",
-            ),
-            timeout=30,
-        )
-        units = [
-            (row.split()[0], " ".join(row.split()[1:4]))
-            for row in listed.stdout.splitlines()
-            if row.split()
-        ]
-    except (OSError, subprocess.SubprocessError):
-        units = []
-        lines.append("job units: unavailable")
-    for unit, state in units[-_JOB_DIAGNOSTIC_UNITS:]:
-        lines.append(f"--- journal {unit} [{state}]")
+    for pattern in _JOB_DIAGNOSTIC_UNIT_GLOBS:
+        lines.append(f"--- journal {pattern}")
         try:
             journal = _run(
                 (
@@ -5314,11 +5299,15 @@ def _job_unit_diagnostics(runtime_env: Mapping[str, str]) -> str:
                     "-n",
                     str(_JOB_DIAGNOSTIC_LINES),
                     "-u",
-                    unit,
+                    pattern,
                 ),
                 timeout=30,
             )
-            lines.extend(journal.stdout.splitlines()[-_JOB_DIAGNOSTIC_LINES:])
+            lines.append(
+                "\n".join(journal.stdout.splitlines()[-_JOB_DIAGNOSTIC_LINES:])[
+                    -_JOB_DIAGNOSTIC_SECTION_CHARS:
+                ]
+            )
         except (OSError, subprocess.SubprocessError):
             lines.append("unavailable")
     try:
@@ -5332,10 +5321,12 @@ def _job_unit_diagnostics(runtime_env: Mapping[str, str]) -> str:
     for log in logs[-3:]:
         lines.append(f"--- gate log {log.parent.name}")
         try:
-            lines.extend(
-                log.read_text(encoding="utf-8", errors="replace").splitlines()[
-                    -_JOB_DIAGNOSTIC_LINES:
-                ]
+            lines.append(
+                "\n".join(
+                    log.read_text(encoding="utf-8", errors="replace").splitlines()[
+                        -_JOB_DIAGNOSTIC_LINES:
+                    ]
+                )[-_JOB_DIAGNOSTIC_SECTION_CHARS:]
             )
         except OSError:
             lines.append("unavailable")
