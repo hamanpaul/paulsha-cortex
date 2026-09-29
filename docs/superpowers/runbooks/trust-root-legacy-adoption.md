@@ -47,11 +47,19 @@ operator_account: <operator>
 # external_reader_account、providers.builder 視需要
 ```
 
-overlay 存成 root 0600 的持久檔（例如 `/var/lib/cortex-installer/host-overlay.yaml`）。之後每一次升級都必須用**同一份** overlay 產生 plan，prior-receipt 交接才會產生相同的帳號 step。
+overlay 存成 root 擁有、operator 可讀、不可被其他帳號寫入的持久檔：plan 依 `trust-root-transactional-install.md` §2 在非 root 空白環境執行，必須讀得到它（overlay 不含機密）。
+
+```bash
+/usr/bin/sudo /usr/bin/install -o root -g root -m 0644 host-overlay.yaml \
+  /var/lib/cortex-installer/host-overlay.yaml
+```
+
+之後每一次升級都必須用**同一份** overlay 產生 plan，prior-receipt 交接才會產生相同的帳號 step。
 
 ## 3. 擷取並審核 legacy inventory
 
 ```bash
+/usr/bin/sudo /usr/bin/install -d -o root -g root -m 0755 /var/lib/cortex-installer/legacy
 cortex_root_cli install trust-root legacy inventory \
   --config "$cortex_install_config" \
   --host-overlay /var/lib/cortex-installer/host-overlay.yaml \
@@ -62,12 +70,12 @@ cortex_root_cli install trust-root legacy inventory \
 - 已有 receipt、maintenance snapshot 或 lease marker 的主機會被拒絕（應改走 `--prior-receipt`）。
 - 輸出位置不得落在 roots、受管路徑或帳號 HOME 之下，也不得經過 symlink；既有檔案不會被覆寫。
 - 結果必須是 `census_stable: true`；`false` 表示擷取期間有物件被換成 symlink 或 inode 改變，找出原因後重新擷取。
-- 以回報的 `inventory_sha256` 重新命名為 `/var/lib/cortex-installer/legacy/<inventory_sha256>.json`（root 0644），作為之後 plan 與 apply 綁定的正本。
+- 以回報的 `inventory_sha256` 重新命名為 `/var/lib/cortex-installer/legacy/<inventory_sha256>.json`（root 0644，operator 可讀），作為之後 plan 與 apply 綁定的正本。
 
 審核：
 
 ```bash
-cortex install trust-root legacy show --inventory /var/lib/cortex-installer/legacy/<inventory_sha256>.json
+"$cortex_cli" install trust-root legacy show --inventory /var/lib/cortex-installer/legacy/<inventory_sha256>.json
 ```
 
 逐項確認：帳號 row（uid／gid、群組成員、密碼鎖定）、各 principal 在宣告可寫資產以外的可寫路徑（census 例外）、state 頂層與受管目錄內的未列管項目、credential 類物件（只有 metadata，不含內容）。
