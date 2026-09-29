@@ -745,6 +745,55 @@ window 內會 fail closed。trap 不依賴 apply child 返回後才更新的 she
 rollback。只有 rollback 回報 `restore_safe=true` 才恢復原本 active 的 units；restore 後才以
 exact token 清除可能殘留的 marker。
 
+### 升級時 repository step 如何接手跑過 job 的來源樹（#1124）
+
+repository step 安裝的 `<repo-source-tree>/<slug>` 同時是 Manager 的 `PSC_REPO_ROOT`。
+Manager 擁有這棵樹，跑 job 時會在裡面留下 branch、ref 與 linked worktree（builder／gate
+在 `PSC_WORKTREE_ROOT` 底下的 per-job clone 工作，不寫這裡）。`--prior-receipt` 升級時，
+installer 把下表這些**執行期狀態**正規化後，再與 prior receipt 的 repository identity
+（HEAD commit、origin URL、工作樹乾淨、`git fsck --strict`、owner／mode）比對；表外的任何
+差異照舊 fail closed。每一列的 production 寫入點逐條列在
+`paulsha_cortex/trust_root/install/backend.py` 的 `_RUNTIME_*` allowlist 註解。
+
+| 類別 | 允許的形狀 | Manager 寫入點 |
+| --- | --- | --- |
+| local git config | `[user]` 的 `name`／`email`（單行純值） | per-job clone 從來源樹 local config 複製 commit identity |
+| linked worktree | `.psc-review-worktrees/<name>`、`.psc-verification-worktrees/<name>`，detached；`.git/worktrees/<id>` 的 `gitdir` 指回同一路徑；目錄已刪的 prunable registry 也接受 | foreign review 與 verification base checkout |
+| ref | `refs/heads/feature/*`、`refs/remotes/origin/*`、`refs/tags/archive/<work>-<sha8>`、`refs/cortex/{reclaimed,main-sync,main-sync-quarantine,mirror}/…` | provision `branch -f`、bundle 回收、`fetch origin <branch>`、封存 tag／ref、main-sync pin、Monitor git mirror |
+
+`FETCH_HEAD`、object pack、reflog 等檔案不另列：它們與整棵樹（含上表的 linked worktree）
+一樣受 owner／group、world-writable、symlink 逃逸檢查，這組檢查沒有任何放寬。刻意**不**
+接受的有：`branch.<name>.*` upstream 設定（trust-root 的 Manager 以 exact commit 建 branch，
+不會寫它；它只出現在 #623 之前的 legacy checkout，那棵樹由 #1122 的 legacy adoption
+quarantine 後重新 clone）、上表以外位置的 linked worktree（包括來源樹外的 worktree，只看
+registry 就拒收，不走訪那個目錄）、其他 config section／key（尤其 `core.hooksPath`、
+`core.fsmonitor`、`include*`、`filter.*`、`alias.*`、`credential.*`、`url.*`）、其他 ref
+namespace（例如會改寫 checkout 內容的 `refs/replace/*`），以及 owner 不是 repo owner 的檔案
+（例如 operator 擁有）。拒收時錯誤訊息會點名項目，例如：
+
+```text
+existing managed object does not match prior receipt provenance: repository:<slug> (foreign owner: README.md is <account>:<group>, expected cortex-manager:cortex-manager)
+```
+
+處置：以 Manager 身分移除或還原點名的那一項後重跑 apply；不要放寬 allowlist 或手改
+receipt。替換與 rollback 只動 main worktree 的 detached checkout 與 installer 自己的 origin
+URL：fetch 不寫任何 ref 與 `FETCH_HEAD`、關閉 auto gc／maintenance、候選 commit 若追蹤
+runtime worktree 根目錄即在 checkout 前拒絕、chmod 不進入 Manager 的 worktree 子樹，完成後
+再確認 worktree／config／ref 摘要與替換前逐項相同，否則 fail closed 並 rollback。
+
+**RC qualification 覆蓋範圍**：`qualification/run.sh` 目前只有單一 candidate 的 fresh
+install、idempotent re-apply、functional drift 拒收與 rollback 後重裝，沒有 `--prior-receipt`
+升級情境。升級需要第二份不同 plan 的 candidate（另一個 commit 的 hash-locked bundle），而
+RC artifact 只帶本次 candidate；release profile 以 `--network none` 執行、容器內也沒有 checkout
+可以另產 bundle；prior receipt 還必須先完整走完 activate／verify 成為 `qualified`。在 release
+gate 內合成第二份 candidate 等於新增一段無法在 CI 之外實跑驗證的 harness，因此本次不加。
+替代驗證是真 git repo 的回歸測試：`tests/test_trust_root_install_backend.py` 與
+`tests/test_trust_root_install_transaction.py` 依上表出處重現 Manager 的寫入，走真
+`LocalInstallBackend` 的 inspect／replace／rollback 與 `apply_plan(--prior-receipt)`／
+`rollback_receipt` 全路徑，並覆蓋 allowlist 以外的 drift 被擋且點名。正式機升級前可先以
+Manager 身分執行 `git -C <repo> worktree list --porcelain`、`git -C <repo> for-each-ref` 與
+`git -C <repo> config --local --list`，對照上表確認沒有表外項目。
+
 ## 4. 明確匯入所需 credentials
 
 只匯入 plan 的 `required_credentials` 列出的項目。預設 release／canary config 需要下列四個

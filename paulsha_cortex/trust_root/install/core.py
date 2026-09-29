@@ -4347,6 +4347,20 @@ def validate_apply_plan(
     return tuple(_validate_apply_plan_schema(plan))
 
 
+def _observed_drift_detail(state: Mapping[str, object]) -> str:
+    """Name what an inspector reported as drift, for an actionable refusal.
+
+    Repository inspection lists every allowlist or safety violation under
+    ``drift`` (#1124: a foreign-owned file, an undeclared config key, a linked
+    worktree outside the Manager's runtime roots); a refusal must say which.
+    """
+
+    drift = state.get("drift")
+    if not isinstance(drift, (list, tuple)) or not drift:
+        return ""
+    return " (" + "; ".join(str(row) for row in drift) + ")"
+
+
 def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
     if not state.get("exists"):
         return False
@@ -5419,11 +5433,11 @@ def _validate_managed_step_provenance_before_apply(
         if prior_plan is not None:
             raise InstallDriftError(
                 "existing managed object does not match prior receipt "
-                f"provenance: {step_id}"
+                f"provenance: {step_id}" + _observed_drift_detail(installed)
             )
         raise InstallDriftError(
             "existing managed object lacks trusted receipt provenance: "
-            f"{step_id}"
+            f"{step_id}" + _observed_drift_detail(installed)
         )
 
 
@@ -6222,14 +6236,17 @@ def apply_plan(
                     if not (adopted_from_receipt or adopted_mount_root):
                         raise InstallDriftError(
                             f"existing {step.get('kind')} lacks trusted receipt provenance: {step_id}"
+                            + _observed_drift_detail(prior)
                         )
                 elif prior_receipt is not None and not prior_receipt_provenance:
                     raise InstallDriftError(
                         f"existing {step.get('kind')} does not match prior receipt provenance: {step_id}"
+                        + _observed_drift_detail(prior)
                     )
                 elif not prior_receipt_provenance:
                     raise InstallDriftError(
                         f"existing {step.get('kind')} lacks trusted receipt provenance: {step_id}"
+                        + _observed_drift_detail(prior)
                     )
             entry = {
                 "step_id": step_id,
