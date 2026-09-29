@@ -1958,3 +1958,52 @@ def test_live_process_started_epoch_reads_proc_stat(tmp_path: Path) -> None:
     assert live_process_started_epoch(4243, proc_root=proc) is None
     assert live_process_started_epoch(None, proc_root=proc) is None
     assert live_process_started_epoch(os.getpid()) is not None
+
+
+def test_in_process_identity_carries_the_installer_wheel_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """服務啟動時寫進 loaded receipt 的 in-process 身分，也要帶 installer venv slot
+    的 wheel digest（#1160 RC：loaded_wheel=missing）。"""
+
+    import importlib
+    import importlib.metadata
+    import types
+
+    from paulsha_cortex import runtime_attestation
+
+    wheel_digest = "e" * 64
+    slot = tmp_path / "venvs" / wheel_digest
+    site = slot / "lib" / "python3.12" / "site-packages"
+    package = site / "paulsha_cortex"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (slot / ".cortex-wheel.sha256").write_text(wheel_digest + "\n", encoding="ascii")
+    venv = tmp_path / "venv"
+    venv.symlink_to(slot)
+    module = types.SimpleNamespace(__file__=str(venv / "lib" / "python3.12" / "site-packages" / "paulsha_cortex" / "__init__.py"))
+
+    class Distribution:
+        version = "0.1.12"
+
+        def locate_file(self, name):
+            return site / name
+
+        def read_text(self, _name):
+            return None
+
+    real_import = importlib.import_module
+    monkeypatch.setattr(
+        runtime_attestation.importlib,
+        "import_module",
+        lambda name: module if name == "paulsha_cortex" else real_import(name),
+    )
+    monkeypatch.setattr(
+        runtime_attestation.importlib.metadata, "distribution", lambda _name: Distribution()
+    )
+
+    identity = runtime_attestation.artifact_identity()
+
+    assert identity["kind"] == "installed-wheel"
+    assert identity["wheel_sha256"] == wheel_digest
+    assert runtime_attestation._safe_artifact(identity)["wheel_sha256"] == wheel_digest

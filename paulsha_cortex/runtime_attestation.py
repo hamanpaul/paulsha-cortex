@@ -1192,16 +1192,7 @@ def artifact_identity_from_package_root(
         if distribution is not None and same_root and not editable
         else "source-override"
     )
-    wheel_sha256: str | None = None
-    try:
-        slot = site.resolve(strict=True).parents[2]
-        marker = slot / ".cortex-wheel.sha256"
-        if marker.is_file() and not marker.is_symlink():
-            candidate = marker.read_text(encoding="ascii").strip()
-            if _SHA256_RE.fullmatch(candidate) and slot.name == candidate:
-                wheel_sha256 = candidate
-    except (IndexError, OSError, UnicodeError):
-        pass
+    wheel_sha256 = _installer_wheel_marker(site)
     return _safe_artifact(
         {
             "kind": kind,
@@ -1212,6 +1203,21 @@ def artifact_identity_from_package_root(
             "wheel_sha256": wheel_sha256,
         }
     )
+
+
+def _installer_wheel_marker(site_packages: Path) -> str | None:
+    """installer venv slot（``venvs/<wheel sha256>``）上的 wheel digest marker。"""
+
+    try:
+        slot = site_packages.resolve(strict=True).parents[2]
+        marker = slot / ".cortex-wheel.sha256"
+        if marker.is_file() and not marker.is_symlink():
+            candidate = marker.read_text(encoding="ascii").strip()
+            if _SHA256_RE.fullmatch(candidate) and slot.name == candidate:
+                return candidate
+    except (IndexError, OSError, UnicodeError):
+        pass
+    return None
 
 
 def artifact_identity_from_python(executable: str | Path | None) -> dict[str, object]:
@@ -1314,13 +1320,21 @@ def artifact_identity(
         selected_root = installed_root
 
     digest = _tree_digest(selected_root) if selected_root is not None else None
-    return {
+    identity: dict[str, object] = {
         "kind": kind if digest is not None else "unknown",
         "package": "paulsha-cortex",
         "package_version": package_version,
         "source_revision": source_revision,
         "sha256": digest,
     }
+    # 服務啟動時寫進 loaded receipt 的就是這份身分；installer venv 的 wheel
+    # marker 也要帶上，operator 端才能把 loaded wheel 綁到 install receipt 的
+    # candidate wheel（#1160 RC run：loaded_wheel=missing）。
+    if kind == "installed-wheel" and installed_root is not None:
+        wheel_sha256 = _installer_wheel_marker(installed_root.parent)
+        if wheel_sha256 is not None:
+            identity["wheel_sha256"] = wheel_sha256
+    return identity
 
 
 def _utc(value: str | None = None) -> str:
