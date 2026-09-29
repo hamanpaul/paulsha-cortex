@@ -1363,10 +1363,15 @@ Profile 以 `WorkflowRun.execution_profile_bindings` 作為獨立 sibling 欄位
 仍按 legacy 載入；新版讀舊資料不補造 profile。格式版本未知、descriptor 不完整、
 key 不一致或 launch 條件與 resolved profile 不符時拒絕派工。
 
-Adapter descriptor 是資料，不會載入 descriptor 提供的程式碼；adapter 實作由 Cortex
-可信註冊表提供，並沿用現有 launcher 的 argv、terminal、usage、cancel/timeout、工具與
-sandbox 邊界。quota 能力預設為 unknown，usage 不代表剩餘額度。正式 dispatch 會重新
-驗證 role、pin、reviewer independence 與既有 Trust Root。Sized run 的 #842
+Adapter descriptor 是資料，不會載入 descriptor 提供的程式碼。adapter 的 protocol／runtime
+version、原生 effort 合法值與預設（含 model 專屬預設）由 packaged
+`data/execution-adapters.yaml` 提供，operator 可在 `$PSC_PROJECT_CONFIG_ROOT/execution-adapters.yaml`
+以同 schema 的 overlay 整筆取代同名條目；未知鍵、缺欄位或未知版本一律拒收。新增 model
+或既有協定的 effort 只改 descriptor；新 runtime 則要以程式碼登記受信任的 adapter 實作，
+並沿用現有 launcher 的 argv、terminal、usage、cancel/timeout、工具與 sandbox 邊界。
+quota 能力預設為 unknown，usage 不代表剩餘額度。正式 dispatch 會重新驗證 role、pin、
+reviewer independence 與既有 Trust Root（加固 runner 下的 launcher／toolchain／credential
+grant），拒絕時在 spawn 前持久化 needs_human。Sized run 的 #842
 exact-profile qualification gate 預設未啟用，讓尚未部署 qualification receipt
 lifecycle 的環境可繼續派工；這類 dispatch 會在 `resolved_model_chain` 留下
 `qualification: not-enforced`。只有 host overlay `model-identities.yaml` 明確宣告

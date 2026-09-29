@@ -11632,6 +11632,7 @@ def _bind_workflow_execution_profile(
     from .execution_adapters import (
         bind_launcher_profile,
         make_launcher_profile,
+        trust_root_compatibility,
         validate_dispatch_requirements,
     )
 
@@ -11676,12 +11677,20 @@ def _bind_workflow_execution_profile(
         from .qualification_lifecycle import lookup_dispatch_qualification
 
         qualification = lookup_dispatch_qualification(identity, binding)
+    # #835 AC3：Trust Root 硬條件由既有 model_resolution 相容性契約（launcher
+    # profile＋persona principal 的 toolchain／credential grant）判定，在這個
+    # profile gate 內生效；加固 runner 未部署（direct）時沒有 Trust Root 契約。
+    trust_root_valid, trust_root_reason = trust_root_compatibility(
+        step.persona, identity, launcher
+    )
     validate_dispatch_requirements(
         binding,
         identity=identity,
         builder_domains=builder_domains,
         qualification_required=qualification_required,
         qualification=qualification,
+        trust_root_valid=trust_root_valid,
+        trust_root_reason=trust_root_reason,
     )
     return binding, bind_launcher_profile(launcher, binding)
 
@@ -11689,6 +11698,12 @@ def _bind_workflow_execution_profile(
 def _workflow_execution_profile_stop(registry, run, step, exc: BaseException):
     """Persist a fail-closed profile gate before any workflow launch side effect."""
 
+    from .execution_adapters import ExecutionAdapterDescriptorError
+
+    if isinstance(exc, ExecutionAdapterDescriptorError):
+        # descriptor 設定錯誤不是這個 run 的 profile 不合格：不寫 sticky needs_human，
+        # 整次派工以例外拒絕（見 `_dispatch_workflow_card` 的 catalog 前置檢查）。
+        raise exc
     updated = registry._manager_update_workflow_run(
         run.run_id,
         facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
@@ -14832,6 +14847,24 @@ def _dispatch_workflow_card(
             if publication is not None:
                 publication.commit()
             return None
+    # #835 AC3／#581：unknown role 不可進候選池、也不可默認 build。legacy manifest
+    # 的未知 persona 在任何候選選擇／worktree／job 之前，以 profile gate 持久化
+    # needs_human（`execution-profile-blocked`），不是每個 tick 丟一次例外。
+    if step.persona != "manager":
+        from .execution_adapters import (
+            ExecutionAdapterError,
+            adapter_catalog,
+            require_workflow_role,
+        )
+
+        try:
+            require_workflow_role(step.persona)
+        except ExecutionAdapterError as exc:
+            return _workflow_execution_profile_stop(registry, run, step, exc)
+        # adapter descriptor（packaged＋config root overlay）壞掉是部署設定錯誤，
+        # 不屬於這個 run：在任何候選／worktree／job 之前整次拒絕（例外交給 tick
+        # 隔離），不寫 per-run needs_human；descriptor 修正後下一個 tick 自然恢復。
+        adapter_catalog()
     # #262／#600 dispatch gate：在建立 worktree／sandbox／job row／model session 前，
     # 驗證 card capability／provider 新鮮度，並探測 overlay Copilot 型號；沒有這些
     # 檢查需求的 card 維持原有直通路徑。
@@ -14981,16 +15014,6 @@ def _dispatch_workflow_card(
             if launcher is None:
                 raise ValueError("workflow launcher unavailable")
             launcher = _specialize_workflow_launcher(launcher, step)
-        if identity is not None:
-            # Hardened candidate ranking checks the static registry contract.  A
-            # final check against the specialized launcher closes the remaining
-            # dependency seam before any job/worktree launch side effect; direct
-            # mode intentionally keeps the legacy operator-overlay path.
-            compatibility_for = model_resolution.compatibility_checker_for(step.persona)
-            if compatibility_for is not None:
-                model_resolution.validate_identity_compatibility(
-                    step.persona, identity, launcher=launcher
-                )
         profile_binding = getattr(launcher, "_execution_profile_binding", None)
         if profile_binding is None:
             try:
@@ -15008,6 +15031,18 @@ def _dispatch_workflow_card(
                 if isinstance(exc, (ExecutionAdapterError, ExecutionProfileError)):
                     return _workflow_execution_profile_stop(registry, run, step, exc)
                 raise
+        if identity is not None:
+            # Hardened candidate ranking checks the static registry contract.  A
+            # final check against the specialized launcher closes the remaining
+            # dependency seam before any job/worktree launch side effect; direct
+            # mode intentionally keeps the legacy operator-overlay path.
+            # #835：profile gate（上方）已用同一個契約判 Trust Root 並持久化
+            # needs_human；這裡保留作為 profile 以外 persona 的 defense-in-depth。
+            compatibility_for = model_resolution.compatibility_checker_for(step.persona)
+            if compatibility_for is not None:
+                model_resolution.validate_identity_compatibility(
+                    step.persona, identity, launcher=launcher
+                )
         if quota_admission_context is None:
             break
         quota_now_ms = int(time.time() * 1000)

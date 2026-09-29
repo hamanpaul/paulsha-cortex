@@ -1419,7 +1419,7 @@ def test_q10_profile_key_and_permissions_remain_separate_from_qualification() ->
 
     before = high.to_dict()
     execution_adapters.validate_dispatch_requirements(
-        high, identity=identity, qualification_required=True,
+        high, identity=identity, qualification_required=True, trust_root_valid=True,
         qualification={
             "state": "approved", "profile_key": high.resolved_key, "role": "build",
             "coverage": "complete", "receipt": "sha256:" + "a" * 64, "revoked": False,

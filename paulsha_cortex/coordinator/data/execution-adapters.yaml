@@ -1,0 +1,62 @@
+# #835：execution adapter descriptor——packaged 內建預設。
+#
+# 本檔是 production adapter／model／原生 effort 能力的資料來源；程式碼
+# （`execution_adapters.py` 與 launcher 的 argv builder）只提供受信任的執行實作，
+# 不再保存 adapter 能力表。規則：
+#   - 同 schema 的 operator overlay 放在 config root（`PSC_PROJECT_CONFIG_ROOT`）的
+#     `execution-adapters.yaml`：同名 adapter 以 overlay 條目整筆取代本檔條目
+#     （不做欄位層級合併），其餘 adapter 沿用本檔。
+#   - 只能描述已有受信任程式碼的 adapter；descriptor 不能宣告命令、argv、路徑或
+#     Python import。未知鍵、缺欄位、未知 schema_version 一律拒收（fail-closed，
+#     不退回本檔）。
+#   - 宣告原生 effort 的 adapter，其 argv builder 必須能表達 effort（`effort` 參數）；
+#     claude／agy 目前沒有 effort 通道，宣告 effort 會被拒收。
+#   - 條目內容會進 execution profile descriptor 與 resolved key；調整版本或 effort
+#     預設會改變新派工的 profile key（既有 run 的 binding 不回寫）。
+schema_version: 1
+adapters:
+  copilot:
+    protocol_id: github-copilot-cli
+    protocol_version: "1"
+    runtime_version: cortex-adapter-v1
+    usage_source: copilot-jsonl
+    quota_state: unknown
+    effort:
+      values: [low, medium, high, xhigh]
+      default: xhigh
+  claude:
+    protocol_id: claude-code-cli
+    protocol_version: "1"
+    runtime_version: cortex-adapter-v1
+    usage_source: claude-jsonl
+    quota_state: unknown
+    effort: null
+  codex:
+    protocol_id: openai-codex-cli
+    protocol_version: "1"
+    runtime_version: cortex-adapter-v1
+    usage_source: codex-jsonl
+    quota_state: unknown
+    effort:
+      values: [low, medium, high, xhigh, max]
+      default: null
+      model_defaults:
+        gpt-5.6-luna: max
+        gpt-6-luna: max
+        gpt-5.3-codex-spark: xhigh
+  agy:
+    protocol_id: antigravity-cli
+    protocol_version: "1"
+    runtime_version: cortex-adapter-v1
+    usage_source: agy-jsonl
+    quota_state: unknown
+    effort: null
+  cg:
+    protocol_id: copilot-gateway-cli
+    protocol_version: "1"
+    runtime_version: cortex-adapter-v1
+    usage_source: cg-jsonl
+    quota_state: unknown
+    effort:
+      values: [low, medium, high, xhigh]
+      default: medium

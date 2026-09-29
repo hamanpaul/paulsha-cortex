@@ -54,6 +54,12 @@ object 的 required 欄位與 array 順序由 descriptor 明示。新增 model�
 descriptor-only 擴充：core wire version 維持 v1，條件改變時 actual key 自然改變。
 這些值不是中央 resolver 的產品名單，也不建立跨 adapter 的同名 effort 等價。
 
+core 本身不讀檔，也不知道 production 用哪些值。production 派工時，#835 的
+`execution_adapters.resolve_profile()` 從 adapter descriptor（packaged
+`data/execution-adapters.yaml` 加上 config root overlay
+`execution-adapters.yaml`）組出本 core 的 descriptor，再交給 core 解析；位置、schema
+與驗證規則見 [Execution profile 操作與相容性](execution-profile.md)。
+
 profile 的 `requested`、`resolved`、`observed` 是三個獨立 plane。每個 tagged value
 只能是：
 

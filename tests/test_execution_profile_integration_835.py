@@ -7,7 +7,6 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -141,83 +140,188 @@ def test_a1_descriptor_only_model_and_native_effort_resolve_exact_profiles() -> 
     assert other_adapter.resolved_key != binding.resolved_key
 
 
-def test_a2_fake_adapter_exercises_argv_terminal_usage_quota_cancel_timeout_tools_sandbox(
-    monkeypatch,
+def _fixture_runtime_argv(
+    *,
+    prompt: str,
+    slice_id: str,
+    log_dir: str,
+    worktree: str | None = None,
+    remote: str | None = None,
+    allow_unsafe: bool = False,
+    model: str | None = None,
+    read_only: bool = False,
+    review_only: bool = False,
+    commit_required: bool = False,
+    effort: str | None = None,
+) -> list[str]:
+    """虛構 runtime 的受信任 argv 實作（新 runtime 以程式碼提供，descriptor 不能）。"""
+
+    if allow_unsafe:
+        raise ValueError("fixture runtime refuses unsafe mode")
+    mode = "read-only" if (read_only or review_only) else "workspace-write"
+    resolved_effort = execution_adapters.adapter_for("fixture-rt").launch_effort(model, effort)
+    argv = ["fixture-rt", "--model", str(model), "--sandbox", mode, "--log", f"{log_dir}/{slice_id}.jsonl"]
+    if resolved_effort is not None:
+        argv += ["--effort", resolved_effort]
+    if commit_required:
+        argv.append("--commit")
+    return [*argv, "--", prompt]
+
+
+def _fixture_runtime_usage(log_path: str) -> dict:
+    rows = [json.loads(line) for line in Path(log_path).read_text(encoding="utf-8").splitlines() if line]
+    usage = next(row["usage"] for row in reversed(rows) if row.get("type") == "usage")
+    return {"usage": {**usage, "source": "fixture-rt"}, "usage_raw": usage, "usage_reason": None}
+
+
+def _fixture_runtime_adapter(**overrides) -> execution_adapters.ExecutionAdapter:
+    fields = {
+        "efforts": ("eco", "turbo"),
+        "default_effort": "eco",
+        "usage_source": "fixture-jsonl",
+        "quota_state": "unknown",
+        "argv_builder": _fixture_runtime_argv,
+        "usage_extractor": _fixture_runtime_usage,
+    }
+    fields.update(overrides)
+    return execution_adapters.ExecutionAdapter(
+        "fixture-rt", "fixture-runtime-protocol", "1", "fixture-adapter-v1", **fields
+    )
+
+
+@pytest.fixture
+def isolated_adapters(monkeypatch):
+    monkeypatch.setattr(execution_adapters, "_REGISTERED_ADAPTERS", {})
+    execution_adapters.reload_adapter_catalog()
+    yield
+    execution_adapters.reload_adapter_catalog()
+
+
+def test_a2_registered_adapter_conformance_through_production_launcher(
+    isolated_adapters, monkeypatch, tmp_path: Path
 ) -> None:
-    identity = _identity()
-    binding = execution_adapters.resolve_profile(identity, "builder")
-    calls: list[str] = []
+    """虛構 runtime 以 `register_adapter` 登記真 `ExecutionAdapter`，逐項走 production
+    路徑：resolve → dispatch 硬條件 → `SubprocessLauncher.launch()` 的 argv／spawn；
+    terminal／usage／quota／cancel／timeout／工具／sandbox 都用 production 實作驗。"""
 
-    class FakeAdapter:
-        def build_argv(self, profile, **kwargs):
-            calls.append("argv")
-            return ["fixture-runtime", profile.resolved_key, kwargs["prompt"]]
+    from paulsha_cortex.coordinator import job_workspace, terminal_contract
 
-        def parse_terminal(self, payload):
-            calls.append("terminal")
-            return {"kind": payload["kind"], "exit_code": payload["exit_code"]}
+    adapter = _fixture_runtime_adapter()
+    # 程式碼登記之前：descriptor／launcher 都不認得這個 runtime，spawn 前即拒絕。
+    with pytest.raises(ValueError, match="unsupported adapter|unknown executor"):
+        launcher.SubprocessLauncher(executor="fixture-rt", model="fixture-model")
+    execution_adapters.register_adapter(adapter)
+    assert execution_adapters.adapter_for("fixture-rt") is adapter
+    with pytest.raises(ValueError, match="already registered"):
+        execution_adapters.register_adapter(adapter)
+    # 新 runtime 沒有受信任 argv 實作、或宣告 launcher 不實作的 cancel／timeout／
+    # terminal 契約，登記即拒絕。
+    for executor, overrides, reason in (
+        ("fixture-noargv", {"argv_builder": None}, "trusted argv"),
+        ("fixture-cancel", {"cancellation_contract": "fixture-kill-v9"}, "cancel"),
+        ("fixture-timeout", {"timeout_contract": "fixture-never-v1"}, "timeout"),
+        ("fixture-terminal", {"terminal_contract": "fixture-terminal-v9"}, "terminal"),
+    ):
+        with pytest.raises(ValueError, match=reason):
+            execution_adapters.register_adapter(
+                replace(_fixture_runtime_adapter(**overrides), executor=executor)
+            )
 
-        def parse_usage(self, payload):
-            calls.append("usage")
-            return {"input_tokens": payload["input_tokens"], "output_tokens": payload["output_tokens"]}
+    spawns: list[dict] = []
 
-        def quota_capability(self):
-            calls.append("quota")
-            return {"state": "unknown", "source": "fixture-only"}
+    class _Proc:
+        pid = 5150
 
-        def cancel(self, process):
-            calls.append("cancel")
-            process.terminate()
+    def _fake_popen(argv, **kwargs):
+        spawns.append({"argv": argv, **kwargs})
+        return _Proc()
 
-        def wait(self, process, timeout):
-            calls.append("timeout")
-            return process.wait(timeout=timeout)
+    monkeypatch.setattr(launcher.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(job_workspace, "prepare_commit_spool", lambda spool_key: tmp_path / "bundle")
 
-        def tools(self, role):
-            calls.append("tools")
-            return {"role": role, "tools": ["fixture-read"]}
+    # --- argv／tools／sandbox：builder profile 由真 launcher 契約導出，launch 發出同一組條件。
+    identity = SimpleNamespace(
+        executor="fixture-rt", model_id="fixture-model", independence_domain="fixture",
+        capabilities=("build", "planning"), profile_provenance=None, executable=None,
+    )
+    builder_launcher = launcher.SubprocessLauncher(
+        executor="fixture-rt", model="fixture-model"
+    ).as_commit_required()
+    binding = execution_adapters.make_launcher_profile(builder_launcher, identity, "builder")
+    resolved = binding.resolved.to_dict()["conditions"]
+    assert resolved["adapter"]["value"] == adapter.descriptor_fields()
+    assert resolved["effort"] == {"state": "known", "value": "eco"}
+    assert resolved["sandbox"]["value"]["id"] == "workspace-write"
+    assert {"id": "git-commit", "version": "1"} in resolved["toolset"]["value"]
+    assert resolved["toolchain"]["value"] == {"id": "fixture-rt", "version": "fixture-adapter-v1"}
+    execution_adapters.validate_dispatch_requirements(
+        binding, identity=identity, trust_root_valid=True
+    )
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    handle = builder_launcher.with_execution_profile(binding).launch(
+        slice_id="fixture-job", prompt="PROMPT", worktree=str(worktree), log_dir=str(tmp_path / "logs")
+    )
+    assert handle.executor == "fixture-rt"
+    assert len(spawns) == 1
+    script = spawns[0]["argv"][2]
+    assert "fixture-rt --model fixture-model --sandbox workspace-write" in script
+    assert "--effort eco" in script and "--commit" in script
+    # cancel：launcher 的 process-group 邊界（adapter 宣告的契約就是 launcher 實作的那一個）。
+    assert adapter.cancel_contract() == "launcher-process-group-v1"
+    assert spawns[0]["start_new_session"] is True
+    assert adapter.timeout_contract_name() == "job-watchdog-v1"
 
-        def sandbox(self, role):
-            calls.append("sandbox")
-            return {"role": role, "mode": "read-only"}
+    planner_launcher = launcher.SubprocessLauncher(
+        executor="fixture-rt", model="fixture-model"
+    ).as_read_only()
+    planner_binding = execution_adapters.make_launcher_profile(planner_launcher, identity, "planner")
+    planner_conditions = planner_binding.resolved.to_dict()["conditions"]
+    assert planner_conditions["sandbox"]["value"]["id"] == "read-only"
+    assert planner_conditions["permissions"]["value"] == [{"id": "read-only", "version": "1"}]
+    assert planner_binding.resolved_key != binding.resolved_key
+    planner_launcher.with_execution_profile(planner_binding).launch(
+        slice_id="fixture-plan", prompt="PLAN", worktree=str(worktree), log_dir=str(tmp_path / "logs")
+    )
+    assert "--sandbox read-only" in spawns[1]["argv"][2]
 
-    adapter = FakeAdapter()
-    argv = adapter.build_argv(binding, prompt="fixture prompt")
-    terminal = adapter.parse_terminal({"kind": "finished", "exit_code": 0})
-    usage = adapter.parse_usage({"input_tokens": 13, "output_tokens": 5})
-    quota = adapter.quota_capability()
-    adapter.cancel(SimpleNamespace(terminate=lambda: None))
+    # --- terminal：共用 terminal contract，不是 adapter 自訂規則。
+    envelope = adapter.parse_terminal(
+        {"schema_version": 2, "kind": "workflow-card", "status": "passed", "gate_evidence": []}
+    )
+    assert envelope.status == "passed"
+    with pytest.raises(terminal_contract.TerminalContractError):
+        adapter.parse_terminal({"schema_version": 2, "kind": "workflow-card", "status": "running"})
 
-    class TimedProcess:
-        def wait(self, timeout):
-            assert timeout == 3
-            raise subprocess.TimeoutExpired("fixture-runtime", timeout)
+    # --- usage：adapter 自己的 extractor，經 production fail-soft 邊界。
+    log = tmp_path / "usage.jsonl"
+    log.write_text(
+        json.dumps({"type": "usage", "usage": {"input_tokens": 13, "output_tokens": 5}}) + "\n",
+        encoding="utf-8",
+    )
+    assert adapter.parse_usage(str(log))["usage"]["input_tokens"] == 13
+    missing = adapter.parse_usage(str(tmp_path / "missing.jsonl"))
+    assert missing["usage"] is None and missing["usage_reason"]
 
-    with pytest.raises(subprocess.TimeoutExpired):
-        adapter.wait(TimedProcess(), timeout=3)
-    tools = adapter.tools("build")
-    sandbox = adapter.sandbox("build")
-    assert argv[0] == "fixture-runtime"
-    assert terminal == {"kind": "finished", "exit_code": 0}
-    assert usage == {"input_tokens": 13, "output_tokens": 5}
-    assert quota["state"] == "unknown"
-    assert tools["tools"] and sandbox["mode"] == "read-only"
-    assert calls == ["argv", "terminal", "usage", "quota", "cancel", "timeout", "tools", "sandbox"]
+    # --- quota：沒有可信 producer 時明示 unknown，不從 usage 推導剩餘額度。
+    assert adapter.quota_capability() == {"state": "unknown", "source": "not-bound"}
 
-    spawn_calls: list[object] = []
-    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *args, **kwargs: spawn_calls.append(args))
+    # --- unsupported：未宣告的 effort、與 profile 不符的 launcher 都在 spawn 前拒絕。
     with pytest.raises(ValueError, match="unsupported effort"):
-        execution_adapters.resolve_profile(
-            identity,
-            "builder",
-            effort="not-in-descriptor",
-            descriptor=_descriptor(effort_values=("fixture-native-v2",)),
+        execution_adapters.resolve_profile(identity, "builder", effort="warp")
+    with pytest.raises(ValueError, match="does not match"):
+        launcher.SubprocessLauncher(
+            executor="fixture-rt", model="fixture-model", effort="turbo"
+        ).as_commit_required().with_execution_profile(binding)
+    with pytest.raises(ValueError, match="effort must be one of"):
+        launcher.SubprocessLauncher(
+            executor="fixture-rt", model="fixture-model", effort="warp"
+        ).as_commit_required().launch(
+            slice_id="fixture-bad", prompt="P", worktree=str(worktree), log_dir=str(tmp_path / "logs")
         )
-    with pytest.raises(ValueError, match="does not match profile"):
-        launcher.SubprocessLauncher(executor="codex", model="different-model").with_execution_profile(
-            binding
-        )
-    assert spawn_calls == []
+    with pytest.raises(ValueError, match="unknown executor|unsupported adapter"):
+        launcher.SubprocessLauncher(executor="fixture-unregistered", model="fixture-model")
+    assert len(spawns) == 2
 
 
 @pytest.mark.parametrize(
@@ -226,7 +330,9 @@ def test_a2_fake_adapter_exercises_argv_terminal_usage_quota_cancel_timeout_tool
 )
 def test_a3_hard_conditions_reject_without_quota_override(case: str) -> None:
     identity = _identity(capabilities=("build", "review"))
-    kwargs = {"quota": {"state": "available", "remaining": 999}}
+    # Trust Root 是必填判定（production 由 `trust_root_compatibility()` 提供）；
+    # 其餘案例明示它成立，確保拒絕來自各自的硬條件。
+    kwargs = {"quota": {"state": "available", "remaining": 999}, "trust_root_valid": True}
     if case == "unknown-role":
         with pytest.raises(ValueError, match="unknown workflow persona"):
             execution_adapters.resolve_profile(identity, "unregistered-role")
@@ -262,10 +368,20 @@ def test_a3_hard_conditions_reject_without_quota_override(case: str) -> None:
     elif case == "trust-root":
         binding = execution_adapters.resolve_profile(identity, "reviewer")
         kwargs["trust_root_valid"] = False
-        expected_reason = "Trust Root"
+        kwargs["trust_root_reason"] = "missing reviewer credential grant"
+        expected_reason = "Trust Root profile is not valid: missing reviewer credential grant"
     kwargs.setdefault("identity", identity)
     with pytest.raises(ValueError, match=expected_reason):
         execution_adapters.validate_dispatch_requirements(binding, **kwargs)
+
+
+def test_a3_trust_root_condition_is_mandatory_at_the_dispatch_boundary() -> None:
+    """舊介面預設 `trust_root_valid=True`，呼叫端不傳就等於永遠成立；現在必填。"""
+
+    identity = _identity(capabilities=("build",))
+    binding = execution_adapters.resolve_profile(identity, "builder")
+    with pytest.raises(TypeError, match="trust_root_valid"):
+        execution_adapters.validate_dispatch_requirements(binding, identity=identity)
 
 
 def test_a3_manager_blocks_sized_dispatch_without_exact_qualification(monkeypatch) -> None:
@@ -612,11 +728,8 @@ def test_a4_actual_key_tracks_conditions_and_never_infers_observed_values() -> N
 def test_a5_binding_migration_and_workflow_restart_preserve_legacy_bytes(tmp_path: Path) -> None:
     identity = _identity()
     binding = execution_adapters.resolve_profile(identity, "builder")
-    legacy_chain = {"builder": {"executor": "copilot", "model_id": "old-pin"}}
-    legacy_bytes = json.dumps(legacy_chain, sort_keys=True).encode()
     encoded = binding.to_dict()
     assert execution_adapters.load_profile_binding(encoded).to_dict() == encoded
-    assert json.dumps(legacy_chain, sort_keys=True).encode() == legacy_bytes
     with pytest.raises(ValueError, match="schema"):
         execution_adapters.load_profile_binding({**encoded, "schema_version": 88})
     with pytest.raises(ValueError, match="descriptor"):
@@ -661,9 +774,19 @@ def test_a5_binding_migration_and_workflow_restart_preserve_legacy_bytes(tmp_pat
     before_chain = deepcopy(run.resolved_model_chain)
     before_attempts = deepcopy(run.attempts)
     before_evidence = tuple(run.evidence_refs)
-    updated = registry._manager_update_workflow_run(
+
+    def _persisted_legacy_bytes() -> bytes:
+        # 直接讀磁碟上的 registry 狀態（不是記憶體物件），比對 legacy 欄位的序列化位元組。
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        record = next(item for item in payload["workflows"] if item["run_id"] == run.run_id)
+        legacy = {key: record[key] for key in ("resolved_model_chain", "attempts", "evidence_refs")}
+        return json.dumps(legacy, sort_keys=True).encode()
+
+    legacy_bytes = _persisted_legacy_bytes()
+    registry._manager_update_workflow_run(
         run.run_id, execution_profile_bindings={"builder": encoded}
     )
+    assert _persisted_legacy_bytes() == legacy_bytes
     registry = JobRegistry(state_path)
     restored = registry.get_workflow_run(run.run_id)
     assert restored.execution_profile_bindings["builder"] == encoded
