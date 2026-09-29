@@ -462,8 +462,28 @@ def _installed_checks(
                 or not isinstance(candidate_commit, str)
                 or SHA40.fullmatch(candidate_commit) is None
             ):
+                def _wheel_state(value: object) -> str:
+                    if not isinstance(value, str):
+                        return "missing"
+                    return "match" if value == wheel_sha256 else "mismatch"
+
                 raise QualificationFailure(
-                    f"system-scope {name} wheel/commit receipt binding is incomplete"
+                    f"system-scope {name} wheel/commit receipt binding is incomplete: "
+                    f"receipt_wheel={'present' if isinstance(wheel_sha256, str) else 'missing'} "
+                    "installed_wheel="
+                    + _wheel_state(
+                        installed_artifact.get("wheel_sha256")
+                        if isinstance(installed_artifact, Mapping)
+                        else None
+                    )
+                    + f" loaded_wheel={_wheel_state(comparison.get('loaded_wheel_sha256'))}"
+                    + " candidate_commit="
+                    + (
+                        "valid"
+                        if isinstance(candidate_commit, str)
+                        and SHA40.fullmatch(candidate_commit) is not None
+                        else "invalid"
+                    )
                 )
         _write_json(evidence_dir / "system-loaded-runtime-status.json", status_payload)
     return [
