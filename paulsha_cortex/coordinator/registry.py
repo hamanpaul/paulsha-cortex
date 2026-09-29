@@ -26,6 +26,7 @@ from .diagnostics import (
 )
 from .usage_extractors import extract_usage
 from .workflow import (
+    STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
     GateEvidenceRef,
     PlanningArtifactAuthority,
     PlanReviewReceipt,
@@ -420,6 +421,47 @@ def describe_stage_execution_mismatch(
     if normalized_current != normalized_stored:
         mismatched.append("frozen_input_hashes")
     return tuple(mismatched)
+
+
+#: #844：authority restart 讓 verify／review 卡回 pending 時寫入的 receipt 原因。
+AUTHORITY_RESTART_STAGE_REUSE_REASON = "authority-restart"
+
+
+def authority_restart_stage_reuse_receipts(
+    run: WorkflowRun,
+) -> dict[str, dict[str, Any]] | None:
+    """#844 S09／S11：authority restart 之後 verify／review 卡的 reuse 狀態。
+
+    被打回 pending、而且之前確實有狀態（已有 receipt，或 gate 不是 pending）
+    的卡，一律標 ``ineligible``／``authority-restart``；前一張 receipt 的 key
+    記為 ``superseded_key`` 供追溯。其他卡的 receipt 原樣保留；完全沒有東西
+    要標記時回傳原值（``None`` 維持 None）。
+    """
+
+    receipts = dict(run.stage_reuse_receipts or {})
+    changed = False
+    for step in run.steps:
+        if step.phase not in {"verify", "review"}:
+            continue
+        prior = receipts.get(step.card)
+        if prior is None and step.gate_result == "pending":
+            continue
+        entry: dict[str, Any] = {
+            "decision": "ineligible",
+            "receipt_schema_version": STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
+            "reason": AUTHORITY_RESTART_STAGE_REUSE_REASON,
+        }
+        if isinstance(prior, dict):
+            prior_key = prior.get("stage_execution_key") or prior.get("superseded_key")
+            if (
+                isinstance(prior_key, str)
+                and len(prior_key) == 64
+                and all(char in "0123456789abcdef" for char in prior_key)
+            ):
+                entry["superseded_key"] = prior_key
+        receipts[step.card] = entry
+        changed = True
+    return receipts if changed else run.stage_reuse_receipts
 
 
 def _default_state_path() -> Path:
@@ -2954,7 +2996,30 @@ class JobRegistry:
         # `workflow_stage_execution_key` 時一併寫入；舊狀態檔／只帶 key 沒帶
         # receipt 的既有測試 fixture 缺席時維持 None，不補值（S10）。
         stage_execution_receipt = job.get("workflow_stage_execution_receipt")
-        if stage_execution_receipt is not None:
+        receipt_schema_version = (
+            stage_execution_receipt.get("schema_version")
+            if isinstance(stage_execution_receipt, dict)
+            else None
+        )
+        if (
+            stage_execution_receipt is not None
+            and receipt_schema_version != STAGE_EXECUTION_KEY_SCHEMA_VERSION
+        ):
+            # #844 S10：其他 schema 版本（升版前寫下的舊 receipt，或 rollback 後
+            # 讀到的較新 receipt）只驗最小形狀，不讓整份 registry 讀取 fail
+            # closed；這種 receipt 永遠不會被當成可重用來源——probe 以
+            # schema_version 不符判定 stale，強制新 attempt。
+            if (
+                not isinstance(receipt_schema_version, int)
+                or isinstance(receipt_schema_version, bool)
+                or receipt_schema_version < 1
+                or stage_execution_receipt.get("key") != stage_execution_key
+            ):
+                raise ValueError(
+                    "coordinator 狀態檔 workflow_stage_execution_receipt 格式錯誤"
+                    f"（fail-closed）: {self._state_path}"
+                )
+        elif stage_execution_receipt is not None:
             required_receipt_keys = set(STAGE_EXECUTION_KEY_STRING_FIELDS) | {
                 "schema_version", "frozen_input_hashes", "key",
             }
@@ -6407,6 +6472,11 @@ class JobRegistry:
             current,
             current_phase="verify",
             steps=steps,
+            # #844 S09／S11：新 claim-era 不接受前代 era 的 stage evidence（跨
+            # era 採信不在 reuse 安全 cohort）。與 gate reset 同一次寫入，把被
+            # 打回 pending 的卡標成 ineligible／authority-restart，status 才說得
+            # 出「為什麼同一個 candidate 的已接受 gate 要重跑」。
+            stage_reuse_receipts=authority_restart_stage_reuse_receipts(current),
             attempts={
                 **current.attempts,
                 "verify": current.attempts.get("verify", 0) + 1,
