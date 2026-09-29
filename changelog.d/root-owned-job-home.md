@@ -1,0 +1,1 @@
+- job_runner 接受 installer 建立的 root-owned job HOME（root:root 0755，保護 root-owned 的 `.gitconfig`／credential symlink）；帳號或 root 擁有但 group／other 可寫的 HOME 改為拒絕（`job-runner-home-writable-by-others`），其他帳號擁有的仍拒絕。修正三 UID 主機上所有降權 job 在 launch 前以 `job-runner-home-owner-mismatch` 失敗（#1189）。

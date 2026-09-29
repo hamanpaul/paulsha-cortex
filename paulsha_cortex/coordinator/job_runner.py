@@ -1345,6 +1345,12 @@ def _assess_home_path(value: str) -> tuple[str | None, os.stat_result | None]:
     return None, stat_result
 
 
+#: installer（``permgen.PathLayout.scaffold_directories``）把 job 帳號的 HOME 建成
+#: root:root 0755：job 不能替換 root-owned 的 ``~/.gitconfig``、``~/.codex`` sticky
+#: tree 與 credential symlink。這種 HOME 與帳號自己擁有的 HOME 一樣可接受（#1189）。
+HOME_ROOT_OWNER_UID = 0
+
+
 def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDER) -> str:
     """解析本角色的 job `HOME`。#692 起與 `PATH` 同樣 fail-closed。"""
 
@@ -1363,9 +1369,17 @@ def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
         if (
             problem is None
             and stat_result is not None
-            and stat_result.st_uid != account_ids[0]
+            and stat_result.st_uid not in {account_ids[0], HOME_ROOT_OWNER_UID}
         ):
             problem = "owner-mismatch"
+        elif (
+            problem is None
+            and stat_result is not None
+            and stat.S_IMODE(stat_result.st_mode) & 0o022
+        ):
+            # 帳號或 root 擁有但 group／other 可寫：其他帳號能在這格 HOME 放入
+            # 或替換 job 會讀取的設定。
+            problem = "writable-by-others"
     if problem is None:
         return value
     hint = _home_contract_hint(config)
@@ -1418,9 +1432,17 @@ def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
             f"{hint}"
         )
         reason = "job-runner-home-not-directory"
+    elif problem == "writable-by-others":
+        detail = (
+            f"{config.home_env} 不得被 group／other 寫入；其他帳號可在這格 HOME 放入或"
+            "替換 job 會讀取的設定。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-writable-by-others"
     else:
         detail = (
-            f"{config.home_env} 的 owner 必須是 {account}；這一格 HOME 若屬於別人，job 的 "
+            f"{config.home_env} 的 owner 必須是 {account} 或 root（installer 建立的形狀）；"
+            "這一格 HOME 若屬於其他帳號，job 的 "
             "state / credentials 就會落在錯帳號的樹。"
             f"{hint}"
         )
