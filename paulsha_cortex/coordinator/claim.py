@@ -1819,13 +1819,18 @@ def needs_human_next_actions(
       （R1 fail-closed），與 `work_actions._recover_planning_action` 自身的前置驗
       （`run.current_phase != "define"` 與 `classification != "environment"` 兩條
       拒收）同一組條件——宣告一個保證失敗的動作比不宣告更糟（#382）。
+    - #1141：job 層動作帶 `retire-delivered`（`work_actions._phase_recovery_actions`
+      只在 delivery journal 證明本 run 的交付 PR 已由 Manager merge 時宣告）代表
+      run 已交付——`abandon` 的 pre-delivery admission 對帶 pr_refs 的 run 必拒，
+      基礎集合改成 `retire-delivered`，同樣不可能回空集合。
     """
 
-    base = (
-        ("recover-planning", "abandon")
-        if planning_failure_classification == "environment" and phase == "define"
-        else ("abandon",)
-    )
+    if "retire-delivered" in job_recovery_actions:
+        base: tuple[str, ...] = ("retire-delivered",)
+    elif planning_failure_classification == "environment" and phase == "define":
+        base = ("recover-planning", "abandon")
+    else:
+        base = ("abandon",)
     return (*base, *(action for action in job_recovery_actions if action not in base))
 
 
@@ -1836,18 +1841,22 @@ def needs_human_next_step_hint(
     work_id: object = None,
     repo: object = None,
     run_id: object = None,
+    job_recovery_actions: tuple[str, ...] = (),
 ) -> str:
     """Return the operator-facing hint paired with ``needs_human_next_actions``.
 
     The action set is deliberately derived first so the hint cannot advertise a
     recovery path that the claim policy does not expose.  Content failures have
     no safe automatic recovery: the accepted planning triplet must be repaired,
-    the stuck run abandoned, and intake started again.
+    the stuck run abandoned, and intake started again.  #1141: a delivered run
+    (``retire-delivered`` in the job-level actions) points at retire-delivered,
+    never at the pre-delivery-only abandon.
     """
 
     actions = needs_human_next_actions(
         phase=phase,
         planning_failure_classification=planning_failure_classification,
+        job_recovery_actions=job_recovery_actions,
     )
 
     def hint_value(value: object, fallback: str, pattern: str) -> str:
@@ -1863,6 +1872,14 @@ def needs_human_next_step_hint(
         f"--expected-run-id {safe_run_id} --actor <operator> "
         "--reason '<single-line reason>'`"
     )
+    if "retire-delivered" in actions:
+        return (
+            "此 run 的交付 PR 已由 Manager merge（abandon 只受理尚未交付的 run）；"
+            "請檢視阻塞證據，接著執行 "
+            f"`cortex work retire-delivered {safe_work_id} --repo {safe_repo} "
+            f"--expected-run-id {safe_run_id} --actor <operator> "
+            "--reason '<single-line reason>'`。"
+        )
     if planning_failure_classification == "content":
         return (
             "規劃內容遭拒；請先恢復可接受的 spec/design/plan 三件套，接著執行 "
@@ -1909,6 +1926,7 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             work_id=candidate.work_id,
             repo=candidate.repo,
             run_id=candidate.active_run_id,
+            job_recovery_actions=candidate.active_recovery_actions,
         )
         return ClaimDecision(
             action="needs_human",

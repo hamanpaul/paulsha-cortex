@@ -1037,6 +1037,8 @@ quota 不會在同一個 identity 上重試；Builder roster 有其他合格 ide
 Merge 後 Manager 會從 canonical checkout fetch default branch，以本機 Git 驗證雙親 merge commit ancestry、OpenSpec tree 與 mapped Todo blob SHA／內容；issue closed 仍由 GitHub API 讀取，並照常驗證 CompletionRecord。shallow checkout 會 fail-closed 並提供診斷，不自動 unshallow。workstream Todo 未勾 checkbox 只作觀測，不阻擋 remote closure。若 work item 有 mapped OpenSpec，仍要求 active OpenSpec 消失且 archive 成立，archived tasks 仍須通過既有 archive gate；`mapped_openspec == ()` 時不要求 archive。其餘 closure 證據不成立時不會提早標 `done`。
 
 若舊版 `authority-restart` 已把 run reset 到 `verify`，但同一 run 的完整 merge authorization 與 delivery journal 仍確認 Candidate 已 merge，`resume` 會停止且不重派 verify，並提示 `cortex work <work-id> retire-delivered`。此出口保留退休／abandoned 語意，不代表 shipped completion。
+
+Ship lane 自動 merge 後，Monitor 會把交付 PR 以 terminal 狀態關聯進 WorkAuthority，`Closes #N` 也會關閉 issue。只要 delivery journal 的完整 merge authorization 證明該 PR 是本 run 已 merge 的交付，且 authority 的 PR 集合恰好只有這一個，closure 就會綁回同一個 run，完成 CompletionRecord 並標記為 `done`（#1141）。若 authority 出現其他 PR，或 PR 不是由本 run merge，仍會 fail-closed。已交付的 run 若停在 `needs_human`，`status`／work list 會列出 `retire-delivered`，不再列出必定被拒絕的 `abandon`。
 `close-delivered` 使用相同的 strict closure 條件，僅補足缺失的 operator CompletionRecord；遠端 issue、PR、OpenSpec 或 Todo 證據未全通過時不會結案。
 
 ### 目前邊界

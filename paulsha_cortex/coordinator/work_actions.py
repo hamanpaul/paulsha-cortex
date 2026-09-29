@@ -1198,13 +1198,60 @@ def _append_delivery_publication_event(
         }
 
 
-def _canonical_workflow_run(*, workflow_registry, authority):
+def _merged_delivery_authority_compatible(
+    authority, run, *, merged_delivery_journal: Path | None
+) -> bool:
+    """#1141：run 自己的交付 PR 已由 ship lane merge 後，authority 前進不使 run 失聯。
+
+    Manager 自動 merge 後，Monitor 會把該 PR 以 terminal 狀態（``state:closed``／
+    ``state:merged``）關聯進 WorkAuthority，``Closes #N`` 也把 issue 轉成 closed——
+    authority digest 因此離開 claim-era，``self_only_authority_drift_matches``
+    （#847）只認 open PR，於是 closure 前的 ship 重入找不到任何 run。
+
+    只在 delivery journal 以完整 merge authorization 證明「本 run 的交付 PR 已 merge」
+    時成立（``manager._merged_delivery_journal_binding``，與 claim 路徑 #887 的
+    merged-delivery-closure 同一個判準），而且 authority 的 PR 集合必須**恰好**是那一個
+    交付 PR、run 的 pr_refs 也只綁它：authority 出現其他 PR、PR 尚未由本 run merge、
+    或呼叫端沒有提供 journal，一律回 False，交回原本的 claim-era 判準 fail-closed。
+    它只綁定 run；remote closure 仍由 ``verify_remote_closure`` 以 current authority
+    向 GitHub 重驗。
+    """
+
+    if merged_delivery_journal is None:
+        return False
+    from .manager import _merged_delivery_journal_binding
+
+    binding = _merged_delivery_journal_binding(
+        run, journal_path=merged_delivery_journal
+    )
+    if binding is None:
+        return False
+    pr_number = binding["pr_number"]
+    return (
+        run.repo == authority.repo
+        and run.work_id == authority.work_id
+        and authority.mapped_prs == (pr_number,)
+        and tuple(getattr(run, "pr_refs", ()) or ())
+        == (f"{authority.repo}#{pr_number}",)
+    )
+
+
+def _canonical_workflow_run(
+    *, workflow_registry, authority, merged_delivery_journal: Path | None = None
+):
     matches = [
         run
         for run in workflow_registry.list_workflow_runs()
         if run.repo == authority.repo
         and run.work_id == authority.work_id
-        and authority_matches_claim_era(authority, run)
+        and (
+            authority_matches_claim_era(authority, run)
+            # #1141：只有 ship lane 帶 journal 進來；本 run 已 merge 的交付 PR
+            # 反映進 authority 之後仍綁回同一個 run 走 closure。
+            or _merged_delivery_authority_compatible(
+                authority, run, merged_delivery_journal=merged_delivery_journal
+            )
+        )
         and run.issue_refs
         == tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
         # A workflow's planning cards may create the active OpenSpec change
@@ -1250,11 +1297,17 @@ def _delivery_journal_row(run, authority) -> dict[str, Any]:
 
 
 def _load_work_run(
-    *, state_path: Path, workflow_registry, authority
+    *,
+    state_path: Path,
+    workflow_registry,
+    authority,
+    allow_merged_delivery: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], object]:
     run = _canonical_workflow_run(
         workflow_registry=workflow_registry,
         authority=authority,
+        # #1141：只有 ship lane 需要在 merge 後續跑 closure；其他動作維持原判準。
+        merged_delivery_journal=state_path if allow_merged_delivery else None,
     )
     state = _load_runs(state_path)
     active = state["runs"].get(run.run_id)
@@ -1457,7 +1510,13 @@ def _resume_existing_candidate_after_authority_change(
     return {"action": "resume", "reason": "active-workflow", "run": active}
 
 
-def _validate_current_run_authority(active: dict[str, Any], authority, canonical_run) -> None:
+def _validate_current_run_authority(
+    active: dict[str, Any],
+    authority,
+    canonical_run,
+    *,
+    merged_delivery_journal: Path | None = None,
+) -> None:
     expected = {
         "claim_key": canonical_run.claim_key,
         "source_revisions": list(authority.source_revisions),
@@ -1468,7 +1527,14 @@ def _validate_current_run_authority(active: dict[str, Any], authority, canonical
         "mapped_todo_paths": list(authority.mapped_todo_paths),
     }
     if (
-        not authority_matches_claim_era(authority, canonical_run)
+        not (
+            authority_matches_claim_era(authority, canonical_run)
+            or _merged_delivery_authority_compatible(
+                authority,
+                canonical_run,
+                merged_delivery_journal=merged_delivery_journal,
+            )
+        )
         or any(active.get(field) != value for field, value in expected.items())
     ):
         raise RuntimeError("persisted workflow does not match current WorkAuthority")
@@ -4732,7 +4798,55 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
             actions.append("recover-pre-candidate")
     except Exception:  # noqa: BLE001 - incomplete owner/job evidence fails closed
         pass
+    if "retire-delivered" not in actions and _merged_delivery_retirement_admitted(
+        run, workflow_registry
+    ):
+        actions.append("retire-delivered")
     return tuple(actions)
+
+
+def _merged_delivery_retirement_admitted(run, workflow_registry) -> bool:
+    """#1141：已交付 run 卡在 needs_human 時，正式出口是 `retire-delivered`。
+
+    Manager 自己 merge 的交付（delivery journal 有完整 merge authorization 與 merge
+    commit，見 `manager._merged_delivery_journal_bound`）之後若 resume 仍失敗，run
+    帶著 pr_refs——`abandon` 的 pre-delivery admission 必拒，operator 只能
+    `retire-delivered`。這裡只在該動作的本地 admission 全數成立時宣告：run ongoing、
+    沒有 active job、同 work 沒有其他 ongoing run；PR 的 terminal 狀態由 journal 的
+    merged 紀錄（merge 當下向 GitHub 確認過）背書，投影不另打 GitHub。拿不準就不
+    宣告（#382）。
+    """
+
+    state_path = getattr(workflow_registry, "_state_path", None)
+    if (
+        getattr(run, "status", None) != "ongoing"
+        or not getattr(run, "pr_refs", ())
+        or not isinstance(state_path, (str, Path))
+    ):
+        return False
+    try:
+        from .manager import _merged_delivery_journal_bound
+        from .registry import ACTIVE_JOB_STATUSES
+
+        if not _merged_delivery_journal_bound(
+            run, journal_path=Path(state_path).parent / "delivery-journal.json"
+        ):
+            return False
+        if any(
+            item.run_id != run.run_id
+            and item.repo == run.repo
+            and item.work_id == run.work_id
+            and item.status == "ongoing"
+            for item in workflow_registry.list_workflow_runs()
+        ):
+            return False
+        return not any(
+            job.get("workflow_run_id") == run.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in workflow_registry.list_jobs()
+        )
+    except Exception:  # noqa: BLE001 - uncertain registry state yields no action
+        return False
 
 
 def _retry_card_target_jobs(run, jobs, *, card: str) -> list[dict[str, Any]]:
@@ -8454,8 +8568,11 @@ def _ship_action(
         state_path=state_path,
         workflow_registry=workflow_registry,
         authority=authority,
+        allow_merged_delivery=True,
     )
-    _validate_current_run_authority(active, authority, canonical_run)
+    _validate_current_run_authority(
+        active, authority, canonical_run, merged_delivery_journal=state_path
+    )
     # #218 AC1：work-item repair budget 依 sizing band 參數化；band 尚未掛
     # （None，#222 既有 work item）時 repair_budget_for_band fail-soft 回退到
     # 現行 MAX_FIX_ROUNDS=2。red 由 repair_budget_for_band 防禦性拒絕——

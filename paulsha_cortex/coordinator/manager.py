@@ -61,6 +61,7 @@ from .claim import (
     decomposition_route,
     needs_human_next_actions,
     needs_human_next_step_hint,
+    planning_declared_openspec_changes,
 )
 from . import model_resolution
 from .diagnostics import (
@@ -1600,11 +1601,23 @@ def workflow_status_entry(
             main_sync_retry_build_next_step_hint,
         )
 
+        recovery_actions = _phase_recovery_actions(run, registry)
         next_actions = needs_human_next_actions(
             phase=getattr(run, "current_phase", None),
             planning_failure_classification=hint_classification,
-            job_recovery_actions=_phase_recovery_actions(run, registry),
+            job_recovery_actions=recovery_actions,
         )
+        if persisted_next_step_hint is None and "retire-delivered" in next_actions:
+            # #1141：已交付的 run（journal 證明交付 PR 已 merge）不得再指向必被拒的
+            # abandon；hint 與 next_actions 同源導出。
+            next_step_hint = needs_human_next_step_hint(
+                phase=getattr(run, "current_phase", None),
+                planning_failure_classification=hint_classification,
+                work_id=getattr(run, "work_id", None),
+                repo=getattr(run, "repo", None),
+                run_id=getattr(run, "run_id", None),
+                job_recovery_actions=recovery_actions,
+            )
         if (
             persisted_next_step_hint is None
             and reason_code == "blocking-findings"
@@ -1663,6 +1676,7 @@ def workflow_status_entry(
                 work_id=getattr(run, "work_id", None),
                 repo=getattr(run, "repo", None),
                 run_id=getattr(run, "run_id", None),
+                job_recovery_actions=filtered_next_actions,
             )
             if not filtered_next_actions:
                 next_step_hint = "目前沒有符合正式入口前置條件的 recovery action。"
@@ -15409,40 +15423,64 @@ def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
     grants completion; resume uses it to avoid invalidating a run whose merge
     was already authorized and durably recorded.
     """
+    return _merged_delivery_journal_binding(run, journal_path=journal_path) is not None
+
+
+# git object id：SHA-1 repo 為 40-hex（preflight 以 `verification.SAFE_SHA_RE` 驗
+# tree_hash），SHA-256 object format 為 64-hex。
+_GIT_OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _merged_delivery_journal_binding(
+    run, *, journal_path: str | Path
+) -> dict[str, object] | None:
+    """回傳此 run 已由 Manager merge 的交付綁定（``pr_number``／``change``／``todo_paths``）。
+
+    與 ``_merged_delivery_journal_bound`` 同一組判準（單一真相）：delivery journal 的
+    ``ship`` 已到 ``merged``／``done``、帶 merge commit，且 merge authorization 證據
+    （唯讀檔、payload／hash 完全一致）逐欄綁定本 run 與 exact candidate。不符回
+    ``None``。它只證明「這個 run 的交付 PR 已 merge」，不證明 remote closure。
+
+    #1141：
+    - ``tree_hash`` 是 preflight 算出的 git tree id（SHA-1 repo 為 40-hex）；舊判準只收
+      64-hex，production 的 merge authorization 因此永遠不被承認。
+    - ``change`` 可以是 run 自己 planning 宣告建立的 OpenSpec change（#776：
+      ``run.openspec_refs`` 是 claim 時快照，不含之後才落地的 run 自產 change）。
+    """
     path = Path(journal_path)
     try:
         if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
-            return False
+            return None
         journal = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
+        return None
     if not isinstance(journal, dict) or journal.get("schema") != "cortex-delivery-journal/v1":
-        return False
+        return None
     runs = journal.get("runs")
     row = runs.get(run.run_id) if isinstance(runs, dict) else None
     if not isinstance(row, dict) or any(
         row.get(field) != getattr(run, field, None)
         for field in ("run_id", "repo", "work_id")
     ):
-        return False
+        return None
 
     expected_step_ids = [
         f"{run.run_id}:{step.phase}:{step.card}"
         for step in getattr(run, "steps", ())
     ]
     if not expected_step_ids or row.get("workflow_step_ids") != expected_step_ids:
-        return False
+        return None
     binding = row.get("delivery_binding")
     if not isinstance(binding, dict) or set(binding) != {
         "pr_number", "change", "todo_paths"
     }:
-        return False
+        return None
 
     ship = row.get("ship")
     if not isinstance(ship, dict):
-        return False
+        return None
     if any(ship.get(field) != binding[field] for field in binding):
-        return False
+        return None
     candidate = getattr(run, "candidate_head", None)
     merge_commit = ship.get("merge_commit")
     if (
@@ -15453,13 +15491,13 @@ def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
         or not isinstance(merge_commit, str)
         or verification.SAFE_SHA_RE.fullmatch(merge_commit) is None
     ):
-        return False
+        return None
 
     authorization = ship.get("merge_authorization")
     if not isinstance(authorization, dict) or set(authorization) != {
         "path", "hash", "payload"
     }:
-        return False
+        return None
     evidence_path_value = authorization.get("path")
     digest = authorization.get("hash")
     body = authorization.get("payload")
@@ -15470,7 +15508,7 @@ def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
         or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         or not isinstance(body, dict)
     ):
-        return False
+        return None
 
     common_fields = {
         "schema", "run_id", "workflow_step_ids", "repo", "work_id",
@@ -15494,7 +15532,7 @@ def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
             frozenset(expected_fields | superseded_fields),
         }
     else:
-        return False
+        return None
 
     body_binding = {
         "pr_number": body.get("pr_number"),
@@ -15514,7 +15552,7 @@ def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
         or not isinstance(body.get("authority_digest"), str)
         or re.fullmatch(r"[0-9a-f]{64}", body["authority_digest"]) is None
         or not isinstance(body.get("tree_hash"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", body["tree_hash"]) is None
+        or _GIT_OBJECT_ID_RE.fullmatch(body["tree_hash"]) is None
         or not isinstance(pr_number, int)
         or isinstance(pr_number, bool)
         or pr_number <= 0
@@ -15526,24 +15564,25 @@ def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
         or (
             change is not None
             and change not in getattr(run, "openspec_refs", ())
+            and change not in planning_declared_openspec_changes(run)
         )
         or f"{run.repo}#{pr_number}" not in getattr(run, "pr_refs", ())
     ):
-        return False
+        return None
     for field in ("foreign_review_hash", "preflight_hash", "checks_hash"):
         if not isinstance(body.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", body[field]) is None:
-            return False
+            return None
     if not isinstance(body.get("foreign_review_path"), str) or not Path(
         body["foreign_review_path"]
     ).is_absolute():
-        return False
+        return None
     if body.get("schema") == "cortex-merge-authorization/v1":
         requested_at = body.get("copilot_requested_at_epoch")
         review_id = body.get("copilot_review_id")
         try:
             requested_at_finite = math.isfinite(float(requested_at))
         except (OverflowError, TypeError, ValueError):
-            return False
+            return None
         if (
             not isinstance(requested_at, (int, float))
             or isinstance(requested_at, bool)
@@ -15554,7 +15593,7 @@ def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
             or not isinstance(body.get("copilot_hash"), str)
             or re.fullmatch(r"[0-9a-f]{64}", body["copilot_hash"]) is None
         ):
-            return False
+            return None
     elif (
         body.get("review_kind") != "maintainer-review"
         or not isinstance(body.get("review_ref"), str)
@@ -15562,31 +15601,37 @@ def _merged_delivery_journal_bound(run, *, journal_path: str | Path) -> bool:
         or not isinstance(body.get("review_hash"), str)
         or re.fullmatch(r"[0-9a-f]{64}", body["review_hash"]) is None
     ):
-        return False
+        return None
     if "superseded_authorization_ref" in body and (
         not isinstance(body.get("superseded_authorization_ref"), str)
         or not Path(body["superseded_authorization_ref"]).is_absolute()
         or not isinstance(body.get("superseded_authorization_hash"), str)
         or re.fullmatch(r"[0-9a-f]{64}", body["superseded_authorization_hash"]) is None
     ):
-        return False
+        return None
 
     try:
         evidence_path = Path(evidence_path_value)
         if evidence_path.is_symlink() or not stat.S_ISREG(evidence_path.lstat().st_mode):
-            return False
+            return None
         if evidence_path.stat().st_mode & 0o222:
-            return False
+            return None
         wrapper = json.loads(evidence_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    return (
+        return None
+    if not (
         isinstance(wrapper, dict)
         and set(wrapper) == {"payload", "hash"}
         and wrapper.get("payload") == body
         and wrapper.get("hash") == digest
         and verification.canonical_json_hash(body) == digest
-    )
+    ):
+        return None
+    return {
+        "pr_number": pr_number,
+        "change": change,
+        "todo_paths": list(todo_paths),
+    }
 
 
 def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path) -> bool:
