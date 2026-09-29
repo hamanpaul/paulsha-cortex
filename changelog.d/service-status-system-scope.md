@@ -1,0 +1,1 @@
+- 新增 `cortex service status --system`，比對 system unit、Manager／Monitor loaded receipt 與 operator 可讀的 Trust Root install receipt；installed wheel 以 wheel SHA-256 綁定 candidate commit，並更新 RC qualification 與 system deployment 操作文件。

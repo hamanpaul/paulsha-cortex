@@ -345,7 +345,11 @@ def _service_rows() -> list[dict[str, object]]:
 
 
 def _installed_checks(
-    *, install_evidence: Path, receipt: Mapping[str, Any], evidence_dir: Path
+    *,
+    install_evidence: Path,
+    receipt: Mapping[str, Any],
+    evidence_dir: Path,
+    require_system_status: bool = True,
 ) -> list[dict[str, str]]:
     install = _load_json(install_evidence, "install verification evidence")
     if (
@@ -389,11 +393,66 @@ def _installed_checks(
             "receipt_id": receipt.get("receipt_id"),
         },
     )
+    if require_system_status:
+        system_status = _run(
+            (
+                "/opt/cortex/venv/bin/cortex",
+                "service",
+                "status",
+                "--system",
+                "--json",
+            ),
+            env=_installed_runtime_env(),
+        )
+        _require_success(system_status, "system-scope loaded runtime status")
+        try:
+            status_payload = json.loads(system_status.stdout)
+        except json.JSONDecodeError as exc:
+            raise QualificationFailure("system-scope status returned invalid JSON") from exc
+        service = status_payload.get("service") if isinstance(status_payload, Mapping) else None
+        loaded_runtime = service.get("loaded_runtime") if isinstance(service, Mapping) else None
+        if not isinstance(loaded_runtime, Mapping):
+            raise QualificationFailure("system-scope status omitted loaded runtime evidence")
+        for name in ("manager", "monitor"):
+            report = loaded_runtime.get(name)
+            comparison = report.get("comparison") if isinstance(report, Mapping) else None
+            if not isinstance(comparison, Mapping) or any(
+                comparison.get(key) != "match"
+                for key in ("artifact_status", "config_status", "process_status")
+            ):
+                raise QualificationFailure(
+                    f"system-scope {name} loaded artifact/config/process did not match"
+                )
+            trust_root = report.get("trust_root")
+            if not isinstance(trust_root, Mapping) or trust_root.get("status") != "verified":
+                raise QualificationFailure(
+                    f"system-scope {name} Trust Root receipt is not verified"
+                )
+            installed_artifact = report.get("installed_artifact")
+            wheel_sha256 = trust_root.get("wheel_sha256")
+            candidate_commit = trust_root.get("candidate_commit")
+            if (
+                not isinstance(installed_artifact, Mapping)
+                or not isinstance(wheel_sha256, str)
+                or installed_artifact.get("wheel_sha256") != wheel_sha256
+                or comparison.get("loaded_wheel_sha256") != wheel_sha256
+                or not isinstance(candidate_commit, str)
+                or SHA40.fullmatch(candidate_commit) is None
+            ):
+                raise QualificationFailure(
+                    f"system-scope {name} wheel/commit receipt binding is incomplete"
+                )
+        _write_json(evidence_dir / "system-loaded-runtime-status.json", status_payload)
     return [
         {"name": "selfcheck", "status": "passed"},
         {"name": "registry-equation", "status": "passed"},
         {"name": "generated-installed-attestation", "status": "passed"},
         {"name": "service-identity-hardening", "status": "passed"},
+        *(
+            [{"name": "system-loaded-runtime-attestation", "status": "passed"}]
+            if require_system_status
+            else []
+        ),
     ]
 
 
@@ -4985,6 +5044,7 @@ def main() -> int:
             install_evidence=args.install_evidence,
             receipt=receipt,
             evidence_dir=args.evidence_dir,
+            require_system_status=not legacy_profile,
         )
         providers: list[dict[str, object]] = []
         if legacy_profile:
