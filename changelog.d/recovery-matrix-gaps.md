@@ -1,0 +1,1 @@
+- 補強 #843 recovery matrix dispatcher branch conformance 與機讀未完成 gap/full-plan gate；記錄 RC multi-UID ACL 證據和 action-level reclaim 驗收缺口。

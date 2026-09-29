@@ -110,6 +110,7 @@ def test_recover_keeps_a_brainstorm_required_run_in_define(tmp_path: Path) -> No
 
     run_id, registry, state, snapshot = _seed(tmp_path, brainstorm_required=True)
     before = registry.get_workflow_run(run_id)
+    jobs_before = registry.list_jobs()
     assert before.current_phase == "define"
     assert "needs_human" in before.facets
     assert not [ref for ref in before.gate_refs if ref.kind == "brainstorm"]
@@ -119,7 +120,8 @@ def test_recover_keeps_a_brainstorm_required_run_in_define(tmp_path: Path) -> No
 
     # 恢復本身仍然成立——封鎖被解除。
     assert result["action"] == "recovered"
-    assert result["reason"] == "planning-recovery-dispatched"
+    assert result["reason"] == "planning-recovery-unblocked"
+    assert registry.list_jobs() == jobs_before
     assert "needs_human" not in after.facets
     assert "blocked" not in after.facets
     # 但 phase 留在 define，交還給正常流程重跑並自然產生 evidence。
@@ -230,7 +232,7 @@ def test_recover_planning_crash_restart_replays_one_immutable_record(
 
     assert run.current_phase == "plan"
     assert "needs_human" not in run.facets
-    assert result["reason"] in {"planning-recovery-dispatched", "already-recovered"}
+    assert result["reason"] in {"planning-recovery-unblocked", "already-recovered"}
     records = [
         path
         for path in (tmp_path / "evidence" / "planning-recovery").glob("*.json")

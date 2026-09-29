@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 from pathlib import Path
@@ -154,6 +155,30 @@ def test_r01_formal_dispatchers_and_public_entrypoints_share_registered_choices(
     assert _choice_set(porcelain_recover._build_parser(), "slice") == set(
         recovery_contracts.RECOVER_SLICE_ACTION_CHOICES
     )
+
+
+def test_r01_work_action_dispatcher_has_a_branch_for_every_registered_recovery() -> None:
+    """Registered names need an actual execute_work_action branch, not self-equality."""
+    tree = ast.parse(Path(work_actions.__file__).read_text(encoding="utf-8"))
+    dispatcher = next(
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "execute_work_action"
+    )
+    dispatched: set[str] = set()
+    for node in ast.walk(dispatcher):
+        if not isinstance(node, ast.Compare):
+            continue
+        left_is_action = isinstance(node.left, ast.Name) and node.left.id == "action"
+        for operator, comparator in zip(node.ops, node.comparators):
+            if not left_is_action or not isinstance(operator, (ast.Eq, ast.In)):
+                continue
+            values = comparator.elts if isinstance(comparator, (ast.Set, ast.Tuple, ast.List)) else [comparator]
+            dispatched.update(
+                value.value for value in values
+                if isinstance(value, ast.Constant) and isinstance(value.value, str)
+            )
+    assert recovery_contracts.RECOVERY_WORK_ACTIONS <= dispatched
 
 
 @pytest.mark.parametrize("action", sorted(recovery_contracts.RECOVERY_WORK_ACTIONS))
@@ -381,3 +406,22 @@ def test_explicit_candidate_cas_rejects_a_conflicting_payload(
     )
     assert result == 2
     assert submitted == []
+
+
+def test_r10_machine_readable_gap_ledger_keeps_unverified_gates_open() -> None:
+    ledger_path = ROOT / "docs" / "recovery-action-gaps-843.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["schema"] == "cortex/recovery-action-gaps/v1"
+    assert ledger["issue"] == 843
+    gaps = ledger["gaps"]
+    assert gaps
+    for gap in gaps:
+        assert gap["id"] and gap["owner"] and gap["source"] and gap["retest"]
+        assert gap["status"] in {"open", "blocked", "pending-owner-evidence"}
+    matrix = MATRIX_PATH.read_text(encoding="utf-8")
+    for gap in gaps:
+        assert gap["id"] in matrix
+    tasks = (ROOT / "openspec/changes/cortex-refine-complete/tasks.md").read_text(
+        encoding="utf-8"
+    )
+    assert "- [ ] 5.5" in tasks, "full-plan recovery gate must remain open"

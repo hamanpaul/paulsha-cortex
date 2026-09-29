@@ -223,7 +223,7 @@ def test_environment_failure_is_recoverable(tmp_path: Path) -> None:
     result_run = recovered["result"]["run"]
 
     assert recovered["result"]["action"] == "recovered"
-    assert recovered["result"]["reason"] == "planning-recovery-dispatched"
+    assert recovered["result"]["reason"] == "planning-recovery-unblocked"
     assert result_run["run_id"] == run_id
     assert result_run["current_phase"] in {"plan", "build", "verify", "review", "ship"}
     assert result_run["source_revision"] == before.source_revision
@@ -527,7 +527,7 @@ def test_recovery_is_idempotent(tmp_path: Path) -> None:
     assert runs_after_second == runs_after_first
     # R4：重送不得產生第二份恢復稽核紀錄或第二個 planning 派工，
     # 且第二次必須明確回報是重放而非再次派工。
-    assert first["result"]["reason"] == "planning-recovery-dispatched"
+    assert first["result"]["reason"] == "planning-recovery-unblocked"
     assert second["result"]["reason"] == "already-recovered"
     recovery_records = sorted(
         (tmp_path / "evidence" / "planning-recovery").glob("*.json")

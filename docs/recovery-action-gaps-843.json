@@ -1,0 +1,35 @@
+{
+  "schema": "cortex/recovery-action-gaps/v1",
+  "issue": 843,
+  "full_plan_gate": "openspec/changes/cortex-refine-complete/tasks.md#5.5",
+  "gaps": [
+    {
+      "id": "G843-R08-live-reclaim",
+      "owner": "runtime-owner",
+      "status": "pending-owner-evidence",
+      "source": "docs/recovery-action-contract-matrix.md#R08 RC boundary",
+      "retest": "Run an authorized recovery canary in the multi-UID RC host; bind the exact installed artifact and loaded runtime, dispatch ACL, owner/run/workspace marker, protected-artifact disposition, restart replay, and immutable receipt."
+    },
+    {
+      "id": "G843-installed-live-recovery",
+      "owner": "runtime-owner",
+      "status": "pending-owner-evidence",
+      "source": "docs/recovery-action-contract-matrix.md#installed-live recovery",
+      "retest": "Run the work and recover aliases against the pinned installed artifact; capture loaded runtime identity, exact CAS, one dispatch or zero-side-effect rejection, restart replay, and workspace disposition."
+    },
+    {
+      "id": "G843-sandbox-egress-acl",
+      "owner": "qualification-owner",
+      "status": "blocked",
+      "source": "docs/recovery-action-contract-matrix.md#sandbox integration limits",
+      "retest": "In a governed environment with GitHub API egress and working POSIX ACLs, rerun the complete immediate-reclaim dispatch and ACL suites; distinguish environmental failures from product results."
+    },
+    {
+      "id": "G843-frozen-reviewer-pin",
+      "owner": "issue-839",
+      "status": "open",
+      "source": "docs/recovery-action-contract-matrix.md#frozen reviewer pin",
+      "retest": "If #839 adds attempt-bound fallback, verify explicit authority, exact candidate/era CAS, qualification and independence revalidation, atomic audit, and no reviewer spawn on a frozen same-domain pin."
+    }
+  ]
+}

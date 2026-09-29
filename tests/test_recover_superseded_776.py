@@ -19,12 +19,15 @@ from unittest import mock
 
 
 from paulsha_cortex.coordinator import work_actions
-from paulsha_cortex.coordinator.claim import claim_key_for_authority_digest
+from paulsha_cortex.coordinator.claim import (
+    WorkAuthority,
+    claim_key_for_authority_digest,
+    work_authority_digest,
+)
 from paulsha_cortex.coordinator.registry import JobRegistry, WorkflowStep
 
 _REPO = "o/r"
 _WORK_ID = "fix-demo"
-_DIGEST = "a" * 64
 
 
 def _step(card: str, *, phase: str, gate_result: str, outputs: tuple[str, ...] = ()) -> WorkflowStep:
@@ -141,20 +144,32 @@ def _args(run_id: str, **overrides):
     return base
 
 
-_AUTHORITY = SimpleNamespace(repo=_REPO, work_id=_WORK_ID, mapped_openspec=())
+_AUTHORITY = WorkAuthority._verified(
+    repo=_REPO,
+    work_id=_WORK_ID,
+    mapped_issues=(9,),
+    mapped_openspec=(),
+    confirmed_todo=True,
+    auto_label=False,
+    source_revisions=("source-revision",),
+    provider_revision="provider-revision",
+    last_success_epoch=1.0,
+    snapshot_hash="3" * 64,
+)
+_DIGEST = work_authority_digest(_AUTHORITY)
 
 
 class RecoverSupersededActionTests(unittest.TestCase):
     def _recover(self, registry, state, run_id, **overrides):
         with mock.patch.object(
-            work_actions, "work_authority_digest", return_value=_DIGEST
+            work_actions, "load_work_authority", return_value=_AUTHORITY
         ):
-            return work_actions._recover_superseded_action(
+            return work_actions.execute_work_action(
                 args=_args(run_id, **overrides),
-                authority=_AUTHORITY,
+                requested_by="operator",
                 state_path=state,
                 workflow_registry=registry,
-            )
+            )["result"]
 
     def test_recovers_run_via_official_authority_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
