@@ -36,16 +36,17 @@ work_item: task-memory-delivery-adapter
 - [x] Generic payload fixture 在兩個 repository、build/verify task kind 間通過；cross-scope mismatch 與 relay/legacy-schema blocker 有明確拒絕測試。
 - [x] Canary summarizer 機械計算 authorized success、failure、permission denial、unknown/ineligible；離線正向 fixture 為每條路徑 5/5，strict KPI 不變。
 - [x] 新增 `cortex task-memory canary`：至少兩個 repo，每 repo/path 跑 `--runs N`（預設 5）真 provide（note-fetch 另 fetch、snapshot 開啟、inline 確認 delivery），並跑 evidence-source 拒絕及跨 project mismatch；JSON 分列 provide 與 candidate-level 成功數及成功率，未指定 evidence path 時不落檔且永不輸出 note 正文。
-- [ ] Installed/live provider canary 必須每 repo/path 至少五次 eligible authorized provide 和五次完整 delivery，provide 與 candidate 成功率 ≥95%；預設 `--runs 5` 要各 repo/path 5/5。驗收命令：`cortex task-memory canary --repo <hippo-registered-repo-a> --repo <hippo-registered-repo-b> --runs 5 --evidence-path "$HOME/.agents/core/runtime/task-memory-canary-857.json"`。
+- [x] canary 輸出以 #845 `cortex/task-memory-live-canary/v1` 契約為正本（`paths.{context-delivered,snapshot-ready,note-fetch}`、`negative_controls[]`、`cross_project[]`、`executor.id`、`--target-file` 的 `target`）；relay overwrite 與既有輸出 schema 破壞由實際觀測判定為 blocker；合成卡片 task kind 輪替 build／verify／review；`legacy_strict_kpi_mutated` 由 receipt 的 `counts_as_read` 計算。
+- [ ] Installed/live provider canary 必須每 repo/path 至少五次 eligible authorized provide 和五次完整 delivery，provide 與 candidate 成功率 ≥95%；預設 `--runs 5` 要各 repo/path 5/5，且無 blocker。驗收命令：`cortex task-memory canary --repo <hippo-registered-repo-a> --repo <hippo-registered-repo-b> --runs 5 --target-file <acceptance-target.json> --evidence-path "$PSC_COORDINATOR_ROOT/evidence/requirement-delivery/live/task-memory-canary-857.json"`。
 - [ ] 只在 canary gate 通過後設計 task-level control/treatment utility trial；retries 合併、至少明列實際 evidence、成本與誤引用，未完成不宣稱 utility improvement。
 
 ## 5. Verification and delivery gates
 
-- [ ] 完整 repo tests、PR-context policy/CI、review 與 merge 仍是後續交付 gate；focused/related 測試輸出已記錄於 `docs/evidence/task-memory-delivery-adapter-857.md`。
+- [x] 完整 repo tests、PR-context policy/CI、review 與 merge：經 PR #1102（2026-09-27）與 #1146（2026-09-29）合入；focused/related 測試輸出記錄於 `docs/evidence/task-memory-delivery-adapter-857.md`。
 - [x] Regression tests 確認未帶 opt-in flag 時 legacy `cortex-work/v1` 不變，inline/context delivery 不增加 strict Read。
 - [x] Read model 以正式 WorkItem/WorkflowRun/Job fixture 串接 routing identity、plan/spec revisions、receipts 與 test/review evidence；live Monitor/Manager state 保留為 runtime 驗收。
 - [x] Provider unavailable、project/scope mismatch 與 unsupported schema 都保留明確 `read-failed`/`ineligible`/`parked`；Trust Root 下 provider exit 10 記為 provider permission-denied，不變更全域權限、不偽造 evidence。
 
-## Local implementation status (2026-09-26)
+## Implementation status (2026-09-29)
 
-本次離線實作驗證及其界線見 [`docs/evidence/task-memory-delivery-adapter-857.md`](../../evidence/task-memory-delivery-adapter-857.md)。Hippo #155 CLI 尚在另一 repo 的未 merge worktree，Cortex client 依其只讀契約實作且沒有 runtime import；未安裝／PATH 無法解析時 fail-closed 為 `provider-unavailable`。Manager opt-in、fake CLI contract 與 canary 指令已落地；Hippo CLI 在 installed service 帳號下的 permission、scope 與 ≥95% live threshold 尚待執行。
+本地實作驗證及其界線見 [`docs/evidence/task-memory-delivery-adapter-857.md`](../../evidence/task-memory-delivery-adapter-857.md)。Hippo #155 provider CLI 已在 Hippo 端合入；Cortex client 依其只讀契約以 subprocess 呼叫，沒有 runtime import。Production 只走 inline、本 work item 不補 `cortex work intake` 兩點為 owner 2026-09-29 裁決的範圍界線（見 workstream Todo）。Hippo CLI 在 installed service 帳號下的 permission、scope 與 ≥95% live threshold 仍待合入後的受治理 canary。

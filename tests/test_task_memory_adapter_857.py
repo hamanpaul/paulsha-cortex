@@ -818,6 +818,67 @@ def test_canary_scope_relay_and_legacy_schema_observations_are_blockers():
     ]
 
 
+def test_canary_legacy_strict_kpi_flag_is_computed_from_observed_receipts():
+    """G857-3：`legacy_strict_kpi_mutated` 由 receipt 實際的 counts_as_read 計算。
+
+    legacy strict funnel 只把 note-fetch 的 `content-returned` 算 Read；inline
+    交付被標成 Read（多算）或 note-fetch 取回被標成非 Read（少算）都會改變
+    legacy 分子／分母，必須被觀測成 blocker，而不是永遠回報常數 False。"""
+    inline_context, *_ = _context(caps=TaskMemoryCapabilities(inline=True))
+    inline_adapter = TaskMemoryAdapter(provider=_provider_for("inline"))
+    inline_prepared = inline_adapter.prepare(inline_context)
+    delivered = inline_adapter.confirm_context_delivered(inline_prepared)
+    fetch_context, *_ = _context(
+        work_id="demo-fetch", caps=TaskMemoryCapabilities(note_fetch=True)
+    )
+    fetch_adapter = TaskMemoryAdapter(
+        provider=_provider_for("note_fetch"),
+        note_fetch=lambda _task_id, _note_id: NOTE_CONTENT,
+    )
+    fetch_prepared = fetch_adapter.prepare(fetch_context)
+    fetched = fetch_adapter.fetch_note(fetch_prepared, "note-1").events
+
+    clean = summarize_canary(
+        (*inline_prepared.events, *delivered, *fetch_prepared.events, *fetched),
+        minimum_successes=1,
+    )
+    assert clean["legacy_strict_kpi_mutated"] is False
+    assert clean["strict_read_violations"] == 0
+    assert "legacy-strict-kpi-mutation" not in clean["blockers"]
+
+    inflated = summarize_canary(
+        (
+            *inline_prepared.events,
+            *(dict(event, counts_as_read=True) for event in delivered),
+            *fetch_prepared.events,
+            *fetched,
+        ),
+        minimum_successes=1,
+    )
+    assert inflated["legacy_strict_kpi_mutated"] is True
+    assert inflated["strict_read_violations"] == len(delivered)
+    assert "legacy-strict-kpi-mutation" in inflated["blockers"]
+    assert inflated["passed"] is False
+
+    dropped = summarize_canary(
+        (
+            *inline_prepared.events,
+            *delivered,
+            *fetch_prepared.events,
+            *(
+                dict(event, counts_as_read=False)
+                if event["event"] == "content-returned"
+                else event
+                for event in fetched
+            ),
+        ),
+        minimum_successes=1,
+    )
+    assert dropped["legacy_strict_kpi_mutated"] is True
+    assert dropped["strict_read_violations"] == 1
+    assert "legacy-strict-kpi-mutation" in dropped["blockers"]
+
+
 def test_canary_merges_retries_by_task_note_and_hash():
     context, *_ = _context(caps=TaskMemoryCapabilities(note_fetch=True))
     failed_adapter = TaskMemoryAdapter(
