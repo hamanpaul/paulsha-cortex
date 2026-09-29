@@ -81,7 +81,7 @@ config root 由 `PSC_PROJECT_CONFIG_ROOT` 決定。只有 operator overlay 的 `
 
 寫入只新增 binding，不把 profile 資料塞入 frozen chain 或歷史 receipt。Profile 更新由本次新的 dispatch decision 建立；歷史 run 不做 migration。Registry 仍使用既有 manager update 與持久化流程。
 
-重啟語意：Manager 重啟就是重新載入 registry 與 descriptor catalog。已派出且仍在執行的 job 照舊沿用，不會重新解析 binding。重派（例如 retry-build）時，凍結的 `model_chain_override` 解析出同一個 identity；descriptor 沒變的話，binding 也逐位元組相同，#844 的 stage-execution reuse key 不會因重啟而漂移。descriptor 資料化之後，內建 adapter 產生的 binding 與原本寫死表時期逐位元組相同（由測試以固定 digest 守住）。legacy manifest 回歸測試使用 #835 合併前的 Manager 實際寫出的 registry（`tests/fixtures/execution_profile/legacy-registry-pre-835.json`），驗證 legacy 欄位位元組不變、只新增 sibling binding。
+重啟語意：Manager 重啟就是重新載入 registry 與 descriptor catalog。已派出且仍在執行的 job 照舊沿用，不會重新解析 binding。重派（例如 retry-build）時，凍結的 `model_chain_override` 解析出同一個 identity；descriptor 沒變的話，binding 也逐位元組相同，#844 的 stage-execution reuse key 不會因重啟而漂移。descriptor 在兩次派工之間被改過時，重派是新的 dispatch decision：以當下 descriptor 建立新 binding，並覆寫 run 上該 persona 的 `execution_profile_bindings` 條目（與 `resolved_model_chain` 相同，記錄最新一次派工）；先前 attempt 的 profile 仍由各自 stage execution receipt 的 `execution_profile_key` 追溯，reuse key 隨 profile 改變，不會跨 profile 重用。descriptor 資料化之後，內建 adapter 產生的 binding 與原本寫死表時期逐位元組相同（由測試以固定 digest 守住）。legacy manifest 回歸測試使用 #835 合併前的 Manager 實際寫出的 registry（`tests/fixtures/execution_profile/legacy-registry-pre-835.json`），驗證 legacy 欄位位元組不變、只新增 sibling binding。
 
 ## PatchMUD producer/consumer 契約
 
