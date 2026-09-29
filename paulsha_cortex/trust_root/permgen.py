@@ -4002,9 +4002,16 @@ class PathLayout:
             # 目錄既有時同一行也會把 owner / mode 修回來，舊部署重跑 scaffold 即修復。
             credential_dir = f"{self.codex_credential_root}/{principal.value}"
             qcred_dir = shlex.quote(credential_dir)
+            qcred_root = shlex.quote(self.codex_credential_root)
             rows.append(
                 " && ".join(
                     (
+                        self._codex_seed_guard(
+                            f"test ! -L {qcred_root}",
+                            message=detail(
+                                f"credential root {self.codex_credential_root} must not be a symlink"
+                            ),
+                        ),
                         self._codex_seed_guard(
                             f"test ! -L {qcred_dir}",
                             message=detail(
@@ -4017,7 +4024,8 @@ class PathLayout:
                 )
             )
             rows.append(
-                f"if [ ! -e {qcred} ]; then test ! -L {qcred_dir} && "
+                f"if [ ! -e {qcred} ]; then test ! -L {qcred_root} && "
+                f"test ! -L {qcred_dir} && "
                 f"test -f {qsrc}/auth.json && "
                 f"test ! -L {qsrc}/auth.json && install -o {manager} "
                 f"-g {scheme.group_of(manager)} -m 0600 {qsrc}/auth.json {qcred}; fi"

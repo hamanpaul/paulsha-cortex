@@ -1238,13 +1238,18 @@ def test_generated_migration_repairs_existing_credential_directory_mode(tmp_path
     assert credential.read_text() == '{"seed":true}\n'
 
 
-def test_generated_migration_rejects_symlinked_credential_directory(tmp_path) -> None:
+@pytest.mark.parametrize("level", ("principal", "root"))
+def test_generated_migration_rejects_symlinked_credential_directory(tmp_path, level) -> None:
     layout, scheme, source, _controls, credential = _local_codex_seed_layout(tmp_path)
     _populate_legacy_codex(source)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir(mode=0o755)
-    credential.parent.parent.mkdir(parents=True)
-    credential.parent.symlink_to(elsewhere, target_is_directory=True)
+    if level == "principal":
+        credential.parent.parent.mkdir(parents=True)
+        credential.parent.symlink_to(elsewhere, target_is_directory=True)
+    else:
+        credential.parent.parent.parent.mkdir(parents=True)
+        credential.parent.parent.symlink_to(elsewhere, target_is_directory=True)
 
     # 與 `scaffold | sh -eu` 相同：整份命令流當一支腳本跑，第一個 guard 失敗即停。
     completed = _run_shell("\n".join(layout.codex_authority_seed_commands(scheme)))
@@ -1252,13 +1257,13 @@ def test_generated_migration_rejects_symlinked_credential_directory(tmp_path) ->
     assert completed.returncode != 0
     assert "must not be a symlink" in completed.stderr
     assert stat.S_IMODE(elsewhere.stat().st_mode) == 0o755
-    assert not (elsewhere / "auth.json").exists()
+    assert list(elsewhere.iterdir()) == []
 
     # 即使 operator 單獨重跑 auth.json 那一行，也不得穿過 symlink 寫進別處。
     for command in layout.codex_authority_seed_commands(scheme):
         if "auth.json" in command and "codex-credentials" in command:
             _run_shell(command)
-    assert not (elsewhere / "auth.json").exists()
+    assert list(elsewhere.iterdir()) == []
 
 
 @pytest.mark.parametrize("missing_relpath", ("config.toml", "hooks.json", "plugins", "skills"))
