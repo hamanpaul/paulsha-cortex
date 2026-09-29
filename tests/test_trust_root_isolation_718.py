@@ -13,6 +13,7 @@ import pwd
 import pytest
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -137,6 +138,7 @@ def _assert_generated_migration_creates_parent_accepts_nested_controls_and_is_id
     assert (controls / "plugins" / "nested" / "plugin.json").read_text() == '{"plugin":true}\n'
     assert (controls / "skills" / "nested" / "deep" / "policy.md").read_text() == "policy\n"
     assert credential.read_text() == '{"seed":true}\n'
+    assert stat.S_IMODE(credential.parent.stat().st_mode) == 0o700
 
     baseline = {
         path.relative_to(controls): path.read_bytes()
@@ -587,7 +589,12 @@ def _assert_scaffold_rerun_never_truncates_deployed_codex_policy() -> None:
         "cp -R --no-preserve=all" in line and "/.codex" in line
         for line in file_lines
     )
-    assert any("auth.json" in line and "install -D" in line for line in lines)
+    # 憑證目錄先以 Manager 身分建好（#716），auth.json 才寫進去；不靠 `install -D`。
+    assert any(
+        "codex-credentials" in line and "install -d -o cortex-manager" in line
+        for line in lines
+    )
+    assert any("auth.json" in line and "install -o cortex-manager" in line for line in lines)
 
 
 def test_scaffold_rerun_never_truncates_deployed_codex_policy() -> None:
@@ -1198,6 +1205,60 @@ def test_generated_migration_creates_parent_accepts_nested_controls_and_is_idemp
     _assert_generated_migration_creates_parent_accepts_nested_controls_and_is_idempotent(
         tmp_path
     )
+
+
+def test_authority_migration_hands_credential_directory_to_manager() -> None:
+    """#716：harvest 以 Manager 身分在憑證目錄內 temp + rename；目錄必須明確交給 Manager。"""
+    commands = permgen.DEFAULT_LAYOUT.codex_authority_seed_commands(permgen.FOUR_WAY_SCHEME)
+    joined = "\n".join(commands)
+    for principal in ("builder", "reviewer"):
+        directory = shlex.quote(
+            f"{permgen.DEFAULT_LAYOUT.codex_credential_root}/{principal}"
+        )
+        assert (
+            f"install -d -o cortex-manager -g cortex-manager -m 0700 {directory}"
+            in joined
+        )
+    # `install -D` 的 leading 目錄屬於執行者（root），不得再用來建憑證目錄。
+    assert "install -D -o cortex-manager" not in joined
+
+
+def test_generated_migration_repairs_existing_credential_directory_mode(tmp_path) -> None:
+    """舊部署留下的 0755 憑證目錄，重跑 scaffold 後回到 0700。"""
+    layout, scheme, source, _controls, credential = _local_codex_seed_layout(tmp_path)
+    _populate_legacy_codex(source)
+    credential.parent.mkdir(parents=True)
+    credential.parent.chmod(0o755)
+
+    for command in layout.codex_authority_seed_commands(scheme):
+        completed = _run_shell(command)
+        assert completed.returncode == 0, completed.stderr
+
+    assert stat.S_IMODE(credential.parent.stat().st_mode) == 0o700
+    assert credential.read_text() == '{"seed":true}\n'
+
+
+def test_generated_migration_rejects_symlinked_credential_directory(tmp_path) -> None:
+    layout, scheme, source, _controls, credential = _local_codex_seed_layout(tmp_path)
+    _populate_legacy_codex(source)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o755)
+    credential.parent.parent.mkdir(parents=True)
+    credential.parent.symlink_to(elsewhere, target_is_directory=True)
+
+    # 與 `scaffold | sh -eu` 相同：整份命令流當一支腳本跑，第一個 guard 失敗即停。
+    completed = _run_shell("\n".join(layout.codex_authority_seed_commands(scheme)))
+
+    assert completed.returncode != 0
+    assert "must not be a symlink" in completed.stderr
+    assert stat.S_IMODE(elsewhere.stat().st_mode) == 0o755
+    assert not (elsewhere / "auth.json").exists()
+
+    # 即使 operator 單獨重跑 auth.json 那一行，也不得穿過 symlink 寫進別處。
+    for command in layout.codex_authority_seed_commands(scheme):
+        if "auth.json" in command and "codex-credentials" in command:
+            _run_shell(command)
+    assert not (elsewhere / "auth.json").exists()
 
 
 @pytest.mark.parametrize("missing_relpath", ("config.toml", "hooks.json", "plugins", "skills"))

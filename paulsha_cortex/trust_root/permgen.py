@@ -3995,9 +3995,31 @@ class PathLayout:
                 f"test ! -L {qctl} && "
                 f"if [ ! -e {qctl} ]; then {' && '.join(control_steps)}; fi"
             )
+            # 憑證所在目錄必須是 Manager 擁有：job 結束後 Manager 以 temp + rename
+            # 把 refresh 過的 auth.json 收回這一格（`spool_slot` 的 harvest）。
+            # `install -D` 建出的 leading 目錄屬於執行者（root，0755），Manager
+            # 在裡面建不了 temp，job 都跑完了才在收割時 EACCES（#716 canary）。
+            # 目錄既有時同一行也會把 owner / mode 修回來，舊部署重跑 scaffold 即修復。
+            credential_dir = f"{self.codex_credential_root}/{principal.value}"
+            qcred_dir = shlex.quote(credential_dir)
             rows.append(
-                f"if [ ! -e {qcred} ]; then test -f {qsrc}/auth.json && "
-                f"test ! -L {qsrc}/auth.json && install -D -o {manager} "
+                " && ".join(
+                    (
+                        self._codex_seed_guard(
+                            f"test ! -L {qcred_dir}",
+                            message=detail(
+                                f"credential directory {credential_dir} must not be a symlink"
+                            ),
+                        ),
+                        f"install -d -o {manager} -g {scheme.group_of(manager)} "
+                        f"-m 0700 {qcred_dir}",
+                    )
+                )
+            )
+            rows.append(
+                f"if [ ! -e {qcred} ]; then test ! -L {qcred_dir} && "
+                f"test -f {qsrc}/auth.json && "
+                f"test ! -L {qsrc}/auth.json && install -o {manager} "
                 f"-g {scheme.group_of(manager)} -m 0600 {qsrc}/auth.json {qcred}; fi"
             )
         return tuple(rows)
