@@ -114,11 +114,13 @@ def _test_candidate() -> dict:
     }
 
 
-def _complete_report_binding() -> tuple[dict, execution_adapters.ExecutionProfileBinding]:
+def _complete_report_binding(
+    binding: execution_adapters.ExecutionProfileBinding | None = None,
+) -> tuple[dict, execution_adapters.ExecutionProfileBinding]:
     identity = SimpleNamespace(
         executor="copilot", model_id="fixture-model", independence_domain="fixture-builder"
     )
-    binding = execution_adapters.resolve_profile(
+    binding = binding or execution_adapters.resolve_profile(
         identity, "builder", effort="high", requirements={"role": "build"}
     )
     observed = execution_adapters.record_observed(
@@ -302,6 +304,51 @@ def _race_live_mutation(
             result_queue.put((kind, "ok", result["revision"]))
     except QualificationConflict:
         result_queue.put((kind, "conflict", None))
+
+
+def _kill_during_candidate_write(root: str) -> None:
+    """Leave a partial temp file and terminate without Python cleanup handlers."""
+    import tempfile
+
+    from paulsha_cortex.coordinator import qualification_lifecycle
+
+    def interrupted_write(path: Path, payload: object, *, governed_parent: bool = False) -> None:
+        del payload, governed_parent
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(b'{"payload":')
+            stream.flush()
+            os.fsync(stream.fileno())
+        del temporary
+        os._exit(73)
+
+    qualification_lifecycle._atomic_write_json = interrupted_write
+    _import_test_candidate(QualificationStore(root=Path(root)))
+
+
+def _kill_during_review_receipt_write(root: str, candidate_id: str) -> None:
+    """Terminate after a partial lifecycle-receipt temp write, before index commit."""
+    import tempfile
+
+    from paulsha_cortex.coordinator import qualification_lifecycle
+
+    def interrupted_write(path: Path, payload: object, *, governed_parent: bool = False) -> None:
+        del payload, governed_parent
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(b'{"payload":')
+            stream.flush()
+            os.fsync(stream.fileno())
+        del temporary
+        os._exit(73)
+
+    qualification_lifecycle._atomic_write_json = interrupted_write
+    QualificationStore(root=Path(root)).review_candidate(
+        candidate_id, verdict="approved", reviewer="fixture-reviewer",
+        reviewer_authority="test-only", policy_revision="qualification-policy-v1",
+        reviewed_at=NOW, expires_at="2026-09-27T00:00:00Z", test_only=True,
+        expected_revision=1, idempotency_key="process-death-review", now=NOW,
+    )
 
 
 def test_q01_patchmud_fixture_candidate_receipt_roster_query_round_trip(tmp_path: Path) -> None:
@@ -523,6 +570,30 @@ def test_q02_effort_and_coverage_mismatch_remain_unknown_and_unapprovable(tmp_pa
     assert coverage_candidate["coverage"]["state"] == "incomplete"
     with pytest.raises(ValueError, match="coverage-incomplete-or-unknown"):
         _review(coverage_store, coverage_candidate, expected_revision=1)
+
+
+def test_q02_approved_profile_cannot_be_borrowed_by_neighbor_profile_or_role(tmp_path: Path) -> None:
+    report, binding = _complete_report_binding()
+    store = QualificationStore(root=tmp_path / "state")
+    imported = _import_bound_report(
+        store, report, binding, expected_revision=0,
+        idempotency_key="q02-exact-row", test_only=False,
+    )
+    candidate = json.loads(
+        (store.paths.candidates_root / f"{imported['candidate_id']}.json").read_text(encoding="utf-8")
+    )["payload"]
+    _review(store, candidate, expected_revision=1, test_only=False)
+
+    assert store.query_qualification(
+        "copilot", "fixture-model", binding.resolved_key, "build", now=NOW,
+    ) is not None
+    assert store.query_qualification(
+        "copilot", "fixture-model",
+        "epk:v1:resolved:" + "0" * 64, "build", now=NOW,
+    ) is None
+    assert store.query_qualification(
+        "copilot", "fixture-model", binding.resolved_key, "review", now=NOW,
+    ) is None
 
 
 def test_q03_incomplete_unknown_and_legacy_rows_never_qualify(tmp_path: Path) -> None:
@@ -1197,27 +1268,48 @@ def test_q07_two_process_publish_revoke_compete_with_one_cas_winner(tmp_path: Pa
     assert candidate_path.is_file()
 
 
-@pytest.mark.parametrize("stage", ["candidate_written", "receipt_written", "index_written", "roster_written", "revoke_index_written"])
+@pytest.mark.parametrize("stage", [
+    "candidate_written", "import_index_written", "import_roster_written",
+    "receipt_written", "index_written", "roster_written",
+    "revoke_receipt_written", "revoke_index_written", "revoke_roster_written",
+])
 def test_q08_crash_failpoints_reconcile_without_half_grant(tmp_path: Path, stage: str) -> None:
     root = tmp_path / stage
     fired = False
+    failpoint_stage = {
+        "import_index_written": "index_written",
+        "import_roster_written": "roster_written",
+        "revoke_receipt_written": "receipt_written",
+        "revoke_index_written": "revoke_index_written",
+        "revoke_roster_written": "roster_written",
+    }.get(stage, stage)
 
     def failpoint(current: str) -> None:
         nonlocal fired
-        if current == stage and not fired:
+        if current == failpoint_stage and not fired:
             fired = True
             raise RuntimeError("simulated crash")
 
     store = QualificationStore(root=root, failpoint=failpoint)
-    if stage == "candidate_written":
+    if stage in {"candidate_written", "import_index_written", "import_roster_written"}:
         with pytest.raises(RuntimeError, match="simulated crash"):
-            _import_test_candidate(store)
+            candidate = _import_test_candidate(store)
         restarted = QualificationStore(root=root)
         restarted.reconcile()
-        assert restarted.revision == 0
-        assert list(restarted.paths.candidates_root.glob("*.json")) == []
-        candidate = _import_test_candidate(restarted)
-        assert candidate["test_only"] is True
+        if stage == "candidate_written":
+            assert restarted.revision == 0
+            assert list(restarted.paths.candidates_root.glob("*.json")) == []
+            candidate = _import_test_candidate(restarted)
+            assert candidate["test_only"] is True
+        else:
+            assert restarted.revision == 1
+            candidate_envelope = next(restarted.paths.candidates_root.glob("*.json"))
+            candidate = json.loads(candidate_envelope.read_text(encoding="utf-8"))["payload"]
+            assert restarted.qualification_status(
+                "copilot", "fixture-model", candidate["profile_key"], "build", now=NOW,
+            )["state"] == "unknown"
+            entries = restarted.read_roster()["entries"]
+            assert sum(row.get("candidate_id") == candidate["candidate_id"] for row in entries) == 1
         return
 
     seed_store = QualificationStore(root=root)
@@ -1237,9 +1329,13 @@ def test_q08_crash_failpoints_reconcile_without_half_grant(tmp_path: Path, stage
                 "copilot", "fixture-model", candidate["profile_key"], "build",
                 now=NOW, allow_test_receipts=True,
             ) is not None
+            entries = restarted.read_roster()["entries"]
+            assert sum(row.get("candidate_id") == candidate["candidate_id"] for row in entries) == 1
     else:
         _review(seed_store, candidate, expected_revision=1)
         store = QualificationStore(root=root, failpoint=failpoint)
+        # The generic receipt_written event also fires during approval, so arm the
+        # failpoint only after the approved state has been established.
         with pytest.raises(RuntimeError, match="simulated crash"):
             store.revoke_qualification(
                 candidate["candidate_id"],
@@ -1254,9 +1350,58 @@ def test_q08_crash_failpoints_reconcile_without_half_grant(tmp_path: Path, stage
             )
         restarted = QualificationStore(root=root)
         restarted.reconcile()
-        assert restarted.qualification_status(
+        final_state = restarted.qualification_status(
             "copilot", "fixture-model", candidate["profile_key"], "build", now=NOW
-        )["state"] == "revoked"
+        )["state"]
+        if stage == "revoke_receipt_written":
+            assert final_state == "unknown"
+            assert restarted.query_qualification(
+                "copilot", "fixture-model", candidate["profile_key"], "build", now=NOW,
+            ) is None
+        else:
+            assert final_state == "revoked"
+
+
+def test_q08_process_death_during_candidate_persistence_leaves_no_half_candidate(tmp_path: Path) -> None:
+    root = tmp_path / "process-death"
+    process = multiprocessing.get_context("spawn").Process(
+        target=_kill_during_candidate_write, args=(str(root),)
+    )
+    process.start()
+    process.join(timeout=20)
+    assert process.exitcode == 73
+
+    restarted = QualificationStore(root=root)
+    restarted.reconcile()
+    assert restarted.revision == 0
+    assert list(restarted.paths.candidates_root.glob("*.json")) == []
+    imported = _import_test_candidate(restarted)
+    assert imported["test_only"] is True
+    assert len(list(restarted.paths.candidates_root.glob("*.json"))) == 1
+
+
+def test_q08_process_death_during_receipt_persistence_reconciles_to_unknown(tmp_path: Path) -> None:
+    root = tmp_path / "receipt-process-death"
+    candidate = _import_test_candidate(QualificationStore(root=root))
+    process = multiprocessing.get_context("spawn").Process(
+        target=_kill_during_review_receipt_write,
+        args=(str(root), candidate["candidate_id"]),
+    )
+    process.start()
+    process.join(timeout=20)
+    assert process.exitcode == 73
+
+    restarted = QualificationStore(root=root)
+    restarted.reconcile()
+    assert restarted.qualification_status(
+        "copilot", "fixture-model", candidate["profile_key"], "build", now=NOW,
+    )["state"] == "unknown"
+    assert restarted.query_qualification(
+        "copilot", "fixture-model", candidate["profile_key"], "build", now=NOW,
+        allow_test_receipts=True,
+    ) is None
+    reviewed = _review(restarted, candidate, expected_revision=1)
+    assert reviewed["state"] == "approved"
 
 
 def test_q08_state_reads_reject_symlinks_and_hardlinks(tmp_path: Path) -> None:
@@ -1275,10 +1420,20 @@ def test_q08_state_reads_reject_symlinks_and_hardlinks(tmp_path: Path) -> None:
 
 
 def test_q09_lifecycle_and_legacy_migration_leave_history_bytes_unchanged(tmp_path: Path) -> None:
-    history = tmp_path / "attempt-evidence-decision.json"
-    history.write_bytes(b'{"attempt":"frozen","evidence":"frozen","decision":"frozen"}\n')
-    before = hashlib.sha256(history.read_bytes()).hexdigest()
-    store = QualificationStore(root=tmp_path / "state")
+    coordinator_root = tmp_path / "coordinator"
+    evidence_root = coordinator_root / "evidence"
+    decisions_root = coordinator_root / "quota-admission-decisions"
+    evidence_root.mkdir(parents=True)
+    decisions_root.mkdir(parents=True)
+    history_files = {
+        coordinator_root / "jobs.json": b'{"jobs":[{"attempt":"frozen"}]}\n',
+        evidence_root / "completion-record.json": b'{"evidence":"frozen"}\n',
+        decisions_root / "decisions.jsonl": b'{"decision":"frozen"}\n',
+    }
+    for path, data in history_files.items():
+        path.write_bytes(data)
+    before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in history_files}
+    store = QualificationStore(root=coordinator_root / "execution-qualification")
     candidate = _import_test_candidate(store)
     _review(store, candidate, expected_revision=1)
     store.revoke_qualification(
@@ -1287,12 +1442,12 @@ def test_q09_lifecycle_and_legacy_migration_leave_history_bytes_unchanged(tmp_pa
         test_only=True, expected_revision=2, idempotency_key="history-revoke", now=NOW,
     )
     store.reconcile()
-    migrated = QualificationStore(root=tmp_path / "migration-state")
+    migrated = QualificationStore(root=coordinator_root / "migration-execution-qualification")
     migrated.migrate_legacy_roster(
         {"schema_version": 1, "entries": []}, expected_revision=0,
         idempotency_key="history-preserving-migration", source_ref="legacy-fixture",
     )
-    assert hashlib.sha256(history.read_bytes()).hexdigest() == before
+    assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in history_files} == before
 
 
 def test_q09_late_report_cannot_replace_the_current_generation(tmp_path: Path) -> None:
@@ -1543,4 +1698,114 @@ def test_manager_reads_exact_roster_query_not_identity_attribute(monkeypatch) ->
     with pytest.raises(execution_adapters.ExecutionAdapterError, match="qualification is unknown"):
         manager._bind_workflow_execution_profile(
             run, step, identity, launcher, qualification_policy="enforce"
+        )
+
+
+def test_q01_live_store_lookup_allows_then_revoke_blocks_manager_enforce(tmp_path: Path, monkeypatch) -> None:
+    from paulsha_cortex.coordinator import manager, qualification_lifecycle
+
+    identity = SimpleNamespace(
+        executor="copilot", model_id="fixture-model", capabilities=("build",),
+        independence_domain="builder-a",
+    )
+    launcher = SimpleNamespace(
+        executor="copilot", model="fixture-model", _effort="high",
+        _effective_tools=(), _commit_required=True,
+    )
+    run = SimpleNamespace(
+        steps=[SimpleNamespace(phase="build", gate_result="passed", commit_policy="required", domain="builder-a")],
+        model_chain_override={}, sizing_band="red",
+    )
+    step = SimpleNamespace(persona="builder")
+    store = QualificationStore(root=tmp_path / "state")
+    monkeypatch.setattr(qualification_lifecycle, "_default_paths", lambda: store.paths)
+
+    # Disabled lookup gives us the exact production binding for this run while
+    # allowing the candidate to be published before enforcing admission.
+    binding, _ = manager._bind_workflow_execution_profile(
+        run, step, identity, launcher, qualification_policy="disabled"
+    )
+    report, report_binding = _complete_report_binding(binding)
+    assert report_binding.resolved_key == binding.resolved_key
+    imported = _import_bound_report(
+        store, report, report_binding, expected_revision=0,
+        idempotency_key="q01-manager-candidate", test_only=False,
+    )
+    candidate = json.loads(
+        (store.paths.candidates_root / f"{imported['candidate_id']}.json").read_text(encoding="utf-8")
+    )["payload"]
+    reviewed_at = datetime.now(timezone.utc).replace(microsecond=0)
+    reviewed = reviewed_at.isoformat().replace("+00:00", "Z")
+    expires = (reviewed_at + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    _review(
+        store, candidate, expected_revision=1, test_only=False,
+        now=reviewed, reviewed_at=reviewed, expires_at=expires,
+    )
+
+    admitted_binding, _ = manager._bind_workflow_execution_profile(
+        run, step, identity, launcher, qualification_policy="enforce"
+    )
+    assert admitted_binding.resolved_key == binding.resolved_key
+    revoke_authority = store.issue_operator_receipt(
+        candidate["candidate_id"], verdict="revoked", actor="fixture-operator",
+        reason="Q01 new admission denial", policy_revision="qualification-policy-v1",
+        reviewed_at=reviewed, expires_at=expires,
+    )
+    store.revoke_qualification(
+        candidate["candidate_id"],
+        operator_receipt_id=revoke_authority["operator_receipt_id"],
+        test_only=False, expected_revision=2, idempotency_key="q01-revoke", now=reviewed,
+    )
+    with pytest.raises(
+        execution_adapters.ExecutionAdapterError,
+        match="exact-profile qualification is unknown|qualification is insufficient",
+    ):
+        manager._bind_workflow_execution_profile(
+            run, step, identity, launcher, qualification_policy="enforce"
+        )
+
+
+def test_q10_qualification_does_not_bypass_pin_or_reviewer_independence(monkeypatch) -> None:
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.coordinator import qualification_lifecycle
+
+    monkeypatch.setattr(
+        qualification_lifecycle, "lookup_dispatch_qualification",
+        lambda _identity, binding: {
+            "state": "approved", "profile_key": binding.resolved_key,
+            "role": binding.resolved.requirements["role"]["value"],
+            "coverage": "complete", "receipt": "sha256:" + "a" * 64,
+            "revoked": False,
+        },
+    )
+
+    builder = SimpleNamespace(
+        executor="copilot", model_id="fixture-model", capabilities=("build",),
+        independence_domain="builder-a",
+        execution_qualification={"state": "approved", "coverage": "complete"},
+    )
+    launcher = SimpleNamespace(executor="copilot", model="fixture-model", _effort="high")
+    step = SimpleNamespace(persona="builder")
+    pinned_run = SimpleNamespace(
+        steps=[], model_chain_override={"builder": {"executor": "other", "model_id": "other-model"}},
+        sizing_band="red",
+    )
+    with pytest.raises(execution_adapters.ExecutionAdapterError, match="explicit model pin"):
+        manager._bind_workflow_execution_profile(
+            pinned_run, step, builder, launcher, qualification_policy="enforce"
+        )
+
+    reviewer = SimpleNamespace(
+        executor="copilot", model_id="fixture-model", capabilities=("review",),
+        independence_domain="builder-a",
+        execution_qualification={"state": "approved", "coverage": "complete"},
+    )
+    reviewer_run = SimpleNamespace(
+        steps=[SimpleNamespace(phase="build", gate_result="passed", commit_policy="required", domain="builder-a")],
+        model_chain_override={}, sizing_band="red",
+    )
+    with pytest.raises(execution_adapters.ExecutionAdapterError, match="independence domain matches a builder"):
+        manager._bind_workflow_execution_profile(
+            reviewer_run, SimpleNamespace(persona="reviewer"), reviewer, launcher,
+            qualification_policy="enforce",
         )

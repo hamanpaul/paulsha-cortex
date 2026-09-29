@@ -72,6 +72,8 @@
 - **#838 reservation crash matrix／coverage gap／死開關**：authority 補 `<stage>-after-append` failpoint，測試證明已落地後重送只得 duplicate 或 CAS 衝突；補重啟不重派活 bound job、window reset 與 reservation×ledger 交叉扣減測試；新增 `authority_coverage()` 與唯讀 `cortex quota reservations [--json]` 輸出 store 路徑、狀態、committed 與跨 host／UID／coordinator root 的 coverage gap；移除從未被讀取的 `PSC_QUOTA_RESERVATION_ENFORCE`，唯一 enforce 開關為 `PSC_QUOTA_ADMISSION_ENFORCE`（#838，見 `changelog.d/quota-observation-reservation.md`）。
 - **#835 execution adapter descriptor 資料化與 Trust Root 接線**：adapter 的 protocol／runtime version、原生 effort 合法值與預設（含 codex 的 model 專屬 effort）移到 packaged `data/execution-adapters.yaml`，並可由 `$PSC_PROJECT_CONFIG_ROOT/execution-adapters.yaml` overlay 整筆取代同名條目。resolver、argv builder 與 launch 前再驗證讀同一份 descriptor；未知鍵、缺欄位、未知版本、沒有受信任程式碼的 adapter、argv 無 effort 通道卻宣告 effort，一律 fail-closed。descriptor 壞掉時整次派工拒絕，但不寫 per-run needs_human。內建 adapter 的 binding 與原本逐位元組相同。`validate_dispatch_requirements()` 的 `trust_root_valid` 改為必填，由 `trust_root_compatibility()`（既有 Trust Root 相容性契約）提供；workflow 與 slice lane 都接上，拒絕時持久化 `execution-profile-blocked`。legacy manifest 的未知 persona 在候選選擇前即 needs_human。`register_adapter()` 可登記自帶 argv／usage 實作的新 runtime，並經真 `SubprocessLauncher` 做 conformance 驗證。另補 legacy registry fixture 與重啟重派測試（見 `changelog.d/execution-profile-descriptor.md`）。
 
+- **#842 qualification 驗收補齊**：補上 Manager enforce 真 store 核可／撤銷、profile／role 鄰列拒借、import／核可／撤銷 crash recovery、歷史 durable 檔案 digest，以及已核可資料仍受 pin／reviewer independence 硬閘限制的測試；文件列出 owner 真人核可 CLI、輸入與 receipt 查核步驟。
+
 ### Fixed
 
 - **#1161 巢狀受管目錄的 rollback unknown state**：`list_unknown_state` 只把目前 inventory 範圍內的更深層 managed directory 當作委派邊界；巢狀目錄中的事後新增 durable state 會列入 `retained_unknown`，使 rollback 正確回報 `rollback-blocked`。非巢狀 inventory 的判定維持不變。

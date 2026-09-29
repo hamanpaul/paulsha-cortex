@@ -1,0 +1,1 @@
+- 補齊 #842 Q01/Q02/Q08/Q09/Q10 qualification lifecycle 驗收：以真 store 的 operator receipt 串接 Manager enforce／撤銷、查詢鄰列拒絕、擴充 import/revoke crash recovery 與歷史檔案 digest，並驗證 qualification 不改寫 pin／reviewer independence；文件補上 owner 真人核可 CLI 的輸入、receipt 與查詢流程。
