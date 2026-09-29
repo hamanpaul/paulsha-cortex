@@ -1,0 +1,1 @@
+- review 卡 blocking findings 的 `next_step_hint` 改以效果命名兩個出口：「豁免 finding（接受偏離、候選不修改）→ `retry-review`」與「要求修正（finding 成立）→ `retry-build`」。原本的「接受／駁回 finding」易被讀成「同意／否認 finding 成立」，與規格語意相反；指令與前置條件不變，規格 R6 同步（#1139）。
