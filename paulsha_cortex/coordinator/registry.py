@@ -5507,6 +5507,70 @@ class JobRegistry:
         self._persist()
         return self._copy_workflow_run(updated)
 
+    def _manager_rechain_workflow(
+        self,
+        expected_run: WorkflowRun,
+        *,
+        expected_candidate: str | None,
+        expected_era: str,
+        model_chain_override: dict[str, dict[str, str]],
+        evidence_ref: str,
+    ) -> WorkflowRun:
+        """Atomically bind an explicitly readjudicated chain to one safe run boundary."""
+
+        index = self._find_workflow_run_index(expected_run.run_id)
+        current = self._workflows[index]
+        if current != expected_run:
+            raise ValueError("rechain WorkflowRun snapshot CAS mismatch")
+        if current.status != "ongoing" or "needs_human" not in current.facets:
+            raise ValueError("rechain requires an ongoing needs_human workflow")
+        if current.current_phase not in {"build", "verify", "review"}:
+            raise ValueError("rechain requires a safe build/verify/review attempt boundary")
+        if current.candidate_head != expected_candidate:
+            raise ValueError("rechain expected Candidate CAS mismatch")
+        if current.claim_key != expected_era:
+            raise ValueError("rechain expected claim-era CAS mismatch")
+        if current.pr_refs or current.pr_candidate is not None or current.merge_revision is not None:
+            raise ValueError("rechain refuses published delivery artifacts")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("rechain refuses active workflow job")
+        if set(model_chain_override) != {"planner", "builder", "reviewer"}:
+            raise ValueError("rechain requires a full per-persona identity chain")
+        for persona, identity in model_chain_override.items():
+            if (
+                not isinstance(identity, dict)
+                or set(identity) != {"executor", "model_id"}
+                or any(
+                    not isinstance(identity.get(field), str) or not identity[field]
+                    for field in ("executor", "model_id")
+                )
+            ):
+                raise ValueError(f"rechain {persona} identity pin malformed")
+        if not isinstance(evidence_ref, str) or not evidence_ref:
+            raise ValueError("rechain requires immutable audit evidence reference")
+        updated = replace(
+            current,
+            model_chain_override={
+                persona: dict(identity)
+                for persona, identity in model_chain_override.items()
+            },
+            facets=tuple(
+                facet for facet in current.facets
+                if facet not in {"needs_human", "blocked"}
+            ),
+            gate_status="running",
+            evidence_refs=tuple(dict.fromkeys((*current.evidence_refs, evidence_ref))),
+            needs_human_reason=None,
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
     def _manager_advance_verify_attest(
         self,
         run_id: str,

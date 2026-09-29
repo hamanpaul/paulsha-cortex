@@ -121,6 +121,53 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
         ):
             raise ValueError(f"work-action {action} requires exact expected_candidate")
+        if action == "rechain":
+            expected_run_id = args.get("expected_run_id")
+            expected_candidate = args.get("expected_candidate")
+            expected_era = args.get("expected_era")
+            if (
+                not isinstance(expected_run_id, str)
+                or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+            ):
+                raise ValueError("work-action rechain requires exact expected_run_id")
+            if (
+                not isinstance(expected_candidate, str)
+                or (expected_candidate != "none" and re.fullmatch(r"[0-9a-fA-F]{40}", expected_candidate) is None)
+            ):
+                raise ValueError("work-action rechain requires exact expected_candidate or none")
+            if (
+                not isinstance(expected_era, str)
+                or re.fullmatch(r"claim:v1:[0-9a-f]{64}", expected_era) is None
+            ):
+                raise ValueError("work-action rechain requires exact expected_era")
+            actor = args.get("actor")
+            reason = args.get("reason")
+            if (
+                not isinstance(actor, str)
+                or actor != actor.strip()
+                or not 1 <= len(actor) <= 128
+                or not actor.isprintable()
+            ):
+                raise ValueError("work-action rechain requires bounded actor")
+            if (
+                not isinstance(reason, str)
+                or reason != reason.strip()
+                or not 1 <= len(reason) <= 500
+                or not reason.isprintable()
+            ):
+                raise ValueError("work-action rechain requires bounded reason")
+            for persona in ("planner", "builder", "reviewer"):
+                for suffix in ("executor", "model"):
+                    value = args.get(f"{persona}_{suffix}")
+                    if (
+                        not isinstance(value, str)
+                        or not value.strip()
+                        or value != value.strip()
+                        or not value.isprintable()
+                    ):
+                        raise ValueError(
+                            f"work-action rechain requires {persona}_{suffix}"
+                        )
         if action in {"start", "intake"} and "combo" in args:
             combo = args.get("combo")
             if (

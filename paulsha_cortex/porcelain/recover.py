@@ -75,9 +75,13 @@ def _build_parser() -> argparse.ArgumentParser:
     work.add_argument("--actor", required=True)
     work.add_argument(
         "--expected-candidate",
-        help="retry-build／recover-repair-commit 專用：exact Candidate SHA CAS",
+        help="retry-build／recover-repair-commit 專用：exact Candidate SHA CAS；rechain 無 candidate 填 none",
     )
     work.add_argument("--expected-run-id")
+    work.add_argument("--expected-era", help="rechain 專用：exact claim:v1 era CAS")
+    for persona in ("planner", "builder", "reviewer"):
+        work.add_argument(f"--{persona}-executor", help=f"rechain 專用：{persona} identity executor")
+        work.add_argument(f"--{persona}-model", help=f"rechain 專用：{persona} identity model ID")
     work.add_argument(
         "--card",
         help="retry-card／regenerate-gates 專用：指定 card id",
@@ -123,10 +127,16 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
         "repo": args.repo,
         "actor": args.actor,
     }
-    for name in ("expected_candidate", "expected_run_id", "card", "reason"):
+    for name in ("expected_candidate", "expected_run_id", "expected_era", "card", "reason"):
         value = getattr(args, name)
         if value is not None:
             payload[name] = value
+    if args.action == "rechain":
+        for persona in ("planner", "builder", "reviewer"):
+            for suffix in ("executor", "model"):
+                value = getattr(args, f"{persona}_{suffix}")
+                if value is not None:
+                    payload[f"{persona}_{suffix}"] = value
     return payload
 
 

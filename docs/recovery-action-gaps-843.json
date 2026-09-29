@@ -142,10 +142,15 @@
     },
     {
       "id": "G843-frozen-reviewer-pin",
-      "owner": "issue-839",
-      "status": "open",
+      "owner": "issue-1173",
+      "status": "closed",
       "source": "docs/recovery-action-contract-matrix.md#frozen reviewer pin",
-      "retest": "If #839 adds attempt-bound fallback, verify explicit authority, exact candidate/era CAS, qualification and independence revalidation, atomic audit, and no reviewer spawn on a frozen same-domain pin."
+      "retest": "If #839 adds attempt-bound fallback, verify explicit authority, exact candidate/era CAS, qualification and independence revalidation, atomic audit, and no reviewer spawn on a frozen same-domain pin.",
+      "verified_by": [
+        "tests/test_recovery_action_rechain_1173.py::test_rechain_positive_updates_all_pins_and_keeps_old_resolved_evidence",
+        "tests/test_recovery_action_rechain_1173.py::test_rechain_rechecks_reviewer_independence_before_recording_audit",
+        "tests/test_recovery_action_rechain_1173.py::test_rechain_explicit_pin_remains_single_candidate_without_automatic_fallback"
+      ]
     }
   ]
 }

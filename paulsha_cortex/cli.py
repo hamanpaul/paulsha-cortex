@@ -51,7 +51,7 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-card|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|close-delivered|recover-superseded|reset-reclaim-budget|refreeze-base|auto|verify-attest|review-attest|review-disposition|ship> ...
+usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-card|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|close-delivered|recover-superseded|reset-reclaim-budget|refreeze-base|rechain|auto|verify-attest|review-attest|review-disposition|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item；--task-memory 顯示 task-memory/run/job/receipt read model
@@ -75,6 +75,7 @@ work item commands:
   regenerate-gates  以 exact WorkflowRun CAS 重跑指定 build 卡的 gate 並重寫 ledger；多張 build 卡時須加 --card（不改判、不重派 builder）
   reset-reclaim-budget  明示重置 semantic-reclaim 世代熔斷計數（需 --actor／--reason，落稽核 evidence）
   refreeze-base  以 exact WorkflowRun CAS 把還活著的 run 的候選 git base 重新凍結到目前的 origin/main（需 --actor／--reason，fast-forward only，落稽核 evidence；已有被採信 candidate／in-flight job／build branch 帶外來 commit 時一律拒絕）
+  rechain  需 actor/reason 與 exact run/candidate/claim-era CAS；完整指定 planner/builder/reviewer identity，安全 attempt 邊界重驗資格與 reviewer independence 後原子更新並留 immutable audit
   auto      管理 cortex:auto-on-going issue label
   verify-attest  需 --expected-candidate／--actor／--payload（failed=0）；寫入 immutable evidence 後推進 review
   review-attest  建立 exact-HEAD maintainer review evidence

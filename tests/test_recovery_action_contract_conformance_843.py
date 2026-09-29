@@ -63,6 +63,20 @@ def _work_fields(action: str) -> dict[str, object]:
         fields.update(actor="operator", reason="recovery audit")
     if action == "refreeze-base":
         fields.update(expected_run_id=RUN_ID, actor="operator", reason="recovery audit")
+    if action == "rechain":
+        fields.update(
+            expected_run_id=RUN_ID,
+            expected_candidate=CANDIDATE,
+            expected_era="claim:v1:" + "c" * 64,
+            actor="operator",
+            reason="recovery audit",
+            planner_executor="claude",
+            planner_model="planner-model",
+            builder_executor="agy",
+            builder_model="builder-model",
+            reviewer_executor="codex",
+            reviewer_model="reviewer-model",
+        )
     return fields
 
 
@@ -95,7 +109,7 @@ def _action_values(cell: str) -> set[str]:
 
 def test_r01_registry_and_versioned_document_cover_each_other() -> None:
     assert recovery_contracts.RECOVERY_ACTION_CONTRACT_VERSION == "recovery-action-contract/v1"
-    assert len(recovery_contracts.RECOVERY_ACTION_FAMILIES) == 13
+    assert len(recovery_contracts.RECOVERY_ACTION_FAMILIES) == 14
     matrix = MATRIX_PATH.read_text(encoding="utf-8")
     rows = _matrix_rows(matrix)
     assert set(rows) == set(recovery_contracts.RECOVERY_ACTION_FAMILIES)
@@ -199,10 +213,17 @@ def test_public_recover_work_alias_preserves_action_and_cas_fields(action: str) 
     option_names = {
         "expected_run_id": "--expected-run-id",
         "expected_candidate": "--expected-candidate",
+        "expected_era": "--expected-era",
         "failure_classification": "--failure-classification",
         "failure_reason": "--failure-reason",
         "card": "--card",
         "reason": "--reason",
+        "planner_executor": "--planner-executor",
+        "planner_model": "--planner-model",
+        "builder_executor": "--builder-executor",
+        "builder_model": "--builder-model",
+        "reviewer_executor": "--reviewer-executor",
+        "reviewer_model": "--reviewer-model",
     }
     for field, value in fields.items():
         if field == "actor":
@@ -233,10 +254,17 @@ def test_recover_work_formal_cli_submits_the_same_registered_action(
     option_names = {
         "expected_run_id": "--expected-run-id",
         "expected_candidate": "--expected-candidate",
+        "expected_era": "--expected-era",
         "failure_classification": "--failure-classification",
         "failure_reason": "--failure-reason",
         "card": "--card",
         "reason": "--reason",
+        "planner_executor": "--planner-executor",
+        "planner_model": "--planner-model",
+        "builder_executor": "--builder-executor",
+        "builder_model": "--builder-model",
+        "reviewer_executor": "--reviewer-executor",
+        "reviewer_model": "--reviewer-model",
     }
     for field, value in _work_fields(action).items():
         if field == "actor":
@@ -321,10 +349,17 @@ def test_coordinator_work_cli_submits_the_registered_action_unchanged(
     option_names = {
         "expected_run_id": "--expected-run-id",
         "expected_candidate": "--expected-candidate",
+        "expected_era": "--expected-era",
         "failure_classification": "--failure-classification",
         "failure_reason": "--failure-reason",
         "card": "--card",
         "reason": "--reason",
+        "planner_executor": "--planner-executor",
+        "planner_model": "--planner-model",
+        "builder_executor": "--builder-executor",
+        "builder_model": "--builder-model",
+        "reviewer_executor": "--reviewer-executor",
+        "reviewer_model": "--reviewer-model",
     }
     for field, value in fields.items():
         if field == "actor":

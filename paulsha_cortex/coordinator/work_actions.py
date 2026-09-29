@@ -7743,6 +7743,233 @@ def _refreeze_base_action(
     return payload
 
 
+def _rechain_prior_request_record(
+    body: dict[str, Any], *, state_path: Path
+) -> dict[str, str] | None:
+    """同一個 rechain 請求（除 prior chain 外逐欄相同）先前寫過的 audit。
+
+    找到而 prior chain 與現在不同，表示該請求先前已受理（已套用，或 crash 在
+    寫完 audit、更新 registry 之前），之後 chain 又被改過。
+    """
+
+    root = state_path.resolve().parent / "evidence" / "work-model-chain-readjudication"
+    request = {key: value for key, value in body.items() if key != "prior_model_chain_override"}
+    try:
+        paths = sorted(root.glob(f"{body['run_id']}-*.json"))
+    except OSError as error:
+        raise RuntimeError("workflow model-chain-readjudication evidence conflict") from error
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 16384:
+                continue
+            recorded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(recorded, dict):
+            continue
+        if {key: value for key, value in recorded.items() if key != "prior_model_chain_override"} == request:
+            return {"ref": str(path), "hash": verification.canonical_json_hash(recorded)}
+    return None
+
+
+def _rechain_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    now_epoch: float,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """Explicit operator-only model-chain readjudication at a safe attempt boundary."""
+
+    expected_run_id = args.get("expected_run_id")
+    expected_candidate_raw = args.get("expected_candidate")
+    expected_era = args.get("expected_era")
+    actor = args.get("actor")
+    reason = args.get("reason")
+    chain: dict[str, dict[str, str]] = {}
+    for persona in ("planner", "builder", "reviewer"):
+        executor = args.get(f"{persona}_executor")
+        model_id = args.get(f"{persona}_model")
+        if (
+            not isinstance(executor, str)
+            or executor != executor.strip()
+            or not executor
+            or not isinstance(model_id, str)
+            or model_id != model_id.strip()
+            or not model_id
+        ):
+            raise ValueError(f"rechain requires a complete {persona} identity pin")
+        chain[persona] = {"executor": executor, "model_id": model_id}
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "reason",
+        "expected_run_id", "expected_candidate", "expected_era",
+        *(f"{persona}_{suffix}" for persona in ("planner", "builder", "reviewer")
+          for suffix in ("executor", "model")),
+    }
+    if extras:
+        raise ValueError(f"rechain rejects caller evidence/input: {sorted(extras)[0]}")
+    # Direct callers cannot bypass the control contract's bounds.
+    if not isinstance(expected_run_id, str) or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None:
+        raise ValueError("rechain requires exact expected_run_id")
+    if not isinstance(expected_candidate_raw, str) or (
+        expected_candidate_raw != "none"
+        and re.fullmatch(r"[0-9a-fA-F]{40}", expected_candidate_raw) is None
+    ):
+        raise ValueError("rechain requires exact expected_candidate or none")
+    expected_candidate = None if expected_candidate_raw == "none" else expected_candidate_raw.lower()
+    if not isinstance(expected_era, str) or re.fullmatch(r"claim:v1:[0-9a-f]{64}", expected_era) is None:
+        raise ValueError("rechain requires exact expected_era")
+    if (
+        not isinstance(actor, str) or actor != actor.strip()
+        or not 1 <= len(actor) <= 128 or not actor.isprintable()
+    ):
+        raise ValueError("rechain requires bounded actor")
+    if (
+        not isinstance(reason, str) or reason != reason.strip()
+        or not 1 <= len(reason) <= 500 or not reason.isprintable()
+    ):
+        raise ValueError("rechain requires bounded reason")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("rechain issue is not authorized by WorkAuthority")
+
+    exact_runs = [
+        item for item in workflow_registry.list_workflow_runs()
+        if item.run_id == expected_run_id
+        and item.repo == authority.repo and item.work_id == authority.work_id
+    ]
+    if len(exact_runs) != 1:
+        raise RuntimeError("rechain expected WorkflowRun CAS mismatch")
+    run = exact_runs[0]
+    if run.run_id != expected_run_id:
+        raise RuntimeError("rechain expected WorkflowRun CAS mismatch")
+    prior_chain = run.model_chain_override if isinstance(run.model_chain_override, dict) else None
+    body = {
+        "schema": "cortex-work-model-chain-readjudication/v1",
+        "repo": run.repo,
+        "work_id": run.work_id,
+        "run_id": run.run_id,
+        "expected_candidate": expected_candidate_raw,
+        "expected_era": expected_era,
+        "actor": actor,
+        "reason": reason,
+        "model_chain_override": chain,
+        # 受理當下被取代的 chain：重送時據此判斷請求是否已被後來的重裁取代。
+        "prior_model_chain_override": prior_chain,
+        "validated_personas": ["planner", "builder", "reviewer"],
+        "validation": "manager-workflow-identity-candidates/v1",
+    }
+    existing_record = _existing_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="work-model-chain-readjudication",
+        label="model-chain-readjudication",
+    )
+    if existing_record is None:
+        prior_record = _rechain_prior_request_record(body, state_path=state_path)
+        if prior_record is not None:
+            if prior_record["ref"] in run.evidence_refs:
+                # 已套用過的同一請求：之後 chain 又變了，重送是 no-op。
+                existing_record = prior_record
+            else:
+                # crash 在寫完 audit、更新 registry 之前，期間 chain 被別的重裁
+                # 改過：重送不得以舊請求覆寫較新的 pin（#1173 審查）。
+                raise RuntimeError(
+                    "rechain request was superseded by a later readjudication"
+                )
+    if (
+        existing_record is not None
+        and existing_record["ref"] in run.evidence_refs
+    ):
+        return {
+            "action": "rechain", "reason": "model-chain-already-readjudicated",
+            "already_applied": True, "actor": actor, "operator_reason": reason,
+            "expected_run_id": expected_run_id, "expected_candidate": expected_candidate_raw,
+            "expected_era": expected_era, "evidence": existing_record, "run": run.to_dict(),
+        }
+    expected_issues = tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
+    canonical = [
+        item for item in workflow_registry.list_workflow_runs()
+        if item.repo == authority.repo and item.work_id == authority.work_id
+        and item.issue_refs == expected_issues and _openspec_refs_compatible(item, authority)
+        and item.status == "ongoing"
+    ]
+    if len(canonical) != 1 or canonical[0].run_id != expected_run_id:
+        raise RuntimeError("rechain requires one active canonical WorkflowRun")
+    if run.claim_key != expected_era:
+        raise RuntimeError("rechain expected claim-era CAS mismatch")
+    if run.candidate_head != expected_candidate:
+        raise RuntimeError("rechain expected Candidate CAS mismatch")
+    if "needs_human" not in run.facets:
+        raise RuntimeError("rechain requires needs_human workflow")
+    if run.current_phase not in {"build", "verify", "review"}:
+        raise RuntimeError("rechain requires a build/verify/review attempt boundary")
+    jobs = [job for job in workflow_registry.list_jobs() if job.get("workflow_run_id") == run.run_id]
+    if any(job.get("status") in ACTIVE_JOB_STATUSES for job in jobs):
+        raise RuntimeError("rechain refuses active workflow job")
+    if run.pr_refs or run.pr_candidate is not None or run.merge_revision is not None:
+        raise RuntimeError("rechain refuses a run with published delivery artifacts")
+
+    # Resolve every requested pair against the current roster and run the same
+    # persona capability, sizing qualification, and reviewer-domain checks used
+    # by the real dispatcher before writing either audit or state.
+    from . import manager as workflow_manager
+    from .model_identities import load_model_identities
+
+    identities = load_model_identities()
+    proposed = replace(run, model_chain_override=chain)
+    resolved: dict[str, Any] = {}
+    for persona in ("planner", "builder", "reviewer"):
+        try:
+            candidates = workflow_manager._workflow_identity_candidates_for_persona(
+                proposed, persona, identities
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"rechain {persona} identity failed qualification/pin validation"
+            ) from exc
+        if len(candidates) != 1 or (
+            candidates[0].executor != chain[persona]["executor"]
+            or candidates[0].model_id != chain[persona]["model_id"]
+        ):
+            raise RuntimeError(f"rechain {persona} identity failed qualification/pin validation")
+        resolved[persona] = candidates[0]
+    # dispatcher 只比對 reviewer 與歷史 builder 的 domain；新的 builder pin 也必須
+    # 與 reviewer 獨立，否則重裁後的下一個 build 與 review 會落在同一 domain。
+    builder_domain = getattr(resolved["builder"], "independence_domain", None)
+    reviewer_domain = getattr(resolved["reviewer"], "independence_domain", None)
+    if (
+        not isinstance(builder_domain, str)
+        or not isinstance(reviewer_domain, str)
+        or builder_domain in {"", "unknown"}
+        or reviewer_domain in {"", "unknown"}
+        or builder_domain == reviewer_domain
+    ):
+        raise RuntimeError("rechain reviewer is not independent of the new builder pin")
+
+    record = existing_record or _write_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="work-model-chain-readjudication",
+        label="model-chain-readjudication",
+        max_size=16384,
+    )
+    updated = workflow_registry._manager_rechain_workflow(
+        run,
+        expected_candidate=expected_candidate,
+        expected_era=expected_era,
+        model_chain_override=chain,
+        evidence_ref=record["ref"],
+    )
+    return {
+        "action": "rechain", "reason": "model-chain-readjudicated",
+        "already_applied": False, "actor": actor, "operator_reason": reason,
+        "expected_run_id": expected_run_id, "expected_candidate": expected_candidate_raw,
+        "expected_era": expected_era, "evidence": record, "run": updated.to_dict(),
+    }
+
+
 def _regenerate_gates_action(
     *,
     args: dict[str, Any],
@@ -9957,6 +10184,14 @@ def execute_work_action(
         )
     elif action == "refreeze-base":
         result = _refreeze_base_action(
+            args=args,
+            authority=authority,
+            now_epoch=now_epoch,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "rechain":
+        result = _rechain_action(
             args=args,
             authority=authority,
             now_epoch=now_epoch,
