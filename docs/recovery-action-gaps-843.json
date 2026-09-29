@@ -117,12 +117,18 @@
       "owner": "issue-1167",
       "status": "closed",
       "source": "docs/recovery-action-contract-matrix.md#R08 RC boundary",
-      "retest": "The fixed root-owned builder template invokes the installed owner_reclaim helper using a Manager-authored marker snapshot. The helper accepts only a marker-matching direct child of the configured pool, performs a fail-closed dirty scan, preserves dirty entries and a bundle of commits beyond marker.base in the per-job Manager-readable spool, then clears the workspace for Manager removal. The RC release owner-bound-reclaim installed check exercises this path with real UIDs/ACLs and asserts foreign-slot preservation, owned-slot removal, preserved content and idempotent replay.",
+      "retest": "The Manager starts the root-owned builder template with the pool slot name as instance; the job spec it writes is the helper's single-use approval (Manager-owned, builder read-only, bound to workspace, pool, preserve area, marker digest and a nonce) and is deleted when the unit finishes. The helper refuses without that approval, accepts only a digest-matching direct child of the configured pool, performs a fail-closed dirty scan, preserves dirty entries and a bundle of commits beyond marker.base, then clears the workspace; the Manager moves the archive into its evidence tree and removes the empty slot. The RC release owner-bound-reclaim installed check runs every Manager step as the installed Manager and asserts a refused builder direct invocation, a consumed approval, foreign-slot preservation, owned-slot removal, Manager-only preserved content and idempotent replay.",
       "verified_by": [
         "tests/test_owner_reclaim_1167.py::test_owner_reclaim_scans_preserves_then_clears_only_marker_bound_workspace",
         "tests/test_owner_reclaim_1167.py::test_owner_reclaim_refuses_foreign_marker_without_mutating_workspace",
         "tests/test_owner_reclaim_1167.py::test_owner_reclaim_dirty_scan_failure_preserves_workspace",
         "tests/test_owner_reclaim_1167.py::test_reclaim_routes_owner_bound_workspace_through_builder_helper",
+        "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_a_builder_invocation_without_any_approval",
+        "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_a_forged_approval",
+        "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_to_clear_another_pool_workspace",
+        "tests/test_owner_reclaim_1167.py::test_helper_cli_refuses_a_replayed_approval",
+        "tests/test_owner_reclaim_1167.py::test_manager_half_runs_the_existing_slot_instance_with_a_single_use_approval",
+        "tests/test_qualification_owner_reclaim_1167.py::test_manager_steps_run_as_the_installed_manager_runtime_not_the_driver",
         "tests/test_phase2_qualification.py::test_release_installed_checks_require_owner_bound_reclaim"
       ]
     },

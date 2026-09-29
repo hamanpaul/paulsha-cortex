@@ -439,8 +439,11 @@ def provision_copilot_home(
 
 
 def provision_runtime_surfaces(
-    *, principal: str, job_id: str, canonical_codex_home: str | Path | None = None,
+    *, principal: str, job_id: str | None = None,
+    canonical_codex_home: str | Path | None = None,
     account: str | None = None,
+    instance: str | None = None,
+    seed_credential: bool = True,
 ) -> tuple[Path, ...]:
     """Provision runtime rows by enumerating the canonical registry.
 
@@ -451,12 +454,27 @@ def provision_runtime_surfaces(
     Control leaves are created before the unit starts and are additionally bind
     mounted read-only by the generated unit; auth.json intentionally remains a
     writable runtime leaf.
+
+    Exactly one of ``job_id`` (a raw registry identity, derived through
+    ``job_segment``) and ``instance`` (an already-issued template instance, used
+    verbatim) names the slot.  ``instance`` exists for work on an existing pool
+    slot whose name *is* the instance (#1167 owner-bound reclaim); deriving a
+    segment from that name again would point every ``ReadWritePaths=<root>/%i``
+    at a different, non-existent slot.  ``seed_credential=False`` provisions the
+    mount points without copying a model credential into a job that runs no
+    model.
     """
+    if (job_id is None) == (instance is None):
+        raise ValueError("provision_runtime_surfaces needs exactly one of job_id or instance")
     provisioned: list[Path] = []
     for row in PER_JOB_WRITABLE_SURFACES:
         if principal not in row.principals:
             continue
-        slot = canonical_job_slot(row.surface_id, job_id)
+        slot = (
+            exact_job_slot(row.surface_id, instance)
+            if instance is not None
+            else canonical_job_slot(row.surface_id, str(job_id))
+        )
         fresh_slot = False
         auth: Path | None = None
         auth_seeded = False
@@ -485,7 +503,7 @@ def provision_runtime_surfaces(
                 auth = slot / "auth.json"
                 if auth.is_symlink() or (auth.exists() and not auth.is_file()):
                     raise SpoolSlotError("shape", f"runtime credential is malformed: {auth}")
-                if not auth.exists():
+                if seed_credential and not auth.exists():
                     desired_auth = credential_authority(principal)
                     if desired_auth.is_symlink() or not desired_auth.is_file():
                         raise SpoolSlotError("credential", f"credential authority is unavailable: {desired_auth}")

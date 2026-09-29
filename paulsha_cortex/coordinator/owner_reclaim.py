@@ -1,16 +1,38 @@
-"""Builder-identity half of the three-UID workspace reclaim protocol.
+"""Builder-identity half of the three-UID workspace reclaim protocol (#1167).
 
-The Manager may request this fixed operation through the root-owned builder
-template, but this module never accepts an arbitrary deletion path.  The
-workspace must be a direct child of the configured pool and its marker must
-match the Manager-authored marker snapshot carried in the protected job spec.
+The Manager has no ACL on builder-created inodes, so it cannot clear a used
+builder clone itself.  It asks the root-owned builder template unit
+(``cortex-job@<slot>.service``) to run this fixed helper as the builder UID
+against exactly one existing pool slot, then removes the emptied directory
+entry it owns.
+
+Threat model (full text: ``docs/three-uid-workspace-reclaim.md``):
+
+* The helper never gains privilege.  It runs as the builder account inside the
+  template unit, whose mount namespace makes only ``<pool>/<instance>`` and that
+  instance's spools writable.  The builder account's per-job named ACL already
+  lets it delete its own slot, so a builder calling this CLI directly can reach
+  nothing it could not ``rm -rf`` anyway.
+* "Manager approved" must still be true.  The workspace marker is readable (and,
+  inside the builder-writable ``.git``, replaceable) by the builder, so a marker
+  match proves nothing about Manager intent.  The helper therefore requires a
+  Manager-authored approval that the builder cannot forge: the job spec the
+  Manager wrote for this unit instance in the builder spec spool (Manager-owned,
+  builder read-only).  The spec must name this exact workspace and carry this
+  exact argv, which binds the pool, the preserve location, the marker digest and
+  a per-invocation nonce.  The Manager deletes the spec as soon as the unit has
+  finished, so an approval is single use; a leftover copy cannot clear a later
+  attempt because that attempt has a different marker digest.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import pwd
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -19,15 +41,73 @@ from pathlib import Path, PurePosixPath
 from typing import Mapping, Sequence
 from uuid import uuid4
 
-from . import job_workspace
-from . import job_runner
+from . import job_runner, job_workspace, spool_slot
 from ..config import paths
 from ..trust_root.permgen import DEFAULT_SCHEME
 
+MODULE = "paulsha_cortex.coordinator.owner_reclaim"
+#: The installed interpreter the approved command names.  The approval compares the
+#: argv after ``-m <MODULE>``; the interpreter itself comes from the Manager spec.
+RECLAIM_PYTHON = "/opt/cortex/venv/bin/python"
+#: Where the helper looks for its approval.  This is deliberately a constant and
+#: not an argument or environment value: a builder invoking the CLI controls both.
+#: It is the builder spec spool the installed Manager writes to (the installed
+#: runtime does not override ``PSC_JOB_SPEC_SPOOL``); the Manager half refuses to
+#: start a reclaim when its own spool differs, instead of producing an approval
+#: that the helper would never find.
+APPROVAL_SPEC_SPOOL = job_runner.DEFAULT_JOB_SPEC_SPOOL
+APPROVAL_MAX_BYTES = 1024 * 1024
+#: Per-instance preserve area inside the builder-writable commit-spool slot.  The
+#: Manager moves each verified archive out of it into the Manager-only evidence
+#: tree, so the slot stays reusable and the builder cannot touch the evidence.
+RECLAIM_ARCHIVE_DIRNAME = "reclaim-preserved"
+RECLAIM_LOG_FILENAME = "reclaim.jsonl"
+RECLAIM_UNIT_TIMEOUT_SECONDS = 1800
 PRESERVE_FILE_MAX_BYTES = 4 * 1024 * 1024
 PRESERVE_FILE_MAX_COUNT = 512
 PRESERVE_BUNDLE_MAX_BYTES = 256 * 1024 * 1024
+#: Builder-created archive directories keep an ACL mask that includes ``w`` so the
+#: Manager's named entry (inherited from the preserve area) can move and later
+#: prune them; files only need to be readable by the Manager.
+ARCHIVE_DIR_MODE = 0o770
+ARCHIVE_FILE_MODE = 0o640
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def marker_digest(marker: Mapping[str, object]) -> str:
+    """SHA-256 of the canonical JSON form of a parsed workspace marker."""
+
+    payload = json.dumps(
+        dict(marker), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def reclaim_arguments(
+    *,
+    workspace: str | Path,
+    pool_root: str | Path,
+    preserve_root: str | Path,
+    marker_sha256: str,
+    nonce: str,
+) -> list[str]:
+    """The helper argv after ``-m MODULE``; the approval must carry it verbatim."""
+
+    return [
+        "--workspace", str(workspace),
+        "--pool-root", str(pool_root),
+        "--preserve-root", str(preserve_root),
+        "--marker-sha256", marker_sha256,
+        "--nonce", nonce,
+    ]
+
+
+def reclaim_evidence_root() -> Path:
+    """Manager-only durable home of preserved reclaim archives."""
+
+    return paths.coordinator_root() / "evidence" / "worktree-reclaim"
 
 
 def _git_status(workspace: Path) -> list[str]:
@@ -41,7 +121,7 @@ def _git_status(workspace: Path) -> list[str]:
         detail = (result.stderr or result.stdout).decode("utf-8", "replace")[-500:]
         raise RuntimeError(f"dirty scan failed: {detail}")
     records = [part for part in result.stdout.split(b"\0") if part]
-    paths: list[str] = []
+    paths_found: list[str] = []
     index = 0
     while index < len(records):
         row = records[index]
@@ -51,10 +131,10 @@ def _git_status(workspace: Path) -> list[str]:
         name = row[3:].decode("utf-8", "surrogateescape")
         # Rename/copy records contain a second NUL-delimited path.
         if row[:2].decode("ascii", "ignore").strip() in {"R", "C"} and index < len(records):
-            paths.append(records[index].decode("utf-8", "surrogateescape"))
+            paths_found.append(records[index].decode("utf-8", "surrogateescape"))
             index += 1
-        paths.append(name)
-    return list(dict.fromkeys(paths))
+        paths_found.append(name)
+    return list(dict.fromkeys(paths_found))
 
 
 def _safe_relative(name: str) -> Path:
@@ -64,11 +144,16 @@ def _safe_relative(name: str) -> Path:
     return Path(*rel.parts)
 
 
-def _preserve(workspace: Path, paths: Sequence[str], preserve_root: Path) -> tuple[Path, int]:
-    if len(paths) > PRESERVE_FILE_MAX_COUNT:
+def _archive_dir(path: Path) -> None:
+    path.mkdir(mode=ARCHIVE_DIR_MODE, parents=False, exist_ok=False)
+    os.chmod(path, ARCHIVE_DIR_MODE)
+
+
+def _preserve(workspace: Path, names: Sequence[str], preserve_root: Path) -> tuple[Path, int]:
+    if len(names) > PRESERVE_FILE_MAX_COUNT:
         raise RuntimeError("dirty workspace exceeds the preserve file-count limit")
     entries: list[tuple[str, Path, os.stat_result]] = []
-    for name in paths:
+    for name in names:
         relative = _safe_relative(name)
         source = workspace / relative
         info = source.lstat()
@@ -78,22 +163,27 @@ def _preserve(workspace: Path, paths: Sequence[str], preserve_root: Path) -> tup
             raise RuntimeError("unsupported dirty workspace entry")
         entries.append((name, source, info))
     archive = preserve_root / f"{workspace.name}-{uuid4().hex}"
-    archive.mkdir(mode=0o755, parents=False, exist_ok=False)
+    _archive_dir(archive)
     copied = 0
     try:
         for name, source, info in entries:
             relative = _safe_relative(name)
             destination = archive / relative
-            destination.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            parent = archive
+            for part in relative.parts[:-1]:
+                parent = parent / part
+                if not parent.is_dir():
+                    _archive_dir(parent)
             if stat.S_ISLNK(info.st_mode):
                 os.symlink(os.readlink(source), destination)
             elif stat.S_ISREG(info.st_mode):
                 if source.stat().st_size > PRESERVE_FILE_MAX_BYTES:
                     raise RuntimeError("dirty workspace file grew beyond the preserve size limit")
                 shutil.copyfile(source, destination, follow_symlinks=False)
-                os.chmod(destination, 0o644)
+                os.chmod(destination, ARCHIVE_FILE_MODE)
             elif stat.S_ISDIR(info.st_mode):
-                destination.mkdir(mode=0o755, exist_ok=True)
+                if not destination.is_dir():
+                    _archive_dir(destination)
             else:
                 raise RuntimeError("unsupported dirty workspace entry")
             copied += 1
@@ -106,19 +196,19 @@ def _preserve(workspace: Path, paths: Sequence[str], preserve_root: Path) -> tup
 def _archive_commit(workspace: Path, archive: Path, base: str) -> str:
     if _COMMIT_RE.fullmatch(base) is None:
         raise RuntimeError("workspace marker base commit is malformed")
+    bundle = archive / "workspace-head.bundle"
     result = subprocess.run(
-        ["git", "-C", str(workspace), "bundle", "create", str(archive / "workspace-head.bundle"), "HEAD", f"^{base}"],
+        ["git", "-C", str(workspace), "bundle", "create", str(bundle), "HEAD", f"^{base}"],
         capture_output=True,
         check=False,
         timeout=job_workspace.WORKSPACE_DIRTY_SCAN_TIMEOUT_SECONDS,
     )
-    bundle = archive / "workspace-head.bundle"
     if result.returncode:
         detail = (result.stderr or result.stdout).decode("utf-8", "replace")[-500:]
         raise RuntimeError(f"workspace commit preservation failed: {detail}")
     if not bundle.is_file() or bundle.stat().st_size > PRESERVE_BUNDLE_MAX_BYTES:
         raise RuntimeError("workspace commit bundle is absent or exceeds the size limit")
-    os.chmod(bundle, 0o644)
+    os.chmod(bundle, ARCHIVE_FILE_MODE)
     return str(bundle)
 
 
@@ -127,12 +217,13 @@ def reclaim_owned_workspace(
     workspace: str | Path,
     pool_root: str | Path,
     preserve_root: str | Path,
-    expected_marker: Mapping[str, object],
+    expected_marker_sha256: str,
 ) -> dict[str, object]:
     """Scan, preserve, and clear one marker-proven builder clone.
 
     The pool parent remains Manager-owned; the caller removes the now-empty
-    workspace after this function succeeds.
+    workspace after this function succeeds.  Authorization is not decided here:
+    :func:`main` verifies the Manager approval before calling this function.
     """
 
     pool = Path(pool_root).resolve(strict=True)
@@ -147,8 +238,8 @@ def reclaim_owned_workspace(
     if not stat.S_ISREG(marker_info.st_mode):
         raise RuntimeError("workspace marker is not a regular file")
     observed = job_workspace.read_marker(resolved)
-    if not isinstance(observed, dict) or dict(observed) != dict(expected_marker):
-        raise RuntimeError("workspace marker does not match the Manager snapshot")
+    if not isinstance(observed, dict) or marker_digest(observed) != expected_marker_sha256:
+        raise RuntimeError("workspace marker does not match the Manager-approved digest")
     if observed.get("model") != job_workspace.WORKSPACE_MODEL:
         raise RuntimeError("workspace marker model is unsupported")
     if not isinstance(observed.get("attempt_id"), str) or not isinstance(observed.get("owner_identity"), dict):
@@ -172,11 +263,12 @@ def reclaim_owned_workspace(
     if preserved_commit:
         if archive is None:
             archive = Path(preserve_root) / f"{resolved.name}-{uuid4().hex}"
-            archive.mkdir(mode=0o755, parents=False, exist_ok=False)
+            _archive_dir(archive)
         _archive_commit(resolved, archive, base)
     # Re-read ownership immediately before mutation.  This rejects marker swaps
     # between the first validation and the destructive phase.
-    if job_workspace.read_marker(resolved) != observed:
+    current = job_workspace.read_marker(resolved)
+    if not isinstance(current, dict) or marker_digest(current) != expected_marker_sha256:
         raise RuntimeError("workspace marker changed during reclaim")
     for child in list(resolved.iterdir()):
         if child.is_dir() and not child.is_symlink():
@@ -193,156 +285,346 @@ def reclaim_owned_workspace(
     }
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
+def verify_manager_approval(
+    *,
+    argv: Sequence[str],
+    workspace: str | Path,
+    approval_spool: str | Path,
+    manager_uid: int,
+) -> dict[str, object]:
+    """Require the Manager-authored job spec that authorizes exactly this call.
+
+    The approval lives at ``<approval_spool>/<workspace name>.json`` (the unit
+    instance of an existing pool slot is its directory name).  It must be a
+    regular file owned by the Manager with no group/other write bit, in a
+    Manager-owned spool without group/other write bits, and it must name this
+    workspace and carry ``-m MODULE`` followed by exactly ``argv``.
+    """
+
+    target = Path(workspace)
+    if target.is_symlink() or not target.is_dir():
+        raise RuntimeError("workspace is not a real directory")
+    resolved = target.resolve(strict=True)
+    instance = resolved.name
+    if not job_runner.instance_name_valid(instance):
+        raise RuntimeError("workspace name is not a builder unit instance")
+    spool = Path(approval_spool)
+    spool_info = os.lstat(spool)
+    if not stat.S_ISDIR(spool_info.st_mode):
+        raise RuntimeError("Manager approval spool is not a real directory")
+    if spool_info.st_uid != manager_uid or stat.S_IMODE(spool_info.st_mode) & 0o022:
+        raise RuntimeError("Manager approval spool is not controlled by the Manager")
+    approval = spool / f"{instance}.json"
+    try:
+        fd = os.open(approval, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        raise RuntimeError("no Manager approval exists for this workspace") from None
+    except OSError as exc:
+        raise RuntimeError(f"Manager approval is unreadable or not a regular file: {exc.strerror}") from None
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError("Manager approval is not a regular file")
+        if info.st_uid != manager_uid:
+            raise RuntimeError("approval is not Manager-authored")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise RuntimeError("approval is writable by a principal other than the Manager")
+        raw = stream.read(APPROVAL_MAX_BYTES + 1)
+    if len(raw) > APPROVAL_MAX_BYTES:
+        raise RuntimeError("Manager approval exceeds its size limit")
+    try:
+        spec = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise RuntimeError("Manager approval is not valid JSON") from None
+    if not isinstance(spec, dict) or spec.get("spec_version") != job_runner.JOB_SPEC_VERSION:
+        raise RuntimeError("Manager approval is not a job spec")
+    if spec.get("instance") != instance or spec.get("working_directory") != str(resolved):
+        raise RuntimeError("Manager approval names a different workspace")
+    command = spec.get("command")
+    if (
+        not isinstance(command, list)
+        or command[1:3] != ["-m", MODULE]
+        or command[3:] != list(argv)
+    ):
+        raise RuntimeError("Manager approval does not authorize this reclaim invocation")
+    return spec
+
+
+def _manager_uid() -> int:
+    account = DEFAULT_SCHEME.durable_state_owner
+    if not account:
+        raise RuntimeError("the installed UID scheme has no Manager durable-state owner")
+    return pwd.getpwnam(account).pw_uid
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    approval_spool: str | Path | None = None,
+    manager_uid: int | None = None,
+) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(prog=f"python -m {MODULE}")
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--pool-root", required=True)
     parser.add_argument("--preserve-root", required=True)
-    parser.add_argument("--marker-json", required=True)
-    args = parser.parse_args(argv)
+    parser.add_argument("--marker-sha256", required=True)
+    parser.add_argument("--nonce", required=True)
+    args = parser.parse_args(arguments)
     try:
-        expected = json.loads(args.marker_json)
-        if not isinstance(expected, dict):
-            raise RuntimeError("marker snapshot is malformed")
+        if _SHA256_RE.fullmatch(args.marker_sha256) is None:
+            raise RuntimeError("marker digest is malformed")
+        if _NONCE_RE.fullmatch(args.nonce) is None:
+            raise RuntimeError("reclaim nonce is malformed")
+        verify_manager_approval(
+            argv=arguments,
+            workspace=args.workspace,
+            approval_spool=approval_spool if approval_spool is not None else APPROVAL_SPEC_SPOOL,
+            manager_uid=manager_uid if manager_uid is not None else _manager_uid(),
+        )
         result = reclaim_owned_workspace(
             workspace=args.workspace,
             pool_root=args.pool_root,
             preserve_root=args.preserve_root,
-            expected_marker=expected,
+            expected_marker_sha256=args.marker_sha256,
         )
+        result["nonce"] = args.nonce
         print(json.dumps(result, sort_keys=True), flush=True)
         return 0
-    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+    except (KeyError, OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
         print(f"owner reclaim failed: {type(exc).__name__}: {str(exc)[:300]}", file=sys.stderr)
         return 1
 
 
-def reclaim_through_builder_unit(
-    *, workspace: str | Path, marker: Mapping[str, object]
-) -> dict[str, object]:
-    """Run the fixed helper under the installed, root-owned builder template."""
+# ---------------------------------------------------------------------------
+# Manager half
+# ---------------------------------------------------------------------------
 
-    env = dict(os.environ)
-    workspace_path = Path(workspace).resolve(strict=True)
-    source_repo = marker.get("source_repo")
-    if not isinstance(source_repo, str) or not source_repo.startswith("/"):
-        raise RuntimeError("workspace marker has no absolute source repository")
-    job_id = workspace_path.name
-    if not job_runner.instance_name_valid(job_id):
-        raise RuntimeError("workspace name cannot be used as a builder unit instance")
-    executor = (env.get("PSC_MANAGER_EXECUTOR") or "").strip()
-    if not executor:
-        raise RuntimeError("PSC_MANAGER_EXECUTOR is required for the builder reclaim unit")
-    plan = job_runner.prepare_systemd_template(
-        env, job_id=job_id, executor=executor, role=job_runner.JOB_ROLE_BUILDER
+
+def _start_builder_unit(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """``systemctl start --wait`` for the approved instance (test seam)."""
+
+    return subprocess.run(
+        list(argv),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=RECLAIM_UNIT_TIMEOUT_SECONDS,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
     )
-    pool_root = paths.worktree_root().resolve(strict=True)
-    archive_bundle = job_workspace.prepare_commit_spool(
-        spool_key=plan.instance, coordinator_root=paths.coordinator_root()
-    )
-    archive_root = archive_bundle.parent / "reclaim-preserved"
-    archive_root.mkdir(mode=0o700, exist_ok=True)
-    manager_account = DEFAULT_SCHEME.durable_state_owner
-    if not manager_account:
-        raise RuntimeError("the installed UID scheme has no Manager durable-state owner")
-    builder_account = plan.account
+
+
+def _grant_archive_acl(archive_root: Path, *, manager_account: str, builder_account: str) -> None:
+    """Let the builder create the archive and let the Manager read, move and prune it."""
+
     acl = shutil.which(job_workspace.SETFACL_PROGRAM)
     if acl is None:
         raise RuntimeError("setfacl is unavailable for the reclaim archive boundary")
-    # Manager can inspect the preserved evidence; builder can create only in
-    # this per-invocation spool slot.  No ACL is added to the workspace for Manager.
     subprocess.run(
         [
             acl, "-m",
-            f"u:{manager_account}:rwx,u:{builder_account}:rwx,d:u:{manager_account}:rwx,d:u:{builder_account}:rwx",
+            f"u:{manager_account}:rwx,u:{builder_account}:rwx,"
+            f"d:u:{manager_account}:rwx,d:u:{builder_account}:rwx",
             str(archive_root),
         ],
         check=True,
         capture_output=True,
         text=True,
     )
-    log = job_workspace.prepare_job_log_spool(
-        principal_id="builder",
-        spool_key=plan.instance,
-        manager_log_path=paths.coordinator_root() / "logs" / "reclaim" / f"{job_id}.jsonl",
+
+
+def _refuse_unreviewed_archive(archive_root: Path) -> None:
+    """An archive left by an earlier, unfinished reclaim is evidence: never reset it."""
+
+    if archive_root.is_symlink():
+        raise RuntimeError("reclaim archive area is a symlink")
+    if archive_root.is_dir() and any(archive_root.iterdir()):
+        raise RuntimeError(
+            "an earlier reclaim archive for this workspace is still present; "
+            "inspect it before retrying"
+        )
+
+
+def _count_archive(archive: Path) -> int:
+    observed = 0
+    for directory, child_dirs, child_files in os.walk(archive, followlinks=False):
+        observed += sum(1 for name in child_dirs if (Path(directory) / name).is_symlink())
+        observed += len(child_files)
+    return observed
+
+
+def _completion(log: Path, *, instance: str, nonce: str) -> dict[str, object]:
+    for line in reversed(log.read_text(encoding="utf-8", errors="replace").splitlines()):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(result, dict)
+            and result.get("status") == "cleared"
+            and result.get("nonce") == nonce
+        ):
+            if result.get("workspace_name") != instance:
+                raise RuntimeError("builder reclaim completion names a different workspace")
+            return result
+    raise RuntimeError("builder reclaim unit returned no completion record for this invocation")
+
+
+def _adopt_archive(result: dict[str, object], *, archive_root: Path) -> dict[str, object]:
+    """Verify the helper's archive claim and move it into Manager-only evidence."""
+
+    preserved = result.get("preserved_files")
+    if not isinstance(preserved, int) or isinstance(preserved, bool) or preserved < 0:
+        raise RuntimeError("builder reclaim completion has an invalid preserve count")
+    preserved_commit = result.get("preserved_commit") is True
+    preserve_path = result.get("preserve_path")
+    if preserved == 0 and not preserved_commit:
+        if preserve_path is not None:
+            raise RuntimeError("builder reclaim returned an empty preserve archive")
+        return result
+    archive = Path(str(preserve_path))
+    if archive.parent != archive_root or archive.is_symlink() or not archive.is_dir():
+        raise RuntimeError("builder reclaim archive is outside its Manager spool slot")
+    evidence_root = reclaim_evidence_root()
+    evidence_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination = evidence_root / archive.name
+    # After the move the builder cannot reach the archive any more; verify the
+    # claimed content there, not in the builder-writable slot.
+    os.rename(archive, destination)
+    expected_count = preserved + (1 if preserved_commit else 0)
+    if _count_archive(destination) != expected_count:
+        raise RuntimeError("builder reclaim archive count does not match its completion")
+    if preserved_commit:
+        bundle = destination / "workspace-head.bundle"
+        if bundle.is_symlink() or not bundle.is_file():
+            raise RuntimeError("builder reclaim omitted the local commit bundle")
+    return {**result, "preserve_path": str(destination)}
+
+
+def reclaim_through_builder_unit(
+    *, workspace: str | Path, marker: Mapping[str, object]
+) -> dict[str, object]:
+    """Run the fixed helper under the installed builder template for one pool slot.
+
+    The unit instance is the slot's own name (it was the instance of the job
+    that used the slot), so the template's ``ReadWritePaths=<pool>/%i`` covers
+    exactly this workspace and nothing else.  The job spec written for the unit
+    is the helper's approval and is removed as soon as the unit finishes.
+    """
+
+    env = dict(os.environ)
+    workspace_path = Path(workspace).resolve(strict=True)
+    instance = workspace_path.name
+    if not job_runner.instance_name_valid(instance):
+        raise RuntimeError("workspace name cannot be used as a builder unit instance")
+    pool_root = paths.worktree_root().resolve(strict=True)
+    if workspace_path.parent != pool_root:
+        raise RuntimeError("workspace is outside the configured job pool")
+    source_repo = marker.get("source_repo")
+    if not isinstance(source_repo, str) or not source_repo.startswith("/"):
+        raise RuntimeError("workspace marker has no absolute source repository")
+    executor = (env.get("PSC_MANAGER_EXECUTOR") or "").strip()
+    if not executor:
+        raise RuntimeError("PSC_MANAGER_EXECUTOR is required for the builder reclaim unit")
+    plan = job_runner.prepare_systemd_template(
+        env,
+        job_id=instance,
+        instance=instance,
+        executor=executor,
+        role=job_runner.JOB_ROLE_BUILDER,
     )
+    if plan.instance != instance:
+        raise RuntimeError("builder reclaim unit instance differs from the pool slot")
+    if Path(plan.spool_dir) != Path(APPROVAL_SPEC_SPOOL):
+        raise RuntimeError(
+            "the builder spec spool differs from the approval spool the reclaim helper trusts"
+        )
+    manager_account = DEFAULT_SCHEME.durable_state_owner
+    if not manager_account:
+        raise RuntimeError("the installed UID scheme has no Manager durable-state owner")
+    # Every ReadWritePaths= of the template must exist or systemd fails the
+    # namespace setup (226/NAMESPACE) before the helper runs.  The reclaim runs
+    # no model, so no credential is copied into its runtime home.
+    spool_slot.provision_runtime_surfaces(
+        principal="builder",
+        instance=instance,
+        canonical_codex_home=spool_slot.canonical_codex_controls("builder", manager_env=env),
+        account=plan.account,
+        seed_credential=False,
+    )
+    commit_slot = spool_slot.exact_job_slot("commit-spool", instance)
+    archive_root = commit_slot / RECLAIM_ARCHIVE_DIRNAME
+    _refuse_unreviewed_archive(archive_root)
+    spool_slot.create_slot(commit_slot, reset=True)
+    archive_root.mkdir(mode=0o700)
+    # Manager can inspect and move the preserved evidence; builder can create only
+    # in this per-instance slot.  No ACL is added to the workspace for Manager.
+    _grant_archive_acl(
+        archive_root, manager_account=manager_account, builder_account=plan.account
+    )
+    # The reclaim log lives in the commit-spool slot that was just reset, not in
+    # the instance's build-log slot: resetting that one would erase the log of
+    # the builder job whose workspace is being reclaimed.
+    log = spool_slot.preseed_job_writable_file(commit_slot / RECLAIM_LOG_FILENAME)
     job_env = job_runner.build_job_env(
         manager_env=env,
-        job_id=job_id,
-        slice_id=job_id,
+        job_id=instance,
+        slice_id=instance,
         repo_root=source_repo,
         workspace=workspace_path,
         role=job_runner.JOB_ROLE_BUILDER,
     )
+    job_env["CODEX_HOME"] = str(spool_slot.exact_job_slot("builder-codex-home", instance))
+    job_env["XDG_CACHE_HOME"] = str(spool_slot.exact_job_slot("builder-runtime-cache", instance))
+    nonce = secrets.token_hex(16)
     command = [
-        "/opt/cortex/venv/bin/python",
+        RECLAIM_PYTHON,
         "-m",
-        "paulsha_cortex.coordinator.owner_reclaim",
-        "--workspace", str(workspace_path),
-        "--pool-root", str(pool_root),
-        "--preserve-root", str(archive_root),
-        "--marker-json", json.dumps(dict(marker), sort_keys=True, separators=(",", ":")),
+        MODULE,
+        *reclaim_arguments(
+            workspace=workspace_path,
+            pool_root=pool_root,
+            preserve_root=archive_root,
+            marker_sha256=marker_digest(marker),
+            nonce=nonce,
+        ),
     ]
     spec = job_runner.build_job_spec(
-        job_id=job_id,
-        instance=plan.instance,
+        job_id=instance,
+        instance=instance,
         unit=plan.unit,
         command=command,
         working_directory=str(workspace_path),
         log_path=str(log),
         env=job_env,
     )
-    job_runner.write_job_spec(plan.spec_path, spec, account=plan.account)
-    start = job_runner.build_systemctl_start_argv(systemctl=plan.binary, unit=plan.unit)
-    completed = subprocess.run(
-        start,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
-    )
+    try:
+        job_runner.write_job_spec(plan.spec_path, spec, account=plan.account)
+        completed = _start_builder_unit(
+            job_runner.build_systemctl_start_argv(systemctl=plan.binary, unit=plan.unit)
+        )
+    finally:
+        # The spec is the helper's approval: single use, whatever happened.
+        Path(plan.spec_path).unlink(missing_ok=True)
     if completed.returncode:
-        raise RuntimeError(f"builder reclaim unit failed: {completed.stderr[-500:]}")
-    lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
-    for line in reversed(lines):
+        # The helper's own refusal is on its stderr, which the shim sent to the log.
         try:
-            result = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(result, dict) or result.get("status") != "cleared":
-            continue
-        if result.get("workspace_name") != workspace_path.name:
-            raise RuntimeError("builder reclaim completion names a different workspace")
-        preserved = result.get("preserved_files")
-        preserve_path = result.get("preserve_path")
-        if not isinstance(preserved, int) or preserved < 0:
-            raise RuntimeError("builder reclaim completion has an invalid preserve count")
-        preserved_commit = result.get("preserved_commit") is True
-        if preserved == 0 and not preserved_commit:
-            if preserve_path is not None:
-                raise RuntimeError("builder reclaim returned an empty preserve archive")
-        else:
-            archive = Path(str(preserve_path))
-            if archive.parent != archive_root or archive.is_symlink() or not archive.is_dir():
-                raise RuntimeError("builder reclaim archive is outside its Manager spool slot")
-            observed_count = 0
-            for directory, child_dirs, child_files in os.walk(archive, followlinks=False):
-                observed_count += sum(
-                    1 for name in child_dirs
-                    if (Path(directory) / name).is_symlink()
-                )
-                observed_count += len(child_files)
-            expected_count = preserved + (1 if preserved_commit else 0)
-            if observed_count != expected_count:
-                raise RuntimeError("builder reclaim archive count does not match its completion")
-            if preserved_commit:
-                bundle = archive / "workspace-head.bundle"
-                if not bundle.is_file() or bundle.is_symlink():
-                    raise RuntimeError("builder reclaim omitted the local commit bundle")
-        job_workspace.seal_commit_spool(archive_bundle)
-        return result
-    raise RuntimeError("builder reclaim unit returned no completion record")
+            log_tail = log.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            log_tail = ""
+        detail = (
+            job_runner.read_shim_error(str(log))
+            or log_tail
+            or completed.stderr
+            or completed.stdout
+        )
+        raise RuntimeError(
+            f"builder reclaim unit failed rc={completed.returncode}: {str(detail)[-500:]}"
+        )
+    result = _adopt_archive(_completion(log, instance=instance, nonce=nonce), archive_root=archive_root)
+    job_workspace.seal_commit_spool(commit_slot / job_workspace.COMMIT_BUNDLE_FILENAME)
+    return result
 
 
 if __name__ == "__main__":  # pragma: no cover - installed helper entry point

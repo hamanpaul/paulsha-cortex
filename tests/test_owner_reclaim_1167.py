@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+import contextlib
+import grp
 import json
+import os
+import pwd
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from paulsha_cortex.coordinator import job_workspace, owner_reclaim, worktree_reclaim
+from paulsha_cortex.coordinator import (
+    job_runner,
+    job_workspace,
+    owner_reclaim,
+    spool_slot,
+    worktree_reclaim,
+)
+
+
+NONCE = "a" * 32
 
 
 def _git(path: Path, *args: str) -> str:
@@ -16,9 +29,7 @@ def _git(path: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _workspace(tmp_path: Path) -> tuple[Path, dict[str, object], Path, Path]:
-    pool = tmp_path / "pool"
-    pool.mkdir()
+def _source(tmp_path: Path) -> Path:
     source = tmp_path / "source"
     source.mkdir()
     _git(source, "init", "-q", "-b", "main")
@@ -28,7 +39,11 @@ def _workspace(tmp_path: Path) -> tuple[Path, dict[str, object], Path, Path]:
         ["git", "-C", str(source), "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "seed"],
         check=True,
     )
-    workspace = pool / "job-1167"
+    return source
+
+
+def _clone(source: Path, pool: Path, name: str, *, attempt_id: str) -> tuple[Path, dict[str, object]]:
+    workspace = pool / name
     subprocess.run(["git", "clone", "-q", str(source), str(workspace)], check=True)
     marker = {
         "schema_version": job_workspace.MARKER_SCHEMA_VERSION,
@@ -36,8 +51,8 @@ def _workspace(tmp_path: Path) -> tuple[Path, dict[str, object], Path, Path]:
         "branch": "feature/reclaim",
         "base": _git(source, "rev-parse", "HEAD"),
         "source_repo": str(source),
-        "owner_identity": {"repo": "acme/repo", "work_id": "reclaim", "slice_id": "job-1167"},
-        "attempt_id": "job-1167",
+        "owner_identity": {"repo": "acme/repo", "work_id": "reclaim", "slice_id": name},
+        "attempt_id": attempt_id,
     }
     marker_path = job_workspace.marker_path(workspace)
     marker_path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,9 +60,57 @@ def _workspace(tmp_path: Path) -> tuple[Path, dict[str, object], Path, Path]:
     dirty = workspace / "new-dir" / "untracked.txt"
     dirty.parent.mkdir()
     dirty.write_text("preserve me\n", encoding="utf-8")
+    return workspace, marker
+
+
+def _workspace(tmp_path: Path) -> tuple[Path, dict[str, object], Path, Path]:
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    source = _source(tmp_path)
+    workspace, marker = _clone(source, pool, "job-1167", attempt_id="job-1167")
     preserve = tmp_path / "preserve"
     preserve.mkdir()
     return workspace, marker, pool, preserve
+
+
+def _arguments(workspace: Path, marker: dict[str, object], pool: Path, preserve: Path) -> list[str]:
+    return owner_reclaim.reclaim_arguments(
+        workspace=workspace.resolve(),
+        pool_root=pool.resolve(),
+        preserve_root=preserve,
+        marker_sha256=owner_reclaim.marker_digest(marker),
+        nonce=NONCE,
+    )
+
+
+def _approve(spool: Path, workspace: Path, command: list[str]) -> Path:
+    """Write the approval exactly as the Manager does: a job spec in its spool."""
+
+    spool.mkdir(mode=0o700, exist_ok=True)
+    spec = job_runner.build_job_spec(
+        job_id=workspace.name,
+        instance=workspace.name,
+        unit=f"cortex-job@{workspace.name}.service",
+        command=command,
+        working_directory=str(workspace.resolve()),
+        log_path=str(spool.parent / "reclaim-job.jsonl"),
+        env={"HOME": "/nonexistent-home", "PATH": "/usr/bin:/bin"},
+    )
+    path = spool / f"{workspace.name}.json"
+    job_runner.write_job_spec(str(path), spec)
+    return path
+
+
+def _reclaim_command(arguments: list[str]) -> list[str]:
+    return [owner_reclaim.RECLAIM_PYTHON, "-m", owner_reclaim.MODULE, *arguments]
+
+
+def _tree(path: Path) -> dict[str, bytes]:
+    return {
+        str(item.relative_to(path)): item.read_bytes()
+        for item in sorted(path.rglob("*"))
+        if item.is_file() and ".git" not in item.relative_to(path).parts
+    }
 
 
 def test_owner_reclaim_scans_preserves_then_clears_only_marker_bound_workspace(tmp_path: Path) -> None:
@@ -60,7 +123,7 @@ def test_owner_reclaim_scans_preserves_then_clears_only_marker_bound_workspace(t
         workspace=workspace,
         pool_root=pool,
         preserve_root=preserve,
-        expected_marker=marker,
+        expected_marker_sha256=owner_reclaim.marker_digest(marker),
     )
 
     assert result["status"] == "cleared"
@@ -82,7 +145,7 @@ def test_owner_reclaim_refuses_foreign_marker_without_mutating_workspace(tmp_pat
             workspace=workspace,
             pool_root=pool,
             preserve_root=preserve,
-            expected_marker=expected,
+            expected_marker_sha256=owner_reclaim.marker_digest(expected),
         )
 
     assert (workspace / "new-dir" / "untracked.txt").read_text() == "preserve me\n"
@@ -98,7 +161,7 @@ def test_owner_reclaim_refuses_non_pool_path_without_mutating_it(tmp_path: Path)
             workspace=workspace,
             pool_root=outside_pool,
             preserve_root=preserve,
-            expected_marker=marker,
+            expected_marker_sha256=owner_reclaim.marker_digest(marker),
         )
     assert (workspace / "new-dir" / "untracked.txt").exists()
 
@@ -118,7 +181,7 @@ def test_owner_reclaim_dirty_scan_failure_preserves_workspace(tmp_path: Path, mo
             workspace=workspace,
             pool_root=pool,
             preserve_root=preserve,
-            expected_marker=marker,
+            expected_marker_sha256=owner_reclaim.marker_digest(marker),
         )
     assert (workspace / "new-dir" / "untracked.txt").exists()
     assert list(preserve.iterdir()) == []
@@ -134,7 +197,7 @@ def test_owner_reclaim_refuses_dirty_content_that_exceeds_preserve_limit(tmp_pat
             workspace=workspace,
             pool_root=pool,
             preserve_root=preserve,
-            expected_marker=marker,
+            expected_marker_sha256=owner_reclaim.marker_digest(marker),
         )
 
     assert oversized.exists()
@@ -152,7 +215,7 @@ def test_reclaim_routes_owner_bound_workspace_through_builder_helper(
             workspace=workspace,
             pool_root=pool,
             preserve_root=preserve,
-            expected_marker=marker,
+            expected_marker_sha256=owner_reclaim.marker_digest(marker),
         )
 
     monkeypatch.setenv("PSC_JOB_RUNNER", "systemd-template")
@@ -168,3 +231,329 @@ def test_reclaim_routes_owner_bound_workspace_through_builder_helper(
     assert not workspace.exists()
     replay = worktree_reclaim.reclaim_worktree(workspace, repo_root=source)
     assert replay.status == worktree_reclaim.RECLAIM_ABSENT
+
+
+# ---------------------------------------------------------------------------
+# Manager approval (#1167 review MAJOR): the helper acts only on a Manager-authored
+# job spec that names exactly this invocation.  The builder can read the marker and
+# can call the CLI itself, so neither may stand in for Manager intent.
+# ---------------------------------------------------------------------------
+
+
+def test_helper_cli_runs_only_with_a_matching_manager_approval(tmp_path: Path, capsys) -> None:
+    workspace, marker, pool, preserve = _workspace(tmp_path)
+    spool = tmp_path / "approvals"
+    arguments = _arguments(workspace, marker, pool, preserve)
+    _approve(spool, workspace, _reclaim_command(arguments))
+
+    rc = owner_reclaim.main(arguments, approval_spool=spool, manager_uid=os.getuid())
+
+    assert rc == 0
+    completion = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert completion["status"] == "cleared"
+    assert completion["nonce"] == NONCE
+    assert completion["workspace_name"] == workspace.name
+    assert list(workspace.iterdir()) == []
+
+
+def test_helper_cli_refuses_a_builder_invocation_without_any_approval(tmp_path: Path, capsys) -> None:
+    workspace, marker, pool, preserve = _workspace(tmp_path)
+    spool = tmp_path / "approvals"
+    spool.mkdir(mode=0o700)
+    before = _tree(workspace)
+
+    rc = owner_reclaim.main(
+        _arguments(workspace, marker, pool, preserve),
+        approval_spool=spool,
+        manager_uid=os.getuid(),
+    )
+
+    assert rc == 1
+    assert "no Manager approval" in capsys.readouterr().err
+    assert _tree(workspace) == before
+    assert list(preserve.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ["not-manager-owner", "approval-group-writable", "spool-group-writable", "approval-symlink"],
+)
+def test_helper_cli_refuses_a_forged_approval(tmp_path: Path, capsys, forgery: str) -> None:
+    workspace, marker, pool, preserve = _workspace(tmp_path)
+    spool = tmp_path / "approvals"
+    arguments = _arguments(workspace, marker, pool, preserve)
+    approval = _approve(spool, workspace, _reclaim_command(arguments))
+    manager_uid = os.getuid()
+    if forgery == "not-manager-owner":
+        # The builder-authored copy has the right bytes but the wrong author.
+        manager_uid = os.getuid() + 1
+    elif forgery == "approval-group-writable":
+        approval.chmod(0o660)
+    elif forgery == "spool-group-writable":
+        spool.chmod(0o770)
+    else:
+        real = tmp_path / "elsewhere.json"
+        real.write_bytes(approval.read_bytes())
+        approval.unlink()
+        approval.symlink_to(real)
+    before = _tree(workspace)
+
+    rc = owner_reclaim.main(arguments, approval_spool=spool, manager_uid=manager_uid)
+
+    assert rc == 1
+    assert "approval" in capsys.readouterr().err
+    assert _tree(workspace) == before
+    assert list(preserve.iterdir()) == []
+
+
+def test_helper_cli_refuses_to_clear_another_pool_workspace(tmp_path: Path, capsys) -> None:
+    owned, owned_marker, pool, preserve = _workspace(tmp_path)
+    source = Path(str(owned_marker["source_repo"]))
+    foreign, foreign_marker = _clone(source, pool, "job-foreign", attempt_id="job-foreign")
+    spool = tmp_path / "approvals"
+    _approve(spool, owned, _reclaim_command(_arguments(owned, owned_marker, pool, preserve)))
+    foreign_arguments = _arguments(foreign, foreign_marker, pool, preserve)
+    before = _tree(foreign)
+
+    # No approval names the foreign slot at all.
+    assert owner_reclaim.main(foreign_arguments, approval_spool=spool, manager_uid=os.getuid()) == 1
+    assert "no Manager approval" in capsys.readouterr().err
+    # The foreign slot's own Manager spec is a model job, not a reclaim approval.
+    _approve(spool, foreign, ["codex", "exec", "--json"])
+    assert owner_reclaim.main(foreign_arguments, approval_spool=spool, manager_uid=os.getuid()) == 1
+    assert "does not authorize" in capsys.readouterr().err
+    # Re-targeting the owned approval at the foreign slot changes the argv.
+    retargeted = _arguments(owned, owned_marker, pool, preserve)
+    retargeted[retargeted.index("--workspace") + 1] = str(foreign.resolve())
+    assert owner_reclaim.main(retargeted, approval_spool=spool, manager_uid=os.getuid()) == 1
+    assert _tree(foreign) == before
+    assert (owned / "new-dir" / "untracked.txt").exists()
+    assert list(preserve.iterdir()) == []
+
+
+def test_helper_cli_refuses_a_replayed_approval(tmp_path: Path, capsys) -> None:
+    workspace, marker, pool, preserve = _workspace(tmp_path)
+    source = Path(str(marker["source_repo"]))
+    spool = tmp_path / "approvals"
+    arguments = _arguments(workspace, marker, pool, preserve)
+    approval = _approve(spool, workspace, _reclaim_command(arguments))
+    stale = approval.read_bytes()
+    assert owner_reclaim.main(arguments, approval_spool=spool, manager_uid=os.getuid()) == 0
+    capsys.readouterr()
+
+    # Consumed: the Manager deletes the approval once the unit has finished.
+    approval.unlink()
+    assert owner_reclaim.main(arguments, approval_spool=spool, manager_uid=os.getuid()) == 1
+    assert "no Manager approval" in capsys.readouterr().err
+
+    # A later attempt provisions the same slot again; a leftover copy of the old
+    # approval must not clear the new attempt's work.
+    workspace.rmdir()
+    workspace, _new_marker = _clone(source, pool, "job-1167", attempt_id="job-1167-retry")
+    approval.write_bytes(stale)
+    approval.chmod(0o640)
+    before = _tree(workspace)
+    assert owner_reclaim.main(arguments, approval_spool=spool, manager_uid=os.getuid()) == 1
+    assert "marker does not match" in capsys.readouterr().err
+    assert _tree(workspace) == before
+
+
+# ---------------------------------------------------------------------------
+# Manager half: one systemd template instance per existing pool slot, with a
+# single-use approval.  systemd is replaced by a fake that executes the approved
+# helper in-process, the way the root-owned shim would.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def manager_runtime(tmp_path: Path, monkeypatch):
+    agents = tmp_path / "agents"
+    pool = tmp_path / "worktree"
+    pool.mkdir()
+    spool = tmp_path / "job-specs" / "builder"
+    spool.mkdir(parents=True, mode=0o700)
+    home = tmp_path / "builder-home"
+    home.mkdir()
+    controls = tmp_path / "codex-controls" / "builder"
+    (controls / "plugins").mkdir(parents=True)
+    (controls / "skills").mkdir()
+    (controls / "config.toml").write_text("model = 'fixture'\n", encoding="utf-8")
+    (controls / "hooks.json").write_text("{}\n", encoding="utf-8")
+    source = _source(tmp_path)
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    for key, value in {
+        "PSC_AGENTS_ROOT": str(agents),
+        "PSC_REPO_ROOT": str(source),
+        "PSC_WORKTREE_ROOT": str(pool),
+        "PSC_JOB_RUNNER": "systemd-template",
+        "PSC_MANAGER_EXECUTOR": "codex",
+        "PSC_BUILDER_ACCOUNT": account,
+        "PSC_BUILDER_GROUP": group,
+        "PSC_BUILDER_HOME": str(home),
+        "PSC_BUILDER_PATH": "/usr/bin:/bin",
+        "PSC_JOB_SPEC_SPOOL": str(spool),
+        "PSC_CODEX_CONTROL_ROOT": str(controls.parent),
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(owner_reclaim, "APPROVAL_SPEC_SPOOL", str(spool))
+    monkeypatch.setattr(job_runner, "preflight_systemd_template", lambda **_kwargs: "/usr/bin/systemctl")
+    monkeypatch.setattr(job_runner, "_unit_is_active", lambda *_args: False)
+    monkeypatch.setattr(spool_slot, "_apply_slot_acl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(owner_reclaim, "_grant_archive_acl", lambda *_args, **_kwargs: None)
+    started: list[dict[str, object]] = []
+
+    def fake_unit(argv, *, completion=None):
+        unit = argv[-1]
+        instance = unit.split("@", 1)[1].removesuffix(".service")
+        spec = json.loads((spool / f"{instance}.json").read_text(encoding="utf-8"))
+        started.append({"argv": list(argv), "spec": spec})
+        with open(spec["log_path"], "a", encoding="utf-8") as log:
+            with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                rc = owner_reclaim.main(
+                    spec["command"][3:], approval_spool=spool, manager_uid=os.getuid()
+                )
+                if completion is not None:
+                    print(json.dumps(completion(spec)), flush=True)
+        return subprocess.CompletedProcess(list(argv), rc, "", "")
+
+    monkeypatch.setattr(owner_reclaim, "_start_builder_unit", fake_unit)
+    workspace, marker = _clone(
+        source, pool, job_workspace.job_segment("slice-1167"), attempt_id="slice-1167"
+    )
+    return {
+        "workspace": workspace,
+        "marker": marker,
+        "spool": spool,
+        "pool": pool,
+        "started": started,
+        "fake_unit": fake_unit,
+    }
+
+
+def test_manager_half_runs_the_existing_slot_instance_with_a_single_use_approval(
+    manager_runtime,
+) -> None:
+    workspace = manager_runtime["workspace"]
+    spool = manager_runtime["spool"]
+    # The log of the builder job that used this slot is still diagnostic evidence.
+    build_log = spool_slot.exact_job_slot("builder-job-log", workspace.name) / "job.jsonl"
+    build_log.parent.mkdir(parents=True)
+    build_log.write_text('{"event": "builder job output"}\n', encoding="utf-8")
+
+    result = owner_reclaim.reclaim_through_builder_unit(
+        workspace=workspace, marker=manager_runtime["marker"]
+    )
+
+    [started] = manager_runtime["started"]
+    spec = started["spec"]
+    # The pool slot name *is* the unit instance: no second job_segment() hash.
+    # (the template stem follows the Manager executor's hardening profile.)
+    assert started["argv"][-1].startswith("cortex-job")
+    assert started["argv"][-1].endswith(f"@{workspace.name}.service")
+    assert spec["unit"] == started["argv"][-1]
+    assert spec["instance"] == workspace.name
+    assert spec["working_directory"] == str(workspace.resolve())
+    assert spec["command"][1:3] == ["-m", owner_reclaim.MODULE]
+    assert spec["env"]["CODEX_HOME"].endswith(f"/codex-home/builder/{workspace.name}")
+    # Single use: the approval is gone once the unit has finished.
+    assert not (spool / f"{workspace.name}.json").exists()
+    assert list(workspace.iterdir()) == []
+    # The preserved evidence has left the builder-writable spool slot.
+    archive = Path(str(result["preserve_path"]))
+    assert archive.parent == owner_reclaim.reclaim_evidence_root()
+    assert (archive / "new-dir" / "untracked.txt").read_text() == "preserve me\n"
+    slot = spool_slot.exact_job_slot("commit-spool", workspace.name)
+    assert list((slot / owner_reclaim.RECLAIM_ARCHIVE_DIRNAME).iterdir()) == []
+    codex_home = spool_slot.exact_job_slot("builder-codex-home", workspace.name)
+    assert codex_home.is_dir() and not (codex_home / "auth.json").exists()
+    assert build_log.read_text(encoding="utf-8") == '{"event": "builder job output"}\n'
+    assert spec["log_path"] == str(slot / owner_reclaim.RECLAIM_LOG_FILENAME)
+
+
+def test_manager_half_rejects_a_completion_from_another_invocation(
+    manager_runtime, monkeypatch
+) -> None:
+    workspace = manager_runtime["workspace"]
+    spool = manager_runtime["spool"]
+    fake_unit = manager_runtime["fake_unit"]
+
+    def forged(spec):
+        return {
+            "schema_version": 1,
+            "status": "cleared",
+            "workspace_name": spec["instance"],
+            "preserved_files": 0,
+            "preserved_commit": False,
+            "preserve_path": None,
+            "nonce": "b" * 32,
+        }
+
+    def unit_without_helper(argv):
+        instance = argv[-1].split("@", 1)[1].removesuffix(".service")
+        spec = json.loads((spool / f"{instance}.json").read_text(encoding="utf-8"))
+        with open(spec["log_path"], "a", encoding="utf-8") as log:
+            print(json.dumps(forged(spec)), file=log, flush=True)
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    monkeypatch.setattr(owner_reclaim, "_start_builder_unit", unit_without_helper)
+    del fake_unit
+    with pytest.raises(RuntimeError, match="no completion record"):
+        owner_reclaim.reclaim_through_builder_unit(
+            workspace=workspace, marker=manager_runtime["marker"]
+        )
+    assert not (spool / f"{workspace.name}.json").exists()
+    assert (workspace / "new-dir" / "untracked.txt").exists()
+
+
+def test_manager_half_surfaces_the_helper_refusal_and_keeps_the_workspace(
+    manager_runtime,
+) -> None:
+    workspace = manager_runtime["workspace"]
+    spool = manager_runtime["spool"]
+    stale_snapshot = {**manager_runtime["marker"], "attempt_id": "an-earlier-attempt"}
+
+    with pytest.raises(RuntimeError, match="marker does not match the Manager-approved digest"):
+        owner_reclaim.reclaim_through_builder_unit(workspace=workspace, marker=stale_snapshot)
+
+    assert not (spool / f"{workspace.name}.json").exists()
+    assert (workspace / "new-dir" / "untracked.txt").read_text() == "preserve me\n"
+    assert job_workspace.read_marker(workspace) == manager_runtime["marker"]
+
+
+def test_manager_half_refuses_to_reset_an_unreviewed_reclaim_archive(manager_runtime) -> None:
+    workspace = manager_runtime["workspace"]
+    slot = spool_slot.exact_job_slot("commit-spool", workspace.name)
+    leftover = slot / owner_reclaim.RECLAIM_ARCHIVE_DIRNAME / f"{workspace.name}-earlier"
+    leftover.mkdir(parents=True)
+    (leftover / "evidence.txt").write_text("from an earlier failed reclaim\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="earlier reclaim archive"):
+        owner_reclaim.reclaim_through_builder_unit(
+            workspace=workspace, marker=manager_runtime["marker"]
+        )
+
+    assert (leftover / "evidence.txt").read_text() == "from an earlier failed reclaim\n"
+    assert manager_runtime["started"] == []
+    assert (workspace / "new-dir" / "untracked.txt").exists()
+
+
+def test_prepare_systemd_template_accepts_an_existing_slot_instance_verbatim(
+    manager_runtime,
+) -> None:
+    workspace = manager_runtime["workspace"]
+    plan = job_runner.prepare_systemd_template(
+        os.environ,
+        job_id=workspace.name,
+        instance=workspace.name,
+        executor="codex",
+    )
+    assert plan.instance == workspace.name
+    assert plan.unit.endswith(f"@{workspace.name}.service")
+    assert plan.spec_path.endswith(f"/{workspace.name}.json")
+    derived = job_runner.prepare_systemd_template(os.environ, job_id=workspace.name, executor="codex")
+    assert derived.instance != workspace.name
+    with pytest.raises(job_runner.JobRunnerError):
+        job_runner.prepare_systemd_template(
+            os.environ, job_id=workspace.name, instance="../escape", executor="codex"
+        )

@@ -188,7 +188,11 @@ def test_release_installed_checks_require_owner_bound_reclaim(
     evidence = tmp_path / "evidence"
     evidence.mkdir()
     seen: list[Path] = []
-    monkeypatch.setattr(driver, "_installed_owner_bound_reclaim", lambda path: seen.append(path))
+    monkeypatch.setattr(
+        driver,
+        "_installed_owner_bound_reclaim",
+        lambda receipt, path: seen.append((receipt["receipt_id"], path)),
+    )
 
     def fake_run(argv, **_kwargs):
         name = "selfcheck" if "selfcheck" in argv else "equation"
@@ -209,7 +213,7 @@ def test_release_installed_checks_require_owner_bound_reclaim(
         "registry-equation",
         "generated-installed-attestation",
     }
-    assert seen == [evidence]
+    assert seen == [("rc-test", evidence)]
 
 
 def _valid_full_qualification(tmp_path: Path) -> dict:
