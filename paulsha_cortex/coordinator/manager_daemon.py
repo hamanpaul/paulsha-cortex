@@ -17,7 +17,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from paulsha_cortex.config import paths
 from ..control import constants, contract
@@ -1390,6 +1390,35 @@ def build_request_executor(
     return execute
 
 
+#: resume 回傳的「無 job」結果中，屬於正常進行中、不需要讓 operator 看見的原因。
+_WORKFLOW_WAIT_SILENT_REASONS = frozenset({"in-flight"})
+
+
+def _workflow_wait_row(workflow: Any, resumed: object) -> dict[str, Any] | None:
+    """resume 沒有派出 job、也沒有轉 needs_human 時的等待原因（#716）。
+
+    這類決策（例如 provider-rate-limited、not-dispatchable、executor backoff）
+    過去只被丟棄，run 會在 status／work show 都看不到原因的情況下無聲地等待。
+    """
+
+    if not isinstance(resumed, Mapping) or resumed.get("job_id"):
+        return None
+    reason = resumed.get("reason")
+    if not isinstance(reason, str) or not reason or reason in _WORKFLOW_WAIT_SILENT_REASONS:
+        return None
+    row: dict[str, Any] = {
+        "run_id": workflow.run_id,
+        "work_id": workflow.work_id,
+        "repo": workflow.repo,
+        "phase": resumed.get("current_phase") or workflow.current_phase,
+        "reason": reason,
+    }
+    retry_after = resumed.get("retry_after_epoch")
+    if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+        row["retry_after_epoch"] = retry_after
+    return row
+
+
 def build_periodic_tick_runner(
     *,
     dispatcher,
@@ -1457,6 +1486,7 @@ def build_periodic_tick_runner(
         quota_admission_error: str | None = None
         quota_admission_reconcile: dict[str, Any] | None = None
         quota_admission_ctx = _quota_admission_context_for()
+        workflow_waits: list[dict[str, Any]] = []
         if registry is not None and hasattr(registry, "list_workflow_runs"):
             state_path = getattr(registry, "_state_path", None)
             coordinator_root = (
@@ -1526,7 +1556,7 @@ def build_periodic_tick_runner(
                     # #381：透過 _call_with_supported_kwargs 遞交 spawn_admission——
                     # 舊版（尚未認得這個參數的）injected fake 仍相容，不會因為新增
                     # 這個可選 kwarg 而 TypeError。
-                    _call_with_supported_kwargs(
+                    resumed = _call_with_supported_kwargs(
                         manager.resume_workflow_run,
                         dispatcher,
                         run_id=workflow.run_id,
@@ -1547,6 +1577,9 @@ def build_periodic_tick_runner(
                         ),
                         quota_admission_context=quota_admission_ctx,
                     )
+                    wait = _workflow_wait_row(workflow, resumed)
+                    if wait is not None:
+                        workflow_waits.append(wait)
                 except Exception as exc:
                     _log_error(
                         exc,
@@ -1673,6 +1706,8 @@ def build_periodic_tick_runner(
         if quota_admission_error is not None:
             summary["quota_admission_reconcile_failed"] = True
             summary["quota_admission_reconcile_error"] = quota_admission_error
+        if workflow_waits:
+            summary["workflow_waits"] = workflow_waits
         return summary
 
     return execute
@@ -1844,6 +1879,9 @@ def run_loop(
     consecutive_tick_failures = 0
     tick_circuit_open = False
     last_tick_error: dict[str, str] | None = None
+    # #716：最近一輪 periodic tick 中「resume 沒派 job、也沒轉 needs_human」的
+    # workflow 與原因，寫進 status.json 供 inspect status／canary 診斷。
+    last_workflow_waits: list[dict[str, Any]] = []
     _reset_log_error_dedup_state()
 
     try:
@@ -1953,6 +1991,8 @@ def run_loop(
                     skipped = isinstance(summary, dict) and summary.get("dispatch_skipped") == "not-idle"
                     daemon_idle = not skipped
                     if not skipped:
+                        waits = summary.get("workflow_waits") if isinstance(summary, dict) else None
+                        last_workflow_waits = list(waits) if isinstance(waits, list) else []
                         last_tick_at = now_fn()
                         last_tick_monotonic = monotonic_fn()
                         consecutive_tick_failures = 0
@@ -1995,6 +2035,7 @@ def run_loop(
                 status_payload["attention"] = list(snapshot.get("attention", []))
                 # #669：claim 判定不可 claim 而**沒有**建立 run 的 work item。
                 status_payload["not_claimable"] = list(snapshot.get("not_claimable", []))
+                status_payload["workflow_waits"] = list(last_workflow_waits)
                 contract.atomic_write_json(constants.status_path(), status_payload)
             except Exception as exc:  # noqa: BLE001
                 _log_error(exc)

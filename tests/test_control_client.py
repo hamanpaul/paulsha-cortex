@@ -579,3 +579,24 @@ def test_text_status_displays_busy_activity_identity_and_progress_time(capsys):
     assert "action=ship" in output
     assert "repo=acme/demo" in output
     assert "last_progress_at=2026-09-25T23:55:00+00:00" in output
+
+
+def test_read_status_passes_through_workflow_waits(monkeypatch, tmp_path):
+    """#716：status.json 的 ``workflow_waits`` 要原樣交給 inspect status。"""
+    from datetime import datetime, timezone
+
+    from paulsha_cortex.control import client
+
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    payload = contract.build_status(
+        ready=[], in_flight=[], recent_done=[], daemon={},
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    wait = {"run_id": "run-1", "work_id": "demo", "repo": "acme/demo", "phase": "build", "reason": "not-dispatchable"}
+    payload["workflow_waits"] = [wait]
+    contract.atomic_write_json(constants.status_path(), payload)
+
+    status = client.read_status()
+
+    assert status["degraded"] is False
+    assert status["workflow_waits"] == [wait]

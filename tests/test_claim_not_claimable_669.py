@@ -566,3 +566,32 @@ def test_clear_is_a_no_op_when_nothing_was_recorded(tmp_path: Path) -> None:
     path = tmp_path / not_claimable.LEDGER_FILENAME
     assert not_claimable.clear(path, repo="acme/demo", work_id="demo") is False
     assert not path.exists()
+
+
+def test_status_text_mode_prints_workflow_waits(capsys) -> None:
+    """#716：resume 沒派 job 也沒轉 needs_human 的 workflow 在文字模式看得到原因。"""
+    from paulsha_cortex.porcelain import inspect as porcelain_inspect
+
+    porcelain_inspect._print_status(
+        {
+            "updated_at": "2026-09-29T00:00:00Z",
+            "degraded": False,
+            "attention": [],
+            "not_claimable": [],
+            "workflow_waits": [
+                {
+                    "repo": "acme/demo",
+                    "work_id": "canary-probe",
+                    "phase": "build",
+                    "reason": "provider-rate-limited",
+                    "retry_after_epoch": 1790000000,
+                }
+            ],
+        }
+    )
+
+    out = capsys.readouterr().out
+    assert (
+        "workflow_wait[acme/demo/canary-probe]: build: provider-rate-limited "
+        "(retry_after_epoch=1790000000)" in out
+    )

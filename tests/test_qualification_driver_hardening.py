@@ -2648,6 +2648,10 @@ def test_full_dispatch_timeout_names_the_stuck_step_jobs_and_daemon_health(
             "last_tick_at": "2026-09-29T09:50:00Z",
         },
         "in_flight": [{"job_id": "job-2"}],
+        "workflow_waits": [
+            {"run_id": "run-qualification", "work_id": "qualification-work", "phase": "build", "reason": "provider-rate-limited"},
+            {"run_id": "run-other", "work_id": "other-work", "phase": "verify", "reason": "not-dispatchable"},
+        ],
     }
     real_run = driver._run
 
@@ -2678,6 +2682,9 @@ def test_full_dispatch_timeout_names_the_stuck_step_jobs_and_daemon_health(
     assert "run-other" not in message
     assert "consecutive_tick_failures=3 tick_circuit_open=true last_tick_error=present" in message
     assert "in_flight=1" in message
+    assert "workflow_wait=build:provider-rate-limited" in message
+    assert "not-dispatchable" not in message
+    assert "last_tick_at=2026-09-29T09:50:00Z" in message
     assert "secret detail" not in message
     assert closeouts == []
 

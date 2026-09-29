@@ -322,3 +322,59 @@ def test_periodic_tick_still_skips_needs_human_define_workflow(
     runner()
 
     assert resume_calls == []
+
+
+def test_periodic_tick_reports_workflows_that_resume_without_a_job(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#716 canary：resume 回「不派工、也不轉 needs_human」的決策（例如
+    provider-rate-limited、not-dispatchable）時，run 會無聲地一直等。summary 的
+    ``workflow_waits`` 要列出 run 與原因；派出 job 或 in-flight 的不列。"""
+
+    workflows = [
+        SimpleNamespace(**{**vars(_resume_target_workflow()), "run_id": run_id, "work_id": run_id})
+        for run_id in ("run-wait", "run-dispatched", "run-in-flight")
+    ]
+    registry = SimpleNamespace(
+        _state_path=str(tmp_path / "jobs.json"),
+        list_workflow_runs=lambda: workflows,
+    )
+    dispatcher = SimpleNamespace(_registry=registry, _git_runner=lambda args: "")
+    results = {
+        "run-wait": {
+            "run_id": "run-wait",
+            "current_phase": "build",
+            "reason": "provider-rate-limited",
+            "retry_after_epoch": 1_790_000_000,
+        },
+        "run-dispatched": {"run_id": "run-dispatched", "job_id": "job-1", "status": "dispatched"},
+        "run-in-flight": {"run_id": "run-in-flight", "current_phase": "build", "reason": "in-flight"},
+    }
+
+    def fake_resume_workflow_run(dispatcher_arg, **kwargs):
+        return results[kwargs["run_id"]]
+
+    monkeypatch.setattr(manager_daemon.manager, "resume_workflow_run", fake_resume_workflow_run)
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=object(),
+        run_tick_fn=lambda dispatcher_arg, **kwargs: {"dispatch_skipped": False},
+        scan_specs_fn=lambda specs_dir: [],
+        auto_claim_fn=lambda: [],
+        workflow_identity_registry=object(),
+    )
+
+    result = runner()
+
+    assert result["workflow_waits"] == [
+        {
+            "run_id": "run-wait",
+            "work_id": "run-wait",
+            "repo": "acme/demo",
+            "phase": "build",
+            "reason": "provider-rate-limited",
+            "retry_after_epoch": 1_790_000_000,
+        }
+    ]

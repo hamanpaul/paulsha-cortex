@@ -398,3 +398,38 @@ def test_safe_tick_error_summary_redacts_paths_and_caps_length(tmp_path: Path):
     long_exc = RuntimeError("x" * 500)
     long_summary = manager_daemon._safe_tick_error_summary(long_exc)
     assert len(long_summary["reason"]) <= manager_daemon.TICK_ERROR_REASON_MAX_LENGTH + 1
+
+
+def test_status_carries_workflow_waits_from_the_last_periodic_tick(monkeypatch, tmp_path):
+    """#716：periodic tick 的 ``workflow_waits`` 寫進 status.json，沒有時為空清單。"""
+
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    wait = {
+        "run_id": "run-wait",
+        "work_id": "demo",
+        "repo": "acme/demo",
+        "phase": "build",
+        "reason": "provider-rate-limited",
+    }
+
+    def run_once(runner):
+        points = iter([0.0, 5.0, 5.0])
+        manager_daemon.run_loop(
+            request_executor=lambda req: {"dispatched": []},
+            status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+            periodic_tick_runner=runner,
+            poll_interval=0.0,
+            tick_interval=5.0,
+            now_fn=lambda: "2026-09-29T13:00:00+00:00",
+            monotonic_fn=lambda: next(points),
+            sleep_fn=lambda _: None,
+            pid=1,
+            max_rounds=1,
+        )
+        return contract.read_json(constants.status_path())
+
+    waiting = run_once(lambda: {"dispatch_skipped": False, "workflow_waits": [wait]})
+    assert waiting["workflow_waits"] == [wait]
+
+    cleared = run_once(lambda: {"dispatch_skipped": False})
+    assert cleared["workflow_waits"] == []
