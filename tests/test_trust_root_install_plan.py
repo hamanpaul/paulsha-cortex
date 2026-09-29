@@ -30,8 +30,11 @@ from paulsha_cortex.trust_root.install import (
     plan_sha256,
     validate_apply_plan,
 )
+from paulsha_cortex.trust_root.install import backend as install_backend
 from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install import core as install_core
+from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
+from paulsha_cortex.trust_root.install.core import InstallReceipt, rollback_receipt
 
 
 def _sha256(path: Path) -> str:
@@ -168,6 +171,59 @@ def test_same_inputs_produce_byte_identical_canonical_plan_and_hash(tmp_path: Pa
     # Canonical JSON is a single deterministic encoding, not pretty-printed output.
     assert canonical_plan_bytes(first).endswith(b"\n")
     assert b"\n  " not in canonical_plan_bytes(first)
+
+
+def test_rollback_reports_unknown_file_inside_nested_plan_managed_directories(
+    tmp_path: Path,
+) -> None:
+    plan, _document = _plan_document(tmp_path)
+    managed_directories = [
+        step
+        for step in plan["apply_order"]
+        if step.get("kind") == "asset" and step.get("asset_type") == "directory"
+    ]
+    parent_step, child_step = next(
+        (parent, child)
+        for parent in managed_directories
+        for child in managed_directories
+        if Path(parent["path"]) in Path(child["path"]).parents
+    )
+    parent = Path(str(parent_step["path"]))
+    child = Path(str(child_step["path"]))
+    child.mkdir(parents=True)
+    parent_baseline = install_backend._directory_inventory(parent)
+    child_baseline = install_backend._directory_inventory(child)
+    unknown = child / "created-after-install.json"
+    unknown.write_text("durable state\n", encoding="utf-8")
+
+    archived = [
+        {
+            "step_id": step["step_id"],
+            "step": dict(step),
+            "status": "completed",
+            "prior": {"exists": True, "children": baseline},
+        }
+        for step, baseline in (
+            (parent_step, parent_baseline),
+            (child_step, child_baseline),
+        )
+    ]
+    receipt = InstallReceipt(
+        {
+            "state": "applied",
+            "journal": [],
+            "rollback_journal": archived,
+            "services_started": False,
+            "credentials": [],
+        }
+    )
+
+    report = rollback_receipt(receipt, backend=LocalInstallBackend(require_root=False))
+
+    assert report.retained_unknown == (str(unknown),)
+    assert receipt.to_dict()["rollback"]["retained_unknown"] == [str(unknown)]
+    assert receipt.to_dict()["state"] == "rollback-blocked"
+    assert unknown.read_text(encoding="utf-8") == "durable state\n"
 
 
 def test_plan_is_exact_artifact_bound_four_way_structured_desired_state(

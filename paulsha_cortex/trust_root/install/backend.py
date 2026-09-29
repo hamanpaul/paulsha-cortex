@@ -4998,6 +4998,7 @@ class LocalInstallBackend:
         def is_managed_inventory_path(candidate: Path, container: Path) -> bool:
             return any(
                 managed != container
+                and container in managed.parents
                 and (
                     candidate == managed
                     or managed in candidate.parents
