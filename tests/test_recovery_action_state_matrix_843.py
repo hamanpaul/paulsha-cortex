@@ -1755,7 +1755,7 @@ def _scenario_builder(action: str) -> Callable[[Path, Any], Scenario]:
 ROUND_TRIP_SCENARIOS: dict[str, tuple[Callable[[Path, Any], Scenario], tuple[str, ...]]] = {
     "build-card-terminal-without-evidence": (
         _scenario_builder("retry-card"),
-        ("regenerate-gates", "retry-card"),
+        ("abandon", "regenerate-gates", "retry-card"),
     ),
     "planning-environment-failure": (
         _planning_failure_before_delivery,
@@ -1763,12 +1763,14 @@ ROUND_TRIP_SCENARIOS: dict[str, tuple[Callable[[Path, Any], Scenario], tuple[str
     ),
     "pre-candidate-owner-slice": (
         _scenario_builder("recover-pre-candidate"),
-        ("recover-pre-candidate",),
+        ("abandon", "recover-pre-candidate"),
     ),
     "blocking-findings-before-delivery": (
         _blocking_findings_before_delivery,
-        ("retry-review", "retry-build"),
+        ("abandon", "retry-review", "retry-build"),
     ),
+    # #1170：帶 PR refs 的 run 越過 abandon 的 pre-delivery 閘門，只投影可受理的
+    # retry lane；pre-delivery 對照組（上一列）仍保留 abandon。
     "blocking-findings-with-open-pr": (
         _blocking_findings_with_open_pr,
         ("retry-review", "retry-build"),

@@ -353,10 +353,11 @@ class TestRecoverPreCandidateOnFreshFailure:
             owner_identity=owner_identity,
             attempt_id=attempt_id,
         )
-        # create_job() 登記時預設 dispatched；本案例模擬 builder 已失敗，因此
-        # 明確終結 job，避免把「尚未啟動的 fixture row」當成可回收的 active writer。
-        reg._find_job(builder_job["job_id"])["status"] = "failed"
-        reg._persist()
+        # #1168：production 只有在 builder job 已由 headless finalize 標成 terminal
+        # `failed` 之後，complete_tick 才會把 slice 轉成 failed/failed（in-flight
+        # job 在 harvest 迴圈直接略過）。create_job() 預設 dispatched，這裡走同一個
+        # 公開 finalize API 還原真實狀態；job 仍 dispatched 時 admission 必須拒絕。
+        reg.update_headless_result(builder_job["job_id"], status="failed", exit_code=1)
         reg.create_slice(
             slice_id="slice-a",
             spec_path="specs/slice-a.md",

@@ -1615,9 +1615,11 @@ def workflow_status_entry(
     # phase 的 needs_human run（現場：`planning-authority-reconciliation-failed`）
     # 因此永遠拿到 `[]`，CLI 面無路可走。基礎集合改由
     # `claim.needs_human_next_actions` 導出——與 `claim._resume_decision` 是**同一
-    # 個函式**，且它永遠至少含 `abandon`，這就是「不得再出現 next_actions: []」
-    # 的機械保證。`_phase_recovery_actions` 退回它原本的職責：**補**那些要看 job
-    # 層事實才判定得出來的動作（regenerate-gates／retry-card）。
+    # 個函式**，pre-delivery run 永遠至少含 `abandon`，越過 pre-delivery 閘門的
+    # run 至少含 `retire-delivered`／retry lane／`resume`（#1170），這就是「不得
+    # 再出現 next_actions: []」的機械保證。`_phase_recovery_actions` 退回它原本的
+    # 職責：**補**那些要看 job 層事實才判定得出來的動作（regenerate-gates／
+    # retry-card）。
     hint_classification: str | None = None
     try:
         from .work_actions import _planning_failure_hint
@@ -1627,10 +1629,17 @@ def workflow_status_entry(
             hint_classification = hint.get("classification")
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         hint_classification = None
-    # 保底集合不依賴任何 registry／檔案讀取，因此上面的 except 分支也不會讓它變空。
+    # #1170：abandon 的 pre-delivery 閘門（`registry.workflow_run_pre_delivery`，
+    # 與 `_manager_validate_workflow_abandon` 同一判準）。越過閘門的 run 不論
+    # job 層投影成敗都不得再拿到必被拒的 abandon。
+    from .registry import workflow_run_pre_delivery
+
+    pre_delivery = workflow_run_pre_delivery(run)
+    # 保底集合不依賴任何 registry／檔案讀取，因此下面的 except 分支也不會讓它變空。
     next_actions: tuple[str, ...] = needs_human_next_actions(
         phase=getattr(run, "current_phase", None),
         planning_failure_classification=hint_classification,
+        pre_delivery=pre_delivery,
     )
     persisted_next_step_hint = None
     if isinstance(reason_payload, dict):
@@ -1643,6 +1652,7 @@ def workflow_status_entry(
         work_id=getattr(run, "work_id", None),
         repo=getattr(run, "repo", None),
         run_id=getattr(run, "run_id", None),
+        pre_delivery=pre_delivery,
     )
     try:
         from .work_actions import (
@@ -1656,10 +1666,13 @@ def workflow_status_entry(
             phase=getattr(run, "current_phase", None),
             planning_failure_classification=hint_classification,
             job_recovery_actions=recovery_actions,
+            pre_delivery=pre_delivery,
         )
-        if persisted_next_step_hint is None and "retire-delivered" in next_actions:
-            # #1141：已交付的 run（journal 證明交付 PR 已 merge）不得再指向必被拒的
-            # abandon；hint 與 next_actions 同源導出。
+        if persisted_next_step_hint is None and (
+            "retire-delivered" in next_actions or not pre_delivery
+        ):
+            # #1141／#1170：已交付或已越過 pre-delivery 閘門的 run 不得再指向
+            # 必被拒的 abandon；hint 與 next_actions 同源導出。
             next_step_hint = needs_human_next_step_hint(
                 phase=getattr(run, "current_phase", None),
                 planning_failure_classification=hint_classification,
@@ -1667,6 +1680,7 @@ def workflow_status_entry(
                 repo=getattr(run, "repo", None),
                 run_id=getattr(run, "run_id", None),
                 job_recovery_actions=recovery_actions,
+                pre_delivery=pre_delivery,
             )
         if (
             persisted_next_step_hint is None
@@ -1727,6 +1741,7 @@ def workflow_status_entry(
                 repo=getattr(run, "repo", None),
                 run_id=getattr(run, "run_id", None),
                 job_recovery_actions=filtered_next_actions,
+                pre_delivery=pre_delivery,
             )
             if not filtered_next_actions:
                 next_step_hint = "目前沒有符合正式入口前置條件的 recovery action。"

@@ -78,7 +78,8 @@
       "retest": "recover-pre-candidate must refuse, with zero side effects, when the bound builder job or another job with the same owner identity and attempt id is still dispatched/running; the projection shares the admission and must stop offering the action.",
       "verified_by": [
         "tests/test_recovery_action_state_matrix_843.py::test_r02_recover_pre_candidate_refuses_a_still_running_bound_builder",
-        "tests/test_recovery_action_state_matrix_843.py::test_r02_recover_pre_candidate_refuses_an_active_sibling_for_same_attempt"
+        "tests/test_recovery_action_state_matrix_843.py::test_r02_recover_pre_candidate_refuses_an_active_sibling_for_same_attempt",
+        "tests/test_pre_candidate_recovery.py::test_allowed_slice_actions_hides_pre_candidate_recovery_admission_rejects"
       ]
     },
     {
@@ -101,7 +102,9 @@
       "verified_by": [
         "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[blocking-findings-with-open-pr-retry-review]",
         "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[blocking-findings-with-open-pr-retry-build]",
-        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[open-pr-awaiting-copilot-resume]"
+        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[open-pr-awaiting-copilot-resume]",
+        "tests/test_open_pr_recovery_projection_1170.py::test_projection_shares_the_abandon_pre_delivery_gate",
+        "tests/test_open_pr_recovery_projection_1170.py::test_open_pr_run_never_falls_back_to_abandon"
       ]
     },
     {

@@ -1312,8 +1312,27 @@ class CompleteTickVerificationTests(unittest.TestCase):
             slice_row = reg.get_slice("slice-runner-bad-evidence")
             self.assertEqual(manifest["gate_status"], "needs_human")
             self.assertEqual(manifest["gate_reason"], "verification-runner-error")
-            self.assertIsNone(manifest["gate_verdict"])
-            self.assertIsNone(manifest["verification_evidence_path"])
+            # #1171：runner 先在 (slice, candidate) 固定路徑寫了內容不同的 evidence；
+            # 過去 runner-error 診斷在同一路徑衝突、舊檔被 quarantine、沒有 verdict。
+            # 現在診斷以 content hash 另存，與 runner 未寫 evidence 的情境
+            # （test_invalid_runner_candidate_payload_marks_needs_human）一致。
+            self.assertEqual(manifest["gate_verdict"]["status"], "needs_human")
+            self.assertEqual(manifest["gate_verdict"]["summary"], "verification-runner-error")
+            canonical = manager.verification.evidence_path(
+                slice_id="slice-runner-bad-evidence",
+                candidate=candidate,
+                coordinator_root=root,
+            )
+            recorded = manifest["verification_evidence_path"]
+            self.assertIsNotNone(recorded)
+            self.assertNotEqual(recorded, str(root / "forged.json"))
+            self.assertNotEqual(recorded, str(canonical))
+            self.assertEqual(Path(recorded).parent, canonical.parent)
+            # runner 自己寫的 evidence 保留原位、未被 quarantine，但不被採信。
+            self.assertIn(
+                "verification-succeeded", canonical.read_text(encoding="utf-8")
+            )
+            self.assertFalse((canonical.parent / "quarantine").exists())
             self.assertEqual(slice_row["state"], "needs_human")
             self.assertEqual(slice_row["gate_state"], "needs_human")
             self.assertEqual(

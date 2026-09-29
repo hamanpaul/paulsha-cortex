@@ -148,8 +148,9 @@ def _seed_planning_failure_run(
     tmp_path: Path, *,
     classification: str,
     reason: str,
+    prs: tuple[int, ...] = (8,),
 ) -> tuple[str, JobRegistry, Path, Path]:
-    snapshot = _snapshot(tmp_path / "snapshot.json")
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=prs)
     state = tmp_path / "runs.json"
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     run_id = _start_define_run(
@@ -329,11 +330,18 @@ def test_resume_without_planning_evidence_offers_no_recovery(tmp_path: Path) -> 
 def test_resume_response_surfaces_next_actions(tmp_path: Path) -> None:
     """R2：operator 走 `cortex work resume` 就要看得到下一步，不必翻 registry。"""
 
+    # #1170：fallback starter 依 mapped PR 預填 run.pr_refs，但 production 的
+    # work_bridge start 建立 run 時 pr_refs 為空；帶 pr_refs 的 run 已越過 abandon
+    # 的 pre-delivery 閘門（admission 必拒），投影不再給 abandon。這裡改用沒有
+    # mapped PR 的 work item，讓 define run 維持 production 的 pre-delivery 形狀，
+    # abandon 與 recover-planning 兩個出口都是正式入口會受理的。
     run_id, registry, state, snapshot = _seed_planning_failure_run(
         tmp_path,
         classification="environment",
         reason="planning identity probe unavailable",
+        prs=(),
     )
+    assert registry.get_workflow_run(run_id).pr_refs == ()
     resumed = work_actions.execute_work_action(
         args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
         requested_by="operator",

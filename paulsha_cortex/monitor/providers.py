@@ -96,6 +96,7 @@ def _workflow_next_actions_projection(
     delivery journal（#1141：已交付 run 的 `retire-delivered`）；缺席時該判準不宣告。
     """
     from ..coordinator.claim import needs_human_next_actions
+    from ..coordinator.registry import workflow_run_pre_delivery
     from ..coordinator.work_actions import (
         _phase_recovery_actions,
         _planning_failure_hint,
@@ -169,6 +170,8 @@ def _workflow_next_actions_projection(
                 phase=run.current_phase,
                 planning_failure_classification=classification,
                 job_recovery_actions=recovery_actions,
+                # #1170：與 abandon admission 同一個 pre-delivery 判準。
+                pre_delivery=workflow_run_pre_delivery(run),
             )
         # #1093 對抗審查第四輪 MAJOR1：`authority_state == "available_last_
         # known_good"` 代表 authority 只靠 canonical GitHub provider 的

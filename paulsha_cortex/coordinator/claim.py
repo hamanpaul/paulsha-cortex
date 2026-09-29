@@ -18,7 +18,6 @@ from urllib.parse import quote
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.schema import BAND_LEVELS
 from paulsha_cortex.github_rate_limit import is_rate_limit_signal
-from paulsha_cortex.recovery_action_contracts import RECOVERY_WORK_ACTIONS
 
 from . import verification
 
@@ -1361,6 +1360,10 @@ class ClaimCandidate:
     # 讀取端從 canonical job／owner slice 摘要導出的可受理復原動作；claim 與
     # status/list 共用同一份投影，不在純決策層重新猜測 job 狀態。
     active_recovery_actions: tuple[str, ...] = ()
+    # #1170：讀取端以 `registry.workflow_run_pre_delivery` 判定 run 是否仍在
+    # abandon 的 pre-delivery 閘門內；越過閘門（PR refs／ship／completion record）
+    # 的 run 不得再被建議 abandon。
+    active_pre_delivery: bool = True
 
 
 @dataclass(frozen=True)
@@ -1390,6 +1393,7 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
         ("confirmed_todo", candidate.confirmed_todo),
         ("auto_label", candidate.auto_label),
         ("active_plan_review_passed", candidate.active_plan_review_passed),
+        ("active_pre_delivery", candidate.active_pre_delivery),
     ):
         if not isinstance(value, bool):
             raise ValueError(f"{field} must be boolean")
@@ -1442,6 +1446,8 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
         raise ValueError("active recovery actions must be a tuple of non-empty strings")
     if candidate.active_run_id is None and candidate.active_recovery_actions:
         raise ValueError("active recovery actions require an active workflow")
+    if candidate.active_run_id is None and not candidate.active_pre_delivery:
+        raise ValueError("active delivery state requires an active workflow")
     if candidate.active_run_id is not None:
         if not isinstance(candidate.active_run_id, str) or not candidate.active_run_id.strip():
             raise ValueError("active_run_id must be a non-empty string")
@@ -1792,6 +1798,7 @@ def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
             active_provider_revision=None,
             active_authority_digest=None,
             active_recovery_actions=(),
+            active_pre_delivery=True,
         )
     )
     if candidate.active_claim_key != expected_key:
@@ -1799,11 +1806,17 @@ def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
     return _resume_decision(candidate)
 
 
+#: #1170：越過 pre-delivery 閘門的 run 若已有可受理的 retry lane，就以該 lane
+#: 為出口；沒有時以註冊的 `resume` 重入目前的 Manager delivery step。
+_DELIVERY_RETRY_LANES = frozenset({"retry-review", "retry-build", "retry-card"})
+
+
 def needs_human_next_actions(
     *,
     phase: str | None,
     planning_failure_classification: str | None,
     job_recovery_actions: tuple[str, ...] = (),
+    pre_delivery: bool = True,
 ) -> tuple[str, ...]:
     """`needs_human` run 的基礎合法動作集合——**單一導出點，回傳值永不為空**。
 
@@ -1812,10 +1825,12 @@ def needs_human_next_actions(
     拿到空的 `next_actions`。現在 `ClaimCandidate` 帶入從 canonical job／owner
     slice admission 導出的動作，claim、status、list 共用本函式合併基礎與 job 動作。
 
-    基礎判準維持不變：
+    基礎判準：
 
-    - 有受理的 job 層復原動作時以該動作作為出口；否則 `abandon` 釋放後可重
-      claim。函式因此不會回空，維持 #728 的「至少有一個 operator action」保證。
+    - pre-delivery run（`pre_delivery=True`，由呼叫端以
+      `registry.workflow_run_pre_delivery` 判定，與 abandon admission 同一判準）的
+      `abandon` **永遠**在集合裡（#256 R3：釋放後可重 claim），因此本函式不可能回
+      空集合；這就是「至少給得出一個合法動作」的機械保證。
     - `recover-planning` 只在「停在 `define` 的環境類 planning 失敗」才浮現
       （R1 fail-closed），與 `work_actions._recover_planning_action` 自身的前置驗
       （`run.current_phase != "define"` 與 `classification != "environment"` 兩條
@@ -1824,25 +1839,37 @@ def needs_human_next_actions(
       只在 delivery journal 證明本 run 的交付 PR 已由 Manager merge 時宣告）代表
       run 已交付——`abandon` 的 pre-delivery admission 對帶 pr_refs 的 run 必拒，
       基礎集合改成 `retire-delivered`，同樣不可能回空集合。
+    - #1170：越過 pre-delivery 閘門（帶 PR refs、已進 ship、ship 已通過或已有
+      completion record）但未證實交付的 run，`abandon` 必被拒，任何來源都不得再
+      投影它；`recover-planning` 的前置驗不看 delivery 狀態，照上一條規則浮現；
+      job 層已有可受理的 retry lane（retry-review／retry-build／retry-card）時
+      以它為出口，否則基礎集合改成註冊的 `resume`（重入目前的 Manager delivery
+      step），#728 的非空保證因此在這一側同樣成立。
     """
 
-    admitted_alternatives = tuple(
-        action
-        for action in job_recovery_actions
-        if action in RECOVERY_WORK_ACTIONS and action != "abandon"
+    planning: tuple[str, ...] = (
+        ("recover-planning",)
+        if planning_failure_classification == "environment" and phase == "define"
+        else ()
     )
-    if "retire-delivered" in admitted_alternatives:
+    if "retire-delivered" in job_recovery_actions:
         base: tuple[str, ...] = ("retire-delivered",)
-    elif planning_failure_classification == "environment" and phase == "define":
-        base = ("recover-planning", "abandon")
-    elif admitted_alternatives:
-        # Use an admitted recovery lane as the base exit when available. In
-        # particular, abandon rejects delivered/open-PR runs; #728 still
-        # requires a non-empty next_actions tuple.
-        base = admitted_alternatives
+    elif pre_delivery:
+        base = (*planning, "abandon")
+    elif planning or any(
+        action in _DELIVERY_RETRY_LANES for action in job_recovery_actions
+    ):
+        base = planning
     else:
-        base = ("abandon",)
-    return (*base, *(action for action in job_recovery_actions if action not in base))
+        base = ("resume",)
+    return (
+        *base,
+        *(
+            action
+            for action in job_recovery_actions
+            if action not in base and (pre_delivery or action != "abandon")
+        ),
+    )
 
 
 def needs_human_next_step_hint(
@@ -1853,6 +1880,7 @@ def needs_human_next_step_hint(
     repo: object = None,
     run_id: object = None,
     job_recovery_actions: tuple[str, ...] = (),
+    pre_delivery: bool = True,
 ) -> str:
     """Return the operator-facing hint paired with ``needs_human_next_actions``.
 
@@ -1861,13 +1889,16 @@ def needs_human_next_step_hint(
     no safe automatic recovery: the accepted planning triplet must be repaired,
     the stuck run abandoned, and intake started again.  #1141: a delivered run
     (``retire-delivered`` in the job-level actions) points at retire-delivered,
-    never at the pre-delivery-only abandon.
+    never at the pre-delivery-only abandon.  #1170: a run past the pre-delivery
+    gate (``pre_delivery=False``) lists only the admitted actions and never
+    points at abandon either.
     """
 
     actions = needs_human_next_actions(
         phase=phase,
         planning_failure_classification=planning_failure_classification,
         job_recovery_actions=job_recovery_actions,
+        pre_delivery=pre_delivery,
     )
 
     def hint_value(value: object, fallback: str, pattern: str) -> str:
@@ -1891,6 +1922,17 @@ def needs_human_next_step_hint(
             f"--expected-run-id {safe_run_id} --actor <operator> "
             "--reason '<single-line reason>'`。"
         )
+    if not pre_delivery:
+        hint = (
+            "此 run 已越過 pre-delivery 閘門（帶 PR refs、已進 ship 或已有 completion "
+            "record），abandon 不受理；可受理的復原動作：" + "、".join(actions) + "。"
+        )
+        if "resume" in actions:
+            hint += (
+                f"排除阻塞後執行 `cortex work resume {safe_work_id} --repo {safe_repo}` "
+                "重入目前的 delivery step。"
+            )
+        return hint
     if planning_failure_classification == "content":
         return (
             "規劃內容遭拒；請先恢復可接受的 spec/design/plan 三件套，接著執行 "
@@ -1901,8 +1943,6 @@ def needs_human_next_step_hint(
             "請修復規劃環境並重試 recover-planning；若無法修復，請執行 "
             f"{abandon}。"
         )
-    if "abandon" not in actions:
-        return "請使用 attention 列出的可受理復原動作：" + "、".join(actions) + "。"
     return f"請檢視阻塞證據，接著執行 {abandon}。"
 
 
@@ -1916,7 +1956,8 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             next_actions=(),
         )
     if candidate.active_status == "needs_human":
-        # #256 R2：不得只原樣回報狀態。`abandon` 永遠合法（釋放後可重 claim，R3）；
+        # #256 R2：不得只原樣回報狀態。pre-delivery run 的 `abandon` 永遠合法（釋放後
+        # 可重 claim，R3；越過閘門的 run 見 #1170 的 `needs_human_next_actions`）；
         # `recover-planning` 只有在該 run 自己的 evidence 顯示「停在 define 的
         # 環境類 planning 失敗」時才是合法出口——內容類失敗不得由本路徑繞過
         # （R1 fail-closed），拿不到 evidence 時也不宣稱它可用。
@@ -1927,6 +1968,7 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             phase=candidate.active_phase,
             planning_failure_classification=classification,
             job_recovery_actions=candidate.active_recovery_actions,
+            pre_delivery=candidate.active_pre_delivery,
         )
         blocking_reason = (
             f"planning-failure:{classification}:{candidate.active_planning_failure_reason}"
@@ -1940,6 +1982,7 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             repo=candidate.repo,
             run_id=candidate.active_run_id,
             job_recovery_actions=candidate.active_recovery_actions,
+            pre_delivery=candidate.active_pre_delivery,
         )
         return ClaimDecision(
             action="needs_human",

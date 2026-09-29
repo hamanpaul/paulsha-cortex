@@ -90,7 +90,7 @@ from .work_bridge import (
     workflow_status,
 )
 from .workflow import GateEvidenceRef, brainstorm_authority_bound
-from .registry import ACTIVE_JOB_STATUSES
+from .registry import ACTIVE_JOB_STATUSES, workflow_run_pre_delivery
 
 
 logger = logging.getLogger(__name__)
@@ -3738,6 +3738,12 @@ def _claim_action(
             planning_failure_hint["reason"] if planning_failure_hint else None
         ),
         active_recovery_actions=active_recovery_actions,
+        # #1170：abandon 的 pre-delivery 閘門與投影共用同一判準。
+        active_pre_delivery=(
+            workflow_run_pre_delivery(canonical_run)
+            if canonical_run is not None
+            else True
+        ),
     )
     if (
         canonical_run is not None
@@ -4918,27 +4924,6 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
                     for action in _blocking_findings_recovery_actions(run)
                     if action not in actions
                 )
-                # `retry-review` admission also accepts a needs_human review run
-                # whose exact verified Candidate and frozen plan remain current.
-                # Expose that same recovery lane for ship handoff failures with an
-                # open PR; `abandon` is pre-delivery only and will reject them.
-                if (
-                    run.current_phase == "review"
-                    and isinstance(run.candidate_head, str)
-                    and run.candidate_head == run.verified_head
-                    and any(item.kind == "plan" for item in run.planning_authority)
-                ):
-                    try:
-                        active_runs = [
-                            item for item in workflow_registry.list_workflow_runs()
-                            if item.repo == run.repo and item.work_id == run.work_id
-                            and item.status == "ongoing"
-                        ]
-                    except Exception:
-                        active_runs = []
-                    if len(active_runs) == 1 and active_runs[0].run_id == run.run_id:
-                        if "retry-review" not in actions:
-                            actions.append("retry-review")
 
     if reason_code.startswith("copilot-") and "review-attest" not in actions:
         actions.append("review-attest")
@@ -4963,24 +4948,6 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
         run, workflow_registry
     ):
         actions.append("retire-delivered")
-    if (
-        run.pr_refs
-        and "retire-delivered" not in actions
-        and not any(action in actions for action in ("retry-review", "retry-build", "retry-card"))
-    ):
-        # An open/unproven PR cannot be abandoned or retired as delivered.
-        # `resume` is the registered ship-lane entry that lets Manager retry
-        # the current delivery step after a transient needs_human failure.
-        try:
-            has_active_job = any(
-                job.get("workflow_run_id") == run.run_id
-                and job.get("status") in ACTIVE_JOB_STATUSES
-                for job in workflow_registry.list_jobs()
-            )
-        except Exception:
-            has_active_job = True
-        if not has_active_job and "resume" not in actions:
-            actions.append("resume")
     return tuple(actions)
 
 
