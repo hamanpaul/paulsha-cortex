@@ -1831,8 +1831,13 @@ def record_config_reload(
 _PROCESS_START_TOLERANCE_SECONDS = 120.0
 
 
+#: 讀取 live 程序啟動時間的 procfs 根目錄；呼叫時才解析，測試可整體替換，
+#: 避免以假 MainPID 查到宿主上剛好同號的真程序。
+PROC_ROOT = Path("/proc")
+
+
 def live_process_started_epoch(
-    pid: object, *, proc_root: Path = Path("/proc")
+    pid: object, *, proc_root: Path | None = None
 ) -> float | None:
     """Start time (epoch seconds) of a live process, from ``/proc/<pid>/stat``.
 
@@ -1844,6 +1849,8 @@ def live_process_started_epoch(
 
     if type(pid) is not int or pid <= 0:
         return None
+    if proc_root is None:
+        proc_root = PROC_ROOT
     try:
         stat_text = (proc_root / str(pid) / "stat").read_text(encoding="ascii")
         boot_text = (proc_root / "stat").read_text(encoding="ascii")

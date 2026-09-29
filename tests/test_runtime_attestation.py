@@ -1957,7 +1957,9 @@ def test_live_process_started_epoch_reads_proc_stat(tmp_path: Path) -> None:
     assert live_process_started_epoch(4242, proc_root=proc) == 1790000000 + 500 / hz
     assert live_process_started_epoch(4243, proc_root=proc) is None
     assert live_process_started_epoch(None, proc_root=proc) is None
-    assert live_process_started_epoch(os.getpid()) is not None
+    assert live_process_started_epoch(os.getpid(), proc_root=Path("/proc")) is not None
+    # 測試預設把 PROC_ROOT 指向不存在的路徑（conftest），不傳 proc_root 時讀不到。
+    assert live_process_started_epoch(os.getpid()) is None
 
 
 def test_in_process_identity_carries_the_installer_wheel_marker(
