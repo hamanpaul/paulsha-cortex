@@ -33,15 +33,15 @@ Slice-only extension：`slice-action supersede`／`cortex recover slice ... supe
 
 | AC | 可執行驗收 | 結果界線 |
 |---|---|---|
-| R01 inventory | 新測試對比正式 action classification、13 個 family rows、work/slice dispatcher、control contract、coordinator/recover parser；新增正式 recovery 名稱若未分類或缺列即 fail。 | 不用全 repo 靜態掃描宣稱無其他入口；另列註冊但非 recovery 的 operation。 |
-| R02 preconditions | 每 action 使用既有 public-path 正例/負例；錯 phase/card、actor/reason、exact CAS、active job 與拒絕後 state/evidence/job 數量見上表引用測試。正式 recover aliases 以 table-driven request round-trip 驗收。 | 各 namespace 分開使用相同名字，slice row 不借 WorkAuthority run CAS。 |
-| R03 drift/CAS | retry/reset tests 在 candidate/card/owner/binding revision 改變後拒絕；public consumer 讀到舊 evidence 不能作用於新 attempt/generation。 | registry receipt 的 CAS/fault tests 仍是 registry 層證據；不能代替 public action/late terminal 驗收。 |
-| R04 retry-card dispatch | `retry-card` 透過正式 work-action 強制派一個 replacement job；launcher failure/no-job 要恢復 `needs_human`，重送不得產生第二顆 active attempt。 | `retry-verify` 同次派 verification；`retry-review` 的 reset/next-tick 語意不同。 |
-| R05 resume/planning | accepted evidence 維持 immutable；recover-planning 只解除 blocker，實際 planner 接續於後續 tick，brainstorm required 時留在 producer 可達的 define phase。 | 回應 action 名稱或 facet 清除不等於 planner/job 已執行。 |
-| R06 legacy retry | work workflow retry-verify/review 與 slice retry-verify/review 各保留自己入口和行為；porcelain recover 未註冊 workflow legacy retry 名稱。 | 各 workflow/slice retry 的 terminal admission 與 dispatch 行為由各自 producer suite 覆蓋，不合併 API。 |
-| R07 crash/restart/late terminal | 公開 recover-planning、work abandon、recover-superseded 均有 crash/restart 與 exact replay 覆蓋；retry dispatch failure/late terminal 由既有 suite 覆蓋。frozen same-domain reviewer pin 有 zero-job/zero-launch negative control。 | **已完成**：recover-superseded 三個 crash 邊界重載 registry 後只會是原 superseded 狀態（可重送）或已完整恢復狀態（audit hash exact replay）；registry status/gate/source revision 同一 CAS，沒有 ongoing wedge。 |
+| R01 inventory | 新測試對比正式 action classification、13 個 family rows、work/slice dispatcher、control contract、coordinator/recover parser；另以 AST 反射確認每個註冊 work recovery action 在 `execute_work_action` 有實際分支。 | 不用全 repo 靜態掃描宣稱無其他入口；另列註冊但非 recovery 的 operation。 |
+| R02 preconditions | 既有 action suites 有各自 public-path 正例/負例；新增 retry-card 重送拒絕與 recover-superseded 公開入口狀態測試。 | **仍缺 G843-R02-action-state-matrix**：沒有共用參數化測試逐項將所有適用 work action 從正式入口連到持久 registry/read model，且同時驗證所有拒絕類別與三種副作用不變。 |
+| R03 drift/CAS | retry/reset tests 在 candidate/card/owner/binding revision 改變後拒絕；public consumer 讀到舊 evidence 不能作用於新 attempt/generation。 | **仍缺 G843-R03-public-cas-drift**：authority/candidate read-to-commit drift 多數只在 registry 層注入，尚無涵蓋各正式 action 的共用 public-path drift matrix。 |
+| R04 retry-card dispatch | `retry-card` 透過正式 work-action 強制派一個 replacement job；launcher failure/no-job 要恢復 `needs_human`；增加 action 重送測試，第二次不能再清除 gate 或建立第二個 attempt。 | `retry-verify` 同次派 verification；`retry-review` 的 reset/next-tick 語意不同。 |
+| R05 resume/planning | accepted evidence 維持 immutable；recover-planning 回應改為 `planning-recovery-unblocked`，並斷言同次呼叫 job 數不變；後續 Manager resume 仍走正式流程且 brainstorm required 時留在 define。 | 下一拍 Manager resume 有執行測試，但目前 launcher fixture 不產生真 planner job；不可宣稱 planner 派工已在此測試完成。 |
+| R06 legacy retry | work workflow retry-verify/review 與 slice retry-verify/review 各保留自己入口和行為；新增 slice `retry-verify` 經 `apply_slice_action` 重跑 verification 的正例。 | workflow 與 slice 仍由各自行為 fixture 驗證，不共用一個跨 namespace fixture，避免合併不同 dispatch 語意。 |
+| R07 crash/restart/late terminal | recover-planning、work abandon 與 recover-superseded 有 crash/restart/exact replay 覆蓋；recover-superseded 現經 `execute_work_action`、真實 `WorkAuthority` digest 與 authority loader seam。 | **仍缺完整 work 層 delayed-terminal 注入**：既有 late-terminal 證據主要是 slice/registry 層；fresh registry exact replay 已驗，不代表所有舊 work job terminal 都已注入。 |
 | R08 ownership/resource | owner-bound recovery 拒絕其他 writer/workspace/marker，abandon/reclaim 只處理可證為 owned 的資源；重送 cleanup 是 no-op/可查 disposition。 | 不處理外部 repo/runtime 的 workspace 實體；必須 live 驗收才能證明安裝後 reclaim。 |
-| R09 next_actions | claim/resume/status/list/attention 用同一前置條件投影 actions；action 發布後若 state drift，正式入口仍可拒絕且不寫入。 | `next_actions` 是當下 read-model 提示，不是授權 token。 |
+| R09 next_actions | claim/resume/status/list/attention 用同一前置條件投影 actions；slice recovery 的 list/action equivalence 有正反例，work projection 亦有 read-model 測試。 | **仍缺 G843-R09-work-next-actions-roundtrip**：尚未將正式 work status/attention 投影出的每個 `next_actions` 原樣送進 `execute_work_action` 參數化驗收。`next_actions` 是當下 read-model 提示，不是授權 token。 |
 | R10 gap ownership | `docs/recovery-action-gaps-843.json` 是機讀 gap 清單；conformance test 驗證每列都有 owner/source/retest，且 full-plan task 5.5 未解除前持續保持 open。不用 skip、寬鬆 xfail 或偽 receipt。 | R07 的 recovery action crash/restart 驗收已完成；本矩陣不宣稱 installed runtime 或 live canary 已驗收。 |
 
 ## 明確未完成與重驗入口
@@ -50,6 +50,9 @@ Slice-only extension：`slice-action supersede`／`cortex recover slice ... supe
 
 | Gap / owner | 本 repo 留下的可重現證據 | 重新驗收條件 |
 |---|---|---|
+| G843-R02-action-state-matrix | 見 R02 row 與 `docs/recovery-action-gaps-843.json`。 | 完成逐 action public-entry→registry→read-model positive/negative matrix，拒絕後 registry/evidence/job count 全不變。 |
+| G843-R03-public-cas-drift | 見 R03 row 與機讀 gap ledger。 | 在正式 action admission/commit 間注入 authority/candidate drift，證明拒絕且 newer generation 不變。 |
+| G843-R09-work-next-actions-roundtrip | 見 R09 row 與機讀 gap ledger。 | 對 work status/attention 所列每個 action 以相同前置條件正式送入 `execute_work_action`。 |
 | G843-R08-live-reclaim | 見下列 RC ACL 能力與 action-level reclaim 邊界。 | 取得 R08 正式入口 recovery canary receipt。 |
 | G843-installed-live-recovery | 只有 CLI/daemon fixture，沒有 pinned installed runtime recovery receipt。 | 按機讀 gap ledger 的 installed/live recovery 條件重驗。 |
 | G843-sandbox-egress-acl | 本機環境的 egress/ACL 限制見下列項目。 | 在符合條件的受治理環境重跑對應 suite。 |

@@ -4,6 +4,27 @@
   "full_plan_gate": "openspec/changes/cortex-refine-complete/tasks.md#5.5",
   "gaps": [
     {
+      "id": "G843-R02-action-state-matrix",
+      "owner": "issue-843",
+      "status": "open",
+      "source": "docs/recovery-action-contract-matrix.md#R02 preconditions",
+      "retest": "Add a shared public-entry-to-persisted-registry-to-read-model matrix for every applicable work action, covering allowed state and wrong phase/card, active job, missing actor/reason, and stale exact-run rejection with unchanged registry, evidence, and job count."
+    },
+    {
+      "id": "G843-R03-public-cas-drift",
+      "owner": "issue-843",
+      "status": "open",
+      "source": "docs/recovery-action-contract-matrix.md#R03 drift/CAS",
+      "retest": "Inject authority/candidate drift between public action admission and registry commit for each applicable action; assert fail-closed result and unchanged newer generation."
+    },
+    {
+      "id": "G843-R09-work-next-actions-roundtrip",
+      "owner": "issue-843",
+      "status": "open",
+      "source": "docs/recovery-action-contract-matrix.md#R09 next_actions",
+      "retest": "For each work action projected by status/attention, pass the projected request through execute_work_action under the same precondition fixture and verify acceptance; retain negative projection cases for missing authority."
+    },
+    {
       "id": "G843-R08-live-reclaim",
       "owner": "runtime-owner",
       "status": "pending-owner-evidence",
