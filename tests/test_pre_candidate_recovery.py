@@ -14,12 +14,23 @@ from paulsha_cortex.coordinator.registry import JobRegistry
 def test_allowed_slice_actions_when_candidate_is_null(tmp_path: Path) -> None:
     state_path = tmp_path / "jobs.json"
     reg = JobRegistry(state_path=state_path)
+    # #1168：slice 投影與 recover-pre-candidate admission 共用同一判準，admission
+    # 只受理 owner-bound slice（完整 owner identity＋attempt，綁定的 builder job
+    # 同一身分），因此 fixture 以 owner-bound 形狀驗「null candidate 可回收」。
+    owner_identity = {
+        "repo": "hamanpaul/example",
+        "work_id": "slice-null-cand",
+        "slice_id": "slice-null-cand",
+    }
+    attempt_id = "attempt-slice-null-cand"
     builder_job = reg.create_job(
         task="slice-null-cand",
         persona="builder",
         branch="feature/slice-null-cand",
         pane="",
         worktree=str(tmp_path / "wt" / "feature-slice-null-cand"),
+        owner_identity=owner_identity,
+        attempt_id=attempt_id,
     )
     reg.update_headless_result(builder_job["job_id"], status="failed", exit_code=1)
     reg.create_slice(
@@ -32,6 +43,8 @@ def test_allowed_slice_actions_when_candidate_is_null(tmp_path: Path) -> None:
         builder_job_id=builder_job["job_id"],
         reviewer_job_id=None,
         candidate=None,
+        owner_identity=owner_identity,
+        attempt_id=attempt_id,
     )
     reg.update_slice("slice-null-cand", state="needs_human", gate_state="needs_human")
     slice_row = reg.get_slice("slice-null-cand")
@@ -39,6 +52,71 @@ def test_allowed_slice_actions_when_candidate_is_null(tmp_path: Path) -> None:
     actions = manager.allowed_slice_actions(reg, slice_row)
     assert "recover-pre-candidate" in actions
     assert "retry-build" not in actions
+
+
+def test_allowed_slice_actions_hides_pre_candidate_recovery_admission_rejects(
+    tmp_path: Path,
+) -> None:
+    """#1168：legacy unbound slice 與 builder 仍 dispatched 的 slice，
+    recover-pre-candidate admission 都會拒絕，投影不得再宣告。"""
+    reg = JobRegistry(state_path=tmp_path / "jobs.json")
+    legacy_job = reg.create_job(
+        task="slice-legacy",
+        persona="builder",
+        branch="feature/slice-legacy",
+        pane="",
+        worktree=str(tmp_path / "wt" / "feature-slice-legacy"),
+    )
+    reg.update_headless_result(legacy_job["job_id"], status="failed", exit_code=1)
+    reg.create_slice(
+        slice_id="slice-legacy",
+        spec_path="specs/slice-legacy.md",
+        spec_hash="spec-sha",
+        plan_path="plans/slice-legacy.md",
+        plan_hash="plan-sha",
+        target_branch="main",
+        builder_job_id=legacy_job["job_id"],
+        reviewer_job_id=None,
+        candidate=None,
+    )
+    reg.update_slice("slice-legacy", state="needs_human", gate_state="needs_human")
+
+    owner_identity = {
+        "repo": "hamanpaul/example",
+        "work_id": "slice-running",
+        "slice_id": "slice-running",
+    }
+    running_job = reg.create_job(
+        task="slice-running",
+        persona="builder",
+        branch="feature/slice-running",
+        pane="",
+        worktree=str(tmp_path / "wt" / "feature-slice-running"),
+        owner_identity=owner_identity,
+        attempt_id="attempt-slice-running",
+    )
+    reg.create_slice(
+        slice_id="slice-running",
+        spec_path="specs/slice-running.md",
+        spec_hash="spec-sha",
+        plan_path="plans/slice-running.md",
+        plan_hash="plan-sha",
+        target_branch="main",
+        builder_job_id=running_job["job_id"],
+        reviewer_job_id=None,
+        candidate=None,
+        owner_identity=owner_identity,
+        attempt_id="attempt-slice-running",
+    )
+    reg.update_slice("slice-running", state="needs_human", gate_state="needs_human")
+
+    for slice_id in ("slice-legacy", "slice-running"):
+        slice_row = reg.get_slice(slice_id)
+        with pytest.raises(RuntimeError):
+            manager._pre_candidate_recovery_admission(reg, slice_row)
+        actions = manager.allowed_slice_actions(reg, slice_row)
+        assert "recover-pre-candidate" not in actions, slice_id
+        assert "abandon" in actions, slice_id
 
 
 def _git(repo: Path, *args: str) -> None:

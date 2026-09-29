@@ -455,7 +455,7 @@ def test_retry_verify_reruns_verification_once_for_the_unchanged_candidate(
     for key in ("executor", "model_id", "log_path", "workflow_evidence", "worktree", "task"):
         assert kept.get(key) == old_job.get(key), key
 
-    # 共用：先前的 evidence 內容一個位元組都沒被抹掉（原地保留或移入 quarantine）。
+    # 共用：先前的 evidence 內容一個位元組都沒被抹掉，原路徑保留。
     surviving = _surviving_bytes(scenario.root)
     for relpath, content in scenario.prior_evidence.items():
         assert content in surviving, relpath
@@ -503,10 +503,12 @@ def test_retry_verify_reruns_verification_once_for_the_unchanged_candidate(
         assert kept == old_job
         persisted = scenario.subject()
         assert response["action"] == "retry-verify"
-        # 本檔只斷言「回應＝持久狀態＝read model」的一致性，不斷言重跑一定被採信：
-        # slice evidence 以 `(slice, candidate)` 為固定路徑，同一 Candidate 重跑得到
-        # 不同內容時 `write_verification_evidence` 會把舊檔移入 quarantine 並拋錯，
-        # action 因此回報 `verification-runner-error`（見 R06 回報的 finding）。
+        # 同一 Candidate 的新結果以 content hash 分出 evidence 路徑，舊 evidence
+        # 原位保留；通過結果應被採信並離開 needs_human。
+        assert response["gate_status"] in {"verified", "reviewing"}
+        prior_path = scenario.root / next(iter(scenario.prior_evidence))
+        assert Path(response["verification_evidence_path"]) != prior_path
+        assert all((scenario.root / relpath).is_file() for relpath in scenario.prior_evidence)
         assert response["slice_state"] == persisted["state"]
         assert response["gate_state"] == persisted["gate_state"]
         assert response["verification_evidence_path"] == persisted["current_evidence_refs"][0]
@@ -584,18 +586,6 @@ def test_rejection_matrix_covers_both_namespaces_with_the_same_categories() -> N
         assert source.count(f'category == "{category}"') == 2, category
 
 
-SLICE_REVERIFY_GAP = "G843-R06-slice-reverify-evidence-collision"
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        f"known gap {SLICE_REVERIFY_GAP}: slice evidence 以 (slice, candidate) 固定路徑"
-        "存放，同一 Candidate 重跑得到不同內容時舊檔移入 quarantine、action 回"
-        " verification-runner-error"
-    ),
-)
 def test_slice_retry_verify_adopts_a_passing_rerun_for_the_same_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

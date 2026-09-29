@@ -447,29 +447,6 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     temp_path.unlink(missing_ok=True)
 
 
-def _existing_evidence_result_or_raise(path: Path, content_hash: str) -> dict[str, Any]:
-    conflict_reason = "existing evidence unreadable"
-    try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        existing = None
-    if isinstance(existing, dict):
-        try:
-            existing_normalized = validate_verification_evidence(existing)
-        except ValueError as exc:
-            existing_normalized = None
-            conflict_reason = f"invalid schema: {exc}"
-        else:
-            if canonical_json_hash(existing_normalized) == content_hash:
-                return {"path": str(path), "hash": content_hash, "payload": existing_normalized}
-            conflict_reason = "content mismatch"
-    quarantine_dir = path.parent / "quarantine"
-    quarantine_dir.mkdir(parents=True, exist_ok=True)
-    quarantine_path = quarantine_dir / f"{path.stem}-{uuid4().hex}.json"
-    os.replace(path, quarantine_path)
-    raise RuntimeError(f"conflicting verification evidence: {path} ({conflict_reason})")
-
-
 def write_verification_evidence(
     payload: object,
     *,
@@ -482,12 +459,51 @@ def write_verification_evidence(
         coordinator_root=coordinator_root,
     )
     content_hash = canonical_json_hash(normalized)
+    canonical_path = path
     if path.exists():
-        return _existing_evidence_result_or_raise(path, content_hash)
+        try:
+            existing = validate_verification_evidence(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            existing = None
+        if existing is not None and canonical_json_hash(existing) == content_hash:
+            return {"path": str(path), "hash": content_hash, "payload": existing}
+        # Evidence is immutable history. A rerun for the same candidate may
+        # produce a different result; content-address the new attempt instead
+        # of quarantining or replacing the earlier evidence.
+        path = path.with_name(f"{path.stem}-{content_hash}.json")
     try:
         atomic_write_json(path, normalized)
     except AtomicWriteConflictError:
-        return _existing_evidence_result_or_raise(path, content_hash)
+        try:
+            existing = validate_verification_evidence(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            existing = None
+        if existing is not None and canonical_json_hash(existing) == content_hash:
+            return {"path": str(path), "hash": content_hash, "payload": existing}
+        if path != canonical_path:
+            raise RuntimeError(f"conflicting verification evidence: {path} (content mismatch)")
+        # Another writer won the canonical (slice, candidate) slot after our
+        # existence check. Keep that result immutable and retry at our own
+        # content-addressed path.
+        path = canonical_path.with_name(f"{canonical_path.stem}-{content_hash}.json")
+        try:
+            atomic_write_json(path, normalized)
+        except AtomicWriteConflictError:
+            try:
+                existing = validate_verification_evidence(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                existing = None
+            if existing is None or canonical_json_hash(existing) != content_hash:
+                raise RuntimeError(
+                    f"conflicting verification evidence: {path} (content mismatch)"
+                )
+            return {"path": str(path), "hash": content_hash, "payload": existing}
     return {"path": str(path), "hash": content_hash, "payload": normalized}
 
 
