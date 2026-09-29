@@ -1,0 +1,1 @@
+- deployment canary 派工逾時的診斷加上 Manager registry 內該 workflow 的 phase／各步驟 gate 結果、該 run 的 job（phase:card:status:exit_code:executor），以及 `inspect status` 的 daemon tick 健康度（連續失敗數、circuit、是否有 tick error、in-flight 數）；只輸出列舉 token，讀取失敗回報 unavailable（#716）。

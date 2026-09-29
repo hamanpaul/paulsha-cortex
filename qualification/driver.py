@@ -4607,6 +4607,108 @@ def _dispatch_item_diagnostic(item: Mapping[str, object] | None) -> str:
     )
 
 
+def _dispatch_timeout_diagnostic(
+    runtime_env: Mapping[str, str], *, repository: str, work_id: str
+) -> str:
+    """逾時時的唯讀診斷：registry 內該 workflow 的步驟與 job，以及 daemon tick 健康度。
+
+    #716 canary run 36538644074 在 build 停了兩小時、沒有 needs_human，只看得到
+    item 狀態。這裡只輸出列舉型 token（錯誤文字只報 present），任何讀取失敗都
+    回報為 unavailable，不影響原本的逾時失敗。
+    """
+
+    parts: list[str] = []
+    try:
+        root = Path(runtime_env["PSC_COORDINATOR_ROOT"]).resolve()
+        registry = _json_object(
+            _manager_file(root / "jobs.json", label="coordinator registry", root=root),
+            label="coordinator registry",
+        )
+        workflows = [
+            row
+            for row in registry.get("workflows") or []
+            if isinstance(row, Mapping)
+            and row.get("work_id") == work_id
+            and row.get("repo") == repository
+        ]
+        if len(workflows) != 1:
+            parts.append(f"registry=workflows:{len(workflows)}")
+        else:
+            workflow = workflows[0]
+            parts.extend(
+                (
+                    f"current_phase={_diagnostic_token(workflow.get('current_phase'))}",
+                    f"status={_diagnostic_token(workflow.get('status'))}",
+                    f"gate_status={_diagnostic_token(workflow.get('gate_status'))}",
+                )
+            )
+            steps = workflow.get("steps")
+            if isinstance(steps, list):
+                parts.append(
+                    "steps="
+                    + ";".join(
+                        f"{_diagnostic_token(row.get('phase'))}:{_diagnostic_token(row.get('card'))}"
+                        f"={_diagnostic_token(row.get('gate_result'))}"
+                        for row in steps
+                        if isinstance(row, Mapping)
+                    )
+                )
+            run_id = workflow.get("run_id")
+            jobs = [
+                job
+                for job in registry.get("jobs") or []
+                if isinstance(job, Mapping) and job.get("workflow_run_id") == run_id
+            ]
+            parts.append(
+                "jobs="
+                + (
+                    ";".join(
+                        f"{_diagnostic_token(job.get('workflow_phase'))}"
+                        f":{_diagnostic_token(job.get('workflow_card'))}"
+                        f":{_diagnostic_token(job.get('status'))}"
+                        f":{_diagnostic_token(None if job.get('exit_code') is None else str(job.get('exit_code')))}"
+                        f":{_diagnostic_token(job.get('executor'))}"
+                        for job in jobs
+                    )
+                    or "none"
+                )
+            )
+    except (QualificationFailure, KeyError, OSError, TypeError, ValueError):
+        parts.append("registry=unavailable")
+    try:
+        status = _run(
+            ("/opt/cortex/venv/bin/cortex", "inspect", "status", "--json"),
+            env=runtime_env,
+            timeout=30,
+        )
+        records = _json_records(status.stdout) if status.returncode == 0 else []
+        payload = records[-1] if records else None
+        if isinstance(payload, Mapping) and isinstance(payload.get("status"), Mapping):
+            payload = payload["status"]
+        daemon = payload.get("daemon") if isinstance(payload, Mapping) else None
+        if not isinstance(daemon, Mapping):
+            raise ValueError("daemon status unavailable")
+        failures = daemon.get("consecutive_tick_failures")
+        circuit = daemon.get("tick_circuit_open")
+        in_flight = payload.get("in_flight")
+        parts.extend(
+            (
+                "consecutive_tick_failures="
+                + (str(failures) if type(failures) is int else "unknown"),
+                "tick_circuit_open="
+                + (str(circuit).lower() if isinstance(circuit, bool) else "unknown"),
+                "last_tick_error="
+                + ("present" if daemon.get("last_tick_error") else "none"),
+                f"last_tick_at={_diagnostic_token(daemon.get('last_tick_at'))}",
+                "in_flight="
+                + (str(len(in_flight)) if isinstance(in_flight, list) else "unknown"),
+            )
+        )
+    except (QualificationFailure, OSError, TypeError, ValueError, subprocess.SubprocessError):
+        parts.append("daemon=unavailable")
+    return " ".join(parts)
+
+
 def _full_dispatch(
     *,
     repository: str,
@@ -4687,6 +4789,10 @@ def _full_dispatch(
         raise QualificationFailure(
             "full dispatch did not reach terminal closeout before timeout: "
             + _dispatch_item_diagnostic(observed)
+            + " "
+            + _dispatch_timeout_diagnostic(
+                runtime_env, repository=repository, work_id=work_id
+            )
         )
     markers, artifact_rows, workflow, agent_loop_probe = _validate_dispatch_closeout(
         repository=repository,
