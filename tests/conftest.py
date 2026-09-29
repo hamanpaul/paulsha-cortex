@@ -129,6 +129,20 @@ def _network_guard(request: pytest.FixtureRequest):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_procfs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """測試以假 MainPID（例如 123、4242）模擬 systemd unit；loaded receipt 的 PID
+    重用檢查會讀 ``/proc/<pid>``，在宿主上剛好有同號真程序時結果不定（CI 3.13
+    曾因此失敗）。預設指向空目錄＝讀不到啟動時間；需要真 procfs 的測試明確傳
+    ``proc_root=Path("/proc")`` 或自行覆寫 ``runtime_attestation.PROC_ROOT``。"""
+
+    from paulsha_cortex import runtime_attestation
+
+    empty = tmp_path / "isolated-procfs"
+    empty.mkdir()
+    monkeypatch.setattr(runtime_attestation, "PROC_ROOT", empty)
+
+
+@pytest.fixture(autouse=True)
 def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep tests hermetic against operator shell/runtime bootstrap variables.
 

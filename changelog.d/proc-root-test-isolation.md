@@ -1,0 +1,1 @@
+- loaded receipt 的 PID 重用檢查讀取的 procfs 根目錄改為呼叫時解析的 `runtime_attestation.PROC_ROOT`；測試預設指向空目錄，避免以假 MainPID 查到 CI 宿主上剛好同號的真程序而結果不定（#841 的 CI flaky）。
