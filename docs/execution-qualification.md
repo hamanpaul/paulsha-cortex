@@ -51,6 +51,54 @@ cortex model qualification approve <candidate-id> \
 
 The operator CLI writes only the durable receipt file under the Operator/Manager-writable `operator-receipts/` directory, then publishes the lifecycle receipt from that same file; it never needs to write the separate Manager-only `operator-receipt-index.json` (an Operator account and a Manager account can be entirely separate principals under the published Trust Root ACL). `--actor` is the audited reviewer label; authority to issue comes from the governed operator/Manager entry and its Trust Root write permissions. Issue, plan, agent review, and test-only receipt are not substitutes for approval of the exact qualification.
 
+### Owner: issue a live human approval
+
+The production owner performs this only after the PatchMUD producer has supplied a report and execution-profile binding for the **same exact resolved key**, with complete deck/role coverage and known observed execution conditions. The checked-in fixtures do not meet those requirements. Do not use `--test-only`; do not use `qualification review` for a live approval. No benchmark or paid evaluation is started by these Cortex commands.
+
+Required inputs:
+
+- The immutable PatchMUD report-v2 JSON, its producer Git revision, and the matching #835 execution-profile binding JSON.
+- The exact `epk:v1:resolved:<64 lowercase hex>` present in both artifacts, plus the Cortex executor, model id, and runtime role (`planning`, `build`, or `review`).
+- The current lifecycle revision. The import command prints the next revision; use that printed value as the approve command's `--expected-revision`.
+- The human actor id, review reason, active qualification policy revision, timezone-aware reviewed/expiry timestamps, and unique idempotency keys.
+
+Import the source artifacts. This creates a pending candidate and does not grant dispatch qualification:
+
+```bash
+CURRENT_QUALIFICATION_REVISION=$(jq -r '.revision' "${PSC_COORDINATOR_ROOT:?set the configured coordinator root}/execution-qualification/index.json")
+cortex model qualification import \
+  --report ./report-v2.json \
+  --source-revision "$PATCHMUD_REVISION" \
+  --profile-key "$RESOLVED_PROFILE_KEY" \
+  --executor "$CORTEX_EXECUTOR" --model-id "$CORTEX_MODEL_ID" --role "$CORTEX_ROLE" \
+  --profile-binding ./execution-profile.json \
+  --expected-revision "$CURRENT_QUALIFICATION_REVISION" \
+  --idempotency-key "patchmud-import-<unique-request-id>"
+```
+
+Read `candidate_id` and `revision` from the JSON result. After personally checking the report, source/profile digests, exact role, and complete coverage, approve that candidate through the confirmed operator entry. Set `--expected-revision` to the `revision` returned by import; timestamps must include a timezone and expiry must be in the future:
+
+```bash
+cortex model qualification approve "$CANDIDATE_ID" \
+  --actor "$OPERATOR_ID" \
+  --reason "Reviewed exact profile, source digests, observed conditions, and complete coverage" \
+  --policy-revision "$QUALIFICATION_POLICY_REVISION" \
+  --reviewed-at "<RFC3339 timestamp with timezone>" \
+  --expires-at "<later RFC3339 timestamp with timezone>" \
+  --expected-revision "$IMPORTED_REVISION" \
+  --idempotency-key "patchmud-approve-<unique-request-id>" --yes
+```
+
+On success, stdout is a JSON approval result containing `state: "approved"`, the lifecycle `receipt_id`/digest, the content-addressed `operator_receipt_id`/digest, and the new revision. The human receipt file is written under the Trust Root managed `execution-qualification/operator-receipts/` directory as `<operator_receipt_id>.json`; the lifecycle receipt and approved roster projection are also persisted. Keep the command result and receipt id/digests as the owner's acceptance evidence. Verify the exact row without changing workflow state:
+
+```bash
+cortex model qualification status \
+  --executor "$CORTEX_EXECUTOR" --model-id "$CORTEX_MODEL_ID" \
+  --profile-key "$RESOLVED_PROFILE_KEY" --role "$CORTEX_ROLE" --json
+```
+
+The status must report approved with complete coverage and receipt references. A separate owner-controlled live acceptance is still needed to capture the effective `qualification_policy.sized_dispatch: enforce` setting and a Manager admission using this row; this documentation does not claim that dispatch was run. To withdraw future admission, the owner uses `cortex model qualification revoke "$CANDIDATE_ID"` with actor, reason, policy revision, timezone-aware `--revoked-at`/`--expires-at`, current `--expected-revision`, a unique `--idempotency-key`, and `--yes`, then captures the revoked status. Revocation blocks new admission and does not cancel or rewrite an already active job.
+
 ## Dispatch and compatibility
 
 The host overlay option `qualification_policy.sized_dispatch: enforce` enables the manager query for sized work. With the default `disabled` policy, Manager does not query qualification and dispatch behavior stays unchanged. Under enforcement, the query returns only an approved, unexpired, non-revoked live record with the exact `profile_key`, runtime `role`, complete coverage, and matching lifecycle/operator receipt digests. Test-only receipts and legacy `Identity.execution_qualification` attributes are not consulted.
