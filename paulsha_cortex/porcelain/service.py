@@ -524,17 +524,12 @@ def _apply_operator_install_evidence(
         state_root = manager_root.parent
         receipt_dir = state_root.parent / f"{state_root.name}-install-receipts"
         installed = loaded_runtime.get("manager", {}).get("installed_artifact", {})
-        loaded = loaded_runtime.get("manager", {}).get("loaded", {})
-        loaded_artifact = loaded.get("artifact", {}) if isinstance(loaded, Mapping) else {}
         # The install receipt attests the wheel currently selected by the
         # on-disk service declaration. The loaded process may intentionally
-        # still be on the previous wheel; that comparison must remain drift.
+        # still be on the previous wheel, so its digest is never a stand-in:
+        # without the installed wheel the receipt cannot be bound (#1160 review).
         expected_wheel = (
             installed.get("wheel_sha256") if isinstance(installed, Mapping) else None
-        ) or (
-            loaded_artifact.get("wheel_sha256")
-            if isinstance(loaded_artifact, Mapping)
-            else None
         )
         candidates: list[tuple[int, dict[str, Any]]] = []
         if receipt_dir.is_dir() and not receipt_dir.is_symlink():
@@ -571,7 +566,12 @@ def _apply_operator_install_evidence(
             if candidates
             else {"status": "unknown", "reason": "install-receipt-unavailable"}
         )
-        if (
+        if evidence.get("status") == "verified" and not isinstance(expected_wheel, str):
+            evidence = {
+                "status": "unknown",
+                "reason": "installed-wheel-unresolved",
+            }
+        elif (
             evidence.get("status") == "verified"
             and evidence.get("wheel_sha256") != expected_wheel
         ):

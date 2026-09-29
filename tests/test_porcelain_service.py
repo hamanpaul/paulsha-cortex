@@ -677,6 +677,58 @@ def test_system_status_binds_operator_install_receipt_to_selected_wheel(
     assert loaded_runtime["manager"]["installed_artifact"]["source_revision"] == "unknown"
 
 
+def test_system_status_never_verifies_trust_root_without_the_installed_wheel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1160 審查：ExecStart 解析不出 installed wheel 時，不得改用 loaded 程序的
+    wheel 去比對 receipt——磁碟上實際選用的 wheel 可能已不同，只能回 unknown。"""
+    from paulsha_cortex.porcelain import service
+    from paulsha_cortex.trust_root.install import core
+
+    state_root = tmp_path / "cortex"
+    receipt_dir = tmp_path / "cortex-install-receipts"
+    receipt_dir.mkdir()
+    (receipt_dir / f"{'a' * 64}.json").write_text("root controlled receipt", encoding="utf-8")
+    wheel_sha = "b" * 64
+
+    class Receipt:
+        def to_dict(self):
+            return {
+                "plan": {
+                    "roots": {"state": str(state_root)},
+                    "candidate": {"wheel_sha256": wheel_sha},
+                    "repo_identity": {"commit": "c" * 40},
+                }
+            }
+
+    monkeypatch.setattr(core.InstallReceipt, "load", lambda _path: Receipt())
+    monkeypatch.setattr(service, "resolve_runtime_root", lambda *_args, **_kwargs: state_root / "coordinator")
+    monkeypatch.setattr(service, "_service_declared_environment", lambda *_args: ({}, "systemd-effective"))
+    monkeypatch.setattr(
+        service,
+        "trust_root_receipt_summary",
+        lambda _path: {"status": "verified", "receipt_id": "receipt"},
+    )
+    loaded_runtime = {
+        "manager": {
+            "loaded": {"artifact": {"wheel_sha256": wheel_sha}},
+            "installed_artifact": {"kind": "unknown"},
+        },
+        "monitor": {"installed_artifact": {}},
+    }
+
+    service._apply_operator_install_evidence(
+        loaded_runtime,
+        environment_overlay={"manager": {}},
+        instance="cortex",
+    )
+
+    assert loaded_runtime["trust_root"]["status"] == "unknown"
+    assert loaded_runtime["trust_root"]["reason"] == "installed-wheel-unresolved"
+    assert "candidate_commit" not in loaded_runtime["manager"]["installed_artifact"]
+
+
 def test_system_status_reports_latest_rollback_receipt_over_prior_verified_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
