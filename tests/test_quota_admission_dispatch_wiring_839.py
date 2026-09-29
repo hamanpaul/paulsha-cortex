@@ -524,6 +524,90 @@ def test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason(
     )
 
 
+def test_periodic_tick_retries_quota_wait_only_after_fresh_recovery_and_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the real daemon tick -> resume -> dispatch path for a durable quota wait."""
+    from paulsha_cortex.coordinator import manager_daemon
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = _two_builder_identities()
+    step = manager._current_workflow_step(run)
+    candidates = manager._workflow_identity_candidates(run, step, identities)
+    codex = next(row for row in candidates if row.executor == "codex")
+    claude = next(row for row in candidates if row.executor == "claude")
+    codex_key = _resolved_profile_key(run, step, codex, "codex", "gpt-primary")
+    claude_key = _resolved_profile_key(run, step, claude, "claude", "claude-primary")
+    codex_pool = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    claude_pool = _pool_descriptor(account="acct-claude", pool="pool-claude")
+    clock_ms = [int(time.time() * 1000)]
+    monkeypatch.setattr(time, "time", lambda: clock_ms[0] / 1000)
+    shadow = QuotaShadowService.in_memory()
+    reset_at_ms = clock_ms[0] + 1_000
+    _observe(shadow, codex_pool, "short", "0", profile_key=codex_key,
+             now_ms=clock_ms[0], reset_at_ms=reset_at_ms)
+    _observe(shadow, claude_pool, "short", "0", profile_key=claude_key,
+             now_ms=clock_ms[0], reset_at_ms=reset_at_ms)
+    context = quota_admission.DispatchContext(
+        authority=QuotaReservationAuthority(tmp_path / "reservations.jsonl"),
+        store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(codex_pool, claude_pool), unit_catalog=(),
+        bindings=(_binding(codex_pool, codex_key), _binding(claude_pool, claude_key)),
+        environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+    dispatcher = type(
+        "D", (), {"_registry": registry, "_git_runner": None,
+                  "_worktree_creator": _FakeWorktreeCreator(worktree)}
+    )()
+    monkeypatch.setattr(manager, "_runtime_preflight_gate", lambda *args, **kwargs: None)
+    initial = manager.dispatch_workflow_card(
+        dispatcher, run=run, identities=identities, launcher_factory=_launcher_factory,
+        coordinator_root=tmp_path / "coordinator", quota_admission_context=context,
+    )
+    assert initial["reason"] == "quota-admission-insufficient"
+    waiting = registry.get_workflow_run(run.run_id)
+    assert waiting.needs_human_reason["reason"] == "quota-admission-insufficient"
+    assert waiting.quota_admission["builder"]["outcome"] == "wait"
+    assert manager.quota_wait_retry_is_eligible(run=waiting, quota_admission_context=context)
+    assert registry.list_jobs() == []
+
+    monkeypatch.setattr(manager_daemon, "_quota_admission_context_for", lambda: context)
+    monkeypatch.setattr(
+        manager_daemon, "_resolve_launcher_compat",
+        lambda executor, *a, identity=None, model=None, **kw: _Launcher(
+            identity.executor if identity is not None else executor,
+            identity.model_id if identity is not None else (model or "gpt-primary"),
+        ),
+    )
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher, specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"), workflow_identity_registry=identities,
+        scan_specs_fn=lambda _dir: [], auto_claim_fn=lambda: [],
+        run_tick_fn=lambda *args, **kwargs: {"dispatched": []},
+    )
+
+    runner()  # still empty: an eligible receipt alone does not admit a candidate
+    assert registry.list_jobs() == []
+    clock_ms[0] = reset_at_ms + 61_000
+    runner()  # reset has passed, but the old observation is stale; do not dispatch
+    assert registry.list_jobs() == []
+
+    _observe(shadow, codex_pool, "short", "5", profile_key=codex_key,
+             now_ms=clock_ms[0], reset_at_ms=clock_ms[0] + 90_000)
+    _observe(shadow, claude_pool, "short", "5", profile_key=claude_key,
+             now_ms=clock_ms[0], reset_at_ms=clock_ms[0] + 90_000)
+    runner()
+    launched = registry.list_jobs()
+    assert len(launched) == 1
+    assert launched[0]["workflow_run_id"] == run.run_id
+    assert launched[0]["workflow_card"] == step.card
+    runner()  # the same attempt is idempotent across consecutive daemon ticks
+    assert len(registry.list_jobs()) == 1
+
+
 def test_quota_context_cannot_override_missing_exact_qualification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
