@@ -1355,6 +1355,8 @@ def _safe_trust_root(value: Mapping[str, object] | None) -> dict[str, object]:
         "install-receipt-unavailable",
         "install-receipt-unconfigured",
         "install-receipt-invalid",
+        "install-rollback-blocked",
+        "install-rollback-incomplete",
     }:
         result["reason"] = reason
     in_flight = value.get("in_flight_jobs")
@@ -1694,6 +1696,16 @@ def record_config_reload(
     recorded_at: str | None = None,
     config_components: Mapping[str, str] | None = None,
 ) -> Path:
+    """在同一程序的 receipt chain 追加 ``config-reload`` 事件。
+
+    **production 沒有呼叫端（#841 AC4 的 reload 條目 owner 裁決 N/A）**：Manager／
+    Monitor 都沒有 hot config reload 入口，程序設定在啟動時固定，變更只能靠重啟
+    生效（重啟寫新的 startup receipt）。此函式只保留 v1 receipt chain 的
+    ``config-reload`` 事件格式，讓 reader 的 chain 驗證（stale parent 拒絕、initial／
+    effective revision 分開）維持可測；沒有真正切換 in-memory config 的 reload owner
+    之前不得從 production 呼叫，接線時須同步更新
+    ``docs/loaded-runtime-attestation.md`` 與對應的 guard 測試。"""
+
     root_dir, directory_fd = _open_attestation_directory(state_root, create=False)
     try:
         if Path(os.path.abspath(previous_receipt.parent)) != root_dir:
@@ -1752,8 +1764,59 @@ def record_config_reload(
     return _write_immutable_receipt(state_root, document)
 
 
+#: receipt 的 ``process_started_at`` 與 /proc 推回的啟動時間之間容許的牆鐘位移
+#: （NTP step、VM 時間同步）。超過即視為同 PID 的先前程序（PID 重用）。
+_PROCESS_START_TOLERANCE_SECONDS = 120.0
+
+
+def live_process_started_epoch(
+    pid: object, *, proc_root: Path = Path("/proc")
+) -> float | None:
+    """Start time (epoch seconds) of a live process, from ``/proc/<pid>/stat``.
+
+    ``starttime`` is clock ticks since boot and ``btime`` the boot time in the
+    current wall-clock frame, so the result shifts with a clock step exactly as
+    much as the receipt's own ``process_started_at`` may; a reused PID differs
+    by the lifetime of the earlier process.  ``None`` when it cannot be read.
+    """
+
+    if type(pid) is not int or pid <= 0:
+        return None
+    try:
+        stat_text = (proc_root / str(pid) / "stat").read_text(encoding="ascii")
+        boot_text = (proc_root / "stat").read_text(encoding="ascii")
+        fields = stat_text.rsplit(")", 1)[1].split()
+        ticks = int(fields[19])
+        btime = next(
+            int(line.split()[1])
+            for line in boot_text.splitlines()
+            if line.startswith("btime ")
+        )
+        hz = os.sysconf("SC_CLK_TCK")
+    except (OSError, UnicodeError, IndexError, ValueError, StopIteration):
+        return None
+    if hz <= 0:
+        return None
+    return btime + ticks / hz
+
+
+def _receipt_started_epoch(row: Mapping[str, object]) -> float | None:
+    try:
+        return datetime.fromisoformat(
+            str(row.get("process_started_at")).replace("Z", "+00:00")
+        ).timestamp()
+    except ValueError:
+        return None
+
+
 def _inspect_runtime_state_fd(
-    directory_fd: int, *, service: str, instance: str, state_root: Path
+    directory_fd: int,
+    *,
+    service: str,
+    instance: str,
+    state_root: Path,
+    expected_pid: int | None = None,
+    expected_process_started_epoch: float | None = None,
 ) -> dict[str, object]:
     try:
         names = sorted(
@@ -1784,7 +1847,36 @@ def _inspect_runtime_state_fd(
     starts = [row for row in matches if row.get("event_type") == "startup" and row.get("event_seq") == 0]
     if not starts:
         return _unknown("receipt-chain-invalid")
-    process_start = max(starts, key=lambda row: str(row.get("process_started_at")))
+    # #841 AC4：牆鐘可能在兩次啟動之間往回跳（NTP step、VM 時間同步），單憑
+    # ``process_started_at`` 會把已結束程序的舊 receipt 當成最新。呼叫端已知 unit
+    # 目前的 MainPID 時，先在屬於該 PID 的 startup receipt 中挑最新者；沒有任何
+    # receipt 屬於它才退回牆鐘最新，交給 compare_runtime_state 標 process 不符。
+    eligible = starts
+    if type(expected_pid) is int and expected_process_started_epoch is not None:
+        # #841 審查：PID 被重用、而新程序尚未寫 receipt 時，同 PID 的舊 receipt
+        # 會被挑中並判成 match。呼叫端給了 live 程序由 /proc 推得的啟動時間時，
+        # 啟動時間差距超過容忍值的同 PID receipt 屬於先前的程序。
+        def _reused(row: Mapping[str, object]) -> bool:
+            if row.get("pid") != expected_pid:
+                return False
+            started = _receipt_started_epoch(row)
+            return (
+                started is None
+                or abs(started - expected_process_started_epoch)
+                > _PROCESS_START_TOLERANCE_SECONDS
+            )
+
+        eligible = [row for row in starts if not _reused(row)]
+        if not eligible:
+            return _unknown("receipt-missing")
+    live_starts = (
+        [row for row in eligible if row.get("pid") == expected_pid]
+        if type(expected_pid) is int
+        else []
+    )
+    process_start = max(
+        live_starts or eligible, key=lambda row: str(row.get("process_started_at"))
+    )
     previous_starts = [
         row for row in starts if row.get("process_id") != process_start.get("process_id")
     ]
@@ -1826,7 +1918,12 @@ def _inspect_runtime_state_fd(
 
 
 def inspect_runtime_state(
-    state_root: Path, *, service: str, instance: str
+    state_root: Path,
+    *,
+    service: str,
+    instance: str,
+    expected_pid: int | None = None,
+    expected_process_started_epoch: float | None = None,
 ) -> dict[str, object]:
     if service not in _SERVICES or _INSTANCE_RE.fullmatch(instance) is None:
         return _unknown("identity-invalid")
@@ -1844,6 +1941,8 @@ def inspect_runtime_state(
             service=service,
             instance=instance,
             state_root=state_root,
+            expected_pid=expected_pid,
+            expected_process_started_epoch=expected_process_started_epoch,
         )
     finally:
         os.close(directory_fd)
@@ -2024,11 +2123,18 @@ def runtime_status_report(
     declared_config_component: str = "effective_revision",
     declared_invocation_revision: str | None = None,
     expected_pid: int | None = None,
+    expected_process_started_epoch: float | None = None,
     require_process_match: bool = False,
     in_flight_jobs: int | None = None,
     current_artifact: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    state = inspect_runtime_state(state_root, service=service, instance=instance)
+    state = inspect_runtime_state(
+        state_root,
+        service=service,
+        instance=instance,
+        expected_pid=expected_pid,
+        expected_process_started_epoch=expected_process_started_epoch,
+    )
     current = _safe_artifact(current_artifact or artifact_identity())
     comparison = compare_runtime_state(
         state,
@@ -2096,9 +2202,27 @@ def trust_root_receipt_summary(path: Path | str | None) -> dict[str, object]:
                 for row in activations
             )
         )
-        status = "rolled-back" if isinstance(rollback, Mapping) else ("verified" if verified else "unknown")
+        # 狀態以 installer 寫入的 receipt ``state`` 為準（#841 AC5）：rollback 遇到
+        # retained drift／unknown durable state（例如 Manager 事後寫入的 jobs.json）
+        # 會停在 ``rollback-blocked``，不得因為已有 ``rollback`` 區塊就寫成
+        # ``rolled-back``；rollback 中斷時 receipt 停在 ``rolling-back``，
+        # ``qualified`` 尚未清掉、activation journal 已逐筆移除，也不得回頭算成
+        # ``verified``。
+        state = document.get("state")
+        reason: str | None = None
+        if state == "rolled-back" and isinstance(rollback, Mapping):
+            status = "rolled-back"
+        elif state == "rollback-blocked":
+            status, reason = "unknown", "install-rollback-blocked"
+        elif state == "rolling-back":
+            status, reason = "unknown", "install-rollback-incomplete"
+        elif state == "applied" and verified:
+            status = "verified"
+        else:
+            status = "unknown"
         summary: dict[str, object] = {
             "status": status,
+            "reason": reason,
             "receipt_id": document.get("receipt_id"),
             "plan_sha256": document.get("plan_sha256"),
             "receipt_sha256": receipt_digest,

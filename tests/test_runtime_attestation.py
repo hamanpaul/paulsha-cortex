@@ -180,6 +180,69 @@ def test_subsecond_restart_selects_the_new_process_without_rewriting_prior_recei
     assert prior.read_bytes() == prior_bytes
 
 
+def test_restart_across_backward_wall_clock_step_binds_receipt_to_live_unit_pid(
+    tmp_path: Path,
+) -> None:
+    """#841 AC4：牆鐘在兩次啟動之間往回跳（NTP step、WSL2 時間同步；已安裝程序測試
+    在本機實測到約 1.9 秒回跳），新程序的 ``process_started_at`` 會早於舊程序。status
+    已知 unit 目前的 MainPID 時，loaded 必須是那個程序的 receipt，不能只憑牆鐘挑到
+    已結束程序的舊 receipt、再把它的 artifact 報成 drift。"""
+
+    from paulsha_cortex.runtime_attestation import runtime_status_report
+
+    state_root = tmp_path / "runtime"
+    prior = record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=state_root,
+        configuration={"poll_interval": 30},
+        artifact=_artifact("1" * 64),
+        started_at="2026-09-26T00:00:05Z",
+        pid=201,
+    )
+    prior_bytes = prior.read_bytes()
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=state_root,
+        configuration={"poll_interval": 30},
+        artifact=_artifact("2" * 64),
+        started_at="2026-09-26T00:00:04Z",
+        pid=202,
+    )
+
+    report = runtime_status_report(
+        state_root,
+        service="manager",
+        instance="test",
+        declared_config_revision=configuration_revision({"poll_interval": 30}),
+        expected_pid=202,
+        require_process_match=True,
+        current_artifact=_artifact("2" * 64),
+    )
+
+    assert report["loaded"]["pid"] == 202
+    assert report["loaded"]["artifact"]["sha256"] == "2" * 64
+    assert report["status"] == "match"
+    assert report["comparison"]["process_status"] == "match"
+    assert report["previous_process_start"]["pid"] == 201
+    assert prior.read_bytes() == prior_bytes
+
+    # 沒有任何 receipt 屬於目前 MainPID：維持以牆鐘最新者比對，並標 process 不符。
+    unmatched = runtime_status_report(
+        state_root,
+        service="manager",
+        instance="test",
+        declared_config_revision=configuration_revision({"poll_interval": 30}),
+        expected_pid=203,
+        require_process_match=True,
+        current_artifact=_artifact("2" * 64),
+    )
+    assert unmatched["loaded"]["pid"] == 201
+    assert unmatched["status"] == "drift"
+    assert unmatched["comparison"]["process_status"] == "unknown"
+
+
 @pytest.mark.parametrize("bad_receipt", ["truncated", "unknown-schema"])
 def test_missing_corrupt_and_unknown_receipts_remain_unknown(
     tmp_path: Path, bad_receipt: str
@@ -290,6 +353,9 @@ def test_trust_root_receipt_summary_binds_install_activation_verify_and_rollback
     document = {
         "receipt_id": "b73e4da7-ef66-423e-bad0-162075ee6d55",
         "plan_sha256": "1" * 64,
+        # 真 receipt 在 rollback 完成時由 installer 寫成 rolled-back；摘要以 state 為準
+        # （完整 installer 路徑見 test_loaded_runtime_rollback_receipt_841.py）。
+        "state": "rolled-back",
         "qualified": True,
         "activation_journal": [
             {"service": "manager", "status": "completed"},
@@ -316,6 +382,30 @@ def test_trust_root_receipt_summary_binds_install_activation_verify_and_rollback
     assert "inventory_sha256" not in summary
     assert summary["rollback_revision"]
     assert str(receipt_path) not in json.dumps(summary)
+
+
+def test_config_reload_writer_has_no_production_caller_and_services_have_no_reload_entry() -> None:
+    """#841 AC4 的 reload 條目 owner 裁決 N/A（見 docs/loaded-runtime-attestation.md
+    「config reload」段）：文件宣稱 Manager／Monitor 沒有 hot reload 入口、
+    ``record_config_reload()`` 沒有 production 呼叫端。這裡把兩個宣稱釘在程式碼上，
+    有人接上 reload 時會在此失敗，提醒同步更新文件與 AC4 分帳。"""
+
+    package = Path(__file__).resolve().parents[1] / "paulsha_cortex"
+    callers = sorted(
+        path.relative_to(package).as_posix()
+        for path in package.rglob("*.py")
+        if path.name != "runtime_attestation.py"
+        and "record_config_reload" in path.read_text(encoding="utf-8")
+    )
+    assert callers == []
+    definition = (package / "runtime_attestation.py").read_text(encoding="utf-8")
+    assert definition.count("record_config_reload(") == 1
+    for service_module in (
+        package / "coordinator" / "manager_daemon.py",
+        package / "monitor" / "__main__.py",
+        package / "monitor" / "service.py",
+    ):
+        assert "SIGHUP" not in service_module.read_text(encoding="utf-8"), service_module
 
 
 def test_config_reload_cannot_branch_from_superseded_process_receipt(tmp_path: Path) -> None:
@@ -1704,3 +1794,76 @@ def test_environment_file_accepts_other_quote_inside_quoted_value(tmp_path: Path
     }
     source, _overlay = runtime_attestation._environment_source_and_overlay(row)
     assert source == "systemd-effective"
+
+
+def test_reused_pid_with_stale_receipt_is_not_reported_as_the_live_process(
+    tmp_path: Path,
+) -> None:
+    """#841 審查：PID 被重用、且新程序尚未寫 receipt 時，同 PID 的舊 receipt 不得
+    被判為 loaded match。呼叫端傳入 live 程序由 /proc 推得的啟動時間；與 receipt
+    的 ``process_started_at`` 差距超過容忍值的同 PID receipt 視為先前的程序。"""
+
+    from datetime import datetime
+
+    from paulsha_cortex.runtime_attestation import runtime_status_report
+
+    state_root = tmp_path / "runtime"
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=state_root,
+        configuration={"poll_interval": 30},
+        artifact=_artifact("1" * 64),
+        started_at="2026-09-26T00:00:05Z",
+        pid=301,
+    )
+    live_started = datetime.fromisoformat("2026-09-26T06:00:00+00:00").timestamp()
+
+    reused = runtime_status_report(
+        state_root,
+        service="manager",
+        instance="test",
+        declared_config_revision=configuration_revision({"poll_interval": 30}),
+        expected_pid=301,
+        expected_process_started_epoch=live_started,
+        require_process_match=True,
+        current_artifact=_artifact("1" * 64),
+    )
+    assert reused["status"] != "match"
+    assert reused["comparison"]["process_status"] != "match"
+
+    # 牆鐘位移在容忍值內（NTP step）仍是同一個程序。
+    same = runtime_status_report(
+        state_root,
+        service="manager",
+        instance="test",
+        declared_config_revision=configuration_revision({"poll_interval": 30}),
+        expected_pid=301,
+        expected_process_started_epoch=datetime.fromisoformat(
+            "2026-09-26T00:00:03+00:00"
+        ).timestamp(),
+        require_process_match=True,
+        current_artifact=_artifact("1" * 64),
+    )
+    assert same["status"] == "match"
+    assert same["loaded"]["pid"] == 301
+
+
+def test_live_process_started_epoch_reads_proc_stat(tmp_path: Path) -> None:
+    import os
+
+    from paulsha_cortex.runtime_attestation import live_process_started_epoch
+
+    proc = tmp_path / "proc"
+    (proc / "4242").mkdir(parents=True)
+    fields = ["S"] + ["0"] * 18 + ["500"] + ["0"] * 10
+    (proc / "4242" / "stat").write_text(
+        "4242 (cortex (manager)) " + " ".join(fields) + "\n", encoding="ascii"
+    )
+    (proc / "stat").write_text("cpu 1 2 3\nbtime 1790000000\n", encoding="ascii")
+    hz = os.sysconf("SC_CLK_TCK")
+
+    assert live_process_started_epoch(4242, proc_root=proc) == 1790000000 + 500 / hz
+    assert live_process_started_epoch(4243, proc_root=proc) is None
+    assert live_process_started_epoch(None, proc_root=proc) is None
+    assert live_process_started_epoch(os.getpid()) is not None
