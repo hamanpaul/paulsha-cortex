@@ -22,7 +22,6 @@ from paulsha_cortex.coordinator.quota_reservation import (
     PoolDemand,
     QuotaReservationAuthority,
     ReservationCorrupt,
-    reservation_authority_enabled,
 )
 
 
@@ -47,17 +46,9 @@ def _cap(amount: str, *, pool_id: str = "pool-x", window_id: str = "week"):
 NOW = 1_700_000_000_000
 
 
-# ---------------------------------------------------------------------------
-# 開關：預設 shadow／不阻擋
-# ---------------------------------------------------------------------------
-
-
-def test_enforcement_flag_defaults_off_and_only_on_is_true() -> None:
-    assert reservation_authority_enabled({}) is False
-    assert reservation_authority_enabled({"PSC_QUOTA_RESERVATION_ENFORCE": "off"}) is False
-    assert reservation_authority_enabled({"PSC_QUOTA_RESERVATION_ENFORCE": "garbage"}) is False
-    assert reservation_authority_enabled({"PSC_QUOTA_RESERVATION_ENFORCE": "ON"}) is True
-    assert reservation_authority_enabled({"PSC_QUOTA_RESERVATION_ENFORCE": "on"}) is True
+# 開關：本模組沒有自己的開關（`PSC_QUOTA_RESERVATION_ENFORCE` 死開關已移除，
+# 見 tests/test_quota_reservation_gaps_838.py）；唯一 enforce 開關是 #839 的
+# `PSC_QUOTA_ADMISSION_ENFORCE`（tests/test_quota_admission_839.py）。
 
 
 # ---------------------------------------------------------------------------

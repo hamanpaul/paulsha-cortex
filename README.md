@@ -74,7 +74,7 @@ producer/consumer 使用，不接 workflow chain、排序、reservation、admiss
 依 profile_key 分組後對應到 `ProviderQuotaTarget`。設定檔路徑一律由呼叫端
 明確給定，本模組不讀任何預設路徑。
 
-CLI 提供三個子命令：
+CLI 提供四個子命令：
 
 - `cortex quota observe --config <path> [--executor codex|agy|copilot|claude|cg]
   [--dry-run] [--json] [--output <file>] [--timeout-s <秒數>]`：對設定檔內每個
@@ -102,6 +102,15 @@ CLI 提供三個子命令：
   `executor`／`model_id`／`profile_key` 分組，附出現次數與最近一次時間戳。
   只讀 decision store 與設定檔，不寫任何狀態，也不啟動任何 provider CLI；
   `--store` 缺省時沿用 `AdmissionDecisionStore` 既有預設路徑。
+- `cortex quota reservations [--store <path>] [--json]`（#838）：唯讀回報
+  目前 instance 解析到的 reservation store（`authority.store`／
+  `store_source`／`exists`）、各邏輯狀態筆數、lease 已過期但仍持有容量的
+  `uncertain` 筆數、每個 pool/window 的 `committed`，以及
+  `quota_reservation.authority_coverage()` 的跨 host／跨 UID／跨
+  coordinator root coverage gap（schema
+  `cortex-porcelain/quota-reservations-report/v1`）。不建立任何檔案；store
+  不存在（shadow 從不建立）時計數為零，store 損毀 exit 1。見下方「Quota
+  reservation authority」的協調範圍說明。
 
 多 UID 部署的建議流程：以任意帳號執行 `cortex quota observe --config <path>
 --output observation.json`（唯讀，只落已去識別的 observation），再由 Manager
@@ -137,9 +146,50 @@ decision 用相同組成重複呼叫 `reserve()`／terminal 事件重送皆冪�
 不同則回報 `conflict`，不會靜默選邊。
 
 本模組刻意**不**做候選排序、fallback 或 forecast（留給 #839），也**不**接線
-任何實際 spawn path——在有呼叫端明確 import 之前，它是完全 dormant 的
-library primitive。`reservation_authority_enabled()` 是保留給未來整合者的
-opt-in 開關，預設關閉即等於 shadow／rollback，不需要改動任何程式碼。
+任何實際 spawn path，也**沒有自己的開關**：是否預留完全由呼叫端決定——
+production 只有 #839 `quota_admission` 在 `PSC_QUOTA_ADMISSION_ENFORCE=on`
+時呼叫（enforce ⇒ 選中的受管候選一律原子預留；shadow ⇒ 完全不碰本模組）。
+先前文件描述的 reservation 專屬開關 `PSC_QUOTA_RESERVATION_ENFORCE` 從來
+沒有任何 production 讀取點（設了也不會改變任何行為），已連同其 helper 一併
+移除；rollback 只需把 `PSC_QUOTA_ADMISSION_ENFORCE` 改回非 `on`。
+
+**協調範圍與 coverage gap**：以檔案鎖序列化的是**同一台主機、同一個檔案**。
+store 固定在 `coordinator_root()/quota-reservations/reservations.jsonl`
+（`paths.quota_reservation_root()`，沒有獨立的覆寫變數），且沿用 owner-only
+硬化（父目錄不得有 group/other 位元、檔案 0600、`O_NOFOLLOW`）。因此
+跨主機、跨 UID、跨 coordinator root 的 Manager **都不共用** authority——
+`quota_reservation.authority_coverage()` 以機讀形式列出這三個 gap
+（`reservation-authority-host-local-flock`／
+`reservation-store-owner-only-permissions`／
+`reservation-authority-scoped-to-coordinator-root`），
+`cortex quota reservations [--store <path>] [--json]` 連同實際解析到的
+store 路徑一起輸出。要確認兩個 instance 是否真的共用同一個 authority，對
+各自的 `PSC_INSTANCE` 各跑一次 `cortex quota reservations --json`，比對
+`authority.store`。
+
+部署拓撲（#838 G838-5，只描述現況，不改部署）：
+
+- `coordinator_root()` 的解析順序：process 的 `PSC_COORDINATOR_ROOT`（絕對
+  路徑）→ process 的 `PSC_AGENTS_ROOT` + `/coordinator` → 依 `PSC_INSTANCE`
+  （預設 `cortex`）讀 installer bootstrap
+  `~/.agents/core/runtime/<instance>-manager.env` 裡的 `PSC_COORDINATOR_ROOT`，
+  否則其 `PSC_AGENTS_ROOT` + `/coordinator` → `$HOME/.agents/coordinator`。
+  `cortex install service` **不**管理 `PSC_COORDINATOR_ROOT`（見下方「Path
+  契約」）；同一個 `$HOME`、都沒設時，多個 instance 會落在同一個
+  `~/.agents/coordinator`，任何一個 instance 自設 `PSC_COORDINATOR_ROOT` 就
+  有自己的 authority。
+- 同帳號多 instance 要共用 authority，只能讓它們解析到**同一個 coordinator
+  root**——這會一併共用 `jobs.json` registry 與全部 coordinator 狀態，不只
+  額度；而且 #836 ledger（`quota-observations/`）與 #839 decision receipt
+  （`quota-admission-decisions/`）也掛在同一個 root 下，capacity 來自各自
+  ledger 的投影，只共用 reservation 而不共用 ledger 會讓各 instance 以不同
+  的 remaining 當 capacity。
+- user 級與 system 級 instance（不同 UID、不同 `$HOME`）**目前無法**共用：
+  即使把兩邊的 `PSC_COORDINATOR_ROOT` 指到同一個路徑，owner-only 權限檢查
+  也會讓非擁有者開檔失敗（`reservation-store-open-failed`／
+  `...-parent-permissions-invalid`，enforce 下 fail closed）。要支援需要
+  程式變更（獨立的 reservation／ledger root 覆寫加上跨 UID 的權限模型），
+  屬待裁決的後續設計，不是部署設定可以達成的。
 
 `list_by_state(state, *, now_ms)`（唯讀）列出目前邏輯狀態恰為 `state`
 （`reserved`／`bound`／`settled`／`released`）的所有 reservation，讓呼叫端
@@ -227,8 +277,9 @@ usage forecast 尚未落地前，demand 只用明確標示版本的 fixture
 （`DEMAND_FIXTURE_VERSION`），receipt 上的 `demand_version` 因此可精確分辨
 「這是 fixture」還是「這是真預測」。
 
-`quota_admission_enabled()` 是本模組自己的 opt-in 開關
-（`PSC_QUOTA_ADMISSION_ENFORCE`），與 #838 的開關各自獨立：預設皆為
+`quota_admission_enabled()`（`PSC_QUOTA_ADMISSION_ENFORCE`）是額度准入
+**唯一**的 enforce 開關——#838 reservation authority 沒有另一道開關，
+enforce 下選中的受管候選一律原子預留。預設為
 shadow——manager 只在有呼叫端明確傳入 `quota_admission.DispatchContext`
 時才會呼叫任何一行本模組（`dispatch_workflow_card`／`resume_workflow_run`
 新增的 `quota_admission_context` 參數，缺省 `None`），shadow 模式下只用
