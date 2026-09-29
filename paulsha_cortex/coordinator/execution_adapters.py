@@ -1,16 +1,25 @@
 """Trusted adapters joining execution profiles to existing launcher contracts.
 
-Descriptors are data only.  Runtime code is registered explicitly by this
-module; a descriptor can never import or execute provider supplied code.
+Descriptors are data only.  Adapter capabilities (protocol/runtime versions,
+native effort grammar and defaults, usage/quota labels) are loaded from the
+packaged ``data/execution-adapters.yaml`` plus an optional operator overlay of
+the same schema in the project config root.  Runtime code — the argv builder,
+usage extractor, terminal/cancel/timeout contracts — is registered explicitly
+by trusted Python; a descriptor can never import or execute provider supplied
+code and can only describe adapters that already have trusted code.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace as _replace
 from hashlib import sha256
+import inspect
 import json
+import os
+from pathlib import Path
 import re
+import threading
 from typing import Any, Callable
 
 from . import execution_profile as schema
@@ -19,6 +28,21 @@ from . import execution_profile as schema
 PROFILE_BINDING_SCHEMA = 1
 _PERSONA_ROLE = {"planner": "planning", "builder": "build", "reviewer": "review"}
 _ROLE_CAPABILITY = dict(_PERSONA_ROLE)
+
+#: Descriptor 檔的 wire version 與檔名（packaged 內建預設與 config root overlay 共用）。
+ADAPTER_CATALOG_SCHEMA_VERSION = 1
+ADAPTER_CATALOG_FILENAME = "execution-adapters.yaml"
+_CATALOG_KEYS = frozenset({"schema_version", "adapters"})
+_ADAPTER_DESCRIPTOR_KEYS = frozenset(
+    {"protocol_id", "protocol_version", "runtime_version", "usage_source", "quota_state", "effort"}
+)
+_EFFORT_REQUIRED_KEYS = frozenset({"values", "default"})
+_EFFORT_OPTIONAL_KEYS = frozenset({"model_defaults"})
+_QUOTA_STATES = frozenset({"supported", "unsupported", "unknown"})
+#: launcher 實際實作的生命週期契約；新 adapter 不能宣告 launcher 沒有的契約。
+SUPPORTED_TERMINAL_CONTRACTS = frozenset({"shared-terminal-contract-v1"})
+SUPPORTED_CANCELLATION_CONTRACTS = frozenset({"launcher-process-group-v1"})
+SUPPORTED_TIMEOUT_CONTRACTS = frozenset({"job-watchdog-v1"})
 
 
 class ExecutionAdapterError(ValueError):
@@ -32,6 +56,11 @@ class ExecutionAdapter:
     The launcher remains the owner of process isolation, terminal lifecycle,
     and cancellation.  These fields describe how the profile is expressed and
     which existing producer is responsible for each observation.
+
+    Built-in adapters get every data field from the descriptor catalog and use
+    the launcher's registered argv builder.  A new runtime supplies its own
+    trusted ``argv_builder`` (and optionally ``usage_extractor``) through
+    :func:`register_adapter`; descriptors cannot set either hook.
     """
 
     executor: str
@@ -45,6 +74,14 @@ class ExecutionAdapter:
     cancellation_contract: str = "launcher-process-group-v1"
     timeout_contract: str = "job-watchdog-v1"
     quota_state: str = "unknown"
+    #: descriptor 宣告的 model → 原生 effort 預設（未列的 model 用 ``default_effort``）。
+    model_default_efforts: tuple[tuple[str, str], ...] = ()
+    argv_builder: Callable[..., list[str]] | None = field(default=None, compare=False, repr=False)
+    usage_extractor: Callable[[str], dict[str, Any]] | None = field(
+        default=None, compare=False, repr=False
+    )
+    #: 資料來源（packaged 檔／overlay 檔路徑，或 ``code``）；只供診斷，不進 key。
+    descriptor_source: str = field(default="code", compare=False)
 
     @property
     def adapter_id(self) -> str:
@@ -63,12 +100,57 @@ class ExecutionAdapter:
             return {"type": "none"}
         return {"type": "string", "enum": list(self.efforts)}
 
-    def build_argv(self, kwargs: Mapping[str, object]) -> list[str]:
-        """Delegate to the existing trusted argv builder for this executor."""
+    def default_effort_for(self, model_id: str | None) -> str | None:
+        """Descriptor-declared native effort default for ``model_id``."""
 
+        if model_id is not None:
+            for model, effort in self.model_default_efforts:
+                if model == model_id:
+                    return effort
+        return self.default_effort
+
+    def launch_effort(self, model: str | None, effort: str | None) -> str | None:
+        """Resolve the native effort an argv builder must emit (``None`` = no flag).
+
+        Resolver 與 argv builder 共用這一個函式，profile 上的 effort 與實際
+        argv 因此不會各自寫死一份而漂移；未宣告的值在 spawn 前拒絕。
+        """
+
+        resolved = effort or self.default_effort_for(model)
+        if resolved is None:
+            return None
+        if resolved not in self.efforts:
+            raise ExecutionAdapterError(
+                f"{self.executor} executor effort must be one of {sorted(self.efforts)}, "
+                f"got {resolved!r}"
+            )
+        return resolved
+
+    def trusted_argv_builder(self) -> Callable[..., list[str]] | None:
+        if self.argv_builder is not None:
+            return self.argv_builder
         from .launcher import _ARGV_BUILDERS
 
-        builder = _ARGV_BUILDERS.get(self.executor)
+        return _ARGV_BUILDERS.get(self.executor)
+
+    def accepts(self, parameter: str) -> bool:
+        """Whether the trusted argv builder can express ``parameter``."""
+
+        builder = self.trusted_argv_builder()
+        if builder is None:
+            return False
+        try:
+            parameters = inspect.signature(builder).parameters
+        except (TypeError, ValueError):
+            return False
+        return parameter in parameters or any(
+            item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+        )
+
+    def build_argv(self, kwargs: Mapping[str, object]) -> list[str]:
+        """Delegate to the trusted argv builder for this executor."""
+
+        builder = self.trusted_argv_builder()
         if builder is None:
             raise ExecutionAdapterError(f"unsupported adapter: {self.executor}")
         return builder(**dict(kwargs))
@@ -83,7 +165,14 @@ class ExecutionAdapter:
     def parse_usage(self, log_path: str | None) -> dict[str, Any]:
         from .usage_extractors import extract_usage
 
-        return extract_usage(self.executor, log_path)
+        if self.usage_extractor is None:
+            return extract_usage(self.executor, log_path)
+        if not log_path:
+            return {"usage": None, "usage_raw": None, "usage_reason": "missing log_path"}
+        try:
+            return self.usage_extractor(log_path)
+        except BaseException as exc:  # noqa: BLE001 - 與 extract_usage 同一 fail-soft 邊界
+            return {"usage": None, "usage_raw": None, "usage_reason": str(exc)}
 
     def quota_capability(self) -> dict[str, str]:
         # Usage is not remaining quota.  Until a trusted source is bound, keep
@@ -97,35 +186,322 @@ class ExecutionAdapter:
         return self.timeout_contract
 
 
-_ADAPTERS: dict[str, ExecutionAdapter] = {
-    "copilot": ExecutionAdapter(
-        "copilot", "github-copilot-cli", "1", "cortex-adapter-v1",
-        efforts=("low", "medium", "high", "xhigh"), default_effort="xhigh",
-        usage_source="copilot-jsonl",
-    ),
-    "claude": ExecutionAdapter(
-        "claude", "claude-code-cli", "1", "cortex-adapter-v1",
-        usage_source="claude-jsonl",
-    ),
-    "codex": ExecutionAdapter(
-        "codex", "openai-codex-cli", "1", "cortex-adapter-v1",
-        efforts=("low", "medium", "high", "xhigh", "max"),
-        usage_source="codex-jsonl",
-    ),
-    "agy": ExecutionAdapter(
-        "agy", "antigravity-cli", "1", "cortex-adapter-v1",
-        usage_source="agy-jsonl",
-    ),
-    "cg": ExecutionAdapter(
-        "cg", "copilot-gateway-cli", "1", "cortex-adapter-v1",
-        efforts=("low", "medium", "high", "xhigh"), default_effort="medium",
-        usage_source="cg-jsonl",
-    ),
-}
+# ---------------------------------------------------------------------------
+# Descriptor catalog（#835 AC1）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdapterDescriptor:
+    """One validated descriptor entry (data only, no code hooks)."""
+
+    executor: str
+    protocol_id: str
+    protocol_version: str
+    runtime_version: str
+    usage_source: str
+    quota_state: str
+    efforts: tuple[str, ...]
+    default_effort: str | None
+    model_default_efforts: tuple[tuple[str, str], ...]
+    source: str
+
+    def adapter_fields(self) -> dict[str, object]:
+        return {
+            "protocol_id": self.protocol_id,
+            "protocol_version": self.protocol_version,
+            "runtime_version": self.runtime_version,
+            "usage_source": self.usage_source,
+            "quota_state": self.quota_state,
+            "efforts": self.efforts,
+            "default_effort": self.default_effort,
+            "model_default_efforts": self.model_default_efforts,
+            "descriptor_source": self.source,
+        }
+
+
+class ExecutionAdapterDescriptorError(ExecutionAdapterError):
+    """The descriptor catalog itself is invalid (deployment configuration error).
+
+    與「這次派工的 profile 不合格」不同：它不屬於任何一個 run，Manager 不把它寫成
+    per-run needs_human，而是整次派工拒絕並在 descriptor 修正後自然恢復。
+    """
+
+
+def _descriptor_error(source: str, message: str) -> ExecutionAdapterDescriptorError:
+    return ExecutionAdapterDescriptorError(f"execution adapter descriptor {source}: {message}")
+
+
+def _require_text(value: object, *, source: str, locator: str) -> str:
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise _descriptor_error(source, f"{locator} must be a non-empty string")
+    return value
+
+
+def _check_keys(
+    value: Mapping[str, object],
+    *,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+    source: str,
+    locator: str,
+) -> None:
+    unknown = sorted(set(value) - required - optional)
+    if unknown:
+        raise _descriptor_error(source, f"{locator} has unknown keys {unknown}")
+    missing = sorted(required - set(value))
+    if missing:
+        raise _descriptor_error(source, f"{locator} is missing fields {missing}")
+
+
+def _parse_effort(
+    value: object, *, source: str, locator: str
+) -> tuple[tuple[str, ...], str | None, tuple[tuple[str, str], ...]]:
+    if value is None:
+        return (), None, ()
+    if not isinstance(value, Mapping):
+        raise _descriptor_error(source, f"{locator} must be null or a mapping")
+    _check_keys(
+        value,
+        required=_EFFORT_REQUIRED_KEYS,
+        optional=_EFFORT_OPTIONAL_KEYS,
+        source=source,
+        locator=locator,
+    )
+    values = value["values"]
+    if not isinstance(values, list) or not values:
+        raise _descriptor_error(source, f"{locator}.values must be a non-empty list")
+    efforts = tuple(
+        _require_text(item, source=source, locator=f"{locator}.values[{index}]")
+        for index, item in enumerate(values)
+    )
+    if len(set(efforts)) != len(efforts):
+        raise _descriptor_error(source, f"{locator}.values has duplicate effort values")
+    default = value["default"]
+    if default is not None:
+        _require_text(default, source=source, locator=f"{locator}.default")
+        if default not in efforts:
+            raise _descriptor_error(source, f"{locator}.default {default!r} is not a declared value")
+    model_defaults_raw = value.get("model_defaults", {})
+    if model_defaults_raw is None:
+        model_defaults_raw = {}
+    if not isinstance(model_defaults_raw, Mapping):
+        raise _descriptor_error(source, f"{locator}.model_defaults must be a mapping")
+    model_defaults: list[tuple[str, str]] = []
+    for model, effort in model_defaults_raw.items():
+        _require_text(model, source=source, locator=f"{locator}.model_defaults key")
+        _require_text(effort, source=source, locator=f"{locator}.model_defaults[{model!r}]")
+        if effort not in efforts:
+            raise _descriptor_error(
+                source, f"{locator}.model_defaults[{model!r}] model default {effort!r} is not a declared value"
+            )
+        model_defaults.append((model, effort))
+    return efforts, default, tuple(model_defaults)
+
+
+def parse_adapter_catalog(payload: object, *, source: str) -> dict[str, AdapterDescriptor]:
+    """Strictly parse one descriptor document (packaged or overlay)."""
+
+    if not isinstance(payload, Mapping):
+        raise _descriptor_error(source, "document must be a mapping")
+    if "schema_version" not in payload:
+        raise _descriptor_error(source, "schema_version is missing")
+    version = payload["schema_version"]
+    if type(version) is not int or version != ADAPTER_CATALOG_SCHEMA_VERSION:
+        raise _descriptor_error(source, f"unsupported schema_version {version!r}")
+    _check_keys(payload, required=_CATALOG_KEYS, source=source, locator="document")
+    adapters = payload["adapters"]
+    if not isinstance(adapters, Mapping) or not adapters:
+        raise _descriptor_error(source, "adapters must be a non-empty mapping")
+    parsed: dict[str, AdapterDescriptor] = {}
+    for executor, entry in adapters.items():
+        _require_text(executor, source=source, locator="adapter name")
+        locator = f"adapters.{executor}"
+        if not isinstance(entry, Mapping):
+            raise _descriptor_error(source, f"{locator} must be a mapping")
+        _check_keys(entry, required=_ADAPTER_DESCRIPTOR_KEYS, source=source, locator=locator)
+        quota_state = _require_text(entry["quota_state"], source=source, locator=f"{locator}.quota_state")
+        if quota_state not in _QUOTA_STATES:
+            raise _descriptor_error(source, f"{locator}.quota_state {quota_state!r} is invalid")
+        efforts, default, model_defaults = _parse_effort(
+            entry["effort"], source=source, locator=f"{locator}.effort"
+        )
+        parsed[executor] = AdapterDescriptor(
+            executor=executor,
+            protocol_id=_require_text(entry["protocol_id"], source=source, locator=f"{locator}.protocol_id"),
+            protocol_version=_require_text(
+                entry["protocol_version"], source=source, locator=f"{locator}.protocol_version"
+            ),
+            runtime_version=_require_text(
+                entry["runtime_version"], source=source, locator=f"{locator}.runtime_version"
+            ),
+            usage_source=_require_text(entry["usage_source"], source=source, locator=f"{locator}.usage_source"),
+            quota_state=quota_state,
+            efforts=efforts,
+            default_effort=default,
+            model_default_efforts=model_defaults,
+            source=source,
+        )
+    return parsed
+
+
+def packaged_catalog_path() -> Path:
+    return Path(__file__).with_name("data") / ADAPTER_CATALOG_FILENAME
+
+
+def overlay_catalog_path(config_root: str | Path | None = None) -> Path:
+    if config_root is None:
+        from paulsha_cortex.config import paths
+
+        config_root = paths.project_config_root()
+    return Path(config_root) / ADAPTER_CATALOG_FILENAME
+
+
+def _read_catalog(path: Path) -> dict[str, AdapterDescriptor]:
+    from .._yaml import YAMLError, safe_load
+
+    source = str(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise _descriptor_error(source, f"unreadable: {exc}") from exc
+    try:
+        payload = safe_load(text)
+    except YAMLError as exc:
+        raise _descriptor_error(source, f"malformed YAML: {exc}") from exc
+    return parse_adapter_catalog(payload, source=source)
+
+
+def _validate_adapter(adapter: ExecutionAdapter) -> None:
+    """Check that data and trusted code agree before the adapter is usable."""
+
+    if adapter.trusted_argv_builder() is None:
+        raise ExecutionAdapterError(
+            f"adapter {adapter.executor} has no trusted argv builder; "
+            "descriptors cannot introduce executable runtimes"
+        )
+    if adapter.quota_state not in _QUOTA_STATES:
+        raise ExecutionAdapterError("adapter quota capability state is invalid")
+    if adapter.terminal_contract not in SUPPORTED_TERMINAL_CONTRACTS:
+        raise ExecutionAdapterError(
+            f"adapter {adapter.executor} terminal contract is not implemented: {adapter.terminal_contract}"
+        )
+    if adapter.cancellation_contract not in SUPPORTED_CANCELLATION_CONTRACTS:
+        raise ExecutionAdapterError(
+            f"adapter {adapter.executor} cancel contract is not implemented: {adapter.cancellation_contract}"
+        )
+    if adapter.timeout_contract not in SUPPORTED_TIMEOUT_CONTRACTS:
+        raise ExecutionAdapterError(
+            f"adapter {adapter.executor} timeout contract is not implemented: {adapter.timeout_contract}"
+        )
+    if len(set(adapter.efforts)) != len(adapter.efforts):
+        raise ExecutionAdapterError(f"adapter {adapter.executor} has duplicate effort values")
+    for effort in (adapter.default_effort, *(value for _, value in adapter.model_default_efforts)):
+        if effort is not None and effort not in adapter.efforts:
+            raise ExecutionAdapterError(
+                f"adapter {adapter.executor} default effort {effort!r} is not declared"
+            )
+    if adapter.efforts and not adapter.accepts("effort"):
+        raise ExecutionAdapterError(
+            f"adapter {adapter.executor} cannot express native effort: its trusted argv "
+            "builder has no effort parameter"
+        )
+
+
+#: 程式碼登記的 adapter（新 runtime 或受信任替換）。descriptor 只能描述已在此或
+#: launcher argv builder 表中的 executor。
+_REGISTERED_ADAPTERS: dict[str, ExecutionAdapter] = {}
+_PACKAGED_DESCRIPTORS: dict[str, AdapterDescriptor] | None = None
+_CATALOG_CACHE: tuple[tuple[object, ...], dict[str, ExecutionAdapter]] | None = None
+_CATALOG_LOCK = threading.Lock()
+
+
+def _packaged_descriptors() -> dict[str, AdapterDescriptor]:
+    global _PACKAGED_DESCRIPTORS
+    if _PACKAGED_DESCRIPTORS is None:
+        _PACKAGED_DESCRIPTORS = _read_catalog(packaged_catalog_path())
+    return _PACKAGED_DESCRIPTORS
+
+
+def _file_signature(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _descriptor_error(str(path), f"unreadable: {exc}") from exc
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+def load_adapter_catalog(config_root: str | Path | None = None) -> dict[str, ExecutionAdapter]:
+    """Build the adapter catalog: packaged defaults ← code registrations ← overlay.
+
+    - packaged ``data/execution-adapters.yaml`` 是內建預設；
+    - :func:`register_adapter` 登記的受信任程式碼可新增 runtime 或替換條目；
+    - config root 的 ``execution-adapters.yaml`` overlay 以同名條目整筆取代資料欄位
+      （保留程式碼 hook），不能新增沒有受信任程式碼的 adapter。
+
+    任何一層不合法都整體拒收（不退回 packaged 預設）。
+    """
+
+    adapters: dict[str, ExecutionAdapter] = {}
+    for executor, descriptor in _packaged_descriptors().items():
+        adapters[executor] = ExecutionAdapter(executor, **descriptor.adapter_fields())
+    adapters.update(_REGISTERED_ADAPTERS)
+    overlay_path = overlay_catalog_path(config_root)
+    if _file_signature(overlay_path) is not None:
+        for executor, descriptor in _read_catalog(overlay_path).items():
+            base = adapters.get(executor)
+            if base is None:
+                raise _descriptor_error(
+                    str(overlay_path),
+                    f"adapter {executor!r} has no trusted code; descriptors cannot "
+                    "introduce executable runtimes",
+                )
+            adapters[executor] = _replace(base, **descriptor.adapter_fields())
+    for adapter in adapters.values():
+        try:
+            _validate_adapter(adapter)
+        except ExecutionAdapterError as exc:
+            raise _descriptor_error(adapter.descriptor_source, str(exc)) from exc
+    return adapters
+
+
+def reload_adapter_catalog() -> None:
+    """Drop cached catalog state (process restart semantics; tests use it)."""
+
+    global _CATALOG_CACHE, _PACKAGED_DESCRIPTORS
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE = None
+        _PACKAGED_DESCRIPTORS = None
+
+
+def adapter_catalog() -> Mapping[str, ExecutionAdapter]:
+    """Active catalog; re-read when the overlay file or code registrations change."""
+
+    global _CATALOG_CACHE
+    try:
+        overlay_path = overlay_catalog_path()
+    except ValueError as exc:
+        raise _descriptor_error("config root", f"unresolvable: {exc}") from exc
+    key = (
+        str(overlay_path),
+        _file_signature(overlay_path),
+        tuple(sorted((name, id(adapter)) for name, adapter in _REGISTERED_ADAPTERS.items())),
+        id(_REGISTERED_ADAPTERS),
+    )
+    with _CATALOG_LOCK:
+        cached = _CATALOG_CACHE
+        if cached is not None and cached[0] == key:
+            return cached[1]
+    catalog = load_adapter_catalog(overlay_path.parent)
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE = (key, catalog)
+    return catalog
 
 
 def adapter_for(executor: str) -> ExecutionAdapter:
-    adapter = _ADAPTERS.get(executor)
+    adapter = adapter_catalog().get(executor)
     if adapter is None:
         raise ExecutionAdapterError(f"unsupported adapter: {executor}")
     return adapter
@@ -136,11 +512,11 @@ def register_adapter(adapter: ExecutionAdapter, *, replace: bool = False) -> Non
 
     if not isinstance(adapter, ExecutionAdapter) or not adapter.executor:
         raise ExecutionAdapterError("invalid trusted execution adapter")
-    if adapter.executor in _ADAPTERS and not replace:
+    known = set(_REGISTERED_ADAPTERS) | set(_packaged_descriptors())
+    if adapter.executor in known and not replace:
         raise ExecutionAdapterError(f"adapter already registered: {adapter.executor}")
-    if adapter.quota_state not in {"supported", "unsupported", "unknown"}:
-        raise ExecutionAdapterError("adapter quota capability state is invalid")
-    _ADAPTERS[adapter.executor] = adapter
+    _validate_adapter(adapter)
+    _REGISTERED_ADAPTERS[adapter.executor] = adapter
 
 
 def _tagged(value: object, *, unknown_reason: str) -> dict[str, object]:
@@ -362,13 +738,9 @@ def resolve_profile(
         explicit_effort = _UNKNOWN
     else:
         explicit_effort = effort
-    resolved_effort = effort or adapter.default_effort
-    if executor == "codex" and effort is None:
-        # Keep the existing Codex mapping as the single source of truth; do
-        # not let profile reporting and argv generation drift apart.
-        from .launcher import _codex_default_effort
-
-        resolved_effort = _codex_default_effort(model_id)
+    # Descriptor 宣告的 model 預設優先、其次 adapter 預設；argv builder 以同一個
+    # `default_effort_for()` 決定實際發出的 effort，兩者不會各寫一份而漂移。
+    resolved_effort = effort or adapter.default_effort_for(model_id)
     effort_known = (
         {"state": "known", "value": resolved_effort}
         if resolved_effort is not None
@@ -525,14 +897,76 @@ def record_observed(
     )
 
 
+def require_workflow_role(persona: str) -> str:
+    """Return the execution role for ``persona``; unknown roles never default to build."""
+
+    role = _PERSONA_ROLE.get(persona)
+    if role is None:
+        raise ExecutionAdapterError(f"unknown workflow persona: {persona}")
+    return role
+
+
+@dataclass(frozen=True)
+class _CapabilityWaivedIdentity:
+    """Identity view for lanes whose contract does not filter by capability."""
+
+    executor: object
+    model_id: object
+    capabilities: tuple[str, ...]
+
+
+def trust_root_compatibility(
+    persona: str,
+    identity: object,
+    launcher: object | None,
+    *,
+    require_role_capability: bool = True,
+) -> tuple[bool, str | None]:
+    """Evaluate the Trust Root launch contract for one selected identity.
+
+    The authority is the existing :mod:`model_resolution` compatibility
+    predicate (launcher profile + Trust Root toolchain grant + credential grant
+    for the persona's principal).  It is active only when the Trust Root runner
+    contract is deployed (``PSC_JOB_RUNNER`` not ``direct``); direct mode keeps
+    the historical operator-overlay path and has no Trust Root contract to
+    violate.  An unresolvable runner configuration fails closed.
+
+    ``require_role_capability=False`` waives only the capability layer for
+    lanes that never filtered by capability (slice lane, #381); launcher,
+    toolchain and credential layers are still enforced.
+    """
+
+    from . import model_resolution
+
+    try:
+        checker = model_resolution.compatibility_checker_for(persona)
+    except ValueError as exc:
+        return False, f"Trust Root runner contract is unresolvable: {exc}"
+    if checker is None:
+        return True, None
+    subject = identity
+    if not require_role_capability:
+        subject = _CapabilityWaivedIdentity(
+            executor=getattr(identity, "executor", None),
+            model_id=getattr(identity, "model_id", None),
+            capabilities=(model_resolution.role_for_persona(persona),),
+        )
+    try:
+        model_resolution.validate_identity_compatibility(persona, subject, launcher=launcher)
+    except ValueError as exc:
+        return False, str(exc)
+    return True, None
+
+
 def validate_dispatch_requirements(
     binding: ExecutionProfileBinding,
     *,
     identity: object,
+    trust_root_valid: bool,
+    trust_root_reason: str | None = None,
     qualification: Mapping[str, object] | None = None,
     qualification_required: bool = False,
     builder_domains: Sequence[str] = (),
-    trust_root_valid: bool = True,
     quota: Mapping[str, object] | None = None,
     require_role_capability: bool = True,
 ) -> None:
@@ -540,6 +974,10 @@ def validate_dispatch_requirements(
 
     Quota is accepted only for observability; it is intentionally excluded from
     the permission calculation.
+
+    ``trust_root_valid`` is mandatory: production callers obtain it from
+    :func:`trust_root_compatibility` (the shared Trust Root predicate) instead
+    of relying on an always-true default.
 
     ``require_role_capability=False`` 只給既有契約本來就不看 capability 宣告的
     入口（slice lane 的 spec 明示 executor/model_id）；unknown role、pin、
@@ -567,8 +1005,9 @@ def validate_dispatch_requirements(
             raise ExecutionAdapterError("explicit model pin does not match resolved identity")
     if role == "review" and getattr(identity, "independence_domain", None) in set(builder_domains):
         raise ExecutionAdapterError("reviewer independence domain matches a builder")
-    if not trust_root_valid:
-        raise ExecutionAdapterError("Trust Root profile is not valid")
+    if trust_root_valid is not True:
+        detail = f": {trust_root_reason}" if trust_root_reason else ""
+        raise ExecutionAdapterError(f"Trust Root profile is not valid{detail}")
     if qualification_required:
         if not isinstance(qualification, Mapping):
             raise ExecutionAdapterError("exact-profile qualification is unknown")
@@ -608,6 +1047,14 @@ def validate_profile_for_launch(
     if effort is not None and not adapter.efforts:
         raise ExecutionAdapterError(f"unsupported effort for adapter {executor}")
     if effort_value.get("state") == "known" and effort is not None and effort_value.get("value") != effort:
+        raise ExecutionAdapterError("launcher effort does not match resolved profile")
+    # argv builder 依目前 descriptor 發出的 effort 必須就是 profile 解析出的那個；
+    # descriptor 在 resolve 與 launch 之間被改動（overlay 熱讀）時在 spawn 前拒絕。
+    emitted = adapter.launch_effort(model, effort) if adapter.efforts else None
+    if effort_value.get("state") == "known":
+        if emitted != effort_value.get("value"):
+            raise ExecutionAdapterError("launcher effort does not match resolved profile")
+    elif emitted is not None:
         raise ExecutionAdapterError("launcher effort does not match resolved profile")
     if sandbox_mode is not None:
         sandbox_value = resolved.conditions["sandbox"]

@@ -984,6 +984,7 @@ def _bind_dispatch_execution_profile(
     from .execution_adapters import (
         bind_launcher_profile,
         make_launcher_profile,
+        trust_root_compatibility,
         validate_dispatch_requirements,
     )
 
@@ -997,8 +998,17 @@ def _bind_dispatch_execution_profile(
     # slice lane 只在 spec 同時明示 executor/model_id 時才綁 profile；#381 起
     # 這條路徑從不以 capability 宣告篩選 spec 指名的 identity（manager 路徑的
     # capability 約束在候選篩選階段已處理），這裡維持同一語意，不新增門檻。
+    # #835 AC3：Trust Root（launcher／toolchain／credential grant）仍是硬條件，
+    # 只豁免 capability 這一層。
+    trust_root_valid, trust_root_reason = trust_root_compatibility(
+        persona, identity, launcher, require_role_capability=False
+    )
     validate_dispatch_requirements(
-        binding, identity=identity, require_role_capability=False
+        binding,
+        identity=identity,
+        require_role_capability=False,
+        trust_root_valid=trust_root_valid,
+        trust_root_reason=trust_root_reason,
     )
     return bind_launcher_profile(launcher, binding)
 

@@ -908,17 +908,14 @@ def _copilot_verdict_spool_tools(
     )
 
 
-_VALID_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
-_COPILOT_DEFAULT_EFFORT = "xhigh"
+def _resolve_reasoning_effort(*, executor: str, model: str | None, effort: str | None) -> str | None:
+    """#835：原生 effort 的合法值與預設（含 model 專屬預設）只來自 adapter descriptor
+    （`data/execution-adapters.yaml` ＋ config root overlay）；argv 不再自帶一份名單，
+    execution profile 的 resolved effort 與這裡發出的值因此同源。"""
 
+    from .execution_adapters import adapter_for
 
-def _resolve_reasoning_effort(*, executor: str, effort: str | None, default: str) -> str:
-    resolved = effort or default
-    if resolved not in _VALID_REASONING_EFFORTS:
-        raise ValueError(
-            f"{executor} executor effort must be one of {sorted(_VALID_REASONING_EFFORTS)}, got {resolved!r}"
-        )
-    return resolved
+    return adapter_for(executor).launch_effort(model, effort)
 
 
 def build_copilot_argv(
@@ -948,8 +945,8 @@ def build_copilot_argv(
         worktree = str(Path(worktree).resolve())
     resolved_effort = _resolve_reasoning_effort(
         executor="copilot",
+        model=model,
         effort=effort,
-        default=_COPILOT_DEFAULT_EFFORT,
     )
     # allow_unsafe（明確 opt-in）才放開 copilot 的全自動授權 --allow-all；
     # 預設關閉 → 由 executor 自身的互動授權把關（manager 自主派工請設 allow_unsafe=True）。
@@ -967,7 +964,8 @@ def build_copilot_argv(
     ]
     if model is not None:
         argv += ["--model", model]
-    argv += ["--effort", resolved_effort]
+    if resolved_effort is not None:
+        argv += ["--effort", resolved_effort]
     if commit_required:
         argv.append("--allow-all-tools")
         argv += ["--add-dir", worktree]
@@ -1113,13 +1111,15 @@ def build_claude_argv(
 
 
 def _codex_default_effort(model: str) -> str | None:
-    """Return the existing model-specific native Codex effort override."""
+    """Return the model-specific native Codex effort declared by the adapter descriptor.
 
-    return {
-        "gpt-5.6-luna": "max",
-        "gpt-6-luna": "max",
-        "gpt-5.3-codex-spark": "xhigh",
-    }.get(model)
+    #835：對照表住在 `data/execution-adapters.yaml`（codex 條目的
+    `effort.model_defaults`），這裡只是 qualification contract 與既有呼叫端的查詢入口。
+    """
+
+    from .execution_adapters import adapter_for
+
+    return adapter_for("codex").default_effort_for(model)
 
 
 def build_codex_argv(
@@ -1138,6 +1138,7 @@ def build_codex_argv(
     trust_root_outer_unit: bool = False,
     verdict_spool_dir: str | None = None,
     last_message_path: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Codex planning cannot bypass sandbox")
@@ -1219,11 +1220,12 @@ def build_codex_argv(
         argv += ["--add-dir", spool_dir]
     if model is not None:
         argv += ["--model", model]
-        reasoning_effort = _codex_default_effort(model)
-        if reasoning_effort is not None:
-            # Codex reads this as a CLI config override, so an ambient
-            # ~/.codex/config.toml cannot silently choose a different effort.
-            argv += ["-c", f'model_reasoning_effort="{reasoning_effort}"']
+    # #835：明示 effort 或 descriptor 的 model／adapter 預設（與 execution profile 同源）。
+    reasoning_effort = _resolve_reasoning_effort(executor="codex", model=model, effort=effort)
+    if reasoning_effort is not None:
+        # Codex reads this as a CLI config override, so an ambient
+        # ~/.codex/config.toml cannot silently choose a different effort.
+        argv += ["-c", f'model_reasoning_effort="{reasoning_effort}"']
     # #714 缺陷 2：`-o` 的落點必須是**這個 job 寫得進去、而且帶 job id** 的那一格。
     # 呼叫端沒給時退回 `<log_dir>/<slice>.last.json`——仍然帶 slice id（共用
     # `last.json` 會讓並行的兩個 job 互相蓋掉），只是落在 Manager 的 dispatch log
@@ -1553,8 +1555,7 @@ def build_agy_argv(
 # llm-share env（含 `COPILOT_MODEL=glm-5.2`），這裡的常數只是 argv 沒收到明確
 # `model` 時的落地預設，實際身分仍由 operator 的 env file 決定。
 _CG_DEFAULT_MODEL = "glm-5.2"
-_CG_VALID_EFFORTS = _VALID_REASONING_EFFORTS
-_CG_DEFAULT_EFFORT = "medium"
+# cg 的原生 effort 值與預設（medium）住在 adapter descriptor（#835）。
 
 
 def build_cg_argv(
@@ -1595,20 +1596,16 @@ def build_cg_argv(
         raise ValueError("cg executor is zero-tool and cannot commit")
     if not (read_only or review_only):
         raise ValueError("cg executor requires read-only or review-only mode")
+    resolved_model = model or _CG_DEFAULT_MODEL
     resolved_effort = _resolve_reasoning_effort(
         executor="cg",
+        model=resolved_model,
         effort=effort,
-        default=_CG_DEFAULT_EFFORT,
     )
-    return [
-        "cg",
-        "--model",
-        model or _CG_DEFAULT_MODEL,
-        "--effort",
-        resolved_effort,
-        "--headless",
-        "--stdin",
-    ]
+    argv = ["cg", "--model", resolved_model]
+    if resolved_effort is not None:
+        argv += ["--effort", resolved_effort]
+    return [*argv, "--headless", "--stdin"]
 
 
 @runtime_checkable
@@ -1693,7 +1690,20 @@ class SubprocessLauncher:
         execution_profile: object | None = None,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
-            raise ValueError(f"unknown executor: {executor}")
+            # #835：程式碼以 `execution_adapters.register_adapter()` 登記的新 runtime
+            # 自帶受信任 argv 實作；descriptor 或其他資料來源不能讓未登記的 executor 通過。
+            from .execution_adapters import ExecutionAdapterError, adapter_for
+
+            try:
+                adapter_for(executor)
+            except ExecutionAdapterError:
+                raise ValueError(f"unknown executor: {executor}") from None
+        if effort is not None:
+            from .execution_adapters import adapter_for
+
+            if not adapter_for(executor).accepts("effort"):
+                # 沒有 effort 通道的 executor 以前會靜默丟掉 effort；現在在 spawn 前拒絕。
+                raise ValueError(f"unsupported effort for adapter {executor}")
         if executable is not None and executor != "claude":
             raise ValueError("executable binding is only supported for claude")
         if executor == "cg" and allow_unsafe:
@@ -1757,9 +1767,9 @@ class SubprocessLauncher:
         # `cortex-builder` 起跑（它就是 builder，只是這一張卡不寫檔）。
         self._write_forbidden = write_forbidden
         self._review_terminal_kind = review_terminal_kind
-        # copilot/cg 共用：兩者都接受 `--effort low|medium|high|xhigh`，但預設不同
-        # （copilot = xhigh；cg = medium）。其餘 executor 沒有對應旗標，因此這裡只
-        # 保留原值，實際合法值與預設都交給各自的 argv builder 驗證。
+        # #835：合法值與預設（copilot = xhigh；cg = medium；codex 依 model）都在 adapter
+        # descriptor；這裡只保留原值，由 argv builder 以 descriptor 驗證。沒有 effort
+        # 通道的 executor（claude／agy）已在上方 fail-closed。
         self._effort = effort
         # trust-root Phase 2a：本 job 專屬的 verdict spool 目錄（唯一額外放行的
         # 寫入路徑）。None ＝ 不放行任何 worktree 之外的寫入（既有行為）。
@@ -2292,6 +2302,9 @@ class SubprocessLauncher:
             prompt_file = job_runner.job_prompt_path(
                 prompt_spool, job_runner.template_instance_id(slice_id)
             )
+        from .execution_adapters import adapter_for
+
+        adapter = adapter_for(self._executor)
         builder_kwargs = {
             "prompt": prompt,
             "slice_id": slice_id,
@@ -2309,7 +2322,9 @@ class SubprocessLauncher:
         # cg 併入同一份 kwarg（issue #442）：self._commit_required 對任何成功建構
         # 的 cg launcher 恆為 False（見 __init__ 的 cg 專屬不變量），這裡顯式傳遞
         # 只是與其餘 builder 的呼叫形狀一致、defense-in-depth，不改變行為。
-        if self._executor in {"codex", "copilot", "claude", "agy", "cg"}:
+        # #835：以受信任 argv builder 的簽名判斷（內建五個 executor 全都接受），
+        # 程式碼登記的新 runtime 不會因為不在固定名單裡而靜默丟掉 commit 契約。
+        if adapter.accepts("commit_required"):
             builder_kwargs["commit_required"] = self._commit_required
         if self._executor == "codex":
             # Codex 0.157 在 Trust Root 加固 unit 內無法使用 bwrap，也無法使用
@@ -2350,7 +2365,9 @@ class SubprocessLauncher:
             # Claude's complete workflow envelope can exceed Linux's per-argv
             # limit.  The wrapper receives it over stdin instead.
             builder_kwargs["prompt_via_stdin"] = True
-        if self._executor in {"copilot", "cg"}:
+        # #835：effort 通道由 argv builder 能否表達決定（copilot／cg 的 `--effort`、
+        # codex 的 `model_reasoning_effort`）；合法值與預設來自 adapter descriptor。
+        if adapter.accepts("effort"):
             builder_kwargs["effort"] = self._effort
         if self._executor == "claude" and self._effective_tools is not None:
             builder_kwargs["effective_tools"] = self._effective_tools
@@ -2361,9 +2378,7 @@ class SubprocessLauncher:
             builder_kwargs["last_message_path"] = last_message_path
         if self._executor == "agy":
             builder_kwargs["print_timeout"] = resolve_agy_print_timeout(os.environ)
-        from .execution_adapters import adapter_for
-
-        inner_argv = adapter_for(self._executor).build_argv(builder_kwargs)
+        inner_argv = adapter.build_argv(builder_kwargs)
         # PSC_REPO_ROOT 讓已安裝 hook 的 `${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh`
         # 在 cwd=worktree（≠repo）時仍可解（worktree 雖是 repo checkout，但 hook 為全域安裝、
         # 不可依賴相對 cwd；互動 session 亦不應因相對路徑找不到 script 而報錯）。

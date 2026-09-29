@@ -1,0 +1,156 @@
+{
+  "jobs": [],
+  "legacy_records": {
+    "jobs": [],
+    "seq": 0,
+    "slices": [],
+    "source_schema_version": 1
+  },
+  "reclaim_resets": [],
+  "schema_version": 2,
+  "seq": 0,
+  "slices": [],
+  "workflows": [
+    {
+      "attempts": {
+        "claim": 1,
+        "plan": 1
+      },
+      "brainstorm_required": false,
+      "candidate_head": null,
+      "claim_key": "claim:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "combo": "feature-oneshot",
+      "combo_selection": null,
+      "completion_record_hash": null,
+      "completion_record_path": null,
+      "completion_record_revision": null,
+      "completion_source_revisions": {},
+      "created_at": "2026-09-29T03:55:58.461812+00:00",
+      "current_phase": "build",
+      "decomposition_depth": 0,
+      "evidence_refs": [
+        "receipt:legacy-plan"
+      ],
+      "facets": [],
+      "frozen_readiness": null,
+      "gate_refs": [],
+      "gate_status": "running",
+      "issue_refs": [],
+      "merge_revision": null,
+      "model_chain_override": {
+        "builder": {
+          "executor": "codex",
+          "model_id": "gpt-legacy-builder"
+        }
+      },
+      "needs_human_reason": null,
+      "openspec_refs": [],
+      "plan_review_passed": false,
+      "planning_authority": [],
+      "planning_source_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "pr_candidate": null,
+      "pr_refs": [],
+      "primary_domain": null,
+      "repo": "owner/repo",
+      "resolved_model_chain": {
+        "planner": {
+          "executor": "claude",
+          "independence_domain": "anthropic",
+          "model_id": "legacy-planner",
+          "source": "registry"
+        }
+      },
+      "retry_classification": null,
+      "run_id": "workflow-ee02c5bc2838087cb4d7",
+      "sizing_band": null,
+      "sizing_score": null,
+      "source_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "status": "ongoing",
+      "steps": [
+        {
+          "action": null,
+          "card": "subagent-build",
+          "commit_policy": null,
+          "domain": null,
+          "executor": null,
+          "gate_result": "pending",
+          "inputs": [],
+          "model": null,
+          "outputs": [],
+          "persona": "builder",
+          "phase": "build",
+          "skill_ref": null,
+          "test_policy": null
+        }
+      ],
+      "updated_at": "2026-09-29T03:55:58.484745+00:00",
+      "verified_head": null,
+      "work_id": "legacy-frozen-chain",
+      "workspace_root": "/nonexistent/legacy-workspace"
+    },
+    {
+      "attempts": {
+        "claim": 1
+      },
+      "brainstorm_required": false,
+      "candidate_head": null,
+      "claim_key": "claim:v1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "combo": "feature-oneshot",
+      "combo_selection": null,
+      "completion_record_hash": null,
+      "completion_record_path": null,
+      "completion_record_revision": null,
+      "completion_source_revisions": {},
+      "created_at": "2026-09-29T03:55:58.488252+00:00",
+      "current_phase": "build",
+      "decomposition_depth": 0,
+      "evidence_refs": [
+        "receipt:legacy-unknown-role"
+      ],
+      "facets": [],
+      "frozen_readiness": null,
+      "gate_refs": [],
+      "gate_status": "running",
+      "issue_refs": [],
+      "merge_revision": null,
+      "model_chain_override": null,
+      "needs_human_reason": null,
+      "openspec_refs": [],
+      "plan_review_passed": false,
+      "planning_authority": [],
+      "planning_source_revision": "dddddddddddddddddddddddddddddddddddddddd",
+      "pr_candidate": null,
+      "pr_refs": [],
+      "primary_domain": null,
+      "repo": "owner/repo",
+      "resolved_model_chain": null,
+      "retry_classification": null,
+      "run_id": "workflow-9f0fc4e6240f8f362c85",
+      "sizing_band": null,
+      "sizing_score": null,
+      "source_revision": "dddddddddddddddddddddddddddddddddddddddd",
+      "status": "ongoing",
+      "steps": [
+        {
+          "action": null,
+          "card": "subagent-build",
+          "commit_policy": null,
+          "domain": null,
+          "executor": null,
+          "gate_result": "pending",
+          "inputs": [],
+          "model": null,
+          "outputs": [],
+          "persona": "architect",
+          "phase": "build",
+          "skill_ref": null,
+          "test_policy": null
+        }
+      ],
+      "updated_at": "2026-09-29T03:55:58.488252+00:00",
+      "verified_head": null,
+      "work_id": "legacy-unknown-persona",
+      "workspace_root": "/nonexistent/legacy-workspace"
+    }
+  ]
+}
