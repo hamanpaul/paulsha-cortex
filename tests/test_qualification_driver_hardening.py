@@ -3235,3 +3235,39 @@ def test_manager_helper_expectation_matches_the_permgen_generated_gitconfig() ->
     driver = _load_driver()
     assert driver.GITHUB_HTTPS_CREDENTIAL_URL == permgen.GITHUB_HTTPS_CREDENTIAL_URL
     assert driver.MANAGER_GH_CREDENTIAL_HELPER == permgen.durable_owner_git_credential_helper()
+
+
+def test_dispatch_closeout_failure_names_the_unmet_conditions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：canary 只看到 `phase chain or candidate binding is invalid`，看不出停在哪。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    payload = json.loads(fixture["registry"].read_text(encoding="utf-8"))
+    workflow = payload["workflows"][0]
+    workflow["status"] = "ongoing"
+    workflow["current_phase"] = "build"
+    workflow["gate_status"] = "running"
+    workflow["facets"] = ["needs_human"]
+    workflow["needs_human_reason"] = {"reason": "job-failed", "detail": "x" * 50}
+    workflow["steps"] = [
+        row for row in workflow["steps"] if row.get("phase") in {"claim", "define", "plan", "build"}
+    ]
+    workflow["steps"][-1]["gate_result"] = "failed"
+    _write_json(fixture["registry"], payload)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    with pytest.raises(driver.QualificationFailure) as caught:
+        _validate_fixture_closeout(driver, fixture)
+    message = str(caught.value)
+    assert "phase chain or candidate binding is invalid" in message
+    for fragment in (
+        "current_phase=build",
+        "status=ongoing",
+        "gate_status=running",
+        "needs_human=job-failed",
+        "missing_phases=verify,review,ship",
+        "failed_steps=build:",
+    ):
+        assert fragment in message
+    assert "x" * 50 not in message
