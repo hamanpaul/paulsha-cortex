@@ -643,6 +643,19 @@ def build_runtime_status_provider(
 
     quota_decision_store = _quota_admission_module.AdmissionDecisionStore()
     quota_decision_cache = DecisionReadCache()
+    # #840 AC4：daemon 重啟時記憶體 last-good 已隨舊 process 消失；以上一個
+    # daemon 自己寫出的 status.json 裡的 quota 投影當跨 process 種子。種子只在
+    # store 讀不到且沒有記憶體 last-good 時採用，仍需通過目前 attempt 判定；
+    # 讀不到或格式不符就是沒有種子（不影響 status 產出）。
+    previous_status = contract.read_json(constants.status_path())
+    if isinstance(previous_status, dict) and isinstance(previous_status.get("attention"), list):
+        quota_decision_cache.seed_last_good_from_projections(
+            [
+                row.get("quota_decision")
+                for row in previous_status["attention"]
+                if isinstance(row, dict) and isinstance(row.get("quota_decision"), dict)
+            ]
+        )
 
     def recent_done_provider() -> list[dict[str, Any]]:
         manifests: list[tuple[str, dict[str, Any]]] = []

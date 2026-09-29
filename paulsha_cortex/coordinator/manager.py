@@ -11837,6 +11837,7 @@ _QUOTA_ADMISSION_NO_CANDIDATE_PROFILE_KEY = "quota-admission:no-admissible-candi
 def _quota_admission_record_wait_decision(
     store, *, registry, run, step, identities: "IdentityRegistry", reason: str,
     excluded: Sequence[Mapping[str, object]] = (),
+    policy_config_revision: str | None = None,
 ) -> dict[str, str] | None:
     """#839 對抗審查修復第二輪（MAJOR manager.py:11413）：全部候選被拒
     （`_quota_admission_stop`）或設定本身無效（`_quota_admission_config_invalid_stop`）
@@ -11874,6 +11875,10 @@ def _quota_admission_record_wait_decision(
                 selected=None, reservation_id=None,
                 excluded=tuple(excluded), reason=reason,
                 retry_eligible=(reason == "quota-admission-insufficient"),
+                # #840 AC2：wait receipt 同樣記下當時生效的 operator 設定 revision
+                # ——投影面才分得出「哪一版 quota-pools 設定判定額度不足」；設定
+                # 本身無效（quota-config-invalid）時沒有可信 revision，維持 None。
+                policy_config_revision=policy_config_revision,
                 reset_at_ms=min(
                     (int(item["reset_at_ms"]) for item in excluded
                      if type(item.get("reset_at_ms")) is int and item["reset_at_ms"] >= 0),
@@ -11940,6 +11945,7 @@ def _quota_admission_stop(
     quota_admission_projection = _quota_admission_record_wait_decision(
         quota_admission_context.store, registry=registry, run=run, step=step,
         identities=identities, reason="quota-admission-insufficient", excluded=attempts,
+        policy_config_revision=getattr(quota_admission_context, "config_revision", None),
     )
     update_kwargs: dict[str, object] = {
         "facets": tuple(dict.fromkeys((*run.facets, "needs_human"))),
