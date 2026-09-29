@@ -347,3 +347,64 @@ def test_rechain_explicit_pin_remains_single_candidate_without_automatic_fallbac
     assert [(item.executor, item.model_id) for item in reviewer] == [
         ("agy", "gemini-3.1-pro-high")
     ]
+
+
+def test_rechain_rejects_a_reviewer_sharing_the_new_builder_domain(tmp_path):
+    """#1173 審查：dispatcher 只比 reviewer 與歷史 builder 的 domain；新的 builder
+    pin 也必須與 reviewer 獨立，否則重裁後 build 與 review 落在同一 domain。"""
+
+    registry, run = _registry(tmp_path)
+    before = registry.get_workflow_run(run.run_id)
+
+    with pytest.raises(RuntimeError, match="not independent of the new builder pin"):
+        _invoke(
+            tmp_path,
+            registry,
+            run,
+            reviewer_executor="claude",
+            reviewer_model="sonnet",
+        )
+
+    assert registry.get_workflow_run(run.run_id) == before
+    assert _audit_files(tmp_path) == []
+
+
+def test_rechain_stale_replay_after_crash_cannot_overwrite_a_later_readjudication(
+    tmp_path, monkeypatch
+):
+    """#1173 審查：A 寫完 audit 後、registry 更新前 crash；B 之後成功，B 的鏈又回到
+    needs_human。重送 A 仍通過 run／candidate／era CAS，但不得覆寫 B 的 pin。"""
+
+    registry, run = _registry(tmp_path)
+    original_update = registry._manager_rechain_workflow
+
+    def crash_before_state_commit(*args, **kwargs):
+        raise RuntimeError("simulated crash before registry transition")
+
+    monkeypatch.setattr(registry, "_manager_rechain_workflow", crash_before_state_commit)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _invoke(tmp_path, registry, run)
+    monkeypatch.setattr(registry, "_manager_rechain_workflow", original_update)
+
+    later = _invoke(
+        tmp_path,
+        registry,
+        registry.get_workflow_run(run.run_id),
+        reason="operator B chose a codex builder",
+        builder_executor="codex",
+        builder_model="gpt-5.3-codex-spark",
+    )
+    assert later["already_applied"] is False
+    applied = registry.get_workflow_run(run.run_id)
+    b_chain = applied.model_chain_override
+    index = registry._find_workflow_run_index(run.run_id)
+    registry._workflows[index] = replace(
+        applied,
+        facets=tuple(dict.fromkeys((*applied.facets, "needs_human"))),
+        needs_human_reason=run.needs_human_reason,
+    )
+
+    with pytest.raises(RuntimeError, match="superseded by a later readjudication"):
+        _invoke(tmp_path, registry, registry.get_workflow_run(run.run_id))
+
+    assert registry.get_workflow_run(run.run_id).model_chain_override == b_chain

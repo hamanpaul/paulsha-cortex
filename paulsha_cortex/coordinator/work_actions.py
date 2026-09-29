@@ -7743,6 +7743,35 @@ def _refreeze_base_action(
     return payload
 
 
+def _rechain_prior_request_record(
+    body: dict[str, Any], *, state_path: Path
+) -> dict[str, str] | None:
+    """同一個 rechain 請求（除 prior chain 外逐欄相同）先前寫過的 audit。
+
+    找到而 prior chain 與現在不同，表示該請求先前已受理（已套用，或 crash 在
+    寫完 audit、更新 registry 之前），之後 chain 又被改過。
+    """
+
+    root = state_path.resolve().parent / "evidence" / "work-model-chain-readjudication"
+    request = {key: value for key, value in body.items() if key != "prior_model_chain_override"}
+    try:
+        paths = sorted(root.glob(f"{body['run_id']}-*.json"))
+    except OSError as error:
+        raise RuntimeError("workflow model-chain-readjudication evidence conflict") from error
+    for path in paths:
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 16384:
+                continue
+            recorded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(recorded, dict):
+            continue
+        if {key: value for key, value in recorded.items() if key != "prior_model_chain_override"} == request:
+            return {"ref": str(path), "hash": verification.canonical_json_hash(recorded)}
+    return None
+
+
 def _rechain_action(
     *,
     args: dict[str, Any],
@@ -7815,6 +7844,7 @@ def _rechain_action(
     run = exact_runs[0]
     if run.run_id != expected_run_id:
         raise RuntimeError("rechain expected WorkflowRun CAS mismatch")
+    prior_chain = run.model_chain_override if isinstance(run.model_chain_override, dict) else None
     body = {
         "schema": "cortex-work-model-chain-readjudication/v1",
         "repo": run.repo,
@@ -7825,6 +7855,8 @@ def _rechain_action(
         "actor": actor,
         "reason": reason,
         "model_chain_override": chain,
+        # 受理當下被取代的 chain：重送時據此判斷請求是否已被後來的重裁取代。
+        "prior_model_chain_override": prior_chain,
         "validated_personas": ["planner", "builder", "reviewer"],
         "validation": "manager-workflow-identity-candidates/v1",
     }
@@ -7834,6 +7866,18 @@ def _rechain_action(
         subdir="work-model-chain-readjudication",
         label="model-chain-readjudication",
     )
+    if existing_record is None:
+        prior_record = _rechain_prior_request_record(body, state_path=state_path)
+        if prior_record is not None:
+            if prior_record["ref"] in run.evidence_refs:
+                # 已套用過的同一請求：之後 chain 又變了，重送是 no-op。
+                existing_record = prior_record
+            else:
+                # crash 在寫完 audit、更新 registry 之前，期間 chain 被別的重裁
+                # 改過：重送不得以舊請求覆寫較新的 pin（#1173 審查）。
+                raise RuntimeError(
+                    "rechain request was superseded by a later readjudication"
+                )
     if (
         existing_record is not None
         and existing_record["ref"] in run.evidence_refs
@@ -7875,6 +7919,7 @@ def _rechain_action(
 
     identities = load_model_identities()
     proposed = replace(run, model_chain_override=chain)
+    resolved: dict[str, Any] = {}
     for persona in ("planner", "builder", "reviewer"):
         try:
             candidates = workflow_manager._workflow_identity_candidates_for_persona(
@@ -7889,6 +7934,19 @@ def _rechain_action(
             or candidates[0].model_id != chain[persona]["model_id"]
         ):
             raise RuntimeError(f"rechain {persona} identity failed qualification/pin validation")
+        resolved[persona] = candidates[0]
+    # dispatcher 只比對 reviewer 與歷史 builder 的 domain；新的 builder pin 也必須
+    # 與 reviewer 獨立，否則重裁後的下一個 build 與 review 會落在同一 domain。
+    builder_domain = getattr(resolved["builder"], "independence_domain", None)
+    reviewer_domain = getattr(resolved["reviewer"], "independence_domain", None)
+    if (
+        not isinstance(builder_domain, str)
+        or not isinstance(reviewer_domain, str)
+        or builder_domain in {"", "unknown"}
+        or reviewer_domain in {"", "unknown"}
+        or builder_domain == reviewer_domain
+    ):
+        raise RuntimeError("rechain reviewer is not independent of the new builder pin")
 
     record = existing_record or _write_supersede_evidence(
         body,
