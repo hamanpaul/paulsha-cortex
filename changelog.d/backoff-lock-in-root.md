@@ -1,0 +1,1 @@
+- executor 退避 store 的 lock 在 coordinator root 存在時一律放在 root 內。舊邏輯取「最高的可寫祖先」，三 UID 安裝（root 由 Manager 擁有、祖先皆 root-owned）會退回 `/`，Manager 開不了 lock，store 讀取永遠 UNKNOWN，build 卡片以 `executor-backoff-unknown` 無聲等待——deployment canary 卡在 build 的根因；且 root 權限的 CLI 與 Manager 會用到不同 lock（#716）。
