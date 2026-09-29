@@ -412,9 +412,11 @@ def _receipt_view(receipt: InstallReceipt) -> dict[str, object]:
 # Recorded from the pre-PR-4 installer (base: legacy plan, 7ddf1957) running
 # this exact scenario.  A plan without a legacy block must keep producing the
 # same receipts, backend calls and rollback report; never regenerate this to
-# make a legacy change pass.
+# make a legacy change pass.  Re-recorded once for a non-legacy change (#716
+# added `version: "1"` to the manager gh config): the same scenario run on
+# 7ddf1957 plus only that change produces this exact digest.
 REGRESSION_GOLDEN_SHA256 = (
-    "c755a6a451755088616a56c4c40fb19319d50a7ac22ca4c31b561dcddc0e46d9"
+    "0ab34362a492a5b76a6b050af6142b21e9e04bb7a41fa9fead03594202bbc9dd"
 )
 
 
