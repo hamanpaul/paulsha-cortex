@@ -511,6 +511,56 @@ def test_opt_in_all_candidates_infeasible_returns_zero_job_with_precise_reason(
         quota_admission_context=ctx,
     )
 
+    # A retry-eligible quota wait exposes the same resume action accepted by the
+    # formal operator resume path. When quota is still insufficient, resume must
+    # retain the original wait receipt instead of appending a duplicate decision.
+    from paulsha_cortex.coordinator import work_actions
+
+    recovery_actions = work_actions._phase_recovery_actions(
+        updated_run, registry, quota_decision_store=ctx.store,
+    )
+    assert "resume" in recovery_actions
+    status_entry = manager.workflow_status_entry(registry, updated_run, quota_decision_store=ctx.store)
+    assert "resume" in status_entry["next_actions"]
+    assert "resume" in status_entry["next_step_hint"]
+    from paulsha_cortex.coordinator import claim
+
+    claim_decision = claim._resume_decision(claim.ClaimCandidate(
+        authority=None, repo=updated_run.repo, work_id=updated_run.work_id,
+        source_revisions=(updated_run.source_revision,), confirmed_todo=False,
+        confirmed_issue=None, auto_label=False, active_run_id=updated_run.run_id,
+        active_claim_key=updated_run.claim_key, active_status="needs_human",
+        active_phase=updated_run.current_phase,
+        active_recovery_actions=recovery_actions, active_pre_delivery=True,
+    ))
+    assert {"abandon", "resume"} <= set(claim_decision.next_actions)
+    assert "resume" in claim_decision.next_step_hint
+    from paulsha_cortex.monitor import providers
+
+    monkeypatch.setattr(
+        work_actions, "work_authority_projection_state", lambda **_kwargs: "available",
+    )
+    monitor_actions = providers._workflow_next_actions_projection(
+        [updated_run.to_dict()], repo=updated_run.repo,
+        job_rows=registry.list_jobs(), slice_rows=[], state_path=registry._state_path,
+        quota_decision_store=ctx.store,
+    )
+    assert "resume" in monitor_actions[updated_run.work_id]["actions"]
+    decisions_before = ctx.store.all_rows()
+    dispatcher = type(
+        "D", (), {"_registry": registry, "_git_runner": None,
+                  "_worktree_creator": _FakeWorktreeCreator(worktree)}
+    )()
+    resumed = manager.resume_workflow_run(
+        dispatcher, run_id=updated_run.run_id, identities=identities,
+        launcher_factory=_launcher_factory, coordinator_root=tmp_path / "coordinator",
+        operator_resume=True, quota_admission_context=ctx,
+    )
+    assert resumed["reason"] == "quota-admission-insufficient"
+    still_waiting = registry.get_workflow_run(updated_run.run_id)
+    assert still_waiting.quota_admission["builder"]["decision_id"] == projection["decision_id"]
+    assert len(ctx.store.all_rows()) == len(decisions_before) == 1
+
     # A reset timestamp alone never releases the wait. A fresh sufficient
     # observation is required, after which the periodic resume path may retry.
     clock_ms[0] += 1_000

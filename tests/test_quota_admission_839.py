@@ -39,11 +39,12 @@ def _pool_descriptor(
     account: str = "account-shared",
     pool: str = "pool-shared",
     unit_id: str = "token",
+    semantics_ref: str = "fixture:native-token/v1",
     windows: tuple[tuple[str, int], ...] = (("short", 300_000), ("week", 604_800_000)),
 ) -> schema.PoolDescriptor:
     unit = {
         "unit_id": unit_id, "version": "1", "quantity_kind": "amount",
-        "semantics_ref": "fixture:native-token/v1",
+        "semantics_ref": semantics_ref,
     }
     return schema.parse_pool_descriptor(
         {
@@ -98,8 +99,9 @@ def _binding(descriptors, profile_key: str, *, binding_id: str = "binding") -> s
 
 def _observation(
     descriptor, window_id: str, *, value: str, observed_at_ms: int, profile_key: str = _PROFILE_A,
-    unit_id: str = "token",
+    unit_id: str | None = None,
 ) -> schema.QuotaObservation:
+    unit_id = unit_id or descriptor.units[0].unit_id
     payload = {
         "schema_version": 1,
         "observation_id": f"fixture-{descriptor.pool_id}-{window_id}-{observed_at_ms}",
@@ -225,12 +227,95 @@ def test_ac2_unknown_remaining_denies_with_precise_reason() -> None:
     assert "missing-snapshot" in assessment.pools[0].coverage_gaps
 
 
+def test_candidate_observation_state_uses_only_its_bound_pool_windows() -> None:
+    observed_pool = _pool_descriptor(account="account-observed", pool="pool-observed", windows=(("short", 300_000),))
+    unobserved_pool = _pool_descriptor(account="account-unobserved", pool="pool-unobserved", windows=(("short", 300_000),))
+    shadow = _shadow_with(observed_pool, "short", "50")
+    descriptors = (observed_pool, unobserved_pool)
+    bindings = (
+        _binding((observed_pool,), _PROFILE_A, binding_id="observed-binding"),
+        _binding((unobserved_pool,), _PROFILE_B, binding_id="unobserved-binding"),
+    )
+
+    observed_candidate, _ = admission.assess_candidate_quota(
+        executor="codex", model_id="gpt-5", independence_domain="codex", profile_key=_PROFILE_A,
+        bindings=bindings, descriptors=descriptors, unit_catalog=(), shadow=shadow, now_ms=_NOW,
+    )
+    unobserved_candidate, _ = admission.assess_candidate_quota(
+        executor="claude", model_id="sonnet", independence_domain="claude", profile_key=_PROFILE_B,
+        bindings=bindings, descriptors=descriptors, unit_catalog=(), shadow=shadow, now_ms=_NOW,
+    )
+
+    assert observed_candidate.observation_state == "known"
+    assert unobserved_candidate.observation_state == "unknown"
+
+
 def test_custom_demand_estimator_requires_explicit_version() -> None:
     descriptor = _pool_descriptor(windows=(("short", 300_000),))
     with pytest.raises(ValueError):
         admission.estimate_demand(
             [(_pool_ref(descriptor), "short")], estimator=lambda pool_ref, window_id: "2",
         )
+
+
+def test_unit_demand_uses_semantics_and_is_versioned() -> None:
+    agy_semantics = "provider:google-antigravity-cli/quota-fraction/v1"
+    descriptor = _pool_descriptor(
+        unit_id="agy-fraction", semantics_ref=agy_semantics, windows=(("daily", 86_400_000),),
+    )
+    binding = _binding((descriptor,), _PROFILE_A)
+
+    sufficient = admission.assess_candidate_quota(
+        executor="agy", model_id="model", independence_domain="agy", profile_key=_PROFILE_A,
+        bindings=(binding,), descriptors=(descriptor,), unit_catalog=(),
+        shadow=_shadow_with(descriptor, "daily", "0.5"), now_ms=_NOW,
+    )
+    insufficient = admission.assess_candidate_quota(
+        executor="agy", model_id="model", independence_domain="agy", profile_key=_PROFILE_A,
+        bindings=(binding,), descriptors=(descriptor,), unit_catalog=(),
+        shadow=_shadow_with(descriptor, "daily", "0.005"), now_ms=_NOW,
+    )
+    assert admission.DISPATCH_UNIT_DEMAND_VERSION == "dispatch-unit:v2"
+    assert sufficient[1] == insufficient[1] == admission.DISPATCH_UNIT_DEMAND_VERSION
+    assert sufficient[0].pools[0].demand == "0.01"
+    assert sufficient[0].pools[0].assessment == "sufficient"
+    assert insufficient[0].pools[0].assessment == "insufficient"
+
+
+def test_codex_percent_demand_keeps_one_percent_threshold() -> None:
+    descriptor = _pool_descriptor(
+        unit_id="codex-percent",
+        semantics_ref="provider:openai-codex-app-server/rate-limit-percent/v2",
+        windows=(("primary", 300_000),),
+    )
+    assessment, version = admission.assess_candidate_quota(
+        executor="codex", model_id="model", independence_domain="codex", profile_key=_PROFILE_A,
+        bindings=(_binding((descriptor,), _PROFILE_A),), descriptors=(descriptor,), unit_catalog=(),
+        shadow=_shadow_with(descriptor, "primary", "50"), now_ms=_NOW,
+    )
+    below_threshold, _ = admission.assess_candidate_quota(
+        executor="codex", model_id="model", independence_domain="codex", profile_key=_PROFILE_A,
+        bindings=(_binding((descriptor,), _PROFILE_A),), descriptors=(descriptor,), unit_catalog=(),
+        shadow=_shadow_with(descriptor, "primary", "0.5"), now_ms=_NOW,
+    )
+    assert assessment.pools[0].demand == "1"
+    assert assessment.pools[0].assessment == "sufficient"
+    assert below_threshold.pools[0].assessment == "insufficient"
+    assert version == admission.DISPATCH_UNIT_DEMAND_VERSION
+
+
+def test_other_unit_semantics_keep_the_native_unit_threshold() -> None:
+    descriptor = _pool_descriptor(
+        unit_id="unmapped-unit", semantics_ref="provider:unknown/quota-unit/v1",
+        windows=(("primary", 300_000),),
+    )
+    assessment, _ = admission.assess_candidate_quota(
+        executor="other", model_id="model", independence_domain="other", profile_key=_PROFILE_A,
+        bindings=(_binding((descriptor,), _PROFILE_A),), descriptors=(descriptor,), unit_catalog=(),
+        shadow=_shadow_with(descriptor, "primary", "50"), now_ms=_NOW,
+    )
+    assert assessment.pools[0].demand == "1"
+    assert assessment.pools[0].assessment == "sufficient"
 
 
 # ---------------------------------------------------------------------------

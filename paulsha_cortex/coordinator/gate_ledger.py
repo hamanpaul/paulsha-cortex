@@ -519,8 +519,10 @@ def snapshot_worktree(source: str | Path, destination: str | Path) -> Path:
     遞迴。不跟隨之後，副本裡的 symlink 仍然是 symlink，解析它們是 gate 命令自己的
     事，而 gate 的 unit 已經把可寫面收斂到自己那兩個目錄。
 
-    目的地**先整個移除再重建**：留下上一輪的殘留等於讓前一次 gate 的產物（甚至前一
-    次被攻陷的 gate 留下的東西）參與這一次的判定。與 `spool_slot.create_slot(
+    目的地**先清空再重建**：留下上一輪的殘留等於讓前一次 gate 的產物（甚至前一
+    次被攻陷的 gate 留下的東西）參與這一次的判定。目的地已存在時（模板 unit 以
+    `StateDirectory=` 預建、bind mount 成可寫的那一格，#716）只清空內容、不移除
+    目錄本身。與 `spool_slot.create_slot(
     reset=True)` 同一條理由——重建比「就地清理」少一個要窮舉的清單。
 
     `SNAPSHOT_REGENERABLE_CACHE_DIRS` **依名跳過、任意深度**（#736）：builder 在
@@ -542,7 +544,14 @@ def snapshot_worktree(source: str | Path, destination: str | Path) -> Path:
         if dst.is_symlink() or dst.is_file():
             dst.unlink()
         elif dst.is_dir():
-            shutil.rmtree(dst)
+            # #716：模板 unit 以 `StateDirectory=` 預建這一格並把它 bind mount 成可寫，
+            # 目錄本身是掛載點、移除不掉（EBUSY）。因此只清空內容、保留目錄——
+            # 「不讓上一輪殘留參與判定」的語意不變。
+            for child in dst.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(
             src,
@@ -550,6 +559,7 @@ def snapshot_worktree(source: str | Path, destination: str | Path) -> Path:
             symlinks=True,
             ignore_dangling_symlinks=True,
             ignore=_snapshot_ignore_caches,
+            dirs_exist_ok=True,
         )
     except OSError as exc:
         raise SnapshotError(f"gate snapshot failed: {src} -> {dst}: {exc}") from exc

@@ -14,6 +14,9 @@
 - **#716 canary 結案診斷**：派工結案驗證失敗時列出不成立的條件（phase／status／gate／needs_human 代碼／缺少 phase／未過步驟），不輸出自由文字（#716）。
 - **#716 Codex 憑證目錄 owner**：scaffold 先以 Manager 身分建立 `codex-credentials/<principal>/`（0700）再寫入 `auth.json`，Manager 收回 refresh 過的憑證不再 EACCES（#716）。
 - **#716 codex code-mode host**：codex 改以 npm 平台套件的整個 `bin/` 目錄做 tree 安裝，`codex-code-mode-host` 與本體同目錄；installer 對原生進入點的 tree 產生直接 exec 的 wrapper（#716）。
+- **#716 gate job 226/NAMESPACE**：gate 模板 unit 以 `StateDirectory=` 由 systemd 預建 `<gate-worktree>/%i`，gate 快照改為就地清空再複製（#716）。
+- **#716 canary job 診斷改以 journal glob 查詢**：結束的模板 instance 不在 unit 清單上，改以 `journalctl -u <glob>` 查三類 job unit，每段各自截尾（#716）。
+- **#716 canary job 診斷**：派工失敗或逾時時，driver 印出最近 job unit 的 journal 與 gate.log 有界尾端（遮蔽 credential 形狀）（#716）。
 - **#716 executor 退避 lock 位置**：lock 改放 coordinator root 內，三 UID 安裝的 Manager 不再因祖先目錄不可寫而讀不到退避 store、卡在 `executor-backoff-unknown`（#716）。
 - **#841 測試隔離**：PID 重用檢查的 procfs 根目錄可替換，測試預設不讀宿主 `/proc`，修正 CI 上以假 MainPID 撞到真程序的不穩定失敗。
 - **#1189 root-owned job HOME**：job_runner 接受 installer 建立的 root:root 0755 job HOME，三 UID 主機的降權 job 不再在 launch 前失敗；group／other 可寫的 HOME 拒絕（#1189）。
@@ -97,6 +100,9 @@
 
 ### Fixed
 
+- **#1197 quota 候選觀測狀態**：准入 receipt 依候選綁定的 pool/window 判定觀測狀態，避免未觀測的其他額度池把已知候選投影成 unknown。
+- **#1196 quota dispatch demand 的比例單位門檻**：agy 的 0–1 比例單位改以 0.01（1%）為門檻，其餘單位維持 1 個原生單位；receipt demand 版本升為 `dispatch-unit:v2`。
+- **#1202 quota wait 手動恢復建議**：帶 retry-eligible `quota-admission-insufficient` receipt 的 run 在 claim、status 與 Monitor 投影 `resume`，提示與正式入口一致；額度仍不足時保留原 wait receipt，`quota-config-invalid` 不提供此動作。
 - **#1184 ship needs_human 復原建議**：Copilot ship 停止回應只列出正式入口可受理的動作；帶 PR 或已進 ship 的 run 不再收到會被拒絕的 `abandon`，`review-attest` 與該動作共用前置判準，皆不成立時改建議重跑 ship，提示與首個動作一致；`_phase_recovery_actions` 也不再對非 exact-HEAD review 的 run 投影 `review-attest`。
 - **#1161 巢狀受管目錄的 rollback unknown state**：`list_unknown_state` 只把目前 inventory 範圍內的更深層 managed directory 當作委派邊界；巢狀目錄中的事後新增 durable state 會列入 `retained_unknown`，使 rollback 正確回報 `rollback-blocked`。非巢狀 inventory 的判定維持不變。
 - **#1099 quota window snapshot refinement**：同值、同時間的 snapshot 補上先前缺失的 window epoch 時，file ledger 與 memory ledger 會追加 refinement observation；shadow 投影在同時間快照間優先採用 epoch 已知者。值不同仍是 conflict，較不完整或完全相同的重送仍是 duplicate；refinement 後的 conflict receipt 以最近接受 observation 的 payload digest 作為 `existing_sha256`；不新增 ledger event kind 或 schema version。

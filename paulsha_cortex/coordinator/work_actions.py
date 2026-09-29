@@ -4902,7 +4902,9 @@ def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
     )
 
 
-def _phase_recovery_actions(run, workflow_registry, authority=None) -> tuple[str, ...]:
+def _phase_recovery_actions(
+    run, workflow_registry, authority=None, *, quota_decision_store=None,
+) -> tuple[str, ...]:
     """計算 needs_human run 中與 job／owner-slice admission 一致的 recovery 動作。
 
     #546 將此結果帶入 `ClaimCandidate`，並供 claim、status、Monitor work list 共用；
@@ -4944,6 +4946,17 @@ def _phase_recovery_actions(run, workflow_registry, authority=None) -> tuple[str
         return ()
 
     actions: list[str] = []
+    if reason_code == "quota-admission-insufficient":
+        try:
+            from . import manager as workflow_manager, quota_admission
+
+            decision_store = quota_decision_store or quota_admission.AdmissionDecisionStore()
+            if workflow_manager._quota_wait_retry_receipt_is_eligible(
+                run=run, store=decision_store,
+            ):
+                actions.append("resume")
+        except Exception:  # noqa: BLE001 - unreadable durable receipt fails closed
+            pass
     if run.current_phase in RETRY_CARD_PHASE_PERSONA:
         jobs_readable = False
         try:

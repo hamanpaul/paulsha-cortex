@@ -3597,3 +3597,68 @@ def test_dispatch_closeout_failure_names_the_unmet_conditions(
     ):
         assert fragment in message
     assert "x" * 50 not in message
+
+
+def test_dispatch_failure_prints_bounded_scrubbed_job_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#716：派工失敗時把 job unit journal 與 gate.log 尾端印出，遮蔽 credential 形狀。
+
+    journal 以 unit glob 查，不先列 unit：結束的模板 instance 已從 unit 清單卸載
+    （run 36634548058 的 list-units 是空的），journal 仍有紀錄。
+    """
+    driver = _load_driver()
+    root = tmp_path / "coordinator"
+    log_dir = root / "gate-ledger-spool" / "gate-logs" / "wf-demo"
+    log_dir.mkdir(parents=True)
+    (log_dir / "gate.log").write_text(
+        "".join(f"gate line {index}\n" for index in range(100))
+        + "token ghp_" + "a" * 30 + "\n",
+        encoding="utf-8",
+    )
+    queried: list[tuple[str, ...]] = []
+
+    def fake_run(argv, **_kwargs):
+        queried.append(tuple(argv))
+        assert argv[0] == "/usr/bin/journalctl"
+        pattern = argv[argv.index("-u") + 1]
+        body = "".join(f"{pattern} journal {index}\n" for index in range(100))
+        return _result(
+            driver, argv, stdout=body + "Authorization: Bearer " + "b" * 40 + "\n"
+        )
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    driver._report_job_unit_diagnostics({"PSC_COORDINATOR_ROOT": str(root)})
+    err = capsys.readouterr().err
+
+    assert err.startswith("dispatch job diagnostics:\n")
+    assert [argv[argv.index("-u") + 1] for argv in queried] == list(
+        driver._JOB_DIAGNOSTIC_UNIT_GLOBS
+    )
+    assert "cortex-gate-job@*" in driver._JOB_DIAGNOSTIC_UNIT_GLOBS
+    # 每個 glob 只取尾端若干行。
+    assert "cortex-gate-job@* journal 99" in err
+    assert "cortex-gate-job@* journal 0\n" not in err
+    assert "--- gate log wf-demo" in err
+    assert "gate line 99" in err and "gate line 10\n" not in err
+    assert "ghp_" + "a" * 30 not in err
+    assert "b" * 40 not in err
+    assert "<redacted>" in err
+    assert len(err) <= driver._JOB_DIAGNOSTIC_CHARS + 64
+    # 每段各自截尾：前面的 journal 再長也擠不掉最後的 gate.log。
+    for pattern in driver._JOB_DIAGNOSTIC_UNIT_GLOBS:
+        section = err.split(f"--- journal {pattern}\n", 1)[1].split("\n--- ", 1)[0]
+        assert len(section) <= driver._JOB_DIAGNOSTIC_SECTION_CHARS
+
+
+def test_job_diagnostics_never_mask_the_dispatch_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    driver = _load_driver()
+
+    def broken(_env):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(driver, "_job_unit_diagnostics", broken)
+    driver._report_job_unit_diagnostics({})
+    assert "job diagnostics unavailable: RuntimeError" in capsys.readouterr().err

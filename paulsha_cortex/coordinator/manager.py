@@ -1661,7 +1661,9 @@ def workflow_status_entry(
             main_sync_retry_build_next_step_hint,
         )
 
-        recovery_actions = _phase_recovery_actions(run, registry)
+        recovery_actions = _phase_recovery_actions(
+            run, registry, quota_decision_store=quota_decision_store,
+        )
         next_actions = needs_human_next_actions(
             phase=getattr(run, "current_phase", None),
             planning_failure_classification=hint_classification,
@@ -1669,7 +1671,7 @@ def workflow_status_entry(
             pre_delivery=pre_delivery,
         )
         if persisted_next_step_hint is None and (
-            "retire-delivered" in next_actions or not pre_delivery
+            "retire-delivered" in next_actions or not pre_delivery or "resume" in next_actions
         ):
             # #1141／#1170：已交付或已越過 pre-delivery 閘門的 run 不得再指向
             # 必被拒的 abandon；hint 與 next_actions 同源導出。
@@ -12533,6 +12535,13 @@ def quota_wait_retry_is_eligible(*, run, quota_admission_context) -> bool:
 
     if isinstance(quota_admission_context, quota_admission.QuotaConfigInvalid):
         return False
+    return _quota_wait_retry_receipt_is_eligible(
+        run=run, store=quota_admission_context.store,
+    )
+
+
+def _quota_wait_retry_receipt_is_eligible(*, run, store) -> bool:
+    """Validate the durable receipt shared by periodic retry and operator hints."""
     reason = getattr(run, "needs_human_reason", None)
     step = _current_workflow_step(run)
     if not isinstance(reason, Mapping) or step is None:
@@ -12544,7 +12553,7 @@ def quota_wait_retry_is_eligible(*, run, quota_admission_context) -> bool:
     if not isinstance(decision_id, str) or not decision_id:
         return False
     try:
-        decision = quota_admission_context.store.get(decision_id)
+        decision = store.get(decision_id)
     except Exception:
         return False
     return bool(
