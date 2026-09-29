@@ -115,10 +115,13 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                     "work-action intake 若帶 issue/kind+ref，必須恰好擇一（或兩者皆不帶）"
                 )
         if action in {
-            "retry-build", "retry-verify", "retry-review", "recover-repair-commit",
+            "retry-build", "retry-verify", "retry-review", "recover-repair-commit", "supersede-attempt",
         } and (
             not isinstance(args.get("expected_candidate"), str)
-            or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
+            or (
+                args["expected_candidate"] != "none"
+                and re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
+            )
         ):
             raise ValueError(f"work-action {action} requires exact expected_candidate")
         if action == "rechain":
@@ -168,6 +171,25 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                         raise ValueError(
                             f"work-action rechain requires {persona}_{suffix}"
                         )
+        if action == "supersede-attempt":
+            for field, pattern in (
+                ("expected_run_id", r"workflow-[0-9a-f]{20}"),
+                ("expected_era", r"claim:v1:[0-9a-f]{64}"),
+                ("card", r"[a-z0-9][a-z0-9-]{0,63}"),
+            ):
+                value = args.get(field)
+                if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+                    raise ValueError(f"work-action supersede-attempt requires exact {field}")
+            job_id = args.get("expected_job_id")
+            if not isinstance(job_id, str) or not job_id.strip() or job_id != job_id.strip():
+                raise ValueError("work-action supersede-attempt requires exact expected_job_id")
+            for field, maximum in (("actor", 128), ("reason", 500)):
+                value = args.get(field)
+                if (
+                    not isinstance(value, str) or value != value.strip()
+                    or not 1 <= len(value) <= maximum or not value.isprintable()
+                ):
+                    raise ValueError(f"work-action supersede-attempt requires bounded {field}")
         if action in {"start", "intake"} and "combo" in args:
             combo = args.get("combo")
             if (

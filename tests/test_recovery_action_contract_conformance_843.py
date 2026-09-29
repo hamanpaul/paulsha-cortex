@@ -45,7 +45,7 @@ def _choice_set(parser: argparse.ArgumentParser, command: str) -> set[str]:
 
 def _work_fields(action: str) -> dict[str, object]:
     fields: dict[str, object] = {}
-    if action in {"retry-build", "retry-verify", "retry-review", "recover-repair-commit"}:
+    if action in {"retry-build", "retry-verify", "retry-review", "recover-repair-commit", "supersede-attempt"}:
         fields["expected_candidate"] = CANDIDATE
     if action in {"retry-card", "regenerate-gates", "recover-repair-commit"}:
         fields["expected_run_id"] = RUN_ID
@@ -76,6 +76,16 @@ def _work_fields(action: str) -> dict[str, object]:
             builder_model="builder-model",
             reviewer_executor="codex",
             reviewer_model="reviewer-model",
+        )
+    if action == "supersede-attempt":
+        fields.update(
+            expected_run_id=RUN_ID,
+            expected_candidate=CANDIDATE,
+            expected_era="claim:v1:" + "c" * 64,
+            expected_job_id="demo-1",
+            card="implement",
+            actor="operator",
+            reason="recovery audit",
         )
     return fields
 
@@ -109,7 +119,7 @@ def _action_values(cell: str) -> set[str]:
 
 def test_r01_registry_and_versioned_document_cover_each_other() -> None:
     assert recovery_contracts.RECOVERY_ACTION_CONTRACT_VERSION == "recovery-action-contract/v1"
-    assert len(recovery_contracts.RECOVERY_ACTION_FAMILIES) == 14
+    assert len(recovery_contracts.RECOVERY_ACTION_FAMILIES) == 15
     matrix = MATRIX_PATH.read_text(encoding="utf-8")
     rows = _matrix_rows(matrix)
     assert set(rows) == set(recovery_contracts.RECOVERY_ACTION_FAMILIES)
@@ -214,6 +224,7 @@ def test_public_recover_work_alias_preserves_action_and_cas_fields(action: str) 
         "expected_run_id": "--expected-run-id",
         "expected_candidate": "--expected-candidate",
         "expected_era": "--expected-era",
+        "expected_job_id": "--expected-job-id",
         "failure_classification": "--failure-classification",
         "failure_reason": "--failure-reason",
         "card": "--card",
@@ -255,6 +266,7 @@ def test_recover_work_formal_cli_submits_the_same_registered_action(
         "expected_run_id": "--expected-run-id",
         "expected_candidate": "--expected-candidate",
         "expected_era": "--expected-era",
+        "expected_job_id": "--expected-job-id",
         "failure_classification": "--failure-classification",
         "failure_reason": "--failure-reason",
         "card": "--card",
@@ -350,6 +362,7 @@ def test_coordinator_work_cli_submits_the_registered_action_unchanged(
         "expected_run_id": "--expected-run-id",
         "expected_candidate": "--expected-candidate",
         "expected_era": "--expected-era",
+        "expected_job_id": "--expected-job-id",
         "failure_classification": "--failure-classification",
         "failure_reason": "--failure-reason",
         "card": "--card",
