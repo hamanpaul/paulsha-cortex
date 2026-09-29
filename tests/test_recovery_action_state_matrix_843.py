@@ -53,6 +53,7 @@ import test_reclaim_budget_reset_519 as reclaim_fixture
 import test_recover_superseded_776 as superseded_fixture
 import test_pre_candidate_recovery as pre_candidate_repo_fixture
 import test_recovery_action_exposure_546 as pre_candidate_fixture
+import test_recovery_action_rechain_1173 as rechain_fixture
 import test_repair_commit_recovery as repair_fixture
 import test_review_gate_adjudication_exit as review_fixture
 import test_work_actions as work_fixture
@@ -735,6 +736,23 @@ def _refreeze_base_scenario(root: Path) -> Scenario:
     )
 
 
+def _rechain_scenario(root: Path) -> Scenario:
+    registry, run = rechain_fixture._registry(root)
+    authority = rechain_fixture._authority()
+    authority.github_provider_revision = None
+    return Scenario(
+        action="rechain",
+        root=root,
+        registry=registry,
+        state_path=root / "state.json",
+        args=rechain_fixture._action_args(run),
+        repo=rechain_fixture.REPO,
+        work_id=rechain_fixture.WORK_ID,
+        run_id=run.run_id,
+        authority=authority,
+    )
+
+
 SCENARIOS: dict[str, Callable[[Path], Scenario]] = {
     "resume": _resume_scenario,
     "retry-build": _retry_build_scenario,
@@ -750,6 +768,7 @@ SCENARIOS: dict[str, Callable[[Path], Scenario]] = {
     "recover-superseded": _recover_superseded_scenario,
     "reset-reclaim-budget": _reset_reclaim_budget_scenario,
     "refreeze-base": _refreeze_base_scenario,
+    "rechain": _rechain_scenario,
 }
 
 
@@ -915,6 +934,22 @@ def _expect_refreeze_base(sc, result, fresh, attention) -> None:
     assert sc.run_id in attention
 
 
+def _expect_rechain(sc, result, fresh, attention) -> None:
+    run = fresh.get_workflow_run(sc.run_id)
+    assert result["result"]["action"] == "rechain"
+    assert run.model_chain_override == {
+        "planner": {"executor": "claude", "model_id": "sonnet"},
+        "builder": {"executor": "claude", "model_id": "sonnet"},
+        "reviewer": {"executor": "agy", "model_id": "gemini-3.1-pro-high"},
+    }
+    assert run.resolved_model_chain is None
+    assert "needs_human" not in run.facets
+    assert run.evidence_refs[-1] == result["result"]["evidence"]["ref"]
+    assert len(fresh.list_jobs()) == 0
+    assert len(rechain_fixture._audit_files(sc.root)) == 1
+    assert sc.run_id not in attention
+
+
 POSITIVE_EXPECTATIONS: dict[str, Callable[..., None]] = {
     "resume": _expect_resume,
     "retry-build": _expect_retry_build,
@@ -930,6 +965,7 @@ POSITIVE_EXPECTATIONS: dict[str, Callable[..., None]] = {
     "recover-superseded": _expect_recover_superseded,
     "reset-reclaim-budget": _expect_reset_reclaim_budget,
     "refreeze-base": _expect_refreeze_base,
+    "rechain": _expect_rechain,
 }
 
 
@@ -1192,6 +1228,14 @@ NEGATIVE_MATRIX: dict[str, dict[str, Any]] = {
         "stale-exact-run": _stale_run_probe,
         "wrong-state": _refreeze_with_candidate,
     },
+    "rechain": {
+        "wrong-phase": _phase_probe("define"),
+        "wrong-card": (N_A, "rechain 以精確 run／candidate／era CAS 定位，沒有 card selector"),
+        "active-job": _active_job_probe(),
+        "missing-actor-reason": _drop_probe("actor", "reason"),
+        "stale-exact-run": _stale_run_probe,
+        "wrong-state": _facets_probe(),
+    },
 }
 
 
@@ -1373,6 +1417,7 @@ DRIFT_MATRIX: dict[str, Callable[[Scenario, JobRegistry], None]] = {
     "recover-superseded": _drift_new_generation,
     "reset-reclaim-budget": _drift_new_superseded_generation,
     "refreeze-base": _drift_new_generation,
+    "rechain": _drift_candidate,
 }
 
 #: action 在第一次 registry 持久化之前就依 #275 順序先落地的 content-addressed
@@ -1390,6 +1435,7 @@ PREPARE_RECORD_DIRS: dict[str, tuple[str, ...]] = {
     "recover-repair-commit": ("evidence/work-repair-adoption",),
     "reset-reclaim-budget": ("evidence/work-reclaim-reset",),
     "refreeze-base": ("evidence/work-candidate-base-refreeze",),
+    "rechain": ("evidence/work-model-chain-readjudication",),
 }
 
 
