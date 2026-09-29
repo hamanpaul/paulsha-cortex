@@ -20,11 +20,10 @@
 - 不重排候選、不重建候選分層排序、不重驗 pin/independence/qualification/
   role——那些是既有 manager 派工路徑的責任。本模組收到的每一個候選都已經
   是「除了額度以外都核可」的候選。
-- 不做 #837 operational usage forecast。:func:`estimate_demand` 目前只有
-  明確標示版本的 fixture（:data:`DEMAND_FIXTURE_VERSION`），或呼叫端注入的
-  estimator＋其自帶版本字串；本模組的正確性不依賴 demand 數字是否真實反映
-  任務成本，只依賴 demand 有一個誰都能追的版本化來源，且這個版本字串會
-  逐字寫入 decision receipt（見 :class:`AdmissionDecision`）。
+- 不做 #837 operational usage forecast（owner 裁決為 not planned）。
+  :func:`estimate_demand` 使用版本化的一個原生計量單位門檻；實際 Cortex job
+  耗用由 #836 terminal-usage ledger 記錄，並在 ``QuotaShadowService.project()``
+  裡從 measured remaining 扣除。決策 receipt 分別保留 demand policy 與觀測版本。
 - 不啟動任何 provider CLI／不讀 credential——額度餘量完全來自呼叫端已經
   用 #836 建好的 ``QuotaShadowService`` 投影。
 - 不觸碰 ``quota_reservation.py`` 的狀態機。#838 本身沒有開關（先前的
@@ -66,6 +65,7 @@ from .quota_shadow import QuotaShadowService
 __all__ = [
     "ADMISSION_POLICY_VERSION",
     "DEMAND_FIXTURE_VERSION",
+    "DISPATCH_UNIT_DEMAND_VERSION",
     "AdmissionDecisionCorrupt",
     "PoolAssessment",
     "CandidateAssessment",
@@ -105,9 +105,10 @@ __all__ = [
 #: observation 的來源版本）時才需要 bump。
 ADMISSION_POLICY_VERSION = "quota-admission-policy:v1"
 
-#: #837 forecast 尚未落地前的明確 placeholder：每個候選 pool/window 一律
-#: 記 demand="1"（該 window 自己的計量單位）。任何用到這個常數的 receipt
-#: 都可以憑這個版本字串精確認出「這筆 demand 不是真實用量預測」。
+#: #839 的確定性准入門檻：每個候選 pool/window 保留一個原生計量單位；實際
+#: Cortex job usage 由 #836 terminal-usage ledger 量測並從觀測 remaining 扣除。
+DISPATCH_UNIT_DEMAND_VERSION = "dispatch-unit:v1"
+#: 舊 receipt 的版本字串保留供讀取端辨認；新決策不再寫 forecast fixture。
 DEMAND_FIXTURE_VERSION = "demand-fixture:v1"
 
 _ENV_ENFORCE_FLAG = "PSC_QUOTA_ADMISSION_ENFORCE"
@@ -499,12 +500,12 @@ def unbound_profile_keys_report(
 
 
 # ---------------------------------------------------------------------------
-# demand estimation（#837 落地前的明確版本化 placeholder）
+# dispatch demand contract
 # ---------------------------------------------------------------------------
 
 
-def _fixture_demand_estimator(pool_ref: Mapping[str, str], window_id: str) -> str:
-    del pool_ref, window_id  # fixture 不看 pool 是誰，一律回報同一個保守值
+def _dispatch_unit_demand(pool_ref: Mapping[str, str], window_id: str) -> str:
+    del pool_ref, window_id  # 每次准入保留一個原生計量單位；不推算 token／時間用量
     return "1"
 
 
@@ -516,14 +517,14 @@ def estimate_demand(
 ) -> tuple[dict[tuple[tuple[str, str, str, str], str], str], str]:
     """回傳 ``(demand_by_window, demand_version)``。
 
-    ``estimator`` 缺席時使用 :data:`DEMAND_FIXTURE_VERSION` 標示的固定
-    fixture；呼叫端提供自己的 estimator 時**必須**同時提供 ``demand_version``
-    ——不允許一個沒有版本字串的『真』預測值躺進 decision receipt，那樣事後
-    沒有人能分辨這筆 demand 是不是 #837 落地後的真實預測。
+    ``estimator`` 缺席時使用 :data:`DISPATCH_UNIT_DEMAND_VERSION`：每個受管
+    pool/window 以一個原生計量單位做准入門檻，不代表使用量預測。候選可用量
+    先經 #836 ledger 的已量測終局用量扣減，再與此單位門檻比較。自訂 estimator
+    仍須提供明確版本字串，避免無版本 demand 混入 decision receipt。
     """
     if estimator is None:
-        estimator = _fixture_demand_estimator
-        demand_version = demand_version or DEMAND_FIXTURE_VERSION
+        estimator = _dispatch_unit_demand
+        demand_version = demand_version or DISPATCH_UNIT_DEMAND_VERSION
     elif not demand_version:
         raise ValueError("demand_version is required when a custom estimator is supplied")
     demand_by_window: dict[tuple[tuple[str, str, str, str], str], str] = {}
@@ -546,6 +547,7 @@ class PoolAssessment:
     demand: str
     assessment: str  # sufficient | insufficient | unknown
     coverage_gaps: tuple[str, ...]
+    reset_at_ms: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -555,6 +557,7 @@ class PoolAssessment:
             "demand": self.demand,
             "assessment": self.assessment,
             "coverage_gaps": list(self.coverage_gaps),
+            "reset_at_ms": self.reset_at_ms,
         }
 
 
@@ -664,6 +667,7 @@ def assess_candidate_quota(
                     remaining={"state": "unknown", "reason": "pool-not-described"},
                     demand=demand_amount, assessment="unknown",
                     coverage_gaps=("pool-not-described",),
+                    reset_at_ms=None,
                 )
             )
             all_gaps.add("pool-not-described")
@@ -676,6 +680,7 @@ def assess_candidate_quota(
                 pool_ref=pool_ref, window_id=window_id, remaining=row["remaining"],
                 demand=demand_amount, assessment=row_assessment,
                 coverage_gaps=tuple(row["coverage_gaps"]),
+                reset_at_ms=row.get("reset_at_ms"),
             )
         )
         all_gaps.update(row["coverage_gaps"])
@@ -1010,6 +1015,10 @@ class AdmissionDecision:
     #: （unmanaged）。比照 #840 三個選填欄位的既有加法模式：缺席（#1116
     #: 之前寫的舊 row）投影面視為 unknown，不臆測；不需要 schema bump。
     selected_binding_kind: str | None = None
+    #: Durable automatic retry contract for quota waits. A reset is evidence only;
+    #: retry is permitted only after a fresh observation makes a candidate feasible.
+    retry_eligible: bool | None = None
+    reset_at_ms: int | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in ("shadow", "enforced"):
@@ -1032,6 +1041,12 @@ class AdmissionDecision:
             "exact", "identity", "none",
         ):
             raise ValueError("invalid admission decision selected_binding_kind")
+        if self.retry_eligible is not None and not isinstance(self.retry_eligible, bool):
+            raise ValueError("retry_eligible must be a bool or None")
+        if self.reset_at_ms is not None and (type(self.reset_at_ms) is not int or self.reset_at_ms < 0):
+            raise ValueError("reset_at_ms must be a non-negative int or None")
+        if self.outcome != "wait" and (self.retry_eligible is not None or self.reset_at_ms is not None):
+            raise ValueError("retry metadata is only valid for wait decisions")
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -1064,6 +1079,8 @@ class AdmissionDecision:
             "selected_feasible": self.selected_feasible,
             "policy_config_revision": self.policy_config_revision,
             "selected_binding_kind": self.selected_binding_kind,
+            "retry_eligible": self.retry_eligible,
+            "reset_at_ms": self.reset_at_ms,
         }
 
     @classmethod
@@ -1081,6 +1098,8 @@ class AdmissionDecision:
             selected_feasible=row.get("selected_feasible"),
             policy_config_revision=row.get("policy_config_revision"),
             selected_binding_kind=row.get("selected_binding_kind"),
+            retry_eligible=row.get("retry_eligible"),
+            reset_at_ms=row.get("reset_at_ms"),
         )
 
 
@@ -1100,6 +1119,7 @@ _DECISION_OPTIONAL_KEYS = frozenset(
     {
         "selected_observation_state", "selected_feasible", "policy_config_revision",
         "selected_binding_kind",
+        "retry_eligible", "reset_at_ms",
     }
 )
 _DECISION_ALL_KEYS = _DECISION_REQUIRED_KEYS | _DECISION_OPTIONAL_KEYS
@@ -1303,6 +1323,16 @@ class AdmissionDecisionStore:
                     "policy_config_revision" in row
                     and row["policy_config_revision"] is not None
                     and not isinstance(row["policy_config_revision"], str)
+                )
+                or (
+                    "retry_eligible" in row
+                    and row["retry_eligible"] is not None
+                    and not isinstance(row["retry_eligible"], bool)
+                )
+                or (
+                    "reset_at_ms" in row
+                    and row["reset_at_ms"] is not None
+                    and (type(row["reset_at_ms"]) is not int or row["reset_at_ms"] < 0)
                 )
             ):
                 raise AdmissionDecisionCorrupt("admission-decision-store-invalid-record")

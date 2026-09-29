@@ -109,7 +109,11 @@ def _decision(
     policy_config_revision: str | None = "pools-config:v1",
     generated_at_ms: int = _NOW,
     reservation_id: str | None = None,
-    demand_version: str = admission.DEMAND_FIXTURE_VERSION,
+    demand_version: str = admission.DISPATCH_UNIT_DEMAND_VERSION,
+    qualification_version: str = "not-enforced",
+    retry_eligible: bool | None = None,
+    reset_at_ms: int | None = None,
+    reason: str | None = None,
 ) -> admission.AdmissionDecision:
     return admission.AdmissionDecision(
         decision_id=decision_id,
@@ -122,14 +126,19 @@ def _decision(
         policy_version=admission.ADMISSION_POLICY_VERSION,
         observation_version="shadow-projection:" + "b" * 16,
         demand_version=demand_version,
-        qualification_version="not-enforced",
+        qualification_version=qualification_version,
         generated_at_ms=generated_at_ms,
-        selected=selected if selected is not None else {"executor": "codex", "model_id": "gpt-5.3-codex"},
+        selected=(selected if selected is not None else (
+            None if outcome == "wait" else {"executor": "codex", "model_id": "gpt-5.3-codex"}
+        )),
         reservation_id=reservation_id,
         excluded=excluded,
         selected_observation_state=selected_observation_state,
         selected_feasible=selected_feasible,
         policy_config_revision=policy_config_revision,
+        retry_eligible=retry_eligible,
+        reset_at_ms=reset_at_ms,
+        reason=reason,
     )
 
 
@@ -308,6 +317,35 @@ def test_wait_without_job_is_not_presented_as_admitted(tmp_path: Path) -> None:
     assert '"job_id"' not in rendered
 
 
+def test_wait_projection_includes_retry_eligibility_and_reset(tmp_path: Path) -> None:
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "1" * 64,
+        outcome="wait",
+        selected=None,
+        retry_eligible=True,
+        reset_at_ms=_NOW + 60_000,
+        reason="quota-admission-insufficient",
+    )
+    store.record(decision)
+    reason = diagnostic_reason(
+        "quota-admission-insufficient", "quota wait",
+        source="manager._dispatch_workflow_card:quota-admission",
+        run_id=decision.run_id, card=decision.card_id,
+    ).to_dict()
+    projection = dp.project_workflow_quota_admission(
+        run_id=decision.run_id,
+        quota_admission=_quota_admission_pointer(decision),
+        needs_human_reason=reason,
+        current_identity_by_persona={"builder": {"card": decision.card_id}},
+        jobs=[], store=store, now_ms=_NOW,
+    )
+
+    wait = projection["wait"]
+    assert wait["retry_eligible"] is True
+    assert wait["reset_at_ms"] == _NOW + 60_000
+
+
 def test_unknown_remaining_selected_candidate_is_not_confirmed(tmp_path: Path) -> None:
     """shadow 模式下即使候選 unknown remaining 一樣會被 admit——投影必須忠實
     標成 unknown，不得呈現成『現在可派』的 confirmed。"""
@@ -327,6 +365,23 @@ def test_unknown_remaining_selected_candidate_is_not_confirmed(tmp_path: Path) -
     persona = projection["personas"]["builder"]
     assert persona["classification"]["observation"] == "unknown"
     assert persona["selected_feasible"] is False
+
+
+def test_missing_qualification_provenance_projects_as_unknown(tmp_path: Path) -> None:
+    store = admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl")
+    decision = _decision(
+        decision_id="adm:v1:" + "9" * 64,
+        qualification_version=None,
+    )
+    store.record(decision)
+    projection = dp.project_workflow_quota_admission(
+        run_id=decision.run_id,
+        quota_admission=_quota_admission_pointer(decision),
+        needs_human_reason=None,
+        store=store, now_ms=_NOW,
+    )
+
+    assert projection["personas"]["builder"]["classification"]["qualification"] == "unknown"
 
 
 def test_expired_observation_gap_marks_observation_unknown(tmp_path: Path) -> None:
