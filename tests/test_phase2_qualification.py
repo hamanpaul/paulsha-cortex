@@ -201,6 +201,8 @@ def test_release_installed_checks_require_owner_bound_reclaim(
         receipt={"receipt_id": "rc-test"},
         evidence_dir=evidence,
         profile="release",
+        # system-scope status 另由 test_qualification_driver_service_status 覆蓋。
+        require_system_status=False,
     )
     assert {row["name"] for row in checks} >= {
         "owner-bound-reclaim",

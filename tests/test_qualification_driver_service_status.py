@@ -77,6 +77,8 @@ def test_installed_checks_fail_closed_on_system_runtime_mismatch(
 
     monkeypatch.setattr(driver, "_run", run)
     monkeypatch.setattr(driver, "_installed_runtime_env", dict)
+    # 本檔只驗 system-scope status；#1167 的 root-only reclaim check 另有測試。
+    monkeypatch.setattr(driver, "_installed_owner_bound_reclaim", lambda _evidence_dir: None)
     monkeypatch.setattr(driver, "SYSTEM_STATUS_SETTLE_SECONDS", 0)
 
     expected = (
@@ -118,6 +120,8 @@ def test_installed_checks_capture_matching_system_runtime_status(
 
     monkeypatch.setattr(driver, "_run", run)
     monkeypatch.setattr(driver, "_installed_runtime_env", dict)
+    # 本檔只驗 system-scope status；#1167 的 root-only reclaim check 另有測試。
+    monkeypatch.setattr(driver, "_installed_owner_bound_reclaim", lambda _evidence_dir: None)
 
     checks = driver._installed_checks(
         install_evidence=install_evidence,
@@ -166,6 +170,8 @@ def test_installed_checks_wait_for_the_loaded_receipt_after_activation(
 
     monkeypatch.setattr(driver, "_run", run)
     monkeypatch.setattr(driver, "_installed_runtime_env", dict)
+    # 本檔只驗 system-scope status；#1167 的 root-only reclaim check 另有測試。
+    monkeypatch.setattr(driver, "_installed_owner_bound_reclaim", lambda _evidence_dir: None)
     monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
 
     tests = driver._installed_checks(
@@ -204,6 +210,8 @@ def test_installed_checks_pass_the_effective_install_receipt_to_system_status(
 
     monkeypatch.setattr(driver, "_run", run)
     monkeypatch.setattr(driver, "_installed_runtime_env", dict)
+    # 本檔只驗 system-scope status；#1167 的 root-only reclaim check 另有測試。
+    monkeypatch.setattr(driver, "_installed_owner_bound_reclaim", lambda _evidence_dir: None)
     receipt_path = Path("/run/cortex-install/install-receipt.json")
 
     driver._installed_checks(
