@@ -21,9 +21,11 @@
   role——那些是既有 manager 派工路徑的責任。本模組收到的每一個候選都已經
   是「除了額度以外都核可」的候選。
 - 不做 #837 operational usage forecast（owner 裁決為 not planned）。
-  :func:`estimate_demand` 使用版本化的一個原生計量單位門檻；實際 Cortex job
-  耗用由 #836 terminal-usage ledger 記錄，並在 ``QuotaShadowService.project()``
-  裡從 measured remaining 扣除。決策 receipt 分別保留 demand policy 與觀測版本。
+  :func:`estimate_demand` 使用版本化門檻（一個原生計量單位；0–1 比例單位
+  換算為 0.01）；實際 Cortex job
+  耗用由 #836 terminal-usage ledger 記錄，並在
+  ``QuotaShadowService.project()`` 裡從 measured remaining 扣除。決策 receipt
+  分別保留 demand policy 與觀測版本。
 - 不啟動任何 provider CLI／不讀 credential——額度餘量完全來自呼叫端已經
   用 #836 建好的 ``QuotaShadowService`` 投影。
 - 不觸碰 ``quota_reservation.py`` 的狀態機。#838 本身沒有開關（先前的
@@ -54,6 +56,7 @@ import threading
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import quota_observation as schema
+from . import quota_sources
 from .quota_reservation import (
     PoolDemand,
     QuotaReservationAuthority,
@@ -105,9 +108,10 @@ __all__ = [
 #: observation 的來源版本）時才需要 bump。
 ADMISSION_POLICY_VERSION = "quota-admission-policy:v1"
 
-#: #839 的確定性准入門檻：每個候選 pool/window 保留一個原生計量單位；實際
-#: Cortex job usage 由 #836 terminal-usage ledger 量測並從觀測 remaining 扣除。
-DISPATCH_UNIT_DEMAND_VERSION = "dispatch-unit:v1"
+#: #839／#1196 的確定性准入門檻：每個候選 pool/window 保留一個原生計量單位，
+#: 以 0–1 比例回報的單位（agy）換算為 0.01（1%）。v1 對比例單位要求 1.0（滿額），
+#: 因此 bump 版本讓 receipt 可區分兩種門檻。
+DISPATCH_UNIT_DEMAND_VERSION = "dispatch-unit:v2"
 #: 舊 receipt 的版本字串保留供讀取端辨認；新決策不再寫 forecast fixture。
 DEMAND_FIXTURE_VERSION = "demand-fixture:v1"
 
@@ -504,9 +508,49 @@ def unbound_profile_keys_report(
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_unit_demand(pool_ref: Mapping[str, str], window_id: str) -> str:
-    del pool_ref, window_id  # 每次准入保留一個原生計量單位；不推算 token／時間用量
-    return "1"
+#: #1196：以 0–1 比例回報剩餘額度的 unit semantics，門檻換算成 1%（0.01）。
+#: 其餘單位（百分比、request、token 等 count 類）沿用一個原生單位——codex 的
+#: 百分比單位下這正好也是 1%。
+_FRACTION_DEMAND_BY_SEMANTICS: Mapping[str, str] = {
+    quota_sources.AGY_UNIT_SEMANTICS: "0.01",
+}
+
+
+def _dispatch_unit_demand(
+    pool_ref: Mapping[str, str],
+    window_id: str,
+    *,
+    unit_semantics_by_window: Mapping[tuple[tuple[str, str, str, str], str], str | None],
+) -> str:
+    semantics = unit_semantics_by_window.get((_pool_key(pool_ref), window_id))
+    return _FRACTION_DEMAND_BY_SEMANTICS.get(semantics or "", "1")
+
+
+def _unit_semantics_for_windows(
+    pool_windows: Sequence[tuple[Mapping[str, str], str]],
+    *,
+    descriptors: Sequence[schema.PoolDescriptor],
+    unit_catalog: Sequence[schema.UnitDefinition],
+) -> dict[tuple[tuple[str, str, str, str], str], str | None]:
+    descriptors_by_ref = {descriptor.pool_ref: descriptor for descriptor in descriptors}
+    catalog_by_ref = {unit.ref: unit for unit in unit_catalog}
+    semantics_by_window: dict[tuple[tuple[str, str, str, str], str], str | None] = {}
+    for pool_ref, window_id in pool_windows:
+        key = (_pool_key(pool_ref), window_id)
+        descriptor = descriptors_by_ref.get(key[0])
+        if descriptor is None:
+            semantics_by_window[key] = None
+            continue
+        wire = descriptor.to_dict()
+        window = next((item for item in wire["windows"] if item["window_id"] == window_id), None)
+        if window is None:
+            semantics_by_window[key] = None
+            continue
+        unit_ref = (window["unit_ref"]["unit_id"], window["unit_ref"]["version"])
+        unit = next((item for item in descriptor.units if item.ref == unit_ref), None)
+        unit = unit or catalog_by_ref.get(unit_ref)
+        semantics_by_window[key] = unit.semantics_ref if unit is not None else None
+    return semantics_by_window
 
 
 def estimate_demand(
@@ -514,16 +558,24 @@ def estimate_demand(
     *,
     estimator: Callable[[Mapping[str, str], str], str] | None = None,
     demand_version: str | None = None,
+    descriptors: Sequence[schema.PoolDescriptor] = (),
+    unit_catalog: Sequence[schema.UnitDefinition] = (),
 ) -> tuple[dict[tuple[tuple[str, str, str, str], str], str], str]:
     """回傳 ``(demand_by_window, demand_version)``。
 
     ``estimator`` 缺席時使用 :data:`DISPATCH_UNIT_DEMAND_VERSION`：每個受管
-    pool/window 以一個原生計量單位做准入門檻，不代表使用量預測。候選可用量
-    先經 #836 ledger 的已量測終局用量扣減，再與此單位門檻比較。自訂 estimator
-    仍須提供明確版本字串，避免無版本 demand 混入 decision receipt。
+    pool/window 以一個原生計量單位做准入門檻（0–1 比例單位為 0.01），不代表
+    使用量預測。候選可用量先經 #836 ledger 的已量測終局用量扣減，再與此門檻
+    比較。自訂 estimator 仍須提供明確版本字串，避免無版本 demand 混入 decision
+    receipt。
     """
     if estimator is None:
-        estimator = _dispatch_unit_demand
+        unit_semantics_by_window = _unit_semantics_for_windows(
+            pool_windows, descriptors=descriptors, unit_catalog=unit_catalog,
+        )
+        estimator = lambda pool_ref, window_id: _dispatch_unit_demand(
+            pool_ref, window_id, unit_semantics_by_window=unit_semantics_by_window,
+        )
         demand_version = demand_version or DISPATCH_UNIT_DEMAND_VERSION
     elif not demand_version:
         raise ValueError("demand_version is required when a custom estimator is supplied")
@@ -642,6 +694,7 @@ def assess_candidate_quota(
         )
     demand_by_window, resolved_demand_version = estimate_demand(
         pool_windows, estimator=demand_estimator, demand_version=demand_version,
+        descriptors=descriptors, unit_catalog=unit_catalog,
     )
     projection = shadow.project(
         descriptors=tuple(descriptors),
