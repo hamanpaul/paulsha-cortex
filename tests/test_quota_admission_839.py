@@ -225,6 +225,29 @@ def test_ac2_unknown_remaining_denies_with_precise_reason() -> None:
     assert "missing-snapshot" in assessment.pools[0].coverage_gaps
 
 
+def test_candidate_observation_state_uses_only_its_bound_pool_windows() -> None:
+    observed_pool = _pool_descriptor(account="account-observed", pool="pool-observed", windows=(("short", 300_000),))
+    unobserved_pool = _pool_descriptor(account="account-unobserved", pool="pool-unobserved", windows=(("short", 300_000),))
+    shadow = _shadow_with(observed_pool, "short", "50")
+    descriptors = (observed_pool, unobserved_pool)
+    bindings = (
+        _binding((observed_pool,), _PROFILE_A, binding_id="observed-binding"),
+        _binding((unobserved_pool,), _PROFILE_B, binding_id="unobserved-binding"),
+    )
+
+    observed_candidate, _ = admission.assess_candidate_quota(
+        executor="codex", model_id="gpt-5", independence_domain="codex", profile_key=_PROFILE_A,
+        bindings=bindings, descriptors=descriptors, unit_catalog=(), shadow=shadow, now_ms=_NOW,
+    )
+    unobserved_candidate, _ = admission.assess_candidate_quota(
+        executor="claude", model_id="sonnet", independence_domain="claude", profile_key=_PROFILE_B,
+        bindings=bindings, descriptors=descriptors, unit_catalog=(), shadow=shadow, now_ms=_NOW,
+    )
+
+    assert observed_candidate.observation_state == "known"
+    assert unobserved_candidate.observation_state == "unknown"
+
+
 def test_custom_demand_estimator_requires_explicit_version() -> None:
     descriptor = _pool_descriptor(windows=(("short", 300_000),))
     with pytest.raises(ValueError):
