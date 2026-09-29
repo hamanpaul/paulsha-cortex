@@ -196,7 +196,6 @@
             "hamanpaul/paulsha-cortex#825",
             "hamanpaul/paulsha-cortex#835",
             "hamanpaul/paulsha-cortex#836",
-            "hamanpaul/paulsha-cortex#837",
             "hamanpaul/paulsha-cortex#838",
             "hamanpaul/paulsha-cortex#839"
           ],
@@ -278,7 +277,9 @@
             "hamanpaul/paulsha-cortex#545",
             "hamanpaul/paulsha-cortex#546",
             "hamanpaul/paulsha-cortex#547",
-            "hamanpaul/paulsha-cortex#577"
+            "hamanpaul/paulsha-cortex#577",
+            "hamanpaul/paulsha-cortex#843",
+            "hamanpaul/paulsha-cortex#844"
           ],
           "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
         }
@@ -360,6 +361,7 @@
             "hamanpaul/paulsha-cortex#454",
             "hamanpaul/paulsha-cortex#466",
             "hamanpaul/paulsha-cortex#534",
+            "hamanpaul/paulsha-cortex#842",
             "hamanpaul/paulsha-patchmud#37"
           ],
           "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
@@ -519,7 +521,6 @@
             "hamanpaul/paulsha-cortex#823",
             "hamanpaul/paulsha-cortex#824",
             "hamanpaul/paulsha-cortex#807",
-            "hamanpaul/paulsha-cortex#820",
             "hamanpaul/paulsha-cortex#860"
           ],
           "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"
@@ -561,6 +562,7 @@
             "hamanpaul/paulsha-cortex#830",
             "hamanpaul/paulsha-cortex#831",
             "hamanpaul/paulsha-cortex#833",
+            "hamanpaul/paulsha-cortex#844",
             "hamanpaul/paulsha-cortex#845"
           ],
           "recovery": "依 work_ids 查明仍有效的責任工作；補齊對應 receipt 後執行 cortex delivery gaps。不得由總帳自動重派或關票。"

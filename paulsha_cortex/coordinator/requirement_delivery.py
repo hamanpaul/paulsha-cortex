@@ -841,7 +841,42 @@ def _verify_source(requirement: Mapping[str, Any], *, source_root: Path) -> dict
         return _stage("unknown", f"source-authority-unavailable:{type(exc).__name__}")
 
 
-def _verify_installed(row: Mapping[str, Any], *, context: Mapping[str, Any]) -> dict[str, Any]:
+def _installed_receipt_freshness(
+    latest: Mapping[str, Any],
+    requirement: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """#845 B8：套用 `max_age_seconds.installed`，與 live 期限同一套處理風格。
+
+    期限以 loaded-runtime receipt（installed 判定所依據的那一筆，startup 或
+    config-reload）的 `recorded_at` 計算：晚於現在或超過期限都是 stale。policy
+    沒宣告 installed 期限時不設上限；宣告了卻讀不到 `recorded_at`（舊投影）只
+    能是 unknown，不推測仍在期限內。回傳 None 表示期限成立。"""
+    max_age = requirement["evidence_policy"]["max_age_seconds"].get("installed")
+    if max_age is None:
+        return None
+    try:
+        recorded_at = _timestamp(latest.get("recorded_at"), field="loaded runtime recorded_at")
+    except ValueError:
+        return _stage("unknown", "installed-runtime-receipt-age-unknown", validator="loaded-runtime-attestation/v1")
+    if recorded_at > now or (now - recorded_at).total_seconds() > max_age:
+        return _stage(
+            "stale",
+            "installed-runtime-receipt-expired",
+            locator=str(latest.get("receipt_id")),
+            digest=canonical_json_sha256(latest),
+            validator="loaded-runtime-attestation/v1",
+        )
+    return None
+
+
+def _verify_installed(
+    row: Mapping[str, Any],
+    requirement: Mapping[str, Any],
+    *,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
     installed = row.get("installed_runtime")
     target = row.get("target")
     if not isinstance(installed, Mapping) or not isinstance(target, Mapping):
@@ -904,6 +939,13 @@ def _verify_installed(row: Mapping[str, Any], *, context: Mapping[str, Any]) -> 
             if isinstance(config, Mapping) and config.get("effective_revision") != expected_target["config_revision"]:
                 return _stage("stale", "loaded-runtime-config-revision-stale", validator="loaded-runtime-attestation/v1")
             return _stage("failed", "loaded-runtime-identity-or-target-mismatch", validator="loaded-runtime-attestation/v1")
+        expired = _installed_receipt_freshness(
+            latest,
+            requirement,
+            now=datetime.fromtimestamp(float(context["now_epoch"]), tz=timezone.utc),
+        )
+        if expired is not None:
+            return expired
         return _stage("verified", "installed-artifact-and-loaded-runtime-matched", locator=str(latest.get("receipt_id")), digest=canonical_json_sha256(latest), validator="loaded-runtime-attestation/v1")
     except (KeyError, OSError, TypeError, ValueError) as exc:
         return _stage("unknown", f"loaded-runtime-unverified:{type(exc).__name__}")
@@ -1194,7 +1236,7 @@ def inspect_delivery(
                 merge_result = _stage("failed", "work-authority-not-listed-for-requirement-owner")
             else:
                 merge_result = _verify_remote_merge(row, record, authority, context=context)
-            installed_result = _verify_installed(row, context=context)
+            installed_result = _verify_installed(row, requirement, context=context)
         live_results: dict[str, dict[str, Any]] = {}
         review_doc = None
         if record is not None and record.get("review_evaluation_path"):
@@ -1393,20 +1435,59 @@ def _stable_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
     return stable
 
 
+_INDEX_ROW_PROJECTION = (
+    "mapping_id", "requirement_id", "requirement_revision", "acceptance_id", "repo", "work_id", "run_id",
+    "workflow_step_ids", "pr_number", "change", "todo_paths", "candidate_sha", "merge_sha", "profile_key",
+    "config_revision", "policy_version", "completion_record", "source_generation", "source_revision_sha256",
+    "authority_sha256", "status", "evidence", "target", "observed_at",
+)
+# 本版 writer 認得的 row 欄位：投影欄位加上 reconcile 自己寫的 lifecycle 欄位。
+_INDEX_ROW_KNOWN_FIELDS = frozenset(_INDEX_ROW_PROJECTION) | {"stale_reason", "superseded_by"}
+
+
+def _carry_unknown_row_fields(previous: Mapping[str, Any], incoming: Mapping[str, Any]) -> dict[str, Any]:
+    """#845 A10：同 schema 版本的較新 writer 可能在 mapping row 留下本版不認得的
+    欄位；重驗同一 mapping 時原樣保留，不因重新投影而靜默丟失。已知欄位（含
+    stale_reason／superseded_by 等 lifecycle 欄位）一律以本次驗證結果為準。"""
+    carried = dict(incoming)
+    for key, value in previous.items():
+        if key not in _INDEX_ROW_KNOWN_FIELDS and key not in carried:
+            carried[key] = copy.deepcopy(value)
+    return carried
+
+
 def _read_completion_review_for_history(mapping: Mapping[str, Any], *, evidence_root: Path) -> dict[str, Any]:
     # 僅保留 opaque-safe provenance；stage verdict 已由 inspect_delivery 正式驗證。
-    projected = {key: mapping.get(key) for key in ("mapping_id", "requirement_id", "requirement_revision", "acceptance_id", "repo", "work_id", "run_id", "workflow_step_ids", "pr_number", "change", "todo_paths", "candidate_sha", "merge_sha", "profile_key", "config_revision", "policy_version", "completion_record", "source_generation", "source_revision_sha256", "authority_sha256", "status", "evidence", "target", "observed_at")}
+    projected = {key: mapping.get(key) for key in _INDEX_ROW_PROJECTION}
     evidence = projected.get("evidence")
     if isinstance(evidence, Mapping):
         projected["evidence"] = _stable_evidence(evidence)
     return projected
 
 
+# #845 B8：依時間確定發生的期限降級。這類 stale 不是暫時性讀取失敗——同一份
+# receipt 過了期限就永遠過期——因此同 generation 重讀時必須讓它取代既有
+# verified，否則持久化索引會一直停在過期前的 ready。
+_FRESHNESS_EXPIRY_REASONS = frozenset({
+    "installed-runtime-receipt-expired",
+    "live-canary-receipt-expired",
+})
+
+
+def _freshness_expired(stage: object) -> bool:
+    return (
+        isinstance(stage, Mapping)
+        and stage.get("status") == "stale"
+        and stage.get("reason") in _FRESHNESS_EXPIRY_REASONS
+    )
+
+
 def _evidence_weakened(previous_evidence: object, incoming_evidence: object) -> bool:
     """對抗審查第四輪 MAJOR：同一 generation 重讀時，任何原本 ``verified`` 的
     階段（例如 merge／installed）在新讀取中不再是 ``verified``，即視為弱化——
     這通常是暫時性讀取失敗（網路抖動、API 短暫不可用），不是真的失效，不可
-    用來取代既有已驗證結果。"""
+    用來取代既有已驗證結果。唯一例外是 installed／live 期限到期
+    （``_FRESHNESS_EXPIRY_REASONS``）：那是確定的降級，不算暫時性弱化。"""
     if not isinstance(previous_evidence, Mapping):
         return False
     if not isinstance(incoming_evidence, Mapping):
@@ -1418,6 +1499,8 @@ def _evidence_weakened(previous_evidence: object, incoming_evidence: object) -> 
         if not (isinstance(previous_stage, Mapping) and previous_stage.get("status") == "verified"):
             continue
         incoming_stage = incoming_evidence.get(stage_name)
+        if _freshness_expired(incoming_stage):
+            continue
         if not (isinstance(incoming_stage, Mapping) and incoming_stage.get("status") == "verified"):
             return True
     return False
@@ -1545,6 +1628,7 @@ def reconcile_delivery(
     for mapping_id, incoming in new_by_id.items():
         previous = old_rows.get(mapping_id)
         if previous is not None:
+            incoming = _carry_unknown_row_fields(previous, incoming)
             old_generation = previous.get("source_generation")
             new_generation = incoming.get("source_generation")
             if type(old_generation) is int and type(new_generation) is int and new_generation < old_generation:

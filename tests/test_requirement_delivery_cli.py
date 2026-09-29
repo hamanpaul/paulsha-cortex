@@ -629,6 +629,10 @@ def _prepare_cli_delivery_gate(
                 "service": service,
                 "instance": instance,
                 "pid": 555,
+                # 與正式 `cortex service status` 投影同形：loaded receipt 帶
+                # `recorded_at`，#845 B8 以它套用 `max_age_seconds.installed`。
+                "process_started_at": "2026-09-25T00:00:00.000000Z",
+                "recorded_at": "2026-09-25T00:00:00.000000Z",
                 "artifact": {
                     "kind": "installed-wheel",
                     "sha256": target["artifact_sha256"],
@@ -755,3 +759,44 @@ def test_delivery_gaps_cli_with_unknown_live_receipt_kind_reports_gap(monkeypatc
     assert live["reason"] == "live-canary-independence-mismatch"
     gap_stages = {gap.get("stage") for gap in report.get("gaps", [])}
     assert "live" in gap_stages
+
+
+def test_delivery_gaps_cli_does_not_honor_waivers_without_production_approval_validator(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """#845 A11／B8：production CLI 不注入 waiver approval validator，即使 manifest
+    與 snapshot 形式上允許一條 test waiver，也只會落成 unknown，不會被當成豁免；
+    production manifest 本身也沒有任何 waiver authority 或 waivable stage。"""
+    target = _cli_target(_cli_config_revision())
+    evidence = _cli_qualification_payload(candidate_sha=target["candidate_sha"], wheel_sha256=target["artifact_sha256"])
+    paths_ = _prepare_cli_delivery_gate(
+        monkeypatch, tmp_path, kind="cortex/some-unregistered-kind/v1", evidence=evidence
+    )
+    manifest = json.loads(paths_["manifest_path"].read_text(encoding="utf-8"))
+    manifest["waiver_policy"] = {"authorities": [{"id": "qa-council", "version": "2"}]}
+    manifest["requirements"][0]["evidence_policy"]["waivable_stages"] = ["test"]
+    paths_["manifest_path"].write_text(json.dumps(manifest), encoding="utf-8")
+    snapshot = json.loads(paths_["snapshot_path"].read_text(encoding="utf-8"))
+    snapshot["mappings"][0]["completion_record"] = None
+    snapshot["waivers"] = [{
+        "requirement_id": "R01", "requirement_revision": "r1", "acceptance_id": "R01-AC1",
+        "stage": "test", "reason": "accepted exception", "authority": {"id": "qa-council", "version": "2"},
+        "expires_at": "2026-10-01T00:00:00+00:00", "receipt": "approval:123",
+    }]
+    paths_["snapshot_path"].write_text(json.dumps(snapshot), encoding="utf-8")
+
+    exit_code = delivery.main([
+        "gaps",
+        "--manifest", str(paths_["manifest_path"]),
+        "--snapshot", str(paths_["snapshot_path"]),
+        "--source-root", str(tmp_path),
+        "--checkout", f"{_CLI_REPO}={tmp_path}",
+    ])
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert report["mappings"][0]["evidence"]["test"] == {
+        "status": "unknown",
+        "reason": "waiver-approval-validator-unavailable",
+    }
+    assert report["closure_readiness"] != "ready"
