@@ -1528,6 +1528,14 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/quota-snapshot-window-refinement/todo.md'
     excludes: []
+  quota-admission-enforce-runbook:
+    title: 'quota admission enforce 營運前提與操作手冊（#1198）'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1198'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/quota-admission-enforce-runbook/todo.md'
+    excludes: []
   wave4-large-bug-integration:
     title: 'wave-4 第一輪 large bug 最小修法整合（PR #1090）'
     links:
