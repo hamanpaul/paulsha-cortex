@@ -28,18 +28,20 @@ Production 的 adapter 能力分成兩半：
 ```yaml
 schema_version: 1
 adapters:
-  codex:                         # 必須已有受信任程式碼
+  codex:
     protocol_id: openai-codex-cli
-    protocol_version: "1"        # 字串
+    protocol_version: "1"
     runtime_version: cortex-adapter-v1
     usage_source: codex-jsonl
-    quota_state: unknown         # supported / unsupported / unknown
-    effort:                      # 沒有原生 effort 的 adapter 寫 null
+    quota_state: unknown
+    effort:
       values: [low, medium, high, xhigh, max]
-      default: null              # 或 values 其中之一
-      model_defaults:            # 選填；model → values 其中之一
+      default: null
+      model_defaults:
         gpt-6-luna: max
 ```
+
+欄位：adapter 名稱必須已有受信任程式碼；`protocol_id`／`protocol_version`／`runtime_version`／`usage_source` 是非空字串（版本號要加引號）；`quota_state` 是 `supported`／`unsupported`／`unknown`；沒有原生 effort 的 adapter 寫 `effort: null`；`default` 是 `null` 或 `values` 其中之一；`model_defaults` 選填，值必須在 `values` 內。檔案由零依賴 YAML subset parser 讀取：註解請寫成獨立一行，不要寫在行尾，也不要用 `{}` 這類 flow mapping。
 
 - **位置與優先序**：packaged 檔是內建預設；overlay 以同名 adapter 條目**整筆取代**資料欄位（不做欄位層級合併），沒列到的 adapter 沿用 packaged。程式碼登記的 adapter 排在兩者之間：overlay 可以調整它的資料，但不能拿掉它的程式碼 hook。
 - **驗證（fail-closed）**：`schema_version` 缺少或不是 `1`、未知鍵（包含 `argv`、命令、路徑之類）、缺必要欄位、版本欄位不是字串、effort 值重複、`default`／`model_defaults` 不在 `values` 內、`quota_state` 不合法，一律拒收。overlay 不合法時**不會**退回 packaged 預設。
