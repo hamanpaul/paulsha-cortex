@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import subprocess
@@ -31,7 +32,6 @@ from paulsha_cortex.coordinator.task_memory_hippo import (
     resolve_hippo_command,
 )
 from paulsha_cortex.coordinator.workflow import WorkflowStep
-from paulsha_cortex.porcelain import task_memory_canary
 from paulsha_cortex import cli
 
 
@@ -959,7 +959,8 @@ def test_live_canary_rotates_task_kind_across_dispatchable_card_phases(
     assert result == 0
     assert report["task_kinds"] == ["build", "verify", "review"]
     # 輪替集合與 Manager 以 task memory 派工、有 applied 回報管道的卡片 phase 一致。
-    assert set(task_memory_canary._TASK_KINDS) == manager.TASK_MEMORY_APPLIED_PHASES
+    canary_module = importlib.import_module("paulsha_cortex.porcelain.task_memory_canary")
+    assert set(canary_module._TASK_KINDS) == manager.TASK_MEMORY_APPLIED_PHASES
     provided: dict[tuple[str, str], set[str]] = {}
     for line in log.read_text(encoding="utf-8").splitlines():
         call = json.loads(line)
@@ -984,14 +985,16 @@ def test_live_canary_rotates_task_kind_across_dispatchable_card_phases(
     assert report["task_kind_coverage"]["passed"] is True
 
 
-def test_live_canary_requires_more_than_one_task_kind(tmp_path, monkeypatch, capsys):
+def test_live_canary_requires_more_than_one_task_kind(tmp_path, monkeypatch):
     script, log = _fake_hippo(tmp_path)
-    _client(monkeypatch, script, log)
-    monkeypatch.setattr(task_memory_canary, "_TASK_KINDS", ("build",))
+    client = _client(monkeypatch, script, log)
+    # 其他 porcelain 測試會從 sys.modules 移除並重新 import family 模組；直接對
+    # 目前載入的模組打補丁並呼叫同一模組的 `_run_canary`，不經 CLI 註冊表。
+    canary_module = importlib.import_module("paulsha_cortex.porcelain.task_memory_canary")
+    monkeypatch.setattr(canary_module, "_TASK_KINDS", ("build",))
 
-    result, report = _run_canary_cli(capsys, "--runs", "5")
+    report = canary_module._run_canary(("acme/demo", "other/demo"), 5, client)
 
-    assert result == 1
     assert report["passed"] is False
     assert report["task_kind_coverage"]["passed"] is False
     assert all(row["passed"] is True for row in report["paths"].values())
