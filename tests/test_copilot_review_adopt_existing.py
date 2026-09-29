@@ -307,6 +307,62 @@ def _invoke_ship(
     )
 
 
+def _assert_next_actions_admitted(
+    tmp_path: Path,
+    *,
+    response: dict[str, Any],
+    snapshot: Path,
+    state: Path,
+    registry: JobRegistry,
+    now: float,
+) -> None:
+    """Re-enter every advertised action through the public work-action dispatcher."""
+    actions = response.get("next_actions")
+    assert isinstance(actions, list) and actions
+    run = next(
+        run
+        for run in registry.list_workflow_runs()
+        if run.repo == REPO and run.work_id == WORK_ID and run.status == "ongoing"
+    )
+    if run.pr_refs:
+        assert "abandon" not in actions
+    assert response.get("next_step_hint", "").startswith(
+        f"cortex work {actions[0]} "
+    )
+    for action in actions:
+        # These Copilot ship stops are beyond the pre-delivery and review-attest
+        # admission gates, so the valid recovery lane is a persisted ship replay.
+        assert action == "ship"
+        args = {
+            "action": action,
+            "repo": REPO,
+            "work_id": WORK_ID,
+            "repo_root": str(tmp_path),
+            "pr_number": 8,
+            "change": None,
+            "todo_paths": [TODO_PATH],
+            "pr_metadata_path": str(_pr_metadata(tmp_path / "formal-pr.json")),
+            "foreign_review_path": str(tmp_path / "foreign-review.json"),
+            "foreign_review_hash": hashlib.sha256(
+                json.dumps(
+                    {"state": "passed", "candidate": HEAD},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        replay = work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: now,
+            workflow_registry=registry,
+        )
+        assert replay["result"]["action"] == "needs_human"
+        assert replay["result"]["reason"] == response["reason"]
+
+
 def test_r6_a_pr_created_with_copilot_commented_review_manager_ships_40m_later_without_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -463,11 +519,11 @@ def test_r6_e_no_existing_copilot_review_requests_copilot_once(
     assert "adopted_review_id" not in ship_state
 
 
-def test_r6_f_copilot_review_timeout_next_actions_includes_review_attest(
+def test_r6_f_copilot_review_timeout_suggests_admitted_ship_replay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """(f) copilot-review-timeout / resume 的 next_actions 都維持 list[str]。"""
+    """(f) Ship timeout exposes the admitted ship replay; resume remains separate."""
     github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
         tmp_path, monkeypatch, reviews=(), threads=()
     )
@@ -484,12 +540,18 @@ def test_r6_f_copilot_review_timeout_next_actions_includes_review_attest(
     assert result.get("reason") == "copilot-review-timeout"
     next_actions = result.get("next_actions", ())
     assert isinstance(next_actions, list)
-    assert "review-attest" in next_actions
-    assert "abandon" in next_actions
-    # 既有值在前，補充在後
-    assert list(next_actions).index("abandon") < list(next_actions).index("review-attest")
+    assert next_actions == ["ship"]
+    _assert_next_actions_admitted(
+        tmp_path,
+        response=result,
+        snapshot=snapshot,
+        state=state,
+        registry=registry,
+        now=t_timeout + 1.0,
+    )
 
-    # 同時驗證透過 execute_work_action resume 該 run 時，返回的 next_actions 亦含 review-attest
+    # resume 走 claim/recovery 投影（`_phase_recovery_actions`）：同樣不得宣告必被拒的
+    # review-attest（本 fixture 的 run 不在 review、HEAD 未驗證）或 abandon（帶 PR refs）。
     resume_resp = work_actions.execute_work_action(
         args={"action": "resume", "repo": REPO, "work_id": WORK_ID},
         requested_by="operator",
@@ -499,8 +561,9 @@ def test_r6_f_copilot_review_timeout_next_actions_includes_review_attest(
         workflow_registry=registry,
     )
     resume_actions = resume_resp["result"].get("next_actions", ())
-    assert isinstance(resume_actions, list)
-    assert "review-attest" in resume_actions
+    assert isinstance(resume_actions, list) and resume_actions
+    assert "review-attest" not in resume_actions
+    assert "abandon" not in resume_actions
 
 
 def test_request_bound_copilot_review_submitted_before_deadline_survives_late_observation(
@@ -714,7 +777,108 @@ def test_persisted_copilot_needs_human_stop_returns_list_shaped_next_actions(
     assert result.get("reason") == "copilot-review-timeout"
     next_actions = result.get("next_actions", ())
     assert isinstance(next_actions, list)
-    assert next_actions == ["abandon", "review-attest"]
+    assert next_actions == ["ship"]
+    _assert_next_actions_admitted(
+        tmp_path,
+        response=result,
+        snapshot=snapshot,
+        state=state,
+        registry=registry,
+        now=1001.0,
+    )
+
+
+def test_persisted_copilot_stop_on_exact_head_review_run_suggests_admitted_review_attest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1184：review-attest 前置成立時才建議它，且送入正式入口被受理。"""
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        gate_refs=(GateEvidenceRef("foreign-review", str(tmp_path / "foreign.json"), "f" * 64),),
+    )
+    work_actions._load_work_run(
+        state_path=state,
+        workflow_registry=registry,
+        authority=authority,
+    )
+    row = _journal_row(state, run_id)
+    row["ship"] = {"phase": "needs_human", "reason": "copilot-review-timeout"}
+    _write_journal_row(state, run_id, row)
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=1000.0,
+    )
+
+    assert result["reason"] == "copilot-review-timeout"
+    # 帶 PR refs：abandon 必被拒，不得出現；review-attest 前置成立，列為首個建議。
+    assert result["next_actions"] == ["review-attest"]
+    assert result["next_step_hint"].startswith("cortex work review-attest ")
+    attested = work_actions.execute_work_action(
+        args={
+            "action": "review-attest",
+            "repo": REPO,
+            "work_id": WORK_ID,
+            "actor": "maintainer@example",
+            "verdict": "approved",
+            "summary": "Copilot review timed out; exact-HEAD maintainer review passed.",
+            "findings": [],
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 1001.0,
+        workflow_registry=registry,
+    )
+    assert attested["result"]["action"] == "review-attested"
+    assert attested["result"]["head"] == HEAD
+
+
+def test_copilot_request_outcome_unknown_actions_pass_formal_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github, orch_holder, snapshot, state, registry, run_id, authority = _setup_ship_env(
+        tmp_path, monkeypatch, reviews=(), threads=()
+    )
+    work_actions._load_work_run(
+        state_path=state,
+        workflow_registry=registry,
+        authority=authority,
+    )
+    row = _journal_row(state, run_id)
+    row["ship"] = {"phase": "review-requesting", "head": HEAD}
+    _write_journal_row(state, run_id, row)
+
+    result = _invoke_ship(
+        tmp_path,
+        authority=authority,
+        state=state,
+        registry=registry,
+        now=1000.0,
+    )
+
+    assert result["reason"] == "copilot-review-request-outcome-unknown"
+    assert result["next_actions"] == ["ship"]
+    _assert_next_actions_admitted(
+        tmp_path,
+        response=result,
+        snapshot=snapshot,
+        state=state,
+        registry=registry,
+        now=1001.0,
+    )
 
 
 def test_copilot_finding_budget_exhausted_returns_list_shaped_next_actions(
@@ -778,7 +942,15 @@ def test_copilot_finding_budget_exhausted_returns_list_shaped_next_actions(
     assert result.get("reason") == "copilot-finding-budget-exhausted"
     next_actions = result.get("next_actions", ())
     assert isinstance(next_actions, list)
-    assert next_actions == ["abandon", "review-attest"]
+    assert next_actions == ["ship"]
+    _assert_next_actions_admitted(
+        tmp_path,
+        response=result,
+        snapshot=snapshot,
+        state=state,
+        registry=registry,
+        now=1001.0,
+    )
     assert result.get("repair_rounds_used") == 3
     assert result.get("repair_rounds_budget") == 2
     assert result.get("repair_rounds_remaining") == 0
@@ -886,7 +1058,15 @@ def test_copilot_error_review_needs_human_next_actions_are_lists(
 
     assert result.get("action") == "needs_human"
     assert result.get("reason") == "copilot-error-review"
-    assert result.get("next_actions") == ["abandon", "review-attest"]
+    assert result.get("next_actions") == ["ship"]
+    _assert_next_actions_admitted(
+        tmp_path,
+        response=result,
+        snapshot=snapshot,
+        state=state,
+        registry=registry,
+        now=requested_at + 3.0,
+    )
 
 
 @pytest.mark.parametrize("adopted_at_epoch", [float("nan"), float("inf")])

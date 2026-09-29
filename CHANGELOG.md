@@ -94,6 +94,7 @@
 
 ### Fixed
 
+- **#1184 ship needs_human 復原建議**：Copilot ship 停止回應只列出正式入口可受理的動作；帶 PR 或已進 ship 的 run 不再收到會被拒絕的 `abandon`，`review-attest` 與該動作共用前置判準，皆不成立時改建議重跑 ship，提示與首個動作一致；`_phase_recovery_actions` 也不再對非 exact-HEAD review 的 run 投影 `review-attest`。
 - **#1161 巢狀受管目錄的 rollback unknown state**：`list_unknown_state` 只把目前 inventory 範圍內的更深層 managed directory 當作委派邊界；巢狀目錄中的事後新增 durable state 會列入 `retained_unknown`，使 rollback 正確回報 `rollback-blocked`。非巢狀 inventory 的判定維持不變。
 - **#1099 quota window snapshot refinement**：同值、同時間的 snapshot 補上先前缺失的 window epoch 時，file ledger 與 memory ledger 會追加 refinement observation；shadow 投影在同時間快照間優先採用 epoch 已知者。值不同仍是 conflict，較不完整或完全相同的重送仍是 duplicate；refinement 後的 conflict receipt 以最近接受 observation 的 payload digest 作為 `existing_sha256`；不新增 ledger event kind 或 schema version。
 
