@@ -89,6 +89,7 @@ def _workflow_next_actions_projection(
     job_rows: Sequence[Mapping[str, object]],
     slice_rows: Sequence[Mapping[str, object]],
     state_path: Path | None = None,
+    quota_decision_store=None,
 ) -> dict[str, dict[str, object]]:
     """以同一 recovery 判準產生 Monitor work-list 的 needs_human 動作。
 
@@ -163,7 +164,9 @@ def _workflow_next_actions_projection(
             actions = ()
         else:
             try:
-                recovery_actions = _phase_recovery_actions(run, registry_view)
+                recovery_actions = _phase_recovery_actions(
+                    run, registry_view, quota_decision_store=quota_decision_store,
+                )
             except Exception:  # noqa: BLE001 - read projection fails closed on registry errors
                 recovery_actions = ()
             actions = needs_human_next_actions(
@@ -661,6 +664,7 @@ class WorkflowRegistryProvider:
                 job_rows=[row for row in job_rows if isinstance(row, Mapping)],
                 slice_rows=[row for row in slice_rows if isinstance(row, Mapping)],
                 state_path=self.state_path,
+                quota_decision_store=self._quota_decision_store,
             )
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
             return ProviderSnapshot(

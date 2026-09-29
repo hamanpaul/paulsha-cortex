@@ -1101,6 +1101,7 @@ def test_daemon_status_inspect_and_work_show_preserve_wait_projection_and_source
     status_entry = next(row for row in daemon_projection["attention"] if row.get("run_id") == run.run_id)
     wait_projection = status_entry["quota_decision"]["wait"]
     assert wait_projection["retry_eligible"] is False
+    assert "resume" not in status_entry.get("next_actions", [])
     assert wait_projection["reset_at_ms"] == decision.reset_at_ms
     assert status_entry["blocking_reason"] == reason
     assert not any(row.get("workflow_run_id") == run.run_id for row in daemon_projection["in_flight"])
