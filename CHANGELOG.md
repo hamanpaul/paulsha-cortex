@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 Manager gh 設定**：root-owned 唯讀的 gh config 加上 `version: "1"`，避免 gh 遷移寫檔導致 `gh auth status` 失敗（#716）。
 - **#716 deployment canary Manager credential helper**：probe 改查 installer 實際寫的 URL-scoped `credential.https://github.com.helper`（reset＋gh 兩列），不再因查不帶 URL 的鍵而失敗（#716）。
 - **#716 deployment canary codex preflight 逾時**：逾時訊息標明卡住的請求，傳輸逾時以新 process 重試一次、單次時限 90 秒；明確否定回答不重試（#716）。
 - **#716 deployment canary provider preflight**：copilot status server 移除會跳過已存登入的 `--no-auto-login`、允許超額使用時不誤判 quota 用盡、codex 方案額度可用時不要求加購 credits（#716）。

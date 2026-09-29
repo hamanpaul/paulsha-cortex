@@ -743,6 +743,12 @@ def _artifact_dict(
     }
 
 
+
+#: Manager 的 gh 設定（root-owned、唯讀）。`version: "1"` 表示已是 gh 2.40+ 的多帳號
+#: 格式；缺少它時 gh 會嘗試遷移並寫回 config.yml，唯讀檔因此讓 `gh auth status`
+#: 失敗（#716 canary）。
+MANAGER_GH_CONFIG_CONTENT = 'version: "1"\ngit_protocol: https\nprompt: disabled\n'
+
 def _generated_inventory(
     scheme: permgen.UidScheme,
     layout: permgen.PathLayout,
@@ -813,7 +819,7 @@ def _generated_inventory(
             mode=generated.mode_str,
         )
     gitconfigs["manager-gh-config"] = _artifact_dict(
-        content="git_protocol: https\nprompt: disabled\n",
+        content=MANAGER_GH_CONFIG_CONTENT,
         path=layout.gh_settings_of(layout.manager_account),
     )
 

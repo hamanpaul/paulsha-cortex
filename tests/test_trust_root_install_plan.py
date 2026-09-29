@@ -2057,3 +2057,18 @@ def test_candidate_bundle_symlink_is_rejected_before_content_is_consumed(
             candidate_wheel=wheel,
             bundle=bundle_link,
         )
+
+
+def test_manager_gh_config_is_already_migrated_so_gh_never_rewrites_it() -> None:
+    """#716：root-owned 唯讀的 gh config 若沒有 `version: "1"`，gh 2.40+ 會嘗試遷移並寫檔，
+    `gh auth status` 以 `failed to write config after migration` 失敗（canary run 36452943660）。"""
+
+    import yaml
+
+    from paulsha_cortex.trust_root.install import core
+
+    content = core.MANAGER_GH_CONFIG_CONTENT
+    parsed = yaml.safe_load(content)
+    assert parsed["version"] == "1"
+    assert parsed["git_protocol"] == "https"
+    assert parsed["prompt"] == "disabled"

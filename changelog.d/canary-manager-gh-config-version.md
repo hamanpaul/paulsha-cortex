@@ -1,0 +1,1 @@
+- installer 產生的 Manager gh 設定（`manager-gh-config`，root-owned 唯讀）加上 `version: "1"`（#716，canary run 36452943660 在 `Manager gh auth status failed rc=1: failed to write config after migration … permission denied` 失敗）：沒有版本鍵時 gh 2.40+ 會把它當舊格式遷移並寫回 config.yml，唯讀檔讓 `gh auth status` 失敗。本機以 gh 2.45 重現並驗證加上版本鍵後不再寫檔；release plan 的 golden digest 因這個非 legacy 變更更新一次並註明原因。
