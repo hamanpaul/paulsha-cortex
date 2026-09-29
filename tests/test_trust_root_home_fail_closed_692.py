@@ -436,3 +436,56 @@ def test_shim_main_redacts_home_lstat_failures_before_taking_over_the_log(tmp_pa
     assert "HOME" in record["error"]
     assert "Permission denied" not in record["error"]
     assert str(secret_home) not in record["error"]
+
+
+def _builder_owned_elsewhere(home: Path) -> pwd.struct_passwd:
+    return pwd.struct_passwd(
+        (
+            "cortex-builder",
+            "x",
+            home.stat().st_uid + 1,
+            os.getegid(),
+            "",
+            str(home),
+            "/usr/sbin/nologin",
+        )
+    )
+
+
+def test_build_job_env_accepts_the_installer_root_owned_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1189：installer 依 permgen scaffold 把 job HOME 建成 root:root 0755（保護
+    root-owned 的 .gitconfig／credential symlink）。root 擁有且不可被 group／other
+    寫入的 HOME 必須通過，否則三 UID 主機上所有降權 job 在 launch 前失敗。"""
+
+    home = tmp_path / "builder-home"
+    home.mkdir(mode=0o755)
+    home.chmod(0o755)
+    env = _manager_env()
+    env[job_runner.BUILDER_HOME_ENV] = str(home)
+    # 以目前 uid 扮演 root（測試不以 root 執行）。
+    monkeypatch.setattr(job_runner, "HOME_ROOT_OWNER_UID", home.stat().st_uid)
+
+    with mock.patch.object(job_runner.pwd, "getpwnam", return_value=_builder_owned_elsewhere(home)):
+        built = _build_env(role=job_runner.JOB_ROLE_BUILDER, manager_env=env)
+
+    assert built["HOME"] == str(home)
+
+
+@pytest.mark.parametrize("mode", [0o775, 0o757])
+def test_build_job_env_rejects_a_root_owned_home_writable_by_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int
+) -> None:
+    home = tmp_path / "builder-home"
+    home.mkdir()
+    home.chmod(mode)
+    env = _manager_env()
+    env[job_runner.BUILDER_HOME_ENV] = str(home)
+    monkeypatch.setattr(job_runner, "HOME_ROOT_OWNER_UID", home.stat().st_uid)
+
+    with mock.patch.object(job_runner.pwd, "getpwnam", return_value=_builder_owned_elsewhere(home)):
+        with pytest.raises(JobRunnerError) as excinfo:
+            _build_env(role=job_runner.JOB_ROLE_BUILDER, manager_env=env)
+
+    assert excinfo.value.diagnostic.reason == "job-runner-home-writable-by-others"
