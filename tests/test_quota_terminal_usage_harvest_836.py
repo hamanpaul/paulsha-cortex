@@ -559,3 +559,22 @@ def test_harvest_reports_missing_usage_unit_mapping_as_skip_reason(tmp_path: Pat
     assert result["recorded"] == []
     assert result["skipped"] == {"usage-unit-mapping-missing": 1}
     assert _usage_rows(tmp_path / "quota" / "events.jsonl") == []
+
+
+def test_reconcile_with_invalid_enforced_config_skips_without_raising(tmp_path: Path) -> None:
+    """enforce＋設定無效時 daemon 傳入 `QuotaConfigInvalid`；periodic reconcile 必須
+    回結構化的略過，而不是每個 tick 擲 AttributeError（既有 reservation 原樣保留，
+    與派工端 fail closed 一致）。"""
+
+    registry = JobRegistry(tmp_path / "jobs.json")
+    marker = quota_admission.QuotaConfigInvalid(reason="quota-pools.json: unknown key")
+
+    result = manager.reconcile_quota_admission_reservations(
+        registry=registry, quota_admission_context=marker
+    )
+
+    assert result == {
+        "wired": True,
+        "config_invalid": True,
+        "reason": "quota-pools.json: unknown key",
+    }

@@ -12315,6 +12315,15 @@ def reconcile_quota_admission_reservations(
         return {"wired": False}
     from . import quota_admission
 
+    if isinstance(quota_admission_context, quota_admission.QuotaConfigInvalid):
+        # enforce＋設定無效：派工端已 fail closed（quota-config-invalid），這裡也不
+        # 動任何 reservation——沒有有效設定就沒有 authority／lease 可用。既有
+        # reservation 原樣保留到設定修好，回結構化略過而非每個 tick 擲例外。
+        return {
+            "wired": True,
+            "config_invalid": True,
+            "reason": quota_admission_context.reason,
+        }
     resolved_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     reserved_outcomes = quota_admission.reconcile_reserved_reservations(
         authority=quota_admission_context.authority,

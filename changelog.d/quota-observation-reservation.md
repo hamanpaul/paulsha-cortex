@@ -48,3 +48,4 @@
   `quota_admission` docstring 卻寫「兩者都要 on」、README 寫「各自獨立」。移除後
   唯一的 enforce 開關是 `PSC_QUOTA_ADMISSION_ENFORCE`（enforce ⇒ 原子預留），
   docstring／README 同步改正；設過舊變數的部署行為不變（它本來就沒有作用）。
+- periodic quota reconcile 在 enforce＋`quota-pools.json` 無效時回結構化略過（`config_invalid`），不再每個 tick 擲 `AttributeError`；既有 reservation 原樣保留到設定修好（#838）。
