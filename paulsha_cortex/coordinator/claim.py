@@ -1943,6 +1943,11 @@ def needs_human_next_step_hint(
             "請修復規劃環境並重試 recover-planning；若無法修復，請執行 "
             f"{abandon}。"
         )
+    if "resume" in actions:
+        return (
+            "額度等待 receipt 允許重試；請確認額度已恢復後執行 "
+            f"`cortex work resume {safe_work_id} --repo {safe_repo}`。"
+        )
     return f"請檢視阻塞證據，接著執行 {abandon}。"
 
 
