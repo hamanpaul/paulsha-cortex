@@ -1,0 +1,1 @@
+- **#1198 quota enforce 操作手冊**：新增額度准入 enforce 的開關切換、binding、fresh observation、wait 恢復、rollback 與 evidence 查核手冊，並由 README quota 段落連結。

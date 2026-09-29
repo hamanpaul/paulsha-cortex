@@ -295,6 +295,8 @@ launcher 提供結構化 HTTP 429，Manager 保留 `rate_limited`／`structured`
 寫入 durable executor backoff；不改 model qualification 或品質分。之後只在既有
 retry／resume 的新 attempt 邊界重選候選，不搬動仍執行的 job。
 
+quota admission 的啟用前提、fresh observation、wait 恢復、rollback 與 evidence 查核步驟，見[Quota admission enforce 操作手冊](docs/superpowers/runbooks/quota-admission-enforce.md)。
+
 ### Production 接線：`manager_daemon.py` 與 quota-pools 設定檔
 
 `manager_daemon.py` 在 workflow start、operator resume（`workflow-action`／
