@@ -19,6 +19,7 @@ from paulsha_cortex.runtime_attestation import (
     artifact_identity,
     cli_runtime_observation,
     declared_service_environment,
+    live_process_started_epoch,
     manager_declared_invocation_revision,
     manager_environment_revision,
     monitor_configuration_revision_from_environment,
@@ -439,6 +440,7 @@ def _loaded_runtime_payload(
                 declared_config_component="environment_revision",
                 declared_invocation_revision=declared_invocation_revision,
                 expected_pid=manager_pid,
+                expected_process_started_epoch=live_process_started_epoch(manager_pid),
                 require_process_match=True,
                 current_artifact=(
                     manager_artifact if isinstance(manager_artifact, dict) else None
@@ -466,6 +468,7 @@ def _loaded_runtime_payload(
                     monitor_environment
                 ),
                 expected_pid=monitor_pid,
+                expected_process_started_epoch=live_process_started_epoch(monitor_pid),
                 require_process_match=True,
                 current_artifact=(
                     monitor_artifact if isinstance(monitor_artifact, dict) else None

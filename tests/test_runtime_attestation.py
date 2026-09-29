@@ -1794,3 +1794,76 @@ def test_environment_file_accepts_other_quote_inside_quoted_value(tmp_path: Path
     }
     source, _overlay = runtime_attestation._environment_source_and_overlay(row)
     assert source == "systemd-effective"
+
+
+def test_reused_pid_with_stale_receipt_is_not_reported_as_the_live_process(
+    tmp_path: Path,
+) -> None:
+    """#841 審查：PID 被重用、且新程序尚未寫 receipt 時，同 PID 的舊 receipt 不得
+    被判為 loaded match。呼叫端傳入 live 程序由 /proc 推得的啟動時間；與 receipt
+    的 ``process_started_at`` 差距超過容忍值的同 PID receipt 視為先前的程序。"""
+
+    from datetime import datetime
+
+    from paulsha_cortex.runtime_attestation import runtime_status_report
+
+    state_root = tmp_path / "runtime"
+    record_runtime_startup(
+        service="manager",
+        instance="test",
+        state_root=state_root,
+        configuration={"poll_interval": 30},
+        artifact=_artifact("1" * 64),
+        started_at="2026-09-26T00:00:05Z",
+        pid=301,
+    )
+    live_started = datetime.fromisoformat("2026-09-26T06:00:00+00:00").timestamp()
+
+    reused = runtime_status_report(
+        state_root,
+        service="manager",
+        instance="test",
+        declared_config_revision=configuration_revision({"poll_interval": 30}),
+        expected_pid=301,
+        expected_process_started_epoch=live_started,
+        require_process_match=True,
+        current_artifact=_artifact("1" * 64),
+    )
+    assert reused["status"] != "match"
+    assert reused["comparison"]["process_status"] != "match"
+
+    # 牆鐘位移在容忍值內（NTP step）仍是同一個程序。
+    same = runtime_status_report(
+        state_root,
+        service="manager",
+        instance="test",
+        declared_config_revision=configuration_revision({"poll_interval": 30}),
+        expected_pid=301,
+        expected_process_started_epoch=datetime.fromisoformat(
+            "2026-09-26T00:00:03+00:00"
+        ).timestamp(),
+        require_process_match=True,
+        current_artifact=_artifact("1" * 64),
+    )
+    assert same["status"] == "match"
+    assert same["loaded"]["pid"] == 301
+
+
+def test_live_process_started_epoch_reads_proc_stat(tmp_path: Path) -> None:
+    import os
+
+    from paulsha_cortex.runtime_attestation import live_process_started_epoch
+
+    proc = tmp_path / "proc"
+    (proc / "4242").mkdir(parents=True)
+    fields = ["S"] + ["0"] * 18 + ["500"] + ["0"] * 10
+    (proc / "4242" / "stat").write_text(
+        "4242 (cortex (manager)) " + " ".join(fields) + "\n", encoding="ascii"
+    )
+    (proc / "stat").write_text("cpu 1 2 3\nbtime 1790000000\n", encoding="ascii")
+    hz = os.sysconf("SC_CLK_TCK")
+
+    assert live_process_started_epoch(4242, proc_root=proc) == 1790000000 + 500 / hz
+    assert live_process_started_epoch(4243, proc_root=proc) is None
+    assert live_process_started_epoch(None, proc_root=proc) is None
+    assert live_process_started_epoch(os.getpid()) is not None

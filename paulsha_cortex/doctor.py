@@ -129,6 +129,7 @@ def _loaded_runtime_probe(
         artifact_identity,
         cli_runtime_observation,
         declared_service_environment,
+        live_process_started_epoch,
         manager_environment_revision,
         monitor_configuration_revision_from_environment,
         runtime_status_report,
@@ -199,6 +200,7 @@ def _loaded_runtime_probe(
                     declared_config_revision=declared_config_revision(service_environment),
                     declared_config_component=declared_config_component,
                     expected_pid=expected_pid,
+                    expected_process_started_epoch=live_process_started_epoch(expected_pid),
                     require_process_match=True,
                     current_artifact=(
                         current_artifact
