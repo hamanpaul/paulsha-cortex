@@ -415,9 +415,18 @@ def test_r10_machine_readable_gap_ledger_keeps_unverified_gates_open() -> None:
     assert ledger["issue"] == 843
     gaps = ledger["gaps"]
     assert gaps
+    assert len({gap["id"] for gap in gaps}) == len(gaps)
     for gap in gaps:
         assert gap["id"] and gap["owner"] and gap["source"] and gap["retest"]
-        assert gap["status"] in {"open", "blocked", "pending-owner-evidence"}
+        assert gap["status"] in {"open", "blocked", "pending-owner-evidence", "closed"}
+        # closed 必須指名實際存在的驗收測試；open 若宣稱可重現，也必須指得到測試。
+        refs = gap.get("verified_by" if gap["status"] == "closed" else "reproduced_by", [])
+        if gap["status"] == "closed":
+            assert refs, gap["id"]
+        for ref in refs:
+            path, _, name = ref.partition("::")
+            source = (ROOT / path).read_text(encoding="utf-8")
+            assert f"def {name.split('[', 1)[0]}(" in source, ref
     matrix = MATRIX_PATH.read_text(encoding="utf-8")
     for gap in gaps:
         assert gap["id"] in matrix
@@ -425,3 +434,5 @@ def test_r10_machine_readable_gap_ledger_keeps_unverified_gates_open() -> None:
         encoding="utf-8"
     )
     assert "- [ ] 5.5" in tasks, "full-plan recovery gate must remain open"
+    # full-plan gate 未解除時，ledger 必須仍顯示未解的依賴。
+    assert any(gap["status"] != "closed" for gap in gaps)
