@@ -10871,6 +10871,33 @@ def _identity_candidates_for_persona(persona: str, identities: IdentityRegistry,
     return candidates
 
 
+def _reviewer_independence_exclusion_detail(
+    persona: str, identities: IdentityRegistry, builder_domains: set
+) -> str:
+    """#839 AC2：唯一 reviewer 與 builder 同 independence domain 時的精確拒因。
+
+    `_identity_candidates_for_persona` 對 reviewer 以 independence domain 硬濾；
+    若具 review capability 的身分**全部**因此被排除，舊訊息只剩「沒有設定
+    identity」，operator 分不出是沒設定還是被 independence 規則擋下。這裡只
+    補述既有過濾的結果（同一份判準，不放寬也不新增規則）；其他 persona 或非
+    independence 造成的空集合維持原訊息。"""
+
+    if persona != "reviewer" or not builder_domains:
+        return ""
+    capability = _MODEL_CHAIN_CAPABILITY_BY_PERSONA.get(persona)
+    same_domain = [
+        f"{item.executor}/{item.model_id}"
+        for item in identities.identities
+        if capability in item.capabilities and item.independence_domain in builder_domains
+    ]
+    if not same_domain:
+        return ""
+    return (
+        "（reviewer independence_domain 與 builder 相同："
+        f"{', '.join(sorted(builder_domains))}；被排除 candidates: {', '.join(same_domain)}）"
+    )
+
+
 def _measured_profile_partition(
     persona: str, sizing_band, candidates: list
 ) -> tuple[list, list[tuple[object, str]]]:
@@ -10976,7 +11003,10 @@ def _workflow_identity_candidates_for_persona(
             ]
             candidates = preferred + rest
     if not candidates:
-        raise ValueError(f"no configured identity for workflow persona: {persona}")
+        raise ValueError(
+            f"no configured identity for workflow persona: {persona}"
+            + _reviewer_independence_exclusion_detail(persona, identities, builder_domains)
+        )
     # #452 C：measured 側寫優先＋band 過濾（三段 persona 之外的 catch-all
     # persona 沒有封套語意，維持原清單）。
     from .model_identities import DEFAULT_ENVELOPE
@@ -11807,6 +11837,7 @@ _QUOTA_ADMISSION_NO_CANDIDATE_PROFILE_KEY = "quota-admission:no-admissible-candi
 def _quota_admission_record_wait_decision(
     store, *, registry, run, step, identities: "IdentityRegistry", reason: str,
     excluded: Sequence[Mapping[str, object]] = (),
+    policy_config_revision: str | None = None,
 ) -> dict[str, str] | None:
     """#839 對抗審查修復第二輪（MAJOR manager.py:11413）：全部候選被拒
     （`_quota_admission_stop`）或設定本身無效（`_quota_admission_config_invalid_stop`）
@@ -11844,6 +11875,10 @@ def _quota_admission_record_wait_decision(
                 selected=None, reservation_id=None,
                 excluded=tuple(excluded), reason=reason,
                 retry_eligible=(reason == "quota-admission-insufficient"),
+                # #840 AC2：wait receipt 同樣記下當時生效的 operator 設定 revision
+                # ——投影面才分得出「哪一版 quota-pools 設定判定額度不足」；設定
+                # 本身無效（quota-config-invalid）時沒有可信 revision，維持 None。
+                policy_config_revision=policy_config_revision,
                 reset_at_ms=min(
                     (int(item["reset_at_ms"]) for item in excluded
                      if type(item.get("reset_at_ms")) is int and item["reset_at_ms"] >= 0),
@@ -11910,6 +11945,7 @@ def _quota_admission_stop(
     quota_admission_projection = _quota_admission_record_wait_decision(
         quota_admission_context.store, registry=registry, run=run, step=step,
         identities=identities, reason="quota-admission-insufficient", excluded=attempts,
+        policy_config_revision=getattr(quota_admission_context, "config_revision", None),
     )
     update_kwargs: dict[str, object] = {
         "facets": tuple(dict.fromkeys((*run.facets, "needs_human"))),
@@ -15465,6 +15501,11 @@ def _dispatch_workflow_card(
         # 續租，後續重試只會一直撞 duplicate（見下面 try/except/finally）。
         quota_admission.IN_FLIGHT_DISPATCHES.mark_started(quota_reservation_handle["reservation_id"])
     quota_job_created = False
+    # except／finally 會清理 sandbox：必須在 try 之前就有值，否則 provisioning
+    # 之前的失敗（例如兩個 Manager 競態）會讓 handler 擲 UnboundLocalError、
+    # 蓋掉原始例外（#1183 CI）。
+    planner_sandbox: Path | None = None
+    reviewer_sandbox: Path | None = None
     try:
         if quota_reservation_handle is not None:
             # 對抗審查第四輪 MAJOR（quota_admission.py:1119）：reserve() 給的
@@ -15596,8 +15637,6 @@ def _dispatch_workflow_card(
         # 配發即消耗（見 `registry.reserve_job_id`），因此 provision 失敗只是燒掉一個
         # 序號，不會有兩個 job 共用同一個 id、進而共用同一個目錄。
         reserved_job_id = registry.reserve_job_id(task)
-        planner_sandbox: Path | None = None
-        reviewer_sandbox: Path | None = None
         sandbox_hash: str | None = None
         repo_root = run.workspace_root
         if step.persona == "planner":

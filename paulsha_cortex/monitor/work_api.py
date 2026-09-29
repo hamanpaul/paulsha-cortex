@@ -308,7 +308,9 @@ class WorkReadModelStore:
 
     def _candidate_git_base(self, repo: str, work_id: str) -> dict:
         for provider_id, provider in self._snapshot.providers.items():
-            if not provider_id.startswith("workflow:"):
+            # #1182：與 `_quota_decision()`／`_needs_human_reason()` 同一個 exact
+            # (repo, work_id) 判準，跨 repo 的相同 work_id 不得互相借用。
+            if not provider_id.startswith("workflow:") or _provider_repo(provider_id) != repo:
                 continue
             observations = provider.observations
             if not isinstance(observations, Mapping):
@@ -346,7 +348,11 @@ class WorkReadModelStore:
 
     def _needs_human_reason(self, repo: str, work_id: str) -> dict:
         for provider_id, provider in self._snapshot.providers.items():
-            if not provider_id.startswith("workflow:"):
+            # #840 AC1：等待來源（#527 blocking reason，含 quota wait）與
+            # `_quota_decision()` 同一個 exact (repo, work_id) 判準——跨 repo 的
+            # work_id 不保證唯一，只憑 `workflow:` 前綴會把另一個 repo 的
+            # needs_human 理由借到這個 repo 的 work show 上。
+            if not provider_id.startswith("workflow:") or _provider_repo(provider_id) != repo:
                 continue
             observations = provider.observations
             if not isinstance(observations, Mapping):
@@ -361,7 +367,8 @@ class WorkReadModelStore:
 
     def _schema_retry(self, repo: str, work_id: str) -> dict:
         for provider_id, provider in self._snapshot.providers.items():
-            if not provider_id.startswith("workflow:"):
+            # #1182：exact (repo, work_id)，見 `_candidate_git_base()`。
+            if not provider_id.startswith("workflow:") or _provider_repo(provider_id) != repo:
                 continue
             observations = provider.observations
             if not isinstance(observations, Mapping):
@@ -566,6 +573,10 @@ class WorkModelRefresher:
             else quota_admission_module.AdmissionDecisionStore()
         )
         self._quota_decision_cache = DecisionReadCache()
+        # #840 AC4：每個 repo 只在本 refresher 生命週期的第一輪以上一份 snapshot
+        # （Monitor 重啟後即 durable bootstrap）種 last-good；之後的 last-good
+        # 由記憶體 cache 承接，不必每輪重種、也不讓種子無限累積。
+        self._quota_decision_seeded_repos: set[str] = set()
         self.stale_after_seconds = stale_after_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
@@ -641,6 +652,20 @@ class WorkModelRefresher:
                 # `quota_decision_cache`（見 `__init__` 註解）；自訂 factory
                 # （測試／上層組裝）呼叫維持原樣（僅 `repo` 單一參數），行為
                 # 不變。
+                if self._uses_default_workflow_provider and repo not in self._quota_decision_seeded_repos:
+                    # #840 AC4：上一份 snapshot（Monitor 重啟後即 durable
+                    # last-good bootstrap）的 quota 投影當跨 process last-good
+                    # 種子——只在這輪 store 讀不到、記憶體內又沒有 last-good 時才
+                    # 採用（見 `DecisionReadCache.seed_last_good_from_projections`）。
+                    self._quota_decision_seeded_repos.add(repo)
+                    previous_workflow = providers.get(f"workflow:{repo}")
+                    previous_observations = (
+                        previous_workflow.observations if previous_workflow is not None else None
+                    )
+                    if isinstance(previous_observations, Mapping):
+                        self._quota_decision_cache.seed_last_good_from_projections(
+                            previous_observations.get("quota_decisions")
+                        )
                 workflow_provider = (
                     self.workflow_provider_factory(
                         repo,

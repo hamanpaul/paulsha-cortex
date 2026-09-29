@@ -65,6 +65,26 @@ QUOTA_WAIT_REASONS = frozenset({"quota-admission-insufficient", "quota-config-in
 #: 這裡的白名單是第二層防線，供未來欄位擴充時不必回頭改本模組）。
 _ALLOWED_WAIT_KEYS: tuple[str, ...] = ("reason", "detail", "source", "recorded_at", "next_step_hint")
 
+#: #840 AC5：quota wait 理由的 ``context`` 只帶出兩個 quota-wait producer
+#: （`manager._quota_admission_stop`／`_quota_admission_config_invalid_stop`）
+#: 實際寫入的識別 key。#527 `DiagnosticReason.context` 只驗型別與長度，不驗
+#: 內容——未來 producer 或手改 registry 夾帶的帳號、token、raw prompt 等 key
+#: 一律不轉發（allowlist，不是 denylist）。
+_ALLOWED_WAIT_CONTEXT_KEYS: tuple[str, ...] = ("run_id", "work_id", "card", "attempted_candidates")
+
+#: #840 AC4：跨 process 重啟時可作為 last-good 種子的 persona 投影欄位。種子
+#: 來自 reader 自己的上一份耐久輸出（Monitor durable snapshot／daemon
+#: status.json），只接受本模組產出的這些 key；``selected``／``excluded`` 仍重新
+#: 套 allowlist，stale／freshness 欄位一律依這次讀取重算。
+_SEEDABLE_PERSONA_KEYS: tuple[str, ...] = (
+    "persona", "decision_id", "source", "mode", "outcome", "policy_version",
+    "policy_config_revision", "observation_version", "demand_version",
+    "qualification_version", "requested_profile_key", "resolved_profile_key",
+    "generated_at_ms", "reservation_id", "card_id", "attempt_id", "reason",
+    "selected_feasible", "retry_eligible", "reset_at_ms",
+)
+_CLASSIFICATION_KEYS: tuple[str, ...] = ("demand", "observation", "binding", "qualification")
+
 
 def _allowlisted_mapping(value: object, keys: Sequence[str]) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
@@ -186,6 +206,49 @@ class _CachedDecision:
     read_at_ms: int
 
 
+@dataclass(frozen=True)
+class _SeededDecision:
+    """跨 process 的 last-good 種子：上一個 reader process 投影出來、已經過
+    allowlist 的 persona 欄位，加上它最後一次真正讀到 store 的時間。"""
+
+    payload: Mapping[str, Any]
+    read_at_ms: int
+
+
+@dataclass(frozen=True)
+class _SeedAttemptView:
+    """供 :func:`_attempt_mismatch_reason` 判定目前 attempt 用的最小欄位——
+    與 ``AdmissionDecision`` 同名，只來自種子內已投影的非機敏識別欄位。"""
+
+    decision_id: str
+    run_id: str
+    card_id: str
+    attempt_id: str
+    outcome: str
+    selected: Mapping[str, Any] | None
+    reason: str | None
+
+
+def _seed_persona_payload(persona_payload: object) -> dict[str, Any] | None:
+    if not isinstance(persona_payload, Mapping) or persona_payload.get("available") is not True:
+        return None
+    for key in ("decision_id", "card_id", "attempt_id"):
+        if not isinstance(persona_payload.get(key), str) or not persona_payload.get(key):
+            return None
+    if persona_payload.get("outcome") not in ("admit", "wait"):
+        return None
+    payload = {key: persona_payload[key] for key in _SEEDABLE_PERSONA_KEYS if key in persona_payload}
+    payload["selected"] = _allowlisted_mapping(persona_payload.get("selected"), _ALLOWED_CANDIDATE_KEYS)
+    payload["excluded"] = _allowlisted_sequence(persona_payload.get("excluded"), _ALLOWED_EXCLUDED_KEYS)
+    classification = persona_payload.get("classification")
+    payload["classification"] = {
+        key: classification[key]
+        for key in _CLASSIFICATION_KEYS
+        if isinstance(classification, Mapping) and isinstance(classification.get(key), str)
+    }
+    return payload
+
+
 class DecisionReadCache:
     """decision store 讀取失敗時的 last-good 快取（純記憶體，不落地）。
 
@@ -208,10 +271,18 @@ class DecisionReadCache:
     ``build_runtime_status_provider()`` 在外層（呼叫一次、跨輪共用）建立
     ``quota_decision_cache``，內層 ``provider()`` closure 每輪呼叫時沿用同
     一個實例，不重建。
+
+    #840 AC4（跨 process 重啟）：記憶體快取隨 reader process 結束而消失；若
+    重啟當下 store 恰好不可讀，就沒有 last-good 可回退。呼叫端因此可用
+    :meth:`seed_last_good_from_projections` 以**自己上一份耐久輸出**（Monitor
+    的 durable work snapshot、daemon 的 status.json）當種子——種子只在這次
+    讀取失敗、且記憶體內沒有 last-good 時才被採用，仍要通過目前 attempt 判定，
+    並帶上次成功讀取的時間當 ``stale_since_ms``；store 可讀時一律以 store 為準。
     """
 
     def __init__(self) -> None:
         self._cache: dict[str, _CachedDecision] = {}
+        self._seeded: dict[str, _SeededDecision] = {}
         # #840 對抗審查修復（MAJOR，manager.py 熱路徑）：`decision_id` →
         # raw row 的全檔索引，一個 store 路徑最多存一份，只在檔案身分
         # （見 `_file_identity`）真的變了才重讀。修好之前，`get()` 對每個
@@ -306,6 +377,40 @@ class DecisionReadCache:
                 "observed_at_ms": now_ms,
             }
         return None, None
+
+    def seed_last_good_from_projections(self, projections: object) -> int:
+        """以上一個 reader process 的投影（``project_workflow_quota_admission``
+        的輸出）當跨 process last-good 種子，回傳採用的 persona 數。
+
+        只採 ``available`` 為真、帶完整 decision／card／attempt 識別的 persona；
+        種子若本身已是 stale（上一個 process 也讀不到），沿用它原本的
+        ``stale_since_ms``，否則用該份投影的 ``as_of_ms``。格式不符一律略過。
+        """
+        if isinstance(projections, Mapping):
+            projections = list(projections.values())
+        if not isinstance(projections, (list, tuple)):
+            return 0
+        adopted = 0
+        for projection in projections:
+            if not isinstance(projection, Mapping):
+                continue
+            as_of_ms = projection.get("as_of_ms")
+            personas = projection.get("personas")
+            if not isinstance(personas, Mapping):
+                continue
+            for persona_payload in personas.values():
+                payload = _seed_persona_payload(persona_payload)
+                if payload is None:
+                    continue
+                since = persona_payload.get("stale_since_ms") if persona_payload.get("stale") is True else as_of_ms
+                if type(since) is not int or since < 0:
+                    continue
+                self._seeded[payload["decision_id"]] = _SeededDecision(payload=payload, read_at_ms=since)
+                adopted += 1
+        return adopted
+
+    def seeded_last_good(self, decision_id: str) -> _SeededDecision | None:
+        return self._seeded.get(decision_id)
 
 
 def _job_ordinal_from_attempt_id(
@@ -494,6 +599,51 @@ def _attempt_mismatch_reason(
     return "unknown-outcome"
 
 
+def _superseded_payload(persona: str, decision_id: str, mismatch_reason: str) -> dict[str, Any]:
+    # 不相符：呈現「目前 attempt 尚無決策」，不得沿用舊 attempt 的
+    # mode／outcome／selected（見票面：『不得沿用舊 attempt』）。
+    return {
+        "persona": persona,
+        "decision_id": decision_id,
+        "source": "decision-store",
+        "available": False,
+        "stale": False,
+        "gap_reason": "quota-decision-attempt-superseded",
+        "mismatch_reason": mismatch_reason,
+    }
+
+
+def _project_seeded_persona(
+    persona: str,
+    seeded: _SeededDecision,
+    stale_info: Mapping[str, Any],
+    *,
+    run_id: str,
+    current_identity: object,
+    needs_human_reason: object,
+    jobs: object,
+) -> dict[str, Any]:
+    """#840 AC4：store 讀不到、記憶體內也沒有 last-good 時，改用上一個 reader
+    process 的耐久投影當 last-good——仍先以目前 attempt 事實判定，不相符就
+    與記憶體路徑一樣回『目前 attempt 尚無決策』。"""
+    payload = seeded.payload
+    if current_identity is not _ATTEMPT_CHECK_DISABLED:
+        view = _SeedAttemptView(
+            decision_id=payload["decision_id"], run_id=run_id, card_id=payload["card_id"],
+            attempt_id=payload["attempt_id"], outcome=payload["outcome"],
+            selected=payload.get("selected"), reason=payload.get("reason"),
+        )
+        mismatch_reason = _attempt_mismatch_reason(
+            view, current_identity, needs_human_reason=needs_human_reason, jobs=jobs,
+        )
+        if mismatch_reason is not None:
+            return _superseded_payload(persona, payload["decision_id"], mismatch_reason)
+    projected = {**payload, "persona": persona, "source": "decision-store", "available": True}
+    projected.update(stale_info)
+    projected["stale_since_ms"] = seeded.read_at_ms
+    return projected
+
+
 def _project_persona_decision(
     persona: str,
     *,
@@ -505,6 +655,7 @@ def _project_persona_decision(
     now_ms: int,
     needs_human_reason: object = None,
     jobs: object = None,
+    run_id: str = "",
 ) -> dict[str, Any] | None:
     if not isinstance(pointer, Mapping):
         return None
@@ -512,6 +663,13 @@ def _project_persona_decision(
     if not isinstance(decision_id, str) or not decision_id:
         return None
     decision, stale_info = cache.get(store, decision_id, now_ms=now_ms)
+    if decision is None and stale_info is not None:
+        seeded = cache.seeded_last_good(decision_id)
+        if seeded is not None:
+            return _project_seeded_persona(
+                persona, seeded, stale_info, run_id=run_id, current_identity=current_identity,
+                needs_human_reason=needs_human_reason, jobs=jobs,
+            )
     if decision is None:
         payload: dict[str, Any] = {
             "persona": persona,
@@ -530,17 +688,7 @@ def _project_persona_decision(
             decision, current_identity, needs_human_reason=needs_human_reason, jobs=jobs,
         )
         if mismatch_reason is not None:
-            # 不相符：呈現「目前 attempt 尚無決策」，不得沿用舊 attempt 的
-            # mode／outcome／selected（見票面：『不得沿用舊 attempt』）。
-            return {
-                "persona": persona,
-                "decision_id": decision.decision_id,
-                "source": "decision-store",
-                "available": False,
-                "stale": False,
-                "gap_reason": "quota-decision-attempt-superseded",
-                "mismatch_reason": mismatch_reason,
-            }
+            return _superseded_payload(persona, decision.decision_id, mismatch_reason)
     requested_profile_key = None
     resolved_profile_key = decision.profile_key
     # #840 對抗審查修復第二輪（MAJOR，約本檔原 250 行）：`execution_profile_bindings`
@@ -584,6 +732,12 @@ def _project_persona_decision(
         "resolved_profile_key": resolved_profile_key,
         "generated_at_ms": decision.generated_at_ms,
         "reservation_id": decision.reservation_id,
+        # #840 修正範圍第 2 點「投影 run/card/attempt/decision」：card 與
+        # attempt 識別（非機敏）一併帶出；跨 process last-good 也靠它們在
+        # store 讀不到時仍能判定目前 attempt（見 `_project_seeded_persona`）。
+        "card_id": decision.card_id,
+        "attempt_id": decision.attempt_id,
+        "reason": decision.reason,
         "selected": _allowlisted_mapping(decision.selected, _ALLOWED_CANDIDATE_KEYS),
         "excluded": _allowlisted_sequence(decision.excluded, _ALLOWED_EXCLUDED_KEYS),
         "classification": {
@@ -611,9 +765,14 @@ def _project_wait(needs_human_reason: object) -> dict[str, Any] | None:
     payload = {key: needs_human_reason[key] for key in _ALLOWED_WAIT_KEYS if key in needs_human_reason}
     context = needs_human_reason.get("context")
     if isinstance(context, Mapping):
-        # #527 `DiagnosticReason.context` 已由該型別驗證過（string→string、
-        # 每值上限 200 字、key 數上限 16）；本模組不重驗，原樣帶出。
-        payload["context"] = dict(context)
+        # #527 `DiagnosticReason.context` 只驗型別與長度（string→string、每值
+        # 上限 200 字、key 數上限 16），不驗內容；這裡只帶出 quota-wait producer
+        # 寫入的識別 key（#840 AC5 allowlist），其餘 key 一律不轉發。
+        payload["context"] = {
+            key: context[key]
+            for key in _ALLOWED_WAIT_CONTEXT_KEYS
+            if key in context and isinstance(context[key], str)
+        }
     return payload
 
 
@@ -710,6 +869,7 @@ def project_workflow_quota_admission(
                 now_ms=now_ms,
                 needs_human_reason=needs_human_reason,
                 jobs=jobs,
+                run_id=run_id,
             )
             if projected is not None:
                 personas[persona] = projected
