@@ -1355,6 +1355,8 @@ def _safe_trust_root(value: Mapping[str, object] | None) -> dict[str, object]:
         "install-receipt-unavailable",
         "install-receipt-unconfigured",
         "install-receipt-invalid",
+        "install-rollback-blocked",
+        "install-rollback-incomplete",
     }:
         result["reason"] = reason
     in_flight = value.get("in_flight_jobs")
@@ -2096,9 +2098,27 @@ def trust_root_receipt_summary(path: Path | str | None) -> dict[str, object]:
                 for row in activations
             )
         )
-        status = "rolled-back" if isinstance(rollback, Mapping) else ("verified" if verified else "unknown")
+        # 狀態以 installer 寫入的 receipt ``state`` 為準（#841 AC5）：rollback 遇到
+        # retained drift／unknown durable state（例如 Manager 事後寫入的 jobs.json）
+        # 會停在 ``rollback-blocked``，不得因為已有 ``rollback`` 區塊就寫成
+        # ``rolled-back``；rollback 中斷時 receipt 停在 ``rolling-back``，
+        # ``qualified`` 尚未清掉、activation journal 已逐筆移除，也不得回頭算成
+        # ``verified``。
+        state = document.get("state")
+        reason: str | None = None
+        if state == "rolled-back" and isinstance(rollback, Mapping):
+            status = "rolled-back"
+        elif state == "rollback-blocked":
+            status, reason = "unknown", "install-rollback-blocked"
+        elif state == "rolling-back":
+            status, reason = "unknown", "install-rollback-incomplete"
+        elif state == "applied" and verified:
+            status = "verified"
+        else:
+            status = "unknown"
         summary: dict[str, object] = {
             "status": status,
+            "reason": reason,
             "receipt_id": document.get("receipt_id"),
             "plan_sha256": document.get("plan_sha256"),
             "receipt_sha256": receipt_digest,

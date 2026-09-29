@@ -290,6 +290,9 @@ def test_trust_root_receipt_summary_binds_install_activation_verify_and_rollback
     document = {
         "receipt_id": "b73e4da7-ef66-423e-bad0-162075ee6d55",
         "plan_sha256": "1" * 64,
+        # 真 receipt 在 rollback 完成時由 installer 寫成 rolled-back；摘要以 state 為準
+        # （完整 installer 路徑見 test_loaded_runtime_rollback_receipt_841.py）。
+        "state": "rolled-back",
         "qualified": True,
         "activation_journal": [
             {"service": "manager", "status": "completed"},
