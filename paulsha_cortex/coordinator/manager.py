@@ -15501,6 +15501,11 @@ def _dispatch_workflow_card(
         # 續租，後續重試只會一直撞 duplicate（見下面 try/except/finally）。
         quota_admission.IN_FLIGHT_DISPATCHES.mark_started(quota_reservation_handle["reservation_id"])
     quota_job_created = False
+    # except／finally 會清理 sandbox：必須在 try 之前就有值，否則 provisioning
+    # 之前的失敗（例如兩個 Manager 競態）會讓 handler 擲 UnboundLocalError、
+    # 蓋掉原始例外（#1183 CI）。
+    planner_sandbox: Path | None = None
+    reviewer_sandbox: Path | None = None
     try:
         if quota_reservation_handle is not None:
             # 對抗審查第四輪 MAJOR（quota_admission.py:1119）：reserve() 給的
@@ -15632,8 +15637,6 @@ def _dispatch_workflow_card(
         # 配發即消耗（見 `registry.reserve_job_id`），因此 provision 失敗只是燒掉一個
         # 序號，不會有兩個 job 共用同一個 id、進而共用同一個目錄。
         reserved_job_id = registry.reserve_job_id(task)
-        planner_sandbox: Path | None = None
-        reviewer_sandbox: Path | None = None
         sandbox_hash: str | None = None
         repo_root = run.workspace_root
         if step.persona == "planner":

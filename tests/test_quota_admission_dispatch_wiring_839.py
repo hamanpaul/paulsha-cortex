@@ -1833,3 +1833,42 @@ def test_concurrent_instance_sweep_renew_between_create_job_and_bind_retries_and
     # 「另一個 instance」的 foreign sweep renew=2 → bind() 重試成功=3。
     assert bound[0].sequence == 3
     assert quota_admission.IN_FLIGHT_DISPATCHES.is_in_flight(bound[0].reservation_id) is False
+
+
+def test_failure_before_sandbox_provisioning_surfaces_the_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1183 CI（兩 Manager 競態）：provisioning try 區塊在 sandbox 變數賦值前就失敗時，
+    except 區塊曾因引用未賦值的 ``planner_sandbox`` 擲 UnboundLocalError、蓋掉原始
+    例外。原始錯誤必須原樣傳出，reservation 也要在 spawn 前釋放。"""
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    worktree = tmp_path / "wt"
+    _init_worktree(worktree)
+    run = _make_run(registry, workspace_root=tmp_path)
+    identities = _two_builder_identities()
+    step = manager._current_workflow_step(run)
+    codex_identity = next(c for c in manager._workflow_identity_candidates(run, step, identities) if c.executor == "codex")
+    codex_key = _resolved_profile_key(run, step, codex_identity, "codex", "gpt-primary")
+    descriptor = _pool_descriptor(account="acct-codex", pool="pool-codex")
+    now_ms = int(time.time() * 1000)
+    _freeze_wall_clock(monkeypatch, now_ms=now_ms)
+    shadow = QuotaShadowService.in_memory()
+    _observe(shadow, descriptor, "short", "5", profile_key=codex_key, now_ms=now_ms)
+    ctx = quota_admission.DispatchContext(
+        authority=QuotaReservationAuthority(tmp_path / "reservations.jsonl"),
+        store=quota_admission.AdmissionDecisionStore(tmp_path / "decisions.jsonl"),
+        shadow=shadow, descriptors=(descriptor,), unit_catalog=(),
+        bindings=(_binding(descriptor, codex_key),), environment={"PSC_QUOTA_ADMISSION_ENFORCE": "on"},
+    )
+
+    def fail_before_provisioning(**_kwargs):
+        raise RuntimeError("stage context failed before provisioning")
+
+    monkeypatch.setattr(manager, "_workflow_stage_execution_context", fail_before_provisioning)
+
+    with pytest.raises(RuntimeError, match="stage context failed before provisioning"):
+        _dispatch(registry, run, identities, worktree, tmp_path / "coordinator", quota_admission_context=ctx)
+
+    assert registry.list_jobs() == []
+    assert ctx.authority.list_by_state("reserved", now_ms=now_ms + 1) == ()

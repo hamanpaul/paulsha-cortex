@@ -3,3 +3,4 @@
 - #840 修正：`cortex work show` 的 `blocking_reason` 改以 exact (repo, work_id) 取值，同 work_id 的其他 repo 不再借用彼此的 quota 等待來源；`wait.context` 只帶出 quota-wait producer 的 `run_id`／`work_id`／`card`／`attempted_candidates`，帳號、token、raw prompt 等其他 key 不轉發；`quota-admission-insufficient` wait receipt 記下 `policy_config_revision`；persona 投影新增 `card_id`／`attempt_id`／`reason`。
 - #840 reader 跨 process 重啟、decision store 此時不可讀：Monitor 以 durable work snapshot、Manager daemon 以上一份 status.json 的投影當 last-good 種子，保留決策內容並標 stale 與重啟前最後成功讀取時間，仍依目前 attempt 事實判定是否已被取代。
 - `work show` 的 `schema_retry` 與 `candidate_git_base` 改為 exact (repo, work_id) 比對，同 work_id 跨 repo 不再互相借用（#1182）。
+- workflow 派工在 sandbox 變數賦值前失敗時（例如兩個 Manager 競態），except 區塊不再擲 UnboundLocalError 蓋掉原始例外（CI 揭露）。
