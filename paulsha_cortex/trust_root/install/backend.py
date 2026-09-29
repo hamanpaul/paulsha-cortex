@@ -3229,6 +3229,72 @@ def _discard_legacy_quarantine(
         os.close(parent_fd)
 
 
+def _resume_legacy_discard(
+    path: Path,
+    identity: Mapping[str, object],
+    *,
+    quarantine_root: Path,
+    key: str,
+) -> bool:
+    """Finish a purge that crashed after staging; ``False`` when nothing is staged.
+
+    The staged ``tree`` is revalidated against the adoption identity exactly as
+    a fresh purge would; any drift restores it to ``path`` (never overwriting)
+    and raises, so a crash never strands an object in private staging (#1152
+    review).
+    """
+
+    if (
+        type(identity.get("device")) is not int
+        or type(identity.get("inode")) is not int
+        or identity.get("type") not in {"directory", "file", "symlink"}
+        or not isinstance(identity.get("tree_sha256"), str)
+    ):
+        raise InstallDriftError(f"no purge identity binds the quarantined object at {path}")
+    staging = _discard_staging_path(quarantine_root, key)
+    staging_fd = _open_quarantine_chain(staging, quarantine_root, create=False)
+    if staging_fd is None:
+        return False
+    try:
+        staged = _stat_at(staging_fd, "tree")
+        if staged is None:
+            return False
+        parent_fd = _open_path_chain(path.parent)
+        try:
+            try:
+                if (staged.st_dev, staged.st_ino, _file_type_name(staged.st_mode)) != (
+                    identity["device"], identity["inode"], identity["type"]
+                ):
+                    raise InstallDriftError(f"{path} staged object no longer matches its adoption inode")
+                if _legacy_quarantine_identity(staging / "tree") != dict(identity):
+                    raise InstallDriftError(f"{path} staged object drifted; restored")
+                if identity["type"] == "directory":
+                    digest, manifest = _tree_digest_at(staging_fd, "tree")
+                    if digest != identity["tree_sha256"]:
+                        raise InstallDriftError(f"{path} staged tree digest drifted; restored")
+                    _remove_verified_tree(staging_fd, "tree", manifest)
+                else:
+                    os.unlink("tree", dir_fd=staging_fd)
+                os.fsync(staging_fd)
+            except BaseException as exc:
+                if _stat_at(staging_fd, "tree") is not None:
+                    restored = _restore_from_discard(
+                        parent_fd=parent_fd,
+                        path=path,
+                        staging=staging,
+                        staging_fd=staging_fd,
+                        leaf="tree",
+                        problem=str(exc),
+                    )
+                    raise restored from exc
+                raise
+        finally:
+            os.close(parent_fd)
+    finally:
+        os.close(staging_fd)
+    return True
+
+
 def _discard_staging_path(quarantine_root: Path, key: str) -> Path:
     """The installer-owned private staging for one discard: ``<root>/.discard/<hash>``."""
 

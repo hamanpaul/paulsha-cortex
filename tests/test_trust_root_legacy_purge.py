@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 from datetime import datetime, timezone
@@ -331,3 +332,118 @@ def test_execution_deletes_only_report_items_and_records_receipt(monkeypatch) ->
     assert deleted == [Path("/quarantine/one")]
     assert results[0]["status"] == "deleted"
     assert receipt.to_dict()["legacy_purge_journal"][0]["report_sha256"] == "d" * 64
+
+
+def _crash_after_staging(root: Path, target: Path, key: str) -> Path:
+    """重現 purge 在物件搬進私有 staging 之後、刪除之前 crash 的狀態。"""
+
+    staging = backend._discard_staging_path(root, key)
+    staging.mkdir(parents=True, mode=0o700)
+    (root / ".discard").chmod(0o700)
+    os.rename(target, staging / "tree")
+    return staging
+
+
+def test_resume_finishes_a_purge_that_crashed_after_staging(tmp_path) -> None:
+    root, target, identity = _quarantine_tree(tmp_path)
+    staging = _crash_after_staging(root, target, "receipt:step")
+
+    assert backend._resume_legacy_discard(
+        target, identity, quarantine_root=root, key="receipt:step"
+    ) is True
+    assert not target.exists()
+    assert not (staging / "tree").exists()
+    # 再跑一次：沒有 staged 物件可接續。
+    assert backend._resume_legacy_discard(
+        target, identity, quarantine_root=root, key="receipt:step"
+    ) is False
+
+
+def test_resume_restores_a_staged_tree_that_drifted(tmp_path) -> None:
+    root, target, identity = _quarantine_tree(tmp_path)
+    staging = _crash_after_staging(root, target, "receipt:step")
+    (staging / "tree" / "data").write_text("changed while staged")
+
+    with pytest.raises(InstallDriftError):
+        backend._resume_legacy_discard(
+            target, identity, quarantine_root=root, key="receipt:step"
+        )
+    assert (target / "data").read_text() == "changed while staged"
+    assert not (staging / "tree").exists()
+
+
+def _pending_report(monkeypatch, tmp_path, *, staged: bool):
+    adoption_path, adoption, successor_path, successor = _receipt_documents(
+        tmp_path, successor_at=datetime(2026, 8, 1, tzinfo=timezone.utc)
+    )
+    adoption["legacy_purge_journal"] = [
+        {"step_id": "q-one", "path": str(tmp_path / "quarantine" / "one"), "status": "pending"}
+    ]
+    if staged:
+        staging = backend._discard_staging_path(
+            tmp_path / "quarantine", "legacy-purge:adoption-id:q-one"
+        )
+        (staging / "tree").mkdir(parents=True)
+    documents = {adoption_path: adoption, successor_path: successor}
+    monkeypatch.setattr(legacy_purge, "_read_receipt", lambda p: documents[p])
+    return legacy_purge.build_legacy_purge_report(
+        adoption_path, now=datetime(2026, 9, 29, tzinfo=timezone.utc)
+    )
+
+
+def test_report_resumes_a_pending_purge_whose_object_is_staged(monkeypatch, tmp_path) -> None:
+    report = _pending_report(monkeypatch, tmp_path, staged=True)
+    assert report["entries"][0]["action"] == "resume"
+    assert report["entries"][0]["reason"] is None
+
+
+def test_report_finalizes_a_pending_purge_whose_object_is_already_gone(
+    monkeypatch, tmp_path
+) -> None:
+    report = _pending_report(monkeypatch, tmp_path, staged=False)
+    assert report["entries"][0]["action"] == "finalize"
+
+
+def test_execution_resumes_and_finalizes_pending_purges(monkeypatch, tmp_path) -> None:
+    """crash 後重跑：resume 走接續刪除，finalize 只在物件確實不在時補記 deleted；
+    finalize 時物件又出現則保留並列 drift。"""
+
+    document = {
+        "receipt_id": "adoption-id",
+        "plan_sha256": "a" * 64,
+        "plan": {},
+        "legacy_adoption": {"quarantine_root": str(tmp_path / "quarantine")},
+        "legacy_purge_journal": [
+            {"step_id": "q-resume", "status": "pending"},
+            {"step_id": "q-gone", "status": "pending"},
+            {"step_id": "q-back", "status": "pending"},
+        ],
+    }
+    receipt = InstallReceipt(document)
+    resumed: list[Path] = []
+
+    def resume(path, *_args, **_kwargs):
+        resumed.append(path)
+        return path.name == "resume"
+
+    monkeypatch.setattr(legacy_purge.backend, "_resume_legacy_discard", resume)
+    reappeared = tmp_path / "quarantine" / "back"
+    reappeared.mkdir(parents=True)
+    identity = {"device": 1, "inode": 2, "type": "directory", "tree_sha256": "b" * 64}
+    results = legacy_purge.purge_legacy_entries(
+        receipt,
+        {
+            "receipt_id": "adoption-id",
+            "plan_sha256": "a" * 64,
+            "report_sha256": "d" * 64,
+            "entries": [
+                {"step_id": "q-resume", "path": str(tmp_path / "quarantine" / "resume"), "identity": identity, "action": "resume"},
+                {"step_id": "q-gone", "path": str(tmp_path / "quarantine" / "gone"), "identity": identity, "action": "finalize"},
+                {"step_id": "q-back", "path": str(reappeared), "identity": identity, "action": "finalize"},
+            ],
+        },
+    )
+
+    statuses = {row["step_id"]: row["status"] for row in results}
+    assert statuses == {"q-resume": "deleted", "q-gone": "deleted", "q-back": "retained-drift"}
+    assert reappeared.is_dir()

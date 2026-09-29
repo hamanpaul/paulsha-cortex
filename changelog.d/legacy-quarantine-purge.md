@@ -1,1 +1,2 @@
 - 新增 trust-root legacy quarantine purge，以 receipt chain、qualified 時間及 inode／樹 digest 驗證決定保留或清除，並以 dry-run 報告 digest 確認刪除。
+- purge 在物件搬進私有 staging 後 crash 時，重跑會接續（重驗 inode／digest 後刪除，drift 則還原回原路徑），物件已不在則只補記 journal；不再把 pending 項目誤列為 retain 而卡在 staging（#1152 審查）。

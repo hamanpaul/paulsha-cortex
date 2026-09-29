@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
 from . import backend
-from .core import InstallError, InstallReceipt, validate_prior_receipt_handoff
+from .core import (
+    InstallDriftError,
+    InstallError,
+    InstallReceipt,
+    validate_prior_receipt_handoff,
+)
 
 _RETENTION_SECONDS = 30 * 24 * 60 * 60
 
@@ -103,6 +109,11 @@ def build_legacy_purge_report(
     evaluated = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     age_ok = anchor is not None and (evaluated - anchor).total_seconds() >= _RETENTION_SECONDS
     entries: list[dict[str, object]] = []
+    pending_steps = {
+        row.get("step_id")
+        for row in adoption.get("legacy_purge_journal") or []
+        if isinstance(row, Mapping) and row.get("status") == "pending"
+    }
     journal = adoption.get("journal")
     if isinstance(journal, list):
         for entry in journal:
@@ -114,6 +125,7 @@ def build_legacy_purge_report(
             destination = step.get("destination")
             identity = entry.get("quarantine_identity")
             reason: str | None = None
+            action = "delete"
             if entry.get("status") != "completed":
                 reason = "adoption-entry-incomplete"
             elif anchor is None:
@@ -122,6 +134,14 @@ def build_legacy_purge_report(
                 reason = "qualified-successor-retention-under-30-days"
             elif not isinstance(destination, str) or not isinstance(identity, Mapping):
                 reason = "adoption-inode-or-tree-digest-missing"
+            elif entry.get("step_id") in pending_steps and not os.path.lexists(destination):
+                # 先前的 purge 在物件搬進私有 staging 之後 crash：staging 還有
+                # 物件就接續（重驗後刪除），沒有就只補記 journal（#1152 審查）。
+                staging = backend._discard_staging_path(
+                    Path(quarantine_root),
+                    f"legacy-purge:{adoption.get('receipt_id')}:{entry.get('step_id')}",
+                )
+                action = "resume" if os.path.lexists(staging / "tree") else "finalize"
             else:
                 try:
                     actual = backend._legacy_quarantine_identity(Path(destination))
@@ -133,7 +153,7 @@ def build_legacy_purge_report(
                 {
                     "step_id": entry.get("step_id"),
                     "path": destination,
-                    "action": "retain" if reason else "delete",
+                    "action": "retain" if reason else action,
                     "reason": reason,
                     "identity": dict(identity) if isinstance(identity, Mapping) else None,
                     "qualified_at": anchor.isoformat().replace("+00:00", "Z") if anchor else None,
@@ -172,8 +192,13 @@ def purge_legacy_entries(
         raise InstallError("legacy purge journal is invalid")
     results: list[dict[str, object]] = []
     for item in report.get("entries", []):
-        if not isinstance(item, Mapping) or item.get("action") != "delete":
+        if not isinstance(item, Mapping) or item.get("action") not in {
+            "delete",
+            "resume",
+            "finalize",
+        }:
             continue
+        action = item.get("action")
         path = Path(str(item.get("path")))
         identity = item.get("identity")
         step_id = item.get("step_id")
@@ -205,13 +230,22 @@ def purge_legacy_entries(
         if not isinstance(prior, dict):
             journal.append(pending)
         receipt._persist()
+        key = f"legacy-purge:{document['receipt_id']}:{step_id}"
         try:
-            backend._discard_legacy_quarantine(
-                path,
-                identity,
-                quarantine_root=root,
-                key=f"legacy-purge:{document['receipt_id']}:{step_id}",
-            )
+            if action == "delete":
+                backend._discard_legacy_quarantine(
+                    path, identity, quarantine_root=root, key=key
+                )
+            elif action == "resume":
+                backend._resume_legacy_discard(
+                    path, identity, quarantine_root=root, key=key
+                )
+            elif os.path.lexists(path) or backend._resume_legacy_discard(
+                path, identity, quarantine_root=root, key=key
+            ):
+                # finalize：報告時物件已不在；執行時又出現或仍有 staged 物件，
+                # 不能只補記，改以重新產生報告處理。
+                raise InstallDriftError(f"{path} reappeared after the purge report")
         except InstallError as exc:
             pending.update({"status": "retained-drift", "error": str(exc)})
             results.append(dict(pending))
