@@ -1,0 +1,1 @@
+- **#1153 fanout quota admission**：fanout 接上 workflow 共用的 quota assessment、decision receipt 與 reservation authority；shadow 維持原派工結果，enforce 額度不足時零 spawn 並回結構化等待。#381 limiter 先於 reserve；fanout reservation 綁定 job，launch failure settle 後記終局用量，#836 harvest 以 decision id 配對 shadow 終局 usage，periodic tick 依 fresh observation 自動重試。

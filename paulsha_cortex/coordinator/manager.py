@@ -3624,6 +3624,7 @@ def run_tick(
     identity_registry=None,
     launcher_factory=None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
+    quota_admission_context=None,
 ) -> dict:
     """跑完整 manager tick：fanout（dispatch_ready）→ complete_tick →（可選）收尾 janitor。
 
@@ -3658,6 +3659,7 @@ def run_tick(
     satisfied = is_satisfied if is_satisfied is not None else _satisfied_pred(handoff_dir)
     dispatched: list = []
     dispatch_skipped_by_backoff: list[dict[str, Any]] = []
+    quota_waits: list[dict[str, Any]] = []
     errors: list = []
     # 已有 handoff 終局紀錄（needs_human/failed/passed/verified 皆算）的 slice：
     # 不論 dispatch_skipped 與否都要掃描——這段刻意放在 idle 判斷之前、兩分支共用，
@@ -3690,6 +3692,8 @@ def run_tick(
                 launcher_factory=launcher_factory,
                 spawn_admission=spawn_admission,
                 backoff_skips=dispatch_skipped_by_backoff,
+                quota_admission_context=quota_admission_context,
+                quota_waits=quota_waits,
             )
         except autonomy.DispatchReadyError as exc:
             dispatched = list(exc.jobs)
@@ -3745,7 +3749,7 @@ def run_tick(
             reaped = reaper()
         except Exception as exc:
             reap_errors.append({"stage": "reap", "error": str(exc)})
-    return {
+    summary = {
         "dispatch_skipped": dispatch_skipped,
         "dispatch_skipped_by_backoff": dispatch_skipped_by_backoff,
         "dispatched": dispatched,
@@ -3756,6 +3760,9 @@ def run_tick(
         "skill_usage_events": skill_usage_events,
         "skill_janitor": skill_janitor_result,
     }
+    if quota_waits:
+        summary["quota_waits"] = quota_waits
+    return summary
 
 
 def _required_workflow_string(args: Mapping[str, object], field: str) -> str:
@@ -12013,9 +12020,15 @@ def _quota_admission_job_lookup_by_decision(
     效果等同『查無此 job』，交給既有的 lease／in-flight 判定（見呼叫端），
     不 bind、不 release（inconclusive），不需要另外特判。"""
     for job in registry.list_jobs():
+        job_run_id = job.get("workflow_run_id")
+        job_card_id = job.get("workflow_card")
+        if job_run_id is None and job.get("quota_decision_id") == decision_id:
+            task = job.get("task")
+            if isinstance(task, str):
+                job_run_id, job_card_id = f"fanout:{task}", task
         if (
-            job.get("workflow_run_id") == run_id
-            and job.get("workflow_card") == card_id
+            job_run_id == run_id
+            and job_card_id == card_id
             and job.get("quota_decision_id") == decision_id
         ):
             return job
@@ -12149,6 +12162,10 @@ def _harvest_admit_profile_key(
 
     run_id = job.get("workflow_run_id")
     card_id = job.get("workflow_card")
+    if run_id is None and isinstance(job.get("quota_decision_id"), str):
+        task = job.get("task")
+        if isinstance(task, str):
+            run_id, card_id = f"fanout:{task}", task
     exact = job.get("quota_decision_id")
     if isinstance(exact, str) and exact:
         row = admit_by_decision_id.get(exact)
@@ -12245,6 +12262,10 @@ def harvest_quota_terminal_usage(
     for job in registry.list_jobs():
         run_id = job.get("workflow_run_id")
         card_id = job.get("workflow_card")
+        if run_id is None and isinstance(job.get("quota_decision_id"), str):
+            task = job.get("task")
+            if isinstance(task, str):
+                run_id, card_id = f"fanout:{task}", task
         if not isinstance(run_id, str) or not isinstance(card_id, str):
             continue  # 非 workflow job（legacy slice／fanout）：沒有 admit receipt。
         ordinal = ordinals.get((run_id, card_id), 0)
