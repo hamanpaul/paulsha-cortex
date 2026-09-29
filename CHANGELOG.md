@@ -10,6 +10,7 @@
 ### Added
 
 - **#716 Manager gh 設定**：root-owned 唯讀的 gh config 加上 `version: "1"`，避免 gh 遷移寫檔導致 `gh auth status` 失敗（#716）。
+- **#1142 main-sync union＋重試用當下 main**：新增追蹤的 `.gitattributes` 宣告 `CHANGELOG.md merge=union`，ship main-sync probe 改以 `git --attr-source=<M> merge-tree` 讀 main 的 attributes，CHANGELOG 同位置插入不再判 conflict、非 union 路徑衝突照判，Candidate 自宣的 union 無效；main-sync stop 後的 `retry-build` 在下達當下重新 fetch origin/main（釘在 run-scoped pin ref），把當下的 exact M 寫進新的 `main-sync-retry` evidence、修復指令與 `WorkflowRun.main_sync_repair`，停機 evidence 保留作稽核、fetch 失敗不重置；harvest 以 quarantine ref 驗證修復候選是該 M 的後代，不含即拒絕。clean-behind 仍停在 `needs_human`（#1142）。
 - **#716 deployment canary Manager credential helper**：probe 改查 installer 實際寫的 URL-scoped `credential.https://github.com.helper`（reset＋gh 兩列），不再因查不帶 URL 的鍵而失敗（#716）。
 - **blocking findings 提示措辭**：兩個出口改稱「豁免 finding → retry-review」與「要求修正 → retry-build」，避免誤讀（#1139）。
 - **#1141 ship lane merge 後 run 自動收尾**：Manager 自動 merge 交付 PR 後，Monitor 把該 PR 關聯進 WorkAuthority、issue 關閉，tick 不再擲 `delivery WorkflowRun does not match current WorkAuthority`。delivery journal 證明本 run 交付 PR 已 merge、且 authority 的 PR 恰好只有該 PR 時，ship 綁回同一 run 完成 CompletionRecord／done；其他 PR 或未 merge 仍 fail-closed。`_merged_delivery_journal_bound` 接受 40-hex git tree id 與 run 自產 OpenSpec change；已交付 run 的 `next_actions`／`next_step_hint` 改指向 `retire-delivered`（#1141）。

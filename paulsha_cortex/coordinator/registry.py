@@ -5434,6 +5434,8 @@ class JobRegistry:
             frozen_readiness=(
                 current.frozen_readiness if frozen_readiness is None else frozen_readiness
             ),
+            # #1142：exact-M 綁定只由 retry-build reset 改寫，一般狀態更新原樣保留。
+            main_sync_repair=current.main_sync_repair,
             needs_human_reason=resolved_needs_human_reason,
         )
         self._workflows[index] = updated
@@ -5731,12 +5733,15 @@ class JobRegistry:
         retry_classification: str | None = None,
         model_chain_override: dict[str, dict[str, str]] | None = None,
         post_pass_adjudicated: bool = False,
+        main_sync_repair: dict[str, str] | None = None,
     ) -> WorkflowRun:
         """以 exact Candidate 重開最後 builder 卡，保留既有 evidence 與下游重驗契約。
 
         ``post_pass_adjudicated`` 僅供 work action 在 verify／review 全部通過且已記錄
         operator 裁決理由後使用；此路徑仍須符合相同 exact Candidate 與無 active job 條件。
         ``model_chain_override`` 則維持既有明示覆寫行為，派工前仍由一般路徑驗證 identity。
+        ``main_sync_repair``（#1142）是這一輪修復的 exact-M 綁定；每次 reset 都以
+        呼叫端給的值取代（``None`` 即清除），不沿用上一輪的綁定。
         """
 
         index = self._find_workflow_run_index(run_id)
@@ -5872,6 +5877,9 @@ class JobRegistry:
                 else retry_classification
             ),
             model_chain_override=effective_model_chain_override,
+            main_sync_repair=(
+                dict(main_sync_repair) if main_sync_repair is not None else None
+            ),
             updated_at=_now_iso(),
         )
         self._workflows[index] = updated

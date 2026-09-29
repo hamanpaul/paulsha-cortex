@@ -53,12 +53,25 @@ from .planning import (
     compute_sizing_score,
 )
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
-from .workflow import MODEL_CHAIN_PERSONAS, validate_ship_stage_transition
+from .workflow import (
+    MAIN_SYNC_REPAIR_SCHEMA,
+    MODEL_CHAIN_PERSONAS,
+    validate_ship_stage_transition,
+)
 
 
 MAIN_SYNC_UNAVAILABLE_REASON = "main-sync-unavailable"
 MAIN_SYNC_PROBE_TIMEOUT_SECONDS = 15.0
 MAIN_SYNC_FULL_OBJECT_ID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+#: #1142：retry-build 當下取得的 main 釘在來源樹這條 run-scoped ref 上（不動
+#: `FETCH_HEAD`／`refs/remotes/origin/main`），harvest 驗證前 M 不會被 gc 掉，
+#: 也不會被同一棵來源樹上的其他 fetch 蓋掉。下一次 main-sync retry-build 覆寫它。
+MAIN_SYNC_RETRY_PIN_REF_PREFIX = "refs/cortex/main-sync"
+#: #1142：harvest 先把 bundle 的 branch 收進這條 run-scoped quarantine ref，驗過
+#: 「候選是 retry 當下 M 的後代」才交給 `harvest_branch()` 推進 feature ref。
+MAIN_SYNC_QUARANTINE_REF_PREFIX = "refs/cortex/main-sync-quarantine"
+MAIN_SYNC_RETRY_EVIDENCE_SCHEMA = "cortex-main-sync-retry/v1"
+_MAIN_SYNC_REF_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
 
 @dataclass
@@ -1057,10 +1070,19 @@ def _probe_main_sync(
             raw=dict(raw),
         )
 
+    # #1142：merge driver 由 attributes 決定（repo 追蹤的 `.gitattributes` 宣告
+    # `CHANGELOG.md merge=union`）。merge-tree 預設讀**工作樹**的 `.gitattributes`，
+    # 讓判定跟著 ship clone 當下 checkout 的狀態漂移；改以全域 `--attr-source`
+    # 固定讀 M（目標分支已合入、已審的版本）的 tree。Candidate 自己改的
+    # attributes 因此無法把真衝突宣告成 union 而矇過 probe；`$GIT_DIR/info/attributes`
+    # 仍照 git 既有優先序套用。需要 git >= 2.43：全域 `--attr-source` 自 2.41 起才有，
+    # 而 merge-tree 搭配它在 2.43 之前會 segfault——舊版一律落成 merge-tree stage
+    # failure（`main-sync-unavailable`），fail-closed，不會誤判 in-sync。
     merge_tree = _run_main_sync_stage(
         worktree=worktree,
         stage="merge-tree",
         argv=(
+            f"--attr-source={main_head}",
             "merge-tree",
             "--write-tree",
             "--name-only",
@@ -1188,6 +1210,89 @@ def _main_sync_stop_result(
         "main_sync": payload,
         **evidence,
     }
+
+
+def main_sync_run_ref(prefix: str, run_id: str) -> str:
+    """#1142：main-sync 在來源樹上的 run-scoped ref 名（pin／quarantine 共用推導）。"""
+
+    if (
+        prefix not in {MAIN_SYNC_RETRY_PIN_REF_PREFIX, MAIN_SYNC_QUARANTINE_REF_PREFIX}
+        or not isinstance(run_id, str)
+        or _MAIN_SYNC_REF_SEGMENT_RE.fullmatch(run_id) is None
+    ):
+        raise ValueError("main-sync run ref malformed")
+    return f"{prefix}/{run_id}"
+
+
+@dataclass(frozen=True)
+class MainSyncRetryMain:
+    main_head: str
+    pin_ref: str
+
+
+def fetch_retry_main(
+    *,
+    source_repo: Path,
+    run_id: str,
+    runner: Callable[..., object] = subprocess.run,
+    timeout_seconds: float = MAIN_SYNC_PROBE_TIMEOUT_SECONDS,
+) -> MainSyncRetryMain:
+    """#1142：retry-build 下達當下重新取得 `origin/main`，回傳 exact M 與它的 pin ref。
+
+    停機 evidence 記錄的 M 只代表停機那一刻；活躍 repo 的 main 會繼續前進，鎖住
+    停機時的 M 會讓修復後的候選在下一次 ship probe 必然又落後。這裡以與 ship probe
+    同一組 bounded direct git stage 在 Manager 來源樹 fetch main，但只寫入
+    run-scoped pin ref（`--no-write-fetch-head`＋`--refmap=`：不碰 `FETCH_HEAD`，
+    也不順手更新 `refs/remotes/origin/main`），讓 harvest 驗證前 M 一直可達。
+
+    任何一段失敗都 raise：呼叫端尚未重置 run，run 維持 `needs_human`（fail-closed），
+    不會退回停機時的 M。
+    """
+
+    pin_ref = main_sync_run_ref(MAIN_SYNC_RETRY_PIN_REF_PREFIX, run_id)
+    fetch = _run_main_sync_stage(
+        worktree=source_repo,
+        stage="retry-fetch",
+        argv=(
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
+            "origin",
+            f"+refs/heads/main:{pin_ref}",
+        ),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    if fetch.error_kind is not None or fetch.returncode != 0:
+        raise RuntimeError(
+            "retry-build could not fetch current origin/main "
+            f"(stage=retry-fetch, error_kind="
+            f"{_main_sync_command_failure_kind(fetch.stage, fetch)}, "
+            f"returncode={fetch.returncode})"
+        )
+    resolve = _run_main_sync_stage(
+        worktree=source_repo,
+        stage="retry-main-resolve",
+        argv=("rev-parse", "--verify", "--quiet", f"{pin_ref}^{{commit}}"),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    if resolve.error_kind is not None or resolve.returncode != 0:
+        raise RuntimeError(
+            "retry-build could not resolve current origin/main "
+            f"(stage=retry-main-resolve, error_kind="
+            f"{_main_sync_command_failure_kind(resolve.stage, resolve)}, "
+            f"returncode={resolve.returncode})"
+        )
+    main_head = _main_sync_object_id(resolve.stdout.decode("ascii", errors="replace"))
+    if main_head is None:
+        raise RuntimeError(
+            "retry-build could not resolve current origin/main "
+            "(stage=retry-main-resolve, error_kind=bad-sha)"
+        )
+    return MainSyncRetryMain(main_head=main_head, pin_ref=pin_ref)
 
 
 def _delivery_closure_phase(
