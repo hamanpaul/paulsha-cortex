@@ -929,7 +929,7 @@ _RUNTIME_WORKTREE_ROOTS: tuple[str, ...] = (
 _RUNTIME_WORKTREE_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 #: What ``git worktree add --detach`` writes into ``.git/worktrees/<id>``.
 _RUNTIME_WORKTREE_ADMIN_ENTRIES = frozenset(
-    {"HEAD", "ORIG_HEAD", "commondir", "gitdir", "index", "locked", "logs"}
+    {"HEAD", "ORIG_HEAD", "commondir", "gitdir", "index", "locked", "logs", "refs"}
 )
 _RUNTIME_IDENTITY_KEYS = frozenset({"name", "email"})
 _RUNTIME_IDENTITY_VALUE = re.compile(r"[^\x00-\x1f\x7f]{1,256}")
@@ -1106,6 +1106,30 @@ def _runtime_directory_members(path: Path, label: str) -> set[str] | None:
         raise _RuntimeDrift(f"cannot inspect {label}") from exc
 
 
+def _require_empty_worktree_refs(path: Path, label: str) -> None:
+    """Newer git creates an empty per-worktree ``refs/`` in the registry entry.
+
+    Only real directories are the git-written shape; any file or symlink is a
+    per-worktree ref (``refs/bisect/*``, ``refs/worktree/*``) the Manager never
+    writes, so it stays drift.
+    """
+
+    if _runtime_directory_members(path, label) is None:
+        return
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        relative = Path(root).relative_to(path)
+        for name in files:
+            raise _RuntimeDrift(
+                f"undeclared linked worktree metadata: {label}/{(relative / name).as_posix()}"
+            )
+        for name in directories:
+            if (Path(root) / name).is_symlink():
+                raise _RuntimeDrift(
+                    "undeclared linked worktree metadata: "
+                    f"{label}/{(relative / name).as_posix()}"
+                )
+
+
 def _runtime_worktree_row(path: Path, real_root: Path, entry: str) -> dict[str, object]:
     """Prove one ``.git/worktrees/<id>`` entry is a declared runtime checkout."""
 
@@ -1119,6 +1143,8 @@ def _runtime_worktree_row(path: Path, real_root: Path, entry: str) -> dict[str, 
         logs = _runtime_directory_members(admin / "logs", f"{label}/logs")
         if logs is None or logs - {"HEAD"}:
             raise _RuntimeDrift(f"undeclared linked worktree metadata: {label}/logs")
+    if members and "refs" in members:
+        _require_empty_worktree_refs(admin / "refs", f"{label}/refs")
     gitdir = _read_runtime_metadata(admin / "gitdir")
     head = _read_runtime_metadata(admin / "HEAD")
     if gitdir is None or _read_runtime_metadata(admin / "commondir") != "../..":

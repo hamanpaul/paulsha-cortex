@@ -1362,6 +1362,21 @@ def test_repository_state_reconciles_manager_runtime_state(tmp_path: Path) -> No
     )
 
 
+def test_repository_state_accepts_empty_per_worktree_refs_directory(tmp_path: Path) -> None:
+    """較新的 git（CI 的 2.55）在 `.git/worktrees/<id>/` 建立空的 `refs/`；
+    只有目錄、沒有任何 ref 檔時屬 git 寫出的形狀（#1124）。"""
+
+    upgrade = repository_runtime_fixtures.repository_upgrade(tmp_path)
+    repository_runtime_fixtures.simulate_manager_runtime(upgrade)
+    admin = upgrade.repository / ".git" / "worktrees" / "s1124-review-1124"
+    (admin / "refs" / "worktree").mkdir(parents=True, exist_ok=True)
+
+    state = LocalInstallBackend(require_root=False).inspect_step(upgrade.old_step)
+
+    assert state["drift"] == []
+    assert state["installed_sha256"] == upgrade.old_step["desired_sha256"]
+
+
 def test_repository_replacement_keeps_manager_runtime_state_through_rollback(
     tmp_path: Path,
 ) -> None:
@@ -1512,6 +1527,14 @@ def _drift_worktree_metadata(upgrade, _monkeypatch) -> None:
     )
 
 
+def _drift_per_worktree_ref(upgrade, _monkeypatch) -> None:
+    admin = upgrade.repository / ".git" / "worktrees" / "s1124-review-1124"
+    (admin / "refs" / "bisect").mkdir(parents=True, exist_ok=True)
+    (admin / "refs" / "bisect" / "bad").write_text(
+        upgrade.new_commit + "\n", encoding="utf-8"
+    )
+
+
 def _drift_undeclared_ref(refname: str):
     def mutate(upgrade, _monkeypatch) -> None:
         repository_runtime_fixtures.git(
@@ -1569,6 +1592,7 @@ def _drift_foreign_owner(upgrade, monkeypatch) -> None:
         (_drift_in_tree_undeclared_worktree, ".git/worktrees/scratch"),
         (_drift_stray_runtime_root_entry, ".psc-review-worktrees/notes.txt"),
         (_drift_worktree_metadata, "config.worktree"),
+        (_drift_per_worktree_ref, "refs/bisect/bad"),
         (_drift_undeclared_ref("refs/heads/operator-topic"), "refs/heads/operator-topic"),
         (_drift_undeclared_ref("refs/notes/commits"), "refs/notes/commits"),
         (_drift_world_writable_runtime_file, "world-writable"),
@@ -1588,6 +1612,7 @@ def _drift_foreign_owner(upgrade, monkeypatch) -> None:
         "worktree-outside-runtime-roots",
         "stray-runtime-root-entry",
         "worktree-metadata",
+        "per-worktree-ref",
         "undeclared-branch",
         "undeclared-ref-namespace",
         "world-writable-runtime-file",
