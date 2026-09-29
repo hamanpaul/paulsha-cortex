@@ -602,14 +602,18 @@ def test_service_declaration_recognizes_installer_console_script_execstarts(
     from paulsha_cortex.runtime_attestation import service_declaration_projection
 
     wheel_digest = "d" * 64
-    venv = tmp_path / "opt" / "cortex" / "venvs" / wheel_digest
+    # installer 的真實形狀：`venv` 是指向 `venvs/<wheel digest>` 的 active link，
+    # unit 的 ExecStart 走 `venv/bin/cortex`，`bin/python` 是指向系統 interpreter
+    # 的 symlink（#1160 RC run 36555744467 在這個形狀上判成 unknown）。
+    slot = tmp_path / "opt" / "cortex" / "venvs" / wheel_digest
+    package_root = _write_fake_install(slot / "lib" / "python3.12" / "site-packages", "system")
+    (slot / "bin").mkdir(parents=True, exist_ok=True)
+    (slot / "bin" / "cortex").touch()
+    (slot / "bin" / "python").symlink_to(sys.executable)
+    (slot / ".cortex-wheel.sha256").write_text(wheel_digest + "\n", encoding="ascii")
+    venv = tmp_path / "opt" / "cortex" / "venv"
+    venv.symlink_to(slot)
     executable = venv / "bin" / "cortex"
-    python = venv / "bin" / "python"
-    package_root = _write_fake_install(venv / "lib" / "python3.12" / "site-packages", "system")
-    python.parent.mkdir(parents=True, exist_ok=True)
-    python.touch()
-    executable.touch()
-    (venv / ".cortex-wheel.sha256").write_text(wheel_digest + "\n", encoding="ascii")
     manager_unit = tmp_path / "cortex-manager.service"
     monitor_unit = tmp_path / "cortex-monitor.service"
     manager_unit.write_text("[Service]\nExecStart=/old/cortex service run\n", encoding="utf-8")

@@ -696,7 +696,10 @@ def _declared_service_artifact(
         and Path(argv[0]).is_absolute()
     ):
         interpreter = Path(argv[0]).with_name("python")
-        if interpreter.is_file() and not interpreter.is_symlink():
+        # venv 的 bin/python 本來就是指向系統 interpreter 的 symlink；這裡只用它
+        # 的路徑前綴找 site-packages（不執行它），venv 樹由 installer 以 root
+        # 擁有，因此不以 symlink 拒絕（#1160 RC run 36555744467）。
+        if interpreter.is_file():
             return artifact_identity_from_python(interpreter)
     module = {
         "manager": "paulsha_cortex.coordinator.manager_daemon",
