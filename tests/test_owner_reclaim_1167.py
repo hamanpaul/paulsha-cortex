@@ -552,6 +552,52 @@ def test_forged_completion_cannot_skip_the_evidence_handover_or_delete_the_slot(
     assert not (spool / f"{workspace.name}.json").exists()
 
 
+def test_retry_after_a_rejected_completion_converges_on_the_emptied_slot(
+    manager_runtime,
+) -> None:
+    """helper 已清空（marker 一併清掉）但完成紀錄被拒：重送不得卡在空 slot。"""
+
+    workspace = manager_runtime["workspace"]
+
+    def forge(spec):
+        Path(spec["log_path"]).write_text(
+            json.dumps(_nothing_preserved(spec)) + "\n", encoding="utf-8"
+        )
+
+    manager_runtime["unit"]["forge"] = forge
+    first = worktree_reclaim.reclaim_worktree(workspace, repo_root=manager_runtime["source"])
+    assert first.status == worktree_reclaim.RECLAIM_FAILED
+    assert workspace.is_dir() and list(workspace.iterdir()) == []
+    [archive] = _evidence_archives(workspace)
+
+    manager_runtime["unit"]["forge"] = None
+    retry = worktree_reclaim.reclaim_worktree(workspace, repo_root=manager_runtime["source"])
+
+    assert retry.status == worktree_reclaim.RECLAIM_RECLAIMED, retry.detail
+    assert retry.directory_removed
+    assert not workspace.exists()
+    # 空目錄的移除不起第二次 unit，也不動已移交的證據。
+    assert len(manager_runtime["started"]) == 1
+    assert (archive / "new-dir" / "untracked.txt").read_text() == "preserve me\n"
+    again = worktree_reclaim.reclaim_worktree(workspace, repo_root=manager_runtime["source"])
+    assert again.status == worktree_reclaim.RECLAIM_ABSENT
+
+
+def test_empty_directory_outside_the_pool_is_still_not_a_worktree(tmp_path: Path, monkeypatch) -> None:
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    monkeypatch.setenv("PSC_WORKTREE_ROOT", str(pool))
+    source = _source(tmp_path)
+    stray = tmp_path / "not-in-pool"
+    stray.mkdir()
+
+    outcome = worktree_reclaim.reclaim_worktree(stray, repo_root=source)
+
+    assert outcome.status == worktree_reclaim.RECLAIM_FAILED
+    assert outcome.detail == "worktree-path-not-a-worktree"
+    assert stray.is_dir()
+
+
 def test_forged_completion_cannot_remove_a_workspace_the_helper_never_cleared(
     manager_runtime,
 ) -> None:

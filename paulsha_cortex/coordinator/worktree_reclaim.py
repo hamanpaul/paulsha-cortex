@@ -290,6 +290,23 @@ def _looks_like_job_workspace(target: Path) -> bool:
     return job_workspace.is_job_clone(target) or _looks_like_linked_worktree(target)
 
 
+def _is_empty_pool_slot(target: Path) -> bool:
+    """``target`` 是否為 job pool 直屬、沒有任何項目的真目錄（#1167）。
+
+    讀不到（權限、pool 未設定）一律回 False，交回既有的安全閘處理。
+    """
+
+    try:
+        if target.is_symlink() or not target.is_dir():
+            return False
+        if target.resolve(strict=True).parent != paths.worktree_root().resolve(strict=True):
+            return False
+        with os.scandir(target) as entries:
+            return next(entries, None) is None
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _looks_like_linked_worktree(target: Path) -> bool:
     """linked worktree 的根目錄帶的是 `.git` **檔案**（內容 `gitdir: ...`）。"""
 
@@ -420,6 +437,29 @@ def reclaim_worktree(
     exists = target.exists() or target.is_symlink()
     if not registered and not exists:
         return WorktreeReclaim(RECLAIM_ABSENT, text, evidence_model=evidence_model)
+
+    # #1167：owner-bound 回收由 builder helper 清空工作區（marker 在 `.git/` 裡，
+    # 一併清掉）後，Manager 若在 rmdir 前中斷——程序死亡，或 helper 的完成紀錄
+    # 被判不符而 fail closed——pool 裡留下的是一個空目錄。它已不帶 marker，重送
+    # 走不了 owner-bound 路徑，下面的安全閘又會把它判成「不是 worktree」而卡住。
+    # 空目錄不含任何證據（封存早已移進 Manager-only evidence），移除目錄項不銷毀
+    # 任何東西；判準是 Manager 自己看到的「pool 直屬、真目錄、沒有任何項目」。
+    if exists and not registered and _is_empty_pool_slot(target):
+        try:
+            target.rmdir()
+        except OSError as exc:
+            return WorktreeReclaim(
+                RECLAIM_FAILED,
+                text,
+                evidence_model=evidence_model,
+                detail=f"empty-pool-slot-remove-failed: {type(exc).__name__}: {exc}",
+            )
+        return WorktreeReclaim(
+            RECLAIM_RECLAIMED,
+            text,
+            directory_removed=True,
+            evidence_model=evidence_model,
+        )
 
     # 安全閘（先於任何寫入／掃描）：registry 沒這筆、目錄本身也沒有
     # linked-worktree 標記，代表這個路徑不是（也不曾是）build worktree——

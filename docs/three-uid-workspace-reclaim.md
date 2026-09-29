@@ -69,6 +69,10 @@ helper 把完成紀錄（含 nonce、保存數量、封存路徑）寫進 reclai
 
 偽造的紀錄因此只能讓回收失敗，不能讓 Manager 跳過證據移交，也不能讓它刪掉沒有清空的工作區。
 
+### 重送收斂：已清空的空 slot
+
+helper 清空工作區時，位於 `.git/` 的 marker 也一起清掉。若 Manager 在刪除目錄項之前中斷（完成紀錄被判不符而 fail closed，或 Manager 程序本身死亡），pool 裡只剩一個空目錄，重送無法再走 owner-bound 路徑。`worktree_reclaim.reclaim_worktree` 因此把「pool 直屬、真目錄、沒有任何項目」的路徑直接 `rmdir` 並回報 `reclaimed`：判準是 Manager 自己列目錄看到的結果，不讀任何 builder 可寫的紀錄；空目錄不含證據，封存早已移進 Manager-only evidence。第一次失敗仍照常回報，由 operator 檢查後重送。pool 以外的空目錄照舊判為 `worktree-path-not-a-worktree`。
+
 ### 保存下來的證據
 
 - helper 建的封存目錄以 `0770`（ACL mask 含 `w`）建立，Manager 的具名條目因此可以移動與清理它。
@@ -86,7 +90,8 @@ helper 把完成紀錄（含 nonce、保存數量、封存路徑）寫進 reclai
   - 核准的正向路徑；
   - 無核准、偽造核准（非 Manager 擁有、群組可寫、spool 可寫、symlink）、他人工作區、重放舊核准；
   - Manager 半：instance 名、單次核准、封存移出、拒絕重設未檢查的封存；
-  - 偽造完成紀錄（追加、覆寫、helper 未執行）、preserve 區被塞入其他項目、同 instance 另有 builder unit 在執行。
+  - 偽造完成紀錄（追加、覆寫、helper 未執行）、preserve 區被塞入其他項目、同 instance 另有 builder unit 在執行；
+  - 完成紀錄被拒後重送收斂於已清空的空 slot，pool 以外的空目錄不受影響。
 - RC `release` profile 的 `owner-bound-reclaim` installed check（`qualification/driver.py::_installed_owner_bound_reclaim`）：
   - 以已安裝 Manager 的身分、runtime 環境與 `UMask` 建出兩格 production 形狀的工作區；
   - 以 builder UID commit 並留下未追蹤內容；
