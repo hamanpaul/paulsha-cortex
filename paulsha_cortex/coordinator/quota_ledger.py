@@ -303,12 +303,20 @@ class QuotaEventLedger:
         os.fsync(fd)
 
 
+def caller_idempotency_key(caller_key: str) -> str:
+    """呼叫端給定的 idempotency key 落在 ledger row 上的實際字串。
+
+    `record_terminal_usage(known_idempotency_keys=...)` 用它比對「這一筆已經
+    在 ledger 裡」，不必各自複製 ``"caller:"`` 前綴（#836 G836-2）。"""
+    return "caller:" + caller_key
+
+
 def _idempotency_key(observation, wire, caller_key):
     if caller_key is not None:
         if (not isinstance(caller_key, str) or not caller_key
                 or len(caller_key) > _MAX_IDEMPOTENCY_CHARS or "\x00" in caller_key):
             raise ValueError("invalid idempotency key")
-        return "caller:" + caller_key
+        return caller_idempotency_key(caller_key)
     identity = schema.event_identity(observation)
     if identity.get("state") == "available":
         measurement = wire.get("measurement", {})

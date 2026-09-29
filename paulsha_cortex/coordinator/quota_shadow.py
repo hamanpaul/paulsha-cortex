@@ -13,7 +13,7 @@ from . import quota_observation as schema
 from .quota_ledger import (
     LedgerAppendResult, LedgerCorrupt, QuotaEventLedger,
     _cross_identity_conflict_digest, _is_terminal_usage_observation,
-    _snapshot_has_known_window_epoch,
+    _snapshot_has_known_window_epoch, caller_idempotency_key,
 )
 from .quota_sources import (
     CoverageGap, ProviderCapture, ProviderQuotaTarget, capture_provider_quota, _parse_iso_epoch_ms,
@@ -49,7 +49,7 @@ class _MemoryLedger:
         )
 
         wire = observation.to_dict()
-        key = "caller:" + idempotency_key if idempotency_key else make_key(observation, wire, None)
+        key = caller_idempotency_key(idempotency_key) if idempotency_key else make_key(observation, wire, None)
         normalized = list(associations)
         # 與持久化 ledger 對齊：終局 usage 的起訖原始事實一併納入 digest，
         # 避免記憶體版 ledger 在測試中與持久化版本的行為分歧。
@@ -223,7 +223,18 @@ class QuotaShadowService:
         unit_catalog: tuple[schema.UnitDefinition, ...],
         unit_ref_by_metric: dict[str, tuple[str, str]],
         observed_at_ms: int,
+        known_idempotency_keys: frozenset[str] | set[str] | None = None,
     ) -> ShadowRecordResult:
+        """記一個受管 job 的終局 usage（每個 metric × binding constraint 一筆）。
+
+        ``known_idempotency_keys``（#836 G836-2，選填）：呼叫端已經讀過一次的
+        ledger ``observation`` row idempotency key 集合（見
+        ``quota_ledger.caller_idempotency_key``）。命中的那一筆直接算
+        ``duplicate``、不重建 observation 也不再開 ledger 檔——periodic tick
+        每輪重掃所有已終局 job 時，已經記過的 row 不必逐筆重讀整份 ledger；
+        沒命中的 row（含前一輪記到一半 crash 留下的缺口）照常走 ledger 的
+        冪等／衝突判定。缺席時行為與先前逐字相同。
+        """
         gaps: list[CoverageGap] = []
         if (not isinstance(job, dict) or not isinstance(profile_key, str)
                 or not _PROFILE_KEY_RE.fullmatch(profile_key)):
@@ -332,16 +343,6 @@ class QuotaShadowService:
                 # 永遠卡在 unknown，shadow 永不收斂（見 #836 對抗審查第五輪
                 # MAJOR quota_shadow.py:273）。
                 window_instance = dict(_TERMINAL_USAGE_WINDOW_INSTANCE_UNKNOWN)
-                try:
-                    observation = _usage_observation(
-                        job_id=job_id, executor=executor, metric=metric, profile_key=profile_key,
-                        unit=unit, unit_ref=unit_ref, scope=scope, quantity=quantity,
-                        observed_at_ms=observed_at_ms, descriptors=descriptors,
-                        unit_catalog=unit_catalog, window_instance=window_instance,
-                    )
-                except (schema.QuotaContractError, TypeError, ValueError):
-                    gaps.append(CoverageGap(metric, "usage-observation-invalid"))
-                    continue
                 # replay key 納入 pool identity（含 revision）：同一 binding 把
                 # 同 metric/unit 映到兩個 pool、且 window_id 恰好同名時（例如
                 # shared-account 多角色都叫 month），不得因 window_id 相同而互相
@@ -369,6 +370,20 @@ class QuotaShadowService:
                     f"terminal-usage:v1:{job_id}:{metric}:{pool_component}:"
                     + constraint["window_id"]
                 )
+                if (known_idempotency_keys is not None
+                        and caller_idempotency_key(key) in known_idempotency_keys):
+                    duplicates += 1
+                    continue
+                try:
+                    observation = _usage_observation(
+                        job_id=job_id, executor=executor, metric=metric, profile_key=profile_key,
+                        unit=unit, unit_ref=unit_ref, scope=scope, quantity=quantity,
+                        observed_at_ms=observed_at_ms, descriptors=descriptors,
+                        unit_catalog=unit_catalog, window_instance=window_instance,
+                    )
+                except (schema.QuotaContractError, TypeError, ValueError):
+                    gaps.append(CoverageGap(metric, "usage-observation-invalid"))
+                    continue
                 result = self.ledger.append_observation(
                     observation,
                     idempotency_key=key,

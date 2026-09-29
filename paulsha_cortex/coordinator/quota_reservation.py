@@ -15,13 +15,23 @@ pool/window 發起 spawn；本模組提供 ``reserve → bind → settle／relea
 - 不判斷某個 pool 是否『足夠』、不做 model 層的候選挑選——``pool_ref`` 沿用
   #836 的契約（``authority_id``／``account_id``／``pool_id``／``revision``），
   刻意不含 model／profile 維度，換 model 名字無法偷換到不同的 authority；
-- 不接線到任何實際 spawn path。本模組本身保持 dormant／shadow，直到有呼叫
-  端明確 import 並呼叫；:func:`reservation_authority_enabled` 是保留給未來
-  整合者（#839）的 opt-in 開關，本模組的正確性完全不依賴這個開關的值——
-  把它調回 off／整條移除即是 rollback。
+- 不接線到任何實際 spawn path，也沒有自己的開關。本模組是純 library
+  primitive：是否預留完全由呼叫端決定——production 只有 #839
+  ``quota_admission`` 在 ``PSC_QUOTA_ADMISSION_ENFORCE=on`` 時呼叫
+  （enforce ⇒ 原子預留，shadow ⇒ 完全不碰本模組）。先前保留的
+  ``PSC_QUOTA_RESERVATION_ENFORCE``／``reservation_authority_enabled()`` 從未
+  有任何 production 讀取點，已移除（#838 G838-3），避免文件把它描述成第二
+  道開關。
 - 不查詢任何 job registry／liveness 來源——:meth:`QuotaReservationAuthority.reconcile`
   的 evidence／resolution 完全由呼叫端提供與裁決，本模組只保證『裁決一旦
   給定，如何原子且冪等地套用』，不自行猜測 job 是否還活著。
+
+協調範圍（:func:`authority_coverage` 的機讀版本）：以 ``flock`` 序列化**同一
+台主機、同一個檔案**的讀—決策—寫入；store 固定 owner-only 權限（父目錄無
+group/other 位元、檔案 0600、``O_NOFOLLOW``），所以只有 store 擁有者 UID 的
+process 能加入；路徑是 ``coordinator_root()/quota-reservations/reservations.jsonl``，
+只有解析到同一個 coordinator root 的 Manager instance 才共用同一個 authority。
+跨 host、跨 UID、跨 coordinator root 都**不**協調——各自是明列的 coverage gap。
 
 儲存形態沿用 #836 ``quota_ledger.QuotaEventLedger`` 的硬化模式（``flock``、
 ``O_NOFOLLOW``、固定權限、fsync、大小上限、損毀一律 fail-closed），但事件
@@ -52,8 +62,9 @@ __all__ = [
     "TransitionResult",
     "ReservationStatus",
     "QuotaReservationAuthority",
-    "reservation_authority_enabled",
     "RESERVATION_LOGICAL_STATES",
+    "RESERVATION_COVERAGE_SCHEMA",
+    "authority_coverage",
 ]
 
 #: :meth:`QuotaReservationAuthority.list_by_state` 接受的邏輯狀態——與折疊後
@@ -75,23 +86,48 @@ _RECONCILE_RESOLUTIONS = frozenset(
 )
 _RELEASE_REASONS = frozenset({"fail-before-spawn", "cancelled", "superseded"})
 
-_ENV_ENFORCE_FLAG = "PSC_QUOTA_RESERVATION_ENFORCE"
+RESERVATION_COVERAGE_SCHEMA = "cortex/quota-reservation-coverage/v1"
 
 
 class ReservationCorrupt(ValueError):
     """reservation store 不完整、超限、版本未知或權限形狀不可信——fail closed。"""
 
 
-def reservation_authority_enabled(environment: Mapping[str, str] | None = None) -> bool:
-    """#839（未來整合者）用的 opt-in 開關；本模組的正確性不依賴它的值。
+def authority_coverage() -> dict[str, Any]:
+    """機讀宣告：這個 authority 協調什麼、明確**不**協調什麼（#838 修正範圍 2）。
 
-    只讀 ``PSC_QUOTA_RESERVATION_ENFORCE``；大小寫不敏感的 ``on`` 才是
-    True，其餘（含未設定、任何拼錯的值）一律 False——預設 shadow、不阻擋
-    既有派工。rollback 只需把環境變數改回非 ``on`` 或整條移除，不需要改
-    任何程式碼。
+    票面要求「跨 host 未協調部分明列 coverage gap，不虛稱全域保證」。這三個
+    gap 是實作本身的結構事實（不是部署狀態），因此是常數；部署當下實際解析到
+    哪一個 store 路徑由呼叫端（`cortex quota reservations --json`）另外回報，
+    operator 對不同 instance 各跑一次、比對 ``authority.store`` 是否相同，即
+    可確認它們是否真的共用同一個 authority。
     """
-    env = os.environ if environment is None else environment
-    return env.get(_ENV_ENFORCE_FLAG, "").strip().lower() == "on"
+    return {
+        "schema": RESERVATION_COVERAGE_SCHEMA,
+        "state": "partial",
+        "coordinated": {
+            "host": "single-host",
+            "principal": "store-owner-uid",
+            "instances": "same-coordinator-root",
+        },
+        "gaps": [
+            {
+                "scope": "cross-host",
+                "reason": "reservation-authority-host-local-flock",
+                "detail": "flock 只序列化同一台主機上的 process；其他主機的 Manager 各扣各的。",
+            },
+            {
+                "scope": "cross-principal",
+                "reason": "reservation-store-owner-only-permissions",
+                "detail": "store 父目錄不得有 group/other 位元、檔案 0600；其他 UID 的 instance 開不了同一份 store。",
+            },
+            {
+                "scope": "cross-coordinator-root",
+                "reason": "reservation-authority-scoped-to-coordinator-root",
+                "detail": "store 固定在 coordinator_root()/quota-reservations；PSC_COORDINATOR_ROOT 解析不同的 instance 用的是不同 authority。",
+            },
+        ],
+    }
 
 
 def _validate_pool_ref(value: object) -> dict[str, str]:
@@ -349,6 +385,9 @@ class QuotaReservationAuthority:
             }
             self._failpoint("reserve-before-append")
             self._append_fd(fd, entry, info.st_size)
+            # crash matrix 的另一半：事件已 fsync 落地、呼叫端還沒拿到結果
+            # （#838 AC3）。重送同一個 decision 會拿回同一筆 grant（duplicate）。
+            self._failpoint("reserve-after-append")
             return ReservationResult(
                 status="granted",
                 reservation_id=reservation_id,
@@ -767,6 +806,10 @@ class QuotaReservationAuthority:
                 raise ReservationCorrupt("reservation-store-event-limit")
             self._failpoint(failpoint_stage)
             self._append_fd(fd, entry, info.st_size)
+            # `<stage>-after-append`：轉移已耐久落地、呼叫端還沒收到結果就
+            # crash（#838 AC3）。重啟後依舊 sequence 重送只會得到 duplicate
+            # 或 CAS 衝突，不會套用第二次。
+            self._failpoint(failpoint_stage.replace("-before-append", "-after-append"))
             return result
         finally:
             os.close(fd)

@@ -27,9 +27,11 @@
   逐字寫入 decision receipt（見 :class:`AdmissionDecision`）。
 - 不啟動任何 provider CLI／不讀 credential——額度餘量完全來自呼叫端已經
   用 #836 建好的 ``QuotaShadowService`` 投影。
-- 不觸碰 ``quota_reservation.py`` 的狀態機或其 opt-in 開關；#839 自己的
-  opt-in 開關（:func:`quota_admission_enabled`）與 #838 的開關各自獨立，
-  兩者都預設 off／shadow，rollback 各自只需要改回對應環境變數。
+- 不觸碰 ``quota_reservation.py`` 的狀態機。#838 本身沒有開關（先前的
+  ``PSC_QUOTA_RESERVATION_ENFORCE`` 從未被任何 production 程式讀取，已移除）；
+  :func:`quota_admission_enabled`（``PSC_QUOTA_ADMISSION_ENFORCE``）是唯一的
+  enforce 開關：on ⇒ 選中的受管候選一律經 #838 原子預留，off／未設 ⇒ shadow，
+  完全不呼叫 reservation。rollback 只需把它改回非 ``on``。
 
 先 shadow，再小範圍 opt-in：:func:`quota_admission_enabled` 預設 False，
 呼叫端在 shadow 模式下只應呼叫 :func:`assess_candidate_quota` 記錄「這個
@@ -119,12 +121,14 @@ class AdmissionDecisionCorrupt(ValueError):
 
 
 def quota_admission_enabled(environment: Mapping[str, str] | None = None) -> bool:
-    """#839 自己的 opt-in 開關；大小寫不敏感的 ``on`` 才是 True。
+    """額度准入唯一的 enforce 開關（``PSC_QUOTA_ADMISSION_ENFORCE``）；大小寫
+    不敏感的 ``on`` 才是 True。
 
     預設（未設定／任何拼錯的值）一律 False——shadow 模式下呼叫端只應觀測、
-    不應改變既有派工結果。獨立於 #838 的
-    ``quota_reservation.reservation_authority_enabled()``：兩者都要 on
-    才會真的原子預留額度並可能拒絕派工。
+    不應改變既有派工結果。True 時 ``manager._dispatch_workflow_card`` 對選中
+    且受額度管理的候選一律經 #838 ``QuotaReservationAuthority`` 原子預留，
+    額度不足／race 落敗才會拒絕派工；沒有另一道 reservation 專屬開關（舊的
+    ``PSC_QUOTA_RESERVATION_ENFORCE`` 從未被讀取，已移除——#838 G838-3）。
     """
     env = os.environ if environment is None else environment
     return env.get(_ENV_ENFORCE_FLAG, "").strip().lower() == "on"
