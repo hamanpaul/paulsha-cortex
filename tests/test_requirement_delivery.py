@@ -7,10 +7,11 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
 
 import pytest
 
-from paulsha_cortex.coordinator import completion, claim, live_receipt_validators, review, verification
+from paulsha_cortex.coordinator import autonomy, completion, claim, live_receipt_validators, requirement_delivery, review, verification
 from paulsha_cortex.coordinator.github_delivery import RemoteClosureFacts
 from paulsha_cortex import runtime_attestation
 from paulsha_cortex.coordinator.requirement_delivery import (
@@ -161,6 +162,9 @@ def _write_completion(
     verification_status: str = "reviewing",
     test_results: list[dict] | None = None,
     acceptance_ids: list[str] | None = None,
+    verification_ref: dict | None = None,
+    review_state: str = "passed",
+    reviewer_identity_known: bool = True,
 ) -> dict:
     authority = authority or _authority()
     if test_results is None:
@@ -169,7 +173,9 @@ def _write_completion(
             "status": "passed",
             "acceptance_ids": acceptance_ids or ["R01-AC1"],
         }]
-    verify_ref = verification.write_verification_evidence(
+    # verification_ref 由呼叫端提供時（例如正式 contract 解析路徑經
+    # run_result_verification 產生的 evidence），直接綁那份，不另造手寫 details。
+    verify_ref = verification_ref or verification.write_verification_evidence(
         {
             "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
             "slice_id": slice_id,
@@ -180,17 +186,34 @@ def _write_completion(
         },
         coordinator_root=root,
     )
+    launch_identity = {
+        "builder": {"executor": "codex", "model_id": "builder", "independence_domain": "builder-domain"},
+        "reviewer": {"executor": "claude", "model_id": "reviewer", "independence_domain": "builder-domain" if same_review_domain else "reviewer-domain"},
+    }
+    if not reviewer_identity_known:
+        launch_identity["reviewer"] = None
+    findings = None
+    if review_state == "rejected":
+        # rejected evaluation 依正式 schema 必須帶 blocking finding。
+        findings = [review._normalize_finding(
+            {
+                "category": "correctness",
+                "severity": "important",
+                "summary": "candidate regresses the acceptance criterion",
+                "evidence": [],
+                "recommendation": "fix the regression before delivery",
+            },
+            field="findings[0]",
+        )]
     review_payload = review.build_gate_evaluation(
         slice_id=slice_id,
-        state="passed",
-        reason="accepted",
+        state=review_state,
+        reason="accepted" if review_state == "passed" else f"review-{review_state}",
         builder_job_id="builder-1",
         reviewer_job_id="reviewer-1",
         candidate=candidate,
-        launch_identity={
-            "builder": {"executor": "codex", "model_id": "builder", "independence_domain": "builder-domain"},
-            "reviewer": {"executor": "claude", "model_id": "reviewer", "independence_domain": "builder-domain" if same_review_domain else "reviewer-domain"},
-        },
+        launch_identity=launch_identity,
+        findings=findings,
     )
     review_ref = review.write_gate_evaluation(review_payload, coordinator_root=root)
     payload = {
@@ -239,7 +262,14 @@ def _target(*, profile_key: str = PROFILE_KEY, config_revision: str = CONFIG_REV
 _CANARY_EVIDENCE_SCOPE = live_receipt_validators.deployment_canary_evidence_scope(_target())
 
 
-def _write_runtime(root: Path, *, target=None, pid: int = 555, state_name: str = "runtime-0") -> None:
+def _write_runtime(
+    root: Path,
+    *,
+    target=None,
+    pid: int = 555,
+    state_name: str = "runtime-0",
+    started_at: str = "2026-09-25T00:00:00+00:00",
+) -> None:
     target = target or _target()
     runtime_attestation.record_runtime_startup(
         service="manager",
@@ -253,14 +283,22 @@ def _write_runtime(root: Path, *, target=None, pid: int = 555, state_name: str =
             "source_revision": target["source_revision"],
             "sha256": target["artifact_sha256"],
         },
-        started_at="2026-09-25T00:00:00+00:00",
+        started_at=started_at,
         pid=pid,
         config_components={"profile_key": target["profile_key"].rsplit(":", 1)[-1]},
         trust_root={"status": "verified", "receipt_id": "00000000-0000-4000-8000-000000000001"},
     )
 
 
-def _write_live(root: Path, *, requirement_id: str, revision: str, criterion_id: str, target=None) -> dict:
+def _write_live(
+    root: Path,
+    *,
+    requirement_id: str,
+    revision: str,
+    criterion_id: str,
+    target=None,
+    observed_at: str = "2026-09-25T00:00:00+00:00",
+) -> dict:
     target = target or _target()
     payload = {
         "schema": "cortex/live-canary-receipt/v1",
@@ -268,7 +306,7 @@ def _write_live(root: Path, *, requirement_id: str, revision: str, criterion_id:
         "requirement_id": requirement_id,
         "requirement_revision": revision,
         "acceptance_id": criterion_id,
-        "observed_at": "2026-09-25T00:00:00+00:00",
+        "observed_at": observed_at,
         "target": target,
         "authority": {"id": "release-operator", "version": "1", "receipt": "approval:123"},
         "independence": {"canary_domain": "loaded-runtime", "review_domain": "reviewer-domain"},
@@ -600,6 +638,32 @@ def test_production_manifest_pins_all_refine_requirements_and_sources() -> None:
     plan = repo_root / "docs/superpowers/plans/2026-09-07-cortex-refine-complete.md"
     plan_sha = hashlib.sha256(plan.read_bytes()).hexdigest()
     assert all(row["source_ref"]["sha256"] == plan_sha for row in normalized["requirements"])
+
+
+def test_production_manifest_owner_work_ids_follow_refine_ticket_split() -> None:
+    """#845 B7：owner work_ids 只列仍有效、實際承接該需求的 issue。#842（R09
+    qualification publication）、#843（R07 recovery conformance）、#844（#214
+    successor，票面覆蓋 R07 恢復與 R14 已完成 stage 接續）補進對應需求；#837 已
+    not planned 移除；#820 是 PR（Refs #807），不是 issue，由已列的 #807 承接。"""
+    repo_root = Path(__file__).resolve().parents[1]
+    manifest = json.loads((repo_root / "docs/superpowers/specs/refine-requirements-v1.json").read_text(encoding="utf-8"))
+    owners = {
+        row["id"]: row["evidence_policy"]["owner"]["work_ids"]
+        for row in manifest["requirements"]
+    }
+    prefix = "hamanpaul/paulsha-cortex#"
+    assert owners["R05"] == [prefix + n for n in ("825", "835", "836", "838", "839")]
+    assert owners["R07"] == [prefix + n for n in ("497", "545", "546", "547", "577", "843", "844")]
+    assert owners["R09"] == [prefix + n for n in ("452", "454", "466", "534", "842")] + ["hamanpaul/paulsha-patchmud#37"]
+    assert owners["R13"] == [prefix + n for n in ("822", "823", "824", "807", "860")]
+    assert owners["R14"] == [prefix + n for n in ("830", "831", "833", "844", "845")]
+    all_refs = [ref for refs in owners.values() for ref in refs]
+    assert prefix + "837" not in all_refs
+    assert prefix + "820" not in all_refs
+    for row in manifest["requirements"]:
+        owner = row["evidence_policy"]["owner"]
+        assert owner["id"] == owner["work_ids"][0]
+        assert len(owner["work_ids"]) == len(set(owner["work_ids"]))
 
 
 def test_a02_each_delivery_stage_is_accounted_separately(tmp_path: Path) -> None:
@@ -1530,6 +1594,7 @@ def _write_governed_live(
     evidence: dict,
     target: dict,
     canary_target: dict | None = None,
+    observed_at: str = "2026-09-25T00:00:00+00:00",
 ) -> dict:
     payload = {
         "schema": "cortex/live-canary-receipt/v1",
@@ -1537,7 +1602,7 @@ def _write_governed_live(
         "requirement_id": requirement_id,
         "requirement_revision": revision,
         "acceptance_id": criterion_id,
-        "observed_at": "2026-09-25T00:00:00+00:00",
+        "observed_at": observed_at,
         "target": target,
         "authority": {"id": "release-operator", "version": "1", "receipt": "approval:123"},
         # #845 對抗審查第九輪 BLOCKER GREEN：canary_domain 不再自報，改由
@@ -2074,3 +2139,642 @@ def test_a04_governed_loader_fails_closed_without_contract(tmp_path: Path) -> No
     report = inspect_delivery(manifest, snapshot, **context)
     assert report["closure_readiness"] == "not-ready"
     assert report["mappings"][0]["evidence"]["live"]["status"] != "verified"
+
+
+# --- #845 refine 缺口補齊：B3（contract ↔ test stage）、B8（installed 期限）、
+#     G845-1（A01／A05／A10／A11／A12 缺塊）----------------------------------------
+
+
+def _todo_contract_frontmatter(*, slice_id: str, acceptance_ids: list[str] | None) -> str:
+    lines = [
+        "---",
+        "dispatch: hold",
+        f"slice_id: {slice_id}",
+        "verification:",
+        "  docs_class: code",
+        "  required_artifacts: []",
+        "  checks:",
+        "    - kind: persona-scope",
+        "  tests:",
+        "    - argv: [python3, -m, pytest, -q, tests/test_r01_contract.py]",
+        "      cwd: .",
+        "      timeout_seconds: 30",
+    ]
+    if acceptance_ids is not None:
+        lines.append(f"      acceptance_ids: [{', '.join(acceptance_ids)}]")
+    lines += [
+        "  full_suite:",
+        "    argv: [python3, -m, pytest, -q]",
+        "    cwd: .",
+        "    timeout_seconds: 60",
+        "    baseline: no-regression",
+        "---",
+        "",
+        "# todo",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _contract_path_verification_ref(
+    root: Path, monkeypatch, *, slice_id: str, acceptance_ids: list[str] | None
+) -> dict:
+    """以正式 contract 解析路徑產生 verification evidence：todo frontmatter →
+    `autonomy.parse_spec_frontmatter`（內含 `validate_verification_contract`）→
+    `verification.run_result_verification`。只把 git／subprocess 換成可控 fake，
+    evidence 由正式 writer 落盤，不手寫 `details.tests`。"""
+    repo_root = root / "repo"
+    worktree = root / "candidate-worktree"
+    todo = repo_root / "docs" / "todo.md"
+    todo.parent.mkdir(parents=True, exist_ok=True)
+    worktree.mkdir(parents=True, exist_ok=True)
+    todo.write_text(_todo_contract_frontmatter(slice_id=slice_id, acceptance_ids=acceptance_ids), encoding="utf-8")
+    monkeypatch.setenv("PSC_REPO_ROOT", str(repo_root))
+    meta = autonomy.parse_spec_frontmatter(todo)
+    assert meta["parse_error"] is None, meta["parse_error"]
+
+    def ok(stdout: str = "") -> SimpleNamespace:
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    def git_runner(args: list[str]):
+        tail = args[2:] if len(args) >= 2 and args[0] == "-C" else args
+        if tail[:1] == ["rev-parse"]:
+            return ok(HEAD + "\n")
+        if tail[:1] == ["status"] or tail[:2] == ["merge-base", "--is-ancestor"] or tail[:1] == ["worktree"]:
+            return ok("")
+        if tail[:3] == ["-c", "core.quotepath=false", "diff"]:
+            return ok("")
+        if tail[:2] == ["cat-file", "-e"]:
+            return SimpleNamespace(returncode=128, stdout="", stderr="fatal: path not in tree")
+        raise AssertionError(f"unexpected git call: {args!r}")
+
+    commands: list[list[str]] = []
+
+    def subprocess_runner(argv, *, shell, cwd, timeout, env, capture_output, text):
+        commands.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="1 passed", stderr="")
+
+    evidence = verification.run_result_verification(
+        slice_row={
+            "slice_id": slice_id,
+            "dispatch_base": "a" * 40,
+            "verification": {"contract": meta["verification"]},
+        },
+        job={"task": slice_id, "branch": f"feature/{slice_id}", "worktree": str(worktree)},
+        repo_root=repo_root,
+        coordinator_root=root,
+        git_runner=git_runner,
+        subprocess_runner=subprocess_runner,
+    )
+    assert evidence["payload"]["status"] == "reviewing", evidence["payload"]["summary"]
+    assert ["python3", "-m", "pytest", "-q", "tests/test_r01_contract.py"] in commands
+    return evidence
+
+
+def test_b3_contract_declared_acceptance_ids_make_completion_test_stage_coverable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """B3：verification contract 的 test entry 宣告 `acceptance_ids` 後，正式
+    run_result_verification 產出的 evidence 帶著同一組綁定，requirement delivery
+    的 test stage 才能對該 criterion 判 verified。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    row = snapshot["mappings"][0]
+    evidence = _contract_path_verification_ref(
+        tmp_path, monkeypatch, slice_id="contract-bound", acceptance_ids=["R01-AC1"]
+    )
+    tests = evidence["payload"]["details"]["tests"]
+    assert [(entry["status"], entry["acceptance_ids"]) for entry in tests] == [("passed", ["R01-AC1"])]
+    row["completion_record"] = _write_completion(
+        tmp_path, run_id=row["run_id"], slice_id="contract-bound", verification_ref=evidence
+    )
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    test_stage = report["mappings"][0]["evidence"]["test"]
+    assert test_stage["status"] == "verified"
+    assert test_stage["reason"] == "criterion-bound-test-passed"
+    assert test_stage["sha256"] == evidence["hash"]
+    assert report["closure_readiness"] == "ready"
+
+
+def test_b3_contract_test_without_acceptance_ids_leaves_criterion_test_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manifest, snapshot, context = _ready_case(tmp_path)
+    row = snapshot["mappings"][0]
+    evidence = _contract_path_verification_ref(
+        tmp_path, monkeypatch, slice_id="contract-unbound", acceptance_ids=None
+    )
+    assert evidence["payload"]["details"]["tests"][0]["status"] == "passed"
+    assert "acceptance_ids" not in evidence["payload"]["details"]["tests"][0]
+    row["completion_record"] = _write_completion(
+        tmp_path, run_id=row["run_id"], slice_id="contract-unbound", verification_ref=evidence
+    )
+
+    report = inspect_delivery(manifest, snapshot, **context)
+
+    assert report["mappings"][0]["evidence"]["test"] == {
+        "status": "missing",
+        "reason": "no-test-bound-to-acceptance-criterion",
+    }
+    test_gap = next(gap for gap in report["gaps"] if gap["stage"] == "test")
+    assert (test_gap["acceptance_id"], test_gap["status"]) == ("R01-AC1", "missing")
+    assert report["closure_readiness"] == "not-ready"
+
+
+def _contract_value(tests: list[dict], **overrides) -> dict:
+    value = {
+        "docs_class": "code",
+        "required_artifacts": [],
+        "checks": [{"kind": "persona-scope"}],
+        "tests": tests,
+        "full_suite": {"argv": ["python3", "-m", "pytest", "-q"], "cwd": ".", "timeout_seconds": 60, "baseline": "no-regression"},
+    }
+    value.update(overrides)
+    return value
+
+
+def test_b3_verification_contract_normalizes_test_acceptance_ids(tmp_path: Path) -> None:
+    normalized = verification.validate_verification_contract(
+        _contract_value([{
+            "argv": ["python3", "-m", "pytest", "-q", "tests/a.py"],
+            "cwd": ".",
+            "timeout_seconds": 30,
+            "acceptance_ids": [" R01-AC1 ", "R02-AC1"],
+        }]),
+        repo_root=tmp_path,
+        auto_dispatch=False,
+    )
+    assert normalized["tests"][0]["acceptance_ids"] == ["R01-AC1", "R02-AC1"]
+
+
+def test_b3_contract_without_acceptance_ids_keeps_legacy_shape_and_hash(tmp_path: Path) -> None:
+    """未宣告 acceptance_ids 的既有 contract 正規化形狀與 hash 不變（不補空欄位）。"""
+    test_entry = {"argv": ["python3", "-m", "pytest", "-q", "tests/a.py"], "cwd": ".", "timeout_seconds": 30}
+    normalized = verification.validate_verification_contract(
+        _contract_value([dict(test_entry)]), repo_root=tmp_path, auto_dispatch=False
+    )
+    assert normalized["tests"] == [test_entry]
+    assert verification.canonical_json_hash(normalized) == verification.canonical_json_hash({
+        "docs_class": "code",
+        "review_policy": "required",
+        "required_artifacts": [],
+        "checks": [{"kind": "persona-scope"}],
+        "tests": [test_entry],
+        "full_suite": {"argv": ["python3", "-m", "pytest", "-q"], "cwd": ".", "timeout_seconds": 60, "baseline": "no-regression"},
+    })
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[], ["R01-AC1", "R01-AC1"], [""], ["   "], [1], "R01-AC1", None, [" R01-AC1", "R01-AC1 "]],
+)
+def test_b3_verification_contract_rejects_malformed_acceptance_ids(tmp_path: Path, value) -> None:
+    with pytest.raises(verification.ContractValidationError) as excinfo:
+        verification.validate_verification_contract(
+            _contract_value([{
+                "argv": ["python3", "-m", "pytest", "-q"],
+                "cwd": ".",
+                "timeout_seconds": 30,
+                "acceptance_ids": value,
+            }]),
+            repo_root=tmp_path,
+            auto_dispatch=False,
+        )
+    assert excinfo.value.field == "verification.tests[0].acceptance_ids"
+
+
+def test_b3_acceptance_ids_are_only_accepted_on_task_tests(tmp_path: Path) -> None:
+    """acceptance_ids 只屬於逐項 task test；check 與 full_suite 仍拒絕此鍵。"""
+    with pytest.raises(verification.ContractValidationError) as excinfo:
+        verification.validate_verification_contract(
+            _contract_value([], checks=[{"kind": "persona-scope"}, {
+                "kind": "command", "name": "policy", "argv": ["python3", "-m", "policy_check"],
+                "cwd": ".", "timeout_seconds": 30, "acceptance_ids": ["R01-AC1"],
+            }]),
+            repo_root=tmp_path,
+            auto_dispatch=False,
+        )
+    assert excinfo.value.field == "verification.checks[1].acceptance_ids"
+    with pytest.raises(verification.ContractValidationError) as excinfo:
+        verification.validate_verification_contract(
+            _contract_value([], full_suite={
+                "argv": ["python3", "-m", "pytest", "-q"], "cwd": ".", "timeout_seconds": 60,
+                "baseline": "no-regression", "acceptance_ids": ["R01-AC1"],
+            }),
+            repo_root=tmp_path,
+            auto_dispatch=False,
+        )
+    assert excinfo.value.field == "verification.full_suite.acceptance_ids"
+
+
+def test_b8_installed_receipt_older_than_policy_max_age_is_stale(tmp_path: Path) -> None:
+    """B8：`max_age_seconds.installed` 生效——loaded-runtime receipt 的 recorded_at
+    超過期限即 stale，期限內維持 verified（fixture receipt 比 NOW 早 86400 秒）。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    policy = manifest["requirements"][0]["evidence_policy"]
+    policy["max_age_seconds"]["installed"] = 3600
+    report = inspect_delivery(manifest, snapshot, **context)
+    installed = report["mappings"][0]["evidence"]["installed"]
+    assert (installed["status"], installed["reason"]) == ("stale", "installed-runtime-receipt-expired")
+    gap = next(g for g in report["gaps"] if g["stage"] == "installed")
+    assert (gap["status"], gap["reason"]) == ("stale", "installed-runtime-receipt-expired")
+    assert report["closure_readiness"] == "not-ready"
+
+    policy["max_age_seconds"]["installed"] = 86400 * 2
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["mappings"][0]["evidence"]["installed"]["status"] == "verified"
+    assert report["closure_readiness"] == "ready"
+
+
+def test_b8_installed_receipt_recorded_after_now_is_stale(tmp_path: Path) -> None:
+    manifest, snapshot, context = _ready_case(tmp_path)
+    shutil.rmtree(tmp_path / "runtime-0")
+    _write_runtime(tmp_path, started_at="2026-09-27T00:00:00+00:00")
+    report = inspect_delivery(manifest, snapshot, **context)
+    installed = report["mappings"][0]["evidence"]["installed"]
+    assert (installed["status"], installed["reason"]) == ("stale", "installed-runtime-receipt-expired")
+    assert report["closure_readiness"] == "not-ready"
+
+
+def test_b8_installed_age_is_unbounded_only_when_policy_declares_no_installed_max_age(tmp_path: Path) -> None:
+    manifest, snapshot, context = _ready_case(tmp_path)
+    shutil.rmtree(tmp_path / "runtime-0")
+    _write_runtime(tmp_path, started_at="2026-01-01T00:00:00+00:00")
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["mappings"][0]["evidence"]["installed"]["reason"] == "installed-runtime-receipt-expired"
+    del manifest["requirements"][0]["evidence_policy"]["max_age_seconds"]["installed"]
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["mappings"][0]["evidence"]["installed"]["status"] == "verified"
+
+
+def test_b8_reconcile_downgrades_persisted_index_when_installed_and_live_expire(tmp_path: Path) -> None:
+    """期限到期是依時間確定發生的降級，不是暫時性弱讀取：同一 generation 重跑
+    reconcile 必須把索引改成 not-ready，不能以 same-generation 弱化保護留住舊 ready。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    index_path = tmp_path / "index.json"
+    first = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+    assert first["index"]["reconcile_receipt"]["coverage"] == "ready"
+
+    later = NOW + 8 * 86400
+    context["now_epoch"] = later
+    context["authority_loader"] = lambda repo, work_id: _authority(work_id=work_id, last_success=later - 1)
+    result = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+
+    assert result["changed"] is True
+    assert result.get("pending_reason") is None
+    persisted = read_index(index_path)
+    assert persisted["reconcile_receipt"]["coverage"] == "not-ready"
+    row = persisted["mappings"][0]
+    assert row["status"] == "blocked"
+    assert (row["evidence"]["installed"]["status"], row["evidence"]["installed"]["reason"]) == (
+        "stale", "installed-runtime-receipt-expired"
+    )
+    assert (row["evidence"]["live"]["status"], row["evidence"]["live"]["reason"]) == (
+        "stale", "live-canary-receipt-expired"
+    )
+
+
+def test_b8_transient_same_generation_weakening_is_still_kept_pending(tmp_path: Path) -> None:
+    """期限降級放行不影響既有保護：暫時性讀取失敗（merge 變 unknown）仍保留 covered。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    index_path = tmp_path / "index.json"
+    reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+    result = reconcile_delivery(manifest, snapshot, index_path=index_path, **{**context, "github_client": _FlakyGitHub()})
+    assert result["changed"] is False
+    assert result["pending_reason"] in {"same-source-generation-content-drift", "same-generation-weaker-evidence-ignored"}
+    assert read_index(index_path)["reconcile_receipt"]["coverage"] == "ready"
+
+
+@pytest.mark.parametrize("observed_at", ["2026-09-18T00:00:00+00:00", "2026-09-27T00:00:00+00:00"])
+def test_a12_live_canary_receipt_outside_max_age_is_expired(tmp_path: Path, observed_at: str) -> None:
+    """全套先前沒有任何測試走到 `live-canary-receipt-expired`：超過 7 天或晚於現在
+    的 live receipt 都是 stale，closure not-ready。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    snapshot["mappings"][0]["live_receipt"] = _write_live(
+        tmp_path, requirement_id="R01", revision="r1", criterion_id="R01-AC1", observed_at=observed_at
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    live = report["mappings"][0]["evidence"]["live"]
+    assert (live["status"], live["reason"]) == ("stale", "live-canary-receipt-expired")
+    gap = next(g for g in report["gaps"] if g["stage"] == "live")
+    assert (gap["status"], gap["reason"]) == ("stale", "live-canary-receipt-expired")
+    assert report["closure_readiness"] == "not-ready"
+
+
+def test_a01_one_requirement_delivered_by_multiple_works_is_aggregated_per_work_scope(tmp_path: Path) -> None:
+    """一需求多 work：同一 criterion 的多個 work mapping 各自是獨立 scope；任一
+    scope 全部 stage 成立才 covered，全部 scope 都未成立時保留 blocked 與 gap。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    first = snapshot["mappings"][0]
+    second = copy.deepcopy(first)
+    second["work_id"] = f"{WORK}-second"
+    second["run_id"] = "run-second"
+    second["completion_record"] = _write_completion(
+        tmp_path, authority=_authority(work_id=second["work_id"]), run_id="run-second", slice_id="second-work"
+    )
+    snapshot["mappings"].append(second)
+
+    report = inspect_delivery(manifest, snapshot, **context)
+    criterion = report["requirements"][0]["acceptance_criteria"][0]
+    assert criterion["status"] == "covered"
+    assert len(criterion["mapping_ids"]) == 2
+    assert {row["work_id"] for row in report["mappings"]} == {WORK, f"{WORK}-second"}
+    assert report["closure_readiness"] == "ready"
+
+    # 第二個 work 的 review 不獨立：該 scope blocked，但第一個 work 仍完整覆蓋。
+    second["completion_record"] = _write_completion(
+        tmp_path, authority=_authority(work_id=second["work_id"]), run_id="run-second",
+        slice_id="second-work-same-domain", same_review_domain=True,
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    statuses = {row["work_id"]: row["status"] for row in report["mappings"]}
+    assert statuses == {WORK: "covered", f"{WORK}-second": "blocked"}
+    assert report["requirements"][0]["status"] == "covered"
+    assert report["gaps"] == []
+
+    # 兩個 work 都不成立：criterion blocked，gap 指到其中一個實際失敗的 mapping。
+    first["completion_record"]["sha256"] = "0" * 64
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["requirements"][0]["status"] == "blocked"
+    mapping_ids = {row["mapping_id"] for row in report["mappings"]}
+    assert report["gaps"] and all(gap["mapping_id"] in mapping_ids for gap in report["gaps"])
+    assert report["closure_readiness"] == "not-ready"
+
+
+def test_a01_one_work_mapped_to_multiple_requirements_covers_only_bound_criteria(tmp_path: Path) -> None:
+    """一 work 多需求：同一 work／run／PR 對 R01、R02 各有 mapping；測試只綁 R01-AC1
+    時，R02 不因同一 PR 已 merge 而被算 covered。"""
+    specs = [("R01", "r1"), ("R02", "r2")]
+    manifest, snapshot, context = _ready_case(tmp_path, specs)
+    r01, r02 = snapshot["mappings"]
+    r02["work_id"] = r01["work_id"]
+    r02["run_id"] = r01["run_id"]
+    shared = _write_completion(tmp_path, run_id=r01["run_id"], slice_id="shared-work", acceptance_ids=["R01-AC1"])
+    r01["completion_record"] = shared
+    r02["completion_record"] = copy.deepcopy(shared)
+
+    report = inspect_delivery(manifest, snapshot, **context)
+    # R02 有 mapping 但未全數成立 → blocked（不是 covered）；唯一缺口是 test 未綁定。
+    statuses = {row["requirement_id"]: row["status"] for row in report["requirements"]}
+    assert statuses == {"R01": "covered", "R02": "blocked"}
+    r02_merge = next(row for row in report["mappings"] if row["requirement_id"] == "R02")["evidence"]["merge"]
+    assert r02_merge["status"] == "verified"
+    r02_gaps = [(gap["stage"], gap["status"], gap["reason"]) for gap in report["gaps"] if gap["requirement_id"] == "R02"]
+    assert r02_gaps == [("test", "missing", "no-test-bound-to-acceptance-criterion")]
+    assert report["closure_readiness"] == "not-ready"
+
+    shared_both = _write_completion(
+        tmp_path, run_id=r01["run_id"], slice_id="shared-work-both", acceptance_ids=["R01-AC1", "R02-AC1"]
+    )
+    r01["completion_record"] = shared_both
+    r02["completion_record"] = copy.deepcopy(shared_both)
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert {row["requirement_id"]: row["status"] for row in report["requirements"]} == {"R01": "covered", "R02": "covered"}
+    assert report["closure_readiness"] == "ready"
+
+
+@pytest.mark.parametrize(
+    ("review_state", "identity_known"),
+    [("rejected", True), ("absent", True), ("passed", False)],
+)
+def test_a05_rejected_absent_or_identity_unknown_review_is_not_trusted(
+    tmp_path: Path, review_state: str, identity_known: bool
+) -> None:
+    """A05：撤銷（rejected）、非 passed（absent）與 reviewer 身分 unknown 的 review
+    都不得被總帳重新包裝成 verified。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    row = snapshot["mappings"][0]
+    row["completion_record"] = _write_completion(
+        tmp_path,
+        run_id=row["run_id"],
+        slice_id=f"review-{review_state}-{'known' if identity_known else 'unknown'}",
+        review_state=review_state,
+        reviewer_identity_known=identity_known,
+    )
+    report = inspect_delivery(manifest, snapshot, **context)
+    review_stage = report["mappings"][0]["evidence"]["review"]
+    assert review_stage["status"] in {"failed", "unknown"}
+    assert any(gap["stage"] == "review" and gap["status"] == review_stage["status"] for gap in report["gaps"])
+    assert report["closure_readiness"] == "not-ready"
+
+
+def test_a05_legacy_mapping_without_installed_runtime_is_missing_not_inferred(tmp_path: Path) -> None:
+    manifest, snapshot, context = _ready_case(tmp_path)
+    del snapshot["mappings"][0]["installed_runtime"]
+    report = inspect_delivery(manifest, snapshot, **context)
+    assert report["mappings"][0]["evidence"]["installed"] == {
+        "status": "missing",
+        "reason": "installed-runtime-receipt-missing",
+    }
+    assert report["closure_readiness"] == "not-ready"
+
+
+def test_a05_loaded_receipt_projection_without_recorded_at_is_unproven(tmp_path: Path) -> None:
+    """舊 loaded-runtime 投影缺 recorded_at：installed 期限無法證實，只能 unknown。"""
+    manifest, snapshot, context = _ready_case(tmp_path)
+    latest = runtime_attestation.inspect_runtime_state(
+        tmp_path / "runtime-0", service="manager", instance="default"
+    )["latest"]
+
+    def projection(loaded: dict):
+        return lambda service, instance: {"status": "match", "loaded": loaded, "trust_root": {"status": "verified"}}
+
+    report = inspect_delivery(manifest, snapshot, **{**context, "runtime_status_resolver": projection(latest)})
+    assert report["mappings"][0]["evidence"]["installed"]["status"] == "verified"
+    legacy = {key: value for key, value in latest.items() if key != "recorded_at"}
+    report = inspect_delivery(manifest, snapshot, **{**context, "runtime_status_resolver": projection(legacy)})
+    installed = report["mappings"][0]["evidence"]["installed"]
+    assert (installed["status"], installed["reason"]) == ("unknown", "installed-runtime-receipt-age-unknown")
+    assert report["closure_readiness"] == "not-ready"
+
+
+def test_a10_mapping_row_unknown_fields_survive_reverification_and_history(tmp_path: Path) -> None:
+    """A10：同版本 index 的 mapping row 若帶未知欄位，重驗同一 mapping 時保留、
+    不改寫索引；該 row 之後被新 candidate 取代成 stale history 時仍保留。"""
+    specs = [("R01", "r1"), ("R02", "r1")]
+    manifest, snapshot, context = _ready_case(tmp_path, specs)
+    index_path = tmp_path / "index.json"
+    reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+    doc = json.loads(index_path.read_text(encoding="utf-8"))
+    for row in doc["mappings"]:
+        row["future_row_field"] = {"provenance": row["requirement_id"]}
+    index_path.write_text(json.dumps(doc), encoding="utf-8")
+    before = read_index(index_path)
+
+    replay = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+
+    assert replay["changed"] is False
+    assert replay["index"]["generation"] == before["generation"]
+    assert all(row["future_row_field"] == {"provenance": row["requirement_id"]} for row in replay["index"]["mappings"])
+
+    changed = copy.deepcopy(snapshot)
+    changed["snapshot_revision"] = 2
+    changed["mappings"][0]["source_generation"] = 3
+    changed["mappings"][0]["candidate_sha"] = "9" * 40
+    result = reconcile_delivery(manifest, changed, index_path=index_path, **context)
+    history = next(row for row in result["index"]["mappings"] if row["requirement_id"] == "R01" and row["candidate_sha"] == HEAD)
+    assert history["status"] == "stale"
+    assert history["future_row_field"] == {"provenance": "R01"}
+    r02 = next(row for row in result["index"]["mappings"] if row["requirement_id"] == "R02")
+    assert r02["future_row_field"] == {"provenance": "R02"}
+
+
+def test_a10_legacy_gap_projection_in_extensions_is_upgraded_read_only(tmp_path: Path) -> None:
+    """A10：舊 reader 收進 extensions 的 gaps 投影，由新 reader 讀回頂層欄位，其餘
+    未知 extension 保留；讀取不改寫來源檔。"""
+    index_path = tmp_path / "index.json"
+    legacy = {
+        "schema": "cortex/requirement-delivery-index",
+        "schema_version": INDEX_SCHEMA,
+        "generation": 2,
+        "manifest_id": "legacy",
+        "manifest_sha256": "a" * 64,
+        "snapshot_sha256": "b" * 64,
+        "mappings": [],
+        "reconcile_receipt": None,
+        "extensions": {"gaps": [{"requirement_id": "R01", "stage": "live", "status": "missing"}], "retained": {"x": 1}},
+    }
+    index_path.write_text(json.dumps(legacy), encoding="utf-8")
+    raw = index_path.read_bytes()
+    index = read_index(index_path)
+    assert index["gaps"] == legacy["extensions"]["gaps"]
+    assert index["extensions"] == {"retained": {"x": 1}}
+    assert index_path.read_bytes() == raw
+
+
+def _waiver_case(tmp_path: Path, *, waivable: list[str], authorities: list[dict]) -> tuple[dict, dict]:
+    manifest = _manifest(tmp_path, [("R01", "r1")], required=["source", "test"], waiver_policy={"authorities": authorities})
+    manifest["requirements"][0]["evidence_policy"]["waivable_stages"] = waivable
+    snapshot = _snapshot(tmp_path, manifest, [("R01", "r1")])
+    snapshot["mappings"][0]["completion_record"] = None
+    snapshot["waivers"] = [{
+        "requirement_id": "R01", "requirement_revision": "r1", "acceptance_id": "R01-AC1",
+        "stage": "test", "reason": "accepted exception", "authority": {"id": "qa-council", "version": "2"},
+        "expires_at": "2026-10-01T00:00:00+00:00", "receipt": "approval:123",
+    }]
+    return manifest, snapshot
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("authority-not-in-policy", ("failed", "waiver-invalid:ValueError")),
+        ("authority-version-not-in-policy", ("failed", "waiver-invalid:ValueError")),
+        ("approval-validator-rejects", ("unknown", "waiver-approval-validator-unavailable")),
+        ("approval-validator-missing", ("unknown", "waiver-approval-validator-unavailable")),
+        ("stage-not-waivable", ("failed", "waiver-not-allowed-by-requirement-policy")),
+    ],
+)
+def test_a11_waiver_without_policy_authority_approval_or_waivable_stage_is_not_applied(
+    tmp_path: Path, case: str, expected: tuple[str, str]
+) -> None:
+    authorities = [{"id": "qa-council", "version": "2"}]
+    waivable = ["test"]
+    if case == "authority-not-in-policy":
+        authorities = [{"id": "other-council", "version": "2"}]
+    elif case == "authority-version-not-in-policy":
+        authorities = [{"id": "qa-council", "version": "1"}]
+    elif case == "stage-not-waivable":
+        waivable = []
+    manifest, snapshot = _waiver_case(tmp_path, waivable=waivable, authorities=authorities)
+    context = _context(tmp_path)
+    if case == "approval-validator-rejects":
+        context["waiver_validator"] = lambda waiver: False
+    elif case == "approval-validator-missing":
+        context["waiver_validator"] = None
+
+    result = inspect_delivery(manifest, snapshot, **context)
+
+    test_stage = result["mappings"][0]["evidence"]["test"]
+    assert (test_stage["status"], test_stage["reason"]) == expected
+    assert result["closure_readiness"] == "not-ready"
+
+
+def test_a11_production_manifest_authorizes_no_waiver() -> None:
+    """production manifest 不可豁免：沒有 waiver authority，也沒有任何 waivable stage。"""
+    repo_root = Path(__file__).resolve().parents[1]
+    manifest = json.loads((repo_root / "docs/superpowers/specs/refine-requirements-v1.json").read_text(encoding="utf-8"))
+    assert manifest["waiver_policy"] == {"authorities": []}
+    assert all(row["evidence_policy"]["waivable_stages"] == [] for row in manifest["requirements"])
+
+
+def test_a12_governed_end_to_end_restores_only_removed_entry_and_expired_live_blocks(tmp_path: Path) -> None:
+    """A12：正式 writer 產生的 CompletionRecord／loaded-runtime receipt、受治理
+    live validator 與 kind-aware domain 導出（不用 `lambda: True`）端到端 ready；
+    重啟時只補回故意移除的 index entry、其他 entry 原封不動；installed evidence
+    記錄實際 loaded receipt；過期 live receipt 的負例讓持久化索引 not-ready。"""
+    specs = [("R01", "r1"), ("R02", "r2")]
+    manifest = _manifest(tmp_path, specs)
+    snapshot = _snapshot(tmp_path, manifest, specs, with_live=False)
+    for row in snapshot["mappings"]:
+        row["live_receipt"] = _write_governed_live(
+            tmp_path,
+            requirement_id=row["requirement_id"],
+            revision=row["requirement_revision"],
+            criterion_id=row["acceptance_ids"][0],
+            kind=live_receipt_validators.KIND_TASK_MEMORY_LIVE_CANARY,
+            evidence=_task_memory_payload(target=row["target"]),
+            target=row["target"],
+        )
+    context = _context(
+        tmp_path,
+        live_validator=live_receipt_validators.make_governed_live_receipt_validator(
+            source_root=tmp_path, evidence_root=tmp_path
+        ),
+        domain_deriver=live_receipt_validators.derive_canary_domain,
+    )
+    index_path = tmp_path / "index.json"
+
+    first = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+    assert first["report"]["closure_readiness"] == "ready"
+    rows_before = {row["requirement_id"]: row for row in first["index"]["mappings"]}
+    assert set(rows_before) == {"R01", "R02"}
+    for position, requirement_id in enumerate(("R01", "R02")):
+        loaded = runtime_attestation.inspect_runtime_state(
+            tmp_path / f"runtime-{position}", service="manager", instance="default"
+        )["latest"]
+        installed = rows_before[requirement_id]["evidence"]["installed"]
+        assert loaded["pid"] == 555 + position
+        assert installed["locator"] == loaded["receipt_id"]
+        assert installed["sha256"] == requirement_delivery.canonical_json_sha256(loaded)
+        assert rows_before[requirement_id]["evidence"]["live"]["validator"] == "live-canary-domain/v1"
+
+    doc = json.loads(index_path.read_text(encoding="utf-8"))
+    doc["mappings"] = [row for row in doc["mappings"] if row["requirement_id"] != "R02"]
+    index_path.write_text(json.dumps(doc), encoding="utf-8")
+    resumed = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+    assert resumed["changed"] is True
+    assert resumed["report"]["closure_readiness"] == "ready"
+    rows_after = {row["requirement_id"]: row for row in resumed["index"]["mappings"]}
+    assert len(resumed["index"]["mappings"]) == 2
+    assert rows_after["R01"] == rows_before["R01"]
+    assert rows_after["R02"]["mapping_id"] == rows_before["R02"]["mapping_id"]
+
+    r02 = snapshot["mappings"][1]
+    r02["live_receipt"] = _write_governed_live(
+        tmp_path,
+        requirement_id="R02",
+        revision="r2",
+        criterion_id="R02-AC1",
+        kind=live_receipt_validators.KIND_TASK_MEMORY_LIVE_CANARY,
+        evidence=_task_memory_payload(target=r02["target"]),
+        target=r02["target"],
+        observed_at="2026-09-18T00:00:00+00:00",
+    )
+    expired = reconcile_delivery(manifest, snapshot, index_path=index_path, **context)
+    assert expired["report"]["closure_readiness"] == "not-ready"
+    persisted = read_index(index_path)
+    assert persisted["reconcile_receipt"]["coverage"] == "not-ready"
+    statuses = {row["requirement_id"]: row["status"] for row in persisted["mappings"]}
+    assert statuses == {"R01": "covered", "R02": "blocked"}
+    assert [(gap["requirement_id"], gap["stage"], gap["reason"]) for gap in persisted["gaps"]] == [
+        ("R02", "live", "live-canary-receipt-expired")
+    ]
+
+    r02["live_receipt"] = None
+    missing = inspect_delivery(manifest, snapshot, **context)
+    assert missing["closure_readiness"] == "not-ready"
+    assert [(gap["requirement_id"], gap["stage"], gap["status"]) for gap in missing["gaps"]] == [
+        ("R02", "live", "missing")
+    ]

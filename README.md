@@ -536,9 +536,13 @@ cortex delivery gaps --manifest docs/superpowers/specs/refine-requirements-v1.js
   --checkout "hamanpaul/paulsha-cortex=$(git rev-parse --show-toplevel)"
 ```
 
+`--snapshot` 的 `cortex/requirement-evidence-snapshot/v1` 目前需由外部提供：本 repo 沒有程式
+產生它，上例路徑只是建議放置位置，不會有程式寫入；外層 live receipt 同樣沒有 in-repo producer。
 `status` 是最近一次 reconcile 的唯讀投影；`gaps` 即時重驗但不寫入；`reconcile` 才以 CAS
 更新 Trust Root 登記的可重建索引。命令不派工、不呼叫模型、不 merge、不部署、不改 issue
-或關票。installed 證據沿用 #841 receipt；live 證據已固定接上
+或關票。installed 證據沿用 #841 receipt，並依 `max_age_seconds.installed` 以 loaded receipt 的
+`recorded_at` 判定期限（過期為 stale）；test 證據只採信 verification contract
+`tests[*].acceptance_ids` 綁定該 criterion 且通過的測試；production 不接受任何 waiver。live 證據已固定接上
 `paulsha_cortex/coordinator/live_receipt_validators.py` 的封閉登記表 validator，只認得
 deployment-canary `qualification.json`（沿用 `qualification/validate.py`）與 #857
 `cortex/task-memory-live-canary/v1` 兩種 receipt kind，兩者都綁定該需求 claim 的
@@ -1101,6 +1105,7 @@ verification:
 - v1 只支援 `tier: shareable`；非 shareable 會 fail-closed 到 `needs_human`。
 - verification command 只接受 typed argv（`shell=False`）；採 sanitized env，但這不是 sandbox，不保證隔離 untrusted code。
 - `required_artifacts` 可選擇以 `mode: "100644"` 或 `mode: "100755"` 宣告 Candidate Git tree 的預期檔案 mode；未宣告時不檢查 mode。
+- `tests[*]` 可選填 `acceptance_ids`（例如 `acceptance_ids: [R01-AC1]`；非空、不重複的 acceptance criterion id），verification 執行該測試後把同一組 id 原樣寫進 evidence 的 `details.tests[*]`，供 `cortex delivery` 的 test stage 逐 criterion 採信（#845）；`checks`／`full_suite` 不接受此鍵，未宣告時 contract 形狀與 hash 不變。
 - verification frontmatter 的 inline `argv` list 由 zero-dependency YAML subset parser 解析；含逗號或 `]` 的元素需使用單／雙引號，單／雙引號內的反斜線跳脫可保留引號等字面值，尾逗號可容忍，前導／中間空元素與未閉合引號會拒絕。
 - `repo` 為 optional 顯式歸屬宣告（`owner/repo`，#469）：宣告後派工會寫進 builder/reviewer job 的 `workflow_repo`，`recent_done`／`slices` 的 repo 歸屬即投影此值；未宣告維持 `null`，不從本機路徑或 git remote 推斷。非法 shape（不是恰一個 `/` 或任一段為空）會 fail-closed 落 `hold`。
 - `cortex deck compile` 可用 `--repo owner/name` 將明確 repo 寫入輸出的 spec；省略時仍為 `repo: null`，不從本機路徑或 git remote 推斷（#473）。

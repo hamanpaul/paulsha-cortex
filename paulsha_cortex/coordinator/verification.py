@@ -192,6 +192,24 @@ def normalize_write_paths(value: object, *, repo_root: Path) -> list[str]:
     return write_paths
 
 
+def normalize_acceptance_ids(value: object, *, field: str) -> list[str]:
+    """正規化 task test 宣告的 acceptance criterion 綁定（#845 B3）。
+
+    requirement delivery 的 test stage 只採信 verification evidence 中以
+    `acceptance_ids` 明確綁定該 criterion 且 passed 的測試；綁定必須由
+    contract 宣告、由 verification 原樣帶進 evidence，不能事後推測。"""
+    if not isinstance(value, list) or not value:
+        raise ContractValidationError(field, f"{field} must be a non-empty list of acceptance criterion ids")
+    normalized: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise ContractValidationError(field, f"{field}[{index}] must be a non-empty string")
+        normalized.append(item.strip())
+    if len(normalized) != len(set(normalized)):
+        raise ContractValidationError(field, f"{field} must not repeat an acceptance criterion id")
+    return normalized
+
+
 def normalize_command_like(
     value: object,
     *,
@@ -199,6 +217,7 @@ def normalize_command_like(
     repo_root: Path,
     allow_name: bool,
     allow_baseline: bool,
+    allow_acceptance_ids: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ContractValidationError(field, f"{field} must be an object")
@@ -207,6 +226,8 @@ def normalize_command_like(
         allowed.add("name")
     if allow_baseline:
         allowed.add("baseline")
+    if allow_acceptance_ids:
+        allowed.add("acceptance_ids")
     extras = set(value) - allowed
     if extras:
         extra = sorted(extras)[0]
@@ -234,6 +255,11 @@ def normalize_command_like(
         if baseline != "no-regression":
             raise ContractValidationError(f"{field}.baseline", "full_suite baseline must be 'no-regression'")
         normalized["baseline"] = baseline
+    # 只在宣告時才出現：未宣告的既有 contract 正規化形狀與 contract hash 不變。
+    if allow_acceptance_ids and "acceptance_ids" in value:
+        normalized["acceptance_ids"] = normalize_acceptance_ids(
+            value["acceptance_ids"], field=f"{field}.acceptance_ids"
+        )
     return normalized
 
 
@@ -312,6 +338,7 @@ def validate_verification_contract(
             repo_root=repo_root,
             allow_name=False,
             allow_baseline=False,
+            allow_acceptance_ids=True,
         )
         for index, entry in enumerate(tests_value)
     ]
@@ -1118,6 +1145,10 @@ def run_result_verification(
             subprocess_runner=subprocess_runner,
             env=env,
         )
+        # #845 B3：contract 宣告的 criterion 綁定原樣帶進 evidence，供 requirement
+        # delivery 的 test stage 逐 criterion 採信；未宣告則不出現，不推測綁定。
+        if "acceptance_ids" in test_spec:
+            test_result["acceptance_ids"] = list(test_spec["acceptance_ids"])
         details["tests"].append(test_result)
         if test_result["status"] != "passed":
             return _finish("needs_human", _failure_summary("task-test", test_result["status"]))
