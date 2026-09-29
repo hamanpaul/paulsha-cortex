@@ -1744,6 +1744,124 @@ def _pick_adoptable_copilot_review(
     return max(adoptable, key=lambda value: (value.submitted_at_epoch, value.review_id))
 
 
+def _review_attest_has_blocking_review_findings(run: Any) -> bool:
+    return any(
+        step.phase == "review" and step.gate_result == "needs_human"
+        for step in tuple(getattr(run, "steps", ()) or ())
+    )
+
+
+def _review_attest_run_admissible(run: Any) -> bool:
+    """``review-attest`` 只看 run 本身的前置（不需 WorkAuthority 的那一半）。
+
+    `_phase_recovery_actions` 拿不到 authority，至少以這一半排除必被拒的 run
+    （#1184：不在 review、HEAD 未驗證、沒有唯一 foreign review 等）。
+    """
+
+    foreign = [
+        ref
+        for ref in tuple(getattr(run, "gate_refs", ()) or ())
+        if ref.kind == "foreign-review"
+    ]
+    return not (
+        _review_attest_has_blocking_review_findings(run)
+        or getattr(run, "current_phase", None) != "review"
+        or getattr(run, "status", None) != "ongoing"
+        or not isinstance(getattr(run, "candidate_head", None), str)
+        or getattr(run, "verified_head", None) != getattr(run, "candidate_head", None)
+        or len(foreign) != 1
+    )
+
+
+def _review_attest_admission_allowed(run: Any, authority: Any) -> bool:
+    """Return whether ``review-attest`` passes its run/authority admission gates."""
+
+    mapped_prs = tuple(getattr(authority, "mapped_prs", ()) or ())
+    mapped_openspec = tuple(getattr(authority, "mapped_openspec", ()) or ())
+    return not (
+        not _review_attest_run_admissible(run)
+        or len(mapped_prs) > 1
+        or len(mapped_openspec) > 1
+        or (
+            len(mapped_prs) == 1
+            and tuple(getattr(run, "pr_refs", ()) or ())
+            != (f"{run.repo}#{mapped_prs[0]}",)
+        )
+        or (
+            len(mapped_prs) == 0
+            and (
+                tuple(getattr(run, "pr_refs", ()) or ()) != ()
+                or mapped_openspec != ()
+            )
+        )
+    )
+
+
+def _abandon_admission_allowed(run: Any, workflow_registry: Any) -> bool:
+    return (
+        workflow_run_pre_delivery(run)
+        and getattr(run, "status", None) == "ongoing"
+        and not any(
+            job.get("workflow_run_id") == run.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in workflow_registry.list_jobs()
+        )
+    )
+
+
+def _ship_needs_human_next_actions(
+    run: Any, authority: Any, workflow_registry: Any
+) -> list[str]:
+    """List actions whose formal admission accepts the current ship stop."""
+
+    actions: list[str] = []
+    if _abandon_admission_allowed(run, workflow_registry):
+        actions.append("abandon")
+    if _review_attest_admission_allowed(run, authority):
+        actions.append("review-attest")
+    # A Copilot ship stop can always be replayed through the normal ship entry:
+    # it reloads and validates the persisted stop, then returns needs_human.
+    if not actions:
+        actions.append("ship")
+    return actions
+
+
+def _ship_needs_human_next_step_hint(
+    action: str, *, run: Any, authority: Any
+) -> str:
+    if action == "abandon":
+        return (
+            f"cortex work abandon {run.work_id} --repo {authority.repo} "
+            f"--expected-run-id {run.run_id} --actor <operator> --reason '<理由>'"
+        )
+    if action == "review-attest":
+        return (
+            f"cortex work review-attest {run.work_id} --repo {authority.repo} "
+            "--actor <operator> --payload <file>"
+        )
+    return f"cortex work ship {run.work_id} --repo {authority.repo}"
+
+
+def _copilot_ship_needs_human_response(
+    *,
+    reason: str,
+    run: Any,
+    authority: Any,
+    workflow_registry: Any,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    actions = _ship_needs_human_next_actions(run, authority, workflow_registry)
+    return {
+        "action": "needs_human",
+        "reason": reason,
+        **(extra or {}),
+        "next_actions": actions,
+        "next_step_hint": _ship_needs_human_next_step_hint(
+            actions[0], run=run, authority=authority
+        ),
+    }
+
+
 def _set_copilot_request_outcome_unknown(
     *,
     active: dict[str, Any],
@@ -1775,14 +1893,12 @@ def _set_copilot_request_outcome_unknown(
             head=str(ship.get("head") or ""),
         ),
     )
-    return {
-        "action": "needs_human",
-        "reason": "copilot-review-request-outcome-unknown",
-        "next_actions": ["abandon", "review-attest"],
-        "next_step_hint": (
-            f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
-        ),
-    }
+    return _copilot_ship_needs_human_response(
+        reason="copilot-review-request-outcome-unknown",
+        run=canonical_run,
+        authority=authority,
+        workflow_registry=workflow_registry,
+    )
 
 
 def _review_attest_evidence_refs(value: object) -> list[dict[str, str]]:
@@ -2395,34 +2511,15 @@ def _review_attest_action(
         authority=authority,
     )
     _validate_current_run_authority(active, authority, run)
-    if any(
-        step.phase == "review" and step.gate_result == "needs_human"
-        for step in run.steps
-    ):
-        raise RuntimeError(
-            "review-attest does not adjudicate review-gate blocking findings; "
-            "use retry-review --reason to accept or retry-build --reason to reject"
-        )
-    foreign = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]
     change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
-    if (
-        run.current_phase != "review"
-        or run.status != "ongoing"
-        or not isinstance(run.candidate_head, str)
-        or run.verified_head != run.candidate_head
-        or len(foreign) != 1
-        or len(authority.mapped_prs) > 1
-        or len(authority.mapped_openspec) > 1
-        or (
-            len(authority.mapped_prs) == 1
-            and run.pr_refs != (f"{run.repo}#{authority.mapped_prs[0]}",)
-        )
-        or (
-            len(authority.mapped_prs) == 0
-            and (run.pr_refs != () or authority.mapped_openspec != ())
-        )
-    ):
+    if not _review_attest_admission_allowed(run, authority):
+        if _review_attest_has_blocking_review_findings(run):
+            raise RuntimeError(
+                "review-attest does not adjudicate review-gate blocking findings; "
+                "use retry-review --reason to accept or retry-build --reason to reject"
+            )
         raise RuntimeError("review-attest requires current exact-HEAD review run")
+    foreign = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]
     pr_number: int | None = authority.mapped_prs[0] if authority.mapped_prs else None
     if pr_number is not None:
         remote = GitHubDeliveryClient(runner=runner).fetch_delivery_facts(
@@ -3689,7 +3786,7 @@ def _claim_action(
     if canonical_run is not None:
         try:
             active_recovery_actions = _phase_recovery_actions(
-                canonical_run, workflow_registry
+                canonical_run, workflow_registry, authority
             )
         except Exception:  # noqa: BLE001 - claim read projection remains fail-soft
             active_recovery_actions = ()
@@ -4805,7 +4902,7 @@ def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
     )
 
 
-def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
+def _phase_recovery_actions(run, workflow_registry, authority=None) -> tuple[str, ...]:
     """計算 needs_human run 中與 job／owner-slice admission 一致的 recovery 動作。
 
     #546 將此結果帶入 `ClaimCandidate`，並供 claim、status、Monitor work list 共用；
@@ -4816,6 +4913,10 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
     刻意**只宣告會被受理的動作**：每一項都用與該動作自身完全相同的前置驗
     （同一份 job/step 判準）判定，拿不準就不宣告。宣告一個保證失敗的動作比不
     宣告更糟——這是 #382 已經付過學費的教訓。
+
+    ``authority``（#1184）：呼叫端手上有 WorkAuthority 時傳入，`review-attest`
+    便以與該動作完全相同的 run＋authority 前置判定；Monitor／Manager 的讀取投影
+    沒有 authority，只能用 run 層那一半。
     """
 
     reason_code = (
@@ -4925,7 +5026,15 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
                     if action not in actions
                 )
 
-    if reason_code.startswith("copilot-") and "review-attest" not in actions:
+    if (
+        reason_code.startswith("copilot-")
+        and "review-attest" not in actions
+        and (
+            _review_attest_admission_allowed(run, authority)
+            if authority is not None
+            else _review_attest_run_admissible(run)
+        )
+    ):
         actions.append("review-attest")
     if reason_code in {"review-disposition-required", "review-threads-unresolved"}:
         actions.append("review-disposition")
@@ -7746,7 +7855,7 @@ def _refreeze_base_action(
         "evidence": record,
         "run": updated.to_dict(),
     }
-    next_actions = _phase_recovery_actions(updated, workflow_registry)
+    next_actions = _phase_recovery_actions(updated, workflow_registry, authority)
     if next_actions:
         payload["next_actions"] = list(next_actions)
     return payload
@@ -9247,9 +9356,11 @@ def _ship_action(
     if ship and ship.get("phase") == "needs_human" and not maintainer_recovery and rearm_permit is None:
         res = {"action": "needs_human", "reason": ship.get("reason")}
         if str(ship.get("reason", "")).startswith("copilot-"):
-            res["next_actions"] = ["abandon", "review-attest"]
-            res["next_step_hint"] = (
-                f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+            return _copilot_ship_needs_human_response(
+                reason=str(ship.get("reason")),
+                run=canonical_run,
+                authority=authority,
+                workflow_registry=workflow_registry,
             )
         return res
 
@@ -9764,19 +9875,17 @@ def _ship_action(
                     fix_rounds=str(fix_rounds),
                 ),
             )
-            return {
-                "action": "needs_human",
-                "reason": "copilot-finding-budget-exhausted",
-                "next_actions": ["abandon", "review-attest"],
-                "next_step_hint": (
-                    f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
-                ),
-                **_repair_budget_status(
+            return _copilot_ship_needs_human_response(
+                reason="copilot-finding-budget-exhausted",
+                run=canonical_run,
+                authority=authority,
+                workflow_registry=workflow_registry,
+                extra=_repair_budget_status(
                     fix_rounds=fix_rounds,
                     max_fix_rounds=max_fix_rounds,
                     current_phase=canonical_run.current_phase,
                 ),
-            }
+            )
     if (
         not ship
         or previous_head != preflight.head
@@ -9958,14 +10067,12 @@ def _ship_action(
                 ),
             )
             _save_runs(state_path, state)
-            return {
-                "action": "needs_human",
-                "reason": "copilot-review-timeout",
-                "next_actions": ["abandon", "review-attest"],
-                "next_step_hint": (
-                    f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
-                ),
-            }
+            return _copilot_ship_needs_human_response(
+                reason="copilot-review-timeout",
+                run=canonical_run,
+                authority=authority,
+                workflow_registry=workflow_registry,
+            )
         return {"action": "awaiting-copilot", "head": preflight.head}
     review = max(current_reviews, key=lambda value: (value.submitted_at_epoch, value.review_id))
     loop = ReviewLoop(
@@ -10030,9 +10137,12 @@ def _ship_action(
         )
         res = {"action": "needs_human", "reason": copilot.reason, **extra}
         if str(copilot.reason or "").startswith("copilot-"):
-            res["next_actions"] = ["abandon", "review-attest"]
-            res["next_step_hint"] = (
-                f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
+            return _copilot_ship_needs_human_response(
+                reason=str(copilot.reason),
+                run=canonical_run,
+                authority=authority,
+                workflow_registry=workflow_registry,
+                extra=extra,
             )
         return res
 
