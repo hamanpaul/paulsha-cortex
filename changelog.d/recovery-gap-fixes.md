@@ -1,0 +1,4 @@
+- **#1168 recover-pre-candidate active writer admission**：正式 admission 與 slice projection 共用 owner/attempt job 狀態檢查，綁定或同 attempt job 仍 dispatched/running 時零副作用拒絕；失敗且 job 已 terminal 的 slice 仍可原子復原。
+- **#1169 retirement outcome commit 順序**：`abandon`／`retire-delivered` 先以 registry CAS 提交終局狀態再寫 engineering outcome，CAS 拒絕不留終局 outcome，commit 後 crash 可由 immutable evidence 冪等補發。
+- **#1170 open PR recovery projection**：needs_human run 帶未證明終結的 PR 時不再建議必被拒的 `abandon`，改投影可受理的 review recovery lane 或 `resume`，維持 `next_actions` 非空。
+- **#1171 slice retry-verify evidence replay**：同 Candidate 的不同驗證結果使用 content-addressed evidence 路徑，保留舊 evidence 並採信通過的重跑結果。

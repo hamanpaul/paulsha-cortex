@@ -73,42 +73,44 @@
     {
       "id": "G843-R02-pre-candidate-active-writer",
       "owner": "issue-1168",
-      "status": "open",
+      "status": "closed",
       "source": "paulsha_cortex/coordinator/manager.py::_pre_candidate_recovery_admission",
       "retest": "recover-pre-candidate must refuse, with zero side effects, when the bound builder job or another job with the same owner identity and attempt id is still dispatched/running; the projection shares the admission and must stop offering the action.",
-      "reproduced_by": [
-        "tests/test_recovery_action_state_matrix_843.py::test_r02_public_entry_rejection_leaves_registry_evidence_jobs_and_read_model_unchanged[recover-pre-candidate-active-job]",
-        "tests/test_recovery_action_state_matrix_843.py::test_r02_recover_pre_candidate_refuses_a_still_running_bound_builder"
+      "verified_by": [
+        "tests/test_recovery_action_state_matrix_843.py::test_r02_recover_pre_candidate_refuses_a_still_running_bound_builder",
+        "tests/test_recovery_action_state_matrix_843.py::test_r02_recover_pre_candidate_refuses_an_active_sibling_for_same_attempt"
       ]
     },
     {
       "id": "G843-R03-outcome-before-commit",
       "owner": "issue-1169",
-      "status": "open",
+      "status": "closed",
       "source": "paulsha_cortex/coordinator/work_actions.py::_abandon_action / _retire_delivered_action",
       "retest": "When the abandon or retire-delivered registry commit is rejected by drift (run still ongoing with an active job), the engineering-outcome outbox must not keep an abandoned/retired outcome for that run.",
-      "reproduced_by": [
-        "tests/test_recovery_action_state_matrix_843.py::test_r03_rejected_retirement_leaves_no_terminal_engineering_outcome"
+      "verified_by": [
+        "tests/test_recovery_action_state_matrix_843.py::test_r03_rejected_retirement_leaves_no_terminal_engineering_outcome",
+        "tests/test_recovery_action_state_matrix_843.py::test_r03_post_commit_crash_replay_emits_outcome_once"
       ]
     },
     {
       "id": "G843-R09-abandon-offered-for-pr-run",
       "owner": "issue-1170",
-      "status": "open",
+      "status": "closed",
       "source": "paulsha_cortex/coordinator/claim.py::needs_human_next_actions",
       "retest": "A needs_human run that carries PR refs but is not proven merged must not be offered abandon (the pre-delivery admission rejects it), or abandon admission must accept it; decide against the #728 non-empty next_actions guarantee.",
-      "reproduced_by": [
-        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[blocking-findings-with-open-pr-abandon]",
-        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[open-pr-awaiting-copilot-abandon]"
+      "verified_by": [
+        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[blocking-findings-with-open-pr-retry-review]",
+        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[blocking-findings-with-open-pr-retry-build]",
+        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[open-pr-awaiting-copilot-resume]"
       ]
     },
     {
       "id": "G843-R06-slice-reverify-evidence-collision",
       "owner": "issue-1171",
-      "status": "open",
+      "status": "closed",
       "source": "paulsha_cortex/coordinator/verification.py::write_verification_evidence",
       "retest": "Slice retry-verify for the unchanged Candidate must be able to adopt a passing rerun; today the fixed (slice, candidate) evidence path quarantines the prior file, raises, and the action records verification-runner-error.",
-      "reproduced_by": [
+      "verified_by": [
         "tests/test_retry_verify_shared_conformance_843.py::test_slice_retry_verify_adopts_a_passing_rerun_for_the_same_candidate"
       ]
     },

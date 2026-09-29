@@ -18,6 +18,7 @@ from urllib.parse import quote
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.schema import BAND_LEVELS
 from paulsha_cortex.github_rate_limit import is_rate_limit_signal
+from paulsha_cortex.recovery_action_contracts import RECOVERY_WORK_ACTIONS
 
 from . import verification
 
@@ -1813,8 +1814,8 @@ def needs_human_next_actions(
 
     基礎判準維持不變：
 
-    - `abandon` **永遠**合法（#256 R3：釋放後可重 claim），因此本函式不可能回空
-      集合；這就是「至少給得出一個合法動作」的機械保證。
+    - 有受理的 job 層復原動作時以該動作作為出口；否則 `abandon` 釋放後可重
+      claim。函式因此不會回空，維持 #728 的「至少有一個 operator action」保證。
     - `recover-planning` 只在「停在 `define` 的環境類 planning 失敗」才浮現
       （R1 fail-closed），與 `work_actions._recover_planning_action` 自身的前置驗
       （`run.current_phase != "define"` 與 `classification != "environment"` 兩條
@@ -1825,10 +1826,20 @@ def needs_human_next_actions(
       基礎集合改成 `retire-delivered`，同樣不可能回空集合。
     """
 
-    if "retire-delivered" in job_recovery_actions:
+    admitted_alternatives = tuple(
+        action
+        for action in job_recovery_actions
+        if action in RECOVERY_WORK_ACTIONS and action != "abandon"
+    )
+    if "retire-delivered" in admitted_alternatives:
         base: tuple[str, ...] = ("retire-delivered",)
     elif planning_failure_classification == "environment" and phase == "define":
         base = ("recover-planning", "abandon")
+    elif admitted_alternatives:
+        # Use an admitted recovery lane as the base exit when available. In
+        # particular, abandon rejects delivered/open-PR runs; #728 still
+        # requires a non-empty next_actions tuple.
+        base = admitted_alternatives
     else:
         base = ("abandon",)
     return (*base, *(action for action in job_recovery_actions if action not in base))
@@ -1890,6 +1901,8 @@ def needs_human_next_step_hint(
             "請修復規劃環境並重試 recover-planning；若無法修復，請執行 "
             f"{abandon}。"
         )
+    if "abandon" not in actions:
+        return "請使用 attention 列出的可受理復原動作：" + "、".join(actions) + "。"
     return f"請檢視阻塞證據，接著執行 {abandon}。"
 
 

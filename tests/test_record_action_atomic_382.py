@@ -353,6 +353,10 @@ class TestRecoverPreCandidateOnFreshFailure:
             owner_identity=owner_identity,
             attempt_id=attempt_id,
         )
+        # create_job() 登記時預設 dispatched；本案例模擬 builder 已失敗，因此
+        # 明確終結 job，避免把「尚未啟動的 fixture row」當成可回收的 active writer。
+        reg._find_job(builder_job["job_id"])["status"] = "failed"
+        reg._persist()
         reg.create_slice(
             slice_id="slice-a",
             spec_path="specs/slice-a.md",

@@ -4918,6 +4918,27 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
                     for action in _blocking_findings_recovery_actions(run)
                     if action not in actions
                 )
+                # `retry-review` admission also accepts a needs_human review run
+                # whose exact verified Candidate and frozen plan remain current.
+                # Expose that same recovery lane for ship handoff failures with an
+                # open PR; `abandon` is pre-delivery only and will reject them.
+                if (
+                    run.current_phase == "review"
+                    and isinstance(run.candidate_head, str)
+                    and run.candidate_head == run.verified_head
+                    and any(item.kind == "plan" for item in run.planning_authority)
+                ):
+                    try:
+                        active_runs = [
+                            item for item in workflow_registry.list_workflow_runs()
+                            if item.repo == run.repo and item.work_id == run.work_id
+                            and item.status == "ongoing"
+                        ]
+                    except Exception:
+                        active_runs = []
+                    if len(active_runs) == 1 and active_runs[0].run_id == run.run_id:
+                        if "retry-review" not in actions:
+                            actions.append("retry-review")
 
     if reason_code.startswith("copilot-") and "review-attest" not in actions:
         actions.append("review-attest")
@@ -4942,6 +4963,24 @@ def _phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
         run, workflow_registry
     ):
         actions.append("retire-delivered")
+    if (
+        run.pr_refs
+        and "retire-delivered" not in actions
+        and not any(action in actions for action in ("retry-review", "retry-build", "retry-card"))
+    ):
+        # An open/unproven PR cannot be abandoned or retired as delivered.
+        # `resume` is the registered ship-lane entry that lets Manager retry
+        # the current delivery step after a transient needs_human failure.
+        try:
+            has_active_job = any(
+                job.get("workflow_run_id") == run.run_id
+                and job.get("status") in ACTIVE_JOB_STATUSES
+                for job in workflow_registry.list_jobs()
+            )
+        except Exception:
+            has_active_job = True
+        if not has_active_job and "resume" not in actions:
+            actions.append("resume")
     return tuple(actions)
 
 
@@ -6463,11 +6502,16 @@ def _abandon_action(
         evidence_ref=str(target),
     )
     record = _abandon_record(body, state_path=state_path)
-    # #275：先 durable 寫 canonical outcome，再改 run status（見
-    # docs/superpowers/specs/engineering-outcome-contract-design.md）。
     outcome_store = engineering_outcome.OutcomeStore(
         engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
     )
+    updated = workflow_registry._manager_abandon_workflow_run(
+        run.run_id,
+        evidence_ref=record["ref"],
+    )
+    # Registry CAS 是終局裁決；只有 commit 成功後才發布 engineering outcome。
+    # 若程序在兩者之間 crash，superseded 重入分支會以相同 evidence digest
+    # 冪等補發這筆 outcome。
     engineering_outcome.emit_outcome(
         outcome_store,
         run=run,
@@ -6476,10 +6520,6 @@ def _abandon_action(
         outcome="abandoned",
         attempt_digest=record["hash"],
         reason_code=reason,
-    )
-    updated = workflow_registry._manager_abandon_workflow_run(
-        run.run_id,
-        evidence_ref=record["ref"],
     )
     # #416：run 終態化為 superseded 之後，盡力回收已發佈未提交的 planning
     # artifacts——放在狀態轉換之後，確保只有 abandon 真的成立時才動檔案；
@@ -6966,6 +7006,12 @@ def _retire_delivered_action(
     outcome_store = engineering_outcome.OutcomeStore(
         engineering_outcome.outcome_store_path(state_path, repo=repo)
     )
+    updated = workflow_registry._manager_retire_delivered_workflow_run(
+        run.run_id,
+        evidence_ref=record["ref"],
+    )
+    # 與 abandon 同序：registry CAS 成功後發布；若中間 crash，superseded
+    # replay 從 immutable evidence 重建相同 digest 並冪等補發。
     engineering_outcome.emit_outcome(
         outcome_store,
         run=run,
@@ -6974,10 +7020,6 @@ def _retire_delivered_action(
         outcome="abandoned",
         attempt_digest=record["hash"],
         reason_code=reason,
-    )
-    updated = workflow_registry._manager_retire_delivered_workflow_run(
-        run.run_id,
-        evidence_ref=record["ref"],
     )
     _gc_abandoned_planning_artifacts(updated)
     result = {

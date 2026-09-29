@@ -1097,13 +1097,6 @@ N_A = "n/a"
 NOOP = "noop"
 GAP = "gap"
 
-#: 已知缺口：正式入口目前不拒絕、但契約應拒絕的組合。以 strict xfail 保留可重現
-#: 證據並指向 `docs/recovery-action-gaps-843.json` 的 gap id；修好時 xfail 轉
-#: XPASS 會讓測試失敗，逼迫同步關閉 gap，不能被當成通過。
-PRE_CANDIDATE_ACTIVE_WRITER_GAP = "G843-R02-pre-candidate-active-writer"
-OUTCOME_BEFORE_COMMIT_GAP = "G843-R03-outcome-before-commit"
-ABANDON_OFFERED_FOR_PR_RUN_GAP = "G843-R09-abandon-offered-for-pr-run"
-
 #: action → 類別 → 下列之一：
 #: - probe（callable）：必須拒絕，且 registry／evidence／job 數／attention 不變。
 #: - (NOOP, probe, reason, 說明)：不拒絕但回無副作用的冪等回應；狀態同樣不變。
@@ -1167,7 +1160,7 @@ NEGATIVE_MATRIX: dict[str, dict[str, Any]] = {
     "recover-pre-candidate": {
         "wrong-phase": (N_A, "admission 以 owner slice／builder job／attempt marker 為準，不看 workflow phase"),
         "wrong-card": (N_A, "recover-pre-candidate 沒有 card selector"),
-        "active-job": (GAP, _pre_candidate_active_writer, PRE_CANDIDATE_ACTIVE_WRITER_GAP),
+        "active-job": _pre_candidate_active_writer,
         "missing-actor-reason": (N_A, "actor 缺席時以 requested_by 記錄；不收 reason"),
         "stale-exact-run": _args_probe(expected_candidate=HEAD),
         "wrong-state": (N_A, "slice 已 pending 且無 binding 時是 already-recovered 冪等回應，不是拒絕"),
@@ -1311,17 +1304,10 @@ def test_r02_public_entry_rejection_leaves_registry_evidence_jobs_and_read_model
     assert after["attention"] == before["attention"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=pytest.fail.Exception,
-    reason=f"known gap {PRE_CANDIDATE_ACTIVE_WRITER_GAP}: admission 不看 builder job 狀態",
-)
 def test_r02_recover_pre_candidate_refuses_a_still_running_bound_builder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """綁定的 builder job 仍在跑時，回收其工作區並清 binding 會讓下一拍派出第二個
-    attempt；`_pre_candidate_recovery_admission` 目前只驗 owner／attempt／marker，
-    不看 job 狀態（已知缺口，見 gap ledger）。"""
+    """綁定的 builder job 仍在跑時，拒絕回收並維持 registry/read model 零副作用。"""
 
     sc = _prepare("recover-pre-candidate", tmp_path, monkeypatch)
     row = sc.registry.get_slice(sc.extra["slice_id"])
@@ -1335,6 +1321,29 @@ def test_r02_recover_pre_candidate_refuses_a_still_running_bound_builder(
     assert _observe(sc, monkeypatch) == before
     # read model 與 admission 同源：active writer 存在時不投影 recover-pre-candidate。
     assert "recover-pre-candidate" not in before["attention"][sc.run_id]["next_actions"]
+
+
+def test_r02_recover_pre_candidate_refuses_an_active_sibling_for_same_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sc = _prepare("recover-pre-candidate", tmp_path, monkeypatch)
+    row = sc.registry.get_slice(sc.extra["slice_id"])
+    sibling = sc.registry.create_job(
+        task=row["slice_id"],
+        persona="reviewer",
+        branch="feature/recovery",
+        pane="",
+        worktree=str(tmp_path / "sibling-worktree"),
+        owner_identity=row["owner_identity"],
+        attempt_id=row["attempt_id"],
+    )
+    before = _observe(sc, monkeypatch)
+
+    with pytest.raises((RuntimeError, ValueError), match="active builder attempt"):
+        _submit(sc)
+
+    assert _observe(sc, monkeypatch) == before
+    assert sc.registry.get_job(sibling["job_id"])["status"] == "dispatched"
 
 
 # ---------------------------------------------------------------------------
@@ -1531,11 +1540,6 @@ def _outcome_rows(sc: Scenario) -> list[dict[str, Any]]:
     return rows
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=f"known gap {OUTCOME_BEFORE_COMMIT_GAP}: outcome 先於 registry CAS 落地",
-)
 @pytest.mark.parametrize("action", ["abandon", "retire-delivered"])
 def test_r03_rejected_retirement_leaves_no_terminal_engineering_outcome(
     action: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1554,6 +1558,41 @@ def test_r03_rejected_retirement_leaves_no_terminal_engineering_outcome(
     run = _fresh(sc).get_workflow_run(sc.run_id)
     assert run.status == "ongoing"
     assert _outcome_rows(sc) == outcomes_before
+
+
+@pytest.mark.parametrize("action", ["abandon", "retire-delivered"])
+def test_r03_post_commit_crash_replay_emits_outcome_once(
+    action: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Registry commit 前進但 outcome append crash 時，重啟重送會冪等補齊 outcome。"""
+
+    sc = _prepare(action, tmp_path, monkeypatch)
+    outcomes_before = _outcome_rows(sc)
+    emit = work_actions.engineering_outcome.emit_outcome
+    calls = 0
+
+    def crash_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected crash between registry commit and outcome append")
+        return emit(*args, **kwargs)
+
+    monkeypatch.setattr(work_actions.engineering_outcome, "emit_outcome", crash_once)
+    with pytest.raises(RuntimeError, match="between registry commit and outcome append"):
+        _submit(sc)
+
+    committed = _fresh(sc).get_workflow_run(sc.run_id)
+    assert committed.status == "superseded"
+    assert _outcome_rows(sc) == outcomes_before
+
+    sc.registry = _fresh(sc)
+    replay = _submit(sc)
+    assert replay["result"]["action"] in {"abandoned", "retired-delivered"}
+    assert len(_outcome_rows(sc)) == len(outcomes_before) + 1
+
+    _submit(sc)
+    assert len(_outcome_rows(sc)) == len(outcomes_before) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -1602,6 +1641,8 @@ def _request_from_read_model(entry: dict[str, Any], action: str) -> dict[str, An
             actor="operator",
             reason="read-model round trip adjudication",
         )
+    elif action == "resume":
+        pass
     elif action != "recover-pre-candidate":
         raise AssertionError(f"R09 尚未定義 {action} 的 read-model 請求組法")
     return request
@@ -1714,7 +1755,7 @@ def _scenario_builder(action: str) -> Callable[[Path, Any], Scenario]:
 ROUND_TRIP_SCENARIOS: dict[str, tuple[Callable[[Path, Any], Scenario], tuple[str, ...]]] = {
     "build-card-terminal-without-evidence": (
         _scenario_builder("retry-card"),
-        ("abandon", "regenerate-gates", "retry-card"),
+        ("regenerate-gates", "retry-card"),
     ),
     "planning-environment-failure": (
         _planning_failure_before_delivery,
@@ -1722,27 +1763,24 @@ ROUND_TRIP_SCENARIOS: dict[str, tuple[Callable[[Path, Any], Scenario], tuple[str
     ),
     "pre-candidate-owner-slice": (
         _scenario_builder("recover-pre-candidate"),
-        ("abandon", "recover-pre-candidate"),
+        ("recover-pre-candidate",),
     ),
     "blocking-findings-before-delivery": (
         _blocking_findings_before_delivery,
-        ("abandon", "retry-review", "retry-build"),
+        ("retry-review", "retry-build"),
     ),
     "blocking-findings-with-open-pr": (
         _blocking_findings_with_open_pr,
-        ("abandon", "retry-review", "retry-build"),
+        ("retry-review", "retry-build"),
     ),
     "delivered-merged-journal": (_delivered_merged_journal, ("retire-delivered",)),
-    # 唯一被投影的動作必被拒：operator 在正式入口上沒有任何可受理的出口。
-    "open-pr-awaiting-copilot": (_open_pr_awaiting_copilot, ("abandon",)),
+    # open PR 的 recovery exit 由 action admission 決定，不能退回 pre-delivery abandon。
+    "open-pr-awaiting-copilot": (_open_pr_awaiting_copilot, ("resume",)),
     "delivered-without-authority": (_delivered_without_authority, ("retire-delivered",)),
 }
 
-#: 投影了但正式入口拒絕的已知缺口（strict xfail，見 gap ledger）。
-ROUND_TRIP_GAPS = {
-    ("blocking-findings-with-open-pr", "abandon"): ABANDON_OFFERED_FOR_PR_RUN_GAP,
-    ("open-pr-awaiting-copilot", "abandon"): ABANDON_OFFERED_FOR_PR_RUN_GAP,
-}
+#: 投影曾提供但正式入口拒絕的缺口已由 issue-1170 修復。
+ROUND_TRIP_GAPS: dict[tuple[str, str], str] = {}
 
 
 def _prepare_round_trip(

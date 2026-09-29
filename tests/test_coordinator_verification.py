@@ -325,7 +325,7 @@ class VerificationEvidenceWriterTests(unittest.TestCase):
             self.assertEqual(first["hash"], second["hash"])
             self.assertEqual(first["payload"], second["payload"])
 
-    def test_write_verification_evidence_quarantines_conflicts(self) -> None:
+    def test_write_verification_evidence_preserves_conflicts_at_content_addressed_paths(self) -> None:
         from paulsha_cortex.coordinator import verification
 
         with tempfile.TemporaryDirectory() as d:
@@ -338,17 +338,19 @@ class VerificationEvidenceWriterTests(unittest.TestCase):
                 "summary": "spec-hash-mismatch",
                 "details": {"expected": "old", "actual": "new"},
             }
-            verification.write_verification_evidence(payload, coordinator_root=coordinator_root)
+            first = verification.write_verification_evidence(payload, coordinator_root=coordinator_root)
+            first_bytes = Path(first["path"]).read_bytes()
 
             conflicting = dict(payload)
             conflicting["summary"] = "different-content"
 
-            with self.assertRaisesRegex(RuntimeError, "conflicting verification evidence"):
-                verification.write_verification_evidence(conflicting, coordinator_root=coordinator_root)
+            second = verification.write_verification_evidence(conflicting, coordinator_root=coordinator_root)
 
-            quarantine_dir = coordinator_root / "evidence" / "verification" / "quarantine"
-            quarantined = list(quarantine_dir.glob("slice-a-*.json"))
-            self.assertEqual(len(quarantined), 1)
+            self.assertNotEqual(first["path"], second["path"])
+            self.assertEqual(Path(first["path"]).read_bytes(), first_bytes)
+            self.assertIn("-" + second["hash"] + ".json", second["path"])
+            self.assertEqual(Path(first["path"]).read_text(encoding="utf-8").count("spec-hash-mismatch"), 1)
+            self.assertFalse((coordinator_root / "evidence" / "verification" / "quarantine").exists())
 
     def test_write_verification_evidence_quarantines_raced_conflicts(self) -> None:
         from paulsha_cortex.coordinator import verification
@@ -367,8 +369,13 @@ class VerificationEvidenceWriterTests(unittest.TestCase):
             conflicting["summary"] = "different-content"
             original_atomic_write_json = verification.atomic_write_json
 
+            raced = False
+
             def racing_atomic_write_json(path: Path, normalized: dict) -> None:
-                original_atomic_write_json(path, conflicting)
+                nonlocal raced
+                if not raced:
+                    raced = True
+                    original_atomic_write_json(path, conflicting)
                 original_atomic_write_json(path, normalized)
 
             with mock.patch.object(
@@ -376,20 +383,18 @@ class VerificationEvidenceWriterTests(unittest.TestCase):
                 "atomic_write_json",
                 side_effect=racing_atomic_write_json,
             ):
-                with self.assertRaisesRegex(RuntimeError, "conflicting verification evidence"):
-                    verification.write_verification_evidence(payload, coordinator_root=coordinator_root)
+                result = verification.write_verification_evidence(payload, coordinator_root=coordinator_root)
 
             evidence_path = verification.evidence_path(
                 slice_id=payload["slice_id"],
                 candidate=payload["candidate"],
                 coordinator_root=coordinator_root,
             )
-            self.assertFalse(evidence_path.exists())
-            quarantine_dir = coordinator_root / "evidence" / "verification" / "quarantine"
-            quarantined = list(quarantine_dir.glob("slice-a-*.json"))
-            self.assertEqual(len(quarantined), 1)
+            self.assertTrue(evidence_path.exists())
+            self.assertNotEqual(result["path"], str(evidence_path))
+            self.assertTrue(Path(result["path"]).is_file())
 
-    def test_write_verification_evidence_quarantines_invalid_existing_json(self) -> None:
+    def test_write_verification_evidence_preserves_invalid_existing_json(self) -> None:
         from paulsha_cortex.coordinator import verification
 
         with tempfile.TemporaryDirectory() as d:
@@ -413,13 +418,11 @@ class VerificationEvidenceWriterTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(RuntimeError, "invalid schema"):
-                verification.write_verification_evidence(payload, coordinator_root=coordinator_root)
+            result = verification.write_verification_evidence(payload, coordinator_root=coordinator_root)
 
-            self.assertFalse(path.exists())
-            quarantine_dir = coordinator_root / "evidence" / "verification" / "quarantine"
-            quarantined = list(quarantine_dir.glob("slice-a-*.json"))
-            self.assertEqual(len(quarantined), 1)
+            self.assertTrue(path.exists())
+            self.assertNotEqual(result["path"], str(path))
+            self.assertTrue(Path(result["path"]).is_file())
 
 
 class DispatchPinningTests(unittest.TestCase):
