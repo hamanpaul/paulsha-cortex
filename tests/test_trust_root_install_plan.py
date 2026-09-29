@@ -342,6 +342,30 @@ def test_service_tool_wrappers_pin_jitless_without_weakening_units(tmp_path: Pat
     ]["content"]
 
 
+def test_native_tree_wrapper_execs_the_entrypoint_beside_its_companions(
+    tmp_path: Path,
+) -> None:
+    """#716：codex 以整個 bin 目錄安裝，wrapper 直接 exec 樹內的原生進入點。
+
+    codex 0.157 的 `features.code_mode_host` 在 codex 本體所在目錄找
+    `codex-code-mode-host`；wrapper 若經 node 或指向單檔，host 就找不到。
+    """
+    config = _safe_config(tmp_path)
+    config["toolchain"]["codex"].update({"shape": "tree", "entrypoint": "codex"})
+    plan = build_install_plan(
+        config=config,
+        candidate_wheel=_artifacts(tmp_path)[0],
+        bundle=_artifacts(tmp_path)[1],
+    )
+    version = config["toolchain"]["codex"]["version"]
+    content = plan["generated"]["toolchain_wrappers"]["codex"]["content"]
+    assert content == (
+        "#!/bin/sh\n"
+        f'exec "{plan["roots"]["deploy"]}/toolchain/lib/codex-{version}/codex" "$@"\n'
+    )
+    assert "/usr/bin/node" not in content
+
+
 def test_scaffold_targets_are_applied_before_home_redirect_symlinks(
     tmp_path: Path,
 ) -> None:

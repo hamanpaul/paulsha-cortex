@@ -788,6 +788,11 @@ def _artifact_dict(
 #: 失敗（#716 canary）。
 MANAGER_GH_CONFIG_CONTENT = 'version: "1"\ngit_protocol: https\nprompt: disabled\n'
 
+#: tree 形 toolchain 的進入點副檔名是這幾個時由系統層 node 執行；其餘視為樹內的
+#: 原生執行檔，wrapper 直接 exec（#716：codex 與它的 code-mode host）。
+_NODE_ENTRYPOINT_SUFFIXES = frozenset({".js", ".mjs", ".cjs"})
+
+
 def _generated_inventory(
     scheme: permgen.UidScheme,
     layout: permgen.PathLayout,
@@ -895,11 +900,20 @@ def _generated_inventory(
                 relative = PurePosixPath(entrypoint)
                 if relative.is_absolute() or ".." in relative.parts or not relative.parts:
                     raise InstallPlanError(f"unsafe tree toolchain entrypoint: {name}")
-                node_mode = "--jitless " if permgen.toolchain_requires_jitless(name) else ""
-                content = (
-                    "#!/bin/sh\n"
-                    f'exec /usr/bin/node {node_mode}"{executable}/{relative.as_posix()}" "$@"\n'
-                )
+                if relative.suffix in _NODE_ENTRYPOINT_SUFFIXES:
+                    node_mode = (
+                        "--jitless " if permgen.toolchain_requires_jitless(name) else ""
+                    )
+                    content = (
+                        "#!/bin/sh\n"
+                        f'exec /usr/bin/node {node_mode}"{executable}/{relative.as_posix()}" "$@"\n'
+                    )
+                else:
+                    # 原生執行檔的樹（#716）：codex 0.157 起 `features.code_mode_host`
+                    # （stable、預設開）要求 `codex-code-mode-host` 與 codex 本體同目錄，
+                    # 只裝單檔時 job 內每個 tool call 都失敗。整個 bin 目錄以 tree 安裝，
+                    # wrapper 直接 exec 樹內的進入點，不經 node。
+                    content = f'#!/bin/sh\nexec "{executable}/{relative.as_posix()}" "$@"\n'
             else:
                 raise InstallPlanError(f"unsupported toolchain shape for {name}: {shape}")
             wrappers[name] = _artifact_dict(
