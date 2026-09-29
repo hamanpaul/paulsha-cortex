@@ -133,9 +133,10 @@ def _normalized_plan_sha256(plan: dict, tmp_path: Path) -> str:
 # Golden digest of the release install config planned by the installer before
 # legacy adoption existed (base: #1123 receipt bounds).  A legacy-free plan
 # must stay byte-identical, so this constant must never be regenerated to make
-# a legacy change pass.
+# a legacy change pass.  Regenerated once for a non-legacy change: #716 added
+# `version: "1"` to the root-owned manager gh config (manager-gh-config asset).
 RELEASE_PLAN_GOLDEN_SHA256 = (
-    "e77c4580b93049cdaf7dbeb516de765e0c237713bb6c8e41e993c3075ba34e03"
+    "ccf8be4bc7787596406ca118fcdcf664bb51e4044a647fd2bd694b46206baef8"
 )
 
 
