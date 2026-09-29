@@ -19,12 +19,15 @@ from unittest import mock
 
 
 from paulsha_cortex.coordinator import work_actions
-from paulsha_cortex.coordinator.claim import claim_key_for_authority_digest
+from paulsha_cortex.coordinator.claim import (
+    WorkAuthority,
+    claim_key_for_authority_digest,
+    work_authority_digest,
+)
 from paulsha_cortex.coordinator.registry import JobRegistry, WorkflowStep
 
 _REPO = "o/r"
 _WORK_ID = "fix-demo"
-_DIGEST = "a" * 64
 
 
 def _step(card: str, *, phase: str, gate_result: str, outputs: tuple[str, ...] = ()) -> WorkflowStep:
@@ -141,20 +144,38 @@ def _args(run_id: str, **overrides):
     return base
 
 
-_AUTHORITY = SimpleNamespace(repo=_REPO, work_id=_WORK_ID, mapped_openspec=())
+_AUTHORITY = WorkAuthority._verified(
+    repo=_REPO,
+    work_id=_WORK_ID,
+    mapped_issues=(9,),
+    mapped_openspec=(),
+    confirmed_todo=True,
+    auto_label=False,
+    source_revisions=("source-revision",),
+    provider_revision="provider-revision",
+    last_success_epoch=1.0,
+    snapshot_hash="3" * 64,
+)
+_DIGEST = work_authority_digest(_AUTHORITY)
+
+
+def _recover_public(registry, state, run_id, **overrides):
+    """經正式入口 `execute_work_action`；只替換 authority loader seam。"""
+
+    with mock.patch.object(
+        work_actions, "load_work_authority", return_value=_AUTHORITY
+    ):
+        return work_actions.execute_work_action(
+            args=_args(run_id, **overrides),
+            requested_by="operator",
+            state_path=state,
+            workflow_registry=registry,
+        )["result"]
 
 
 class RecoverSupersededActionTests(unittest.TestCase):
     def _recover(self, registry, state, run_id, **overrides):
-        with mock.patch.object(
-            work_actions, "work_authority_digest", return_value=_DIGEST
-        ):
-            return work_actions._recover_superseded_action(
-                args=_args(run_id, **overrides),
-                authority=_AUTHORITY,
-                state_path=state,
-                workflow_registry=registry,
-            )
+        return _recover_public(registry, state, run_id, **overrides)
 
     def test_recovers_run_via_official_authority_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -573,3 +594,245 @@ class ArchiveScaffoldTests(unittest.TestCase):
         scaffold = source.index("_ensure_openspec_change_scaffold")
         gate = source.index("_validate_local_archive_inputs")
         self.assertLess(scaffold, gate)
+
+
+# ==========================================================================
+# #843 R07：work 層延遲 terminal——舊 attempt 的 terminal 不得被恢復後的
+# 新 era 採信
+# ==========================================================================
+
+import hashlib  # noqa: E402
+
+import pytest  # noqa: E402
+
+from paulsha_cortex.coordinator import manager_daemon  # noqa: E402
+from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority  # noqa: E402
+
+from test_reviewer_card_retry_569 import (  # noqa: E402
+    BUILDER_DOMAIN,
+    PLAN_REF,
+    PLAN_TEXT,
+    _ReviewLauncher,
+    _init_candidate_repo,
+    _reviewer_identities,
+    _steps_stopped_at,
+)
+
+_OLD_CLAIM_KEY = "claim:v1:" + "1" * 64
+
+
+class _TickDispatcher:
+    def __init__(self, registry: JobRegistry) -> None:
+        self._registry = registry
+        self._git_runner = None
+
+    def poll_headless_done(self, job_id: str):
+        return self._registry.get_job(job_id)
+
+
+def _superseded_run_with_inflight_verifier(root: Path):
+    """已交付（candidate＋PR）的 verify run，被 supersede 時 verification job
+    仍在飛；該 job 綁在被 supersede 那一代的 claim era。"""
+
+    workspace = root / "workspace"
+    candidate = _init_candidate_repo(workspace)
+    registry = _make_registry(root)
+    run = registry._manager_create_workflow_run(
+        work_id=_WORK_ID,
+        repo=_REPO,
+        claim_key=_OLD_CLAIM_KEY,
+        source_revision="2" * 64,
+        workspace_root=str(workspace),
+        combo="feature-oneshot",
+        current_phase="verify",
+        steps=_steps_stopped_at("verification"),
+        issue_refs=(f"{_REPO}#9",),
+        openspec_refs=(),
+        pr_refs=(f"{_REPO}#1",),
+        attempts={"build": 1, "verify": 1},
+        candidate_head=candidate,
+        gate_status="running",
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=PLAN_REF,
+                kind="plan",
+                work_id=_WORK_ID,
+                baseline_sha256=hashlib.sha256(PLAN_TEXT.encode()).hexdigest(),
+            ),
+        ),
+    )
+    builder = registry.create_job(
+        task="wf-subagent-build",
+        persona="builder",
+        branch="feature/9-fix-demo",
+        pane="",
+        worktree=str(root / "builder-worktree"),
+        dispatch_head="b" * 40,
+        subject_head=candidate,
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain=BUILDER_DOMAIN,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=_OLD_CLAIM_KEY,
+        workflow_repo=run.repo,
+        workflow_card="subagent-build",
+        workflow_phase="build",
+        source_revision=run.source_revision,
+    )
+    registry.update_headless_result(builder["job_id"], status="exited", exit_code=0)
+    old_verifier = registry.create_job(
+        task="wf-verification",
+        persona="reviewer",
+        kind="review",
+        branch="feature/9-fix-demo",
+        pane="",
+        worktree=str(root / "old-reviewer-sandbox"),
+        subject_head=candidate,
+        executor="agy",
+        model_id="gemini-3.7-flash-high",
+        independence_domain="google",
+        workflow_run_id=run.run_id,
+        workflow_claim_key=_OLD_CLAIM_KEY,
+        workflow_repo=run.repo,
+        workflow_card="verification",
+        workflow_phase="verify",
+        workflow_builder_job_id=str(builder["job_id"]),
+        source_revision=run.source_revision,
+    )
+    registry._manager_update_workflow_run(
+        run.run_id, status="superseded", facets=("blocked",)
+    )
+    return registry, run.run_id, candidate, old_verifier["job_id"]
+
+
+def _deliver_late_terminal(registry: JobRegistry, root: Path, job_id: str) -> None:
+    """舊 attempt 的 terminal 延遲送達：log 帶一份看似通過的 envelope。"""
+
+    log = root / "logs" / "workflow" / "late-verification.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(
+        json.dumps({"status": "passed", "summary": "late terminal from old era"}) + "\n",
+        encoding="utf-8",
+    )
+    registry.attach_launch_handle(
+        job_id,
+        executor="agy",
+        model_id="gemini-3.7-flash-high",
+        log_path=str(log),
+    )
+    registry.update_headless_result(job_id, status="exited", exit_code=0)
+
+
+def _periodic_tick(root: Path, registry: JobRegistry, launched: list) -> dict:
+    return manager_daemon.build_periodic_tick_runner(
+        dispatcher=_TickDispatcher(registry),
+        specs_dir=str(root / "specs"),
+        handoff_dir=str(root / "handoff"),
+        launcher=_ReviewLauncher(launched),
+        run_tick_fn=lambda *_args, **_kwargs: {
+            "dispatch_skipped": False,
+            "dispatched": [],
+            "completed": [],
+            "errors": [],
+            "reaped": None,
+        },
+        scan_specs_fn=lambda _specs_dir: [],
+        auto_claim_fn=lambda: [],
+        workflow_identity_registry=_reviewer_identities(),
+    )()
+
+
+def _audit_files(root: Path) -> dict[str, bytes]:
+    audit_root = root / "evidence" / "work-recover-superseded"
+    if not audit_root.is_dir():
+        return {}
+    return {path.name: path.read_bytes() for path in sorted(audit_root.iterdir())}
+
+
+def test_r07_recover_superseded_never_adopts_a_late_terminal_from_the_superseded_era(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path
+    state = root / "jobs.json"
+    registry, run_id, candidate, old_job_id = _superseded_run_with_inflight_verifier(root)
+
+    # 1) terminal 尚未送達：舊 job 仍 active，正式入口拒絕且零副作用。
+    before_state = state.read_bytes()
+    with pytest.raises(RuntimeError, match="refuses active workflow job"):
+        _recover_public(registry, state, run_id)
+    assert state.read_bytes() == before_state
+    assert _audit_files(root) == {}
+
+    # 2) 延遲 terminal 送達（舊 era 的 job 變 exited，log 帶看似通過的 envelope）。
+    _deliver_late_terminal(registry, root, old_job_id)
+    old_job_before = registry.get_job(old_job_id)
+    assert old_job_before["workflow_evidence"] is None
+
+    # 3) 經正式入口恢復：新 era 的 claim key，verify/review 打回 pending。
+    result = _recover_public(registry, state, run_id)
+    assert result["action"] == "recovered-superseded"
+    recovered = registry.get_workflow_run(run_id)
+    new_claim_key = claim_key_for_authority_digest(
+        repo=_REPO, work_id=_WORK_ID, authority_digest=_DIGEST
+    )
+    assert recovered.claim_key == new_claim_key != _OLD_CLAIM_KEY
+    assert recovered.status == "ongoing"
+    assert recovered.current_phase == "verify"
+    assert recovered.verified_head is None
+    audit = _audit_files(root)
+    assert len(audit) == 1
+    assert recovered.evidence_refs.count(result["evidence"]["ref"]) == 1
+
+    # 4) 下一拍 periodic tick：舊 era 的 terminal 不得被 harvest 成新 era 的
+    #    gate 證據；只允許為新 era 派一顆新的 verification job。
+    launched: list = []
+    first = _periodic_tick(root, registry, launched)
+    assert first["errors"] == []
+    run_jobs = [
+        job for job in registry.list_jobs() if job.get("workflow_run_id") == run_id
+    ]
+    new_jobs = [
+        job for job in run_jobs if job["job_id"] not in {old_job_id}
+        and job.get("workflow_phase") == "verify"
+    ]
+    assert len(new_jobs) == 1
+    replacement = new_jobs[0]
+    assert replacement["workflow_card"] == "verification"
+    assert replacement["workflow_claim_key"] == new_claim_key
+    assert replacement["subject_head"] == candidate
+    assert replacement["status"] == "dispatched"
+    assert len(launched) == 1
+    assert registry.get_job(old_job_id) == old_job_before
+    after_first = registry.get_workflow_run(run_id)
+    # 舊 era 的 terminal 若被 harvest（例如 era 過濾失效），resume 會對它做採信
+    # 判定並記 `schema-mismatch:<card>` 之類的計數；attempts 必須與恢復當下完全
+    # 相同。註：`_dispatch_workflow_card` 的 `matching` 刻意保留全 era 歷史（#765），
+    # 新 job 的 prompt 可能帶 Manager 自產的 retry_context——那是回饋，不是 gate
+    # 證據，因此這裡不以 prompt 內容判定。
+    assert after_first.attempts == recovered.attempts
+    assert after_first.current_phase == "verify"
+    assert after_first.verified_head is None
+    assert {
+        step.card: step.gate_result
+        for step in after_first.steps
+        if step.phase in {"verify", "review"}
+    } == {
+        "verification": "pending",
+        "code-review": "pending",
+        "adversarial-review": "pending",
+    }
+    assert "needs_human" not in after_first.facets
+
+    # 5) 再一拍：不重複採信、不重複派工；恢復 audit 與 registry 綁定不被改寫。
+    second = _periodic_tick(root, registry, launched)
+    assert second["errors"] == []
+    assert len(
+        [job for job in registry.list_jobs() if job.get("workflow_run_id") == run_id]
+    ) == len(run_jobs)
+    assert len(launched) == 1
+    assert registry.get_job(old_job_id) == old_job_before
+    after_second = registry.get_workflow_run(run_id)
+    assert after_second.verified_head is None
+    assert after_second.claim_key == new_claim_key
+    assert after_second.evidence_refs.count(result["evidence"]["ref"]) == 1
+    assert _audit_files(root) == audit

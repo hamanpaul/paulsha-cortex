@@ -8074,7 +8074,7 @@ def _recover_planning_action(
     )
     return {
         "action": "recovered",
-        "reason": "planning-recovery-dispatched",
+        "reason": "planning-recovery-unblocked",
         "expected_run_id": expected_run_id,
         # #728：出口 phase 是本動作的裁決結果，不再是寫死的 `plan`——operator
         # 不必翻 evidence 檔就看得到這次 recover 把 run 留在哪裡。

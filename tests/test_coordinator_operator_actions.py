@@ -232,6 +232,81 @@ def test_retry_review_rejected_without_verified_evidence(tmp_path):
         )
 
 
+def test_retry_verify_rechecks_slice_through_the_public_action_path(
+    tmp_path, monkeypatch
+):
+    repo_root = tmp_path / "repo"
+    make_fake_repo(repo_root)
+    registry = JobRegistry(state_path=tmp_path / "runtime" / "coordinator" / "jobs.json")
+    row = _create_slice_in_needs_human(
+        registry, repo_root=repo_root, slice_id="slice-retry-verify", builder_status="exited"
+    )
+    prior_evidence = tmp_path / "prior-verification.json"
+    prior_evidence.write_text(
+        json.dumps({
+            "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+            "slice_id": row["slice_id"],
+            "candidate": "b" * 40,
+            "status": "needs_human",
+            "summary": "previous-verification-failed",
+            "details": {},
+        }),
+        encoding="utf-8",
+    )
+    row = registry.update_slice(
+        row["slice_id"], current_evidence_refs=[str(prior_evidence)]
+    )
+    dispatcher = Dispatcher(
+        registry=registry,
+        pane_sender=_PaneSender(),
+        worktree_creator=_WorktreeCreator(tmp_path / "worktrees"),
+        git_runner=_git_runner,
+    )
+    verification_calls = []
+    evidence = {
+        "payload": {
+            "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+            "slice_id": row["slice_id"],
+            "status": "verified",
+            "summary": "verification-passed",
+            "candidate": "b" * 40,
+            "details": {},
+        },
+        "path": str(tmp_path / "verification.json"),
+    }
+
+    def verify_again(**kwargs):
+        verification_calls.append(kwargs["job"]["job_id"])
+        return evidence
+
+    monkeypatch.setattr(manager, "_validate_result_evidence", lambda **kwargs: kwargs["evidence"])
+    monkeypatch.setattr(
+        manager,
+        "_apply_verification_result",
+        lambda target_registry, slice_id, result: target_registry.update_slice(
+            slice_id,
+            state="verified",
+            gate_state="passed",
+            current_evidence_refs=[result["path"]],
+        ),
+    )
+    result = manager.apply_slice_action(
+        dispatcher,
+        slice_id=row["slice_id"],
+        action="retry-verify",
+        actor="operator",
+        specs_dir=str(repo_root / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        git_runner=_git_runner,
+        verification_runner=verify_again,
+    )
+
+    assert verification_calls == [row["builder_job_id"]]
+    assert result["action"] == "retry-verify"
+    assert result["gate_status"] == "verified"
+    assert registry.get_slice(row["slice_id"])["gate_state"] == "passed"
+
+
 def test_abandon_marks_slice_failed_and_records_result(tmp_path):
     repo_root = tmp_path / "repo"
     make_fake_repo(repo_root)

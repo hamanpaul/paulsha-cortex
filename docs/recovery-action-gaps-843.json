@@ -1,0 +1,151 @@
+{
+  "schema": "cortex/recovery-action-gaps/v1",
+  "issue": 843,
+  "full_plan_gate": "openspec/changes/cortex-refine-complete/tasks.md#5.5",
+  "gaps": [
+    {
+      "id": "G843-R02-action-state-matrix",
+      "owner": "issue-843",
+      "status": "closed",
+      "source": "docs/recovery-action-contract-matrix.md#R02 preconditions",
+      "retest": "Every registered work recovery action has a public-entry positive case (fresh registry reload plus daemon status attention read model) and a negative matrix over wrong phase, wrong card, active job, missing actor/reason, stale exact-run and wrong state; each action/category is a probe, a documented no-op, a strict-xfail known gap, or an explicit N/A reason.",
+      "verified_by": [
+        "tests/test_recovery_action_state_matrix_843.py::test_r02_public_entry_positive_reaches_persisted_registry_and_read_model",
+        "tests/test_recovery_action_state_matrix_843.py::test_r02_public_entry_rejection_leaves_registry_evidence_jobs_and_read_model_unchanged",
+        "tests/test_recovery_action_state_matrix_843.py::test_r02_negative_matrix_classifies_every_action_and_category"
+      ]
+    },
+    {
+      "id": "G843-R03-public-cas-drift",
+      "owner": "issue-843",
+      "status": "closed",
+      "source": "docs/recovery-action-contract-matrix.md#R03 drift/CAS",
+      "retest": "For every registered work recovery action, a second registry writer commits a newer generation, candidate, slice binding or superseded generation after admission and before the action's first persist; the public entry fails closed and the durable registry equals the drifted state.",
+      "verified_by": [
+        "tests/test_recovery_action_state_matrix_843.py::test_r03_public_entry_fails_closed_on_read_to_commit_drift",
+        "tests/test_recovery_action_state_matrix_843.py::test_r03_drift_matrix_covers_every_registered_work_recovery_action"
+      ]
+    },
+    {
+      "id": "G843-R05-next-tick-planner",
+      "owner": "issue-843",
+      "status": "closed",
+      "source": "docs/recovery-action-contract-matrix.md#R05 resume/planning",
+      "retest": "recover-planning through the daemon work-action request creates zero jobs; the next production periodic tick dispatches one writing-plans planner job, or re-enters the define producer without a registry job when brainstorm is required.",
+      "verified_by": [
+        "tests/test_recover_planning_brainstorm_authority_728.py::test_r05_recover_planning_unblocks_and_the_next_tick_dispatches_the_planner",
+        "tests/test_recover_planning_brainstorm_authority_728.py::test_r05_brainstorm_required_next_tick_reenters_the_define_producer_without_a_job"
+      ]
+    },
+    {
+      "id": "G843-R06-shared-retry-verify-fixture",
+      "owner": "issue-843",
+      "status": "closed",
+      "source": "docs/recovery-action-contract-matrix.md#R06 legacy retry",
+      "retest": "Work and slice retry-verify enter through the daemon request executor and run the same assertions from one namespace-adapter fixture; dispatch differences are declared by dispatch_mode.",
+      "verified_by": [
+        "tests/test_retry_verify_shared_conformance_843.py::test_retry_verify_reruns_verification_once_for_the_unchanged_candidate",
+        "tests/test_retry_verify_shared_conformance_843.py::test_retry_verify_rejections_leave_registry_evidence_and_jobs_unchanged",
+        "tests/test_retry_verify_shared_conformance_843.py::test_retry_verify_replay_never_opens_a_second_concurrent_attempt"
+      ]
+    },
+    {
+      "id": "G843-R07-work-late-terminal",
+      "owner": "issue-843",
+      "status": "closed",
+      "source": "docs/recovery-action-contract-matrix.md#R07 crash/restart/late terminal",
+      "retest": "recover-superseded refuses while the old attempt is active; after the late terminal lands and the run is recovered through execute_work_action, the next ticks never harvest the old-era terminal and dispatch exactly one new verification job.",
+      "verified_by": [
+        "tests/test_recover_superseded_776.py::test_r07_recover_superseded_never_adopts_a_late_terminal_from_the_superseded_era"
+      ]
+    },
+    {
+      "id": "G843-R09-work-next-actions-roundtrip",
+      "owner": "issue-843",
+      "status": "closed",
+      "source": "docs/recovery-action-contract-matrix.md#R09 next_actions",
+      "retest": "Every recovery action the attention read model can project is exercised by a scenario; each projected next_action is rebuilt only from the attention entry (hint and evidence refs) and submitted to execute_work_action.",
+      "verified_by": [
+        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry",
+        "tests/test_recovery_action_state_matrix_843.py::test_r09_round_trip_scenarios_cover_every_projectable_recovery_action"
+      ]
+    },
+    {
+      "id": "G843-R02-pre-candidate-active-writer",
+      "owner": "issue-1168",
+      "status": "open",
+      "source": "paulsha_cortex/coordinator/manager.py::_pre_candidate_recovery_admission",
+      "retest": "recover-pre-candidate must refuse, with zero side effects, when the bound builder job or another job with the same owner identity and attempt id is still dispatched/running; the projection shares the admission and must stop offering the action.",
+      "reproduced_by": [
+        "tests/test_recovery_action_state_matrix_843.py::test_r02_public_entry_rejection_leaves_registry_evidence_jobs_and_read_model_unchanged[recover-pre-candidate-active-job]",
+        "tests/test_recovery_action_state_matrix_843.py::test_r02_recover_pre_candidate_refuses_a_still_running_bound_builder"
+      ]
+    },
+    {
+      "id": "G843-R03-outcome-before-commit",
+      "owner": "issue-1169",
+      "status": "open",
+      "source": "paulsha_cortex/coordinator/work_actions.py::_abandon_action / _retire_delivered_action",
+      "retest": "When the abandon or retire-delivered registry commit is rejected by drift (run still ongoing with an active job), the engineering-outcome outbox must not keep an abandoned/retired outcome for that run.",
+      "reproduced_by": [
+        "tests/test_recovery_action_state_matrix_843.py::test_r03_rejected_retirement_leaves_no_terminal_engineering_outcome"
+      ]
+    },
+    {
+      "id": "G843-R09-abandon-offered-for-pr-run",
+      "owner": "issue-1170",
+      "status": "open",
+      "source": "paulsha_cortex/coordinator/claim.py::needs_human_next_actions",
+      "retest": "A needs_human run that carries PR refs but is not proven merged must not be offered abandon (the pre-delivery admission rejects it), or abandon admission must accept it; decide against the #728 non-empty next_actions guarantee.",
+      "reproduced_by": [
+        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[blocking-findings-with-open-pr-abandon]",
+        "tests/test_recovery_action_state_matrix_843.py::test_r09_every_projected_next_action_is_accepted_by_the_formal_entry[open-pr-awaiting-copilot-abandon]"
+      ]
+    },
+    {
+      "id": "G843-R06-slice-reverify-evidence-collision",
+      "owner": "issue-1171",
+      "status": "open",
+      "source": "paulsha_cortex/coordinator/verification.py::write_verification_evidence",
+      "retest": "Slice retry-verify for the unchanged Candidate must be able to adopt a passing rerun; today the fixed (slice, candidate) evidence path quarantines the prior file, raises, and the action records verification-runner-error.",
+      "reproduced_by": [
+        "tests/test_retry_verify_shared_conformance_843.py::test_slice_retry_verify_adopts_a_passing_rerun_for_the_same_candidate"
+      ]
+    },
+    {
+      "id": "G843-R08-live-reclaim",
+      "owner": "issue-1167",
+      "status": "blocked",
+      "source": "docs/recovery-action-contract-matrix.md#R08 RC boundary",
+      "retest": "Blocked on a producer fix: under the three-UID deployment the Manager has no ACL entry on builder-created inodes (trust_root registry JOB_WORKSPACE_REACH builder note), so owner-bound reclaim of a used builder workspace can only fail closed or leave it behind, and reclaim_worktree continues to rmtree when the dirty scan is unavailable. After a root-owned or job-identity reclaim helper lands and dirty-scan failure fails closed, add a release-profile owner-bound-reclaim installed check in a driver-created isolated coordinator root: owned and foreign pool slots with plan ACLs, builder commit plus untracked subdirectory, recover-pre-candidate and abandon via execute_work_action as cortex-manager; verify the foreign slot is unchanged (bytes, owner, ACL), the owned slot is removed with a preserve archive, the result is unique after a fresh registry reload, and exact replay deletes nothing."
+    },
+    {
+      "id": "G843-R08-reclaim-dirty-scan-fail-open",
+      "owner": "issue-1166",
+      "status": "open",
+      "source": "paulsha_cortex/coordinator/worktree_reclaim.py::reclaim_worktree",
+      "retest": "When the dirty scan cannot read the workspace (for example no Manager ACL on the builder index), reclaim_worktree must fail closed before any deletion instead of logging and continuing to rmtree; verify under a multi-UID RC profile that nothing is deleted and the marker survives for replay."
+    },
+    {
+      "id": "G843-installed-live-recovery",
+      "owner": "runtime-owner",
+      "status": "pending-owner-evidence",
+      "source": "docs/recovery-action-contract-matrix.md#installed-live recovery",
+      "retest": "Run the work and recover aliases against the pinned installed artifact; capture loaded runtime identity, exact CAS, one dispatch or zero-side-effect rejection, restart replay, and workspace disposition."
+    },
+    {
+      "id": "G843-sandbox-egress-acl",
+      "owner": "qualification-owner",
+      "status": "blocked",
+      "source": "docs/recovery-action-contract-matrix.md#sandbox integration limits",
+      "retest": "In a governed environment with GitHub API egress and working POSIX ACLs, rerun the complete immediate-reclaim dispatch and ACL suites; distinguish environmental failures from product results."
+    },
+    {
+      "id": "G843-frozen-reviewer-pin",
+      "owner": "issue-839",
+      "status": "open",
+      "source": "docs/recovery-action-contract-matrix.md#frozen reviewer pin",
+      "retest": "If #839 adds attempt-bound fallback, verify explicit authority, exact candidate/era CAS, qualification and independence revalidation, atomic audit, and no reviewer spawn on a frozen same-domain pin."
+    }
+  ]
+}

@@ -706,6 +706,33 @@ def test_retry_build_final_card_semantics_do_not_regress(tmp_path: Path) -> None
     assert target.action.startswith("Repair the exact Candidate")
 
 
+def test_retry_card_replay_after_dispatch_rejects_second_active_attempt(
+    tmp_path: Path,
+) -> None:
+    snapshot, registry, run, _old_job_id = _stuck_run(tmp_path)
+    request = {"expected_run_id": run.run_id, "card": "tdd-red"}
+    _retry_card(tmp_path, snapshot, registry, **request)
+    first_count = len(registry.list_jobs())
+    active = registry.create_job(
+        task="retry-card-replacement",
+        persona="builder",
+        branch="feature/retry-card-replacement",
+        pane="",
+        worktree=str(tmp_path / "replacement-worktree"),
+        workflow_run_id=run.run_id,
+        workflow_card="tdd-red",
+        workflow_phase="build",
+    )
+    before = registry.get_workflow_run(run.run_id).to_dict()
+
+    with pytest.raises(RuntimeError, match="needs_human workflow"):
+        _retry_card(tmp_path, snapshot, registry, **request)
+
+    assert len(registry.list_jobs()) == first_count + 1
+    assert registry.get_job(active["job_id"])["status"] in {"queued", "dispatched"}
+    assert registry.get_workflow_run(run.run_id).to_dict() == before
+
+
 def test_retry_card_reset_refuses_the_final_card_after_state_drift(tmp_path: Path) -> None:
     """registry 層的原子重驗：work action 通過後狀態若漂移，reset 仍 fail closed。"""
 

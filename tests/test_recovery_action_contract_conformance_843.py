@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import importlib
 import json
 import re
 from pathlib import Path
@@ -154,6 +156,30 @@ def test_r01_formal_dispatchers_and_public_entrypoints_share_registered_choices(
     assert _choice_set(porcelain_recover._build_parser(), "slice") == set(
         recovery_contracts.RECOVER_SLICE_ACTION_CHOICES
     )
+
+
+def test_r01_work_action_dispatcher_has_a_branch_for_every_registered_recovery() -> None:
+    """Registered names need an actual execute_work_action branch, not self-equality."""
+    tree = ast.parse(Path(work_actions.__file__).read_text(encoding="utf-8"))
+    dispatcher = next(
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "execute_work_action"
+    )
+    dispatched: set[str] = set()
+    for node in ast.walk(dispatcher):
+        if not isinstance(node, ast.Compare):
+            continue
+        left_is_action = isinstance(node.left, ast.Name) and node.left.id == "action"
+        for operator, comparator in zip(node.ops, node.comparators):
+            if not left_is_action or not isinstance(operator, (ast.Eq, ast.In)):
+                continue
+            values = comparator.elts if isinstance(comparator, (ast.Set, ast.Tuple, ast.List)) else [comparator]
+            dispatched.update(
+                value.value for value in values
+                if isinstance(value, ast.Constant) and isinstance(value.value, str)
+            )
+    assert recovery_contracts.RECOVERY_WORK_ACTIONS <= dispatched
 
 
 @pytest.mark.parametrize("action", sorted(recovery_contracts.RECOVERY_WORK_ACTIONS))
@@ -381,3 +407,73 @@ def test_explicit_candidate_cas_rejects_a_conflicting_payload(
     )
     assert result == 2
     assert submitted == []
+
+
+def _gap_test_marks(ref: str) -> tuple[list[object], list[object]]:
+    """(function-level marks, marks of the named parametrize case) for a ledger ref."""
+
+    path, _, name = ref.partition("::")
+    function_name, _, case = name.partition("[")
+    module = importlib.import_module(Path(path).stem)
+    function = getattr(module, function_name)
+    marks = list(getattr(function, "pytestmark", []))
+    case_marks: list[object] = []
+    if case:
+        case_id = case.rstrip("]")
+        for mark in marks:
+            if mark.name != "parametrize":
+                continue
+            for value in mark.args[1]:
+                if getattr(value, "id", None) == case_id:
+                    case_marks.extend(value.marks)
+    return marks, case_marks
+
+
+def _is_strict_xfail_for(mark: object, gap_id: str) -> bool:
+    return (
+        getattr(mark, "name", None) == "xfail"
+        and mark.kwargs.get("strict") is True
+        and gap_id in str(mark.kwargs.get("reason", ""))
+    )
+
+
+def test_r10_machine_readable_gap_ledger_keeps_unverified_gates_open() -> None:
+    ledger_path = ROOT / "docs" / "recovery-action-gaps-843.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["schema"] == "cortex/recovery-action-gaps/v1"
+    assert ledger["issue"] == 843
+    gaps = ledger["gaps"]
+    assert gaps
+    assert len({gap["id"] for gap in gaps}) == len(gaps)
+    for gap in gaps:
+        assert gap["id"] and gap["owner"] and gap["source"] and gap["retest"]
+        assert gap["status"] in {"open", "blocked", "pending-owner-evidence", "closed"}
+        # closed 必須指名實際存在的驗收測試；open 若宣稱可重現，也必須指得到測試。
+        refs = gap.get("verified_by" if gap["status"] == "closed" else "reproduced_by", [])
+        if gap["status"] == "closed":
+            assert refs, gap["id"]
+        for ref in refs:
+            path, _, name = ref.partition("::")
+            source = (ROOT / path).read_text(encoding="utf-8")
+            assert f"def {name.split('[', 1)[0]}(" in source, ref
+            marks, case_marks = _gap_test_marks(ref)
+            if gap["status"] == "closed":
+                # 關閉的缺口：驗收測試本身不得仍是 xfail。
+                assert not any(
+                    getattr(mark, "name", None) == "xfail" for mark in marks
+                ), ref
+            else:
+                # 未關閉且宣稱可重現：該測試（或參數化案例）必須仍是指名此 gap 的
+                # strict xfail。修好後移除 xfail 卻沒關閉 ledger 條目會在這裡失敗。
+                assert any(
+                    _is_strict_xfail_for(mark, gap["id"]) for mark in (*marks, *case_marks)
+                ), ref
+    matrix = MATRIX_PATH.read_text(encoding="utf-8")
+    for gap in gaps:
+        assert gap["id"] in matrix
+    tasks = (ROOT / "openspec/changes/cortex-refine-complete/tasks.md").read_text(
+        encoding="utf-8"
+    )
+    assert "- [ ] 5.5" in tasks, "full-plan recovery gate must remain open"
+    # full-plan gate 未解除時，ledger 必須仍顯示未解的依賴。
+    assert any(gap["status"] != "closed" for gap in gaps)
