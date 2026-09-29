@@ -10,6 +10,7 @@
 ### Added
 
 - **#716 canary 結案診斷**：派工結案驗證失敗時列出不成立的條件（phase／status／gate／needs_human 代碼／缺少 phase／未過步驟），不輸出自由文字（#716）。
+- **#716 executor 退避 lock 位置**：lock 改放 coordinator root 內，三 UID 安裝的 Manager 不再因祖先目錄不可寫而讀不到退避 store、卡在 `executor-backoff-unknown`（#716）。
 - **#841 測試隔離**：PID 重用檢查的 procfs 根目錄可替換，測試預設不讀宿主 `/proc`，修正 CI 上以假 MainPID 撞到真程序的不穩定失敗。
 - **#1189 root-owned job HOME**：job_runner 接受 installer 建立的 root:root 0755 job HOME，三 UID 主機的降權 job 不再在 launch 前失敗；group／other 可寫的 HOME 拒絕（#1189）。
 - **#716 workflow 無聲等待可見化**：resume 沒派 job 也沒轉 needs_human 的決策寫進 status.json 的 `workflow_waits`，`inspect status` 與 canary 逾時診斷都看得到原因（#716）。
@@ -88,6 +89,7 @@
 - **#1153 fanout quota admission**：fanout 接上 workflow 共用的 quota assessment、decision receipt 與 reservation authority；shadow 維持原派工結果，enforce 額度不足時零 spawn 並回結構化等待。#381 limiter 先於 reserve；fanout reservation 綁定 job，launch failure settle 後記終局用量，#836 harvest 以 decision id 配對 shadow 終局 usage，periodic tick 依 fresh observation 自動重試。
 - **#839／#840 逐票驗收補齊**：非額度硬條件在 quota admission shadow／enforce 下零 spawn 並回精確拒因（唯一 reviewer 同 independence domain 的拒因列出衝突 domain 與被排除候選）；兩個 Manager process 以 barrier 搶最後一單位額度只有 grant 者 launch；spawn 時 429 走 structured rate-limited＋耐久 backoff、同一 attempt 不重選、backoff 到期後排序不受影響；daemon start 與 forced retry 遇真 quota wait 的 #830 分類。#840 修正 `work show` 的 `blocking_reason` 跨 repo 借用、`wait.context` 改 allowlist、wait receipt 記 `policy_config_revision`、persona 投影新增 `card_id`／`attempt_id`／`reason`，reader 跨 process 重啟且 decision store 不可讀時以 durable snapshot／上一份 status.json 保留 last-good（見 `changelog.d/acceptance-completion.md`）。
 - **#1167 三 UID builder workspace reclaim**：owner-bound clone 改由 root-owned builder template 以 builder UID 執行固定 reclaim helper，unit instance 即工作區目錄名（`prepare_systemd_template(instance=...)`、`provision_runtime_surfaces(instance=..., seed_credential=False)` 依既有 slot 逐字建齊掛載點、不複製 model credential）。helper 只在 Manager 寫於 builder 唯讀 spec spool 的單次核准存在時動作（綁定工作區、pool、保存位置、marker digest 與 nonce，unit 結束即刪），builder 自行呼叫、偽造核准、指向他人工作區或重放舊核准一律拒絕；dirty scan、未提交檔保存或 base 後 commit bundle 保存失敗即不清除。Manager 不憑 builder 可寫的完成紀錄做決定：起 unit 前確認同 instance 的其他 builder 模板都不在執行，unit 結束先封 slot、把觀察到的封存移入 builder 碰不到的 evidence 樹，以 systemd 結果與工作區確實清空判定成敗，完成紀錄只作交叉核對。威脅模型見 `docs/three-uid-workspace-reclaim.md`。完成紀錄被拒或 Manager 在刪目錄前中斷而留下的 pool 直屬空目錄，重送時直接移除並回報 `reclaimed`，不再卡在 `worktree-path-not-a-worktree`。RC release profile 新增 `owner-bound-reclaim` installed check，所有 Manager 步驟以已安裝 Manager 的身分與 runtime 環境執行（修正 driver 行程缺 `PSC_REPO_ROOT` 的失敗），並關閉 #843 G843-R08-live-reclaim gap；真容器 receipt 仍須依 #843 owner 裁決執行。
+- **#1174 in-flight attempt supersession 與 artifact preservation**：新增 `supersede-attempt` work action 和 `cortex recover work` alias，要求 operator actor/reason、exact WorkflowRun/Candidate/claim-era/card/job CAS；active job fail-closed 拒絕，terminal attempt 以 append-only audit 和單次 registry update 重開精確卡片，舊 job、stage receipt、evidence 與 artifacts 原樣保留，後續由正常 Manager tick 派工。#843 R02/R03 matrix 與 5.4 OpenSpec 同步（見 `changelog.d/inflight-supersession.md`）。
 
 ### Fixed
 

@@ -355,6 +355,14 @@ def _lock_path(coordinator_root: str | Path) -> Path:
 
 
 def _stable_lock_base(coordinator_root: Path) -> Path:
+    # coordinator root 已存在時 lock 一律放在 root 內：能修改 store 的呼叫端本來就
+    # 必須能寫 root，位置因此與呼叫端對祖先目錄的權限無關。舊邏輯取「最高的可寫
+    # 祖先」，在三 UID 安裝（root 由 Manager 擁有、祖先皆 root-owned）會退回 `/`，
+    # Manager 開不了 lock，store 讀取永遠 UNKNOWN，build 卡片以
+    # executor-backoff-unknown 無聲等待（#716 canary）；且 root 權限的 CLI 與
+    # Manager 會用到不同 lock。root 尚不存在時沿用舊邏輯。
+    if coordinator_root.is_dir() and not coordinator_root.is_symlink():
+        return coordinator_root
     parent = coordinator_root.parent
     ancestors = (parent, *parent.parents)
     for ancestor in reversed(ancestors):

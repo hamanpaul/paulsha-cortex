@@ -22,7 +22,7 @@ class RecoveryActionFamily:
     recover_slice: tuple[str, ...] = ()
 
 
-# 14 個 work recovery 契約家族。legacy reviewer retry 家族內的
+# 15 個 work recovery 契約家族。legacy reviewer retry 家族內的
 # retry-verify／retry-review 是兩個不同 action，並非互相替代的 alias。
 RECOVERY_ACTION_FAMILIES: dict[str, RecoveryActionFamily] = {
     "resume": RecoveryActionFamily(
@@ -83,6 +83,9 @@ RECOVERY_ACTION_FAMILIES: dict[str, RecoveryActionFamily] = {
     "rechain": RecoveryActionFamily(
         coordinator_work=("rechain",), recover_work=("rechain",)
     ),
+    "supersede-attempt": RecoveryActionFamily(
+        coordinator_work=("supersede-attempt",), recover_work=("supersede-attempt",)
+    ),
 }
 
 
@@ -125,6 +128,7 @@ WORK_ACTION_CLASSIFICATION: dict[str, str] = {
     "reset-reclaim-budget": "reset-reclaim-budget",
     "refreeze-base": "refreeze-base",
     "rechain": "rechain",
+    "supersede-attempt": "supersede-attempt",
     "auto": "non-recovery:workflow-automation",
     "ship": "non-recovery:delivery",
     "review-attest": "non-recovery:review-attestation",
@@ -165,5 +169,5 @@ RECOVER_WORK_ACTION_CHOICES = tuple(
 RECOVER_SLICE_ACTION_CHOICES = SLICE_ACTION_CHOICES
 
 RECOVERY_EXPECTED_CANDIDATE_ACTIONS = frozenset(
-    {"retry-build", "retry-verify", "retry-review", "recover-repair-commit", "rechain"}
+    {"retry-build", "retry-verify", "retry-review", "recover-repair-commit", "rechain", "supersede-attempt"}
 )
