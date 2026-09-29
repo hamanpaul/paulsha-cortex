@@ -242,3 +242,55 @@ def test_terminal_usage_harvest_pairs_fanout_job_by_decision_id(tmp_path):
     assert result["recorded"][0]["job_id"] == "fanout-job-1"
     events = context.shadow.ledger.read().events
     assert any(event.get("kind") == "observation" and "terminal-usage" in event.get("idempotency_key", "") for event in events)
+
+
+def test_reserve_race_loss_after_feasible_wait_still_records_an_admit_receipt(
+    tmp_path, monkeypatch
+):
+    """#1153 審查：tick1 額度不足（wait@g0）；tick2 觀測可行但 reserve 被 workflow
+    搶先（wait@g1）；tick3 容量釋出時必須跳過所有已有 wait receipt 的世代，讓 job
+    指向 admit receipt，harvest 才配得到終局用量。"""
+
+    context, descriptor, _binding = _context(tmp_path / "race", enforce=True, remaining="0")
+    identity = IdentityRegistry().identity
+    launcher = SimpleNamespace(_execution_profile_binding=SimpleNamespace(resolved_key=_PROFILE_A))
+    dispatcher = SimpleNamespace(_registry=SimpleNamespace(list_jobs=lambda: []))
+    waits = []
+
+    def admit():
+        return autonomy._fanout_quota_admission(
+            context=context, dispatcher=dispatcher, slice_id="slice-race", persona="builder",
+            identity=identity, launcher=launcher, quota_waits=waits,
+        )
+
+    first = admit()
+    assert first[2].outcome == "wait"
+    refreshed = _observation(
+        descriptor, "short", value="10",
+        observed_at_ms=int(__import__("time").time() * 1000), profile_key=_PROFILE_A,
+    )
+    context.shadow.record_observation(refreshed.to_dict(), descriptors=(descriptor,), unit_catalog=())
+
+    real_reserve = quota_admission.reserve_for_candidate_with_generation_fallback
+
+    def lose_race(authority, **kwargs):
+        attempt_id = kwargs["base_attempt_id"]
+        decision_id = quota_admission.decision_id_for(
+            run_id=kwargs["run_id"], card_id=kwargs["card_id"], attempt_id=attempt_id,
+            profile_key=kwargs["profile_key"], mode="enforced",
+        )
+        return attempt_id, decision_id, SimpleNamespace(status="denied", reason="held by workflow")
+
+    monkeypatch.setattr(quota_admission, "reserve_for_candidate_with_generation_fallback", lose_race)
+    second = admit()
+    assert second[0] is None
+    monkeypatch.setattr(quota_admission, "reserve_for_candidate_with_generation_fallback", real_reserve)
+
+    third = admit()
+
+    assert third[0] is not None
+    assert third[2].outcome == "admit"
+    stored = context.store.get(third[2].decision_id)
+    assert stored is not None and stored.outcome == "admit"
+    wait_ids = {row["decision_id"] for row in context.store.all_rows() if row["outcome"] == "wait"}
+    assert third[2].decision_id not in wait_ids

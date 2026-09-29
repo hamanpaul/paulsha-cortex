@@ -733,19 +733,31 @@ def _fanout_quota_admission(
         return None, assessment, decision
 
     # A quota wait receipt is immutable for its attempt. When a fresh observation
-    # first makes that attempt feasible, advance to a deterministic new generation
-    # before reserving so the new admit receipt cannot collide with the wait row.
+    # makes the slice feasible, skip every generation that already holds a wait
+    # receipt — an infeasible wait and a reserve race lost to a workflow card
+    # both leave one — so the admit receipt the job points at is always written
+    # (#1153 review: a job bound to a wait receipt cannot be harvested).
     if enabled and assessment.pools:
-        try:
-            prior = context.store.get(decision_id)
-        except Exception:
-            prior = None
-        if prior is not None and prior.outcome == "wait" and prior.reason == "quota-admission-insufficient":
-            attempt_id = quota_admission.generation_attempt_id(base_attempt_id, 1)
-            decision_id = quota_admission.decision_id_for(
-                run_id=run_id, card_id=slice_id, attempt_id=attempt_id,
+        for generation in range(quota_admission._MAX_ATTEMPTS_PER_DECISION):
+            candidate_attempt = quota_admission.generation_attempt_id(base_attempt_id, generation)
+            candidate_decision = quota_admission.decision_id_for(
+                run_id=run_id, card_id=slice_id, attempt_id=candidate_attempt,
                 profile_key=profile_binding.resolved_key, mode=mode,
             )
+            try:
+                prior = context.store.get(candidate_decision)
+            except Exception:
+                prior = None
+            attempt_id, decision_id = candidate_attempt, candidate_decision
+            if prior is None or prior.outcome != "wait":
+                break
+        else:
+            quota_waits.append({
+                "slice_id": slice_id, "reason": "quota-admission-generations-exhausted",
+                "detail": "every attempt generation already holds a wait receipt",
+                "decision_id": decision_id, "retry_eligible": False, "reset_at_ms": reset_at_ms,
+            })
+            return None, assessment, None
 
     reservation = None
     if enabled and assessment.pools:
