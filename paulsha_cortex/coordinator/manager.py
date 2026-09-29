@@ -12031,8 +12031,9 @@ def _quota_admission_job_view_for_terminal_usage(job: Mapping[str, object]) -> d
 
 
 def _quota_admission_record_terminal_usage(
-    quota_ctx, *, profile_key: str, job: Mapping[str, object], now_ms: int
-) -> None:
+    quota_ctx, *, profile_key: str, job: Mapping[str, object], now_ms: int,
+    known_idempotency_keys: frozenset[str] | None = None,
+) -> tuple[object, ...]:
     """job 終局時（不論成功／失敗）記一筆終局 usage 的共用 helper——
     `quota_admission.reconcile_bound_reservations(on_settled=...)`（restart
     後 periodic tick 的收斂掃描）與 spawn 時 429／infra 失敗的即時 settle
@@ -12048,7 +12049,13 @@ def _quota_admission_record_terminal_usage(
     逐一嘗試 ``quota_ctx.bindings`` 而不先自行判斷『這個 binding 是否匹配
     這個 profile』——``record_terminal_usage`` 本身已經對不匹配／不完整的
     binding 回報 ``invalid``（無副作用），不必在這裡重新實作一次 #836 的
-    binding subject 比對規則（#839 契約邊界：不重驗、只消費）。"""
+    binding subject 比對規則（#839 契約邊界：不重驗、只消費）。
+
+    #836 G836-2：periodic tick 的 `harvest_quota_terminal_usage`（shadow／
+    enforce 共用的終局 usage 收割）也走這支 helper，並帶入該輪已讀過的
+    ledger key 集合（``known_idempotency_keys``）避免每輪逐筆重讀 ledger；
+    回傳逐 binding 的 `ShadowRecordResult`（不受額度管理時為空 tuple），
+    既有呼叫端忽略回傳值即與先前行為相同。"""
     from . import quota_admission
 
     job_view = _quota_admission_job_view_for_terminal_usage(job)
@@ -12064,9 +12071,13 @@ def _quota_admission_record_terminal_usage(
         bindings=quota_ctx.bindings,
     )
     if not pool_windows:
-        return  # 這個 profile 不受額度管理，沒有任何 binding 可解析。
+        return ()  # 這個 profile 不受額度管理，沒有任何 binding 可解析。
+    extra: dict[str, object] = {}
+    if known_idempotency_keys is not None:
+        extra["known_idempotency_keys"] = known_idempotency_keys
+    results = []
     for binding in quota_ctx.bindings:
-        quota_ctx.shadow.record_terminal_usage(
+        results.append(quota_ctx.shadow.record_terminal_usage(
             job_view,
             profile_key=profile_key,
             binding=binding,
@@ -12074,7 +12085,195 @@ def _quota_admission_record_terminal_usage(
             unit_catalog=quota_ctx.unit_catalog,
             unit_ref_by_metric=dict(quota_ctx.usage_unit_refs or {}),
             observed_at_ms=now_ms,
+            **extra,
+        ))
+    return tuple(results)
+
+
+#: `harvest_quota_terminal_usage` 回報「沒記」的機讀理由——只列真的會影響
+#: 『這個受管 job 的消耗有沒有進 ledger』判斷的類別；`record_terminal_usage`
+#: 自己回的 gap 理由（例如 `usage-unit-mapping-missing`）原樣沿用。
+_HARVEST_NO_ADMIT_DECISION = "no-admit-decision"
+_HARVEST_AMBIGUOUS_ADMIT_DECISION = "ambiguous-admit-decision"
+_HARVEST_DECISION_RECEIPT_MISSING = "decision-receipt-missing"
+_HARVEST_PROFILE_UNMANAGED = "profile-unmanaged"
+_HARVEST_USAGE_UNAVAILABLE = "usage-unavailable"
+
+
+def _harvest_admit_profile_key(
+    job: Mapping[str, object],
+    *,
+    ordinal: int,
+    admit_by_decision_id: Mapping[str, Mapping[str, object]],
+    admit_by_run_card: Mapping[tuple[str, str], list[Mapping[str, object]]],
+) -> tuple[str | None, str | None]:
+    """找出這個終局 job 當初派工時的 admit receipt，回 ``(profile_key, 未找到的理由)``。
+
+    只認 job 事實，不猜：
+
+    - job 帶 ``quota_decision_id``（enforce 且真的拿到 reservation）→ 精確比對
+      那筆 receipt（與 `_quota_admission_job_lookup_by_decision` 同一把尺）。
+    - 否則（shadow，或 enforce 下不受額度管理的候選）→ 依
+      `_quota_admission_attempt_id` 的 ordinal 語意（``n{k}`` 就是這個 job 在
+      『同 run/card 全部 job，依建立順序』中的 0-based 索引；與
+      `decision_projection._job_for_attempt` 共用同一套解析）找同一個 ordinal
+      的 admit receipt，並要求 receipt 的 ``selected`` executor／model_id 與
+      job 相同。對到兩個以上不同的 resolved profile key（例如 create_job 前
+      失敗後換 effort 重試、或多 Manager instance 交錯）一律不記——寧可留缺口
+      也不把消耗算到錯的 profile／pool。
+    """
+    from paulsha_cortex.monitor.decision_projection import _job_ordinal_from_attempt_id
+
+    run_id = job.get("workflow_run_id")
+    card_id = job.get("workflow_card")
+    exact = job.get("quota_decision_id")
+    if isinstance(exact, str) and exact:
+        row = admit_by_decision_id.get(exact)
+        if row is None or row.get("run_id") != run_id or row.get("card_id") != card_id:
+            return None, _HARVEST_DECISION_RECEIPT_MISSING
+        return str(row["profile_key"]), None
+    profile_keys: set[str] = set()
+    for row in admit_by_run_card.get((str(run_id), str(card_id)), ()):
+        attempt_id = row.get("attempt_id")
+        if not isinstance(attempt_id, str) or _job_ordinal_from_attempt_id(
+            attempt_id, run_id=str(run_id), card_id=str(card_id)
+        ) != ordinal:
+            continue
+        selected = row.get("selected")
+        if (
+            not isinstance(selected, Mapping)
+            or selected.get("executor") != job.get("executor")
+            or selected.get("model_id") != job.get("model_id")
+        ):
+            continue
+        profile_keys.add(str(row["profile_key"]))
+    if not profile_keys:
+        return None, _HARVEST_NO_ADMIT_DECISION
+    if len(profile_keys) > 1:
+        return None, _HARVEST_AMBIGUOUS_ADMIT_DECISION
+    return next(iter(profile_keys)), None
+
+
+def harvest_quota_terminal_usage(
+    *, registry, quota_admission_context, now_ms: int | None = None,
+) -> dict[str, object]:
+    """#836 G836-2（owner 2026-09-29 裁決屬本票）：把 Cortex 自家受管 job 的
+    終局 usage 寫進 #836 quota ledger——shadow 與 enforce 共用。
+
+    在這之前，`record_terminal_usage` 只有兩個 production 呼叫點，而且都要先
+    有 reservation（enforce）：shadow 期間 ledger 完全不含自家消耗，shadow 投影
+    與 decision receipt 因此看不見 Cortex 自己燒掉的額度。job 進終局的地方
+    （`dispatcher.poll_headless_done` → `registry.update_headless_result`）沒有
+    quota context，這裡改由 periodic tick 以 registry 事實收割（見
+    `reconcile_quota_admission_reservations` 第三步）：
+
+    1. 一次讀 decision store 的 admit receipt、一次讀 ledger 既有的
+       observation key、一次 `registry.list_jobs()`。
+    2. 每個已終局（`exited`／`failed`）的 workflow job，以
+       `_harvest_admit_profile_key` 找回派工時的 resolved profile key；找不到
+       或有歧義就不記（`skipped` 理由）。
+    3. 經既有 `_quota_admission_record_terminal_usage` 記一筆（與 enforce
+       的 settle 路徑同一支 helper、同一組 idempotency key），已在 ledger 的
+       key 直接算 duplicate、不重讀 ledger。
+
+    冪等：同一個 job 不論 harvest 幾輪、manager 重啟幾次、enforce 的
+    `on_settled` 是否已經先記過，ledger 都只有一份（key 不含 profile_key 與
+    記錄時間，見 `QuotaShadowService.record_terminal_usage`）；記到一半 crash
+    的缺口下一輪自動補齊。manager persona（不派模型）與 autonomy fanout job
+    （尚未接 quota admission）沒有 admit receipt，照舊不記。
+
+    回傳純診斷投影（進 daemon tick summary）：``recorded``（這一輪新寫入的
+    job）、``failed``（寫入時拋例外的 job）、``skipped``（理由→件數）。
+    """
+    if quota_admission_context is None or not all(
+        hasattr(quota_admission_context, name) for name in ("shadow", "store", "bindings")
+    ):
+        # 沒接線，或 enforce 下設定檔無效（`QuotaConfigInvalid` 訊號物件）。
+        return {"wired": False}
+    from .quota_ledger import LedgerCorrupt
+
+    resolved_now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    try:
+        rows = quota_admission_context.store.all_rows()
+    except Exception as exc:  # noqa: BLE001 - 診斷投影，不擋 tick
+        return {"wired": True, "error": f"admission-decision-store-unreadable:{type(exc).__name__}"}
+    try:
+        ledger_rows = quota_admission_context.shadow.ledger.read().events
+    except (LedgerCorrupt, OSError, ValueError) as exc:
+        return {"wired": True, "error": f"quota-ledger-unreadable:{type(exc).__name__}"}
+    known_keys = frozenset(
+        row["idempotency_key"]
+        for row in ledger_rows
+        if row.get("kind") == "observation" and isinstance(row.get("idempotency_key"), str)
+    )
+    admit_rows = [
+        row for row in rows
+        if row.get("outcome") == "admit" and isinstance(row.get("profile_key"), str)
+    ]
+    admit_by_decision_id = {str(row["decision_id"]): row for row in admit_rows}
+    admit_by_run_card: dict[tuple[str, str], list[Mapping[str, object]]] = {}
+    for row in admit_rows:
+        admit_by_run_card.setdefault((str(row.get("run_id")), str(row.get("card_id"))), []).append(row)
+
+    recorded: list[dict[str, object]] = []
+    failed: list[dict[str, object]] = []
+    skipped: dict[str, int] = {}
+    ordinals: dict[tuple[str, str], int] = {}
+    for job in registry.list_jobs():
+        run_id = job.get("workflow_run_id")
+        card_id = job.get("workflow_card")
+        if not isinstance(run_id, str) or not isinstance(card_id, str):
+            continue  # 非 workflow job（legacy slice／fanout）：沒有 admit receipt。
+        ordinal = ordinals.get((run_id, card_id), 0)
+        ordinals[(run_id, card_id)] = ordinal + 1
+        if job.get("status") not in TERMINAL_STATUSES:
+            continue
+        profile_key, reason = _harvest_admit_profile_key(
+            job, ordinal=ordinal, admit_by_decision_id=admit_by_decision_id,
+            admit_by_run_card=admit_by_run_card,
         )
+        if profile_key is None:
+            skipped[str(reason)] = skipped.get(str(reason), 0) + 1
+            continue
+        if not isinstance(job.get("usage"), Mapping):
+            # #325 usage extractor 沒抽到（`usage_reason` 在 job 上）：沒有可記
+            # 的消耗事實，每輪只算一次、不寫 ledger。
+            skipped[_HARVEST_USAGE_UNAVAILABLE] = skipped.get(_HARVEST_USAGE_UNAVAILABLE, 0) + 1
+            continue
+        try:
+            results = _quota_admission_record_terminal_usage(
+                quota_admission_context, profile_key=profile_key, job=job,
+                now_ms=resolved_now_ms, known_idempotency_keys=known_keys,
+            )
+        except Exception as exc:  # noqa: BLE001 - 單一 job 失敗不擋其他 job
+            failed.append({"job_id": job.get("job_id"), "error": type(exc).__name__})
+            continue
+        accepted = sum(getattr(result, "accepted", 0) for result in results)
+        duplicates = sum(getattr(result, "duplicates", 0) for result in results)
+        conflicts = sum(getattr(result, "conflicts", 0) for result in results)
+        if accepted or conflicts:
+            recorded.append({
+                "job_id": job.get("job_id"), "accepted": accepted, "conflicts": conflicts,
+            })
+            continue
+        if duplicates:
+            continue  # 早就記過（本 helper 前一輪、或 enforce 的 on_settled）。
+        if not results:
+            reason = _HARVEST_PROFILE_UNMANAGED
+        else:
+            # 逐 binding 呼叫：不涵蓋這個 profile 的 binding 一律回
+            # `profile-binding-unresolved`，那不是這個 job 沒記的原因。
+            reasons = sorted({
+                gap.reason
+                for result in results
+                for gap in getattr(result, "gaps", ())
+                if gap.reason != "profile-binding-unresolved"
+            })
+            reason = reasons[0] if len(reasons) == 1 else (
+                ",".join(reasons) if reasons else "no-usage-recorded"
+            )
+        skipped[reason] = skipped.get(reason, 0) + 1
+    return {"wired": True, "recorded": recorded, "failed": failed, "skipped": skipped}
 
 
 def reconcile_quota_admission_reservations(
@@ -12103,6 +12302,10 @@ def reconcile_quota_admission_reservations(
        失敗都記消耗；infra／429 失敗不得寫成品質失敗」——這裡只記錄額度
        usage，不對 job 的品質分類做任何判斷，那是既有
        `provider_outcome.classify_launch_failure` 的責任）。
+    3. `harvest_quota_terminal_usage`（#836 G836-2）——shadow 模式沒有
+       reservation 可 settle，受管 job 的終局 usage 改由這一步依 registry 與
+       admit receipt 事實收割進 ledger；enforce 下已由第 2 步記過的 job 只會
+       得到 duplicate。結果放在回傳值的 ``terminal_usage``。
 
     這支函式本身不是新的 dispatch producer，不塞進 #830 的 Job／decision
     契約——它只操作既有 reservation／decision receipt 的收斂狀態，回傳值
@@ -12144,8 +12347,20 @@ def reconcile_quota_admission_reservations(
             else None
         ),
     )
+    # 3. #836 G836-2：shadow／enforce 共用的受管 job 終局 usage 收割。排在
+    #    bound 收斂之後——同一輪 enforce job 已由上面的 `on_settled` 記過，這裡
+    #    讀到的 ledger key 已含那幾筆，只補 shadow 與先前漏記的；自身 fail-soft
+    #    （讀檔失敗回 `error`），不讓收割失效抹掉上面兩步的收斂結果。
+    try:
+        terminal_usage = harvest_quota_terminal_usage(
+            registry=registry, quota_admission_context=quota_admission_context,
+            now_ms=resolved_now_ms,
+        )
+    except Exception as exc:  # noqa: BLE001 - tick isolation
+        terminal_usage = {"wired": True, "error": f"terminal-usage-harvest-failed:{type(exc).__name__}"}
     return {
         "wired": True,
+        "terminal_usage": terminal_usage,
         "reserved": [
             {"decision_id": o.decision_id, "reservation_id": o.reservation_id, "action": o.action, "detail": o.detail}
             for o in reserved_outcomes

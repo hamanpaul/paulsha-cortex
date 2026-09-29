@@ -247,6 +247,23 @@ reservation）與 `bound` 兩種狀態，job 進終局時若 binding 可解析�
 `QuotaShadowService.record_terminal_usage()` 記消耗（成功／失敗都記，
 infra／429 失敗不改寫品質分類）。
 
+同一支 reconcile 的第三步 `manager.harvest_quota_terminal_usage()`（#836）
+在 **shadow 與 enforce 都會執行**：shadow 沒有 reservation 可 settle，受管
+workflow job 的終局 usage 改由這一步依 registry 與 admit receipt 的事實寫進
+quota ledger，讓 shadow 投影與 decision receipt 看得到 Cortex 自家的消耗。
+job 對 receipt 只認事實——enforce job 用 `quota_decision_id` 精確比對；
+shadow job 用 attempt ordinal（`n{k}` 即該 run/card 第 k 個 job）＋ receipt
+`selected` 的 executor／model_id，對不上或同一個 ordinal 對到多個 resolved
+profile key 就不記（`skipped` 理由 `no-admit-decision`／
+`ambiguous-admit-decision`）。idempotency key 與 enforce settle 路徑相同
+（`terminal-usage:v1:<job_id>:<metric>:<pool>:<window>`），因此重複 harvest、
+manager 重啟、enforce 已由 `on_settled` 記過，ledger 都只有一份；記到一半
+crash 的缺口下一輪補齊。manager persona 與 autonomy fanout job 沒有 admit
+receipt，不在收割範圍。要真的寫入 ledger，quota-pools 設定檔必須有涵蓋
+job metric 的 `usage_unit_refs`，否則 tick summary 的
+`quota_admission_reconcile.terminal_usage.skipped` 會回
+`usage-unit-mapping-missing`，ledger 不變。
+
 Manager 讀取 `paulsha_cortex.config.paths.quota_pools_config_path()`
 （預設 `~/.config/paulshaclaw/quota-pools.json`，可用 `PSC_QUOTA_POOLS_CONFIG`
 覆寫整個檔案路徑；比照既有 `paulshaclaw.yaml`，這是 operator-owned app 設定，
