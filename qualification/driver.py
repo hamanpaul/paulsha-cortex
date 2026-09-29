@@ -394,34 +394,45 @@ def _installed_checks(
         },
     )
     if require_system_status:
-        system_status = _run(
-            (
-                "/opt/cortex/venv/bin/cortex",
-                "service",
-                "status",
-                "--system",
-                "--json",
-            ),
-            env=_installed_runtime_env(),
-        )
-        _require_success(system_status, "system-scope loaded runtime status")
-        try:
-            status_payload = json.loads(system_status.stdout)
-        except json.JSONDecodeError as exc:
-            raise QualificationFailure("system-scope status returned invalid JSON") from exc
-        service = status_payload.get("service") if isinstance(status_payload, Mapping) else None
-        loaded_runtime = service.get("loaded_runtime") if isinstance(service, Mapping) else None
-        if not isinstance(loaded_runtime, Mapping):
-            raise QualificationFailure("system-scope status omitted loaded runtime evidence")
+        # 服務在 activate 時才啟動，loaded receipt 可能晚幾秒才寫入：輪詢到三項
+        # 全部 match 或逾時，逾時時列出各項狀態（只輸出列舉 token）。
+        deadline = time.monotonic() + SYSTEM_STATUS_SETTLE_SECONDS
+        while True:
+            system_status = _run(
+                (
+                    "/opt/cortex/venv/bin/cortex",
+                    "service",
+                    "status",
+                    "--system",
+                    "--json",
+                ),
+                env=_installed_runtime_env(),
+            )
+            _require_success(system_status, "system-scope loaded runtime status")
+            try:
+                status_payload = json.loads(system_status.stdout)
+            except json.JSONDecodeError as exc:
+                raise QualificationFailure("system-scope status returned invalid JSON") from exc
+            service = status_payload.get("service") if isinstance(status_payload, Mapping) else None
+            loaded_runtime = service.get("loaded_runtime") if isinstance(service, Mapping) else None
+            if not isinstance(loaded_runtime, Mapping):
+                raise QualificationFailure("system-scope status omitted loaded runtime evidence")
+            mismatched = [
+                name
+                for name in ("manager", "monitor")
+                if _system_status_mismatch(loaded_runtime.get(name))
+            ]
+            if not mismatched or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
         for name in ("manager", "monitor"):
             report = loaded_runtime.get(name)
             comparison = report.get("comparison") if isinstance(report, Mapping) else None
-            if not isinstance(comparison, Mapping) or any(
-                comparison.get(key) != "match"
-                for key in ("artifact_status", "config_status", "process_status")
-            ):
+            detail = _system_status_mismatch(report)
+            if detail:
                 raise QualificationFailure(
-                    f"system-scope {name} loaded artifact/config/process did not match"
+                    f"system-scope {name} loaded artifact/config/process did not match: "
+                    + detail
                 )
             trust_root = report.get("trust_root")
             if not isinstance(trust_root, Mapping) or trust_root.get("status") != "verified":
@@ -454,6 +465,40 @@ def _installed_checks(
             else []
         ),
     ]
+
+
+#: activate 後等待 system-scope loaded receipt 寫入並與宣告一致的上限。
+SYSTEM_STATUS_SETTLE_SECONDS = 60
+
+
+def _system_status_mismatch(report: object) -> str:
+    """空字串表示三項皆 match；否則回傳各項狀態與 reason（列舉 token）。"""
+
+    comparison = report.get("comparison") if isinstance(report, Mapping) else None
+    if not isinstance(comparison, Mapping):
+        return "comparison=missing"
+    statuses = {
+        key: comparison.get(key)
+        for key in ("artifact_status", "config_status", "process_status")
+    }
+    if all(value == "match" for value in statuses.values()):
+        return ""
+    parts = [f"{key}={_diagnostic_token(value)}" for key, value in statuses.items()]
+    parts.append(f"status={_diagnostic_token(report.get('status'))}")
+    parts.append(f"reason={_diagnostic_token(report.get('reason'))}")
+    loaded = report.get("loaded")
+    if isinstance(loaded, Mapping):
+        artifact = loaded.get("artifact")
+        parts.append(
+            "loaded_artifact_kind="
+            + _diagnostic_token(artifact.get("kind") if isinstance(artifact, Mapping) else None)
+        )
+    installed = report.get("installed_artifact")
+    parts.append(
+        "installed_artifact_kind="
+        + _diagnostic_token(installed.get("kind") if isinstance(installed, Mapping) else None)
+    )
+    return " ".join(parts)
 
 
 def _denied(

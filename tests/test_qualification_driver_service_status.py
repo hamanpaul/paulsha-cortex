@@ -77,8 +77,14 @@ def test_installed_checks_fail_closed_on_system_runtime_mismatch(
 
     monkeypatch.setattr(driver, "_run", run)
     monkeypatch.setattr(driver, "_installed_runtime_env", dict)
+    monkeypatch.setattr(driver, "SYSTEM_STATUS_SETTLE_SECONDS", 0)
 
-    with pytest.raises(driver.QualificationFailure, match="system-scope"):
+    expected = (
+        "artifact_status=drift config_status=match process_status=match"
+        if manager_artifact == "drift"
+        else "Trust Root receipt is not verified"
+    )
+    with pytest.raises(driver.QualificationFailure, match=expected):
         driver._installed_checks(
             install_evidence=install_evidence,
             receipt={},
@@ -124,3 +130,49 @@ def test_installed_checks_capture_matching_system_runtime_status(
         (evidence_dir / "system-loaded-runtime-status.json").read_text(encoding="utf-8")
     )
     assert captured["service"]["loaded_runtime"]["manager"]["comparison"]["process_status"] == "match"
+
+
+def test_installed_checks_wait_for_the_loaded_receipt_after_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """服務在 activate 時才啟動：第一次查詢 loaded receipt 可能尚未寫入
+    （process 為 unknown），輪詢到 match 後才判定。"""
+
+    driver = _driver()
+    install_evidence = tmp_path / "install-evidence.json"
+    install_evidence.write_text(
+        json.dumps({"result": "pass", "attestation": {"ok": True}}),
+        encoding="utf-8",
+    )
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    status_calls: list[int] = []
+
+    def run(argv, **_kwargs):
+        if "service" in argv:
+            status_calls.append(1)
+            payload = _status_payload()
+            if len(status_calls) == 1:
+                payload["service"]["loaded_runtime"]["manager"]["comparison"][
+                    "process_status"
+                ] = "unknown"
+            stdout = json.dumps(payload)
+        elif "selfcheck" in argv:
+            stdout = json.dumps({"ok": True, "job_writable_count": 0})
+        else:
+            stdout = json.dumps({"ok": True})
+        return driver.CommandResult(tuple(argv), 0, stdout, "")
+
+    monkeypatch.setattr(driver, "_run", run)
+    monkeypatch.setattr(driver, "_installed_runtime_env", dict)
+    monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
+
+    tests = driver._installed_checks(
+        install_evidence=install_evidence,
+        receipt={},
+        evidence_dir=evidence_dir,
+    )
+
+    assert len(status_calls) == 2
+    assert {"name": "system-loaded-runtime-attestation", "status": "passed"} in tests
