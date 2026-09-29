@@ -2750,9 +2750,11 @@ def _manager_github_probe(
         or credential.stderr
     ):
         raise QualificationFailure("Manager secret-safe credential probe failed")
+    # `--refs` 只列 refs/*：真實 ls-remote 第一行是 `HEAD`（及 peeled tag `^{}`），
+    # 會被 `_parse_remote_refs` 當成畸形而失敗（#716 canary）。
     remote = f"https://github.com/{repository}.git"
     before = _run(
-        ("/usr/bin/git", "ls-remote", remote), user=account, env=env, timeout=60
+        ("/usr/bin/git", "ls-remote", "--refs", remote), user=account, env=env, timeout=60
     )
     _require_success(before, "Manager probe repo ls-remote before")
     before_refs = _parse_remote_refs(before.stdout)
@@ -2772,7 +2774,7 @@ def _manager_github_probe(
     )
     _require_success(dry_run, "Manager authenticated dry-run push")
     after = _run(
-        ("/usr/bin/git", "ls-remote", remote), user=account, env=env, timeout=60
+        ("/usr/bin/git", "ls-remote", "--refs", remote), user=account, env=env, timeout=60
     )
     _require_success(after, "Manager probe repo ls-remote after")
     after_refs = _parse_remote_refs(after.stdout)

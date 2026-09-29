@@ -1,0 +1,1 @@
+- deployment canary 的 Manager GitHub probe 以 `git ls-remote --refs` 取遠端 refs（#716，canary run 36510345017 在 `Manager probe returned malformed remote refs` 失敗）：真實 `ls-remote` 第一行是 `HEAD`（另可能有 peeled tag `^{}`），`_parse_remote_refs` 只接受 `refs/*` 而判為畸形；既有 fixture 沒有 `HEAD` 列。新增以本機 bare repo 跑真實 `git ls-remote` 的測試。

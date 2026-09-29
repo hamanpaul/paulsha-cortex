@@ -1428,6 +1428,66 @@ def test_manager_helper_inventory_parses_real_git_output_for_the_installed_shape
         driver._manager_github_probe("owner/repo", "b" * 40, evidence, source_repo=repo)
 
 
+def test_manager_probe_lists_only_refs_so_real_ls_remote_output_parses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：真實 `git ls-remote` 第一行是 `HEAD`，canary 以 malformed remote refs 失敗。"""
+
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git is unavailable")
+    driver = _load_driver()
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+    subprocess.run(
+        ["git", "-C", str(work), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "commit", "-q", "--allow-empty", "-m", "seed"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(work), "push", "-q", str(origin), "main"], check=True)
+    home = tmp_path / "manager-home"
+    home.mkdir()
+    gitconfig = home / ".gitconfig"
+    gitconfig.write_text(_INSTALLED_MANAGER_CREDENTIAL_SECTION, encoding="utf-8")
+    monkeypatch.setattr(
+        driver.pwd,
+        "getpwnam",
+        lambda _account: SimpleNamespace(pw_dir=str(home), pw_uid=os.getuid()),
+    )
+    monkeypatch.setattr(driver, "_require_installed_manager_gitconfig", lambda path: None)
+    seen: list[tuple[str, ...]] = []
+
+    def fake_run(argv, *, user=None, env=None, timeout=120):
+        command = tuple(argv)
+        seen.append(command)
+        if "config" in command:
+            return _result(driver, command, stdout=_installed_helper_rows(gitconfig))
+        if command[:2] == ("/usr/bin/python3", "-c"):
+            return _result(driver, command, stdout="credential-ok\n")
+        if "ls-remote" in command:
+            real = [c for c in command[1:] if c != f"https://github.com/owner/repo.git"]
+            completed = subprocess.run(
+                ["git", *real, str(origin)], capture_output=True, text=True, check=False
+            )
+            return driver.CommandResult(
+                command, completed.returncode, completed.stdout, completed.stderr
+            )
+        return _result(driver, command)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    driver._manager_github_probe("owner/repo", "b" * 40, evidence, source_repo=work)
+    ls_remote = [c for c in seen if "ls-remote" in c]
+    assert len(ls_remote) == 2 and all("--refs" in c for c in ls_remote)
+    payload = json.loads((evidence / "manager-github-auth.json").read_text())
+    assert payload["remote_refs_unchanged"] is True
+
+
 def test_manager_github_probe_does_not_emit_credential_material(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
