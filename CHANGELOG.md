@@ -10,6 +10,7 @@
 ### Added
 
 - **#716 canary 結案診斷**：派工結案驗證失敗時列出不成立的條件（phase／status／gate／needs_human 代碼／缺少 phase／未過步驟），不輸出自由文字（#716）。
+- **#716 canary 逾時診斷**：派工逾時時列出 registry 內卡住的步驟、該 run 的 job 狀態與 daemon tick 健康度（#716）。
 - **#716 canary 結案判定**：派工結案只看本 work item 的 `item.state`／workflow_run source，不再被 `work show` envelope 其他區段（providers、fleet_health）的 closed／done 誤判（#716）。
 - **#716 canary ls-remote**：Manager GitHub probe 改用 `git ls-remote --refs`，不再因真實輸出的 `HEAD` 列判為畸形（#716）。
 - **#716 Manager gh 設定**：root-owned 唯讀的 gh config 加上 `version: "1"`，避免 gh 遷移寫檔導致 `gh auth status` 失敗（#716）。

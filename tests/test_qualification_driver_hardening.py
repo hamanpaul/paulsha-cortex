@@ -2583,6 +2583,105 @@ def test_full_dispatch_times_out_while_the_bound_run_is_still_running(
     assert closeouts == []
 
 
+def test_full_dispatch_timeout_names_the_stuck_step_jobs_and_daemon_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716 canary run 36538644074：workflow 在 build 停了兩小時、沒有 needs_human，
+    逾時訊息只看得到 item 狀態。逾時時另從 Manager registry 列出各步驟與該 run
+    的 job 狀態，並從 `inspect status` 帶出 daemon tick 健康度（只輸出列舉 token）。"""
+
+    driver = _load_driver()
+    ongoing = _work_show_envelope("qualification-work", state="on-going")
+    calls, closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [ongoing])
+    coordinator = tmp_path / "coordinator"
+    coordinator.mkdir()
+    (coordinator / "jobs.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "jobs": [
+                    {
+                        "job_id": "job-1",
+                        "workflow_run_id": "run-qualification",
+                        "workflow_phase": "build",
+                        "workflow_card": "worktree-isolation",
+                        "status": "exited",
+                        "exit_code": 0,
+                        "executor": "codex",
+                    },
+                    {
+                        "job_id": "job-2",
+                        "workflow_run_id": "run-qualification",
+                        "workflow_phase": "build",
+                        "workflow_card": "tdd-red",
+                        "status": "running",
+                        "exit_code": None,
+                        "executor": "codex",
+                    },
+                    {"job_id": "other", "workflow_run_id": "run-other", "status": "running"},
+                ],
+                "workflows": [
+                    {
+                        "run_id": "run-qualification",
+                        "work_id": "qualification-work",
+                        "repo": "owner/repo",
+                        "current_phase": "build",
+                        "status": "ongoing",
+                        "gate_status": "running",
+                        "facets": [],
+                        "steps": [
+                            {"phase": "build", "card": "worktree-isolation", "gate_result": "passed"},
+                            {"phase": "build", "card": "tdd-red", "gate_result": "pending"},
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    status = {
+        "daemon": {
+            "consecutive_tick_failures": 3,
+            "tick_circuit_open": True,
+            "last_tick_error": "Traceback: secret detail that must not leak",
+            "last_tick_at": "2026-09-29T09:50:00Z",
+        },
+        "in_flight": [{"job_id": "job-2"}],
+    }
+    real_run = driver._run
+
+    def run_with_status(argv, **kwargs):
+        if "inspect" in argv:
+            calls.append(tuple(argv))
+            return _result(driver, argv, stdout=json.dumps(status) + "\n")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(driver, "_run", run_with_status)
+    clock = iter(float(tick) for tick in range(0, 1000, 5))
+    monkeypatch.setattr(driver.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(driver.QualificationFailure) as failure:
+        driver._full_dispatch(
+            repository="owner/repo",
+            work_id="qualification-work",
+            issue=42,
+            release_candidate_sha="a" * 40,
+            timeout=30,
+            evidence_dir=tmp_path / "evidence",
+        )
+
+    message = str(failure.value)
+    assert "current_phase=build status=ongoing gate_status=running" in message
+    assert "steps=build:worktree-isolation=passed;build:tdd-red=pending" in message
+    assert "jobs=build:worktree-isolation:exited:0:codex;build:tdd-red:running:none:codex" in message
+    assert "run-other" not in message
+    assert "consecutive_tick_failures=3 tick_circuit_open=true last_tick_error=present" in message
+    assert "in_flight=1" in message
+    assert "secret detail" not in message
+    assert closeouts == []
+
+
 def test_full_dispatch_ignores_a_record_for_another_work_item(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
