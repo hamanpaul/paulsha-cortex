@@ -908,6 +908,9 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         # #839：quota-aware admission 的診斷投影，provenance-only，比照
         # execution_profile_bindings／model_qualification 的可選欄位模式。
         "quota_admission",
+        # #1142：main-sync retry-build 的 exact-M 綁定（retry 當下的 main、停機
+        # M、pin ref 與 retry evidence），只在有值時寫出。
+        "main_sync_repair",
         # 診斷 invariant（#527／#514／#515／#511／#482）：run 被轉入 needs_human
         # 時同時落地的結構化理由（機器可讀 reason ＋ 人可讀 detail ＋ 來源位置）。
         # **必須列在這裡**：這個 whitelist 是封閉的，漏掉會讓每一個 run row 都被

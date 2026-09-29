@@ -4926,6 +4926,129 @@ def _validate_candidate_planning_authority(
         )
 
 
+_MAIN_SYNC_REPAIR_OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+def _verify_main_sync_repair_candidate(
+    job: Mapping[str, object],
+    *,
+    run,
+    candidate: str,
+    coordinator_root: str | Path | None = None,
+) -> None:
+    """#1142：main-sync 修復卡的候選必須是 retry-build 當下 exact M 的後代。
+
+    ``run.main_sync_repair`` 由 main-sync retry-build 寫入，``main_head`` 是 operator
+    下 retry-build 當下 Manager 重新 fetch 並釘在來源樹 pin ref 上的 main（不是停機時
+    probe 記錄的 M）。harvest 推進 feature ref 之前：
+
+    1. job 有 bundle 時，先把 bundle 的 ``refs/heads/<branch>`` fetch 進 run-scoped
+       quarantine ref（``refs/cortex/main-sync-quarantine/<run_id>``），要求它恰等於
+       被採信的 candidate——驗的是 bundle 真正帶來的 commit，feature ref 此時不動；
+    2. 在來源樹以 ``merge-base --is-ancestor <M> <candidate>`` 判定：0 通過；1 代表
+       候選沒有納入 M，拒絕；其他 returncode（M 或 candidate 不在來源樹）一律
+       fail-closed。
+
+    驗證全程只讀來源樹與 spool 裡的 bundle 檔，不碰 builder 的 clone（三分部署下
+    Manager 讀不到）。quarantine ref 於結束時移除；拒絕時 feature ref 仍停在舊候選。
+    沒有綁定的 run（一般 build、非 main-sync 的 retry）直接略過。
+    """
+
+    binding = getattr(run, "main_sync_repair", None)
+    if binding is None:
+        return
+    required_main = binding.get("main_head") if isinstance(binding, Mapping) else None
+    if (
+        not isinstance(required_main, str)
+        or _MAIN_SYNC_REPAIR_OBJECT_ID_RE.fullmatch(required_main) is None
+    ):
+        raise ValueError("workflow main-sync repair binding malformed")
+    source_repo = getattr(run, "workspace_root", None)
+    if not isinstance(source_repo, str) or not source_repo:
+        raise ValueError("workflow main-sync repair source repo missing")
+    from .work_bridge import MAIN_SYNC_QUARANTINE_REF_PREFIX, main_sync_run_ref
+
+    quarantine_ref = main_sync_run_ref(MAIN_SYNC_QUARANTINE_REF_PREFIX, str(run.run_id))
+    branch = job.get("branch")
+    bundle = (
+        job_workspace.commit_bundle_path_for_job(job, coordinator_root=coordinator_root)
+        if isinstance(branch, str) and branch
+        else None
+    )
+    quarantined = False
+    try:
+        if bundle is not None and not bundle.is_symlink() and bundle.is_file():
+            quarantined = True
+            fetched = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    source_repo,
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    str(bundle),
+                    f"+refs/heads/{branch}:{quarantine_ref}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if fetched.returncode != 0:
+                detail = (fetched.stderr or fetched.stdout).strip()
+                raise ValueError(
+                    f"workflow main-sync repair candidate quarantine failed: {detail}"
+                )
+            quarantined_head = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    source_repo,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"{quarantine_ref}^{{commit}}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if (
+                quarantined_head.returncode != 0
+                or quarantined_head.stdout.strip().lower() != candidate.lower()
+            ):
+                raise ValueError("workflow main-sync repair quarantine head mismatch")
+        ancestry = subprocess.run(
+            [
+                "git",
+                "-C",
+                source_repo,
+                "merge-base",
+                "--is-ancestor",
+                required_main,
+                candidate.lower(),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if ancestry.returncode == 1:
+            raise ValueError(
+                "workflow build candidate does not contain the main-sync retry main "
+                f"{required_main}"
+            )
+        if ancestry.returncode != 0:
+            raise ValueError("workflow main-sync repair candidate ancestry unavailable")
+    finally:
+        if quarantined:
+            subprocess.run(
+                ["git", "-C", source_repo, "update-ref", "-d", quarantine_ref],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+
 def _harvest_build_candidate(
     job: Mapping[str, object],
     *,
@@ -4951,8 +5074,15 @@ def _harvest_build_candidate(
 
     這個 job 沒有 spool 那一格（升級前既存的工作區、或測試裡的假 job 記錄）時回
     None，不做任何事——既有部署零回歸的掛點。
+
+    #1142：run 帶 main-sync 修復綁定時，推進 feature ref 之前先以 quarantine ref
+    驗證候選是 retry 當下 exact M 的後代（見 `_verify_main_sync_repair_candidate`），
+    沒有 spool 的 job 也照驗。
     """
 
+    _verify_main_sync_repair_candidate(
+        job, run=run, candidate=candidate, coordinator_root=coordinator_root
+    )
     branch = job.get("branch")
     if not isinstance(branch, str) or not branch:
         return None

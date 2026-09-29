@@ -4349,8 +4349,13 @@ _MAIN_SYNC_RETRYABLE_REASONS = frozenset(
 _MAIN_SYNC_STOP_REASONS = _MAIN_SYNC_RETRYABLE_REASONS | {"main-sync-unavailable"}
 
 
-def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None) -> dict[str, Any]:
-    """Reopen the final builder card with exact-Candidate CAS after a human stop."""
+def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None, runner: Runner = subprocess.run) -> dict[str, Any]:
+    """Reopen the final builder card with exact-Candidate CAS after a human stop.
+
+    #1142：main-sync stop 的修復會在這裡（reset 之前）重新取得 origin/main，
+    把 retry 當下的 exact M 寫進新的 ``main-sync-retry`` evidence、修復指令與
+    ``WorkflowRun.main_sync_repair`` 綁定；``runner`` 只用於這段 bounded git 探測。
+    """
 
     extras = set(args) - {
         "action", "repo", "work_id", "issue", "actor", "expected_candidate", "reason",
@@ -4449,8 +4454,19 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
                 }
             )
     retry_classification = _classify_retry(run, workflow_registry)
+    main_sync_repair: dict[str, str] | None = None
     if main_sync_context is not None:
-        repair_action = _main_sync_retry_build_action(main_sync_context)
+        # #1142：M 取自 retry 當下重新 fetch 的 main，而不是停機時 probe 記錄的 M；
+        # fetch／evidence 任一失敗都在 reset 前 raise，run 維持 needs_human。
+        main_sync_repair = _main_sync_retry_binding(
+            run=run,
+            context=main_sync_context,
+            state_path=state_path,
+            runner=runner,
+        )
+        repair_action = _main_sync_retry_build_action(
+            main_sync_repair, stop_evidence_ref=main_sync_context["evidence_ref"]
+        )
     elif run.current_phase == "build":
         repair_action = (
             "Recover the exact Candidate after a builder terminalization failure. Preserve all "
@@ -4459,6 +4475,13 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
             "OpenSpec archive, and do not recreate the active change or claim merge, issue closure, "
             "or done. Commit or adopt a tested descendant Candidate."
         )
+        # #1142：main-sync 修復卡 terminalization 失敗後的重派仍是同一輪修復，
+        # 沿用原 exact-M 綁定並把要求寫回指令，harvest 驗證與指令不脫鉤。
+        main_sync_repair = _inherited_main_sync_repair(run)
+        if main_sync_repair is not None:
+            repair_action = (
+                f"{repair_action} {_main_sync_repair_requirement(main_sync_repair)}"
+            )
     elif archive_applied:
         repair_action = (
             "Repair the exact Candidate after a post-archive verification or review failure. "
@@ -4494,9 +4517,10 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         retry_classification=retry_classification.value,
         model_chain_override=model_chain_override,
         post_pass_adjudicated=post_pass_adjudication,
+        main_sync_repair=main_sync_repair,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
-    return {
+    result = {
         "action": "retry-build",
         "adjudication_evidence": adjudication_evidence,
         "adjudication": operator_adjudication_receipt(adjudication_evidence, card="subagent-build"),
@@ -4506,6 +4530,9 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         "run": updated.to_dict(),
         "retry_classification": retry_classification,
     }
+    if main_sync_repair is not None:
+        result["main_sync_repair"] = dict(main_sync_repair)
+    return result
 
 
 def _blocking_findings_recovery_actions(run) -> tuple[str, ...]:
@@ -4598,18 +4625,95 @@ def _main_sync_retry_context(run) -> dict[str, str] | None:
         "candidate": current_candidate.lower(),
         "main_head": main_head.lower(),
         "evidence_ref": evidence_ref,
+        "evidence_hash": context["main_sync_evidence_hash"].lower(),
     }
 
 
-def _main_sync_retry_build_action(context: dict[str, str]) -> str:
+def _main_sync_retry_binding(
+    *,
+    run,
+    context: dict[str, str],
+    state_path: Path | None,
+    runner: Runner,
+) -> dict[str, str]:
+    """#1142：retry-build 當下重新取得 main，落 `main-sync-retry` evidence 並回傳綁定。
+
+    停機 evidence（``context``）原樣保留作稽核；新 evidence 同時記錄停機 M 與
+    retry 當下的 M，修復指令與 harvest 驗證只認後者。
+    """
+
+    from . import work_bridge
+
+    source_repo = getattr(run, "workspace_root", None)
+    if not isinstance(source_repo, str) or not source_repo:
+        raise RuntimeError("retry-build main-sync source repo missing")
+    retry_main = work_bridge.fetch_retry_main(
+        source_repo=Path(source_repo),
+        run_id=run.run_id,
+        runner=runner,
+    )
+    payload = {
+        "schema": work_bridge.MAIN_SYNC_RETRY_EVIDENCE_SCHEMA,
+        "repo": run.repo,
+        "work_id": run.work_id,
+        "run_id": run.run_id,
+        "candidate": context["candidate"],
+        "main_head": retry_main.main_head,
+        "pin_ref": retry_main.pin_ref,
+        "stop_main_head": context["main_head"],
+        "stop_evidence_ref": context["evidence_ref"],
+        "stop_evidence_hash": context["evidence_hash"],
+        "build_attempt": int(run.attempts.get("build", 0)) + 1,
+    }
+    root = (Path(state_path) if state_path is not None else _run_state_path()).resolve().parent
+    evidence = work_bridge._write_json_evidence(root, "main-sync-retry", payload)
+    return {
+        "schema": work_bridge.MAIN_SYNC_REPAIR_SCHEMA,
+        "candidate": context["candidate"],
+        "main_head": retry_main.main_head,
+        "stop_main_head": context["main_head"],
+        "pin_ref": retry_main.pin_ref,
+        "evidence_ref": evidence["ref"],
+        "evidence_hash": evidence["hash"],
+    }
+
+
+def _inherited_main_sync_repair(run) -> dict[str, str] | None:
+    """build phase 重派時沿用尚未被採信的 main-sync 修復綁定（#1142）。"""
+
+    binding = getattr(run, "main_sync_repair", None)
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(binding, dict)
+        or getattr(run, "current_phase", None) != "build"
+        or not isinstance(candidate, str)
+        or binding.get("candidate") != candidate.lower()
+    ):
+        return None
+    return dict(binding)
+
+
+def _main_sync_repair_requirement(binding: dict[str, str]) -> str:
     return (
-        f"Repair the exact Candidate {context['candidate']} using the saved main-sync "
-        f"probe evidence at {context['evidence_ref']}. That stop recorded origin/main "
-        f"as {context['main_head']}; include this exact main commit in a tested "
-        "descendant Candidate instead of substituting a newly fetched main. Do not "
-        "claim merge, issue closure, or done. The existing verification and review "
-        "gates must rerun, and the ship probe must confirm main sync before delivery "
-        "continues."
+        f"This build is a main-sync repair: Manager fetched origin/main as "
+        f"{binding['main_head']} when retry-build was issued (retry evidence "
+        f"{binding['evidence_ref']}). Include this exact main commit in the tested "
+        "descendant Candidate (merge it so it becomes an ancestor of the new HEAD) "
+        "instead of substituting any other main commit; Manager rejects a repaired "
+        "Candidate that does not contain it."
+    )
+
+
+def _main_sync_retry_build_action(
+    binding: dict[str, str], *, stop_evidence_ref: str
+) -> str:
+    return (
+        f"Repair the exact Candidate {binding['candidate']} after a main-sync stop. "
+        f"The saved main-sync probe evidence at {stop_evidence_ref} recorded origin/main "
+        f"as {binding['stop_main_head']} at the stop; that commit is audit context only. "
+        f"{_main_sync_repair_requirement(binding)} Do not claim merge, issue "
+        "closure, or done. The existing verification and review gates must rerun, "
+        "and the ship probe must confirm main sync before delivery continues."
     )
 
 
@@ -4619,8 +4723,9 @@ def main_sync_retry_build_next_step_hint(run) -> str | None:
         return None
     return (
         f"main-sync evidence `{context['evidence_ref']}` 記錄停機時的 Candidate C 與 "
-        f"main M `{context['main_head']}`。請依該證據人工修復候選並納入這個 M，讓既有 "
-        f"verify／review 與 ship probe 重跑；執行 `cortex run work retry-build "
+        f"main M `{context['main_head']}`（僅供稽核）。`retry-build` 會在執行當下重新取得 "
+        "origin/main，要求修復候選納入那個 exact M 並落新的 main-sync-retry evidence，"
+        f"讓既有 verify／review 與 ship probe 重跑；執行 `cortex run work retry-build "
         f"{run.work_id} --repo {run.repo} --expected-candidate {context['candidate']} "
         "--actor <operator> --reason '<人工裁決>'`。"
     )
@@ -9719,6 +9824,7 @@ def execute_work_action(
             workflow_registry=workflow_registry,
             state_path=resolved_state_path,
             now_epoch=now_epoch,
+            runner=runner,
         )
     elif action == "retry-card":
         result = _retry_card_action(

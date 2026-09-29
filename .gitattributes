@@ -1,0 +1,4 @@
+# #1142：每個 PR 都在 CHANGELOG.md [Unreleased] 頂端加一條，兩邊同位置插入的衝突
+# 可機械合併（git 內建 union driver）。Manager 的 main-sync probe
+# （merge-tree --attr-source=<main>）、builder 的合併與本機 merge 共用這條宣告。
+CHANGELOG.md merge=union

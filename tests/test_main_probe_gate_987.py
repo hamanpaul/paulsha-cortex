@@ -126,6 +126,12 @@ def _probe_success_prefix(
     ]
 
 
+def _isolation_objects_outcome(objects_dir: Path):
+    """#1142：merge-tree 前的 `merge-tree-objects` stage（來源 object store 絕對路徑）。"""
+
+    return _probe_result(0, stdout=f"{objects_dir}\n")
+
+
 def _init_probe_repo(root: Path, *, files: dict[str, str]) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
@@ -381,7 +387,7 @@ def test_main_sync_probe_preserves_main_head_for_post_fetch_failures(
     if stage == "merge-base":
         outcomes[-1] = outcome
     else:
-        outcomes.append(outcome)
+        outcomes.extend([_isolation_objects_outcome(tmp_path), outcome])
     probe = work_bridge._probe_main_sync(
         worktree=tmp_path,
         candidate=candidate,
@@ -447,6 +453,7 @@ def test_main_sync_probe_classifies_zero_path_merge_tree_conflict_as_generic_con
                     main_head=main_head,
                     merge_base=merge_base,
                 ),
+                _isolation_objects_outcome(tmp_path),
                 _probe_result(1, stdout=f"{tree_oid}\0"),
             ]
         ),
@@ -821,7 +828,7 @@ def test_manager_stop_reads_back_post_fetch_main_sync_probe_failures(
     if stage == "merge-base":
         outcomes[-1] = final_outcome
     else:
-        outcomes.append(final_outcome)
+        outcomes.extend([_isolation_objects_outcome(tmp_path), final_outcome])
     validator = work_bridge.build_production_ship_validator(
         registry=harness.registry,
         coordinator_root=harness.state_root,

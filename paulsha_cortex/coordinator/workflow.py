@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -222,6 +223,59 @@ def _validate_model_qualification(value: object) -> None:
             raise ValueError(
                 f"workflow run model_qualification[{persona!r}] 非法: {state!r}"
             )
+
+
+MAIN_SYNC_REPAIR_SCHEMA = "cortex-main-sync-repair/v1"
+_MAIN_SYNC_REPAIR_KEYS = frozenset(
+    {
+        "schema",
+        "candidate",
+        "main_head",
+        "stop_main_head",
+        "pin_ref",
+        "evidence_ref",
+        "evidence_hash",
+    }
+)
+_MAIN_SYNC_REPAIR_OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_MAIN_SYNC_REPAIR_PIN_REF_RE = re.compile(
+    r"refs/cortex/main-sync/[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+)
+
+
+def _validate_main_sync_repair(value: object) -> None:
+    """#1142：main-sync retry-build 的 exact-M 綁定。
+
+    retry-build 下達當下 Manager 重新取得的 main（``main_head``）是修復候選必須
+    包含的 commit；停機時 probe 記錄的 M 只留作稽核（``stop_main_head``）。
+    harvest（``manager._verify_main_sync_repair_candidate``）以這份綁定驗證候選
+    是 ``main_head`` 的後代，這裡只驗形狀。
+    """
+
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != _MAIN_SYNC_REPAIR_KEYS:
+        raise ValueError("workflow run main_sync_repair 必須為null或完整綁定")
+    if value["schema"] != MAIN_SYNC_REPAIR_SCHEMA:
+        raise ValueError("workflow run main_sync_repair schema 非法")
+    for key in ("candidate", "main_head", "stop_main_head"):
+        if (
+            not isinstance(value[key], str)
+            or _MAIN_SYNC_REPAIR_OBJECT_ID_RE.fullmatch(value[key]) is None
+        ):
+            raise ValueError(f"workflow run main_sync_repair.{key} 必須為完整小寫 object id")
+    if (
+        not isinstance(value["pin_ref"], str)
+        or _MAIN_SYNC_REPAIR_PIN_REF_RE.fullmatch(value["pin_ref"]) is None
+    ):
+        raise ValueError("workflow run main_sync_repair.pin_ref 非法")
+    if not isinstance(value["evidence_ref"], str) or not value["evidence_ref"].strip():
+        raise ValueError("workflow run main_sync_repair.evidence_ref 必須為非空字串")
+    if (
+        not isinstance(value["evidence_hash"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["evidence_hash"]) is None
+    ):
+        raise ValueError("workflow run main_sync_repair.evidence_hash 格式錯誤")
 
 
 QUOTA_ADMISSION_MODES = frozenset({"shadow", "enforced"})
@@ -890,6 +944,12 @@ class WorkflowRun:
     # 行」，比照 execution_profile_bindings／model_qualification 的加法模式。
     # 缺席（None）＝尚未有任何 reuse 決策，legacy run 天然缺席。
     stage_reuse_receipts: dict[str, dict[str, Any]] | None = None
+    # #1142：main-sync retry-build 的 exact-M 綁定（retry 當下重新取得的 main、
+    # 停機時的 M、pin ref 與 retry evidence）。每次 retry-build 重設：main-sync
+    # 修復寫入新綁定、build phase terminalization 重派沿用、其他 retry 清為 None。
+    # harvest 以它驗證修復候選是 retry 當下 M 的後代。頂層新欄位只在有值時寫出，
+    # 理由同 model_qualification。
+    main_sync_repair: dict[str, str] | None = None
     # 診斷 invariant 家族（#527／#514／#515／#511／#482）：把 run 轉入
     # `needs_human` 的那一刻必須同時落一份結構化理由（`diagnostics.
     # DiagnosticReason` 的 dict 投影：機器可讀 reason ＋ 人可讀 detail ＋ 來源
@@ -1115,6 +1175,7 @@ class WorkflowRun:
         _validate_quota_admission(self.quota_admission)
         _validate_combo_selection(self.combo_selection)
         _validate_stage_reuse_receipts(self.stage_reuse_receipts, self.steps)
+        _validate_main_sync_repair(self.main_sync_repair)
         if self.needs_human_reason is not None:
             # 形狀驗證：DiagnosticReason.from_dict 自己 fail-closed（reason 必須
             # 是 kebab-case 機器碼、detail 非空、source 為 <module>.<function>）。
@@ -1208,6 +1269,8 @@ class WorkflowRun:
             payload["quota_admission"] = {
                 persona: dict(row) for persona, row in self.quota_admission.items()
             }
+        if self.main_sync_repair is not None:
+            payload["main_sync_repair"] = dict(self.main_sync_repair)
         return payload
 
     @classmethod
@@ -1303,6 +1366,7 @@ class WorkflowRun:
             quota_admission=payload.get("quota_admission"),
             combo_selection=payload.get("combo_selection"),
             stage_reuse_receipts=payload.get("stage_reuse_receipts"),
+            main_sync_repair=payload.get("main_sync_repair"),
             # 既有部署的狀態檔沒有這個欄位；缺席時維持 None（facet 有、理由沒有
             # 的 legacy run 照常載入，見上方 __post_init__ 的說明）。facet 已清
             # 掉卻殘留理由的狀態檔（手改／舊版寫壞）在此直接丟掉，避免載入即炸。

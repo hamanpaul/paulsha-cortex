@@ -53,12 +53,25 @@ from .planning import (
     compute_sizing_score,
 )
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
-from .workflow import MODEL_CHAIN_PERSONAS, validate_ship_stage_transition
+from .workflow import (
+    MAIN_SYNC_REPAIR_SCHEMA,
+    MODEL_CHAIN_PERSONAS,
+    validate_ship_stage_transition,
+)
 
 
 MAIN_SYNC_UNAVAILABLE_REASON = "main-sync-unavailable"
 MAIN_SYNC_PROBE_TIMEOUT_SECONDS = 15.0
 MAIN_SYNC_FULL_OBJECT_ID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+#: #1142：retry-build 當下取得的 main 釘在來源樹這條 run-scoped ref 上（不動
+#: `FETCH_HEAD`／`refs/remotes/origin/main`），harvest 驗證前 M 不會被 gc 掉，
+#: 也不會被同一棵來源樹上的其他 fetch 蓋掉。下一次 main-sync retry-build 覆寫它。
+MAIN_SYNC_RETRY_PIN_REF_PREFIX = "refs/cortex/main-sync"
+#: #1142：harvest 先把 bundle 的 branch 收進這條 run-scoped quarantine ref，驗過
+#: 「候選是 retry 當下 M 的後代」才交給 `harvest_branch()` 推進 feature ref。
+MAIN_SYNC_QUARANTINE_REF_PREFIX = "refs/cortex/main-sync-quarantine"
+MAIN_SYNC_RETRY_EVIDENCE_SCHEMA = "cortex-main-sync-retry/v1"
+_MAIN_SYNC_REF_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
 
 @dataclass
@@ -666,14 +679,22 @@ def _run_main_sync_stage(
     argv: tuple[str, ...],
     runner: Callable[..., object],
     timeout_seconds: float,
+    git_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> MainSyncProbeStageOutcome:
-    command = ("git", "-C", str(worktree), *argv)
+    command = (
+        ("git", "-C", str(worktree), *argv)
+        if git_dir is None
+        else ("git", f"--git-dir={git_dir}", *argv)
+    )
+    extra: dict[str, object] = {} if env is None else {"env": dict(env)}
     try:
         completed = runner(
             list(command),
             shell=False,
             capture_output=True,
             timeout=timeout_seconds,
+            **extra,
         )
     except subprocess.TimeoutExpired as exc:
         return MainSyncProbeStageOutcome(
@@ -871,6 +892,68 @@ def _classify_main_sync_conflicts(
     return "conflict"
 
 
+def _main_sync_objects_dir(stdout: bytes) -> Path | None:
+    """`rev-parse --path-format=absolute --git-path objects` 的輸出 → 既存的絕對目錄。"""
+
+    text = stdout.decode("utf-8", errors="surrogateescape")
+    if text.endswith("\n"):
+        text = text[:-1]
+    if not text or "\n" in text or "\0" in text:
+        return None
+    objects_dir = Path(text)
+    if not objects_dir.is_absolute() or not objects_dir.is_dir():
+        return None
+    return objects_dir
+
+
+def _create_isolated_merge_git_dir(*, objects_dir: Path, sha256: bool) -> Path:
+    """#1142：merge-tree 專用、用完即刪的私有 bare GIT_DIR。
+
+    不走 `git init`（template 可能帶 `info/attributes`），直接寫最小 bare repo：
+    HEAD、refs/、只含 `repositoryformatversion`／`bare`（sha256 另加
+    `extensions.objectformat`）的 config，以及指向來源 repo object store 的
+    `objects/info/alternates`——唯讀共用、不複製。沒有 `info/attributes`，沒有
+    工作樹。`tempfile.mkdtemp` 以 0700 建立，呼叫端負責刪除。
+    """
+
+    root = Path(tempfile.mkdtemp(prefix="cortex-main-sync-"))
+    try:
+        (root / "objects" / "info").mkdir(parents=True)
+        (root / "refs" / "heads").mkdir(parents=True)
+        (root / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        config = (
+            "[core]\n"
+            f"\trepositoryformatversion = {1 if sha256 else 0}\n"
+            "\tbare = true\n"
+        )
+        if sha256:
+            config += "[extensions]\n\tobjectformat = sha256\n"
+        (root / "config").write_text(config, encoding="utf-8")
+        (root / "objects" / "info" / "alternates").write_text(
+            f"{objects_dir}\n", encoding="utf-8"
+        )
+    except OSError:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    return root
+
+
+def _main_sync_isolated_git_env() -> dict[str, str]:
+    """#1142：merge-tree 的隔離環境——剝掉呼叫端所有 `GIT_*`，關掉 system／global
+    config 與 system attributes；全域 attributes 檔另以 `-c core.attributesFile`
+    關掉（它的預設值是 XDG 路徑，不隨 `GIT_CONFIG_GLOBAL` 消失）。"""
+
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
+        }
+    )
+    return env
+
+
 def _probe_main_sync(
     *,
     worktree: Path,
@@ -1057,22 +1140,101 @@ def _probe_main_sync(
             raw=dict(raw),
         )
 
-    merge_tree = _run_main_sync_stage(
+    # #1142：merge driver 由 attributes 決定（repo 追蹤的 `.gitattributes` 宣告
+    # `CHANGELOG.md merge=union`），判定只能看 M（目標分支已合入、已審的版本）
+    # 的 tree。`--attr-source=<M>` 只取代工作樹 `.gitattributes`；git 仍會疊上
+    # `$GIT_DIR/info/attributes`、`core.attributesFile`（含 XDG 預設）與 system
+    # attributes，任一處把 README 之類宣告成 union 都能把真衝突矇成 clean。因此
+    # merge-tree 改在用完即刪的私有暫存 GIT_DIR 裡跑：object store 以 alternates
+    # 唯讀共用來源 repo（不複製、merge 結果 tree 只寫進暫存 repo），環境剝掉
+    # 呼叫端的 `GIT_*` 並設 `GIT_CONFIG_NOSYSTEM`／`GIT_CONFIG_GLOBAL=/dev/null`／
+    # `GIT_ATTR_NOSYSTEM`，再以 `-c core.attributesFile=/dev/null` 關掉全域
+    # attributes 檔。任何一步失敗都是 probe failure（`main-sync-unavailable`）。
+    # 需要 git >= 2.43：全域 `--attr-source` 自 2.41 起才有，而 merge-tree 搭配它
+    # 在 2.43 之前會 segfault——舊版一律落成 merge-tree stage failure，fail-closed，
+    # 不會誤判 in-sync。
+    objects_stage = _run_main_sync_stage(
         worktree=worktree,
-        stage="merge-tree",
-        argv=(
-            "merge-tree",
-            "--write-tree",
-            "--name-only",
-            "--no-messages",
-            "-z",
-            f"--merge-base={merge_base_oid}",
-            candidate_oid,
-            main_head,
-        ),
+        stage="merge-tree-objects",
+        argv=("rev-parse", "--path-format=absolute", "--git-path", "objects"),
         runner=runner,
         timeout_seconds=timeout_seconds,
     )
+    raw[objects_stage.stage] = objects_stage
+    if objects_stage.error_kind is not None or objects_stage.returncode != 0:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=objects_stage.stage,
+            outcome=objects_stage,
+            error_kind=_main_sync_command_failure_kind(objects_stage.stage, objects_stage),
+            raw=raw,
+            main_head=main_head,
+        )
+    objects_dir = _main_sync_objects_dir(objects_stage.stdout)
+    if objects_dir is None:
+        raw[objects_stage.stage] = MainSyncProbeStageOutcome(
+            stage=objects_stage.stage,
+            argv=objects_stage.argv,
+            returncode=objects_stage.returncode,
+            stdout=objects_stage.stdout,
+            stderr=objects_stage.stderr,
+            error_kind="output-malformed",
+        )
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=objects_stage.stage,
+            outcome=raw[objects_stage.stage],
+            error_kind="output-malformed",
+            raw=raw,
+            main_head=main_head,
+        )
+    try:
+        isolated_git_dir = _create_isolated_merge_git_dir(
+            objects_dir=objects_dir,
+            sha256=len(main_head) == 64,
+        )
+    except OSError as exc:
+        isolation = MainSyncProbeStageOutcome(
+            stage="merge-tree-isolation",
+            argv=(),
+            returncode=None,
+            stdout=b"",
+            stderr=str(exc).encode("utf-8", errors="replace"),
+            error_kind="isolation-failed",
+        )
+        raw[isolation.stage] = isolation
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=isolation.stage,
+            outcome=isolation,
+            error_kind="isolation-failed",
+            raw=raw,
+            main_head=main_head,
+        )
+    try:
+        merge_tree = _run_main_sync_stage(
+            worktree=worktree,
+            stage="merge-tree",
+            git_dir=isolated_git_dir,
+            env=_main_sync_isolated_git_env(),
+            argv=(
+                "-c",
+                f"core.attributesFile={os.devnull}",
+                f"--attr-source={main_head}",
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                "-z",
+                f"--merge-base={merge_base_oid}",
+                candidate_oid,
+                main_head,
+            ),
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        shutil.rmtree(isolated_git_dir, ignore_errors=True)
     raw[merge_tree.stage] = merge_tree
     if merge_tree.error_kind is not None or merge_tree.returncode not in {0, 1}:
         return _main_sync_failure(
@@ -1188,6 +1350,89 @@ def _main_sync_stop_result(
         "main_sync": payload,
         **evidence,
     }
+
+
+def main_sync_run_ref(prefix: str, run_id: str) -> str:
+    """#1142：main-sync 在來源樹上的 run-scoped ref 名（pin／quarantine 共用推導）。"""
+
+    if (
+        prefix not in {MAIN_SYNC_RETRY_PIN_REF_PREFIX, MAIN_SYNC_QUARANTINE_REF_PREFIX}
+        or not isinstance(run_id, str)
+        or _MAIN_SYNC_REF_SEGMENT_RE.fullmatch(run_id) is None
+    ):
+        raise ValueError("main-sync run ref malformed")
+    return f"{prefix}/{run_id}"
+
+
+@dataclass(frozen=True)
+class MainSyncRetryMain:
+    main_head: str
+    pin_ref: str
+
+
+def fetch_retry_main(
+    *,
+    source_repo: Path,
+    run_id: str,
+    runner: Callable[..., object] = subprocess.run,
+    timeout_seconds: float = MAIN_SYNC_PROBE_TIMEOUT_SECONDS,
+) -> MainSyncRetryMain:
+    """#1142：retry-build 下達當下重新取得 `origin/main`，回傳 exact M 與它的 pin ref。
+
+    停機 evidence 記錄的 M 只代表停機那一刻；活躍 repo 的 main 會繼續前進，鎖住
+    停機時的 M 會讓修復後的候選在下一次 ship probe 必然又落後。這裡以與 ship probe
+    同一組 bounded direct git stage 在 Manager 來源樹 fetch main，但只寫入
+    run-scoped pin ref（`--no-write-fetch-head`＋`--refmap=`：不碰 `FETCH_HEAD`，
+    也不順手更新 `refs/remotes/origin/main`），讓 harvest 驗證前 M 一直可達。
+
+    任何一段失敗都 raise：呼叫端尚未重置 run，run 維持 `needs_human`（fail-closed），
+    不會退回停機時的 M。
+    """
+
+    pin_ref = main_sync_run_ref(MAIN_SYNC_RETRY_PIN_REF_PREFIX, run_id)
+    fetch = _run_main_sync_stage(
+        worktree=source_repo,
+        stage="retry-fetch",
+        argv=(
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--refmap=",
+            "origin",
+            f"+refs/heads/main:{pin_ref}",
+        ),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    if fetch.error_kind is not None or fetch.returncode != 0:
+        raise RuntimeError(
+            "retry-build could not fetch current origin/main "
+            f"(stage=retry-fetch, error_kind="
+            f"{_main_sync_command_failure_kind(fetch.stage, fetch)}, "
+            f"returncode={fetch.returncode})"
+        )
+    resolve = _run_main_sync_stage(
+        worktree=source_repo,
+        stage="retry-main-resolve",
+        argv=("rev-parse", "--verify", "--quiet", f"{pin_ref}^{{commit}}"),
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    if resolve.error_kind is not None or resolve.returncode != 0:
+        raise RuntimeError(
+            "retry-build could not resolve current origin/main "
+            f"(stage=retry-main-resolve, error_kind="
+            f"{_main_sync_command_failure_kind(resolve.stage, resolve)}, "
+            f"returncode={resolve.returncode})"
+        )
+    main_head = _main_sync_object_id(resolve.stdout.decode("ascii", errors="replace"))
+    if main_head is None:
+        raise RuntimeError(
+            "retry-build could not resolve current origin/main "
+            "(stage=retry-main-resolve, error_kind=bad-sha)"
+        )
+    return MainSyncRetryMain(main_head=main_head, pin_ref=pin_ref)
 
 
 def _delivery_closure_phase(
