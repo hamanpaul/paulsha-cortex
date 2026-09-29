@@ -306,6 +306,15 @@ reservation）與 `bound` 兩種狀態，job 進終局時若 binding 可解析�
 `QuotaShadowService.record_terminal_usage()` 記消耗（成功／失敗都記，
 infra／429 失敗不改寫品質分類）。
 
+fanout 消費端 `autonomy.dispatch_ready()` 也使用同一份 `DispatchContext` 與
+`quota_admission.assess_candidate_quota()`／reservation authority；daemon 的
+手動 fanout 與 periodic `run_tick()` 都會傳入 context。shadow 只追加共用
+`AdmissionDecisionStore` receipt，保留既有派工結果；enforce 只在受管候選
+reserve 成功後建立 job、bind 到 job id 再 spawn。#381 `SpawnAdmissionLimiter`
+先行，limiter 拒絕時不會 reserve。額度不足或 reservation 被其他 attempt
+持有時，fanout 回傳 `quota_waits` 結構化等待；periodic tick 每輪以 fresh
+observation 重評，額度足夠後自動續派，reset 時間本身不會解除等待。
+
 同一支 reconcile 的第三步 `manager.harvest_quota_terminal_usage()`（#836）
 在 **shadow 與 enforce 都會執行**：shadow 沒有 reservation 可 settle，受管
 workflow job 的終局 usage 改由這一步依 registry 與 admit receipt 的事實寫進
@@ -317,8 +326,8 @@ profile key 就不記（`skipped` 理由 `no-admit-decision`／
 `ambiguous-admit-decision`）。idempotency key 與 enforce settle 路徑相同
 （`terminal-usage:v1:<job_id>:<metric>:<pool>:<window>`），因此重複 harvest、
 manager 重啟、enforce 已由 `on_settled` 記過，ledger 都只有一份；記到一半
-crash 的缺口下一輪補齊。manager persona 與 autonomy fanout job 沒有 admit
-receipt，不在收割範圍。要真的寫入 ledger，quota-pools 設定檔必須有涵蓋
+crash 的缺口下一輪補齊。manager persona 與沒有 admit receipt 的 legacy job
+不在收割範圍。要真的寫入 ledger，quota-pools 設定檔必須有涵蓋
 job metric 的 `usage_unit_refs`，否則 tick summary 的
 `quota_admission_reconcile.terminal_usage.skipped` 會回
 `usage-unit-mapping-missing`，ledger 不變。

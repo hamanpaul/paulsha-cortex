@@ -632,6 +632,193 @@ def _confirmed_owner_identity(meta: dict, *, slice_id: str) -> dict[str, str] | 
     return {"repo": authority.repo, "work_id": authority.work_id, "slice_id": slice_id}
 
 
+def _fanout_quota_admission(
+    *, context, dispatcher, slice_id: str, persona: str, identity, launcher,
+    quota_waits: list[dict],
+):
+    """Apply the shared #839 assessment/reservation contract to one fanout job."""
+    if context is None:
+        return None, None, None
+    from . import quota_admission
+
+    if isinstance(context, quota_admission.QuotaConfigInvalid):
+        if not quota_admission.quota_admission_enabled():
+            return None, None, None
+        run_id = f"fanout:{slice_id}"
+        registry = getattr(dispatcher, "_registry", None)
+        ordinal = sum(
+            1 for row in (registry.list_jobs() if registry is not None else [])
+            if row.get("task") == slice_id and row.get("persona") == persona
+        )
+        attempt_id = f"{run_id}:{slice_id}:n{ordinal}"
+        profile_key = "quota-admission:no-admissible-candidate"
+        decision_id = quota_admission.decision_id_for(
+            run_id=run_id, card_id=slice_id, attempt_id=attempt_id,
+            profile_key=profile_key, mode="enforced",
+        )
+        decision = quota_admission.AdmissionDecision(
+            decision_id=decision_id, run_id=run_id, card_id=slice_id,
+            attempt_id=attempt_id, profile_key=profile_key, mode="enforced", outcome="wait",
+            policy_version=quota_admission.ADMISSION_POLICY_VERSION,
+            observation_version="not-applicable", demand_version="not-applicable",
+            qualification_version="not-applicable", generated_at_ms=int(time.time() * 1000),
+            reason="quota-config-invalid",
+        )
+        try:
+            store = quota_admission.AdmissionDecisionStore()
+            if store.get(decision_id) is None:
+                store.record(decision)
+        except Exception:
+            pass
+        quota_waits.append({
+            "slice_id": slice_id, "reason": decision.reason,
+            "detail": context.reason, "decision_id": decision_id,
+            "retry_eligible": False, "reset_at_ms": None,
+        })
+        return None, None, decision
+
+    profile_binding = getattr(launcher, "_execution_profile_binding", None)
+    if profile_binding is None or identity is None:
+        return None, None, None
+    registry = getattr(dispatcher, "_registry", None)
+    run_id = f"fanout:{slice_id}"
+    ordinal = sum(
+        1 for row in (registry.list_jobs() if registry is not None else [])
+        if row.get("task") == slice_id and row.get("persona") == persona
+    )
+    base_attempt_id = f"{run_id}:{slice_id}:n{ordinal}"
+    enabled = quota_admission.quota_admission_enabled(context.environment)
+    mode = "enforced" if enabled else "shadow"
+    now_ms = int(time.time() * 1000)
+    assessment, demand_version = quota_admission.assess_candidate_quota(
+        executor=identity.executor, model_id=identity.model_id,
+        independence_domain=getattr(identity, "independence_domain", "unknown"),
+        profile_key=profile_binding.resolved_key, bindings=context.bindings,
+        descriptors=context.descriptors, unit_catalog=context.unit_catalog,
+        shadow=context.shadow, now_ms=now_ms,
+    )
+    observation_version = quota_admission.observation_fingerprint(assessment)
+    attempt_id = base_attempt_id
+    decision_id = quota_admission.decision_id_for(
+        run_id=run_id, card_id=slice_id, attempt_id=attempt_id,
+        profile_key=profile_binding.resolved_key, mode=mode,
+    )
+    reset_at_ms = min(
+        (pool.reset_at_ms for pool in assessment.pools if pool.reset_at_ms is not None),
+        default=None,
+    )
+    if enabled and assessment.pools and not assessment.feasible:
+        decision = quota_admission.AdmissionDecision(
+            decision_id=decision_id, run_id=run_id, card_id=slice_id,
+            attempt_id=attempt_id, profile_key=profile_binding.resolved_key,
+            mode=mode, outcome="wait", policy_version=quota_admission.ADMISSION_POLICY_VERSION,
+            observation_version=observation_version, demand_version=demand_version,
+            qualification_version="not-applicable", generated_at_ms=now_ms,
+            selected=assessment.to_dict(), reason="quota-admission-insufficient",
+            selected_observation_state=assessment.observation_state,
+            selected_feasible=assessment.feasible, selected_binding_kind=assessment.binding_kind,
+            policy_config_revision=context.config_revision,
+            retry_eligible=True, reset_at_ms=reset_at_ms,
+        )
+        try:
+            if context.store.get(decision_id) is None:
+                context.store.record(decision)
+        except Exception:
+            pass
+        quota_waits.append({
+            "slice_id": slice_id, "reason": decision.reason,
+            "detail": "quota observation is insufficient or unknown",
+            "decision_id": decision_id, "retry_eligible": True, "reset_at_ms": reset_at_ms,
+        })
+        return None, assessment, decision
+
+    # A quota wait receipt is immutable for its attempt. When a fresh observation
+    # makes the slice feasible, skip every generation that already holds a wait
+    # receipt — an infeasible wait and a reserve race lost to a workflow card
+    # both leave one — so the admit receipt the job points at is always written
+    # (#1153 review: a job bound to a wait receipt cannot be harvested).
+    if enabled and assessment.pools:
+        for generation in range(quota_admission._MAX_ATTEMPTS_PER_DECISION):
+            candidate_attempt = quota_admission.generation_attempt_id(base_attempt_id, generation)
+            candidate_decision = quota_admission.decision_id_for(
+                run_id=run_id, card_id=slice_id, attempt_id=candidate_attempt,
+                profile_key=profile_binding.resolved_key, mode=mode,
+            )
+            try:
+                prior = context.store.get(candidate_decision)
+            except Exception:
+                prior = None
+            attempt_id, decision_id = candidate_attempt, candidate_decision
+            if prior is None or prior.outcome != "wait":
+                break
+        else:
+            quota_waits.append({
+                "slice_id": slice_id, "reason": "quota-admission-generations-exhausted",
+                "detail": "every attempt generation already holds a wait receipt",
+                "decision_id": decision_id, "retry_eligible": False, "reset_at_ms": reset_at_ms,
+            })
+            return None, assessment, None
+
+    reservation = None
+    if enabled and assessment.pools:
+        if registry is None:
+            raise RuntimeError("quota-admission-requires-job-registry")
+        attempt_id, decision_id, reserved = quota_admission.reserve_for_candidate_with_generation_fallback(
+            context.authority, run_id=run_id, card_id=slice_id,
+            base_attempt_id=attempt_id, profile_key=profile_binding.resolved_key,
+            assessment=assessment, observation_version=observation_version,
+            demand_version=demand_version, lease_ms=context.lease_ms, now_ms=now_ms,
+        )
+        if reserved.status != "granted":
+            reason = (
+                "quota-admission-attempt-held-elsewhere"
+                if reserved.status == "duplicate" else "quota-admission-insufficient"
+            )
+            wait_decision = quota_admission.AdmissionDecision(
+                decision_id=decision_id, run_id=run_id, card_id=slice_id,
+                attempt_id=attempt_id, profile_key=profile_binding.resolved_key,
+                mode=mode, outcome="wait", policy_version=quota_admission.ADMISSION_POLICY_VERSION,
+                observation_version=observation_version, demand_version=demand_version,
+                qualification_version="not-applicable", generated_at_ms=now_ms,
+                selected=assessment.to_dict(), reason=reason,
+                selected_observation_state=assessment.observation_state,
+                selected_feasible=assessment.feasible, selected_binding_kind=assessment.binding_kind,
+                policy_config_revision=context.config_revision,
+                retry_eligible=reason == "quota-admission-insufficient", reset_at_ms=reset_at_ms,
+            )
+            try:
+                if context.store.get(decision_id) is None:
+                    context.store.record(wait_decision)
+            except Exception:
+                pass
+            quota_waits.append({
+                "slice_id": slice_id, "reason": reason,
+                "detail": reserved.reason or reserved.status,
+                "decision_id": decision_id, "retry_eligible": reason == "quota-admission-insufficient",
+                "reset_at_ms": reset_at_ms,
+            })
+            return None, assessment, None
+        reservation = (reserved, attempt_id, decision_id)
+    decision = quota_admission.AdmissionDecision(
+        decision_id=decision_id, run_id=run_id, card_id=slice_id, attempt_id=attempt_id,
+        profile_key=profile_binding.resolved_key, mode=mode, outcome="admit",
+        policy_version=quota_admission.ADMISSION_POLICY_VERSION,
+        observation_version=observation_version, demand_version=demand_version,
+        qualification_version="not-applicable", generated_at_ms=now_ms,
+        selected=assessment.to_dict(),
+        reservation_id=reservation[0].reservation_id if reservation else None,
+        selected_observation_state=assessment.observation_state,
+        selected_feasible=assessment.feasible, selected_binding_kind=assessment.binding_kind,
+        policy_config_revision=context.config_revision,
+    )
+    try:
+        if context.store.get(decision_id) is None:
+            context.store.record(decision)
+    except Exception:
+        pass
+    return reservation, assessment, decision
+
+
 def dispatch_ready(
     metas: list[dict],
     is_satisfied: IsSatisfied,
@@ -645,6 +832,8 @@ def dispatch_ready(
     spawn_admission: SpawnAdmissionLimiter | None = None,
     *,
     backoff_skips: list[dict] | None = None,
+    quota_admission_context=None,
+    quota_waits: list[dict] | None = None,
 ) -> list[dict]:
     """算就緒集，對每單位經注入的 headless AgentLauncher 各啟一個 agent（一單位一 job）。
 
@@ -687,6 +876,7 @@ def dispatch_ready(
     runner = git_runner or _default_git_runner
     resolved_identity_registry = identity_registry
     limiter = resolve_limiter(spawn_admission)
+    quota_wait_rows = quota_waits if quota_waits is not None else []
     jobs: list[dict] = []
     errors: list[tuple[str, Exception]] = []
     for m in ready:
@@ -705,6 +895,11 @@ def dispatch_ready(
         launched = False
         written_dispatch_base: str | None = None
         attempt_id = uuid4().hex
+        quota_reservation = None
+        quota_profile_binding = None
+        quota_decision = None
+        quota_reservation_sequence = None
+        quota_bound = False
         owner_identity = None
         try:
             # 若 spec 要求 owner binding，先確認 WorkAuthority；錯誤時不得 pin
@@ -763,6 +958,32 @@ def dispatch_ready(
                 meta=m,
                 launcher=active_launcher,
             )
+            if (
+                quota_admission_context is not None
+                and not hasattr(quota_admission_context, "reason")
+                and identity is None
+                and resolved_executor is not None
+                and resolved_model_id is not None
+            ):
+                from . import quota_admission
+
+                if resolved_identity_registry is None:
+                    resolved_identity_registry = load_model_identities()
+                identity = resolved_identity_registry.get(resolved_executor, resolved_model_id)
+                if identity is not None:
+                    # Resolve the same profile key without adding a dispatch gate
+                    # to the legacy fanout path.
+                    try:
+                        from .execution_adapters import make_launcher_profile
+                        active_launcher._execution_profile_binding = make_launcher_profile(
+                            active_launcher, identity, persona,
+                        )
+                    except Exception:
+                        if quota_admission.quota_admission_enabled(
+                            getattr(quota_admission_context, "environment", None)
+                        ):
+                            raise
+                        identity = None
             coordinator_root = _dispatcher_coordinator_root(dispatcher)
             if (
                 identity_diagnostic is None
@@ -850,34 +1071,7 @@ def dispatch_ready(
             except Exception:
                 dispatch_head = None
             log_dir = str(Path("runtime/dispatch") / slice_id)
-            # 在 launch 前先落地 registry row：Popen 之後、記錄完成之前若 daemon
-            # 崩潰，仍有可回收的 job 列（否則 agent 在跑卻無 job / in_flight / 輪詢）。
-            job = _record_launching_job(
-                dispatcher=dispatcher,
-                slice_id=slice_id,
-                persona=persona,
-                worktree=worktree,
-                dispatch_head=dispatch_head,
-                # #469：spec frontmatter 顯式宣告的 repo 歸屬（未宣告 → None，
-                # 不推斷）；寫進 job record 既有 workflow_repo 欄，終局 manifest
-                # 與 slices/attention 讀取端（#465/#349）即可投影。
-                workflow_repo=m.get("repo"),
-                owner_identity=owner_identity,
-                attempt_id=attempt_id,
-                # #503：attestation——這顆 job 實際拿到的 spec／plan 就是這兩個 hash。
-                spec_hash=str(pinned_inputs["spec_hash"]),
-                plan_hash=str(pinned_inputs["plan_hash"]),
-            )
-            _mark_slice_building(
-                dispatcher=dispatcher,
-                slice_id=slice_id,
-                builder_job_id=job.get("job_id"),
-                dispatch_base=base_sha or dispatch_head,
-            )
-            if base_sha or dispatch_head:
-                written_dispatch_base = base_sha or dispatch_head
-            # #381：真正 spawn 前才 admit——記錄下這次要用的 job row 之後、
-            # Popen 之前，讓等待時間不計入「job 已在跑」的錯覺。
+            # #381 limiter 在 quota reserve 前；limiter 拒絕時不會留下 reservation。
             limiter.admit(
                 # spawn admission 的 provider 分桶沿用 spec 的 executor 字面值
                 # （todo 非目標：不改 spawn_admission 節流語意）；identity 不完整時
@@ -892,6 +1086,50 @@ def dispatch_ready(
                     launcher=active_launcher,
                 )
             )
+            quota_reservation, _quota_assessment, quota_decision = _fanout_quota_admission(
+                context=quota_admission_context, dispatcher=dispatcher, slice_id=slice_id,
+                persona=persona, identity=identity, launcher=active_launcher,
+                quota_waits=quota_wait_rows,
+            )
+            quota_profile_binding = getattr(active_launcher, "_execution_profile_binding", None)
+            if quota_decision is not None and quota_decision.outcome == "wait":
+                continue
+            # 在 launch 前先落地 job row；Popen 後 crash 時仍可供 poll/reconcile 回收。
+            job = _record_launching_job(
+                dispatcher=dispatcher, slice_id=slice_id, persona=persona,
+                worktree=worktree, dispatch_head=dispatch_head, workflow_repo=m.get("repo"),
+                owner_identity=owner_identity, attempt_id=attempt_id,
+                spec_hash=str(pinned_inputs["spec_hash"]), plan_hash=str(pinned_inputs["plan_hash"]),
+                quota_decision_id=quota_decision.decision_id if quota_decision else None,
+            )
+            if quota_reservation is not None:
+                reserved, quota_attempt, _decision_id = quota_reservation
+                quota_reservation_sequence = reserved.sequence
+                bound = quota_admission_context.authority.bind(
+                    reservation_id=reserved.reservation_id, owner_token=reserved.owner_token,
+                    attempt_id=quota_attempt, job_id=job["job_id"],
+                    expected_sequence=reserved.sequence, now_ms=int(time.time() * 1000),
+                )
+                if (
+                    bound.status == "conflict" and bound.reason == "sequence-mismatch"
+                    and bound.state == "reserved"
+                ):
+                    quota_reservation_sequence = bound.sequence
+                    bound = quota_admission_context.authority.bind(
+                        reservation_id=reserved.reservation_id, owner_token=reserved.owner_token,
+                        attempt_id=quota_attempt, job_id=job["job_id"],
+                        expected_sequence=bound.sequence, now_ms=int(time.time() * 1000),
+                    )
+                if bound.status not in ("ok", "duplicate"):
+                    raise RuntimeError(f"quota-reservation-bind-{bound.status}")
+                quota_reservation_sequence = bound.sequence
+                quota_bound = True
+            _mark_slice_building(
+                dispatcher=dispatcher, slice_id=slice_id,
+                builder_job_id=job.get("job_id"), dispatch_base=base_sha or dispatch_head,
+            )
+            if base_sha or dispatch_head:
+                written_dispatch_base = base_sha or dispatch_head
             handle = active_launcher.launch(
                 slice_id=slice_id,
                 prompt=prompt,
@@ -902,6 +1140,36 @@ def dispatch_ready(
             job = _attach_launch_handle(dispatcher=dispatcher, job=job, handle=handle)
             jobs.append(job)
         except Exception as exc:
+            if quota_reservation is not None:
+                from . import quota_admission
+                reserved, quota_attempt, _decision_id = quota_reservation
+                try:
+                    if quota_bound and job is not None:
+                        settled = quota_admission.settle_reservation_after_spawn_failure(
+                            quota_admission_context.authority,
+                            reservation_id=reserved.reservation_id,
+                            owner_token=reserved.owner_token, attempt_id=quota_attempt,
+                            expected_sequence=bound.sequence, now_ms=int(time.time() * 1000),
+                            note=f"{type(exc).__name__}: {exc}",
+                        )
+                        registry = getattr(dispatcher, "_registry", None)
+                        if settled.status in ("ok", "duplicate") and registry is not None:
+                            from . import manager as manager_module
+                            manager_module._quota_admission_record_terminal_usage(
+                                quota_admission_context, profile_key=quota_profile_binding.resolved_key,
+                                job=registry.get_job(job["job_id"]), now_ms=int(time.time() * 1000),
+                            )
+                    elif not quota_bound:
+                        quota_admission.release_reservation_before_spawn(
+                            quota_admission_context.authority,
+                            reservation_id=reserved.reservation_id,
+                            owner_token=reserved.owner_token, attempt_id=quota_attempt,
+                            expected_sequence=quota_reservation_sequence or reserved.sequence,
+                            now_ms=int(time.time() * 1000),
+                            reason="fanout-fail-before-spawn",
+                        )
+                except Exception:
+                    pass
             if pinned_inputs is not None and not slice_recorded and snapshot is None:
                 try:
                     _record_pending_slice(
@@ -1212,6 +1480,7 @@ def _record_launching_job(
     attempt_id: str | None = None,
     spec_hash: str | None = None,
     plan_hash: str | None = None,
+    quota_decision_id: str | None = None,
 ) -> dict:
     """Persist the job row *before* launch (handle fields filled in later)."""
     registry = getattr(dispatcher, "_registry", None)
@@ -1229,6 +1498,7 @@ def _record_launching_job(
             "workflow_repo": workflow_repo,
             "spec_hash": spec_hash,
             "plan_hash": plan_hash,
+            "quota_decision_id": quota_decision_id,
         }
         if owner_identity is not None:
             job["owner_identity"] = owner_identity
@@ -1239,6 +1509,7 @@ def _record_launching_job(
         if owner_identity is not None
         else {}
     )
+    extra_quota = {"quota_decision_id": quota_decision_id} if quota_decision_id else {}
     return registry.create_job(
         task=slice_id,
         persona=persona,
@@ -1258,6 +1529,7 @@ def _record_launching_job(
         # #503：builder 實際拿到的 pinned inputs（完成側據此對照 slice 釘住的值）。
         spec_hash=spec_hash,
         plan_hash=plan_hash,
+        **extra_quota,
     )
 
 

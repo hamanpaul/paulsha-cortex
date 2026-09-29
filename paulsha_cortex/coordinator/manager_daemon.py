@@ -1315,6 +1315,7 @@ def build_request_executor(
                 metas, handoff_dir=request_handoff_dir, registry=getattr(dispatcher, "_registry", None)
             )
             backoff_skips: list[dict[str, Any]] = []
+            quota_waits: list[dict[str, Any]] = []
             jobs = _call_with_supported_kwargs(
                 dispatch_ready_fn,
                 fanout_metas,
@@ -1328,8 +1329,10 @@ def build_request_executor(
                 launcher_factory=builder_launcher_factory,
                 spawn_admission=spawn_admission,
                 backoff_skips=backoff_skips,
+                quota_admission_context=_quota_admission_context_for(),
+                quota_waits=quota_waits,
             )
-            return {
+            result = {
                 "dispatch_skipped": False,
                 "dispatch_skipped_by_backoff": backoff_skips,
                 "dispatched": jobs,
@@ -1337,6 +1340,9 @@ def build_request_executor(
                 "errors": [],
                 "reaped": None,
             }
+            if quota_waits:
+                result["quota_waits"] = quota_waits
+            return result
         run_tick_kwargs = {
             "metas": metas,
             "launcher": active_launcher,
@@ -1349,6 +1355,7 @@ def build_request_executor(
             "identity_registry": builder_identity_registry,
             "launcher_factory": builder_launcher_factory,
             "spawn_admission": spawn_admission,
+            "quota_admission_context": _quota_admission_context_for(),
         }
         if requested_review_executor is not None or requested_review_model is not None:
             run_tick_kwargs.update(
@@ -1436,6 +1443,7 @@ def build_periodic_tick_runner(
         planning_transaction_error: str | None = None
         quota_admission_error: str | None = None
         quota_admission_reconcile: dict[str, Any] | None = None
+        quota_admission_ctx = _quota_admission_context_for()
         if registry is not None and hasattr(registry, "list_workflow_runs"):
             state_path = getattr(registry, "_state_path", None)
             coordinator_root = (
@@ -1462,7 +1470,6 @@ def build_periodic_tick_runner(
             # #839 production 接線 b：本輪 tick 內所有 resume 呼叫與稍後的
             # reserved／bound 收斂掃描（c）共用同一個 context——同一次讀檔／
             # 解析結果，不必每個 workflow 各自重建。
-            quota_admission_ctx = _quota_admission_context_for()
             for workflow in registry.list_workflow_runs():
                 if (
                     workflow.status != "ongoing"
@@ -1620,6 +1627,7 @@ def build_periodic_tick_runner(
                 identity=identity,
             ),
             "spawn_admission": spawn_admission,
+            "quota_admission_context": quota_admission_ctx,
         }
         if default_review_executor is not None or default_review_model is not None:
             run_tick_kwargs.update(
