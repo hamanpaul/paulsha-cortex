@@ -87,7 +87,6 @@
 - [x] 5.4 由 #839 完成候選 fallback，並由 #1174 補齊 supersession 與 artifact preservation：operator 以 actor/reason 和 exact run/candidate/claim-era/job CAS 明示授權；舊 job 仍 active 時 fail-closed 拒絕，不假稱底層 process 已停止；舊 job terminal 後以 append-only audit 與單次 registry update 重開精確卡片，保留舊 job、stage receipt、evidence 與 artifact 原樣，後續由正常 Manager tick 派工。正式 work/recover 入口、#843 R02/R03 matrix、replay/crash 與 CAS 測試見 `tests/test_recovery_action_supersession_1174.py`、`tests/test_recovery_action_state_matrix_843.py`。
 - [ ] 5.5 由 #843 補 R07 recovery matrix 與 exact-run/card CAS、late evidence、重送冪等、abandon owner-aware 資源處置；#497/#547/#577等原producer缺陷仍須修正。
 - [ ] 5.6 通過計畫 12 個 quota/profile 場景，再有限 opt-in canary；保留 legacy policy 回復路徑與 receipts。
-  - [x] 5.6.1 #1198 docs-only：新增 quota admission enforce 操作手冊，記錄開關、觀測新鮮度、wait 恢復、rollback 與 evidence 查核；12 個場景與 live canary 尚未執行，母項 5.6 維持未完成。
 - [ ] 5.7 由 #844 完成 production stage reuse 的同run/claim-era安全cohort與可信採信；跨run新採信未支援需列管，不能以相同key改寫舊evidence。
 
 ## 6. B5 狀態與部署
