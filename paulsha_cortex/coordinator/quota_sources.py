@@ -19,9 +19,9 @@ from . import quota_observation as schema
 
 _PROFILE_KEY_RE = re.compile(r"epk:v1:resolved:[0-9a-f]{64}\Z")
 _RESOURCE_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
-_CODEX_UNIT = "provider:openai-codex-app-server/rate-limit-percent/v2"
-_COPILOT_UNIT = "provider:github-copilot-sdk/requests/v1"
-_AGY_UNIT = "provider:google-antigravity-cli/quota-fraction/v1"
+CODEX_UNIT_SEMANTICS = "provider:openai-codex-app-server/rate-limit-percent/v2"
+COPILOT_UNIT_SEMANTICS = "provider:github-copilot-sdk/requests/v1"
+AGY_UNIT_SEMANTICS = "provider:google-antigravity-cli/quota-fraction/v1"
 _TIME_MAX_MS = 253402300799999
 _DURATION_MAX_MS = 31622400000
 
@@ -58,21 +58,21 @@ def provider_read_contract(executor: str) -> dict[str, object]:
             "method": "account/rateLimits/read",
             "source_schema": "openai-codex-app-server-rate-limits-v2",
             "authority_ref": "https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/account.rs",
-            "unit_semantics_ref": _CODEX_UNIT,
+            "unit_semantics_ref": CODEX_UNIT_SEMANTICS,
         },
         "copilot": {
             "state": "supported",
             "method": "account.getQuota",
             "source_schema": "github-copilot-sdk-quota-v1",
             "authority_ref": "https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/usage-and-billing",
-            "unit_semantics_ref": _COPILOT_UNIT,
+            "unit_semantics_ref": COPILOT_UNIT_SEMANTICS,
         },
         "agy": {
             "state": "supported",
             "argv": ("agy", "-p", "/usage", "--output-format", "json"),
             "source_schema": "google-antigravity-cli-usage-v1",
             "authority_ref": "https://antigravity.google/docs/cli/commands/usage",
-            "unit_semantics_ref": _AGY_UNIT,
+            "unit_semantics_ref": AGY_UNIT_SEMANTICS,
         },
         "claude": {
             "state": "unsupported",
@@ -328,7 +328,7 @@ def _codex_window_value(
             ))
             or expected is None):
         return (None, None, "invalid-provider-value")
-    if _target_semantics(target) != _CODEX_UNIT:
+    if _target_semantics(target) != CODEX_UNIT_SEMANTICS:
         return (None, None, "provider-unit-mapping-mismatch")
 
     reset_at_ms = None if reset_seconds is None else reset_seconds * 1000
@@ -439,7 +439,7 @@ def _parse_copilot(payload: dict[str, Any], targets):
                 or entitlement < 0 or used < 0 or used > entitlement):
             result[target.resource_key] = (None, None, "invalid-provider-value")
             continue
-        if _target_semantics(target) != _COPILOT_UNIT:
+        if _target_semantics(target) != COPILOT_UNIT_SEMANTICS:
             result[target.resource_key] = (None, None, "provider-unit-mapping-mismatch")
             continue
         reset_at = _parse_iso_epoch_ms(row.get("resetDate"))
@@ -486,7 +486,7 @@ def _parse_agy(payload: dict[str, Any], targets):
         if value < 0 or value > 1:
             result[target.resource_key] = (None, None, "invalid-provider-value")
             continue
-        if _target_semantics(target) != _AGY_UNIT:
+        if _target_semantics(target) != AGY_UNIT_SEMANTICS:
             result[target.resource_key] = (None, None, "provider-unit-mapping-mismatch")
             continue
         reset_at = _parse_iso_epoch_ms(row.get("reset_time"))
