@@ -17,6 +17,7 @@ import tempfile
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import (
     TYPE_CHECKING,
@@ -2857,6 +2858,20 @@ class InstallReceipt:
             )
         if payload.get("effective_receipt_path") != str(path):
             raise InstallError(f"receipt effective path binding is invalid: {path}")
+        parent = payload.get("parent_receipt")
+        if parent is not None and (
+            not isinstance(parent, Mapping)
+            or set(parent) != {"path", "receipt_id", "plan_sha256"}
+            or not isinstance(parent.get("path"), str)
+            or not Path(str(parent.get("path"))).is_absolute()
+            or ".." in Path(str(parent.get("path"))).parts
+            or parent.get("path") == str(path)
+            or not isinstance(parent.get("receipt_id"), str)
+            or not parent.get("receipt_id")
+            or not _valid_sha256(parent.get("plan_sha256"))
+            or plan.get("legacy_adoption") is not None
+        ):
+            raise InstallError(f"receipt predecessor link is invalid: {path}")
         if expected_plan is not None and canonical_plan_bytes(plan) != canonical_plan_bytes(
             expected_plan
         ):
@@ -3115,9 +3130,23 @@ _QUARANTINE_PRIOR_KEYS = ("type", "uid", "gid", "mode", "dev", "ino")
 _QUARANTINE_ENTRY_KEYS = frozenset(
     {"step_id", "step", "status", "prior", "quarantine_authority"}
 )
+_QUARANTINE_IDENTITY_KEYS = frozenset({"device", "inode", "type", "tree_sha256"})
 #: Set on a prepared quarantine entry whose move took another object into
 #: quarantine and could not move it back: that object is never legacy.
 _QUARANTINE_UNEXPECTED = "quarantine_unexpected"
+
+
+def _valid_quarantine_identity(value: object) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value) == _QUARANTINE_IDENTITY_KEYS
+        and type(value.get("device")) is int
+        and value["device"] >= 0  # type: ignore[operator]
+        and type(value.get("inode")) is int
+        and value["inode"] > 0  # type: ignore[operator]
+        and value.get("type") in {"directory", "file", "symlink"}
+        and _valid_sha256(value.get("tree_sha256"))
+    )
 
 
 def _quarantine_step_expected(step: Mapping[str, object]) -> Mapping[str, object]:
@@ -3289,9 +3318,14 @@ def _validate_receipt_legacy_provenance(
             unexpected = entry.get(_QUARANTINE_UNEXPECTED)
             if (
                 record is None
-                or set(entry) - {_QUARANTINE_UNEXPECTED} != _QUARANTINE_ENTRY_KEYS
+                or set(entry) - {_QUARANTINE_UNEXPECTED, "quarantine_identity"}
+                != _QUARANTINE_ENTRY_KEYS
                 or entry.get("prior") != _quarantine_prior(step)
                 or not _quarantine_authority_matches(entry.get("quarantine_authority"), step)
+                or (
+                    "quarantine_identity" in entry
+                    and not _valid_quarantine_identity(entry.get("quarantine_identity"))
+                )
                 or (
                     _QUARANTINE_UNEXPECTED in entry
                     and (
@@ -5676,10 +5710,22 @@ def _apply_legacy_quarantine(
     if isinstance(entry, dict):
         if entry.get("status") == "completed":
             if _quarantine_moved_exact(step, state):
+                if "quarantine_identity" not in entry:
+                    identity_reader = getattr(backend, "legacy_quarantine_identity", None)
+                    if callable(identity_reader):
+                        entry["quarantine_identity"] = identity_reader(
+                            Path(str(step["destination"]))
+                        )
+                        receipt._persist()
                 return
             raise InstallDriftError(f"completed legacy quarantine drifted: {step_id}")
         if _quarantine_moved_exact(step, state):
             entry["status"] = "completed"
+            identity_reader = getattr(backend, "legacy_quarantine_identity", None)
+            if callable(identity_reader):
+                entry["quarantine_identity"] = identity_reader(
+                    Path(str(step["destination"]))
+                )
             receipt._persist()
             return
         authority = entry.get("quarantine_authority")
@@ -5727,6 +5773,9 @@ def _apply_legacy_quarantine(
     if not _quarantine_moved_exact(step, dict(backend.inspect_step(step))):
         raise InstallDriftError(f"legacy quarantine did not reach its destination: {step_id}")
     entry["status"] = "completed"
+    identity_reader = getattr(backend, "legacy_quarantine_identity", None)
+    if callable(identity_reader):
+        entry["quarantine_identity"] = identity_reader(Path(str(step["destination"])))
     receipt._persist()
 
 
@@ -5918,6 +5967,14 @@ def apply_plan(
     )
     if prior_receipt is not None:
         validate_prior_receipt_handoff(plan, prior_receipt)
+        if prior_receipt.path is not None:
+            parent_document = prior_receipt.to_dict()
+            receipt._document["parent_receipt"] = {
+                "path": str(prior_receipt.path),
+                "receipt_id": parent_document.get("receipt_id"),
+                "plan_sha256": parent_document.get("plan_sha256"),
+            }
+            receipt._persist()
     covered = _pending_quarantine_paths(steps, receipt)
     facts = backend.preflight_facts(plan)
     report = validate_preflight(
@@ -8402,6 +8459,12 @@ def verify_receipt(
     atomic_write_json(evidence_path.absolute(), evidence, mode=0o600)
     receipt._document["activated"] = report.ok
     receipt._document["qualified"] = report.ok
+    if report.ok:
+        receipt._document["qualified_at"] = datetime.now(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+    else:
+        receipt._document.pop("qualified_at", None)
     if not report.ok and service_controller is not None:
         stop_failures: list[str] = []
         for service in reversed(_SERVICE_ORDER):

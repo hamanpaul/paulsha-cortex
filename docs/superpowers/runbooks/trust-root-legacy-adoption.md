@@ -149,7 +149,26 @@ legacy 的 credential 已在 quarantine 內，可直接以 quarantine 內的檔�
 
 ## 9. quarantine 的保留
 
-quarantine 內的 legacy 物件保留到**後繼的 qualified receipt 成立後至少 30 天**。在那之前不得刪除；自動 purge 指令尚未提供，需要清理時另行開票，以後繼 receipt 與日期為前提人工處理。
+quarantine 內的 legacy 物件保留到**receipt chain 驗證出的後繼 applied＋qualified receipt 成立後至少 30 天**。qualified 時間取 receipt 明確記錄的 `qualified_at`，不以檔案時間推測；舊 receipt 若沒有 predecessor link 或 qualified timestamp，該次 adoption 會列為保留。
+
+先產生 dry-run 報告，確認將刪除、保留與 drift 項目：
+
+```bash
+"$cortex_cli" install trust-root legacy purge \
+  --receipt /var/lib/cortex-installer/<state>-install-receipts/<adoption-plan-sha256>.json \
+  --report /var/lib/cortex-installer/legacy-purge-report.json
+```
+
+只有報告列為 `delete` 的項目會進入刪除。人工審閱報告後，將報告輸出的 `report_sha256` 原值帶入確認；執行會重算報告並在 receipt transaction lock 下再次核對：
+
+```bash
+"$cortex_cli" install trust-root legacy purge \
+  --receipt /var/lib/cortex-installer/<state>-install-receipts/<adoption-plan-sha256>.json \
+  --report /var/lib/cortex-installer/legacy-purge-report.json \
+  --confirm-sha256 <report_sha256>
+```
+
+每個物件會先移入 quarantine root 下的私有 discard staging，再驗 inode、樹 digest、掛載點與檔案系統邊界；驗證失敗會保留並記為 drift。完成或 pending 的結果會追加到 adoption receipt 的 `legacy_purge_journal`。不要手動刪除報告中的保留項目或 staging 內容。
 
 ## 10. 已知限制
 

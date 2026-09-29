@@ -30,7 +30,7 @@
 - [x] 3.5 receipt 欄位與 `InstallReceipt.load` 驗證；`_entry_has_adoption_provenance` 收斂
 - [x] 3.6 rollback 搬回 quarantine、`daemon-reload`、重新擷取證明 `legacy_restored`、納入 `restore_safe`
 - [x] 3.7 以 adoption receipt 作為 `--prior-receipt` 的升級測試
-- [ ] 3.8 purge 指令：需後繼 qualified receipt 且滿 30 天
+- [x] 3.8 purge 指令：需 receipt chain 驗證的後繼 applied＋qualified receipt 且滿 30 天；dry-run digest 確認、drift 保留與安全 staging 刪除
 
 ## 4. RC qualification
 

@@ -1,0 +1,1 @@
+- 新增 trust-root legacy quarantine purge，以 receipt chain、qualified 時間及 inode／樹 digest 驗證決定保留或清除，並以 dry-run 報告 digest 確認刪除。

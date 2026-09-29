@@ -3121,6 +3121,114 @@ def _created_tree_identity(path: Path) -> dict[str, object]:
         os.close(parent_fd)
 
 
+def _legacy_quarantine_identity(path: Path) -> dict[str, object]:
+    """Capture a no-follow inode and content identity for a quarantined object."""
+
+    parent_fd = _open_path_chain(path.parent)
+    try:
+        observed = _stat_at(parent_fd, path.name)
+        if observed is None:
+            raise InstallDriftError(f"quarantined object is missing: {path}")
+        kind = _file_type_name(observed.st_mode)
+        if kind == "directory":
+            digest, manifest = _tree_digest_at(parent_fd, path.name)
+            if manifest.get("") != (observed.st_dev, observed.st_ino, kind):
+                raise InstallDriftError(f"quarantined object changed while hashed: {path}")
+        elif kind == "file":
+            digest = _sha256_at(parent_fd, path.name, observed)
+        elif kind == "symlink":
+            digest = hashlib.sha256(
+                os.readlink(path.name, dir_fd=parent_fd).encode("utf-8", "surrogateescape")
+            ).hexdigest()
+        else:
+            raise InstallDriftError(f"unsupported quarantined object type at {path}: {kind}")
+        return {
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+            "type": kind,
+            "tree_sha256": digest,
+        }
+    finally:
+        os.close(parent_fd)
+
+
+def _discard_legacy_quarantine(
+    path: Path,
+    identity: Mapping[str, object],
+    *,
+    quarantine_root: Path,
+    key: str,
+) -> None:
+    """Stage, revalidate, and remove exactly one receipt-bound quarantine object."""
+
+    if (
+        type(identity.get("device")) is not int
+        or type(identity.get("inode")) is not int
+        or identity.get("type") not in {"directory", "file", "symlink"}
+        or not isinstance(identity.get("tree_sha256"), str)
+    ):
+        raise InstallDriftError(f"no purge identity binds the quarantined object at {path}")
+    staging = _discard_staging_path(quarantine_root, key)
+    parent_fd = _open_path_chain(path.parent)
+    try:
+        staging_fd = _open_quarantine_chain(staging, quarantine_root, create=True)
+        assert staging_fd is not None
+        try:
+            observed = _stat_at(parent_fd, path.name)
+            if observed is None:
+                raise InstallDriftError(f"quarantined object disappeared before purge: {path}")
+            if (observed.st_dev, observed.st_ino, _file_type_name(observed.st_mode)) != (
+                identity["device"], identity["inode"], identity["type"]
+            ):
+                raise InstallDriftError(f"{path} no longer matches its adoption inode; kept")
+            if _mount_id(parent_fd) != _mount_id(staging_fd):
+                raise InstallDriftError(
+                    f"{path} and private discard staging are on different mounts; kept"
+                )
+            _stage_for_discard(
+                parent_fd=parent_fd,
+                path=path,
+                staging=staging,
+                staging_fd=staging_fd,
+                leaf="tree",
+                device=observed.st_dev,
+            )
+            staged = _stat_at(staging_fd, "tree")
+            try:
+                actual = _legacy_quarantine_identity(staging / "tree")
+                if staged is None or actual != dict(identity):
+                    raise InstallDriftError(f"{path} changed during purge staging; kept")
+                if identity["type"] == "directory":
+                    digest, manifest = _tree_digest_at(staging_fd, "tree")
+                    if digest != identity["tree_sha256"]:
+                        raise InstallDriftError(f"{path} tree digest drifted; kept")
+                    _remove_verified_tree(staging_fd, "tree", manifest)
+                else:
+                    current = _stat_at(staging_fd, "tree")
+                    if current is None or (current.st_dev, current.st_ino) != (
+                        identity["device"], identity["inode"]
+                    ):
+                        raise InstallDriftError(f"{path} inode changed in staging; kept")
+                    os.unlink("tree", dir_fd=staging_fd)
+                os.fsync(staging_fd)
+            except BaseException as exc:
+                if _stat_at(staging_fd, "tree") is not None:
+                    restored = _restore_from_discard(
+                        parent_fd=parent_fd,
+                        path=path,
+                        staging=staging,
+                        staging_fd=staging_fd,
+                        leaf="tree",
+                        problem=str(exc),
+                    )
+                    raise restored from exc
+                raise
+        finally:
+            os.close(staging_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def _discard_staging_path(quarantine_root: Path, key: str) -> Path:
     """The installer-owned private staging for one discard: ``<root>/.discard/<hash>``."""
 
@@ -3629,6 +3737,21 @@ class LocalInstallBackend:
         if step.get("kind") != "venv":
             raise InstallPlanError("venv activation inspection requires a venv step")
         return _venv_activation_state(step)
+
+    def legacy_quarantine_identity(self, path: Path) -> Mapping[str, object]:
+        return _legacy_quarantine_identity(path)
+
+    def discard_legacy_quarantine(
+        self,
+        path: Path,
+        identity: Mapping[str, object],
+        *,
+        quarantine_root: Path,
+        key: str,
+    ) -> None:
+        _discard_legacy_quarantine(
+            path, identity, quarantine_root=quarantine_root, key=key
+        )
 
     def inspect_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
         if step.get("kind") == "legacy-quarantine":

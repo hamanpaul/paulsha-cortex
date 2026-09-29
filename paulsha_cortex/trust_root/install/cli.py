@@ -56,6 +56,7 @@ from .core import (
     validate_prior_receipt_handoff,
     verify_receipt,
 )
+from .legacy_purge import build_legacy_purge_report, purge_legacy_entries
 
 
 _TRUST_ROOT_LOCK_ROOT = Path("/run/paulsha-cortex-trust-root")
@@ -758,6 +759,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "show", help="print a review summary of a legacy inventory"
     )
     legacy_show.add_argument("--inventory", required=True)
+    legacy_purge = legacy_sub.add_parser(
+        "purge", help="report or purge adoption quarantine after a qualified upgrade"
+    )
+    legacy_purge.add_argument("--receipt", required=True, help="legacy adoption receipt")
+    legacy_purge.add_argument(
+        "--receipts-dir", help="receipt directory to inspect for linked successors"
+    )
+    legacy_purge.add_argument("--report", required=True, help="report file to write/read")
+    legacy_purge.add_argument(
+        "--confirm-sha256", help="digest printed by the matching dry-run report"
+    )
     return parser
 
 
@@ -1353,6 +1365,39 @@ def _legacy_show_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _legacy_purge_command(args: argparse.Namespace) -> int:
+    _require_root()
+    receipt_path = Path(args.receipt).expanduser().absolute()
+    receipts_dir = (
+        Path(args.receipts_dir).expanduser().absolute()
+        if args.receipts_dir
+        else receipt_path.parent
+    )
+    report_path = Path(args.report).expanduser().absolute()
+    report = build_legacy_purge_report(receipt_path, receipts_dir=receipts_dir)
+    if args.confirm_sha256 is None:
+        atomic_write_json(report_path, report, mode=0o600)
+        _emit(report)
+        return 0
+    if args.confirm_sha256 != report.get("report_sha256"):
+        raise InstallPlanError("--confirm-sha256 does not match the current purge report")
+    try:
+        recorded = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise InstallPlanError(f"cannot read purge report {report_path}: {exc}") from exc
+    if recorded != report:
+        raise InstallPlanError("purge report file does not match the current report")
+    with _locked_receipt(receipt_path) as (receipt, _plan):
+        locked_report = build_legacy_purge_report(
+            receipt_path, receipts_dir=receipts_dir
+        )
+        if locked_report != report:
+            raise InstallPlanError("purge eligibility changed after the report was written")
+        results = purge_legacy_entries(receipt, locked_report)
+    _emit({"report_sha256": report["report_sha256"], "purged": results})
+    return 0
+
+
 def _receipt_restore_safe(document: Mapping[str, object]) -> bool:
     """Prove that restarting the pre-transaction services is safe."""
 
@@ -1410,7 +1455,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.trust_root_command == "legacy":
             if args.legacy_command == "inventory":
                 return _legacy_inventory_command(args)
-            return _legacy_show_command(args)
+            if args.legacy_command == "show":
+                return _legacy_show_command(args)
+            return _legacy_purge_command(args)
     except (InstallError, PermissionError, OSError, ValueError) as exc:
         sys.stderr.write(f"trust-root install failed: {exc}\n")
         return 1
