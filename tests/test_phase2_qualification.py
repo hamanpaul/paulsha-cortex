@@ -651,6 +651,7 @@ def test_qualification_schema_binds_release_evidence_and_runtime_identity() -> N
     assert set(payload["properties"]["profile"]["enum"]) == {
         "release",
         "deployment-canary",
+        "legacy-adoption",
     }
     assert payload["properties"]["providers"]["minItems"] == 0
 

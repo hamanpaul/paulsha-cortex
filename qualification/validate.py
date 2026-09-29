@@ -21,12 +21,14 @@ try:
         PROVIDERS as PROVIDER_CONTRACTS,
         canary_identity,
     )
+    from qualification import legacy_fixture
 except ModuleNotFoundError:  # host 端以 qualification/validate.py 執行
     from contract import (  # type: ignore[no-redef]
         CANARY_BUILDER,
         PROVIDERS as PROVIDER_CONTRACTS,
         canary_identity,
     )
+    import legacy_fixture  # type: ignore[no-redef]
 
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
@@ -60,7 +62,8 @@ REPOSITORY = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?/"
     r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?$"
 )
-QUALIFICATION_PROFILES = {"release", "deployment-canary"}
+LEGACY_PROFILE = legacy_fixture.LEGACY_PROFILE
+QUALIFICATION_PROFILES = {"release", "deployment-canary", LEGACY_PROFILE}
 BASE_TESTS = {"fresh-install"}
 REQUIRED_RELEASE_SERVICES = {
     "cortex-egress-proxy.service",
@@ -102,6 +105,30 @@ CANARY_ONLY_TESTS = {
 }
 REQUIRED_CANARY_ARTIFACTS = REQUIRED_RELEASE_ARTIFACTS | CANARY_ONLY_ARTIFACTS
 REQUIRED_CANARY_TESTS = REQUIRED_RELEASE_TESTS | CANARY_ONLY_TESTS
+#: legacy-adoption（#1122）：Phase 2b 形狀的舊主機接手、rollback 證明與再接手。
+INSTALLED_CHECK_TESTS = {
+    "selfcheck",
+    "registry-equation",
+    "generated-installed-attestation",
+    "service-identity-hardening",
+}
+REQUIRED_LEGACY_TESTS = set(legacy_fixture.LEGACY_TESTS) | INSTALLED_CHECK_TESTS
+REQUIRED_LEGACY_ARTIFACTS = {
+    "evidence/install-verification.json",
+    "evidence/generated-installed-attestation.json",
+    "evidence/artifact-inventory.json",
+    *(f"evidence/{name}" for name in legacy_fixture.LEGACY_EVIDENCE_FILES),
+}
+REQUIRED_PROFILE_TESTS = {
+    "release": REQUIRED_RELEASE_TESTS,
+    "deployment-canary": REQUIRED_CANARY_TESTS,
+    LEGACY_PROFILE: REQUIRED_LEGACY_TESTS,
+}
+REQUIRED_PROFILE_ARTIFACTS = {
+    "release": REQUIRED_RELEASE_ARTIFACTS,
+    "deployment-canary": REQUIRED_CANARY_ARTIFACTS,
+    LEGACY_PROFILE: REQUIRED_LEGACY_ARTIFACTS,
+}
 R9_HEADLESS_PRINCIPALS = {"cortex-builder", "cortex-reviewer-planner"}
 R9_DENY_ONLY_ASSET_IDS = {"review-verdict"}
 R9_MUTATIONS = {
@@ -260,17 +287,10 @@ def _validate_evidence_file_set(
         )
 
 
-def _validate_profile_artifacts(
-    *,
-    qualification: dict[str, Any],
-    evidence_root: Path,
-    artifact_hashes: dict[str, str],
-    include_canary: bool,
-    canary_repository: str | None = None,
-    canary_work_id: str | None = None,
-    canary_issue: int | None = None,
+def _validate_install_attestation(
+    *, qualification: dict[str, Any], evidence_root: Path
 ) -> None:
-    """Validate evidence semantics, not merely candidate-supplied filenames and hashes."""
+    """The installer's own verify evidence and its generated-installed attestation."""
 
     install = _artifact_json(evidence_root, "evidence/install-verification.json")
     _required_fields(
@@ -329,6 +349,21 @@ def _validate_profile_artifacts(
         _fail("generated-installed artifact hash inventory drifted")
     if generated["service_identities"] != install["service_identities"]:
         _fail("generated-installed service identity inventory drifted")
+
+
+def _validate_profile_artifacts(
+    *,
+    qualification: dict[str, Any],
+    evidence_root: Path,
+    artifact_hashes: dict[str, str],
+    include_canary: bool,
+    canary_repository: str | None = None,
+    canary_work_id: str | None = None,
+    canary_issue: int | None = None,
+) -> None:
+    """Validate evidence semantics, not merely candidate-supplied filenames and hashes."""
+
+    _validate_install_attestation(qualification=qualification, evidence_root=evidence_root)
 
     attack = _mapping(
         _artifact_json(evidence_root, "evidence/attack-matrix.json"),
@@ -774,6 +809,244 @@ def _validate_profile_artifacts(
     )
 
 
+def _passed_steps(value: Any) -> None:
+    expected = [{"name": name, "status": "passed"} for name in legacy_fixture.LEGACY_STEPS]
+    if value != expected:
+        _fail(
+            "legacy-adoption steps must be exactly "
+            + " -> ".join(legacy_fixture.LEGACY_STEPS)
+            + ", each passed"
+        )
+
+
+def _legacy_rows(value: Any, *, label: str, expected_paths: list[str]) -> list[dict[str, Any]]:
+    rows = _list(value, label)
+    if not all(isinstance(row, dict) for row in rows):
+        _fail(f"{label} rows must be objects")
+    if sorted(str(row.get("path")) for row in rows) != expected_paths:
+        _fail(f"{label} does not cover exactly the fixture's expected quarantine set")
+    return rows
+
+
+def _validate_legacy_artifacts(
+    *,
+    qualification: dict[str, Any],
+    evidence_root: Path,
+    artifact_hashes: dict[str, str],
+) -> None:
+    """Bind the legacy-adoption harness evidence to the fixture and the candidate."""
+
+    _validate_install_attestation(qualification=qualification, evidence_root=evidence_root)
+    manifest = legacy_fixture.load_manifest()
+    services = list(legacy_fixture.SERVICES)
+    expected_quarantine = sorted(manifest["expected"]["quarantine"])
+    expected_samples = sorted(manifest["expected"]["adopted_samples"])
+    quarantine_root = manifest["legacy_adoption"]["quarantine_root"]
+
+    adoption = _artifact_json(evidence_root, "evidence/legacy-adoption.json")
+    if (
+        adoption.get("schema_version") != 1
+        or adoption.get("profile") != LEGACY_PROFILE
+        or adoption.get("status") != "passed"
+    ):
+        _fail("legacy-adoption evidence must be schema v1 of the legacy profile and passed")
+    if adoption.get("candidate") != {
+        "candidate_sha": qualification["candidate_sha"],
+        "wheel_sha256": qualification["wheel"]["sha256"],
+        "bundle_sha256": qualification["bundle"]["sha256"],
+    }:
+        _fail("legacy-adoption evidence is bound to another candidate")
+    _passed_steps(adoption.get("steps"))
+
+    seeded = _required_fields(
+        adoption.get("fixture"), "legacy-adoption.fixture", {"sha256", "accounts", "services"}
+    )
+    if seeded["sha256"] != legacy_fixture.manifest_sha256():
+        _fail("legacy-adoption ran another fixture than qualification/legacy_fixture.json")
+    if seeded["accounts"] != {
+        name: {"uid": row["uid"], "gid": row["gid"]}
+        for name, row in sorted(legacy_fixture.accounts(manifest).items())
+    }:
+        _fail("legacy-adoption fixture accounts do not match the manifest ids")
+    if seeded["services"] != {name: "active" for name in services}:
+        _fail("legacy-adoption fixture services were not running before the inventory")
+
+    inventory = _required_fields(
+        adoption.get("inventory"),
+        "legacy-adoption.inventory",
+        {"inventory_sha256", "census_stable"},
+    )
+    inventory_sha = _digest(
+        inventory["inventory_sha256"], "legacy-adoption.inventory.inventory_sha256"
+    )
+    if inventory["census_stable"] is not True:
+        _fail("legacy inventory census was not stable")
+    captured = _artifact_json(evidence_root, "evidence/legacy-inventory.json")
+    if (
+        captured.get("schema_version") != 1
+        or captured.get("kind") != "paulsha-cortex/trust-root-legacy-inventory"
+        or captured.get("inventory_sha256") != inventory_sha
+    ):
+        _fail("legacy-inventory evidence is not the inventory the plan bound")
+
+    plan = _required_fields(
+        adoption.get("plan"),
+        "legacy-adoption.plan",
+        {
+            "reported_sha256",
+            "observed_sha256",
+            "recomputed_sha256",
+            "confirmed_sha256",
+            "quarantine",
+        },
+    )
+    digests = {
+        _digest(plan[key], f"legacy-adoption.plan.{key}")
+        for key in (
+            "reported_sha256",
+            "observed_sha256",
+            "recomputed_sha256",
+            "confirmed_sha256",
+        )
+    }
+    if len(digests) != 1:
+        _fail("legacy plan SHA-256 three-way confirmation does not agree")
+    bucket = f"{quarantine_root}/{inventory_sha[:16]}/root"
+    plan_rows: dict[str, dict[str, Any]] = {}
+    for row in _legacy_rows(
+        plan["quarantine"], label="legacy plan quarantine", expected_paths=expected_quarantine
+    ):
+        path = str(row["path"])
+        if row.get("destination") != bucket + path:
+            _fail(f"legacy plan quarantine destination for {path} is outside {bucket}")
+        for key in ("dev", "ino"):
+            if isinstance(row.get(key), bool) or not isinstance(row.get(key), int):
+                _fail(f"legacy plan quarantine {path} lacks its inode identity")
+        plan_rows[path] = row
+
+    def check_samples(value: Any, label: str) -> None:
+        rows = _list(value, label)
+        if sorted(
+            str(row.get("path")) for row in rows if isinstance(row, dict)
+        ) != expected_samples:
+            _fail(f"{label} does not cover the fixture's adopted samples")
+        if not all(isinstance(row, dict) and row.get("unchanged") is True for row in rows):
+            _fail(f"{label}: an adopted legacy sample changed")
+
+    for section in ("apply", "reapply"):
+        applied = _required_fields(
+            adoption.get(section),
+            f"legacy-adoption.{section}",
+            {"state", "quarantine", "samples"},
+        )
+        if applied["state"] != "applied":
+            _fail(f"legacy {section} did not leave the receipt applied")
+        for row in _legacy_rows(
+            applied["quarantine"],
+            label=f"legacy {section} quarantine",
+            expected_paths=expected_quarantine,
+        ):
+            if (
+                row.get("moved") is not True
+                or row.get("destination") != plan_rows[str(row["path"])]["destination"]
+            ):
+                _fail(f"legacy {section} did not move {row['path']} into its quarantine")
+        check_samples(applied["samples"], f"legacy {section} adopted sample")
+
+    rollback = _required_fields(
+        adoption.get("rollback"),
+        "legacy-adoption.rollback",
+        {
+            "legacy_restored",
+            "restore_safe",
+            "retained_unknown",
+            "retained_drift",
+            "systemd_daemon_reload",
+            "restored",
+            "need_daemon_reload",
+            "samples",
+        },
+    )
+    if rollback["legacy_restored"] is not True or rollback["restore_safe"] is not True:
+        _fail("legacy rollback did not prove legacy_restored and restore_safe")
+    if rollback["retained_unknown"] != [] or rollback["retained_drift"] != []:
+        _fail("legacy rollback retained unknown or drifted state")
+    if rollback["systemd_daemon_reload"] != "completed":
+        _fail("legacy rollback did not reload the restored unit definitions")
+    for row in _legacy_rows(
+        rollback["restored"], label="legacy rollback", expected_paths=expected_quarantine
+    ):
+        plan_row = plan_rows[str(row["path"])]
+        if row.get("restored") is not True or (row.get("dev"), row.get("ino")) != (
+            plan_row["dev"],
+            plan_row["ino"],
+        ):
+            _fail(f"legacy rollback did not return {row['path']} with its legacy inode")
+    if rollback["need_daemon_reload"] != {name: "no" for name in services}:
+        _fail("legacy rollback left NeedDaemonReload set on a legacy service")
+    check_samples(rollback["samples"], "legacy rollback adopted sample")
+    rolled = _artifact_json(evidence_root, "evidence/legacy-rollback.json")
+    if (
+        rolled.get("returncode") != 0
+        or rolled.get("legacy_restored") is not True
+        or rolled.get("restore_safe") is not True
+        or rolled.get("retained_unknown") != []
+        or rolled.get("retained_drift") != []
+    ):
+        _fail(
+            "legacy-rollback evidence does not show a restore_safe, legacy_restored rollback"
+        )
+
+    legacy_services = _required_fields(
+        adoption.get("legacy_services"),
+        "legacy-adoption.legacy_services",
+        {"stopped_before_apply", "restarted", "stopped_before_reapply"},
+    )
+    if legacy_services["restarted"] != {name: "active" for name in services}:
+        _fail("legacy services did not run again after the rollback")
+    for key in ("stopped_before_apply", "stopped_before_reapply"):
+        states = legacy_services[key]
+        if (
+            not isinstance(states, dict)
+            or set(states) != set(services)
+            or not set(states.values()) <= {"inactive", "failed"}
+        ):
+            _fail(f"legacy services were not stopped ({key})")
+
+    expected_credentials = {
+        (row["principal"], row["provider"]) for row in manifest["credentials"]
+    }
+    imported: set[tuple[str, str]] = set()
+    for index, raw in enumerate(
+        _list(adoption.get("credentials"), "legacy-adoption.credentials")
+    ):
+        row = _mapping(
+            raw,
+            f"legacy-adoption.credentials[{index}]",
+            {"principal", "provider", "source", "mode"},
+        )
+        key = (row["principal"], row["provider"])
+        if key in imported:
+            _fail(f"legacy credential {key[0]}/{key[1]} was imported twice")
+        imported.add(key)
+        if not str(row["source"]).startswith(bucket + "/"):
+            _fail(
+                f"legacy credential {key[0]}/{key[1]} was not reimported from the quarantine"
+            )
+    if imported != expected_credentials:
+        _fail("legacy credential reimport does not match the fixture's credentials")
+
+    if adoption.get("activate") != {"services_started": True}:
+        _fail("legacy activate did not start the adopted services")
+    verified = adoption.get("verify")
+    if not isinstance(verified, dict) or verified.get("result") != "pass":
+        _fail("legacy verify of the re-adopted host did not pass")
+
+    _validate_artifact_inventory(
+        evidence_root=evidence_root, artifact_hashes=artifact_hashes
+    )
+
+
 def validate(
     payload: Any,
     *,
@@ -783,6 +1056,7 @@ def validate(
     evidence_root: Path | None = None,
     require_release_profile: bool = False,
     require_canary_profile: bool = False,
+    require_legacy_profile: bool = False,
     canary_repository: str | None = None,
     canary_work_id: str | None = None,
     canary_issue: int | None = None,
@@ -796,20 +1070,27 @@ def validate(
         _fail("$.status must be passed")
     profile = _nonempty_string(root["profile"], "$.profile")
     if profile not in QUALIFICATION_PROFILES:
-        _fail("$.profile must be release or deployment-canary")
-    if require_release_profile and require_canary_profile:
-        _fail("release and deployment-canary profiles are mutually exclusive")
+        _fail("$.profile must be release, deployment-canary or legacy-adoption")
+    if (
+        sum((require_release_profile, require_canary_profile, require_legacy_profile))
+        > 1
+    ):
+        _fail("release, deployment-canary and legacy-adoption profiles are mutually exclusive")
     if require_release_profile and profile != "release":
         _fail("qualification profile is not release")
     if require_canary_profile and profile != "deployment-canary":
         _fail("qualification profile is not deployment-canary")
+    if require_legacy_profile and profile != LEGACY_PROFILE:
+        _fail("qualification profile is not legacy-adoption")
     if require_canary_profile and (
         canary_repository is None
         or canary_work_id is None
         or canary_issue is None
     ):
         _fail("full deployment-canary validation requires external canary identity")
-    require_profile_suite = require_release_profile or require_canary_profile
+    require_profile_suite = (
+        require_release_profile or require_canary_profile or require_legacy_profile
+    )
 
     evidence_sha = _nonempty_string(root["candidate_sha"], "$.candidate_sha")
     if SHA40.fullmatch(evidence_sha) is None:
@@ -850,7 +1131,20 @@ def validate(
             _fail(f"{path}.active must be true")
     if require_profile_suite and service_names != REQUIRED_RELEASE_SERVICES:
         _fail("$.services must contain exactly egress proxy, Manager, and Monitor")
-    if require_profile_suite:
+    if require_profile_suite and profile == LEGACY_PROFILE:
+        # An adopted legacy host keeps its Phase 2b ids (owner ruling, #1122):
+        # every service must run as exactly the fixture account the unit names.
+        expected_identities = legacy_fixture.service_identities(
+            legacy_fixture.load_manifest()
+        )
+        for service in root["services"]:
+            if (service["uid"], service["gid"]) != expected_identities[service["name"]]:
+                uid, gid = expected_identities[service["name"]]
+                _fail(
+                    f"{service['name']} identity must be the adopted legacy account "
+                    f"uid={uid} gid={gid}"
+                )
+    elif require_profile_suite:
         services_by_name = {service["name"]: service for service in root["services"]}
         manager = services_by_name["cortex-manager.service"]
         monitor = services_by_name["cortex-monitor.service"]
@@ -909,9 +1203,9 @@ def validate(
             _fail(f"{path} runtime model does not match requested model")
         if runtime_effort != requested_effort:
             _fail(f"{path} runtime effort does not match requested effort")
-    if profile == "release":
+    if profile in {"release", LEGACY_PROFILE}:
         if provider_names:
-            _fail("release qualification must not contain provider verdicts")
+            _fail(f"{profile} qualification must not contain provider verdicts")
     else:
         if provider_names != set(REQUIRED_PROVIDERS):
             _fail("$.providers must contain exactly agy, copilot, and codex verdicts")
@@ -936,18 +1230,19 @@ def validate(
         test_names.add(name)
         if test["status"] != "passed":
             _fail(f"{path}.status must be passed")
-    required_base_tests = BASE_TESTS | (
-        {"full-dispatch-closeout"} if profile == "deployment-canary" else set()
-    )
+    if profile == LEGACY_PROFILE:
+        required_base_tests = {"legacy-adoption-apply", "legacy-adoption-rollback"}
+    else:
+        required_base_tests = BASE_TESTS | (
+            {"full-dispatch-closeout"} if profile == "deployment-canary" else set()
+        )
     missing_tests = required_base_tests - test_names
     if missing_tests:
         _fail(
             "$.tests missing release-critical results: "
             + ", ".join(sorted(missing_tests))
         )
-    required_profile_tests = (
-        REQUIRED_RELEASE_TESTS if profile == "release" else REQUIRED_CANARY_TESTS
-    )
+    required_profile_tests = REQUIRED_PROFILE_TESTS[profile]
     if require_profile_suite:
         missing_profile_tests = required_profile_tests - test_names
         if missing_profile_tests:
@@ -955,8 +1250,8 @@ def validate(
                 f"$.tests missing full {profile} qualification results: "
                 + ", ".join(sorted(missing_profile_tests))
             )
-    if profile == "release" and test_names & CANARY_ONLY_TESTS:
-        _fail("release qualification must not contain live canary tests")
+    if profile in {"release", LEGACY_PROFILE} and test_names & CANARY_ONLY_TESTS:
+        _fail(f"{profile} qualification must not contain live canary tests")
 
     artifact_paths: set[str] = set()
     artifact_hashes: dict[str, str] = {}
@@ -982,14 +1277,10 @@ def validate(
 
     if require_profile_suite and evidence_root is None:
         _fail(f"full {profile} validation requires --evidence-root")
-    if profile == "release" and artifact_paths & CANARY_ONLY_ARTIFACTS:
-        _fail("release qualification must not contain live canary artifacts")
+    if profile in {"release", LEGACY_PROFILE} and artifact_paths & CANARY_ONLY_ARTIFACTS:
+        _fail(f"{profile} qualification must not contain live canary artifacts")
     if require_profile_suite:
-        required_artifacts = (
-            REQUIRED_RELEASE_ARTIFACTS
-            if profile == "release"
-            else REQUIRED_CANARY_ARTIFACTS
-        )
+        required_artifacts = REQUIRED_PROFILE_ARTIFACTS[profile]
         missing_artifacts = required_artifacts - artifact_paths
         if missing_artifacts:
             _fail(
@@ -1001,6 +1292,13 @@ def validate(
             evidence_root=evidence_root,
             artifact_paths=artifact_paths,
         )
+        if profile == LEGACY_PROFILE:
+            _validate_legacy_artifacts(
+                qualification=root,
+                evidence_root=evidence_root,
+                artifact_hashes=artifact_hashes,
+            )
+            return
         _validate_profile_artifacts(
             qualification=root,
             evidence_root=evidence_root,
@@ -1025,6 +1323,7 @@ def _parser() -> argparse.ArgumentParser:
     profile_group = parser.add_mutually_exclusive_group()
     profile_group.add_argument("--require-release-profile", action="store_true")
     profile_group.add_argument("--require-canary-profile", action="store_true")
+    profile_group.add_argument("--require-legacy-profile", action="store_true")
     return parser
 
 
@@ -1050,6 +1349,7 @@ def main(argv: list[str] | None = None) -> int:
             evidence_root=args.evidence_root,
             require_release_profile=args.require_release_profile,
             require_canary_profile=args.require_canary_profile,
+            require_legacy_profile=args.require_legacy_profile,
             canary_repository=args.canary_repository,
             canary_work_id=args.canary_work_id,
             canary_issue=args.canary_issue,

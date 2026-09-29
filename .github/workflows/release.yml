@@ -26,9 +26,13 @@ jobs:
       release_sha: ${{ steps.preflight.outputs.release_sha }}
       tag_name: ${{ steps.preflight.outputs.tag_name }}
       rc_run_id: ${{ steps.preflight.outputs.rc_run_id }}
+      legacy_rc_run_id: ${{ steps.preflight.outputs.legacy_rc_run_id }}
     steps:
       - name: Checkout untagged release candidate
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          # The legacy-adoption requirement diffs against the previous release tag.
+          fetch-depth: 0
 
       - name: Verify untagged exact source and governance gates
         id: preflight
@@ -232,9 +236,12 @@ jobs:
             workflow_runs=$(gh api --method GET \
               "repos/${GITHUB_REPOSITORY}/actions/workflows/$workflow/runs" \
               -f head_sha="$pr_head" -f event="$event" -f per_page=100)
+            # The PR-head RC run is the release profile; a legacy-adoption run
+            # of the same head never stands in for it.
             latest_run=$(jq -c --arg sha "$pr_head" --arg event "$event" '
               [.workflow_runs[]
-                | select(.head_sha == $sha and .event == $event)]
+                | select(.head_sha == $sha and .event == $event)
+                | select((.display_title // "") != "RC qualification (legacy-adoption)")]
               | sort_by([.created_at, .run_attempt])
               | last // null
             ' <<<"$workflow_runs")
@@ -251,28 +258,48 @@ jobs:
           run_json=$(gh api --method GET \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/rc-qualification.yml/runs" \
             -f event=workflow_dispatch -f per_page=100)
-          rc_run=$(jq -c --arg sha "$release_sha" '
-            [.workflow_runs[]
-              | select(.head_sha == $sha and .status == "completed" and .conclusion == "success")]
-            | sort_by(.created_at)
-            | last // null
-          ' <<<"$run_json")
-          [[ "$rc_run" != null ]] || {
-            echo "::error::no successful rc-qualification.yml run has head_sha=$release_sha"
+          rc_runs_path="$RUNNER_TEMP/rc-qualification-runs.json"
+          printf '%s\n' "$run_json" > "$rc_runs_path"
+          # Newest successful release-profile run on the exact SHA, at most 3 days
+          # old and not future-dated (qualification/release_gate.py).
+          rc_run=$(python3 qualification/release_gate.py select-run \
+            --runs "$rc_runs_path" --sha "$release_sha" --profile release) || {
+            echo "::error::no successful release-profile rc-qualification.yml run has head_sha=$release_sha within 3 days"
             exit 1
           }
           rc_run_id=$(jq -er .id <<<"$rc_run")
-          created_at=$(jq -er .created_at <<<"$rc_run")
-          created_epoch=$(date --date="$created_at" +%s)
-          now_epoch=$(date +%s)
-          (( created_epoch <= now_epoch && now_epoch - created_epoch <= 3 * 24 * 60 * 60 )) || {
-            echo "::error::the exact-SHA RC qualification is older than 3 days or future-dated"
-            exit 1
-          }
+
+          # #1122: a release that changes the installer or the qualification
+          # harness since the previous release tag also needs a passing
+          # legacy-adoption qualification of the exact SHA. Other releases do not.
+          legacy_requirement=$(python3 qualification/release_gate.py legacy-requirement \
+            --head "$release_sha")
+          echo "::notice::legacy-adoption requirement: $(jq -r .reason <<<"$legacy_requirement")"
+          legacy_rc_run_id=
+          if jq -e '.required == true' <<<"$legacy_requirement" >/dev/null; then
+            legacy_paths=$(jq -r '.paths | join(", ")' <<<"$legacy_requirement")
+            legacy_run=$(python3 qualification/release_gate.py select-run \
+              --runs "$rc_runs_path" --sha "$release_sha" --profile legacy-adoption) || {
+              echo "::error::missing legacy-adoption qualification: this release changes ${legacy_paths:-installer or qualification code (no previous release tag)}; no successful legacy-adoption rc-qualification.yml run has head_sha=$release_sha within 3 days -- dispatch rc-qualification.yml with profile=legacy-adoption on this commit"
+              exit 1
+            }
+            legacy_rc_run_id=$(jq -er .id <<<"$legacy_run")
+            legacy_artifact="rc-qualification-legacy-adoption-$release_sha"
+            legacy_artifacts=$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/$legacy_rc_run_id/artifacts" \
+              -f name="$legacy_artifact" -f per_page=100)
+            jq -e --arg name "$legacy_artifact" '
+              any(.artifacts[]; .name == $name and .expired == false)
+            ' <<<"$legacy_artifacts" >/dev/null || {
+              echo "::error::legacy-adoption run $legacy_rc_run_id has no unexpired $legacy_artifact evidence"
+              exit 1
+            }
+          fi
 
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
           echo "rc_run_id=$rc_run_id" >> "$GITHUB_OUTPUT"
+          echo "legacy_rc_run_id=$legacy_rc_run_id" >> "$GITHUB_OUTPUT"
 
   build:
     runs-on: ubuntu-latest

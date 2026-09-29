@@ -1,7 +1,20 @@
 name: RC qualification
+# The run title carries the profile: release preflight tells release and
+# legacy-adoption runs of the same SHA apart by it (qualification/release_gate.py).
+run-name: RC qualification (${{ inputs.profile || 'release' }})
 
 on:
   workflow_dispatch:
+    inputs:
+      profile:
+        description: >-
+          release (default), or legacy-adoption, which release preflight also
+          requires when the release changes paulsha_cortex/trust_root/install/ or qualification/
+        type: choice
+        options:
+          - release
+          - legacy-adoption
+        default: release
 
 permissions:
   contents: read
@@ -168,10 +181,20 @@ jobs:
           echo "bundle_sha256=$bundle_sha" >> "$GITHUB_OUTPUT"
 
       - name: Run privileged systemd qualification
+        env:
+          QUALIFICATION_PROFILE: ${{ inputs.profile || 'release' }}
         run: |
           set -euo pipefail
+          case "$QUALIFICATION_PROFILE" in
+            release) profile_args=(--profile release) ;;
+            legacy-adoption) profile_args=(--profile legacy-adoption) ;;
+            *)
+              echo "::error::unknown RC qualification profile: $QUALIFICATION_PROFILE"
+              exit 1
+              ;;
+          esac
           qualification/run.sh \
-            --profile release \
+            "${profile_args[@]}" \
             --artifacts qualification-input \
             --candidate-sha "${{ github.sha }}" \
             --wheel-sha256 "${{ steps.candidate.outputs.wheel_sha256 }}" \
@@ -180,14 +203,16 @@ jobs:
           test -s qualification-output/qualification.json
 
       - name: Fail closed on credential material in evidence
+        env:
+          QUALIFICATION_PROFILE: ${{ inputs.profile || 'release' }}
         run: >-
           python qualification/redaction_scan.py qualification-output
-          --profile release
+          --profile "$QUALIFICATION_PROFILE"
 
       - name: Upload exact candidate and redacted evidence
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
         with:
-          name: rc-qualification-${{ github.sha }}
+          name: ${{ inputs.profile == 'legacy-adoption' && format('rc-qualification-legacy-adoption-{0}', github.sha) || format('rc-qualification-{0}', github.sha) }}
           if-no-files-found: error
           retention-days: 3
           path: |
