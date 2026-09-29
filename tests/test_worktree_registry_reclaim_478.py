@@ -432,6 +432,9 @@ def test_reclaim_fails_closed_when_index_is_unreadable_to_scanning_uid(
 
     repo = _init_repo(tmp_path)
     with tempfile.TemporaryDirectory(prefix="cortex-reclaim-", dir="/tmp") as raw_pool:
+        # TemporaryDirectory 是 0700；降權後的掃描身分必須能進入工作區，失敗才
+        # 會來自 index 權限而不是目錄存取（審查指出的假陽性）。
+        os.chmod(raw_pool, 0o755)
         workspace = Path(raw_pool) / "job-workspace"
         subprocess.run(["git", "clone", "-q", str(repo), str(workspace)], check=True)
         marker = job_workspace.write_marker(
@@ -443,7 +446,6 @@ def test_reclaim_fails_closed_when_index_is_unreadable_to_scanning_uid(
         precious = workspace / "uncommitted.txt"
         precious.write_text("unsaved builder data\n", encoding="utf-8")
         index = workspace / ".git" / "index"
-        index.chmod(0)
         real = _runner_for(repo)
 
         def manager_with_builder_uid(args: list[str]):
@@ -459,6 +461,12 @@ def test_reclaim_fails_closed_when_index_is_unreadable_to_scanning_uid(
                     options["preexec_fn"] = drop_privileges
                 return subprocess.run(command, capture_output=True, text=True, **options)
             return real(args)
+
+        # 對照：index 可讀時同一個掃描身分能列出工作區，證明下方的失敗只來自
+        # index 權限。
+        control = manager_with_builder_uid(["-C", str(workspace), "ls-files"])
+        assert control.returncode == 0, control.stderr
+        index.chmod(0)
 
         result = worktree_reclaim.reclaim_worktree(
             workspace,
