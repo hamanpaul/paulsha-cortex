@@ -1451,7 +1451,14 @@ def summarize_canary(
     legacy_schema_compatible: bool = True,
     observed_blockers: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """分開計算路徑成功率、內容取回率與 inline delivery；不修改 strict KPI。"""
+    """分開計算路徑成功率、內容取回率與 inline delivery；不修改 strict KPI。
+
+    `legacy_strict_kpi_mutated` 由 receipt 實際的 ``counts_as_read`` 計算
+    （#857 G857-3）：Hippo legacy strict funnel 只把 note-fetch 的
+    ``content-returned`` 算 Read，任何 receipt 的旗標與此不符（inline／snapshot／
+    denied 被標成 Read，或真正的 note-fetch 取回沒被標成 Read）都會改變 legacy
+    分子或分母，記為 ``legacy-strict-kpi-mutation`` blocker，該筆 receipt 不計入
+    任何成功率。"""
 
     if minimum_successes < 1 or not 0.0 <= minimum_rate <= 1.0:
         raise ValueError("canary gate bounds invalid")
@@ -1460,6 +1467,7 @@ def summarize_canary(
         "cross-project-misattribution",
         "relay-overwrite",
         "legacy-output-schema-break",
+        "legacy-strict-kpi-mutation",
     }
     if any(not isinstance(item, str) or item not in known_blockers for item in observed_blockers):
         raise ValueError("unknown task memory canary blocker")
@@ -1472,7 +1480,11 @@ def summarize_canary(
     selected_all: set[tuple[str, str, str]] = set()
     read_attempts: set[tuple[str, str, str]] = set()
     returned_all: set[tuple[str, str, str]] = set()
+    strict_read_violations = 0
     for raw in events:
+        if _violates_strict_read_semantics(raw):
+            strict_read_violations += 1
+            continue
         event = _validate_event(raw)
         mode = event.get("mode")
         if mode not in {"inline", "snapshot", "note_fetch"}:
@@ -1573,6 +1585,8 @@ def summarize_canary(
     inline_delivery_rate = inline_row.get("delivery_rate")
     if not legacy_schema_compatible:
         blockers.add("legacy-output-schema-break")
+    if strict_read_violations:
+        blockers.add("legacy-strict-kpi-mutation")
     return {
         "schema": "cortex/task-memory-canary/v1",
         "paths": by_path,
@@ -1605,12 +1619,26 @@ def summarize_canary(
             1 for event in events if event.get("event") in {"ineligible", "read-failed"}
         ),
         "blockers": sorted(blockers),
-        "legacy_strict_kpi_mutated": False,
+        "strict_read_violations": strict_read_violations,
+        "legacy_strict_kpi_mutated": strict_read_violations > 0,
         "passed": bool(by_path)
         and all(row["passed"] for row in by_path.values())
         and retrieval_passed
         and not blockers,
     }
+
+
+def _violates_strict_read_semantics(raw: object) -> bool:
+    """receipt 的 counts_as_read 是否偏離 legacy strict funnel 的 Read 定義。
+
+    與 `_validate_event` 的同名檢查一致：只有 note-fetch 的 ``content-returned``
+    是 Read。帶有 ``counts_as_read`` 欄位卻與此不符者視為 legacy KPI 變動；
+    缺欄位或非 mapping 交給 `_validate_event` 以 schema 錯誤處理。"""
+
+    if not isinstance(raw, Mapping) or "counts_as_read" not in raw:
+        return False
+    expected = raw.get("event") == "content-returned" and raw.get("mode") == "note_fetch"
+    return raw.get("counts_as_read") is not expected
 
 
 def project_task_memory_read_model(

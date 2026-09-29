@@ -5,12 +5,13 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from paulsha_cortex.coordinator import manager
+from paulsha_cortex.coordinator import live_receipt_validators, manager, requirement_delivery
 from paulsha_cortex.coordinator.launcher import LaunchHandle
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -30,6 +31,7 @@ from paulsha_cortex.coordinator.task_memory_hippo import (
     resolve_hippo_command,
 )
 from paulsha_cortex.coordinator.workflow import WorkflowStep
+from paulsha_cortex.porcelain import task_memory_canary
 from paulsha_cortex import cli
 
 
@@ -187,6 +189,18 @@ if operation == "provide":
         "evidence": [], "producer": {"id": "hippo-task-memory-provider", "version": "1"},
         "adapter": {"id": "hippo-host-adapter", "version": "1"},
     }
+    fault = os.environ.get("FAKE_HIPPO_PAYLOAD_MODE")
+    # #857 G857-3 負例：provider 覆寫 Cortex 轉交的 task identity／delivery mode
+    # （relay overwrite），或輸出不再符合既有 v1 schema（schema break）。
+    if fault == "mode-overwrite":
+        payload["delivery"]["mode"] = "inline" if mode != "inline" else "note_fetch"
+    elif fault == "task-id-overwrite":
+        payload["task_id"] = "task-overwritten-by-provider"
+    elif fault == "schema-major-2":
+        payload["schema_version"] = "2"
+    elif fault == "not-json":
+        sys.stdout.write("hippo emitted a non-JSON line\n")
+        raise SystemExit(0)
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
 elif operation == "fetch":
     sleep = float(os.environ.get("FAKE_HIPPO_SLEEP_FETCH", "0"))
@@ -630,37 +644,74 @@ def test_live_canary_cli_emits_bounded_machine_json_and_private_evidence(
     report = json.loads(captured.out)
     assert result == 0
     assert report["passed"] is True
+    assert report["schema"] == "cortex/task-memory-live-canary/v1"
     assert report["repositories"] == ["acme/demo", "other/demo"]
-    assert all(report["paths"][mode]["successes"] >= 5 for mode in ("inline", "snapshot", "note_fetch"))
-    assert all(report["paths"][mode]["successful_provides"] == 10 for mode in report["paths"])
-    assert all(
-        row["successful_provides"] == 5
-        for mode in report["paths"].values()
-        for row in mode["per_repo"].values()
-    )
-    assert all(report["paths"][mode]["eligible_authorized_success_rate"] == 1.0 for mode in report["paths"])
-    assert report["content_retrieval"]["paths"] == ["note_fetch", "snapshot"]
+    # #845 B5：`paths` 以 #857 spec R3 的 delivery 結果命名，恰為三條 path，
+    # 每條另以 `mode` 標明對應的 executor capability。
+    assert set(report["paths"]) == {"context-delivered", "snapshot-ready", "note-fetch"}
+    assert {name: row["mode"] for name, row in report["paths"].items()} == {
+        "context-delivered": "inline",
+        "snapshot-ready": "snapshot",
+        "note-fetch": "note_fetch",
+    }
+    for row in report["paths"].values():
+        assert row["attempts"] == row["eligible_authorized_attempts"] == 10
+        assert row["successes"] == 10
+        assert row["success_rate"] == row["successes"] / row["attempts"] == 1.0
+        assert row["successful_provides"] == 10
+        assert all(repo_row["successful_provides"] == 5 for repo_row in row["per_repo"].values())
+    assert report["content_retrieval"]["paths"] == ["note-fetch", "snapshot-ready"]
+    assert report["content_retrieval"]["attempts"] == 20
     assert report["content_retrieval"]["eligible_authorized_attempts"] == 20
     assert report["content_retrieval"]["successes"] == 20
     assert report["content_retrieval"]["success_rate"] == 1.0
     assert report["content_retrieval"]["passed"] is True
-    assert report["paths"]["note_fetch"]["success_semantics"] == (
+    assert report["paths"]["note-fetch"]["success_semantics"] == (
         "content-returned after note content hash match"
     )
-    assert report["paths"]["snapshot"]["success_semantics"] == (
+    assert report["paths"]["snapshot-ready"]["success_event"] == "content-returned"
+    assert report["paths"]["snapshot-ready"]["success_semantics"] == (
         "content-returned after snapshot read-back and hash match; snapshot-ready is not a read"
     )
-    assert report["paths"]["inline"]["metric_kind"] == "delivery"
-    assert report["paths"]["inline"]["eligible_authorized_delivery_rate"] == 1.0
-    assert report["paths"]["inline"]["counts_as_read"] is False
+    assert report["paths"]["context-delivered"]["metric_kind"] == "delivery"
+    assert report["paths"]["context-delivered"]["eligible_authorized_delivery_rate"] == 1.0
+    assert report["paths"]["context-delivered"]["counts_as_read"] is False
     assert report["inline_delivery"]["delivery_rate"] == 1.0
     assert report["inline_delivery"]["counts_as_read"] is False
-    assert report["permission_negative_control"]["passed"] is True
+    assert report["negative_controls"] == [
+        {"case": "permission-denied", "attempted": 6, "observed": 6, "status": "passed"},
+        {
+            "case": "cross-scope-rejection",
+            "attempted": 6,
+            "observed": 6,
+            "misattribution_leaks": 0,
+            "status": "passed",
+        },
+    ]
+    assert [(row["repo"], row["status"]) for row in report["cross_project"]] == [
+        ("acme/demo", "passed"),
+        ("other/demo", "passed"),
+    ]
     assert report["scope_checks"]["scope_leaks"] == 0
-    assert report["cross_project_checks"]["passed"] is True
+    assert report["relay_checks"] == {
+        "executor_prompts_checked": 10,
+        "executor_prompt_overwrites": 0,
+        "provider_identity_overwrites": 0,
+        "passed": True,
+    }
+    assert report["schema_checks"] == {
+        "provider_payloads_checked": 30,
+        "schema_breaks": 0,
+        "passed": True,
+    }
+    assert report["blockers"] == []
     assert report["legacy_strict_kpi_mutated"] is False
+    assert report["strict_read_violations"] == 0
+    assert isinstance(report["executor"]["id"], str) and report["executor"]["id"]
+    assert report["target"] is None
     assert _BODY not in captured.out
     assert _BODY not in evidence.read_text()
+    assert str(tmp_path) not in captured.out
     assert evidence.stat().st_mode & 0o777 == 0o600
 
 
@@ -688,6 +739,287 @@ def test_live_canary_rejects_fewer_than_five_successful_provides_per_repo_path(
     # 聚合指標也必須套用每 repo／path 至少 5 次的門檻，不能只看成功率。
     assert report["content_retrieval"]["passed"] is False
     assert report["inline_delivery"]["passed"] is False
+
+
+# ---------------------------------------------------------------------------
+# #845 B5：canary 產物與 `cortex/task-memory-live-canary/v1` validator 相容
+# ---------------------------------------------------------------------------
+
+_CANARY_TARGET = {
+    "repo": "acme/cortex-deploy",
+    "candidate_sha": "a" * 40,
+    "artifact_sha256": "b" * 64,
+    "source_revision": "c" * 40,
+    "service": "cortex-manager.service",
+    "instance": "cortex",
+    "profile_key": "epk:v1:resolved:" + "d" * 64,
+    "config_revision": "e" * 64,
+}
+
+
+def _run_canary_cli(capsys, *extra: str):
+    result = cli.main(
+        ["task-memory", "canary", "--repo", "acme/demo", "--repo", "other/demo", *extra]
+    )
+    return result, json.loads(capsys.readouterr().out)
+
+
+def _live_receipt(evidence: dict) -> dict:
+    return {
+        "schema": "cortex/live-canary-receipt/v1",
+        "result": "passed",
+        "requirement_id": "R99",
+        "requirement_revision": "r1",
+        "acceptance_id": "R99-AC1",
+        "observed_at": evidence["finished_at"],
+        "target": dict(_CANARY_TARGET),
+        "authority": {"id": "release-operator", "version": "1", "receipt": "approval:fixture"},
+        "independence": {"review_domain": "reviewer-domain"},
+        "kind": live_receipt_validators.KIND_TASK_MEMORY_LIVE_CANARY,
+        "evidence": evidence,
+    }
+
+
+def test_live_canary_evidence_is_accepted_by_governed_live_receipt_validator(
+    tmp_path, monkeypatch, capsys
+):
+    """#845 B5：`--evidence-path` 落檔的真 canary 產物原封不動包進
+    `cortex/live-canary-receipt/v1`，必須走完 `_verify_live`（hash／target／
+    期限／independence 導出）並通過 production validator。"""
+    script, log = _fake_hippo(tmp_path)
+    _client(monkeypatch, script, log)
+    target_file = tmp_path / "target.json"
+    target_file.write_text(json.dumps(_CANARY_TARGET), encoding="utf-8")
+    evidence_root = tmp_path / "coordinator"
+    evidence_path = evidence_root / "evidence" / "task-memory-canary.json"
+
+    result, report = _run_canary_cli(
+        capsys, "--runs", "5", "--evidence-path", str(evidence_path),
+        "--target-file", str(target_file),
+    )
+
+    assert result == 0 and report["passed"] is True
+    produced = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert produced["target"] == _CANARY_TARGET
+    receipt = _live_receipt(produced)
+    receipt_path = evidence_root / "live" / "task-memory-canary-receipt.json"
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    row = {
+        "repo": _CANARY_TARGET["repo"],
+        "candidate_sha": _CANARY_TARGET["candidate_sha"],
+        "target": dict(_CANARY_TARGET),
+        "live_receipt": {
+            "locator": "live/task-memory-canary-receipt.json",
+            "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        },
+    }
+    requirement = {
+        "id": "R99",
+        "revision": "r1",
+        "evidence_policy": {"max_age_seconds": {"live": 3600}},
+    }
+    validator = live_receipt_validators.make_governed_live_receipt_validator(
+        source_root=tmp_path, evidence_root=evidence_root
+    )
+
+    stage = requirement_delivery._verify_live(
+        row,
+        requirement,
+        "R99-AC1",
+        evidence_root=evidence_root,
+        now=datetime.now(timezone.utc),
+        validator=validator,
+        review_document=None,
+        domain_deriver=live_receipt_validators.derive_canary_domain,
+    )
+
+    assert stage["status"] == "verified", stage
+    assert validator(receipt) is True
+    assert live_receipt_validators.derive_canary_domain(receipt) == (
+        "task-memory-live-canary-executor:" + produced["executor"]["id"]
+    )
+    # 未帶 --target-file 的產物沒有綁定 target，不能拿來核銷任何需求。
+    assert validator(_live_receipt({**produced, "target": None})) is False
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda t: {k: v for k, v in t.items() if k != "service"}, id="missing-field"),
+        pytest.param(lambda t: {**t, "extra": "value"}, id="extra-field"),
+        pytest.param(lambda t: {**t, "candidate_sha": "not-a-sha"}, id="invalid-sha"),
+        pytest.param(lambda t: [t], id="not-an-object"),
+    ],
+)
+def test_live_canary_rejects_invalid_target_file(tmp_path, monkeypatch, capsys, mutate):
+    script, log = _fake_hippo(tmp_path)
+    _client(monkeypatch, script, log)
+    target_file = tmp_path / "target.json"
+    target_file.write_text(json.dumps(mutate(dict(_CANARY_TARGET))), encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "task-memory", "canary", "--repo", "acme/demo", "--repo", "other/demo",
+                "--target-file", str(target_file),
+            ]
+        )
+
+    assert exc.value.code == 2
+    error = capsys.readouterr().err
+    assert "unrecognized arguments" not in error
+    assert "--target-file" in error
+    assert not log.exists()
+
+
+# ---------------------------------------------------------------------------
+# #857 G857-3：relay overwrite／schema 破壞偵測、task kind 輪替、KPI 由觀測計算
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fault", ["mode-overwrite", "task-id-overwrite"])
+def test_live_canary_flags_provider_relay_overwrite_as_blocker(
+    tmp_path, monkeypatch, capsys, fault
+):
+    script, log = _fake_hippo(tmp_path)
+    _client(monkeypatch, script, log, FAKE_HIPPO_PAYLOAD_MODE=fault)
+
+    result, report = _run_canary_cli(capsys, "--runs", "5")
+
+    assert result == 1
+    assert report["passed"] is False
+    assert "relay-overwrite" in report["blockers"]
+    assert report["relay_checks"]["provider_identity_overwrites"] == 30
+    assert report["relay_checks"]["passed"] is False
+    assert report["schema_checks"]["schema_breaks"] == 0
+
+
+def test_live_canary_detects_executor_prompt_relay_overwrite(tmp_path, monkeypatch, capsys):
+    """inline 交付必須以附加方式進入 Cortex 轉交給 executor 的 prompt；canary
+    以 Manager 正式 composer 組 prompt 並核對原 prompt 逐字保留。"""
+    script, log = _fake_hippo(tmp_path)
+    _client(monkeypatch, script, log)
+
+    def overwriting(prompt, prepared):
+        # 回歸模擬：task-memory 區塊取代原 prompt，而不是附加在其後。
+        rows = [f"[{item['note_id']}] {item['text']}" for item in prepared.inline_context]
+        return "\n".join(rows) if rows else prompt
+
+    monkeypatch.setattr(manager, "_append_task_memory_inline", overwriting)
+
+    result, report = _run_canary_cli(capsys, "--runs", "5")
+
+    assert result == 1
+    assert report["passed"] is False
+    assert "relay-overwrite" in report["blockers"]
+    assert report["relay_checks"]["executor_prompts_checked"] == 10
+    assert report["relay_checks"]["executor_prompt_overwrites"] == 10
+    # 被覆寫的 prompt 不算完成 inline 交付；其他 path 不受影響。
+    assert report["paths"]["context-delivered"]["successes"] == 0
+    assert report["paths"]["note-fetch"]["passed"] is True
+    assert report["paths"]["snapshot-ready"]["passed"] is True
+
+
+@pytest.mark.parametrize(
+    ("env_name", "env_value"),
+    [
+        ("FAKE_HIPPO_EXIT_PROVIDE", "14"),
+        ("FAKE_HIPPO_PAYLOAD_MODE", "schema-major-2"),
+        ("FAKE_HIPPO_PAYLOAD_MODE", "not-json"),
+    ],
+)
+def test_live_canary_flags_legacy_output_schema_break_as_blocker(
+    tmp_path, monkeypatch, capsys, env_name, env_value
+):
+    script, log = _fake_hippo(tmp_path)
+    _client(monkeypatch, script, log, **{env_name: env_value})
+
+    result, report = _run_canary_cli(capsys, "--runs", "5")
+
+    assert result == 1
+    assert report["passed"] is False
+    assert "legacy-output-schema-break" in report["blockers"]
+    assert report["schema_checks"] == {
+        "provider_payloads_checked": 30,
+        "schema_breaks": 30,
+        "passed": False,
+    }
+    assert report["relay_checks"]["provider_identity_overwrites"] == 0
+
+
+def test_live_canary_rotates_task_kind_across_dispatchable_card_phases(
+    tmp_path, monkeypatch, capsys
+):
+    script, log = _fake_hippo(tmp_path)
+    _client(monkeypatch, script, log)
+
+    result, report = _run_canary_cli(capsys, "--runs", "5")
+
+    assert result == 0
+    assert report["task_kinds"] == ["build", "verify", "review"]
+    # 輪替集合與 Manager 以 task memory 派工、有 applied 回報管道的卡片 phase 一致。
+    assert set(task_memory_canary._TASK_KINDS) == manager.TASK_MEMORY_APPLIED_PHASES
+    provided: dict[tuple[str, str], set[str]] = {}
+    for line in log.read_text(encoding="utf-8").splitlines():
+        call = json.loads(line)
+        if call["operation"] != "provide":
+            continue
+        request = call["request"]
+        scope = request["delivery"]["host_scope"]
+        if "hippo" not in scope["allowed_evidence_sources"] or request["project"] != scope["repo"]:
+            continue  # permission／cross-scope 負例
+        provided.setdefault((scope["repo"], request["delivery"]["mode"]), set()).add(
+            scope["task_kind"]
+        )
+    assert set(provided) == {
+        (repo, mode)
+        for repo in ("acme/demo", "other/demo")
+        for mode in ("inline", "snapshot", "note_fetch")
+    }
+    assert all(kinds == {"build", "verify", "review"} for kinds in provided.values())
+    for row in report["paths"].values():
+        assert set(row["task_kinds"]) == {"build", "verify", "review"}
+        assert all(kind_row["successes"] >= 1 for kind_row in row["task_kinds"].values())
+    assert report["task_kind_coverage"]["passed"] is True
+
+
+def test_live_canary_requires_more_than_one_task_kind(tmp_path, monkeypatch, capsys):
+    script, log = _fake_hippo(tmp_path)
+    _client(monkeypatch, script, log)
+    monkeypatch.setattr(task_memory_canary, "_TASK_KINDS", ("build",))
+
+    result, report = _run_canary_cli(capsys, "--runs", "5")
+
+    assert result == 1
+    assert report["passed"] is False
+    assert report["task_kind_coverage"]["passed"] is False
+    assert all(row["passed"] is True for row in report["paths"].values())
+
+
+def test_live_canary_legacy_strict_kpi_flag_reflects_observed_receipts(
+    tmp_path, monkeypatch, capsys
+):
+    """`legacy_strict_kpi_mutated` 由實際 receipt 的 counts_as_read 計算：inline
+    交付若被標成 Read，canary 必須判為 blocker。"""
+    script, log = _fake_hippo(tmp_path)
+    _client(monkeypatch, script, log)
+    original = TaskMemoryAdapter.confirm_context_delivered
+
+    def regressed(self, prepared, **kwargs):
+        return tuple(
+            dict(event, counts_as_read=True) for event in original(self, prepared, **kwargs)
+        )
+
+    monkeypatch.setattr(TaskMemoryAdapter, "confirm_context_delivered", regressed)
+
+    result, report = _run_canary_cli(capsys, "--runs", "5")
+
+    assert result == 1
+    assert report["passed"] is False
+    assert report["legacy_strict_kpi_mutated"] is True
+    assert report["strict_read_violations"] == 10
+    assert "legacy-strict-kpi-mutation" in report["blockers"]
 
 
 def test_task_memory_canary_appears_in_umbrella_help(capsys):

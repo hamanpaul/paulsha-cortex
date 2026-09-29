@@ -951,11 +951,30 @@ def _verify_installed(
         return _stage("unknown", f"loaded-runtime-unverified:{type(exc).__name__}")
 
 
+#: acceptance target 的封閉欄位集合；`_target_identity` 回傳值與 live receipt 的
+#: `target`（含 task-memory canary evidence 的 `target`）都必須恰為這些欄位。
+ACCEPTANCE_TARGET_FIELDS = (
+    "repo", "candidate_sha", "artifact_sha256", "source_revision",
+    "service", "instance", "profile_key", "config_revision",
+)
+
+
+def validate_acceptance_target(value: object) -> dict[str, Any]:
+    """獨立驗證一個 acceptance target（給 live canary producer 在量測前檢查
+    `--target-file`）。規則與 `_target_identity` 相同，但沒有 mapping row 可比對；
+    欄位必須恰為 `ACCEPTANCE_TARGET_FIELDS`，多或少都拒絕。"""
+    if not isinstance(value, Mapping) or set(value) != set(ACCEPTANCE_TARGET_FIELDS):
+        raise ValueError("acceptance target must contain exactly the acceptance target fields")
+    return _target_identity(
+        {"target": value, "candidate_sha": value.get("candidate_sha"), "repo": value.get("repo")}
+    )
+
+
 def _target_identity(row: Mapping[str, Any]) -> dict[str, Any]:
     value = row.get("target")
     if not isinstance(value, Mapping):
         raise ValueError("acceptance target is missing")
-    fields = ("repo", "candidate_sha", "artifact_sha256", "source_revision", "service", "instance", "profile_key", "config_revision")
+    fields = ACCEPTANCE_TARGET_FIELDS
     if any(not isinstance(value.get(field), str) or not value.get(field) for field in fields):
         raise ValueError("acceptance target is incomplete")
     if _GIT_SHA_RE.fullmatch(value["candidate_sha"].lower()) is None or _GIT_SHA_RE.fullmatch(value["source_revision"].lower()) is None:
