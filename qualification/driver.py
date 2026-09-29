@@ -25,6 +25,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -5250,6 +5251,105 @@ def _dispatch_timeout_diagnostic(
     return " ".join(parts)
 
 
+#: 失敗診斷裡要遮蔽的 credential 形狀（與 `qualification/redaction_scan.py` 的
+#: TOKEN_PATTERNS 同一組；driver 在容器內不 import host 端的掃描器）。
+_DIAGNOSTIC_SECRET_PATTERNS = (
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[A-Za-z0-9._~+/-]{16,}"),
+)
+_JOB_DIAGNOSTIC_UNITS = 6
+_JOB_DIAGNOSTIC_LINES = 40
+_JOB_DIAGNOSTIC_CHARS = 16000
+
+
+def _scrub_diagnostic(text: str) -> str:
+    for pattern in _DIAGNOSTIC_SECRET_PATTERNS:
+        text = pattern.sub(
+            lambda match: (match.group(1) if match.groups() else "") + "<redacted>", text
+        )
+    return text
+
+
+def _job_unit_diagnostics(runtime_env: Mapping[str, str]) -> str:
+    """派工失敗時的 job 層診斷：最近幾個 job unit 的 journal 尾端與 gate.log 尾端。
+
+    #716 canary run 36628749017 以 `gate-spool-empty` 終局，錯誤訊息只指向
+    `journalctl -u <gate unit>` 與 gate.log，而容器在 workflow 結束後就銷毀。
+    這裡在拋出失敗前把兩者的有界尾端印到 stderr（遮蔽 credential 形狀）；
+    任何讀取失敗只記 unavailable，不影響原本的失敗。
+    """
+
+    lines: list[str] = []
+    try:
+        listed = _run(
+            (
+                "/usr/bin/systemctl",
+                "list-units",
+                "--all",
+                "--no-legend",
+                "--plain",
+                "--no-pager",
+                "cortex-*job@*",
+            ),
+            timeout=30,
+        )
+        units = [
+            (row.split()[0], " ".join(row.split()[1:4]))
+            for row in listed.stdout.splitlines()
+            if row.split()
+        ]
+    except (OSError, subprocess.SubprocessError):
+        units = []
+        lines.append("job units: unavailable")
+    for unit, state in units[-_JOB_DIAGNOSTIC_UNITS:]:
+        lines.append(f"--- journal {unit} [{state}]")
+        try:
+            journal = _run(
+                (
+                    "/usr/bin/journalctl",
+                    "--no-pager",
+                    "-o",
+                    "short-iso",
+                    "-n",
+                    str(_JOB_DIAGNOSTIC_LINES),
+                    "-u",
+                    unit,
+                ),
+                timeout=30,
+            )
+            lines.extend(journal.stdout.splitlines()[-_JOB_DIAGNOSTIC_LINES:])
+        except (OSError, subprocess.SubprocessError):
+            lines.append("unavailable")
+    try:
+        root = Path(runtime_env["PSC_COORDINATOR_ROOT"])
+        logs = sorted(
+            (root / "gate-ledger-spool" / "gate-logs").glob("*/gate.log"),
+            key=lambda path: path.stat().st_mtime,
+        )
+    except (KeyError, OSError):
+        logs = []
+    for log in logs[-3:]:
+        lines.append(f"--- gate log {log.parent.name}")
+        try:
+            lines.extend(
+                log.read_text(encoding="utf-8", errors="replace").splitlines()[
+                    -_JOB_DIAGNOSTIC_LINES:
+                ]
+            )
+        except OSError:
+            lines.append("unavailable")
+    return _scrub_diagnostic("\n".join(lines))[-_JOB_DIAGNOSTIC_CHARS:]
+
+
+def _report_job_unit_diagnostics(runtime_env: Mapping[str, str]) -> None:
+    try:
+        text = _job_unit_diagnostics(runtime_env)
+    except Exception as exc:  # noqa: BLE001 - diagnostics never mask the real failure
+        text = f"job diagnostics unavailable: {type(exc).__name__}"
+    print("dispatch job diagnostics:\n" + text, file=sys.stderr, flush=True)
+
+
 def _full_dispatch(
     *,
     repository: str,
@@ -5321,12 +5421,14 @@ def _full_dispatch(
                     item = candidate
                     break
                 if verdict == "failed":
+                    _report_job_unit_diagnostics(runtime_env)
                     raise QualificationFailure(
                         "full dispatch reached a failed/needs_human terminal"
                         + _dispatch_blocking_summary(envelope)
                     )
         time.sleep(10)
     else:
+        _report_job_unit_diagnostics(runtime_env)
         raise QualificationFailure(
             "full dispatch did not reach terminal closeout before timeout: "
             + _dispatch_item_diagnostic(observed)

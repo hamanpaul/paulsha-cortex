@@ -3597,3 +3597,60 @@ def test_dispatch_closeout_failure_names_the_unmet_conditions(
     ):
         assert fragment in message
     assert "x" * 50 not in message
+
+
+def test_dispatch_failure_prints_bounded_scrubbed_job_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#716：派工失敗時把 job unit journal 與 gate.log 尾端印出，遮蔽 credential 形狀。"""
+    driver = _load_driver()
+    root = tmp_path / "coordinator"
+    log_dir = root / "gate-ledger-spool" / "gate-logs" / "wf-demo"
+    log_dir.mkdir(parents=True)
+    (log_dir / "gate.log").write_text(
+        "".join(f"gate line {index}\n" for index in range(100))
+        + "token ghp_" + "a" * 30 + "\n",
+        encoding="utf-8",
+    )
+    units = "\n".join(
+        f"cortex-gate-job@wf-{index}.service loaded failed failed Cortex gate job"
+        for index in range(9)
+    )
+
+    def fake_run(argv, **_kwargs):
+        if argv[0].endswith("systemctl"):
+            return _result(driver, argv, stdout=units + "\n")
+        unit = argv[-1]
+        body = "".join(f"{unit} journal {index}\n" for index in range(80))
+        return _result(
+            driver, argv, stdout=body + "Authorization: Bearer " + "b" * 40 + "\n"
+        )
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    driver._report_job_unit_diagnostics({"PSC_COORDINATOR_ROOT": str(root)})
+    err = capsys.readouterr().err
+
+    assert err.startswith("dispatch job diagnostics:\n")
+    # 只取最後幾個 unit，每個只取尾端若干行。
+    assert "cortex-gate-job@wf-8.service journal 79" in err
+    assert "cortex-gate-job@wf-2.service" not in err
+    assert "journal 0\n" not in err
+    assert "--- gate log wf-demo" in err
+    assert "gate line 99" in err and "gate line 10\n" not in err
+    assert "ghp_" + "a" * 30 not in err
+    assert "b" * 40 not in err
+    assert "<redacted>" in err
+    assert len(err) <= driver._JOB_DIAGNOSTIC_CHARS + 64
+
+
+def test_job_diagnostics_never_mask_the_dispatch_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    driver = _load_driver()
+
+    def broken(_env):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(driver, "_job_unit_diagnostics", broken)
+    driver._report_job_unit_diagnostics({})
+    assert "job diagnostics unavailable: RuntimeError" in capsys.readouterr().err

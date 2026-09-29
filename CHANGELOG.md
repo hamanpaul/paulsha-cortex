@@ -13,6 +13,7 @@
 - **#716 canary 結案診斷**：派工結案驗證失敗時列出不成立的條件（phase／status／gate／needs_human 代碼／缺少 phase／未過步驟），不輸出自由文字（#716）。
 - **#716 Codex 憑證目錄 owner**：scaffold 先以 Manager 身分建立 `codex-credentials/<principal>/`（0700）再寫入 `auth.json`，Manager 收回 refresh 過的憑證不再 EACCES（#716）。
 - **#716 codex code-mode host**：codex 改以 npm 平台套件的整個 `bin/` 目錄做 tree 安裝，`codex-code-mode-host` 與本體同目錄；installer 對原生進入點的 tree 產生直接 exec 的 wrapper（#716）。
+- **#716 canary job 診斷**：派工失敗或逾時時，driver 印出最近 job unit 的 journal 與 gate.log 有界尾端（遮蔽 credential 形狀）（#716）。
 - **#716 executor 退避 lock 位置**：lock 改放 coordinator root 內，三 UID 安裝的 Manager 不再因祖先目錄不可寫而讀不到退避 store、卡在 `executor-backoff-unknown`（#716）。
 - **#841 測試隔離**：PID 重用檢查的 procfs 根目錄可替換，測試預設不讀宿主 `/proc`，修正 CI 上以假 MainPID 撞到真程序的不穩定失敗。
 - **#1189 root-owned job HOME**：job_runner 接受 installer 建立的 root:root 0755 job HOME，三 UID 主機的降權 job 不再在 launch 前失敗；group／other 可寫的 HOME 拒絕（#1189）。
