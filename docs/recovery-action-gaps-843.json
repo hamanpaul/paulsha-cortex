@@ -72,7 +72,7 @@
     },
     {
       "id": "G843-R02-pre-candidate-active-writer",
-      "owner": "unfiled:producer-recover-pre-candidate-admission",
+      "owner": "issue-1168",
       "status": "open",
       "source": "paulsha_cortex/coordinator/manager.py::_pre_candidate_recovery_admission",
       "retest": "recover-pre-candidate must refuse, with zero side effects, when the bound builder job or another job with the same owner identity and attempt id is still dispatched/running; the projection shares the admission and must stop offering the action.",
@@ -83,7 +83,7 @@
     },
     {
       "id": "G843-R03-outcome-before-commit",
-      "owner": "unfiled:producer-engineering-outcome-275",
+      "owner": "issue-1169",
       "status": "open",
       "source": "paulsha_cortex/coordinator/work_actions.py::_abandon_action / _retire_delivered_action",
       "retest": "When the abandon or retire-delivered registry commit is rejected by drift (run still ongoing with an active job), the engineering-outcome outbox must not keep an abandoned/retired outcome for that run.",
@@ -93,7 +93,7 @@
     },
     {
       "id": "G843-R09-abandon-offered-for-pr-run",
-      "owner": "unfiled:producer-needs-human-projection",
+      "owner": "issue-1170",
       "status": "open",
       "source": "paulsha_cortex/coordinator/claim.py::needs_human_next_actions",
       "retest": "A needs_human run that carries PR refs but is not proven merged must not be offered abandon (the pre-delivery admission rejects it), or abandon admission must accept it; decide against the #728 non-empty next_actions guarantee.",
@@ -104,7 +104,7 @@
     },
     {
       "id": "G843-R06-slice-reverify-evidence-collision",
-      "owner": "unfiled:producer-slice-verification-evidence",
+      "owner": "issue-1171",
       "status": "open",
       "source": "paulsha_cortex/coordinator/verification.py::write_verification_evidence",
       "retest": "Slice retry-verify for the unchanged Candidate must be able to adopt a passing rerun; today the fixed (slice, candidate) evidence path quarantines the prior file, raises, and the action records verification-runner-error.",
@@ -114,14 +114,14 @@
     },
     {
       "id": "G843-R08-live-reclaim",
-      "owner": "runtime-owner",
+      "owner": "issue-1167",
       "status": "blocked",
       "source": "docs/recovery-action-contract-matrix.md#R08 RC boundary",
       "retest": "Blocked on a producer fix: under the three-UID deployment the Manager has no ACL entry on builder-created inodes (trust_root registry JOB_WORKSPACE_REACH builder note), so owner-bound reclaim of a used builder workspace can only fail closed or leave it behind, and reclaim_worktree continues to rmtree when the dirty scan is unavailable. After a root-owned or job-identity reclaim helper lands and dirty-scan failure fails closed, add a release-profile owner-bound-reclaim installed check in a driver-created isolated coordinator root: owned and foreign pool slots with plan ACLs, builder commit plus untracked subdirectory, recover-pre-candidate and abandon via execute_work_action as cortex-manager; verify the foreign slot is unchanged (bytes, owner, ACL), the owned slot is removed with a preserve archive, the result is unique after a fresh registry reload, and exact replay deletes nothing."
     },
     {
       "id": "G843-R08-reclaim-dirty-scan-fail-open",
-      "owner": "unfiled:producer-worktree-reclaim",
+      "owner": "issue-1166",
       "status": "open",
       "source": "paulsha_cortex/coordinator/worktree_reclaim.py::reclaim_worktree",
       "retest": "When the dirty scan cannot read the workspace (for example no Manager ACL on the builder index), reclaim_worktree must fail closed before any deletion instead of logging and continuing to rmtree; verify under a multi-UID RC profile that nothing is deleted and the marker survives for replay."
