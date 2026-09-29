@@ -350,6 +350,7 @@ def _installed_checks(
     receipt: Mapping[str, Any],
     evidence_dir: Path,
     require_system_status: bool = True,
+    receipt_path: Path | None = None,
 ) -> list[dict[str, str]]:
     install = _load_json(install_evidence, "install verification evidence")
     if (
@@ -405,6 +406,11 @@ def _installed_checks(
                     "status",
                     "--system",
                     "--json",
+                    *(
+                        ("--install-receipt", str(receipt_path))
+                        if receipt_path is not None
+                        else ()
+                    ),
                 ),
                 env=_installed_runtime_env(),
             )
@@ -437,7 +443,13 @@ def _installed_checks(
             trust_root = report.get("trust_root")
             if not isinstance(trust_root, Mapping) or trust_root.get("status") != "verified":
                 raise QualificationFailure(
-                    f"system-scope {name} Trust Root receipt is not verified"
+                    f"system-scope {name} Trust Root receipt is not verified: "
+                    + (
+                        f"status={_diagnostic_token(trust_root.get('status'))} "
+                        f"reason={_diagnostic_token(trust_root.get('reason'))}"
+                        if isinstance(trust_root, Mapping)
+                        else "trust_root=missing"
+                    )
                 )
             installed_artifact = report.get("installed_artifact")
             wheel_sha256 = trust_root.get("wheel_sha256")
@@ -5090,6 +5102,7 @@ def main() -> int:
             receipt=receipt,
             evidence_dir=args.evidence_dir,
             require_system_status=not legacy_profile,
+            receipt_path=args.receipt,
         )
         providers: list[dict[str, object]] = []
         if legacy_profile:

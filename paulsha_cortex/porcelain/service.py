@@ -75,6 +75,11 @@ def _build_parser() -> argparse.ArgumentParser:
                 "--system", action="store_true",
                 help="讀取 system scope units 與 Trust Root install receipt",
             )
+            cmd.add_argument(
+                "--install-receipt",
+                help="（搭配 --system）明確指定 effective install receipt；"
+                "未指定時搜尋 canonical receipt 目錄",
+            )
 
     ensure = sub.add_parser("ensure-running", help="確保 manager／monitor 正在執行（輸出 JSON）")
     ensure.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
@@ -502,6 +507,7 @@ def _apply_operator_install_evidence(
     *,
     environment_overlay: Any,
     instance: str,
+    receipt_path: Path | None = None,
 ) -> None:
     """Resolve the root-owned Trust Root receipt from the operator side.
 
@@ -532,12 +538,20 @@ def _apply_operator_install_evidence(
             installed.get("wheel_sha256") if isinstance(installed, Mapping) else None
         )
         candidates: list[tuple[int, dict[str, Any]]] = []
-        if receipt_dir.is_dir() and not receipt_dir.is_symlink():
-            from paulsha_cortex.trust_root.install.core import InstallReceipt
-
+        receipt_paths: list[Path] = []
+        if receipt_path is not None:
+            # installer 允許 effective receipt 放在 canonical 目錄以外（例如 RC
+            # 的 /run/cortex-install）；operator 明確指定時只看這一份。
+            if not receipt_path.is_absolute():
+                raise ValueError("install receipt path must be absolute")
+            receipt_paths = [receipt_path]
+        elif receipt_dir.is_dir() and not receipt_dir.is_symlink():
             receipt_paths = sorted(receipt_dir.glob("*.json"))
             if len(receipt_paths) > 256:
                 raise ValueError("install receipt directory exceeds scan limit")
+        if receipt_paths:
+            from paulsha_cortex.trust_root.install.core import InstallReceipt
+
             for path in receipt_paths:
                 if path.is_symlink() or not path.is_file():
                     continue
@@ -598,7 +612,12 @@ def _apply_operator_install_evidence(
             artifact["source_revision"] = "unknown"
 
 
-def _status_payload(instance: str, *, system_scope: bool = False) -> dict[str, Any]:
+def _status_payload(
+    instance: str,
+    *,
+    system_scope: bool = False,
+    install_receipt: str | None = None,
+) -> dict[str, Any]:
     probe = (
         probe_service_runtime(instance, scope="system")
         if system_scope
@@ -659,6 +678,7 @@ def _status_payload(instance: str, *, system_scope: bool = False) -> dict[str, A
                 payload["loaded_runtime"],
                 environment_overlay=environment_overlay,
                 instance=instance,
+                receipt_path=Path(install_receipt) if install_receipt else None,
             )
         return payload
     if system_scope:
@@ -1103,8 +1123,16 @@ def _run_lifecycle(command: str, *, instance: str, json_output: bool) -> int:
     return 0
 
 
-def _run_status(*, instance: str, json_output: bool, system_scope: bool = False) -> int:
-    service = _status_payload(instance, system_scope=system_scope)
+def _run_status(
+    *,
+    instance: str,
+    json_output: bool,
+    system_scope: bool = False,
+    install_receipt: str | None = None,
+) -> int:
+    service = _status_payload(
+        instance, system_scope=system_scope, install_receipt=install_receipt
+    )
     if json_output:
         _json_dump(_service_envelope("status", instance, mode=str(service.get("mode")), service=service))
         return 0
@@ -1321,6 +1349,7 @@ def main(argv: Sequence[str]) -> int:
                 instance=instance,
                 json_output=args.json,
                 system_scope=args.system,
+                install_receipt=getattr(args, "install_receipt", None),
             )
         if args.command == "logs":
             return _run_logs(

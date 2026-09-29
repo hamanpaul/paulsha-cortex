@@ -176,3 +176,41 @@ def test_installed_checks_wait_for_the_loaded_receipt_after_activation(
 
     assert len(status_calls) == 2
     assert {"name": "system-loaded-runtime-attestation", "status": "passed"} in tests
+
+
+def test_installed_checks_pass_the_effective_install_receipt_to_system_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _driver()
+    install_evidence = tmp_path / "install-evidence.json"
+    install_evidence.write_text(
+        json.dumps({"result": "pass", "attestation": {"ok": True}}),
+        encoding="utf-8",
+    )
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    status_commands: list[tuple[str, ...]] = []
+
+    def run(argv, **_kwargs):
+        if "service" in argv:
+            status_commands.append(tuple(argv))
+            stdout = json.dumps(_status_payload())
+        elif "selfcheck" in argv:
+            stdout = json.dumps({"ok": True, "job_writable_count": 0})
+        else:
+            stdout = json.dumps({"ok": True})
+        return driver.CommandResult(tuple(argv), 0, stdout, "")
+
+    monkeypatch.setattr(driver, "_run", run)
+    monkeypatch.setattr(driver, "_installed_runtime_env", dict)
+    receipt_path = Path("/run/cortex-install/install-receipt.json")
+
+    driver._installed_checks(
+        install_evidence=install_evidence,
+        receipt={},
+        evidence_dir=evidence_dir,
+        receipt_path=receipt_path,
+    )
+
+    assert status_commands[0][-2:] == ("--install-receipt", str(receipt_path))

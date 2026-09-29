@@ -729,6 +729,56 @@ def test_system_status_never_verifies_trust_root_without_the_installed_wheel(
     assert "candidate_commit" not in loaded_runtime["manager"]["installed_artifact"]
 
 
+def test_system_status_uses_an_explicit_effective_receipt_outside_the_canonical_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """installer 允許 effective receipt 放在 canonical 目錄以外（RC 放在
+    /run/cortex-install）；`--install-receipt` 明確指定時只採用這一份。"""
+    from paulsha_cortex.porcelain import service
+    from paulsha_cortex.trust_root.install import core
+
+    state_root = tmp_path / "cortex"
+    elsewhere = tmp_path / "run" / "install-receipt.json"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text("root controlled receipt", encoding="utf-8")
+    wheel_sha = "b" * 64
+    loaded_paths: list[Path] = []
+
+    class Receipt:
+        def to_dict(self):
+            return {
+                "plan": {
+                    "roots": {"state": str(state_root)},
+                    "candidate": {"wheel_sha256": wheel_sha},
+                    "repo_identity": {"commit": "c" * 40},
+                }
+            }
+
+    def load(path):
+        loaded_paths.append(path)
+        return Receipt()
+
+    monkeypatch.setattr(core.InstallReceipt, "load", load)
+    monkeypatch.setattr(service, "resolve_runtime_root", lambda *_args, **_kwargs: state_root / "coordinator")
+    monkeypatch.setattr(service, "_service_declared_environment", lambda *_args: ({}, "systemd-effective"))
+    monkeypatch.setattr(service, "trust_root_receipt_summary", lambda _path: {"status": "verified"})
+    loaded_runtime = {
+        "manager": {"installed_artifact": {"wheel_sha256": wheel_sha}},
+        "monitor": {"installed_artifact": {"wheel_sha256": wheel_sha}},
+    }
+
+    service._apply_operator_install_evidence(
+        loaded_runtime,
+        environment_overlay={"manager": {}},
+        instance="cortex",
+        receipt_path=elsewhere,
+    )
+
+    assert loaded_paths == [elsewhere]
+    assert loaded_runtime["trust_root"]["status"] == "verified"
+
+
 def test_system_status_reports_latest_rollback_receipt_over_prior_verified_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
