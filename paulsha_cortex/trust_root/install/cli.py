@@ -18,11 +18,16 @@ import yaml
 
 from .backend import LocalInstallBackend
 from .legacy import (
+    LegacyApplyContext,
     LegacyInventory,
     LocalLegacyHostBackend,
     apply_host_overlay,
+    bind_host_overlay,
     check_inventory_output,
     collect_legacy_inventory,
+    derive_legacy_adoption,
+    host_binding_sha256,
+    legacy_adoption_request,
     legacy_scope,
     publish_inventory,
     render_inventory_summary,
@@ -648,7 +653,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     plan = sub.add_parser("plan", help="produce a rootless exact-artifact desired-state plan")
     plan.add_argument("--config", required=True)
+    plan.add_argument(
+        "--host-overlay",
+        help="allowlisted host delta (account ids, egress home, operator/reader, "
+        "builder providers, legacy_adoption); the plan records its digest",
+    )
     plan.add_argument("--bundle", required=True)
+    plan.add_argument(
+        "--legacy-inventory",
+        help="reviewed legacy inventory the host overlay's legacy_adoption block binds "
+        "(legacy_policy: quarantine only)",
+    )
     plan.add_argument("--output", required=True)
 
     apply = sub.add_parser("apply", help="apply an exact confirmed plan as root")
@@ -661,6 +676,11 @@ def _build_parser() -> argparse.ArgumentParser:
     apply.add_argument(
         "--prior-receipt",
         help="explicit qualified receipt from the previous candidate during upgrade",
+    )
+    apply.add_argument(
+        "--legacy-inventory",
+        help="the reviewed legacy inventory a legacy_adoption plan binds; required "
+        "for such a plan, mutually exclusive with --prior-receipt",
     )
     apply.add_argument(
         "--maintenance-token",
@@ -804,13 +824,95 @@ def _bound_plan_from_config(
     return plan
 
 
+def _host_machine_id() -> str:
+    """This host's machine identity; ``/etc/machine-id`` is world-readable."""
+
+    return LocalLegacyHostBackend(require_root=False).machine_id()
+
+
+def _plan_document(
+    config: Mapping[str, object],
+    bundle: Path,
+    *,
+    overlay: Mapping[str, object] | None = None,
+    legacy_inventory: Path | None = None,
+    machine_id: str | None = None,
+) -> dict[str, object]:
+    """Plan ``config`` with an optional host overlay and legacy inventory.
+
+    Without an overlay the plan is exactly the release config's plan.  An
+    overlay changes only its allowlisted fields and records its digest.  A
+    ``legacy_adoption`` block (``legacy_policy: quarantine`` only) binds the
+    reviewed inventory, which must have been captured on this host with the
+    same config, overlay and bundle.
+    """
+
+    validated = validate_host_overlay(overlay) if overlay is not None else None
+    request = legacy_adoption_request(
+        config, validated, inventory_given=legacy_inventory is not None
+    )
+    effective = apply_host_overlay(config, validated) if validated is not None else config
+    plan = bind_host_overlay(_bound_plan_from_config(effective, Path(bundle)), validated)
+    if request is None:
+        return plan
+    assert legacy_inventory is not None
+    inventory = LegacyInventory.load(Path(legacy_inventory).expanduser().absolute())
+    return derive_legacy_adoption(
+        plan,
+        request=request,
+        overlay=validated,
+        inventory=inventory,
+        host_binding_sha256=host_binding_sha256(
+            machine_id if machine_id is not None else _host_machine_id()
+        ),
+    )
+
+
 def _plan_command(args: argparse.Namespace) -> int:
     config = _load_mapping(Path(args.config), label="trust-root config")
-    plan = _bound_plan_from_config(config, Path(args.bundle))
+    overlay = (
+        _load_mapping(Path(args.host_overlay), label="host overlay")
+        if args.host_overlay is not None
+        else None
+    )
+    plan = _plan_document(
+        config,
+        Path(args.bundle),
+        overlay=overlay,
+        legacy_inventory=(
+            Path(args.legacy_inventory) if args.legacy_inventory is not None else None
+        ),
+    )
     output = Path(args.output).expanduser().absolute()
     atomic_write_json(output, plan, mode=0o600)
-    _emit({"output": str(output), "plan_sha256": plan_sha256(plan)})
+    payload: dict[str, object] = {"output": str(output), "plan_sha256": plan_sha256(plan)}
+    if "host_overlay_sha256" in plan:
+        payload["host_overlay_sha256"] = plan["host_overlay_sha256"]
+    legacy_block = plan.get("legacy_adoption")
+    if isinstance(legacy_block, Mapping):
+        quarantine = legacy_block["quarantine"]
+        assert isinstance(quarantine, list)
+        payload["legacy_adoption"] = {
+            "inventory_sha256": legacy_block["inventory_sha256"],
+            "quarantine": len(quarantine),
+            "summary": legacy_block["summary"],
+        }
+    _emit(payload)
     return 0
+
+
+def _legacy_host_backend() -> LocalLegacyHostBackend:
+    """The root-only read-only host view legacy re-captures run against."""
+
+    return LocalLegacyHostBackend()
+
+
+def _legacy_rollback_host(receipt: InstallReceipt) -> LocalLegacyHostBackend | None:
+    """A host view for proving a legacy rollback, when the receipt adopted one."""
+
+    if receipt.to_dict().get("legacy_adoption") is None:
+        return None
+    return _legacy_host_backend()
 
 
 def _apply_command(args: argparse.Namespace) -> int:
@@ -826,6 +928,25 @@ def _apply_command(args: argparse.Namespace) -> int:
         raise UnsafeInstallPathError(
             f"receipt path must be absolute and contain no '..': {receipt_path}"
         )
+    # Refuse a wrong legacy flag combination before any lock, file or host read.
+    if args.legacy_inventory is not None and args.prior_receipt is not None:
+        raise InstallPlanError(
+            "--legacy-inventory and --prior-receipt are mutually exclusive"
+        )
+    if "legacy_adoption" in plan and args.legacy_inventory is None:
+        raise InstallPlanError(
+            "this plan carries a legacy_adoption block; apply requires --legacy-inventory"
+        )
+    if "legacy_adoption" not in plan and args.legacy_inventory is not None:
+        raise InstallPlanError(
+            "--legacy-inventory is accepted only for a plan that carries a "
+            "legacy_adoption block"
+        )
+    legacy_inventory = (
+        Path(args.legacy_inventory).expanduser().absolute()
+        if args.legacy_inventory is not None
+        else None
+    )
     with _install_transaction_lock(
         plan, maintenance_token=args.maintenance_token
     ):
@@ -836,6 +957,16 @@ def _apply_command(args: argparse.Namespace) -> int:
         )
         if prior_receipt is not None:
             validate_prior_receipt_handoff(plan, prior_receipt)
+        legacy_context = (
+            LegacyApplyContext(
+                plan,
+                LegacyInventory.load(legacy_inventory),
+                _legacy_host_backend(),
+                inventory_path=str(legacy_inventory),
+            )
+            if legacy_inventory is not None
+            else None
+        )
         receipt = (
             InstallReceipt.load(receipt_path, expected_plan=plan)
             if receipt_path.exists()
@@ -847,6 +978,7 @@ def _apply_command(args: argparse.Namespace) -> int:
             receipt=receipt,
             prior_receipt=prior_receipt,
             backend=LocalInstallBackend(),
+            legacy=legacy_context,
         )
     _emit(
         {
@@ -970,7 +1102,11 @@ def _recover_command(args: argparse.Namespace) -> int:
                 receipt_path, maintenance_token=maintenance_token
             ) as (receipt, _receipt_plan_value):
                 if not _receipt_restore_safe(receipt.to_dict()):
-                    rollback_receipt(receipt, backend=LocalInstallBackend())
+                    rollback_receipt(
+                        receipt,
+                        backend=LocalInstallBackend(),
+                        legacy_host=_legacy_rollback_host(receipt),
+                    )
                 restore_safe = _receipt_restore_safe(receipt.to_dict())
         if not restore_safe:
             raise InstallError(
@@ -1099,7 +1235,11 @@ def _rollback_command(args: argparse.Namespace) -> int:
                 }
             )
             return 0 if restore_safe or state == "applied" else 1
-        result = rollback_receipt(receipt, backend=LocalInstallBackend())
+        result = rollback_receipt(
+            receipt,
+            backend=LocalInstallBackend(),
+            legacy_host=_legacy_rollback_host(receipt),
+        )
     payload = result.to_dict()
     payload["restore_safe"] = _receipt_restore_safe(receipt.to_dict())
     _emit(payload)
@@ -1236,6 +1376,12 @@ def _receipt_restore_safe(document: Mapping[str, object]) -> bool:
         and rollback.get("retained_unknown") == []
         and rollback.get("retained_drift") == []
         and document.get("credentials", []) == []
+        # A legacy adoption is restore-safe only once a re-capture proved the
+        # reviewed legacy host is back.
+        and (
+            document.get("legacy_adoption") is None
+            or rollback.get("legacy_restored") is True
+        )
     )
 
 

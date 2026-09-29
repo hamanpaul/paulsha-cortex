@@ -2445,6 +2445,58 @@ def test_read_acl_reports_named_perms_when_live_mask_restricts_them(
     assert all(set(str(row["perms"])) <= set("rwx") for row in rows)
 
 
+def test_acl_argument_renders_an_empty_permission_set_as_a_dash() -> None:
+    # ``_read_acl`` records ``---`` as ``""`` (receipts already hold that
+    # form); ``setfacl -m "m::"`` is rejected as incomplete, ``m::-`` is not.
+    render = backend_module._acl_argument
+    assert render({"account": "", "perms": "", "default": False, "entry_type": "mask"}) == "m::-"
+    assert render({"account": "operator", "perms": "", "default": False}) == "u:operator:-"
+    assert render({"account": "", "perms": "", "default": True, "entry_type": "mask"}) == "d:m::-"
+    assert render({"account": "", "perms": "rX", "default": False, "entry_type": "other"}) == "o::rx"
+
+
+def test_acl_with_empty_permission_entries_round_trips_through_rollback_apply(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
+        pytest.skip("requires acl tools")
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    target = tmp_path / "legacy-state"
+    target.mkdir(mode=0o750)
+    try:
+        subprocess.run(
+            [
+                "setfacl",
+                "-m",
+                f"u:{account}:---,m::---,d:u::rwx,d:g::r-x,d:o::---,d:u:{account}:---,d:m::---",
+                str(target),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        pytest.skip("this filesystem does not support POSIX ACLs")
+    prior = backend_module._read_acl(target)
+    assert {"account": account, "perms": "", "default": False} in prior
+    assert {"account": "", "perms": "", "default": False, "entry_type": "mask"} in prior
+    mode = format(stat.S_IMODE(target.lstat().st_mode), "04o")
+    # Metadata replacement changes it; rollback applies the recorded prior.
+    subprocess.run(["setfacl", "-b", "-k", str(target)], check=True)
+    subprocess.run(["setfacl", "-m", f"u:{account}:rwx", str(target)], check=True)
+    assert backend_module._read_acl(target) != prior
+
+    descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        backend_module._apply_fd_asset_state(
+            descriptor, owner=account, group=group, mode=mode, acls=prior, directory=True
+        )
+    finally:
+        os.close(descriptor)
+
+    assert backend_module._read_acl(target) == prior
+
+
 def test_missing_getfacl_binary_is_not_reported_as_an_empty_acl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
