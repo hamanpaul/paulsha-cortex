@@ -679,14 +679,22 @@ def _run_main_sync_stage(
     argv: tuple[str, ...],
     runner: Callable[..., object],
     timeout_seconds: float,
+    git_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> MainSyncProbeStageOutcome:
-    command = ("git", "-C", str(worktree), *argv)
+    command = (
+        ("git", "-C", str(worktree), *argv)
+        if git_dir is None
+        else ("git", f"--git-dir={git_dir}", *argv)
+    )
+    extra: dict[str, object] = {} if env is None else {"env": dict(env)}
     try:
         completed = runner(
             list(command),
             shell=False,
             capture_output=True,
             timeout=timeout_seconds,
+            **extra,
         )
     except subprocess.TimeoutExpired as exc:
         return MainSyncProbeStageOutcome(
@@ -884,6 +892,68 @@ def _classify_main_sync_conflicts(
     return "conflict"
 
 
+def _main_sync_objects_dir(stdout: bytes) -> Path | None:
+    """`rev-parse --path-format=absolute --git-path objects` 的輸出 → 既存的絕對目錄。"""
+
+    text = stdout.decode("utf-8", errors="surrogateescape")
+    if text.endswith("\n"):
+        text = text[:-1]
+    if not text or "\n" in text or "\0" in text:
+        return None
+    objects_dir = Path(text)
+    if not objects_dir.is_absolute() or not objects_dir.is_dir():
+        return None
+    return objects_dir
+
+
+def _create_isolated_merge_git_dir(*, objects_dir: Path, sha256: bool) -> Path:
+    """#1142：merge-tree 專用、用完即刪的私有 bare GIT_DIR。
+
+    不走 `git init`（template 可能帶 `info/attributes`），直接寫最小 bare repo：
+    HEAD、refs/、只含 `repositoryformatversion`／`bare`（sha256 另加
+    `extensions.objectformat`）的 config，以及指向來源 repo object store 的
+    `objects/info/alternates`——唯讀共用、不複製。沒有 `info/attributes`，沒有
+    工作樹。`tempfile.mkdtemp` 以 0700 建立，呼叫端負責刪除。
+    """
+
+    root = Path(tempfile.mkdtemp(prefix="cortex-main-sync-"))
+    try:
+        (root / "objects" / "info").mkdir(parents=True)
+        (root / "refs" / "heads").mkdir(parents=True)
+        (root / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        config = (
+            "[core]\n"
+            f"\trepositoryformatversion = {1 if sha256 else 0}\n"
+            "\tbare = true\n"
+        )
+        if sha256:
+            config += "[extensions]\n\tobjectformat = sha256\n"
+        (root / "config").write_text(config, encoding="utf-8")
+        (root / "objects" / "info" / "alternates").write_text(
+            f"{objects_dir}\n", encoding="utf-8"
+        )
+    except OSError:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    return root
+
+
+def _main_sync_isolated_git_env() -> dict[str, str]:
+    """#1142：merge-tree 的隔離環境——剝掉呼叫端所有 `GIT_*`，關掉 system／global
+    config 與 system attributes；全域 attributes 檔另以 `-c core.attributesFile`
+    關掉（它的預設值是 XDG 路徑，不隨 `GIT_CONFIG_GLOBAL` 消失）。"""
+
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
+        }
+    )
+    return env
+
+
 def _probe_main_sync(
     *,
     worktree: Path,
@@ -1071,30 +1141,100 @@ def _probe_main_sync(
         )
 
     # #1142：merge driver 由 attributes 決定（repo 追蹤的 `.gitattributes` 宣告
-    # `CHANGELOG.md merge=union`）。merge-tree 預設讀**工作樹**的 `.gitattributes`，
-    # 讓判定跟著 ship clone 當下 checkout 的狀態漂移；改以全域 `--attr-source`
-    # 固定讀 M（目標分支已合入、已審的版本）的 tree。Candidate 自己改的
-    # attributes 因此無法把真衝突宣告成 union 而矇過 probe；`$GIT_DIR/info/attributes`
-    # 仍照 git 既有優先序套用。需要 git >= 2.43：全域 `--attr-source` 自 2.41 起才有，
-    # 而 merge-tree 搭配它在 2.43 之前會 segfault——舊版一律落成 merge-tree stage
-    # failure（`main-sync-unavailable`），fail-closed，不會誤判 in-sync。
-    merge_tree = _run_main_sync_stage(
+    # `CHANGELOG.md merge=union`），判定只能看 M（目標分支已合入、已審的版本）
+    # 的 tree。`--attr-source=<M>` 只取代工作樹 `.gitattributes`；git 仍會疊上
+    # `$GIT_DIR/info/attributes`、`core.attributesFile`（含 XDG 預設）與 system
+    # attributes，任一處把 README 之類宣告成 union 都能把真衝突矇成 clean。因此
+    # merge-tree 改在用完即刪的私有暫存 GIT_DIR 裡跑：object store 以 alternates
+    # 唯讀共用來源 repo（不複製、merge 結果 tree 只寫進暫存 repo），環境剝掉
+    # 呼叫端的 `GIT_*` 並設 `GIT_CONFIG_NOSYSTEM`／`GIT_CONFIG_GLOBAL=/dev/null`／
+    # `GIT_ATTR_NOSYSTEM`，再以 `-c core.attributesFile=/dev/null` 關掉全域
+    # attributes 檔。任何一步失敗都是 probe failure（`main-sync-unavailable`）。
+    # 需要 git >= 2.43：全域 `--attr-source` 自 2.41 起才有，而 merge-tree 搭配它
+    # 在 2.43 之前會 segfault——舊版一律落成 merge-tree stage failure，fail-closed，
+    # 不會誤判 in-sync。
+    objects_stage = _run_main_sync_stage(
         worktree=worktree,
-        stage="merge-tree",
-        argv=(
-            f"--attr-source={main_head}",
-            "merge-tree",
-            "--write-tree",
-            "--name-only",
-            "--no-messages",
-            "-z",
-            f"--merge-base={merge_base_oid}",
-            candidate_oid,
-            main_head,
-        ),
+        stage="merge-tree-objects",
+        argv=("rev-parse", "--path-format=absolute", "--git-path", "objects"),
         runner=runner,
         timeout_seconds=timeout_seconds,
     )
+    raw[objects_stage.stage] = objects_stage
+    if objects_stage.error_kind is not None or objects_stage.returncode != 0:
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=objects_stage.stage,
+            outcome=objects_stage,
+            error_kind=_main_sync_command_failure_kind(objects_stage.stage, objects_stage),
+            raw=raw,
+            main_head=main_head,
+        )
+    objects_dir = _main_sync_objects_dir(objects_stage.stdout)
+    if objects_dir is None:
+        raw[objects_stage.stage] = MainSyncProbeStageOutcome(
+            stage=objects_stage.stage,
+            argv=objects_stage.argv,
+            returncode=objects_stage.returncode,
+            stdout=objects_stage.stdout,
+            stderr=objects_stage.stderr,
+            error_kind="output-malformed",
+        )
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=objects_stage.stage,
+            outcome=raw[objects_stage.stage],
+            error_kind="output-malformed",
+            raw=raw,
+            main_head=main_head,
+        )
+    try:
+        isolated_git_dir = _create_isolated_merge_git_dir(
+            objects_dir=objects_dir,
+            sha256=len(main_head) == 64,
+        )
+    except OSError as exc:
+        isolation = MainSyncProbeStageOutcome(
+            stage="merge-tree-isolation",
+            argv=(),
+            returncode=None,
+            stdout=b"",
+            stderr=str(exc).encode("utf-8", errors="replace"),
+            error_kind="isolation-failed",
+        )
+        raw[isolation.stage] = isolation
+        return _main_sync_failure(
+            candidate=candidate,
+            stage=isolation.stage,
+            outcome=isolation,
+            error_kind="isolation-failed",
+            raw=raw,
+            main_head=main_head,
+        )
+    try:
+        merge_tree = _run_main_sync_stage(
+            worktree=worktree,
+            stage="merge-tree",
+            git_dir=isolated_git_dir,
+            env=_main_sync_isolated_git_env(),
+            argv=(
+                "-c",
+                f"core.attributesFile={os.devnull}",
+                f"--attr-source={main_head}",
+                "merge-tree",
+                "--write-tree",
+                "--name-only",
+                "--no-messages",
+                "-z",
+                f"--merge-base={merge_base_oid}",
+                candidate_oid,
+                main_head,
+            ),
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+        )
+    finally:
+        shutil.rmtree(isolated_git_dir, ignore_errors=True)
     raw[merge_tree.stage] = merge_tree
     if merge_tree.error_kind is not None or merge_tree.returncode not in {0, 1}:
         return _main_sync_failure(

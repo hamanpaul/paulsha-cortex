@@ -16,9 +16,11 @@ owner 裁決（2026-09-29）「union＋重試用當下 main」：
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,9 +29,11 @@ from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
 from paulsha_cortex.coordinator.seams import ScriptWorktreeCreator
 
 from test_main_probe_gate_987 import (
+    _SequencedProbeRunner,
     _advance_origin_with,
     _git,
     _init_probe_repo,
+    _probe_success_prefix,
     _wire_origin,
 )
 from test_main_sync_retry_exit import _main_sync_stop, _retry_build
@@ -195,6 +199,204 @@ def test_main_sync_probe_ignores_candidate_declared_union_attributes(
     assert isinstance(probe, work_bridge.MainSyncProbe)
     assert probe.relation == "conflict"
     assert probe.conflict_paths == ("README.md",)
+
+
+def _declare_readme_union_outside_m(
+    repo: Path, tmp_path: Path, monkeypatch, *, source: str
+) -> None:
+    """在 M 的 tree 以外的 attributes 來源宣告 `README.md merge=union`。"""
+
+    declaration = "README.md merge=union\n"
+    if source == "info-attributes":
+        git_dir = Path(_git(repo, "rev-parse", "--absolute-git-dir"))
+        (git_dir / "info").mkdir(exist_ok=True)
+        (git_dir / "info" / "attributes").write_text(declaration, encoding="utf-8")
+        return
+    home = tmp_path / "attr-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    if source == "global-attributes-file":
+        attributes = home / "global-attributes"
+        attributes.write_text(declaration, encoding="utf-8")
+        config = home / "global-gitconfig"
+        config.write_text(f"[core]\n\tattributesFile = {attributes}\n", encoding="utf-8")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+        return
+    if source == "xdg-attributes":
+        xdg = home / "xdg"
+        (xdg / "git").mkdir(parents=True)
+        (xdg / "git" / "attributes").write_text(declaration, encoding="utf-8")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+        monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+        return
+    raise AssertionError(source)
+
+
+@pytest.mark.parametrize(
+    "source", ["info-attributes", "global-attributes-file", "xdg-attributes"]
+)
+def test_main_sync_probe_only_reads_attributes_from_main_commit(
+    tmp_path: Path, monkeypatch, source: str
+) -> None:
+    """來源 repo 的 `info/attributes`、`core.attributesFile`／XDG attributes 不得影響判定。
+
+    M 只宣告 CHANGELOG union：README 兩邊真衝突時仍判 conflict，CHANGELOG 同位置
+    插入仍由 M 的 union 收斂。
+    """
+
+    repo, origin = _union_probe_repo(tmp_path)
+    candidate = _commit_files(
+        repo,
+        {
+            "CHANGELOG.md": _CHANGELOG_BASE.replace("- base", "- feature entry\n- base"),
+            "README.md": "feature readme\n",
+        },
+        "feature edits",
+    )
+    _advance_origin_with(
+        origin,
+        tmp_path / "origin-conflict",
+        files={
+            "CHANGELOG.md": _CHANGELOG_BASE.replace("- base", "- main entry\n- base"),
+            "README.md": "main readme\n",
+        },
+        message="main edits",
+    )
+    _declare_readme_union_outside_m(repo, tmp_path, monkeypatch, source=source)
+
+    probe = work_bridge._probe_main_sync(
+        worktree=repo, candidate=candidate, timeout_seconds=5.0
+    )
+
+    assert isinstance(probe, work_bridge.MainSyncProbe)
+    assert probe.relation == "conflict"
+    assert probe.conflict_paths == ("README.md",)
+    stop = work_bridge._main_sync_stop_result(state_root=tmp_path / "state", probe=probe)
+    assert stop["reason"] == "candidate-conflicts-with-main"
+
+
+def test_main_sync_probe_keeps_main_declared_changelog_union_despite_source_info_attributes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo, origin = _union_probe_repo(tmp_path)
+    candidate = _commit_files(
+        repo,
+        {"CHANGELOG.md": _CHANGELOG_BASE.replace("- base", "- feature entry\n- base")},
+        "feature changelog",
+    )
+    remote_main = _advance_origin_with(
+        origin,
+        tmp_path / "origin-changelog",
+        files={"CHANGELOG.md": _CHANGELOG_BASE.replace("- base", "- main entry\n- base")},
+        message="main changelog",
+    )
+    _declare_readme_union_outside_m(repo, tmp_path, monkeypatch, source="info-attributes")
+
+    probe = work_bridge._probe_main_sync(
+        worktree=repo, candidate=candidate, timeout_seconds=5.0
+    )
+
+    assert isinstance(probe, work_bridge.MainSyncProbe)
+    assert probe.relation == "clean-behind"
+    assert probe.main_head == remote_main
+    assert probe.conflict_paths == ()
+
+
+class _RecordingGitRunner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(([str(value) for value in argv], dict(kwargs)))
+        return subprocess.run(argv, **kwargs)
+
+
+def test_main_sync_probe_runs_merge_tree_in_isolated_throwaway_git_dir(
+    tmp_path: Path,
+) -> None:
+    repo, origin = _union_probe_repo(tmp_path)
+    candidate = _commit_files(repo, {"README.md": "feature readme\n"}, "feature readme")
+    remote_main = _advance_origin_with(
+        origin,
+        tmp_path / "origin-readme",
+        files={"README.md": "main readme\n"},
+        message="main readme",
+    )
+    runner = _RecordingGitRunner()
+
+    probe = work_bridge._probe_main_sync(
+        worktree=repo, candidate=candidate, runner=runner, timeout_seconds=5.0
+    )
+
+    assert isinstance(probe, work_bridge.MainSyncProbe)
+    assert probe.relation == "conflict"
+    [(argv, kwargs)] = [call for call in runner.calls if "merge-tree" in call[0]]
+    git_dir_arg = argv[1]
+    assert git_dir_arg.startswith("--git-dir=")
+    isolated = Path(git_dir_arg.removeprefix("--git-dir="))
+    assert argv[:2] == ["git", git_dir_arg]
+    assert argv[2:6] == [
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        f"--attr-source={remote_main}",
+        "merge-tree",
+    ]
+    env = kwargs["env"]
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert env["GIT_ATTR_NOSYSTEM"] == "1"
+    assert not any(
+        key in env for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_ATTR_SOURCE")
+    )
+    # 用完即刪；merge 結果 tree 寫在暫存 repo，來源 repo 的 object store 唯讀共用。
+    assert not isolated.exists()
+    tree_oid = probe.raw["merge-tree"].stdout.split(b"\0", 1)[0].decode("ascii")
+    assert _try_git(repo, "cat-file", "-e", tree_oid).returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("objects_outcome", "expected_error_kind", "expected_returncode"),
+    [
+        (
+            SimpleNamespace(returncode=128, stdout=b"", stderr=b"fatal: not a git repository\n"),
+            "command-failed",
+            128,
+        ),
+        (
+            SimpleNamespace(returncode=0, stdout=b"relative/objects\n", stderr=b""),
+            "output-malformed",
+            0,
+        ),
+    ],
+)
+def test_main_sync_probe_isolation_failure_is_main_sync_unavailable(
+    tmp_path: Path,
+    objects_outcome: object,
+    expected_error_kind: str,
+    expected_returncode: int,
+) -> None:
+    candidate, main_head, merge_base = "a" * 40, "b" * 40, "c" * 40
+    runner = _SequencedProbeRunner(
+        [
+            *_probe_success_prefix(
+                candidate=candidate, main_head=main_head, merge_base=merge_base
+            ),
+            objects_outcome,
+        ]
+    )
+
+    probe = work_bridge._probe_main_sync(
+        worktree=tmp_path, candidate=candidate, runner=runner, timeout_seconds=0.1
+    )
+
+    assert isinstance(probe, work_bridge.MainSyncProbeFailure)
+    assert probe.stage == "merge-tree-objects"
+    assert probe.error_kind == expected_error_kind
+    assert probe.returncode == expected_returncode
+    assert probe.main_head == main_head
+    assert not any("merge-tree" in call for call in runner.calls)
+    stop = work_bridge._main_sync_stop_result(state_root=tmp_path / "state", probe=probe)
+    assert stop["reason"] == work_bridge.MAIN_SYNC_UNAVAILABLE_REASON
 
 
 # ---------------------------------------------------------------------------
