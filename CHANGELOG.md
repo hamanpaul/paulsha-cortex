@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 canary ls-remote**：Manager GitHub probe 改用 `git ls-remote --refs`，不再因真實輸出的 `HEAD` 列判為畸形（#716）。
 - **#716 Manager gh 設定**：root-owned 唯讀的 gh config 加上 `version: "1"`，避免 gh 遷移寫檔導致 `gh auth status` 失敗（#716）。
 - **#716 deployment canary Manager credential helper**：probe 改查 installer 實際寫的 URL-scoped `credential.https://github.com.helper`（reset＋gh 兩列），不再因查不帶 URL 的鍵而失敗（#716）。
 - **blocking findings 提示措辭**：兩個出口改稱「豁免 finding → retry-review」與「要求修正 → retry-build」，避免誤讀（#1139）。
