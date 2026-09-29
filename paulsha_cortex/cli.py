@@ -279,6 +279,46 @@ def _format_candidate_git_base(payload: object) -> list[str]:
     return lines
 
 
+def _format_stage_reuse(payload: object) -> list[str]:
+    """`cortex work show` 的 stage-evidence reuse 區塊（#844 S11）。
+
+    每張有 receipt 的 verify／review 卡一行：``reused`` 印出來源 run／job／
+    evidence sha256 與採信結果，``fresh`` 印新 attempt 的 job，``ineligible``
+    印原因。純函式；Monitor 沒有這一欄（legacy）時回空清單。
+    """
+
+    if not isinstance(payload, dict) or not payload:
+        return []
+    cards = payload.get("cards")
+    if not isinstance(cards, dict):
+        return []
+    lines: list[str] = []
+    for card in sorted(cards):
+        receipt = cards[card]
+        if not isinstance(receipt, dict):
+            continue
+        decision = receipt.get("decision")
+        parts = [f"stage_reuse[{card}]: decision={decision}"]
+        if decision == "reused":
+            parts.extend(
+                [
+                    f"source_job={receipt.get('source_job_id') or '-'}",
+                    f"source_run={receipt.get('source_run_id') or '-'}",
+                    f"evidence_sha256={receipt.get('source_evidence_hash') or '-'}",
+                    f"adoption={receipt.get('adoption') or '-'}",
+                ]
+            )
+        elif decision == "fresh":
+            parts.append(f"job={receipt.get('job_id') or '-'}")
+        else:
+            parts.append(f"reason={receipt.get('reason') or '-'}")
+        mismatched = receipt.get("mismatched_fields")
+        if isinstance(mismatched, list) and mismatched:
+            parts.append(f"mismatched={','.join(str(item) for item in mismatched)}")
+        lines.append(" ".join(parts))
+    return lines
+
+
 def _format_quota_decision(payload: object) -> list[str]:
     """`cortex work show` 的 quota-aware admission 決策區塊（#840）。
 
@@ -460,6 +500,9 @@ def _work_read_main(
         # status` 共用同一份投影，逐行印出與其 `--json` 相同的內容，維持文字
         # 模式與 JSON 模式一致。
         for line in _format_quota_decision(data.get("quota_decision")):
+            print(line)
+        # #844 S11：verify／review 卡的 stage-evidence reuse receipt。
+        for line in _format_stage_reuse(data.get("stage_reuse")):
             print(line)
         if parsed.explain:
             print(json.dumps(data.get("explanation", {}), ensure_ascii=False, indent=2))

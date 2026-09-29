@@ -283,7 +283,28 @@ class WorkReadModelStore:
             quota_decision = self._quota_decision(item.repo, item.work_id)
             if quota_decision:
                 envelope["quota_decision"] = quota_decision
+            # #844 S11：verify／review 卡的 stage-evidence reuse receipt（reused
+            # 連回來源 run／job／evidence hash）。資料源同上（workflow provider
+            # 的 observations），exact (repo, work_id) 比對。
+            stage_reuse = self._stage_reuse(item.repo, item.work_id)
+            if stage_reuse:
+                envelope["stage_reuse"] = stage_reuse
             return envelope
+
+    def _stage_reuse(self, repo: str, work_id: str) -> dict:
+        for provider_id, provider in self._snapshot.providers.items():
+            if not provider_id.startswith("workflow:") or _provider_repo(provider_id) != repo:
+                continue
+            observations = provider.observations
+            if not isinstance(observations, Mapping):
+                continue
+            rows = observations.get("stage_reuse", {})
+            if not isinstance(rows, Mapping):
+                continue
+            found = rows.get(work_id)
+            if isinstance(found, Mapping) and found:
+                return dict(found)
+        return {}
 
     def _candidate_git_base(self, repo: str, work_id: str) -> dict:
         for provider_id, provider in self._snapshot.providers.items():

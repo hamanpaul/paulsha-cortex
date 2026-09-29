@@ -3463,6 +3463,33 @@ def _maybe_record_copilot_timeout_rearm_permit(
     return existing
 
 
+def _authority_restart_stage_invalidation(before, after) -> dict[str, Any]:
+    """#844 S09（2026-09-20 留言）：一般 resume 因 authority 前進而讓同一個
+    candidate 已接受的 verify／review gate 回 pending 時，action result 必須說得
+    出原因、變更的 authority 與重跑範圍——而不是只剩一個
+    ``retry_classification``。新 claim-era 不沿用前代 era 的 stage evidence
+    （跨 era 採信不在 #844 reuse 安全 cohort），build candidate 保留。"""
+
+    return {
+        "reason": "authority-restart",
+        "previous_claim_key": before.claim_key,
+        "claim_key": after.claim_key,
+        "previous_source_revision": before.source_revision,
+        "source_revision": after.source_revision,
+        "candidate_head": after.candidate_head,
+        "rerun_cards": [
+            step.card
+            for step in before.steps
+            if step.phase in {"verify", "review"} and step.gate_result != "pending"
+        ],
+        "preserved_cards": [
+            step.card
+            for step in after.steps
+            if step.phase == "build" and step.gate_result == "passed"
+        ],
+    }
+
+
 def _claim_action(
     *,
     args: dict[str, Any],
@@ -3780,7 +3807,9 @@ def _claim_action(
             )
         new_digest = work_authority_digest(authority)
         authority_restart_classification = None
+        stage_invalidation = None
         if canonical_run.current_phase in {"verify", "review"}:
+            previous_run = canonical_run
             try:
                 canonical_run = workflow_registry._manager_reset_workflow_for_authority_restart(
                     canonical_run.run_id,
@@ -3789,6 +3818,9 @@ def _claim_action(
                 )
                 authority_restart_classification = _classify_retry(
                     canonical_run, workflow_registry, trigger="authority-restart"
+                )
+                stage_invalidation = _authority_restart_stage_invalidation(
+                    previous_run, canonical_run
                 )
             except ValueError:
                 pass
@@ -3804,11 +3836,14 @@ def _claim_action(
         )
         if authority_restart_classification is not None:
             active["retry_classification"] = authority_restart_classification
-        return {
+        resumed: dict[str, Any] = {
             "action": "resume",
             "reason": "active-workflow",
             "run": active,
         }
+        if stage_invalidation is not None:
+            resumed["stage_invalidation"] = stage_invalidation
+        return resumed
     decision = (
         decide_auto_claim(candidate, now_epoch=now_epoch)
         if automatic

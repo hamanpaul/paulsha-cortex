@@ -140,6 +140,33 @@ def _validate_execution_profile_bindings(
 
 _STAGE_REUSE_DECISIONS = frozenset({"reused", "fresh", "ineligible"})
 
+#: #844 G844-2：`stage_reuse_receipts` 單卡 receipt 的版本。缺席＝第一版
+#: （只有 decision／key，#1102 起的既有資料），讀取時照舊接受、不補值；
+#: 版本 2 起 Manager 在採信當下寫入來源連結（見 manager
+#: `_stage_reuse_adoption_receipt`）。
+STAGE_REUSE_RECEIPT_SCHEMA_VERSION = 2
+
+#: 版本 2 的 reused receipt 必備來源連結欄位（S11：連回來源 run／job／
+#: evidence hash 與採信結果）。
+STAGE_REUSE_REUSED_REQUIRED_FIELDS = (
+    "source_run_id",
+    "source_job_id",
+    "source_evidence_hash",
+    "adoption",
+)
+STAGE_REUSE_ADOPTIONS = frozenset({"accepted", "rejected"})
+_STAGE_REUSE_OPTIONAL_STRING_FIELDS = (
+    "job_id",
+    "phase",
+    "compatibility",
+    "candidate_sha",
+    "source_run_id",
+    "source_claim_key",
+    "source_job_id",
+    "source_evidence_path",
+    "adoption",
+)
+
 
 def _is_stage_execution_key(value: object) -> bool:
     return (
@@ -147,6 +174,10 @@ def _is_stage_execution_key(value: object) -> bool:
         and len(value) == 64
         and all(char in "0123456789abcdef" for char in value)
     )
+
+
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 def _validate_stage_reuse_receipts(
@@ -203,6 +234,42 @@ def _validate_stage_reuse_receipts(
         ):
             raise ValueError(
                 f"workflow run stage_reuse_receipts[{card!r}].mismatched_fields 格式錯誤"
+            )
+        # #844 G844-2：新增欄位一律「出現才驗形狀」，讓第一版 receipt（沒有這些
+        # 欄位）與未來版本（rollback 讀到較新的 receipt）都不會讓 registry
+        # 讀取 fail closed；只有明示第 2 版的 reused receipt 才要求來源連結。
+        version = receipt.get("receipt_schema_version")
+        if version is not None and not _is_positive_int(version):
+            raise ValueError(
+                f"workflow run stage_reuse_receipts[{card!r}].receipt_schema_version 格式錯誤"
+            )
+        key_version = receipt.get("stage_execution_key_schema_version")
+        if key_version is not None and not _is_positive_int(key_version):
+            raise ValueError(
+                f"workflow run stage_reuse_receipts[{card!r}]"
+                ".stage_execution_key_schema_version 格式錯誤"
+            )
+        if version == STAGE_REUSE_RECEIPT_SCHEMA_VERSION and decision == "reused":
+            for field_name in STAGE_REUSE_REUSED_REQUIRED_FIELDS:
+                if field_name not in receipt:
+                    raise ValueError(
+                        f"workflow run stage_reuse_receipts[{card!r}] 缺 {field_name}"
+                    )
+        for field_name in _STAGE_REUSE_OPTIONAL_STRING_FIELDS:
+            value = receipt.get(field_name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(
+                    f"workflow run stage_reuse_receipts[{card!r}].{field_name} 必須為非空字串"
+                )
+        evidence_hash = receipt.get("source_evidence_hash")
+        if evidence_hash is not None and not _is_stage_execution_key(evidence_hash):
+            raise ValueError(
+                f"workflow run stage_reuse_receipts[{card!r}].source_evidence_hash 格式錯誤"
+            )
+        adoption = receipt.get("adoption")
+        if adoption is not None and adoption not in STAGE_REUSE_ADOPTIONS:
+            raise ValueError(
+                f"workflow run stage_reuse_receipts[{card!r}].adoption 非法"
             )
 
 

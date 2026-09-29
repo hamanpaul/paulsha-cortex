@@ -521,6 +521,7 @@ class WorkflowRegistryProvider:
             needs_human_reasons: dict[str, dict[str, object]] = {}
             candidate_git_bases: dict[str, dict[str, object]] = {}
             quota_decisions: dict[str, dict[str, object]] = {}
+            stage_reuse: dict[str, dict[str, object]] = {}
             diagnostics: list[str] = []
             validated_completions: dict[str, list[dict[str, object]]] = {}
             for row in rows:
@@ -597,6 +598,18 @@ class WorkflowRegistryProvider:
                         quota_decisions[work_id] = {"run_id": run_id, **quota_projection}
                     elif work_id not in quota_decisions:
                         quota_decisions[work_id] = {"run_id": run_id, **quota_projection}
+                # #844 S11：verify／review 卡的 stage-evidence reuse receipt
+                # （reused 連回來源 run／job／evidence hash；fresh 帶新 attempt
+                # 的 job；ineligible 帶原因）。canonical coordinator 狀態檔的 row
+                # 已由 `_validate_canonical_coordinator_v2_root` 經
+                # `WorkflowRun.from_dict` 驗過形狀；這裡只做唯讀投影。同一
+                # work_id 多個 run 時沿用 quota_decisions 的選 run 規則。
+                reuse_projection = _stage_reuse_row(row)
+                if reuse_projection is not None:
+                    if row.get("status", "ongoing") not in _TERMINAL_WORKFLOW_RUN_STATUSES:
+                        stage_reuse[work_id] = {"run_id": run_id, **reuse_projection}
+                    elif work_id not in stage_reuse:
+                        stage_reuse[work_id] = {"run_id": run_id, **reuse_projection}
                 # #731 (C)：候選 git base（真的那個 40-hex commit SHA）與落後
                 # mirror 上 origin/main 的距離。同樣走 observations 通道，理由
                 # 與上面兩段一致（新增 row 欄位會讓整份 projection degraded）。
@@ -669,6 +682,7 @@ class WorkflowRegistryProvider:
             "needs_human_reasons": needs_human_reasons,
             "candidate_git_bases": candidate_git_bases,
             "quota_decisions": quota_decisions,
+            "stage_reuse": stage_reuse,
         }
         if workflow_next_actions:
             observations["workflow_next_actions"] = workflow_next_actions
@@ -804,6 +818,21 @@ _TERMINAL_WORKFLOW_RUN_STATUSES = frozenset({"done", "completed", "failed", "sup
 # 共用判準移到 `decision_projection.current_identity_by_persona_from_steps`，
 # 讓 `cortex inspect status`（Manager 端）與本 provider 用同一份實作。
 _current_persona_identity_from_steps = current_identity_by_persona_from_steps
+
+
+def _stage_reuse_row(row: Mapping[str, Any]) -> dict[str, object] | None:
+    """#844：run row 的 `stage_reuse_receipts` 投影；缺席或空時略過。"""
+
+    receipts = row.get("stage_reuse_receipts")
+    if not isinstance(receipts, Mapping) or not receipts:
+        return None
+    return {
+        "cards": {
+            str(card): dict(receipt)
+            for card, receipt in receipts.items()
+            if isinstance(receipt, Mapping)
+        }
+    }
 
 
 def _quota_decision_row(

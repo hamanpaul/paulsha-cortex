@@ -52,6 +52,7 @@ from .task_memory import (
 from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
 from .registry import (
     RETRY_CARD_PHASE_PERSONA,
+    STAGE_EXECUTION_KEY_SCHEMA_VERSION,
     describe_stage_execution_mismatch,
     slice_repin_eligible,
     stage_execution_receipt,
@@ -98,6 +99,7 @@ from .planning import (
 )
 from .workflow import (
     BRAINSTORM_AUTHORITY_MISSING,
+    STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
     WORKFLOW_PHASES,
     GateEvidenceRef,
     PlanningDriftArtifact,
@@ -14206,6 +14208,153 @@ _TASK_MEMORY_APPLIED_PROMPT = (
 #: 列為明確 gap（見 #844 交付報告）。
 STAGE_EXECUTION_REUSE_SUPPORTED_PHASES = frozenset({"verify", "review"})
 
+#: #844 G844-2：reused receipt 記錄的相容性規則。目前只有一條：現在會派出的
+#: 受信 stage-execution 快照與來源 job 落盤的快照逐欄相同（key 相同只是必要
+#: 條件），且來源 job 實際執行的 identity 就是快照上的 identity。
+STAGE_REUSE_COMPATIBILITY_RULE = "exact-stage-execution-key"
+
+
+class StageReuseAdoptionDrift(ValueError):
+    """#844 S07：reuse 決策之後、採信寫入之前，run 衍生的輸入已經改變。
+
+    由 `apply_workflow_action(action="advance")` 在同一份會被 registry revision
+    CAS 保護的 run 快照上重算時擲出；`resume_workflow_run` 據此放棄這次採信、
+    記錄 ``ineligible``／``adoption-drift``，不落 needs_human——下一次接續以
+    新狀態重新裁決（通常是 stale → 新 attempt）。
+    """
+
+    def __init__(self, reason: str, mismatched_fields: Sequence[str]) -> None:
+        self.reason = reason
+        self.mismatched_fields = tuple(dict.fromkeys(mismatched_fields)) or (reason,)
+        super().__init__(
+            f"stage reuse adoption drift: {reason}: {', '.join(self.mismatched_fields)}"
+        )
+
+
+def _stage_reuse_provenance_mismatch(
+    context: Mapping[str, object], job: Mapping[str, object]
+) -> list[str]:
+    """#844 S05：key 相同之外，來源 job 的 provenance 也必須對得上。
+
+    只比對 key 會讓「抄一把相同 key、卻由別的 identity 執行／receipt 缺席或
+    被竄改」的 job 被當成可重用來源。這裡要求：receipt 是現行 schema、receipt
+    的 key 就是 job 的 key、逐欄與現在會派出的快照相同，而且 job 實際記錄的
+    executor／model 與快照一致。回傳不相容項目（空＝provenance 成立）。
+    """
+
+    mismatched: list[str] = []
+    stored = job.get("workflow_stage_execution_receipt")
+    if not isinstance(stored, Mapping):
+        mismatched.append("unknown-legacy-receipt")
+    else:
+        if stored.get("schema_version") != STAGE_EXECUTION_KEY_SCHEMA_VERSION:
+            mismatched.append("schema_version")
+        if stored.get("key") != job.get("workflow_stage_execution_key"):
+            mismatched.append("stage_execution_key")
+        mismatched.extend(describe_stage_execution_mismatch(context, stored))
+    if (
+        job.get("executor") != context.get("executor")
+        or job.get("model_id") != context.get("model")
+    ):
+        mismatched.append("job_identity")
+    if (
+        job.get("workflow_run_id") != context.get("run_id")
+        or job.get("workflow_claim_key") != context.get("claim_key")
+    ):
+        mismatched.append("job_binding")
+    return list(dict.fromkeys(mismatched))
+
+
+def _stage_reuse_adoption_receipt(
+    stage_reuse: Mapping[str, object],
+    *,
+    job: Mapping[str, object],
+    run,
+    step,
+    registry,
+    coordinator_root: str | Path,
+    evidence_hash: str,
+) -> dict[str, object]:
+    """#844 G844-2／S07：在採信點重新驗證 reuse 決策，產出連結來源的 receipt。
+
+    ``stage_reuse`` 是 `_workflow_stage_reuse_probe` 判定 ``reused`` 時的受信
+    快照；``run`` 必須是 advance 自己剛從 registry 讀到、之後那次
+    `_manager_update_workflow_run` 會以 revision CAS 保護的同一份快照。這裡：
+
+    1. 重新確認來源 job 的 provenance（key、receipt 逐欄、實際 identity）；
+    2. 以 ``run`` 重算所有 run 衍生的輸入（candidate、claim-era、planning
+       authority、test policy、builder job、gate ledger、operator 裁決），
+       executor／model／execution profile 沿用 probe 在同一次呼叫內解析出的值；
+    3. 任一不符即擲 `StageReuseAdoptionDrift`——決策與採信之間的狀態改變不得
+       被舊決策放行（TOCTOU）。
+
+    通過時回傳的 receipt 連結來源 run／job／evidence hash、key／schema／
+    相容性規則；``adoption`` 由呼叫端依採信結果補上，與 gate 同一次寫入。
+    """
+
+    key = stage_reuse.get("key")
+    if not isinstance(key, str) or job.get("workflow_stage_execution_key") != key:
+        raise StageReuseAdoptionDrift("source-key-mismatch", ("stage_execution_key",))
+    provenance = _stage_reuse_provenance_mismatch(stage_reuse, job)
+    if provenance:
+        raise StageReuseAdoptionDrift("source-provenance-mismatch", provenance)
+    _builder_jobs, builder_job_id, manager_gate_ledger = (
+        _workflow_stage_execution_builder_context(run, step, registry)
+    )
+    recomputed = _workflow_stage_execution_context(
+        run=run,
+        step=step,
+        identity=SimpleNamespace(
+            executor=stage_reuse.get("executor"), model_id=stage_reuse.get("model")
+        ),
+        profile_binding=SimpleNamespace(
+            resolved_key=stage_reuse.get("execution_profile_key")
+        ),
+        builder_job_id=builder_job_id,
+        manager_gate_ledger=manager_gate_ledger,
+        operator_adjudications=_operator_adjudications(run, coordinator_root),
+    )
+    if recomputed is None:
+        raise StageReuseAdoptionDrift("run-inputs-unresolvable", ("candidate_sha",))
+    if recomputed["key"] != key:
+        raise StageReuseAdoptionDrift(
+            "run-inputs-changed", describe_stage_execution_mismatch(recomputed, stage_reuse)
+        )
+    locator = job.get("workflow_evidence")
+    if not isinstance(locator, Mapping) or locator.get("hash") != evidence_hash:
+        raise ValueError("stage reuse source evidence locator mismatch")
+    return {
+        "decision": "reused",
+        "receipt_schema_version": STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
+        "stage_execution_key": key,
+        "stage_execution_key_schema_version": STAGE_EXECUTION_KEY_SCHEMA_VERSION,
+        "compatibility": STAGE_REUSE_COMPATIBILITY_RULE,
+        "phase": str(step.phase),
+        "candidate_sha": str(recomputed["candidate_sha"]),
+        "source_run_id": str(job["workflow_run_id"]),
+        "source_claim_key": str(job["workflow_claim_key"]),
+        "source_job_id": str(job["job_id"]),
+        "source_evidence_path": str(locator["path"]),
+        "source_evidence_hash": evidence_hash,
+    }
+
+def _stage_reuse_receipts_with_adoption(
+    run,
+    card_id: str,
+    receipt: Mapping[str, object] | None,
+    *,
+    adoption: str,
+) -> dict[str, dict[str, object]] | None:
+    """#844：把採信結果併進 receipts，供與 gate 同一次 durable 寫入；沒有
+    reuse 採信時回 None（`_manager_update_workflow_run` 視為不變更）。"""
+
+    if receipt is None:
+        return None
+    receipts = dict(getattr(run, "stage_reuse_receipts", None) or {})
+    receipts[card_id] = {**receipt, "adoption": adoption}
+    return receipts
+
+
 #: #844：producer 側計算 stage_execution_key 時固定使用的 action 字面值。
 #: probe（`_workflow_stage_reuse_probe`）與正式派工（`_dispatch_workflow_card`）
 #: 必須用同一個字面值，否則同一次 dispatch 決策會算出兩個不同的 key。
@@ -14480,7 +14629,12 @@ def _workflow_stage_reuse_probe(
             "superseded_key": stored_key,
             "reason": "profile-unresolvable",
         }
-    if context["key"] == stored_key:
+    # #844 S05：key 相同只是必要條件。來源 job 的 receipt 必須是現行 schema、
+    # 逐欄與現在會派出的快照相同，且 job 實際記錄的 identity 就是快照上的
+    # identity；否則視為 stale（強制新 attempt）——不能讓「抄一把 key」的 job
+    # 或舊 schema receipt 冒充可重用來源。
+    provenance_mismatch = _stage_reuse_provenance_mismatch(context, latest)
+    if context["key"] == stored_key and not provenance_mismatch:
         return "reused", context
     stored_receipt = latest.get("workflow_stage_execution_receipt")
     mismatched_fields = (
@@ -14491,7 +14645,7 @@ def _workflow_stage_reuse_probe(
     return "stale", {
         **context,
         "superseded_key": stored_key,
-        "mismatched_fields": list(mismatched_fields),
+        "mismatched_fields": list(dict.fromkeys((*mismatched_fields, *provenance_mismatch))),
     }
 
 
@@ -15751,7 +15905,10 @@ def _dispatch_workflow_card(
         stage_reuse_receipts = dict(getattr(run, "stage_reuse_receipts", None) or {})
         stage_reuse_receipts[step.card] = {
             "decision": "fresh",
+            "receipt_schema_version": STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
             "stage_execution_key": stage_execution_context["key"],
+            # #844 S11：fresh 的「來源」就是這次新派出的 attempt 本身。
+            "job_id": str(job["job_id"]),
         }
         registry._manager_update_workflow_run(
             run.run_id, stage_reuse_receipts=stage_reuse_receipts
@@ -16948,21 +17105,47 @@ def resume_workflow_run(
         # 制新 attempt（不算 operator retry-card，`retry_failed` 語意不
         # 變）。若這裡因 launcher 綁不出而失敗，`dispatch_or_stop` 會先落
         # needs_human 再重新拋出——沿用既有 fail-closed 流程，不吞例外。
-        job = dispatch_or_stop(run, force_new_card=True)
+        try:
+            job = dispatch_or_stop(run, force_new_card=True)
+        except Exception:
+            # #844 S11：強制新 attempt 本身失敗時，receipt 不能還停在指向舊
+            # job 的 fresh／reused——舊 evidence 已判定不可沿用，照實記 ineligible。
+            if stage_reuse_context is not None:
+                failed_entry: dict[str, object] = {
+                    "decision": "ineligible",
+                    "receipt_schema_version": STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
+                    "reason": (
+                        str(stage_reuse_context.get("reason") or "stale-dispatch-failed")
+                        if stage_reuse_kind == "ineligible"
+                        else "stale-dispatch-failed"
+                    ),
+                }
+                failed_key = stage_reuse_context.get("superseded_key")
+                if isinstance(failed_key, str) and failed_key:
+                    failed_entry["superseded_key"] = failed_key
+                failed_receipts = dict(
+                    registry.get_workflow_run(run.run_id).stage_reuse_receipts or {}
+                )
+                failed_receipts[step.card] = failed_entry
+                registry._manager_update_workflow_run(
+                    run.run_id, stage_reuse_receipts=failed_receipts
+                )
+            raise
     else:
         job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
-    if stage_reuse_kind == "reused" and stage_reuse_context is not None:
-        # #844 S11：純 provenance 快照，供 status／`cortex status` 辨識這張
-        # 卡是 reuse；沒有新 job，receipt 由這裡寫。
-        stage_reuse_receipts = dict(getattr(run, "stage_reuse_receipts", None) or {})
-        stage_reuse_receipts[step.card] = {
-            "decision": "reused",
-            "stage_execution_key": stage_reuse_context["key"],
-        }
-        registry._manager_update_workflow_run(
-            run.run_id, stage_reuse_receipts=stage_reuse_receipts
-        )
-    elif stage_reuse_kind in ("stale", "ineligible") and stage_reuse_context is not None:
+    # #844 G844-2／S08：reused receipt 不在這裡預寫。舊實作在任何採信驗證
+    # 之前就寫下 `decision=reused`，之後 evidence 缺檔／壞 hash／模型明示停止
+    # 等任何一條分支失敗，run 上都會留著一張沒有發生過的 reuse。現在只記下
+    # 決策來源（probe 判定 reused 的那顆 job），真正的 receipt 由
+    # `apply_workflow_action(action="advance")` 在採信驗證通過後，與 gate 同一次
+    # durable 寫入落地（連結來源 run／job／evidence hash）。
+    stage_reuse_source_job_id = (
+        str(jobs[-1]["job_id"])
+        if stage_reuse_kind == "reused" and stage_reuse_context is not None and jobs
+        else None
+    )
+    stage_reuse_report: dict[str, object] | None = None
+    if stage_reuse_kind in ("stale", "ineligible") and stage_reuse_context is not None:
         # 對抗審查 MAJOR-2 修法：這張卡確定不再沿用舊 evidence，receipt 必
         # 須覆寫，不能留著前一次可能還是 "reused" 的字樣。真的建立了新
         # job 時（`job` 帶 `job_id`），用**那顆新 job 自己的**
@@ -16977,11 +17160,15 @@ def resume_workflow_run(
             if isinstance(job, dict) and "job_id" in job
             else None
         )
-        stage_reuse_receipts = dict(getattr(run, "stage_reuse_receipts", None) or {})
+        stage_reuse_receipts = dict(
+            registry.get_workflow_run(run.run_id).stage_reuse_receipts or {}
+        )
         if isinstance(new_key, str) and new_key:
             entry: dict[str, object] = {
                 "decision": "fresh",
+                "receipt_schema_version": STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
                 "stage_execution_key": new_key,
+                "job_id": str(job["job_id"]),
             }
             if stage_reuse_kind == "stale":
                 entry["mismatched_fields"] = list(
@@ -16990,6 +17177,7 @@ def resume_workflow_run(
         else:
             entry = {
                 "decision": "ineligible",
+                "receipt_schema_version": STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
                 "reason": (
                     stage_reuse_context.get("reason")
                     if stage_reuse_kind == "ineligible"
@@ -17003,6 +17191,7 @@ def resume_workflow_run(
         registry._manager_update_workflow_run(
             run.run_id, stage_reuse_receipts=stage_reuse_receipts
         )
+        stage_reuse_report = {"card": step.card, **entry}
     if (
         recovery_job_id is not None
         and job is not None
@@ -17031,7 +17220,26 @@ def resume_workflow_run(
     if job.get("status") in IN_FLIGHT_STATUSES:
         job = dispatcher.poll_headless_done(str(job["job_id"]))
     if job.get("status") in IN_FLIGHT_STATUSES:
-        return {"run_id": run.run_id, "current_phase": run.current_phase, "job_id": job["job_id"], "reason": "in-flight"}
+        in_flight: dict[str, object] = {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "job_id": job["job_id"],
+            "reason": "in-flight",
+        }
+        # #844 S11：這次呼叫若剛為這張卡做了 reuse 決策（fresh／ineligible），
+        # action result 直接帶出同一份 receipt；沒有決策時形狀逐字不變。
+        fresh_receipt = (
+            (registry.get_workflow_run(run.run_id).stage_reuse_receipts or {}).get(step.card)
+            if stage_reuse_report is None
+            and stage_reuse_kind == "legacy"
+            and not jobs
+            else None
+        )
+        if stage_reuse_report is not None:
+            in_flight["stage_reuse"] = stage_reuse_report
+        elif isinstance(fresh_receipt, dict) and fresh_receipt.get("job_id") == job["job_id"]:
+            in_flight["stage_reuse"] = {"card": step.card, **fresh_receipt}
+        return in_flight
     if job.get("status") != "exited" or job.get("exit_code") != 0:
         failure_reason = "job-failed"
         runtime_diagnostic = job.get("runtime_diagnostic")
@@ -17568,6 +17776,14 @@ def resume_workflow_run(
         if is_last
         else run.current_phase
     )
+    # #844 G844-2：只有這次採信的正是 probe 判定 reused 的那顆 job，才把決策
+    # 交給 advance 在採信點重驗；中途換成重派／恢復 job 時照舊走一般採信。
+    adoption_stage_reuse = (
+        stage_reuse_context
+        if stage_reuse_source_job_id is not None
+        and str(job.get("job_id")) == stage_reuse_source_job_id
+        else None
+    )
     try:
         result = apply_workflow_action(
             registry,
@@ -17583,7 +17799,31 @@ def resume_workflow_run(
             git_runner=getattr(dispatcher, "_git_runner", None),
             coordinator_root=coordinator_root,
             trusted_terminal=True,
+            stage_reuse=adoption_stage_reuse,
         )
+    except StageReuseAdoptionDrift as drift:
+        # #844 S07：決策之後、採信之前 run 衍生的輸入變了。advance 沒有寫入
+        # 任何東西（drift 在 durable 更新前擲出）；記一張 ineligible receipt
+        # 說明原因後結束這次接續，不落 needs_human——下一次接續以新狀態重新
+        # 裁決（不相容即 stale → 新 attempt）。
+        entry: dict[str, object] = {
+            "decision": "ineligible",
+            "receipt_schema_version": STAGE_REUSE_RECEIPT_SCHEMA_VERSION,
+            "reason": "adoption-drift",
+            "superseded_key": str(stage_reuse_context["key"]),
+            "mismatched_fields": list(drift.mismatched_fields),
+        }
+        receipts = dict(registry.get_workflow_run(run.run_id).stage_reuse_receipts or {})
+        receipts[step.card] = entry
+        registry._manager_update_workflow_run(run.run_id, stage_reuse_receipts=receipts)
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "job_id": job["job_id"],
+            "reason": "stage-reuse-adoption-drift",
+            "mismatched_fields": list(drift.mismatched_fields),
+            "stage_reuse": {"card": step.card, **entry},
+        }
     except Exception as exc:
         rate_limited = _provider_rate_limit_result(
             exc,
@@ -17594,6 +17834,24 @@ def resume_workflow_run(
         if rate_limited is not None:
             return rate_limited
         current = registry.get_workflow_run(run.run_id)
+        # #844 S08：交錯的重複 request——另一個 request 在本 request 讀到 run 之後
+        # 已經採信這張卡（本 request 開始時它仍是 pending），advance 因此以
+        # 「卡已不在目前 phase／重放」拒絕。那是同一個接續的重複，不是新的失敗：
+        # 不落 needs_human、不重派，交回已經發生的那一次接續。
+        already_adopted = [
+            item for item in current.steps if item.card == step.card
+        ]
+        if (
+            step.phase in STAGE_EXECUTION_REUSE_SUPPORTED_PHASES
+            and already_adopted
+            and already_adopted[0].gate_result == "passed"
+        ):
+            return {
+                "run_id": run.run_id,
+                "current_phase": current.current_phase,
+                "job_id": job["job_id"],
+                "reason": "duplicate-continuation",
+            }
         registry._manager_update_workflow_run(
             run.run_id,
             facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
@@ -17611,6 +17869,10 @@ def resume_workflow_run(
         )
         raise
     updated = registry.get_workflow_run(run.run_id)
+    if adoption_stage_reuse is not None:
+        adopted_receipt = (updated.stage_reuse_receipts or {}).get(step.card)
+        if isinstance(adopted_receipt, dict):
+            result["stage_reuse"] = {"card": step.card, **adopted_receipt}
     if "needs_human" in updated.facets:
         return result
     next_job = dispatch_or_stop(updated)
@@ -17773,12 +18035,18 @@ def apply_workflow_action(
     git_runner=None,
     coordinator_root: str | Path | None = None,
     trusted_terminal: bool = False,
+    stage_reuse: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Apply the sole production mutation API for Manager-owned workflows.
 
     Callers reach this function through the durable control queue. Registry
     mutation methods are intentionally private so CLI/socket clients cannot
     bypass Manager orchestration.
+
+    ``stage_reuse``（#844 G844-2）只在內部 terminal polling 的 ``advance``
+    有意義：`resume_workflow_run` 判定 reused 時傳入 probe 的受信快照，這裡在
+    採信點重驗並把連結來源的 receipt 與 gate 同一次寫入；control queue 的
+    args 無法帶入這個參數。
     """
 
     action = _required_workflow_string(args, "action")
@@ -18128,6 +18396,24 @@ def apply_workflow_action(
             run=current,
             coordinator_root=coordinator_root,
         )
+        # #844 G844-2／S07：reuse 決策在這裡、以這份 `current`（之後那次
+        # durable 更新受 registry revision CAS 保護的同一份快照）重驗；通過才
+        # 產出連結來源 run／job／evidence hash 的 receipt，與 gate 同一次寫入。
+        # 放在 candidate／domain 驗證之前，讓 candidate drift 走「重新裁決」
+        # 而不是一般的採信失敗。
+        stage_reuse_receipt: dict[str, object] | None = None
+        if stage_reuse is not None:
+            if current.current_phase not in STAGE_EXECUTION_REUSE_SUPPORTED_PHASES:
+                raise ValueError("stage reuse adoption outside supported cohort")
+            stage_reuse_receipt = _stage_reuse_adoption_receipt(
+                stage_reuse,
+                job=job,
+                run=current,
+                step=step,
+                registry=registry,
+                coordinator_root=coordinator_root,
+                evidence_hash=evidence_hash,
+            )
         candidate = current.candidate_head
         if current.current_phase == "build":
             candidate = _verify_build_candidate_transition(
@@ -18217,6 +18503,9 @@ def apply_workflow_action(
             updated = registry._manager_update_workflow_run(
                 run_id,
                 current_phase=current.current_phase,
+                stage_reuse_receipts=_stage_reuse_receipts_with_adoption(
+                    current, card_id, stage_reuse_receipt, adoption="rejected"
+                ),
                 steps=updated_steps,
                 gate_refs=tuple(
                     by_kind[kind]
@@ -18346,6 +18635,9 @@ def apply_workflow_action(
             run_id,
             current_phase=next_phase,
             needs_human_reason=facets_reason,
+            stage_reuse_receipts=_stage_reuse_receipts_with_adoption(
+                current, card_id, stage_reuse_receipt, adoption="accepted"
+            ),
             steps=(
                 _validated_ship_steps(
                     registry,
