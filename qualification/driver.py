@@ -4520,6 +4520,93 @@ def _dispatch_blocking_summary(terminal: object) -> str:
     return f"{summary} ({detail})" if detail else summary
 
 
+def _dispatch_work_item(envelope: object, work_id: str) -> Mapping[str, object] | None:
+    """`cortex work show --json` 裡屬於本 work item 的 `item` 區段。
+
+    envelope 其他區段（providers、fleet_health 等）也有 `status`／`state`，值可能
+    是 closed／done；#716 canary run 36519844244 曾因遞迴掃整份輸出，在 build
+    階段就被誤判結案。terminal 判定只看 `item`。
+    """
+
+    item = envelope.get("item") if isinstance(envelope, Mapping) else None
+    if not isinstance(item, Mapping) or item.get("work_id") != work_id:
+        return None
+    return item
+
+
+_DISPATCH_RUN_TERMINAL = frozenset({"done", "completed", "failed", "superseded"})
+
+
+def _dispatch_run_refs(
+    item: Mapping[str, object], statuses: set[str] | None = None
+) -> set[str]:
+    """本 work item 的 workflow_run source ref；`statuses=None` 取進行中的 run。
+
+    進行中的定義與 `monitor.lifecycle.project_work_items` 相同：status 不在
+    done／completed／failed／superseded 之內。
+    """
+
+    sources = item.get("sources")
+    refs: set[str] = set()
+    for source in sources if isinstance(sources, list) else []:
+        if not isinstance(source, Mapping) or source.get("kind") != "workflow_run":
+            continue
+        status = str(source.get("status", "")).lower()
+        active = status not in _DISPATCH_RUN_TERMINAL
+        if active if statuses is None else status in statuses:
+            refs.add(str(source.get("ref")))
+    return refs
+
+
+def _dispatch_item_verdict(envelope: object, item: Mapping[str, object]) -> str:
+    """回傳 done／failed／pending。
+
+    work item 的 `state` 只有在 strict closure（PR merged、issue 全關、openspec
+    archive、todo 完成、CompletionRecord 有效）才會是 done；workflow 本身結案時
+    `item.sources` 內的 workflow_run 會先變成 done，closeout 另外逐欄驗 registry。
+    """
+
+    facets = item.get("facets")
+    blocked = (
+        isinstance(facets, list) and "needs_human" in facets
+    ) or (isinstance(envelope, Mapping) and bool(envelope.get("blocking_reason")))
+    if blocked:
+        return "failed"
+    if _dispatch_run_refs(item):
+        return "pending"
+    if item.get("state") == "done" or _dispatch_run_refs(item, {"done", "completed"}):
+        return "done"
+    if _dispatch_run_refs(item, set(_DISPATCH_RUN_TERMINAL)):
+        return "failed"
+    return "pending"
+
+
+def _dispatch_item_diagnostic(item: Mapping[str, object] | None) -> str:
+    """逾時時最後一次看到的 work item 狀態；只輸出列舉型 token。"""
+
+    if item is None:
+        return "item=unobserved"
+    sources = item.get("sources")
+    runs = [
+        f"{_diagnostic_token(source.get('ref'))}:{_diagnostic_token(source.get('status'))}"
+        for source in (sources if isinstance(sources, list) else [])
+        if isinstance(source, Mapping) and source.get("kind") == "workflow_run"
+    ]
+    facets = item.get("facets")
+    return " ".join(
+        (
+            f"state={_diagnostic_token(item.get('state'))}",
+            "runs=" + (",".join(runs) or "none"),
+            "facets="
+            + (
+                ",".join(_diagnostic_token(facet) for facet in facets) or "none"
+                if isinstance(facets, list)
+                else _diagnostic_token(facets)
+            ),
+        )
+    )
+
+
 def _full_dispatch(
     *,
     repository: str,
@@ -4564,7 +4651,8 @@ def _full_dispatch(
     )
     _require_success(intake, "full-dispatch intake")
     deadline = time.monotonic() + timeout
-    terminal: object | None = None
+    item: Mapping[str, object] | None = None
+    observed: Mapping[str, object] | None = None
     while time.monotonic() < deadline:
         status = _run(
             (
@@ -4581,32 +4669,30 @@ def _full_dispatch(
         )
         if status.returncode == 0:
             records = _json_records(status.stdout)
-            if records:
-                terminal = records[-1]
-                terminal_states = {
-                    value.lower()
-                    for value in _walk_values(
-                        terminal, {"state", "status", "lifecycle"}
-                    )
-                }
-                rendered = json.dumps(terminal, sort_keys=True).lower()
-                if terminal_states & {"done", "delivered", "closed"}:
+            envelope = records[-1] if records else None
+            candidate = _dispatch_work_item(envelope, work_id)
+            if candidate is not None:
+                observed = candidate
+                verdict = _dispatch_item_verdict(envelope, candidate)
+                if verdict == "done":
+                    item = candidate
                     break
-                if "needs_human" in rendered or '"failed"' in rendered:
+                if verdict == "failed":
                     raise QualificationFailure(
                         "full dispatch reached a failed/needs_human terminal"
-                        + _dispatch_blocking_summary(terminal)
+                        + _dispatch_blocking_summary(envelope)
                     )
         time.sleep(10)
     else:
         raise QualificationFailure(
-            "full dispatch did not reach terminal closeout before timeout"
+            "full dispatch did not reach terminal closeout before timeout: "
+            + _dispatch_item_diagnostic(observed)
         )
     markers, artifact_rows, workflow, agent_loop_probe = _validate_dispatch_closeout(
         repository=repository,
         work_id=work_id,
         issue=issue,
-        terminal=terminal,
+        terminal=item,
         coordinator_root=Path(runtime_env["PSC_COORDINATOR_ROOT"]),
     )
     run_id = workflow.get("run_id")
@@ -4618,6 +4704,10 @@ def _full_dispatch(
         or SHA40.fullmatch(workflow_candidate) is None
     ):
         raise QualificationFailure("full-dispatch workflow run identity is unavailable")
+    if run_id not in _dispatch_run_refs(item, {"done", "completed"}):
+        raise QualificationFailure(
+            "CLI terminal is not bound to the completed workflow"
+        )
     agent_loop_probe["artifact_set_sha256"] = hashlib.sha256(
         _canonical_bytes(artifact_rows)
     ).hexdigest()

@@ -2450,16 +2450,236 @@ def test_codex_agent_loop_parser_rejects_forged_head_command_shapes(
         )
 
 
+def _work_show_envelope(
+    work_id: str,
+    *,
+    state: str,
+    run_id: str = "run-qualification",
+    run_status: str = "running",
+    facets: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """`cortex work show --json` 的真實形狀：envelope 外層＋`item`。
+
+    envelope 其他區段（providers、fleet_health）也帶 `status`／`state` 欄位，
+    值可能是 closed／done；terminal 判定不得被它們誤導（#716 canary run
+    36519844244 在 build 階段約 2 分鐘就被誤判結案）。
+    """
+
+    return {
+        "schema": "cortex/work-item/v1",
+        "degraded": False,
+        "providers": [
+            {
+                "name": "github",
+                "status": "ok",
+                "sources": [{"source_id": "github_issue:other#9", "status": "closed"}],
+            }
+        ],
+        "fleet_health": {"jobs": [{"job_id": "other-job", "state": "done"}]},
+        "item": {
+            "work_id": work_id,
+            "repo": "owner/repo",
+            "state": state,
+            "facets": list(facets),
+            "workflow_run_id": run_id if run_status not in {"done", "failed", "superseded"} else None,
+            "sources": [
+                {"kind": "github_issue", "ref": "owner/repo#42", "status": "open"},
+                {"kind": "workflow_run", "ref": run_id, "status": run_status},
+            ],
+        },
+    }
+
+
+def _full_dispatch_fixture(
+    driver, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shows: list[dict[str, object]]
+) -> tuple[list[tuple[str, ...]], list[object]]:
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    (config_root / "model-identities.yaml").write_text(
+        render_model_identity_overlay(), encoding="utf-8"
+    )
+    calls: list[tuple[str, ...]] = []
+    closeout_terminals: list[object] = []
+    remaining = list(shows)
+
+    def fake_run(argv, **_kwargs):
+        calls.append(tuple(argv))
+        if "show" in argv:
+            record = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+            return _result(driver, argv, stdout=json.dumps(record) + "\n")
+        return _result(driver, argv)
+
+    def fake_closeout(**kwargs):
+        closeout_terminals.append(kwargs["terminal"])
+        return (
+            ["agent-loop-command"],
+            [{"path": "coordinator/jobs.json", "sha256": "d" * 64}],
+            {"run_id": "run-qualification", "candidate_head": "f" * 40},
+            {"schema_version": 1},
+        )
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        driver,
+        "_installed_runtime_env",
+        lambda: {
+            "PSC_COORDINATOR_ROOT": str(tmp_path / "coordinator"),
+            "PSC_PROJECT_CONFIG_ROOT": str(config_root),
+        },
+    )
+    monkeypatch.setattr(driver, "_validate_dispatch_closeout", fake_closeout)
+    return calls, closeout_terminals
+
+
+def test_full_dispatch_ignores_done_values_outside_the_work_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """envelope 其他區段的 closed／done 不算結案；只看本 work item（#716）。"""
+
+    driver = _load_driver()
+    ongoing = _work_show_envelope("qualification-work", state="on-going")
+    finished = _work_show_envelope(
+        "qualification-work", state="on-going", run_status="done"
+    )
+    calls, closeouts = _full_dispatch_fixture(
+        driver, tmp_path, monkeypatch, [ongoing, ongoing, finished]
+    )
+
+    driver._full_dispatch(
+        repository="owner/repo",
+        work_id="qualification-work",
+        issue=42,
+        release_candidate_sha="a" * 40,
+        timeout=60,
+        evidence_dir=tmp_path / "evidence",
+    )
+
+    assert sum(1 for argv in calls if "show" in argv) == 3
+    assert closeouts == [finished["item"]]
+
+
+def test_full_dispatch_times_out_while_the_bound_run_is_still_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    ongoing = _work_show_envelope("qualification-work", state="on-going")
+    _calls, closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [ongoing])
+    clock = iter(float(tick) for tick in range(0, 1000, 5))
+    monkeypatch.setattr(driver.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(
+        driver.QualificationFailure,
+        match="before timeout: state=on-going runs=run-qualification:running facets=none",
+    ):
+        driver._full_dispatch(
+            repository="owner/repo",
+            work_id="qualification-work",
+            issue=42,
+            release_candidate_sha="a" * 40,
+            timeout=30,
+            evidence_dir=tmp_path / "evidence",
+        )
+    assert closeouts == []
+
+
+def test_full_dispatch_ignores_a_record_for_another_work_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    foreign = _work_show_envelope("other-work", state="done", run_status="done")
+    _calls, closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [foreign])
+    clock = iter(float(tick) for tick in range(0, 1000, 5))
+    monkeypatch.setattr(driver.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(driver.QualificationFailure, match="before timeout: item=unobserved"):
+        driver._full_dispatch(
+            repository="owner/repo",
+            work_id="qualification-work",
+            issue=42,
+            release_candidate_sha="a" * 40,
+            timeout=30,
+            evidence_dir=tmp_path / "evidence",
+        )
+    assert closeouts == []
+
+
+@pytest.mark.parametrize("run_status", ["failed", "superseded"])
+def test_full_dispatch_fails_when_the_bound_run_ends_without_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_status: str
+) -> None:
+    driver = _load_driver()
+    ended = _work_show_envelope(
+        "qualification-work", state="todo", run_status=run_status
+    )
+    _calls, closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [ended])
+
+    with pytest.raises(driver.QualificationFailure, match="failed/needs_human"):
+        driver._full_dispatch(
+            repository="owner/repo",
+            work_id="qualification-work",
+            issue=42,
+            release_candidate_sha="a" * 40,
+            timeout=60,
+            evidence_dir=tmp_path / "evidence",
+        )
+    assert closeouts == []
+
+
+def test_full_dispatch_waits_while_any_bound_run_is_still_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """舊 run 已 done、新 run 仍進行中（狀態值不在已知清單內也算進行中）時不得結案。"""
+
+    driver = _load_driver()
+    mixed = _work_show_envelope("qualification-work", state="on-going", run_id="run-old", run_status="done")
+    mixed["item"]["sources"].append(
+        {"kind": "workflow_run", "ref": "run-qualification", "status": "blocked-on-review"}
+    )
+    _calls, closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [mixed])
+    clock = iter(float(tick) for tick in range(0, 1000, 5))
+    monkeypatch.setattr(driver.time, "monotonic", lambda: next(clock))
+
+    with pytest.raises(driver.QualificationFailure, match="before timeout"):
+        driver._full_dispatch(
+            repository="owner/repo",
+            work_id="qualification-work",
+            issue=42,
+            release_candidate_sha="a" * 40,
+            timeout=30,
+            evidence_dir=tmp_path / "evidence",
+        )
+    assert closeouts == []
+
+
+def test_full_dispatch_rejects_a_done_run_that_is_not_the_closed_out_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    finished = _work_show_envelope(
+        "qualification-work", state="on-going", run_id="run-stale", run_status="done"
+    )
+    _full_dispatch_fixture(driver, tmp_path, monkeypatch, [finished])
+
+    with pytest.raises(driver.QualificationFailure, match="not bound"):
+        driver._full_dispatch(
+            repository="owner/repo",
+            work_id="qualification-work",
+            issue=42,
+            release_candidate_sha="a" * 40,
+            timeout=60,
+            evidence_dir=tmp_path / "evidence",
+        )
+
+
 def test_full_dispatch_pins_codex_builder_and_persists_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     driver = _load_driver()
     calls: list[tuple[str, ...]] = []
-    terminal = {
-        "status": "done",
-        "run_id": "run-qualification",
-        "work_id": "qualification-work",
-    }
+    terminal = _work_show_envelope(
+        "qualification-work", state="on-going", run_id="run-qualification", run_status="done"
+    )
 
     def fake_run(argv, **_kwargs):
         calls.append(tuple(argv))

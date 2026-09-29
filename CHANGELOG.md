@@ -10,6 +10,7 @@
 ### Added
 
 - **#716 canary 結案診斷**：派工結案驗證失敗時列出不成立的條件（phase／status／gate／needs_human 代碼／缺少 phase／未過步驟），不輸出自由文字（#716）。
+- **#716 canary 結案判定**：派工結案只看本 work item 的 `item.state`／workflow_run source，不再被 `work show` envelope 其他區段（providers、fleet_health）的 closed／done 誤判（#716）。
 - **#716 canary ls-remote**：Manager GitHub probe 改用 `git ls-remote --refs`，不再因真實輸出的 `HEAD` 列判為畸形（#716）。
 - **#716 Manager gh 設定**：root-owned 唯讀的 gh config 加上 `version: "1"`，避免 gh 遷移寫檔導致 `gh auth status` 失敗（#716）。
 - **#1142 main-sync union＋重試用當下 main**：新增追蹤的 `.gitattributes` 宣告 `CHANGELOG.md merge=union`，ship main-sync probe 改以 `git --attr-source=<M> merge-tree` 讀 main 的 attributes，CHANGELOG 同位置插入不再判 conflict、非 union 路徑衝突照判，Candidate 自宣的 union 無效；main-sync stop 後的 `retry-build` 在下達當下重新 fetch origin/main（釘在 run-scoped pin ref），把當下的 exact M 寫進新的 `main-sync-retry` evidence、修復指令與 `WorkflowRun.main_sync_repair`，停機 evidence 保留作稽核、fetch 失敗不重置；harvest 以 quarantine ref 驗證修復候選是該 M 的後代，不含即拒絕。clean-behind 仍停在 `needs_human`（#1142）。
