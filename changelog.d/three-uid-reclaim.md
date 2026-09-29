@@ -1,0 +1,1 @@
+- **#1167 三 UID builder workspace reclaim**：owner-bound clone 改由 root-owned builder template 以 builder UID 執行固定 reclaim helper；helper 僅接受 configured pool 直接子項及完全匹配的 Manager marker snapshot，dirty scan、未提交檔保存或 base 後 commit bundle 保存失敗即不清除。RC release profile 新增 `owner-bound-reclaim` installed check，並關閉 #843 G843-R08-live-reclaim gap；真容器 receipt 仍須依 #843 owner 裁決執行。

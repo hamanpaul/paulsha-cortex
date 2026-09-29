@@ -30,7 +30,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from paulsha_cortex.coordinator import job_runner, spool_slot
+from paulsha_cortex.coordinator import job_runner, job_workspace, spool_slot, worktree_reclaim
+from paulsha_cortex.config import paths
+from paulsha_cortex.trust_root import registry as trust_registry
 from paulsha_cortex.trust_root.registry import (
     JobWriteContract,
     inner_sandbox_attached_for,
@@ -351,6 +353,7 @@ def _installed_checks(
     evidence_dir: Path,
     require_system_status: bool = True,
     receipt_path: Path | None = None,
+    profile: str = "release",
 ) -> list[dict[str, str]]:
     install = _load_json(install_evidence, "install verification evidence")
     if (
@@ -385,6 +388,10 @@ def _installed_checks(
     equation_payload = json.loads(equation.stdout)
     if equation_payload.get("ok") is not True:
         raise QualificationFailure("registry equation is not balanced")
+    owner_reclaim_check: list[dict[str, str]] = []
+    if profile == "release":
+        _installed_owner_bound_reclaim(evidence_dir)
+        owner_reclaim_check.append({"name": "owner-bound-reclaim", "status": "passed"})
     _write_json(
         evidence_dir / "install-semantic-checks.json",
         {
@@ -496,6 +503,7 @@ def _installed_checks(
             if require_system_status
             else []
         ),
+        *owner_reclaim_check,
     ]
 
 
@@ -531,6 +539,197 @@ def _system_status_mismatch(report: object) -> str:
         + _diagnostic_token(installed.get("kind") if isinstance(installed, Mapping) else None)
     )
     return " ".join(parts)
+
+
+def _installed_owner_bound_reclaim(evidence_dir: Path) -> None:
+    """Exercise marker-bound cleanup through the installed builder template."""
+
+    if os.geteuid() != 0:
+        raise QualificationFailure("owner-bound-reclaim installed check requires root")
+    builder = job_runner.resolve_job_account(os.environ, role=job_runner.JOB_ROLE_BUILDER)
+    manager = pwd.getpwnam("cortex-manager")
+    pool = paths.worktree_root().resolve(strict=True)
+    token = f"owner-reclaim-{os.getpid()}-{os.urandom(4).hex()}"
+    source = evidence_dir / token / "source"
+    source.mkdir(parents=True)
+    owned = pool / token
+    foreign = pool / f"{token}-foreign"
+    created: list[Path] = []
+    spool_dir: Path | None = None
+    try:
+        subprocess.run(("git", "init", "-q", "-b", "main", str(source)), check=True)
+        (source / "seed.txt").write_text("seed\n", encoding="utf-8")
+        subprocess.run(("git", "-C", str(source), "add", "seed.txt"), check=True)
+        subprocess.run(
+            ("git", "-C", str(source), "-c", "user.name=RC", "-c", "user.email=rc@example.invalid", "commit", "-qm", "seed"),
+            check=True,
+        )
+        base = subprocess.run(
+            ("git", "-C", str(source), "rev-parse", "HEAD"),
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        for target in (owned, foreign):
+            subprocess.run(("git", "clone", "-q", str(source), str(target)), check=True)
+            created.append(target)
+            for directory, child_dirs, child_files in os.walk(target, followlinks=False):
+                os.chown(directory, manager.pw_uid, manager.pw_gid)
+                for name in (*child_dirs, *child_files):
+                    child = Path(directory) / name
+                    if not child.is_symlink():
+                        os.chown(child, manager.pw_uid, manager.pw_gid)
+            acl = shutil.which("setfacl")
+            if acl is None:
+                raise QualificationFailure("setfacl is required by owner-bound-reclaim")
+            reach = next(
+                row for row in trust_registry.JOB_WORKSPACE_REACH
+                if row.principal is trust_registry.Principal.BUILDER
+            )
+            subprocess.run(
+                (acl, "-R", "-m", f"u:{builder}:{reach.access_perms}", str(target)),
+                check=True, capture_output=True, text=True,
+            )
+            subprocess.run(
+                (acl, "-R", "-d", "-m", f"u:{builder}:{reach.default_perms}", str(target)),
+                check=True, capture_output=True, text=True,
+            )
+            for principal, perms in reach.extra_reader_perms:
+                if principal is trust_registry.Principal.GATE:
+                    reader = job_runner.resolve_job_account(
+                        os.environ, role=job_runner.JOB_ROLE_GATE
+                    )
+                else:
+                    raise QualificationFailure(
+                        "owner-bound-reclaim plan has an unsupported extra reader"
+                    )
+                subprocess.run(
+                    (acl, "-R", "-m", f"u:{reader}:{perms}", str(target)),
+                    check=True, capture_output=True, text=True,
+                )
+                subprocess.run(
+                    (acl, "-R", "-d", "-m", f"u:{reader}:{perms}", str(target)),
+                    check=True, capture_output=True, text=True,
+                )
+        marker = {
+            "schema_version": job_workspace.MARKER_SCHEMA_VERSION,
+            "model": job_workspace.WORKSPACE_MODEL,
+            "branch": "feature/rc-owner-reclaim",
+            "base": base,
+            "source_repo": str(source),
+            "owner_identity": {"repo": "qualification/reclaim", "work_id": token, "slice_id": token},
+            "attempt_id": token,
+        }
+        for target in (owned, foreign):
+            marker_path = job_workspace.marker_path(target)
+            marker_path.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
+            os.chown(marker_path, manager.pw_uid, manager.pw_gid)
+        # Create both a committed builder-owned inode and an untracked directory
+        # as the real builder identity.  The Manager has no ACL on these inodes.
+        commit = _run(
+            ("/usr/bin/python3", "-c", "import sys; from pathlib import Path; Path(sys.argv[1], 'builder-commit.txt').write_text('commit\\n')", str(owned)),
+            user=builder, env=_account_env(builder), timeout=30,
+        )
+        _require_success(commit, "owner-bound-reclaim builder file setup")
+        commit = _run(
+            ("/usr/bin/git", "-C", str(owned), "add", "builder-commit.txt"),
+            user=builder, env=_account_env(builder), timeout=30,
+        )
+        _require_success(commit, "owner-bound-reclaim builder git add")
+        commit = _run(
+            ("/usr/bin/git", "-C", str(owned), "-c", "user.name=RC", "-c", "user.email=rc@example.invalid", "commit", "-qm", "builder commit"),
+            user=builder, env=_account_env(builder), timeout=30,
+        )
+        _require_success(commit, "owner-bound-reclaim builder commit")
+        head_probe = _run(
+            ("/usr/bin/git", "-C", str(owned), "rev-parse", "HEAD"),
+            user=builder, env=_account_env(builder), timeout=30,
+        )
+        _require_success(head_probe, "owner-bound-reclaim builder HEAD")
+        builder_head = head_probe.stdout.strip()
+        untracked = _run(
+            ("/usr/bin/python3", "-c", "import sys; from pathlib import Path; p=Path(sys.argv[1], 'untracked/nested'); p.mkdir(parents=True); (p/'payload.txt').write_text('preserve\\n')", str(owned)),
+            user=builder, env=_account_env(builder), timeout=30,
+        )
+        _require_success(untracked, "owner-bound-reclaim builder untracked setup")
+        marker_path = job_workspace.marker_path(owned)
+        marker_read = _run(
+            ("/usr/bin/python3", "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).read_bytes()", str(marker_path)),
+            user=builder, env=_account_env(builder), timeout=30,
+        )
+        _require_success(marker_read, "owner-bound-reclaim builder marker access")
+        marker_acl = _run(("getfacl", "-cp", str(marker_path)))
+        _require_success(marker_acl, "owner-bound-reclaim marker ACL")
+        if marker_path.stat().st_uid != manager.pw_uid or f"user:{builder}:" not in marker_acl.stdout:
+            raise QualificationFailure("owner-bound-reclaim marker owner/ACL is incorrect")
+        payload_path = owned / "untracked" / "nested" / "payload.txt"
+        if payload_path.stat().st_uid != pwd.getpwnam(builder).pw_uid:
+            raise QualificationFailure("builder artifact was not created by the builder UID")
+        manager_read = _run(
+            ("/usr/bin/python3", "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).read_bytes()", str(payload_path)),
+            user="cortex-manager", env=_account_env("cortex-manager"), timeout=30,
+        )
+        if manager_read.returncode == 0:
+            raise QualificationFailure("Manager unexpectedly read a builder-created artifact")
+        artifact_acl = _run(("getfacl", "-cp", str(payload_path)))
+        _require_success(artifact_acl, "owner-bound-reclaim builder artifact ACL")
+        if f"user:{manager.pw_name}:" in artifact_acl.stdout:
+            raise QualificationFailure("builder artifact unexpectedly has a Manager ACL entry")
+        foreign_bytes = (foreign / "seed.txt").read_bytes()
+        foreign_stat = foreign.stat()
+        foreign_acl = _run(("getfacl", "-cp", str(foreign)))
+        _require_success(foreign_acl, "owner-bound-reclaim foreign ACL snapshot")
+
+        previous_runner = os.environ.get("PSC_JOB_RUNNER")
+        os.environ["PSC_JOB_RUNNER"] = "systemd-template"
+        try:
+            outcome = worktree_reclaim.reclaim_worktree(owned, repo_root=source)
+        finally:
+            if previous_runner is None:
+                os.environ.pop("PSC_JOB_RUNNER", None)
+            else:
+                os.environ["PSC_JOB_RUNNER"] = previous_runner
+        if not outcome.ok or not outcome.preserved_ref:
+            raise QualificationFailure("owner-bound-reclaim returned no preserved-content receipt")
+        archive = Path(outcome.preserved_ref)
+        if (archive / "untracked" / "nested" / "payload.txt").read_text() != "preserve\n":
+            raise QualificationFailure("owner-bound-reclaim archive omitted builder content")
+        bundle_heads = _run(("git", "bundle", "list-heads", str(archive / "workspace-head.bundle")))
+        _require_success(bundle_heads, "owner-bound-reclaim preserved commit bundle")
+        if builder_head not in bundle_heads.stdout:
+            raise QualificationFailure("owner-bound-reclaim did not preserve the builder commit")
+        if (
+            foreign_bytes != (foreign / "seed.txt").read_bytes()
+            or foreign_stat.st_uid != foreign.stat().st_uid
+            or _run(("getfacl", "-cp", str(foreign))).stdout != foreign_acl.stdout
+        ):
+            raise QualificationFailure("owner-bound-reclaim modified the foreign pool slot")
+        replay = worktree_reclaim.reclaim_worktree(owned, repo_root=source)
+        if replay.status != worktree_reclaim.RECLAIM_ABSENT:
+            raise QualificationFailure("owner-bound-reclaim replay was not an absent no-op")
+        spool_dir = archive.parent.parent
+        _write_json(
+            evidence_dir / "owner-bound-reclaim.json",
+            {
+                "schema_version": 1,
+                "status": "passed",
+                "builder_account": builder,
+                "manager_account": manager.pw_name,
+                "owner_slot_removed": True,
+                "preserved_files": outcome.preserved_files,
+                "preserved_commit_bundle": True,
+                "foreign_slot_unchanged": True,
+                "marker_manager_owned_builder_readable": True,
+                "manager_artifact_read_denied": True,
+                "replay_status": replay.status,
+            },
+        )
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as exc:
+        raise QualificationFailure(f"owner-bound-reclaim failed: {type(exc).__name__}: {str(exc)[:500]}") from exc
+    finally:
+        for target in created:
+            shutil.rmtree(target, ignore_errors=True)
+        if spool_dir is not None:
+            shutil.rmtree(spool_dir, ignore_errors=True)
+        shutil.rmtree(source.parent, ignore_errors=True)
 
 
 def _denied(
@@ -5123,6 +5322,7 @@ def main() -> int:
             evidence_dir=args.evidence_dir,
             require_system_status=not legacy_profile,
             receipt_path=args.receipt,
+            profile=args.profile,
         )
         providers: list[dict[str, object]] = []
         if legacy_profile:

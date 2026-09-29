@@ -97,6 +97,7 @@ from uuid import uuid4
 from paulsha_cortex.config import paths
 
 from . import job_workspace
+from . import owner_reclaim
 from .dispatcher import _default_git_runner
 
 logger = logging.getLogger(__name__)
@@ -438,6 +439,48 @@ def reclaim_worktree(
             text,
             evidence_model=evidence_model,
             detail="worktree-path-not-a-worktree",
+        )
+
+    # A used builder clone contains builder-owned inodes.  In the three-UID
+    # profile the Manager deliberately has no ACL on those inodes, so route
+    # only marker- and owner-bound clones through the fixed root-owned builder
+    # template.  The worker scans and preserves before clearing children; the
+    # Manager only removes the empty directory entry it owns in the pool.
+    marker_snapshot = job_workspace.read_marker(target) if exists and not target.is_symlink() else None
+    if (
+        isinstance(marker_snapshot, dict)
+        and isinstance(marker_snapshot.get("owner_identity"), dict)
+        and isinstance(marker_snapshot.get("attempt_id"), str)
+        and (os.environ.get("PSC_JOB_RUNNER") or "").strip() == "systemd-template"
+    ):
+        try:
+            pool_root = paths.worktree_root().resolve(strict=True)
+            if target.resolve(strict=True).parent != pool_root:
+                raise RuntimeError("owner-bound builder workspace is outside the configured pool")
+            outcome = owner_reclaim.reclaim_through_builder_unit(
+                workspace=target, marker=marker_snapshot
+            )
+            if outcome.get("status") != "cleared" or outcome.get("workspace_name") != target.name:
+                raise RuntimeError("builder reclaim returned an invalid completion record")
+            target.rmdir()
+            if target.exists() or target.is_symlink():
+                raise RuntimeError("workspace directory remains after builder reclaim")
+        except Exception as exc:  # noqa: BLE001 - any uncertainty leaves evidence in place
+            return WorktreeReclaim(
+                RECLAIM_FAILED,
+                text,
+                registry_entry_found=registered,
+                evidence_model=evidence_model,
+                detail=f"builder-owner-reclaim-failed: {type(exc).__name__}: {str(exc)[:300]}",
+            )
+        return WorktreeReclaim(
+            RECLAIM_RECLAIMED,
+            text,
+            registry_entry_found=registered,
+            directory_removed=True,
+            preserved_ref=str(outcome.get("preserve_path")) if outcome.get("preserve_path") else None,
+            preserved_files=int(outcome.get("preserved_files", 0)),
+            evidence_model=evidence_model,
         )
 
     # #623：clone 模型下 `rmtree` 會連 object store 一起刪掉——worktree 模型下這些
