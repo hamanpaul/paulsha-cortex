@@ -692,11 +692,13 @@ class TestS04ExecutionSemantics:
         harness = Harness(tmp_path, monkeypatch)
         first = harness.resume()
         harness.finish(first["job_id"])
+        # #835 起 adapter 由 descriptor catalog 提供；以受信任程式碼註冊路徑替換
+        # claude adapter 的 runtime_version（monkeypatch 會在測試後移除該註冊）。
         monkeypatch.setitem(
-            execution_adapters._ADAPTERS,
+            execution_adapters._REGISTERED_ADAPTERS,
             "claude",
-            execution_adapters.ExecutionAdapter(
-                "claude", "claude-code-cli", "1", "cortex-adapter-v2", usage_source="claude-jsonl"
+            replace(
+                execution_adapters.adapter_for("claude"), runtime_version="cortex-adapter-v2"
             ),
         )
 
