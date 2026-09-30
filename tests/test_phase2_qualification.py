@@ -548,7 +548,6 @@ def test_reference_image_is_ubuntu_2404_systemd_pid1_with_os_dependencies() -> N
         "gh",
         "bubblewrap",
         "socat",
-        "nodejs",
     ):
         assert re.search(
             rf"\b{re.escape(package)}\b", lowered
@@ -556,6 +555,8 @@ def test_reference_image_is_ubuntu_2404_systemd_pid1_with_os_dependencies() -> N
     assert re.search(
         r"\b(?:polkitd|policykit-1)\b", lowered
     ), "Dockerfile must install polkit"
+    # #716：系統層 node 由官方 tarball 裝到 wrapper 寫死的 `/usr/bin/node`，不走 apt。
+    assert "/usr/bin/node" in raw, "Dockerfile must install the system node runtime"
     assert re.search(
         r"(?im)^\s*(?:entrypoint|cmd)\s+\[\s*[\"'](?:/sbin/init|/lib/systemd/systemd)[\"']",
         raw,

@@ -1433,8 +1433,9 @@ SYSTEM_PROGRAMS: tuple[SystemProgram, ...] = (
         "node", "apt: nodejs", ("codex", "copilot", "srt", "openspec"),
         note=(
             "通用 JS runtime，換版本幾乎不影響產出，因此不進部署樹；但版本本身仍是"
-            "部署決定（目前 codex 宣告 `node >=16`）。所有 `needs_node` 的 toolchain "
-            "程式都吃它。"
+            "部署決定：wrapper 寫死 `/usr/bin/node`，而 toolchain 的 openspec 要求 "
+            "`node >=20.19`（Ubuntu 24.04 apt 的 nodejs 18.19 不夠，#716）。所有 "
+            "`needs_node` 的 toolchain 程式都吃它。"
         ),
     ),
     SystemProgram(

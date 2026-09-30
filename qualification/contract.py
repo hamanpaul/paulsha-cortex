@@ -59,6 +59,17 @@ TOOLCHAIN: Mapping[str, Mapping[str, str]] = {
     },
 }
 
+#: 系統層 node runtime（#716）。toolchain 的 `.js` 進入點由 root-owned wrapper 以
+#: `/usr/bin/node` 執行（`trust_root/install/core.py`）；openspec 1.10.0 要求
+#: node >=20.19，Ubuntu 24.04 apt 的 nodejs 是 18.19，Manager 在 ship lane 跑
+#: `openspec validate` 直接 SyntaxError，archive gate 判 `canonical-specs-invalid`。
+#: reference image 改以官方 tarball 安裝 node 本體，版本與 sha256 以此為唯一真相。
+NODE_RUNTIME: Mapping[str, str] = {
+    "version": "22.20.0",
+    "url": "https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.gz",
+    "sha256": "eeaccb0378b79406f2208e8b37a62479c70595e20be6b659125eb77dd1ab2a29",
+}
+
 #: 部署 venv 需要、但不是 cortex 相依的 python 發行版（permgen
 #: `DEPLOYMENT_PYTHON_DISTRIBUTIONS`）。`policy-check` 是 ship preflight 的 backend
 #: （`PSC_PREFLIGHT_CMD` → `paulsha_cortex.preflight_ci` → `policy_check.preflight

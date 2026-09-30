@@ -13,6 +13,7 @@ from qualification.contract import (
     CANARY_BUILDER,
     CANARY_REVIEWER,
     IMAGE_APT_PINS,
+    NODE_RUNTIME,
     PROBE_GATE_PYTEST_VERSION,
     PROVIDERS,
     TOOLCHAIN,
@@ -397,6 +398,30 @@ def test_reference_image_apt_pins_mirror_the_contract() -> None:
     assert pinned == dict(IMAGE_APT_PINS)
     assert IMAGE_APT_PINS["python3-pytest"].split("-", 1)[0] == PROBE_GATE_PYTEST_VERSION
     assert "pip install" not in dockerfile.split("COPY", 1)[0]
+
+
+def test_reference_image_node_runtime_mirrors_the_contract() -> None:
+    """#716：`/usr/bin/node` 必須滿足 toolchain 的 node 需求（openspec 1.10.0 要 >=20.19）。
+
+    Ubuntu 24.04 apt 的 nodejs 是 18.19，ship lane 的 `openspec validate` 在它底下
+    直接 SyntaxError；image 改由 contract 釘版本與 sha256 的官方 tarball 安裝。
+    """
+
+    dockerfile = (REPO_ROOT / "qualification" / "Dockerfile").read_text(encoding="utf-8")
+    args = dict(re.findall(r"(?m)^ARG\s+(NODE_RUNTIME_[A-Z0-9_]+)=(\S+)\s*$", dockerfile))
+    assert args == {
+        "NODE_RUNTIME_VERSION": NODE_RUNTIME["version"],
+        "NODE_RUNTIME_SHA256": NODE_RUNTIME["sha256"],
+    }
+    version = NODE_RUNTIME["version"]
+    assert NODE_RUNTIME["url"] == (
+        f"https://nodejs.org/dist/v{version}/node-v{version}-linux-x64.tar.gz"
+    )
+    assert tuple(int(part) for part in version.split(".")) >= (20, 19, 0)
+    assert re.search(r"sha256sum --check --strict", dockerfile)
+    assert "/usr/bin/node" in dockerfile
+    apt_block = dockerfile.split("apt-get clean", 1)[0]
+    assert not re.search(r"(?m)^\s+nodejs\b", apt_block), "apt nodejs (18.19) must not shadow /usr/bin/node"
 
 
 def test_policy_check_wheel_matches_probe_policy_and_engine_pin() -> None:

@@ -107,6 +107,7 @@
 
 ### Fixed
 
+- **#716 qualification image 的系統層 node**：改由 contract 釘版本與 sha256 的官方 Node.js 22 tarball 安裝 `/usr/bin/node`（openspec 要求 >=20.19，apt 的 18.19 會讓 `openspec validate` SyntaxError）（#716）。
 - **#1215 builder 刪除 seed 的 pinned 輸入**：commit-required builder 的 contract 說明 seed 進工作區的 untracked pinned 輸入不得刪除；build phase terminalization 失敗且 `retry-build` 可受理時，next_actions 會列出 `retry-build`（#1215）。
 - **#1220 closing reference 缺席的出口**：merge 授權只剩 `closing-issue-missing` 時記錄結構化 needs_human `closing-reference-missing` 並投影 `resume`／場外合入提示，不再變成 `resume-workflow-failed`（#1220）。
 - **#1210 direct 模式 Claude reviewer 的 Bash allow**：reviewer settings 補 `permissions.allow: ["Bash"]`，dontAsk 下複合命令不再被拒；沙箱與憑證讀取拒絕不變。
