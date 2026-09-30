@@ -110,6 +110,7 @@
 ### Fixed
 
 - **#1237 archive 後補上新 spec 的 Purpose**：`openspec archive` 為新 capability 留下的 TBD Purpose 佔位，改由 Manager 以 proposal 的 Why 補上，避免 Copilot finding 卡住 ship（#1237）。
+- **#716 Codex app-server 探針重試**：canary 的 codex status 探針改為最多 3 次、每次 60 秒（總上限不變），減少 `account/read` 偶發卡住造成的整輪失敗（#716）。
 - **#1233 backoff lock 在 root 建立前後分裂**：writer 先建 coordinator root 再拿 lock，reader 在 root 不存在時不去祖先建 lock，修正 CI 偶發的 `missing`（#1233）。
 - **#1234 builder contract 列出 work item 的 todo**：commit-required 卡一併勾選 plan-kind todo（只改勾選狀態，排除 seed 的輸入），避免漏勾造成 Copilot finding（#1234）。
 - **#716 openspec 在 jitless 下的執行環境**：qualification image 的 node 改為 20.20.2（node 22 在 `--jitless` 下 import `node:http` 即崩），Manager EnvironmentFile 加 `DO_NOT_TRACK=1` 關掉 openspec telemetry（#716）。

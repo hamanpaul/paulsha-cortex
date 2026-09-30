@@ -97,8 +97,11 @@ SERVICES = (
 )
 
 
-#: codex app-server 單次 status 交換的時限（秒）；逾時會以新 process 重試一次（#716）。
-CODEX_STATUS_PROBE_TIMEOUT_SECONDS = 90
+#: codex app-server 單次 status 交換的時限（秒）與次數（#716）。卡住時重開 process 即恢復，
+#: 因此以較短的單次時限多試幾次：總上限與舊的 90 秒×2 相同。deployment canary 在
+#: 2026-09-30 兩度在 `account/read` 連續逾時兩次，而同一 main 重跑即通過。
+CODEX_STATUS_PROBE_TIMEOUT_SECONDS = 60
+CODEX_STATUS_PROBE_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -2871,7 +2874,7 @@ def _provider_preflight(provider: str, account: str) -> dict[str, object]:
         # #716：app-server 對上游的 account／rate-limit 查詢偶發卡住（本機經 egress
         # proxy 重現過數次不回應，重開一個 process 即正常）。只有傳輸層逾時才以新
         # process 重試一次；認證失敗、額度用盡等明確回答仍立即 fail closed。
-        for attempt in range(2):
+        for attempt in range(CODEX_STATUS_PROBE_ATTEMPTS):
             try:
                 account_response, rate_limits_response = _codex_app_server_exchange(
                     adapter.status_command,
@@ -2881,7 +2884,10 @@ def _provider_preflight(provider: str, account: str) -> dict[str, object]:
                 )
                 break
             except QualificationFailure as exc:
-                if attempt == 1 or "status probe timed out" not in str(exc):
+                if (
+                    attempt == CODEX_STATUS_PROBE_ATTEMPTS - 1
+                    or "status probe timed out" not in str(exc)
+                ):
                     raise
         return _codex_preflight_from_responses(account_response, rate_limits_response)
     if adapter.status_kind == "copilot-app-server":
