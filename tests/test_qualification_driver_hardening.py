@@ -1715,7 +1715,7 @@ def _dispatch_fixture(tmp_path: Path, driver):
                     "spec_version": 1,
                     "instance": job_id,
                     "job_id": job_id,
-                    "unit": f"cortex-job-jit@{job_id}.service",
+                    "unit": f"cortex-job-ro-jit@{job_id}.service",
                     "command": [
                         "bash",
                         "-c",
@@ -4013,5 +4013,25 @@ def test_dispatch_closeout_requires_the_final_candidate_to_be_verified(
     with pytest.raises(
         driver.QualificationFailure,
         match="final workflow candidate was not verified and reviewed: observed=review",
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+def test_dispatch_closeout_requires_the_read_only_template_for_the_probe_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：worktree-isolation 是 BUILDER_WRITE_FORBIDDEN，必須跑在 `cortex-job-ro`
+    模板；可寫模板代表派工選錯了工作區契約。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    spec_path = fixture["coordinator"] / "job-specs" / "builder" / "build-job.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    spec["unit"] = "cortex-job-jit@build-job.service"
+    _write_json(spec_path, spec)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    with pytest.raises(
+        driver.QualificationFailure, match="job spec authority mismatch: unit"
     ):
         _validate_fixture_closeout(driver, fixture)
