@@ -2407,6 +2407,9 @@ class SubprocessLauncher:
                     manager_env=os.environ,
                 ),
                 account=runtime_account,
+                # #716：Codex 憑證只給 codex executor（與下方 credential_publish 同一
+                # 判準）；copilot／agy／claude reviewer 的部署可以根本沒有 Codex 憑證。
+                seed_credential=self._executor == "codex",
             )
             copilot_home: Path | None = None
             if self._executor == "copilot":
