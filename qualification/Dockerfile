@@ -37,10 +37,10 @@ RUN apt-get update \
         console-getty.service
 
 # 系統層 node（#716）：toolchain wrapper 以 `/usr/bin/node` 執行 `.js` 進入點，
-# contract 釘住的 openspec 要求 node >=20.19，Ubuntu 24.04 的 apt nodejs（18.19）跑不起來。
+# contract 釘住的 openspec 要求 node >=20.19，且 `--jitless` 下只能用 20.x（見 contract 的 NODE_RUNTIME）。
 # 版本與 sha256 逐字鏡射 qualification/contract.py 的 NODE_RUNTIME（測試釘住）。
-ARG NODE_RUNTIME_VERSION=22.20.0
-ARG NODE_RUNTIME_SHA256=eeaccb0378b79406f2208e8b37a62479c70595e20be6b659125eb77dd1ab2a29
+ARG NODE_RUNTIME_VERSION=20.20.2
+ARG NODE_RUNTIME_SHA256=19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b
 RUN curl -fsSLo /tmp/node.tar.gz \
         "https://nodejs.org/dist/v${NODE_RUNTIME_VERSION}/node-v${NODE_RUNTIME_VERSION}-linux-x64.tar.gz" \
     && echo "${NODE_RUNTIME_SHA256}  /tmp/node.tar.gz" | sha256sum --check --strict - \

@@ -416,9 +416,10 @@ def _receipt_view(receipt: InstallReceipt) -> dict[str, object]:
 # added `version: "1"` to the manager gh config, and #716 again added
 # `StateDirectory=` for the gate worktree slot to the gate job template units
 # (generated unit bytes only; no legacy code path changed), and #716 once more
-# added the toolchain-first `PATH` to the generated manager EnvironmentFile.
+# added the toolchain-first `PATH` to the generated manager EnvironmentFile,
+# and #716 again added `DO_NOT_TRACK=1` there (openspec under `--jitless`).
 REGRESSION_GOLDEN_SHA256 = (
-    "d4922d855f74367d79809de3fb538c0056c068b7540cb712c08c438daf7a51d6"
+    "998f5e7babbe431f73afe9543065024c43c9e336ca25cc16d86c1d6c33485fcb"
 )
 
 
