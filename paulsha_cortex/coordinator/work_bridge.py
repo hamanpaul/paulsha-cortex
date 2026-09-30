@@ -1908,6 +1908,78 @@ def _matching_archive_entries(root: Path, *, change: str) -> tuple[str, ...]:
     return tuple(sorted(matches))
 
 
+def _archived_spec_purpose_placeholder(change: str) -> str:
+    """openspec 1.10 `buildSpecSkeleton` 替新 capability 寫入的 Purpose 佔位（逐字）。"""
+
+    return f"TBD - created by archiving change {change}. Update Purpose after archive."
+
+
+def _proposal_why(proposal: Path) -> str | None:
+    """archived proposal `## Why` 的第一段，空白收斂成單行；找不到就回 None。"""
+
+    try:
+        lines = proposal.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    paragraph: list[str] = []
+    in_why = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            if in_why and paragraph:
+                break
+            in_why = stripped.lstrip("#").strip().lower() == "why"
+            continue
+        if not in_why:
+            continue
+        if not stripped:
+            if paragraph:
+                break
+            continue
+        paragraph.append(stripped)
+    text = ""
+    for part in (" ".join(line.split()) for line in paragraph):
+        # 中文段落換行只是排版，接回時不補空格；兩側都是 ASCII 才以空格相接。
+        if text and not (ord(text[-1]) > 127 or ord(part[0]) > 127):
+            text += " "
+        text += part
+    return text or None
+
+
+def _fill_archived_spec_purposes(worktree: Path, *, change: str) -> tuple[str, ...]:
+    """#1237：archive 為新 capability 留下的 TBD Purpose 換成 proposal 的 Why。
+
+    delta spec 沒寫 `## Purpose` 時，openspec 會替新的主 spec 寫入佔位；Manager 的
+    archive commit 原樣收下，之後的 re-verification 唯讀也不會補，PR 因此必帶佔位，
+    Copilot 必回 finding。只替換本 change 的佔位，其他內容一律不動。"""
+
+    specs_root = worktree / "openspec" / "specs"
+    entries = _matching_archive_entries(worktree, change=change)
+    if not entries or specs_root.is_symlink() or not specs_root.is_dir():
+        return ()
+    proposal = worktree / "openspec" / "changes" / "archive" / entries[-1] / "proposal.md"
+    if proposal.is_symlink() or not proposal.is_file():
+        return ()
+    purpose = _proposal_why(proposal)
+    if purpose is None:
+        return ()
+    placeholder = _archived_spec_purpose_placeholder(change)
+    filled: list[str] = []
+    for spec in sorted(specs_root.glob("*/spec.md")):
+        if spec.is_symlink() or not spec.is_file():
+            continue
+        text = spec.read_text(encoding="utf-8")
+        lines = text.split("\n")
+        if placeholder not in lines:
+            continue
+        spec.write_text(
+            "\n".join(purpose if line == placeholder else line for line in lines),
+            encoding="utf-8",
+        )
+        filled.append(spec.relative_to(worktree).as_posix())
+    return tuple(filled)
+
+
 def _path_exists_or_is_symlink(path: Path) -> bool:
     try:
         return path.exists() or path.is_symlink()
@@ -2909,6 +2981,7 @@ def build_production_ship_validator(
             )
             if "Aborted" in output:
                 raise RuntimeError("official OpenSpec archive aborted: no files were changed")
+            _fill_archived_spec_purposes(worktree, change=str(change))
             reset = _commit_archive_and_require_reverification(
                 registry=registry,
                 state_root=state_root,
