@@ -14,7 +14,6 @@ RUN apt-get update \
         gh \
         git \
         jq \
-        nodejs \
         polkitd \
         python3 \
         python3-iniconfig=1.1.1-2 \
@@ -36,6 +35,21 @@ RUN apt-get update \
         systemd-remount-fs.service \
         getty.target \
         console-getty.service
+
+# 系統層 node（#716）：toolchain wrapper 以 `/usr/bin/node` 執行 `.js` 進入點，
+# contract 釘住的 openspec 要求 node >=20.19，Ubuntu 24.04 的 apt nodejs（18.19）跑不起來。
+# 版本與 sha256 逐字鏡射 qualification/contract.py 的 NODE_RUNTIME（測試釘住）。
+ARG NODE_RUNTIME_VERSION=22.20.0
+ARG NODE_RUNTIME_SHA256=eeaccb0378b79406f2208e8b37a62479c70595e20be6b659125eb77dd1ab2a29
+RUN curl -fsSLo /tmp/node.tar.gz \
+        "https://nodejs.org/dist/v${NODE_RUNTIME_VERSION}/node-v${NODE_RUNTIME_VERSION}-linux-x64.tar.gz" \
+    && echo "${NODE_RUNTIME_SHA256}  /tmp/node.tar.gz" | sha256sum --check --strict - \
+    && tar -xzf /tmp/node.tar.gz -C /tmp --no-same-owner \
+        "node-v${NODE_RUNTIME_VERSION}-linux-x64/bin/node" \
+    && install -o root -g root -m 0755 \
+        "/tmp/node-v${NODE_RUNTIME_VERSION}-linux-x64/bin/node" /usr/bin/node \
+    && rm -rf /tmp/node.tar.gz "/tmp/node-v${NODE_RUNTIME_VERSION}-linux-x64" \
+    && /usr/bin/node --version
 
 COPY validate.py /usr/local/libexec/cortex-qualification-validate
 COPY contract.py /usr/local/libexec/qualification/contract.py
