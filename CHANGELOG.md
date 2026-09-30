@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#1226 planning quota identity fallback**：enforce 在 brainstorm 前一次選定額度可行且 domain 異質的 primary／secondary，無可行組合時 wait，receipt 記錄排除候選與實際 primary（#1226）。
 - **#1222 Claude quota observation source**：從終局 Claude job 的 stream-json `rate_limit_event` 收割五小時／七日剩餘百分比至 quota observation ledger，支援 identity binding、coverage gap 與 TTL；更新 quota enforce 手冊（#1222）。
 - **#1224 rollback loaded-runtime qualification**：RC 對已核可 prior receipt 執行隔離 upgrade rollback，立即比對 Manager／Monitor 的 loaded artifact 與 receipt，並將列舉結果納入 qualification evidence；文件明示同 artifact 情境、證據界線與 RC/live 驗收分工（#1224）
 - **#829 refine 結案小缺口**：#843 R04 builder 版 retry-card 失敗補 reason 斷言、#844 S04 補 loadout 版本測試、stage reuse 文件寫明重啟產生 `reused` 的前提、#857 todo 回填 09-29 canary 通過紀錄（#829）。

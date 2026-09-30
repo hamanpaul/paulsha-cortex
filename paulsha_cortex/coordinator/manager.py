@@ -84,6 +84,7 @@ from .model_identities import (
     ModelIdentity,
     is_environment_grade_rejection_reason,
     load_model_identities,
+    select_secondary_planner,
 )
 from .planning import (
     ACCEPTANCE_SURFACE_RULES,
@@ -12000,6 +12001,58 @@ class _PlanningQuotaGate:
         self.identities = identities
         self.context = quota_context
         self._attempts: dict[str, int] = {}
+        self._preflight_excluded: list[Mapping[str, object]] = []
+
+    def feasible(self, identity) -> bool:
+        """唯讀判斷單一 planner identity 是否可在 enforce 下准入。"""
+        from . import execution_adapters, quota_admission
+
+        mode = "enforced" if quota_admission.quota_admission_enabled(
+            self.context.environment
+        ) else "shadow"
+        if mode != "enforced":
+            return True
+        binding = execution_adapters.resolve_profile(
+            identity, "planner", launch_contract={"sandbox": "read-only", "tools": ()}
+        )
+        evaluated = _evaluate_quota_admission_candidate(
+            self.context, identity=identity, profile_binding=binding,
+            now_ms=int(time.time() * 1000),
+        )
+        if evaluated is None:
+            return True
+        assessment, _demand_version = evaluated
+        if assessment.feasible:
+            return True
+        excluded = {
+            "executor": identity.executor,
+            "model_id": identity.model_id,
+            "exclusion_reason": assessment.exclusion_reason or "quota-admission-insufficient",
+            "reset_at_ms": min(
+                (pool.reset_at_ms for pool in assessment.pools
+                 if type(pool.reset_at_ms) is int and pool.reset_at_ms >= 0),
+                default=None,
+            ),
+        }
+        if excluded not in self._preflight_excluded:
+            self._preflight_excluded.append(excluded)
+        return False
+
+    def preflight_wait(self, excluded: Sequence[Mapping[str, object]]) -> None:
+        card_id = "planning:questioner"
+        step = SimpleNamespace(card=card_id, persona="planner")
+        projection = _quota_admission_record_wait_decision(
+            self.context.store, registry=self.registry, run=self.run, step=step,
+            identities=self.identities, reason="quota-admission-insufficient",
+            excluded=tuple(excluded),
+            policy_config_revision=getattr(self.context, "config_revision", None),
+        )
+        if projection is not None:
+            self.registry._manager_update_workflow_run(
+                self.run.run_id,
+                quota_admission={**(self.run.quota_admission or {}), "planner": projection},
+            )
+        raise planning_runtime.PlanningQuotaWait(excluded=tuple(excluded))
 
     def acquire(self, invocation):
         from . import execution_adapters, quota_admission
@@ -12129,6 +12182,7 @@ class _PlanningQuotaGate:
             generated_at_ms=int(time.time() * 1000),
             selected={"executor": identity.executor, "model_id": identity.model_id,
                       "independence_domain": getattr(identity, "independence_domain", "unknown")},
+            excluded=tuple(self._preflight_excluded),
             reservation_id=reservation["reservation_id"] if reservation else None,
             selected_observation_state=assessment.observation_state,
             selected_feasible=assessment.feasible,
@@ -12137,6 +12191,7 @@ class _PlanningQuotaGate:
             job_id=job_id,
         )
         projection = _quota_admission_record_admit_decision(self.context.store, decision)
+        self._preflight_excluded.clear()
         if projection is not None:
             self.registry._manager_update_workflow_run(
                 self.run.run_id,
@@ -19709,6 +19764,86 @@ def apply_workflow_action(
     identities = identity_registry
     if identities is None:
         identities = runtime.identity_registry if runtime is not None else planning_identities
+    planning_admissible = None
+    # #1226：preflight 選組發現整組都不可行時 raise `PlanningQuotaWait`；它在
+    # brainstorm 的 try 之外，必須走同一個 wait 出口，不能漏成 resume 失敗。
+    try:
+        if quota_gate is not None and quota_admission.quota_admission_enabled(
+            quota_admission_context.environment
+        ):
+            planning_admissible = quota_gate.feasible
+            primary_identity = identities.get(*primary)
+            if primary_identity is not None and not planning_admissible(primary_identity):
+                selected_primary = None
+                candidate_probes = probes or {}
+                for candidate in planning_identities.identities:
+                    if (
+                        "planning" not in candidate.capabilities
+                        or (candidate.executor, candidate.model_id) == primary
+                    ):
+                        continue
+                    probe = candidate_probes.get((candidate.executor, candidate.model_id))
+                    if (
+                        probe is None or not probe.ready
+                        or probe.identity != (
+                            candidate.executor, candidate.model_id,
+                            candidate.independence_domain,
+                        )
+                        or not planning_admissible(candidate)
+                    ):
+                        continue
+                    candidate_key = (candidate.executor, candidate.model_id)
+                    secondary = select_secondary_planner(
+                        registry=identities,
+                        primary=candidate_key,
+                        probes=candidate_probes,
+                        admissible=planning_admissible,
+                    )
+                    if secondary.state == "ready" and secondary.identity is not None:
+                        selected_primary = candidate_key
+                        break
+                    excluded = {
+                        "executor": candidate.executor,
+                        "model_id": candidate.model_id,
+                        "exclusion_reason": "no-admissible-heterogeneous-secondary",
+                        "reset_at_ms": None,
+                    }
+                    if excluded not in quota_gate._preflight_excluded:
+                        quota_gate._preflight_excluded.append(excluded)
+                if selected_primary is None:
+                    quota_gate.preflight_wait(tuple(quota_gate._preflight_excluded))
+                primary = selected_primary
+                if runtime_factory is not None and runtime is not None:
+                    runtime = runtime_factory(
+                        primary=primary,
+                        worktree=_required_workflow_string(args, "artifact_root"),
+                        evidence_root=transaction_root,
+                        run_id=run.run_id,
+                        **({"quota_gate": quota_gate} if quota_gate is not None else {}),
+                    )
+                    identities = runtime.identity_registry
+                    probes = runtime.probes
+                    primary_questioner = runtime.primary_questioner
+                    secondary_planner = runtime.secondary_planner
+                    primary_integrator = runtime.primary_integrator
+            else:
+                secondary = select_secondary_planner(
+                    registry=identities,
+                    primary=primary,
+                    probes=probes or {},
+                    admissible=planning_admissible,
+                )
+                if secondary.state != "ready" and quota_gate._preflight_excluded:
+                    quota_gate.preflight_wait(tuple(quota_gate._preflight_excluded))
+    except planning_runtime.PlanningQuotaWait as wait:
+        updated = _planning_quota_wait_stop(
+            registry=registry, run=run, excluded=wait.excluded,
+            card_id=define_step.card if define_step else "define",
+        )
+        return {
+            "run_id": updated.run_id, "current_phase": updated.current_phase,
+            "reason": "quota-admission-insufficient",
+        }
     publication = _PlanningPublicationTransaction(
         root=artifact_root,
         run_id=run.run_id,
@@ -19761,6 +19896,7 @@ def apply_workflow_action(
             # 前一世代（已 abandon）的殘留檔才不會佔住新世代的落點。前代檔案原位
             # 保留、原路徑仍可稽核——evidence 不搬不刪。
             run_id=run.run_id,
+            admissible=planning_admissible,
         )
     except planning_runtime.PlanningQuotaWait as wait:
         publication.rollback()

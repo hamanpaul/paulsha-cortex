@@ -2019,11 +2019,14 @@ def run_heterogeneous_brainstorm(
     evidence_writer: Callable[[Path, object], None] | None = None,
     run_id: str | None = None,
     rejection_recorder: Callable[[ArtifactAssessment], str | None] | None = None,
+    admissible: Callable[[ModelIdentity], bool] | None = None,
 ) -> BrainstormResult:
     empty_refs = PlanningGateRefs()
     if report.complete:
         return BrainstormResult("ready", None, None, empty_refs, None)
-    selection = select_secondary_planner(registry=registry, primary=primary, probes=probes)
+    selection = select_secondary_planner(
+        registry=registry, primary=primary, probes=probes, admissible=admissible
+    )
     if selection.state != "ready" or selection.identity is None:
         # issue #682（#672 票 A）：`no-heterogeneous-planner` 從**結論**變成
         # **結論 ＋ 每個候選為什麼落選**。這一行就是「讓誤報不可能」的機制

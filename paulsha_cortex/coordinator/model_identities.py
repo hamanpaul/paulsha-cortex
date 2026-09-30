@@ -1389,6 +1389,7 @@ def select_secondary_planner(
     registry: IdentityRegistry,
     primary: tuple[str, str],
     probes: Mapping[tuple[str, str], CapabilityProbe],
+    admissible: Callable[[ModelIdentity], bool] | None = None,
 ) -> SecondarySelection:
     """挑異質 domain 的次要 planner。
 
@@ -1457,6 +1458,11 @@ def select_secondary_planner(
                     # probe 回報的身分是 roster／probe 兩側的常數，不含自由文字。
                     diagnostic="probe-reported=" + "/".join(probe.identity),
                 )
+            )
+            continue
+        if admissible is not None and not admissible(identity):
+            rejections.append(
+                CandidateRejection.topological(identity, "quota-admission-insufficient")
             )
             continue
         return SecondarySelection("ready", None, identity)
