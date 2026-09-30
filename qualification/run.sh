@@ -393,9 +393,17 @@ docker exec \
     --receipt "$receipt_path" --json --evidence "$install_evidence_path"
 
 # 上方 fresh-install rollback 會刻意回到沒有服務的主機。為擷取 loaded-runtime
-# 證據，從同一個不可變 RC artifact 建立不同 plan hash 的空 overlay plan，以已核可
-# receipt 作為 upgrade parent，並在任何後續安裝動作前 rollback 此 transaction。
-docker exec "$container_name" sh -eu -c 'printf "{}\n" > "$1"' sh "$rollback_overlay_path"
+# 證據，從同一個不可變 RC artifact 建立另一份 plan，以已核可 receipt 作為 upgrade
+# parent，並在任何後續安裝動作前 rollback 此 transaction。空 overlay 不產生
+# overlay 紀錄、plan 與 prior 逐字相同（installer 拒絕同一 plan 當 upgrade）；
+# 這裡改為重述 release 設定既有的 `providers.builder`：有效設定不變，plan 多帶
+# `host_overlay_sha256` 而成為不同的 transaction。
+docker exec "$container_name" python3 -c '
+import json, sys, yaml
+config = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+overlay = {"providers": {"builder": list(config["providers"]["builder"])}}
+open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(overlay) + "\n")
+' /artifacts/install-config.yaml "$rollback_overlay_path"
 docker exec "$container_name" cortex install trust-root plan \
     --config /artifacts/install-config.yaml \
     --host-overlay "$rollback_overlay_path" \
