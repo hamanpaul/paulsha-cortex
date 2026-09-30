@@ -136,9 +136,11 @@ def _normalized_plan_sha256(plan: dict, tmp_path: Path) -> str:
 # a legacy change pass.  Regenerated for non-legacy changes only: #716 added
 # `version: "1"` to the root-owned manager gh config (manager-gh-config asset),
 # and #716 again added `StateDirectory=` for the gate worktree slot to the gate
-# job template units (the slot must exist before namespace setup).
+# job template units (the slot must exist before namespace setup), and #716
+# once more added the toolchain-first `PATH` to the manager EnvironmentFile
+# (the ship lane calls `openspec` by name).
 RELEASE_PLAN_GOLDEN_SHA256 = (
-    "b6500fb582ec918d087f350149d93d8ba070bc4a05e0f705f46c7909daee79d2"
+    "7f9079bb2c86b2ac57f217f3230fe5ef0d805cdb5cc8b62b833cfa59dc4e3048"
 )
 
 

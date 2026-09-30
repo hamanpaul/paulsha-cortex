@@ -3146,6 +3146,18 @@ class PathLayout:
         """
         return ":".join((self.toolchain_bin,) + JOB_PATH_SYSTEM_TAIL)
 
+    def manager_path_value(self) -> str:
+        """Manager 服務行程的 `PATH`（寫進 Manager 的 EnvironmentFile，#716）。
+
+        ship lane 以相對名呼叫 `openspec validate`／`openspec archive`，而 openspec 只以
+        tool tree 裝在 toolchain（qualification 的 `--tool-tree openspec,…`）。unit 不帶
+        `PATH` 時 systemd 給的預設值不含 toolchain，Manager 在 archive gate 當下
+        `FileNotFoundError: 'openspec'`（#716 canary）。形狀與 job 相同：toolchain 排最前
+        面，確保跑的是受 qualification 的那份；尾段是系統層（git、gh、python3、
+        systemctl／systemd-run 都在 `/usr/bin`），同樣不含 sbin。
+        """
+        return self.job_path_value()
+
     def job_home_value(self, account: str) -> str:
         """job 應該拿到的 `HOME`（＝ Manager 端 `PSC_<ROLE>_HOME` 的值，#685／#686）。
 
