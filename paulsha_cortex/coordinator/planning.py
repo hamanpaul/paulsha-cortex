@@ -1995,6 +1995,14 @@ def brainstorm_evidence_filename(
     return f"brainstorm-{identity}-{evidence_key}.json"
 
 
+def _rethrow_planning_quota_wait(exc: BaseException) -> None:
+    """保留 manager 的 quota wait 控制流程，不降格成 planning failure。"""
+    from .planning_runtime import PlanningQuotaWait
+
+    if isinstance(exc, PlanningQuotaWait):
+        raise exc
+
+
 def run_heterogeneous_brainstorm(
     *,
     report: CompletenessReport,
@@ -2040,6 +2048,7 @@ def run_heterogeneous_brainstorm(
         questioner_model_input = _snapshot_model_input("questioner", questioner_input)
         pack = validate_question_pack(primary_questioner(questioner_input), report=report)
     except Exception as exc:
+        _rethrow_planning_quota_wait(exc)
         # issue #397：這三處 `except Exception` 過去把底層例外整段壓平成單一
         # 字面值 reason，操作者只看得到分支名稱、看不到底層是哪種例外、訊息
         # 內容是什麼——排障要另外重跑加 print 才查得到（曾經雙重誤導：真正
@@ -2069,6 +2078,7 @@ def run_heterogeneous_brainstorm(
             question_pack=pack,
         )
     except Exception as exc:
+        _rethrow_planning_quota_wait(exc)
         return BrainstormResult(
             "needs_human",
             f"secondary-output-malformed: {summarize_planning_exception(exc)}",
@@ -2092,6 +2102,7 @@ def run_heterogeneous_brainstorm(
             secondary_evidence_hash=evidence_hash,
         )
     except Exception as exc:
+        _rethrow_planning_quota_wait(exc)
         return BrainstormResult(
             "needs_human",
             f"primary-integration-malformed: {summarize_planning_exception(exc)}",

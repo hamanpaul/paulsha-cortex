@@ -11991,6 +11991,252 @@ def _quota_admission_record_admit_decision(
         return None
 
 
+class _PlanningQuotaGate:
+    """把單次同步 planning 呼叫接到既有 quota decision 與 reservation。"""
+
+    def __init__(self, *, registry, run, identities, quota_context) -> None:
+        self.registry = registry
+        self.run = run
+        self.identities = identities
+        self.context = quota_context
+        self._attempts: dict[str, int] = {}
+
+    def acquire(self, invocation):
+        from . import execution_adapters, quota_admission
+
+        purpose = str(invocation.purpose)
+        ordinal = self._attempts.get(purpose, 0)
+        self._attempts[purpose] = ordinal + 1
+        card_id = f"planning:{purpose}"
+        attempt_id = f"{self.run.run_id}:planning:{purpose}:n{ordinal}"
+        identity = invocation.identity
+        binding = execution_adapters.resolve_profile(
+            identity,
+            "planner",
+            launch_contract={"sandbox": "read-only", "tools": ()},
+        )
+        assessment, demand_version = _evaluate_quota_admission_candidate(
+            self.context, identity=identity, profile_binding=binding,
+            now_ms=int(time.time() * 1000),
+        )
+        if assessment is None:
+            return None
+        mode = "enforced" if quota_admission.quota_admission_enabled(
+            self.context.environment
+        ) else "shadow"
+        excluded = ({
+            "executor": identity.executor,
+            "model_id": identity.model_id,
+            "exclusion_reason": assessment.exclusion_reason,
+            "reset_at_ms": min(
+                (pool.reset_at_ms for pool in assessment.pools
+                 if type(pool.reset_at_ms) is int and pool.reset_at_ms >= 0),
+                default=None,
+            ),
+        },)
+        if mode == "enforced" and not assessment.feasible:
+            step = SimpleNamespace(card=card_id, persona="planner")
+            projection = _quota_admission_record_wait_decision(
+                self.context.store, registry=self.registry, run=self.run, step=step,
+                identities=self.identities, reason="quota-admission-insufficient",
+                excluded=excluded,
+                policy_config_revision=getattr(self.context, "config_revision", None),
+            )
+            if projection is not None:
+                self.registry._manager_update_workflow_run(
+                    self.run.run_id,
+                    quota_admission={**(self.run.quota_admission or {}), "planner": projection},
+                )
+            raise planning_runtime.PlanningQuotaWait(excluded=excluded)
+
+        observation_version = quota_admission.observation_fingerprint(assessment)
+        decision_id = quota_admission.decision_id_for(
+            run_id=self.run.run_id, card_id=card_id, attempt_id=attempt_id,
+            profile_key=binding.resolved_key, mode=mode,
+        )
+        reservation = None
+        if mode == "enforced" and assessment.pools:
+            attempt_id, decision_id, result = quota_admission.reserve_for_candidate_with_generation_fallback(
+                self.context.authority,
+                run_id=self.run.run_id, card_id=card_id, base_attempt_id=attempt_id,
+                profile_key=binding.resolved_key, assessment=assessment,
+                observation_version=observation_version, demand_version=demand_version,
+                lease_ms=self.context.lease_ms, now_ms=int(time.time() * 1000),
+            )
+            if result.status != "granted":
+                excluded = ({**excluded[0], "exclusion_reason": (
+                    "quota-admission-insufficient" if result.status == "denied"
+                    else f"quota-admission-{result.status}"
+                )},)
+                step = SimpleNamespace(card=card_id, persona="planner")
+                projection = _quota_admission_record_wait_decision(
+                    self.context.store, registry=self.registry, run=self.run, step=step,
+                    identities=self.identities, reason="quota-admission-insufficient",
+                    excluded=excluded,
+                    policy_config_revision=getattr(self.context, "config_revision", None),
+                )
+                if projection is not None:
+                    self.registry._manager_update_workflow_run(
+                        self.run.run_id,
+                        quota_admission={**(self.run.quota_admission or {}), "planner": projection},
+                    )
+                raise planning_runtime.PlanningQuotaWait(excluded=excluded)
+            reservation = {
+                "reservation_id": result.reservation_id,
+                "owner_token": result.owner_token,
+                "sequence": result.sequence,
+            }
+        job_id = _planning_synthetic_job_id(attempt_id)
+        if reservation is not None:
+            bound = self.context.authority.bind(
+                reservation_id=reservation["reservation_id"],
+                owner_token=reservation["owner_token"], attempt_id=attempt_id,
+                job_id=job_id, expected_sequence=reservation["sequence"],
+                now_ms=int(time.time() * 1000),
+            )
+            if bound.status not in ("ok", "duplicate"):
+                if bound.state == "reserved" and type(bound.sequence) is int:
+                    try:
+                        self.context.authority.release(
+                            reservation_id=reservation["reservation_id"],
+                            owner_token=reservation["owner_token"], attempt_id=attempt_id,
+                            reason="fail-before-spawn", expected_sequence=bound.sequence,
+                            now_ms=int(time.time() * 1000),
+                        )
+                    except Exception:
+                        pass
+                excluded = ({**excluded[0], "exclusion_reason": "quota-admission-reservation-lost"},)
+                step = SimpleNamespace(card=card_id, persona="planner")
+                projection = _quota_admission_record_wait_decision(
+                    self.context.store, registry=self.registry, run=self.run, step=step,
+                    identities=self.identities, reason="quota-admission-insufficient",
+                    excluded=excluded,
+                    policy_config_revision=getattr(self.context, "config_revision", None),
+                )
+                if projection is not None:
+                    self.registry._manager_update_workflow_run(
+                        self.run.run_id,
+                        quota_admission={**(self.run.quota_admission or {}), "planner": projection},
+                    )
+                raise planning_runtime.PlanningQuotaWait(excluded=excluded)
+            reservation["sequence"] = bound.sequence
+        decision = quota_admission.AdmissionDecision(
+            decision_id=decision_id, run_id=self.run.run_id, card_id=card_id,
+            attempt_id=attempt_id, profile_key=binding.resolved_key, mode=mode,
+            outcome="admit", policy_version=quota_admission.ADMISSION_POLICY_VERSION,
+            observation_version=observation_version, demand_version=demand_version,
+            qualification_version=_quota_admission_qualification_version(self.run, self.identities),
+            generated_at_ms=int(time.time() * 1000),
+            selected={"executor": identity.executor, "model_id": identity.model_id,
+                      "independence_domain": getattr(identity, "independence_domain", "unknown")},
+            reservation_id=reservation["reservation_id"] if reservation else None,
+            selected_observation_state=assessment.observation_state,
+            selected_feasible=assessment.feasible,
+            policy_config_revision=getattr(self.context, "config_revision", None),
+            selected_binding_kind=assessment.binding_kind,
+            job_id=job_id,
+        )
+        projection = _quota_admission_record_admit_decision(self.context.store, decision)
+        if projection is not None:
+            self.registry._manager_update_workflow_run(
+                self.run.run_id,
+                quota_admission={**(self.run.quota_admission or {}), "planner": projection},
+            )
+        return {
+            "decision": decision, "reservation": reservation,
+            "attempt_id": attempt_id, "profile_key": binding.resolved_key,
+            "job_id": decision.job_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def settle(self, lease, invocation, outcome) -> None:
+        if not lease:
+            return
+        from . import quota_admission
+
+        now_ms = int(time.time() * 1000)
+        reservation = lease["reservation"]
+        synthetic_job = {
+            "job_id": lease["job_id"], "executor": invocation.identity.executor,
+            "model_id": invocation.identity.model_id,
+            "started_at": lease["started_at"],
+            "exited_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if reservation is not None:
+            authority = self.context.authority
+            terminal = outcome is None or outcome.returncode != 0
+            sequence = reservation["sequence"]
+            for _ in range(3):
+                settled = authority.settle(
+                    reservation_id=reservation["reservation_id"],
+                    owner_token=reservation["owner_token"], attempt_id=lease["attempt_id"],
+                    outcome="failed" if terminal else "succeeded",
+                    expected_sequence=sequence, now_ms=now_ms,
+                )
+                if settled.status in ("ok", "duplicate"):
+                    break
+                if settled.reason != "sequence-mismatch" or type(settled.sequence) is not int:
+                    break
+                sequence = settled.sequence
+            # usage 記錄與 reservation 收斂彼此獨立；settle 失敗不改 planning 結果。
+        usage = _planning_outcome_usage(invocation.identity.executor, outcome)
+        if usage is not None:
+            _quota_admission_record_terminal_usage(
+                self.context, profile_key=lease["profile_key"],
+                job={**synthetic_job, "usage": usage}, now_ms=now_ms,
+            )
+
+
+def _planning_outcome_usage(executor: str, outcome) -> Mapping[str, object] | None:
+    """沿用既有 executor usage extractor 解析 planning invoker 的 stdout。"""
+    if outcome is None or not isinstance(outcome.stdout, str):
+        return None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".jsonl") as stream:
+            stream.write(outcome.stdout)
+            stream.flush()
+            from .usage_extractors import extract_usage
+
+            extracted = extract_usage(executor, stream.name)
+        usage = extracted.get("usage")
+        return usage if isinstance(usage, Mapping) else None
+    except Exception:
+        return None
+
+
+def _planning_process_start_ticks(pid: int) -> str:
+    """回傳 Linux process start ticks，讓 restart 後可辨識原 planning 呼叫。"""
+    try:
+        tail = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        return tail[19]
+    except (OSError, IndexError):
+        return "unknown"
+
+
+def _planning_synthetic_job_id(attempt_id: str) -> str:
+    pid = os.getpid()
+    return (
+        f"planning:{pid}:{_planning_process_start_ticks(pid)}:"
+        f"{hashlib.sha256(attempt_id.encode()).hexdigest()[:16]}"
+    )
+
+
+def _planning_quota_wait_stop(*, registry, run, excluded, card_id: str) -> object:
+    current = registry.get_workflow_run(run.run_id)
+    return registry._manager_update_workflow_run(
+        run.run_id,
+        facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+        brainstorm_required=True,
+        needs_human_reason=diagnostic_reason(
+            "quota-admission-insufficient",
+            "planning quota admission 暫停 brainstorm，等待額度觀測恢復後重試",
+            source="manager.apply_workflow_action:planning-quota-admission",
+            run_id=run.run_id, work_id=run.work_id, card=card_id,
+            attempted_candidates=str(len(excluded)),
+        ),
+    )
+
+
 def _quota_admission_stop(
     registry, run, step, *, attempts: Sequence[Mapping[str, object]],
     quota_admission_context, identities: "IdentityRegistry",
@@ -12092,7 +12338,23 @@ def _quota_admission_job_lookup(registry, job_id: str) -> Mapping[str, object] |
     try:
         return registry.get_job(job_id)
     except KeyError:
-        return None
+        # 同步 planning 沒有一般 JobRegistry row；reservation 仍綁定帶 PID 與
+        # process start ticks 的 synthetic job id。manager restart 後若原 process
+        # 已退出，這是可驗證的終局證據；同一 process 仍活著時只回 dispatched，
+        # 讓既有 reconcile 延長 lease。PID 重用會由 start ticks 排除。
+        parts = job_id.split(":", 3)
+        if len(parts) != 4 or parts[0] != "planning" or not parts[1].isdigit():
+            return None
+        pid = int(parts[1])
+        expected_start = parts[2]
+        actual_start = _planning_process_start_ticks(pid)
+        if expected_start == "unknown" or actual_start == "unknown":
+            return None
+        return {
+            "job_id": job_id,
+            "status": "dispatched" if actual_start == expected_start else "failed",
+            "exit_code": None if actual_start == expected_start else 1,
+        }
 
 
 def _quota_admission_job_lookup_by_decision(
@@ -12682,7 +12944,10 @@ def _quota_wait_retry_receipt_is_eligible(*, run, store) -> bool:
     return bool(
         decision is not None
         and decision.run_id == run.run_id
-        and decision.card_id == step.card
+        and (
+            decision.card_id == step.card
+            or (step.phase == "define" and decision.card_id.startswith("planning:"))
+        )
         and decision.mode == "enforced"
         and decision.outcome == "wait"
         and decision.reason == reason.get("reason")
@@ -18416,6 +18681,7 @@ def apply_workflow_action(
     coordinator_root: str | Path | None = None,
     trusted_terminal: bool = False,
     stage_reuse: Mapping[str, object] | None = None,
+    quota_admission_context=None,
 ) -> dict[str, object]:
     """Apply the sole production mutation API for Manager-owned workflows.
 
@@ -19278,6 +19544,23 @@ def apply_workflow_action(
         _required_workflow_string(args, "primary_executor"),
         _required_workflow_string(args, "primary_model"),
     )
+    planning_identities = identity_registry
+    if planning_identities is None:
+        planning_identities = load_model_identities()
+    from . import quota_admission
+
+    quota_gate = None
+    if (
+        quota_admission_context is not None
+        and not isinstance(quota_admission_context, quota_admission.QuotaConfigInvalid)
+    ):
+        define_step = next((item for item in run.steps if item.phase == "define"), None)
+        if define_step is not None:
+            quota_gate = _PlanningQuotaGate(
+                registry=registry, run=run, identities=planning_identities,
+                quota_context=quota_admission_context,
+            )
+    runtime = None
     if (
         runtime_factory is not None
         and (primary_questioner is None or secondary_planner is None or primary_integrator is None)
@@ -19294,6 +19577,7 @@ def apply_workflow_action(
                 # `planning-worktree-drift` 三份 evidence。
                 evidence_root=transaction_root,
                 run_id=run.run_id,
+                **({"quota_gate": quota_gate} if quota_gate is not None else {}),
             )
         except Exception as exc:
             # #393：recover-planning 靠 `cortex-planning-failure/v1` evidence
@@ -19388,59 +19672,72 @@ def apply_workflow_action(
             "reason": "planning-runtime-unavailable",
         }
 
-    identities = identity_registry or load_model_identities()
+    identities = identity_registry
+    if identities is None:
+        identities = runtime.identity_registry if runtime is not None else planning_identities
     publication = _PlanningPublicationTransaction(
         root=artifact_root,
         run_id=run.run_id,
         journal_root=transaction_root,
     )
-    result = run_heterogeneous_brainstorm(
-        report=report,
-        primary=primary,
-        registry=identities,
-        probes=probes or {},
-        evidence_dir=_required_workflow_string(args, "evidence_dir"),
-        artifact_root=_required_workflow_string(args, "artifact_root"),
-        scope=PlanningScope(
-            repo=run.repo,
-            work_id=run.work_id,
-            source_revision=_required_workflow_string(args, "source_revision"),
-        ),
-        primary_questioner=primary_questioner,
-        secondary_planner=secondary_planner,
-        primary_integrator=primary_integrator,
-        artifact_writer=lambda rows: _publish_planning_artifacts(
-            _required_workflow_string(args, "artifact_root"),
-            rows,
-            work_id=run.work_id,
-            allowed_refs=tuple(
-                ref for step in manifest.steps for ref in step.outputs
+    try:
+        result = run_heterogeneous_brainstorm(
+            report=report,
+            primary=primary,
+            registry=identities,
+            probes=probes or {},
+            evidence_dir=_required_workflow_string(args, "evidence_dir"),
+            artifact_root=_required_workflow_string(args, "artifact_root"),
+            scope=PlanningScope(
+                repo=run.repo,
+                work_id=run.work_id,
+                source_revision=_required_workflow_string(args, "source_revision"),
             ),
-            anchor_slugs=_planning_anchor_slugs(run),
-            authorities=run.planning_authority,
-            transaction=publication,
-            # #511：拒收 evidence 必須落在 coordinator_root，不能落在
-            # `artifact_root`——後者是被 cortex daemon 監控的 operator worktree，
-            # planning 失敗時會被整棵樹抹除再從 baseline 還原（#507），診斷會跟著
-            # 一起消失。與 `_record_planning_failure_evidence` 用同一個 root。
-            coordinator_root=transaction_root,
-        ),
-        evidence_writer=publication.write_evidence,
-        # #515：post-integration 檢查判定 artifact 不合驗收條件時，被拒內容會在
-        # 緊接著的 `rollback_publication()` 被撤下——不先存一份，operator 就再也
-        # 看不到 planner 到底寫了什麼（#511 的同一個教訓）。沿用 #513 已建立的
-        # `cortex-planning-artifact-rejection/v1` evidence 落檔，不另創格式。
-        rejection_recorder=lambda assessment: _record_planning_artifact_rejection_evidence(
-            coordinator_root=transaction_root,
+            primary_questioner=primary_questioner,
+            secondary_planner=secondary_planner,
+            primary_integrator=primary_integrator,
+            artifact_writer=lambda rows: _publish_planning_artifacts(
+                _required_workflow_string(args, "artifact_root"),
+                rows,
+                work_id=run.work_id,
+                allowed_refs=tuple(
+                    ref for step in manifest.steps for ref in step.outputs
+                ),
+                anchor_slugs=_planning_anchor_slugs(run),
+                authorities=run.planning_authority,
+                transaction=publication,
+                # #511：拒收 evidence 必須落在 coordinator_root，不能落在
+                # `artifact_root`——後者是被 cortex daemon 監控的 operator worktree，
+                # planning 失敗時會被整棵樹抹除再從 baseline 還原（#507），診斷會跟著
+                # 一起消失。與 `_record_planning_failure_evidence` 用同一個 root。
+                coordinator_root=transaction_root,
+            ),
+            evidence_writer=publication.write_evidence,
+            # #515：post-integration 檢查判定 artifact 不合驗收條件時，被拒內容會在
+            # 緊接著的 `rollback_publication()` 被撤下——不先存一份，operator 就再也
+            # 看不到 planner 到底寫了什麼（#511 的同一個教訓）。沿用 #513 已建立的
+            # `cortex-planning-artifact-rejection/v1` evidence 落檔，不另創格式。
+            rejection_recorder=lambda assessment: _record_planning_artifact_rejection_evidence(
+                coordinator_root=transaction_root,
+                run_id=run.run_id,
+                work_id=run.work_id,
+                assessment=assessment,
+            ),
+            # #535：brainstorm evidence 的 content-addressed 命名納入 run identity，
+            # 前一世代（已 abandon）的殘留檔才不會佔住新世代的落點。前代檔案原位
+            # 保留、原路徑仍可稽核——evidence 不搬不刪。
             run_id=run.run_id,
-            work_id=run.work_id,
-            assessment=assessment,
-        ),
-        # #535：brainstorm evidence 的 content-addressed 命名納入 run identity，
-        # 前一世代（已 abandon）的殘留檔才不會佔住新世代的落點。前代檔案原位
-        # 保留、原路徑仍可稽核——evidence 不搬不刪。
-        run_id=run.run_id,
-    )
+        )
+    except planning_runtime.PlanningQuotaWait as wait:
+        publication.rollback()
+        updated = _planning_quota_wait_stop(
+            registry=registry, run=run, excluded=wait.excluded,
+            card_id=define_step.card if define_step else "define",
+        )
+        return {
+            "run_id": updated.run_id, "current_phase": updated.current_phase,
+            "reason": "quota-admission-insufficient",
+        }
     if result.state != "ready" or result.gate_refs.brainstorm_peer is None:
         publication.rollback()
         # #393：brainstorm 未收斂預設歸內容缺陷（非 runtime 環境問題），
@@ -19579,7 +19876,10 @@ def apply_workflow_action(
     return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "brainstorm-complete"}
 
 
-def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None):
+def apply_work_action(
+    *, args, requested_by, registry=None, runtime_factory=None,
+    quota_admission_context=None,
+):
     """唯一 production mutation seam；daemon control request 之外不直接呼叫。"""
     from .work_actions import execute_work_action
     from .registry import JobRegistry
@@ -19632,6 +19932,7 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
             needs_human_reason=reason,
             model_chain_override=work_action_model_chain_override,
             combo_override=work_action_combo_override,
+            quota_admission_context=quota_admission_context,
         )
 
     recovery_kwargs = (
@@ -19648,7 +19949,7 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
     )
 
 
-def run_auto_claim_scan(*, registry=None, runtime_factory=None):
+def run_auto_claim_scan(*, registry=None, runtime_factory=None, quota_admission_context=None):
     """Periodic Manager-owned durable work claim projection."""
     from .work_actions import run_auto_claim_scan as scan
     from .registry import JobRegistry
@@ -19668,6 +19969,7 @@ def run_auto_claim_scan(*, registry=None, runtime_factory=None):
             coordinator_root=coordinator_root,
             runtime_factory=runtime_factory or planning_runtime.build_production_planning_runtime,
             needs_human_reason=reason,
+            quota_admission_context=quota_admission_context,
         )
 
     return scan(workflow_registry=active_registry, workflow_starter=starter)
