@@ -1200,6 +1200,41 @@ class PlanningInvoker(Protocol):
         """
 
 
+class PlanningQuotaWait(RuntimeError):
+    """准入額度不足時停止本次 planning 呼叫。"""
+
+    def __init__(self, *, excluded=(), reason: str = "quota-admission-insufficient") -> None:
+        super().__init__(reason)
+        self.excluded = tuple(excluded)
+        self.reason = reason
+
+
+class QuotaGatedPlanningInvoker:
+    """在既有 planning invoker 外套同步額度准入。"""
+
+    def __init__(self, inner: PlanningInvoker, gate) -> None:
+        self._inner = inner
+        self._gate = gate
+
+    def capability_probe_runner(self) -> Callable[..., object]:
+        # 能力探測不是模型規劃呼叫，不納入 quota admission。
+        return self._inner.capability_probe_runner()
+
+    def run(self, invocation: PlanningInvocation) -> PlanningOutcome:
+        if invocation.purpose == PLANNING_PURPOSE_PROBE:
+            return self._inner.run(invocation)
+        lease = self._gate.acquire(invocation)
+        outcome = None
+        try:
+            outcome = self._inner.run(invocation)
+            return outcome
+        finally:
+            try:
+                self._gate.settle(lease, invocation, outcome)
+            except Exception:
+                # 額度診斷／收斂不得覆蓋 planning 本身的結果。
+                pass
+
 class InProcessPlanningInvoker:
     """在呼叫端行程內執行（＝**現行行為**，direct 模式）。
 
@@ -1647,6 +1682,7 @@ def build_production_planning_runtime(
     evidence_root: str | Path | None = None,
     run_id: str = "ephemeral",
     probe_cache_path: str | Path | None = None,
+    quota_gate=None,
 ) -> ProductionPlanningRuntime:
     """Build the daemon's real, safe, heterogeneous planning adapters.
 
@@ -1688,6 +1724,8 @@ def build_production_planning_runtime(
             if runner is not None
             else _select_planning_invoker(os.environ)
         )
+    if quota_gate is not None:
+        invoker = QuotaGatedPlanningInvoker(invoker, quota_gate)
     root = Path(worktree).resolve()
     registry = load_model_identities()
     cache = planning_probe_cache.ProbeCache.open(

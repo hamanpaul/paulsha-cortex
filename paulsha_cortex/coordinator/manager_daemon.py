@@ -862,6 +862,7 @@ def build_request_executor(
                     workflow_runtime_factory
                     or planning_runtime.build_production_planning_runtime
                 ),
+                quota_admission_context=_quota_admission_context_for(),
             )
 
         return intake
@@ -985,6 +986,7 @@ def build_request_executor(
                 ship_validator=workflow_ship_validator,
                 git_runner=getattr(dispatcher, "_git_runner", None),
                 coordinator_root=coordinator_root,
+                quota_admission_context=_quota_admission_context_for(),
             )
             if args.get("action") == "start":
                 run = registry.get_workflow_run(str(result["run_id"]))
@@ -1042,6 +1044,7 @@ def build_request_executor(
                         workflow_runtime_factory
                         or planning_runtime.build_production_planning_runtime
                     ),
+                    quota_admission_context=_quota_admission_context_for(),
                 )
             else:
                 result = work_action_fn(
@@ -1463,6 +1466,7 @@ def build_periodic_tick_runner(
             identity=identity,
         )
         registry = getattr(dispatcher, "_registry", None)
+        quota_admission_ctx = _quota_admission_context_for()
         auto_claim_error: str | None = None
         try:
             auto_claims = (
@@ -1471,6 +1475,7 @@ def build_periodic_tick_runner(
                 else manager.run_auto_claim_scan(
                     registry=registry,
                     runtime_factory=planning_runtime.build_production_planning_runtime,
+                    quota_admission_context=quota_admission_ctx,
                 )
             )
         except (ValueError, RuntimeError, OSError) as exc:
@@ -1485,7 +1490,6 @@ def build_periodic_tick_runner(
         planning_transaction_error: str | None = None
         quota_admission_error: str | None = None
         quota_admission_reconcile: dict[str, Any] | None = None
-        quota_admission_ctx = _quota_admission_context_for()
         workflow_waits: list[dict[str, Any]] = []
         if registry is not None and hasattr(registry, "list_workflow_runs"):
             state_path = getattr(registry, "_state_path", None)
@@ -1574,6 +1578,7 @@ def build_periodic_tick_runner(
                             requested_by="manager-daemon",
                             registry=registry,
                             runtime_factory=planning_runtime.build_production_planning_runtime,
+                            quota_admission_context=quota_admission_ctx,
                         ),
                         quota_admission_context=quota_admission_ctx,
                     )

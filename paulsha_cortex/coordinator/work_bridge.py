@@ -432,6 +432,7 @@ def start_canonical_workflow(
     needs_human_reason: str | None = None,
     model_chain_override: dict[str, dict[str, str]] | None = None,
     combo_override: str | None = None,
+    quota_admission_context=None,
 ):
     """Create/resume the real WorkflowRun for a WorkAuthority claim."""
 
@@ -602,6 +603,7 @@ def start_canonical_workflow(
         identity_registry=identities,
         runtime_factory=runtime_factory,
         coordinator_root=coordinator_root,
+        quota_admission_context=quota_admission_context,
     )
     return registry.get_workflow_run(str(result["run_id"]))
 
