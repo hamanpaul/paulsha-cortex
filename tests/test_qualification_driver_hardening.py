@@ -3892,3 +3892,56 @@ def test_dispatch_closeout_does_not_require_ledgers_for_reviewer_jobs(
 
     _markers, _rows, workflow, _probe = _validate_fixture_closeout(driver, fixture)
     assert workflow["run_id"] == fixture["run_id"]
+
+
+def _prepend_build_job(fixture, *, job_id: str, card: str, gate_status: str) -> None:
+    """在既有 build job 之前插入一個同身分的 build job（例如 tdd-red），帶自己的
+    evidence 與 Manager ledger——對應真實 canary 的 worktree-isolation → tdd-red →
+    subagent-build 順序。"""
+
+    coordinator = fixture["coordinator"]
+    registry = json.loads(fixture["registry"].read_text(encoding="utf-8"))
+    final = next(job for job in registry["jobs"] if job["workflow_phase"] == "build")
+    envelope = json.loads(
+        (coordinator / final["workflow_evidence"]["path"]).read_text(encoding="utf-8")
+    )
+    envelope["job"] = {**envelope["job"], "job_id": job_id, "card_id": card}
+    evidence_rel = f"evidence/workflow/{job_id}.json"
+    evidence_hash = _write_json(coordinator / evidence_rel, envelope)
+    control = coordinator / "control" / f"{job_id}.log"
+    control.write_text("", encoding="utf-8")
+    _write_json(
+        control.with_name(f"{job_id}.gates.json"),
+        {
+            "gates": [{"exit_code": 1, "name": "pytest", "status": gate_status}],
+            "kind": "workflow-gate-ledger",
+            "schema_version": 1,
+            "slice_id": job_id,
+        },
+    )
+    early = {
+        **final,
+        "job_id": job_id,
+        "workflow_card": card,
+        "template_instance": job_id,
+        "control_log_path": str(control),
+        "workflow_evidence": {"hash": evidence_hash, "kind": "build", "path": evidence_rel},
+    }
+    index = registry["jobs"].index(final)
+    registry["jobs"].insert(index, early)
+    _write_json(fixture["registry"], registry)
+
+
+def test_dispatch_closeout_accepts_a_red_ledger_before_the_final_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：tdd-red 的 pytest 依設計必須 failed；只有最後一個 build job（產出交付
+    candidate 的那一個）必須讓部署宣告的 gate 全部 passed。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    _prepend_build_job(fixture, job_id="tdd-job", card="tdd-red", gate_status="failed")
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    _markers, _rows, workflow, _probe = _validate_fixture_closeout(driver, fixture)
+    assert workflow["run_id"] == fixture["run_id"]
