@@ -109,6 +109,7 @@
 
 ### Fixed
 
+- **#716 canary 的 Copilot findings 修正回合**：canary 碰到 `copilot-findings` 時，以 `retry-build` 正式出口把 findings 交給 builder 修正，最多 2 回合（#716）。
 - **#716 canary 結案檢查的 job phase 鏈**：只要求 builder／reviewer 步驟的 phase 有 registry job（plan／ship 由 Manager 執行、define 走 planning runtime），錯誤列出缺少與觀察到的 phase（#716）。
 - **#1237 archive 後補上新 spec 的 Purpose**：`openspec archive` 為新 capability 留下的 TBD Purpose 佔位，改由 Manager 以 proposal 的 Why 補上，避免 Copilot finding 卡住 ship（#1237）。
 - **#716 Codex app-server 探針重試**：canary 的 codex status 探針改為最多 3 次、每次 60 秒（總上限不變），減少 `account/read` 偶發卡住造成的整輪失敗（#716）。
