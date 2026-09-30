@@ -434,6 +434,8 @@ def test_manager_daemon_routes_reviewed_child_through_standard_work_intake(
         "requested_by": "manager-daemon",
         "registry": registry,
         "runtime_factory": manager_daemon.planning_runtime.build_production_planning_runtime,
+        # #1223：拆分出的 child 走標準 intake 時也帶 quota context（未接線時為 None）。
+        "quota_admission_context": None,
     }]
 
 
@@ -640,6 +642,8 @@ def test_periodic_resume_supplies_standard_red_child_intake(
         "requested_by": "manager-daemon",
         "registry": registry,
         "runtime_factory": manager_daemon.planning_runtime.build_production_planning_runtime,
+        # #1223：拆分出的 child 走標準 intake 時也帶 quota context（未接線時為 None）。
+        "quota_admission_context": None,
     }]
 
 
