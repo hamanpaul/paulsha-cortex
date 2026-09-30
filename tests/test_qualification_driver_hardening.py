@@ -3117,7 +3117,8 @@ def test_dispatch_closeout_rejects_a_non_passed_expected_gate(
 
     driver = _load_driver()
     fixture = _dispatch_fixture(tmp_path, driver)
-    ledger_path = fixture["coordinator"] / "control" / "verify-job.gates.json"
+    # #716：Manager 只替 build phase 產生權威 ledger（GATE_LEDGER_REQUIRED_PHASES）。
+    ledger_path = fixture["coordinator"] / "control" / "build-job.gates.json"
     ledger = json.loads(ledger_path.read_text())
     ledger["gates"] = [{"name": "pytest", "status": "failed", "exit_code": 1}]
     _write_json(ledger_path, ledger)
@@ -3137,7 +3138,7 @@ def test_dispatch_closeout_rejects_a_malformed_gate_ledger_entry(
 
     driver = _load_driver()
     fixture = _dispatch_fixture(tmp_path, driver)
-    ledger_path = fixture["coordinator"] / "control" / "plan-job.gates.json"
+    ledger_path = fixture["coordinator"] / "control" / "build-job.gates.json"
     ledger = json.loads(ledger_path.read_text())
     ledger["gates"] = [{"name": "pytest"}]
     _write_json(ledger_path, ledger)
@@ -3157,9 +3158,9 @@ def test_dispatch_closeout_rejects_a_gate_ledger_slice_id_mismatch(
 
     driver = _load_driver()
     fixture = _dispatch_fixture(tmp_path, driver)
-    ledger_path = fixture["coordinator"] / "control" / "verify-job.gates.json"
+    ledger_path = fixture["coordinator"] / "control" / "build-job.gates.json"
     ledger = json.loads(ledger_path.read_text())
-    ledger["slice_id"] = "build-job"
+    ledger["slice_id"] = "verify-job"
     _write_json(ledger_path, ledger)
     monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
     monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
