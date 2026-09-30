@@ -1659,6 +1659,7 @@ def workflow_status_entry(
             _phase_recovery_actions,
             blocking_findings_next_step_hint,
             main_sync_retry_build_next_step_hint,
+            retry_build_next_step_hint,
         )
 
         recovery_actions = _phase_recovery_actions(
@@ -1698,6 +1699,10 @@ def workflow_status_entry(
             main_sync_hint = main_sync_retry_build_next_step_hint(run)
             if main_sync_hint is not None:
                 next_step_hint = main_sync_hint
+            elif reason_code != "blocking-findings":
+                retry_build_hint = retry_build_next_step_hint(run)
+                if retry_build_hint is not None:
+                    next_step_hint = retry_build_hint
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         pass
     if work_authority_state in {"missing", "unavailable"}:

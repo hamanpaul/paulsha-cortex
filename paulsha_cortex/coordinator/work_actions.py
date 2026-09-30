@@ -4178,6 +4178,16 @@ def _claim_action(
                 repo=canonical_run.repo,
                 candidate=canonical_run.candidate_head,
             )
+        elif (
+            "retry-build" in projected_actions
+            and reason_code in {
+                "verification-terminal-explicit-stop",
+                "review-terminal-explicit-stop",
+            }
+        ):
+            retry_build_hint = retry_build_next_step_hint(canonical_run)
+            if retry_build_hint is not None:
+                response["next_step_hint"] = retry_build_hint
         elif "review-attest" in projected_actions and authority is not None:
             response["next_step_hint"] = (
                 f"cortex work review-attest {canonical_run.work_id} --repo {authority.repo} --actor <operator> --payload <file>"
@@ -4529,23 +4539,16 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
     if len(active) != 1:
         raise RuntimeError("retry-build requires one active canonical WorkflowRun")
     run = active[0]
-    verify_steps = [step for step in run.steps if step.phase == "verify"]
-    review_steps = [step for step in run.steps if step.phase == "review"]
-    post_pass_adjudication = (
-        "needs_human" not in run.facets
-        and run.current_phase == "review"
-        and run.candidate_head is not None
-        and run.verified_head == run.candidate_head
-        and bool(verify_steps)
-        and bool(review_steps)
-        and all(step.gate_result == "passed" for step in (*verify_steps, *review_steps))
+    admission_error = _retry_build_admission_error(
+        run,
+        workflow_registry,
+        expected_candidate=expected_candidate,
+        authority=authority,
     )
-    if "needs_human" not in run.facets and not post_pass_adjudication:
-        raise RuntimeError("retry-build requires needs_human workflow")
-    if run.current_phase not in {"build", "verify", "review"}:
-        raise RuntimeError("retry-build requires build/verify/review workflow")
-    if run.candidate_head != expected_candidate.lower():
-        raise RuntimeError("retry-build expected Candidate CAS mismatch")
+    if admission_error is not None:
+        error_type, message = admission_error
+        raise error_type(message)
+    post_pass_adjudication = _retry_build_post_pass_adjudication(run)
     if post_pass_adjudication and not args.get("reason"):
         raise ValueError("retry-build post-pass adjudication requires --reason")
     reason_payload = run.needs_human_reason
@@ -4671,6 +4674,142 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
     if main_sync_repair is not None:
         result["main_sync_repair"] = dict(main_sync_repair)
     return result
+
+
+def _retry_build_post_pass_adjudication(run) -> bool:
+    verify_steps = [step for step in run.steps if step.phase == "verify"]
+    review_steps = [step for step in run.steps if step.phase == "review"]
+    return (
+        "needs_human" not in run.facets
+        and run.current_phase == "review"
+        and isinstance(getattr(run, "candidate_head", None), str)
+        and run.verified_head == run.candidate_head
+        and bool(verify_steps)
+        and bool(review_steps)
+        and all(step.gate_result == "passed" for step in (*verify_steps, *review_steps))
+    )
+
+
+def _retry_build_admission_error(
+    run,
+    workflow_registry,
+    *,
+    expected_candidate: str | None,
+    authority=None,
+) -> tuple[type[Exception], str] | None:
+    """Return the retry-build preflight rejection shared by action and projections.
+
+    The formal action supplies WorkAuthority and its exact CAS payload. Read models without
+    authority can still prove the run/job/card half, which is also what their shared recovery
+    projection contract permits; callers with authority pass it for the same refs check.
+    """
+
+    def reject(error_type: type[Exception], message: str):
+        return error_type, message
+
+    if run is None or workflow_registry is None:
+        return reject(RuntimeError, "retry-build requires canonical workflow state")
+    if getattr(run, "status", None) != "ongoing":
+        return reject(RuntimeError, "retry-build requires one active canonical WorkflowRun")
+    try:
+        active_runs = [
+            item for item in workflow_registry.list_workflow_runs()
+            if item.repo == run.repo
+            and item.work_id == run.work_id
+            and item.status == "ongoing"
+            and (authority is None or _openspec_refs_compatible(item, authority))
+        ]
+        jobs = list(workflow_registry.list_jobs())
+    except Exception:
+        return reject(RuntimeError, "retry-build requires readable canonical workflow state")
+    if len(active_runs) != 1 or active_runs[0].run_id != run.run_id:
+        return reject(RuntimeError, "retry-build requires one active canonical WorkflowRun")
+    if authority is not None:
+        expected_issues = tuple(
+            f"{authority.repo}#{number}" for number in authority.mapped_issues
+        )
+        if run.repo != authority.repo or run.work_id != authority.work_id or run.issue_refs != expected_issues:
+            return reject(RuntimeError, "retry-build issue is not authorized by WorkAuthority")
+    from .registry import ACTIVE_JOB_STATUSES
+
+    if any(
+        job.get("workflow_run_id") == run.run_id
+        and job.get("status") in ACTIVE_JOB_STATUSES
+        for job in jobs
+    ):
+        return reject(ValueError, "retry-build reset refuses active workflow job")
+    if run.current_phase not in {"build", "verify", "review"}:
+        return reject(RuntimeError, "retry-build requires build/verify/review workflow")
+
+    candidate = getattr(run, "candidate_head", None)
+    if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        return reject(RuntimeError, "retry-build requires exact Candidate")
+    if (
+        not isinstance(expected_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(expected_candidate) is None
+        or candidate.lower() != expected_candidate.lower()
+    ):
+        return reject(RuntimeError, "retry-build expected Candidate CAS mismatch")
+
+    post_pass_adjudication = _retry_build_post_pass_adjudication(run)
+    if "needs_human" not in run.facets and not post_pass_adjudication:
+        return reject(RuntimeError, "retry-build requires needs_human workflow")
+
+    build_steps = [step for step in run.steps if step.phase == "build"]
+    if not build_steps:
+        return reject(ValueError, "retry-build reset requires build phase")
+    if run.current_phase == "build":
+        if (
+            any(step.gate_result != "passed" for step in build_steps[:-1])
+            or build_steps[-1].gate_result != "pending"
+        ):
+            return reject(ValueError, "retry-build reset requires only the final builder card pending")
+        repair_card = build_steps[-1].card
+        terminal_repairs = [
+            job for job in jobs
+            if job.get("workflow_run_id") == run.run_id
+            and job.get("workflow_phase") == "build"
+            and job.get("workflow_card") == repair_card
+            and job.get("status") == "exited"
+            and job.get("exit_code") == 0
+        ]
+        if not terminal_repairs or terminal_repairs[-1].get("workflow_evidence") is not None:
+            return reject(ValueError, "retry-build reset requires unbound terminal builder evidence")
+    elif any(step.gate_result != "passed" for step in build_steps):
+        return reject(ValueError, "retry-build reset requires completed build phase")
+
+    passed_ship_steps = [
+        step for step in run.steps if step.phase == "ship" and step.gate_result == "passed"
+    ]
+    if len(passed_ship_steps) > 1 or any(
+        step.card != "openspec-archive"
+        or step.executor != "cortex-manager"
+        or step.model != "deterministic"
+        or step.domain != "cortex"
+        for step in passed_ship_steps
+    ):
+        return reject(ValueError, "retry-build reset only permits Manager-owned archive authority")
+
+    reason_payload = run.needs_human_reason
+    reason_context = reason_payload.get("context") if isinstance(reason_payload, dict) else None
+    delivery_reason = reason_context.get("delivery_reason") if isinstance(reason_context, dict) else None
+    main_sync_stop = (
+        isinstance(reason_payload, dict)
+        and reason_payload.get("reason") == "delivery-needs-human"
+        and (
+            delivery_reason in _MAIN_SYNC_STOP_REASONS
+            or (
+                isinstance(reason_context, dict)
+                and ("main_sync" in reason_context or "main_sync_evidence_hash" in reason_context)
+            )
+            or any(value in str(reason_payload.get("detail", "")) for value in _MAIN_SYNC_STOP_REASONS)
+        )
+    )
+    if main_sync_stop and (
+        run.current_phase != "review" or _main_sync_retry_context(run) is None
+    ):
+        return reject(RuntimeError, "retry-build requires valid matching main-sync stop evidence")
+    return None
 
 
 def _blocking_findings_recovery_actions(run) -> tuple[str, ...]:
@@ -4869,6 +5008,20 @@ def main_sync_retry_build_next_step_hint(run) -> str | None:
     )
 
 
+def retry_build_next_step_hint(run) -> str | None:
+    """Format the exact-Candidate command for an admitted retry-build exit."""
+
+    candidate = getattr(run, "candidate_head", None)
+    if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        return None
+    return (
+        "依目前 exact Candidate 重跑 build、verification、review 與後續交付檢查；"
+        f"執行 `cortex run work retry-build {run.work_id} --repo {run.repo} "
+        f"--expected-candidate {candidate.lower()} --actor <operator> "
+        "--reason '<人工裁決>'`。"
+    )
+
+
 def blocking_findings_next_step_hint(*, work_id, repo, candidate) -> str:
     """Format the two operator exits for a blocking review finding."""
 
@@ -4999,45 +5152,29 @@ def _phase_recovery_actions(
                     actions.append("retry-card")
 
             if jobs_readable:
-                main_sync_context = _main_sync_retry_context(run)
-                build_steps = [step for step in run.steps if step.phase == "build"]
-                ship_steps = [
-                    step for step in run.steps
-                    if step.phase == "ship" and step.gate_result == "passed"
-                ]
-                reset_steps_valid = (
-                    bool(build_steps)
-                    and all(step.gate_result == "passed" for step in build_steps)
-                    and len(ship_steps) <= 1
-                    and all(
-                        step.card == "openspec-archive"
-                        and step.executor == "cortex-manager"
-                        and step.model == "deterministic"
-                        and step.domain == "cortex"
-                        for step in ship_steps
-                    )
-                )
+                for action in _blocking_findings_recovery_actions(run):
+                    if action == "retry-build" and _retry_build_admission_error(
+                        run,
+                        workflow_registry,
+                        expected_candidate=getattr(run, "candidate_head", None),
+                        authority=authority,
+                    ) is not None:
+                        continue
+                    if action not in actions:
+                        actions.append(action)
                 if (
-                    main_sync_context is not None
-                    and run.status == "ongoing"
-                    and run.current_phase == "review"
-                    and reset_steps_valid
-                ):
-                    try:
-                        active_runs = [
-                            item for item in workflow_registry.list_workflow_runs()
-                            if item.repo == run.repo and item.work_id == run.work_id
-                            and item.status == "ongoing"
-                        ]
-                    except Exception:
-                        active_runs = []
-                    if len(active_runs) == 1 and active_runs[0].run_id == run.run_id:
-                        actions.append("retry-build")
-                actions.extend(
-                    action
-                    for action in _blocking_findings_recovery_actions(run)
-                    if action not in actions
-                )
+                    reason_code in {
+                        "verification-terminal-explicit-stop",
+                        "review-terminal-explicit-stop",
+                    }
+                    or _main_sync_retry_context(run) is not None
+                ) and _retry_build_admission_error(
+                    run,
+                    workflow_registry,
+                    expected_candidate=getattr(run, "candidate_head", None),
+                    authority=authority,
+                ) is None and "retry-build" not in actions:
+                    actions.append("retry-build")
 
     if (
         reason_code.startswith("copilot-")
