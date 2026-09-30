@@ -407,6 +407,58 @@ class WorkflowJobPromptTests(unittest.TestCase):
             prompt,
         )
 
+    def test_commit_required_prompt_lists_tracked_work_item_todo_for_checkboxes(self) -> None:
+        """#1234：workstream todo 是 plan-kind pinned 輸入，contract 必須明講能勾、只能勾。"""
+        from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority
+
+        todo = "docs/superpowers/workstreams/work-1/todo.md"
+        run = self._run()
+        run.planning_authority = (
+            PlanningArtifactAuthority(ref=todo, kind="plan", work_id="work-1", baseline_sha256="a" * 64),
+            PlanningArtifactAuthority(
+                ref="docs/superpowers/specs/work-1-spec.md", kind="spec",
+                work_id="work-1", baseline_sha256="b" * 64,
+            ),
+        )
+        step = WorkflowStep(
+            phase="build", persona="builder", card="subagent-build", executor=None,
+            model=None, domain=None, inputs=(), outputs=(),
+        )
+
+        prompt = manager._workflow_job_prompt(
+            run, step, builder_job_id="job-1", coordinator_root="/tmp/coordinator",
+        )
+
+        self.assertIn(
+            f"openspec/changes/issue-116/tasks.md and the work item's todo ({todo}) checkboxes",
+            prompt,
+        )
+        self.assertIn("only checkbox state may change in these files", prompt)
+        self.assertNotIn("work-1-spec.md) checkboxes", prompt)
+
+    def test_builder_todo_refs_skip_seeded_inputs_and_the_tasks_path(self) -> None:
+        from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority
+
+        tasks = "openspec/changes/issue-116/tasks.md"
+        run = self._run()
+        run.planning_authority = tuple(
+            PlanningArtifactAuthority(ref=ref, kind="plan", work_id="work-1", baseline_sha256="a" * 64)
+            for ref in (
+                "docs/superpowers/workstreams/work-1/todo.md",
+                "docs/superpowers/plans/work-1.md",
+                tasks,
+            )
+        )
+        seeded = ({"path": "docs/superpowers/plans/work-1.md"},)
+
+        self.assertEqual(
+            manager._builder_todo_refs(run, input_snapshot=seeded, tasks_path=tasks),
+            ("docs/superpowers/workstreams/work-1/todo.md",),
+        )
+        self.assertEqual(
+            manager._builder_todo_refs(self._run(), input_snapshot=(), tasks_path=tasks), ()
+        )
+
     def test_commit_required_build_card_without_openspec_ref_uses_generic_tasks_path(self) -> None:
         step = WorkflowStep(
             phase="build",
