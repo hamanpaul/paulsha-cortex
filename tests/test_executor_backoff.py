@@ -3018,3 +3018,49 @@ def test_lock_location_does_not_depend_on_the_callers_ancestor_permissions(
     monkeypatch.setattr(executor_backoff.os, "access", lambda *_args, **_kwargs: True)
     as_root = executor_backoff._lock_path(root)
     assert as_manager == as_root
+
+
+def test_writer_creates_the_root_before_taking_the_lock(tmp_path: Path) -> None:
+    """#1233：root 不存在時，writer 必須先建 root 再拿 lock——lock 一律在 root 內。
+
+    舊實作先依「root 當下不存在」把 lock 放在祖先，寫 snapshot 時才建 root；之後
+    才計算 lock 路徑的 reader 會拿到 root 內的另一個 lock 檔，兩邊同時「持有」
+    lock，reader 讀到尚未寫完的 state（CI 上的 `missing`）。"""
+    from paulsha_cortex.coordinator import executor_backoff
+
+    root = tmp_path / "fresh-root"
+    seen: list[tuple[bool, Path]] = []
+
+    def hook(stage: str) -> None:
+        if stage == "lock-acquired":
+            seen.append((root.is_dir(), executor_backoff._lock_path(root)))
+
+    executor_backoff._TEST_HOOK = hook
+    try:
+        _record(
+            root, job_id="job-1", event_epoch=100.0, reset_at=None,
+            reason="first-writer", now=0.0,
+        )
+    finally:
+        executor_backoff._TEST_HOOK = None
+
+    assert seen and seen[0][0] is True
+    assert seen[0][1].parent == root
+
+
+def test_reader_of_a_missing_root_does_not_create_an_ancestor_lock(tmp_path: Path) -> None:
+    """#1233：root 不存在時沒有任何已提交的 state，reader 直接回 missing，不在祖先建 lock。"""
+    from paulsha_cortex.coordinator import executor_backoff
+
+    root = tmp_path / "absent-root"
+    ancestor_lock = executor_backoff._lock_path(root)
+    assert ancestor_lock.parent != root and not ancestor_lock.exists()
+
+    try:
+        status = executor_backoff.active_backoff(root, "copilot", "gpt-5", now=0.0)
+
+        assert status.observation is executor_backoff.StoreObservation.MISSING
+        assert not ancestor_lock.exists()
+        assert not root.exists()
+    finally:
+        ancestor_lock.unlink(missing_ok=True)

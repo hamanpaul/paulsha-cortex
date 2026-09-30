@@ -1523,6 +1523,19 @@ def _invoke_test_hook(stage: str) -> None:
 
 @contextmanager
 def _root_lock(coordinator_root: Path, *, exclusive: bool) -> Iterator[None]:
+    # #1233：lock 位置取決於 root 是否存在（`_stable_lock_base`）。writer 若在 root
+    # 尚不存在時拿祖先的 lock、寫 snapshot 時才建 root，之後才計算路徑的 reader 會
+    # 拿到 root 內的另一個 lock 檔，互斥失效。writer 因此先建 root 再拿 lock；root
+    # 不存在時沒有任何已提交的 state，reader 直接讀（snapshot 以 tempfile＋rename
+    # 原子寫入，只會讀到 missing 或完整結果），不在祖先建 lock。
+    if exclusive:
+        try:
+            coordinator_root.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise _StoreProblem(f"unable to create executor backoff root: {error}") from error
+    elif not coordinator_root.is_dir():
+        yield
+        return
     lock_path = _lock_path(coordinator_root)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     if exclusive:
