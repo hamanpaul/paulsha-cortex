@@ -30,6 +30,7 @@ from . import quota_observation as schema
 from .quota_ledger import LedgerCorrupt
 from .quota_shadow import QuotaShadowService
 from .quota_sources import (
+    CoverageGap,
     ProviderCapture,
     ProviderQuotaTarget,
     _PROFILE_KEY_RE as _RESOLVED_PROFILE_KEY_RE,
@@ -334,8 +335,8 @@ def collect_provider_quota(
 ) -> ProviderCapture:
     """對單一 executor 執行唯讀讀取，交給 ``capture_provider_quota()`` 解析。
 
-    claude／cg／未知 executor 沒有讀取動作，直接依 ``provider_read_contract()``
-    既有的 unsupported／unknown 狀態回報（沿用既有 parser，不另寫第二套）。
+    Claude 是被動 job-log 來源，不在此啟動 CLI；cg／未知 executor 依
+    ``provider_read_contract()`` 的 unknown 狀態回報。
     """
 
     if executor == "codex":
@@ -348,6 +349,10 @@ def collect_provider_quota(
         raw = read_agy_quota(timeout_s=timeout_s, run=run_agy or _default_run_agy)
     elif executor == "copilot":
         raw = read_copilot_quota()
+    elif executor == "claude":
+        return ProviderCapture(
+            executor, (), (CoverageGap("claude:rate_limit_event", "passive-job-log-source"),)
+        )
     else:
         raw = None
 

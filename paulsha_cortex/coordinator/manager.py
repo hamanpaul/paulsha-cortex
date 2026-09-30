@@ -12296,6 +12296,103 @@ def _harvest_admit_profile_key(
     return next(iter(profile_keys)), None
 
 
+def _harvest_claude_rate_limit_event(*, job, profile_key, quota_admission_context, now_ms):
+    """將終局 Claude job log 的結構化 quota event 寫入既有 observation ledger。
+
+    periodic reconcile 每一拍都會走過全部 job；終局時間加上 TTL 已經過期的 job
+    在讀 log 之前就略過——那筆 observation 寫進去也立刻是 unknown，而重讀歷史
+    job 的大型 log（單顆可達數十 MB）只會讓每一拍的 I/O 隨 job 數線性成長。
+    """
+    from . import quota_admission, quota_sources
+
+    if job.get("executor") != "claude":
+        return {"recorded": 0, "gaps": 0, "reason": "not-claude"}
+    model_id = job.get("model_id")
+    if not isinstance(model_id, str) or not model_id:
+        return {"recorded": 0, "gaps": 0, "reason": "model-identity-missing"}
+    pool_windows = quota_admission.pools_for_profile(
+        profile_key, executor="claude", model_id=model_id,
+        bindings=quota_admission_context.bindings,
+    )
+    if not pool_windows:
+        return {"recorded": 0, "gaps": 0, "reason": "profile-unmanaged"}
+    descriptors = tuple(quota_admission_context.descriptors)
+    descriptor_by_ref = {
+        (item.authority_id, item.account_id, item.pool_id, item.revision): item
+        for item in descriptors
+    }
+    targets = []
+    seen = set()
+    for pool_ref, window_id in pool_windows:
+        ref_key = tuple(pool_ref[key] for key in ("authority_id", "account_id", "pool_id", "revision"))
+        descriptor = descriptor_by_ref.get(ref_key)
+        if descriptor is None:
+            continue
+        for binding in quota_admission_context.bindings:
+            wire = binding.to_dict()
+            if not quota_sources._binding_has_profile(
+                wire, profile_key, executor="claude", model_id=model_id
+            ):
+                continue
+            constraints = wire.get("constraints", [])
+            matches = any(
+                isinstance(row, Mapping) and row.get("state") == "known"
+                and isinstance(row.get("value"), Mapping)
+                and row["value"].get("window_id") == window_id
+                and row["value"].get("pool_ref") == pool_ref
+                for row in constraints
+            )
+            if matches:
+                key = (ref_key, window_id)
+                if key not in seen:
+                    targets.append(quota_sources.ProviderQuotaTarget(
+                        resource_key=f"claude:{descriptor.pool_id}:{window_id}",
+                        binding=binding, descriptor=descriptor, window_id=window_id,
+                    ))
+                    seen.add(key)
+                break
+    if not targets:
+        return {"recorded": 0, "gaps": 0, "reason": "binding-target-unresolved"}
+
+    terminal_ms = quota_sources._parse_iso_epoch_ms(job.get("exited_at") or job.get("failed_at"))
+    if terminal_ms is None:
+        return {"recorded": 0, "gaps": 0, "reason": "terminal-time-unavailable"}
+    ttl_ms = getattr(quota_admission_context, "lease_ms", 900_000)
+    if terminal_ms + ttl_ms <= now_ms:
+        return {"recorded": 0, "gaps": 0, "reason": "observation-expired"}
+
+    log_path = job.get("log_path")
+    events = []
+    if isinstance(log_path, str) and log_path:
+        path = Path(log_path)
+        try:
+            if not path.is_symlink() and path.is_file() and path.stat().st_size <= 64 * 1024 * 1024:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        value = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if isinstance(value, dict) and value.get("type") == "rate_limit_event":
+                        events.append(value)
+        except (OSError, UnicodeDecodeError):
+            events = []
+    capture = quota_sources.capture_provider_quota(
+        "claude", {"rate_limit_events": events}, profile_key=profile_key, model_id=model_id,
+        targets=tuple(targets), descriptors=descriptors,
+        unit_catalog=tuple(quota_admission_context.unit_catalog), observed_at_ms=terminal_ms,
+        ttl_ms=ttl_ms,
+    )
+    recorded = gaps = 0
+    for observation in capture.observations:
+        result = quota_admission_context.shadow.record_observation(
+            observation.to_dict(), descriptors=descriptors,
+            unit_catalog=tuple(quota_admission_context.unit_catalog),
+        )
+        recorded += getattr(result, "accepted", 0)
+        gaps += getattr(result, "coverage_gaps", 0) or 0
+    return {"recorded": recorded, "gaps": gaps + len(capture.gaps)}
+
+
 def harvest_quota_terminal_usage(
     *, registry, quota_admission_context, now_ms: int | None = None,
 ) -> dict[str, object]:
@@ -12360,6 +12457,7 @@ def harvest_quota_terminal_usage(
     recorded: list[dict[str, object]] = []
     failed: list[dict[str, object]] = []
     skipped: dict[str, int] = {}
+    rate_limit_observations = {"recorded": 0, "gaps": 0, "skipped": {}}
     ordinals: dict[tuple[str, str], int] = {}
     for job in registry.list_jobs():
         run_id = job.get("workflow_run_id")
@@ -12381,6 +12479,25 @@ def harvest_quota_terminal_usage(
         if profile_key is None:
             skipped[str(reason)] = skipped.get(str(reason), 0) + 1
             continue
+        try:
+            quota_result = _harvest_claude_rate_limit_event(
+                job=job, profile_key=profile_key, quota_admission_context=quota_admission_context,
+                now_ms=resolved_now_ms,
+            )
+            rate_limit_observations["recorded"] += quota_result["recorded"]
+            rate_limit_observations["gaps"] += quota_result["gaps"]
+            if quota_result.get("reason") not in {
+                None, "not-claude", "profile-unmanaged", "observation-expired",
+            }:
+                reason_key = str(quota_result["reason"])
+                rate_limit_observations["skipped"][reason_key] = (
+                    rate_limit_observations["skipped"].get(reason_key, 0) + 1
+                )
+        except Exception as exc:  # noqa: BLE001 - 單一 quota event 不擋終局 usage 收斂
+            reason_key = f"harvest-failed:{type(exc).__name__}"
+            rate_limit_observations["skipped"][reason_key] = (
+                rate_limit_observations["skipped"].get(reason_key, 0) + 1
+            )
         if not isinstance(job.get("usage"), Mapping):
             # #325 usage extractor 沒抽到（`usage_reason` 在 job 上）：沒有可記
             # 的消耗事實，每輪只算一次、不寫 ledger。
@@ -12419,7 +12536,8 @@ def harvest_quota_terminal_usage(
                 ",".join(reasons) if reasons else "no-usage-recorded"
             )
         skipped[reason] = skipped.get(reason, 0) + 1
-    return {"wired": True, "recorded": recorded, "failed": failed, "skipped": skipped}
+    return {"wired": True, "recorded": recorded, "failed": failed, "skipped": skipped,
+            "rate_limit_observations": rate_limit_observations}
 
 
 def reconcile_quota_admission_reservations(
