@@ -1828,6 +1828,29 @@ def _open_pr_awaiting_copilot(root: Path, monkeypatch) -> Scenario:
     )
 
 
+def _closing_reference_missing(root: Path, monkeypatch) -> Scenario:
+    """#1220：GitHub 沒替 ship lane 的 PR 建立 closing reference，授權停在結構化 needs_human。"""
+
+    lane = delivered_fixture._ship_lane(root, monkeypatch)
+    original_fetch = lane.github.fetch_delivery_facts
+    lane.github.fetch_delivery_facts = lambda **kwargs: replace(
+        original_fetch(**kwargs), closing_issues=()
+    )
+    delivered_fixture._open_pr_snapshot(lane.snapshot)
+    assert lane.ship(now=2000.0)["reason"] == "closing-reference-missing"
+    return Scenario(
+        action="resume",
+        root=root,
+        registry=lane.registry,
+        state_path=lane.journal,
+        args={},
+        repo=delivered_fixture.REPO,
+        work_id=delivered_fixture.WORK_ID,
+        run_id=lane.run_id,
+        snapshot=lane.snapshot,
+    )
+
+
 def _delivered_without_authority(root: Path, monkeypatch) -> Scenario:
     sc = _retire_delivered_scenario(root)
     payload = json.loads(sc.snapshot.read_text(encoding="utf-8"))
@@ -1886,6 +1909,8 @@ ROUND_TRIP_SCENARIOS: dict[str, tuple[Callable[[Path, Any], Scenario], tuple[str
     # open PR 的 recovery exit 由 action admission 決定，不能退回 pre-delivery abandon。
     "open-pr-awaiting-copilot": (_open_pr_awaiting_copilot, ("resume",)),
     "delivered-without-authority": (_delivered_without_authority, ("retire-delivered",)),
+    # #1220：closing reference 缺席時只投影會重新評估授權的 resume。
+    "closing-reference-missing": (_closing_reference_missing, ("resume",)),
 }
 
 #: 投影曾提供但正式入口拒絕的缺口已由 issue-1170 修復。
