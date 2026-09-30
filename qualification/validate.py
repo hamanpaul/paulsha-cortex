@@ -75,6 +75,7 @@ REQUIRED_RELEASE_ARTIFACTS = {
     "evidence/generated-installed-attestation.json",
     "evidence/attack-matrix.json",
     "evidence/artifact-inventory.json",
+    "evidence/rollback-loaded-runtime-status.json",
 }
 CANARY_ONLY_ARTIFACTS = {
     "evidence/provider-capabilities.json",
@@ -98,6 +99,7 @@ REQUIRED_RELEASE_TESTS = {
     "process-attack-matrix",
     "gate-attack-matrix",
     "negative-controls",
+    "rollback-loaded-runtime",
 }
 CANARY_ONLY_TESTS = {
     "provider-capability-smoke",
@@ -1289,6 +1291,76 @@ def validate(
                 + ", ".join(sorted(missing_artifacts))
             )
         assert evidence_root is not None
+        if profile in {"release", "deployment-canary"}:
+            rollback_status = _artifact_json(
+                evidence_root, "evidence/rollback-loaded-runtime-status.json"
+            )
+            if (
+                rollback_status.get("schema_version") != 1
+                or rollback_status.get("scenario")
+                != "same-artifact-qualified-prior-to-candidate-rollback"
+            ):
+                _fail("rollback loaded-runtime evidence scenario is unknown")
+            rollback_receipt = _required_fields(
+                rollback_status.get("rollback_receipt"),
+                "rollback loaded-runtime receipt",
+                {"receipt_id", "state", "parent_receipt_id"},
+            )
+            expected = _required_fields(
+                rollback_status.get("expected"),
+                "rollback loaded-runtime expected receipt",
+                {"receipt_id", "wheel_sha256", "candidate_commit"},
+            )
+            if (
+                rollback_receipt["state"] != "rolled-back"
+                or rollback_receipt["parent_receipt_id"] != expected["receipt_id"]
+            ):
+                _fail("rollback receipt is not bound to the qualified prior receipt")
+            service_status = rollback_status.get("service_status")
+            service = (
+                service_status.get("service")
+                if isinstance(service_status, dict)
+                else None
+            )
+            loaded_runtime = (
+                service.get("loaded_runtime") if isinstance(service, dict) else None
+            )
+            if not isinstance(loaded_runtime, dict):
+                _fail("rollback loaded-runtime status is unknown")
+            for service_name in ("manager", "monitor"):
+                report = loaded_runtime.get(service_name)
+                comparison = (
+                    report.get("comparison") if isinstance(report, dict) else None
+                )
+                trust_root = (
+                    report.get("trust_root") if isinstance(report, dict) else None
+                )
+                installed = (
+                    report.get("installed_artifact")
+                    if isinstance(report, dict)
+                    else None
+                )
+                if not all(
+                    isinstance(row, dict) for row in (comparison, trust_root, installed)
+                ):
+                    _fail("rollback loaded-runtime report is unknown")
+                if (
+                    any(
+                        comparison.get(key) != "match"
+                        for key in (
+                            "artifact_status",
+                            "config_status",
+                            "process_status",
+                        )
+                    )
+                    or trust_root.get("status") != "verified"
+                    or trust_root.get("receipt_id") != expected["receipt_id"]
+                    or trust_root.get("wheel_sha256") != expected["wheel_sha256"]
+                    or trust_root.get("candidate_commit") != expected["candidate_commit"]
+                    or comparison.get("loaded_wheel_sha256") != expected["wheel_sha256"]
+                    or installed.get("wheel_sha256") != expected["wheel_sha256"]
+                ):
+                    _fail("rollback loaded-runtime artifact or receipt does not match")
         _validate_evidence_file_set(
             evidence_root=evidence_root,
             artifact_paths=artifact_paths,

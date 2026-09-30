@@ -129,6 +129,9 @@ docker exec "$container_name" sh -eu -c \
 
 plan_path=/run/cortex-install/install-plan.json
 receipt_path=/run/cortex-install/install-receipt.json
+rollback_receipt_path=/run/cortex-install/rollback-install-receipt.json
+rollback_plan_path=/run/cortex-install/rollback-install-plan.json
+rollback_overlay_path=/run/cortex-install/rollback-host-overlay.json
 qualification_root=/qualification-output
 qualification_path=$qualification_root/qualification.json
 
@@ -389,12 +392,34 @@ docker exec \
     "$container_name" cortex install trust-root verify \
     --receipt "$receipt_path" --json --evidence "$install_evidence_path"
 
+# 上方 fresh-install rollback 會刻意回到沒有服務的主機。為擷取 loaded-runtime
+# 證據，從同一個不可變 RC artifact 建立不同 plan hash 的空 overlay plan，以已核可
+# receipt 作為 upgrade parent，並在任何後續安裝動作前 rollback 此 transaction。
+docker exec "$container_name" sh -eu -c 'printf "{}\n" > "$1"' sh "$rollback_overlay_path"
+docker exec "$container_name" cortex install trust-root plan \
+    --config /artifacts/install-config.yaml \
+    --host-overlay "$rollback_overlay_path" \
+    --bundle /artifacts/bundle.json \
+    --output "$rollback_plan_path"
+rollback_plan_sha=$(docker exec "$container_name" sha256sum "$rollback_plan_path" | awk '{print $1}')
+docker exec "$container_name" cortex install trust-root apply \
+    --plan "$rollback_plan_path" \
+    --confirm-sha256 "$rollback_plan_sha" \
+    --receipt "$rollback_receipt_path" \
+    --prior-receipt "$receipt_path"
+docker exec "$container_name" cortex install trust-root rollback \
+    --receipt "$rollback_receipt_path"
+
 # A fixed harness installed in the reference image always runs the five attack
 # families and negative controls. Only deployment-canary mode adds provider
 # smokes/runtime identity, Manager auth dry-run, and full intake-to-closeout;
 # protected repository identity is never inferred from HOME or candidate JSON.
 qualification_driver=/usr/local/libexec/cortex-release-qualification
 driver_profile_args=(--profile "$profile")
+driver_profile_args+=(
+    --rollback-receipt "$rollback_receipt_path"
+    --prior-receipt "$receipt_path"
+)
 validator_profile_args=(--require-release-profile)
 if [[ "$profile" == deployment-canary ]]; then
     [[ -n ${CORTEX_RC_PROBE_REPOSITORY:-} ]] || die "protected probe repository is unavailable"

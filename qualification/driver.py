@@ -540,6 +540,131 @@ def _system_status_mismatch(report: object) -> str:
     return " ".join(parts)
 
 
+def _rollback_loaded_runtime_mismatch(
+    payload: object, expected: Mapping[str, object]
+) -> str:
+    """比對 rollback 後 Manager／Monitor 載入的 artifact 與 prior receipt。"""
+
+    service = payload.get("service") if isinstance(payload, Mapping) else None
+    loaded = service.get("loaded_runtime") if isinstance(service, Mapping) else None
+    if not isinstance(loaded, Mapping):
+        return "loaded_runtime=unknown"
+    expected_receipt = expected.get("receipt_id")
+    expected_wheel = expected.get("wheel_sha256")
+    expected_commit = expected.get("candidate_commit")
+    if not all(
+        isinstance(value, str) and value
+        for value in (expected_receipt, expected_wheel, expected_commit)
+    ):
+        return "expected_receipt=unknown"
+    mismatches: list[str] = []
+    for name in ("manager", "monitor"):
+        report = loaded.get(name)
+        if not isinstance(report, Mapping):
+            mismatches.append(f"{name}=unknown")
+            continue
+        comparison = report.get("comparison")
+        trust_root = report.get("trust_root")
+        installed = report.get("installed_artifact")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (comparison, trust_root, installed)
+        ):
+            mismatches.append(f"{name}=unknown")
+            continue
+        if any(
+            comparison.get(key) != "match"
+            for key in ("artifact_status", "config_status", "process_status")
+        ):
+            mismatches.append(f"{name}_runtime=mismatch")
+        if trust_root.get("status") != "verified":
+            mismatches.append(f"{name}_trust={_diagnostic_token(trust_root.get('status'))}")
+        if trust_root.get("receipt_id") != expected_receipt:
+            state = "mismatch" if isinstance(trust_root.get("receipt_id"), str) else "unknown"
+            mismatches.append(f"{name}_receipt={state}")
+        for label, value in (
+            ("loaded_wheel", comparison.get("loaded_wheel_sha256")),
+            ("installed_wheel", installed.get("wheel_sha256")),
+            ("receipt_wheel", trust_root.get("wheel_sha256")),
+        ):
+            if value != expected_wheel:
+                mismatches.append(f"{name}_{label}={'mismatch' if isinstance(value, str) else 'unknown'}")
+        loaded_commit = trust_root.get("candidate_commit")
+        if loaded_commit != expected_commit:
+            state = "mismatch" if isinstance(loaded_commit, str) else "unknown"
+            mismatches.append(f"{name}_commit={state}")
+    return " ".join(mismatches)
+
+
+def _rollback_runtime_expected(receipt: Mapping[str, object]) -> dict[str, object]:
+    plan = receipt.get("plan")
+    candidate = plan.get("candidate") if isinstance(plan, Mapping) else None
+    identity = plan.get("repo_identity") if isinstance(plan, Mapping) else None
+    return {
+        "receipt_id": receipt.get("receipt_id"),
+        "wheel_sha256": candidate.get("wheel_sha256") if isinstance(candidate, Mapping) else None,
+        "candidate_commit": identity.get("commit") if isinstance(identity, Mapping) else None,
+    }
+
+
+def _capture_rollback_loaded_runtime(
+    *,
+    rollback_receipt: Mapping[str, object],
+    prior_receipt: Mapping[str, object],
+    receipt_path: Path,
+    evidence_dir: Path,
+) -> None:
+    parent = rollback_receipt.get("parent_receipt")
+    if (
+        rollback_receipt.get("state") != "rolled-back"
+        or not isinstance(parent, Mapping)
+        or parent.get("receipt_id") != prior_receipt.get("receipt_id")
+    ):
+        raise QualificationFailure(
+            "rollback receipt is unknown or not bound to the prior receipt"
+        )
+    expected = _rollback_runtime_expected(prior_receipt)
+    result = _run(
+        (
+            "/opt/cortex/venv/bin/cortex",
+            "service",
+            "status",
+            "--system",
+            "--json",
+            "--install-receipt",
+            str(receipt_path),
+        ),
+        env=_installed_runtime_env(),
+    )
+    if result.returncode != 0:
+        raise QualificationFailure("rollback-system-status=unavailable")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise QualificationFailure(
+            "rollback system-scope status returned invalid JSON"
+        ) from exc
+    _write_json(
+        evidence_dir / "rollback-loaded-runtime-status.json",
+        {
+            "schema_version": 1,
+            "scenario": "same-artifact-qualified-prior-to-candidate-rollback",
+            "rollback_receipt": {
+                "receipt_id": rollback_receipt.get("receipt_id"),
+                "state": rollback_receipt.get("state"),
+                "parent_receipt_id": parent.get("receipt_id"),
+            },
+            "expected": expected,
+            "service_status": payload,
+        },
+    )
+    mismatch = _rollback_loaded_runtime_mismatch(payload, expected)
+    if mismatch:
+        raise QualificationFailure(
+            "rollback loaded runtime did not match prior receipt: " + mismatch
+        )
+
+
 #: #1167 owner-bound-reclaim installed check.  Every Manager step runs as the
 #: installed Manager (its UID, its root-owned runtime environment, its unit's
 #: UMask, the installed wheel) — never in this driver process: the driver has no
@@ -5613,6 +5738,8 @@ def _artifact_inventory(evidence_dir: Path) -> list[dict[str, str]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--receipt", required=True, type=Path)
+    parser.add_argument("--rollback-receipt", type=Path)
+    parser.add_argument("--prior-receipt", type=Path)
     parser.add_argument("--install-evidence", required=True, type=Path)
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--wheel-sha256", required=True)
@@ -5655,9 +5782,20 @@ def main() -> int:
         value is None for value in probe_values
     ):
         parser.error("deployment-canary profile requires every external probe input")
+    if (args.rollback_receipt is None) != (args.prior_receipt is None):
+        parser.error("rollback loaded-runtime evidence requires both receipt paths")
     try:
         receipt = _load_json(args.receipt, "install receipt")
         args.evidence_dir.mkdir(parents=True, exist_ok=False)
+        if args.rollback_receipt is not None and args.prior_receipt is not None:
+            prior_receipt = _load_json(args.prior_receipt, "prior install receipt")
+            rollback_receipt = _load_json(args.rollback_receipt, "rollback install receipt")
+            _capture_rollback_loaded_runtime(
+                rollback_receipt=rollback_receipt,
+                prior_receipt=prior_receipt,
+                receipt_path=args.prior_receipt,
+                evidence_dir=args.evidence_dir,
+            )
         tests = _installed_checks(
             install_evidence=args.install_evidence,
             receipt=receipt,
@@ -5730,6 +5868,8 @@ def main() -> int:
                     "reinstall",
                 )
             ] + tests
+            if args.rollback_receipt is not None:
+                tests.append({"name": "rollback-loaded-runtime", "status": "passed"})
         artifacts = _artifact_inventory(args.evidence_dir)
         qualification = {
             "schema_version": 2,

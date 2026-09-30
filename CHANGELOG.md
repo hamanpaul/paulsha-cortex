@@ -10,6 +10,7 @@
 ### Added
 
 - **#1222 Claude quota observation source**：從終局 Claude job 的 stream-json `rate_limit_event` 收割五小時／七日剩餘百分比至 quota observation ledger，支援 identity binding、coverage gap 與 TTL；更新 quota enforce 手冊（#1222）。
+- **#1224 rollback loaded-runtime qualification**：RC 對已核可 prior receipt 執行隔離 upgrade rollback，立即比對 Manager／Monitor 的 loaded artifact 與 receipt，並將列舉結果納入 qualification evidence；文件明示同 artifact 情境、證據界線與 RC/live 驗收分工（#1224）
 - **#829 refine 結案小缺口**：#843 R04 builder 版 retry-card 失敗補 reason 斷言、#844 S04 補 loadout 版本測試、stage reuse 文件寫明重啟產生 `reused` 的前提、#857 todo 回填 09-29 canary 通過紀錄（#829）。
 - **#716 Manager 的 toolchain PATH**：Manager EnvironmentFile 帶與 job 同形的 `PATH`（toolchain 最前），ship lane 找得到只裝在 toolchain 的 `openspec`（#716）。
 - **#1198 work item 進件**：登記 `quota-admission-enforce-runbook` work item 與 canonical Todo（quota enforce 操作手冊的派工卡、enforce live canary 載體）。

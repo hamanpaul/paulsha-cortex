@@ -68,12 +68,13 @@ owner 於 2026-09-29 裁決：AC4「reload 明確區分初始／有效 config」
 
 ## 驗收分帳
 
-本地測試涵蓋（皆不代表共享服務已安裝新 wheel 或完成 live 驗收）：
+本地測試與 RC 隔離 qualification 涵蓋（皆不代表共享服務已安裝新 wheel 或完成 live 驗收）：
 
 - `tests/test_loaded_runtime_installed_process_841.py`：checkout `pip install` 進隔離 venv，從 checkout 外、無 `PYTHONPATH` 的乾淨環境啟動**已安裝**的長駐 Manager／Monitor，receipt 由它們自己寫下；同一 prefix 的已安裝 `cortex service status --json`（PATH 上的假 `systemctl` 回報 MainPID 與有效宣告）比對為 `match`。同一組真程序再驗磁碟 artifact／Monitor 設定更新但未重啟時為 drift、receipt 不增不改，受控重啟後新 receipt 對齊新 identity、舊 receipt bytes 不變。從目錄安裝的 wheel 沒有 VCS commit，`source_revision` 維持 `unknown`。
 - `tests/test_loaded_runtime_rollback_receipt_841.py`：走正式 `apply`→`activate`→`verify`→`rollback` 產生的真 install receipt，loaded receipt 串接 prior（`verified`）與 rollback 後（`rolled-back`／`install-rollback-blocked`）兩次啟動；durable `jobs.json` 與 installer 讀到的 in-flight 事實在 rollback 前後不變，比對只標 `blocked-in-flight`。
+- RC release／deployment-canary qualification：fresh-install rollback 會回到無服務狀態，因此另外以已核可 prior receipt 建立不同 plan 的隔離升級 transaction，rollback 後、任何後續安裝前擷取 `cortex service status --system --json --install-receipt <prior>`。`rollback-loaded-runtime` 必須證明 Manager／Monitor 的 loaded wheel、installed wheel、candidate commit 與 prior receipt ID 全部相符；原始狀態存於 `qualification-output/evidence/rollback-loaded-runtime-status.json` 並由 validator 重驗。輸入只有 candidate wheel，故 evidence 將情境明示為 `same-artifact-qualified-prior-to-candidate-rollback`，不宣稱比較了不同歷史版本。
 
-**限制：`cortex service status`／`cortex doctor` 目前只探測 user 級 unit**（`systemctl --user`、`$HOME/.config/systemd/user`）。Trust Root 的 system 部署（`/etc/systemd/system/cortex-*.service`、`ExecStart=<venv>/bin/cortex service run`／`cortex monitor`、state 在 root／服務帳號擁有的樹）不在探測範圍，也不認得 console script 形式的 ExecStart，loaded↔installed 比對在該部署維持 unknown；system 部署的 installed／live 證據需要另外補上 system scope 探測後才能由這兩個命令產生。operator 需在有權控管的 live target 上依序：
+`cortex service status` 預設與 `cortex doctor` 維持 user scope；`service status --system` 可另外探測 Trust Root system units、installed artifact 與 receipt。release／deployment-canary RC qualification 會在隔離 systemd 容器驗 rollback 後的 loaded↔installed↔receipt 一致性，不依賴 9900X 實機。以下步驟仍用於另外驗收受控 live target 上的程序與外部狀態：
 
 ```bash
 sudo /opt/cortex/venv/bin/cortex service status --system --instance cortex --json
