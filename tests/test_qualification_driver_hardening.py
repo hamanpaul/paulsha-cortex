@@ -1570,10 +1570,15 @@ def _dispatch_fixture(tmp_path: Path, driver):
     repository = "owner/repo"
     issue = 42
     phases = ("claim", "define", "plan", "build", "verify", "review", "ship")
+    personas = {
+        "claim": "manager", "define": "planner", "plan": "planner", "build": "builder",
+        "verify": "reviewer", "review": "reviewer", "ship": "manager",
+    }
     steps = [
         {
             "phase": phase,
             "card": "worktree-isolation" if phase == "build" else f"{phase}-card",
+            "persona": personas[phase],
             "gate_result": "passed",
         }
         for phase in phases
@@ -1970,6 +1975,43 @@ def _validate_fixture_closeout(driver, fixture):
         },
         coordinator_root=fixture["coordinator"],
     )
+
+
+def _drop_fixture_jobs(fixture, *phases: str) -> None:
+    registry = json.loads(fixture["registry"].read_text(encoding="utf-8"))
+    registry["jobs"] = [
+        job for job in registry["jobs"] if job.get("workflow_phase") not in phases
+    ]
+    _write_json(fixture["registry"], registry)
+
+
+def test_dispatch_closeout_requires_jobs_only_for_builder_and_reviewer_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：plan（writing-plans-light）與 ship（archive／policy-commit）由 Manager
+    執行、define 的 planner 走 planning runtime，都不產生 registry job。真實 canary
+    因此永遠湊不齊 plan／ship job——只有 builder／reviewer 步驟的 phase 必須有 job。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    _drop_fixture_jobs(fixture, "plan", "ship")
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    _markers, _rows, workflow, _probe = _validate_fixture_closeout(driver, fixture)
+    assert workflow["run_id"] == fixture["run_id"]
+
+
+def test_dispatch_closeout_names_missing_job_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    _drop_fixture_jobs(fixture, "review")
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    with pytest.raises(driver.QualificationFailure, match="phase chain is incomplete: missing=review"):
+        _validate_fixture_closeout(driver, fixture)
 
 
 def test_dispatch_closeout_rejects_forged_marker_text(

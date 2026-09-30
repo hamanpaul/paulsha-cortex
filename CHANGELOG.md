@@ -109,6 +109,7 @@
 
 ### Fixed
 
+- **#716 canary 結案檢查的 job phase 鏈**：只要求 builder／reviewer 步驟的 phase 有 registry job（plan／ship 由 Manager 執行、define 走 planning runtime），錯誤列出缺少與觀察到的 phase（#716）。
 - **#1237 archive 後補上新 spec 的 Purpose**：`openspec archive` 為新 capability 留下的 TBD Purpose 佔位，改由 Manager 以 proposal 的 Why 補上，避免 Copilot finding 卡住 ship（#1237）。
 - **#716 Codex app-server 探針重試**：canary 的 codex status 探針改為最多 3 次、每次 60 秒（總上限不變），減少 `account/read` 偶發卡住造成的整輪失敗（#716）。
 - **#1233 backoff lock 在 root 建立前後分裂**：writer 先建 coordinator root 再拿 lock，reader 在 root 不存在時不去祖先建 lock，修正 CI 偶發的 `missing`（#1233）。

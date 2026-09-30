@@ -4696,8 +4696,22 @@ def _validate_dispatch_closeout(
         if isinstance(row, dict) and row.get("workflow_run_id") == run_id
     ]
     job_phases = {str(row.get("workflow_phase")) for row in bound_jobs}
-    if not {"plan", "build", "verify", "review", "ship"} <= job_phases:
-        raise QualificationFailure("workflow job phase chain is incomplete")
+    # #716：只有 builder／reviewer 步驟會產生 registry job。plan（writing-plans-light）
+    # 與 ship（archive／policy-commit）由 Manager 執行，define 的 planner 走 planning
+    # runtime——要求這些 phase 也有 job 會讓真實 canary 永遠過不了這一關。
+    expected_job_phases = {
+        str(row.get("phase"))
+        for row in steps
+        if isinstance(row, dict) and row.get("persona") in {"builder", "reviewer"}
+    }
+    missing_job_phases = sorted(expected_job_phases - job_phases)
+    if not expected_job_phases or missing_job_phases:
+        raise QualificationFailure(
+            "workflow job phase chain is incomplete: missing="
+            + (",".join(missing_job_phases) or "none")
+            + " observed="
+            + (",".join(sorted(job_phases)) or "none")
+        )
 
     artifact_digests: dict[Path, str] = {}
 
