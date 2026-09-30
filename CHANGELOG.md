@@ -10,6 +10,7 @@
 ### Added
 
 - **#1198 work item 進件**：登記 `quota-admission-enforce-runbook` work item 與 canonical Todo（quota enforce 操作手冊的派工卡、enforce live canary 載體）。
+- **#1198 quota enforce 操作手冊**：新增額度准入 enforce 的開關切換、binding、fresh observation、wait 恢復、rollback 與 evidence 查核手冊，並由 README quota 段落連結。
 - **#716 canary 結案診斷**：派工結案驗證失敗時列出不成立的條件（phase／status／gate／needs_human 代碼／缺少 phase／未過步驟），不輸出自由文字（#716）。
 - **#716 Codex 憑證目錄 owner**：scaffold 先以 Manager 身分建立 `codex-credentials/<principal>/`（0700）再寫入 `auth.json`，Manager 收回 refresh 過的憑證不再 EACCES（#716）。
 - **#716 codex code-mode host**：codex 改以 npm 平台套件的整個 `bin/` 目錄做 tree 安裝，`codex-code-mode-host` 與本體同目錄；installer 對原生進入點的 tree 產生直接 exec 的 wrapper（#716）。
