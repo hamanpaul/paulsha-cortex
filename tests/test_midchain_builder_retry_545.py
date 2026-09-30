@@ -839,7 +839,12 @@ def test_public_work_retry_card_restores_needs_human_when_dispatch_fails(
     with pytest.raises(RuntimeError, match="launcher down"):
         executor(_retry_card_request(run))
 
-    assert "needs_human" in registry.get_workflow_run(run.run_id).facets
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" in persisted.facets
+    # #843 R04：builder 版與 reviewer 版同樣必須落結構化理由，不只補回 facet。
+    assert persisted.needs_human_reason["reason"] == "forced-card-retry-failed"
+    assert persisted.needs_human_reason["context"]["phase"] == "build"
+    assert persisted.needs_human_reason["context"]["action"] == "retry-card"
 
 
 def test_public_work_retry_card_fails_when_dispatch_produces_no_job(
@@ -853,7 +858,10 @@ def test_public_work_retry_card_fails_when_dispatch_produces_no_job(
     with pytest.raises(RuntimeError, match="retry-card produced no builder Job"):
         executor(_retry_card_request(run))
 
-    assert "needs_human" in registry.get_workflow_run(run.run_id).facets
+    persisted = registry.get_workflow_run(run.run_id)
+    assert "needs_human" in persisted.facets
+    assert persisted.needs_human_reason["reason"] == "forced-card-retry-failed"
+    assert persisted.needs_human_reason["context"]["phase"] == "build"
 
 
 # ==========================================================================

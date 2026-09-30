@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#829 refine 結案小缺口**：#843 R04 builder 版 retry-card 失敗補 reason 斷言、#844 S04 補 loadout 版本測試、stage reuse 文件寫明重啟產生 `reused` 的前提、#857 todo 回填 09-29 canary 通過紀錄（#829）。
 - **#1198 work item 進件**：登記 `quota-admission-enforce-runbook` work item 與 canonical Todo（quota enforce 操作手冊的派工卡、enforce live canary 載體）。
 - **#1198 quota enforce 操作手冊**：新增額度准入 enforce 的開關切換、binding、fresh observation、wait 恢復、rollback 與 evidence 查核手冊，並由 README quota 段落連結。
 - **#716 canary 結案診斷**：派工結案驗證失敗時列出不成立的條件（phase／status／gate／needs_human 代碼／缺少 phase／未過步驟），不輸出自由文字（#716）。
