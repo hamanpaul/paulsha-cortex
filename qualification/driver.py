@@ -5265,6 +5265,13 @@ _JOB_DIAGNOSTIC_LINES = 60
 _JOB_DIAGNOSTIC_SECTION_CHARS = 4000
 _JOB_DIAGNOSTIC_CHARS = 36000
 _JOB_DIAGNOSTIC_JOB_LOGS = 3
+#: 相對 coordinator root：direct 派工的 workflow log，與模板 unit 的 builder／reviewer
+#: job log spool（gate 的 log 另在 gate-logs 段印）。
+_JOB_DIAGNOSTIC_JOB_LOG_GLOBS = (
+    "logs/workflow/*.jsonl",
+    "commit-spool/build-logs/*/*",
+    "review-verdicts/planning-logs/*/*",
+)
 
 
 def _scrub_diagnostic(text: str) -> str:
@@ -5335,10 +5342,18 @@ def _job_unit_diagnostics(runtime_env: Mapping[str, str]) -> str:
     # 最近幾顆 workflow job 自己的 log 尾端：unit 正常結束（exit 0）卻沒有交付 terminal
     # JSON 時（run 36652684030 的 agy verification，8 秒結束），journal 只有啟停兩行，
     # 真正的原因只在 job 的 log 裡。
+    # 模板 unit 派出的 job，log 在各 principal 的 job log spool（#708），不在
+    # `logs/workflow/`：builder 在 `commit-spool/build-logs/<i>/`、reviewer／planner
+    # 在 `review-verdicts/planning-logs/<i>/`（run 36656955386 因此一份都沒印到）。
     try:
         job_logs = (
             sorted(
-                (root / "logs" / "workflow").glob("*.jsonl"),
+                (
+                    path
+                    for pattern in _JOB_DIAGNOSTIC_JOB_LOG_GLOBS
+                    for path in root.glob(pattern)
+                    if path.is_file() and not path.is_symlink()
+                ),
                 key=lambda path: path.stat().st_mtime,
             )
             if root is not None
@@ -5347,7 +5362,7 @@ def _job_unit_diagnostics(runtime_env: Mapping[str, str]) -> str:
     except OSError:
         job_logs = []
     for log in job_logs[-_JOB_DIAGNOSTIC_JOB_LOGS:]:
-        lines.append(f"--- job log {log.name}")
+        lines.append(f"--- job log {log.parent.name}/{log.name}")
         try:
             lines.append(
                 "\n".join(
