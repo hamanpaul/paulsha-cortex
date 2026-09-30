@@ -108,6 +108,7 @@
 
 ### Fixed
 
+- **#1233 backoff lock 在 root 建立前後分裂**：writer 先建 coordinator root 再拿 lock，reader 在 root 不存在時不去祖先建 lock，修正 CI 偶發的 `missing`（#1233）。
 - **#716 openspec 在 jitless 下的執行環境**：qualification image 的 node 改為 20.20.2（node 22 在 `--jitless` 下 import `node:http` 即崩），Manager EnvironmentFile 加 `DO_NOT_TRACK=1` 關掉 openspec telemetry（#716）。
 - **#716 qualification image 的系統層 node**：改由 contract 釘版本與 sha256 的官方 Node.js 22 tarball 安裝 `/usr/bin/node`（openspec 要求 >=20.19，apt 的 18.19 會讓 `openspec validate` SyntaxError）（#716）。
 - **#1223 brainstorm／planning 派工納入 quota admission**：planner 的模型呼叫（questioner、secondary、integrator）走與 workflow card 相同的准入：shadow 只記錄，enforce 下不可行時不呼叫模型、run 標 `quota-admission-insufficient` 並寫可重試 wait receipt；可行時同步預留並收斂 reservation，終局用量記入 own-job ledger（#1223）。
