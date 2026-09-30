@@ -13649,9 +13649,15 @@ def _workflow_job_prompt(
                 "tests and sandbox conditions must not override it, and this Candidate must "
                 "not be reported verified. Continue the diff review and report the failed gate."
             )
+    # #1215：Manager 會把候選裡沒有的 pinned 規劃輸入以 untracked 檔 seed 進工作區，
+    # 採信時逐檔驗存在與 bytes。builder 的 self-review 曾把它當 stray 檔刪掉，候選因此
+    # 被 fail-closed 擋下——這裡明講 untracked 是刻意的，不算 dirty。
     commit_required_contract = (
         f" Before the final commit, update {tasks_path} checkboxes for work completed by this card, "
-        "and never modify pinned input files such as the plan document."
+        "and never modify pinned input files such as the plan document. The Manager seeds pinned "
+        "input files that the Candidate does not track into this worktree as untracked files; that "
+        "untracked state is expected and is not dirt or an extra change. Keep every path listed in "
+        "the contract's source_material in place: never delete, move, stash, or git clean it."
         if effective_commit_policy == "required"
         else ""
     )

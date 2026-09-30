@@ -399,6 +399,13 @@ class WorkflowJobPromptTests(unittest.TestCase):
 
         self.assertIn("openspec/changes/issue-116/tasks.md checkboxes", prompt)
         self.assertIn("never modify pinned input files such as the plan document", prompt)
+        # #1215：seed 進來的 untracked pinned 輸入不是 stray 檔，不得刪除。
+        self.assertIn("as untracked files; that untracked state is expected", prompt)
+        self.assertIn(
+            "Keep every path listed in the contract's source_material in place: never delete, "
+            "move, stash, or git clean it.",
+            prompt,
+        )
 
     def test_commit_required_build_card_without_openspec_ref_uses_generic_tasks_path(self) -> None:
         step = WorkflowStep(
@@ -462,6 +469,8 @@ class WorkflowJobPromptTests(unittest.TestCase):
         self.assertNotIn("never modify pinned input files", worktree_prompt)
         self.assertNotIn("tasks.md checkboxes", verification_prompt)
         self.assertNotIn("never modify pinned input files", verification_prompt)
+        self.assertNotIn("source_material in place", worktree_prompt)
+        self.assertNotIn("source_material in place", verification_prompt)
 
     def test_commit_required_prompt_includes_needs_fix_reviewer_findings(self) -> None:
         step = WorkflowStep(
