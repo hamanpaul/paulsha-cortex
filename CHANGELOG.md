@@ -109,6 +109,8 @@
 
 ### Fixed
 
+- **#716 canary 結案只對 build job 要求 gate ledger**：driver 以 `GATE_LEDGER_PHASES` 鏡射 manager 的 `GATE_LEDGER_REQUIRED_PHASES`，不再要求 reviewer job 有 ledger（#716）。
+- **#716 模板模式的 gate ledger 綁定 job**：Manager 從 gate spool 重建 ledger 時，`slice_id` 改由呼叫端帶入 job id（服務行程沒有 `PSC_SLICE_ID`，原本寫成空字串）（#716）。
 - **#716 canary 的 Copilot findings 修正回合**：canary 碰到 `copilot-findings` 時，以 `retry-build` 正式出口把 findings 交給 builder 修正，最多 2 回合（#716）。
 - **#716 canary 結案檢查的 job phase 鏈**：只要求 builder／reviewer 步驟的 phase 有 registry job（plan／ship 由 Manager 執行、define 走 planning runtime），錯誤列出缺少與觀察到的 phase（#716）。
 - **#1237 archive 後補上新 spec 的 Purpose**：`openspec archive` 為新 capability 留下的 TBD Purpose 佔位，改由 Manager 以 proposal 的 Why 補上，避免 Copilot finding 卡住 ship（#1237）。

@@ -774,6 +774,17 @@ class GateExecutionTests(unittest.TestCase):
             self.assertEqual(snapshot.name, spool_key)
             self.assertFalse((snapshot.parent / job_runner.template_instance_id(spool_key)).exists())
 
+    def test_the_authoritative_ledger_is_bound_to_the_job_id(self) -> None:
+        """#716：canary 結案驗證要求 ledger 的 `slice_id` 等於 job_id（direct 模式的
+        wrapper 以 `PSC_SLICE_ID=<job id>` 寫出）。模板模式由 Manager 從 gate spool
+        重建 ledger 時，卻取了 Manager 自己 env 的 `PSC_SLICE_ID`（空字串）。"""
+        with tempfile.TemporaryDirectory() as root:
+            # Manager 服務行程沒有 `PSC_SLICE_ID`（那是 job env 才有的標記）；本檔的
+            # _BASE_ENV 帶著它，恰好把這個缺陷遮住。
+            out = self._run(root=root, payload=_ok_payload(), env_extra={"PSC_SLICE_ID": ""})
+            ledger = json.loads(Path(out["ledger_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(ledger["slice_id"], "psc-0629-build")
+
     def test_the_spec_carries_no_identity_or_profile_field(self) -> None:
         """身分只由 root-owned unit 的 `User=` 決定（#643／0816 裁決 B 的核心）。"""
         with tempfile.TemporaryDirectory() as root:

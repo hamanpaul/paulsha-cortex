@@ -425,7 +425,12 @@ def _normalize_worktree_state(
     }
 
 
-def read_gate_spool(ledger_file: str | Path, *, env: Mapping[str, str]) -> dict[str, Any]:
+def read_gate_spool(
+    ledger_file: str | Path,
+    *,
+    env: Mapping[str, str],
+    slice_id: str | None = None,
+) -> dict[str, Any]:
     """讀回 gate 交付的 ledger 並**以不受信任輸入驗證**，回傳正規化後的 payload。
 
     寫這份檔的身分正在執行 builder 交出來的程式碼；它可以被攻陷。因此這裡逐項驗
@@ -515,7 +520,9 @@ def read_gate_spool(ledger_file: str | Path, *, env: Mapping[str, str]) -> dict[
         )
     return gate_ledger.build_ledger(
         normalized,
-        slice_id=str(env.get("PSC_SLICE_ID", "")),
+        # #716：Manager 服務行程沒有 `PSC_SLICE_ID`（那是 job env 的標記），由呼叫端
+        # 帶入 job id，ledger 才與 direct 模式一樣綁定到它所屬的 job。
+        slice_id=slice_id if slice_id is not None else str(env.get("PSC_SLICE_ID", "")),
         worktree_state=_normalize_worktree_state(payload, path=path),
     )
 
@@ -669,7 +676,7 @@ def _run_as_gate_identity(
     completed = execute(start, capture_output=True, text=True, check=False)
     returncode = int(getattr(completed, "returncode", 1))
     try:
-        payload = read_gate_spool(spool_ledger, env=env)
+        payload = read_gate_spool(spool_ledger, env=env, slice_id=job_id)
     except GateRunnerError as exc:
         # unit 起不來（polkit 拒絕、模板未安裝、shim 讀不到 spec）與「跑了但沒交付」
         # 在 spool 端是同一個形狀，因此把 client 的 exit code 與 stderr 帶進錯誤裡
