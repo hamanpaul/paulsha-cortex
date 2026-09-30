@@ -401,7 +401,7 @@ def test_reference_image_apt_pins_mirror_the_contract() -> None:
 
 
 def test_reference_image_node_runtime_mirrors_the_contract() -> None:
-    """#716：`/usr/bin/node` 必須滿足 toolchain 的 node 需求（openspec 1.10.0 要 >=20.19）。
+    """#716：`/usr/bin/node` 必須滿足 toolchain 的 node 需求（>=20.19 且 <22）。
 
     Ubuntu 24.04 apt 的 nodejs 是 18.19，ship lane 的 `openspec validate` 在它底下
     直接 SyntaxError；image 改由 contract 釘版本與 sha256 的官方 tarball 安裝。
@@ -417,7 +417,8 @@ def test_reference_image_node_runtime_mirrors_the_contract() -> None:
     assert NODE_RUNTIME["url"] == (
         f"https://nodejs.org/dist/v{version}/node-v{version}-linux-x64.tar.gz"
     )
-    assert tuple(int(part) for part in version.split(".")) >= (20, 19, 0)
+    # openspec engines 要求 >=20.19；node 22 在 `--jitless` 下 import `node:http` 即崩。
+    assert (20, 19, 0) <= tuple(int(part) for part in version.split(".")) < (22, 0, 0)
     assert re.search(r"sha256sum --check --strict", dockerfile)
     assert "/usr/bin/node" in dockerfile
     apt_block = dockerfile.split("apt-get clean", 1)[0]

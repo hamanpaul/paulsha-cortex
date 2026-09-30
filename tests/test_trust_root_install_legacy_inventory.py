@@ -138,9 +138,10 @@ def _normalized_plan_sha256(plan: dict, tmp_path: Path) -> str:
 # and #716 again added `StateDirectory=` for the gate worktree slot to the gate
 # job template units (the slot must exist before namespace setup), and #716
 # once more added the toolchain-first `PATH` to the manager EnvironmentFile
-# (the ship lane calls `openspec` by name).
+# (the ship lane calls `openspec` by name), and #716 again added
+# `DO_NOT_TRACK=1` there (openspec telemetry crashes under `--jitless`).
 RELEASE_PLAN_GOLDEN_SHA256 = (
-    "7f9079bb2c86b2ac57f217f3230fe5ef0d805cdb5cc8b62b833cfa59dc4e3048"
+    "56b820032411a4823761e8ae43e4ff916329201ef49e1e5c7c7aeaec540932d6"
 )
 
 

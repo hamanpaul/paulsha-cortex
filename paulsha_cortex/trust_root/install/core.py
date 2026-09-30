@@ -734,6 +734,9 @@ def _manager_environment(
     values = {
         # #716：Manager 的 ship lane 以相對名呼叫 openspec，它只裝在 toolchain。
         "PATH": layout.manager_path_value(),
+        # #716：openspec 以 `--jitless` 執行（Manager 有 MemoryDenyWriteExecute），
+        # 它的 usage telemetry 走 fetch→undici→wasm，jitless 下直接崩；關掉統計。
+        "DO_NOT_TRACK": "1",
         "PSC_INSTANCE": layout.instance,
         "PSC_AGENTS_ROOT": layout.agents_root,
         "PSC_PROJECT_CONFIG_ROOT": layout.project_config_root,

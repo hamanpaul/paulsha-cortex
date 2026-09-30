@@ -1434,8 +1434,10 @@ SYSTEM_PROGRAMS: tuple[SystemProgram, ...] = (
         note=(
             "通用 JS runtime，換版本幾乎不影響產出，因此不進部署樹；但版本本身仍是"
             "部署決定：wrapper 寫死 `/usr/bin/node`，而 toolchain 的 openspec 要求 "
-            "`node >=20.19`（Ubuntu 24.04 apt 的 nodejs 18.19 不夠，#716）。所有 "
-            "`needs_node` 的 toolchain 程式都吃它。"
+            "`node >=20.19`（Ubuntu 24.04 apt 的 nodejs 18.19 不夠），且它以 "
+            "`--jitless` 執行時只能用 20.x——node 22 的 ESM facade 會載入 undici "
+            "的 wasm，jitless 下直接崩（#716）。所有 `needs_node` 的 toolchain "
+            "程式都吃它。"
         ),
     ),
     SystemProgram(

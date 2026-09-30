@@ -60,14 +60,17 @@ TOOLCHAIN: Mapping[str, Mapping[str, str]] = {
 }
 
 #: 系統層 node runtime（#716）。toolchain 的 `.js` 進入點由 root-owned wrapper 以
-#: `/usr/bin/node` 執行（`trust_root/install/core.py`）；openspec 1.10.0 要求
-#: node >=20.19，Ubuntu 24.04 apt 的 nodejs 是 18.19，Manager 在 ship lane 跑
-#: `openspec validate` 直接 SyntaxError，archive gate 判 `canonical-specs-invalid`。
-#: reference image 改以官方 tarball 安裝 node 本體，版本與 sha256 以此為唯一真相。
+#: `/usr/bin/node` 執行（`trust_root/install/core.py`），openspec 還帶 `--jitless`
+#: （Manager unit 維持 MemoryDenyWriteExecute）。版本限制兩端都實測過：
+#: - 下限 20.19：openspec 1.10.0 的 engines；Ubuntu 24.04 apt 的 nodejs 18.19 下
+#:   `openspec validate` 直接 SyntaxError（archive gate 判 `canonical-specs-invalid`）。
+#: - 上限 <22：node 22 的 ESM facade 會列舉 `node:http` 的 lazy `WebSocket` export，
+#:   載入 undici 並編譯 wasm；`--jitless` 關掉 WebAssembly，openspec 一 import 就崩。
+#: 與 9900X 系統部署的 node 同版，reference image 以官方 tarball 安裝。
 NODE_RUNTIME: Mapping[str, str] = {
-    "version": "22.20.0",
-    "url": "https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.gz",
-    "sha256": "eeaccb0378b79406f2208e8b37a62479c70595e20be6b659125eb77dd1ab2a29",
+    "version": "20.20.2",
+    "url": "https://nodejs.org/dist/v20.20.2/node-v20.20.2-linux-x64.tar.gz",
+    "sha256": "19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b",
 }
 
 #: 部署 venv 需要、但不是 cortex 相依的 python 發行版（permgen

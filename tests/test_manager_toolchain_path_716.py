@@ -57,6 +57,13 @@ def test_manager_environment_path_puts_toolchain_first(tmp_path: Path) -> None:
     assert values["PATH"] == values["PSC_BUILDER_PATH"]
 
 
+def test_manager_environment_disables_openspec_telemetry(tmp_path: Path) -> None:
+    """#716：`--jitless` 下 openspec 的 telemetry（fetch→undici→wasm）必崩，Manager 關掉它。"""
+    values = _manager_environment(tmp_path)
+
+    assert values["DO_NOT_TRACK"] == "1"
+
+
 def test_manager_path_resolves_toolchain_openspec_before_system_copy(tmp_path: Path) -> None:
     toolchain = tmp_path / "opt" / "toolchain" / "bin"
     system = tmp_path / "usr" / "bin"
