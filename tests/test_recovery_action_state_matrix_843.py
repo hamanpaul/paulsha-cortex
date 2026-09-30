@@ -35,6 +35,7 @@ from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
     claim as claim_module,
     gate_runner,
+    manager,
     manager_daemon,
     work_actions,
 )
@@ -383,6 +384,60 @@ def _retry_build_scenario(root: Path) -> Scenario:
         run_id=run.run_id,
         snapshot=snapshot,
     )
+
+
+def _verification_explicit_stop_scenario(root: Path, _monkeypatch=None) -> Scenario:
+    snapshot, _authority, registry, run = _started_run(root)
+    _advance(registry, run, phase="verify")
+    passed_build = tuple(
+        replace(step, gate_result="passed") if step.phase == "build" else step
+        for step in registry.get_workflow_run(run.run_id).steps
+    )
+    current = registry.get_workflow_run(run.run_id)
+    registry._manager_update_workflow_run(
+        current.run_id,
+        steps=passed_build,
+        candidate_head=HEAD,
+        facets=("needs_human",),
+        gate_status="running",
+        needs_human_reason=replace(
+            fixture_needs_human_reason(),
+            reason="verification-terminal-explicit-stop",
+            detail="verification explicitly requested operator stop",
+        ),
+    )
+    return Scenario(
+        action="retry-build",
+        root=root,
+        registry=registry,
+        state_path=root / "runs.json",
+        args={
+            "action": "retry-build",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "issue": 12,
+            "actor": "operator",
+            "expected_candidate": HEAD,
+        },
+        repo="acme/demo",
+        work_id="demo",
+        run_id=run.run_id,
+        snapshot=snapshot,
+    )
+
+
+def _review_explicit_stop_scenario(root: Path, _monkeypatch=None) -> Scenario:
+    sc = _retry_build_scenario(root)
+    run = sc.registry.get_workflow_run(sc.run_id)
+    sc.registry._manager_update_workflow_run(
+        run.run_id,
+        needs_human_reason=replace(
+            fixture_needs_human_reason(),
+            reason="review-terminal-explicit-stop",
+            detail="review explicitly requested operator stop",
+        ),
+    )
+    return sc
 
 
 def _retry_card_scenario(root: Path) -> Scenario:
@@ -1797,6 +1852,14 @@ def _scenario_builder(action: str) -> Callable[[Path, Any], Scenario]:
 #: 情境 → (builder, 預期 read model 投影的 next_actions)。預期值寫死，讓投影
 #: 多出或少了動作都會被看見，而不是只驗「投影出來的都能過」。
 ROUND_TRIP_SCENARIOS: dict[str, tuple[Callable[[Path, Any], Scenario], tuple[str, ...]]] = {
+    "verification-explicit-stop": (
+        _verification_explicit_stop_scenario,
+        ("abandon", "retry-build"),
+    ),
+    "review-explicit-stop": (
+        _review_explicit_stop_scenario,
+        ("abandon", "retry-build"),
+    ),
     "build-card-terminal-without-evidence": (
         _scenario_builder("retry-card"),
         ("abandon", "regenerate-gates", "retry-card"),
@@ -1913,3 +1976,64 @@ def test_r09_every_projected_next_action_is_accepted_by_the_formal_entry(
 
     assert result["result"]
     assert result.get("work_id") == entry["work_id"]
+
+
+def test_retry_build_projection_and_shared_admission_fail_closed_on_job_or_candidate_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sc = _prepare_round_trip("verification-explicit-stop", tmp_path, monkeypatch)
+    run = sc.registry.get_workflow_run(sc.run_id)
+    assert "retry-build" in work_actions._phase_recovery_actions(run, sc.registry)
+    assert work_actions._retry_build_admission_error(
+        run, sc.registry, expected_candidate="c" * 40
+    ) is not None
+
+    original_list_jobs = sc.registry.list_jobs
+    monkeypatch.setattr(
+        sc.registry,
+        "list_jobs",
+        lambda: [
+            *original_list_jobs(),
+            {"workflow_run_id": run.run_id, "status": "running"},
+        ],
+    )
+    assert "retry-build" not in work_actions._phase_recovery_actions(run, sc.registry)
+    assert work_actions._retry_build_admission_error(
+        run, sc.registry, expected_candidate=HEAD
+    ) is not None
+
+
+def test_retry_build_hint_and_claim_delivery_lane_order(tmp_path: Path) -> None:
+    scenario_root = tmp_path / "scenario"
+    scenario_root.mkdir()
+    sc = _verification_explicit_stop_scenario(scenario_root)
+    run = sc.registry.get_workflow_run(sc.run_id)
+    status = manager.workflow_status_entry(sc.registry, run)
+    assert "retry-build" in status["next_actions"]
+    assert f"--expected-candidate {HEAD}" in status["next_step_hint"]
+    authority = work_actions.load_work_authority(
+        repo=sc.repo, work_id=sc.work_id, snapshot_path=sc.snapshot
+    )
+    claim_response = work_actions._claim_action(
+        args={"action": "start", "repo": sc.repo, "work_id": sc.work_id},
+        authority=authority,
+        requested_by="operator",
+        now_epoch=NOW,
+        state_path=sc.state_path,
+        workflow_registry=sc.registry,
+        snapshot_path=sc.snapshot,
+    )
+    assert claim_response["next_actions"] == ["abandon", "retry-build"]
+    assert f"--expected-candidate {HEAD}" in claim_response["next_step_hint"]
+    assert claim_module.needs_human_next_actions(
+        phase="verify",
+        planning_failure_classification=None,
+        job_recovery_actions=("retry-build",),
+        pre_delivery=True,
+    ) == ("abandon", "retry-build")
+    assert claim_module.needs_human_next_actions(
+        phase="verify",
+        planning_failure_classification=None,
+        job_recovery_actions=("retry-build",),
+        pre_delivery=False,
+    ) == ("retry-build",)

@@ -51,7 +51,7 @@ cortex quota observe --config "$QUOTA_CONFIG" --json
 
 ## 4. Admission 判定與等待
 
-目前預設 demand 版本是 dispatch-unit:v1：每個受管 pool/window 以一個原生計量單位作准入門檻，不是模型用量預測。Manager 依既有排序逐一評估候選；enforce 下某候選不可行時會排除並嘗試下一個候選。全部候選都不可行時，不建立 job，run 進入 needs_human，reason 為 quota-admission-insufficient，並寫入 mode=enforced、outcome=wait、retry_eligible=true 的 receipt。（出處：paulsha_cortex/coordinator/quota_admission.py:DISPATCH_UNIT_DEMAND_VERSION、estimate_demand、paulsha_cortex/coordinator/manager.py:_dispatch_workflow_card、_quota_admission_stop）
+目前預設 demand 版本是 dispatch-unit:v2：每個受管 pool/window 以一個原生計量單位作准入門檻；若單位語意是 0–1 比例（如 AGY），門檻為 0.01（1%）。這不是模型用量預測。Manager 依既有排序逐一評估候選；enforce 下某候選不可行時會排除並嘗試下一個候選。全部候選都不可行時，不建立 job，run 進入 needs_human，reason 為 quota-admission-insufficient，並寫入 mode=enforced、outcome=wait、retry_eligible=true 的 receipt。（出處：paulsha_cortex/coordinator/quota_admission.py:DISPATCH_UNIT_DEMAND_VERSION、estimate_demand、paulsha_cortex/coordinator/manager.py:_dispatch_workflow_card、_quota_admission_stop）
 
 quota-pools 設定檔存在但格式或內容無效時，enforce 會 fail closed：run reason 為 quota-config-invalid，不派 job，wait receipt 的 retry_eligible 為 false。修好設定檔後需手動 resume；periodic tick 不會自動重試這種設定錯誤。（出處：paulsha_cortex/coordinator/manager_daemon.py:_quota_admission_context_for、paulsha_cortex/coordinator/manager.py:_quota_admission_config_invalid_stop、_quota_admission_record_wait_decision）
 
@@ -90,6 +90,6 @@ cortex work show "$WORK_ID" --repo "$REPO" --json
 
 job 終局若由 periodic reconcile 確認，reservation authority 會記錄 confirmed-terminated 並把 reservation state 收斂為 released；這與 settled 不同。終局用量另由 quota ledger 記錄，因此看到 released 不代表沒有記到用量。（出處：paulsha_cortex/coordinator/quota_admission.py:reconcile_bound_reservations、paulsha_cortex/coordinator/quota_reservation.py:QuotaReservationAuthority.reconcile、paulsha_cortex/coordinator/manager.py:_quota_admission_record_terminal_usage）
 
-讀歷史 decision 時要一併看 demand／observation 版本與所選候選欄位。#1196 修正前的 AGY fractional remaining 不應直接當成一個完整 dispatch unit；#1197 修正前的 selected_observation_state 可能反映整體狀態，而非所選候選。新 receipt 的 selected_observation_state 來自所選候選的 CandidateAssessment；較舊 receipt 若缺少此選填欄位，投影應視為 unknown，不要自行推定。（出處：paulsha_cortex/coordinator/quota_admission.py:estimate_demand、AdmissionDecision.selected_observation_state、paulsha_cortex/coordinator/manager.py:_dispatch_workflow_card）
+讀歷史 decision 時要一併看 demand／observation 版本與所選候選欄位。現在的新 receipt 預設是 dispatch-unit:v2；若看到較舊的 dispatch-unit:v1，#1196 修正前的 AGY fractional remaining 不應直接當成目前的 dispatch-unit:v2 門檻解讀。#1197 修正前的 selected_observation_state 也可能反映整體狀態，而非所選候選。新 receipt 的 selected_observation_state 來自所選候選的 CandidateAssessment；較舊 receipt 若缺少此選填欄位，投影應視為 unknown，不要自行推定。（出處：paulsha_cortex/coordinator/quota_admission.py:estimate_demand、AdmissionDecision.selected_observation_state、paulsha_cortex/coordinator/manager.py:_dispatch_workflow_card）
 
 額度准入在 workflow card 的 _dispatch_workflow_card 候選迴圈執行；manager.apply_work_action 的 brainstorm／planning runtime 不經這條 quota admission 路徑。（出處：paulsha_cortex/coordinator/manager.py:_dispatch_workflow_card、apply_work_action）

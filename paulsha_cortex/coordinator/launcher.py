@@ -452,7 +452,12 @@ def _claude_review_settings(worktree: str) -> str:
             separators=(",", ":"),
         )
     settings = {
-        "permissions": {"deny": read_denials},
+        # #1210：direct 分支同樣需要明示的 Bash allow（#748 的同一條理由）。只靠
+        # `autoAllowBashIfSandboxed` 時，dontAsk 會直接拒絕複合命令（`;` 串接、
+        # `for` 迴圈），reviewer 沒有 Read／Grep 可替代，只能以 needs_human 收場。
+        # 放行後命令仍一律在下方沙箱內執行（allowUnsandboxedCommands=false），
+        # deny 規則優先於 allow，憑證讀取拒絕不受影響。
+        "permissions": {"allow": ["Bash"], "deny": read_denials},
         "sandbox": {
             "enabled": True,
             "failIfUnavailable": True,
@@ -2407,6 +2412,9 @@ class SubprocessLauncher:
                     manager_env=os.environ,
                 ),
                 account=runtime_account,
+                # #716：Codex 憑證只給 codex executor（與下方 credential_publish 同一
+                # 判準）；copilot／agy／claude reviewer 的部署可以根本沒有 Codex 憑證。
+                seed_credential=self._executor == "codex",
             )
             copilot_home: Path | None = None
             if self._executor == "copilot":

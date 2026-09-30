@@ -14,6 +14,9 @@
 - **#716 canary 結案診斷**：派工結案驗證失敗時列出不成立的條件（phase／status／gate／needs_human 代碼／缺少 phase／未過步驟），不輸出自由文字（#716）。
 - **#716 Codex 憑證目錄 owner**：scaffold 先以 Manager 身分建立 `codex-credentials/<principal>/`（0700）再寫入 `auth.json`，Manager 收回 refresh 過的憑證不再 EACCES（#716）。
 - **#716 codex code-mode host**：codex 改以 npm 平台套件的整個 `bin/` 目錄做 tree 安裝，`codex-code-mode-host` 與本體同目錄；installer 對原生進入點的 tree 產生直接 exec 的 wrapper（#716）。
+- **#716 canary 診斷涵蓋模板 job 的 log spool**：同時掃 builder／reviewer 的 job log spool，不只 `logs/workflow/`（#716）。
+- **#716 canary 診斷帶 workflow job log 尾端**：派工失敗時另印最近 3 顆 workflow job 的 log 尾端（有界、遮蔽 credential 形狀）（#716）。
+- **#716 非 codex job 不 seed Codex 憑證**：launcher 與 planning job 只在 executor 是 codex 時 seed／收回 Codex 憑證，部署沒有 reviewer Codex 憑證時 agy／copilot reviewer 不再於 provision 時停住（#716）。
 - **#716 gate job 226/NAMESPACE**：gate 模板 unit 以 `StateDirectory=` 由 systemd 預建 `<gate-worktree>/%i`，gate 快照改為就地清空再複製（#716）。
 - **#716 canary job 診斷改以 journal glob 查詢**：結束的模板 instance 不在 unit 清單上，改以 `journalctl -u <glob>` 查三類 job unit，每段各自截尾（#716）。
 - **#716 canary job 診斷**：派工失敗或逾時時，driver 印出最近 job unit 的 journal 與 gate.log 有界尾端（遮蔽 credential 形狀）（#716）。
@@ -100,6 +103,8 @@
 
 ### Fixed
 
+- **#1210 direct 模式 Claude reviewer 的 Bash allow**：reviewer settings 補 `permissions.allow: ["Bash"]`，dontAsk 下複合命令不再被拒；沙箱與憑證讀取拒絕不變。
+- **#1206 verification／review 明示停止的 retry-build 出口**：claim、status 與 Monitor 投影依正式入口共用 admission 判斷列出 exact-Candidate `retry-build`，並提供可直接執行的 CAS 指令提示；保留 pre-delivery 的 `abandon` 出口（#1206）。
 - **#1197 quota 候選觀測狀態**：准入 receipt 依候選綁定的 pool/window 判定觀測狀態，避免未觀測的其他額度池把已知候選投影成 unknown。
 - **#1196 quota dispatch demand 的比例單位門檻**：agy 的 0–1 比例單位改以 0.01（1%）為門檻，其餘單位維持 1 個原生單位；receipt demand 版本升為 `dispatch-unit:v2`。
 - **#1202 quota wait 手動恢復建議**：帶 retry-eligible `quota-admission-insufficient` receipt 的 run 在 claim、status 與 Monitor 投影 `resume`，提示與正式入口一致；額度仍不足時保留原 wait receipt，`quota-config-invalid` 不提供此動作。

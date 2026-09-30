@@ -3651,6 +3651,66 @@ def test_dispatch_failure_prints_bounded_scrubbed_job_diagnostics(
         assert len(section) <= driver._JOB_DIAGNOSTIC_SECTION_CHARS
 
 
+def test_dispatch_failure_prints_recent_workflow_job_log_tails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#716：unit exit 0 卻沒交付 terminal JSON 時，原因只在 job 自己的 log 裡。"""
+    import os as _os
+
+    driver = _load_driver()
+    root = tmp_path / "coordinator"
+    logs = root / "logs" / "workflow"
+    logs.mkdir(parents=True)
+    for index in range(5):
+        log = logs / f"wf-job-{index}.jsonl"
+        log.write_text(
+            "".join(f"job{index} line {n}\n" for n in range(100))
+            + ("sk-" + "c" * 30 + "\n" if index == 4 else ""),
+            encoding="utf-8",
+        )
+        _os.utime(log, (1_000_000 + index, 1_000_000 + index))
+    monkeypatch.setattr(
+        driver, "_run", lambda argv, **_kwargs: _result(driver, argv, stdout="")
+    )
+
+    driver._report_job_unit_diagnostics({"PSC_COORDINATOR_ROOT": str(root)})
+    err = capsys.readouterr().err
+
+    for index in (2, 3, 4):
+        assert f"--- job log workflow/wf-job-{index}.jsonl" in err
+        assert f"job{index} line 99" in err
+    assert "wf-job-1.jsonl" not in err
+    assert "job4 line 0\n" not in err
+    assert "sk-" + "c" * 30 not in err
+
+
+def test_dispatch_failure_prints_template_job_log_spools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#716：模板 unit 的 job log 在 principal 的 log spool，不在 logs/workflow。"""
+    import os as _os
+
+    driver = _load_driver()
+    root = tmp_path / "coordinator"
+    reviewer = root / "review-verdicts" / "planning-logs" / "wf-verification-4"
+    builder = root / "commit-spool" / "build-logs" / "wf-build-3"
+    for index, directory in enumerate((builder, reviewer)):
+        directory.mkdir(parents=True)
+        log = directory / "job.jsonl"
+        log.write_text(f"{directory.name} tail\n", encoding="utf-8")
+        _os.utime(log, (2_000_000 + index, 2_000_000 + index))
+    monkeypatch.setattr(
+        driver, "_run", lambda argv, **_kwargs: _result(driver, argv, stdout="")
+    )
+
+    driver._report_job_unit_diagnostics({"PSC_COORDINATOR_ROOT": str(root)})
+    err = capsys.readouterr().err
+
+    assert "--- job log wf-verification-4/job.jsonl" in err
+    assert "wf-verification-4 tail" in err
+    assert "--- job log wf-build-3/job.jsonl" in err
+
+
 def test_job_diagnostics_never_mask_the_dispatch_failure(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

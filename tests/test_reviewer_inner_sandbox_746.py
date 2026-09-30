@@ -39,9 +39,15 @@ class ReviewerInnerSandboxTests(unittest.TestCase):
         self.assertEqual(settings["permissions"]["allow"], ["Bash"])
         self.assertTrue(settings["permissions"]["deny"])
 
-    def test_direct_mode_has_no_allow_entry(self) -> None:
+    def test_direct_mode_allows_bash_but_keeps_the_inner_sandbox(self) -> None:
+        """#1210：direct 只靠 `autoAllowBashIfSandboxed` 時，dontAsk 會拒絕複合命令
+        （live：`;` 串接、for 迴圈），reviewer 沒有 Read／Grep 可替代。改與模板 runner
+        同樣顯式 allow Bash；命令仍在內層 sandbox 執行、不得逃出沙箱。"""
+
         settings = _settings(job_runner.RUNNER_DIRECT)
-        self.assertNotIn("allow", settings["permissions"])
+        self.assertEqual(settings["permissions"]["allow"], ["Bash"])
+        self.assertIs(settings["sandbox"]["enabled"], True)
+        self.assertIs(settings["sandbox"]["allowUnsandboxedCommands"], False)
 
     def test_permission_denials_are_identical_across_modes(self) -> None:
         direct = _settings(job_runner.RUNNER_DIRECT)

@@ -367,8 +367,12 @@ def test_reviewer_directive_lists_blocking_and_non_blocking_categories() -> None
 
 
 class _JobList:
-    def __init__(self, jobs=(), *, error: Exception | None = None):
+    """Registry view stub. #1206: retry-build 的投影與正式 admission 共用判準，
+    需要讀 ongoing WorkflowRun（恰好一個、就是這個 run），stub 因此也提供 runs。"""
+
+    def __init__(self, jobs=(), *, runs=(), error: Exception | None = None):
         self.jobs = list(jobs)
+        self.runs = list(runs)
         self.error = error
 
     def list_jobs(self):
@@ -376,12 +380,17 @@ class _JobList:
             raise self.error
         return list(self.jobs)
 
+    def list_workflow_runs(self):
+        if self.error is not None:
+            raise self.error
+        return list(self.runs)
+
 
 def test_blocking_findings_recovery_actions_follow_review_then_build_matrix(
     tmp_path: Path,
 ) -> None:
     _snapshot_path, _authority, _registry, run = _review_fixture(tmp_path)
-    actions = work_actions._phase_recovery_actions(run, _JobList())
+    actions = work_actions._phase_recovery_actions(run, _JobList(runs=[run]))
     assert "retry-review" in actions
     assert "retry-build" in actions
     assert actions.index("retry-review") < actions.index("retry-build")
@@ -389,12 +398,12 @@ def test_blocking_findings_recovery_actions_follow_review_then_build_matrix(
     other_root = tmp_path / "other-reason"
     other_root.mkdir()
     _, _, _, other_reason_run = _review_fixture(other_root, reason="reviewer-timeout")
-    other_actions = work_actions._phase_recovery_actions(other_reason_run, _JobList())
+    other_actions = work_actions._phase_recovery_actions(other_reason_run, _JobList(runs=[other_reason_run]))
     assert "retry-review" not in other_actions
     assert "retry-build" not in other_actions
 
     active_jobs = _JobList(
-        [{"workflow_run_id": run.run_id, "status": "running"}]
+        [{"workflow_run_id": run.run_id, "status": "running"}], runs=[run]
     )
     active_actions = work_actions._phase_recovery_actions(run, active_jobs)
     assert "retry-review" not in active_actions
@@ -411,14 +420,14 @@ def test_blocking_findings_recovery_actions_follow_review_then_build_matrix(
     _, _, _, mismatch_run = _review_fixture(
         mismatch_root, verified_head="c" * 40
     )
-    mismatch_actions = work_actions._phase_recovery_actions(mismatch_run, _JobList())
+    mismatch_actions = work_actions._phase_recovery_actions(mismatch_run, _JobList(runs=[mismatch_run]))
     assert "retry-review" not in mismatch_actions
     assert "retry-build" in mismatch_actions
 
     no_plan_root = tmp_path / "missing-plan"
     no_plan_root.mkdir()
     _, _, _, no_plan_run = _review_fixture(no_plan_root, plan_authority=False)
-    no_plan_actions = work_actions._phase_recovery_actions(no_plan_run, _JobList())
+    no_plan_actions = work_actions._phase_recovery_actions(no_plan_run, _JobList(runs=[no_plan_run]))
     assert "retry-review" not in no_plan_actions
     assert "retry-build" in no_plan_actions
 
