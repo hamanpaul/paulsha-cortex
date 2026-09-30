@@ -40,6 +40,61 @@ def _status_payload(*, manager_artifact: str = "match", monitor_trust: str = "ve
     return {"service": {"loaded_runtime": reports}}
 
 
+def _rollback_status_payload(*, manager_wheel: str = "b" * 64, monitor_receipt: str = "prior"):
+    reports = {}
+    for name in ("manager", "monitor"):
+        reports[name] = {
+            "comparison": {
+                "artifact_status": "match",
+                "config_status": "match",
+                "process_status": "match",
+                "loaded_wheel_sha256": manager_wheel if name == "manager" else "b" * 64,
+            },
+            "trust_root": {
+                "status": "verified",
+                "receipt_id": "prior" if name == "manager" else monitor_receipt,
+                "wheel_sha256": "b" * 64,
+                "candidate_commit": "c" * 40,
+            },
+            "installed_artifact": {"wheel_sha256": "b" * 64},
+        }
+    return {"service": {"loaded_runtime": reports}}
+
+
+def test_rollback_loaded_runtime_parser_accepts_prior_artifact_and_receipt() -> None:
+    driver = _driver()
+
+    assert driver._rollback_loaded_runtime_mismatch(
+        _rollback_status_payload(),
+        {"receipt_id": "prior", "wheel_sha256": "b" * 64, "candidate_commit": "c" * 40},
+    ) == ""
+
+
+def test_rollback_loaded_runtime_parser_rejects_artifact_or_receipt_mismatch() -> None:
+    driver = _driver()
+
+    mismatch = driver._rollback_loaded_runtime_mismatch(
+        _rollback_status_payload(manager_wheel="d" * 64, monitor_receipt="other"),
+        {"receipt_id": "prior", "wheel_sha256": "b" * 64, "candidate_commit": "c" * 40},
+    )
+
+    assert "wheel=mismatch" in mismatch
+    assert "receipt=mismatch" in mismatch
+
+
+def test_rollback_loaded_runtime_parser_rejects_unknown_receipt_evidence() -> None:
+    driver = _driver()
+    payload = _rollback_status_payload()
+    del payload["service"]["loaded_runtime"]["manager"]["trust_root"]
+
+    mismatch = driver._rollback_loaded_runtime_mismatch(
+        payload,
+        {"receipt_id": "prior", "wheel_sha256": "b" * 64, "candidate_commit": "c" * 40},
+    )
+
+    assert "manager=unknown" in mismatch
+
+
 @pytest.mark.parametrize(
     ("manager_artifact", "monitor_trust"),
     [("drift", "verified"), ("match", "unknown")],

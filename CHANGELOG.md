@@ -10,6 +10,7 @@
 ### Added
 
 - **#1222 Claude quota observation source**：從終局 Claude job 的 stream-json `rate_limit_event` 收割五小時／七日剩餘百分比至 quota observation ledger，支援 identity binding、coverage gap 與 TTL；更新 quota enforce 手冊（#1222）。
+- **#1224 rollback loaded-runtime qualification**：RC 對已核可 prior receipt 執行隔離 upgrade rollback，立即比對 Manager／Monitor 的 loaded artifact 與 receipt，並將列舉結果納入 qualification evidence；文件明示同 artifact 情境、證據界線與 RC/live 驗收分工（#1224）
 - **#829 refine 結案小缺口**：#843 R04 builder 版 retry-card 失敗補 reason 斷言、#844 S04 補 loadout 版本測試、stage reuse 文件寫明重啟產生 `reused` 的前提、#857 todo 回填 09-29 canary 通過紀錄（#829）。
 - **#716 Manager 的 toolchain PATH**：Manager EnvironmentFile 帶與 job 同形的 `PATH`（toolchain 最前），ship lane 找得到只裝在 toolchain 的 `openspec`（#716）。
 - **#1198 work item 進件**：登記 `quota-admission-enforce-runbook` work item 與 canonical Todo（quota enforce 操作手冊的派工卡、enforce live canary 載體）。
@@ -109,6 +110,7 @@
 
 - **#716 qualification image 的系統層 node**：改由 contract 釘版本與 sha256 的官方 Node.js 22 tarball 安裝 `/usr/bin/node`（openspec 要求 >=20.19，apt 的 18.19 會讓 `openspec validate` SyntaxError）（#716）。
 - **#1223 brainstorm／planning 派工納入 quota admission**：planner 的模型呼叫（questioner、secondary、integrator）走與 workflow card 相同的准入：shadow 只記錄，enforce 下不可行時不呼叫模型、run 標 `quota-admission-insufficient` 並寫可重試 wait receipt；可行時同步預留並收斂 reservation，終局用量記入 own-job ledger（#1223）。
+- **#1225 Monitor 不再覆寫 run dir 權限**：只在自己建立 run dir 時設 0700、既有目錄僅在 group／other 可寫時收緊，保留 installer 的 ACL mask，服務跑過後的升級不再被 `runtime-run-tree` provenance 擋下（#1225）。
 - **#1215 builder 刪除 seed 的 pinned 輸入**：commit-required builder 的 contract 說明 seed 進工作區的 untracked pinned 輸入不得刪除；build phase terminalization 失敗且 `retry-build` 可受理時，next_actions 會列出 `retry-build`（#1215）。
 - **#1220 closing reference 缺席的出口**：merge 授權只剩 `closing-issue-missing` 時記錄結構化 needs_human `closing-reference-missing` 並投影 `resume`／場外合入提示，不再變成 `resume-workflow-failed`（#1220）。
 - **#1210 direct 模式 Claude reviewer 的 Bash allow**：reviewer settings 補 `permissions.allow: ["Bash"]`，dontAsk 下複合命令不再被拒；沙箱與憑證讀取拒絕不變。

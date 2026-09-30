@@ -129,6 +129,9 @@ docker exec "$container_name" sh -eu -c \
 
 plan_path=/run/cortex-install/install-plan.json
 receipt_path=/run/cortex-install/install-receipt.json
+rollback_receipt_path=/run/cortex-install/rollback-install-receipt.json
+rollback_plan_path=/run/cortex-install/rollback-install-plan.json
+rollback_overlay_path=/run/cortex-install/rollback-host-overlay.json
 qualification_root=/qualification-output
 qualification_path=$qualification_root/qualification.json
 
@@ -389,12 +392,50 @@ docker exec \
     "$container_name" cortex install trust-root verify \
     --receipt "$receipt_path" --json --evidence "$install_evidence_path"
 
+# 上方 fresh-install rollback 會刻意回到沒有服務的主機。為擷取 loaded-runtime
+# 證據，從同一個不可變 RC artifact 建立另一份 plan，以已核可 receipt 作為 upgrade
+# parent，並在任何後續安裝動作前 rollback 此 transaction。空 overlay 不產生
+# overlay 紀錄、plan 與 prior 逐字相同（installer 拒絕同一 plan 當 upgrade）；
+# 這裡改為重述 release 設定既有的 `providers.builder`：有效設定不變，plan 多帶
+# `host_overlay_sha256` 而成為不同的 transaction。
+docker exec "$container_name" python3 -c '
+import json, sys, yaml
+config = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+overlay = {"providers": {"builder": list(config["providers"]["builder"])}}
+open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(overlay) + "\n")
+' /artifacts/install-config.yaml "$rollback_overlay_path"
+docker exec "$container_name" cortex install trust-root plan \
+    --config /artifacts/install-config.yaml \
+    --host-overlay "$rollback_overlay_path" \
+    --bundle /artifacts/bundle.json \
+    --output "$rollback_plan_path"
+rollback_plan_sha=$(docker exec "$container_name" sha256sum "$rollback_plan_path" | awk '{print $1}')
+# 與 transactional-install runbook 的升級流程相同：apply 前停下服務，rollback 回報
+# restore_safe 之後才把原本在跑的 unit 啟動回來，driver 再比對 loaded runtime。
+rollback_services=(cortex-egress-proxy.service cortex-manager.service cortex-monitor.service)
+docker exec "$container_name" systemctl stop "${rollback_services[@]}"
+docker exec "$container_name" cortex install trust-root apply \
+    --plan "$rollback_plan_path" \
+    --confirm-sha256 "$rollback_plan_sha" \
+    --receipt "$rollback_receipt_path" \
+    --prior-receipt "$receipt_path"
+rollback_report=$(docker exec "$container_name" cortex install trust-root rollback \
+    --receipt "$rollback_receipt_path")
+printf '%s\n' "$rollback_report"
+jq -e '.restore_safe == true' <<<"$rollback_report" >/dev/null || \
+    die "upgrade rollback was not restore-safe"
+docker exec "$container_name" systemctl start "${rollback_services[@]}"
+
 # A fixed harness installed in the reference image always runs the five attack
 # families and negative controls. Only deployment-canary mode adds provider
 # smokes/runtime identity, Manager auth dry-run, and full intake-to-closeout;
 # protected repository identity is never inferred from HOME or candidate JSON.
 qualification_driver=/usr/local/libexec/cortex-release-qualification
 driver_profile_args=(--profile "$profile")
+driver_profile_args+=(
+    --rollback-receipt "$rollback_receipt_path"
+    --prior-receipt "$receipt_path"
+)
 validator_profile_args=(--require-release-profile)
 if [[ "$profile" == deployment-canary ]]; then
     [[ -n ${CORTEX_RC_PROBE_REPOSITORY:-} ]] || die "protected probe repository is unavailable"
