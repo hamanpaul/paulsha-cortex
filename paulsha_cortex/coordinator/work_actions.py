@@ -1862,6 +1862,66 @@ def _copilot_ship_needs_human_response(
     }
 
 
+def _closing_reference_missing_next_step_hint(*, work_id: str, repo: str, pr_number: int) -> str:
+    return (
+        f"GitHub 未替 PR #{pr_number} 建立 closing reference。請在 PR 的 Development "
+        "手動連結 issue 後執行 "
+        f"`cortex work resume {work_id} --repo {repo}`；若 operator 已在管線外合入，執行 "
+        f"`cortex work retire-delivered {work_id} --repo {repo}`。"
+    )
+
+
+def _closing_reference_missing_response(
+    *,
+    active: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    authority: Any,
+    canonical_run: Any,
+    workflow_registry: Any,
+    pr_number: int,
+    head: str,
+    remote: Any,
+) -> dict[str, Any]:
+    missing_issues = sorted(set(authority.mapped_issues) - set(remote.closing_issues))
+    hint = _closing_reference_missing_next_step_hint(
+        work_id=canonical_run.work_id,
+        repo=authority.repo,
+        pr_number=pr_number,
+    )
+    active["ship"] = {
+        **(active.get("ship") or {}),
+        "phase": "needs_human",
+        "reason": "closing-reference-missing",
+        "head": head,
+        "pr_number": pr_number,
+    }
+    _save_runs(state_path, state)
+    workflow_registry._manager_update_workflow_run(
+        canonical_run.run_id,
+        facets=("needs_human",),
+        gate_status="running",
+        needs_human_reason=diagnostic_reason(
+            "closing-reference-missing",
+            f"GitHub 未替 PR #{pr_number} 建立 mapped issue 的 closing reference。",
+            source="work_actions._ship_action:closing-reference-missing",
+            next_step_hint=hint,
+            run_id=canonical_run.run_id,
+            work_id=canonical_run.work_id,
+            repo=authority.repo,
+            pr=str(pr_number),
+            missing_issues=",".join(str(issue) for issue in missing_issues),
+            head=head,
+        ),
+    )
+    return {
+        "action": "needs_human",
+        "reason": "closing-reference-missing",
+        "next_actions": ["resume"],
+        "next_step_hint": hint,
+    }
+
+
 def _set_copilot_request_outcome_unknown(
     *,
     active: dict[str, Any],
@@ -3106,6 +3166,7 @@ def _ship_with_maintainer_review(
     state_path: Path,
     authority,
     canonical_run,
+    workflow_registry,
     binding: dict[str, Any],
     preflight: object,
     remote: object,
@@ -3138,6 +3199,18 @@ def _ship_with_maintainer_review(
         ),
     )
     if not remote_gate.allowed:
+        if remote_gate.reasons == ("closing-issue-missing",):
+            return _closing_reference_missing_response(
+                active=active,
+                state=state,
+                state_path=state_path,
+                authority=authority,
+                canonical_run=canonical_run,
+                workflow_registry=workflow_registry,
+                pr_number=binding["pr_number"],
+                head=preflight.head,
+                remote=remote,
+            )
         raise RuntimeError(f"merge authorization blocked: {', '.join(remote_gate.reasons)}")
     existing_authorization = ship.get("merge_authorization") if ship else None
     superseded_authorization = (
@@ -4172,7 +4245,25 @@ def _claim_action(
             if isinstance(reason_payload, dict)
             else None
         )
-        if "retry-review" in projected_actions and reason_code == "blocking-findings":
+        closing_context = (
+            reason_payload.get("context")
+            if isinstance(reason_payload, dict)
+            and isinstance(reason_payload.get("context"), dict)
+            else {}
+        )
+        closing_pr = closing_context.get("pr")
+        if (
+            reason_code == "closing-reference-missing"
+            and authority is not None
+            and isinstance(closing_pr, str)
+            and re.fullmatch(r"[1-9][0-9]*", closing_pr)
+        ):
+            response["next_step_hint"] = _closing_reference_missing_next_step_hint(
+                work_id=canonical_run.work_id,
+                repo=authority.repo,
+                pr_number=int(closing_pr),
+            )
+        elif "retry-review" in projected_actions and reason_code == "blocking-findings":
             response["next_step_hint"] = blocking_findings_next_step_hint(
                 work_id=canonical_run.work_id,
                 repo=canonical_run.repo,
@@ -5099,6 +5190,8 @@ def _phase_recovery_actions(
         return ()
 
     actions: list[str] = []
+    if reason_code == "closing-reference-missing":
+        actions.append("resume")
     if reason_code == "quota-admission-insufficient":
         try:
             from . import manager as workflow_manager, quota_admission
@@ -9866,6 +9959,7 @@ def _ship_action(
             state_path=state_path,
             authority=authority,
             canonical_run=canonical_run,
+            workflow_registry=workflow_registry,
             binding=binding,
             preflight=preflight,
             remote=remote,
@@ -10316,6 +10410,18 @@ def _ship_action(
         ),
     )
     if not remote_gate.allowed:
+        if remote_gate.reasons == ("closing-issue-missing",):
+            return _closing_reference_missing_response(
+                active=active,
+                state=state,
+                state_path=state_path,
+                authority=authority,
+                canonical_run=canonical_run,
+                workflow_registry=workflow_registry,
+                pr_number=pr_number,
+                head=preflight.head,
+                remote=remote,
+            )
         raise RuntimeError(f"merge authorization blocked: {', '.join(remote_gate.reasons)}")
     authorization = _authorization_record(
         _merge_authorization_body(

@@ -107,6 +107,7 @@
 ### Fixed
 
 - **#1215 builder 刪除 seed 的 pinned 輸入**：commit-required builder 的 contract 說明 seed 進工作區的 untracked pinned 輸入不得刪除；build phase terminalization 失敗且 `retry-build` 可受理時，next_actions 會列出 `retry-build`（#1215）。
+- **#1220 closing reference 缺席的出口**：merge 授權只剩 `closing-issue-missing` 時記錄結構化 needs_human `closing-reference-missing` 並投影 `resume`／場外合入提示，不再變成 `resume-workflow-failed`（#1220）。
 - **#1210 direct 模式 Claude reviewer 的 Bash allow**：reviewer settings 補 `permissions.allow: ["Bash"]`，dontAsk 下複合命令不再被拒；沙箱與憑證讀取拒絕不變。
 - **#1206 verification／review 明示停止的 retry-build 出口**：claim、status 與 Monitor 投影依正式入口共用 admission 判斷列出 exact-Candidate `retry-build`，並提供可直接執行的 CAS 指令提示；保留 pre-delivery 的 `abandon` 出口（#1206）。
 - **#1197 quota 候選觀測狀態**：准入 receipt 依候選綁定的 pool/window 判定觀測狀態，避免未觀測的其他額度池把已知候選投影成 unknown。
