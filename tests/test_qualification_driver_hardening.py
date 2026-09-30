@@ -895,10 +895,38 @@ def test_codex_preflight_retries_a_timed_out_status_probe_once(
 
     monkeypatch.setattr(driver, "_codex_app_server_exchange", flaky)
     assert driver._provider_preflight("codex", "cortex-builder")["status"] == "ready"
-    assert attempts == [90, 90]
+    assert attempts == [60, 60]
 
 
-def test_codex_preflight_fails_after_a_second_timeout(
+def test_codex_preflight_recovers_on_the_third_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#716：canary 兩度在 account/read 連續逾時兩次，重跑即過——第三次 process 要能接住。"""
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(
+            driver, argv, stdout=f"codex-cli {TOOL_VERSIONS['codex']}\n"
+        ),
+    )
+    attempts: list[int] = []
+
+    def twice_stuck(_command, **kwargs):
+        attempts.append(kwargs["timeout"])
+        if len(attempts) < 3:
+            raise driver.QualificationFailure(
+                "Codex app-server status probe timed out waiting for account/read"
+            )
+        return _codex_ready_responses()
+
+    monkeypatch.setattr(driver, "_codex_app_server_exchange", twice_stuck)
+    assert driver._provider_preflight("codex", "cortex-builder")["status"] == "ready"
+    assert attempts == [60, 60, 60]
+
+
+def test_codex_preflight_fails_after_the_last_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     driver = _load_driver()
@@ -921,7 +949,7 @@ def test_codex_preflight_fails_after_a_second_timeout(
     monkeypatch.setattr(driver, "_codex_app_server_exchange", always_timeout)
     with pytest.raises(driver.QualificationFailure, match="timed out waiting for account/read"):
         driver._provider_preflight("codex", "cortex-builder")
-    assert len(attempts) == 2
+    assert len(attempts) == 3
 
 
 def test_codex_preflight_does_not_retry_a_definitive_answer(
