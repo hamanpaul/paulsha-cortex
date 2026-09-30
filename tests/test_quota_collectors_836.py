@@ -646,7 +646,7 @@ def test_copilot_reports_precise_unknown_gap_without_guessing():
 @pytest.mark.parametrize(
     "executor,expected_reason",
     [
-        ("claude", "no-documented-machine-readable-quota-remaining-interface"),
+        ("claude", "passive-job-log-source"),
         ("cg", "no-verified-quota-read-contract"),
     ],
 )

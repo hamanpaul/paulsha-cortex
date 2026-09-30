@@ -610,7 +610,7 @@ def test_ac2_provider_missing_stale_corrupt_and_invalid_values_remain_unknown(tm
         targets=(target,), descriptors=(descriptor,), unit_catalog=(), observed_at_ms=_NOW,
     )
     assert unsupported.observations[0].to_dict()["measurement"]["quantity"]["state"] == "unknown"
-    assert "no-documented-machine-readable-quota-remaining-interface" in {
+    assert "unsupported-provider-window" in {
         gap.reason for gap in unsupported.gaps
     }
 
@@ -980,7 +980,7 @@ def test_ac6_provider_read_interfaces_and_shadow_fixture_do_not_touch_dispatch_o
     )
     assert sources.provider_read_contract("codex")["method"] == "account/rateLimits/read"
     assert sources.provider_read_contract("copilot")["method"] == "account.getQuota"
-    assert sources.provider_read_contract("claude")["state"] == "unsupported"
+    assert sources.provider_read_contract("claude")["state"] == "supported"
     assert sources.provider_read_contract("cg")["state"] == "unknown"
 
     positive = json.loads(

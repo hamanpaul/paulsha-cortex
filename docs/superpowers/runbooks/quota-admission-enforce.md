@@ -27,7 +27,18 @@ Manager 從 user unit 載入 $HOME/.agents/core/runtime/<instance>-manager.env�
 
 以 executor 和 model_id 綁定，不要複製某張卡解析出的 resolved profile key；該 key 可能隨卡片的 launch contract 或 requirements 改變。若同時有精確 profile binding，精確 binding 優先並覆寫 identity binding 的 pool/window 集合。（出處：paulsha_cortex/coordinator/quota_observation.py:_parse_binding_subject、paulsha_cortex/coordinator/quota_admission.py:_resolve_binding_coverage）
 
-enforce 下，已綁 pool 的候選必須有 fresh observation，且所有綁定 pool/window 都要足額。沒有可用 collector、collector 回報 gap，或 observation 過期時，候選會是 unknown-remaining-quota 並被排除。可以先在 shadow 模式觀察這類 provider；若刻意不替該 identity 綁 pool，它會是 unmanaged，照既有派工規則放行，也就不受 quota admission 保護。（出處：paulsha_cortex/coordinator/quota_admission.py:assess_candidate_quota、paulsha_cortex/coordinator/quota_sources.py:provider_read_contract）
+額度來源依 provider 各自的唯讀契約運作：
+
+| Executor | 來源與單位語意 | 更新時機 |
+| --- | --- | --- |
+| codex | app-server `account/rateLimits/read`；剩餘百分比 | operator 排程 `cortex quota observe` |
+| agy | `agy -p /usage --output-format json`；剩餘比例 | operator 排程 `cortex quota observe` |
+| copilot | SDK `account.getQuota`；requests 原生計數 | operator 排程 `cortex quota observe` |
+| claude | 終局 Claude job 的 stream-json `rate_limit_event.unifiedWindows`；剩餘百分比 = `(1 - utilization) × 100` | periodic reconcile 收割已終局 job log；沒有 Claude job 執行時不會更新 |
+
+Claude 使用的 pool unit `semantics_ref` 必須是 `provider:anthropic-claude-code/rate-limit-percent/v1`，window id 使用 `five_hour`／`seven_day`，subject 綁定該 Claude `executor` 與 `model_id`。只有 `unifiedWindows` 內明確提供的 `utilization` 與 `resetsAt` 會形成 known observation；缺欄、型別錯誤、未支援 window 或讀不到 log 都形成 unknown／coverage gap。Claude 觀測的 TTL 使用 `quota-pools.json` 的 `lease_ms`（未設定時 900000 ms）；同一終局 job 重複 reconcile 不延長觀測期限，過期後 admission 回到 unknown。它是被動來源，不會在候選選擇時另外啟動 Claude CLI。（出處：`provider_read_contract("claude")`、`manager.harvest_quota_terminal_usage()`）
+
+enforce 下，已綁 pool 的候選必須有 fresh observation，且所有綁定 pool/window 都要足額。沒有可用來源、來源回報 gap，或 observation 過期時，候選會是 unknown-remaining-quota 並被排除。Claude 需先有已終局 job 供 periodic reconcile 收割；如要求在沒有近期 job 時仍持續有 fresh quota，應安排有界的 Claude job 並評估其執行成本。若刻意不替該 identity 綁 pool，它會是 unmanaged，照既有派工規則放行，也就不受 quota admission 保護。（出處：paulsha_cortex/coordinator/quota_admission.py:assess_candidate_quota、paulsha_cortex/coordinator/quota_sources.py:provider_read_contract）
 
 用目前 quota-pools 設定檢查曾出現在 admission receipts、但沒有任何 binding 涵蓋的 resolved profile：
 

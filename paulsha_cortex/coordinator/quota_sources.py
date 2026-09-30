@@ -22,6 +22,7 @@ _RESOURCE_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 CODEX_UNIT_SEMANTICS = "provider:openai-codex-app-server/rate-limit-percent/v2"
 COPILOT_UNIT_SEMANTICS = "provider:github-copilot-sdk/requests/v1"
 AGY_UNIT_SEMANTICS = "provider:google-antigravity-cli/quota-fraction/v1"
+CLAUDE_UNIT_SEMANTICS = "provider:anthropic-claude-code/rate-limit-percent/v1"
 _TIME_MAX_MS = 253402300799999
 _DURATION_MAX_MS = 31622400000
 
@@ -75,8 +76,11 @@ def provider_read_contract(executor: str) -> dict[str, object]:
             "unit_semantics_ref": AGY_UNIT_SEMANTICS,
         },
         "claude": {
-            "state": "unsupported",
-            "reason": "no-documented-machine-readable-quota-remaining-interface",
+            "state": "supported",
+            "method": "structured_event",
+            "source_schema": "anthropic-claude-code-stream-json-rate-limit-event-v1",
+            "authority_ref": "https://docs.anthropic.com/en/docs/claude-code/headless",
+            "unit_semantics_ref": CLAUDE_UNIT_SEMANTICS,
         },
         "cg": {"state": "unknown", "reason": "no-verified-quota-read-contract"},
     }
@@ -88,6 +92,7 @@ def capture_provider_quota(
     payload: object,
     *,
     profile_key: str,
+    model_id: str | None = None,
     targets: tuple[ProviderQuotaTarget, ...],
     descriptors: tuple[schema.PoolDescriptor, ...],
     unit_catalog: tuple[schema.UnitDefinition, ...],
@@ -112,6 +117,8 @@ def capture_provider_quota(
         indexed = _validate_targets(
             targets,
             profile_key=profile_key,
+            executor=executor,
+            model_id=model_id,
             descriptors=descriptors,
             unit_catalog=unit_catalog,
         )
@@ -124,7 +131,8 @@ def capture_provider_quota(
     if contract.get("state") != "supported":
         reason = str(contract.get("reason", "provider-interface-unsupported"))
         return _unknown_capture(
-            executor, targets, profile_key, observed_at_ms, ttl_ms, reason, descriptors, unit_catalog
+            executor, targets, profile_key, observed_at_ms, ttl_ms, reason, descriptors, unit_catalog,
+            model_id=model_id,
         )
 
     try:
@@ -166,7 +174,7 @@ def capture_provider_quota(
     return ProviderCapture(executor, tuple(observations), tuple(gaps))
 
 
-def _validate_targets(targets, *, profile_key, descriptors, unit_catalog):
+def _validate_targets(targets, *, profile_key, descriptors, unit_catalog, executor=None, model_id=None):
     if type(targets) is not tuple or len(targets) > 64:
         raise ValueError("invalid targets")
     if type(descriptors) is not tuple or type(unit_catalog) is not tuple:
@@ -188,7 +196,9 @@ def _validate_targets(targets, *, profile_key, descriptors, unit_catalog):
             raise ValueError("descriptor is not in the supplied context")
         status = schema.binding_status(target.binding)
         binding = target.binding.to_dict()
-        if status.get("state") != "complete" or not _binding_has_profile(binding, profile_key):
+        if status.get("state") != "complete" or not _binding_has_profile(
+            binding, profile_key, executor=executor, model_id=model_id
+        ):
             raise ValueError("binding does not cover this profile")
         pool_ref = descriptor.pool_ref
         constraints = binding.get("constraints", [])
@@ -218,19 +228,19 @@ def _validate_targets(targets, *, profile_key, descriptors, unit_catalog):
     return result
 
 
-def _binding_has_profile(binding: dict[str, Any], profile_key: str) -> bool:
-    """刻意**不**支援 #1116 新增的 ``identity`` subject kind。
+def _binding_has_profile(
+    binding: dict[str, Any], profile_key: str, *, executor: str | None = None,
+    model_id: str | None = None,
+) -> bool:
+    """重放固定 target 的 subject 判定；identity 必須精確比對 executor/model。
 
     這裡的 ``profile_key`` 一定是某個 collector target（見
     `quota_collectors._find_binding`）在**設定載入當下**已經精確比對過一次
     的 resolved key——`target.binding` 是那次比對留下的固定物件，本函式在
     `_validate_targets()` 只是重放同一份判定（收到的 payload／targets 沒變、
-    profile_key 沒變），不是重新搜尋『這個候選現在有沒有 binding』。identity
-    比對需要 executor＋model_id，而 `ProviderQuotaTarget` 本身不帶 model_id
-    （collector_targets 設定檔目前也沒有這個欄位）；替 collector_targets
-    另開一個 model_id 欄位是獨立的設定檔 schema 擴充，不是這次重放判定的
-    自然延伸，因此本函式維持只認 resolved profile key 精確綁定
-    （``profile``／``group`` 兩種 kind）。"""
+    profile_key 沒變），不是重新搜尋『這個候選現在有沒有 binding』。一般
+    collector target 仍只帶 profile/group subject；終局 Claude job harvest 另帶
+    model_id，才可在此驗證 quota-pools identity subject。"""
     subject = binding.get("subject")
     if not isinstance(subject, dict):
         return False
@@ -245,6 +255,11 @@ def _binding_has_profile(binding: dict[str, Any], profile_key: str) -> bool:
             return False
         return any(isinstance(item, dict) and item.get("key") == profile_key
                    for item in members.get("value", []))
+    if subject.get("kind") == "identity":
+        return bool(
+            isinstance(executor, str) and isinstance(model_id, str)
+            and subject.get("executor") == executor and subject.get("model_id") == model_id
+        )
     return False
 
 
@@ -257,7 +272,54 @@ def _parse_provider_payload(executor: str, payload: object, targets):
         return _parse_copilot(payload, targets)
     if executor == "agy":
         return _parse_agy(payload, targets)
+    if executor == "claude":
+        return _parse_claude(payload, targets)
     return {}
+
+
+def _parse_claude(payload: dict[str, Any], targets):
+    """解析 Claude Code stream-json 的最後一筆 rate_limit_event。"""
+    events = payload.get("rate_limit_events")
+    if events is None:
+        events = (payload,) if payload.get("type") == "rate_limit_event" else ()
+    if not isinstance(events, (list, tuple)):
+        events = ()
+    event = next((row for row in reversed(events)
+                  if isinstance(row, dict) and row.get("type") == "rate_limit_event"), None)
+    info = event.get("rate_limit_info") if isinstance(event, dict) else None
+    windows = info.get("unifiedWindows") if isinstance(info, dict) else None
+    result: dict[str, tuple[str | None, int | None, str | None]] = {}
+    for target in targets:
+        key = target.resource_key
+        if target.window_id not in {"five_hour", "seven_day"}:
+            result[key] = (None, None, "unsupported-provider-window")
+            continue
+        window = windows.get(target.window_id) if isinstance(windows, dict) else None
+        if not isinstance(window, dict):
+            result[key] = (None, None, "provider-window-absent" if isinstance(windows, dict)
+                           else "provider-value-missing")
+            continue
+        utilization = window.get("utilization")
+        reset_seconds = window.get("resetsAt")
+        if (isinstance(utilization, bool) or not isinstance(utilization, (int, float, Decimal))
+                or isinstance(reset_seconds, bool) or type(reset_seconds) is not int
+                or reset_seconds < 0 or reset_seconds * 1000 > _TIME_MAX_MS):
+            result[key] = (None, None, "invalid-provider-value")
+            continue
+        try:
+            used = Decimal(str(utilization))
+        except InvalidOperation:
+            result[key] = (None, None, "invalid-provider-value")
+            continue
+        if not used.is_finite() or used < 0 or used > 1:
+            result[key] = (None, None, "invalid-provider-value")
+            continue
+        if _target_semantics(target) != CLAUDE_UNIT_SEMANTICS:
+            result[key] = (None, None, "provider-unit-mapping-mismatch")
+            continue
+        remaining_percent = (Decimal(1) - used) * Decimal(100)
+        result[key] = (_decimal_wire(remaining_percent), reset_seconds * 1000, None)
+    return result
 
 
 def _codex_merged_field(
@@ -508,12 +570,14 @@ def _target_semantics(target: ProviderQuotaTarget) -> str | None:
     return unit.semantics_ref if unit is not None else None
 
 
-def _unknown_capture(executor, targets, profile_key, observed_at_ms, ttl_ms, reason, descriptors, unit_catalog):
+def _unknown_capture(executor, targets, profile_key, observed_at_ms, ttl_ms, reason, descriptors,
+                     unit_catalog, *, model_id=None):
     observations: list[schema.QuotaObservation] = []
     gaps: list[CoverageGap] = []
     try:
-        indexed = _validate_targets(targets, profile_key=profile_key,
-                                    descriptors=descriptors, unit_catalog=unit_catalog)
+        indexed = _validate_targets(targets, profile_key=profile_key, executor=executor,
+                                    model_id=model_id, descriptors=descriptors,
+                                    unit_catalog=unit_catalog)
     except (TypeError, ValueError, schema.QuotaContractError):
         return ProviderCapture(executor, (), tuple(CoverageGap(t.resource_key, "invalid-target-mapping") for t in targets))
     for target in targets:
@@ -564,6 +628,7 @@ def _observation(*, executor, resource_key, profile_key, target, target_info, am
         "codex": "openai-codex-app-server",
         "copilot": "github-copilot-sdk",
         "agy": "google-antigravity-cli",
+        "claude": "anthropic-claude-code",
     }.get(executor, "cortex-unknown-provider")
     source_schema = str(contract.get("source_schema", "cortex-provider-quota-unknown-v1"))
     authority_ref = str(contract.get("authority_ref", "cortex:provider-read-contract/v1"))
@@ -599,7 +664,7 @@ def _observation(*, executor, resource_key, profile_key, target, target_info, am
             "source_schema": source_schema,
             "adapter_version": "cortex-quota-adapter-836-v1",
             "authority_ref": authority_ref,
-            "method": "provider_status",
+            "method": "structured_event" if executor == "claude" else "provider_status",
             "provenance_refs": [authority_ref],
             "event_identity": {"state": "unknown", "reason": "source-event-id-unavailable"},
         },
