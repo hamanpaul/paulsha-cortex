@@ -3945,3 +3945,73 @@ def test_dispatch_closeout_accepts_a_red_ledger_before_the_final_build(
 
     _markers, _rows, workflow, _probe = _validate_fixture_closeout(driver, fixture)
     assert workflow["run_id"] == fixture["run_id"]
+
+
+def _reviewer_job_on_subject(
+    fixture, *, source_job_id: str, job_id: str | None, subject: str
+) -> None:
+    """讓 reviewer job 綁到指定 subject：`job_id` 給值時複製一份插在原 job 之前
+    （archive 前那一輪），否則就地改寫原 job 的 subject 與 evidence。"""
+
+    coordinator = fixture["coordinator"]
+    registry = json.loads(fixture["registry"].read_text(encoding="utf-8"))
+    source = next(job for job in registry["jobs"] if job["job_id"] == source_job_id)
+    envelope = json.loads(
+        (coordinator / source["workflow_evidence"]["path"]).read_text(encoding="utf-8")
+    )
+    target_id = job_id or source_job_id
+    envelope["job"] = {**envelope["job"], "job_id": target_id}
+    envelope["payload"] = {**envelope["payload"], "candidate": subject}
+    if "reviewer_job_id" in envelope["payload"]:
+        envelope["payload"]["reviewer_job_id"] = target_id
+    evidence_rel = f"evidence/workflow/{target_id}.json"
+    evidence_hash = _write_json(coordinator / evidence_rel, envelope)
+    updated = {
+        **source,
+        "job_id": target_id,
+        "subject_head": subject,
+        "workflow_evidence": {**source["workflow_evidence"], "hash": evidence_hash, "path": evidence_rel},
+    }
+    index = registry["jobs"].index(source)
+    if job_id is None:
+        registry["jobs"][index] = updated
+    else:
+        registry["jobs"].insert(index, updated)
+    _write_json(fixture["registry"], registry)
+
+
+def test_dispatch_closeout_accepts_pre_archive_reviews_of_an_earlier_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：ship 的 archive commit 換掉 workflow candidate；archive 前的 verify／
+    review 驗的是舊 candidate，各自綁自己的 subject 即可。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    for phase in ("verify", "review"):
+        _reviewer_job_on_subject(
+            fixture, source_job_id=f"{phase}-job", job_id=f"{phase}-pre-archive",
+            subject="e" * 40,
+        )
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    _markers, _rows, workflow, _probe = _validate_fixture_closeout(driver, fixture)
+    assert workflow["run_id"] == fixture["run_id"]
+
+
+def test_dispatch_closeout_requires_the_final_candidate_to_be_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    _reviewer_job_on_subject(
+        fixture, source_job_id="verify-job", job_id=None, subject="e" * 40,
+    )
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    with pytest.raises(
+        driver.QualificationFailure,
+        match="final workflow candidate was not verified and reviewed: observed=review",
+    ):
+        _validate_fixture_closeout(driver, fixture)
