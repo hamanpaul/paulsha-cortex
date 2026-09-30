@@ -857,10 +857,17 @@ def test_retry_build_recovers_unbound_builder_terminalization(
             state_path=tmp_path / "runs.json",
             workflow_registry=registry,
         )
+    # #1215：投影只在同一份 admission 會受理時宣告 retry-build。
+    assert "retry-build" not in work_actions._phase_recovery_actions(
+        registry.get_workflow_run(initial.run_id), registry
+    )
 
     successful_job = registry.create_job(**job_args)
     registry.update_headless_result(
         successful_job["job_id"], status="exited", exit_code=0
+    )
+    assert "retry-build" in work_actions._phase_recovery_actions(
+        registry.get_workflow_run(initial.run_id), registry
     )
     result = work_actions.execute_work_action(
         args=action_args,

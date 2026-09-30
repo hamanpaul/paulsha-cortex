@@ -5162,11 +5162,15 @@ def _phase_recovery_actions(
                         continue
                     if action not in actions:
                         actions.append(action)
+                # #1215：build phase 的 builder terminalization 失敗（exit 0 但 evidence
+                # 未綁定，例如採信時 input snapshot 驗不過）由 retry-build 的 build 分支
+                # 受理；宣告與否仍完全取決於同一份 admission。
                 if (
                     reason_code in {
                         "verification-terminal-explicit-stop",
                         "review-terminal-explicit-stop",
                     }
+                    or run.current_phase == "build"
                     or _main_sync_retry_context(run) is not None
                 ) and _retry_build_admission_error(
                     run,
