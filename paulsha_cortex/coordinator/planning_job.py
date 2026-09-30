@@ -484,6 +484,11 @@ class JobPlanningInvoker:
         # 的，而 reviewer 帳號的**另一種**工作區（foreign review 的 linked worktree）
         # 確實跨 owner——見 `registry.JOB_GIT_WORKSPACE_TRUST` 的 reviewer 那一列。
         workspace = str(Path(reservation.cwd).resolve())
+        # #716：Codex 憑證只在 executor 是 codex 時 seed／收回。canary run
+        # 36647138121 的 reviewer 不是 codex，部署也沒有 reviewer 的 Codex 憑證，
+        # 無條件 seed 讓派工在 provision 當下就以 `credential authority is
+        # unavailable` 停住。
+        codex_credential = plan.executor == "codex"
         spool_slot.provision_runtime_surfaces(
             principal="reviewer", job_id=reservation.job_id,
             canonical_codex_home=spool_slot.canonical_codex_controls(
@@ -495,6 +500,7 @@ class JobPlanningInvoker:
                     self._env, role=job_runner.JOB_ROLE_REVIEW
                 )) else None
             ),
+            seed_credential=codex_credential,
         )
         env = job_runner.build_job_env(
             manager_env=self._env,
@@ -601,9 +607,10 @@ class JobPlanningInvoker:
         # The per-job auth leaf is writable so Codex can perform an atomic
         # refresh. Harvest it only after the unit has stopped, then seed the
         # following job from this Manager-owned authority.
-        spool_slot.commit_runtime_credential(
-            principal="reviewer", job_id=reservation.job_id
-        )
+        if codex_credential:
+            spool_slot.commit_runtime_credential(
+                principal="reviewer", job_id=reservation.job_id
+            )
         if returncode != 0:
             client_tail = self._read_log(client_log)
             silent = not stdout.strip()

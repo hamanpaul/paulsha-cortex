@@ -240,6 +240,25 @@ def test_role_is_review_and_not_derivable_from_spec(tmp_path, monkeypatch) -> No
     assert spec["env"]["PSC_JOB_ID"] == spec["job_id"]
 
 
+def test_non_codex_planner_needs_no_codex_credential(tmp_path, monkeypatch) -> None:
+    """#716：只有 codex executor 才 seed／收回 reviewer 的 Codex 憑證。
+
+    canary run 36647138121：部署沒有 reviewer 的 Codex 憑證（reviewer 是 agy／
+    copilot），無條件 seed 讓 job 在 provision 當下就以
+    `credential authority is unavailable` 停住。
+    """
+
+    harness = _Harness(tmp_path, monkeypatch, log_payload='{"ok":true}')
+    agents = Path(os.environ["PSC_AGENTS_ROOT"])
+    (agents / "config/codex-credentials/reviewer/auth.json").unlink()
+    invoker = harness.invoker(monkeypatch)
+
+    invoker.run(_invocation())
+
+    assert len(harness.specs) == 1
+    assert not (agents / "config/codex-credentials/reviewer/auth.json").exists()
+
+
 def test_profile_comes_only_from_executor(tmp_path, monkeypatch) -> None:
     """剖面唯一輸入是 `identity.executor`；未登記 executor fail-closed。
 

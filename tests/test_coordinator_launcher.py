@@ -2244,6 +2244,72 @@ class ArgvTests(unittest.TestCase):
                     )
             self.assertIn("Copilot OAuth authority", str(raised.exception))
 
+    def test_codex_credential_is_seeded_only_for_the_codex_executor(self) -> None:
+        """#716：非 codex 的 job 不 seed Codex 憑證（canary run 36647138121）。
+
+        部署可以根本沒有該 principal 的 Codex 憑證（canary 的 reviewer 是 agy／copilot）；
+        無條件 seed 會讓派工在 provision 當下就以 `credential authority is unavailable`
+        停住。seed 與 `credential_publish` 同一個判準：executor 是 codex。
+        """
+        for executor, expected in (("copilot", False), ("agy", False), ("codex", True)):
+            with self.subTest(executor=executor), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                slice_id = "wf-" + ("s" * 40)
+                instance = launcher_module.job_runner.template_instance_id(slice_id)
+                plan = launcher_module.job_runner.SystemdTemplatePlan(
+                    binary="systemctl",
+                    template_unit="cortex-reviewer-job@.service",
+                    instance=instance,
+                    unit=f"cortex-reviewer-job@{instance}.service",
+                    account="cortex-reviewer-planner",
+                    group="cortex-reviewer-planner",
+                    shim="/usr/bin/psc-job-shim",
+                    spool_dir=str(root / "job-specs"),
+                    spec_path=str(root / "job-specs" / f"{instance}.json"),
+                    hardening_profile="strict",
+                    executor=executor,
+                    base_template_unit="cortex-reviewer-job@.service",
+                    role=launcher_module.job_runner.JOB_ROLE_REVIEW,
+                )
+                captured: dict[str, object] = {}
+
+                def stop_after_provision(**kwargs):
+                    captured.update(kwargs)
+                    raise RuntimeError("stop-after-provision")
+
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "PSC_JOB_RUNNER": launcher_module.job_runner.RUNNER_SYSTEMD_TEMPLATE,
+                        "PSC_AGENTS_ROOT": str(root),
+                    },
+                    clear=False,
+                ), mock.patch.object(
+                    launcher_module.job_runner, "prepare_systemd_template", return_value=plan
+                ), mock.patch.object(
+                    launcher_module.spool_slot, "system_account_exists", return_value=False
+                ), mock.patch.object(
+                    launcher_module.spool_slot,
+                    "canonical_codex_controls",
+                    return_value=str(root / "codex-controls" / "reviewer"),
+                ), mock.patch.object(
+                    launcher_module.spool_slot,
+                    "provision_runtime_surfaces",
+                    side_effect=stop_after_provision,
+                ), mock.patch.object(
+                    launcher_module.subprocess,
+                    "Popen",
+                    side_effect=AssertionError("systemctl start must not run"),
+                ):
+                    with self.assertRaises(RuntimeError):
+                        SubprocessLauncher(executor).launch(
+                            slice_id=slice_id,
+                            prompt="PROMPT",
+                            worktree=str(root),
+                            log_dir=str(root / "runtime" / "dispatch"),
+                        )
+                self.assertIs(captured.get("seed_credential"), expected)
+
     def test_launch_sentinel_is_absolute_cwd_independent(self) -> None:
         # bug：相對 log_dir + 子進程 cwd=worktree → sentinel 寫到 worktree（poller 找不到）。
         # 修：launch 把 log_dir resolve 成絕對 → script 內 sentinel 與回傳 log_path 皆絕對。
