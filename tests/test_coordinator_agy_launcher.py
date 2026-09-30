@@ -786,3 +786,40 @@ def test_agy_launcher_rejects_invalid_print_timeout_before_popen(
         )
 
     assert popen_calls == []
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        {"review_only": True, "review_terminal_kind": "workflow-verification-result"},
+        {},  # accept-edits builder
+        {"write_forbidden": True},
+    ],
+)
+def test_agy_in_trust_root_template_unit_auto_approves_commands(tmp_path, shape) -> None:
+    """#716：模板 unit 的 job 帳號沒有 operator 的 command allowlist。
+
+    canary run 36661289336：reviewer 的每個 command 都被 headless 自動拒絕，
+    agy 以空 response 結束（`jetski: no output produced — a tool required the
+    "command" permission …`）。外層 unit 是唯一邊界時放行；direct 模式不變。
+    """
+
+    worktree = tmp_path / "checkout"
+    kwargs = dict(
+        prompt="inspect", slice_id="demo", log_dir=str(tmp_path / "logs"),
+        worktree=str(worktree), **shape,
+    )
+    assert "--dangerously-skip-permissions" not in build_agy_argv(**kwargs)
+    template = build_agy_argv(**kwargs, trust_root_outer_unit=True)
+    assert template.count("--dangerously-skip-permissions") == 1
+    if shape.get("review_only") or shape.get("write_forbidden"):
+        # plan＋sandbox 形狀不變，只多了放行。
+        assert template[3:6] == ["--mode", "plan", "--sandbox"]
+
+
+def test_zero_tool_agy_planner_never_auto_approves_even_in_template_unit(tmp_path) -> None:
+    argv = build_agy_argv(
+        prompt="plan", slice_id="planning", log_dir=str(tmp_path / "logs"),
+        worktree=str(tmp_path / "wt"), read_only=True, trust_root_outer_unit=True,
+    )
+    assert "--dangerously-skip-permissions" not in argv

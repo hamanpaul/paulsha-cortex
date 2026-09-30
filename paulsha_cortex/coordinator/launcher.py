@@ -1480,6 +1480,8 @@ def build_agy_argv(
     # rejects ``--json-schema`` there and the probe parser reads raw JSON.
     json_envelope: bool = True,
     print_timeout: str | None = None,
+    # #716：已通過 preflight 的 Trust Root 模板 unit（外層加固面是唯一邊界）。
+    trust_root_outer_unit: bool = False,
 ) -> list[str]:
     """Build the headless Antigravity invocation for each launcher persona.
 
@@ -1542,6 +1544,17 @@ def build_agy_argv(
                 argv += ["--add-dir", git_write_dir]
         if allow_unsafe:
             argv.append("--dangerously-skip-permissions")
+    # #716：headless agy 只能靠 settings.json 的 `permissions.allow` 放行 command；
+    # 沒有 allowlist 時每個 command 都被自動拒絕，reviewer 以空 response 結束
+    # （canary run 36661289336：`jetski: no output produced — a tool required the
+    # "command" permission that headless mode cannot prompt for`）。Trust Root 模板
+    # unit 的 job 帳號沒有 operator 的 allowlist，而且外層 unit（ProtectSystem=strict、
+    # 僅列舉的 ReadWritePaths、出口管制）是唯一邊界——與 codex 的
+    # `danger-full-access`、claude reviewer 的 Bash allow（#748）同一個處置。
+    # 零工具的 planner（read_only）不需要、也不放行；direct 模式維持原形狀，沿用
+    # operator 自己的 allowlist。
+    if trust_root_outer_unit and not read_only and "--dangerously-skip-permissions" not in argv:
+        argv.append("--dangerously-skip-permissions")
     # Antigravity's default text output pretty-prints structured responses over
     # multiple lines.  Workflow terminal evidence is JSONL, so ask the CLI for
     # its single-line JSON envelope and let Manager unwrap the ``response``.
@@ -2331,6 +2344,10 @@ class SubprocessLauncher:
         # 程式碼登記的新 runtime 不會因為不在固定名單裡而靜默丟掉 commit 契約。
         if adapter.accepts("commit_required"):
             builder_kwargs["commit_required"] = self._commit_required
+        if self._executor == "agy":
+            # #716：模板 unit 內的 agy 沒有 operator 的 command allowlist，headless 下
+            # 每個 command 都被拒；外層 unit 是唯一邊界時放行（見 `build_agy_argv`）。
+            builder_kwargs["trust_root_outer_unit"] = template_plan is not None
         if self._executor == "codex":
             # Codex 0.157 在 Trust Root 加固 unit 內無法使用 bwrap，也無法使用
             # legacy Landlock（需要 bubblewrap 隔離 app-server sockets）。只在已通過
