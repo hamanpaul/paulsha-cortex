@@ -100,6 +100,7 @@
 
 ### Fixed
 
+- **#1210 direct 模式 Claude reviewer 的 Bash allow**：reviewer settings 補 `permissions.allow: ["Bash"]`，dontAsk 下複合命令不再被拒；沙箱與憑證讀取拒絕不變。
 - **#1206 verification／review 明示停止的 retry-build 出口**：claim、status 與 Monitor 投影依正式入口共用 admission 判斷列出 exact-Candidate `retry-build`，並提供可直接執行的 CAS 指令提示；保留 pre-delivery 的 `abandon` 出口（#1206）。
 - **#1197 quota 候選觀測狀態**：准入 receipt 依候選綁定的 pool/window 判定觀測狀態，避免未觀測的其他額度池把已知候選投影成 unknown。
 - **#1196 quota dispatch demand 的比例單位門檻**：agy 的 0–1 比例單位改以 0.01（1%）為門檻，其餘單位維持 1 個原生單位；receipt demand 版本升為 `dispatch-unit:v2`。
