@@ -13,6 +13,7 @@
 - **#716 canary 結案診斷**：派工結案驗證失敗時列出不成立的條件（phase／status／gate／needs_human 代碼／缺少 phase／未過步驟），不輸出自由文字（#716）。
 - **#716 Codex 憑證目錄 owner**：scaffold 先以 Manager 身分建立 `codex-credentials/<principal>/`（0700）再寫入 `auth.json`，Manager 收回 refresh 過的憑證不再 EACCES（#716）。
 - **#716 codex code-mode host**：codex 改以 npm 平台套件的整個 `bin/` 目錄做 tree 安裝，`codex-code-mode-host` 與本體同目錄；installer 對原生進入點的 tree 產生直接 exec 的 wrapper（#716）。
+- **#716 canary 診斷帶 workflow job log 尾端**：派工失敗時另印最近 3 顆 workflow job 的 log 尾端（有界、遮蔽 credential 形狀）（#716）。
 - **#716 非 codex job 不 seed Codex 憑證**：launcher 與 planning job 只在 executor 是 codex 時 seed／收回 Codex 憑證，部署沒有 reviewer Codex 憑證時 agy／copilot reviewer 不再於 provision 時停住（#716）。
 - **#716 gate job 226/NAMESPACE**：gate 模板 unit 以 `StateDirectory=` 由 systemd 預建 `<gate-worktree>/%i`，gate 快照改為就地清空再複製（#716）。
 - **#716 canary job 診斷改以 journal glob 查詢**：結束的模板 instance 不在 unit 清單上，改以 `journalctl -u <glob>` 查三類 job unit，每段各自截尾（#716）。
