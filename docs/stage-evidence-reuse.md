@@ -63,7 +63,7 @@ receipt 只是 provenance，不是 admission authority。每次 gate 都照常�
 正常流程中，resume 在同一次呼叫內 poll 到 job 結束後就直接採信，receipt 維持派工時寫的 `fresh`。要看到 `reused`，必須有一個後來的決策點遇上「job 已經是 `exited`／0，gate 仍是 pending」。例如：
 
 - job 在 workflow resume 之前就被其他路徑 finalize，像是 `run_tick` 的 in-flight poll：periodic tick 的後半段或手動 `cortex tick`；
-- job 結束後、採信前 Manager crash 或重啟；
+- job 結束且已被 finalize 成 `exited` 之後、採信之前 Manager crash 或重啟。job 行程結束但 registry 仍是 `dispatched`／`running` 時重啟，重啟後的 resume 會在同一次呼叫內 poll、finalize、採信，receipt 仍是 `fresh`（2026-09-30 live 實測）。要在 live 重現，可在 job 結束後、下一次 tick 之前執行 `cortex run complete`，先讓 job 收割成 `exited`；
 - 採信暫時失敗（例如 rate limit），之後再接續。
 
 ## 呈現

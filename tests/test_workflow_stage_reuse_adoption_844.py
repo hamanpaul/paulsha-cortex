@@ -744,6 +744,39 @@ class TestS04ExecutionSemantics:
         assert cheap == pricey
         assert key(effort="low") != cheap
 
+    def test_loadout_version_change_alone_changes_stage_key(self, tmp_path) -> None:
+        """#844 S04：loadout 的 id 由 persona 決定，唯一能單獨變動的是版本；
+        只改 loadout 版本也必須換 stage key，其餘條件相同時 key 穩定。"""
+
+        registry, run, _candidate = base._build_verify_run(tmp_path)
+        step = manager._current_workflow_step(run)
+        identity = _codex_reviewer_identities().require("codex", "reviewer-844")
+
+        def key(loadout_version: str) -> str:
+            binding = execution_adapters.resolve_profile(
+                identity,
+                "reviewer",
+                effort="high",
+                launch_contract={"loadout_version": loadout_version},
+            )
+            assert binding.resolved.conditions["loadout"]["value"] == {
+                "id": "reviewer",
+                "version": loadout_version,
+            }
+            context = manager._workflow_stage_execution_context(
+                run=run,
+                step=step,
+                identity=identity,
+                profile_binding=binding,
+                builder_job_id="builder-job",
+                manager_gate_ledger=None,
+                operator_adjudications=None,
+            )
+            return context["key"]
+
+        assert key("1") == key("1")
+        assert key("2") != key("1")
+
 
 # ===========================================================================
 # S05：偽造與損壞的來源各自拒絕，失敗不留 reused receipt
