@@ -4733,6 +4733,7 @@ def _validate_dispatch_closeout(
     verdict_seen = False
     ledgers_seen = 0
     final_build_gate_status: dict[str, str] | None = None
+    final_candidate_phases: set[str] = set()
     # #1096：foreign-review 這個 delivery gate 唯一可信的綁定來源，就是本迴圈稍後
     # 對 review job 已獨立驗過 run_id／repo／candidate／reviewer_job_id 的那份
     # workflow canonical evidence；記住它的 path＋hash，讓 gate_refs 段落能要求
@@ -4770,14 +4771,18 @@ def _validate_dispatch_closeout(
                 "workflow canonical evidence payload is malformed"
             )
         payload_candidate = payload.get("candidate")
-        expected_evidence_candidate = (
-            job.get("subject_head") if phase in {"build", "ship"} else candidate
-        )
+        # #716：每張卡的 evidence 綁它自己的 subject（reviewer job 在派出時記下當時的
+        # candidate）。ship 的 archive commit 會換掉 workflow candidate，archive 前的
+        # verify／review 驗的是舊 candidate——它們各自正確，不能拿最終 candidate 比。
+        # 最終 candidate 有沒有被驗證與 review，由迴圈後的檢查負責。
+        expected_evidence_candidate = job.get("subject_head")
         if phase in {"build", "verify", "review", "ship"} and (
             SHA40.fullmatch(str(expected_evidence_candidate)) is None
             or payload_candidate != expected_evidence_candidate
         ):
             raise QualificationFailure("workflow evidence candidate mismatch")
+        if phase in {"verify", "review"} and expected_evidence_candidate == candidate:
+            final_candidate_phases.add(phase)
         if phase == "review":
             if (
                 payload.get("state") != "passed"
@@ -4877,6 +4882,11 @@ def _validate_dispatch_closeout(
         raise QualificationFailure(
             "workflow gate ledger is missing an expected passed gate: "
             + ", ".join(missing_or_failed)
+        )
+    if not {"verify", "review"} <= final_candidate_phases:
+        raise QualificationFailure(
+            "final workflow candidate was not verified and reviewed: observed="
+            + (",".join(sorted(final_candidate_phases)) or "none")
         )
     if not verdict_seen or ledgers_seen == 0:
         raise QualificationFailure("workflow verdict or Manager gate ledger is absent")
