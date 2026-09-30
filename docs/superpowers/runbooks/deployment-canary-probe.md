@@ -168,6 +168,14 @@ dry-run 通過後，`qualification/driver.py` 依序：
 會帶出 `cortex work show --json` 的 `blocking_reason`（例如 Copilot review 沒有送達時的
 review gate 原因）。
 
+唯一的例外是 Copilot findings（`delivery-needs-human`、`delivery_reason=copilot-findings`）：
+即使 Copilot 總評是 Approval recommended，只要有一條（哪怕 optional）finding，ship 就會停住。
+driver 會走 operator 的正式出口 `cortex run work retry-build --expected-candidate <candidate>`
+（#1139／#1206），把 findings 交給 builder 修正，最多
+`DEPLOYMENT_CANARY_COPILOT_FIX_ROUNDS`（2）回合，每回合在 log 印出
+`copilot findings fix round N dispatched`。超過上限，或是其他 needs_human 原因，仍照上述
+方式失敗。
+
 ## 5. reference image 與部署 venv 提供的釘版本工具
 
 單一真相是 `qualification/contract.py`，workflow、Dockerfile 與 driver 由它導出或以測試

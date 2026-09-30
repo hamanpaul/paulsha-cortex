@@ -3792,3 +3792,75 @@ def test_job_diagnostics_never_mask_the_dispatch_failure(
     monkeypatch.setattr(driver, "_job_unit_diagnostics", broken)
     driver._report_job_unit_diagnostics({})
     assert "job diagnostics unavailable: RuntimeError" in capsys.readouterr().err
+
+
+def _copilot_findings_stop(work_id: str, *, candidate: str = "c" * 40) -> dict[str, object]:
+    envelope = _work_show_envelope(work_id, state="on-going", facets=("needs_human",))
+    envelope["blocking_reason"] = {
+        "reason": "delivery-needs-human",
+        "detail": "ship validator 判定交付需要人工介入：copilot-findings",
+        "context": {"delivery_reason": "copilot-findings", "candidate": candidate},
+    }
+    return envelope
+
+
+def _retry_build_calls(calls):
+    return [argv for argv in calls if "retry-build" in argv]
+
+
+def test_full_dispatch_hands_copilot_findings_to_the_builder_then_closes_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：Copilot 即使建議核可，只要有一條 optional finding，ship 就停住；canary
+    改走 operator 的正式出口（retry-build）交給 builder 修，而不是直接判失敗。"""
+
+    driver = _load_driver()
+    ongoing = _work_show_envelope("qualification-work", state="on-going")
+    finished = _work_show_envelope("qualification-work", state="on-going", run_status="done")
+    calls, closeouts = _full_dispatch_fixture(
+        driver, tmp_path, monkeypatch,
+        [ongoing, _copilot_findings_stop("qualification-work"), ongoing, finished],
+    )
+
+    driver._full_dispatch(
+        repository="owner/repo", work_id="qualification-work", issue=42,
+        release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
+    )
+
+    retries = _retry_build_calls(calls)
+    assert len(retries) == 1
+    argv = retries[0]
+    assert argv[argv.index("--expected-candidate") + 1] == "c" * 40
+    assert argv[argv.index("--repo") + 1] == "owner/repo"
+    assert closeouts == [finished["item"]]
+
+
+def test_full_dispatch_gives_up_after_the_copilot_fix_round_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    stop = _copilot_findings_stop("qualification-work")
+    calls, _closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [stop])
+
+    with pytest.raises(driver.QualificationFailure, match="copilot-findings"):
+        driver._full_dispatch(
+            repository="owner/repo", work_id="qualification-work", issue=42,
+            release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
+        )
+    assert len(_retry_build_calls(calls)) == driver.DEPLOYMENT_CANARY_COPILOT_FIX_ROUNDS
+
+
+def test_full_dispatch_does_not_retry_other_needs_human_reasons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    stop = _copilot_findings_stop("qualification-work")
+    stop["blocking_reason"]["context"]["delivery_reason"] = "candidate-behind-main"
+    calls, _closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [stop])
+
+    with pytest.raises(driver.QualificationFailure, match="failed/needs_human terminal"):
+        driver._full_dispatch(
+            repository="owner/repo", work_id="qualification-work", issue=42,
+            release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
+        )
+    assert _retry_build_calls(calls) == []

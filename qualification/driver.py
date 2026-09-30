@@ -5184,6 +5184,31 @@ def _validate_canary_dispatch_model_identities(
         ) from exc
 
 
+#: canary 碰到 Copilot findings 時，以 operator 的正式出口（`retry-build`，#1139／#1206）
+#: 交由 builder 修正的回合上限（#716）。Copilot 的總評即使是「Approval recommended」，
+#: 只要有一條（哪怕 optional）finding，ship 就停在 `delivery-needs-human`；canary 若一律
+#: 當失敗，等於要求首輪零 finding，而那不是部署是否可用的判準。
+DEPLOYMENT_CANARY_COPILOT_FIX_ROUNDS = 2
+
+
+def _copilot_findings_candidate(terminal: object) -> str | None:
+    """ship 因 Copilot findings 停住時，回傳要交給 `retry-build` 的 exact candidate。"""
+
+    blocking = terminal.get("blocking_reason") if isinstance(terminal, Mapping) else None
+    context = blocking.get("context") if isinstance(blocking, Mapping) else None
+    if (
+        not isinstance(blocking, Mapping)
+        or blocking.get("reason") != "delivery-needs-human"
+        or not isinstance(context, Mapping)
+        or context.get("delivery_reason") != "copilot-findings"
+    ):
+        return None
+    candidate = context.get("candidate")
+    if not isinstance(candidate, str) or SHA40.fullmatch(candidate) is None:
+        return None
+    return candidate
+
+
 def _dispatch_blocking_summary(terminal: object) -> str:
     """把 `cortex work show --json` 的結構化 blocking reason 帶進失敗訊息。
 
@@ -5584,6 +5609,7 @@ def _full_dispatch(
     deadline = time.monotonic() + timeout
     item: Mapping[str, object] | None = None
     observed: Mapping[str, object] | None = None
+    copilot_fix_rounds = 0
     while time.monotonic() < deadline:
         status = _run(
             (
@@ -5609,6 +5635,44 @@ def _full_dispatch(
                     item = candidate
                     break
                 if verdict == "failed":
+                    fix_candidate = _copilot_findings_candidate(envelope)
+                    if (
+                        fix_candidate is not None
+                        and copilot_fix_rounds < DEPLOYMENT_CANARY_COPILOT_FIX_ROUNDS
+                    ):
+                        retry = _run(
+                            (
+                                "/opt/cortex/venv/bin/cortex",
+                                "run",
+                                "work",
+                                "retry-build",
+                                work_id,
+                                "--repo",
+                                repository,
+                                "--expected-candidate",
+                                fix_candidate,
+                                "--actor",
+                                "deployment-canary",
+                                "--reason",
+                                "deployment canary：Copilot review findings 交由 builder 修正"
+                                "（#1139 的 retry-build 出口）",
+                                "--wait",
+                                "--timeout",
+                                "60",
+                                "--json",
+                            ),
+                            env=runtime_env,
+                            timeout=90,
+                        )
+                        _require_success(retry, "copilot findings retry-build")
+                        copilot_fix_rounds += 1
+                        print(
+                            f"copilot findings fix round {copilot_fix_rounds} dispatched",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        time.sleep(10)
+                        continue
                     _report_job_unit_diagnostics(runtime_env)
                     raise QualificationFailure(
                         "full dispatch reached a failed/needs_human terminal"
