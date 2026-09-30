@@ -1404,6 +1404,7 @@ def _full_canary_qualification(
                 "capability-attack-matrix", "durable-state-attack-matrix",
                 "enforcement-plane-attack-matrix", "process-attack-matrix",
                 "gate-attack-matrix", "negative-controls",
+                "rollback-loaded-runtime",
                 "provider-capability-smoke", "full-dispatch-closeout",
                 "manager-github-dry-run-push",
             )
@@ -1535,6 +1536,33 @@ def _full_canary_qualification(
         "provider-capabilities.json": provider_evidence,
         "dispatch-closeout.json": dispatch,
         "manager-github-auth.json": github,
+        # #1224：release／canary 都要求 upgrade rollback 後的 loaded runtime 證據，
+        # expected 綁回本次 candidate（same-artifact 情境）。
+        "rollback-loaded-runtime-status.json": {
+            "schema_version": 1,
+            "scenario": "same-artifact-qualified-prior-to-candidate-rollback",
+            "rollback_receipt": {
+                "receipt_id": "rollback", "state": "rolled-back", "parent_receipt_id": "prior",
+            },
+            "expected": {
+                "receipt_id": "prior", "wheel_sha256": wheel_sha256,
+                "candidate_commit": candidate_sha,
+            },
+            "service_status": {"service": {"loaded_runtime": {
+                name: {
+                    "comparison": {
+                        "artifact_status": "match", "config_status": "match",
+                        "process_status": "match", "loaded_wheel_sha256": wheel_sha256,
+                    },
+                    "trust_root": {
+                        "status": "verified", "receipt_id": "prior",
+                        "wheel_sha256": wheel_sha256, "candidate_commit": candidate_sha,
+                    },
+                    "installed_artifact": {"wheel_sha256": wheel_sha256},
+                }
+                for name in ("manager", "monitor")
+            }}},
+        },
     }
     for name, value in documents.items():
         path = evidence_dir / name

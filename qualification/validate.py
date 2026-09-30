@@ -1316,6 +1316,13 @@ def validate(
                 or rollback_receipt["parent_receipt_id"] != expected["receipt_id"]
             ):
                 _fail("rollback receipt is not bound to the qualified prior receipt")
+            # same-artifact 情境：prior receipt 就是本次 candidate 的安裝，expected 必須
+            # 綁回 qualification 自己的 candidate，不能是任意 wheel／commit。
+            if (
+                expected["wheel_sha256"] != evidence_wheel_sha
+                or expected["candidate_commit"] != evidence_sha
+            ):
+                _fail("rollback loaded-runtime expected receipt is not this candidate")
             service_status = rollback_status.get("service_status")
             service = (
                 service_status.get("service")

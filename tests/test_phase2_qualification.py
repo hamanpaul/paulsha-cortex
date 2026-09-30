@@ -216,7 +216,7 @@ def test_release_installed_checks_require_owner_bound_reclaim(
     assert seen == [("rc-test", evidence)]
 
 
-def _valid_full_qualification(tmp_path: Path) -> dict:
+def _valid_full_qualification(tmp_path: Path, *, rollback_expected_wheel: str = "b" * 64) -> dict:
     payload = _valid_qualification()
     payload["services"] = [
         {"name": "cortex-egress-proxy.service", "uid": 995, "gid": 995, "active": True},
@@ -435,7 +435,7 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
             },
             "expected": {
                 "receipt_id": "prior",
-                "wheel_sha256": "b" * 64,
+                "wheel_sha256": rollback_expected_wheel,
                 "candidate_commit": "a" * 40,
             },
             "service_status": {
@@ -446,15 +446,15 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
                                 "artifact_status": "match",
                                 "config_status": "match",
                                 "process_status": "match",
-                                "loaded_wheel_sha256": "b" * 64,
+                                "loaded_wheel_sha256": rollback_expected_wheel,
                             },
                             "trust_root": {
                                 "status": "verified",
                                 "receipt_id": "prior",
-                                "wheel_sha256": "b" * 64,
+                                "wheel_sha256": rollback_expected_wheel,
                                 "candidate_commit": "a" * 40,
                             },
-                            "installed_artifact": {"wheel_sha256": "b" * 64},
+                            "installed_artifact": {"wheel_sha256": rollback_expected_wheel},
                         }
                         for name in ("manager", "monitor")
                     }
@@ -871,6 +871,17 @@ def test_full_suite_validator_accepts_distinct_candidate_identities(tmp_path: Pa
 
     completed = _run_full_validator(tmp_path, payload)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_full_suite_validator_rejects_rollback_evidence_for_another_candidate(
+    tmp_path: Path,
+) -> None:
+    """#1224：rollback 證據的 expected 必須是本次 candidate，不能是任意 wheel。"""
+    payload = _valid_full_qualification(tmp_path, rollback_expected_wheel="9" * 64)
+
+    completed = _run_full_validator(tmp_path, payload)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert "expected receipt is not this candidate" in completed.stderr
 
 
 def test_full_suite_validator_rejects_unlisted_evidence_files(tmp_path: Path) -> None:
