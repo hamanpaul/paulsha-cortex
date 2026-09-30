@@ -110,6 +110,7 @@
 
 - **#716 qualification image 的系統層 node**：改由 contract 釘版本與 sha256 的官方 Node.js 22 tarball 安裝 `/usr/bin/node`（openspec 要求 >=20.19，apt 的 18.19 會讓 `openspec validate` SyntaxError）（#716）。
 - **#1223 brainstorm／planning 派工納入 quota admission**：planner 的模型呼叫（questioner、secondary、integrator）走與 workflow card 相同的准入：shadow 只記錄，enforce 下不可行時不呼叫模型、run 標 `quota-admission-insufficient` 並寫可重試 wait receipt；可行時同步預留並收斂 reservation，終局用量記入 own-job ledger（#1223）。
+- **#1225 Monitor 不再覆寫 run dir 權限**：只在自己建立 run dir 時設 0700、既有目錄僅在 group／other 可寫時收緊，保留 installer 的 ACL mask，服務跑過後的升級不再被 `runtime-run-tree` provenance 擋下（#1225）。
 - **#1215 builder 刪除 seed 的 pinned 輸入**：commit-required builder 的 contract 說明 seed 進工作區的 untracked pinned 輸入不得刪除；build phase terminalization 失敗且 `retry-build` 可受理時，next_actions 會列出 `retry-build`（#1215）。
 - **#1220 closing reference 缺席的出口**：merge 授權只剩 `closing-issue-missing` 時記錄結構化 needs_human `closing-reference-missing` 並投影 `resume`／場外合入提示，不再變成 `resume-workflow-failed`（#1220）。
 - **#1210 direct 模式 Claude reviewer 的 Bash allow**：reviewer settings 補 `permissions.allow: ["Bash"]`，dontAsk 下複合命令不再被拒；沙箱與憑證讀取拒絕不變。

@@ -106,9 +106,18 @@ class ProjectMonitorService:
         self._join_refresh_thread()
 
     def _prepare_run_dir(self) -> None:
+        # #1225：system 部署的 run dir 由 installer 建立並管理（0700＋`root:rX` ACL，
+        # group 位元即 ACL mask）。無條件 chmod 0700 會把 mask 清成 ---，目錄因此偏離
+        # receipt、之後的 upgrade 被 provenance 檢查拒絕。只在自己建立時設 0700；
+        # 既有目錄只在 group／other 可寫時才收緊。
         run_dir = self._config.socket_path.parent
-        run_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(str(run_dir), 0o700)
+        try:
+            run_dir.mkdir(parents=True, mode=0o700)
+        except FileExistsError:
+            if stat.S_IMODE(run_dir.stat().st_mode) & 0o022:
+                os.chmod(str(run_dir), 0o700)
+        else:
+            os.chmod(str(run_dir), 0o700)
 
     def _start_poll_thread(self) -> None:
         if self._poll_thread is not None:
