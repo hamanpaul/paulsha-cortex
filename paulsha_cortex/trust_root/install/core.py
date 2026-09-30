@@ -732,6 +732,8 @@ def _manager_environment(
         raise InstallPlanError("repo_identity.remote cannot be converted to owner/repo")
     repo_slug = layout.source_repo_slugs[0]
     values = {
+        # #716：Manager 的 ship lane 以相對名呼叫 openspec，它只裝在 toolchain。
+        "PATH": layout.manager_path_value(),
         "PSC_INSTANCE": layout.instance,
         "PSC_AGENTS_ROOT": layout.agents_root,
         "PSC_PROJECT_CONFIG_ROOT": layout.project_config_root,

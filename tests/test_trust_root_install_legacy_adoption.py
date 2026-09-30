@@ -415,9 +415,10 @@ def _receipt_view(receipt: InstallReceipt) -> dict[str, object]:
 # make a legacy change pass.  Re-recorded only for non-legacy changes: #716
 # added `version: "1"` to the manager gh config, and #716 again added
 # `StateDirectory=` for the gate worktree slot to the gate job template units
-# (generated unit bytes only; no legacy code path changed).
+# (generated unit bytes only; no legacy code path changed), and #716 once more
+# added the toolchain-first `PATH` to the generated manager EnvironmentFile.
 REGRESSION_GOLDEN_SHA256 = (
-    "fc9c43e6826c004b29413ea15938911c5492bd1e86160f297ba6f86aa1b58e5d"
+    "d4922d855f74367d79809de3fb538c0056c068b7540cb712c08c438daf7a51d6"
 )
 
 
