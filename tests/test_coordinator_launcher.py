@@ -640,6 +640,9 @@ class ArgvTests(unittest.TestCase):
         self.assertNotIn("--allowedTools", claude)
         self.assertEqual(claude[claude.index("--setting-sources") + 1], "")
         settings = json.loads(claude[claude.index("--settings") + 1])
+        # #1210：dontAsk 下 Bash 需要明示 allow，否則複合命令被拒；仍在沙箱內執行。
+        self.assertEqual(settings["permissions"]["allow"], ["Bash"])
+        self.assertTrue(settings["permissions"]["deny"])
         self.assertTrue(settings["sandbox"]["enabled"])
         self.assertTrue(settings["sandbox"]["failIfUnavailable"])
         self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
