@@ -82,6 +82,10 @@ DEPLOYMENT_CANARY_BUILDER_PATH = "/opt/cortex/toolchain/bin:/usr/bin:/bin"
 #: gate 名稱都存在於 Manager 權威 gate ledger 且為 terminal passed，回歸把 gate
 #: 跳過、或跳過後仍宣告 `passed` 都會被擋下，而不是只驗 ledger 的外層形狀。
 DEPLOYMENT_CANARY_EXPECTED_GATE_NAMES = frozenset({"pytest"})
+#: 會產生 Manager 權威 gate ledger 的 workflow phase（#716）。逐字鏡射
+#: `paulsha_cortex.coordinator.manager.GATE_LEDGER_REQUIRED_PHASES`（測試釘住）：
+#: verify／review 的 reviewer 在唯讀沙箱裡不跑 gate，模板模式下沒有 ledger。
+GATE_LEDGER_PHASES = frozenset({"build"})
 MAX_AGENT_LOOP_LOG_BYTES = 128 * 1024 * 1024
 MAX_AGENT_LOOP_COMMANDS = 128
 MAX_DISPATCH_ARTIFACTS = 128
@@ -4812,7 +4816,7 @@ def _validate_dispatch_closeout(
                 )
             remember_artifact(output, output_digest)
         remember_artifact(evidence_path, evidence_digest)
-        if phase != "ship":
+        if phase in GATE_LEDGER_PHASES:
             control_value = job.get("control_log_path") or job.get("log_path")
             if not isinstance(control_value, str) or not control_value:
                 raise QualificationFailure(

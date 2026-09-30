@@ -3864,3 +3864,30 @@ def test_full_dispatch_does_not_retry_other_needs_human_reasons(
             release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
         )
     assert _retry_build_calls(calls) == []
+
+
+def test_driver_gate_ledger_phases_mirror_the_manager_contract() -> None:
+    """#716：driver 只對 Manager 會產生權威 ledger 的 phase 要求 ledger。"""
+
+    from paulsha_cortex.coordinator import manager
+
+    driver = _load_driver()
+    assert driver.GATE_LEDGER_PHASES == manager.GATE_LEDGER_REQUIRED_PHASES
+
+
+def test_dispatch_closeout_does_not_require_ledgers_for_reviewer_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：模板模式下 verify／review job 沒有 gate ledger；closeout 不得因此失敗。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    registry = json.loads(fixture["registry"].read_text(encoding="utf-8"))
+    for job in registry["jobs"]:
+        if job.get("workflow_phase") in {"verify", "review"}:
+            control = Path(job.get("control_log_path") or job["log_path"])
+            control.with_name(f"{control.stem}.gates.json").unlink(missing_ok=True)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    _markers, _rows, workflow, _probe = _validate_fixture_closeout(driver, fixture)
+    assert workflow["run_id"] == fixture["run_id"]
