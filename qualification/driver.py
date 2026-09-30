@@ -4732,6 +4732,7 @@ def _validate_dispatch_closeout(
     remember_artifact(registry_path, hashlib.sha256(registry_content).hexdigest())
     verdict_seen = False
     ledgers_seen = 0
+    final_build_gate_status: dict[str, str] | None = None
     # #1096：foreign-review 這個 delivery gate 唯一可信的綁定來源，就是本迴圈稍後
     # 對 review job 已獨立驗過 run_id／repo／candidate／reviewer_job_id 的那份
     # workflow canonical evidence；記住它的 path＋hash，讓 gate_refs 段落能要求
@@ -4858,20 +4859,25 @@ def _validate_dispatch_closeout(
                         "workflow gate ledger entry is malformed"
                     )
                 observed_gate_status[gate_row["name"]] = gate_row["status"]
-            missing_or_failed = sorted(
-                name
-                for name in DEPLOYMENT_CANARY_EXPECTED_GATE_NAMES
-                if observed_gate_status.get(name) != "passed"
-            )
-            if missing_or_failed:
-                raise QualificationFailure(
-                    "workflow gate ledger is missing an expected passed gate: "
-                    + ", ".join(missing_or_failed)
-                )
+            # #716：只有最後一個 build job（產出交付 candidate 的那一個；有修正回合時
+            # 是 repair builder）必須讓部署宣告的 gate 全部 passed。前面的 build 卡各有
+            # 自己的測試政策——worktree-isolation 不跑 gate、tdd-red 是 red-required
+            # （pytest 依設計必須 failed）——要求它們也 passed 等於否定 RED 階段。
+            final_build_gate_status = observed_gate_status
             ledgers_seen += 1
             remember_artifact(
                 ledger_path, hashlib.sha256(ledger_content).hexdigest()
             )
+    missing_or_failed = sorted(
+        name
+        for name in DEPLOYMENT_CANARY_EXPECTED_GATE_NAMES
+        if final_build_gate_status is None or final_build_gate_status.get(name) != "passed"
+    )
+    if missing_or_failed:
+        raise QualificationFailure(
+            "workflow gate ledger is missing an expected passed gate: "
+            + ", ".join(missing_or_failed)
+        )
     if not verdict_seen or ledgers_seen == 0:
         raise QualificationFailure("workflow verdict or Manager gate ledger is absent")
 
