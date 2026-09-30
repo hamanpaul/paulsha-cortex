@@ -13693,6 +13693,32 @@ def _harvest_task_memory_applied(
             logger.warning("task-memory applied evidence rejected (%s)", type(exc).__name__)
 
 
+def _builder_todo_refs(
+    run, *, input_snapshot: Sequence[Mapping[str, object]], tasks_path: str
+) -> tuple[str, ...]:
+    """#1234：commit-required 卡要一併勾選的 work item todo。
+
+    workstream todo 是 kind=plan 的 planning authority（pinned 輸入），#310 允許它只改
+    勾選狀態；contract 沒提到它時 builder 只能猜，結果 todo 漏勾、Copilot 回 finding。
+    以 untracked 形式 seed 進來的輸入在採信時逐 byte 比對，不能勾，因此排除；
+    `tasks_path` 已在同一句話裡，去重。"""
+
+    seeded = {
+        str(row.get("path")) for row in input_snapshot if isinstance(row, Mapping)
+    }
+    return tuple(
+        sorted(
+            {
+                authority.ref
+                for authority in getattr(run, "planning_authority", ()) or ()
+                if authority.kind == "plan"
+                and authority.ref not in seeded
+                and authority.ref != tasks_path
+            }
+        )
+    )
+
+
 def _workflow_job_prompt(
     run,
     step,
@@ -14035,8 +14061,16 @@ def _workflow_job_prompt(
     # #1215：Manager 會把候選裡沒有的 pinned 規劃輸入以 untracked 檔 seed 進工作區，
     # 採信時逐檔驗存在與 bytes。builder 的 self-review 曾把它當 stray 檔刪掉，候選因此
     # 被 fail-closed 擋下——這裡明講 untracked 是刻意的，不算 dirty。
+    todo_refs = _builder_todo_refs(run, input_snapshot=input_snapshot, tasks_path=tasks_path)
+    todo_clause = f" and the work item's todo ({', '.join(todo_refs)})" if todo_refs else ""
+    todo_scope = (
+        " (only checkbox state may change in these files; keep every other line as is)"
+        if todo_refs
+        else ""
+    )
     commit_required_contract = (
-        f" Before the final commit, update {tasks_path} checkboxes for work completed by this card, "
+        f" Before the final commit, update {tasks_path}{todo_clause} checkboxes for work "
+        f"completed by this card{todo_scope}, "
         "and never modify pinned input files such as the plan document. The Manager seeds pinned "
         "input files that the Candidate does not track into this worktree as untracked files; that "
         "untracked state is expected and is not dirt or an extra change. Keep every path listed in "
