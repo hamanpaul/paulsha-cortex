@@ -410,13 +410,21 @@ docker exec "$container_name" cortex install trust-root plan \
     --bundle /artifacts/bundle.json \
     --output "$rollback_plan_path"
 rollback_plan_sha=$(docker exec "$container_name" sha256sum "$rollback_plan_path" | awk '{print $1}')
+# 與 transactional-install runbook 的升級流程相同：apply 前停下服務，rollback 回報
+# restore_safe 之後才把原本在跑的 unit 啟動回來，driver 再比對 loaded runtime。
+rollback_services=(cortex-egress-proxy.service cortex-manager.service cortex-monitor.service)
+docker exec "$container_name" systemctl stop "${rollback_services[@]}"
 docker exec "$container_name" cortex install trust-root apply \
     --plan "$rollback_plan_path" \
     --confirm-sha256 "$rollback_plan_sha" \
     --receipt "$rollback_receipt_path" \
     --prior-receipt "$receipt_path"
-docker exec "$container_name" cortex install trust-root rollback \
-    --receipt "$rollback_receipt_path"
+rollback_report=$(docker exec "$container_name" cortex install trust-root rollback \
+    --receipt "$rollback_receipt_path")
+printf '%s\n' "$rollback_report"
+jq -e '.restore_safe == true' <<<"$rollback_report" >/dev/null || \
+    die "upgrade rollback was not restore-safe"
+docker exec "$container_name" systemctl start "${rollback_services[@]}"
 
 # A fixed harness installed in the reference image always runs the five attack
 # families and negative controls. Only deployment-canary mode adds provider

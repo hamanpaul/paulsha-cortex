@@ -624,26 +624,35 @@ def _capture_rollback_loaded_runtime(
             "rollback receipt is unknown or not bound to the prior receipt"
         )
     expected = _rollback_runtime_expected(prior_receipt)
-    result = _run(
-        (
-            "/opt/cortex/venv/bin/cortex",
-            "service",
-            "status",
-            "--system",
-            "--json",
-            "--install-receipt",
-            str(receipt_path),
-        ),
-        env=_installed_runtime_env(),
-    )
-    if result.returncode != 0:
-        raise QualificationFailure("rollback-system-status=unavailable")
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise QualificationFailure(
-            "rollback system-scope status returned invalid JSON"
-        ) from exc
+    # rollback 後服務才剛被啟動回來，loaded receipt 可能晚幾秒寫入：與
+    # `_installed_checks` 相同，輪詢到比對一致或逾時，逾時以最後一次結果判定。
+    deadline = time.monotonic() + SYSTEM_STATUS_SETTLE_SECONDS
+    while True:
+        result = _run(
+            (
+                "/opt/cortex/venv/bin/cortex",
+                "service",
+                "status",
+                "--system",
+                "--json",
+                "--install-receipt",
+                str(receipt_path),
+            ),
+            env=_installed_runtime_env(),
+        )
+        if result.returncode != 0:
+            raise QualificationFailure("rollback-system-status=unavailable")
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise QualificationFailure(
+                "rollback system-scope status returned invalid JSON"
+            ) from exc
+        if not _rollback_loaded_runtime_mismatch(payload, expected) or (
+            time.monotonic() >= deadline
+        ):
+            break
+        time.sleep(2)
     _write_json(
         evidence_dir / "rollback-loaded-runtime-status.json",
         {
