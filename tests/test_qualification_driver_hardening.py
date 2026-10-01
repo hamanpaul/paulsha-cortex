@@ -4167,3 +4167,93 @@ def test_driver_builder_path_matches_the_installed_manager_environment(
     values = _manager_environment(tmp_path)
 
     assert driver.DEPLOYMENT_CANARY_BUILDER_PATH == values["PSC_BUILDER_PATH"]
+
+
+_HEAD_PROBE_WORKTREE = "/var/lib/cortex/worktree/build-job-0a1b2c3d4e5f"
+
+
+def _head_probe_log(command: str, output: str) -> bytes:
+    return (
+        json.dumps({"type": "thread.started", "thread_id": "thread-build-job"})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": command,
+                    "aggregated_output": output,
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n"
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    ("command", "output"),
+    [
+        # 實機 codex log 裡最常見的形狀：裸 git、包在 `/bin/bash -lc` 裡。
+        ("/bin/bash -lc 'git rev-parse HEAD'", "a" * 40 + "\n"),
+        ("git rev-parse HEAD", "a" * 40 + "\n"),
+        (f"/bin/bash -lc 'git -C {_HEAD_PROBE_WORKTREE} rev-parse HEAD'", "a" * 40 + "\n"),
+        # `&&` 串接的唯讀檢查：多印的行不影響，只要真正的 HEAD 在其中一行。
+        ("/bin/bash -lc 'git rev-parse HEAD && git status --short'", "a" * 40 + "\n"),
+        (
+            "/bin/bash -lc 'pwd && git rev-parse --show-toplevel && git rev-parse HEAD'",
+            f"{_HEAD_PROBE_WORKTREE}\n{_HEAD_PROBE_WORKTREE}\n" + "a" * 40 + "\n",
+        ),
+        (
+            f"/bin/bash -lc 'cd {_HEAD_PROBE_WORKTREE} && git rev-parse --abbrev-ref HEAD"
+            " && git rev-parse HEAD'",
+            "feature/probe\n" + "a" * 40 + "\n",
+        ),
+    ],
+)
+def test_codex_agent_loop_parser_accepts_real_codex_head_command_shapes(
+    command: str, output: str
+) -> None:
+    """#716：先前只收 `/usr/bin/git` 的單一指令，實機 codex 從不這樣寫，canary 永遠過不了。"""
+    driver = _load_driver()
+
+    observation = driver._codex_agent_loop_observation(
+        (("build-job", _head_probe_log(command, output)),),
+        expected_head="a" * 40,
+        expected_worktree=_HEAD_PROBE_WORKTREE,
+    )
+
+    assert observation["successful_command_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 串接中混入能自行印出 SHA 的指令。
+        "/bin/bash -lc 'git rev-parse HEAD && printf %s " + "a" * 40 + "'",
+        "/bin/bash -lc 'git rev-parse HEAD && git rev-parse " + "a" * 40 + "'",
+        "/bin/bash -lc 'git rev-parse HEAD && git show -s --format=" + "a" * 40 + "'",
+        # `&&` 以外的運算子、重導向、命令替換。
+        "/bin/bash -lc 'git rev-parse HEAD; echo done'",
+        "/bin/bash -lc 'git rev-parse HEAD & pwd'",
+        "/bin/bash -lc 'git rev-parse HEAD > /tmp/head'",
+        "/bin/bash -lc 'echo $(git rev-parse HEAD)'",
+        # 會改動 repo 的子命令、git 全域選項、別的目錄。
+        "/bin/bash -lc 'git rev-parse HEAD && git commit --allow-empty -m probe'",
+        "/bin/bash -lc 'git -c core.pager=cat rev-parse HEAD'",
+        "/bin/bash -lc 'git -C /tmp/other rev-parse HEAD'",
+        "/bin/bash -lc 'cd /tmp && git rev-parse HEAD'",
+        # 沒有 `rev-parse HEAD` 那一段。
+        "/bin/bash -lc 'git log -1 --format=%H'",
+    ],
+)
+def test_codex_agent_loop_parser_rejects_unsafe_head_command_chains(command: str) -> None:
+    driver = _load_driver()
+
+    with pytest.raises(driver.QualificationFailure, match="no completed git HEAD proof"):
+        driver._codex_agent_loop_observation(
+            (("build-job", _head_probe_log(command, "a" * 40 + "\n")),),
+            expected_head="a" * 40,
+            expected_worktree=_HEAD_PROBE_WORKTREE,
+        )
