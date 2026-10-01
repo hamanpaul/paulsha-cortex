@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 canary closeout spec conformance**：端到端測試讓 Manager 以 production 路徑派出探針卡並交給 driver 驗 spec；driver 探針 prompt 的卡片欄位、input source material 與 gate 範圍文字改由 deck 編譯、Manager input snapshot 與 EnvironmentFile 導出，修正 action／inputs／source_material／status_policy 四處過時預期（#716）。
 - **#716 canary builder PATH**：closeout 預期的 job `PATH` 與 installer 的 `PSC_BUILDER_PATH` 同源（含 `/usr/local/bin`），runtime home 失敗時列出條件名（#716）。
 - **#1226 planning quota identity fallback**：enforce 在 brainstorm 前一次選定額度可行且 domain 異質的 primary／secondary，無可行組合時 wait，receipt 記錄排除候選與實際 primary（#1226）。
 - **#1222 Claude quota observation source**：從終局 Claude job 的 stream-json `rate_limit_event` 收割五小時／七日剩餘百分比至 quota observation ledger，支援 identity binding、coverage gap 與 TTL；更新 quota enforce 手冊（#1222）。
