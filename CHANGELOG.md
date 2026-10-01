@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 work show 帶出 needs_human context**：`blocking_reason.context`（candidate、delivery_reason 等）投影到 `work show --json`，canary 的 Copilot 修正回合得以觸發；probe 範本 todo 的 meta 項目改為 builder 可完成的寫法（#716）。
 - **#716 canary HEAD proof 診斷**：缺 proof 時列出實際指令形狀與判定；另接受 `sh` 包裝與只印 hash 的 `log`／`show`／`rev-parse --verify` 寫法（#716）。
 - **#716 canary HEAD 探針形狀**：closeout 接受實機 codex 的裸 `git` 與 `&&` 串接唯讀檢查，偽造形狀仍拒絕（#716）。
 - **#716 canary closeout spec conformance**：端到端測試讓 Manager 以 production 路徑派出探針卡並交給 driver 驗 spec；driver 探針 prompt 的卡片欄位、input source material 與 gate 範圍文字改由 deck 編譯、Manager input snapshot 與 EnvironmentFile 導出，修正 action／inputs／source_material／status_policy 四處過時預期（#716）。

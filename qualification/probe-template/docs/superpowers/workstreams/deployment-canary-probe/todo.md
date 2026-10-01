@@ -19,5 +19,5 @@ work_item: deployment-canary-probe
 - [ ] 在 `README.md` 的 Usage 段落記載新行為。
 - [ ] 新增 `changelog.d/deployment-canary-probe.md`，並在 `CHANGELOG.md` 的 `## [Unreleased]`
   加一行含 `deployment-canary-probe` 的條目。
-- [ ] 勾選本檔與 `openspec/changes/deployment-canary-probe/tasks.md` 的全部項目。
-- [ ] 執行 `.project-policy.yml` 的 preflight 指令並全部通過。
+- [ ] 勾選 OpenSpec change `deployment-canary-probe` 的 tasks 全部項目。
+- [ ] 執行 `python3 -m pytest -q` 並全部通過。
