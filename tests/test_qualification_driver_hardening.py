@@ -4301,3 +4301,55 @@ def test_codex_agent_loop_missing_proof_names_the_observed_commands() -> None:
     assert "git status --short && echo <redacted>" in message
     assert secret not in message
     assert "do-not-leak" not in message
+
+
+def test_dispatch_closeout_runs_source_repo_git_as_the_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：source repo 屬 cortex-manager，root 跑 git 會撞 safe.directory，
+    `bundle verify` 只回「need a repository」（canary run 36820714562）。凡是
+    `git -C <source repo>` 都必須以 Manager 身分執行。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    fake_run = _dispatch_fixture_fake_run(driver, fixture)
+    calls: list[tuple[tuple[str, ...], object]] = []
+
+    def recording_run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs.get("user")))
+        return fake_run(argv, **kwargs)
+
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", recording_run)
+
+    _validate_fixture_closeout(driver, fixture)
+
+    repo_git = [
+        (argv, user)
+        for argv, user in calls
+        if argv[:2] == ("/usr/bin/git", "-C")
+        and argv[2] == str(fixture["repo"])
+    ]
+    subcommands = {argv[3] for argv, _user in repo_git}
+    assert {"cat-file", "bundle", "worktree"} <= subcommands
+    assert all(user == "cortex-manager" for _argv, user in repo_git), repo_git
+
+
+def test_dispatch_closeout_names_unreclaimed_build_worktrees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：build worktree 沒回收時，失敗訊息要指出是哪張卡、哪一種殘留。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    state = json.loads((fixture["coordinator"] / "jobs.json").read_text(encoding="utf-8"))
+    build_job = next(job for job in state["jobs"] if job["workflow_phase"] == "build")
+    Path(build_job["worktree"]).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    with pytest.raises(driver.QualificationFailure) as caught:
+        _validate_fixture_closeout(driver, fixture)
+
+    assert str(caught.value) == (
+        "build worktree reclaim is incomplete: "
+        f"{build_job['workflow_card']}/{build_job['job_id']}:exists"
+    )

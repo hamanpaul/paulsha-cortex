@@ -1,0 +1,1 @@
+- #716 canary closeout：以 cortex-manager 身分對 source repo 執行 `git bundle verify`／`git worktree list`（root 會撞 safe.directory，只回「need a repository」）；build worktree 未回收時列出卡片與殘留類型。
