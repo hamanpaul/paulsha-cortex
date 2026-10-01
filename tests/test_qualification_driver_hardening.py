@@ -1588,6 +1588,47 @@ def _dispatch_fixture(tmp_path: Path, driver):
     artifacts: list[Path] = []
     workflow_evidence: dict[str, tuple[Path, str]] = {}
     probe_codex_home: Path | None = None
+    # #716：探針卡 prompt 的 gate 文字由 Manager 的 EnvironmentFile 導出，這裡用 installer
+    # 實際產出的那一份，並讓 driver 的 closeout 讀到同一份。
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_manager_toolchain_path_716 import _manager_environment
+
+    (tmp_path / "install").mkdir()
+    manager_env = _manager_environment(tmp_path / "install")
+    driver._installed_runtime_env = lambda: dict(manager_env)
+    # #716：feature-oneshot 的探針卡宣告 accepted plan 為 input，Manager 派工時把它 pin
+    # 成 job 的 input snapshot，內容寫進 content-addressed evidence（同一支 writer）。
+    from paulsha_cortex.coordinator import manager as manager_module
+    from paulsha_cortex.coordinator.work_bridge import default_workflow_manifest
+
+    probe_step = next(
+        step
+        for step in default_workflow_manifest(work_id, change=work_id).steps
+        if step.card == "worktree-isolation"
+    )
+    plan_ref = f"docs/superpowers/plans/2026-10-01-{work_id}.md"
+    plan_text = "# plan\n\n- [ ] confirm the Manager-provisioned worktree\n"
+    plan_sha256 = hashlib.sha256(plan_text.encode("utf-8")).hexdigest()
+    probe_input_snapshot = [
+        {
+            "pattern": probe_step.inputs[0],
+            "path": plan_ref,
+            "sha256": plan_sha256,
+            "authority": "planning-authority",
+            "content_ref": manager_module._write_workflow_input_content(
+                coordinator_root=coordinator,
+                run=SimpleNamespace(
+                    run_id=run_id,
+                    work_id=work_id,
+                    repo=repository,
+                    source_revision="2" * 64,
+                ),
+                ref=plan_ref,
+                digest=plan_sha256,
+                content=plan_text,
+            ),
+        }
+    ]
     for phase in ("plan", "build", "verify", "review", "ship"):
         job_id = f"{phase}-job"
         worktree = tmp_path / "reclaimed" / job_id
@@ -1661,19 +1702,29 @@ def _dispatch_fixture(tmp_path: Path, driver):
                     "runtime_surface": "builder-codex-home",
                     "credential_publish": True,
                     "log_path": str(log),
+                    "workflow_input_snapshot": probe_input_snapshot,
                 }
             )
             artifacts.append(log)
             spec_path = coordinator / "job-specs" / "builder" / f"{job_id}.json"
-            prompt = driver._expected_worktree_isolation_prompt(
-                job,
-                {
-                    "run_id": run_id,
-                    "work_id": work_id,
-                    "repo": repository,
-                    "openspec_refs": [],
-                },
-            )
+            # 重建 prompt 會讀 input snapshot 的 Manager-owned 內容檔；fixture 的檔案屬於
+            # 測試行程，只在這一步把 Manager 身分換成它，之後還原給各測試自己決定。
+            real_manager_uid = driver._manager_uid
+            driver._manager_uid = lambda: os.getuid()
+            try:
+                prompt = driver._expected_worktree_isolation_prompt(
+                    job,
+                    {
+                        "run_id": run_id,
+                        "work_id": work_id,
+                        "repo": repository,
+                        "openspec_refs": [],
+                    },
+                    root=coordinator,
+                    manager_env=manager_env,
+                )
+            finally:
+                driver._manager_uid = real_manager_uid
             last_message = log.with_name("job.last.json")
             # Manager 在 Trust Root 模板 unit 內實際發出的 argv（#716 之後）。
             from paulsha_cortex.coordinator.launcher import build_codex_argv
@@ -4039,35 +4090,46 @@ def test_dispatch_closeout_requires_the_read_only_template_for_the_probe_card(
         _validate_fixture_closeout(driver, fixture)
 
 
-def test_driver_probe_prompt_matches_the_manager_prompt() -> None:
+def test_driver_probe_prompt_matches_the_manager_prompt(tmp_path: Path) -> None:
     """#716：driver 獨立重建探針卡的 Manager prompt 並要求逐字相同；Manager 的 prompt
-    一改（例如 terminal schema 新增欄位），這裡要先紅，而不是等 canary 才發現。"""
-    from types import SimpleNamespace
+    一改（例如 terminal schema 新增欄位），這裡要先紅，而不是等 canary 才發現。
 
+    卡片定義取 canary combo 的編譯結果、input snapshot 與 gate 宣告取 production 形狀
+    （先前手寫的 step 沒有 action／inputs、env 也沒有 gate，四處不一致都測不出來）；
+    完整的 Manager 派工路徑見 `test_qualification_closeout_spec_conformance_716.py`。
+    """
     from paulsha_cortex.coordinator import manager
-    from paulsha_cortex.coordinator.workflow import WorkflowStep
+    from paulsha_cortex.coordinator.work_bridge import default_workflow_manifest
 
     driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    registry = json.loads(fixture["registry"].read_text(encoding="utf-8"))
+    job = next(row for row in registry["jobs"] if row["job_id"] == "build-job")
+    workflow = registry["workflows"][0]
     run = SimpleNamespace(
-        run_id="workflow-abc", work_id="deployment-canary-probe", repo="owner/probe",
-        source_revision="2" * 64, candidate_head=None,
-        openspec_refs=("deployment-canary-probe",), planning_authority=(),
-        quota_admission=None,
+        run_id=workflow["run_id"], work_id=workflow["work_id"], repo=workflow["repo"],
+        source_revision=job["source_revision"], candidate_head=None,
+        openspec_refs=(), planning_authority=(), quota_admission=None,
     )
-    step = WorkflowStep(
-        phase="build", persona="builder", card=driver.DEPLOYMENT_CANARY_PROBE_CARD,
-        executor="codex", model=PROVIDER_MODELS["codex"], domain="openai",
-        inputs=(), outputs=(),
+    step = next(
+        item
+        for item in default_workflow_manifest(
+            run.work_id, change=run.work_id, combo_name=driver.DEPLOYMENT_CANARY_COMBO
+        ).steps
+        if item.card == driver.DEPLOYMENT_CANARY_PROBE_CARD
     )
+    manager_env = driver._installed_runtime_env()
     actual = manager._workflow_job_prompt(
-        run, step, builder_job_id=None, coordinator_root="/tmp/coordinator", env={},
+        run,
+        step,
+        builder_job_id=None,
+        coordinator_root=fixture["coordinator"],
+        input_snapshot=tuple(job["workflow_input_snapshot"]),
+        env=manager_env,
     )
+    driver._manager_uid = lambda: os.getuid()
     expected = driver._expected_worktree_isolation_prompt(
-        {"source_revision": run.source_revision},
-        {
-            "run_id": run.run_id, "work_id": run.work_id, "repo": run.repo,
-            "openspec_refs": list(run.openspec_refs),
-        },
+        job, workflow, root=fixture["coordinator"], manager_env=manager_env
     )
     assert actual == expected
 
@@ -4105,3 +4167,93 @@ def test_driver_builder_path_matches_the_installed_manager_environment(
     values = _manager_environment(tmp_path)
 
     assert driver.DEPLOYMENT_CANARY_BUILDER_PATH == values["PSC_BUILDER_PATH"]
+
+
+_HEAD_PROBE_WORKTREE = "/var/lib/cortex/worktree/build-job-0a1b2c3d4e5f"
+
+
+def _head_probe_log(command: str, output: str) -> bytes:
+    return (
+        json.dumps({"type": "thread.started", "thread_id": "thread-build-job"})
+        + "\n"
+        + json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": command,
+                    "aggregated_output": output,
+                    "exit_code": 0,
+                    "status": "completed",
+                },
+            }
+        )
+        + "\n"
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    ("command", "output"),
+    [
+        # 實機 codex log 裡最常見的形狀：裸 git、包在 `/bin/bash -lc` 裡。
+        ("/bin/bash -lc 'git rev-parse HEAD'", "a" * 40 + "\n"),
+        ("git rev-parse HEAD", "a" * 40 + "\n"),
+        (f"/bin/bash -lc 'git -C {_HEAD_PROBE_WORKTREE} rev-parse HEAD'", "a" * 40 + "\n"),
+        # `&&` 串接的唯讀檢查：多印的行不影響，只要真正的 HEAD 在其中一行。
+        ("/bin/bash -lc 'git rev-parse HEAD && git status --short'", "a" * 40 + "\n"),
+        (
+            "/bin/bash -lc 'pwd && git rev-parse --show-toplevel && git rev-parse HEAD'",
+            f"{_HEAD_PROBE_WORKTREE}\n{_HEAD_PROBE_WORKTREE}\n" + "a" * 40 + "\n",
+        ),
+        (
+            f"/bin/bash -lc 'cd {_HEAD_PROBE_WORKTREE} && git rev-parse --abbrev-ref HEAD"
+            " && git rev-parse HEAD'",
+            "feature/probe\n" + "a" * 40 + "\n",
+        ),
+    ],
+)
+def test_codex_agent_loop_parser_accepts_real_codex_head_command_shapes(
+    command: str, output: str
+) -> None:
+    """#716：先前只收 `/usr/bin/git` 的單一指令，實機 codex 從不這樣寫，canary 永遠過不了。"""
+    driver = _load_driver()
+
+    observation = driver._codex_agent_loop_observation(
+        (("build-job", _head_probe_log(command, output)),),
+        expected_head="a" * 40,
+        expected_worktree=_HEAD_PROBE_WORKTREE,
+    )
+
+    assert observation["successful_command_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 串接中混入能自行印出 SHA 的指令。
+        "/bin/bash -lc 'git rev-parse HEAD && printf %s " + "a" * 40 + "'",
+        "/bin/bash -lc 'git rev-parse HEAD && git rev-parse " + "a" * 40 + "'",
+        "/bin/bash -lc 'git rev-parse HEAD && git show -s --format=" + "a" * 40 + "'",
+        # `&&` 以外的運算子、重導向、命令替換。
+        "/bin/bash -lc 'git rev-parse HEAD; echo done'",
+        "/bin/bash -lc 'git rev-parse HEAD & pwd'",
+        "/bin/bash -lc 'git rev-parse HEAD > /tmp/head'",
+        "/bin/bash -lc 'echo $(git rev-parse HEAD)'",
+        # 會改動 repo 的子命令、git 全域選項、別的目錄。
+        "/bin/bash -lc 'git rev-parse HEAD && git commit --allow-empty -m probe'",
+        "/bin/bash -lc 'git -c core.pager=cat rev-parse HEAD'",
+        "/bin/bash -lc 'git -C /tmp/other rev-parse HEAD'",
+        "/bin/bash -lc 'cd /tmp && git rev-parse HEAD'",
+        # 沒有 `rev-parse HEAD` 那一段。
+        "/bin/bash -lc 'git log -1 --format=%H'",
+    ],
+)
+def test_codex_agent_loop_parser_rejects_unsafe_head_command_chains(command: str) -> None:
+    driver = _load_driver()
+
+    with pytest.raises(driver.QualificationFailure, match="no completed git HEAD proof"):
+        driver._codex_agent_loop_observation(
+            (("build-job", _head_probe_log(command, "a" * 40 + "\n")),),
+            expected_head="a" * 40,
+            expected_worktree=_HEAD_PROBE_WORKTREE,
+        )

@@ -13,8 +13,10 @@ provider or repository probe.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import hashlib
+import io
 import json
 import os
 import pwd
@@ -31,7 +33,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from paulsha_cortex.coordinator import job_runner, job_workspace, owner_reclaim, spool_slot
+from paulsha_cortex.coordinator import (
+    gate_ledger,
+    job_runner,
+    job_workspace,
+    owner_reclaim,
+    spool_slot,
+)
 from paulsha_cortex.trust_root.registry import (
     JobWriteContract,
     inner_sandbox_attached_for,
@@ -76,6 +84,9 @@ DEPLOYMENT_CANARY_REVIEWER_EXECUTOR, DEPLOYMENT_CANARY_REVIEWER_MODEL = canary_i
     CANARY_REVIEWER
 )
 DEPLOYMENT_CANARY_PROBE_CARD = "worktree-isolation"
+#: canary intake 指定的 combo（`cortex run work intake --combo`）。closeout 重建探針卡
+#: prompt 時以同一個 combo 編譯卡片定義（#716），兩處共用這一個值。
+DEPLOYMENT_CANARY_COMBO = "feature-oneshot"
 #: #716：job 的 `PATH` 由 installer 以 `layout.job_path_value()` 寫進 `PSC_BUILDER_PATH`
 #: （toolchain 在前，尾段含 `/usr/local/bin`）。這裡必須取同一個來源，不能另抄一份字面值：
 #: 先前寫死的 `toolchain:/usr/bin:/bin` 少了 `/usr/local/bin`，實機 spec 永遠對不上。
@@ -4093,40 +4104,99 @@ def _shell_segments(command: str) -> list[list[str]]:
     return segments
 
 
+#: HEAD 探針鏈中允許出現的唯讀 git 子命令（#716）。只收「讀」的子命令：探針觀察的是
+#: 模型自主做的唯讀檢查，任何會改動 repo 的子命令都讓整條指令不算數。
+HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS = frozenset(
+    {"rev-parse", "status", "branch", "worktree", "log", "show", "symbolic-ref"}
+)
+#: 系統 git 的兩種寫法。裸 `git` 由 job 的 `PATH` 解析，而那條 PATH 已在
+#: `_bound_codex_builder_spec` 驗為 installer 寫的值（toolchain 與系統目錄，全部
+#: root-owned、沒有相對路徑段），解析不到 worktree 內的 `./git`。
+HEAD_PROBE_GIT_BINARIES = frozenset({"git", "/usr/bin/git"})
+
+
+def _head_probe_git_args(
+    segment: Sequence[str], *, expected_worktree: str
+) -> list[str] | None:
+    """去掉 git 本體與可選的 `-C <bound worktree>`，回傳子命令 argv；不是 git 時回 None。"""
+
+    if not segment or segment[0] not in HEAD_PROBE_GIT_BINARIES:
+        return None
+    args = list(segment[1:])
+    if args[:1] == ["-C"]:
+        if args[1:2] != [expected_worktree]:
+            return None
+        args = args[2:]
+    return args
+
+
 def _is_expected_head_probe(
     command: str, *, expected_worktree: str
 ) -> bool:
-    """Accept only one exact Git invocation, optionally in Codex's shell envelope.
+    """Accept a read-only inspection chain that runs `git rev-parse HEAD` in the bound worktree.
 
     The job spec already fixes ``working_directory`` and Codex ``-C`` to the
-    Manager-owned worktree. Requiring the absolute system Git path prevents a
-    repository-local ``./git`` or PATH substitution, while exact argv equality
-    rejects pipes, boolean fallbacks, redirections, aliases, and suffixes. The
-    Codex CLI serializes shell-tool executions as a three-argument Bash ``-c``/``-lc``
-    argv; only that exact outer shape is unwrapped once.
+    Manager-owned worktree. The Codex CLI serializes shell-tool executions as a
+    three-argument Bash ``-c``/``-lc`` argv; only that exact outer shape is
+    unwrapped once.
+
+    #716：實機 codex 的 log 裡，模型取 HEAD 幾乎都寫成裸 `git rev-parse HEAD`，
+    而且常與 `git status --short`、`pwd` 用 `&&` 串成一條；先前只收絕對路徑
+    `/usr/bin/git` 的單一指令，真實的 agent loop 永遠留不下可採信的證據。現在的界線：
+
+    - 只接受 `&&` 串接（前一段失敗就不會往下跑，exit 0 代表每一段都成功）；
+      管線、`||`、`;`、重導向、背景執行、子 shell、命令替換一律拒絕。
+    - 每一段都必須是唯讀檢查：`pwd`、`cd <bound worktree>`，或子命令在
+      :data:`HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS` 內的系統 git（可帶
+      `-C <bound worktree>`，不能指向其他目錄）。repo 內的 `./git`、`printf`／`echo`
+      等能自行印出 SHA 的指令、任何含 `$` 或反引號的字詞，以及帶 7 位以上 hex 的字詞
+      （字面 SHA；bound worktree 路徑除外），都讓整條不算數。
+    - 至少一段恰好是 `git rev-parse HEAD`（可帶 `-C <bound worktree>`）。
     """
 
     try:
         argv = shlex.split(command, posix=True)
     except ValueError:
         return False
-    expected = (
-        ["/usr/bin/git", "rev-parse", "HEAD"],
-        ["/usr/bin/git", "-C", expected_worktree, "rev-parse", "HEAD"],
-    )
-    if argv in expected:
-        return True
+    inner = command
     if (
-        len(argv) != 3
-        or argv[0] not in {"/bin/bash", "/usr/bin/bash"}
-        or argv[1] not in {"-c", "-lc"}
+        len(argv) == 3
+        and argv[0] in {"/bin/bash", "/usr/bin/bash"}
+        and argv[1] in {"-c", "-lc"}
     ):
-        return False
+        inner = argv[2]
     try:
-        inner_argv = shlex.split(argv[2], posix=True)
+        lexer = shlex.shlex(inner, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
     except ValueError:
         return False
-    return inner_argv in expected
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token == "&&":
+            segments.append([])
+            continue
+        if not token or set(token) <= set(lexer.punctuation_chars):
+            return False
+        if "$" in token or "`" in token:
+            return False
+        # 字面 SHA（`git rev-parse <sha>`、`--format=<sha>`）能讓唯讀 git 直接印出任意值；
+        # bound worktree 路徑本身可能帶 hex 的 job id，只有它例外。
+        if token != expected_worktree and re.search(r"[0-9a-fA-F]{7,}", token):
+            return False
+        segments[-1].append(token)
+    if any(not segment for segment in segments):
+        return False
+    saw_head = False
+    for segment in segments:
+        if segment == ["pwd"] or segment == ["cd", expected_worktree]:
+            continue
+        args = _head_probe_git_args(segment, expected_worktree=expected_worktree)
+        if not args or args[0] not in HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS:
+            return False
+        if args == ["rev-parse", "HEAD"]:
+            saw_head = True
+    return saw_head
 
 
 def _codex_agent_loop_thread_id(
@@ -4210,9 +4280,11 @@ def _codex_agent_loop_observation(
                 for line in item["aggregated_output"].splitlines()
                 if line.strip()
             ]
+            # #716：串接的唯讀檢查會多印幾行（`git status`、`pwd` 等），只要求真正的
+            # HEAD 出現在其中一行；整條 exit 0 代表 `rev-parse HEAD` 那一段也成功了。
             if not _is_expected_head_probe(
                 item["command"], expected_worktree=expected_worktree
-            ) or output_lines != [expected_head]:
+            ) or expected_head not in output_lines:
                 continue
             commands.append(item["command"])
             outputs.append(item["aggregated_output"])
@@ -4280,6 +4352,8 @@ def _bound_codex_builder_spec(
     root: Path,
     job: Mapping[str, object],
     workflow: Mapping[str, object],
+    *,
+    manager_env: Mapping[str, str],
 ) -> tuple[Path, Path, str]:
     """Validate the Manager-authored launch contract for the observed job."""
 
@@ -4379,7 +4453,9 @@ def _bound_codex_builder_spec(
     if not segments or len(segments[0]) < 4:
         raise QualificationFailure("Codex agent-loop job command identity is invalid")
     prompt = segments[0][3]
-    if prompt != _expected_worktree_isolation_prompt(job, workflow):
+    if prompt != _expected_worktree_isolation_prompt(
+        job, workflow, root=root, manager_env=manager_env
+    ):
         raise QualificationFailure("Codex agent-loop job prompt is invalid")
     expected_last_message = Path(log_path).with_name(
         f"{Path(log_path).stem}.last.json"
@@ -4429,8 +4505,16 @@ def _bound_codex_builder_spec(
     return path, expected_codex_home, hashlib.sha256(content).hexdigest()
 
 
-def _worktree_isolation_terminal_schema(run_id: str) -> dict[str, object]:
-    """Exact command-free terminal contract accepted by the live probe."""
+def _worktree_isolation_terminal_schema(
+    run_id: str, *, test_policy: str | None, manager_env: Mapping[str, str]
+) -> dict[str, object]:
+    """Exact command-free terminal contract accepted by the live probe.
+
+    #716：gate 範圍紀律與 gate_evidence 的說明文字由 Manager 自己的 EnvironmentFile
+    （`PSC_GATE_CMD_*`）經 `gate_ledger` 機械導出——Manager 組 prompt 用的就是這幾支。
+    先前這裡抄的是「Manager 沒有宣告任何 gate」那一版字面值，而 installer 一定宣告
+    `PSC_GATE_CMD_PYTEST`，實機 prompt 因此永遠對不上。
+    """
 
     return {
         "kind": "workflow-card",
@@ -4458,12 +4542,8 @@ def _worktree_isolation_terminal_schema(run_id: str) -> dict[str, object]:
             "Report passed only when this card's own action is genuinely complete. "
             "Natural-language confidence, an exit code of 0, and the absence of an "
             "explicit error do NOT authorize passed; if the action is not complete, or "
-            "the decision needs a human, report failed or needs_human instead. Scope "
-            "discipline: this card's test_policy requires no test run from you, and the "
-            "Manager has declared no gate commands either, so no deterministic gate "
-            "result is expected from either side. Report the status you actually "
-            "observed, keep the concrete detail in diagnostics, and leave gate_evidence "
-            "exactly []."
+            "the decision needs a human, report failed or needs_human instead. "
+            + gate_ledger.gate_scope_honesty_hint(manager_env, test_policy=test_policy)
         ),
         "outputs": {
             "type": "array",
@@ -4485,21 +4565,155 @@ def _worktree_isolation_terminal_schema(run_id: str) -> dict[str, object]:
                 "name": "one of allowed_names below",
                 "status": "passed | failed",
             },
-            "allowed_names": [],
-            "description": (
-                "This card's test_policy requires no test run from you, so there is no "
-                "gate name for you to claim and gate_evidence must be exactly []. A name "
-                "of your own invention fails the card closed; put whatever you observed "
-                "into diagnostics instead."
+            "allowed_names": list(
+                gate_ledger.card_gate_names(manager_env, test_policy=test_policy)
+            ),
+            "description": gate_ledger.gate_evidence_name_hint(
+                manager_env, test_policy=test_policy
             ),
         },
     }
 
 
+def _deployment_canary_probe_step(work_id: str, change: str) -> Any:
+    """canary intake 那個 combo 編譯出來的探針卡定義（#716）。
+
+    Manager 組 prompt 的 `skill_ref`／`action`／`commit_policy`／`test_policy`／
+    `inputs`／`declared_outputs` 都來自 intake 當下 `work_bridge.default_workflow_manifest()`
+    編譯的 deck 卡片；這裡呼叫同一支、帶同一組引數（`change` 與 intake 相同：第一個
+    OpenSpec ref，沒有時是 work_id），不再自己抄一份。先前抄的是 Manager 的 legacy
+    fallback（英文 action、沒有 inputs），而 feature-oneshot 的探針卡宣告了 deck 的
+    action 與 accepted plan 這個 input，實機 prompt 因此永遠對不上。
+    """
+
+    # lazy import：work_bridge 的載入圖很大，只有 deployment canary 的 closeout 需要它。
+    from paulsha_cortex.coordinator.work_bridge import default_workflow_manifest
+
+    try:
+        # compile 順帶產 slice 的 verification 骨架，找不到 cwd 的 `.project-policy.yml`
+        # 時會往 stderr 印 warning；那一段與 workflow manifest 無關，不讓它混進 canary log。
+        with contextlib.redirect_stderr(io.StringIO()):
+            manifest = default_workflow_manifest(
+                work_id, change=change, combo_name=DEPLOYMENT_CANARY_COMBO
+            )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise QualificationFailure(
+            "Codex agent-loop probe card cannot be compiled from the canary combo"
+        ) from exc
+    steps = [
+        step
+        for step in manifest.steps
+        if step.phase == "build"
+        and step.persona == "builder"
+        and step.card == DEPLOYMENT_CANARY_PROBE_CARD
+    ]
+    if len(steps) != 1:
+        raise QualificationFailure(
+            "Codex agent-loop probe card is not unique in the canary combo"
+        )
+    return steps[0]
+
+
+#: Manager 寫進 job 記錄 `workflow_input_snapshot` 的每一列（`manager._workflow_input_snapshot`）。
+WORKFLOW_INPUT_SNAPSHOT_KEYS = frozenset(
+    {"pattern", "path", "sha256", "authority", "content_ref"}
+)
+#: `manager._write_workflow_input_content` 寫出的 content-addressed envelope。
+WORKFLOW_INPUT_CONTENT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "run_id",
+        "work_id",
+        "repo",
+        "source_revision",
+        "path",
+        "sha256",
+        "content",
+    }
+)
+
+
+def _bound_workflow_input_material(
+    root: Path,
+    job: Mapping[str, object],
+    workflow: Mapping[str, object],
+    *,
+    patterns: Sequence[str],
+) -> tuple[list[str], list[dict[str, object]]]:
+    """探針卡 prompt 的 `inputs`／`source_material`，由 Manager 的 input snapshot 導出。
+
+    #716：feature-oneshot 的探針卡宣告了 accepted plan 這個 input，Manager 派工時把
+    它 pin 成 job 記錄的 `workflow_input_snapshot`，內容落在 coordinator 的
+    content-addressed evidence（`evidence/workflow-inputs/<sha256>.json`），prompt 的
+    `source_material` 就是這些列加上內容。這裡讀同一份 Manager-authored evidence，
+    逐項驗 pattern 集合等於卡片宣告、內容雜湊與綁定欄位都對得上，再照 Manager 的
+    形狀組回來——內容是 planner 寫的、每次 canary 都不同，沒有別的來源可以重建。
+    """
+
+    rows = job.get("workflow_input_snapshot")
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict)
+        or set(row) != WORKFLOW_INPUT_SNAPSHOT_KEYS
+        or not all(isinstance(row[key], str) for key in WORKFLOW_INPUT_SNAPSHOT_KEYS)
+        for row in rows
+    ):
+        raise QualificationFailure("Codex agent-loop job input snapshot is malformed")
+    inputs = list(dict.fromkeys(row["pattern"] for row in rows))
+    if inputs != list(patterns):
+        raise QualificationFailure(
+            "Codex agent-loop job inputs are not the probe card's declared inputs"
+        )
+    evidence_root = root / "evidence" / "workflow-inputs"
+    material: list[dict[str, object]] = []
+    for row in rows:
+        content_path = Path(row["content_ref"])
+        if (
+            not content_path.is_absolute()
+            or content_path.parent != evidence_root
+            or content_path.suffix != ".json"
+        ):
+            raise QualificationFailure("Codex agent-loop job input locator is unsafe")
+        content = _manager_file(
+            content_path, label="Codex agent-loop job input", root=root
+        )
+        envelope = _json_object(content, label="Codex agent-loop job input")
+        text = envelope.get("content")
+        if (
+            hashlib.sha256(content).hexdigest() != content_path.stem
+            or set(envelope) != WORKFLOW_INPUT_CONTENT_KEYS
+            or envelope.get("schema_version") != 1
+            or envelope.get("kind") != "workflow-input-content"
+            or envelope.get("run_id") != workflow.get("run_id")
+            or envelope.get("work_id") != workflow.get("work_id")
+            or envelope.get("repo") != workflow.get("repo")
+            or envelope.get("source_revision") != job.get("source_revision")
+            or envelope.get("path") != row["path"]
+            or envelope.get("sha256") != row["sha256"]
+            or not isinstance(text, str)
+            or hashlib.sha256(text.encode("utf-8")).hexdigest() != row["sha256"]
+        ):
+            raise QualificationFailure(
+                "Codex agent-loop job input is not bound to this dispatch"
+            )
+        material.append({**row, "content": text})
+    return inputs, material
+
+
 def _expected_worktree_isolation_prompt(
-    job: Mapping[str, object], workflow: Mapping[str, object]
+    job: Mapping[str, object],
+    workflow: Mapping[str, object],
+    *,
+    root: Path,
+    manager_env: Mapping[str, str],
 ) -> str:
-    """Reconstruct the only Manager prompt that qualifies as autonomous."""
+    """Reconstruct the only Manager prompt that qualifies as autonomous.
+
+    #716：結構（autonomous preamble、契約鍵、terminal schema 的固定段）仍由這裡獨立
+    釘住；隨部署與 deck 變動的值改由 production 的同一個來源導出——卡片欄位取 canary
+    combo 的編譯結果、gate 文字取 Manager 的 EnvironmentFile、source material 取
+    Manager pin 下來的 input snapshot。
+    """
 
     run_id = workflow.get("run_id")
     work_id = workflow.get("work_id")
@@ -4510,6 +4724,21 @@ def _expected_worktree_isolation_prompt(
         for value in (run_id, work_id, repository, source_revision)
     ):
         raise QualificationFailure("Codex agent-loop prompt authority is incomplete")
+    refs = workflow.get("openspec_refs", [])
+    openspec_ref: str | None = None
+    if refs not in (None, [], ()):
+        if (
+            not isinstance(refs, (list, tuple))
+            or not refs
+            or not isinstance(refs[0], str)
+            or not refs[0]
+        ):
+            raise QualificationFailure("Codex agent-loop OpenSpec authority is invalid")
+        openspec_ref = refs[0]
+    step = _deployment_canary_probe_step(work_id, openspec_ref or work_id)
+    inputs, source_material = _bound_workflow_input_material(
+        root, job, workflow, patterns=step.inputs
+    )
     contract: dict[str, object] = {
         "schema_version": 1,
         "kind": "workflow-card-prompt",
@@ -4520,28 +4749,20 @@ def _expected_worktree_isolation_prompt(
         "phase": "build",
         "card_id": DEPLOYMENT_CANARY_PROBE_CARD,
         "persona": "builder",
-        "inputs": [],
-        "source_material": [],
-        "declared_outputs": [],
+        "inputs": inputs,
+        "source_material": source_material,
+        "declared_outputs": list(step.outputs),
         "candidate": None,
-        "skill_ref": "superpowers:using-git-worktrees",
-        "action": (
-            "Confirm the Manager-provisioned worktree; do not create a second worktree."
+        "skill_ref": step.skill_ref,
+        "action": step.action,
+        "commit_policy": step.commit_policy,
+        "test_policy": step.test_policy,
+        "terminal_schema": _worktree_isolation_terminal_schema(
+            run_id, test_policy=step.test_policy, manager_env=manager_env
         ),
-        "commit_policy": "forbidden",
-        "test_policy": "none",
-        "terminal_schema": _worktree_isolation_terminal_schema(run_id),
     }
-    refs = workflow.get("openspec_refs", [])
-    if refs not in (None, [], ()):
-        if (
-            not isinstance(refs, (list, tuple))
-            or not refs
-            or not isinstance(refs[0], str)
-            or not refs[0]
-        ):
-            raise QualificationFailure("Codex agent-loop OpenSpec authority is invalid")
-        contract["openspec_ref"] = refs[0]
+    if openspec_ref is not None:
+        contract["openspec_ref"] = openspec_ref
     return (
         job_runner.WORKTREE_ISOLATION_AUTONOMOUS_PREAMBLE
         + " Contract: "
@@ -4610,6 +4831,51 @@ def _closeout_diagnostic(
     return " ".join(parts)
 
 
+def _validate_codex_builder_binding(
+    workflow: Mapping[str, object], build_jobs: Sequence[Mapping[str, object]]
+) -> None:
+    """workflow 的 builder 覆寫與每個 build job 的身分／runtime 欄位（皆為 Manager 產物）。
+
+    #716：自 `_validate_dispatch_closeout` 原樣抽出，讓端到端 conformance 測試能拿
+    Manager 真實派工寫下的 workflow／job 記錄跑同一段判準。
+    """
+
+    expected_builder = {
+        "executor": DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
+        "model_id": DEPLOYMENT_CANARY_BUILDER_MODEL,
+    }
+    resolved_chain = workflow.get("resolved_model_chain")
+    resolved_builder = (
+        resolved_chain.get("builder") if isinstance(resolved_chain, dict) else None
+    )
+    if (
+        workflow.get("model_chain_override") != {"builder": expected_builder}
+        or not isinstance(resolved_builder, dict)
+        or resolved_builder.get("executor") != expected_builder["executor"]
+        or resolved_builder.get("model_id") != expected_builder["model_id"]
+        or resolved_builder.get("independence_domain") != "openai"
+        or resolved_builder.get("source") != "run-override"
+        or resolved_builder.get("envelope_source") not in {"default", "measured"}
+        or not build_jobs
+    ):
+        raise QualificationFailure(
+            "Codex agent-loop workflow is not bound to the exact builder override"
+        )
+    for job in build_jobs:
+        if (
+            job.get("persona") != "builder"
+            or job.get("executor") != DEPLOYMENT_CANARY_BUILDER_EXECUTOR
+            or job.get("model_id") != DEPLOYMENT_CANARY_BUILDER_MODEL
+            or job.get("runtime_principal") != "builder"
+            or job.get("runtime_mode") != "systemd-template"
+            or job.get("runtime_surface") != "builder-codex-home"
+            or job.get("credential_publish") is not True
+        ):
+            raise QualificationFailure(
+                "Codex agent-loop builder identity/runtime binding is invalid"
+            )
+
+
 def _validate_dispatch_closeout(
     *,
     repository: str,
@@ -4617,6 +4883,7 @@ def _validate_dispatch_closeout(
     issue: int,
     terminal: object,
     coordinator_root: Path,
+    manager_env: Mapping[str, str] | None = None,
 ) -> tuple[list[str], list[dict[str, str]], dict[str, Any], dict[str, object]]:
     root = coordinator_root.resolve()
     state_root = root.parent
@@ -4909,40 +5176,7 @@ def _validate_dispatch_closeout(
 
     bundle_seen = False
     build_jobs = [job for job in bound_jobs if job.get("workflow_phase") == "build"]
-    expected_builder = {
-        "executor": DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
-        "model_id": DEPLOYMENT_CANARY_BUILDER_MODEL,
-    }
-    resolved_chain = workflow.get("resolved_model_chain")
-    resolved_builder = (
-        resolved_chain.get("builder") if isinstance(resolved_chain, dict) else None
-    )
-    if (
-        workflow.get("model_chain_override") != {"builder": expected_builder}
-        or not isinstance(resolved_builder, dict)
-        or resolved_builder.get("executor") != expected_builder["executor"]
-        or resolved_builder.get("model_id") != expected_builder["model_id"]
-        or resolved_builder.get("independence_domain") != "openai"
-        or resolved_builder.get("source") != "run-override"
-        or resolved_builder.get("envelope_source") not in {"default", "measured"}
-        or not build_jobs
-    ):
-        raise QualificationFailure(
-            "Codex agent-loop workflow is not bound to the exact builder override"
-        )
-    for job in build_jobs:
-        if (
-            job.get("persona") != "builder"
-            or job.get("executor") != DEPLOYMENT_CANARY_BUILDER_EXECUTOR
-            or job.get("model_id") != DEPLOYMENT_CANARY_BUILDER_MODEL
-            or job.get("runtime_principal") != "builder"
-            or job.get("runtime_mode") != "systemd-template"
-            or job.get("runtime_surface") != "builder-codex-home"
-            or job.get("credential_publish") is not True
-        ):
-            raise QualificationFailure(
-                "Codex agent-loop builder identity/runtime binding is invalid"
-            )
+    _validate_codex_builder_binding(workflow, build_jobs)
     probe_jobs = [
         job
         for job in build_jobs
@@ -4954,9 +5188,13 @@ def _validate_dispatch_closeout(
         )
     bound_logs: list[tuple[str, bytes]] = []
     probe_codex_homes: list[Path] = []
+    # #716：探針卡 prompt 的 gate 文字由 Manager 的 EnvironmentFile 導出；呼叫端沒給時
+    # 讀已安裝的那一份（Manager unit 的 `EnvironmentFile=` 指的就是它）。
+    if manager_env is None:
+        manager_env = _installed_runtime_env()
     for job in probe_jobs:
         spec_path, codex_home, spec_digest = _bound_codex_builder_spec(
-            root, job, workflow
+            root, job, workflow, manager_env=manager_env
         )
         log_path, log_content = _bound_codex_builder_log(root, job)
         remember_artifact(spec_path, spec_digest)
@@ -5628,7 +5866,7 @@ def _full_dispatch(
             "--issue",
             str(issue),
             "--combo",
-            "feature-oneshot",
+            DEPLOYMENT_CANARY_COMBO,
             "--builder-executor",
             DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
             "--builder-model",
@@ -5731,6 +5969,7 @@ def _full_dispatch(
         issue=issue,
         terminal=item,
         coordinator_root=Path(runtime_env["PSC_COORDINATOR_ROOT"]),
+        manager_env=runtime_env,
     )
     run_id = workflow.get("run_id")
     workflow_candidate = workflow.get("candidate_head")

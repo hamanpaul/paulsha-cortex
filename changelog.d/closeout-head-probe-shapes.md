@@ -1,0 +1,1 @@
+- #716 canary closeout：HEAD 探針比對改為接受實機 codex 的指令形狀——裸 `git`（由已驗證的 Manager PATH 解析）、`/bin/bash -lc` 包裝、以 `&&` 串接的唯讀檢查（`pwd`、`cd <bound worktree>`、唯讀 git 子命令）；管線、`||`、`;`、重導向、命令替換、`./git`、會改動 repo 的子命令與字面 SHA 仍一律拒絕，輸出只要求真正的 HEAD 出現在其中一行。
