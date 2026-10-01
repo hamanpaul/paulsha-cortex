@@ -5333,8 +5333,14 @@ def _validate_dispatch_closeout(
         ):
             raise QualificationFailure("build commit bundle slot is not Manager-sealed")
         bundle_digest_before = _sha256(bundle)
+        # #716：source repo 屬 cortex-manager；以 root 跑 git 會撞 safe.directory
+        # （dubious ownership），`bundle verify` 只回「need a repository」。與上面的
+        # candidate_check 相同，以 Manager 身分執行。
         verify = _run(
-            ("/usr/bin/git", "-C", str(repo_root), "bundle", "verify", str(bundle))
+            ("/usr/bin/git", "-C", str(repo_root), "bundle", "verify", str(bundle)),
+            user="cortex-manager",
+            env=_account_env("cortex-manager"),
+            timeout=60,
         )
         _require_success(verify, "build commit bundle verification")
         heads = _run(("/usr/bin/git", "bundle", "list-heads", str(bundle)))
@@ -5386,7 +5392,10 @@ def _validate_dispatch_closeout(
     )
 
     worktrees = _run(
-        ("/usr/bin/git", "-C", str(repo_root), "worktree", "list", "--porcelain")
+        ("/usr/bin/git", "-C", str(repo_root), "worktree", "list", "--porcelain"),
+        user="cortex-manager",
+        env=_account_env("cortex-manager"),
+        timeout=30,
     )
     _require_success(worktrees, "source repository worktree inventory")
     registered = {
@@ -5394,13 +5403,31 @@ def _validate_dispatch_closeout(
         for line in worktrees.stdout.splitlines()
         if line.startswith("worktree ")
     }
+    leftovers: list[str] = []
     for job in build_jobs:
         path_value = job.get("worktree")
         if not isinstance(path_value, str) or not path_value:
             raise QualificationFailure("build worktree binding is absent")
         worktree = Path(path_value)
-        if worktree.exists() or worktree.is_symlink() or str(worktree) in registered:
-            raise QualificationFailure("build worktree reclaim is incomplete")
+        # #716：失敗時列出是哪張卡、哪一種殘留（目錄仍在／symlink／仍登記在來源 repo），
+        # 否則下一輪 canary 只能盲猜回收路徑。
+        states = [
+            name
+            for name, present in (
+                ("exists", worktree.exists()),
+                ("symlink", worktree.is_symlink()),
+                ("registered", str(worktree) in registered),
+            )
+            if present
+        ]
+        if states:
+            leftovers.append(
+                f"{job.get('workflow_card')}/{job.get('job_id')}:{'+'.join(states)}"
+            )
+    if leftovers:
+        raise QualificationFailure(
+            "build worktree reclaim is incomplete: " + ", ".join(leftovers)
+        )
 
     gate_refs = workflow.get("gate_refs")
     if not isinstance(gate_refs, list) or not gate_refs:
