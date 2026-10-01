@@ -4210,6 +4210,11 @@ def _head_probe_log(command: str, output: str) -> bytes:
             " && git rev-parse HEAD'",
             "feature/probe\n" + "a" * 40 + "\n",
         ),
+        # 帳號 shell 不一定是 `/bin/bash`；印出 HEAD 的其他最小 git 寫法。
+        ("sh -c 'git rev-parse HEAD'", "a" * 40 + "\n"),
+        ("bash -lc 'git rev-parse --verify HEAD'", "a" * 40 + "\n"),
+        ("/bin/bash -lc 'git log -1 --format=%H'", "a" * 40 + "\n"),
+        ("/bin/bash -lc 'git show -s --format=%H HEAD'", "a" * 40 + "\n"),
     ],
 )
 def test_codex_agent_loop_parser_accepts_real_codex_head_command_shapes(
@@ -4244,8 +4249,13 @@ def test_codex_agent_loop_parser_accepts_real_codex_head_command_shapes(
         "/bin/bash -lc 'git -c core.pager=cat rev-parse HEAD'",
         "/bin/bash -lc 'git -C /tmp/other rev-parse HEAD'",
         "/bin/bash -lc 'cd /tmp && git rev-parse HEAD'",
-        # 沒有 `rev-parse HEAD` 那一段。
-        "/bin/bash -lc 'git log -1 --format=%H'",
+        # 沒有印出 HEAD 的那一段；印出內容不只 hash 的寫法。
+        "/bin/bash -lc 'git status --short'",
+        "/bin/bash -lc 'git log --format=%H'",
+        "/bin/bash -lc 'git show --format=%H'",
+        "/bin/bash -lc 'git rev-parse --short HEAD'",
+        # 非系統目錄的 shell。
+        "/tmp/bash -lc 'git rev-parse HEAD'",
     ],
 )
 def test_codex_agent_loop_parser_rejects_unsafe_head_command_chains(command: str) -> None:
@@ -4257,3 +4267,37 @@ def test_codex_agent_loop_parser_rejects_unsafe_head_command_chains(command: str
             expected_head="a" * 40,
             expected_worktree=_HEAD_PROBE_WORKTREE,
         )
+
+
+def test_codex_agent_loop_missing_proof_names_the_observed_commands() -> None:
+    """#716：找不到 HEAD proof 時，失敗訊息帶出實際指令形狀與判定，長 token 遮蔽、輸出不外露。"""
+    driver = _load_driver()
+    secret = "s" * 40
+    events = [
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": f"/bin/bash -lc 'git status --short && echo {secret}'",
+                "aggregated_output": "do-not-leak\n",
+                "exit_code": 0,
+                "status": "completed",
+            },
+        },
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done"}},
+    ]
+    content = "\n".join(json.dumps(event) for event in events).encode()
+
+    with pytest.raises(driver.QualificationFailure) as caught:
+        driver._codex_agent_loop_observation(
+            (("build-job", content),),
+            expected_head="a" * 40,
+            expected_worktree=_HEAD_PROBE_WORKTREE,
+        )
+
+    message = str(caught.value)
+    assert "agent_message=1,command_execution=1" in message
+    assert "accepted=False head_in_output=False" in message
+    assert "git status --short && echo <redacted>" in message
+    assert secret not in message
+    assert "do-not-leak" not in message
