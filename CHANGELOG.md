@@ -109,6 +109,7 @@
 
 ### Fixed
 
+- **#716 canary 探針卡的唯讀模板**：worktree-isolation（write-forbidden）必須跑在 `cortex-job-ro[-jit]@`，spec 檢查失敗時列出不成立的條件（#716）。
 - **#716 canary 結案的 evidence candidate 綁定**：每張卡的 evidence 綁它自己的 subject，另要求最終 candidate 被 verify 與 review（archive commit 會換掉 candidate）（#716）。
 - **#716 canary 結案只要求最後一個 build 的 gate passed**：tdd-red 依設計 pytest failed、worktree-isolation 不跑 gate；只有產出交付 candidate 的最後一個 build job 必須 passed（#716）。
 - **#716 canary 結案只對 build job 要求 gate ledger**：driver 以 `GATE_LEDGER_PHASES` 鏡射 manager 的 `GATE_LEDGER_REQUIRED_PHASES`，不再要求 reviewer job 有 ledger（#716）。

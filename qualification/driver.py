@@ -4300,28 +4300,34 @@ def _bound_codex_builder_spec(
     repo_root = job.get("workflow_repo_root")
     log_path = job.get("log_path")
     unit = spec.get("unit")
-    if (
-        set(spec) != set(job_runner.SPEC_REQUIRED_KEYS)
-        or spec.get("spec_version") != job_runner.JOB_SPEC_VERSION
-        or spec.get("instance") != slot
-        or spec.get("job_id") != job_id
-        or not isinstance(unit, str)
-        or re.fullmatch(
-            rf"cortex-job(?:-jit)?@{re.escape(slot)}\.service", unit
+    # #716：探針卡是 BUILDER_WRITE_FORBIDDEN，launcher 選的是唯讀工作區模板
+    # （`cortex-job-ro[-jit]@`，`job_runner.template_unit_for_workspace_contract`）；
+    # 可寫的 `cortex-job[-jit]@` 在這裡反而是錯的。失敗時列出不成立的條件名稱。
+    checks = {
+        "keys": set(spec) == set(job_runner.SPEC_REQUIRED_KEYS),
+        "spec_version": spec.get("spec_version") == job_runner.JOB_SPEC_VERSION,
+        "instance": spec.get("instance") == slot,
+        "job_id": spec.get("job_id") == job_id,
+        "unit": isinstance(unit, str)
+        and re.fullmatch(
+            rf"cortex-job-ro(?:-jit)?@{re.escape(slot)}\.service", unit
         )
-        is None
-        or not isinstance(worktree, str)
-        or not Path(worktree).is_absolute()
-        or repo_root != worktree
-        or spec.get("working_directory") != worktree
-        or spec.get("log_path") != log_path
-        or not isinstance(spec_env, dict)
-        or not isinstance(command, list)
-        or len(command) != 3
-        or command[:2] != ["bash", "-c"]
-        or not isinstance(command[2], str)
-    ):
-        raise QualificationFailure("Codex agent-loop job spec authority mismatch")
+        is not None,
+        "worktree": isinstance(worktree, str) and Path(worktree).is_absolute(),
+        "repo_root": repo_root == worktree,
+        "working_directory": spec.get("working_directory") == worktree,
+        "log_path": spec.get("log_path") == log_path,
+        "env": isinstance(spec_env, dict),
+        "command": isinstance(command, list)
+        and len(command) == 3
+        and command[:2] == ["bash", "-c"]
+        and isinstance(command[2], str),
+    }
+    failed = sorted(name for name, ok in checks.items() if not ok)
+    if failed:
+        raise QualificationFailure(
+            "Codex agent-loop job spec authority mismatch: " + ",".join(failed)
+        )
     surface = writable_surface("builder-codex-home")
     expected_codex_home = spool_slot.exact_job_slot(
         surface.surface_id,
