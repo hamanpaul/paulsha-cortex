@@ -1,0 +1,1 @@
+- #716 canary closeout：找不到 HEAD proof 時，失敗訊息列出 Codex log 的 item 類型計數與每筆 command_execution 的判定（exit、status、是否採信、輸出是否含 HEAD、遮蔽長 token 後的指令形狀），輸出內容不外露；HEAD 探針另接受 `sh`／裸 `bash` 包裝，以及 `rev-parse --verify HEAD`、`log -1 --format=%H`、`show -s --format=%H` 這幾種只印 hash 的最小寫法。

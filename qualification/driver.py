@@ -4113,6 +4113,11 @@ HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS = frozenset(
 #: `_bound_codex_builder_spec` 驗為 installer 寫的值（toolchain 與系統目錄，全部
 #: root-owned、沒有相對路徑段），解析不到 worktree 內的 `./git`。
 HEAD_PROBE_GIT_BINARIES = frozenset({"git", "/usr/bin/git"})
+#: codex 把 shell tool 的執行序列化成 `<shell> -c|-lc '<script>'`；shell 取自帳號設定，
+#: 系統帳號不一定是 `/bin/bash`（#716）。只認系統目錄下或裸名的 bash／sh。
+HEAD_PROBE_SHELLS = frozenset(
+    {"/bin/bash", "/usr/bin/bash", "bash", "/bin/sh", "/usr/bin/sh", "sh"}
+)
 
 
 def _head_probe_git_args(
@@ -4151,7 +4156,9 @@ def _is_expected_head_probe(
       `-C <bound worktree>`，不能指向其他目錄）。repo 內的 `./git`、`printf`／`echo`
       等能自行印出 SHA 的指令、任何含 `$` 或反引號的字詞，以及帶 7 位以上 hex 的字詞
       （字面 SHA；bound worktree 路徑除外），都讓整條不算數。
-    - 至少一段恰好是 `git rev-parse HEAD`（可帶 `-C <bound worktree>`）。
+    - 至少一段是印出 HEAD hash 的最小形狀（:func:`_git_args_print_head`：
+      `rev-parse [--verify] HEAD`、`log -1 --format=%H`、`show -s --format=%H`），可帶
+      `-C <bound worktree>`。
     """
 
     try:
@@ -4161,7 +4168,7 @@ def _is_expected_head_probe(
     inner = command
     if (
         len(argv) == 3
-        and argv[0] in {"/bin/bash", "/usr/bin/bash"}
+        and argv[0] in HEAD_PROBE_SHELLS
         and argv[1] in {"-c", "-lc"}
     ):
         inner = argv[2]
@@ -4194,9 +4201,43 @@ def _is_expected_head_probe(
         args = _head_probe_git_args(segment, expected_worktree=expected_worktree)
         if not args or args[0] not in HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS:
             return False
-        if args == ["rev-parse", "HEAD"]:
+        if _git_args_print_head(args):
             saw_head = True
     return saw_head
+
+
+#: `--format`／`--pretty` 只印 commit hash 的寫法（#716）。
+_HEAD_FORMAT_RE = re.compile(r"--(?:format|pretty)=(?:t?format:)?%H")
+
+
+def _git_args_print_head(args: Sequence[str]) -> bool:
+    """這段唯讀 git 是否就是「印出 HEAD 的 commit hash」（#716）。
+
+    `rev-parse HEAD` 之外，模型也常用 `rev-parse --verify HEAD`、`log -1 --format=%H`、
+    `show -s --format=%H` 取 HEAD——它們印出的是同一個值、同樣出自 git 本身。
+    只收這幾種最小形狀：其他旗標（尤其會改變印出內容的）一律不算。
+    """
+
+    if not args:
+        return False
+    subcommand, rest = args[0], list(args[1:])
+    if subcommand == "rev-parse":
+        return rest.count("HEAD") == 1 and set(rest) <= {"HEAD", "--verify", "-q", "--quiet"}
+    if subcommand in {"log", "show"}:
+        formats = [arg for arg in rest if _HEAD_FORMAT_RE.fullmatch(arg)]
+        others = [arg for arg in rest if arg not in formats]
+        allowed = {"HEAD", "--no-patch", "-s", "--no-color"}
+        if subcommand == "log":
+            allowed |= {"-1", "-n1", "--max-count=1"}
+        # log 要限一筆、show 要關掉 patch：兩者都只印那一個 hash。
+        limiter = {"-1", "-n1", "--max-count=1"} if subcommand == "log" else {"-s", "--no-patch"}
+        return (
+            len(formats) == 1
+            and rest.count("HEAD") <= 1
+            and set(others) <= allowed
+            and bool(set(others) & limiter)
+        )
+    return False
 
 
 def _codex_agent_loop_thread_id(
@@ -4228,6 +4269,31 @@ def _codex_agent_loop_thread_id(
     return next(iter(thread_ids))
 
 
+def _head_probe_diagnostic(
+    item: Mapping[str, object], *, expected_head: str, expected_worktree: str
+) -> str:
+    """一筆 command_execution 的診斷摘要：exit／status／是否採信／輸出含不含 HEAD／指令形狀。
+
+    指令只留前 200 字，32 字以上的連續 token 字元（憑證、長 hash）一律遮掉；輸出內容
+    不進訊息，只記 HEAD 是否出現在其中一行。
+    """
+
+    command = item.get("command")
+    output = item.get("aggregated_output")
+    shape = command if isinstance(command, str) else repr(type(command).__name__)
+    shape = re.sub(r"[A-Za-z0-9_+/=-]{32,}", "<redacted>", shape)[:200]
+    head_seen = isinstance(output, str) and expected_head in [
+        line.strip() for line in output.splitlines()
+    ]
+    accepted = isinstance(command, str) and _is_expected_head_probe(
+        command, expected_worktree=expected_worktree
+    )
+    return (
+        f"exit={item.get('exit_code')!r} status={item.get('status')!r} "
+        f"accepted={accepted} head_in_output={head_seen} cmd={shape!r}"
+    )
+
+
 def _codex_agent_loop_observation(
     logs: Sequence[tuple[str, bytes]],
     *,
@@ -4247,6 +4313,10 @@ def _codex_agent_loop_observation(
     outputs: list[str] = []
     builder_job_ids: list[str] = []
     raw_log_sha256 = ""
+    # #716：找不到 HEAD proof 時，失敗訊息要帶出模型實際跑了什麼——否則只能盲改比對器、
+    # 每輪 canary 再燒一個 probe repo。只記指令形狀與布林，不記輸出內容。
+    item_types: dict[str, int] = {}
+    observed: list[str] = []
     for job_id, content in logs:
         if not isinstance(job_id, str) or not job_id or not isinstance(content, bytes):
             raise QualificationFailure("Codex agent-loop log binding is malformed")
@@ -4262,6 +4332,20 @@ def _codex_agent_loop_observation(
             except json.JSONDecodeError:
                 continue
             item = event.get("item") if isinstance(event, dict) else None
+            if (
+                isinstance(item, dict)
+                and event.get("type") == "item.completed"
+                and isinstance(item.get("type"), str)
+            ):
+                item_types[item["type"]] = item_types.get(item["type"], 0) + 1
+                if item["type"] == "command_execution" and len(observed) < 12:
+                    observed.append(
+                        _head_probe_diagnostic(
+                            item,
+                            expected_head=expected_head,
+                            expected_worktree=expected_worktree,
+                        )
+                    )
             if (
                 not isinstance(item, dict)
                 or event.get("type") != "item.completed"
@@ -4295,6 +4379,13 @@ def _codex_agent_loop_observation(
     if not commands:
         raise QualificationFailure(
             "Codex agent-loop has no completed git HEAD proof for the bound worktree"
+            + "; item types: "
+            + (
+                ",".join(f"{name}={count}" for name, count in sorted(item_types.items()))
+                or "none"
+            )
+            + "; commands: "
+            + (" | ".join(observed) or "none")
         )
     thread_id = _codex_agent_loop_thread_id(logs)
     return {
