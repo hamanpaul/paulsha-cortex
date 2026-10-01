@@ -1,0 +1,1 @@
+- #716 canary closeout：driver 預期的 builder job `PATH` 改取 `DEFAULT_LAYOUT.job_path_value()`（與 installer 寫進 `PSC_BUILDER_PATH` 同源，尾段含 `/usr/local/bin`），取代少了 `/usr/local/bin` 的字面值；runtime home 檢查失敗時列出不成立的條件（`codex_home`／`path`／`slot_dir`／`slot_owner`）。

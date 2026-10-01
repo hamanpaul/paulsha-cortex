@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from paulsha_cortex.trust_root.permgen import DEFAULT_LAYOUT
 from qualification.contract import (
     CANARY_BUILDER,
     CANARY_REVIEWER,
@@ -1725,7 +1726,8 @@ def _dispatch_fixture(tmp_path: Path, driver):
                     "log_path": str(log),
                     "env": {
                         "CODEX_HOME": str(probe_codex_home),
-                        "PATH": driver.DEPLOYMENT_CANARY_BUILDER_PATH,
+                        # installer 寫進 PSC_BUILDER_PATH 的值，不是 driver 自己的常數。
+                        "PATH": DEFAULT_LAYOUT.job_path_value(),
                         "GIT_CONFIG_COUNT": "1",
                         "GIT_CONFIG_KEY_0": "safe.directory",
                         "GIT_CONFIG_VALUE_0": str(worktree),
@@ -4068,3 +4070,38 @@ def test_driver_probe_prompt_matches_the_manager_prompt() -> None:
         },
     )
     assert actual == expected
+
+
+def test_dispatch_closeout_names_the_failing_runtime_home_condition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716：spec 的 PATH 與 installer 的 `PSC_BUILDER_PATH` 不同時，失敗訊息要指出
+    是 `path` 這一條，而不是一句籠統的 runtime home mismatch。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    spec_path = fixture["coordinator"] / "job-specs" / "builder" / "build-job.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    spec["env"]["PATH"] = "/opt/cortex/toolchain/bin:/usr/bin:/bin"
+    _write_json(spec_path, spec)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    with pytest.raises(
+        driver.QualificationFailure,
+        match="runtime home is not the exact Manager-owned job slot: path$",
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+def test_driver_builder_path_matches_the_installed_manager_environment(
+    tmp_path: Path,
+) -> None:
+    """#716：driver 預期的 job PATH 必須等於 installer 實際寫進 Manager EnvironmentFile
+    的 `PSC_BUILDER_PATH`；先前抄成字面值少了 `/usr/local/bin`，實機永遠對不上。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_manager_toolchain_path_716 import _manager_environment
+
+    driver = _load_driver()
+    values = _manager_environment(tmp_path)
+
+    assert driver.DEPLOYMENT_CANARY_BUILDER_PATH == values["PSC_BUILDER_PATH"]
