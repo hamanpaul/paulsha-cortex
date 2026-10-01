@@ -4035,3 +4035,36 @@ def test_dispatch_closeout_requires_the_read_only_template_for_the_probe_card(
         driver.QualificationFailure, match="job spec authority mismatch: unit"
     ):
         _validate_fixture_closeout(driver, fixture)
+
+
+def test_driver_probe_prompt_matches_the_manager_prompt() -> None:
+    """#716：driver 獨立重建探針卡的 Manager prompt 並要求逐字相同；Manager 的 prompt
+    一改（例如 terminal schema 新增欄位），這裡要先紅，而不是等 canary 才發現。"""
+    from types import SimpleNamespace
+
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.coordinator.workflow import WorkflowStep
+
+    driver = _load_driver()
+    run = SimpleNamespace(
+        run_id="workflow-abc", work_id="deployment-canary-probe", repo="owner/probe",
+        source_revision="2" * 64, candidate_head=None,
+        openspec_refs=("deployment-canary-probe",), planning_authority=(),
+        quota_admission=None,
+    )
+    step = WorkflowStep(
+        phase="build", persona="builder", card=driver.DEPLOYMENT_CANARY_PROBE_CARD,
+        executor="codex", model=PROVIDER_MODELS["codex"], domain="openai",
+        inputs=(), outputs=(),
+    )
+    actual = manager._workflow_job_prompt(
+        run, step, builder_job_id=None, coordinator_root="/tmp/coordinator", env={},
+    )
+    expected = driver._expected_worktree_isolation_prompt(
+        {"source_revision": run.source_revision},
+        {
+            "run_id": run.run_id, "work_id": run.work_id, "repo": run.repo,
+            "openspec_refs": list(run.openspec_refs),
+        },
+    )
+    assert actual == expected
