@@ -803,6 +803,11 @@ def _needs_human_reason_row(row: Mapping[str, Any]) -> dict[str, object] | None:
     if not all(isinstance(item, str) and item for item in (reason, detail, source)):
         return None
     evidence_refs = payload.get("evidence_refs")
+    # #716：`context` 是 DiagnosticReason 的機器可讀附註（str→str：candidate、card、
+    # delivery_reason…）。過去這裡沒帶出去，`cortex work show --json` 只剩人讀的
+    # detail；operator 與 deployment canary 要對 Copilot findings 走 `retry-build`
+    # 時拿不到 exact candidate，只能去解析 detail 字串。
+    context = payload.get("context")
     return {
         "reason": reason,
         "detail": detail,
@@ -811,6 +816,11 @@ def _needs_human_reason_row(row: Mapping[str, Any]) -> dict[str, object] | None:
         "evidence_refs": [
             item for item in (evidence_refs or []) if isinstance(item, str) and item
         ],
+        "context": {
+            key: value
+            for key, value in (context.items() if isinstance(context, Mapping) else ())
+            if isinstance(key, str) and isinstance(value, str)
+        },
     }
 
 

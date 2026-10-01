@@ -1,0 +1,1 @@
+- #716：`cortex work show --json` 的 `blocking_reason` 帶出 DiagnosticReason 的 `context`（candidate、card、delivery_reason 等 str→str 附註）。monitor 投影過去會丟掉它，deployment canary 的 Copilot findings 修正回合因此從未觸發。probe 範本 todo 的最後兩項改為 builder 做得到、而且不寫死 archive 會搬動的路徑（勾選 OpenSpec tasks、執行 pytest），runbook 記錄這條規則。
