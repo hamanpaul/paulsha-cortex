@@ -37,6 +37,7 @@ from paulsha_cortex.trust_root.registry import (
     inner_sandbox_attached_for,
     sandbox_mode_for,
 )
+from paulsha_cortex.trust_root.permgen import DEFAULT_LAYOUT
 from paulsha_cortex.trust_root.surfaces import writable_surface
 
 try:
@@ -75,7 +76,10 @@ DEPLOYMENT_CANARY_REVIEWER_EXECUTOR, DEPLOYMENT_CANARY_REVIEWER_MODEL = canary_i
     CANARY_REVIEWER
 )
 DEPLOYMENT_CANARY_PROBE_CARD = "worktree-isolation"
-DEPLOYMENT_CANARY_BUILDER_PATH = "/opt/cortex/toolchain/bin:/usr/bin:/bin"
+#: #716：job 的 `PATH` 由 installer 以 `layout.job_path_value()` 寫進 `PSC_BUILDER_PATH`
+#: （toolchain 在前，尾段含 `/usr/local/bin`）。這裡必須取同一個來源，不能另抄一份字面值：
+#: 先前寫死的 `toolchain:/usr/bin:/bin` 少了 `/usr/local/bin`，實機 spec 永遠對不上。
+DEPLOYMENT_CANARY_BUILDER_PATH = DEFAULT_LAYOUT.job_path_value()
 #: #1096：部署層固定宣告的 `PSC_GATE_CMD_*`（見
 #: `docs/superpowers/runbooks/deployment-canary-probe.md` §5：canary 每張非-ship 卡
 #: 的 gate 身分只跑 `PSC_GATE_CMD_PYTEST`）。closeout 逐項驗證這個集合裡的每個
@@ -253,7 +257,7 @@ def _account_env(account: str) -> dict[str, str]:
         # root-owned，帳號唯一可寫的是 `cache`；copilot 1.0.88 會把自身 pkg 解到
         # `$XDG_CACHE_HOME/copilot/pkg`，沒有這一格就會嘗試建立不可寫的 `~/.cache`。
         "XDG_CACHE_HOME": f"{home}/cache",
-        "PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+        "PATH": DEPLOYMENT_CANARY_BUILDER_PATH,
         "NO_COLOR": "1",
         "CI": "true",
     }
@@ -4343,15 +4347,21 @@ def _bound_codex_builder_spec(
         cursor = cursor / part
         if cursor.is_symlink():
             raise QualificationFailure("Codex agent-loop runtime home contains a symlink")
-    if (
-        spec_env.get("CODEX_HOME") != str(expected_codex_home)
-        or spec_env.get("PATH") != DEPLOYMENT_CANARY_BUILDER_PATH
-        or expected_codex_home.is_symlink()
-        or not expected_codex_home.is_dir()
-        or expected_codex_home.stat().st_uid != _manager_uid()
-    ):
+    home_checks = {
+        "codex_home": spec_env.get("CODEX_HOME") == str(expected_codex_home),
+        "path": spec_env.get("PATH") == DEPLOYMENT_CANARY_BUILDER_PATH,
+        "slot_dir": not expected_codex_home.is_symlink()
+        and expected_codex_home.is_dir(),
+    }
+    home_checks["slot_owner"] = (
+        home_checks["slot_dir"]
+        and expected_codex_home.stat().st_uid == _manager_uid()
+    )
+    failed_home = sorted(name for name, ok in home_checks.items() if not ok)
+    if failed_home:
         raise QualificationFailure(
-            "Codex agent-loop runtime home is not the exact Manager-owned job slot"
+            "Codex agent-loop runtime home is not the exact Manager-owned job slot: "
+            + ",".join(failed_home)
         )
     try:
         job_runner.reject_unsafe_env(
