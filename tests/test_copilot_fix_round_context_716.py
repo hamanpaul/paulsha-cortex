@@ -75,3 +75,32 @@ def test_canary_fix_round_ignores_other_delivery_reasons(tmp_path: Path) -> None
     )
 
     assert driver._copilot_findings_candidate({"blocking_reason": projected}) is None
+
+
+def test_canary_fix_round_triggers_from_a_projected_verify_stop(tmp_path: Path) -> None:
+    """#716：verify 明示停止的 context 帶 candidate，經真實投影後 driver 能走 retry-build。"""
+    driver = _load_driver()
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    run = _seed_run(registry)
+    registry._manager_update_workflow_run(
+        run.run_id,
+        facets=("needs_human",),
+        needs_human_reason=diagnostic_reason(
+            "verification-terminal-explicit-stop",
+            "verification terminal 明示要求停止（status=failed）：summary=tasks unchecked",
+            source="manager._poll_workflow_job:explicit-stop",
+            run_id=run.run_id,
+            work_id=run.work_id,
+            card="verification",
+            phase="verify",
+            candidate=CANDIDATE,
+        ),
+    )
+    result = WorkflowRegistryProvider("hamanpaul/paulsha-cortex", state_path=state).scan()
+    projected = result.observations["needs_human_reasons"][run.work_id]
+
+    assert driver._canary_fix_round({"blocking_reason": projected}) == (
+        CANDIDATE,
+        "verification-terminal-explicit-stop",
+    )

@@ -18230,6 +18230,10 @@ def resume_workflow_run(
                 card=step.card,
                 declared_status=declared_status,
                 phase=step.phase,
+                # #716：這個停止點的正式出口是 `retry-build --expected-candidate`
+                # （#1206）；把 exact candidate 放進機器可讀 context，operator 與
+                # deployment canary 不必從 next_step_hint 的文字裡解析。
+                candidate=current.candidate_head,
             ),
         )
         return {

@@ -380,6 +380,9 @@ def test_verify_needs_human_terminal_becomes_explicit_stop_attention(
     assert "needs_human" in persisted.facets
     reason = dict(persisted.needs_human_reason)
     assert reason["reason"] == "verification-terminal-explicit-stop"
+    # #716：retry-build 出口需要的 exact candidate 放在機器可讀 context。
+    assert reason["context"]["candidate"] == persisted.candidate_head
+    assert persisted.candidate_head
     diagnostics = result["terminal_diagnostics"]
     assert reason["detail"] == _expected_attention_detail(
         "verification", "needs_human", diagnostics["model_diagnostics"]

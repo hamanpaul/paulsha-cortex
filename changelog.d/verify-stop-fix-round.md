@@ -1,0 +1,1 @@
+- #716：verify／review 明示停止的 needs_human context 帶出 exact `candidate`（`retry-build --expected-candidate` 所需，#1206 出口），deployment canary 的修正回合因此也涵蓋這兩種停止點（與 Copilot findings 共用 2 回合上限）；probe 範本 todo 改為指名 `tasks.md` 檔名。
