@@ -3901,7 +3901,7 @@ def test_full_dispatch_gives_up_after_the_copilot_fix_round_budget(
             repository="owner/repo", work_id="qualification-work", issue=42,
             release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
         )
-    assert len(_retry_build_calls(calls)) == driver.DEPLOYMENT_CANARY_COPILOT_FIX_ROUNDS
+    assert len(_retry_build_calls(calls)) == driver.DEPLOYMENT_CANARY_FIX_ROUNDS
 
 
 def test_full_dispatch_does_not_retry_other_needs_human_reasons(
@@ -3910,6 +3910,85 @@ def test_full_dispatch_does_not_retry_other_needs_human_reasons(
     driver = _load_driver()
     stop = _copilot_findings_stop("qualification-work")
     stop["blocking_reason"]["context"]["delivery_reason"] = "candidate-behind-main"
+    calls, _closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [stop])
+
+    with pytest.raises(driver.QualificationFailure, match="failed/needs_human terminal"):
+        driver._full_dispatch(
+            repository="owner/repo", work_id="qualification-work", issue=42,
+            release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
+        )
+    assert _retry_build_calls(calls) == []
+
+
+def _explicit_stop(work_id: str, reason: str, *, candidate: str | None = "c" * 40):
+    envelope = _work_show_envelope(work_id, state="on-going", facets=("needs_human",))
+    context = {"phase": "verify", "card": "verification"}
+    if candidate is not None:
+        context["candidate"] = candidate
+    envelope["blocking_reason"] = {
+        "reason": reason,
+        "detail": "verification terminal 明示要求停止（status=failed）",
+        "context": context,
+    }
+    return envelope
+
+
+@pytest.mark.parametrize(
+    "reason", ["verification-terminal-explicit-stop", "review-terminal-explicit-stop"]
+)
+def test_full_dispatch_hands_explicit_stops_to_the_builder_then_closes_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    """#716（canary run 37234528252）：verifier 抓到 builder 漏勾 OpenSpec tasks 而明示
+    停止，是系統如實攔下缺陷；canary 走 #1206 的 retry-build 出口交 builder 修正。"""
+
+    driver = _load_driver()
+    ongoing = _work_show_envelope("qualification-work", state="on-going")
+    finished = _work_show_envelope("qualification-work", state="on-going", run_status="done")
+    calls, closeouts = _full_dispatch_fixture(
+        driver, tmp_path, monkeypatch,
+        [ongoing, _explicit_stop("qualification-work", reason), ongoing, finished],
+    )
+
+    driver._full_dispatch(
+        repository="owner/repo", work_id="qualification-work", issue=42,
+        release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
+    )
+
+    retries = _retry_build_calls(calls)
+    assert len(retries) == 1
+    argv = retries[0]
+    assert argv[argv.index("--expected-candidate") + 1] == "c" * 40
+    assert reason in argv[argv.index("--reason") + 1]
+    assert closeouts == [finished["item"]]
+
+
+def test_full_dispatch_shares_one_fix_round_budget_across_stop_kinds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    stops = [
+        _explicit_stop("qualification-work", "verification-terminal-explicit-stop"),
+        _copilot_findings_stop("qualification-work"),
+        _explicit_stop("qualification-work", "verification-terminal-explicit-stop"),
+    ]
+    calls, _closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, stops)
+
+    with pytest.raises(driver.QualificationFailure, match="verification-terminal-explicit-stop"):
+        driver._full_dispatch(
+            repository="owner/repo", work_id="qualification-work", issue=42,
+            release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
+        )
+    assert len(_retry_build_calls(calls)) == driver.DEPLOYMENT_CANARY_FIX_ROUNDS
+
+
+def test_full_dispatch_does_not_retry_an_explicit_stop_without_a_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    stop = _explicit_stop(
+        "qualification-work", "verification-terminal-explicit-stop", candidate=None
+    )
     calls, _closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [stop])
 
     with pytest.raises(driver.QualificationFailure, match="failed/needs_human terminal"):

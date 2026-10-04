@@ -5580,7 +5580,13 @@ def _validate_canary_dispatch_model_identities(
 #: 交由 builder 修正的回合上限（#716）。Copilot 的總評即使是「Approval recommended」，
 #: 只要有一條（哪怕 optional）finding，ship 就停在 `delivery-needs-human`；canary 若一律
 #: 當失敗，等於要求首輪零 finding，而那不是部署是否可用的判準。
-DEPLOYMENT_CANARY_COPILOT_FIX_ROUNDS = 2
+DEPLOYMENT_CANARY_FIX_ROUNDS = 2
+#: 同一個 `retry-build` 出口也收 verify／review 卡的明示停止（#1206）：那是 verifier／
+#: reviewer 抓到 builder 的缺陷（例如 todo 勾了、OpenSpec tasks 卻沒勾），系統如實攔下，
+#: 不是部署壞掉。與 Copilot findings 共用回合上限。
+DEPLOYMENT_CANARY_EXPLICIT_STOP_REASONS = frozenset(
+    {"verification-terminal-explicit-stop", "review-terminal-explicit-stop"}
+)
 
 
 def _copilot_findings_candidate(terminal: object) -> str | None:
@@ -5599,6 +5605,25 @@ def _copilot_findings_candidate(terminal: object) -> str | None:
     if not isinstance(candidate, str) or SHA40.fullmatch(candidate) is None:
         return None
     return candidate
+
+
+def _canary_fix_round(terminal: object) -> tuple[str, str] | None:
+    """canary 可交 builder 以 `retry-build` 修正的停止點：回傳 `(exact candidate, 理由)`。"""
+
+    candidate = _copilot_findings_candidate(terminal)
+    if candidate is not None:
+        return candidate, "Copilot review findings"
+    blocking = terminal.get("blocking_reason") if isinstance(terminal, Mapping) else None
+    context = blocking.get("context") if isinstance(blocking, Mapping) else None
+    reason = blocking.get("reason") if isinstance(blocking, Mapping) else None
+    candidate = context.get("candidate") if isinstance(context, Mapping) else None
+    if (
+        reason in DEPLOYMENT_CANARY_EXPLICIT_STOP_REASONS
+        and isinstance(candidate, str)
+        and SHA40.fullmatch(candidate) is not None
+    ):
+        return candidate, f"{reason}"
+    return None
 
 
 def _dispatch_blocking_summary(terminal: object) -> str:
@@ -6001,7 +6026,7 @@ def _full_dispatch(
     deadline = time.monotonic() + timeout
     item: Mapping[str, object] | None = None
     observed: Mapping[str, object] | None = None
-    copilot_fix_rounds = 0
+    fix_rounds = 0
     while time.monotonic() < deadline:
         status = _run(
             (
@@ -6027,11 +6052,12 @@ def _full_dispatch(
                     item = candidate
                     break
                 if verdict == "failed":
-                    fix_candidate = _copilot_findings_candidate(envelope)
+                    fix_round = _canary_fix_round(envelope)
                     if (
-                        fix_candidate is not None
-                        and copilot_fix_rounds < DEPLOYMENT_CANARY_COPILOT_FIX_ROUNDS
+                        fix_round is not None
+                        and fix_rounds < DEPLOYMENT_CANARY_FIX_ROUNDS
                     ):
+                        fix_candidate, fix_reason = fix_round
                         retry = _run(
                             (
                                 "/opt/cortex/venv/bin/cortex",
@@ -6046,8 +6072,8 @@ def _full_dispatch(
                                 "--actor",
                                 "deployment-canary",
                                 "--reason",
-                                "deployment canary：Copilot review findings 交由 builder 修正"
-                                "（#1139 的 retry-build 出口）",
+                                f"deployment canary：{fix_reason} 交由 builder 修正"
+                                "（retry-build 出口，#1139／#1206）",
                                 "--wait",
                                 "--timeout",
                                 "60",
@@ -6056,10 +6082,10 @@ def _full_dispatch(
                             env=runtime_env,
                             timeout=90,
                         )
-                        _require_success(retry, "copilot findings retry-build")
-                        copilot_fix_rounds += 1
+                        _require_success(retry, "canary fix-round retry-build")
+                        fix_rounds += 1
                         print(
-                            f"copilot findings fix round {copilot_fix_rounds} dispatched",
+                            f"canary fix round {fix_rounds} dispatched ({fix_reason})",
                             file=sys.stderr,
                             flush=True,
                         )
