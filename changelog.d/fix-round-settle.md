@@ -1,0 +1,1 @@
+- #716 canary 修正回合：retry-build 受理後，同一個 (candidate, 理由) 停止點在 Monitor snapshot 沉澱窗口（300 秒）內只等不重派，避免撞上剛派出的 build job（`retry-build reset refuses active workflow job`）；窗口過後仍是同一點才判失敗。

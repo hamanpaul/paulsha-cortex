@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 canary 修正回合沉澱窗口**：同一停止點在 snapshot 刷新前不重送 retry-build（#716）。
 - **#716 explicit stop 帶 candidate、canary 修正回合涵蓋 verify／review 停止**：`work show` 的 context 可直接取 retry-build 所需 candidate（#716）。
 - **#716 canary closeout 以 Manager 身分跑 git**：bundle verify／worktree list 改以 cortex-manager 執行，worktree 殘留時列出卡片（#716）。
 - **#716 work show 帶出 needs_human context**：`blocking_reason.context`（candidate、delivery_reason 等）投影到 `work show --json`，canary 的 Copilot 修正回合得以觸發；probe 範本 todo 的 meta 項目改為 builder 可完成的寫法（#716）。

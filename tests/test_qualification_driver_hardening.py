@@ -3893,8 +3893,12 @@ def test_full_dispatch_gives_up_after_the_copilot_fix_round_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     driver = _load_driver()
-    stop = _copilot_findings_stop("qualification-work")
-    calls, _closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [stop])
+    # 每一輪 retry-build 都產生新 candidate；同一個 candidate 的停止點只會等它沉澱。
+    stops = [
+        _copilot_findings_stop("qualification-work", candidate=str(index) * 40)
+        for index in range(1, driver.DEPLOYMENT_CANARY_FIX_ROUNDS + 2)
+    ]
+    calls, _closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, stops)
 
     with pytest.raises(driver.QualificationFailure, match="copilot-findings"):
         driver._full_dispatch(
@@ -3968,9 +3972,13 @@ def test_full_dispatch_shares_one_fix_round_budget_across_stop_kinds(
 ) -> None:
     driver = _load_driver()
     stops = [
-        _explicit_stop("qualification-work", "verification-terminal-explicit-stop"),
-        _copilot_findings_stop("qualification-work"),
-        _explicit_stop("qualification-work", "verification-terminal-explicit-stop"),
+        _explicit_stop(
+            "qualification-work", "verification-terminal-explicit-stop", candidate="1" * 40
+        ),
+        _copilot_findings_stop("qualification-work", candidate="2" * 40),
+        _explicit_stop(
+            "qualification-work", "verification-terminal-explicit-stop", candidate="3" * 40
+        ),
     ]
     calls, _closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, stops)
 
@@ -3997,6 +4005,45 @@ def test_full_dispatch_does_not_retry_an_explicit_stop_without_a_candidate(
             release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
         )
     assert _retry_build_calls(calls) == []
+
+
+def test_full_dispatch_waits_out_the_stale_stop_after_a_fix_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716（canary run 37239630311）：retry-build 受理後，Monitor snapshot 約一分鐘才
+    反映；這段期間讀到的同一個停止點不得再送 retry-build（會撞上剛派出的 build job）。"""
+
+    driver = _load_driver()
+    stop = _explicit_stop("qualification-work", "verification-terminal-explicit-stop")
+    ongoing = _work_show_envelope("qualification-work", state="on-going")
+    finished = _work_show_envelope("qualification-work", state="on-going", run_status="done")
+    calls, closeouts = _full_dispatch_fixture(
+        driver, tmp_path, monkeypatch, [stop, stop, stop, ongoing, finished]
+    )
+
+    driver._full_dispatch(
+        repository="owner/repo", work_id="qualification-work", issue=42,
+        release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
+    )
+
+    assert len(_retry_build_calls(calls)) == 1
+    assert closeouts == [finished["item"]]
+
+
+def test_full_dispatch_fails_when_the_same_stop_outlives_the_settle_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "DEPLOYMENT_CANARY_FIX_ROUND_SETTLE_SECONDS", 0)
+    stop = _explicit_stop("qualification-work", "verification-terminal-explicit-stop")
+    calls, _closeouts = _full_dispatch_fixture(driver, tmp_path, monkeypatch, [stop])
+
+    with pytest.raises(driver.QualificationFailure, match="verification-terminal-explicit-stop"):
+        driver._full_dispatch(
+            repository="owner/repo", work_id="qualification-work", issue=42,
+            release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
+        )
+    assert len(_retry_build_calls(calls)) == 1
 
 
 def test_driver_gate_ledger_phases_mirror_the_manager_contract() -> None:
