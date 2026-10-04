@@ -5584,6 +5584,11 @@ DEPLOYMENT_CANARY_FIX_ROUNDS = 2
 #: 同一個 `retry-build` 出口也收 verify／review 卡的明示停止（#1206）：那是 verifier／
 #: reviewer 抓到 builder 的缺陷（例如 todo 勾了、OpenSpec tasks 卻沒勾），系統如實攔下，
 #: 不是部署壞掉。與 Copilot findings 共用回合上限。
+#: retry-build 被受理後，`work show` 要等 Monitor snapshot 下一次 refresh（約一分鐘）才
+#: 看得到新狀態；這段期間讀到的仍是同一個停止點。同一個 (candidate, 理由) 在這個窗口內
+#: 只等不重派——再送一次 retry-build 會撞上剛派出的 build job（canary run 37239630311：
+#: `retry-build reset refuses active workflow job`）。窗口過了仍是同一點才判失敗。
+DEPLOYMENT_CANARY_FIX_ROUND_SETTLE_SECONDS = 300
 DEPLOYMENT_CANARY_EXPLICIT_STOP_REASONS = frozenset(
     {"verification-terminal-explicit-stop", "review-terminal-explicit-stop"}
 )
@@ -6027,6 +6032,7 @@ def _full_dispatch(
     item: Mapping[str, object] | None = None
     observed: Mapping[str, object] | None = None
     fix_rounds = 0
+    handled_stops: dict[tuple[str, str], float] = {}
     while time.monotonic() < deadline:
         status = _run(
             (
@@ -6053,8 +6059,19 @@ def _full_dispatch(
                     break
                 if verdict == "failed":
                     fix_round = _canary_fix_round(envelope)
+                    handled_at = (
+                        handled_stops.get(fix_round) if fix_round is not None else None
+                    )
+                    if (
+                        handled_at is not None
+                        and time.monotonic() - handled_at
+                        < DEPLOYMENT_CANARY_FIX_ROUND_SETTLE_SECONDS
+                    ):
+                        time.sleep(10)
+                        continue
                     if (
                         fix_round is not None
+                        and handled_at is None
                         and fix_rounds < DEPLOYMENT_CANARY_FIX_ROUNDS
                     ):
                         fix_candidate, fix_reason = fix_round
@@ -6084,6 +6101,7 @@ def _full_dispatch(
                         )
                         _require_success(retry, "canary fix-round retry-build")
                         fix_rounds += 1
+                        handled_stops[fix_round] = time.monotonic()
                         print(
                             f"canary fix round {fix_rounds} dispatched ({fix_reason})",
                             file=sys.stderr,
