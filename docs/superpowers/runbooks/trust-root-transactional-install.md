@@ -22,6 +22,9 @@ refs:
 
     sudo /opt/cortex/venv/bin/cortex upgrade <版本>
 
+經 SSH 升級時，一律在 `tmux` 或 `screen` 裡執行 `cortex upgrade`：斷線送出的 SIGHUP 雖會自動
+rollback，但升級本身就此中止，終端機上的摘要也會跟著消失。
+
 工具依序執行下列 §1–§5：以 GitHub Releases REST metadata 取得 annotated tag 的 commit target
 與三個 asset digest，驗過 qualification manifest、archive topology 與 bundle 每一個檔案後，
 在新的 `/var/lib/cortex-installer/<版本>/attempt-*` 目錄封存 candidate CLI；以非 root 身分產生
@@ -36,7 +39,8 @@ receipt 由 receipt chain 判定，不看檔名或時間。結果寫在
 - activate 之前的失敗（ingress、plan、apply、credential handoff）會自動 rollback 並恢復原本
   active 的服務。activate 之後的失敗若 rollback 回報 `restore_safe=false`，服務維持停止、
   snapshot 保留，報告列出保留的 unknown state／drift；處理後執行
-  `sudo /opt/cortex/venv/bin/cortex upgrade --recover`，或依 §6 由 operator 裁決。
+  `sudo /opt/cortex/venv/bin/cortex upgrade --recover`，或依 §6「手動恢復 `cortex upgrade`
+  中斷的升級」由 operator 裁決。
 - 新 plan 若要求 prior receipt 沒有記錄的 credential（例如新增 provider），升級會在 activate
   前停止並回到 prior；依 §4 匯入後改走下列手動流程。
 - `cortex upgrade --status` 唯讀顯示生效中的 receipt、上一次升級結果與 loaded runtime 是否一致。
@@ -1024,6 +1028,27 @@ recovery 完成。若回報 retained unknown/drift，marker 與 snapshot 會保�
 stopped；若 service restore 本身失敗，流程會重新 stop 已嘗試恢復的 units 並保留 recovery
 state，必須先人工裁決。不得改用 tokenless rollback 或手動刪 receipt。下一次正常執行會
 產生新的 effective receipt nonce，因此已安全收斂的舊 receipt 可保留為稽核紀錄。
+
+### 手動恢復 `cortex upgrade` 中斷的升級
+
+`cortex upgrade` 中斷或停在原地（`halted`）時，第一步一律先執行
+`sudo /opt/cortex/venv/bin/cortex upgrade --recover`：它從 maintenance snapshot（只剩 stale
+lease marker 時改用 marker）取得 plan sha、核對 durable plan，再走上面同一個 `recover`。只有
+它拒絕執行或回報要人工裁決時，才照上面的 snippet 手動恢復。這時 snippet 裡寫死的
+`0.1.12/venv` 不適用：該次升級的 sealed CLI 在它自己的 attempt 目錄。每個變數改由該次升級的
+report（`/var/lib/cortex-installer/<版本>/upgrade-report.json`，與
+`/var/lib/cortex-installer/last-upgrade-report.json` 內容相同）對應：
+
+| snippet 變數 | 該次 `cortex upgrade` 的來源 |
+| --- | --- |
+| `cortex_bootstrap_root` | report 的 `candidate.attempt_dir`（`/var/lib/cortex-installer/<版本>/attempt-*`），因此 `cortex_cli` 是 `<attempt_dir>/venv/bin/cortex` |
+| `cortex_recovery_sealed_cli_tree_sha` | 照 snippet 算出後必須等於 report 的 `candidate.cli_tree_sha256`（同一套 tree digest）；不相等就停止，交給人工裁決 |
+| `cortex_confirmed_plan_sha`（`read -r -p` 輸入） | report 的 `plan.sha256`；必須等於 `/var/lib/cortex-installer/maintenance-snapshot.json` 的 `plan_sha256`，沒有 snapshot 時則等於 `/run/paulsha-cortex-trust-root/maintenance.lock` marker 的 `plan_sha256` |
+| `cortex_plan_path` | report 的 `plan.durable_path`，也就是 `/var/lib/cortex-installer/plans/<plan sha>.json` |
+| 要 rollback 的 receipt | report 的 `receipt.path`；必須等於 snapshot 的 `receipt_path`。`recover` 自己讀 snapshot，不需輸入 |
+
+三者（report、snapshot 或 marker、durable plan）任何一處對不上，都不要硬湊變數執行，維持服務
+停止並人工裁決。
 
 ## 7. Deployment canary
 
