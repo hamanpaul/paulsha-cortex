@@ -4262,8 +4262,13 @@ def _is_read_only_file_view(segment: Sequence[str], *, expected_worktree: str) -
 
 
 def _is_worktree_path(arg: str, *, expected_worktree: str) -> bool:
-    """路徑參數是否留在 bound worktree 內（#716）：不得含 `..`；絕對路徑只能是 worktree 本身或其下。"""
+    """路徑參數是否留在 bound worktree 內（#716）：不得含 `..`；絕對路徑只能是 worktree 本身或其下。
 
+    `~` 開頭的字詞會被 bash 展開成 home 目錄，`shlex` 去引號後卻看成相對路徑，一律不收。
+    """
+
+    if arg.startswith("~"):
+        return False
     path = Path(arg)
     if ".." in path.parts:
         return False

@@ -4733,6 +4733,29 @@ def test_codex_agent_loop_still_rejects_the_failed_canary_37343291869_rg_probe()
     assert "exit=127 status='failed' accepted=True head_in_output=True" in message
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/bin/bash -lc 'git rev-parse HEAD && cat ~/x'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg pattern ~/x'",
+        "/bin/bash -lc 'git rev-parse HEAD && find ~ -name x'",
+    ],
+)
+def test_codex_agent_loop_rejects_tilde_paths_in_head_probe_chains(command: str) -> None:
+    """#716：bash 會把 `~` 開頭的字詞展開成 home 目錄，`shlex` 看到的卻是相對路徑；
+    檢視／搜尋段的路徑以 `~` 開頭就跑出 bound worktree，整條不算數。"""
+    driver = _load_driver()
+
+    assert not driver._is_expected_head_probe(command, expected_worktree=_HEAD_PROBE_WORKTREE)
+    with pytest.raises(driver.QualificationFailure) as caught:
+        driver._codex_agent_loop_observation(
+            (("build-job", _head_probe_log(command, "a" * 40 + "\n")),),
+            expected_head="a" * 40,
+            expected_worktree=_HEAD_PROBE_WORKTREE,
+        )
+    assert "exit=0 status='completed' accepted=False head_in_output=True" in str(caught.value)
+
+
 def test_codex_agent_loop_read_only_search_without_head_is_not_a_proof() -> None:
     """#716：允許 `rg`／`find` 段不代表放寬 proof——鏈中沒有印出 HEAD 的 git 段就不算，
     即使輸出剛好含 HEAD（canary run 37343291869 第 2 筆的形狀）。"""
