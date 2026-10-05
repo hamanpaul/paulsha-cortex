@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from paulsha_cortex.coordinator import verification
 from paulsha_cortex.trust_root.permgen import DEFAULT_LAYOUT
 from qualification.contract import (
     CANARY_BUILDER,
@@ -1560,6 +1561,39 @@ def _write_json(path: Path, value: object) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _write_delivery_adapter_envelope_payload(
+    directory: Path, payload: dict
+) -> tuple[Path, str]:
+    """以生產環境 `work_bridge._write_json_evidence` 的 envelope 形狀寫 copilot
+    delivery gate 證據：`{"payload": payload, "hash": canonical_json_hash(payload)}`，
+    檔名＝digest（#716，canary run 37308848071）。"""
+
+    digest = verification.canonical_json_hash(payload)
+    envelope = {"payload": payload, "hash": digest}
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{digest}.json"
+    path.write_text(
+        json.dumps(envelope, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    return path, digest
+
+
+def _write_delivery_adapter_envelope(
+    directory: Path, *, run_id: str, candidate: str, **extra: object
+) -> tuple[Path, str]:
+    payload = {
+        "schema": "cortex-delivery-adapter/v1",
+        "run_id": run_id,
+        "candidate": candidate,
+        "action": "done",
+        "pr_number": 1,
+        **extra,
+    }
+    return _write_delivery_adapter_envelope_payload(directory, payload)
+
+
 def _dispatch_fixture(tmp_path: Path, driver):
     coordinator = tmp_path / "coordinator"
     repo = tmp_path / "repo"
@@ -1893,17 +1927,13 @@ def _dispatch_fixture(tmp_path: Path, driver):
     )
     artifacts.append(brainstorm_path)
     review_path, review_hash = workflow_evidence["review"]
-    copilot_path = coordinator / "evidence" / "delivery-adapter" / "copilot.json"
-    copilot_hash = _write_json(
-        copilot_path,
-        {
-            "schema_version": 1,
-            "kind": "copilot",
-            "run_id": run_id,
-            "work_id": work_id,
-            "candidate": candidate,
-            "status": "passed",
-        },
+    # #716（canary run 37308848071）：copilot 不是普通檔案雜湊比對，而是
+    # `work_bridge._write_json_evidence` 的 `{"payload":..., "hash":...}` envelope，
+    # 檔名＝digest。fixture 必須照生產形狀寫，否則測不到真的回歸。
+    copilot_path, copilot_hash = _write_delivery_adapter_envelope(
+        coordinator / "evidence" / "delivery-adapter",
+        run_id=run_id,
+        candidate=candidate,
     )
     artifacts.append(copilot_path)
     gate_refs = [
@@ -3227,25 +3257,156 @@ def test_dispatch_closeout_rejects_a_gate_ledger_slice_id_mismatch(
     "field,value",
     [
         ("run_id", "another-run"),
-        ("work_id", "another-work"),
         ("candidate", "c" * 40),
     ],
 )
 def test_dispatch_closeout_rejects_delivery_gate_evidence_from_another_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: str
 ) -> None:
-    """copilot delivery gate evidence 若自報的 run_id／work_id／candidate 與本次
-    派工不符，closeout 必須拒絕——過去只以 kind／path／hash 採信，他 run 或舊
-    candidate 遺留、hash 對得上的合法檔案一樣能滿足 closeout。"""
+    """copilot delivery gate evidence（`_write_json_evidence` envelope 的
+    payload）若自報的 run_id／candidate 與本次派工不符，closeout 必須拒絕——過去
+    只以 kind／path／hash 採信，他 run 或舊 candidate 遺留、hash 對得上的合法檔案
+    一樣能滿足 closeout。雜湊照正確值重算，只有欄位不符，確認失敗來自綁定檢查
+    而非 envelope 雜湊檢查。"""
 
     driver = _load_driver()
     fixture = _dispatch_fixture(tmp_path, driver)
     payload = json.loads(fixture["registry"].read_text())
     refs = payload["workflows"][0]["gate_refs"]
     copilot_ref = next(row for row in refs if row["kind"] == "copilot")
-    tampered = json.loads(Path(copilot_ref["ref"]).read_text())
-    tampered[field] = value
-    copilot_ref["sha256"] = _write_json(Path(copilot_ref["ref"]), tampered)
+    original = json.loads(Path(copilot_ref["ref"]).read_text())
+    tampered_payload = dict(original["payload"])
+    tampered_payload[field] = value
+    Path(copilot_ref["ref"]).unlink()
+    new_path, new_hash = _write_delivery_adapter_envelope_payload(
+        Path(copilot_ref["ref"]).parent, tampered_payload
+    )
+    copilot_ref["ref"] = str(new_path)
+    copilot_ref["sha256"] = new_hash
+    _write_json(fixture["registry"], payload)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    with pytest.raises(
+        driver.QualificationFailure, match="not bound to this dispatch"
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+def test_dispatch_closeout_rejects_brainstorm_delivery_gate_evidence_from_another_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """非 copilot kind（如 brainstorm，走一般檔案 bytes 雜湊比對）的 delivery gate
+    evidence 若自報 work_id 與本次派工不符，closeout 一樣要拒絕——copilot 改用
+    envelope 語意後，payload 本身沒有 work_id 欄位，這條規則改由仍帶 work_id 的
+    其他 kind 覆蓋。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    payload = json.loads(fixture["registry"].read_text())
+    refs = payload["workflows"][0]["gate_refs"]
+    brainstorm_ref = next(row for row in refs if row["kind"] == "brainstorm")
+    tampered = json.loads(Path(brainstorm_ref["ref"]).read_text())
+    tampered["work_id"] = "another-work"
+    brainstorm_ref["sha256"] = _write_json(Path(brainstorm_ref["ref"]), tampered)
+    _write_json(fixture["registry"], payload)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    with pytest.raises(
+        driver.QualificationFailure, match="not bound to this dispatch"
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["wrong-stem", "hash-not-row", "payload-tampered", "extra-keys"],
+)
+def test_dispatch_closeout_rejects_malformed_copilot_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    """#716（canary run 37308848071）：copilot gate ref 的 envelope 語意——檔名＝
+    digest、`{"payload","hash"}` 恰好兩個鍵、envelope["hash"] 與 payload 的
+    canonical hash 都要等於 row 記的 sha256——任一環節被破壞，都要以同一句
+    「hash mismatch」擋下，不能被格式看似合法但語意不符的檔案通過。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    payload = json.loads(fixture["registry"].read_text())
+    refs = payload["workflows"][0]["gate_refs"]
+    copilot_ref = next(row for row in refs if row["kind"] == "copilot")
+    directory = Path(copilot_ref["ref"]).parent
+    original = json.loads(Path(copilot_ref["ref"]).read_text())
+    delivery_payload = original["payload"]
+    digest = original["hash"]
+
+    if mutation == "wrong-stem":
+        # 內容合法、row 的 sha256 也對得上檔案真實內容，只是檔名＝別的 digest。
+        decoy_path = directory / ("0" * 64 + ".json")
+        decoy_path.write_text(
+            json.dumps(original, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        decoy_path.chmod(0o600)
+        copilot_ref["ref"] = str(decoy_path)
+    elif mutation == "hash-not-row":
+        # 檔名＝row 記的 sha256，但 envelope 自己的 "hash" 欄位是別的值。
+        tampered_envelope = {"payload": delivery_payload, "hash": "1" * 64}
+        Path(copilot_ref["ref"]).write_text(
+            json.dumps(tampered_envelope, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    elif mutation == "payload-tampered":
+        # envelope["hash"] 與檔名都還是舊 digest，但 payload 內容被偷改，
+        # canonical hash 已經對不上。
+        tampered_payload = dict(delivery_payload)
+        tampered_payload["action"] = "archive-applied-needs-commit"
+        tampered_envelope = {"payload": tampered_payload, "hash": digest}
+        Path(copilot_ref["ref"]).write_text(
+            json.dumps(tampered_envelope, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        assert mutation == "extra-keys"
+        tampered_envelope = {
+            "payload": delivery_payload,
+            "hash": digest,
+            "note": "unexpected",
+        }
+        Path(copilot_ref["ref"]).write_text(
+            json.dumps(tampered_envelope, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    _write_json(fixture["registry"], payload)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+    with pytest.raises(
+        driver.QualificationFailure, match=r"gate hash mismatch: copilot:"
+    ):
+        _validate_fixture_closeout(driver, fixture)
+
+
+def test_dispatch_closeout_rejects_copilot_payload_with_the_wrong_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """copilot envelope 的結構、雜湊、run_id／candidate 都對，但 payload 的
+    `schema` 不是 `cortex-delivery-adapter/v1`——代表來源不是
+    `work_bridge._write_json_evidence` 寫出的 delivery-adapter 證據，仍要擋下。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    payload = json.loads(fixture["registry"].read_text())
+    refs = payload["workflows"][0]["gate_refs"]
+    copilot_ref = next(row for row in refs if row["kind"] == "copilot")
+    original = json.loads(Path(copilot_ref["ref"]).read_text())
+    tampered_payload = dict(original["payload"])
+    tampered_payload["schema"] = "cortex-some-other-adapter/v1"
+    Path(copilot_ref["ref"]).unlink()
+    new_path, new_hash = _write_delivery_adapter_envelope_payload(
+        Path(copilot_ref["ref"]).parent, tampered_payload
+    )
+    copilot_ref["ref"] = str(new_path)
+    copilot_ref["sha256"] = new_hash
     _write_json(fixture["registry"], payload)
     monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
     monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
@@ -4688,15 +4849,21 @@ def test_dispatch_closeout_names_the_failing_delivery_gate_ref(
     fixture = _dispatch_fixture(tmp_path, driver)
     payload = json.loads(fixture["registry"].read_text())
     refs = payload["workflows"][0]["gate_refs"]
-    foreign_ref = next(row for row in refs if row["kind"] == "foreign-review")
     copilot_ref = next(row for row in refs if row["kind"] == "copilot")
     if mutation == "hash":
         copilot_ref["sha256"] = "0" * 64
     else:
-        # copilot 指向與 foreign-review 同一份檔案（hash 也一致），只能以路徑重複擋下。
-        copilot_ref["ref"] = foreign_ref["ref"]
-        copilot_ref["sha256"] = foreign_ref["sha256"]
-        refs.sort(key=lambda row: row["kind"] != "foreign-review")
+        # copilot 的 envelope 語意要求檔名＝digest，所以不能再像以前那樣讓 copilot
+        # 指到 foreign-review 的檔案（名字對不上就先撞 envelope 檢查、測不到路徑
+        # 重複）。改成反方向：brainstorm（一般 kind，只比 bytes 雜湊，不管內容
+        # 形狀）指到 copilot 的 envelope 檔案，雜湊填該檔案真實的 bytes 雜湊；
+        # copilot 自己這列維持原樣、合法。brainstorm 在 gate_refs 裡排在 copilot
+        # 之前，先登記路徑，輪到 copilot 時就只能以路徑重複擋下。
+        brainstorm_ref = next(row for row in refs if row["kind"] == "brainstorm")
+        brainstorm_ref["ref"] = copilot_ref["ref"]
+        brainstorm_ref["sha256"] = hashlib.sha256(
+            Path(copilot_ref["ref"]).read_bytes()
+        ).hexdigest()
     _write_json(fixture["registry"], payload)
     monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
     monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
