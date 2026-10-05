@@ -128,6 +128,7 @@
 
 ### Fixed
 
+- **#716 ship merge gate 遇到仍在跑的 check 改為等待而非 needs_human**：gate 唯一理由是 `checks-not-terminal-green`、且所有非綠 check 都還是非終局 status（queued／in_progress／waiting／requested／pending）時，Copilot 與 maintainer-review 兩條 ship 路徑共用 `_checks_pending_response` 回非終局 `checks-pending`（附 `pending_checks`），不寫 merge authorization、不動 ship state、不吃 repair round，delivery adapter 映射為 pending、下一個 tick 以同一 exact HEAD 與同一筆 Copilot review 重評；completed 但非綠、未知 status、沒有任何 check 或併有其他 gate 理由仍 fail-closed 擲例外（canary run 37320144662：`copilot-pull-request-reviewer` check 仍 in_progress 時 tick 撞 `merge authorization blocked: checks-not-terminal-green` → `resume-workflow-failed`）（#716）。
 - **#716 canary closeout 以 envelope 語意驗 copilot gate ref**：`copilot` delivery gate ref 記的是 `work_bridge._write_json_evidence` 寫出的 `{"payload": ..., "hash": ...}` envelope（payload 的 canonical hash，不是檔案 bytes 雜湊），closeout 改認 envelope 語意——檔名＝digest、envelope 的 `hash` 與 payload 的 canonical hash 都要等於 row 記的 sha256，payload 另外核對 schema／run_id／candidate——不再對它做純 bytes 雜湊比對；dispatch artifact ledger 一律記真實 bytes 雜湊，不混用 gate-ref 語意的 digest（canary run 37308848071）（#716）。
 - **#716 canary 探針卡的唯讀模板**：worktree-isolation（write-forbidden）必須跑在 `cortex-job-ro[-jit]@`，spec 檢查失敗時列出不成立的條件（#716）。
 - **#716 canary 結案的 evidence candidate 綁定**：每張卡的 evidence 綁它自己的 subject，另要求最終 candidate 被 verify 與 review（archive commit 會換掉 candidate）（#716）。

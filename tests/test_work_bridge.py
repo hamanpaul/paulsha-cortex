@@ -231,6 +231,8 @@ def _successful_main_probe_runner(candidate: str):
         ("fix-required", "needs_human"),
         ("needs_human", "needs_human"),
         ("awaiting-copilot", "pending"),
+        # #716：merge gate 只差仍在跑的 check → 非終局等待，下一個 tick 重評。
+        ("checks-pending", "pending"),
     ],
 )
 def test_delivery_adapter_status(action: object, expected: str) -> None:
