@@ -1143,5 +1143,207 @@ def perform_upgrade(options: UpgradeOptions) -> int:
         os.umask(previous_umask)
 
 
+# --- recovery and status (spec §3, §7, §12.6) ------------------------------------
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _interrupted_plan_sha() -> str | None:
+    """Plan sha of an interrupted upgrade: the snapshot first, else a stale marker."""
+
+    snapshot = install_cli._read_maintenance_snapshot()
+    if snapshot is not None:
+        value = snapshot.get("plan_sha256")
+    else:
+        with install_cli._host_lock_file(leaf="maintenance.lock") as lock_fd:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise UpgradeError(
+                    "the interrupted upgrade's maintenance window is still held by a "
+                    "live process; recovery refuses to run"
+                ) from exc
+            marker = install_cli._maintenance_lock_payload(lock_fd, allow_absent=True)
+        if marker is None:
+            return None
+        value = marker.get("plan_sha256")
+    if not isinstance(value, str) or _SHA256_HEX.fullmatch(value) is None:
+        raise UpgradeError("the maintenance record does not name a plan sha256")
+    return value
+
+
+def verified_durable_plan(plan_sha: str) -> Path:
+    """Runbook §6 checks on the root-owned durable plan named by ``plan_sha``."""
+
+    plans_root = install_cli._TRUST_ROOT_MAINTENANCE_ROOT / "plans"
+    path = plans_root / f"{plan_sha}.json"
+    try:
+        observed = path.lstat()
+        parent = plans_root.lstat()
+    except FileNotFoundError as exc:
+        raise UpgradeError(
+            f"the durable plan of the interrupted upgrade is missing: {path}"
+        ) from exc
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != _OWNER_UID
+        or observed.st_nlink != 1
+        or stat.S_IMODE(observed.st_mode) != 0o600
+    ):
+        raise UpgradeError("durable reviewed plan is unsafe")
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != _OWNER_UID
+        or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        raise UpgradeError("durable plan root is unsafe")
+    if hashlib.sha256(_read_regular_bytes(path)).hexdigest() != plan_sha:
+        raise UpgradeError("durable reviewed plan digest mismatch")
+    return path
+
+
+def _mark_last_report(plan_sha: str, *, recovered: bool) -> None:
+    path = install_cli._TRUST_ROOT_MAINTENANCE_ROOT / _LAST_REPORT_NAME
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return
+    plan = report.get("plan") if isinstance(report, dict) else None
+    if not isinstance(plan, dict) or plan.get("sha256") != plan_sha:
+        return
+    report["result"] = "recovered" if recovered else "halted"
+    report["recovered_at"] = _now()
+    _publish_report(report)
+
+
+def recover_upgrade() -> int:
+    """Runbook §6 without re-entering the plan sha: it comes from the snapshot."""
+
+    previous_umask = os.umask(0o077)
+    try:
+        _pin_import_paths()
+        with install_cli._host_lock(
+            leaf="upgrade.lock", conflict="another `cortex upgrade` is already running"
+        ):
+            plan_sha = _interrupted_plan_sha()
+            if plan_sha is None:
+                install_cli._emit(
+                    {"maintenance_recovered": False, "reason": "nothing-to-recover"}
+                )
+                return 0
+            durable = verified_durable_plan(plan_sha)
+            try:
+                code = install_cli._recover_command(
+                    Namespace(plan=str(durable), confirm_sha256=plan_sha)
+                )
+            except InstallError:
+                _mark_last_report(plan_sha, recovered=False)
+                raise
+            _mark_last_report(plan_sha, recovered=code == 0)
+            return code
+    finally:
+        os.umask(previous_umask)
+
+
+def upgrade_status() -> dict[str, object]:
+    """Read-only: effective receipt, loaded runtime, last upgrade, pending recovery."""
+
+    root = install_cli._TRUST_ROOT_MAINTENANCE_ROOT
+    status: dict[str, object] = {
+        "effective_receipt": None,
+        "loaded_runtime": None,
+        "last_upgrade": None,
+        "maintenance_pending": os.path.lexists(install_cli._maintenance_snapshot_path()),
+    }
+    try:
+        receipt = effective_receipt(_STATE_ROOT)
+    except InstallError as exc:
+        status["effective_receipt_error"] = str(exc)
+    else:
+        document = receipt.to_dict()
+        plan = document.get("plan")
+        candidate = plan.get("candidate") if isinstance(plan, Mapping) else None
+        wheel = candidate.get("wheel") if isinstance(candidate, Mapping) else None
+        try:
+            version: str | None = format_version(
+                wheel_version(wheel.get("path") if isinstance(wheel, Mapping) else None)
+            )
+        except InstallError:
+            version = None
+        status["effective_receipt"] = {
+            "path": str(receipt.path),
+            "receipt_id": document.get("receipt_id"),
+            "version": version,
+        }
+        if isinstance(plan, Mapping) and receipt.path is not None:
+            mismatch, _payload = await_loaded_runtime(
+                plan, receipt.path, runtime_expected(document), settle_seconds=0
+            )
+            status["loaded_runtime"] = "match" if not mismatch else mismatch
+    try:
+        report = json.loads((root / _LAST_REPORT_NAME).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        report = None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        status["last_upgrade_error"] = f"last upgrade report is unreadable: {exc}"
+        report = None
+    if isinstance(report, dict):
+        status["last_upgrade"] = {
+            key: report.get(key)
+            for key in ("version", "result", "failed_step", "error", "finished_at", "report_path")
+        }
+    return status
+
+
+def _status_ok(status: Mapping[str, object]) -> bool:
+    return (
+        isinstance(status.get("effective_receipt"), Mapping)
+        and status.get("loaded_runtime") == "match"
+        and not status.get("maintenance_pending")
+    )
+
+
+def _print_status(status: Mapping[str, object], *, json_output: bool) -> None:
+    if json_output:
+        sys.stdout.write(
+            json.dumps(status, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        return
+    lines = ["cortex upgrade status"]
+    receipt = status.get("effective_receipt")
+    if isinstance(receipt, Mapping):
+        lines.append(
+            f"  effective receipt: {receipt.get('path')} "
+            f"({receipt.get('version')}, receipt {receipt.get('receipt_id')})"
+        )
+    else:
+        lines.append(f"  effective receipt: unknown: {status.get('effective_receipt_error')}")
+    lines.append(f"  loaded runtime:    {status.get('loaded_runtime') or 'unknown'}")
+    last = status.get("last_upgrade")
+    if isinstance(last, Mapping):
+        detail = f" (failed step: {last.get('failed_step')})" if last.get("failed_step") else ""
+        lines.append(
+            f"  last upgrade:      {last.get('version')} {last.get('result')} "
+            f"at {last.get('finished_at')}{detail}"
+        )
+    else:
+        lines.append("  last upgrade:      none recorded")
+    lines.append(
+        "  maintenance:       "
+        + (
+            "unfinished snapshot: run `cortex upgrade --recover`"
+            if status.get("maintenance_pending")
+            else "idle"
+        )
+    )
+    sys.stdout.write("\n".join(lines) + "\n")
+
+
 def run_upgrade(options: UpgradeOptions) -> int:
+    if options.status:
+        status = upgrade_status()
+        _print_status(status, json_output=options.json_output)
+        return 0 if _status_ok(status) else 1
+    if options.recover:
+        return recover_upgrade()
     return perform_upgrade(options)
