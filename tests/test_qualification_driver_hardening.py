@@ -4573,3 +4573,48 @@ def test_unreclaimed_worktrees_print_manager_reclaim_events(
     assert "workflow-build-workspace-reclaim-failed" in err
     assert "tick ok" not in err
     assert "sk-" + "c" * 30 not in err
+
+
+def test_fix_round_reason_carries_the_stop_detail_to_the_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716（canary run 37256414890）：修正回合的 builder 只看得到裁決理由；理由若只是
+    泛用文字，builder 找不到要修的 finding 而以 needs_human 停下。理由要帶上停止點內容。"""
+
+    from paulsha_cortex.coordinator.work_actions import OPERATOR_ADJUDICATION_REASON_LIMIT
+
+    driver = _load_driver()
+    stop = _explicit_stop("qualification-work", "verification-terminal-explicit-stop")
+    stop["blocking_reason"]["detail"] = (
+        "verification terminal 明示要求停止（status=failed）：summary=tasks.md 未勾\n"
+        "details.gates=boundary_compliance failed"
+    )
+    ongoing = _work_show_envelope("qualification-work", state="on-going")
+    finished = _work_show_envelope("qualification-work", state="on-going", run_status="done")
+    calls, _closeouts = _full_dispatch_fixture(
+        driver, tmp_path, monkeypatch, [stop, ongoing, finished]
+    )
+
+    driver._full_dispatch(
+        repository="owner/repo", work_id="qualification-work", issue=42,
+        release_candidate_sha="a" * 40, timeout=600, evidence_dir=tmp_path / "evidence",
+    )
+
+    argv = _retry_build_calls(calls)[0]
+    reason = argv[argv.index("--reason") + 1]
+    assert "summary=tasks.md 未勾" in reason
+    assert "details.gates=boundary_compliance failed" in reason
+    assert "\n" not in reason
+    assert len(reason) <= OPERATOR_ADJUDICATION_REASON_LIMIT
+
+
+def test_fix_round_reason_is_bounded_by_the_manager_limit() -> None:
+    from paulsha_cortex.coordinator.work_actions import OPERATOR_ADJUDICATION_REASON_LIMIT
+
+    driver = _load_driver()
+    terminal = {"blocking_reason": {"reason": "x", "detail": "長" * 10_000}}
+
+    reason = driver._canary_fix_round_reason(terminal, "verification-terminal-explicit-stop")
+
+    assert len(reason) == OPERATOR_ADJUDICATION_REASON_LIMIT
+    assert reason.endswith("…")

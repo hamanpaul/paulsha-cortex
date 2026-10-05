@@ -1,0 +1,1 @@
+- #716 canary 修正回合：`retry-build --reason` 附上停止點的實際內容（blocking_reason detail，含 verify／review 的 summary 與 details，壓成單行，截到 Manager 的 `OPERATOR_ADJUDICATION_REASON_LIMIT`），並在派出時印出停止點摘要。先前只送泛用文字，post-archive 修正的 builder 找不到具體 finding，只能以 needs_human 停下（canary run 37256414890）。
