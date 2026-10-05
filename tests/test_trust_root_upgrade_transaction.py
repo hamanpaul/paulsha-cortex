@@ -132,6 +132,29 @@ def test_post_activate_failure_with_retained_state_stays_put(harness) -> None:
     assert _marker()["plan_sha256"] == harness.bound.sha256
 
 
+def test_a_failed_rollback_child_surfaces_its_stderr_in_the_report(harness) -> None:
+    # Fix round 1 / Finding 2: the real installer's rollback subcommand writes
+    # only to stderr and exits non-zero with empty stdout when it raises
+    # (`cli.py`'s top-level `except (InstallError, ...)` handler) -- unlike the
+    # normal restore_safe=false path, which always emits a JSON payload first.
+    # `harness.cli.fail[...]` reproduces exactly that shape (empty stdout,
+    # `returncode=1`, stderr-only), for any candidate subcommand including
+    # "rollback".
+    harness.cli.fail["verify"] = "verify FAIL"
+    harness.cli.fail["rollback"] = "backend lock is held by another process"
+
+    code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["result"] == "halted"
+    assert "backend lock is held by another process" in report["rollback"]["error"]
+    assert report["rollback"]["restore_safe"] is False
+    assert not [call for call in harness.systemd.calls if call[0] == "start"]
+    snapshot = install_cli._read_maintenance_snapshot()
+    assert snapshot is not None
+    assert snapshot["receipt_path"] == str(harness.bound.receipt_path)
+
+
 def test_loaded_runtime_mismatch_after_verify_rolls_back(harness) -> None:
     # This is the "typical" post-activate failure, where the installer's
     # `rollback` call proves `restore_safe=true` (the fixture's default
@@ -155,7 +178,9 @@ def test_loaded_runtime_mismatch_after_verify_rolls_back(harness) -> None:
     assert report["result"] == "rolled-back"
 
 
-def test_interrupt_after_the_apply_child_wrote_the_receipt_still_rolls_back(harness) -> None:
+def test_interrupt_after_the_apply_child_wrote_the_receipt_still_rolls_back(
+    harness, capsys: pytest.CaptureFixture[str]
+) -> None:
     harness.cli.interrupt_after = "apply"
 
     code, report = _run_transaction(harness)
@@ -163,10 +188,18 @@ def test_interrupt_after_the_apply_child_wrote_the_receipt_still_rolls_back(harn
     assert code == 1
     assert report["failed_step"] == "apply"
     assert report["error"] == "interrupted by SIGTERM"
+    # Fix round 1 / Finding 1: the report must name the new receipt even though
+    # apply never returned -- it is set as soon as the child starts, not only
+    # on a successful return, so a halted/rolled-back report still tells the
+    # operator which receipt holds any retained state.
+    assert report["receipt"]["path"] == str(harness.bound.receipt_path)
     rollback = next(call for call in harness.cli.calls if call[0] == "rollback")
     assert rollback[rollback.index("--receipt") + 1] == str(harness.bound.receipt_path)
     assert harness.systemd.active == set(fx.SERVICES)
     assert report["result"] == "rolled-back"
+
+    upgrade._print_outcome(report, json_output=False)
+    assert f"new receipt:   {harness.bound.receipt_path}" in capsys.readouterr().out
 
 
 def test_failure_before_apply_restores_services_without_a_rollback(harness) -> None:

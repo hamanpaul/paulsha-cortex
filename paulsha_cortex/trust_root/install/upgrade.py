@@ -650,6 +650,9 @@ _HALTED_NEXT_ACTION = (
     "retained state listed above, then run `cortex upgrade --recover` or decide "
     "by hand per trust-root-transactional-install.md §6"
 )
+# Cap on the rollback child's stderr/stdout we fold into the report; keeps a
+# noisy backend traceback from bloating `upgrade-report.json`.
+_ROLLBACK_ERROR_LIMIT = 4000
 
 
 class UpgradeInterrupted(BaseException):
@@ -756,6 +759,12 @@ def _advance(
         # Set before the child starts: a signal that lands after the child wrote
         # the receipt but before it returned must still roll that receipt back.
         state.apply_attempted = True
+        # Likewise set before the child starts, with the id still unknown: a
+        # halted or rolled-back report must still name the receipt holding any
+        # retained state even when the child never returned (interrupted, or
+        # exited non-zero after writing the file). The success assignment below
+        # overwrites this with the real receipt_id once apply actually returns.
+        report["receipt"] = {"path": receipt, "receipt_id": None}
         applied = _candidate_json(
             sealed,
             "apply",
@@ -863,6 +872,7 @@ def _abort(
     if state.apply_attempted and os.path.lexists(bound.receipt_path):
         rollback["attempted"] = True
         payload: object = None
+        result: CompletedProcess[str] | None = None
         try:
             result = _candidate(
                 sealed,
@@ -875,6 +885,16 @@ def _abort(
             payload = json.loads(result.stdout) if result.stdout.strip() else None
         except (InstallError, OSError, json.JSONDecodeError) as exc:
             rollback["error"] = _describe(exc)
+        if result is not None and (result.returncode != 0 or not isinstance(payload, dict)):
+            # The real installer always emits a JSON payload before returning,
+            # even when restore_safe is false; empty/unparseable stdout here
+            # means the child raised before that happened, and only its stderr
+            # says why -- without this, that cause is silently discarded and
+            # the operator is left with an unexplained "restore_safe: false".
+            detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+            rollback["error"] = (
+                f"rollback exited {result.returncode}: {detail[:_ROLLBACK_ERROR_LIMIT]}"
+            )
         if not isinstance(payload, dict):
             payload = {}
         rollback["restore_safe"] = payload.get("restore_safe") is True
@@ -1039,6 +1059,8 @@ def _print_outcome(report: Mapping[str, object], *, json_output: bool) -> None:
     rollback = report.get("rollback")
     if isinstance(rollback, Mapping):
         lines.append(f"  rollback:      restore_safe={rollback.get('restore_safe')}")
+        if rollback.get("error"):
+            lines.append(f"  rollback error: {rollback['error']}")
         for key in ("retained_unknown", "retained_drift"):
             for row in rollback.get(key) or []:
                 lines.append(f"    {key}: {json.dumps(row, ensure_ascii=False, sort_keys=True)}")
