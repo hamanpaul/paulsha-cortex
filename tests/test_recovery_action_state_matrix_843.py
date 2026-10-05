@@ -1537,6 +1537,9 @@ PREPARE_RECORD_DIRS: dict[str, tuple[str, ...]] = {
     # claim decision 讀取時 lazy 初始化 delivery journal 的衍生列（以 run_id 為鍵），
     # 早於 daemon 的 resume 派工，與 recovery commit 無關。
     "resume": ("runs.json",),
+    # #1259：retry-build 在 reset 前寫 receipt；reset 被 drift 拒絕時殘留的 receipt
+    # 綁 attempt N+1，不被持久狀態引用，對仍在 attempt N 的 run 無效。
+    "retry-build": ("evidence/retry-build",),
     "recover-superseded": ("evidence/work-recover-superseded",),
     "recover-planning": ("evidence/planning-recovery",),
     "recover-repair-commit": ("evidence/work-repair-adoption",),

@@ -1619,12 +1619,85 @@ def manager_pr_refs_compatible(authority: WorkAuthority, run) -> bool:
     )
 
 
-def self_only_authority_drift_matches(authority: WorkAuthority, run) -> bool:
+@dataclass(frozen=True)
+class SelfDeliveryEvidence:
+    """Manager 已驗證、綁定單一 run 與 exact Candidate 的自產交付事實（#1259）。
+
+    claim 判準不讀 registry、delivery journal 或 evidence 檔；這些事實由 Manager
+    端（``manager.self_delivery_evidence``）以既有驗證入口算好後注入，claim 端只
+    再核對 ``run_id``／``candidate`` 與傳入的 run 一致。
+
+    - ``archive_applied``：本 run 的 ``openspec-archive`` 恰為一筆 Manager-owned
+      passed step，且 registry 恰有一筆本 run 的 Manager archive job，其
+      ``subject_head`` 為 Candidate 本身或祖先（``manager._manager_archive_applied``
+      ＋``manager._manager_archive_job_applied``）。
+    - ``retry_build_candidate``：本 run 目前這一輪 retry-build reset 綁定的 exact
+      Candidate（``cortex-retry-build-receipt/v1``；retry-build admission 在 reset
+      前以即將寫入的值投影）。
+    - ``delivery_pr_number``：delivery journal 證實由本 run 推送、所有 push head
+      皆為 Candidate 本身或祖先的交付 PR 編號。
+    """
+
+    run_id: str
+    candidate: str
+    archive_applied: bool = False
+    retry_build_candidate: str | None = None
+    delivery_pr_number: int | None = None
+
+
+def _self_delivery_evidence_bound(run, evidence) -> bool:
+    candidate = getattr(run, "candidate_head", None)
+    return (
+        isinstance(evidence, SelfDeliveryEvidence)
+        and isinstance(getattr(run, "run_id", None), str)
+        and evidence.run_id == run.run_id
+        and isinstance(candidate, str)
+        and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+        and evidence.candidate == candidate
+    )
+
+
+def _retry_build_pr_candidate_is_exact(run, evidence, *, number: int) -> bool:
+    """#1259：retry-build reset 後的 build phase，交付 PR 視為本 run 自產的窄條件。
+
+    reset 把 run 推回 build 並清掉 ``verified_head``，``_manager_pr_candidate_is_exact``
+    因此不再成立。這裡只在三項 Manager 證據同時成立時接受：retry-build receipt
+    綁定目前的 exact Candidate、delivery journal 證實這個 PR 由本 run 推送，且呼叫端
+    已確認 authority 與 ``run.pr_refs`` 都恰為這一個 open PR。
+    """
+
+    candidate = getattr(run, "candidate_head", None)
+    return (
+        _self_delivery_evidence_bound(run, evidence)
+        and getattr(run, "current_phase", None) == "build"
+        and getattr(run, "verified_head", None) is None
+        and getattr(run, "pr_candidate", None) in {None, candidate}
+        and evidence.retry_build_candidate == candidate
+        and evidence.delivery_pr_number == number
+    )
+
+
+def self_only_authority_drift_matches(
+    authority: WorkAuthority,
+    run,
+    *,
+    delivery_evidence: SelfDeliveryEvidence | None = None,
+) -> bool:
     """只在漂移能逐項對應此 run 的已接受產物時，比對原 claim-era。
 
     比對以完整 current authority 為起點，只可移除已接受的 planning 檔案、run
     宣告建立的 OpenSpec proposal，或綁定已驗證 Candidate 的單一 open PR。其他
     authority 欄位都保留在 digest 比對中。
+
+    ``delivery_evidence``（#1259）是 Manager 已驗證的自產交付事實，缺席時行為不變：
+
+    - 有 Manager archive 證據時，``run.openspec_refs`` 唯一的那個 change 可由
+      ``state:archived`` 還原成 claim-era 的 ``state:active``；
+    - retry-build reset 後的 build phase，有 receipt 與推送證據時，單一 open 交付 PR
+      可比照 review／ship phase 的 Manager PR 移除。
+
+    其他 links、issue 映射與 PR 狀態檢查完全不放寬；重算 baseline 後仍須唯一對上
+    ``run.source_revision``。
     """
 
     if (
@@ -1683,6 +1756,24 @@ def self_only_authority_drift_matches(authority: WorkAuthority, run) -> bool:
             return False
         openspec_revisions.append(revision)
 
+    # #1259：Manager archive 把本 run 唯一的 mapped OpenSpec 推到 archived。只在
+    # Manager archive 證據綁定本 run 與 Candidate 時，允許把它還原成 claim-era 的
+    # active 值（同一 source_id，排序位置不變）；外部 archive 沒有這份證據。
+    archive_restore: tuple[str, str] | None = None
+    if (
+        len(run_openspec) == 1
+        and run_openspec[0] in authority.mapped_openspec
+        and _self_delivery_evidence_bound(run, delivery_evidence)
+        and delivery_evidence.archive_applied
+    ):
+        ref = run_openspec[0]
+        archived = f"openspec:{authority.repo}:{ref}@identity:{ref};state:archived"
+        if archived in revisions:
+            archive_restore = (
+                archived,
+                f"openspec:{authority.repo}:{ref}@identity:{ref};state:active",
+            )
+
     pr_revisions: tuple[str, ...] = ()
     pr_removal_allowed = False
     if authority.mapped_prs:
@@ -1690,7 +1781,12 @@ def self_only_authority_drift_matches(authority: WorkAuthority, run) -> bool:
         if (
             len(refs) == 1
             and tuple(getattr(run, "pr_refs", ()) or ()) == refs
-            and _manager_pr_candidate_is_exact(run)
+            and (
+                _manager_pr_candidate_is_exact(run)
+                or _retry_build_pr_candidate_is_exact(
+                    run, delivery_evidence, number=authority.mapped_prs[0]
+                )
+            )
         ):
             number = authority.mapped_prs[0]
             expected = (
@@ -1705,15 +1801,23 @@ def self_only_authority_drift_matches(authority: WorkAuthority, run) -> bool:
     matches = 0
     for count in range(len(planning_revisions) + 1):
         for planning_removed in itertools.combinations(planning_revisions, count):
-            for remove_pr in ((False, True) if pr_removal_allowed else (False,)):
+            for remove_pr, restore_archive in itertools.product(
+                (False, True) if pr_removal_allowed else (False,),
+                (False, True) if archive_restore is not None else (False,),
+            ):
                 removed = set(planning_removed) | set(openspec_revisions)
                 if remove_pr:
                     removed.update(pr_revisions)
+                restored = dict((archive_restore,)) if restore_archive else {}
                 mapped_openspec = tuple(
                     ref for ref in authority.mapped_openspec if ref not in extra_openspec
                 )
                 mapped_prs = () if remove_pr else authority.mapped_prs
-                if not removed and mapped_openspec == authority.mapped_openspec:
+                if (
+                    not removed
+                    and not restored
+                    and mapped_openspec == authority.mapped_openspec
+                ):
                     continue
                 baseline = WorkAuthority._verified(
                     repo=authority.repo,
@@ -1725,7 +1829,9 @@ def self_only_authority_drift_matches(authority: WorkAuthority, run) -> bool:
                     confirmed_todo=authority.confirmed_todo,
                     auto_label=authority.auto_label,
                     source_revisions=tuple(
-                        revision for revision in revisions if revision not in removed
+                        restored.get(revision, revision)
+                        for revision in revisions
+                        if revision not in removed
                     ),
                     provider_revision=authority.github_provider_revision,
                     provider_id=authority.github_provider_id,
@@ -1740,8 +1846,17 @@ def self_only_authority_drift_matches(authority: WorkAuthority, run) -> bool:
     return matches == 1
 
 
-def authority_matches_claim_era(authority: WorkAuthority, run) -> bool:
-    """判定 authority 與 claim-era 完全相同，或只差此 run 自身發布的內容。"""
+def authority_matches_claim_era(
+    authority: WorkAuthority,
+    run,
+    *,
+    delivery_evidence: SelfDeliveryEvidence | None = None,
+) -> bool:
+    """判定 authority 與 claim-era 完全相同，或只差此 run 自身發布的內容。
+
+    ``delivery_evidence`` 見 ``self_only_authority_drift_matches``；只有 Manager
+    Builder admission（``manager.builder_authority_matches_claim_era``）會帶入。
+    """
 
     if (
         not isinstance(authority, WorkAuthority)
@@ -1751,7 +1866,9 @@ def authority_matches_claim_era(authority: WorkAuthority, run) -> bool:
         return False
     digest = work_authority_digest(authority)
     return getattr(run, "source_revision", None) == digest or (
-        self_only_authority_drift_matches(authority, run)
+        self_only_authority_drift_matches(
+            authority, run, delivery_evidence=delivery_evidence
+        )
     )
 
 

@@ -4448,6 +4448,28 @@ def _record_operator_adjudication(
     )
 
 
+def _record_retry_build_receipt(*, run, state_path: Path | None) -> dict[str, str]:
+    """#1259：retry-build reset 的 Manager-owned receipt（`cortex-retry-build-receipt/v1`）。
+
+    body 由 ``manager.retry_build_receipt_body`` 以 reset 後的 run 形狀算出，與
+    Builder admission 讀回時的期望值同一個定義；沿用 supersede-family 的
+    content-addressed 寫入器（O_EXCL、0444、fsync）。它不是 operator 裁決，不會
+    注入任何 prompt。
+    """
+
+    if state_path is None:
+        raise RuntimeError("retry-build receipt requires a durable state path")
+    from . import manager
+    from .registry import retry_build_reset_projection
+
+    return _write_supersede_evidence(
+        manager.retry_build_receipt_body(retry_build_reset_projection(run)),
+        state_path=state_path,
+        subdir=manager.RETRY_BUILD_RECEIPT_SUBDIR,
+        label="retry-build receipt",
+    )
+
+
 def operator_adjudication_receipt(
     evidence: dict[str, str] | None, *, card: str
 ) -> dict[str, object] | None:
@@ -4742,6 +4764,10 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         state_path=state_path,
         now_epoch=now_epoch,
     )
+    # #1259：reset 前落 Manager-owned retry-build receipt（綁 run、exact Candidate、
+    # reset 後的 build attempt）。寫入失敗時 run 維持原狀；reset 失敗時留下的
+    # receipt 綁的是 attempt N+1，對仍在 attempt N 的 run 無效。
+    _record_retry_build_receipt(run=run, state_path=state_path)
     updated = workflow_registry._manager_reset_workflow_for_retry_build(
         run.run_id,
         expected_candidate=expected_candidate.lower(),
@@ -4900,6 +4926,42 @@ def _retry_build_admission_error(
         run.current_phase != "review" or _main_sync_retry_context(run) is None
     ):
         return reject(RuntimeError, "retry-build requires valid matching main-sync stop evidence")
+    if authority is not None:
+        # #1259：與 Manager Builder 派工入口共用同一個 admission 判定，並以 reset 後的
+        # run 形狀評估（phase=build、verified_head 清空、build attempt +1）；
+        # receipt 尚未寫入，以本次 exact CAS Candidate 投影。受理即派得出 Builder，
+        # 派不出去就在 reset 之前拒絕。
+        from . import manager
+        from .registry import retry_build_reset_projection
+
+        state_path = getattr(workflow_registry, "_state_path", None)
+        try:
+            projected = retry_build_reset_projection(run)
+            decision = manager.builder_todo_admission_decision(
+                registry=workflow_registry,
+                run=projected,
+                step=build_steps[-1],
+                admission=manager.builder_todo_admission_for_authority(
+                    projected, authority
+                ),
+                coordinator_root=(
+                    Path(state_path).resolve().parent
+                    if isinstance(state_path, (str, Path))
+                    else None
+                ),
+                projected_retry_build_candidate=expected_candidate.lower(),
+            )
+        except Exception:  # noqa: BLE001 - admission that cannot be evaluated fails closed
+            return reject(
+                RuntimeError,
+                "retry-build builder admission could not be evaluated: "
+                "builder-todo-authority-unavailable",
+            )
+        if decision is not None:
+            return reject(
+                RuntimeError,
+                f"retry-build would not dispatch a builder: {decision[0]}",
+            )
     return None
 
 
