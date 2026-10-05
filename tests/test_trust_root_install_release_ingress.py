@@ -5,6 +5,7 @@ import io
 import json
 import os
 import stat
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -17,13 +18,20 @@ from paulsha_cortex.trust_root.install.release_ingress import (
     ReleaseAsset,
     asset_names,
     assert_private_chain,
+    build_sealed_venv,
+    check_archive_topology,
     download_asset,
     format_version,
+    ingest_release,
     make_attempt_dir,
     parse_version,
+    read_qualification_authority,
     resolve_release,
+    tree_sha256,
+    verify_input_tree,
     wheel_version,
 )
+from qualification.verify_bundle import validate_bundle as qualification_validate_bundle
 
 API = "api/repos/hamanpaul/paulsha-cortex"
 
@@ -232,3 +240,265 @@ def test_each_ingress_attempt_gets_a_fresh_private_directory(tmp_path: Path) -> 
     assert first.parent == second.parent == installer / "0.1.13"
     assert first.name.startswith("attempt-")
     assert stat.S_IMODE((second / "release").stat().st_mode) == 0o700
+
+
+def _ingest(tmp_path: Path, release, calls=None):
+    return ingest_release(
+        fixtures.VERSION,
+        fetcher=DirectoryReleaseFetcher(release.source),
+        installer_root=tmp_path / "installer",
+        owner_uid=os.getuid(),
+        chain_stop=tmp_path,
+        run=fixtures.fake_venv_runner(calls if calls is not None else []),
+    )
+
+
+def test_ingest_seals_the_candidate_cli_after_every_check(tmp_path: Path) -> None:
+    release = fixtures.write_release_source(tmp_path)
+    calls: list = []
+
+    sealed = _ingest(tmp_path, release, calls)
+
+    _wheel, input_name, qualification_name = asset_names(fixtures.VERSION)
+    assert sorted(path.name for path in (sealed.attempt_dir / "release").iterdir()) == sorted(
+        [input_name, qualification_name]
+    )
+    assert sealed.metadata.commit == fixtures.CANDIDATE_SHA
+    assert sealed.cli == sealed.venv / "bin" / "cortex"
+    assert sealed.bundle == sealed.input_root / "bundle.json"
+    assert sealed.install_config == sealed.input_root / "install-config.yaml"
+    assert sealed.tree_sha256 == tree_sha256(sealed.venv, owner_uid=os.getuid())
+    requirements = (sealed.attempt_dir / "bootstrap-requirements.txt").read_text().splitlines()
+    assert requirements == sorted(requirements)
+    assert all(
+        line.startswith("file://") and " --hash=sha256:" in line for line in requirements
+    )
+    assert stat.S_IMODE((sealed.input_root / "toolchain" / "codex").stat().st_mode) == 0o755
+    assert stat.S_IMODE((sealed.input_root / "bundle.json").stat().st_mode) == 0o644
+    assert calls[0][0][:6] == ("/usr/bin/python3", "-I", "-S", "-m", "venv", "--copies")
+    pip = next(argv for argv, _env in calls if "pip" in argv)
+    for flag in ("--no-index", "--no-deps", "--only-binary=:all:", "--require-hashes"):
+        assert flag in pip
+
+
+def test_sealed_candidate_detects_a_changed_cli_tree(tmp_path: Path) -> None:
+    sealed = _ingest(tmp_path, fixtures.write_release_source(tmp_path))
+
+    sealed.assert_unchanged()
+    (sealed.venv / "bin" / "cortex").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    with pytest.raises(IngressError, match="changed since ingress"):
+        sealed.assert_unchanged()
+
+
+def test_rerunning_the_same_version_ingests_into_a_new_attempt(tmp_path: Path) -> None:
+    release = fixtures.write_release_source(tmp_path)
+
+    first = _ingest(tmp_path, release)
+    second = _ingest(tmp_path, release)
+
+    assert first.attempt_dir != second.attempt_dir
+    assert second.tree_sha256 == tree_sha256(second.venv, owner_uid=os.getuid())
+
+
+def test_manifest_must_name_the_tag_target_before_extraction(tmp_path: Path) -> None:
+    release = fixtures.write_release_source(tmp_path)
+    tag_document = next((release.source / API / "git/tags").iterdir())
+    document = json.loads(tag_document.read_text())
+    document["object"]["sha"] = "f" * 40
+    tag_document.write_text(json.dumps(document))
+
+    with pytest.raises(IngressError, match="manifest candidate does not match the tag target"):
+        _ingest(tmp_path, release)
+    attempts = list((tmp_path / "installer" / fixtures.VERSION).iterdir())
+    assert attempts and all(not (attempt / "input").exists() for attempt in attempts)
+
+
+def test_bundle_must_match_the_manifest_digest(tmp_path: Path) -> None:
+    release = fixtures.write_release_source(tmp_path)
+    fixtures.rewrite_manifest(release, bundle_sha256="0" * 64)
+
+    with pytest.raises(IngressError, match="bundle.json does not match"):
+        _ingest(tmp_path, release)
+
+
+def test_manifest_must_be_a_passed_release_attestation(tmp_path: Path) -> None:
+    path = tmp_path / "qualification.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "profile": "deployment-canary",
+                "status": "passed",
+                "candidate_sha": "a" * 40,
+                "wheel": {"filename": "x.whl", "sha256": "b" * 64},
+                "bundle": {"sha256": "c" * 64},
+            }
+        )
+    )
+
+    with pytest.raises(IngressError, match="not a passed release attestation"):
+        read_qualification_authority(path)
+
+
+def _tar(path: Path, members: list[tuple[str, bytes | None, str | None]]) -> Path:
+    with tarfile.open(path, "w:gz") as archive:
+        for name, payload, link in members:
+            info = tarfile.TarInfo(name)
+            if link is not None:
+                info.type = tarfile.SYMTYPE
+                info.linkname = link
+                archive.addfile(info)
+            elif payload is None:
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+            else:
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+    return path
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        [("qualification-input", None, None), ("qualification-input/link", None, "/etc/passwd")],
+        [("qualification-input", None, None), ("qualification-input/../escape", b"x", None)],
+        [("other-root/bundle.json", b"{}", None)],
+        [("/qualification-input/bundle.json", b"{}", None)],
+        [("qualification-input/a", b"1", None), ("qualification-input/a", b"2", None)],
+    ],
+)
+def test_archive_topology_refuses_unsafe_members(tmp_path: Path, members) -> None:
+    with pytest.raises(IngressError, match="topology is unsafe"):
+        check_archive_topology(_tar(tmp_path / "input.tar.gz", members))
+
+
+def _extra_wheelhouse(root: Path) -> None:
+    (root / "wheelhouse" / "extra.whl").write_bytes(b"x")
+
+
+def _missing_tool(root: Path) -> None:
+    (root / "toolchain" / "srt").unlink()
+
+
+def _tampered_wheel(root: Path) -> None:
+    (root / "dist" / f"paulsha_cortex-{fixtures.VERSION}-py3-none-any.whl").write_bytes(
+        b"tampered\n"
+    )
+
+
+def _extra_root_entry(root: Path) -> None:
+    (root / "notes.txt").write_text("x", encoding="utf-8")
+
+
+def _symlinked_source(root: Path) -> None:
+    source = root / "source" / "paulsha-cortex.bundle"
+    real = root.parent / "elsewhere.bundle"
+    real.write_bytes(source.read_bytes())
+    source.unlink()
+    source.symlink_to(real)
+
+
+def test_input_tree_validation_accepts_what_verify_bundle_accepts(tmp_path: Path) -> None:
+    tree = fixtures.write_input_tree(tmp_path / "base")
+
+    assert (
+        verify_input_tree(
+            tree.bundle,
+            candidate_sha=fixtures.CANDIDATE_SHA,
+            wheel_sha256=tree.wheel_sha256,
+            owner_uid=os.getuid(),
+        )
+        is None
+    )
+    assert (
+        qualification_validate_bundle(
+            tree.bundle, candidate_sha=fixtures.CANDIDATE_SHA, wheel_sha256=tree.wheel_sha256
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [_extra_wheelhouse, _missing_tool, _tampered_wheel, _extra_root_entry, _symlinked_source],
+    ids=lambda mutate: mutate.__name__,
+)
+def test_input_tree_mutations_are_refused_like_verify_bundle(tmp_path: Path, mutate) -> None:
+    tree = fixtures.write_input_tree(tmp_path / "case")
+    mutate(tree.root)
+
+    with pytest.raises(IngressError):
+        verify_input_tree(
+            tree.bundle,
+            candidate_sha=fixtures.CANDIDATE_SHA,
+            wheel_sha256=tree.wheel_sha256,
+            owner_uid=os.getuid(),
+        )
+    with pytest.raises((ValueError, OSError)):
+        qualification_validate_bundle(
+            tree.bundle, candidate_sha=fixtures.CANDIDATE_SHA, wheel_sha256=tree.wheel_sha256
+        )
+
+
+def test_input_tree_refuses_group_writable_files(tmp_path: Path) -> None:
+    tree = fixtures.write_input_tree(tmp_path / "case")
+    (tree.root / "install-config.yaml").chmod(0o664)
+
+    with pytest.raises(IngressError, match="ownership/mode is unsafe"):
+        verify_input_tree(
+            tree.bundle,
+            candidate_sha=fixtures.CANDIDATE_SHA,
+            wheel_sha256=tree.wheel_sha256,
+            owner_uid=os.getuid(),
+        )
+
+
+def test_sealed_venv_is_built_offline_with_copies_and_no_symlinks(tmp_path: Path) -> None:
+    calls: list = []
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("", encoding="utf-8")
+
+    cli = build_sealed_venv(
+        tmp_path / "venv",
+        requirements,
+        owner_uid=os.getuid(),
+        run=fixtures.fake_venv_runner(calls),
+    )
+
+    assert cli == tmp_path / "venv/bin/cortex"
+    assert not os.path.lexists(tmp_path / "venv/lib64")
+    assert stat.S_IMODE((tmp_path / "venv").stat().st_mode) == 0o755
+    assert stat.S_IMODE(cli.stat().st_mode) == 0o755
+    assert stat.S_IMODE((tmp_path / "venv/lib/site.py").stat().st_mode) == 0o644
+    assert calls[0][1] == {
+        "HOME": "/root",
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONNOUSERSITE": "1",
+    }
+
+
+def test_sealed_venv_refuses_an_existing_path(tmp_path: Path) -> None:
+    (tmp_path / "venv").mkdir()
+
+    with pytest.raises(IngressError, match="already exists"):
+        build_sealed_venv(
+            tmp_path / "venv",
+            tmp_path / "requirements.txt",
+            owner_uid=os.getuid(),
+            run=fixtures.fake_venv_runner([]),
+        )
+
+
+def test_tree_digest_tracks_content_and_refuses_symlinks(tmp_path: Path) -> None:
+    root = tmp_path / "venv"
+    (root / "bin").mkdir(parents=True)
+    (root / "bin" / "x").write_text("x", encoding="utf-8")
+    digest = tree_sha256(root, owner_uid=os.getuid())
+
+    (root / "bin" / "x").write_text("y", encoding="utf-8")
+    assert tree_sha256(root, owner_uid=os.getuid()) != digest
+    (root / "bin" / "link").symlink_to("x")
+    with pytest.raises(IngressError, match="unsafe candidate CLI"):
+        tree_sha256(root, owner_uid=os.getuid())

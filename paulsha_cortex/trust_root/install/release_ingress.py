@@ -356,3 +356,516 @@ def make_attempt_dir(
     os.mkdir(attempt / "release", 0o700)
     assert_private_chain(attempt / "release", owner_uid=owner_uid, stop=chain_stop)
     return attempt
+
+
+# --- qualification manifest, archive and input tree (runbook §1) ---------------
+
+_INPUT_ROOT_ENTRIES = frozenset(
+    {"bundle.json", "install-config.yaml", "dist", "wheelhouse", "toolchain", "source"}
+)
+_BUNDLE_ROOT_KEYS = frozenset(
+    {
+        "schema_version",
+        "candidate_sha",
+        "wheel",
+        "wheelhouse",
+        "generated_artifacts",
+        "toolchain",
+        "source_repositories",
+    }
+)
+_TOOL_NAMES = frozenset({"codex", "claude", "copilot", "agy", "srt", "openspec"})
+_VENV_ENV = {
+    "HOME": "/root",
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PYTHONNOUSERSITE": "1",
+}
+
+
+@dataclass(frozen=True)
+class QualificationAuthority:
+    candidate_sha: str
+    wheel_filename: str
+    wheel_sha256: str
+    bundle_sha256: str
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_qualification_authority(path: Path) -> QualificationAuthority:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IngressError("qualification manifest is not readable JSON") from exc
+    wheel = document.get("wheel") if isinstance(document, dict) else None
+    bundle = document.get("bundle") if isinstance(document, dict) else None
+    if (
+        not isinstance(document, dict)
+        or document.get("schema_version") != 2
+        or document.get("profile") != "release"
+        or document.get("status") != "passed"
+        or not isinstance(wheel, dict)
+        or not isinstance(bundle, dict)
+    ):
+        raise IngressError("qualification manifest is not a passed release attestation")
+    candidate_sha = _hex(document.get("candidate_sha"), _SHA40)
+    filename = wheel.get("filename")
+    wheel_sha = _hex(wheel.get("sha256"), _SHA256)
+    bundle_sha = _hex(bundle.get("sha256"), _SHA256)
+    if (
+        candidate_sha is None
+        or not isinstance(filename, str)
+        or not filename
+        or "/" in filename
+        or wheel_sha is None
+        or bundle_sha is None
+    ):
+        raise IngressError("qualification manifest identity is invalid")
+    return QualificationAuthority(candidate_sha, filename, wheel_sha, bundle_sha)
+
+
+def check_archive_topology(path: Path) -> None:
+    try:
+        with tarfile.open(path, mode="r:gz") as archive:
+            seen: set[str] = set()
+            for member in archive.getmembers():
+                pure = PurePosixPath(member.name)
+                if (
+                    pure.is_absolute()
+                    or not pure.parts
+                    or pure.parts[0] != "qualification-input"
+                    or ".." in pure.parts
+                    or member.name in seen
+                    or not (member.isdir() or member.isfile())
+                ):
+                    raise IngressError("install-input archive topology is unsafe")
+                seen.add(member.name)
+    except (OSError, tarfile.TarError) as exc:
+        raise IngressError(f"install-input archive is unreadable: {exc}") from exc
+
+
+def extract_install_input(archive: Path, input_root: Path) -> None:
+    """Strip ``qualification-input/``; private modes, only the user-x bit survives."""
+
+    try:
+        with tarfile.open(archive, mode="r:gz") as stream:
+            for member in stream.getmembers():
+                parts = PurePosixPath(member.name).parts[1:]
+                if not parts:
+                    continue
+                target = input_root.joinpath(*parts)
+                if member.isdir():
+                    os.mkdir(target, 0o700)
+                    continue
+                source = stream.extractfile(member)
+                if source is None:
+                    raise IngressError(f"install-input member is unreadable: {member.name}")
+                mode = 0o700 if member.mode & 0o100 else 0o600
+                descriptor = os.open(target, _OPEN_NEW, mode)
+                with os.fdopen(descriptor, "wb") as output:
+                    while chunk := source.read(_CHUNK_BYTES):
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+    except (OSError, tarfile.TarError) as exc:
+        raise IngressError(f"install-input extraction failed: {exc}") from exc
+
+
+def _single_link_regular(path: Path, *, label: str) -> None:
+    observed = path.lstat()
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise IngressError(f"{label} must be a single-link regular file")
+
+
+def _plain_directory(path: Path, *, label: str) -> None:
+    if not stat.S_ISDIR(path.lstat().st_mode):
+        raise IngressError(f"{label} must be a real directory")
+
+
+def _bundle_entry(raw: object, *, root: Path, label: str) -> str:
+    if not isinstance(raw, dict) or set(raw) != {"path", "sha256"}:
+        raise IngressError(f"{label} must contain only path and sha256")
+    relative = raw["path"]
+    if not isinstance(relative, str) or not relative:
+        raise IngressError(f"{label}.path must be a non-empty string")
+    pure = PurePosixPath(relative)
+    if pure.is_absolute() or ".." in pure.parts or "\x00" in relative:
+        raise IngressError(f"{label}.path is unsafe")
+    expected = _hex(raw["sha256"], _SHA256)
+    if expected is None:
+        raise IngressError(f"{label}.sha256 is invalid")
+    path = root / pure
+    _single_link_regular(path, label=f"{label}.path")
+    cursor = root
+    for part in pure.parts[:-1]:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise IngressError(f"{label}.path has a symlink ancestor")
+    if _sha256_file(path) != expected:
+        raise IngressError(f"{label}.sha256 does not match {relative}")
+    return relative
+
+
+def _directory_files(root: Path, directory: str, *, label: str) -> set[str]:
+    found: set[str] = set()
+    for path in (root / directory).iterdir():
+        _single_link_regular(path, label=label)
+        found.add(path.relative_to(root).as_posix())
+    return found
+
+
+def _validate_bundle_inventory(bundle: Path, *, candidate_sha: str, wheel_sha256: str) -> None:
+    """Port of ``qualification/verify_bundle.py::validate_bundle`` plus runbook §1.
+
+    ``verify_bundle.py`` runs stand-alone during RC qualification, before the
+    candidate wheel is installed, so it cannot import this package: keep the
+    two validators hand-in-sync on any change. Parity between them is pinned
+    by ``tests/test_trust_root_install_release_ingress.py``'s
+    ``test_input_tree_validation_accepts_what_verify_bundle_accepts`` and
+    ``test_input_tree_mutations_are_refused_like_verify_bundle``.
+    """
+
+    _single_link_regular(bundle, label="bundle")
+    root = bundle.parent
+    _plain_directory(root, label="qualification input root")
+    if {path.name for path in root.iterdir()} != _INPUT_ROOT_ENTRIES:
+        raise IngressError("qualification input root inventory is not exact")
+    _single_link_regular(root / "install-config.yaml", label="install config")
+    for directory in ("dist", "wheelhouse", "toolchain", "source"):
+        _plain_directory(root / directory, label=f"{directory} root")
+    try:
+        payload = json.loads(bundle.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IngressError("bundle is not JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != _BUNDLE_ROOT_KEYS:
+        raise IngressError("bundle has missing or unknown root fields")
+    if payload["schema_version"] != 1 or isinstance(payload["schema_version"], bool):
+        raise IngressError("bundle schema_version must be 1")
+    if payload["candidate_sha"] != candidate_sha:
+        raise IngressError("bundle candidate_sha does not match")
+    wheel_path = _bundle_entry(payload["wheel"], root=root, label="wheel")
+    if payload["wheel"]["sha256"] != wheel_sha256:
+        raise IngressError("bundle wheel sha256 does not match the selected candidate")
+    if not wheel_path.startswith("dist/"):
+        raise IngressError("bundle wheel must be under dist/")
+    if _directory_files(root, "dist", label="dist entry") != {wheel_path}:
+        raise IngressError("dist inventory must contain only the declared candidate wheel")
+    wheelhouse = payload["wheelhouse"]
+    if not isinstance(wheelhouse, list) or not wheelhouse:
+        raise IngressError("bundle wheelhouse must be a non-empty array")
+    if any(
+        not isinstance(raw, dict)
+        or not isinstance(raw.get("path"), str)
+        or not raw["path"].endswith(".whl")
+        or PurePosixPath(raw["path"]).parent != PurePosixPath("wheelhouse")
+        for raw in wheelhouse
+    ):
+        raise IngressError("bundle wheelhouse must list wheels directly under wheelhouse/")
+    declared = [
+        _bundle_entry(raw, root=root, label=f"wheelhouse[{index}]")
+        for index, raw in enumerate(wheelhouse)
+    ]
+    if len(set(declared)) != len(declared):
+        raise IngressError("wheelhouse manifest paths are duplicated")
+    if set(declared) != _directory_files(root, "wheelhouse", label="wheelhouse entry"):
+        raise IngressError("wheelhouse inventory is incomplete or contains an undeclared file")
+    if not any(raw.get("sha256") == wheel_sha256 for raw in wheelhouse):
+        raise IngressError("wheelhouse does not contain the exact candidate wheel")
+    generated = payload["generated_artifacts"]
+    if not isinstance(generated, list):
+        raise IngressError("generated_artifacts must be an array")
+    generated_paths = [
+        _bundle_entry(raw, root=root, label=f"generated_artifacts[{index}]")
+        for index, raw in enumerate(generated)
+    ]
+    if len(set(generated_paths)) != len(generated_paths):
+        raise IngressError("bundle contains duplicate generated artifact paths")
+    tools = payload["toolchain"]
+    if not isinstance(tools, list) or not tools:
+        raise IngressError("toolchain must be a non-empty array")
+    tool_names: set[str] = set()
+    tool_paths: set[str] = set()
+    for index, raw in enumerate(tools):
+        if not isinstance(raw, dict):
+            raise IngressError(f"toolchain[{index}] must be an object")
+        required = {"name", "version", "shape", "path", "sha256"}
+        if raw.get("shape") == "tree":
+            required |= {"entrypoint", "installed_sha256"}
+        if set(raw) != required:
+            raise IngressError(f"toolchain[{index}] has missing or unknown fields")
+        name = raw.get("name")
+        version = raw.get("version")
+        if (
+            not isinstance(name, str)
+            or not name
+            or "/" in name
+            or name in tool_names
+            or not isinstance(version, str)
+            or not version
+            or raw.get("shape") not in {"file", "tree"}
+        ):
+            raise IngressError(f"toolchain[{index}] identity is invalid")
+        if raw.get("shape") == "tree":
+            entrypoint = raw.get("entrypoint")
+            if (
+                not isinstance(entrypoint, str)
+                or PurePosixPath(entrypoint).is_absolute()
+                or ".." in PurePosixPath(entrypoint).parts
+                or _hex(raw.get("installed_sha256"), _SHA256) is None
+            ):
+                raise IngressError(f"toolchain[{index}] tree metadata is invalid")
+        tool_names.add(name)
+        tool_paths.add(
+            _bundle_entry(
+                {"path": raw["path"], "sha256": raw["sha256"]},
+                root=root,
+                label=f"toolchain[{index}]",
+            )
+        )
+    if tool_names != _TOOL_NAMES:
+        raise IngressError("toolchain inventory is incomplete")
+    if tool_paths != _directory_files(root, "toolchain", label="toolchain entry"):
+        raise IngressError("toolchain directory has undeclared or missing artifacts")
+    repositories = payload["source_repositories"]
+    if not isinstance(repositories, list) or not repositories:
+        raise IngressError("source_repositories must be a non-empty array")
+    repository_paths: set[str] = set()
+    slugs: set[str] = set()
+    for index, raw in enumerate(repositories):
+        if not isinstance(raw, dict) or set(raw) != {
+            "slug",
+            "commit",
+            "remote",
+            "path",
+            "sha256",
+        }:
+            raise IngressError(f"source_repositories[{index}] fields are invalid")
+        slug = raw.get("slug")
+        if (
+            not isinstance(slug, str)
+            or not slug
+            or "/" in slug
+            or slug in slugs
+            or _hex(raw.get("commit"), _SHA40) is None
+            or not isinstance(raw.get("remote"), str)
+            or not raw["remote"].startswith("https://")
+        ):
+            raise IngressError(f"source_repositories[{index}] identity is invalid")
+        slugs.add(slug)
+        repository_paths.add(
+            _bundle_entry(
+                {"path": raw["path"], "sha256": raw["sha256"]},
+                root=root,
+                label=f"source_repositories[{index}]",
+            )
+        )
+    if repository_paths != _directory_files(root, "source", label="source entry"):
+        raise IngressError("source directory has undeclared or missing artifacts")
+
+
+def verify_input_tree(
+    bundle: Path, *, candidate_sha: str, wheel_sha256: str, owner_uid: int
+) -> None:
+    root = bundle.parent
+    try:
+        for path in [root, *sorted(root.rglob("*"), key=lambda item: item.as_posix())]:
+            observed = path.lstat()
+            if stat.S_ISLNK(observed.st_mode):
+                raise IngressError("qualification input contains a symlink")
+            if observed.st_uid != owner_uid or stat.S_IMODE(observed.st_mode) & 0o022:
+                raise IngressError("qualification input ownership/mode is unsafe")
+            if stat.S_ISDIR(observed.st_mode):
+                continue
+            if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+                raise IngressError("qualification input contains an unsafe object")
+        _validate_bundle_inventory(
+            bundle, candidate_sha=candidate_sha, wheel_sha256=wheel_sha256
+        )
+    except OSError as exc:
+        raise IngressError(f"qualification input is incomplete: {exc}") from exc
+
+
+def write_bootstrap_requirements(bundle: Path, requirements: Path) -> None:
+    root = bundle.parent
+    if os.path.lexists(requirements) or requirements.parent != root.parent:
+        raise IngressError("bootstrap requirements path is unsafe")
+    document = json.loads(bundle.read_text(encoding="utf-8"))
+    rows = sorted(document["wheelhouse"], key=lambda item: item["path"])
+    descriptor = os.open(requirements, _OPEN_NEW, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        for row in rows:
+            uri = (root / PurePosixPath(row["path"])).as_uri()
+            stream.write(f"{uri} --hash=sha256:{row['sha256']}\n")
+
+
+def _open_for_readers(root: Path) -> None:
+    """``chmod -R u=rwX,go=rX`` that refuses symlinks instead of following them."""
+
+    for path in [root, *root.rglob("*")]:
+        observed = path.lstat()
+        if stat.S_ISLNK(observed.st_mode):
+            raise IngressError(f"unexpected symlink: {path}")
+        executable = stat.S_ISDIR(observed.st_mode) or bool(
+            stat.S_IMODE(observed.st_mode) & 0o111
+        )
+        os.chmod(path, 0o755 if executable else 0o644)
+
+
+def tree_sha256(root: Path, *, owner_uid: int) -> str:
+    """Deterministic digest of relative path, mode and content (runbook §1)."""
+
+    digest = hashlib.sha256()
+    paths = [root, *sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())]
+    for path in paths:
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        observed = path.lstat()
+        if observed.st_uid != owner_uid or stat.S_IMODE(observed.st_mode) & 0o022:
+            raise IngressError("unsafe candidate CLI ownership/mode")
+        digest.update(relative.encode() + b"\0")
+        digest.update(format(stat.S_IMODE(observed.st_mode), "04o").encode() + b"\0")
+        if stat.S_ISDIR(observed.st_mode):
+            digest.update(b"D\0")
+        elif stat.S_ISREG(observed.st_mode) and observed.st_nlink == 1:
+            digest.update(b"F\0" + hashlib.sha256(path.read_bytes()).digest())
+        else:
+            raise IngressError("unsafe candidate CLI tree object")
+    return digest.hexdigest()
+
+
+def build_sealed_venv(
+    venv: Path,
+    requirements: Path,
+    *,
+    owner_uid: int,
+    run: Callable[..., object] = _run,
+) -> Path:
+    if os.path.lexists(venv):
+        raise IngressError(f"sealed venv path already exists: {venv}")
+    run(
+        ("/usr/bin/python3", "-I", "-S", "-m", "venv", "--copies", str(venv)),
+        check=True,
+        env=dict(_VENV_ENV),
+    )
+    run(
+        (
+            str(venv / "bin" / "python"),
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--only-binary=:all:",
+            "--require-hashes",
+            "--requirement",
+            str(requirements),
+        ),
+        check=True,
+        env={**_VENV_ENV, "PATH": f"{venv}/bin:/usr/bin:/bin"},
+    )
+    lib64 = venv / "lib64"
+    if lib64.is_symlink():
+        if os.readlink(lib64) != "lib":
+            raise IngressError("sealed venv lib64 link does not point at lib")
+        lib64.unlink()
+    _open_for_readers(venv)
+    cli = venv / "bin" / "cortex"
+    if cli.is_symlink() or not cli.is_file() or not os.access(cli, os.X_OK):
+        raise IngressError("sealed venv has no executable cortex CLI")
+    tree_sha256(venv, owner_uid=owner_uid)
+    return cli
+
+
+@dataclass(frozen=True)
+class SealedCandidate:
+    metadata: ReleaseMetadata
+    attempt_dir: Path
+    input_root: Path
+    bundle: Path
+    install_config: Path
+    venv: Path
+    cli: Path
+    tree_sha256: str
+    owner_uid: int
+
+    def assert_unchanged(self) -> None:
+        if tree_sha256(self.venv, owner_uid=self.owner_uid) != self.tree_sha256:
+            raise IngressError("sealed candidate CLI changed since ingress")
+
+
+def ingest_release(
+    version: str,
+    *,
+    fetcher: ReleaseFetcher,
+    installer_root: Path,
+    repository: str = OFFICIAL_REPOSITORY,
+    owner_uid: int = 0,
+    chain_stop: Path = Path("/"),
+    run: Callable[..., object] = _run,
+) -> SealedCandidate:
+    """Runbook §1 end to end: nothing from the release runs before this returns."""
+
+    metadata = resolve_release(fetcher, version, repository=repository)
+    attempt = make_attempt_dir(
+        installer_root, version, owner_uid=owner_uid, chain_stop=chain_stop
+    )
+    release_dir = attempt / "release"
+    archive = download_asset(fetcher, metadata.install_input, release_dir)
+    manifest = download_asset(fetcher, metadata.qualification, release_dir)
+    for path in (archive, manifest):
+        observed = path.lstat()
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != owner_uid
+            or stat.S_IMODE(observed.st_mode) & 0o022
+        ):
+            raise IngressError(f"downloaded release asset is not private: {path.name}")
+    authority = read_qualification_authority(manifest)
+    if authority.candidate_sha != metadata.commit:
+        raise IngressError("qualification manifest candidate does not match the tag target")
+    if authority.wheel_filename != metadata.wheel.name:
+        raise IngressError("qualification manifest wheel is not the release wheel asset")
+    if authority.wheel_sha256 != metadata.wheel.sha256:
+        raise IngressError("qualification manifest wheel digest is not the release wheel digest")
+    check_archive_topology(archive)
+    input_root = attempt / "input"
+    os.mkdir(input_root, 0o700)
+    extract_install_input(archive, input_root)
+    bundle = input_root / "bundle.json"
+    if _sha256_file(bundle) != authority.bundle_sha256:
+        raise IngressError("bundle.json does not match the qualification manifest")
+    verify_input_tree(
+        bundle,
+        candidate_sha=authority.candidate_sha,
+        wheel_sha256=authority.wheel_sha256,
+        owner_uid=owner_uid,
+    )
+    requirements = attempt / "bootstrap-requirements.txt"
+    write_bootstrap_requirements(bundle, requirements)
+    # The input is not a credential surface: once verified, the unprivileged
+    # plan identity may traverse and read it (runbook §1).
+    for directory in (installer_root, installer_root / version, attempt):
+        os.chmod(directory, 0o755)
+    _open_for_readers(input_root)
+    venv = attempt / "venv"
+    cli = build_sealed_venv(venv, requirements, owner_uid=owner_uid, run=run)
+    return SealedCandidate(
+        metadata=metadata,
+        attempt_dir=attempt,
+        input_root=input_root,
+        bundle=bundle,
+        install_config=input_root / "install-config.yaml",
+        venv=venv,
+        cli=cli,
+        tree_sha256=tree_sha256(venv, owner_uid=owner_uid),
+        owner_uid=owner_uid,
+    )

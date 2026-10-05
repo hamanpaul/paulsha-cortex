@@ -72,6 +72,13 @@ def validate_bundle(
     candidate_sha: str,
     wheel_sha256: str,
 ) -> None:
+    # Ported (by hand, kept in sync) at
+    # paulsha_cortex.trust_root.install.release_ingress._validate_bundle_inventory,
+    # which runs after the wheel is installed; this one runs stand-alone during
+    # RC qualification, before the wheel exists, so it cannot import that
+    # package. Parity is pinned by
+    # tests/test_trust_root_install_release_ingress.py::test_input_tree_validation_accepts_what_verify_bundle_accepts
+    # and ::test_input_tree_mutations_are_refused_like_verify_bundle.
     _single_link_regular(bundle, label="bundle")
     root = bundle.parent
     _plain_directory(root, label="qualification input root")
