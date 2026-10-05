@@ -5698,6 +5698,35 @@ def _canary_fix_round(terminal: object) -> tuple[str, str] | None:
     return None
 
 
+def _canary_fix_round_reason(terminal: object, fix_reason: str) -> str:
+    """修正回合交給 builder 的裁決理由，附上停止點的實際內容（#716）。
+
+    post-archive 的 repair action 要 builder「只修 current verification／review evidence
+    指出的缺陷」，但 builder 的契約裡只看得到 operator 的裁決理由——canary run
+    37256414890 送的是一句泛用文字，builder 找不到任何具體 finding，只能以 needs_human
+    停下。人工 operator 會把要修的問題寫進 `--reason`；這裡同樣帶上 blocking_reason 的
+    detail（verify／review 的 summary 與 details），截到 Manager 接受的長度
+    （`work_actions.OPERATOR_ADJUDICATION_REASON_LIMIT`，同一個常數）。
+    """
+
+    from paulsha_cortex.coordinator.work_actions import (
+        OPERATOR_ADJUDICATION_REASON_LIMIT,
+    )
+
+    blocking = terminal.get("blocking_reason") if isinstance(terminal, Mapping) else None
+    detail = blocking.get("detail") if isinstance(blocking, Mapping) else None
+    prefix = f"deployment canary：{fix_reason} 交由 builder 修正（retry-build 出口，#1139／#1206）"
+    if not isinstance(detail, str) or not detail.strip():
+        return prefix
+    flat = " ".join(
+        "".join(char if char.isprintable() else " " for char in detail).split()
+    )
+    reason = f"{prefix}。停止點內容：{flat}"
+    if len(reason) > OPERATOR_ADJUDICATION_REASON_LIMIT:
+        reason = reason[: OPERATOR_ADJUDICATION_REASON_LIMIT - 1] + "…"
+    return reason
+
+
 def _dispatch_blocking_summary(terminal: object) -> str:
     """把 `cortex work show --json` 的結構化 blocking reason 帶進失敗訊息。
 
@@ -6191,8 +6220,7 @@ def _full_dispatch(
                                 "--actor",
                                 "deployment-canary",
                                 "--reason",
-                                f"deployment canary：{fix_reason} 交由 builder 修正"
-                                "（retry-build 出口，#1139／#1206）",
+                                _canary_fix_round_reason(envelope, fix_reason),
                                 "--wait",
                                 "--timeout",
                                 "60",
@@ -6205,7 +6233,8 @@ def _full_dispatch(
                         fix_rounds += 1
                         handled_stops[fix_round] = time.monotonic()
                         print(
-                            f"canary fix round {fix_rounds} dispatched ({fix_reason})",
+                            f"canary fix round {fix_rounds} dispatched ({fix_reason})"
+                            + _dispatch_blocking_summary(envelope),
                             file=sys.stderr,
                             flush=True,
                         )
