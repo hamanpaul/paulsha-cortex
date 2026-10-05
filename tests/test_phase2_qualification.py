@@ -820,9 +820,14 @@ def test_release_harness_refreshes_the_builder_credential_before_the_full_upgrad
     services = runner.index('die "upgrade drill did not restore $upgrade_service"')
     prior_sha = runner.index("builder_codex_prior_sha=$(docker exec")
     identity = runner.index("builder_codex_identity=$(docker exec")
+    # Rewritten as the owning account, the way codex refreshes it: root's
+    # O_CREAT open of another user's file in the sticky `.codex` is refused by
+    # fs.protected_regular.
     rewrite = runner.index(
-        "docker exec \"$container_name\" sh -eu -c 'printf \"\\n\" >> \"$1\"' "
-        'sh "$builder_codex_credential"'
+        'if ! docker exec "$container_name" /usr/sbin/runuser -u cortex-builder -- \\\n'
+        "    sh -eu -c 'printf \"\\n\" >> \"$1\"' sh \"$builder_codex_credential\"; then\n"
+        '    die "credential refresh drill could not rewrite the builder credential as '
+        'cortex-builder"\nfi\n'
     )
     refreshed = runner.index("builder_codex_refreshed_sha=$(docker exec")
     full = runner.index('sh "$upgrade_report" "${upgrade_cli[@]}"')
@@ -845,8 +850,13 @@ def test_release_harness_refreshes_the_builder_credential_before_the_full_upgrad
         'die "credential refresh drill did not change the builder credential digest"',
     ):
         assert fragment in section, fragment
-    # The drill hashes the credential and never prints its content.
+    # The drill hashes the credential and never prints its content; root never
+    # writes it directly.
     assert 'cat "$builder_codex_credential"' not in runner
+    assert (
+        "docker exec \"$container_name\" sh -eu -c 'printf \"\\n\" >> \"$1\"'"
+        not in runner
+    )
     check = runner[recorded : runner.index("fi\n", recorded)]
     for fragment in (
         '--slurpfile prior "$receipt_path"',

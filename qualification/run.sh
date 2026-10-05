@@ -469,10 +469,12 @@ for upgrade_service in cortex-egress-proxy.service cortex-manager.service cortex
     docker exec "$container_name" systemctl is-active --quiet "$upgrade_service" || \
         die "upgrade drill did not restore $upgrade_service"
 done
-# 模擬 executor 自行刷新登入檔（#1275）：codex 刷新 token 時就地改寫 auth.json。以 root
-# 在檔尾附加一個換行（JSON 尾端空白，憑證語意不變，內容不讀出也不印出），inode、owner、
-# group、mode、nlink 都不變，只有 sha256 改變。完整升級必須照常接手，並在新 receipt 記錄
-# 改寫後的 sha。
+# 模擬 executor 自行刷新登入檔（#1275）：codex 以 builder 帳號身分就地改寫 auth.json。
+# 這裡同樣以 cortex-builder（driver 跑 job 帳號指令用的 `/usr/sbin/runuser -u`）在檔尾附加
+# 一個換行（JSON 尾端空白，憑證語意不變，內容不讀出也不印出），inode、owner、group、mode、
+# nlink 都不變，只有 sha256 改變。不能以 root 寫：`.codex` 是 sticky 目錄，kernel 的
+# fs.protected_regular 會拒絕 root 以 O_CREAT 開啟（shell `>>`）別的帳號的檔。完整升級必須
+# 照常接手，並在新 receipt 記錄改寫後的 sha。
 builder_codex_prior_sha=$(docker exec "$container_name" jq -r \
     '[.credentials[] | select(.principal == "builder" and .provider == "codex")]
      | if length == 1 then .[0].sha256 else empty end' \
@@ -481,7 +483,10 @@ builder_codex_identity=$(docker exec "$container_name" \
     stat -c '%F %i %u %g %a %h' "$builder_codex_credential")
 [[ "$builder_codex_identity" == "regular file "*" 600 1" ]] || \
     die "credential refresh drill changed the builder credential metadata"
-docker exec "$container_name" sh -eu -c 'printf "\n" >> "$1"' sh "$builder_codex_credential"
+if ! docker exec "$container_name" /usr/sbin/runuser -u cortex-builder -- \
+    sh -eu -c 'printf "\n" >> "$1"' sh "$builder_codex_credential"; then
+    die "credential refresh drill could not rewrite the builder credential as cortex-builder"
+fi
 [[ "$(docker exec "$container_name" \
     stat -c '%F %i %u %g %a %h' "$builder_codex_credential")" == "$builder_codex_identity" ]] || \
     die "credential refresh drill changed the builder credential metadata"
