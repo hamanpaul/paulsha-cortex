@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **#1275 `cortex upgrade` 的憑證接手改記錄當下 sha256**：executor 會自己改寫登入檔（codex 刷新 token 等），原本 `credentials inherit` 要求 sha256 等於 prior 匯入時的值，升級因此在 credentials 步驟失敗並 rollback。現在照舊驗 `(principal, provider)` 已記錄、落點與 prior 相同、regular file、nlink 1、uid／gid、0600（共用 `validate_credentials` 的 fd-based `O_NOFOLLOW` 檢查），sha256 改記錄接手當下的值，activate 以它驗證；所有可匯入形狀都是持有帳號可改寫的 0600 檔，沒有形狀保留嚴格比對。credential 列不加新欄位，已安裝的 0.1.13 仍讀得懂 candidate 寫出的 receipt，prior 的 sha256 經 `inherited_from` 回到 prior receipt 查；`credentials import` 不變。RC 在完整升級前就地改寫 builder／codex 憑證並核對新 receipt 記錄新 sha256（見 `changelog.d/credential-drift-inherit.md`）（#1275）。
 - **#716 canary HEAD proof 接受唯讀 `rg`／`find` 段，qualification image 安裝 ripgrep**：canary run 37343291869 的 codex 在探針鏈尾端接 `rg --files`，RC image 缺 ripgrep 而 exit 127、結案找不到 HEAD proof；image 補裝 `ripgrep`，探針鏈接受選項／述詞限允許清單的唯讀 `rg`／`find` 段（會執行、寫檔、刪檔或印出任意字面值的選項不收，路徑限 bound worktree 內、拒絕 `~` 開頭），proof 仍須整條 exit 0 且含印出 HEAD 的 git 段（見 `changelog.d/head-probe-rg.md`）（#716）。
 - **#716 validator 接受 agy smoke 的 persisted_variants 證據**：canary run 37331921480 顯示 driver（commit a6340da2 起）為 agy smoke 多寫的 `persisted_variants` 欄位被 validator 當 unknown field 擋下；改為對 agy 額外接受該欄位，且值須恰好等於驗證通過時的那組 runtime model／effort（#716）。
 

@@ -1469,11 +1469,170 @@ def test_inherit_prior_credentials_marks_rows_and_activation_counts_them(
     ]
 
 
-def test_inherit_refuses_a_destination_whose_digest_changed(tmp_path: Path) -> None:
-    _write_credential(tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"new"}')
-    prior, receipt = _handoff(tmp_path, prior_rows=[_prior_row("0" * 64)])
+class _LiveCredentialBackend(CredentialBackend):
+    """Activation double whose credential check is the real live validation."""
 
-    with pytest.raises(CredentialImportError, match="builder/codex metadata or hash mismatch"):
+    def validate_credentials(self, current):
+        return LocalInstallBackend(require_root=False).validate_credentials(current)
+
+
+def _rewrite_in_place(path: Path, content: bytes) -> str:
+    """Rewrite like a token refresh: same inode, owner, mode and link count."""
+
+    before = path.lstat()
+    descriptor = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    try:
+        os.write(descriptor, content)
+    finally:
+        os.close(descriptor)
+    after = path.lstat()
+    assert (after.st_ino, after.st_mode, after.st_uid, after.st_nlink) == (
+        before.st_ino,
+        before.st_mode,
+        before.st_uid,
+        before.st_nlink,
+    )
+    return hashlib.sha256(content).hexdigest()
+
+
+def test_inherit_records_the_current_digest_of_a_credential_its_account_rewrote(
+    tmp_path: Path,
+) -> None:
+    prior_digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    current = _rewrite_in_place(
+        tmp_path / "cortex-builder/.codex/auth.json", b'{"token":"refreshed"}'
+    )
+    assert current != prior_digest
+    prior, receipt = _handoff(tmp_path, prior_rows=[_prior_row(prior_digest)])
+    prior_id = prior.to_dict()["receipt_id"]
+
+    rows = inherit_prior_credentials(
+        receipt, prior, backend=LocalInstallBackend(require_root=False)
+    )
+
+    assert rows == (_inherited_row(current, prior_id),)
+    assert receipt.to_dict()["credentials"] == [_inherited_row(current, prior_id)]
+    # Provenance stays in the chain: the prior receipt still records its digest.
+    assert prior.to_dict()["credentials"] == [_prior_row(prior_digest)]
+
+    backend = _LiveCredentialBackend()
+    activate_receipt(receipt, backend=backend)
+    assert backend.started == [
+        "cortex-egress-proxy.service",
+        "cortex-manager.service",
+        "cortex-monitor.service",
+    ]
+    assert receipt.to_dict()["services_started"] is True
+
+
+def test_activation_binds_the_inherited_row_to_the_digest_recorded_at_inheritance(
+    tmp_path: Path,
+) -> None:
+    prior_digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    destination = tmp_path / "cortex-builder/.codex/auth.json"
+    _rewrite_in_place(destination, b'{"token":"refreshed"}')
+    prior, receipt = _handoff(tmp_path, prior_rows=[_prior_row(prior_digest)])
+    inherit_prior_credentials(
+        receipt, prior, backend=LocalInstallBackend(require_root=False)
+    )
+    _rewrite_in_place(destination, b'{"token":"after-inheritance"}')
+
+    backend = _LiveCredentialBackend()
+    with pytest.raises(ActivationError, match="builder/codex metadata or hash mismatch"):
+        activate_receipt(receipt, backend=backend)
+    assert backend.started == []
+
+
+@pytest.mark.parametrize(
+    ("principal", "provider"),
+    [
+        ("builder", "codex"),
+        ("reviewer-planner", "codex"),
+        ("builder", "agy"),
+        ("reviewer-planner", "agy"),
+        ("reviewer-planner", "copilot"),
+        ("manager", "github"),
+    ],
+)
+def test_inherit_follows_an_owner_rewrite_for_every_credential_shape(
+    tmp_path: Path, principal: str, provider: str
+) -> None:
+    account = {
+        "builder": "cortex-builder",
+        "reviewer-planner": "cortex-reviewer-planner",
+        "manager": "cortex-manager",
+    }[principal]
+    adapter = install_core._credential_adapter_for(principal, provider)
+    assert adapter is not None
+    relative = "/".join(adapter.destination_parts)
+    prior_digest = _write_credential(tmp_path / account, relative, b"prior-content\n")
+    current = _rewrite_in_place(tmp_path / account / relative, b"refreshed-content\n")
+    prior, receipt = _handoff(
+        tmp_path,
+        required=((principal, provider),),
+        prior_rows=[_prior_row(prior_digest, principal=principal, provider=provider)],
+    )
+    prior_id = prior.to_dict()["receipt_id"]
+
+    rows = inherit_prior_credentials(
+        receipt, prior, backend=LocalInstallBackend(require_root=False)
+    )
+
+    expected = _inherited_row(current, prior_id, principal=principal, provider=provider)
+    assert rows == (expected,)
+    assert LocalInstallBackend(require_root=False).validate_credentials(receipt) == ()
+
+
+def _drift_then(tmp_path: Path, unsafe: str) -> dict[str, object]:
+    """Rewrite the builder credential, then break one metadata property."""
+
+    home = tmp_path / "cortex-builder"
+    prior_digest = _write_credential(home, ".codex/auth.json", b'{"token":"prior"}')
+    destination = home / ".codex/auth.json"
+    _rewrite_in_place(destination, b'{"token":"refreshed"}')
+    handoff: dict[str, object] = {"prior_rows": [_prior_row(prior_digest)]}
+    if unsafe == "mode-0640":
+        destination.chmod(0o640)
+    elif unsafe == "hard-link":
+        os.link(destination, tmp_path / "second-link")
+    elif unsafe == "symlink":
+        target = tmp_path / "elsewhere.json"
+        target.write_bytes(b'{"token":"refreshed"}')
+        target.chmod(0o600)
+        destination.unlink()
+        destination.symlink_to(target)
+    elif unsafe == "foreign-uid":
+        handoff["prior_builder_uid"] = os.getuid() + 1
+    elif unsafe == "moved-destination":
+        handoff["new_builder_uid"] = os.getuid() + 1
+    elif unsafe == "unrecorded-pair":
+        handoff["required"] = (("builder", "codex"), ("reviewer-planner", "copilot"))
+    else:  # pragma: no cover - parametrization guard
+        raise AssertionError(unsafe)
+    return handoff
+
+
+@pytest.mark.parametrize(
+    ("unsafe", "refusal"),
+    [
+        ("mode-0640", "builder/codex metadata mismatch"),
+        ("hard-link", "builder/codex metadata mismatch"),
+        ("symlink", "builder/codex unavailable"),
+        ("foreign-uid", "builder/codex metadata mismatch"),
+        ("moved-destination", "destination changed"),
+        ("unrecorded-pair", "never recorded: reviewer-planner/copilot"),
+    ],
+)
+def test_inherit_still_refuses_unsafe_metadata_after_an_owner_rewrite(
+    tmp_path: Path, unsafe: str, refusal: str
+) -> None:
+    prior, receipt = _handoff(tmp_path, **_drift_then(tmp_path, unsafe))  # type: ignore[arg-type]
+
+    with pytest.raises(CredentialImportError, match=refusal):
         inherit_prior_credentials(
             receipt, prior, backend=LocalInstallBackend(require_root=False)
         )
@@ -1502,7 +1661,7 @@ def test_inherit_refuses_a_file_owned_by_another_uid(tmp_path: Path) -> None:
         tmp_path, prior_rows=[_prior_row(digest)], prior_builder_uid=os.getuid() + 1
     )
 
-    with pytest.raises(CredentialImportError, match="builder/codex metadata or hash mismatch"):
+    with pytest.raises(CredentialImportError, match="builder/codex metadata mismatch"):
         inherit_prior_credentials(
             receipt, prior, backend=LocalInstallBackend(require_root=False)
         )
@@ -1515,7 +1674,7 @@ def test_inherit_refuses_a_hard_linked_destination(tmp_path: Path) -> None:
     os.link(tmp_path / "cortex-builder/.codex/auth.json", tmp_path / "second-link")
     prior, receipt = _handoff(tmp_path, prior_rows=[_prior_row(digest)])
 
-    with pytest.raises(CredentialImportError, match="builder/codex metadata or hash mismatch"):
+    with pytest.raises(CredentialImportError, match="builder/codex metadata mismatch"):
         inherit_prior_credentials(
             receipt, prior, backend=LocalInstallBackend(require_root=False)
         )
@@ -1555,10 +1714,12 @@ def test_inherit_refuses_a_receipt_that_is_not_the_prior_successor(tmp_path: Pat
         )
 
 
+@pytest.mark.parametrize("refreshed", [False, True])
 def test_credentials_inherit_cli_records_rows_in_the_durable_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    refreshed: bool,
 ) -> None:
     monkeypatch.setattr(install_core, "_validate_receipt_parent", lambda _o, _p: None)
     monkeypatch.setattr(install_core, "_validate_receipt_file", lambda _o, _p: None)
@@ -1592,6 +1753,10 @@ def test_credentials_inherit_cli_records_rows_in_the_durable_receipt(
         "plan_sha256": prior_document["plan_sha256"],
     }
     successor._persist()
+    if refreshed:
+        digest = _rewrite_in_place(
+            tmp_path / "cortex-builder/.codex/auth.json", b'{"token":"refreshed"}'
+        )
 
     assert install_cli.main(
         [
@@ -1614,4 +1779,10 @@ def test_credentials_inherit_cli_records_rows_in_the_durable_receipt(
     ]
     assert InstallReceipt.load(next_path).to_dict()["credentials"] == [
         _inherited_row(digest, prior_document["receipt_id"])
+    ]
+    # Compatibility pin (#1275): the row keeps the exact key set every released
+    # reader accepts, so an installed coordinator still loads this receipt.
+    on_disk = json.loads(next_path.read_text(encoding="utf-8"))["credentials"]
+    assert [set(row) for row in on_disk] == [
+        {"principal", "provider", "mode", "sha256", "inherited_from"}
     ]

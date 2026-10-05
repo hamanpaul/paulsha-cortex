@@ -3598,6 +3598,45 @@ def _remove_created_credential_directories(
     return None
 
 
+def _observe_credential(
+    receipt: InstallReceipt, *, principal: str, provider: str
+) -> tuple[str, bool]:
+    """Hash one receipt credential through the fd-bound, no-follow path.
+
+    Returns the live sha256 and whether the file passes the metadata check
+    (regular file, one link, the account's uid/gid, mode 0600).  The content
+    leaves the descriptor only as its digest.  Raises ``InstallError`` or
+    ``OSError`` when the destination cannot be opened safely (for example a
+    symlink at the leaf, or a path that no longer names the held inode).
+    """
+
+    destination, uid, gid = credential_destination(
+        receipt, principal=principal, provider=provider
+    )
+    parent_fd, leaf = _open_parent_directory(destination)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            leaf,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        observed = os.fstat(descriptor)
+        digest = hashlib.sha256(_read_fd_bytes(descriptor)).hexdigest()
+        _assert_fd_path_binding(destination, descriptor, directory=False)
+        return digest, (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_nlink == 1
+            and observed.st_uid == uid
+            and observed.st_gid == gid
+            and stat.S_IMODE(observed.st_mode) == 0o600
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
 def _refuse_unprepared_quarantine(step: Mapping[str, object]) -> None:
     if step.get("kind") == "legacy-quarantine":
         raise InstallPlanError(
@@ -5333,40 +5372,48 @@ class LocalInstallBackend:
             principal = str(row.get("principal", ""))
             provider = str(row.get("provider", ""))
             try:
-                destination, uid, gid = credential_destination(
+                digest, metadata_ok = _observe_credential(
                     receipt, principal=principal, provider=provider
                 )
-                parent_fd, leaf = _open_parent_directory(destination)
-                descriptor: int | None = None
-                try:
-                    descriptor = os.open(
-                        leaf,
-                        os.O_RDONLY
-                        | getattr(os, "O_NOFOLLOW", 0)
-                        | getattr(os, "O_CLOEXEC", 0),
-                        dir_fd=parent_fd,
-                    )
-                    observed = os.fstat(descriptor)
-                    digest = hashlib.sha256(_read_fd_bytes(descriptor)).hexdigest()
-                    _assert_fd_path_binding(destination, descriptor, directory=False)
-                    if (
-                        not stat.S_ISREG(observed.st_mode)
-                        or observed.st_nlink != 1
-                        or observed.st_uid != uid
-                        or observed.st_gid != gid
-                        or stat.S_IMODE(observed.st_mode) != 0o600
-                        or digest != row.get("sha256")
-                    ):
-                        failures.append(
-                            f"{principal}/{provider} metadata or hash mismatch"
-                        )
-                finally:
-                    if descriptor is not None:
-                        os.close(descriptor)
-                    os.close(parent_fd)
             except (InstallError, OSError):
                 failures.append(f"{principal}/{provider} unavailable")
+                continue
+            if not metadata_ok or digest != row.get("sha256"):
+                failures.append(f"{principal}/{provider} metadata or hash mismatch")
         return tuple(failures)
+
+    def observe_credentials(
+        self, receipt: InstallReceipt
+    ) -> tuple[dict[tuple[str, str], str], tuple[str, ...]]:
+        """Live sha256 of each receipt credential that passes the metadata check.
+
+        Same fd-bound, no-follow open and the same metadata check as
+        :meth:`validate_credentials`, but the digest is reported instead of
+        compared: credential inheritance (#1275) records what the owning
+        account's file holds now.  Returns ``(digests, failures)``.
+        """
+
+        digests: dict[tuple[str, str], str] = {}
+        failures: list[str] = []
+        rows = receipt.to_dict().get("credentials", [])
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, Mapping):
+                failures.append("invalid credential metadata")
+                continue
+            principal = str(row.get("principal", ""))
+            provider = str(row.get("provider", ""))
+            try:
+                digest, metadata_ok = _observe_credential(
+                    receipt, principal=principal, provider=provider
+                )
+            except (InstallError, OSError):
+                failures.append(f"{principal}/{provider} unavailable")
+                continue
+            if not metadata_ok:
+                failures.append(f"{principal}/{provider} metadata mismatch")
+                continue
+            digests[(principal, provider)] = digest
+        return digests, tuple(failures)
 
     def rollback_credentials(self, receipt: InstallReceipt) -> Sequence[dict[str, object]]:
         retained: list[dict[str, object]] = []
