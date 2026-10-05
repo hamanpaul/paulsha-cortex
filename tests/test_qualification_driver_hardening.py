@@ -4669,3 +4669,37 @@ def test_reclaimed_build_counts_as_harvest_only_when_its_commit_landed(
         assert calls[0][0][-1] == "b" * 40 + "^{commit}"
     else:
         assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("hash", r"gate hash mismatch: copilot:"),
+        ("duplicate-path", r"gate path is not unique: copilot:"),
+    ],
+)
+def test_dispatch_closeout_names_the_failing_delivery_gate_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, message: str
+) -> None:
+    """#716（canary run 37290200603）：雜湊不符、路徑重複、inode 重複過去合成一句
+    「hash/path is not unique」，看不出是哪一種、哪一個 kind。"""
+
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    payload = json.loads(fixture["registry"].read_text())
+    refs = payload["workflows"][0]["gate_refs"]
+    foreign_ref = next(row for row in refs if row["kind"] == "foreign-review")
+    copilot_ref = next(row for row in refs if row["kind"] == "copilot")
+    if mutation == "hash":
+        copilot_ref["sha256"] = "0" * 64
+    else:
+        # copilot 指向與 foreign-review 同一份檔案（hash 也一致），只能以路徑重複擋下。
+        copilot_ref["ref"] = foreign_ref["ref"]
+        copilot_ref["sha256"] = foreign_ref["sha256"]
+        refs.sort(key=lambda row: row["kind"] != "foreign-review")
+    _write_json(fixture["registry"], payload)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    with pytest.raises(driver.QualificationFailure, match=message):
+        _validate_fixture_closeout(driver, fixture)

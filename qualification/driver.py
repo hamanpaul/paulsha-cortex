@@ -5569,12 +5569,21 @@ def _validate_dispatch_closeout(
         )
         metadata = path.stat()
         inode = (metadata.st_dev, metadata.st_ino)
-        if (
-            hashlib.sha256(content).hexdigest() != expected_hash
-            or path in gate_paths
-            or inode in gate_inodes
-        ):
-            raise QualificationFailure("workflow delivery gate hash/path is not unique")
+        # #716（canary run 37290200603）：三種情況過去合成一句，看不出是哪一種。
+        # 分開報出，並帶上 ref 的 kind 與檔名（不含內容）。
+        gate_label = f"{row.get('kind')}:{path.name}"
+        if hashlib.sha256(content).hexdigest() != expected_hash:
+            raise QualificationFailure(
+                f"workflow delivery gate hash mismatch: {gate_label}"
+            )
+        if path in gate_paths:
+            raise QualificationFailure(
+                f"workflow delivery gate path is not unique: {gate_label}"
+            )
+        if inode in gate_inodes:
+            raise QualificationFailure(
+                f"workflow delivery gate inode is not unique: {gate_label}"
+            )
         # #1096：evidence 過去只以 kind／path／hash 採信，證據內容從未被讀——他 run
         # 或舊 candidate 遺留的合法檔案，只要湊得出對應的 path＋hash 就能滿足
         # closeout。這裡把內容當 JSON 讀出來，凡是自報 run_id／work_id／candidate

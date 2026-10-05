@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 closeout gate ref 診斷**：gate ref 失敗時分開報出雜湊、路徑、inode 與 kind（#716）。
 - **#716 closeout 接受已回收的 harvest 證據**：bundle 隨 owner-bound reclaim 移除時，以 source repo 中的 subject_head 證明 harvest 落地（#716）。
 - **#1261 workflow lane 的 builder 工作區改走 owner-bound reclaim**：會寫檔的 build 卡派工時把 owner identity／attempt 寫進 marker 與 job 記錄，三 UID 下經 builder unit 回收；唯讀卡維持 Manager 直接回收，回收前以 job 記錄核對 marker（#1261）。
 - **#1259 archive 與交付 PR 之後的 retry-build 派得出 Builder**：Builder admission 另外接受兩種 Manager 自產漂移（Manager archive 造成的 OpenSpec archived；retry-build 後 build phase 的交付 PR，須同時具備 receipt、delivery journal 推送證據與唯一 open PR）。retry-build admission 與 Builder 派工入口共用判定，派不出 Builder 時在 reset 前拒絕；新增 `cortex-retry-build-receipt/v1`（#1259）。

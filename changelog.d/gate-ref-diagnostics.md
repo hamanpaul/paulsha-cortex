@@ -1,0 +1,1 @@
+- #716 canary closeout：delivery gate ref 的檢查把「雜湊不符」、「路徑重複」、「inode 重複」分成三個具名失敗，並帶上 ref 的 kind 與檔名（不含內容），取代過去合併的「hash/path is not unique」（canary run 37290200603）。
