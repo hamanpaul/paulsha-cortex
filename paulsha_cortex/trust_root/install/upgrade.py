@@ -210,12 +210,41 @@ def check_target_version(
     )
 
 
+# Cap on a failed child's output we fold into the report or an error message.
+_CHILD_OUTPUT_LIMIT = 4000
+
+
+def _output_tail(result: CompletedProcess[str]) -> str:
+    """A failed child's stderr and stdout, each cut to its last characters.
+
+    Installer refusals reach only stderr while a verify FAIL result is the JSON on
+    stdout, so both are kept (bounded together); the exit code when both are empty.
+    """
+
+    parts = [
+        text
+        for text in ((result.stderr or "").strip(), (result.stdout or "").strip())
+        if text
+    ]
+    if not parts:
+        return f"exit {result.returncode}"
+    limit = _CHILD_OUTPUT_LIMIT // len(parts)
+    return " | ".join(text if len(text) <= limit else "…" + text[-limit:] for text in parts)
+
+
+@dataclass(frozen=True)
+class _StatusUnavailable:
+    """Why the installed `cortex service status` gave no payload."""
+
+    reason: str
+
+
 def _service_status(plan: Mapping[str, object], receipt_path: Path) -> object:
-    """`cortex service status --system --json` of the installed CLI, or None."""
+    """`cortex service status --system --json` of the installed CLI, or why not."""
 
     roots = plan.get("roots")
     if not isinstance(roots, Mapping):
-        return None
+        return _StatusUnavailable("the plan has no roots")
     deploy = Path(str(roots.get("deploy")))
     try:
         env = installed_runtime_env(
@@ -233,14 +262,14 @@ def _service_status(plan: Mapping[str, object], receipt_path: Path) -> object:
             ),
             env=env,
         )
-    except (InstallError, OSError):
-        return None
+    except (InstallError, OSError) as exc:
+        return _StatusUnavailable(f"{type(exc).__name__}: {exc}")
     if result.returncode != 0:
-        return None
+        return _StatusUnavailable(f"exit {result.returncode}: {_output_tail(result)}")
     try:
         return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        return _StatusUnavailable(f"invalid JSON: {exc}")
 
 
 def await_loaded_runtime(
@@ -256,11 +285,12 @@ def await_loaded_runtime(
     deadline = _monotonic() + window
     while True:
         payload = _service_status(plan, receipt_path)
-        mismatch = (
-            "service_status=unavailable"
-            if payload is None
-            else loaded_runtime_mismatch(payload, expected)
-        )
+        if payload is None or isinstance(payload, _StatusUnavailable):
+            reason = f" ({payload.reason})" if isinstance(payload, _StatusUnavailable) else ""
+            mismatch = f"service_status=unavailable{reason}"
+            payload = None
+        else:
+            mismatch = loaded_runtime_mismatch(payload, expected)
         if not mismatch or _monotonic() >= deadline:
             return mismatch, payload
         _sleep(_STATUS_POLL_SECONDS)
@@ -342,6 +372,9 @@ def preflight(options: UpgradeOptions) -> Preflight:
 
     if options.version is None:
         raise UpgradeError("a target version is required")
+    # First: after a crashed upgrade the services are stopped, so every later
+    # check would fail with a misleading cause instead of "run --recover".
+    assert_installer_idle()
     prior = locate_prior(options)
     target = check_target_version(
         options.version, prior.version, allow_same_version=options.allow_same_version
@@ -354,7 +387,6 @@ def preflight(options: UpgradeOptions) -> Preflight:
             f"the running services do not match the current receipt ({mismatch}); "
             "the effective receipt cannot be confirmed"
         )
-    assert_installer_idle()
     wait_until_idle(prior.plan, wait_seconds=options.wait_idle)
     return Preflight(prior=prior, target=target)
 
@@ -656,7 +688,12 @@ _ROLLBACK_ERROR_LIMIT = 4000
 
 
 class UpgradeInterrupted(BaseException):
-    """INT/TERM inside the maintenance window; handled like any step failure."""
+    """INT/TERM/HUP inside the maintenance window; handled like any step failure."""
+
+
+# SIGHUP is here because production upgrades run over SSH: a dropped session
+# must roll back and report, not kill the coordinator mid-window.
+_INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
 def _interrupt(signum: int, _frame: object) -> None:
@@ -665,7 +702,7 @@ def _interrupt(signum: int, _frame: object) -> None:
 
 @contextmanager
 def _signals_raise() -> Iterator[None]:
-    previous = {sig: signal.signal(sig, _interrupt) for sig in (signal.SIGINT, signal.SIGTERM)}
+    previous = {sig: signal.signal(sig, _interrupt) for sig in _INTERRUPT_SIGNALS}
     try:
         yield
     finally:
@@ -674,7 +711,7 @@ def _signals_raise() -> Iterator[None]:
 
 
 def _ignore_interrupts() -> None:
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in _INTERRUPT_SIGNALS:
         signal.signal(sig, signal.SIG_IGN)
 
 
@@ -732,8 +769,7 @@ def _candidate(sealed: SealedCandidate, *arguments: str) -> CompletedProcess[str
 def _candidate_json(sealed: SealedCandidate, step: str, *arguments: str) -> dict[str, object]:
     result = _candidate(sealed, *arguments)
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
-        raise UpgradeError(f"{step} failed: {detail}")
+        raise UpgradeError(f"{step} failed: {_output_tail(result)}")
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -822,7 +858,11 @@ def _advance(
             token,
         )
         if verified.returncode != 0:
-            raise UpgradeError("verify did not PASS")
+            # Refusals reach only stderr and a FAIL result is the JSON on stdout;
+            # without them the report could not say why verify failed.
+            raise UpgradeError(
+                f"verify did not PASS (exit {verified.returncode}): {_output_tail(verified)}"
+            )
         inactive = [
             service
             for service in install_cli._MAINTENANCE_SERVICES
@@ -946,14 +986,21 @@ def run_transaction(
     prior: PriorReceipt,
     report: dict[str, object],
     steps: StepLog,
+    *,
+    wait_idle: int,
 ) -> int:
-    """Lease → snapshot → stop → apply → inherit → activate → verify → loaded runtime."""
+    """Lease → idle check → snapshot → stop → apply → inherit → activate → verify → runtime."""
 
     state = _TransactionState()
     lifecycle = {"complete": False}
     with _signals_raise():
         with install_cli._maintenance_lease(bound.plan, lifecycle_state=lifecycle) as token:
             try:
+                with steps.step("idle-check"):
+                    # Preflight checked before ingress, the venv build and plan;
+                    # jobs may have started since.  Re-check under the lease, right
+                    # before the services stop: a refusal here has stopped nothing.
+                    wait_until_idle(prior.plan, wait_seconds=wait_idle)
                 with steps.step("maintenance-snapshot"):
                     if os.path.lexists(bound.receipt_path):
                         raise UpgradeError(
@@ -981,6 +1028,10 @@ def run_transaction(
                 return _abort(
                     sealed, bound, prior, token, report, steps, state, error, lifecycle
                 )
+            # The new receipt is verified: from here a signal must not turn it into
+            # "halted, run --recover" (which would roll a verified receipt back).
+            # `_signals_raise` still restores the previous handlers on exit.
+            _ignore_interrupts()
             install_cli._clear_maintenance_snapshot(bound.plan, receipt_path=bound.receipt_path)
             lifecycle["complete"] = True
     report["result"] = "upgraded"
@@ -1121,7 +1172,9 @@ def perform_upgrade(options: UpgradeOptions) -> int:
                 }
                 report["result"] = "in-progress"
                 _publish_report(report)
-                code = run_transaction(sealed, bound, checked.prior, report, steps)
+                code = run_transaction(
+                    sealed, bound, checked.prior, report, steps, wait_idle=options.wait_idle
+                )
             except BaseException as error:  # noqa: BLE001 — every outcome is reported
                 if report["result"] in (None, "in-progress"):
                     stopped = report["services_stopped"] is True
@@ -1245,6 +1298,27 @@ def recover_upgrade() -> int:
         os.umask(previous_umask)
 
 
+def _maintenance_marker_present() -> bool:
+    """Read-only twin of `assert_installer_idle`'s stale-marker check.
+
+    Opens an existing lock file read-only; unlike `_host_lock_file` it never
+    creates the file or its directory.  A marker that cannot be read is not idle.
+    """
+
+    try:
+        descriptor = os.open(install_cli._TRUST_ROOT_LOCK_ROOT / "maintenance.lock", _READ_FLAGS)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        return install_cli._maintenance_lock_payload(descriptor, allow_absent=True) is not None
+    except InstallError:
+        return True
+    finally:
+        os.close(descriptor)
+
+
 def upgrade_status() -> dict[str, object]:
     """Read-only: effective receipt, loaded runtime, last upgrade, pending recovery."""
 
@@ -1253,7 +1327,9 @@ def upgrade_status() -> dict[str, object]:
         "effective_receipt": None,
         "loaded_runtime": None,
         "last_upgrade": None,
-        "maintenance_pending": os.path.lexists(install_cli._maintenance_snapshot_path()),
+        # Either leftover makes the next upgrade demand `--recover`.
+        "maintenance_pending": os.path.lexists(install_cli._maintenance_snapshot_path())
+        or _maintenance_marker_present(),
     }
     try:
         receipt = effective_receipt(_STATE_ROOT)
@@ -1331,7 +1407,7 @@ def _print_status(status: Mapping[str, object], *, json_output: bool) -> None:
     lines.append(
         "  maintenance:       "
         + (
-            "unfinished snapshot: run `cortex upgrade --recover`"
+            "unfinished snapshot or lease marker: run `cortex upgrade --recover`"
             if status.get("maintenance_pending")
             else "idle"
         )

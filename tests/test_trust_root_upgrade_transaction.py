@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
+import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,13 +36,30 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     prior = fx.make_prior(tmp_path)
     cli.loaded[str(bound.receipt_path)] = ("new-receipt", fx.NEW_WHEEL, fx.NEW_COMMIT)
     cli.loaded[str(prior.path)] = ("prior-receipt", fx.PRIOR_WHEEL, fx.PRIOR_COMMIT)
-    return SimpleNamespace(systemd=systemd, cli=cli, sealed=sealed, bound=bound, prior=prior)
+    in_flight = [(0, 0)]
+
+    def counts(plan):
+        assert plan is prior.plan or plan == prior.plan
+        systemd.calls.append(("in-flight",))
+        return in_flight.pop(0) if len(in_flight) > 1 else in_flight[0]
+
+    monkeypatch.setattr(upgrade, "in_flight_counts", counts)
+    return SimpleNamespace(
+        systemd=systemd, cli=cli, sealed=sealed, bound=bound, prior=prior, in_flight=in_flight
+    )
 
 
-def _run_transaction(harness: SimpleNamespace) -> tuple[int, dict[str, object]]:
+def _run_transaction(
+    harness: SimpleNamespace, *, wait_idle: int = 0, steps: upgrade.StepLog | None = None
+) -> tuple[int, dict[str, object]]:
     report: dict[str, object] = {"version": "0.1.13", "services_stopped": False}
     code = upgrade.run_transaction(
-        harness.sealed, harness.bound, harness.prior, report, upgrade.StepLog()
+        harness.sealed,
+        harness.bound,
+        harness.prior,
+        report,
+        steps or upgrade.StepLog(),
+        wait_idle=wait_idle,
     )
     return code, report
 
@@ -83,6 +105,46 @@ def test_upgrade_runs_every_candidate_step_with_the_bound_sha_and_lease_token(ha
     }
     assert install_cli._read_maintenance_snapshot() is None
     assert _marker() is None
+
+
+def test_jobs_started_during_preparation_refuse_before_any_service_stops(harness) -> None:
+    # Final review item 5: preflight ran before ingress, venv build and plan;
+    # the lease re-checks just before stopping, and a refusal stops nothing.
+    harness.in_flight[:] = [(1, 0)]
+    steps = upgrade.StepLog()
+
+    with pytest.raises(upgrade.UpgradeError, match="in-flight jobs block the upgrade"):
+        _run_transaction(harness, wait_idle=0, steps=steps)
+
+    assert harness.systemd.calls == [("in-flight",)]
+    assert harness.cli.calls == []
+    assert steps.rows[-1]["name"] == "idle-check"
+    assert steps.rows[-1]["status"] == "failed"
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None
+
+
+def test_the_in_lease_idle_check_waits_like_preflight(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = SimpleNamespace(now=0.0, sleeps=[])
+
+    def sleep(seconds: float) -> None:
+        clock.sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr(upgrade, "_monotonic", lambda: clock.now)
+    monkeypatch.setattr(upgrade, "_sleep", sleep)
+    harness.in_flight[:] = [(1, 0), (0, 0)]
+
+    code, report = _run_transaction(harness, wait_idle=60)
+
+    assert code == 0
+    assert report["result"] == "upgraded"
+    assert clock.sleeps == [5.0]
+    events = harness.systemd.calls
+    first_stop = min(index for index, call in enumerate(events) if call[0] == "stop")
+    assert max(index for index, call in enumerate(events) if call == ("in-flight",)) < first_stop
 
 
 def test_credential_handoff_failure_rolls_back_and_restores_services(harness) -> None:
@@ -178,6 +240,80 @@ def test_loaded_runtime_mismatch_after_verify_rolls_back(harness) -> None:
     assert report["result"] == "rolled-back"
 
 
+def test_a_verify_refusal_keeps_its_stderr_in_the_report(harness) -> None:
+    # Final review item 2: refusals reach only the child's stderr.
+    harness.cli.fail["verify"] = "maintenance token does not authorize the active plan"
+
+    code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["failed_step"] == "verify"
+    assert report["error"].startswith("verify did not PASS (exit 1)")
+    assert "maintenance token does not authorize the active plan" in report["error"]
+
+
+def test_a_verify_fail_keeps_its_stdout_detail_in_the_report(harness) -> None:
+    # Final review item 2: a FAIL result is the JSON verify prints to stdout.
+    harness.cli.verify_failure = {
+        "ok": False,
+        "checks": [{"name": "unit-drift", "status": "FAIL", "path": "cortex-manager.service"}],
+    }
+
+    code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["failed_step"] == "verify"
+    assert '"name": "unit-drift"' in report["error"]
+
+
+def test_the_verify_failure_detail_is_a_bounded_tail(harness) -> None:
+    harness.cli.fail["verify"] = "x" * 20000 + " last line names the cause"
+
+    _code, report = _run_transaction(harness)
+
+    assert len(report["error"]) < 4200
+    assert report["error"].rstrip().endswith("last line names the cause")
+
+
+def test_an_unavailable_service_status_names_the_exit_code(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Final review item 2: "service_status=unavailable" alone hid the cause.
+    monkeypatch.setattr(
+        upgrade,
+        "_run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 3, "", "service status failed: install receipt is unreadable\n"
+        ),
+    )
+
+    mismatch, payload = upgrade.await_loaded_runtime(
+        harness.prior.plan, harness.prior.path, {}, settle_seconds=0
+    )
+
+    assert payload is None
+    assert mismatch.startswith("service_status=unavailable")
+    assert "exit 3" in mismatch
+    assert "install receipt is unreadable" in mismatch
+
+
+def test_an_unavailable_service_status_names_the_exception_type(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def missing(argv, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    monkeypatch.setattr(upgrade, "_run", missing)
+
+    mismatch, payload = upgrade.await_loaded_runtime(
+        harness.prior.plan, harness.prior.path, {}, settle_seconds=0
+    )
+
+    assert payload is None
+    assert mismatch.startswith("service_status=unavailable")
+    assert "FileNotFoundError" in mismatch
+
+
 def test_interrupt_after_the_apply_child_wrote_the_receipt_still_rolls_back(
     harness, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -200,6 +336,71 @@ def test_interrupt_after_the_apply_child_wrote_the_receipt_still_rolls_back(
 
     upgrade._print_outcome(report, json_output=False)
     assert f"new receipt:   {harness.bound.receipt_path}" in capsys.readouterr().out
+
+
+@contextmanager
+def _recording_handler(signum: int) -> Iterator[list[int]]:
+    """Install a harmless handler so a stray signal never kills the test run."""
+
+    received: list[int] = []
+    previous = signal.signal(signum, lambda number, _frame: received.append(number))
+    try:
+        yield received
+    finally:
+        signal.signal(signum, previous)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_a_signal_after_verification_cannot_undo_the_upgrade(
+    harness, monkeypatch: pytest.MonkeyPatch, signum: int
+) -> None:
+    # Final review item 3/6: once `_advance` returns, the receipt is verified;
+    # INT/TERM/HUP while clearing the snapshot must not turn it into "halted".
+    clear = install_cli._clear_maintenance_snapshot
+
+    def clear_with_signal(plan, *, receipt_path):
+        os.kill(os.getpid(), signum)
+        return clear(plan, receipt_path=receipt_path)
+
+    monkeypatch.setattr(install_cli, "_clear_maintenance_snapshot", clear_with_signal)
+
+    with _recording_handler(signum) as received:
+        code, report = _run_transaction(harness)
+
+    assert code == 0
+    assert report["result"] == "upgraded"
+    assert "rollback" not in harness.cli.commands()
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None
+    # Ignored, not merely handled: the handler outside the window never ran.
+    assert received == []
+
+
+def test_sighup_inside_the_maintenance_window_rolls_back(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Final review item 6: a dropped SSH session sends SIGHUP; it must roll back
+    # and report like SIGTERM instead of killing the coordinator.
+    candidate = harness.cli
+
+    def run(argv, **kwargs):
+        result = candidate(argv, **kwargs)
+        if tuple(argv)[3:4] == ("apply",):
+            os.kill(os.getpid(), signal.SIGHUP)
+        return result
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+    with _recording_handler(signal.SIGHUP) as received:
+        code, report = _run_transaction(harness)
+
+    assert received == []
+    assert code == 1
+    assert report["failed_step"] == "apply"
+    assert report["error"] == "interrupted by SIGHUP"
+    assert report["result"] == "rolled-back"
+    assert "rollback" in harness.cli.commands()
+    assert harness.systemd.active == set(fx.SERVICES)
 
 
 def test_failure_before_apply_restores_services_without_a_rollback(harness) -> None:
@@ -250,7 +451,8 @@ def test_perform_upgrade_publishes_the_report_and_prints_a_summary(
 ) -> None:
     last = composed.tmp_path / "installer" / "last-upgrade-report.json"
 
-    def transaction(_sealed, _bound, _prior, report, _steps):
+    def transaction(_sealed, _bound, _prior, report, _steps, *, wait_idle):
+        assert wait_idle == 0
         assert json.loads(last.read_text())["result"] == "in-progress"
         report["receipt"] = {
             "path": str(composed.bound.receipt_path),
@@ -293,7 +495,7 @@ def test_an_ingress_failure_is_reported_as_refused(
 
     monkeypatch.setattr(upgrade, "ingest_release", refuse)
     monkeypatch.setattr(
-        upgrade, "run_transaction", lambda *_args: pytest.fail("must not reach the transaction")
+        upgrade, "run_transaction", lambda *_args, **_kwargs: pytest.fail("must not reach the transaction")
     )
 
     assert upgrade.perform_upgrade(
@@ -305,3 +507,37 @@ def test_an_ingress_failure_is_reported_as_refused(
     assert report["failed_step"] == "ingress"
     assert "REST metadata" in report["error"]
     assert (composed.tmp_path / "installer" / "0.1.13" / "upgrade-report.json").exists()
+
+
+def test_an_in_lease_idle_refusal_is_reported_as_refused(
+    composed, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Final review item 5: same `--wait-idle` semantics as preflight; nothing
+    # was stopped, so the report says refused and the lease is released.
+    seen: list[tuple[object, int]] = []
+
+    def busy(plan, *, wait_seconds):
+        seen.append((plan, wait_seconds))
+        raise upgrade.UpgradeError(
+            "in-flight jobs block the upgrade: job processes=1, durable in-flight jobs=0; "
+            "retry when idle or pass --wait-idle <seconds>"
+        )
+
+    monkeypatch.setattr(upgrade, "wait_until_idle", busy)
+    monkeypatch.setattr(
+        install_cli, "_systemctl", lambda *args: pytest.fail(f"nothing may stop: {args}")
+    )
+
+    assert upgrade.perform_upgrade(
+        upgrade.UpgradeOptions(version="0.1.13", wait_idle=7, json_output=True)
+    ) == 1
+
+    report = json.loads(capsys.readouterr().out)
+    assert seen == [(composed.prior.plan, 7)]
+    assert report["result"] == "refused"
+    assert report["failed_step"] == "idle-check"
+    assert "in-flight jobs block the upgrade" in report["error"]
+    assert report["services_stopped"] is False
+    assert report["rollback"] is None
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None

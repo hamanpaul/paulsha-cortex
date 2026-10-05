@@ -126,6 +126,7 @@ def test_recover_marks_the_last_report_recovered(tmp_path: Path, recovering) -> 
 def test_status_is_read_only_and_reports_receipt_runtime_and_last_upgrade(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.setattr(install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "locks")
     monkeypatch.setattr(install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "installer")
     (tmp_path / "installer").mkdir()
     upgrade._publish_report(
@@ -163,6 +164,7 @@ def test_status_is_read_only_and_reports_receipt_runtime_and_last_upgrade(
 def test_status_is_non_zero_when_the_receipt_cannot_be_decided(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.setattr(install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "locks")
     monkeypatch.setattr(install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "installer")
 
     def undecided(_state_root):
@@ -175,3 +177,34 @@ def test_status_is_non_zero_when_the_receipt_cannot_be_decided(
 
     assert upgrade.run_upgrade(upgrade.UpgradeOptions(status=True)) == 1
     assert "cannot decide the effective receipt" in capsys.readouterr().out
+
+
+def test_status_reports_a_stale_maintenance_marker_as_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Final review item 9: a crashed lease leaves only the marker (no snapshot
+    # yet); the next upgrade demands --recover, so --status must not say idle.
+    monkeypatch.setattr(install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "locks")
+    monkeypatch.setattr(install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "installer")
+    monkeypatch.setattr(install_core, "_validate_receipt_parent", lambda _o, _p: None)
+    (tmp_path / "installer").mkdir()
+    with install_cli._host_lock(leaf="maintenance.lock", conflict="unexpected") as lock_fd:
+        install_cli._write_lock_payload(lock_fd, {"plan_sha256": "a" * 64, "token_sha256": "b" * 64})
+    prior = fx.make_prior(tmp_path)
+    monkeypatch.setattr(upgrade, "effective_receipt", lambda _state_root: prior.receipt)
+    monkeypatch.setattr(
+        upgrade, "await_loaded_runtime", lambda plan, path, expected, **_kwargs: ("", {})
+    )
+    before = sorted(str(path) for path in tmp_path.rglob("*"))
+
+    status = upgrade.upgrade_status()
+
+    assert sorted(str(path) for path in tmp_path.rglob("*")) == before
+    assert status["maintenance_pending"] is True
+    assert upgrade.run_upgrade(upgrade.UpgradeOptions(status=True)) == 1
+    assert "cortex upgrade --recover" in capsys.readouterr().out
+
+    # The empty marker every completed lease leaves behind is idle.
+    with install_cli._host_lock(leaf="maintenance.lock", conflict="unexpected") as lock_fd:
+        install_cli._write_lock_payload(lock_fd, None)
+    assert upgrade.upgrade_status()["maintenance_pending"] is False

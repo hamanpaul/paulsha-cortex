@@ -255,6 +255,8 @@ class FakeCandidateCli:
         self.calls: list[tuple[str, ...]] = []
         self.fail: dict[str, str] = {}
         self.interrupt_after: str | None = None
+        # A verify that runs and FAILs: exit 1 with its JSON result on stdout.
+        self.verify_failure: dict[str, object] | None = None
         self.rollback_result: dict[str, object] = {
             "restore_safe": True,
             "retained_unknown": [],
@@ -307,6 +309,13 @@ class FakeCandidateCli:
             self.systemd.active.update(SERVICES)
             payload = {"receipt_id": "new-receipt", "services_started": True, "qualified": False}
         elif command == "verify":
+            if self.verify_failure is not None:
+                Path(self._value(argv, "--evidence")).write_text(
+                    '{"result":"fail"}\n', encoding="utf-8"
+                )
+                return subprocess.CompletedProcess(
+                    argv, 1, json.dumps(self.verify_failure), ""
+                )
             Path(self._value(argv, "--evidence")).write_text('{"result":"pass"}\n', encoding="utf-8")
             payload = {"ok": True}
         elif command == "rollback":

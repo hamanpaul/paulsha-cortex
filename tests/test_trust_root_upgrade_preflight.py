@@ -258,6 +258,50 @@ def test_an_unreadable_durable_registry_counts_as_busy(
     assert sum(clock.sleeps) == 10.0
 
 
+@pytest.mark.parametrize(
+    ("leftover", "version"),
+    [("snapshot", "0.1.13"), ("marker", "0.1.13"), ("marker", "0.1.11")],
+)
+def test_preflight_names_recover_before_any_other_check(
+    rootless: Path, monkeypatch: pytest.MonkeyPatch, leftover: str, version: str
+) -> None:
+    # Final review item 4: after a crashed upgrade the services are stopped, so
+    # the runtime check would wait 60s and then blame the services, and an older
+    # target would hear "only moves forward"; the operator must hear --recover.
+    fx.durable_prior(rootless)
+    if leftover == "snapshot":
+        install_cli._write_maintenance_snapshot(
+            {
+                "schema_version": 1,
+                "plan_sha256": "a" * 64,
+                "receipt_path": str(rootless / "receipt.json"),
+                "present_services": [],
+                "previously_active": [],
+            }
+        )
+    else:
+        with install_cli._host_lock(leaf="maintenance.lock", conflict="unexpected") as lock_fd:
+            install_cli._write_lock_payload(
+                lock_fd, {"plan_sha256": "a" * 64, "token_sha256": "b" * 64}
+            )
+    clock = _Clock()
+    monkeypatch.setattr(upgrade, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(upgrade, "_sleep", clock.sleep)
+    monkeypatch.setattr(upgrade, "_STATUS_SETTLE_SECONDS", 60)
+    monkeypatch.setattr(
+        upgrade,
+        "_service_status",
+        lambda _plan, _path: upgrade._StatusUnavailable("exit 3: services are stopped"),
+    )
+    monkeypatch.setattr(
+        upgrade, "in_flight_counts", lambda _plan: pytest.fail("must stop first")
+    )
+
+    with pytest.raises(upgrade.UpgradeError, match=r"cortex upgrade --recover"):
+        upgrade.preflight(upgrade.UpgradeOptions(version=version))
+    assert clock.sleeps == []
+
+
 def test_in_flight_counts_reads_job_accounts_from_the_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
