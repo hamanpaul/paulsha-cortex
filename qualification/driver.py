@@ -5113,6 +5113,22 @@ def _validate_dispatch_closeout(
     # workflow canonical evidence；記住它的 path＋hash，讓 gate_refs 段落能要求
     # 「foreign-review 引用的必須逐字是這一份」，不接受他 run／舊 candidate 的證據。
     review_evidence_locator: tuple[Path, str] | None = None
+    # #716（canary run 37243213297）：canary 修正回合的 `retry-build` 會重派最後一張
+    # build 卡與之後的 verify／review，被取代的那一輪 job 仍留在 registry。其中明示停止的
+    # verify／review、未採信的 builder terminal 沒有 canonical evidence（`workflow_evidence`
+    # 為 None，registry 的 retry-build 判準也以此認定「未綁定」）。只有在同一張卡之後
+    # 還有新 job 時才把它視為被取代而跳過 evidence 檢查；每張卡的最後一個 job 仍必須有
+    # 完整的 canonical evidence，身分與 exit 綁定則對所有 job 照舊檢查。
+    superseded_unbound = {
+        str(job.get("job_id"))
+        for index, job in enumerate(bound_jobs)
+        if job.get("workflow_evidence") is None
+        and any(
+            later.get("workflow_phase") == job.get("workflow_phase")
+            and later.get("workflow_card") == job.get("workflow_card")
+            for later in bound_jobs[index + 1:]
+        )
+    }
     for job in bound_jobs:
         phase = job.get("workflow_phase")
         if (
@@ -5122,6 +5138,8 @@ def _validate_dispatch_closeout(
             or phase not in {"plan", "build", "verify", "review", "ship"}
         ):
             raise QualificationFailure("workflow job authority binding is invalid")
+        if str(job.get("job_id")) in superseded_unbound:
+            continue
         envelope, evidence_path, evidence_digest = _bound_relative_json(
             root, job.get("workflow_evidence"), label="workflow canonical evidence"
         )

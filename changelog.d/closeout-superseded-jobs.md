@@ -1,0 +1,1 @@
+- #716 canary closeout：修正回合 `retry-build` 之後，被取代那一輪沒有 canonical evidence 的 job（明示停止的 verify／review、未採信的 builder terminal）若同一張卡之後還有新 job，就跳過 evidence 檢查；每張卡的最後一個 job 仍必須有完整 evidence，身分與 exit 綁定照舊檢查。
