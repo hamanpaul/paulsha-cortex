@@ -4537,3 +4537,39 @@ def test_dispatch_closeout_still_requires_evidence_on_the_final_job_of_a_card(
 
     with pytest.raises(driver.QualificationFailure, match="canonical evidence locator is malformed"):
         _validate_fixture_closeout(driver, fixture)
+
+
+def test_unreclaimed_worktrees_print_manager_reclaim_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#716（canary run 37252201568）：worktree 沒回收時，要印出 Manager journal 的回收事件
+    （skipped／failed 與理由），否則看不出是哪一段沒有回收。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    state = json.loads((fixture["coordinator"] / "jobs.json").read_text(encoding="utf-8"))
+    build_job = next(job for job in state["jobs"] if job["workflow_phase"] == "build")
+    Path(build_job["worktree"]).mkdir(parents=True, exist_ok=True)
+    fake_run = _dispatch_fixture_fake_run(driver, fixture)
+    journal = "\n".join(
+        [
+            "2026-10-05T02:00:00 cortex-manager[1]: tick ok",
+            "2026-10-05T02:00:01 cortex-manager[1]: workflow-build-workspace-reclaim-failed"
+            " run_id=r job_id=j detail=permission denied token=sk-" + "c" * 30,
+        ]
+    )
+
+    def run(argv, **kwargs):
+        if argv[:1] == ("/usr/bin/journalctl",) or (argv and argv[0] == "/usr/bin/journalctl"):
+            return _result(driver, argv, stdout=journal)
+        return fake_run(argv, **kwargs)
+
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", run)
+
+    with pytest.raises(driver.QualificationFailure, match="reclaim is incomplete"):
+        _validate_fixture_closeout(driver, fixture)
+    err = capsys.readouterr().err
+    assert "manager reclaim events:" in err
+    assert "workflow-build-workspace-reclaim-failed" in err
+    assert "tick ok" not in err
+    assert "sk-" + "c" * 30 not in err

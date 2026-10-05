@@ -5491,6 +5491,7 @@ def _validate_dispatch_closeout(
                 f"{job.get('workflow_card')}/{job.get('job_id')}:{'+'.join(states)}"
             )
     if leftovers:
+        _report_manager_reclaim_events()
         raise QualificationFailure(
             "build worktree reclaim is incomplete: " + ", ".join(leftovers)
         )
@@ -6041,6 +6042,41 @@ def _job_unit_diagnostics(runtime_env: Mapping[str, str]) -> str:
         except OSError:
             lines.append("unavailable")
     return _scrub_diagnostic("\n".join(lines))[-_JOB_DIAGNOSTIC_CHARS:]
+
+
+#: Manager journal 中與工作區回收相關的事件（`workflow-build-workspace-reclaim-*`、
+#: #1167 的 owner reclaim）。closeout 發現 build worktree 沒回收時印出，才看得出是
+#: 被跳過（skipped＋理由）、回收失敗（failed＋detail），還是根本沒有觸發。
+_MANAGER_RECLAIM_JOURNAL_LINES = 5000
+_MANAGER_RECLAIM_EVENT_LINES = 40
+
+
+def _manager_reclaim_events() -> str:
+    journal = _run(
+        (
+            "/usr/bin/journalctl",
+            "--no-pager",
+            "-o",
+            "short-iso",
+            "-n",
+            str(_MANAGER_RECLAIM_JOURNAL_LINES),
+            "-u",
+            "cortex-manager.service",
+        ),
+        timeout=30,
+    )
+    events = [line for line in journal.stdout.splitlines() if "reclaim" in line]
+    return _scrub_diagnostic(
+        "\n".join(events[-_MANAGER_RECLAIM_EVENT_LINES:]) or "no reclaim events"
+    )[-_JOB_DIAGNOSTIC_SECTION_CHARS:]
+
+
+def _report_manager_reclaim_events() -> None:
+    try:
+        text = _manager_reclaim_events()
+    except Exception as exc:  # noqa: BLE001 - diagnostics never mask the real failure
+        text = f"manager reclaim events unavailable: {type(exc).__name__}"
+    print("manager reclaim events:\n" + text, file=sys.stderr, flush=True)
 
 
 def _report_job_unit_diagnostics(runtime_env: Mapping[str, str]) -> None:

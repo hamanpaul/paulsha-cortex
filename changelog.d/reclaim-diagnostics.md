@@ -1,0 +1,1 @@
+- #716 canary closeout：build worktree 未回收時，印出 Manager journal 中的回收事件（`workflow-build-workspace-reclaim-*`、owner reclaim；遮蔽 credential、有界），用來分辨回收是被跳過、失敗，還是沒有觸發（canary run 37252201568）。

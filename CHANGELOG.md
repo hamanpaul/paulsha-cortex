@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 closeout 回收診斷**：worktree 未回收時印出 Manager 的回收事件（#716）。
 - **#716 HEAD proof 接受唯讀檔案檢視**：探針鏈可含 `cat`／`sed -n` 等讀 worktree 內檔案的段（#716）。
 - **#716 closeout 容許 retry-build 取代的未綁定 job**：同卡之後有新 job 才跳過，最後一個 job 仍要 evidence（#716）。
 - **#716 canary 修正回合沉澱窗口**：同一停止點在 snapshot 刷新前不重送 retry-build（#716）。
