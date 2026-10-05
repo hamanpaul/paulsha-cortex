@@ -162,3 +162,41 @@ cortex upgrade --status
 
 - 現行 installer 在 prior-receipt 升級後是否會把 credential 記錄帶進新 receipt（§5）。如果不會，補上 handoff。
 - maintenance snapshot 目前的格式是否已足夠讓 `--recover` 不靠人工輸入 plan sha（§7）。如果不夠，補上必要欄位，但不改變 snapshot 的權限模型。
+
+## 12. 實作前調查結果與修正（2026-10-05，依 origin/main 程式碼）
+
+本節取代前面各節中與之衝突的敘述。
+
+1. **憑證 handoff 一定要補，而且現行的手動升級同樣走不通。**
+   - `apply_plan(--prior-receipt)` 不會把 prior 的 `credentials` 帶進新 receipt（`new_install_receipt` 從 `[]` 開始），所以 `activate_receipt` 必定以 `missing required credential` 失敗。
+   - 照 runbook §4 重新匯入也會被拒：落點檔已經存在，新 receipt 卻沒有 authority（`import_credential` 的 `credential destination already exists without matching receipt authority`）。
+   - 現行 RC 的升級演練在 apply 之後就直接 rollback，所以從來沒有發現。
+   - **修正**：在 `core` 新增 `inherit_prior_credentials(receipt, prior_receipt, *, backend)`。只接手 prior receipt 已記錄的列，條件是 `(principal, provider)` 相同、由新 plan 推得的落點與 prior 相同，而且落點檔通過與 `backend.validate_credentials` 相同的檢查：regular file、nlink 1、uid／gid 正確、權限 0600、sha256 相符。
+   - 繼承來的列加上 `inherited_from: <prior receipt_id>` 標記。新 receipt rollback 時，`rollback_credentials` **不得刪除**繼承列的落點檔，因為那是 prior 的憑證；`_receipt_restore_safe` 把「只剩繼承列」視為可安全還原。
+   - `InstallReceipt.load` 的 credentials key set 要放寬，接受 `inherited_from`。
+2. **目前生效中的 receipt**：沒有現成函式。`service status` 以 mtime 取最新一份，rollback 之後會挑錯。
+   - **修正**：新增 `effective_receipt(state_root) -> InstallReceipt`，依 receipt chain 判定：在 receipt 目錄中，找出 `state=="applied"`、`qualified is True`、而且沒有任何「applied 且 qualified 的子 receipt」以 `parent_receipt.receipt_id` 指向它的那一份。必須唯一，否則停止。之後與 `cortex service status --system --install-receipt <該份>` 的 loaded↔installed 交叉核對。
+   - `parent_receipt` 的比對沿用 `legacy_purge._successor_qualified_at` 的寫法。
+3. **release ingress**：runbook §1 目前全部是 bash 加 python heredoc，而 `qualification/` 沒有打包進 wheel。
+   - **修正**：在 `paulsha_cortex/trust_root/install/release_ingress.py` 實作，逐項移植 runbook §1 的檢查：REST metadata、asset digest、qualification manifest、archive topology、解壓、bundle 逐檔驗證（含 owner、mode 與清單完全一致）、`--copies` 離線 venv、tree sha。
+   - GitHub REST 以注入的 fetcher 存取，方便測試。
+   - 版本由 plan 的 `candidate.wheel.path` 檔名解析，比較時只接受 `MAJOR.MINOR.PATCH`，不引入 `packaging` 依賴。
+4. **activate 之後的 rollback 依設計不是 restore-safe**（`trust-root-legacy-adoption.md` L130：新服務啟動後寫入的 runtime state 會被視為 unknown 並保留）。
+   - **修正 §6**：
+     - **activate 之前**失敗（ingress、plan、apply、credential handoff）：自動 rollback，並依 snapshot 恢復原本的服務。這是可以保證的自動還原。
+     - **activate 之後**失敗（verify FAIL、loaded↔installed 不一致）：執行 rollback。若 `restore_safe=false`，就停在原地，report 與終端機明確列出保留的 unknown state，以及接下來該怎麼做：用 `cortex upgrade --recover`，或交給 operator 裁決。工具**不會**自動啟動 prior 的服務。
+   - spec §8 的 RC「verify 後注入失敗 → 自動回到 prior」改成兩件事：
+     - RC 驗證「activate 前注入失敗 → 自動回到 prior 並恢復服務」；
+     - activate 之後失敗的行為，以單元測試驗證「停在原地並列出保留狀態」。
+5. **RC 只有單一 candidate，版本相同**，而且 release profile 跑在 `--network none`。
+   - **修正**：新增兩個僅限測試的覆寫，只有在環境變數 `PSC_UPGRADE_QUALIFICATION=1` 明示時才接受，否則參數直接被拒：
+     - `--release-source <dir>`：讀本機目錄中與 GitHub REST 同形狀的 tag 與 asset metadata，以及 asset 檔本身；
+     - `--allow-same-version`：允許升級到相同版本。
+   - `--prior-receipt <path>` 也只在同一個環境變數下開放，供 RC 指定不在 canonical 目錄的 prior receipt。
+   - 正式部署一律從 GitHub 公開 repo 抓取，只能升級到更高版本，用 `effective_receipt` 定位 current receipt。
+6. **lease 與停服務**：runbook 用 bash 停服務，`lease` 子命令走 stdin 協定。
+   - **修正**：upgrade 在 process 內直接使用 `cli._maintenance_lease`、`_service_snapshot`、`_stop_current_services`、`_restore_snapshot_services`，不經 stdin 協定。
+   - snapshot 的格式不改：它已經有 plan sha、receipt path、service pre-state。`--recover` 由 `plan_sha256` 推出 durable plan `/var/lib/cortex-installer/plans/<sha>.json`，再呼叫現有 `_recover_command` 的邏輯。
+7. **host overlay**：plan 只記 overlay 的 digest。adoption 之後，持久檔中若還留著 `legacy_adoption` 區塊，plan 會要求 `--legacy-inventory`。
+   - **修正**：upgrade 讀 overlay 時去掉 `legacy_adoption` 區塊，再產生 plan。這個區塊本來就不納入 digest，所以 digest 不變。
+8. 改動 `qualification/` 或 `trust_root/install/` 會觸發 release gate 的 legacy-adoption RC 要求（`release_gate.LEGACY_TRIGGER_PREFIXES`），0.1.13 發版時要兩個 profile 都跑。
