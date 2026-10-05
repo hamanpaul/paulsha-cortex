@@ -5220,6 +5220,97 @@ def _harvest_build_candidate(
 WORKFLOW_BUILD_WORKSPACE_RECLAIM_EVENT = "workflow-build-workspace-reclaim"
 
 
+def _workflow_card_task(run, card: str) -> str:
+    """workflow lane 一張卡的 job `task`（`wf-<run_id 雜湊>-<card>`）。
+
+    派工（`reserve_job_id()`／`create_job()`）與 #1261 的 owner identity 都由這裡
+    導出，回收時才能以 run＋card 重算同一個值核對。
+    """
+
+    return f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{card}"
+
+
+def workflow_build_owner_identity(run, *, card: str) -> dict[str, str]:
+    """#1261：workflow lane build 工作區的 owner identity。
+
+    形狀比照 slice lane（`autonomy._confirmed_owner_identity()`）的
+    ``{repo, work_id, slice_id}``，registry 的 owner identity 契約不必新增第二種形狀。
+    `slice_id` 是這張卡的 job task，本身由 run_id 與 card 導出，因此身分同時綁住
+    repo／Work Item、run 與 card。repo／work_id 來自 claim 時已確認的 run 記錄。
+    """
+
+    return {
+        "repo": run.repo,
+        "work_id": run.work_id,
+        "slice_id": _workflow_card_task(run, card),
+    }
+
+
+def _workflow_build_owner_binding(
+    registry, run, *, card: str, task: str, launcher
+) -> dict[str, object]:
+    """#1261：一張 build 卡 provision 時要寫進 marker 與 job 記錄的 owner kwargs。
+
+    **唯讀卡回空 dict**，回收維持 Manager 直接回收：launcher 的 `_write_forbidden`
+    就是它選 `cortex-job-ro@` 的那個旗標（`launcher.launch()` →
+    `prepare_systemd_template(workspace_read_only=...)`）。那份模板把 `<pool>/%i`
+    掛成 `ReadOnlyPaths`，job 寫不進工作區，也就不會留下 builder 擁有的 inode；
+    #1167 的 helper 要清空工作區，在唯讀模板裡也跑不動。
+
+    會寫檔的卡：身分見 :func:`workflow_build_owner_identity`；attempt 每張 job 一個
+    （與 slice lane 同為 `uuid4().hex`），marker digest 因此逐 attempt 不同。身分在
+    provision 之前就以 registry 的契約驗過，不合法即 fail closed，不會先 clone 出
+    一個之後 `create_job()` 才拒收的工作區。
+    """
+
+    if getattr(launcher, "_write_forbidden", False) is True:
+        return {}
+    from .registry import _normalize_owner_identity
+
+    identity = workflow_build_owner_identity(run, card=card)
+    if identity["slice_id"] != task:
+        raise ValueError("workflow build owner identity does not bind this card task")
+    state_path = getattr(registry, "_state_path", None)
+    identity = _normalize_owner_identity(
+        identity,
+        state_path=Path(state_path) if isinstance(state_path, (str, Path)) else Path("registry"),
+    )
+    return {"owner_identity": identity, "attempt_id": uuid4().hex}
+
+
+def _workflow_build_owner_refusal(
+    job: Mapping[str, object], *, run, marker: Mapping[str, object]
+) -> str | None:
+    """#1261：job 記錄與工作區 marker 的 owner 綁定是否一致；不一致回拒絕理由。
+
+    marker 位於 builder 可寫的 `.git/`，能被整檔替換，因此 Manager 只以自己的 job
+    記錄為準：
+
+    - job 帶身分（會寫檔的 workflow build 卡）：身分必須恰好是本 run、本卡導出的
+      那一組，attempt 為非空字串；marker 的身分與 attempt 必須逐字相同。marker 被拿掉
+      身分（想把回收逼回 Manager 自己的 dirty scan）或換成別人的，都拒絕。
+    - job 不帶身分（唯讀卡、#1261 之前派出的 job）：marker 也不得帶。marker 自己
+      長出身分，不能把回收導進 builder unit。
+    """
+
+    job_owner = job.get("owner_identity")
+    job_attempt = job.get("attempt_id")
+    if job_owner is not None or job_attempt is not None:
+        card = job.get("workflow_card")
+        if (
+            not isinstance(card, str)
+            or not card
+            or job_owner != workflow_build_owner_identity(run, card=card)
+            or job_owner.get("slice_id") != job.get("task")
+            or not isinstance(job_attempt, str)
+            or not job_attempt
+        ):
+            return "job-owner-identity-invalid"
+    if marker.get("owner_identity") != job_owner or marker.get("attempt_id") != job_attempt:
+        return "workspace-owner-identity-mismatch"
+    return None
+
+
 def _trusted_build_workspace_target(
     job: Mapping[str, object], *, run, candidate: str
 ) -> tuple[Path | None, str | None]:
@@ -5246,6 +5337,10 @@ def _trusted_build_workspace_target(
     4. **標記檔的 `branch` 與 `source_repo` 都對得上**——分別對 job 記錄的 branch
        與 run 的 `workspace_root`。標記檔是 provisioning 當下寫的，因此這一條驗的
        是「這棵樹真的是本 run、這條交付線 provision 出來的」，不只是路徑長得像。
+       #1261 起標記檔的 `owner_identity`／`attempt_id` 也必須與 job 記錄逐字相同，
+       job 記錄的身分又必須是本 run、本卡導出的那一組（`_workflow_build_owner_refusal()`）。
+       三 UID 下 `worktree_reclaim` 依標記檔上的身分決定是否改走 builder unit，
+       這一條讓那個決定以 Manager 自己的 job 記錄為準，不以 builder 可寫的標記檔為準。
     5. **來源樹裡真的有這顆 candidate**（`commit_present`）。
     6. **來源樹的 `refs/heads/<branch>` 恰等於 candidate**。
 
@@ -5289,6 +5384,9 @@ def _trusted_build_workspace_target(
     recorded_source = marker.get("source_repo")
     if not isinstance(recorded_source, str) or Path(recorded_source) != Path(source_repo):
         return None, "workspace-source-repo-mismatch"
+    owner_refusal = _workflow_build_owner_refusal(job, run=run, marker=marker)
+    if owner_refusal is not None:
+        return None, owner_refusal
 
     if not job_workspace.commit_present(source_repo, candidate):
         return None, "candidate-not-in-source-repo"
@@ -16179,7 +16277,7 @@ def _dispatch_workflow_card(
             manager_gate_ledger=verification_gate_ledger,
             operator_adjudications=operator_adjudications,
         )
-        task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
+        task = _workflow_card_task(run, step.card)
         # #648：job_id 必須在 **provision 之前**就定案——per-job 工作區的目錄名就是
         # `job_workspace.job_segment(job_id)`，而 `launcher.launch(slice_id=job_id)`
         # 之後交給 `job_runner.prepare_systemd_template(job_id=…)` 算 instance 名的也是
@@ -16190,6 +16288,9 @@ def _dispatch_workflow_card(
         reserved_job_id = registry.reserve_job_id(task)
         sandbox_hash: str | None = None
         repo_root = run.workspace_root
+        #: #1261：會寫檔的 build 卡在 provision 時帶 owner identity／attempt，寫進
+        #: 工作區 marker 與 job 記錄（見 `_workflow_build_owner_binding()`）。
+        owner_binding: dict[str, object] = {}
         if step.persona == "planner":
             sandbox_parent = Path(coordinator_root).resolve() / "planning-sandboxes"
             try:
@@ -16286,16 +16387,30 @@ def _dispatch_workflow_card(
                     candidate_base_sha = run.frozen_readiness.get("base_sha")
                     if isinstance(candidate_base_sha, str) and candidate_base_sha:
                         build_base_sha = candidate_base_sha
+            # #1261：三 UID 下 builder 建立的 inode 只有 builder 能清，回收要經 #1167 的
+            # builder unit，而那條路徑以 marker 上的 owner identity／attempt 為前提。
+            # 在任何 provision 副作用之前算好並驗過契約；唯讀卡回空 dict。
+            owner_binding = _workflow_build_owner_binding(
+                registry, run, card=step.card, task=task, launcher=launcher
+            )
             # 無凍結集且為首張卡時完全不傳 base_sha 引數，維持現行為（呼叫端保有舊
             # WorktreeCreator 實作 without base_sha 亦不受影響）。
+            # owner identity 不設 TypeError 退路：收不下它的 creator 會 provision 出
+            # 一個三 UID 下回收不掉的工作區，與 slice lane（`autonomy._launcher_worktree`）
+            # 一樣 fail closed。
             if build_base_sha is not None:
                 worktree = str(
                     creator.create(
-                        build_branch, job_id=reserved_job_id, base_sha=build_base_sha
+                        build_branch,
+                        job_id=reserved_job_id,
+                        base_sha=build_base_sha,
+                        **owner_binding,
                     )
                 )
             else:
-                worktree = str(creator.create(build_branch, job_id=reserved_job_id))
+                worktree = str(
+                    creator.create(build_branch, job_id=reserved_job_id, **owner_binding)
+                )
         elif step.persona == "reviewer":
             # #650：verify／review 卡的 candidate 樹改為 **Manager 自己在來源樹上 clone
             # 出來的一棵**，不再是 `builder_jobs[-1]["worktree"]`。
@@ -16468,6 +16583,9 @@ def _dispatch_workflow_card(
             # 與 registry 現有 WorkflowRun.steps 的現值比對出 drift（見
             # manager._workflow_acceptance_definition_drifted）。
             workflow_test_policy=step.test_policy,
+            # #1261：與工作區 marker 同一組；回收時 Manager 以這筆記錄核對 marker。
+            owner_identity=owner_binding.get("owner_identity"),
+            attempt_id=owner_binding.get("attempt_id"),
             dispatch_reroute=dispatch_reroute,
             # #839 對抗審查第四輪 MAJOR（manager.py:11603）：只有這個候選真的
             # 拿到 reservation（enforce＋可行＋受額度管理）才記——shadow 模式

@@ -348,7 +348,15 @@ class _WorktreeCreator:
         self._path = path
         self.calls: list[str] = []
 
-    def create(self, branch: str, base_sha: str | None = None, *, job_id: str | None = None) -> Path:
+    def create(
+        self,
+        branch: str,
+        base_sha: str | None = None,
+        *,
+        job_id: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> Path:
         self.calls.append(branch)
         return self._path
 

@@ -74,6 +74,14 @@ class StubWorktreeCreator:
         self._root = str(root)
         self.calls: list[tuple[str, str, str | None]] = []
 
-    def create(self, branch: str, *, job_id: str, base_sha: str | None = None) -> str:
+    def create(
+        self,
+        branch: str,
+        *,
+        job_id: str,
+        base_sha: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> str:
         self.calls.append((branch, job_id, base_sha))
         return self._root

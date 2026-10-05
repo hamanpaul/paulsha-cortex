@@ -525,7 +525,15 @@ class _RecordingCreator:
     def __init__(self, root: Path) -> None:
         self.root = root
 
-    def create(self, branch: str, *, job_id: str | None = None, base_sha: str | None = None) -> str:
+    def create(
+        self,
+        branch: str,
+        *,
+        job_id: str | None = None,
+        base_sha: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> str:
         return str(self.root)
 
 

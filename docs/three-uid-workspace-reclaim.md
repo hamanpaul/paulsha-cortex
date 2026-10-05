@@ -15,6 +15,25 @@
    - unit 結束後先封住 commit-spool 格，把 preserve 區裡的封存全部移到 Manager-only 的 `<coordinator>/evidence/worktree-reclaim/`；以 systemd 回報的結果與工作區是否確實清空判定成敗，最後才交叉核對 helper 的完成紀錄，由呼叫端刪掉已清空的 pool 目錄（見下文「完成紀錄不是決策依據」）。
 2. **builder 半**（`python -m paulsha_cortex.coordinator.owner_reclaim`，在 root-owned 模板 unit 內以 builder UID 執行）：驗證 Manager 核准，比對 marker digest，dirty scan、保存未提交內容與 `marker.base` 之後的本機 commit bundle，再清空工作區內容。掃描、保存或 bundle 任一步失敗就不刪任何東西。
 
+## 涵蓋哪些工作區（#1261）
+
+owner-bound 路徑只看 marker 有沒有 `owner_identity`／`attempt_id`，這兩個欄位由派工時傳給 `ScriptWorktreeCreator.create()` 寫入：
+
+| 派工路徑 | marker 身分 | 三 UID 下的回收 |
+| --- | --- | --- |
+| slice lane（`autonomy._launcher_worktree`） | `{repo, work_id, slice_id}`，attempt 為 `uuid4().hex` | builder unit |
+| workflow lane 會寫檔的 build 卡（`manager._dispatch_workflow_card`） | 同一形狀；`slice_id` 是這張卡的 job task（`wf-<run_id 雜湊>-<card>`），attempt 每張 job 一個 `uuid4().hex`，同時寫進 job 記錄 | builder unit |
+| workflow lane 唯讀 build 卡（`BUILDER_WRITE_FORBIDDEN`，跑 `cortex-job-ro@`） | 不帶 | Manager 直接回收 |
+
+唯讀卡維持原路徑，理由有兩個：
+
+- `cortex-job-ro@` 把 `<pool>/%i` 列進 `ReadOnlyPaths`、不在 `ReadWritePaths`，helper 要清空工作區，在這份模板裡跑不動。
+- 同樣因為外層掛載唯讀，唯讀卡的 job 寫不進工作區，工作區裡沒有 builder 擁有的 inode，Manager 自己的 dirty scan 讀得到全部內容。#716 的 deployment canary 實跑時，唯讀的 worktree-isolation 卡就是這樣回收成功的。
+
+workflow lane 的 trusted-build reclaim（`manager._reclaim_trusted_build_workspace`）在呼叫 `reclaim_worktree` 之前，先以 Manager 自己的 job 記錄核對 marker：job 帶身分時，身分必須恰好是本 run、本卡導出的那一組，marker 的身分與 attempt 必須逐字相同；job 不帶身分時，marker 也不得帶。marker 被拿掉身分（想把回收逼回 Manager 的 dirty scan）、換成別人的身分，或自己長出身分，都以具名理由跳過，不刪任何東西。這一步只多加一道核對，Manager 撰寫的 job spec、marker digest、nonce、pool 範圍與 unit 身分這幾項綁定都照舊。
+
+#1261 之前派出的 workflow build 卡沒有身分，三 UID 下仍回收不了，需要 operator 處理既有殘留。
+
 ## 威脅模型
 
 ### reclaim 以什麼身分、什麼權限執行

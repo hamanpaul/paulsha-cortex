@@ -65,7 +65,15 @@ class _FakeWorktreeCreator:
     def __init__(self, path: Path):
         self._path = path
 
-    def create(self, branch: str, base_sha: str | None = None, *, job_id: str | None = None) -> Path:
+    def create(
+        self,
+        branch: str,
+        base_sha: str | None = None,
+        *,
+        job_id: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> Path:
         return self._path
 
 
@@ -371,11 +379,11 @@ def test_shadow_mode_store_record_failure_never_changes_dispatch_result(
 
     # 派工結果逐字相同——只允許每個獨立 registry／run 自身內在就會不同的
     # 識別碼／路徑／時間戳差異，其餘欄位（executor／status／facets 等）必須
-    # 完全一致。
+    # 完全一致。`attempt_id`（#1261）是每張 build job 各自的 owner attempt。
     allowed_volatile = {
         "job_id", "pid", "log_path", "session_name", "worktree", "prompt_path",
         "workflow_run_id", "workflow_repo_root", "workflow_input_root",
-        "control_log_path", "created_at", "started_at",
+        "control_log_path", "created_at", "started_at", "attempt_id",
     }
     volatile_job_keys = {
         key for key in set(baseline_job) | set(shadow_job)
@@ -1654,7 +1662,15 @@ class _FailingOnceWorktreeCreator:
         self._path = path
         self.calls = 0
 
-    def create(self, branch: str, base_sha: str | None = None, *, job_id: str | None = None) -> Path:
+    def create(
+        self,
+        branch: str,
+        base_sha: str | None = None,
+        *,
+        job_id: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> Path:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError("fake-worktree-provisioning-failure")

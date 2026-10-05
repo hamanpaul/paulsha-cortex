@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#1261 workflow lane 的 builder 工作區改走 owner-bound reclaim**：會寫檔的 build 卡派工時把 owner identity／attempt 寫進 marker 與 job 記錄，三 UID 下經 builder unit 回收；唯讀卡維持 Manager 直接回收，回收前以 job 記錄核對 marker（#1261）。
 - **#716 probe issue 說明 archive**：避免 Copilot 把 Manager 的 archive 誤判成 finding（#716）。
 - **#716 修正回合帶上停止點內容**：retry-build 的裁決理由附上 verify／review 指出的問題（#716）。
 - **#716 closeout 回收診斷**：worktree 未回收時印出 Manager 的回收事件（#716）。
