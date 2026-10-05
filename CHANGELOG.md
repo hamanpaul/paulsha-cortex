@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **#716 canary HEAD proof 接受唯讀 `rg`／`find` 段，qualification image 安裝 ripgrep**：canary run 37343291869 的 codex 在探針鏈尾端接 `rg --files`，RC image 缺 ripgrep 而 exit 127、結案找不到 HEAD proof；image 補裝 `ripgrep`，探針鏈接受選項／述詞限允許清單的唯讀 `rg`／`find` 段（會執行、寫檔、刪檔或印出任意字面值的選項不收，路徑限 bound worktree 內），proof 仍須整條 exit 0 且含印出 HEAD 的 git 段（見 `changelog.d/head-probe-rg.md`）（#716）。
 - **#716 validator 接受 agy smoke 的 persisted_variants 證據**：canary run 37331921480 顯示 driver（commit a6340da2 起）為 agy smoke 多寫的 `persisted_variants` 欄位被 validator 當 unknown field 擋下；改為對 agy 額外接受該欄位，且值須恰好等於驗證通過時的那組 runtime model／effort（#716）。
 
 ### Added

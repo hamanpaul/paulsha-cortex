@@ -22,6 +22,7 @@ RUN apt-get update \
         python3-pluggy=1.4.0-1 \
         python3-pytest=7.4.4-1 \
         python3-venv \
+        ripgrep \
         socat \
         sudo \
         systemd \

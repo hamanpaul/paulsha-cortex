@@ -1,0 +1,3 @@
+### Fixed
+
+- **#716 canary HEAD proof 接受唯讀 `rg`／`find` 段，qualification image 安裝 ripgrep**：canary run 37343291869 的派工、交付與 merge 都成功，卻在結案時找不到 HEAD proof——codex 在探針鏈尾端接了 `rg --files docs/superpowers/…`，而 RC image 沒有 ripgrep（正式主機通常有），整條 exit 127。`qualification/Dockerfile` 補裝 `ripgrep`；HEAD 探針鏈另接受唯讀搜尋段：`rg --files [PATH…]`／`rg [OPTION…] PATTERN [PATH…]`（選項採允許清單，`--pre`、`--pre-glob`、`-z`／`--search-zip`、`--hostname-bin`、`-r`／`--replace`、`-L`／`--follow` 與未列出的選項一律不收）與 `find`（只收 `-maxdepth`／`-mindepth N`、`-type f|d|l`、`-name`／`-iname`／`-path`／`-ipath`、`-print`／`-print0`、`-o`／`-a`／`!`／`-not` 與加引號或跳脫的 `(`／`)`；`-exec*`／`-ok*`／`-delete`／`-fprint*`／`-fls`／`-printf` 等一律不收）。路徑規則與既有檔案檢視段相同（限 bound worktree 內、不含 `..`）；重導向、未加引號的括號仍拒絕，proof 仍須整條 exit 0 且含印出 HEAD 的 git 段（#716）。

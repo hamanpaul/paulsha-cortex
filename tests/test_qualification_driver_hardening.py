@@ -4511,6 +4511,31 @@ def _head_probe_log(command: str, output: str) -> bytes:
             + "\n## main\nworktree x\n# plan\n",
         ),
         ("/bin/bash -lc 'git rev-parse HEAD && head -n 20 src/canary_probe.py'", "a" * 40 + "\n"),
+        # canary run 37343291869：codex 用 `rg`／`find` 做唯讀探索（image 補上 ripgrep 後 exit 0）。
+        (
+            "/bin/bash -lc \"git rev-parse HEAD && rg -n 'deployment canary' "
+            'docs/superpowers/plans"',
+            "a" * 40 + "\nplan.md:3:deployment canary\n",
+        ),
+        ("/bin/bash -lc 'git rev-parse HEAD && rg --files'", "a" * 40 + "\nREADME.md\n"),
+        (
+            "/bin/bash -lc \"git rev-parse HEAD && rg --files -g '*.md' --hidden docs\"",
+            "a" * 40 + "\ndocs/a.md\n",
+        ),
+        (
+            f"/bin/bash -lc 'git rev-parse HEAD && rg -nS -C2 -m5 probe {_HEAD_PROBE_WORKTREE}/src'",
+            "a" * 40 + "\n",
+        ),
+        (
+            "/bin/bash -lc \"git rev-parse HEAD && find docs/superpowers/plans -maxdepth 2"
+            " -type f -name '*dep*'\"",
+            "a" * 40 + "\ndocs/superpowers/plans/x-deployment.md\n",
+        ),
+        (
+            "/bin/bash -lc \"git rev-parse HEAD && find . -mindepth 1 -maxdepth 3"
+            " \\( -name '*.md' -o -iname '*.PY' \\) ! -path './.git/*' -print\"",
+            "a" * 40 + "\n./README.md\n",
+        ),
     ],
 )
 def test_codex_agent_loop_parser_accepts_real_codex_head_command_shapes(
@@ -4558,6 +4583,41 @@ def test_codex_agent_loop_parser_accepts_real_codex_head_command_shapes(
         "/bin/bash -lc 'git rev-parse HEAD && cat /etc/passwd'",
         "/bin/bash -lc 'git rev-parse HEAD && cat ../outside'",
         "/bin/bash -lc 'git rev-parse HEAD && tee README.md'",
+        # `rg` 只收唯讀選項：會執行外部程式（`--pre`、`-z`、`--hostname-bin`）、
+        # 能印出任意字面值（`--replace`）、跟隨 symlink 或沒列在允許清單的選項都不算。
+        "/bin/bash -lc 'git rev-parse HEAD && rg --pre cat probe .'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg --pre=cat probe .'",
+        "/bin/bash -lc \"git rev-parse HEAD && rg --pre-glob '*.gz' probe .\"",
+        "/bin/bash -lc 'git rev-parse HEAD && rg -z probe .'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg -nz probe .'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg --search-zip probe .'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg --hostname-bin hostname probe .'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg -o -r " + "a" * 40 + " . README.md'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg --replace=" + "a" * 40 + " . README.md'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg -L probe .'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg --unknown-flag probe .'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg probe ../outside'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg probe /etc'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg --files /etc'",
+        "/bin/bash -lc 'git rev-parse HEAD && rg --ignore-file /etc/ignore probe .'",
+        # `find` 只收列舉的述詞／運算子：會執行、刪除、寫檔或自訂輸出的一律不算。
+        "/bin/bash -lc 'git rev-parse HEAD && find . -name x -exec cat {} +'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . -execdir cat {} +'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . -ok cat {} +'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . -name x -delete'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . -fprint /tmp/x'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . -fls /tmp/x'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . -maxdepth 0 -printf " + "a" * 40 + "'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . -type s'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . -maxdepth two'",
+        "/bin/bash -lc 'git rev-parse HEAD && find -L . -name x'",
+        "/bin/bash -lc 'git rev-parse HEAD && find /var/lib/cortex -name x'",
+        "/bin/bash -lc 'git rev-parse HEAD && find ../outside -name x'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . -name x extra'",
+        # 重導向維持原本的拒絕；未加引號的括號是 shell 語法（子 shell／函式定義），不是 find 的分組。
+        "/bin/bash -lc 'git rev-parse HEAD && find . -name x 2>/dev/null'",
+        "/bin/bash -lc 'git rev-parse HEAD && find . ( -name x )'",
+        "/bin/bash -lc 'find ( ) ( ! -name x ) && git rev-parse HEAD && find'",
     ],
 )
 def test_codex_agent_loop_parser_rejects_unsafe_head_command_chains(command: str) -> None:
@@ -4603,6 +4663,97 @@ def test_codex_agent_loop_missing_proof_names_the_observed_commands() -> None:
     assert "git status --short && echo <redacted>" in message
     assert secret not in message
     assert "do-not-leak" not in message
+
+
+#: canary run 37343291869 第 1 筆 command_execution 的指令形狀：唯讀 git 檢查串上 `rg --files`。
+_CANARY_37343291869_RG_PROBE = (
+    '/usr/bin/bash -lc "git rev-parse HEAD && git rev-parse --show-toplevel'
+    " && git rev-parse --git-common-dir && git worktree list --porcelain"
+    ' && git status --short --branch && rg --files docs/superpowers/plans"'
+)
+_CANARY_37343291869_RG_OUTPUT = (
+    "a" * 40
+    + f"\n{_HEAD_PROBE_WORKTREE}\n/var/lib/cortex/repos/probe/.git\n"
+    + f"worktree {_HEAD_PROBE_WORKTREE}\nHEAD "
+    + "a" * 40
+    + "\n## feature/probe\ndocs/superpowers/plans/2026-10-05-deployment-canary-probe.md\n"
+)
+
+
+def _command_event(command: str, output: str, *, exit_code: int, status: str) -> dict:
+    return {
+        "type": "item.completed",
+        "item": {
+            "type": "command_execution",
+            "command": command,
+            "aggregated_output": output,
+            "exit_code": exit_code,
+            "status": status,
+        },
+    }
+
+
+def test_codex_agent_loop_accepts_the_canary_37343291869_rg_probe_once_rg_succeeds() -> None:
+    """#716（canary run 37343291869）：codex 在 HEAD 探針鏈尾端接 `rg --files`；image 補上 ripgrep 後
+    整條 exit 0，`rg` 段是唯讀探索，這筆就是合格的 HEAD proof。"""
+    driver = _load_driver()
+
+    observation = driver._codex_agent_loop_observation(
+        (("build-job", _head_probe_log(_CANARY_37343291869_RG_PROBE, _CANARY_37343291869_RG_OUTPUT)),),
+        expected_head="a" * 40,
+        expected_worktree=_HEAD_PROBE_WORKTREE,
+    )
+
+    assert observation["successful_command_count"] == 1
+
+
+def test_codex_agent_loop_still_rejects_the_failed_canary_37343291869_rg_probe() -> None:
+    """#716：同一條鏈若 `rg` 不存在（exit 127）仍不是 proof——形狀可採信，但沒有完整跑完。"""
+    driver = _load_driver()
+    events = [
+        {"type": "thread.started", "thread_id": "thread-build-job"},
+        _command_event(
+            _CANARY_37343291869_RG_PROBE,
+            "a" * 40 + "\nbash: line 1: rg: command not found\n",
+            exit_code=127,
+            status="failed",
+        ),
+    ]
+    content = "\n".join(json.dumps(event) for event in events).encode()
+
+    with pytest.raises(driver.QualificationFailure) as caught:
+        driver._codex_agent_loop_observation(
+            (("build-job", content),),
+            expected_head="a" * 40,
+            expected_worktree=_HEAD_PROBE_WORKTREE,
+        )
+
+    message = str(caught.value)
+    assert "no completed git HEAD proof" in message
+    assert "exit=127 status='failed' accepted=True head_in_output=True" in message
+
+
+def test_codex_agent_loop_read_only_search_without_head_is_not_a_proof() -> None:
+    """#716：允許 `rg`／`find` 段不代表放寬 proof——鏈中沒有印出 HEAD 的 git 段就不算，
+    即使輸出剛好含 HEAD（canary run 37343291869 第 2 筆的形狀）。"""
+    driver = _load_driver()
+    commands = (
+        "/usr/bin/bash -lc \"git rev-parse --git-dir --git-common-dir --show-toplevel"
+        " && git worktree list --porcelain && git status --porcelain=v1"
+        " && find docs/superpowers/plans -maxdepth 2 -type f -name '*dep*'\"",
+        "/bin/bash -lc 'git status --short && rg --files docs'",
+        "/bin/bash -lc 'rg -n HEAD .'",
+    )
+    for command in commands:
+        assert not driver._is_expected_head_probe(
+            command, expected_worktree=_HEAD_PROBE_WORKTREE
+        ), command
+        with pytest.raises(driver.QualificationFailure, match="no completed git HEAD proof"):
+            driver._codex_agent_loop_observation(
+                (("build-job", _head_probe_log(command, "a" * 40 + "\n")),),
+                expected_head="a" * 40,
+                expected_worktree=_HEAD_PROBE_WORKTREE,
+            )
 
 
 def test_dispatch_closeout_runs_source_repo_git_as_the_manager(

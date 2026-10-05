@@ -659,6 +659,9 @@ def test_reference_image_is_ubuntu_2404_systemd_pid1_with_os_dependencies() -> N
         "gh",
         "bubblewrap",
         "socat",
+        # #716（canary run 37343291869）：codex 以 `rg` 做唯讀探索，正式主機通常有
+        # ripgrep；image 缺它時 HEAD 探針鏈 exit 127，canary 結案失敗。
+        "ripgrep",
     ):
         assert re.search(
             rf"\b{re.escape(package)}\b", lowered

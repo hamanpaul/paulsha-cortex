@@ -4158,7 +4158,9 @@ def _is_expected_head_probe(
       `-C <bound worktree>`，不能指向其他目錄）。repo 內的 `./git`、`printf`／`echo`
       等能自行印出 SHA 的指令、任何含 `$` 或反引號的字詞，以及 git 段中帶 7 位以上 hex
       的字詞（字面 SHA），都讓整條不算數。唯讀檔案檢視（:func:`_is_read_only_file_view`）
-      可以出現在鏈中。
+      與唯讀搜尋（:func:`_is_read_only_rg`、:func:`_is_read_only_find`，canary run
+      37343291869）可以出現在鏈中；`find` 分組用的 `(`／`)` 只在整條指令沒有未加引號、
+      未跳脫的括號時才當字面值收下。
     - 至少一段是印出 HEAD hash 的最小形狀（:func:`_git_args_print_head`：
       `rev-parse [--verify] HEAD`、`log -1 --format=%H`、`show -s --format=%H`），可帶
       `-C <bound worktree>`。
@@ -4181,10 +4183,14 @@ def _is_expected_head_probe(
         tokens = list(lexer)
     except ValueError:
         return False
+    literal_parens = not _has_unquoted_paren(inner)
     segments: list[list[str]] = [[]]
     for token in tokens:
         if token == "&&":
             segments.append([])
+            continue
+        if token in {"(", ")"} and literal_parens:
+            segments[-1].append(token)
             continue
         if not token or set(token) <= set(lexer.punctuation_chars):
             return False
@@ -4197,7 +4203,11 @@ def _is_expected_head_probe(
     for segment in segments:
         if segment == ["pwd"] or segment == ["cd", expected_worktree]:
             continue
-        if _is_read_only_file_view(segment, expected_worktree=expected_worktree):
+        if (
+            _is_read_only_file_view(segment, expected_worktree=expected_worktree)
+            or _is_read_only_rg(segment, expected_worktree=expected_worktree)
+            or _is_read_only_find(segment, expected_worktree=expected_worktree)
+        ):
             continue
         args = _head_probe_git_args(segment, expected_worktree=expected_worktree)
         if not args or args[0] not in HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS:
@@ -4246,14 +4256,227 @@ def _is_read_only_file_view(segment: Sequence[str], *, expected_worktree: str) -
             if _VIEWER_OPTION_RE.fullmatch(arg) is None:
                 return False
             continue
-        path = Path(arg)
-        if ".." in path.parts:
-            return False
-        if path.is_absolute() and not (
-            arg == expected_worktree or arg.startswith(expected_worktree.rstrip("/") + "/")
-        ):
+        if not _is_worktree_path(arg, expected_worktree=expected_worktree):
             return False
     return True
+
+
+def _is_worktree_path(arg: str, *, expected_worktree: str) -> bool:
+    """路徑參數是否留在 bound worktree 內（#716）：不得含 `..`；絕對路徑只能是 worktree 本身或其下。"""
+
+    path = Path(arg)
+    if ".." in path.parts:
+        return False
+    return not path.is_absolute() or (
+        arg == expected_worktree or arg.startswith(expected_worktree.rstrip("/") + "/")
+    )
+
+
+#: `rg` 允許的唯讀選項（#716，canary run 37343291869：codex 習慣用 `rg`／`find` 做唯讀探索）。
+#: 採允許清單、只列「讀、篩選、排版」：會執行外部程式的（`--pre`、`--pre-glob`、`-z`／
+#: `--search-zip`、`--hostname-bin`）、能把任意字面值印進輸出的 `-r`／`--replace`、跟隨
+#: symlink 而可能讀出 worktree 外的 `-L`／`--follow`，以及任何沒列出的選項都讓這段不算數。
+_RG_SHORT_FLAG_CLUSTER_RE = re.compile(r"-[nNiSsFwxlcovuHI]+")
+_RG_ATTACHED_COUNT_RE = re.compile(r"-[mdABC][0-9]+")
+_RG_LONG_FLAGS = frozenset(
+    {
+        "--files",
+        "--line-number",
+        "--no-line-number",
+        "--ignore-case",
+        "--smart-case",
+        "--case-sensitive",
+        "--fixed-strings",
+        "--word-regexp",
+        "--line-regexp",
+        "--files-with-matches",
+        "--files-without-match",
+        "--count",
+        "--count-matches",
+        "--only-matching",
+        "--invert-match",
+        "--hidden",
+        "--no-ignore",
+        "--no-ignore-vcs",
+        "--no-heading",
+        "--heading",
+        "--with-filename",
+        "--no-filename",
+        "--column",
+        "--no-messages",
+        "--unrestricted",
+        "--no-config",
+    }
+)
+#: 帶值的 `rg` 選項與值的種類（`-x VALUE` 或 `--long=VALUE`）。
+_RG_VALUE_OPTIONS: Mapping[str, str] = {
+    "-g": "glob",
+    "--glob": "glob",
+    "--iglob": "glob",
+    "-t": "type",
+    "--type": "type",
+    "-T": "type",
+    "--type-not": "type",
+    "-m": "count",
+    "--max-count": "count",
+    "-d": "count",
+    "--max-depth": "count",
+    "-A": "count",
+    "--after-context": "count",
+    "-B": "count",
+    "--before-context": "count",
+    "-C": "count",
+    "--context": "count",
+    "-e": "pattern",
+    "--regexp": "pattern",
+    "--ignore-file": "path",
+    "--color": "color",
+    "--colour": "color",
+}
+
+
+def _rg_option_value_ok(kind: str, value: str, *, expected_worktree: str) -> bool:
+    if kind == "pattern":
+        return True
+    # 值以 `-` 開頭時，不同版本的 rg 可能把它當成另一個選項；一律不收。
+    if value.startswith("-"):
+        return False
+    if kind == "count":
+        return re.fullmatch(r"[0-9]+", value) is not None
+    if kind == "type":
+        return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_+-]*", value) is not None
+    if kind == "color":
+        return value in {"never", "auto", "always", "ansi"}
+    if kind == "path":
+        return _is_worktree_path(value, expected_worktree=expected_worktree)
+    return kind == "glob"
+
+
+def _is_read_only_rg(segment: Sequence[str], *, expected_worktree: str) -> bool:
+    """這一段是否只是在 bound worktree 內以 `rg` 唯讀搜尋或列檔（#716）。
+
+    收 `rg --files [PATH…]` 與 `rg [OPTION…] PATTERN [PATH…]`（`-e`／`--regexp` 給樣式時
+    所有位置參數都是路徑），選項限 :data:`_RG_LONG_FLAGS` 等允許清單；路徑規則與
+    :func:`_is_read_only_file_view` 相同（:func:`_is_worktree_path`）。
+    """
+
+    if not segment or segment[0].removeprefix("/usr/bin/").removeprefix("/bin/") != "rg":
+        return False
+    args = list(segment[1:])
+    positionals: list[str] = []
+    pattern_given = False
+    list_files = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--":
+            positionals.extend(args[index:])
+            break
+        if not arg.startswith("-"):
+            positionals.append(arg)
+            continue
+        if arg == "--files":
+            list_files = True
+            continue
+        if (
+            arg in _RG_LONG_FLAGS
+            or _RG_SHORT_FLAG_CLUSTER_RE.fullmatch(arg)
+            or _RG_ATTACHED_COUNT_RE.fullmatch(arg)
+        ):
+            continue
+        name, separator, value = arg.partition("=")
+        if separator and name.startswith("--"):
+            kind = _RG_VALUE_OPTIONS.get(name)
+        elif arg in _RG_VALUE_OPTIONS and index < len(args):
+            kind, value = _RG_VALUE_OPTIONS[arg], args[index]
+            index += 1
+        else:
+            return False
+        if kind is None or not _rg_option_value_ok(
+            kind, value, expected_worktree=expected_worktree
+        ):
+            return False
+        pattern_given = pattern_given or kind == "pattern"
+    if not list_files and not pattern_given:
+        if not positionals:
+            return False
+        positionals = positionals[1:]
+    return all(
+        path != "-" and _is_worktree_path(path, expected_worktree=expected_worktree)
+        for path in positionals
+    )
+
+
+#: `find` 允許的述詞與運算子（#716）。只收篩選與印路徑：`-exec`／`-execdir`／`-ok`／`-okdir`
+#: 會執行指令、`-delete` 會刪檔、`-fprint*`／`-fls` 會寫檔、`-printf` 能印出任意字面值、
+#: `-L`／`-H` 會跟隨 symlink，以及任何沒列出的述詞都讓這段不算數。
+_FIND_OPERATORS = frozenset({"-o", "-a", "!", "-not", "(", ")", "-print", "-print0"})
+_FIND_PATTERN_TESTS = frozenset({"-name", "-iname", "-path", "-ipath"})
+_FIND_DEPTH_OPTIONS = frozenset({"-maxdepth", "-mindepth"})
+_FIND_TYPES = frozenset({"f", "d", "l"})
+
+
+def _is_read_only_find(segment: Sequence[str], *, expected_worktree: str) -> bool:
+    """這一段是否只是在 bound worktree 內以 `find` 唯讀列檔（#716）。
+
+    起點路徑規則與 :func:`_is_read_only_file_view` 相同（:func:`_is_worktree_path`），
+    運算式只收 :data:`_FIND_OPERATORS`、`-maxdepth`／`-mindepth N`、`-type f|d|l` 與
+    `-name`／`-iname`／`-path`／`-ipath PATTERN`。
+    """
+
+    if not segment or segment[0].removeprefix("/usr/bin/").removeprefix("/bin/") != "find":
+        return False
+    args = list(segment[1:])
+    index = 0
+    while index < len(args) and not (
+        args[index].startswith("-") or args[index] in {"(", ")", "!"}
+    ):
+        if not _is_worktree_path(args[index], expected_worktree=expected_worktree):
+            return False
+        index += 1
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg in _FIND_OPERATORS:
+            continue
+        if arg not in _FIND_PATTERN_TESTS | _FIND_DEPTH_OPTIONS | {"-type"}:
+            return False
+        if index >= len(args):
+            return False
+        value = args[index]
+        index += 1
+        if arg in _FIND_DEPTH_OPTIONS and re.fullmatch(r"[0-9]+", value) is None:
+            return False
+        if arg == "-type" and value not in _FIND_TYPES:
+            return False
+    return True
+
+
+def _has_unquoted_paren(script: str) -> bool:
+    """`(`／`)` 是否以 shell 語法出現（子 shell、函式定義），而不是加引號或跳脫的字面值（#716）。
+
+    `shlex` 去掉引號後分不出 `\\(`／`'('` 與裸 `(`；`find` 的分組要用前者，後者一律不收。
+    """
+
+    quote = ""
+    escaped = False
+    for char in script:
+        if escaped:
+            escaped = False
+        elif quote == "'":
+            if char == "'":
+                quote = ""
+        elif char == "\\":
+            escaped = True
+        elif quote == '"':
+            if char == '"':
+                quote = ""
+        elif char in {"'", '"'}:
+            quote = char
+        elif char in {"(", ")"}:
+            return True
+    return False
 
 
 #: `--format`／`--pretty` 只印 commit hash 的寫法（#716）。
