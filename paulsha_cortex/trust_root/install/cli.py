@@ -647,6 +647,43 @@ def _locked_receipt(
         yield InstallReceipt.load(path, expected_plan=plan), plan
 
 
+def _add_upgrade_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "version", nargs="?", help="target release MAJOR.MINOR.PATCH (tag v<version>)"
+    )
+    parser.add_argument(
+        "--wait-idle",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="wait up to SECONDS for in-flight jobs to finish (default 0: refuse at once)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="print the upgrade report or status as JSON",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--recover",
+        action="store_true",
+        help="recover an upgrade interrupted by SIGKILL, OOM or power loss (runbook §6)",
+    )
+    mode.add_argument(
+        "--status",
+        action="store_true",
+        help="read-only: effective receipt, last upgrade result, loaded runtime match",
+    )
+    # RC qualification only: accepted when PSC_UPGRADE_QUALIFICATION=1, hidden from help.
+    parser.add_argument("--release-source", help=argparse.SUPPRESS)
+    # RC qualification only (PSC_UPGRADE_QUALIFICATION=1): lets a drill rerun the
+    # exact same version, and also relaxes the host-overlay-digest equality check
+    # against the prior plan. Hidden from help; never used in production.
+    parser.add_argument("--allow-same-version", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--prior-receipt", help=argparse.SUPPRESS)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cortex install trust-root",
@@ -780,6 +817,11 @@ def _build_parser() -> argparse.ArgumentParser:
     legacy_purge.add_argument(
         "--confirm-sha256", help="digest printed by the matching dry-run report"
     )
+
+    upgrade_parser = sub.add_parser(
+        "upgrade", help="one-command upgrade to a published release (root only)"
+    )
+    _add_upgrade_arguments(upgrade_parser)
     return parser
 
 
@@ -1294,6 +1336,35 @@ def _rollback_command(args: argparse.Namespace) -> int:
     return 0 if payload["restore_safe"] is True else 1
 
 
+def _upgrade_command(args: argparse.Namespace) -> int:
+    _require_root()
+    # upgrade.py imports this module, so it is imported here -- still before any
+    # host mutation.  upgrade.py itself imports everything at module level.
+    from . import upgrade
+
+    options = upgrade.options_from_args(args, environ=os.environ)
+    return upgrade.run_upgrade(options)
+
+
+def upgrade_main(argv: Sequence[str] | None = None) -> int:
+    """`cortex upgrade`: alias of `cortex install trust-root upgrade`."""
+
+    parser = argparse.ArgumentParser(
+        prog="cortex upgrade",
+        description=(
+            "Upgrade this host to a published release in one root command "
+            "(alias of `cortex install trust-root upgrade`)."
+        ),
+    )
+    _add_upgrade_arguments(parser)
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        return _upgrade_command(args)
+    except (InstallError, PermissionError, OSError, ValueError) as exc:
+        sys.stderr.write(f"cortex upgrade failed: {exc}\n")
+        return 1
+
+
 _RECEIPT_MANAGED_HINT = (
     "this host is managed by the transactional installer; upgrade it with "
     "`apply --prior-receipt <applied and qualified receipt>` instead of legacy adoption"
@@ -1494,6 +1565,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _verify_command(args)
         if args.trust_root_command == "rollback":
             return _rollback_command(args)
+        if args.trust_root_command == "upgrade":
+            return _upgrade_command(args)
         if args.trust_root_command == "legacy":
             if args.legacy_command == "inventory":
                 return _legacy_inventory_command(args)

@@ -23,6 +23,7 @@ options:
 
 setup and workflow commands:
   install service  安裝 manager service/timer 與 monitor 的 systemd --user units
+  upgrade          以 root 一鍵升級到指定 release（--status 唯讀、--recover 收拾中斷）
   deck             預覽或產生 dispatch:hold 的 slice specs
   skill            skill usage ledger 檢視與 park/janitor 操作（inspect/park/restore/...）
   monitor          掃描專案文件並輸出 Project Monitor 狀態
@@ -147,6 +148,10 @@ def main(
         from paulsha_cortex.deploy.installer import main as install_main
 
         return int(install_main(args[1:]) or 0)
+    if args[0] == "upgrade":
+        from paulsha_cortex.trust_root.install.cli import upgrade_main
+
+        return int(upgrade_main(args[1:]) or 0)
     if args[0] == "relay-hook":
         script = str(_relay_hook_script_path())
         try:

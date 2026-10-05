@@ -107,3 +107,35 @@ def test_install_help_explains_enable_start_and_interval_semantics(capsys) -> No
     assert "usage: cortex install service" in output
     assert "PSC_MANAGER_INTERVAL_SECONDS" in output
     assert "被治理的目標 git repo" in output
+
+
+def test_umbrella_help_lists_one_command_upgrade(capsys) -> None:
+    assert umbrella_cli.main(["--help"]) == 0
+    assert "  upgrade          以 root 一鍵升級" in capsys.readouterr().out
+
+
+def test_upgrade_alias_help_uses_cortex_upgrade_and_hides_test_only_flags(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        umbrella_cli.main(["upgrade", "--help"])
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "usage: cortex upgrade" in output
+    for flag in ("--wait-idle", "--recover", "--status", "--json"):
+        assert flag in output
+    for hidden in ("--release-source", "--allow-same-version", "--prior-receipt"):
+        assert hidden not in output
+
+
+def test_trust_root_help_lists_the_upgrade_subcommand(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        installer.main(["trust-root", "--help"])
+    assert exc.value.code == 0
+    assert "upgrade" in capsys.readouterr().out
+
+
+def test_install_help_mentions_trust_root_upgrade(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        installer.main(["--help"])
+    assert exc.value.code == 0
+    # argparse wraps the help column, so compare without whitespace.
+    assert "rollback/upgrade" in "".join(capsys.readouterr().out.split())
