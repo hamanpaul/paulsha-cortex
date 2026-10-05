@@ -4451,6 +4451,45 @@ def _codex_agent_loop_observation(
     }
 
 
+def _reclaimed_build_harvested(job: Mapping[str, object], *, repo_root: Path) -> bool:
+    """bundle 已隨 owner-bound reclaim 移除時，這張 build 卡的 harvest 是否確實落地。
+
+    #716（canary run 37282854268）：#1261 之後，會寫檔的 build 卡在採信時經 #1167
+    的 builder unit 回收，`owner_reclaim.reclaim_through_builder_unit` 以
+    `create_slot(commit_slot, reset=True)` 重設該 slot，`commits.bundle` 隨之移除——
+    那是 slot 重用的設計，bundle 早在採信時已 harvest 進 source repo。此時以三件事
+    作為 harvest 落地的證據：不是唯讀探針卡（它不產生 commit）、job 的 worktree 已
+    回收、job 的 subject_head 以 cortex-manager 身分可在 source repo 找到。
+    """
+
+    subject_head = job.get("subject_head")
+    worktree_value = job.get("worktree")
+    if (
+        job.get("workflow_card") == DEPLOYMENT_CANARY_PROBE_CARD
+        or not isinstance(subject_head, str)
+        or SHA40.fullmatch(subject_head) is None
+        or not isinstance(worktree_value, str)
+        or not worktree_value
+        or Path(worktree_value).exists()
+        or Path(worktree_value).is_symlink()
+    ):
+        return False
+    harvested = _run(
+        (
+            "/usr/bin/git",
+            "-C",
+            str(repo_root),
+            "cat-file",
+            "-e",
+            f"{subject_head}^{{commit}}",
+        ),
+        user="cortex-manager",
+        env=_account_env("cortex-manager"),
+        timeout=30,
+    )
+    return harvested.returncode == 0
+
+
 def _bound_codex_builder_log(
     root: Path, job: Mapping[str, object]
 ) -> tuple[Path, bytes]:
@@ -5387,6 +5426,14 @@ def _validate_dispatch_closeout(
             raise QualificationFailure("build commit spool authority is invalid")
         bundle = root / "commit-spool" / slot / "commits.bundle"
         if not bundle.exists():
+            # #716（canary run 37282854268）：#1261 之後，會寫檔的 build 卡在採信時經
+            # #1167 的 builder unit 回收，`reclaim_through_builder_unit` 會以
+            # `create_slot(commit_slot, reset=True)` 重設該 slot，bundle 隨之移除——
+            # 那是 slot 重用的設計，bundle 早已 harvest 進 source repo。這時改以
+            # 「worktree 已回收，且 job 的 subject_head 確實在 source repo」作為 harvest
+            # 落地的證據；唯讀的探針卡不產生 commit，不計入。
+            if _reclaimed_build_harvested(job, repo_root=repo_root):
+                bundle_seen = True
             continue
         if bundle.is_symlink() or bundle.parent.is_symlink() or not bundle.is_file():
             raise QualificationFailure(
@@ -5426,7 +5473,9 @@ def _validate_dispatch_closeout(
         bundle_seen = True
         remember_artifact(bundle, bundle_digest_before)
     if not bundle_seen:
-        raise QualificationFailure("workflow has no verified commit bundle artifact")
+        raise QualificationFailure(
+            "workflow has no verified commit bundle artifact or reclaimed harvested candidate"
+        )
 
     completion_value = workflow.get("completion_record_path")
     if not isinstance(completion_value, str):
