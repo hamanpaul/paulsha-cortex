@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **#716 canary provider preflight 證據補上 `returncode`／`skipped`**：canary run 37357552758 跑完全部 live 階段後，validate 以 `provider-capabilities.providers.agy.preflight missing required fields: returncode, skipped` 失敗；driver 的 `_provider_preflight` 對三個 provider 都只寫四欄。改為一律寫出 validator 要求的六欄（agy 記 `/quota` status probe 的真實結束碼，codex／copilot 的 app-server 交換成功記 0，`skipped` 為 False），並新增以 driver 自己的 writer 產生整套 canary 證據、交給 validator canary profile 驗收的端到端契約測試（見 `changelog.d/canary-evidence-contract.md`）（#716）。
 - **#716 canary HEAD proof 接受唯讀 `rg`／`find` 段，qualification image 安裝 ripgrep**：canary run 37343291869 的 codex 在探針鏈尾端接 `rg --files`，RC image 缺 ripgrep 而 exit 127、結案找不到 HEAD proof；image 補裝 `ripgrep`，探針鏈接受選項／述詞限允許清單的唯讀 `rg`／`find` 段（會執行、寫檔、刪檔或印出任意字面值的選項不收，路徑限 bound worktree 內、拒絕 `~` 開頭），proof 仍須整條 exit 0 且含印出 HEAD 的 git 段（見 `changelog.d/head-probe-rg.md`）（#716）。
 - **#716 validator 接受 agy smoke 的 persisted_variants 證據**：canary run 37331921480 顯示 driver（commit a6340da2 起）為 agy smoke 多寫的 `persisted_variants` 欄位被 validator 當 unknown field 擋下；改為對 agy 額外接受該欄位，且值須恰好等於驗證通過時的那組 runtime model／effort（#716）。
 
