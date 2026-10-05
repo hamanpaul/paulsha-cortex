@@ -21,6 +21,7 @@
 - **#716 canary HEAD 探針形狀**：closeout 接受實機 codex 的裸 `git` 與 `&&` 串接唯讀檢查，偽造形狀仍拒絕（#716）。
 - **#716 canary closeout spec conformance**：端到端測試讓 Manager 以 production 路徑派出探針卡並交給 driver 驗 spec；driver 探針 prompt 的卡片欄位、input source material 與 gate 範圍文字改由 deck 編譯、Manager input snapshot 與 EnvironmentFile 導出，修正 action／inputs／source_material／status_policy 四處過時預期（#716）。
 - **#716 canary builder PATH**：closeout 預期的 job `PATH` 與 installer 的 `PSC_BUILDER_PATH` 同源（含 `/usr/local/bin`），runtime home 失敗時列出條件名（#716）。
+- **v0.1.12 發版**：`VERSION` 升為 0.1.12，收錄 #716 deployment canary 端到端、#1122 legacy adoption、refine 缺口補齊與額度管理延伸（見 `changelog.d/release-0-1-12.md`）。
 - **#1226 planning quota identity fallback**：enforce 在 brainstorm 前一次選定額度可行且 domain 異質的 primary／secondary，無可行組合時 wait，receipt 記錄排除候選與實際 primary（#1226）。
 - **#1222 Claude quota observation source**：從終局 Claude job 的 stream-json `rate_limit_event` 收割五小時／七日剩餘百分比至 quota observation ledger，支援 identity binding、coverage gap 與 TTL；更新 quota enforce 手冊（#1222）。
 - **#1224 rollback loaded-runtime qualification**：RC 對已核可 prior receipt 執行隔離 upgrade rollback，立即比對 Manager／Monitor 的 loaded artifact 與 receipt，並將列舉結果納入 qualification evidence；文件明示同 artifact 情境、證據界線與 RC/live 驗收分工（#1224）
