@@ -1477,6 +1477,17 @@ def _full_canary_qualification(
                 "efforts": [row["runtime_effort"]],
                 "native_metadata": True,
                 "response_token": True,
+                # #716：canary run 37331921480 顯示 driver（a6340da2）對 agy smoke
+                # 多寫 persisted_variants，fixture 跟著真實 driver 輸出走。
+                **(
+                    {
+                        "persisted_variants": [
+                            f"{row['runtime_model']}-{row['runtime_effort']}"
+                        ]
+                    }
+                    if row["provider"] == "agy"
+                    else {}
+                ),
             }
             for row in providers
         },

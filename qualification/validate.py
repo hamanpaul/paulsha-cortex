@@ -539,17 +539,23 @@ def _validate_profile_artifacts(
         row["provider"]: row for row in qualification["providers"]
     }
     for name, raw in provider_evidence["providers"].items():
+        base_provider_keys = {
+            "preflight",
+            "returncode",
+            "models",
+            "efforts",
+            "native_metadata",
+            "response_token",
+        }
+        # canary run 37331921480：driver a6340da2 起，agy smoke 改以持久化對話的模型
+        # 變體證明 model／effort，raw_evidence 多寫一個 persisted_variants 欄位；
+        # 其他 provider 的欄位集合維持不變。
         row = _mapping(
             raw,
             f"provider-capabilities.providers.{name}",
-            {
-                "preflight",
-                "returncode",
-                "models",
-                "efforts",
-                "native_metadata",
-                "response_token",
-            },
+            base_provider_keys | {"persisted_variants"}
+            if name == "agy"
+            else base_provider_keys,
         )
         expected = qualification_providers[name]
         preflight = _mapping(
@@ -582,6 +588,12 @@ def _validate_profile_artifacts(
             _fail(f"provider {name} native evidence must name one exact runtime model")
         if row["efforts"] != [expected["runtime_effort"]]:
             _fail(f"provider {name} native evidence must name one exact runtime effort")
+        if name == "agy" and row["persisted_variants"] != [
+            f"{expected['runtime_model']}-{expected['runtime_effort']}"
+        ]:
+            _fail(
+                "provider agy persisted variants must name one exact runtime model/effort"
+            )
         if (
             expected["quota"] != preflight["quota"]
             or expected["fallback"] != preflight["fallback"]

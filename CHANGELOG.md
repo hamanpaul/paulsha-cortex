@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **#716 validator 接受 agy smoke 的 persisted_variants 證據**：canary run 37331921480 顯示 driver（commit a6340da2 起）為 agy smoke 多寫的 `persisted_variants` 欄位被 validator 當 unknown field 擋下；改為對 agy 額外接受該欄位，且值須恰好等於驗證通過時的那組 runtime model／effort（#716）。
+
 ### Added
 
 - **#716 post-archive reviewer 不再補入過期的 active OpenSpec 檔**：archive 之後 reviewer 的 OpenSpec planning authority 輸入改讀候選自己的 archive 副本（tasks.md 只容忍 checkbox 差異，entry 不唯一／symlink／缺檔 fail-closed），不再從來源樹 seed claim 當下未勾選的 active 檔（#716）。

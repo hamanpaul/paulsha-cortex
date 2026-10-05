@@ -348,6 +348,17 @@ def _valid_full_qualification(tmp_path: Path, *, rollback_expected_wheel: str = 
                 "efforts": [row["runtime_effort"]],
                 "native_metadata": True,
                 "response_token": True,
+                # #716：canary run 37331921480 顯示 driver（a6340da2）對 agy smoke
+                # 多寫 persisted_variants，fixture 跟著真實 driver 輸出走。
+                **(
+                    {
+                        "persisted_variants": [
+                            f"{row['runtime_model']}-{row['runtime_effort']}"
+                        ]
+                    }
+                    if row["provider"] == "agy"
+                    else {}
+                ),
             }
             for row in payload["providers"]
         },
@@ -856,6 +867,24 @@ def test_qualification_validator_rejects_release_binding_mismatch(
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
+def test_full_suite_validator_accepts_agy_persisted_variants_evidence(
+    tmp_path: Path,
+) -> None:
+    """#716：canary run 37331921480 顯示 driver（commit a6340da2 起）為 agy smoke
+    的 raw_evidence 多寫 persisted_variants，validator 必須放行這個真實 driver
+    形狀，而不是當成 unknown field 擋下（曾經的失敗訊息：
+    "provider-capabilities.providers.agy has unknown fields: persisted_variants"）。"""
+    payload = _valid_full_qualification(tmp_path)
+    provider_path = tmp_path / "evidence" / "provider-capabilities.json"
+    document = json.loads(provider_path.read_text(encoding="utf-8"))
+    assert document["providers"]["agy"]["persisted_variants"] == [
+        f"{PROVIDER_MODELS['agy']}-{PROVIDER_EFFORTS['agy']}"
+    ]
+
+    completed = _run_full_validator(tmp_path, payload)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_full_suite_validator_accepts_distinct_candidate_identities(tmp_path: Path) -> None:
     payload = _valid_full_qualification(tmp_path)
     dispatch = json.loads(
@@ -1069,6 +1098,10 @@ def test_full_suite_validator_binds_legacy_deny_only_asset(
         "missing-gate-case",
         "missing-family-control",
         "provider-self-attestation",
+        "agy-missing-persisted-variants",
+        "agy-wrong-persisted-variant",
+        "agy-multiple-persisted-variants",
+        "non-agy-persisted-variants",
         "nonterminal-dispatch",
         "unbounded-terminal-dispatch",
         "unbounded-marker-dispatch",
@@ -1111,6 +1144,30 @@ def test_full_suite_validator_rejects_self_consistent_forged_artifacts(
         path = evidence / "provider-capabilities.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         document["providers"]["codex"]["native_metadata"] = False
+    elif mutation == "agy-missing-persisted-variants":
+        # #716：agy smoke 證據若少了 persisted_variants，不能靠少驗一個欄位就放行。
+        path = evidence / "provider-capabilities.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        del document["providers"]["agy"]["persisted_variants"]
+    elif mutation == "agy-wrong-persisted-variant":
+        # #716：persisted_variants 指到另一個 model／effort 組合必須被拒。
+        path = evidence / "provider-capabilities.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["providers"]["agy"]["persisted_variants"] = ["other-model-low"]
+    elif mutation == "agy-multiple-persisted-variants":
+        # #716：persisted_variants 命中多個變體代表 model／effort 不是唯一值。
+        path = evidence / "provider-capabilities.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["providers"]["agy"]["persisted_variants"] = sorted(
+            document["providers"]["agy"]["persisted_variants"] + ["other-model-low"]
+        )
+    elif mutation == "non-agy-persisted-variants":
+        # #716：persisted_variants 只是 agy 專屬欄位，其他 provider 帶上仍是 unknown field。
+        path = evidence / "provider-capabilities.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["providers"]["codex"]["persisted_variants"] = document["providers"][
+            "agy"
+        ]["persisted_variants"]
     elif mutation == "nonterminal-dispatch":
         path = evidence / "dispatch-closeout.json"
         document = json.loads(path.read_text(encoding="utf-8"))
