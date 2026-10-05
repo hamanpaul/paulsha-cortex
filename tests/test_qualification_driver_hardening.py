@@ -4479,3 +4479,46 @@ def test_dispatch_closeout_names_unreclaimed_build_worktrees(
         "build worktree reclaim is incomplete: "
         f"{build_job['workflow_card']}/{build_job['job_id']}:exists"
     )
+
+
+def _insert_unbound_job(fixture, *, phase: str, before: bool) -> dict:
+    registry = fixture["coordinator"] / "jobs.json"
+    state = json.loads(registry.read_text(encoding="utf-8"))
+    index, original = next(
+        (index, job)
+        for index, job in enumerate(state["jobs"])
+        if job["workflow_phase"] == phase
+    )
+    unbound = copy.deepcopy(original)
+    unbound["job_id"] = f"{original['job_id']}-stopped"
+    unbound["workflow_evidence"] = None
+    state["jobs"].insert(index if before else index + 1, unbound)
+    _write_json(registry, state)
+    return unbound
+
+
+def test_dispatch_closeout_skips_unbound_jobs_superseded_by_retry_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#716（canary run 37243213297）：修正回合的 retry-build 之後，明示停止的 verify job
+    沒有 canonical evidence；同一張卡之後有新 job 時視為被取代，不讓結案失敗。"""
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    _insert_unbound_job(fixture, phase="verify", before=True)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    _validate_fixture_closeout(driver, fixture)
+
+
+def test_dispatch_closeout_still_requires_evidence_on_the_final_job_of_a_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    _insert_unbound_job(fixture, phase="verify", before=False)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+    monkeypatch.setattr(driver, "_run", _dispatch_fixture_fake_run(driver, fixture))
+
+    with pytest.raises(driver.QualificationFailure, match="canonical evidence locator is malformed"):
+        _validate_fixture_closeout(driver, fixture)
