@@ -128,6 +128,7 @@
 
 ### Fixed
 
+- **#716 canary closeout 以 envelope 語意驗 copilot gate ref**：`copilot` delivery gate ref 記的是 `work_bridge._write_json_evidence` 寫出的 `{"payload": ..., "hash": ...}` envelope（payload 的 canonical hash，不是檔案 bytes 雜湊），closeout 改認 envelope 語意——檔名＝digest、envelope 的 `hash` 與 payload 的 canonical hash 都要等於 row 記的 sha256，payload 另外核對 schema／run_id／candidate——不再對它做純 bytes 雜湊比對；dispatch artifact ledger 一律記真實 bytes 雜湊，不混用 gate-ref 語意的 digest（canary run 37308848071）（#716）。
 - **#716 canary 探針卡的唯讀模板**：worktree-isolation（write-forbidden）必須跑在 `cortex-job-ro[-jit]@`，spec 檢查失敗時列出不成立的條件（#716）。
 - **#716 canary 結案的 evidence candidate 綁定**：每張卡的 evidence 綁它自己的 subject，另要求最終 candidate 被 verify 與 review（archive commit 會換掉 candidate）（#716）。
 - **#716 canary 結案只要求最後一個 build 的 gate passed**：tdd-red 依設計 pytest failed、worktree-isolation 不跑 gate；只有產出交付 candidate 的最後一個 build job 必須 passed（#716）。

@@ -39,6 +39,7 @@ from paulsha_cortex.coordinator import (
     job_workspace,
     owner_reclaim,
     spool_slot,
+    verification,
 )
 from paulsha_cortex.trust_root.registry import (
     JobWriteContract,
@@ -5572,7 +5573,34 @@ def _validate_dispatch_closeout(
         # #716（canary run 37290200603）：三種情況過去合成一句，看不出是哪一種。
         # 分開報出，並帶上 ref 的 kind 與檔名（不含內容）。
         gate_label = f"{row.get('kind')}:{path.name}"
-        if hashlib.sha256(content).hexdigest() != expected_hash:
+        # #716（canary run 37308848071）：`copilot` 這張 gate ref 記的不是檔案
+        # bytes 雜湊。Manager 經 `work_bridge._write_json_evidence` 寫出的證據是
+        # `{"payload": ..., "hash": canonical_json_hash(payload)}` envelope，檔名
+        # ＝ digest；`row["sha256"]` 來自 `validate_ship_result` 的
+        # `review_hash = value["hash"]`，即 envelope 的 `hash`（payload 的
+        # canonical hash），永遠對不上整個檔案的 bytes 雜湊。改用與 Manager 相同
+        # 的 envelope 語意（manager.py `set(envelope) != {"payload", "hash"}`
+        # 採信慣例）核對 stem／envelope hash／payload canonical hash 三者一致；
+        # 其餘 kind 維持原本的檔案 bytes 雜湊比對。
+        if row["kind"] == "copilot":
+            envelope: object = None
+            if path.name == f"{expected_hash}.json":
+                try:
+                    envelope = json.loads(content.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    envelope = None
+            payload = envelope.get("payload") if isinstance(envelope, dict) else None
+            if (
+                not isinstance(envelope, dict)
+                or set(envelope) != {"payload", "hash"}
+                or not isinstance(payload, dict)
+                or envelope.get("hash") != expected_hash
+                or verification.canonical_json_hash(payload) != expected_hash
+            ):
+                raise QualificationFailure(
+                    f"workflow delivery gate hash mismatch: {gate_label}"
+                )
+        elif hashlib.sha256(content).hexdigest() != expected_hash:
             raise QualificationFailure(
                 f"workflow delivery gate hash mismatch: {gate_label}"
             )
@@ -5590,8 +5618,15 @@ def _validate_dispatch_closeout(
         # 的欄位都必須與本次派工相符（欄位不存在則不強求，避免對未帶這些欄位的
         # 既有 evidence adapter 產生新的形狀假設）；`foreign-review` 另外強制要求
         # 逐字等於本 run 已獨立驗過的 review job workflow evidence（同一份
-        # path＋hash），不接受任何「看起來合法」但不是那一份的檔案。
-        evidence_payload = _json_object(content, label="workflow delivery gate")
+        # path＋hash），不接受任何「看起來合法」但不是那一份的檔案。`copilot` 的
+        # 可驗內容是 envelope 的 `payload`（頂層只有 `payload`／`hash` 兩個鍵，
+        # 沒有 run_id／work_id／candidate），且額外強制 schema／run_id／candidate
+        # 必須存在並等於本次派工，不像其他 kind 允許欄位缺席。
+        evidence_payload = (
+            payload
+            if row["kind"] == "copilot"
+            else _json_object(content, label="workflow delivery gate")
+        )
         observed_run_id = evidence_payload.get("run_id")
         observed_work_id = evidence_payload.get("work_id")
         observed_candidate = evidence_payload.get("candidate")
@@ -5601,6 +5636,16 @@ def _validate_dispatch_closeout(
             or (
                 isinstance(observed_candidate, str)
                 and observed_candidate != candidate
+            )
+            or (
+                row["kind"] == "copilot"
+                and (
+                    evidence_payload.get("schema") != "cortex-delivery-adapter/v1"
+                    or not isinstance(observed_run_id, str)
+                    or observed_run_id != run_id
+                    or not isinstance(observed_candidate, str)
+                    or observed_candidate != candidate
+                )
             )
         ):
             raise QualificationFailure(
@@ -5618,7 +5663,11 @@ def _validate_dispatch_closeout(
         gate_paths.add(path)
         gate_inodes.add(inode)
         gate_kinds.add(row["kind"])
-        remember_artifact(path, expected_hash)
+        # `expected_hash`／`row["sha256"]` 對 `copilot` 而言是 payload 的 canonical
+        # hash，不是檔案 bytes 雜湊（見上方 envelope 驗證）；dispatch artifact
+        # ledger 的不變式是「記的是這個路徑當下真實內容的雜湊」，所以一律重算
+        # bytes 雜湊，不要混用 gate-ref 語意的 digest。
+        remember_artifact(path, hashlib.sha256(content).hexdigest())
     if (
         "foreign-review" not in gate_kinds
         or len(gate_kinds & {"copilot", "maintainer-review"}) != 1
