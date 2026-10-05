@@ -4166,15 +4166,22 @@ HEAD_PROBE_SHELLS = frozenset(
 def _head_probe_git_args(
     segment: Sequence[str], *, expected_worktree: str
 ) -> list[str] | None:
-    """去掉 git 本體與可選的 `-C <bound worktree>`，回傳子命令 argv；不是 git 時回 None。"""
+    """去掉 git 本體與可選的 `-C <bound worktree>`／`--no-pager`，回傳子命令 argv；不是 git 時回 None。
+
+    全域選項只收這兩個：`-C` 必須指向 bound worktree，`--no-pager` 只關掉分頁器、不改輸出
+    內容（#716）。`-c`、`--git-dir` 等其他全域選項會留在 argv 開頭，由呼叫端當成未知子命令拒絕。
+    """
 
     if not segment or segment[0] not in HEAD_PROBE_GIT_BINARIES:
         return None
     args = list(segment[1:])
-    if args[:1] == ["-C"]:
-        if args[1:2] != [expected_worktree]:
-            return None
-        args = args[2:]
+    while args[:1] in (["-C"], ["--no-pager"]):
+        if args[0] == "-C":
+            if args[1:2] != [expected_worktree]:
+                return None
+            args = args[2:]
+        else:
+            args = args[1:]
     return args
 
 
@@ -4202,9 +4209,11 @@ def _is_expected_head_probe(
       與唯讀搜尋（:func:`_is_read_only_rg`、:func:`_is_read_only_find`，canary run
       37343291869）可以出現在鏈中；`find` 分組用的 `(`／`)` 只在整條指令沒有未加引號、
       未跳脫的括號時才當字面值收下。
-    - 至少一段是印出 HEAD hash 的最小形狀（:func:`_git_args_print_head`：
-      `rev-parse [--verify] HEAD`、`log -1 --format=%H`、`show -s --format=%H`），可帶
-      `-C <bound worktree>`。
+    - 至少一段是印出 HEAD hash 的形狀（:func:`_git_args_print_head`：
+      `rev-parse [唯讀查詢旗標…] HEAD`、`log -1 --format=%H`、`show -s --format=%H`），可帶
+      `-C <bound worktree>` 與 `--no-pager`。`rev-parse` 的旗標限
+      :data:`_REV_PARSE_HEAD_QUERY_OPTIONS`（canary run 37375402971：
+      `git rev-parse --show-toplevel --git-dir --git-common-dir HEAD`）。
     """
 
     try:
@@ -4525,38 +4534,97 @@ def _has_unquoted_paren(script: str) -> bool:
     return False
 
 
-#: `--format`／`--pretty` 只印 commit hash 的寫法（#716）。
+#: `--format`／`--pretty` 只印 commit hash 的寫法（#716）。格式字串只收 `%H`（可帶 `format:`／
+#: `tformat:`）：夾帶字面文字或其他佔位符時，那一行就不再只是 git 給的 hash。
 _HEAD_FORMAT_RE = re.compile(r"--(?:format|pretty)=(?:t?format:)?%H")
+#: 指向 HEAD 本身那個 commit 的位置參數寫法（#716）：`HEAD^{commit}` 把 HEAD 剝到 commit、
+#: `@` 是 HEAD 的別名，印出的都是同一個 hash。`HEAD~N`、ref 名稱等其他 revision 一律不算。
+_HEAD_REVISIONS = frozenset({"HEAD", "HEAD^{commit}", "@"})
+#: `git rev-parse <HEAD>` 證明 HEAD 時允許同時出現的唯讀查詢選項（#716，canary run 37375402971：
+#: codex 寫成 `git rev-parse --show-toplevel --git-dir --git-common-dir HEAD`）。每個選項只在
+#: 自己那一行印出路徑、`true`／`false` 或物件格式，不改變 HEAD 那一行（這些值也不可能是
+#: 40 位 hex）。採允許清單：`--short`、`--abbrev-ref`、`--symbolic`、`--symbolic-full-name`
+#: （以 ref 名稱取代 hash）、`--sq`／`--sq-quote`、`--not`（印 `^<hash>`）、`--local-env-vars`、
+#: `--git-path`、`--default`、`--all`（印出所有 ref 的 hash）、`--prefix`、`--`，以及任何沒列出的
+#: 選項都讓這段不算 proof。
+_REV_PARSE_HEAD_QUERY_OPTIONS = frozenset(
+    {
+        "--verify",
+        "--show-toplevel",
+        "--git-dir",
+        "--absolute-git-dir",
+        "--git-common-dir",
+        "--is-inside-work-tree",
+        "--is-inside-git-dir",
+        "--is-bare-repository",
+        "--is-shallow-repository",
+        "--show-prefix",
+        "--show-cdup",
+        "--show-object-format",
+        "--show-superproject-working-tree",
+        "--path-format=absolute",
+        "--path-format=relative",
+    }
+)
+#: 只在 `--verify` 模式下有意義的安靜旗標；沒有 `--verify` 時不收。
+_REV_PARSE_VERIFY_QUIET_OPTIONS = frozenset({"-q", "--quiet"})
+#: `git log` 限一筆的寫法；`-n 1`／`--max-count 1` 先併成單一 token 再比對。
+_LOG_SINGLE_COMMIT_LIMITS = frozenset({"-1", "-n1", "--max-count=1"})
 
 
 def _git_args_print_head(args: Sequence[str]) -> bool:
     """這段唯讀 git 是否就是「印出 HEAD 的 commit hash」（#716）。
 
-    `rev-parse HEAD` 之外，模型也常用 `rev-parse --verify HEAD`、`log -1 --format=%H`、
-    `show -s --format=%H` 取 HEAD——它們印出的是同一個值、同樣出自 git 本身。
-    只收這幾種最小形狀：其他旗標（尤其會改變印出內容的）一律不算。
+    `rev-parse HEAD` 之外，模型也常用 `rev-parse --verify HEAD`、
+    `rev-parse --show-toplevel --git-dir … HEAD`（canary run 37375402971）、`log -1 --format=%H`、
+    `show -s --format=%H` 取 HEAD——它們印出的是同一個值、同樣出自 git 本身。位置參數必須恰好
+    一個且屬 :data:`_HEAD_REVISIONS`；`rev-parse` 的選項限 :data:`_REV_PARSE_HEAD_QUERY_OPTIONS`
+    （`-q`／`--quiet` 只能搭配 `--verify`），`log`／`show` 的格式只收 `%H`。其他旗標（尤其會
+    改變 HEAD 那一行印法、或印出 HEAD 以外的值的）一律不算。
     """
 
     if not args:
         return False
     subcommand, rest = args[0], list(args[1:])
+    revisions = [arg for arg in rest if arg in _HEAD_REVISIONS]
     if subcommand == "rev-parse":
-        return rest.count("HEAD") == 1 and set(rest) <= {"HEAD", "--verify", "-q", "--quiet"}
+        allowed = _REV_PARSE_HEAD_QUERY_OPTIONS
+        if "--verify" in rest:
+            allowed = allowed | _REV_PARSE_VERIFY_QUIET_OPTIONS
+        options = {arg for arg in rest if arg not in _HEAD_REVISIONS}
+        return len(revisions) == 1 and options <= allowed
     if subcommand in {"log", "show"}:
-        formats = [arg for arg in rest if _HEAD_FORMAT_RE.fullmatch(arg)]
-        others = [arg for arg in rest if arg not in formats]
-        allowed = {"HEAD", "--no-patch", "-s", "--no-color"}
         if subcommand == "log":
-            allowed |= {"-1", "-n1", "--max-count=1"}
+            rest = _join_single_commit_limit(rest)
+        formats = [arg for arg in rest if _HEAD_FORMAT_RE.fullmatch(arg)]
+        others = [arg for arg in rest if arg not in formats and arg not in _HEAD_REVISIONS]
+        allowed = {"--no-patch", "-s", "--no-color"}
+        if subcommand == "log":
+            allowed |= _LOG_SINGLE_COMMIT_LIMITS
         # log 要限一筆、show 要關掉 patch：兩者都只印那一個 hash。
-        limiter = {"-1", "-n1", "--max-count=1"} if subcommand == "log" else {"-s", "--no-patch"}
+        limiter = _LOG_SINGLE_COMMIT_LIMITS if subcommand == "log" else {"-s", "--no-patch"}
         return (
             len(formats) == 1
-            and rest.count("HEAD") <= 1
+            and len(revisions) <= 1
             and set(others) <= allowed
             and bool(set(others) & limiter)
         )
     return False
+
+
+def _join_single_commit_limit(args: Sequence[str]) -> list[str]:
+    """把 `git log` 分開寫的 `-n 1`／`--max-count 1` 併成 `-n1`（#716）；其他數值原樣留下，交給允許清單拒絕。"""
+
+    joined: list[str] = []
+    index = 0
+    while index < len(args):
+        if args[index] in {"-n", "--max-count"} and args[index + 1 : index + 2] == ["1"]:
+            joined.append("-n1")
+            index += 2
+            continue
+        joined.append(args[index])
+        index += 1
+    return joined
 
 
 def _codex_agent_loop_thread_id(
