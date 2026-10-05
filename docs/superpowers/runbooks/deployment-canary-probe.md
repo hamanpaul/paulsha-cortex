@@ -89,8 +89,10 @@ gh repo edit "$template_repo" --template
    ```sh
    gh issue create --repo "$probe_repo" \
      --title "deployment canary: blank labels become unnamed" \
-     --body "normalize_label(\"   \") 回傳 \"unnamed\"；補回歸測試、README、changelog.d/deployment-canary-probe.md 與 CHANGELOG [Unreleased]；勾完 todo 與 OpenSpec tasks；通過 .project-policy.yml 的 preflight。"
+     --body "normalize_label(\"   \") 回傳 \"unnamed\"；補回歸測試、README、changelog.d/deployment-canary-probe.md 與 CHANGELOG [Unreleased]；勾完 todo 與 OpenSpec tasks（交付時 Manager 會把 change archive 到 openspec/changes/archive/、active 的 tasks.md 因此移除，屬預期）；通過 .project-policy.yml 的 preflight。"
    ```
+
+   issue 內文要說明 archive 會移除 active 的 `tasks.md`：Copilot 讀到「勾完 OpenSpec tasks」卻看到 PR 刪掉 `tasks.md`，曾把 Manager 的 archive 誤判成 finding（#716，canary run 37261846387）；builder 依規定不能動 Manager 的 archive，修正回合修不了這種 finding。
 
 4. 在該 repo 的 `main` 把 issue link 加進 `.cortex/work-items.yaml`（ref 必須是
    `OWNER/REPO#N`，大小寫與步驟 5 的 `CORTEX_RC_PROBE_REPOSITORY` 完全一致），commit 並

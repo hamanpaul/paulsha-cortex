@@ -1,0 +1,1 @@
+- #716 deployment canary probe：runbook §3 的 probe issue 內文說明交付時 Manager 會 archive OpenSpec change、移除 active `tasks.md`，避免 Copilot 把 archive 誤判成「tasks 未勾」的 finding（canary run 37261846387）。
