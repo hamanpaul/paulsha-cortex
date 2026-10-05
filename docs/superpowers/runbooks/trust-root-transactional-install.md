@@ -16,6 +16,37 @@ refs:
 這是目前唯一可執行的 production 安裝／升級 runbook。舊的 Phase 2b 文件只保留歷史
 診斷與決策脈絡，不得再照其中的 `rm`／`cp`／`chown`／`mv` 手工重播部署狀態。
 
+## 一般升級：`cortex upgrade`
+
+主機已有 installer 寫入、狀態為 applied＋qualified 的 receipt 時，升級只需要一個 root 指令：
+
+    sudo /opt/cortex/venv/bin/cortex upgrade <版本>
+
+工具依序執行下列 §1–§5：以 GitHub Releases REST metadata 取得 annotated tag 的 commit target
+與三個 asset digest，驗過 qualification manifest、archive topology 與 bundle 每一個檔案後，
+在新的 `/var/lib/cortex-installer/<版本>/attempt-*` 目錄封存 candidate CLI；以非 root 身分產生
+plan 並自行綁定 plan sha、發布 durable plan；取得 maintenance lease、記下並停止服務；以
+`--prior-receipt` apply；沿用 prior receipt 已記錄的 credentials（`credentials inherit`，
+不讀憑證內容）；activate、verify，最後核對 loaded runtime 與新 receipt 一致。生效中的
+receipt 由 receipt chain 判定，不看檔名或時間。結果寫在
+`/var/lib/cortex-installer/<版本>/upgrade-report.json`，終端機印出摘要（`--json` 改印完整報告）。
+
+- 只升不降：目標版本必須高於生效中的 receipt；降版改用 installer `rollback` 或下列手動流程。
+- 有在飛 job 時預設直接拒絕；`--wait-idle <秒>` 會等到 idle 或逾時。
+- activate 之前的失敗（ingress、plan、apply、credential handoff）會自動 rollback 並恢復原本
+  active 的服務。activate 之後的失敗若 rollback 回報 `restore_safe=false`，服務維持停止、
+  snapshot 保留，報告列出保留的 unknown state／drift；處理後執行
+  `sudo /opt/cortex/venv/bin/cortex upgrade --recover`，或依 §6 由 operator 裁決。
+- 新 plan 若要求 prior receipt 沒有記錄的 credential（例如新增 provider），升級會在 activate
+  前停止並回到 prior；依 §4 匯入後改走下列手動流程。
+- `cortex upgrade --status` 唯讀顯示生效中的 receipt、上一次升級結果與 loaded runtime 是否一致。
+- 升級中途 shell 或主機被 SIGKILL、OOM、斷電打斷時，執行
+  `sudo /opt/cortex/venv/bin/cortex upgrade --recover`：它從 maintenance snapshot 取得 plan sha、
+  核對 durable plan，再走 §6 的 recovery。
+
+下列 §1–§6 是首次安裝與手動操作參考，也是 `cortex upgrade` 每一步的逐步說明；首次安裝與
+legacy adoption（`trust-root-legacy-adoption.md`）仍照這些步驟操作。
+
 ## 邊界
 
 - GitHub release 會發佈 immutable wheel、同一個 RC 驗過的完整

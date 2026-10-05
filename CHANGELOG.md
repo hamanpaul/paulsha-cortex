@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#1263 一鍵升級 `cortex upgrade <版本>`**：root 一個指令完成 ingress → plan → apply → 憑證繼承 → activate → verify → loaded↔installed 核對，失敗自動回到前一版；新增 `--recover`／`--status`、`credentials inherit`、`effective_receipt` 與 RC 升級演練；`--release-source`／`--allow-same-version`／`--prior-receipt` 僅供 qualification（`PSC_UPGRADE_QUALIFICATION=1`）使用、無 `--repository` 參數（官方來源固定 `hamanpaul/paulsha-cortex`）（見 `changelog.d/one-command-upgrade.md`）（#1263）。
 - **#1261 workflow lane 的 builder 工作區改走 owner-bound reclaim**：會寫檔的 build 卡派工時把 owner identity／attempt 寫進 marker 與 job 記錄，三 UID 下經 builder unit 回收；唯讀卡維持 Manager 直接回收，回收前以 job 記錄核對 marker（#1261）。
 - **#1259 archive 與交付 PR 之後的 retry-build 派得出 Builder**：Builder admission 另外接受兩種 Manager 自產漂移（Manager archive 造成的 OpenSpec archived；retry-build 後 build phase 的交付 PR，須同時具備 receipt、delivery journal 推送證據與唯一 open PR）。retry-build admission 與 Builder 派工入口共用判定，派不出 Builder 時在 reset 前拒絕；新增 `cortex-retry-build-receipt/v1`（#1259）。
 - **#716 probe issue 說明 archive**：避免 Copilot 把 Manager 的 archive 誤判成 finding（#716）。

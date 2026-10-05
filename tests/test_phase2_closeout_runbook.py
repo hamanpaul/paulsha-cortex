@@ -248,3 +248,28 @@ def test_generated_units_link_only_to_current_install_runbook() -> None:
     for content in units:
         assert f"Documentation=file://{CURRENT}" in content
         assert LEGACY not in content
+
+
+def test_current_runbook_opens_with_the_one_command_upgrade() -> None:
+    current = (ROOT / CURRENT).read_text(encoding="utf-8")
+
+    upgrade = current.index("## 一般升級")
+    boundary = current.index("## 邊界")
+    assert upgrade < boundary < current.index("## 1. 封存唯一 candidate CLI")
+    section = current[upgrade:boundary]
+    assert "sudo /opt/cortex/venv/bin/cortex upgrade <版本>" in section
+    assert "cortex upgrade --recover" in section
+    assert "cortex upgrade --status" in section
+    assert "--wait-idle" in section
+    assert "/var/lib/cortex-installer/<版本>/upgrade-report.json" in section
+    assert "首次安裝與手動操作參考" in section
+
+
+def test_legacy_adoption_runbook_hands_later_upgrades_to_cortex_upgrade() -> None:
+    legacy = (
+        ROOT / "docs/superpowers/runbooks/trust-root-legacy-adoption.md"
+    ).read_text(encoding="utf-8")
+
+    tail = legacy.rstrip().rsplit("\n\n", 1)[1]
+    assert "cortex upgrade" in tail
+    assert "legacy_adoption" in tail

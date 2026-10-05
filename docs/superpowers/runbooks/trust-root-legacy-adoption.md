@@ -175,3 +175,7 @@ quarantine 內的 legacy 物件保留到**receipt chain 驗證出的後繼 appli
 - Manager 主機的 git 必須 ≥ 2.43（`--attr-source` 搭配 merge-tree，#1142）；此限制屬 delivery，與本流程無關，但升級後會影響 dogfood 的 main-sync probe。
 - credential 目錄是先建立、後寫入紀錄；兩者之間若 crash，該目錄不會被記錄，rollback 會停在 blocked 而不是誤刪。
 - rollback 刪除 staging 內已驗證的樹時，若有 writer 在搬進 staging 之前就持有樹內的 descriptor，仍可能在逐條 unlink 的空檔寫入；manifest 檢查把風險縮小到單一條目，但未完全消除。
+
+adoption 完成（verify 通過、receipt 為 applied＋qualified）後，之後的升級一律使用
+`sudo /opt/cortex/venv/bin/cortex upgrade <版本>`（見 `trust-root-transactional-install.md`
+開頭的「一般升級」）；它讀 host overlay 時會略過 `legacy_adoption` 區塊，overlay digest 不變。
