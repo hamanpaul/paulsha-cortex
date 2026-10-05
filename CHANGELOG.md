@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 probe issue 說明 archive**：避免 Copilot 把 Manager 的 archive 誤判成 finding（#716）。
 - **#716 修正回合帶上停止點內容**：retry-build 的裁決理由附上 verify／review 指出的問題（#716）。
 - **#716 closeout 回收診斷**：worktree 未回收時印出 Manager 的回收事件（#716）。
 - **#716 HEAD proof 接受唯讀檔案檢視**：探針鏈可含 `cat`／`sed -n` 等讀 worktree 內檔案的段（#716）。
