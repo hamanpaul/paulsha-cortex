@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#716 post-archive reviewer 不再補入過期的 active OpenSpec 檔**：archive 之後 reviewer 的 OpenSpec planning authority 輸入改讀候選自己的 archive 副本（tasks.md 只容忍 checkbox 差異，entry 不唯一／symlink／缺檔 fail-closed），不再從來源樹 seed claim 當下未勾選的 active 檔（#716）。
 - **#716 closeout gate ref 診斷**：gate ref 失敗時分開報出雜湊、路徑、inode 與 kind（#716）。
 - **#716 closeout 接受已回收的 harvest 證據**：bundle 隨 owner-bound reclaim 移除時，以 source repo 中的 subject_head 證明 harvest 落地（#716）。
 - **#1261 workflow lane 的 builder 工作區改走 owner-bound reclaim**：會寫檔的 build 卡派工時把 owner identity／attempt 寫進 marker 與 job 記錄，三 UID 下經 builder unit 回收；唯讀卡維持 Manager 直接回收，回收前以 job 記錄核對 marker（#1261）。
