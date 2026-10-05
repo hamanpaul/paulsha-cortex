@@ -35,5 +35,6 @@ from .core import (
     verify_receipt,
 )
 from .backend import LocalInstallBackend, SystemInstallBackend
+from .receipt_chain import effective_receipt, receipt_directory
 
 __all__ = [name for name in globals() if not name.startswith("_")]
