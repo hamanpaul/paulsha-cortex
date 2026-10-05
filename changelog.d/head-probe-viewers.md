@@ -1,0 +1,1 @@
+- #716 canary HEAD proof：探針鏈中接受唯讀檔案檢視（`cat`／`head`／`tail`／`ls`／`wc`、`sed -n '<N,M>p'`，路徑限 bound worktree 內、不含 `..`）；字面 SHA 限制改為只套用在 git 段。實機 codex 會在同一條指令裡順手讀 plan（canary run 37247943097）。
