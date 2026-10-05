@@ -1832,15 +1832,14 @@ def _expected_acls(step: Mapping[str, object]) -> list[dict[str, object]]:
     )
 
 
+JOB_ACCOUNT_NAMES = ("cortex-builder", "cortex-reviewer-planner", "cortex-gate")
+
+
 def _in_flight_process_count(accounts: Sequence[Mapping[str, object]]) -> int:
     job_uids = {
         int(row["uid"])
         for row in accounts
-        if row.get("name") in {
-            "cortex-builder",
-            "cortex-reviewer-planner",
-            "cortex-gate",
-        }
+        if row.get("name") in JOB_ACCOUNT_NAMES
         and isinstance(row.get("uid"), int)
     }
     count = 0
