@@ -357,3 +357,284 @@ def preflight(options: UpgradeOptions) -> Preflight:
     assert_installer_idle()
     wait_until_idle(prior.plan, wait_seconds=options.wait_idle)
     return Preflight(prior=prior, target=target)
+
+
+# --- plan (spec §4 step 3) -----------------------------------------------------
+
+_HOST_OVERLAY_NAME = "host-overlay.yaml"
+_PLAN_ENV = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"}
+_MAX_PLAN_BYTES = 64 * 1024 * 1024
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+_CREATE_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+@dataclass(frozen=True)
+class BoundPlan:
+    plan: dict[str, object]
+    sha256: str
+    durable_path: Path
+    receipt_path: Path
+    overlay_sha256: str | None
+
+
+def _read_regular_bytes(path: Path, *, limit: int = _MAX_PLAN_BYTES) -> bytes:
+    descriptor = os.open(path, _READ_FLAGS)
+    try:
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise UpgradeError(f"expected a single-link regular file: {path}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise UpgradeError(f"file is too large: {path}")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _write_new_file(path: Path, payload: bytes, *, mode: int) -> None:
+    descriptor = os.open(path, _CREATE_FLAGS, 0o600)
+    try:
+        os.fchmod(descriptor, mode)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def read_host_overlay(installer_root: Path) -> dict[str, object] | None:
+    """The persisted host overlay minus ``legacy_adoption`` (its digest is unchanged)."""
+
+    path = installer_root / _HOST_OVERLAY_NAME
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != _OWNER_UID
+        or stat.S_IMODE(observed.st_mode) & 0o022
+    ):
+        raise UpgradeError(
+            f"host overlay must be a regular file owned by uid {_OWNER_UID} "
+            f"without group/other write: {path}"
+        )
+    overlay = install_cli._load_mapping(path, label="host overlay")
+    stripped = {key: value for key, value in overlay.items() if key != "legacy_adoption"}
+    return validate_host_overlay(stripped) or None
+
+
+def plan_identity(overlay: Mapping[str, object] | None) -> tuple[int, int]:
+    """The overlay's operator account, or ``nobody``; never root."""
+
+    name = overlay.get("operator_account") if overlay is not None else None
+    if isinstance(name, str) and name:
+        try:
+            account = _lookup_account(name)
+        except KeyError as exc:
+            raise UpgradeError(
+                f"host overlay operator_account does not exist on this host: {name}"
+            ) from exc
+        if account.pw_uid != 0:
+            return account.pw_uid, account.pw_gid
+    try:
+        fallback = _lookup_account("nobody")
+    except KeyError as exc:
+        raise UpgradeError("no unprivileged account is available to produce the plan") from exc
+    if fallback.pw_uid == 0:
+        raise UpgradeError("the fallback plan account resolves to root")
+    return fallback.pw_uid, fallback.pw_gid
+
+
+def publish_durable_plan(payload: bytes, expected_sha256: str, *, plans_root: Path) -> Path:
+    """Runbook §2 durable publication: never overwrite, reuse only identical bytes."""
+
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise UpgradeError("reviewed plan changed before durable publication")
+    try:
+        os.mkdir(plans_root, 0o700)
+    except FileExistsError:
+        pass
+    root_stat = plans_root.lstat()
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid != _OWNER_UID
+        or stat.S_IMODE(root_stat.st_mode) != 0o700
+    ):
+        raise UpgradeError("durable plan root is unsafe")
+    target_name = f"{expected_sha256}.json"
+    staging_name = f".{target_name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    root_fd = os.open(plans_root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    lock_fd: int | None = None
+    staging_fd: int | None = None
+    try:
+        lock_fd = os.open(
+            ".publish.lock",
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=root_fd,
+        )
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        lock_stat = os.fstat(lock_fd)
+        if (
+            not stat.S_ISREG(lock_stat.st_mode)
+            or lock_stat.st_uid != _OWNER_UID
+            or lock_stat.st_nlink != 1
+            or stat.S_IMODE(lock_stat.st_mode) != 0o600
+        ):
+            raise UpgradeError("durable plan publication lock is unsafe")
+        try:
+            existing_fd = os.open(target_name, _READ_FLAGS, dir_fd=root_fd)
+        except FileNotFoundError:
+            existing_fd = None
+        if existing_fd is not None:
+            try:
+                observed = os.fstat(existing_fd)
+                existing = b""
+                while chunk := os.read(existing_fd, 1024 * 1024):
+                    existing += chunk
+            finally:
+                os.close(existing_fd)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != _OWNER_UID
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != 0o600
+                or existing != payload
+            ):
+                raise UpgradeError("existing durable plan does not match reviewed bytes")
+        else:
+            staging_fd = os.open(staging_name, _CREATE_FLAGS, 0o600, dir_fd=root_fd)
+            os.fchmod(staging_fd, 0o600)
+            _write_all(staging_fd, payload)
+            os.fsync(staging_fd)
+            os.close(staging_fd)
+            staging_fd = None
+            _rename_noreplace_at(root_fd, staging_name, target_name)
+            os.fsync(root_fd)
+    finally:
+        if staging_fd is not None:
+            os.close(staging_fd)
+        try:
+            os.unlink(staging_name, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+        if lock_fd is not None:
+            os.close(lock_fd)
+        os.close(root_fd)
+    return plans_root / target_name
+
+
+def _bind_plan_to_release(
+    plan: Mapping[str, object],
+    *,
+    sealed: SealedCandidate,
+    prior: PriorReceipt,
+    overlay_sha: str | None,
+) -> None:
+    candidate = plan.get("candidate")
+    wheel = candidate.get("wheel") if isinstance(candidate, Mapping) else None
+    if not isinstance(candidate, Mapping) or candidate.get("candidate_sha") != sealed.metadata.commit:
+        raise UpgradeError("plan candidate is not the release tag target")
+    if not isinstance(wheel, Mapping) or wheel.get("sha256") != sealed.metadata.wheel.sha256:
+        raise UpgradeError("plan candidate wheel is not the release wheel")
+    if format_version(wheel_version(wheel.get("path"))) != sealed.metadata.version:
+        raise UpgradeError("plan candidate wheel version is not the requested version")
+    if plan.get("host_overlay_sha256") != overlay_sha:
+        raise UpgradeError("plan did not bind the host overlay it was given")
+    if "legacy_adoption" in plan:
+        raise UpgradeError("an upgrade plan must not carry a legacy_adoption block")
+    validate_prior_receipt_handoff(plan, prior.receipt)
+
+
+def produce_plan(
+    sealed: SealedCandidate, prior: PriorReceipt, *, options: UpgradeOptions
+) -> BoundPlan:
+    """Runbook §2 without the human: plan unprivileged, bind the sha, publish durably."""
+
+    installer_root = install_cli._TRUST_ROOT_MAINTENANCE_ROOT
+    overlay = read_host_overlay(installer_root)
+    record = host_overlay_record(overlay) if overlay is not None else None
+    overlay_sha = str(record["sha256"]) if record is not None else None
+    # `allow_same_version` relaxes this equality check only for the RC
+    # qualification drill (gated by PSC_UPGRADE_QUALIFICATION=1 in
+    # `options_from_args`), where rerunning the same version against an
+    # already-matching overlay is expected; production upgrades never set it.
+    if overlay_sha != prior.plan.get("host_overlay_sha256") and not options.allow_same_version:
+        raise UpgradeError(
+            "the host overlay differs from the one the current receipt was planned with; "
+            "overlay changes go through trust-root-transactional-install.md"
+        )
+    uid, gid = plan_identity(overlay)
+    work = sealed.attempt_dir / "plan"
+    os.mkdir(work, 0o700)
+    _chown(work, uid, gid)
+    home = work / "home"
+    os.mkdir(home, 0o700)
+    _chown(home, uid, gid)
+    overlay_args: tuple[str, ...] = ()
+    if overlay is not None:
+        overlay_path = sealed.attempt_dir / "host-overlay.json"
+        _write_new_file(
+            overlay_path,
+            (json.dumps(overlay, sort_keys=True) + "\n").encode("utf-8"),
+            mode=0o644,
+        )
+        overlay_args = ("--host-overlay", str(overlay_path))
+    output = work / "install-plan.json"
+    sealed.assert_unchanged()
+    result = _run(
+        (
+            str(sealed.cli),
+            "install",
+            "trust-root",
+            "plan",
+            "--config",
+            str(sealed.install_config),
+            "--bundle",
+            str(sealed.bundle),
+            *overlay_args,
+            "--output",
+            str(output),
+        ),
+        check=True,
+        env={**_PLAN_ENV, "HOME": str(home), "PATH": f"{sealed.venv}/bin:/usr/bin:/bin"},
+        uid=uid,
+        gid=gid,
+    )
+    try:
+        reported = json.loads(result.stdout)["plan_sha256"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise UpgradeError("candidate plan did not report its plan_sha256") from exc
+    payload = _read_regular_bytes(output)
+    observed = hashlib.sha256(payload).hexdigest()
+    if reported != observed:
+        raise UpgradeError("candidate plan sha256 does not match the plan file")
+    plan = json.loads(payload.decode("utf-8"))
+    if not isinstance(plan, dict) or plan_sha256(plan) != observed:
+        raise UpgradeError("plan file is not the canonical plan document")
+    _bind_plan_to_release(plan, sealed=sealed, prior=prior, overlay_sha=overlay_sha)
+    canonical = Path(str(plan.get("receipt_path")))
+    if not canonical.is_absolute() or ".." in canonical.parts:
+        raise UpgradeError("plan receipt_path is not absolute")
+    durable = publish_durable_plan(payload, observed, plans_root=installer_root / "plans")
+    receipt_path = canonical.with_name(f"{canonical.stem}.run-{secrets.token_hex(16)}.json")
+    return BoundPlan(
+        plan=plan,
+        sha256=observed,
+        durable_path=durable,
+        receipt_path=receipt_path,
+        overlay_sha256=overlay_sha,
+    )

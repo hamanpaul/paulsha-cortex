@@ -1,7 +1,12 @@
 """Shared fakes for `cortex upgrade` tests: no root, no network, no systemd."""
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install import upgrade
@@ -9,6 +14,13 @@ from paulsha_cortex.trust_root.install.core import (
     InstallReceipt,
     new_install_receipt,
     plan_sha256,
+)
+from paulsha_cortex.trust_root.install.release_ingress import (
+    ReleaseAsset,
+    ReleaseMetadata,
+    SealedCandidate,
+    asset_names,
+    tree_sha256,
 )
 from paulsha_cortex.trust_root.install.release_ingress import parse_version
 
@@ -107,3 +119,75 @@ def make_prior(
         receipt=InstallReceipt(document, path=path),
         version=parse_version(version),
     )
+
+
+def make_sealed(
+    tmp_path: Path,
+    *,
+    version: str = "0.1.13",
+    commit: str = NEW_COMMIT,
+    wheel_sha256: str = NEW_WHEEL,
+) -> SealedCandidate:
+    attempt = tmp_path / "installer" / version / "attempt-test"
+    venv = attempt / "venv"
+    (venv / "bin").mkdir(parents=True)
+    cli = venv / "bin" / "cortex"
+    cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    cli.chmod(0o755)
+    input_root = attempt / "input"
+    input_root.mkdir()
+    (input_root / "bundle.json").write_text("{}\n", encoding="utf-8")
+    (input_root / "install-config.yaml").write_text("schema_version: 1\n", encoding="utf-8")
+    wheel_name, input_name, qualification_name = asset_names(version)
+
+    def asset(name: str, digest: str = "0" * 64) -> ReleaseAsset:
+        return ReleaseAsset(
+            name,
+            digest,
+            1,
+            f"https://github.com/hamanpaul/paulsha-cortex/releases/download/v{version}/{name}",
+        )
+
+    metadata = ReleaseMetadata(
+        version=version,
+        tag=f"v{version}",
+        commit=commit,
+        wheel=asset(wheel_name, wheel_sha256),
+        install_input=asset(input_name),
+        qualification=asset(qualification_name),
+    )
+    return SealedCandidate(
+        metadata=metadata,
+        attempt_dir=attempt,
+        input_root=input_root,
+        bundle=input_root / "bundle.json",
+        install_config=input_root / "install-config.yaml",
+        venv=venv,
+        cli=cli,
+        tree_sha256=tree_sha256(venv, owner_uid=os.getuid()),
+        owner_uid=os.getuid(),
+    )
+
+
+class FakePlanCli:
+    """Stands in for `<sealed>/bin/cortex install trust-root plan ...` run unprivileged."""
+
+    def __init__(self, plan: dict[str, object], *, reported_sha: str | None = None) -> None:
+        self.plan = plan
+        self.reported_sha = reported_sha
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, argv, *, check=False, env=None, uid=None, gid=None, **_kwargs):
+        argv = tuple(argv)
+        self.calls.append({"argv": argv, "env": dict(env or {}), "uid": uid, "gid": gid})
+        output = Path(argv[argv.index("--output") + 1])
+        payload = install_core.canonical_plan_bytes(self.plan)
+        output.write_bytes(payload)
+        sha = self.reported_sha or hashlib.sha256(payload).hexdigest()
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps({"output": str(output), "plan_sha256": sha}), ""
+        )
+
+
+def account(uid: int, gid: int) -> SimpleNamespace:
+    return SimpleNamespace(pw_uid=uid, pw_gid=gid)
