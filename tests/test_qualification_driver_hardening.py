@@ -4797,6 +4797,148 @@ def test_codex_agent_loop_read_only_search_without_head_is_not_a_proof() -> None
             )
 
 
+#: canary run 37375402971 唯一一筆 command_execution 的指令形狀：一條 `git rev-parse` 帶多個
+#: 唯讀查詢旗標、再加位置參數 `HEAD`（driver 診斷把 plan 檔名遮成 `<redacted>.md`）。
+_CANARY_37375402971_REV_PARSE_PROBE = (
+    '/usr/bin/bash -lc "git rev-parse --show-toplevel --git-dir --git-common-dir HEAD'
+    " && git worktree list --porcelain && git status --short && sed -n '1,120p'"
+    ' docs/superpowers/plans/2026-10-05-deployment-canary-probe.md"'
+)
+_CANARY_37375402971_REV_PARSE_OUTPUT = (
+    f"{_HEAD_PROBE_WORKTREE}\n/var/lib/cortex/repos/probe/.git/worktrees/build-job\n"
+    "/var/lib/cortex/repos/probe/.git\n"
+    + "a" * 40
+    + f"\nworktree {_HEAD_PROBE_WORKTREE}\nHEAD "
+    + "a" * 40
+    + "\ndetached\n\n?? docs/superpowers/plans/\n# Deployment canary probe plan\n"
+)
+
+
+def test_codex_agent_loop_accepts_the_canary_37375402971_multi_flag_rev_parse_probe() -> None:
+    """#716（canary run 37375402971）：codex 用一條 `git rev-parse` 一次問 toplevel／git-dir／
+    common-dir 再加 `HEAD`；整條 exit 0、bound HEAD 單獨成行，先前只收 `rev-parse [--verify] HEAD`
+    而判為 `accepted=False`，結案找不到 HEAD proof。"""
+    driver = _load_driver()
+
+    assert driver._is_expected_head_probe(
+        _CANARY_37375402971_REV_PARSE_PROBE, expected_worktree=_HEAD_PROBE_WORKTREE
+    )
+    observation = driver._codex_agent_loop_observation(
+        (
+            (
+                "build-job",
+                _head_probe_log(
+                    _CANARY_37375402971_REV_PARSE_PROBE, _CANARY_37375402971_REV_PARSE_OUTPUT
+                ),
+            ),
+        ),
+        expected_head="a" * 40,
+        expected_worktree=_HEAD_PROBE_WORKTREE,
+    )
+
+    assert observation["successful_command_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 唯讀查詢旗標只多印路徑／布林／物件格式，各占一行，不改變 HEAD 那一行。
+        "/bin/bash -lc 'git rev-parse --show-toplevel HEAD'",
+        "/bin/bash -lc 'git rev-parse --absolute-git-dir --is-inside-work-tree"
+        " --is-bare-repository --show-prefix --show-cdup HEAD'",
+        "/bin/bash -lc 'git rev-parse --git-dir --is-inside-git-dir --is-shallow-repository"
+        " --show-object-format --show-superproject-working-tree @'",
+        f"/bin/bash -lc 'git -C {_HEAD_PROBE_WORKTREE} rev-parse --path-format=absolute"
+        " --git-common-dir HEAD'",
+        # HEAD 的等價寫法：`HEAD^{commit}`、`@`；`-q`／`--quiet` 搭配 `--verify`。
+        "/bin/bash -lc 'git rev-parse HEAD^{commit}'",
+        "/bin/bash -lc 'git rev-parse --verify HEAD^{commit}'",
+        "/bin/bash -lc 'git rev-parse @'",
+        "/bin/bash -lc 'git rev-parse --verify --quiet HEAD'",
+        "/bin/bash -lc 'git rev-parse -q --verify --show-toplevel HEAD'",
+        # log／show 的分開寫法 `-n 1`、`--max-count 1`，以及 `--no-pager`。
+        "/bin/bash -lc 'git log -n 1 --format=%H'",
+        "/bin/bash -lc 'git log --max-count 1 --pretty=format:%H HEAD'",
+        "/bin/bash -lc 'git show -s --format=%H HEAD^{commit}'",
+        "/bin/bash -lc 'git --no-pager log -1 --format=%H'",
+        f"/bin/bash -lc 'git --no-pager -C {_HEAD_PROBE_WORKTREE} show --no-patch"
+        " --format=%H @'",
+    ],
+)
+def test_codex_agent_loop_accepts_read_only_head_query_variants(command: str) -> None:
+    """#716：codex 每輪換一種寫法取 HEAD；只要選項全在唯讀允許清單內、位置參數就是 HEAD，
+    印出的那一行就是 git 本身給的 HEAD hash（canary run 37375402971）。"""
+    driver = _load_driver()
+
+    assert driver._is_expected_head_probe(command, expected_worktree=_HEAD_PROBE_WORKTREE)
+    observation = driver._codex_agent_loop_observation(
+        (("build-job", _head_probe_log(command, "a" * 40 + "\n")),),
+        expected_head="a" * 40,
+        expected_worktree=_HEAD_PROBE_WORKTREE,
+    )
+    assert observation["successful_command_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # 改變 HEAD 那一行印法的選項：縮寫、ref 名稱、加引號、取反、印路徑。
+        "/bin/bash -lc 'git rev-parse --short=12 HEAD'",
+        "/bin/bash -lc 'git rev-parse --show-toplevel --short HEAD'",
+        "/bin/bash -lc 'git rev-parse --git-dir --abbrev-ref HEAD'",
+        "/bin/bash -lc 'git rev-parse --symbolic HEAD'",
+        "/bin/bash -lc 'git rev-parse --show-toplevel --symbolic-full-name HEAD'",
+        "/bin/bash -lc 'git rev-parse --sq HEAD'",
+        "/bin/bash -lc 'git rev-parse --sq-quote HEAD'",
+        "/bin/bash -lc 'git rev-parse --local-env-vars HEAD'",
+        "/bin/bash -lc 'git rev-parse --not HEAD'",
+        "/bin/bash -lc 'git rev-parse --git-path HEAD'",
+        # HEAD 以外的值也會印出來：`--default`、`--all`、`--prefix`、`--` 之後的字詞。
+        "/bin/bash -lc 'git rev-parse --default HEAD'",
+        "/bin/bash -lc 'git rev-parse --all HEAD'",
+        "/bin/bash -lc 'git rev-parse --prefix sub HEAD'",
+        "/bin/bash -lc 'git rev-parse HEAD --'",
+        "/bin/bash -lc 'git rev-parse --show-toplevel HEAD -- README.md'",
+        # `-q`／`--quiet` 只在 `--verify` 下有意義。
+        "/bin/bash -lc 'git rev-parse -q HEAD'",
+        "/bin/bash -lc 'git rev-parse --quiet --show-toplevel HEAD'",
+        # 沒有 HEAD、HEAD 以外的 revision、重複的位置參數。
+        "/bin/bash -lc 'git rev-parse --show-toplevel --git-dir'",
+        "/bin/bash -lc 'git rev-parse --show-toplevel main'",
+        "/bin/bash -lc 'git rev-parse --verify HEAD~1'",
+        "/bin/bash -lc 'git rev-parse HEAD @'",
+        # log／show 的格式只收 `%H`；字面文字、其他佔位符、多筆、別的 revision、寫檔都不算。
+        "/bin/bash -lc \"git log -1 --format='%H %s'\"",
+        "/bin/bash -lc 'git log -1 --format=%h'",
+        "/bin/bash -lc 'git log -1 --format=%H%n%P'",
+        "/bin/bash -lc 'git log -n 2 --format=%H'",
+        "/bin/bash -lc 'git log -n 1 --format=%H --all'",
+        "/bin/bash -lc 'git log -n'",
+        "/bin/bash -lc 'git show -s --format=%H main'",
+        "/bin/bash -lc 'git log -1 --format=%H --output=README.md'",
+        # `--no-pager` 以外的 git 全域選項、指向別處的 `-C` 照舊拒絕。
+        "/bin/bash -lc 'git --no-pager -c core.pager=cat rev-parse HEAD'",
+        "/bin/bash -lc 'git --paginate rev-parse HEAD'",
+        "/bin/bash -lc 'git --no-pager -C /tmp/other rev-parse HEAD'",
+        "/bin/bash -lc 'git --no-pager'",
+    ],
+)
+def test_codex_agent_loop_rejects_head_queries_that_reshape_or_replace_the_hash(
+    command: str,
+) -> None:
+    """#716：放寬 `rev-parse` 只限唯讀查詢旗標；會改寫 HEAD 那一行、印出 HEAD 以外的值、
+    或根本沒有 HEAD 的寫法都不是 proof，即使輸出剛好含 HEAD。"""
+    driver = _load_driver()
+
+    assert not driver._is_expected_head_probe(command, expected_worktree=_HEAD_PROBE_WORKTREE)
+    with pytest.raises(driver.QualificationFailure, match="no completed git HEAD proof"):
+        driver._codex_agent_loop_observation(
+            (("build-job", _head_probe_log(command, "a" * 40 + "\n")),),
+            expected_head="a" * 40,
+            expected_worktree=_HEAD_PROBE_WORKTREE,
+        )
+
+
 def test_dispatch_closeout_runs_source_repo_git_as_the_manager(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
