@@ -1922,6 +1922,44 @@ def _closing_reference_missing_response(
     }
 
 
+def _checks_pending_response(
+    *,
+    remote_gate: Any,
+    remote: Any,
+    head: str,
+) -> dict[str, Any] | None:
+    """#716：merge gate 只卡在「check 仍在跑」時回非終局等待，而非擲例外。
+
+    live canary run 37320144662：Copilot review 已送出且 review loop 判 passed，但
+    `copilot-pull-request-reviewer` check run 仍是 in_progress，gate 給出
+    `checks-not-terminal-green`；原本直接 raise，periodic tick 記成
+    `resume-workflow-failed` → needs_human。只有 gate 唯一理由是
+    `checks-not-terminal-green`、且每個非綠 check 都還是已知的非終局 status 時才等待；
+    completed 但非綠（真失敗）、未知 status、沒有任何 check、或併有其他 gate 理由，
+    一律回 None 讓呼叫端維持 fail-closed。此回應不寫 merge authorization、不動 ship
+    state、不吃 repair round；`_delivery_adapter_status` 將其映射為 pending，下一個 tick
+    以同一 exact HEAD 重新評估 gate。
+    """
+
+    if tuple(remote_gate.reasons) != ("checks-not-terminal-green",):
+        return None
+    not_green = [check for check in remote.checks if not check.terminal_green]
+    if not not_green or not all(check.pending for check in not_green):
+        return None
+    pending_checks = [check.name for check in not_green]
+    logger.info(
+        "ship merge gate waiting for running checks head=%s checks=%s",
+        head,
+        ",".join(pending_checks),
+    )
+    return {
+        "action": "checks-pending",
+        "reason": "checks-not-terminal-green",
+        "pending_checks": pending_checks,
+        "head": head,
+    }
+
+
 def _set_copilot_request_outcome_unknown(
     *,
     active: dict[str, Any],
@@ -3211,6 +3249,11 @@ def _ship_with_maintainer_review(
                 head=preflight.head,
                 remote=remote,
             )
+        checks_pending = _checks_pending_response(
+            remote_gate=remote_gate, remote=remote, head=preflight.head
+        )
+        if checks_pending is not None:
+            return checks_pending
         raise RuntimeError(f"merge authorization blocked: {', '.join(remote_gate.reasons)}")
     existing_authorization = ship.get("merge_authorization") if ship else None
     superseded_authorization = (
@@ -10484,6 +10527,11 @@ def _ship_action(
                 head=preflight.head,
                 remote=remote,
             )
+        checks_pending = _checks_pending_response(
+            remote_gate=remote_gate, remote=remote, head=preflight.head
+        )
+        if checks_pending is not None:
+            return checks_pending
         raise RuntimeError(f"merge authorization blocked: {', '.join(remote_gate.reasons)}")
     authorization = _authorization_record(
         _merge_authorization_body(
