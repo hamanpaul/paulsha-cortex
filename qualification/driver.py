@@ -47,6 +47,13 @@ from paulsha_cortex.trust_root.registry import (
 )
 from paulsha_cortex.trust_root.permgen import DEFAULT_LAYOUT
 from paulsha_cortex.trust_root.surfaces import writable_surface
+from paulsha_cortex.trust_root.install import loaded_runtime
+from paulsha_cortex.trust_root.install.core import InstallError
+from paulsha_cortex.trust_root.install.loaded_runtime import (
+    diagnostic_token as _diagnostic_token,
+    loaded_runtime_mismatch as _rollback_loaded_runtime_mismatch,
+    runtime_expected as _rollback_runtime_expected,
+)
 
 try:
     from qualification.contract import (
@@ -286,35 +293,12 @@ def _account_env(account: str) -> dict[str, str]:
 def _installed_runtime_env() -> dict[str, str]:
     """Load only the installed, root-owned PSC runtime projection for operator CLI probes."""
 
-    path = Path("/opt/cortex/etc/cortex-manager.env")
-    if path.is_symlink() or not path.is_file():
-        raise QualificationFailure("installed Manager environment is absent")
-    if path.stat().st_uid != 0 or stat.S_IMODE(path.stat().st_mode) & 0o022:
-        raise QualificationFailure(
-            "installed Manager environment is not root-controlled"
+    try:
+        return loaded_runtime.installed_runtime_env(
+            Path("/opt/cortex"), Path("/var/lib/cortex")
         )
-    env = {
-        "HOME": "/root",
-        "PATH": "/opt/cortex/venv/bin:/opt/cortex/toolchain/bin:/usr/bin:/bin",
-    }
-    for raw in path.read_text(encoding="utf-8", errors="strict").splitlines():
-        key, separator, encoded = raw.partition("=")
-        if not separator or not key.startswith("PSC_"):
-            continue
-        try:
-            value = json.loads(encoded)
-        except json.JSONDecodeError as exc:
-            raise QualificationFailure(
-                f"invalid installed runtime value for {key}"
-            ) from exc
-        if not isinstance(value, str) or "\x00" in value:
-            raise QualificationFailure(f"invalid installed runtime value for {key}")
-        env[key] = value
-    env.setdefault("PSC_CONTROL_ROOT", "/var/lib/cortex/control")
-    env.setdefault("PSC_COORDINATOR_ROOT", "/var/lib/cortex/coordinator")
-    env.setdefault("PSC_SPECS_ROOT", "/var/lib/cortex/specs")
-    env.setdefault("PSC_MONITOR_STATE_ROOT", "/var/lib/cortex/monitor")
-    return env
+    except InstallError as exc:
+        raise QualificationFailure(str(exc)) from exc
 
 
 def _account_runtime_env(account: str) -> dict[str, str]:
@@ -560,73 +544,6 @@ def _system_status_mismatch(report: object) -> str:
         + _diagnostic_token(installed.get("kind") if isinstance(installed, Mapping) else None)
     )
     return " ".join(parts)
-
-
-def _rollback_loaded_runtime_mismatch(
-    payload: object, expected: Mapping[str, object]
-) -> str:
-    """比對 rollback 後 Manager／Monitor 載入的 artifact 與 prior receipt。"""
-
-    service = payload.get("service") if isinstance(payload, Mapping) else None
-    loaded = service.get("loaded_runtime") if isinstance(service, Mapping) else None
-    if not isinstance(loaded, Mapping):
-        return "loaded_runtime=unknown"
-    expected_receipt = expected.get("receipt_id")
-    expected_wheel = expected.get("wheel_sha256")
-    expected_commit = expected.get("candidate_commit")
-    if not all(
-        isinstance(value, str) and value
-        for value in (expected_receipt, expected_wheel, expected_commit)
-    ):
-        return "expected_receipt=unknown"
-    mismatches: list[str] = []
-    for name in ("manager", "monitor"):
-        report = loaded.get(name)
-        if not isinstance(report, Mapping):
-            mismatches.append(f"{name}=unknown")
-            continue
-        comparison = report.get("comparison")
-        trust_root = report.get("trust_root")
-        installed = report.get("installed_artifact")
-        if not all(
-            isinstance(value, Mapping)
-            for value in (comparison, trust_root, installed)
-        ):
-            mismatches.append(f"{name}=unknown")
-            continue
-        if any(
-            comparison.get(key) != "match"
-            for key in ("artifact_status", "config_status", "process_status")
-        ):
-            mismatches.append(f"{name}_runtime=mismatch")
-        if trust_root.get("status") != "verified":
-            mismatches.append(f"{name}_trust={_diagnostic_token(trust_root.get('status'))}")
-        if trust_root.get("receipt_id") != expected_receipt:
-            state = "mismatch" if isinstance(trust_root.get("receipt_id"), str) else "unknown"
-            mismatches.append(f"{name}_receipt={state}")
-        for label, value in (
-            ("loaded_wheel", comparison.get("loaded_wheel_sha256")),
-            ("installed_wheel", installed.get("wheel_sha256")),
-            ("receipt_wheel", trust_root.get("wheel_sha256")),
-        ):
-            if value != expected_wheel:
-                mismatches.append(f"{name}_{label}={'mismatch' if isinstance(value, str) else 'unknown'}")
-        loaded_commit = trust_root.get("candidate_commit")
-        if loaded_commit != expected_commit:
-            state = "mismatch" if isinstance(loaded_commit, str) else "unknown"
-            mismatches.append(f"{name}_commit={state}")
-    return " ".join(mismatches)
-
-
-def _rollback_runtime_expected(receipt: Mapping[str, object]) -> dict[str, object]:
-    plan = receipt.get("plan")
-    candidate = plan.get("candidate") if isinstance(plan, Mapping) else None
-    identity = plan.get("repo_identity") if isinstance(plan, Mapping) else None
-    return {
-        "receipt_id": receipt.get("receipt_id"),
-        "wheel_sha256": candidate.get("wheel_sha256") if isinstance(candidate, Mapping) else None,
-        "candidate_commit": identity.get("commit") if isinstance(identity, Mapping) else None,
-    }
 
 
 def _capture_rollback_loaded_runtime(
@@ -4907,19 +4824,6 @@ def _expected_worktree_isolation_prompt(
         + " Contract: "
         + json.dumps(contract, ensure_ascii=False, sort_keys=True)
     )
-
-
-_DIAGNOSTIC_TOKEN = re.compile(r"[A-Za-z0-9_.:+-]{1,64}")
-
-
-def _diagnostic_token(value: object) -> str:
-    """只輸出短的列舉型字串；其他型別或內容一律遮成型別名（不洩漏 detail 文字）。"""
-
-    if value is None:
-        return "none"
-    if isinstance(value, str) and _DIAGNOSTIC_TOKEN.fullmatch(value):
-        return value
-    return f"<{type(value).__name__}>"
 
 
 def _closeout_diagnostic(
