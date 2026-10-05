@@ -98,7 +98,15 @@ class _WorktreeCreator:
         self.workspace = workspace
         self.calls: list[tuple[str, str, str | None]] = []
 
-    def create(self, branch: str, *, job_id: str, base_sha: str | None = None) -> str:
+    def create(
+        self,
+        branch: str,
+        *,
+        job_id: str,
+        base_sha: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> str:
         self.calls.append((branch, job_id, base_sha))
         return str(self.workspace)
 

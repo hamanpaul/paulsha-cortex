@@ -919,7 +919,9 @@ identities:
     job_worktrees: list[Path] = []
 
     class WorktreeCreator:
-        def create(self, branch, base_sha=None, *, job_id=None):
+        def create(
+            self, branch, base_sha=None, *, job_id=None, owner_identity=None, attempt_id=None
+        ):
             branches.append(branch)
             provisioned_job_ids.append(job_id)
             if not job_worktrees:

@@ -83,7 +83,13 @@ class _FixedWorktreeCreator:
         self._path = path
 
     def create(
-        self, branch: str, base_sha: str | None = None, *, job_id: str | None = None
+        self,
+        branch: str,
+        base_sha: str | None = None,
+        *,
+        job_id: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
     ) -> Path:
         return self._path
 

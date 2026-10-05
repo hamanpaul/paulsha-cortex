@@ -44,7 +44,15 @@ class _RecordingCreator:
         self.repo_root = repo_root
         self.calls: list[str] = []
 
-    def create(self, branch: str, *, job_id: str | None = None, base_sha: str | None = None) -> str:
+    def create(
+        self,
+        branch: str,
+        *,
+        job_id: str | None = None,
+        base_sha: str | None = None,
+        owner_identity: dict[str, str] | None = None,
+        attempt_id: str | None = None,
+    ) -> str:
         self.calls.append(branch)
         return str(self.repo_root)
 
