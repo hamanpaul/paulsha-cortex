@@ -4154,8 +4154,9 @@ def _is_expected_head_probe(
     - 每一段都必須是唯讀檢查：`pwd`、`cd <bound worktree>`，或子命令在
       :data:`HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS` 內的系統 git（可帶
       `-C <bound worktree>`，不能指向其他目錄）。repo 內的 `./git`、`printf`／`echo`
-      等能自行印出 SHA 的指令、任何含 `$` 或反引號的字詞，以及帶 7 位以上 hex 的字詞
-      （字面 SHA；bound worktree 路徑除外），都讓整條不算數。
+      等能自行印出 SHA 的指令、任何含 `$` 或反引號的字詞，以及 git 段中帶 7 位以上 hex
+      的字詞（字面 SHA），都讓整條不算數。唯讀檔案檢視（:func:`_is_read_only_file_view`）
+      可以出現在鏈中。
     - 至少一段是印出 HEAD hash 的最小形狀（:func:`_git_args_print_head`：
       `rev-parse [--verify] HEAD`、`log -1 --format=%H`、`show -s --format=%H`），可帶
       `-C <bound worktree>`。
@@ -4187,10 +4188,6 @@ def _is_expected_head_probe(
             return False
         if "$" in token or "`" in token:
             return False
-        # 字面 SHA（`git rev-parse <sha>`、`--format=<sha>`）能讓唯讀 git 直接印出任意值；
-        # bound worktree 路徑本身可能帶 hex 的 job id，只有它例外。
-        if token != expected_worktree and re.search(r"[0-9a-fA-F]{7,}", token):
-            return False
         segments[-1].append(token)
     if any(not segment for segment in segments):
         return False
@@ -4198,12 +4195,63 @@ def _is_expected_head_probe(
     for segment in segments:
         if segment == ["pwd"] or segment == ["cd", expected_worktree]:
             continue
+        if _is_read_only_file_view(segment, expected_worktree=expected_worktree):
+            continue
         args = _head_probe_git_args(segment, expected_worktree=expected_worktree)
         if not args or args[0] not in HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS:
+            return False
+        # 字面 SHA（`git rev-parse <sha>`、`--format=<sha>`）能讓唯讀 git 直接印出任意值；
+        # 只限 git 段——檢視檔案的段印的是檔案內容，而 worktree 內的檔案不可能含有
+        # 自己所屬 commit 的 hash。
+        if any(re.search(r"[0-9a-fA-F]{7,}", arg) for arg in args):
             return False
         if _git_args_print_head(args):
             saw_head = True
     return saw_head
+
+
+#: HEAD 探針鏈中允許的唯讀檔案檢視指令（#716）。實機 codex 會在同一條指令裡順手讀 plan
+#: （canary run 37247943097：`… && git rev-parse HEAD && … && sed -n '1,220p' <plan>.md`）。
+HEAD_PROBE_FILE_VIEWERS = frozenset({"cat", "head", "tail", "ls", "wc", "sed"})
+_SED_PRINT_RANGE_RE = re.compile(r"[0-9]+(?:,[0-9]+)?p")
+_VIEWER_OPTION_RE = re.compile(r"-[A-Za-z]+|-[0-9]+|--?[A-Za-z][A-Za-z-]*=[0-9]+")
+
+
+def _is_read_only_file_view(segment: Sequence[str], *, expected_worktree: str) -> bool:
+    """這一段是否只是在 bound worktree 內檢視檔案（#716）。
+
+    只收 `cat`／`head`／`tail`／`ls`／`wc`（可帶 `/usr/bin/` 前綴），以及
+    `sed -n '<N>[,<M>]p'`——`sed -i`、`w` 指令等會寫檔的形狀都不算。路徑不得是
+    bound worktree 以外的絕對路徑，也不得含 `..`；選項只收短旗標與數值。
+    """
+
+    if not segment:
+        return False
+    name = segment[0].removeprefix("/usr/bin/").removeprefix("/bin/")
+    if name not in HEAD_PROBE_FILE_VIEWERS:
+        return False
+    rest = list(segment[1:])
+    if name == "sed":
+        if rest[:1] != ["-n"] or len(rest) < 2 or _SED_PRINT_RANGE_RE.fullmatch(rest[1]) is None:
+            return False
+        rest = rest[2:]
+    elif name in {"head", "tail"} and rest[:1] == ["-n"]:
+        if len(rest) < 2 or not rest[1].isdigit():
+            return False
+        rest = rest[2:]
+    for arg in rest:
+        if arg.startswith("-"):
+            if _VIEWER_OPTION_RE.fullmatch(arg) is None:
+                return False
+            continue
+        path = Path(arg)
+        if ".." in path.parts:
+            return False
+        if path.is_absolute() and not (
+            arg == expected_worktree or arg.startswith(expected_worktree.rstrip("/") + "/")
+        ):
+            return False
+    return True
 
 
 #: `--format`／`--pretty` 只印 commit hash 的寫法（#716）。

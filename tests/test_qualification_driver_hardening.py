@@ -4341,6 +4341,15 @@ def _head_probe_log(command: str, output: str) -> bytes:
         ("bash -lc 'git rev-parse --verify HEAD'", "a" * 40 + "\n"),
         ("/bin/bash -lc 'git log -1 --format=%H'", "a" * 40 + "\n"),
         ("/bin/bash -lc 'git show -s --format=%H HEAD'", "a" * 40 + "\n"),
+        # canary run 37247943097 實機逐字：同一條指令裡順手讀 plan。
+        (
+            '/usr/bin/bash -lc "pwd && git rev-parse --show-toplevel && git rev-parse HEAD'
+            " && git status --short --branch && git worktree list --porcelain && sed -n "
+            "'1,220p' docs/superpowers/plans/2026-10-05-deployment-canary-probe.md\"",
+            f"{_HEAD_PROBE_WORKTREE}\n{_HEAD_PROBE_WORKTREE}\n" + "a" * 40
+            + "\n## main\nworktree x\n# plan\n",
+        ),
+        ("/bin/bash -lc 'git rev-parse HEAD && head -n 20 src/canary_probe.py'", "a" * 40 + "\n"),
     ],
 )
 def test_codex_agent_loop_parser_accepts_real_codex_head_command_shapes(
@@ -4382,6 +4391,12 @@ def test_codex_agent_loop_parser_accepts_real_codex_head_command_shapes(
         "/bin/bash -lc 'git rev-parse --short HEAD'",
         # 非系統目錄的 shell。
         "/tmp/bash -lc 'git rev-parse HEAD'",
+        # 檢視檔案的段只收唯讀形狀、只看 bound worktree 內的路徑。
+        "/bin/bash -lc 'git rev-parse HEAD && sed -i s/a/b/ README.md'",
+        "/bin/bash -lc \"git rev-parse HEAD && sed -n '1w /tmp/x' README.md\"",
+        "/bin/bash -lc 'git rev-parse HEAD && cat /etc/passwd'",
+        "/bin/bash -lc 'git rev-parse HEAD && cat ../outside'",
+        "/bin/bash -lc 'git rev-parse HEAD && tee README.md'",
     ],
 )
 def test_codex_agent_loop_parser_rejects_unsafe_head_command_chains(command: str) -> None:
