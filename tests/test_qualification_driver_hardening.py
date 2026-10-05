@@ -4618,3 +4618,54 @@ def test_fix_round_reason_is_bounded_by_the_manager_limit() -> None:
 
     assert len(reason) == OPERATOR_ADJUDICATION_REASON_LIMIT
     assert reason.endswith("…")
+
+
+def _reclaimed_job(tmp_path: Path, **overrides) -> dict[str, object]:
+    job = {
+        "workflow_card": "subagent-build",
+        "subject_head": "b" * 40,
+        "worktree": str(tmp_path / "reclaimed-worktree"),
+    }
+    job.update(overrides)
+    return job
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("harvested", True),
+        ("commit-missing", False),
+        ("probe-card", False),
+        ("worktree-still-present", False),
+        ("bad-subject", False),
+    ],
+)
+def test_reclaimed_build_counts_as_harvest_only_when_its_commit_landed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, expected: bool
+) -> None:
+    """#716（canary run 37282854268）：#1261 之後 owner-bound reclaim 會重設 commit
+    spool slot、bundle 隨之移除；這時以「worktree 已回收＋subject_head 在 source
+    repo」證明 harvest 落地，唯讀探針卡與 commit 不在 repo 的情況都不算。"""
+
+    driver = _load_driver()
+    job = _reclaimed_job(tmp_path)
+    if case == "probe-card":
+        job["workflow_card"] = driver.DEPLOYMENT_CANARY_PROBE_CARD
+    if case == "worktree-still-present":
+        Path(job["worktree"]).mkdir()
+    if case == "bad-subject":
+        job["subject_head"] = "HEAD"
+    calls: list[tuple[tuple[str, ...], object]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs.get("user")))
+        return _result(driver, argv, returncode=1 if case == "commit-missing" else 0)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+
+    assert driver._reclaimed_build_harvested(job, repo_root=tmp_path / "repo") is expected
+    if case in {"harvested", "commit-missing"}:
+        assert calls and calls[0][1] == "cortex-manager"
+        assert calls[0][0][-1] == "b" * 40 + "^{commit}"
+    else:
+        assert calls == []
