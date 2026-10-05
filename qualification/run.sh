@@ -403,7 +403,25 @@ upgrade_version=${upgrade_version%-py3-none-any.whl}
 upgrade_release_source=/run/cortex-upgrade-release
 upgrade_drill_report=/run/cortex-install/upgrade-drill-report.json
 upgrade_report=/run/cortex-install/upgrade-report.json
+upgrade_durable_report=/var/lib/cortex-installer/$upgrade_version/upgrade-report.json
+upgrade_status_report=/run/cortex-install/upgrade-status.json
 builder_codex_credential=/var/lib/cortex-builder/.codex/auth.json
+# `--json` 只把 report 寫進容器內的檔案，而 `trap cleanup EXIT` 會刪掉容器：每個失敗的
+# `cortex upgrade` 檢查在 die 之前，先把 `--json` 輸出、durable report 與它指向的 verify
+# evidence 印到 stderr，live RC 失敗時才留得下診斷。
+upgrade_diagnostics() {
+    local evidence
+    echo "qualification: cortex upgrade --json output ($1):" >&2
+    docker exec "$container_name" cat "$1" >&2 || true
+    echo "qualification: durable upgrade report ($upgrade_durable_report):" >&2
+    docker exec "$container_name" cat "$upgrade_durable_report" >&2 || true
+    evidence=$(docker exec "$container_name" jq -r '.verify_evidence // empty' \
+        "$upgrade_durable_report" 2>/dev/null) || evidence=""
+    if [[ "$evidence" == /* ]]; then
+        echo "qualification: verify evidence ($evidence):" >&2
+        docker exec "$container_name" cat "$evidence" >&2 || true
+    fi
+}
 docker exec "$container_name" /usr/local/libexec/cortex-qualification-release-source \
     --artifacts /artifacts \
     --output "$upgrade_release_source" \
@@ -434,29 +452,55 @@ upgrade_cli=(
 docker exec "$container_name" chmod 0640 "$builder_codex_credential"
 if docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \
     sh -eu -c 'out=$1; shift; "$@" >"$out"' sh "$upgrade_drill_report" "${upgrade_cli[@]}"; then
+    upgrade_diagnostics "$upgrade_drill_report"
     die "one-command upgrade accepted a drifted inherited credential"
 fi
 docker exec "$container_name" chmod 0600 "$builder_codex_credential"
 docker exec "$container_name" cat "$upgrade_drill_report"
-docker exec "$container_name" jq -e \
+if ! docker exec "$container_name" jq -e \
     '.result == "rolled-back" and .failed_step == "credentials"
      and .rollback.restore_safe == true
      and .rollback.prior_loaded_runtime.mismatch == ""' \
-    "$upgrade_drill_report" >/dev/null || \
+    "$upgrade_drill_report" >/dev/null; then
+    upgrade_diagnostics "$upgrade_drill_report"
     die "pre-activate upgrade failure did not return to the prior receipt"
+fi
 for upgrade_service in cortex-egress-proxy.service cortex-manager.service cortex-monitor.service; do
     docker exec "$container_name" systemctl is-active --quiet "$upgrade_service" || \
         die "upgrade drill did not restore $upgrade_service"
 done
 # 完整升級：apply → 繼承 prior 憑證 → activate → verify → loaded↔installed 一致。
-docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \
-    sh -eu -c 'out=$1; shift; "$@" >"$out"' sh "$upgrade_report" "${upgrade_cli[@]}"
-docker exec "$container_name" jq -e '.result == "upgraded"' "$upgrade_report" >/dev/null || \
+if ! docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \
+    sh -eu -c 'out=$1; shift; "$@" >"$out"' sh "$upgrade_report" "${upgrade_cli[@]}"; then
+    upgrade_diagnostics "$upgrade_report"
+    die "one-command upgrade failed"
+fi
+if ! docker exec "$container_name" jq -e '.result == "upgraded"' "$upgrade_report" >/dev/null; then
+    upgrade_diagnostics "$upgrade_report"
     die "one-command upgrade did not complete"
+fi
 upgrade_receipt_path=$(docker exec "$container_name" jq -r '.receipt.path' "$upgrade_report")
 upgrade_evidence_path=$(docker exec "$container_name" jq -r '.verify_evidence' "$upgrade_report")
 [[ "$upgrade_receipt_path" == /* && "$upgrade_evidence_path" == /* ]] || \
     die "one-command upgrade report lacks the new receipt or verify evidence"
+# `--status` 是只有正式部署才走的唯讀路徑（receipt chain 判定 effective receipt、維護
+# 狀態）；它不吃任何僅限測試的參數。升級後生效中的必須就是剛升級的 receipt、loaded
+# runtime 一致，而且沒有留下待 `--recover` 的 snapshot 或 lease marker。
+if ! docker exec "$container_name" sh -eu -c 'out=$1; shift; "$@" >"$out"' \
+    sh "$upgrade_status_report" /opt/cortex/venv/bin/cortex upgrade --status --json; then
+    docker exec "$container_name" cat "$upgrade_status_report" >&2 || true
+    die "cortex upgrade --status does not show the upgraded receipt in force"
+fi
+docker exec "$container_name" cat "$upgrade_status_report"
+if ! docker exec "$container_name" jq -e --slurpfile report "$upgrade_report" \
+    '.effective_receipt.path == $report[0].receipt.path
+     and .effective_receipt.receipt_id == $report[0].receipt.receipt_id
+     and .loaded_runtime == "match"
+     and .maintenance_pending == false' \
+    "$upgrade_status_report" >/dev/null; then
+    docker exec "$container_name" cat "$upgrade_status_report" >&2 || true
+    die "cortex upgrade --status does not show the upgraded receipt in force"
+fi
 
 # A fixed harness installed in the reference image always runs the five attack
 # families and negative controls. Only deployment-canary mode adds provider
