@@ -23,6 +23,7 @@ from .core import (
     canonical_receipt_path,
     canonical_plan_bytes,
     import_credential,
+    is_inherited_credential,
     new_install_receipt,
     plan_sha256,
     rollback_receipt,

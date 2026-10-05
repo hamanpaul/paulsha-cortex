@@ -13,6 +13,7 @@ import pytest
 from paulsha_cortex.trust_root.install import (
     ActivationError,
     CredentialImportError,
+    InstallError,
     InstallReceipt,
     activate_receipt,
     apply_plan,
@@ -1247,3 +1248,156 @@ def test_activation_revalidates_imported_credential_bytes(tmp_path: Path) -> Non
     with pytest.raises(ActivationError, match="hash mismatch"):
         activate_receipt(receipt, backend=backend)
     assert backend.started == []
+
+
+_PRIOR_RECEIPT_PATH = Path("/var/lib/cortex-install-receipts/prior.json")
+
+
+def _inherited_row(
+    digest: str,
+    prior_id: str,
+    *,
+    principal: str = "builder",
+    provider: str = "codex",
+) -> dict[str, str]:
+    return {
+        "principal": principal,
+        "provider": provider,
+        "mode": "0600",
+        "sha256": digest,
+        "inherited_from": prior_id,
+    }
+
+
+def _write_credential(home: Path, relative: str, content: bytes) -> str:
+    destination = home / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(content)
+    destination.chmod(0o600)
+    return hashlib.sha256(content).hexdigest()
+
+
+def _credential_accounts(
+    tmp_path: Path, *, builder_uid: int | None = None
+) -> list[dict[str, object]]:
+    return [
+        {
+            "name": name,
+            "home": str(tmp_path / name),
+            "uid": (
+                builder_uid
+                if builder_uid is not None and name == "cortex-builder"
+                else os.getuid()
+            ),
+            "gid": os.getgid(),
+        }
+        for name in ("cortex-builder", "cortex-reviewer-planner", "cortex-manager")
+    ]
+
+
+def _successor_link(prior_id: str) -> dict[str, str]:
+    return {
+        "path": str(_PRIOR_RECEIPT_PATH),
+        "receipt_id": prior_id,
+        "plan_sha256": "d" * 64,
+    }
+
+
+def test_receipt_load_accepts_inherited_credential_linked_to_its_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(install_core, "_validate_receipt_parent", lambda _o, _p: None)
+    monkeypatch.setattr(install_core, "_validate_receipt_file", lambda _o, _p: None)
+    path = (tmp_path / "receipts" / "successor.json").absolute()
+    receipt = new_install_receipt(_plan(), path=path)
+    receipt._document["parent_receipt"] = _successor_link("prior-receipt")
+    receipt._document["credentials"] = [_inherited_row("e" * 64, "prior-receipt")]
+    receipt._persist()
+
+    loaded = InstallReceipt.load(path)
+
+    assert loaded.to_dict()["credentials"] == [
+        _inherited_row("e" * 64, "prior-receipt")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("parent", "inherited_from"),
+    [
+        (_successor_link("prior-receipt"), "another-receipt"),
+        (_successor_link("prior-receipt"), ""),
+        (None, "prior-receipt"),
+    ],
+)
+def test_receipt_load_rejects_inherited_credential_not_linked_to_its_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent: dict[str, str] | None,
+    inherited_from: str,
+) -> None:
+    monkeypatch.setattr(install_core, "_validate_receipt_parent", lambda _o, _p: None)
+    monkeypatch.setattr(install_core, "_validate_receipt_file", lambda _o, _p: None)
+    path = (tmp_path / "receipts" / "successor.json").absolute()
+    receipt = new_install_receipt(_plan(), path=path)
+    if parent is not None:
+        receipt._document["parent_receipt"] = parent
+    receipt._document["credentials"] = [_inherited_row("e" * 64, inherited_from)]
+    receipt._persist()
+
+    with pytest.raises(InstallError, match="credential metadata is invalid"):
+        InstallReceipt.load(path)
+
+
+def test_rollback_keeps_the_prior_credential_and_its_inherited_record(
+    tmp_path: Path,
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    receipt._document["plan"]["accounts"] = _credential_accounts(tmp_path)  # type: ignore[index]
+    receipt._document["parent_receipt"] = _successor_link("prior-receipt")
+    inherited = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    owned = _write_credential(
+        tmp_path / "cortex-manager", ".config/gh/hosts.yml", b"github.com: {}\n"
+    )
+    receipt._document["credentials"] = [
+        _inherited_row(inherited, "prior-receipt"),
+        {
+            "principal": "manager",
+            "provider": "github",
+            "mode": "0600",
+            "sha256": owned,
+        },
+    ]
+
+    report = rollback_receipt(
+        receipt, backend=LocalInstallBackend(require_root=False)
+    )
+
+    assert report.retained_drift == ()
+    assert (tmp_path / "cortex-builder/.codex/auth.json").read_bytes() == (
+        b'{"token":"prior"}'
+    )
+    assert not (tmp_path / "cortex-manager/.config/gh/hosts.yml").exists()
+    document = receipt.to_dict()
+    assert document["state"] == "rolled-back"
+    assert document["credentials"] == [_inherited_row(inherited, "prior-receipt")]
+    assert install_cli._receipt_restore_safe(document) is True
+
+
+def test_restore_safe_refuses_an_owned_credential_left_after_rollback() -> None:
+    document = {
+        "state": "rolled-back",
+        "journal": [],
+        "activation_journal": [],
+        "credential_journal": [],
+        "services_started": False,
+        "rollback": {"retained_unknown": [], "retained_drift": []},
+        "credentials": [
+            {"principal": "builder", "provider": "codex", "mode": "0600", "sha256": "e" * 64}
+        ],
+    }
+
+    assert install_cli._receipt_restore_safe(document) is False
+    document["credentials"] = [_inherited_row("e" * 64, "prior-receipt")]
+    assert install_cli._receipt_restore_safe(document) is True

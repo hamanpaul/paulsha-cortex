@@ -42,6 +42,7 @@ from .core import (
     _read_fd_bytes,
     _reject_symlink_ancestors,
     credential_destination,
+    is_inherited_credential,
 )
 
 
@@ -5380,6 +5381,9 @@ class LocalInstallBackend:
         seen: set[tuple[str, str]] = set()
         for row in rows:
             if not isinstance(row, Mapping):
+                continue
+            if is_inherited_credential(row):
+                # The prior receipt owns this file; the successor only relied on it.
                 continue
             principal = str(row.get("principal", ""))
             provider = str(row.get("provider", ""))

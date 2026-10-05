@@ -3001,12 +3001,27 @@ class InstallReceipt:
             rollback_seen.add(step_id)
         _validate_receipt_legacy_provenance(payload, plan, planned_steps, path)
         credentials = payload.get("credentials")
+        parent_receipt_id = (
+            parent.get("receipt_id") if isinstance(parent, Mapping) else None
+        )
         if not isinstance(credentials, list) or any(
             not isinstance(row, Mapping)
-            or set(row) - {"created_directories"} != {"principal", "provider", "mode", "sha256"}
+            or set(row) - {"created_directories", "inherited_from"}
+            != {"principal", "provider", "mode", "sha256"}
             or row.get("mode") != "0600"
             or not isinstance(row.get("sha256"), str)
             or len(str(row.get("sha256"))) != 64
+            # An inherited row names the prior receipt's file: it is valid only
+            # in a successor linked to exactly that prior receipt, and it never
+            # owns credential directories.
+            or (
+                "inherited_from" in row
+                and (
+                    not is_inherited_credential(row)
+                    or row.get("inherited_from") != parent_receipt_id
+                    or "created_directories" in row
+                )
+            )
             for row in credentials
         ):
             raise InstallError(f"receipt credential metadata is invalid: {path}")
@@ -7187,7 +7202,14 @@ def rollback_receipt(
         for row in retained_drift
     )
     if not credentials_retained:
-        receipt._document["credentials"] = []
+        # Inherited rows name the prior receipt's files.  Rollback never touched
+        # them, so they stay as the record of what this receipt relied on.
+        current = receipt._document.get("credentials")
+        receipt._document["credentials"] = [
+            row
+            for row in (current if isinstance(current, list) else [])
+            if is_inherited_credential(row)
+        ]
         receipt._document["credential_journal"] = []
     receipt._document["rollback"] = {
         "retained_unknown": list(unknown),
@@ -7426,6 +7448,16 @@ def credential_destination(
         Path(str(account["home"])).joinpath(*adapter.destination_parts),
         int(account["uid"]),
         int(account["gid"]),
+    )
+
+
+def is_inherited_credential(row: object) -> bool:
+    """True for a receipt credential row handed over from the prior receipt."""
+
+    return (
+        isinstance(row, Mapping)
+        and isinstance(row.get("inherited_from"), str)
+        and bool(row["inherited_from"])
     )
 
 

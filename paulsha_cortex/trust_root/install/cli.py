@@ -48,6 +48,7 @@ from .core import (
     build_install_plan,
     canonical_receipt_path,
     import_credential,
+    is_inherited_credential,
     new_install_receipt,
     plan_sha256,
     rollback_receipt,
@@ -1398,6 +1399,10 @@ def _legacy_purge_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _only_inherited_credentials(rows: object) -> bool:
+    return isinstance(rows, list) and all(is_inherited_credential(row) for row in rows)
+
+
 def _receipt_restore_safe(document: Mapping[str, object]) -> bool:
     """Prove that restarting the pre-transaction services is safe."""
 
@@ -1420,7 +1425,7 @@ def _receipt_restore_safe(document: Mapping[str, object]) -> bool:
         isinstance(rollback, Mapping)
         and rollback.get("retained_unknown") == []
         and rollback.get("retained_drift") == []
-        and document.get("credentials", []) == []
+        and _only_inherited_credentials(document.get("credentials", []))
         # A legacy adoption is restore-safe only once a re-capture proved the
         # reviewed legacy host is back.
         and (
