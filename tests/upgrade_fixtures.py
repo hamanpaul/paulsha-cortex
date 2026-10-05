@@ -253,6 +253,9 @@ class FakeCandidateCli:
     def __init__(self, systemd: FakeSystemd) -> None:
         self.systemd = systemd
         self.calls: list[tuple[str, ...]] = []
+        # One entry per `self.calls` entry, in the same order: the `env`
+        # mapping `_candidate`/`_service_status` actually passed to `_run`.
+        self.envs: list[dict[str, str]] = []
         self.fail: dict[str, str] = {}
         self.interrupt_after: str | None = None
         # A verify that runs and FAILs: exit 1 with its JSON result on stdout.
@@ -274,6 +277,7 @@ class FakeCandidateCli:
 
     def __call__(self, argv, *, check=False, env=None, uid=None, gid=None, **_kwargs):
         argv = tuple(argv)
+        self.envs.append(dict(env or {}))
         if argv[1:4] == ("service", "status", "--system"):
             receipt = self._value(argv, "--install-receipt")
             self.calls.append(("status", receipt))

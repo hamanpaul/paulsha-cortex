@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 from collections.abc import Iterator
@@ -105,6 +106,60 @@ def test_upgrade_runs_every_candidate_step_with_the_bound_sha_and_lease_token(ha
     }
     assert install_cli._read_maintenance_snapshot() is None
     assert _marker() is None
+
+
+def test_candidate_cli_calls_get_a_root_path_with_sbin_and_no_usr_local(harness) -> None:
+    # #1263 RC qualification (run 37336228620): the activate-before drill's
+    # `apply` hit `preflight failed: universal NOPASSWD is forbidden` because
+    # `_candidate`'s PATH had no `/usr/sbin` for `shutil.which("visudo")` to
+    # find -- even though a manual `install trust-root apply` with a normal
+    # root PATH passed the same preflight. Every candidate-CLI call (apply,
+    # credentials inherit, activate, verify, rollback) must get a PATH that
+    # actually has the sealed venv first and the sbin dirs an installer needs
+    # for `visudo`/`cvtsudoers`/`useradd`/`groupadd`.
+    code, _report = _run_transaction(harness)
+    assert code == 0
+
+    apply_index = harness.cli.commands().index("apply")
+    path = harness.cli.envs[apply_index]["PATH"]
+    entries = path.split(":")
+
+    assert entries[0] == f"{harness.sealed.venv}/bin"
+    assert "/usr/sbin" in entries
+    assert "/sbin" in entries
+    assert "/usr/local" not in path
+
+
+def test_a_tool_that_only_lives_in_sbin_resolves_under_the_candidate_path_shape(
+    tmp_path: Path,
+) -> None:
+    """Hermetic: on Debian/Ubuntu `visudo`/`cvtsudoers`/`useradd`/`groupadd`
+    live in `/usr/sbin`, not `/usr/bin`. Builds the candidate PATH's *shape*
+    (venv/bin first, then sbin ahead of bin) out of tmp_path directories --
+    never the host's real `/usr/sbin` -- and proves `shutil.which` only finds
+    the sbin-only tool once the sbin segment is present.
+    """
+
+    root = tmp_path / "root"
+    venv_bin = root / "venv" / "bin"
+    usr_sbin = root / "usr" / "sbin"
+    usr_bin = root / "usr" / "bin"
+    sbin = root / "sbin"
+    bin_dir = root / "bin"
+    for directory in (venv_bin, usr_sbin, usr_bin, sbin, bin_dir):
+        directory.mkdir(parents=True)
+
+    tool = usr_sbin / "visudo"
+    tool.write_text("#!/bin/sh\n", encoding="utf-8")
+    tool.chmod(0o755)
+
+    with_sbin = f"{venv_bin}:{usr_sbin}:{usr_bin}:{sbin}:{bin_dir}"
+    assert shutil.which("visudo", path=with_sbin) == str(tool)
+
+    # The regression this guards against: the old candidate PATH shape had no
+    # sbin segment at all, and never finds an sbin-only tool.
+    without_sbin = f"{venv_bin}:{usr_bin}:{bin_dir}"
+    assert shutil.which("visudo", path=without_sbin) is None
 
 
 def test_jobs_started_during_preparation_refuse_before_any_service_stops(harness) -> None:

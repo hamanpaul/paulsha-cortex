@@ -675,6 +675,16 @@ def produce_plan(
 # --- transaction (spec §4 steps 4–8, §6, §12.4) -----------------------------------
 
 _CANDIDATE_ENV = {"HOME": "/root", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"}
+# The system half of the root PATH every root-side candidate-CLI call gets
+# (#1263 RC qualification, run 37336228620): apply's `preflight_facts()`
+# resolves `visudo`/`cvtsudoers` by bare name (`shutil.which`, fail-closed to
+# "universal NOPASSWD is forbidden" when either is missing), and the account
+# step resolves `useradd`/`groupadd` the same way. On Debian/Ubuntu all four
+# live in `/usr/sbin`, not on a venv-only PATH -- a manual `install
+# trust-root apply` under a normal root PATH never hit this because it had
+# `/usr/sbin` already. `/usr/local/{s,}bin` is deliberately left out: the
+# sealed candidate must never pick up a host-local override.
+_CANDIDATE_SYSTEM_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _REPORT_NAME = "upgrade-report.json"
 _LAST_REPORT_NAME = "last-upgrade-report.json"
 _HALTED_NEXT_ACTION = (
@@ -762,7 +772,7 @@ def _candidate(sealed: SealedCandidate, *arguments: str) -> CompletedProcess[str
     sealed.assert_unchanged()
     return _run(
         (str(sealed.cli), "install", "trust-root", *arguments),
-        env={**_CANDIDATE_ENV, "PATH": f"{sealed.venv}/bin:/usr/bin:/bin"},
+        env={**_CANDIDATE_ENV, "PATH": f"{sealed.venv}/bin:{_CANDIDATE_SYSTEM_PATH}"},
     )
 
 
