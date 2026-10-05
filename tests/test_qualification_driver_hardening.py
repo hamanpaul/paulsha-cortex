@@ -53,7 +53,10 @@ def _provider_name(argv) -> str:
 
 
 def _preflight(**overrides) -> dict[str, object]:
+    # #716（canary run 37357552758）：與 `_provider_preflight` 真實輸出同形狀——validator
+    # 要求 returncode／skipped 兩欄，舊 fixture 少了 returncode，才讓 driver 的缺欄漏網。
     payload: dict[str, object] = {
+        "returncode": 0,
         "status": "ready",
         "authenticated": True,
         "quota": "available",
@@ -458,10 +461,12 @@ def test_agy_preflight_accepts_machine_readable_quota_without_prompt_or_retry(
 
     monkeypatch.setattr(driver, "_run", fake_run)
     assert driver._provider_preflight("agy", "cortex-reviewer-planner") == {
+        "returncode": 0,
         "status": "ready",
         "authenticated": True,
         "quota": "available",
         "fallback": False,
+        "skipped": False,
     }
     assert len(calls) == 2
     assert calls[0][-1] == "--version"
@@ -534,10 +539,12 @@ def test_copilot_app_server_accepts_authenticated_quota_snapshots(
     )
 
     assert driver._provider_preflight("copilot", "cortex-reviewer-planner") == {
+        "returncode": 0,
         "status": "ready",
         "authenticated": True,
         "quota": "available",
         "fallback": False,
+        "skipped": False,
     }
     assert calls == [("/opt/cortex/toolchain/bin/copilot", "--version")]
 
@@ -600,10 +607,12 @@ def test_copilot_preflight_accepts_exhausted_quota_when_usage_remains_allowed(
 
     driver = _load_driver()
     assert _copilot_preflight_with_quota(driver, monkeypatch, _copilot_live_snapshots()) == {
+        "returncode": 0,
         "status": "ready",
         "authenticated": True,
         "quota": "available",
         "fallback": False,
+        "skipped": False,
     }
 
 
@@ -701,10 +710,12 @@ def test_codex_app_server_accepts_authenticated_rate_limits(
     )
 
     assert driver._provider_preflight("codex", "cortex-builder") == {
+        "returncode": 0,
         "status": "ready",
         "authenticated": True,
         "quota": "available",
         "fallback": False,
+        "skipped": False,
     }
     assert calls == [("/opt/cortex/toolchain/bin/codex", "--version")]
 
@@ -757,7 +768,14 @@ def test_codex_preflight_ignores_purchased_credits_when_plan_usage_is_allowed(
     driver = _load_driver()
     assert _codex_preflight_with_rate_limits(
         driver, monkeypatch, _codex_live_rate_limits(ordinary_usage_allowed=True)
-    ) == {"status": "ready", "authenticated": True, "quota": "available", "fallback": False}
+    ) == {
+        "returncode": 0,
+        "status": "ready",
+        "authenticated": True,
+        "quota": "available",
+        "fallback": False,
+        "skipped": False,
+    }
 
 
 @pytest.mark.parametrize("ordinary", [False, None])

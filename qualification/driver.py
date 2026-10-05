@@ -2864,6 +2864,37 @@ def _copilot_preflight_from_responses(
     }
 
 
+#: app-server 型 status probe（codex／copilot 的 JSON-RPC 交換）沒有可代表結果的
+#: process exit code：driver 拿到回應後就關閉 stdin 並終止 server，結束碼只反映被
+#: SIGTERM。交換的傳輸錯誤、逾時、`error` 回應與欄位不合都已在判定前 fail closed，
+#: 能走到判定就等同 status probe 成功，因此證據記 0（#716）。
+APP_SERVER_STATUS_PROBE_RETURNCODE = 0
+#: validate.py 對每個 provider preflight 要求的判定欄位（不含 returncode／skipped）。
+PREFLIGHT_VERDICT_FIELDS = frozenset({"status", "authenticated", "quota", "fallback"})
+
+
+def _preflight_evidence(
+    verdict: Mapping[str, object], *, returncode: int
+) -> dict[str, object]:
+    """把 provider 原生 status 的判定收成 validate.py 要求的 preflight 證據形狀。
+
+    #716（canary run 37357552758）：validator 要求每個 provider 的 preflight 恰好是
+    returncode／status／authenticated／quota／fallback／skipped 六欄，且
+    ``returncode == 0``、``skipped is False``；driver 先前三個 provider 都只寫後四欄，
+    canary 跑完全部 live 階段後在 validate 被拒（agy 只是先被檢查到）。canary 路徑上
+    preflight 從不跳過——沒有結構化 status 的 provider 會直接 fail closed——因此
+    ``skipped`` 一律為 False；returncode 記 status probe 實際的結束碼。
+    """
+
+    if set(verdict) != PREFLIGHT_VERDICT_FIELDS:
+        raise QualificationFailure("provider preflight verdict shape is invalid")
+    if isinstance(returncode, bool) or not isinstance(returncode, int) or returncode != 0:
+        raise QualificationFailure(
+            f"provider preflight status probe did not succeed (rc={returncode!r})"
+        )
+    return {"returncode": returncode, **verdict, "skipped": False}
+
+
 def _provider_preflight(provider: str, account: str) -> dict[str, object]:
     adapter = PROVIDER_PREFLIGHTS[provider]
     version = _run(
@@ -2910,7 +2941,10 @@ def _provider_preflight(provider: str, account: str) -> dict[str, object]:
                     or "status probe timed out" not in str(exc)
                 ):
                     raise
-        return _codex_preflight_from_responses(account_response, rate_limits_response)
+        return _preflight_evidence(
+            _codex_preflight_from_responses(account_response, rate_limits_response),
+            returncode=APP_SERVER_STATUS_PROBE_RETURNCODE,
+        )
     if adapter.status_kind == "copilot-app-server":
         auth_response, quota_response = _copilot_app_server_exchange(
             adapter.status_command,
@@ -2918,7 +2952,10 @@ def _provider_preflight(provider: str, account: str) -> dict[str, object]:
             env=account_env,
             timeout=45,
         )
-        return _copilot_preflight_from_responses(auth_response, quota_response)
+        return _preflight_evidence(
+            _copilot_preflight_from_responses(auth_response, quota_response),
+            returncode=APP_SERVER_STATUS_PROBE_RETURNCODE,
+        )
 
     status = _run(
         adapter.status_command,
@@ -2971,12 +3008,16 @@ def _provider_preflight(provider: str, account: str) -> dict[str, object]:
             raise QualificationFailure(
                 f"provider {provider} structured quota reports no remaining capacity"
             )
-        return {
-            "status": "ready",
-            "authenticated": True,
-            "quota": "available",
-            "fallback": False,
-        }
+        # agy 的 `/quota` 是一次性 print-mode process，記它真實的結束碼。
+        return _preflight_evidence(
+            {
+                "status": "ready",
+                "authenticated": True,
+                "quota": "available",
+                "fallback": False,
+            },
+            returncode=status.returncode,
+        )
 
     raise QualificationFailure(
         f"provider {provider} {adapter.version} structured status lacks live "
