@@ -16,6 +16,9 @@ from urllib.parse import quote
 
 
 GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+# #716：GitHub check run 已知的非終局 status；commit status 的 pending 已由
+# fetch_delivery_facts 正規化成 in_progress。未知／缺漏的 status 不算「仍在跑」。
+PENDING_CHECK_STATUSES = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
 COPILOT_REVIEWER_LOGIN = "copilot-pull-request-reviewer[bot]"
 REVIEW_TIMEOUT_SECONDS = 15 * 60
 _SHIP_CAPABILITY = object()
@@ -39,6 +42,10 @@ class GitHubCheck:
     @property
     def terminal_green(self) -> bool:
         return self.status == "completed" and self.conclusion in GREEN_CONCLUSIONS
+
+    @property
+    def pending(self) -> bool:
+        return self.status in PENDING_CHECK_STATUSES
 
 
 @dataclass(frozen=True)

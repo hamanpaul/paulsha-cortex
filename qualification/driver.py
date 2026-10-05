@@ -39,6 +39,7 @@ from paulsha_cortex.coordinator import (
     job_workspace,
     owner_reclaim,
     spool_slot,
+    verification,
 )
 from paulsha_cortex.trust_root.registry import (
     JobWriteContract,
@@ -4452,6 +4453,45 @@ def _codex_agent_loop_observation(
     }
 
 
+def _reclaimed_build_harvested(job: Mapping[str, object], *, repo_root: Path) -> bool:
+    """bundle 已隨 owner-bound reclaim 移除時，這張 build 卡的 harvest 是否確實落地。
+
+    #716（canary run 37282854268）：#1261 之後，會寫檔的 build 卡在採信時經 #1167
+    的 builder unit 回收，`owner_reclaim.reclaim_through_builder_unit` 以
+    `create_slot(commit_slot, reset=True)` 重設該 slot，`commits.bundle` 隨之移除——
+    那是 slot 重用的設計，bundle 早在採信時已 harvest 進 source repo。此時以三件事
+    作為 harvest 落地的證據：不是唯讀探針卡（它不產生 commit）、job 的 worktree 已
+    回收、job 的 subject_head 以 cortex-manager 身分可在 source repo 找到。
+    """
+
+    subject_head = job.get("subject_head")
+    worktree_value = job.get("worktree")
+    if (
+        job.get("workflow_card") == DEPLOYMENT_CANARY_PROBE_CARD
+        or not isinstance(subject_head, str)
+        or SHA40.fullmatch(subject_head) is None
+        or not isinstance(worktree_value, str)
+        or not worktree_value
+        or Path(worktree_value).exists()
+        or Path(worktree_value).is_symlink()
+    ):
+        return False
+    harvested = _run(
+        (
+            "/usr/bin/git",
+            "-C",
+            str(repo_root),
+            "cat-file",
+            "-e",
+            f"{subject_head}^{{commit}}",
+        ),
+        user="cortex-manager",
+        env=_account_env("cortex-manager"),
+        timeout=30,
+    )
+    return harvested.returncode == 0
+
+
 def _bound_codex_builder_log(
     root: Path, job: Mapping[str, object]
 ) -> tuple[Path, bytes]:
@@ -5375,6 +5415,14 @@ def _validate_dispatch_closeout(
             raise QualificationFailure("build commit spool authority is invalid")
         bundle = root / "commit-spool" / slot / "commits.bundle"
         if not bundle.exists():
+            # #716（canary run 37282854268）：#1261 之後，會寫檔的 build 卡在採信時經
+            # #1167 的 builder unit 回收，`reclaim_through_builder_unit` 會以
+            # `create_slot(commit_slot, reset=True)` 重設該 slot，bundle 隨之移除——
+            # 那是 slot 重用的設計，bundle 早已 harvest 進 source repo。這時改以
+            # 「worktree 已回收，且 job 的 subject_head 確實在 source repo」作為 harvest
+            # 落地的證據；唯讀的探針卡不產生 commit，不計入。
+            if _reclaimed_build_harvested(job, repo_root=repo_root):
+                bundle_seen = True
             continue
         if bundle.is_symlink() or bundle.parent.is_symlink() or not bundle.is_file():
             raise QualificationFailure(
@@ -5414,7 +5462,9 @@ def _validate_dispatch_closeout(
         bundle_seen = True
         remember_artifact(bundle, bundle_digest_before)
     if not bundle_seen:
-        raise QualificationFailure("workflow has no verified commit bundle artifact")
+        raise QualificationFailure(
+            "workflow has no verified commit bundle artifact or reclaimed harvested candidate"
+        )
 
     completion_value = workflow.get("completion_record_path")
     if not isinstance(completion_value, str):
@@ -5508,20 +5558,63 @@ def _validate_dispatch_closeout(
         )
         metadata = path.stat()
         inode = (metadata.st_dev, metadata.st_ino)
-        if (
-            hashlib.sha256(content).hexdigest() != expected_hash
-            or path in gate_paths
-            or inode in gate_inodes
-        ):
-            raise QualificationFailure("workflow delivery gate hash/path is not unique")
+        # #716（canary run 37290200603）：三種情況過去合成一句，看不出是哪一種。
+        # 分開報出，並帶上 ref 的 kind 與檔名（不含內容）。
+        gate_label = f"{row.get('kind')}:{path.name}"
+        # #716（canary run 37308848071）：`copilot` 這張 gate ref 記的不是檔案
+        # bytes 雜湊。Manager 經 `work_bridge._write_json_evidence` 寫出的證據是
+        # `{"payload": ..., "hash": canonical_json_hash(payload)}` envelope，檔名
+        # ＝ digest；`row["sha256"]` 來自 `validate_ship_result` 的
+        # `review_hash = value["hash"]`，即 envelope 的 `hash`（payload 的
+        # canonical hash），永遠對不上整個檔案的 bytes 雜湊。改用與 Manager 相同
+        # 的 envelope 語意（manager.py `set(envelope) != {"payload", "hash"}`
+        # 採信慣例）核對 stem／envelope hash／payload canonical hash 三者一致；
+        # 其餘 kind 維持原本的檔案 bytes 雜湊比對。
+        if row["kind"] == "copilot":
+            envelope: object = None
+            if path.name == f"{expected_hash}.json":
+                try:
+                    envelope = json.loads(content.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    envelope = None
+            payload = envelope.get("payload") if isinstance(envelope, dict) else None
+            if (
+                not isinstance(envelope, dict)
+                or set(envelope) != {"payload", "hash"}
+                or not isinstance(payload, dict)
+                or envelope.get("hash") != expected_hash
+                or verification.canonical_json_hash(payload) != expected_hash
+            ):
+                raise QualificationFailure(
+                    f"workflow delivery gate hash mismatch: {gate_label}"
+                )
+        elif hashlib.sha256(content).hexdigest() != expected_hash:
+            raise QualificationFailure(
+                f"workflow delivery gate hash mismatch: {gate_label}"
+            )
+        if path in gate_paths:
+            raise QualificationFailure(
+                f"workflow delivery gate path is not unique: {gate_label}"
+            )
+        if inode in gate_inodes:
+            raise QualificationFailure(
+                f"workflow delivery gate inode is not unique: {gate_label}"
+            )
         # #1096：evidence 過去只以 kind／path／hash 採信，證據內容從未被讀——他 run
         # 或舊 candidate 遺留的合法檔案，只要湊得出對應的 path＋hash 就能滿足
         # closeout。這裡把內容當 JSON 讀出來，凡是自報 run_id／work_id／candidate
         # 的欄位都必須與本次派工相符（欄位不存在則不強求，避免對未帶這些欄位的
         # 既有 evidence adapter 產生新的形狀假設）；`foreign-review` 另外強制要求
         # 逐字等於本 run 已獨立驗過的 review job workflow evidence（同一份
-        # path＋hash），不接受任何「看起來合法」但不是那一份的檔案。
-        evidence_payload = _json_object(content, label="workflow delivery gate")
+        # path＋hash），不接受任何「看起來合法」但不是那一份的檔案。`copilot` 的
+        # 可驗內容是 envelope 的 `payload`（頂層只有 `payload`／`hash` 兩個鍵，
+        # 沒有 run_id／work_id／candidate），且額外強制 schema／run_id／candidate
+        # 必須存在並等於本次派工，不像其他 kind 允許欄位缺席。
+        evidence_payload = (
+            payload
+            if row["kind"] == "copilot"
+            else _json_object(content, label="workflow delivery gate")
+        )
         observed_run_id = evidence_payload.get("run_id")
         observed_work_id = evidence_payload.get("work_id")
         observed_candidate = evidence_payload.get("candidate")
@@ -5531,6 +5624,16 @@ def _validate_dispatch_closeout(
             or (
                 isinstance(observed_candidate, str)
                 and observed_candidate != candidate
+            )
+            or (
+                row["kind"] == "copilot"
+                and (
+                    evidence_payload.get("schema") != "cortex-delivery-adapter/v1"
+                    or not isinstance(observed_run_id, str)
+                    or observed_run_id != run_id
+                    or not isinstance(observed_candidate, str)
+                    or observed_candidate != candidate
+                )
             )
         ):
             raise QualificationFailure(
@@ -5548,7 +5651,11 @@ def _validate_dispatch_closeout(
         gate_paths.add(path)
         gate_inodes.add(inode)
         gate_kinds.add(row["kind"])
-        remember_artifact(path, expected_hash)
+        # `expected_hash`／`row["sha256"]` 對 `copilot` 而言是 payload 的 canonical
+        # hash，不是檔案 bytes 雜湊（見上方 envelope 驗證）；dispatch artifact
+        # ledger 的不變式是「記的是這個路徑當下真實內容的雜湊」，所以一律重算
+        # bytes 雜湊，不要混用 gate-ref 語意的 digest。
+        remember_artifact(path, hashlib.sha256(content).hexdigest())
     if (
         "foreign-review" not in gate_kinds
         or len(gate_kinds & {"copilot", "maintainer-review"}) != 1

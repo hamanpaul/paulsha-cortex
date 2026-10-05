@@ -1,0 +1,1 @@
+- #716 canary closeout：#1261 之後，會寫檔的 build 卡經 owner-bound reclaim 回收時，commit-spool slot 會被重設、bundle 隨之移除（slot 重用的設計）。closeout 改為：bundle 還在就照舊驗證；bundle 已移除時，以「非唯讀探針卡、worktree 已回收、subject_head 以 cortex-manager 身分可在 source repo 找到」證明 harvest 落地（canary run 37282854268）。

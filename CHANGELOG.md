@@ -10,6 +10,9 @@
 ### Added
 
 - **#1263 一鍵升級 `cortex upgrade <版本>`**：root 一個指令完成 ingress → plan → apply → 憑證繼承 → activate → verify → loaded↔installed 核對，失敗自動回到前一版；新增 `--recover`／`--status`、`credentials inherit`、`effective_receipt` 與 RC 升級演練；`--release-source`／`--allow-same-version`／`--prior-receipt` 僅供 qualification（`PSC_UPGRADE_QUALIFICATION=1`）使用、無 `--repository` 參數（官方來源固定 `hamanpaul/paulsha-cortex`）；maintenance window 內 SIGHUP 與 INT／TERM 一樣觸發 rollback、`--status` 也偵測 stale lease marker（見 `changelog.d/one-command-upgrade.md`）（#1263）。
+- **#716 post-archive reviewer 不再補入過期的 active OpenSpec 檔**：archive 之後 reviewer 的 OpenSpec planning authority 輸入改讀候選自己的 archive 副本（tasks.md 只容忍 checkbox 差異，entry 不唯一／symlink／缺檔 fail-closed），不再從來源樹 seed claim 當下未勾選的 active 檔（#716）。
+- **#716 closeout gate ref 診斷**：gate ref 失敗時分開報出雜湊、路徑、inode 與 kind（#716）。
+- **#716 closeout 接受已回收的 harvest 證據**：bundle 隨 owner-bound reclaim 移除時，以 source repo 中的 subject_head 證明 harvest 落地（#716）。
 - **#1261 workflow lane 的 builder 工作區改走 owner-bound reclaim**：會寫檔的 build 卡派工時把 owner identity／attempt 寫進 marker 與 job 記錄，三 UID 下經 builder unit 回收；唯讀卡維持 Manager 直接回收，回收前以 job 記錄核對 marker（#1261）。
 - **#1259 archive 與交付 PR 之後的 retry-build 派得出 Builder**：Builder admission 另外接受兩種 Manager 自產漂移（Manager archive 造成的 OpenSpec archived；retry-build 後 build phase 的交付 PR，須同時具備 receipt、delivery journal 推送證據與唯一 open PR）。retry-build admission 與 Builder 派工入口共用判定，派不出 Builder 時在 reset 前拒絕；新增 `cortex-retry-build-receipt/v1`（#1259）。
 - **#716 probe issue 說明 archive**：避免 Copilot 把 Manager 的 archive 誤判成 finding（#716）。
@@ -126,6 +129,8 @@
 
 ### Fixed
 
+- **#716 ship merge gate 遇到仍在跑的 check 改為等待而非 needs_human**：gate 唯一理由是 `checks-not-terminal-green`、且所有非綠 check 都還是非終局 status（queued／in_progress／waiting／requested／pending）時，Copilot 與 maintainer-review 兩條 ship 路徑共用 `_checks_pending_response` 回非終局 `checks-pending`（附 `pending_checks`），不寫 merge authorization、不動 ship state、不吃 repair round，delivery adapter 映射為 pending、下一個 tick 以同一 exact HEAD 與同一筆 Copilot review 重評；completed 但非綠、未知 status、沒有任何 check 或併有其他 gate 理由仍 fail-closed 擲例外（canary run 37320144662：`copilot-pull-request-reviewer` check 仍 in_progress 時 tick 撞 `merge authorization blocked: checks-not-terminal-green` → `resume-workflow-failed`）（#716）。
+- **#716 canary closeout 以 envelope 語意驗 copilot gate ref**：`copilot` delivery gate ref 記的是 `work_bridge._write_json_evidence` 寫出的 `{"payload": ..., "hash": ...}` envelope（payload 的 canonical hash，不是檔案 bytes 雜湊），closeout 改認 envelope 語意——檔名＝digest、envelope 的 `hash` 與 payload 的 canonical hash 都要等於 row 記的 sha256，payload 另外核對 schema／run_id／candidate——不再對它做純 bytes 雜湊比對；dispatch artifact ledger 一律記真實 bytes 雜湊，不混用 gate-ref 語意的 digest（canary run 37308848071）（#716）。
 - **#716 canary 探針卡的唯讀模板**：worktree-isolation（write-forbidden）必須跑在 `cortex-job-ro[-jit]@`，spec 檢查失敗時列出不成立的條件（#716）。
 - **#716 canary 結案的 evidence candidate 綁定**：每張卡的 evidence 綁它自己的 subject，另要求最終 candidate 被 verify 與 review（archive commit 會換掉 candidate）（#716）。
 - **#716 canary 結案只要求最後一個 build 的 gate passed**：tdd-red 依設計 pytest failed、worktree-isolation 不跑 gate；只有產出交付 candidate 的最後一個 build job 必須 passed（#716）。
