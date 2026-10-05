@@ -61,12 +61,14 @@ from ..config.paths import worktree_root_for
 from .claim import (
     AuthorityValidationError,
     REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+    SelfDeliveryEvidence,
     WorkAuthority,
     authority_matches_claim_era,
     decomposition_route,
     needs_human_next_actions,
     needs_human_next_step_hint,
     planning_declared_openspec_changes,
+    work_authority_digest,
 )
 from . import model_resolution
 from .diagnostics import (
@@ -4213,6 +4215,242 @@ def _post_archive_candidate(run, *, registry, jobs) -> str | None:
     ):
         return None
     return candidate.lower()
+
+
+# #1259：retry-build reset 的 Manager-owned receipt。work action 在 reset 前以
+# `work_actions._write_supersede_evidence` 寫入（content-addressed、O_EXCL、0444），
+# 只供 Builder admission 判定「這個 build phase 是本輪 retry-build reset 的結果」；
+# 它不是 operator 裁決，不會注入任何 prompt。
+RETRY_BUILD_RECEIPT_SCHEMA = "cortex-retry-build-receipt/v1"
+RETRY_BUILD_RECEIPT_SUBDIR = "retry-build"
+_RETRY_BUILD_RECEIPT_MAX_BYTES = 4096
+
+
+def retry_build_receipt_body(run) -> dict[str, object]:
+    """reset 後 run 形狀對應的 receipt body（writer 與 reader 共用的單一定義）。
+
+    writer 以 ``registry.retry_build_reset_projection(run)`` 呼叫，reader 以目前的
+    run 呼叫；``build_attempt`` 因此只對 reset 完成後的那一個 attempt 有效——
+    receipt 已寫但 reset 失敗時，留下的檔案對 attempt N 的 run 永遠對不上。
+    """
+
+    return {
+        "schema": RETRY_BUILD_RECEIPT_SCHEMA,
+        "repo": run.repo,
+        "work_id": run.work_id,
+        "run_id": run.run_id,
+        "claim_key": run.claim_key,
+        "source_revision": run.source_revision,
+        "expected_candidate": run.candidate_head,
+        "build_attempt": int(run.attempts.get("build", 0)),
+        "pr_refs": list(run.pr_refs),
+    }
+
+
+def _manager_owned_regular_file(path: Path, *, max_bytes: int, read_only: bool) -> bytes | None:
+    """lstat 判定：非 symlink、regular file、owner 為 Manager（effective uid）；
+    ``read_only`` 時另要求沒有任何 write bit。不符或讀不到一律回 ``None``。"""
+
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    geteuid = getattr(os, "geteuid", None)
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or (geteuid is not None and info.st_uid != geteuid())
+        or (read_only and stat.S_IMODE(info.st_mode) & 0o222)
+        or info.st_size > max_bytes
+    ):
+        return None
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def _retry_build_receipt_candidate(run, *, coordinator_root: str | Path | None) -> str | None:
+    """回傳本 run 目前這一輪 retry-build receipt 綁定的 exact Candidate；沒有則 ``None``。"""
+
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        coordinator_root is None
+        or getattr(run, "current_phase", None) != "build"
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+    ):
+        return None
+    try:
+        expected = retry_build_receipt_body(run)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    root = Path(coordinator_root) / "evidence" / RETRY_BUILD_RECEIPT_SUBDIR
+    if root.parent.is_symlink() or root.is_symlink() or not root.is_dir():
+        return None
+    digest = verification.canonical_json_hash(expected)
+    content = _manager_owned_regular_file(
+        root / f"{run.run_id}-{digest}.json",
+        max_bytes=_RETRY_BUILD_RECEIPT_MAX_BYTES,
+        read_only=True,
+    )
+    if content is None:
+        return None
+    try:
+        body = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if body != expected or verification.canonical_json_hash(body) != digest:
+        return None
+    return candidate
+
+
+def _delivery_journal_pushed_pr_number(
+    run, *, coordinator_root: str | Path | None
+) -> int | None:
+    """#1259：delivery journal 證實「由本 run 推送」的交付 PR 編號。
+
+    只接受 Manager 寫入的事實：journal row 以 run_id／repo／work_id／claim_key 綁本
+    run，``delivery_binding.pr_number`` 由 ``_ship_action`` 寫入，``pushes`` 由
+    ``work_bridge._push_exact_candidate`` 寫入；每一筆 push 都必須是合法 feature
+    ref 上的 exact head，且是目前 Candidate 本身或其祖先（Git 驗證）。PR 標題、
+    內文或分支名稱都不算證據。
+    """
+
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        coordinator_root is None
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+    ):
+        return None
+    content = _manager_owned_regular_file(
+        Path(coordinator_root) / "delivery-journal.json",
+        max_bytes=64 * 1024 * 1024,
+        read_only=False,
+    )
+    if content is None:
+        return None
+    try:
+        journal = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    runs = journal.get("runs") if isinstance(journal, dict) else None
+    if not isinstance(journal, dict) or journal.get("schema") != "cortex-delivery-journal/v1":
+        return None
+    row = runs.get(run.run_id) if isinstance(runs, dict) else None
+    if not isinstance(row, dict) or any(
+        row.get(field) != getattr(run, field, None)
+        for field in ("run_id", "repo", "work_id", "claim_key")
+    ):
+        return None
+    binding = row.get("delivery_binding")
+    if not isinstance(binding, dict) or set(binding) != {"pr_number", "change", "todo_paths"}:
+        return None
+    pr_number = binding.get("pr_number")
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+        return None
+    pushes = row.get("pushes")
+    if not isinstance(pushes, dict) or not pushes:
+        return None
+    branches: set[str] = set()
+    for head, push in pushes.items():
+        branch = push.get("branch") if isinstance(push, dict) else None
+        if (
+            not isinstance(push, dict)
+            or set(push) != {"branch", "ref", "head"}
+            or not isinstance(head, str)
+            or verification.SAFE_SHA_RE.fullmatch(head) is None
+            or push.get("head") != head
+            or not isinstance(branch, str)
+            or re.fullmatch(r"feature/[a-z0-9][a-z0-9._/-]*", branch) is None
+            or push.get("ref") != f"refs/heads/{branch}"
+        ):
+            return None
+        branches.add(branch)
+        # 與 archive job 的 Candidate 綁定同一個 Git ancestry 判準。
+        if not _manager_archive_subject_applies(
+            workspace_root=getattr(run, "workspace_root", ""),
+            subject_head=head.lower(),
+            candidate_head=candidate.lower(),
+        ):
+            return None
+    if len(branches) != 1:
+        return None
+    return pr_number
+
+
+def self_delivery_evidence(
+    run,
+    *,
+    registry,
+    coordinator_root: str | Path | None,
+    projected_retry_build_candidate: str | None = None,
+) -> SelfDeliveryEvidence | None:
+    """#1259：以 Manager 既有驗證入口算出本 run 的自產交付事實。
+
+    ``projected_retry_build_candidate`` 只給 retry-build admission 使用：reset 前
+    receipt 尚未寫入，以即將寫入的 exact Candidate 投影；其餘呼叫端一律讀 receipt。
+    """
+
+    run_id = getattr(run, "run_id", None)
+    candidate = getattr(run, "candidate_head", None)
+    if (
+        not isinstance(run_id, str)
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+    ):
+        return None
+    try:
+        jobs = list(registry.list_jobs()) if registry is not None else []
+    except Exception:  # noqa: BLE001 - unreadable registry yields no evidence
+        jobs = []
+    archive_applied = _manager_archive_applied(
+        run, registry=registry, jobs=jobs
+    ) and _manager_archive_job_applied(registry, run, jobs=jobs)
+    retry_build_candidate = (
+        projected_retry_build_candidate
+        if projected_retry_build_candidate is not None
+        else _retry_build_receipt_candidate(run, coordinator_root=coordinator_root)
+    )
+    return SelfDeliveryEvidence(
+        run_id=run_id,
+        candidate=candidate,
+        archive_applied=archive_applied,
+        retry_build_candidate=retry_build_candidate,
+        delivery_pr_number=_delivery_journal_pushed_pr_number(
+            run, coordinator_root=coordinator_root
+        ),
+    )
+
+
+def builder_authority_matches_claim_era(
+    authority,
+    run,
+    *,
+    registry,
+    coordinator_root: str | Path | None,
+    projected_retry_build_candidate: str | None = None,
+) -> bool:
+    """Builder 派工入口的 claim-era 判準（#847、#1259），retry-build admission 共用。
+
+    先走原本的 claim-era 比對；不相符時才以 Manager 自產交付事實（archive、
+    retry-build receipt、delivery journal 推送證據）重試一次。
+    """
+
+    if not isinstance(authority, WorkAuthority):
+        return False
+    if authority_matches_claim_era(authority, run):
+        return True
+    evidence = self_delivery_evidence(
+        run,
+        registry=registry,
+        coordinator_root=coordinator_root,
+        projected_retry_build_candidate=projected_retry_build_candidate,
+    )
+    return evidence is not None and authority_matches_claim_era(
+        authority, run, delivery_evidence=evidence
+    )
 
 
 def _planning_artifact_relative_path_after_archive(
@@ -14574,14 +14812,49 @@ class BuilderTodoAdmission:
     authority: WorkAuthority | None = None
 
 
-def _builder_todo_admission_stop(
+def builder_todo_admission_for_authority(run, authority) -> BuilderTodoAdmission | None:
+    """由已載入的 WorkAuthority 建 Builder Todo admission（retry-build admission 用）。
+
+    與 ``manager_daemon._builder_todo_admission_for_run`` 同一組條件：只有 build
+    phase 且 claim 為 ``claim:v1:`` 的 run 需要 admission；identity 不符一律回
+    ``error``（fail closed）。判定本身由 ``builder_todo_admission_decision`` 共用。
+    """
+
+    if (
+        getattr(run, "current_phase", None) != "build"
+        or not str(getattr(run, "claim_key", "")).startswith("claim:v1:")
+    ):
+        return None
+    if (
+        not isinstance(authority, WorkAuthority)
+        or authority.repo != run.repo
+        or authority.work_id != run.work_id
+    ):
+        return BuilderTodoAdmission(error="current-work-authority-unavailable")
+    return BuilderTodoAdmission(
+        authority_revision=work_authority_digest(authority),
+        mapped_todo_paths=authority.mapped_todo_paths,
+        # #847：把完整 WorkAuthority 一併帶給 admission，讓它能在裸 digest 不符時
+        # 另核對 self-only drift。
+        authority=authority,
+    )
+
+
+def builder_todo_admission_decision(
     *,
     registry,
     run,
     step,
     admission: BuilderTodoAdmission | None,
-) -> dict[str, object] | None:
-    """在 Builder 派工入口、建立 job/worktree 前驗證目前 Todo authority。"""
+    coordinator_root: str | Path | None = None,
+    projected_retry_build_candidate: str | None = None,
+) -> tuple[str, str, str] | None:
+    """Builder Todo admission 的純判定：回 ``(reason, detail, next_step_hint)`` 或 ``None``。
+
+    Manager 派工入口（``_builder_todo_admission_stop``）與 retry-build admission
+    （``work_actions._retry_build_admission_error``，以 reset 後的 run 形狀評估）
+    共用這一個判定（#1259），因此「action 受理」與「Builder 派得出去」不會分岔。
+    """
     if admission is None or step.phase != "build" or step.persona != "builder":
         return None
 
@@ -14607,8 +14880,16 @@ def _builder_todo_admission_stop(
             # #847：漂移若只來自本 run 自己已接受、內容 sha256 與 baseline 相符
             # 的 planning 產物（或等價的 OpenSpec／Manager PR 綁定），視為未變動；
             # 沿用既有 self-only drift 判準，不自行放寬或忽略 authority。
+            # #1259：另以 Manager 自產交付事實（archive、retry-build receipt、
+            # delivery journal 推送證據）覆核，見 builder_authority_matches_claim_era。
             isinstance(authority, WorkAuthority)
-            and authority_matches_claim_era(authority, run)
+            and builder_authority_matches_claim_era(
+                authority,
+                run,
+                registry=registry,
+                coordinator_root=coordinator_root,
+                projected_retry_build_candidate=projected_retry_build_candidate,
+            )
         )
     ):
         reason = "builder-todo-authority-changed"
@@ -14634,6 +14915,28 @@ def _builder_todo_admission_stop(
         next_step_hint = "保留唯一 canonical Todo；unlink 其他 mapping，等 Monitor 更新後 resume。"
     else:
         return None
+    return reason, detail, next_step_hint
+
+
+def _builder_todo_admission_stop(
+    *,
+    registry,
+    run,
+    step,
+    admission: BuilderTodoAdmission | None,
+    coordinator_root: str | Path | None = None,
+) -> dict[str, object] | None:
+    """在 Builder 派工入口、建立 job/worktree 前驗證目前 Todo authority。"""
+    decision = builder_todo_admission_decision(
+        registry=registry,
+        run=run,
+        step=step,
+        admission=admission,
+        coordinator_root=coordinator_root,
+    )
+    if decision is None:
+        return None
+    reason, detail, next_step_hint = decision
 
     current = registry.get_workflow_run(run.run_id)
     updated = registry._manager_update_workflow_run(
@@ -15396,6 +15699,7 @@ def _dispatch_workflow_card(
         run=run,
         step=step,
         admission=builder_todo_admission,
+        coordinator_root=coordinator_root,
     )
     if admission_stop is not None:
         return admission_stop

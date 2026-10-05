@@ -9,6 +9,7 @@
 
 ### Added
 
+- **#1259 archive 與交付 PR 之後的 retry-build 派得出 Builder**：Builder admission 另外接受兩種 Manager 自產漂移（Manager archive 造成的 OpenSpec archived；retry-build 後 build phase 的交付 PR，須同時具備 receipt、delivery journal 推送證據與唯一 open PR）。retry-build admission 與 Builder 派工入口共用判定，派不出 Builder 時在 reset 前拒絕；新增 `cortex-retry-build-receipt/v1`（#1259）。
 - **#716 probe issue 說明 archive**：避免 Copilot 把 Manager 的 archive 誤判成 finding（#716）。
 - **#716 修正回合帶上停止點內容**：retry-build 的裁決理由附上 verify／review 指出的問題（#716）。
 - **#716 closeout 回收診斷**：worktree 未回收時印出 Manager 的回收事件（#716）。

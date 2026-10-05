@@ -178,6 +178,32 @@ def slice_repin_eligible(slice_row: dict[str, Any]) -> bool:
     return "pending" in GATE_STATE_TRANSITIONS.get(gate_state, frozenset())
 
 
+def retry_build_reset_projection(current: WorkflowRun) -> WorkflowRun:
+    """#1259：retry-build reset 之後 run 的 phase／attempt／Candidate 形狀（純函式）。
+
+    `_manager_reset_workflow_for_retry_build` 以它為基底，再套上 step 重設、
+    model override 等欄位；`work_actions._retry_build_admission_error` 在 reset 前
+    以同一份形狀評估 Builder admission、`manager.retry_build_receipt_body` 以它
+    算出 receipt，三者不會分岔。不做任何驗證，也不持久化。
+    """
+
+    return replace(
+        current,
+        current_phase="build",
+        attempts={
+            **current.attempts,
+            "build": current.attempts.get("build", 0) + 1,
+        },
+        gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+        verified_head=None,
+        facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+        # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
+        # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
+        needs_human_reason=None,
+        gate_status="running",
+    )
+
+
 def workflow_run_pre_delivery(run: Any) -> bool:
     """`abandon` 的 pre-delivery 閘門：run 尚未進 ship、沒有 PR refs、沒有 ship
     step 通過、也沒有 completion record。
@@ -6003,22 +6029,8 @@ class JobRegistry:
                 **{persona: dict(row) for persona, row in model_chain_override.items()},
             }
         updated = replace(
-            current,
-            current_phase="build",
+            retry_build_reset_projection(current),
             steps=steps,
-            attempts={
-                **current.attempts,
-                "build": current.attempts.get("build", 0) + 1,
-            },
-            gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
-            verified_head=None,
-            facets=tuple(
-                facet for facet in current.facets if facet != "needs_human"
-            ),
-            # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
-            # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
-            needs_human_reason=None,
-            gate_status="running",
             retry_classification=(
                 current.retry_classification
                 if retry_classification is None
