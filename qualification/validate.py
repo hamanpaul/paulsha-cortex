@@ -76,6 +76,7 @@ REQUIRED_RELEASE_ARTIFACTS = {
     "evidence/attack-matrix.json",
     "evidence/artifact-inventory.json",
     "evidence/rollback-loaded-runtime-status.json",
+    "evidence/one-command-upgrade.json",
 }
 CANARY_ONLY_ARTIFACTS = {
     "evidence/provider-capabilities.json",
@@ -100,6 +101,7 @@ REQUIRED_RELEASE_TESTS = {
     "gate-attack-matrix",
     "negative-controls",
     "rollback-loaded-runtime",
+    "one-command-upgrade",
 }
 CANARY_ONLY_TESTS = {
     "provider-capability-smoke",
@@ -203,6 +205,103 @@ def _artifact_json(evidence_root: Path, relative: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         _fail(f"{relative} must contain a JSON object")
     return value
+
+
+def _require_loaded_runtime_match(
+    service_status: Any, expected: dict[str, Any], *, label: str
+) -> None:
+    service = service_status.get("service") if isinstance(service_status, dict) else None
+    loaded_runtime = service.get("loaded_runtime") if isinstance(service, dict) else None
+    if not isinstance(loaded_runtime, dict):
+        _fail(f"{label} loaded-runtime status is unknown")
+    for service_name in ("manager", "monitor"):
+        report = loaded_runtime.get(service_name)
+        comparison = report.get("comparison") if isinstance(report, dict) else None
+        trust_root = report.get("trust_root") if isinstance(report, dict) else None
+        installed = report.get("installed_artifact") if isinstance(report, dict) else None
+        if not all(isinstance(row, dict) for row in (comparison, trust_root, installed)):
+            _fail(f"{label} loaded-runtime report is unknown")
+        if (
+            any(
+                comparison.get(key) != "match"
+                for key in ("artifact_status", "config_status", "process_status")
+            )
+            or trust_root.get("status") != "verified"
+            or trust_root.get("receipt_id") != expected["receipt_id"]
+            or trust_root.get("wheel_sha256") != expected["wheel_sha256"]
+            or trust_root.get("candidate_commit") != expected["candidate_commit"]
+            or comparison.get("loaded_wheel_sha256") != expected["wheel_sha256"]
+            or installed.get("wheel_sha256") != expected["wheel_sha256"]
+        ):
+            _fail(f"{label} loaded-runtime artifact or receipt does not match")
+
+
+def _validate_one_command_upgrade(
+    evidence_root: Path,
+    *,
+    prior_receipt_id: Any,
+    drill_receipt_id: Any,
+    evidence_sha: str,
+    evidence_wheel_sha: str,
+) -> None:
+    """#1263：activate 前失敗演練與完整升級都必須綁回同一個 qualified prior。"""
+
+    status = _artifact_json(evidence_root, "evidence/one-command-upgrade.json")
+    if (
+        status.get("schema_version") != 1
+        or status.get("scenario") != "one-command-upgrade-same-artifact"
+    ):
+        _fail("one-command upgrade evidence scenario is unknown")
+    drill = _required_fields(
+        status.get("drill"),
+        "one-command upgrade drill",
+        {"result", "failed_step", "restore_safe", "receipt_id", "parent_receipt_id"},
+    )
+    if (
+        drill["result"] != "rolled-back"
+        or drill["failed_step"] != "credentials"
+        or drill["restore_safe"] is not True
+        or drill["parent_receipt_id"] != prior_receipt_id
+        or drill["receipt_id"] != drill_receipt_id
+    ):
+        _fail("one-command upgrade drill did not return to the qualified prior receipt")
+    upgraded = _required_fields(
+        status.get("upgrade"),
+        "one-command upgrade result",
+        {"result", "receipt_id", "parent_receipt_id", "plan_sha256", "inherited_credentials"},
+    )
+    if (
+        upgraded["result"] != "upgraded"
+        or upgraded["parent_receipt_id"] != prior_receipt_id
+        or upgraded["receipt_id"] in {prior_receipt_id, drill_receipt_id}
+        or not isinstance(upgraded["plan_sha256"], str)
+        or SHA256.fullmatch(upgraded["plan_sha256"]) is None
+    ):
+        _fail("one-command upgrade receipt is not a new successor of the qualified prior")
+    inherited = upgraded["inherited_credentials"]
+    if (
+        not isinstance(inherited, list)
+        or not inherited
+        or any(
+            not isinstance(row, dict) or row.get("inherited_from") != prior_receipt_id
+            for row in inherited
+        )
+    ):
+        _fail("one-command upgrade did not inherit the prior receipt's credentials")
+    expected = _required_fields(
+        status.get("expected"),
+        "one-command upgrade expected receipt",
+        {"receipt_id", "wheel_sha256", "candidate_commit"},
+    )
+    if (
+        expected["receipt_id"] != upgraded["receipt_id"]
+        or expected["wheel_sha256"] != evidence_wheel_sha
+        or expected["candidate_commit"] != evidence_sha
+    ):
+        _fail("one-command upgrade expected receipt is not this candidate")
+    _require_loaded_runtime_match(
+        status.get("service_status"), expected, label="one-command upgrade"
+    )
 
 
 def _normalized_keys(value: Any, keys: set[str]) -> set[str]:
@@ -1323,51 +1422,16 @@ def validate(
                 or expected["candidate_commit"] != evidence_sha
             ):
                 _fail("rollback loaded-runtime expected receipt is not this candidate")
-            service_status = rollback_status.get("service_status")
-            service = (
-                service_status.get("service")
-                if isinstance(service_status, dict)
-                else None
+            _require_loaded_runtime_match(
+                rollback_status.get("service_status"), expected, label="rollback"
             )
-            loaded_runtime = (
-                service.get("loaded_runtime") if isinstance(service, dict) else None
+            _validate_one_command_upgrade(
+                evidence_root,
+                prior_receipt_id=expected["receipt_id"],
+                drill_receipt_id=rollback_receipt["receipt_id"],
+                evidence_sha=evidence_sha,
+                evidence_wheel_sha=evidence_wheel_sha,
             )
-            if not isinstance(loaded_runtime, dict):
-                _fail("rollback loaded-runtime status is unknown")
-            for service_name in ("manager", "monitor"):
-                report = loaded_runtime.get(service_name)
-                comparison = (
-                    report.get("comparison") if isinstance(report, dict) else None
-                )
-                trust_root = (
-                    report.get("trust_root") if isinstance(report, dict) else None
-                )
-                installed = (
-                    report.get("installed_artifact")
-                    if isinstance(report, dict)
-                    else None
-                )
-                if not all(
-                    isinstance(row, dict) for row in (comparison, trust_root, installed)
-                ):
-                    _fail("rollback loaded-runtime report is unknown")
-                if (
-                    any(
-                        comparison.get(key) != "match"
-                        for key in (
-                            "artifact_status",
-                            "config_status",
-                            "process_status",
-                        )
-                    )
-                    or trust_root.get("status") != "verified"
-                    or trust_root.get("receipt_id") != expected["receipt_id"]
-                    or trust_root.get("wheel_sha256") != expected["wheel_sha256"]
-                    or trust_root.get("candidate_commit") != expected["candidate_commit"]
-                    or comparison.get("loaded_wheel_sha256") != expected["wheel_sha256"]
-                    or installed.get("wheel_sha256") != expected["wheel_sha256"]
-                ):
-                    _fail("rollback loaded-runtime artifact or receipt does not match")
         _validate_evidence_file_set(
             evidence_root=evidence_root,
             artifact_paths=artifact_paths,

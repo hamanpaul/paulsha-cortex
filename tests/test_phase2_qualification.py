@@ -216,7 +216,64 @@ def test_release_installed_checks_require_owner_bound_reclaim(
     assert seen == [("rc-test", evidence)]
 
 
-def _valid_full_qualification(tmp_path: Path, *, rollback_expected_wheel: str = "b" * 64) -> dict:
+def _one_command_upgrade_document(
+    *,
+    drill_result: str = "rolled-back",
+    inherited_from: str = "prior",
+    loaded_receipt_id: str = "upgraded",
+) -> dict:
+    wheel, commit = "b" * 64, "a" * 40
+    return {
+        "schema_version": 1,
+        "scenario": "one-command-upgrade-same-artifact",
+        "drill": {
+            "result": drill_result,
+            "failed_step": "credentials",
+            "restore_safe": True,
+            "receipt_id": "rollback",
+            "parent_receipt_id": "prior",
+        },
+        "upgrade": {
+            "result": "upgraded",
+            "receipt_id": "upgraded",
+            "parent_receipt_id": "prior",
+            "plan_sha256": "e" * 64,
+            "inherited_credentials": [
+                {"principal": "builder", "provider": "codex", "inherited_from": inherited_from}
+            ],
+        },
+        "expected": {"receipt_id": "upgraded", "wheel_sha256": wheel, "candidate_commit": commit},
+        "service_status": {
+            "service": {
+                "loaded_runtime": {
+                    name: {
+                        "comparison": {
+                            "artifact_status": "match",
+                            "config_status": "match",
+                            "process_status": "match",
+                            "loaded_wheel_sha256": wheel,
+                        },
+                        "trust_root": {
+                            "status": "verified",
+                            "receipt_id": loaded_receipt_id,
+                            "wheel_sha256": wheel,
+                            "candidate_commit": commit,
+                        },
+                        "installed_artifact": {"wheel_sha256": wheel},
+                    }
+                    for name in ("manager", "monitor")
+                }
+            }
+        },
+    }
+
+
+def _valid_full_qualification(
+    tmp_path: Path,
+    *,
+    rollback_expected_wheel: str = "b" * 64,
+    upgrade_document: dict | None = None,
+) -> dict:
     payload = _valid_qualification()
     payload["services"] = [
         {"name": "cortex-egress-proxy.service", "uid": 995, "gid": 995, "active": True},
@@ -242,6 +299,7 @@ def _valid_full_qualification(tmp_path: Path, *, rollback_expected_wheel: str = 
             "gate-attack-matrix",
             "negative-controls",
             "rollback-loaded-runtime",
+            "one-command-upgrade",
             "provider-capability-smoke",
             "full-dispatch-closeout",
             "manager-github-dry-run-push",
@@ -461,6 +519,11 @@ def _valid_full_qualification(tmp_path: Path, *, rollback_expected_wheel: str = 
                 }
             },
         },
+        "one-command-upgrade.json": (
+            upgrade_document
+            if upgrade_document is not None
+            else _one_command_upgrade_document()
+        ),
     }
     for name, value in documents.items():
         _write_json(evidence / name, value)
@@ -706,12 +769,66 @@ def test_release_harness_rolls_back_before_adding_runtime_scaffold_fixture() -> 
     assert rollback < reinstall < scaffold
 
 
-def test_release_harness_checks_loaded_runtime_after_qualified_upgrade_rollback() -> None:
+def test_release_harness_drives_one_command_upgrade_drill_then_full_upgrade() -> None:
     runner = _required_text(RUNNER)
-    qualified_rollback = runner.index('cortex install trust-root rollback \\')
-    driver = runner.index('driver_profile_args+=(\n    --rollback-receipt')
-    assert qualified_rollback < driver
+    assert "cortex install trust-root rollback \\" not in runner
+    assert "rollback_overlay_path" not in runner
+    source = runner.index("/usr/local/libexec/cortex-qualification-release-source")
+    overlay = runner.index("/var/lib/cortex-installer/host-overlay.yaml")
+    drift = runner.index('chmod 0640 "$builder_codex_credential"')
+    drill = runner.index('sh "$upgrade_drill_report" "${upgrade_cli[@]}"')
+    restore = runner.index('chmod 0600 "$builder_codex_credential"')
+    full = runner.index('sh "$upgrade_report" "${upgrade_cli[@]}"')
+    driver = runner.index("driver_profile_args+=(\n    --prior-receipt")
+    assert source < overlay < drift < drill < restore < full < driver
+    assert runner.count("--env PSC_UPGRADE_QUALIFICATION=1") == 2
+    for fragment in (
+        '/opt/cortex/venv/bin/cortex upgrade "$upgrade_version"',
+        '--release-source "$upgrade_release_source"',
+        "--allow-same-version",
+        '--prior-receipt "$receipt_path"',
+        '--upgrade-drill-report "$upgrade_drill_report"',
+        '--upgrade-report "$upgrade_report"',
+        '--receipt "$upgrade_receipt_path"',
+        '--install-evidence "$upgrade_evidence_path"',
+    ):
+        assert fragment in runner
     assert '"--install-receipt"' in _required_text(DRIVER)
+
+
+def test_reference_image_ships_the_release_source_helper() -> None:
+    raw = _required_text(DOCKERFILE)
+    assert (
+        "COPY release_source.py /usr/local/libexec/cortex-qualification-release-source"
+        in raw
+    )
+    assert "/usr/local/libexec/cortex-qualification-release-source" in raw.split(
+        "RUN chmod", 1
+    )[1]
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"drill_result": "halted"}, "drill did not return to the qualified prior receipt"),
+        ({"inherited_from": "another"}, "did not inherit the prior receipt's credentials"),
+        (
+            {"loaded_receipt_id": "prior"},
+            "one-command upgrade loaded-runtime artifact or receipt does not match",
+        ),
+    ],
+)
+def test_full_suite_validator_rejects_broken_one_command_upgrade_evidence(
+    tmp_path: Path, changes, message
+) -> None:
+    payload = _valid_full_qualification(
+        tmp_path, upgrade_document=_one_command_upgrade_document(**changes)
+    )
+
+    completed = _run_full_validator(tmp_path, payload)
+
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert message in completed.stderr
 
 
 def test_qualification_schema_binds_release_evidence_and_runtime_identity() -> None:

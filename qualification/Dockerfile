@@ -55,6 +55,7 @@ COPY validate.py /usr/local/libexec/cortex-qualification-validate
 COPY contract.py /usr/local/libexec/qualification/contract.py
 COPY __init__.py /usr/local/libexec/qualification/__init__.py
 COPY verify_bundle.py /usr/local/libexec/cortex-qualification-verify-bundle
+COPY release_source.py /usr/local/libexec/cortex-qualification-release-source
 COPY driver.py /usr/local/libexec/cortex-release-qualification
 COPY qualification.schema.json /usr/local/share/cortex/qualification.schema.json
 # legacy-adoption profile (#1122): the Phase 2b-shaped fixture and its harness.
@@ -65,6 +66,7 @@ COPY legacy_adoption.py /usr/local/libexec/cortex-legacy-adoption
 RUN chmod 0755 \
         /usr/local/libexec/cortex-qualification-validate \
         /usr/local/libexec/cortex-qualification-verify-bundle \
+        /usr/local/libexec/cortex-qualification-release-source \
         /usr/local/libexec/cortex-release-qualification \
         /usr/local/libexec/cortex-legacy-adoption
 

@@ -277,3 +277,123 @@ def test_installed_checks_pass_the_effective_install_receipt_to_system_status(
     )
 
     assert status_commands[0][-2:] == ("--install-receipt", str(receipt_path))
+
+
+def _upgrade_inputs(
+    tmp_path: Path, *, drill_result: str = "rolled-back", inherited_from: str = "prior"
+):
+    drill_receipt = tmp_path / "drill-receipt.json"
+    parent = {
+        "path": "/run/cortex-install/install-receipt.json",
+        "receipt_id": "prior",
+        "plan_sha256": "e" * 64,
+    }
+    drill_receipt.write_text(
+        json.dumps({"receipt_id": "drill", "state": "rolled-back", "parent_receipt": parent}),
+        encoding="utf-8",
+    )
+    plan = {"candidate": {"wheel_sha256": "b" * 64}, "repo_identity": {"commit": "c" * 40}}
+    prior = {"receipt_id": "prior", "plan": plan}
+    upgraded = {
+        "receipt_id": "upgraded",
+        "state": "applied",
+        "qualified": True,
+        "parent_receipt": parent,
+        "plan": plan,
+        "credentials": [
+            {
+                "principal": "builder",
+                "provider": "codex",
+                "mode": "0600",
+                "sha256": "f" * 64,
+                "inherited_from": inherited_from,
+            }
+        ],
+    }
+    drill = {
+        "result": drill_result,
+        "failed_step": "credentials",
+        "receipt": {"path": str(drill_receipt), "receipt_id": "drill"},
+        "rollback": {
+            "restore_safe": True,
+            "prior_loaded_runtime": {"mismatch": "", "service_status": _rollback_status_payload()},
+        },
+    }
+    report = {
+        "result": "upgraded",
+        "receipt": {"path": "/var/lib/cortex-install-receipts/next.json", "receipt_id": "upgraded"},
+        "plan": {"sha256": "d" * 64},
+    }
+    return prior, upgraded, drill, report
+
+
+def _upgraded_status_payload():
+    payload = _rollback_status_payload()
+    for report in payload["service"]["loaded_runtime"].values():
+        report["trust_root"]["receipt_id"] = "upgraded"
+    return payload
+
+
+def _capture(driver, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **changes):
+    prior, upgraded, drill, report = _upgrade_inputs(tmp_path, **changes)
+    commands: list[tuple[str, ...]] = []
+
+    def run(argv, **_kwargs):
+        commands.append(tuple(argv))
+        return driver.CommandResult(tuple(argv), 0, json.dumps(_upgraded_status_payload()), "")
+
+    monkeypatch.setattr(driver, "_run", run)
+    monkeypatch.setattr(driver, "_installed_runtime_env", dict)
+    monkeypatch.setattr(driver, "SYSTEM_STATUS_SETTLE_SECONDS", 0)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    driver._capture_one_command_upgrade(
+        prior_receipt=prior,
+        upgrade_receipt=upgraded,
+        receipt_path=Path(report["receipt"]["path"]),
+        drill_report=drill,
+        upgrade_report=report,
+        evidence_dir=evidence,
+    )
+    return evidence, commands
+
+
+def test_one_command_upgrade_evidence_binds_the_drill_and_the_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _driver()
+
+    evidence, commands = _capture(driver, tmp_path, monkeypatch)
+
+    rollback = json.loads((evidence / "rollback-loaded-runtime-status.json").read_text())
+    assert rollback["scenario"] == "same-artifact-qualified-prior-to-candidate-rollback"
+    assert rollback["rollback_receipt"] == {
+        "receipt_id": "drill",
+        "state": "rolled-back",
+        "parent_receipt_id": "prior",
+    }
+    upgrade = json.loads((evidence / "one-command-upgrade.json").read_text())
+    assert upgrade["scenario"] == "one-command-upgrade-same-artifact"
+    assert upgrade["upgrade"]["inherited_credentials"] == [
+        {"principal": "builder", "provider": "codex", "inherited_from": "prior"}
+    ]
+    assert upgrade["expected"]["receipt_id"] == "upgraded"
+    assert commands[-1][-2:] == ("--install-receipt", "/var/lib/cortex-install-receipts/next.json")
+
+
+def test_one_command_upgrade_evidence_refuses_a_drill_that_did_not_roll_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _driver()
+
+    with pytest.raises(driver.QualificationFailure, match="did not roll back"):
+        _capture(driver, tmp_path, monkeypatch, drill_result="halted")
+
+
+def test_one_command_upgrade_evidence_refuses_credentials_not_inherited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _driver()
+
+    with pytest.raises(driver.QualificationFailure, match="inherited the prior credentials"):
+        _capture(driver, tmp_path, monkeypatch, inherited_from="another")
