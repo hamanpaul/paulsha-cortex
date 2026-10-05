@@ -7471,10 +7471,27 @@ def inherit_prior_credentials(
 
     Only rows the prior receipt already records move over, and only when the
     new plan derives the same destination and the file there passes the same
-    live check activation runs (regular file, one link, uid/gid, 0600, sha256).
-    No HOME is searched and no credential content leaves the file.  A pair the
-    new plan requires but the prior never recorded is refused: the operator
-    imports it through the runbook instead.
+    live metadata check activation runs (regular file, one link, uid/gid,
+    0600).  No HOME is searched and no credential content leaves the file
+    except as its sha256.  A pair the new plan requires but the prior never
+    recorded is refused: the operator imports it through the runbook instead.
+
+    The inherited row records the sha256 the file holds now, not the value the
+    prior receipt recorded at import (#1275).  Every inheritable destination is
+    a file its own account owns with mode 0600 (the metadata check enforces
+    exactly that), so that account can always rewrite the content, and the
+    executors do so by design: codex refreshes ``auth.json`` inside its
+    job-writable ``HOME_STICKY_TREE``, agy writes its token inside the
+    ``HOME_REDIRECT_TREE`` under ``cache``, ``gh`` rewrites ``hosts.yml`` in
+    place (``IN_PLACE_CONTENT_WRITE_ASSETS``), and ``.copilot/`` is a state
+    directory the installer hands to the account.  No shape leaves the content
+    out of the owner's reach, so none keeps a strict digest match.  A pinned
+    digest would not stop that account, while other accounts are kept out by
+    the owner, mode, link count and fixed location, which stay checked.  The
+    row keeps the released key set; the prior's digest stays recoverable
+    through ``inherited_from`` and the prior receipt's own row.  Activation
+    then validates the row against the digest recorded here, with services
+    stopped so no refresh can land in between.
     """
 
     document = receipt._document
@@ -7522,7 +7539,6 @@ def inherit_prior_credentials(
             "roll back and import them per trust-root-transactional-install.md §4"
         )
     prior_id = str(prior_document.get("receipt_id"))
-    inherited: list[dict[str, str]] = []
     for principal, provider in required:
         if credential_destination(
             prior_receipt, principal=principal, provider=provider
@@ -7530,18 +7546,37 @@ def inherit_prior_credentials(
             raise CredentialImportError(
                 f"credential destination changed since the prior receipt: {principal}/{provider}"
             )
-        inherited.append(
+    observer = getattr(backend, "observe_credentials", None)
+    validator = getattr(backend, "validate_credentials", None)
+    if not callable(observer) or not callable(validator):
+        raise CredentialImportError("backend cannot validate inherited credentials")
+    observed, observe_failures = observer(
+        InstallReceipt(
             {
-                "principal": principal,
-                "provider": provider,
-                "mode": "0600",
-                "sha256": str(prior_rows[(principal, provider)].get("sha256")),
-                "inherited_from": prior_id,
+                **document,
+                "credentials": [
+                    {"principal": principal, "provider": provider}
+                    for principal, provider in required
+                ],
             }
         )
-    validator = getattr(backend, "validate_credentials", None)
-    if not callable(validator):
-        raise CredentialImportError("backend cannot validate inherited credentials")
+    )
+    failures = tuple(str(row) for row in observe_failures)
+    if failures:
+        raise CredentialImportError(
+            "prior credential cannot be inherited: " + "; ".join(failures)
+        )
+    inherited: list[dict[str, str]] = [
+        {
+            "principal": principal,
+            "provider": provider,
+            "mode": "0600",
+            "sha256": str(observed[(principal, provider)]),
+            "inherited_from": prior_id,
+        }
+        for principal, provider in required
+    ]
+    # The exact check activation runs, against the digest just recorded.
     probe = InstallReceipt({**document, "credentials": deepcopy(inherited)})
     failures = tuple(str(row) for row in validator(probe))
     if failures:

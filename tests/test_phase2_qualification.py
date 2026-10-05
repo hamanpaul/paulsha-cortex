@@ -810,6 +810,69 @@ def test_release_harness_drives_one_command_upgrade_drill_then_full_upgrade() ->
     assert '"--install-receipt"' in _required_text(DRIVER)
 
 
+def test_release_harness_refreshes_the_builder_credential_before_the_full_upgrade() -> None:
+    # #1275: executors rewrite their own login files between upgrades. RC
+    # rewrites the builder codex credential in place after the drill restored
+    # 0600 and before the full upgrade, then pins that the new receipt records
+    # the rewritten digest and names the prior receipt it inherited from.
+    runner = _required_text(RUNNER)
+    restore = runner.index('chmod 0600 "$builder_codex_credential"')
+    services = runner.index('die "upgrade drill did not restore $upgrade_service"')
+    prior_sha = runner.index("builder_codex_prior_sha=$(docker exec")
+    identity = runner.index("builder_codex_identity=$(docker exec")
+    # Rewritten as the owning account, the way codex refreshes it: root's
+    # O_CREAT open of another user's file in the sticky `.codex` is refused by
+    # fs.protected_regular.
+    rewrite = runner.index(
+        'if ! docker exec "$container_name" /usr/sbin/runuser -u cortex-builder -- \\\n'
+        "    sh -eu -c 'printf \"\\n\" >> \"$1\"' sh \"$builder_codex_credential\"; then\n"
+        '    die "credential refresh drill could not rewrite the builder credential as '
+        'cortex-builder"\nfi\n'
+    )
+    refreshed = runner.index("builder_codex_refreshed_sha=$(docker exec")
+    full = runner.index('sh "$upgrade_report" "${upgrade_cli[@]}"')
+    receipt = runner.index("upgrade_receipt_path=$(docker exec")
+    recorded = runner.index('--arg refreshed "$builder_codex_refreshed_sha"')
+    status_call = runner.index("/opt/cortex/venv/bin/cortex upgrade --status --json")
+    assert (
+        restore < services < prior_sha < identity < rewrite < refreshed < full
+        < receipt < recorded < status_call
+    )
+    section = runner[prior_sha:full]
+    for fragment in (
+        'select(.principal == "builder" and .provider == "codex")',
+        '"$receipt_path")',
+        "stat -c '%F %i %u %g %a %h' \"$builder_codex_credential\"",
+        '"regular file "*" 600 1"',
+        'sha256sum "$builder_codex_credential"',
+        '"$builder_codex_refreshed_sha" != "$builder_codex_prior_sha"',
+        'die "credential refresh drill changed the builder credential metadata"',
+        'die "credential refresh drill did not change the builder credential digest"',
+    ):
+        assert fragment in section, fragment
+    # The drill hashes the credential and never prints its content; root never
+    # writes it directly.
+    assert 'cat "$builder_codex_credential"' not in runner
+    assert (
+        "docker exec \"$container_name\" sh -eu -c 'printf \"\\n\" >> \"$1\"'"
+        not in runner
+    )
+    check = runner[recorded : runner.index("fi\n", recorded)]
+    for fragment in (
+        '--slurpfile prior "$receipt_path"',
+        "length == 1",
+        ".[0].sha256 == $refreshed",
+        ".[0].inherited_from == $prior[0].receipt_id",
+        '"$upgrade_receipt_path" >/dev/null; then',
+        'upgrade_diagnostics "$upgrade_report"',
+        'die "upgrade did not record the refreshed builder credential digest"',
+    ):
+        assert fragment in check, fragment
+    assert check.index('upgrade_diagnostics "$upgrade_report"') < check.index(
+        'die "upgrade did not record the refreshed builder credential digest"'
+    )
+
+
 def test_release_harness_prints_upgrade_diagnostics_before_dying() -> None:
     # Final review item 1: `--json` sends the report only to a file in the
     # container and `trap cleanup EXIT` deletes the container, so every failed

@@ -469,6 +469,33 @@ for upgrade_service in cortex-egress-proxy.service cortex-manager.service cortex
     docker exec "$container_name" systemctl is-active --quiet "$upgrade_service" || \
         die "upgrade drill did not restore $upgrade_service"
 done
+# 模擬 executor 自行刷新登入檔（#1275）：codex 以 builder 帳號身分就地改寫 auth.json。
+# 這裡同樣以 cortex-builder（driver 跑 job 帳號指令用的 `/usr/sbin/runuser -u`）在檔尾附加
+# 一個換行（JSON 尾端空白，憑證語意不變，內容不讀出也不印出），inode、owner、group、mode、
+# nlink 都不變，只有 sha256 改變。不能以 root 寫：`.codex` 是 sticky 目錄，kernel 的
+# fs.protected_regular 會拒絕 root 以 O_CREAT 開啟（shell `>>`）別的帳號的檔。完整升級必須
+# 照常接手，並在新 receipt 記錄改寫後的 sha。
+builder_codex_prior_sha=$(docker exec "$container_name" jq -r \
+    '[.credentials[] | select(.principal == "builder" and .provider == "codex")]
+     | if length == 1 then .[0].sha256 else empty end' \
+    "$receipt_path")
+builder_codex_identity=$(docker exec "$container_name" \
+    stat -c '%F %i %u %g %a %h' "$builder_codex_credential")
+[[ "$builder_codex_identity" == "regular file "*" 600 1" ]] || \
+    die "credential refresh drill changed the builder credential metadata"
+if ! docker exec "$container_name" /usr/sbin/runuser -u cortex-builder -- \
+    sh -eu -c 'printf "\n" >> "$1"' sh "$builder_codex_credential"; then
+    die "credential refresh drill could not rewrite the builder credential as cortex-builder"
+fi
+[[ "$(docker exec "$container_name" \
+    stat -c '%F %i %u %g %a %h' "$builder_codex_credential")" == "$builder_codex_identity" ]] || \
+    die "credential refresh drill changed the builder credential metadata"
+builder_codex_refreshed_sha=$(docker exec "$container_name" sha256sum "$builder_codex_credential")
+builder_codex_refreshed_sha=${builder_codex_refreshed_sha%% *}
+[[ "$builder_codex_prior_sha" =~ ^[0-9a-f]{64}$
+   && "$builder_codex_refreshed_sha" =~ ^[0-9a-f]{64}$
+   && "$builder_codex_refreshed_sha" != "$builder_codex_prior_sha" ]] || \
+    die "credential refresh drill did not change the builder credential digest"
 # 完整升級：apply → 繼承 prior 憑證 → activate → verify → loaded↔installed 一致。
 if ! docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \
     sh -eu -c 'out=$1; shift; "$@" >"$out"' sh "$upgrade_report" "${upgrade_cli[@]}"; then
@@ -483,6 +510,19 @@ upgrade_receipt_path=$(docker exec "$container_name" jq -r '.receipt.path' "$upg
 upgrade_evidence_path=$(docker exec "$container_name" jq -r '.verify_evidence' "$upgrade_report")
 [[ "$upgrade_receipt_path" == /* && "$upgrade_evidence_path" == /* ]] || \
     die "one-command upgrade report lacks the new receipt or verify evidence"
+# 新 receipt 的 builder/codex 列記錄改寫後的 sha，並標示接手自 prior receipt；prior 匯入
+# 時的 sha 仍在 prior receipt 自己那一列（#1275）。
+if ! docker exec "$container_name" jq -e \
+    --arg refreshed "$builder_codex_refreshed_sha" \
+    --slurpfile prior "$receipt_path" \
+    '[.credentials[] | select(.principal == "builder" and .provider == "codex")]
+     | length == 1
+       and .[0].sha256 == $refreshed
+       and .[0].inherited_from == $prior[0].receipt_id' \
+    "$upgrade_receipt_path" >/dev/null; then
+    upgrade_diagnostics "$upgrade_report"
+    die "upgrade did not record the refreshed builder credential digest"
+fi
 # `--status` 是只有正式部署才走的唯讀路徑（receipt chain 判定 effective receipt、維護
 # 狀態）；它不吃任何僅限測試的參數。升級後生效中的必須就是剛升級的 receipt、loaded
 # runtime 一致，而且沒有留下待 `--recover` 的 snapshot 或 lease marker。

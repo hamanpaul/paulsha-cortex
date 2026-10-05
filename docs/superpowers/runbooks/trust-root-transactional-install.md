@@ -29,9 +29,13 @@ rollback，但升級本身就此中止，終端機上的摘要也會跟著消失
 與三個 asset digest，驗過 qualification manifest、archive topology 與 bundle 每一個檔案後，
 在新的 `/var/lib/cortex-installer/<版本>/attempt-*` 目錄封存 candidate CLI；以非 root 身分產生
 plan 並自行綁定 plan sha、發布 durable plan；取得 maintenance lease、記下並停止服務；以
-`--prior-receipt` apply；沿用 prior receipt 已記錄的 credentials（`credentials inherit`，
-不讀憑證內容）；activate、verify，最後核對 loaded runtime 與新 receipt 一致。生效中的
-receipt 由 receipt chain 判定，不看檔名或時間。結果寫在
+`--prior-receipt` apply；沿用 prior receipt 已記錄的 credentials（`credentials inherit`）：
+新 plan 推得的落點必須與 prior 相同，落點檔照舊必須是 regular file、nlink 1、屬該帳號的
+uid／gid、權限 0600。executor 會自己改寫登入檔（例如 codex 刷新 token 時重寫 `auth.json`），
+因此新 receipt 記錄接手當下的 sha256 並標示 `inherited_from`，不要求等於 prior 匯入時記錄的
+值（那個值仍在 prior receipt 的同一列）；除了計算 sha256 不讀憑證內容。接著 activate（以剛
+記錄的 sha256 驗證憑證；升級期間服務已停，不會再刷新）、verify，最後核對 loaded runtime 與新
+receipt 一致。生效中的 receipt 由 receipt chain 判定，不看檔名或時間。結果寫在
 `/var/lib/cortex-installer/<版本>/upgrade-report.json`，終端機印出摘要（`--json` 改印完整報告）。
 
 - 只升不降：目標版本必須高於生效中的 receipt；降版改用 installer `rollback` 或下列手動流程。
