@@ -802,7 +802,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     sub.add_parser(
         "trust-root",
-        help="Phase 2: plan/apply/credentials/activate/verify/rollback",
+        help="Phase 2: plan/apply/credentials/activate/verify/rollback/upgrade",
         add_help=False,
     )
     args = parser.parse_args(raw_args)

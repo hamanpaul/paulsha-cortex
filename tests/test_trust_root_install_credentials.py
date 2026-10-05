@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -13,10 +14,12 @@ import pytest
 from paulsha_cortex.trust_root.install import (
     ActivationError,
     CredentialImportError,
+    InstallError,
     InstallReceipt,
     activate_receipt,
     apply_plan,
     import_credential,
+    inherit_prior_credentials,
     new_install_receipt,
     plan_sha256,
     rollback_receipt,
@@ -1247,3 +1250,368 @@ def test_activation_revalidates_imported_credential_bytes(tmp_path: Path) -> Non
     with pytest.raises(ActivationError, match="hash mismatch"):
         activate_receipt(receipt, backend=backend)
     assert backend.started == []
+
+
+_PRIOR_RECEIPT_PATH = Path("/var/lib/cortex-install-receipts/prior.json")
+
+
+def _inherited_row(
+    digest: str,
+    prior_id: str,
+    *,
+    principal: str = "builder",
+    provider: str = "codex",
+) -> dict[str, str]:
+    return {
+        "principal": principal,
+        "provider": provider,
+        "mode": "0600",
+        "sha256": digest,
+        "inherited_from": prior_id,
+    }
+
+
+def _write_credential(home: Path, relative: str, content: bytes) -> str:
+    destination = home / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(content)
+    destination.chmod(0o600)
+    return hashlib.sha256(content).hexdigest()
+
+
+def _credential_accounts(
+    tmp_path: Path, *, builder_uid: int | None = None
+) -> list[dict[str, object]]:
+    return [
+        {
+            "name": name,
+            "home": str(tmp_path / name),
+            "uid": (
+                builder_uid
+                if builder_uid is not None and name == "cortex-builder"
+                else os.getuid()
+            ),
+            "gid": os.getgid(),
+        }
+        for name in ("cortex-builder", "cortex-reviewer-planner", "cortex-manager")
+    ]
+
+
+def _successor_link(prior_id: str) -> dict[str, str]:
+    return {
+        "path": str(_PRIOR_RECEIPT_PATH),
+        "receipt_id": prior_id,
+        "plan_sha256": "d" * 64,
+    }
+
+
+def test_receipt_load_accepts_inherited_credential_linked_to_its_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(install_core, "_validate_receipt_parent", lambda _o, _p: None)
+    monkeypatch.setattr(install_core, "_validate_receipt_file", lambda _o, _p: None)
+    path = (tmp_path / "receipts" / "successor.json").absolute()
+    receipt = new_install_receipt(_plan(), path=path)
+    receipt._document["parent_receipt"] = _successor_link("prior-receipt")
+    receipt._document["credentials"] = [_inherited_row("e" * 64, "prior-receipt")]
+    receipt._persist()
+
+    loaded = InstallReceipt.load(path)
+
+    assert loaded.to_dict()["credentials"] == [
+        _inherited_row("e" * 64, "prior-receipt")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("parent", "inherited_from"),
+    [
+        (_successor_link("prior-receipt"), "another-receipt"),
+        (_successor_link("prior-receipt"), ""),
+        (None, "prior-receipt"),
+    ],
+)
+def test_receipt_load_rejects_inherited_credential_not_linked_to_its_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent: dict[str, str] | None,
+    inherited_from: str,
+) -> None:
+    monkeypatch.setattr(install_core, "_validate_receipt_parent", lambda _o, _p: None)
+    monkeypatch.setattr(install_core, "_validate_receipt_file", lambda _o, _p: None)
+    path = (tmp_path / "receipts" / "successor.json").absolute()
+    receipt = new_install_receipt(_plan(), path=path)
+    if parent is not None:
+        receipt._document["parent_receipt"] = parent
+    receipt._document["credentials"] = [_inherited_row("e" * 64, inherited_from)]
+    receipt._persist()
+
+    with pytest.raises(InstallError, match="credential metadata is invalid"):
+        InstallReceipt.load(path)
+
+
+def test_rollback_keeps_the_prior_credential_and_its_inherited_record(
+    tmp_path: Path,
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    receipt._document["plan"]["accounts"] = _credential_accounts(tmp_path)  # type: ignore[index]
+    receipt._document["parent_receipt"] = _successor_link("prior-receipt")
+    inherited = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    owned = _write_credential(
+        tmp_path / "cortex-manager", ".config/gh/hosts.yml", b"github.com: {}\n"
+    )
+    receipt._document["credentials"] = [
+        _inherited_row(inherited, "prior-receipt"),
+        {
+            "principal": "manager",
+            "provider": "github",
+            "mode": "0600",
+            "sha256": owned,
+        },
+    ]
+
+    report = rollback_receipt(
+        receipt, backend=LocalInstallBackend(require_root=False)
+    )
+
+    assert report.retained_drift == ()
+    assert (tmp_path / "cortex-builder/.codex/auth.json").read_bytes() == (
+        b'{"token":"prior"}'
+    )
+    assert not (tmp_path / "cortex-manager/.config/gh/hosts.yml").exists()
+    document = receipt.to_dict()
+    assert document["state"] == "rolled-back"
+    assert document["credentials"] == [_inherited_row(inherited, "prior-receipt")]
+    assert install_cli._receipt_restore_safe(document) is True
+
+
+def test_restore_safe_refuses_an_owned_credential_left_after_rollback() -> None:
+    document = {
+        "state": "rolled-back",
+        "journal": [],
+        "activation_journal": [],
+        "credential_journal": [],
+        "services_started": False,
+        "rollback": {"retained_unknown": [], "retained_drift": []},
+        "credentials": [
+            {"principal": "builder", "provider": "codex", "mode": "0600", "sha256": "e" * 64}
+        ],
+    }
+
+    assert install_cli._receipt_restore_safe(document) is False
+    document["credentials"] = [_inherited_row("e" * 64, "prior-receipt")]
+    assert install_cli._receipt_restore_safe(document) is True
+
+
+def _handoff(
+    tmp_path: Path,
+    *,
+    required: tuple[tuple[str, str], ...] = (("builder", "codex"),),
+    prior_rows: list[dict[str, str]] | None = None,
+    prior_builder_uid: int | None = None,
+    new_builder_uid: int | None = None,
+) -> tuple[InstallReceipt, InstallReceipt]:
+    rows = [{"principal": principal, "provider": provider} for principal, provider in required]
+    prior_plan = _plan(required_credentials=rows)
+    prior_plan["accounts"] = _credential_accounts(tmp_path, builder_uid=prior_builder_uid)
+    prior_plan["candidate"] = {**prior_plan["candidate"], "wheel_sha256": "1" * 64}
+    seed = new_install_receipt(prior_plan).to_dict()
+    seed.update(state="applied", qualified=True, credentials=deepcopy(prior_rows or []))
+    prior = InstallReceipt(seed, path=_PRIOR_RECEIPT_PATH)
+    plan = deepcopy(prior_plan)
+    plan["accounts"] = _credential_accounts(
+        tmp_path,
+        builder_uid=new_builder_uid if new_builder_uid is not None else prior_builder_uid,
+    )
+    plan["candidate"]["wheel_sha256"] = "2" * 64
+    receipt = new_install_receipt(plan)
+    receipt._document["state"] = "applied"
+    receipt._document["parent_receipt"] = {
+        "path": str(_PRIOR_RECEIPT_PATH),
+        "receipt_id": seed["receipt_id"],
+        "plan_sha256": seed["plan_sha256"],
+    }
+    return prior, receipt
+
+
+def _prior_row(digest: str, *, principal: str = "builder", provider: str = "codex") -> dict[str, str]:
+    return {"principal": principal, "provider": provider, "mode": "0600", "sha256": digest}
+
+
+def test_inherit_prior_credentials_marks_rows_and_activation_counts_them(
+    tmp_path: Path,
+) -> None:
+    digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    prior, receipt = _handoff(tmp_path, prior_rows=[_prior_row(digest)])
+    prior_id = prior.to_dict()["receipt_id"]
+
+    rows = inherit_prior_credentials(
+        receipt, prior, backend=LocalInstallBackend(require_root=False)
+    )
+
+    assert rows == (_inherited_row(digest, prior_id),)
+    assert receipt.to_dict()["credentials"] == [_inherited_row(digest, prior_id)]
+
+    class LiveValidation(CredentialBackend):
+        def validate_credentials(self, current):
+            return LocalInstallBackend(require_root=False).validate_credentials(current)
+
+    backend = LiveValidation()
+    activate_receipt(receipt, backend=backend)
+    assert backend.started == [
+        "cortex-egress-proxy.service",
+        "cortex-manager.service",
+        "cortex-monitor.service",
+    ]
+
+
+def test_inherit_refuses_a_destination_whose_digest_changed(tmp_path: Path) -> None:
+    _write_credential(tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"new"}')
+    prior, receipt = _handoff(tmp_path, prior_rows=[_prior_row("0" * 64)])
+
+    with pytest.raises(CredentialImportError, match="builder/codex metadata or hash mismatch"):
+        inherit_prior_credentials(
+            receipt, prior, backend=LocalInstallBackend(require_root=False)
+        )
+    assert receipt.to_dict()["credentials"] == []
+
+
+def test_inherit_refuses_a_destination_the_new_plan_moved(tmp_path: Path) -> None:
+    digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    prior, receipt = _handoff(
+        tmp_path, prior_rows=[_prior_row(digest)], new_builder_uid=os.getuid() + 1
+    )
+
+    with pytest.raises(CredentialImportError, match="destination changed"):
+        inherit_prior_credentials(
+            receipt, prior, backend=LocalInstallBackend(require_root=False)
+        )
+
+
+def test_inherit_refuses_a_file_owned_by_another_uid(tmp_path: Path) -> None:
+    digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    prior, receipt = _handoff(
+        tmp_path, prior_rows=[_prior_row(digest)], prior_builder_uid=os.getuid() + 1
+    )
+
+    with pytest.raises(CredentialImportError, match="builder/codex metadata or hash mismatch"):
+        inherit_prior_credentials(
+            receipt, prior, backend=LocalInstallBackend(require_root=False)
+        )
+
+
+def test_inherit_refuses_a_hard_linked_destination(tmp_path: Path) -> None:
+    digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    os.link(tmp_path / "cortex-builder/.codex/auth.json", tmp_path / "second-link")
+    prior, receipt = _handoff(tmp_path, prior_rows=[_prior_row(digest)])
+
+    with pytest.raises(CredentialImportError, match="builder/codex metadata or hash mismatch"):
+        inherit_prior_credentials(
+            receipt, prior, backend=LocalInstallBackend(require_root=False)
+        )
+
+
+def test_inherit_refuses_a_provider_the_prior_receipt_never_recorded(
+    tmp_path: Path,
+) -> None:
+    digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    prior, receipt = _handoff(
+        tmp_path,
+        required=(("builder", "codex"), ("reviewer-planner", "copilot")),
+        prior_rows=[_prior_row(digest)],
+    )
+
+    with pytest.raises(CredentialImportError) as exc:
+        inherit_prior_credentials(
+            receipt, prior, backend=LocalInstallBackend(require_root=False)
+        )
+    assert "reviewer-planner/copilot" in str(exc.value)
+    assert "§4" in str(exc.value)
+    assert receipt.to_dict()["credentials"] == []
+
+
+def test_inherit_refuses_a_receipt_that_is_not_the_prior_successor(tmp_path: Path) -> None:
+    digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    prior, receipt = _handoff(tmp_path, prior_rows=[_prior_row(digest)])
+    del receipt._document["parent_receipt"]
+
+    with pytest.raises(CredentialImportError, match="not the upgrade successor"):
+        inherit_prior_credentials(
+            receipt, prior, backend=LocalInstallBackend(require_root=False)
+        )
+
+
+def test_credentials_inherit_cli_records_rows_in_the_durable_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(install_core, "_validate_receipt_parent", lambda _o, _p: None)
+    monkeypatch.setattr(install_core, "_validate_receipt_file", lambda _o, _p: None)
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "host-locks")
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "maintenance-state"
+    )
+    monkeypatch.setattr(
+        install_cli, "LocalInstallBackend", lambda: LocalInstallBackend(require_root=False)
+    )
+    digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    prior_plan = _plan(required_credentials=[{"principal": "builder", "provider": "codex"}])
+    prior_plan["accounts"] = _credential_accounts(tmp_path)
+    prior_plan["candidate"] = {**prior_plan["candidate"], "wheel_sha256": "1" * 64}
+    prior_path = (tmp_path / "receipts" / "prior.json").absolute()
+    prior = new_install_receipt(prior_plan, path=prior_path)
+    prior._document.update(state="applied", qualified=True, credentials=[_prior_row(digest)])
+    prior._persist()
+    plan = deepcopy(prior_plan)
+    plan["candidate"]["wheel_sha256"] = "2" * 64
+    next_path = (tmp_path / "receipts" / "next.json").absolute()
+    successor = new_install_receipt(plan, path=next_path)
+    successor._document["state"] = "applied"
+    prior_document = prior.to_dict()
+    successor._document["parent_receipt"] = {
+        "path": str(prior_path),
+        "receipt_id": prior_document["receipt_id"],
+        "plan_sha256": prior_document["plan_sha256"],
+    }
+    successor._persist()
+
+    assert install_cli.main(
+        [
+            "credentials",
+            "inherit",
+            "--receipt",
+            str(next_path),
+            "--prior-receipt",
+            str(prior_path),
+        ]
+    ) == 0
+
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["inherited"] == [
+        {
+            "principal": "builder",
+            "provider": "codex",
+            "inherited_from": prior_document["receipt_id"],
+        }
+    ]
+    assert InstallReceipt.load(next_path).to_dict()["credentials"] == [
+        _inherited_row(digest, prior_document["receipt_id"])
+    ]

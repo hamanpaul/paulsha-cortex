@@ -378,7 +378,7 @@ def _cli_full_canary_qualification(
                 "capability-attack-matrix", "durable-state-attack-matrix",
                 "enforcement-plane-attack-matrix", "process-attack-matrix",
                 "gate-attack-matrix", "negative-controls",
-                "rollback-loaded-runtime",
+                "rollback-loaded-runtime", "one-command-upgrade",
                 "provider-capability-smoke", "full-dispatch-closeout",
                 "manager-github-dry-run-push",
             )
@@ -541,6 +541,41 @@ def _cli_full_canary_qualification(
                     },
                     "trust_root": {
                         "status": "verified", "receipt_id": "prior",
+                        "wheel_sha256": wheel_sha256, "candidate_commit": candidate_sha,
+                    },
+                    "installed_artifact": {"wheel_sha256": wheel_sha256},
+                }
+                for name in ("manager", "monitor")
+            }}},
+        },
+        # #1263：與 `test_requirement_delivery._full_canary_qualification` 相同的
+        # one-command upgrade 證據，drill 與完整升級都綁回同一個 prior。
+        "one-command-upgrade.json": {
+            "schema_version": 1,
+            "scenario": "one-command-upgrade-same-artifact",
+            "drill": {
+                "result": "rolled-back", "failed_step": "credentials", "restore_safe": True,
+                "receipt_id": "rollback", "parent_receipt_id": "prior",
+            },
+            "upgrade": {
+                "result": "upgraded", "receipt_id": "upgraded", "parent_receipt_id": "prior",
+                "plan_sha256": "e" * 64,
+                "inherited_credentials": [
+                    {"principal": "builder", "provider": "codex", "inherited_from": "prior"},
+                ],
+            },
+            "expected": {
+                "receipt_id": "upgraded", "wheel_sha256": wheel_sha256,
+                "candidate_commit": candidate_sha,
+            },
+            "service_status": {"service": {"loaded_runtime": {
+                name: {
+                    "comparison": {
+                        "artifact_status": "match", "config_status": "match",
+                        "process_status": "match", "loaded_wheel_sha256": wheel_sha256,
+                    },
+                    "trust_root": {
+                        "status": "verified", "receipt_id": "upgraded",
                         "wheel_sha256": wheel_sha256, "candidate_commit": candidate_sha,
                     },
                     "installed_artifact": {"wheel_sha256": wheel_sha256},

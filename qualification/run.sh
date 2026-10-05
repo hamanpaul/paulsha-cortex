@@ -129,9 +129,6 @@ docker exec "$container_name" sh -eu -c \
 
 plan_path=/run/cortex-install/install-plan.json
 receipt_path=/run/cortex-install/install-receipt.json
-rollback_receipt_path=/run/cortex-install/rollback-install-receipt.json
-rollback_plan_path=/run/cortex-install/rollback-install-plan.json
-rollback_overlay_path=/run/cortex-install/rollback-host-overlay.json
 qualification_root=/qualification-output
 qualification_path=$qualification_root/qualification.json
 
@@ -392,39 +389,118 @@ docker exec \
     "$container_name" cortex install trust-root verify \
     --receipt "$receipt_path" --json --evidence "$install_evidence_path"
 
-# 上方 fresh-install rollback 會刻意回到沒有服務的主機。為擷取 loaded-runtime
-# 證據，從同一個不可變 RC artifact 建立另一份 plan，以已核可 receipt 作為 upgrade
-# parent，並在任何後續安裝動作前 rollback 此 transaction。空 overlay 不產生
-# overlay 紀錄、plan 與 prior 逐字相同（installer 拒絕同一 plan 當 upgrade）；
-# 這裡改為重述 release 設定既有的 `providers.builder`：有效設定不變，plan 多帶
-# `host_overlay_sha256` 而成為不同的 transaction。
+# 一鍵升級演練（#1263）：上方已 qualified 的 receipt 是 prior，同一容器以已安裝的
+# `/opt/cortex/venv/bin/cortex upgrade` 走完整流程。release profile 沒有網路，release
+# 來源改用容器內與 GitHub REST 同形狀的本機目錄；同一 candidate 的 plan 只能靠
+# host overlay digest 不同才成為新的 transaction，因此 overlay 重述 release 設定既有
+# 的 `providers.builder`（有效設定不變）。三個僅限測試的參數只有在
+# PSC_UPGRADE_QUALIFICATION=1 時才被接受。
+upgrade_version=$(basename "$wheel_path")
+upgrade_version=${upgrade_version#paulsha_cortex-}
+upgrade_version=${upgrade_version%-py3-none-any.whl}
+[[ "$upgrade_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || \
+    die "candidate wheel carries no MAJOR.MINOR.PATCH release version"
+upgrade_release_source=/run/cortex-upgrade-release
+upgrade_drill_report=/run/cortex-install/upgrade-drill-report.json
+upgrade_report=/run/cortex-install/upgrade-report.json
+upgrade_durable_report=/var/lib/cortex-installer/$upgrade_version/upgrade-report.json
+upgrade_status_report=/run/cortex-install/upgrade-status.json
+builder_codex_credential=/var/lib/cortex-builder/.codex/auth.json
+# `--json` 只把 report 寫進容器內的檔案，而 `trap cleanup EXIT` 會刪掉容器：每個失敗的
+# `cortex upgrade` 檢查在 die 之前，先把 `--json` 輸出、durable report 與它指向的 verify
+# evidence 印到 stderr，live RC 失敗時才留得下診斷。
+upgrade_diagnostics() {
+    local evidence
+    echo "qualification: cortex upgrade --json output ($1):" >&2
+    docker exec "$container_name" cat "$1" >&2 || true
+    echo "qualification: durable upgrade report ($upgrade_durable_report):" >&2
+    docker exec "$container_name" cat "$upgrade_durable_report" >&2 || true
+    evidence=$(docker exec "$container_name" jq -r '.verify_evidence // empty' \
+        "$upgrade_durable_report" 2>/dev/null) || evidence=""
+    if [[ "$evidence" == /* ]]; then
+        echo "qualification: verify evidence ($evidence):" >&2
+        docker exec "$container_name" cat "$evidence" >&2 || true
+    fi
+}
+docker exec "$container_name" /usr/local/libexec/cortex-qualification-release-source \
+    --artifacts /artifacts \
+    --output "$upgrade_release_source" \
+    --version "$upgrade_version" \
+    --candidate-sha "$candidate_sha" \
+    --wheel-sha256 "$expected_wheel_sha" \
+    --bundle-sha256 "$expected_bundle_sha"
 docker exec "$container_name" python3 -c '
 import json, sys, yaml
 config = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
 overlay = {"providers": {"builder": list(config["providers"]["builder"])}}
 open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(overlay) + "\n")
-' /artifacts/install-config.yaml "$rollback_overlay_path"
-docker exec "$container_name" cortex install trust-root plan \
-    --config /artifacts/install-config.yaml \
-    --host-overlay "$rollback_overlay_path" \
-    --bundle /artifacts/bundle.json \
-    --output "$rollback_plan_path"
-rollback_plan_sha=$(docker exec "$container_name" sha256sum "$rollback_plan_path" | awk '{print $1}')
-# 與 transactional-install runbook 的升級流程相同：apply 前停下服務，rollback 回報
-# restore_safe 之後才把原本在跑的 unit 啟動回來，driver 再比對 loaded runtime。
-rollback_services=(cortex-egress-proxy.service cortex-manager.service cortex-monitor.service)
-docker exec "$container_name" systemctl stop "${rollback_services[@]}"
-docker exec "$container_name" cortex install trust-root apply \
-    --plan "$rollback_plan_path" \
-    --confirm-sha256 "$rollback_plan_sha" \
-    --receipt "$rollback_receipt_path" \
+' /artifacts/install-config.yaml /run/cortex-install/upgrade-host-overlay.json
+docker exec "$container_name" install -o root -g root -m 0644 \
+    /run/cortex-install/upgrade-host-overlay.json /var/lib/cortex-installer/host-overlay.yaml
+upgrade_cli=(
+    /opt/cortex/venv/bin/cortex upgrade "$upgrade_version"
+    --release-source "$upgrade_release_source"
+    --allow-same-version
     --prior-receipt "$receipt_path"
-rollback_report=$(docker exec "$container_name" cortex install trust-root rollback \
-    --receipt "$rollback_receipt_path")
-printf '%s\n' "$rollback_report"
-jq -e '.restore_safe == true' <<<"$rollback_report" >/dev/null || \
-    die "upgrade rollback was not restore-safe"
-docker exec "$container_name" systemctl start "${rollback_services[@]}"
+    --wait-idle 120
+    --json
+)
+# 剛恢復的 Manager 可能正在改寫 durable jobs registry；`--wait-idle` 讓前置檢查重試而不是
+# 立刻拒絕（讀不到 registry 一律視為忙碌）。
+# activate 前注入失敗：prior 已記錄的 builder/codex 落點檔權限偏離 0600，credential
+# handoff 拒絕繼承 → 工具自動 rollback 新 receipt，並把原本 active 的服務啟動回來。
+docker exec "$container_name" chmod 0640 "$builder_codex_credential"
+if docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \
+    sh -eu -c 'out=$1; shift; "$@" >"$out"' sh "$upgrade_drill_report" "${upgrade_cli[@]}"; then
+    upgrade_diagnostics "$upgrade_drill_report"
+    die "one-command upgrade accepted a drifted inherited credential"
+fi
+docker exec "$container_name" chmod 0600 "$builder_codex_credential"
+docker exec "$container_name" cat "$upgrade_drill_report"
+if ! docker exec "$container_name" jq -e \
+    '.result == "rolled-back" and .failed_step == "credentials"
+     and .rollback.restore_safe == true
+     and .rollback.prior_loaded_runtime.mismatch == ""' \
+    "$upgrade_drill_report" >/dev/null; then
+    upgrade_diagnostics "$upgrade_drill_report"
+    die "pre-activate upgrade failure did not return to the prior receipt"
+fi
+for upgrade_service in cortex-egress-proxy.service cortex-manager.service cortex-monitor.service; do
+    docker exec "$container_name" systemctl is-active --quiet "$upgrade_service" || \
+        die "upgrade drill did not restore $upgrade_service"
+done
+# 完整升級：apply → 繼承 prior 憑證 → activate → verify → loaded↔installed 一致。
+if ! docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \
+    sh -eu -c 'out=$1; shift; "$@" >"$out"' sh "$upgrade_report" "${upgrade_cli[@]}"; then
+    upgrade_diagnostics "$upgrade_report"
+    die "one-command upgrade failed"
+fi
+if ! docker exec "$container_name" jq -e '.result == "upgraded"' "$upgrade_report" >/dev/null; then
+    upgrade_diagnostics "$upgrade_report"
+    die "one-command upgrade did not complete"
+fi
+upgrade_receipt_path=$(docker exec "$container_name" jq -r '.receipt.path' "$upgrade_report")
+upgrade_evidence_path=$(docker exec "$container_name" jq -r '.verify_evidence' "$upgrade_report")
+[[ "$upgrade_receipt_path" == /* && "$upgrade_evidence_path" == /* ]] || \
+    die "one-command upgrade report lacks the new receipt or verify evidence"
+# `--status` 是只有正式部署才走的唯讀路徑（receipt chain 判定 effective receipt、維護
+# 狀態）；它不吃任何僅限測試的參數。升級後生效中的必須就是剛升級的 receipt、loaded
+# runtime 一致，而且沒有留下待 `--recover` 的 snapshot 或 lease marker。
+if ! docker exec "$container_name" sh -eu -c 'out=$1; shift; "$@" >"$out"' \
+    sh "$upgrade_status_report" /opt/cortex/venv/bin/cortex upgrade --status --json; then
+    docker exec "$container_name" cat "$upgrade_status_report" >&2 || true
+    die "cortex upgrade --status does not show the upgraded receipt in force"
+fi
+docker exec "$container_name" cat "$upgrade_status_report"
+if ! docker exec "$container_name" jq -e --slurpfile report "$upgrade_report" \
+    '.effective_receipt.path == $report[0].receipt.path
+     and .effective_receipt.receipt_id == $report[0].receipt.receipt_id
+     and .loaded_runtime == "match"
+     and .maintenance_pending == false' \
+    "$upgrade_status_report" >/dev/null; then
+    docker exec "$container_name" cat "$upgrade_status_report" >&2 || true
+    die "cortex upgrade --status does not show the upgraded receipt in force"
+fi
 
 # A fixed harness installed in the reference image always runs the five attack
 # families and negative controls. Only deployment-canary mode adds provider
@@ -433,8 +509,9 @@ docker exec "$container_name" systemctl start "${rollback_services[@]}"
 qualification_driver=/usr/local/libexec/cortex-release-qualification
 driver_profile_args=(--profile "$profile")
 driver_profile_args+=(
-    --rollback-receipt "$rollback_receipt_path"
     --prior-receipt "$receipt_path"
+    --upgrade-drill-report "$upgrade_drill_report"
+    --upgrade-report "$upgrade_report"
 )
 validator_profile_args=(--require-release-profile)
 if [[ "$profile" == deployment-canary ]]; then
@@ -455,8 +532,8 @@ if [[ "$profile" == deployment-canary ]]; then
 fi
 wheel_filename=$(basename "$wheel_path")
 docker exec "$container_name" "$qualification_driver" \
-    --receipt "$receipt_path" \
-    --install-evidence "$install_evidence_path" \
+    --receipt "$upgrade_receipt_path" \
+    --install-evidence "$upgrade_evidence_path" \
     --candidate-sha "$candidate_sha" \
     --wheel-sha256 "$expected_wheel_sha" \
     --bundle-sha256 "$expected_bundle_sha" \

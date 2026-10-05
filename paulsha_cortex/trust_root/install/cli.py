@@ -47,7 +47,9 @@ from .core import (
     bind_bundle_artifacts,
     build_install_plan,
     canonical_receipt_path,
+    inherit_prior_credentials,
     import_credential,
+    is_inherited_credential,
     new_install_receipt,
     plan_sha256,
     rollback_receipt,
@@ -645,6 +647,43 @@ def _locked_receipt(
         yield InstallReceipt.load(path, expected_plan=plan), plan
 
 
+def _add_upgrade_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "version", nargs="?", help="target release MAJOR.MINOR.PATCH (tag v<version>)"
+    )
+    parser.add_argument(
+        "--wait-idle",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help="wait up to SECONDS for in-flight jobs to finish (default 0: refuse at once)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="print the upgrade report or status as JSON",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--recover",
+        action="store_true",
+        help="recover an upgrade interrupted by SIGKILL, OOM or power loss (runbook §6)",
+    )
+    mode.add_argument(
+        "--status",
+        action="store_true",
+        help="read-only: effective receipt, last upgrade result, loaded runtime match",
+    )
+    # RC qualification only: accepted when PSC_UPGRADE_QUALIFICATION=1, hidden from help.
+    parser.add_argument("--release-source", help=argparse.SUPPRESS)
+    # RC qualification only (PSC_UPGRADE_QUALIFICATION=1): lets a drill rerun the
+    # exact same version, and also relaxes the host-overlay-digest equality check
+    # against the prior plan. Hidden from help; never used in production.
+    parser.add_argument("--allow-same-version", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--prior-receipt", help=argparse.SUPPRESS)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cortex install trust-root",
@@ -719,6 +758,14 @@ def _build_parser() -> argparse.ArgumentParser:
     credential_import.add_argument("--source", required=True)
     credential_import.add_argument("--maintenance-token")
 
+    credential_inherit = credential_sub.add_parser(
+        "inherit",
+        help="hand the prior receipt's recorded credentials to an upgrade receipt",
+    )
+    credential_inherit.add_argument("--receipt", required=True)
+    credential_inherit.add_argument("--prior-receipt", required=True)
+    credential_inherit.add_argument("--maintenance-token")
+
     activate = sub.add_parser("activate", help="start egress, Manager, then Monitor")
     activate.add_argument("--receipt", required=True)
     activate.add_argument("--maintenance-token")
@@ -770,6 +817,11 @@ def _build_parser() -> argparse.ArgumentParser:
     legacy_purge.add_argument(
         "--confirm-sha256", help="digest printed by the matching dry-run report"
     )
+
+    upgrade_parser = sub.add_parser(
+        "upgrade", help="one-command upgrade to a published release (root only)"
+    )
+    _add_upgrade_arguments(upgrade_parser)
     return parser
 
 
@@ -1183,6 +1235,32 @@ def _credential_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _credential_inherit_command(args: argparse.Namespace) -> int:
+    _require_root()
+    prior_path = Path(args.prior_receipt).expanduser()
+    with _locked_receipt(
+        Path(args.receipt), maintenance_token=args.maintenance_token
+    ) as (receipt, _plan):
+        prior = InstallReceipt.load(prior_path)
+        rows = inherit_prior_credentials(
+            receipt, prior, backend=LocalInstallBackend()
+        )
+    _emit(
+        {
+            "receipt_id": receipt.to_dict()["receipt_id"],
+            "inherited": [
+                {
+                    "principal": row["principal"],
+                    "provider": row["provider"],
+                    "inherited_from": row["inherited_from"],
+                }
+                for row in rows
+            ],
+        }
+    )
+    return 0
+
+
 def _activate_command(args: argparse.Namespace) -> int:
     _require_root()
     with _locked_receipt(
@@ -1256,6 +1334,35 @@ def _rollback_command(args: argparse.Namespace) -> int:
     payload["restore_safe"] = _receipt_restore_safe(receipt.to_dict())
     _emit(payload)
     return 0 if payload["restore_safe"] is True else 1
+
+
+def _upgrade_command(args: argparse.Namespace) -> int:
+    _require_root()
+    # upgrade.py imports this module, so it is imported here -- still before any
+    # host mutation.  upgrade.py itself imports everything at module level.
+    from . import upgrade
+
+    options = upgrade.options_from_args(args, environ=os.environ)
+    return upgrade.run_upgrade(options)
+
+
+def upgrade_main(argv: Sequence[str] | None = None) -> int:
+    """`cortex upgrade`: alias of `cortex install trust-root upgrade`."""
+
+    parser = argparse.ArgumentParser(
+        prog="cortex upgrade",
+        description=(
+            "Upgrade this host to a published release in one root command "
+            "(alias of `cortex install trust-root upgrade`)."
+        ),
+    )
+    _add_upgrade_arguments(parser)
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        return _upgrade_command(args)
+    except (InstallError, PermissionError, OSError, ValueError) as exc:
+        sys.stderr.write(f"cortex upgrade failed: {exc}\n")
+        return 1
 
 
 _RECEIPT_MANAGED_HINT = (
@@ -1398,6 +1505,10 @@ def _legacy_purge_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _only_inherited_credentials(rows: object) -> bool:
+    return isinstance(rows, list) and all(is_inherited_credential(row) for row in rows)
+
+
 def _receipt_restore_safe(document: Mapping[str, object]) -> bool:
     """Prove that restarting the pre-transaction services is safe."""
 
@@ -1420,7 +1531,7 @@ def _receipt_restore_safe(document: Mapping[str, object]) -> bool:
         isinstance(rollback, Mapping)
         and rollback.get("retained_unknown") == []
         and rollback.get("retained_drift") == []
-        and document.get("credentials", []) == []
+        and _only_inherited_credentials(document.get("credentials", []))
         # A legacy adoption is restore-safe only once a re-capture proved the
         # reviewed legacy host is back.
         and (
@@ -1445,6 +1556,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.trust_root_command == "recover":
             return _recover_command(args)
         if args.trust_root_command == "credentials":
+            if args.credential_command == "inherit":
+                return _credential_inherit_command(args)
             return _credential_command(args)
         if args.trust_root_command == "activate":
             return _activate_command(args)
@@ -1452,6 +1565,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _verify_command(args)
         if args.trust_root_command == "rollback":
             return _rollback_command(args)
+        if args.trust_root_command == "upgrade":
+            return _upgrade_command(args)
         if args.trust_root_command == "legacy":
             if args.legacy_command == "inventory":
                 return _legacy_inventory_command(args)

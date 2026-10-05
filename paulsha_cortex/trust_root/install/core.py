@@ -3001,12 +3001,27 @@ class InstallReceipt:
             rollback_seen.add(step_id)
         _validate_receipt_legacy_provenance(payload, plan, planned_steps, path)
         credentials = payload.get("credentials")
+        parent_receipt_id = (
+            parent.get("receipt_id") if isinstance(parent, Mapping) else None
+        )
         if not isinstance(credentials, list) or any(
             not isinstance(row, Mapping)
-            or set(row) - {"created_directories"} != {"principal", "provider", "mode", "sha256"}
+            or set(row) - {"created_directories", "inherited_from"}
+            != {"principal", "provider", "mode", "sha256"}
             or row.get("mode") != "0600"
             or not isinstance(row.get("sha256"), str)
             or len(str(row.get("sha256"))) != 64
+            # An inherited row names the prior receipt's file: it is valid only
+            # in a successor linked to exactly that prior receipt, and it never
+            # owns credential directories.
+            or (
+                "inherited_from" in row
+                and (
+                    not is_inherited_credential(row)
+                    or row.get("inherited_from") != parent_receipt_id
+                    or "created_directories" in row
+                )
+            )
             for row in credentials
         ):
             raise InstallError(f"receipt credential metadata is invalid: {path}")
@@ -7187,7 +7202,14 @@ def rollback_receipt(
         for row in retained_drift
     )
     if not credentials_retained:
-        receipt._document["credentials"] = []
+        # Inherited rows name the prior receipt's files.  Rollback never touched
+        # them, so they stay as the record of what this receipt relied on.
+        current = receipt._document.get("credentials")
+        receipt._document["credentials"] = [
+            row
+            for row in (current if isinstance(current, list) else [])
+            if is_inherited_credential(row)
+        ]
         receipt._document["credential_journal"] = []
     receipt._document["rollback"] = {
         "retained_unknown": list(unknown),
@@ -7427,6 +7449,113 @@ def credential_destination(
         int(account["uid"]),
         int(account["gid"]),
     )
+
+
+def is_inherited_credential(row: object) -> bool:
+    """True for a receipt credential row handed over from the prior receipt."""
+
+    return (
+        isinstance(row, Mapping)
+        and isinstance(row.get("inherited_from"), str)
+        and bool(row["inherited_from"])
+    )
+
+
+def inherit_prior_credentials(
+    receipt: InstallReceipt,
+    prior_receipt: InstallReceipt,
+    *,
+    backend: InstallBackend,
+) -> tuple[dict[str, str], ...]:
+    """Hand the prior receipt's recorded credentials to its upgrade successor.
+
+    Only rows the prior receipt already records move over, and only when the
+    new plan derives the same destination and the file there passes the same
+    live check activation runs (regular file, one link, uid/gid, 0600, sha256).
+    No HOME is searched and no credential content leaves the file.  A pair the
+    new plan requires but the prior never recorded is refused: the operator
+    imports it through the runbook instead.
+    """
+
+    document = receipt._document
+    if document.get("state") != "applied":
+        raise CredentialImportError(
+            "credentials may only be inherited into an applied receipt"
+        )
+    if document.get("credentials") or document.get("credential_journal"):
+        raise CredentialImportError(
+            "receipt already records credential authority; inheritance applies "
+            "only to a fresh upgrade receipt"
+        )
+    plan = document.get("plan")
+    if not isinstance(plan, Mapping):
+        raise CredentialImportError("receipt plan is invalid")
+    try:
+        validate_prior_receipt_handoff(plan, prior_receipt)
+    except InstallPlanError as exc:
+        raise CredentialImportError(
+            f"prior receipt cannot hand off credentials: {exc}"
+        ) from exc
+    prior_document = prior_receipt.to_dict()
+    if prior_receipt.path is None or document.get("parent_receipt") != {
+        "path": str(prior_receipt.path),
+        "receipt_id": prior_document.get("receipt_id"),
+        "plan_sha256": prior_document.get("plan_sha256"),
+    }:
+        raise CredentialImportError(
+            "receipt is not the upgrade successor of the prior receipt"
+        )
+    prior_rows: dict[tuple[str, str], Mapping[str, object]] = {}
+    for row in prior_document.get("credentials", []):
+        if isinstance(row, Mapping):
+            prior_rows[(str(row.get("principal")), str(row.get("provider")))] = row
+    required = [
+        (str(row.get("principal")), str(row.get("provider")))
+        for row in plan.get("required_credentials", [])
+        if isinstance(row, Mapping)
+    ]
+    missing = [pair for pair in required if pair not in prior_rows]
+    if missing:
+        rendered = ", ".join(f"{principal}/{provider}" for principal, provider in missing)
+        raise CredentialImportError(
+            f"new plan requires credentials the prior receipt never recorded: {rendered}; "
+            "roll back and import them per trust-root-transactional-install.md §4"
+        )
+    prior_id = str(prior_document.get("receipt_id"))
+    inherited: list[dict[str, str]] = []
+    for principal, provider in required:
+        if credential_destination(
+            prior_receipt, principal=principal, provider=provider
+        ) != credential_destination(receipt, principal=principal, provider=provider):
+            raise CredentialImportError(
+                f"credential destination changed since the prior receipt: {principal}/{provider}"
+            )
+        inherited.append(
+            {
+                "principal": principal,
+                "provider": provider,
+                "mode": "0600",
+                "sha256": str(prior_rows[(principal, provider)].get("sha256")),
+                "inherited_from": prior_id,
+            }
+        )
+    validator = getattr(backend, "validate_credentials", None)
+    if not callable(validator):
+        raise CredentialImportError("backend cannot validate inherited credentials")
+    probe = InstallReceipt({**document, "credentials": deepcopy(inherited)})
+    failures = tuple(str(row) for row in validator(probe))
+    if failures:
+        raise CredentialImportError(
+            "prior credential cannot be inherited: " + "; ".join(failures)
+        )
+    previous = document.get("credentials")
+    document["credentials"] = deepcopy(inherited)
+    try:
+        receipt._persist()
+    except BaseException:
+        document["credentials"] = previous
+        raise
+    return tuple(inherited)
 
 
 def _open_unnamed_credential_tmpfile(parent_fd: int) -> int | None:

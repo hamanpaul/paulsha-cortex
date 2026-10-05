@@ -48,6 +48,13 @@ from paulsha_cortex.trust_root.registry import (
 )
 from paulsha_cortex.trust_root.permgen import DEFAULT_LAYOUT
 from paulsha_cortex.trust_root.surfaces import writable_surface
+from paulsha_cortex.trust_root.install import loaded_runtime
+from paulsha_cortex.trust_root.install.core import InstallError
+from paulsha_cortex.trust_root.install.loaded_runtime import (
+    diagnostic_token as _diagnostic_token,
+    loaded_runtime_mismatch as _rollback_loaded_runtime_mismatch,
+    runtime_expected as _rollback_runtime_expected,
+)
 
 try:
     from qualification.contract import (
@@ -287,35 +294,12 @@ def _account_env(account: str) -> dict[str, str]:
 def _installed_runtime_env() -> dict[str, str]:
     """Load only the installed, root-owned PSC runtime projection for operator CLI probes."""
 
-    path = Path("/opt/cortex/etc/cortex-manager.env")
-    if path.is_symlink() or not path.is_file():
-        raise QualificationFailure("installed Manager environment is absent")
-    if path.stat().st_uid != 0 or stat.S_IMODE(path.stat().st_mode) & 0o022:
-        raise QualificationFailure(
-            "installed Manager environment is not root-controlled"
+    try:
+        return loaded_runtime.installed_runtime_env(
+            Path("/opt/cortex"), Path("/var/lib/cortex")
         )
-    env = {
-        "HOME": "/root",
-        "PATH": "/opt/cortex/venv/bin:/opt/cortex/toolchain/bin:/usr/bin:/bin",
-    }
-    for raw in path.read_text(encoding="utf-8", errors="strict").splitlines():
-        key, separator, encoded = raw.partition("=")
-        if not separator or not key.startswith("PSC_"):
-            continue
-        try:
-            value = json.loads(encoded)
-        except json.JSONDecodeError as exc:
-            raise QualificationFailure(
-                f"invalid installed runtime value for {key}"
-            ) from exc
-        if not isinstance(value, str) or "\x00" in value:
-            raise QualificationFailure(f"invalid installed runtime value for {key}")
-        env[key] = value
-    env.setdefault("PSC_CONTROL_ROOT", "/var/lib/cortex/control")
-    env.setdefault("PSC_COORDINATOR_ROOT", "/var/lib/cortex/coordinator")
-    env.setdefault("PSC_SPECS_ROOT", "/var/lib/cortex/specs")
-    env.setdefault("PSC_MONITOR_STATE_ROOT", "/var/lib/cortex/monitor")
-    return env
+    except InstallError as exc:
+        raise QualificationFailure(str(exc)) from exc
 
 
 def _account_runtime_env(account: str) -> dict[str, str]:
@@ -563,92 +547,92 @@ def _system_status_mismatch(report: object) -> str:
     return " ".join(parts)
 
 
-def _rollback_loaded_runtime_mismatch(
-    payload: object, expected: Mapping[str, object]
-) -> str:
-    """比對 rollback 後 Manager／Monitor 載入的 artifact 與 prior receipt。"""
-
-    service = payload.get("service") if isinstance(payload, Mapping) else None
-    loaded = service.get("loaded_runtime") if isinstance(service, Mapping) else None
-    if not isinstance(loaded, Mapping):
-        return "loaded_runtime=unknown"
-    expected_receipt = expected.get("receipt_id")
-    expected_wheel = expected.get("wheel_sha256")
-    expected_commit = expected.get("candidate_commit")
-    if not all(
-        isinstance(value, str) and value
-        for value in (expected_receipt, expected_wheel, expected_commit)
-    ):
-        return "expected_receipt=unknown"
-    mismatches: list[str] = []
-    for name in ("manager", "monitor"):
-        report = loaded.get(name)
-        if not isinstance(report, Mapping):
-            mismatches.append(f"{name}=unknown")
-            continue
-        comparison = report.get("comparison")
-        trust_root = report.get("trust_root")
-        installed = report.get("installed_artifact")
-        if not all(
-            isinstance(value, Mapping)
-            for value in (comparison, trust_root, installed)
-        ):
-            mismatches.append(f"{name}=unknown")
-            continue
-        if any(
-            comparison.get(key) != "match"
-            for key in ("artifact_status", "config_status", "process_status")
-        ):
-            mismatches.append(f"{name}_runtime=mismatch")
-        if trust_root.get("status") != "verified":
-            mismatches.append(f"{name}_trust={_diagnostic_token(trust_root.get('status'))}")
-        if trust_root.get("receipt_id") != expected_receipt:
-            state = "mismatch" if isinstance(trust_root.get("receipt_id"), str) else "unknown"
-            mismatches.append(f"{name}_receipt={state}")
-        for label, value in (
-            ("loaded_wheel", comparison.get("loaded_wheel_sha256")),
-            ("installed_wheel", installed.get("wheel_sha256")),
-            ("receipt_wheel", trust_root.get("wheel_sha256")),
-        ):
-            if value != expected_wheel:
-                mismatches.append(f"{name}_{label}={'mismatch' if isinstance(value, str) else 'unknown'}")
-        loaded_commit = trust_root.get("candidate_commit")
-        if loaded_commit != expected_commit:
-            state = "mismatch" if isinstance(loaded_commit, str) else "unknown"
-            mismatches.append(f"{name}_commit={state}")
-    return " ".join(mismatches)
-
-
-def _rollback_runtime_expected(receipt: Mapping[str, object]) -> dict[str, object]:
-    plan = receipt.get("plan")
-    candidate = plan.get("candidate") if isinstance(plan, Mapping) else None
-    identity = plan.get("repo_identity") if isinstance(plan, Mapping) else None
-    return {
-        "receipt_id": receipt.get("receipt_id"),
-        "wheel_sha256": candidate.get("wheel_sha256") if isinstance(candidate, Mapping) else None,
-        "candidate_commit": identity.get("commit") if isinstance(identity, Mapping) else None,
-    }
-
-
-def _capture_rollback_loaded_runtime(
+def _capture_one_command_upgrade(
     *,
-    rollback_receipt: Mapping[str, object],
     prior_receipt: Mapping[str, object],
+    upgrade_receipt: Mapping[str, object],
     receipt_path: Path,
+    drill_report: Mapping[str, object],
+    upgrade_report: Mapping[str, object],
     evidence_dir: Path,
 ) -> None:
-    parent = rollback_receipt.get("parent_receipt")
+    """#1263：`cortex upgrade` 的 activate 前失敗演練與完整升級都綁回同一個 prior。"""
+
+    prior_id = prior_receipt.get("receipt_id")
+    drill_rollback = drill_report.get("rollback")
+    drill_receipt = drill_report.get("receipt")
     if (
-        rollback_receipt.get("state") != "rolled-back"
-        or not isinstance(parent, Mapping)
-        or parent.get("receipt_id") != prior_receipt.get("receipt_id")
+        drill_report.get("result") != "rolled-back"
+        or drill_report.get("failed_step") != "credentials"
+        or not isinstance(drill_rollback, Mapping)
+        or drill_rollback.get("restore_safe") is not True
+        or not isinstance(drill_receipt, Mapping)
+        or not isinstance(drill_receipt.get("path"), str)
     ):
         raise QualificationFailure(
-            "rollback receipt is unknown or not bound to the prior receipt"
+            "one-command upgrade drill did not roll back to the prior receipt: "
+            f"result={_diagnostic_token(drill_report.get('result'))} "
+            f"failed_step={_diagnostic_token(drill_report.get('failed_step'))}"
         )
-    expected = _rollback_runtime_expected(prior_receipt)
-    # rollback 後服務才剛被啟動回來，loaded receipt 可能晚幾秒寫入：與
-    # `_installed_checks` 相同，輪詢到比對一致或逾時，逾時以最後一次結果判定。
+    rolled_back = _load_json(Path(str(drill_receipt["path"])), "upgrade drill receipt")
+    parent = rolled_back.get("parent_receipt")
+    if (
+        rolled_back.get("state") != "rolled-back"
+        or not isinstance(parent, Mapping)
+        or parent.get("receipt_id") != prior_id
+    ):
+        raise QualificationFailure(
+            "upgrade drill receipt is not a rolled-back successor of the prior receipt"
+        )
+    prior_runtime = drill_rollback.get("prior_loaded_runtime")
+    drill_status = (
+        prior_runtime.get("service_status") if isinstance(prior_runtime, Mapping) else None
+    )
+    expected_prior = _rollback_runtime_expected(prior_receipt)
+    _write_json(
+        evidence_dir / "rollback-loaded-runtime-status.json",
+        {
+            "schema_version": 1,
+            "scenario": "same-artifact-qualified-prior-to-candidate-rollback",
+            "rollback_receipt": {
+                "receipt_id": rolled_back.get("receipt_id"),
+                "state": rolled_back.get("state"),
+                "parent_receipt_id": parent.get("receipt_id"),
+            },
+            "expected": expected_prior,
+            "service_status": drill_status,
+        },
+    )
+    mismatch = _rollback_loaded_runtime_mismatch(drill_status, expected_prior)
+    if mismatch:
+        raise QualificationFailure(
+            "upgrade drill did not restore the prior loaded runtime: " + mismatch
+        )
+    upgraded_parent = upgrade_receipt.get("parent_receipt")
+    credentials = upgrade_receipt.get("credentials")
+    report_receipt = upgrade_report.get("receipt")
+    if (
+        upgrade_report.get("result") != "upgraded"
+        or not isinstance(report_receipt, Mapping)
+        or report_receipt.get("path") != str(receipt_path)
+        or upgrade_receipt.get("state") != "applied"
+        or upgrade_receipt.get("qualified") is not True
+        or not isinstance(upgraded_parent, Mapping)
+        or upgraded_parent.get("receipt_id") != prior_id
+        or not isinstance(credentials, list)
+        or not credentials
+        or any(
+            not isinstance(row, Mapping) or row.get("inherited_from") != prior_id
+            for row in credentials
+        )
+    ):
+        raise QualificationFailure(
+            "one-command upgrade receipt is not a qualified successor that "
+            "inherited the prior credentials"
+        )
+    expected = _rollback_runtime_expected(upgrade_receipt)
+    # activate 之後 loaded receipt 可能晚幾秒寫入：與 `_installed_checks` 相同，
+    # 輪詢到比對一致或逾時，逾時以最後一次結果判定。
     deadline = time.monotonic() + SYSTEM_STATUS_SETTLE_SECONDS
     while True:
         result = _run(
@@ -664,27 +648,44 @@ def _capture_rollback_loaded_runtime(
             env=_installed_runtime_env(),
         )
         if result.returncode != 0:
-            raise QualificationFailure("rollback-system-status=unavailable")
+            raise QualificationFailure("upgrade-system-status=unavailable")
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise QualificationFailure(
-                "rollback system-scope status returned invalid JSON"
+                "upgrade system-scope status returned invalid JSON"
             ) from exc
         if not _rollback_loaded_runtime_mismatch(payload, expected) or (
             time.monotonic() >= deadline
         ):
             break
         time.sleep(2)
+    plan = upgrade_report.get("plan")
     _write_json(
-        evidence_dir / "rollback-loaded-runtime-status.json",
+        evidence_dir / "one-command-upgrade.json",
         {
             "schema_version": 1,
-            "scenario": "same-artifact-qualified-prior-to-candidate-rollback",
-            "rollback_receipt": {
-                "receipt_id": rollback_receipt.get("receipt_id"),
-                "state": rollback_receipt.get("state"),
+            "scenario": "one-command-upgrade-same-artifact",
+            "drill": {
+                "result": drill_report.get("result"),
+                "failed_step": drill_report.get("failed_step"),
+                "restore_safe": drill_rollback.get("restore_safe"),
+                "receipt_id": rolled_back.get("receipt_id"),
                 "parent_receipt_id": parent.get("receipt_id"),
+            },
+            "upgrade": {
+                "result": upgrade_report.get("result"),
+                "receipt_id": upgrade_receipt.get("receipt_id"),
+                "parent_receipt_id": upgraded_parent.get("receipt_id"),
+                "plan_sha256": plan.get("sha256") if isinstance(plan, Mapping) else None,
+                "inherited_credentials": [
+                    {
+                        "principal": row.get("principal"),
+                        "provider": row.get("provider"),
+                        "inherited_from": row.get("inherited_from"),
+                    }
+                    for row in credentials
+                ],
             },
             "expected": expected,
             "service_status": payload,
@@ -693,7 +694,7 @@ def _capture_rollback_loaded_runtime(
     mismatch = _rollback_loaded_runtime_mismatch(payload, expected)
     if mismatch:
         raise QualificationFailure(
-            "rollback loaded runtime did not match prior receipt: " + mismatch
+            "upgraded loaded runtime did not match the new receipt: " + mismatch
         )
 
 
@@ -4949,19 +4950,6 @@ def _expected_worktree_isolation_prompt(
     )
 
 
-_DIAGNOSTIC_TOKEN = re.compile(r"[A-Za-z0-9_.:+-]{1,64}")
-
-
-def _diagnostic_token(value: object) -> str:
-    """只輸出短的列舉型字串；其他型別或內容一律遮成型別名（不洩漏 detail 文字）。"""
-
-    if value is None:
-        return "none"
-    if isinstance(value, str) and _DIAGNOSTIC_TOKEN.fullmatch(value):
-        return value
-    return f"<{type(value).__name__}>"
-
-
 def _closeout_diagnostic(
     workflow: Mapping[str, object],
     *,
@@ -6506,8 +6494,9 @@ def _artifact_inventory(evidence_dir: Path) -> list[dict[str, str]]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--receipt", required=True, type=Path)
-    parser.add_argument("--rollback-receipt", type=Path)
     parser.add_argument("--prior-receipt", type=Path)
+    parser.add_argument("--upgrade-drill-report", type=Path)
+    parser.add_argument("--upgrade-report", type=Path)
     parser.add_argument("--install-evidence", required=True, type=Path)
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--wheel-sha256", required=True)
@@ -6550,18 +6539,25 @@ def main() -> int:
         value is None for value in probe_values
     ):
         parser.error("deployment-canary profile requires every external probe input")
-    if (args.rollback_receipt is None) != (args.prior_receipt is None):
-        parser.error("rollback loaded-runtime evidence requires both receipt paths")
+    upgrade_evidence = (args.prior_receipt, args.upgrade_drill_report, args.upgrade_report)
+    if any(value is not None for value in upgrade_evidence) and not all(
+        value is not None for value in upgrade_evidence
+    ):
+        parser.error(
+            "one-command upgrade evidence requires --prior-receipt, "
+            "--upgrade-drill-report and --upgrade-report together"
+        )
     try:
         receipt = _load_json(args.receipt, "install receipt")
         args.evidence_dir.mkdir(parents=True, exist_ok=False)
-        if args.rollback_receipt is not None and args.prior_receipt is not None:
-            prior_receipt = _load_json(args.prior_receipt, "prior install receipt")
-            rollback_receipt = _load_json(args.rollback_receipt, "rollback install receipt")
-            _capture_rollback_loaded_runtime(
-                rollback_receipt=rollback_receipt,
-                prior_receipt=prior_receipt,
-                receipt_path=args.prior_receipt,
+        if args.upgrade_report is not None:
+            assert args.prior_receipt is not None and args.upgrade_drill_report is not None
+            _capture_one_command_upgrade(
+                prior_receipt=_load_json(args.prior_receipt, "prior install receipt"),
+                upgrade_receipt=receipt,
+                receipt_path=args.receipt,
+                drill_report=_load_json(args.upgrade_drill_report, "upgrade drill report"),
+                upgrade_report=_load_json(args.upgrade_report, "upgrade report"),
                 evidence_dir=args.evidence_dir,
             )
         tests = _installed_checks(
@@ -6636,8 +6632,11 @@ def main() -> int:
                     "reinstall",
                 )
             ] + tests
-            if args.rollback_receipt is not None:
-                tests.append({"name": "rollback-loaded-runtime", "status": "passed"})
+            if args.upgrade_report is not None:
+                tests += [
+                    {"name": "rollback-loaded-runtime", "status": "passed"},
+                    {"name": "one-command-upgrade", "status": "passed"},
+                ]
         artifacts = _artifact_inventory(args.evidence_dir)
         qualification = {
             "schema_version": 2,

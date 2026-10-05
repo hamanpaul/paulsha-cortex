@@ -248,3 +248,55 @@ def test_generated_units_link_only_to_current_install_runbook() -> None:
     for content in units:
         assert f"Documentation=file://{CURRENT}" in content
         assert LEGACY not in content
+
+
+def test_current_runbook_opens_with_the_one_command_upgrade() -> None:
+    current = (ROOT / CURRENT).read_text(encoding="utf-8")
+
+    upgrade = current.index("## 一般升級")
+    boundary = current.index("## 邊界")
+    assert upgrade < boundary < current.index("## 1. 封存唯一 candidate CLI")
+    section = current[upgrade:boundary]
+    assert "sudo /opt/cortex/venv/bin/cortex upgrade <版本>" in section
+    assert "cortex upgrade --recover" in section
+    assert "cortex upgrade --status" in section
+    assert "--wait-idle" in section
+    assert "/var/lib/cortex-installer/<版本>/upgrade-report.json" in section
+    assert "首次安裝與手動操作參考" in section
+    # A dropped SSH session (SIGHUP) must not end the upgrade or lose its summary.
+    assert "`tmux` 或 `screen` 裡執行 `cortex upgrade`" in section
+    assert "手動恢復 `cortex upgrade`" in section
+
+
+def test_hard_crash_recovery_maps_a_cortex_upgrade_report_onto_its_variables() -> None:
+    current = (ROOT / CURRENT).read_text(encoding="utf-8")
+
+    recovery = current.split("## 6. Hard-crash recovery", 1)[1].split(
+        "## 7. Deployment canary", 1
+    )[0]
+    start = recovery.index("### 手動恢復 `cortex upgrade` 中斷的升級")
+    section = recovery[start:]
+    assert recovery.index('cortex_root_cli install trust-root recover') < start
+    first = section.index("sudo /opt/cortex/venv/bin/cortex upgrade --recover")
+    table = section.index("| snippet 變數 |")
+    assert first < table
+    for variable, field in (
+        ("`cortex_bootstrap_root`", "`candidate.attempt_dir`"),
+        ("`cortex_recovery_sealed_cli_tree_sha`", "`candidate.cli_tree_sha256`"),
+        ("`cortex_confirmed_plan_sha`", "`plan.sha256`"),
+        ("`cortex_plan_path`", "`plan.durable_path`"),
+        ("要 rollback 的 receipt", "`receipt.path`"),
+    ):
+        row = next(line for line in section.splitlines() if line.startswith(f"| {variable}"))
+        assert field in row, row
+    assert "maintenance-snapshot.json" in section
+
+
+def test_legacy_adoption_runbook_hands_later_upgrades_to_cortex_upgrade() -> None:
+    legacy = (
+        ROOT / "docs/superpowers/runbooks/trust-root-legacy-adoption.md"
+    ).read_text(encoding="utf-8")
+
+    tail = legacy.rstrip().rsplit("\n\n", 1)[1]
+    assert "cortex upgrade" in tail
+    assert "legacy_adoption" in tail

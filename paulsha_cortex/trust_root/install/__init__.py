@@ -22,7 +22,9 @@ from .core import (
     build_install_plan,
     canonical_receipt_path,
     canonical_plan_bytes,
+    inherit_prior_credentials,
     import_credential,
+    is_inherited_credential,
     new_install_receipt,
     plan_sha256,
     rollback_receipt,
@@ -33,5 +35,6 @@ from .core import (
     verify_receipt,
 )
 from .backend import LocalInstallBackend, SystemInstallBackend
+from .receipt_chain import effective_receipt, receipt_directory
 
 __all__ = [name for name in globals() if not name.startswith("_")]

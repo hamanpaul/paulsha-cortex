@@ -42,6 +42,7 @@ from .core import (
     _read_fd_bytes,
     _reject_symlink_ancestors,
     credential_destination,
+    is_inherited_credential,
 )
 
 
@@ -1831,15 +1832,14 @@ def _expected_acls(step: Mapping[str, object]) -> list[dict[str, object]]:
     )
 
 
+JOB_ACCOUNT_NAMES = ("cortex-builder", "cortex-reviewer-planner", "cortex-gate")
+
+
 def _in_flight_process_count(accounts: Sequence[Mapping[str, object]]) -> int:
     job_uids = {
         int(row["uid"])
         for row in accounts
-        if row.get("name") in {
-            "cortex-builder",
-            "cortex-reviewer-planner",
-            "cortex-gate",
-        }
+        if row.get("name") in JOB_ACCOUNT_NAMES
         and isinstance(row.get("uid"), int)
     }
     count = 0
@@ -5380,6 +5380,9 @@ class LocalInstallBackend:
         seen: set[tuple[str, str]] = set()
         for row in rows:
             if not isinstance(row, Mapping):
+                continue
+            if is_inherited_credential(row):
+                # The prior receipt owns this file; the successor only relied on it.
                 continue
             principal = str(row.get("principal", ""))
             provider = str(row.get("provider", ""))
