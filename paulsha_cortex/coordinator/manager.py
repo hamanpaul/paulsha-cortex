@@ -7841,7 +7841,68 @@ def _checkbox_insensitive_equal(baseline: bytes, current: bytes) -> bool:
     return normalize(base_text) == normalize(cur_text)
 
 
-def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict[str, str]:
+def _post_archive_openspec_alias(
+    run,
+    *,
+    root: Path,
+    ref: str,
+    archive_applied: bool | None = None,
+) -> str | None:
+    """#716：post-archive 時，OpenSpec change 的 planning authority ref 以候選
+    樹自己的官方 archive 副本為準。
+
+    Manager 的 `openspec-archive` 把 `openspec/changes/<change>/` 搬進
+    `openspec/changes/archive/<entry>/` 之後，候選樹已沒有 active 路徑；舊的
+    fallback 會改從 operator_root（來源樹，仍是 claim 當下未勾選的 active 檔，
+    hash 恰等於 baseline）seed 一份回候選樹——reviewer 因此看到一個「復活」的
+    active change 與官方 archive 並存（live canary 的 post-archive verification
+    連兩輪因「tasks.md 未勾選」FAIL）。
+
+    回傳候選樹中的 archive 對應路徑；不適用時回 ``None``（行為不變）。只在
+    ref 形如 `openspec/changes/<change>/<rest>`、候選樹有 `<entry> == <change>`
+    或以 `-<change>` 結尾的 archive entry、Manager archive 已完成且 change 屬於
+    ``run.openspec_refs`` 時成立；active 路徑此時即使還在（例如同一棵 review 樹
+    裡先前 seed 的未追蹤檔）也一律以 archive 為準。entry 為 symlink 或不只一個
+    時 fail-closed；archive entry 唯一卻缺該檔時同樣 fail-closed，不退回 seed。
+    ``archive_applied`` 由 dispatch 以 registry 判定後傳入（涵蓋未宣告
+    `openspec-archive` 卡、靠 archive job 證據的 combo）；``None`` 時以
+    ``run.steps`` 判定，與 `_planning_artifact_relative_path_after_archive` 相同。
+    """
+    parts = Path(ref).parts
+    if len(parts) < 4 or parts[:2] != ("openspec", "changes") or parts[2] == "archive":
+        return None
+    change = parts[2]
+    archive_root = root / "openspec" / "changes" / "archive"
+    if archive_root.is_symlink() or not archive_root.is_dir():
+        return None
+    entries = [
+        entry
+        for entry in archive_root.iterdir()
+        if (entry.name == change or entry.name.endswith(f"-{change}"))
+        and (entry.is_symlink() or entry.is_dir())
+    ]
+    if not entries:
+        return None
+    if archive_applied is None:
+        archive_applied = _manager_archive_applied(run)
+    if not archive_applied or change not in run.openspec_refs:
+        return None
+    if any(entry.is_symlink() for entry in entries):
+        raise ValueError(f"workflow post-archive OpenSpec input symlink rejected: ref={ref}")
+    if len(entries) != 1:
+        raise ValueError(f"workflow post-archive OpenSpec input archive ambiguous: ref={ref}")
+    alias = Path("openspec", "changes", "archive", entries[0].name, *parts[3:]).as_posix()
+    if not _safe_input_matches(root, alias):
+        raise ValueError(f"workflow planning input missing: ref={ref} (archive={alias})")
+    return alias
+
+
+def _authority_map_with_checkbox_tolerance(
+    run,
+    *,
+    candidate_root: Path,
+    archive_applied: bool | None = None,
+) -> dict[str, str]:
     """#310 補遺：reviewer 的 frozen authority 驗證沿用 checkbox-insensitive 容忍。
 
     tasks/todo（kind=plan）在候選 worktree 的 checkbox 勾選不視為 drift；容忍
@@ -7849,13 +7910,22 @@ def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict
     snapshot 就是這份內容，hash 必須對得上實檔。其他差異維持 baseline，使
     `verify_authority_in_input_snapshot` 照舊 fail-closed。baseline bytes 取自
     operator_root 的同 ref 檔案，且必須先驗證其 hash 等於 authority baseline。
+
+    #716：post-archive 的 OpenSpec ref 以候選的 archive 副本路徑為 key（與
+    `_workflow_input_snapshot` 同一判準，見 `_post_archive_openspec_alias`）。
     """
     operator_root = Path(run.workspace_root).resolve()
     mapping: dict[str, str] = {}
     for item in run.planning_authority:
         expected = item.baseline_sha256
+        candidate_ref = (
+            _post_archive_openspec_alias(
+                run, root=candidate_root, ref=item.ref, archive_applied=archive_applied
+            )
+            or item.ref
+        )
         if item.kind == "plan" and Path(item.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES:
-            candidate_matches = _safe_input_matches(candidate_root, item.ref)
+            candidate_matches = _safe_input_matches(candidate_root, candidate_ref)
             baseline_matches = _safe_input_matches(operator_root, item.ref)
             if len(candidate_matches) == 1 and len(baseline_matches) == 1:
                 candidate_data = candidate_matches[0].read_bytes()
@@ -7867,7 +7937,7 @@ def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict
                     and _checkbox_insensitive_equal(baseline_data, candidate_data)
                 ):
                     expected = digest
-        mapping[item.ref] = expected
+        mapping[candidate_ref] = expected
     return mapping
 
 
@@ -7901,6 +7971,7 @@ def _workflow_input_snapshot(
     patterns: tuple[str, ...],
     coordinator_root: str | Path,
     persist_content: bool = True,
+    archive_applied: bool | None = None,
 ) -> tuple[dict[str, str], ...]:
     root = repo_root.resolve()
     operator_root = Path(run.workspace_root).resolve()
@@ -7908,8 +7979,35 @@ def _workflow_input_snapshot(
     seeds: dict[str, bytes] = {}
     drift_rows: list[dict[str, str]] = []
 
+    # #716：post-archive 時 OpenSpec authority ref 解析到候選自己的 archive 副本
+    # （見 `_post_archive_openspec_alias`），不再從 operator_root seed 過期的
+    # active 檔；active 路徑上殘留的檔案也不算數。沒有 alias 時（所有
+    # pre-archive 與非 OpenSpec ref）`_input_matches` 等同 `_safe_input_matches`。
+    archived_inputs: dict[str, str] = {}
+    for ref in authority:
+        if any(fnmatch.fnmatch(ref, pattern) for pattern in patterns):
+            alias = _post_archive_openspec_alias(
+                run, root=root, ref=ref, archive_applied=archive_applied
+            )
+            if alias is not None:
+                archived_inputs[ref] = alias
+    archived_authority = {alias: ref for ref, alias in archived_inputs.items()}
+
+    def _input_matches(pattern: str) -> tuple[Path, ...]:
+        if not archived_inputs:
+            return _safe_input_matches(root, pattern)
+        matches = {
+            match
+            for match in _safe_input_matches(root, pattern)
+            if match.relative_to(root).as_posix() not in archived_inputs
+        }
+        for ref, alias in archived_inputs.items():
+            if fnmatch.fnmatch(ref, pattern):
+                matches.update(_safe_input_matches(root, alias))
+        return tuple(sorted(matches, key=lambda item: item.relative_to(root).as_posix()))
+
     for pattern in patterns:
-        if _safe_input_matches(root, pattern):
+        if _input_matches(pattern):
             continue
         authority_refs = sorted(ref for ref in authority if fnmatch.fnmatch(ref, pattern))
         if not authority_refs:
@@ -7979,25 +8077,27 @@ def _workflow_input_snapshot(
     counted_digests: set[str] = set()
     ref_sizes: dict[str, int] = {}
     for pattern in patterns:
-        matches = _safe_input_matches(root, pattern)
+        matches = _input_matches(pattern)
         if not matches:
             raise ValueError(f"workflow declared input missing: {pattern}")
         for resolved in matches:
             ref = resolved.relative_to(root).as_posix()
+            authority_ref = archived_authority.get(ref, ref)
             data = resolved.read_bytes()
             digest = hashlib.sha256(data).hexdigest()
-            bound = authority.get(ref)
+            bound = authority.get(authority_ref)
             if bound is not None and digest != bound.baseline_sha256:
                 # #310：tasks/todo（kind=plan）的 checkbox 勾選是卡片契約的既定
                 # 行為，不得視為 drift。baseline bytes 取自 operator_root 的同
                 # ref 檔案，且必須先驗證其 hash 等於 authority baseline，才可
                 # 作為 checkbox-insensitive 比對的基準；其餘任何差異 fail-closed。
+                # #716：post-archive 的 archive 副本以原 authority ref 的 baseline 比對。
                 tolerated = False
                 if (
                     bound.kind == "plan"
-                    and Path(ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
+                    and Path(authority_ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
                 ):
-                    baseline_matches = _safe_input_matches(operator_root, ref)
+                    baseline_matches = _safe_input_matches(operator_root, authority_ref)
                     if len(baseline_matches) == 1:
                         baseline_data = baseline_matches[0].read_bytes()
                         if (
@@ -8009,7 +8109,7 @@ def _workflow_input_snapshot(
                 if not tolerated:
                     drift_rows.append(
                         {
-                            "ref": ref,
+                            "ref": authority_ref,
                             "kind": bound.kind,
                             "expected_sha256": bound.baseline_sha256,
                             "current_sha256": digest,
@@ -16754,11 +16854,14 @@ def _dispatch_workflow_card(
             worktree = run.workspace_root
         effective_repo_root = Path(worktree).resolve()
         effective_inputs = _effective_workflow_inputs(run, step)
+        # #716：post-archive 的 OpenSpec authority ref 解析到候選自己的 archive 副本；
+        # archive 是否完成沿用本次派工以 registry 判定的同一個事實。
+        archive_applied = post_archive_candidate is not None
         if step.persona == "reviewer":
             reviewer_target = effective_repo_root
             # #310 補遺：checkbox 容忍成立的 tasks/todo 以候選實際 hash 為 pinned 期望值。
             authority_map = _authority_map_with_checkbox_tolerance(
-                run, candidate_root=reviewer_target
+                run, candidate_root=reviewer_target, archive_applied=archive_applied
             )
             effective_inputs = _reviewer_input_patterns(run, effective_inputs)
             input_snapshot = _workflow_input_snapshot(
@@ -16766,6 +16869,7 @@ def _dispatch_workflow_card(
                 repo_root=reviewer_target,
                 patterns=effective_inputs,
                 coordinator_root=coordinator_root,
+                archive_applied=archive_applied,
             )
             foreign_review.verify_authority_in_input_snapshot(
                 authority=authority_map,
@@ -16801,6 +16905,7 @@ def _dispatch_workflow_card(
                 repo_root=effective_repo_root,
                 patterns=effective_inputs,
                 coordinator_root=coordinator_root,
+                archive_applied=archive_applied,
             )
             output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
         dispatch_base: str | None = None
