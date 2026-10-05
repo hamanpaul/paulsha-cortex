@@ -47,6 +47,7 @@ from .core import (
     bind_bundle_artifacts,
     build_install_plan,
     canonical_receipt_path,
+    inherit_prior_credentials,
     import_credential,
     is_inherited_credential,
     new_install_receipt,
@@ -720,6 +721,14 @@ def _build_parser() -> argparse.ArgumentParser:
     credential_import.add_argument("--source", required=True)
     credential_import.add_argument("--maintenance-token")
 
+    credential_inherit = credential_sub.add_parser(
+        "inherit",
+        help="hand the prior receipt's recorded credentials to an upgrade receipt",
+    )
+    credential_inherit.add_argument("--receipt", required=True)
+    credential_inherit.add_argument("--prior-receipt", required=True)
+    credential_inherit.add_argument("--maintenance-token")
+
     activate = sub.add_parser("activate", help="start egress, Manager, then Monitor")
     activate.add_argument("--receipt", required=True)
     activate.add_argument("--maintenance-token")
@@ -1184,6 +1193,32 @@ def _credential_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _credential_inherit_command(args: argparse.Namespace) -> int:
+    _require_root()
+    prior_path = Path(args.prior_receipt).expanduser()
+    with _locked_receipt(
+        Path(args.receipt), maintenance_token=args.maintenance_token
+    ) as (receipt, _plan):
+        prior = InstallReceipt.load(prior_path)
+        rows = inherit_prior_credentials(
+            receipt, prior, backend=LocalInstallBackend()
+        )
+    _emit(
+        {
+            "receipt_id": receipt.to_dict()["receipt_id"],
+            "inherited": [
+                {
+                    "principal": row["principal"],
+                    "provider": row["provider"],
+                    "inherited_from": row["inherited_from"],
+                }
+                for row in rows
+            ],
+        }
+    )
+    return 0
+
+
 def _activate_command(args: argparse.Namespace) -> int:
     _require_root()
     with _locked_receipt(
@@ -1450,6 +1485,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.trust_root_command == "recover":
             return _recover_command(args)
         if args.trust_root_command == "credentials":
+            if args.credential_command == "inherit":
+                return _credential_inherit_command(args)
             return _credential_command(args)
         if args.trust_root_command == "activate":
             return _activate_command(args)

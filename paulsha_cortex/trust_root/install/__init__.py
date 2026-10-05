@@ -22,6 +22,7 @@ from .core import (
     build_install_plan,
     canonical_receipt_path,
     canonical_plan_bytes,
+    inherit_prior_credentials,
     import_credential,
     is_inherited_credential,
     new_install_receipt,
