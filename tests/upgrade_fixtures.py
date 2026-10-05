@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
+from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install import upgrade
 from paulsha_cortex.trust_root.install.core import (
@@ -191,3 +193,139 @@ class FakePlanCli:
 
 def account(uid: int, gid: int) -> SimpleNamespace:
     return SimpleNamespace(pw_uid=uid, pw_gid=gid)
+
+
+SERVICES = install_cli._MAINTENANCE_SERVICES
+
+
+def status_payload(receipt_id: str, wheel: str, commit: str) -> dict[str, object]:
+    return {
+        "service": {
+            "loaded_runtime": {
+                name: {
+                    "comparison": {
+                        "artifact_status": "match",
+                        "config_status": "match",
+                        "process_status": "match",
+                        "loaded_wheel_sha256": wheel,
+                    },
+                    "trust_root": {
+                        "status": "verified",
+                        "receipt_id": receipt_id,
+                        "wheel_sha256": wheel,
+                        "candidate_commit": commit,
+                    },
+                    "installed_artifact": {"wheel_sha256": wheel},
+                }
+                for name in ("manager", "monitor")
+            }
+        }
+    }
+
+
+@dataclass
+class FakeSystemd:
+    active: set[str] = field(default_factory=lambda: set(SERVICES))
+    fail_stop: set[str] = field(default_factory=set)
+    calls: list[tuple[str, ...]] = field(default_factory=list)
+
+    def __call__(self, *args: str) -> subprocess.CompletedProcess[str]:
+        self.calls.append(args)
+        verb, service = args[0], args[-1]
+        if verb == "show":
+            return subprocess.CompletedProcess(args, 0, "loaded\n", "")
+        if verb == "is-active":
+            return subprocess.CompletedProcess(args, 0 if service in self.active else 3, "", "")
+        if verb == "stop":
+            if service in self.fail_stop:
+                return subprocess.CompletedProcess(args, 1, "", "stop failed")
+            self.active.discard(service)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if verb == "start":
+            self.active.add(service)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        raise AssertionError(f"unexpected systemctl call: {args}")
+
+
+class FakeCandidateCli:
+    """Stands in for the sealed candidate installer and the installed status probe."""
+
+    def __init__(self, systemd: FakeSystemd) -> None:
+        self.systemd = systemd
+        self.calls: list[tuple[str, ...]] = []
+        self.fail: dict[str, str] = {}
+        self.interrupt_after: str | None = None
+        self.rollback_result: dict[str, object] = {
+            "restore_safe": True,
+            "retained_unknown": [],
+            "retained_drift": [],
+            "systemd_daemon_reload": "not-required",
+        }
+        self.loaded: dict[str, tuple[str, str, str]] = {}
+
+    @staticmethod
+    def _value(argv: tuple[str, ...], flag: str) -> str:
+        return argv[argv.index(flag) + 1]
+
+    def commands(self) -> list[str]:
+        return [call[0] for call in self.calls]
+
+    def __call__(self, argv, *, check=False, env=None, uid=None, gid=None, **_kwargs):
+        argv = tuple(argv)
+        if argv[1:4] == ("service", "status", "--system"):
+            receipt = self._value(argv, "--install-receipt")
+            self.calls.append(("status", receipt))
+            identity = self.loaded.get(receipt, ("unknown", "0" * 64, "0" * 40))
+            return subprocess.CompletedProcess(argv, 0, json.dumps(status_payload(*identity)), "")
+        assert argv[1:3] == ("install", "trust-root"), argv
+        command = "credentials inherit" if argv[3] == "credentials" else argv[3]
+        self.calls.append((command, *argv[4:]))
+        self.systemd.calls.append(("candidate", command))
+        if command in self.fail:
+            return subprocess.CompletedProcess(
+                argv, 1, "", f"trust-root install failed: {self.fail[command]}\n"
+            )
+        if command == "apply":
+            receipt = Path(self._value(argv, "--receipt"))
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            receipt.write_text("{}\n", encoding="utf-8")
+            if self.interrupt_after == "apply":
+                raise upgrade.UpgradeInterrupted("SIGTERM")
+            payload: dict[str, object] = {
+                "receipt": str(receipt),
+                "receipt_id": "new-receipt",
+                "state": "applied",
+            }
+        elif command == "credentials inherit":
+            payload = {
+                "receipt_id": "new-receipt",
+                "inherited": [
+                    {"principal": "builder", "provider": "codex", "inherited_from": "prior-receipt"}
+                ],
+            }
+        elif command == "activate":
+            self.systemd.active.update(SERVICES)
+            payload = {"receipt_id": "new-receipt", "services_started": True, "qualified": False}
+        elif command == "verify":
+            Path(self._value(argv, "--evidence")).write_text('{"result":"pass"}\n', encoding="utf-8")
+            payload = {"ok": True}
+        elif command == "rollback":
+            self.systemd.active.clear()
+            code = 0 if self.rollback_result.get("restore_safe") is True else 1
+            return subprocess.CompletedProcess(argv, code, json.dumps(self.rollback_result), "")
+        else:
+            raise AssertionError(f"unexpected candidate command: {argv}")
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+
+def make_bound(tmp_path: Path) -> upgrade.BoundPlan:
+    plan = plan_document(tmp_path, version="0.1.13", wheel_sha256=NEW_WHEEL, commit=NEW_COMMIT)
+    sha = plan_sha256(plan)
+    canonical = Path(str(plan["receipt_path"]))
+    return upgrade.BoundPlan(
+        plan=plan,
+        sha256=sha,
+        durable_path=tmp_path / "installer" / "plans" / f"{sha}.json",
+        receipt_path=canonical.with_name(f"{canonical.stem}.run-{'0' * 32}.json"),
+        overlay_sha256=None,
+    )

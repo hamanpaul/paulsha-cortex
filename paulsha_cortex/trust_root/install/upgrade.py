@@ -638,3 +638,488 @@ def produce_plan(
         receipt_path=receipt_path,
         overlay_sha256=overlay_sha,
     )
+
+
+# --- transaction (spec §4 steps 4–8, §6, §12.4) -----------------------------------
+
+_CANDIDATE_ENV = {"HOME": "/root", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"}
+_REPORT_NAME = "upgrade-report.json"
+_LAST_REPORT_NAME = "last-upgrade-report.json"
+_HALTED_NEXT_ACTION = (
+    "services remain stopped and the maintenance snapshot is kept; resolve the "
+    "retained state listed above, then run `cortex upgrade --recover` or decide "
+    "by hand per trust-root-transactional-install.md §6"
+)
+
+
+class UpgradeInterrupted(BaseException):
+    """INT/TERM inside the maintenance window; handled like any step failure."""
+
+
+def _interrupt(signum: int, _frame: object) -> None:
+    raise UpgradeInterrupted(signal.Signals(signum).name)
+
+
+@contextmanager
+def _signals_raise() -> Iterator[None]:
+    previous = {sig: signal.signal(sig, _interrupt) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _ignore_interrupts() -> None:
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _describe(error: BaseException) -> str:
+    if isinstance(error, UpgradeInterrupted):
+        return f"interrupted by {error}"
+    return str(error) or type(error).__name__
+
+
+class StepLog:
+    """Per-step timing and status for the upgrade report."""
+
+    def __init__(self) -> None:
+        self.rows: list[dict[str, object]] = []
+        self.current: str | None = None
+
+    @contextmanager
+    def step(self, name: str) -> Iterator[None]:
+        self.current = name
+        started = _monotonic()
+        try:
+            yield
+        except BaseException:
+            self.rows.append(
+                {"name": name, "status": "failed", "seconds": round(_monotonic() - started, 3)}
+            )
+            raise
+        self.rows.append(
+            {"name": name, "status": "passed", "seconds": round(_monotonic() - started, 3)}
+        )
+
+
+@dataclass
+class _TransactionState:
+    previously_active: list[str] = field(default_factory=list)
+    apply_attempted: bool = False
+    activation_attempted: bool = False
+    receipt_id: str | None = None
+
+
+def _candidate(sealed: SealedCandidate, *arguments: str) -> CompletedProcess[str]:
+    """One sealed-candidate installer call; the sealed tree is re-attested first."""
+
+    sealed.assert_unchanged()
+    return _run(
+        (str(sealed.cli), "install", "trust-root", *arguments),
+        env={**_CANDIDATE_ENV, "PATH": f"{sealed.venv}/bin:/usr/bin:/bin"},
+    )
+
+
+def _candidate_json(sealed: SealedCandidate, step: str, *arguments: str) -> dict[str, object]:
+    result = _candidate(sealed, *arguments)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+        raise UpgradeError(f"{step} failed: {detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise UpgradeError(f"{step} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise UpgradeError(f"{step} returned invalid JSON")
+    return payload
+
+
+def _advance(
+    sealed: SealedCandidate,
+    bound: BoundPlan,
+    prior: PriorReceipt,
+    token: str,
+    report: dict[str, object],
+    steps: StepLog,
+    state: _TransactionState,
+) -> None:
+    receipt = str(bound.receipt_path)
+    with steps.step("stop-services"):
+        install_cli._stop_current_services()
+    with steps.step("apply"):
+        # Set before the child starts: a signal that lands after the child wrote
+        # the receipt but before it returned must still roll that receipt back.
+        state.apply_attempted = True
+        applied = _candidate_json(
+            sealed,
+            "apply",
+            "apply",
+            "--plan",
+            str(bound.durable_path),
+            "--confirm-sha256",
+            bound.sha256,
+            "--receipt",
+            receipt,
+            "--prior-receipt",
+            str(prior.path),
+            "--maintenance-token",
+            token,
+        )
+        state.receipt_id = str(applied.get("receipt_id"))
+        report["receipt"] = {"path": receipt, "receipt_id": state.receipt_id}
+    with steps.step("credentials"):
+        # Called exactly once per transaction attempt — never retried here.
+        # `inherit_prior_credentials` (Task 2) refuses a second run against the
+        # same receipt by design (`receipt already records credential
+        # authority`), so a retry loop around this step would not recover;
+        # recovery of a transaction that failed after this step belongs to
+        # Task 10's `--recover`, not to a loop inside this function.
+        inherited = _candidate_json(
+            sealed,
+            "credential inheritance",
+            "credentials",
+            "inherit",
+            "--receipt",
+            receipt,
+            "--prior-receipt",
+            str(prior.path),
+            "--maintenance-token",
+            token,
+        )
+        report["inherited_credentials"] = inherited.get("inherited", [])
+    with steps.step("activate"):
+        state.activation_attempted = True
+        _candidate_json(
+            sealed, "activate", "activate", "--receipt", receipt, "--maintenance-token", token
+        )
+    with steps.step("verify"):
+        evidence = sealed.attempt_dir / "install-verification.json"
+        report["verify_evidence"] = str(evidence)
+        verified = _candidate(
+            sealed,
+            "verify",
+            "--receipt",
+            receipt,
+            "--json",
+            "--evidence",
+            str(evidence),
+            "--maintenance-token",
+            token,
+        )
+        if verified.returncode != 0:
+            raise UpgradeError("verify did not PASS")
+        inactive = [
+            service
+            for service in install_cli._MAINTENANCE_SERVICES
+            if install_cli._systemctl("is-active", "--quiet", service).returncode != 0
+        ]
+        if inactive:
+            raise UpgradeError("services are not active after activation: " + ", ".join(inactive))
+    with steps.step("loaded-runtime"):
+        expected = runtime_expected({"receipt_id": state.receipt_id, "plan": bound.plan})
+        mismatch, _payload = await_loaded_runtime(bound.plan, bound.receipt_path, expected)
+        report["loaded_runtime"] = {"expected": expected, "mismatch": mismatch}
+        if mismatch:
+            raise UpgradeError(f"loaded runtime does not match the new receipt: {mismatch}")
+
+
+def _abort(
+    sealed: SealedCandidate,
+    bound: BoundPlan,
+    prior: PriorReceipt,
+    token: str,
+    report: dict[str, object],
+    steps: StepLog,
+    state: _TransactionState,
+    error: BaseException,
+    lifecycle: dict[str, bool],
+) -> int:
+    """Roll the new receipt back; restore services only when that is restore-safe.
+
+    A post-activate rollback that proves ``restore_safe=true`` auto-restores the
+    prior services below — the accepted design per spec §6/§7 and `--recover`
+    (Task 10 reads the same contract on resume); `restore_safe=false` instead
+    halts with services stopped and the maintenance snapshot kept, for the
+    operator or `--recover` to resolve by hand.
+    """
+
+    _ignore_interrupts()
+    report["failed_step"] = steps.current
+    report["error"] = _describe(error)
+    report["phase"] = "post-activate" if state.activation_attempted else "pre-activate"
+    rollback: dict[str, object] = {
+        "attempted": False,
+        "restore_safe": True,
+        "retained_unknown": [],
+        "retained_drift": [],
+    }
+    report["rollback"] = rollback
+    if state.apply_attempted and os.path.lexists(bound.receipt_path):
+        rollback["attempted"] = True
+        payload: object = None
+        try:
+            result = _candidate(
+                sealed,
+                "rollback",
+                "--receipt",
+                str(bound.receipt_path),
+                "--maintenance-token",
+                token,
+            )
+            payload = json.loads(result.stdout) if result.stdout.strip() else None
+        except (InstallError, OSError, json.JSONDecodeError) as exc:
+            rollback["error"] = _describe(exc)
+        if not isinstance(payload, dict):
+            payload = {}
+        rollback["restore_safe"] = payload.get("restore_safe") is True
+        rollback["retained_unknown"] = list(payload.get("retained_unknown") or [])
+        rollback["retained_drift"] = list(payload.get("retained_drift") or [])
+    if rollback["restore_safe"] is not True:
+        report["result"] = "halted"
+        report["next_action"] = _HALTED_NEXT_ACTION
+        return 1
+    try:
+        rollback["services_restored"] = install_cli._restore_snapshot_services(
+            state.previously_active
+        )
+    except InstallError as exc:
+        rollback["services_restored"] = []
+        rollback["restore_error"] = str(exc)
+        report["result"] = "halted"
+        report["next_action"] = (
+            "restoring the previous services failed; they were stopped again and the "
+            "snapshot is kept: run `cortex upgrade --recover`"
+        )
+        return 1
+    if state.previously_active:
+        mismatch, status = await_loaded_runtime(
+            prior.plan, prior.path, runtime_expected(prior.document)
+        )
+        rollback["prior_loaded_runtime"] = {"mismatch": mismatch, "service_status": status}
+    else:
+        mismatch = ""
+        rollback["prior_loaded_runtime"] = {
+            "mismatch": "",
+            "service_status": None,
+            "reason": "no-previously-active-services",
+        }
+    install_cli._clear_maintenance_snapshot(bound.plan, receipt_path=bound.receipt_path)
+    lifecycle["complete"] = True
+    report["result"] = "rolled-back"
+    if mismatch:
+        report["next_action"] = (
+            "the previous services run again but do not match the current receipt; "
+            "inspect `cortex service status --system`"
+        )
+    return 1
+
+
+def run_transaction(
+    sealed: SealedCandidate,
+    bound: BoundPlan,
+    prior: PriorReceipt,
+    report: dict[str, object],
+    steps: StepLog,
+) -> int:
+    """Lease → snapshot → stop → apply → inherit → activate → verify → loaded runtime."""
+
+    state = _TransactionState()
+    lifecycle = {"complete": False}
+    with _signals_raise():
+        with install_cli._maintenance_lease(bound.plan, lifecycle_state=lifecycle) as token:
+            try:
+                with steps.step("maintenance-snapshot"):
+                    if os.path.lexists(bound.receipt_path):
+                        raise UpgradeError(
+                            "the new receipt path already exists; run `cortex upgrade --recover`"
+                        )
+                    present, previously_active = install_cli._service_snapshot()
+                    state.previously_active = list(previously_active)
+                    install_cli._write_maintenance_snapshot(
+                        {
+                            "schema_version": 1,
+                            "plan_sha256": bound.sha256,
+                            "receipt_path": str(bound.receipt_path),
+                            "present_services": present,
+                            "previously_active": previously_active,
+                        }
+                    )
+            except BaseException:
+                # Nothing was stopped yet; the lease marker may go with the lease.
+                lifecycle["complete"] = True
+                raise
+            report["services_stopped"] = True
+            try:
+                _advance(sealed, bound, prior, token, report, steps, state)
+            except BaseException as error:  # noqa: BLE001 — every failure rolls back
+                return _abort(
+                    sealed, bound, prior, token, report, steps, state, error, lifecycle
+                )
+            install_cli._clear_maintenance_snapshot(bound.plan, receipt_path=bound.receipt_path)
+            lifecycle["complete"] = True
+    report["result"] = "upgraded"
+    return 0
+
+
+def _fetcher(options: UpgradeOptions) -> ReleaseFetcher:
+    if options.release_source is not None:
+        return DirectoryReleaseFetcher(options.release_source)
+    return GitHubReleaseFetcher(OFFICIAL_REPOSITORY)
+
+
+def _report_path(version: str) -> Path:
+    return install_cli._TRUST_ROOT_MAINTENANCE_ROOT / version / _REPORT_NAME
+
+
+def _publish_report(report: Mapping[str, object]) -> None:
+    root = install_cli._TRUST_ROOT_MAINTENANCE_ROOT
+    atomic_write_json(_report_path(str(report["version"])), report, mode=0o600)
+    atomic_write_json(root / _LAST_REPORT_NAME, report, mode=0o600)
+
+
+def _new_report(version: str, prior: PriorReceipt, steps: StepLog) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "version": version,
+        # Closed set, written only by this module and by Task 10's `--recover`:
+        # "upgraded" | "rolled-back" | "halted" | "refused" | "in-progress" |
+        # "recovered" (the last is `--recover`'s own terminal outcome; keep this
+        # list in sync with whichever module next widens it).
+        "result": None,
+        "phase": None,
+        "failed_step": None,
+        "error": None,
+        "started_at": _now(),
+        "finished_at": None,
+        "prior_receipt": {
+            "path": str(prior.path),
+            "receipt_id": prior.document.get("receipt_id"),
+            "version": format_version(prior.version),
+        },
+        "candidate": None,
+        "plan": None,
+        "receipt": None,
+        "inherited_credentials": [],
+        "verify_evidence": None,
+        "loaded_runtime": None,
+        "rollback": None,
+        "services_stopped": False,
+        "next_action": None,
+        "steps": steps.rows,
+        "report_path": str(_report_path(version)),
+    }
+
+
+def _print_outcome(report: Mapping[str, object], *, json_output: bool) -> None:
+    if json_output:
+        sys.stdout.write(
+            json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        return
+    lines = [f"cortex upgrade {report['version']}: {report['result']}"]
+    if report.get("failed_step"):
+        lines.append(f"  failed step:   {report['failed_step']} ({report.get('error')})")
+    prior = report.get("prior_receipt")
+    if isinstance(prior, Mapping):
+        lines.append(f"  prior receipt: {prior.get('path')} ({prior.get('version')})")
+    receipt = report.get("receipt")
+    if isinstance(receipt, Mapping):
+        lines.append(f"  new receipt:   {receipt.get('path')}")
+    plan = report.get("plan")
+    if isinstance(plan, Mapping):
+        lines.append(f"  plan sha256:   {plan.get('sha256')}")
+    if report.get("verify_evidence"):
+        lines.append(f"  verify:        {report['verify_evidence']}")
+    rollback = report.get("rollback")
+    if isinstance(rollback, Mapping):
+        lines.append(f"  rollback:      restore_safe={rollback.get('restore_safe')}")
+        for key in ("retained_unknown", "retained_drift"):
+            for row in rollback.get(key) or []:
+                lines.append(f"    {key}: {json.dumps(row, ensure_ascii=False, sort_keys=True)}")
+        if "services_restored" in rollback:
+            restored = rollback.get("services_restored") or []
+            lines.append(
+                "  services restored: " + (", ".join(str(name) for name in restored) or "none")
+            )
+    if report.get("next_action"):
+        lines.append(f"  next:          {report['next_action']}")
+    lines.append(f"  report:        {report.get('report_path')}")
+    sys.stdout.write("\n".join(lines) + "\n")
+
+
+def perform_upgrade(options: UpgradeOptions) -> int:
+    """Spec §4 end to end; every outcome after preflight lands in the report."""
+
+    previous_umask = os.umask(0o077)
+    try:
+        _pin_import_paths()
+        with install_cli._host_lock(
+            leaf="upgrade.lock", conflict="another `cortex upgrade` is already running"
+        ):
+            checked = preflight(options)
+            version = format_version(checked.target)
+            steps = StepLog()
+            report = _new_report(version, checked.prior, steps)
+            code = 1
+            try:
+                with steps.step("ingress"):
+                    sealed = ingest_release(
+                        version,
+                        fetcher=_fetcher(options),
+                        installer_root=install_cli._TRUST_ROOT_MAINTENANCE_ROOT,
+                        owner_uid=_OWNER_UID,
+                        chain_stop=_CHAIN_STOP,
+                    )
+                report["candidate"] = {
+                    "tag": sealed.metadata.tag,
+                    "commit": sealed.metadata.commit,
+                    "assets": {
+                        asset.name: asset.sha256
+                        for asset in (
+                            sealed.metadata.wheel,
+                            sealed.metadata.install_input,
+                            sealed.metadata.qualification,
+                        )
+                    },
+                    "attempt_dir": str(sealed.attempt_dir),
+                    "cli_tree_sha256": sealed.tree_sha256,
+                }
+                with steps.step("plan"):
+                    bound = produce_plan(sealed, checked.prior, options=options)
+                report["plan"] = {
+                    "sha256": bound.sha256,
+                    "durable_path": str(bound.durable_path),
+                    "host_overlay_sha256": bound.overlay_sha256,
+                }
+                report["result"] = "in-progress"
+                _publish_report(report)
+                code = run_transaction(sealed, bound, checked.prior, report, steps)
+            except BaseException as error:  # noqa: BLE001 — every outcome is reported
+                if report["result"] in (None, "in-progress"):
+                    stopped = report["services_stopped"] is True
+                    report["result"] = "halted" if stopped else "refused"
+                    report["failed_step"] = steps.current
+                    report["error"] = _describe(error)
+                    if stopped:
+                        report["next_action"] = (
+                            "the upgrade stopped inside the maintenance window; "
+                            "run `cortex upgrade --recover`"
+                        )
+                code = 1
+            finally:
+                report["finished_at"] = _now()
+                _publish_report(report)
+            _print_outcome(report, json_output=options.json_output)
+            return code
+    finally:
+        os.umask(previous_umask)
+
+
+def run_upgrade(options: UpgradeOptions) -> int:
+    return perform_upgrade(options)
