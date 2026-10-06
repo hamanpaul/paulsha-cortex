@@ -12,3 +12,8 @@
   - RC `upgrade_diagnostics` 比對 `--json` 輸出與 durable report 的 `started_at`：完整升級在發布 report 之前就被拒（例如 preflight）時，標示 durable report「possibly stale」（那是 activate 前失敗演練留下的同版本 report），verify evidence 也只取這次的輸出。
   - `trust-root-transactional-install.md`：§6「手動恢復 `cortex upgrade` 中斷的升級」對應表註明 SIGKILL 後 durable report 停在 `in-progress`、`receipt` 為 null 時只依 snapshot 的 `receipt_path`；「一般升級」補上中斷訊號等該步結束才 rollback、再送一次才立即中止，以及 `attempt-*` 目錄不會自動清理、何時可以安全刪除（工具不自動刪：plan 與 receipt 記錄其中的路徑、halted 的升級還要用它恢復）。
   - `trust-root-legacy-adoption.md` §8 改為指向 `cortex upgrade`，不再描述手動 `--prior-receipt` 升級。
+- **#1270 `cortex upgrade` 的測試覆蓋與兩套 bundle 驗證對齊**：
+  - `qualification/verify_bundle.py` 與移植版 `release_ingress._validate_bundle_inventory` 改為同樣嚴格、訊息相同：兩者都拒絕重複的 wheelhouse 條目、不在 `wheelhouse/` 正下方的 wheel、`dist/` 內的非一般檔案、路徑祖先有 symlink 的條目、非 JSON 的 bundle（`bundle is not JSON`），也都要求 `candidate_sha` 參數是 40 位小寫 hex。新增逐分支 parity 測試（42 個 refusal，`match=` 比對兩邊相同訊息），以及從 `verify_bundle.py` 的 AST 列出每個 refusal、確認 parity 表都涵蓋的守門測試。
+  - RC driver 交叉核對 upgrade report 的 `receipt.receipt_id` 與 `plan.sha256` 必須等於升級後 receipt 自己的 `receipt_id`／`plan_sha256`；validator 要求 one-command upgrade 證據的 receipt id 都是非空字串（原本 null 會與 null 的 expected／loaded id 相等而通過，非字串則讓 validator 崩潰）。
+  - release ingress：asset 下載成功路徑的 header 與 timeout、短於 metadata 的 asset、超過 1 MiB 的 metadata、tag／release 名稱不符、重複 asset、畸形 digest／size／URL、`O_EXCL`／`O_NOFOLLOW` 不覆寫也不跟隨既有檔案或 symlink；`test_private_chain_refuses_a_symlinked_ancestor` 等測試與 `make_sealed`／`write_input_tree` fixture 不再依賴 umask（在 umask 0002 下原本會失敗）。
+  - transaction：activate 失敗（post-activate rollback）、服務恢復失敗（halted、snapshot 保留）、snapshot 步驟失敗（什麼都沒停、lease 釋放）、新 receipt 路徑已存在、candidate 子程序之外的真實 SIGHUP。

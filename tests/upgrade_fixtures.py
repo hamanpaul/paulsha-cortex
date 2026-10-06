@@ -167,6 +167,9 @@ def make_sealed(
     cli = venv / "bin" / "cortex"
     cli.write_text("#!/bin/sh\n", encoding="utf-8")
     cli.chmod(0o755)
+    # tree_sha256 refuses group/other-writable entries; do not depend on umask.
+    venv.chmod(0o755)
+    (venv / "bin").chmod(0o755)
     input_root = attempt / "input"
     input_root.mkdir()
     (input_root / "bundle.json").write_text("{}\n", encoding="utf-8")

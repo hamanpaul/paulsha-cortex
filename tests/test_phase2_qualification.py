@@ -221,9 +221,12 @@ def _one_command_upgrade_document(
     *,
     drill_result: str = "rolled-back",
     inherited_from: str = "prior",
-    loaded_receipt_id: str = "upgraded",
+    receipt_id: object = "upgraded",
+    loaded_receipt_id: object = None,
+    drill_receipt_id: object = "rollback",
 ) -> dict:
     wheel, commit = "b" * 64, "a" * 40
+    loaded_receipt_id = receipt_id if loaded_receipt_id is None else loaded_receipt_id
     return {
         "schema_version": 1,
         "scenario": "one-command-upgrade-same-artifact",
@@ -231,19 +234,19 @@ def _one_command_upgrade_document(
             "result": drill_result,
             "failed_step": "credentials",
             "restore_safe": True,
-            "receipt_id": "rollback",
+            "receipt_id": drill_receipt_id,
             "parent_receipt_id": "prior",
         },
         "upgrade": {
             "result": "upgraded",
-            "receipt_id": "upgraded",
+            "receipt_id": receipt_id,
             "parent_receipt_id": "prior",
             "plan_sha256": "e" * 64,
             "inherited_credentials": [
                 {"principal": "builder", "provider": "codex", "inherited_from": inherited_from}
             ],
         },
-        "expected": {"receipt_id": "upgraded", "wheel_sha256": wheel, "candidate_commit": commit},
+        "expected": {"receipt_id": receipt_id, "wheel_sha256": wheel, "candidate_commit": commit},
         "service_status": {
             "service": {
                 "loaded_runtime": {
@@ -1019,6 +1022,18 @@ def test_reference_image_ships_the_release_source_helper() -> None:
         (
             {"loaded_receipt_id": "prior"},
             "one-command upgrade loaded-runtime artifact or receipt does not match",
+        ),
+        # #1270: a null receipt id matched a null expected/loaded id, and a
+        # non-string one crashed the validator instead of failing it.
+        ({"receipt_id": None}, "one-command upgrade receipt ids must be non-empty strings"),
+        ({"receipt_id": ""}, "one-command upgrade receipt ids must be non-empty strings"),
+        (
+            {"receipt_id": ["upgraded"]},
+            "one-command upgrade receipt ids must be non-empty strings",
+        ),
+        (
+            {"drill_receipt_id": None},
+            "one-command upgrade receipt ids must be non-empty strings",
         ),
     ],
 )

@@ -635,10 +635,14 @@ def _validate_bundle_inventory(bundle: Path, *, candidate_sha: str, wheel_sha256
 
     ``verify_bundle.py`` runs stand-alone during RC qualification, before the
     candidate wheel is installed, so it cannot import this package: keep the
-    two validators hand-in-sync on any change. Parity between them is pinned
-    by ``tests/test_trust_root_install_release_ingress.py``'s
-    ``test_input_tree_validation_accepts_what_verify_bundle_accepts`` and
-    ``test_input_tree_mutations_are_refused_like_verify_bundle``.
+    two validators hand-in-sync on any change.  Both are equally strict and
+    raise the same messages.  ``tests/test_trust_root_install_release_ingress.py``
+    pins that branch by branch in
+    ``test_bundle_port_refuses_every_branch_with_verify_bundles_message``; its
+    case table is kept complete by
+    ``test_bundle_parity_table_covers_every_refusal_message_of_verify_bundle``,
+    and ``test_input_tree_validation_accepts_what_verify_bundle_accepts`` covers
+    an accepted tree.
     """
 
     _single_link_regular(bundle, label="bundle")
@@ -657,7 +661,7 @@ def _validate_bundle_inventory(bundle: Path, *, candidate_sha: str, wheel_sha256
         raise IngressError("bundle has missing or unknown root fields")
     if payload["schema_version"] != 1 or isinstance(payload["schema_version"], bool):
         raise IngressError("bundle schema_version must be 1")
-    if payload["candidate_sha"] != candidate_sha:
+    if payload["candidate_sha"] != candidate_sha or _hex(candidate_sha, _SHA40) is None:
         raise IngressError("bundle candidate_sha does not match")
     wheel_path = _bundle_entry(payload["wheel"], root=root, label="wheel")
     if payload["wheel"]["sha256"] != wheel_sha256:

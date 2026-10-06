@@ -697,6 +697,115 @@ def test_perform_upgrade_keeps_an_upgrade_finished_before_a_late_interrupt(
     assert report["error"] is None
 
 
+def test_an_activate_failure_rolls_back_as_post_activate(harness) -> None:
+    # #1270: activate counts as attempted before its child runs, so a failed
+    # activate is a post-activate rollback (restore_safe decides what restarts).
+    harness.cli.fail["activate"] = "unit start failed"
+
+    code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["failed_step"] == "activate"
+    assert report["phase"] == "post-activate"
+    assert "unit start failed" in report["error"]
+    assert "verify" not in harness.cli.commands()
+    assert report["rollback"]["attempted"] is True
+    assert report["result"] == "rolled-back"
+    assert report["rollback"]["services_restored"] == list(fx.SERVICES)
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None
+
+
+def test_a_failed_service_restore_halts_with_the_snapshot_kept(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.cli.fail["credentials inherit"] = "credential drifted"
+
+    def restore(_services):
+        raise install_core.InstallError("cannot restore previously active service: x")
+
+    monkeypatch.setattr(install_cli, "_restore_snapshot_services", restore)
+
+    code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["result"] == "halted"
+    assert report["rollback"]["services_restored"] == []
+    assert "cannot restore previously active service" in report["rollback"]["restore_error"]
+    assert "cortex upgrade --recover" in report["next_action"]
+    snapshot = install_cli._read_maintenance_snapshot()
+    assert snapshot is not None
+    assert snapshot["receipt_path"] == str(harness.bound.receipt_path)
+    assert _marker()["plan_sha256"] == harness.bound.sha256
+
+
+@pytest.mark.parametrize("failing", ["_service_snapshot", "_write_maintenance_snapshot"])
+def test_a_snapshot_step_failure_stops_nothing_and_releases_the_lease(
+    harness, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    def fail(*_args, **_kwargs):
+        raise install_core.InstallError(f"{failing} failed")
+
+    monkeypatch.setattr(install_cli, failing, fail)
+    report: dict[str, object] = {"version": "0.1.13", "services_stopped": False}
+    steps = upgrade.StepLog()
+
+    with pytest.raises(install_core.InstallError, match=f"{failing} failed"):
+        upgrade.run_transaction(
+            harness.sealed, harness.bound, harness.prior, report, steps, wait_idle=0
+        )
+
+    assert steps.current == "maintenance-snapshot"
+    assert report["services_stopped"] is False
+    assert not [call for call in harness.systemd.calls if call[0] == "stop"]
+    assert harness.cli.commands() == []
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None
+
+
+def test_an_existing_new_receipt_path_is_refused_before_anything_stops(harness) -> None:
+    harness.bound.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    harness.bound.receipt_path.write_text("{}\n", encoding="utf-8")
+    report: dict[str, object] = {"version": "0.1.13", "services_stopped": False}
+
+    with pytest.raises(upgrade.UpgradeError, match="new receipt path already exists"):
+        upgrade.run_transaction(
+            harness.sealed, harness.bound, harness.prior, report, upgrade.StepLog(), wait_idle=0
+        )
+
+    assert not [call for call in harness.systemd.calls if call[0] == "stop"]
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None
+
+
+def test_a_real_sighup_outside_a_candidate_child_is_raised_at_once(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only a running candidate child defers an interrupt; a signal while the
+    # coordinator itself works (here: right after stopping the services) stops
+    # the transaction before the next step starts.
+    stop = install_cli._stop_current_services
+
+    def stop_then_hang_up():
+        stopped = stop()
+        os.kill(os.getpid(), signal.SIGHUP)
+        return stopped
+
+    monkeypatch.setattr(install_cli, "_stop_current_services", stop_then_hang_up)
+
+    with _recording_handler(signal.SIGHUP) as received:
+        code, report = _run_transaction(harness)
+
+    assert received == []
+    assert code == 1
+    assert report["failed_step"] == "stop-services"
+    assert report["error"] == "interrupted by SIGHUP"
+    assert "apply" not in harness.cli.commands()
+    assert report["rollback"]["attempted"] is False
+    assert report["result"] == "rolled-back"
+    assert harness.systemd.active == set(fx.SERVICES)
+
+
 def test_failure_before_apply_restores_services_without_a_rollback(harness) -> None:
     harness.systemd.fail_stop.add("cortex-monitor.service")
 

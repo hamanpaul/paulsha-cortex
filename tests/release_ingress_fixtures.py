@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,14 @@ class ReleaseFixture:
     source: Path
     tree: InputTree
     assets: dict[str, str]
+
+
+def drop_group_other_write(root: Path) -> None:
+    """Clear group/other write like a umask-022 host; the suite may run under 0002."""
+
+    for path in [root, *root.rglob("*")]:
+        if not path.is_symlink():
+            path.chmod(stat.S_IMODE(path.lstat().st_mode) & ~0o022)
 
 
 def write_input_tree(
@@ -79,6 +88,7 @@ def write_input_tree(
         ],
     }
     (root / "bundle.json").write_text(json.dumps(bundle, sort_keys=True), encoding="utf-8")
+    drop_group_other_write(root)
     return InputTree(
         root=root,
         bundle=root / "bundle.json",
