@@ -923,14 +923,24 @@ source path 都必須由 operator 逐一指定到正確檔案；不要從任何 
 secret 值放進環境變數或命令列。
 
 各 provider 的 source basename 由 installer 的 credential adapter 決定（allowlist，檔名不符
-即拒絕），內容只驗結構、不記錄：
+即拒絕），內容只驗結構、不記錄。新 plan 的 Codex controls 與 Codex／Copilot credentials
+由 installer 放在 Manager launcher 的 canonical authority 路徑；其他 provider 仍安裝到 role
+HOME：
 
-| principal／provider | source basename | 來源 | 安裝落點（該帳號 HOME 下） |
+| principal／provider | source basename | 來源 | 安裝落點 |
 | --- | --- | --- | --- |
-| builder／codex | `auth.json` | codex 登入後的 `$CODEX_HOME/auth.json` | `.codex/auth.json` |
+| builder／codex | `auth.json` | codex 登入後的 `$CODEX_HOME/auth.json` | `<state>/config/codex-credentials/builder/auth.json`（Manager-owned） |
+| reviewer-planner／codex | `auth.json` | codex 登入後的 `$CODEX_HOME/auth.json` | `<state>/config/codex-credentials/reviewer/auth.json`（Manager-owned；僅 overlay 要求時匯入） |
 | reviewer-planner／agy、builder／agy | `antigravity-oauth-token` | agy 1.2.11 登入後的 `~/.gemini/antigravity-cli/antigravity-oauth-token` | `cache/gemini/antigravity-cli/antigravity-oauth-token` |
-| reviewer-planner／copilot | `config.json` | copilot 1.0.88 登入後的 `~/.copilot/config.json` | `.copilot/config.json` |
+| reviewer-planner／copilot | `config.json` | copilot 1.0.88 登入後的 `~/.copilot/config.json` | `<state>/config/codex-credentials/reviewer/copilot/config.json`（Manager-owned） |
 | manager／github | `hosts.yml` | gh 的 `~/.config/gh/hosts.yml` | `.config/gh/hosts.yml` |
+
+plan 會同時建立 root-owned `<state>/config/codex-controls/builder/` 與
+`reviewer/`。每個 principal 都包含封存政策提供的最小 `config.toml`、root-owned
+`hooks.json`，以及空的 `plugins/`、`skills/` 目錄；不要從 operator 或 role HOME 複製或
+手動補 controls。Manager EnvironmentFile 會宣告 `PSC_CODEX_CONTROL_ROOT`、
+`PSC_CODEX_CREDENTIAL_ROOT` 與 `PSC_COPILOT_OAUTH_CONFIG`，verify 會檢查 controls 形狀與
+receipt 記錄的 credentials。
 
 - AGY 的 basename 與落點由 permgen 的 `ExecutorCredential("agy", token_leaf=...,
   cache_target="gemini")` 導出：`~/.gemini` 是指向 `cache/gemini` 的 symlink，installer
@@ -939,8 +949,8 @@ secret 值放進環境變數或命令列。
 - Copilot 1.0.88 不再讀 `~/.config/github-copilot/hosts.json`。installer 採 Copilot 自己的
   `config.json`（`copilotTokens`／`loggedInUsers`／`lastLoggedInUser`），不採 gh 的
   `hosts.yml`：job 帳號依 #666 刻意沒有 `~/.config/gh`（GitHub 寫入一律由 Manager 代理），
-  放進 gh token 會讓 job 內的 `gh` 重新取得寫入通道；Manager 派 Copilot job 時也是把
-  `PSC_COPILOT_OAUTH_CONFIG` 複製成 `$COPILOT_HOME/config.json`，兩條路徑是同一種檔。
+  放進 gh token 會讓 job 內的 `gh` 重新取得寫入通道；Manager 派 Copilot job 時會從
+  canonical `PSC_COPILOT_OAUTH_CONFIG` 複製成 `$COPILOT_HOME/config.json`，兩條路徑是同一種檔。
   匯入要求 `copilotTokens` 為非空物件，錯誤訊息不含任何來源內容。建議來源只保留上述三個
   鍵，不要帶入其他 CLI 偏好設定。
 - `antigravity-cli/` 與 `.copilot/` 是 CLI 自己的狀態目錄；缺少時 installer 以 0700 建立並
@@ -999,8 +1009,9 @@ cortex_release_maintenance_lease complete
 trap - EXIT INT TERM
 ```
 
-`verify` 必須回傳 PASS，且三個 units 都必須是 `active`，才可宣稱這台主機已部署。package
-release、RC container success 或靜態測試都不能代替這個 live 結論。
+`verify` 必須回傳 PASS，且三個 units 都必須是 `active`。之後至少由正常 Manager launcher
+成功啟動一個 job，確認安裝後的 controls、credential 與 provider authority 可用，才可宣稱
+這台主機已部署。package release、RC container success 或靜態測試都不能代替這個 live 結論。
 
 若一般 command failure／INT／TERM 發生，trap 會使用同一份 root-owned receipt 回滾；
 rollback 只處理 receipt-owned state，偵測到未知 drift 時會保留並回報，需先人工裁決。

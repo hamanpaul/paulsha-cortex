@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from paulsha_cortex.coordinator.spool_slot import canonical_codex_controls
+from paulsha_cortex.coordinator.spool_slot import copilot_oauth_authority
 from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install.core import new_install_receipt
 from test_trust_root_install_legacy_adoption import LegacyCase
@@ -24,10 +25,14 @@ def installer_plan(request: pytest.FixtureRequest, tmp_path: Path) -> dict:
         plan = LegacyCase(tmp_path).plan
 
     # This test executes the root-owned CLI path as the current test user.
-    # Keep the planned identity intact apart from the uid/gid needed by the
-    # rootless credential-import seam.
+    # Keep planned identities intact apart from uid/gid needed by the
+    # rootless credential-import seam; canonical credentials are Manager-owned.
     for account in plan["accounts"]:
-        if account["name"] in {"cortex-builder", "cortex-reviewer-planner"}:
+        if account["name"] in {
+            "cortex-manager",
+            "cortex-builder",
+            "cortex-reviewer-planner",
+        }:
             account["uid"] = os.getuid()
             account["gid"] = os.getgid()
     return plan
@@ -69,6 +74,31 @@ def test_first_install_and_legacy_adoption_provision_canonical_codex_controls(
         principal,
         manager_env={"PSC_CODEX_CONTROL_ROOT": str(root)},
     ) == root / principal
+
+
+def test_legacy_manual_codex_controls_are_quarantined_as_a_tree(tmp_path: Path) -> None:
+    def seed_manual_controls(_seeded, _fake, base) -> None:
+        root = Path(base["roots"]["state"]) / "config/codex-controls"
+        for principal in ("builder", "reviewer"):
+            control = root / principal
+            (control / "plugins").mkdir(parents=True)
+            (control / "skills").mkdir()
+            (control / "config.toml").write_text("# operator copy\n", encoding="utf-8")
+            (control / "hooks.json").write_text("{}\n", encoding="utf-8")
+            (control / "plugins" / "operator-plugin").mkdir()
+
+    case = LegacyCase(tmp_path, host=seed_manual_controls)
+    quarantined = {
+        row["path"]: row["reason"] for row in case.block["quarantine"]
+    }
+    for principal in ("builder", "reviewer"):
+        path = str(
+            Path(case.plan["roots"]["state"])
+            / "config/codex-controls"
+            / principal
+        )
+        assert quarantined[path] == "codex-controls-policy"
+        assert any(step["path"] == path for step in case.quarantine_steps())
 
 
 def _applied_receipt(plan: dict):
@@ -186,3 +216,12 @@ def test_imported_copilot_credential_is_bound_into_manager_environment(
     )
 
     assert "PSC_COPILOT_OAUTH_CONFIG=" in manager_env.read_text(encoding="utf-8")
+    expected = (
+        Path(installer_plan["roots"]["state"])
+        / "config/codex-credentials/reviewer/copilot/config.json"
+    )
+    assert expected.is_file()
+    assert copilot_oauth_authority(
+        manager_env={"PSC_COPILOT_OAUTH_CONFIG": str(expected)}
+    ) == expected
+    assert (expected.stat().st_mode & 0o777) == 0o600

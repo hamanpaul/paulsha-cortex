@@ -612,6 +612,48 @@ class Harness:
             )
         self.evidence["verify"] = {"result": "pass", "evidence": self.verify_path.name}
 
+    def _launcher_authorities(self) -> None:
+        assert self.plan is not None
+        required = self.plan.get("required_credentials")
+        if not isinstance(required, list):
+            raise HarnessError("install plan has no required credential roster")
+        expected = [
+            {
+                "principal": str(row["principal"]),
+                "provider": str(row["provider"]),
+                "check": "credential" if row["principal"] == "manager" else "launcher",
+            }
+            for row in required
+            if isinstance(row, Mapping)
+        ]
+        result = self.runner(
+            (
+                "/usr/local/libexec/cortex-launch-authority-probe",
+                "--plan",
+                str(self.plan_path),
+                "--receipt",
+                str(self.receipt_path),
+            )
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip().replace("\n", " ")[:800]
+            raise HarnessError(f"Manager launcher authority probe failed: {detail}")
+        output = (result.stdout or "").strip()
+        if not output:
+            raise HarnessError("Manager launcher authority probe returned no evidence")
+        try:
+            payload = json.loads(output.splitlines()[-1])
+        except json.JSONDecodeError as exc:
+            raise HarnessError("Manager launcher authority probe returned invalid JSON") from exc
+        if not isinstance(payload, Mapping) or payload.get("status") != "passed" or payload.get(
+            "providers"
+        ) != expected:
+            raise HarnessError("Manager launcher authority probe did not cover every imported provider")
+        self.evidence["launcher_authorities"] = {
+            "status": "passed",
+            "providers": expected,
+        }
+
     # -- driver ------------------------------------------------------------
 
     def _write_evidence(self) -> None:
@@ -631,6 +673,7 @@ class Harness:
             "credentials": "_credentials",
             "activate": "_activate",
             "verify": "_verify",
+            "launcher-authorities": "_launcher_authorities",
         }
         assert tuple(handlers) == fixture.LEGACY_STEPS
         for name in fixture.LEGACY_STEPS:

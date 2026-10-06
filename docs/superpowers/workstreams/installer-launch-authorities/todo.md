@@ -32,21 +32,21 @@ work_item: installer-launch-authorities
       `canonical_codex_controls('builder')`／`('reviewer')` 失敗；
       `<state>/config/codex-credentials/builder/auth.json` 不存在；
       已匯入 reviewer-planner/copilot 時 Manager env 缺 `PSC_COPILOT_OAUTH_CONFIG`。
-- [ ] **T2 canonical codex controls 由 installer 建立**：plan 宣告 builder 與 reviewer 的
+- [x] **T2 canonical codex controls 由 installer 建立**：plan 宣告 builder 與 reviewer 的
       `codex-controls/<principal>` 為 installer-owned root 物件，apply 時建立，receipt 記錄、verify 檢查、
       rollback 還原後 inventory digest 一致。內容取自 release 封存的政策：最小 `config.toml`、與 role HOME
       相同形狀的 `hooks.json` 政策（#698 root-owned／sticky 規則）、空的 `plugins/` 與 `skills/`。不得從
       operator 或 role HOME 複製。
-- [ ] **T3 codex 憑證位置一致**：選定唯一的 canonical 位置，讓 `credentials import` 與 launcher 的
+- [x] **T3 codex 憑證位置一致**：選定唯一的 canonical 位置，讓 `credentials import` 與 launcher 的
       `provision_runtime_surfaces(seed_credential=True)` 讀寫同一處。#1275 的 inherit 與 receipt credential
       row 模型維持一致。既有安裝經升級後自動收斂，不需手動搬檔。
-- [ ] **T4 copilot OAuth authority**：匯入 reviewer-planner/copilot 憑證時，installer 推導並寫入 Manager
+- [x] **T4 copilot OAuth authority**：匯入 reviewer-planner/copilot 憑證時，installer 推導並寫入 Manager
       EnvironmentFile 的 `PSC_COPILOT_OAUTH_CONFIG`，verify 會檢查。
-- [ ] **T5 升級與 adoption 收斂**：既有安裝缺 controls 時，新 plan 自動補上。若 controls 已存在但內容與
+- [x] **T5 升級與 adoption 收斂**：既有安裝缺 controls 時，新 plan 自動補上。若 controls 已存在但內容與
       封存政策不同（例如 operator 手動補過），依 installer 既有的 drift／adoption 規則以
       quarantine-then-create 處理，保留舊副本，不默默覆寫、不停下來等人。legacy adoption 的舊 controls
       照舊 quarantine，再由 T2 建立新的。
-- [ ] **T6 RC production parity**：
+- [x] **T6 RC production parity**：
       - 拿掉 `qualification/run.sh` 用 harness fixture 與 scaffold 種 controls／憑證的步驟。
       - installer 照 runbook 走完（apply → credentials import → activate → verify）之後、harness 對
         installer 管理目錄做任何布置之前，先經 Manager launcher 路徑實際啟動一個 job。若 release profile
@@ -55,6 +55,6 @@ work_item: installer-launch-authorities
       - harness 對 installer 管理路徑（`/opt/cortex`、`/var/lib/cortex*`、`/etc/systemd/system`、role HOME）
         剩下的寫入，必須列在有註解的允許清單內，並由單元測試解析 `qualification/run.sh` 強制執行。
       - legacy-adoption profile 證明 adoption 之後 launcher authority 檢查通過。
-- [ ] **T7 文件**：`trust-root-transactional-install.md` 與 `trust-root-legacy-adoption.md` 寫明 controls、
+- [x] **T7 文件**：`trust-root-transactional-install.md` 與 `trust-root-legacy-adoption.md` 寫明 controls、
       憑證與 copilot authority 由 installer 管理；驗收步驟加入「至少一個 job 成功啟動」。新增 changelog
       fragment，並同步 `CHANGELOG.md [Unreleased]`。

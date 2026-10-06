@@ -71,6 +71,7 @@ LEGACY_STEPS = (
     "credentials",
     "activate",
     "verify",
+    "launcher-authorities",
 )
 #: qualification.json 的 legacy-adoption 專屬測試名稱。
 LEGACY_TESTS = (
@@ -83,6 +84,7 @@ LEGACY_TESTS = (
     "legacy-adoption-reapply",
     "legacy-credential-reimport",
     "legacy-activate-verify",
+    "legacy-launcher-authorities",
 )
 #: harness 產生、driver 帶進 evidence 的檔名。
 LEGACY_EVIDENCE_FILES = (

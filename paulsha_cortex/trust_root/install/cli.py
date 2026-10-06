@@ -52,6 +52,7 @@ from .core import (
     bind_bundle_artifacts,
     build_install_plan,
     canonical_receipt_path,
+    credential_import_location,
     inherit_prior_credentials,
     import_credential,
     is_inherited_credential,
@@ -1251,37 +1252,17 @@ def _credential_command(args: argparse.Namespace) -> int:
     with _locked_receipt(
         Path(args.receipt), maintenance_token=args.maintenance_token
     ) as (receipt, plan):
-        accounts = plan.get("accounts", [])
-        account_name = {
-            "builder": "cortex-builder",
-            "reviewer-planner": "cortex-reviewer-planner",
-            "manager": "cortex-manager",
-        }.get(args.principal)
-        account = next(
-            (
-                row
-                for row in accounts
-                if isinstance(row, Mapping) and row.get("name") == account_name
-            ),
-            None,
+        destination_root, destination_uid, destination_gid = credential_import_location(
+            plan, principal=args.principal, provider=args.provider
         )
-        if (
-            not isinstance(account, Mapping)
-            or not isinstance(account.get("home"), str)
-            or not isinstance(account.get("uid"), int)
-            or not isinstance(account.get("gid"), int)
-        ):
-            raise InstallPlanError(
-                f"receipt plan lacks the home for principal {args.principal}"
-            )
         metadata = import_credential(
             receipt,
             principal=args.principal,
             provider=args.provider,
             source=Path(args.source),
-            destination_root=Path(str(account["home"])),
-            destination_uid=account["uid"],
-            destination_gid=account["gid"],
+            destination_root=destination_root,
+            destination_uid=destination_uid,
+            destination_gid=destination_gid,
         )
     _emit(metadata.to_dict())
     return 0

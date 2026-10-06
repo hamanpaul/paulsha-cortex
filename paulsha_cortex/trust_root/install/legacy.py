@@ -2770,6 +2770,7 @@ _QUARANTINE_DISPOSITIONS = frozenset({"quarantine", "quarantine-then-create"})
 QUARANTINE_REASONS = frozenset(
     {
         "authority",
+        "codex-controls-policy",
         "credential",
         "deploy-backup",
         "home-top",
@@ -3107,6 +3108,32 @@ def _classify_managed(
     def fail(message: str) -> _Outcome:
         outcome.failure = message
         return outcome
+
+    # A legacy Codex control tree is never adopted in place. Moving the
+    # principal root as one object preserves any operator-added controls or
+    # plugins in quarantine, then the ordinary asset steps create the exact
+    # release policy tree. Descendant rows are recreated after their parent
+    # move and must not compete for a second quarantine rename.
+    path_parts = tuple(part for part in path.split("/") if part)
+    control_index = next(
+        (
+            index
+            for index in range(len(path_parts) - 1)
+            if path_parts[index : index + 2] == ("config", "codex-controls")
+        ),
+        None,
+    )
+    if control_index is not None:
+        suffix = path_parts[control_index + 2 :]
+        if suffix and suffix[0] in {"builder", "reviewer"}:
+            principal_root = "/" + "/".join(
+                (*path_parts[: control_index + 2], suffix[0])
+            )
+            if path == principal_root and kind == "asset" and row["asset_type"] == "directory":
+                return quarantine("quarantine-then-create", "codex-controls-policy")
+            if path.startswith(principal_root + "/"):
+                outcome.disposition = "create"
+                return outcome
 
     if kind == "asset":
         expected = {"directory": "directory", "symlink": "symlink", "file": "file"}.get(

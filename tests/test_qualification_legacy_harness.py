@@ -64,6 +64,8 @@ class FakeHost:
         self.plan_sha_override: str | None = None
         self.leave_source_after_apply = False
         self.verify_result = "pass"
+        self.authority_probe_failure = False
+        self.authority_probe_output: str | None = None
         self.extra_quarantine: list[str] = []
         self.plan: dict | None = None
         self.sample_changes: dict[str, str] = {}
@@ -140,6 +142,26 @@ class FakeHost:
         self.environments.append((argv, env))
         if argv[0] == "systemctl":
             return self._systemctl(argv)
+        if argv[0].endswith("/cortex-launch-authority-probe"):
+            if self.authority_probe_failure:
+                return Result(1, stderr="injected authority probe failure")
+            if self.authority_probe_output is not None:
+                return Result(stdout=self.authority_probe_output)
+            plan_path = Path(argv[argv.index("--plan") + 1])
+            required = json.loads(plan_path.read_text(encoding="utf-8"))[
+                "required_credentials"
+            ]
+            providers = [
+                {
+                    "principal": str(row["principal"]),
+                    "provider": str(row["provider"]),
+                    "check": "credential" if row["principal"] == "manager" else "launcher",
+                }
+                for row in required
+            ]
+            return Result(
+                stdout=json.dumps({"status": "passed", "providers": providers})
+            )
         assert argv[:3] == ("cortex", "install", "trust-root"), argv
         command = argv[3:]
         if command[:2] == ("legacy", "inventory"):
@@ -300,6 +322,17 @@ def test_harness_runs_every_step_in_order_and_records_passing_evidence(tmp_path:
     assert all(row["source"].startswith(QUARANTINE_ROOT + "/") for row in evidence["credentials"])
     assert all("sha256" not in row for row in evidence["credentials"])
     assert evidence["verify"]["result"] == "pass"
+    assert evidence["launcher_authorities"] == {
+        "status": "passed",
+        "providers": [
+            {
+                "principal": str(row["principal"]),
+                "provider": str(row["provider"]),
+                "check": "credential" if row["principal"] == "manager" else "launcher",
+            }
+            for row in MANIFEST["credentials"]
+        ],
+    }
 
     # The rollback payload and the reviewed inventory become evidence files.
     rollback_file = json.loads((tmp_path / "output" / "legacy-rollback.json").read_text())
@@ -422,6 +455,16 @@ def test_harness_order_rolls_back_before_credentials_and_activation(tmp_path: Pa
         (lambda host: setattr(host, "need_reload", "yes"), "rollback", "NeedDaemonReload"),
         (lambda host: setattr(host, "verify_result", "fail"), "verify", "verify"),
         (
+            lambda host: setattr(host, "authority_probe_failure", True),
+            "launcher-authorities",
+            "authority probe failed",
+        ),
+        (
+            lambda host: setattr(host, "authority_probe_output", ""),
+            "launcher-authorities",
+            "returned no evidence",
+        ),
+        (
             lambda host: host.plan_preview.update(
                 ready=False, failures=["unclassified: /var/lib/cortex-manager/x"]
             ),
@@ -446,6 +489,8 @@ def test_harness_order_rolls_back_before_credentials_and_activation(tmp_path: Pa
         "rollback-not-restored",
         "stale-units",
         "verify-failed",
+        "authority-probe",
+        "authority-probe-no-evidence",
         "preview-not-ready",
         "sudoers-offender",
         "sudoers-unproven",

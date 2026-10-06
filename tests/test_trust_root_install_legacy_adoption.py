@@ -417,9 +417,10 @@ def _receipt_view(receipt: InstallReceipt) -> dict[str, object]:
 # `StateDirectory=` for the gate worktree slot to the gate job template units
 # (generated unit bytes only; no legacy code path changed), and #716 once more
 # added the toolchain-first `PATH` to the generated manager EnvironmentFile,
-# and #716 again added `DO_NOT_TRACK=1` there (openspec under `--jitless`).
+# and #716 again added `DO_NOT_TRACK=1` there (openspec under `--jitless`). #1289
+# adds launch-authority installer assets to this base install/apply/rollback trace.
 REGRESSION_GOLDEN_SHA256 = (
-    "998f5e7babbe431f73afe9543065024c43c9e336ca25cc16d86c1d6c33485fcb"
+    "3992b4ba9038e042b536838feacd2b81633e615136315f336870b21f55898674"
 )
 
 
@@ -2274,12 +2275,30 @@ def _import(case: LegacyCase, receipt: InstallReceipt, principal: str, provider:
         json.dumps({"copilotTokens": {"host": "token"}}) if provider == "copilot" else "token\n"
     )
     account = install_core._PRINCIPAL_ACCOUNTS[principal]
+    destination_root = (
+        install_core.credential_import_location(
+            case.plan, principal=principal, provider=provider
+        )[0]
+        if provider in {"codex", "copilot"}
+        and case.plan.get("launch_layout_version") == install_core.LAUNCH_AUTHORITY_LAYOUT_VERSION
+        else _home(case, account)
+    )
+    if (
+        provider in {"codex", "copilot"}
+        and case.plan.get("launch_layout_version") == install_core.LAUNCH_AUTHORITY_LAYOUT_VERSION
+    ):
+        credential_path, _uid, _gid = install_core.credential_destination(
+            InstallReceipt({"plan": case.plan}),
+            principal=principal,
+            provider=provider,
+        )
+        credential_path.parent.mkdir(parents=True, exist_ok=True)
     install_core.import_credential(
         receipt,
         principal=principal,
         provider=provider,
         source=source,
-        destination_root=_home(case, account),
+        destination_root=destination_root,
     )
 
 
@@ -2298,6 +2317,10 @@ class AdoptedHost:
         self.venvs = self.slot.parent
         self.reviewer = _home(case, "cortex-reviewer-planner")
         self.copilot = self.reviewer / ".copilot"
+        self.canonical_copilot = (
+            Path(case.plan["roots"]["state"])
+            / "config/codex-credentials/reviewer/copilot"
+        )
         self.agy = self.reviewer / "cache" / "gemini" / "antigravity-cli"
         self.receipt = new_install_receipt(case.plan)
         case.apply(self.receipt)
@@ -2318,12 +2341,10 @@ def test_legacy_rollback_returns_the_repository_venv_and_credential_directories(
     # Apply created real objects where the legacy ones were quarantined.
     assert (host.repository / "README.md").read_text() == "candidate checkout\n"
     assert (host.slot / "bin" / "python").is_file()
-    assert (host.copilot / "config.json").is_file()
+    assert (host.canonical_copilot / "config.json").is_file()
     assert (host.agy / "antigravity-oauth-token").is_file()
     rows = {row["provider"]: row for row in host.receipt.to_dict()["credentials"]}
-    assert [item["path"] for item in rows["copilot"]["created_directories"]] == [
-        str(host.copilot)
-    ]
+    assert "created_directories" not in rows["copilot"]
     assert [item["path"] for item in rows["agy"]["created_directories"]] == [str(host.agy)]
     repository_entry = _entry(host.receipt.to_dict(), "repository:paulsha-cortex")
     assert repository_entry["legacy_creation"]["inode"] == host.repository.lstat().st_ino
@@ -2384,23 +2405,22 @@ def test_legacy_rollback_keeps_a_credential_directory_with_other_content(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     host = AdoptedHost(tmp_path, monkeypatch)
-    (host.copilot / "session-state.json").write_text("{}\n")
+    (host.canonical_copilot / "session-state.json").write_text("{}\n")
 
     report = host.rollback()
 
-    reasons = [
-        row["observed"].get("reason")
+    assert any(
+        row["step_id"] == "legacy-inventory"
+        and str(host.canonical_copilot) in str(row["observed"])
         for row in report.retained_drift
-        if str(row["step_id"]).startswith("credential:")
-    ]
-    assert any("not empty" in str(reason) for reason in reasons)
-    assert (host.copilot / "session-state.json").is_file()
-    assert not (host.copilot / "config.json").exists()
+    )
+    assert (host.canonical_copilot / "session-state.json").is_file()
+    assert not (host.canonical_copilot / "config.json").exists()
     assert report.legacy_restored is False
     assert install_cli._receipt_restore_safe(host.receipt.to_dict()) is False
 
 
-def test_receipt_load_binds_created_credential_directories_to_the_destination(
+def test_receipt_load_uses_installer_owned_copilot_authority_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     case = LegacyCase(tmp_path)
@@ -2409,16 +2429,15 @@ def test_receipt_load_binds_created_credential_directories_to_the_destination(
     _import(case, receipt, "reviewer-planner", "copilot")
     loaded = InstallReceipt.load(path, expected_plan=case.plan)
     row = loaded.to_dict()["credentials"][0]
-    assert [item["path"] for item in row["created_directories"]] == [
-        str(_home(case, "cortex-reviewer-planner") / ".copilot")
-    ]
-
-    def elsewhere(document: dict) -> None:
-        document["credentials"][0]["created_directories"][0]["path"] = "/srv/elsewhere"
-
-    _tampered(path, elsewhere)
-    with pytest.raises(InstallError, match="created directories"):
-        InstallReceipt.load(path, expected_plan=case.plan)
+    expected = (
+        Path(case.plan["roots"]["state"])
+        / "config/codex-credentials/reviewer/copilot/config.json"
+    )
+    assert install_core.credential_destination(
+        loaded, principal="reviewer-planner", provider="copilot"
+    )[0] == expected
+    assert expected.is_file()
+    assert "created_directories" not in row
 
 
 def test_plain_receipt_credential_import_records_no_created_directories(
@@ -2438,11 +2457,16 @@ def test_plain_receipt_credential_import_records_no_created_directories(
         principal="reviewer-planner",
         provider="copilot",
         source=source,
-        destination_root=home,
+        destination_root=install_core.credential_import_location(
+            plan, principal="reviewer-planner", provider="copilot"
+        )[0],
     )
 
     assert set(receipt.to_dict()["credentials"][0]) == {"principal", "provider", "mode", "sha256"}
-    assert (home / ".copilot" / "config.json").is_file()
+    assert (
+        Path(plan["roots"]["state"])
+        / "config/codex-credentials/reviewer/copilot/config.json"
+    ).is_file()
 
 
 def _checkout(tmp_path: Path) -> Path:

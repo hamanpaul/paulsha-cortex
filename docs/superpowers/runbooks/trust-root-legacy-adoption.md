@@ -167,7 +167,9 @@ rollback 反向處理 journal：以 `RENAME_NOREPLACE` 把 quarantine 物件搬�
 
 ## 7. credential 重新匯入、activate、verify
 
-legacy 的 credential 已在 quarantine 內，可直接以 quarantine 內的檔案作為 `--source`，依 `trust-root-transactional-install.md` 的 credential import 步驟逐一匯入 plan 的 `required_credentials`；接著 `activate` → `verify`，verify 通過後 receipt 成為 applied＋qualified。
+legacy 的 credential 已在 quarantine 內，可直接以 quarantine 內的檔案作為 `--source`，依 `trust-root-transactional-install.md` 的 credential import 步驟逐一匯入 plan 的 `required_credentials`。legacy controls 也會先 quarantine；installer 再依封存政策建立 builder/reviewer 的 root-owned Codex controls。Codex credentials 與 reviewer-planner/Copilot OAuth config 由 installer 寫入 Manager-owned `<state>/config/codex-credentials/`，Manager EnvironmentFile 會設定 `PSC_COPILOT_OAUTH_CONFIG`。verify 會檢查這些 authority 與 receipt 記錄的 credential digest。
+
+接著執行 `activate` → `verify`。verify 通過後，至少再由正常 Manager launcher 成功啟動一個 job，確認 adoption 後 launcher authority 可用；receipt 成為 applied＋qualified 才算完成部署。RC 的 `legacy-adoption` profile 會在 verify 後、harness 寫入 installer 管理路徑之前，對每個已匯入 provider 執行與 launcher 相同順序的 authority/provisioning probe；任一失敗即 RC 失敗。
 
 ## 8. 之後的升級
 

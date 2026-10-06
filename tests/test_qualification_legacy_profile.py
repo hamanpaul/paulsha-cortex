@@ -152,6 +152,19 @@ def _legacy_adoption_document() -> dict:
         ],
         "activate": {"services_started": True},
         "verify": {"result": "pass", "evidence": "install-verification.json"},
+        "launcher_authorities": {
+            "status": "passed",
+            "providers": [
+                {
+                    "principal": str(row["principal"]),
+                    "provider": str(row["provider"]),
+                    "check": "credential"
+                    if row["principal"] == "manager"
+                    else "launcher",
+                }
+                for row in MANIFEST["credentials"]
+            ],
+        },
     }
 
 

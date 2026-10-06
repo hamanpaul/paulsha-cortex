@@ -7116,6 +7116,23 @@ def _legacy_adoption_checks(
             raise QualificationFailure(
                 f"legacy object {row.get('path')} is no longer in its quarantine destination"
             )
+    launcher = adoption.get("launcher_authorities")
+    expected_launcher_providers = [
+        {
+            "principal": str(row["principal"]),
+            "provider": str(row["provider"]),
+            "check": "credential" if row["principal"] == "manager" else "launcher",
+        }
+        for row in legacy_fixture.load_manifest()["credentials"]
+    ]
+    if (
+        not isinstance(launcher, Mapping)
+        or launcher.get("status") != "passed"
+        or launcher.get("providers") != expected_launcher_providers
+    ):
+        raise QualificationFailure(
+            "legacy-adoption launcher authority probe did not cover every imported provider"
+        )
     for name, document in documents.items():
         _write_json(evidence_dir / name, document)
     return [{"name": name, "status": "passed"} for name in legacy_fixture.LEGACY_TESTS]

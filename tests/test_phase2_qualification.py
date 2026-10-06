@@ -797,15 +797,65 @@ def test_runner_declares_disposable_systemd_container_boundaries() -> None:
     assert mode & 0o100, "qualification/run.sh must be executable"
 
 
-def test_release_harness_rolls_back_before_adding_runtime_scaffold_fixture() -> None:
+def test_release_harness_probes_installed_authorities_before_harness_setup() -> None:
     runner = _required_text(RUNNER)
-    rollback = runner.index(
-        'cortex install trust-root rollback --receipt "$receipt_path"'
-    )
-    reinstall = runner.index("cortex install trust-root apply", rollback)
-    scaffold = runner.index("python3 -m paulsha_cortex.trust_root scaffold")
+    verify = runner.index("cortex install trust-root verify")
+    probe = runner.index("/usr/local/libexec/cortex-launch-authority-probe")
+    canary_overlay = runner.index("--model-identity-overlay")
 
-    assert rollback < reinstall < scaffold
+    assert verify < probe < canary_overlay
+    assert "trust_root scaffold" not in runner
+    assert "qualification control fixture" not in runner
+
+
+def test_release_harness_declares_installer_managed_write_allowlist() -> None:
+    import fnmatch
+    import json
+    import re
+
+    runner = _required_text(RUNNER)
+    block = runner.split("# BEGIN INSTALLER-MANAGED WRITE ALLOWLIST", 1)[1].split(
+        "# END INSTALLER-MANAGED WRITE ALLOWLIST", 1
+    )[0]
+    allowed = [
+        match.group(1).rstrip("/")
+        for line in block.splitlines()
+        if (match := re.match(r"# (/[A-Za-z0-9_/*.-]+) — .+", line))
+    ]
+    assert allowed, "qualification/run.sh needs a commented write allowlist"
+    for path in (
+        "/etc/systemd/system/cortex-manager.service",
+        "/var/lib/cortex/runtime/",
+        "/var/lib/cortex/config/codex-credentials/builder/auth.json",
+        "/var/lib/cortex/config/paulsha/model-identities.yaml",
+        "/var/lib/cortex-installer/host-overlay.yaml",
+    ):
+        assert any(path.rstrip("/").startswith(prefix) or fnmatch.fnmatch(path.rstrip("/"), prefix + "*") for prefix in allowed), path
+
+    manifest = json.loads((QUALIFICATION / "legacy_fixture.json").read_text(encoding="utf-8"))
+    roots = ("/opt/cortex", "/etc/systemd/system", "/etc/polkit-1/rules.d", "/var/lib/cortex")
+    service_homes = ("/var/lib/cortex-", "/var/lib/cortex-installer")
+    paths = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                walk(key)
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+        elif isinstance(value, str) and value.startswith("/"):
+            paths.append(value)
+
+    walk(manifest)
+    for path in paths:
+        if path.startswith(roots) or path.startswith(service_homes):
+            assert any(
+                path == prefix or path.startswith(prefix.rstrip("*").rstrip("/") + "/")
+                or fnmatch.fnmatch(path, prefix + ("*" if prefix.endswith("-") else ""))
+                for prefix in allowed
+            ), path
 
 
 def test_release_harness_drives_one_command_upgrade_drill_then_full_upgrade() -> None:

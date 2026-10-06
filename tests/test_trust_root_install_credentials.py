@@ -1471,6 +1471,49 @@ def test_inherit_prior_credentials_marks_rows_and_activation_counts_them(
     ]
 
 
+def test_inherit_migrates_legacy_codex_auth_to_manager_authority(tmp_path: Path) -> None:
+    prior_plan = _plan(
+        required_credentials=[{"principal": "builder", "provider": "codex"}]
+    )
+    prior_plan["accounts"] = _credential_accounts(tmp_path)
+    prior_plan["candidate"]["wheel_sha256"] = "1" * 64
+    prior_plan["roots"]["state"] = str(tmp_path / "state")
+    source = tmp_path / "cortex-builder" / ".codex" / "auth.json"
+    digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"legacy"}'
+    )
+    prior_document = new_install_receipt(prior_plan).to_dict()
+    prior_document.update(
+        state="applied", qualified=True, credentials=[_prior_row(digest)]
+    )
+    prior = InstallReceipt(prior_document, path=_PRIOR_RECEIPT_PATH)
+
+    new_plan = deepcopy(prior_plan)
+    new_plan["candidate"]["wheel_sha256"] = "2" * 64
+    new_plan["launch_layout_version"] = install_core.LAUNCH_AUTHORITY_LAYOUT_VERSION
+    destination_root = (
+        Path(new_plan["roots"]["state"]) / "config/codex-credentials"
+    )
+    (destination_root / "builder").mkdir(parents=True)
+    successor = new_install_receipt(new_plan)
+    successor._document["state"] = "applied"
+    successor._document["parent_receipt"] = {
+        "path": str(_PRIOR_RECEIPT_PATH),
+        "receipt_id": prior.to_dict()["receipt_id"],
+        "plan_sha256": prior.to_dict()["plan_sha256"],
+    }
+
+    rows = inherit_prior_credentials(
+        successor, prior, backend=LocalInstallBackend(require_root=False)
+    )
+
+    canonical = destination_root / "builder/auth.json"
+    assert canonical.read_bytes() == source.read_bytes()
+    assert rows[0]["inherited_from"] == prior.to_dict()["receipt_id"]
+    assert rows[0]["sha256"] == hashlib.sha256(canonical.read_bytes()).hexdigest()
+    assert LocalInstallBackend(require_root=False).validate_credentials(successor) == ()
+
+
 class _LiveCredentialBackend(CredentialBackend):
     """Activation double whose credential check is the real live validation."""
 

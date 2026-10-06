@@ -1253,6 +1253,24 @@ def _validate_legacy_artifacts(
     verified = adoption.get("verify")
     if not isinstance(verified, dict) or verified.get("result") != "pass":
         _fail("legacy verify of the re-adopted host did not pass")
+    launcher = _required_fields(
+        adoption.get("launcher_authorities"),
+        "legacy-adoption.launcher_authorities",
+        {"status", "providers"},
+    )
+    expected_launcher_providers = [
+        {
+            "principal": str(row["principal"]),
+            "provider": str(row["provider"]),
+            "check": "credential" if row["principal"] == "manager" else "launcher",
+        }
+        for row in manifest["credentials"]
+    ]
+    if (
+        launcher["status"] != "passed"
+        or launcher["providers"] != expected_launcher_providers
+    ):
+        _fail("legacy launcher authority probe did not cover every imported provider")
 
     _validate_artifact_inventory(
         evidence_root=evidence_root, artifact_hashes=artifact_hashes

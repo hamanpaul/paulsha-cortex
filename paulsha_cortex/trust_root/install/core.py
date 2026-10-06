@@ -970,6 +970,12 @@ def _manager_environment(
         "PSC_INSTANCE": layout.instance,
         "PSC_AGENTS_ROOT": layout.agents_root,
         "PSC_PROJECT_CONFIG_ROOT": layout.project_config_root,
+        "PSC_CODEX_CONTROL_ROOT": layout.codex_control_root,
+        "PSC_CODEX_CREDENTIAL_ROOT": layout.codex_credential_root,
+        "PSC_COPILOT_OAUTH_CONFIG": str(
+            Path(layout.codex_credential_root)
+            / COPILOT_OAUTH_CONFIG_RELATIVE_PATH
+        ),
         "PSC_WORKTREE_ROOT": layout.worktree_root,
         "PSC_DEGRADED_OPERATION": "per-case-approval",
         "PSC_REPO_ROOT": layout.source_repo_paths()[0],
@@ -1026,6 +1032,71 @@ MANAGER_GH_CONFIG_CONTENT = 'version: "1"\ngit_protocol: https\nprompt: disabled
 #: tree 形 toolchain 的進入點副檔名是這幾個時由系統層 node 執行；其餘視為樹內的
 #: 原生執行檔，wrapper 直接 exec（#716：codex 與它的 code-mode host）。
 _NODE_ENTRYPOINT_SUFFIXES = frozenset({".js", ".mjs", ".cjs"})
+
+# These are release policy, not copies from an operator or job HOME. The
+# runtime projection consumes the same four controls through
+# ``canonical_codex_controls`` and refuses a partial tree.
+CODEX_CONFIG_SEED_CONTENT = ""
+CODEX_HOOKS_SEED_CONTENT = permgen.CODEX_HOOKS_SEED_CONTENT + "\n"
+LAUNCH_AUTHORITY_LAYOUT_VERSION = 1
+COPILOT_OAUTH_CONFIG_RELATIVE_PATH = "reviewer/copilot/config.json"
+
+
+def _codex_control_inventory(root: str | Path) -> dict[str, dict[str, str]]:
+    control_root = Path(root)
+    return {
+        f"{principal}/{name}": _artifact_dict(
+            content=content,
+            path=str(control_root / principal / name),
+            owner="root",
+            group="root",
+            mode="0644",
+        )
+        for principal in ("builder", "reviewer")
+        for name, content in (
+            ("config.toml", CODEX_CONFIG_SEED_CONTENT),
+            ("hooks.json", CODEX_HOOKS_SEED_CONTENT),
+        )
+    }
+
+
+def _launch_authority_scaffolds(
+    layout: permgen.PathLayout, scheme: permgen.UidScheme
+) -> list[dict[str, object]]:
+    """Typed directory policy for installer-owned launcher authorities."""
+
+    manager = str(scheme.resolve(registry.Principal.MANAGER))
+    manager_group = scheme.group_of(manager)
+    rows: list[dict[str, object]] = []
+    for principal in ("builder", "reviewer"):
+        control = Path(layout.codex_control_root) / principal
+        rows.extend(
+            {
+                "path": str(path),
+                "owner": "root",
+                "group": "root",
+                "mode": "0755",
+            }
+            for path in (control, control / "plugins", control / "skills")
+        )
+        credential = Path(layout.codex_credential_root) / principal
+        rows.append(
+            {
+                "path": str(credential),
+                "owner": manager,
+                "group": manager_group,
+                "mode": "0700",
+            }
+        )
+    rows.append(
+        {
+            "path": str(Path(layout.codex_credential_root) / "reviewer" / "copilot"),
+            "owner": manager,
+            "group": manager_group,
+            "mode": "0700",
+        }
+    )
+    return rows
 
 
 def _generated_inventory(
@@ -1110,6 +1181,7 @@ def _generated_inventory(
         )
         for asset_id in sorted(permgen.ENFORCEMENT_LEAF_ASSETS)
     }
+    codex_controls = _codex_control_inventory(layout.codex_control_root)
 
     wrappers: dict[str, dict[str, str]] = {}
     if isinstance(toolchain, Mapping):
@@ -1168,6 +1240,7 @@ def _generated_inventory(
         "toolchain_wrappers": wrappers,
         "environment": environment,
         "enforcement": enforcement,
+        "codex_controls": codex_controls,
     }
 
 
@@ -1313,6 +1386,7 @@ def _apply_steps(
         "toolchain_wrappers",
         "environment",
         "enforcement",
+        "codex_controls",
     ):
         for name, artifact in sorted(generated.get(category, {}).items()):
             step = {
@@ -1660,6 +1734,7 @@ def build_install_plan(
         for path, owner, group, mode in layout.scaffold_directories(scheme)
         if path != active_venv_link
     ]
+    scaffolds.extend(_launch_authority_scaffolds(layout, scheme))
     generated = _generated_inventory(
         scheme,
         layout,
@@ -1702,6 +1777,7 @@ def build_install_plan(
     )
     plan: dict[str, object] = {
         "schema_version": 1,
+        "launch_layout_version": LAUNCH_AUTHORITY_LAYOUT_VERSION,
         "scheme": "four-way",
         "instance": config.get("instance", "cortex"),
         "repo_identity": deepcopy(dict(repo_identity)),
@@ -4648,6 +4724,72 @@ def _validate_asset_step_bijection(
         raise InstallPlanError("asset inventory and apply steps are not an exact bijection")
 
 
+def _validate_launch_authority_plan(plan: Mapping[str, object]) -> None:
+    version = plan.get("launch_layout_version")
+    if version is None:
+        return  # v0.1.13/v0.1.14 plans retain their original authority layout.
+    if version != LAUNCH_AUTHORITY_LAYOUT_VERSION:
+        raise InstallPlanError("plan launch authority layout version is unsupported")
+    roots = plan.get("roots")
+    accounts = plan.get("accounts")
+    repositories = plan.get("source_repositories")
+    if (
+        not isinstance(roots, Mapping)
+        or not isinstance(accounts, list)
+        or not isinstance(repositories, list)
+    ):
+        raise InstallPlanError("plan launch authority layout is invalid")
+    config = {
+        "scheme": "four-way",
+        "instance": plan.get("instance", "cortex"),
+        "operator_account": plan.get("operator_account"),
+        "external_reader_account": plan.get("external_reader_account"),
+        "roots": dict(roots),
+        "source_repositories": list(repositories),
+    }
+    scheme = _configured_scheme(config)
+    layout, _ = _layout_from_config(config, accounts)
+    expected_scaffolds = _launch_authority_scaffolds(layout, scheme)
+    raw_scaffolds = plan.get("scaffolds")
+    if not isinstance(raw_scaffolds, list):
+        raise InstallPlanError("plan launch authority scaffolds are invalid")
+    expected_by_path = {str(row["path"]): row for row in expected_scaffolds}
+    observed_rows = [
+        row
+        for row in raw_scaffolds
+        if isinstance(row, Mapping) and row.get("path") in expected_by_path
+    ]
+    observed_by_path = {str(row.get("path")): row for row in observed_rows}
+    if (
+        len(observed_rows) != len(expected_by_path)
+        or observed_by_path != expected_by_path
+    ):
+        raise InstallPlanError("plan launch authority directories are not canonical")
+    generated = plan.get("generated")
+    controls = generated.get("codex_controls") if isinstance(generated, Mapping) else None
+    if controls != _codex_control_inventory(layout.codex_control_root):
+        raise InstallPlanError("plan Codex controls do not match release policy")
+    environment = generated.get("environment") if isinstance(generated, Mapping) else None
+    env_row = environment.get(Path(layout.env_file).name) if isinstance(environment, Mapping) else None
+    if not isinstance(env_row, Mapping) or not isinstance(env_row.get("content"), str):
+        raise InstallPlanError("plan Manager environment is invalid")
+    expected_environment = {
+        "PSC_CODEX_CONTROL_ROOT": layout.codex_control_root,
+        "PSC_CODEX_CREDENTIAL_ROOT": layout.codex_credential_root,
+        "PSC_COPILOT_OAUTH_CONFIG": str(
+            Path(layout.codex_credential_root) / COPILOT_OAUTH_CONFIG_RELATIVE_PATH
+        ),
+    }
+    for name, value in expected_environment.items():
+        matches = [
+            line
+            for line in str(env_row["content"]).splitlines()
+            if line.startswith(name + "=")
+        ]
+        if matches != [f"{name}={json.dumps(value, ensure_ascii=False)}"]:
+            raise InstallPlanError(f"plan Manager environment lacks canonical {name}")
+
+
 def _validate_systemctl_steps(steps: Sequence[Mapping[str, object]]) -> None:
     expected = _systemctl_steps()
     observed = [
@@ -4754,6 +4896,7 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
         raise InstallPlanError("plan candidate identity is invalid")
     account_inventory = _validate_apply_account_inventories(plan)
     _validate_required_credentials(plan)
+    _validate_launch_authority_plan(plan)
     steps = plan.get("apply_order")
     if not isinstance(steps, list):
         raise InstallPlanError("apply_order must be a list")
@@ -7727,6 +7870,66 @@ def _credential_adapter_for(principal: str, provider: str) -> _CredentialAdapter
     return _CREDENTIAL_ADAPTERS.get((principal, provider))
 
 
+def _runtime_credential_principal(principal: str) -> str:
+    if principal == "builder":
+        return "builder"
+    if principal == "reviewer-planner":
+        return "reviewer"
+    raise CredentialImportError(
+        f"Codex credential principal has no runtime authority: {principal}"
+    )
+
+
+def credential_import_location(
+    plan: Mapping[str, object], *, principal: str, provider: str
+) -> tuple[Path, int, int]:
+    """Return the approved import root and owner for one receipt credential."""
+
+    canonical = plan.get("launch_layout_version") == LAUNCH_AUTHORITY_LAYOUT_VERSION
+    roots = plan.get("roots")
+    accounts = plan.get("accounts", [])
+    if canonical and provider in {"codex", "copilot"}:
+        if not isinstance(roots, Mapping) or not isinstance(accounts, list):
+            raise CredentialImportError("receipt lacks launch authority layout")
+        manager = next(
+            (
+                row
+                for row in accounts
+                if isinstance(row, Mapping) and row.get("name") == "cortex-manager"
+            ),
+            None,
+        )
+        if not isinstance(manager, Mapping) or not all(
+            isinstance(manager.get(key), int) for key in ("uid", "gid")
+        ):
+            raise CredentialImportError("receipt lacks Manager account identity")
+        return (
+            Path(str(roots.get("state"))) / "config/codex-credentials",
+            int(manager["uid"]),
+            int(manager["gid"]),
+        )
+
+    adapter = _credential_adapter_for(principal, provider)
+    account_name = _PRINCIPAL_ACCOUNTS.get(principal)
+    account = next(
+        (
+            row
+            for row in accounts if isinstance(row, Mapping)
+            and row.get("name") == account_name
+        ),
+        None,
+    ) if isinstance(accounts, list) else None
+    if (
+        adapter is None
+        or not isinstance(account, Mapping)
+        or not isinstance(account.get("home"), str)
+        or not isinstance(account.get("uid"), int)
+        or not isinstance(account.get("gid"), int)
+    ):
+        raise CredentialImportError(f"receipt lacks account identity for {principal}")
+    return Path(str(account["home"])), int(account["uid"]), int(account["gid"])
+
+
 def credential_source_basename(principal: str, provider: str) -> str:
     """回傳 allowlist 內的來源 basename；不讀任何 credential 內容。"""
 
@@ -7844,6 +8047,29 @@ def credential_destination(
         )
     account_name = _PRINCIPAL_ACCOUNTS.get(principal)
     plan = receipt._document.get("plan")
+    if (
+        isinstance(plan, Mapping)
+        and plan.get("launch_layout_version") == LAUNCH_AUTHORITY_LAYOUT_VERSION
+        and provider in {"codex", "copilot"}
+    ):
+        root, uid, gid = credential_import_location(
+            plan, principal=principal, provider=provider
+        )
+        if provider == "codex":
+            return (
+                root / _runtime_credential_principal(principal) / "auth.json",
+                uid,
+                gid,
+            )
+        if principal != "reviewer-planner":
+            raise CredentialImportError(
+                f"Copilot credential principal has no runtime authority: {principal}"
+            )
+        return (
+            root / "reviewer" / "copilot" / COPILOT_CONFIG_FILENAME,
+            uid,
+            gid,
+        )
     accounts = plan.get("accounts", []) if isinstance(plan, Mapping) else []
     account = next(
         (
@@ -7884,28 +8110,21 @@ def inherit_prior_credentials(
     """Hand the prior receipt's recorded credentials to its upgrade successor.
 
     Only rows the prior receipt already records move over, and only when the
-    new plan derives the same destination and the file there passes the same
-    live metadata check activation runs (regular file, one link, uid/gid,
-    0600).  No HOME is searched and no credential content leaves the file
-    except as its sha256.  A pair the new plan requires but the prior never
-    recorded is refused: the operator imports it through the runbook instead.
+    prior file passes the same live metadata check activation runs (regular
+    file, one link, uid/gid, 0600). Legacy Codex and Copilot authorities are
+    copied through the normal validated importer into the new Manager-owned
+    canonical locations; no HOME is searched and credential content is never
+    serialized into a receipt or diagnostic. A pair the new plan requires but
+    the prior never recorded is refused: the operator imports it through the
+    runbook instead.
 
     The inherited row records the sha256 the file holds now, not the value the
-    prior receipt recorded at import (#1275).  Every inheritable destination is
-    a file its own account owns with mode 0600 (the metadata check enforces
-    exactly that), so that account can always rewrite the content, and the
-    executors do so by design: codex refreshes ``auth.json`` inside its
-    job-writable ``HOME_STICKY_TREE``, agy writes its token inside the
-    ``HOME_REDIRECT_TREE`` under ``cache``, ``gh`` rewrites ``hosts.yml`` in
-    place (``IN_PLACE_CONTENT_WRITE_ASSETS``), and ``.copilot/`` is a state
-    directory the installer hands to the account.  No shape leaves the content
-    out of the owner's reach, so none keeps a strict digest match.  A pinned
-    digest would not stop that account, while other accounts are kept out by
-    the owner, mode, link count and fixed location, which stay checked.  The
-    row keeps the released key set; the prior's digest stays recoverable
-    through ``inherited_from`` and the prior receipt's own row.  Activation
-    then validates the row against the digest recorded here, with services
-    stopped so no refresh can land in between.
+    prior receipt recorded at import (#1275). Runtime Codex refreshes are
+    harvested by Manager into its seed authority; AGY and GitHub continue to
+    write their role-owned state as designed. The owner, mode, link count and
+    fixed location stay checked. The prior digest remains recoverable through
+    ``inherited_from`` and the prior receipt's own row. Activation validates
+    the new row with services stopped so no refresh can land in between.
     """
 
     document = receipt._document
@@ -7952,59 +8171,100 @@ def inherit_prior_credentials(
             f"new plan requires credentials the prior receipt never recorded: {rendered}; "
             "roll back and import them per trust-root-transactional-install.md §4"
         )
-    prior_id = str(prior_document.get("receipt_id"))
+    canonical_layout = (
+        plan.get("launch_layout_version") == LAUNCH_AUTHORITY_LAYOUT_VERSION
+    )
     for principal, provider in required:
-        if credential_destination(
+        prior_destination = credential_destination(
             prior_receipt, principal=principal, provider=provider
-        ) != credential_destination(receipt, principal=principal, provider=provider):
-            raise CredentialImportError(
-                f"credential destination changed since the prior receipt: {principal}/{provider}"
-            )
+        )
+        new_destination = credential_destination(
+            receipt, principal=principal, provider=provider
+        )
+        if prior_destination == new_destination:
+            continue
+        if canonical_layout and provider in {"codex", "copilot"}:
+            continue
+        raise CredentialImportError(
+            f"credential destination changed since the prior receipt: {principal}/{provider}"
+        )
+    prior_id = str(prior_document.get("receipt_id"))
     observer = getattr(backend, "observe_credentials", None)
     validator = getattr(backend, "validate_credentials", None)
     if not callable(observer) or not callable(validator):
         raise CredentialImportError("backend cannot validate inherited credentials")
-    observed, observe_failures = observer(
-        InstallReceipt(
-            {
-                **document,
-                "credentials": [
-                    {"principal": principal, "provider": provider}
-                    for principal, provider in required
-                ],
-            }
-        )
+    prior_probe = InstallReceipt(
+        {
+            **prior_document,
+            "credentials": [deepcopy(prior_rows[pair]) for pair in required],
+        },
+        path=prior_receipt.path,
     )
+    observed, observe_failures = observer(prior_probe)
     failures = tuple(str(row) for row in observe_failures)
     if failures:
         raise CredentialImportError(
             "prior credential cannot be inherited: " + "; ".join(failures)
         )
-    inherited: list[dict[str, str]] = [
-        {
-            "principal": principal,
-            "provider": provider,
-            "mode": "0600",
-            "sha256": str(observed[(principal, provider)]),
-            "inherited_from": prior_id,
-        }
-        for principal, provider in required
-    ]
-    # The exact check activation runs, against the digest just recorded.
-    probe = InstallReceipt({**document, "credentials": deepcopy(inherited)})
-    failures = tuple(str(row) for row in validator(probe))
-    if failures:
-        raise CredentialImportError(
-            "prior credential cannot be inherited: " + "; ".join(failures)
-        )
-    previous = document.get("credentials")
-    document["credentials"] = deepcopy(inherited)
+    moved: dict[tuple[str, str], str] = {}
     try:
+        for principal, provider in required:
+            prior_destination = credential_destination(
+                prior_receipt, principal=principal, provider=provider
+            )
+            new_destination = credential_destination(
+                receipt, principal=principal, provider=provider
+            )
+            if prior_destination == new_destination:
+                continue
+            destination_root, uid, gid = credential_import_location(
+                plan, principal=principal, provider=provider
+            )
+            metadata = import_credential(
+                receipt,
+                principal=principal,
+                provider=provider,
+                source=prior_destination[0],
+                destination_root=destination_root,
+                destination_uid=uid,
+                destination_gid=gid,
+            )
+            moved[(principal, provider)] = metadata.sha256
+
+        inherited = [
+            {
+                "principal": principal,
+                "provider": provider,
+                "mode": "0600",
+                "sha256": moved.get(
+                    (principal, provider), str(observed[(principal, provider)])
+                ),
+                "inherited_from": prior_id,
+            }
+            for principal, provider in required
+        ]
+        probe = InstallReceipt({**document, "credentials": deepcopy(inherited)})
+        failures = tuple(str(row) for row in validator(probe))
+        if failures:
+            raise CredentialImportError(
+                "inherited credential destination is invalid: " + "; ".join(failures)
+            )
+        document["credentials"] = deepcopy(inherited)
+        document["credential_journal"] = []
         receipt._persist()
+        return tuple(inherited)
     except BaseException:
-        document["credentials"] = previous
+        # Relocated files were imported through the normal journaled writer.
+        # Remove those new authorities if the aggregate handoff cannot commit;
+        # same-path inherited authorities were never added to this receipt.
+        if moved:
+            rollback_credentials = getattr(backend, "rollback_credentials", None)
+            if callable(rollback_credentials):
+                rollback_credentials(receipt)
+            document["credentials"] = []
+            document["credential_journal"] = []
+            receipt._persist()
         raise
-    return tuple(inherited)
 
 
 def _open_unnamed_credential_tmpfile(parent_fd: int) -> int | None:
@@ -8193,11 +8453,27 @@ def import_credential(
             f"provider/principal pair is not allowed: {principal}/{provider}"
         )
     allowed_name = adapter.source_name
-    destination_parts = adapter.destination_parts
     if source.name != allowed_name:
         raise CredentialImportError(
             f"{provider} source filename is outside the allowlist; expected {allowed_name}"
         )
+    plan = receipt._document.get("plan")
+    canonical_authority = (
+        isinstance(plan, Mapping)
+        and plan.get("launch_layout_version") == LAUNCH_AUTHORITY_LAYOUT_VERSION
+        and provider in {"codex", "copilot"}
+    )
+    if canonical_authority and provider == "codex":
+        destination_parts = (_runtime_credential_principal(principal), "auth.json")
+    elif canonical_authority and provider == "copilot":
+        if principal != "reviewer-planner":
+            raise CredentialImportError(
+                f"Copilot credential principal has no runtime authority: {principal}"
+            )
+        destination_parts = ("reviewer", "copilot", COPILOT_CONFIG_FILENAME)
+    else:
+        destination_parts = adapter.destination_parts
+    account_owned_dirs = 0 if canonical_authority else adapter.account_owned_dirs
     source = source.expanduser().absolute()
     source_authority: list[tuple[int, int]] = []
     try:
@@ -8381,7 +8657,7 @@ def import_credential(
     try:
         parent_fd, destination_name = _open_credential_parent(
             destination,
-            account_owned_dirs=adapter.account_owned_dirs,
+            account_owned_dirs=account_owned_dirs,
             uid=destination_uid,
             gid=destination_gid,
             created=created_directories,
@@ -8827,7 +9103,12 @@ def attest_generated_inventory(
 ) -> AttestationReport:
     warnings: list[dict[str, object]] = []
     failures: list[dict[str, object]] = []
-    for category in _INVENTORY_CATEGORIES:
+    categories = _INVENTORY_CATEGORIES + (
+        ("codex_controls",)
+        if "codex_controls" in expected or "codex_controls" in installed
+        else ()
+    )
+    for category in categories:
         expected_rows = expected.get(category)
         installed_rows = installed.get(category)
         if not isinstance(expected_rows, Mapping) or not isinstance(installed_rows, Mapping):
@@ -8902,6 +9183,89 @@ def attest_generated_inventory(
     return AttestationReport(tuple(warnings), tuple(failures))
 
 
+def _launch_authority_verification_failures(
+    plan: Mapping[str, object],
+    *,
+    receipt: InstallReceipt,
+    service_controller: object | None,
+) -> list[dict[str, object]]:
+    if plan.get("launch_layout_version") != LAUNCH_AUTHORITY_LAYOUT_VERSION:
+        return []
+    roots = plan.get("roots")
+    state_root = roots.get("state") if isinstance(roots, Mapping) else None
+    if not _is_safe_absolute_plan_path(state_root):
+        return [{"code": "launch_authority_layout_invalid", "artifact": "roots.state"}]
+    failures: list[dict[str, object]] = []
+    controls_root = Path(state_root) / "config/codex-controls"
+    for principal in ("builder", "reviewer"):
+        control = controls_root / principal
+        try:
+            observed = control.lstat()
+        except OSError:
+            observed = None
+        if (
+            observed is None
+            or not stat.S_ISDIR(observed.st_mode)
+            or stat.S_ISLNK(observed.st_mode)
+            or stat.S_IMODE(observed.st_mode) != 0o755
+            or observed.st_uid != 0
+            or observed.st_gid != 0
+        ):
+            failures.append(
+                {"code": "codex_control_tree_drift", "artifact": principal}
+            )
+            continue
+        try:
+            children = {row.name for row in control.iterdir()}
+        except OSError:
+            children = set()
+        if children != {"config.toml", "hooks.json", "plugins", "skills"}:
+            failures.append(
+                {"code": "codex_control_tree_drift", "artifact": principal}
+            )
+            continue
+        for dirname in ("plugins", "skills"):
+            child = control / dirname
+            try:
+                child_state = child.lstat()
+            except OSError:
+                child_state = None
+            if (
+                child_state is None
+                or not stat.S_ISDIR(child_state.st_mode)
+                or stat.S_ISLNK(child_state.st_mode)
+                or stat.S_IMODE(child_state.st_mode) != 0o755
+                or child_state.st_uid != 0
+                or child_state.st_gid != 0
+            ):
+                failures.append(
+                    {
+                        "code": "codex_control_directory_drift",
+                        "artifact": f"{principal}/{dirname}",
+                    }
+                )
+                continue
+            try:
+                empty = not any(child.iterdir())
+            except OSError:
+                empty = False
+            if not empty:
+                failures.append(
+                    {
+                        "code": "codex_control_directory_drift",
+                        "artifact": f"{principal}/{dirname}",
+                    }
+                )
+    if service_controller is not None:
+        credential_validator = getattr(service_controller, "validate_credentials", None)
+        if callable(credential_validator):
+            for detail in credential_validator(receipt):
+                failures.append(
+                    {"code": "credential_authority_unavailable", "artifact": str(detail)}
+                )
+    return failures
+
+
 @dataclass(frozen=True)
 class VerificationResult:
     report: AttestationReport
@@ -8932,6 +9296,13 @@ def verify_receipt(
     report = attest_generated_inventory(
         expected=expected_inventory, installed=installed_inventory
     )
+    launch_authority_failures = _launch_authority_verification_failures(
+        plan, receipt=receipt, service_controller=service_controller
+    )
+    if launch_authority_failures:
+        report = AttestationReport(
+            report.warnings, (*report.failures, *launch_authority_failures)
+        )
     candidate_venv, candidate_failure = _attest_candidate_venv(
         plan=plan,
         receipt=receipt,

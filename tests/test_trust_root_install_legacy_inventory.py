@@ -141,9 +141,10 @@ def _normalized_plan_sha256(plan: dict, tmp_path: Path) -> str:
 # (the ship lane calls `openspec` by name), and #716 again added
 # `DO_NOT_TRACK=1` there (openspec telemetry crashes under `--jitless`).  #1286
 # moved the account ids out of the release config: the plan now resolves them
-# (and records `account_id_sources`) against the fixed snapshot below.
+# (and records `account_id_sources`) against the fixed snapshot below. #1289
+# added installer-owned launcher controls and Manager credential authorities.
 RELEASE_PLAN_GOLDEN_SHA256 = (
-    "8ec74721fd7fe0466b5c70bd0b789fb57c5cdc7f9234d58fddd8588773fc7ab6"
+    "87e2f4d2a351a6ea8391b287bd0a76d4430f9dd9b1a66389e9dcad868fb4b60e"
 )
 #: The passwd/group snapshot release-config plans resolve against in tests
 #: (#1286): an Ubuntu-shaped host whose 991-995 are already taken.  Planning a

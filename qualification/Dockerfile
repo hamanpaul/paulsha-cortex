@@ -63,13 +63,15 @@ COPY qualification.schema.json /usr/local/share/cortex/qualification.schema.json
 COPY legacy_fixture.py /usr/local/libexec/qualification/legacy_fixture.py
 COPY legacy_fixture.json /usr/local/libexec/qualification/legacy_fixture.json
 COPY legacy_adoption.py /usr/local/libexec/cortex-legacy-adoption
+COPY launch_authority_probe.py /usr/local/libexec/cortex-launch-authority-probe
 
 RUN chmod 0755 \
         /usr/local/libexec/cortex-qualification-validate \
         /usr/local/libexec/cortex-qualification-verify-bundle \
         /usr/local/libexec/cortex-qualification-release-source \
         /usr/local/libexec/cortex-release-qualification \
-        /usr/local/libexec/cortex-legacy-adoption
+        /usr/local/libexec/cortex-legacy-adoption \
+        /usr/local/libexec/cortex-launch-authority-probe
 
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/sbin/init"]

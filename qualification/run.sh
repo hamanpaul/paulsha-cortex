@@ -132,6 +132,20 @@ receipt_path=/run/cortex-install/install-receipt.json
 qualification_root=/qualification-output
 qualification_path=$qualification_root/qualification.json
 
+# BEGIN INSTALLER-MANAGED WRITE ALLOWLIST
+# /etc/systemd/system/cortex-manager.service — intentional drift probe, restored before rollback.
+# /var/lib/cortex/runtime/ — Manager launcher authority probe creates per-provider job slots.
+# /var/lib/cortex/config/codex-credentials/builder/auth.json — upgrade inherit guard changes mode, then restores it.
+# /var/lib/cortex/config/paulsha/ — deployment-canary model-identity overlay consumed by Manager.
+# /var/lib/cortex-installer/host-overlay* — deployment-canary upgrade overlay.
+# /opt/cortex/ — legacy-adoption profile seeds the disposable Phase 2b installation fixture.
+# /etc/systemd/system/ — legacy-adoption profile seeds and restores fixture service units.
+# /etc/polkit-1/rules.d/ — legacy-adoption profile seeds quarantinable fixture rules.
+# /var/lib/cortex/ — legacy-adoption profile seeds the disposable Phase 2b state fixture.
+# /var/lib/cortex-*/ — legacy-adoption profile seeds fixture service-account homes.
+# /var/lib/cortex-installer/ — legacy-adoption profile seeds the installer fixture directory.
+# END INSTALLER-MANAGED WRITE ALLOWLIST
+
 docker exec "$container_name" install -d -o root -g root -m 0700 /run/cortex-install
 docker exec "$container_name" install -d -o root -g root -m 0700 "$qualification_root"
 
@@ -303,25 +317,6 @@ docker exec "$container_name" cortex install trust-root rollback --receipt "$rec
 docker exec "$container_name" cortex install trust-root apply \
     --plan "$plan_path" --confirm-sha256 "$plan_sha" --receipt "$receipt_path"
 
-# The real template unit has read-only bindings for the deployment-owned Codex
-# controls. Add this non-transactional runtime fixture only after the rollback
-# proof and clean reinstall, so the rollback scanner never has to classify
-# harness-authored state as installer-owned state. Credentials are still
-# imported exclusively through the protected stdin path below.
-docker exec "$container_name" sh -eu -c '
-    for account in cortex-builder cortex-reviewer-planner; do
-        install -d -o root -g root -m 0755 "/var/lib/$account/.codex/plugins" "/var/lib/$account/.codex/skills"
-        printf "%s\n" "# qualification control fixture" > "/var/lib/$account/.codex/config.toml"
-        test -f "/var/lib/$account/.codex/hooks.json"
-        printf "%s\n" "{}" > "/var/lib/$account/.codex/auth.json"
-    done
-    python3 -m paulsha_cortex.trust_root scaffold | sh -eu
-    for principal in builder reviewer; do
-        rm -f "/var/lib/cortex/config/codex-credentials/$principal/auth.json"
-    done
-    rm -f /var/lib/cortex-builder/.codex/auth.json /var/lib/cortex-reviewer-planner/.codex/auth.json
-'
-
 # The reference image never fetches mutable runtime tools.  Every executor and
 # qualification helper must resolve through the root-owned installed wrappers.
 for provider_tool in codex claude copilot agy srt openspec; do
@@ -386,6 +381,26 @@ else
     import_fixture manager github "/run/$manager_github_auth_leaf"
 fi
 
+docker exec "$container_name" cortex install trust-root activate --receipt "$receipt_path"
+install_evidence_path=$qualification_root/install-verification.json
+docker exec \
+    --env "CORTEX_QUALIFICATION_CANDIDATE_SHA=$candidate_sha" \
+    --env "CORTEX_QUALIFICATION_WHEEL_SHA256=$expected_wheel_sha" \
+    --env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$expected_bundle_sha" \
+    --env "CORTEX_QUALIFICATION_IMAGE_DIGEST=$image_digest" \
+    "$container_name" cortex install trust-root verify \
+    --receipt "$receipt_path" --json --evidence "$install_evidence_path"
+
+# Release and canary images use deliberately non-secret credentials without
+# provider network access, so they cannot complete a real model turn. Exercise
+# the exact launcher authority/provisioning sequence for every imported runtime
+# provider under the installed Manager account before any harness setup writes
+# to the installer-managed state. This probe creates only the listed transient
+# Manager-preseeded job slots under /var/lib/cortex/runtime/.
+docker exec "$container_name" /usr/local/libexec/cortex-launch-authority-probe \
+    --plan "$plan_path" --receipt "$receipt_path" || \
+    die "Manager launcher authority/provisioning probe failed"
+
 if [[ "$profile" == deployment-canary ]]; then
     # The packaged roster has neither the canary builder nor its independent
     # planner/reviewer. Install the operator overlay rendered by the same
@@ -413,27 +428,6 @@ else:
     ' sh "$model_config_root"
 fi
 
-# Imported Codex material lands in the account's legacy ``~/.codex`` path. Run
-# the same production scaffold once more so the canary credential or release
-# fixture traverses the Manager-owned canonical projection used by
-# ``spool_slot.provision_runtime_surfaces``. Existing controls and generated
-# hooks are already present, so the scaffold remains idempotent.
-docker exec "$container_name" sh -eu -c \
-    'printf "%s\n" "{}" > /var/lib/cortex-reviewer-planner/.codex/auth.json
-     python3 -m paulsha_cortex.trust_root scaffold | sh -eu
-     rm -f /var/lib/cortex/config/codex-credentials/reviewer/auth.json
-     rm -f /var/lib/cortex-reviewer-planner/.codex/auth.json'
-
-docker exec "$container_name" cortex install trust-root activate --receipt "$receipt_path"
-install_evidence_path=$qualification_root/install-verification.json
-docker exec \
-    --env "CORTEX_QUALIFICATION_CANDIDATE_SHA=$candidate_sha" \
-    --env "CORTEX_QUALIFICATION_WHEEL_SHA256=$expected_wheel_sha" \
-    --env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$expected_bundle_sha" \
-    --env "CORTEX_QUALIFICATION_IMAGE_DIGEST=$image_digest" \
-    "$container_name" cortex install trust-root verify \
-    --receipt "$receipt_path" --json --evidence "$install_evidence_path"
-
 # 一鍵升級演練（#1263）：上方已 qualified 的 receipt 是 prior，同一容器以已安裝的
 # `/opt/cortex/venv/bin/cortex upgrade` 走完整流程。release profile 沒有網路，release
 # 來源改用容器內與 GitHub REST 同形狀的本機目錄；同一 candidate 的 plan 只能靠
@@ -450,7 +444,7 @@ upgrade_drill_report=/run/cortex-install/upgrade-drill-report.json
 upgrade_report=/run/cortex-install/upgrade-report.json
 upgrade_durable_report=/var/lib/cortex-installer/$upgrade_version/upgrade-report.json
 upgrade_status_report=/run/cortex-install/upgrade-status.json
-builder_codex_credential=/var/lib/cortex-builder/.codex/auth.json
+builder_codex_credential=/var/lib/cortex/config/codex-credentials/builder/auth.json
 # `--json` 只把 report 寫進容器內的檔案，而 `trap cleanup EXIT` 會刪掉容器：每個失敗的
 # `cortex upgrade` 檢查在 die 之前，先把 `--json` 輸出、durable report 與它指向的 verify
 # evidence 印到 stderr，live RC 失敗時才留得下診斷。這次執行若在發布 report 之前就被拒
