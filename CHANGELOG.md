@@ -10,6 +10,7 @@
 ### Fixed
 
 - **#1291 packaged model identity roster**：新增 `codex/gpt-6-luna`、`copilot/gpt-5.4-mini` 與只具 planning/review 的 `agy/gemini-3.8-flash-high`；`cortex model identity add` 可驗證並原子更新 system deployment 的 Manager-owned overlay，保留檔案 owner/mode，無須手改 0600 設定檔（見 `changelog.d/system-deploy-ops-defects.md`）。
+- **cortex 進件：#1309 task-memory 逐則處置回報**：登記 work item `task-memory-disposition` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-task-memory-disposition.md`）。
 - **cortex 進件：派工穩定性 #1302–#1307**：登記六個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-dispatch-stability.md`）。
 - **cortex 進件：#1282 審查後續／#1296／#1297**：登記三個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006b.md`）。
 - **撤回 v0.1.14**：該版升級會在 verify 失敗（#1295）且仍封存 agent 執行檔（#1293）；release 與 tag 已刪除，`VERSION` 與 runbook 版本字串改回 0.1.13，修完後重新發布 0.1.14（見 `changelog.d/withdraw-release-0-1-14.md`）。
