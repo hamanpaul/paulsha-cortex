@@ -63,20 +63,64 @@ def test_provider_check_mapping_is_shared_across_qualification_paths() -> None:
         "reviewer-planner": "launcher",
     }
 
-    for filename in (
+    def is_shared_helper_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "provider_check_for_principal"
+        )
+
+    def is_duplicated_mapping(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.IfExp)
+            and isinstance(node.body, ast.Constant)
+            and node.body.value == "credential"
+            and isinstance(node.orelse, ast.Constant)
+            and node.orelse.value == "launcher"
+        )
+
+    production_files = (
         "launch_authority_probe.py",
         "legacy_adoption.py",
         "validate.py",
         "driver.py",
-    ):
-        source = (QUALIFICATION / filename).read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(QUALIFICATION / filename))
-        assert any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "provider_check_for_principal"
+    )
+    all_files = production_files + (
+        "../tests/test_qualification_legacy_harness.py",
+        "../tests/test_qualification_legacy_profile.py",
+    )
+    trees: dict[str, ast.Module] = {}
+    for relative_path in all_files:
+        path = QUALIFICATION / relative_path
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        trees[relative_path] = tree
+        assert not any(is_duplicated_mapping(node) for node in ast.walk(tree)), relative_path
+        assert any(is_shared_helper_call(node) for node in ast.walk(tree)), relative_path
+
+    for filename in production_files:
+        tree = trees[filename]
+        check_fields = [
+            value
             for node in ast.walk(tree)
-        ), filename
+            if isinstance(node, ast.Dict)
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant) and key.value == "check"
+        ]
+        assert check_fields, filename
+        if filename == "launch_authority_probe.py":
+            assert len(check_fields) == 2
+            assert all(
+                isinstance(value, ast.Name) and value.id == "check"
+                for value in check_fields
+            )
+            assert any(
+                isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "check" for target in node.targets)
+                and is_shared_helper_call(node.value)
+                for node in ast.walk(tree)
+            ), filename
+        else:
+            assert all(is_shared_helper_call(value) for value in check_fields), filename
 
 
 # ---------------------------------------------------------------------------
