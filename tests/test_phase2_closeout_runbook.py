@@ -348,3 +348,22 @@ def test_legacy_adoption_section_8_points_later_upgrades_at_cortex_upgrade() -> 
     assert "sudo /opt/cortex/venv/bin/cortex upgrade <版本>" in section
     assert "--prior-receipt" not in section
     assert "legacy_adoption" in section
+
+
+def test_upgrade_recover_documents_finalize_before_rollback() -> None:
+    # #1270 owner ruling: `--recover` finalizes a verified, serving receipt and
+    # rolls back only when that cannot be proven; the runbook says how it decides.
+    current = (ROOT / CURRENT).read_text(encoding="utf-8")
+
+    recovery = current.split("## 6. Hard-crash recovery", 1)[1].split(
+        "## 7. Deployment canary", 1
+    )[0]
+    section = recovery[recovery.index("### 手動恢復 `cortex upgrade` 中斷的升級") :]
+    finalize = section.index('"action": "finalized"')
+    assert finalize < section.index('"action": "rolled-back"') < section.index("| snippet 變數 |")
+    for condition in ("applied＋qualified", "三個 service 都 active", "loaded runtime 與該 receipt 一致"):
+        assert condition in section, condition
+    assert '"action": "marker-cleared"' in section
+    assert "`recovery.reason`" in section
+    general = current[current.index("## 一般升級") : current.index("## 邊界")]
+    assert "`finalized`" in general
