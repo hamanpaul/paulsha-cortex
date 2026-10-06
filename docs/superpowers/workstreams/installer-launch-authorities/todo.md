@@ -28,7 +28,7 @@ work_item: installer-launch-authorities
 
 ## Tasks
 
-- [ ] **T1 RED**：新增測試，證明現行 installer 在首次安裝與 legacy adoption 之後：
+- [x] **T1 RED**：新增測試，證明現行 installer 在首次安裝與 legacy adoption 之後：
       `canonical_codex_controls('builder')`／`('reviewer')` 失敗；
       `<state>/config/codex-credentials/builder/auth.json` 不存在；
       已匯入 reviewer-planner/copilot 時 Manager env 缺 `PSC_COPILOT_OAUTH_CONFIG`。
