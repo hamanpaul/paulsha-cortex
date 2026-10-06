@@ -10,6 +10,8 @@
 ### Fixed
 
 - **#1304 Codex 唯讀卡 sandbox 啟動相容性**：以 production-shaped `codex exec` 迴圈探測 `read-only` 與 `workspace-write`；Codex 0.159.3 的 app-server socket bubblewrap panic 不再因 CLI exit 0 被誤判通過。僅在唯讀模式失敗而 workspace-write 通過時，建置卡改走 workspace-write，Manager 於派工前綁定完整 worktree／Git status snapshot，結案時驗證 snapshot 與 HEAD 未變；兩種模式都不能執行時回報明確原因（見 `changelog.d/codex-readonly-sandbox.md`）（#1304）。
+- **cortex 進件：派工穩定性第二批 #1311–#1314、#1319–#1321**：登記七個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006c.md`）。
+- **#1297 copilot 健康檢查程序逾時後連同子程序一起回收**：`paulsha_cortex/coordinator/executor_auth.py` 與 `paulsha_cortex/porcelain/bootstrap.py` 的 probe 改共用 `run_probe` runner；一律在獨立 session／process group 執行（`start_new_session=True`），逾時或發生例外時對整個 process group 先送 SIGTERM、短暫等待後送 SIGKILL 並等待回收，防止 node wrapper 終止後 native `copilot-linux-x64` 子程序殘留（見 `changelog.d/copilot-probe-reap.md`）（#1297）。
 - **cortex 進件：#1309 task-memory 逐則處置回報**：登記 work item `task-memory-disposition` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-task-memory-disposition.md`）。
 - **cortex 進件：派工穩定性 #1302–#1307**：登記六個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-dispatch-stability.md`）。
 - **cortex 進件：#1282 審查後續／#1296／#1297**：登記三個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006b.md`）。
