@@ -31,7 +31,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from paulsha_cortex.coordinator import (
     gate_ledger,
@@ -4170,11 +4170,9 @@ def _shell_segments(command: str) -> list[list[str]]:
     return segments
 
 
-#: HEAD 探針鏈中允許出現的唯讀 git 子命令（#716）。只收「讀」的子命令：探針觀察的是
-#: 模型自主做的唯讀檢查，任何會改動 repo 的子命令都讓整條指令不算數。
-HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS = frozenset(
-    {"rev-parse", "status", "branch", "worktree", "log", "show", "symbolic-ref"}
-)
+# HEAD 探針鏈中允許出現的唯讀 git 子命令與各自的選項允許清單見
+# :data:`HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS`／:func:`_is_read_only_git_segment`（#716、#1278）。
+
 #: 系統 git 的兩種寫法。裸 `git` 由 job 的 `PATH` 解析，而那條 PATH 已在
 #: `_bound_codex_builder_spec` 驗為 installer 寫的值（toolchain 與系統目錄，全部
 #: root-owned、沒有相對路徑段），解析不到 worktree 內的 `./git`。
@@ -4225,7 +4223,8 @@ def _is_expected_head_probe(
     - 只接受 `&&` 串接（前一段失敗就不會往下跑，exit 0 代表每一段都成功）；
       管線、`||`、`;`、重導向、背景執行、子 shell、命令替換一律拒絕。
     - 每一段都必須是唯讀檢查：`pwd`、`cd <bound worktree>`，或子命令在
-      :data:`HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS` 內的系統 git（可帶
+      :data:`HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS` 內、選項與位置參數也落在該子命令唯讀允許
+      清單內的系統 git（:func:`_is_read_only_git_segment`，#1278；可帶
       `-C <bound worktree>`，不能指向其他目錄）。repo 內的 `./git`、`printf`／`echo`
       等能自行印出 SHA 的指令、任何含 `$` 或反引號的字詞，以及 git 段中帶 7 位以上 hex
       的字詞（字面 SHA），都讓整條不算數。唯讀檔案檢視（:func:`_is_read_only_file_view`）
@@ -4237,6 +4236,9 @@ def _is_expected_head_probe(
       `-C <bound worktree>` 與 `--no-pager`。`rev-parse` 的旗標限
       :data:`_REV_PARSE_HEAD_QUERY_OPTIONS`（canary run 37375402971：
       `git rev-parse --show-toplevel --git-dir --git-common-dir HEAD`）。
+    - 輸出裡的 bound HEAD 必須出自印出 HEAD 的那一段（#1278）：其他 git 段的允許清單排除了
+      所有能讓 git 印出另一個 commit 完整 hash 的寫法，理由見
+      :data:`_HEAD_PROBE_GIT_SEGMENT_CHECKS` 的註解。
     """
 
     try:
@@ -4292,6 +4294,8 @@ def _is_expected_head_probe(
             return False
         if _git_args_print_head(args):
             saw_head = True
+        elif not _is_read_only_git_segment(args, expected_worktree=expected_worktree):
+            return False
     return saw_head
 
 
@@ -4648,6 +4652,292 @@ def _join_single_commit_limit(args: Sequence[str]) -> list[str]:
         joined.append(args[index])
         index += 1
     return joined
+
+
+#: `git rev-parse` 不當 proof 時（例如 `--abbrev-ref HEAD`）另外允許的改寫 HEAD 印法的選項
+#: （#1278）。位置參數仍只收 :data:`_HEAD_REVISIONS`，所以印出的永遠是 HEAD 的 ref 名稱或縮寫。
+_REV_PARSE_HEAD_RENDER_OPTIONS = frozenset(
+    {
+        "--abbrev-ref",
+        "--abbrev-ref=strict",
+        "--abbrev-ref=loose",
+        "--symbolic",
+        "--symbolic-full-name",
+        "--short",
+    }
+)
+_REV_PARSE_SHORT_LENGTH_RE = re.compile(r"--short=[0-9]+")
+#: `git status` 允許的選項（#1278）。`-v`／`--verbose` 會印出 diff 內容，不收。
+_STATUS_FLAGS = frozenset(
+    {
+        "--short",
+        "--branch",
+        "--porcelain",
+        "--porcelain=v1",
+        "--porcelain=v2",
+        "--long",
+        "--show-stash",
+        "--ahead-behind",
+        "--no-ahead-behind",
+        "--untracked-files",
+        "--untracked-files=no",
+        "--untracked-files=normal",
+        "--untracked-files=all",
+        "--ignored",
+        "--ignored=traditional",
+        "--ignored=matching",
+        "--ignored=no",
+        "--ignore-submodules",
+        "--ignore-submodules=none",
+        "--ignore-submodules=untracked",
+        "--ignore-submodules=dirty",
+        "--ignore-submodules=all",
+        "--null",
+        "--renames",
+        "--no-renames",
+        "--no-column",
+    }
+)
+#: `-s`／`-b`／`-z` 可合寫（`-sb`），`-u` 可帶 `no|normal|all`（`-uno`、`-sbuno`）。
+_STATUS_SHORT_RE = re.compile(r"-[sbz]*u(?:no|normal|all)?|-[sbz]+")
+#: `git branch` 只收列表（#1278）：刪除、建立、改名、複製、`-f`、上游設定、
+#: `--edit-description`，以及能印出任一分支完整 hash 的 `--format` 都不在清單內。
+_BRANCH_LIST_FLAGS = frozenset(
+    {"--all", "--remotes", "--verbose", "--list", "--no-color", "--color=never", "--no-column"}
+)
+_BRANCH_SHORT_RE = re.compile(r"-[arvl]+")
+#: `git branch --list <pattern>` 的樣式：ref 名稱字元與 glob，不得以 `-` 開頭。
+_BRANCH_PATTERN_RE = re.compile(r"[A-Za-z0-9._/*?\[\]][A-Za-z0-9._/*?\[\]-]*")
+#: `git worktree` 只收 `list`；`add`／`remove`／`prune`／`move`／`lock`／`unlock`／`repair` 都會寫入。
+_WORKTREE_LIST_FLAGS = frozenset({"--porcelain", "-v", "--verbose", "-z"})
+#: `git symbolic-ref` 只收讀一個 ref；兩個位置參數是改寫，`-d`／`--delete`、`-m` 也不收。
+_SYMBOLIC_REF_FLAGS = frozenset({"--short", "-q", "--quiet"})
+_SYMBOLIC_REF_NAME_RE = re.compile(r"HEAD|refs/[A-Za-z0-9._/-]+")
+#: `git log`／`git show` 不當 proof 時的選項（#1278）。只收縮寫 hash（`--oneline`、
+#: `--abbrev-commit`）、統計、patch 與帶前綴的固定格式；`--output`（寫檔）、`--ext-diff`
+#: （執行外部程式）、自訂 `--format`／`--pretty`、`--pretty=oneline`、`--no-abbrev-commit`、
+#: `--date=format:`、`--all` 等沒列出的選項都不收。
+_LOG_SHOW_FLAGS = frozenset(
+    {
+        "--oneline",
+        "--abbrev-commit",
+        "--decorate",
+        "--decorate=short",
+        "--decorate=full",
+        "--decorate=no",
+        "--no-decorate",
+        "--stat",
+        "--shortstat",
+        "--name-only",
+        "--name-status",
+        "-s",
+        "--no-patch",
+        "-p",
+        "--patch",
+        "--no-color",
+        "--color=never",
+        "--pretty",
+    }
+)
+_LOG_ONLY_FLAGS = frozenset({"--graph", "--first-parent", "--no-merges", "--reverse", "--follow"})
+#: `git log` 的筆數限制：`-5`、`-n5`、`--max-count=5`；分開寫的 `-n 5`／`--max-count 5` 另外處理。
+_LOG_COUNT_RE = re.compile(r"-[0-9]+|-n[0-9]+|--max-count=[0-9]+")
+_LOG_COUNT_OPTIONS = frozenset({"-n", "--max-count"})
+#: 固定格式只收每個 hash 都帶前綴（`commit <hash>`）或縮寫的幾種；`oneline` 印完整 hash 後接
+#: subject，subject 空白時整行就是 hash，不收。
+_LOG_SHOW_PRETTY_PRESETS = frozenset({"short", "medium", "full", "fuller", "reference"})
+_LOG_SHOW_DATE_MODES = frozenset(
+    {
+        "relative",
+        "local",
+        "iso",
+        "iso8601",
+        "iso-strict",
+        "iso8601-strict",
+        "rfc",
+        "rfc2822",
+        "short",
+        "raw",
+        "unix",
+        "human",
+        "default",
+    }
+)
+
+
+def _git_segment_operands(
+    rest: Sequence[str],
+    *,
+    flag_ok: Callable[[str], bool],
+    count_options: frozenset[str] = frozenset(),
+) -> list[str] | None:
+    """把 git 子命令的參數拆成選項與位置參數（#1278）；有任何不收的選項就回 None。
+
+    選項逐一交給 ``flag_ok``；``count_options`` 內的選項吃下一個純數字值；`--` 之後全是位置參數。
+    """
+
+    operands: list[str] = []
+    index = 0
+    while index < len(rest):
+        arg = rest[index]
+        index += 1
+        if arg == "--":
+            operands.extend(rest[index:])
+            break
+        if not arg.startswith("-"):
+            operands.append(arg)
+            continue
+        if arg in count_options:
+            if index >= len(rest) or re.fullmatch(r"[0-9]+", rest[index]) is None:
+                return None
+            index += 1
+            continue
+        if not flag_ok(arg):
+            return None
+    return operands
+
+
+def _git_operands_in_worktree(operands: Sequence[str], *, expected_worktree: str) -> bool:
+    """git 的位置參數（pathspec、revision、`<rev>:<path>`）是否都留在 bound worktree 內（#1278）。
+
+    路徑規則與 :func:`_is_worktree_path` 相同；`<rev>:<path>` 的路徑部分另外再驗一次。
+    """
+
+    return all(
+        _is_worktree_path(operand, expected_worktree=expected_worktree)
+        and _is_worktree_path(operand.partition(":")[2], expected_worktree=expected_worktree)
+        for operand in operands
+    )
+
+
+def _git_rev_parse_segment_ok(rest: Sequence[str], *, expected_worktree: str) -> bool:
+    """不當 proof 的 `git rev-parse`：唯讀查詢旗標，位置參數只收 HEAD 本身（#1278）。"""
+
+    allowed = _REV_PARSE_HEAD_QUERY_OPTIONS | _REV_PARSE_HEAD_RENDER_OPTIONS
+    if "--verify" in rest:
+        allowed = allowed | _REV_PARSE_VERIFY_QUIET_OPTIONS
+    return all(
+        arg in _HEAD_REVISIONS
+        or arg in allowed
+        or _REV_PARSE_SHORT_LENGTH_RE.fullmatch(arg) is not None
+        for arg in rest
+    )
+
+
+def _git_status_segment_ok(rest: Sequence[str], *, expected_worktree: str) -> bool:
+    operands = _git_segment_operands(
+        rest,
+        flag_ok=lambda arg: arg in _STATUS_FLAGS or _STATUS_SHORT_RE.fullmatch(arg) is not None,
+    )
+    return operands is not None and _git_operands_in_worktree(
+        operands, expected_worktree=expected_worktree
+    )
+
+
+def _git_branch_segment_ok(rest: Sequence[str], *, expected_worktree: str) -> bool:
+    if list(rest) == ["--show-current"]:
+        return True
+    operands = _git_segment_operands(
+        rest,
+        flag_ok=lambda arg: arg in _BRANCH_LIST_FLAGS or _BRANCH_SHORT_RE.fullmatch(arg) is not None,
+    )
+    if operands is None:
+        return False
+    if not operands:
+        return True
+    # 帶位置參數而沒有 `--list`／`-l` 時，git 把它當成要建立的分支名稱（`git branch -v <name>`
+    # 也照樣建立）；只有明示列表時位置參數才是樣式。
+    options = list(rest[: rest.index("--")] if "--" in rest else rest)
+    listing = any(
+        arg == "--list" or (_BRANCH_SHORT_RE.fullmatch(arg) is not None and "l" in arg)
+        for arg in options
+    )
+    return listing and all(_BRANCH_PATTERN_RE.fullmatch(operand) for operand in operands)
+
+
+def _git_worktree_segment_ok(rest: Sequence[str], *, expected_worktree: str) -> bool:
+    return list(rest[:1]) == ["list"] and set(rest[1:]) <= _WORKTREE_LIST_FLAGS
+
+
+def _git_symbolic_ref_segment_ok(rest: Sequence[str], *, expected_worktree: str) -> bool:
+    operands = _git_segment_operands(rest, flag_ok=_SYMBOLIC_REF_FLAGS.__contains__)
+    return (
+        operands is not None
+        and len(operands) == 1
+        and _SYMBOLIC_REF_NAME_RE.fullmatch(operands[0]) is not None
+    )
+
+
+def _log_show_flag_ok(arg: str, *, log: bool) -> bool:
+    if arg in _LOG_SHOW_FLAGS:
+        return True
+    if log and (arg in _LOG_ONLY_FLAGS or _LOG_COUNT_RE.fullmatch(arg) is not None):
+        return True
+    name, separator, value = arg.partition("=")
+    if not separator:
+        return False
+    if name in {"--format", "--pretty"}:
+        return value in _LOG_SHOW_PRETTY_PRESETS
+    return name == "--date" and value in _LOG_SHOW_DATE_MODES
+
+
+def _git_log_segment_ok(rest: Sequence[str], *, expected_worktree: str) -> bool:
+    operands = _git_segment_operands(
+        rest,
+        flag_ok=lambda arg: _log_show_flag_ok(arg, log=True),
+        count_options=_LOG_COUNT_OPTIONS,
+    )
+    return operands is not None and _git_operands_in_worktree(
+        operands, expected_worktree=expected_worktree
+    )
+
+
+def _git_show_segment_ok(rest: Sequence[str], *, expected_worktree: str) -> bool:
+    operands = _git_segment_operands(rest, flag_ok=lambda arg: _log_show_flag_ok(arg, log=False))
+    return operands is not None and _git_operands_in_worktree(
+        operands, expected_worktree=expected_worktree
+    )
+
+
+#: HEAD 探針鏈中 git 段的唯讀界線（#716、#1278）。先前只看子命令名稱，`git branch -D x`、
+#: `git worktree add|remove …`、`git symbolic-ref HEAD refs/heads/x`、`git log --output=<file>`
+#: 這類寫入形態也被當成唯讀段收下；現在每個子命令各有選項與位置參數的允許清單，沒列出的
+#: 一律不收。允許的子命令仍只有這七個：`tag`、`config`、`stash`、`diff`、`rev-list` 等即使有
+#: 唯讀寫法也不列入——歷史 canary 形狀用不到，多收只會放寬界線。
+#:
+#: bound HEAD 必須出自印出 HEAD 的那一段（#1278）。`aggregated_output` 是整條鏈合併的輸出，
+#: 分不出哪一行出自哪一段，所以改由形狀保證：能讓 git 印出「單獨成行的完整 commit hash」的
+#: 只有 proof 段（:func:`_git_args_print_head`），而它的位置參數就是 HEAD。其他 git 段：
+#:
+#: - `rev-parse` 的位置參數只收 HEAD 本身（`HEAD`／`HEAD^{commit}`／`@`）；`main`、`HEAD~1`、
+#:   `--all`、`--branches`、`--default` 等會印出別的 commit 的寫法不收。
+#: - `log`／`show` 不收 `%H`／`%P`（會印出別的 commit 的 hash）與任何自訂 `--format`／`--pretty`：
+#:   `%x61` 跳脫字元、可能展開成空字串的 `%d`／`%b`，能把不到 7 位的字面 hex 片段拼成任意
+#:   40 位 hex，繞過字面 SHA 檢查；`--date=format:` 的 strftime 字面值同理。`--pretty=oneline`、
+#:   `--no-abbrev-commit` 印完整 hash 後接 subject，subject 空白時整行就是 hash，也不收。
+#: - `branch` 不收 `--format`；`status`、`worktree list` 印出的 hash 都帶前綴，`symbolic-ref`
+#:   只印 ref 名稱。
+#:
+#: 檔案檢視／搜尋段（`cat`、`sed -n`、`rg`、`find` 等）、git 印出的檔案內容（patch、
+#: `show <rev>:<path>`）、commit 訊息與 ref 名稱印的是 bound repo 自己的內容，不是 git 替另一個
+#: ref 算出的 object name，維持既有判斷（唯讀探針卡改不了這些內容）。
+_HEAD_PROBE_GIT_SEGMENT_CHECKS: Mapping[str, Callable[..., bool]] = {
+    "rev-parse": _git_rev_parse_segment_ok,
+    "status": _git_status_segment_ok,
+    "branch": _git_branch_segment_ok,
+    "worktree": _git_worktree_segment_ok,
+    "log": _git_log_segment_ok,
+    "show": _git_show_segment_ok,
+    "symbolic-ref": _git_symbolic_ref_segment_ok,
+}
+HEAD_PROBE_READ_ONLY_GIT_SUBCOMMANDS = frozenset(_HEAD_PROBE_GIT_SEGMENT_CHECKS)
+
+
+def _is_read_only_git_segment(args: Sequence[str], *, expected_worktree: str) -> bool:
+    """不當 proof 的 git 段（子命令 argv）是否是該子命令允許清單內的唯讀寫法（#1278）。"""
+
+    check = _HEAD_PROBE_GIT_SEGMENT_CHECKS.get(args[0]) if args else None
+    return check is not None and check(list(args[1:]), expected_worktree=expected_worktree)
 
 
 def _codex_agent_loop_thread_id(

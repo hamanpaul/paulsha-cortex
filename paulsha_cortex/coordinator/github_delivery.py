@@ -21,6 +21,13 @@ GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 PENDING_CHECK_STATUSES = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
 COPILOT_REVIEWER_LOGIN = "copilot-pull-request-reviewer[bot]"
 REVIEW_TIMEOUT_SECONDS = 15 * 60
+# #1271：delivery review 已就緒後，merge gate 只卡在「check 仍在跑」時最多等這麼久
+# （Copilot 路徑從 request／採信既有 review 起算，maintainer 路徑從 review 時間起算），
+# 超過即以非 review 的 `checks-pending-timeout` 交人工。取 GitHub Actions job 預設
+# `timeout-minutes`（360 分鐘）：未自訂 timeout 的 required check（例如本 repo 的
+# tests.yml）可以合法跑到這麼久，GitHub 會自己把它收成 timed_out；超過仍非終局，多半是
+# runner 排不到或外部 commit status 從未回報，等下去沒有意義。
+CHECKS_PENDING_TIMEOUT_SECONDS = 6 * 60 * 60
 _SHIP_CAPABILITY = object()
 COPILOT_ERROR_MARKERS = (
     "encountered an error",
@@ -78,6 +85,24 @@ class ReviewThread:
 
 
 @dataclass(frozen=True)
+class MergeBlockFacts:
+    """#1271：REST 回報 `mergeable_state == "blocked"` 時另讀的 GraphQL 事實。
+
+    REST 的 `blocked` 不分原因（required check 未完成、required review、
+    conversation resolution…）。這裡讀同一 exact HEAD 的 status check rollup，只保留
+    GitHub 對這條 PR 標為 required 的 context（`isRequired(pullRequestNumber:)`），
+    並帶上 `reviewDecision`，讓 ship merge gate 只在有正向證據時把 blocked 當成
+    「required check 仍在跑」。`complete` 為 False 表示 rollup 超過一頁未讀完，
+    呼叫端不得據以等待。
+    """
+
+    head: str
+    review_decision: str | None
+    required_checks: tuple[GitHubCheck, ...]
+    complete: bool
+
+
+@dataclass(frozen=True)
 class DeliveryFacts:
     head: str
     mergeable: bool
@@ -89,6 +114,9 @@ class DeliveryFacts:
     active_openspec_absent: bool
     archive_present: bool
     openspec_required: bool = True
+    # #1271：只有 REST 回報 blocked 時才讀；其餘情況為 None。不進 merge authorization
+    # 的 checks_hash，也不參與 `evaluate_delivery_gate`。
+    merge_block: MergeBlockFacts | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +228,44 @@ def evaluate_delivery_gate(*, facts: DeliveryFacts, policy: DeliveryPolicy) -> G
             reasons.append("openspec-archive-missing")
     normalized = _unique_reasons(reasons)
     return GateResult(allowed=not normalized, reasons=normalized)
+
+
+def required_checks_pending_block(facts: DeliveryFacts) -> tuple[str, ...]:
+    """#1271：回傳「GitHub 回報 blocked 是因為 required check 仍在跑」的正向證據。
+
+    回傳值是仍在跑的 required check 名稱；任一條件不成立回空 tuple，呼叫端維持
+    fail-closed。條件全部要成立：
+    - REST `mergeable is True`（沒有衝突）且 `mergeable_state == "blocked"`；
+    - GraphQL 事實存在、rollup 已完整讀取，且綁定同一個 exact HEAD；
+    - `reviewDecision` 是 None（branch 未要求 review）或 APPROVED——
+      REVIEW_REQUIRED／CHANGES_REQUESTED 代表 block 來自 review，不是 check；
+    - required context 裡沒有已終局非綠或未知 status 的項目；
+    - 至少一個 required context 仍在跑，且 REST 也看到同名 check 仍在跑。
+    其他 blocked 原因（例如 conversation resolution、簽章）在 check 結束後會以
+    `not-mergeable` 單獨出現，照舊 fail-closed；等待期間從不寫 merge authorization。
+    """
+
+    block = facts.merge_block
+    if (
+        facts.mergeable is not True
+        or facts.mergeable_state != "blocked"
+        or block is None
+        or not block.complete
+        or block.head.lower() != facts.head.lower()
+        or block.review_decision not in {None, "APPROVED"}
+    ):
+        return ()
+    if any(not check.terminal_green and not check.pending for check in block.required_checks):
+        return ()
+    rest_pending = {check.name for check in facts.checks if check.pending}
+    return tuple(
+        dict.fromkeys(
+            check.name
+            for check in block.required_checks
+            if check.pending and check.name in rest_pending
+        )
+    )
+
 
 def build_copilot_request_argv(*, repo: str, pr_number: int) -> list[str]:
     if "/" not in repo or repo.startswith("/") or repo.endswith("/"):
@@ -339,6 +405,31 @@ query($owner:String!,$name:String!,$number:Int!,$issueCursor:String,$threadCurso
   }
 }
 """.strip()
+# #1271：只在 REST 回報 blocked 時讀；以 exact HEAD 的 commit object 取 rollup，
+# required 判定綁定這條 PR 的 branch protection／ruleset。
+_MERGE_BLOCK_QUERY = """
+query($owner:String!,$name:String!,$number:Int!,$head:GitObjectID!) {
+  repository(owner:$owner,name:$name) {
+    pullRequest(number:$number) { reviewDecision }
+    object(oid:$head) {
+      ... on Commit {
+        oid
+        statusCheckRollup {
+          contexts(first:100) {
+            nodes {
+              __typename
+              ... on CheckRun { name status conclusion isRequired(pullRequestNumber:$number) }
+              ... on StatusContext { context state isRequired(pullRequestNumber:$number) }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
+_ROLLUP_STATUS_CONTEXT_STATES = frozenset({"SUCCESS", "PENDING", "EXPECTED", "FAILURE", "ERROR"})
 
 
 class GitHubDeliveryClient:
@@ -680,6 +771,105 @@ class GitHubDeliveryClient:
                 issue_numbers.append(node["number"])
         return tuple(sorted(issue_numbers))
 
+    def _merge_block_facts(self, *, repo: str, pr_number: int, head: str) -> MergeBlockFacts:
+        """#1271：讀 exact HEAD 的 required status check 與 reviewDecision；格式不符 fail-closed。"""
+
+        owner, name = self._repo_parts(repo)
+        payload = self._run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={_MERGE_BLOCK_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={pr_number}",
+                # `-F` 會把純數字字串轉成整數；exact HEAD 一律以 raw string 傳入。
+                "-f",
+                f"head={head}",
+            ],
+            expect_json=True,
+        )
+        if not isinstance(payload, dict) or payload.get("errors"):
+            raise RuntimeError("GitHub merge block facts unavailable")
+        try:
+            repository = payload["data"]["repository"]
+            decision = repository["pullRequest"]["reviewDecision"]
+            commit = repository["object"]
+            oid = commit["oid"]
+            rollup = commit["statusCheckRollup"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("GitHub merge block facts malformed") from exc
+        if (
+            (decision is not None and not isinstance(decision, str))
+            or not isinstance(oid, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", oid) is None
+        ):
+            raise RuntimeError("GitHub merge block facts malformed")
+        if rollup is None:
+            return MergeBlockFacts(
+                head=oid.lower(), review_decision=decision, required_checks=(), complete=True
+            )
+        try:
+            connection = rollup["contexts"]
+            nodes = connection["nodes"]
+            has_next_page = connection["pageInfo"]["hasNextPage"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("GitHub merge block facts malformed") from exc
+        if not isinstance(nodes, list) or not isinstance(has_next_page, bool):
+            raise RuntimeError("GitHub merge block facts malformed")
+        required: list[GitHubCheck] = []
+        for node in nodes:
+            if not isinstance(node, dict) or not isinstance(node.get("isRequired"), bool):
+                raise RuntimeError("GitHub merge block facts malformed")
+            kind = node.get("__typename")
+            if kind == "CheckRun":
+                check_name = node.get("name")
+                status = node.get("status")
+                conclusion = node.get("conclusion")
+                if (
+                    not isinstance(check_name, str)
+                    or not isinstance(status, str)
+                    or (conclusion is not None and not isinstance(conclusion, str))
+                ):
+                    raise RuntimeError("GitHub merge block facts malformed")
+                check = GitHubCheck(
+                    name=check_name,
+                    status=status.lower(),
+                    conclusion=conclusion.lower() if conclusion is not None else None,
+                )
+            elif kind == "StatusContext":
+                context = node.get("context")
+                state = node.get("state")
+                if (
+                    not isinstance(context, str)
+                    or not isinstance(state, str)
+                    or state not in _ROLLUP_STATUS_CONTEXT_STATES
+                ):
+                    raise RuntimeError("GitHub merge block facts malformed")
+                # 與 REST commit status 的正規化一致：仍在等（含 required 但尚未回報的
+                # EXPECTED）視為 in_progress，其餘為 completed。
+                if state in {"PENDING", "EXPECTED"}:
+                    check = GitHubCheck(name=context, status="in_progress", conclusion=None)
+                else:
+                    check = GitHubCheck(
+                        name=context, status="completed", conclusion=state.lower()
+                    )
+            else:
+                raise RuntimeError("GitHub merge block facts malformed")
+            if node["isRequired"]:
+                required.append(check)
+        return MergeBlockFacts(
+            head=oid.lower(),
+            review_decision=decision,
+            required_checks=tuple(required),
+            complete=not has_next_page,
+        )
+
     def _closing_issue_numbers(self, *, repo: str, pr_number: int) -> tuple[int, ...]:
         graph = self._work_graph(repo=repo, pr_number=pr_number)
         return self._parse_closing_issue_numbers(graph, repo=repo)
@@ -930,10 +1120,19 @@ class GitHubDeliveryClient:
         # contains the active change until this PR is merged.
         paths = self._commit_tree_paths(repo=repo, commit=head)
         active_absent, archive_present = self._openspec_facts(paths, change)
+        mergeable = pull.get("mergeable") is True
+        mergeable_state = str(pull.get("mergeable_state", ""))
+        # #1271：只有「沒有衝突但被 branch protection 擋下」時才多讀一次 required
+        # check 事實；其他狀態不會因此多打 API。
+        merge_block = (
+            self._merge_block_facts(repo=repo, pr_number=pr_number, head=head)
+            if mergeable and mergeable_state == "blocked"
+            else None
+        )
         return DeliveryFacts(
             head=head,
-            mergeable=pull.get("mergeable") is True,
-            mergeable_state=str(pull.get("mergeable_state", "")),
+            mergeable=mergeable,
+            mergeable_state=mergeable_state,
             checks=tuple(checks),
             copilot_reviews=tuple(reviews),
             review_threads=threads,
@@ -941,6 +1140,7 @@ class GitHubDeliveryClient:
             active_openspec_absent=active_absent,
             archive_present=archive_present,
             openspec_required=change is not None,
+            merge_block=merge_block,
         )
 
     def fetch_remote_closure(

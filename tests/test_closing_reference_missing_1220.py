@@ -110,6 +110,7 @@ def test_maintainer_review_path_uses_the_same_structured_exit(
         github=lane.github,
         ship=active["ship"],
         fix_rounds=0,
+        now_epoch=2000.0,
     )
 
     assert result["action"] == "needs_human"
