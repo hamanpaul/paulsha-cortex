@@ -475,3 +475,76 @@ def test_a_durable_plan_that_is_not_canonical_is_never_finalized(
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["action"] == "rolled-back"
     assert emitted["reason"] == "plan-mismatch"
+
+
+def _fail_once(monkeypatch: pytest.MonkeyPatch, owner: object, name: str, when) -> list[str]:
+    """Make ``owner.name`` raise once when ``when(*args, **kwargs)``; then delegate."""
+
+    real = getattr(owner, name)
+    failures: list[str] = []
+
+    def flaky(*args, **kwargs):
+        if not failures and when(*args, **kwargs):
+            failures.append(name)
+            raise OSError(5, "Input/output error")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, flaky)
+    return failures
+
+
+@pytest.mark.parametrize("cleanup", ["snapshot", "marker"])
+def test_a_cleanup_failure_after_the_proof_never_rolls_back_and_a_rerun_finalizes(
+    interrupted,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cleanup: str,
+) -> None:
+    # #1270 review: once the receipt is proven verified and serving, failing to
+    # clear the snapshot or the lease marker must not fall back to rollback.
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    if cleanup == "snapshot":
+        failures = _fail_once(
+            monkeypatch, install_cli, "_clear_maintenance_snapshot", lambda *_a, **_k: True
+        )
+    else:
+        failures = _fail_once(
+            monkeypatch,
+            install_cli,
+            "_write_lock_payload",
+            lambda _fd, payload: payload is None,
+        )
+
+    assert install_cli.upgrade_main(["--recover"]) == 1
+
+    assert failures == [
+        "_clear_maintenance_snapshot" if cleanup == "snapshot" else "_write_lock_payload"
+    ]
+    assert interrupted.rollbacks == []
+    assert _service_changes(interrupted) == []
+    assert "rollback" not in interrupted.cli.commands()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "finalize failed" in captured.err
+    receipt = InstallReceipt.load(interrupted.bound.receipt_path).to_dict()
+    assert receipt["state"] == "applied" and receipt["qualified"] is True
+    # The interrupted state stays for the next `--recover`.
+    assert _marker() is not None
+    assert (install_cli._read_maintenance_snapshot() is not None) is (cleanup == "snapshot")
+    report = _last_report(interrupted)
+    assert report["result"] == "halted"
+    assert report["recovery"]["action"] == "finalize-failed"
+    assert "Input/output error" in report["recovery"]["reason"]
+    assert report["recovery"]["receipt"] == {
+        "path": str(interrupted.bound.receipt_path),
+        "receipt_id": interrupted.receipt_id,
+    }
+
+    assert upgrade.recover_upgrade() == 0
+
+    assert interrupted.rollbacks == []
+    assert _service_changes(interrupted) == []
+    assert json.loads(capsys.readouterr().out)["action"] == "finalized"
+    assert install_cli._read_maintenance_snapshot() is None
+    assert _marker() is None
+    assert _last_report(interrupted)["result"] == "finalized"

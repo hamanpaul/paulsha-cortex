@@ -365,5 +365,7 @@ def test_upgrade_recover_documents_finalize_before_rollback() -> None:
         assert condition in section, condition
     assert '"action": "marker-cleared"' in section
     assert "`recovery.reason`" in section
+    # A cleanup failure after the proof is reported, never rolled back.
+    assert "`recovery.action=finalize-failed`" in section
     general = current[current.index("## 一般升級") : current.index("## 邊界")]
     assert "`finalized`" in general

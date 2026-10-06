@@ -1070,8 +1070,12 @@ transaction lock 下得到證明時才發生：
 改為 `finalized`，`recovery.receipt` 記下收尾的 receipt。這涵蓋升級在 verify PASS 之後、清
 snapshot／marker 之前被 SIGKILL 或斷電打斷（重開機後 `/run` 的 marker 會消失，只剩 snapshot），
 以及清 snapshot 本身失敗的情況：已驗證、正在服務的 receipt 不會被 rollback 成服務停止、等人工。
+三點證明成立之後，`--recover` 自己清 snapshot 或 marker 失敗也不會改走 rollback：receipt 與服務
+都不動、剩下的 snapshot／marker 保留，report 記 `halted` 與 `recovery.action=finalize-failed`，
+指令以非 0 結束；排除原因後重跑 `--recover` 會重新證明並收尾。有 snapshot 時不要求該 receipt
+是 receipt chain 的 head；chain 若判不出，下一次升級的 preflight 仍會照舊擋下。
 
-任何一點不成立或無法證明（receipt 不存在或讀不到、不是該 plan 的、未 qualified、service 不
+證明完成前任何一點不成立或無法證明（receipt 不存在或讀不到、不是該 plan 的、未 qualified、service 不
 active、loaded runtime 不一致或 status 探測失敗），就照舊執行上面的 `recover`，輸出多帶
 `"action": "rolled-back"` 與 `reason`（例如 `receipt-not-qualified: …`、`services-inactive: …`、
 `loaded-runtime-mismatch: …`）；report 的 `result` 為 `recovered`（失敗則 `halted`），
