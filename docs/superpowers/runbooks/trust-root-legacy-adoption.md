@@ -23,6 +23,7 @@ refs:
 - quarantine root（預設 `/var/lib/cortex-installer/legacy-quarantine`）與所有會被 quarantine 的物件在**同一個檔案系統**：搬移只用 `renameat2(RENAME_NOREPLACE)`，跨檔案系統會 fail closed，沒有 copy fallback。
 - 主機提供 `/proc`（rollback 以 `/proc/self/fdinfo` 判定掛載點），且 `getfacl`／`setfacl` 可用。
 - system instance 沒有在飛 job；本流程會停止 `cortex-egress-proxy`、`cortex-manager`、`cortex-monitor` 三個 service。
+- sudoers 不得讓任何 cortex 帳號（overlay 宣告的四個 principal 與 `cortex-egress`）免認證以萬用指令 sudo，例如 `ALL ALL=(ALL) NOPASSWD: ALL`，或以帳號名稱、`#uid`、所屬群組、User_Alias 指到它的 `NOPASSWD: ALL`；apply preflight 以 `cortex_account_universal_nopasswd` 拒絕並列出帳號。operator 自己的 `NOPASSWD: ALL` 放行，apply 前不必移開。判定細節見 `trust-root-transactional-install.md` §3。
 
 ## 1. 保留原則
 

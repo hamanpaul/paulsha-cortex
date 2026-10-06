@@ -151,7 +151,7 @@ def _safe_facts(plan: dict[str, object]) -> dict[str, object]:
         "cgroup_v2": True,
         "acl": True,
         "disk_free_bytes": 2 * 1024 * 1024 * 1024,
-        "universal_nopasswd": False,
+        "cortex_account_universal_nopasswd": {"accounts": [], "unproven": None},
         "in_flight_jobs": 0,
         "services": {
             "cortex-egress-proxy.service": "inactive",
@@ -1856,6 +1856,100 @@ def test_oversized_prior_asset_file_fails_preflight_before_any_mutation(
     assert unit_path in str(caught.value)
     assert backend.applied == []
     assert receipt.to_dict()["journal"] == []
+
+
+
+# --- cortex 帳號免密碼 sudo（#1122 owner 裁決：operator 的 NOPASSWD 放行） ---
+
+
+def test_preflight_allows_universal_nopasswd_that_reaches_no_cortex_account(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    facts = _safe_facts(plan)
+    facts["cortex_account_universal_nopasswd"] = {"accounts": [], "unproven": None}
+
+    assert validate_preflight(plan, facts).ok
+
+
+def test_preflight_refuses_universal_nopasswd_naming_each_cortex_account(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    facts = _safe_facts(plan)
+    facts["cortex_account_universal_nopasswd"] = {
+        "accounts": ["cortex-gate", "cortex-builder"],
+        "unproven": None,
+    }
+
+    report = validate_preflight(plan, facts)
+
+    assert [row["code"] for row in report.failures] == [
+        "cortex_account_universal_nopasswd"
+    ]
+    detail = report.failures[0]["detail"]
+    assert "NOPASSWD" in detail
+    assert "cortex-builder, cortex-gate" in detail
+
+
+def test_preflight_fails_closed_when_cortex_sudo_state_is_unproven(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    facts = _safe_facts(plan)
+    facts["cortex_account_universal_nopasswd"] = {
+        "accounts": [],
+        "unproven": "visudo -c rejected /etc/sudoers",
+    }
+
+    report = validate_preflight(plan, facts)
+
+    assert [row["code"] for row in report.failures] == [
+        "cortex_account_universal_nopasswd"
+    ]
+    assert "visudo -c rejected /etc/sudoers" in report.failures[0]["detail"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        "cortex-builder",
+        {},
+        {"accounts": "cortex-builder", "unproven": None},
+        {"accounts": [1], "unproven": None},
+        {"accounts": [], "unproven": 1},
+        {"accounts": []},
+    ],
+)
+def test_preflight_fails_closed_on_malformed_cortex_sudo_fact(
+    tmp_path: Path, value: object
+) -> None:
+    plan = _plan(tmp_path)
+    facts = _safe_facts(plan)
+    facts["cortex_account_universal_nopasswd"] = value
+
+    report = validate_preflight(plan, facts)
+
+    assert [row["code"] for row in report.failures] == [
+        "cortex_account_universal_nopasswd"
+    ]
+
+
+def test_preflight_still_honors_the_legacy_universal_nopasswd_fact(
+    tmp_path: Path,
+) -> None:
+    # 舊形狀的 fact 只說「主機上有萬用免密碼規則」，分不出帳號 → 照舊拒絕。
+    plan = _plan(tmp_path)
+    facts = _safe_facts(plan)
+    facts.pop("cortex_account_universal_nopasswd", None)
+    facts["universal_nopasswd"] = True
+
+    report = validate_preflight(plan, facts)
+
+    assert report.failures == (
+        {"code": "universal_nopasswd", "detail": "universal NOPASSWD is forbidden"},
+    )
 
 
 def test_apply_requires_the_exact_canonical_plan_hash(tmp_path: Path) -> None:

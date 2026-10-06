@@ -2340,6 +2340,55 @@ def _covered_by(path: object, covered: Sequence[str]) -> bool:
     )
 
 
+_CORTEX_NOPASSWD_CODE = "cortex_account_universal_nopasswd"
+
+
+def _cortex_account_nopasswd_failures(
+    facts: Mapping[str, object],
+) -> list[dict[str, str]]:
+    """只拒絕對 cortex 帳號生效的萬用免密碼 sudo（#1122 owner 裁決）。
+
+    operator 等其他帳號的 `NOPASSWD: ALL` 放行；fact 形狀不對或 backend 回報
+    sudoers 狀態無法判定時一律 fail closed。舊版 fact ``universal_nopasswd``
+    只說主機上有萬用免密碼規則、分不出帳號，出現 truthy 值時照舊拒絕。
+    """
+
+    observed = facts.get(_CORTEX_NOPASSWD_CODE)
+    if observed is None:
+        if facts.get("universal_nopasswd"):
+            return [
+                {"code": "universal_nopasswd", "detail": "universal NOPASSWD is forbidden"}
+            ]
+        return []
+    unproven_detail = "cortex account sudo authentication could not be proven: "
+    accounts = observed.get("accounts") if isinstance(observed, Mapping) else None
+    unproven = observed.get("unproven") if isinstance(observed, Mapping) else None
+    if (
+        not isinstance(observed, Mapping)
+        or "unproven" not in observed
+        or not isinstance(accounts, list)
+        or not all(isinstance(name, str) and name for name in accounts)
+        or not (unproven is None or (isinstance(unproven, str) and unproven))
+    ):
+        return [
+            {
+                "code": _CORTEX_NOPASSWD_CODE,
+                "detail": unproven_detail + "preflight fact is malformed",
+            }
+        ]
+    if unproven is not None:
+        return [{"code": _CORTEX_NOPASSWD_CODE, "detail": unproven_detail + unproven}]
+    if accounts:
+        return [
+            {
+                "code": _CORTEX_NOPASSWD_CODE,
+                "detail": "universal NOPASSWD sudo is forbidden for cortex accounts: "
+                + ", ".join(sorted(set(accounts))),
+            }
+        ]
+    return []
+
+
 def validate_preflight(
     plan: Mapping[str, object],
     facts: Mapping[str, object],
@@ -2369,8 +2418,7 @@ def validate_preflight(
     free = facts.get("disk_free_bytes", 0)
     if not isinstance(free, int) or not isinstance(minimum, int) or free < minimum:
         failures.append({"code": "insufficient_disk", "detail": f"free={free}, required={minimum}"})
-    if facts.get("universal_nopasswd"):
-        failures.append({"code": "universal_nopasswd", "detail": "universal NOPASSWD is forbidden"})
+    failures.extend(_cortex_account_nopasswd_failures(facts))
     if facts.get("in_flight_jobs") not in (0, None):
         failures.append({"code": "in_flight_jobs", "detail": "jobs are still in flight"})
 

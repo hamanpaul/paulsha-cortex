@@ -467,7 +467,7 @@ class VerifyBackend:
             "cgroup_v2": True,
             "acl": True,
             "disk_free_bytes": 2 * 1024 * 1024 * 1024,
-            "universal_nopasswd": False,
+            "cortex_account_universal_nopasswd": {"accounts": [], "unproven": None},
             "in_flight_jobs": 0,
             "services": {
                 "cortex-egress-proxy.service": "inactive",
