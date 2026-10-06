@@ -73,6 +73,7 @@ REQUIRED_RELEASE_SERVICES = {
 REQUIRED_RELEASE_ARTIFACTS = {
     "evidence/install-verification.json",
     "evidence/generated-installed-attestation.json",
+    "evidence/install-semantic-checks.json",
     "evidence/attack-matrix.json",
     "evidence/artifact-inventory.json",
     "evidence/rollback-loaded-runtime-status.json",
@@ -236,9 +237,29 @@ def _require_loaded_runtime_match(
             _fail(f"{label} loaded-runtime artifact or receipt does not match")
 
 
+def _same_artifact_prior_anchor(evidence_root: Path) -> tuple[str, str]:
+    semantic = _required_fields(
+        _artifact_json(evidence_root, "evidence/install-semantic-checks.json"),
+        "install-semantic-checks",
+        {"schema_version", "receipt_id", "prior_receipt_id"},
+    )
+    if semantic["schema_version"] != 1:
+        _fail("install-semantic-checks must be schema v1")
+    return (
+        _nonempty_string(
+            semantic["receipt_id"], "install-semantic-checks.receipt_id"
+        ),
+        _nonempty_string(
+            semantic["prior_receipt_id"],
+            "install-semantic-checks.prior_receipt_id",
+        ),
+    )
+
+
 def _validate_one_command_upgrade(
     evidence_root: Path,
     *,
+    qualified_receipt_id: str,
     prior_receipt_id: Any,
     drill_receipt_id: Any,
     evidence_sha: str,
@@ -311,6 +332,8 @@ def _validate_one_command_upgrade(
         or expected["candidate_commit"] != evidence_sha
     ):
         _fail("one-command upgrade expected receipt is not this candidate")
+    if expected["receipt_id"] != qualified_receipt_id:
+        _fail("install-semantic-checks receipt is not the qualified candidate receipt")
     _require_loaded_runtime_match(
         status.get("service_status"), expected, label="one-command upgrade"
     )
@@ -1415,6 +1438,9 @@ def validate(
             )
         assert evidence_root is not None
         if profile in {"release", "deployment-canary"}:
+            qualified_receipt_id, qualified_prior_receipt_id = _same_artifact_prior_anchor(
+                evidence_root
+            )
             rollback_status = _artifact_json(
                 evidence_root, "evidence/rollback-loaded-runtime-status.json"
             )
@@ -1439,6 +1465,10 @@ def validate(
                 or rollback_receipt["parent_receipt_id"] != expected["receipt_id"]
             ):
                 _fail("rollback receipt is not bound to the qualified prior receipt")
+            if expected["receipt_id"] != qualified_prior_receipt_id:
+                _fail(
+                    "rollback loaded-runtime expected receipt is not anchored to the qualified prior receipt"
+                )
             # same-artifact 情境：prior receipt 就是本次 candidate 的安裝，expected 必須
             # 綁回 qualification 自己的 candidate，不能是任意 wheel／commit。
             if (
@@ -1451,7 +1481,8 @@ def validate(
             )
             _validate_one_command_upgrade(
                 evidence_root,
-                prior_receipt_id=expected["receipt_id"],
+                qualified_receipt_id=qualified_receipt_id,
+                prior_receipt_id=qualified_prior_receipt_id,
                 drill_receipt_id=rollback_receipt["receipt_id"],
                 evidence_sha=evidence_sha,
                 evidence_wheel_sha=evidence_wheel_sha,

@@ -206,6 +206,7 @@ def test_release_installed_checks_require_owner_bound_reclaim(
         receipt={"receipt_id": "rc-test"},
         evidence_dir=evidence,
         profile="release",
+        prior_receipt_id="prior-anchor",
         # system-scope status 另由 test_qualification_driver_service_status 覆蓋。
         require_system_status=False,
     )
@@ -215,6 +216,10 @@ def test_release_installed_checks_require_owner_bound_reclaim(
         "generated-installed-attestation",
     }
     assert seen == [("rc-test", evidence)]
+    semantic = json.loads(
+        (evidence / "install-semantic-checks.json").read_text(encoding="utf-8")
+    )
+    assert semantic["prior_receipt_id"] == "prior-anchor"
 
 
 def _one_command_upgrade_document(
@@ -495,6 +500,13 @@ def _valid_full_qualification(
     documents = {
         "install-verification.json": installed,
         "generated-installed-attestation.json": generated,
+        "install-semantic-checks.json": {
+            "schema_version": 1,
+            "selfcheck": {"ok": True, "job_writable_count": 0},
+            "registry_equation": {"ok": True},
+            "receipt_id": "upgraded",
+            "prior_receipt_id": "prior",
+        },
         "attack-matrix.json": attack,
         "provider-capabilities.json": provider_evidence,
         "dispatch-closeout.json": dispatch,
@@ -794,19 +806,20 @@ def test_release_harness_drives_one_command_upgrade_drill_then_full_upgrade() ->
     assert "rollback_overlay_path" not in runner
     source = runner.index("/usr/local/libexec/cortex-qualification-release-source")
     overlay = runner.index("/var/lib/cortex-installer/host-overlay.yaml")
+    warmup = runner.index('sh "$upgrade_warmup_report" "${warmup_upgrade_cli[@]}"')
     drift = runner.index('chmod 0640 "$builder_codex_credential"')
-    drill = runner.index('sh "$upgrade_drill_report" "${upgrade_cli[@]}"')
+    drill = runner.index('sh "$upgrade_drill_report" "${same_artifact_upgrade_cli[@]}"')
     restore = runner.index('chmod 0600 "$builder_codex_credential"')
-    fresh = runner.index('docker exec "$container_name" rm -rf "$upgrade_slot"')
-    full = runner.index('sh "$upgrade_report" "${upgrade_cli[@]}"')
+    full = runner.index('sh "$upgrade_report" "${same_artifact_upgrade_cli[@]}"')
     driver = runner.index("driver_profile_args+=(\n    --prior-receipt")
-    assert source < overlay < drift < drill < restore < fresh < full < driver
-    assert runner.count("--env PSC_UPGRADE_QUALIFICATION=1") == 2
+    assert source < overlay < warmup < drift < drill < restore < full < driver
+    assert runner.count("--env PSC_UPGRADE_QUALIFICATION=1") == 3
     for fragment in (
         '/opt/cortex/venv/bin/cortex upgrade "$upgrade_version"',
         '--release-source "$upgrade_release_source"',
         "--allow-same-version",
         '--prior-receipt "$receipt_path"',
+        '--prior-receipt "$same_artifact_prior_receipt_path"',
         '--upgrade-drill-report "$upgrade_drill_report"',
         '--upgrade-report "$upgrade_report"',
         '--receipt "$upgrade_receipt_path"',
@@ -816,38 +829,54 @@ def test_release_harness_drives_one_command_upgrade_drill_then_full_upgrade() ->
     assert '"--install-receipt"' in _required_text(DRIVER)
 
 
-def test_release_harness_keeps_the_same_candidate_as_the_qualified_prior() -> None:
+def test_release_harness_warms_from_a_synthetic_prior_before_same_artifact_replays() -> None:
     runner = _required_text(RUNNER)
-    for fragment in (
-        '--config /artifacts/install-config.yaml',
-        '--bundle /artifacts/bundle.json',
-        '--env "CORTEX_QUALIFICATION_WHEEL_SHA256=$expected_wheel_sha"',
-        '--env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$expected_bundle_sha"',
-    ):
-        assert fragment in runner
+    plan = runner[
+        runner.index("cortex install trust-root plan \\") : runner.index(
+            "plan_sha=", runner.index("cortex install trust-root plan \\")
+        )
+    ]
+    verify = runner[
+        runner.index("install_evidence_path=$qualification_root/install-verification.json") : runner.index(
+            "upgrade_version=$(basename", runner.index("install_evidence_path=$qualification_root/install-verification.json")
+        )
+    ]
     for fragment in (
         "prior_artifact_root=/run/cortex-prior-artifacts",
         "qualification-prior-same-version",
         "prior_wheel_sha=",
         "prior_bundle_sha=",
+        'same_artifact_prior_receipt_path=$(docker exec "$container_name" jq -r \\',
+        'die "warmup upgrade report lacks the same-artifact prior receipt"',
     ):
-        assert fragment not in runner
+        assert fragment in runner
+    for fragment in ('--config "$prior_config_path"', '--bundle "$prior_bundle_path"'):
+        assert fragment in plan
+    for fragment in (
+        '--env "CORTEX_QUALIFICATION_WHEEL_SHA256=$prior_wheel_sha"',
+        '--env "CORTEX_QUALIFICATION_BUNDLE_SHA256=$prior_bundle_sha"',
+    ):
+        assert fragment in verify
 
 
 def test_release_harness_runs_same_version_upgrade_under_umask_077_and_exec_checks() -> None:
     runner = _required_text(RUNNER)
 
-    assert runner.count("umask 077; out=$1; shift; \"$@\" >\"$out\"") == 2
+    assert runner.count("umask 077; out=$1; shift; \"$@\" >\"$out\"") == 3
     for fragment in (
         'upgrade_slot=/opt/cortex/venvs/$expected_wheel_sha',
-        'die "upgrade drill did not create the candidate venv slot"',
-        'docker exec "$container_name" rm -rf "$upgrade_slot"',
-        'die "upgrade drill candidate venv slot was not removed"',
+        'die "warmup upgrade did not create the candidate venv slot"',
+        'die "upgrade drill removed the live candidate venv slot"',
         "for upgrade_account in cortex-egress-proxy cortex-manager; do",
         'die "upgraded venv is not executable as $upgrade_account"',
         "test -x /opt/cortex/venv/bin/cortex; /opt/cortex/venv/bin/cortex --help >/dev/null",
     ):
         assert fragment in runner
+    for fragment in (
+        'docker exec "$container_name" rm -rf "$upgrade_slot"',
+        'die "upgrade drill candidate venv slot was not removed"',
+    ):
+        assert fragment not in runner
 
 
 def test_release_harness_refreshes_the_builder_credential_before_the_full_upgrade() -> None:
@@ -870,7 +899,7 @@ def test_release_harness_refreshes_the_builder_credential_before_the_full_upgrad
         'cortex-builder"\nfi\n'
     )
     refreshed = runner.index("builder_codex_refreshed_sha=$(docker exec")
-    full = runner.index('sh "$upgrade_report" "${upgrade_cli[@]}"')
+    full = runner.index('sh "$upgrade_report" "${same_artifact_upgrade_cli[@]}"')
     receipt = runner.index("upgrade_receipt_path=$(docker exec")
     recorded = runner.index('--arg refreshed "$builder_codex_refreshed_sha"')
     status_call = runner.index("/opt/cortex/venv/bin/cortex upgrade --status --json")
@@ -881,7 +910,7 @@ def test_release_harness_refreshes_the_builder_credential_before_the_full_upgrad
     section = runner[prior_sha:full]
     for fragment in (
         'select(.principal == "builder" and .provider == "codex")',
-        '"$receipt_path")',
+        '"$same_artifact_prior_receipt_path")',
         "stat -c '%F %i %u %g %a %h' \"$builder_codex_credential\"",
         '"regular file "*" 600 1"',
         'sha256sum "$builder_codex_credential"',
@@ -899,7 +928,7 @@ def test_release_harness_refreshes_the_builder_credential_before_the_full_upgrad
     )
     check = runner[recorded : runner.index("fi\n", recorded)]
     for fragment in (
-        '--slurpfile prior "$receipt_path"',
+        '--slurpfile prior "$same_artifact_prior_receipt_path"',
         "length == 1",
         ".[0].sha256 == $refreshed",
         ".[0].inherited_from == $prior[0].receipt_id",
@@ -928,14 +957,22 @@ def test_release_harness_prints_upgrade_diagnostics_before_dying() -> None:
         "upgrade_durable_report=/var/lib/cortex-installer/$upgrade_version/upgrade-report.json"
         in runner
     )
-    assert start < runner.index('sh "$upgrade_drill_report" "${upgrade_cli[@]}"')
+    assert start < runner.index('sh "$upgrade_warmup_report" "${warmup_upgrade_cli[@]}"')
 
     def guarded(call: str, message: str, report: str) -> None:
         opened = runner.index(call)
         dies = runner.index(f'die "{message}"', opened)
         assert opened < runner.index(f'upgrade_diagnostics "{report}"', opened) < dies
 
-    drill_call = 'sh "$upgrade_drill_report" "${upgrade_cli[@]}"; then'
+    warmup_call = 'sh "$upgrade_warmup_report" "${warmup_upgrade_cli[@]}"; then'
+    guarded(warmup_call, "warmup upgrade failed", "$upgrade_warmup_report")
+    guarded(
+        "if ! docker exec \"$container_name\" jq -e '.result == \"upgraded\"' \\\n"
+        '    "$upgrade_warmup_report" >/dev/null; then',
+        "warmup upgrade did not complete",
+        "$upgrade_warmup_report",
+    )
+    drill_call = 'sh "$upgrade_drill_report" "${same_artifact_upgrade_cli[@]}"; then'
     guarded(drill_call, "one-command upgrade accepted a drifted inherited credential",
             "$upgrade_drill_report")
     guarded(
@@ -947,7 +984,7 @@ def test_release_harness_prints_upgrade_diagnostics_before_dying() -> None:
         'if ! docker exec --env PSC_UPGRADE_QUALIFICATION=1 "$container_name" \\\n'
         "    sh -eu -c 'umask 077; out=$1; shift; \"$@\" >\"$out\"' \\\n"
         '    sh "$upgrade_report" '
-        '"${upgrade_cli[@]}"; then'
+        '"${same_artifact_upgrade_cli[@]}"; then'
     )
     guarded(full_call, "one-command upgrade failed", "$upgrade_report")
     guarded(
@@ -1017,7 +1054,7 @@ def test_release_harness_checks_upgrade_status_after_the_full_upgrade() -> None:
     # Final review item 8: RC must exercise the production-only `--status`
     # path (effective_receipt, maintenance marker) on the upgraded host.
     runner = _required_text(RUNNER)
-    full = runner.index('sh "$upgrade_report" "${upgrade_cli[@]}"')
+    full = runner.index('sh "$upgrade_report" "${same_artifact_upgrade_cli[@]}"')
     receipt = runner.index("upgrade_receipt_path=$(docker exec")
     status_call = runner.index("/opt/cortex/venv/bin/cortex upgrade --status --json")
     driver = runner.index("driver_profile_args+=(\n    --prior-receipt")
@@ -1085,6 +1122,55 @@ def test_full_suite_validator_rejects_broken_one_command_upgrade_evidence(
 
     assert completed.returncode != 0, completed.stdout + completed.stderr
     assert message in completed.stderr
+
+
+def test_full_suite_validator_requires_the_same_artifact_prior_anchor(
+    tmp_path: Path,
+) -> None:
+    payload = _valid_full_qualification(tmp_path)
+    evidence = tmp_path / "evidence"
+
+    rollback_path = evidence / "rollback-loaded-runtime-status.json"
+    rollback = json.loads(rollback_path.read_text(encoding="utf-8"))
+    rollback["rollback_receipt"]["parent_receipt_id"] = "foreign-prior"
+    rollback["expected"]["receipt_id"] = "foreign-prior"
+    for report in rollback["service_status"]["service"]["loaded_runtime"].values():
+        report["trust_root"]["receipt_id"] = "foreign-prior"
+    _write_json(rollback_path, rollback)
+
+    upgrade_path = evidence / "one-command-upgrade.json"
+    upgrade = json.loads(upgrade_path.read_text(encoding="utf-8"))
+    upgrade["drill"]["parent_receipt_id"] = "foreign-prior"
+    upgrade["upgrade"]["parent_receipt_id"] = "foreign-prior"
+    for row in upgrade["upgrade"]["inherited_credentials"]:
+        row["inherited_from"] = "foreign-prior"
+    _write_json(upgrade_path, upgrade)
+
+    _refresh_full_hashes(tmp_path, payload)
+    completed = _run_full_validator(tmp_path, payload)
+
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert (
+        "rollback loaded-runtime expected receipt is not anchored to the qualified prior receipt"
+        in completed.stderr
+    )
+
+
+def test_full_suite_validator_requires_install_semantic_prior_anchor(
+    tmp_path: Path,
+) -> None:
+    payload = _valid_full_qualification(tmp_path)
+    evidence = tmp_path / "evidence"
+    semantic_path = evidence / "install-semantic-checks.json"
+    semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+    semantic.pop("prior_receipt_id")
+    _write_json(semantic_path, semantic)
+
+    _refresh_full_hashes(tmp_path, payload)
+    completed = _run_full_validator(tmp_path, payload)
+
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert "install-semantic-checks missing required fields: prior_receipt_id" in completed.stderr
 
 
 def test_qualification_schema_binds_release_evidence_and_runtime_identity() -> None:

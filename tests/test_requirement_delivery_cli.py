@@ -517,6 +517,13 @@ def _cli_full_canary_qualification(
     documents = {
         "install-verification.json": installed,
         "generated-installed-attestation.json": generated,
+        "install-semantic-checks.json": {
+            "schema_version": 1,
+            "selfcheck": {"ok": True, "job_writable_count": 0},
+            "registry_equation": {"ok": True},
+            "receipt_id": "upgraded",
+            "prior_receipt_id": "prior",
+        },
         "attack-matrix.json": attack,
         "provider-capabilities.json": provider_evidence,
         "dispatch-closeout.json": dispatch,
