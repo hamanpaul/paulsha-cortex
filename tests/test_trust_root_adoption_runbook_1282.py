@@ -32,6 +32,16 @@ def _block(text: str, start: str, end: str) -> str:
     return text[begin:stop]
 
 
+def _run_shell(script: str, *arguments: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [BASH, "-c", script, "runbook", *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+
+
 def _lease_result(present: list[str], active: list[str]) -> str:
     return json.dumps(
         {
@@ -68,13 +78,7 @@ def _runbook_shell(body: str, *arguments: str, tmp_path: Path) -> subprocess.Com
             body,
         ]
     )
-    return subprocess.run(
-        [BASH, "-c", script, "runbook", *arguments],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=tmp_path,
-    )
+    return _run_shell(script, *arguments, tmp_path=tmp_path)
 
 
 def _lists(tmp_path: Path, present: list[str], active: list[str]) -> tuple[list[str], list[str]]:
@@ -135,6 +139,76 @@ def test_restore_starts_exactly_the_previously_active_services(tmp_path: Path) -
     assert calls[1] == "/usr/bin/systemctl stop cortex-manager.service"
 
 
+def test_legacy_capture_stops_before_running_root_cli_on_a_sealed_tree_mismatch(
+    tmp_path: Path,
+) -> None:
+    text = LEGACY.read_text(encoding="utf-8")
+    root_cli = _block(
+        TRANSACTIONAL.read_text(encoding="utf-8"), "cortex_root_cli() {", "\n}\n"
+    )
+    capture = _block(
+        text,
+        "cortex_capture_result=$(cortex_root_cli install trust-root legacy inventory \\",
+        '/usr/bin/printf \'%s\\n\' "$cortex_capture_result"',
+    )
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            'cortex_calls=$1',
+            'cortex_install_config=/tmp/install-config.yaml',
+            'cortex_bundle=/tmp/bundle.json',
+            'cortex_cli_tree_sha() { printf "%s\\n" mismatch; }',
+            'cortex_sealed_cli_tree_sha=expected',
+            root_cli,
+            capture,
+        ]
+    )
+
+    completed = _run_shell(script, str(tmp_path / "calls"), tmp_path=tmp_path)
+
+    assert completed.returncode != 0
+    assert not (tmp_path / "calls").exists(), "sealed-tree mismatch must abort before root CLI"
+
+
+def test_transactional_rollback_trap_stops_before_running_root_cli_on_a_sealed_tree_mismatch(
+    tmp_path: Path,
+) -> None:
+    text = TRANSACTIONAL.read_text(encoding="utf-8")
+    recovery = text.split(
+        "cortex_recovery_sealed_cli_tree_sha=$(cortex_recovery_cli_tree_sha)", 1
+    )[1]
+    root_cli = _block(recovery, "cortex_root_cli() {", "\n}\n")
+    abort_restore = _block(text, "cortex_abort_restore() {", "\n}\n")
+    abort_restore = abort_restore.replace("/usr/bin/sudo ", "cortex_fake_sudo ")
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            'cortex_calls=$1',
+            'cortex_apply_attempted=1',
+            'cortex_receipt_path=/var/lib/cortex-installer/receipt.json',
+            'cortex_maintenance_token=token',
+            'cortex_recovery_cli_tree_sha() { printf "%s\\n" mismatch; }',
+            'cortex_recovery_sealed_cli_tree_sha=expected',
+            root_cli,
+            'cortex_fake_sudo() {',
+            '  if [ "$1" = "/usr/bin/test" ] && [ "$2" = "-f" ]; then',
+            '    return 0',
+            '  fi',
+            '  return 0',
+            '}',
+            'cortex_restore_active() { return 0; }',
+            'cortex_release_maintenance_lease() { return 0; }',
+            abort_restore,
+            'cortex_abort_restore 1',
+        ]
+    )
+
+    completed = _run_shell(script, str(tmp_path / "calls"), tmp_path=tmp_path)
+
+    assert completed.returncode == 1
+    assert not (tmp_path / "calls").exists(), "sealed-tree mismatch must abort before rollback"
+
+
 @pytest.mark.parametrize(
     "start",
     [
@@ -149,6 +223,16 @@ def test_root_installer_paths_include_the_system_sbin_directories(start: str) ->
     # itself also resolves those tools from fixed directories.
     text = TRANSACTIONAL.read_text(encoding="utf-8")
     block = _block(text, start, "PYTHONNOUSERSITE=1")
+    assert 'PATH="$cortex_bootstrap_root/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin"' in block
+
+
+def test_recovery_root_installer_path_includes_the_system_sbin_directories() -> None:
+    text = TRANSACTIONAL.read_text(encoding="utf-8")
+    recovery = text.split(
+        "cortex_recovery_sealed_cli_tree_sha=$(cortex_recovery_cli_tree_sha)", 1
+    )[1]
+    block = _block(recovery, "cortex_root_cli() {", "PYTHONNOUSERSITE=1")
+
     assert 'PATH="$cortex_bootstrap_root/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin"' in block
 
 
