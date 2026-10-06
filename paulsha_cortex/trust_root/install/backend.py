@@ -2363,6 +2363,22 @@ def _sudoers_tool(name: str) -> str | None:
     return None
 
 
+def _account_tool(name: str) -> str:
+    """``useradd``／``groupadd`` 同樣只從固定系統目錄解析（#1282）。
+
+    Ubuntu 把它們放在 `/usr/sbin`，runbook 給 root installer 的 PATH 原本沒有它；
+    依賴 PATH 會讓首次安裝在建帳號時才失敗。找不到就在任何 mutation 前 fail closed。
+    """
+
+    resolved = _sudoers_tool(name)
+    if resolved is None:
+        raise InstallError(
+            f"{name} not found in {', '.join(_SUDOERS_TOOL_DIRECTORIES)}; the account "
+            "step cannot create the account"
+        )
+    return resolved
+
+
 def _sudoers_tool_reason(result: subprocess.CompletedProcess[str]) -> str:
     lines = (result.stderr or "").strip().splitlines()
     return f" ({lines[0][:200]})" if lines else ""
@@ -2714,13 +2730,37 @@ def _quarantine_layout(step: Mapping[str, object]) -> tuple[Path, Path, Path]:
 
 
 def _file_type_name(mode: int) -> str:
+    """The inventory's type names (``legacy._file_type``), so they compare."""
+
     if stat.S_ISREG(mode):
         return "file"
     if stat.S_ISDIR(mode):
         return "directory"
     if stat.S_ISLNK(mode):
         return "symlink"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISBLK(mode):
+        return "block-device"
+    if stat.S_ISCHR(mode):
+        return "char-device"
     return "other"
+
+
+#: Quarantined objects whose identity is bound without reading content:
+#: a stale socket or FIFO is moved like a file but never opened (#1282).
+_SPECIAL_IDENTITY_TYPES = frozenset({"socket", "fifo"})
+_QUARANTINE_IDENTITY_TYPES = frozenset({"directory", "file", "symlink"}) | _SPECIAL_IDENTITY_TYPES
+#: Tree members recorded by type and mode only (plus the device number for a
+#: device node); the walk never opens them.
+_TREE_SPECIAL_RECORDS = {
+    "socket": b"S",
+    "fifo": b"P",
+    "block-device": b"B",
+    "char-device": b"C",
+}
 
 
 def _quarantine_record(observed: os.stat_result) -> dict[str, object]:
@@ -3301,6 +3341,11 @@ _TreeManifest = dict[str, tuple[int, int, str]]
 def _tree_digest_at(parent_fd: int, name: str) -> tuple[str, _TreeManifest]:
     """``_tree_sha256`` of ``name`` under ``parent_fd``, walked by descriptors.
 
+    Unlike the venv digest it also accepts special members a legacy tree may
+    hold (#1282): a socket, FIFO or device node is recorded by its type and
+    mode (and device number) and is never opened.  A tree of only files,
+    directories and symlinks has exactly the ``_tree_sha256`` digest.
+
     Every directory is opened ``O_NOFOLLOW`` relative to its verified parent,
     so the walk never leaves the tree through a symlink.  Besides the digest
     it returns the manifest of every member (relative path -> dev, ino,
@@ -3344,6 +3389,14 @@ def _tree_digest_at(parent_fd: int, name: str) -> tuple[str, _TreeManifest]:
                     record += b"F\0" + file_sha256.encode("ascii") + b"\0"
                 elif kind == "directory":
                     record += b"D\0"
+                elif kind in _TREE_SPECIAL_RECORDS:
+                    # A stale socket, FIFO or device node in a legacy tree
+                    # (#1282): bound by type and mode, never opened.
+                    record += _TREE_SPECIAL_RECORDS[kind] + b"\0"
+                    if kind.endswith("-device"):
+                        record += (
+                            f"{os.major(observed.st_rdev)}:{os.minor(observed.st_rdev)}"
+                        ).encode("ascii") + b"\0"
                 else:
                     raise InstallDriftError(f"tree contains an unsupported object: {relative}")
                 records.append((relative, record))
@@ -3408,6 +3461,10 @@ def _legacy_quarantine_identity(path: Path) -> dict[str, object]:
             digest = hashlib.sha256(
                 os.readlink(path.name, dir_fd=parent_fd).encode("utf-8", "surrogateescape")
             ).hexdigest()
+        elif kind in _SPECIAL_IDENTITY_TYPES:
+            # A stale socket or FIFO has no content to bind; its inode and
+            # type are the identity (#1282).
+            digest = hashlib.sha256(f"{kind}\0".encode("ascii")).hexdigest()
         else:
             raise InstallDriftError(f"unsupported quarantined object type at {path}: {kind}")
         return {
@@ -3432,7 +3489,7 @@ def _discard_legacy_quarantine(
     if (
         type(identity.get("device")) is not int
         or type(identity.get("inode")) is not int
-        or identity.get("type") not in {"directory", "file", "symlink"}
+        or identity.get("type") not in _QUARANTINE_IDENTITY_TYPES
         or not isinstance(identity.get("tree_sha256"), str)
     ):
         raise InstallDriftError(f"no purge identity binds the quarantined object at {path}")
@@ -3515,7 +3572,7 @@ def _resume_legacy_discard(
     if (
         type(identity.get("device")) is not int
         or type(identity.get("inode")) is not int
-        or identity.get("type") not in {"directory", "file", "symlink"}
+        or identity.get("type") not in _QUARANTINE_IDENTITY_TYPES
         or not isinstance(identity.get("tree_sha256"), str)
     ):
         raise InstallDriftError(f"no purge identity binds the quarantined object at {path}")
@@ -4702,10 +4759,14 @@ class LocalInstallBackend:
                 or not Path(login_program).is_absolute()
             ):
                 raise InstallPlanError(f"invalid account step: {step!r}")
+            # Both tools resolve before the first mutation: a missing
+            # useradd must not leave a group behind.
+            groupadd = _account_tool("groupadd")
+            useradd = _account_tool("useradd")
             try:
                 existing_group = grp.getgrnam(name)
             except KeyError:
-                _run(("groupadd", "--gid", str(gid), "--system", name), check=True)
+                _run((groupadd, "--gid", str(gid), "--system", name), check=True)
             else:
                 if existing_group.gr_gid != gid:
                     raise InstallDriftError(
@@ -4713,7 +4774,7 @@ class LocalInstallBackend:
                     )
             _run(
                 (
-                    "useradd",
+                    useradd,
                     "--uid",
                     str(uid),
                     "--gid",

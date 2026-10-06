@@ -24,11 +24,13 @@ refs:
 - 主機提供 `/proc`（rollback 以 `/proc/self/fdinfo` 判定掛載點），且 `getfacl`／`setfacl` 可用。
 - system instance 沒有在飛 job；本流程會停止 `cortex-egress-proxy`、`cortex-manager`、`cortex-monitor` 三個 service。
 - sudoers 不得讓任何 cortex 帳號（overlay 宣告的四個 principal 與 `cortex-egress`）免認證以萬用指令 sudo，例如 `ALL ALL=(ALL) NOPASSWD: ALL`，或以帳號名稱、`#uid`、所屬群組、User_Alias 指到它的 `NOPASSWD: ALL`；apply preflight 以 `cortex_account_universal_nopasswd` 拒絕並列出帳號。operator 自己的 `NOPASSWD: ALL` 放行，apply 前不必移開。判定細節見 `trust-root-transactional-install.md` §3。
+- **sudoers 的前置檢查要以 sudo 唯讀執行**（#1282）：非 root 讀不到 `/etc/sudoers`，plan 通過不代表 sudoers 沒問題。§3 的 root capture 以與 apply preflight 相同的判定回報 `cortex_account_universal_nopasswd`（`accounts` 為空、`unproven` 為 `null` 才算通過）；不通過就先修 sudoers 再往下，不要等 apply 才被拒。
 
 ## 1. 保留原則
 
 - **不刪除、不覆寫任何 legacy 物件。** installer 未產生、會衝突或 plan 未宣告的物件一律 rename 進 quarantine；受管目錄只修改 inode 本身的 metadata。
-- **state 只接手必要子集**（owner 裁決）：plan 宣告受管的 state 目錄連同內容就地接手；state 根目錄下 plan 未宣告的頂層項目、受管目錄內未列管的子目錄與 `tmp*`／`*.rollback.bak` 殘留、job worktree pool、source repo、credential 類物件一律 quarantine。
+- **state 只接手必要子集**（owner 裁決）：plan 宣告受管的 state 目錄連同內容就地接手；state 根目錄下 plan 未宣告的頂層項目、受管目錄內未列管的子目錄與 `tmp*`／`*.rollback.bak` 殘留、job worktree pool、source repo、credential 類物件一律 quarantine。cortex 帳號 HOME 頂層 plan 未宣告的項目（shell history、`retry-*.json` 之類，disposition reason `home-top`）同樣自動 quarantine，不需要 operator 清單（#1282）。
+- **殘留的 UNIX socket 與 FIFO**（服務停了留下的 stale socket）跟一般檔案一樣 quarantine：頂層的以 type／owner／mode／inode 綁定；在被 quarantine 的目錄裡的，樹 digest 只記 type 與 mode（裝置節點另記裝置號），installer 從不開啟它們。rollback 照舊以 inode 搬回，inventory digest 回到原值。頂層的裝置節點不是 cortex state，plan 以 `unclassified` 拒絕。
 - **不 remap uid／gid**：帳號以 host overlay 宣告現有 id；uid／gid 被非 cortex 身分持有時 plan 失敗。release install config 不寫死號碼（#1286）：overlay 沒宣告的號碼，plan 會沿用主機上同名帳號的現有號碼（`existing`），一樣不 remap；adoption 仍建議以 overlay 明確宣告全部號碼（程式不強制），審核時對照 inventory 一眼看得出綁定的是哪一組號碼。
 - 既有檔案的 ACL 不遞迴重寫；安全性由 writable census 把關（各 job 帳號以 `access(2)` 判定可寫路徑）。
 
@@ -61,16 +63,39 @@ overlay 存成 root 擁有、operator 可讀、不可被其他帳號寫入的持
 
 ```bash
 /usr/bin/sudo /usr/bin/install -d -o root -g root -m 0755 /var/lib/cortex-installer/legacy
-cortex_root_cli install trust-root legacy inventory \
+cortex_capture_result=$(cortex_root_cli install trust-root legacy inventory \
   --config "$cortex_install_config" \
   --host-overlay /var/lib/cortex-installer/host-overlay.yaml \
   --bundle "$cortex_bundle" \
-  --output /var/lib/cortex-installer/legacy/capture.json
+  --output /var/lib/cortex-installer/legacy/capture.json)
+/usr/bin/printf '%s\n' "$cortex_capture_result"
+# 前置檢查（#1282）：上面這次 capture 以 sudo 唯讀執行，回報的 sudoers 判定與 plan
+# 預覽都必須乾淨才往下。
+/usr/bin/python3 -I -S - "$cortex_capture_result" <<'PY'
+import json
+import sys
+
+result = json.loads(sys.argv[1])
+sudoers = result["cortex_account_universal_nopasswd"]
+preview = result["plan_preview"]
+problems = []
+if sudoers["accounts"] or sudoers["unproven"] is not None:
+    problems.append(f"sudoers: {sudoers}")
+if result["census_stable"] is not True:
+    problems.append("census is unstable; recapture with the services stopped")
+for failure in preview["failures"]:
+    problems.append(f"plan preview: {failure}")
+if problems:
+    raise SystemExit("\n".join(problems))
+print(f"plan preview ready: {preview['quarantine']} quarantine roots, {preview['summary']}")
+PY
 ```
 
 - 已有 receipt、maintenance snapshot 或 lease marker 的主機會被拒絕（應改走 `--prior-receipt`）。
 - 輸出位置不得落在 roots、受管路徑或帳號 HOME 之下，也不得經過 symlink；既有檔案不會被覆寫。
 - 結果必須是 `census_stable: true`；`false` 表示擷取期間有物件被換成 symlink 或 inode 改變，找出原因後重新擷取。
+- `cortex_account_universal_nopasswd` 是 apply preflight 的同一個 sudoers 判定，由 root capture 讀 `/etc/sudoers` 得出：`accounts` 列出的 cortex 帳號要先從萬用免密碼規則移開；`unproven` 非 `null`（找不到 `visudo`／`cvtsudoers`、`visudo -c` 失敗等）也要先處理，否則 apply 會 fail closed。
+- `plan_preview` 以 plan 的同一套推導預覽這份 capture：`ready: true` 表示不加任何清單就能產生 plan；`failures` 逐條列出 plan 會拒絕的原因與處置（`unclassified` 物件：確認後移走或列入 `quarantine_paths`；census：確認後列入 `census_exceptions`）。overlay 已帶 `legacy_adoption` 區塊時，預覽沿用其中的清單與 `quarantine_root`。capture 本身照樣寫出，修正後重新擷取再看一次。
 - 以回報的 `inventory_sha256` 重新命名為 `/var/lib/cortex-installer/legacy/<inventory_sha256>.json`（root 0644，operator 可讀），作為之後 plan 與 apply 綁定的正本。
 
 審核：
@@ -79,7 +104,7 @@ cortex_root_cli install trust-root legacy inventory \
 "$cortex_cli" install trust-root legacy show --inventory /var/lib/cortex-installer/legacy/<inventory_sha256>.json
 ```
 
-逐項確認：帳號 row（uid／gid、群組成員、密碼鎖定）、各 principal 在宣告可寫資產以外的可寫路徑（census 例外）、state 頂層與受管目錄內的未列管項目、credential 類物件（只有 metadata，不含內容）。
+逐項確認：帳號 row（uid／gid、群組成員、密碼鎖定）、各 principal 在宣告可寫資產以外的可寫路徑（落在會被 quarantine 的物件內的已自動涵蓋，其餘需要 census 例外）、state 頂層、HOME 頂層與受管目錄內的未列管項目（含 socket／FIFO）、credential 類物件（只有 metadata，不含內容）。
 
 ## 4. 產生 legacy plan
 
@@ -89,9 +114,9 @@ cortex_root_cli install trust-root legacy inventory \
 legacy_adoption:
   inventory_sha256: <inventory_sha256>
   quarantine_root: /var/lib/cortex-installer/legacy-quarantine
-  census_exceptions:          # operator 明示接受、plan 未列管的 job 可寫目錄（可省略）
+  census_exceptions:          # operator 明示接受、plan 未列管且不會被 quarantine 的 job 可寫目錄（可省略）
     - {path: <路徑>, principal: <cortex 帳號>}
-  quarantine_paths: []        # operator 額外指定 quarantine 的物件（可省略）
+  quarantine_paths: []        # operator 額外指定 quarantine 的物件，例如 plan_preview 仍列為 unclassified 者（可省略）
 ```
 
 ```bash
@@ -105,13 +130,13 @@ env -i HOME="$cortex_plan_home" PATH="$cortex_bootstrap_root/venv/bin:/usr/bin:/
   --output "$cortex_plan_path" >"$cortex_plan_result"
 ```
 
-plan 會為每個物件推導 disposition（adopt／adopt-in-place／quarantine-then-create／quarantine／失敗）；出現 `unclassified`、census `unstable`、未宣告的可寫路徑、帳號不符或 uid／gid 被外部身分持有時，一次列出全部原因並失敗。
+plan 會為每個物件推導 disposition（adopt／adopt-in-place／quarantine-then-create／quarantine／失敗）；出現 `unclassified`、census `unstable`、未宣告的可寫路徑、帳號不符或 uid／gid 被外部身分持有時，一次列出全部原因並失敗。這些原因在 §3 的 `plan_preview` 已先列出。census 的可寫路徑若落在本 plan 會 quarantine 的物件內（例如 `managed-subdir` 的 review sandbox），plan 與 apply gate 都視為已涵蓋，不需要 `census_exceptions`（#1282）。
 
 之後依 `trust-root-transactional-install.md` §2 做**三方 plan SHA 確認**並把 plan durable 發布。人工審核除了該節列的項目，另外確認 `legacy_adoption` 區塊的 quarantine 清單與 adopted 清單。
 
 ## 5. 停止服務並 apply
 
-依 `trust-root-transactional-install.md` §3 取得 maintenance lease、停止三個 service；apply 改帶 `--legacy-inventory`（與 `--prior-receipt` 互斥）：
+依 `trust-root-transactional-install.md` §3 取得 maintenance lease、停止三個 service（服務在 lease 前就已停止也可以：`previously_active` 為空，trap 不會 start 任何 unit）；apply 改帶 `--legacy-inventory`（與 `--prior-receipt` 互斥）：
 
 ```bash
 cortex_root_cli install trust-root apply \

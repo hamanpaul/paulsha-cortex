@@ -57,11 +57,13 @@ root 擷取 inventory（唯讀，service 可繼續運轉）並以 no-overwrite �
 | source repository | `quarantine-then-clone` |
 | job worktree pool | `quarantine-then-create` |
 | state 根目錄下 plan 未宣告的頂層項目 | `quarantine` |
+| cortex 帳號 HOME 頂層 plan 未宣告的項目（#1282） | `quarantine`（reason `home-top`） |
+| 上述位置的殘留 UNIX socket／FIFO（#1282） | `quarantine`，以 type／owner／mode／inode 綁定，從不開啟 |
 | 受管目錄內未列管的子目錄、`tmp*.tmp`、`*.rollback.bak` 等殘留 | `quarantine` |
 | installer 未產生的權威面物件（unit drop-in、`.env.bak-*` 等 verify 會判 FAIL 的類別） | `quarantine` |
 | credential 類物件 | `quarantine`，再依 plan 的 `required_credentials` 重新匯入 |
 | deploy root 內非權威的舊備份（venv 備份、operator-backups、`toolchain/lib/*`） | `quarantine` |
-| census 中 job 帳號可寫、但不在宣告資產或 `census_exceptions` 的路徑 | plan 失敗 |
+| census 中 job 帳號可寫、但不在宣告資產、本 plan quarantine 的物件內（#1282）或 `census_exceptions` 的路徑 | plan 失敗 |
 | 其他 | `unclassified` → plan 失敗 |
 
 「必要子集」依 owner 裁決：只有 plan 宣告受管的 state 目錄連同內容就地接手（coordinator、monitor、control、registry、config、run、runtime 下的受管路徑）；其餘一律移入 quarantine。舊 run 若引用被 quarantine 的 worktree 或 manifest，接手後由 operator 以 abandon／retire 收尾。

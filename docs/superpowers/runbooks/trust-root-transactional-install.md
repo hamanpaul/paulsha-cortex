@@ -363,6 +363,11 @@ test -x "$cortex_cli"
 一次；兩次 digest 不同就停止。digest 只涵蓋 relative path、mode 與 file content，且遇到
 symlink、非 root owner、group/other writable 或特殊檔案立即失敗。
 
+`cortex_root_cli` 給 root installer 的 PATH 與 `cortex upgrade` 相同，含 `/usr/sbin`、`/sbin`
+（Ubuntu 的 `useradd`、`groupadd`、`visudo` 在 `/usr/sbin`，#1282）。installer 本身也只從固定
+系統目錄（依序 `/usr/sbin`、`/usr/bin`、`/sbin`、`/bin`）解析這些工具、不看 PATH，PATH 缺 sbin
+不會再讓 apply 失敗；PATH 只影響 installer 以外的指令。
+
 ```bash
 cortex_cli_tree_sha() {
   /usr/bin/sudo /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
@@ -396,7 +401,7 @@ cortex_sealed_cli_tree_sha=$(cortex_cli_tree_sha)
 cortex_root_cli() {
   test "$(cortex_cli_tree_sha)" = "$cortex_sealed_cli_tree_sha"
   /usr/bin/sudo /usr/bin/env -i HOME=/root \
-    PATH="$cortex_bootstrap_root/venv/bin:/usr/bin:/bin" \
+    PATH="$cortex_bootstrap_root/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 \
     "$cortex_cli" "$@"
 }
@@ -775,14 +780,17 @@ PY
     cortex_release_maintenance_lease || true
     return 1
   fi
+  # One line per name and nothing for an empty list: `print(*[], sep=...)`
+  # still prints a newline, which mapfile reads as one empty service name
+  # (#1282 -- services stopped before the lease made restore start "").
   mapfile -t cortex_present_services < <(
     /usr/bin/python3 -I -S -c \
-      'import json,sys; print(*json.loads(sys.argv[1])["present_services"], sep="\n")' \
+      'import json,sys; sys.stdout.write("".join(n + "\n" for n in json.loads(sys.argv[1])["present_services"]))' \
       "$cortex_maintenance_result"
   )
   mapfile -t cortex_previously_active < <(
     /usr/bin/python3 -I -S -c \
-      'import json,sys; print(*json.loads(sys.argv[1])["previously_active"], sep="\n")' \
+      'import json,sys; sys.stdout.write("".join(n + "\n" for n in json.loads(sys.argv[1])["previously_active"]))' \
       "$cortex_maintenance_result"
   )
 }
@@ -832,7 +840,7 @@ test "$(cortex_cli_tree_sha)" = "$cortex_sealed_cli_tree_sha"
 
 cortex_apply_attempted=1
 /usr/bin/sudo /usr/bin/env -i HOME=/root \
-  PATH="$cortex_bootstrap_root/venv/bin:/usr/bin:/bin" \
+  PATH="$cortex_bootstrap_root/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 \
   "$cortex_cli" install trust-root apply \
     --plan "$cortex_plan_path" \
@@ -852,7 +860,10 @@ window 內會 fail closed。trap 不依賴 apply child 返回後才更新的 she
 誤當本次 transaction 回滾。lease 的 root-owned plan/token marker 只在 helper 正常結束時
 清除；若 coproc 先死亡，marker 仍擋住所有新 lease 與 tokenless mutation，原 token 可繼續
 rollback。只有 rollback 回報 `restore_safe=true` 才恢復原本 active 的 units；restore 後才以
-exact token 清除可能殘留的 marker。
+exact token 清除可能殘留的 marker。取得 lease 前服務就已停止時，`previously_active` 是空
+陣列（每個名稱一行、空清單不輸出任何行），restore 不 start 任何 unit 而直接成功，trap
+照常清除 snapshot／marker（#1282：舊寫法把空清單讀成一個空字串，`systemctl start ""` 失敗
+後保留 snapshot，只能走 recover）。
 
 ### 升級時 repository step 如何接手跑過 job 的來源樹（#1124）
 

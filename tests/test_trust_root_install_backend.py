@@ -316,10 +316,10 @@ def test_account_step_creates_exact_group_and_user_through_typed_argv(
     def run(argv, **_kwargs):
         command = tuple(argv)
         calls.append(command)
-        if command[0] == "groupadd":
+        if command[0] == str(sbin / "groupadd"):
             name = command[-1]
             groups[name] = SimpleNamespace(gr_gid=int(command[2]))
-        elif command[0] == "useradd":
+        elif command[0] == str(sbin / "useradd"):
             name = command[-1]
             users[name] = SimpleNamespace(
                 pw_uid=int(command[2]),
@@ -329,6 +329,17 @@ def test_account_step_creates_exact_group_and_user_through_typed_argv(
             )
         return _completed(command)
 
+    # #1282: useradd/groupadd live in /usr/sbin on Debian/Ubuntu and the
+    # runbook's root PATH has no sbin; they resolve from the fixed system
+    # directory list, never from PATH.
+    sbin = tmp_path / "usr-sbin"
+    _fake_account_tools(sbin)
+    monkeypatch.setattr(
+        backend_module,
+        "_SUDOERS_TOOL_DIRECTORIES",
+        (str(sbin), str(tmp_path / "usr-bin-missing")),
+    )
+    monkeypatch.setenv("PATH", str(tmp_path / "path-without-sbin"))
     monkeypatch.setattr(backend_module.pwd, "getpwnam", get_user)
     monkeypatch.setattr(backend_module.grp, "getgrnam", get_group)
     monkeypatch.setattr(backend_module, "_run", run)
@@ -350,9 +361,9 @@ def test_account_step_creates_exact_group_and_user_through_typed_argv(
 
     assert result["installed_sha256"] == step["desired_sha256"]
     assert calls == [
-        ("groupadd", "--gid", "993", "--system", "cortex-builder"),
+        (str(sbin / "groupadd"), "--gid", "993", "--system", "cortex-builder"),
         (
-            "useradd",
+            str(sbin / "useradd"),
             "--uid",
             "993",
             "--gid",
@@ -366,6 +377,144 @@ def test_account_step_creates_exact_group_and_user_through_typed_argv(
             "cortex-builder",
         ),
     ]
+
+
+def _fake_account_tools(directory: Path, names=("groupadd", "useradd")) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        tool = directory / name
+        tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        tool.chmod(0o755)
+
+
+@pytest.mark.parametrize("missing", ["groupadd", "useradd"])
+def test_account_step_fails_closed_before_any_mutation_without_its_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    sbin = tmp_path / "usr-sbin"
+    _fake_account_tools(sbin, names=tuple({"groupadd", "useradd"} - {missing}))
+    on_path = tmp_path / "path-tools"
+    _fake_account_tools(on_path)
+    monkeypatch.setattr(backend_module, "_SUDOERS_TOOL_DIRECTORIES", (str(sbin),))
+    monkeypatch.setenv("PATH", str(on_path))
+    monkeypatch.setattr(
+        backend_module.pwd, "getpwnam", lambda name: (_ for _ in ()).throw(KeyError(name))
+    )
+    monkeypatch.setattr(
+        backend_module.grp, "getgrnam", lambda name: (_ for _ in ()).throw(KeyError(name))
+    )
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        backend_module, "_run", lambda argv, **_kwargs: calls.append(tuple(argv))
+    )
+    identity = {
+        "name": "cortex-builder",
+        "uid": 993,
+        "gid": 993,
+        "home": str(tmp_path / "var/lib/cortex-builder"),
+        "login_program": "/usr/sbin/nologin",
+    }
+    step = {
+        "step_id": "account:cortex-builder",
+        "kind": "account",
+        **identity,
+        "desired_sha256": _account_digest(identity),
+    }
+
+    with pytest.raises(backend_module.InstallError, match=missing):
+        LocalInstallBackend(require_root=False).apply_step(step)
+
+    # Neither the tool on PATH nor a half-created group: nothing ran.
+    assert calls == []
+
+
+def _tree_digest(tree: Path):
+    parent = os.open(tree.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return backend_module._tree_digest_at(parent, tree.name)
+    finally:
+        os.close(parent)
+
+
+def test_file_type_names_tell_special_files_apart() -> None:
+    names = {
+        stat.S_IFREG: "file",
+        stat.S_IFDIR: "directory",
+        stat.S_IFLNK: "symlink",
+        stat.S_IFSOCK: "socket",
+        stat.S_IFIFO: "fifo",
+        stat.S_IFBLK: "block-device",
+        stat.S_IFCHR: "char-device",
+    }
+    for kind, name in names.items():
+        assert backend_module._file_type_name(kind | 0o600) == name
+
+
+def test_tree_digest_records_special_members_by_type_and_mode(tmp_path: Path) -> None:
+    # #1282: a legacy tree with a stale socket or FIFO is digested by the
+    # member's type and mode (never opened); a device node also by its
+    # device number.  A regular tree keeps the venv digest.
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "data").write_text("payload\n")
+    plain, _manifest = _tree_digest(tree)
+    assert plain == backend_module._tree_sha256(tree)
+
+    os.mknod(tree / "agent.sock", 0o600 | stat.S_IFSOCK)
+    os.mkfifo(tree / "events.fifo", 0o600)
+    digest, manifest = _tree_digest(tree)
+    assert manifest["agent.sock"][2] == "socket"
+    assert manifest["events.fifo"][2] == "fifo"
+    assert digest != plain
+    assert _tree_digest(tree)[0] == digest
+
+    # Same name and mode, other type: another digest.
+    (tree / "events.fifo").unlink()
+    os.mknod(tree / "events.fifo", 0o600 | stat.S_IFSOCK)
+    assert _tree_digest(tree)[0] != digest
+
+    # The verified removal unlinks special members as the manifest proves.
+    swapped, manifest = _tree_digest(tree)
+    parent = os.open(tree.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        backend_module._remove_verified_tree(parent, tree.name, manifest)
+    finally:
+        os.close(parent)
+    assert not tree.exists()
+
+
+def test_tree_digest_records_a_device_node_without_opening_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    node = tree / "tty-legacy"
+    node.write_text("never read\n")
+    inode = node.lstat().st_ino
+    real_stat = os.stat
+
+    def as_device(*args, **kwargs):
+        result = real_stat(*args, **kwargs)
+        if result.st_ino != inode:
+            return result
+        values = list(result[:10])
+        values[0] = stat.S_IFCHR | 0o600
+        extra = {
+            name: getattr(result, name)
+            for name in ("st_atime_ns", "st_mtime_ns", "st_ctime_ns")
+        }
+        extra["st_rdev"] = os.makedev(4, 64)
+        return os.stat_result(values, extra)
+
+    monkeypatch.setattr(os, "stat", as_device)
+    monkeypatch.setattr(
+        backend_module, "_sha256_at", lambda *_a, **_k: pytest.fail("device node was opened")
+    )
+
+    digest, manifest = _tree_digest(tree)
+
+    assert manifest["tty-legacy"][2] == "char-device"
+    assert digest == _tree_digest(tree)[0]
 
 
 def test_account_state_distinguishes_exact_orphan_group(

@@ -45,7 +45,7 @@ The installer MUST treat `legacy_policy: reject` exactly as today: any existing 
 
 ### Requirement: plan MUST derive a deterministic disposition for every inventoried object
 
-With `--legacy-inventory`, planning MUST verify the inventory schema, self digest, scope and host binding, then derive exactly one disposition per object: `adopt`, `adopt-in-place`, `quarantine-then-create`, `quarantine`, or planning failure. Any object that no rule classifies MUST fail planning as `unclassified`. State adoption MUST be limited to the necessary subset: plan-managed state directories and their existing contents are adopted in place; state-root entries not declared by the plan, unmanaged subdirectories and leftover temporary files inside managed directories, job worktree pools, the source repository and credential-class objects MUST be quarantined. Existing file ACLs inside adopted directories MUST NOT be rewritten recursively.
+With `--legacy-inventory`, planning MUST verify the inventory schema, self digest, scope and host binding, then derive exactly one disposition per object: `adopt`, `adopt-in-place`, `quarantine-then-create`, `quarantine`, or planning failure. Any object that no rule classifies MUST fail planning as `unclassified`. State adoption MUST be limited to the necessary subset: plan-managed state directories and their existing contents are adopted in place; state-root entries and top-level entries of a cortex account HOME not declared by the plan, unmanaged subdirectories and leftover temporary files inside managed directories, job worktree pools, the source repository and credential-class objects MUST be quarantined. Stale UNIX sockets and FIFOs MUST be quarantined like files, bound by type, owner, mode and inode and never opened. Existing file ACLs inside adopted directories MUST NOT be rewritten recursively.
 
 #### Scenario: unmanaged state entry
 
@@ -79,7 +79,7 @@ A `legacy-quarantine` step MUST verify the source against the inventoried type, 
 
 ### Requirement: apply MUST re-capture the inventory and fail closed on drift
 
-`apply --legacy-inventory` MUST be mutually exclusive with `--prior-receipt` and MUST be required when the plan carries a `legacy_adoption` block. After services are stopped and before the receipt leaves the planned state, apply MUST re-capture the inventory; the stable-field digest, host binding and scope MUST equal the plan. The writable census MUST show no job-account writable path outside plan-declared writable assets and the plan's census exceptions. In-flight jobs, active cortex services or template instances MUST fail closed.
+`apply --legacy-inventory` MUST be mutually exclusive with `--prior-receipt` and MUST be required when the plan carries a `legacy_adoption` block. After services are stopped and before the receipt leaves the planned state, apply MUST re-capture the inventory; the stable-field digest, host binding and scope MUST equal the plan. The writable census MUST show no job-account writable path outside plan-declared writable assets, objects the plan quarantines, and the plan's census exceptions. In-flight jobs, active cortex services or template instances MUST fail closed.
 
 #### Scenario: object changed between plan and apply
 
@@ -88,7 +88,7 @@ A `legacy-quarantine` step MUST verify the source against the inventoried type, 
 
 #### Scenario: new writable path
 
-- **WHEN** a job account can write a path that is neither a declared writable asset nor a census exception
+- **WHEN** a job account can write a path that is neither a declared writable asset, inside an object the plan quarantines, nor a census exception
 - **THEN** apply fails before the first mutation and names the principal and path
 
 ### Requirement: receipts MUST record legacy provenance distinguishably

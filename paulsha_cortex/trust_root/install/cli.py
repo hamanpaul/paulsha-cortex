@@ -31,6 +31,7 @@ from .legacy import (
     host_binding_sha256,
     legacy_adoption_request,
     legacy_scope,
+    preview_legacy_adoption,
     publish_inventory,
     render_inventory_summary,
     validate_host_overlay,
@@ -1487,9 +1488,10 @@ def _legacy_inventory_command(args: argparse.Namespace) -> int:
         raise InstallError(
             f"legacy inventory output already exists; refusing to overwrite: {output}"
         )
+    backend = LocalLegacyHostBackend()
     with _legacy_inventory_admission(plan):
         document = collect_legacy_inventory(
-            plan=plan, backend=LocalLegacyHostBackend(), host_overlay=overlay
+            plan=plan, backend=backend, host_overlay=overlay
         )
         publish_inventory(output, document)
     host = document["host"]
@@ -1505,6 +1507,28 @@ def _legacy_inventory_command(args: argparse.Namespace) -> int:
             "changed while they were checked); any adoption plan or apply gate must "
             "refuse this inventory -- rerun the capture with the services stopped\n"
         )
+    # S2 review (#1282): what the plan will refuse, and the sudoers preflight a
+    # non-root review cannot read, surface here instead of at plan or apply.
+    preview = preview_legacy_adoption(plan, overlay=overlay, document=document)
+    sudoers = backend.sudoers_verdict(plan)
+    if not preview["ready"]:
+        sys.stderr.write(
+            "trust-root legacy inventory: a plan bound to this capture would refuse it:\n"
+            + "".join(f"  - {failure}\n" for failure in preview["failures"])  # type: ignore[union-attr]
+        )
+    if sudoers.get("accounts"):
+        sys.stderr.write(
+            "trust-root legacy inventory: cortex account(s) "
+            f"{', '.join(sudoers['accounts'])} have universal NOPASSWD sudo; apply "  # type: ignore[arg-type]
+            "preflight refuses them (cortex_account_universal_nopasswd) -- fix "
+            "/etc/sudoers before apply\n"
+        )
+    if sudoers.get("unproven"):
+        sys.stderr.write(
+            "trust-root legacy inventory: sudoers cannot be proven free of universal "
+            f"NOPASSWD for cortex accounts ({sudoers['unproven']}); apply preflight "
+            "fails closed until it can\n"
+        )
     _emit(
         {
             "output": str(output),
@@ -1512,6 +1536,11 @@ def _legacy_inventory_command(args: argparse.Namespace) -> int:
             "scope_sha256": document["scope_sha256"],
             "host_binding_sha256": host["binding_sha256"],
             "census_stable": census_stable,
+            "plan_preview": preview,
+            "cortex_account_universal_nopasswd": {
+                "accounts": list(sudoers.get("accounts") or []),
+                "unproven": sudoers.get("unproven"),
+            },
         }
     )
     return 0

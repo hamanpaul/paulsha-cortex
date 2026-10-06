@@ -3558,7 +3558,8 @@ def _valid_quarantine_identity(value: object) -> bool:
         and value["device"] >= 0  # type: ignore[operator]
         and type(value.get("inode")) is int
         and value["inode"] > 0  # type: ignore[operator]
-        and value.get("type") in {"directory", "file", "symlink"}
+        # A stale socket or FIFO is quarantined too, bound by inode (#1282).
+        and value.get("type") in {"directory", "file", "symlink", "socket", "fifo"}
         and _valid_sha256(value.get("tree_sha256"))
     )
 

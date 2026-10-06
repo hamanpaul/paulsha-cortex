@@ -477,9 +477,17 @@ class FakeLegacyHost(legacy.LocalLegacyHostBackend):
         self.census_calls: list[tuple[legacy.CensusIdentity, list[str]]] = []
         self.machine = MACHINE_ID
         self.host_name = "legacy-host"
+        self.sudoers: dict[str, object] = {"accounts": [], "unproven": None}
+        self.sudoers_calls: list[list[str]] = []
 
     def machine_id(self) -> str:
         return self.machine
+
+    def sudoers_verdict(self, plan):
+        self.sudoers_calls.append(
+            [row["name"] for key in ("accounts", "service_accounts") for row in plan[key]]
+        )
+        return dict(self.sudoers)
 
     def hostname(self) -> str:
         return self.host_name
@@ -1386,6 +1394,77 @@ def _cli_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overlay: dict | 
         str(output_dir / "inventory.json"),
     ]
     return plan, backend, seeded, argv, output_dir / "inventory.json", constructed
+
+
+def test_legacy_inventory_cli_previews_the_plan_and_the_sudoers_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # #1282: the root capture is where S2 review starts; it reports what a
+    # plan would refuse and the sudoers preflight non-root review cannot read.
+    plan, backend, _seeded, argv, output, _constructed = _cli_setup(tmp_path, monkeypatch)
+
+    assert install_cli.main(argv) == 0
+
+    captured = capsys.readouterr()
+    emitted = json.loads(captured.out)
+    assert emitted["plan_preview"]["ready"] is True
+    assert emitted["plan_preview"]["failures"] == []
+    assert emitted["plan_preview"]["quarantine"] > 0
+    assert emitted["cortex_account_universal_nopasswd"] == {"accounts": [], "unproven": None}
+    assert backend.sudoers_calls == [
+        [row["name"] for key in ("accounts", "service_accounts") for row in plan[key]]
+    ]
+    assert "would refuse" not in captured.err
+    assert "NOPASSWD" not in captured.err
+    assert output.is_file()
+
+
+def test_legacy_inventory_cli_names_plan_refusals_and_sudoers_findings_early(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan, backend, _seeded, argv, output, _constructed = _cli_setup(tmp_path, monkeypatch)
+    (Path(plan["roots"]["deploy"]) / "mystery.txt").write_text("?\n", encoding="utf-8")
+    backend.sudoers = {"accounts": ["cortex-builder"], "unproven": None}
+
+    # The capture itself still succeeds: it is read-only and complete.
+    assert install_cli.main(argv) == 0
+
+    captured = capsys.readouterr()
+    emitted = json.loads(captured.out)
+    assert output.is_file()
+    assert emitted["plan_preview"]["ready"] is False
+    assert any("mystery.txt" in failure for failure in emitted["plan_preview"]["failures"])
+    assert emitted["cortex_account_universal_nopasswd"]["accounts"] == ["cortex-builder"]
+    assert "would refuse" in captured.err and "mystery.txt" in captured.err
+    assert "cortex-builder" in captured.err and "NOPASSWD" in captured.err
+
+    backend.sudoers = {"accounts": [], "unproven": "visudo not found in /usr/sbin"}
+    output.unlink()
+    assert install_cli.main(argv) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["cortex_account_universal_nopasswd"]["unproven"]
+    assert "visudo not found" in captured.err
+
+
+def test_local_backend_sudoers_verdict_covers_every_plan_declared_cortex_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _overlay, _backend, _seeded = _legacy_setup(tmp_path)
+    seen: dict[str, object] = {}
+
+    def verdict(accounts, *, passwd_records, group_records):
+        seen["accounts"] = [row["name"] for row in accounts]
+        seen["records"] = (len(passwd_records) > 0, len(group_records) > 0)
+        return {"accounts": [], "unproven": None}
+
+    monkeypatch.setattr(legacy, "_cortex_account_universal_nopasswd", verdict)
+
+    host = legacy.LocalLegacyHostBackend(require_root=False)
+    assert host.sudoers_verdict(plan) == {"accounts": [], "unproven": None}
+    assert seen["accounts"] == [
+        row["name"] for key in ("accounts", "service_accounts") for row in plan[key]
+    ]
+    assert seen["records"] == (True, True)
 
 
 def test_legacy_inventory_cli_requires_root(
