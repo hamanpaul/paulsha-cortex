@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable, TypeVar
 
 from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install import core as install_core
@@ -30,6 +32,35 @@ PRIOR_WHEEL = "1" * 64
 PRIOR_COMMIT = "b" * 40
 NEW_WHEEL = "2" * 64
 NEW_COMMIT = "a" * 40
+
+_T = TypeVar("_T")
+
+
+def call_without_blocking_on(fifo: Path, call: Callable[[], _T], *, seconds: float = 3.0) -> _T:
+    """Run ``call``; fail (instead of hanging) if it blocks opening ``fifo`` for reading.
+
+    A reader blocked in ``open(fifo, O_RDONLY)`` is released by a non-blocking
+    writer open and close, so the watchdog never leaves a stuck thread behind.
+    """
+
+    outcome: dict[str, object] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller's thread
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        thread.join(seconds)
+        raise AssertionError(f"blocked opening a FIFO for reading: {fifo.name}")
+    if "error" in outcome:
+        raise outcome["error"]  # type: ignore[misc]
+    return outcome["value"]  # type: ignore[return-value]
 
 
 def plan_document(

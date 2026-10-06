@@ -17,16 +17,27 @@ import stat
 import tarfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, Callable, Protocol
+from typing import BinaryIO, Callable, Protocol, Sequence
 
 from .backend import _run
 from .core import InstallError
 
 OFFICIAL_REPOSITORY = "hamanpaul/paulsha-cortex"
 GITHUB_API_ROOT = "https://api.github.com"
+# Hosts each channel may be served from, over HTTPS on the default port only.
+# REST metadata stays on the API host (a renamed repository redirects within
+# it).  A release asset URL is github.com, which answers one 302 to
+# release-assets.githubusercontent.com (checked 2026-10-06);
+# objects.githubusercontent.com is the host it used before.  Redirects are
+# refused before they are followed (#1270).
+GITHUB_METADATA_HOSTS = frozenset({"api.github.com"})
+GITHUB_ASSET_HOSTS = frozenset(
+    {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+)
 _VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 _WHEEL_FILENAME = re.compile(r"paulsha_cortex-(?P<version>[^-]+)-py3-none-any\.whl")
 _SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -120,6 +131,61 @@ def _copy_limited(source: BinaryIO, destination: BinaryIO, asset: ReleaseAsset) 
         raise IngressError(f"release asset is shorter than its metadata: {asset.name}")
 
 
+def _https_on(url: object, hosts: frozenset[str]) -> bool:
+    """``url`` is HTTPS on one of ``hosts``, default port, no userinfo."""
+
+    if not isinstance(url, str):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "https"
+        and parts.hostname in hosts
+        and parts.username is None
+        and parts.password is None
+        and port in (None, 443)
+    )
+
+
+def _origin(url: object) -> str:
+    """Scheme and host only: a signed asset URL's query string never reaches a message."""
+
+    try:
+        parts = urllib.parse.urlsplit(str(url))
+        return f"{parts.scheme}://{parts.hostname or ''}"
+    except ValueError:
+        return "<unparseable URL>"
+
+
+class _GitHubRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only to HTTPS on ``hosts``; refuse it before connecting."""
+
+    def __init__(self, hosts: frozenset[str]) -> None:
+        super().__init__()
+        self._hosts = hosts
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        if not _https_on(newurl, self._hosts):
+            try:
+                fp.close()
+            except Exception:  # noqa: BLE001 - the refusal below is what matters
+                pass
+            raise IngressError(
+                "GitHub redirected outside "
+                f"https://{{{', '.join(sorted(self._hosts))}}}: {_origin(newurl)}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _github_opener(
+    hosts: frozenset[str], transport: Sequence[urllib.request.BaseHandler] = ()
+) -> Callable[..., object]:
+    return urllib.request.build_opener(_GitHubRedirectHandler(hosts), *transport).open
+
+
 def _decode_metadata(raw: bytes, api_path: str) -> object:
     if len(raw) > _MAX_METADATA_BYTES:
         raise IngressError(f"GitHub REST metadata is too large: {api_path}")
@@ -130,17 +196,26 @@ def _decode_metadata(raw: bytes, api_path: str) -> object:
 
 
 class GitHubReleaseFetcher:
-    """Public GitHub REST over HTTPS; no token is ever sent."""
+    """Public GitHub REST over HTTPS; no token is ever sent.
+
+    Each channel has its own urllib opener whose redirect handler follows only
+    HTTPS redirects to that channel's GitHub hosts, and the final URL of every
+    response is checked again.  ``urlopen`` replaces both openers outright
+    (tests); ``transport`` adds urllib handlers to the real openers (tests swap
+    HTTPS for an in-memory transport and keep the redirect handling real).
+    """
 
     def __init__(
         self,
         repository: str = OFFICIAL_REPOSITORY,
         *,
-        urlopen: Callable[..., object] = urllib.request.urlopen,
+        urlopen: Callable[..., object] | None = None,
         timeout: float = 60.0,
+        transport: Sequence[urllib.request.BaseHandler] = (),
     ) -> None:
         self._repository = repository
-        self._urlopen = urlopen
+        self._metadata_open = urlopen or _github_opener(GITHUB_METADATA_HOSTS, transport)
+        self._asset_open = urlopen or _github_opener(GITHUB_ASSET_HOSTS, transport)
         self._timeout = timeout
 
     def get_json(self, api_path: str) -> object:
@@ -153,7 +228,11 @@ class GitHubReleaseFetcher:
             },
         )
         try:
-            with self._urlopen(request, timeout=self._timeout) as response:  # type: ignore[attr-defined]
+            with self._metadata_open(request, timeout=self._timeout) as response:  # type: ignore[attr-defined]
+                if not _https_on(response.geturl(), GITHUB_METADATA_HOSTS):
+                    raise IngressError(
+                        f"GitHub REST response left HTTPS on {GITHUB_API_ROOT}: {api_path}"
+                    )
                 raw = response.read(_MAX_METADATA_BYTES + 1)
         except (urllib.error.URLError, OSError) as exc:
             raise IngressError(f"GitHub REST request failed: {api_path}: {exc}") from exc
@@ -173,9 +252,12 @@ class GitHubReleaseFetcher:
             },
         )
         try:
-            with self._urlopen(request, timeout=self._timeout) as response:  # type: ignore[attr-defined]
-                if not str(response.geturl()).startswith("https://"):
-                    raise IngressError(f"release asset download left HTTPS: {asset.name}")
+            with self._asset_open(request, timeout=self._timeout) as response:  # type: ignore[attr-defined]
+                if not _https_on(response.geturl(), GITHUB_ASSET_HOSTS):
+                    raise IngressError(
+                        "release asset download left HTTPS on the GitHub release hosts: "
+                        f"{asset.name}"
+                    )
                 _copy_limited(response, destination, asset)
         except (urllib.error.URLError, OSError) as exc:
             raise IngressError(f"release asset download failed: {asset.name}: {exc}") from exc
@@ -314,8 +396,14 @@ def download_asset(fetcher: ReleaseFetcher, asset: ReleaseAsset, release_dir: Pa
 
 
 def assert_private_chain(path: Path, *, owner_uid: int, stop: Path = Path("/")) -> None:
-    """Every directory from ``path`` up to ``stop`` is owner-owned, unwritable by others."""
+    """Every directory from ``path`` up to ``stop`` is owner-owned, unwritable by others.
 
+    ``path`` must be absolute without ``..``: a relative walk would end at "."
+    without checking the real ancestors (#1270).
+    """
+
+    if not path.is_absolute() or ".." in path.parts:
+        raise IngressError(f"release ingress path must be absolute without '..': {path}")
     cursor = path
     while True:
         observed = cursor.lstat()
@@ -432,11 +520,31 @@ def read_qualification_authority(path: Path) -> QualificationAuthority:
     return QualificationAuthority(candidate_sha, filename, wheel_sha, bundle_sha)
 
 
+# Generous bounds on the install-input archive (#1270).  The REST digest already
+# pins the archive; these only bound a polluted release before extraction.
+# v0.1.13's archive has 18 members and about 0.9 GB of file content.
+_MAX_ARCHIVE_MEMBERS = 10_000
+_MAX_ARCHIVE_BYTES = 8 * 1024**3
+
+
 def check_archive_topology(path: Path) -> None:
     try:
         with tarfile.open(path, mode="r:gz") as archive:
             seen: set[str] = set()
-            for member in archive.getmembers():
+            total = 0
+            for member in archive:
+                if len(seen) >= _MAX_ARCHIVE_MEMBERS:
+                    raise IngressError(
+                        "install-input archive has too many members "
+                        f"(limit {_MAX_ARCHIVE_MEMBERS})"
+                    )
+                if member.isfile():
+                    total += member.size
+                    if total > _MAX_ARCHIVE_BYTES:
+                        raise IngressError(
+                            "install-input archive exceeds the extracted size limit "
+                            f"({_MAX_ARCHIVE_BYTES} bytes)"
+                        )
                 pure = PurePosixPath(member.name)
                 if (
                     pure.is_absolute()

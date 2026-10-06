@@ -23,6 +23,7 @@ import re
 import secrets
 import signal
 import stat
+import subprocess
 import sys
 import time
 from argparse import Namespace
@@ -30,7 +31,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, TimeoutExpired
 from typing import Iterator, Mapping
 
 from . import cli as install_cli
@@ -66,6 +67,8 @@ _CHAIN_STOP = Path("/")
 _IDLE_POLL_SECONDS = 5.0
 _STATUS_SETTLE_SECONDS = 60.0
 _STATUS_POLL_SECONDS = 2.0
+# One `cortex service status` call; a hung probe counts as unavailable (#1270).
+_STATUS_TIMEOUT_SECONDS = 60.0
 _JOB_ACCOUNTS = JOB_ACCOUNT_NAMES
 _sleep = time.sleep
 _monotonic = time.monotonic
@@ -261,8 +264,9 @@ def _service_status(plan: Mapping[str, object], receipt_path: Path) -> object:
                 str(receipt_path),
             ),
             env=env,
+            timeout=_STATUS_TIMEOUT_SECONDS,
         )
-    except (InstallError, OSError) as exc:
+    except (InstallError, OSError, TimeoutExpired) as exc:
         return _StatusUnavailable(f"{type(exc).__name__}: {exc}")
     if result.returncode != 0:
         return _StatusUnavailable(f"exit {result.returncode}: {_output_tail(result)}")
@@ -396,7 +400,15 @@ def preflight(options: UpgradeOptions) -> Preflight:
 _HOST_OVERLAY_NAME = "host-overlay.yaml"
 _PLAN_ENV = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1"}
 _MAX_PLAN_BYTES = 64 * 1024 * 1024
-_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+# O_NONBLOCK: the plan account owns the plan output directory and could swap
+# the file for a FIFO; open() must not block root (#1270).  Every reader checks
+# the type with fstat before reading; regular files ignore the flag.
+_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 _CREATE_FLAGS = (
     os.O_WRONLY
     | os.O_CREAT
@@ -535,8 +547,11 @@ def publish_durable_plan(payload: bytes, expected_sha256: str, *, plans_root: Pa
             try:
                 observed = os.fstat(existing_fd)
                 existing = b""
-                while chunk := os.read(existing_fd, 1024 * 1024):
-                    existing += chunk
+                if stat.S_ISREG(observed.st_mode):
+                    while chunk := os.read(existing_fd, 1024 * 1024):
+                        existing += chunk
+                        if len(existing) > len(payload):
+                            break
             finally:
                 os.close(existing_fd)
             if (
@@ -627,6 +642,8 @@ def produce_plan(
         overlay_args = ("--host-overlay", str(overlay_path))
     output = work / "install-plan.json"
     sealed.assert_unchanged()
+    # No root stdin, controlling terminal or working directory reaches the
+    # unprivileged plan child (#1270).
     result = _run(
         (
             str(sealed.cli),
@@ -645,6 +662,9 @@ def produce_plan(
         env={**_PLAN_ENV, "HOME": str(home), "PATH": f"{sealed.venv}/bin:/usr/bin:/bin"},
         uid=uid,
         gid=gid,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        cwd=work,
     )
     try:
         reported = json.loads(result.stdout)["plan_sha256"]
@@ -706,8 +726,49 @@ class UpgradeInterrupted(BaseException):
 _INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
+@dataclass
+class _InterruptDeferral:
+    """While a candidate child mutates the host, the first interrupt waits for it.
+
+    Candidate children run in their own session, so the terminal's INT/HUP reach
+    only this coordinator.  Raising inside ``subprocess.run`` would SIGKILL the
+    root child mid-mutation; instead the first signal is held until the child's
+    step ends and is raised right after it.  A second signal while the same
+    child still runs is raised at once: ``subprocess.run`` then stops the child
+    (SIGKILL) and the installer's journal crash recovery covers that step, as it
+    did before #1270.
+    """
+
+    active: bool = False
+    pending: str | None = None
+
+
+_DEFERRAL = _InterruptDeferral()
+
+
 def _interrupt(signum: int, _frame: object) -> None:
-    raise UpgradeInterrupted(signal.Signals(signum).name)
+    name = signal.Signals(signum).name
+    if _DEFERRAL.active and _DEFERRAL.pending is None:
+        _DEFERRAL.pending = name
+        return
+    raise UpgradeInterrupted(name)
+
+
+@contextmanager
+def _interrupts_deferred() -> Iterator[None]:
+    """Hold the first interrupt until the enclosed child returns, then raise it."""
+
+    # Ordered so a signal between two stores is never lost: ``pending`` is
+    # cleared before deferral starts, and deferral ends before it is read.
+    _DEFERRAL.pending = None
+    _DEFERRAL.active = True
+    try:
+        yield
+    finally:
+        _DEFERRAL.active = False
+        pending, _DEFERRAL.pending = _DEFERRAL.pending, None
+    if pending is not None:
+        raise UpgradeInterrupted(pending)
 
 
 @contextmanager
@@ -767,13 +828,21 @@ class _TransactionState:
 
 
 def _candidate(sealed: SealedCandidate, *arguments: str) -> CompletedProcess[str]:
-    """One sealed-candidate installer call; the sealed tree is re-attested first."""
+    """One sealed-candidate installer call; the sealed tree is re-attested first.
+
+    The child runs in its own session without root's stdin, so an interrupt
+    reaches only this coordinator, which lets the running step finish before it
+    rolls back (see ``_InterruptDeferral``).
+    """
 
     sealed.assert_unchanged()
-    return _run(
-        (str(sealed.cli), "install", "trust-root", *arguments),
-        env={**_CANDIDATE_ENV, "PATH": f"{sealed.venv}/bin:{_CANDIDATE_SYSTEM_PATH}"},
-    )
+    with _interrupts_deferred():
+        return _run(
+            (str(sealed.cli), "install", "trust-root", *arguments),
+            env={**_CANDIDATE_ENV, "PATH": f"{sealed.venv}/bin:{_CANDIDATE_SYSTEM_PATH}"},
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
 
 def _candidate_json(sealed: SealedCandidate, step: str, *arguments: str) -> dict[str, object]:
@@ -1323,7 +1392,7 @@ def _maintenance_marker_present() -> bool:
         return True
     try:
         return install_cli._maintenance_lock_payload(descriptor, allow_absent=True) is not None
-    except InstallError:
+    except (InstallError, OSError):
         return True
     finally:
         os.close(descriptor)

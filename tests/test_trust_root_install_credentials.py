@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import upgrade_fixtures
 from paulsha_cortex.trust_root.install import (
     ActivationError,
     CredentialImportError,
@@ -24,6 +25,7 @@ from paulsha_cortex.trust_root.install import (
     plan_sha256,
     rollback_receipt,
 )
+from paulsha_cortex.trust_root.install import backend as install_backend
 from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
@@ -1786,3 +1788,70 @@ def test_credentials_inherit_cli_records_rows_in_the_durable_receipt(
     assert [set(row) for row in on_disk] == [
         {"principal", "provider", "mode", "sha256", "inherited_from"}
     ]
+
+
+def _fifo_credential(tmp_path: Path) -> tuple[InstallReceipt, InstallReceipt, Path]:
+    """A recorded builder/codex credential whose destination became a FIFO (#1270)."""
+
+    digest = _write_credential(
+        tmp_path / "cortex-builder", ".codex/auth.json", b'{"token":"prior"}'
+    )
+    destination = tmp_path / "cortex-builder/.codex/auth.json"
+    destination.unlink()
+    os.mkfifo(destination, 0o600)
+    prior, receipt = _handoff(tmp_path, prior_rows=[_prior_row(digest)])
+    return prior, receipt, destination
+
+
+def test_live_validation_refuses_a_fifo_credential_without_blocking(tmp_path: Path) -> None:
+    # #1270: the root installer validates credentials while it holds the
+    # transaction lock; a FIFO at the destination must not hang it.
+    prior, _receipt, fifo = _fifo_credential(tmp_path)
+
+    failures = upgrade_fixtures.call_without_blocking_on(
+        fifo, lambda: LocalInstallBackend(require_root=False).validate_credentials(prior)
+    )
+
+    assert failures == ("builder/codex unavailable",)
+
+
+def test_inherit_refuses_a_fifo_credential_without_blocking(tmp_path: Path) -> None:
+    prior, receipt, fifo = _fifo_credential(tmp_path)
+
+    with pytest.raises(CredentialImportError, match="builder/codex unavailable"):
+        upgrade_fixtures.call_without_blocking_on(
+            fifo,
+            lambda: inherit_prior_credentials(
+                receipt, prior, backend=LocalInstallBackend(require_root=False)
+            ),
+        )
+    assert receipt.to_dict()["credentials"] == []
+
+
+def test_credential_rollback_keeps_a_fifo_destination_without_blocking(
+    tmp_path: Path,
+) -> None:
+    prior, _receipt, fifo = _fifo_credential(tmp_path)
+
+    retained = upgrade_fixtures.call_without_blocking_on(
+        fifo, lambda: LocalInstallBackend(require_root=False).rollback_credentials(prior)
+    )
+
+    assert list(retained) == [
+        {"credential": "builder/codex", "reason": "credential drifted after import"}
+    ]
+    assert fifo.exists()
+
+
+def test_live_validation_hashes_at_most_the_credential_size_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b'{"token":"0123456789"}'
+    digest = _write_credential(tmp_path / "cortex-builder", ".codex/auth.json", content)
+    prior, _receipt = _handoff(tmp_path, prior_rows=[_prior_row(digest)])
+    backend = LocalInstallBackend(require_root=False)
+    assert backend.validate_credentials(prior) == ()
+
+    monkeypatch.setattr(install_backend, "_CREDENTIAL_MAX_BYTES", len(content) - 1)
+
+    assert backend.validate_credentials(prior) == ("builder/codex unavailable",)

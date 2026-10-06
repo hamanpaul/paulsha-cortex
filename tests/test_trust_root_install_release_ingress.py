@@ -1,16 +1,20 @@
 """#1263：release ingress 逐項移植 runbook §1（REST metadata、asset、目錄與 fetcher）。"""
 from __future__ import annotations
 
+import email.message
 import io
 import json
 import os
 import stat
 import tarfile
+import urllib.request
+import urllib.response
 from pathlib import Path
 
 import pytest
 
 import release_ingress_fixtures as fixtures
+from paulsha_cortex.trust_root.install import release_ingress
 from paulsha_cortex.trust_root.install.release_ingress import (
     DirectoryReleaseFetcher,
     GitHubReleaseFetcher,
@@ -201,6 +205,114 @@ def test_github_fetcher_refuses_a_download_that_leaves_https() -> None:
         fetcher.copy_asset(ReleaseAsset("x.whl", "0" * 64, 1, url), io.BytesIO())
 
 
+class _Transport(urllib.request.HTTPSHandler):
+    """In-memory HTTPS for the real urllib opener: an optional first 302, then bytes."""
+
+    def __init__(self, location: str | None, body: bytes = b"x") -> None:
+        super().__init__()
+        self.location = location
+        self.body = body
+        self.urls: list[str] = []
+
+    def https_open(self, request):
+        self.urls.append(request.full_url)
+        headers = email.message.Message()
+        if self.location is not None and len(self.urls) == 1:
+            headers["Location"] = self.location
+            response = urllib.response.addinfourl(io.BytesIO(b""), headers, request.full_url, 302)
+            response.msg = "Found"
+        else:
+            response = urllib.response.addinfourl(
+                io.BytesIO(self.body), headers, request.full_url, 200
+            )
+            response.msg = "OK"
+        return response
+
+
+_ASSET_URL = "https://github.com/hamanpaul/paulsha-cortex/releases/download/v0.1.13/x.whl"
+
+
+def _asset(body: bytes = b"x") -> ReleaseAsset:
+    return ReleaseAsset("x.whl", "0" * 64, len(body), _ASSET_URL)
+
+
+def test_github_asset_download_follows_the_release_assets_redirect() -> None:
+    # How github.com serves a release asset today (checked 2026-10-06): one 302
+    # to release-assets.githubusercontent.com with a signed query string.
+    target = (
+        "https://release-assets.githubusercontent.com/github-production-release-asset/"
+        "1/2?sp=r&sig=x"
+    )
+    transport = _Transport(target, body=b"wheel")
+    destination = io.BytesIO()
+
+    GitHubReleaseFetcher(transport=(transport,)).copy_asset(_asset(b"wheel"), destination)
+
+    assert transport.urls == [_ASSET_URL, target]
+    assert destination.getvalue() == b"wheel"
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://release-assets.githubusercontent.com/github-production-release-asset/1/2",
+        "https://evil.example/github-production-release-asset/1/2",
+        "https://release-assets.githubusercontent.com.evil.example/x",
+        "https://user@release-assets.githubusercontent.com/x",
+        "https://release-assets.githubusercontent.com:8443/x",
+    ],
+)
+def test_github_asset_download_refuses_a_redirect_off_the_release_hosts(location: str) -> None:
+    transport = _Transport(location)
+
+    with pytest.raises(IngressError, match="redirected outside"):
+        GitHubReleaseFetcher(transport=(transport,)).copy_asset(_asset(), io.BytesIO())
+    assert transport.urls == [_ASSET_URL]
+
+
+def test_github_metadata_follows_redirects_only_within_the_rest_api() -> None:
+    moved = "https://api.github.com/repositories/1/releases/tags/v0.1.13"
+    transport = _Transport(moved, body=b'{"ok": true}')
+
+    fetcher = GitHubReleaseFetcher(transport=(transport,))
+    assert fetcher.get_json("repos/hamanpaul/paulsha-cortex/releases/tags/v0.1.13") == {
+        "ok": True
+    }
+    assert transport.urls[-1] == moved
+
+    elsewhere = _Transport("https://github.com/hamanpaul/paulsha-cortex/releases/tag/v0.1.13")
+    with pytest.raises(IngressError, match="redirected outside"):
+        GitHubReleaseFetcher(transport=(elsewhere,)).get_json(
+            "repos/hamanpaul/paulsha-cortex/releases/tags/v0.1.13"
+        )
+
+
+def test_github_metadata_refuses_a_response_from_outside_the_rest_api() -> None:
+    fetcher = GitHubReleaseFetcher(
+        urlopen=lambda request, timeout: _Response(b"{}", "https://evil.example/api")
+    )
+
+    with pytest.raises(IngressError, match="left HTTPS"):
+        fetcher.get_json("repos/hamanpaul/paulsha-cortex/releases/tags/v0.1.13")
+
+
+def test_github_asset_download_refuses_a_final_url_off_the_release_hosts() -> None:
+    fetcher = GitHubReleaseFetcher(
+        urlopen=lambda request, timeout: _Response(b"x", "https://evil.example/x.whl")
+    )
+
+    with pytest.raises(IngressError, match="left HTTPS"):
+        fetcher.copy_asset(_asset(), io.BytesIO())
+
+
+def test_private_chain_refuses_a_relative_path(tmp_path: Path) -> None:
+    # #1270: a relative path ends at "." without checking the real ancestors.
+    with pytest.raises(IngressError, match="absolute"):
+        assert_private_chain(Path("installer/0.1.13"), owner_uid=os.getuid(), stop=tmp_path)
+    with pytest.raises(IngressError, match="absolute"):
+        assert_private_chain(tmp_path / ".." / tmp_path.name, owner_uid=os.getuid())
+
+
 def test_private_chain_accepts_owner_only_directories(tmp_path: Path) -> None:
     target = tmp_path / "installer" / "0.1.13"
     target.mkdir(parents=True)
@@ -370,6 +482,46 @@ def _tar(path: Path, members: list[tuple[str, bytes | None, str | None]]) -> Pat
 def test_archive_topology_refuses_unsafe_members(tmp_path: Path, members) -> None:
     with pytest.raises(IngressError, match="topology is unsafe"):
         check_archive_topology(_tar(tmp_path / "input.tar.gz", members))
+
+
+def test_archive_topology_caps_the_member_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    members = [("qualification-input", None, None)] + [
+        (f"qualification-input/{index}", b"x", None) for index in range(3)
+    ]
+    archive = _tar(tmp_path / "input.tar.gz", members)
+    check_archive_topology(archive)
+
+    monkeypatch.setattr(release_ingress, "_MAX_ARCHIVE_MEMBERS", 3)
+
+    with pytest.raises(IngressError, match="too many members"):
+        check_archive_topology(archive)
+
+
+def test_archive_topology_caps_the_extracted_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _tar(
+        tmp_path / "input.tar.gz",
+        [
+            ("qualification-input", None, None),
+            ("qualification-input/a", b"1234", None),
+            ("qualification-input/b", b"5678", None),
+        ],
+    )
+    check_archive_topology(archive)
+
+    monkeypatch.setattr(release_ingress, "_MAX_ARCHIVE_BYTES", 7)
+
+    with pytest.raises(IngressError, match="size limit"):
+        check_archive_topology(archive)
+
+
+def test_archive_size_caps_are_generous_for_a_real_install_input() -> None:
+    # v0.1.13's install-input has 18 members and ~0.9 GB of file content.
+    assert release_ingress._MAX_ARCHIVE_MEMBERS >= 1000
+    assert release_ingress._MAX_ARCHIVE_BYTES >= 4 * 1024**3
 
 
 def _extra_wheelhouse(root: Path) -> None:

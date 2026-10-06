@@ -11,6 +11,7 @@ import pwd
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -3018,3 +3019,43 @@ def test_sudoers_detector_follows_authoritative_includedir(tmp_path: Path) -> No
     sudoers.write_text(f"#includedir {sudoers_d}\n", encoding="utf-8")
 
     assert backend_module._universal_nopasswd(sudoers)
+
+
+def test_run_keeps_the_callers_session_stdin_and_cwd_by_default() -> None:
+    result = backend_module._run(
+        (sys.executable, "-c", "import os; print(os.getsid(0)); print(os.getcwd())")
+    )
+
+    sid, cwd = result.stdout.splitlines()
+    assert int(sid) == os.getsid(0)
+    assert cwd == os.getcwd()
+
+
+def test_run_can_detach_a_child_from_the_callers_session_stdin_and_cwd(
+    tmp_path: Path,
+) -> None:
+    # #1270: the unprivileged plan child must not inherit root's controlling
+    # terminal, stdin or working directory.
+    script = (
+        "import json, os; print(json.dumps({'sid': os.getsid(0), 'cwd': os.getcwd(),"
+        " 'stdin': os.path.realpath('/proc/self/fd/0')}))"
+    )
+
+    result = backend_module._run(
+        (sys.executable, "-c", script),
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        cwd=tmp_path,
+    )
+
+    observed = json.loads(result.stdout)
+    assert observed["sid"] != os.getsid(0)
+    assert observed["cwd"] == os.path.realpath(tmp_path)
+    assert observed["stdin"] == "/dev/null"
+
+
+def test_run_enforces_an_optional_timeout() -> None:
+    with pytest.raises(subprocess.TimeoutExpired):
+        backend_module._run(
+            (sys.executable, "-c", "import time; time.sleep(30)"), timeout=0.2
+        )

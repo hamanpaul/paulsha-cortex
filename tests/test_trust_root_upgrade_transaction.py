@@ -7,6 +7,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 import upgrade_fixtures as fx
+from paulsha_cortex.trust_root.install import backend as install_backend
 from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install import upgrade
@@ -456,6 +458,127 @@ def test_sighup_inside_the_maintenance_window_rolls_back(
     assert report["result"] == "rolled-back"
     assert "rollback" in harness.cli.commands()
     assert harness.systemd.active == set(fx.SERVICES)
+
+
+def test_candidate_children_run_in_their_own_session_without_the_callers_stdin(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1270: the terminal's INT/HUP reach only the coordinator, which decides
+    # how the running installer step ends; the child never reads root's stdin.
+    seen: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def run(argv, **kwargs):
+        seen.append((tuple(argv)[1:3], kwargs))
+        return harness.cli(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+    code, _report = _run_transaction(harness)
+
+    assert code == 0
+    candidate = [kwargs for head, kwargs in seen if head == ("install", "trust-root")]
+    assert len(candidate) == 4
+    for kwargs in candidate:
+        assert kwargs["start_new_session"] is True
+        assert kwargs["stdin"] == subprocess.DEVNULL
+
+
+_SIGNAL_PARENT = (
+    "import os, signal, sys, time\n"
+    "for _ in range(int(sys.argv[2])):\n"
+    "    os.kill(os.getppid(), signal.SIGTERM)\n"
+    "    time.sleep(0.3)\n"
+    "time.sleep(float(sys.argv[3]))\n"
+    "open(sys.argv[1], 'w').write('finished')\n"
+)
+
+
+def _apply_child_signals_the_coordinator(
+    harness, monkeypatch: pytest.MonkeyPatch, marker: Path, *, signals: int, linger: float
+) -> None:
+    """Run a real child for `apply` that sends SIGTERM to the coordinator mid-step."""
+
+    candidate = harness.cli
+
+    def run(argv, **kwargs):
+        if tuple(argv)[3:4] == ("apply",):
+            child = install_backend._run(
+                (sys.executable, "-c", _SIGNAL_PARENT, str(marker), str(signals), str(linger)),
+                **kwargs,
+            )
+            assert child.returncode == 0, child.stderr
+        return candidate(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+
+def test_a_real_sigterm_lets_the_running_installer_step_finish_then_rolls_back(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #1270: a signal while a root child mutates the host must not SIGKILL that
+    # child; the coordinator waits for the step to end, then rolls back.
+    marker = tmp_path / "apply-child"
+    _apply_child_signals_the_coordinator(harness, monkeypatch, marker, signals=1, linger=0.5)
+
+    with _recording_handler(signal.SIGTERM) as received:
+        code, report = _run_transaction(harness)
+
+    assert marker.read_text() == "finished"
+    assert received == []
+    assert code == 1
+    assert report["failed_step"] == "apply"
+    assert report["error"] == "interrupted by SIGTERM"
+    assert report["result"] == "rolled-back"
+    assert "rollback" in harness.cli.commands()
+    assert "credentials inherit" not in harness.cli.commands()
+    assert harness.systemd.active == set(fx.SERVICES)
+
+
+def test_a_second_signal_stops_a_running_installer_step_at_once(
+    harness, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An operator who signals again does not wait for a hung step: the child is
+    # stopped (journal crash recovery covers it) and the upgrade rolls back.
+    marker = tmp_path / "apply-child"
+
+    def run(argv, **kwargs):
+        if tuple(argv)[3:4] == ("apply",):
+            install_backend._run(
+                (sys.executable, "-c", _SIGNAL_PARENT, str(marker), "2", "60"), **kwargs
+            )
+        return harness.cli(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+    with _recording_handler(signal.SIGTERM) as received:
+        code, report = _run_transaction(harness)
+
+    assert not marker.exists()
+    assert received == []
+    assert code == 1
+    assert report["failed_step"] == "apply"
+    assert report["error"] == "interrupted by SIGTERM"
+    assert report["result"] == "rolled-back"
+
+
+def test_a_hung_service_status_probe_times_out_as_unavailable(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    timeouts: list[object] = []
+
+    def hung(argv, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(upgrade, "_run", hung)
+
+    mismatch, payload = upgrade.await_loaded_runtime(
+        harness.prior.plan, harness.prior.path, {}, settle_seconds=0
+    )
+
+    assert payload is None
+    assert mismatch.startswith("service_status=unavailable (TimeoutExpired")
+    assert timeouts == [upgrade._STATUS_TIMEOUT_SECONDS]
 
 
 def test_failure_before_apply_restores_services_without_a_rollback(harness) -> None:

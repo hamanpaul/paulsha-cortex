@@ -39,7 +39,6 @@ from .core import (
     _open_directory_chain,
     _observed_drift_detail,
     _open_parent_directory,
-    _read_fd_bytes,
     _reject_symlink_ancestors,
     credential_destination,
     is_inherited_credential,
@@ -55,8 +54,18 @@ def _run(
     env: Mapping[str, str] | None = None,
     uid: int | None = None,
     gid: int | None = None,
+    stdin: int | None = None,
+    start_new_session: bool = False,
+    cwd: str | os.PathLike[str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one typed argv.  Shell text is never accepted by this backend."""
+    """Run one typed argv.  Shell text is never accepted by this backend.
+
+    ``stdin`` (for example ``subprocess.DEVNULL``; not with ``input_text``),
+    ``start_new_session``, ``cwd`` and ``timeout`` are opt-in; the defaults keep
+    the inherited stdin, session and working directory, and wait without limit.
+    A timeout raises ``subprocess.TimeoutExpired`` after the child is killed.
+    """
 
     if not argv or not all(isinstance(part, str) and part for part in argv):
         raise InstallPlanError(f"invalid argv: {argv!r}")
@@ -72,6 +81,11 @@ def _run(
             }
         elif target_uid != os.geteuid() or target_gid != os.getegid():
             raise PermissionError("cannot run command as the requested repository owner")
+    redirected: dict[str, object] = {}
+    if stdin is not None:
+        if input_text is not None:
+            raise InstallPlanError("stdin and input_text are mutually exclusive")
+        redirected["stdin"] = stdin
     result = subprocess.run(
         list(argv),
         check=False,
@@ -80,6 +94,10 @@ def _run(
         input=input_text,
         pass_fds=tuple(pass_fds),
         env=None if env is None else dict(env),
+        start_new_session=start_new_session,
+        cwd=cwd,
+        timeout=timeout,
+        **redirected,
         **identity,
     )
     if check and result.returncode != 0:
@@ -3598,6 +3616,41 @@ def _remove_created_credential_directories(
     return None
 
 
+#: Credential destinations are opened without following a symlink and without
+#: blocking: a FIFO swapped in at the leaf must not hang the root installer
+#: while it holds the transaction lock (#1270).  Regular files ignore
+#: ``O_NONBLOCK``.
+_CREDENTIAL_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+#: Upper bound on the credential bytes hashed for validation, inheritance and
+#: rollback.  Real executor login files are a few KiB; the cap only stops a
+#: huge or sparse file from being read whole by root (#1270).
+_CREDENTIAL_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _credential_fd_sha256(descriptor: int) -> str | None:
+    """sha256 of an opened credential, or ``None`` when it is not a regular file.
+
+    The type is checked with ``fstat`` before any read; a regular file larger
+    than ``_CREDENTIAL_MAX_BYTES`` raises ``InstallError``.
+    """
+
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        return None
+    digest = hashlib.sha256()
+    total = 0
+    while chunk := os.read(descriptor, 1024 * 1024):
+        total += len(chunk)
+        if total > _CREDENTIAL_MAX_BYTES:
+            raise InstallError("credential file exceeds the credential size limit")
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _observe_credential(
     receipt: InstallReceipt, *, principal: str, provider: str
 ) -> tuple[str, bool]:
@@ -3607,7 +3660,9 @@ def _observe_credential(
     (regular file, one link, the account's uid/gid, mode 0600).  The content
     leaves the descriptor only as its digest.  Raises ``InstallError`` or
     ``OSError`` when the destination cannot be opened safely (for example a
-    symlink at the leaf, or a path that no longer names the held inode).
+    symlink at the leaf, or a path that no longer names the held inode), when
+    it is not a regular file (never read), or when it exceeds
+    ``_CREDENTIAL_MAX_BYTES``.
     """
 
     destination, uid, gid = credential_destination(
@@ -3616,13 +3671,11 @@ def _observe_credential(
     parent_fd, leaf = _open_parent_directory(destination)
     descriptor: int | None = None
     try:
-        descriptor = os.open(
-            leaf,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=parent_fd,
-        )
+        descriptor = os.open(leaf, _CREDENTIAL_READ_FLAGS, dir_fd=parent_fd)
         observed = os.fstat(descriptor)
-        digest = hashlib.sha256(_read_fd_bytes(descriptor)).hexdigest()
+        digest = _credential_fd_sha256(descriptor)
+        if digest is None:
+            raise InstallError("credential destination is not a regular file")
         _assert_fd_path_binding(destination, descriptor, directory=False)
         return digest, (
             stat.S_ISREG(observed.st_mode)
@@ -5461,21 +5514,16 @@ class LocalInstallBackend:
             try:
                 descriptor: int | None = None
                 try:
-                    descriptor = os.open(
-                        leaf,
-                        os.O_RDONLY
-                        | getattr(os, "O_NOFOLLOW", 0)
-                        | getattr(os, "O_CLOEXEC", 0),
-                        dir_fd=parent_fd,
-                    )
+                    descriptor = os.open(leaf, _CREDENTIAL_READ_FLAGS, dir_fd=parent_fd)
                 except FileNotFoundError:
                     pass
                 if descriptor is not None:
                     observed = os.fstat(descriptor)
-                    digest = hashlib.sha256(_read_fd_bytes(descriptor)).hexdigest()
+                    digest = _credential_fd_sha256(descriptor)
                     _assert_fd_path_binding(destination, descriptor, directory=False)
                     if (
-                        stat.S_ISREG(observed.st_mode)
+                        digest is not None
+                        and stat.S_ISREG(observed.st_mode)
                         and observed.st_nlink == 1
                         and observed.st_uid == uid
                         and observed.st_gid == gid
@@ -5524,19 +5572,14 @@ class LocalInstallBackend:
                             os.fsync(parent_fd)
                             continue
                         temp_fd = os.open(
-                            temp_name,
-                            os.O_RDONLY
-                            | getattr(os, "O_NOFOLLOW", 0)
-                            | getattr(os, "O_CLOEXEC", 0),
-                            dir_fd=parent_fd,
+                            temp_name, _CREDENTIAL_READ_FLAGS, dir_fd=parent_fd
                         )
                         try:
                             observed = os.fstat(temp_fd)
-                            digest = hashlib.sha256(
-                                _read_fd_bytes(temp_fd)
-                            ).hexdigest()
+                            digest = _credential_fd_sha256(temp_fd)
                             removable = (
-                                stat.S_ISREG(observed.st_mode)
+                                digest is not None
+                                and stat.S_ISREG(observed.st_mode)
                                 and observed.st_nlink == 1
                                 and observed.st_uid == uid
                                 and observed.st_gid == gid
