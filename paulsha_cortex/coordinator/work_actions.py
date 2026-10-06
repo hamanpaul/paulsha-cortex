@@ -70,11 +70,13 @@ from .delivery import (
     _validate_foreign_review,
 )
 from .github_delivery import (
+    CHECKS_PENDING_TIMEOUT_SECONDS,
     COPILOT_REVIEWER_LOGIN,
     DeliveryPolicy,
     GitHubDeliveryClient,
     evaluate_delivery_gate,
     evaluate_remote_closure,
+    required_checks_pending_block,
 )
 from . import candidate_base
 from . import engineering_outcome
@@ -1927,6 +1929,11 @@ def _checks_pending_response(
     remote_gate: Any,
     remote: Any,
     head: str,
+    now_epoch: float,
+    waiting_since_epoch: object,
+    canonical_run: Any,
+    authority: Any,
+    workflow_registry: Any,
 ) -> dict[str, Any] | None:
     """#716：merge gate 只卡在「check 仍在跑」時回非終局等待，而非擲例外。
 
@@ -1939,24 +1946,104 @@ def _checks_pending_response(
     一律回 None 讓呼叫端維持 fail-closed。此回應不寫 merge authorization、不動 ship
     state、不吃 repair round；`_delivery_adapter_status` 將其映射為 pending，下一個 tick
     以同一 exact HEAD 重新評估 gate。
+
+    #1271：branch protection 把仍在跑的 check 列為 required 時，GitHub 同時回報
+    `mergeable_state=blocked`，gate 多一個 `not-mergeable`。只有
+    `required_checks_pending_block` 提出正向證據（同一 exact HEAD 有 required check
+    仍在跑、沒有 required check 已失敗、reviewDecision 不要求 review）時才把這個組合
+    也當成等待；其他 blocked 原因照舊 fail-closed。等待有上限：從
+    ``waiting_since_epoch``（Copilot request／採信時間或 maintainer review 時間）起超過
+    `CHECKS_PENDING_TIMEOUT_SECONDS` 仍在跑，就以非 review 的
+    `checks-pending-timeout` 交人工；ship state 仍不動，check 結束後 operator
+    `resume` 以同一 exact HEAD 重評。``waiting_since_epoch`` 不是有限數時不等待。
     """
 
-    if tuple(remote_gate.reasons) != ("checks-not-terminal-green",):
+    reasons = tuple(remote_gate.reasons)
+    required_pending: tuple[str, ...] = ()
+    if reasons == ("not-mergeable", "checks-not-terminal-green"):
+        required_pending = required_checks_pending_block(remote)
+        if not required_pending:
+            return None
+    elif reasons != ("checks-not-terminal-green",):
         return None
     not_green = [check for check in remote.checks if not check.terminal_green]
     if not not_green or not all(check.pending for check in not_green):
         return None
+    if (
+        not isinstance(waiting_since_epoch, (int, float))
+        or isinstance(waiting_since_epoch, bool)
+        or not math.isfinite(float(waiting_since_epoch))
+    ):
+        return None
     pending_checks = [check.name for check in not_green]
+    if float(now_epoch) - float(waiting_since_epoch) > CHECKS_PENDING_TIMEOUT_SECONDS:
+        return _checks_pending_timeout_response(
+            canonical_run=canonical_run,
+            authority=authority,
+            workflow_registry=workflow_registry,
+            head=head,
+            pending_checks=pending_checks,
+            waiting_since_epoch=float(waiting_since_epoch),
+        )
     logger.info(
-        "ship merge gate waiting for running checks head=%s checks=%s",
+        "ship merge gate waiting for running checks head=%s checks=%s required=%s",
         head,
         ",".join(pending_checks),
+        ",".join(required_pending),
     )
-    return {
+    response: dict[str, Any] = {
         "action": "checks-pending",
         "reason": "checks-not-terminal-green",
         "pending_checks": pending_checks,
         "head": head,
+    }
+    if required_pending:
+        response["required_pending_checks"] = list(required_pending)
+    return response
+
+
+def _checks_pending_timeout_response(
+    *,
+    canonical_run: Any,
+    authority: Any,
+    workflow_registry: Any,
+    head: str,
+    pending_checks: list[str],
+    waiting_since_epoch: float,
+) -> dict[str, Any]:
+    """#1271：check 等太久時的非 review 停點；不寫 ship state，`resume` 即可重評。"""
+
+    hours = CHECKS_PENDING_TIMEOUT_SECONDS // 3600
+    hint = (
+        f"PR 上的 check（{', '.join(pending_checks)}）超過 {hours} 小時仍未結束；"
+        "確認 CI 是否卡住（runner 排不到、外部 status 未回報），check 結束後執行 "
+        f"`cortex work resume {canonical_run.work_id} --repo {authority.repo}`，"
+        "以同一 exact HEAD 與同一筆 delivery review 重評 merge gate。"
+    )
+    workflow_registry._manager_update_workflow_run(
+        canonical_run.run_id,
+        facets=("needs_human",),
+        gate_status="running",
+        needs_human_reason=diagnostic_reason(
+            "checks-pending-timeout",
+            f"delivery review 已就緒，但 merge gate 等 check 跑完已超過 {hours} 小時",
+            source="work_actions._checks_pending_response:checks-pending-timeout",
+            next_step_hint=hint,
+            run_id=canonical_run.run_id,
+            work_id=canonical_run.work_id,
+            repo=authority.repo,
+            head=head,
+            pending_checks=",".join(pending_checks),
+            waiting_since=str(waiting_since_epoch),
+        ),
+    )
+    return {
+        "action": "needs_human",
+        "reason": "checks-pending-timeout",
+        "pending_checks": pending_checks,
+        "head": head,
+        "next_actions": ["resume"],
+        "next_step_hint": hint,
     }
 
 
@@ -3212,10 +3299,11 @@ def _ship_with_maintainer_review(
     github: GitHubDeliveryClient,
     ship: dict[str, Any] | None,
     fix_rounds: int,
+    now_epoch: float,
 ) -> dict[str, Any]:
     path = args.get("maintainer_review_path")
     expected_hash = args.get("maintainer_review_hash")
-    _validate_maintainer_review(
+    maintainer_body = _validate_maintainer_review(
         path=path,
         expected_hash=expected_hash,
         run=canonical_run,
@@ -3250,7 +3338,19 @@ def _ship_with_maintainer_review(
                 remote=remote,
             )
         checks_pending = _checks_pending_response(
-            remote_gate=remote_gate, remote=remote, head=preflight.head
+            remote_gate=remote_gate,
+            remote=remote,
+            head=preflight.head,
+            now_epoch=now_epoch,
+            # #1271：maintainer 路徑從 exact-HEAD review 的時間起算等待；缺值即不等待。
+            waiting_since_epoch=(
+                maintainer_body.get("reviewed_at_epoch")
+                if isinstance(maintainer_body, dict)
+                else None
+            ),
+            canonical_run=canonical_run,
+            authority=authority,
+            workflow_registry=workflow_registry,
         )
         if checks_pending is not None:
             return checks_pending
@@ -10072,6 +10172,7 @@ def _ship_action(
             github=github,
             ship=ship,
             fix_rounds=fix_rounds,
+            now_epoch=float(now_epoch),
         )
     if rearm_permit is not None and preflight.head != rearm_permit["candidate_head"]:
         _invalidate_copilot_rearm_permit(
@@ -10528,7 +10629,19 @@ def _ship_action(
                 remote=remote,
             )
         checks_pending = _checks_pending_response(
-            remote_gate=remote_gate, remote=remote, head=preflight.head
+            remote_gate=remote_gate,
+            remote=remote,
+            head=preflight.head,
+            now_epoch=float(now_epoch),
+            # #1271：Copilot 路徑從 request（或採信既有 review）那一刻起算等待。
+            waiting_since_epoch=(
+                copilot.loop.adopted_at
+                if copilot.loop.adopted_at is not None
+                else copilot.loop.requested_at
+            ),
+            canonical_run=canonical_run,
+            authority=authority,
+            workflow_registry=workflow_registry,
         )
         if checks_pending is not None:
             return checks_pending
