@@ -41,6 +41,7 @@ def _resolve_launcher(
     model,
     identity=None,
     identity_registry=None,
+    codex_compatibility_probe=False,
 ):
     """注入優先；否則以已解析 identity 建立 SubprocessLauncher。"""
     if injected is not None:
@@ -62,6 +63,7 @@ def _resolve_launcher(
         allow_unsafe=allow_unsafe,
         model=model,
         executable=executable,
+        codex_compatibility_probe=codex_compatibility_probe,
     )
 
 

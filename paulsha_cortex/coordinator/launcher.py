@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shlex
@@ -8,6 +9,8 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +18,8 @@ from typing import Mapping, Protocol, Sequence, runtime_checkable
 
 from . import gate_ledger, job_runner, job_workspace, spool_slot, task_memory, terminal_contract
 from ..persona.context import build_persona_context
+
+logger = logging.getLogger(__name__)
 
 
 _GIT_REPOSITORY_ENV_KEYS = job_runner.GIT_REPOSITORY_ENV_KEYS | frozenset(
@@ -1127,6 +1132,174 @@ def _codex_default_effort(model: str) -> str | None:
     return adapter_for("codex").default_effort_for(model)
 
 
+@dataclass(frozen=True)
+class CodexSandboxCompatibilityProbe:
+    """Results from production-shaped Codex agent loops in both sandbox modes."""
+
+    selected_mode: str | None
+    read_only_passed: bool
+    workspace_write_passed: bool
+    read_only_reason: str | None = None
+    workspace_write_reason: str | None = None
+
+    @property
+    def fallback(self) -> bool:
+        return self.selected_mode == "workspace-write"
+
+
+_CODEX_COMPATIBILITY_CACHE: dict[tuple[str, ...], CodexSandboxCompatibilityProbe] = {}
+_CODEX_COMPATIBILITY_CACHE_LOCK = threading.Lock()
+
+
+def _codex_probe_agent_messages(stdout: object) -> tuple[str, ...]:
+    if not isinstance(stdout, str):
+        return ()
+    messages: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+        ):
+            messages.append(item["text"])
+    return tuple(messages)
+
+
+def _codex_probe_failure_reason(result: object, *, timeout_seconds: float) -> str:
+    stdout = getattr(result, "stdout", "")
+    stderr = getattr(result, "stderr", "")
+    messages = _codex_probe_agent_messages(stdout)
+    combined = " ".join((*messages, stderr if isinstance(stderr, str) else ""))
+    if "bubblewrap" in combined and (
+        "app-server socket" in combined or "filesystem-restricted execution" in combined
+    ):
+        return "filesystem-restricted execution requires bubblewrap to isolate app-server sockets"
+    returncode = getattr(result, "returncode", None)
+    if "timed out after" in combined:
+        return f"codex exec timed out after {timeout_seconds:g}s"
+    if returncode not in (0, None):
+        return f"codex exec exited with status {returncode}"
+    return "codex exec did not return the exact probe marker"
+
+
+def probe_codex_sandbox_compatibility(
+    *,
+    model_id: str | None = None,
+    temp_root: str | Path | None = None,
+    runner: Callable[..., object] | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout_seconds: float = 45.0,
+) -> CodexSandboxCompatibilityProbe:
+    """Exercise both modes through the actual headless ``codex exec`` agent loop.
+
+    `codex sandbox` cannot qualify this path: the observed failure occurs while
+    `codex exec` starts its app-server and isolates its socket.  Each prompt asks
+    the agent to run a harmless `git rev-parse HEAD` in an isolated, disposable
+    repository and must echo the exact expected hash.  Process exit status alone
+    is not evidence; Codex can exit zero after emitting a failed-turn message.
+    """
+
+    if timeout_seconds <= 0:
+        raise ValueError("Codex compatibility probe timeout must be positive")
+    process_runner = runner or subprocess.run
+    parent = None if temp_root is None else str(Path(temp_root))
+    with tempfile.TemporaryDirectory(prefix="cortex-codex-compat-", dir=parent) as raw:
+        root = Path(raw)
+        worktree = root / "repo"
+        logs = root / "logs"
+        worktree.mkdir()
+        logs.mkdir()
+        subprocess.run(["/usr/bin/git", "init", "--quiet", str(worktree)], check=True)
+        subprocess.run(
+            [
+                "/usr/bin/git", "-C", str(worktree), "-c", "user.name=Cortex probe",
+                "-c", "user.email=cortex-probe@example.invalid", "commit", "--quiet",
+                "--allow-empty", "-m", "Codex sandbox compatibility probe",
+            ],
+            check=True,
+        )
+        head = subprocess.run(
+            ["/usr/bin/git", "-C", str(worktree), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        marker = f"PSC-CODEX-PROBE-OK:{head}"
+        prompt = (
+            "Run exactly `/usr/bin/git -C "
+            f"{shlex.quote(str(worktree))} rev-parse HEAD`. If it returns the expected "
+            f"hash `{head}`, reply with exactly `{marker}`. If the command cannot execute "
+            "or returns a different hash, explain that failure and do not use the marker. "
+            "Do not modify any file."
+        )
+        probe_env = dict(_git_scope_env() if env is None else env)
+        outcomes: dict[str, tuple[bool, str | None]] = {}
+        for mode in ("read-only", "workspace-write"):
+            argv = build_codex_argv(
+                prompt=prompt,
+                slice_id=f"codex-compat-{mode}",
+                log_dir=str(logs),
+                worktree=str(worktree),
+                model=model_id,
+                write_forbidden=True,
+                sandbox_mode_override=mode if mode == "workspace-write" else None,
+            )
+            argv.append("--ephemeral")
+            try:
+                result = process_runner(
+                    argv,
+                    cwd=str(worktree),
+                    env=probe_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired:
+                result = subprocess.CompletedProcess(
+                    argv,
+                    124,
+                    stdout="",
+                    stderr=f"codex exec timed out after {timeout_seconds:g}s",
+                )
+            except OSError as exc:
+                result = subprocess.CompletedProcess(
+                    argv, 127, stdout="", stderr=f"{type(exc).__name__}: {exc}"
+                )
+            messages = _codex_probe_agent_messages(getattr(result, "stdout", ""))
+            passed = (
+                getattr(result, "returncode", 1) == 0
+                and any(message.strip() == marker for message in messages)
+            )
+            outcomes[mode] = (
+                passed,
+                None if passed else _codex_probe_failure_reason(
+                    result, timeout_seconds=timeout_seconds
+                ),
+            )
+
+        read_only_passed, read_only_reason = outcomes["read-only"]
+        workspace_write_passed, workspace_write_reason = outcomes["workspace-write"]
+        selected_mode = (
+            "read-only" if read_only_passed else
+            "workspace-write" if workspace_write_passed else
+            None
+        )
+        return CodexSandboxCompatibilityProbe(
+            selected_mode=selected_mode,
+            read_only_passed=read_only_passed,
+            workspace_write_passed=workspace_write_passed,
+            read_only_reason=read_only_reason,
+            workspace_write_reason=workspace_write_reason,
+        )
+
+
 def build_codex_argv(
     *,
     prompt: str,
@@ -1144,6 +1317,7 @@ def build_codex_argv(
     verdict_spool_dir: str | None = None,
     last_message_path: str | None = None,
     effort: str | None = None,
+    sandbox_mode_override: str | None = None,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Codex planning cannot bypass sandbox")
@@ -1188,6 +1362,7 @@ def build_codex_argv(
             commit_required=commit_required,
             write_forbidden=write_forbidden,
             trust_root_outer_unit=trust_root_outer_unit,
+            sandbox_mode_override=sandbox_mode_override,
         )]
         if read_only or review_only:
             # planner／reviewer 的既有旗標，**逐字不變**：它們的工作區可能根本不是
@@ -1217,6 +1392,7 @@ def build_codex_argv(
             commit_required=commit_required,
             write_forbidden=write_forbidden,
             trust_root_outer_unit=trust_root_outer_unit,
+            sandbox_mode_override=sandbox_mode_override,
         )
     )
     for spool_dir in _verdict_spool_add_dirs(
@@ -1251,6 +1427,7 @@ def _codex_inner_sandbox_argv(
     commit_required: bool = False,
     write_forbidden: bool = False,
     trust_root_outer_unit: bool = False,
+    sandbox_mode_override: str | None = None,
 ) -> tuple[str, ...]:
     """codex 的內層沙箱形態 argv（#714），依寫入契約決定附不附（#716 B 後半）。
 
@@ -1286,6 +1463,11 @@ def _codex_inner_sandbox_argv(
         commit_required=commit_required,
         write_forbidden=write_forbidden,
     )
+    if sandbox_mode_override == registry.SANDBOX_MODE_WORKSPACE_WRITE:
+        # The compatibility fallback deliberately uses Codex's current native
+        # workspace-write sandbox.  Attaching legacy Landlock recreates the
+        # rc=101 failure seen on Codex 0.159.3 for write-capable profiles.
+        return ()
     if not registry.inner_sandbox_attached_for(
         contract, trust_root_outer_unit=trust_root_outer_unit
     ):
@@ -1302,6 +1484,7 @@ def _codex_sandbox_mode(
     commit_required: bool,
     write_forbidden: bool,
     trust_root_outer_unit: bool = False,
+    sandbox_mode_override: str | None = None,
 ) -> str:
     """codex `--sandbox` 的值（`registry.SANDBOX_MODE_DERIVATION` 是唯一真相，#716）。
 
@@ -1326,6 +1509,16 @@ def _codex_sandbox_mode(
         commit_required=commit_required,
         write_forbidden=write_forbidden,
     )
+    if sandbox_mode_override is not None:
+        if (
+            contract is not registry.JobWriteContract.BUILDER_WRITE_FORBIDDEN
+            or sandbox_mode_override != registry.SANDBOX_MODE_WORKSPACE_WRITE
+            or trust_root_outer_unit
+        ):
+            raise ValueError(
+                "Codex sandbox compatibility fallback requires the write-forbidden contract"
+            )
+        return sandbox_mode_override
     mode = registry.sandbox_mode_for(
         contract, trust_root_outer_unit=trust_root_outer_unit
     )
@@ -1706,6 +1899,7 @@ class SubprocessLauncher:
         verdict_spool_dir: str | None = None,
         effective_tools: Sequence[str] | None = None,
         execution_profile: object | None = None,
+        codex_compatibility_probe: bool = False,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             # #835：程式碼以 `execution_adapters.register_adapter()` 登記的新 runtime
@@ -1784,6 +1978,9 @@ class SubprocessLauncher:
         # `_is_review_persona()` 的三個判準一個都沒動，write-forbidden 的 build 卡仍以
         # `cortex-builder` 起跑（它就是 builder，只是這一張卡不寫檔）。
         self._write_forbidden = write_forbidden
+        self._codex_compatibility_probe = bool(codex_compatibility_probe)
+        self._codex_sandbox_mode_override: str | None = None
+        self._codex_compatibility_diagnostic: str | None = None
         self._review_terminal_kind = review_terminal_kind
         # #835：合法值與預設（copilot = xhigh；cg = medium；codex 依 model）都在 adapter
         # descriptor；這裡只保留原值，由 argv builder 以 descriptor 驗證。沒有 effort
@@ -1883,6 +2080,7 @@ class SubprocessLauncher:
             commit_required=False,
             effort=self._effort,
             execution_profile=self._execution_profile_binding,
+            codex_compatibility_probe=self._codex_compatibility_probe,
         )
 
     def as_review_only(self, *, terminal_kind: str) -> "SubprocessLauncher":
@@ -1901,6 +2099,7 @@ class SubprocessLauncher:
             review_terminal_kind=terminal_kind,
             effort=self._effort,
             execution_profile=self._execution_profile_binding,
+            codex_compatibility_probe=self._codex_compatibility_probe,
         )
 
     def as_verdict_spool_writer(self, spool_dir: str) -> "SubprocessLauncher":
@@ -1936,6 +2135,7 @@ class SubprocessLauncher:
             effort=self._effort,
             verdict_spool_dir=spool_dir,
             execution_profile=self._execution_profile_binding,
+            codex_compatibility_probe=self._codex_compatibility_probe,
         )
 
     def as_commit_required(self) -> "SubprocessLauncher":
@@ -1962,6 +2162,7 @@ class SubprocessLauncher:
             effort=self._effort,
             effective_tools=self._effective_tools,
             execution_profile=self._execution_profile_binding,
+            codex_compatibility_probe=self._codex_compatibility_probe,
         )
 
     def as_write_forbidden(self) -> "SubprocessLauncher":
@@ -2006,6 +2207,7 @@ class SubprocessLauncher:
             verdict_spool_dir=self._verdict_spool_dir,
             effective_tools=self._effective_tools,
             execution_profile=self._execution_profile_binding,
+            codex_compatibility_probe=self._codex_compatibility_probe,
         )
 
     def _should_run_gates(self, env: Mapping[str, str]) -> bool:
@@ -2136,6 +2338,112 @@ class SubprocessLauncher:
 
         return self._downgraded_mode(env) is not None
 
+    def _ensure_codex_compatibility(self) -> None:
+        """Probe Codex's two sandbox modes before dispatching a write-forbidden card."""
+
+        if not (
+            self._codex_compatibility_probe
+            and self._executor == "codex"
+            and self._write_forbidden
+        ):
+            return
+        runner_mode = self._downgraded_mode(os.environ) or job_runner.RUNNER_DIRECT
+        if runner_mode == job_runner.RUNNER_SYSTEMD_TEMPLATE:
+            # This exact, preflighted read-only unit is the enforcement boundary;
+            # its Codex invocation is outer-only and uses neither inner mode.
+            self._codex_compatibility_diagnostic = (
+                "Trust Root read-only template selected; Codex inner sandbox probe not applicable"
+            )
+            return
+        if runner_mode == job_runner.RUNNER_SYSTEMD_RUN:
+            probe_id = "codex-sandbox-compat-probe"
+            probe_env = job_runner.build_job_env(
+                manager_env=os.environ,
+                job_id=probe_id,
+                slice_id=probe_id,
+                repo_root=str(Path(__file__).resolve().parents[2]),
+                workspace=None,
+                relay_target=self._relay_target,
+                role=self._job_role(),
+            )
+        else:
+            probe_id = "codex-sandbox-compat-probe"
+            probe_env = {
+                **_git_scope_env(),
+                "PSC_SLICE_ID": probe_id,
+                "PSC_JOB_ID": probe_id,
+                "PSC_REPO_ROOT": str(Path(__file__).resolve().parents[2]),
+            }
+            if self._relay_target is not None:
+                probe_env["PSC_RELAY_TARGET"] = self._relay_target
+        executable = shutil.which("codex", path=probe_env.get("PATH", ""))
+        if executable is None:
+            raise RuntimeError("Codex compatibility probe could not find the codex executable")
+        version_result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=probe_env,
+        )
+        version = (version_result.stdout or version_result.stderr or "").strip()
+        if version_result.returncode != 0 or not version:
+            raise RuntimeError(
+                "Codex compatibility probe could not identify the CLI version"
+            )
+        cache_key = (
+            str(Path(executable).resolve()),
+            version,
+            self._model or "",
+            self._effort or "",
+            runner_mode,
+            probe_env.get("HOME", ""),
+            probe_env.get("CODEX_HOME", ""),
+            probe_env.get("PATH", ""),
+        )
+        with _CODEX_COMPATIBILITY_CACHE_LOCK:
+            result = _CODEX_COMPATIBILITY_CACHE.get(cache_key)
+            if result is None:
+                result = probe_codex_sandbox_compatibility(
+                    model_id=self._model,
+                    env=probe_env,
+                )
+                _CODEX_COMPATIBILITY_CACHE[cache_key] = result
+        if result.selected_mode is None:
+            raise RuntimeError(
+                "Codex sandbox compatibility probe failed for both modes: "
+                f"read-only={result.read_only_reason or 'no agent-loop marker'}; "
+                "workspace-write="
+                f"{result.workspace_write_reason or 'no agent-loop marker'}"
+            )
+        self._codex_sandbox_mode_override = (
+            "workspace-write" if result.fallback else None
+        )
+        if result.fallback:
+            self._codex_compatibility_diagnostic = (
+                "read-only agent loop unavailable: "
+                f"{result.read_only_reason or 'no agent-loop marker'}; "
+                "using workspace-write with Manager worktree/HEAD verification"
+            )
+            logger.warning(
+                "Codex read-only sandbox compatibility fallback: %s",
+                self._codex_compatibility_diagnostic,
+            )
+        elif not result.workspace_write_passed:
+            self._codex_compatibility_diagnostic = (
+                "read-only agent loop passed; workspace-write fallback unavailable: "
+                f"{result.workspace_write_reason or 'no agent-loop marker'}"
+            )
+            logger.warning(
+                "Codex workspace-write compatibility probe failed: %s",
+                self._codex_compatibility_diagnostic,
+            )
+        else:
+            self._codex_compatibility_diagnostic = (
+                "read-only and workspace-write Codex exec probes passed"
+            )
+
     def executor_environment(self, *, slice_id: str = "preflight"):
         """#262 D2：回報正式 job 會實際看到的 executor 環境。
 
@@ -2145,6 +2453,8 @@ class SubprocessLauncher:
         """
 
         from .runtime_preflight import ExecutorEnvironment
+
+        self._ensure_codex_compatibility()
 
         # 降權判定**排在 review_only 之前**（#615 M2）：reviewer 也走降權之後，
         # `_review_scope_env()` 那份「從 daemon environ 篩出來的最小集」對它已經
@@ -2194,7 +2504,11 @@ class SubprocessLauncher:
             # 「不然只是安慰劑」逐字適用）。這張卡的契約宣告不寫工作區，argv 上發的
             # 是 `read-only`——名字沿用契約值而不是 mode 值，因為 `read-only` 那個名字
             # 已經被 planner 佔著，兩者的其餘旗標並不相同（見 `as_write_forbidden`）。
-            mode = "write-forbidden"
+            mode = (
+                "write-forbidden-workspace-write-fallback"
+                if self._codex_sandbox_mode_override == "workspace-write"
+                else "write-forbidden"
+            )
         else:
             mode = "workspace-write"
         return ExecutorEnvironment(
@@ -2355,6 +2669,8 @@ class SubprocessLauncher:
             # `direct` 與 transient `systemd-run` 都不具備這份完整 template 加固面，
             # 因此維持原先按卡片契約導出的 Codex sandbox argv。
             builder_kwargs["trust_root_outer_unit"] = template_plan is not None
+            if self._codex_sandbox_mode_override is not None:
+                builder_kwargs["sandbox_mode_override"] = self._codex_sandbox_mode_override
         # #716：只有 codex 的 argv 上有 `--sandbox <mode>` 這個維度可表達。其餘 executor
         # 沒有對應旗標（`build_claude_argv` 走 `--permission-mode`、`build_copilot_argv`
         # 走 `--allow-all`／`--deny-tool`、agy 走 plan 或 accept-edits、cg 是

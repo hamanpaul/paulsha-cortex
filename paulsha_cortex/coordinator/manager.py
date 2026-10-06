@@ -5050,6 +5050,94 @@ def _verify_build_candidate_transition(
     return candidate
 
 
+def _verify_write_forbidden_worktree(
+    job: Mapping[str, object],
+    *,
+    candidate: str,
+    baseline_candidate: str | None,
+) -> None:
+    """Independently reject any workspace mutation by a no-write build card."""
+
+    if (
+        not isinstance(baseline_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(baseline_candidate) is None
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+    ):
+        raise ValueError("write-forbidden workflow card baseline/candidate unavailable")
+    if candidate.lower() != baseline_candidate.lower():
+        raise ValueError("write-forbidden workflow card changed HEAD")
+    expected = job.get("workflow_sandbox_hash")
+    if expected is None:
+        # Older jobs used Codex's inner read-only sandbox and predate the snapshot
+        # field.  Preserve their closeout contract while new dispatches bind it.
+        return
+    if (
+        not isinstance(expected, str)
+        or len(expected) != 64
+        or any(character not in "0123456789abcdef" for character in expected)
+    ):
+        raise ValueError("write-forbidden workflow card snapshot baseline invalid")
+    worktree_value = job.get("worktree")
+    if not isinstance(worktree_value, str) or not worktree_value:
+        raise ValueError("write-forbidden workflow card worktree unavailable")
+    worktree = Path(worktree_value)
+    if worktree.is_symlink() or not worktree.is_dir():
+        raise ValueError("write-forbidden workflow card worktree unavailable")
+    if _write_forbidden_worktree_snapshot(worktree) != expected:
+        raise ValueError("write-forbidden workflow card changed worktree")
+
+
+def _write_forbidden_worktree_snapshot(worktree: str | Path) -> str:
+    """Bind every checkout file plus Git index/status, excluding `.git` metadata."""
+
+    root = Path(worktree)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("write-forbidden workflow card worktree unavailable")
+    status = subprocess.run(
+        [
+            "git", "-C", str(root), "status", "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise ValueError("write-forbidden workflow card Git status unavailable")
+    digest = hashlib.sha256()
+    digest.update(b"cortex/write-forbidden-worktree/v1\0")
+
+    def visit(path: Path, relative: Path) -> None:
+        metadata = path.lstat()
+        rel = relative.as_posix().encode("utf-8", errors="surrogateescape")
+        digest.update(rel)
+        digest.update(b"\0")
+        digest.update(str(metadata.st_mode).encode("ascii"))
+        digest.update(b"\0")
+        if stat.S_ISLNK(metadata.st_mode):
+            digest.update(b"link\0")
+            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+        elif stat.S_ISDIR(metadata.st_mode):
+            digest.update(b"dir\0")
+            for child in sorted(path.iterdir(), key=lambda item: item.name):
+                if relative == Path(".") and child.name == ".git":
+                    continue
+                visit(child, relative / child.name)
+        elif stat.S_ISREG(metadata.st_mode):
+            digest.update(b"file\0")
+            digest.update(path.read_bytes())
+        else:
+            digest.update(b"special\0")
+            digest.update(str(metadata.st_rdev).encode("ascii"))
+        digest.update(b"\0")
+
+    visit(root, Path("."))
+    digest.update(b"git-status\0")
+    digest.update(status.stdout.encode("utf-8", errors="surrogateescape"))
+    return digest.hexdigest()
+
+
 def workflow_build_branch(run) -> str:
     """run 的 canonical build branch 名——**唯一**一條推導。
 
@@ -11862,19 +11950,40 @@ def _runtime_preflight_gate(
         and getattr(identity, "origin", None) == model_resolution.IDENTITY_ORIGIN_OVERLAY
         for identity in active_candidates
     )
-    if not requirements and not has_overlay_copilot_candidate:
-        return None
     compatibility_for = model_resolution.compatibility_checker_for(step.persona)
 
     # 每個 identity 只 specialize 一次並記憶：preflight 與最終 dispatch 共用同一
     # 個 launcher 實例，因此（a）檢查的環境就是 job 的環境，（b）通過的 identity
     # 不會被重複套用 as_commit_required／as_review_only 等契約工廠。
     specialized: dict[int, object] = {}
+    prebuilt: dict[int, object] = {}
+    codex_readonly_card = False
+    if step.phase == "build" and step.persona == "builder":
+        from ..trust_root import registry as trust_registry
+
+        codex_readonly_card = trust_registry.card_contract_forbids_workspace_write(
+            commit_policy=step.commit_policy,
+            declared_outputs=getattr(step, "outputs", None),
+        )
+    if codex_readonly_card:
+        codex_identity = next(
+            (item for item in active_candidates if getattr(item, "executor", None) == "codex"),
+            None,
+        )
+        if codex_identity is not None:
+            base_launcher = launcher_factory(codex_identity)
+            if getattr(base_launcher, "_codex_compatibility_probe", False):
+                prebuilt[id(codex_identity)] = base_launcher
+
+    if not requirements and not has_overlay_copilot_candidate and not prebuilt:
+        return None
 
     def _launcher_for(identity):
         key = id(identity)
         if key not in specialized:
-            launcher = _specialize_workflow_launcher(launcher_factory(identity), step)
+            launcher = _specialize_workflow_launcher(
+                prebuilt.pop(key, None) or launcher_factory(identity), step
+            )
             _, launcher = _bind_workflow_execution_profile(
                 run,
                 step,
@@ -16908,6 +17017,21 @@ def _dispatch_workflow_card(
                 archive_applied=archive_applied,
             )
             output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
+            if step.phase == "build" and step.persona == "builder":
+                from ..trust_root import registry as trust_registry
+
+                if trust_registry.card_contract_forbids_workspace_write(
+                    commit_policy=step.commit_policy,
+                    declared_outputs=getattr(step, "outputs", None),
+                ) and (
+                    identity.executor == "codex"
+                    and getattr(launcher, "_codex_sandbox_mode_override", None)
+                    == "workspace-write"
+                ):
+                    # A Codex workspace-write compatibility fallback is accepted
+                    # only when Manager can independently compare the entire
+                    # post-input worktree snapshot at closeout.
+                    sandbox_hash = _write_forbidden_worktree_snapshot(effective_repo_root)
         dispatch_base: str | None = None
         if step.phase == "build":
             if post_archive_candidate is not None:
@@ -19682,11 +19806,29 @@ def apply_workflow_action(
             )
         candidate = current.candidate_head
         if current.current_phase == "build":
+            build_baseline = (
+                current.candidate_head
+                if current.candidate_head is not None
+                else job.get("dispatch_head")
+            )
             candidate = _verify_build_candidate_transition(
                 job,
                 previous_candidate=candidate,
                 git_runner=git_runner,
             )
+            from ..trust_root import registry as trust_registry
+
+            if trust_registry.card_contract_forbids_workspace_write(
+                commit_policy=step.commit_policy,
+                declared_outputs=getattr(step, "outputs", None),
+            ):
+                _verify_write_forbidden_worktree(
+                    job,
+                    candidate=candidate,
+                    baseline_candidate=(
+                        build_baseline if isinstance(build_baseline, str) else None
+                    ),
+                )
             _harvest_build_candidate(
                 job, run=current, candidate=candidate, coordinator_root=coordinator_root
             )

@@ -478,6 +478,7 @@ def _call_with_supported_kwargs(func, *args, **kwargs):
 
 
 def _resolve_launcher_compat(*args, **kwargs):
+    kwargs.setdefault("codex_compatibility_probe", True)
     return _call_with_supported_kwargs(_resolve_launcher, *args, **kwargs)
 
 
