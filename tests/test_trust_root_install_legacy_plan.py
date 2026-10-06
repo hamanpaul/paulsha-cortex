@@ -1031,6 +1031,28 @@ def test_undeclared_home_top_entries_are_quarantined_without_review(
     assert _quarantine_steps(plan)[str(retry)]["expected"]["type"] == "file"
 
 
+def test_egress_shared_home_top_level_entries_stay_unclassified(tmp_path: Path) -> None:
+    # #1282 review follow-up: the overlay-owned egress HOME may be a shared
+    # host directory, so its unknown top level must not be auto-quarantined as
+    # if it were a plan-managed cortex HOME.
+    overlay = _legacy_overlay(tmp_path)
+    overlay["service_accounts"]["cortex-egress"]["home"] = str(tmp_path / "host/srv")
+    shared = tmp_path / "host/srv/shared-operator-drop.txt"
+
+    def host(_seeded, _backend, _base) -> None:
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        shared.write_text("shared\n", encoding="utf-8")
+
+    failures = _failures(tmp_path, overlay=overlay, host=host)
+
+    assert any(
+        failure.startswith("unclassified")
+        and str(shared) in failure
+        and "quarantine_paths" in failure
+        for failure in failures
+    ), failures
+
+
 def test_stale_sockets_and_fifos_at_the_top_are_quarantined(tmp_path: Path) -> None:
     # #1282: a stale UNIX socket or FIFO is quarantined like a file, bound
     # by type, owner, mode and inode; nothing ever opens it.
