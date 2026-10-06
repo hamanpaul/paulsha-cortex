@@ -68,6 +68,14 @@ cases:
   rule: protected-root-destruction
   expect: blocked
   command: 'if true; then rm -rf /; fi'
+- id: protected-root-blocked-while-do
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'while true; do rm -rf /; done'
+- id: protected-root-blocked-if-else
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'if false; then echo safe; else rm -rf /; fi'
 - id: protected-root-blocked-time-wrapper
   rule: protected-root-destruction
   expect: blocked
