@@ -2247,7 +2247,7 @@ def test_release_harness_occupies_the_ubuntu_system_ids_before_the_first_plan() 
     runner = _required_text(RUNNER)
     legacy_exit = runner.index("    run_legacy_adoption_profile\n    exit 0")
     seed = runner.index("991:systemd-resolve")
-    plan = runner.index('cortex install trust-root plan \\\n    --config /artifacts/install-config.yaml')
+    plan = runner.index('cortex install trust-root plan \\\n    --config "$prior_config_path"')
     check = runner.index("account_id_sources", plan)
     apply = runner.index("cortex install trust-root apply", plan)
 
@@ -2267,7 +2267,7 @@ def test_release_harness_also_occupies_ids_inside_the_allocation_range() -> None
 
     runner = _required_text(RUNNER)
     seed = runner.index("991:systemd-resolve")
-    plan = runner.index('cortex install trust-root plan \\\n    --config /artifacts/install-config.yaml')
+    plan = runner.index('cortex install trust-root plan \\\n    --config "$prior_config_path"')
     seeding = runner[seed:plan]
     assert "useradd --system --uid 989 --gid 991" in seeding
     assert "groupadd --gid 988" in seeding
