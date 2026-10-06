@@ -21,6 +21,7 @@
 
 ### Added
 
+- **v0.1.14 發版**：`VERSION` 升為 0.1.14，收錄 installer 只拒絕 cortex 帳號的免密碼 sudo（operator 的 `NOPASSWD: ALL` 放行、`visudo`／`cvtsudoers` 改從固定目錄解析）、#1270 `cortex upgrade` 加固、#1275 憑證繼承記錄當下 sha、#1271 ship merge gate 等待仍在跑的 required check、#1278／#716 canary HEAD proof 與證據契約修正（見 `changelog.d/release-0-1-14.md`）。
 - **v0.1.13 發版**：`VERSION` 升為 0.1.13，收錄 #1263 一鍵升級 `cortex upgrade` 與 #716 deployment canary 端到端修正（見 `changelog.d/release-0-1-13.md`）。
 - **#1263 一鍵升級 `cortex upgrade <版本>`**：root 一個指令完成 ingress → plan → apply → 憑證繼承 → activate → verify → loaded↔installed 核對，失敗自動回到前一版；新增 `--recover`／`--status`、`credentials inherit`、`effective_receipt` 與 RC 升級演練；`--release-source`／`--allow-same-version`／`--prior-receipt` 僅供 qualification（`PSC_UPGRADE_QUALIFICATION=1`）使用、無 `--repository` 參數（官方來源固定 `hamanpaul/paulsha-cortex`）；maintenance window 內 SIGHUP 與 INT／TERM 一樣觸發 rollback、`--status` 也偵測 stale lease marker（見 `changelog.d/one-command-upgrade.md`）（#1263）。
 - **#716 post-archive reviewer 不再補入過期的 active OpenSpec 檔**：archive 之後 reviewer 的 OpenSpec planning authority 輸入改讀候選自己的 archive 副本（tasks.md 只容忍 checkbox 差異，entry 不唯一／symlink／缺檔 fail-closed），不再從來源樹 seed claim 當下未勾選的 active 檔（#716）。
