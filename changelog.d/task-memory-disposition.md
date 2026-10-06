@@ -1,0 +1,1 @@
+- #1309：task-memory inline note 增加逐則 disposition terminal 回報；Manager 驗證 note 集合並寫入 reason 雜湊收據，漏報不影響卡片結果。記錄送出區塊雜湊，支援 verify／review 引用已採信 finding 作 applied 證據，並新增 KPI 查詢與文件。
