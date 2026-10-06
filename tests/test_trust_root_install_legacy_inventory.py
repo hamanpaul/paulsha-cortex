@@ -131,9 +131,9 @@ def _normalized_plan_sha256(plan: dict, tmp_path: Path) -> str:
 
 
 # Golden digest of the release install config planned by the installer before
-# legacy adoption existed (base: #1123 receipt bounds).  A legacy-free plan
-# must stay byte-identical, so this constant must never be regenerated to make
-# a legacy change pass.  Regenerated for non-legacy changes only: #716 added
+# legacy adoption existed (base: #1123 receipt bounds). A legacy-free plan must
+# stay byte-identical except for intentional non-legacy deployment contract
+# changes. Regenerated for non-legacy changes: #716 added
 # `version: "1"` to the root-owned manager gh config (manager-gh-config asset),
 # and #716 again added `StateDirectory=` for the gate worktree slot to the gate
 # job template units (the slot must exist before namespace setup), and #716
@@ -141,9 +141,10 @@ def _normalized_plan_sha256(plan: dict, tmp_path: Path) -> str:
 # (the ship lane calls `openspec` by name), and #716 again added
 # `DO_NOT_TRACK=1` there (openspec telemetry crashes under `--jitless`).  #1286
 # moved the account ids out of the release config: the plan now resolves them
-# (and records `account_id_sources`) against the fixed snapshot below.
+# (and records `account_id_sources`) against the fixed snapshot below; #1291
+# added system source-sync, quota-shadow and read-only Monitor unit settings.
 RELEASE_PLAN_GOLDEN_SHA256 = (
-    "8ec74721fd7fe0466b5c70bd0b789fb57c5cdc7f9234d58fddd8588773fc7ab6"
+    "52329e74f84bed178d176d343408d5088a3b31be88eff7a6fd80df499c409abb"
 )
 #: The passwd/group snapshot release-config plans resolve against in tests
 #: (#1286): an Ubuntu-shaped host whose 991-995 are already taken.  Planning a

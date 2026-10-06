@@ -53,6 +53,7 @@ class ProjectMonitorService:
             durable_store=self._durable_work_store,
             read_store=self._work_store,
             stale_after_seconds=config.provider_stale_after_seconds,
+            repo_checkout_read_only=config.repo_checkout_read_only,
             # #506：GitHub 掃描的節流／退避閘門，跨 repo、跨輪次共用一份。
             github_pressure_gate=GitHubPressureGate.from_config(config),
         )

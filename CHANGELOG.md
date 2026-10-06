@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- **#1291 packaged model identity roster**：新增 `codex/gpt-6-luna`、`copilot/gpt-5.4-mini` 與只具 planning/review 的 `agy/gemini-3.8-flash-high`；`cortex model identity add` 可驗證並原子更新 system deployment 的 Manager-owned overlay，保留檔案 owner/mode，無須手改 0600 設定檔（見 `changelog.d/system-deploy-ops-defects.md`）。
+- **#1291 Trust Root system 部署運作修正**：Monitor 以唯讀方式讀取 Manager 擁有的來源樹，Manager 定期將乾淨 checkout 快轉至 GitHub 預設分支；claim 新鮮度上限與 Monitor 刷新週期共用 900 秒界線；packaged roster 加入 `codex/gpt-6-luna`、`copilot/gpt-5.4-mini` 與只具 planning/review 的 `agy/gemini-3.8-flash-high`，`cortex model identity add` 可驗證並原子更新 system Manager-owned overlay；system Manager 無 quota 設定時產生不執行 enforcement 的 shadow admission；Monitor workspace 固定使用 `PSC_REPO_ROOT`；adoption/首次升級時可逆停放既有 `dispatch: auto` slice specs；runbook 補齊行為與檢查方式（見 `changelog.d/system-deploy-ops-defects.md`）。
 - **cortex 進件：#1309 task-memory 逐則處置回報**：登記 work item `task-memory-disposition` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-task-memory-disposition.md`）。
 - **cortex 進件：派工穩定性 #1302–#1307**：登記六個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-dispatch-stability.md`）。
 - **cortex 進件：#1282 審查後續／#1296／#1297**：登記三個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006b.md`）。

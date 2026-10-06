@@ -122,11 +122,13 @@ class LocalGitMirror:
         repo: str,
         runner: GitRunner | None = None,
         timeout_seconds: float = 30.0,
+        allow_fetch: bool = True,
     ) -> None:
         self.repo_root = Path(repo_root)
         self.repo = repo
         self.runner = runner or SubprocessGitRunner()
         self.timeout_seconds = float(timeout_seconds)
+        self.allow_fetch = bool(allow_fetch)
         # 私有 namespace 以 repo slug 的 hash 命名：永遠是合法 ref component，
         # 且兩個 repo 不會互撞。
         self._namespace = (
@@ -273,6 +275,11 @@ class LocalGitMirror:
         wanted = (*wanted_required, *wanted_optional)
         missing = self._missing(wanted)
         if missing:
+            if not self.allow_fetch:
+                raise GitMirrorError(
+                    "read-only local checkout is missing required Git objects; "
+                    "the Manager source sync must advance it first"
+                )
             self._fetch(
                 default_branch=default_branch,
                 # 只替「merge commit 不在本機」的 PR 拉 head ref——已經握有 merge

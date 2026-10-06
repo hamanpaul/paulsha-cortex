@@ -29,6 +29,7 @@ from ..runtime_attestation import (
 )
 from ..trust_root import selfcheck as trust_root_selfcheck
 from . import autonomy, backoff, candidate_base, manager, not_claimable, planning_runtime
+from . import legacy_spec_parking, source_sync
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .diagnostics import diagnostic_reason, summarize_exception
 from .dispatcher import Dispatcher
@@ -528,7 +529,7 @@ def _quota_admission_context_for(environment: dict[str, str] | None = None):
     ``manager._dispatch_workflow_card``／``manager.resume_workflow_run`` 的
     ``quota_admission_context``。
 
-    - 設定檔不存在 → ``None``（行為與 #839 落地前逐字相同）。
+    - 設定檔不存在 → user deploy 保持 ``None``；system deploy 預設建立 shadow map。
     - 設定檔存在但無效：
       - ``PSC_QUOTA_ADMISSION_ENFORCE=on`` → 回
         ``quota_admission.QuotaConfigInvalid``，manager 端在建立任何 job 前
@@ -549,7 +550,13 @@ def _quota_admission_context_for(environment: dict[str, str] | None = None):
     config_path = paths.quota_pools_config_path()
     config, error = _load_quota_pools_config_cached(config_path)
     if config is None and error is None:
-        return None
+        if (
+            os.environ.get("PSC_SYSTEM_QUOTA_SHADOW_DEFAULT") == "1"
+            and not quota_admission.quota_admission_enabled(environment)
+        ):
+            config = _system_default_shadow_quota_config()
+        else:
+            return None
     if error is not None:
         if quota_admission.quota_admission_enabled(environment):
             return quota_admission.QuotaConfigInvalid(reason=safe_exception_summary(error))
@@ -569,6 +576,81 @@ def _quota_admission_context_for(environment: dict[str, str] | None = None):
         # ——落地決策 receipt 才有得投影「這筆決策當時用的是哪一版 operator
         # 設定」，不只有一個只做快取鍵的內部 digest。
         config_revision=config.config_revision,
+    )
+
+
+def _system_default_shadow_quota_config():
+    """Build an unknown-capacity shadow map for every installed model identity."""
+    from . import quota_admission, quota_observation as schema
+
+    identity_registry = load_model_identities()
+    identities = sorted(
+        {(item.executor, item.model_id) for item in identity_registry.identities}
+    )
+    if not identities:
+        raise ValueError("system shadow quota defaults require a non-empty model roster")
+    descriptor_payload = {
+        "schema_version": 1,
+        "authority_id": "cortex-system-shadow-default",
+        "account_id": "unconfigured",
+        "pool_id": "unconfigured",
+        "revision": "1",
+        "authority_ref": "cortex:system-shadow-default/v1",
+        "provenance_refs": ["cortex:system-shadow-default/v1"],
+        "units": [
+            {
+                "unit_id": "capacity",
+                "version": "1",
+                "quantity_kind": "amount",
+                "semantics_ref": "cortex:unconfigured-capacity/v1",
+            }
+        ],
+        "windows": [
+            {
+                "window_id": "default",
+                "kind": "rolling",
+                "unit_ref": {"unit_id": "capacity", "version": "1"},
+                "duration_ms": 3_600_000,
+            }
+        ],
+    }
+    descriptor = schema.parse_pool_descriptor(descriptor_payload)
+    pool_ref = {
+        "authority_id": descriptor.authority_id,
+        "account_id": descriptor.account_id,
+        "pool_id": descriptor.pool_id,
+        "revision": descriptor.revision,
+    }
+    bindings = []
+    for executor, model_id in identities:
+        suffix = hashlib.sha256(f"{executor}\0{model_id}".encode("utf-8")).hexdigest()[:16]
+        bindings.append(
+            {
+                "schema_version": 1,
+                "binding_id": f"system-default-{suffix}",
+                "revision": "1",
+                "subject": {
+                    "kind": "identity",
+                    "executor": executor,
+                    "model_id": model_id,
+                },
+                "constraints": [
+                    {
+                        "state": "known",
+                        "value": {"pool_ref": pool_ref, "window_id": "default"},
+                    }
+                ],
+                "coverage": {"state": "complete", "gaps": []},
+            }
+        )
+    return quota_admission.parse_quota_pools_config(
+        {
+            "schema": quota_admission.QUOTA_POOLS_CONFIG_SCHEMA,
+            "config_revision": "system-shadow-default-v1",
+            "descriptors": [descriptor.to_dict()],
+            "unit_catalog": [],
+            "bindings": bindings,
+        }
     )
 
 
@@ -1876,6 +1958,13 @@ def run_loop(
 
     _run_trust_root_selfcheck()
 
+    if os.environ.get("PSC_PARK_LEGACY_AUTO_SPECS") == "1":
+        legacy_spec_parking.park_legacy_auto_specs(
+            resolved_specs_dir,
+            paths.coordinator_root() / "legacy-auto-spec-parking.json",
+        )
+    _sync_system_repo_source()
+
     last_tick_at: str | None = None
     daemon_idle = True
     last_tick_monotonic = monotonic_fn()
@@ -1991,6 +2080,7 @@ def run_loop(
                 and monotonic_fn() - last_tick_monotonic >= effective_tick_interval
             ):
                 periodic_tick_attempted = True
+                _sync_system_repo_source()
                 try:
                     summary = periodic_runner()
                     skipped = isinstance(summary, dict) and summary.get("dispatch_skipped") == "not-idle"
@@ -2159,6 +2249,18 @@ _LOG_ERROR_DEDUP_STATE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 # 充裕餘裕，同時避免長時間運行的 daemon 因 signature 種類持續增生
 # （例如 source_revision 不斷變動）而讓 dedup state 無界成長。
 LOG_ERROR_DEDUP_MAX_SLOTS = 64
+
+
+def _sync_system_repo_source() -> None:
+    if os.environ.get("PSC_MANAGER_REPO_SOURCE_SYNC") != "1":
+        return
+    try:
+        result = source_sync.sync_source_checkout(paths.repo_root())
+    except (OSError, RuntimeError, ValueError) as exc:
+        _log_error(exc, context={"action": "system-repo-source-sync"})
+        return
+    if result == "advanced":
+        print("manager source checkout advanced to GitHub default branch", file=sys.stderr)
 
 
 def _reset_log_error_dedup_state() -> None:

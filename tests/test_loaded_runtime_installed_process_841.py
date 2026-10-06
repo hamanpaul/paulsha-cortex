@@ -180,7 +180,7 @@ class _Deployment:
             f"    path: {self.tmp_path / 'workspace'}\n"
             "monitor:\n"
             f"  poll_interval_seconds: {poll_interval_seconds}\n"
-            "  github_refresh_interval_seconds: 3600\n"
+            "  github_refresh_interval_seconds: 300\n"
             f"  socket_path: {self.socket_path}\n",
             encoding="utf-8",
         )

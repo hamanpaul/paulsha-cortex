@@ -18,13 +18,13 @@ from urllib.parse import quote
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.schema import BAND_LEVELS
 from paulsha_cortex.github_rate_limit import is_rate_limit_signal
+from paulsha_cortex.provider_freshness import PROVIDER_MAX_AGE_SECONDS
 
 from . import verification
 
 AUTO_LABEL = "cortex:auto-on-going"
 WORK_SNAPSHOT_SCHEMA = "work-items-snapshot/v1"
 GITHUB_PROVIDER_ID = "github"
-PROVIDER_MAX_AGE_SECONDS = 900
 DERIVED_AUTHORITY_KINDS = frozenset({"workflow_run", "completion_record"})
 
 # #206：穩定 reason code，供 upstream（durable done record／manager log）在不

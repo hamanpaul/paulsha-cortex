@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 from paulsha_cortex.config import paths
 from paulsha_cortex.monitor.registry import ProjectEntry, load_hippo_projects, merge_projects
+from paulsha_cortex.provider_freshness import PROVIDER_MAX_AGE_SECONDS
 
 ENV_CONFIG_VAR = "PAULSHACLAW_CONFIG"
 NEW_ENV_CONFIG_VAR = "PSC_MONITOR_CONFIG"
@@ -56,6 +57,7 @@ class MonitorConfig:
     thread_count_warn_threshold: int = 200
     github_refresh_interval_seconds: int = 300
     provider_stale_after_seconds: int = 900
+    repo_checkout_read_only: bool = False
     legacy_policy: str = "list-only"
     socket_path: Path = field(default_factory=default_socket_path)
     ignore_dirs: tuple[str, ...] = ()
@@ -148,6 +150,28 @@ def _parse_monitor_section(raw: Any) -> dict[str, Any]:
     return raw
 
 
+def _enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _system_workspace_override(config: MonitorConfig) -> MonitorConfig:
+    """Use the system deployment's own source tree instead of an operator HOME path."""
+    if not _enabled("PSC_MONITOR_REPO_ROOT_ONLY"):
+        return config
+    repo_root = paths.configured_repo_root()
+    if repo_root is None or not repo_root.is_dir():
+        raise ValueError("PSC_MONITOR_REPO_ROOT_ONLY requires an existing PSC_REPO_ROOT")
+    from paulsha_cortex.monitor.fs import stable_path
+
+    root = stable_path(repo_root)
+    hippo_projects = tuple(project for project in config.hippo_projects if project.path != root)
+    return replace(
+        config,
+        workspaces=(WorkspaceConfig(path=root, name=root.name),),
+        hippo_projects=hippo_projects,
+    )
+
+
 def _load_manual_config(resolved: Path) -> MonitorConfig:
     if not resolved.exists():
         raise FileNotFoundError(f"設定檔不存在：{resolved}")
@@ -200,6 +224,18 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
     poll_interval = intervals["poll_interval_seconds"]
     rescan_interval = intervals["rescan_interval_seconds"]
     debounce = intervals["watch_debounce_ms"]
+    refresh_interval = intervals["github_refresh_interval_seconds"]
+    stale_after = intervals["provider_stale_after_seconds"]
+    if stale_after > PROVIDER_MAX_AGE_SECONDS:
+        raise ValueError(
+            "config.monitor.provider_stale_after_seconds must not exceed "
+            f"claim provider freshness limit {PROVIDER_MAX_AGE_SECONDS}"
+        )
+    if refresh_interval >= min(stale_after, PROVIDER_MAX_AGE_SECONDS):
+        raise ValueError(
+            "config.monitor.github_refresh_interval_seconds must be less than "
+            "the provider freshness limit"
+        )
 
     socket_raw = monitor.get("socket_path")
     socket_path = (
@@ -221,6 +257,7 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
         thread_count_warn_threshold=intervals["thread_count_warn_threshold"],
         github_refresh_interval_seconds=intervals["github_refresh_interval_seconds"],
         provider_stale_after_seconds=intervals["provider_stale_after_seconds"],
+        repo_checkout_read_only=_enabled("PSC_MONITOR_REPO_READONLY"),
         legacy_policy=legacy_policy,
         socket_path=socket_path,
         ignore_dirs=ignore_dirs,
@@ -259,15 +296,25 @@ def load_config(*, config_path: Path | None = None) -> MonitorConfig:
                 "無 project 設定：manual（project-cortex.yaml / legacy）與 "
                 "project-hippo.yaml 皆不存在"
             )
-        return MonitorConfig(workspaces=(), hippo_projects=tuple(hippo))
+        return _system_workspace_override(
+            MonitorConfig(
+                workspaces=(),
+                hippo_projects=tuple(hippo),
+                repo_checkout_read_only=_enabled("PSC_MONITOR_REPO_READONLY"),
+            )
+        )
     if config_path is not None:
-        return replace(_load_manual_config(resolved), hippo_projects=())
+        return _system_workspace_override(
+            replace(_load_manual_config(resolved), hippo_projects=())
+        )
     
     hippo_list = merge_projects(
         load_hippo_projects(resolved.parent / "project-hippo.yaml"),
         active_repo_projects,
     )
-    return replace(
-        _load_manual_config(resolved),
-        hippo_projects=tuple(hippo_list),
+    return _system_workspace_override(
+        replace(
+            _load_manual_config(resolved),
+            hippo_projects=tuple(hippo_list),
+        )
     )

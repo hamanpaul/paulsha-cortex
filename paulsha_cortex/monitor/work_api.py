@@ -528,6 +528,7 @@ class WorkModelRefresher:
         issue_sync_store: IssueSyncStore | None = None,
         event_spool: EventSpool | None = None,
         quota_decision_store: "quota_admission_module.AdmissionDecisionStore | None" = None,
+        repo_checkout_read_only: bool = False,
     ) -> None:
         self.durable_store = durable_store
         self.read_store = read_store
@@ -578,6 +579,7 @@ class WorkModelRefresher:
         # 由記憶體 cache 承接，不必每輪重種、也不讓種子無限累積。
         self._quota_decision_seeded_repos: set[str] = set()
         self.stale_after_seconds = stale_after_seconds
+        self.repo_checkout_read_only = bool(repo_checkout_read_only)
         self.now = now or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
 
@@ -716,6 +718,11 @@ class WorkModelRefresher:
                             # 讀的就是這個 repo 在 workspace 的 canonical checkout
                             # （與 ``RepoWorkProvider`` 同一個 root）。
                             repo_root=root,
+                            **(
+                                {"allow_git_fetch": False}
+                                if self.repo_checkout_read_only
+                                else {}
+                            ),
                         )
                         if self._uses_default_github_terminal_provider
                         else self.github_terminal_provider_factory(repo)

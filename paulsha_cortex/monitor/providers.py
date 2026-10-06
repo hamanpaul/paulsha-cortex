@@ -2218,6 +2218,7 @@ class GitHubTerminalProvider:
         pressure_gate: GitHubPressureGate | None = None,
         repo_root: str | Path | None = None,
         git_runner: GitRunner | None = None,
+        allow_git_fetch: bool = True,
     ) -> None:
         self.repo = repo
         self.provider_id = f"github-terminal:{repo}"
@@ -2229,6 +2230,7 @@ class GitHubTerminalProvider:
         # closed（degraded），**不會**退回 REST，也不會當成「檔案不存在」。
         self.repo_root = None if repo_root is None else Path(repo_root)
         self.git_runner = git_runner
+        self.allow_git_fetch = bool(allow_git_fetch)
         # #506：本 provider 的 GraphQL 分頁仍需共用 token 節流／退避。
         self.pressure_gate = pressure_gate
         if any(
@@ -2542,6 +2544,7 @@ class GitHubTerminalProvider:
             repo=self.repo,
             runner=self.git_runner,
             timeout_seconds=self.timeout_seconds,
+            allow_fetch=self.allow_git_fetch,
         )
 
     @staticmethod

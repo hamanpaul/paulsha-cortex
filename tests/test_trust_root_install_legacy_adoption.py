@@ -417,9 +417,10 @@ def _receipt_view(receipt: InstallReceipt) -> dict[str, object]:
 # `StateDirectory=` for the gate worktree slot to the gate job template units
 # (generated unit bytes only; no legacy code path changed), and #716 once more
 # added the toolchain-first `PATH` to the generated manager EnvironmentFile,
-# and #716 again added `DO_NOT_TRACK=1` there (openspec under `--jitless`).
+# and #716 again added `DO_NOT_TRACK=1` there (openspec under `--jitless`), and
+# #1291 added system source-sync, quota-shadow and read-only Monitor unit settings.
 REGRESSION_GOLDEN_SHA256 = (
-    "998f5e7babbe431f73afe9543065024c43c9e336ca25cc16d86c1d6c33485fcb"
+    "2415ef99e01fa981de697b52d8cd39c96792ceac0dc2cec8b52d27b79baa1598"
 )
 
 

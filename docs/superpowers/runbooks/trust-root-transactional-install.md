@@ -1171,3 +1171,52 @@ container 內安裝 exact wheel、跑完整 intake-to-closeout，並要求 `work
 確實由指定 Codex model 自主產生至少一筆成功且有輸出的 command event。沒有成功的 live
 canary run 時，#716 必須維持 open。probe repository 的準備、secret 形狀與重置見
 `docs/superpowers/runbooks/deployment-canary-probe.md`。
+
+## 8. Issue #1291 system deployment operations
+
+### Source checkout sync and Monitor access
+
+`cortex-manager` owns `<PSC_AGENTS_ROOT>/repos/<repo>` and is the only service that
+writes it. At startup and before each periodic tick, Manager reads the GitHub
+origin's advertised default branch, fetches it into a private ref without writing
+`.git/FETCH_HEAD`, and fast-forwards only when the tracked worktree is clean and
+the update is a fast-forward. Dirty, ahead, diverged, or unreachable checkouts are
+left in place and reported through the `system-repo-source-sync` diagnostic.
+New `.cortex/work-items.yaml` and workstream files become visible to the next
+Monitor scan after a successful advance.
+
+The system Monitor unit sets `PSC_MONITOR_REPO_READONLY=1` and
+`PSC_MONITOR_REPO_ROOT_ONLY=1`. It uses the instance's `PSC_REPO_ROOT` workspace
+and does not fetch. If a required object is missing, `github-terminal` remains
+degraded until Manager advances the checkout; last-good provider data remains
+available. Check the Manager journal for `system-repo-source-sync`, then compare
+`git -C "$PSC_REPO_ROOT" rev-parse HEAD` with the GitHub default branch.
+
+### Freshness, quota shadow, and project config
+
+`github_refresh_interval_seconds` must be less than `provider_stale_after_seconds`,
+and the stale threshold cannot exceed the shared 900-second claim limit. The
+default refresh interval is 300 seconds and the default stale threshold is 900
+seconds. Invalid combinations fail during Monitor config loading. These rules
+apply to system and user-level Monitor configurations.
+
+When a system Manager has no operator `quota-pools.json`, it uses an in-memory
+shadow configuration with an unknown-capacity pool bound to installed model
+identities. This records quota admission decisions without enforcing them. An
+explicit operator configuration takes precedence; enforcement still requires its
+existing opt-in. The system Monitor's project workspace resolves to
+`PSC_REPO_ROOT`, even if a retained `project-cortex.yaml` points into operator
+HOME. Check the generated Monitor environment and keep `ProtectHome=yes` enabled.
+
+### Model identities and legacy automatic specs
+
+Use `cortex model identity add` to validate and atomically update the Manager-owned
+model identity overlay; the command preserves its owner and mode. Do not edit the
+0600 Manager file by hand.
+
+On the first Manager start after adoption or upgrade, existing top-level
+`dispatch: auto` slice specs move intact to `specs/.parked-YYYY-MM-DD/`. A durable
+marker makes this migration run once, so specs created later remain eligible for
+dispatch. Restore a parked spec by moving the reviewed file back to the `specs/`
+root; its bytes are preserved. These checks describe pre-archive delivery only;
+archive, merge, and issue closure remain delivery-manager actions.
