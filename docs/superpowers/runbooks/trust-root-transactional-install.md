@@ -91,8 +91,8 @@ legacy adoption（`trust-root-legacy-adoption.md`）仍照這些步驟操作。
 
 ## 1. 封存唯一 candidate CLI
 
-先由 release artifact ingress 將 `v0.1.13` 的 install-input archive 與 qualification
-manifest 放到 `/var/lib/cortex-installer/0.1.13/release`。這個 ingress 是前置 authority：
+先由 release artifact ingress 將 `v0.1.14` 的 install-input archive 與 qualification
+manifest 放到 `/var/lib/cortex-installer/0.1.14/release`。這個 ingress 是前置 authority：
 目錄及每一層 ancestor 必須是 root-owned、不可由 group/other 寫入、不可有 symlink。
 不要直接從使用者 checkout、`$HOME` 或 `/tmp` 以 root 執行 candidate code。
 
@@ -112,15 +112,15 @@ PATH=/usr/bin:/bin
 export PATH
 
 cortex_installer_root=/var/lib/cortex-installer
-cortex_bootstrap_root="$cortex_installer_root/0.1.13"
+cortex_bootstrap_root="$cortex_installer_root/0.1.14"
 cortex_release_root="$cortex_bootstrap_root/release"
 cortex_input_root="$cortex_bootstrap_root/input"
-cortex_install_input_archive="$cortex_release_root/paulsha-cortex-0.1.13-install-input.tar.gz"
-cortex_qualification_manifest="$cortex_release_root/paulsha-cortex-0.1.13-qualification.json"
+cortex_install_input_archive="$cortex_release_root/paulsha-cortex-0.1.14-install-input.tar.gz"
+cortex_qualification_manifest="$cortex_release_root/paulsha-cortex-0.1.14-qualification.json"
 cortex_bundle="$cortex_input_root/bundle.json"
 cortex_install_config="$cortex_input_root/install-config.yaml"
 cortex_release_candidate_sha=<40-hex-annotated-tag-target>
-cortex_release_wheel_asset_name=paulsha_cortex-0.1.13-py3-none-any.whl
+cortex_release_wheel_asset_name=paulsha_cortex-0.1.14-py3-none-any.whl
 cortex_release_wheel_asset_sha256=<64-hex-release-wheel-asset-digest>
 cortex_install_input_asset_sha256=<64-hex-release-install-input-asset-digest>
 cortex_qualification_asset_sha256=<64-hex-release-qualification-asset-digest>
@@ -972,7 +972,7 @@ PATH=/usr/bin:/bin
 export PATH
 
 cortex_installer_root=/var/lib/cortex-installer
-cortex_bootstrap_root="$cortex_installer_root/0.1.13"
+cortex_bootstrap_root="$cortex_installer_root/0.1.14"
 cortex_cli="$cortex_bootstrap_root/venv/bin/cortex"
 read -r -p "Re-enter the previously reviewed plan SHA-256: " cortex_confirmed_plan_sha
 test "${#cortex_confirmed_plan_sha}" -eq 64
@@ -1067,7 +1067,7 @@ state，必須先人工裁決。不得改用 tokenless rollback 或手動刪 rec
 `sudo /opt/cortex/venv/bin/cortex upgrade --recover`：它從 maintenance snapshot（只剩 stale
 lease marker 時改用 marker）取得 plan sha、核對 durable plan，再走上面同一個 `recover`。只有
 它拒絕執行或回報要人工裁決時，才照上面的 snippet 手動恢復。這時 snippet 裡寫死的
-`0.1.13/venv` 不適用：該次升級的 sealed CLI 在它自己的 attempt 目錄。每個變數改由該次升級的
+`0.1.14/venv` 不適用：該次升級的 sealed CLI 在它自己的 attempt 目錄。每個變數改由該次升級的
 report（`/var/lib/cortex-installer/<版本>/upgrade-report.json`，與
 `/var/lib/cortex-installer/last-upgrade-report.json` 內容相同）對應：
 
