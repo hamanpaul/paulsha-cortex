@@ -1673,3 +1673,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/async-long-requests/todo.md'
     excludes: []
+  task-memory-disposition:
+    title: 'task-memory-disposition'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1309'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/task-memory-disposition/todo.md'
+    excludes: []
