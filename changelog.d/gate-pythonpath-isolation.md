@@ -1,0 +1,1 @@
+Gate and preflight subprocesses now remove inherited Python startup and import-path variables. Gate tests therefore import from the candidate worktree instead of the Manager runtime pin. Operator documentation describes the isolation.

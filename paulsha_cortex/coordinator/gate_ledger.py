@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from ..python_env import clean_python_path_environment
 from . import spool_slot, terminal_contract
 
 
@@ -356,6 +357,7 @@ def run_gates(
     """
 
     execute = subprocess.run if runner is None else runner
+    environment = clean_python_path_environment()
     rows: list[dict[str, object]] = []
     for spec in specs:
         try:
@@ -365,6 +367,7 @@ def run_gates(
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=environment,
             )
             exit_code = int(completed.returncode)
             detail = ""

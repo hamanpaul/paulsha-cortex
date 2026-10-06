@@ -200,6 +200,9 @@ def test_run_preflight_strips_inherited_cortex_runtime_from_gate_processes(
     monkeypatch.setenv("PREFLIGHT_AUTH_MARKER", "preserved")
     monkeypatch.setenv("HOME", "/operator/home")
     monkeypatch.setenv("XDG_CACHE_HOME", "/operator/cache")
+    monkeypatch.setenv("PYTHONPATH", "/operator/python-path")
+    monkeypatch.setenv("PYTHONHOME", "/operator/python-home")
+    monkeypatch.setenv("PYTHONSTARTUP", "/operator/python-startup")
     monkeypatch.setenv("PYTHONUSERBASE", "/operator/python-user-base")
     monkeypatch.setenv("GH_CONFIG_DIR", "/operator/gh-config")
     calls: list[dict[str, object]] = []
@@ -238,7 +241,10 @@ def test_run_preflight_strips_inherited_cortex_runtime_from_gate_processes(
         assert environment["XDG_CACHE_HOME"] == str(
             Path(environment["HOME"]) / ".cache"
         )
-        assert environment["PYTHONUSERBASE"] == "/operator/python-user-base"
+        assert not any(
+            name in environment
+            for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE")
+        )
         assert environment["GH_CONFIG_DIR"] == "/operator/gh-config"
         disposable_homes.add(Path(environment["HOME"]))
     assert len(disposable_homes) == 1

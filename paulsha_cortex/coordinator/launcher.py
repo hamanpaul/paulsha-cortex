@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
+from ..python_env import PYTHON_PATH_ENVIRONMENT
 from . import gate_ledger, job_runner, job_workspace, spool_slot, task_memory, terminal_contract
 from ..persona.context import build_persona_context
 
@@ -301,8 +302,14 @@ def _gate_segment(*, ledger: str, worktree: str, repo_root: str) -> str:
         "--worktree",
         worktree,
     ]
+    environment_argv = ["env"]
+    for name in sorted(PYTHON_PATH_ENVIRONMENT - {"PYTHONPATH"}):
+        environment_argv.extend(("-u", name))
+    # gate_ledger must import the deployed Cortex runtime; run_gates() removes this
+    # explicit PYTHONPATH, and the other inherited Python overrides, from test children.
+    environment_argv.append(f"PYTHONPATH={repo_root}")
     return (
-        f"PYTHONPATH={shlex.quote(repo_root)} {shlex.join(gate_argv)} >/dev/null 2>&1"
+        f"{shlex.join(environment_argv)} {shlex.join(gate_argv)} >/dev/null 2>&1"
     )
 
 

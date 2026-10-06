@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **#1302 gate 與 preflight 的 Python 環境隔離**：子程序清除繼承的 Python startup／import-path 變數，使 gate 從候選工作樹載入程式；同步更新 operator 說明（見 `changelog.d/gate-pythonpath-isolation.md`）。
 - **cortex 進件：#1309 task-memory 逐則處置回報**：登記 work item `task-memory-disposition` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-task-memory-disposition.md`）。
 - **cortex 進件：派工穩定性 #1302–#1307**：登記六個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-dispatch-stability.md`）。
 - **cortex 進件：#1282 審查後續／#1296／#1297**：登記三個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006b.md`）。

@@ -7,7 +7,6 @@ import math
 import os
 import shlex
 import shutil
-import site
 import subprocess
 import tempfile
 import time
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.python_env import clean_python_path_environment
 
 from . import verification
 
@@ -368,17 +368,16 @@ def _run(
 def _preflight_environment(*, disposable_home: Path) -> dict[str, str]:
     """Isolate Cortex state while retaining the operator's tool/auth roots."""
 
-    environment = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith("PSC_")
-    }
+    environment = clean_python_path_environment(
+        {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith("PSC_")
+        }
+    )
     original_home = Path(environment.get("HOME") or Path.home()).expanduser()
-    python_user_base = environment.get("PYTHONUSERBASE") or site.getuserbase()
     environment["HOME"] = str(disposable_home)
     environment["XDG_CACHE_HOME"] = str(disposable_home / ".cache")
-    if python_user_base:
-        environment["PYTHONUSERBASE"] = str(python_user_base)
     environment.setdefault("GH_CONFIG_DIR", str(original_home / ".config" / "gh"))
     return environment
 

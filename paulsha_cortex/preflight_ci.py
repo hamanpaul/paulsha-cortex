@@ -66,6 +66,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .python_env import clean_python_path_environment
+
 Runner = Callable[..., object]
 
 #: backend：治理引擎自己的 CI-parity preflight 進入點。**本模組不 import 它**——
@@ -103,6 +105,7 @@ def _run(argv: Sequence[str], *, cwd: Path, runner: Runner) -> subprocess.Comple
             capture_output=True,
             text=True,
             timeout=120,
+            env=clean_python_path_environment(),
         )
     except FileNotFoundError as exc:
         # `gh` 不在 PATH 上時原本會是一個裸 traceback；這一族外部程式在登記表的
@@ -268,7 +271,12 @@ def main(argv: Sequence[str] | None = None, *, runner: Runner = subprocess.run) 
             skip_tests=args.skip_tests,
         )
         try:
-            completed = runner(list(backend), cwd=str(repo_root), shell=False)
+            completed = runner(
+                list(backend),
+                cwd=str(repo_root),
+                shell=False,
+                env=clean_python_path_environment(),
+            )
         except FileNotFoundError:
             print(
                 "PREFLIGHT ERROR: 找不到 python interpreter——`PSC_PREFLIGHT_CMD` 應指向"

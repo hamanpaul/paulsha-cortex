@@ -519,6 +519,7 @@ def test_wrapper_without_a_bundle_runs_gate_before_sentinel() -> None:
 
     assert _wrapper() == (
         "true; __psc_rc=$?; "
+        "env -u PYTHONHOME -u PYTHONSTARTUP -u PYTHONUSERBASE "
         "PYTHONPATH=/tmp/psc-nonexistent/repo python3 -m paulsha_cortex.coordinator.gate_ledger "
         "--out /tmp/psc-nonexistent/s.gates.json --worktree /tmp/psc-nonexistent/wt "
         '>/dev/null 2>&1; printf %s "$__psc_rc" > /tmp/psc-nonexistent/s.exit; '

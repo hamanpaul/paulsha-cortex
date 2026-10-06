@@ -1010,6 +1010,8 @@ cortex tick \
 
 Daemon log 的每筆輸出則會以 ISO-8601 時間戳作為欄位首位，便於 `journalctl` / `manager.log` 直接過濾。
 
+Gate wrapper 只在啟動部署 runtime 的 `gate_ledger` 時明確設定 `PYTHONPATH`；啟動前會清除其他繼承的 Python override。`gate_ledger` 再從 gate 子程序環境移除 `PYTHONPATH`、`PYTHONHOME`、`PYTHONSTARTUP`、`PYTHONUSERBASE`，讓測試從快照工作樹解析 imports。Preflight 子程序也會移除這四個變數。operator 不需要再為此替 gate 命令加 `env -u`。
+
 ### 3. 觀察任務狀態
 
 ```bash
