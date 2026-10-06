@@ -1729,3 +1729,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/tick-background-preflight/todo.md'
     excludes: []
+  reviewer-sandbox-retention:
+    title: 'reviewer-sandbox-retention'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1321'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/reviewer-sandbox-retention/todo.md'
+    excludes: []
