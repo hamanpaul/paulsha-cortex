@@ -580,6 +580,19 @@ parent 與本次隨機且不存在的 effective receipt path 都符合本次變�
 必須明確指定上一個已 `applied` 且 `qualified` 的 root-owned receipt，installer 只從該
 receipt 繼承同 roots、同 repository remote、逐 step 相符的 provenance。
 
+preflight 也檢查 sudoers：以固定路徑（依序 `/usr/sbin`、`/usr/bin`、`/sbin`、`/bin`，
+不看 `PATH`）的 `visudo -c` 驗證 `/etc/sudoers`，再以 `cvtsudoers -f json -e` 展開
+include 與別名後評估。**只拒絕對 plan 宣告的 cortex 帳號生效的萬用免密碼 sudo**——
+cortex 帳號指四個 principal 帳號與 `cortex-egress`；規則的 user-spec 以帳號名稱、`#uid`、
+它所屬的 primary／supplementary 群組（`%群組`、`%#gid`）、展開後含上述任一者的
+User_Alias，或 `ALL` 指到它，且主機與指令皆為萬用、不需認證（runas 是 root 或另一個帳號
+都算）。失敗代碼為 `cortex_account_universal_nopasswd`，detail 列出帳號。operator 等其他
+帳號的 `NOPASSWD: ALL`（例如 `<operator> ALL=(ALL) NOPASSWD: ALL`）放行，apply 前不必
+移開；cortex 帳號只對特定指令免認證也不算萬用。sudoers 狀態無法判定（固定路徑找不到
+`visudo`／`cvtsudoers`、`visudo -c` 失敗、轉出的 JSON 無法解析）時以同一代碼 fail
+closed，detail 寫明原因。本機證明不了成員的 user-spec（netgroup、non-Unix group）以及
+否定排除（`!帳號`）都保守地當成涵蓋 cortex 帳號。
+
 ```bash
 cortex_prior_receipt=  # fresh install 保持空字串；upgrade 填絕對路徑
 cortex_prior_args=()

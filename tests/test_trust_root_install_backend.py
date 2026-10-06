@@ -2003,7 +2003,7 @@ def test_preflight_rejects_non_private_service_group_membership_or_gid_alias(
         "cgroup_v2": True,
         "acl": True,
         "disk_free_bytes": 1,
-        "universal_nopasswd": False,
+        "cortex_account_universal_nopasswd": {"accounts": [], "unproven": None},
         "in_flight_jobs": 0,
         "services": {},
         "accounts": {},
@@ -2818,10 +2818,204 @@ def test_missing_getfacl_binary_is_not_reported_as_an_empty_acl(
     assert calls == []
 
 
+# --- sudoers：只拒絕對 cortex 帳號生效的萬用免密碼 sudo（#1122 owner 裁決） ---
+#
+# 兩個 plan 宣告的 cortex 帳號：cortex-builder 另屬 supplementary 群組 cortex-ops；
+# operator 是 operator 帳號，屬 operators 群組，與 cortex 帳號無交集。
+_SUDO_PLAN_ACCOUNTS: tuple[Mapping[str, object], ...] = (
+    {"name": "cortex-builder", "uid": 1234, "gid": 1234},
+    {"name": "cortex-gate", "uid": 1235, "gid": 1235},
+)
+_SUDO_PASSWD = (SimpleNamespace(pw_name="operator", pw_uid=1000, pw_gid=1000),)
+_SUDO_GROUPS = (
+    SimpleNamespace(gr_name="cortex-builder", gr_gid=1234, gr_mem=[]),
+    SimpleNamespace(gr_name="cortex-gate", gr_gid=1235, gr_mem=[]),
+    SimpleNamespace(gr_name="cortex-ops", gr_gid=5555, gr_mem=["cortex-builder"]),
+    SimpleNamespace(gr_name="operators", gr_gid=1000, gr_mem=["operator"]),
+)
+_SUDO_ALLOWED = {"accounts": [], "unproven": None}
+_SUDO_BUILDER_REFUSED = {"accounts": ["cortex-builder"], "unproven": None}
+_SUDO_ALL_REFUSED = {"accounts": ["cortex-builder", "cortex-gate"], "unproven": None}
+# 測試只用這組固定路徑找真的 sudo 工具，不靠 process PATH。
+_SYSTEM_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _cortex_sudo_verdict(sudoers: Path) -> Mapping[str, object]:
+    return backend_module._cortex_account_universal_nopasswd(
+        _SUDO_PLAN_ACCOUNTS,
+        passwd_records=_SUDO_PASSWD,
+        group_records=_SUDO_GROUPS,
+        sudoers=sudoers,
+    )
+
+
+def _cortex_sudo_document_verdict(document: object) -> Mapping[str, object]:
+    principals = backend_module._cortex_sudoers_principals(
+        _SUDO_PLAN_ACCOUNTS,
+        passwd_records=_SUDO_PASSWD,
+        group_records=_SUDO_GROUPS,
+    )
+    return backend_module._sudoers_document_verdict(document, principals)
+
+
+def _assert_sudo_unproven(verdict: Mapping[str, object], *needles: str) -> None:
+    assert verdict["accounts"] == []
+    reason = verdict["unproven"]
+    assert isinstance(reason, str) and reason
+    for needle in needles:
+        assert needle in reason
+
+
+def _sudoers_rule(
+    users: list[Mapping[str, object]],
+    *,
+    commands: tuple[str, ...] = ("ALL",),
+    authenticate: bool | None = False,
+    runas: tuple[str, ...] | None = ("ALL",),
+) -> dict[str, object]:
+    """一列 cvtsudoers `-f json -e` 的 User_Specs（形狀照實機輸出）。"""
+
+    command_spec: dict[str, object] = {
+        "Commands": [{"command": command} for command in commands],
+    }
+    if runas is not None:
+        command_spec["runasusers"] = [{"username": name} for name in runas]
+    if authenticate is not None:
+        command_spec["Options"] = [{"authenticate": authenticate}, {"setenv": True}]
+    return {
+        "User_List": users,
+        "Host_List": [{"hostname": "ALL"}],
+        "Cmnd_Specs": [command_spec],
+    }
+
+
+def _sudoers_json(*rules: dict[str, object], defaults: list[object] | None = None) -> dict[str, object]:
+    document: dict[str, object] = {"User_Specs": list(rules)}
+    if defaults is not None:
+        document["Defaults"] = defaults
+    return document
+
+
+@pytest.mark.parametrize(
+    ("users", "expected"),
+    [
+        # operator／其他帳號的萬用免密碼 sudo 放行（owner 裁決）。
+        ([{"username": "operator"}], _SUDO_ALLOWED),
+        ([{"usergroup": "operators"}], _SUDO_ALLOWED),
+        ([{"userid": 1000}], _SUDO_ALLOWED),
+        ([{"usergid": 1000}], _SUDO_ALLOWED),
+        # `ALL ALL=(ALL) NOPASSWD: ALL` 涵蓋每一個 cortex 帳號。
+        ([{"username": "ALL"}], _SUDO_ALL_REFUSED),
+        ([{"username": "cortex-builder"}], _SUDO_BUILDER_REFUSED),
+        # sudoers 預設 case_insensitive_user／case_insensitive_group。
+        ([{"username": "CORTEX-Builder"}], _SUDO_BUILDER_REFUSED),
+        ([{"userid": 1234}], _SUDO_BUILDER_REFUSED),
+        ([{"usergroup": "cortex-ops"}], _SUDO_BUILDER_REFUSED),
+        ([{"usergroup": "Cortex-Ops"}], _SUDO_BUILDER_REFUSED),
+        ([{"usergroup": "cortex-builder"}], _SUDO_BUILDER_REFUSED),
+        ([{"usergid": 5555}], _SUDO_BUILDER_REFUSED),
+        ([{"usergid": 1234}], _SUDO_BUILDER_REFUSED),
+        # User_Alias 經 `-e` 展開成成員清單。
+        (
+            [{"username": "operator"}, {"username": "cortex-builder"}, {"userid": 1235}],
+            _SUDO_ALL_REFUSED,
+        ),
+        # 否定項只會排除；保守地不採信排除（寧可多拒）。
+        (
+            [{"username": "ALL"}, {"username": "cortex-builder", "negated": True}],
+            _SUDO_ALL_REFUSED,
+        ),
+        ([{"username": "cortex-builder", "negated": True}], _SUDO_ALLOWED),
+        # 本機無法證明成員的 user 形式一律視為涵蓋 cortex 帳號。
+        ([{"netgroup": "admins"}], _SUDO_ALL_REFUSED),
+        ([{"nonunixgroup": "admins"}], _SUDO_ALL_REFUSED),
+        ([{"nonunixgid": 7777}], _SUDO_ALL_REFUSED),
+        ([{"useralias": "UNEXPANDED"}], _SUDO_ALL_REFUSED),
+    ],
+)
+def test_cortex_sudo_verdict_scopes_universal_noauth_to_cortex_accounts(
+    users: list[Mapping[str, object]], expected: Mapping[str, object]
+) -> None:
+    assert _cortex_sudo_document_verdict(_sudoers_json(_sudoers_rule(users))) == expected
+
+
+@pytest.mark.parametrize("runas", [("ALL",), ("root",), ("cortex-gate",), None])
+def test_cortex_sudo_verdict_refuses_universal_noauth_for_any_runas_target(
+    runas: tuple[str, ...] | None,
+) -> None:
+    # root 是提權；另一個 cortex 帳號是跨 principal 橫移——兩者都不可免認證。
+    document = _sudoers_json(_sudoers_rule([{"username": "cortex-builder"}], runas=runas))
+
+    assert _cortex_sudo_document_verdict(document) == _SUDO_BUILDER_REFUSED
+
+
+def test_cortex_sudo_verdict_allows_specific_command_noauth_for_cortex_account() -> None:
+    document = _sudoers_json(
+        _sudoers_rule([{"username": "cortex-builder"}], commands=("/usr/bin/id",)),
+        _sudoers_rule([{"username": "operator"}]),
+    )
+
+    assert _cortex_sudo_document_verdict(document) == _SUDO_ALLOWED
+
+
+def test_cortex_sudo_verdict_applies_global_noauth_default_to_cortex_rules_only() -> None:
+    defaults = [{"Options": [{"authenticate": False}]}]
+
+    assert _cortex_sudo_document_verdict(
+        _sudoers_json(
+            _sudoers_rule([{"username": "operator"}], authenticate=None),
+            defaults=defaults,
+        )
+    ) == _SUDO_ALLOWED
+    assert _cortex_sudo_document_verdict(
+        _sudoers_json(
+            _sudoers_rule([{"usergroup": "cortex-ops"}], authenticate=None),
+            defaults=defaults,
+        )
+    ) == _SUDO_BUILDER_REFUSED
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        [],
+        {"User_Specs": "operator"},
+        _sudoers_json({**_sudoers_rule([{"username": "operator"}]), "User_List": []}),
+        _sudoers_json({**_sudoers_rule([{"username": "operator"}]), "User_List": "operator"}),
+        _sudoers_json(_sudoers_rule([{"userid": "1234"}])),
+        _sudoers_json(_sudoers_rule([{"username": "operator", "negated": "no"}])),
+        _sudoers_json(_sudoers_rule(["cortex-builder"])),  # type: ignore[list-item]
+    ],
+)
+def test_cortex_sudo_verdict_fails_closed_on_malformed_document(document: object) -> None:
+    _assert_sudo_unproven(_cortex_sudo_document_verdict(document))
+
+
+def test_cortex_sudoers_principals_cover_plan_ids_primary_and_supplementary_groups() -> None:
+    principals = backend_module._cortex_sudoers_principals(
+        [{"name": "cortex-builder", "uid": 1234, "gid": 1234}],
+        passwd_records=[
+            SimpleNamespace(pw_name="cortex-builder", pw_uid=1234, pw_gid=1234),
+        ],
+        group_records=[
+            SimpleNamespace(gr_name="cortex-builder", gr_gid=1234, gr_mem=[]),
+            SimpleNamespace(gr_name="builder-alias", gr_gid=1234, gr_mem=[]),
+            SimpleNamespace(gr_name="cortex-ops", gr_gid=5555, gr_mem=["cortex-builder"]),
+            SimpleNamespace(gr_name="operators", gr_gid=1000, gr_mem=["operator"]),
+        ],
+    )
+
+    assert [row.name for row in principals] == ["cortex-builder"]
+    (builder,) = principals
+    assert builder.uids == frozenset({1234})
+    assert builder.gids == frozenset({1234, 5555})
+    assert builder.groups == frozenset({"cortex-builder", "builder-alias", "cortex-ops"})
+
+
 def _write_visudo_valid_fixture(tmp_path: Path, policy: str) -> Path:
     sudoers = tmp_path / "sudoers"
     sudoers.write_text(policy, encoding="utf-8")
-    visudo = shutil.which("visudo")
+    visudo = shutil.which("visudo", path=_SYSTEM_TOOL_PATH)
     assert visudo is not None, "sudo package must provide visudo"
     validated = subprocess.run(
         (visudo, "-c", "-f", str(sudoers)),
@@ -2834,66 +3028,112 @@ def _write_visudo_valid_fixture(tmp_path: Path, policy: str) -> Path:
 
 
 @pytest.fixture
-def _system_sbin_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The manager service PATH omits sbin; validation and detection need the same tools.
-    existing_path = os.environ.get("PATH")
-    parts = (existing_path, "/usr/sbin", "/sbin")
-    monkeypatch.setenv("PATH", os.pathsep.join(part for part in parts if part))
+def _path_without_system_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 9900X adoption：runbook 的 PATH 沒有 `/usr/sbin`（Ubuntu 的 visudo 就在那），
+    # 舊實作因此誤報「universal NOPASSWD」。偵測必須不看 process PATH。
+    empty = tmp_path / "path-without-sbin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
 
 
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [
+        ("operator ALL=(ALL) NOPASSWD: ALL\n", _SUDO_ALLOWED),
+        ("%operators ALL=(ALL:ALL) NOPASSWD: ALL\n", _SUDO_ALLOWED),
+        ("ALL ALL=(ALL) NOPASSWD: ALL\n", _SUDO_ALL_REFUSED),
+        ("cortex-builder ALL=(ALL) NOPASSWD: ALL\n", _SUDO_BUILDER_REFUSED),
+        ("#1234 ALL=(ALL:ALL) NOPASSWD: ALL\n", _SUDO_BUILDER_REFUSED),
+        ("%cortex-ops ALL=(root) NOPASSWD: ALL\n", _SUDO_BUILDER_REFUSED),
+        ("%#5555 ALL=NOPASSWD: ALL\n", _SUDO_BUILDER_REFUSED),
+        (
+            "User_Alias CORTEX = operator, cortex-gate\n"
+            "CORTEX ALL=(ALL) NOPASSWD: ALL\n",
+            {"accounts": ["cortex-gate"], "unproven": None},
+        ),
+        (
+            # `!ALIAS` 經 `-e` 展開時會翻轉成員的否定：這裡展開成 `!ALL, cortex-builder`。
+            "User_Alias EVERYONE_BUT_BUILDER = ALL, !cortex-builder\n"
+            "!EVERYONE_BUT_BUILDER ALL=(ALL) NOPASSWD: ALL\n",
+            _SUDO_BUILDER_REFUSED,
+        ),
+        ("cortex-builder ALL=(ALL) NOPASSWD: /usr/bin/id\n", _SUDO_ALLOWED),
+        (
+            "cortex-gate ALL=(cortex-builder) NOPASSWD: ALL\n",
+            {"accounts": ["cortex-gate"], "unproven": None},
+        ),
+        (
+            "operator ALL=(ALL) NOPASSWD: ALL\n"
+            "%sudo ALL=(ALL:ALL) ALL\n"
+            "cortex-builder ALL=(ALL) NOPASSWD: /usr/bin/id\n",
+            _SUDO_ALLOWED,
+        ),
+    ],
+)
+@pytest.mark.usefixtures("_path_without_system_tools")
+def test_sudoers_detector_scopes_real_cvtsudoers_output_to_cortex_accounts(
+    tmp_path: Path, policy: str, expected: Mapping[str, object]
+) -> None:
+    sudoers = _write_visudo_valid_fixture(tmp_path, policy)
+
+    assert _cortex_sudo_verdict(sudoers) == expected
+
+
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_catches_blanket_noauth_in_colon_host_spec(
     tmp_path: Path,
 ) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
-        "%operators buildhost=(ALL) /usr/bin/id : "
+        "%cortex-ops buildhost=(ALL) /usr/bin/id : "
         "ALL=(ALL) NOPASSWD: ALL\n",
     )
 
-    assert backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_BUILDER_REFUSED
 
 
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_catches_defaults_noauth_for_blanket_authority(
     tmp_path: Path,
 ) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
         "Defaults !authenticate\n"
-        "%operators ALL=(ALL) ALL\n",
+        "%cortex-ops ALL=(ALL) ALL\n",
     )
 
-    assert backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_BUILDER_REFUSED
 
 
 @pytest.mark.parametrize("host", ["*", "0.0.0.0/0", "::/0"])
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_catches_blanket_noauth_on_universal_host_expression(
     tmp_path: Path, host: str
 ) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
-        f"%operators {host}=(ALL) NOPASSWD: ALL\n",
+        f"%cortex-ops {host}=(ALL) NOPASSWD: ALL\n",
     )
 
-    assert backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_BUILDER_REFUSED
 
 
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_honors_explicit_passwd_override(
     tmp_path: Path,
 ) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
         "Defaults !authenticate\n"
-        "%operators ALL=(ALL) PASSWD: ALL\n",
+        "%cortex-ops ALL=(ALL) PASSWD: ALL\n",
     )
 
-    assert not backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_ALLOWED
 
 
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_resolves_universal_command_alias_across_continuations(
     tmp_path: Path,
 ) -> None:
@@ -2903,123 +3143,299 @@ def test_sudoers_detector_resolves_universal_command_alias_across_continuations(
         "Cmnd_Alias ROOT_COMMANDS = \\\n"
         "    LIMITED, \\\n"
         "    ALL\n"
-        "%operators ALL=(ALL:ALL) NOPASSWD: ROOT_COMMANDS\n",
+        "%cortex-ops ALL=(ALL:ALL) NOPASSWD: ROOT_COMMANDS\n",
     )
 
-    assert backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_BUILDER_REFUSED
 
 
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_does_not_treat_limited_alias_as_universal(
     tmp_path: Path,
 ) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
         "Cmnd_Alias LIMITED = /usr/bin/id, /usr/bin/true\n"
-        "%operators ALL=(ALL:ALL) NOPASSWD: LIMITED\n",
+        "%cortex-ops ALL=(ALL:ALL) NOPASSWD: LIMITED\n",
     )
 
-    assert not backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_ALLOWED
 
 
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_resolves_host_alias_to_all(tmp_path: Path) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
         "Host_Alias LOCAL = ALL\n"
-        "%operators LOCAL=(ALL) NOPASSWD: ALL\n",
+        "%cortex-ops LOCAL=(ALL) NOPASSWD: ALL\n",
     )
 
-    assert backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_BUILDER_REFUSED
 
 
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_resolves_recursive_host_aliases(tmp_path: Path) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
         "Host_Alias LOCAL = ALL\n"
         "Host_Alias EDGE = LOCAL\n"
-        "%operators EDGE=(ALL) NOPASSWD: ALL\n",
+        "%cortex-ops EDGE=(ALL) NOPASSWD: ALL\n",
     )
 
-    assert backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_BUILDER_REFUSED
 
 
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_fails_closed_on_referenced_host_alias_cycle(
     tmp_path: Path,
 ) -> None:
+    # visudo -c 對 alias cycle 只警告；cvtsudoers 隨之吐出不合法 JSON。
     sudoers = tmp_path / "sudoers"
     sudoers.write_text(
         "Host_Alias FIRST = SECOND\n"
         "Host_Alias SECOND = FIRST\n"
-        "%operators FIRST=(ALL) NOPASSWD: ALL\n",
+        "%cortex-ops FIRST=(ALL) NOPASSWD: ALL\n",
         encoding="utf-8",
     )
 
-    assert backend_module._universal_nopasswd(sudoers)
+    _assert_sudo_unproven(_cortex_sudo_verdict(sudoers))
 
 
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_does_not_treat_limited_host_alias_as_universal(
     tmp_path: Path,
 ) -> None:
     sudoers = _write_visudo_valid_fixture(
         tmp_path,
         "Host_Alias LOCAL = buildhost\n"
-        "%operators LOCAL=(ALL) NOPASSWD: ALL\n",
+        "%cortex-ops LOCAL=(ALL) NOPASSWD: ALL\n",
     )
 
-    assert not backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_ALLOWED
 
 
+@pytest.mark.parametrize(
+    ("rule", "expected"),
+    [
+        ("%cortex-ops LOCAL=(ALL) NOPASSWD: ALL\n", _SUDO_BUILDER_REFUSED),
+        ("operator LOCAL=(ALL) NOPASSWD: ALL\n", _SUDO_ALLOWED),
+    ],
+)
 @pytest.mark.parametrize("directive", ["@include", "#include"])
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_follows_authoritative_include(
-    tmp_path: Path, directive: str
+    tmp_path: Path, directive: str, rule: str, expected: Mapping[str, object]
 ) -> None:
     included = tmp_path / "operators"
-    included.write_text(
-        "Host_Alias LOCAL = ALL\n"
-        "%operators LOCAL=(ALL) NOPASSWD: ALL\n",
-        encoding="utf-8",
-    )
+    included.write_text("Host_Alias LOCAL = ALL\n" + rule, encoding="utf-8")
     sudoers = tmp_path / "sudoers"
     sudoers.write_text(f"{directive} {included}\n", encoding="utf-8")
 
-    assert backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == expected
 
 
-@pytest.mark.usefixtures("_system_sbin_on_path")
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_does_not_scan_unincluded_sibling_policy(
     tmp_path: Path,
 ) -> None:
     sudoers = tmp_path / "sudoers"
-    sudoers.write_text("%operators ALL=(ALL) /usr/bin/id\n", encoding="utf-8")
+    sudoers.write_text("%cortex-ops ALL=(ALL) /usr/bin/id\n", encoding="utf-8")
     (tmp_path / "unreferenced").write_text(
-        "%operators ALL=(ALL) NOPASSWD: ALL\n", encoding="utf-8"
+        "%cortex-ops ALL=(ALL) NOPASSWD: ALL\n", encoding="utf-8"
     )
 
-    assert not backend_module._universal_nopasswd(sudoers)
+    assert _cortex_sudo_verdict(sudoers) == _SUDO_ALLOWED
 
 
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_fails_closed_on_include_cycle(tmp_path: Path) -> None:
     sudoers = tmp_path / "sudoers"
     included = tmp_path / "included"
     sudoers.write_text(f"@include {included}\n", encoding="utf-8")
     included.write_text(f"@include {sudoers}\n", encoding="utf-8")
 
-    assert backend_module._universal_nopasswd(sudoers)
+    _assert_sudo_unproven(_cortex_sudo_verdict(sudoers), "visudo -c")
 
 
+@pytest.mark.usefixtures("_path_without_system_tools")
+def test_sudoers_detector_fails_closed_when_visudo_rejects_the_policy(
+    tmp_path: Path,
+) -> None:
+    sudoers = tmp_path / "sudoers"
+    sudoers.write_text("cortex-builder ALL=(ALL NOPASSWD: ALL\n", encoding="utf-8")
+
+    _assert_sudo_unproven(_cortex_sudo_verdict(sudoers), "visudo -c")
+
+
+@pytest.mark.usefixtures("_path_without_system_tools")
 def test_sudoers_detector_follows_authoritative_includedir(tmp_path: Path) -> None:
+    # cvtsudoers 與 sudo 一樣略過非 root 擁有的 includedir：以非 root 跑測試時整份
+    # policy 轉出空輸出 → fail closed；以 root 跑時實際評估到 cortex 規則。兩者都拒絕。
     sudoers_d = tmp_path / "sudoers.d"
     sudoers_d.mkdir()
     (sudoers_d / "operators").write_text(
-        "%operators ALL=(ALL) NOPASSWD: ALL\n", encoding="utf-8"
+        "%cortex-ops ALL=(ALL) NOPASSWD: ALL\n", encoding="utf-8"
     )
     sudoers = tmp_path / "sudoers"
     sudoers.write_text(f"#includedir {sudoers_d}\n", encoding="utf-8")
 
-    assert backend_module._universal_nopasswd(sudoers)
+    verdict = _cortex_sudo_verdict(sudoers)
+
+    if os.geteuid() == 0:
+        assert verdict == _SUDO_BUILDER_REFUSED
+    else:
+        _assert_sudo_unproven(verdict, "JSON")
+
+
+def _fake_sudoers_tools(
+    directory: Path,
+    *,
+    document: object = None,
+    stdout: str | None = None,
+    visudo_status: int = 0,
+    converter_status: int = 0,
+) -> None:
+    directory.mkdir(parents=True)
+    payload = directory / "document.json"
+    payload.write_text(
+        stdout if stdout is not None else json.dumps(document), encoding="utf-8"
+    )
+    visudo = directory / "visudo"
+    visudo.write_text(f"#!/bin/sh\nexit {visudo_status}\n", encoding="utf-8")
+    converter = directory / "cvtsudoers"
+    converter.write_text(
+        f"#!/bin/sh\n/bin/cat '{payload}'\nexit {converter_status}\n",
+        encoding="utf-8",
+    )
+    visudo.chmod(0o755)
+    converter.chmod(0o755)
+
+
+def _plain_sudoers(tmp_path: Path) -> Path:
+    sudoers = tmp_path / "sudoers"
+    sudoers.write_text("operator ALL=(ALL) NOPASSWD: ALL\n", encoding="utf-8")
+    return sudoers
+
+
+def test_sudoers_tools_resolve_from_fixed_system_directories_not_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 工具只在固定清單的 sbin 位置；PATH 上沒有它 → 照樣評估，不 fail closed。
+    sbin_only = tmp_path / "usr-sbin"
+    _fake_sudoers_tools(
+        sbin_only,
+        document=_sudoers_json(
+            _sudoers_rule([{"username": "operator"}]),
+            _sudoers_rule([{"username": "cortex-builder"}]),
+        ),
+    )
+    monkeypatch.setattr(
+        backend_module,
+        "_SUDOERS_TOOL_DIRECTORIES",
+        (str(sbin_only), str(tmp_path / "usr-bin-missing")),
+    )
+    monkeypatch.setenv("PATH", str(tmp_path / "path-without-sbin"))
+
+    assert _cortex_sudo_verdict(_plain_sudoers(tmp_path)) == _SUDO_BUILDER_REFUSED
+
+
+def test_sudoers_tools_on_process_path_are_never_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PATH 上有一組「乾淨」的假工具，固定清單裡卻沒有 → 仍 fail closed。
+    on_path = tmp_path / "path-tools"
+    _fake_sudoers_tools(on_path, document=_sudoers_json())
+    monkeypatch.setattr(
+        backend_module,
+        "_SUDOERS_TOOL_DIRECTORIES",
+        (str(tmp_path / "usr-sbin-missing"),),
+    )
+    monkeypatch.setenv("PATH", str(on_path))
+
+    _assert_sudo_unproven(_cortex_sudo_verdict(_plain_sudoers(tmp_path)), "visudo")
+
+
+def test_default_sudoers_tool_directories_are_the_fixed_system_list() -> None:
+    assert backend_module._SUDOERS_TOOL_DIRECTORIES == (
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    )
+
+
+@pytest.mark.parametrize(
+    ("tools", "needle"),
+    [
+        ({"visudo_status": 1, "document": {"User_Specs": []}}, "visudo -c"),
+        ({"converter_status": 1, "document": {"User_Specs": []}}, "cvtsudoers"),
+        ({"stdout": '{"User_Specs": [ }'}, "JSON"),
+    ],
+)
+def test_sudoers_detector_fails_closed_when_tools_cannot_prove_the_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tools: Mapping[str, object],
+    needle: str,
+) -> None:
+    sbin = tmp_path / "sbin"
+    _fake_sudoers_tools(sbin, **tools)  # type: ignore[arg-type]
+    monkeypatch.setattr(backend_module, "_SUDOERS_TOOL_DIRECTORIES", (str(sbin),))
+
+    _assert_sudo_unproven(_cortex_sudo_verdict(_plain_sudoers(tmp_path)), needle)
+
+
+def test_sudoers_detector_fails_closed_when_the_policy_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    _assert_sudo_unproven(_cortex_sudo_verdict(tmp_path / "missing-sudoers"))
+
+
+def test_preflight_facts_scope_the_sudo_check_to_plan_declared_cortex_accounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_verdict(accounts, *, passwd_records, group_records, **_kwargs):
+        seen["accounts"] = [row["name"] for row in accounts]
+        seen["passwd"] = list(passwd_records)
+        seen["groups"] = list(group_records)
+        return {"accounts": ["cortex-builder"], "unproven": None}
+
+    monkeypatch.setattr(
+        backend_module, "_cortex_account_universal_nopasswd", fake_verdict
+    )
+    monkeypatch.setattr(backend_module.pwd, "getpwall", lambda: list(_SUDO_PASSWD))
+
+    def no_such_account(name: str):
+        raise KeyError(name)
+
+    monkeypatch.setattr(backend_module.pwd, "getpwnam", no_such_account)
+    monkeypatch.setattr(backend_module.grp, "getgrall", lambda: list(_SUDO_GROUPS))
+    monkeypatch.setattr(backend_module, "_in_flight_process_count", lambda _rows: 0)
+    monkeypatch.setattr(backend_module, "_run", lambda argv, **_kwargs: _completed(argv))
+    plan = {
+        "roots": {"state": str(tmp_path / "state"), "deploy": str(tmp_path / "deploy")},
+        "accounts": [
+            {"name": "cortex-builder", "uid": 1234, "gid": 1234,
+             "home": str(tmp_path / "builder"), "shell": "/usr/sbin/nologin"},
+        ],
+        "service_accounts": [
+            {"name": "cortex-egress", "uid": 1236, "gid": 1236,
+             "home": str(tmp_path / "egress"), "shell": "/usr/sbin/nologin"},
+        ],
+        "operator_account": "operator",
+        "apply_order": [],
+        "minimum_disk_free_bytes": 0,
+    }
+
+    facts = LocalInstallBackend(require_root=False).preflight_facts(plan)
+
+    assert seen["accounts"] == ["cortex-builder", "cortex-egress"]
+    assert seen["passwd"] == list(_SUDO_PASSWD)
+    assert seen["groups"] == list(_SUDO_GROUPS)
+    assert facts["cortex_account_universal_nopasswd"] == _SUDO_BUILDER_REFUSED
+    assert "universal_nopasswd" not in facts
 
 
 def test_run_keeps_the_callers_session_stdin_and_cwd_by_default() -> None:
