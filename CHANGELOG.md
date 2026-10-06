@@ -10,6 +10,10 @@
 ### Fixed
 
 - **#1296 work 進件模型鏈旗標**：`cortex run work start/intake/rechain/supersede-attempt` 現在會把 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model` 送入同一條 `extract_model_chain_override` 路徑；與 `--payload` 衝突時會明確拒絕，未成對指定時也會報錯，其他 work action 帶這些旗標則不受理。
+- **cortex 進件：派工穩定性第二批 #1311–#1314、#1319–#1321**：登記七個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006c.md`）。
+- **#1297 copilot 健康檢查程序逾時後連同子程序一起回收**：`paulsha_cortex/coordinator/executor_auth.py` 與 `paulsha_cortex/porcelain/bootstrap.py` 的 probe 改共用 `run_probe` runner；一律在獨立 session／process group 執行（`start_new_session=True`），逾時或發生例外時對整個 process group 先送 SIGTERM、短暫等待後送 SIGKILL 並等待回收，防止 node wrapper 終止後 native `copilot-linux-x64` 子程序殘留（見 `changelog.d/copilot-probe-reap.md`）（#1297）。
+- **cortex 進件：#1309 task-memory 逐則處置回報**：登記 work item `task-memory-disposition` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-task-memory-disposition.md`）。
+- **cortex 進件：派工穩定性 #1302–#1307**：登記六個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-dispatch-stability.md`）。
 - **cortex 進件：#1282 審查後續／#1296／#1297**：登記三個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006b.md`）。
 - **撤回 v0.1.14**：該版升級會在 verify 失敗（#1295）且仍封存 agent 執行檔（#1293）；release 與 tag 已刪除，`VERSION` 與 runbook 版本字串改回 0.1.13，修完後重新發布 0.1.14（見 `changelog.d/withdraw-release-0-1-14.md`）。
 - **#1282 legacy adoption 實機缺陷修正**：`useradd`／`groupadd` 改從固定系統目錄解析、不看 PATH（缺工具時在任何 mutation 前 fail closed），runbook 的 root installer PATH 補上 `/usr/sbin`；T §3 服務清單改為空清單不輸出，服務在 lease 前已停時 trap 不再 `systemctl start ""`；plan 與 apply gate 把落在 quarantine 物件內的 census 可寫路徑視為已涵蓋；quarantine 的樹 digest 以 type／mode 記錄 socket、FIFO 與裝置節點（從不開啟），頂層殘留 socket／FIFO 也可 quarantine；cortex 帳號 HOME 頂層未宣告的項目以 `home-top` 自動 quarantine；root capture 回報 `plan_preview`（plan 會拒絕的原因與處置）與 sudoers 判定 `cortex_account_universal_nopasswd`，legacy runbook 補以 sudo 唯讀執行的前置檢查；RC `legacy-adoption` 以不含 sbin 的 PATH 呼叫 installer，fixture 加入殘留 socket／FIFO 與 HOME 頂層 retry 檔、拿掉 census 例外（見 `changelog.d/adoption-runbook-fixes.md`）（#1282）。

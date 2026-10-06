@@ -1625,3 +1625,115 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/copilot-probe-reap/todo.md'
     excludes: []
+  gate-pythonpath-isolation:
+    title: 'gate-pythonpath-isolation'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1302'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/gate-pythonpath-isolation/todo.md'
+    excludes: []
+  copilot-headless-compat:
+    title: 'copilot-headless-compat'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1303'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/copilot-headless-compat/todo.md'
+    excludes: []
+  codex-readonly-sandbox:
+    title: 'codex-readonly-sandbox'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1304'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/codex-readonly-sandbox/todo.md'
+    excludes: []
+  worktree-containment-authority:
+    title: 'worktree-containment-authority'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1305'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/worktree-containment-authority/todo.md'
+    excludes: []
+  auto-retry-fallback:
+    title: 'auto-retry-fallback'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1306'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/auto-retry-fallback/todo.md'
+    excludes: []
+  async-long-requests:
+    title: 'async-long-requests'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1307'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/async-long-requests/todo.md'
+    excludes: []
+  task-memory-disposition:
+    title: 'task-memory-disposition'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1309'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/task-memory-disposition/todo.md'
+    excludes: []
+  ship-clean-behind-autosync:
+    title: 'ship-clean-behind-autosync'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1311'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/ship-clean-behind-autosync/todo.md'
+    excludes: []
+  passive-executor-health:
+    title: 'passive-executor-health'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1312'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/passive-executor-health/todo.md'
+    excludes: []
+  planner-timeout-retry:
+    title: 'planner-timeout-retry'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1313'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/planner-timeout-retry/todo.md'
+    excludes: []
+  archive-ref-namespace:
+    title: 'archive-ref-namespace'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1314'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/archive-ref-namespace/todo.md'
+    excludes: []
+  monitor-frontmatter-isolation:
+    title: 'monitor-frontmatter-isolation'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1319'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-frontmatter-isolation/todo.md'
+    excludes: []
+  tick-background-preflight:
+    title: 'tick-background-preflight'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1320'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/tick-background-preflight/todo.md'
+    excludes: []
+  reviewer-sandbox-retention:
+    title: 'reviewer-sandbox-retention'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1321'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/reviewer-sandbox-retention/todo.md'
+    excludes: []

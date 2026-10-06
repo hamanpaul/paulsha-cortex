@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from paulsha_cortex.coordinator import manager_daemon
-from paulsha_cortex.coordinator.executor_auth import classify_cli_output
+from paulsha_cortex.coordinator.executor_auth import classify_cli_output, run_probe
 from paulsha_cortex.deploy import installer
 
 from . import COMMANDS, PorcelainCommand, register
@@ -57,7 +57,7 @@ def _bootstrap_envelope(**payload: Any) -> dict[str, Any]:
 
 
 def _run(argv: list[str], *, timeout: int = 10) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, check=False, capture_output=True, text=True, timeout=timeout)
+    return run_probe(argv, timeout=timeout)
 
 
 def _slugify(value: str) -> str:
