@@ -368,6 +368,11 @@ symlink、非 root owner、group/other writable 或特殊檔案立即失敗。
 系統目錄（依序 `/usr/sbin`、`/usr/bin`、`/sbin`、`/bin`）解析這些工具、不看 PATH，PATH 缺 sbin
 不會再讓 apply 失敗；PATH 只影響 installer 以外的指令。
 
+RC release profile 的首次安裝確實會由 installer 建立 plan 指定的帳號：`qualification/run.sh`
+先占用一組 uid／gid，再執行 `cortex install trust-root apply`。該 apply 的 account steps 會呼叫
+`groupadd`／`useradd`；backend 從固定系統目錄解析工具。`legacy-adoption` profile 的 fixture
+布置則直接使用絕對 `/usr/sbin` 路徑，並非首次安裝帳號建立的驗證。
+
 ```bash
 cortex_cli_tree_sha() {
   /usr/bin/sudo /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
@@ -399,7 +404,7 @@ PY
 }
 cortex_sealed_cli_tree_sha=$(cortex_cli_tree_sha)
 cortex_root_cli() {
-  test "$(cortex_cli_tree_sha)" = "$cortex_sealed_cli_tree_sha"
+  test "$(cortex_cli_tree_sha)" = "$cortex_sealed_cli_tree_sha" || return 1
   /usr/bin/sudo /usr/bin/env -i HOME=/root \
     PATH="$cortex_bootstrap_root/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 \
@@ -1096,9 +1101,9 @@ PY
 }
 cortex_recovery_sealed_cli_tree_sha=$(cortex_recovery_cli_tree_sha)
 cortex_root_cli() {
-  test "$(cortex_recovery_cli_tree_sha)" = "$cortex_recovery_sealed_cli_tree_sha"
+  test "$(cortex_recovery_cli_tree_sha)" = "$cortex_recovery_sealed_cli_tree_sha" || return 1
   /usr/bin/sudo /usr/bin/env -i HOME=/root \
-    PATH="$cortex_bootstrap_root/venv/bin:/usr/bin:/bin" \
+    PATH="$cortex_bootstrap_root/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONNOUSERSITE=1 \
     "$cortex_cli" "$@"
 }

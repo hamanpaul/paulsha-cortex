@@ -1695,7 +1695,10 @@ def _discovered_rows(
         ("env-dir", [_env_dir(plan, roots)]),
         ("deploy-top", [roots["deploy"]]),
         ("toolchain-bin", [_toolchain_bin(plan, roots)]),
-        ("home-top", sorted({str(row.get("home")) for _k, row in _plan_account_rows(plan)})),
+        (
+            "home-top",
+            sorted({str(row.get("home")) for _kind, row in _plan_account_rows(plan)}),
+        ),
         ("state-top", [roots["state"]]),
     ):
         for parent in parents:
@@ -3172,6 +3175,7 @@ def _classify_discovered(
     row: Mapping[str, object],
     *,
     links: Mapping[str, tuple[str, str]],
+    plan_managed_homes: frozenset[str],
     operator_paths: frozenset[str],
 ) -> _Outcome:
     path = str(row["path"])
@@ -3230,10 +3234,10 @@ def _classify_discovered(
         return quarantine("managed-subdir")
     if "managed-residue" in rules:
         return quarantine("managed-residue")
-    if "home-top" in rules:
-        # A cortex HOME keeps only what the plan declares (the necessary
-        # subset, #1282): shell history, retry files and the like move into
-        # the quarantine instead of needing a review list.
+    if "home-top" in rules and posixpath.dirname(path) in plan_managed_homes:
+        # A plan-managed principal HOME keeps only what the plan declares
+        # (the necessary subset, #1282): shell history, retry files and the
+        # like move into quarantine instead of needing a review list.
         return quarantine("operator" if path in operator_paths else "home-top")
     return unclassified()
 
@@ -3557,6 +3561,11 @@ def derive_legacy_adoption(
     toolchain_bin = _toolchain_bin(plan, roots)
     owners = _owner_ids(plan)
     links = _enablement_links(plan, roots)
+    plan_managed_homes = frozenset(
+        str(row.get("home"))
+        for kind, row in _plan_account_rows(plan)
+        if kind == "principal"
+    )
     outcomes: list[_Outcome] = []
     for row in document["managed_paths"]:  # type: ignore[union-attr]
         step_id = str(row["step_id"])
@@ -3571,7 +3580,14 @@ def derive_legacy_adoption(
             )
         )
     for row in document["discovered"]:  # type: ignore[union-attr]
-        outcomes.append(_classify_discovered(row, links=links, operator_paths=operator_paths))
+        outcomes.append(
+            _classify_discovered(
+                row,
+                links=links,
+                plan_managed_homes=plan_managed_homes,
+                operator_paths=operator_paths,
+            )
+        )
     for row in document["credentials"]:  # type: ignore[union-attr]
         if isinstance(row["lstat"], Mapping):
             outcomes.append(_classify_credential(row, operator_paths=operator_paths))
