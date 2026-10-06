@@ -1713,3 +1713,11 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/archive-ref-namespace/todo.md'
     excludes: []
+  monitor-frontmatter-isolation:
+    title: 'monitor-frontmatter-isolation'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1319'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-frontmatter-isolation/todo.md'
+    excludes: []
