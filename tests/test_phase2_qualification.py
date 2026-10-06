@@ -276,6 +276,7 @@ def _valid_full_qualification(
     tmp_path: Path,
     *,
     rollback_expected_wheel: str = "b" * 64,
+    rollback_expected_candidate: str = "a" * 40,
     upgrade_document: dict | None = None,
 ) -> dict:
     payload = _valid_qualification()
@@ -509,7 +510,7 @@ def _valid_full_qualification(
             "expected": {
                 "receipt_id": "prior",
                 "wheel_sha256": rollback_expected_wheel,
-                "candidate_commit": "a" * 40,
+                "candidate_commit": rollback_expected_candidate,
             },
             "service_status": {
                 "service": {
@@ -525,7 +526,7 @@ def _valid_full_qualification(
                                 "status": "verified",
                                 "receipt_id": "prior",
                                 "wheel_sha256": rollback_expected_wheel,
-                                "candidate_commit": "a" * 40,
+                                "candidate_commit": rollback_expected_candidate,
                             },
                             "installed_artifact": {"wheel_sha256": rollback_expected_wheel},
                         }
@@ -1268,6 +1269,18 @@ def test_full_suite_validator_rejects_rollback_evidence_for_another_candidate(
 ) -> None:
     """#1224：rollback 證據的 expected 必須是本次 candidate，不能是任意 wheel。"""
     payload = _valid_full_qualification(tmp_path, rollback_expected_wheel="9" * 64)
+
+    completed = _run_full_validator(tmp_path, payload)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert "expected receipt is not this candidate" in completed.stderr
+
+
+def test_full_suite_validator_rejects_rollback_evidence_for_a_foreign_commit(
+    tmp_path: Path,
+) -> None:
+    payload = _valid_full_qualification(
+        tmp_path, rollback_expected_candidate="9" * 40
+    )
 
     completed = _run_full_validator(tmp_path, payload)
     assert completed.returncode != 0, completed.stdout + completed.stderr
