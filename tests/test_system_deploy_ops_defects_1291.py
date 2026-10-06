@@ -27,6 +27,52 @@ def _write(path: Path, text: str) -> Path:
     return path
 
 
+def _manager_source_checkout(remote, source: Path, initial: str, *, github: bool = True) -> Path:
+    subprocess.run(
+        ("git", "clone", "--quiet", str(remote.origin), str(source)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if github:
+        subprocess.run(
+            ("git", "-C", str(source), "remote", "set-url", "origin", remote.url),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-C",
+                str(source),
+                "config",
+                f"url.{remote.origin.as_uri()}.insteadOf",
+                remote.url,
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    subprocess.run(
+        ("git", "-C", str(source), "checkout", "--quiet", "--detach", initial),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (source / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+    return source
+
+
+def _git(source: Path, *args: str) -> str:
+    return subprocess.run(
+        ("git", "-C", str(source), *args),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
 def test_read_only_monitor_mirror_never_fetches(git_origin) -> None:
     repo = git_origin()
     repo.commit({"docs/superpowers/workstreams/example/todo.md": "# todo\n"})
@@ -306,6 +352,131 @@ def test_manager_syncs_default_branch_for_read_only_monitor(
     manager_unit = build_manager_unit(THREE_WAY_SCHEME, DEFAULT_LAYOUT)
     assert "Environment=PSC_MANAGER_REPO_SOURCE_SYNC=1" in manager_unit.content
     assert "Environment=PSC_PARK_LEGACY_AUTO_SPECS=1" in manager_unit.content
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_reason"),
+    [
+        ("dirty", "dirty"),
+        ("ahead", "ahead-or-diverged"),
+        ("diverged", "ahead-or-diverged"),
+        ("unchanged", "unchanged"),
+    ],
+)
+def test_manager_reports_source_sync_skip_without_merging(
+    git_origin,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: str,
+    expected_reason: str,
+) -> None:
+    remote = git_origin()
+    initial = remote.commit({"README.md": "initial\n"})
+    remote.publish()
+    source = _manager_source_checkout(remote, tmp_path / "manager-source", initial)
+
+    if state == "dirty":
+        (source / "README.md").write_text("local edit\n", encoding="utf-8")
+        remote.commit({".cortex/work-items.yaml": "work_items: []\n"})
+        remote.publish()
+    elif state in {"ahead", "diverged"}:
+        subprocess.run(
+            ("git", "-C", str(source), "config", "user.email", "fixture@example.invalid"),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ("git", "-C", str(source), "config", "user.name", "fixture"),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _write(source / "local-only.txt", "local\n")
+        subprocess.run(
+            ("git", "-C", str(source), "add", "--", "local-only.txt"),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ("git", "-C", str(source), "commit", "--quiet", "-m", "local commit"),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if state == "diverged":
+            remote.commit({"remote-only.txt": "remote\n"})
+            remote.publish()
+
+    before_head = _git(source, "rev-parse", "HEAD")
+    before_status = _git(source, "status", "--porcelain", "--untracked-files=no")
+    before_local = (
+        (source / "local-only.txt").read_text(encoding="utf-8")
+        if state in {"ahead", "diverged"}
+        else None
+    )
+    commands: list[tuple[str, ...]] = []
+    run = source_sync._subprocess_runner
+
+    def recording_runner(argv):
+        commands.append(tuple(argv))
+        return run(argv)
+
+    monkeypatch.setenv("PSC_MANAGER_REPO_SOURCE_SYNC", "1")
+    monkeypatch.setattr(manager_daemon.paths, "repo_root", lambda: source)
+    monkeypatch.setattr(source_sync, "_subprocess_runner", recording_runner)
+    monkeypatch.setattr(manager_daemon, "_LAST_REPORTED_REPO_SOURCE_SYNC_RESULT", None)
+
+    manager_daemon._sync_system_repo_source()
+
+    after = capsys.readouterr().err
+    assert f"system-repo-source-sync: {expected_reason}" in after
+    assert not any("merge" in command for command in commands)
+    assert _git(source, "rev-parse", "HEAD") == before_head
+    assert _git(source, "status", "--porcelain", "--untracked-files=no") == before_status
+    if state == "dirty":
+        assert (source / "README.md").read_text(encoding="utf-8") == "local edit\n"
+    if before_local is not None:
+        assert (source / "local-only.txt").read_text(encoding="utf-8") == before_local
+    assert not (source / ".git" / "FETCH_HEAD").exists()
+
+
+def test_manager_rejects_non_github_source_origin_without_merging(
+    git_origin,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    remote = git_origin()
+    initial = remote.commit({"README.md": "initial\n"})
+    remote.publish()
+    source = _manager_source_checkout(
+        remote, tmp_path / "manager-source", initial, github=False
+    )
+    before_head = _git(source, "rev-parse", "HEAD")
+    before_status = _git(source, "status", "--porcelain", "--untracked-files=no")
+    commands: list[tuple[str, ...]] = []
+    run = source_sync._subprocess_runner
+
+    def recording_runner(argv):
+        commands.append(tuple(argv))
+        return run(argv)
+
+    monkeypatch.setenv("PSC_MANAGER_REPO_SOURCE_SYNC", "1")
+    monkeypatch.setattr(manager_daemon.paths, "repo_root", lambda: source)
+    monkeypatch.setattr(source_sync, "_subprocess_runner", recording_runner)
+    manager_daemon._reset_log_error_dedup_state()
+
+    manager_daemon._sync_system_repo_source()
+
+    after = capsys.readouterr().err
+    assert "source checkout origin is not a GitHub repository" in after
+    assert "action=system-repo-source-sync" in after
+    assert not any("merge" in command for command in commands)
+    assert _git(source, "rev-parse", "HEAD") == before_head
+    assert _git(source, "status", "--porcelain", "--untracked-files=no") == before_status
 
 
 def test_legacy_auto_specs_are_parked_once_and_reversible(tmp_path: Path) -> None:

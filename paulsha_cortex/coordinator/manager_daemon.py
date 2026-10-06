@@ -73,6 +73,7 @@ TICK_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 3600.0  # cool-down before one retry
 LOG_ERROR_SUMMARY_INTERVAL = 50  # suppressed-repeat summary cadence for _log_error
 _MULTI_SEGMENT_PATH_PATTERN = re.compile(r"\S*/\S*/\S+")
 TICK_ERROR_REASON_MAX_LENGTH = 200  # bounds status.json against a runaway message
+_LAST_REPORTED_REPO_SOURCE_SYNC_RESULT: str | None = None
 
 
 @dataclass
@@ -2267,15 +2268,27 @@ LOG_ERROR_DEDUP_MAX_SLOTS = 64
 
 
 def _sync_system_repo_source() -> None:
+    global _LAST_REPORTED_REPO_SOURCE_SYNC_RESULT
+
     if os.environ.get("PSC_MANAGER_REPO_SOURCE_SYNC") != "1":
         return
     try:
         result = source_sync.sync_source_checkout(paths.repo_root())
     except (OSError, RuntimeError, ValueError) as exc:
+        _LAST_REPORTED_REPO_SOURCE_SYNC_RESULT = None
         _log_error(exc, context={"action": "system-repo-source-sync"})
         return
     if result == "advanced":
+        _LAST_REPORTED_REPO_SOURCE_SYNC_RESULT = None
         print("manager source checkout advanced to GitHub default branch", file=sys.stderr)
+    else:
+        if result != _LAST_REPORTED_REPO_SOURCE_SYNC_RESULT:
+            print(
+                f"{contract.utcnow()} manager_daemon warning: "
+                f"system-repo-source-sync: {result}",
+                file=sys.stderr,
+            )
+        _LAST_REPORTED_REPO_SOURCE_SYNC_RESULT = result
 
 
 def _reset_log_error_dedup_state() -> None:
