@@ -1,0 +1,1 @@
+- 進件：派工穩定性一批，在 `.cortex/work-items.yaml` 登記六個 work item 並附上 accepted todo，交給 cortex 平行派工：`gate-pythonpath-isolation`（#1302）、`copilot-headless-compat`（#1303）、`codex-readonly-sandbox`（#1304）、`worktree-containment-authority`（#1305）、`auto-retry-fallback`（#1306）、`async-long-requests`（#1307）。

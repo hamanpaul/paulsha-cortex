@@ -1,0 +1,1 @@
+- 進件：派工穩定性第二批，在 `.cortex/work-items.yaml` 登記七個 work item 並附上 accepted todo：`ship-clean-behind-autosync`（#1311）、`passive-executor-health`（#1312）、`planner-timeout-retry`（#1313）、`archive-ref-namespace`（#1314）、`monitor-frontmatter-isolation`（#1319）、`tick-background-preflight`（#1320）、`reviewer-sandbox-retention`（#1321）。

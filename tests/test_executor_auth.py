@@ -7,7 +7,12 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import signal
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -15,6 +20,7 @@ from paulsha_cortex.coordinator.executor_auth import (
     EXECUTOR_CANDIDATES,
     check_executor_auth,
     classify_cli_output,
+    run_probe,
 )
 
 
@@ -154,3 +160,131 @@ def test_check_executor_auth_rejects_unsupported_executor():
 
 def test_executor_candidates_matches_bootstrap_convention():
     assert set(EXECUTOR_CANDIDATES) == {"claude", "codex", "copilot"}
+
+
+# ---------------------------------------------------------------- run_probe & reaping
+
+
+def _is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _kill_pid(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def test_legacy_unmanaged_subprocess_leaves_child_alive_on_timeout(tmp_path: Path):
+    """T1 RED：以測試替身模擬「wrapper 啟動一個不會自己結束的子程序」，
+    probe 逾時後斷言子程序仍存活（舊 _default_runner／未管 process group 的現行行為）。
+    """
+    pid_file = tmp_path / "child.pid"
+    wrapper = (
+        "import subprocess, sys, time\n"
+        f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(100)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(100)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        subprocess.run(
+            [sys.executable, "-c", wrapper],
+            capture_output=True,
+            text=True,
+            timeout=0.2,
+            check=False,
+        )
+
+    assert pid_file.exists(), "child pid file was not written"
+    child_pid = int(pid_file.read_text().strip())
+    try:
+        # 現行行為：直接 subprocess.run 只終止 wrapper，child 仍存活
+        assert _is_alive(child_pid)
+    finally:
+        _kill_pid(child_pid)
+
+
+def test_run_probe_reaps_child_processes_on_timeout(tmp_path: Path):
+    """T2：run_probe 在新 session/process group 執行，逾時時整組回收子程序。"""
+    pid_file = tmp_path / "child.pid"
+    wrapper = (
+        "import subprocess, sys, time\n"
+        f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(100)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(100)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_probe([sys.executable, "-c", wrapper], timeout=0.2)
+
+    assert pid_file.exists(), "child pid file was not written"
+    child_pid = int(pid_file.read_text().strip())
+    assert not _is_alive(child_pid), f"child pid {child_pid} should have been reaped"
+
+
+def test_run_probe_escalates_to_sigkill_when_sigterm_ignored(tmp_path: Path):
+    """T2：子程序若忽略 SIGTERM，短暫等待後送 SIGKILL 強制回收。"""
+    pid_file = tmp_path / "child.pid"
+    wrapper = (
+        "import signal, subprocess, sys, time\n"
+        "script = 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(100)'\n"
+        f"p = subprocess.Popen([sys.executable, '-c', script])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(100)\n"
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_probe(
+            [sys.executable, "-c", wrapper],
+            timeout=0.2,
+            sigterm_grace_seconds=0.1,
+        )
+
+    assert pid_file.exists(), "child pid file was not written"
+    child_pid = int(pid_file.read_text().strip())
+    assert not _is_alive(child_pid), f"stubborn child pid {child_pid} should have been reaped via SIGKILL"
+
+
+def test_run_probe_reaps_on_exception(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """T2：communicate 發生非逾時例外時，亦回收 process group。"""
+    pid_file = tmp_path / "child.pid"
+    wrapper = (
+        "import subprocess, sys, time\n"
+        f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(100)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(100)\n"
+    )
+
+    class CustomProbeError(RuntimeError):
+        pass
+
+    real_communicate = subprocess.Popen.communicate
+
+    def _failing_communicate(self, *args, **kwargs):
+        deadline = time.monotonic() + 5.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise CustomProbeError("simulated probe failure")
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", _failing_communicate)
+    with pytest.raises(CustomProbeError):
+        run_probe([sys.executable, "-c", wrapper], timeout=5.0)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", real_communicate)
+    assert pid_file.exists()
+    child_pid = int(pid_file.read_text().strip())
+    assert not _is_alive(child_pid), f"child pid {child_pid} should have been reaped on exception"
+
+
+def test_run_probe_normal_execution_returns_completed_process():
+    result = run_probe(
+        [sys.executable, "-c", "import sys; sys.stdout.write('hello'); sys.stderr.write('err')"],
+        timeout=5.0,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "hello"
+    assert result.stderr == "err"
+
