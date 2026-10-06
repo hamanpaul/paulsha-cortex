@@ -1,0 +1,27 @@
+version: 1
+wrappers: [sudo, env, timeout, command, nohup]
+protected_paths: ["/", "/*", "~", "~/*"]
+protected_sudoers_paths: ["/etc/sudoers", "/etc/sudoers.d"]
+block_device_prefixes: ["/dev/sd", "/dev/vd", "/dev/nvme"]
+protected_refs: [main, master]
+rules:
+- id: protected-root-destruction
+  commands: [rm, find, python]
+  category: filesystem
+  severity: critical
+  summary: block destructive deletion of protected roots
+- id: account-mutation
+  commands: [passwd, useradd, adduser, tee, echo, printf]
+  category: identity
+  severity: critical
+  summary: block account mutation and sudoers writes
+- id: block-device-clobber
+  commands: [dd]
+  category: device
+  severity: critical
+  summary: block raw device overwrite targets
+- id: repository-destruction
+  commands: [git, gh]
+  category: repository
+  severity: high
+  summary: block protected ref rewrites and repo deletion

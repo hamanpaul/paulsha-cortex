@@ -1,0 +1,1 @@
+- #1283：新增 `paulsha_cortex.command_policy` 純函式核心、版本化基準政策 `coordinator/data/command-policy.yaml`，以及涵蓋高危指令阻擋／放行樣式的 corpus fixture，為後續 executor 阻擋接線提供可重用的政策資產。

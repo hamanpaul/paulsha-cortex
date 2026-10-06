@@ -34,7 +34,7 @@ work_item: dangerous-command-blocklist
       `sh -c`／`bash -c` 遞迴、`python -c` 字面引數、路徑正規化與保護根、git／gh 子命令選項。基準政策
       `coordinator/data/command-policy.yaml`（versioned）；operator overlay 只能加嚴，不認得的鍵或想降級時
       fail closed，並自動重驗。
-- [ ] **T3 corpus 測試**：`tests/fixtures/command-policy/corpus.yaml`，每條規則至少一個應擋、一個應放。
+- [x] **T3 corpus 測試**：`tests/fixtures/command-policy/corpus.yaml`，每條規則至少一個應擋、一個應放。
       規避案例至少包含：`\rm -rf /`、`/bin/rm -rf /`、`rm -r -f /*`、`sudo -E rm -fr ~`、`env -S 'rm -rf /'`、
       `bash -c "rm -rf /"`、`sh -c 'sudo passwd root'`、`sudo useradd x`、`sudo adduser x`、
       `echo 'x ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/x`、`find / -delete`、

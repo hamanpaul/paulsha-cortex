@@ -1,0 +1,354 @@
+version: 1
+cases:
+- id: protected-root-blocked-backslash-rm
+  rule: protected-root-destruction
+  expect: blocked
+  command: '\rm -rf /'
+- id: protected-root-blocked-absolute-rm
+  rule: protected-root-destruction
+  expect: blocked
+  command: /bin/rm -rf /
+- id: protected-root-blocked-split-flags
+  rule: protected-root-destruction
+  expect: blocked
+  command: rm -r -f /*
+- id: protected-root-blocked-double-slash-root
+  rule: protected-root-destruction
+  expect: blocked
+  command: rm -rf //
+- id: protected-root-blocked-sudo-home
+  rule: protected-root-destruction
+  expect: blocked
+  command: sudo -E rm -fr ~
+- id: protected-root-blocked-many-sudo
+  rule: protected-root-destruction
+  expect: blocked
+  command: sudo sudo sudo sudo sudo sudo sudo sudo sudo rm -rf /
+- id: protected-root-blocked-env-shell
+  rule: protected-root-destruction
+  expect: blocked
+  command: "env -S 'rm -rf /'"
+- id: protected-root-blocked-bash-c
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'bash -c "rm -rf /"'
+- id: protected-root-blocked-bash-lc
+  rule: protected-root-destruction
+  expect: blocked
+  command: "bash -lc 'rm -rf /'"
+- id: protected-root-blocked-sudo-cluster
+  rule: protected-root-destruction
+  expect: blocked
+  command: sudo -iu root rm -rf /
+- id: protected-root-blocked-sudo-directory
+  rule: protected-root-destruction
+  expect: blocked
+  command: sudo -D / rm -rf /
+- id: protected-root-blocked-sudo-chroot
+  rule: protected-root-destruction
+  expect: blocked
+  command: sudo --chroot / rm -rf /
+- id: protected-root-blocked-sudo-env
+  rule: protected-root-destruction
+  expect: blocked
+  command: sudo FOO=1 rm -rf /
+- id: protected-root-blocked-env-cluster
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'env -iS "rm -rf /"'
+- id: protected-root-blocked-env-attached
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'env -S"rm -rf /"'
+- id: protected-root-blocked-env-long-split
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'env --split-string "rm -rf /"'
+- id: protected-root-blocked-env-long-chdir
+  rule: protected-root-destruction
+  expect: blocked
+  command: env --chdir / rm -rf /
+- id: protected-root-blocked-find-delete
+  rule: protected-root-destruction
+  expect: blocked
+  command: find / -delete
+- id: protected-root-blocked-find-double-slash
+  rule: protected-root-destruction
+  expect: blocked
+  command: find // -delete
+- id: protected-root-blocked-dot-root
+  rule: protected-root-destruction
+  expect: blocked
+  command: rm -rf /./
+- id: protected-root-blocked-dotdot-root
+  rule: protected-root-destruction
+  expect: blocked
+  command: rm -rf /../
+- id: protected-root-blocked-find-dot-root
+  rule: protected-root-destruction
+  expect: blocked
+  command: find /./ -delete
+- id: protected-root-blocked-find-option-root
+  rule: protected-root-destruction
+  expect: blocked
+  command: find -xdev / -delete
+- id: protected-root-blocked-python-rmtree
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'python3 -c "import shutil; shutil.rmtree(''/'')"'
+- id: protected-root-blocked-python-double-slash
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'python3 -c "import shutil; shutil.rmtree(''//'')"'
+- id: protected-root-blocked-python-from-import
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'python -c "from shutil import rmtree; rmtree(''/'')"'
+- id: protected-root-blocked-python-alias
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'python -c "import shutil as s; s.rmtree(''/'')"'
+- id: protected-root-blocked-python-local-callable
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'python -c "import shutil; rr = shutil.rmtree; rr(''/'')"'
+- id: protected-root-blocked-python-import-callable
+  rule: protected-root-destruction
+  expect: blocked
+  command: 'python -c "mod = __import__(''shutil''); mod.rmtree(''/'')"'
+- id: protected-root-allowed-build-clean
+  rule: protected-root-destruction
+  expect: allowed
+  command: rm -rf build/ node_modules
+- id: protected-root-allowed-rm-preserve-root
+  rule: protected-root-destruction
+  expect: allowed
+  command: rm --preserve-root /
+- id: protected-root-allowed-rm-preserve-root-recursive
+  rule: protected-root-destruction
+  expect: allowed
+  command: rm --preserve-root -rf /
+- id: protected-root-allowed-rm-preserve-root-all
+  rule: protected-root-destruction
+  expect: allowed
+  command: rm --preserve-root=all -rf /
+- id: protected-root-allowed-find-build
+  rule: protected-root-destruction
+  expect: allowed
+  command: find -xdev build -delete
+- id: protected-root-allowed-find-predicate-tilde
+  rule: protected-root-destruction
+  expect: allowed
+  command: 'find build -name "~" -delete'
+- id: protected-root-allowed-find-predicate-root
+  rule: protected-root-destruction
+  expect: allowed
+  command: find build -path / -delete
+- id: protected-root-allowed-env-echo
+  rule: protected-root-destruction
+  expect: allowed
+  command: 'env -S "echo safe"'
+- id: protected-root-allowed-env-long-echo
+  rule: protected-root-destruction
+  expect: allowed
+  command: 'env --split-string "echo safe"'
+- id: protected-root-allowed-env-help
+  rule: protected-root-destruction
+  expect: allowed
+  command: 'env --help -S "rm -rf /"'
+- id: protected-root-allowed-echo
+  rule: protected-root-destruction
+  expect: allowed
+  command: 'echo "rm -rf /"'
+- id: protected-root-allowed-python-module
+  rule: protected-root-destruction
+  expect: allowed
+  command: python -m pytest
+- id: account-mutation-blocked-passwd
+  rule: account-mutation
+  expect: blocked
+  command: "sh -c 'sudo passwd root'"
+- id: account-mutation-blocked-shell-passwd
+  rule: account-mutation
+  expect: blocked
+  command: "sh -ec 'sudo passwd root'"
+- id: account-mutation-blocked-useradd
+  rule: account-mutation
+  expect: blocked
+  command: sudo useradd x
+- id: account-mutation-blocked-sudo-env-passwd
+  rule: account-mutation
+  expect: blocked
+  command: sudo FOO=1 passwd root
+- id: protected-root-blocked-sudo-long-user
+  rule: protected-root-destruction
+  expect: blocked
+  command: sudo --user root rm -rf /
+- id: account-mutation-blocked-adduser
+  rule: account-mutation
+  expect: blocked
+  command: sudo adduser x
+- id: account-mutation-blocked-sudoers-tee
+  rule: account-mutation
+  expect: blocked
+  command: "echo 'x ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/x"
+- id: account-mutation-blocked-double-slash-tee
+  rule: account-mutation
+  expect: blocked
+  command: sudo tee //etc/sudoers.d/x
+- id: account-mutation-blocked-shell-redirect
+  rule: account-mutation
+  expect: blocked
+  command: "sudo sh -c 'echo x > /etc/sudoers.d/x'"
+- id: account-mutation-blocked-shell-redirect-glued
+  rule: account-mutation
+  expect: blocked
+  command: "sudo sh -c 'echo x>/etc/sudoers.d/x'"
+- id: account-mutation-blocked-printf-redirect
+  rule: account-mutation
+  expect: blocked
+  command: "bash -c 'printf x>/etc/sudoers.d/x'"
+- id: account-mutation-blocked-leading-redirect
+  rule: account-mutation
+  expect: blocked
+  command: "> /etc/sudoers.d/x echo x"
+- id: account-mutation-blocked-leading-append
+  rule: account-mutation
+  expect: blocked
+  command: ">>/etc/sudoers.d/x echo x"
+- id: account-mutation-blocked-leading-fd-append
+  rule: account-mutation
+  expect: blocked
+  command: "1>>/etc/sudoers.d/x echo x"
+- id: account-mutation-allowed-grep
+  rule: account-mutation
+  expect: allowed
+  command: grep passwd /etc/group
+- id: account-mutation-allowed-sudo-install
+  rule: account-mutation
+  expect: allowed
+  command: sudo apt-get install -y jq
+- id: account-mutation-allowed-sudo-long-install
+  rule: account-mutation
+  expect: allowed
+  command: sudo --user root apt-get install -y jq
+- id: account-mutation-allowed-sudo-help
+  rule: account-mutation
+  expect: allowed
+  command: sudo --help passwd root
+- id: block-device-blocked-dd
+  rule: block-device-clobber
+  expect: blocked
+  command: dd if=/dev/zero of=/dev/sda
+- id: block-device-blocked-double-slash-dd
+  rule: block-device-clobber
+  expect: blocked
+  command: dd if=/dev/zero of=//dev/sda
+- id: block-device-allowed-dd-image
+  rule: block-device-clobber
+  expect: allowed
+  command: dd if=a.img of=b.img
+- id: repository-blocked-force-push-main
+  rule: repository-destruction
+  expect: blocked
+  command: git push -f origin main
+- id: repository-blocked-delete-main
+  rule: repository-destruction
+  expect: blocked
+  command: git push origin :main
+- id: repository-blocked-delete-full-ref
+  rule: repository-destruction
+  expect: blocked
+  command: git push origin :refs/heads/main
+- id: repository-blocked-delete-option
+  rule: repository-destruction
+  expect: blocked
+  command: git push --delete origin main
+- id: repository-blocked-delete-option-short
+  rule: repository-destruction
+  expect: blocked
+  command: git push origin -d main
+- id: repository-blocked-delete-default-remote
+  rule: repository-destruction
+  expect: blocked
+  command: git push --delete main
+- id: repository-blocked-delete-default-remote-short
+  rule: repository-destruction
+  expect: blocked
+  command: git push -d main
+- id: repository-blocked-global-no-pager
+  rule: repository-destruction
+  expect: blocked
+  command: git --no-pager push --delete origin main
+- id: repository-blocked-global-config
+  rule: repository-destruction
+  expect: blocked
+  command: git -c core.pager=cat push --force origin main
+- id: repository-blocked-global-worktree
+  rule: repository-destruction
+  expect: blocked
+  command: git -C repo push -f origin main
+- id: repository-blocked-sudo-env-git
+  rule: repository-destruction
+  expect: blocked
+  command: sudo PATH=/usr/bin git push -f origin main
+- id: repository-blocked-mirror
+  rule: repository-destruction
+  expect: blocked
+  command: git push --mirror origin
+- id: repository-blocked-all-force
+  rule: repository-destruction
+  expect: blocked
+  command: git push --all --force origin
+- id: repository-blocked-force-default-remote
+  rule: repository-destruction
+  expect: blocked
+  command: git push -f HEAD:main
+- id: repository-blocked-force-default-remote-full-ref
+  rule: repository-destruction
+  expect: blocked
+  command: git push --force-with-lease HEAD:refs/heads/main
+- id: repository-blocked-force-full-ref
+  rule: repository-destruction
+  expect: blocked
+  command: git push --force-with-lease origin HEAD:refs/heads/main
+- id: repository-blocked-gh-delete
+  rule: repository-destruction
+  expect: blocked
+  command: gh repo delete o/r --yes
+- id: repository-blocked-gh-global-repo
+  rule: repository-destruction
+  expect: blocked
+  command: gh --repo o/r repo delete --yes
+- id: repository-blocked-gh-short-repo
+  rule: repository-destruction
+  expect: blocked
+  command: gh -R o/r repo delete --yes
+- id: repository-allowed-normal-push
+  rule: repository-destruction
+  expect: allowed
+  command: git push origin feature/test
+- id: repository-allowed-force-feature-ref
+  rule: repository-destruction
+  expect: allowed
+  command: git push --force-with-lease origin HEAD:refs/heads/feature/test
+- id: repository-allowed-force-default-feature-ref
+  rule: repository-destruction
+  expect: allowed
+  command: git push -f HEAD:feature/test
+- id: repository-allowed-git-help
+  rule: repository-destruction
+  expect: allowed
+  command: git --help push --delete origin main
+- id: repository-allowed-gh-view
+  rule: repository-destruction
+  expect: allowed
+  command: gh repo view o/r
+- id: repository-allowed-gh-global-view
+  rule: repository-destruction
+  expect: allowed
+  command: gh --repo o/r repo view
+- id: repository-allowed-gh-version
+  rule: repository-destruction
+  expect: allowed
+  command: gh --version repo delete o/r --yes
