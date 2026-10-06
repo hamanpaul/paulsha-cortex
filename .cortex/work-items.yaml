@@ -1681,3 +1681,35 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/task-memory-disposition/todo.md'
     excludes: []
+  ship-clean-behind-autosync:
+    title: 'ship-clean-behind-autosync'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1311'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/ship-clean-behind-autosync/todo.md'
+    excludes: []
+  passive-executor-health:
+    title: 'passive-executor-health'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1312'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/passive-executor-health/todo.md'
+    excludes: []
+  planner-timeout-retry:
+    title: 'planner-timeout-retry'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1313'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/planner-timeout-retry/todo.md'
+    excludes: []
+  archive-ref-namespace:
+    title: 'archive-ref-namespace'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1314'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/archive-ref-namespace/todo.md'
+    excludes: []

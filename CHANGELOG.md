@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- **cortex 進件：派工穩定性第二批 #1311–#1314**：登記四個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006c.md`）。
 - **cortex 進件：#1309 task-memory 逐則處置回報**：登記 work item `task-memory-disposition` 與 accepted todo，交給 cortex 派工（見 `changelog.d/cortex-intake-task-memory-disposition.md`）。
 - **cortex 進件：派工穩定性 #1302–#1307**：登記六個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-dispatch-stability.md`）。
 - **cortex 進件：#1282 審查後續／#1296／#1297**：登記三個 work item 與 accepted todo，交給 cortex 平行派工（見 `changelog.d/cortex-intake-batch-20261006b.md`）。
