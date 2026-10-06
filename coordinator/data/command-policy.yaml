@@ -1,5 +1,5 @@
 version: 1
-wrappers: [sudo, env, timeout, command, nohup, xargs, eval]
+wrappers: [sudo, env, timeout, command, nohup, xargs, eval, time, exec, nice, setsid, busybox]
 protected_paths: ["/", "/*", "~", "~/*"]
 protected_sudoers_paths: ["/etc/sudoers", "/etc/sudoers.d"]
 block_device_prefixes: ["/dev/sd", "/dev/vd", "/dev/nvme"]

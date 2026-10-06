@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -48,6 +49,7 @@ _IMPLEMENTED_RULE_COMMANDS = {
 _ENV_CLUSTER_VALUE_OPTIONS = frozenset({"C", "S", "u"})
 _ENV_LONG_VALUE_OPTIONS = frozenset({"--chdir", "--split-string", "--unset"})
 _SEGMENT_SEPARATORS = frozenset({"|", "||", "&", "&&", ";", "|&", "\n"})
+_SEGMENT_KEYWORDS = frozenset({"{", "then", "do", "else", "elif", "}", "fi", "done", "esac"})
 _FORCE_PUSH_FLAGS = frozenset({"-f", "--force", "--force-with-lease"})
 _GH_VALUE_OPTIONS = frozenset({"-R", "--repo", "--hostname"})
 _GIT_GLOBAL_VALUE_OPTIONS = frozenset(
@@ -64,7 +66,20 @@ _SUDO_LONG_VALUE_OPTIONS = frozenset(
 _SUDO_VALUE_OPTIONS = frozenset({"-C", "-D", "-R", "-g", "-h", "-p", "-r", "-t", "-T", "-u"})
 _SUDO_VALUE_OPTION_CHARS = frozenset(token[1:] for token in _SUDO_VALUE_OPTIONS)
 _SUPPORTED_WRAPPERS = frozenset(
-    {"command", "env", "eval", "nohup", "sudo", "timeout", "xargs"}
+    {
+        "busybox",
+        "command",
+        "env",
+        "eval",
+        "exec",
+        "nice",
+        "nohup",
+        "setsid",
+        "sudo",
+        "time",
+        "timeout",
+        "xargs",
+    }
 )
 _ENV_VALUE_OPTIONS = frozenset({"-C", "-S", "-u"})
 _TIMEOUT_VALUE_OPTIONS = frozenset({"-k", "-s", "--kill-after", "--signal"})
@@ -82,6 +97,12 @@ _XARGS_LONG_VALUE_OPTIONS = frozenset(
     }
 )
 _XARGS_SHORT_VALUE_OPTIONS = frozenset({"a", "d", "E", "I", "L", "n", "P", "s"})
+_TIME_VALUE_OPTIONS = frozenset({"-f", "--format", "-o", "--output"})
+_NICE_VALUE_OPTIONS = frozenset({"-n", "--adjustment"})
+_SETSID_VALUE_OPTIONS = frozenset({"-S"})
+_HERE_DOCUMENT = re.compile(
+    r"(?<!<)<<(?!<)(?P<strip_tabs>-)?[ \t]*(?:'(?P<single>[^']*)'|\"(?P<double>[^\"]*)\"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
 _MAX_NESTED_SHELL_DEPTH = 16
 
 
@@ -327,6 +348,8 @@ def split_command_segments(command: str) -> tuple[tuple[str, ...], ...]:
                     segments.append(tuple(current))
                     current.clear()
                 continue
+            if token in _SEGMENT_KEYWORDS and not current:
+                continue
             current.append(token)
     except ValueError as exc:
         raise CommandPolicyError(f"command segmentation 失敗: {exc}") from exc
@@ -354,7 +377,7 @@ def unwrap_command_argv(
     remaining = tuple(token for token in argv if token)
     active_wrappers = frozenset(token.lower() for token in (wrappers or ()))
     if not active_wrappers:
-        active_wrappers = frozenset({"sudo", "env", "timeout", "command", "nohup"})
+        active_wrappers = _SUPPORTED_WRAPPERS
     stop_wrappers = frozenset(token.lower() for token in stop_before)
 
     seen: set[tuple[str, ...]] = set()
@@ -381,6 +404,14 @@ def unwrap_command_argv(
             next_argv = _strip_eval(remaining)
         elif argv0 == "xargs":
             next_argv = _strip_xargs(remaining)
+        elif argv0 == "nice":
+            next_argv = _strip_nice(remaining)
+        elif argv0 == "time":
+            next_argv = _strip_time(remaining)
+        elif argv0 == "exec":
+            next_argv = _strip_exec(remaining)
+        elif argv0 == "setsid":
+            next_argv = _strip_setsid(remaining)
         else:
             next_argv = _strip_simple_prefix_wrapper(remaining)
         if next_argv == remaining:
@@ -398,7 +429,8 @@ def _evaluate_command(
 ) -> CommandDecision:
     if depth > _MAX_NESTED_SHELL_DEPTH:
         raise CommandPolicyError("shell 巢狀命令超過解析上限")
-    nested_commands = _nested_shell_commands(command)
+    parsed_command, here_document_commands = _extract_here_documents(command, policy)
+    nested_commands = (*here_document_commands, *_nested_shell_commands(parsed_command))
     for nested_command in nested_commands:
         nested_decision = _evaluate_command(
             nested_command, policy=policy, depth=depth + 1
@@ -407,10 +439,10 @@ def _evaluate_command(
             return CommandDecision(
                 allowed=False,
                 command=command,
-                segments=split_command_segments(command),
+                segments=split_command_segments(parsed_command),
                 match=nested_decision.match,
             )
-    segments = split_command_segments(command)
+    segments = split_command_segments(parsed_command)
     for segment in segments:
         match = _match_segment(segment, policy, depth=depth)
         if match is not None:
@@ -436,6 +468,10 @@ def _match_segment(
     nested_command = _shell_command_payload(unwrapped)
     if argv0 in _SHELL_ARGV0 and nested_command is not None:
         return _evaluate_command(nested_command, policy=policy, depth=depth + 1).match
+    if argv0 in _SHELL_ARGV0:
+        here_string = _shell_here_string_payload(unwrapped)
+        if here_string is not None:
+            return _evaluate_command(here_string, policy=policy, depth=depth + 1).match
 
     if _rule_matches_command(policy, "protected-root-destruction", argv0) and _is_python_argv0(argv0):
         python_match = _match_python_command(unwrapped, policy)
@@ -698,6 +734,62 @@ def _strip_timeout(argv: Sequence[str]) -> tuple[str, ...]:
     return tuple(argv[index + 1 :])
 
 
+def _strip_nice(argv: Sequence[str]) -> tuple[str, ...]:
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return tuple(argv[index + 1 :])
+        if token in _HELP_OR_VERSION_FLAGS:
+            return ()
+        if token in _NICE_VALUE_OPTIONS:
+            index += 2
+            continue
+        if token.startswith("--adjustment=") or (token.startswith("-") and token[1:].isdigit()):
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            index += 1
+            continue
+        return tuple(argv[index:])
+    return ()
+
+
+def _strip_time(argv: Sequence[str]) -> tuple[str, ...]:
+    index = _skip_options(argv, start=1, value_options=_TIME_VALUE_OPTIONS)
+    return tuple(argv[index:])
+
+
+def _strip_exec(argv: Sequence[str]) -> tuple[str, ...]:
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return tuple(argv[index + 1 :])
+        if token in {"-c", "-l"} or (
+            token.startswith("-")
+            and len(token) > 1
+            and all(option in {"c", "l"} for option in token[1:])
+        ):
+            index += 1
+            continue
+        if token == "-a":
+            index += 2
+            continue
+        if token.startswith("-a") and len(token) > 2:
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            raise CommandPolicyError(f"exec option 無法解析: {token}")
+        return tuple(argv[index:])
+    return ()
+
+
+def _strip_setsid(argv: Sequence[str]) -> tuple[str, ...]:
+    index = _skip_options(argv, start=1, value_options=_SETSID_VALUE_OPTIONS)
+    return tuple(argv[index:])
+
+
 def _strip_simple_prefix_wrapper(argv: Sequence[str]) -> tuple[str, ...]:
     index = _skip_options(argv, start=1, value_options=frozenset())
     return tuple(argv[index:])
@@ -723,6 +815,13 @@ def _shell_command_payload(argv: Sequence[str]) -> str | None:
         if token in _SHELL_INLINE_COMMAND_OPTIONS and index + 1 < len(argv):
             return argv[index + 1]
         if token.startswith("-") and not token.startswith("--") and "c" in token[1:] and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
+def _shell_here_string_payload(argv: Sequence[str]) -> str | None:
+    for index, token in enumerate(argv[:-1]):
+        if token == "<<<":
             return argv[index + 1]
     return None
 
@@ -1190,6 +1289,96 @@ def _nested_shell_commands(command: str) -> tuple[str, ...]:
             continue
         index += 1
     return tuple(nested)
+
+
+def _extract_here_documents(
+    command: str, policy: CommandPolicy
+) -> tuple[str, tuple[str, ...]]:
+    """Remove here-document bodies from shell syntax and return shell-fed bodies."""
+
+    lines = command.splitlines(keepends=True)
+    if not lines:
+        return command, ()
+
+    parsed_lines: list[str] = []
+    nested: list[str] = []
+    index = 0
+    while index < len(lines):
+        header = lines[index]
+        matches = tuple(
+            match
+            for match in _HERE_DOCUMENT.finditer(header)
+            if _outside_shell_quotes(header, match.start())
+        )
+        if not matches:
+            parsed_lines.append(header)
+            index += 1
+            continue
+
+        shell_input = _line_runs_shell(header[: matches[0].start()], policy)
+        parsed_header = header
+        for match in reversed(matches):
+            parsed_header = parsed_header[: match.start()] + parsed_header[match.end() :]
+        parsed_lines.append(parsed_header)
+
+        cursor = index + 1
+        for match in matches:
+            delimiter = match.group("single") or match.group("double") or match.group("bare")
+            if delimiter is None:
+                raise CommandPolicyError("shell here-document delimiter 無法解析")
+            strip_tabs = match.group("strip_tabs") is not None
+            body: list[str] = []
+            while cursor < len(lines):
+                candidate = lines[cursor].rstrip("\r\n")
+                comparable = candidate.lstrip("\t") if strip_tabs else candidate
+                consumed_line = lines[cursor]
+                cursor += 1
+                if comparable == delimiter:
+                    parsed_lines.append("\n" if consumed_line.endswith(("\n", "\r")) else "")
+                    break
+                body.append(consumed_line)
+                parsed_lines.append("\n" if consumed_line.endswith(("\n", "\r")) else "")
+            else:
+                raise CommandPolicyError("shell here-document delimiter 未閉合")
+            if shell_input:
+                nested.append("".join(body))
+        index = cursor
+
+    return "".join(parsed_lines), tuple(nested)
+
+
+def _line_runs_shell(line_prefix: str, policy: CommandPolicy) -> bool:
+    try:
+        segments = split_command_segments(line_prefix)
+    except CommandPolicyError:
+        return False
+    if not segments:
+        return False
+    argv = unwrap_command_argv(segments[-1], wrappers=policy.wrappers)
+    return bool(argv and normalize_argv0(argv[0]) in _SHELL_ARGV0)
+
+
+def _outside_shell_quotes(command: str, end: int) -> bool:
+    quote: str | None = None
+    escaped = False
+    for char in command[:end]:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+    return quote is None and not escaped
 
 
 def _extract_parenthesized_payload(command: str, opening_index: int) -> tuple[str, int]:

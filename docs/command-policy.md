@@ -12,14 +12,14 @@
 
 | 欄位 | 用途 |
 | --- | --- |
-| `wrappers` | 可剝除後繼續檢查的命令 wrapper，例如 `sudo`、`env`、`timeout` |
+| `wrappers` | 可剝除後繼續檢查的命令 wrapper，例如 `sudo`、`env`、`timeout`、`time`、`exec`、`nice`、`setsid`、`busybox` |
 | `protected_paths` | `rm`／`find`／`python` 的受保護路徑 |
 | `protected_sudoers_paths` | 阻擋寫入 sudoers 檔案的路徑 |
 | `block_device_prefixes` | `dd` 不得覆寫的裝置路徑前綴 |
 | `protected_refs` | `git`／`gh` 不得強制改寫的分支 |
 | `rules` | 已實作的規則 id、命令、類別、嚴重度與摘要 |
 
-引擎先切分 shell 命令段，再比對 argv；會剝除開頭的 `VAR=value` 指派、正規化 argv0、剝除支援的 wrapper（含 `xargs`、`eval`），遞迴處理 `sh -c`／`bash -c`、括號 subshell、`$()` 與反引號命令替換，並檢查 `python -c` 的字面引數、路徑、sudoers 寫入、block device 目的地及 git／gh 子命令選項。`$HOME` 與 `${HOME}` 會正規化為受保護的 `~` 路徑。未知 rule、wrapper、policy key 或格式錯誤一律拒絕載入。
+引擎先切分 shell 命令段，再比對 argv；會剝除開頭的 `VAR=value` 指派、正規化 argv0、剝除支援的 wrapper（含 `xargs`、`eval`、`time`、`exec`、`nice`、`setsid`、`nohup` 與 `busybox`），遞迴處理 `sh -c`／`bash -c`、括號 subshell、`{ ...; }`、`if`／`then`／`else`／`fi` 控制段、`$()` 與反引號命令替換。送給 `sh`／`bash` 的 here-string（`<<<`）與 here-document（`<<`）本文也會遞迴檢查。引擎並檢查 `python -c` 的字面引數、路徑、sudoers 寫入、block device 目的地及 git／gh 子命令選項。`$HOME` 與 `${HOME}` 會正規化為受保護的 `~` 路徑。未知 rule、wrapper、policy key 或格式錯誤一律拒絕載入。
 
 ## Operator overlay
 
@@ -51,7 +51,7 @@ Overlay 不接受重寫 rules、wrappers、severity 或既有欄位；未知欄�
 
 `tests/test_command_policy_hook_1283.py` 以各 executor 的原生 payload 形狀執行 hook，確認拒絕輸出、稽核事件與 critical job termination；launcher 測試檢查注入的 argv、settings、plugin 與 hook 設定。量測沒有啟動模型 API session，也沒有讓 executor 真正送出 shell call，因此 matrix 對四種 executor 的必要角色都標為 `unsupported-measured`。此狀態表示目前只有 CLI／設定注入與 hook 自身測試證據；必須完成 executor 到 hook 的端到端阻擋量測後，才能改標 `hook-enforced`。Copilot 的 command hook 超時依其文件屬 fail-open；此處設 5 秒 timeout，並以原生 deny rules 覆蓋少數靜態命令。其餘動態命令依賴 hook 正常載入。
 
-命令解析會檢查括號 subshell、`$()`、反引號，以及經 `xargs`／`eval` 執行的命令。它不會執行 shell 展開，也無法分析模型先建立或改寫腳本、再用允許命令執行的內容；這是已接受的邊界。
+命令解析會檢查 shell 的常見直接控制段、括號 subshell、`$()`、反引號、here-string、here-document，以及經 `xargs`／`eval` 執行的命令。它不會執行 shell 展開；依賴未解析變數或 runtime 輸入組成的命令，以及模型先建立或改寫腳本、再用允許命令執行的內容，無法靜態判定，這是已接受的限制。
 
 原生介面依據：
 
