@@ -64,6 +64,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, Mapping, Protocol, Sequence
 
 from .backend import (
+    _cortex_account_universal_nopasswd,
     _durable_in_flight_job_count,
     _in_flight_process_count,
     _password_locked,
@@ -200,6 +201,9 @@ _VANISHED_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
 #: Where the design publishes inventories: installer-owned, outside every root
 #: and managed path the inventory records.
 INSTALLER_LEGACY_DIRECTORY = "/var/lib/cortex-installer/legacy/"
+#: The runbook's quarantine root; the capture preview plans against it until
+#: the operator's overlay names another one (#1282).
+DEFAULT_QUARANTINE_ROOT = "/var/lib/cortex-installer/legacy-quarantine"
 
 _AT_SYMLINK_NOFOLLOW = 0x100
 #: ``faccessat2`` joined the unified syscall table in Linux 5.8.
@@ -850,6 +854,7 @@ class LegacyHostBackend(Protocol):
         self, identity: CensusIdentity, tree: CensusTree
     ) -> CensusResult: ...
     def running_cortex_units(self) -> Sequence[tuple[str, str]]: ...
+    def sudoers_verdict(self, plan: Mapping[str, object]) -> Mapping[str, object]: ...
 
 
 _READ_FLAGS = (
@@ -1092,6 +1097,30 @@ class LocalLegacyHostBackend:
                 continue
             rows.append((fields[0], fields[2]))
         return sorted(rows)
+
+    def sudoers_verdict(self, plan: Mapping[str, object]) -> Mapping[str, object]:
+        """The apply preflight's sudoers fact, read here as root (#1282).
+
+        ``{"accounts": [...], "unproven": None | reason}`` exactly as
+        ``preflight_facts`` derives ``cortex_account_universal_nopasswd``
+        for the plan's cortex accounts.  A non-root review cannot read
+        ``/etc/sudoers``; the root capture can, so the finding surfaces at
+        inventory review instead of only at apply.  Read-only.
+        """
+
+        desired = [
+            row
+            for key in ("accounts", "service_accounts")
+            for row in plan.get(key, []) or []  # type: ignore[union-attr]
+            if isinstance(row, Mapping)
+        ]
+        return dict(
+            _cortex_account_universal_nopasswd(
+                desired,
+                passwd_records=list(pwd.getpwall()),
+                group_records=list(grp.getgrall()),
+            )
+        )
 
     def in_flight(
         self, job_uids: Mapping[str, int], plan: Mapping[str, object]
@@ -2743,6 +2772,7 @@ QUARANTINE_REASONS = frozenset(
         "authority",
         "credential",
         "deploy-backup",
+        "home-top",
         "job-worktree-pool",
         "managed-generated",
         "managed-residue",
@@ -2765,7 +2795,10 @@ DEPLOY_BACKUP_PATTERNS = ("venv.*", "venv-*", "operator-backups", *RESIDUE_PATTE
 #: The #568 reviewer drop-in and its settings file; the reviewer launcher's
 #: ``--add-dir`` superseded both (#1125), so they move without a port.
 SUPERSEDED_BY_LAUNCHER = ("agy-reviewer-settings.json", "agy-review-settings.conf")
-_QUARANTINABLE_TYPES = frozenset({"file", "directory", "symlink"})
+#: Sockets and FIFOs are stale runtime objects (#1282): moved like a file and
+#: bound by type, owner, mode and inode; nothing ever opens them.  A device
+#: node at the top stays unclassified -- it is no cortex state.
+_QUARANTINABLE_TYPES = frozenset({"file", "directory", "symlink", "socket", "fifo"})
 _EXPECTED_BASE_KEYS = ("type", "uid", "gid", "mode", "dev", "ino")
 
 _LEGACY_REQUEST_KEYS = frozenset(
@@ -3185,6 +3218,11 @@ def _classify_discovered(
         return quarantine("managed-subdir")
     if "managed-residue" in rules:
         return quarantine("managed-residue")
+    if "home-top" in rules:
+        # A cortex HOME keeps only what the plan declares (the necessary
+        # subset, #1282): shell history, retry files and the like move into
+        # the quarantine instead of needing a review list.
+        return quarantine("operator" if path in operator_paths else "home-top")
     return unclassified()
 
 
@@ -3386,6 +3424,30 @@ def _covering_root(path: str, roots: frozenset[str]) -> str | None:
     return None
 
 
+def _census_finding_admitted(
+    principal: str,
+    path: str,
+    *,
+    exceptions: Sequence[Mapping[str, object]],
+    quarantined: frozenset[str],
+) -> bool:
+    """A job-writable path is fine if excepted or inside a quarantined object.
+
+    An object the plan moves into the quarantine (#1282) is gone from its path
+    once apply runs -- its legacy permissions go with it into a root-only
+    tree, and a ``quarantine-then-create`` path is recreated with the plan's
+    own -- so what the account could write there needs no exception.  A
+    writable path *above* a quarantined object still does.
+    """
+
+    if path in quarantined or _covering_root(path, quarantined) is not None:
+        return True
+    return any(
+        exception["principal"] == principal and _within(path, str(exception["path"]))
+        for exception in exceptions
+    )
+
+
 def derive_legacy_adoption(
     plan: Mapping[str, object],
     *,
@@ -3562,7 +3624,7 @@ def derive_legacy_adoption(
                     "it would keep altering the unit the plan installs"
                 )
 
-    # writable census: stable, and only declared or excepted paths
+    # writable census: stable, and only declared, excepted or quarantined paths
     census = document["census"]
     assert isinstance(census, Mapping)
     for principal, row in sorted(census.items()):
@@ -3573,13 +3635,13 @@ def derive_legacy_adoption(
             )
         for item in row["writable_outside_declared"]:
             path = str(item["path"])
-            if not any(
-                exception["principal"] == principal and _within(path, exception["path"])
-                for exception in exceptions
+            if not _census_finding_admitted(
+                principal, path, exceptions=exceptions, quarantined=quarantine_roots
             ):
                 failures.append(
                     f"census: {principal} can write {path}, which is neither a "
-                    "plan-declared writable asset nor a legacy_adoption.census_exceptions entry"
+                    "plan-declared writable asset, inside an object the plan quarantines, "
+                    "nor a legacy_adoption.census_exceptions entry"
                 )
 
     if failures:
@@ -3627,6 +3689,61 @@ def derive_legacy_adoption(
     _assert_managed_parent_topology(bound)
     validate_legacy_adoption_plan(bound, bound["apply_order"])  # type: ignore[arg-type]
     return bound
+
+
+def preview_legacy_adoption(
+    plan: Mapping[str, object],
+    *,
+    overlay: Mapping[str, object] | None,
+    document: Mapping[str, object],
+) -> dict[str, object]:
+    """What planning would decide for a fresh capture -- at review time (#1282).
+
+    The root capture is where the operator's review (S2) starts, but the
+    plan's verdict used to appear only when ``plan`` ran.  This runs exactly
+    the plan's derivation on the just-captured ``document``: with the review
+    lists (``quarantine_root``, ``census_exceptions``, ``quarantine_paths``)
+    the overlay's ``legacy_adoption`` block already carries, or with none and
+    :data:`DEFAULT_QUARANTINE_ROOT`.  ``ready`` is true when a plan bound to
+    this capture would succeed; otherwise ``failures`` lists every reason the
+    plan would give, each naming its resolution.  Pure computation: nothing
+    on the host is read or changed.
+    """
+
+    inventory = LegacyInventory.from_document(document)
+    try:
+        if plan.get("legacy_policy") != "quarantine":
+            raise InstallPlanError(
+                f"legacy_policy: {plan.get('legacy_policy')} refuses legacy adoption; "
+                "only legacy_policy: quarantine may adopt a host without a receipt"
+            )
+        block = overlay.get("legacy_adoption") if isinstance(overlay, Mapping) else None
+        reviewed = dict(block) if isinstance(block, Mapping) else {}
+        reviewed.setdefault("quarantine_root", DEFAULT_QUARANTINE_ROOT)
+        # The block may still name an earlier capture; preview this one.
+        reviewed["inventory_sha256"] = inventory.inventory_sha256
+        request = validate_legacy_adoption_request(reviewed)
+        bound = derive_legacy_adoption(
+            bind_host_overlay(plan, overlay),
+            request=request,
+            overlay=overlay,
+            inventory=inventory,
+            host_binding_sha256=inventory.host_binding_sha256,
+        )
+    except LegacyAdoptionPlanError as exc:
+        return {"ready": False, "failures": list(exc.failures), "quarantine": None, "summary": None}
+    except InstallPlanError as exc:
+        return {"ready": False, "failures": [str(exc)], "quarantine": None, "summary": None}
+    result = bound["legacy_adoption"]
+    assert isinstance(result, Mapping)
+    quarantine = result["quarantine"]
+    assert isinstance(quarantine, list)
+    return {
+        "ready": True,
+        "failures": [],
+        "quarantine": len(quarantine),
+        "summary": dict(result["summary"]),  # type: ignore[arg-type]
+    }
 
 
 def _plan_sorted_unique(keys: Sequence[object], label: str) -> None:
@@ -4105,6 +4222,9 @@ class LegacyApplyContext:
         failures: list[str] = []
         exceptions = block["census_exceptions"]
         assert isinstance(exceptions, list)
+        quarantine = block["quarantine"]
+        assert isinstance(quarantine, list)
+        quarantined = frozenset(str(row["path"]) for row in quarantine)
         census = document["census"]
         assert isinstance(census, Mapping)
         for principal, row in sorted(census.items()):
@@ -4115,14 +4235,13 @@ class LegacyApplyContext:
                 )
             for item in row["writable_outside_declared"]:
                 path = str(item["path"])
-                if not any(
-                    exception["principal"] == principal and _within(path, exception["path"])
-                    for exception in exceptions
+                if not _census_finding_admitted(
+                    principal, path, exceptions=exceptions, quarantined=quarantined
                 ):
                     failures.append(
                         f"census: {principal} can write {path}, which is neither a "
-                        "plan-declared writable asset nor a "
-                        "legacy_adoption.census_exceptions entry"
+                        "plan-declared writable asset, inside an object the plan "
+                        "quarantines, nor a legacy_adoption.census_exceptions entry"
                     )
         volatile = document["volatile"]
         assert isinstance(volatile, Mapping)

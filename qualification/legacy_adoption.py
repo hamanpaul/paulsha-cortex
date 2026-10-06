@@ -5,7 +5,8 @@ Runs as root inside the disposable qualification container (never on a host),
 after the exact candidate wheel is installed.  It lays out the fixture from
 `legacy_fixture.json`, then drives only the public installer CLI:
 
-  fixture -> legacy inventory -> host overlay -> plan (three-way plan SHA)
+  fixture -> legacy inventory (plan preview and sudoers preflight must be
+  clean before any review list) -> host overlay -> plan (three-way plan SHA)
   -> stop the legacy services -> apply --legacy-inventory
   -> rollback (legacy_restored, restore_safe, every quarantined object back at
      its path with the same inode, no stale unit definitions)
@@ -18,6 +19,12 @@ unknown, so a post-activation rollback can never be restore-safe.  Every step
 is written to `legacy-adoption.json`; the driver turns it into
 qualification.json and the validator re-checks it.  No provider credential,
 provider smoke or GitHub access is involved.
+
+The installer runs the way the runbook ran it on the reference host (#1282):
+by absolute path, with a PATH that holds the installer's own directory and
+`/usr/bin:/bin` but no sbin directory, so any tool the installer still looked
+up through PATH (`visudo`, `useradd`, `groupadd` live in `/usr/sbin`) fails
+the profile instead of a host adoption.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -38,6 +46,10 @@ except ModuleNotFoundError:  # run as qualification/legacy_adoption.py from a ch
 
 
 CLI = ("cortex", "install", "trust-root")
+#: The `docker exec` PATH the installer itself is resolved on.
+FULL_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+#: The system half of the installer PATH: the runbook's, without any sbin.
+CLI_SYSTEM_PATH = "/usr/bin:/bin"
 DEFAULT_WORK_DIR = Path("/run/cortex-install")
 SERVICE_WAIT_ATTEMPTS = 30
 STOPPED_STATES = frozenset({"inactive", "failed"})
@@ -59,7 +71,7 @@ def _run_command(argv: Sequence[str], env: Mapping[str, str] | None = None) -> C
 
     # The same environment `docker exec` gives the release profile's CLI calls.
     process_env = {
-        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "PATH": FULL_PATH,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "HOME": "/root",
@@ -138,6 +150,8 @@ class Harness:
         work_dir: Path = DEFAULT_WORK_DIR,
         installer_dir: Path | None = None,
         runner: Callable[..., Any] = _run_command,
+        cli: Sequence[str] = CLI,
+        cli_env: Mapping[str, str] | None = None,
         lstat: Callable[[str], tuple[int, int] | None] = _identity,
         sha256_file: Callable[[str], str] = _sha256_file,
         plan_digest: Callable[[Mapping[str, Any]], str] = _installed_plan_digest,
@@ -159,6 +173,8 @@ class Harness:
         self.overlay_path = overlay_path
         self.candidate = dict(candidate)
         self.runner = runner
+        self.cli = tuple(cli)
+        self.cli_env = dict(cli_env) if cli_env is not None else None
         self.lstat = lstat
         self.sha256_file = sha256_file
         self.plan_digest = plan_digest
@@ -175,6 +191,14 @@ class Harness:
             "candidate": dict(candidate),
             "steps": [],
         }
+        if self.cli_env is not None:
+            path = self.cli_env.get("PATH", "")
+            self.evidence["cli_environment"] = {
+                "path": path,
+                "sbin_on_path": any(
+                    part.rstrip("/").endswith("sbin") for part in path.split(":")
+                ),
+            }
         self.inventory_sha256: str | None = None
         self.inventory_path: Path | None = None
         self.plan: dict[str, Any] | None = None
@@ -185,7 +209,7 @@ class Harness:
     # -- helpers ---------------------------------------------------------
 
     def _cli(self, *arguments: str, allow_failure: bool = False) -> tuple[CommandResult, Any]:
-        result = self.runner((*CLI, *arguments))
+        result = self.runner((*self.cli, *arguments), env=self.cli_env)
         payload: Any = None
         text = (result.stdout or "").strip()
         if text:
@@ -334,6 +358,23 @@ class Harness:
             raise HarnessError("legacy inventory printed no JSON result")
         if payload.get("census_stable") is not True:
             raise HarnessError("legacy inventory census is unstable; the capture cannot bind a plan")
+        # #1282: the root capture is the S2 review.  The fixture's census
+        # finding, stale sockets/FIFO and HOME residue are all covered by the
+        # installer itself, so the plan preview is ready before any review
+        # list, and the sudoers preflight (unreadable without root) is clean.
+        preview = payload.get("plan_preview")
+        if not isinstance(preview, Mapping) or preview.get("ready") is not True:
+            failures = preview.get("failures") if isinstance(preview, Mapping) else None
+            raise HarnessError(
+                "legacy inventory plan preview is not ready before review: "
+                f"{json.dumps(failures)[:1200]}"
+            )
+        sudoers = payload.get("cortex_account_universal_nopasswd")
+        if sudoers != {"accounts": [], "unproven": None}:
+            raise HarnessError(
+                "legacy inventory sudoers preflight is not clean (universal NOPASSWD "
+                f"for cortex accounts or unproven): {json.dumps(sudoers)[:400]}"
+            )
         digest = payload.get("inventory_sha256")
         raw = capture.read_bytes()
         document = json.loads(raw)
@@ -355,6 +396,8 @@ class Harness:
             "census_stable": True,
             "summary_sha256": hashlib.sha256(summary).hexdigest(),
             "summary_lines": len(show.stdout.splitlines()),
+            "plan_preview": {"ready": True, "quarantine": preview.get("quarantine")},
+            "cortex_account_universal_nopasswd": {"accounts": [], "unproven": None},
         }
 
     def _plan(self) -> None:
@@ -623,12 +666,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     except fixture.FixtureError as exc:
         print(f"legacy-adoption harness: {exc}", file=sys.stderr)
         return 2
+    installer = shutil.which(CLI[0], path=FULL_PATH)
+    if installer is None or not os.path.isabs(installer):
+        print("legacy-adoption harness: the candidate cortex CLI is not installed", file=sys.stderr)
+        return 2
     harness = Harness(
         manifest=manifest,
         config=args.config,
         bundle=args.bundle,
         output_dir=args.output_dir,
         work_dir=args.work_dir,
+        cli=(installer, *CLI[1:]),
+        cli_env={"PATH": f"{os.path.dirname(installer)}:{CLI_SYSTEM_PATH}"},
         candidate={
             "candidate_sha": args.candidate_sha,
             "wheel_sha256": args.wheel_sha256,

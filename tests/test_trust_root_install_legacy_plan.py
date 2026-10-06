@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from copy import deepcopy
 from pathlib import Path
 
@@ -988,14 +989,58 @@ def test_deploy_backups_are_quarantined_and_unknown_deploy_entries_are_unclassif
 
 def test_unclassified_objects_fail_and_are_all_listed(tmp_path: Path) -> None:
     def host(_seeded, _backend, base) -> None:
-        (_home(tmp_path, "cortex-builder") / ".bash_history").write_text("ls\n")
-        os.mkfifo(_state(base) / "legacy.fifo")
+        (_deploy(base) / "mystery.txt").write_text("?\n")
+        (_deploy(base) / "etc" / "notes.txt").write_text("?\n")
 
     failures = _failures(tmp_path, host=host)
     unclassified = [failure for failure in failures if failure.startswith("unclassified")]
 
-    assert any(".bash_history" in failure for failure in unclassified)
-    assert any("legacy.fifo" in failure for failure in unclassified)
+    assert any("mystery.txt" in failure for failure in unclassified)
+    assert any("notes.txt" in failure for failure in unclassified)
+    # The failure names the review list that resolves it.
+    assert all("quarantine_paths" in failure for failure in unclassified)
+
+
+def test_undeclared_home_top_entries_are_quarantined_without_review(
+    tmp_path: Path,
+) -> None:
+    # #1282: a cortex HOME keeps only what the plan declares; residue such as
+    # shell history or a manager retry file no longer needs a review list.
+    history = _home(tmp_path, "cortex-builder") / ".bash_history"
+    retry = _home(tmp_path, "cortex-manager") / "retry-718-0001.json"
+
+    def host(_seeded, _backend, _base) -> None:
+        history.write_text("ls\n")
+        retry.write_text("{}\n")
+
+    plan, _seeded, _base = _adopt(tmp_path, host=host)
+    quarantined = _quarantine(plan)
+
+    for path in (history, retry):
+        assert quarantined[str(path)]["disposition"] == "quarantine"
+        assert quarantined[str(path)]["reason"] == "home-top"
+    assert _quarantine_steps(plan)[str(retry)]["expected"]["type"] == "file"
+
+
+def test_stale_sockets_and_fifos_at_the_top_are_quarantined(tmp_path: Path) -> None:
+    # #1282: a stale UNIX socket or FIFO is quarantined like a file, bound
+    # by type, owner, mode and inode; nothing ever opens it.
+    def host(_seeded, _backend, base) -> None:
+        os.mkfifo(_state(base) / "legacy.fifo")
+        os.mknod(_home(tmp_path, "cortex-gate") / "agent.sock", 0o600 | stat.S_IFSOCK)
+
+    plan, _seeded, base = _adopt(tmp_path, host=host)
+    quarantined = _quarantine(plan)
+    steps = _quarantine_steps(plan)
+
+    fifo = str(_state(base) / "legacy.fifo")
+    sock = str(_home(tmp_path, "cortex-gate") / "agent.sock")
+    assert quarantined[fifo]["reason"] == "state-top"
+    assert quarantined[sock]["reason"] == "home-top"
+    assert steps[fifo]["expected"]["type"] == "fifo"
+    assert steps[sock]["expected"]["type"] == "socket"
+    for path in (fifo, sock):
+        assert set(steps[path]["expected"]) == {"type", "uid", "gid", "mode", "dev", "ino"}
 
 
 def test_operator_quarantine_paths_resolve_unclassified_objects(tmp_path: Path) -> None:
@@ -1065,23 +1110,102 @@ def _sandbox_writable(seeded, backend, _base) -> None:
     }
 
 
+def _coordinator_writable(_seeded, backend, base) -> None:
+    # The adopted coordinator root itself: nothing quarantines it.
+    backend.writable = {
+        LEGACY_IDS["cortex-reviewer-planner"][0]: {str(_state(base) / "coordinator")}
+    }
+
+
+def test_census_paths_inside_quarantined_objects_need_no_exception(tmp_path: Path) -> None:
+    # #1282: review-sandboxes moves into the quarantine, so what the account
+    # could write there is no longer at that path after apply.
+    plan, seeded, _base = _adopt(tmp_path, host=_sandbox_writable)
+
+    assert plan["legacy_adoption"]["census_exceptions"] == []
+    assert _quarantine(plan)[str(seeded["sandboxes"])]["reason"] == "managed-subdir"
+
+
 def test_census_path_outside_declared_assets_needs_an_exception(tmp_path: Path) -> None:
-    failures = _failures(tmp_path, host=_sandbox_writable)
+    failures = _failures(tmp_path, host=_coordinator_writable)
     assert any(
-        "census" in failure and "cortex-reviewer-planner" in failure and "review-sandboxes" in failure
+        "census" in failure
+        and "cortex-reviewer-planner" in failure
+        and failure.split(" can write ", 1)[1].startswith(
+            str(tmp_path / "host/var/lib/cortex/coordinator") + ","
+        )
         for failure in failures
     ), failures
 
-    sandboxes = str(tmp_path / "admitted/host/var/lib/cortex/coordinator/review-sandboxes")
-    exception = {"path": sandboxes, "principal": "cortex-reviewer-planner"}
+    coordinator = str(tmp_path / "admitted/host/var/lib/cortex/coordinator")
+    exception = {"path": coordinator, "principal": "cortex-reviewer-planner"}
     plan, _seeded, _base = _adopt(
-        tmp_path / "admitted", host=_sandbox_writable, request={"census_exceptions": [exception]}
+        tmp_path / "admitted",
+        host=_coordinator_writable,
+        request={"census_exceptions": [exception]},
     )
     assert plan["legacy_adoption"]["census_exceptions"] == [exception]
 
-    wrong = {"path": str(tmp_path / "wrong/host/var/lib/cortex/coordinator/review-sandboxes"), "principal": "cortex-gate"}
-    failures = _failures(tmp_path / "wrong", host=_sandbox_writable, request={"census_exceptions": [wrong]})
+    wrong = {"path": str(tmp_path / "wrong/host/var/lib/cortex/coordinator"), "principal": "cortex-gate"}
+    failures = _failures(
+        tmp_path / "wrong", host=_coordinator_writable, request={"census_exceptions": [wrong]}
+    )
     assert any("census" in failure for failure in failures)
+
+
+def test_capture_preview_names_what_a_plan_would_refuse(tmp_path: Path) -> None:
+    # #1282: the capture itself shows (S2) what planning will refuse, with the
+    # same derivation the plan runs, before any review list exists.
+    _config, _bundle, overlay, backend, _seeded, base = _setup(tmp_path)
+    (_deploy(base) / "mystery.txt").write_text("?\n")
+    _coordinator_writable(None, backend, base)
+
+    preview = legacy.preview_legacy_adoption(
+        base, overlay=overlay, document=_collect(base, overlay, backend)
+    )
+
+    assert preview["ready"] is False
+    assert preview["quarantine"] is None and preview["summary"] is None
+    assert any(
+        failure.startswith("unclassified") and "mystery.txt" in failure
+        for failure in preview["failures"]
+    )
+    assert any(
+        "census" in failure and "cortex-reviewer-planner" in failure
+        for failure in preview["failures"]
+    )
+
+
+def test_capture_preview_of_a_clean_host_matches_the_plan(tmp_path: Path) -> None:
+    plan, seeded, base = _adopt(tmp_path, host=_sandbox_writable)
+    inventory = legacy.LegacyInventory.load(next((tmp_path / "inventories").iterdir()))
+    overlay = _legacy_overlay(tmp_path)
+
+    preview = legacy.preview_legacy_adoption(
+        base, overlay=overlay, document=inventory.document
+    )
+
+    assert preview == {
+        "ready": True,
+        "failures": [],
+        "quarantine": len(plan["legacy_adoption"]["quarantine"]),
+        "summary": plan["legacy_adoption"]["summary"],
+    }
+    # An overlay that already carries review lists is previewed with them.
+    unresolved = _deploy(base) / "mystery.txt"
+    unresolved.write_text("?\n")
+    backend = FakeLegacyHost(base, seeded)
+    reviewed = {
+        **overlay,
+        "legacy_adoption": {
+            "inventory_sha256": "0" * 64,
+            "quarantine_root": "/var/lib/cortex-installer/legacy-quarantine",
+            "quarantine_paths": [str(unresolved)],
+        },
+    }
+    document = _collect(base, overlay, backend)
+    assert legacy.preview_legacy_adoption(base, overlay=overlay, document=document)["ready"] is False
+    assert legacy.preview_legacy_adoption(base, overlay=reviewed, document=document)["ready"] is True
 
 
 def test_census_exception_principal_must_be_a_job_account(tmp_path: Path) -> None:

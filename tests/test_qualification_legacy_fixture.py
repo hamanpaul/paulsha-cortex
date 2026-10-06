@@ -110,6 +110,13 @@ def test_manifest_covers_every_phase2b_shape(manifest) -> None:
     assert "/var/lib/cortex/legacy-imported" in entries
     assert "/var/lib/cortex/coordinator/review-sandboxes" in entries
     assert "/var/lib/cortex/coordinator/tmpq1w2e3r4.tmp" in entries
+    # #1282 reference-host shapes: stale sockets and a FIFO (one inside a
+    # quarantined directory, one at the state top) and a manager retry file
+    # at the top of its HOME.
+    assert entries["/var/lib/cortex/coordinator/handoff/manager.sock"]["type"] == "socket"
+    assert entries["/var/lib/cortex/manager-control.sock"]["type"] == "socket"
+    assert entries["/var/lib/cortex/legacy-imported/notify.fifo"]["type"] == "fifo"
+    assert entries["/var/lib/cortex-manager/retry-718-legacy.json"]["type"] == "file"
     # Worktree pools and a non-canonical source checkout with branch/worktree.
     assert "/var/lib/cortex/worktree" in entries
     assert "/var/lib/cortex/gate-worktree" in entries
@@ -213,12 +220,9 @@ def test_host_overlay_is_the_manifest_ids_and_the_legacy_block(
     assert bound["legacy_adoption"] == {
         "inventory_sha256": "a" * 64,
         "quarantine_root": "/var/lib/cortex-installer/legacy-quarantine",
-        "census_exceptions": [
-            {
-                "path": "/var/lib/cortex/coordinator/review-sandboxes",
-                "principal": "cortex-reviewer-planner",
-            }
-        ],
+        # #1282: review-sandboxes is quarantined, so its census finding needs
+        # no exception any more.
+        "census_exceptions": [],
         "quarantine_paths": ["/var/lib/cortex-builder/.bash_history"],
     }
     # The overlay digest the plan records excludes the legacy block.
@@ -286,6 +290,14 @@ def test_rootless_seed_lays_out_the_fixture_tree(
     assert {"legacy/operator-hotfix", "legacy/job-legacy-1"} <= set(branches)
     worktree = host / "var/lib/cortex/worktree/job-legacy-1"
     assert (worktree / ".git").is_file()
+    # Stale special files are laid out without any listener or reader.
+    assert stat.S_ISSOCK((host / "var/lib/cortex/manager-control.sock").lstat().st_mode)
+    assert stat.S_ISSOCK(
+        (host / "var/lib/cortex/coordinator/handoff/manager.sock").lstat().st_mode
+    )
+    fifo = host / "var/lib/cortex/legacy-imported/notify.fifo"
+    assert stat.S_ISFIFO(fifo.lstat().st_mode)
+    assert stat.S_IMODE(fifo.lstat().st_mode) == 0o600
     assert (repository / "NOTES.local").is_file()
     # The egress home stays absent, as on the reference host.
     assert not (host / "srv/cortex-egress").exists()
@@ -520,6 +532,7 @@ def _adopt(fixture_module, manifest, tmp_path: Path, *, overlay_changes=None):
     base = install_cli._plan_document(config, bundle, overlay=overlay)
     fixture_module.seed(manifest, root=host, rootless=True)
     backend = FixtureHost(fixture_module, manifest, host, base)
+    backend.capture_inputs = (base, overlay)
     document = legacy.collect_legacy_inventory(
         plan=base, backend=backend, host_overlay=overlay
     )
@@ -572,6 +585,14 @@ def test_fixture_plans_without_failure_and_quarantines_exactly_the_expected_obje
     assert reasons["/etc/systemd/system/cortex-reviewer-job@.service.d"] == "authority"
     assert reasons["/opt/cortex/etc/agy-reviewer-settings.json"] == "superseded-by-launcher"
     assert reasons["/var/lib/cortex-builder/.bash_history"] == "operator"
+    assert reasons["/var/lib/cortex-manager/retry-718-legacy.json"] == "home-top"
+    assert reasons["/var/lib/cortex/manager-control.sock"] == "state-top"
+    steps = {
+        step["path"].removeprefix(str(host)): step
+        for step in plan["apply_order"]
+        if step["kind"] == "legacy-quarantine"
+    }
+    assert steps["/var/lib/cortex/manager-control.sock"]["expected"]["type"] == "socket"
     assert reasons["/var/lib/cortex/legacy-imported"] == "state-top"
     assert reasons["/var/lib/cortex/coordinator/tmpq1w2e3r4.tmp"] == "managed-residue"
     assert reasons["/var/lib/cortex/coordinator/review-sandboxes"] == "managed-subdir"
@@ -591,12 +612,7 @@ def test_fixture_plans_without_failure_and_quarantines_exactly_the_expected_obje
         "asset:repo-source-tree",
         "asset:runtime-run-tree",
     } <= adopted
-    assert block["census_exceptions"] == [
-        {
-            "path": str(host) + "/var/lib/cortex/coordinator/review-sandboxes",
-            "principal": "cortex-reviewer-planner",
-        }
-    ]
+    assert block["census_exceptions"] == []
     # The adopted samples stay inside adopted-in-place directories.
     for sample in manifest["expected"]["adopted_samples"]:
         assert not any(
@@ -605,32 +621,52 @@ def test_fixture_plans_without_failure_and_quarantines_exactly_the_expected_obje
         )
 
 
-def test_fixture_census_exception_is_load_bearing(
+def test_fixture_census_finding_lies_inside_a_quarantined_object(
     fixture_module, manifest, tmp_path: Path
 ) -> None:
-    def drop_exceptions(bound: dict) -> None:
+    # #1282: the reviewer can write review-sandboxes (the reference host's
+    # one census finding); it is quarantined, so no exception is needed.
+    sandboxes = "/var/lib/cortex/coordinator/review-sandboxes"
+    assert sandboxes in fixture_module.writable_paths(manifest)["cortex-reviewer-planner"]
+    assert manifest["legacy_adoption"]["census_exceptions"] == []
+
+    plan, host, _backend, document = _adopt(fixture_module, manifest, tmp_path)
+
+    census = document["census"]["cortex-reviewer-planner"]["writable_outside_declared"]
+    assert str(host) + sandboxes in {row["path"] for row in census}
+    quarantined = {row["path"] for row in plan["legacy_adoption"]["quarantine"]}
+    assert str(host) + sandboxes in quarantined
+
+
+def test_fixture_plans_without_any_operator_review_list(
+    fixture_module, manifest, tmp_path: Path
+) -> None:
+    # The operator list only changes the recorded reason of .bash_history.
+    def drop_review_lists(bound: dict) -> None:
+        bound["legacy_adoption"]["quarantine_paths"] = []
         bound["legacy_adoption"]["census_exceptions"] = []
 
-    with pytest.raises(legacy.LegacyAdoptionPlanError) as caught:
-        _adopt(fixture_module, manifest, tmp_path, overlay_changes=drop_exceptions)
-    assert any(
-        "cortex-reviewer-planner can write" in failure and "review-sandboxes" in failure
-        for failure in caught.value.failures
+    plan, host, _backend, _document = _adopt(
+        fixture_module, manifest, tmp_path, overlay_changes=drop_review_lists
     )
+    reasons = {
+        row["path"].removeprefix(str(host)): row["reason"]
+        for row in plan["legacy_adoption"]["quarantine"]
+    }
+    assert reasons["/var/lib/cortex-builder/.bash_history"] == "home-top"
+    assert sorted(reasons) == manifest["expected"]["quarantine"]
 
 
-def test_fixture_operator_quarantine_path_is_load_bearing(
+def test_fixture_capture_preview_is_ready_before_review(
     fixture_module, manifest, tmp_path: Path
 ) -> None:
-    def drop_operator_paths(bound: dict) -> None:
-        bound["legacy_adoption"]["quarantine_paths"] = []
+    plan, _host, backend, document = _adopt(fixture_module, manifest, tmp_path)
+    base, overlay = backend.capture_inputs
 
-    with pytest.raises(legacy.LegacyAdoptionPlanError) as caught:
-        _adopt(fixture_module, manifest, tmp_path, overlay_changes=drop_operator_paths)
-    assert any(
-        failure.startswith("unclassified:") and ".bash_history" in failure
-        for failure in caught.value.failures
-    )
+    preview = legacy.preview_legacy_adoption(base, overlay=overlay, document=document)
+
+    assert preview["ready"] is True, preview["failures"]
+    assert preview["quarantine"] == len(plan["legacy_adoption"]["quarantine"])
 
 
 def test_fixture_credentials_are_reimportable_from_quarantine(
