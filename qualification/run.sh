@@ -408,15 +408,28 @@ upgrade_status_report=/run/cortex-install/upgrade-status.json
 builder_codex_credential=/var/lib/cortex-builder/.codex/auth.json
 # `--json` 只把 report 寫進容器內的檔案，而 `trap cleanup EXIT` 會刪掉容器：每個失敗的
 # `cortex upgrade` 檢查在 die 之前，先把 `--json` 輸出、durable report 與它指向的 verify
-# evidence 印到 stderr，live RC 失敗時才留得下診斷。
+# evidence 印到 stderr，live RC 失敗時才留得下診斷。這次執行若在發布 report 之前就被拒
+# （例如 preflight），`--json` 沒有輸出，同版本的 durable report 仍是先前（activate 前失敗
+# 演練）留下的那一份：`started_at` 對不上時標示為可能過時，verify evidence 也只取這次的輸出。
 upgrade_diagnostics() {
-    local evidence
+    local evidence evidence_report run_started durable_started
     echo "qualification: cortex upgrade --json output ($1):" >&2
     docker exec "$container_name" cat "$1" >&2 || true
-    echo "qualification: durable upgrade report ($upgrade_durable_report):" >&2
+    run_started=$(docker exec "$container_name" jq -r '.started_at // empty' \
+        "$1" 2>/dev/null) || run_started=""
+    durable_started=$(docker exec "$container_name" jq -r '.started_at // empty' \
+        "$upgrade_durable_report" 2>/dev/null) || durable_started=""
+    if [[ -n "$run_started" && "$run_started" == "$durable_started" ]]; then
+        echo "qualification: durable upgrade report ($upgrade_durable_report):" >&2
+        evidence_report=$upgrade_durable_report
+    else
+        echo "qualification: durable upgrade report ($upgrade_durable_report)," \
+            "possibly stale: its started_at does not match this run's --json output" >&2
+        evidence_report=$1
+    fi
     docker exec "$container_name" cat "$upgrade_durable_report" >&2 || true
     evidence=$(docker exec "$container_name" jq -r '.verify_evidence // empty' \
-        "$upgrade_durable_report" 2>/dev/null) || evidence=""
+        "$evidence_report" 2>/dev/null) || evidence=""
     if [[ "$evidence" == /* ]]; then
         echo "qualification: verify evidence ($evidence):" >&2
         docker exec "$container_name" cat "$evidence" >&2 || true

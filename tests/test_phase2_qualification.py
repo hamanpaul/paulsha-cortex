@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -914,6 +915,62 @@ def test_release_harness_prints_upgrade_diagnostics_before_dying() -> None:
         "one-command upgrade did not complete",
         "$upgrade_report",
     )
+
+
+def _run_upgrade_diagnostics(tmp_path: Path, *, output: str, durable: dict) -> str:
+    """Run run.sh's `upgrade_diagnostics` with `docker exec <c>` mapped to the host."""
+
+    runner = _required_text(RUNNER)
+    start = runner.index("upgrade_diagnostics() {")
+    function = runner[start : runner.index("\n}\n", start) + 3]
+    run_output = tmp_path / "upgrade-report.json"
+    run_output.write_text(output, encoding="utf-8")
+    durable_report = tmp_path / "durable-upgrade-report.json"
+    durable_report.write_text(json.dumps(durable), encoding="utf-8")
+    script = (
+        "set -euo pipefail\n"
+        "container_name=qualification\n"
+        f"upgrade_durable_report={durable_report}\n"
+        'docker() { [[ "$1" == exec && "$2" == "$container_name" ]]; shift 2; "$@"; }\n'
+        + function
+        + f"upgrade_diagnostics {run_output}\n"
+    )
+    completed = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+    return completed.stderr
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
+def test_upgrade_diagnostics_flags_a_durable_report_left_by_an_earlier_run(
+    tmp_path: Path,
+) -> None:
+    # #1270: a full upgrade refused before it published a report (preflight)
+    # prints nothing on --json; the durable report of the same version is then
+    # the drill's, and must not read as this run's.
+    drill = {"result": "rolled-back", "started_at": "2026-10-06T01:00:00Z"}
+
+    stderr = _run_upgrade_diagnostics(tmp_path, output="", durable=drill)
+
+    assert "possibly stale" in stderr
+    assert '"rolled-back"' in stderr
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not installed")
+def test_upgrade_diagnostics_trusts_the_durable_report_of_this_run(tmp_path: Path) -> None:
+    evidence = tmp_path / "install-verification.json"
+    evidence.write_text('{"result": "fail"}\n', encoding="utf-8")
+    report = {
+        "result": "rolled-back",
+        "started_at": "2026-10-06T02:00:00Z",
+        "verify_evidence": str(evidence),
+    }
+
+    stderr = _run_upgrade_diagnostics(tmp_path, output=json.dumps(report), durable=report)
+
+    assert "possibly stale" not in stderr
+    assert f"verify evidence ({evidence})" in stderr
 
 
 def test_release_harness_checks_upgrade_status_after_the_full_upgrade() -> None:

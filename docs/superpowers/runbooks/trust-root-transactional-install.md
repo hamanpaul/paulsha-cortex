@@ -23,7 +23,9 @@ refs:
     sudo /opt/cortex/venv/bin/cortex upgrade <版本>
 
 經 SSH 升級時，一律在 `tmux` 或 `screen` 裡執行 `cortex upgrade`：斷線送出的 SIGHUP 雖會自動
-rollback，但升級本身就此中止，終端機上的摘要也會跟著消失。
+rollback，但升級本身就此中止，終端機上的摘要也會跟著消失。maintenance window 內的 INT／TERM／HUP
+不會殺掉正在執行的 installer 子程序：工具會等正在執行的那一步結束，再 rollback；同一步還在跑時
+再送一次訊號，才會立即中止該步（之後由 installer 的 journal crash recovery 收拾）。
 
 工具依序執行下列 §1–§5：以 GitHub Releases REST metadata 取得 annotated tag 的 commit target
 與三個 asset digest，驗過 qualification manifest、archive topology 與 bundle 每一個檔案後，
@@ -51,6 +53,13 @@ receipt 一致。生效中的 receipt 由 receipt chain 判定，不看檔名或
 - 升級中途 shell 或主機被 SIGKILL、OOM、斷電打斷時，執行
   `sudo /opt/cortex/venv/bin/cortex upgrade --recover`：它從 maintenance snapshot 取得 plan sha、
   核對 durable plan，再走 §6 的 recovery。
+- 每次執行都在 `/var/lib/cortex-installer/<版本>/attempt-*` 留下完整的 install input、toolchain
+  與封存 venv（數百 MB 到約 1 GB），工具不會自動清理：失敗重試會在同一版本目錄下累積。report 的
+  `candidate.attempt_dir` 指向該次使用的目錄，`--recover` 與 §6 的手動恢復都要用到它，durable plan
+  與 receipt 也記錄了其中的路徑。只在 `cortex upgrade --status` 顯示 `maintenance: idle`、loaded
+  runtime 為 `match`，而且生效中的 receipt 已是之後的版本時，才可以刪除舊版本的 attempt 目錄；
+  生效中版本的 attempt 目錄（含失敗的重試）保留到下一次升級成功之後。刪除前先確認沒有任何
+  `upgrade-report.json` 的 `result` 是 `halted`／`in-progress`。
 
 下列 §1–§6 是首次安裝與手動操作參考，也是 `cortex upgrade` 每一步的逐步說明；首次安裝與
 legacy adoption（`trust-root-legacy-adoption.md`）仍照這些步驟操作。
@@ -1049,7 +1058,7 @@ report（`/var/lib/cortex-installer/<版本>/upgrade-report.json`，與
 | `cortex_recovery_sealed_cli_tree_sha` | 照 snippet 算出後必須等於 report 的 `candidate.cli_tree_sha256`（同一套 tree digest）；不相等就停止，交給人工裁決 |
 | `cortex_confirmed_plan_sha`（`read -r -p` 輸入） | report 的 `plan.sha256`；必須等於 `/var/lib/cortex-installer/maintenance-snapshot.json` 的 `plan_sha256`，沒有 snapshot 時則等於 `/run/paulsha-cortex-trust-root/maintenance.lock` marker 的 `plan_sha256` |
 | `cortex_plan_path` | report 的 `plan.durable_path`，也就是 `/var/lib/cortex-installer/plans/<plan sha>.json` |
-| 要 rollback 的 receipt | report 的 `receipt.path`；必須等於 snapshot 的 `receipt_path`。`recover` 自己讀 snapshot，不需輸入 |
+| 要 rollback 的 receipt | report 的 `receipt.path`；必須等於 snapshot 的 `receipt_path`。被 SIGKILL、OOM 或斷電打斷時，durable report 停在 `in-progress`、`receipt` 為 null（apply 之前的狀態才會落盤），這時只依 snapshot 的 `receipt_path`，其餘變數照舊取自同一份 report。`recover` 自己讀 snapshot，不需輸入 |
 
 三者（report、snapshot 或 marker、durable plan）任何一處對不上，都不要硬湊變數執行，維持服務
 停止並人工裁決。

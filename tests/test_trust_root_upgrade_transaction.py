@@ -581,6 +581,122 @@ def test_a_hung_service_status_probe_times_out_as_unavailable(
     assert timeouts == [upgrade._STATUS_TIMEOUT_SECONDS]
 
 
+def test_a_silent_service_status_failure_names_its_exit_code_once(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1270: a child with no output used to read "exit 3: exit 3".
+    monkeypatch.setattr(
+        upgrade, "_run", lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 3, "", "")
+    )
+
+    mismatch, _payload = upgrade.await_loaded_runtime(
+        harness.prior.plan, harness.prior.path, {}, settle_seconds=0
+    )
+
+    assert mismatch == "service_status=unavailable (exit 3 with no output)"
+
+
+def test_a_silent_verify_failure_names_its_exit_code_once(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def run(argv, **kwargs):
+        if tuple(argv)[3:4] == ("verify",):
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return harness.cli(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+    _code, report = _run_transaction(harness)
+
+    assert report["failed_step"] == "verify"
+    assert report["error"] == "verify did not PASS (exit 1) with no output"
+
+
+def test_a_silent_rollback_child_names_its_exit_code_once(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.cli.fail["verify"] = "verify FAIL"
+
+    def run(argv, **kwargs):
+        if tuple(argv)[3:4] == ("rollback",):
+            harness.cli.calls.append(("rollback",))
+            return subprocess.CompletedProcess(argv, 1, "", "")
+        return harness.cli(argv, **kwargs)
+
+    monkeypatch.setattr(upgrade, "_run", run)
+
+    code, report = _run_transaction(harness)
+
+    assert code == 1
+    assert report["result"] == "halted"
+    assert report["rollback"]["error"] == "rollback exited 1 with no output"
+    assert report["rollback"]["restore_safe"] is False
+    assert install_cli._read_maintenance_snapshot() is not None
+
+
+def test_a_sigint_right_after_the_window_closes_keeps_the_upgrade_recorded(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1270: the result used to be written after `_signals_raise` restored the
+    # default handlers, so a SIGINT landing in between left `result` unset and
+    # perform_upgrade reported a finished upgrade as "halted".
+    real_signal = signal.signal
+    saved = {sig: signal.getsignal(sig) for sig in upgrade._INTERRUPT_SIGNALS}
+    last = upgrade._INTERRUPT_SIGNALS[-1]
+    armed: list[bool] = []
+    clear = install_cli._clear_maintenance_snapshot
+
+    def clear_then_arm(plan, *, receipt_path):
+        cleared = clear(plan, receipt_path=receipt_path)
+        armed.append(True)
+        return cleared
+
+    def restore_then_interrupt(signum, handler):
+        previous = real_signal(signum, handler)
+        if armed and signum == last and handler is saved[last]:
+            armed.clear()
+            raise KeyboardInterrupt
+        return previous
+
+    monkeypatch.setattr(install_cli, "_clear_maintenance_snapshot", clear_then_arm)
+    monkeypatch.setattr(signal, "signal", restore_then_interrupt)
+    report: dict[str, object] = {"version": "0.1.13", "services_stopped": False}
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            upgrade.run_transaction(
+                harness.sealed,
+                harness.bound,
+                harness.prior,
+                report,
+                upgrade.StepLog(),
+                wait_idle=0,
+            )
+    finally:
+        for sig, handler in saved.items():
+            real_signal(sig, handler)
+
+    assert report["result"] == "upgraded"
+    assert "rollback" not in harness.cli.commands()
+
+
+def test_perform_upgrade_keeps_an_upgrade_finished_before_a_late_interrupt(
+    composed, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def transaction(_sealed, _bound, _prior, report, _steps, *, wait_idle):
+        report["result"] = "upgraded"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(upgrade, "run_transaction", transaction)
+
+    assert upgrade.perform_upgrade(
+        upgrade.UpgradeOptions(version="0.1.13", json_output=True)
+    ) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["result"] == "upgraded"
+    assert report["error"] is None
+
+
 def test_failure_before_apply_restores_services_without_a_rollback(harness) -> None:
     harness.systemd.fail_stop.add("cortex-monitor.service")
 

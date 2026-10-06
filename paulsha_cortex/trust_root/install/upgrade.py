@@ -217,6 +217,10 @@ def check_target_version(
 _CHILD_OUTPUT_LIMIT = 4000
 
 
+def _has_output(result: CompletedProcess[str]) -> bool:
+    return bool((result.stderr or "").strip() or (result.stdout or "").strip())
+
+
 def _output_tail(result: CompletedProcess[str]) -> str:
     """A failed child's stderr and stdout, each cut to its last characters.
 
@@ -230,9 +234,17 @@ def _output_tail(result: CompletedProcess[str]) -> str:
         if text
     ]
     if not parts:
-        return f"exit {result.returncode}"
+        return f"exit {result.returncode} with no output"
     limit = _CHILD_OUTPUT_LIMIT // len(parts)
     return " | ".join(text if len(text) <= limit else "…" + text[-limit:] for text in parts)
+
+
+def _exit_detail(result: CompletedProcess[str]) -> str:
+    """``exit N: <output tail>``; a silent child names its exit code once (#1270)."""
+
+    if not _has_output(result):
+        return _output_tail(result)
+    return f"exit {result.returncode}: {_output_tail(result)}"
 
 
 @dataclass(frozen=True)
@@ -269,7 +281,7 @@ def _service_status(plan: Mapping[str, object], receipt_path: Path) -> object:
     except (InstallError, OSError, TimeoutExpired) as exc:
         return _StatusUnavailable(f"{type(exc).__name__}: {exc}")
     if result.returncode != 0:
-        return _StatusUnavailable(f"exit {result.returncode}: {_output_tail(result)}")
+        return _StatusUnavailable(_exit_detail(result))
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -939,9 +951,8 @@ def _advance(
         if verified.returncode != 0:
             # Refusals reach only stderr and a FAIL result is the JSON on stdout;
             # without them the report could not say why verify failed.
-            raise UpgradeError(
-                f"verify did not PASS (exit {verified.returncode}): {_output_tail(verified)}"
-            )
+            detail = f": {_output_tail(verified)}" if _has_output(verified) else " with no output"
+            raise UpgradeError(f"verify did not PASS (exit {verified.returncode}){detail}")
         inactive = [
             service
             for service in install_cli._MAINTENANCE_SERVICES
@@ -1010,9 +1021,11 @@ def _abort(
             # means the child raised before that happened, and only its stderr
             # says why -- without this, that cause is silently discarded and
             # the operator is left with an unexplained "restore_safe: false".
-            detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+            detail = (result.stderr or result.stdout).strip()
             rollback["error"] = (
                 f"rollback exited {result.returncode}: {detail[:_ROLLBACK_ERROR_LIMIT]}"
+                if detail
+                else f"rollback exited {result.returncode} with no output"
             )
         if not isinstance(payload, dict):
             payload = {}
@@ -1113,7 +1126,10 @@ def run_transaction(
             _ignore_interrupts()
             install_cli._clear_maintenance_snapshot(bound.plan, receipt_path=bound.receipt_path)
             lifecycle["complete"] = True
-    report["result"] = "upgraded"
+        # The lease is released and interrupts are still ignored: record the
+        # outcome before `_signals_raise` restores the previous handlers, so a
+        # signal right after cannot leave a finished upgrade unrecorded (#1270).
+        report["result"] = "upgraded"
     return 0
 
 
@@ -1265,7 +1281,9 @@ def perform_upgrade(options: UpgradeOptions) -> int:
                             "the upgrade stopped inside the maintenance window; "
                             "run `cortex upgrade --recover`"
                         )
-                code = 1
+                # Only a signal after the window closed can land here with the
+                # upgrade already recorded as finished; it does not undo it.
+                code = 0 if report["result"] == "upgraded" else 1
             finally:
                 report["finished_at"] = _now()
                 _publish_report(report)

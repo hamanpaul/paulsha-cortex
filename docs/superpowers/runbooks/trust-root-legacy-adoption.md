@@ -145,7 +145,7 @@ legacy 的 credential 已在 quarantine 內，可直接以 quarantine 內的檔�
 
 ## 8. 之後的升級
 
-以本次的 adoption receipt 作為 `--prior-receipt`，並用**同一份** host overlay 產生新 plan；新 plan 不會再有 `legacy_adoption` 區塊，新 receipt 為一般的 v2。
+adoption receipt 成為 applied＋qualified 之後，升級一律執行 `sudo /opt/cortex/venv/bin/cortex upgrade <版本>`（見 `trust-root-transactional-install.md` 開頭的「一般升級」）。它以 receipt chain 找到這份 adoption receipt 作為 prior，讀**同一份** host overlay 時略過 `legacy_adoption` 區塊（overlay digest 不變），產生的新 plan 不會再有 `legacy_adoption` 區塊，新 receipt 為一般的 v2。只有 `cortex upgrade` 拒絕、需要人工裁決時，才改照該 runbook 的手動流程。
 
 ## 9. quarantine 的保留
 
