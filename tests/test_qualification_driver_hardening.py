@@ -4939,6 +4939,335 @@ def test_codex_agent_loop_rejects_head_queries_that_reshape_or_replace_the_hash(
         )
 
 
+def _assert_head_probe_chain_refused(driver, command: str, output: str) -> None:
+    assert not driver._is_expected_head_probe(command, expected_worktree=_HEAD_PROBE_WORKTREE)
+    with pytest.raises(driver.QualificationFailure, match="no completed git HEAD proof"):
+        driver._codex_agent_loop_observation(
+            (("build-job", _head_probe_log(command, output)),),
+            expected_head="a" * 40,
+            expected_worktree=_HEAD_PROBE_WORKTREE,
+        )
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        # branch：刪除、建立（含 `-v <name>`，git 照樣建立）、改名、複製、強制、上游設定、描述。
+        "git branch -D probe",
+        "git branch -d probe",
+        "git branch --delete probe",
+        "git branch probe",
+        "git branch -v probe",
+        "git branch --track probe origin/main",
+        "git branch -m old new",
+        "git branch -M probe",
+        "git branch --move old new",
+        "git branch -c old new",
+        "git branch -C old new",
+        "git branch --copy old new",
+        "git branch -f probe HEAD",
+        "git branch -u origin/main",
+        "git branch --set-upstream-to=origin/main",
+        "git branch --unset-upstream",
+        "git branch --edit-description",
+        # worktree：只有 `list` 是讀。
+        "git worktree add ../probe",
+        "git worktree add probe HEAD",
+        "git worktree add -b probe probe",
+        "git worktree remove probe",
+        "git worktree remove --force probe",
+        "git worktree prune",
+        "git worktree move probe moved",
+        "git worktree lock probe",
+        "git worktree unlock probe",
+        "git worktree repair",
+        # symbolic-ref：兩個位置參數就是改寫，`-d` 會刪掉 HEAD。
+        "git symbolic-ref HEAD refs/heads/probe",
+        "git symbolic-ref -m probe HEAD refs/heads/probe",
+        "git symbolic-ref -d HEAD",
+        "git symbolic-ref --delete HEAD",
+        # log／show：`--output` 會寫檔，`--ext-diff` 會執行外部 diff 程式。
+        "git log --output=notes.txt",
+        "git log --output notes.txt",
+        "git log -1 --format=%H --output=README.md",
+        "git show --output=notes.txt HEAD",
+        "git log -p --ext-diff",
+        "git show --ext-diff HEAD",
+    ],
+)
+def test_codex_agent_loop_rejects_write_forms_of_read_only_git_subcommands(segment: str) -> None:
+    """#1278：唯讀鏈段原本只看子命令名稱，`branch -D`、`worktree add|remove`、
+    `symbolic-ref HEAD <ref>`、`log --output` 這類寫入形態都被當成唯讀段收下；
+    改為逐子命令的選項允許清單後，鏈中任何一段是寫入形態，整條就不算 proof。"""
+    driver = _load_driver()
+
+    for command in (
+        f"/bin/bash -lc 'git rev-parse HEAD && {segment}'",
+        f"/bin/bash -lc '{segment} && git rev-parse HEAD'",
+    ):
+        _assert_head_probe_chain_refused(driver, command, "a" * 40 + "\n")
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        # 位置參數不是 HEAD 本身的 rev-parse：印出的是別的 commit。
+        "git rev-parse main",
+        "git rev-parse HEAD~1",
+        "git rev-parse --verify origin/main",
+        "git rev-parse --short=40 main",
+        "git rev-parse --all",
+        "git rev-parse --branches",
+        "git rev-parse --default main",
+        # log／show 的 `%H`／`%P` 只在 proof 形狀（限 HEAD 一筆）才收。
+        "git log --format=%H",
+        "git log -1 --format=%H main",
+        "git log -1 --format=%P",
+        "git show -s --format=%H main",
+        "git show -s --format=%H HEAD~1",
+        # `--pretty=oneline`／`--no-abbrev-commit` 印完整 hash，subject 空白時整行就是 hash。
+        "git log -1 --pretty=oneline main",
+        "git log -1 --oneline --no-abbrev-commit main",
+        # 自訂格式能把字面值拼成任意 40 位 hex：`%x61` 跳脫、可能展開成空字串的 `%d`／`%b`，
+        # 以及 `--date=format:` 的 strftime 字面值。字面 SHA 檢查只看得到 7 位以上連續 hex。
+        "git log -1 --format=" + "%x61" * 40,
+        "git log -1 --format=" + "aaaaa%d" * 8,
+        "git log -1 --format=" + "abcde%b" * 8,
+        'git log -1 --format="%h %s"',
+        "git log -1 --date=format:aaaaaa%naaaaa",
+        # branch 的 `--format` 能印出任一分支的完整 hash。
+        'git branch --format="%(objectname)"',
+    ],
+)
+def test_codex_agent_loop_rejects_segments_that_can_print_another_commit_hash(
+    segment: str,
+) -> None:
+    """#1278：`aggregated_output` 是整條鏈合併的輸出，分不出 HEAD 那一行出自哪一段；
+    只要鏈中另有一段能印出別的 commit 的完整 hash（`rev-parse main`、`log --format=%H` 等），
+    worktree HEAD 與 bound HEAD 不同時那一段也能補上 bound HEAD 那一行。"""
+    driver = _load_driver()
+    # 真正的 HEAD 是 `b…`，另一段印出 bound HEAD `a…`。
+    output = "b" * 40 + "\n" + "a" * 40 + "\n"
+
+    _assert_head_probe_chain_refused(
+        driver, f"/bin/bash -lc 'git rev-parse HEAD && {segment}'", output
+    )
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        "git tag probe",
+        "git config user.name probe",
+        "git config --get user.name",
+        "git stash",
+        "git stash list",
+        "git update-ref refs/heads/probe HEAD",
+        "git reflog expire --expire=now --all",
+        "git notes add -m probe",
+        "git remote add probe ../probe",
+        "git remote -v",
+        "git checkout -b probe",
+        "git reset --hard",
+        "git gc",
+        "git fetch",
+        "git diff",
+        "git rev-list HEAD",
+        "git ls-files",
+        "git cat-file -p HEAD",
+        "git for-each-ref",
+        "git show-ref",
+        "git merge-base HEAD main",
+    ],
+)
+def test_codex_agent_loop_keeps_refusing_git_subcommands_outside_the_allowlist(
+    segment: str,
+) -> None:
+    """#1278：允許的 git 子命令仍只有 `rev-parse`／`status`／`branch`／`worktree`／`log`／
+    `show`／`symbolic-ref`；其他子命令（含 `config --get`、`diff` 等唯讀形態）一律不收。"""
+    driver = _load_driver()
+
+    _assert_head_probe_chain_refused(
+        driver, f"/bin/bash -lc 'git rev-parse HEAD && {segment}'", "a" * 40 + "\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        # status：短格式、porcelain、branch、untracked 與 pathspec。
+        "git status",
+        "git status --short",
+        "git status -s",
+        "git status -sb",
+        "git status --short --branch",
+        "git status --porcelain",
+        "git status --porcelain=v1",
+        "git status --porcelain=v2 --branch",
+        "git status -uno",
+        "git status -sbuno",
+        "git status --untracked-files=no",
+        "git status --short -- docs",
+        # branch：目前分支與列表（`--list` 才收樣式）。
+        "git branch",
+        "git branch --show-current",
+        "git branch -a",
+        "git branch -vv",
+        "git branch -avv",
+        "git branch --list 'feature/*'",
+        "git branch -r --list 'origin/*'",
+        "git branch --no-color",
+        # worktree list。
+        "git worktree list",
+        "git worktree list --porcelain",
+        "git worktree list -v",
+        # symbolic-ref 只讀一個 ref。
+        "git symbolic-ref HEAD",
+        "git symbolic-ref --short HEAD",
+        "git symbolic-ref -q HEAD",
+        "git symbolic-ref --short -q HEAD",
+        # rev-parse 非 proof 段：唯讀查詢、HEAD 的 ref 名稱或縮寫。
+        "git rev-parse --show-toplevel",
+        "git rev-parse --git-dir --git-common-dir",
+        "git rev-parse --is-inside-work-tree",
+        "git rev-parse --abbrev-ref HEAD",
+        "git rev-parse --symbolic-full-name HEAD",
+        "git rev-parse --short HEAD",
+        # log／show：縮寫 hash、統計、帶前綴的固定格式、pathspec 與 HEAD 的檔案。
+        "git log --oneline -- docs/superpowers/workstreams/probe/todo.md"
+        " openspec/changes/probe/tasks.md",
+        "git log --oneline -5",
+        "git log --oneline -n 5",
+        "git log --oneline --max-count=5 --decorate",
+        "git log --stat -1",
+        "git log -3 --name-only",
+        "git log --graph --oneline",
+        "git log -1",
+        "git log -1 --pretty=fuller --date=iso",
+        "git log --oneline main..HEAD",
+        "git --no-pager log --oneline -3",
+        "git show --stat HEAD",
+        "git show --name-only HEAD",
+        "git show HEAD",
+        "git show -s HEAD",
+        "git show --no-patch --oneline",
+        "git show HEAD:README.md",
+    ],
+)
+def test_codex_agent_loop_accepts_read_only_forms_of_each_git_chain_segment(
+    segment: str,
+) -> None:
+    """#1278：逐子命令收緊後，各子命令的唯讀寫法仍可出現在 HEAD 探針鏈中。"""
+    driver = _load_driver()
+    command = f"/bin/bash -lc \"git rev-parse HEAD && {segment}\""
+
+    assert driver._is_expected_head_probe(command, expected_worktree=_HEAD_PROBE_WORKTREE)
+    observation = driver._codex_agent_loop_observation(
+        (("build-job", _head_probe_log(command, "a" * 40 + "\n")),),
+        expected_head="a" * 40,
+        expected_worktree=_HEAD_PROBE_WORKTREE,
+    )
+    assert observation["successful_command_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        "git status -v",
+        "git status --short ../outside",
+        "git status /etc",
+        "git log --oneline -- ../outside",
+        "git log --oneline -- ~/notes",
+        "git show HEAD:../outside",
+        "git branch --list -- -D",
+        "git worktree",
+        "git worktree list extra",
+        "git symbolic-ref",
+        "git symbolic-ref --short",
+        "git rev-parse --git-path HEAD",
+        "git log -n",
+        "git log -n five",
+        "git log --all --oneline",
+    ],
+)
+def test_codex_agent_loop_rejects_unlisted_options_and_operands_of_git_chain_segments(
+    segment: str,
+) -> None:
+    """#1278：允許清單以外的選項、跑出 bound worktree 的路徑、缺值的選項一律不收。"""
+    driver = _load_driver()
+
+    _assert_head_probe_chain_refused(
+        driver, f"/bin/bash -lc 'git rev-parse HEAD && {segment}'", "a" * 40 + "\n"
+    )
+
+
+#: canary 歷史形狀（#1278 回歸，見 #1279 報告的表）：S1–S3、S7 是合法 proof，S9／S11 是
+#: 合法的唯讀鏈段；S4、S5、S8、S10 本來就不收。
+_HISTORICAL_HEAD_PROBE_SHAPES = [
+    ("S1 37375402971", _CANARY_37375402971_REV_PARSE_PROBE, True),
+    (
+        "S2 37247943097",
+        '/usr/bin/bash -lc "pwd && git rev-parse --show-toplevel && git rev-parse HEAD'
+        " && git status --short --branch && git worktree list --porcelain && sed -n "
+        "'1,220p' docs/superpowers/plans/2026-10-05-deployment-canary-probe.md\"",
+        True,
+    ),
+    ("S3 37343291869#1", _CANARY_37343291869_RG_PROBE, True),
+    (
+        "S4 37343291869#2",
+        "/usr/bin/bash -lc \"git rev-parse --git-dir --git-common-dir --show-toplevel"
+        " && git worktree list --porcelain && git status --porcelain=v1"
+        " && find docs/superpowers/plans -maxdepth 2 -type f -name '*dep*'\"",
+        False,
+    ),
+    (
+        "S5 37343291869#3",
+        "/usr/bin/bash -lc \"find /var/lib/cortex /usr/local/share /opt -type f -name SKILL.md"
+        " -path '*worktrees*' -print 2>/dev/null\"",
+        False,
+    ),
+    ("S7 37256414890", "/usr/bin/bash -lc '/usr/bin/git rev-parse HEAD'", True),
+    (
+        "S8 37297832560",
+        "/usr/bin/bash -lc '/usr/bin/git show d0ddda2''^:openspec/changes/"
+        "deployment-canary-probe/tasks.md'",
+        False,
+    ),
+    (
+        "S9 37297832560",
+        "/usr/bin/bash -lc '/usr/bin/git log --oneline -- docs/superpowers/workstreams/"
+        "deployment-canary-probe/todo.md openspec/changes/deployment-canary-probe/tasks.md'",
+        False,
+    ),
+    ("S10 37297832560", "/usr/bin/bash -lc 'python3 -m pytest -q'", False),
+    ("S11 37297832560", "/usr/bin/bash -lc '/usr/bin/git status --short'", False),
+    (
+        "S7+S11+S9 chain",
+        "/usr/bin/bash -lc '/usr/bin/git rev-parse HEAD && /usr/bin/git status --short"
+        " && /usr/bin/git log --oneline -- docs/superpowers/workstreams/"
+        "deployment-canary-probe/todo.md openspec/changes/deployment-canary-probe/tasks.md'",
+        True,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "command", "accepted"),
+    _HISTORICAL_HEAD_PROBE_SHAPES,
+    ids=[row[0] for row in _HISTORICAL_HEAD_PROBE_SHAPES],
+)
+def test_head_probe_keeps_the_historical_canary_shape_verdicts(
+    label: str, command: str, accepted: bool
+) -> None:
+    """#1278：逐子命令收緊不得把歷史 canary 的合法形狀改成拒絕，也不得放行原本拒絕的形狀。"""
+    driver = _load_driver()
+
+    assert (
+        driver._is_expected_head_probe(command, expected_worktree=_HEAD_PROBE_WORKTREE)
+        is accepted
+    ), label
+
+
 def test_dispatch_closeout_runs_source_repo_git_as_the_manager(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
