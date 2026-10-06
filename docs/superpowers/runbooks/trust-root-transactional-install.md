@@ -58,7 +58,8 @@ receipt 一致。生效中的 receipt 由 receipt chain 判定，不看檔名或
 - `cortex upgrade --status` 唯讀顯示生效中的 receipt、上一次升級結果與 loaded runtime 是否一致。
 - 升級中途 shell 或主機被 SIGKILL、OOM、斷電打斷時，執行
   `sudo /opt/cortex/venv/bin/cortex upgrade --recover`：它從 maintenance snapshot 取得 plan sha、
-  核對 durable plan，再走 §6 的 recovery。
+  核對 durable plan；該次升級的 receipt 已 verify PASS 且正在服務時直接收尾（`finalized`），
+  否則走 §6 的 rollback recovery（判斷條件見 §6「手動恢復 `cortex upgrade` 中斷的升級」）。
 - 每次執行都在 `/var/lib/cortex-installer/<版本>/attempt-*` 留下完整的 install input、toolchain
   與封存 venv（數百 MB 到約 1 GB），工具不會自動清理：失敗重試會在同一版本目錄下累積。report 的
   `candidate.attempt_dir` 指向該次使用的目錄，`--recover` 與 §6 的手動恢復都要用到它，durable plan
@@ -91,8 +92,8 @@ legacy adoption（`trust-root-legacy-adoption.md`）仍照這些步驟操作。
 
 ## 1. 封存唯一 candidate CLI
 
-先由 release artifact ingress 將 `v0.1.13` 的 install-input archive 與 qualification
-manifest 放到 `/var/lib/cortex-installer/0.1.13/release`。這個 ingress 是前置 authority：
+先由 release artifact ingress 將 `v0.1.14` 的 install-input archive 與 qualification
+manifest 放到 `/var/lib/cortex-installer/0.1.14/release`。這個 ingress 是前置 authority：
 目錄及每一層 ancestor 必須是 root-owned、不可由 group/other 寫入、不可有 symlink。
 不要直接從使用者 checkout、`$HOME` 或 `/tmp` 以 root 執行 candidate code。
 
@@ -112,15 +113,15 @@ PATH=/usr/bin:/bin
 export PATH
 
 cortex_installer_root=/var/lib/cortex-installer
-cortex_bootstrap_root="$cortex_installer_root/0.1.13"
+cortex_bootstrap_root="$cortex_installer_root/0.1.14"
 cortex_release_root="$cortex_bootstrap_root/release"
 cortex_input_root="$cortex_bootstrap_root/input"
-cortex_install_input_archive="$cortex_release_root/paulsha-cortex-0.1.13-install-input.tar.gz"
-cortex_qualification_manifest="$cortex_release_root/paulsha-cortex-0.1.13-qualification.json"
+cortex_install_input_archive="$cortex_release_root/paulsha-cortex-0.1.14-install-input.tar.gz"
+cortex_qualification_manifest="$cortex_release_root/paulsha-cortex-0.1.14-qualification.json"
 cortex_bundle="$cortex_input_root/bundle.json"
 cortex_install_config="$cortex_input_root/install-config.yaml"
 cortex_release_candidate_sha=<40-hex-annotated-tag-target>
-cortex_release_wheel_asset_name=paulsha_cortex-0.1.13-py3-none-any.whl
+cortex_release_wheel_asset_name=paulsha_cortex-0.1.14-py3-none-any.whl
 cortex_release_wheel_asset_sha256=<64-hex-release-wheel-asset-digest>
 cortex_install_input_asset_sha256=<64-hex-release-install-input-asset-digest>
 cortex_qualification_asset_sha256=<64-hex-release-qualification-asset-digest>
@@ -573,10 +574,51 @@ PY
 cortex_plan_path=$cortex_durable_plan_path
 ```
 
-人工 review 至少確認 candidate SHA／wheel hash、四個 service accounts、所有目標路徑、
+人工 review 至少確認 candidate SHA／wheel hash、四個 service accounts 與
+`plan-result.json` 的 `account_ids`（每個帳號的 uid／gid 與來源，見下方）、所有目標路徑、
 systemd units、polkit 規則、toolchain artifacts、required credentials、canonical receipt
 parent 與本次隨機且不存在的 effective receipt path 都符合本次變更。不要只把畫面上的 SHA
 複製回 prompt；確認值代表 operator 已閱讀 plan 並接受其完整 mutation set。
+
+### 帳號 uid／gid 的來源（#1286）
+
+release 的 install config 不寫死帳號號碼。plan 對五個帳號（`cortex-manager`、
+`cortex-reviewer-planner`、`cortex-builder`、`cortex-gate`、`cortex-egress`）的 uid 與 gid
+逐一決定，優先順序：
+
+1. host overlay（`--host-overlay`）宣告的號碼，來源記為 `overlay`；手寫的 install config
+   自己宣告的號碼記為 `config`。
+2. 主機已有同名帳號／群組：沿用現有號碼，來源 `existing`。升級與重跑 plan 都走這條，
+   帳號 step 不需要 overlay；從未用過 overlay 的主機升級時也不需要（曾用過的見下方）。
+3. 都沒有：自動配號，來源 `allocated`。從 989 往下找第一個 uid 與 gid 都空著的號碼，
+   uid＝gid；沒有同號可用時 uid、gid 分開配。範圍限 system 範圍 100–989，避開發行版
+   慣用的 990–999（Ubuntu 的 `systemd-resolve` 與 udev 的 `render`／`kvm`／`sgx`／`input`
+   等都在這段）。同一份 passwd／group，plan 兩次得到同一組號碼，plan sha 不變。
+
+plan 經 NSS 讀 passwd／group（非 root 也讀得到），與 apply preflight 看到的是同一份；自動配號
+另對每個候選號碼做 `getpwuid`／`getgrgid` 單點查詢。passwd／group 有 `files`／`systemd` 以外
+來源（sssd、LDAP）的主機，目錄服務的使用者若以某號碼當 primary gid、卻沒有同號的 group，
+這兩種查詢都看不到，這類主機請用 overlay 指定號碼。
+host overlay 只在要**指定**號碼時才需要，例如多台主機要統一號碼：
+
+```yaml
+accounts:
+  cortex-builder: {uid: 1500, gid: 1500}
+```
+
+要用 overlay 時，先以 `/usr/bin/sudo /usr/bin/install -o root -g root -m 0644` 存成
+`/var/lib/cortex-installer/host-overlay.yaml`，上面的 plan 指令再加
+`--host-overlay /var/lib/cortex-installer/host-overlay.yaml`。之後 `cortex upgrade` 會讀同一份
+檔案，並要求它的 digest 與上一次 plan 相同，所以 overlay 一旦用了就保留原檔。以前從暫存路徑
+或家目錄傳 `--host-overlay` 安裝的主機，`cortex upgrade` 之前要先把**同一份**檔案（內容不變）
+以上述方式放到 `/var/lib/cortex-installer/host-overlay.yaml`，否則升級會以 overlay 不同拒絕。
+
+`account_ids` 以帳號名為 key，列出 `uid`、`gid`、`uid_source`、`gid_source`；審核時用
+`/usr/bin/python3 -I -S -m json.tool "$cortex_plan_result"` 檢視。apply preflight 在任何變更
+之前重新確認：`allocated` 的號碼仍沒有被其他帳號或群組占用，`existing` 的號碼仍屬同名
+帳號。plan 之後主機帳號有變動（例如期間裝了會建 system 帳號的套件）時，apply 在任何變更
+前 fail closed 並要求重新產生 plan，回到本節重跑 plan 與三方確認即可。overlay 指定的號碼
+被占用時照舊報錯，要改 overlay。
 
 ## 3. Stop services and apply exact plan
 
@@ -983,7 +1025,7 @@ PATH=/usr/bin:/bin
 export PATH
 
 cortex_installer_root=/var/lib/cortex-installer
-cortex_bootstrap_root="$cortex_installer_root/0.1.13"
+cortex_bootstrap_root="$cortex_installer_root/0.1.14"
 cortex_cli="$cortex_bootstrap_root/venv/bin/cortex"
 read -r -p "Re-enter the previously reviewed plan SHA-256: " cortex_confirmed_plan_sha
 test "${#cortex_confirmed_plan_sha}" -eq 64
@@ -1076,9 +1118,37 @@ state，必須先人工裁決。不得改用 tokenless rollback 或手動刪 rec
 
 `cortex upgrade` 中斷或停在原地（`halted`）時，第一步一律先執行
 `sudo /opt/cortex/venv/bin/cortex upgrade --recover`：它從 maintenance snapshot（只剩 stale
-lease marker 時改用 marker）取得 plan sha、核對 durable plan，再走上面同一個 `recover`。只有
-它拒絕執行或回報要人工裁決時，才照上面的 snippet 手動恢復。這時 snippet 裡寫死的
-`0.1.13/venv` 不適用：該次升級的 sealed CLI 在它自己的 attempt 目錄。每個變數改由該次升級的
+lease marker 時改用 marker）取得 plan sha、核對 durable plan，先判斷能不能直接收尾，不能才走
+上面同一個 `recover`（rollback）。
+
+收尾（輸出 `"action": "finalized"`）只在下列三點都在 maintenance lease 與該 receipt 的
+transaction lock 下得到證明時才發生：
+
+1. 該次升級綁定的 receipt（snapshot 的 `receipt_path`；只剩 marker 時是 receipt chain 判定的
+   effective receipt）由同一份 plan 產生（`plan_sha256` 相同），且為 applied＋qualified（verify
+   PASS 已記錄）；
+2. `cortex-egress-proxy`、`cortex-manager`、`cortex-monitor` 三個 service 都 active；
+3. Manager／Monitor 的 loaded runtime 與該 receipt 一致（與升級 verify 後同一個比對，最多等
+   60 秒穩定）。
+
+收尾只清 snapshot 與 lease marker，不 stop／start 任何 service、不 rollback；report 的 `result`
+改為 `finalized`，`recovery.receipt` 記下收尾的 receipt。這涵蓋升級在 verify PASS 之後、清
+snapshot／marker 之前被 SIGKILL 或斷電打斷（重開機後 `/run` 的 marker 會消失，只剩 snapshot），
+以及清 snapshot 本身失敗的情況：已驗證、正在服務的 receipt 不會被 rollback 成服務停止、等人工。
+三點證明成立之後，`--recover` 自己清 snapshot 或 marker 失敗也不會改走 rollback：receipt 與服務
+都不動、剩下的 snapshot／marker 保留，report 記 `halted` 與 `recovery.action=finalize-failed`，
+指令以非 0 結束；排除原因後重跑 `--recover` 會重新證明並收尾。有 snapshot 時不要求該 receipt
+是 receipt chain 的 head；chain 若判不出，下一次升級的 preflight 仍會照舊擋下。
+
+證明完成前任何一點不成立或無法證明（receipt 不存在或讀不到、不是該 plan 的、未 qualified、service 不
+active、loaded runtime 不一致或 status 探測失敗），就照舊執行上面的 `recover`，輸出多帶
+`"action": "rolled-back"` 與 `reason`（例如 `receipt-not-qualified: …`、`services-inactive: …`、
+`loaded-runtime-mismatch: …`）；report 的 `result` 為 `recovered`（失敗則 `halted`），
+`recovery.reason` 記下原因。只剩 marker、而生效中的不是該 plan 的 receipt 時（例如寫 snapshot
+前就被打斷），`recover` 本來就只清 marker、不動 service，輸出標為 `"action": "marker-cleared"`。
+
+只有 `--recover` 拒絕執行或回報要人工裁決時，才照上面的 snippet 手動恢復。這時 snippet 裡寫死的
+`0.1.14/venv` 不適用：該次升級的 sealed CLI 在它自己的 attempt 目錄。每個變數改由該次升級的
 report（`/var/lib/cortex-installer/<版本>/upgrade-report.json`，與
 `/var/lib/cortex-installer/last-upgrade-report.json` 內容相同）對應：
 

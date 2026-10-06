@@ -2985,6 +2985,18 @@ def bind_host_overlay(
         return plan  # type: ignore[return-value]
     bound = deepcopy(dict(plan))
     bound["host_overlay_sha256"] = record["sha256"]
+    # #1286：overlay 宣告的 uid／gid 已併進有效 config，plan 先記成 config；在這裡改記
+    # 為 overlay，審核摘要才看得出號碼是這台主機指定的。
+    sources = bound.get("account_id_sources")
+    validated = validate_host_overlay(overlay)
+    for section in ("accounts", "service_accounts"):
+        for name, row in (validated.get(section) or {}).items():
+            source = sources.get(name) if isinstance(sources, dict) else None
+            if not isinstance(source, dict):
+                continue
+            for field in ("uid", "gid"):
+                if field in row:
+                    source[field] = "overlay"
     bound["receipt_path"] = str(canonical_receipt_path(bound))
     return bound
 

@@ -22,6 +22,8 @@ def recovering(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[object]:
     monkeypatch.setattr(install_core, "_validate_receipt_parent", lambda _o, _p: None)
     monkeypatch.setattr(upgrade, "_OWNER_UID", os.getuid())
     monkeypatch.setattr(upgrade, "_pin_import_paths", lambda: None)
+    # #1270: a marker-only recovery consults the receipt chain; never the host's.
+    monkeypatch.setattr(upgrade, "_STATE_ROOT", tmp_path / "var/lib/cortex")
     monkeypatch.setattr(
         upgrade,
         "ingest_release",
@@ -30,7 +32,7 @@ def recovering(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[object]:
     (tmp_path / "installer").mkdir()
     captured: list[object] = []
 
-    def recover_command(args) -> int:
+    def recover_command(args, *, emit=None) -> int:
         captured.append(args)
         return 0
 

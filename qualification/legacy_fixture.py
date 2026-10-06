@@ -52,7 +52,9 @@ PRINCIPAL_ACCOUNTS = {
 }
 #: 會被 writable census 檢查的 job 帳號（Manager 不在其內）。
 CENSUS_PRINCIPALS = ("cortex-builder", "cortex-reviewer-planner", "cortex-gate", "cortex-egress")
-#: release install config（`write_install_config.py`）的帳號 id；legacy fixture 必須避開。
+#: v0.1.13 以前 release install config 寫死的帳號 id（#1286 起改由 plan 決定；Ubuntu 上
+#: 這段屬於 systemd-resolve 與 udev 群組）。legacy fixture 必須避開，adoption 才證明是
+#: overlay 宣告的號碼而不是預設值。
 RELEASE_ACCOUNT_IDS = frozenset({991, 992, 993, 994, 995})
 SERVICES = ("cortex-egress-proxy.service", "cortex-manager.service", "cortex-monitor.service")
 

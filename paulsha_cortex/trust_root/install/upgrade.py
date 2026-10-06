@@ -46,7 +46,12 @@ from .core import (
     validate_prior_receipt_handoff,
 )
 from .legacy import LocalLegacyHostBackend, host_overlay_record, validate_host_overlay
-from .loaded_runtime import installed_runtime_env, loaded_runtime_mismatch, runtime_expected
+from .loaded_runtime import (
+    diagnostic_token,
+    installed_runtime_env,
+    loaded_runtime_mismatch,
+    runtime_expected,
+)
 from .receipt_chain import effective_receipt
 from .release_ingress import (
     OFFICIAL_REPOSITORY,
@@ -1264,8 +1269,13 @@ def _new_report(version: str, prior: PriorReceipt, steps: StepLog) -> dict[str, 
         "version": version,
         # Closed set, written only by this module and by Task 10's `--recover`:
         # "upgraded" | "rolled-back" | "halted" | "refused" | "in-progress" |
-        # "recovered" (the last is `--recover`'s own terminal outcome; keep this
-        # list in sync with whichever module next widens it).
+        # "recovered" | "finalized".  The last two are `--recover`'s terminal
+        # outcomes: "finalized" kept the interrupted upgrade's verified, serving
+        # receipt (#1270); "recovered" ran the runbook §6 rollback recovery.
+        # `--recover` also adds a "recovery" block saying which and why
+        # ("finalized" | "rolled-back" | "marker-cleared" | "finalize-failed",
+        # the last with result "halted").  Keep this list in sync with
+        # whichever module next widens it.
         "result": None,
         "phase": None,
         "failed_step": None,
@@ -1461,7 +1471,9 @@ def verified_durable_plan(plan_sha: str) -> Path:
     return path
 
 
-def _mark_last_report(plan_sha: str, *, recovered: bool) -> None:
+def _mark_last_report(
+    plan_sha: str, *, result: str, recovery: Mapping[str, object]
+) -> None:
     path = install_cli._TRUST_ROOT_MAINTENANCE_ROOT / _LAST_REPORT_NAME
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
@@ -1470,13 +1482,159 @@ def _mark_last_report(plan_sha: str, *, recovered: bool) -> None:
     plan = report.get("plan") if isinstance(report, dict) else None
     if not isinstance(plan, dict) or plan.get("sha256") != plan_sha:
         return
-    report["result"] = "recovered" if recovered else "halted"
+    report["result"] = result
     report["recovered_at"] = _now()
+    report["recovery"] = dict(recovery)
+    if result == "finalized":
+        # The interrupted run's "run `cortex upgrade --recover`" is done.
+        report["next_action"] = None
     _publish_report(report)
 
 
+class _NotFinalized(Exception):
+    """Why `--recover` cannot prove the interrupted upgrade finished (#1270)."""
+
+
+class _FinalizeFailed(UpgradeError):
+    """The receipt was proven serving, but clearing the snapshot or marker failed.
+
+    Never a reason to roll back: the receipt and services stay as they are and
+    the next `--recover` proves and finalizes again.
+    """
+
+    def __init__(self, receipt: Mapping[str, object], reason: str) -> None:
+        super().__init__(
+            "finalize failed after proving the interrupted upgrade's receipt is "
+            f"verified and serving ({reason}); the receipt and services are "
+            "untouched; rerun `cortex upgrade --recover`"
+        )
+        self.receipt = dict(receipt)
+        self.reason = reason
+
+
+def _interrupted_receipt_path(snapshot: Mapping[str, object] | None, plan_sha: str) -> Path:
+    """The receipt the interrupted upgrade bound: the snapshot's, else the chain's.
+
+    A stale marker names only the plan, so without a snapshot the receipt
+    chain's effective receipt counts only when that same plan produced it.
+    """
+
+    if snapshot is not None:
+        return Path(str(snapshot["receipt_path"]))
+    try:
+        receipt = effective_receipt(_STATE_ROOT)
+    except InstallError as exc:
+        raise _NotFinalized(f"receipt-undecided: {exc}") from exc
+    if receipt.path is None or receipt.to_dict().get("plan_sha256") != plan_sha:
+        raise _NotFinalized("receipt-not-from-interrupted-plan")
+    return receipt.path
+
+
+def _prove_serving(receipt_path: Path, plan_sha: str, token: str) -> dict[str, object]:
+    """Applied and qualified, every service active, loaded runtime match; or why not.
+
+    The same checks the upgrade makes after verify, under the receipt's
+    transaction lock (the one `_recover_command` rolls back under).
+    """
+
+    if not os.path.lexists(receipt_path):
+        raise _NotFinalized("receipt-absent")
+    try:
+        bound = InstallReceipt.load(receipt_path).to_dict().get("plan_sha256")
+    except InstallError as exc:
+        raise _NotFinalized(f"receipt-unreadable: {exc}") from exc
+    if bound != plan_sha:
+        raise _NotFinalized("receipt-not-from-interrupted-plan")
+    with install_cli._locked_receipt(receipt_path, maintenance_token=token) as (
+        receipt,
+        plan,
+    ):
+        document = receipt.to_dict()
+        state = document.get("state")
+        qualified = document.get("qualified") is True
+        if state != "applied" or not qualified:
+            raise _NotFinalized(
+                f"receipt-not-qualified: state={diagnostic_token(state)} "
+                f"qualified={str(qualified).lower()}"
+            )
+        # Cheap first: a host whose services are stopped is never probed.
+        inactive = [
+            service
+            for service in install_cli._MAINTENANCE_SERVICES
+            if install_cli._systemctl("is-active", "--quiet", service).returncode != 0
+        ]
+        if inactive:
+            raise _NotFinalized("services-inactive: " + ", ".join(inactive))
+        mismatch, _payload = await_loaded_runtime(
+            plan, receipt_path, runtime_expected(document)
+        )
+        if mismatch:
+            raise _NotFinalized(f"loaded-runtime-mismatch: {mismatch}")
+        return {"path": str(receipt_path), "receipt_id": document.get("receipt_id")}
+
+
+def _finalize_verified(durable: Path, plan_sha: str) -> dict[str, object] | str:
+    """Finish an interrupted upgrade whose receipt is verified and serving (#1270).
+
+    Owner ruling 2026-10-06: an upgrade killed after verify PASS but before the
+    snapshot and lease marker were cleared must not have its verified receipt
+    rolled back.  Under the locks `_recover_command` takes -- the lease (exact
+    plan only) and the receipt's transaction lock -- the bound receipt must be
+    applied and qualified, every maintenance service active, and Manager and
+    Monitor must have loaded it.  Then only the snapshot and the marker are
+    cleared.  Returns the result to emit, or why finalize was not taken: any
+    failed or unprovable check, after which the caller recovers as before.
+    Once the proof holds, a failure clearing the snapshot or the marker raises
+    `_FinalizeFailed` instead: a proven receipt is never rolled back.
+    """
+
+    lifecycle = {"complete": False}
+    receipt: dict[str, object] | None = None
+    try:
+        plan = install_cli._load_plan(durable)
+        if plan_sha256(plan) != plan_sha:
+            return "plan-mismatch"
+        with install_cli._maintenance_lease(
+            plan, recover_stale=True, lifecycle_state=lifecycle
+        ) as token:
+            # The lease already refused a snapshot or marker of another plan.
+            snapshot = install_cli._read_maintenance_snapshot()
+            receipt_path = _interrupted_receipt_path(snapshot, plan_sha)
+            receipt = _prove_serving(receipt_path, plan_sha, token)
+            if snapshot is not None:
+                install_cli._clear_maintenance_snapshot(plan, receipt_path=receipt_path)
+            # Completing the lifecycle clears the marker when the lease ends.
+            lifecycle["complete"] = True
+    except _NotFinalized as declined:
+        # The lease ends with its marker kept: the rollback recovery takes it.
+        return str(declined)
+    except Exception as exc:  # noqa: BLE001 -- after the proof nothing rolls back
+        if receipt is not None:
+            # Whatever of the snapshot and marker is left stays for a rerun.
+            raise _FinalizeFailed(receipt, f"{type(exc).__name__}: {exc}") from exc
+        if isinstance(exc, (InstallError, OSError, ValueError)):
+            return f"recovery-state-unavailable: {type(exc).__name__}: {exc}"
+        raise
+    assert receipt is not None
+    return {
+        "maintenance_recovered": True,
+        "action": "finalized",
+        "plan_sha256": plan_sha,
+        "receipt_path": receipt["path"],
+        "receipt_id": receipt["receipt_id"],
+        "snapshot_cleared": snapshot is not None,
+        "services_restored": [],
+        "services_stopped": [],
+    }
+
+
 def recover_upgrade() -> int:
-    """Runbook §6 without re-entering the plan sha: it comes from the snapshot."""
+    """Runbook §6 without re-entering the plan sha: it comes from the snapshot.
+
+    A receipt the interrupted upgrade already verified and the services serve
+    is finalized, not rolled back (#1270); without that proof the recovery
+    runs exactly as before and its result says why.
+    """
 
     previous_umask = os.umask(0o077)
     try:
@@ -1492,13 +1650,51 @@ def recover_upgrade() -> int:
                 return 0
             durable = verified_durable_plan(plan_sha)
             try:
+                verdict = _finalize_verified(durable, plan_sha)
+            except _FinalizeFailed as failed:
+                _mark_last_report(
+                    plan_sha,
+                    result="halted",
+                    recovery={
+                        "action": "finalize-failed",
+                        "reason": failed.reason,
+                        "receipt": failed.receipt,
+                    },
+                )
+                raise
+            if not isinstance(verdict, str):
+                install_cli._emit(verdict)
+                _mark_last_report(
+                    plan_sha,
+                    result="finalized",
+                    recovery={
+                        "action": "finalized",
+                        "receipt": {
+                            "path": verdict["receipt_path"],
+                            "receipt_id": verdict["receipt_id"],
+                        },
+                    },
+                )
+                return 0
+            recovery: dict[str, object] = {"action": "rolled-back", "reason": verdict}
+
+            def emit(payload: dict[str, object]) -> None:
+                # Without a snapshot `_recover_command` only clears the stale
+                # marker: nothing was stopped or rolled back.
+                if payload.get("receipt_path") is None:
+                    recovery["action"] = "marker-cleared"
+                install_cli._emit({**payload, **recovery})
+
+            try:
                 code = install_cli._recover_command(
-                    Namespace(plan=str(durable), confirm_sha256=plan_sha)
+                    Namespace(plan=str(durable), confirm_sha256=plan_sha), emit=emit
                 )
             except InstallError:
-                _mark_last_report(plan_sha, recovered=False)
+                _mark_last_report(plan_sha, result="halted", recovery=recovery)
                 raise
-            _mark_last_report(plan_sha, recovered=code == 0)
+            _mark_last_report(
+                plan_sha, result="recovered" if code == 0 else "halted", recovery=recovery
+            )
             return code
     finally:
         os.umask(previous_umask)

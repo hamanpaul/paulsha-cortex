@@ -31,7 +31,7 @@ refs:
 - **不刪除、不覆寫任何 legacy 物件。** installer 未產生、會衝突或 plan 未宣告的物件一律 rename 進 quarantine；受管目錄只修改 inode 本身的 metadata。
 - **state 只接手必要子集**（owner 裁決）：plan 宣告受管的 state 目錄連同內容就地接手；state 根目錄下 plan 未宣告的頂層項目、受管目錄內未列管的子目錄與 `tmp*`／`*.rollback.bak` 殘留、job worktree pool、source repo、credential 類物件一律 quarantine。cortex 帳號 HOME 頂層 plan 未宣告的項目（shell history、`retry-*.json` 之類，disposition reason `home-top`）同樣自動 quarantine，不需要 operator 清單（#1282）。
 - **殘留的 UNIX socket 與 FIFO**（服務停了留下的 stale socket）跟一般檔案一樣 quarantine：頂層的以 type／owner／mode／inode 綁定；在被 quarantine 的目錄裡的，樹 digest 只記 type 與 mode（裝置節點另記裝置號），installer 從不開啟它們。rollback 照舊以 inode 搬回，inventory digest 回到原值。頂層的裝置節點不是 cortex state，plan 以 `unclassified` 拒絕。
-- **不 remap uid／gid**：帳號以 host overlay 宣告現有 id；uid／gid 被非 cortex 身分持有時 plan 失敗。
+- **不 remap uid／gid**：帳號以 host overlay 宣告現有 id；uid／gid 被非 cortex 身分持有時 plan 失敗。release install config 不寫死號碼（#1286）：overlay 沒宣告的號碼，plan 會沿用主機上同名帳號的現有號碼（`existing`），一樣不 remap；adoption 仍建議以 overlay 明確宣告全部號碼（程式不強制），審核時對照 inventory 一眼看得出綁定的是哪一組號碼。
 - 既有檔案的 ACL 不遞迴重寫；安全性由 writable census 把關（各 job 帳號以 `access(2)` 判定可寫路徑）。
 
 ## 2. host overlay
@@ -57,7 +57,7 @@ overlay 存成 root 擁有、operator 可讀、不可被其他帳號寫入的持
   /var/lib/cortex-installer/host-overlay.yaml
 ```
 
-之後每一次升級都必須用**同一份** overlay 產生 plan，prior-receipt 交接才會產生相同的帳號 step。
+之後每一次升級都必須用**同一份** overlay 產生 plan。帳號 step 本身不依賴 overlay（#1286）：帳號已存在時 plan 沿用現有號碼，沒有 overlay 檔也得出與 prior receipt 相同的帳號 step。但 overlay 還承載 egress home、operator 與 builder providers，`cortex upgrade` 也要求 overlay digest 與 prior plan 相同，所以保留原檔不要刪改；要移除或修改 overlay 屬於設定變更，改走 `trust-root-transactional-install.md` 的手動流程。
 
 ## 3. 擷取並審核 legacy inventory
 

@@ -1561,3 +1561,43 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#810'
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#821'
+  installer-launch-authorities:
+    title: 'installer-launch-authorities'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1289'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/installer-launch-authorities/todo.md'
+    excludes: []
+  host-runtime-executors:
+    title: 'host-runtime-executors'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1293'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/host-runtime-executors/todo.md'
+    excludes: []
+  system-deploy-ops-defects:
+    title: 'system-deploy-ops-defects'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1291'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/system-deploy-ops-defects/todo.md'
+    excludes: []
+  dangerous-command-blocklist:
+    title: 'dangerous-command-blocklist'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1283'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/dangerous-command-blocklist/todo.md'
+    excludes: []
+  upgrade-venv-umask:
+    title: 'upgrade-venv-umask'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#1295'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/upgrade-venv-umask/todo.md'
+    excludes: []

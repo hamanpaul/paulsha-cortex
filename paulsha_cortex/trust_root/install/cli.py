@@ -4,15 +4,17 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import fcntl
+import grp
 import hashlib
 import json
 import os
+import pwd
 import secrets
 import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 import yaml
 
@@ -35,6 +37,7 @@ from .legacy import (
     validate_host_overlay,
 )
 from .core import (
+    HostAccounts,
     InstallError,
     InstallPlanError,
     InstallReceipt,
@@ -42,6 +45,7 @@ from .core import (
     _open_receipt_parent_directory,
     _rename_noreplace_at,
     _write_all,
+    account_id_summary,
     activate_receipt,
     apply_plan,
     atomic_write_json,
@@ -826,6 +830,35 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _nss_id_in_use(kind: str, number: int) -> bool:
+    """The point lookup ``useradd``/``groupadd`` make before taking an id."""
+
+    try:
+        if kind == "uid":
+            pwd.getpwuid(number)
+        else:
+            grp.getgrgid(number)
+    except KeyError:
+        return False
+    return True
+
+
+def _host_account_snapshot() -> HostAccounts:
+    """passwd/group as plan resolves undeclared account ids against (#1286).
+
+    Read through NSS like apply's ``preflight_facts``; both databases are
+    world-readable, so the unprivileged plan account sees the same rows.
+    Allocation also point-looks-up each candidate id, which catches sources
+    that do not enumerate.
+    """
+
+    return HostAccounts(
+        users=tuple((row.pw_name, row.pw_uid, row.pw_gid) for row in pwd.getpwall()),
+        groups=tuple((row.gr_name, row.gr_gid) for row in grp.getgrall()),
+        id_in_use=_nss_id_in_use,
+    )
+
+
 def _bound_plan_from_config(
     config: Mapping[str, object], bundle: Path
 ) -> dict[str, object]:
@@ -844,6 +877,7 @@ def _bound_plan_from_config(
         config=config,
         candidate_wheel=Path(str(wheel["resolved_path"])),
         bundle=Path(str(manifest["manifest_path"])),
+        host_accounts=_host_account_snapshot,
     )
     plan = bind_bundle_artifacts(plan, manifest)
     candidate = plan.get("candidate")
@@ -950,7 +984,12 @@ def _plan_command(args: argparse.Namespace) -> int:
     )
     output = Path(args.output).expanduser().absolute()
     atomic_write_json(output, plan, mode=0o600)
-    payload: dict[str, object] = {"output": str(output), "plan_sha256": plan_sha256(plan)}
+    payload: dict[str, object] = {
+        "output": str(output),
+        "plan_sha256": plan_sha256(plan),
+        # #1286：每個帳號的號碼與來源（overlay／config／existing／allocated），供審核。
+        "account_ids": account_id_summary(plan),
+    }
     if "host_overlay_sha256" in plan:
         payload["host_overlay_sha256"] = plan["host_overlay_sha256"]
     legacy_block = plan.get("legacy_adoption")
@@ -1133,7 +1172,19 @@ def _lease_release_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _recover_command(args: argparse.Namespace) -> int:
+def _recover_command(
+    args: argparse.Namespace,
+    *,
+    emit: Callable[[dict[str, object]], None] | None = None,
+) -> int:
+    """Runbook §6: roll the snapshot's receipt back, restore the previous services.
+
+    Without a snapshot only the stale marker is cleared.  ``emit`` replaces
+    ``_emit`` for the result: `cortex upgrade --recover` adds why it did not
+    finalize instead (#1270).
+    """
+
+    report = emit or _emit
     _require_root()
     plan = _load_plan(Path(args.plan))
     validate_apply_plan(plan, confirm_sha256=args.confirm_sha256)
@@ -1144,7 +1195,7 @@ def _recover_command(args: argparse.Namespace) -> int:
         snapshot = _read_maintenance_snapshot()
         if snapshot is None:
             lifecycle_state["complete"] = True
-            _emit(
+            report(
                 {
                     "maintenance_recovered": True,
                     "plan_sha256": plan_sha256(plan),
@@ -1182,7 +1233,7 @@ def _recover_command(args: argparse.Namespace) -> int:
         restored = _restore_snapshot_services(previously_active)
         _clear_maintenance_snapshot(plan, receipt_path=receipt_path)
         lifecycle_state["complete"] = True
-        _emit(
+        report(
             {
                 "maintenance_recovered": True,
                 "plan_sha256": plan_sha256(plan),

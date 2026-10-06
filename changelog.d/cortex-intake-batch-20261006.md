@@ -1,0 +1,1 @@
+- 進件：在 `.cortex/work-items.yaml` 登記五個 work item，並附上 accepted todo，交給 cortex 平行派工：`installer-launch-authorities`（#1289）、`host-runtime-executors`（#1293，須在 #1289 之後）、`system-deploy-ops-defects`（#1291）、`dangerous-command-blocklist`（#1283）、`upgrade-venv-umask`（#1295）。
